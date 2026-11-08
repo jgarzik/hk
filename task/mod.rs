@@ -1,6 +1,7 @@
 //! Task management
 
 pub mod acct;
+pub(crate) mod argstr;
 pub(crate) mod binfmt_script;
 pub mod futex;
 pub mod kcmp;
@@ -20,6 +21,7 @@ pub mod misc;
 pub mod percpu;
 pub mod pgrp;
 pub mod pid;
+pub mod pidns;
 pub mod proc;
 pub mod process_vm;
 pub mod ptrace;
@@ -35,6 +37,8 @@ pub mod syscall;
 pub mod clone_flags {
     /// Return a pidfd for the child process
     pub const CLONE_PIDFD: u64 = 0x00001000;
+    /// Unused, refused with CLONE_PIDFD (kept for a later use of it)
+    pub const CLONE_DETACHED: u64 = 0x00400000;
     /// Share virtual memory (address space) - creates a thread
     pub const CLONE_VM: u64 = 0x00000100;
     /// Share filesystem info (root, cwd, umask)
@@ -119,7 +123,6 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use crate::arch::ArchPageTable;
 use crate::fs::FsStruct;
 use crate::ipc::sem::SemUndoList;
 use crate::ns::NsProxy;
@@ -554,10 +557,6 @@ pub struct PrctlState {
     /// Keep capabilities across setuid (PR_SET_KEEPCAPS)
     /// When set, capabilities are preserved when changing UIDs
     pub keep_caps: bool,
-    /// Child subreaper flag (PR_SET_CHILD_SUBREAPER)
-    /// When set, this process becomes the parent of orphaned descendants
-    /// instead of init (PID 1)
-    pub child_subreaper: bool,
     /// TSC mode (x86-64 only): PR_TSC_ENABLE or PR_TSC_SIGSEGV
     /// Controls whether RDTSC instruction is allowed
     #[cfg(target_arch = "x86_64")]
@@ -572,7 +571,6 @@ impl Default for PrctlState {
             no_new_privs: false,
             timer_slack_ns: 50_000, // 50 microseconds default
             keep_caps: false,
-            child_subreaper: false,
             #[cfg(target_arch = "x86_64")]
             tsc_mode: prctl_ops::PR_TSC_ENABLE as u8, // RDTSC allowed by default
             thp_disable: false,
@@ -935,7 +933,7 @@ pub mod tif {
 /// [`TaskRef`]: the task table, run queues and lookups hold references
 ///
 /// Three kinds of fields:
-/// - fixed at creation: `tid`, `pid`, `kind`, `kstack_top`;
+/// - fixed at creation: `tid`, `pid`, `pid_ns`, `kind`, `kstack_top`;
 /// - hot counters and flags: atomics written by the task itself (or
 ///   its creator before it first runs) or under TASKLIST, and read
 ///   lock-free by anyone (accounting, `flags`, `thread_flags`, `cpu`,
@@ -955,6 +953,10 @@ pub struct Task {
     tid: AtomicU64,
     /// Process (thread-group) ID: the leader's tid (Linux tgid)
     pub pid: Pid,
+    /// The pid namespace it was created in (Linux task_active_pid_ns;
+    /// None: the root one): fixed at creation, its threads' too
+    /// (CLONE_THREAD stays in the creator's), so read lock-free
+    pid_ns: Option<Arc<crate::ns::PidNamespace>>,
     /// Kind of task
     pub kind: TaskKind,
     /// Kernel stack top
@@ -1145,8 +1147,9 @@ pub struct TaskInner {
     /// Current state
     pub state: TaskState,
     /// CPU affinity mask (bit N = CPU N is allowed)
-    /// Page table for this task
-    pub page_table: ArchPageTable,
+    /// Top-level page table it runs on: its mm's, else the kernel's
+    /// (`ArchPageTable::kernel_root`)
+    pub pgd: u64,
 
     // =========================================================================
     // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)
@@ -1570,6 +1573,7 @@ impl Task {
         Self {
             tid: AtomicU64::new(tid),
             pid: ids.pid,
+            pid_ns: inner.thread_pid.as_ref().map(|p| p.ns().clone()),
             kind,
             kstack_top,
             start_time: AtomicU64::new(now),
@@ -1634,6 +1638,7 @@ impl Task {
         Self {
             tid: AtomicU64::new(0),
             pid: 0,
+            pid_ns: None,
             kind: TaskKind::KernelThread,
             kstack_top,
             start_time: AtomicU64::new(0),
@@ -1696,6 +1701,20 @@ impl Task {
     #[inline]
     pub fn tid(&self) -> Tid {
         self.tid.load(Ordering::Relaxed)
+    }
+
+    /// The pid namespace it was created in (Linux task_active_pid_ns)
+    #[inline]
+    pub fn pid_ns(&self) -> &crate::ns::PidNamespace {
+        self.pid_ns.as_deref().unwrap_or(&crate::ns::INIT_PID_NS)
+    }
+
+    /// Its pid namespace, a counted reference (Linux
+    /// get_pid_ns(task_active_pid_ns(p)))
+    pub fn get_pid_ns(&self) -> Arc<crate::ns::PidNamespace> {
+        self.pid_ns
+            .clone()
+            .unwrap_or_else(|| crate::ns::INIT_PID_NS.clone())
     }
 
     /// Take over thread ID `tid` (exec's exchange_tids, TASKLIST and

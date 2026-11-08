@@ -454,8 +454,11 @@ pub fn raw_deliver(net: &NetNamespace, skb: &SkBuff) -> bool {
         if icmp && skb.data().first().is_none_or(|&t| s.filtered(t)) {
             continue;
         }
-        s.rxq
-            .enqueue(&s.sk, Dgram::new(saddr, 0, pkt.to_vec(), info));
+        // No copy, no delivery (Linux raw_v4_input: a failed skb_clone
+        // skips the socket)
+        if let Some(d) = Dgram::copy(saddr, 0, pkt, info) {
+            s.rxq.enqueue(&s.sk, d);
+        }
     }
     true
 }

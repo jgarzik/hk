@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 use crate::sync::spin::Mutex;
 
 use crate::net::ipv4::Ipv4Addr;
+use crate::util::kmem::{KVec, try_to_vec};
 
 /// Largest IPv4 datagram
 const IP_MAX: usize = 65535;
@@ -123,13 +124,28 @@ impl FragQueue {
         if self.frags.len() >= MAX_FRAGS {
             return Ins::Kill;
         }
-        self.frags.insert(off, data[..end - off].to_vec());
+        // Out of memory kills the queue, as Linux ip_frag_reasm's
+        // out_nomem does (the caller frees it)
+        let first = if off == 0 {
+            let mut f = KVec::new();
+            if f.try_extend_from_slice(hdr).is_err()
+                || f.try_extend_from_slice(&data[..(end - off).min(8)])
+                    .is_err()
+            {
+                return Ins::Kill;
+            }
+            Some(f.into_vec())
+        } else {
+            None
+        };
+        let Ok(piece) = try_to_vec(&data[..end - off]) else {
+            return Ins::Kill;
+        };
+        self.frags.insert(off, piece);
         self.meat += end - off;
         self.mem += end - off + OVERHEAD;
-        if off == 0 {
-            let mut f = hdr.to_vec();
-            f.extend_from_slice(&data[..(end - off).min(8)]);
-            self.first = Some(f);
+        if first.is_some() {
+            self.first = first;
         }
         if self.done() { Ins::Done } else { Ins::More }
     }
@@ -169,18 +185,20 @@ impl FragQueue {
     }
 
     /// The whole datagram: first header (fixed up) + payload; None if
-    /// incomplete or beyond 65535 bytes (Linux "Oversized IP packet")
+    /// incomplete, beyond 65535 bytes (Linux "Oversized IP packet") or
+    /// out of memory (Linux ip_frag_reasm's out_nomem)
     pub fn assemble(&self) -> Option<Vec<u8>> {
         let first = self.first.as_ref()?;
         let ihl = ((first[0] & 0x0f) as usize) * 4;
         if !self.done() || ihl + self.len > IP_MAX {
             return None;
         }
-        let mut out = Vec::with_capacity(ihl + self.len);
-        out.extend_from_slice(&first[..ihl]);
+        let mut out = KVec::try_with_capacity(ihl + self.len).ok()?;
+        out.try_extend_from_slice(&first[..ihl]).ok()?;
         for d in self.frags.values() {
-            out.extend_from_slice(d);
+            out.try_extend_from_slice(d).ok()?;
         }
+        let mut out = out.into_vec();
         let tot = u16::try_from(out.len()).ok()?;
         out[2..4].copy_from_slice(&tot.to_be_bytes());
         out[6] = 0;

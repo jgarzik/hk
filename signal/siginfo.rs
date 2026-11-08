@@ -258,6 +258,21 @@ impl SigInfo {
         layout(self.sig(), self.code)
     }
 
+    /// It names its sender: a kill, sigqueue or SIGCHLD info (Linux
+    /// has_si_pid_and_uid)
+    pub fn has_sender(&self) -> bool {
+        matches!(self.layout(), Layout::Kill | Layout::Rt | Layout::Chld)
+    }
+
+    /// Sent by a task the receiver's pid namespace does not see: an
+    /// info naming its sender (kill, sigqueue, SIGCHLD) names none
+    /// (Linux send_signal_locked: si_pid 0 from an ancestor namespace)
+    pub fn hide_sender(&mut self) {
+        if self.has_sender() {
+            self.f[..4].copy_from_slice(&0i32.to_ne_bytes());
+        }
+    }
+
     /// The typed union
     pub fn fields(&self) -> SigFields {
         match self.layout() {
@@ -464,6 +479,23 @@ mod tests {
                 addr_lsb: 0
             }
         );
+    }
+
+    /// hide_sender clears si_pid of the layouts that carry a sender
+    /// only
+    #[test]
+    fn hide_sender_layouts() {
+        let mut k = SigInfo::kill(SIGUSR1, SI_USER, 9, 3);
+        k.hide_sender();
+        assert_eq!(k.fields(), SigFields::Kill { pid: 0, uid: 3 });
+        let t = SigFields::Timer {
+            tid: 9,
+            overrun: 0,
+            value: 0,
+        };
+        let mut tm = SigInfo::new(SIGUSR1, SI_TIMER, t);
+        tm.hide_sender();
+        assert_eq!(tm.fields(), t);
     }
 
     /// Linux siginfo_layout's choices

@@ -48,36 +48,51 @@ const CMSG_HDR: usize = 16;
 /// overflowuid / overflowgid
 const OVERFLOW_ID: u32 = 65534;
 
-/// Credentials carried by a message (Linux UNIXCB pid/uid/gid)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Credentials carried by a message (Linux UNIXCB pid/uid/gid): the
+/// sender's struct pid, numbered only for a receiver (none: pid 0)
+#[derive(Clone)]
 pub struct Creds {
-    pub pid: i32,
+    pub pid: Option<Arc<crate::task::pid::Pid>>,
     pub uid: u32,
     pub gid: u32,
 }
 
+impl PartialEq for Creds {
+    /// The same pid (not number), uid and gid (Linux unix_skb_scm_eq)
+    fn eq(&self, o: &Self) -> bool {
+        let same = match (&self.pid, &o.pid) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        same && self.uid == o.uid && self.gid == o.gid
+    }
+}
+
 impl Creds {
-    /// The current task's (tgid, real uid, real gid)
+    /// The current task's (process, real uid, real gid)
     pub fn current() -> Self {
         let c = crate::task::current_cred();
         Self {
-            pid: crate::task::percpu::current_pid() as i32,
+            pid: crate::task::pid::find_pid(
+                &crate::ns::INIT_PID_NS,
+                crate::task::percpu::current_pid() as u32,
+            ),
             uid: c.uid,
             gid: c.gid,
         }
     }
 
-    /// struct ucred
-    fn bytes(c: Option<Self>) -> [u8; 12] {
-        let c = c.unwrap_or(Self {
-            pid: 0,
-            uid: OVERFLOW_ID,
-            gid: OVERFLOW_ID,
+    /// struct ucred, its pid in the reader's namespace (Linux
+    /// scm_set_cred: pid_vnr; 0 if not visible)
+    fn bytes(c: Option<&Self>) -> [u8; 12] {
+        let (pid, uid, gid) = c.map_or((0, OVERFLOW_ID, OVERFLOW_ID), |c| {
+            (c.pid.as_ref().map_or(0, |p| p.vnr()), c.uid, c.gid)
         });
         let mut b = [0u8; 12];
-        b[..4].copy_from_slice(&c.pid.to_ne_bytes());
-        b[4..8].copy_from_slice(&c.uid.to_ne_bytes());
-        b[8..].copy_from_slice(&c.gid.to_ne_bytes());
+        b[..4].copy_from_slice(&pid.to_ne_bytes());
+        b[4..8].copy_from_slice(&uid.to_ne_bytes());
+        b[8..].copy_from_slice(&gid.to_ne_bytes());
         b
     }
 }
@@ -290,7 +305,8 @@ fn check_creds(data: &[u8]) -> Result<Creds, KernelError> {
         return Err(KernelError::InvalidArgument);
     }
     let c = crate::task::current_cred();
-    let me = crate::task::percpu::current_pid() as i32;
+    // The caller's numbers (Linux scm_check_creds: task_tgid_vnr)
+    let me = crate::task::pid::vnr(crate::task::percpu::current_pid()) as i32;
     let cap = crate::task::capable;
     let pid_ok = pid == me || cap(crate::task::CAP_SYS_ADMIN);
     let uid_ok = [c.uid, c.euid, c.suid].contains(&uid) || cap(crate::task::CAP_SETUID);
@@ -298,10 +314,17 @@ fn check_creds(data: &[u8]) -> Result<Creds, KernelError> {
     if !(pid_ok && uid_ok && gid_ok) {
         return Err(KernelError::NotPermitted);
     }
-    if pid != me && (pid <= 0 || crate::fs::proc::get_tid_for_pid(pid as u64).is_none()) {
-        return Err(KernelError::NoProcess);
-    }
-    Ok(Creds { pid, uid, gid })
+    // Held by struct pid, numbered again for each reader (Linux
+    // __scm_send: find_get_pid)
+    let p = u32::try_from(pid)
+        .ok()
+        .and_then(crate::task::pid::find_vpid)
+        .ok_or(KernelError::NoProcess)?;
+    Ok(Creds {
+        pid: Some(p),
+        uid,
+        gid,
+    })
 }
 
 /// Deliver received ancillary data (Linux scm_recv_unix): credentials
@@ -317,7 +340,7 @@ pub fn put(m: &mut RecvMsg<'_>, passcred: bool, creds: Option<Creds>, fds: Optio
     }
     if passcred {
         m.cmsg
-            .put(SOL_SOCKET, SCM_CREDENTIALS, &Creds::bytes(creds));
+            .put(SOL_SOCKET, SCM_CREDENTIALS, &Creds::bytes(creds.as_ref()));
     }
     if let Some(f) = fds {
         put_fds(m, f);

@@ -859,7 +859,11 @@ pub fn create_posix_timer(
         return Err(-22);
     }
     let owner = match sev.sigev_notify {
-        SIGEV_THREAD_ID => sev.sigev_notify_thread_id as Tid,
+        // The caller's number (Linux good_sigevent: find_task_by_vpid);
+        // one it does not see names no task (0), so EINVAL below
+        SIGEV_THREAD_ID => {
+            crate::task::pid::from_vnr(sev.sigev_notify_thread_id as Tid).unwrap_or(0)
+        }
         _ => tid,
     };
 
@@ -906,6 +910,7 @@ fn own_cpu_clock(clockid: i32) -> Option<crate::time::cpu_timer::CpuClock> {
     else {
         return None;
     };
+    let pid = crate::time::time_syscall::clock_pid(pid)?;
     let sample = crate::time::cpu_timer::Sample::of(which);
     if thread {
         let tid = if pid == 0 { current_tid() } else { pid };

@@ -134,7 +134,7 @@ impl NlSkb {
             portid: 0,
             group,
             creds: Creds {
-                pid: 0,
+                pid: None,
                 uid: 0,
                 gid: 0,
             },
@@ -344,12 +344,13 @@ impl NlSock {
         self.sk.net.nl.insert(self.sk.protocol, portid, self)
     }
 
-    /// Linux netlink_autobind: tgid first, then unique negative ids
+    /// Linux netlink_autobind: the caller's tgid as its pid namespace
+    /// numbers it (task_tgid_vnr) first, then unique negative ids
     pub fn autobind(self: &Arc<Self>) -> Result<(), KernelError> {
         if self.bound.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut id = crate::task::percpu::current_pid() as u32;
+        let mut id = crate::task::pid::vnr(crate::task::percpu::current_pid());
         loop {
             match self.insert(id) {
                 Err(KernelError::AddressInUse) => {
@@ -607,7 +608,7 @@ impl NlSock {
                 data: data.to_vec(),
                 portid: me,
                 group,
-                creds,
+                creds: creds.clone(),
             };
             broadcast(&self.sk.net, self.sk.protocol, skb, me);
         }

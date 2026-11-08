@@ -294,7 +294,9 @@ unsafe impl GlobalAlloc for KernelAlloc {
         if in_arena(ptr) {
             unsafe { self.arena.dealloc(ptr, layout) };
         } else if crate::mm::vmalloc::contains(ptr as u64) {
-            crate::mm::vmalloc::free(ptr, layout.size());
+            // SAFETY: `ptr` came from `kvmalloc(layout)`, whose vmalloc
+            // block it is; freed once (GlobalAlloc::dealloc's contract)
+            unsafe { crate::mm::vmalloc::free(ptr, layout.size()) };
         } else {
             crate::mm::slab::kfree(ptr, layout.size(), layout.align());
         }

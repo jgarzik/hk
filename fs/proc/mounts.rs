@@ -13,21 +13,17 @@ use super::super::mount::{
     MNT_RELATIME, Mount, NAMESPACE_SEM,
 };
 use super::super::name::mangle;
-use super::get_tid_for_pid;
-use crate::task::Pid;
+use crate::task::percpu::TaskRef;
 
 /// mangle's set: space, tab, newline, backslash (Linux seq_escape)
 const ESC: &[u8] = b" \t\n\\";
 /// For source and type, '#' too (Linux mangle in proc_namespace.c)
 const ESC_HASH: &[u8] = b" \t\n\\#";
 
-/// The mounts `pid` sees: (mount, mountpoint as seen from its root), by
-/// mount order; a mount its root does not reach is left out
-fn visible(pid: Pid) -> Vec<(Arc<Mount>, Vec<u8>)> {
-    let Some(tid) = get_tid_for_pid(pid) else {
-        return Vec::new();
-    };
-    let (Some(ns), Some(fs)) = (crate::ns::get_task_ns(tid), crate::fs::get_task_fs(tid)) else {
+/// The mounts task `t` sees: (mount, mountpoint as seen from its root),
+/// by mount order; a mount its root does not reach is left out
+fn visible(t: &TaskRef) -> Vec<(Arc<Mount>, Vec<u8>)> {
+    let (Some(ns), Some(fs)) = (super::task_nsproxy(t), crate::fs::task_fs(t)) else {
         return Vec::new();
     };
     let root = fs.get_root();
@@ -78,9 +74,9 @@ fn mnt_opts(out: &mut Vec<u8>, m: &Mount) {
 
 /// /proc/<pid>/mounts (Linux show_vfsmnt): source mountpoint type
 /// options 0 0
-pub fn show_mounts(pid: Pid) -> Vec<u8> {
+pub fn show_mounts(t: &TaskRef) -> Vec<u8> {
     let mut out = Vec::new();
-    for (m, mp) in visible(pid) {
+    for (m, mp) in visible(t) {
         mangle(&mut out, &m.devname, ESC_HASH);
         out.push(b' ');
         mangle(&mut out, &mp, ESC);
@@ -100,10 +96,10 @@ pub fn show_mounts(pid: Pid) -> Vec<u8> {
 
 /// /proc/<pid>/mountinfo (Linux show_mountinfo): id parent major:minor
 /// root mountpoint options [optional fields] - type source super-options
-pub fn show_mountinfo(pid: Pid) -> Vec<u8> {
+pub fn show_mountinfo(t: &TaskRef) -> Vec<u8> {
     use alloc::fmt::Write;
     let mut out = Vec::new();
-    let vis = visible(pid);
+    let vis = visible(t);
     for (m, mp) in vis.iter().cloned() {
         // The namespace root's parent is itself (Linux: its mnt_parent)
         let parent = m.get_parent().map_or(m.mnt_id, |p| p.mnt_id);
@@ -118,7 +114,7 @@ pub fn show_mountinfo(pid: Pid) -> Vec<u8> {
             dev & 0xff
         );
         out.extend_from_slice(head.as_bytes());
-        mangle(&mut out, &dentry_path(&m.root), ESC);
+        mangle(&mut out, &dentry_path(&m.root).unwrap_or_default(), ESC);
         out.push(b' ');
         mangle(&mut out, &mp, ESC);
         out.push(b' ');

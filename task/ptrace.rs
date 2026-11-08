@@ -9,12 +9,11 @@
 //! This implementation follows the Linux ptrace ABI for both x86-64 and aarch64.
 //! Not all ptrace operations are implemented; this focuses on the core subset
 //! needed for basic debugging and tracing.
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP};
 use crate::task::percpu::{self, TASKLIST};
 use crate::task::{CAP_SYS_PTRACE, Pid, TaskState, Tid, capable};
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_to_user, copy_val_from_user, copy_val_to_user};
 
 // =============================================================================
 // Ptrace request codes (from Linux include/uapi/linux/ptrace.h)
@@ -252,12 +251,6 @@ impl Drop for Frozen {
     }
 }
 
-/// Find a task by PID (thread group leader)
-fn find_task_by_pid(pid: Pid) -> Option<Tid> {
-    let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.tid())
-}
-
 /// Check if a task is being traced
 pub fn is_traced(tid: Tid) -> bool {
     let table = TASKLIST.read();
@@ -318,7 +311,7 @@ fn ptrace_traceme() -> i64 {
 ///
 /// This sends SIGSTOP to the target and makes the caller the tracer.
 fn ptrace_attach(target_pid: Pid) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -377,7 +370,7 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
         return -EINVAL;
     }
 
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -429,7 +422,7 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
 ///
 /// The tracee is continued with an optional signal.
 fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -442,17 +435,10 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
 
     {
         let mut table = TASKLIST.write();
-        let mut target = match table.get_mut(target_tid) {
-            Some(t) => t,
-            None => return -ESRCH,
-        };
-
-        // Clear tracing state
-        target.ptrace = 0;
-        target.ptrace_frozen = false;
-        target.ptracer = None;
-        target.ptrace_options = 0;
-        target.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
+        if table.get(target_tid).is_none() {
+            return -ESRCH;
+        }
+        ptrace_unlink(&mut table, target_tid);
     }
     crate::arch::ptrace::disable_single_step(target_tid);
 
@@ -498,7 +484,7 @@ fn ptrace_wake(tid: Tid, sig: u32) {
 /// * `request` - PTRACE_CONT, PTRACE_SYSCALL, or PTRACE_SINGLESTEP
 /// * `signal` - Signal to inject (0 for none)
 fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -554,7 +540,7 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
 
 /// PTRACE_KILL - kill a traced process (deprecated, use PTRACE_CONT with SIGKILL).
 fn ptrace_kill(target_pid: Pid) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -602,7 +588,7 @@ fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
 
 /// Read a word from tracee's memory.
 fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -642,7 +628,7 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
 
 /// Write a word to tracee's memory.
 fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -682,7 +668,7 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
         return -EINVAL;
     }
 
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -714,7 +700,7 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
 /// PTRACE_GETSIGINFO: the stopped tracee's stop siginfo to `data`
 /// (Linux ptrace_getsiginfo): EINVAL if the stop has none
 fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> i64 {
-    let Some(tid) = find_task_by_pid(target_pid) else {
+    let Some(tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) else {
         return -ESRCH;
     };
     let _frozen = match ptrace_check_attach(tid) {
@@ -735,7 +721,7 @@ fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> i64 {
 /// the one at `data` (Linux ptrace_setsiginfo): what it delivers if the
 /// tracer resumes it with that signal; EINVAL if the stop has none
 fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> i64 {
-    let Some(tid) = find_task_by_pid(target_pid) else {
+    let Some(tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) else {
         return -ESRCH;
     };
     let _frozen = match ptrace_check_attach(tid) {
@@ -761,7 +747,7 @@ fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> i64 {
 /// its group's, to `data` (Linux ptrace_peek_siginfo): how many
 fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> i64 {
     const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
-    let Some(tid) = find_task_by_pid(target_pid) else {
+    let Some(tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) else {
         return -ESRCH;
     };
     let _frozen = match ptrace_check_attach(tid) {
@@ -809,7 +795,7 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> i64 {
 }
 
 fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -840,7 +826,7 @@ fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
 
 /// Get all general-purpose registers from tracee.
 fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -854,13 +840,7 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
     // Architecture-specific implementation
     match crate::arch::ptrace::get_user_regs(target_tid) {
         Ok(regs) => {
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&raw const regs).cast::<u8>(),
-                    core::mem::size_of_val(&regs),
-                )
-            };
-            if copy_to_user::<crate::arch::Uaccess>(data, bytes).is_err() {
+            if copy_val_to_user::<crate::arch::Uaccess, _>(data, &regs).is_err() {
                 return -EFAULT;
             }
             0
@@ -871,7 +851,7 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
 
 /// Set all general-purpose registers for tracee.
 fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -882,41 +862,13 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
         Err(e) => return e,
     };
 
-    // Architecture-specific implementation
-    #[cfg(target_arch = "x86_64")]
-    {
-        let mut regs = crate::arch::ptrace::UserRegsStruct::default();
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                (&raw mut regs).cast::<u8>(),
-                core::mem::size_of_val(&regs),
-            )
-        };
-        if copy_from_user::<crate::arch::Uaccess>(bytes, data, bytes.len()).is_err() {
-            return -EFAULT;
-        }
-        match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
-            Ok(()) => 0,
-            Err(e) => i64::from(e),
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        let mut regs = crate::arch::ptrace::UserPtRegs::default();
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                (&raw mut regs).cast::<u8>(),
-                core::mem::size_of_val(&regs),
-            )
-        };
-        if copy_from_user::<crate::arch::Uaccess>(bytes, data, bytes.len()).is_err() {
-            return -EFAULT;
-        }
-        match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
-            Ok(()) => 0,
-            Err(e) => i64::from(e),
-        }
+    let Ok(regs) = copy_val_from_user::<crate::arch::Uaccess, crate::arch::ptrace::UserRegs>(data)
+    else {
+        return -EFAULT;
+    };
+    match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
+        Ok(()) => 0,
+        Err(e) => i64::from(e),
     }
 }
 
@@ -1035,7 +987,7 @@ pub fn ptrace_report_syscall(entry: bool) {
     let info = crate::signal::SigInfo::kill(
         SIGTRAP,
         code as i32,
-        tid as i32,
+        crate::task::pid::vnr(tid) as i32,
         crate::task::current_cred().uid,
     );
     // Linux send_sig(exit_code, current, 1): SEND_SIG_PRIV
@@ -1059,8 +1011,22 @@ pub fn ptrace_signal(info: &mut crate::signal::SigInfo) -> u32 {
     new
 }
 
-/// The exiting task's tracees are detached (Linux exit_ptrace): stopped
-/// ones go on, and PTRACE_O_EXITKILL ones are killed
+/// Task `tid` is no longer traced (Linux __ptrace_unlink), under
+/// TASKLIST's write lock
+pub(crate) fn ptrace_unlink(table: &mut percpu::GlobalTaskTable, tid: Tid) {
+    let Some(mut t) = table.get_mut(tid) else {
+        return;
+    };
+    t.ptrace = 0;
+    t.ptrace_frozen = false;
+    t.ptracer = None;
+    t.ptrace_options = 0;
+    t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
+}
+
+/// The exiting task's tracees are detached (Linux exit_ptrace), one per
+/// TASKLIST write section: stopped ones go on, and PTRACE_O_EXITKILL
+/// ones are killed; then the zombies ([`percpu::detach_zombies`])
 pub fn exit_ptrace() {
     let me = percpu::current();
     // Most tasks trace nothing: look under the read lock first
@@ -1071,39 +1037,39 @@ pub fn exit_ptrace() {
     if !traces {
         return;
     }
-    let mut gone = alloc::vec::Vec::new();
-    {
-        let mut table = TASKLIST.write();
-        let tids: alloc::vec::Vec<Tid> = table
-            .iter()
-            .filter(|t| t.ptrace != 0 && t.traced_by(&me))
-            .map(|t| t.task.tid())
-            .collect();
-        for tid in tids {
-            let Some(mut t) = table.get_mut(tid) else {
-                continue;
-            };
-            let kill = t.ptrace_options & PTRACE_O_EXITKILL != 0;
-            t.ptrace = 0;
-            t.ptrace_frozen = false;
-            t.ptracer = None;
-            t.ptrace_options = 0;
-            t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
-            if matches!(t.state, TaskState::Traced(_)) {
-                t.state = TaskState::Ready;
-                t.ptrace_code = 0;
-            }
-            if let Some(task) = table.task(tid) {
-                gone.push((task, kill));
-            }
-        }
-    }
-    for (t, kill) in gone {
-        if kill {
-            signal::send_signal(t.tid(), SIGKILL);
+    while let Some((t, kill)) = detach_live(&me) {
+        if let Some(k) = kill {
+            k.finish();
         }
         percpu::try_to_wake_up(&t, percpu::WakeMode::Any);
     }
+    percpu::detach_zombies(&me);
+}
+
+/// [`exit_ptrace`]'s write section for one live tracee of `me`: an
+/// EXITKILL one gets SIGKILL before it is detached and resumed (Linux
+/// exit_ptrace: send_sig_info under tasklist_lock, then
+/// __ptrace_detach), so it never runs untraced code first; the tracee
+/// and the kill's wakeups, for after the lock
+fn detach_live(me: &crate::task::Task) -> Option<(percpu::TaskRef, Option<signal::Posted>)> {
+    let mut table = TASKLIST.write();
+    let v = table
+        .find(|t| t.ptrace != 0 && t.traced_by(me) && !matches!(t.state, TaskState::Zombie(_)))?;
+    let (tid, exitkill) = (v.task.tid(), v.ptrace_options & PTRACE_O_EXITKILL != 0);
+    let t = table.task(tid)?;
+    let kill = if exitkill {
+        signal::sigkill_held(&table, &t)
+    } else {
+        None
+    };
+    ptrace_unlink(&mut table, tid);
+    if let Some(mut v) = table.get_mut(tid)
+        && matches!(v.state, TaskState::Traced(_))
+    {
+        v.state = TaskState::Ready;
+        v.ptrace_code = 0;
+    }
+    Some((t, kill))
 }
 
 // =============================================================================
@@ -1149,15 +1115,23 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
 
         // Not yet implemented
         PTRACE_PEEKUSER | PTRACE_POKEUSER | PTRACE_GETFPREGS | PTRACE_SETFPREGS
-        | PTRACE_GETREGSET | PTRACE_SETREGSET | PTRACE_INTERRUPT | PTRACE_LISTEN => {
-            crate::printkln!("ptrace: unimplemented request {}", request);
-            -EINVAL
-        }
+        | PTRACE_GETREGSET | PTRACE_SETREGSET | PTRACE_INTERRUPT | PTRACE_LISTEN => -EINVAL,
 
-        _ => {
-            crate::printkln!("ptrace: unknown request {}", request);
-            -EINVAL
-        }
+        _ => ptrace_unknown(pid as Pid),
+    }
+}
+
+/// A request ptrace does not know (Linux sys_ptrace: ptrace_check_attach,
+/// then ptrace_request's default): ESRCH unless the caller traces `pid`
+/// and it is stopped, else EIO; nothing is logged, a user can send any
+/// number
+fn ptrace_unknown(pid: Pid) -> i64 {
+    let Some(tid) = percpu::find_task_by_vpid(pid).map(|t| t.tid()) else {
+        return -ESRCH;
+    };
+    match ptrace_check_attach(tid) {
+        Ok(_frozen) => -EIO,
+        Err(e) => e,
     }
 }
 
@@ -1170,6 +1144,16 @@ pub fn may_read_proc(pid: crate::task::Pid) -> bool {
         return true;
     }
     may_access(|t| t.task.pid == pid, true)
+}
+
+/// [`may_read_proc`] for the pinned task `t` itself (Linux
+/// ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS) on the task
+/// get_pid_task returned): its own thread group always
+pub fn may_read_ref(t: &crate::task::Task) -> bool {
+    if t.pid == percpu::current_pid() {
+        return true;
+    }
+    may_access(|v| core::ptr::eq(v.task, t), true)
 }
 
 /// [`may_read_proc`] for task `tid` itself (tids are never reused): a

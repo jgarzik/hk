@@ -15,15 +15,22 @@
 //! pages are unmapped and freed at once, but its slot is reused only
 //! after a flush of the whole area on every CPU (Linux vmalloc's lazy
 //! purge), done by `alloc` in thread context once `DIRTY_MAX` slots
-//! wait for it (or no clean slot is left): `free` runs at the end of a
+//! wait for it (or no clean slot is left): a stack is freed at the end of a
 //! context switch, where interrupts may be off and IPIs must not be
 //! waited for. Slots are taken lowest first, so the page tables of the
 //! area stay those of the stacks in use (they are never freed).
 //!
-//! Locking: `SLOTS` is a spin leaf, thread context only (`free` may
-//! run with interrupts off; no interrupt handler takes it); frames are
+//! A stack is a [`VmStack`], its slot's ownership token: dropping it
+//! frees the stack, so only its holder can (a task holds its own in a
+//! [`StackSlot`] until its exit hands it to the next task to free).
+//!
+//! Locking: `SLOTS` is a spin leaf, thread context only (a stack may be
+//! freed with interrupts off; no interrupt handler takes it); frames are
 //! allocated, mapped and freed outside it.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use super::vmalloc::VmArea;
 use crate::arch::paging::VMSTACK_START;
 use crate::sync::spin::Mutex;
 
@@ -43,6 +50,9 @@ const DIRTY_MAX: usize = 64;
 
 const PAGE_SIZE: u64 = 4096;
 const WORDS: usize = NR_SLOTS / 64;
+
+/// Pages of one stack
+const STACK_PAGES: usize = THREAD_SIZE / PAGE_SIZE as usize;
 
 /// End of the stack area
 const VMSTACK_END: u64 = VMSTACK_START + NR_SLOTS as u64 * SLOT_SIZE;
@@ -138,39 +148,140 @@ fn try_clean_slot() -> Option<usize> {
     }
 }
 
-/// Allocate a zeroed kernel stack; its base (lowest address; the top
-/// is `base + THREAD_SIZE`). Thread context (may flush every CPU's TLB).
-pub fn alloc() -> Option<u64> {
+/// A kernel stack from [`alloc`], owned: dropping it unmaps and frees
+/// its pages (code that runs on it, through its address, is `unsafe`
+/// and keeps the token meanwhile). A leaked one keeps its slot.
+///
+/// # Invariants
+///
+/// `0` is the stack pages of a slot `alloc` took for this holder alone,
+/// all mapped.
+#[must_use]
+pub struct VmStack(VmArea);
+
+impl VmStack {
+    /// The lowest address
+    #[inline]
+    pub fn base(&self) -> u64 {
+        self.0.base()
+    }
+
+    /// The top (`base + THREAD_SIZE`), where the stack starts
+    #[inline]
+    pub fn top(&self) -> u64 {
+        self.base() + THREAD_SIZE as u64
+    }
+
+    /// Keep it for good (a CPU's own stacks); its base
+    pub fn leak(self) -> u64 {
+        let base = self.base();
+        core::mem::forget(self);
+        base
+    }
+
+    /// The stack at `base`, out of a leaked token
+    ///
+    /// # Safety
+    ///
+    /// `base` is from [`leak`](Self::leak) of a stack no token holds
+    /// now (made again at most once).
+    unsafe fn from_base(base: u64) -> Self {
+        debug_assert!(contains(base) && (base - VMSTACK_START).is_multiple_of(SLOT_SIZE));
+        // SAFETY: the stack pages of `base`'s slot, from `alloc`, whose
+        // token is gone (the caller's guarantee)
+        // INVARIANT: as the leaked token's
+        Self(unsafe { VmArea::new(base, STACK_PAGES) })
+    }
+}
+
+impl Drop for VmStack {
+    /// Free it; this CPU's stale TLB entries go now, the other CPUs'
+    /// before the slot is reused
+    fn drop(&mut self) {
+        let base = self.base();
+        unmap(&mut self.0, STACK_PAGES);
+        release(((base - VMSTACK_START) / SLOT_SIZE) as usize);
+    }
+}
+
+/// The kernel stack a task owns (Linux task->stack), taken out once to
+/// be freed after its last switch away; empty for a task on a stack it
+/// does not own (the boot and idle stacks). A stack still in it when it
+/// is dropped is freed.
+///
+/// # Invariants
+///
+/// `base` is 0 or the base of a leaked [`VmStack`] this slot owns.
+pub struct StackSlot {
+    base: AtomicU64,
+}
+
+impl StackSlot {
+    /// No stack
+    pub const fn empty() -> Self {
+        // INVARIANT: 0
+        Self {
+            base: AtomicU64::new(0),
+        }
+    }
+
+    /// Hold `s` (the slot is empty)
+    pub fn set(&self, s: VmStack) {
+        // INVARIANT: a leaked token, held here from now on
+        let old = self.base.swap(s.leak(), Ordering::AcqRel);
+        assert_eq!(old, 0, "task stack set twice");
+    }
+
+    /// The stack, if still held: the slot is empty after
+    pub fn take(&self) -> Option<VmStack> {
+        // INVARIANT: 0, the stack handed to the caller
+        let base = self.base.swap(0, Ordering::AcqRel);
+        // SAFETY: a leaked token this slot owned (type invariant), taken
+        // out once by the swap
+        (base != 0).then(|| unsafe { VmStack::from_base(base) })
+    }
+}
+
+impl Drop for StackSlot {
+    fn drop(&mut self) {
+        drop(self.take());
+    }
+}
+
+/// Allocate a zeroed kernel stack. Thread context (may flush every
+/// CPU's TLB).
+pub fn alloc() -> Option<VmStack> {
     let slot = take_slot()?;
     let base = slot_base(slot);
-    for off in (0..THREAD_SIZE as u64).step_by(PAGE_SIZE as usize) {
-        let mapped = crate::FRAME_ALLOCATOR
-            .alloc()
-            .filter(|&pa| crate::arch::vmap_page(base + off, pa).is_ok());
-        if mapped.is_none() {
-            unmap(base, off);
+    // SAFETY: the stack pages of the slot just taken, ours alone until
+    // released
+    let mut area = unsafe { VmArea::new(base, STACK_PAGES) };
+    for i in 0..STACK_PAGES {
+        let mapped = crate::FRAME_ALLOCATOR.alloc().is_some_and(|pa| {
+            // SAFETY: a fresh frame, ours, handed to the area
+            let ok = unsafe { area.map(i, pa) };
+            if !ok {
+                crate::FRAME_ALLOCATOR.free(pa);
+            }
+            ok
+        });
+        if !mapped {
+            unmap(&mut area, i);
             release(slot);
             return None;
         }
     }
     // SAFETY: the pages just mapped
     unsafe { core::ptr::write_bytes(base as *mut u8, 0, THREAD_SIZE) };
-    Some(base)
+    // INVARIANT: the slot's stack pages, all mapped, ours alone
+    Some(VmStack(area))
 }
 
-/// Free the stack at `base` (from `alloc`): nothing runs on it any more
-pub fn free(base: u64) {
-    debug_assert!(contains(base) && (base - VMSTACK_START).is_multiple_of(SLOT_SIZE));
-    unmap(base, THREAD_SIZE as u64);
-    release(((base - VMSTACK_START) / SLOT_SIZE) as usize);
-}
-
-/// Unmap and free the first `len` bytes of the stack at `base`; this
+/// Unmap and free the first `pages` pages of the stack `area`; this
 /// CPU's stale entries go now, the other CPUs' before the slot is reused
-fn unmap(base: u64, len: u64) {
-    for off in (0..len).step_by(PAGE_SIZE as usize) {
-        if let Some(pa) = crate::arch::vunmap_page(base + off) {
-            crate::arch::tlb::local_flush_one(base + off);
+fn unmap(area: &mut VmArea, pages: usize) {
+    for i in 0..pages {
+        if let Some(pa) = area.unmap(i) {
             crate::FRAME_ALLOCATOR.free(pa);
         }
     }

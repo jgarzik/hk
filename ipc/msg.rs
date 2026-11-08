@@ -242,8 +242,9 @@ impl MsgQueue {
         ds.msg_cbytes = q.cbytes;
         ds.msg_qnum = q.qnum;
         ds.msg_qbytes = q.qbytes;
-        ds.msg_lspid = q.lspid;
-        ds.msg_lrpid = q.lrpid;
+        // In the caller's namespace (Linux msg: pid_vnr)
+        ds.msg_lspid = crate::task::pid::vnr(q.lspid as u64) as i32;
+        ds.msg_lrpid = crate::task::pid::vnr(q.lrpid as u64) as i32;
         ds.__unused4 = 0;
         ds.__unused5 = 0;
     }
@@ -313,9 +314,10 @@ pub fn sys_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> i64 {
 fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i32> {
     let ns = current_ipc_ns();
 
-    // Validate size
-    if msgsz > ns.msg_ctlmax as usize {
-        return Err(KernelError::MessageTooLong.errno());
+    // Linux do_msgsnd: a size past msgmax or negative as a long, or a
+    // negative id, is EINVAL
+    if msgsz > ns.msg_ctlmax as usize || (msgsz as i64) < 0 || msqid < 0 {
+        return Err(KernelError::InvalidArgument.errno());
     }
 
     // Read message type
@@ -381,6 +383,10 @@ pub fn sys_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32)
 }
 
 fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> Result<i32, i32> {
+    // Linux do_msgrcv: a negative id or size (as a long) is EINVAL
+    if msqid < 0 || (msgsz as i64) < 0 {
+        return Err(KernelError::InvalidArgument.errno());
+    }
     let ns = current_ipc_ns();
 
     // Find queue

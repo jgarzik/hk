@@ -25,7 +25,6 @@
 //! CONFIG_BPF_UNPRIV_DEFAULT_OFF) set, creating maps and loading
 //! programs needs CAP_BPF or CAP_SYS_ADMIN (EPERM). The sysctl takes
 //! 0..2 from CAP_SYS_ADMIN only, and 1 is permanent.
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -40,8 +39,9 @@ use super::map::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BpfMapOps, create_map};
 use super::prog::BpfProg;
 use super::verifier::{Kind, verify};
 use crate::arch::Uaccess;
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, put_user};
 use crate::util::error::KernelError;
+use crate::util::pod::FromBytes;
 
 // =============================================================================
 // Privilege (Linux kernel.unprivileged_bpf_disabled)
@@ -129,9 +129,9 @@ fn copy_insns(ptr: u64, n: usize) -> Result<Vec<BpfInsn>, KernelError> {
 }
 
 /// Get object info by fd
-pub const BPF_OBJ_GET_INFO_BY_FD: i32 = 29;
+pub const BPF_OBJ_GET_INFO_BY_FD: i32 = 15;
 /// Freeze a map (make read-only)
-pub const BPF_MAP_FREEZE: i32 = 38;
+pub const BPF_MAP_FREEZE: i32 = 22;
 
 // =============================================================================
 // BPF Program Types (Linux ABI)
@@ -239,45 +239,106 @@ pub struct ObjGetInfoAttr {
     pub info: u64,
 }
 
-/// Map info structure (returned by BPF_OBJ_GET_INFO_BY_FD)
+crate::pod!(
+    MapCreateAttr { map_type, key_size, value_size, max_entries, map_flags, inner_map_fd, numa_node, map_name };
+    MapElemAttr { map_fd, _pad0, key, value, flags };
+    ProgLoadAttr {
+        prog_type, insn_cnt, insns, license, log_level, log_size, log_buf, kern_version,
+        prog_flags, prog_name, prog_ifindex, expected_attach_type
+    };
+    ObjGetInfoAttr { bpf_fd, info_len, info }
+);
+
+/// struct bpf_map_info (Linux uapi, BPF_OBJ_GET_INFO_BY_FD); hk fills
+/// the map's own fields, the rest stays as the caller's or zero
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct BpfMapInfo {
-    /// Map type
     pub map_type: u32,
-    /// Map ID
     pub id: u32,
-    /// Key size
     pub key_size: u32,
-    /// Value size
     pub value_size: u32,
-    /// Max entries
     pub max_entries: u32,
-    /// Map flags
     pub map_flags: u32,
-    /// Map name
     pub name: [u8; 16],
+    pub ifindex: u32,
+    pub btf_vmlinux_value_type_id: u32,
+    pub netns_dev: u64,
+    pub netns_ino: u64,
+    pub btf_id: u32,
+    pub btf_key_type_id: u32,
+    pub btf_value_type_id: u32,
+    pub btf_vmlinux_id: u32,
+    pub map_extra: u64,
+    /// Where to store the map's hash (only frozen maps with a hash op)
+    pub hash: u64,
+    pub hash_size: u32,
+    pub _pad: u32,
 }
 
-/// Program info structure (returned by BPF_OBJ_GET_INFO_BY_FD)
+/// struct bpf_prog_info (Linux uapi); hk has no JIT, BTF, maps used by
+/// a program or run statistics, so those read as none
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct BpfProgInfo {
-    /// Program type
     pub prog_type: u32,
-    /// Program ID
     pub id: u32,
-    /// Tag (8 bytes)
     pub tag: [u8; 8],
-    /// jited_prog_len
     pub jited_prog_len: u32,
-    /// xlated_prog_len
     pub xlated_prog_len: u32,
-    /// jited_prog_insns
     pub jited_prog_insns: u64,
-    /// xlated_prog_insns
     pub xlated_prog_insns: u64,
+    pub load_time: u64,
+    pub created_by_uid: u32,
+    pub nr_map_ids: u32,
+    pub map_ids: u64,
+    pub name: [u8; 16],
+    pub ifindex: u32,
+    /// gpl_compatible:1, then padding bits
+    pub gpl_flags: u32,
+    pub netns_dev: u64,
+    pub netns_ino: u64,
+    pub nr_jited_ksyms: u32,
+    pub nr_jited_func_lens: u32,
+    pub jited_ksyms: u64,
+    pub jited_func_lens: u64,
+    pub btf_id: u32,
+    pub func_info_rec_size: u32,
+    pub func_info: u64,
+    pub nr_func_info: u32,
+    pub nr_line_info: u32,
+    pub line_info: u64,
+    pub jited_line_info: u64,
+    pub nr_jited_line_info: u32,
+    pub line_info_rec_size: u32,
+    pub jited_line_info_rec_size: u32,
+    pub nr_prog_tags: u32,
+    pub prog_tags: u64,
+    pub run_time_ns: u64,
+    pub run_cnt: u64,
+    pub recursion_misses: u64,
+    pub verified_insns: u32,
+    pub attach_btf_obj_id: u32,
+    pub attach_btf_id: u32,
+    pub _pad: u32,
 }
+
+crate::pod!(
+    BpfMapInfo {
+        map_type, id, key_size, value_size, max_entries, map_flags, name, ifindex,
+        btf_vmlinux_value_type_id, netns_dev, netns_ino, btf_id, btf_key_type_id,
+        btf_value_type_id, btf_vmlinux_id, map_extra, hash, hash_size, _pad
+    };
+    BpfProgInfo {
+        prog_type, id, tag, jited_prog_len, xlated_prog_len, jited_prog_insns,
+        xlated_prog_insns, load_time, created_by_uid, nr_map_ids, map_ids, name, ifindex,
+        gpl_flags, netns_dev, netns_ino, nr_jited_ksyms, nr_jited_func_lens, jited_ksyms,
+        jited_func_lens, btf_id, func_info_rec_size, func_info, nr_func_info, nr_line_info,
+        line_info, jited_line_info, nr_jited_line_info, line_info_rec_size,
+        jited_line_info_rec_size, nr_prog_tags, prog_tags, run_time_ns, run_cnt,
+        recursion_misses, verified_insns, attach_btf_obj_id, attach_btf_id, _pad
+    }
+);
 
 // =============================================================================
 // Syscall Implementation
@@ -313,7 +374,7 @@ pub fn sys_bpf(cmd: i32, attr: u64, size: u32) -> i64 {
         BPF_MAP_DELETE_ELEM => bpf_map_delete_elem(&attr_buf),
         BPF_MAP_GET_NEXT_KEY => bpf_map_get_next_key(&attr_buf),
         BPF_PROG_LOAD => bpf_prog_load(&attr_buf),
-        BPF_OBJ_GET_INFO_BY_FD => bpf_obj_get_info_by_fd(&attr_buf),
+        BPF_OBJ_GET_INFO_BY_FD => bpf_obj_get_info_by_fd(&attr_buf, attr),
         _ => KernelError::InvalidArgument.sysret(),
     }
 }
@@ -321,16 +382,13 @@ pub fn sys_bpf(cmd: i32, attr: u64, size: u32) -> i64 {
 /// Create a BPF map
 fn bpf_map_create(attr_buf: &[u8]) -> i64 {
     // Parse MapCreateAttr
-    if attr_buf.len() < size_of::<MapCreateAttr>() {
-        return KernelError::InvalidArgument.sysret();
-    }
     if let Err(e) = unpriv_ok() {
         return e.sysret();
     }
 
-    // Safety: we've verified the buffer is large enough
-    let attr: MapCreateAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<MapCreateAttr>()) };
+    let Some(attr) = MapCreateAttr::read_from(attr_buf) else {
+        return KernelError::InvalidArgument.sysret();
+    };
 
     // Validate map type
     match attr.map_type {
@@ -359,12 +417,9 @@ fn bpf_map_create(attr_buf: &[u8]) -> i64 {
 
 /// Look up an element in a map
 fn bpf_map_lookup_elem(attr_buf: &[u8]) -> i64 {
-    if attr_buf.len() < size_of::<MapElemAttr>() {
+    let Some(attr) = MapElemAttr::read_from(attr_buf) else {
         return KernelError::InvalidArgument.sysret();
-    }
-
-    let attr: MapElemAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<MapElemAttr>()) };
+    };
 
     // Get map from fd
     let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
@@ -394,12 +449,9 @@ fn bpf_map_lookup_elem(attr_buf: &[u8]) -> i64 {
 
 /// Update an element in a map
 fn bpf_map_update_elem(attr_buf: &[u8]) -> i64 {
-    if attr_buf.len() < size_of::<MapElemAttr>() {
+    let Some(attr) = MapElemAttr::read_from(attr_buf) else {
         return KernelError::InvalidArgument.sysret();
-    }
-
-    let attr: MapElemAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<MapElemAttr>()) };
+    };
 
     // Get map from fd
     let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
@@ -430,12 +482,9 @@ fn bpf_map_update_elem(attr_buf: &[u8]) -> i64 {
 
 /// Delete an element from a map
 fn bpf_map_delete_elem(attr_buf: &[u8]) -> i64 {
-    if attr_buf.len() < size_of::<MapElemAttr>() {
+    let Some(attr) = MapElemAttr::read_from(attr_buf) else {
         return KernelError::InvalidArgument.sysret();
-    }
-
-    let attr: MapElemAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<MapElemAttr>()) };
+    };
 
     // Get map from fd
     let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
@@ -459,12 +508,9 @@ fn bpf_map_delete_elem(attr_buf: &[u8]) -> i64 {
 
 /// Get the next key in a map
 fn bpf_map_get_next_key(attr_buf: &[u8]) -> i64 {
-    if attr_buf.len() < size_of::<MapElemAttr>() {
+    let Some(attr) = MapElemAttr::read_from(attr_buf) else {
         return KernelError::InvalidArgument.sysret();
-    }
-
-    let attr: MapElemAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<MapElemAttr>()) };
+    };
 
     // Get map from fd
     let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
@@ -499,12 +545,9 @@ fn bpf_map_get_next_key(attr_buf: &[u8]) -> i64 {
 
 /// Load a BPF program
 fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
-    if attr_buf.len() < size_of::<ProgLoadAttr>() {
+    let Some(attr) = ProgLoadAttr::read_from(attr_buf) else {
         return KernelError::InvalidArgument.sysret();
-    }
-
-    let attr: ProgLoadAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<ProgLoadAttr>()) };
+    };
 
     if let Err(e) = unpriv_ok() {
         return e.sysret();
@@ -551,60 +594,126 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
     }
 }
 
+/// The caller's info buffer, as much of it as the kernel knows
+/// (Linux bpf_check_uarg_tail_zero, then copy_from_user of
+/// min(info_len, sizeof)): past PAGE_SIZE, or nonzero bytes past the
+/// kernel's struct, is E2BIG
+fn info_in<T: crate::util::pod::Pod>(ptr: u64, info_len: u32) -> Result<(T, usize), KernelError> {
+    let ulen = info_len as usize;
+    if ulen > crate::mm::filemap::PAGE_SIZE {
+        return Err(KernelError::ArgListTooLong);
+    }
+    let len = ulen.min(size_of::<T>());
+    if ulen > len {
+        let mut tail = [0u8; 64];
+        let mut at = len;
+        while at < ulen {
+            let n = (ulen - at).min(tail.len());
+            let src = ptr.checked_add(at as u64).ok_or(KernelError::BadAddress)?;
+            copy_from_user::<Uaccess>(&mut tail[..n], src, n)
+                .map_err(|_| KernelError::BadAddress)?;
+            if tail[..n].iter().any(|&b| b != 0) {
+                return Err(KernelError::ArgListTooLong);
+            }
+            at += n;
+        }
+    }
+    let mut info = T::zeroed();
+    copy_from_user::<Uaccess>(&mut info.as_bytes_mut()[..len], ptr, len)
+        .map_err(|_| KernelError::BadAddress)?;
+    Ok((info, len))
+}
+
+/// Copy `info`'s first `len` bytes out and store `len` in the caller's
+/// attr.info.info_len (Linux: copy_to_user, put_user)
+fn info_out<T: crate::util::pod::IntoBytes>(
+    info: &T,
+    len: usize,
+    ptr: u64,
+    uattr: u64,
+) -> Result<(), KernelError> {
+    copy_to_user::<Uaccess>(ptr, &info.as_bytes()[..len]).map_err(|_| KernelError::BadAddress)?;
+    let at = uattr.checked_add(4).ok_or(KernelError::BadAddress)?;
+    put_user::<Uaccess, u32>(at, len as u32).map_err(|_| KernelError::BadAddress)
+}
+
+/// BPF_OBJ_GET_INFO_BY_FD on a map (Linux bpf_map_get_info_by_fd)
+fn map_info(
+    map: &super::map::BpfMap,
+    attr: &ObjGetInfoAttr,
+    uattr: u64,
+) -> Result<(), KernelError> {
+    let (mut info, len) = info_in::<BpfMapInfo>(attr.info, attr.info_len)?;
+    info.map_type = map.map_type();
+    info.id = map.id;
+    info.key_size = map.key_size();
+    info.value_size = map.value_size();
+    info.max_entries = map.max_entries();
+    info.map_flags = map.flags;
+    info.map_extra = 0;
+    info.name = [0; 16];
+    // No map has a hash op (Linux: EINVAL for a hash request without
+    // one, or a hash size without a hash)
+    if info.hash != 0 || info.hash_size != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    info_out(&info, len, attr.info, uattr)
+}
+
+/// BPF_OBJ_GET_INFO_BY_FD on a program (Linux bpf_prog_get_info_by_fd):
+/// the caller's array pointers and sizes in, the counts out; the
+/// translated instructions are copied when asked for
+fn prog_info(
+    prog: &BpfProg,
+    prog_type: u32,
+    attr: &ObjGetInfoAttr,
+    uattr: u64,
+) -> Result<(), KernelError> {
+    let (mut info, len) = info_in::<BpfProgInfo>(attr.info, attr.info_len)?;
+    info.prog_type = prog_type;
+    info.id = 0;
+    info.tag = [0; 8];
+    info.name = [0; 16];
+    info.nr_map_ids = 0;
+    info.jited_prog_len = 0;
+    info.nr_jited_ksyms = 0;
+    info.nr_jited_func_lens = 0;
+    info.nr_func_info = 0;
+    info.nr_line_info = 0;
+    info.nr_jited_line_info = 0;
+    info.btf_id = 0;
+    info.verified_insns = 0;
+    let insns = crate::util::pod::slice_bytes(prog.insns());
+    let ulen = info.xlated_prog_len as usize;
+    info.xlated_prog_len = insns.len() as u32;
+    if !insns.is_empty() && ulen != 0 && info.xlated_prog_insns != 0 {
+        let n = ulen.min(insns.len());
+        copy_to_user::<Uaccess>(info.xlated_prog_insns, &insns[..n])
+            .map_err(|_| KernelError::BadAddress)?;
+    }
+    // One program, one tag (Linux: func_cnt or 1)
+    let tags = info.nr_prog_tags;
+    info.nr_prog_tags = 1;
+    if tags != 0 && info.prog_tags != 0 {
+        copy_to_user::<Uaccess>(info.prog_tags, &[0u8; 8]).map_err(|_| KernelError::BadAddress)?;
+    }
+    info_out(&info, len, attr.info, uattr)
+}
+
 /// Get object info by fd
-fn bpf_obj_get_info_by_fd(attr_buf: &[u8]) -> i64 {
-    if attr_buf.len() < size_of::<ObjGetInfoAttr>() {
+fn bpf_obj_get_info_by_fd(attr_buf: &[u8], uattr: u64) -> i64 {
+    let Some(attr) = ObjGetInfoAttr::read_from(attr_buf) else {
         return KernelError::InvalidArgument.sysret();
+    };
+    let r = if let Ok(map) = get_bpf_map_from_fd(attr.bpf_fd as i32) {
+        map_info(&map, &attr, uattr)
+    } else if let Ok((prog, prog_type)) = get_bpf_prog_info_from_fd(attr.bpf_fd as i32) {
+        prog_info(&prog, prog_type, &attr, uattr)
+    } else {
+        Err(KernelError::BadFd)
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
     }
-
-    let attr: ObjGetInfoAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<ObjGetInfoAttr>()) };
-
-    // Try to get as map first
-    if let Ok(map) = get_bpf_map_from_fd(attr.bpf_fd as i32) {
-        let info = BpfMapInfo {
-            map_type: map.map_type(),
-            id: map.id,
-            key_size: map.key_size(),
-            value_size: map.value_size(),
-            max_entries: map.max_entries(),
-            map_flags: map.flags,
-            name: [0; 16],
-        };
-
-        let info_size = core::cmp::min(attr.info_len as usize, size_of::<BpfMapInfo>());
-        let info_bytes =
-            unsafe { core::slice::from_raw_parts((&raw const info).cast::<u8>(), info_size) };
-
-        if copy_to_user::<Uaccess>(attr.info, info_bytes).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-
-        return 0;
-    }
-
-    // Try to get as program
-    if let Ok((prog, prog_type)) = get_bpf_prog_info_from_fd(attr.bpf_fd as i32) {
-        let info = BpfProgInfo {
-            prog_type,
-            id: 0, // Would need a global prog ID counter
-            tag: [0; 8],
-            jited_prog_len: 0,
-            xlated_prog_len: (prog.len() * size_of::<BpfInsn>()) as u32,
-            jited_prog_insns: 0,
-            xlated_prog_insns: 0,
-        };
-
-        let info_size = core::cmp::min(attr.info_len as usize, size_of::<BpfProgInfo>());
-        let info_bytes =
-            unsafe { core::slice::from_raw_parts((&raw const info).cast::<u8>(), info_size) };
-
-        if copy_to_user::<Uaccess>(attr.info, info_bytes).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-
-        return 0;
-    }
-
-    KernelError::BadFd.sysret()
 }

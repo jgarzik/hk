@@ -357,137 +357,129 @@ fn table_signature(phys: u64) -> Option<[u8; 4]> {
     let ptr = unsafe { ioremap(phys, size) }.ok()?;
     // SAFETY: the header is mapped; the signature is its first 4 bytes
     let sig = unsafe { core::ptr::read_unaligned(ptr as *const [u8; 4]) };
-    iounmap(ptr, size);
+    // SAFETY: the mapping just made, no longer used
+    unsafe { iounmap(ptr, size) };
     Some(sig)
 }
 
 /// Parse MADT and extract CPU/APIC information (uses ioremap)
 fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
-    unsafe {
-        // Map the MADT
-        let madt_ptr = map_acpi_table(madt_phys)?;
-
-        // Read length from SDT header (offset 4) first for checksum validation
-        let length_ptr = madt_ptr.add(4) as *const u32;
-        let madt_length = core::ptr::read_unaligned(length_ptr) as usize;
-
-        // Validate MADT checksum (warn but continue per Linux behavior)
-        validate_table_checksum(madt_ptr.cast_const(), madt_length, "MADT");
-
-        // Read fields using offsets (packed struct)
-        // MadtHeader layout: SdtHeader (36 bytes) + lapic_address (4) + flags (4)
-        let lapic_addr_ptr = madt_ptr.add(36) as *const u32;
-        let lapic_base = u64::from(core::ptr::read_unaligned(lapic_addr_ptr));
-
-        let mut info = AcpiInfo {
-            lapic_base,
-            cpus: Vec::new(),
-            ioapics: Vec::new(),
-            bsp_apic_id: 0,   // Will be set after LAPIC is mapped
-            power_info: None, // Will be set after FADT parsing
-        };
-
-        let entries_start = madt_ptr.add(core::mem::size_of::<MadtHeader>());
-        let entries_end = madt_ptr.add(madt_length);
-
-        // Track if we found LAPIC entries (for X2APIC duplicate filtering)
-        let mut has_lapic_cpus = false;
-
-        let mut ptr = entries_start;
-        while ptr < entries_end {
-            // MadtEntryHeader: entry_type (1 byte) + length (1 byte)
-            let entry_type = core::ptr::read_unaligned(ptr);
-            let entry_len = core::ptr::read_unaligned(ptr.add(1)) as usize;
-
-            if entry_len == 0 {
-                break; // Prevent infinite loop on malformed tables
-            }
-
-            match entry_type {
-                MADT_ENTRY_LAPIC => {
-                    // MadtLapic: header (2) + processor_id (1) + apic_id (1) + flags (4)
-                    let flags = core::ptr::read_unaligned(ptr.add(4) as *const u32);
-                    // Bit 0: Processor Enabled
-                    // Bit 1: Online Capable (ACPI 6.3+)
-                    let enabled = (flags & 0x1) != 0 || (flags & 0x2) != 0;
-
-                    if enabled {
-                        has_lapic_cpus = true;
-                        let apic_id = u32::from(core::ptr::read_unaligned(ptr.add(3)));
-                        info.cpus.push(CpuInfo {
-                            apic_id,
-                            enabled,
-                            is_bsp: false, // Will be set after LAPIC is mapped
-                        });
-                    }
-                }
-
-                MADT_ENTRY_X2APIC => {
-                    // X2APIC: header (2) + reserved (2) + x2apic_id (4) + flags (4) + uid (4)
-                    let x2apic_id = core::ptr::read_unaligned(ptr.add(4) as *const u32);
-                    let flags = core::ptr::read_unaligned(ptr.add(8) as *const u32);
-                    let enabled = (flags & 0x1) != 0 || (flags & 0x2) != 0;
-
-                    // Ignore invalid ID (0xffffffff)
-                    if x2apic_id == 0xffffffff {
-                        // skip
-                    }
-                    // Per ACPI spec: if LAPIC entries exist, X2APIC entries with ID < 0xff
-                    // are duplicates and should be ignored
-                    else if has_lapic_cpus && x2apic_id < 0xff {
-                        // skip duplicate
-                    } else if enabled {
-                        info.cpus.push(CpuInfo {
-                            apic_id: x2apic_id,
-                            enabled,
-                            is_bsp: false,
-                        });
-                    }
-                }
-
-                MADT_ENTRY_IOAPIC => {
-                    // IOAPIC: header (2) + id (1) + reserved (1) + address (4) + gsi_base (4)
-                    let id = core::ptr::read_unaligned(ptr.add(2));
-                    let address = core::ptr::read_unaligned(ptr.add(4) as *const u32);
-                    let gsi_base = core::ptr::read_unaligned(ptr.add(8) as *const u32);
-
-                    info.ioapics.push(IoApicInfo {
-                        id,
-                        address,
-                        gsi_base,
-                    });
-                }
-
-                MADT_ENTRY_LAPIC_64 => {
-                    // MadtLapicAddrOverride: header (2) + reserved (2) + address (8)
-                    let addr_ptr = ptr.add(4) as *const u64;
-                    info.lapic_base = core::ptr::read_unaligned(addr_ptr);
-                }
-
-                MADT_ENTRY_ISO | MADT_ENTRY_LAPIC_NMI => {
-                    // Interrupt source override and LAPIC NMI entries
-                    // Not needed for basic SMP boot
-                }
-
-                _ => {
-                    // Unknown entry type, skip
-                }
-            }
-
-            ptr = ptr.add(entry_len);
-        }
-
-        // Unmap the MADT
-        iounmap(madt_ptr, madt_length as u64);
-
-        if info.cpus.is_empty() {
-            return Err("No CPUs found in MADT");
-        }
-
-        Ok(info)
-    }
+    let ptr = map_acpi_table(madt_phys)?;
+    // SAFETY: map_acpi_table mapped the table, header included
+    let len = unsafe { core::ptr::read_unaligned(ptr.add(4).cast::<u32>()) } as usize;
+    // Validate MADT checksum (warn but continue per Linux behavior)
+    validate_table_checksum(ptr.cast_const(), len, "MADT");
+    // SAFETY: map_acpi_table mapped the `len` bytes the header claims:
+    // firmware's table, which nothing writes; the slice is gone before
+    // the iounmap below
+    let info = parse_madt(unsafe { core::slice::from_raw_parts(ptr.cast_const(), len) });
+    // SAFETY: the table's mapping, no longer used (the slice is gone)
+    unsafe { iounmap(ptr, len as u64) };
+    info
 }
 
+/// Little-endian u32 at `off` in `b` (None past its end)
+fn le32(b: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
+}
+
+/// The subtables of an ACPI table's body (MADT: `[type, length, ...]`
+/// each). A length under 2 or past the table is an error, as in Linux
+/// acpi_parse_entries_array ("Invalid zero length", an entry past the
+/// table end); trailing bytes too short for a header end the walk.
+fn subtables(mut b: &[u8]) -> impl Iterator<Item = Result<&[u8], &'static str>> {
+    core::iter::from_fn(move || {
+        let len = usize::from(*b.get(1)?);
+        if len < 2 || len > b.len() {
+            b = &[];
+            return Some(Err("MADT entry length invalid"));
+        }
+        let (e, rest) = b.split_at(len);
+        b = rest;
+        Some(Ok(e))
+    })
+}
+
+/// The CPUs and I/O APICs of a MADT (`t`: the whole table). Each entry
+/// is read only inside the table and only if long enough for its type:
+/// a short one fails the table (Linux BAD_MADT_ENTRY in the
+/// acpi_parse_lapic/x2apic/ioapic handlers).
+fn parse_madt(t: &[u8]) -> Result<AcpiInfo, &'static str> {
+    const BAD: &str = "MADT entry too short";
+    let hdr = core::mem::size_of::<MadtHeader>();
+    if t.len() < hdr {
+        return Err("MADT shorter than its header");
+    }
+    let mut info = AcpiInfo {
+        lapic_base: u64::from(le32(t, 36).ok_or(BAD)?),
+        cpus: Vec::new(),
+        ioapics: Vec::new(),
+        bsp_apic_id: 0,   // Will be set after LAPIC is mapped
+        power_info: None, // Will be set after FADT parsing
+    };
+    // Track if we found LAPIC entries (for X2APIC duplicate filtering)
+    let mut has_lapic_cpus = false;
+    for e in subtables(&t[hdr..]) {
+        let e = e?;
+        match e[0] {
+            MADT_ENTRY_LAPIC => {
+                // header (2) + processor_id (1) + apic_id (1) + flags (4)
+                let flags = le32(e, 4).ok_or(BAD)?;
+                // Bit 0: Processor Enabled; bit 1: Online Capable (ACPI 6.3+)
+                if flags & 0x3 != 0 {
+                    has_lapic_cpus = true;
+                    info.cpus.push(CpuInfo {
+                        apic_id: u32::from(e[3]),
+                        enabled: true,
+                        is_bsp: false, // Will be set after LAPIC is mapped
+                    });
+                }
+            }
+            MADT_ENTRY_X2APIC => {
+                // header (2) + reserved (2) + x2apic_id (4) + flags (4) + uid (4)
+                if e.len() < 16 {
+                    return Err(BAD);
+                }
+                let x2apic_id = le32(e, 4).ok_or(BAD)?;
+                let flags = le32(e, 8).ok_or(BAD)?;
+                // Ignore the invalid id; per the ACPI spec, with LAPIC
+                // entries present an X2APIC id below 0xff is a duplicate
+                let dup = x2apic_id == 0xffff_ffff || (has_lapic_cpus && x2apic_id < 0xff);
+                if !dup && flags & 0x3 != 0 {
+                    info.cpus.push(CpuInfo {
+                        apic_id: x2apic_id,
+                        enabled: true,
+                        is_bsp: false,
+                    });
+                }
+            }
+            MADT_ENTRY_IOAPIC => {
+                // header (2) + id (1) + reserved (1) + address (4) + gsi_base (4)
+                if e.len() < 12 {
+                    return Err(BAD);
+                }
+                info.ioapics.push(IoApicInfo {
+                    id: e[2],
+                    address: le32(e, 4).ok_or(BAD)?,
+                    gsi_base: le32(e, 8).ok_or(BAD)?,
+                });
+            }
+            MADT_ENTRY_LAPIC_64 => {
+                // header (2) + reserved (2) + address (8)
+                let b = e.get(4..12).ok_or(BAD)?;
+                info.lapic_base = u64::from_le_bytes(b.try_into().map_err(|_| BAD)?);
+            }
+            // Interrupt source overrides, LAPIC NMIs and the rest are not
+            // needed for basic SMP boot
+            MADT_ENTRY_ISO | MADT_ENTRY_LAPIC_NMI => {}
+            _ => {}
+        }
+    }
+    if info.cpus.is_empty() {
+        return Err("No CPUs found in MADT");
+    }
+    Ok(info)
+}
 /// FADT field offsets (ACPI 6.5 table 5.9)
 mod fadt {
     pub const DSDT: usize = 40;
@@ -581,7 +573,8 @@ fn parse_fadt_mapped(fadt_phys: u64) -> Result<(PowerInfo, u64), &'static str> {
 
     let reset = reset_reg(&t);
 
-    iounmap(ptr, len as u64);
+    // SAFETY: the table's mapping, no longer used (`t` is done)
+    unsafe { iounmap(ptr, len as u64) };
     let power = PowerInfo {
         pm,
         s5: SleepType::default(),
@@ -654,7 +647,8 @@ fn table_s5(phys: u64, sig: &[u8; 4]) -> Option<SleepType> {
     } else {
         None
     };
-    iounmap(ptr, len as u64);
+    // SAFETY: the table's mapping, no longer used (`body` is gone)
+    unsafe { iounmap(ptr, len as u64) };
     s5
 }
 
@@ -764,174 +758,123 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
 
 /// Parse SRAT table and populate NUMA topology
 fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
+    let ptr = map_acpi_table(srat_phys)?;
+    // SAFETY: map_acpi_table mapped the table, header included
+    let len = unsafe { core::ptr::read_unaligned(ptr.add(4).cast::<u32>()) } as usize;
+    validate_table_checksum(ptr.cast_const(), len, "SRAT");
+    // SAFETY: map_acpi_table mapped the `len` bytes the header claims:
+    // firmware's table, which nothing writes; the slice is gone before
+    // the iounmap below
+    let r = parse_srat(unsafe { core::slice::from_raw_parts(ptr.cast_const(), len) });
+    // SAFETY: the table's mapping, no longer used (the slice is gone)
+    unsafe { iounmap(ptr, len as u64) };
+    r
+}
+
+/// The SRAT's affinity entries past its 48-byte header (SdtHeader +
+/// 12 reserved bytes), each long enough for its type. A bad entry
+/// length, or an affinity entry shorter than its structure, rejects the
+/// whole table, as Linux's bad_srat() turns SRAT NUMA off
+/// (acpi_numa_memory_affinity_init, acpi_numa_processor_affinity_init).
+fn srat_body(t: &[u8]) -> Result<&[u8], &'static str> {
+    let body = t.get(48..).ok_or("SRAT shorter than its header")?;
+    for e in subtables(body) {
+        let e = e.map_err(|_| "SRAT entry length invalid")?;
+        let need = match e[0] {
+            SRAT_ENTRY_LAPIC_AFFINITY => 16,
+            SRAT_ENTRY_MEMORY_AFFINITY => 40,
+            SRAT_ENTRY_X2APIC_AFFINITY => 24,
+            _ => 2,
+        };
+        if e.len() < need {
+            return Err("SRAT entry too short");
+        }
+    }
+    Ok(body)
+}
+
+/// Fill NUMA_TOPOLOGY from a SRAT (`t`: the whole table)
+fn parse_srat(t: &[u8]) -> Result<(), &'static str> {
     use crate::mm::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode};
 
-    unsafe {
-        // Map the SRAT
-        let srat_ptr = map_acpi_table(srat_phys)?;
+    let entries = srat_body(t)?;
+    let mut topology = NUMA_TOPOLOGY.lock();
 
-        // Read length from SDT header (offset 4)
-        let length_ptr = srat_ptr.add(4) as *const u32;
-        let srat_length = core::ptr::read_unaligned(length_ptr) as usize;
+    // Number the proximity domains first, in Linux's order
+    srat_pxm_order(entries, |pxm| {
+        let _ = topology.acpi_map_pxm(pxm);
+    });
 
-        // Validate SRAT checksum
-        validate_table_checksum(srat_ptr.cast_const(), srat_length, "SRAT");
+    // First pass: memory affinity entries build the nodes. Memory
+    // Affinity Structure (length 40): 0 type, 1 length, 2 proximity
+    // domain (4), 8 base lo/hi (8), 16 length lo/hi (8), 28 flags (4)
+    for e in srat_entries(entries).filter(|e| e[0] == SRAT_ENTRY_MEMORY_AFFINITY) {
+        // srat_body checked the length
+        let rd = |o: usize| u64::from(le32(e, o).unwrap_or(0));
+        // Bit 0: Enabled
+        if rd(28) & 1 == 0 {
+            continue;
+        }
+        let base_addr = rd(8) | (rd(12) << 32);
+        let length = rd(16) | (rd(20) << 32);
+        let node_id = topology.pxm_to_node(rd(2) as u32).unwrap_or(MAX_NUMA_NODES);
+        if node_id >= MAX_NUMA_NODES || length == 0 {
+            continue;
+        }
+        let start_pfn = base_addr / 4096;
+        // firmware's numbers: a range past 2^64 ends there
+        let end_pfn = base_addr.saturating_add(length) / 4096;
+        let pages = length / 4096;
 
-        // SRAT header: SdtHeader (36) + Reserved (4) + Reserved (8) = 48 bytes
-        let entries_start = srat_ptr.add(48);
-        let entries_end = srat_ptr.add(srat_length);
-
-        let mut topology = NUMA_TOPOLOGY.lock();
-
-        // Number the proximity domains first, in Linux's order
-        let entries = core::slice::from_raw_parts(
-            entries_start,
-            entries_end.offset_from(entries_start) as usize,
-        );
-        srat_pxm_order(entries, |pxm| {
-            let _ = topology.acpi_map_pxm(pxm);
-        });
-
-        // First pass: collect memory affinity entries to build nodes
-        let mut ptr = entries_start;
-        while ptr < entries_end {
-            let entry_type = core::ptr::read_unaligned(ptr);
-            let entry_len = core::ptr::read_unaligned(ptr.add(1)) as usize;
-
-            if entry_len == 0 {
-                break;
-            }
-
-            if entry_type == SRAT_ENTRY_MEMORY_AFFINITY {
-                // Memory Affinity Structure (length 40):
-                // 0: type (1), 1: length (1), 2: proximity_domain_lo (4)
-                // 6: reserved (2), 8: base_addr_lo (4), 12: base_addr_hi (4)
-                // 16: length_lo (4), 20: length_hi (4), 24: reserved (4)
-                // 28: flags (4), 32: reserved (8)
-                let prox_domain_lo = core::ptr::read_unaligned(ptr.add(2) as *const u32);
-                let base_lo = u64::from(core::ptr::read_unaligned(ptr.add(8) as *const u32));
-                let base_hi = u64::from(core::ptr::read_unaligned(ptr.add(12) as *const u32));
-                let len_lo = u64::from(core::ptr::read_unaligned(ptr.add(16) as *const u32));
-                let len_hi = u64::from(core::ptr::read_unaligned(ptr.add(20) as *const u32));
-                let flags = core::ptr::read_unaligned(ptr.add(28) as *const u32);
-
-                // Bit 0: Enabled
-                let enabled = (flags & 0x1) != 0;
-
-                if enabled {
-                    let base_addr = base_lo | (base_hi << 32);
-                    let length = len_lo | (len_hi << 32);
-                    let node_id = topology
-                        .pxm_to_node(prox_domain_lo)
-                        .unwrap_or(MAX_NUMA_NODES);
-
-                    if node_id < MAX_NUMA_NODES && length > 0 {
-                        let start_pfn = base_addr / 4096;
-                        let end_pfn = (base_addr + length) / 4096;
-                        let pages = length / 4096;
-
-                        // Get or create node
-                        if topology.nodes[node_id].is_none() {
-                            topology.nodes[node_id] = Some(NumaNode::new(node_id as u32));
-                            topology.node_online_mask |= 1u64 << node_id;
-                        }
-
-                        if let Some(ref mut node) = topology.nodes[node_id] {
-                            // Extend node's memory range (SRAT can have multiple entries per node)
-                            if node.start_pfn == 0 || start_pfn < node.start_pfn {
-                                node.start_pfn = start_pfn;
-                            }
-                            if end_pfn > node.end_pfn {
-                                node.end_pfn = end_pfn;
-                            }
-                            node.present_pages += pages;
-                        }
-                    }
-                }
-            }
-
-            ptr = ptr.add(entry_len);
+        // Get or create node
+        if topology.nodes[node_id].is_none() {
+            topology.nodes[node_id] = Some(NumaNode::new(node_id as u32));
+            topology.node_online_mask |= 1u64 << node_id;
         }
 
-        // Second pass: collect CPU affinity entries
-        ptr = entries_start;
-        while ptr < entries_end {
-            let entry_type = core::ptr::read_unaligned(ptr);
-            let entry_len = core::ptr::read_unaligned(ptr.add(1)) as usize;
-
-            if entry_len == 0 {
-                break;
+        if let Some(ref mut node) = topology.nodes[node_id] {
+            // Extend node's memory range (SRAT can have multiple entries per node)
+            if node.start_pfn == 0 || start_pfn < node.start_pfn {
+                node.start_pfn = start_pfn;
             }
-
-            match entry_type {
-                SRAT_ENTRY_LAPIC_AFFINITY => {
-                    // Processor Local APIC Affinity (length 16):
-                    // 0: type (1), 1: length (1), 2: proximity_domain_lo (1)
-                    // 3: apic_id (1), 4: flags (4), 8: sapic_eid (1)
-                    // 9: proximity_domain_hi (3), 12: clock_domain (4)
-                    let prox_domain_lo = u32::from(core::ptr::read_unaligned(ptr.add(2)));
-                    let apic_id = u32::from(core::ptr::read_unaligned(ptr.add(3)));
-                    let flags = core::ptr::read_unaligned(ptr.add(4) as *const u32);
-                    let prox_hi_bytes: [u8; 3] = [
-                        core::ptr::read_unaligned(ptr.add(9)),
-                        core::ptr::read_unaligned(ptr.add(10)),
-                        core::ptr::read_unaligned(ptr.add(11)),
-                    ];
-                    let prox_domain_hi = u32::from(prox_hi_bytes[0])
-                        | (u32::from(prox_hi_bytes[1]) << 8)
-                        | (u32::from(prox_hi_bytes[2]) << 16);
-
-                    let enabled = (flags & 0x1) != 0;
-
-                    if enabled {
-                        let node_id = topology
-                            .pxm_to_node(prox_domain_lo | (prox_domain_hi << 8))
-                            .unwrap_or(MAX_NUMA_NODES);
-                        // By APIC id: the logical CPU joins at bring-up
-                        if node_id < MAX_NUMA_NODES {
-                            topology.set_hwid_node(u64::from(apic_id), node_id as u32);
-                        }
-                    }
-                }
-
-                SRAT_ENTRY_X2APIC_AFFINITY => {
-                    // Processor Local x2APIC Affinity (length 24):
-                    // 0: type (1), 1: length (1), 2: reserved (2)
-                    // 4: proximity_domain (4), 8: x2apic_id (4)
-                    // 12: flags (4), 16: clock_domain (4), 20: reserved (4)
-                    let prox_domain = core::ptr::read_unaligned(ptr.add(4) as *const u32);
-                    let x2apic_id = core::ptr::read_unaligned(ptr.add(8) as *const u32);
-                    let flags = core::ptr::read_unaligned(ptr.add(12) as *const u32);
-
-                    let enabled = (flags & 0x1) != 0;
-
-                    if enabled {
-                        let node_id = topology.pxm_to_node(prox_domain).unwrap_or(MAX_NUMA_NODES);
-                        // By x2APIC id: the logical CPU joins at bring-up
-                        if node_id < MAX_NUMA_NODES {
-                            topology.set_hwid_node(u64::from(x2apic_id), node_id as u32);
-                        }
-                    }
-                }
-
-                _ => {}
+            if end_pfn > node.end_pfn {
+                node.end_pfn = end_pfn;
             }
-
-            ptr = ptr.add(entry_len);
+            node.present_pages = node.present_pages.saturating_add(pages);
         }
-
-        // Update node count
-        topology.nr_nodes = topology.node_online_mask.count_ones() as usize;
-
-        // Unmap the SRAT
-        iounmap(srat_ptr, srat_length as u64);
-
-        if topology.nr_nodes == 0 {
-            return Err("SRAT contained no valid nodes");
-        }
-
-        Ok(())
     }
+
+    // Second pass: CPU affinity entries, by APIC id (the logical CPU
+    // joins its node at bring-up)
+    for e in srat_entries(entries) {
+        let hwid = match e[0] {
+            // Processor Local APIC Affinity (length 16): 2 proximity
+            // domain lo (1), 3 apic_id (1), 4 flags (4), 9 domain hi (3)
+            SRAT_ENTRY_LAPIC_AFFINITY => u64::from(e[3]),
+            // Processor Local x2APIC Affinity (length 24): 4 proximity
+            // domain (4), 8 x2apic_id (4), 12 flags (4)
+            SRAT_ENTRY_X2APIC_AFFINITY => u64::from(le32(e, 8).unwrap_or(0)),
+            _ => continue,
+        };
+        // srat_entry_pxm: the domain of an enabled entry (Linux numbering)
+        let Some(pxm) = srat_entry_pxm(e) else {
+            continue;
+        };
+        if let Some(node_id) = topology.pxm_to_node(pxm)
+            && node_id < MAX_NUMA_NODES
+        {
+            topology.set_hwid_node(hwid, node_id as u32);
+        }
+    }
+
+    // Update node count
+    topology.nr_nodes = topology.node_online_mask.count_ones() as usize;
+
+    if topology.nr_nodes == 0 {
+        return Err("SRAT contained no valid nodes");
+    }
+
+    Ok(())
 }
 
 /// Parse SLIT table for inter-node distance matrix
@@ -1042,5 +985,74 @@ mod tests {
         let mut bad = lapic(1);
         bad[1] = 0;
         assert_eq!(order(&[&lapic(2), &bad, &lapic(3)]), [2]);
+    }
+
+    /// A table: `hdr` header bytes (lapic_address 0xfee00000 at 36 if
+    /// they reach it), then `parts`
+    fn table(hdr: usize, parts: &[&[u8]]) -> alloc::vec::Vec<u8> {
+        let mut t = alloc::vec![0u8; hdr];
+        if hdr >= 40 {
+            t[36..40].copy_from_slice(&0xfee0_0000u32.to_le_bytes());
+        }
+        t.extend(parts.iter().flat_map(|p| p.iter().copied()));
+        t
+    }
+
+    const MADT_LAPIC: [u8; 8] = [MADT_ENTRY_LAPIC, 8, 0, 3, 1, 0, 0, 0];
+    const MADT_IOAPIC: [u8; 12] = [MADT_ENTRY_IOAPIC, 12, 2, 0, 0, 0, 0xc0, 0xfe, 0, 0, 0, 0];
+
+    #[test]
+    fn madt_parses_in_bounds() {
+        let i = parse_madt(&table(44, &[&MADT_LAPIC, &MADT_IOAPIC, &[0x7f, 2]])).unwrap();
+        assert_eq!(i.lapic_base, 0xfee0_0000);
+        assert_eq!((i.cpus.len(), i.cpus[0].apic_id), (1, 3));
+        assert_eq!((i.ioapics[0].id, i.ioapics[0].address), (2, 0xfec0_0000));
+        // trailing bytes too short for an entry header end the walk
+        assert!(parse_madt(&table(44, &[&MADT_LAPIC, &[0]])).is_ok());
+    }
+
+    #[test]
+    fn madt_rejects_bad_entries() {
+        // shorter than its header
+        assert!(parse_madt(&table(40, &[])).is_err());
+        // an entry running past the table, a zero length
+        let mut over = MADT_LAPIC;
+        over[1] = 200;
+        assert!(parse_madt(&table(44, &[&MADT_LAPIC, &over])).is_err());
+        let mut zero = MADT_LAPIC;
+        zero[1] = 0;
+        assert!(parse_madt(&table(44, &[&MADT_LAPIC, &zero])).is_err());
+        // entries too short for their type
+        assert!(parse_madt(&table(44, &[&MADT_LAPIC, &[MADT_ENTRY_IOAPIC, 2]])).is_err());
+        assert!(parse_madt(&table(44, &[&[MADT_ENTRY_LAPIC, 4, 0, 3]])).is_err());
+        assert!(
+            parse_madt(&table(
+                44,
+                &[
+                    &MADT_LAPIC,
+                    &[MADT_ENTRY_X2APIC, 12, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0]
+                ]
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_madt(&table(
+                44,
+                &[&MADT_LAPIC, &[MADT_ENTRY_LAPIC_64, 8, 0, 0, 0, 0, 0, 0]]
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn srat_rejects_bad_entries() {
+        assert!(srat_body(&table(44, &[])).is_err());
+        assert!(srat_body(&table(48, &[&lapic(0), &mem(0, true), &x2apic(1)])).is_ok());
+        let mut short = mem(0, true);
+        short[1] = 24;
+        assert!(srat_body(&table(48, &[&lapic(0), &short[..24]])).is_err());
+        let mut over = lapic(0);
+        over[1] = 255;
+        assert!(srat_body(&table(48, &[&over])).is_err());
     }
 }

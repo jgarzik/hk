@@ -21,7 +21,7 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, box_nofail, try_arc, try_box};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::ns::PidNamespace;
 use crate::sync::spin::Mutex;
@@ -35,7 +35,7 @@ const PER_PAGE: u32 = 4096 * 8;
 /// they wrap, so a freed number is not reused soon (raw tids still name
 /// tasks in places: ptrace and parent links until the tasklist
 /// conversion)
-const PID_MAX_LIMIT: u32 = 4 * 1024 * 1024;
+pub const PID_MAX_LIMIT: u32 = 4 * 1024 * 1024;
 /// After a wrap, numbers restart above these (Linux RESERVED_PIDS)
 const RESERVED_PIDS: u32 = 300;
 
@@ -70,11 +70,9 @@ pub struct Pid {
     /// The session whose id this is, likewise (Linux
     /// pid->tasks[PIDTYPE_SID]; links `Task.session_link`)
     pub(crate) session: TableCell<List<SessionLink>>,
-    /// pidfd pollers of the process this pid leads (Linux wait_pidfd)
+    /// pidfd pollers of the task it names (Linux wait_pidfd): woken
+    /// under TASKLIST when it exits and when it is released
     pub wait_pidfd: crate::sync::waitqueue::WaitQueue,
-    /// The process's wait status once all its threads have exited;
-    /// ALIVE before
-    exit: AtomicI64,
     /// Execs the process it leads has done (Linux self_exec_id, which
     /// the leader carries): what it registered before an exec is not
     /// delivered after it
@@ -85,25 +83,28 @@ pub struct Pid {
     hashed: AtomicBool,
 }
 
-/// `Pid.exit` of a process that still runs
-const ALIVE: i64 = i64::MIN;
-
 impl Pid {
     /// The global number (root namespace): the tid
     pub fn nr(&self) -> u32 {
         self.numbers[0].nr
     }
 
-    /// Its number in `ns`, if it is visible there (Linux pid_nr_ns)
+    /// Its number in `ns`, if it is visible there
     pub fn nr_in(&self, ns: &PidNamespace) -> Option<u32> {
         let u = self.numbers.get(ns.level as usize)?;
         core::ptr::eq(Arc::as_ptr(&u.ns), ns).then_some(u.nr)
     }
 
-    /// The process it leads has exited: its wait status
-    pub fn exited(&self) -> Option<i32> {
-        let v = self.exit.load(Ordering::Acquire);
-        (v != ALIVE).then_some(v as i32)
+    /// Its number in `ns`, 0 if it is not visible there (Linux
+    /// pid_nr_ns)
+    pub fn nr_ns(&self, ns: &PidNamespace) -> u32 {
+        self.nr_in(ns).unwrap_or(0)
+    }
+
+    /// Its number in the caller's namespace, 0 if not visible (Linux
+    /// pid_vnr)
+    pub fn vnr(&self) -> u32 {
+        self.nr_ns(current_pid_ns())
     }
 
     /// Execs of the process it leads
@@ -114,21 +115,6 @@ impl Pid {
     /// The process it leads exec'd (its point of no return)
     pub fn exec_done(&self) {
         self.exec_gen.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Its process has exited with `status` (the last thread's exit):
-    /// a pidfd poll sees it from now on. Marked under TASKLIST before
-    /// the exit's signal is queued (Linux do_notify_pidfd from
-    /// do_notify_parent); [`Pid::exit_wake`] wakes the pollers after.
-    pub fn set_exited(&self, status: i32) {
-        self.exit.store(i64::from(status), Ordering::Release);
-    }
-
-    /// Wake the pidfd pollers of a process [`Pid::set_exited`] marked
-    pub fn exit_wake(&self) {
-        self.wait_pidfd.wake_poll(u32::from(
-            crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM,
-        ));
     }
 
     /// The task it names (null if none: not yet attached, or released)
@@ -142,9 +128,20 @@ impl Pid {
         self.task.store(t.cast_mut(), Ordering::Release);
     }
 
+    /// Its numbers, one per level from the root (Linux pid->numbers)
+    pub fn numbers(&self) -> &[UPid] {
+        &self.numbers
+    }
+
     /// The namespace it was created in
     pub fn ns(&self) -> &Arc<PidNamespace> {
         &self.numbers[self.level as usize].ns
+    }
+
+    /// It is 1 in the namespace it was made in: its process is that
+    /// namespace's init (Linux is_child_reaper)
+    pub fn is_child_reaper(&self) -> bool {
+        self.numbers[self.level as usize].nr == 1
     }
 }
 
@@ -289,7 +286,7 @@ fn bucket(ns: &PidNamespace, nr: u32) -> &'static AtomicPtr<UPid> {
 /// A new `Pid` in `ns` and each ancestor namespace (Linux alloc_pid);
 /// EAGAIN if a namespace has no number left, ENOMEM
 pub fn alloc_pid(ns: &Arc<PidNamespace>) -> Result<Arc<Pid>, KernelError> {
-    alloc_pid_nr(ns, None)
+    alloc_pid_nr(ns, &[])
 }
 
 /// The numbers taken so far, given back on an error
@@ -299,8 +296,12 @@ fn free_numbers(numbers: &[UPid]) {
     }
 }
 
-/// `alloc_pid` with the root number chosen (init: 1; EAGAIN if taken)
-pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Result<Arc<Pid>, KernelError> {
+/// `alloc_pid` with the numbers of the innermost `set_tid.len()`
+/// levels chosen, `ns`'s first (Linux alloc_pid's set_tid: clone3,
+/// init's 1): EEXIST if one is taken. The caller checked them (at most
+/// one per level, each in 1..PID_MAX_LIMIT).
+pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>, KernelError> {
+    retry_init(ns);
     let mut chain = alloc::vec::Vec::new();
     let mut n = Some(ns.clone());
     while let Some(cur) = n {
@@ -309,16 +310,22 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Result<Arc<
     }
     chain.reverse(); // root first
     let mut numbers = alloc::vec::Vec::with_capacity(chain.len());
+    let top = chain.len() - 1;
     for (level, ns) in chain.into_iter().enumerate() {
-        let nr = match root_nr {
-            Some(nr) if level == 0 => ns.map.take(nr).map(|t| t.then_some(nr)),
-            _ => ns.map.alloc(),
+        let chosen = set_tid.get(top - level).copied();
+        let nr = match chosen {
+            Some(nr) => ns.map.take(nr).map(|t| t.then_some(nr)),
+            None => ns.map.alloc(),
         };
         let nr = match nr {
             Ok(Some(nr)) => nr,
             Ok(None) => {
                 free_numbers(&numbers);
-                return Err(KernelError::WouldBlock);
+                return Err(if chosen.is_some() {
+                    KernelError::AlreadyExists
+                } else {
+                    KernelError::WouldBlock
+                });
             }
             Err(e) => {
                 free_numbers(&numbers);
@@ -332,8 +339,12 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Result<Arc<
             pid: AtomicPtr::new(core::ptr::null_mut()),
         });
     }
-    // On failure the unbuilt Pid's Drop gives its numbers back (it was
-    // never hashed)
+    if let Err(e) = admit(&numbers) {
+        free_numbers(&numbers);
+        return Err(e);
+    }
+    // Counted now: on failure the unbuilt Pid's Drop uncounts it and
+    // gives its numbers back (it was never hashed)
     let pid = try_arc(Pid {
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
@@ -341,7 +352,6 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Result<Arc<
         pgrp: TableCell::new(List::new()),
         session: TableCell::new(List::new()),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
-        exit: AtomicI64::new(ALIVE),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(true),
     })?;
@@ -354,6 +364,89 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Result<Arc<
         b.store(core::ptr::from_ref::<UPid>(u).cast_mut(), Ordering::Release);
     }
     Ok(pid)
+}
+
+/// `ns` holds no pid and has had no init: an earlier attempt to make
+/// its init failed after taking pid 1 (its `uncount` kept NS_ADDING),
+/// so numbering starts over at 1 and the next fork makes init (Linux
+/// alloc_pid: idr_set_cursor(0) while pid_allocated == PIDNS_ADDING)
+fn retry_init(ns: &PidNamespace) {
+    let _g = PIDMAP_LOCK.lock();
+    if ns.alloc.load(Ordering::Relaxed) == crate::ns::pid::NS_ADDING {
+        ns.map.last.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Count `numbers` in their namespaces (Linux alloc_pid under
+/// pidmap_lock): EINVAL if a namespace with no init yet would get a
+/// number other than 1 (pid 1 is made first), ENOMEM if one takes no
+/// new pids (its init died: PIDNS_ADDING cleared)
+fn admit(numbers: &[UPid]) -> Result<(), KernelError> {
+    use crate::ns::pid::{NS_ADDING, NS_INIT};
+    let _g = PIDMAP_LOCK.lock();
+    let state = |u: &UPid| u.ns.alloc.load(Ordering::Relaxed);
+    if numbers.iter().any(|u| u.nr != 1 && state(u) & NS_INIT == 0) {
+        return Err(KernelError::InvalidArgument);
+    }
+    if numbers.iter().any(|u| state(u) & NS_ADDING == 0) {
+        return Err(KernelError::OutOfMemory);
+    }
+    for u in numbers {
+        u.ns.alloc.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// No more pids in `ns` (Linux disable_pid_allocation): its init died
+pub fn disable_pid_allocation(ns: &PidNamespace) {
+    let _g = PIDMAP_LOCK.lock();
+    ns.alloc
+        .fetch_and(!crate::ns::pid::NS_ADDING, Ordering::Relaxed);
+}
+
+/// `ns` and every namespace above it still take new pids (Linux
+/// copy_process: PIDNS_ADDING, checked again under tasklist_lock as a
+/// task joins, so a zap that disabled allocation sees the task or the
+/// fork fails)
+pub fn ns_adding(ns: &PidNamespace) -> bool {
+    let _g = PIDMAP_LOCK.lock();
+    let mut n = Some(ns);
+    while let Some(cur) = n {
+        if cur.alloc.load(Ordering::Relaxed) & crate::ns::pid::NS_ADDING == 0 {
+            return false;
+        }
+        n = cur.parent.as_deref();
+    }
+    true
+}
+
+/// The count of pids numbered in `ns` (Linux pid_allocated)
+pub fn ns_pids(ns: &PidNamespace) -> u32 {
+    let _g = PIDMAP_LOCK.lock();
+    ns.alloc.load(Ordering::Relaxed) & crate::ns::pid::NS_PIDS
+}
+
+/// `ns` has had its init (Linux child_reaper set): a number other than
+/// 1 may be made there
+pub fn ns_has_init(ns: &PidNamespace) -> bool {
+    let _g = PIDMAP_LOCK.lock();
+    ns.alloc.load(Ordering::Relaxed) & crate::ns::pid::NS_INIT != 0
+}
+
+/// `ns`'s init joined the task list (Linux copy_process sets
+/// child_reaper)
+pub fn set_ns_init(ns: &PidNamespace) {
+    let _g = PIDMAP_LOCK.lock();
+    ns.alloc
+        .fetch_or(crate::ns::pid::NS_INIT, Ordering::Relaxed);
+}
+
+/// One pid fewer in `ns` (PIDMAP_LOCK held): true if it is dying and
+/// down to its init's pids (Linux free_pid: pid_allocated 2 or 1)
+fn uncount(ns: &PidNamespace) -> bool {
+    use crate::ns::pid::{NS_ADDING, NS_PIDS};
+    let old = ns.alloc.fetch_sub(1, Ordering::Relaxed);
+    old & NS_ADDING == 0 && (old & NS_PIDS) <= 3
 }
 
 /// The process group and session of the boot task, number 0 (Linux
@@ -372,19 +465,90 @@ pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
         pgrp: TableCell::new(List::new()),
         session: TableCell::new(List::new()),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
-        exit: AtomicI64::new(ALIVE),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(false),
     })
 });
 
-/// The process group (or session) numbered `nr` in the root namespace:
-/// 0 is the boot one (`INIT_STRUCT_PID`)
-pub fn find_pgrp(nr: u64) -> Option<Arc<Pid>> {
+/// The process group (or session) numbered `nr` in `ns`: 0 in the root
+/// namespace is the boot one (`INIT_STRUCT_PID`)
+pub fn find_pgrp(ns: &PidNamespace, nr: u64) -> Option<Arc<Pid>> {
     if nr == 0 {
-        return Some(INIT_STRUCT_PID.clone());
+        return (ns.level == 0).then(|| INIT_STRUCT_PID.clone());
     }
-    find_pid(&crate::ns::INIT_PID_NS, u32::try_from(nr).ok()?)
+    find_pid(ns, u32::try_from(nr).ok()?)
+}
+
+/// The caller's pid namespace (Linux task_active_pid_ns(current)):
+/// lock-free, it cannot change while the task runs
+pub fn current_pid_ns() -> &'static PidNamespace {
+    crate::task::percpu::current_pid_ns()
+}
+
+/// The caller's pid namespace, a counted reference to keep (Linux
+/// get_pid_ns(task_active_pid_ns(current)))
+pub fn get_current_pid_ns() -> Arc<PidNamespace> {
+    crate::task::percpu::current().get_pid_ns()
+}
+
+/// The caller has a number in `ns`: it is in `ns` or a namespace
+/// below it (Linux task_pid_nr_ns(current, ns) != 0); lock-free
+pub fn current_in(ns: &PidNamespace) -> bool {
+    let mut n = Some(current_pid_ns());
+    while let Some(cur) = n {
+        if core::ptr::eq(cur, ns) {
+            return true;
+        }
+        if cur.level <= ns.level {
+            return false;
+        }
+        n = cur.parent.as_deref();
+    }
+    false
+}
+
+/// The live `Pid` numbered `nr` in the caller's namespace (Linux
+/// find_vpid)
+pub fn find_vpid(nr: u32) -> Option<Arc<Pid>> {
+    find_pid(current_pid_ns(), nr)
+}
+
+/// Root number `nr` (a tid, tgid, process group or session id) as `ns`
+/// numbers it, 0 if not visible there (Linux pid_nr_ns of its struct
+/// pid). The caller keeps its owner alive (it is the caller's own, or
+/// TASKLIST is held), so the number is not reused meanwhile.
+pub fn nr_ns(nr: u64, ns: &PidNamespace) -> u32 {
+    let Ok(n) = u32::try_from(nr) else {
+        return 0;
+    };
+    if ns.level == 0 {
+        return n;
+    }
+    find_pid(&crate::ns::INIT_PID_NS, n).map_or(0, |p| p.nr_ns(ns))
+}
+
+/// Root number `nr` in the caller's namespace (Linux pid_vnr)
+pub fn vnr(nr: u64) -> u32 {
+    nr_ns(nr, current_pid_ns())
+}
+
+/// The root number of the caller's number `nr` (a syscall argument:
+/// a tid, tgid, process group or session id), so lookups by root
+/// number find what the caller names: None if no live pid has it in
+/// the caller's namespace (ESRCH); in the root namespace `nr` itself
+/// (Linux find_vpid, by number)
+pub fn from_vnr(nr: u64) -> Option<u64> {
+    let ns = current_pid_ns();
+    if ns.level == 0 {
+        return Some(nr);
+    }
+    find_pid(ns, u32::try_from(nr).ok()?).map(|p| u64::from(p.nr()))
+}
+
+/// [`from_vnr`] with 0 naming the caller (`me`), as most pid
+/// arguments do
+pub fn from_vnr_or(nr: u64, me: u64) -> Option<u64> {
+    if nr == 0 { Some(me) } else { from_vnr(nr) }
 }
 
 /// The live `Pid` numbered `nr` in `ns` (Linux find_pid_ns)
@@ -413,12 +577,14 @@ impl Pid {
     /// owner, a tty's session), naming no task. Once.
     pub fn release_numbers(&self) {
         let mut weaks = [core::ptr::null_mut::<Pid>(); 33];
+        let mut zapping = false;
         {
             let _g = PIDMAP_LOCK.lock();
             if !self.hashed.swap(false, Ordering::Relaxed) {
                 return;
             }
             for (i, u) in self.numbers.iter().enumerate() {
+                zapping |= uncount(&u.ns);
                 let b = bucket(&u.ns, u.nr);
                 let me = core::ptr::from_ref::<UPid>(u).cast_mut();
                 let mut link = b;
@@ -441,6 +607,11 @@ impl Pid {
         }
         for u in self.numbers.iter() {
             u.ns.map.free(u.nr);
+        }
+        // A dying namespace's init waits for its last pids
+        // (zap_pid_ns_processes; Linux free_pid wakes child_reaper)
+        if zapping {
+            crate::task::proc::CHILD_EXIT_WQ.wake_all();
         }
         for w in weaks.into_iter().filter(|w| !w.is_null()) {
             // SAFETY: the hash's weak references, released once here

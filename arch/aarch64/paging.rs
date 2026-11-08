@@ -11,7 +11,10 @@
 //!
 //! TTBR0_EL1 maps user space only (lower half of the address space);
 //! TTBR1_EL1 maps the kernel (upper half): see kmap.rs and doc/MEMORY.md.
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+//!
+//! The user-table walkers here are `unsafe fn`s on a raw root: generic
+//! code reaches them only through `mm::pgtable`, whose handles borrow
+//! the lock that keeps the tables.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -165,22 +168,41 @@ fn user_va(va: u64) -> bool {
     va < TASK_SIZE
 }
 
+/// Entry `idx` (mod 512) of the table frame `table`, through the linear
+/// map
+#[inline]
+fn slot(table: u64, idx: u64) -> *mut u64 {
+    phys_to_virt(table)
+        .cast::<u64>()
+        .wrapping_add((idx & 511) as usize)
+}
+
+/// The value of the descriptor at `p`
+///
+/// # Safety
+///
+/// `p` is an entry of a live table frame.
+#[inline]
+unsafe fn load(p: *mut u64) -> u64 {
+    // SAFETY: a live entry (the caller's guarantee); page-table entries
+    // are only accessed atomically
+    unsafe { AtomicU64::from_ptr(p) }.load(Ordering::Acquire)
+}
+
 /// Pointer to the 4KB leaf (L3) entry for `va` in the tables rooted at
 /// `root` (valid or not, e.g. a swap entry); None if an upper level is
 /// missing or is a block
-pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
-    if !user_va(va) {
-        return None;
-    }
-    let mut table = phys_to_virt(root).cast::<u64>();
-    for shift in [39, 30, 21] {
-        let e = unsafe { *table.add(((va >> shift) & 511) as usize) };
-        if e & 0b11 != DESC_TABLE {
-            return None;
-        }
-        table = phys_to_virt(e & ADDR_MASK).cast::<u64>();
-    }
-    Some(unsafe { table.add(((va >> 12) & 511) as usize) })
+///
+/// # Safety
+///
+/// `root` is a live top-level table, and no table under it that maps
+/// `va` is freed during the call.
+pub(crate) unsafe fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
+    // SAFETY: the caller's guarantee
+    let pmd = unsafe { pmd_ptr(root, va) }?;
+    // SAFETY: an entry of a table under `root` mapping `va`, kept
+    let l3 = table_of(unsafe { load(pmd) })?;
+    Some(slot(l3, va >> 12))
 }
 
 /// A leaf entry maps a page: valid, or protnone (Linux pte_present)
@@ -259,33 +281,23 @@ fn leaf_attrs(flags: PageFlags) -> u64 {
 /// AP[2]: read-only at every level
 const AP_RDONLY: u64 = 1 << 7;
 
-/// The descriptor at `idx` (mod 512) of the table at `table`, as an atomic
-fn entry_atomic(table: *mut u64, idx: u64) -> &'static AtomicU64 {
-    // SAFETY: a live table frame reached through the linear map
-    unsafe { AtomicU64::from_ptr(table.add((idx & 511) as usize)) }
-}
-
-/// The descriptor at `p` in a live table, as an atomic
-fn entry_ptr(p: *mut u64) -> &'static AtomicU64 {
-    // SAFETY: `p` points into a live table frame (linear map)
-    unsafe { AtomicU64::from_ptr(p) }
-}
-
 /// Pointer to the 2MB-level (L2) entry for `va` in the tables rooted at
 /// `root` (Linux pmd_offset); None if an upper level is missing
-pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
+///
+/// # Safety
+///
+/// As [`pte_ptr`].
+pub(crate) unsafe fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
     if !user_va(va) {
         return None;
     }
-    let mut table = phys_to_virt(root).cast::<u64>();
+    let mut table = root;
     for shift in [39, 30] {
-        let e = entry_atomic(table, va >> shift).load(Ordering::Acquire);
-        if e & 0b11 != DESC_TABLE {
-            return None;
-        }
-        table = phys_to_virt(e & ADDR_MASK).cast::<u64>();
+        // SAFETY: an entry of `root` or of a table under it mapping
+        // `va`, kept (the caller's guarantee)
+        table = table_of(unsafe { load(slot(table, va >> shift)) })?;
     }
-    Some(entry_atomic(table, va >> 21).as_ptr())
+    Some(slot(table, va >> 21))
 }
 
 /// The next-level table an L0-L2 entry points to (not a block)
@@ -298,70 +310,190 @@ pub fn pmd_huge(pmd: u64) -> bool {
     pmd & 0b11 == DESC_BLOCK
 }
 
-/// Pointer to the 4KB leaf (L3) entry for `va`, allocating the missing
-/// tables (Linux pte_alloc). A table is installed with a compare and
-/// swap, so racing faults share one. None if out of memory (down to
-/// the low watermark) or a block maps `va`.
-pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
+/// A zeroed frame for a user page table, not yet in any table (Linux
+/// pte_alloc_one, pmd_alloc_one): taken with no page-table lock held,
+/// so it may reclaim. User page tables stop at the low watermark like
+/// the user pages they map: a process touching sparse addresses cannot
+/// drain the kernel's reserve with tables. None if out of memory.
+pub fn table_alloc() -> Option<u64> {
+    let new = crate::FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::USER)?;
+    // SAFETY: a fresh frame, reached through the linear map
+    unsafe { core::ptr::write_bytes(phys_to_virt(new), 0, PAGE_SIZE as usize) };
+    Some(new)
+}
+
+/// Install the table `new` in the upper-level entry `slot` if it is
+/// still empty (Linux pmd_install, pud_populate); false if an entry is
+/// there, `new` then still the caller's
+///
+/// # Safety
+///
+/// `slot` is an upper-level entry of a live user table, its address
+/// space's page_table_lock held (no split under way); `new` is a zeroed
+/// table frame the caller owns, which the tables take over on success.
+pub(crate) unsafe fn table_install(slot: &AtomicU64, new: u64) -> bool {
+    slot.compare_exchange(0, new | DESC_TABLE, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// The table under the upper-level entry `p` of a user table, `install`
+/// called to put one in while it is empty. None if `install` fails (out
+/// of memory) or a block maps it.
+///
+/// # Safety
+///
+/// `p` is an upper-level entry of a live user table; `install` changes
+/// the entry it is handed only through [`table_install`].
+unsafe fn next_alloc(p: *mut u64, install: &mut dyn FnMut(&AtomicU64) -> bool) -> Option<u64> {
+    // SAFETY: a live entry (the caller's guarantee), only accessed
+    // atomically
+    let slot = unsafe { AtomicU64::from_ptr(p) };
+    loop {
+        let e = crate::mm::huge_page::pmd_settled(slot);
+        if e != 0 {
+            return table_of(e);
+        }
+        if !install(slot) {
+            return None;
+        }
+    }
+}
+
+/// Pointer to the 2MB-level (L2) entry for `va`, missing upper tables
+/// put in by `install` (Linux pmd_alloc); None if out of memory
+///
+/// # Safety
+///
+/// As [`pte_ptr`]; `install` changes the entry it is handed only
+/// through [`table_install`].
+pub(crate) unsafe fn pmd_alloc(
+    root: u64,
+    va: u64,
+    install: &mut dyn FnMut(&AtomicU64) -> bool,
+) -> Option<*mut u64> {
     if !user_va(va) {
         return None;
     }
-    let mut table = phys_to_virt(root).cast::<u64>();
-    for shift in [39, 30, 21] {
-        let slot = entry_atomic(table, va >> shift);
-        let mut e = crate::mm::huge_page::pmd_settled(slot);
-        if e & 0b11 == DESC_INVALID {
-            // User page tables stop at the low watermark like the
-            // user pages they map: a process touching sparse addresses
-            // cannot drain the kernel's reserve with tables
-            let new = crate::FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::USER)?;
-            // SAFETY: a fresh frame, reached through the linear map
-            unsafe { core::ptr::write_bytes(phys_to_virt(new), 0, PAGE_SIZE as usize) };
-            let ent = new | DESC_TABLE;
-            e = match slot.compare_exchange(e, ent, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => ent,
-                Err(cur) => {
-                    crate::FRAME_ALLOCATOR.free(new);
-                    cur
-                }
-            };
-        }
-        if e & 0b11 != DESC_TABLE {
-            return None;
-        }
-        table = phys_to_virt(e & ADDR_MASK).cast::<u64>();
+    let mut table = root;
+    for shift in [39, 30] {
+        // SAFETY: an entry of `root` or of a table under it mapping
+        // `va`, kept (the caller's guarantee); `install` as required
+        table = unsafe { next_alloc(slot(table, va >> shift), install) }?;
     }
-    Some(entry_atomic(table, va >> 12).as_ptr())
+    Some(slot(table, va >> 21))
 }
 
-/// Fill the fresh L3 table `pt` with the 512 4KB pages of the 2MB block
+/// Pointer to the 4KB leaf entry for `va`, missing tables put in by
+/// `install` (Linux pte_alloc). None if out of memory or a block maps
+/// `va`.
+///
+/// # Safety
+///
+/// As [`pmd_alloc`].
+pub(crate) unsafe fn pte_alloc(
+    root: u64,
+    va: u64,
+    install: &mut dyn FnMut(&AtomicU64) -> bool,
+) -> Option<*mut u64> {
+    // SAFETY: the caller's guarantee
+    let pmd = unsafe { pmd_alloc(root, va, install) }?;
+    // SAFETY: the 2MB-level entry of `va` under `root`, kept; `install`
+    // as required
+    let l3 = unsafe { next_alloc(pmd, install) }?;
+    Some(slot(l3, va >> 12))
+}
+
+/// The physical address `va` maps to in the tables rooted at `root`
+/// (a 4KB page or 2MB block); None if not mapped
+///
+/// # Safety
+///
+/// As [`pte_ptr`].
+pub(crate) unsafe fn translate(root: u64, va: u64) -> Option<u64> {
+    // SAFETY: the caller's guarantee
+    let pmd = unsafe { pmd_ptr(root, va) }?;
+    // SAFETY: the 2MB-level entry of `va` under `root`, kept
+    let e = PageTableEntry(unsafe { load(pmd) });
+    if e.is_block() {
+        return Some(e.addr() | (va & 0x1F_FFFF));
+    }
+    if !e.is_table() {
+        return None;
+    }
+    // SAFETY: the 4KB entry of `va`, in a table kept like the others
+    let e = PageTableEntry(unsafe { load(slot(e.addr(), va >> 12)) });
+    e.is_valid().then(|| e.addr() | (va & 0xFFF))
+}
+
+/// Fill the L3 table `pt` with the 512 4KB pages of the 2MB block
 /// `pmd`: same frames and attributes (Linux __split_huge_pmd_locked).
 /// Returns the block's base.
-pub fn split_table(pt: u64, pmd: u64) -> u64 {
+///
+/// # Safety
+///
+/// `pt` is a table frame the caller owns that no table holds yet.
+pub(crate) unsafe fn split_table(pt: u64, pmd: u64) -> u64 {
     const HUGE_MASK: u64 = (2 << 20) - 1;
     let base = pmd & ADDR_MASK & !HUGE_MASK;
     let attrs = pmd & !ADDR_MASK & !0b11;
-    let l3 = phys_to_virt_table(pt);
-    for i in 0..ENTRIES_PER_TABLE {
-        // SAFETY: a fresh table frame, not yet reachable
-        unsafe {
-            (*l3)
-                .entry_mut(i)
-                .set_page(base + i as u64 * PAGE_SIZE, attrs)
-        };
+    for i in 0..ENTRIES_PER_TABLE as u64 {
+        let e = ((base + i * PAGE_SIZE) & ADDR_MASK) | attrs | DESC_PAGE;
+        // SAFETY: entry `i` of the caller's unreachable table frame
+        unsafe { slot(pt, i).write(e) };
     }
     base
 }
 
 /// Install the filled table `pt` in the invalid (broken and flushed)
-/// L2 entry at `pmdp` (Linux pmd_populate): the table's entries are
+/// L2 entry `pmd` (Linux pmd_populate): the table's entries are
 /// visible before the table is (break-before-make, "make")
-pub fn pmd_populate(pmdp: *mut u64, pt: u64) {
-    // SAFETY: barriers only
+///
+/// # Safety
+///
+/// `pt` is a PTE table frame the caller owns and hands to the tables
+/// `pmd` lies in.
+pub(crate) unsafe fn pmd_populate(pmd: &AtomicU64, pt: u64) {
+    // SAFETY: a store barrier only (orders the table's entries first)
     unsafe { asm!("dsb ishst", options(nostack)) };
-    entry_ptr(pmdp).store(pt | DESC_TABLE, Ordering::Release);
+    pmd.store(pt | DESC_TABLE, Ordering::Release);
+    // SAFETY: barriers only (the entry visible to table walks)
+    unsafe { asm!("dsb ishst", "isb", options(nostack)) };
+}
+
+/// A 2MB user block for the 2MB frame `pa` with `flags` (Linux mk_pmd
+/// + pmd_mkhuge)
+pub fn mk_pmd(pa: u64, flags: PageFlags) -> u64 {
+    (pa & ADDR_MASK) | leaf_attrs(flags) | DESC_BLOCK
+}
+
+/// Install the block `v` in the invalid 2MB-level entry `pmd`: false if
+/// it was not empty. Visible to table walks before the access retries;
+/// an invalid entry is never cached, nothing to flush.
+pub fn pmd_set_huge(pmd: &AtomicU64, v: u64) -> bool {
+    let ok = pmd
+        .compare_exchange(0, v, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
     // SAFETY: barriers only
     unsafe { asm!("dsb ishst", "isb", options(nostack)) };
+    ok
+}
+
+/// The 2MB block `pmd` writable or not, executable or not (Linux
+/// pmd_modify): only AP[2:1] (EL0 access, bit 6, kept) and the
+/// execute-never bits change, which needs no break-before-make
+pub fn pmd_mkprot(pmd: u64, writable: bool, executable: bool) -> u64 {
+    let mut flags = PageFlags::READ;
+    if pmd & AP_EL0_RW != 0 {
+        flags |= PageFlags::USER;
+    }
+    if writable {
+        flags |= PageFlags::WRITE;
+    }
+    if executable {
+        flags |= PageFlags::EXECUTE;
+    }
+    let perm = AP_EL0_RO | PXN | UXN;
+    (pmd & !perm) | (leaf_attrs(flags) & perm)
 }
 
 /// A user leaf entry for `phys` with the protection of a VMA (PROT_*),
@@ -441,6 +573,12 @@ pub fn sync_icache(phys: u64, len: usize) {
 
 /// The user page tables of an address space, detached from its
 /// top-level table by [`detach_user`]
+///
+/// # Invariants
+///
+/// Each frame is an L1 table detached from its address space, which no
+/// CPU walks once the caller flushed them, owned by this value with
+/// every table under it.
 pub struct UserTables(alloc::vec::Vec<u64>);
 
 /// Detach the user tables from the TTBR0 root `l0_phys` (Linux
@@ -448,23 +586,28 @@ pub struct UserTables(alloc::vec::Vec<u64>);
 /// are cleared, the tables below kept intact for [`UserTables::free`],
 /// which runs after the caller flushed every CPU that may still walk
 /// them. The root frame itself is left to the caller.
-pub fn detach_user(l0_phys: u64) -> UserTables {
-    let l0 = phys_to_virt_table(l0_phys);
+///
+/// # Safety
+///
+/// `l0_phys` is a live top-level table whose user tables no one else
+/// reaches (no handle to them lives or is made later), and the caller
+/// frees them only after that flush.
+pub(crate) unsafe fn detach_user(l0_phys: u64) -> UserTables {
     let mut top = alloc::vec::Vec::new();
-    for i in 0..ENTRIES_PER_TABLE {
-        // SAFETY: a live root table reached through the linear map; its
-        // entries belong to the caller
-        unsafe {
-            let e = *(*l0).entry(i);
-            if e.is_table() {
-                top.push(e.addr());
-            }
-            (*l0).entry_mut(i).clear();
+    for i in 0..ENTRIES_PER_TABLE as u64 {
+        // SAFETY: an entry of the live root (the caller's guarantee),
+        // only accessed atomically
+        let e = PageTableEntry(
+            unsafe { AtomicU64::from_ptr(slot(l0_phys, i)) }.swap(0, Ordering::AcqRel),
+        );
+        if e.is_table() {
+            top.push(e.addr());
         }
     }
     // The cleared entries are visible to table walks before the flush
     // SAFETY: barrier only
     unsafe { asm!("dsb ishst", options(nostack)) };
+    // INVARIANT: the user tables, detached, ours (the caller's guarantee)
     UserTables(top)
 }
 
@@ -477,12 +620,13 @@ impl UserTables {
     }
 }
 
-/// Release the table at `phys` (`level` 1, 2 or 3) and everything below
+/// Release the table at `phys` (`level` 1, 2 or 3) and everything
+/// below: a table of a `UserTables`
 fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
-    let table = phys_to_virt_table_const(phys);
-    for i in 0..ENTRIES_PER_TABLE {
-        // SAFETY: a detached table frame owned by the caller
-        let e = unsafe { *(*table).entry(i) };
+    for i in 0..ENTRIES_PER_TABLE as u64 {
+        // SAFETY: a detached table frame that no CPU walks, owned by
+        // the `UserTables` being freed (its type invariant)
+        let e = PageTableEntry(unsafe { slot(phys, i).read() });
         match level {
             3 if pte_present(e.0) => put(Leaf::Page(e.addr())),
             3 if e.0 != 0 => put(Leaf::Swap(e.0)),
@@ -556,12 +700,6 @@ impl PageTableEntry {
     pub fn set_block(&mut self, phys_addr: u64, attrs: u64) {
         self.0 = (phys_addr & ADDR_MASK) | attrs | DESC_BLOCK;
     }
-
-    /// Clear the entry
-    #[inline]
-    pub fn clear(&mut self) {
-        self.0 = 0;
-    }
 }
 
 // ============================================================================
@@ -634,14 +772,27 @@ fn page_indices(vaddr: u64) -> (usize, usize, usize, usize) {
 /// AArch64 page table
 ///
 /// Uses 4-level page tables with 4KB pages.
+///
+/// # Invariants
+///
+/// `root_phys` is a live top-level table its holder owns: a fresh one
+/// (`new_user`), the only way to make one. The shared reserved empty
+/// table is never one (`kernel_root` gives only its address), so a safe
+/// map cannot write into it.
 pub struct Aarch64PageTable {
     /// Physical address of the root table (L0)
     root_phys: u64,
 }
 
 impl Aarch64PageTable {
-    /// Create a page table from an existing root physical address
-    pub fn new(root_phys: u64) -> Self {
+    /// The table at `root_phys`
+    ///
+    /// # Safety
+    ///
+    /// `root_phys` is a live top-level table the result's holder owns
+    /// (type invariant).
+    unsafe fn from_root(root_phys: u64) -> Self {
+        // INVARIANT: the caller's guarantee
         Self { root_phys }
     }
 
@@ -651,20 +802,20 @@ impl Aarch64PageTable {
         self.root_phys
     }
 
-    /// TTBR0 table for kernel threads: empty (the kernel is in TTBR1;
-    /// Linux reserved_pg_dir)
-    pub fn kernel_identity() -> Self {
-        Self::new(super::kmap::reserved_phys())
+    /// The TTBR0 root for kernel threads: an empty table (the kernel is
+    /// in TTBR1; Linux reserved_pg_dir). Only its address: a value of
+    /// this type could map into it
+    pub fn kernel_root() -> u64 {
+        super::kmap::reserved_phys()
     }
 
     /// Create a new user page table (allocates L0)
     pub fn new_user<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) -> Option<Self> {
         let l0_phys = frame_alloc.alloc_frame()?;
-        // Zero the L0 table
-        unsafe {
-            core::ptr::write_bytes(phys_to_virt(l0_phys), 0, PAGE_SIZE as usize);
-        }
-        Some(Self::new(l0_phys))
+        // SAFETY: a fresh frame, reached through the linear map
+        unsafe { core::ptr::write_bytes(phys_to_virt(l0_phys), 0, PAGE_SIZE as usize) };
+        // SAFETY: a fresh zeroed table frame, the result's
+        Some(unsafe { Self::from_root(l0_phys) })
     }
 
     /// Nothing to copy: the kernel lives in TTBR1, shared by all
@@ -682,6 +833,10 @@ impl Aarch64PageTable {
 
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
+        // SAFETY: `root_phys` is a live root its holder owns (type
+        // invariant; exec builds it before any CPU loads it), and each
+        // table under it is a live frame reached through the linear
+        // map; fresh frames are zeroed before they are linked
         unsafe {
             let l0 = phys_to_virt_table(self.root_phys);
 
@@ -745,6 +900,9 @@ impl Aarch64PageTable {
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
         let offset = va & 0xFFF;
 
+        // SAFETY: `root_phys` is a live root its holder owns (type
+        // invariant); each table under it is a live frame reached
+        // through the linear map
         unsafe {
             let l0 = phys_to_virt_table_const(self.root_phys);
 
@@ -784,174 +942,6 @@ impl Aarch64PageTable {
             Some(l3_entry.addr() | offset)
         }
     }
-
-    /// Update protection flags for a 2MB huge page (L2 block descriptor)
-    ///
-    /// # Arguments
-    /// * `l0_phys` - Physical address of the L0 table
-    /// * `va` - Virtual address (must be 2MB-aligned)
-    /// * `writable` - Whether the page should be writable
-    /// * `executable` - Whether the page should be executable
-    ///
-    /// # Returns
-    /// `true` if the huge page was found and updated, `false` if not mapped
-    pub fn update_huge_page_protection(
-        l0_phys: u64,
-        va: u64,
-        writable: bool,
-        executable: bool,
-    ) -> bool {
-        let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
-
-        unsafe {
-            let l0 = phys_to_virt_table(l0_phys);
-
-            let l0_entry = (*l0).entry(l0_idx);
-            if !l0_entry.is_valid() || !l0_entry.is_table() {
-                return false;
-            }
-            let l1 = phys_to_virt_table(l0_entry.addr());
-
-            let l1_entry = (*l1).entry(l1_idx);
-            if !l1_entry.is_valid() {
-                return false;
-            }
-            if l1_entry.is_block() {
-                // 1GB block page - not handled here
-                return false;
-            }
-            let l2 = phys_to_virt_table(l1_entry.addr());
-
-            let l2_entry = (*l2).entry_mut(l2_idx);
-            if !l2_entry.is_valid() || !l2_entry.is_block() {
-                // Must be a 2MB block page
-                return false;
-            }
-
-            // Get current entry, preserve address
-            let phys = l2_entry.addr();
-
-            // Only the permissions change: AP[2:1] (EL0 access, bit 6,
-            // is kept) and the execute-never bits
-            let user = l2_entry.0 & AP_EL0_RW != 0;
-            let mut flags = PageFlags::READ;
-            if user {
-                flags |= PageFlags::USER;
-            }
-            if writable {
-                flags |= PageFlags::WRITE;
-            }
-            if executable {
-                flags |= PageFlags::EXECUTE;
-            }
-            let keep = l2_entry.0 & !(ADDR_MASK | 0b11 | AP_EL0_RO | PXN | UXN);
-            let perm = AP_EL0_RO | PXN | UXN;
-            let attrs = keep | (leaf_attrs(flags) & perm);
-
-            // Write back the updated entry as a block descriptor
-            l2_entry.set_block(phys, attrs);
-
-            // Permissions only (no break-before-make needed); the
-            // caller flushes the TLB of the range
-            true
-        }
-    }
-
-    /// Translate a virtual address to physical using the given page table root
-    ///
-    /// Static method that takes l0_phys directly.
-    pub fn translate_with_root(l0_phys: u64, va: u64) -> Option<u64> {
-        let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
-        let offset = va & 0xFFF;
-
-        unsafe {
-            let l0 = phys_to_virt_table_const(l0_phys);
-
-            let l0_entry = (*l0).entry(l0_idx);
-            if !l0_entry.is_valid() || !l0_entry.is_table() {
-                return None;
-            }
-            let l1 = phys_to_virt_table_const(l0_entry.addr());
-
-            let l1_entry = (*l1).entry(l1_idx);
-            if !l1_entry.is_valid() {
-                return None;
-            }
-            if l1_entry.is_block() {
-                let base = l1_entry.addr();
-                return Some(base | (va & 0x3FFF_FFFF)); // 1GB mask
-            }
-            let l2 = phys_to_virt_table_const(l1_entry.addr());
-
-            let l2_entry = (*l2).entry(l2_idx);
-            if !l2_entry.is_valid() {
-                return None;
-            }
-            if l2_entry.is_block() {
-                let base = l2_entry.addr();
-                return Some(base | (va & 0x1F_FFFF)); // 2MB mask
-            }
-            let l3 = phys_to_virt_table_const(l2_entry.addr());
-
-            let l3_entry = (*l3).entry(l3_idx);
-            if !l3_entry.is_valid() {
-                return None;
-            }
-
-            Some(l3_entry.addr() | offset)
-        }
-    }
-
-    /// Read the page table entry for a virtual address
-    ///
-    /// Returns the physical address and attributes of the mapped page, or None if not mapped.
-    /// Only supports 4KB pages (not block descriptors).
-    ///
-    /// This is used by mremap to copy page mappings to a new location.
-    pub fn read_pte(l0_phys: u64, va: u64) -> Option<(u64, u64)> {
-        let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
-
-        unsafe {
-            let l0 = phys_to_virt_table_const(l0_phys);
-
-            let l0_entry = (*l0).entry(l0_idx);
-            if !l0_entry.is_valid() || !l0_entry.is_table() {
-                return None;
-            }
-            let l1 = phys_to_virt_table_const(l0_entry.addr());
-
-            let l1_entry = (*l1).entry(l1_idx);
-            if !l1_entry.is_valid() {
-                return None;
-            }
-            // Block pages not supported
-            if l1_entry.is_block() {
-                return None;
-            }
-            let l2 = phys_to_virt_table_const(l1_entry.addr());
-
-            let l2_entry = (*l2).entry(l2_idx);
-            if !l2_entry.is_valid() {
-                return None;
-            }
-            // Block pages not supported
-            if l2_entry.is_block() {
-                return None;
-            }
-            let l3 = phys_to_virt_table_const(l2_entry.addr());
-
-            let l3_entry = (*l3).entry(l3_idx);
-            if !l3_entry.is_valid() {
-                return None;
-            }
-
-            // Get physical address and attributes (strip the descriptor type bits)
-            let phys = l3_entry.addr();
-            let attrs = l3_entry.0 & !ADDR_MASK & !0b11;
-
-            Some((phys, attrs))
-        }
-    }
 }
 
 // ============================================================================
@@ -988,93 +978,7 @@ impl PageTable for Aarch64PageTable {
         self.root_phys
     }
 
-    fn kernel_identity() -> Self {
-        Aarch64PageTable::kernel_identity()
-    }
-}
-
-// ============================================================================
-// Transparent Huge Page (THP) Support - 2MB blocks at L2 level
-// ============================================================================
-
-impl Aarch64PageTable {
-    /// Map a 2MB huge page at L2 level (block descriptor)
-    ///
-    /// Creates a 2MB block descriptor in the L2 table entry.
-    /// The virtual address must be 2MB-aligned.
-    ///
-    /// # Arguments
-    /// * `l0_phys` - Physical address of the L0 (root) table
-    /// * `va` - Virtual address (must be 2MB-aligned)
-    /// * `pa` - Physical address of the 2MB frame (must be 2MB-aligned)
-    /// * `flags` - Page flags
-    /// * `frame_alloc` - Frame allocator for intermediate tables
-    ///
-    /// # Returns
-    /// Ok(()) on success, Err(MapError) on failure
-    pub fn map_huge_page<FA: FrameAlloc<PhysAddr = u64>>(
-        l0_phys: u64,
-        va: u64,
-        pa: u64,
-        flags: PageFlags,
-        frame_alloc: &mut FA,
-    ) -> Result<(), MapError> {
-        const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
-
-        // Verify alignment
-        if va & (HUGE_PAGE_SIZE - 1) != 0 {
-            return Err(MapError::InvalidAddress);
-        }
-        if pa & (HUGE_PAGE_SIZE - 1) != 0 {
-            return Err(MapError::InvalidAddress);
-        }
-
-        let attrs = leaf_attrs(flags);
-
-        let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
-
-        unsafe {
-            let l0 = phys_to_virt_table(l0_phys);
-
-            // Get or create L1 table
-            let l0_entry = (*l0).entry_mut(l0_idx);
-            if !l0_entry.is_valid() {
-                let l1_phys = frame_alloc
-                    .alloc_frame()
-                    .ok_or(MapError::FrameAllocationFailed)?;
-                core::ptr::write_bytes(phys_to_virt(l1_phys), 0, PAGE_SIZE as usize);
-                l0_entry.set_table(l1_phys);
-            } else if !l0_entry.is_table() {
-                return Err(MapError::InvalidArgument);
-            }
-            let l1 = phys_to_virt_table(l0_entry.addr());
-
-            // Get or create L2 table
-            let l1_entry = (*l1).entry_mut(l1_idx);
-            if !l1_entry.is_valid() {
-                let l2_phys = frame_alloc
-                    .alloc_frame()
-                    .ok_or(MapError::FrameAllocationFailed)?;
-                core::ptr::write_bytes(phys_to_virt(l2_phys), 0, PAGE_SIZE as usize);
-                l1_entry.set_table(l2_phys);
-            } else if l1_entry.is_block() {
-                // 1GB block exists here - can't map 2MB within it
-                return Err(MapError::AlreadyMapped);
-            }
-            let l2 = phys_to_virt_table(l1_entry.addr());
-
-            // Check L2 entry - should not already be mapped
-            let l2_entry = (*l2).entry_mut(l2_idx);
-            if l2_entry.is_valid() {
-                return Err(MapError::AlreadyMapped);
-            }
-
-            // Set the 2MB block entry: it was invalid, no TLB entry to
-            // flush; visible to table walks before the access retries
-            l2_entry.set_block(pa, attrs);
-            asm!("dsb ishst", "isb", options(nostack));
-        }
-
-        Ok(())
+    fn kernel_root() -> u64 {
+        Aarch64PageTable::kernel_root()
     }
 }

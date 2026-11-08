@@ -29,6 +29,9 @@ use alloc::sync::Arc;
 use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::fs::file::File;
+use crate::fs::io::verify_area;
+use crate::fs::superblock::MAX_LFS_FILESIZE;
+use crate::fs::syscall::MAX_RW_COUNT;
 use crate::io::pipe::PipePage;
 use crate::io::pipe::{
     PIPE_RING, Pipe, PipeBuffer, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags,
@@ -54,6 +57,9 @@ pub const SPLICE_F_MORE: u32 = 0x04;
 
 /// Pages passed in are a gift (for vmsplice)
 pub const SPLICE_F_GIFT: u32 = 0x08;
+
+/// Every splice flag (Linux SPLICE_F_ALL)
+const SPLICE_F_ALL: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
 
 // =============================================================================
 // Splice helper types
@@ -110,48 +116,6 @@ pub fn splice_to_pipe(
         }
         Err(_) => Err(KernelError::WouldBlock),
     }
-}
-
-/// Extract a page reference from a pipe (for splice pipe->file)
-///
-/// Returns the next page buffer from the pipe without copying.
-///
-/// # Arguments
-/// * `pipe` - Source pipe to extract from
-///
-/// # Returns
-/// The pipe buffer containing page reference, or None if pipe is empty
-pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<PipePage>, u32, u32)> {
-    let mut inner = pipe.lock();
-
-    if inner.is_empty() {
-        return None;
-    }
-
-    // Get the tail buffer
-    let tail_idx = inner.tail;
-    let pipe_buf = &mut inner.bufs[tail_idx];
-
-    if pipe_buf.is_empty() {
-        inner.tail = (inner.tail + 1) % PIPE_RING;
-        return None;
-    }
-
-    // Extract page reference
-    let page = pipe_buf.page.clone()?;
-    let offset = pipe_buf.offset;
-    let len = pipe_buf.len;
-
-    // Consume the buffer
-    pipe_buf.release();
-    inner.tail = (inner.tail + 1) % PIPE_RING;
-    inner.total_len = inner.total_len.saturating_sub(len as usize);
-
-    // Wake writers - there's now space
-    drop(inner);
-    pipe.wake_writers();
-
-    Some((page, offset, len))
 }
 
 /// Link pipe buffers for tee() operation
@@ -315,6 +279,9 @@ pub fn sys_splice(
     if len == 0 {
         return 0;
     }
+    if flags & !SPLICE_F_ALL != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
 
     // Get the files
     let in_file = match get_file_from_fd(fd_in) {
@@ -335,8 +302,22 @@ pub fn sys_splice(
     let in_pipe = pipe_of_file(&in_file);
     let out_pipe = pipe_of_file(&out_file);
 
-    // Pipe-to-pipe splice
+    // Linux do_splice: O_NONBLOCK on the pipe side's file (either, for
+    // pipe to pipe) makes the splice nonblocking
+    let nb = |f: &File| f.get_flags() & crate::fs::file::flags::O_NONBLOCK != 0;
+    let len = len.min(MAX_RW_COUNT);
+
+    // Pipe-to-pipe splice: neither side has an offset
     if let (Some(in_pipe), Some(out_pipe)) = (&in_pipe, &out_pipe) {
+        if off_in != 0 || off_out != 0 {
+            return KernelError::IllegalSeek.sysret();
+        }
+        let flags = flags
+            | if nb(&in_file) || nb(&out_file) {
+                SPLICE_F_NONBLOCK
+            } else {
+                0
+            };
         return do_splice_pipe_to_pipe(in_pipe, out_pipe, len, flags);
     }
 
@@ -351,6 +332,10 @@ pub fn sys_splice(
             Ok(p) => p,
             Err(e) => return e.sysret(),
         };
+        if let Err(e) = verify_area(&in_file, pos, len) {
+            return e.sysret();
+        }
+        let flags = flags | if nb(&out_file) { SPLICE_F_NONBLOCK } else { 0 };
         let ret = do_splice_file_to_pipe(&in_file, pos, &out_pipe, len, flags);
         return write_back_offset(off_in, pos, ret);
     }
@@ -366,6 +351,14 @@ pub fn sys_splice(
             Ok(p) => p,
             Err(e) => return e.sysret(),
         };
+        // Linux do_splice: an O_APPEND output is EINVAL
+        if out_file.get_flags() & crate::fs::file::flags::O_APPEND != 0 {
+            return KernelError::InvalidArgument.sysret();
+        }
+        if let Err(e) = verify_area(&out_file, pos, len) {
+            return e.sysret();
+        }
+        let flags = flags | if nb(&in_file) { SPLICE_F_NONBLOCK } else { 0 };
         let ret = do_splice_pipe_to_file(&in_pipe, &out_file, pos, len, flags);
         return write_back_offset(off_out, pos, ret);
     }
@@ -459,6 +452,16 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
     moved as i64
 }
 
+/// errno of a failed read feeding a splice: the read's own, except that
+/// a file without a read is EINVAL (Linux do_splice_read: no
+/// ->splice_read)
+fn read_err(e: KernelError) -> i64 {
+    match e {
+        KernelError::OperationNotSupported => KernelError::InvalidArgument.sysret(),
+        e => e.sysret(),
+    }
+}
+
 /// Splice from file to pipe (read file into pipe)
 fn do_splice_file_to_pipe(
     file: &Arc<File>,
@@ -499,7 +502,7 @@ fn do_splice_file_to_pipe(
                     0
                 };
             }
-            Err(_) => return KernelError::Io.sysret(),
+            Err(e) => return read_err(e),
         }
     } else {
         // Use regular read (advances file position)
@@ -512,7 +515,7 @@ fn do_splice_file_to_pipe(
                     0
                 };
             }
-            Err(_) => return KernelError::Io.sysret(),
+            Err(e) => return read_err(e),
         }
     };
 
@@ -586,23 +589,27 @@ fn do_splice_pipe_to_file(
         }
     }
 
-    // Regular file path - extract data and write
+    // The pipe stays locked across the writes, and each buffer gives up
+    // only the bytes written (Linux iter_file_splice_write under
+    // pipe_lock): a short write or `len` leaves the rest in the pipe
+    let mut g = pipe.lock();
     let mut written = 0;
-
-    while written < len {
-        // Get data from pipe
-        let (page, offset, buf_len) = match splice_from_pipe(pipe) {
-            Some(data) => data,
-            None => break,
+    let mut err = None;
+    while written < len && !g.is_empty() {
+        let tail = g.tail;
+        let pb = &g.bufs[tail];
+        let Some(page) = pb.page.clone().filter(|_| !pb.is_empty()) else {
+            g.bufs[tail].release();
+            g.tail = (tail + 1) % PIPE_RING;
+            continue;
         };
+        let (offset, avail) = (pb.offset, pb.len as usize);
+        let to_write = (len - written).min(avail);
 
-        let to_write = (len - written).min(buf_len as usize);
-
-        // Copy data from page to temporary buffer
         let mut buf = [0u8; PAGE_SIZE];
         // SAFETY: the pipe buffer holds `page` (kernel-mapped, PAGE_SIZE)
-        // with valid data at `offset..offset + buf_len` inside it, and
-        // `to_write <= buf_len` bytes of it are copied out
+        // with valid data at `offset..offset + avail` inside it, and
+        // `to_write <= avail` bytes of it are copied out
         unsafe {
             let src = crate::arch::phys_to_virt(page.frame)
                 .cast_const()
@@ -610,28 +617,40 @@ fn do_splice_pipe_to_file(
             core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_write);
         }
 
-        // Write to file
-        let bytes_written = if let Some(off_out) = off_out {
-            let actual_offset = off_out + written as u64;
-            match file.pwrite(&buf[..to_write], actual_offset) {
-                Ok(n) => n,
-                Err(_) => {
-                    // Put data back? For now, data is lost on error
-                    break;
-                }
-            }
-        } else {
-            match file.write(&buf[..to_write]) {
-                Ok(n) => n,
-                Err(_) => break,
+        let r = match off_out {
+            Some(o) => file.pwrite(&buf[..to_write], o + written as u64),
+            None => file.write(&buf[..to_write]),
+        };
+        let n = match r {
+            Ok(n) => n.min(to_write),
+            Err(e) => {
+                err = Some(e);
+                break;
             }
         };
-
-        written += bytes_written;
-
-        if bytes_written < to_write {
+        // Consume exactly what was written
+        let pb = &mut g.bufs[tail];
+        if n == avail {
+            pb.release();
+            g.tail = (tail + 1) % PIPE_RING;
+        } else {
+            pb.offset += n as u32;
+            pb.len -= n as u32;
+        }
+        g.total_len = g.total_len.saturating_sub(n);
+        written += n;
+        if n < to_write {
             break;
         }
+    }
+    drop(g);
+    if written > 0 {
+        pipe.wake_writers();
+    }
+    if written == 0
+        && let Some(e) = err
+    {
+        return e.sysret();
     }
 
     if written == 0 && nonblock {
@@ -710,14 +729,23 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
 /// # Returns
 /// Number of bytes spliced, or negative errno
 pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
-    if nr_segs == 0 {
-        return 0;
+    if flags & !SPLICE_F_ALL != 0 {
+        return KernelError::InvalidArgument.sysret();
     }
 
     // A pipe open for writing (Linux vmsplice_to_pipe); vmsplice from
     // a pipe open only for reading (vmsplice_to_user) is not done: EBADF
     let Some(file) = get_file_from_fd(fd) else {
         return KernelError::BadFd.sysret();
+    };
+    // The segments as readv takes them (Linux import_iovec): EINVAL
+    // past IOV_MAX or for a negative length, cut to MAX_RW_COUNT
+    let segs = match i32::try_from(nr_segs)
+        .map_err(|_| KernelError::InvalidArgument)
+        .and_then(|n| crate::fs::iov::import_iovec(iov, n))
+    {
+        Ok(v) => v,
+        Err(e) => return e.sysret(),
     };
     let Some(pipe) = pipe_of_file(&file) else {
         return KernelError::InvalidArgument.sysret();
@@ -727,30 +755,10 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
     }
 
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
-
-    // Read iovec from user space
-    // struct iovec { void *iov_base; size_t iov_len; }
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct IoVec {
-        base: u64,
-        len: u64,
-    }
-    crate::pod!(IoVec { base, len });
-
-    let iov_size = core::mem::size_of::<IoVec>();
     let mut total = 0usize;
 
-    for i in 0..nr_segs {
-        let iov_ptr = iov + (i * iov_size) as u64;
-
-        // Read the iovec from user space
-        let user_iov = match get_user::<Uaccess, IoVec>(iov_ptr) {
-            Ok(v) => v,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        };
-
-        if user_iov.len == 0 {
+    for seg in &segs {
+        if seg.iov_len == 0 {
             continue;
         }
 
@@ -761,13 +769,13 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         };
 
         // Copy user data to page (limited to PAGE_SIZE)
-        let to_copy = (user_iov.len as usize).min(PAGE_SIZE);
+        let to_copy = (seg.iov_len as usize).min(PAGE_SIZE);
         // SAFETY: page.frame is a freshly allocated, kernel-mapped page of
         // PAGE_SIZE bytes owned by this pipe buffer.
         let dst = unsafe {
             core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), to_copy)
         };
-        if copy_from_user::<Uaccess>(dst, user_iov.base, to_copy).is_err() {
+        if copy_from_user::<Uaccess>(dst, seg.iov_base, to_copy).is_err() {
             // Bytes already queued count as success (Linux iov_iter)
             pipe.wake_readers();
             return if total > 0 {
@@ -823,43 +831,64 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
 /// # Returns
 /// Number of bytes sent, or negative errno
 pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: u64, count: usize) -> i64 {
-    if count == 0 {
-        return 0;
-    }
-
-    // Get input file
-    let in_file = match get_file_from_fd(in_fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Get output file
-    let out_file = match get_file_from_fd(out_fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Linux do_sendfile: read from a readable file, write to a writable
-    // one; the input cannot be a pipe
-    if !in_file.is_readable() || !out_file.is_writable() {
-        return KernelError::BadFd.sysret();
-    }
-    if pipe_of_file(&in_file).is_some() {
-        return KernelError::InvalidArgument.sysret();
-    }
-
     let pos = match read_user_offset(offset) {
         Ok(p) => p,
         Err(e) => return e.sysret(),
     };
-
-    let ret = if let Some(out_pipe) = pipe_of_file(&out_file) {
-        do_splice_file_to_pipe(&in_file, pos, &out_pipe, count, 0)
-    } else {
-        // File to file (rare, but supported)
-        do_sendfile_to_file(&in_file, pos, &out_file, count)
-    };
+    let ret = do_sendfile(out_fd, in_fd, pos, count);
     write_back_offset(offset, pos, ret)
+}
+
+/// Linux do_sendfile: `count` bytes of `in_fd` at `pos` (None: its
+/// position) to `out_fd`, cut to MAX_RW_COUNT and to the smaller
+/// s_maxbytes of the two files (EOVERFLOW at or past it)
+fn do_sendfile(out_fd: i32, in_fd: i32, pos: Option<u64>, count: usize) -> i64 {
+    let Some(in_file) = get_file_from_fd(in_fd) else {
+        return KernelError::BadFd.sysret();
+    };
+    if !in_file.is_readable() {
+        return KernelError::BadFd.sysret();
+    }
+    // A pipe has no position (ESPIPE) and no read to splice from
+    if pipe_of_file(&in_file).is_some() {
+        return if pos.is_some() {
+            KernelError::IllegalSeek.sysret()
+        } else {
+            KernelError::InvalidArgument.sysret()
+        };
+    }
+    if let Err(e) = verify_area(&in_file, pos, count) {
+        return e.sysret();
+    }
+    let mut count = count.min(MAX_RW_COUNT);
+    let Some(out_file) = get_file_from_fd(out_fd) else {
+        return KernelError::BadFd.sysret();
+    };
+    if !out_file.is_writable() {
+        return KernelError::BadFd.sysret();
+    }
+    let maxb = |f: &File| f.get_inode().map_or(MAX_LFS_FILESIZE, |i| i.maxbytes());
+    let max = maxb(&in_file).min(maxb(&out_file));
+    let start = pos.unwrap_or_else(|| in_file.get_pos());
+    if start.saturating_add(count as u64) > max {
+        if start >= max {
+            return KernelError::Overflow.sysret();
+        }
+        count = (max - start) as usize;
+    }
+    if count == 0 {
+        return 0;
+    }
+    if let Some(out_pipe) = pipe_of_file(&out_file) {
+        let nb = out_file.get_flags() & crate::fs::file::flags::O_NONBLOCK != 0;
+        let flags = if nb { SPLICE_F_NONBLOCK } else { 0 };
+        do_splice_file_to_pipe(&in_file, pos, &out_pipe, count, flags)
+    } else {
+        if let Err(e) = verify_area(&out_file, None, count) {
+            return e.sysret();
+        }
+        do_sendfile_to_file(&in_file, pos, &out_file, count)
+    }
 }
 
 /// Sendfile to regular file
@@ -876,32 +905,23 @@ fn do_sendfile_to_file(
         let to_read = (count - transferred).min(PAGE_SIZE);
 
         // Read from input file
-        let bytes_read = if let Some(offset) = offset {
-            let actual_offset = offset + transferred as u64;
-            match in_file.pread(&mut buf[..to_read], actual_offset) {
-                Ok(n) => n,
-                Err(_) => break,
-            }
-        } else {
-            match in_file.read(&mut buf[..to_read]) {
-                Ok(n) => n,
-                Err(_) => break,
-            }
+        let r = match offset {
+            Some(o) => in_file.pread(&mut buf[..to_read], o + transferred as u64),
+            None => in_file.read(&mut buf[..to_read]),
         };
-
-        if bytes_read == 0 {
-            break; // EOF
-        }
-
-        // Write to output file
-        match out_file.write(&buf[..bytes_read]) {
-            Ok(n) => {
-                transferred += n;
-                if n < bytes_read {
-                    break;
-                }
-            }
+        let r = r.and_then(|n| match n {
+            0 => Ok((0, 0)),
+            n => out_file.write(&buf[..n]).map(|w| (n, w)),
+        });
+        // An error ends the transfer: the error if nothing moved yet
+        let (got, put) = match r {
+            Ok(r) => r,
+            Err(e) if transferred == 0 => return read_err(e),
             Err(_) => break,
+        };
+        transferred += put;
+        if got == 0 || put < got {
+            break;
         }
     }
 
@@ -912,26 +932,15 @@ fn do_sendfile_to_file(
 // copy_file_range syscall
 // =============================================================================
 
-/// sys_copy_file_range - Copy a range of data between two files
+/// sys_copy_file_range - copy a range between two regular files in the
+/// kernel (Linux fs/read_write.c copy_file_range, vfs_copy_file_range)
 ///
-/// Efficiently copies data between two file descriptors without the need
-/// to transfer data to and from user space. The copy is done in kernel space.
-///
-/// # Arguments
-/// * `fd_in` - Source file descriptor
-/// * `off_in_ptr` - Pointer to source offset (NULL=0 uses file position)
-/// * `fd_out` - Destination file descriptor
-/// * `off_out_ptr` - Pointer to destination offset (NULL=0 uses file position)
-/// * `len` - Number of bytes to copy
-/// * `flags` - Reserved, must be 0
-///
-/// # Returns
-/// Number of bytes copied on success, negative errno on error:
-/// * -EBADF: fd_in or fd_out is not a valid file descriptor
-/// * -EINVAL: flags is not 0, or offsets are invalid
-/// * -EISDIR: fd_in or fd_out is a directory
-/// * -EXDEV: Cross-device copy not supported (not enforced here)
-/// * -EOVERFLOW: Requested range exceeds maximum file size
+/// NULL offset pointers use and advance the file positions. Errors:
+/// EBADF (fds, access mode, O_APPEND output), EINVAL (flags, not
+/// regular files, overlapping ranges of one file, an offset the copy
+/// would carry negative), EISDIR, EXDEV (different file systems),
+/// ETXTBSY (swap files), EOVERFLOW (an offset plus the length wraps),
+/// EFBIG (output limits).
 pub fn sys_copy_file_range(
     fd_in: i32,
     off_in_ptr: u64,
@@ -940,142 +949,158 @@ pub fn sys_copy_file_range(
     len: u64,
     flags: u32,
 ) -> i64 {
-    use crate::uaccess::UaccessArch;
-
-    // flags must be 0 (reserved for future use)
+    let Some(in_file) = get_file_from_fd(fd_in) else {
+        return KernelError::BadFd.sysret();
+    };
+    let Some(out_file) = get_file_from_fd(fd_out) else {
+        return KernelError::BadFd.sysret();
+    };
+    let at = |ptr: u64, f: &File| -> Result<i64, KernelError> {
+        if ptr == 0 {
+            return Ok(f.get_pos() as i64);
+        }
+        get_user::<Uaccess, i64>(ptr).map_err(|_| KernelError::BadAddress)
+    };
+    let (pos_in, pos_out) = match (at(off_in_ptr, &in_file), at(off_out_ptr, &out_file)) {
+        (Ok(i), Ok(o)) => (i, o),
+        (Err(e), _) | (_, Err(e)) => return e.sysret(),
+    };
     if flags != 0 {
         return KernelError::InvalidArgument.sysret();
     }
-
-    if len == 0 {
-        return 0;
-    }
-
-    // Get input file
-    let in_file = match get_file_from_fd(fd_in) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let n = match copy_range(&in_file, pos_in, &out_file, pos_out, len) {
+        Ok(0) => return 0,
+        Ok(n) => n,
+        Err(e) => return e.sysret(),
     };
+    // Both offsets were checked to stay valid past the copy
+    let (end_in, end_out) = (pos_in as u64 + n, pos_out as u64 + n);
+    let mut ret = n as i64;
+    if off_in_ptr == 0 {
+        in_file.set_pos(end_in);
+    } else if put_user::<Uaccess, u64>(off_in_ptr, end_in).is_err() {
+        ret = KernelError::BadAddress.sysret();
+    }
+    if off_out_ptr == 0 {
+        out_file.set_pos(end_out);
+    } else if put_user::<Uaccess, u64>(off_out_ptr, end_out).is_err() {
+        ret = KernelError::BadAddress.sysret();
+    }
+    ret
+}
 
-    // Get output file
-    let out_file = match get_file_from_fd(fd_out) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+/// Linux generic_file_rw_checks: two regular files, readable and
+/// writable, the output not O_APPEND; their inodes
+fn copy_files_ok(
+    fin: &File,
+    fout: &File,
+) -> Result<(Arc<crate::fs::Inode>, Arc<crate::fs::Inode>), KernelError> {
+    let (Some(iin), Some(iout)) = (fin.get_inode(), fout.get_inode()) else {
+        return Err(KernelError::InvalidArgument);
     };
+    if iin.mode().is_dir() || iout.mode().is_dir() {
+        return Err(KernelError::IsDirectory);
+    }
+    if !iin.mode().is_file() || !iout.mode().is_file() {
+        return Err(KernelError::InvalidArgument);
+    }
+    if !fin.is_readable()
+        || !fout.is_writable()
+        || fout.get_flags() & crate::fs::file::flags::O_APPEND != 0
+    {
+        return Err(KernelError::BadFd);
+    }
+    Ok((iin, iout))
+}
 
-    // Check permissions
-    if !in_file.is_readable() {
-        return KernelError::BadFd.sysret();
+/// Linux rw_verify_area for a regular file: `pos` and `pos + count`
+/// valid offsets (EINVAL)
+fn verify_pos(pos: i64, count: u64) -> Result<(), KernelError> {
+    match i64::try_from(count).ok().and_then(|c| pos.checked_add(c)) {
+        Some(_) if pos >= 0 => Ok(()),
+        _ => Err(KernelError::InvalidArgument),
     }
-    if !out_file.is_writable() {
-        return KernelError::BadFd.sysret();
-    }
+}
 
-    // Check file types - must be regular files
-    if let Some(inode) = in_file.get_inode() {
-        if inode.mode().is_dir() {
-            return KernelError::IsDirectory.sysret();
-        }
-        if !inode.mode().is_file() {
-            return KernelError::InvalidArgument.sysret();
-        }
+/// The checks and length of a copy (Linux generic_copy_file_checks and
+/// vfs_copy_file_range): the length cut to the input's end, the output's
+/// limits and MAX_RW_COUNT
+fn copy_len(
+    fin: &File,
+    pos_in: i64,
+    fout: &File,
+    pos_out: i64,
+    len: u64,
+) -> Result<u64, KernelError> {
+    let (iin, iout) = copy_files_ok(fin, fout)?;
+    let same_sb = match (iin.superblock(), iout.superblock()) {
+        (Some(a), Some(b)) => Arc::ptr_eq(&a, &b),
+        _ => false,
+    };
+    if !same_sb {
+        return Err(KernelError::CrossDevice);
     }
-    if let Some(inode) = out_file.get_inode() {
-        if inode.mode().is_dir() {
-            return KernelError::IsDirectory.sysret();
-        }
-        if !inode.mode().is_file() {
-            return KernelError::InvalidArgument.sysret();
-        }
+    let swap = |i: &crate::fs::Inode| i.i_swapfile.load(core::sync::atomic::Ordering::Acquire);
+    if swap(&iin) || swap(&iout) {
+        return Err(KernelError::TextBusy);
     }
-
-    // Get input offset
-    let off_in: u64 = if off_in_ptr != 0 {
-        if !Uaccess::access_ok(off_in_ptr, core::mem::size_of::<u64>()) {
-            return KernelError::BadAddress.sysret();
-        }
-        match get_user::<Uaccess, u64>(off_in_ptr) {
-            Ok(v) => v,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        }
+    // Offsets that wrap as unsigned 64-bit values (Linux: loff_t plus
+    // size_t)
+    if (pos_in as u64).checked_add(len).is_none() || (pos_out as u64).checked_add(len).is_none() {
+        return Err(KernelError::Overflow);
+    }
+    // Shorten the copy to the input's end
+    let size_in = iin.get_size() as i64;
+    let mut count = if pos_in >= size_in {
+        0
     } else {
-        in_file.get_pos()
+        // pos_in may be negative here: rw_verify_area below refuses it
+        len.min((size_in as u64).wrapping_sub(pos_in as u64))
     };
-
-    // Get output offset
-    let off_out: u64 = if off_out_ptr != 0 {
-        if !Uaccess::access_ok(off_out_ptr, core::mem::size_of::<u64>()) {
-            return KernelError::BadAddress.sysret();
-        }
-        match get_user::<Uaccess, u64>(off_out_ptr) {
-            Ok(v) => v,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        }
-    } else {
-        out_file.get_pos()
-    };
-
-    // Check for overflow
-    if off_in.checked_add(len).is_none() || off_out.checked_add(len).is_none() {
-        return KernelError::Overflow.sysret();
+    if let Ok(p) = u64::try_from(pos_out) {
+        count = iout.write_limit(p, count as usize)? as u64;
     }
+    // Overlapping ranges of one file
+    let (i, o, c) = (i128::from(pos_in), i128::from(pos_out), i128::from(count));
+    if Arc::ptr_eq(&iin, &iout) && o + c > i && o < i + c {
+        return Err(KernelError::InvalidArgument);
+    }
+    verify_pos(pos_in, count)?;
+    verify_pos(pos_out, count)?;
+    Ok(count.min(super::syscall::MAX_RW_COUNT as u64))
+}
 
-    // Perform the copy
+/// Copy up to `len` bytes from `fin` at `pos_in` to `fout` at `pos_out`;
+/// the bytes copied
+fn copy_range(
+    fin: &File,
+    pos_in: i64,
+    fout: &File,
+    pos_out: i64,
+    len: u64,
+) -> Result<u64, KernelError> {
+    let len = copy_len(fin, pos_in, fout, pos_out, len)?;
+    // Checked: both offsets stay valid through `len`
+    let (pos_in, pos_out) = (pos_in as u64, pos_out as u64);
     let mut buf = [0u8; PAGE_SIZE];
     let mut copied: u64 = 0;
-    let mut current_off_in = off_in;
-    let mut current_off_out = off_out;
-
     while copied < len {
-        let to_copy = ((len - copied) as usize).min(PAGE_SIZE);
-
-        // Read from source at current offset
-        let bytes_read = match in_file.pread(&mut buf[..to_copy], current_off_in) {
-            Ok(0) => break, // EOF
-            Ok(n) => n,
-            Err(e) => {
-                if copied > 0 {
-                    break; // Return partial success
-                }
-                return e.sysret();
+        let want = ((len - copied) as usize).min(PAGE_SIZE);
+        let step = fin.pread(&mut buf[..want], pos_in + copied).and_then(|n| {
+            if n == 0 {
+                return Ok((0, 0));
             }
+            fout.pwrite(&buf[..n], pos_out + copied).map(|w| (n, w))
+        });
+        let (got, put) = match step {
+            Ok(r) => r,
+            Err(e) if copied == 0 => return Err(e),
+            Err(_) => break,
         };
-
-        // Write to destination at current offset
-        let bytes_written = match out_file.pwrite(&buf[..bytes_read], current_off_out) {
-            Ok(n) => n,
-            Err(e) => {
-                if copied > 0 {
-                    break; // Return partial success
-                }
-                return e.sysret();
-            }
-        };
-
-        copied += bytes_written as u64;
-        current_off_in += bytes_written as u64;
-        current_off_out += bytes_written as u64;
-
-        if bytes_written < bytes_read {
-            break; // Partial write, stop
+        copied += put as u64;
+        if got == 0 || put < got {
+            break;
         }
     }
-
-    // Update offset pointers if provided
-    if off_in_ptr != 0 && copied > 0 {
-        let _ = put_user::<Uaccess, u64>(off_in_ptr, off_in + copied);
-    }
-    if off_out_ptr != 0 && copied > 0 {
-        let _ = put_user::<Uaccess, u64>(off_out_ptr, off_out + copied);
-    }
-
-    // Update file positions if offset pointers were NULL
-    if off_in_ptr == 0 && copied > 0 {
-        in_file.set_pos(off_in + copied);
-    }
-    if off_out_ptr == 0 && copied > 0 {
-        out_file.set_pos(off_out + copied);
-    }
-
-    copied as i64
+    Ok(copied)
 }

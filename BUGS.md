@@ -25,33 +25,20 @@ infallible, so each one is investigated, not written off.
   missed wakeup on the contended mmap_lock; a recurrence should dump
   the stuck threads' state.
 
-## Safe kernel code that can cause UB (doc/UNSAFE.md)
-
-These are safe fns or patterns whose use leads to undefined behaviour.
-None is known to fail today, but each is a soundness bug:
-
-- **Safe fns that take addresses:**
-  - aarch64/x86 paging `entry_atomic` returns `&'static AtomicU64` into
-    a table that can be freed; the mm `pte` helpers take `*mut u64`.
-
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
-There are 63 files with `#![expect(clippy::undocumented_unsafe_blocks)]
+There are 56 files with `#![expect(clippy::undocumented_unsafe_blocks)]
 // TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`). Most of their
 blocks belong in a missing wrapper:
 
 - **Frames:** an owned / page-locked / PTL-held frame borrow type in
   place of the `frame_bytes` unsafe fn (17 callers: vfat, pipe, splice,
   exec, fault, filemap, swap).
-- **Page tables:** a table / `Pte` reference type made only by the
-  walker and tied to the mmap_lock / PTL. It replaces `entry_atomic`,
-  `pagewalk::entry` and the `*mut u64` PTE helpers (the soundness item
-  above), and the boot kmap and ioremap walkers.
 - **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
   `&T` into device-written memory: xhci rings and contexts, virtio
   rings and blk, e1000 descriptors, virtio-net buffers.
-- **MMIO:** the remaining raw MMIO users move to `mmio::IoMem`: xhci
-  operational/runtime registers, gfx framebuffer, vgacon, rtc,
+- **MMIO:** the remaining raw MMIO users move to `mmio::IoMem`: xhci's
+  interrupt handler (USBSTS, IMAN), gfx framebuffer, vgacon, rtc,
   pci_quirks, aarch64 serial, x86 power.
 - **Lists:** an intrusive `CursorMut` for the walk-and-remove loops
   (futex, waitqueue, sched, percpu).
@@ -196,10 +183,7 @@ getcpu reports it; nothing else uses it. Missing (Linux
   node-aware allocation, so no policy (BIND, PREFERRED, INTERLEAVE,
   local) affects where pages come from.
 - No page migration: migrate_pages and move_pages validate and move
-  nothing; move_pages query mode reports node 0 for every page. For
-  another process they take CAP_SYS_NICE instead of Linux's
-  ptrace_may_access(PTRACE_MODE_READ_REALCREDS) (move_pages: under its
-  exec_update_lock), which they need once pages move.
+  nothing; move_pages query mode reports node 0 for every page.
 - Nodemasks are one `u64` (64 nodes); the gate has no multi-node QEMU
   run (by hand: `QEMU_EXTRA="-object memory-backend-ram,id=m0,size=256M
   -object memory-backend-ram,id=m1,size=256M -numa
@@ -400,11 +384,6 @@ unreachable today.
 
 **Location:** `tty/`, `hw/serial.rs`, `arch/aarch64/serial.rs`.
 
-- **write(2) is not atomic:** `n_tty::write` takes no per-tty write
-  lock, so two processes writing one tty interleave inside a single
-  write (boot logs show torn verdicts such as `MCELM_TOTAL:OK`). Linux
-  tty_write holds `tty->atomic_write_lock` (tty_write_lock) for the
-  whole call, chunk by chunk.
 - **No hangup:** nothing hangs a tty up (Linux __tty_hangup: vhangup,
   a session leader's exit, carrier loss), so open files stay usable.
   A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
@@ -433,8 +412,6 @@ unreachable today.
   console (console=tty0), Linux's /dev/console is the VT; on hk user
   console I/O stays on the serial port and the screen shows only
   printk.
-- **Pid namespaces:** TIOCGPGRP/TIOCGSID return global numbers (Linux
-  pid_vnr: the caller's namespace).
 
 ## Futex gaps
 
@@ -485,31 +462,6 @@ tmpfs (doc/ROADMAP.md phase 6). Kernel code that resolves a path from a kernel t
 (knullfs); hk has none today, and has no scoped_with_init_fs for one
 that would need init's root.
 
-## Thread-group exit gaps
-
-**Location**: `signal/mod.rs` (group exit), `task/exec.rs`
-de_thread
-
-- A pidfd polls readable when the leader exits, not when the whole
-  group is gone.
-
-## Exit notification gaps
-
-**Location**: `signal/notify.rs`, `task/percpu.rs` (exit_notify)
-
-A traced child's exit tells its tracer only; once the tracer reaps or
-detaches it, its real parent is not told nor can wait for it (Linux
-wait_task_zombie / __ptrace_detach: do_notify_parent to the real
-parent).
-
-A traced zombie thread is never released: neither its tracer's wait
-nor `exit_ptrace` frees it (Linux wait_task_zombie, __ptrace_detach
-release_task). wait4 therefore still tests `group_alive` (zombie
-threads ignored), not the `group_pending` the notice paths use.
-
-A subreaper is found only if its ancestor task itself is alive; Linux
-find_new_reaper takes any live thread of a subreaper process.
-
 ## No vDSO
 
 **Location**: `task/exec.rs`, `arch/aarch64/signal.rs`
@@ -527,12 +479,7 @@ return trampoline stands in for the vDSO's sigtramp, shown as
 Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
 clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
 PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
-to an untraced task is ignored: stop/continue are not implemented),
-and the tracee's exit being
-reported to a tracer that is not its parent. A traced non-leader
-thread's zombie cannot be waited for by its tracer, and a sibling's
-exec removes it at once (Linux: the tracer reaps it, and de_thread
-waits for that).
+to an untraced task is ignored: stop/continue are not implemented).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 
@@ -665,8 +612,8 @@ instead of filling all of RAM and being skipped above 4GB
 
 **Location**: `bpf/map.rs`
 
-An array map refuses a preallocation over half of free memory, but
-nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
+An array or hash map refuses a size over half of free memory at
+creation, but nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
 bpf_map_charge_memlock / memcg accounting), so many maps can still use
 up memory.
 
@@ -682,6 +629,17 @@ lists each lock allocated under once (`LOCKDEP:ATOMIC_ALLOC ... under
 mostly collections grown under spin mutexes, in fs, net, task and
 ipc (procfs: only its mount-time tree building). Each wants its allocation moved out of the
 lock (preallocate, or a sleeping lock as in Linux).
+
+## Sleeping mutex has no handoff
+
+**Location**: `sync/mutex.rs`
+
+A woken waiter retries the CAS and sleeps again if it lost, so a task
+that unlocks and relocks at once can starve the sleepers indefinitely;
+Linux hands the lock to a waiter that has failed for over a jiffy
+(MUTEX_FLAG_HANDOFF). Seen with a test-only 300 us delay under
+`Pipe.inner` in pipe_read: a reader spinning in non-blocking reads kept
+the writer off the pipe for over 10 s.
 
 ## Scheduler gaps (deviations from Linux)
 
@@ -856,12 +814,12 @@ or discards the range).
 Designs that grew one commit at a time. Tag = roadmap phase
 (doc/ROADMAP.md).
 
-- **Syscalls that do not deliver** (H/C): inotify and fanotify never
-  queue an event (no fsnotify hooks in the VFS); waitid without
-  WEXITED is EINVAL (C).
+- **Syscalls that do not deliver** (H/C): inotify queues only
+  IN_DELETE_SELF, IN_UNMOUNT and IN_IGNORED, fanotify nothing (no
+  fsnotify hooks in the VFS operations); waitid without WEXITED is
+  EINVAL (C).
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in five
-  places; `find_task_by_pid` in four (all root-namespace pids); four
-  `current_time`s; about ten user-timespec readers each validating
+  places; four `current_time`s; about ten user-timespec readers each validating
   (Linux get_timespec64); three iovec structs and five
   importers; three Timeval, two Timespec types.
 - **Error conventions** (M1): Result<_, KernelError> about a thousand
@@ -883,7 +841,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
   softnet/0 only; CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
-  (bpf, keys, mqueue, which wrap with no collision check): one
+  (bpf, mqueue, which wrap with no collision check): one
   IDR/IDA.
 - **procfs** (H): a file is generated whole (no seq_file records): an
   open file's reads continuing one another see one generation, where
@@ -923,11 +881,10 @@ Tag = roadmap phase (doc/ROADMAP.md).
    allocator, cached sorted device list.
 6. **One AnonVma per fork family, Vec chain** (J).
    `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
-7. **Syscalls report root-namespace pids** (C). Tasks get a number in
-   every level of their pid namespace chain (`task/pid.rs`), but
-   getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
-   child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
-   at the syscall boundary.
+7. **reboot(2) in a pid namespace checks `capable`** (B4). It checks
+   CAP_SYS_BOOT with `capable`, not in the namespace's user namespace
+   (Linux ns_capable(pid_ns->user_ns)): a pid namespace has no owning
+   user namespace yet.
 8. **MM_LIFE_EXEC_CHAIN flake** (arm64 CI, TCG, NIC=e1000):
    `MM_LIFE_EXEC_CHAIN:FAIL -2`, a measured chain's child (busybox
    `env` x40 then `true`: 41 execs in one process) exited nonzero: a
@@ -947,11 +904,18 @@ Tag = roadmap phase (doc/ROADMAP.md).
    its port in bhash (`TcpSock::assert_owner`). On failure the test
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
-10. **STDIO_STDOUT_PIPE flake** (hk arm64, KVM-less local boot, once
-   in four): `STDIO_STDOUT_PIPE:FAIL got 0`, the parent read nothing
-   from the pipe its child dup3'd onto stdout (EOF or an error before
-   the child's write, or the child failed). Not reproduced in two
-   reruns; investigate when it repeats.
+
+## Namespace files are not nsfs
+
+**Location**: `fs/proc/mod.rs` (`ns_file`), `ns/mod.rs` (`sys_setns`)
+
+/proc/<pid>/ns/<type> leads to a procfs inode numbered as the
+namespace, not to an nsfs inode: st_dev is procfs's, and the file names
+the task and the type, so setns joins the namespace that task is in at
+setns time (Linux: the open file pins the namespace itself, and a bind
+mount of it keeps the namespace alive). No cgroup, time,
+pid_for_children or time_for_children links, no NS_GET_* ioctls, and
+open(O_CREAT) through a link does not follow it.
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 

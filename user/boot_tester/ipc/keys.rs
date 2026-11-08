@@ -11,6 +11,9 @@
 //! - Test request_key finds existing key
 //! - Test keyctl CLEAR clears keyring
 //! - Test keyctl INVALIDATE removes key
+//! - KEY_SERIAL_RANDOM: serials are random (Linux key_alloc_serial), not
+//!   a counter a caller could predict or wrap: two keys made in a row
+//!   are not neighbours, and both are at least 3
 
 use crate::harness::pass;
 use crate::helpers::{print, print_num};
@@ -36,6 +39,33 @@ pub fn run_tests() {
     test_request_key();
     test_keyctl_clear();
     test_keyctl_invalidate();
+    test_key_serial_random();
+}
+
+/// Two keys made back to back get unrelated serials
+fn test_key_serial_random() {
+    let mk = |d: &[u8]| {
+        sys_add_key(
+            b"user\0".as_ptr(),
+            d.as_ptr(),
+            b"x".as_ptr(),
+            1,
+            KEY_SPEC_PROCESS_KEYRING,
+        )
+    };
+    let a = mk(b"serial_a\0");
+    let b = mk(b"serial_b\0");
+    // A chance of 2^-29 that random serials are neighbours
+    crate::harness::verdict(
+        b"KEY_SERIAL_RANDOM",
+        a >= 3 && b >= 3 && (a - b).abs() > 1,
+        a - b,
+    );
+    for k in [a, b] {
+        if k > 0 {
+            sys_keyctl(KEYCTL_INVALIDATE, k as u64, 0, 0, 0);
+        }
+    }
 }
 
 /// Test add_key creates a user key

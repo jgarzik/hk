@@ -358,6 +358,28 @@ pub fn sys_mbind(start: u64, len: u64, mode: u64, nmask_ptr: u64, maxnode: u64, 
     0
 }
 
+/// The process migrate_pages and move_pages act on (Linux
+/// kernel_migrate_pages, find_mm_struct): the caller for pid 0; else
+/// ESRCH if there is none, EPERM unless the caller may inspect it
+/// (ptrace_may_access, PTRACE_MODE_READ_REALCREDS), EINVAL without an
+/// address space; decided under its exec_update_lock, so an exec cannot
+/// swap the mm or dumpability meanwhile
+fn mm_target(pid: i64) -> Result<(), KernelError> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let tid = crate::task::percpu::find_task_by_vpid(pid as u64)
+        .map(|t| t.tid())
+        .ok_or(KernelError::NoProcess)?;
+    let _g = crate::signal::ExecUpdateRead::lock(tid);
+    if !crate::task::ptrace::may_access_tid(tid, false) {
+        return Err(KernelError::NotPermitted);
+    }
+    crate::mm::get_task_mm(tid)
+        .map(|_| ())
+        .ok_or(KernelError::InvalidArgument)
+}
+
 /// sys_migrate_pages - Migrate process pages between NUMA nodes
 ///
 /// # Arguments
@@ -372,26 +394,14 @@ pub fn sys_mbind(start: u64, len: u64, mode: u64, nmask_ptr: u64, maxnode: u64, 
 /// Validates node masks against real online NUMA nodes; no page is
 /// migrated yet (BUGS.md).
 ///
-/// # Permission Requirements
-/// - Operating on own process: always allowed
-/// - Operating on other processes: requires CAP_SYS_NICE or appropriate ptrace access
+/// Linux kernel_migrate_pages order: the masks (EFAULT, EINVAL), the
+/// target ([`mm_target`]: ESRCH, EPERM), then new nodes outside the
+/// online ones (cpuset_mems_allowed) need CAP_SYS_NICE (EPERM), and
+/// none online is EINVAL
 pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_ptr: u64) -> i64 {
-    // Validate maxnode - must be at least 1 to have any nodes
+    // get_nodes: maxnode 0 leaves no bit count (EINVAL)
     if maxnode == 0 {
         return KernelError::InvalidArgument.sysret();
-    }
-
-    // Permission check for operating on other processes
-    let current_pid = crate::task::percpu::current_pid();
-    if pid != 0 && pid != current_pid as i64 {
-        // Operating on another process requires CAP_SYS_NICE
-        if !crate::task::capable(crate::task::CAP_SYS_NICE) {
-            return KernelError::NotPermitted.sysret();
-        }
-        // Check if target process exists
-        if !crate::task::percpu::task_exists(pid as u64) {
-            return KernelError::NoProcess.sysret();
-        }
     }
 
     if maxnode > MAX_MASK_BITS + 1 {
@@ -405,13 +415,8 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
         if !Uaccess::access_ok(old_nodes_ptr, mask_bytes as usize) {
             return KernelError::BadAddress.sysret();
         }
-        let old_mask: u64 = match get_user::<Uaccess, u64>(old_nodes_ptr) {
-            Ok(m) => m,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        };
-        // Validate old_nodes are online
-        if old_mask != 0 && old_mask & !online_mask != 0 {
-            return KernelError::InvalidArgument.sysret();
+        if get_user::<Uaccess, u64>(old_nodes_ptr).is_err() {
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -425,12 +430,15 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
             Ok(m) => m,
             Err(_) => return KernelError::BadAddress.sysret(),
         };
-        // Validate new_nodes are online
-        if new_mask != 0 && new_mask & !online_mask != 0 {
-            return KernelError::InvalidArgument.sysret();
-        }
     }
 
+    if let Err(e) = mm_target(pid) {
+        return e.sysret();
+    }
+    // Nodes the target may not use (no cpusets: the online ones)
+    if new_mask & !online_mask != 0 && !crate::task::capable(crate::task::CAP_SYS_NICE) {
+        return KernelError::NotPermitted.sysret();
+    }
     // No allowed target node: EINVAL (Linux kernel_migrate_pages)
     if new_mask & online_mask == 0 {
         return KernelError::InvalidArgument.sysret();
@@ -458,7 +466,8 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
 ///
 /// # Permission Requirements
 /// - MPOL_MF_MOVE_ALL requires CAP_SYS_NICE
-/// - Operating on other processes requires CAP_SYS_NICE or ptrace access
+/// - Another process: [`mm_target`] (Linux find_mm_struct), before
+///   anything else is looked at
 pub fn sys_move_pages(
     pid: i64,
     nr_pages: u64,
@@ -473,25 +482,20 @@ pub fn sys_move_pages(
         return KernelError::InvalidArgument.sysret();
     }
 
-    // Zero pages is a no-op
-    if nr_pages == 0 {
-        return 0;
-    }
-
     // Permission check for MPOL_MF_MOVE_ALL
     if (flags as u32) & MPOL_MF_MOVE_ALL != 0 && !crate::task::capable(crate::task::CAP_SYS_NICE) {
         return KernelError::NotPermitted.sysret();
     }
 
-    // Permission check for operating on other processes
-    let current_pid = crate::task::percpu::current_pid();
-    if pid != 0 && pid != current_pid as i64 {
-        if !crate::task::capable(crate::task::CAP_SYS_NICE) {
-            return KernelError::NotPermitted.sysret();
-        }
-        if !crate::task::percpu::task_exists(pid as u64) {
-            return KernelError::NoProcess.sysret();
-        }
+    // The target before anything else (Linux kernel_move_pages ->
+    // find_mm_struct)
+    if let Err(e) = mm_target(pid) {
+        return e.sysret();
+    }
+
+    // Zero pages is a no-op
+    if nr_pages == 0 {
+        return 0;
     }
 
     // Validate the user arrays; sizes are user-controlled, so an

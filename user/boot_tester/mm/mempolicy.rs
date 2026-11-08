@@ -49,6 +49,7 @@ pub fn run_tests() {
     test_move_pages_query();
     test_move_pages_node0();
     test_move_pages_invalid_node();
+    test_migrate_pages_perm();
 }
 
 /// Test: Get default memory policy
@@ -365,5 +366,69 @@ fn test_move_pages_invalid_node() {
         print(b", status=");
         print_num(status[0] as i64);
         println(b")");
+    }
+}
+
+/// MIGRATE_PAGES_PERM: migrate_pages and move_pages on another process
+/// as an unprivileged user (Linux kernel_migrate_pages,
+/// find_mm_struct): no such pid is ESRCH before any permission check,
+/// root's init is EPERM (ptrace_may_access, PTRACE_MODE_READ_REALCREDS),
+/// and one's own same-uid child needs no CAP_SYS_NICE; a move_pages of
+/// no page still looks the target up first
+fn test_migrate_pages_perm() {
+    use hk_syscall::{
+        sys_exit, sys_fork, sys_kill, sys_pause, sys_prctl, sys_setresgid, sys_setresuid, sys_wait4,
+    };
+    const ESRCH: i64 = -3;
+    const EPERM: i64 = -1;
+    let prober = sys_fork();
+    if prober == 0 {
+        if sys_setresgid(1000, 1000, 1000) != 0 || sys_setresuid(1000, 1000, 1000) != 0 {
+            sys_exit(1);
+        }
+        // The id change made it non-dumpable (Linux commit_creds)
+        sys_prctl(4, 1, 0, 0, 0); // PR_SET_DUMPABLE
+        let child = sys_fork();
+        if child == 0 {
+            sys_pause();
+            sys_exit(0);
+        }
+        let node0: u64 = 1;
+        let mask = &node0 as *const u64;
+        let word = 0u64;
+        let pages: [u64; 1] = [&word as *const u64 as u64];
+        let mut status: [i32; 1] = [0];
+        let none = core::ptr::null();
+        let mut move_query =
+            |pid: i64, n: u64| sys_move_pages(pid, n, pages.as_ptr(), none, status.as_mut_ptr(), 0);
+        let code = if sys_migrate_pages(99_999_999, 64, mask, mask) != ESRCH {
+            2
+        } else if sys_migrate_pages(1, 64, mask, mask) != EPERM {
+            3
+        } else if sys_migrate_pages(child, 64, mask, mask) < 0 {
+            4
+        } else if move_query(99_999_999, 0) != ESRCH {
+            5
+        } else if move_query(1, 1) != EPERM {
+            6
+        } else if move_query(child, 1) != 0 {
+            7
+        } else {
+            0
+        };
+        sys_kill(child, 9);
+        let mut st = 0i32;
+        sys_wait4(child, &mut st, 0, 0);
+        sys_exit(code);
+    }
+    let mut st = 0i32;
+    sys_wait4(prober, &mut st, 0, 0);
+    print(b"MIGRATE_PAGES_PERM");
+    if st == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL wstatus=");
+        print_num(i64::from(st));
+        println(b"");
     }
 }

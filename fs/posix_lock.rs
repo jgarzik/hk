@@ -55,6 +55,15 @@ pub struct Flock {
     /// Explicit tail padding (always zero)
     pub _pad1: u32,
 }
+crate::pod!(Flock {
+    l_type,
+    l_whence,
+    _pad0,
+    l_start,
+    l_len,
+    l_pid,
+    _pad1
+});
 
 const _: () = assert!(core::mem::size_of::<Flock>() == 32);
 
@@ -388,7 +397,13 @@ pub fn posix_getlk(file: &File, flock: &mut Flock) -> Result<(), KernelError> {
             } else {
                 (c.end - c.start) as i64
             };
-            flock.l_pid = c.pid as i32;
+            // In the caller's namespace, 0 if not visible (Linux
+            // locks_translate_pid)
+            flock.l_pid = if (c.pid as i32) > 0 {
+                crate::task::pid::vnr(c.pid) as i32
+            } else {
+                c.pid as i32
+            };
         }
         None => flock.l_type = F_UNLCK,
     }

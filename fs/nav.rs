@@ -162,9 +162,17 @@ pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
         Ok(r) => r,
         Err(e) => return e.sysret(),
     };
-    let (mut path_str, reached) = crate::fs::dentry::d_path(&pwd, &root);
+    // Past PATH_MAX (the NUL included) is ENAMETOOLONG (Linux getcwd)
+    let (mut path_str, reached) = match crate::fs::dentry::try_d_path(&pwd, &root) {
+        Ok(r) => r,
+        Err(e) => return e.sysret(),
+    };
     if !reached {
-        path_str.splice(0..0, b"(unreachable)".iter().copied());
+        const UNREACHABLE: &[u8] = b"(unreachable)";
+        if path_str.len() + UNREACHABLE.len() >= crate::fs::dentry::PATH_MAX {
+            return KernelError::NameTooLong.sysret();
+        }
+        path_str.splice(0..0, UNREACHABLE.iter().copied());
     }
 
     // Need space for path + null terminator

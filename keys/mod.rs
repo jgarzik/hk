@@ -33,7 +33,6 @@ use crate::sync::spin::RwLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, Ordering};
 
 // =============================================================================
 // Special keyring IDs (negative values, Linux ABI compatible)
@@ -117,12 +116,24 @@ pub const KEYCTL_GET_PERSISTENT: i32 = 22;
 /// lock (lookups upgrade after releasing it), so a key's Drop may take it.
 static KEY_DATABASE: RwLock<BTreeMap<KeySerial, Weak<Key>>> = RwLock::new(BTreeMap::new());
 
-/// Next serial number to allocate (keys start at serial 3)
-static NEXT_SERIAL: AtomicI32 = AtomicI32::new(3);
-
-/// Allocate a new unique key serial number
+/// Reserve a new key serial number (Linux key_alloc_serial): a random
+/// start, never below 3, moved up past serials in use (wrapping back to
+/// 3). It is taken under the database lock by a placeholder entry, which
+/// `register_key` replaces or the key's Drop removes.
 pub fn alloc_serial() -> KeySerial {
-    NEXT_SERIAL.fetch_add(1, Ordering::Relaxed)
+    let mut serial = loop {
+        // Negative serials are not permitted (Linux: random >> 1)
+        let r = (crate::random::get_random_u32() >> 1) as KeySerial;
+        if r >= 3 {
+            break r;
+        }
+    };
+    let mut db = KEY_DATABASE.write();
+    while db.contains_key(&serial) {
+        serial = serial.checked_add(1).unwrap_or(3);
+    }
+    db.insert(serial, Weak::new());
+    serial
 }
 
 /// Register a key in the global database
@@ -147,9 +158,10 @@ pub fn remove_key(serial: KeySerial) {
 /// serial names another entry by then
 fn unregister_key(serial: KeySerial, key: *const Key) {
     let mut db = KEY_DATABASE.write();
+    // Its own entry, or the placeholder of a key never registered
     if db
         .get(&serial)
-        .is_some_and(|w| core::ptr::eq(w.as_ptr(), key))
+        .is_some_and(|w| core::ptr::eq(w.as_ptr(), key) || w.ptr_eq(&Weak::new()))
     {
         db.remove(&serial);
     }

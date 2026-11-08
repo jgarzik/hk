@@ -258,6 +258,34 @@ fn pids_max_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
     }
 }
 
+/// One past the largest pids.max (Linux PIDS_MAX: PID_MAX_LIMIT + 1,
+/// 64-bit)
+const PIDS_MAX: i64 = 4 * 1024 * 1024 + 1;
+
+/// Linux kstrtoll(s, 0): an optional sign, then `0x` hex, a leading `0`
+/// octal, else decimal; EINVAL if malformed, ERANGE past the range
+fn kstrtoll(s: &str) -> Result<i64, KernelError> {
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (radix, digits) = match body.strip_prefix("0x").or(body.strip_prefix("0X")) {
+        Some(h) => (16, h),
+        None if body.len() > 1 && body.starts_with('0') => (8, &body[1..]),
+        None => (10, body),
+    };
+    if digits.is_empty() || !digits.bytes().all(|c| (c as char).is_digit(radix)) {
+        return Err(KernelError::InvalidArgument);
+    }
+    let v = u64::from_str_radix(digits, radix).map_err(|_| KernelError::Range)?;
+    let v = if neg {
+        0i64.checked_sub_unsigned(v)
+    } else {
+        i64::try_from(v).ok()
+    };
+    v.ok_or(KernelError::Range)
+}
+
 /// Write pids.max
 fn pids_max_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelError> {
     if let Some(state) = css.private_as::<PidsState>() {
@@ -267,7 +295,12 @@ fn pids_max_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelErro
         let max = if trimmed == "max" {
             PIDS_MAX_UNLIMITED
         } else {
-            trimmed.parse().map_err(|_| KernelError::InvalidArgument)?
+            // Linux pids_max_write: kstrtoll, then 0..PIDS_MAX
+            let v = kstrtoll(trimmed)?;
+            if !(0..PIDS_MAX).contains(&v) {
+                return Err(KernelError::InvalidArgument);
+            }
+            v as u64
         };
 
         state.set_max(max);

@@ -188,10 +188,10 @@ pub use x86_64::tlb;
 
 // Kernel pages in the vmalloc area (mm::vmstack)
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::ioremap::{vmap_page, vunmap_page};
+pub(crate) use x86_64::ioremap::{vmap_page, vunmap_page};
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::ioremap::{vmap_page, vunmap_page};
+pub(crate) use aarch64::ioremap::{vmap_page, vunmap_page};
 
 // TLB self-test hook (kselftest, LOCKDEP builds)
 #[cfg(all(feature = "lockdep", target_arch = "x86_64"))]
@@ -343,11 +343,10 @@ pub trait PageTable: Sized {
     /// - aarch64: TTBR0/TTBR1 (translation table base)
     fn root_table_phys(&self) -> Self::PhysAddr;
 
-    /// Create a page table representing the current kernel identity mapping
-    ///
-    /// This uses the currently active page table (e.g., CR3 on x86-64).
-    /// No new allocation is performed.
-    fn kernel_identity() -> Self;
+    /// The root of the table kernel threads run on (x86 swapper, arm64
+    /// empty TTBR0), to load only: the shared kernel table is never a
+    /// page-table value, so nothing can map into it through one
+    fn kernel_root() -> Self::PhysAddr;
 }
 
 /// Frame allocator trait
@@ -590,10 +589,12 @@ pub trait IoremapOps {
 
     /// Unmap a previously mapped device memory region
     ///
-    /// # Arguments
-    /// * `virt_addr` - Virtual address returned by ioremap
-    /// * `size` - Size of the region (must match ioremap call)
-    fn iounmap(virt_addr: *mut u8, size: u64);
+    /// # Safety
+    ///
+    /// `virt_addr` and `size` are a mapping `ioremap` returned (with that
+    /// size) that the caller owns, and nothing uses it any more: no
+    /// reference into it or accessor of it (`IoMem`) is left.
+    unsafe fn iounmap(virt_addr: *mut u8, size: u64);
 }
 
 // ============================================================================

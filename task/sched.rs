@@ -99,9 +99,9 @@ pub struct SchedEntity {
     pub link: Link,
     /// Saved kernel context while switched out (under the rq lock)
     ctx: UnsafeCell<TaskContext>,
-    /// The kernel stack is freed with the task (the boot stack of the
-    /// first user task is not)
-    owns_stack: AtomicBool,
+    /// The kernel stack it owns, freed after its last switch away (none
+    /// for the boot stack of the first user task, nor an idle task's)
+    pub stack: crate::mm::vmstack::StackSlot,
     /// Next task on a [`WakeQ`](crate::task::percpu::WakeQ); null when
     /// on none (Linux wake_q_node)
     pub wake_q: AtomicPtr<()>,
@@ -134,7 +134,7 @@ impl SchedEntity {
             ctx: UnsafeCell::new(
                 <crate::arch::CurrentArch as crate::arch::ContextOps>::ZERO_CONTEXT,
             ),
-            owns_stack: AtomicBool::new(true),
+            stack: crate::mm::vmstack::StackSlot::empty(),
             wake_q: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -247,15 +247,6 @@ impl SchedEntity {
     pub unsafe fn ctx(&self) -> &mut TaskContext {
         // SAFETY: see above
         unsafe { &mut *self.ctx.get() }
-    }
-
-    pub fn owns_stack(&self) -> bool {
-        self.owns_stack.load(Ordering::Relaxed)
-    }
-
-    /// The task runs on a stack it does not own (before it is shared)
-    pub fn disown_stack(&self) {
-        self.owns_stack.store(false, Ordering::Relaxed);
     }
 }
 

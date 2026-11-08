@@ -11,6 +11,11 @@
 //! - ACCT_ASU: ASU marks a process that used a capability (Linux
 //!   PF_SUPERPRIV), not one that ran as root; AFORK one that forked and
 //!   never exec'd (PF_FORKNOEXEC)
+//! - ACCT_PIDNS: accounting is per pid namespace (Linux
+//!   pid_namespace->bacct): switched on inside a new one it records only
+//!   that namespace's processes, numbered there (its child 2 with parent
+//!   1, its init 1 with parent 0); the file switched on outside also
+//!   gets them, in outer numbers (the init with parent the caller)
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -27,6 +32,102 @@ pub fn run_tests() {
     test_acct_invalid_path();
     test_acct_group_once();
     test_acct_asu();
+    test_acct_pidns();
+}
+
+const ACCT_X: &[u8] = b"/tmp/acct_ns_x\0";
+const ACCT_Y: &[u8] = b"/tmp/acct_ns_y\0";
+
+/// An empty file at `path`
+fn create(path: &[u8]) {
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_WRONLY | O_TRUNC, 0o600);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+}
+
+/// The (ac_pid, ac_ppid) of each acct_v3 record of `path` (up to 16),
+/// and how many there were
+fn records(path: &[u8]) -> ([(u32, u32); 16], usize) {
+    let mut out = [(0, 0); 16];
+    let mut buf = [0u8; 64 * 16];
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    let n = if fd >= 0 {
+        let n = sys_read(fd as u64, buf.as_mut_ptr(), buf.len() as u64).max(0) as usize;
+        sys_close(fd as u64);
+        n
+    } else {
+        0
+    };
+    let u = |r: &[u8], at: usize| u32::from_ne_bytes([r[at], r[at + 1], r[at + 2], r[at + 3]]);
+    let mut k = 0;
+    for r in buf[..n - n % 64].chunks(64) {
+        out[k] = (u(r, 16), u(r, 20));
+        k += 1;
+    }
+    (out, k)
+}
+
+/// Reap `pid`: its exit code, 200 if the wait fails or a signal killed it
+fn reap(pid: i64) -> i64 {
+    let mut st = 0;
+    if pid <= 0 || sys_wait4(pid, &mut st, 0, 0) != pid || st & 0x7f != 0 {
+        return 200;
+    }
+    i64::from((st >> 8) & 0xff)
+}
+
+/// The namespace's init: accounting on inside, a child that exits,
+/// accounting off (its own record); the first failed step
+fn acct_ns_init() -> u64 {
+    if sys_acct(ACCT_Y.as_ptr()) != 0 {
+        return 1;
+    }
+    let z = sys_fork();
+    if z == 0 {
+        sys_exit_group(0);
+    }
+    let st = reap(z);
+    let off = sys_acct(ptr::null());
+    [z == 2, st == 0, off == 0]
+        .iter()
+        .position(|ok| !ok)
+        .map_or(0, |i| i as u64 + 2)
+}
+
+/// One namespace's file, one outer file: each numbers what it records
+fn test_acct_pidns() {
+    const CLONE_NEWPID: u64 = 0x2000_0000;
+    const SIGCHLD: u64 = 17;
+    create(ACCT_X);
+    create(ACCT_Y);
+    if sys_acct(ACCT_X.as_ptr()) != 0 {
+        println(b"ACCT_PIDNS:FAIL acct on");
+        return;
+    }
+    let y = hk_syscall::sys_clone(CLONE_NEWPID | SIGCHLD, 0, 0, 0, 0);
+    if y == 0 {
+        sys_exit_group(acct_ns_init());
+    }
+    let st = reap(y);
+    sys_acct(ptr::null());
+    let me = sys_getpid() as u32;
+    let (inner, ni) = records(ACCT_Y);
+    let (outer, no) = records(ACCT_X);
+    let outer = &outer[..no];
+    sys_unlink(ACCT_X.as_ptr());
+    sys_unlink(ACCT_Y.as_ptr());
+    let y = y as u32;
+    let steps = [
+        st == 0,
+        ni == 2,
+        inner[0] == (2, 1),
+        inner[1] == (1, 0),
+        outer.contains(&(y, me)),
+        outer.iter().any(|&(p, pp)| pp == y && p != y),
+    ];
+    let step = steps.iter().position(|ok| !ok).map_or(0, |i| i as i64 + 1);
+    crate::harness::report_step(b"ACCT_PIDNS", if st != 0 { 100 + st } else { step });
 }
 
 const THREADS: usize = 7;

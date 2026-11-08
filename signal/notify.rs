@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 /// SIGCHLD info for child `tid` with `code` (CLD_*) and `status`: its
 /// pid, real uid and CPU time in clock ticks (Linux
 /// do_notify_parent_cldstop's fields). None once it is gone.
-fn chld_info(tid: Tid, code: i32, status: i32) -> Option<SigInfo> {
+fn chld_info(tid: Tid, code: i32, status: i32, ns: &crate::ns::PidNamespace) -> Option<SigInfo> {
     let (uid, (utime, stime)) = {
         let table = TASKLIST.read();
         let t = table.get(tid)?;
@@ -19,7 +19,7 @@ fn chld_info(tid: Tid, code: i32, status: i32) -> Option<SigInfo> {
         )
     };
     let fields = SigFields::Chld {
-        pid: tid as i32,
+        pid: crate::task::pid::nr_ns(tid, ns) as i32,
         uid,
         status,
         utime: crate::time::ns_to_clock_t(utime) as i64,
@@ -40,7 +40,10 @@ pub fn notify_tracer_trapped(tid: Tid, tracer: &TaskRef, code: u32) {
         return;
     }
     let status = (code & 0x7f) as i32;
-    if let Some(info) = chld_info(tid, super::si_code::CLD_TRAPPED, status) {
+    // The tracee as its tracer's namespace numbers it (Linux
+    // do_notify_parent_cldstop: task_pid_nr_ns(tsk, ns of parent))
+    let ns = tracer.pid_ns();
+    if let Some(info) = chld_info(tid, super::si_code::CLD_TRAPPED, status, ns) {
         super::kill_proc_info(tracer.pid, SIGCHLD, SendInfo::Info(info));
     }
 }
@@ -86,13 +89,17 @@ pub enum Zombie {
     /// A zombie leader whose group just emptied, or moved to a new
     /// parent (Linux release_task, reparent_leader): its exit signal
     Leader(Tid),
+    /// A traced zombie leader whose tracer is done with it (reaped it,
+    /// or exited), told to its real parent as if never traced (Linux
+    /// wait_task_zombie EXIT_TRACE, __ptrace_detach): its exit signal
+    Detached(Tid),
 }
 
 impl Zombie {
     /// Its tid
     pub fn tid(self) -> Tid {
         match self {
-            Self::Exiting(t) | Self::Leader(t) => t,
+            Self::Exiting(t) | Self::Leader(t) | Self::Detached(t) => t,
         }
     }
 }
@@ -102,7 +109,10 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
     let tid = z.tid();
     let t = table.get(tid)?;
     let real = t.real_parent.as_ref().and_then(|w| w.upgrade());
-    let tracer = t.tracer();
+    let tracer = match z {
+        Zombie::Detached(_) => None,
+        _ => t.tracer(),
+    };
     let traced = tracer.is_some();
     let parent = tracer.or(real.clone())?;
     let own = match z {
@@ -114,7 +124,7 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
                 && !reparented
                 && !crate::task::percpu::group_pending(table, t.task.pid, &[tid])
         }
-        Zombie::Leader(_) => true,
+        Zombie::Leader(_) | Zombie::Detached(_) => true,
     };
     let mut sig = if own { t.exit_signal as u32 } else { SIGCHLD };
     // A custom exit signal only to the image that asked for it (Linux:
@@ -157,6 +167,13 @@ fn disposition(table: &GlobalTaskTable, to: &TaskRef, sig: u32) -> (u32, bool) {
         Some(a) if a.flags & sa_flags::SA_NOCLDWAIT != 0 => (sig, true),
         _ => (sig, false),
     }
+}
+
+/// The process `pid` reaps its children itself: it ignores SIGCHLD or
+/// set SA_NOCLDWAIT (Linux ignoring_children, by its SIGCHLD action as
+/// [`disposition`] reads it)
+pub fn ignoring_children(table: &GlobalTaskTable, pid: crate::task::Pid) -> bool {
+    super::group_task(table, table.get(pid)).is_some_and(|to| disposition(table, &to, SIGCHLD).1)
 }
 
 /// The entry a zombie's notice is queued with, made before TASKLIST is
@@ -212,7 +229,8 @@ impl Entry {
         };
         let info = SendInfo::Info(SigInfo::new(sig, super::si_code::CLD_EXITED, fields));
         let q = SigQueue::alloc(
-            info.resolve(sig),
+            // An Info: no namespace to number in (filled when queued)
+            info.resolve(sig, &crate::ns::INIT_PID_NS),
             tg.uid,
             tg.limit,
             info.override_rlimit(sig),
@@ -289,6 +307,8 @@ impl Told {
 /// is pending, and a parent its signal wakes finds it.
 pub fn notify(table: &GlobalTaskTable, z: Zombie, mut entry: Entry) -> Told {
     let tid = z.tid();
+    // Its pidfd pollers first (Linux do_notify_parent: do_notify_pidfd)
+    crate::task::percpu::notify_pidfd(table, tid);
     let Some(r) = receiver(table, z) else {
         return Told {
             entry,
@@ -296,10 +316,11 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie, mut entry: Entry) -> Told {
         };
     };
     let (sig, autoreap) = (r.sig, r.autoreap);
-    let posted = match chld_notice(table, tid) {
+    let posted = match chld_notice(table, tid, r.to.pid_ns()) {
         Some(mut info) if sig != 0 => {
             info.signo = sig as i32;
-            super::send_held(table, &r.to, sig, info, &mut entry.q)
+            let info = SendInfo::Info(info);
+            super::send_held(table, &r.to, sig, info, super::PidType::Tgid, &mut entry.q)
         }
         _ => None,
     };
@@ -311,9 +332,10 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie, mut entry: Entry) -> Told {
     }
 }
 
-/// Zombie `tid`'s notice info, read under TASKLIST: its pid, uid, wait
+/// Zombie `tid`'s notice info, read under TASKLIST: its pid (as the
+/// receiver's namespace `ns` numbers it: Linux do_notify_parent), uid, wait
 /// status, and its CPU times (a leader's: its group's)
-fn chld_notice(table: &GlobalTaskTable, tid: Tid) -> Option<SigInfo> {
+fn chld_notice(table: &GlobalTaskTable, tid: Tid, ns: &crate::ns::PidNamespace) -> Option<SigInfo> {
     let t = table.get(tid)?;
     let crate::task::TaskState::Zombie(own) = t.state else {
         return None;
@@ -329,7 +351,7 @@ fn chld_notice(table: &GlobalTaskTable, tid: Tid) -> Option<SigInfo> {
     };
     let (code, st) = chld_code(status);
     let fields = SigFields::Chld {
-        pid: tid as i32,
+        pid: crate::task::pid::nr_ns(tid, ns) as i32,
         uid: t.cred_arc().uid,
         status: st,
         utime: crate::time::ns_to_clock_t(utime) as i64,

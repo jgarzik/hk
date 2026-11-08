@@ -18,61 +18,53 @@
 //! dirty bits): a compare-and-swap that fails sees such an update, the
 //! same page with more bits, and nothing else.
 
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::PAGE_SIZE;
+use super::pgtable::{Dir, PgTables, Pmd};
 use crate::arch::paging;
-
-/// The page table entry at `p`, as an atomic
-pub(super) fn entry(p: *mut u64) -> &'static AtomicU64 {
-    // SAFETY: `p` points into a live page table (see the module doc)
-    unsafe { AtomicU64::from_ptr(p) }
-}
-
-/// Slot `i` of the table frame `table`
-pub(super) fn table_slot(table: u64, i: u64) -> *mut u64 {
-    // SAFETY: a live table frame, through the direct map
-    unsafe {
-        crate::arch::phys_to_virt(table)
-            .cast::<u64>()
-            .add(i as usize)
-    }
-}
 
 /// The part of one PTE table a walk visits: the 4KB entries of
 /// [start, end), all in the table frame `table`, its PTE lock held
-pub struct PteRange {
+/// (unless the walker reads hints only, `PteWalk::LOCKED`)
+///
+/// # Invariants
+///
+/// `table` is the PTE table of a `Pmd<'a>` of [start, end), kept for
+/// `'a`.
+pub struct PteRange<'a> {
     table: u64,
     /// First address
     pub start: u64,
     /// One past the last address (inside the same 2MB region)
     pub end: u64,
+    _pin: PhantomData<&'a ()>,
 }
 
-impl PteRange {
-    /// The entries of [start, end) of the table holding the entry `ptep`
-    /// (the caller holds its PTE lock)
-    pub fn at(ptep: *mut u64, start: u64, end: u64) -> Self {
-        Self {
-            table: crate::mm::ptl::table_of_ptep(ptep),
-            start,
-            end,
-        }
-    }
-
+impl PteRange<'_> {
     /// The table frame
     pub fn table(&self) -> u64 {
         self.table
     }
 
-    /// The entry for `addr` (inside the range)
-    pub fn entry(&self, addr: u64) -> &'static AtomicU64 {
-        debug_assert!(self.start <= addr && addr < self.end);
-        entry(table_slot(self.table, (addr >> 12) & 511))
+    /// The entry for `addr`, in the range or elsewhere in its table
+    /// (whose lock the walk holds for all of it), borrowed while the
+    /// walk is on this table
+    pub fn entry(&self, addr: u64) -> &AtomicU64 {
+        debug_assert!(addr >> 21 == self.start >> 21, "entry outside the table");
+        let i = ((addr >> 12) & 511) as usize;
+        let p = crate::arch::phys_to_virt(self.table)
+            .cast::<u64>()
+            .wrapping_add(i);
+        // SAFETY: entry `i` < 512 of a table kept for 'a (type
+        // invariant), borrowed no longer than `self`; entries are only
+        // accessed atomically
+        unsafe { AtomicU64::from_ptr(p) }
     }
 
     /// (address, entry) for each 4KB page of the range
-    pub fn iter(&self) -> impl Iterator<Item = (u64, &'static AtomicU64)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &AtomicU64)> + '_ {
         (self.start..self.end)
             .step_by(PAGE_SIZE as usize)
             .map(|a| (a, self.entry(a)))
@@ -99,15 +91,15 @@ pub trait PteWalk {
         Ok(())
     }
 
-    /// A 2MB page maps [addr, end) (inside its 2MB region; no PTE lock
-    /// held): true if done with the region, false to walk its PTE table
-    /// if it has one now (it was split)
-    fn huge(&mut self, _pmd: &AtomicU64, _addr: u64, _end: u64) -> Result<bool, Self::Err> {
+    /// A 2MB page, in the entry `pmd`, maps [addr, end) (inside its 2MB
+    /// region; no PTE lock held): true if done with the region, false
+    /// to walk its PTE table if it has one now (it was split)
+    fn huge(&mut self, _pmd: Pmd<'_>, _addr: u64, _end: u64) -> Result<bool, Self::Err> {
         Ok(true)
     }
 
     /// The entries of one PTE table, its PTE lock held: `pte` for each
-    fn ptes(&mut self, r: &PteRange) -> Result<(), Self::Err> {
+    fn ptes(&mut self, r: &PteRange<'_>) -> Result<(), Self::Err> {
         for (addr, e) in r.iter() {
             self.pte(e, addr)?;
         }
@@ -120,39 +112,37 @@ pub trait PteWalk {
     }
 }
 
-/// Walk the user page tables rooted at `pgd` over [start, end) with `w`
-/// (Linux walk_page_range); the first error stops it. Only user
-/// addresses: a range past TASK_SIZE is a bug (clamped).
-pub fn walk_pte_range<W: PteWalk>(pgd: u64, start: u64, end: u64, w: &mut W) -> Result<(), W::Err> {
+/// Walk the page tables `t` over [start, end) with `w` (Linux
+/// walk_page_range); the first error stops it. Addresses outside `t`'s
+/// pinned range are skipped; only user addresses: a range past
+/// TASK_SIZE is a bug.
+pub fn walk_pte_range<W: PteWalk>(
+    t: PgTables<'_>,
+    start: u64,
+    end: u64,
+    w: &mut W,
+) -> Result<(), W::Err> {
     debug_assert!(
         start <= end && end <= super::TASK_SIZE,
         "walk {start:#x}..{end:#x}"
     );
     let end = end.min(super::TASK_SIZE);
     if start < end {
-        walk_level(pgd, 3, start, end, w)?;
+        walk_level(t.top(), start, end, w)?;
     }
     Ok(())
 }
 
-/// The entries of the table `table` at `level` (3: top, 1: the 2MB
-/// level) for [start, end)
-fn walk_level<W: PteWalk>(
-    table: u64,
-    level: u32,
-    start: u64,
-    end: u64,
-    w: &mut W,
-) -> Result<(), W::Err> {
-    let shift = 12 + 9 * level;
+/// The entries of the table `d` for [start, end)
+fn walk_level<W: PteWalk>(d: Dir<'_>, start: u64, end: u64, w: &mut W) -> Result<(), W::Err> {
+    let shift = 12 + 9 * d.level();
     let mut addr = start;
     while addr < end {
         let next = ((addr | ((1u64 << shift) - 1)) + 1).min(end);
-        let slot = entry(table_slot(table, (addr >> shift) & 511));
-        if level == 1 {
-            walk_pmd(slot, addr, next, w)?;
-        } else if let Some(child) = paging::table_of(slot.load(Ordering::Acquire)) {
-            walk_level(child, level - 1, addr, next, w)?;
+        if let Some(pmd) = d.pmd(addr) {
+            walk_pmd(pmd, addr, next, w)?;
+        } else if let Some(child) = d.child(addr) {
+            walk_level(child, addr, next, w)?;
         }
         addr = next;
     }
@@ -161,24 +151,26 @@ fn walk_level<W: PteWalk>(
 
 /// One 2MB-level entry for [addr, end): its 2MB page, then its PTE
 /// table under the table's PTE lock
-fn walk_pmd<W: PteWalk>(pmd: &AtomicU64, addr: u64, end: u64, w: &mut W) -> Result<(), W::Err> {
+fn walk_pmd<W: PteWalk>(pmd: Pmd<'_>, addr: u64, end: u64, w: &mut W) -> Result<(), W::Err> {
     // A split under way is waited out: its slot is about to hold a PTE
     // table (huge_page::PMD_SPLITTING)
-    if paging::pmd_huge(super::huge_page::pmd_settled(pmd)) && w.huge(pmd, addr, end)? {
+    if paging::pmd_huge(pmd.settled()) && w.huge(pmd, addr, end)? {
         return Ok(());
     }
     if !W::PTES {
         return Ok(());
     }
-    let Some(table) = paging::table_of(super::huge_page::pmd_settled(pmd)) else {
+    let Some(table) = pmd.pte_table() else {
         return Ok(());
     };
     w.prepare(addr, end)?;
     let _l = W::LOCKED.then(|| super::ptl::table_lock(table));
+    // INVARIANT: the PTE table of `pmd`, kept as long as it is
     w.ptes(&PteRange {
         table,
         start: addr,
         end,
+        _pin: PhantomData,
     })
 }
 
@@ -196,13 +188,15 @@ pub fn selftest() -> Option<&'static str> {
     unsafe { core::ptr::write_bytes(phys_to_virt(root), 0, PAGE_SIZE as usize) };
     // Owns `root`: dropping it frees the tables
     let mm = super::mm_alloc(root);
+    let map = mm.mmap_read();
+    let tables = PgTables::new(&mm, &map);
     let addrs = [A, A + PAGE_SIZE, B, B + 5 * PAGE_SIZE];
     for (i, &a) in addrs.iter().enumerate() {
-        let Some(p) = paging::pte_alloc(root, a) else {
+        let Some(p) = tables.pte_alloc(&mm, a) else {
             return Some("pagewalk_alloc");
         };
         // Swap-like values: no frame behind them, nothing to free
-        entry(p).store((i as u64 + 1) << 12, Ordering::Release);
+        p.lock().store(a, (i as u64 + 1) << 12);
     }
     struct Seen {
         tables: u32,
@@ -211,7 +205,7 @@ pub fn selftest() -> Option<&'static str> {
     }
     impl PteWalk for Seen {
         type Err = ();
-        fn ptes(&mut self, r: &PteRange) -> Result<(), ()> {
+        fn ptes(&mut self, r: &PteRange<'_>) -> Result<(), ()> {
             self.tables += 1;
             for (a, e) in r.iter() {
                 if e.load(Ordering::Acquire) != 0 {
@@ -227,7 +221,7 @@ pub fn selftest() -> Option<&'static str> {
         found: [0; 4],
         n: 0,
     };
-    let ok = walk_pte_range(root, PAGE_SIZE, 0x1_0000_0000, &mut s).is_ok()
+    let ok = walk_pte_range(tables, PAGE_SIZE, 0x1_0000_0000, &mut s).is_ok()
         && s.tables == 2
         && s.n == 4
         && s.found == addrs;
@@ -237,15 +231,16 @@ pub fn selftest() -> Option<&'static str> {
         found: [0; 4],
         n: 0,
     };
-    let part = walk_pte_range(root, B + PAGE_SIZE, B + 6 * PAGE_SIZE, &mut t).is_ok()
+    let part = walk_pte_range(tables, B + PAGE_SIZE, B + 6 * PAGE_SIZE, &mut t).is_ok()
         && t.tables == 1
         && t.n == 1
         && t.found[0] == B + 5 * PAGE_SIZE;
     for &a in &addrs {
-        if let Some(p) = paging::pte_ptr(root, a) {
-            entry(p).store(0, Ordering::Release);
+        if let Some(p) = tables.pte(a) {
+            p.lock().store(a, 0);
         }
     }
+    drop(map);
     drop(mm);
     match (ok, part) {
         (true, true) => None,

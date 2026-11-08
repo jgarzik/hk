@@ -505,8 +505,13 @@ impl Ooo {
         if self.map.len() >= OOO_MAX {
             return false;
         }
+        // No memory: the segment is dropped, the peer resends it (Linux
+        // tcp_data_queue_ofo's failed tcp_try_rmem_schedule)
+        let Ok(v) = crate::util::kmem::try_to_vec(d) else {
+            return false;
+        };
         self.bytes += d.len();
-        self.map.insert(off, d.to_vec());
+        self.map.insert(off, v);
         true
     }
 
@@ -552,11 +557,13 @@ impl Ooo {
         let old = core::mem::take(&mut self.map);
         self.bytes = 0;
         self.base = nxt;
-        for (s, d) in old {
+        for (s, mut d) in old {
             let skip = shift.saturating_sub(s) as usize;
             if skip < d.len() {
-                self.bytes += d.len() - skip;
-                self.map.insert(s + skip as u32 - shift, d[skip..].to_vec());
+                // trimmed in place: no allocation on the receive path
+                d.drain(..skip);
+                self.bytes += d.len();
+                self.map.insert(s + skip as u32 - shift, d);
             }
         }
     }
@@ -586,11 +593,13 @@ impl Ooo {
             if s > at {
                 return None;
             }
-            let d = self.map.remove(&s)?;
+            let mut d = self.map.remove(&s)?;
             self.bytes -= d.len();
             let skip = (at - s) as usize;
             if skip < d.len() {
-                return Some(d[skip..].to_vec());
+                // trimmed in place: no allocation on the receive path
+                d.drain(..skip);
+                return Some(d);
             }
         }
     }
@@ -722,7 +731,7 @@ pub struct TcpCb {
     held: usize,
 }
 
-/// Counters for TCP_INFO
+/// Counters for TCP_INFO; the u32 ones wrap, as Linux tcp_info's
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
     pub total_retrans: u32,

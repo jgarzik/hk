@@ -478,16 +478,15 @@ pub fn dirty_folio(m: &AddressSpace, phys: u64) {
 fn mkclean(m: &AddressSpace, index: u64, phys: u64) {
     use crate::arch::paging;
     let chain = m.i_mmap.read();
-    for avc in chain.iter() {
+    for (avc, tables) in chain.entries() {
         let (Some(addr), Some(mm)) = (avc.address(index), avc.mm.upgrade()) else {
             continue;
         };
-        let Some(ptep) = paging::pte_ptr(avc.pgd, addr) else {
+        let Some(ptep) = tables.pte(addr) else {
             continue;
         };
-        let _l = super::ptl::pte_lock(ptep);
-        // SAFETY: a live table of a VMA in the chain, under its PTE lock
-        let e = unsafe { AtomicU64::from_ptr(ptep) };
+        let t = ptep.lock();
+        let e = t.entry(addr);
         // The MMU may set accessed/dirty meanwhile (under the PTE lock
         // only it changes the entry): a compare-exchange keeps those
         // bits, where a load then store could drop a dirty bit set by a
@@ -862,7 +861,7 @@ pub fn unmap_mapping_range(m: &AddressSpace, from: u64) {
 /// `unmap_mapping_range` of the pages with index in [from, last]
 pub fn unmap_pages(m: &AddressSpace, from: u64, last: u64) {
     let chain = m.i_mmap.read();
-    for avc in chain.iter() {
+    for (avc, t) in chain.entries() {
         let pages = (avc.end - avc.start) / PAGE_SIZE as u64;
         if avc.pgoff + pages <= from || avc.pgoff > last {
             continue;
@@ -877,7 +876,7 @@ pub fn unmap_pages(m: &AddressSpace, from: u64, last: u64) {
         let start = page_addr(from);
         let end = page_addr(last.saturating_add(1)).min(avc.end);
         let mut tlb = super::gather::Gather::new(&mm);
-        super::memory::zap_range(&mut tlb, start, end);
+        super::memory::zap_range(&mut tlb, t, start, end);
     }
 }
 

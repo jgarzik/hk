@@ -243,6 +243,17 @@ impl Drop for SeccompFilter {
     }
 }
 
+/// struct sock_fprog (Linux include/uapi/linux/filter.h): the count
+/// of instructions, padding, then the user address of the first
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockFprog {
+    len: u16,
+    _pad: [u16; 3],
+    filter: u64,
+}
+crate::pod!(SockFprog { len, _pad, filter });
+
 /// Copy a struct sock_fprog from user memory and build a filter on
 /// `prev` (Linux seccomp_prepare_user_filter)
 pub fn create_filter_from_user<A: crate::uaccess::UaccessArch>(
@@ -250,11 +261,13 @@ pub fn create_filter_from_user<A: crate::uaccess::UaccessArch>(
     prev: Option<Arc<SeccompFilter>>,
     log: bool,
 ) -> Result<Arc<SeccompFilter>, KernelError> {
-    use crate::uaccess::{copy_from_user, get_user};
+    use crate::uaccess::{copy_from_user, copy_val_from_user};
 
-    // struct sock_fprog { u16 len; struct sock_filter *filter; }
-    let len = get_user::<A, u16>(fprog_ptr).map_err(|_| KernelError::BadAddress)? as usize;
-    let ptr = get_user::<A, u64>(fprog_ptr + 8).map_err(|_| KernelError::BadAddress)?;
+    // Read whole (Linux seccomp_prepare_user_filter: copy_from_user of
+    // the struct), so no field address is computed from the pointer
+    let fprog =
+        copy_val_from_user::<A, SockFprog>(fprog_ptr).map_err(|_| KernelError::BadAddress)?;
+    let (len, ptr) = (usize::from(fprog.len), fprog.filter);
     if len == 0 || len > classic::BPF_MAXINSNS {
         return Err(KernelError::InvalidArgument);
     }

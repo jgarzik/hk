@@ -270,12 +270,13 @@ fn all_mms() -> Vec<Arc<super::Mm>> {
 /// Fault in the swap PTEs of type `ty` in `mm`
 fn unuse_mm(mm: &super::Mm, ty: u8) -> Result<(), KernelError> {
     let map = mm.mmap_read_killable()?;
+    let t = super::pgtable::PgTables::new(mm, &map);
     for vma in map.iter().filter(|v| v.anon_vma.is_some()) {
         let mut addr = vma.start;
         while addr < vma.end {
-            match super::memory::next_swap_pte(mm.pgd(), addr, vma.end, ty) {
+            match super::memory::next_swap_pte(t, addr, vma.end, ty) {
                 Some(a) => {
-                    super::fault::unuse_pte(mm, vma, a).map_err(|_| KernelError::OutOfMemory)?;
+                    super::fault::unuse_pte(mm, t, vma, a).map_err(|_| KernelError::OutOfMemory)?;
                     addr = a + super::PAGE_SIZE;
                 }
                 None => break,

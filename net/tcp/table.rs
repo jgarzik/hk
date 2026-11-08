@@ -295,8 +295,17 @@ impl TcpTables {
             }
             i32::from(!a.is_unspecified()) * 2 + i32::from(dev != 0)
         };
-        let best = v.iter().map(|s| score(s)).max().filter(|&b| b >= 0)?;
-        v.iter().find(|s| score(s) == best).cloned()
+        // One pass, each listener scored once: a bind or SO_BINDTODEVICE
+        // racing this lookup cannot make a second look miss the winner
+        // (Linux inet_lhash2_lookup)
+        let mut best: Option<(i32, &Arc<TcpSock>)> = None;
+        for s in v {
+            let sc = score(s);
+            if sc >= 0 && best.is_none_or(|b| sc > b.0) {
+                best = Some((sc, s));
+            }
+        }
+        best.map(|b| b.1.clone())
     }
 
     /// Listeners, then connections and TIME_WAIT entries (Linux

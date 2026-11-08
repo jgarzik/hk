@@ -60,6 +60,7 @@ pub fn tables() -> &'static [&'static [Ctl]] {
         crate::task::fdbits::FS_CTLS,
         crate::fs::dac::PROTECTED_CTLS,
         crate::bpf::syscall::BPF_CTLS,
+        crate::io::inotify::INOTIFY_CTLS,
     ];
     TABLES
 }

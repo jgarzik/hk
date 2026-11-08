@@ -220,14 +220,6 @@ pub fn rlimit_max(resource: u32) -> u64 {
 // Syscall Implementations
 // =============================================================================
 
-/// Find task TID by process PID
-///
-/// Searches the task table for a task with the given PID.
-fn find_task_by_pid(pid: u64) -> Option<Tid> {
-    let table = crate::task::percpu::TASKLIST.read();
-    table.get(pid).map(|t| t.task.tid())
-}
-
 /// sys_getrlimit - get resource limits
 ///
 /// Syscall number: 97 (x86_64), 163 (aarch64)
@@ -332,7 +324,7 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
     let target_tid = if pid == 0 {
         current_tid()
     } else {
-        match find_task_by_pid(pid as u64) {
+        match crate::task::percpu::find_task_by_vpid(pid as u64).map(|t| t.tid()) {
             Some(tid) => tid,
             None => return -3, // ESRCH
         }

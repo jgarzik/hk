@@ -234,6 +234,19 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
+    /// Where symlink `inode` (on mount `mnt`) leads if it is a magic
+    /// link, one that goes to an object rather than to the path its
+    /// readlink shows (Linux get_link + nd_jump_link); None for a plain
+    /// symlink
+    fn jump_link(
+        &self,
+        inode: &Inode,
+        mnt: &Arc<super::mount::Mount>,
+    ) -> Option<Result<super::Path, KernelError>> {
+        let _ = (inode, mnt);
+        None
+    }
+
     /// Create a symbolic link
     fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, target);
@@ -515,6 +528,9 @@ pub struct Inode {
     /// The file's page cache (Linux i_data)
     pub i_data: crate::mm::filemap::AddressSpace,
 
+    /// The inotify watches on it (Linux i_fsnotify_marks)
+    pub fsnotify: crate::io::inotify::Marks,
+
     /// On its superblock's dirty list (Linux I_DIRTY_PAGES; fs_writeback)
     pub(crate) i_dirty: core::sync::atomic::AtomicBool,
 
@@ -573,6 +589,7 @@ impl Inode {
             i_hash: AtomicU64::new(0),
             i_hashed: core::sync::atomic::AtomicBool::new(false),
             i_data: crate::mm::filemap::AddressSpace::new(),
+            fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
@@ -617,6 +634,7 @@ impl Inode {
             i_hash: AtomicU64::new(0),
             i_hashed: core::sync::atomic::AtomicBool::new(false),
             i_data: crate::mm::filemap::AddressSpace::new(),
+            fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),

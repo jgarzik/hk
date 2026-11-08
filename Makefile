@@ -20,6 +20,12 @@ DISK_IMAGE = target/disk.img
 # check (MMCHECK:FAIL), e.g. make check LOCKDEP=1
 KERNEL_FEATURES = $(if $(LOCKDEP),--features lockdep)
 
+# OVERFLOW=1: the release kernel (not user/) with overflow checks, so an
+# unintended integer wrap panics instead of wrapping silently, e.g.
+# make check OVERFLOW=1 (phase-end heavy gate; intended wraps use
+# wrapping_* / overflowing_*)
+KERNEL_FEATURES += $(if $(OVERFLOW),--config profile.release.overflow-checks=true)
+
 # Machine-specific ISO configuration
 # Usage: make iso MACHINE=dell
 MACHINE ?=
@@ -49,6 +55,7 @@ help:
 	@echo "  make disk-image - Build the virtio-blk test disk (target/disk.img)"
 	@echo "  make check    - Boot kernel in QEMU, verify tests pass"
 	@echo "  make check LOCKDEP=1 - Same with lockdep-lite (LOCKDEP:FAIL reports)"
+	@echo "  make check OVERFLOW=1 - Same with integer overflow checks (panics)"
 	@echo ""
 	@echo "  make build-arm - Build ARM64 kernel"
 	@echo "  make run-arm   - Run ARM64 kernel in QEMU"

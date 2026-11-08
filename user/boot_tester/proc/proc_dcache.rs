@@ -3,12 +3,16 @@
 //! a closed fd's link are gone even after being looked up, the owner of
 //! a process's files follows its dumpability, and inode numbers do not
 //! collide
+//! - PROC_OPEN_REAPED: files opened before a process is reaped stay its
+//!   own (Linux proc_inode->pid): its status and stat then read ESRCH,
+//!   its directory lists ENOENT
 
 use crate::harness::{R, check, report_r};
 use crate::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
-    O_RDONLY, PR_SET_DUMPABLE, Stat, sys_close, sys_exit, sys_fork, sys_kill, sys_open, sys_pipe2,
-    sys_prctl, sys_read, sys_readlink, sys_setgid, sys_setuid, sys_stat, sys_wait4, sys_write,
+    O_DIRECTORY, O_RDONLY, PR_SET_DUMPABLE, Stat, sys_close, sys_exit, sys_fork, sys_kill,
+    sys_open, sys_pipe2, sys_prctl, sys_read, sys_readlink, sys_setgid, sys_setuid, sys_stat,
+    sys_wait4, sys_write,
 };
 
 const ENOENT: i64 = -2;
@@ -16,6 +20,7 @@ const SIGKILL: u32 = 9;
 
 pub fn run_tests() {
     report_r(b"PROC_PID_GONE", pid_gone());
+    report_r(b"PROC_OPEN_REAPED", open_reaped());
     report_r(b"PROC_FD_CLOSED", fd_closed());
     report_r(b"PROC_OWNER_REFRESH", owner_refresh());
     report_r(b"PROC_INO_UNIQUE", ino_unique());
@@ -83,6 +88,44 @@ fn pid_gone() -> R {
     check(b"alive", alive, -1)?;
     check(b"dir gone", stat(&dir).err() == Some(ENOENT), -1)?;
     check(b"file gone", stat(&status).err() == Some(ENOENT), -1)
+}
+
+/// Status, stat and the directory of a process, opened while it lives,
+/// read after it is reaped
+fn open_reaped() -> R {
+    const ESRCH: i64 = -3;
+    let (pid, w) = waiting_child();
+    let mut b = [0u8; 64];
+    let mut b2 = [0u8; 64];
+    let mut b3 = [0u8; 64];
+    let status = sys_open(proc_path(&mut b, pid, b"/status").as_ptr(), O_RDONLY, 0);
+    let st = sys_open(proc_path(&mut b2, pid, b"/stat").as_ptr(), O_RDONLY, 0);
+    let dir = sys_open(
+        proc_path(&mut b3, pid, b"").as_ptr(),
+        O_RDONLY | O_DIRECTORY,
+        0,
+    );
+    sys_kill(pid, SIGKILL);
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    sys_close(w as u64);
+    let mut buf = [0u8; 256];
+    let r1 = sys_read(status as u64, buf.as_mut_ptr(), buf.len() as u64);
+    let r2 = sys_read(st as u64, buf.as_mut_ptr(), buf.len() as u64);
+    let r3 = hk_syscall::sys_getdents64(dir as u64, buf.as_mut_ptr(), buf.len() as u64);
+    for fd in [status, st, dir] {
+        if fd >= 0 {
+            sys_close(fd as u64);
+        }
+    }
+    check(
+        b"open",
+        status >= 0 && st >= 0 && dir >= 0,
+        status.min(st).min(dir),
+    )?;
+    check(b"status ESRCH", r1 == ESRCH, r1)?;
+    check(b"stat ESRCH", r2 == ESRCH, r2)?;
+    check(b"dir ENOENT", r3 == ENOENT, r3)
 }
 
 /// /proc/self/fd/N and fdinfo/N go with the fd

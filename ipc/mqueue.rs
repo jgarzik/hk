@@ -33,8 +33,8 @@ use core::any::Any;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use crate::sync::spin::{Mutex, RwLock};
-use spin::Lazy;
+use crate::sync::RwSem;
+use crate::sync::spin::Mutex;
 
 use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
@@ -183,6 +183,17 @@ pub struct MqQueue {
     notify: Mutex<Option<MqNotify>>,
     waitq_send: WaitQueue,
     waitq_recv: WaitQueue,
+    /// The creator's real uid and the bytes charged to it (Linux
+    /// info->ucounts, mq_bytes), returned when the queue is freed
+    charge: (u32, u64),
+}
+
+impl Drop for MqQueue {
+    /// The queue is gone (unlinked, last file closed): its charges go
+    /// (Linux mqueue_evict_inode)
+    fn drop(&mut self) {
+        mq_uncharge(self.charge.0, self.charge.1);
+    }
 }
 
 impl MqQueue {
@@ -198,7 +209,9 @@ impl MqQueue {
                 } else {
                     0
                 },
-                n.owner.nr(),
+                // In the reader's namespace (Linux mqueue_read_file:
+                // pid_vnr)
+                n.owner.vnr(),
             ),
             None => (0, 0, 0),
         };
@@ -207,7 +220,8 @@ impl MqQueue {
         )
     }
 
-    fn new(name: FileName, mode: u32, maxmsg: i64, msgsize: i64) -> Self {
+    /// A queue charged as `charge` (see [`mq_charge`])
+    fn new(name: FileName, mode: u32, maxmsg: i64, msgsize: i64, charge: (u32, u64)) -> Self {
         // Get current task's effective uid/gid as owner
         let cred = crate::task::percpu::current_cred();
         Self {
@@ -223,6 +237,7 @@ impl MqQueue {
             notify: Mutex::new(None),
             waitq_send: WaitQueue::new(),
             waitq_recv: WaitQueue::new(),
+            charge,
         }
     }
 
@@ -378,11 +393,13 @@ impl MqQueue {
             // The registrant's authority, not the sender's (Linux
             // __do_notify sends without the kill permission check), and
             // only to the process that registered: not after it exited
-            // or exec'd; signal 0 sends nothing
-            let live = n.owner.exited().is_none() && n.owner.exec_gen() == n.exec_gen;
+            // or exec'd (Linux __do_notify: pid_task and self_exec_id;
+            // a released process has no task to send to); signal 0
+            // sends nothing
+            let live = n.owner.exec_gen() == n.exec_gen;
             let sig = n.sigev_signo as u32;
             if n.sigev_notify == SIGEV_SIGNAL && live && sig != 0 {
-                let info = mesgq_info(sig, n.sigev_value);
+                let info = mesgq_info(sig, n.sigev_value, &n.owner);
                 // To the registrant's struct pid, never its number
                 crate::signal::kill_pid_info(&n.owner, sig, info, |_| 0);
             }
@@ -391,11 +408,14 @@ impl MqQueue {
 }
 
 /// SI_MESGQ info from the current task, the process that made the queue
-/// non-empty, with the registrant's sigev_value (Linux __do_notify)
-fn mesgq_info(sig: u32, value: u64) -> crate::signal::SendInfo {
+/// non-empty, as the registrant `owner`'s namespace numbers it, with its
+/// sigev_value (Linux __do_notify: task_tgid_nr_ns(current,
+/// ns_of_pid(notify_owner)))
+fn mesgq_info(sig: u32, value: u64, owner: &crate::task::pid::Pid) -> crate::signal::SendInfo {
     use crate::signal::{SendInfo, SigFields, SigInfo, si_code};
+    let me = crate::task::percpu::current_pid();
     let fields = SigFields::Rt {
-        pid: crate::task::percpu::current_pid() as i32,
+        pid: crate::task::pid::nr_ns(me, owner.ns()) as i32,
         uid: crate::task::current_cred().uid,
         value,
     };
@@ -484,10 +504,98 @@ impl FileOps for MqFileOps {
 // Global Registry
 // ============================================================================
 
-static MQ_REGISTRY: Lazy<RwLock<BTreeMap<FileName, Arc<MqQueue>>>> =
-    Lazy::new(|| RwLock::new(BTreeMap::new()));
+/// The queues by name (Linux: the mqueue root directory, under its
+/// i_rwsem): sleeping, as a create allocates the queue under it
+static MQ_REGISTRY: RwSem<BTreeMap<FileName, Arc<MqQueue>>> = RwSem::new(BTreeMap::new());
 
 static MQ_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Queues in the system without CAP_SYS_RESOURCE (Linux
+/// DFLT_QUEUESMAX, fs.mqueue.queues_max)
+const QUEUES_MAX: u32 = 256;
+
+/// sizeof(struct msg_msg) and sizeof(struct posix_msg_tree_node) on
+/// 64-bit Linux: the per-message overhead in a queue's charge
+const MSG_MSG_SIZE: u64 = 48;
+const MSG_TREE_NODE_SIZE: u64 = 48;
+
+/// The queue count and each user's queue bytes (Linux mq_lock over
+/// ipc_ns->mq_queues_count and the UCOUNT_RLIMIT_MSGQUEUE ucounts); a
+/// leaf, taken under `MQ_REGISTRY` by a create and by a queue's Drop
+struct MqAcct {
+    queues: u32,
+    /// (uid, bytes) of each user with a charge; grown with the lock
+    /// released (`kmem::spare`): nothing allocates under it
+    bytes: Vec<(u32, u64)>,
+}
+
+static MQ_ACCT: Mutex<MqAcct> = Mutex::new(MqAcct {
+    queues: 0,
+    bytes: Vec::new(),
+});
+
+/// What a queue of `maxmsg` messages of `msgsize` bytes charges its
+/// creator against RLIMIT_MSGQUEUE (Linux mqueue_get_inode's mq_bytes);
+/// both positive and capped by mq_attr_ok, so the sum fits
+fn mq_bytes(maxmsg: i64, msgsize: i64) -> u64 {
+    let (m, s) = (maxmsg as u64, msgsize as u64);
+    m * MSG_MSG_SIZE + m.min(u64::from(MQ_PRIO_MAX)) * MSG_TREE_NODE_SIZE + m * s
+}
+
+/// Charge a new queue of `bytes` to the caller's real uid (Linux
+/// mqueue_create_attr, mqueue_get_inode): ENOSPC past QUEUES_MAX
+/// without CAP_SYS_RESOURCE, EMFILE past `limit` (the caller's
+/// RLIMIT_MSGQUEUE), ENOMEM; the charge. A user's first charge needs
+/// room in the list: it is made with `MQ_ACCT` released and the check
+/// repeated (Linux charges the cred's ucounts, made before)
+fn mq_charge(bytes: u64, limit: u64) -> Result<(u32, u64), KernelError> {
+    let uid = crate::task::percpu::current_cred().uid;
+    let cap = crate::task::capable(crate::task::CAP_SYS_RESOURCE);
+    loop {
+        let full = 'locked: {
+            let mut a = MQ_ACCT.lock();
+            if a.queues >= QUEUES_MAX && !cap {
+                return Err(KernelError::NoSpace);
+            }
+            let i = a.bytes.iter().position(|e| e.0 == uid);
+            let cur = i.map_or(0, |i| a.bytes[i].1);
+            let new = cur
+                .checked_add(bytes)
+                .filter(|&n| limit == rlimit::RLIM_INFINITY || n <= limit)
+                .ok_or(KernelError::ProcessFileLimit)?;
+            match i {
+                Some(i) => a.bytes[i].1 = new,
+                None if a.bytes.len() < a.bytes.capacity() => a.bytes.push((uid, new)),
+                None => break 'locked a.bytes.capacity(),
+            }
+            a.queues += 1;
+            return Ok((uid, bytes));
+        };
+        mq_grow(full)?;
+    }
+}
+
+/// Room for one more user in `MQ_ACCT` if its list is still full at
+/// `cap`: allocated, and the old list freed, with the lock released
+fn mq_grow(cap: usize) -> Result<(), KernelError> {
+    let bigger = crate::util::kmem::spare(cap)?;
+    let old = crate::util::kmem::adopt(&mut MQ_ACCT.lock().bytes, bigger);
+    drop(old);
+    Ok(())
+}
+
+/// Return a queue's charge
+fn mq_uncharge(uid: u32, bytes: u64) {
+    let mut a = MQ_ACCT.lock();
+    a.queues = a.queues.saturating_sub(1);
+    if let Some(i) = a.bytes.iter().position(|e| e.0 == uid) {
+        let b = &mut a.bytes[i].1;
+        *b = b.saturating_sub(bytes);
+        if *b == 0 {
+            a.bytes.swap_remove(i);
+        }
+    }
+}
 
 // ============================================================================
 // Helper Functions
@@ -612,6 +720,9 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
         None
     };
 
+    // Read before the registry's spin lock
+    let msgq_limit = rlimit::rlimit(rlimit::RLIMIT_MSGQUEUE);
+
     // Try to find or create queue
     let queue = {
         let mut registry = MQ_REGISTRY.write();
@@ -639,11 +750,17 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
                 None => (DFLT_MSGMAX, DFLT_MSGSIZEMAX),
             };
 
+            let charge = match mq_charge(mq_bytes(maxmsg, msgsize), msgq_limit) {
+                Ok(c) => c,
+                Err(e) => return e.sysret(),
+            };
+            // A queue that cannot be made returns its charge as it drops
             let queue = match try_arc(MqQueue::new(
                 queue_name.clone().into(),
                 mode,
                 maxmsg,
                 msgsize,
+                charge,
             )) {
                 Ok(q) => q,
                 Err(e) => return e.sysret(),
@@ -721,8 +838,7 @@ fn mq_deadline(abs: u64) -> Result<Option<u64>, KernelError> {
     if abs == 0 {
         return Ok(None);
     }
-    let sec = get_user::<Uaccess, i64>(abs).map_err(|_| KernelError::BadAddress)?;
-    let nsec = get_user::<Uaccess, i64>(abs + 8).map_err(|_| KernelError::BadAddress)?;
+    let [sec, nsec] = get_user::<Uaccess, [i64; 2]>(abs).map_err(|_| KernelError::BadAddress)?;
     if !(0..1_000_000_000).contains(&nsec) || sec < 0 {
         return Err(KernelError::InvalidArgument);
     }
@@ -764,8 +880,8 @@ pub fn sys_mq_timedsend(
         return KernelError::BadFd.sysret();
     }
 
-    // Check message size
-    if msg_len as i64 > mq_ops.queue.msgsize {
+    // Check message size (msgsize is positive: mq_attr_ok)
+    if msg_len > mq_ops.queue.msgsize as usize {
         return KernelError::MessageTooLong.sysret();
     }
 
@@ -824,8 +940,8 @@ pub fn sys_mq_timedreceive(
         return KernelError::BadFd.sysret();
     }
 
-    // Check buffer size
-    if (msg_len as i64) < mq_ops.queue.msgsize {
+    // Check buffer size (msgsize is positive: mq_attr_ok)
+    if msg_len < mq_ops.queue.msgsize as usize {
         return KernelError::MessageTooLong.sysret();
     }
 

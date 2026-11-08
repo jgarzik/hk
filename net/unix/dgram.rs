@@ -290,7 +290,7 @@ fn take(s: &UnixSock, peek: bool) -> Option<Rx> {
             Rx {
                 skb: None,
                 peeked: skb.data.clone(),
-                creds: skb.creds,
+                creds: skb.creds.clone(),
                 fds: skb.fds.as_ref().map(|f| f.dup()),
                 from: skb.from.clone(),
             }
@@ -298,7 +298,7 @@ fn take(s: &UnixSock, peek: bool) -> Option<Rx> {
             let mut skb = q.q.pop_front()?;
             q.bytes -= skb.len();
             Rx {
-                creds: skb.creds,
+                creds: skb.creds.take(),
                 fds: skb.fds.take(),
                 from: skb.from.clone(),
                 skb: Some(skb),
@@ -374,7 +374,7 @@ fn deliver(
         m.flags |= MSG_TRUNC;
     }
     m.data.put(0, &rx.data()[..size])?;
-    super::scm_recv(s, m, rx.creds, rx.fds.take());
+    super::scm_recv(s, m, rx.creds.take(), rx.fds.take());
     drop(rx);
     Ok(if flags & MSG_TRUNC != 0 { n } else { size })
 }

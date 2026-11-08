@@ -14,17 +14,22 @@
 //!
 //! Uses Linux acct_v3 format (64 bytes per record).
 //! Records are written when processes exit (group leader exits).
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+//!
+//! Accounting is per pid namespace (Linux pid_namespace->bacct): acct(2)
+//! sets the caller's namespace's file, and an exiting process writes
+//! its record to the file of its namespace and of each one above it,
+//! numbered as that namespace sees it.
 
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use crate::fs::KernelError;
 use crate::fs::file::File;
+use crate::ns::PidNamespace;
 use crate::sync::spin::Mutex;
 use crate::task::CAP_SYS_PACCT;
-use crate::task::Pid;
 use crate::task::Tid;
+use crate::util::pod::IntoBytes;
 
 // =============================================================================
 // Accounting Flags
@@ -48,8 +53,8 @@ pub const ACCT_VERSION: u8 = 3;
 // Accounting Record Structure (Linux ABI - acct_v3)
 // =============================================================================
 
-/// Linux acct_v3 structure (64 bytes)
-#[repr(C, packed)]
+/// Linux acct_v3 structure (64 bytes, every field naturally aligned)
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AcctV3 {
     /// Flags: AFORK, ASU, ACORE, AXSIG
@@ -98,17 +103,27 @@ pub const ACCT_V3_SIZE: usize = core::mem::size_of::<AcctV3>();
 // Compile-time check that AcctV3 is 64 bytes
 const _: () = assert!(ACCT_V3_SIZE == 64);
 
-impl AcctV3 {
-    /// Get the record as a byte slice
-    pub fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::from_ref::<AcctV3>(self).cast::<u8>(),
-                ACCT_V3_SIZE,
-            )
-        }
-    }
-}
+crate::pod!(AcctV3 {
+    ac_flag,
+    ac_version,
+    ac_tty,
+    ac_exitcode,
+    ac_uid,
+    ac_gid,
+    ac_pid,
+    ac_ppid,
+    ac_btime,
+    ac_etime,
+    ac_utime,
+    ac_stime,
+    ac_mem,
+    ac_io,
+    ac_rw,
+    ac_minflt,
+    ac_majflt,
+    ac_swaps,
+    ac_comm,
+});
 
 // =============================================================================
 // comp_t Encoding
@@ -165,19 +180,55 @@ fn encode_float(mut value: u64) -> u32 {
 // Accounting State
 // =============================================================================
 
-/// The accounting file (Linux acct->file). A leaf spin lock, thread
-/// context only: users clone the file out and write with no lock held
-/// (the write sleeps), and a replaced file is released after unlocking.
-static ACCT_FILE: Mutex<Option<Arc<File>>> = Mutex::new(None);
+/// A pid namespace's accounting file (Linux pid_namespace->bacct,
+/// acct->file). A leaf spin lock, thread context only: users clone the
+/// file out and write with no lock held (the write sleeps), and a
+/// replaced file is released after unlocking.
+pub struct Acct(Mutex<Option<Arc<File>>>);
 
-/// Install `file` (None: accounting off). The old file gets a record
-/// for the calling process before it is released, with no lock held
-/// (Linux acct_pin_kill -> do_acct_process(current))
+impl Default for Acct {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+impl Acct {
+    /// The file, if accounting is on
+    fn get(&self) -> Option<Arc<File>> {
+        self.0.lock().clone()
+    }
+
+    /// Install `file`, returning the old one
+    fn replace(&self, file: Option<Arc<File>>) -> Option<Arc<File>> {
+        core::mem::replace(&mut *self.0.lock(), file)
+    }
+}
+
+/// Install `file` as the caller's namespace's (None: accounting off).
+/// The old file gets a record for the calling process before it is
+/// released, with no lock held (Linux acct_pin_kill ->
+/// do_acct_process(current))
 fn set_acct_file(file: Option<Arc<File>>) {
-    let old = core::mem::replace(&mut *ACCT_FILE.lock(), file);
-    if let Some(old) = old {
-        let tid = crate::task::percpu::current_tid();
-        write_record(&old, tid, crate::task::percpu::current_pid(), 0);
+    let ns = crate::task::pid::current_pid_ns();
+    if let Some(old) = ns.bacct.replace(file) {
+        close(&old, ns);
+    }
+}
+
+/// The record of the calling process into `old`, which is then
+/// released (Linux acct_pin_kill)
+fn close(old: &File, ns: &PidNamespace) {
+    let tid = crate::task::percpu::current_tid();
+    if let Some(info) = get_task_info(tid) {
+        write_record(old, ns, tid, &info, 0);
+    }
+}
+
+/// Namespace `ns` is ending (its init is past the zap): its accounting
+/// stops with a record of the caller, its init (Linux acct_exit_ns)
+pub fn exit_ns(ns: &PidNamespace) {
+    if let Some(old) = ns.bacct.replace(None) {
+        close(&old, ns);
     }
 }
 
@@ -269,24 +320,30 @@ fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
 /// Write accounting record for an exiting process
 ///
 /// Called by a process's last exiting thread before it releases its
-/// mm and files (Linux acct_process from do_exit).
+/// mm and files (Linux acct_process from do_exit): into the accounting
+/// file of its pid namespace and of each one above it.
 /// It's best-effort - failures are silently ignored to not block the exit path.
-pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
-    // Accounting enabled? (the file is used with no lock held)
-    let Some(file) = ACCT_FILE.lock().clone() else {
-        return;
-    };
-    write_record(&file, tid, pid, exit_status);
+pub fn write_acct_record(tid: Tid, exit_status: i32) {
+    let mut info = None;
+    let mut ns = Some(crate::task::pid::current_pid_ns());
+    while let Some(n) = ns {
+        // Accounting on there? (the file is used with no lock held)
+        if let Some(file) = n.bacct.get() {
+            if info.is_none() {
+                info = get_task_info(tid);
+            }
+            if let Some(i) = &info {
+                write_record(&file, n, tid, i, exit_status);
+            }
+        }
+        ns = n.parent.as_deref();
+    }
 }
 
-/// Write the record of process `pid` (thread `tid`) to `file`
-fn write_record(file: &File, tid: Tid, pid: Pid, exit_status: i32) {
-    // Get task information
-    let task_info = match get_task_info(tid) {
-        Some(info) => info,
-        None => return, // Task not found
-    };
-
+/// Write the record of the process of thread `tid` to `file`, the
+/// accounting file of `ns`, which numbers it (Linux fill_ac: ac_pid
+/// and ac_ppid by task_tgid_nr_ns with acct->ns)
+fn write_record(file: &File, ns: &PidNamespace, tid: Tid, task_info: &TaskInfo, exit_status: i32) {
     // Compute flags
     let mut ac_flag: u8 = 0;
 
@@ -317,8 +374,8 @@ fn write_record(file: &File, tid: Tid, pid: Pid, exit_status: i32) {
         ac_exitcode: exit_status as u32,
         ac_uid: task_info.uid,
         ac_gid: task_info.gid,
-        ac_pid: pid as u32,
-        ac_ppid: task_info.ppid as u32,
+        ac_pid: task_info.tgid.as_ref().map_or(0, |p| p.nr_ns(ns)),
+        ac_ppid: task_info.parent.as_ref().map_or(0, |p| p.nr_ns(ns)),
         ac_btime: task_info.start_time,
         ac_etime: encode_float(nsec_to_ahz(task_info.elapsed_ns)),
         ac_utime: encode_comp_t(nsec_to_ahz(task_info.utime_ns)),
@@ -351,7 +408,10 @@ fn write_record(file: &File, tid: Tid, pid: Pid, exit_status: i32) {
 struct TaskInfo {
     uid: u32,
     gid: u32,
-    ppid: Pid,
+    /// Its process's and its parent's pids (Linux task_tgid of current
+    /// and of real_parent), numbered per file
+    tgid: Option<Arc<crate::task::pid::Pid>>,
+    parent: Option<Arc<crate::task::pid::Pid>>,
     tty: u16,
     start_time: u32,
     elapsed_ns: u64,
@@ -399,10 +459,13 @@ fn get_task_info(tid: Tid) -> Option<TaskInfo> {
     };
     let start_time = (realtime_start_ns / 1_000_000_000) as u32;
 
+    // Taken under TASKLIST, released after it (3.1.1 rule 4)
+    let pid_of = |p| table.get(p).and_then(|t| t.thread_pid.clone());
     Some(TaskInfo {
         uid,
         gid,
-        ppid: task.task.ppid(),
+        tgid: pid_of(task.task.pid),
+        parent: pid_of(task.task.ppid()),
         tty: 0, // TODO: Get controlling terminal
         start_time,
         elapsed_ns,

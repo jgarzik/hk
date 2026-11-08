@@ -46,6 +46,38 @@ pub struct UserRegsStruct {
     pub fs: u64,
     pub gs: u64,
 }
+crate::pod!(UserRegsStruct {
+    r15,
+    r14,
+    r13,
+    r12,
+    rbp,
+    rbx,
+    r11,
+    r10,
+    r9,
+    r8,
+    rax,
+    rcx,
+    rdx,
+    rsi,
+    rdi,
+    orig_rax,
+    rip,
+    cs,
+    eflags,
+    rsp,
+    ss,
+    fs_base,
+    gs_base,
+    ds,
+    es,
+    fs,
+    gs
+});
+
+/// The register block PTRACE_GETREGS / PTRACE_SETREGS copy
+pub type UserRegs = UserRegsStruct;
 
 // =============================================================================
 // Register access functions

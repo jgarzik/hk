@@ -10,33 +10,17 @@
 //! only a private (copy-on-write) one, whose page is then copied and
 //! stays read-only to the target if its mapping is.
 
-use core::sync::atomic::Ordering;
-
 use crate::arch::paging;
-use crate::mm::ptl::{pt_lock, pte_lock};
+use crate::mm::pgtable::PgTables;
+use crate::mm::ptl::pt_lock;
 use crate::mm::vma::{PROT_READ, PROT_WRITE};
 use crate::mm::{Mm, MmStruct, Vma};
 use crate::util::error::KernelError;
 
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::paging::{X86_64PageTable, phys_to_virt};
-
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::paging::{Aarch64PageTable, phys_to_virt};
+use crate::arch::phys_to_virt;
 
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
-
-/// Translate virtual address to physical using another process's page table
-#[cfg(target_arch = "x86_64")]
-fn translate_with_root(page_table_root: u64, va: u64) -> Option<u64> {
-    X86_64PageTable::translate_with_root(page_table_root, va)
-}
-
-#[cfg(target_arch = "aarch64")]
-fn translate_with_root(page_table_root: u64, va: u64) -> Option<u64> {
-    Aarch64PageTable::translate_with_root(page_table_root, va)
-}
 
 /// The VMA of `addr` in the target, if it may be accessed (Linux
 /// check_vma_flags): a user address with a VMA; without `force` the VMA
@@ -108,7 +92,8 @@ pub fn access_remote_vm_read(
             if let Err(e) = remote_vma(&map, addr, false, force) {
                 return short(done, e);
             }
-            read_pages(target, addr, &mut buf[done..done + chunk])?
+            let t = PgTables::new(target, &map);
+            read_pages(target, t, addr, &mut buf[done..done + chunk])?
         };
         if n == 0 {
             // Not present: fault it in and retry
@@ -144,7 +129,8 @@ pub fn access_remote_vm_write(
                 Ok(v) => v,
                 Err(e) => return short(done, e),
             };
-            let r = write_page(target, vma, addr, &buf[done..done + chunk]);
+            let t = PgTables::new(target, &map);
+            let r = write_page(target, t, vma, addr, &buf[done..done + chunk]);
             (r, vma.prot & PROT_WRITE != 0)
         };
         match r {
@@ -169,32 +155,29 @@ pub fn access_remote_vm_write(
 }
 
 /// Run `f` on the physical address `addr` maps to in `mm` (None if
-/// unmapped), with the page-table lock of its entry held, so a racing
-/// zap (MADV_DONTNEED) or copy-on-write break cannot free the frame
-/// while `f` copies through it
-fn with_frame<R>(mm: &Mm, addr: u64, f: impl FnOnce(u64) -> R) -> Option<R> {
-    let pgd = mm.pgd();
+/// unmapped; `t`: its tables), with the page-table lock of its entry
+/// held, so a racing zap (MADV_DONTNEED) or copy-on-write break cannot
+/// free the frame while `f` copies through it
+fn with_frame<R>(mm: &Mm, t: PgTables<'_>, addr: u64, f: impl FnOnce(u64) -> R) -> Option<R> {
     loop {
-        if let Some(p) = paging::pte_ptr(pgd, addr) {
-            let _l = pte_lock(p);
-            // SAFETY: `p` points into a live table; its lock is held
-            let pte = unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.load(Ordering::Acquire);
-            return frame_of(pte, addr).map(f);
+        if let Some(p) = t.pte(addr) {
+            let l = p.lock();
+            return frame_of(l.get(addr), addr).map(f);
         }
         // No 4KB table: a 2MB page or nothing, both stable under the
         // page_table_lock unless a split installed a table meanwhile
         let _l = pt_lock(mm);
-        if paging::pte_ptr(pgd, addr).is_none() {
-            return translate_with_root(pgd, addr).map(f);
+        if t.pte(addr).is_none() {
+            return t.translate(addr).map(f);
         }
     }
 }
 
 /// Copy the start of page `addr` into `buf` (within one page); the
 /// bytes read, 0 if not mapped
-fn read_pages(mm: &Mm, addr: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
+fn read_pages(mm: &Mm, t: PgTables<'_>, addr: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
     let n = buf.len();
-    Ok(with_frame(mm, addr, |phys| {
+    Ok(with_frame(mm, t, addr, |phys| {
         // SAFETY: a mapped frame, kept by the held page-table lock
         unsafe { core::ptr::copy_nonoverlapping(phys_to_virt(phys), buf.as_mut_ptr(), n) };
         n
@@ -220,10 +203,17 @@ enum Wrote {
 /// a racing MADV_DONTNEED or fault may have put another page there,
 /// which is never written through. A frame outside the allocator
 /// (MMIO) is EFAULT.
-fn write_page(mm: &Mm, vma: &Vma, addr: u64, buf: &[u8]) -> Result<Wrote, KernelError> {
+fn write_page(
+    mm: &Mm,
+    t: PgTables<'_>,
+    vma: &Vma,
+    addr: u64,
+    buf: &[u8],
+) -> Result<Wrote, KernelError> {
     if !vma.is_shared() {
         crate::mm::fault::unshare_for_write(
             mm,
+            t,
             addr,
             vma.anon_vma.clone(),
             vma.index_of(addr),
@@ -231,7 +221,7 @@ fn write_page(mm: &Mm, vma: &Vma, addr: u64, buf: &[u8]) -> Result<Wrote, Kernel
         )
         .map_err(|_| KernelError::OutOfMemory)?;
     }
-    write_frame(mm, addr, buf, !vma.is_shared())
+    write_frame(mm, t, addr, buf, !vma.is_shared())
 }
 
 /// The byte of page `addr` a 4KB entry maps, also when it is PROT_NONE
@@ -253,12 +243,16 @@ fn exclusive(pte: u64) -> bool {
 /// Copy `buf` to page `addr` under the entry's page-table lock; with
 /// `private`, only if the 4KB entry is `exclusive` (a 2MB page is never
 /// shared)
-fn write_frame(mm: &Mm, addr: u64, buf: &[u8], private: bool) -> Result<Wrote, KernelError> {
-    let pgd = mm.pgd();
-    if private && let Some(p) = paging::pte_ptr(pgd, addr) {
-        let _l = pte_lock(p);
-        // SAFETY: `p` points into a live table; its lock is held
-        let pte = unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.load(Ordering::Acquire);
+fn write_frame(
+    mm: &Mm,
+    t: PgTables<'_>,
+    addr: u64,
+    buf: &[u8],
+    private: bool,
+) -> Result<Wrote, KernelError> {
+    if private && let Some(p) = t.pte(addr) {
+        let l = p.lock();
+        let pte = l.get(addr);
         let Some(phys) = frame_of(pte, addr) else {
             return Ok(Wrote::Absent);
         };
@@ -267,7 +261,7 @@ fn write_frame(mm: &Mm, addr: u64, buf: &[u8], private: bool) -> Result<Wrote, K
         }
         return copy_to_frame(phys, buf);
     }
-    with_frame(mm, addr, |phys| copy_to_frame(phys, buf)).unwrap_or(Ok(Wrote::Absent))
+    with_frame(mm, t, addr, |phys| copy_to_frame(phys, buf)).unwrap_or(Ok(Wrote::Absent))
 }
 
 /// Copy `buf` into the frame at `phys`: an ordinary frame only (Linux

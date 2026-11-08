@@ -13,6 +13,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use super::pgtable::PgTables;
 use super::shmem::Shmem;
 use super::{
     MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
@@ -54,7 +55,7 @@ pub fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
     };
     let r = walk(&mut map, &mm, start, end, advice, &mut punch);
     #[cfg(feature = "mmcheck")]
-    super::check::verify(map.get(), mm.pgd(), "madvise");
+    super::check::verify(&mm, map.get(), "madvise");
     drop(map);
     // MADV_REMOVE frees the shared object's pages after the zap, also
     // for the VMAs done before an error (Linux punches VMA by VMA)
@@ -191,11 +192,14 @@ fn vma_advise(
         MADV_WILLNEED => Ok(()),
         MADV_COLD | MADV_PAGEOUT => {
             lru_ok(vma)?;
-            cold_or_pageout(vma, owner, start, end, advice == MADV_PAGEOUT);
+            let t = PgTables::new(owner, mm);
+            cold_or_pageout(vma, owner, t, start, end, advice == MADV_PAGEOUT);
             Ok(())
         }
-        MADV_DONTNEED | MADV_FREE => dontneed(vma, owner, start, end, advice),
-        MADV_REMOVE => remove(vma, owner, start, end, punch),
+        MADV_DONTNEED | MADV_FREE => {
+            dontneed(vma, owner, PgTables::new(owner, mm), start, end, advice)
+        }
+        MADV_REMOVE => remove(vma, owner, PgTables::new(owner, mm), start, end, punch),
         _ => {
             let flags = new_flags(vma, advice)?;
             match map {
@@ -226,8 +230,9 @@ fn lru_ok(vma: &Vma) -> Result<(), KernelError> {
 /// madvise_cold_or_pageout_pte_range), mm lock held for reading: 2MB
 /// pages are split first, the pages taken off the LRU under each
 /// table's PTE lock, then reclaimed with no spinlock held (the swap
-/// writes sleep). Without swap, PAGEOUT leaves anonymous memory alone.
-fn cold_or_pageout(vma: &Vma, owner: &Mm, start: u64, end: u64, pageout: bool) {
+/// writes sleep), one table's worth at a time like Linux's per-PMD
+/// reclaim_pages. Without swap, PAGEOUT leaves anonymous memory alone.
+fn cold_or_pageout(vma: &Vma, owner: &Mm, t: PgTables<'_>, start: u64, end: u64, pageout: bool) {
     if vma.anon_vma.is_none() || (pageout && super::swap::swap_totals().0 == 0) {
         return;
     }
@@ -237,24 +242,47 @@ fn cold_or_pageout(vma: &Vma, owner: &Mm, start: u64, end: u64, pageout: bool) {
         pageout,
         pages: Vec::new(),
     };
-    let _ = super::pagewalk::walk_pte_range(owner.pgd(), start, end, &mut w);
-    if !w.pages.is_empty() {
-        super::vmscan::reclaim_pages(w.pages);
-    }
+    let _ = super::pagewalk::walk_pte_range(t, start, end, &mut w);
+    w.flush();
 }
 
-/// `cold_or_pageout`'s walk: the pages to reclaim
+/// Most pages one PTE table maps (a batch never grows under its lock)
+const PTRS_PER_PTE: usize = 512;
+
+/// `cold_or_pageout`'s walk: the pages isolated from the current table,
+/// in room reserved before its PTE lock
 struct Cold<'a> {
     mm: &'a Mm,
     pageout: bool,
     pages: Vec<u64>,
 }
 
-impl super::pagewalk::PteWalk for Cold<'_> {
-    type Err = core::convert::Infallible;
+impl Cold<'_> {
+    /// Reclaim the batch (no spin lock held)
+    fn flush(&mut self) {
+        if !self.pages.is_empty() {
+            super::vmscan::reclaim_pages(core::mem::take(&mut self.pages));
+        }
+    }
+}
 
-    fn huge(&mut self, _: &AtomicU64, addr: u64, _: u64) -> Result<bool, Self::Err> {
-        let _ = super::huge_page::split_huge_pmd(self.mm, addr);
+impl super::pagewalk::PteWalk for Cold<'_> {
+    type Err = KernelError;
+
+    /// Before each table's lock: reclaim the last table's pages and
+    /// reserve room for this one's (ENOMEM ends the walk)
+    fn prepare(&mut self, _addr: u64, _end: u64) -> Result<(), Self::Err> {
+        if !self.pageout {
+            return Ok(());
+        }
+        self.flush();
+        self.pages
+            .try_reserve_exact(PTRS_PER_PTE)
+            .map_err(|_| KernelError::OutOfMemory)
+    }
+
+    fn huge(&mut self, pmd: super::pgtable::Pmd<'_>, _: u64, _: u64) -> Result<bool, Self::Err> {
+        let _ = super::huge_page::split_huge_pmd(self.mm, pmd);
         Ok(false)
     }
 
@@ -262,7 +290,8 @@ impl super::pagewalk::PteWalk for Cold<'_> {
         if let Some(phys) = own_page(e) {
             if !self.pageout {
                 super::lru::deactivate(phys);
-            } else if super::lru::isolate(phys) {
+            } else if self.pages.len() < self.pages.capacity() && super::lru::isolate(phys) {
+                // Within the room `prepare` reserved: no allocation here
                 self.pages.push(phys);
             }
         }
@@ -287,13 +316,20 @@ fn own_page(e: &AtomicU64) -> Option<u64> {
 /// MADV_DONTNEED / MADV_FREE (Linux madvise_dontneed_free): not on
 /// locked memory, MADV_FREE only on private anonymous memory. MADV_FREE
 /// frees at once, like DONTNEED (the pages are not kept for reuse).
-fn dontneed(vma: &Vma, owner: &Mm, start: u64, end: u64, advice: i32) -> Result<(), KernelError> {
+fn dontneed(
+    vma: &Vma,
+    owner: &Mm,
+    t: PgTables<'_>,
+    start: u64,
+    end: u64,
+    advice: i32,
+) -> Result<(), KernelError> {
     if vma.is_locked() || (advice == MADV_FREE && !is_anon(vma)) {
         return Err(KernelError::InvalidArgument);
     }
     // Under the mm lock held for reading: a racing fault may map a page
     // again (the page-table locks order it before or after the zap)
-    super::memory::zap_range(&mut super::gather::Gather::new(owner), start, end);
+    super::memory::zap_range(&mut super::gather::Gather::new(owner), t, start, end);
     Ok(())
 }
 
@@ -306,6 +342,7 @@ fn dontneed(vma: &Vma, owner: &Mm, start: u64, end: u64, advice: i32) -> Result<
 fn remove(
     vma: &Vma,
     owner: &Mm,
+    t: PgTables<'_>,
     start: u64,
     end: u64,
     punch: &mut Vec<Punch>,
@@ -322,7 +359,7 @@ fn remove(
     if vma.file.is_some() {
         return Err(KernelError::OperationNotSupported);
     }
-    super::memory::zap_range(&mut super::gather::Gather::new(owner), start, end);
+    super::memory::zap_range(&mut super::gather::Gather::new(owner), t, start, end);
     if let Some(sh) = &vma.shmem {
         let first = vma.offset + start - vma.start;
         let last = vma.offset + end - vma.start;

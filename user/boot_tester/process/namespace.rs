@@ -3,6 +3,7 @@
 //! Tests for namespace-related syscalls:
 //! - unshare(2) - create new namespace(s) for current process
 //! - setns(2) - join existing namespace via file descriptor
+//! - /proc/<pid>/ns/<type>: links reading "<type>:[<inum>]" (NS_LINK)
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{linux_at_least, print, print_num, println};
@@ -27,6 +28,12 @@ pub fn run_tests() {
     test_unshare_newns();
     test_setns_ebadf();
     test_setns_uts();
+    let r = ns_links();
+    if r == 0 {
+        pass(b"NS_LINK");
+    } else {
+        fail_num(b"NS_LINK:FAIL step ", i64::from(r));
+    }
     test_pivot_root_enoent();
     test_pivot_root_enotdir();
     test_pivot_root_einval();
@@ -193,6 +200,89 @@ fn test_unshare_newuts() {
             fail_num(b"UNSHARE_NEWUTS:FAIL exit_status=", exit_status as i64);
         }
     }
+}
+
+/// The number in "<type>:[<n>]", what readlink of `path` (NUL-terminated)
+/// gives for a namespace link of type `ty`; 0 if it is not that
+fn ns_link(path: &[u8], ty: &[u8]) -> u64 {
+    let mut b = [0u8; 64];
+    let n = hk_syscall::sys_readlink(path.as_ptr(), b.as_mut_ptr(), b.len() as u64);
+    if n <= 0 {
+        return 0;
+    }
+    let s = &b[..n as usize];
+    if s.len() < ty.len() + 3 || &s[..ty.len()] != ty || &s[ty.len()..ty.len() + 2] != b":[" {
+        return 0;
+    }
+    if s[s.len() - 1] != b']' {
+        return 0;
+    }
+    let mut v = 0u64;
+    for &c in &s[ty.len() + 2..s.len() - 1] {
+        if !c.is_ascii_digit() {
+            return 0;
+        }
+        v = v * 10 + u64::from(c - b'0');
+    }
+    v
+}
+
+/// st_ino of what `path` leads to (0 on error) and whether `path`
+/// itself is a symlink
+fn ns_stat(path: &[u8]) -> (u64, bool) {
+    // SAFETY: Stat is plain integers
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let ino = if sys_stat(path.as_ptr(), &mut st) == 0 {
+        st.st_ino
+    } else {
+        0
+    };
+    // SAFETY: Stat is plain integers
+    let mut l: Stat = unsafe { core::mem::zeroed() };
+    let link =
+        hk_syscall::sys_lstat(path.as_ptr(), &mut l) == 0 && l.st_mode & 0o170000 == 0o120000;
+    (ino, link)
+}
+
+/// NS_LINK: /proc/<pid>/ns/<type> is a symlink reading "<type>:[<inum>]",
+/// the inode number of the namespace (Linux ns_get_name), which is the
+/// st_ino of the file it leads to; a child shares its parent's number
+/// until it unshares, then has a new one, and the parent's stays
+fn ns_links() -> i32 {
+    let uts = b"/proc/self/ns/uts\0";
+    let parent = ns_link(uts, b"uts");
+    let (ino, link) = ns_stat(uts);
+    if parent == 0 {
+        return 1;
+    }
+    if ino != parent || !link {
+        return 2;
+    }
+    let pid = ns_link(b"/proc/self/ns/pid\0", b"pid");
+    if pid == 0 || pid == parent || ns_stat(b"/proc/self/ns/pid\0").0 != pid {
+        return 3;
+    }
+    let c = sys_fork();
+    if c == 0 {
+        let same = ns_link(uts, b"uts") == parent;
+        if sys_unshare(CLONE_NEWUTS) != 0 {
+            sys_exit(10);
+        }
+        let mine = ns_link(uts, b"uts");
+        let ok = [same, mine != 0 && mine != parent, ns_stat(uts).0 == mine];
+        sys_exit(ok.iter().position(|o| !o).map_or(0, |i| 11 + i as u64));
+    }
+    let mut ws = 0;
+    if c < 0 || sys_wait4(c, &mut ws, 0, 0) != c {
+        return 4;
+    }
+    if ws != 0 {
+        return (ws >> 8) & 0xff;
+    }
+    if ns_link(uts, b"uts") != parent {
+        return 5;
+    }
+    0
 }
 
 /// Test: unshare(CLONE_NEWNET) creates new network namespace

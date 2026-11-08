@@ -40,6 +40,7 @@ pub mod mremap;
 pub mod page;
 pub mod page_alloc;
 pub mod pagewalk;
+pub mod pgtable;
 pub mod ptl;
 pub mod remote;
 pub mod rmap;
@@ -420,6 +421,17 @@ impl MmStruct {
             .iter()
             .position(|v| v.start > vma.start)
             .unwrap_or(self.vmas.len());
+        // VMAs never overlap: two would own the same pages and free
+        // them twice (callers remove the range first, as Linux
+        // vma_link's callers do)
+        assert!(
+            pos == 0 || self.vmas[pos - 1].end <= vma.start,
+            "insert_vma: overlaps the VMA below"
+        );
+        assert!(
+            self.vmas.get(pos).is_none_or(|v| vma.end <= v.start),
+            "insert_vma: overlaps the VMA above"
+        );
         self.link(&vma);
         // VMA allocation failure is not plumbed to the ~20 callers (the
         // Vec growth beside it cannot fail gracefully either)
@@ -938,6 +950,13 @@ impl Mm {
         self.map.write_killable()
     }
 
+    /// `map` is this address space's VMA tree (the one under its
+    /// mmap_lock), so a borrow of it pins this address space's page
+    /// tables (`pgtable::PgTables`)
+    pub fn holds(&self, map: &MmStruct) -> bool {
+        core::ptr::eq(map, self.map.data_ptr())
+    }
+
     /// The page_table_lock (taken through `ptl::pt_lock`)
     pub(crate) fn page_table_lock(&self) -> &Mutex<()> {
         &self.page_table_lock
@@ -984,27 +1003,20 @@ pub struct MmRef(Arc<Mm>);
 impl MmRef {
     /// A new address space rooted at the fresh table `pgd`, with one user
     pub fn new(pgd: u64, mut map: MmStruct) -> Self {
-        Self::new_cyclic(pgd, |me| {
-            map.set_owner(me, pgd);
-            map
-        })
-    }
-
-    /// A new address space rooted at `pgd`, with one user, whose VMAs
-    /// `build` makes knowing the address space (for rmap chains)
-    fn new_cyclic(pgd: u64, build: impl FnOnce(&Weak<Mm>) -> MmStruct) -> Self {
-        // Not try_arc_cyclic: that runs `build` with preemption off, and
-        // dup_mm's copies the page tables under the parent's mmap_lock.
         // The failure is not plumbed (fork, exec and boot callers)
-        MmRef(arc_cyclic_nofail(|me| Mm {
-            users: AtomicUsize::new(1),
-            pgd,
-            map: RwSem::new(build(me)),
-            page_table_lock: Mutex::new(()),
-            dumpable: AtomicU8::new(crate::task::dumpable::SUID_DUMP_USER),
-            ctx: tlb::MmContext::new(),
-            membarrier: AtomicU32::new(0),
-            sigpage: AtomicU64::new(0),
+        MmRef(arc_cyclic_nofail(|me| {
+            // Knowing the address space (for rmap chains)
+            map.set_owner(me, pgd);
+            Mm {
+                users: AtomicUsize::new(1),
+                pgd,
+                map: RwSem::new(map),
+                page_table_lock: Mutex::new(()),
+                dumpable: AtomicU8::new(crate::task::dumpable::SUID_DUMP_USER),
+                ctx: tlb::MmContext::new(),
+                membarrier: AtomicU32::new(0),
+                sigpage: AtomicU64::new(0),
+            }
         }))
     }
 
@@ -1123,51 +1135,55 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
         crate::FRAME_ALLOCATOR.free(pgd);
         return Err(KernelError::Interrupted.errno());
     };
+    let mut header = MmStruct::new(guard.mmap_base);
+    header.start_brk = guard.start_brk;
+    header.brk = guard.brk;
+    header.total_vm = guard.total_vm;
+    header.exe = guard.exe.clone();
+    header.exe_deny = guard.exe_deny.clone();
+    header.args = guard.args;
+    let child = MmRef::new(pgd, header);
+    // The child's mm lock for writing, nested in the parent's (Linux
+    // dup_mmap: mmap_write_lock_nested): no one else can reach the
+    // child yet, and its page tables are borrowed from this guard
+    let mut map = child.mmap_write();
     let mut res = Ok(());
-    let child = MmRef::new_cyclic(pgd, |me| {
-        let mut map = MmStruct::new(guard.mmap_base);
-        map.set_owner(me, pgd);
-        map.start_brk = guard.start_brk;
-        map.brk = guard.brk;
-        map.total_vm = guard.total_vm;
-        map.exe = guard.exe.clone();
-        map.exe_deny = guard.exe_deny.clone();
-        map.args = guard.args;
-        for vma in guard.iter() {
-            if vma.flags & VM_DONTCOPY != 0 {
-                map.total_vm -= vma.size() / PAGE_SIZE;
-                continue;
-            }
-            let mut v = vma.clone();
-            v.flags &= !VM_LOCKED_MASK;
-            if v.flags & VM_WIPEONFORK != 0 && v.anon_vma.is_some() {
-                match anon_vma::AnonVma::new() {
-                    Ok(av) => v.anon_vma = Some(av),
-                    Err(e) => {
-                        // Not linked: the child is torn down below
-                        res = Err(e.errno());
-                        break;
-                    }
+    for vma in guard.iter() {
+        if vma.flags & VM_DONTCOPY != 0 {
+            map.total_vm -= vma.size() / PAGE_SIZE;
+            continue;
+        }
+        let mut v = vma.clone();
+        v.flags &= !VM_LOCKED_MASK;
+        if v.flags & VM_WIPEONFORK != 0 && v.anon_vma.is_some() {
+            match anon_vma::AnonVma::new() {
+                Ok(av) => v.anon_vma = Some(av),
+                Err(e) => {
+                    // Not linked: the child is torn down below
+                    res = Err(e.errno());
+                    break;
                 }
             }
-            // In the chain before its pages are copied (Linux
-            // anon_vma_fork before copy_page_range)
-            map.link(&v);
-            if vma_needs_copy(&v) {
-                res = memory::copy_page_range(pgd, parent, &v).map(|wp| {
-                    if wp {
-                        tlb::flush_tlb_mm_range(parent, v.start, v.end, tlb::PAGE_SHIFT, false);
-                    }
-                });
-            }
-            // Not plumbed: see `insert_vma`
-            map.vmas.push(box_nofail(v));
-            if res.is_err() {
-                break;
-            }
         }
-        map
-    });
+        // In the chain before its pages are copied (Linux
+        // anon_vma_fork before copy_page_range)
+        map.link(&v);
+        if vma_needs_copy(&v) {
+            let dst = pgtable::PgTables::new(&child, &map);
+            let src = pgtable::PgTables::new(parent, &guard);
+            res = memory::copy_page_range(dst, &child, src, parent, &v).map(|wp| {
+                if wp {
+                    tlb::flush_tlb_mm_range(parent, v.start, v.end, tlb::PAGE_SHIFT, false);
+                }
+            });
+        }
+        // Not plumbed: see `insert_vma`
+        map.vmas.push(box_nofail(v));
+        if res.is_err() {
+            break;
+        }
+    }
+    drop(map);
     drop(guard);
     // A fork child's address space holds the same secrets (Linux
     // dup_mmap copies mm->flags)

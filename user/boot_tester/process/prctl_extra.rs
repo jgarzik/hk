@@ -2,9 +2,15 @@
 //!
 //! Tests for PR_SET/GET_KEEPCAPS, PR_SET/GET_CHILD_SUBREAPER, PR_SET/GET_THP_DISABLE,
 //! x86-64 specific PR_SET/GET_TSC, and x86-64 arch_prctl(ARCH_GET/SET_CPUID)
+//!
+//! The subreaper flag is the process's (Linux signal->is_child_subreaper):
+//! set by a thread that then exits, it stays, every thread reads it, a
+//! forked child does not inherit it, and an orphan goes to a live
+//! thread of the subreaper process.
 
-use crate::harness::{fail_num, pass};
+use crate::harness::{fail_num, pass, verdict};
 use crate::helpers::{print, print_num, println};
+use crate::mm::fork_mm::{join, spawn_thread};
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::{
     ARCH_GET_CPUID, ARCH_SET_CPUID, PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSEGV,
@@ -12,7 +18,8 @@ use hk_syscall::{
 };
 use hk_syscall::{
     PR_GET_CHILD_SUBREAPER, PR_GET_KEEPCAPS, PR_GET_THP_DISABLE, PR_SET_CHILD_SUBREAPER,
-    PR_SET_KEEPCAPS, PR_SET_THP_DISABLE, sys_prctl,
+    PR_SET_KEEPCAPS, PR_SET_THP_DISABLE, sys_close, sys_exit, sys_fork, sys_getpid, sys_getppid,
+    sys_pipe2, sys_prctl, sys_read, sys_wait4, sys_write,
 };
 
 /// Run all prctl extra tests
@@ -22,6 +29,7 @@ pub fn run_tests() {
     test_keepcaps_invalid();
     test_child_subreaper_default();
     test_child_subreaper_set_get();
+    test_child_subreaper_thread();
 
     // THP disable test (all architectures)
     test_thp_disable();
@@ -165,6 +173,94 @@ fn test_child_subreaper_set_get() {
     }
 
     pass(b"PRCTL_SUBREAPER_SET");
+}
+
+#[repr(C, align(16))]
+struct Stack([u8; 16384]);
+static mut STACK: Stack = Stack([0; 16384]);
+static mut CTID: u32 = 0;
+
+/// PR_GET_CHILD_SUBREAPER of the calling thread
+fn subreaper() -> i32 {
+    let mut v: i32 = -1;
+    sys_prctl(PR_GET_CHILD_SUBREAPER, &raw mut v as u64, 0, 0, 0);
+    v
+}
+
+/// A second thread makes the process a subreaper and exits
+extern "C" fn set_subreaper(_: u64) -> ! {
+    sys_prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    sys_exit(0)
+}
+
+/// SUBREAPER_THREAD: in a helper process, a thread sets the flag and
+/// exits; the main thread reads 1, a forked child 0, and the child's
+/// orphan is reparented to the helper, which reaps it
+fn test_child_subreaper_thread() {
+    let h = sys_fork();
+    if h == 0 {
+        sys_exit(subreaper_thread() as u64);
+    }
+    let mut st = 0i32;
+    sys_wait4(h, &mut st, 0, 0);
+    verdict(b"SUBREAPER_THREAD", st == 0, i64::from(st));
+}
+
+/// [`test_child_subreaper_thread`]'s helper: 0, else the first failed
+/// step
+fn subreaper_thread() -> i32 {
+    let me = sys_getpid();
+    let top = unsafe { (&raw mut STACK as *mut u8).add(16384) as u64 };
+    let ctid = &raw mut CTID;
+    // Nonzero until the thread's exit clears it (no CLONE_CHILD_SETTID)
+    unsafe { core::ptr::write_volatile(ctid, 1) };
+    if unsafe { spawn_thread(top, set_subreaper, 0, ctid) } <= 0 || !join(ctid) {
+        return 1;
+    }
+    // The flag outlives the thread that set it, read from another
+    if subreaper() != 1 {
+        return 2;
+    }
+    let mut p = [0i32; 2];
+    let mut go = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    sys_pipe2(go.as_mut_ptr(), 0);
+    let child = sys_fork();
+    if child == 0 {
+        let gc = sys_fork();
+        if gc == 0 {
+            // Once the middle process is gone, report the new parent
+            let mut c = [0u8; 1];
+            sys_read(go[0] as u64, c.as_mut_ptr(), 1);
+            let v = [sys_getppid()];
+            sys_write(p[1] as u64, v.as_ptr() as *const u8, 8);
+            sys_exit(7);
+        }
+        // Not inherited (Linux copy_signal: is_child_subreaper is not)
+        let v = [gc, i64::from(subreaper())];
+        sys_write(p[1] as u64, v.as_ptr() as *const u8, 16);
+        sys_exit(0);
+    }
+    let mut v = [0i64; 2];
+    sys_read(p[0] as u64, v.as_mut_ptr() as *mut u8, 16);
+    let mut st = 0;
+    sys_wait4(child, &mut st, 0, 0);
+    sys_write(go[1] as u64, b"g".as_ptr(), 1);
+    let mut ppid = [0i64; 1];
+    let n = sys_read(p[0] as u64, ppid.as_mut_ptr() as *mut u8, 8);
+    let w = sys_wait4(v[0], &mut st, 0, 0);
+    for fd in [p[0], p[1], go[0], go[1]] {
+        sys_close(fd as u64);
+    }
+    if v[1] != 0 {
+        3
+    } else if n != 8 || ppid[0] != me {
+        4
+    } else if w != v[0] || (st >> 8) & 0xff != 7 {
+        5
+    } else {
+        0
+    }
 }
 
 /// Test: THP_DISABLE set and get

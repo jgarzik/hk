@@ -37,13 +37,19 @@ use crate::task::Pid;
 pub mod pidfd_flags {
     /// Non-blocking mode
     pub const PIDFD_NONBLOCK: u32 = 0o4000; // O_NONBLOCK
+    /// A thread's pidfd, any thread's (O_EXCL; Linux 6.9)
+    pub const PIDFD_THREAD: u32 = 0o200;
 }
 
 /// A pidfd (Linux: the file's private data is the struct pid): a
-/// reference to the process's leader `Pid`, so a recycled number never
-/// names another process
+/// reference to its task's `Pid` (a process's leader, or with
+/// PIDFD_THREAD any thread), so a recycled number never names another
+/// task
 pub struct Pidfd {
     pid: Arc<crate::task::pid::Pid>,
+    /// Opened with PIDFD_THREAD (Linux f_flags & PIDFD_THREAD): signals
+    /// go to the thread by default
+    thread: bool,
 }
 
 impl Pidfd {
@@ -57,19 +63,21 @@ impl Pidfd {
         &self.pid
     }
 
-    pub fn is_exited(&self) -> bool {
-        self.pid.exited().is_some()
+    /// A thread pidfd (PIDFD_THREAD)
+    pub fn thread(&self) -> bool {
+        self.thread
     }
 
+    /// Readable once its task exited, its whole group if it leads one;
+    /// hung up too once it is released (Linux pidfd_poll)
     pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.pid.wait_pidfd);
         }
-        if self.is_exited() {
-            // Process has exited - return readable + hangup
-            POLLIN | POLLRDNORM | POLLHUP
-        } else {
-            0
+        match crate::task::percpu::pidfd_exited(&self.pid) {
+            None => POLLIN | POLLRDNORM | POLLHUP,
+            Some(true) => POLLIN | POLLRDNORM,
+            Some(false) => 0,
         }
     }
 }
@@ -95,23 +103,32 @@ impl FileOps for PidfdFileOps {
     }
 }
 
-/// Create a pidfd file for the given process
-///
-/// # Arguments
-/// * `pid` - Process ID to create pidfd for
-/// * `file_flags` - File flags (O_NONBLOCK, O_CLOEXEC via FD_CLOEXEC)
-///
-/// # Returns
-/// Arc<File> for the new pidfd
-pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
+/// pidfd_open's pidfd for task `pid` (Linux pidfd_prepare): ESRCH
+/// once its task is released, ENOENT for a thread that does not lead
+/// its group unless PIDFD_THREAD asks for a thread's
+pub fn open_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
+    // The caller's number (Linux pidfd_open: find_get_pid)
     let nr = u32::try_from(pid).map_err(|_| KernelError::NoProcess)?;
-    let pid =
-        crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr).ok_or(KernelError::NoProcess)?;
-    let pidfd = try_arc(Pidfd { pid })?;
+    let p = crate::task::pid::find_vpid(nr).ok_or(KernelError::NoProcess)?;
+    let thread = file_flags & pidfd_flags::PIDFD_THREAD != 0;
+    {
+        let table = crate::task::percpu::TASKLIST.read();
+        let tid = table.pid_tid(&p).ok_or(KernelError::NoProcess)?;
+        if !thread && !table.get(tid).is_some_and(|t| t.leader) {
+            return Err(KernelError::NotFound);
+        }
+    }
+    pidfd_file(p, file_flags)
+}
 
-    // Create dummy dentry for pidfd
-
-    // Determine file flags
+/// A pidfd file for `pid` (no check that it names a task: clone's
+/// child is not listed yet, Linux PIDFD_STALE)
+pub fn pidfd_file(
+    pid: Arc<crate::task::pid::Pid>,
+    file_flags: u32,
+) -> Result<Arc<File>, KernelError> {
+    let thread = file_flags & pidfd_flags::PIDFD_THREAD != 0;
+    let pidfd = try_arc(Pidfd { pid, thread })?;
     let mut f_flags = flags::O_RDONLY;
     if file_flags & pidfd_flags::PIDFD_NONBLOCK != 0 {
         f_flags |= flags::O_NONBLOCK;
@@ -133,6 +150,35 @@ pub fn get_pidfd(file: &File) -> Option<Arc<Pidfd>> {
 /// Returns the PID if the file is a pidfd, None otherwise.
 pub fn get_pidfd_pid(file: &File) -> Option<Pid> {
     get_pidfd(file).map(|pidfd| pidfd.pid())
+}
+
+/// A pidfd's fdinfo lines as a procfs of pid namespace `ns` shows them
+/// (Linux pidfd_show_fdinfo): `Pid:` its number there (0 if not visible
+/// there, -1 once it names no task), `NSpid:` the same, then, if it is
+/// visible, its numbers in each namespace below. False for another file.
+pub fn show_fdinfo(
+    file: &File,
+    ns: &crate::ns::PidNamespace,
+    out: &mut alloc::string::String,
+) -> bool {
+    use core::fmt::Write;
+    let Some(pidfd) = get_pidfd(file) else {
+        return false;
+    };
+    let pid = &pidfd.pid;
+    let nr = if pid.task().is_null() {
+        -1
+    } else {
+        i64::from(pid.nr_ns(ns))
+    };
+    let _ = write!(out, "Pid:\t{nr}\nNSpid:\t{nr}");
+    if nr > 0 {
+        for u in pid.numbers().iter().skip(ns.level as usize + 1) {
+            let _ = write!(out, "\t{}", u.nr);
+        }
+    }
+    out.push('\n');
+    true
 }
 
 /// The tid of a pidfd's process (Linux pidfd_get_task): from its struct

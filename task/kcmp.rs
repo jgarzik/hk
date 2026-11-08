@@ -142,7 +142,11 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
     if pid1 <= 0 || pid2 <= 0 {
         return KernelError::NoProcess.sysret();
     }
-    let (pid1, pid2) = (pid1 as u64, pid2 as u64);
+    // The caller's numbers (Linux find_task_by_vpid)
+    let from = |p: i32| crate::task::pid::from_vnr(p as u64);
+    let (Some(pid1), Some(pid2)) = (from(pid1), from(pid2)) else {
+        return KernelError::NoProcess.sysret();
+    };
 
     // Validate type
     if !(0..KCMP_TYPES).contains(&kcmp_type) {

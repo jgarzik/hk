@@ -13,6 +13,9 @@
 //! - Test removexattr on non-existent attr returns ENODATA
 //! - Test xattr on directories
 //! - Test getxattr with buffer too small returns ERANGE
+//! - XATTR_SPACE: user.* attributes draw on a per-file-system space
+//!   (tmpfs: half of RAM's pages times 1 KB) and are ENOSPC past it;
+//!   removing them gives it back (Linux shmem_xattr_handler_set)
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -45,6 +48,49 @@ pub fn run_tests() {
     test_xattr_on_directory();
     test_getxattr_erange();
     test_xattr_size_limits();
+    test_xattr_space();
+}
+
+fn test_xattr_space() {
+    const ENOSPC: i64 = -28;
+    const VAL: usize = 65536;
+    // 3000 * 64 KB is past half of the test machines' RAM
+    const MAX: usize = 3000;
+    let path = b"/tmp/xattr_space\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let val = hk_syscall::sys_mmap(0, VAL as u64, 3, 0x22, -1, 0);
+    let set_name = |name: &mut [u8; 12], i: usize| {
+        for (k, d) in [1000, 100, 10, 1].iter().enumerate() {
+            name[7 + k] = b'0' + (i / d % 10) as u8;
+        }
+    };
+    let mut name = *b"user.sp0000\0";
+    let (mut made, mut last) = (0, 0);
+    while made < MAX && fd >= 0 && val > 0 {
+        set_name(&mut name, made);
+        last = sys_fsetxattr(fd, name.as_ptr(), val as *const u8, VAL, 0);
+        if last != 0 {
+            break;
+        }
+        made += 1;
+    }
+    for i in 0..made {
+        set_name(&mut name, i);
+        hk_syscall::sys_fremovexattr(fd, name.as_ptr());
+    }
+    set_name(&mut name, 0);
+    let again = sys_fsetxattr(fd, name.as_ptr(), val as *const u8, VAL, 0);
+    hk_syscall::sys_fremovexattr(fd, name.as_ptr());
+    if val > 0 {
+        hk_syscall::sys_munmap(val as u64, VAL as u64);
+    }
+    sys_close(fd as u64);
+    hk_syscall::sys_unlink(path.as_ptr());
+    crate::harness::verdict(
+        b"XATTR_SPACE",
+        made > 0 && last == ENOSPC && again == 0,
+        last * 10_000 + made as i64,
+    );
 }
 
 /// A getxattr buffer past XATTR_SIZE_MAX is clamped, not refused; a

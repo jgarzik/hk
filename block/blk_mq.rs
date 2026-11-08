@@ -132,6 +132,7 @@ fn end_all(l: &mut BioList) {
 /// The software and hardware queues of one request queue
 pub struct BlkMq {
     ctxs: Vec<IrqSpinlock<BioList>>,
+    /// Never empty (`new` refuses that): `map` divides by its length
     hctxs: Vec<IrqSpinlock<HwState>>,
     /// Per hardware queue, a bit per software queue mapped to it with
     /// bios pending (bit `cpu / nr_hw`; Linux hctx->ctx_map)
@@ -141,11 +142,16 @@ pub struct BlkMq {
 }
 
 impl BlkMq {
-    /// One hardware queue per element of `ops`
-    pub fn new(ops: Vec<Box<dyn MqOps>>) -> Self {
+    /// One hardware queue per element of `ops`; EINVAL for none (CPUs
+    /// are mapped `cpu % nr_hw`: Linux blk_mq_alloc_tag_set refuses
+    /// nr_hw_queues 0)
+    pub fn new(ops: Vec<Box<dyn MqOps>>) -> Result<Self, KernelError> {
+        if ops.is_empty() {
+            return Err(KernelError::InvalidArgument);
+        }
         let n = crate::cpu::nr_cpu_ids() as usize;
-        let words = n.div_ceil(ops.len().max(1)).div_ceil(64);
-        Self {
+        let words = n.div_ceil(ops.len()).div_ceil(64);
+        Ok(Self {
             ctxs: (0..n).map(|_| IrqSpinlock::new(BioList::new())).collect(),
             ctx_maps: (0..ops.len())
                 .map(|_| (0..words).map(|_| AtomicU64::new(0)).collect())
@@ -162,7 +168,7 @@ impl BlkMq {
                 })
                 .collect(),
             drained: WaitQueue::new(),
-        }
+        })
     }
 
     pub fn nr_hw_queues(&self) -> usize {

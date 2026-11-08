@@ -3,7 +3,15 @@
 //! Provides Linux-like ioremap/iounmap functions for mapping physical
 //! MMIO regions to kernel virtual addresses. Uses a dedicated virtual
 //! address region separate from the kernel heap and user space.
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+//!
+//! The walkers here change the swapper's kernel half only, whose tables
+//! are never freed; a page is mapped or unmapped only by the holder of
+//! its range (an ioremap caller, `mm::vmalloc::VmArea`). Entries are
+//! only accessed atomically: a missing table is added under `KTABLES`
+//! (a release store), and read without it (an acquire load) by any
+//! walker, which may race with that add in a neighbouring range.
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync::spin::Mutex;
 use crate::util::scope::ScopeGuard;
@@ -11,7 +19,7 @@ use crate::util::scope::ScopeGuard;
 use super::kmap::swapper_phys;
 use super::paging::{
     PAGE_CACHE_DISABLE, PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
-    PAGE_WRITE_THROUGH, VMALLOC_START, phys_to_virt, phys_to_virt_table,
+    PAGE_WRITE_THROUGH, PTE_ADDR_MASK, VMALLOC_START, phys_to_virt,
 };
 use crate::mm::tlb::flush_tlb_kernel_range;
 
@@ -232,19 +240,26 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
         .alloc(num_pages)
         .ok_or(IoremapError::OutOfVirtualSpace)?;
 
-    // Kernel half: the same tables in every address space
-    let cr3 = swapper_phys();
-
     // Map each page; on failure, unmap the ones mapped and free the range
     let mut mapped = ScopeGuard::new_with_data(0u64, |n| {
         for j in 0..n {
-            unmap_page(cr3, virt_base + j * PAGE_SIZE);
+            // SAFETY: a page of the range just allocated to us, mapped
+            // here and not yet handed out
+            unsafe { unmap_page(virt_base + j * PAGE_SIZE) };
         }
         flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
         IOREMAP.lock().free(virt_base, num_pages);
     });
     for i in 0..aligned_size / PAGE_SIZE {
-        map_mmio_page(cr3, virt_base + i * PAGE_SIZE, aligned_phys + i * PAGE_SIZE)?;
+        // SAFETY: an unmapped page of the range just allocated to us;
+        // the target is MMIO (this fn's contract)
+        unsafe {
+            map_page(
+                virt_base + i * PAGE_SIZE,
+                aligned_phys + i * PAGE_SIZE,
+                MMIO_FLAGS,
+            )
+        }?;
         *mapped += 1;
     }
     mapped.dismiss();
@@ -258,22 +273,31 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
 
 /// Point the ioremap page at `va` to `pa` instead (TLB self-test):
 /// break (clear, flush every CPU), then make
+///
+/// # Safety
+///
+/// `va` is a page of the caller's ioremap mapping, and `pa` MMIO or a
+/// frame the caller owns and touches through no other mapping.
 #[cfg(feature = "lockdep")]
-pub fn retarget(va: u64, pa: u64) -> Result<(), IoremapError> {
-    let root = swapper_phys();
-    unmap_page(root, va);
+pub unsafe fn retarget(va: u64, pa: u64) -> Result<(), IoremapError> {
+    // SAFETY: the caller's page (the caller's guarantee)
+    unsafe { unmap_page(va) };
     flush_tlb_kernel_range(va, va + PAGE_SIZE);
-    map_mmio_page(root, va, pa)?;
+    // SAFETY: the caller's page, unmapped and flushed; `pa` as the
+    // caller guarantees
+    unsafe { map_page(va, pa, MMIO_FLAGS) }?;
     flush_tlb_kernel_range(va, va + PAGE_SIZE);
     Ok(())
 }
 
 /// Unmap a previously ioremap'd region
 ///
-/// # Arguments
-/// * `virt_addr` - Virtual address returned by ioremap
-/// * `size` - Size that was passed to ioremap
-pub fn iounmap(virt_addr: *mut u8, size: u64) {
+/// # Safety
+///
+/// `virt_addr` and `size` are a mapping `ioremap` returned (with that
+/// size) that the caller owns, and nothing uses it any more: no
+/// reference into it or accessor of it (`IoMem`) is left.
+pub unsafe fn iounmap(virt_addr: *mut u8, size: u64) {
     let virt = virt_addr as u64;
 
     // Validate address is in ioremap region
@@ -287,11 +311,11 @@ pub fn iounmap(virt_addr: *mut u8, size: u64) {
     let aligned_size = (size + offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let num_pages = (aligned_size / PAGE_SIZE) as usize;
 
-    let cr3 = swapper_phys();
-
     // Unmap pages, then flush every CPU before the range can be reused
     for i in 0..num_pages {
-        unmap_page(cr3, aligned_virt + (i as u64) * PAGE_SIZE);
+        // SAFETY: the caller's mapping from `ioremap`, no longer used
+        // (the caller's guarantee); MMIO pages, nothing is freed
+        unsafe { unmap_page(aligned_virt + (i as u64) * PAGE_SIZE) };
     }
     flush_tlb_kernel_range(aligned_virt, aligned_virt + aligned_size);
 
@@ -303,85 +327,110 @@ pub fn iounmap(virt_addr: *mut u8, size: u64) {
 /// area (Linux vmap_pages_range): writable, never executable. No TLB
 /// flush: `va` was not present (x86 caches no not-present entry), and
 /// whoever unmapped it flushed it before handing it out again.
-pub fn vmap_page(va: u64, pa: u64) -> Result<(), IoremapError> {
-    map_page(swapper_phys(), va, pa, RAM_FLAGS)
+///
+/// # Safety
+///
+/// `va` is an unmapped page of a vmalloc-area range the caller holds
+/// alone (`mm::vmalloc::VmArea`), and `pa` a free frame the caller
+/// owns and hands to that range.
+pub(crate) unsafe fn vmap_page(va: u64, pa: u64) -> Result<(), IoremapError> {
+    // SAFETY: the caller's guarantee
+    unsafe { map_page(va, pa, RAM_FLAGS) }
 }
 
 /// Unmap the vmalloc-area page at `va`, returning the RAM page it
 /// mapped. The caller flushes the TLBs before `va` is mapped again.
-pub fn vunmap_page(va: u64) -> Option<u64> {
-    unmap_page(swapper_phys(), va)
+///
+/// # Safety
+///
+/// `va` is a page of a vmalloc-area range the caller holds alone, which
+/// nothing uses any more.
+pub(crate) unsafe fn vunmap_page(va: u64) -> Option<u64> {
+    // SAFETY: the caller's guarantee
+    unsafe { unmap_page(va) }
 }
 
-/// Map a single 4KB MMIO page
-fn map_mmio_page(cr3: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
-    map_page(cr3, va, pa, MMIO_FLAGS)
+/// The swapper's entry `idx` (mod 512) of the kernel table frame
+/// `table`
+///
+/// # Safety
+///
+/// `table` is a kernel table frame under the swapper (never freed).
+unsafe fn entry(table: u64, idx: usize) -> &'static AtomicU64 {
+    let p = phys_to_virt(table).cast::<u64>().wrapping_add(idx & 511);
+    // SAFETY: an entry of a table frame that stays (the caller's
+    // guarantee), through the direct map; page-table entries are only
+    // accessed atomically
+    unsafe { AtomicU64::from_ptr(p) }
 }
 
-/// Map a single 4KB page in the vmalloc area with `flags`
-fn map_page(cr3: u64, va: u64, pa: u64, flags: u64) -> Result<(), IoremapError> {
+/// Map a single 4KB page in the vmalloc window of the swapper's kernel
+/// half (shared by every address space) with `flags`
+///
+/// # Safety
+///
+/// `va` is an unmapped page of a vmalloc-window range the caller holds
+/// alone, and `pa` a page the caller may map there (MMIO, or a frame it
+/// owns and hands over).
+unsafe fn map_page(va: u64, pa: u64, flags: u64) -> Result<(), IoremapError> {
     let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
     let _tables = KTABLES.lock();
-
-    unsafe {
-        // The window's PML4 entry is preallocated (kmap::init)
-        let pml4 = phys_to_virt_table(cr3);
-        let pml4_entry = (*pml4).entry(pml4_idx);
-        assert!(pml4_entry.is_present(), "ioremap: no vmalloc PDPT");
-        let pdpt = phys_to_virt_table(pml4_entry.addr());
-        let pd = table(&mut *(*pdpt).entry_mut(pdpt_idx))?;
-        let pt = table(&mut *(*pd).entry_mut(pd_idx))?;
-        (*pt).entry_mut(pt_idx).set(pa, flags);
-    }
-
+    // SAFETY: the swapper root, live forever
+    let pml4e = unsafe { entry(swapper_phys(), pml4_idx) }.load(Ordering::Acquire);
+    // The window's PML4 entry is preallocated (kmap::init)
+    assert!(pml4e & PAGE_PRESENT != 0, "ioremap: no vmalloc PDPT");
+    // SAFETY: the kernel tables under the swapper are never freed;
+    // KTABLES held while missing ones are added
+    let pd = unsafe { table(entry(pml4e & PTE_ADDR_MASK, pdpt_idx)) }?;
+    // SAFETY: as above
+    let pt = unsafe { table(entry(pd, pd_idx)) }?;
+    // SAFETY: a kernel table, never freed; the entry is the caller's
+    // page, which no one else changes (the caller's guarantee)
+    unsafe { entry(pt, pt_idx) }.store((pa & PTE_ADDR_MASK) | flags, Ordering::Release);
     Ok(())
 }
 
-/// Table under a PDPT or PD entry, allocated if absent
+/// Table frame under a PDPT or PD entry, added if absent
 ///
 /// # Safety
-/// `e` is an entry of a live kernel page table, under the ioremap lock.
-unsafe fn table(
-    e: &mut super::paging::PageTableEntry,
-) -> Result<*mut super::paging::RawPageTable, IoremapError> {
-    if !e.is_present() {
-        e.set(alloc_zeroed_frame()?, INTERMEDIATE_FLAGS);
+///
+/// `e` is an upper entry of a kernel page table under the swapper,
+/// KTABLES held.
+unsafe fn table(e: &AtomicU64) -> Result<u64, IoremapError> {
+    let v = e.load(Ordering::Acquire);
+    if v & PAGE_PRESENT != 0 {
+        return Ok(v & PTE_ADDR_MASK);
     }
-    Ok(phys_to_virt_table(e.addr()))
+    let t = alloc_zeroed_frame()?;
+    // Release: lock-free walkers that see the entry see the zeroed table
+    e.store(t | INTERMEDIATE_FLAGS, Ordering::Release);
+    Ok(t)
 }
 
 /// Unmap a single page (clear PTE, don't free intermediate tables);
 /// the page it mapped, if any
-fn unmap_page(cr3: u64, va: u64) -> Option<u64> {
+///
+/// # Safety
+///
+/// `va` is a page of a vmalloc-window range the caller holds alone,
+/// which nothing uses any more.
+unsafe fn unmap_page(va: u64) -> Option<u64> {
     let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
-
-    unsafe {
-        let pml4 = phys_to_virt_table(cr3);
-
-        let pml4_entry = (*pml4).entry(pml4_idx);
-        if !pml4_entry.is_present() {
+    let mut table = swapper_phys();
+    for idx in [pml4_idx, pdpt_idx, pd_idx] {
+        // SAFETY: the swapper root or a kernel table under it, never
+        // freed; read atomically (KTABLES not needed: an upper entry is
+        // only ever added, under it)
+        let e = unsafe { entry(table, idx) }.load(Ordering::Acquire);
+        if e & PAGE_PRESENT == 0 {
             return None;
         }
-        let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-        let pdpt_entry = (*pdpt).entry(pdpt_idx);
-        if !pdpt_entry.is_present() {
-            return None;
-        }
-        let pd = phys_to_virt_table(pdpt_entry.addr());
-
-        let pd_entry = (*pd).entry(pd_idx);
-        if !pd_entry.is_present() {
-            return None;
-        }
-        let pt = phys_to_virt_table(pd_entry.addr());
-
-        // Clear the page table entry
-        let pt_entry = (*pt).entry_mut(pt_idx);
-        let pa = pt_entry.is_present().then(|| pt_entry.addr());
-        pt_entry.clear();
-        pa
+        table = e & PTE_ADDR_MASK;
     }
+    // SAFETY: a kernel table, never freed; the entry is the caller's
+    // page, which no one else changes (the caller's guarantee)
+    let e = unsafe { entry(table, pt_idx) }.swap(0, Ordering::AcqRel);
+    (e & PAGE_PRESENT != 0).then_some(e & PTE_ADDR_MASK)
 }
 
 /// Allocate a zeroed frame for page tables
@@ -389,12 +438,8 @@ fn alloc_zeroed_frame() -> Result<u64, IoremapError> {
     let frame = crate::FRAME_ALLOCATOR
         .alloc()
         .ok_or(IoremapError::FrameAllocationFailed)?;
-
-    // Zero the frame
-    unsafe {
-        core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
-    }
-
+    // SAFETY: a fresh frame, reached through the direct map
+    unsafe { core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize) };
     Ok(frame)
 }
 

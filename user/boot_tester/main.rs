@@ -266,6 +266,8 @@ pub fn run_all_tests() {
     proc::kmsg::run_tests();
     process::groups::run_tests();
     fs::fifo::run_tests();
+    fs::splice::run_tests();
+    fs::deep_chain::run_tests();
     fs::anon_inode::run_tests();
     fs::etxtbsy::run_tests();
     fs::cpio_nodes::run_tests();
@@ -287,6 +289,7 @@ pub fn run_all_tests() {
     isolated(b"LAYOUT", mm::layout::run_tests);
     isolated(b"STARTUP", process::startup::run_tests);
     isolated(b"ELF_EXEC", exec::elf_exec::run_tests);
+    isolated(b"EXEC_ARGS", exec::exec_args::run_tests);
     isolated(b"EXEC_IDENTITY", exec::exec_identity::run_tests);
     isolated(b"EXEC_RACE", exec::exec_race::run_tests);
     isolated(b"PROCFS_ACCESS", proc::procfs_access::run_tests);
@@ -301,6 +304,7 @@ pub fn run_all_tests() {
     process::rlimit::run_tests();
     isolated(b"NR_OPEN", io::nr_open::run_tests);
     process::namespace::run_tests();
+    process::pidns::run_tests();
     net::sockets::run_tests();
     net::sockcore::run_tests();
     net::unix::run_tests();
@@ -331,12 +335,14 @@ pub fn run_all_tests() {
     proc::acct::run_tests();
     process::clone3_syslog::run_tests();
     process::pidfd::run_tests();
+    process::pidfd_thread::run_tests();
     mm::swap::run_tests();
     isolated(b"BLK", fs::blk::run_tests);
     isolated(b"SWAPOUT", mm::swapout::run_tests);
     time::adjtimex::run_tests();
     isolated(b"SETTIME", time::settime::run_tests);
     isolated(b"SECCOMP", signal::seccomp::run_tests);
+    isolated(b"UPTR_TOP", process::uptr_top::run_tests);
     isolated(b"SCHED_IDS", process::sched_ids::run_tests);
     io::errno_pass::run_tests();
     isolated(b"CPU_ACCT", proc::cpu_acct::run_tests);
@@ -384,6 +390,7 @@ pub fn run_all_tests() {
     time::timer_accuracy::run_tests();
     time::timer_rt::run_tests();
     signal::ptrace_stop::run_tests();
+    signal::ptrace_exit::run_tests();
     process::wake_storm::run_tests();
     io::enomem::run_tests();
     io::uaccess::run_tests();

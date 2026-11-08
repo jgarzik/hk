@@ -68,9 +68,9 @@ impl TcpCb {
         if fl & flags::ACK != 0 {
             self.ack_sent();
         }
-        self.stats.segs_out += 1;
+        self.stats.segs_out = self.stats.segs_out.wrapping_add(1);
         if !data.is_empty() {
-            self.stats.data_segs_out += 1;
+            self.stats.data_segs_out = self.stats.data_segs_out.wrapping_add(1);
         }
         Seg {
             seq,
@@ -209,6 +209,10 @@ impl TcpCb {
                 return None;
             }
         }
+        // No memory: nothing sent now; the retransmit or probe timer
+        // (check_persist) tries again (Linux tcp_write_xmit stops on a
+        // failed tcp_transmit_skb and tcp_check_probe_timer arms)
+        let mut data = crate::util::kmem::try_vec(n as usize, 0u8).ok()?;
         if self.snd_nxt == self.snd_max
             && !in_flight
             && now.saturating_sub(self.lsndtime) > self.rto
@@ -216,7 +220,6 @@ impl TcpCb {
             // Idle longer than an RTO: restart from the initial window
             self.cong.restart(now - self.lsndtime, self.rto);
         }
-        let mut data = alloc::vec![0u8; n as usize];
         copy_out(&self.sndq, off as usize, &mut data);
         let seq = self.snd_nxt;
         let mut fl = flags::ACK;
@@ -239,7 +242,7 @@ impl TcpCb {
             self.lsndtime = now;
         }
         if before(seq, self.snd_max) {
-            self.stats.total_retrans += 1;
+            self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
             self.stats.bytes_retrans += u64::from(n);
         }
         self.stats.bytes_sent += u64::from(n);
@@ -274,7 +277,10 @@ impl TcpCb {
             return;
         }
         let n = (len - off).min(self.mss as usize);
-        let mut data = alloc::vec![0u8; n];
+        // No memory: the retransmit timer tries again
+        let Ok(mut data) = crate::util::kmem::try_vec(n, 0u8) else {
+            return;
+        };
         copy_out(&self.sndq, off, &mut data);
         let fin_sent = self.fin_queued && after(self.snd_max, self.data_end());
         let mut fl = flags::ACK;
@@ -284,7 +290,7 @@ impl TcpCb {
         if n == 0 && fl & flags::FIN == 0 {
             return;
         }
-        self.stats.total_retrans += 1;
+        self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
         self.stats.bytes_retrans += n as u64;
         let s = self.mk_seg(self.snd_una, fl, data);
         out.segs.push(s);

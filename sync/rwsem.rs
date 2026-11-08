@@ -257,6 +257,12 @@ impl<T: ?Sized> RwSem<T> {
     pub fn get_mut(&mut self) -> &mut T {
         self.data.get_mut()
     }
+
+    /// Where the data lives, to tell which semaphore a borrow of it came
+    /// from (never dereferenced here; std Mutex::data_ptr)
+    pub fn data_ptr(&self) -> *const T {
+        self.data.get()
+    }
 }
 
 /// A shared hold of a `RwSem`, released on drop

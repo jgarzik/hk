@@ -836,6 +836,10 @@ pub fn bdev_rw_frame(
         return Err(KernelError::Io);
     }
     if len < PAGE && op == BioOp::Read {
+        // SAFETY: `frame` is a whole direct-mapped page frame the caller
+        // holds for this I/O (a locked page-cache or swap-cache page), the
+        // same frame the bios below hand the device to fill by DMA; the
+        // CPU zeroes the part past the device's end, `len..PAGE`, inside it
         unsafe { core::ptr::write_bytes(crate::arch::phys_to_virt(frame).add(len), 0, PAGE - len) };
     }
     // One bio per piece the queue limits allow (segments of at most

@@ -224,8 +224,10 @@ fn idents_reserve(hash: u32, segs: u32) -> u32 {
     {
         delta = crate::random::get_random_u32() % now.wrapping_sub(old).max(1);
     }
+    // ids are a free-running 32-bit space (Linux ip_idents_reserve's
+    // atomic_add_return wraps)
     IP_IDENTS[b]
-        .fetch_add(segs + delta, Ordering::Relaxed)
+        .fetch_add(segs.wrapping_add(delta), Ordering::Relaxed)
         .wrapping_add(delta)
 }
 
@@ -247,21 +249,23 @@ pub fn select_ident(net: &NetNamespace, saddr: Ipv4Addr, daddr: Ipv4Addr, proto:
 /// The checksum is the 16-bit one's complement of the one's complement
 /// sum of all 16-bit words in the header.
 pub fn ip_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
+    // 64 bits: no slice is long enough to carry out of it (a u32 would
+    // overflow past 128KiB of 0xffff words)
+    let mut sum: u64 = 0;
 
     // Sum all 16-bit words
     let mut i = 0;
     while i + 1 < data.len() {
-        sum += u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
+        sum += u64::from(u16::from_be_bytes([data[i], data[i + 1]]));
         i += 2;
     }
 
     // Add odd byte if present
     if i < data.len() {
-        sum += u32::from(data[i]) << 8;
+        sum += u64::from(data[i]) << 8;
     }
 
-    // Fold 32-bit sum to 16 bits
+    // Fold to 16 bits
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
@@ -653,4 +657,18 @@ pub fn ip_finish_output(mut skb: Box<SkBuff>, dest_mac: [u8; ETH_ALEN]) -> Resul
 
     // Transmit
     crate::net::dev::dev_queue_xmit(skb)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ip_checksum;
+
+    #[test]
+    fn checksum_long_input() {
+        // 256KiB of 0xffff words: a 32-bit sum would carry out
+        let b = alloc::vec![0xffu8; 256 << 10];
+        assert_eq!(ip_checksum(&b), 0);
+        assert_eq!(ip_checksum(&[0x45, 0x00, 0x00, 0x1c]), !0x451c);
+        assert_eq!(ip_checksum(&[0x01]), !0x0100);
+    }
 }

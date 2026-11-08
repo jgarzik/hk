@@ -26,28 +26,20 @@ pub struct IoVec {
 }
 crate::pod!(IoVec { iov_base, iov_len });
 
-/// Validate an iovec array from user space
-///
-/// Copies and validates the iovec array. Returns the validated iovecs
-/// or an error code.
-///
-/// # Arguments
-/// * `iov_ptr` - User pointer to array of iovec structures
-/// * `iovcnt` - Number of iovec structures
-///
-/// # Returns
-/// * `Ok(Vec<IoVec>)` - Validated iovec array
-/// * `Err(errno)` - Error code (EINVAL, EFAULT)
-fn validate_iovec_array(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoVec>, i64> {
+/// The `iovcnt` iovecs at `iov_ptr`, checked and cut to MAX_RW_COUNT
+/// in total (Linux import_iovec): EINVAL for a count outside
+/// 0..=IOV_MAX or a length negative as ssize_t, EFAULT for a bad array
+/// or buffer
+pub fn import_iovec(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoVec>, KernelError> {
     // Check iovcnt bounds
     if iovcnt < 0 {
-        return Err(KernelError::InvalidArgument.sysret());
+        return Err(KernelError::InvalidArgument);
     }
     if iovcnt == 0 {
         return Ok(alloc::vec::Vec::new());
     }
     if iovcnt as usize > IOV_MAX {
-        return Err(KernelError::InvalidArgument.sysret());
+        return Err(KernelError::InvalidArgument);
     }
 
     let iovcnt = iovcnt as usize;
@@ -56,7 +48,7 @@ fn validate_iovec_array(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoV
 
     // Validate iovec array pointer
     if !Uaccess::access_ok(iov_ptr, total_size) {
-        return Err(KernelError::BadAddress.sysret());
+        return Err(KernelError::BadAddress);
     }
 
     // Copy iovec array from user space
@@ -66,13 +58,13 @@ fn validate_iovec_array(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoV
     let bytes =
         unsafe { core::slice::from_raw_parts_mut(iovecs.as_mut_ptr().cast::<u8>(), total_size) };
     if copy_from_user::<Uaccess>(bytes, iov_ptr, total_size).is_err() {
-        return Err(KernelError::BadAddress.sysret());
+        return Err(KernelError::BadAddress);
     }
 
     // A length negative as ssize_t is EINVAL, for any segment before
     // any address is checked (Linux copy_iovec_from_user)
     if iovecs.iter().any(|v| (v.iov_len as i64) < 0) {
-        return Err(KernelError::InvalidArgument.sysret());
+        return Err(KernelError::InvalidArgument);
     }
     // One segment is cut to MAX_RW_COUNT, then checked (Linux
     // import_ubuf); several are checked whole, then cut so the total
@@ -85,7 +77,7 @@ fn validate_iovec_array(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoV
             len = len.min(MAX_RW_COUNT);
         }
         if len != 0 && !Uaccess::access_ok(iov.iov_base, len) {
-            return Err(KernelError::BadAddress.sysret());
+            return Err(KernelError::BadAddress);
         }
         len = len.min(MAX_RW_COUNT - total);
         iov.iov_len = len as u64;
@@ -102,24 +94,27 @@ fn pos_arg(offset: i64) -> Result<u64, i64> {
 
 /// sys_readv - scatter read at the file position
 pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
-    match validate_iovec_array(iov_ptr, iovcnt) {
+    match import_iovec(iov_ptr, iovcnt) {
         Ok(v) => do_readv(fd, &v, None, RwFlags::empty()),
-        Err(e) => e,
+        Err(e) => e.sysret(),
     }
 }
 
 /// sys_writev - gather write at the file position (one write: atomic
 /// for regular files like Linux)
 pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
-    match validate_iovec_array(iov_ptr, iovcnt) {
+    match import_iovec(iov_ptr, iovcnt) {
         Ok(v) => do_writev(fd, &v, None, RwFlags::empty(), None),
-        Err(e) => e,
+        Err(e) => e.sysret(),
     }
 }
 
 /// sys_preadv - scatter read at an offset
 pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
-    match (pos_arg(offset), validate_iovec_array(iov_ptr, iovcnt)) {
+    match (
+        pos_arg(offset),
+        import_iovec(iov_ptr, iovcnt).map_err(KernelError::sysret),
+    ) {
         (Ok(o), Ok(v)) => do_readv(fd, &v, Some(o), RwFlags::empty()),
         (Err(e), _) | (_, Err(e)) => e,
     }
@@ -127,7 +122,10 @@ pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
 
 /// sys_pwritev - gather write at an offset (O_APPEND still appends)
 pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
-    match (pos_arg(offset), validate_iovec_array(iov_ptr, iovcnt)) {
+    match (
+        pos_arg(offset),
+        import_iovec(iov_ptr, iovcnt).map_err(KernelError::sysret),
+    ) {
         (Ok(o), Ok(v)) => do_writev(fd, &v, Some(o), RwFlags::empty(), None),
         (Err(e), _) | (_, Err(e)) => e,
     }
@@ -159,7 +157,7 @@ fn pos2(offset: i64) -> Result<Option<u64>, i64> {
 pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) -> i64 {
     let r = rwf_check(flags).and_then(|f| {
         let at = pos2(offset)?;
-        let v = validate_iovec_array(iov_ptr, iovcnt)?;
+        let v = import_iovec(iov_ptr, iovcnt).map_err(KernelError::sysret)?;
         Ok(do_readv(fd, &v, at, f))
     });
     r.unwrap_or_else(|e| e)
@@ -177,7 +175,7 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
     };
     let r = rwf_check(flags).and_then(|f| {
         let at = pos2(offset)?;
-        let v = validate_iovec_array(iov_ptr, iovcnt)?;
+        let v = import_iovec(iov_ptr, iovcnt).map_err(KernelError::sysret)?;
         Ok(do_writev(fd, &v, at, f, append))
     });
     let n = r.unwrap_or_else(|e| e);

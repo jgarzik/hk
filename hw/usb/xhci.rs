@@ -11,13 +11,14 @@ use alloc::vec::Vec;
 
 use core::any::Any;
 use core::mem::MaybeUninit;
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::{NonNull, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::sync::spin::Mutex;
 
 use crate::arch::FrameAlloc;
 use crate::arch::{CurrentArch, IoremapOps, phys_to_virt};
+use crate::hw::mmio::IoMem;
 use crate::hw::pci::PciDevice;
 use crate::printkln;
 use crate::time::delay::{poll_timeout, udelay};
@@ -629,22 +630,66 @@ impl EventRing {
     }
 }
 
+/// Operational registers before the port register sets (xHCI 5.4)
+const OP_PORTS: usize = 0x400;
+/// Bytes per port register set (PORTSC, PORTPMSC, PORTLI, PORTHLPMC)
+const PORT_STRIDE: usize = 0x10;
+/// Runtime registers through interrupter 0's set (MFINDEX, then
+/// IMAN..ERDP at 0x20..0x40; xHCI 5.5)
+const RT_IR0_END: usize = 0x40;
+
+/// The controller's register windows, carved out of BAR0 at the offsets
+/// the controller reports (xHCI 5.3-5.6). Each is checked against the
+/// BAR when it is made, and every access against its window, so a
+/// device reporting a bad CAPLENGTH, DBOFF, RTSOFF or MaxPorts cannot
+/// steer an access outside its registers.
+#[derive(Clone, Copy)]
+struct Regs {
+    cap: IoMem,
+    op: IoMem,
+    port: IoMem,
+    db: IoMem,
+    rt: IoMem,
+}
+
+impl Regs {
+    /// The windows inside BAR0's mapping `bar`; None if one does not fit
+    fn map(bar: IoMem) -> Option<Self> {
+        let caplen = (bar.try_read32(0)? & 0xff) as usize;
+        // The capability registers run through HCCPARAMS2 (0x1c); the
+        // operational ones are dword registers
+        if caplen < 0x20 || !caplen.is_multiple_of(4) {
+            return None;
+        }
+        let cap = bar.sub(0, caplen)?;
+        let hcs1 = cap.read32(0x04);
+        let slots = (hcs1 & 0xff) as usize;
+        let ports = (hcs1 >> 24) as usize;
+        let op = bar.sub(caplen, OP_PORTS + ports * PORT_STRIDE)?;
+        let port = op.sub(OP_PORTS, ports * PORT_STRIDE)?;
+        // DBOFF bits 1:0 and RTSOFF bits 4:0 are reserved (xHCI 5.3.7-8);
+        // doorbell 0 is the host's, then one per slot
+        let db = bar.sub((cap.read32(0x14) & !0x3) as usize, (slots + 1) * 4)?;
+        let rt = bar.sub((cap.read32(0x18) & !0x1f) as usize, RT_IR0_END)?;
+        Some(Self {
+            cap,
+            op,
+            port,
+            db,
+            rt,
+        })
+    }
+}
+
 /// xHCI controller state
 pub struct XhciController {
     /// MMIO base address
     mmio_base: u64,
     /// PCI device info
     pci_dev: PciDevice,
-    /// Capability registers offset
-    cap_regs: u64,
-    /// Operational registers offset
-    op_regs: u64,
-    /// Doorbell registers offset
-    db_regs: u64,
-    /// Runtime registers offset
-    rt_regs: u64,
-    /// Port registers offset
-    port_regs: u64,
+    /// Register windows (None until BAR0 is mapped and checked, and
+    /// again once the controller is stopped)
+    regs: Option<Regs>,
     /// Command ring
     cmd_ring: Option<CommandRing>,
     /// Event ring
@@ -682,11 +727,7 @@ impl XhciController {
             mmio_base,
             quirks: quirk::of(&pci_dev),
             pci_dev,
-            cap_regs: mmio_base,
-            op_regs: 0,
-            db_regs: 0,
-            rt_regs: 0,
-            port_regs: 0,
+            regs: None,
             cmd_ring: None,
             event_ring: None,
             dcbaa_phys: 0,
@@ -703,34 +744,42 @@ impl XhciController {
         }
     }
 
-    /// Read capability register
+    /// Read capability register (all ones before the BAR is mapped,
+    /// like a read from a missing device)
     fn read_cap(&self, offset: usize) -> u32 {
-        unsafe { read_volatile((self.cap_regs + offset as u64) as *const u32) }
+        self.regs.map_or(!0, |r| r.cap.read32(offset))
     }
 
     /// Read operational register
     fn read_op(&self, offset: usize) -> u32 {
-        unsafe { read_volatile((self.op_regs + offset as u64) as *const u32) }
+        self.regs.map_or(!0, |r| r.op.read32(offset))
     }
 
     /// Write operational register
     fn write_op(&self, offset: usize, value: u32) {
-        unsafe {
-            write_volatile((self.op_regs + offset as u64) as *mut u32, value);
+        if let Some(r) = self.regs {
+            r.op.write32(offset, value);
         }
     }
 
-    /// Read port register
-    fn read_port(&self, port: u8, offset: usize) -> u32 {
-        let port_offset = self.port_regs + ((u64::from(port) - 1) * 0x10);
-        unsafe { read_volatile((port_offset + offset as u64) as *const u32) }
+    /// Offset of `port`'s (1-based) register at `offset` in the port
+    /// window; past MaxPorts the window check refuses it
+    fn port_off(port: u8, offset: usize) -> Option<usize> {
+        Some(usize::from(port).checked_sub(1)? * PORT_STRIDE + offset)
     }
 
-    /// Write port register
+    /// Read port register (all ones for a port the controller lacks)
+    fn read_port(&self, port: u8, offset: usize) -> u32 {
+        Self::port_off(port, offset)
+            .zip(self.regs)
+            .and_then(|(o, r)| r.port.try_read32(o))
+            .unwrap_or(!0)
+    }
+
+    /// Write port register (nothing for a port the controller lacks)
     fn write_port(&self, port: u8, offset: usize, value: u32) {
-        let port_offset = self.port_regs + ((u64::from(port) - 1) * 0x10);
-        unsafe {
-            write_volatile((port_offset + offset as u64) as *mut u32, value);
+        if let (Some(o), Some(r)) = (Self::port_off(port, offset), self.regs) {
+            r.port.try_write32(o, value);
         }
     }
 
@@ -739,26 +788,26 @@ impl XhciController {
     /// Note: A write memory barrier is required before ringing the doorbell
     /// to ensure the xHC sees all TRB/context updates. The enqueue() functions
     /// already include this barrier, so this is just the doorbell write itself.
+    /// A slot past MaxSlots (an id the controller made up) rings nothing.
     fn ring_doorbell(&self, slot: u8, target: u8) {
         // Write barrier to ensure all TRB writes are visible to device
         fence(Ordering::Release);
-        let db_offset = self.db_regs + (u64::from(slot) * 4);
-        unsafe {
-            write_volatile(db_offset as *mut u32, u32::from(target));
+        if let Some(r) = self.regs {
+            r.db.try_write32(usize::from(slot) * 4, u32::from(target));
         }
     }
 
     /// Write runtime register
     fn write_rt(&self, offset: usize, value: u32) {
-        unsafe {
-            write_volatile((self.rt_regs + offset as u64) as *mut u32, value);
+        if let Some(r) = self.regs {
+            r.rt.write32(offset, value);
         }
     }
 
     /// Write 64-bit runtime register
     fn write_rt64(&self, offset: usize, value: u64) {
-        unsafe {
-            write_volatile((self.rt_regs + offset as u64) as *mut u64, value);
+        if let Some(r) = self.regs {
+            r.rt.write64(offset, value);
         }
     }
 
@@ -776,8 +825,13 @@ impl XhciController {
                 // Update all base addresses to virtual address
                 let virt_base = virt as u64;
                 self.mmio_base = virt_base;
-                self.cap_regs = virt_base;
                 self.mmio_len = bar_size;
+                let len = usize::try_from(bar_size).unwrap_or(0);
+                // SAFETY: ioremap mapped BAR0's `bar_size` bytes of
+                // registers at `virt`; the windows are dropped (stop()
+                // clears `regs`) before mem_cleanup unmaps them
+                let bar = NonNull::new(virt).map(|p| unsafe { IoMem::new(p, len) });
+                self.regs = bar.and_then(Regs::map);
             }
             Err(e) => {
                 printkln!("xHCI: Failed to ioremap MMIO region: {:?}", e);
@@ -785,14 +839,18 @@ impl XhciController {
             }
         }
         // frame_alloc still used for device context allocations below
+        if self.regs.is_none() {
+            printkln!(
+                "xHCI: register offsets outside the {:#x}-byte BAR0",
+                bar_size
+            );
+            return Err(UsbError::NoResources);
+        }
 
         // Read capability registers
-        let caplength = u64::from(self.read_cap(0) & 0xFF);
         let hciversion = self.read_cap(0) >> 16;
         self.hci_version = hciversion as u16;
         let hcsparams1 = self.read_cap(0x04);
-        let dboff = self.read_cap(0x14);
-        let rtsoff = self.read_cap(0x18);
 
         self.max_slots = (hcsparams1 & 0xFF) as u8;
         let hccparams1 = self.read_cap(0x10);
@@ -802,12 +860,6 @@ impl XhciController {
         self.pci_dev
             .set_dma_mask_and_coherent(hcc_dma_mask(hccparams1));
         self.max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
-
-        // Calculate register offsets
-        self.op_regs = self.mmio_base + caplength;
-        self.db_regs = self.mmio_base + u64::from(dboff);
-        self.rt_regs = self.mmio_base + u64::from(rtsoff);
-        self.port_regs = self.op_regs + 0x400;
 
         printkln!(
             "xHCI: version={:x}.{:x}, max_slots={}, max_ports={}, context={} bytes",
@@ -986,13 +1038,15 @@ impl XhciController {
     /// Registers the IRQ handler and enables USBCMD.INTE.
     /// Must be called after configure() and before start_controller().
     fn enable_interrupts(&mut self) -> Result<(), UsbError> {
-        // Store register addresses for ISR access
+        // Store register addresses for ISR access: the windows' bases,
+        // checked at mapping to hold USBSTS and interrupter 0's IMAN
+        let r = self.regs.ok_or(UsbError::NoResources)?;
         XHCI_IRQ_STATE
             .op_regs
-            .store(self.op_regs, Ordering::Release);
+            .store(r.op.addr() as u64, Ordering::Release);
         XHCI_IRQ_STATE
             .rt_regs
-            .store(self.rt_regs, Ordering::Release);
+            .store(r.rt.addr() as u64, Ordering::Release);
 
         // Register IRQ handler with PCI device
         let h = try_arc(crate::irq::IrqFn(xhci_irq_handler)).map_err(|_| "out of memory");
@@ -1780,7 +1834,7 @@ impl XhciController {
         }
 
         // Calculate actual transferred bytes
-        let transferred = data.len() - residue as usize;
+        let transferred = data.len().saturating_sub(residue as usize);
         Ok(transferred)
     }
 
@@ -2019,7 +2073,7 @@ impl XhciController {
             }
         }
         self.initialized = false;
-        if self.mmio_len != 0 {
+        if self.regs.is_some() {
             let _ = self.halt();
             let _ = self.reset_controller(XHCI_RESET_SHORT_US);
         }
@@ -2031,6 +2085,8 @@ impl XhciController {
         }
         XHCI_IRQ_STATE.op_regs.store(0, Ordering::Release);
         XHCI_IRQ_STATE.rt_regs.store(0, Ordering::Release);
+        // The windows go before mem_cleanup unmaps what they cover
+        self.regs = None;
         self.mem_cleanup();
         // PCI_COMMAND: bus mastering off (pci_disable_device)
         let cmd = self.pci_dev.cfg_read16(0x04);
@@ -2061,7 +2117,9 @@ impl XhciController {
             self.dcbaa_phys = 0;
         }
         if self.mmio_len != 0 {
-            CurrentArch::iounmap(self.mmio_base as *mut u8, self.mmio_len);
+            // SAFETY: the controller's registers, mapped at probe and
+            // no longer used (the device is stopped)
+            unsafe { CurrentArch::iounmap(self.mmio_base as *mut u8, self.mmio_len) };
             self.mmio_len = 0;
         }
     }
@@ -2301,6 +2359,44 @@ mod tests {
         assert_eq!(t.get_type(), trb_type::RESET_ENDPOINT);
         assert_eq!(t.control >> 24, 3);
         assert_eq!((t.control >> 16) & 0x1f, 1);
+    }
+
+    /// A fake 16KiB BAR (QEMU qemu-xhci's layout) with the given
+    /// CAPLENGTH, HCSPARAMS1, DBOFF and RTSOFF, carved into windows
+    fn regs_of(caplen: u32, hcs1: u32, dboff: u32, rtsoff: u32) -> Option<Regs> {
+        let mut bar = alloc::vec![0u32; 0x1000].into_boxed_slice();
+        bar[0] = caplen;
+        bar[1] = hcs1;
+        bar[5] = dboff;
+        bar[6] = rtsoff;
+        let p = NonNull::new(Box::leak(bar).as_mut_ptr().cast::<u8>()).unwrap();
+        // SAFETY: 16KiB of leaked heap, never freed: as good as a
+        // permanently mapped register block for a test
+        Regs::map(unsafe { IoMem::new(p, 0x4000) })
+    }
+
+    #[test]
+    fn regs_inside_bar() {
+        // 64 slots, 8 ports, doorbells at 0x2000, runtime at 0x1000
+        let r = regs_of(0x40, (8 << 24) | 64, 0x2000, 0x1000).unwrap();
+        assert_eq!(r.op.len(), 0x400 + 8 * 0x10);
+        assert_eq!(r.port.len(), 8 * 0x10);
+        assert_eq!(r.db.len(), 65 * 4);
+        assert_eq!(r.rt.addr() - r.cap.addr(), 0x1000);
+        // reserved offset bits are ignored
+        assert!(regs_of(0x40, (8 << 24) | 64, 0x2003, 0x101f).is_some());
+    }
+
+    #[test]
+    fn regs_outside_bar_refused() {
+        let ok = (8 << 24) | 64;
+        assert!(regs_of(0x10, ok, 0x2000, 0x1000).is_none()); // CAPLENGTH short
+        assert!(regs_of(0x42, ok, 0x2000, 0x1000).is_none()); // misaligned
+        assert!(regs_of(0x40, ok, 0x3ff0, 0x1000).is_none()); // doorbells past it
+        assert!(regs_of(0x40, ok, 0x2000, 0x3fe0).is_none()); // runtime past it
+        assert!(regs_of(0x40, ok, 0xffff_fffc, 0x1000).is_none());
+        // the most a byte CAPLENGTH and MaxPorts can claim still fits
+        assert!(regs_of(0xfc, (255 << 24) | 64, 0x2000, 0x1000).is_some());
     }
 
     #[test]

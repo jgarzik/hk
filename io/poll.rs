@@ -89,6 +89,11 @@ pub struct PollFd {
     /// Returned events
     pub revents: i16,
 }
+crate::pod!(PollFd {
+    fd,
+    events,
+    revents
+});
 
 /// fd_set for select(2) - 1024 bits = 128 bytes
 #[repr(C)]

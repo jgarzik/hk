@@ -27,6 +27,15 @@ pub struct UserPtRegs {
     /// Processor state (SPSR_EL1)
     pub pstate: u64,
 }
+crate::pod!(UserPtRegs {
+    regs,
+    sp,
+    pc,
+    pstate
+});
+
+/// The register block PTRACE_GETREGS / PTRACE_SETREGS copy
+pub type UserRegs = UserPtRegs;
 
 // =============================================================================
 // Register access functions

@@ -10,15 +10,31 @@
 //!   ignored)
 //! - Test procfs /proc/<pid>/fdinfo/<pidfd> shows Pid line
 //! - Test waitid with P_PIDFD
+//! - WAITID_PIDFD_NONBLOCK: waitid(P_PIDFD) of an O_NONBLOCK pidfd is
+//!   EAGAIN while the child runs (Linux kernel_waitid adds WNOHANG)
+//! - CLONE_PIDFD_LEGACY: clone(2) with CLONE_PIDFD stores the pidfd at
+//!   parent_tid; with CLONE_PARENT_SETTID too it is EINVAL
+//! - CLONE_PIDFD_EFAULT: a pidfd pointer the kernel cannot write
+//!   (legacy clone's parent_tid, clone3's pidfd, null included) fails
+//!   the clone with EFAULT: no child, no descriptor left
 //! - Test pidfd_getfd to get own fd via pidfd
 //! - Test pidfd_getfd with invalid flags returns EINVAL
+//! - PIDFD_POLL_GROUP: a process whose leader exits first is not
+//!   readable while another thread (here a traced zombie) is listed;
+//!   readable once that one is reaped, POLLHUP once the process is
+//!   (Linux pidfd_poll: delay_group_leader, no task)
+//! - PIDFD_OPEN_THREAD: pidfd_open of a non-leader thread without
+//!   PIDFD_THREAD fails (ENOENT since 6.16, EINVAL before)
+//! - PIDFD_OPEN_CLOEXEC: the new descriptor is close-on-exec
 
 use crate::harness::{fail_num, pass, verdict};
-use crate::helpers::{print, print_num, println};
+use crate::helpers::{linux_at_least, msleep, print, print_num, println};
+use crate::mm::fork_mm::{join, spawn_thread};
 use hk_syscall::{
-    P_PIDFD, POLLIN, PollFd, SigInfo, WEXITED, sys_close, sys_exit, sys_exit_group, sys_fork,
-    sys_getpid, sys_open, sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2,
-    sys_poll, sys_read, sys_rt_sigaction, sys_wait4, sys_waitid,
+    CloneArgs, O_NONBLOCK, P_PIDFD, POLLHUP, POLLIN, PollFd, SIGKILL, SigInfo, WEXITED, sys_clone,
+    sys_clone3, sys_close, sys_exit, sys_exit_group, sys_fcntl, sys_fork, sys_getpid, sys_kill,
+    sys_open, sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2, sys_poll,
+    sys_ptrace, sys_read, sys_rt_sigaction, sys_wait4, sys_waitid, sys_write,
 };
 
 /// Run all pidfd tests
@@ -31,8 +47,160 @@ pub fn run_tests() {
     test_pidfd_poll_autoreap();
     test_pidfd_fdinfo();
     test_waitid_p_pidfd();
+    test_waitid_pidfd_nonblock();
+    test_clone_pidfd_legacy();
+    test_clone_pidfd_efault();
     test_pidfd_getfd_self();
     test_pidfd_getfd_invalid_flags();
+    test_pidfd_poll_group();
+    test_pidfd_open_thread();
+    test_pidfd_open_cloexec();
+}
+
+#[repr(C, align(16))]
+struct Stack([u8; 16384]);
+static mut STACK: Stack = Stack([0; 16384]);
+static mut CTID: u32 = 0;
+
+/// Start `f(arg)` as a second thread of this process: its tid
+fn start(f: extern "C" fn(u64) -> !, arg: u64) -> i64 {
+    let top = unsafe { (&raw mut STACK as *mut u8).add(16384) as u64 };
+    // Nonzero until the thread's exit clears it (no CLONE_CHILD_SETTID)
+    unsafe { core::ptr::write_volatile(&raw mut CTID, 1) };
+    unsafe { spawn_thread(top, f, arg, &raw mut CTID) }
+}
+
+/// Read a byte from `fd`, then exit the thread with status 3
+extern "C" fn exit3_after(fd: u64) -> ! {
+    let mut c = [0u8; 1];
+    sys_read(fd, c.as_mut_ptr(), 1);
+    sys_exit(3)
+}
+
+/// The events of `fd` within `ms` (0 on timeout)
+fn poll_in(fd: i64, ms: i32) -> i16 {
+    let mut fds = [PollFd {
+        fd: fd as i32,
+        events: POLLIN,
+        revents: 0,
+    }];
+    if sys_poll(fds.as_mut_ptr(), 1, ms) == 1 {
+        fds[0].revents
+    } else {
+        0
+    }
+}
+
+/// PIDFD_POLL_GROUP, in a helper process (it traces its child's thread)
+fn test_pidfd_poll_group() {
+    let h = sys_fork();
+    if h == 0 {
+        sys_exit_group(poll_group() as u64);
+    }
+    let mut st = 0i32;
+    sys_wait4(h, &mut st, 0, 0);
+    verdict(b"PIDFD_POLL_GROUP", st == 0, i64::from(st));
+}
+
+/// [`test_pidfd_poll_group`]'s helper: its child's second thread,
+/// traced from here, exits, then the child's leader; 0 if the pidfd
+/// becomes readable only once the thread is reaped, and hangs up once
+/// the child is; else the failed step
+fn poll_group() -> i32 {
+    const PTRACE_SEIZE: i64 = 0x4206;
+    const WALL: i32 = 0x4000_0000;
+    let mut tids = [0i32; 2];
+    let mut block = [0i32; 2];
+    let mut lead = [0i32; 2];
+    sys_pipe2(tids.as_mut_ptr(), 0);
+    sys_pipe2(block.as_mut_ptr(), 0);
+    sys_pipe2(lead.as_mut_ptr(), 0);
+    let c = sys_fork();
+    if c == 0 {
+        let t = [start(exit3_after, block[0] as u64)];
+        sys_write(tids[1] as u64, t.as_ptr() as *const u8, 8);
+        let mut b = [0u8; 1];
+        sys_read(lead[0] as u64, b.as_mut_ptr(), 1);
+        // The leader alone: the thread is still listed
+        sys_exit(0);
+    }
+    let pidfd = sys_pidfd_open(c as i32, 0);
+    let mut t = [0i64; 1];
+    sys_read(tids[0] as u64, t.as_mut_ptr() as *mut u8, 8);
+    let seized = sys_ptrace(PTRACE_SEIZE, t[0], 0, 0);
+    sys_write(block[1] as u64, b"t".as_ptr(), 1);
+    sys_write(lead[1] as u64, b"l".as_ptr(), 1);
+    let r = if pidfd < 0 || t[0] <= 0 || seized != 0 {
+        1
+    } else if poll_in(pidfd, 300) != 0 {
+        // Leader exited, traced zombie thread still listed
+        2
+    } else {
+        let mut st = 0i32;
+        let w = sys_wait4(t[0], &mut st, WALL, 0);
+        let ev = poll_in(pidfd, 2000);
+        if w != t[0] {
+            3
+        } else if ev & POLLIN == 0 || ev & POLLHUP != 0 {
+            4
+        } else {
+            sys_wait4(c, &mut st, 0, 0);
+            let ev = poll_in(pidfd, 0);
+            // POLLHUP for a reaped process since Linux 6.9
+            let hup = !linux_at_least(6, 9) || ev & POLLHUP != 0;
+            if ev & POLLIN == 0 || !hup { 5 } else { 0 }
+        }
+    };
+    if r != 0 {
+        // The traced thread first: the child is not reaped before it
+        hk_syscall::sys_kill(c, 9);
+        sys_wait4(t[0], core::ptr::null_mut(), WALL, 0);
+        sys_wait4(c, core::ptr::null_mut(), 0, 0);
+    }
+    r
+}
+
+/// Read a byte from `fd`, then exit the thread
+extern "C" fn exit_after(fd: u64) -> ! {
+    let mut c = [0u8; 1];
+    sys_read(fd, c.as_mut_ptr(), 1);
+    sys_exit(0)
+}
+
+/// PIDFD_OPEN_THREAD: in a helper process, pidfd_open of its second
+/// thread without PIDFD_THREAD (Linux pidfd_prepare: not a thread-group
+/// leader's pid; ENOENT since 6.16, EINVAL before)
+fn test_pidfd_open_thread() {
+    let h = sys_fork();
+    if h == 0 {
+        let mut go = [0i32; 2];
+        sys_pipe2(go.as_mut_ptr(), 0);
+        let t = start(exit_after, go[0] as u64);
+        let r = sys_pidfd_open(t as i32, 0);
+        sys_write(go[1] as u64, b"x".as_ptr(), 1);
+        join(&raw mut CTID);
+        let want = if linux_at_least(6, 16) { -2 } else { -22 };
+        sys_exit_group(if t > 0 && r == want { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(h, &mut st, 0, 0);
+    verdict(b"PIDFD_OPEN_THREAD", st == 0, i64::from(st));
+}
+
+/// PIDFD_OPEN_CLOEXEC: pidfd_open's descriptor is close-on-exec
+/// (Linux pidfd_prepare: get_unused_fd_flags(O_CLOEXEC))
+fn test_pidfd_open_cloexec() {
+    const F_GETFD: i32 = 1;
+    let fd = sys_pidfd_open(sys_getpid() as i32, 0);
+    let fl = if fd >= 0 {
+        sys_fcntl(fd as i32, F_GETFD, 0)
+    } else {
+        fd
+    };
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    verdict(b"PIDFD_OPEN_CLOEXEC", fl == 1, fl);
 }
 
 /// Test pidfd_open for current process
@@ -342,6 +510,204 @@ fn test_waitid_p_pidfd() {
     }
 
     pass(b"WAITID_PIDFD");
+}
+
+/// An empty siginfo for waitid
+fn siginfo() -> SigInfo {
+    SigInfo {
+        si_signo: 0,
+        si_errno: 0,
+        si_code: 0,
+        _pad0: 0,
+        si_pid: 0,
+        si_uid: 0,
+        si_status: 0,
+        _pad: [0u8; 128 - 28],
+    }
+}
+
+/// waitid(P_PIDFD) of an O_NONBLOCK pidfd (PIDFD_NONBLOCK) waits as
+/// with WNOHANG (Linux kernel_waitid_prepare): EAGAIN while the child
+/// runs and WNOHANG was not asked, 0 with an empty siginfo when it was,
+/// and the child once it is dead
+fn test_waitid_pidfd_nonblock() {
+    const NAME: &[u8] = b"WAITID_PIDFD_NONBLOCK";
+    const WNOHANG: i32 = 1;
+    const EAGAIN: i64 = -11;
+    let pid = sys_fork();
+    if pid < 0 {
+        fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL fork ", pid);
+        return;
+    }
+    if pid == 0 {
+        // Bounded, so a kernel that blocks still finishes the test
+        msleep(2000);
+        sys_exit(0);
+    }
+    let fd = sys_pidfd_open(pid as i32, O_NONBLOCK);
+    if fd < 0 {
+        sys_kill(pid, SIGKILL);
+        sys_wait4(pid, core::ptr::null_mut(), 0, 0);
+        fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL pidfd_open ", fd);
+        return;
+    }
+    let mut info = siginfo();
+    let busy = sys_waitid(P_PIDFD, fd as u64, &mut info, WEXITED, 0);
+    let mut nohang_info = siginfo();
+    nohang_info.si_pid = -1;
+    let nohang = sys_waitid(P_PIDFD, fd as u64, &mut nohang_info, WEXITED | WNOHANG, 0);
+    sys_kill(pid, SIGKILL);
+    // EAGAIN until it is a zombie
+    let mut dead_info = siginfo();
+    let mut dead = EAGAIN;
+    for _ in 0..1000 {
+        dead = sys_waitid(P_PIDFD, fd as u64, &mut dead_info, WEXITED, 0);
+        if dead != EAGAIN {
+            break;
+        }
+        msleep(1);
+    }
+    sys_close(fd as u64);
+    if busy == 0 {
+        // Reaped by the blocking wait (a kernel without the rule)
+        dead = 0;
+        dead_info.si_pid = pid as i32;
+    } else if dead == EAGAIN {
+        sys_wait4(pid, core::ptr::null_mut(), 0, 0);
+    }
+    if busy != EAGAIN {
+        fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL running: waitid ", busy);
+    } else if nohang != 0 || nohang_info.si_pid != 0 {
+        fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL WNOHANG: waitid ", nohang);
+    } else if dead != 0 || dead_info.si_pid != pid as i32 {
+        fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL dead: waitid ", dead);
+    } else {
+        pass(NAME);
+    }
+}
+
+/// Legacy clone(2) with CLONE_PIDFD (Linux 5.2) stores a close-on-exec
+/// pidfd of the child at parent_tid, the one place for both, so
+/// CLONE_PARENT_SETTID with it is EINVAL (kernel_clone)
+fn test_clone_pidfd_legacy() {
+    const CLONE_PIDFD: u64 = 0x1000;
+    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+    const SIGCHLD: u64 = 17;
+    const F_GETFD: i32 = 1;
+    const FD_CLOEXEC: i64 = 1;
+    let mut both: i32 = -1;
+    let flags = CLONE_PIDFD | CLONE_PARENT_SETTID | SIGCHLD;
+    let r = sys_clone(flags, 0, (&raw mut both) as u64, 0, 0);
+    if r == 0 {
+        sys_exit(0);
+    }
+    if r > 0 {
+        sys_wait4(r, core::ptr::null_mut(), 0, 0);
+    }
+    let mut pidfd: i32 = -1;
+    let pid = sys_clone(CLONE_PIDFD | SIGCHLD, 0, (&raw mut pidfd) as u64, 0, 0);
+    if pid == 0 {
+        sys_exit(7);
+    }
+    if pid < 0 {
+        fail_num(b"CLONE_PIDFD_LEGACY:FAIL clone ", pid);
+        return;
+    }
+    let fdflags = if pidfd >= 0 {
+        sys_fcntl(pidfd, F_GETFD, 0)
+    } else {
+        -1
+    };
+    let mut info = siginfo();
+    let w = if pidfd >= 0 {
+        sys_waitid(P_PIDFD, pidfd as u64, &mut info, WEXITED, 0)
+    } else {
+        sys_wait4(pid, core::ptr::null_mut(), 0, 0)
+    };
+    if pidfd >= 0 {
+        sys_close(pidfd as u64);
+    }
+    if r != -22 || both != -1 {
+        fail_num(
+            b"CLONE_PIDFD_LEGACY:FAIL with CLONE_PARENT_SETTID: clone ",
+            r,
+        );
+    } else if pidfd < 0 {
+        fail_num(
+            b"CLONE_PIDFD_LEGACY:FAIL no pidfd at parent_tid: ",
+            i64::from(pidfd),
+        );
+    } else if fdflags != FD_CLOEXEC {
+        fail_num(b"CLONE_PIDFD_LEGACY:FAIL F_GETFD ", fdflags);
+    } else if w != 0 || info.si_pid != pid as i32 || info.si_status != 7 {
+        fail_num(b"CLONE_PIDFD_LEGACY:FAIL waitid(P_PIDFD) ", w);
+    } else {
+        pass(b"CLONE_PIDFD_LEGACY");
+    }
+}
+
+/// CLONE_PIDFD stores the pidfd before the child exists, so a pointer
+/// the kernel cannot write fails the clone with EFAULT and leaves no
+/// child or descriptor (Linux copy_process: put_user, then
+/// bad_fork_put_pidfd); clone3's null pidfd pointer too
+fn test_clone_pidfd_efault() {
+    const NAME: &[u8] = b"CLONE_PIDFD_EFAULT";
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(clone_pidfd_efault() as u64);
+    }
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    let step = if st & 0x7f != 0 {
+        100
+    } else {
+        (st >> 8) & 0xff
+    };
+    verdict(NAME, step == 0, i64::from(step));
+}
+
+/// [`test_clone_pidfd_efault`]'s steps in a process with no children:
+/// the failing step, 0 if none
+fn clone_pidfd_efault() -> i32 {
+    const CLONE_PIDFD: u64 = 0x1000;
+    const SIGCHLD: u64 = 17;
+    const F_DUPFD: i32 = 0;
+    const WNOHANG: i32 = 1;
+    const EFAULT: i64 = -14;
+    const ECHILD: i64 = -10;
+    let lowest = || {
+        let fd = sys_fcntl(0, F_DUPFD, 0);
+        sys_close(fd as u64);
+        fd
+    };
+    let free = lowest();
+    // An address no mapping covers
+    let bad = sys_clone(CLONE_PIDFD | SIGCHLD, 0, 8, 0, 0);
+    if bad == 0 {
+        sys_exit(0);
+    }
+    let args = CloneArgs {
+        flags: CLONE_PIDFD,
+        exit_signal: SIGCHLD,
+        ..CloneArgs::default()
+    };
+    let null = sys_clone3(&args, core::mem::size_of::<CloneArgs>());
+    if null == 0 {
+        sys_exit(0);
+    }
+    let none = sys_wait4(-1, core::ptr::null_mut(), WNOHANG, 0);
+    while sys_wait4(-1, core::ptr::null_mut(), 0, 0) > 0 {}
+    if bad != EFAULT {
+        1
+    } else if null != EFAULT {
+        2
+    } else if none != ECHILD {
+        3
+    } else if lowest() != free {
+        4
+    } else {
+        0
+    }
 }
 
 // Helper: write a number to a buffer as ASCII digits, return new position

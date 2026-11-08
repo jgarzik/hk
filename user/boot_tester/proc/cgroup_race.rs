@@ -46,6 +46,10 @@
 //!   whole, never one's quota with the other's period (Linux
 //!   cpu_max_show reads the two unlocked and may tear, so not there).
 //!
+//! - PIDS_MAX_BOUNDS: pids.max takes kstrtoll numbers (hex too) in
+//!   0..PIDS_MAX (PID_MAX_LIMIT + 1): PID_MAX_LIMIT is the largest, one
+//!   more or a negative number is EINVAL (Linux pids_max_write).
+//!
 //! Runs after cgroup.rs, which mounts cgroup2 at /sys/fs/cgroup and
 //! enables +pids at the root.
 
@@ -79,6 +83,31 @@ pub fn run_tests() {
         crate::helpers::skip(b"PIDS_EVENTS", b"Linux 6.11 pids events");
     }
     report_step(b"CPU_MAX_RW", cpu_max_rw());
+    report_step(b"PIDS_MAX_BOUNDS", pids_max_bounds());
+}
+
+fn pids_max_bounds() -> i64 {
+    const C: &[u8] = b"pmb";
+    if !make_cgroup(C, b"max") {
+        return 1;
+    }
+    let step = (|| {
+        if write_file(C, b"pids.max", b"4194304") < 0 || read_num(C, b"pids.max") != 4194304 {
+            return 2;
+        }
+        if write_file(C, b"pids.max", b"4194305") != EINVAL {
+            return 3;
+        }
+        if write_file(C, b"pids.max", b"-1") != EINVAL {
+            return 4;
+        }
+        if write_file(C, b"pids.max", b"0x10") < 0 || read_num(C, b"pids.max") != 16 {
+            return 5;
+        }
+        0
+    })();
+    remove_cgroup(C);
+    step
 }
 
 /// The count in "max N" of `file` of cgroup `name`, -1 if unreadable

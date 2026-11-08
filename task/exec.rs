@@ -17,20 +17,28 @@ use crate::fs::{File, kernel_open_exec};
 use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
 use crate::util::elf::ElfExecutable;
 
+pub use super::argstr::ArgStrings;
+
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
 
-/// Pages of the main stack's initial VMA when RLIMIT_STACK is
-/// unlimited or small (1 MB); only the pages holding the arguments are
-/// mapped at exec, the rest fault in, and the VMA grows down on demand
-/// up to RLIMIT_STACK (mm::expand_downwards)
-const USER_STACK_PAGES: usize = 256;
+/// Room for argument and environment strings whatever RLIMIT_STACK
+/// (Linux ARG_MAX: 32 pages)
+const ARG_MAX: usize = 32 * PAGE_SIZE as usize;
 
-/// Maximum number of pages for user stack (8MB, matching default RLIMIT_STACK)
-const MAX_STACK_PAGES: usize = 2048;
+/// Longest argument or environment string, NUL included (Linux
+/// MAX_ARG_STRLEN: 32 pages)
+const MAX_ARG_STRLEN: usize = 32 * PAGE_SIZE as usize;
 
-/// Maximum combined size of argv + envp (128KB like Linux's MAX_ARG_STRLEN * MAX_ARG_STRINGS)
-const MAX_ARG_PAGES: usize = 32;
+/// Most argument or environment strings (Linux MAX_ARG_STRINGS)
+const MAX_ARG_STRINGS: usize = 0x7FFF_FFFF;
+
+/// The stack limit the strings may take at most 3/4 of (Linux _STK_LIM)
+const STK_LIM: u64 = 8 << 20;
+
+/// Stack room above the arguments in the initial stack VMA (Linux
+/// setup_arg_pages: stack_expand)
+const STACK_EXPAND_PAGES: usize = 32;
 
 /// Error codes for execve
 pub const ENOENT: i32 = 2; // No such file or directory
@@ -42,50 +50,87 @@ pub const EFAULT: i32 = 14; // Bad address
 pub const E2BIG: i32 = 7; // Argument list too long
 pub const EAGAIN: i32 = 11; // Try again
 pub const EINVAL: i32 = 22; // Invalid argument
+pub const EEXIST: i32 = 17; // File exists
 pub const ELOOP: i32 = 40; // Too many levels of symbolic links
 pub const ELIBBAD: i32 = 80; // Accessing a corrupted shared library
 
-/// Maximum path length (matching Linux PATH_MAX)
-const PATH_MAX: usize = 4096;
-
-/// Copy a null-terminated string from user space (through uaccess, so
-/// SMAP/PAN stay enforced and a bad pointer is EFAULT, not a kernel fault)
-fn copy_string_from_user(ptr: u64, max_len: usize) -> Result<Vec<u8>, i32> {
-    use crate::uaccess::UaccessError;
-    crate::uaccess::strndup_user_bytes::<crate::arch::Uaccess>(ptr, max_len).map_err(|e| match e {
-        UaccessError::TooLong => E2BIG,
-        _ => EFAULT,
-    })
+/// The user pointer `i` of a NULL-terminated array (Linux
+/// get_user_arg_ptr): EFAULT
+fn arg_ptr(argv: u64, i: usize) -> Result<u64, i32> {
+    crate::uaccess::UserPtr::<u64>::new(argv)
+        .offset(i)
+        .ok_or(EFAULT)?
+        .read()
+        .map_err(|_| EFAULT)
 }
 
-/// Copy a null-terminated array of string pointers from user space
-///
-/// Returns a Vec of strings, or an error.
-fn copy_string_array_from_user(
-    argv_ptr: u64,
-    max_strings: usize,
-    budget: &mut usize,
-) -> Result<Vec<Vec<u8>>, i32> {
-    if argv_ptr == 0 {
-        return Ok(Vec::new());
+/// The strings in a NULL-terminated user array (Linux count): EFAULT,
+/// E2BIG past MAX_ARG_STRINGS; a fatal signal ends the walk
+fn count(argv: u64) -> Result<usize, i32> {
+    if argv == 0 {
+        return Ok(0);
     }
-
-    let mut result = Vec::new();
-    for i in 0..max_strings as u64 {
-        let slot = argv_ptr.checked_add(i * 8).ok_or(EFAULT)?;
-        let str_ptr =
-            crate::uaccess::get_user::<crate::arch::Uaccess, u64>(slot).map_err(|_| EFAULT)?;
-        if str_ptr == 0 {
-            break;
+    let mut i = 0;
+    while arg_ptr(argv, i)? != 0 {
+        if i >= MAX_ARG_STRINGS {
+            return Err(E2BIG);
         }
-        let s = copy_string_from_user(str_ptr, PATH_MAX)?;
-        // Charge against the combined argv+envp budget as we go (Linux
-        // copy_strings), so a huge list is E2BIG before it is all copied
-        *budget = budget.checked_sub(s.len() + 1).ok_or(E2BIG)?;
-        result.push(s);
+        i += 1;
+        if crate::signal::fatal_signal_pending() {
+            return Err(crate::util::error::KernelError::RestartNoHand.errno());
+        }
+        percpu::cond_resched();
     }
+    Ok(i)
+}
 
-    Ok(result)
+/// Bytes the strings may take on the new stack (Linux
+/// bprm_stack_limits): a quarter of RLIMIT_STACK, at most 3/4 of
+/// _STK_LIM and at least ARG_MAX, less the argv and envp pointers
+/// (argc counted as at least 1); E2BIG if they leave nothing
+fn arg_limit(argc: usize, envc: usize) -> Result<usize, i32> {
+    use crate::task::rlimit::{RLIMIT_STACK, rlimit};
+    let quarter = usize::try_from(rlimit(RLIMIT_STACK) / 4).unwrap_or(usize::MAX);
+    let limit = ((STK_LIM / 4 * 3) as usize).min(quarter).max(ARG_MAX);
+    let ptrs = argc
+        .max(1)
+        .checked_add(envc)
+        .and_then(|n| n.checked_mul(8))
+        .ok_or(E2BIG)?;
+    limit.checked_sub(ptrs).filter(|&l| l > 0).ok_or(E2BIG)
+}
+
+/// Copy the `n` strings of user array `argv`, packed, each charged
+/// with its NUL against `budget` (Linux copy_strings): one longer than
+/// MAX_ARG_STRLEN, or past the budget, is E2BIG; EFAULT; ENOMEM
+fn copy_strings(argv: u64, n: usize, budget: &mut usize) -> Result<ArgStrings, i32> {
+    let mut out = ArgStrings::new();
+    for i in 0..n {
+        let p = arg_ptr(argv, i)?;
+        if p == 0 {
+            return Err(EFAULT);
+        }
+        out.push_user::<crate::arch::Uaccess>(p, MAX_ARG_STRLEN, budget)
+            .map_err(|e| e.errno())?;
+        if crate::signal::fatal_signal_pending() {
+            return Err(crate::util::error::KernelError::RestartNoHand.errno());
+        }
+    }
+    Ok(out)
+}
+
+/// The argument and environment strings of an exec of `filename`
+/// (Linux do_execveat_common): both arrays counted, the room for them
+/// worked out from RLIMIT_STACK, then the file name, the environment
+/// and the arguments copied against it
+fn copy_args(filename: &[u8], argv: u64, envp: u64) -> Result<(ArgStrings, ArgStrings), i32> {
+    let argc = count(argv)?;
+    let envc = count(envp)?;
+    let mut budget = arg_limit(argc, envc)?;
+    budget = budget.checked_sub(filename.len() + 1).ok_or(E2BIG)?;
+    let envp = copy_strings(envp, envc, &mut budget)?;
+    let argv = copy_strings(argv, argc, &mut budget)?;
+    Ok((argv, envp))
 }
 
 /// What the new image tells the program through the auxiliary vector
@@ -110,11 +155,19 @@ struct StackWriter<'a> {
 }
 
 impl StackWriter<'_> {
-    /// Copy `data` to user address `va`
+    /// Copy `data` to user address `va`, a page at a time
     fn write(&self, va: u64, data: &[u8]) -> Result<(), i32> {
-        for (i, &b) in data.iter().enumerate() {
-            let phys = self.pt.translate(va + i as u64).ok_or(EFAULT)?;
-            unsafe { core::ptr::write(phys_to_virt(phys), b) };
+        let mut done = 0;
+        while done < data.len() {
+            let at = va + done as u64;
+            let n = ((PAGE_SIZE - at % PAGE_SIZE) as usize).min(data.len() - done);
+            let phys = self.pt.translate(at).ok_or(EFAULT)?;
+            // SAFETY: `phys` is a stack frame of the new address space,
+            // mapped above, and `n` bytes stay within its page
+            unsafe {
+                core::ptr::copy_nonoverlapping(data[done..].as_ptr(), phys_to_virt(phys), n);
+            }
+            done += n;
         }
         Ok(())
     }
@@ -130,6 +183,42 @@ impl StackWriter<'_> {
     fn push_str(&mut self, s: &[u8]) -> Result<u64, i32> {
         self.push(&[0])?;
         self.push(s)
+    }
+}
+
+/// Stores consecutive words to the new stack through a small buffer
+struct WordWriter<'a, 'b> {
+    w: &'a StackWriter<'b>,
+    /// Where the buffered words go
+    at: u64,
+    buf: [u8; 512],
+    n: usize,
+}
+
+impl<'a, 'b> WordWriter<'a, 'b> {
+    fn new(w: &'a StackWriter<'b>, at: u64) -> Self {
+        Self {
+            w,
+            at,
+            buf: [0; 512],
+            n: 0,
+        }
+    }
+
+    fn put(&mut self, v: u64) -> Result<(), i32> {
+        if self.n == self.buf.len() {
+            self.flush()?;
+        }
+        self.buf[self.n..self.n + 8].copy_from_slice(&v.to_le_bytes());
+        self.n += 8;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), i32> {
+        self.w.write(self.at, &self.buf[..self.n])?;
+        self.at += self.n as u64;
+        self.n = 0;
+        Ok(())
     }
 }
 
@@ -189,33 +278,58 @@ fn auxv(info: &ExecInfo<'_>, random: u64, execfn: u64, platform: u64) -> [(u64, 
 /// the auxiliary vector, envp, argv and argc at the 16-byte aligned
 /// initial stack pointer.
 ///
-/// Returns (where argv, envp and the SP went, lowest mapped stack
-/// address).
+/// Returns where argv, envp and the SP went.
+/// The initial stack's pages: those the stack image takes (mapped at
+/// exec), and those of its VMA, from RLIMIT_STACK and with room to run
+/// above the image (Linux setup_arg_pages: stack_expand)
+struct StackSize {
+    mapped: usize,
+    pages: usize,
+    /// Words below the strings: argc, the argv and envp pointers with
+    /// their NULLs, the auxiliary vector
+    words: usize,
+}
+
+impl StackSize {
+    fn new(argv: &ArgStrings, envp: &ArgStrings, execfn: &[u8]) -> Self {
+        // RLIMIT_STACK in whole pages (Linux rlim_cur & PAGE_MASK)
+        let rlim = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK) / PAGE_SIZE;
+        let rlim = usize::try_from(rlim).unwrap_or(usize::MAX);
+        // What the image holds: its strings were bounded by copy_args
+        // (Linux bprm_stack_limits), plus a script's interpreter
+        let strings = argv.bytes().len() + envp.bytes().len();
+        let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * AUXV_LEN;
+        let need = strings + execfn.len() + 64 + 16 + words * 8 + 64;
+        let mapped = need.div_ceil(PAGE_SIZE as usize) + 1;
+        // The VMA is the image and stack_expand's room above it, never
+        // past RLIMIT_STACK, nor below the image (Linux setup_arg_pages:
+        // stack_expand = min(rlim_stack, stack_size + stack_expand), an
+        // expand_stack that only grows); faults grow it down from there
+        // up to RLIMIT_STACK (mm::expand_downwards)
+        Self {
+            mapped,
+            pages: (mapped + STACK_EXPAND_PAGES).min(rlim).max(mapped),
+            words,
+        }
+    }
+
+    /// The bottom of the stack VMA
+    fn bottom(&self) -> u64 {
+        STACK_TOP - self.pages as u64 * PAGE_SIZE
+    }
+}
+
 fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
-    argv: &[Vec<u8>],
-    envp: &[Vec<u8>],
+    argv: &ArgStrings,
+    envp: &ArgStrings,
     info: &ExecInfo<'_>,
-) -> Result<(MmLayout, u64), i32> {
-    // Calculate stack pages based on RLIMIT_STACK
-    let stack_limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
-    let stack_pages = if stack_limit == crate::task::rlimit::RLIM_INFINITY {
-        USER_STACK_PAGES
-    } else {
-        ((stack_limit / PAGE_SIZE) as usize).clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
-    };
-    // Everything must fit in the stack, with room to run
-    let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum();
-    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * AUXV_LEN;
-    let need = strings + info.execfn.len() + 64 + 16 + words * 8 + 64;
-    if need > stack_pages * PAGE_SIZE as usize / 2 {
-        return Err(E2BIG);
-    }
-
-    // Map only what the arguments use (Linux setup_arg_pages: the rest
-    // of the stack VMA faults in on first touch)
-    let mapped = need.div_ceil(PAGE_SIZE as usize) + 1;
+    size: &StackSize,
+) -> Result<MmLayout, i32> {
+    // Map only what the image uses (Linux setup_arg_pages: the rest of
+    // the stack VMA faults in on first touch)
+    let mapped = size.mapped;
     let map_bottom = STACK_TOP - (mapped as u64 * PAGE_SIZE);
     for i in 0..mapped {
         let va = map_bottom + (i as u64 * PAGE_SIZE);
@@ -240,38 +354,32 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     let execfn = w.push_str(info.execfn)?;
     // argv then envp strings, back to back (Linux arg_start..env_end)
     let env_end = w.top;
-    let mut envp_addrs = Vec::with_capacity(envp.len());
-    for e in envp.iter().rev() {
-        envp_addrs.push(w.push_str(e)?);
-    }
-    envp_addrs.reverse();
-    let env_start = w.top;
-    let mut argv_addrs = Vec::with_capacity(argv.len());
-    for a in argv.iter().rev() {
-        argv_addrs.push(w.push_str(a)?);
-    }
-    argv_addrs.reverse();
-    let arg_start = w.top;
+    let env_start = w.push(envp.bytes())?;
+    let arg_start = w.push(argv.bytes())?;
     let platform = w.push_str(crate::arch::ELF_PLATFORM)?;
     let mut rnd = [0u8; 16];
     let _ = crate::random::get_random_bytes(&mut rnd, 0);
     w.top &= !15;
     let random = w.push(&rnd)?;
 
-    // argc, argv[], NULL, envp[], NULL, auxv pairs
-    let mut v: Vec<u64> = Vec::with_capacity(words);
-    v.push(argv.len() as u64);
-    v.extend_from_slice(&argv_addrs);
-    v.push(0);
-    v.extend_from_slice(&envp_addrs);
-    v.push(0);
-    for (k, val) in auxv(info, random, execfn, platform) {
-        v.push(k);
-        v.push(val);
+    // argc, argv[], NULL, envp[], NULL, auxv pairs, streamed to the
+    // stack: each string's address found by walking the NULs
+    let sp = (w.top - size.words as u64 * 8) & !15;
+    let mut out = WordWriter::new(&w, sp);
+    out.put(argv.len() as u64)?;
+    for (strs, start) in [(argv, arg_start), (envp, env_start)] {
+        let mut at = start;
+        for s in strs.iter() {
+            out.put(at)?;
+            at += s.len() as u64 + 1;
+        }
+        out.put(0)?;
     }
-    let sp = (w.top - v.len() as u64 * 8) & !15;
-    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-    w.write(sp, &bytes)?;
+    for (k, val) in auxv(info, random, execfn, platform) {
+        out.put(k)?;
+        out.put(val)?;
+    }
+    out.flush()?;
 
     // The kernel wrote through the linear map (arm64: clean the data
     // cache for the user mapping)
@@ -291,7 +399,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
         start_stack: sp,
         ..MmLayout::default()
     };
-    Ok((area, STACK_TOP - (stack_pages as u64 * PAGE_SIZE)))
+    Ok(area)
 }
 
 /// The highest free page below mmap_base clear of `vmas` (Linux
@@ -362,9 +470,11 @@ fn map_sigpage<FA: FrameAlloc<PhysAddr = u64>>(
 
 /// Every PT_LOAD segment and the entry point must land in mappable
 /// user space: past TASK_SIZE (or overflowing) is EINVAL (Linux
-/// BAD_ADDR), below mmap_min_addr EPERM (security_mmap_addr)
-fn check_segments(elf: &ElfExecutable, base: u64) -> Result<(), i32> {
-    const EINVAL: i32 = 22;
+/// BAD_ADDR), below mmap_min_addr EPERM (security_mmap_addr), on the
+/// stack at or above `stack_bottom` EEXIST (Linux maps the stack first
+/// and an image over it fails its MAP_FIXED_NOREPLACE, after the point
+/// of no return; hk refuses it before)
+fn check_segments(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Result<(), i32> {
     for seg in &elf.segments {
         let va = seg.vaddr.checked_add(base).ok_or(EINVAL)?;
         let end = va.checked_add(seg.mem_size as u64).ok_or(EINVAL)?;
@@ -373,6 +483,9 @@ fn check_segments(elf: &ElfExecutable, base: u64) -> Result<(), i32> {
         }
         let start = va & !(PAGE_SIZE - 1);
         crate::mm::check_fixed(start, end - start).map_err(|e| e.errno())?;
+        if seg.mem_size > 0 && end > stack_bottom {
+            return Err(EEXIST);
+        }
     }
     if elf
         .entry
@@ -454,57 +567,98 @@ fn anon_vma(start: u64, end: u64, prot: u32) -> crate::mm::Vma {
     )
 }
 
-/// The whole pages of each loaded segment of `elf` at `base` that a
-/// private mapping of `file` supplies (Linux elf_map), with the page
-/// before which a segment's pages belong to the previous one; the same
-/// computation decides what `load_elf_segments` leaves unfilled and
-/// which VMAs are file-backed
-fn file_mapped(elf: &ElfExecutable, base: u64) -> Vec<Option<(u64, u64, u64)>> {
-    let mut prev_end = 0;
-    let mut out = Vec::new();
-    for seg in elf.segments.iter().filter(|s| s.mem_size > 0) {
-        out.push(seg.file_pages(base, prev_end));
-        let end = (seg.vaddr + base + seg.mem_size as u64).next_multiple_of(PAGE_SIZE);
-        prev_end = prev_end.max(end);
-    }
-    out
+/// A run of pages of a loaded image that one PT_LOAD segment owns
+/// (`seg`, its index in `elf.segments`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Span {
+    start: u64,
+    end: u64,
+    seg: usize,
 }
 
-/// One VMA per loaded segment of `elf` at `base`; with `file` (the
-/// image mapped from the page cache) a segment's whole file pages are a
-/// private file VMA and the rest (the partial last page, the bss) an
-/// anonymous one after it
-fn segment_vmas(elf: &ElfExecutable, base: u64, file: Option<&Arc<File>>) -> Vec<crate::mm::Vma> {
-    use crate::mm::{MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, Vma};
-    let anon = anon_vma;
-    let mapped = file.map(|_| file_mapped(elf, base));
-    let mut vmas: Vec<Vma> = Vec::new();
-    let mut prev_end = 0;
-    for (k, seg) in elf.segments.iter().filter(|s| s.mem_size > 0).enumerate() {
-        // A page shared with the previous segment stays in its VMA
-        let start = ((seg.vaddr + base) & !(PAGE_SIZE - 1)).max(prev_end);
-        let end = (seg.vaddr + base + seg.mem_size as u64).next_multiple_of(PAGE_SIZE);
-        if start >= end {
+/// The page-aligned [start, end) of segment `seg` loaded `base` higher;
+/// None past u64 (check_segments rules that out for a loaded image)
+fn seg_pages(seg: &crate::util::elf::ElfSegment, base: u64) -> Option<(u64, u64)> {
+    let start = seg.vaddr.checked_add(base)?;
+    let end = start
+        .checked_add(seg.mem_size as u64)?
+        .checked_next_multiple_of(PAGE_SIZE)?;
+    Some((start & !(PAGE_SIZE - 1), end))
+}
+
+/// The pages of `elf` loaded at `base`, sorted and disjoint, each owned
+/// by the last segment in file order that covers it: Linux
+/// load_elf_binary maps every PT_LOAD in file order, each MAP_FIXED
+/// over what the earlier ones mapped, so the segments may come in any
+/// order and overlap (a page shared by two adjacent segments is the
+/// later one's)
+fn image_spans(elf: &ElfExecutable, base: u64) -> Vec<Span> {
+    let mut spans: Vec<Span> = Vec::new();
+    for (k, seg) in elf.segments.iter().enumerate() {
+        if seg.mem_size == 0 {
             continue;
         }
-        let f = &seg.flags;
-        let prot = (u32::from(f.read) * PROT_READ)
-            | (u32::from(f.write) * PROT_WRITE)
-            | (u32::from(f.execute) * PROT_EXEC);
-        let fm = mapped
-            .as_ref()
-            .and_then(|m| m[k])
-            .filter(|&(lo, _, _)| lo == start);
-        match (file, fm) {
-            (Some(f), Some((lo, hi, off))) => {
-                vmas.push(Vma::new_file(lo, hi, prot, MAP_PRIVATE, f.clone(), off));
-                if hi < end {
-                    vmas.push(anon(hi, end, prot));
+        let Some((start, end)) = seg_pages(seg, base) else {
+            continue;
+        };
+        let mut next = Vec::with_capacity(spans.len() + 2);
+        for sp in spans {
+            if sp.end <= start || end <= sp.start {
+                next.push(sp);
+                continue;
+            }
+            if sp.start < start {
+                next.push(Span { end: start, ..sp });
+            }
+            if end < sp.end {
+                next.push(Span { start: end, ..sp });
+            }
+        }
+        next.push(Span { start, end, seg: k });
+        spans = next;
+    }
+    spans.sort_unstable_by_key(|sp| sp.start);
+    spans
+}
+
+/// The part of `sp` a private mapping of the file supplies (Linux
+/// elf_map): its segment's whole file pages within it, as (start, end,
+/// file offset of start)
+fn span_file(elf: &ElfExecutable, base: u64, sp: &Span) -> Option<(u64, u64, u64)> {
+    let (lo, hi, off) = elf.segments[sp.seg].file_pages(base, 0)?;
+    let (a, b) = (lo.max(sp.start), hi.min(sp.end));
+    (a < b).then(|| (a, b, off + (a - lo)))
+}
+
+/// mmap protection of a segment
+fn seg_prot(f: &crate::util::elf::SegmentFlags) -> u32 {
+    use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE};
+    (u32::from(f.read) * PROT_READ)
+        | (u32::from(f.write) * PROT_WRITE)
+        | (u32::from(f.execute) * PROT_EXEC)
+}
+
+/// The VMAs of `elf` loaded at `base`, one per span; with `file` (the
+/// image mapped from the page cache) a span's whole file pages are a
+/// private file VMA, the rest (a partial page, the bss) anonymous ones
+/// around it. They cover exactly the pages `load_elf_segments` maps.
+fn segment_vmas(elf: &ElfExecutable, base: u64, file: Option<&Arc<File>>) -> Vec<crate::mm::Vma> {
+    use crate::mm::{MAP_PRIVATE, Vma};
+    let mut vmas: Vec<Vma> = Vec::new();
+    for sp in image_spans(elf, base) {
+        let prot = seg_prot(&elf.segments[sp.seg].flags);
+        match file.zip(span_file(elf, base, &sp)) {
+            Some((f, (a, b, off))) => {
+                if sp.start < a {
+                    vmas.push(anon_vma(sp.start, a, prot));
+                }
+                vmas.push(Vma::new_file(a, b, prot, MAP_PRIVATE, f.clone(), off));
+                if b < sp.end {
+                    vmas.push(anon_vma(b, sp.end, prot));
                 }
             }
-            _ => vmas.push(anon(start, end, prot)),
+            None => vmas.push(anon_vma(sp.start, sp.end, prot)),
         }
-        prev_end = end;
     }
     vmas
 }
@@ -555,7 +709,9 @@ fn interp_base(interp: &ElfExecutable, prog: &ElfExecutable, prog_base: u64) -> 
     Ok(bias)
 }
 
-/// Load ELF segments into a page table
+/// Load ELF segments into a page table: every page of every span
+/// (`image_spans`), but for those a file mapping supplies when `lazy`
+/// (`span_file`), so the VMAs of `segment_vmas` cover each page mapped
 ///
 /// Returns the end address of the highest loaded segment (for setting brk).
 fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
@@ -566,104 +722,78 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
     base_addr: u64,
     lazy: bool,
 ) -> Result<u64, i32> {
-    let mut highest_end: u64 = 0;
-    // Pages the file mapping supplies at fault time (`segment_vmas`)
-    let mapped = if lazy {
-        file_mapped(elf, base_addr)
-    } else {
-        Vec::new()
-    };
-    let mut k = 0;
-
-    for segment in &elf.segments {
-        if segment.mem_size == 0 {
-            continue;
-        }
-        let from_file = mapped.get(k).copied().flatten();
-        k += 1;
-
-        let seg_start = segment.vaddr + base_addr;
-        let seg_end = seg_start + segment.mem_size as u64;
-        let page_start = seg_start & !(PAGE_SIZE - 1);
-        let page_end = (seg_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
-        // Track the highest segment end for brk initialization
-        if seg_end > highest_end {
-            highest_end = seg_end;
-        }
-
-        // Convert ELF flags to PageFlags
+    for sp in image_spans(elf, base_addr) {
+        let seg = &elf.segments[sp.seg];
+        let file = if lazy {
+            span_file(elf, base_addr, &sp)
+        } else {
+            None
+        };
         let mut flags = PageFlags::READ | PageFlags::USER;
-        if segment.flags.write {
+        if seg.flags.write {
             flags |= PageFlags::WRITE;
         }
-        if segment.flags.execute {
+        if seg.flags.execute {
             flags |= PageFlags::EXECUTE;
         }
-
-        let mut va = page_start;
-        while va < page_end {
-            if from_file.is_some_and(|(lo, hi, _)| (lo..hi).contains(&va)) {
-                va += PAGE_SIZE;
-                continue;
-            }
-            // A page shared with the previous segment is filled in place
-            let mapped = page_table.translate(va).map(|p| p & !(PAGE_SIZE - 1));
-            let frame = match mapped {
-                Some(f) => f,
-                None => user_frame()?,
-            };
-
-            // Zero a new frame first (for BSS and partial pages)
-            if mapped.is_none() {
-                unsafe {
-                    ::core::ptr::write_bytes(
-                        crate::arch::phys_to_virt(frame),
-                        0,
-                        PAGE_SIZE as usize,
-                    );
-                }
-            }
-
-            // File bytes for this page, bounds-checked against the page,
-            // the segment and the file (elf::ElfSegment::page_fill), read
-            // straight into the frame (Linux maps the file instead)
-            let size = usize::try_from(image.size).unwrap_or(usize::MAX);
-            if let Some((dst, src, len)) = segment.page_fill(base_addr, va, size) {
-                // SAFETY: our frame, reached through the direct map
-                let page = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        crate::arch::phys_to_virt(frame),
-                        PAGE_SIZE as usize,
-                    )
-                };
-                if let Err(e) = image.read_into(&mut page[dst..dst + len], src as u64) {
-                    if mapped.is_none() {
-                        crate::FRAME_ALLOCATOR.free(frame);
-                    }
-                    return Err(e);
-                }
-            }
-
-            // The kernel wrote it: code reaches the instruction caches
-            // (arm64; Linux __sync_icache_dcache on the exec mapping)
-            crate::arch::paging::sync_page(frame, segment.flags.execute);
-
-            // Map the page (once mapped, the address space frees it)
-            if mapped.is_none()
-                && page_table
+        let mut va = sp.start;
+        while va < sp.end {
+            if !file.is_some_and(|(a, b, _)| (a..b).contains(&va)) {
+                let frame = fill_page(elf, image, base_addr, va)?;
+                // The kernel wrote it: code reaches the instruction
+                // caches (arm64; Linux __sync_icache_dcache)
+                crate::arch::paging::sync_page(frame, seg.flags.execute);
+                // Once mapped, the address space frees it
+                if page_table
                     .map_with_alloc(va, frame, flags, frame_alloc)
                     .is_err()
-            {
-                crate::FRAME_ALLOCATOR.free(frame);
-                return Err(ENOMEM);
+                {
+                    crate::FRAME_ALLOCATOR.free(frame);
+                    return Err(ENOMEM);
+                }
             }
-
             va += PAGE_SIZE;
         }
     }
+    // The highest segment end (Linux elf_brk); check_segments bounded
+    // each below TASK_SIZE
+    Ok(elf
+        .segments
+        .iter()
+        .filter_map(|s| {
+            s.vaddr
+                .checked_add(base_addr)?
+                .checked_add(s.mem_size as u64)
+        })
+        .max()
+        .unwrap_or(0))
+}
 
-    Ok(highest_end)
+/// A new frame for user page `va` of the image: zeroed, then the file
+/// bytes of every segment over it, in file order (each page and file
+/// range bounds-checked by elf::ElfSegment::page_fill), read straight
+/// into it. For the congruent offsets linkers produce this is what the
+/// owning segment's file page holds (Linux maps the file instead).
+fn fill_page(elf: &ElfExecutable, image: &FileImage<'_>, base: u64, va: u64) -> Result<u64, i32> {
+    let frame = user_frame()?;
+    // SAFETY: a fresh frame, ours alone, reached through the direct map
+    let page = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
+    page.fill(0);
+    let size = usize::try_from(image.size).unwrap_or(usize::MAX);
+    for seg in &elf.segments {
+        let covers =
+            seg.mem_size > 0 && seg_pages(seg, base).is_some_and(|(lo, hi)| (lo..hi).contains(&va));
+        if !covers {
+            continue;
+        }
+        if let Some((dst, src, len)) = seg.page_fill(base, va, size)
+            && let Err(e) = image.read_into(&mut page[dst..dst + len], src as u64)
+        {
+            crate::FRAME_ALLOCATOR.free(frame);
+            return Err(e);
+        }
+    }
+    Ok(frame)
 }
 
 /// Apply ELF relocations for PIE binaries
@@ -704,10 +834,10 @@ fn apply_relocations(
 /// (execveat) cannot be reopened by its interpreter: ENOENT.
 fn resolve_scripts(
     mut file: Arc<File>,
-    mut argv: Vec<Vec<u8>>,
+    mut argv: ArgStrings,
     path: &[u8],
     path_inaccessible: bool,
-) -> Result<(Arc<File>, Vec<Vec<u8>>), i32> {
+) -> Result<(Arc<File>, ArgStrings), i32> {
     use crate::task::binfmt_script::{BINPRM_BUF_SIZE, MAX_DEPTH, parse, rewrite_argv};
     let mut name = path.to_vec();
     for depth in 0.. {
@@ -726,7 +856,7 @@ fn resolve_scripts(
         if path_inaccessible {
             return Err(ENOENT);
         }
-        argv = rewrite_argv(&argv, interp, arg, &name);
+        argv = rewrite_argv(&argv, interp, arg, &name).map_err(|e| e.errno())?;
         name = interp.to_vec();
         file = kernel_open_exec(interp)?;
     }
@@ -825,8 +955,9 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
 }
 
 /// End the other threads of the caller's group and wait until they
-/// have exited (Linux de_thread); a non-leader caller then takes the
-/// leader's place. EAGAIN if the group is exiting, or a fatal signal
+/// have exited and, but for the leader, been released (Linux
+/// de_thread: a traced zombie waits for its tracer); a non-leader
+/// caller then takes the leader's place. EAGAIN if the group is exiting, or a fatal signal
 /// arrives meanwhile (the caller then dies on its way out). Threads
 /// running user code end at their next syscall or fault (P7: IRQ
 /// return).
@@ -838,7 +969,7 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
     let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
         return Ok(());
     };
-    if percpu::group_others(tgid, tid) {
+    if percpu::exec_waits(tgid, tid) {
         if !sig.start_exec(tid) {
             return Err(EAGAIN);
         }
@@ -847,7 +978,7 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
         let w = core::pin::pin!(WaitEntry::new());
         let r = loop {
             wq.prepare_to_wait(w.as_ref(), SleepState::Killable);
-            if !percpu::group_others(tgid, tid) {
+            if !percpu::exec_waits(tgid, tid) {
                 break Ok(());
             }
             if crate::signal::fatal_signal_pending() {
@@ -859,8 +990,14 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
         sig.end_exec(tid);
         r?;
     }
-    // Released after TASKLIST: the old leader and exited threads
-    drop(percpu::take_leadership(tgid, tid));
+    // Released after TASKLIST: the old leader and exited threads; a
+    // tracer waiting for the old leader rechecks (Linux de_thread:
+    // __wake_up_parent before its silent release)
+    let gone = percpu::take_leadership(tgid, tid);
+    if !gone.is_empty() {
+        drop(gone);
+        crate::task::proc::CHILD_EXIT_WQ.wake_all();
+    }
     Ok(())
 }
 
@@ -888,8 +1025,8 @@ fn exec_fatal() {
 /// On error, it returns the error code and the process continues.
 pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     path: Vec<u8>,
-    argv: Vec<Vec<u8>>,
-    envp: Vec<Vec<u8>>,
+    argv: ArgStrings,
+    envp: ArgStrings,
     frame_alloc: &mut FA,
 ) -> i32 {
     exec_file(path, kernel_open_exec, false, argv, envp, frame_alloc)
@@ -902,8 +1039,8 @@ fn exec_file<FA, F>(
     path: Vec<u8>,
     open: F,
     path_inaccessible: bool,
-    argv: Vec<Vec<u8>>,
-    envp: Vec<Vec<u8>>,
+    argv: ArgStrings,
+    envp: ArgStrings,
     frame_alloc: &mut FA,
 ) -> i32
 where
@@ -988,7 +1125,9 @@ where
     } else {
         0
     };
-    if let Err(e) = check_segments(&elf, base_addr) {
+    // The stack VMA's bottom: the image must stay below it
+    let stack = StackSize::new(&argv, &envp, pathname);
+    if let Err(e) = check_segments(&elf, base_addr, stack.bottom()) {
         return -e;
     }
     let interp_base = match interp.as_ref().map(|ie| interp_base(ie, &elf, base_addr)) {
@@ -997,7 +1136,7 @@ where
         None => 0,
     };
     if let Some(ie) = &interp
-        && let Err(e) = check_segments(ie, interp_base)
+        && let Err(e) = check_segments(ie, interp_base, stack.bottom())
     {
         return -e;
     }
@@ -1075,15 +1214,21 @@ where
         phnum: elf.phnum,
         execfn: pathname,
     };
-    let (args, stack_bottom) =
-        match setup_user_stack(&mut new_page_table, frame_alloc, &argv, &envp, &info) {
-            Ok(r) => r,
-            Err(e) => return -e,
-        };
+    let args = match setup_user_stack(
+        &mut new_page_table,
+        frame_alloc,
+        &argv,
+        &envp,
+        &info,
+        &stack,
+    ) {
+        Ok(r) => r,
+        Err(e) => return -e,
+    };
     // The new image's VMAs, then the signal page in the free space they
     // leave (Linux arch_setup_additional_pages: get_unmapped_area and a
     // special mapping once the image and stack are in place)
-    let mut vmas = image_vmas(&elf, base_addr, stack_bottom, exe_map);
+    let mut vmas = image_vmas(&elf, base_addr, stack.bottom(), exe_map);
     if let Some(ie) = &interp {
         vmas.extend(segment_vmas(ie, interp_base, interp_map));
     }
@@ -1143,7 +1288,10 @@ where
 
     // Initialize brk for the new process
     // Calculate page-aligned start_brk (end of loaded segments, rounded up)
-    let start_brk = (segments_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    // (segments end below TASK_SIZE: check_segments)
+    let start_brk = segments_end
+        .checked_next_multiple_of(PAGE_SIZE)
+        .unwrap_or(crate::mm::TASK_SIZE);
 
     // The new image's VMAs
     {
@@ -1203,16 +1351,8 @@ pub fn sys_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
         Err(e) => return e.sysret(),
     };
 
-    // Copy argv from user space
-    let mut budget = MAX_ARG_PAGES * PAGE_SIZE as usize;
-    let argv = match copy_string_array_from_user(argv_ptr, 1024, &mut budget) {
+    let (argv, envp) = match copy_args(&path, argv_ptr, envp_ptr) {
         Ok(a) => a,
-        Err(e) => return -i64::from(e),
-    };
-
-    // Copy envp from user space
-    let envp = match copy_string_array_from_user(envp_ptr, 1024, &mut budget) {
-        Ok(e) => e,
         Err(e) => return -i64::from(e),
     };
 
@@ -1248,16 +1388,11 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
         Ok(p) => p,
         Err(e) => return e.sysret(),
     };
-    let mut budget = MAX_ARG_PAGES * PAGE_SIZE as usize;
-    let argv = match copy_string_array_from_user(argv_ptr, 1024, &mut budget) {
+    let name = exec_name(dirfd, &path);
+    let (argv, envp) = match copy_args(&name, argv_ptr, envp_ptr) {
         Ok(a) => a,
         Err(e) => return -i64::from(e),
     };
-    let envp = match copy_string_array_from_user(envp_ptr, 1024, &mut budget) {
-        Ok(e) => e,
-        Err(e) => return -i64::from(e),
-    };
-    let name = exec_name(dirfd, &path);
     // Linux BINPRM_FLAGS_PATH_INACCESSIBLE: the program came through a
     // close-on-exec fd, so a script's interpreter could not open it
     let via_fd = dirfd != AT_FDCWD && path.first() != Some(&b'/');
@@ -1303,7 +1438,7 @@ fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<crate::fs::Path, i
 
 #[cfg(test)]
 mod tests {
-    use super::{PAGE_SIZE, highest_gap};
+    use super::{ElfExecutable, PAGE_SIZE, highest_gap, image_spans};
 
     const P: u64 = PAGE_SIZE;
 
@@ -1331,6 +1466,61 @@ mod tests {
         let mut s = [(P, 4 * P), (2 * P, 9 * P)];
         assert_eq!(highest_gap(&mut s, 9 * P, P), None);
         assert_eq!(highest_gap(&mut [], P, P), None);
+    }
+
+    fn elf(segs: &[(u64, usize)]) -> ElfExecutable {
+        use crate::util::elf::{ElfSegment, SegmentFlags};
+        ElfExecutable {
+            entry: 0,
+            segments: segs
+                .iter()
+                .map(|&(vaddr, mem_size)| ElfSegment {
+                    vaddr,
+                    mem_size,
+                    file_size: 0,
+                    flags: SegmentFlags::from_elf_flags(4),
+                    offset: 0,
+                })
+                .collect(),
+            is_pie: false,
+            rela: None,
+            phdr: 0,
+            phent: 56,
+            phnum: segs.len() as u64,
+            align: P,
+            interp: None,
+            end: 0,
+        }
+    }
+
+    fn spans(segs: &[(u64, usize)]) -> Vec<(u64, u64, usize)> {
+        image_spans(&elf(segs), 0)
+            .iter()
+            .map(|s| (s.start, s.end, s.seg))
+            .collect()
+    }
+
+    #[test]
+    fn spans_sorted_whatever_the_file_order() {
+        let s = spans(&[(6 * P, 2 * P as usize), (4 * P, P as usize)]);
+        assert_eq!(s, [(4 * P, 5 * P, 1), (6 * P, 8 * P, 0)]);
+    }
+
+    #[test]
+    fn spans_later_segment_owns_shared_page() {
+        // Text ends mid-page, data starts in that page
+        let s = spans(&[(4 * P, P as usize + 0x10), (5 * P + 0x10, P as usize)]);
+        assert_eq!(s, [(4 * P, 5 * P, 0), (5 * P, 7 * P, 1)]);
+    }
+
+    #[test]
+    fn spans_overlap_goes_to_the_later() {
+        // A later segment inside an earlier one splits it
+        let s = spans(&[(4 * P, 4 * P as usize), (5 * P, P as usize), (0, 0)]);
+        assert_eq!(s, [(4 * P, 5 * P, 0), (5 * P, 6 * P, 1), (6 * P, 8 * P, 0)]);
+        // An earlier one inside a later one vanishes
+        let s = spans(&[(5 * P, P as usize), (4 * P, 4 * P as usize)]);
+        assert_eq!(s, [(4 * P, 8 * P, 1)]);
     }
 
     #[test]

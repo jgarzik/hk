@@ -53,7 +53,7 @@ use crate::mm::PAGE_SIZE;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::uaccess::{UaccessArch, copy_from_user, copy_val_from_user, get_user, put_user};
+use crate::uaccess::{copy_from_user, copy_val_from_user, get_user, put_user};
 
 // ============================================================================
 // io_uring constants
@@ -379,7 +379,8 @@ impl IoUringInner {
 
         // Check for overflow
         if cq_next.wrapping_sub(cq_head) > self.cq_entries {
-            self.cq_overflow += 1;
+            // Linux cq_overflow is a free-running u32 the reader diffs
+            self.cq_overflow = self.cq_overflow.wrapping_add(1);
             return false;
         }
 
@@ -513,7 +514,8 @@ impl IoUring {
             let sqe_idx = inner.sq_array.get(sq_idx as usize).copied().unwrap_or(0);
 
             if sqe_idx >= inner.sq_entries {
-                inner.sq_dropped += 1;
+                // Free-running, as Linux sq_dropped
+                inner.sq_dropped = inner.sq_dropped.wrapping_add(1);
                 inner.sq_head = inner.sq_head.wrapping_add(1);
                 continue;
             }
@@ -657,15 +659,10 @@ impl IoUring {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        rw_one(
-            &file,
-            &[IoVec {
-                iov_base: buf_addr,
-                iov_len: len as u64,
-            }],
-            offset,
-            false,
-        )
+        match crate::fs::io::import_ubuf(buf_addr, len as u64) {
+            Ok(seg) => rw_one(&file, &seg, offset, false),
+            Err(e) => e.to_errno_neg(),
+        }
     }
 
     /// Handle IORING_OP_WRITE
@@ -698,15 +695,10 @@ impl IoUring {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        rw_one(
-            &file,
-            &[IoVec {
-                iov_base: buf_addr,
-                iov_len: len as u64,
-            }],
-            offset,
-            true,
-        )
+        match crate::fs::io::import_ubuf(buf_addr, len as u64) {
+            Ok(seg) => rw_one(&file, &seg, offset, true),
+            Err(e) => e.to_errno_neg(),
+        }
     }
 
     /// Handle IORING_OP_READV (vectored read)
@@ -740,7 +732,7 @@ impl IoUring {
 
         match read_user_iovecs(iov_addr, iov_count) {
             Ok(v) => rw_one(&file, &v, offset, false),
-            Err(e) => e,
+            Err(e) => e.to_errno_neg(),
         }
     }
 
@@ -775,7 +767,7 @@ impl IoUring {
 
         match read_user_iovecs(iov_addr, iov_count) {
             Ok(v) => rw_one(&file, &v, offset, true),
-            Err(e) => e,
+            Err(e) => e.to_errno_neg(),
         }
     }
 
@@ -1278,21 +1270,11 @@ fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
 // Helper structures and functions
 // ============================================================================
 
-/// The `n` iovecs at `iov_addr` (EINVAL beyond IOV_MAX, EFAULT for a bad
-/// array or buffer)
-fn read_user_iovecs(iov_addr: u64, n: usize) -> Result<Vec<IoVec>, i32> {
-    if n > crate::fs::syscall::IOV_MAX {
-        return Err(KernelError::InvalidArgument.to_errno_neg());
-    }
-    let v = (0..n)
-        .map(|i| read_user_iovec(iov_addr, i))
-        .collect::<Result<Vec<_>, _>>()?;
-    if v.iter()
-        .any(|s| s.iov_len > 0 && !Uaccess::access_ok(s.iov_base, s.iov_len as usize))
-    {
-        return Err(KernelError::BadAddress.to_errno_neg());
-    }
-    Ok(v)
+/// The `n` iovecs at `iov_addr`, checked and cut like readv's (Linux
+/// io_import_iovec -> __import_iovec)
+fn read_user_iovecs(iov_addr: u64, n: usize) -> Result<Vec<IoVec>, KernelError> {
+    let n = i32::try_from(n).map_err(|_| KernelError::InvalidArgument)?;
+    crate::fs::iov::import_iovec(iov_addr, n)
 }
 
 /// Read or write `segs` at `offset` (u64::MAX: the file position, under
@@ -1300,7 +1282,15 @@ fn read_user_iovecs(iov_addr: u64, n: usize) -> Result<Vec<IoVec>, i32> {
 fn rw_one(file: &File, segs: &[IoVec], offset: u64, write: bool) -> i32 {
     use crate::fs::RwFlags;
     let at = (offset != u64::MAX).then_some(offset);
+    // Any other negative offset is EINVAL, as is one the transfer would
+    // carry past the largest offset (Linux rw_verify_area)
+    if at.is_some_and(|o| o > i64::MAX as u64) {
+        return KernelError::InvalidArgument.to_errno_neg();
+    }
     let _pos = at.is_none().then(|| file.pos_lock());
+    if let Err(e) = crate::fs::io::verify_area(file, at, crate::fs::io::seg_len(segs)) {
+        return e.to_errno_neg();
+    }
     let r = if write {
         crate::fs::io::file_writev(file, segs, at, RwFlags::empty(), None)
     } else {
@@ -1310,15 +1300,6 @@ fn rw_one(file: &File, segs: &[IoVec], offset: u64, write: bool) -> i32 {
         Ok(n) => n as i32,
         Err(e) => fs_error_to_errno(e) as i32,
     }
-}
-
-/// Read element `i` of a user iovec array (negative errno on fault)
-fn read_user_iovec(iov_addr: u64, i: usize) -> Result<IoVec, i32> {
-    let addr = (i as u64)
-        .checked_mul(core::mem::size_of::<IoVec>() as u64)
-        .and_then(|o| iov_addr.checked_add(o))
-        .ok_or(KernelError::BadAddress.to_errno_neg())?;
-    copy_val_from_user::<Uaccess, IoVec>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
 
 /// Most registered files (Linux IORING_MAX_FIXED_FILES)

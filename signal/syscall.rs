@@ -334,6 +334,13 @@ fn user_group_send(pid: u64, sig: u32, info: SendInfo) -> i32 {
 /// permission check as a process-wide signal, then the send.
 fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32, info: SendInfo) -> i32 {
     use crate::task::percpu::TASKLIST;
+    // The caller's numbers (Linux find_task_by_vpid, task_tgid_vnr)
+    let (Some(tid), Some(tgid)) = (
+        crate::task::pid::from_vnr(tid),
+        tgid.map_or(Some(None), |g| crate::task::pid::from_vnr(g).map(Some)),
+    ) else {
+        return -3; // ESRCH
+    };
     if let Some(tgid) = tgid {
         let in_group = TASKLIST
             .read()
@@ -354,7 +361,7 @@ fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32, info: SendInfo) -> i3
 /// What tkill and tgkill send: SI_TKILL from the caller's process and
 /// real uid (Linux prepare_kill_siginfo, PIDTYPE_PID)
 fn tkill_info(sig: u32) -> SendInfo {
-    let pid = crate::task::percpu::current_pid() as i32;
+    let pid = crate::task::pid::vnr(crate::task::percpu::current_pid()) as i32;
     let uid = crate::task::current_cred().uid;
     SendInfo::Info(SigInfo::kill(sig, si_code::SI_TKILL, pid, uid))
 }
@@ -376,8 +383,13 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         return -22; // EINVAL
     }
 
+    // Numbers are the caller's (Linux find_vpid): none it sees is ESRCH
+    let vpid = |nr: u64| crate::task::pid::from_vnr(nr);
     if pid > 0 {
-        i64::from(user_group_send(pid as u64, sig, SendInfo::User))
+        let Some(pid) = vpid(pid as u64) else {
+            return -3; // ESRCH
+        };
+        i64::from(user_group_send(pid, sig, SendInfo::User))
     } else if pid == 0 {
         // Every process in the caller's process group, once each
         i64::from(kill_pgrp(current_pgid(), sig, SendInfo::User, |p| {
@@ -393,9 +405,12 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
             let table = crate::task::percpu::TASKLIST.read();
             table.get(current_tid()).map(|t| t.task.pid).unwrap_or(0)
         };
+        // Only processes the caller's namespace numbers, but its init
+        // (Linux kill_something_info: task_pid_vnr(p) > 1)
+        let ns = crate::task::pid::current_pid_ns();
         let mut matched = false;
         for target_pid in get_all_pids() {
-            if target_pid <= 1 || target_pid == self_tgid {
+            if crate::task::pid::nr_ns(target_pid, ns) <= 1 || target_pid == self_tgid {
                 continue;
             }
             match check_kill_permission(target_pid, sig) {
@@ -413,7 +428,9 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
     } else {
         // pid < -1: every process in group -pid, once each (signal 0:
         // does the group exist, may we signal it)
-        let pgid = pid.unsigned_abs();
+        let Some(pgid) = vpid(pid.unsigned_abs()) else {
+            return -3; // ESRCH
+        };
         i64::from(kill_pgrp(pgid, sig, SendInfo::User, |p| {
             check_kill_permission(p, sig)
         }))
@@ -481,11 +498,14 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
     // values reserved to the kernel (>= 0, or SI_TKILL) may only be queued
     // by a thread to its own number, never used to forge signals to
     // other processes
-    if reserved_to_kernel(info.code) && pid != current_tid() as i64 {
+    if reserved_to_kernel(info.code) && pid != i64::from(crate::task::pid::vnr(current_tid())) {
         return -1; // EPERM
     }
 
-    i64::from(user_group_send(pid as u64, sig, SendInfo::Info(info)))
+    let Some(pid) = crate::task::pid::from_vnr(pid as u64) else {
+        return -3; // ESRCH
+    };
+    i64::from(user_group_send(pid, sig, SendInfo::Info(info)))
 }
 
 /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo) - send signal with info to a thread
@@ -519,7 +539,7 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
 
     // Security check (Linux do_rt_tgsigqueueinfo): kernel-reserved si_code
     // only when targeting the calling thread itself
-    let caller_tid = crate::task::percpu::current_tid() as i64;
+    let caller_tid = i64::from(crate::task::pid::vnr(crate::task::percpu::current_tid()));
     if reserved_to_kernel(info.code) && tid != caller_tid {
         return -1; // EPERM
     }
@@ -639,13 +659,11 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
 
     // Read timeout if provided
     let timeout_ns = if ts_ptr != 0 {
-        let tv_sec = match get_user::<Uaccess, i64>(ts_ptr) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
-        };
-        let tv_nsec = match get_user::<Uaccess, i64>(ts_ptr + 8) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
+        // struct timespec read whole, never field by field from a
+        // computed user address
+        let Ok([tv_sec, tv_nsec]) = crate::uaccess::copy_val_from_user::<Uaccess, [i64; 2]>(ts_ptr)
+        else {
+            return KernelError::BadAddress.sysret();
         };
 
         // Validate timeout

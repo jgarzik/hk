@@ -2747,7 +2747,7 @@ pub const BPF_MAP_UPDATE_ELEM: i32 = 2;
 pub const BPF_MAP_DELETE_ELEM: i32 = 3;
 pub const BPF_MAP_GET_NEXT_KEY: i32 = 4;
 pub const BPF_PROG_LOAD: i32 = 5;
-pub const BPF_OBJ_GET_INFO_BY_FD: i32 = 29;
+pub const BPF_OBJ_GET_INFO_BY_FD: i32 = 15;
 
 /// BPF map types
 pub const BPF_MAP_TYPE_HASH: u32 = 1;

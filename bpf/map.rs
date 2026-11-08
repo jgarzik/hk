@@ -138,6 +138,19 @@ impl BpfHashMap {
         if max_entries == 0 || max_entries > BPF_MAX_ENTRIES {
             return Err(KernelError::InvalidArgument);
         }
+        // A full map must fit the budget the array map preallocates
+        // against: ENOMEM at create (Linux preallocates every hash
+        // element, bpf_map_area_alloc failing) rather than later. Each
+        // entry: key and value in their kmalloc classes, their Vec
+        // headers, and a share of the tree's node
+        let class = |n: u32| u64::from(n).next_power_of_two().max(16);
+        let entry = class(key_size)
+            + class(value_size)
+            + 2 * core::mem::size_of::<Vec<u8>>() as u64
+            + HASH_NODE_SHARE;
+        if u64::from(max_entries) * entry > prealloc_budget() {
+            return Err(KernelError::OutOfMemory);
+        }
 
         try_arc(Self {
             data: IrqSpinlock::new(BTreeMap::new()),
@@ -165,21 +178,27 @@ impl BpfMapOps for BpfHashMap {
             return Err(KernelError::InvalidArgument);
         }
 
+        // A new element's key and value are allocated before the lock
+        // (IRQs are off under it), fallibly (ENOMEM); dropped after it
+        // when unused
+        let k = crate::util::kmem::try_to_vec(key)?;
+        let v = crate::util::kmem::try_to_vec(value)?;
         let mut data = self.data.lock();
-        let exists = data.contains_key(key);
-
-        match flags {
-            BPF_NOEXIST if exists => return Err(KernelError::AlreadyExists),
-            BPF_EXIST if !exists => return Err(KernelError::NotFound),
-            _ => {}
+        if let Some(old) = data.get_mut(key) {
+            if flags == BPF_NOEXIST {
+                return Err(KernelError::AlreadyExists);
+            }
+            old.copy_from_slice(value);
+            return Ok(());
         }
-
-        // Check max entries only for new insertions
-        if !exists && data.len() >= self.max_entries as usize {
+        if flags == BPF_EXIST {
+            return Err(KernelError::NotFound);
+        }
+        // Full (Linux htab: E2BIG)
+        if data.len() >= self.max_entries as usize {
             return Err(KernelError::ArgListTooLong);
         }
-
-        data.insert(key.to_vec(), value.to_vec());
+        data.insert(k, v);
         Ok(())
     }
 
@@ -237,6 +256,11 @@ impl BpfMapOps for BpfHashMap {
 // =============================================================================
 // BPF Array Map
 // =============================================================================
+
+/// Per-entry share of a BTreeMap node in the hash map's budget (a node
+/// holds up to 11 entries in about 300 bytes of keys and values plus
+/// edges)
+const HASH_NODE_SHARE: u64 = 32;
 
 /// Most bytes a map may preallocate: half of free memory (host tests:
 /// no limit)

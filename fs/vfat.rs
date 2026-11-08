@@ -513,6 +513,8 @@ pub struct VfatSbData {
     pub fat_start_sector: u64,
     /// Size of each FAT in sectors
     pub fat_sectors: u64,
+    /// Number of FAT copies, each written on a change (Linux sbi->fats)
+    pub num_fats: u64,
     /// First sector of the data region
     pub data_start_sector: u64,
     /// Root directory cluster
@@ -872,9 +874,8 @@ fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), K
     let new_value = (existing & 0xF000_0000) | (value & 0x0FFF_FFFF);
     let buf = new_value.to_le_bytes();
 
-    // Write to all FAT copies (typically 2)
-    let num_fats = 2u64; // FAT32 standard
-    for fat_num in 0..num_fats {
+    // Every FAT copy the boot sector declares (Linux fat_mirror_bhs)
+    for fat_num in 0..sb_data.num_fats {
         let fat_start = sb_data.fat_start_sector + fat_num * sb_data.fat_sectors;
         let byte_offset = fat_start * u64::from(sb_data.bytes_per_sector) + offset_in_fat;
         write_bytes(&sb_data.bdev, byte_offset, &buf)?;
@@ -1059,15 +1060,61 @@ fn lfn_name(parts: &mut [(u8, Vec<u16>)]) -> String {
         .collect()
 }
 
-/// Read and parse directory entries from a cluster chain
+/// Most LFN entries one name spans (Linux: 255 UTF-16 units in 13-unit
+/// slots, fat_parse_long's "slots > 20" bogus check)
+const MAX_LFN_SLOTS: usize = 20;
+
+/// The LFN entries gathered before their short entry (Linux
+/// fat_parse_long): at most MAX_LFN_SLOTS of them, the first carrying
+/// the last-entry bit and the short name's checksum
+#[derive(Default)]
+struct Lfn {
+    parts: Vec<(u8, Vec<u16>)>,
+    checksum: Option<u8>,
+}
+
+impl Lfn {
+    fn clear(&mut self) {
+        self.parts.clear();
+        self.checksum = None;
+    }
+
+    /// One LFN entry; a sequence that does not start with the last-entry
+    /// bit, an order outside 1..=20 or more than 20 entries is bogus and
+    /// leaves only the short name
+    fn add(&mut self, lfn: &VfatLfnEntry) {
+        let order = lfn.order & 0x3F;
+        if lfn.order & 0x40 != 0 {
+            self.clear();
+            self.checksum = Some(lfn.checksum);
+        }
+        let bogus = order == 0 || usize::from(order) > MAX_LFN_SLOTS;
+        if bogus || self.checksum.is_none() || self.parts.len() >= MAX_LFN_SLOTS {
+            self.clear();
+            return;
+        }
+        self.parts.push((order, lfn_entry_chars(lfn)));
+    }
+
+    /// The long name for the short entry `name`.`ext`, if the gathered
+    /// entries belong to it (checksum); the state is cleared
+    fn take_name(&mut self, name: &[u8; 8], ext: &[u8; 3]) -> Option<String> {
+        let ok = !self.parts.is_empty() && self.checksum == Some(lfn_checksum(name, ext));
+        let long = ok.then(|| lfn_name(&mut self.parts));
+        self.clear();
+        long
+    }
+}
+
+/// Read and parse directory entries from a cluster chain; the list
+/// grows fallibly (ENOMEM), a directory being as large as its disk says
 fn read_directory_entries(
     sb_data: &VfatSbData,
     start_cluster: u32,
 ) -> Result<Vec<ParsedDirEntry>, KernelError> {
     let chain = read_cluster_chain(sb_data, start_cluster)?;
-    let mut entries = Vec::new();
-    let mut lfn_parts: Vec<(u8, Vec<u16>)> = Vec::new();
-    let mut lfn_checksum_expected: Option<u8> = None;
+    let mut entries = crate::util::kmem::KVec::new();
+    let mut lfn = Lfn::default();
 
     for (ci, &cluster) in chain.iter().enumerate() {
         let cluster_offset = cluster_to_offset(sb_data, cluster);
@@ -1080,13 +1127,12 @@ fn read_directory_entries(
 
             // Check for end of directory
             if buf[0] == END_MARKER {
-                return Ok(entries);
+                return Ok(entries.into_vec());
             }
 
             // Skip deleted entries
             if buf[0] == DELETED_MARKER {
-                lfn_parts.clear();
-                lfn_checksum_expected = None;
+                lfn.clear();
                 continue;
             }
 
@@ -1094,49 +1140,21 @@ fn read_directory_entries(
 
             // Check if this is a long filename entry
             if (attr & attr::LONG_NAME_MASK) == attr::LONG_NAME {
-                // Parse as LFN entry
-                let lfn = VfatLfnEntry::read_from(&buf).expect("32-byte entry");
-                let order = lfn.order & 0x3F;
-                let is_last = (lfn.order & 0x40) != 0;
-
-                if is_last {
-                    lfn_parts.clear();
-                    lfn_checksum_expected = Some(lfn.checksum);
-                }
-
-                let chars = lfn_entry_chars(&lfn);
-                lfn_parts.push((order, chars));
+                lfn.add(&VfatLfnEntry::read_from(&buf).expect("32-byte entry"));
             } else {
                 // Parse as regular directory entry
                 let dirent = VfatDirEntry::read_from(&buf).expect("32-byte entry");
 
                 // Skip volume labels
                 if (attr & attr::VOLUME_ID) != 0 {
-                    lfn_parts.clear();
-                    lfn_checksum_expected = None;
+                    lfn.clear();
                     continue;
                 }
 
-                // Build the filename
-                let name = if !lfn_parts.is_empty() {
-                    // Verify checksum
-                    let expected = lfn_checksum_expected.unwrap_or(0);
-                    let actual = lfn_checksum(&dirent.name, &dirent.ext);
-
-                    if expected == actual {
-                        // Sort LFN parts by order and concatenate
-                        lfn_name(&mut lfn_parts)
-                    } else {
-                        // Checksum mismatch, use short name
-                        short_name_to_string(&dirent.name, &dirent.ext)
-                    }
-                } else {
-                    short_name_to_string(&dirent.name, &dirent.ext)
-                };
-
-                // Clear LFN state
-                lfn_parts.clear();
-                lfn_checksum_expected = None;
+                // The long name if its entries match, else the short one
+                let name = lfn
+                    .take_name(&dirent.name, &dirent.ext)
+                    .unwrap_or_else(|| short_name_to_string(&dirent.name, &dirent.ext));
 
                 // Skip "." and ".." entries
                 if name == "." || name == ".." {
@@ -1151,19 +1169,19 @@ fn read_directory_entries(
                 short_name[0..8].copy_from_slice(&dirent.name);
                 short_name[8..11].copy_from_slice(&dirent.ext);
 
-                entries.push(ParsedDirEntry {
+                entries.try_push(ParsedDirEntry {
                     name,
                     short_name,
                     attr,
                     start_cluster,
                     file_size: dirent.file_size,
                     slot: (ci * entries_per_cluster + i) as u64,
-                });
+                })?;
             }
         }
     }
 
-    Ok(entries)
+    Ok(entries.into_vec())
 }
 
 // ============================================================================
@@ -1595,8 +1613,7 @@ fn delete_dir_entry(
     let entries_per_cluster = sb_data.cluster_size as usize / 32;
 
     let mut lfn_start: Option<(usize, usize)> = None; // (chain_idx, entry_in_cluster)
-    let mut lfn_parts: Vec<(u8, Vec<u16>)> = Vec::new(); // LFN parts: (order, chars)
-    let mut lfn_checksum_expected: Option<u8> = None;
+    let mut lfn = Lfn::default();
 
     // Search for the entry
     for (chain_idx, &cluster) in chain.iter().enumerate() {
@@ -1615,56 +1632,27 @@ fn delete_dir_entry(
             // Skip already deleted
             if buf[0] == DELETED_MARKER {
                 lfn_start = None;
-                lfn_parts.clear();
-                lfn_checksum_expected = None;
+                lfn.clear();
                 continue;
             }
 
             // Track and collect LFN entries
             let attr_byte = buf[11];
             if (attr_byte & attr::LONG_NAME_MASK) == attr::LONG_NAME {
-                let lfn = VfatLfnEntry::read_from(&buf).expect("32-byte entry");
-                let order = lfn.order & 0x3F;
-                let is_last = (lfn.order & 0x40) != 0;
-
-                if is_last {
+                let entry = VfatLfnEntry::read_from(&buf).expect("32-byte entry");
+                if entry.order & 0x40 != 0 {
                     // Start of LFN sequence
                     lfn_start = Some((chain_idx, i));
-                    lfn_parts.clear();
-                    lfn_checksum_expected = Some(lfn.checksum);
                 }
-
-                let chars = lfn_entry_chars(&lfn);
-                lfn_parts.push((order, chars));
+                lfn.add(&entry);
                 continue;
             }
 
             // Regular entry - check name (both short and long)
-            let short_name = short_name_to_string(
-                buf[0..8].try_into().unwrap(),
-                buf[8..11].try_into().unwrap(),
-            );
-
-            // Build long filename if LFN entries were collected
-            let long_name = if !lfn_parts.is_empty() {
-                let expected = lfn_checksum_expected.unwrap_or(0);
-                let actual = lfn_checksum(
-                    buf[0..8].try_into().unwrap(),
-                    buf[8..11].try_into().unwrap(),
-                );
-                if expected == actual {
-                    Some(lfn_name(&mut lfn_parts))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // Clear LFN state for next entry
+            let dirent = VfatDirEntry::read_from(&buf).expect("32-byte entry");
+            let short_name = short_name_to_string(&dirent.name, &dirent.ext);
+            let long_name = lfn.take_name(&dirent.name, &dirent.ext);
             let current_lfn_start = lfn_start.take();
-            lfn_parts.clear();
-            lfn_checksum_expected = None;
 
             // Check if either short name or long name matches
             let matches = short_name.eq_ignore_ascii_case(name)
@@ -2536,6 +2524,7 @@ fn vfat_mount_dev(
         sectors_per_cluster: u32::from(boot_sector.sectors_per_cluster),
         fat_start_sector,
         fat_sectors,
+        num_fats,
         data_start_sector,
         root_cluster: boot_sector.root_cluster,
         max_cluster: (total_clusters + 2) as u32,

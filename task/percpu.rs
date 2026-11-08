@@ -200,8 +200,8 @@ unsafe impl Send for CpuRunQueue {}
 /// What an exited task still holds while its CPU runs on its stack and
 /// its page tables: freed by the next task (`DeadTask::drop`)
 pub struct DeadTask {
-    /// Kernel stack (`mm::vmstack` base) and size; size 0 = not owned
-    stack: (u64, usize),
+    /// Its kernel stack, if it owned one
+    stack: Option<crate::mm::vmstack::VmStack>,
     /// mm_count reference on the address space it last ran in (mmdrop)
     mm: Option<alloc::sync::Arc<crate::mm::Mm>>,
     /// The run queue's reference (per-CPU `curr` pointed at it)
@@ -217,9 +217,11 @@ const STACK_MIN_LEFT: usize = 4096;
 /// zeroed, so the untouched bottom shows how deep the task ever went.
 /// An overflow faults in the guard gap below the stack (a "kernel stack
 /// overflow" panic); this reports a path that came close. Reported once.
-fn check_stack_usage(base: u64, size: usize) {
-    // SAFETY: the dead task's stack, still owned and no longer in use
-    let words = unsafe { core::slice::from_raw_parts(base as *const u64, size / 8) };
+fn check_stack_usage(stack: &crate::mm::vmstack::VmStack) {
+    let size = crate::mm::vmstack::THREAD_SIZE;
+    // SAFETY: the dead task's stack, mapped while `stack` lives and no
+    // longer in use
+    let words = unsafe { core::slice::from_raw_parts(stack.base() as *const u64, size / 8) };
     let left = words.iter().position(|&w| w != 0).unwrap_or(words.len()) * 8;
     if left < STACK_MIN_LEFT {
         static REPORTED: AtomicBool = AtomicBool::new(false);
@@ -236,10 +238,8 @@ fn check_stack_usage(base: u64, size: usize) {
 
 impl Drop for DeadTask {
     fn drop(&mut self) {
-        let (base, size) = self.stack;
-        if size != 0 {
-            check_stack_usage(base, size);
-            crate::mm::vmstack::free(base);
+        if let Some(stack) = self.stack.take() {
+            check_stack_usage(&stack);
         }
         // mmdrop: the last reference frees the top-level table
         drop(self.mm.take());
@@ -749,6 +749,11 @@ impl GlobalTaskTable {
         self.pid_task(pid).map(Task::tid)
     }
 
+    /// A reference to the task `pid` names
+    pub fn pid_task_ref(&self, pid: &crate::task::pid::Pid) -> Option<TaskRef> {
+        self.pid_task(pid).map(task_ref)
+    }
+
     /// Task `tid`
     pub fn get(&self, tid: Tid) -> Option<TaskView<'_>> {
         self.lookup(tid).map(|t| view(self, t))
@@ -794,6 +799,43 @@ impl GlobalTaskTable {
         Self::collect(
             |table, visit| {
                 for t in table.pgrp(pg) {
+                    if !visit(&t) {
+                        break;
+                    }
+                }
+            },
+            f,
+        )
+    }
+
+    /// What `f` picks of each thread of task `t`'s process, gathered as
+    /// `collect_threads` does, nothing once `t` is no longer listed (its
+    /// group is found from `t` under each read hold, never by a number
+    /// taken earlier)
+    pub fn collect_group<T>(
+        t: &Task,
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Vec<T> {
+        Self::collect(
+            |table, visit| {
+                if !table.get(t.tid()).is_some_and(|v| core::ptr::eq(v.task, t)) {
+                    return;
+                }
+                for x in table.threads(t.pid) {
+                    if !visit(&x) {
+                        break;
+                    }
+                }
+            },
+            f,
+        )
+    }
+
+    /// What `f` picks of every task, gathered as `collect_threads` does
+    pub fn collect_tasks<T>(f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>) -> Vec<T> {
+        Self::collect(
+            |table, visit| {
+                for t in table.iter() {
                     if !visit(&t) {
                         break;
                     }
@@ -967,6 +1009,9 @@ impl GlobalTaskTable {
             && let Some(p) = &inner.thread_pid
         {
             p.set_task(core::ptr::null());
+            // Its pidfd pollers see it gone (Linux __unhash_process:
+            // wake_up_all under tasklist_lock)
+            p.wait_pidfd.wake_all();
         }
         if release {
             self.release_pids(&t);
@@ -1118,6 +1163,21 @@ pub static TASKLIST: RwLock<GlobalTaskTable> = RwLock::new(GlobalTaskTable::new(
 /// A reference to task `tid` (TASKLIST only for the lookup)
 pub fn find_task(tid: Tid) -> Option<TaskRef> {
     TASKLIST.read().task(tid)
+}
+
+/// The task `ns` numbers `nr` (Linux find_task_by_pid_ns; TASKLIST
+/// only for the lookup)
+pub fn find_task_by_pid_ns(nr: u64, ns: &crate::ns::PidNamespace) -> Option<TaskRef> {
+    let pid = crate::task::pid::find_pid(ns, u32::try_from(nr).ok()?)?;
+    let t = TASKLIST.read().pid_task_ref(&pid);
+    drop(pid);
+    t
+}
+
+/// The task the caller numbers `nr` (Linux find_task_by_vpid): what a
+/// pid argument names, None (ESRCH) if not visible in its namespace
+pub fn find_task_by_vpid(nr: u64) -> Option<TaskRef> {
+    find_task_by_pid_ns(nr, crate::task::pid::current_pid_ns())
 }
 
 /// Run `f` with task `tid`'s `alloc_lock` held (Linux task_lock(p));
@@ -1332,8 +1392,8 @@ fn create_kernel_task(
     const NOMEM: &str = "Out of memory for kernel thread";
     let cred = try_arc(Cred::ROOT).map_err(|_| NOMEM)?;
     let sig = crate::signal::TaskSignalState::new();
-    let stack_base = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
-    let stack_top = stack_base + KERNEL_STACK_SIZE as u64;
+    let stack = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
+    let stack_top = stack.top();
 
     let task_inner = crate::task::TaskInner {
         thread_pid,
@@ -1346,7 +1406,7 @@ fn create_kernel_task(
         parent_exec_id: 0,
         pdeath_signal: 0,
         state: TaskState::Ready,
-        page_table: ArchPageTable::kernel_identity(),
+        pgd: ArchPageTable::kernel_root(),
         // TLS fields (not used for idle task)
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -1402,10 +1462,9 @@ fn create_kernel_task(
     set_kthread_class(&task.se, priority);
     // SAFETY: not on a run queue yet
     unsafe { *task.se.ctx() = TaskContext::new_kernel_thread(entry, stack_top) };
-    let task = try_arc(task).map_err(|_| {
-        crate::mm::vmstack::free(stack_base);
-        NOMEM
-    })?;
+    task.se.stack.set(stack);
+    // On failure the stack goes with the task
+    let task = try_arc(task).map_err(|_| NOMEM)?;
     if idle {
         set_idle(cpu_id, &task);
     } else {
@@ -1542,7 +1601,7 @@ pub fn can_sleep() -> bool {
 pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     let cpu_id = crate::cpu::this_id();
     // init is pid 1 (Linux: the first pid of the root namespace)
-    let thread_pid = crate::task::pid::alloc_pid_nr(&crate::ns::INIT_PID_NS, Some(1))
+    let thread_pid = crate::task::pid::alloc_pid_nr(&crate::ns::INIT_PID_NS, &[1])
         .map_err(|_| "init: pid 1 taken")?;
     let (tid, pid): (Tid, Pid) = (1, 1);
     // The first address space owns the boot-built tables
@@ -1552,15 +1611,15 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     let task_inner = crate::task::TaskInner {
         thread_pid: Some(thread_pid),
         // The boot group and session, number 0 (Linux init_struct_pid)
-        pgrp: crate::task::pid::find_pgrp(config.pgid),
-        session: crate::task::pid::find_pgrp(config.sid),
+        pgrp: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.pgid),
+        session: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.sid),
         pids_linked: false,
         exit_code: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // Default: notify parent with SIGCHLD
         parent_exec_id: 0,
         pdeath_signal: 0,
         state: TaskState::Running, // Will be running immediately
-        page_table: config.page_table,
+        pgd: config.page_table.root_table_phys(),
         // TLS fields (initialized to 0, set by syscalls)
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -1615,12 +1674,15 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         task_inner,
     ));
 
-    // Add to global table
-    TASKLIST.write().insert(task.clone());
+    // Add to global table, as the root namespace's child reaper
+    {
+        let mut table = TASKLIST.write();
+        table.insert(task.clone());
+        crate::task::pidns::attach_init(&mut table, &task);
+    }
 
-    // The boot-allocated stack of the first task is never freed; its
-    // switch frame is saved at its first switch out
-    task.se.disown_stack();
+    // The boot-allocated stack of the first task is not its own (never
+    // freed); its switch frame is saved at its first switch out
     task.se.set_state(RUNNING);
     task.se.set_on_rq(true);
     task.se.set_on_cpu(true);
@@ -1661,12 +1723,10 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
 
 /// A thread of group `tgid` other than those in `but` will still
 /// report its leader when it leaves (Linux thread_group_empty is
-/// false): any listed thread but a traced zombie, whose tracer releases
-/// it
+/// false): any listed thread, a traced zombie too until its tracer
+/// releases it
 pub fn group_pending(table: &GlobalTaskTable, tgid: Pid, but: &[Tid]) -> bool {
-    table.threads(tgid).any(|u| {
-        !but.contains(&u.task.tid()) && !(matches!(u.state, TaskState::Zombie(_)) && u.ptrace != 0)
-    })
+    table.threads(tgid).any(|u| !but.contains(&u.task.tid()))
 }
 
 /// Reap a zombie child of the given parent
@@ -1706,69 +1766,190 @@ pub fn reap_zombie_child_times(
     wflags: i32,
 ) -> Option<(Pid, i32, u64, u64)> {
     let pgid = current_pgid();
-    let mut table = TASKLIST.write();
-
-    // Find a zombie child matching the criteria: a thread-group leader
-    // (threads are never waited for) whose other threads are all gone
-    // (Linux delay_group_leader)
-    let zombie = table.find(|t| {
-        // Must be a child of the parent
-        if t.task.ppid() != parent_pid || !t.leader {
-            return false;
-        }
-
-        // Must be a zombie
-        if !matches!(t.state, TaskState::Zombie(_)) || group_alive(&table, t.task.pid, t.task.tid())
-        {
-            return false;
-        }
-
-        if !wait_eligible(t.exit_signal, wflags) {
-            return false;
-        }
-
-        // Linux: pid > 0 that child, -1 any, 0 the caller's process
-        // group, < -1 that process group
-        wait_match(t, target_pid, pgid)
-    })?;
-    let TaskState::Zombie(status) = zombie.state else {
-        return None;
+    let w = Wait {
+        parent_pid,
+        target_pid,
+        wflags,
+        pgid,
+        ns: crate::task::pid::current_pid_ns(),
     };
-    // The child's own time (every thread gone, so the group's) and its
-    // children's: wait's rusage (Linux RUSAGE_BOTH), and the reaper's
-    // cutime/cstime
-    let (tid, pid, uid) = (zombie.task.tid(), zombie.task.pid, zombie.cred().uid);
-    let (mut utime, mut stime) = group_times(&table, pid);
-    if let Some(s) = &zombie.signal {
+    let (report, done) = with_entry(|table, entry| wait_zombie(table, entry, &w))?;
+    done.finish();
+    Some(report)
+}
+
+/// A reaped zombie's tid (a leader's: its pid; reported in the
+/// waiter's namespace), wait status, user and system time
+type WaitReport = (Pid, i32, u64, u64);
+
+/// What a wait4/waitid asks for: the waiting process, wait4's pid,
+/// the flags, the caller's process group
+struct Wait {
+    parent_pid: Pid,
+    target_pid: i64,
+    wflags: i32,
+    pgid: Pid,
+    /// The waiter's pid namespace, which numbers the report
+    ns: &'static crate::ns::PidNamespace,
+}
+
+/// Zombie `t` is one `w` reaps (Linux wait_consider_task): never a
+/// leader with threads left (delay_group_leader); its tracer any task
+/// it traces, __WCLONE or not (eligible_child: traced by us); its real
+/// parent an untraced leader by the __WALL/__WCLONE rule (a zombie
+/// ptracee is visible only to its ptracer)
+fn reapable(table: &GlobalTaskTable, t: &TaskView<'_>, w: &Wait) -> bool {
+    if !matches!(t.state, TaskState::Zombie(_)) || !wait_match(t, w.target_pid, w.pgid) {
+        return false;
+    }
+    if t.leader && group_pending(table, t.task.pid, &[t.task.tid()]) {
+        return false;
+    }
+    if tracee_of(t, w.parent_pid) {
+        return true;
+    }
+    t.leader
+        && t.ptrace == 0
+        && t.task.ppid() == w.parent_pid
+        && wait_eligible(t.exit_signal, w.wflags)
+}
+
+/// How [`wait_zombie`] releases the zombie it reaps
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reap {
+    /// A traced thread (Linux EXIT_DEAD, release_task)
+    Thread,
+    /// A leader traced from outside its real parent's process: its
+    /// tracer is done, its real parent told (Linux EXIT_TRACE)
+    Traced,
+    /// A leader its real parent's process reaps (Linux EXIT_DEAD)
+    Child,
+}
+
+/// [`Reap`] of zombie `z`
+fn reap_kind(z: &TaskView<'_>) -> Reap {
+    if !z.leader {
+        Reap::Thread
+    } else if ptrace_reparented(z) {
+        Reap::Traced
+    } else {
+        Reap::Child
+    }
+}
+
+/// `t` is traced by a task outside its real parent's process (Linux
+/// ptrace_reparented)
+fn ptrace_reparented(t: &TaskView<'_>) -> bool {
+    t.tracer().is_some_and(|tr| tr.pid != t.task.ppid())
+}
+
+/// [`reap_zombie_child_times`]'s TASKLIST write section: the zombie
+/// `w` finds is reported and, unless WNOWAIT, released, a traced
+/// thread as by [`unhash_thread`]; `Err(z)`: an entry for zombie `z`'s
+/// notice is needed first
+fn wait_zombie(
+    table: &mut GlobalTaskTable,
+    entry: &mut Entry,
+    w: &Wait,
+) -> Result<Option<(WaitReport, Unhashed)>, Zombie> {
+    let found = {
+        let tb: &GlobalTaskTable = table;
+        tb.find(|t| reapable(tb, t, w))
+            .map(|z| (zombie_report(tb, &z), reap_kind(&z)))
+    };
+    let Some((report, kind)) = found else {
+        return Ok(None);
+    };
+    // Numbered for the waiter while the zombie is still listed (Linux
+    // wait_task_zombie: task_pid_vnr)
+    let tid = report.0;
+    let report = (
+        Pid::from(crate::task::pid::nr_ns(tid, w.ns)),
+        report.1,
+        report.2,
+        report.3,
+    );
+    // WNOWAIT (waitid): report the zombie, leave it waitable
+    if w.wflags & super::wait_options::WNOWAIT != 0 {
+        return Ok(Some((report, Unhashed::default())));
+    }
+    if kind == Reap::Traced {
+        // Its real parent is told now, as if it had never been traced
+        // (Linux wait_task_zombie: EXIT_TRACE, ptrace_unlink,
+        // do_notify_parent); the tracer's process gets no child times
+        let z = Zombie::Detached(tid);
+        if !entry.fits(table, z) {
+            return Err(z);
+        }
+        crate::task::ptrace::ptrace_unlink(table, tid);
+        let (told, gone) = tell(table, Some(z), entry);
+        let done = Unhashed {
+            thread: None,
+            told,
+            gone,
+        };
+        return Ok(Some((report, done)));
+    }
+    if kind == Reap::Thread {
+        // A traced thread: its tracer releases it (Linux
+        // wait_task_zombie: EXIT_DEAD, then release_task)
+        let z = table
+            .get(tid)
+            .and_then(|t| thread_teller(table, t.task.pid, tid));
+        if let Some(z) = z
+            && !entry.fits(table, z)
+        {
+            return Err(z);
+        }
+        return Ok(Some((report, unhash_thread(table, tid, z, entry))));
+    }
+    // The reaper's cutime/cstime
+    if let Some(s) = table.get(current_tid()).and_then(|t| t.signal.clone()) {
+        s.add_child_times((report.2, report.3));
+    }
+    let gone = reap_locked(table, tid);
+    Ok(Some((
+        report,
+        Unhashed {
+            gone,
+            ..Unhashed::default()
+        },
+    )))
+}
+
+/// Zombie `z`'s wait report `(tid, status, utime, stime)`: a leader's
+/// time is its group's (every thread gone) and its children's (wait's
+/// rusage, Linux RUSAGE_BOTH); a thread's its own
+fn zombie_report(table: &GlobalTaskTable, z: &TaskView<'_>) -> WaitReport {
+    let own = match z.state {
+        TaskState::Zombie(s) => s,
+        _ => 0,
+    };
+    let (mut utime, mut stime) = if z.leader {
+        group_times(table, z.task.pid)
+    } else {
+        z.task.cputime(crate::time::monotonic_ns())
+    };
+    if z.leader
+        && let Some(s) = &z.signal
+    {
         let (cu, cs) = s.child_times();
         utime = utime.saturating_add(cu);
         stime = stime.saturating_add(cs);
     }
-    let report = (pid, group_status(&zombie, status), utime, stime);
-
-    // WNOWAIT (waitid): report the zombie, leave it waitable
-    if wflags & super::wait_options::WNOWAIT != 0 {
-        return Some(report);
-    }
-
-    if let Some(s) = table.get(current_tid()).and_then(|t| t.signal.clone()) {
-        s.add_child_times((utime, stime));
-    }
-    let task = table.remove(tid);
-    // The Task is released after TASKLIST (nothing is released under it)
-    drop(table);
-    drop(task);
-    crate::fs::proc::proc_flush_pid(pid, tid);
-    // Released: drop the RLIMIT_NPROC charge (threads drop it at exit)
-    if tid == pid {
-        crate::task::nproc_uncharge(uid);
-    }
-    Some(report)
+    (z.task.tid(), group_status(z, own), utime, stime)
 }
 
-/// A thread of group `tgid` other than `tid` has not exited yet
-pub fn group_others(tgid: Pid, tid: Tid) -> bool {
-    group_alive(&TASKLIST.read(), tgid, tid)
+/// A thread of group `tgid` other than `tid` that an exec by `tid`
+/// still waits for (Linux de_thread: notify_count, dropped at each
+/// thread's release_task, then the leader's exit_state): any other
+/// thread still listed, a traced zombie until its tracer releases it,
+/// but the leader once it is a zombie
+pub fn exec_waits(tgid: Pid, tid: Tid) -> bool {
+    TASKLIST
+        .read()
+        .threads(tgid)
+        .any(|u| u.task.tid() != tid && !(u.leader && matches!(u.state, TaskState::Zombie(_))))
 }
 
 /// After de_thread: `tid` is the only thread of `tgid` left running and
@@ -1873,14 +2054,6 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     gone
 }
 
-/// A thread of group `tgid` other than `tid` has not exited yet (Linux
-/// thread_group_empty / delay_group_leader)
-fn group_alive(table: &GlobalTaskTable, tgid: Pid, tid: Tid) -> bool {
-    table
-        .threads(tgid)
-        .any(|u| u.task.tid() != tid && !matches!(u.state, TaskState::Zombie(_)))
-}
-
 /// The wait status a zombie leader reports (Linux wait_task_zombie):
 /// the group's exit status after a group exit, else its own
 fn group_status(t: &TaskInner, own: i32) -> i32 {
@@ -1892,8 +2065,8 @@ fn group_status(t: &TaskInner, own: i32) -> i32 {
 
 /// A ptrace stop of a task traced by the group `tracer_pid`, matching
 /// `target_pid` (wait4's pid: > 0 that tid, -1 any, 0 the caller's
-/// process group, < -1 that group), not yet reported: its tid and the
-/// stop's code. Reported once unless `wnowait` (Linux wait_task_stopped
+/// process group, < -1 that group), not yet reported: its tid (as the
+/// caller numbers it) and the stop's code. Reported once unless `wnowait` (Linux wait_task_stopped
 /// with ptrace: exit_code cleared). Found under the read lock; the write
 /// lock only to take the code.
 pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32)> {
@@ -1916,7 +2089,12 @@ pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(T
     if !wnowait {
         t.ptrace_code = 0;
     }
-    Some((tid, code))
+    // The tracee as the tracer numbers it (Linux wait_task_stopped:
+    // task_pid_vnr)
+    Some((
+        Tid::from(crate::task::pid::nr_ns(tid, current_pid_ns())),
+        code,
+    ))
 }
 
 /// `t` is what wait4's `target_pid` names (`pgid`: the caller's group)
@@ -1988,6 +2166,44 @@ pub struct CloneConfig {
     pub exit_signal: i32,
     /// Cgroup file descriptor (CLONE_INTO_CGROUP, clone3 only)
     pub cgroup_fd: i32,
+    /// clone3 set_tid: the child's number in the innermost
+    /// `set_tid_size` levels of its pid namespace, its own first
+    pub set_tid: [u32; crate::ns::pid::MAX_PID_NS_LEVEL as usize],
+    pub set_tid_size: usize,
+}
+
+impl CloneConfig {
+    /// No set_tid
+    pub const NO_SET_TID: [u32; crate::ns::pid::MAX_PID_NS_LEVEL as usize] =
+        [0; crate::ns::pid::MAX_PID_NS_LEVEL as usize];
+}
+
+/// clone3's set_tid numbers for a child in `ns` (Linux alloc_pid): no
+/// more than its levels and each a valid number (EINVAL), and the
+/// right to choose them (EPERM: CAP_CHECKPOINT_RESTORE or
+/// CAP_SYS_ADMIN, checkpoint_restore_ns_capable); a level with no init
+/// yet takes only 1 (EINVAL)
+fn check_set_tid(ns: &crate::ns::PidNamespace, set_tid: &[u32]) -> Result<(), i32> {
+    if set_tid.len() > ns.level as usize + 1 {
+        return Err(22); // EINVAL
+    }
+    let mut level = Some(ns);
+    for &nr in set_tid {
+        if !(1..crate::task::pid::PID_MAX_LIMIT).contains(&nr) {
+            return Err(22);
+        }
+        let l = level.ok_or(22)?;
+        if nr != 1 && !crate::task::pid::ns_has_init(l) {
+            return Err(22);
+        }
+        level = l.parent.as_deref();
+        if !crate::task::capable(crate::task::CAP_CHECKPOINT_RESTORE)
+            && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
+        {
+            return Err(1); // EPERM
+        }
+    }
+    Ok(())
 }
 
 /// Create a new thread/process via clone()
@@ -2011,6 +2227,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Validate: CLONE_VM requires child_stack UNLESS CLONE_VFORK is also set
     // (vfork shares parent's stack with the child)
     if config.flags & CLONE_VM != 0 && config.child_stack == 0 && config.flags & CLONE_VFORK == 0 {
+        return Err(22); // EINVAL
+    }
+
+    // CLONE_DETACHED is refused with CLONE_PIDFD (Linux copy_process)
+    if config.flags & CLONE_PIDFD != 0 && config.flags & CLONE_DETACHED != 0 {
         return Err(22); // EINVAL
     }
 
@@ -2080,7 +2301,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
                 parent.task.se.reset_on_fork(),
             ),
             parent.task.cpus_mask.snapshot(),
-            parent.page_table.root_table_phys(),
+            parent.pgd,
             parent.cred_arc(),
             parent.prctl.clone(),
             parent.personality,
@@ -2099,9 +2320,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         comm: me.comm(),
         mempolicy: me.task_lock().mempolicy(),
     };
-    let parent_pid_ns = me
-        .nsproxy()
-        .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |n| n.pid_ns.clone());
     let parent_mm = me.mm_ref();
 
     // Get parent iopl_emul (x86-64 only) - must be done in separate block
@@ -2111,9 +2329,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         table.get(current_tid).map(|t| t.iopl_emul).unwrap_or(0)
     };
 
-    // Validate CLONE_PARENT: cannot be used by init process (pid 1)
-    // Linux checks for SIGNAL_UNKILLABLE flag, but we simplify to pid == 1
-    if config.flags & CLONE_PARENT != 0 && parent_pid == 1 {
+    // A pid namespace's init cannot make a sibling (Linux
+    // copy_process: CLONE_PARENT with SIGNAL_UNKILLABLE)
+    if config.flags & CLONE_PARENT != 0
+        && crate::signal::get_task_signal_struct(current_tid).is_some_and(|s| s.unkillable())
+    {
         return Err(22); // EINVAL
     }
 
@@ -2138,6 +2358,15 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let child_fs = crate::fs::fsstruct::fork_fs(current_tid, config.flags & CLONE_FS != 0)
         .map_err(|e| e.errno())?;
     let child_ns = crate::ns::fork_nsproxy(current_tid, config.flags, child_fs.as_deref())?;
+    // A thread stays in its group's pid namespace (Linux copy_process:
+    // CLONE_THREAD with CLONE_NEWPID or CLONE_NEWUSER, or after an
+    // unshare(CLONE_NEWPID), is EINVAL)
+    if config.flags & CLONE_THREAD != 0
+        && (config.flags & (CLONE_NEWPID | CLONE_NEWUSER) != 0
+            || !core::ptr::eq(Arc::as_ptr(&child_ns.pid_ns), me.task.pid_ns()))
+    {
+        return Err(22); // EINVAL
+    }
     let into_cgroup = if config.flags & CLONE_INTO_CGROUP != 0 {
         Some(crate::task::cgroup_from_fd(current_tid, config.cgroup_fd)?)
     } else {
@@ -2166,12 +2395,22 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         None
     };
 
-    // The child's pid, numbered in each level of the parent's pid
-    // namespace (Linux alloc_pid); a new process's pid is its tid
-    // (leader pid == tid), a thread keeps its group's
-    // EAGAIN with no number left, ENOMEM
-    let child_thread_pid = crate::task::pid::alloc_pid(&parent_pid_ns).map_err(|e| e.errno())?;
+    // The child's pid, numbered in each level of its pid namespace: the
+    // one its creator makes children in, a new one with CLONE_NEWPID
+    // (Linux alloc_pid(p->nsproxy->pid_ns_for_children)); a new
+    // process's pid is its tid (leader pid == tid), a thread keeps its
+    // group's. EAGAIN with no number left, ENOMEM
+    let set_tid = &config.set_tid[..config.set_tid_size];
+    check_set_tid(&child_ns.pid_ns, set_tid)?;
+    let child_thread_pid =
+        crate::task::pid::alloc_pid_nr(&child_ns.pid_ns, set_tid).map_err(|e| e.errno())?;
     let child_tid = Tid::from(child_thread_pid.nr());
+    // A new process numbered 1 is its namespace's init (Linux
+    // copy_process: is_child_reaper)
+    let child_init = config.flags & CLONE_THREAD == 0 && child_thread_pid.is_child_reaper();
+    if child_init {
+        child_signal.set_unkillable();
+    }
     let child_pid = if config.flags & CLONE_THREAD != 0 {
         parent_pid
     } else {
@@ -2189,11 +2428,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             Some(crate::mm::dup_mm(&pm, pt.root_table_phys())?)
         }
     };
-    let child_pt = ArchPageTable::new(child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd()));
+    let child_pgd = child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd());
 
     // The child's kernel stack (zeroed, guard gap below)
-    let stack_base = crate::mm::vmstack::alloc().ok_or(12)?; // ENOMEM
-    let kstack_top = stack_base + KERNEL_STACK_SIZE as u64;
+    let stack = crate::mm::vmstack::alloc().ok_or(12)?; // ENOMEM
+    let kstack_top = stack.top();
 
     // Build child's TrapFrame at the top of the child's kernel stack (its
     // pt_regs), the inherited FP/SIMD state below it if the arch keeps
@@ -2234,7 +2473,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Create child task
     let child_task_inner = crate::task::TaskInner {
-        thread_pid: Some(child_thread_pid),
+        thread_pid: Some(child_thread_pid.clone()),
         // Set from the creator's under TASKLIST (`inherit_pids`)
         pgrp: None,
         session: None,
@@ -2257,7 +2496,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         },
         pdeath_signal: 0, // Never inherited, must be set explicitly via prctl
         state: TaskState::Ready,
-        page_table: child_pt,
+        pgd: child_pgd,
         // TLS fields - will be set based on clone flags below
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -2273,7 +2512,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             no_new_privs: parent_prctl.no_new_privs, // Inherited (irreversible)
             timer_slack_ns: parent_prctl.timer_slack_ns, // Inherited
             keep_caps: false,                        // Reset on fork
-            child_subreaper: false,                  // Not inherited
             #[cfg(target_arch = "x86_64")]
             tsc_mode: parent_prctl.tsc_mode, // Inherited
             thp_disable: parent_prctl.thp_disable,   // Inherited
@@ -2324,7 +2562,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         ptrace_frozen: false,
         last_siginfo: None,
     };
-    let child_task = try_arc(Task::new(
+    let child_task = Task::new(
         child_tid,
         crate::task::TaskIds {
             pid: child_pid,
@@ -2343,13 +2581,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_alloc,
         child_sig,
         child_task_inner,
-    ))
-    .map_err(|e| {
-        // Nothing else owns the stack yet (its pid and mm went with
-        // the unbuilt task)
-        crate::mm::vmstack::free(stack_base);
-        e.errno()
-    })?;
+    );
+    child_task.se.stack.set(stack);
+    // On failure the stack goes with the unbuilt task, like its pid
+    // and mm
+    let child_task = try_arc(child_task).map_err(|e| e.errno())?;
     if parent_nproc_exceeded {
         child_task.set_flag(crate::task::pf::NPROC_EXCEEDED);
     }
@@ -2371,9 +2607,37 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // SAFETY: not on a run queue yet
     unsafe { *child_task.se.ctx() = context };
 
+    // CLONE_PIDFD: the child's pidfd is in the caller's table and its
+    // number stored before the child exists, so a failure leaves
+    // neither (Linux copy_process: pidfd_prepare and put_user, EFAULT
+    // through bad_fork_put_pidfd)
+    let pidfd = if config.flags & CLONE_PIDFD != 0 {
+        Some(clone_pidfd(
+            child_thread_pid,
+            config.flags & CLONE_THREAD != 0,
+            config.pidfd_ptr,
+        )?)
+    } else {
+        None
+    };
+
     // Add to global task table
     {
         let mut table = TASKLIST.write();
+        // Not into a namespace whose init died meanwhile (Linux
+        // copy_process: PIDNS_ADDING under tasklist_lock, ENOMEM): its
+        // zap walks the list after disabling allocation, so it sees
+        // this child or this sees the namespace dying
+        if !crate::task::pid::ns_adding(child_task.pid_ns()) {
+            drop(table);
+            if let Some(fd) = pidfd {
+                close_pidfd(fd);
+            }
+            return Err(12); // ENOMEM
+        }
+        if child_init {
+            crate::task::pidns::attach_init(&mut table, &child_task);
+        }
         table.inherit_pids(&child_task, &current());
         table.insert(child_task.clone());
         // A new process joins its real parent's children (Linux: only
@@ -2445,11 +2709,16 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         .gsbase
         .store(crate::arch::read_user_gsbase(), Ordering::Relaxed);
 
+    // The child's number as the caller sees it, for the return value
+    // and CLONE_PARENT_SETTID, taken before it can run and be reaped
+    // (Linux kernel_clone: pid_vnr before wake_up_new_task)
+    let child_vnr = crate::task::pid::vnr(child_tid);
+
     // Handle CLONE_PARENT_SETTID: write child TID to parent's address space
     if config.flags & CLONE_PARENT_SETTID != 0 && config.parent_tidptr != 0 {
         use crate::arch::Uaccess;
         use crate::uaccess::put_user;
-        if put_user::<Uaccess, i32>(config.parent_tidptr, child_tid as i32).is_err() {
+        if put_user::<Uaccess, i32>(config.parent_tidptr, child_vnr as i32).is_err() {
             // Continue even if write fails - Linux does the same
             printkln!("CLONE: CLONE_PARENT_SETTID write failed");
         }
@@ -2460,10 +2729,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // For fork (CLONE_VM not set), store for clone_child_entry to write in child's context.
     if config.flags & CLONE_CHILD_SETTID != 0 && config.child_tidptr != 0 {
         if config.flags & CLONE_VM != 0 {
-            // Shared address space - write directly
+            // Shared address space - write directly, the child's own
+            // number in its namespace (Linux schedule_tail writes it)
             use crate::arch::Uaccess;
             use crate::uaccess::put_user;
-            if put_user::<Uaccess, i32>(config.child_tidptr, child_tid as i32).is_err() {
+            let own = crate::task::pid::nr_ns(child_tid, child_task.pid_ns()) as i32;
+            if put_user::<Uaccess, i32>(config.child_tidptr, own).is_err() {
                 printkln!("CLONE: CLONE_CHILD_SETTID write failed");
             }
         } else {
@@ -2478,12 +2749,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         crate::task::set_clear_child_tid(child_tid, config.child_tidptr);
     }
 
-    // Determine return value before potential blocking
-    let return_value = if config.flags & CLONE_THREAD != 0 {
-        child_tid
-    } else {
-        child_pid
-    };
+    // The return value: the child's pid (a new process's pid is its
+    // tid), as the caller numbers it
+    let return_value = Tid::from(child_vnr);
 
     // CLONE_VFORK: the completion must be in place before the child can
     // run (it may exec or exit at once on another CPU; Linux
@@ -2516,55 +2784,39 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         vfork.wait();
     }
 
-    // Handle CLONE_PIDFD: create a pidfd for the child and write it to parent's address space
-    if config.flags & CLONE_PIDFD != 0 && config.pidfd_ptr != 0 {
-        use crate::arch::Uaccess;
-        use crate::uaccess::put_user;
-
-        // Create pidfd for the child
-        let pidfd_file = match crate::task::pidfd::create_pidfd(child_pid, 0) {
-            Ok(file) => file,
-            Err(_) => {
-                // Pidfd creation failed - this is not critical, just don't set it
-                // Return success anyway as the child is already created
-                return Ok(return_value);
-            }
-        };
-
-        // Allocate FD in parent's FD table
-        let fd_table = match crate::task::fdtable::get_task_fd(current_tid) {
-            Some(table) => table,
-            None => return Ok(return_value), // No FD table - shouldn't happen
-        };
-
-        // Get NOFILE limit
-        let nofile = {
-            let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-            if limit == crate::task::rlimit::RLIM_INFINITY {
-                u64::MAX
-            } else {
-                limit
-            }
-        };
-
-        let pidfd_num = {
-            let mut table = fd_table.lock();
-            // Allocate with O_CLOEXEC by default for pidfds
-            match table.alloc_with_flags(pidfd_file, crate::task::FD_CLOEXEC, nofile) {
-                Ok(fd) => fd,
-                Err(_) => return Ok(return_value), // FD allocation failed
-            }
-        };
-
-        // Write the pidfd number to parent's address space
-        let _ = put_user::<Uaccess, i32>(config.pidfd_ptr, pidfd_num as i32);
-    }
-
-    // Return value depends on CLONE_THREAD flag:
-    // - CLONE_THREAD: return child TID (thread in same process)
-    // - No CLONE_THREAD: return child PID (new process)
-    // This matches Linux behavior.
     Ok(return_value)
+}
+
+/// CLONE_PIDFD: a close-on-exec pidfd of the child `pid` (a thread
+/// pidfd for a new thread: Linux PIDFD_THREAD) in the caller's table,
+/// its number stored at `ptr`: EMFILE, ENOMEM, or EFAULT (the
+/// descriptor closed again). The child does not exist yet: nothing
+/// but the caller's threads can see the descriptor before clone
+/// returns (Linux reserves it and installs it at the end).
+fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Result<i32, i32> {
+    use crate::task::pidfd::pidfd_flags::PIDFD_THREAD;
+    let flags = if thread { PIDFD_THREAD } else { 0 };
+    let file = crate::task::pidfd::pidfd_file(pid, flags).map_err(|e| e.errno())?;
+    let files = crate::task::fdtable::get_task_fd(current_tid()).ok_or(9)?; // EBADF
+    let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+    let fd = files
+        .lock()
+        .alloc_with_flags(file, crate::task::FD_CLOEXEC, nofile)?;
+    if crate::uaccess::put_user::<crate::arch::Uaccess, i32>(ptr, fd).is_err() {
+        // Released after the table lock (FilesGuard)
+        files.lock().close(fd);
+        return Err(14); // EFAULT
+    }
+    Ok(fd)
+}
+
+/// A clone whose child was not made after all closes the pidfd
+/// [`clone_pidfd`] gave the caller (Linux bad_fork_put_pidfd)
+fn close_pidfd(fd: i32) {
+    if let Some(files) = crate::task::fdtable::get_task_fd(current_tid()) {
+        // Released after the table lock (FilesGuard)
+        files.lock().close(fd);
+    }
 }
 
 /// Mark the current task exiting (Linux PF_EXITING)
@@ -2579,10 +2831,18 @@ pub fn current_exiting() -> bool {
 
 /// Hand the current task's children to a new parent before it dies
 /// (Linux forget_original_parent): another live thread of its group,
-/// else the nearest PR_SET_CHILD_SUBREAPER ancestor, else init
+/// else a live thread of the nearest PR_SET_CHILD_SUBREAPER ancestor
+/// process in its pid namespace, else that namespace's init. Its
+/// tracees are detached first (exit_ptrace), while it is still the
+/// real parent of those that are its children: a zombie one is then
+/// released or told to it as Linux __ptrace_detach does, before any
+/// is handed on. A dying namespace init then kills and reaps the rest
+/// of its namespace (find_child_reaper).
 #[inline(never)]
 fn forget_original_parent() {
+    crate::task::ptrace::exit_ptrace();
     let me = task_ref(&current());
+    crate::task::pidns::find_child_reaper(&me);
     // Room for every child first: nothing allocates under TASKLIST
     let mut moved = Vec::new();
     let mut entry = Entry::default();
@@ -2629,8 +2889,7 @@ enum Moved {
     Told(Told, Option<Reaped>),
 }
 
-/// Hand `me`'s children to their new parent: another live thread of
-/// its group, else the nearest live subreaper ancestor, else init. A
+/// Hand `me`'s children to their new parent ([`find_reaper`]). A
 /// zombie whose group is gone moving to another process tells its new
 /// parent in the same TASKLIST write section (Linux reparent_leader),
 /// with `entry`; one such move ends the pass.
@@ -2674,28 +2933,47 @@ fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>, entry: &mut Entry) 
     }
 }
 
-/// `me`'s children's new parent: another live thread of its group,
-/// else the nearest live subreaper ancestor, else init
+/// `me`'s children's new parent (Linux find_new_reaper): another live
+/// thread of its group, else a live thread of the nearest ancestor
+/// process in its pid namespace that is a child subreaper, else that
+/// namespace's init (its child reaper).
+/// Unlike Linux, every ancestor is checked, with no has_child_subreaper
+/// shortcut: that flag is set on every descendant of a subreaper (fork,
+/// walk_process_tree), and an orphan only moves up, so the walk finds
+/// the same reaper.
 fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
-    let live = crate::signal::task_live;
-    let thread = table
-        .threads(me.pid)
-        .find(|t| !core::ptr::eq(t.task, Arc::as_ptr(me)) && live(t))
-        .map(|t| task_ref(t.task));
-    if thread.is_some() {
-        return thread;
+    if let Some(t) = live_thread(table, me.pid) {
+        return Some(t);
     }
-    let mut p = table.get(me.tid()).and_then(|t| t.real_parent.clone());
+    let v = table.get(me.tid())?;
+    let level = v.thread_pid.as_ref().map(|p| p.level);
+    let mut p = v.real_parent.clone();
     while let Some(t) = p.and_then(|w| w.upgrade()) {
-        // An ancestor gone from the list ends the walk: init adopts
-        // (Linux find_new_reaper ends at the child_reaper)
+        // An ancestor gone from the list, or in another pid namespace,
+        // ends the walk: the namespace's init adopts (Linux
+        // find_new_reaper ends at the child_reaper, by
+        // task_pid(reaper)->level)
         let Some(v) = table.get(t.tid()) else { break };
-        if v.prctl.child_subreaper && live(&v) {
-            return Some(t.clone());
+        if v.thread_pid.as_ref().map(|p| p.level) != level {
+            break;
+        }
+        if v.signal.as_ref().is_some_and(|s| s.subreaper(table))
+            && let Some(r) = live_thread(table, t.pid)
+        {
+            return Some(r);
         }
         p = v.real_parent.clone();
     }
-    table.task(1)
+    crate::task::pidns::child_reaper(table, me.pid_ns())
+}
+
+/// A thread of process `pid` that has not started exiting (Linux
+/// find_alive_thread: !PF_EXITING)
+pub(crate) fn live_thread(table: &GlobalTaskTable, pid: Pid) -> Option<TaskRef> {
+    table
+        .threads(pid)
+        .find(crate::signal::task_live)
+        .map(|t| task_ref(t.task))
 }
 
 /// Run `f` under TASKLIST's write lock with a notice entry; while `f`
@@ -2725,52 +3003,20 @@ fn with_entry<R>(mut f: impl FnMut(&mut GlobalTaskTable, &mut Entry) -> Result<R
 // Not inlined: its send path's stack is used only for the call, not
 // added to exit_current's frame for the rest of the exit
 #[inline(never)]
-fn exit_notify(tid: Tid, status: i32, group_dead: bool) {
-    let r = with_entry(|table, entry| exit_locked(table, entry, tid, status, group_dead));
-    let Some(Exited {
-        pidfd,
-        thread,
-        told,
-        gone,
-    }) = r
-    else {
-        return;
-    };
-    if let Some(t) = &thread {
-        crate::fs::proc::proc_flush_pid(t.pid, tid);
+fn exit_notify(tid: Tid, status: i32) {
+    if let Some(done) = with_entry(|table, entry| exit_locked(table, entry, tid, status)) {
+        done.finish();
     }
-    drop(thread);
-    // Pidfd pollers first, then whoever takes the signal (Linux
-    // do_notify_parent: do_notify_pidfd before the send)
-    if let Some(p) = pidfd {
-        p.exit_wake();
-    }
-    if let Some(t) = told {
-        t.finish();
-    }
-    release(gone);
 }
 
-/// What [`exit_locked`] leaves for after TASKLIST: the `Pid` whose
-/// pidfd pollers are to wake, the thread it took out of the list, the
-/// notice's wakeups, the zombie leader it autoreaped
-struct Exited {
-    pidfd: Option<Arc<crate::task::pid::Pid>>,
-    thread: Option<TaskRef>,
-    told: Option<Told>,
-    gone: Option<Reaped>,
-}
-
-/// [`exit_notify`]'s TASKLIST write section for task `tid`, the last
-/// of its process if `group_dead`; `Err(z)`: an entry for zombie `z`'s
-/// notice is needed first
+/// [`exit_notify`]'s TASKLIST write section for task `tid`; `Err(z)`:
+/// an entry for zombie `z`'s notice is needed first
 fn exit_locked(
     table: &mut GlobalTaskTable,
     entry: &mut Entry,
     tid: Tid,
     status: i32,
-    group_dead: bool,
-) -> Result<Option<Exited>, Zombie> {
+) -> Result<Option<Unhashed>, Zombie> {
     let Some(t) = table.get(tid) else {
         return Ok(None);
     };
@@ -2781,7 +3027,7 @@ fn exit_locked(
     let teller = if stays {
         (traced || !group_pending(table, pid, &[tid])).then_some(Zombie::Exiting(tid))
     } else {
-        last_thread(table, pid, tid).then_some(Zombie::Leader(pid))
+        thread_teller(table, pid, tid)
     };
     if let Some(z) = teller
         && !entry.fits(table, z)
@@ -2792,38 +3038,178 @@ fn exit_locked(
         t.exit_code = status;
         t.state = TaskState::Zombie(status);
     }
-    let pidfd = if group_dead {
-        mark_pidfd(table, pid, status)
-    } else {
-        None
-    };
-    let thread = if stays { None } else { table.remove(tid) };
-    let told = teller.map(|z| notify(table, z, core::mem::take(entry)));
-    let gone = match (&told, teller) {
-        (Some(t), Some(z)) if t.autoreap => reap_locked(table, z.tid()),
-        _ => None,
-    };
-    Ok(Some(Exited {
-        pidfd,
-        thread,
+    if !stays {
+        // An untraced thread's pidfd pollers (Linux exit_notify:
+        // do_notify_pidfd for an untraced sub-thread); its removal
+        // wakes them again
+        notify_pidfd(table, tid);
+        return Ok(Some(unhash_thread(table, tid, teller, entry)));
+    }
+    let (told, gone) = tell(table, teller, entry);
+    Ok(Some(Unhashed {
+        thread: None,
         told,
         gone,
     }))
 }
 
-/// Process `pid` exited with `status` (its last thread): its pidfds see
-/// it before its parent is told (Linux do_notify_pidfd in
-/// do_notify_parent), marked on its leader's `Pid` while the leader is
-/// listed, never found by a number an autoreap may unhash or reuse;
-/// that `Pid`, for its pollers' wakeup after TASKLIST
-fn mark_pidfd(
-    table: &GlobalTaskTable,
-    pid: Pid,
-    status: i32,
-) -> Option<Arc<crate::task::pid::Pid>> {
-    let p = table.get(pid)?.thread_pid.clone()?;
-    p.set_exited(status);
-    Some(p)
+/// What a TASKLIST write section that released zombies leaves for
+/// after the lock (Linux release_task's work past tasklist_lock): the
+/// thread it took out of the list, its leader's notice, the leader it
+/// autoreaped
+#[derive(Default)]
+struct Unhashed {
+    thread: Option<TaskRef>,
+    told: Option<Told>,
+    gone: Option<Reaped>,
+}
+
+impl Unhashed {
+    /// Release what the section took and wake whoever waits (TASKLIST
+    /// not held): a tracer or an exec (de_thread) waiting for the thread
+    fn finish(self) {
+        if let Some(t) = self.thread {
+            crate::fs::proc::proc_flush_pid(&t);
+            drop(t);
+            crate::task::proc::CHILD_EXIT_WQ.wake_all();
+        }
+        if let Some(t) = self.told {
+            t.finish();
+        }
+        release(self.gone);
+    }
+}
+
+/// Zombie `z`'s notice, if any, sent with `entry` (checked by
+/// [`Entry::fits`] in this section); a zombie its parent does not wait
+/// for is taken out of the list (autoreap)
+fn tell(
+    table: &mut GlobalTaskTable,
+    z: Option<Zombie>,
+    entry: &mut Entry,
+) -> (Option<Told>, Option<Reaped>) {
+    let Some(z) = z else {
+        return (None, None);
+    };
+    let told = notify(table, z, core::mem::take(entry));
+    let gone = if told.autoreap {
+        reap_locked(table, z.tid())
+    } else {
+        None
+    };
+    (Some(told), gone)
+}
+
+/// Thread `tid` (not a leader) leaves the task list (Linux
+/// release_task); `z`, from [`thread_teller`] in this section, is its
+/// zombie leader's notice if it was the last thread
+fn unhash_thread(
+    table: &mut GlobalTaskTable,
+    tid: Tid,
+    z: Option<Zombie>,
+    entry: &mut Entry,
+) -> Unhashed {
+    let thread = table.remove(tid);
+    let (told, gone) = tell(table, z, entry);
+    Unhashed { thread, told, gone }
+}
+
+/// The notice thread `tid` of process `pid` leaving the list sends:
+/// its zombie leader's, if it is the last thread but the leader
+fn thread_teller(table: &GlobalTaskTable, pid: Pid, tid: Tid) -> Option<Zombie> {
+    last_thread(table, pid, tid).then_some(Zombie::Leader(pid))
+}
+
+/// The exiting tracer `me`'s zombie tracees are detached, one per
+/// TASKLIST write section, leaders first (Linux exit_ptrace ->
+/// __ptrace_detach, its dead list released after the lock): a thread
+/// is released, the last of its group telling its zombie leader's
+/// parent (release_task); a leader with no thread left tells its real
+/// parent as if never traced, or, if that is `me`'s own process, is
+/// released if that process does not wait for children
+pub fn detach_zombies(me: &Task) {
+    while let Some(done) = with_entry(|table, entry| detach_zombie(table, entry, me)) {
+        done.finish();
+    }
+}
+
+/// [`detach_zombies`]'s TASKLIST write section for one zombie `me`
+/// traces; `Err(z)`: an entry for zombie `z`'s notice is needed first
+fn detach_zombie(
+    table: &mut GlobalTaskTable,
+    entry: &mut Entry,
+    me: &Task,
+) -> Result<Option<Unhashed>, Zombie> {
+    let Some((tid, pid, leader, ppid)) = traced_zombie(table, me) else {
+        return Ok(None);
+    };
+    let (z, dead) = if !leader {
+        (thread_teller(table, pid, tid), true)
+    } else if group_pending(table, pid, &[pid]) {
+        (None, false)
+    } else if ppid != me.pid {
+        (Some(Zombie::Detached(tid)), false)
+    } else {
+        (
+            None,
+            crate::signal::notify::ignoring_children(table, me.pid),
+        )
+    };
+    if let Some(z) = z
+        && !entry.fits(table, z)
+    {
+        return Err(z);
+    }
+    crate::task::ptrace::ptrace_unlink(table, tid);
+    if !leader {
+        return Ok(Some(unhash_thread(table, tid, z, entry)));
+    }
+    let (told, mut gone) = tell(table, z, entry);
+    if dead {
+        gone = reap_locked(table, tid);
+    }
+    Ok(Some(Unhashed {
+        thread: None,
+        told,
+        gone,
+    }))
+}
+
+/// A zombie `me` traces, a leader first: its tid, pid, whether it
+/// leads, its real parent's pid
+fn traced_zombie(table: &GlobalTaskTable, me: &Task) -> Option<(Tid, Pid, bool, Pid)> {
+    let mine = |t: &TaskView<'_>| {
+        t.ptrace != 0 && t.traced_by(me) && matches!(t.state, TaskState::Zombie(_))
+    };
+    table
+        .find(|t| mine(t) && t.leader)
+        .or_else(|| table.find(|t| mine(t)))
+        .map(|t| (t.task.tid(), t.task.pid, t.leader, t.task.ppid()))
+}
+
+/// Wake the pidfd pollers of zombie `tid` (Linux do_notify_pidfd,
+/// under tasklist_lock): it exited, so a poll may now see it readable
+/// ([`pidfd_exited`])
+pub fn notify_pidfd(table: &GlobalTaskTable, tid: Tid) {
+    if let Some(p) = table.get(tid).and_then(|t| t.thread_pid.clone()) {
+        p.wait_pidfd.wake_poll(u32::from(
+            crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM,
+        ));
+    }
+}
+
+/// What a pidfd poll sees of the task `pid` names (Linux pidfd_poll,
+/// with TASKLIST's read lock for its RCU read side): None once it is
+/// released; Some(true) once it is a zombie, unless it leads a group
+/// with another thread still listed (delay_group_leader: a thread
+/// still running or exiting, or a traced zombie its tracer has not
+/// reaped)
+pub fn pidfd_exited(pid: &crate::task::pid::Pid) -> Option<bool> {
+    let table = TASKLIST.read();
+    let tid = table.pid_tid(pid)?;
+    let t = table.get(tid)?;
+    let delayed = t.leader && group_pending(&table, t.task.pid, &[tid]);
+    Some(matches!(t.state, TaskState::Zombie(_)) && !delayed)
 }
 
 /// Thread `tid` of process `pid` is the last but its zombie leader:
@@ -2873,7 +3259,7 @@ fn release(gone: Option<Reaped>) {
     let Some(Reaped { t, uid }) = gone else {
         return;
     };
-    crate::fs::proc::proc_flush_pid(t.pid, t.tid());
+    crate::fs::proc::proc_flush_pid(&t);
     crate::task::nproc_uncharge(uid);
     drop(t);
     crate::task::proc::CHILD_EXIT_WQ.wake_all();
@@ -2891,7 +3277,6 @@ fn release(gone: Option<Reaped>) {
 /// runs on its resources.
 pub fn exit_current(status: Option<i32>) -> ! {
     let tid = current_tid();
-    let mut group_dead = true;
 
     // Release the task's resources first, without the rq lock: these paths
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
@@ -2905,7 +3290,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // Exactly one thread, the one taking the group's live count to
         // zero, does the group-level exit work (Linux do_exit:
         // group_dead = atomic_dec_and_test(&signal->live))
-        group_dead =
+        let group_dead =
             crate::signal::get_task_signal_struct(tid).is_none_or(|s| s.thread_exiting(status));
 
         // Nothing reaps orphans or keeps userspace going without the
@@ -2924,7 +3309,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         if let Some(st) = status
             && group_dead
         {
-            crate::task::acct::write_acct_record(tid, current_pid(), st);
+            crate::task::acct::write_acct_record(tid, st);
         }
 
         // A non-leader thread is released at exit (Linux autoreaps it):
@@ -2972,9 +3357,6 @@ pub fn exit_current(status: Option<i32>) -> ! {
             crate::time::posix_timer::exit_itimers(&sig);
         }
 
-        // Clean up signal state for exiting task
-        crate::signal::exit_task_signal(tid);
-
         // Clean up robust futex list for exiting task
         crate::task::futex::exit_robust_list(tid);
 
@@ -2998,14 +3380,18 @@ pub fn exit_current(status: Option<i32>) -> ! {
     };
     if tid != 0 {
         forget_original_parent();
-        crate::task::ptrace::exit_ptrace();
+        // Its signal state goes once its tracees and children are dealt
+        // with: whether the process ignores SIGCHLD decides the fate of
+        // a zombie tracee of its own (Linux keeps sighand until
+        // __exit_signal, in release_task)
+        crate::signal::exit_task_signal(tid);
         // Out of its cgroup while still running, before it is a zombie
         // a waiting parent may reap at once (Linux do_exit: cgroup_exit
         // before exit_notify); TASKLIST is not held
         crate::cgroup::detach_task(tid);
     }
     if let Some(st) = status {
-        exit_notify(tid, st, group_dead);
+        exit_notify(tid, st);
     }
 
     // Let a parent sleeping in wait4/waitid re-check for zombies
@@ -3026,11 +3412,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // reference go once this CPU runs something else
     me.se.set_on_rq(false);
     rq.add_nr(-1);
-    let stack = if me.se.owns_stack() {
-        (me.kstack_top - KERNEL_STACK_SIZE as u64, KERNEL_STACK_SIZE)
-    } else {
-        (0, 0)
-    };
+    let stack = me.se.stack.take();
     // SAFETY: the run queue's reference to the running task
     let task = Some(unsafe { Arc::from_raw(rq.curr) });
     rq.dead = Some(DeadTask {
@@ -3993,7 +4375,10 @@ pub extern "C" fn write_child_tid_if_needed() {
     if let Some(addr) = crate::task::get_set_child_tid(tid) {
         use crate::arch::Uaccess;
         use crate::uaccess::put_user;
-        if put_user::<Uaccess, i32>(addr, tid as i32).is_err() {
+        // Its own number, in its namespace (Linux schedule_tail:
+        // task_pid_vnr(current))
+        let nr = crate::task::pid::vnr(tid) as i32;
+        if put_user::<Uaccess, i32>(addr, nr).is_err() {
             printkln!("CLONE: CLONE_CHILD_SETTID write failed in child");
         }
     }
@@ -4086,6 +4471,13 @@ pub fn current_pid() -> Pid {
     current().pid
 }
 
+/// The current task's pid namespace (Linux task_active_pid_ns(current)):
+/// a creation-time field, read lock-free; it outlives the task's every
+/// syscall like `current()` itself
+pub fn current_pid_ns() -> &'static crate::ns::PidNamespace {
+    current().task.pid_ns()
+}
+
 /// Get the current task's thread ID
 pub fn current_tid() -> Tid {
     current().tid()
@@ -4094,6 +4486,20 @@ pub fn current_tid() -> Tid {
 /// Get the current task's parent process ID
 pub fn current_ppid() -> Pid {
     current().ppid()
+}
+
+/// The current task's parent process as its pid namespace numbers it,
+/// 0 if outside it (Linux task_tgid_vnr(current->real_parent)):
+/// TASKLIST keeps the parent listed, and its number, while it is
+/// translated
+pub fn current_ppid_vnr() -> u32 {
+    let me = current();
+    let ns = me.task.pid_ns();
+    if ns.level == 0 {
+        return crate::task::pid::nr_ns(me.ppid(), ns);
+    }
+    let _table = TASKLIST.read();
+    crate::task::pid::nr_ns(me.ppid(), ns)
 }
 
 /// Get the current task's process group ID
@@ -4130,7 +4536,7 @@ pub fn increment_maj_flt() {
 
 /// Every thread of every process in group `pgid` (its pid links)
 pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
-    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
+    let Some(pg) = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid) else {
         return alloc::vec::Vec::new();
     };
     let table = TASKLIST.read();
@@ -4140,7 +4546,7 @@ pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
 /// The processes of group `pgid`, by pid (their leaders on its list;
 /// Linux do_each_pid_task PIDTYPE_PGID)
 pub fn pgrp_pids(pgid: Pid) -> alloc::vec::Vec<Pid> {
-    match crate::task::pid::find_pgrp(pgid) {
+    match crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid) {
         Some(pg) => pgrp_members(&pg),
         None => alloc::vec::Vec::new(),
     }
@@ -4215,29 +4621,29 @@ pub fn current_cred() -> crate::task::Cred {
     current().cred()
 }
 
-/// Look up a task's process group ID by PID
-///
-/// Returns None if the process is not found.
-pub fn lookup_task_pgid(pid: Pid) -> Option<Pid> {
+/// Process `pid`'s group as the caller numbers it, 0 if outside its
+/// namespace (Linux pid_vnr(task_pgrp(p))): None if not found
+pub fn lookup_task_pgid(pid: Pid) -> Option<u32> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.pgid())
+    let pg = table.get(pid)?.pgrp.as_ref().map_or(0, |p| p.vnr());
+    Some(pg)
 }
 
 /// True if some process is in group `pgid`
 pub fn pgrp_exists(pgid: Pid) -> bool {
-    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
+    let Some(pg) = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid) else {
         return false;
     };
     let table = TASKLIST.read();
     table.pgrp(&pg).next().is_some()
 }
 
-/// Look up a task's session ID by PID
-///
-/// Returns None if the process is not found.
-pub fn lookup_task_sid(pid: Pid) -> Option<Pid> {
+/// Process `pid`'s session as the caller numbers it, 0 if outside its
+/// namespace (Linux pid_vnr(task_session(p))): None if not found
+pub fn lookup_task_sid(pid: Pid) -> Option<u32> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.sid())
+    let s = table.get(pid)?.session.as_ref().map_or(0, |p| p.vnr());
+    Some(s)
 }
 
 /// Look up a task's nice value by PID
@@ -4533,7 +4939,7 @@ pub fn set_task_pgid(
     caller_sid: Pid,
 ) -> Result<(), i32> {
     // Found before TASKLIST (the pid hash's lock is not nested in it)
-    let target = crate::task::pid::find_pgrp(new_pgid);
+    let target = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, new_pgid);
     let mut old = Vec::new();
     let mut table = TASKLIST.write();
     setpgid_who(&table, caller_pid, target_pid, caller_sid)?;
@@ -4932,7 +5338,7 @@ pub fn exec_replace_image(
         let mut table = TASKLIST.write();
         let task = table.get_mut(tid);
         let mut task = task.expect("exec: current task not in the task table");
-        task.page_table = ArchPageTable::new(new.pgd());
+        task.pgd = new.pgd();
         new.set_dumpable(ident.dumpable);
         // A new execution domain (Linux de_thread): SIGCHLD; a secure
         // exec is not signalled at its parent's death (begin_new_exec)

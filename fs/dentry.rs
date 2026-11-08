@@ -174,9 +174,10 @@ impl Dentry {
 
     /// The child `name` was unlinked (Linux d_delete): one no one but
     /// the caller (`held` references) holds becomes negative in place,
-    /// with what was cached under it dropped; a held one leaves the
-    /// tree. Decided under this parent's d_lock, where lookups take
-    /// their references.
+    /// with what was cached under it dropped, and lets go of its inode
+    /// after the locks (dentry_unlink_inode); a held one leaves the
+    /// tree, and lets go when its last holder does. Decided under this
+    /// parent's d_lock, where lookups take their references.
     pub fn d_delete(&self, name: &[u8], held: usize) {
         let mut p = self.d_lock.write();
         let Some(c) = p.children.get(name) else {
@@ -184,8 +185,13 @@ impl Dentry {
         };
         if Arc::strong_count(c) <= held + 1 {
             let mut ci = c.d_lock.write();
-            ci.inode = None;
+            let inode = ci.inode.take();
             ci.children.clear();
+            drop(ci);
+            drop(p);
+            if let Some(i) = inode {
+                crate::io::inotify::d_iput(&i);
+            }
         } else if let Some(c) = p.children.remove(name) {
             c.d_lock.write().flags.unhashed = true;
             drop(p);
@@ -245,83 +251,138 @@ impl Dentry {
     }
 }
 
+/// Longest path name, its NUL included (Linux PATH_MAX)
+pub const PATH_MAX: usize = 4096;
+
+/// A path name built backwards from the end of a PATH_MAX buffer
+/// allocated up front, so nothing allocates under RENAME_LOCK (Linux
+/// struct prepend_buffer over a page); one byte stays for the NUL
+struct Prepend {
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl Prepend {
+    fn new() -> Result<Self, KernelError> {
+        Ok(Self {
+            buf: crate::util::kmem::try_vec(PATH_MAX, 0u8)?,
+            pos: PATH_MAX - 1,
+        })
+    }
+
+    /// "/name" of `d` in front (ENAMETOOLONG when it does not fit)
+    fn name(&mut self, d: &Dentry) -> Result<(), KernelError> {
+        let di = d.d_lock.read();
+        let n: &[u8] = &di.name;
+        let start = self
+            .pos
+            .checked_sub(n.len() + 1)
+            .ok_or(KernelError::NameTooLong)?;
+        self.buf[start] = b'/';
+        self.buf[start + 1..self.pos].copy_from_slice(n);
+        self.pos = start;
+        Ok(())
+    }
+
+    /// The name ("/" when nothing was prepended)
+    fn into_name(mut self) -> Vec<u8> {
+        let end = PATH_MAX - 1;
+        if self.pos == end {
+            self.pos -= 1;
+            self.buf[self.pos] = b'/';
+        }
+        self.buf.copy_within(self.pos..end, 0);
+        self.buf.truncate(end - self.pos);
+        self.buf
+    }
+}
+
 /// The name of `p` as seen from `root` (Linux prepend_path): climbs
 /// dentry parents and, at a mount's root, to its mountpoint in the
 /// parent mount; one consistent picture under RENAME_LOCK. The bool is
 /// false when the walk ended without meeting `root` (a path outside
 /// the caller's root, or on a detached mount): the name then starts at
-/// whatever root it reached.
-pub fn d_path(p: &Path, root: &Path) -> (Vec<u8>, bool) {
-    let _r = RENAME_LOCK.read();
-    let (mut mnt, mut d) = (p.mnt.clone(), p.dentry.clone());
-    let mut names = Vec::new();
-    let reached = loop {
-        if Arc::ptr_eq(&mnt, &root.mnt) && Arc::ptr_eq(&d, &root.dentry) {
-            break true;
-        }
-        if Arc::ptr_eq(&d, &mnt.root) {
-            match (mnt.get_parent(), mnt.get_mountpoint()) {
-                (Some(m), Some(mp)) => {
-                    (mnt, d) = (m, mp);
-                    continue;
-                }
-                _ => break false,
+/// whatever root it reached. ENAMETOOLONG past PATH_MAX (its NUL
+/// included), ENOMEM without a buffer.
+pub fn try_d_path(p: &Path, root: &Path) -> Result<(Vec<u8>, bool), KernelError> {
+    let mut b = Prepend::new()?;
+    let reached = {
+        let _r = RENAME_LOCK.read();
+        let (mut mnt, mut d) = (p.mnt.clone(), p.dentry.clone());
+        loop {
+            if Arc::ptr_eq(&mnt, &root.mnt) && Arc::ptr_eq(&d, &root.dentry) {
+                break true;
             }
+            if Arc::ptr_eq(&d, &mnt.root) {
+                match (mnt.get_parent(), mnt.get_mountpoint()) {
+                    (Some(m), Some(mp)) => {
+                        (mnt, d) = (m, mp);
+                        continue;
+                    }
+                    _ => break false,
+                }
+            }
+            let Some(parent) = d.get_parent() else {
+                break false;
+            };
+            b.name(&d)?;
+            d = parent;
         }
-        let Some(parent) = d.get_parent() else {
-            break false;
-        };
-        names.push(d.name());
-        d = parent;
     };
-    if names.is_empty() {
-        return (b"/".to_vec(), reached);
-    }
-    let mut out = Vec::new();
-    for n in names.iter().rev() {
-        out.push(b'/');
-        out.extend_from_slice(n);
-    }
-    (out, reached)
+    Ok((b.into_name(), reached))
+}
+
+/// [`try_d_path`], with an empty name not reaching `root` when it
+/// fails (a name too long, no memory)
+pub fn d_path(p: &Path, root: &Path) -> (Vec<u8>, bool) {
+    try_d_path(p, root).unwrap_or_default()
 }
 
 /// The path of `d` from the root of its filesystem (Linux
-/// dentry_path_raw): a mount's root in mountinfo
-pub fn dentry_path(d: &Arc<Dentry>) -> Vec<u8> {
-    let _r = RENAME_LOCK.read();
-    let mut names = Vec::new();
-    let mut cur = d.clone();
-    while let Some(p) = cur.get_parent() {
-        names.push(cur.name());
-        cur = p;
+/// dentry_path_raw): a mount's root in mountinfo; ENAMETOOLONG past
+/// PATH_MAX
+pub fn dentry_path(d: &Arc<Dentry>) -> Result<Vec<u8>, KernelError> {
+    let mut b = Prepend::new()?;
+    {
+        let _r = RENAME_LOCK.read();
+        let mut cur = d.clone();
+        while let Some(p) = cur.get_parent() {
+            b.name(&cur)?;
+            cur = p;
+        }
     }
-    if names.is_empty() {
-        return b"/".to_vec();
-    }
-    let mut out = Vec::new();
-    for n in names.iter().rev() {
-        out.push(b'/');
-        out.extend_from_slice(n);
-    }
-    out
+    Ok(b.into_name())
 }
 
-/// A /proc link's name for `p` (Linux d_path): as `d_path` from the
+/// A /proc link's name for `p` (Linux d_path): as `try_d_path` from the
 /// reader's root, " (deleted)" appended for a removed file
-pub fn d_path_link(p: &Path) -> Vec<u8> {
+pub fn d_path_link(p: &Path) -> Result<Vec<u8>, KernelError> {
     let mut out = match super::namei::nd_root() {
-        Ok(root) => d_path(p, &root).0,
+        Ok(root) => try_d_path(p, &root)?.0,
         Err(_) => Vec::new(),
     };
     if p.dentry.is_unhashed() {
         out.extend_from_slice(b" (deleted)");
     }
-    out
+    Ok(out)
 }
 
 impl Drop for Dentry {
+    /// The parents this dentry alone held go here in a loop, not by
+    /// nested drops: a chain of removed directories pinned only by its
+    /// deepest one (an open descriptor) may be as deep as the caller
+    /// could make it
     fn drop(&mut self) {
         NR_DENTRY.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        // Its inode, if the last name of it is gone, takes its watches
+        // with it (Linux dentry_unlink_inode at the final dput)
+        if let Some(i) = self.d_lock.get_mut().inode.take() {
+            crate::io::inotify::d_iput(&i);
+        }
+        let mut next = self.d_lock.get_mut().parent.take();
+        while let Some(p) = next {
+            next = Arc::into_inner(p).and_then(|mut d| d.d_lock.get_mut().parent.take());
+        }
     }
 }
 

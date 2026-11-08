@@ -3,20 +3,20 @@
 
 - [x] fork (x86-64 only, legacy; use clone)
 - [x] vfork (x86-64 only, legacy; use clone with CLONE_VFORK)
-- [x] clone (Linux thread/process creation)
-- [x] clone3
+- [x] clone (Linux thread/process creation; CLONE_PIDFD returns the pidfd at parent_tid)
+- [x] clone3 (set_tid: a namespace with no init yet takes only 1; CLONE_INTO_CGROUP)
 - [x] execve (ELF, #! scripts up to 5 levels)
 - [x] execveat (dirfd, AT_EMPTY_PATH for fexecve, AT_SYMLINK_NOFOLLOW)
 - [x] _exit
 - [x] set_tid_address
 - [x] exit_group
 - [x] wait4
-- [x] waitid
+- [x] waitid (P_PIDFD; an O_NONBLOCK pidfd waits as WNOHANG, EAGAIN)
 
 1.2 Process IDs & basic info
 
-- [x] getpid
-- [x] getppid
+- [x] getpid (pids in the caller's pid namespace throughout)
+- [x] getppid (0 for a parent outside the caller's pid namespace)
 - [x] gettid
 - [x] getpgid
 - [x] setpgid
@@ -255,8 +255,8 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] pipe2
 - [x] eventfd (x86-64 only, legacy; use eventfd2)
 - [x] eventfd2
-- [x] pidfd_open
-- [x] pidfd_send_signal
+- [x] pidfd_open (PIDFD_NONBLOCK, PIDFD_THREAD)
+- [x] pidfd_send_signal (PIDFD_SIGNAL_THREAD, _THREAD_GROUP, _PROCESS_GROUP; no PIDFD_SELF_*)
 - [x] pidfd_getfd
 
 7.2 Futex (core for modern libs/threads)
@@ -447,7 +447,7 @@ goes down later.
 
 - [x] inotify_init (x86-64 only, legacy; use inotify_init1)
 - [x] inotify_init1
-- [x] inotify_add_watch
+- [x] inotify_add_watch (a watch is on the inode, not its number: one per inode across filesystems; IN_DELETE_SELF, IN_UNMOUNT and IN_IGNORED are delivered, no other event yet)
 - [x] inotify_rm_watch
 - [x] fanotify_init
 - [x] fanotify_mark
@@ -508,7 +508,7 @@ goes down later.
 
 - [x] unshare
 - [x] setns
-- [x] clone with namespace flags
+- [x] clone with namespace flags (CLONE_NEWPID: the first process is pid 1 and its child reaper; its death kills the namespace, then fork into it is ENOMEM)
 
 11.3 Host identity
 
@@ -524,10 +524,10 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [x] uname
 - [x] sysinfo
 - [x] getrandom (ChaCha20 CRNG, up to MAX_RW_COUNT per call)
-- [x] reboot
+- [x] reboot (inside a child pid namespace: RESTART/RESTART2 and POWER_OFF/HALT kill its init, reported as SIGHUP/SIGINT, other commands EINVAL)
 - [x] kexec_load (stub, returns -ENOSYS; requires CAP_SYS_BOOT)
 - [x] syslog (READ, READ_ALL, READ_CLEAR, CLEAR, SIZE_UNREAD, SIZE_BUFFER over the record log; console actions no-ops; CAP_SYSLOG for all, as with dmesg_restrict=1)
-- [x] acct
+- [x] acct (per pid namespace: an exit is recorded in its namespace's file and each parent's, numbered there)
 - [x] swapon
 - [x] swapoff
 - [x] getcpu

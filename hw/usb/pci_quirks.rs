@@ -106,7 +106,9 @@ impl Bar {
 
 impl Drop for Bar {
     fn drop(&mut self) {
-        CurrentArch::iounmap(self.virt, u64::from(self.len));
+        // SAFETY: the mapping `map` made, owned by this `Bar` and used
+        // only through it
+        unsafe { CurrentArch::iounmap(self.virt, u64::from(self.len)) };
     }
 }
 

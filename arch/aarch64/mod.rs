@@ -249,8 +249,9 @@ impl IoremapOps for Aarch64Arch {
         unsafe { ioremap::ioremap(phys_addr, size) }
     }
 
-    fn iounmap(virt_addr: *mut u8, size: u64) {
-        ioremap::iounmap(virt_addr, size);
+    unsafe fn iounmap(virt_addr: *mut u8, size: u64) {
+        // SAFETY: the trait's contract
+        unsafe { ioremap::iounmap(virt_addr, size) };
     }
 }
 

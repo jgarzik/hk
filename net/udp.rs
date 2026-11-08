@@ -610,20 +610,15 @@ fn score(s: &UdpSock, k: &Key) -> i32 {
 }
 
 /// Best socket for a unicast datagram; a SO_REUSEPORT group shares by
-/// flow hash
+/// flow hash. Each socket's state is read once (Linux udp4_lib_lookup2
+/// scores in a single pass): a concurrent connect() or SO_BINDTODEVICE
+/// cannot make a second look disagree with the first.
 fn lookup(t: &UdpTable, k: &Key) -> Option<Arc<UdpSock>> {
     let cands = t.on_port(k.dport);
-    let best = cands
+    let seen: Vec<(i32, bool)> = cands
         .iter()
-        .map(|s| score(s, k))
-        .max()
-        .filter(|&b| b >= 0)?;
-    let top: Vec<&Arc<UdpSock>> = cands.iter().filter(|s| score(s, k) == best).collect();
-    let first = top[0];
-    if !first.sk.flag(sf::REUSEPORT) || top.len() == 1 {
-        return Some(first.clone());
-    }
-    let group: Vec<&&Arc<UdpSock>> = top.iter().filter(|s| s.sk.flag(sf::REUSEPORT)).collect();
+        .map(|s| (score(s, k), s.sk.flag(sf::REUSEPORT)))
+        .collect();
     let h = port::siphash(
         [0x9e37_79b9, 0x7f4a_7c15],
         &[
@@ -631,7 +626,22 @@ fn lookup(t: &UdpTable, k: &Key) -> Option<Arc<UdpSock>> {
             (u64::from(k.sport) << 16) | u64::from(k.dport),
         ],
     );
-    Some((*group[(h as usize) % group.len()]).clone())
+    pick(&seen, h).map(|i| cands[i].clone())
+}
+
+/// Index of the winner among (score, SO_REUSEPORT) snapshots: the first
+/// best-scoring socket, or, if it is in a reuseport group, the group
+/// member (best score, REUSEPORT) chosen by `h`. None if nothing matches.
+fn pick(seen: &[(i32, bool)], h: u64) -> Option<usize> {
+    let best = seen.iter().map(|x| x.0).max().filter(|&b| b >= 0)?;
+    let top = || seen.iter().enumerate().filter(move |x| x.1.0 == best);
+    let (first, &(_, reuse)) = top().next()?;
+    let n = top().filter(|x| x.1.1).count();
+    if !reuse || n < 2 {
+        return Some(first);
+    }
+    let nth = usize::try_from(h % n as u64).unwrap_or(0);
+    top().filter(|x| x.1.1).nth(nth).map(|x| x.0)
 }
 
 /// Linux __udp_is_mcast_sock: broadcast receivers
@@ -671,7 +681,14 @@ pub fn udp_rcv(skb: SkBuff) {
         dif,
     };
     let info = RxInfo::of(&net, &skb);
-    let d = Dgram::new(saddr, k.sport, pkt[UDP_HLEN..].to_vec(), info);
+    // Each socket's copy may fail to allocate: that socket counts a drop
+    // (Linux __udp4_lib_mcast_deliver when skb_clone fails)
+    let deliver = |s: &UdpSock| match Dgram::copy(saddr, k.sport, &pkt[UDP_HLEN..], info) {
+        Some(d) => s.rxq.enqueue(&s.sk, d),
+        None => {
+            s.sk.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    };
     if skb.ip_bcast || daddr.is_multicast() {
         for s in net
             .udp
@@ -679,12 +696,12 @@ pub fn udp_rcv(skb: SkBuff) {
             .iter()
             .filter(|s| bcast_match(s, &k))
         {
-            s.rxq.enqueue(&s.sk, d.clone());
+            deliver(s);
         }
         return;
     }
     match lookup(&net.udp, &k) {
-        Some(s) => s.rxq.enqueue(&s.sk, d),
+        Some(s) => deliver(&s),
         None => crate::net::icmp::port_unreach(&net, &skb),
     }
 }
@@ -800,4 +817,27 @@ pub fn proc_net_udp() -> Vec<u8> {
         let _ = writeln!(out, "{:<127}", line);
     }
     out.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick;
+
+    #[test]
+    fn pick_best_first() {
+        assert_eq!(pick(&[], 0), None);
+        assert_eq!(pick(&[(-1, false), (-1, true)], 0), None);
+        assert_eq!(pick(&[(2, false), (6, false), (6, true)], 0), Some(1));
+    }
+
+    #[test]
+    fn pick_reuseport_group() {
+        let s = [(6, true), (2, true), (6, true), (6, false), (6, true)];
+        // the group is indices 0, 2, 4; the hash picks among them
+        assert_eq!(pick(&s, 0), Some(0));
+        assert_eq!(pick(&s, 1), Some(2));
+        assert_eq!(pick(&s, 5), Some(4));
+        // a lone REUSEPORT member is just the first
+        assert_eq!(pick(&[(6, true), (6, false)], 7), Some(0));
+    }
 }

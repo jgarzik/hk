@@ -23,6 +23,12 @@ const FDT_PROP: u32 = 0x00000003;
 const FDT_NOP: u32 = 0x00000004;
 const FDT_END: u32 = 0x00000009;
 
+/// Deepest node visited (Linux FDT_MAX_DEPTH): nodes at depth
+/// `FDT_MAX_DEPTH - 1` and below are skipped, as Linux
+/// unflatten_dt_nodes does, so the recursive walks stay bounded however
+/// deep a blob nests
+const FDT_MAX_DEPTH: usize = 64;
+
 /// Error types for FDT parsing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DtError {
@@ -511,6 +517,9 @@ impl<'a> Iterator for ChildIter<'a> {
     type Item = Node<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.depth >= FDT_MAX_DEPTH - 1 {
+            return None;
+        }
         loop {
             if self.offset >= self.info.struct_offset + self.info.struct_size {
                 return None;
@@ -659,6 +668,33 @@ mod tests {
         // strings offset past the end
         let h = header(64, 40, 1000, 8);
         assert!(matches!(DeviceTree::from_fdt(&h), Err(DtError::Truncated)));
+    }
+
+    /// Levels below `n` reachable through children()
+    fn below(n: &Node<'_>) -> usize {
+        n.children().map(|c| 1 + below(&c)).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn depth_is_capped() {
+        // root plus 200 nested nodes named "n"
+        let mut s = alloc::vec::Vec::new();
+        for _ in 0..201 {
+            s.extend_from_slice(&FDT_BEGIN_NODE.to_be_bytes());
+            s.extend_from_slice(b"n\0\0\0");
+        }
+        for _ in 0..201 {
+            s.extend_from_slice(&FDT_END_NODE.to_be_bytes());
+        }
+        s.extend_from_slice(&FDT_END.to_be_bytes());
+        let end = (64 + s.len()) as u32;
+        let mut blob = header(end, 64, end, s.len() as u32).to_vec();
+        blob.extend_from_slice(&s);
+        let dt = DeviceTree::from_fdt(&blob).unwrap();
+        let root = dt.root().unwrap();
+        assert_eq!(below(&root), FDT_MAX_DEPTH - 2);
+        assert!(dt.find_compatible("x").is_empty());
+        dt.build_registry();
     }
 
     #[test]

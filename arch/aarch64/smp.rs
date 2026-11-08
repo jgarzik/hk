@@ -103,15 +103,15 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
 
         // Allocate stack for this AP (aligned like every EL1 stack:
         // vectors.S KERNEL_ENTRY), and its overflow stack
-        let Some(stack_base) = crate::mm::vmstack::alloc().filter(|_| set_overflow_stack(cpu_id))
-        else {
+        let Some(stack) = crate::mm::vmstack::alloc().filter(|_| set_overflow_stack(cpu_id)) else {
             printkln!(
                 "SMP: Failed to allocate stack for CPU {}",
                 cpu_info.hw_cpu_id
             );
             continue;
         };
-        let stack_top = stack_base + AP_STACK_SIZE as u64;
+        // The CPU's for good
+        let stack_top = stack.leak() + AP_STACK_SIZE as u64;
 
         // Build MPIDR for target CPU
         // QEMU virt uses Aff0 for CPU ID within cluster
@@ -175,7 +175,8 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
 /// stack overflow continues on (vectors.S `el1_stack_overflow`); false
 /// if out of memory
 fn set_overflow_stack(cpu: u32) -> bool {
-    let Some(base) = crate::mm::vmstack::alloc() else {
+    // The CPU's for good
+    let Some(base) = crate::mm::vmstack::alloc().map(|s| s.leak()) else {
         return false;
     };
     percpu::get_percpu(cpu).overflow_stack.store(

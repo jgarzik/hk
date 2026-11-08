@@ -706,6 +706,12 @@ impl TcpSock {
             || g.cb.state == TcpState::Closed
     }
 
+    /// More than `more_than` bytes are queued (published with the end
+    /// condition of the same segment, under the control block lock)
+    fn rx_queued(&self, more_than: usize) -> bool {
+        self.cb.lock().cb.rcvq_len() > more_than
+    }
+
     /// Copy (or with MSG_TRUNC drop) up to `want` readable bytes into
     /// `m` at `off`; MSG_PEEK reads past the `off` bytes already peeked
     fn take_rx(
@@ -986,21 +992,31 @@ fn tcp_recvmsg(s: &TcpSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, Ke
         if copied >= target.max(1) || len == 0 {
             break;
         }
+        let more = if flags & MSG_PEEK != 0 { copied } else { 0 };
+        // Linux tests the end conditions with the receive queue empty
+        // under one socket lock; here a segment may queue data and then
+        // publish its FIN, reset or error after take_rx looked, so an
+        // end seen now counts only if nothing was queued ahead of it.
+        // The ends are sampled once: one that lands after the queue
+        // check is left for the next pass.
+        let err = s.sk.has_err();
+        let shut = s.sk.shutdown() & RCV_SHUTDOWN != 0;
+        let closed = s.state() == TcpState::Closed;
+        if (err || shut || closed) && s.rx_queued(more) {
+            continue;
+        }
         if copied > 0 {
-            if s.sk.has_err()
-                || s.sk.shutdown() & RCV_SHUTDOWN != 0
-                || s.state() == TcpState::Closed
-            {
+            if err || shut || closed {
                 break;
             }
         } else {
-            if let Some(e) = s.sk.take_err() {
+            if err && let Some(e) = s.sk.take_err() {
                 return Err(e);
             }
-            if s.sk.shutdown() & RCV_SHUTDOWN != 0 {
+            if shut {
                 break;
             }
-            if s.state() == TcpState::Closed {
+            if closed {
                 // The step that closed it published its error first
                 return Err(s.sk.take_err().unwrap_or(KernelError::NotConnected));
             }
@@ -1008,7 +1024,6 @@ fn tcp_recvmsg(s: &TcpSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, Ke
         if flags & MSG_PEEK != 0 && copied > 0 {
             break;
         }
-        let more = if flags & MSG_PEEK != 0 { copied } else { 0 };
         match s.sk.wait_data(timeo, || s.rx_ready(more)) {
             Ok(t) => timeo = t,
             Err(e)

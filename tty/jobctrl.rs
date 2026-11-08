@@ -201,7 +201,8 @@ pub fn tiocgpgrp(tty: &Tty) -> Result<u32, KernelError> {
     if !is_current(tty) {
         return Err(KernelError::NotTty);
     }
-    Ok(tty.ctrl.lock().pgrp.as_ref().map_or(0, |p| p.nr()))
+    // In the caller's namespace (Linux tiocgpgrp: pid_vnr)
+    Ok(tty.ctrl.lock().pgrp.as_ref().map_or(0, |p| p.vnr()))
 }
 
 /// TIOCSPGRP (Linux tiocspgrp): a group of the caller's session becomes
@@ -216,7 +217,7 @@ pub fn tiocspgrp(tty: &Tty, pgrp: i32) -> Result<(), KernelError> {
     // A group id names a live pid (Linux find_vpid); 0 never does
     let pg = match nr {
         0 => None,
-        n => crate::task::pid::find_pgrp(n),
+        n => crate::task::pid::find_pgrp(crate::task::pid::current_pid_ns(), n),
     };
     let table = TASKLIST.read();
     let (_, s) = pids(&table).ok_or(KernelError::NotTty)?;
@@ -252,6 +253,6 @@ pub fn tiocgsid(tty: &Tty) -> Result<u32, KernelError> {
         .lock()
         .session
         .as_ref()
-        .map(|s| s.nr())
+        .map(|s| s.vnr())
         .ok_or(KernelError::NotTty)
 }

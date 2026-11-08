@@ -9,6 +9,8 @@
 //! `boot_tester2 auxv`: exit 0 if the initial stack and auxiliary
 //! vector are what the Linux ELF loader provides, else the failed check.
 //! `boot_tester2 exe`: exit 0 if /proc/self/exe names this program.
+//! `boot_tester2 stackvma`: exit 0 if the stack VMA is within
+//! RLIMIT_STACK.
 //! `boot_tester2 comm`: exit 0 if the task name (PR_GET_NAME) is
 //! "boot_tester2"; `boot_tester2 dumpable`: exit with PR_GET_DUMPABLE.
 //! `boot_tester2 sleep`: write a byte to fd 3, then sleep until killed.
@@ -248,6 +250,56 @@ fn stack_check(sp: *const u64) -> ! {
     sys_exit(0);
 }
 
+/// stackvma mode: the [stack] VMA in /proc/self/maps is no larger than
+/// RLIMIT_STACK (exit 0), 1-3 if it cannot be read or found, 4 if larger
+fn stackvma_check() -> ! {
+    static mut MAPS: [u8; 16384] = [0; 16384];
+    // SAFETY: single-threaded; only this function touches MAPS
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(MAPS) };
+    let fd = hk_syscall::sys_open(b"/proc/self/maps\0".as_ptr(), 0, 0);
+    if fd < 0 {
+        sys_exit(1);
+    }
+    let mut n = 0usize;
+    loop {
+        let r = hk_syscall::sys_read(fd as u64, buf[n..].as_mut_ptr(), (buf.len() - n) as u64);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    let mut rl = hk_syscall::RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if hk_syscall::sys_getrlimit(hk_syscall::RLIMIT_STACK, &mut rl) != 0 {
+        sys_exit(2);
+    }
+    for line in buf[..n].split(|&c| c == b'\n') {
+        // byte loop: a slice compare becomes a bcmp call (no libc here)
+        let tag = b"[stack]";
+        let stack = line.len() >= tag.len()
+            && (0..tag.len()).all(|i| unsafe {
+                core::ptr::read_volatile(&line[line.len() - tag.len() + i])
+            } == tag[i]);
+        if !stack {
+            continue;
+        }
+        let mut v = [0u64; 2];
+        let mut i = 0;
+        for &c in line.iter().take_while(|&&c| c != b' ') {
+            match c {
+                b'-' => i = 1,
+                b'0'..=b'9' => v[i] = v[i] * 16 + u64::from(c - b'0'),
+                b'a'..=b'f' => v[i] = v[i] * 16 + u64::from(c - b'a' + 10),
+                _ => {}
+            }
+        }
+        sys_exit(if v[1] - v[0] <= rl.rlim_cur { 0 } else { 4 });
+    }
+    sys_exit(3)
+}
+
 /// exe mode: /proc/self/exe is the executed file
 fn exe_check() -> ! {
     let mut buf = [0u8; 64];
@@ -341,6 +393,7 @@ extern "C" fn rust_start(sp: *const u64) -> ! {
         b"fdcheck" => fdcheck(),
         b"auxv" => auxv_check(sp),
         b"stack" => stack_check(sp),
+        b"stackvma" => stackvma_check(),
         b"exe" => exe_check(),
         b"comm" => comm_check(),
         b"dumpable" => sys_exit(sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) as u64),

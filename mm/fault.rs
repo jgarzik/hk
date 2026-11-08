@@ -3,8 +3,9 @@
 //! The arch trap handlers decode a fault (address, access, user or
 //! kernel mode) and call [`handle_mm_fault`]; its error says what the
 //! access earns (Linux VM_FAULT_SIGSEGV / VM_FAULT_SIGBUS /
-//! VM_FAULT_OOM). Page tables are read and changed through the
-//! `arch::paging` PTE helpers (`pte_alloc`, `mk_pte`, `pte_mkwrite`, ...).
+//! VM_FAULT_OOM). Page tables are reached through the fault's mmap_lock
+//! guard (`pgtable::PgTables`), entries built by the `arch::paging` PTE
+//! helpers (`mk_pte`, `pte_mkwrite`, ...).
 //!
 //! The fault holds the mmap_lock for reading from the VMA lookup to the
 //! PTE update, I/O included (doc/LOCKING.md, Address Spaces): a PTE is
@@ -14,16 +15,16 @@
 //! lock).
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 use super::anon_vma::AnonVma;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
-use super::ptl::pte_lock;
+use super::pgtable::{PgTables, Pte, PteTable};
 use super::shmem::Shmem;
 use super::tlb::flush_tlb_page;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry};
 use crate::FRAME_ALLOCATOR;
-use crate::arch::{ArchPageTable, PageFlags, paging, phys_to_virt};
+use crate::arch::{PageFlags, paging, phys_to_virt};
 use crate::fs::File;
 use crate::mm::page_alloc::Gfp;
 use crate::task::percpu::{increment_maj_flt, increment_min_flt};
@@ -130,33 +131,18 @@ pub(crate) fn alloc_user() -> Option<u64> {
     FRAME_ALLOCATOR.alloc_gfp(Gfp::HIGHUSER_MOVABLE)
 }
 
-/// Install `new` in the leaf entry at `ptep` if it still holds `old`
-fn set_pte(ptep: *mut u64, old: u64, new: u64) -> bool {
-    // SAFETY: `ptep` points into a live page table of the faulting mm
-    let pte = unsafe { AtomicU64::from_ptr(ptep) };
-    pte.compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-}
-
-/// Replace the present entry `old` at `ptep` by `new`, which maps
-/// another page (Linux ptep_clear_flush + set_pte_at): the entry is
-/// cleared and its TLB entry flushed before `new` is written, so no CPU
-/// caches both translations at once (arm64 break-before-make). False
-/// if the entry no longer holds `old`.
-fn replace_pte(mm: &Mm, ptep: *mut u64, old: u64, new: u64, addr: u64) -> bool {
-    if !set_pte(ptep, old, 0) {
+/// Replace the present entry `old` for `addr` in the locked table `t`
+/// by `new`, which maps another page (Linux ptep_clear_flush +
+/// set_pte_at): the entry is cleared and its TLB entry flushed before
+/// `new` is written, so no CPU caches both translations at once (arm64
+/// break-before-make). False if the entry no longer holds `old`.
+fn replace_pte(mm: &Mm, t: &PteTable<'_>, addr: u64, old: u64, new: u64) -> bool {
+    if !t.set(addr, old, 0) {
         return false;
     }
     flush_tlb_page(mm, addr);
-    // SAFETY: as in `set_pte`
-    unsafe { AtomicU64::from_ptr(ptep) }.store(new, Ordering::Release);
+    t.store(addr, new);
     true
-}
-
-/// Read the entry at `ptep`
-fn get_pte(ptep: *mut u64) -> u64 {
-    // SAFETY: as in `set_pte`
-    unsafe { AtomicU64::from_ptr(ptep) }.load(Ordering::Acquire)
 }
 
 /// A new anonymous page at `addr` joins the rmap and LRU
@@ -212,20 +198,22 @@ type MmRead<'a> = crate::sync::RwSemReadGuard<'a, MmStruct>;
 
 fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     let (map, area) = lock_area(mm, addr, access)?;
-    if let Some(r) = huge_fault(mm, addr, &area, access) {
+    let t = PgTables::new(mm, &map);
+    if let Some(r) = huge_fault(mm, t, addr, &area, access) {
         return r;
     }
-    let ptep = leaf(mm, addr)?;
-    let pte = get_pte(ptep);
+    let ptep = leaf(mm, t, addr)?;
+    let pte = ptep.get();
     if paging::pte_protnone(pte) {
         // Only mprotect makes protnone entries, with the VMA (which
         // allows this access): restore it, read-only, and retry (a
         // write then goes through do_wp_page; write implies read)
         let prot = (area.prot & !PROT_WRITE) | PROT_READ;
-        let _l = pte_lock(ptep);
-        if set_pte(ptep, pte, paging::pte_modify(pte, prot)) {
+        let l = ptep.lock();
+        if l.set(addr, pte, paging::pte_modify(pte, prot)) {
             flush_tlb_page(mm, addr);
         }
+        drop(l);
         return Ok(());
     }
     if paging::pte_present(pte) {
@@ -257,16 +245,15 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
 }
 
 /// The leaf entry for `addr`, allocating missing tables; out of memory,
-/// pages are reclaimed (with no spinlock held: the tables are allocated
-/// under the page_table_lock) and the allocation tried again while that
-/// frees some, a bounded number of times
-fn leaf(mm: &Mm, addr: u64) -> Result<*mut u64, VmFault> {
+/// pages are reclaimed and the allocation tried again while that frees
+/// some, a bounded number of times
+fn leaf<'a>(mm: &Mm, t: PgTables<'a>, addr: u64) -> Result<Pte<'a>, VmFault> {
     for _ in 0..16 {
-        if let Some(p) = super::ptl::pte_alloc(mm, addr) {
+        if let Some(p) = t.pte_alloc(mm, addr) {
             return Ok(p);
         }
         // A huge page mapped there: the access is retried
-        if paging::pmd_ptr(mm.pgd(), addr).is_some_and(|p| paging::pmd_huge(get_pte(p))) {
+        if still_huge(t, addr) {
             return Err(VmFault::Retry);
         }
         if super::vmscan::try_to_free_pages(super::vmscan::SWAP_CLUSTER_MAX) == 0 {
@@ -277,13 +264,20 @@ fn leaf(mm: &Mm, addr: u64) -> Result<*mut u64, VmFault> {
 }
 
 /// A fault in a 2MB region: None to continue at the 4KB level
-fn huge_fault(mm: &Mm, addr: u64, area: &Area, access: Access) -> Option<Result<(), VmFault>> {
-    let pmd = get_pte(paging::pmd_ptr(mm.pgd(), addr)?);
+fn huge_fault(
+    mm: &Mm,
+    t: PgTables<'_>,
+    addr: u64,
+    area: &Area,
+    access: Access,
+) -> Option<Result<(), VmFault>> {
+    let pmdp = t.pmd(addr)?;
+    let pmd = pmdp.get();
     if paging::pmd_huge(pmd) {
         if access == Access::Write && !paging::pte_write(pmd) {
             // Write-protected huge page: split, then fault on the 4KB
             // page; a racing fault may have split (or unmapped) it first
-            if split_huge_pmd(mm, addr).is_none() && still_huge(mm, addr) {
+            if split_huge_pmd(mm, pmdp).is_none() && still_huge(t, addr) {
                 return Some(Err(VmFault::Oom));
             }
             return None;
@@ -295,20 +289,20 @@ fn huge_fault(mm: &Mm, addr: u64, area: &Area, access: Access) -> Option<Result<
         return Some(Ok(()));
     }
     if pmd == 0 && area.thp {
-        return do_huge_anon(mm, addr, area).then_some(Ok(()));
+        return do_huge_anon(mm, t, addr, area).then_some(Ok(()));
     }
     None
 }
 
 /// A 2MB page still maps `addr`
-fn still_huge(mm: &Mm, addr: u64) -> bool {
-    paging::pmd_ptr(mm.pgd(), addr).is_some_and(|p| paging::pmd_huge(get_pte(p)))
+fn still_huge(t: PgTables<'_>, addr: u64) -> bool {
+    t.pmd(addr).is_some_and(|p| p.huge())
 }
 
 /// Map a zeroed 2MB page for a THP-eligible area if it covers the whole
 /// aligned 2MB around `addr` (Linux do_huge_pmd_anonymous_page); false
 /// to fall back to a 4KB page
-fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
+fn do_huge_anon(mm: &Mm, t: PgTables<'_>, addr: u64, area: &Area) -> bool {
     let base = addr & !(HUGE_PAGE_SIZE - 1);
     if base < area.start || base + HUGE_PAGE_SIZE > area.end {
         return false;
@@ -334,16 +328,18 @@ fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
     if area.prot & PROT_EXEC != 0 {
         flags |= PageFlags::EXECUTE;
     }
-    // Fails if a racing fault installed a table or a page first
-    let _l = super::ptl::pt_lock(mm);
-    if ArchPageTable::map_huge_page(mm.pgd(), base, frame, flags, &mut &FRAME_ALLOCATOR).is_err() {
+    // The upper tables first, outside the page_table_lock (Linux
+    // __handle_mm_fault's pmd_alloc); fails if a racing fault installed
+    // a table or a page first
+    let pmd = t.pmd_alloc(mm, base);
+    let l = super::ptl::pt_lock(mm);
+    let entry = crate::arch::paging::mk_pmd(frame, flags);
+    let Some(pmd) = pmd.filter(|p| p.set_huge(&l, entry)) else {
         FRAME_ALLOCATOR.free_huge(frame);
         FRAME_ALLOCATOR.free(pt);
         return false;
-    }
-    if let Some(pmdp) = paging::pmd_ptr(mm.pgd(), base) {
-        super::huge_page::deposit(pmdp, pt);
-    }
+    };
+    super::huge_page::deposit(&pmd, &l, pt);
     add_anon(frame, area, base);
     increment_min_flt();
     true
@@ -448,7 +444,7 @@ fn file_page(
 /// page-cache page: the first write copies it)
 fn do_fault(
     mm: &Mm,
-    ptep: *mut u64,
+    ptep: Pte<'_>,
     old: u64,
     page: u64,
     addr: u64,
@@ -460,8 +456,12 @@ fn do_fault(
     } else {
         area.prot
     };
-    let _l = pte_lock(ptep);
-    if !set_pte(ptep, old, paging::mk_pte(page, prot)) {
+    // Held across the rmap add and the flush (Linux do_anonymous_page
+    // / finish_fault under the PTL): a reverse-map walk never sees the
+    // entry without its page's rmap
+    let l = ptep.lock();
+    if !l.set(addr, old, paging::mk_pte(page, prot)) {
+        drop(l);
         // A racing fault mapped the page first
         super::memory::put_page(page);
         return Ok(());
@@ -470,6 +470,7 @@ fn do_fault(
         add_anon(page, area, addr);
     }
     flush_tlb_page(mm, addr);
+    drop(l);
     increment_min_flt();
     Ok(())
 }
@@ -483,7 +484,7 @@ fn do_fault(
 /// slot), and a later write fault decides.
 fn do_swap_page(
     mm: &Mm,
-    ptep: *mut u64,
+    ptep: Pte<'_>,
     pte: u64,
     addr: u64,
     area: &Area,
@@ -504,15 +505,15 @@ fn do_swap_page(
 /// PTE's, replaces the swap PTE `pte` if the entry still holds it
 fn map_swap_page(
     mm: &Mm,
-    ptep: *mut u64,
+    ptep: Pte<'_>,
     pte: u64,
     page: u64,
     addr: u64,
     area: &Area,
     access: Access,
 ) -> Result<(), VmFault> {
-    let _l = pte_lock(ptep);
-    if get_pte(ptep) != pte {
+    let t = ptep.lock();
+    if t.get(addr) != pte {
         FRAME_ALLOCATOR.decref(page);
         return Ok(());
     }
@@ -529,7 +530,7 @@ fn map_swap_page(
     if !exclusive && !area.shared {
         entry = paging::pte_mkcow(entry);
     }
-    let ok = set_pte(ptep, pte, entry);
+    let ok = t.set(addr, pte, entry);
     debug_assert!(ok, "swap PTE changed under its PTE lock");
     if let Some(av) = &area.anon_vma {
         super::rmap::page_add_anon_rmap(page, av, area.index(addr));
@@ -540,13 +541,13 @@ fn map_swap_page(
 }
 
 /// swapoff: fault in the swap PTE at `addr` of `vma` (Linux
-/// unuse_pte), mm lock held for reading
-pub fn unuse_pte(mm: &Mm, vma: &super::Vma, addr: u64) -> Result<(), VmFault> {
+/// unuse_pte), mm lock held for reading (`t` borrows it)
+pub fn unuse_pte(mm: &Mm, t: PgTables<'_>, vma: &super::Vma, addr: u64) -> Result<(), VmFault> {
     let area = area_of(vma);
-    let Some(ptep) = paging::pte_ptr(mm.pgd(), addr) else {
+    let Some(ptep) = t.pte(addr) else {
         return Ok(());
     };
-    let pte = get_pte(ptep);
+    let pte = ptep.get();
     if !SwapEntry::is_swap_pte(pte) {
         return Ok(());
     }
@@ -557,7 +558,7 @@ pub fn unuse_pte(mm: &Mm, vma: &super::Vma, addr: u64) -> Result<(), VmFault> {
 /// do_wp_page): a shared mapping, or a private page no one else maps,
 /// is made writable in place; a private page still shared (fork's
 /// copy-on-write) is copied first
-fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), VmFault> {
+fn do_wp_page(mm: &Mm, ptep: Pte<'_>, pte: u64, addr: u64, area: &Area) -> Result<(), VmFault> {
     // A shared file page written back (write-protected by mkclean) is
     // dirty again once writable (Linux wp_page_shared ->
     // fault_dirty_shared_page)
@@ -608,14 +609,14 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
 /// if there is one, else `Retry` asks for one when none is free at once
 fn wp_locked(
     mm: &Mm,
-    ptep: *mut u64,
+    ptep: Pte<'_>,
     pte: u64,
     addr: u64,
     area: &Area,
     spare: &mut Option<u64>,
 ) -> Result<(), VmFault> {
-    let _l = pte_lock(ptep);
-    if get_pte(ptep) != pte {
+    let t = ptep.lock();
+    if t.get(addr) != pte {
         return Ok(()); // changed meanwhile: the access is retried
     }
     // This mapping's own page, writable only if the mapping is (a
@@ -632,7 +633,7 @@ fn wp_locked(
         reuse_swap_page(old);
     }
     if area.shared || FRAME_ALLOCATOR.refcount(old) <= 1 {
-        if set_pte(ptep, pte, own(pte)) {
+        if t.set(addr, pte, own(pte)) {
             flush_tlb_page(mm, addr);
             increment_min_flt();
         }
@@ -644,7 +645,7 @@ fn wp_locked(
     unsafe { super::page::copy_page(new, old) };
     paging::sync_page(new, paging::pte_exec(pte));
     let entry = own((pte & !paging::PTE_ADDR_MASK) | new);
-    if !replace_pte(mm, ptep, pte, entry, addr) {
+    if !replace_pte(mm, &t, addr, pte, entry) {
         FRAME_ALLOCATOR.free(new);
         return Ok(());
     }
@@ -698,10 +699,11 @@ pub fn pagefault_out_of_memory() -> ! {
 /// own copy if it is still shared copy-on-write, so the write cannot
 /// reach the process it is shared with. The caller checked that the
 /// VMA is private (writable, or the write is forced: ptrace), and holds
-/// the target's mm lock; the copy gets the VMA's `prot` and joins its
-/// rmap (`anon_vma`) like a write fault's copy.
+/// the target's mm lock (`t` borrows it); the copy gets the VMA's
+/// `prot` and joins its rmap (`anon_vma`) like a write fault's copy.
 pub fn unshare_for_write(
     mm: &Mm,
+    t: PgTables<'_>,
     addr: u64,
     anon_vma: Option<Arc<AnonVma>>,
     index: u64,
@@ -711,10 +713,10 @@ pub fn unshare_for_write(
     if addr >= super::TASK_SIZE {
         return Err(VmFault::Segv);
     }
-    let Some(ptep) = paging::pte_ptr(mm.pgd(), addr) else {
+    let Some(ptep) = t.pte(addr) else {
         return Ok(()); // not mapped, or a 2MB page (never shared)
     };
-    let pte = get_pte(ptep);
+    let pte = ptep.get();
     // A PROT_NONE entry keeps its frame: a forced write copies it too
     // (Linux FOLL_FORCE follows protnone), and the copy stays PROT_NONE
     let mapped = paging::pte_present(pte) || paging::pte_protnone(pte);

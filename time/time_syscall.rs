@@ -137,6 +137,17 @@ impl PosixClock {
     }
 }
 
+/// The root number of a CPU clock's pid, which the caller numbers (0,
+/// the caller, stays 0): None if it sees no such task (Linux
+/// lookup_task: find_task_by_vpid)
+pub fn clock_pid(pid: u64) -> Option<u64> {
+    if pid == 0 {
+        Some(0)
+    } else {
+        crate::task::pid::from_vnr(pid)
+    }
+}
+
 /// TAI - UTC (adjtimex ADJ_TAI), in ns
 pub fn tai_offset_ns() -> i128 {
     i128::from(TIMEKEEPER.tai_offset()) * 1_000_000_000
@@ -148,6 +159,7 @@ pub fn tai_offset_ns() -> i128 {
 /// caller's own tid
 fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64, KernelError> {
     use crate::task::percpu;
+    let pid = clock_pid(pid).ok_or(KernelError::InvalidArgument)?;
     let me = percpu::current_tid();
     let (utime, stime) = if thread {
         let tid = if pid == 0 {

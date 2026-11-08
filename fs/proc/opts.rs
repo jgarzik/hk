@@ -1,13 +1,16 @@
 //! procfs mount options (Linux fs/proc/root.c proc_fs_parameters,
 //! struct proc_fs_info): hidepid=, gid= and subset=pid, per superblock
-//! (each mount of procfs is its own), changed by a remount
+//! (each mount of procfs is its own), changed by a remount; and the
+//! superblock's pid namespace, the mounter's, fixed at mount
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use crate::fs::Inode;
 use crate::fs::superblock::{SuperBlock, SuperBlockData};
-use crate::task::Pid;
+use crate::ns::PidNamespace;
+use crate::task::Task;
 use crate::util::error::KernelError;
 
 /// hidepid=: every /proc/<pid> visible and accessible (Linux HIDEPID_OFF)
@@ -21,6 +24,10 @@ const HIDEPID_NOT_PTRACEABLE: u8 = 4;
 
 /// One procfs superblock's options (Linux proc_fs_info)
 pub struct ProcOpts {
+    /// The pid namespace whose processes it shows, numbered as there
+    /// (Linux proc_fs_info.pid_ns: the mounter's active one); fixed at
+    /// mount, read with no lock
+    pid_ns: Arc<PidNamespace>,
     hidepid: AtomicU8,
     /// Members of this group see every process (Linux pid_gid; 0 by
     /// default, as Linux GLOBAL_ROOT_GID)
@@ -105,9 +112,11 @@ fn parse(data: &[u8]) -> Result<Parsed, KernelError> {
 }
 
 impl ProcOpts {
-    /// The options of a new mount
+    /// The options of a new mount by the caller, whose pid namespace it
+    /// shows (Linux proc_init_fs_context)
     pub fn new(data: &[u8]) -> Result<Self, KernelError> {
         let o = Self {
+            pid_ns: crate::task::pid::get_current_pid_ns(),
             hidepid: AtomicU8::new(HIDEPID_OFF),
             gid: AtomicU32::new(0),
             pidonly: AtomicBool::new(false),
@@ -140,10 +149,10 @@ impl ProcOpts {
     /// Linux has_pid_permissions: may the caller see process `pid` at
     /// hidepid level `min` (NO_ACCESS for its files, INVISIBLE for
     /// lookup and readdir)
-    fn allows(&self, pid: Pid, min: u8) -> bool {
+    fn allows(&self, t: &Task, min: u8) -> bool {
         let h = self.hidepid.load(Ordering::Relaxed);
         if h == HIDEPID_NOT_PTRACEABLE {
-            return crate::task::ptrace::may_read_proc(pid);
+            return crate::task::ptrace::may_read_ref(t);
         }
         if h < min {
             return true;
@@ -152,18 +161,18 @@ impl ProcOpts {
         if crate::fs::dac::in_group(&crate::fs::dac::cred(), gid) {
             return true;
         }
-        crate::task::ptrace::may_read_proc(pid)
+        crate::task::ptrace::may_read_ref(t)
     }
 
     /// The process shows in lookup and readdir
-    pub fn visible(&self, pid: Pid) -> bool {
-        self.allows(pid, HIDEPID_INVISIBLE)
+    pub fn visible(&self, t: &Task) -> bool {
+        self.allows(t, HIDEPID_INVISIBLE)
     }
 
     /// Linux proc_pid_permission: a process directory the options hide
     /// is ENOENT (invisible) or EPERM
-    pub fn pid_permission(&self, pid: Pid) -> Result<(), KernelError> {
-        if self.allows(pid, HIDEPID_NO_ACCESS) {
+    pub fn pid_permission(&self, t: &Task) -> Result<(), KernelError> {
+        if self.allows(t, HIDEPID_NO_ACCESS) {
             return Ok(());
         }
         if self.hidepid.load(Ordering::Relaxed) == HIDEPID_INVISIBLE {
@@ -205,6 +214,18 @@ pub fn with_sb<R>(sb: &SuperBlock, f: impl FnOnce(&ProcOpts) -> R) -> Option<R> 
 /// `f` on the options of the procfs superblock `inode` is on
 pub fn with<R>(inode: &Inode, f: impl FnOnce(&ProcOpts) -> R) -> Option<R> {
     with_sb(&*inode.superblock()?, f)
+}
+
+/// The pid namespace the procfs superblock `sb` shows
+pub fn sb_pid_ns(sb: &SuperBlock) -> Arc<PidNamespace> {
+    with_sb(sb, |o| o.pid_ns.clone()).unwrap_or_else(|| crate::ns::INIT_PID_NS.clone())
+}
+
+/// The pid namespace of the procfs `inode` is on
+pub fn pid_ns(inode: &Inode) -> Arc<PidNamespace> {
+    inode
+        .superblock()
+        .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |sb| sb_pid_ns(&sb))
 }
 
 #[cfg(test)]

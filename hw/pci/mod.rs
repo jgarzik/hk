@@ -56,23 +56,9 @@ mod bar_alloc {
     ///
     /// Returns None if the MMIO space is exhausted.
     pub fn allocate(size: u64) -> Option<u64> {
-        if size == 0 {
-            return None;
-        }
-
-        // BARs must be naturally aligned (address aligned to size)
-        let align = size;
-
         loop {
             let current = NEXT_ADDR.load(Ordering::Relaxed);
-
-            // Align up to the required alignment
-            let aligned = (current + align - 1) & !(align - 1);
-            let next = aligned + size;
-
-            if next > MMIO_END {
-                return None; // Out of space
-            }
+            let (aligned, next) = place(current, size)?;
 
             // Try to update atomically
             match NEXT_ADDR.compare_exchange(current, next, Ordering::SeqCst, Ordering::Relaxed) {
@@ -80,6 +66,20 @@ mod bar_alloc {
                 Err(_) => continue, // Retry on contention
             }
         }
+    }
+
+    /// Where a BAR of `size` goes with the window's free space starting
+    /// at `current`: (its address, the new start). BARs are naturally
+    /// aligned powers of two; a size the device reports that is not one,
+    /// or that would run past the window (or past 2^64, which a 64-bit
+    /// BAR can claim), gets None (Linux pci_assign_resource fails).
+    pub(super) fn place(current: u64, size: u64) -> Option<(u64, u64)> {
+        if !size.is_power_of_two() {
+            return None;
+        }
+        let aligned = current.checked_next_multiple_of(size)?;
+        let next = aligned.checked_add(size)?;
+        (next <= MMIO_END).then_some((aligned, next))
     }
 }
 
@@ -1041,5 +1041,20 @@ mod bar_size_tests {
         // 32-byte I/O BAR whose upper 16 bits read 0
         assert_eq!(bar_size_from_mask(true, 0x0000_FFE1, 0), 0x20);
         assert_eq!(bar_size_from_mask(false, 0, 0), 0);
+    }
+
+    #[test]
+    fn bar_place() {
+        use super::bar_alloc::place;
+        let base = 0x1000_0000;
+        assert_eq!(
+            place(base + 0x10, 0x1000),
+            Some((base + 0x1000, base + 0x2000))
+        );
+        assert_eq!(place(base, 0), None);
+        assert_eq!(place(base, 0x3000), None);
+        // a 64-bit BAR claiming 2^63 bytes: no wrap, just no room
+        assert_eq!(place(base, 1 << 63), None);
+        assert_eq!(place(u64::MAX - 0xfff, 0x1000), None);
     }
 }

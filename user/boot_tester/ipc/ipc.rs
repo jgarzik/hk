@@ -67,6 +67,7 @@ pub fn run_tests() {
     test_msgctl_rmid();
     test_msgrcv_long_min();
     test_msgrcv_e2big_order();
+    test_ipc_size_errno();
 }
 
 /// Test basic pipe creation
@@ -1275,4 +1276,22 @@ fn test_msgrcv_e2big_order() {
         print_num(t);
         println(b"");
     }
+}
+
+/// Linux do_msgsnd / do_msgrcv / newseg: a message past msgmax and a
+/// size negative as a long are EINVAL (not EMSGSIZE), and a segment
+/// past the largest file size is EINVAL
+fn test_ipc_size_errno() {
+    const EINVAL: i64 = -22;
+    let mut t = crate::harness::T::new(b"IPC_SIZE_ERRNO");
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as i32;
+    t.eq(b"msgsnd msgmax", msg_send(msqid, 1, 65537), EINVAL);
+    t.eq(b"msgrcv neg", msg_recv(msqid, usize::MAX, 0).0, EINVAL);
+    sys_msgctl(msqid, IPC_RMID, 0);
+    let r = hk_syscall::sys_shmget(IPC_PRIVATE, 1usize << 63, IPC_CREAT | 0o600);
+    if r >= 0 {
+        sys_shmctl(r as i32, IPC_RMID, 0);
+    }
+    t.eq(b"shmget huge", r, EINVAL);
+    t.done();
 }

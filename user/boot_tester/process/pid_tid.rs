@@ -3,7 +3,8 @@
 //! - the leader's getpid() equals its gettid();
 //! - fork returns the child's pid, which is also the child's tid;
 //! - a thread's tid, as clone returns it and CLONE_PARENT_SETTID stores
-//!   it, names /proc/self/task/<tid>;
+//!   it, names /proc/self/task/<tid>, whose stat and status describe
+//!   that thread, not the leader;
 //! - a non-leader thread that execs keeps the pid and becomes its tid
 //!   (de_thread's exchange_tids);
 //! - an orphan goes to the nearest child subreaper, which waits for it
@@ -62,8 +63,11 @@ static mut PTID: u32 = 0;
 static mut SEEN: i64 = 0;
 static mut GO: u32 = 0;
 
-/// The thread records its own tid and stays until the test is done
+/// The thread names itself, records its own tid and stays until the
+/// test is done
 extern "C" fn record(_: u64) -> ! {
+    const PR_SET_NAME: i32 = 15;
+    sys_prctl(PR_SET_NAME, b"bt-thread\0".as_ptr() as u64, 0, 0, 0);
     unsafe { core::ptr::write_volatile(&raw mut SEEN, sys_gettid()) };
     while unsafe { core::ptr::read_volatile(&raw const GO) } == 0 {
         hk_syscall::sys_sched_yield();
@@ -110,12 +114,50 @@ fn thread_ids() {
     // The task entry exists while the thread does: check before join
     let mut buf = [0u8; 48];
     let listed = tid > 0 && sys_faccessat(AT_FDCWD, task_path(tid, &mut buf), 0) == 0;
+    if tid > 0 {
+        while unsafe { core::ptr::read_volatile(&raw const SEEN) } == 0 {
+            hk_syscall::sys_sched_yield();
+        }
+        task_files(tid);
+    }
     unsafe { core::ptr::write_volatile(&raw mut GO, 1) };
     let joined = tid > 0 && join(&raw mut CTID);
     let ptid = unsafe { core::ptr::read_volatile(&raw const PTID) } as i64;
     let seen = unsafe { core::ptr::read_volatile(&raw const SEEN) };
     let ok = tid > 0 && joined && ptid == tid && seen == tid && tid != sys_getpid() && listed;
     verdict(b"PID_TID_THREAD", ok, tid);
+}
+
+/// /proc/self/task/<tid>/`file` (NUL-terminated) of thread `tid` into
+/// `out`: bytes read or a negative errno
+fn read_task(tid: i64, file: &[u8], out: &mut [u8]) -> i64 {
+    let mut buf = [0u8; 48];
+    task_path(tid, &mut buf);
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    let mut path = [0u8; 64];
+    path[..end].copy_from_slice(&buf[..end]);
+    path[end] = b'/';
+    path[end + 1..end + 1 + file.len()].copy_from_slice(file);
+    crate::helpers::read_file(&path[..end + 1 + file.len()], out)
+}
+
+/// Thread `tid`'s task/<tid> files describe that thread, not the
+/// leader (Linux proc_task_lookup instantiates the thread): stat starts
+/// with its tid, status names it as it named itself
+fn task_files(tid: i64) {
+    let mut b = [0u8; 512];
+    let n = read_task(tid, b"stat\0", &mut b);
+    let mut nr = 0i64;
+    for &c in b[..n.max(0) as usize]
+        .iter()
+        .take_while(|c| c.is_ascii_digit())
+    {
+        nr = nr * 10 + i64::from(c - b'0');
+    }
+    verdict(b"PID_TID_TASK_STAT", nr == tid, nr);
+    let n = read_task(tid, b"status\0", &mut b);
+    let ok = n > 0 && b[..n as usize].starts_with(b"Name:\tbt-thread\n");
+    verdict(b"PID_TID_TASK_STATUS", ok, n);
 }
 
 extern "C" fn exec_ids(_: u64) -> ! {

@@ -22,6 +22,10 @@
 //! list kept in its own first bytes and is freed by the next allocation
 //! (Linux vfree_atomic).
 //!
+//! Ownership: the pages of a range are mapped and unmapped only through
+//! its [`VmArea`] (Linux vm_struct), which only the range's allocator
+//! (this file's `AREA`, `mm::vmstack`'s slots) makes.
+//!
 //! Locking: `AREA` is a spin leaf, thread context (bitmap updates only:
 //! no mapping, flush or allocation under it); `FLUSH` (sleeping) keeps
 //! one purge at a time; mapping takes the arch's KTABLES and the frame
@@ -162,6 +166,79 @@ impl<const W: usize> Map<W> {
     }
 }
 
+/// A range of the vmalloc area or the kernel-stack area that its holder
+/// alone maps and unmaps (Linux vm_struct): unmapping a page another
+/// owner uses would free memory still in use
+///
+/// # Invariants
+///
+/// [base, base + pages * PAGE_SIZE) is a page-aligned range of the
+/// vmalloc window that its allocator handed to this holder alone, and
+/// no other `VmArea` of it exists.
+pub(crate) struct VmArea {
+    base: u64,
+    pages: usize,
+}
+
+impl VmArea {
+    /// The range of `pages` pages at `base`
+    ///
+    /// # Safety
+    ///
+    /// The range is page-aligned, in `VMALLOC_AREA` or the kernel-stack
+    /// area, handed by its allocator to the caller alone (not freed
+    /// back), and no other `VmArea` of it lives.
+    pub(crate) unsafe fn new(base: u64, pages: usize) -> Self {
+        debug_assert!(base.is_multiple_of(PAGE_SIZE));
+        // INVARIANT: the caller's guarantee
+        Self { base, pages }
+    }
+
+    /// The first address
+    pub(crate) fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Its size in pages
+    pub(crate) fn pages(&self) -> usize {
+        self.pages
+    }
+
+    /// Page `i`'s address
+    fn va(&self, i: usize) -> u64 {
+        assert!(i < self.pages, "page {i} outside the area");
+        self.base + i as u64 * PAGE_SIZE
+    }
+
+    /// Map the frame `pa` at page `i` (unmapped); false if a page table
+    /// could not be allocated
+    ///
+    /// # Safety
+    ///
+    /// `pa` is a free frame the caller owns, handed to the area (freed
+    /// by whoever unmaps it).
+    #[must_use]
+    pub(crate) unsafe fn map(&mut self, i: usize, pa: u64) -> bool {
+        // SAFETY: a page of this area, held alone (type invariant), the
+        // only map of page `i` before its unmap; `pa` as the caller
+        // guarantees
+        unsafe { crate::arch::vmap_page(self.va(i), pa) }.is_ok()
+    }
+
+    /// Unmap page `i`, flushing this CPU's TLB entry: the frame it
+    /// mapped, for the caller to free (other CPUs are flushed before the
+    /// range is handed out again)
+    pub(crate) fn unmap(&mut self, i: usize) -> Option<u64> {
+        let va = self.va(i);
+        // SAFETY: a page of this area, held alone (type invariant):
+        // only its holder uses it, and a reference into it was made by
+        // `unsafe` code bound to keep the mapping
+        let pa = unsafe { crate::arch::vunmap_page(va) }?;
+        crate::arch::tlb::local_flush_one(va);
+        Some(pa)
+    }
+}
+
 static AREA: Mutex<Map<WORDS>> = Mutex::new(Map::new());
 
 /// One purge at a time: a second one must not clean, from an older
@@ -223,7 +300,9 @@ fn drain_deferred() {
         // SAFETY: `d` heads an area pushed by `free` that nothing else
         // uses; read before the area is unmapped
         let Deferred { next, pages } = unsafe { d.read() };
-        release(d as u64, pages);
+        // SAFETY: the block of `alloc` that `free` was given: ours alone
+        // and unused (free's contract)
+        release(unsafe { VmArea::new(d as u64, pages) });
         d = next;
     }
 }
@@ -240,51 +319,58 @@ pub fn alloc(size: usize) -> *mut u8 {
     let Some(p) = take_range(pages + 1) else {
         return core::ptr::null_mut();
     };
-    let base = va_of(p);
+    // SAFETY: the pages (and guard page) just taken from AREA, ours
+    // alone until put back
+    let mut area = unsafe { VmArea::new(va_of(p), pages) };
     for i in 0..pages {
-        let va = base + i as u64 * PAGE_SIZE;
-        let ok =
-            crate::FRAME_ALLOCATOR
-                .alloc()
-                .is_some_and(|pa| match crate::arch::vmap_page(va, pa) {
-                    Ok(()) => true,
-                    Err(_) => {
-                        crate::FRAME_ALLOCATOR.free(pa);
-                        false
-                    }
-                });
+        let ok = crate::FRAME_ALLOCATOR.alloc().is_some_and(|pa| {
+            // SAFETY: a fresh frame, ours, handed to the area
+            let mapped = unsafe { area.map(i, pa) };
+            if !mapped {
+                crate::FRAME_ALLOCATOR.free(pa);
+            }
+            mapped
+        });
         if !ok {
-            unmap(base, i);
+            unmap(&mut area, i);
             AREA.lock().put(p, pages + 1);
             return core::ptr::null_mut();
         }
     }
-    base as *mut u8
+    area.base() as *mut u8
 }
 
-/// Unmap and free the first `pages` pages at `base`
-fn unmap(base: u64, pages: usize) {
+/// Unmap and free the first `pages` pages of `area`
+fn unmap(area: &mut VmArea, pages: usize) {
     for i in 0..pages {
-        let va = base + i as u64 * PAGE_SIZE;
-        if let Some(pa) = crate::arch::vunmap_page(va) {
-            crate::arch::tlb::local_flush_one(va);
+        if let Some(pa) = area.unmap(i) {
             crate::FRAME_ALLOCATOR.free(pa);
         }
     }
 }
 
-fn release(base: u64, pages: usize) {
-    unmap(base, pages);
-    AREA.lock().put(page_of(base), pages + 1);
+/// Unmap and free the block `area`, and give its range (and guard page)
+/// back
+fn release(mut area: VmArea) {
+    let pages = area.pages();
+    unmap(&mut area, pages);
+    AREA.lock().put(page_of(area.base()), area.pages() + 1);
 }
 
 /// Free `size` bytes at `ptr` (from `alloc(size)`), from any context
-pub fn free(ptr: *mut u8, size: usize) {
+///
+/// # Safety
+///
+/// `ptr` was returned by `alloc(size)`, is not used afterwards, and is
+/// freed once.
+pub unsafe fn free(ptr: *mut u8, size: usize) {
     use crate::arch::{CurrentArch, PerCpuOps};
     debug_assert!(contains(ptr as u64) && (ptr as u64).is_multiple_of(PAGE_SIZE));
     let pages = size.div_ceil(PAGE_SIZE as usize);
     if CurrentArch::interrupt_depth() == 0 {
-        release(ptr as u64, pages);
+        // SAFETY: the block of `alloc(size)`, ours alone and unused (the
+        // caller's guarantee)
+        release(unsafe { VmArea::new(ptr as u64, pages) });
         return;
     }
     // Interrupt handler: KTABLES is thread-context only

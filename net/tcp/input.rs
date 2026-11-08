@@ -25,9 +25,9 @@ impl TcpCb {
     /// Process a segment for this connection
     pub fn input(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
         self.tick(now);
-        self.stats.segs_in += 1;
+        self.stats.segs_in = self.stats.segs_in.wrapping_add(1);
         if !s.data.is_empty() {
-            self.stats.data_segs_in += 1;
+            self.stats.data_segs_in = self.stats.data_segs_in.wrapping_add(1);
         }
         match self.state {
             TcpState::Closed | TcpState::Listen => {}

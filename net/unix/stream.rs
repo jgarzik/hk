@@ -84,7 +84,7 @@ fn connect_to(
 ) -> Result<(), KernelError> {
     loop {
         let other = find_other(&s.sk.net, a, s.sk.stype)?;
-        match try_connect(s, &other, newsk, cred) {
+        match try_connect(s, &other, newsk, cred.clone()) {
             Err(KernelError::WouldBlock) => {
                 if *timeo == 0 {
                     return Err(KernelError::WouldBlock);
@@ -141,7 +141,7 @@ fn try_connect(
     newsk.sk.set_flag(sf::PASSCRED, pass);
     newsk.sk.set_flag(sf::PASSSEC, other.sk.flag(sf::PASSSEC));
     *newsk.addr.write() = other.addr();
-    let pc = *other.peercred.lock();
+    let pc = other.peercred.lock().clone();
     *s.peercred.lock() = pc;
     s.set_state(ESTABLISHED);
     *st = Some(newsk.clone());
@@ -241,7 +241,7 @@ fn send_chunk(
     s.wmem_wait(timeo)?;
     let data = m.data.take_at(off, size)?;
     let mut skb = Skb::new(&s.arc(), data);
-    skb.creds = scm.creds;
+    skb.creds = scm.creds.take();
     if let Some(f) = scm.fds.take() {
         if too_many_fds() {
             return Err(KernelError::TooManyRefs);
@@ -349,10 +349,22 @@ fn read_some(
                 if g.copied >= target {
                     return Ok(None);
                 }
-                if let Some(e) = s.sk.take_err() {
+                // Linux tests the end conditions with the queue empty
+                // under unix_state_lock; here the peer may queue and
+                // then shut down after the queue looked empty, so an
+                // end counts only if nothing was queued ahead of it. The
+                // ends are sampled once: one that lands after the queue
+                // check is left for the next pass.
+                let seen = if peek { *peek_at } else { 0 };
+                let err = s.sk.has_err();
+                let shut = super::rcv_shut(s);
+                if (err || shut) && s.rq.lock().q.len() > seen {
+                    continue;
+                }
+                if err && let Some(e) = s.sk.take_err() {
                     return Err(e);
                 }
-                if super::rcv_shut(s) {
+                if shut {
                     return Ok(None);
                 }
                 if timeo == 0 {
@@ -383,17 +395,17 @@ enum Step {
 /// unix_skb_scm_eq); also copies the source address once
 fn may_join(
     s: &UnixSock,
-    creds: Option<Creds>,
+    creds: Option<&Creds>,
     from: &UnixSock,
     m: &mut RecvMsg<'_>,
     g: &mut Got,
 ) -> bool {
     if g.check_creds {
-        if creds != g.creds {
+        if creds != g.creds.as_ref() {
             return false;
         }
     } else if s.passcred() {
-        g.creds = creds;
+        g.creds = creds.cloned();
         g.check_creds = true;
     }
     if m.want_name && !g.named {
@@ -417,7 +429,7 @@ fn read_one(
         };
         front
     };
-    if !may_join(s, skb.creds, &skb.from, m, g) {
+    if !may_join(s, skb.creds.as_ref(), &skb.from, m, g) {
         s.rq.lock().q.push_front(skb);
         return Ok(Step::Stop);
     }
@@ -473,12 +485,12 @@ fn peek_one(
         let d = skb.data[skb.consumed..skb.consumed + chunk].to_vec();
         (
             d,
-            skb.creds,
+            skb.creds.clone(),
             skb.fds.as_ref().map(|f| f.dup()),
             skb.from.clone(),
         )
     };
-    if !may_join(s, creds, &name, m, g) {
+    if !may_join(s, creds.as_ref(), &name, m, g) {
         drop(fds);
         return Ok(Step::Stop);
     }

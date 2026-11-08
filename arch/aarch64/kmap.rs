@@ -18,7 +18,6 @@
 //! TTBR1 tables once the heap exists (the DTB parser needs it) and
 //! leaves TTBR0 with an empty table; user page tables only ever hold
 //! user mappings. Boot-time tables come from a static pool.
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -111,6 +110,9 @@ fn pool_page() -> u64 {
 /// `table` is a boot page table (swapper or pool page), during
 ///  single-CPU early boot.
 unsafe fn next(table: *mut RawPageTable, idx: usize) -> *mut RawPageTable {
+    // SAFETY: `table` is a boot table no other CPU or reference reaches
+    // (the caller's guarantee); a missing entry gets a zeroed pool
+    // page, itself a boot table, reached through the linear map
     unsafe {
         let e = (*table).entry_mut(idx);
         if !e.is_valid() {
@@ -136,6 +138,8 @@ unsafe fn map_linear(root: *mut RawPageTable, base: u64, size: u64) -> u64 {
     let mut p = start;
     while p < end {
         let va = PAGE_OFFSET + p;
+        // SAFETY: `root` and the tables `next` returns are boot tables
+        // (this fn's contract, `next`'s), single CPU
         unsafe {
             let l1 = next(root, idx(va, 39));
             if p.is_multiple_of(SZ_1G) && p + SZ_1G <= end {
@@ -171,6 +175,7 @@ unsafe fn map_image(root: *mut RawPageTable) {
         } else {
             normal | AP_EL1_RO | PXN
         };
+        // SAFETY: as in `map_linear`
         unsafe {
             let l1 = next(root, idx(va, 39));
             let l2 = next(l1, idx(va, 30));
@@ -187,6 +192,7 @@ unsafe fn map_image(root: *mut RawPageTable) {
 /// As [`next`] for `root`.
 unsafe fn map_io(root: *mut RawPageTable) {
     let attrs = AF | ATTR_IDX_DEVICE | AP_EL1_RW | PXN | UXN;
+    // SAFETY: as in `map_linear`
     unsafe {
         let l1 = next(root, idx(IO_BASE, 39));
         (*l1).entry_mut(idx(IO_BASE, 30)).set_block(0, attrs);
@@ -205,6 +211,13 @@ pub unsafe fn init() {
     if !super::dtb::for_each_memory(memblock::add) {
         memblock::add(DEFAULT_RAM.0, DEFAULT_RAM.1);
     }
+    // SAFETY: once on the BSP before SMP (this fn's contract): the
+    // swapper is a boot table nothing else reaches yet, and the
+    // map_* calls get it. The barrier only orders the table writes
+    // (nostack). `__replace_ttbr1` is the asm routine at that linker
+    // symbol with this C signature, run through its physical
+    // (identity-mapped) address; the tables it installs map the
+    // running image and the linear map
     unsafe {
         let root = SWAPPER.get();
         let mut end = 0;
@@ -235,6 +248,8 @@ pub unsafe fn init() {
 /// # Safety
 /// Boot CPU, before SMP; `va` is unmapped and not in use.
 pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+    // SAFETY: `walk`'s contract is this fn's; `va`'s entry, unmapped
+    // and unused, in a live swapper table; barriers only (nostack)
     unsafe {
         let t = walk(va, &[39, 30, 21], table);
         (*t).entry_mut(idx(va, 12)).set_page(pa, KERNEL_RW);
@@ -249,6 +264,7 @@ pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
 /// # Safety
 /// As for `map_page`.
 pub unsafe fn map_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+    // SAFETY: as in `map_page`
     unsafe {
         let t = walk(va, &[39, 30], table);
         (*t).entry_mut(idx(va, 21)).set_block(pa, KERNEL_RW);
@@ -265,6 +281,9 @@ const KERNEL_RW: u64 = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
 /// # Safety
 /// As for `map_page`.
 unsafe fn walk(va: u64, shifts: &[u32], table: &mut dyn FnMut() -> u64) -> *mut RawPageTable {
+    // SAFETY: the swapper and the kernel tables under it are live and,
+    // before SMP (the caller's guarantee), changed by this CPU only;
+    // `table` gives zeroed frames, reached through the linear map
     unsafe {
         let mut t = SWAPPER.get();
         for &shift in shifts {
@@ -281,6 +300,9 @@ unsafe fn walk(va: u64, shifts: &[u32], table: &mut dyn FnMut() -> u64) -> *mut 
 /// Leave the boot identity map on this CPU (APs, after reaching the
 /// high half): TTBR0 gets the empty table
 pub fn drop_idmap() {
+    // SAFETY: TTBR0 gets the empty reserved table (the kernel runs from
+    // TTBR1), then this CPU's TLB is flushed; it changes how memory is
+    // reached, so no nomem (nostack: no stack use)
     unsafe {
         asm!(
             "msr ttbr0_el1, {}",

@@ -294,11 +294,13 @@ static ALL_SBS: crate::sync::spin::Mutex<alloc::vec::Vec<alloc::sync::Weak<Super
 
 impl Drop for SuperBlock {
     /// What the filesystem had cached goes with it (Linux
-    /// shrink_dcache_for_umount)
+    /// generic_shutdown_super: shrink_dcache_for_umount, then
+    /// fsnotify_sb_delete: its watches get IN_UNMOUNT and go)
     fn drop(&mut self) {
         if let Some(root) = self.root.get_mut().take() {
             super::dentry::d_drop_tree(&root);
         }
+        self.s_fsnotify.sb_delete();
     }
 }
 
@@ -355,6 +357,9 @@ pub struct SuperBlock {
     /// Inodes with dirty pages, each held until written back (Linux
     /// wb->b_dirty; `fs_writeback`)
     pub(crate) s_dirty: crate::sync::spin::Mutex<alloc::vec::Vec<Arc<Inode>>>,
+
+    /// Its inodes that have had inotify watches (Linux s_fsnotify_info)
+    pub s_fsnotify: crate::io::inotify::SbMarks,
 
     /// Serializes whole-filesystem writeback passes (sleeping: held
     /// across the I/O; `fs_writeback::writeback_sb`)
@@ -416,6 +421,7 @@ impl SuperBlock {
             private: RwLock::new(None),
             s_bdev: spin::Once::new(),
             s_dirty: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
+            s_fsnotify: crate::io::inotify::SbMarks::default(),
             s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
             s_umount: sync::RwSem::new(()),

@@ -656,7 +656,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
     } else {
         None
     };
-    let pid = current_pid() as i32;
+    let pid = crate::task::pid::vnr(current_pid()) as i32;
     let mut l = sem_array.lock_for(&sops);
     if sem_array.perm.is_deleted() {
         return Err(KernelError::IdentifierRemoved.errno());
@@ -889,7 +889,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let mut l = sem_array.lock_valid()?;
             let s = l.sem(semnum as usize);
             s.val = val;
-            s.pid = current_pid() as i32;
+            s.pid = crate::task::pid::vnr(current_pid()) as i32;
             s.undo.clear();
             if let Some(g) = l.global() {
                 g.ctime = current_time_secs();
@@ -947,7 +947,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             if vals.iter().any(|&v| v > SEMVMX) {
                 return Err(KernelError::Range.errno());
             }
-            let pid = current_pid() as i32;
+            let pid = crate::task::pid::vnr(current_pid()) as i32;
             let mut l = sem_array.lock_valid()?;
             for (i, &v) in vals.iter().enumerate() {
                 let s = l.sem(i);
@@ -1132,7 +1132,7 @@ pub fn exit_sem(tid: Tid) {
         return;
     };
     let arrays = core::mem::take(&mut *undo_list.arrays.lock());
-    let pid = current_pid() as i32;
+    let pid = crate::task::pid::vnr(current_pid()) as i32;
     for (_, weak) in arrays {
         // Gone, or removed (IPC_RMID): nothing to undo
         let Some(sem_array) = weak.upgrade() else {

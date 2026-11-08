@@ -55,7 +55,8 @@ pub fn do_exit(wait_status: i32) -> ! {
 /// # Arguments
 /// * `flags` - Clone flags (CLONE_VM, CLONE_THREAD, etc.)
 /// * `child_stack` - Stack pointer for child (required for CLONE_VM)
-/// * `_parent_tidptr` - Where to store parent TID (if CLONE_PARENT_SETTID)
+/// * `parent_tidptr` - Where to store parent TID (if CLONE_PARENT_SETTID),
+///   or the child's pidfd (if CLONE_PIDFD)
 /// * `_child_tidptr` - Where to store child TID (if CLONE_CHILD_SETTID)
 /// * `_tls` - TLS pointer for child (if CLONE_SETTLS)
 ///
@@ -80,15 +81,30 @@ pub fn sys_clone(
     // Extract exit_signal from low 8 bits of flags (CSIGNAL mask = 0xff)
     let exit_signal = (flags & 0xff) as i32;
 
+    // CLONE_PIDFD stores the pidfd at parent_tid (Linux sys_clone: one
+    // pointer for both), so CLONE_PARENT_SETTID with it is EINVAL
+    // (kernel_clone)
+    use super::clone_flags::{CLONE_PARENT_SETTID, CLONE_PIDFD};
+    let pidfd_ptr = if flags & CLONE_PIDFD != 0 {
+        if flags & CLONE_PARENT_SETTID != 0 {
+            return KernelError::InvalidArgument.sysret();
+        }
+        parent_tidptr
+    } else {
+        0
+    };
+
     clone(super::percpu::CloneConfig {
         flags: flags & !0xff, // Remove signal bits from flags
         child_stack,
         parent_tidptr,
         child_tidptr,
         tls,
-        pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
+        pidfd_ptr,
         exit_signal,
         cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
+        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid_size: 0,
     })
 }
 
@@ -122,6 +138,8 @@ pub fn sys_fork() -> i64 {
         pidfd_ptr: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // fork sends SIGCHLD on exit
         cgroup_fd: -1,
+        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid_size: 0,
     })
 }
 
@@ -157,6 +175,8 @@ pub fn sys_vfork() -> i64 {
         pidfd_ptr: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // vfork sends SIGCHLD on exit
         cgroup_fd: -1,
+        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid_size: 0,
     })
 }
 
@@ -193,6 +213,9 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, rusage: u64) -> i64 {
     }
 
     let current_pid = super::percpu::current_pid();
+    let Some(pid) = wait_target(pid) else {
+        return KernelError::NoChild.sysret();
+    };
 
     use super::percpu::{SleepState, schedule};
     use crate::sync::waitqueue::{WaitEntry, signal_pending};
@@ -253,6 +276,20 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, rusage: u64) -> i64 {
     };
     CHILD_EXIT_WQ.finish_wait(w.as_ref());
     result
+}
+
+/// wait4's `pid` (> 0 a child, < -1 a group, 0 the caller's group, -1
+/// any) with the caller's numbers made root ones: None if it names a
+/// pid the caller does not see, which no child matches (Linux
+/// find_get_pid: NULL, so ECHILD)
+fn wait_target(pid: i64) -> Option<i64> {
+    use crate::task::pid::from_vnr;
+    let root = |nr: u64| from_vnr(nr).and_then(|r| i64::try_from(r).ok());
+    match pid {
+        -1 | 0 => Some(pid),
+        p if p > 0 => root(p as u64),
+        p => root(p.unsigned_abs()).map(|r| -r),
+    }
 }
 
 /// The siginfo bytes waitid writes: si_signo through si_status
@@ -323,6 +360,10 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
         return KernelError::InvalidArgument.sysret();
     }
 
+    // An O_NONBLOCK pidfd waits as with WNOHANG, EAGAIN where WNOHANG
+    // itself would return 0 (Linux kernel_waitid_prepare, kernel_waitid)
+    let mut nohang = options & WNOHANG != 0;
+
     // Convert idtype/id to the pid format used by wait4/reap_zombie_child:
     // pid > 0: specific child
     // pid == -1: any child (P_ALL)
@@ -351,12 +392,22 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
                     None => return KernelError::BadFd.sysret(),
                 }
             };
-            match crate::task::pidfd::get_pidfd_pid(&file) {
-                Some(pid) => pid as i64,
-                None => return KernelError::BadFd.sysret(), // not a pidfd
-            }
+            let Some(pid) = crate::task::pidfd::get_pidfd_pid(&file) else {
+                return KernelError::BadFd.sysret(); // not a pidfd
+            };
+            nohang |= file.get_flags() & crate::fs::file::flags::O_NONBLOCK != 0;
+            pid as i64
         }
         _ => return KernelError::InvalidArgument.sysret(),
+    };
+    // A pidfd names its pid by root number already
+    let wait_pid = if idtype == P_PIDFD {
+        wait_pid
+    } else {
+        match wait_target(wait_pid) {
+            Some(p) => p,
+            None => return KernelError::NoChild.sysret(),
+        }
     };
 
     use super::percpu::{SleepState, schedule};
@@ -414,13 +465,17 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
             break KernelError::NoChild.sysret();
         }
 
-        // If WNOHANG, return 0 but leave infop->si_pid as 0 to indicate no child
-        if options & WNOHANG != 0 {
+        // If WNOHANG, return 0 but leave infop->si_pid as 0 to indicate
+        // no child (EAGAIN for a non-blocking pidfd without WNOHANG)
+        if nohang {
             if infop != 0 {
                 // Zero out siginfo to indicate no child was available
                 if put_waitid_info(infop, &crate::signal::SigInfo::default()).is_err() {
                     break KernelError::BadAddress.sysret();
                 }
+            }
+            if options & WNOHANG == 0 {
+                break KernelError::WouldBlock.sysret();
             }
             break 0;
         }
@@ -480,7 +535,7 @@ pub struct CloneArgs {
     pub stack_size: u64,
     /// TLS pointer for child (CLONE_SETTLS)
     pub tls: u64,
-    /// Array of PIDs for set_tid feature (CLONE_SET_TID, not implemented)
+    /// The child's pid in each innermost level (an array of pid_t)
     pub set_tid: u64,
     /// Size of set_tid array
     pub set_tid_size: u64,
@@ -564,9 +619,24 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         -1
     };
 
-    // set_tid feature not supported
-    if args.set_tid != 0 || args.set_tid_size != 0 {
+    // set_tid: at most MAX_PID_NS_LEVEL numbers, a pointer exactly
+    // when a size (EINVAL), copied in now (EFAULT); checked against the
+    // child's namespace at clone (Linux copy_clone_args_from_user)
+    let size_ok = args.set_tid_size <= u64::from(crate::ns::pid::MAX_PID_NS_LEVEL);
+    if !size_ok || (args.set_tid == 0) != (args.set_tid_size == 0) {
         return KernelError::InvalidArgument.sysret();
+    }
+    let n = args.set_tid_size as usize;
+    let mut set_tid = CloneConfig::NO_SET_TID;
+    if n > 0 {
+        let mut b = [0u8; 4 * crate::ns::pid::MAX_PID_NS_LEVEL as usize];
+        if crate::uaccess::copy_from_user::<Uaccess>(&mut b[..n * 4], args.set_tid, n * 4).is_err()
+        {
+            return KernelError::BadAddress.sysret();
+        }
+        for (t, c) in set_tid.iter_mut().zip(b[..n * 4].as_chunks::<4>().0) {
+            *t = u32::from_ne_bytes(*c);
+        }
     }
 
     // Validate stack - if stack is provided, stack_size must also be provided
@@ -574,6 +644,13 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
     if args.stack == 0 && args.stack_size != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    // The pidfd and the parent's tid cannot share one place (Linux
+    // kernel_clone)
+    let both = super::clone_flags::CLONE_PIDFD | super::clone_flags::CLONE_PARENT_SETTID;
+    if args.flags & both == both && args.pidfd == args.parent_tid {
         return KernelError::InvalidArgument.sysret();
     }
 
@@ -602,5 +679,7 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         pidfd_ptr: args.pidfd,
         exit_signal: args.exit_signal as i32,
         cgroup_fd,
+        set_tid,
+        set_tid_size: n,
     })
 }

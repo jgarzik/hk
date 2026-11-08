@@ -408,6 +408,10 @@ pub fn ip_icmp_error(
     port: u16,
     payload: &[u8],
 ) {
+    // Linux ip_icmp_error: no clone, no queued error
+    let Ok(payload) = crate::util::kmem::try_to_vec(payload) else {
+        return;
+    };
     sk.queue_err(crate::net::sock::ErrSkb {
         errno: errno as u32,
         origin: crate::net::sock::EE_ORIGIN_ICMP,
@@ -416,7 +420,7 @@ pub fn ip_icmp_error(
         info: e.info,
         name: sin_bytes(e.inner_daddr(), port),
         offender: sin_bytes(e.from, 0),
-        payload: payload.to_vec(),
+        payload,
         rx: Some(e.rx),
     });
 }
