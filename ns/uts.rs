@@ -22,6 +22,7 @@ use spin::Lazy;
 use crate::arch::Uaccess;
 use crate::uaccess::{UaccessArch, copy_from_user};
 use crate::util::error::KernelError;
+use crate::util::pod::FromBytes;
 
 /// Maximum string length for UTS fields (not including NUL terminator)
 ///
@@ -74,19 +75,6 @@ crate::pod!(NewUtsname {
     domainname
 });
 
-impl Default for NewUtsname {
-    fn default() -> Self {
-        Self {
-            sysname: [0; UTS_FIELD_SIZE],
-            nodename: [0; UTS_FIELD_SIZE],
-            release: [0; UTS_FIELD_SIZE],
-            version: [0; UTS_FIELD_SIZE],
-            machine: [0; UTS_FIELD_SIZE],
-            domainname: [0; UTS_FIELD_SIZE],
-        }
-    }
-}
-
 /// UTS namespace (like Linux struct uts_namespace)
 ///
 /// Contains the utsname data for this namespace. Each namespace
@@ -131,7 +119,7 @@ pub struct UtsNamespace {
 impl UtsNamespace {
     /// Create initial UTS namespace with default values
     fn new_init() -> Self {
-        let mut name = NewUtsname::default();
+        let mut name = NewUtsname::zeroed();
 
         // Set default values (like Linux's init_uts_ns)
         copy_str(&mut name.sysname, b"hk");

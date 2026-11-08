@@ -121,19 +121,6 @@ crate::pod!(UContext {
     uc_mcontext
 });
 
-impl Default for UContext {
-    fn default() -> Self {
-        Self {
-            uc_flags: 0,
-            uc_link: 0,
-            uc_stack: StackT::default(),
-            uc_sigmask: SigSet::EMPTY,
-            _pad: [0; 128],
-            uc_mcontext: SigContext::default(),
-        }
-    }
-}
-
 // =============================================================================
 // RT Signal Frame
 // =============================================================================
@@ -370,16 +357,11 @@ pub fn setup_rt_frame(
     let frame = RtSigFrame {
         info: info.to_user(),
         uc: UContext {
-            uc_flags: 0,
-            uc_link: 0,
             uc_stack: StackT {
-                ss_sp: 0,
                 ss_flags: SS_DISABLE,
-                _pad: 0,
-                ss_size: 0,
+                ..FromBytes::zeroed()
             },
             uc_sigmask: blocked,
-            _pad: [0; 128],
             uc_mcontext: SigContext {
                 // The last fault's FAR (Linux thread.fault_address)
                 fault_address,
@@ -389,6 +371,7 @@ pub fn setup_rt_frame(
                 pstate: user_spsr,
                 _pad: 0,
             },
+            ..FromBytes::zeroed()
         },
     };
     if copy_to_user::<Uaccess>(frame_addr, frame.as_bytes()).is_err() {

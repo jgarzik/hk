@@ -26,6 +26,7 @@
 
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
+use crate::util::pod::FromBytes;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::pin::Pin;
@@ -87,11 +88,9 @@ crate::pod!(SigEvent {
 impl Default for SigEvent {
     fn default() -> Self {
         Self {
-            sigev_value: 0,
             sigev_signo: SIGALRM as i32,
             sigev_notify: sigev_notify::SIGEV_SIGNAL,
-            sigev_notify_thread_id: 0,
-            _pad: [0; 11],
+            ..FromBytes::zeroed()
         }
     }
 }

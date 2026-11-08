@@ -10,6 +10,7 @@ use crate::time::hrtimer::HrClock;
 use crate::time::{ClockId, STA_NANO, STA_UNSYNC, TIMEKEEPER};
 use crate::uaccess::{UaccessArch, get_user, put_user};
 use crate::util::error::KernelError;
+use crate::util::pod::FromBytes;
 
 /// Linux clock IDs
 pub const CLOCK_REALTIME: i32 = 0;
@@ -326,12 +327,7 @@ pub fn sys_gettimeofday(tv: u64, tz: u64) -> i64 {
             return KernelError::BadAddress.sysret();
         }
 
-        let timezone = Timezone {
-            tz_minuteswest: 0,
-            tz_dsttime: 0,
-        };
-
-        if put_user::<Uaccess, Timezone>(tz, timezone).is_err() {
+        if put_user::<Uaccess, Timezone>(tz, Timezone::zeroed()).is_err() {
             return KernelError::BadAddress.sysret();
         }
     }
@@ -943,12 +939,6 @@ crate::pod!(Timex {
     tai,
     _reserved
 });
-
-impl Default for Timex {
-    fn default() -> Self {
-        <Self as crate::util::pod::FromBytes>::zeroed()
-    }
-}
 
 /// ADJ_* mode flags for adjtimex
 pub const ADJ_FREQUENCY: u32 = 0x0002;

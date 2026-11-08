@@ -5,6 +5,7 @@ use crate::arch::uapi::{Stat, st_nlink};
 use crate::fs::namei::{filename_lookup, getname_maybe_null, user_path_at};
 use crate::fs::{Inode, KernelError, LinuxStatFs, LookupFlags};
 use crate::uaccess::{UaccessArch, put_user};
+use crate::util::pod::FromBytes;
 
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW};
 use super::syscall::current_fd_table;
@@ -141,6 +142,16 @@ crate::pod!(StatxTimestamp {
     tv_nsec,
     __reserved
 });
+
+impl From<super::inode::Timespec> for StatxTimestamp {
+    fn from(t: super::inode::Timespec) -> Self {
+        Self {
+            tv_sec: t.sec,
+            tv_nsec: t.nsec,
+            __reserved: 0,
+        }
+    }
+}
 
 /// Extended file status structure (256 bytes)
 ///
@@ -396,36 +407,17 @@ fn fill_statx(
                 STATX_MNT_ID
             },
         stx_blksize: 4096,
-        stx_attributes: 0,
         stx_nlink: attr.nlink,
         stx_uid: attr.uid,
         stx_gid: attr.gid,
         stx_mode: attr.mode.raw(),
-        __spare0: [0],
         stx_ino: attr.ino,
         stx_size: attr.size,
         stx_blocks: attr.size.div_ceil(512),
-        stx_attributes_mask: 0,
-        stx_atime: StatxTimestamp {
-            tv_sec: attr.atime.sec,
-            tv_nsec: attr.atime.nsec,
-            __reserved: 0,
-        },
-        stx_btime: StatxTimestamp {
-            tv_sec: 0,
-            tv_nsec: 0,
-            __reserved: 0,
-        }, // Birth time not tracked
-        stx_ctime: StatxTimestamp {
-            tv_sec: attr.ctime.sec,
-            tv_nsec: attr.ctime.nsec,
-            __reserved: 0,
-        },
-        stx_mtime: StatxTimestamp {
-            tv_sec: attr.mtime.sec,
-            tv_nsec: attr.mtime.nsec,
-            __reserved: 0,
-        },
+        // Birth time not tracked: stx_btime stays zero
+        stx_atime: attr.atime.into(),
+        stx_ctime: attr.ctime.into(),
+        stx_mtime: attr.mtime.into(),
         stx_rdev_major: ((st_rdev >> 8) & 0xfff) as u32,
         stx_rdev_minor: (st_rdev & 0xff) as u32 | ((st_rdev >> 12) & 0xfff00) as u32,
         stx_dev_major: ((st_dev >> 8) & 0xfff) as u32,
@@ -435,16 +427,7 @@ fn fill_statx(
             Some(m) => u64::from(m.mnt_id),
             None => 0,
         },
-        stx_dio_mem_align: 0,
-        stx_dio_offset_align: 0,
-        stx_subvol: 0,
-        stx_atomic_write_unit_min: 0,
-        stx_atomic_write_unit_max: 0,
-        stx_atomic_write_segments_max: 0,
-        stx_dio_read_offset_align: 0,
-        stx_atomic_write_unit_max_opt: 0,
-        __spare2: [0],
-        __spare3: [0; 8],
+        ..FromBytes::zeroed()
     })
 }
 

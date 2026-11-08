@@ -40,6 +40,7 @@
 //! - Registered buffers and files for performance
 
 use crate::util::kalloc::try_arc;
+use crate::util::pod::FromBytes;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -1373,8 +1374,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
         flags: 16,
         dropped: 20,
         array: 24,
-        resv1: 0,
-        user_addr: 0,
+        ..FromBytes::zeroed()
     };
 
     // Fill in CQ ring offsets (CQ follows SQ in memory)
@@ -1388,8 +1388,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
         overflow: cq_base + 16,
         cqes: cq_base + 24, // Skip flags at +20
         flags: cq_base + 20,
-        resv1: 0,
-        user_addr: 0,
+        ..FromBytes::zeroed()
     };
 
     // Create file

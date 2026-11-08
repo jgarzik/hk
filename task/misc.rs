@@ -9,6 +9,7 @@
 
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
+use crate::util::pod::FromBytes;
 
 use super::Pid;
 
@@ -75,28 +76,6 @@ crate::pod!(SysInfo {
 
 // Compile-time assertion that SysInfo is 112 bytes (matches Linux and userspace)
 const _: () = assert!(core::mem::size_of::<SysInfo>() == 112);
-
-impl Default for SysInfo {
-    fn default() -> Self {
-        Self {
-            uptime: 0,
-            loads: [0; 3],
-            totalram: 0,
-            freeram: 0,
-            sharedram: 0,
-            bufferram: 0,
-            totalswap: 0,
-            freeswap: 0,
-            procs: 0,
-            pad: 0,
-            _pad2: 0,
-            totalhigh: 0,
-            freehigh: 0,
-            mem_unit: 1,
-            _f: 0,
-        }
-    }
-}
 
 /// Timeval structure for rusage (matches Linux)
 #[repr(C)]
@@ -220,17 +199,11 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
         loads: crate::task::loadavg::avenrun().map(|a| a << (16 - crate::task::loadavg::FSHIFT)),
         totalram: mem_stats.total_bytes,
         freeram: mem_stats.free_bytes,
-        sharedram: 0,
-        bufferram: 0,
         totalswap: swap_total * 4096,
         freeswap: swap_free * 4096,
         procs,
-        pad: 0,
-        _pad2: 0,
-        totalhigh: 0,
-        freehigh: 0,
         mem_unit: 1, // All sizes in bytes
-        _f: 0,
+        ..FromBytes::zeroed()
     };
 
     // Copy to user space

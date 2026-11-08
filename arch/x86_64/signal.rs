@@ -17,7 +17,7 @@ use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 use crate::util::error::KernelError;
-use crate::util::pod::IntoBytes;
+use crate::util::pod::{FromBytes, IntoBytes};
 
 // =============================================================================
 // Signal Context (sigcontext)
@@ -149,18 +149,6 @@ crate::pod!(UContext {
     uc_mcontext,
     uc_sigmask
 });
-
-impl Default for UContext {
-    fn default() -> Self {
-        Self {
-            uc_flags: 0,
-            uc_link: 0,
-            uc_stack: StackT::default(),
-            uc_mcontext: SigContext::default(),
-            uc_sigmask: SigSet::EMPTY,
-        }
-    }
-}
 
 // =============================================================================
 // RT Signal Frame
@@ -332,23 +320,19 @@ pub fn setup_rt_frame(
         rip: user_rip,
         eflags: user_rflags,
         cs: USER_CS,
-        gs: 0,
-        fs: 0,
         ss: USER_SS,
         err: trap.error,
         trapno: trap.trapno,
         oldmask: blocked.bits(),
         cr2: trap.addr,
         fpstate: fpstate_addr,
-        reserved: [0; 8],
+        ..FromBytes::zeroed()
     };
 
     // Build StackT for ucontext (current stack info)
     let stack_t = StackT {
-        ss_sp: 0,
         ss_flags: SS_DISABLE,
-        _pad: 0,
-        ss_size: 0,
+        ..FromBytes::zeroed()
     };
 
     let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;

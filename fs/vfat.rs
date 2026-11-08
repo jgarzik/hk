@@ -1311,13 +1311,9 @@ fn create_lfn_entries(name: &str, short_name: &[u8; 11]) -> Vec<VfatLfnEntry> {
 
         let mut entry = VfatLfnEntry {
             order,
-            name1: [0u16; 5],
             attr: attr::LONG_NAME,
-            entry_type: 0,
             checksum,
-            name2: [0u16; 6],
-            first_cluster: 0,
-            name3: [0u16; 2],
+            ..FromBytes::zeroed()
         };
 
         // The name fields (packed: assigned by value)
