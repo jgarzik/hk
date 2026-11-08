@@ -644,17 +644,17 @@ pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
         sighand.get(&mut table);
     }
     if let Some(mut task) = table.view_mut(t) {
-        task.sighand = Some(sighand);
+        task.set_sighand(sighand);
         *task.task.sig.lock() = state;
         task.task.set_sigpending(false);
         task.task.set_cpu_group(&s);
-        task.signal = Some(s);
+        task.set_signal(s);
     }
 }
 
 /// Task `t`'s signal handlers
 pub fn get_task_sighand(t: &Task) -> Option<Arc<SigHand>> {
-    TASKLIST.read().view(t)?.sighand.clone()
+    TASKLIST.read().view(t)?.sighand().cloned()
 }
 
 /// How the current task takes `sig` (for tty job control)
@@ -802,7 +802,7 @@ pub fn fork_signal(
         let table = TASKLIST.read();
         let parent = table.view(parent);
         (
-            parent.and_then(|p| p.sighand.clone()),
+            parent.and_then(|p| p.sighand().cloned()),
             parent.map(|p| {
                 let s = p.task.sig.lock();
                 (s.blocked, s.trap)
@@ -885,9 +885,9 @@ pub fn install_fork_signal(child: &Task, f: ForkSignal) {
         f.sighand.get(&mut table);
     }
     if let Some(mut c) = table.view_mut(child) {
-        c.sighand = Some(f.sighand);
+        c.set_sighand(f.sighand);
         c.task.set_cpu_group(&f.signal);
-        c.signal = Some(f.signal);
+        c.set_signal(f.signal);
     }
 }
 
@@ -908,12 +908,12 @@ pub fn exit_task_signal(t: &Task) {
             } else {
                 // Its CPU time stays the group's (Linux __exit_signal)
                 let t = task.task.cputime(crate::time::monotonic_ns());
-                if let Some(s) = &task.signal {
+                if let Some(s) = task.signal() {
                     s.add_dead_times(t);
                 }
-                task.signal.take()
+                task.take_signal()
             };
-            (task.sighand.take(), signal, old)
+            (task.take_sighand(), signal, old)
         });
         if let Some((Some(h), _, _)) = &old {
             h.put(&mut table);
@@ -950,7 +950,7 @@ pub fn exec_signals() -> Result<(), KernelError> {
             if table.view(&me).is_some() {
                 new.get(&mut table);
             }
-            let prev = table.view_mut(&me).and_then(|mut t| t.sighand.replace(new));
+            let prev = table.view_mut(&me).and_then(|mut t| t.set_sighand(new));
             if let Some(p) = &prev {
                 p.put(&mut table);
             }
@@ -1178,7 +1178,7 @@ fn target(t: &Task) -> Option<Target> {
 /// [`target`] under TASKLIST held by the caller
 fn target_in(table: &crate::task::percpu::GlobalTaskTable, t: &Task) -> Option<Target> {
     let v = table.view(t)?;
-    let sig = v.signal.as_ref();
+    let sig = v.signal();
     let limit = sig.and_then(|s| s.get_rlimit(RLIMIT_SIGPENDING));
     Some(Target {
         kthread: v.task.has_flag(crate::task::pf::KTHREAD),
@@ -1187,7 +1187,7 @@ fn target_in(table: &crate::task::percpu::GlobalTaskTable, t: &Task) -> Option<T
         stopped: matches!(v.state, crate::task::TaskState::Traced(_)),
         uid: v.cred_arc().uid,
         limit: limit.map_or(0, |r| r.rlim_cur),
-        sighand: v.sighand.clone(),
+        sighand: v.sighand().cloned(),
         signal: sig.cloned(),
     })
 }
@@ -1827,8 +1827,8 @@ fn group_signal(
 ) -> Option<Arc<SignalStruct>> {
     table
         .get(tgid)
-        .and_then(|t| t.signal.clone())
-        .or_else(|| table.threads(tgid).find_map(|t| t.signal.clone()))
+        .and_then(|t| t.signal().cloned())
+        .or_else(|| table.threads(tgid).find_map(|t| t.signal().cloned()))
 }
 
 /// SIGKILL every thread of `tgid` that has not started exiting, but
@@ -2463,7 +2463,7 @@ impl SignalStruct {
 
 /// Task `t`'s signal struct (none once it is reaped)
 pub fn get_task_signal_struct(t: &Task) -> Option<Arc<SignalStruct>> {
-    TASKLIST.read().view(t)?.signal.clone()
+    TASKLIST.read().view(t)?.signal().cloned()
 }
 
 /// A new task's signal struct for fork/clone, and whether it is the

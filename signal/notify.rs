@@ -166,7 +166,7 @@ fn disposition(
     }
     let action = table
         .view(to)
-        .and_then(|v| v.sighand.as_ref().map(|h| h.get_action(SIGCHLD)));
+        .and_then(|v| v.sighand().map(|h| h.get_action(SIGCHLD)));
     match action {
         Some(a) if a.handler == SigHandler::Ignore => (None, true),
         Some(a) if a.flags & sa_flags::SA_NOCLDWAIT != 0 => (sig, true),
@@ -348,7 +348,7 @@ fn chld_notice(table: &GlobalTaskTable, tid: Tid, ns: &crate::ns::PidNamespace) 
     let crate::task::TaskState::Zombie(own) = t.state else {
         return None;
     };
-    let status = match t.signal.as_ref().map(|s| s.group_exit()) {
+    let status = match t.signal().map(|s| s.group_exit()) {
         Some(super::GroupExit::Exit(code)) => code,
         _ => own,
     };

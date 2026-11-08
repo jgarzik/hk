@@ -1160,10 +1160,10 @@ pub struct TaskInner {
     // Shared resources (Arc for clone-sharing, like Linux pointers)
     // =========================================================================
     /// Signal handlers (shared when CLONE_SIGHAND)
-    pub sighand: Option<Arc<SigHand>>,
+    sighand: Option<Arc<SigHand>>,
 
     /// Thread-group signal state (shared when CLONE_THREAD)
-    pub signal: Option<Arc<SignalStruct>>,
+    signal: Option<Arc<SignalStruct>>,
 
     /// SysV semaphore undo list (shared when CLONE_SYSVSEM)
     pub sysvsem: Option<Arc<SemUndoList>>,
@@ -1300,6 +1300,36 @@ impl TaskInner {
             last_siginfo: None,
             ptrace_frozen: false,
         }
+    }
+
+    /// Its signal handlers (none once it exits)
+    pub fn sighand(&self) -> Option<&Arc<SigHand>> {
+        self.sighand.as_ref()
+    }
+
+    /// Install signal handlers `h`; returns the old ones
+    pub fn set_sighand(&mut self, h: Arc<SigHand>) -> Option<Arc<SigHand>> {
+        self.sighand.replace(h)
+    }
+
+    /// Detach its signal handlers
+    pub fn take_sighand(&mut self) -> Option<Arc<SigHand>> {
+        self.sighand.take()
+    }
+
+    /// Its thread group's signal state (none once it is reaped)
+    pub fn signal(&self) -> Option<&Arc<SignalStruct>> {
+        self.signal.as_ref()
+    }
+
+    /// Install thread-group signal state `s`
+    pub fn set_signal(&mut self, s: Arc<SignalStruct>) {
+        self.signal = Some(s);
+    }
+
+    /// Detach its thread group's signal state
+    pub fn take_signal(&mut self) -> Option<Arc<SignalStruct>> {
+        self.signal.take()
     }
 }
 
