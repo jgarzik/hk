@@ -373,6 +373,9 @@ unreachable today.
 There is no mqueue filesystem at all: queues live only in a kernel
 table, so they cannot be listed or read as files under /dev/mqueue
 (Linux mqueue_fs_type).
+mq_notify with SIGEV_THREAD is EINVAL: Linux delivers that notice as
+a message on a netlink socket the caller names (NETLINK_NOTIFY_COOKIE,
+glibc's helper thread), and hk has no such path.
 
 ## sysfs gaps
 
