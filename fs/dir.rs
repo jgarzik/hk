@@ -108,7 +108,9 @@ pub fn sys_getdents(fd: i32, dirp: u64, count: u64) -> i64 {
 /// at most GETDENTS_CHUNK bytes and copied to user space only after
 /// `readdir` returned and every lock is dropped.
 fn getdents(fd: i32, dirp: u64, count: u64, fmt: Fmt) -> i64 {
-    let count = core::cmp::min(count as usize, MAX_RW_COUNT);
+    // count is an unsigned int (Linux getdents64): the high bits of the
+    // register are not part of it
+    let count = core::cmp::min(count as u32 as usize, MAX_RW_COUNT);
     if !Uaccess::access_ok(dirp, count) {
         return KernelError::BadAddress.sysret();
     }

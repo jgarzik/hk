@@ -3,6 +3,9 @@
 //! returned entry and returns 0 at the end; d_off cookies work with
 //! lseek (telldir/seekdir), lseek(0) rewinds, and a buffer too small for
 //! one entry is EINVAL
+//!
+//! GETDENTS_COUNT_U32: count is an unsigned int, so 2^32 + 8 is a count
+//! of 8 (too small: EINVAL) and 2^32 + 4096 one of 4096
 
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -23,6 +26,20 @@ pub fn run_tests() {
     check_proc();
     #[cfg(target_arch = "x86_64")]
     check_legacy();
+    check_count_u32();
+}
+
+fn check_count_u32() {
+    let fd = sys_open(b"/\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    let mut buf = [0u8; 4096];
+    let small = sys_getdents64(fd as u64, buf.as_mut_ptr(), (1 << 32) + 8);
+    let ok = sys_getdents64(fd as u64, buf.as_mut_ptr(), (1 << 32) + 4096);
+    sys_close(fd as u64);
+    crate::harness::verdict(
+        b"GETDENTS_COUNT_U32",
+        small == EINVAL && ok > 0,
+        small * 100_000 + ok,
+    );
 }
 
 /// Legacy getdents (x86-64): struct linux_dirent records (d_ino, d_off,
