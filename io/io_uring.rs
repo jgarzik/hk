@@ -739,13 +739,13 @@ impl IoUring {
         let flags = sqe.op_flags;
         let mode = sqe.len;
 
-        crate::fs::syscall::sys_openat(dirfd, path_ptr, flags, mode) as i32
+        crate::fs::syscall::sys_openat(dirfd, UserPtr::new(path_ptr), flags, mode).ret() as i32
     }
 
     /// Handle IORING_OP_CLOSE
     fn do_close(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
-        crate::fs::syscall::sys_close(fd) as i32
+        crate::fs::syscall::sys_close(fd).ret() as i32
     }
 
     /// Handle IORING_OP_FSYNC
@@ -783,7 +783,7 @@ impl IoUring {
         let fd = sqe.fd;
         let length = sqe.off as i64;
 
-        crate::fs::syscall::sys_ftruncate(fd, length) as i32
+        crate::fs::syscall::sys_ftruncate(fd, length).ret() as i32
     }
 
     /// Wait for completions

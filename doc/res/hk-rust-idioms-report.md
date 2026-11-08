@@ -27,7 +27,8 @@ Order: 2 goes per subsystem (M1); let-else is done and linted
   `Option::ok_or`, `is_none_or` (1.82) and let-else (1.65). The point is that 257+
   `sys_*` fns return a bare `i64`, so `?` can't be used in any of them.
 - **Done:** net/ (its 18 `sys_*` return `KernelResult` and take `UserPtr`); fs/
-  read/write, vectored I/O, splice/tee/vmsplice/sendfile/copy_file_range.
+  read/write, vectored I/O, splice/tee/vmsplice/sendfile/copy_file_range,
+  open/close/dup/fcntl/pipe/truncate.
 - **Evidence (counts):**
   - 81 x `let v = match f() { Ok(v) => v, Err(e) => return e.sysret(), };` (4 lines)
   - 22 x `if let Err(e) = f() { return e.sysret(); }` (3 lines)

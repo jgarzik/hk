@@ -10,6 +10,7 @@
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::syscall::Sys;
+use crate::uaccess::UserPtr;
 use crate::util::error::SysRet;
 
 use super::cpu::{KERNEL_CODE_SELECTOR, USER_DATA_SELECTOR};
@@ -794,10 +795,11 @@ pub fn x86_64_syscall_dispatch(
         SYS_MKDIR => crate::fs::syscall::sys_mkdir(args[0], args[1] as u32).ret() as u64,
         SYS_MKNOD => crate::fs::syscall::sys_mknod(args[0], args[1] as u32, args[2]).ret() as u64,
         SYS_OPEN => {
-            crate::fs::syscall::sys_open(args[0], args[1] as u32, args[2] as u32).ret() as u64
+            crate::fs::syscall::sys_open(UserPtr::new(args[0]), args[1] as u32, args[2] as u32)
+                .ret() as u64
         }
         SYS_PAUSE => crate::signal::syscall::sys_pause().ret() as u64,
-        SYS_PIPE => crate::fs::syscall::sys_pipe(args[0]).ret() as u64,
+        SYS_PIPE => crate::fs::syscall::sys_pipe(UserPtr::new(args[0])).ret() as u64,
         SYS_POLL => {
             crate::fs::syscall::sys_poll(args[0], args[1] as u32, args[2] as i32).ret() as u64
         }

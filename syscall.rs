@@ -722,9 +722,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Newfstatat => {
             crate::fs::stat::sys_fstatat(a[0] as i32, a[1], a[2], a[3] as i32).ret() as u64
         }
-        Sys::Openat => {
-            crate::fs::syscall::sys_openat(a[0] as i32, a[1], a[2] as u32, a[3] as u32).ret() as u64
-        }
+        Sys::Openat => crate::fs::syscall::sys_openat(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as u32,
+            a[3] as u32,
+        )
+        .ret() as u64,
         Sys::PerfEventOpen => KernelError::OperationNotSupported.sysret() as u64,
         Sys::Personality => crate::task::syscall::sys_personality(a[0] as u32).ret() as u64,
         Sys::PidfdGetfd => {
@@ -738,7 +742,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::syscall::sys_pidfd_send_signal(a[0] as i32, a[1] as i32, a[2], a[3] as u32)
                 as u64
         }
-        Sys::Pipe2 => crate::fs::syscall::sys_pipe2(a[0], a[1] as u32).ret() as u64,
+        Sys::Pipe2 => crate::fs::syscall::sys_pipe2(UserPtr::new(a[0]), a[1] as u32).ret() as u64,
         Sys::PivotRoot => crate::fs::syscall::sys_pivot_root(a[0], a[1]).ret() as u64,
         Sys::Ppoll => {
             crate::fs::syscall::sys_ppoll(a[0], a[1] as u32, a[2], a[3], a[4]).ret() as u64
@@ -1178,7 +1182,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Tkill => {
             crate::signal::syscall::sys_tkill(i64::from(a[0] as i32), a[1] as u32).ret() as u64
         }
-        Sys::Truncate => crate::fs::syscall::sys_truncate(a[0], a[1] as i64).ret() as u64,
+        Sys::Truncate => {
+            crate::fs::syscall::sys_truncate(UserPtr::new(a[0]), a[1] as i64).ret() as u64
+        }
         Sys::Umask => crate::fs::syscall::sys_umask(a[0] as u32).ret() as u64,
         Sys::Umount2 => crate::fs::syscall::sys_umount2(a[0], a[1] as i32).ret() as u64,
         Sys::Uname => crate::ns::uts::sys_uname(UserPtr::new(a[0])).ret() as u64,

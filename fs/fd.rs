@@ -8,14 +8,15 @@
 
 use alloc::sync::Arc;
 
-use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags};
 use crate::task::percpu::current_tid;
-use crate::uaccess::{copy_val_from_user, copy_val_to_user, put_user};
+use crate::uaccess::UserPtr;
+use crate::util::error::KernelResult;
 
 use super::file::File;
+use super::io::fget;
 use super::posix_lock::{Flock, posix_getlk, posix_setlk, posix_setlkw};
-use super::syscall::{current_fd_table, get_nofile_limit};
+use super::syscall::{current_fd_table, fd_err, get_nofile_limit};
 
 // =============================================================================
 // truncate, ftruncate syscalls
@@ -25,7 +26,7 @@ use super::syscall::{current_fd_table, get_nofile_limit};
 /// `times` (ftruncate: Linux ATTR_MTIME | ATTR_CTIME): mtime and ctime
 /// are set even when the size stays; without it only a size change
 /// sets them (the file system's setattr, as ext4, tmpfs and vfat).
-fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> i64 {
+fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> KernelResult<()> {
     // Check RLIMIT_FSIZE when extending the file
     let current_size = inode.get_size();
     // RLIMIT_FSIZE (SIGXFSZ), then the filesystem's largest file (Linux
@@ -35,19 +36,16 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> i64 {
         if limit != crate::task::rlimit::RLIM_INFINITY && length > limit {
             let tid = current_tid();
             crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
-            return KernelError::FileTooLarge.sysret();
+            return Err(KernelError::FileTooLarge);
         }
         if length > inode.maxbytes() {
-            return KernelError::FileTooLarge.sysret();
+            return Err(KernelError::FileTooLarge);
         }
     }
 
     // Write access first (Linux vfs_truncate / do_sys_ftruncate):
     // ETXTBSY while the file runs
-    let _w = match inode.get_write_access() {
-        Ok(w) => w,
-        Err(e) => return e.sysret(),
-    };
+    let _w = inode.get_write_access()?;
     // Under i_rwsem, like Linux do_truncate: atomic with writes; an
     // active swap area (set by swapon under i_rwsem) is ETXTBSY
     let lock = inode.lock();
@@ -65,15 +63,12 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> i64 {
         })
     };
     drop(lock);
-    match r {
-        Ok(()) => 0,
-        Err(KernelError::IsDirectory) => KernelError::IsDirectory.sysret(),
-        Err(KernelError::OperationNotSupported) => KernelError::InvalidArgument.sysret(),
-        Err(KernelError::PermissionDenied) => KernelError::PermissionDenied.sysret(),
-        Err(KernelError::FileTooLarge) => KernelError::FileTooLarge.sysret(),
-        Err(KernelError::TextBusy) => KernelError::TextBusy.sysret(),
-        Err(_) => KernelError::InvalidArgument.sysret(),
-    }
+    // A file system without truncate: EINVAL; else its own error (Linux
+    // do_truncate returns notify_change's)
+    r.map_err(|e| match e {
+        KernelError::OperationNotSupported => KernelError::InvalidArgument,
+        e => e,
+    })
 }
 
 /// sys_ftruncate - truncate a file to a specified length
@@ -86,26 +81,16 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> i64 {
 /// * `fd` - File descriptor (must be open for writing)
 /// * `length` - New file length
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
+pub fn sys_ftruncate(fd: i32, length: i64) -> KernelResult<()> {
     if length < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Get file from fd table
-    let Some(file) = current_fd_table().lock().get(fd) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Get the inode
-    let Some(inode) = file.get_inode() else {
-        return KernelError::BadFd.sysret();
-    };
+    let file = fget(fd)?;
+    let inode = file.get_inode().ok_or(KernelError::BadFd)?;
 
     // Linux do_ftruncate: a regular file open for writing, else EINVAL
     if !file.is_writable() || !inode.mode().is_file() {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     do_truncate(&inode, length as u64, true)
@@ -117,55 +102,31 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
 /// * `path_ptr` - User pointer to path string
 /// * `length` - New file length
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
+pub fn sys_truncate(path_ptr: UserPtr<u8>, length: i64) -> KernelResult<()> {
     if length < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Read path from user space
-    let path = match crate::fs::namei::getname(path_ptr, false) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
-
-    if path.is_empty() {
-        return KernelError::NotFound.sysret();
-    }
+    let path = crate::fs::namei::getname(path_ptr.addr(), false)?;
 
     // Look up the file (follow symlinks for truncate)
-    let fpath = match crate::fs::namei::path_lookupat(
+    let fpath = crate::fs::namei::path_lookupat(
         crate::task::percpu::current_cwd(),
         &path,
         LookupFlags::open(),
-    ) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
-    let dentry = fpath.dentry.clone();
-
-    // Get the inode
-    let Some(inode) = dentry.get_inode() else {
-        return KernelError::NotFound.sysret();
-    };
+    )?;
+    let inode = fpath.dentry.get_inode().ok_or(KernelError::NotFound)?;
 
     // vfs_truncate: EISDIR / EINVAL, write access (EROFS), write
     // permission, then set-id removal
     let m = inode.mode();
     if m.is_dir() {
-        return KernelError::IsDirectory.sysret();
+        return Err(KernelError::IsDirectory);
     }
     if !m.is_file() {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    let _w = match fpath.mnt.want_write() {
-        Ok(w) => w,
-        Err(e) => return e.sysret(),
-    };
-    if let Err(e) = super::dac::may_truncate(&inode) {
-        return e.sysret();
-    }
+    let _w = fpath.mnt.want_write()?;
+    super::dac::may_truncate(&inode)?;
     do_truncate(&inode, length as u64, false)
 }
 
@@ -182,19 +143,14 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
 /// * `oldfd` - File descriptor to duplicate
 ///
 /// # Returns
-/// New file descriptor on success, negative errno on error.
-pub fn sys_dup(oldfd: i32) -> i64 {
+/// The new file descriptor
+pub fn sys_dup(oldfd: i32) -> KernelResult<i32> {
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
-    let Some(file) = table.get(oldfd) else {
-        return KernelError::BadFd.sysret();
-    };
+    let file = table.get(oldfd).ok_or(KernelError::BadFd)?;
 
     // Allocate fd (RLIMIT_NOFILE enforced inside alloc)
-    match table.alloc(file, get_nofile_limit()) {
-        Ok(newfd) => i64::from(newfd),
-        Err(e) => -i64::from(e),
-    }
+    table.alloc(file, get_nofile_limit()).map_err(fd_err)
 }
 
 /// sys_dup2 - duplicate a file descriptor to a specific number
@@ -207,16 +163,14 @@ pub fn sys_dup(oldfd: i32) -> i64 {
 /// * `newfd` - Target file descriptor number
 ///
 /// # Returns
-/// newfd on success, negative errno on error.
-pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
+/// newfd
+pub fn sys_dup2(oldfd: i32, newfd: i32) -> KernelResult<i32> {
     // If oldfd == newfd, just verify oldfd is valid
     if oldfd == newfd {
-        let fd_table = current_fd_table();
-        let table = fd_table.lock();
-        return if table.is_valid(oldfd) {
-            i64::from(newfd)
+        return if current_fd_table().lock().is_valid(oldfd) {
+            Ok(newfd)
         } else {
-            KernelError::BadFd.sysret()
+            Err(KernelError::BadFd)
         };
     }
     dup_to(oldfd, newfd, 0)
@@ -233,15 +187,12 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
 /// * `flags` - Flags (only O_CLOEXEC supported)
 ///
 /// # Returns
-/// newfd on success, negative errno on error.
-pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
-    // Only O_CLOEXEC is valid for dup3
-    if flags & !super::file::flags::O_CLOEXEC != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-    // dup3 requires oldfd != newfd (unlike dup2)
-    if oldfd == newfd {
-        return KernelError::InvalidArgument.sysret();
+/// newfd
+pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> KernelResult<i32> {
+    // Only O_CLOEXEC is valid for dup3; dup3 requires oldfd != newfd
+    // (unlike dup2)
+    if flags & !super::file::flags::O_CLOEXEC != 0 || oldfd == newfd {
+        return Err(KernelError::InvalidArgument);
     }
     let fd_flags = if flags & super::file::flags::O_CLOEXEC != 0 {
         crate::task::FD_CLOEXEC
@@ -254,29 +205,26 @@ pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
 /// Make `newfd` a copy of `oldfd` (Linux ksys_dup3 + do_dup2): a newfd
 /// at or past RLIMIT_NOFILE or fs.nr_open is EBADF, and every check,
 /// including room for newfd, comes before newfd is closed
-fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> i64 {
+fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> KernelResult<i32> {
     let nofile = get_nofile_limit();
     // Linux takes newfd unsigned: a negative one is past any limit
     if u64::from(newfd as u32) >= nofile {
-        return KernelError::BadFd.sysret();
+        return Err(KernelError::BadFd);
     }
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
     let room = table.expand(newfd);
-    let Some(file) = table.get(oldfd) else {
-        return KernelError::BadFd.sysret();
-    };
-    match room {
-        Ok(()) => {}
-        // Past fs.nr_open: EBADF, not EMFILE (Linux ksys_dup3)
-        Err(e) if e == KernelError::ProcessFileLimit.errno() => return KernelError::BadFd.sysret(),
-        Err(e) => return -i64::from(e),
-    }
+    let file = table.get(oldfd).ok_or(KernelError::BadFd)?;
+    // Past fs.nr_open: EBADF, not EMFILE (Linux ksys_dup3)
+    room.map_err(|e| match fd_err(e) {
+        KernelError::ProcessFileLimit => KernelError::BadFd,
+        e => e,
+    })?;
     table.close(newfd);
-    match table.alloc_at_with_flags(newfd, file, fd_flags, nofile) {
-        Ok(()) => i64::from(newfd),
-        Err(e) => -i64::from(e),
-    }
+    table
+        .alloc_at_with_flags(newfd, file, fd_flags, nofile)
+        .map_err(fd_err)?;
+    Ok(newfd)
 }
 
 // =============================================================================
@@ -296,7 +244,7 @@ fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> i64 {
 /// * 0 on success
 /// * -EFAULT if pipefd is invalid
 /// * -EMFILE if too many file descriptors
-pub fn sys_pipe(pipefd: u64) -> i64 {
+pub fn sys_pipe(pipefd: UserPtr<[i32; 2]>) -> KernelResult<()> {
     sys_pipe2(pipefd, 0)
 }
 
@@ -313,25 +261,22 @@ pub fn sys_pipe(pipefd: u64) -> i64 {
 /// * -EFAULT if pipefd is invalid
 /// * -EINVAL if invalid flags
 /// * -EMFILE if too many file descriptors
-pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
+pub fn sys_pipe2(pipefd: UserPtr<[i32; 2]>, flags: u32) -> KernelResult<()> {
     use crate::fs::file::flags::{O_CLOEXEC, O_NONBLOCK};
     use crate::io::pipe::{FD_CLOEXEC, create_pipe};
 
     // Validate flags - only O_CLOEXEC and O_NONBLOCK are allowed
     const VALID_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
     if flags & !VALID_FLAGS != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate user pointer
-    if pipefd == 0 {
-        return KernelError::BadAddress.sysret();
+    if pipefd.is_null() {
+        return Err(KernelError::BadAddress);
     }
 
-    // Create the pipe
-    let Ok((read_file, write_file)) = create_pipe(flags & O_NONBLOCK) else {
-        return KernelError::OutOfMemory.sysret();
-    };
+    let (read_file, write_file) = create_pipe(flags & O_NONBLOCK)?;
 
     // Allocate file descriptors (RLIMIT_NOFILE enforced inside alloc)
     // Following Linux pattern: each get_unused_fd_flags() call checks limit
@@ -346,33 +291,29 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
         0
     };
 
-    let read_fd = match table.alloc_with_flags(read_file, fd_flags, nofile) {
-        Ok(fd) => fd,
-        Err(e) => return -i64::from(e),
-    };
+    let read_fd = table
+        .alloc_with_flags(read_file, fd_flags, nofile)
+        .map_err(fd_err)?;
 
     let write_fd = match table.alloc_with_flags(write_file, fd_flags, nofile) {
         Ok(fd) => fd,
         Err(e) => {
             // Clean up read fd on failure
             table.close(read_fd);
-            return -i64::from(e);
+            return Err(fd_err(e));
         }
     };
 
     drop(table);
 
     // Write file descriptors to user space
-    match put_user::<Uaccess, [i32; 2]>(pipefd, [read_fd, write_fd]) {
-        Ok(()) => 0,
-        Err(_) => {
-            // Clean up on error
-            let mut table = fd_table.lock();
-            table.close(read_fd);
-            table.close(write_fd);
-            KernelError::BadAddress.sysret()
-        }
-    }
+    pipefd.write(&[read_fd, write_fd]).map_err(|e| {
+        // Clean up on error
+        let mut table = fd_table.lock();
+        table.close(read_fd);
+        table.close(write_fd);
+        e.into()
+    })
 }
 
 // =============================================================================
@@ -418,181 +359,102 @@ fn setlk_recheck(fd: i32, file: &Arc<crate::fs::File>, flock: &Flock, range: (u6
 
 /// sys_fcntl - file control operations
 ///
-/// Performs various operations on file descriptors.
-///
-/// # Arguments
-/// * `fd` - File descriptor to operate on
-/// * `cmd` - Operation to perform (F_DUPFD, F_GETFD, etc.)
-/// * `arg` - Optional argument (meaning depends on cmd)
-///
 /// # Returns
-/// * F_DUPFD/F_DUPFD_CLOEXEC: new fd on success
+/// * F_DUPFD/F_DUPFD_CLOEXEC: the new fd
 /// * F_GETFD: fd flags (FD_CLOEXEC)
 /// * F_GETFL: file status flags
-/// * F_SETFD/F_SETFL: 0 on success
-/// * negative errno on error
-pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
+/// * F_GETOWN: the owner (a process group negative)
+/// * others: 0
+pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
     use fcntl_cmd::*;
 
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
 
-    let nofile = get_nofile_limit();
-
     match cmd {
-        F_DUPFD => {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
             // Duplicate fd to lowest available >= arg
-            let Some(file) = table.get(fd) else {
-                return KernelError::BadFd.sysret();
-            };
+            let file = table.get(fd).ok_or(KernelError::BadFd)?;
+            let nofile = get_nofile_limit();
             let min_fd = arg as i32;
-            if min_fd < 0 {
-                return KernelError::InvalidArgument.sysret();
-            }
             // Linux: if (from >= nofile) return -EINVAL
-            if (min_fd as u64) >= nofile {
-                return KernelError::InvalidArgument.sysret();
+            if min_fd < 0 || (min_fd as u64) >= nofile {
+                return Err(KernelError::InvalidArgument);
             }
-            // RLIMIT_NOFILE enforced inside alloc_at_or_above
-            match table.alloc_at_or_above(file, min_fd, 0, nofile) {
-                Ok(new_fd) => i64::from(new_fd),
-                Err(e) => -i64::from(e),
-            }
-        }
-
-        F_DUPFD_CLOEXEC => {
-            // Duplicate fd with FD_CLOEXEC set
-            let Some(file) = table.get(fd) else {
-                return KernelError::BadFd.sysret();
+            let fl = if cmd == F_DUPFD_CLOEXEC {
+                crate::task::FD_CLOEXEC
+            } else {
+                0
             };
-            let min_fd = arg as i32;
-            if min_fd < 0 {
-                return KernelError::InvalidArgument.sysret();
-            }
-            // Linux: if (from >= nofile) return -EINVAL
-            if (min_fd as u64) >= nofile {
-                return KernelError::InvalidArgument.sysret();
-            }
             // RLIMIT_NOFILE enforced inside alloc_at_or_above
-            match table.alloc_at_or_above(file, min_fd, crate::task::FD_CLOEXEC, nofile) {
-                Ok(new_fd) => i64::from(new_fd),
-                Err(e) => -i64::from(e),
-            }
+            let new_fd = table
+                .alloc_at_or_above(file, min_fd, fl, nofile)
+                .map_err(fd_err)?;
+            Ok(i64::from(new_fd))
         }
 
         F_GETFD => {
             // Get fd flags (FD_CLOEXEC)
             if !table.is_valid(fd) {
-                return KernelError::BadFd.sysret();
+                return Err(KernelError::BadFd);
             }
-            i64::from(table.get_fd_flags(fd))
+            Ok(i64::from(table.get_fd_flags(fd)))
         }
 
         F_SETFD => {
             // Set fd flags (only FD_CLOEXEC is valid)
             if !table.set_fd_flags(fd, arg as u32) {
-                return KernelError::BadFd.sysret();
+                return Err(KernelError::BadFd);
             }
-            0
+            Ok(0)
         }
 
         F_GETFL => {
-            // Get file status flags
-            let Some(file) = table.get(fd) else {
-                return KernelError::BadFd.sysret();
-            };
-            i64::from(file.get_flags())
+            let file = table.get(fd).ok_or(KernelError::BadFd)?;
+            Ok(i64::from(file.get_flags()))
         }
 
         F_SETFL => {
-            let Some(file) = table.get(fd) else {
-                return KernelError::BadFd.sysret();
-            };
+            let file = table.get(fd).ok_or(KernelError::BadFd)?;
             // ->fasync takes sleeping locks
             drop(table);
-            match setfl(fd, &file, arg as u32) {
-                Ok(()) => 0,
-                Err(e) => e.sysret(),
-            }
+            setfl(fd, &file, arg as u32)?;
+            Ok(0)
         }
 
         F_GETLK => {
             // Get lock info - test if a lock would block
-            let Some(file) = table.get(fd) else {
-                return KernelError::BadFd.sysret();
-            };
+            let file = table.get(fd).ok_or(KernelError::BadFd)?;
             drop(table); // Release FD table lock before copying
-
-            // Copy flock from user
-            let Ok(mut flock) = copy_val_from_user::<Uaccess, Flock>(arg) else {
-                return KernelError::BadAddress.sysret();
-            };
-
-            // Do the getlk
-            if let Err(e) = posix_getlk(&file, &mut flock) {
-                return e.sysret();
-            }
-
-            // Copy result back
-            if copy_val_to_user::<Uaccess, Flock>(arg, &flock).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-
-            0
+            let uflock = UserPtr::<Flock>::new(arg);
+            let mut flock = uflock.read()?;
+            posix_getlk(&file, &mut flock)?;
+            uflock.write(&flock)?;
+            Ok(0)
         }
 
-        F_SETLK => {
-            // Set lock (non-blocking)
-            let Some(file) = table.get(fd) else {
-                return KernelError::BadFd.sysret();
-            };
+        F_SETLK | F_SETLKW => {
+            // F_SETLKW: blocking - but we don't actually block, like flock
+            let file = table.get(fd).ok_or(KernelError::BadFd)?;
             drop(table);
-
-            // Copy flock from user
-            let Ok(flock) = copy_val_from_user::<Uaccess, Flock>(arg) else {
-                return KernelError::BadAddress.sysret();
+            let flock = UserPtr::<Flock>::new(arg).read()?;
+            let range = if cmd == F_SETLK {
+                posix_setlk(&file, &flock)?
+            } else {
+                posix_setlkw(&file, &flock)?
             };
-
-            match posix_setlk(&file, &flock) {
-                Ok(range) => {
-                    setlk_recheck(fd, &file, &flock, range);
-                    0
-                }
-                Err(e) => e.sysret(),
-            }
-        }
-
-        F_SETLKW => {
-            // Set lock (blocking - but we don't actually block, like flock)
-            let Some(file) = table.get(fd) else {
-                return KernelError::BadFd.sysret();
-            };
-            drop(table);
-
-            // Copy flock from user
-            let Ok(flock) = copy_val_from_user::<Uaccess, Flock>(arg) else {
-                return KernelError::BadAddress.sysret();
-            };
-
-            match posix_setlkw(&file, &flock) {
-                Ok(range) => {
-                    setlk_recheck(fd, &file, &flock, range);
-                    0
-                }
-                Err(e) => e.sysret(),
-            }
+            setlk_recheck(fd, &file, &flock, range);
+            Ok(0)
         }
 
         F_SETOWN | F_GETOWN | F_SETOWN_EX | F_GETOWN_EX | F_SETSIG | F_GETSIG => {
-            let Some(file) = table.get(fd) else {
-                return KernelError::BadFd.sysret();
-            };
+            let file = table.get(fd).ok_or(KernelError::BadFd)?;
             // They allocate and copy to and from the user
             drop(table);
             fcntl_owner(&file, cmd, arg)
         }
 
-        _ => KernelError::InvalidArgument.sysret(),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
 
@@ -621,19 +483,16 @@ fn setfl(fd: i32, file: &File, arg: u32) -> Result<(), KernelError> {
 
 /// The SIGIO owner commands (Linux do_fcntl); F_GETOWN of a process
 /// group is negative, returned as a value, not an error
-fn fcntl_owner(file: &File, cmd: i32, arg: u64) -> i64 {
+fn fcntl_owner(file: &File, cmd: i32, arg: u64) -> KernelResult<i64> {
     use crate::io::fasync;
     use fcntl_cmd::*;
-    let r = match cmd {
-        F_SETOWN => fasync::f_setown(file, arg as i32, true),
-        F_GETOWN => return i64::from(fasync::f_getown(file)),
-        F_SETOWN_EX => fasync::f_setown_ex(file, arg),
-        F_GETOWN_EX => fasync::f_getown_ex(file, arg),
-        F_SETSIG => fasync::f_setsig(file, arg),
-        _ => return i64::from(fasync::f_getsig(file)),
-    };
-    match r {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
+    match cmd {
+        F_SETOWN => fasync::f_setown(file, arg as i32, true)?,
+        F_GETOWN => return Ok(i64::from(fasync::f_getown(file))),
+        F_SETOWN_EX => fasync::f_setown_ex(file, arg)?,
+        F_GETOWN_EX => fasync::f_getown_ex(file, arg)?,
+        F_SETSIG => fasync::f_setsig(file, arg)?,
+        _ => return Ok(i64::from(fasync::f_getsig(file))),
     }
+    Ok(0)
 }
