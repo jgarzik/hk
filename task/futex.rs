@@ -912,9 +912,9 @@ pub fn exit_robust_list(tid: Tid) {
         }
     };
 
-    let head_addr = match head_addr {
-        Some(addr) => addr,
-        None => return, // No robust list registered
+    let Some(head_addr) = head_addr else {
+        // No robust list registered
+        return;
     };
 
     // The robust list head, read whole (Linux fetch_robust_entry and

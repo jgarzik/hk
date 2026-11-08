@@ -782,9 +782,8 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
         Err(e) => return e,
     };
 
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::ProcessFileLimit.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::ProcessFileLimit.sysret();
     };
 
     let fd_flags = if oflag & O_CLOEXEC != 0 {
@@ -859,20 +858,17 @@ pub fn sys_mq_timedsend(
     }
 
     // Get file from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
 
-    let file = match fd_table.lock().get(mqdes) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(mqdes) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get MqFileOps from file
-    let mq_ops = match mq_of(&file) {
-        Some(ops) => ops,
-        None => return KernelError::BadFd.sysret(),
+    let Some(mq_ops) = mq_of(&file) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Check write permission
@@ -919,20 +915,17 @@ pub fn sys_mq_timedreceive(
     abs_timeout: u64,
 ) -> i64 {
     // Get file from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
 
-    let file = match fd_table.lock().get(mqdes) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(mqdes) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get MqFileOps from file
-    let mq_ops = match mq_of(&file) {
-        Some(ops) => ops,
-        None => return KernelError::BadFd.sysret(),
+    let Some(mq_ops) = mq_of(&file) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Check read permission
@@ -977,20 +970,17 @@ pub fn sys_mq_timedreceive(
 /// mq_notify - register for notification
 pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     // Get file from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
 
-    let file = match fd_table.lock().get(mqdes) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(mqdes) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get MqFileOps from file
-    let mq_ops = match mq_of(&file) {
-        Some(ops) => ops,
-        None => return KernelError::BadFd.sysret(),
+    let Some(mq_ops) = mq_of(&file) else {
+        return KernelError::BadFd.sysret();
     };
 
     let current_pid = crate::task::percpu::current_pid();
@@ -1052,20 +1042,17 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
 /// mq_getsetattr - get/set message queue attributes
 pub fn sys_mq_getsetattr(mqdes: i32, newattr_ptr: u64, oldattr_ptr: u64) -> i64 {
     // Get file from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
 
-    let file = match fd_table.lock().get(mqdes) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(mqdes) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get MqFileOps from file
-    let mq_ops = match mq_of(&file) {
-        Some(ops) => ops,
-        None => return KernelError::BadFd.sysret(),
+    let Some(mq_ops) = mq_of(&file) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get old attributes if requested

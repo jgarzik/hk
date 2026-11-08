@@ -525,9 +525,8 @@ fn fmt_stat(
 /// mmap_lock not held; what could be read, at most ARGS_MAX bytes
 fn read_remote(mm: &Mm, start: u64, end: u64) -> Vec<u8> {
     let len = end.saturating_sub(start).min(ARGS_MAX) as usize;
-    let mut buf = match crate::util::kmem::try_vec(len, 0u8) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
+    let Ok(mut buf) = crate::util::kmem::try_vec(len, 0u8) else {
+        return Vec::new();
     };
     let n = crate::mm::remote::access_remote_vm_read(mm, start, &mut buf, true).unwrap_or(0);
     buf.truncate(n);

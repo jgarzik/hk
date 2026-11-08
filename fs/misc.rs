@@ -634,9 +634,8 @@ fn do_setxattr(
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(name) = strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Validate name length
@@ -670,9 +669,8 @@ fn do_setxattr(
     };
     let dentry = fpath.dentry.clone();
 
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
+    let Some(inode) = dentry.get_inode() else {
+        return KernelError::NotFound.sysret();
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
@@ -699,15 +697,13 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
     }
 
     // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = current_fd_table().lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(name) = strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Validate name length
@@ -721,9 +717,8 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
         Err(e) => return e,
     };
 
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
+    let Some(inode) = file.get_inode() else {
+        return KernelError::BadFd.sysret();
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
@@ -776,9 +771,8 @@ fn do_getxattr(
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(name) = strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Validate name length
@@ -801,9 +795,8 @@ fn do_getxattr(
         Err(e) => return e.sysret(),
     };
 
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
+    let Some(inode) = dentry.get_inode() else {
+        return KernelError::NotFound.sysret();
     };
 
     if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_READ) {
@@ -849,15 +842,13 @@ fn do_getxattr(
 /// sys_fgetxattr - get an extended attribute value from a file descriptor
 pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
     // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = current_fd_table().lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(name) = strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Validate name length
@@ -865,9 +856,8 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
         return KernelError::Range.sysret();
     }
 
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
+    let Some(inode) = file.get_inode() else {
+        return KernelError::BadFd.sysret();
     };
 
     if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_READ) {
@@ -951,9 +941,8 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
         Err(e) => return e.sysret(),
     };
 
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
+    let Some(inode) = dentry.get_inode() else {
+        return KernelError::NotFound.sysret();
     };
 
     // If size is 0, query the size needed
@@ -992,14 +981,12 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
 /// sys_flistxattr - list extended attribute names from a file descriptor
 pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
     // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = current_fd_table().lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
+    let Some(inode) = file.get_inode() else {
+        return KernelError::BadFd.sysret();
     };
 
     // If size is 0, query the size needed
@@ -1061,9 +1048,8 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(name) = strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Validate name length
@@ -1091,9 +1077,8 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
     };
     let dentry = fpath.dentry.clone();
 
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
+    let Some(inode) = dentry.get_inode() else {
+        return KernelError::NotFound.sysret();
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
@@ -1115,15 +1100,13 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
 /// sys_fremovexattr - remove an extended attribute from a file descriptor
 pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
     // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = current_fd_table().lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(name) = strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Validate name length
@@ -1131,9 +1114,8 @@ pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
         return KernelError::Range.sysret();
     }
 
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
+    let Some(inode) = file.get_inode() else {
+        return KernelError::BadFd.sysret();
     };
 
     // setxattr/removexattr: write access first (EROFS), held across

@@ -381,9 +381,8 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
         }
         P_PIDFD => {
             // id is a file descriptor - get the PID from the pidfd
-            let fd_table = match super::fdtable::get_task_fd(current_tid) {
-                Some(table) => table,
-                None => return KernelError::NoProcess.sysret(),
+            let Some(fd_table) = super::fdtable::get_task_fd(current_tid) else {
+                return KernelError::NoProcess.sysret();
             };
             let file = {
                 let table = fd_table.lock();

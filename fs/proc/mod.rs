@@ -1477,12 +1477,9 @@ fn get_task_cgroup_path(t: &TaskRef) -> String {
     // Get the task's cgroup
     let task_cgroup = t.cgroup.lock().clone();
 
-    let cgroup = match task_cgroup {
-        Some(cg) => cg,
-        None => {
-            // Task not in any cgroup - return root
-            return String::from("/");
-        }
+    let Some(cgroup) = task_cgroup else {
+        // Task not in any cgroup - return root
+        return String::from("/");
     };
 
     // Get the task's cgroup namespace

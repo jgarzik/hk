@@ -61,9 +61,8 @@ pub fn sys_chdir(path_ptr: u64) -> i64 {
 /// 0 on success, negative errno on error.
 pub fn sys_fchdir(fd: i32) -> i64 {
     // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = current_fd_table().lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Must be a searchable directory
@@ -147,9 +146,8 @@ pub fn sys_chroot(path_ptr: u64) -> i64 {
 /// - ERANGE: Buffer too small for pathname
 pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
     // Get current task's filesystem context
-    let fs = match crate::task::percpu::current_fs() {
-        Some(fs) => fs,
-        None => return KernelError::NotFound.sysret(),
+    let Some(fs) = crate::task::percpu::current_fs() else {
+        return KernelError::NotFound.sysret();
     };
 
     // Linux getcwd: ENOENT for a removed directory; one outside the

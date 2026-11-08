@@ -207,13 +207,11 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
         KCMP_FILE => {
             // Compare specific file descriptors; the tables are locked
             // after task_lock is dropped
-            let ptr1 = match fd_key(&t1, idx1) {
-                Some(p) => p,
-                None => return KernelError::BadFd.sysret(),
+            let Some(ptr1) = fd_key(&t1, idx1) else {
+                return KernelError::BadFd.sysret();
             };
-            let ptr2 = match fd_key(&t2, idx2) {
-                Some(p) => p,
-                None => return KernelError::BadFd.sysret(),
+            let Some(ptr2) = fd_key(&t2, idx2) else {
+                return KernelError::BadFd.sysret();
             };
             kcmp_ptr(ptr1, ptr2, KCMP_FILE)
         }

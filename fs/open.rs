@@ -232,12 +232,9 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
 /// Give init /dev/console as stdin, stdout and stderr (Linux
 /// console_on_rootfs); call in init's context before it runs
 pub fn console_on_rootfs() {
-    let file = match filp_open(AT_FDCWD, b"/dev/console", O_RDWR, 0) {
-        Ok(f) => f,
-        Err(_) => {
-            crate::printkln!("Warning: unable to open an initial console.");
-            return;
-        }
+    let Ok(file) = filp_open(AT_FDCWD, b"/dev/console", O_RDWR, 0) else {
+        crate::printkln!("Warning: unable to open an initial console.");
+        return;
     };
     let table = current_fd_table();
     let mut t = table.lock();

@@ -45,21 +45,18 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
     }
 
     // Copy type string from userspace
-    let type_name = match strncpy_from_user_str::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(type_name) = strncpy_from_user_str::<Uaccess>(type_ptr, MAX_TYPE_LEN) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Copy description from userspace
-    let description = match strncpy_from_user_str::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(description) = strncpy_from_user_str::<Uaccess>(desc_ptr, MAX_DESC_LEN) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Look up the key type
-    let key_type = match get_key_type(&type_name) {
-        Some(kt) => kt,
-        None => return KernelError::InvalidArgument.sysret(),
+    let Some(key_type) = get_key_type(&type_name) else {
+        return KernelError::InvalidArgument.sysret();
     };
 
     // Copy payload from userspace (if any)
@@ -162,15 +159,13 @@ pub fn sys_request_key(
     dest_keyring: i32,
 ) -> i64 {
     // Copy type string from userspace
-    let type_name = match strncpy_from_user_str::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(type_name) = strncpy_from_user_str::<Uaccess>(type_ptr, MAX_TYPE_LEN) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Copy description from userspace
-    let description = match strncpy_from_user_str::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(description) = strncpy_from_user_str::<Uaccess>(desc_ptr, MAX_DESC_LEN) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Get current credentials

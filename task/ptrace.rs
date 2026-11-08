@@ -281,9 +281,8 @@ fn ptrace_traceme() -> i64 {
     let tid = percpu::current_tid();
 
     let mut table = TASKLIST.write();
-    let mut task = match table.get_mut(tid) {
-        Some(t) => t,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(mut task) = table.get_mut(tid) else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Already being traced?
@@ -306,9 +305,9 @@ fn ptrace_traceme() -> i64 {
 ///
 /// This sends SIGSTOP to the target and makes the caller the tracer.
 fn ptrace_attach(target_pid: Pid) -> i64 {
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     if attach_refused(target_tid) {
@@ -327,9 +326,8 @@ fn ptrace_attach(target_pid: Pid) -> i64 {
 
     {
         let mut table = TASKLIST.write();
-        let mut target = match table.get_mut(target_tid) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.sysret(),
+        let Some(mut target) = table.get_mut(target_tid) else {
+            return KernelError::NoProcess.sysret();
         };
 
         // Already being traced?
@@ -365,9 +363,9 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     if attach_refused(target_tid) {
@@ -386,9 +384,8 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
 
     {
         let mut table = TASKLIST.write();
-        let mut target = match table.get_mut(target_tid) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.sysret(),
+        let Some(mut target) = table.get_mut(target_tid) else {
+            return KernelError::NoProcess.sysret();
         };
 
         // Already being traced?
@@ -417,9 +414,9 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
 ///
 /// The tracee is continued with an optional signal.
 fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Verify we are the tracer
@@ -479,9 +476,9 @@ fn ptrace_wake(tid: Tid, sig: u32) {
 /// * `request` - PTRACE_CONT, PTRACE_SYSCALL, or PTRACE_SINGLESTEP
 /// * `signal` - Signal to inject (0 for none)
 fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Verify we are the tracer and tracee is stopped
@@ -492,9 +489,8 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
 
     {
         let mut table = TASKLIST.write();
-        let mut target = match table.get_mut(target_tid) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.sysret(),
+        let Some(mut target) = table.get_mut(target_tid) else {
+            return KernelError::NoProcess.sysret();
         };
 
         // Update ptrace flags based on request
@@ -535,17 +531,16 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
 
 /// PTRACE_KILL - kill a traced process (deprecated, use PTRACE_CONT with SIGKILL).
 fn ptrace_kill(target_pid: Pid) -> i64 {
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Verify we are the tracer
     {
         let table = TASKLIST.read();
-        let target = match table.get(target_tid) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.sysret(),
+        let Some(target) = table.get(target_tid) else {
+            return KernelError::NoProcess.sysret();
         };
 
         if !target.traced_by(&percpu::current()) {
@@ -583,9 +578,9 @@ fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
 
 /// Read a word from tracee's memory.
 fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Verify we are the tracer
@@ -595,9 +590,8 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     };
 
     // Get target's mm and page table
-    let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
-        Some(x) => x,
-        None => return KernelError::NoProcess.sysret(),
+    let Some((target_mm, _)) = get_target_mm_and_pt(target_tid) else {
+        return KernelError::NoProcess.sysret();
     };
     if !may_access_vm(&target_mm) {
         return KernelError::Io.sysret();
@@ -623,9 +617,9 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
 
 /// Write a word to tracee's memory.
 fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Verify we are the tracer
@@ -635,9 +629,8 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     };
 
     // Get target's mm and page table
-    let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
-        Some(x) => x,
-        None => return KernelError::NoProcess.sysret(),
+    let Some((target_mm, _)) = get_target_mm_and_pt(target_tid) else {
+        return KernelError::NoProcess.sysret();
     };
     if !may_access_vm(&target_mm) {
         return KernelError::Io.sysret();
@@ -663,9 +656,9 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Verify we are the tracer
@@ -676,9 +669,8 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
 
     {
         let mut table = TASKLIST.write();
-        let mut target = match table.get_mut(target_tid) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.sysret(),
+        let Some(mut target) = table.get_mut(target_tid) else {
+            return KernelError::NoProcess.sysret();
         };
 
         target.ptrace_options = options;
@@ -794,9 +786,9 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> i64 {
 }
 
 fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Verify we are the tracer
@@ -825,9 +817,9 @@ fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
 
 /// Get all general-purpose registers from tracee.
 fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Verify we are the tracer
@@ -850,9 +842,9 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
 
 /// Set all general-purpose registers for tracee.
 fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
-    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid())
+    else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Verify we are the tracer

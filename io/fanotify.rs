@@ -636,15 +636,13 @@ pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
     }
 
     // Create fanotify file
-    let file = match create_fanotify(init_flags, event_f_flags) {
-        Ok(f) => f,
-        Err(_) => return KernelError::OutOfMemory.sysret(),
+    let Ok(file) = create_fanotify(init_flags, event_f_flags) else {
+        return KernelError::OutOfMemory.sysret();
     };
 
     // Allocate fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::ProcessFileLimit.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::ProcessFileLimit.sysret();
     };
 
     let mut table = fd_table.lock();
@@ -678,21 +676,18 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
     use crate::task::percpu::current_tid;
 
     // Get fd table
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get fanotify file
-    let file = match fd_table.lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Verify it's a fanotify fd
-    let fanotify = match get_fanotify(&file) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fanotify) = get_fanotify(&file) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Determine operation

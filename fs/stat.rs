@@ -88,15 +88,13 @@ pub fn sys_fstat(fd: i32, statbuf: u64) -> i64 {
     }
 
     // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = current_fd_table().lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get the inode
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
+    let Some(inode) = file.get_inode() else {
+        return KernelError::BadFd.sysret();
     };
 
     // Fill the stat structure
@@ -344,15 +342,13 @@ pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
     }
 
     // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = current_fd_table().lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get superblock from file's dentry
-    let sb = match file.dentry.superblock() {
-        Some(sb) => sb,
-        None => return KernelError::BadFd.sysret(),
+    let Some(sb) = file.dentry.superblock() else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get stats

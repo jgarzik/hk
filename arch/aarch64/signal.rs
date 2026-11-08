@@ -286,9 +286,9 @@ pub fn setup_rt_frame(
     let user_regs = regs.x;
 
     // Get handler address
-    let handler = match action.handler {
-        SigHandler::Handler(addr) => addr,
-        _ => return Err(KernelError::InvalidArgument.to_errno_neg()), // not a handler
+    let SigHandler::Handler(handler) = action.handler else {
+        // not a handler
+        return Err(KernelError::InvalidArgument.to_errno_neg());
     };
 
     // The trampoline that calls rt_sigreturn: the handler's own, else

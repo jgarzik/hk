@@ -1233,9 +1233,8 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 
     // Allocate FD in current task's FD table
     let current_tid = super::percpu::current_tid();
-    let fd_table = match super::fdtable::get_task_fd(current_tid) {
-        Some(table) => table,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(fd_table) = super::fdtable::get_task_fd(current_tid) else {
+        return KernelError::NoProcess.sysret();
     };
 
     let mut table = fd_table.lock();
@@ -1286,9 +1285,8 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64
 
     // Get the file from FD table
     let current_tid = super::percpu::current_tid();
-    let fd_table = match super::fdtable::get_task_fd(current_tid) {
-        Some(table) => table,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(fd_table) = super::fdtable::get_task_fd(current_tid) else {
+        return KernelError::NoProcess.sysret();
     };
 
     let file = {
@@ -1410,9 +1408,8 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
 
     // Get caller's fd table and the pidfd file
     let caller_tid = super::percpu::current_tid();
-    let caller_fd_table = match super::fdtable::get_task_fd(caller_tid) {
-        Some(t) => t,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(caller_fd_table) = super::fdtable::get_task_fd(caller_tid) else {
+        return KernelError::NoProcess.sysret();
     };
 
     let pidfd_file = {
@@ -1437,9 +1434,9 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
     }
 
     // Get target's fd table
-    let target_fd_table = match super::fdtable::get_task_fd(target_tid) {
-        Some(t) => t,
-        None => return KernelError::NoProcess.sysret(), // Process exiting
+    let Some(target_fd_table) = super::fdtable::get_task_fd(target_tid) else {
+        // Process exiting
+        return KernelError::NoProcess.sysret();
     };
     // Its process still being that task, every lookup by tid above
     // found it (the tid is not freed while it is listed); else its

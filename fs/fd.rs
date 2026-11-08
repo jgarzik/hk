@@ -94,15 +94,13 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
     }
 
     // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = current_fd_table().lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get the inode
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
+    let Some(inode) = file.get_inode() else {
+        return KernelError::BadFd.sysret();
     };
 
     // Linux do_ftruncate: a regular file open for writing, else EINVAL
@@ -148,9 +146,8 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     let dentry = fpath.dentry.clone();
 
     // Get the inode
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
+    let Some(inode) = dentry.get_inode() else {
+        return KernelError::NotFound.sysret();
     };
 
     // vfs_truncate: EISDIR / EINVAL, write access (EROFS), write
@@ -189,9 +186,8 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
 pub fn sys_dup(oldfd: i32) -> i64 {
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
-    let file = match table.get(oldfd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = table.get(oldfd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Allocate fd (RLIMIT_NOFILE enforced inside alloc)
@@ -332,9 +328,8 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
     }
 
     // Create the pipe
-    let (read_file, write_file) = match create_pipe(flags & O_NONBLOCK) {
-        Ok((r, w)) => (r, w),
-        Err(_) => return KernelError::OutOfMemory.sysret(),
+    let Ok((read_file, write_file)) = create_pipe(flags & O_NONBLOCK) else {
+        return KernelError::OutOfMemory.sysret();
     };
 
     // Allocate file descriptors (RLIMIT_NOFILE enforced inside alloc)
@@ -446,9 +441,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
     match cmd {
         F_DUPFD => {
             // Duplicate fd to lowest available >= arg
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
+            let Some(file) = table.get(fd) else {
+                return KernelError::BadFd.sysret();
             };
             let min_fd = arg as i32;
             if min_fd < 0 {
@@ -467,9 +461,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
 
         F_DUPFD_CLOEXEC => {
             // Duplicate fd with FD_CLOEXEC set
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
+            let Some(file) = table.get(fd) else {
+                return KernelError::BadFd.sysret();
             };
             let min_fd = arg as i32;
             if min_fd < 0 {
@@ -504,9 +497,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
 
         F_GETFL => {
             // Get file status flags
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
+            let Some(file) = table.get(fd) else {
+                return KernelError::BadFd.sysret();
             };
             i64::from(file.get_flags())
         }
@@ -525,9 +517,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
 
         F_GETLK => {
             // Get lock info - test if a lock would block
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
+            let Some(file) = table.get(fd) else {
+                return KernelError::BadFd.sysret();
             };
             drop(table); // Release FD table lock before copying
 
@@ -551,9 +542,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
 
         F_SETLK => {
             // Set lock (non-blocking)
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
+            let Some(file) = table.get(fd) else {
+                return KernelError::BadFd.sysret();
             };
             drop(table);
 
@@ -573,9 +563,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
 
         F_SETLKW => {
             // Set lock (blocking - but we don't actually block, like flock)
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
+            let Some(file) = table.get(fd) else {
+                return KernelError::BadFd.sysret();
             };
             drop(table);
 

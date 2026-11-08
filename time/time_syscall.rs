@@ -274,9 +274,8 @@ pub fn sys_clock_gettime(clockid: i32, tp: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    let ns = match PosixClock::decode(clockid).map(PosixClock::now_ns) {
-        Some(Ok(ns)) => ns,
-        _ => return KernelError::InvalidArgument.sysret(),
+    let Some(Ok(ns)) = PosixClock::decode(clockid).map(PosixClock::now_ns) else {
+        return KernelError::InvalidArgument.sysret();
     };
     let ts = crate::time::Timespec::from_nanos(ns);
     let result = LinuxTimespec {
@@ -383,9 +382,8 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 
     // EOPNOTSUPP (coarse, raw, thread CPU clocks: no nsleep); a process
     // CPU clock sleeps until that process has used the time
     // (posix_cpu_nsleep; the caller's own process here, BUGS.md)
-    let pclock = match PosixClock::decode(clockid) {
-        Some(c) => c,
-        None => return KernelError::InvalidArgument.sysret(),
+    let Some(pclock) = PosixClock::decode(clockid) else {
+        return KernelError::InvalidArgument.sysret();
     };
     let base = match pclock.timer_base() {
         Some(b) => b,
@@ -684,15 +682,13 @@ pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
     }
 
     // Create the timerfd file
-    let file = match create_timerfd(clockid, flags) {
-        Ok(f) => f,
-        Err(_) => return KernelError::ProcessFileLimit.sysret(),
+    let Ok(file) = create_timerfd(clockid, flags) else {
+        return KernelError::ProcessFileLimit.sysret();
     };
 
     // Get the FD table and allocate a file descriptor
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::ProcessFileLimit.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::ProcessFileLimit.sysret();
     };
     let mut table = fd_table.lock();
     let fd_flags = if flags & tfd_flags::TFD_CLOEXEC != 0 {
@@ -740,19 +736,17 @@ pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: u64, old_value: u64) 
     }
 
     // Get the file from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
-    let file = match fd_table.lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get the timerfd from the file
-    let timerfd = match get_timerfd(&file) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(), // Not a timerfd
+    let Some(timerfd) = get_timerfd(&file) else {
+        // Not a timerfd
+        return KernelError::BadFd.sysret();
     };
 
     // Set the timer and get the old value
@@ -785,19 +779,17 @@ pub fn sys_timerfd_gettime(fd: i32, curr_value: u64) -> i64 {
     }
 
     // Get the file from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
-    let file = match fd_table.lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get the timerfd from the file
-    let timerfd = match get_timerfd(&file) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(), // Not a timerfd
+    let Some(timerfd) = get_timerfd(&file) else {
+        // Not a timerfd
+        return KernelError::BadFd.sysret();
     };
 
     // Get current timer value
@@ -830,15 +822,13 @@ pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
     }
 
     // Create the eventfd file
-    let file = match create_eventfd(u64::from(initval), flags) {
-        Ok(f) => f,
-        Err(_) => return KernelError::ProcessFileLimit.sysret(),
+    let Ok(file) = create_eventfd(u64::from(initval), flags) else {
+        return KernelError::ProcessFileLimit.sysret();
     };
 
     // Get the FD table and allocate a file descriptor
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::ProcessFileLimit.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::ProcessFileLimit.sysret();
     };
     let mut table = fd_table.lock();
     let fd_flags = if flags & efd_flags::EFD_CLOEXEC != 0 {

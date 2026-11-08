@@ -240,9 +240,9 @@ pub fn sys_getrlimit(resource: u32, rlim_ptr: u64) -> i64 {
     }
 
     let tid = current_tid();
-    let rlim = match get_task_rlimit(tid, resource) {
-        Some(r) => r,
-        None => return KernelError::NoProcess.sysret(), // (shouldn't happen for current task)
+    let Some(rlim) = get_task_rlimit(tid, resource) else {
+        // (shouldn't happen for current task)
+        return KernelError::NoProcess.sysret();
     };
 
     // Copy to user (16 bytes: cur + max)
@@ -263,9 +263,8 @@ pub fn sys_getrlimit(resource: u32, rlim_ptr: u64) -> i64 {
 /// Returns: 0 on success, negative errno on error
 pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
     // Linux sys_setrlimit: copied in first (EFAULT), then do_prlimit
-    let new_rlim = match copy_val_from_user::<Uaccess, RLimit>(rlim_ptr) {
-        Ok(r) => r,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(new_rlim) = copy_val_from_user::<Uaccess, RLimit>(rlim_ptr) else {
+        return KernelError::BadAddress.sysret();
     };
     if resource as usize >= RLIM_NLIMITS {
         return KernelError::InvalidArgument.sysret();

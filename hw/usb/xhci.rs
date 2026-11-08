@@ -1944,9 +1944,9 @@ impl XhciController {
     /// Issues STOP_ENDPOINT commands for each configured endpoint.
     /// This ensures no pending transfers complete after device removal.
     fn stop_device_endpoints(&mut self, slot_id: u8) -> Result<(), UsbError> {
-        let state = match self.device_states.get(&slot_id) {
-            Some(s) => s,
-            None => return Ok(()), // No state = nothing to stop
+        let Some(state) = self.device_states.get(&slot_id) else {
+            // No state = nothing to stop
+            return Ok(());
         };
 
         // Get list of configured endpoint DCIs
@@ -1956,9 +1956,8 @@ impl XhciController {
             printkln!("xHCI: Stopping endpoint DCI {} for slot {}", dci, slot_id);
 
             // Issue STOP_ENDPOINT command
-            let cmd_ring = match self.cmd_ring.as_mut() {
-                Some(r) => r,
-                None => return Err(UsbError::NoResources),
+            let Some(cmd_ring) = self.cmd_ring.as_mut() else {
+                return Err(UsbError::NoResources);
             };
 
             let mut trb = Trb::new();
@@ -1982,9 +1981,8 @@ impl XhciController {
     fn disable_slot(&mut self, slot_id: u8) -> Result<(), UsbError> {
         printkln!("xHCI: Disabling slot {}", slot_id);
 
-        let cmd_ring = match self.cmd_ring.as_mut() {
-            Some(r) => r,
-            None => return Err(UsbError::NoResources),
+        let Some(cmd_ring) = self.cmd_ring.as_mut() else {
+            return Err(UsbError::NoResources);
         };
 
         let mut trb = Trb::new();

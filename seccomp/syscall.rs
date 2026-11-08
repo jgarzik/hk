@@ -68,9 +68,8 @@ fn set_seccomp_strict() -> i64 {
 
     {
         let mut table = TASKLIST.write();
-        let task = match table.get_mut(tid) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.sysret(),
+        let Some(task) = table.get_mut(tid) else {
+            return KernelError::NoProcess.sysret();
         };
 
         // Can only enable seccomp, not change modes once enabled
@@ -116,9 +115,8 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
         // Get current task's existing filter and check no_new_privs
         let (existing_filter, has_no_new_privs, is_privileged) = {
             let table = TASKLIST.read();
-            let task = match table.get(tid) {
-                Some(t) => t,
-                None => return KernelError::NoProcess.sysret(),
+            let Some(task) = table.get(tid) else {
+                return KernelError::NoProcess.sysret();
             };
             (
                 task.seccomp_filter.clone(),

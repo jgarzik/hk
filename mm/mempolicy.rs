@@ -517,9 +517,8 @@ pub fn sys_move_pages(
                 return e;
             }
             // In range: access_ok checked nodes_ptr + nr_pages * 4
-            let node = match get_user::<Uaccess, i32>(nodes_ptr + i * 4) {
-                Ok(n) => n,
-                Err(_) => return KernelError::BadAddress.sysret(),
+            let Ok(node) = get_user::<Uaccess, i32>(nodes_ptr + i * 4) else {
+                return KernelError::BadAddress.sysret();
             };
             if !(0..64).contains(&node) || online_mask & (1u64 << node) == 0 {
                 return KernelError::NoDevice.sysret();

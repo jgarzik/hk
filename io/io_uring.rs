@@ -871,9 +871,8 @@ impl IoUring {
             Ok(v) => v,
             Err(e) => return e.sysret(),
         };
-        let fd_table = match get_task_fd(current_tid()) {
-            Some(t) => t,
-            None => return KernelError::BadFd.sysret(),
+        let Some(fd_table) = get_task_fd(current_tid()) else {
+            return KernelError::BadFd.sysret();
         };
 
         let mut inner = self.inner.lock();
@@ -918,9 +917,8 @@ impl IoUring {
     pub fn update_files(&self, offset: u32, fds: &[i32]) -> i64 {
         let mut inner = self.inner.lock();
 
-        let registered = match inner.registered_files.as_mut() {
-            Some(r) => r,
-            None => return KernelError::InvalidArgument.sysret(),
+        let Some(registered) = inner.registered_files.as_mut() else {
+            return KernelError::InvalidArgument.sysret();
         };
 
         let offset = offset as usize;
@@ -929,9 +927,8 @@ impl IoUring {
         }
 
         // Resolve fds to File references
-        let fd_table = match get_task_fd(current_tid()) {
-            Some(t) => t,
-            None => return KernelError::BadFd.sysret(),
+        let Some(fd_table) = get_task_fd(current_tid()) else {
+            return KernelError::BadFd.sysret();
         };
 
         let fd_table_locked = fd_table.lock();
@@ -1034,9 +1031,8 @@ impl IoUring {
 
         // Read timespec from userspace
         // struct __kernel_timespec { i64 tv_sec; i64 tv_nsec; }
-        let ts = match copy_val_from_user::<Uaccess, [i64; 2]>(ts_ptr) {
-            Ok(v) => v,
-            Err(_) => return KernelError::BadAddress.to_errno_neg(),
+        let Ok(ts) = copy_val_from_user::<Uaccess, [i64; 2]>(ts_ptr) else {
+            return KernelError::BadAddress.to_errno_neg();
         };
         let (tv_sec, tv_nsec) = (ts[0], ts[1]);
 
@@ -1447,15 +1443,13 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
     };
 
     // Create file
-    let file = match create_io_uring_file(ring) {
-        Ok(f) => f,
-        Err(_) => return KernelError::OutOfMemory.sysret(),
+    let Ok(file) = create_io_uring_file(ring) else {
+        return KernelError::OutOfMemory.sysret();
     };
 
     // Allocate fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::OutOfMemory.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::OutOfMemory.sysret();
     };
 
     let fd = match fd_table
@@ -1503,19 +1497,16 @@ pub fn sys_io_uring_enter(
     }
 
     // Get io_uring from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
 
-    let file = match fd_table.lock().get(fd as i32) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(fd as i32) else {
+        return KernelError::BadFd.sysret();
     };
 
-    let ring = match get_io_uring(&file) {
-        Some(r) => r,
-        None => return KernelError::BadFd.sysret(),
+    let Some(ring) = get_io_uring(&file) else {
+        return KernelError::BadFd.sysret();
     };
 
     let mut ret = 0i64;
@@ -1552,19 +1543,16 @@ pub fn sys_io_uring_enter(
 /// 0 on success, or negative errno
 pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i64 {
     // Get io_uring from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
 
-    let file = match fd_table.lock().get(fd as i32) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(fd as i32) else {
+        return KernelError::BadFd.sysret();
     };
 
-    let ring = match get_io_uring(&file) {
-        Some(r) => r,
-        None => return KernelError::BadFd.sysret(),
+    let Some(ring) = get_io_uring(&file) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Handle register operations

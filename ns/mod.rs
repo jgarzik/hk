@@ -506,9 +506,8 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
     } else {
         None
     };
-    let new_ns = match current_ns.copy(ns_flags, fs.as_deref()) {
-        Ok(ns) => ns,
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+    let Ok(new_ns) = current_ns.copy(ns_flags, fs.as_deref()) else {
+        return KernelError::InvalidArgument.sysret();
     };
 
     // Switch to new namespace (atomic via mutex)
@@ -551,34 +550,30 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
     let tid = current_tid();
 
     // Get file from fd
-    let fd_table = match get_task_fd(tid) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(tid) else {
+        return KernelError::BadFd.sysret();
     };
-    let file = match fd_table.lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get inode from file
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
+    let Some(inode) = file.get_inode() else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get private data and check if it's a namespace file
-    let private = match inode.get_private() {
-        Some(p) => p,
-        None => return KernelError::InvalidArgument.sysret(),
+    let Some(private) = inode.get_private() else {
+        return KernelError::InvalidArgument.sysret();
     };
 
-    let wrapper = match private
+    let Some(wrapper) = private
         .as_ref()
         .as_any()
         .downcast_ref::<ProcfsInodeWrapper>()
-    {
-        Some(w) => w,
-        None => return KernelError::InvalidArgument.sysret(), // Not a procfs file
+    else {
+        // Not a procfs file
+        return KernelError::InvalidArgument.sysret();
     };
 
     // Copied out: the inode data's spin lock is not held for the rest
@@ -609,9 +604,8 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
     }
 
     // The target task's namespaces
-    let target_ns = match crate::fs::proc::task_nsproxy(&target) {
-        Some(ns) => ns,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(target_ns) = crate::fs::proc::task_nsproxy(&target) else {
+        return KernelError::NoProcess.sysret();
     };
 
     let current_ns = get_task_ns(tid).unwrap_or_else(|| INIT_NSPROXY.clone());

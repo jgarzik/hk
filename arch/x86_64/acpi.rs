@@ -717,12 +717,9 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
     };
 
     // Try to find SRAT table
-    let srat_phys = match find_table_phys(sdt_phys, is_xsdt, SRAT_SIGNATURE) {
-        Ok(addr) => addr,
-        Err(_) => {
-            // No SRAT table - not an error, just use single-node fallback
-            return Ok(false);
-        }
+    let Ok(srat_phys) = find_table_phys(sdt_phys, is_xsdt, SRAT_SIGNATURE) else {
+        // No SRAT table - not an error, just use single-node fallback
+        return Ok(false);
     };
 
     // Parse SRAT to extract NUMA topology

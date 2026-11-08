@@ -108,9 +108,8 @@ pub fn keyctl_update(key_serial: i32, payload_ptr: u64, plen: usize) -> i64 {
 /// * 0 on success
 /// * Negative errno on failure
 pub fn keyctl_revoke(key_serial: i32) -> i64 {
-    let key = match lookup_key(key_serial) {
-        Some(k) => k,
-        None => return KernelError::NoKey.sysret(),
+    let Some(key) = lookup_key(key_serial) else {
+        return KernelError::NoKey.sysret();
     };
 
     // Check permission (need SETATTR to revoke)
@@ -139,9 +138,8 @@ pub fn keyctl_chown(key_serial: i32, new_uid: i32, new_gid: i32) -> i64 {
     if uid.is_none() && gid.is_none() {
         return 0;
     }
-    let key = match lookup_key(key_serial) {
-        Some(k) => k,
-        None => return KernelError::NoKey.sysret(),
+    let Some(key) = lookup_key(key_serial) else {
+        return KernelError::NoKey.sysret();
     };
     if !check_key_permission(&key, KEY_NEED_SETATTR) {
         return KernelError::PermissionDenied.sysret();
@@ -178,9 +176,8 @@ pub fn keyctl_setperm(key_serial: i32, perm: u32) -> i64 {
     if perm & !(KEY_POS_ALL | KEY_USR_ALL | KEY_GRP_ALL | KEY_OTH_ALL) != 0 {
         return KernelError::InvalidArgument.sysret();
     }
-    let key = match lookup_key(key_serial) {
-        Some(k) => k,
-        None => return KernelError::NoKey.sysret(),
+    let Some(key) = lookup_key(key_serial) else {
+        return KernelError::NoKey.sysret();
     };
     if !check_key_permission(&key, KEY_NEED_SETATTR) {
         return KernelError::PermissionDenied.sysret();
@@ -297,9 +294,8 @@ pub fn keyctl_link(key_serial: i32, keyring_serial: i32) -> i64 {
     let (tid, uid, gid) = current_cred();
 
     // Look up the key
-    let key = match lookup_key(key_serial) {
-        Some(k) => k,
-        None => return KernelError::NoKey.sysret(),
+    let Some(key) = lookup_key(key_serial) else {
+        return KernelError::NoKey.sysret();
     };
 
     // Look up the keyring
@@ -342,9 +338,8 @@ pub fn keyctl_unlink(key_serial: i32, keyring_serial: i32) -> i64 {
     let (tid, uid, gid) = current_cred();
 
     // Look up the key
-    let key = match lookup_key(key_serial) {
-        Some(k) => k,
-        None => return KernelError::NoKey.sysret(),
+    let Some(key) = lookup_key(key_serial) else {
+        return KernelError::NoKey.sysret();
     };
 
     // Look up the keyring
@@ -386,14 +381,12 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
     let (tid, uid, gid) = current_cred();
 
     // Copy type and description from userspace
-    let type_name = match strncpy_from_user_str::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(type_name) = strncpy_from_user_str::<Uaccess>(type_ptr, MAX_TYPE_LEN) else {
+        return KernelError::BadAddress.sysret();
     };
 
-    let description = match strncpy_from_user_str::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(description) = strncpy_from_user_str::<Uaccess>(desc_ptr, MAX_DESC_LEN) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // Look up the keyring to search
@@ -512,9 +505,8 @@ pub fn keyctl_read(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
 /// * 0 on success
 /// * Negative errno on failure
 pub fn keyctl_invalidate(key_serial: i32) -> i64 {
-    let key = match lookup_key(key_serial) {
-        Some(k) => k,
-        None => return KernelError::NoKey.sysret(),
+    let Some(key) = lookup_key(key_serial) else {
+        return KernelError::NoKey.sysret();
     };
 
     // Check permission (need SEARCH to invalidate)

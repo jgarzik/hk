@@ -152,9 +152,8 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
             return KernelError::BadFd.sysret();
         }
         let tid = current_tid();
-        let fd_table = match get_task_fd(tid) {
-            Some(t) => t,
-            None => return KernelError::BadFd.sysret(),
+        let Some(fd_table) = get_task_fd(tid) else {
+            return KernelError::BadFd.sysret();
         };
         match fd_table.lock().get(fd) {
             Some(f) => Some(f),
@@ -395,9 +394,9 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
     }
 
     let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return 0, // No mm, nothing to unmap
+    let Some(mm) = get_task_mm(tid) else {
+        // No mm, nothing to unmap
+        return 0;
     };
 
     let mut mm_guard = match mm.mmap_write_killable() {
@@ -881,9 +880,8 @@ pub fn sys_mlockall(flags: i32) -> i64 {
     }
 
     let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return KernelError::OutOfMemory.sysret(),
+    let Some(mm) = get_task_mm(tid) else {
+        return KernelError::OutOfMemory.sysret();
     };
 
     let mut mm_guard = match mm.mmap_write_killable() {
@@ -978,9 +976,9 @@ pub fn sys_mlockall(flags: i32) -> i64 {
 /// 0 on success, negative errno on failure
 pub fn sys_munlockall() -> i64 {
     let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return 0, // No mm, nothing to unlock
+    let Some(mm) = get_task_mm(tid) else {
+        // No mm, nothing to unlock
+        return 0;
     };
 
     let mut mm_guard = match mm.mmap_write_killable() {
@@ -1346,9 +1344,8 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         // The new range must not overlap the old one (Linux
         // vrm_overlaps, MREMAP_DONTUNMAP included) and must end in
         // user space
-        let new_end = match new_addr.checked_add(new_len_aligned) {
-            Some(e) => e,
-            None => return KernelError::InvalidArgument.sysret(),
+        let Some(new_end) = new_addr.checked_add(new_len_aligned) else {
+            return KernelError::InvalidArgument.sysret();
         };
         if (new_end > old_addr && new_addr < old_addr + old_len) || new_end > super::TASK_SIZE {
             return KernelError::InvalidArgument.sysret();
@@ -1364,9 +1361,8 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     }
 
     let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return KernelError::BadAddress.sysret(),
+    let Some(mm) = get_task_mm(tid) else {
+        return KernelError::BadAddress.sysret();
     };
 
     // VMAs unmapped or moved away: dropped after the lock on every return

@@ -352,9 +352,8 @@ pub fn sys_utime(pathname: u64, times: u64) -> i64 {
         if !Uaccess::access_ok(times, core::mem::size_of::<Utimbuf>()) {
             return KernelError::BadAddress.sysret();
         }
-        let b = match copy_val_from_user::<Uaccess, Utimbuf>(times) {
-            Ok(v) => v,
-            Err(_) => return KernelError::BadAddress.sysret(),
+        let Ok(b) = copy_val_from_user::<Uaccess, Utimbuf>(times) else {
+            return KernelError::BadAddress.sysret();
         };
         let at = |sec| UserTimespec {
             tv_sec: sec,

@@ -11,15 +11,14 @@ belongs to doc/ROADMAP.md phase M1, the rest to S1.
 | # | Item | Lines saved | Risk | Prio |
 |---|------|-------------|------|------|
 | 2 | `SysRet` trait + `From<UaccessError>`: `?` in `sys_*` | about -750 | low-med (errno mapping) | high |
-| 3 | let-else for `match {Some(x)=>x, None=>return}` | about -288 | ~0 | high |
 | 4 | Delete the dead code behind `expect(dead_code)` | about -100 | ~0 | high |
 | 5 | Struct update `..Default::default()` / `..zeroed()` | -300 (kernel) / -120 (user) | low | med |
 | 7 | One `util/bytes` LE/BE reader on `first_chunk` | -40 | low | low |
 | 8 | `is_multiple_of` for `% a == 0` | 0 | 0 | low |
 | 9 | xhci MMIO through `IoMem` | 0 | 0 | low |
 
-Order: 4 is mechanical, one commit. 2 goes per subsystem (M1) and also
-removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
+Order: 4 is mechanical, one commit. 2 goes per subsystem (M1); let-else
+is done and linted (`manual_let_else`), so its error exits become `?`.
 
 ---
 
@@ -93,8 +92,7 @@ removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
     `get_task_fd(current_tid())` + `.lock().get(fd)` pairs (13+12+6 different spellings).
   - (b) Drop the `access_ok` pre-checks that come right before
     `put_user`/`copy_*_user`, since those already check: 14 sites, 3 lines each.
-- **Estimate:** 81x3 + 22x2 + 22x3 + 130x3 + 85x2 + 15, about **-920**. Item 3 already
-  takes about 130 of those let-else lines, so net about **-750** beyond item 3.
+- **Estimate:** about **-750** (let-else already took the `match` shapes).
 - **ABI/correctness notes:**
   - The bits returned to user space don't change. `Ok(v)` is still `v`; `Err(e)` is
     still `-errno`. Negative success values, such as `F_GETOWN` returning `-pgrp`,
@@ -108,27 +106,6 @@ removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
     strncpy TooLong).
   - No locking impact: `?` drops guards in reverse order, exactly as the early
     `return` does now.
-
-## 3. let-else (1.65) for `match`/`return|continue|break`
-
-- **Evidence:** clippy `manual_let_else` (pedantic, off today) finds **249 sites on
-  x86-64 + 4 aarch64-only**. Grep agrees: 180 `Some` and 75 `Ok(_)/Err(_)` matches
-  that diverge.
-- **Action:** apply clippy's suggestions plus `cargo fmt` (about -288), then turn
-  the lint on.
-- **Before/after** (main.rs:626):
-  ```rust
-  let vfat_data = match arch::x86_64::multiboot2::find_module("vfat") {
-      Some(data) => data,
-      None => return,
-  };
-  // ->
-  let Some(vfat_data) = arch::x86_64::multiboot2::find_module("vfat") else { return };
-  ```
-- **Lock-in:** add `manual_let_else = "warn"` to `[workspace.lints.clippy]`.
-- **Risk:** none (same semantics). rustfmt puts long let-else on 3 lines, so the
-  saving is 1 to 3 lines per site. Do item 2 first in syscall code, where `?` beats
-  let-else.
 
 ## 4. Deleting what `expect(dead_code)` hides
 

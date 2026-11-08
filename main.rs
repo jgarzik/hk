@@ -403,12 +403,9 @@ fn kmain() -> ! {
     // Its program is loaded into the address space made here once the
     // initramfs is unpacked (Linux kernel_init, then run_init_process).
     // ========================================================================
-    let mut user_pt = match ArchPageTable::new_user(&mut frame_alloc) {
-        Some(pt) => pt,
-        None => {
-            printkln!("ERR: page table alloc");
-            CurrentArch::halt_loop();
-        }
+    let Some(mut user_pt) = ArchPageTable::new_user(&mut frame_alloc) else {
+        printkln!("ERR: page table alloc");
+        CurrentArch::halt_loop();
     };
     user_pt.copy_kernel_mappings();
     // Its stack comes with the program exec loads into it (run_init)
@@ -643,9 +640,8 @@ pub fn init_vfat_ramdisk(
     use fs::ramfs_create_dir;
 
     // Look for vfat module loaded by bootloader
-    let vfat_data = match arch::x86_64::multiboot2::find_module("vfat") {
-        Some(data) => data,
-        None => return,
+    let Some(vfat_data) = arch::x86_64::multiboot2::find_module("vfat") else {
+        return;
     };
 
     // Ramdisk rd1 from the vfat image data (node in devtmpfs)

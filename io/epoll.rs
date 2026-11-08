@@ -748,13 +748,11 @@ pub fn sys_epoll_create1(eflags: i32) -> i64 {
     if eflags & !EPOLL_CLOEXEC != 0 {
         return KernelError::InvalidArgument.sysret();
     }
-    let file = match create_epoll_file(eflags) {
-        Ok(f) => f,
-        Err(_) => return KernelError::OutOfMemory.sysret(),
+    let Ok(file) = create_epoll_file(eflags) else {
+        return KernelError::OutOfMemory.sysret();
     };
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::OutOfMemory.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::OutOfMemory.sysret();
     };
     let mut table = fd_table.lock();
     let fd_flags = if eflags & EPOLL_CLOEXEC != 0 {

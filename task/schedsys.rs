@@ -416,9 +416,8 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u
     };
 
     // Get the RT priority (0 for non-RT tasks)
-    let rt_prio = match super::percpu::lookup_task_rt_priority(target_pid) {
-        Some(p) => p,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(rt_prio) = super::percpu::lookup_task_rt_priority(target_pid) else {
+        return KernelError::NoProcess.sysret();
     };
 
     let param = SchedParam {
@@ -481,9 +480,8 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u
     };
 
     // Get current policy to preserve it
-    let current_policy = match super::percpu::lookup_task_policy(target_pid) {
-        Some(p) => p,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(current_policy) = super::percpu::lookup_task_policy(target_pid) else {
+        return KernelError::NoProcess.sysret();
     };
 
     if let Err(e) = check_setscheduler(
@@ -686,9 +684,8 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(pid: i64, tp_pt
     };
 
     // Get the scheduling policy
-    let policy = match super::percpu::lookup_task_policy(target_pid) {
-        Some(p) => p,
-        None => return KernelError::NoProcess.sysret(),
+    let Some(policy) = super::percpu::lookup_task_policy(target_pid) else {
+        return KernelError::NoProcess.sysret();
     };
 
     // Only SCHED_RR has a meaningful time quantum

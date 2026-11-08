@@ -1112,13 +1112,11 @@ where
         Ok(d) => d,
         Err(e) => return e.sysret() as i32,
     };
-    let interp_image = match interp_file.as_deref().map(FileImage::new).transpose() {
-        Ok(i) => i,
-        Err(_) => return KernelError::LibBad.to_errno_neg(),
+    let Ok(interp_image) = interp_file.as_deref().map(FileImage::new).transpose() else {
+        return KernelError::LibBad.to_errno_neg();
     };
-    let interp = match interp_image.as_ref().map(ElfExecutable::parse).transpose() {
-        Ok(i) => i,
-        Err(_) => return KernelError::LibBad.to_errno_neg(),
+    let Ok(interp) = interp_image.as_ref().map(ElfExecutable::parse).transpose() else {
+        return KernelError::LibBad.to_errno_neg();
     };
 
     // PIE images load at ELF_ET_DYN_BASE (aligned to their segments),
@@ -1151,9 +1149,8 @@ where
     };
 
     // Create new page table for the process
-    let mut new_page_table = match ArchPageTable::new_user(frame_alloc) {
-        Some(pt) => pt,
-        None => return KernelError::OutOfMemory.to_errno_neg(),
+    let Some(mut new_page_table) = ArchPageTable::new_user(frame_alloc) else {
+        return KernelError::OutOfMemory.to_errno_neg();
     };
 
     // Link the kernel half (x86; arm64 keeps the kernel in TTBR1)

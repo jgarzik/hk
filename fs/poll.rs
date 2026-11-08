@@ -224,14 +224,11 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
 
             // Look up the file
             let file = fd_table.lock().get(pollfd.fd);
-            let file = match file {
-                Some(f) => f,
-                None => {
-                    // Invalid fd - set POLLNVAL
-                    pollfd.revents = POLLNVAL as i16;
-                    ready_count += 1;
-                    continue;
-                }
+            let Some(file) = file else {
+                // Invalid fd - set POLLNVAL
+                pollfd.revents = POLLNVAL as i16;
+                ready_count += 1;
+                continue;
             };
 
             // Set key for this fd's events
@@ -311,9 +308,8 @@ pub fn sys_ppoll(fds: u64, nfds: u32, tmo_p: u64, sigmask_ptr: u64, sigsetsize: 
         }
 
         // Read new mask from user space
-        let new_mask_bits = match get_user::<Uaccess, u64>(sigmask_ptr) {
-            Ok(v) => v,
-            Err(_) => return KernelError::BadAddress.sysret(),
+        let Ok(new_mask_bits) = get_user::<Uaccess, u64>(sigmask_ptr) else {
+            return KernelError::BadAddress.sysret();
         };
         let new_mask = SigSet::from_bits(new_mask_bits);
 
@@ -405,9 +401,8 @@ pub fn sys_pselect6(
     // struct { const sigset_t *ss; size_t ss_len; }
     let saved_mask = if sigmask != 0 {
         // The pointer to the sigset_t and its size, read whole
-        let [ss_ptr, ss_len] = match get_user::<Uaccess, [u64; 2]>(sigmask) {
-            Ok(v) => v,
-            Err(_) => return KernelError::BadAddress.sysret(),
+        let Ok([ss_ptr, ss_len]) = get_user::<Uaccess, [u64; 2]>(sigmask) else {
+            return KernelError::BadAddress.sysret();
         };
 
         if ss_ptr != 0 {
@@ -415,9 +410,8 @@ pub fn sys_pselect6(
                 return KernelError::InvalidArgument.sysret();
             }
 
-            let new_mask_bits = match get_user::<Uaccess, u64>(ss_ptr) {
-                Ok(v) => v,
-                Err(_) => return KernelError::BadAddress.sysret(),
+            let Ok(new_mask_bits) = get_user::<Uaccess, u64>(ss_ptr) else {
+                return KernelError::BadAddress.sysret();
             };
             let new_mask = SigSet::from_bits(new_mask_bits);
             set_poll_sigmask(new_mask)

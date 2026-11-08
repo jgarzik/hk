@@ -877,23 +877,20 @@ pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
     }
 
     // Read mask from user space
-    let mask_bits = match get_user::<Uaccess, u64>(mask_ptr) {
-        Ok(v) => v,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let Ok(mask_bits) = get_user::<Uaccess, u64>(mask_ptr) else {
+        return KernelError::BadAddress.sysret();
     };
     let mask = SigSet::from_bits(mask_bits);
 
     if fd == -1 {
         // Create new signalfd
-        let file = match create_signalfd(mask, flags) {
-            Ok(f) => f,
-            Err(_) => return KernelError::OutOfMemory.sysret(),
+        let Ok(file) = create_signalfd(mask, flags) else {
+            return KernelError::OutOfMemory.sysret();
         };
 
         // Allocate fd and install file
-        let fd_table = match get_task_fd(current_tid()) {
-            Some(t) => t,
-            None => return KernelError::ProcessFileLimit.sysret(),
+        let Some(fd_table) = get_task_fd(current_tid()) else {
+            return KernelError::ProcessFileLimit.sysret();
         };
         let mut table = fd_table.lock();
         let fd_flags = if flags & sfd_flags::SFD_CLOEXEC != 0 {
@@ -918,14 +915,12 @@ pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
         }
     } else {
         // Update existing signalfd mask
-        let fd_table = match get_task_fd(current_tid()) {
-            Some(t) => t,
-            None => return KernelError::BadFd.sysret(),
+        let Some(fd_table) = get_task_fd(current_tid()) else {
+            return KernelError::BadFd.sysret();
         };
 
-        let file = match fd_table.lock().get(fd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
+        let Some(file) = fd_table.lock().get(fd) else {
+            return KernelError::BadFd.sysret();
         };
 
         // Verify it's a signalfd

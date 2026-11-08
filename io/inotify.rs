@@ -817,9 +817,8 @@ impl FileOps for InotifyFileOps {
 
     /// Linux fsnotify_fasync: the group's list; a failure is EIO
     fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
-        let g = match file.private_ref::<Inotify>() {
-            Some(g) => g,
-            None => return Some(Err(KernelError::BadFd)),
+        let Some(g) = file.private_ref::<Inotify>() else {
+            return Some(Err(KernelError::BadFd));
         };
         Some(
             fasync_helper(&g.fasync, file, fd, on)
@@ -917,15 +916,13 @@ pub fn sys_inotify_init1(in_flags: i32) -> i64 {
     }
 
     // Create inotify file
-    let file = match create_inotify(in_flags) {
-        Ok(f) => f,
-        Err(_) => return KernelError::OutOfMemory.sysret(),
+    let Ok(file) = create_inotify(in_flags) else {
+        return KernelError::OutOfMemory.sysret();
     };
 
     // Allocate fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::ProcessFileLimit.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::ProcessFileLimit.sysret();
     };
 
     let mut table = fd_table.lock();
@@ -967,21 +964,18 @@ pub fn sys_inotify_add_watch(fd: i32, pathname_ptr: u64, mask: u32) -> i64 {
     }
 
     // Get fd table
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get file
-    let file = match fd_table.lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Verify it's an inotify fd
-    let inotify = match get_inotify(&file) {
-        Some(i) => i,
-        None => return KernelError::InvalidArgument.sysret(),
+    let Some(inotify) = get_inotify(&file) else {
+        return KernelError::InvalidArgument.sysret();
     };
 
     // Copy pathname from user
@@ -1014,21 +1008,18 @@ pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
     use crate::task::percpu::current_tid;
 
     // Get fd table
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
+    let Some(fd_table) = get_task_fd(current_tid()) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Get file
-    let file = match fd_table.lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = fd_table.lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
 
     // Verify it's an inotify fd
-    let inotify = match get_inotify(&file) {
-        Some(i) => i,
-        None => return KernelError::InvalidArgument.sysret(),
+    let Some(inotify) = get_inotify(&file) else {
+        return KernelError::InvalidArgument.sysret();
     };
 
     // Remove watch

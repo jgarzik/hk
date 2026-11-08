@@ -1094,9 +1094,9 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
     }
 
     // Get the timer
-    let timer = match user_timer(tid, timerid) {
-        Some(t) => t,
-        None => return KernelError::InvalidArgument.sysret(), // timer not found
+    let Some(timer) = user_timer(tid, timerid) else {
+        // timer not found
+        return KernelError::InvalidArgument.sysret();
     };
 
     // Read new value from user space
@@ -1145,9 +1145,9 @@ pub fn sys_timer_gettime(timerid: TimerT, curr_value: u64) -> i64 {
     let tid = current_tid();
 
     // Get the timer
-    let timer = match user_timer(tid, timerid) {
-        Some(t) => t,
-        None => return KernelError::InvalidArgument.sysret(), // timer not found
+    let Some(timer) = user_timer(tid, timerid) else {
+        // timer not found
+        return KernelError::InvalidArgument.sysret();
     };
 
     if curr_value == 0 {
@@ -1176,9 +1176,9 @@ pub fn sys_timer_getoverrun(timerid: TimerT) -> i64 {
     let tid = current_tid();
 
     // Get the timer
-    let timer = match user_timer(tid, timerid) {
-        Some(t) => t,
-        None => return KernelError::InvalidArgument.sysret(), // timer not found
+    let Some(timer) = user_timer(tid, timerid) else {
+        // timer not found
+        return KernelError::InvalidArgument.sysret();
     };
 
     i64::from(timer.getoverrun())

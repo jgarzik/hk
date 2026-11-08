@@ -114,9 +114,8 @@ fn getdents(fd: i32, dirp: u64, count: u64, fmt: Fmt) -> i64 {
     if !Uaccess::access_ok(dirp, count) {
         return KernelError::BadAddress.sysret();
     }
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(file) = current_fd_table().lock().get(fd) else {
+        return KernelError::BadFd.sysret();
     };
     if !file.is_dir() {
         return KernelError::NotDirectory.sysret();

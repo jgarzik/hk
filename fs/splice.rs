@@ -284,13 +284,11 @@ pub fn sys_splice(
     }
 
     // Get the files
-    let in_file = match get_file_from_fd(fd_in) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(in_file) = get_file_from_fd(fd_in) else {
+        return KernelError::BadFd.sysret();
     };
-    let out_file = match get_file_from_fd(fd_out) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
+    let Some(out_file) = get_file_from_fd(fd_out) else {
+        return KernelError::BadFd.sysret();
     };
     // Linux do_splice: read from a readable file, write to a writable
     // one (a FIFO is open one way or both)
@@ -524,9 +522,8 @@ fn do_splice_file_to_pipe(
     }
 
     // Allocate a pipe page and copy data
-    let page = match allocate_pipe_page() {
-        Some(p) => p,
-        None => return KernelError::OutOfMemory.sysret(),
+    let Some(page) = allocate_pipe_page() else {
+        return KernelError::OutOfMemory.sysret();
     };
 
     // Copy data to page
@@ -763,9 +760,8 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         }
 
         // Allocate a pipe page
-        let page = match allocate_pipe_page() {
-            Some(p) => p,
-            None => return KernelError::OutOfMemory.sysret(),
+        let Some(page) = allocate_pipe_page() else {
+            return KernelError::OutOfMemory.sysret();
         };
 
         // Copy user data to page (limited to PAGE_SIZE)
