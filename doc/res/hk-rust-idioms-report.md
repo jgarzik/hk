@@ -101,7 +101,7 @@ Order: 2 goes per subsystem (M1); let-else is done and linted
 - **Converted** (KernelResult + UserPtr): time/, signal/ (the signal
   core's send paths still return 0 or -errno as i32), ns/, keys/, tty/,
   seccomp/, bpf/, power.rs, arch rt_sigreturn; task/ clone, fork,
-  exec, wait.
+  exec, wait, ids, credentials, groups, capabilities, pgrp/session.
 - **Estimate:** about **-750** (let-else already took the `match` shapes).
 - **Done:** mm/, ipc/, io/ epoll, inotify, fanotify, io_uring (sys_* return
   `KernelResult`, user pointers typed).

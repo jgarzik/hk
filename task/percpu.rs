@@ -4836,7 +4836,7 @@ pub fn set_task_pgid(
     target_pid: Pid,
     new_pgid: Pid,
     caller_sid: Pid,
-) -> Result<(), i32> {
+) -> KernelResult<()> {
     // Found before TASKLIST (the pid hash's lock is not nested in it)
     let target = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, new_pgid);
     let mut old = Vec::new();
@@ -4857,24 +4857,24 @@ fn setpgid_who(
     caller_pid: Pid,
     pid: Pid,
     caller_sid: Pid,
-) -> Result<(), i32> {
+) -> KernelResult<()> {
     if pid == caller_pid {
         return Ok(());
     }
-    let p = table.get(pid).ok_or(KernelError::NoProcess.errno())?;
+    let p = table.get(pid).ok_or(KernelError::NoProcess)?;
     let child = p
         .real_parent
         .as_ref()
         .and_then(|w| w.upgrade())
         .is_some_and(|parent| parent.pid == caller_pid);
     if !child {
-        return Err(KernelError::NoProcess.errno());
+        return Err(KernelError::NoProcess);
     }
     if p.task.sid() != caller_sid {
-        return Err(KernelError::NotPermitted.errno());
+        return Err(KernelError::NotPermitted);
     }
     if !p.task.has_flag(crate::task::pf::FORKNOEXEC) {
-        return Err(KernelError::PermissionDenied.errno());
+        return Err(KernelError::PermissionDenied);
     }
     Ok(())
 }
@@ -4888,40 +4888,36 @@ fn setpgid_target(
     pgid: Pid,
     target: Option<&Arc<crate::task::pid::Pid>>,
     caller_sid: Pid,
-) -> Result<Arc<crate::task::pid::Pid>, i32> {
-    let l = table.get(pid).ok_or(KernelError::NoProcess.errno())?;
+) -> KernelResult<Arc<crate::task::pid::Pid>> {
+    let l = table.get(pid).ok_or(KernelError::NoProcess)?;
     let sid = l.task.sid();
     if pid == sid || sid != caller_sid {
-        return Err(KernelError::NotPermitted.errno());
+        return Err(KernelError::NotPermitted);
     }
     if pgid == pid {
-        return l.thread_pid.clone().ok_or(KernelError::NoProcess.errno());
+        return l.thread_pid.clone().ok_or(KernelError::NoProcess);
     }
-    let pg = target.ok_or(KernelError::NotPermitted.errno())?;
+    let pg = target.ok_or(KernelError::NotPermitted)?;
     match table.pgrp(pg).next() {
         Some(g) if g.task.sid() == caller_sid => Ok(pg.clone()),
-        _ => Err(KernelError::NotPermitted.errno()), // no such group in the caller's session
+        _ => Err(KernelError::NotPermitted), // no such group in the caller's session
     }
 }
 
 /// Create a new session for the current process
 ///
-/// Returns the new session ID on success, Err(errno) on failure.
-/// Error codes:
-/// - EPERM (1): a session leader already, or a process group with the
+/// Returns the new session ID; EPERM if a session leader already, or a process group with the
 ///   caller's pid as id exists
-pub fn create_session(caller_pid: Pid) -> Result<Pid, i32> {
+pub fn create_session(caller_pid: Pid) -> KernelResult<Pid> {
     let mut old = Vec::new();
     let mut table = TASKLIST.write();
     let pid = {
-        let l = table
-            .get(caller_pid)
-            .ok_or(KernelError::NoProcess.errno())?;
-        let pid = l.thread_pid.clone().ok_or(KernelError::NoProcess.errno())?;
+        let l = table.get(caller_pid).ok_or(KernelError::NoProcess)?;
+        let pid = l.thread_pid.clone().ok_or(KernelError::NoProcess)?;
         // A session leader already, or a process group with the
         // caller's id exists (Linux ksys_setsid)
         if l.task.sid() == caller_pid || table.pgrp(&pid).next().is_some() {
-            return Err(KernelError::NotPermitted.errno());
+            return Err(KernelError::NotPermitted);
         }
         pid
     };

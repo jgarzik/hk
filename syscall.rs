@@ -303,8 +303,14 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         }
         Sys::Bpf => crate::bpf::sys_bpf(a[0] as i32, UserPtr::new(a[1]), a[2] as u32).ret() as u64,
         Sys::Brk => crate::mm::syscall::sys_brk(a[0]).ret() as u64,
-        Sys::Capget => crate::task::syscall::sys_capget::<Uaccess>(a[0], a[1]).ret() as u64,
-        Sys::Capset => crate::task::syscall::sys_capset::<Uaccess>(a[0], a[1]).ret() as u64,
+        Sys::Capget => {
+            crate::task::syscall::sys_capget::<Uaccess>(UserPtr::new(a[0]), UserPtr::new(a[1]))
+                .ret() as u64
+        }
+        Sys::Capset => {
+            crate::task::syscall::sys_capset::<Uaccess>(UserPtr::new(a[0]), UserPtr::new(a[1]))
+                .ret() as u64
+        }
         Sys::Chdir => crate::fs::syscall::sys_chdir(UserPtr::new(a[0])).ret() as u64,
         Sys::Chroot => crate::fs::syscall::sys_chroot(UserPtr::new(a[0])).ret() as u64,
         Sys::ClockGetres => {
@@ -514,7 +520,8 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::syscall::sys_getgid(crate::task::percpu::current_cred().gid).ret() as u64
         }
         Sys::Getgroups => {
-            crate::task::syscall::sys_getgroups::<Uaccess>(a[0] as i32, a[1]).ret() as u64
+            crate::task::syscall::sys_getgroups::<Uaccess>(a[0] as i32, UserPtr::new(a[1])).ret()
+                as u64
         }
         Sys::Getitimer => {
             crate::time::posix_timer::sys_getitimer(a[0] as i32, UserPtr::new(a[1])).ret() as u64
@@ -541,16 +548,16 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
                 as u64
         }
         Sys::Getresgid => crate::task::syscall::sys_getresgid::<Uaccess>(
-            a[0],
-            a[1],
-            a[2],
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
             crate::task::percpu::current_cred(),
         )
         .ret() as u64,
         Sys::Getresuid => crate::task::syscall::sys_getresuid::<Uaccess>(
-            a[0],
-            a[1],
-            a[2],
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
             crate::task::percpu::current_cred(),
         )
         .ret() as u64,
@@ -1101,11 +1108,12 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
                 as u64
         }
         Sys::Setgid => {
-            crate::task::syscall::sys_setgid(a[0] as u32, crate::task::percpu::current_cred())
+            crate::task::syscall::sys_setgid(a[0] as u32, crate::task::percpu::current_cred()).ret()
                 as u64
         }
         Sys::Setgroups => {
-            crate::task::syscall::sys_setgroups::<Uaccess>(a[0] as i32, a[1]).ret() as u64
+            crate::task::syscall::sys_setgroups::<Uaccess>(a[0] as i32, UserPtr::new(a[1])).ret()
+                as u64
         }
         Sys::Sethostname => crate::ns::uts::sys_sethostname(UserPtr::new(a[0]), a[1]).ret() as u64,
         Sys::Setitimer => crate::time::posix_timer::sys_setitimer(
@@ -1170,7 +1178,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
                 .ret() as u64
         }
         Sys::Setuid => {
-            crate::task::syscall::sys_setuid(a[0] as u32, crate::task::percpu::current_cred())
+            crate::task::syscall::sys_setuid(a[0] as u32, crate::task::percpu::current_cred()).ret()
                 as u64
         }
         Sys::Setxattr => crate::fs::syscall::sys_setxattr(

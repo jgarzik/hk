@@ -985,33 +985,22 @@ use super::{
 /// Validate capability header version and return number of u32s to copy
 ///
 /// If the version is invalid, writes the current version back to the header
-/// and returns -EINVAL.
+/// and returns EINVAL.
 fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
-    header_addr: u64,
-) -> Result<(usize, i32), i64> {
+    header: UserPtr<CapUserHeader>,
+) -> KernelResult<(usize, i32)> {
     use crate::uaccess::{get_user, put_user};
 
-    if header_addr == 0 {
-        return Err(KernelError::BadAddress.sysret());
+    if header.is_null() {
+        return Err(KernelError::BadAddress);
     }
-
-    // Read header from user space
-    let hdr: CapUserHeader = match get_user::<A, CapUserHeader>(header_addr) {
-        Ok(h) => h,
-        Err(_) => return Err(KernelError::BadAddress.sysret()),
-    };
-
-    let version = hdr.version;
-    let pid = hdr.pid;
-
-    match version {
-        _LINUX_CAPABILITY_VERSION_1 => {
-            // Legacy 32-bit version - only 1 u32 per set
-            Ok((1, pid))
-        }
+    let hdr: CapUserHeader = get_user::<A, CapUserHeader>(header.addr())?;
+    match hdr.version {
+        // Legacy 32-bit version - only 1 u32 per set
+        _LINUX_CAPABILITY_VERSION_1 => Ok((1, hdr.pid)),
+        // 64-bit versions - 2 u32s per set
         _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
-            // 64-bit versions - 2 u32s per set
-            Ok((_LINUX_CAPABILITY_U32S_3, pid))
+            Ok((_LINUX_CAPABILITY_U32S_3, hdr.pid))
         }
         _ => {
             // Invalid version - write current version back and return EINVAL
@@ -1019,8 +1008,8 @@ fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
                 version: _LINUX_CAPABILITY_VERSION_3,
                 pid: 0,
             };
-            let _ = put_user::<A, CapUserHeader>(header_addr, current_version);
-            Err(KernelError::InvalidArgument.sysret())
+            let _ = put_user::<A, CapUserHeader>(header.addr(), current_version);
+            Err(KernelError::InvalidArgument)
         }
     }
 }
@@ -1034,24 +1023,23 @@ fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
 ///
 /// If dataptr is NULL and the version is valid, returns 0 (version query).
 /// Otherwise, copies capability data to userspace.
-pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u64) -> i64 {
+pub fn sys_capget<A: crate::uaccess::UaccessArch>(
+    header: UserPtr<CapUserHeader>,
+    data: UserPtr<CapUserData>,
+) -> KernelResult<()> {
     use crate::uaccess::put_user;
 
     // Validate version and get number of u32s to copy
-    let (tocopy, pid) = match cap_validate_magic::<A>(header_addr) {
-        Ok((n, p)) => (n, p),
-        Err(e) => {
-            // If dataptr is NULL and we got EINVAL, this is a version query
-            if data_addr == 0 && e == KernelError::InvalidArgument.sysret() {
-                return 0;
-            }
-            return e;
-        }
+    let (tocopy, pid) = match cap_validate_magic::<A>(header) {
+        Ok(r) => r,
+        // If dataptr is NULL and we got EINVAL, this is a version query
+        Err(KernelError::InvalidArgument) if data.is_null() => return Ok(()),
+        Err(e) => return Err(e),
     };
 
     // If dataptr is NULL, this is just a version query (already validated)
-    if data_addr == 0 {
-        return 0;
+    if data.is_null() {
+        return Ok(());
     }
 
     // Get current pid
@@ -1062,12 +1050,12 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
         // Query our own capabilities
         super::current_cred()
     } else if pid < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     } else {
         // Query another process's capabilities
         // For now, only support querying current process
         // Full implementation would use find_task_by_vpid and RCU
-        return KernelError::NoProcess.sysret();
+        return Err(KernelError::NoProcess);
     };
 
     // Build capability data arrays
@@ -1082,13 +1070,10 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
 
     // Copy to user space
     for (i, item) in kdata.iter().enumerate().take(tocopy) {
-        let dst = data_addr + (i * core::mem::size_of::<CapUserData>()) as u64;
-        if put_user::<A, CapUserData>(dst, *item).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        let dst = data.offset(i).ok_or(KernelError::BadAddress)?;
+        put_user::<A, CapUserData>(dst.addr(), *item)?;
     }
-
-    0
+    Ok(())
 }
 
 /// sys_capset - set capabilities of current process
@@ -1100,31 +1085,28 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
 /// - I (inheritable): raised bits must be subset of old permitted
 /// - P (permitted): raised bits must be subset of old permitted
 /// - E (effective): must be subset of new permitted
-pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u64) -> i64 {
+pub fn sys_capset<A: crate::uaccess::UaccessArch>(
+    header: UserPtr<CapUserHeader>,
+    data: UserPtr<CapUserData>,
+) -> KernelResult<()> {
     use crate::uaccess::get_user;
 
     // Validate version and get number of u32s to copy
-    let (tocopy, pid) = match cap_validate_magic::<A>(header_addr) {
-        Ok((n, p)) => (n, p),
-        Err(e) => return e,
-    };
+    let (tocopy, pid) = cap_validate_magic::<A>(header)?;
 
     // Get current pid
     let current_pid = super::pid::vnr(super::percpu::current_pid()) as i32;
 
     // May only affect current process (Linux restriction since kernel 2.6.27)
     if pid != 0 && pid != current_pid {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Read capability data from user space
     let mut kdata = [CapUserData::default(); 2];
     for (i, item) in kdata.iter_mut().enumerate().take(tocopy) {
-        let src = data_addr + (i * core::mem::size_of::<CapUserData>()) as u64;
-        match get_user::<A, CapUserData>(src) {
-            Ok(d) => *item = d,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        }
+        let src = data.offset(i).ok_or(KernelError::BadAddress)?;
+        *item = get_user::<A, CapUserData>(src.addr())?;
     }
 
     // Combine 32-bit values into 64-bit capabilities
@@ -1139,20 +1121,15 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
     //
     // 1. New inheritable must not add any capabilities not in old permitted
     //    (can only inherit what we're permitted to use)
-    if !inheritable.is_subset(&old_cred.cap_permitted) {
-        return KernelError::NotPermitted.sysret();
-    }
-
     // 2. New permitted must not add any capabilities not in old permitted
     //    (can't gain capabilities we don't already have)
-    if !permitted.is_subset(&old_cred.cap_permitted) {
-        return KernelError::NotPermitted.sysret();
-    }
-
     // 3. New effective must be subset of new permitted
     //    (can't use capabilities we're not permitted to use)
-    if !effective.is_subset(&permitted) {
-        return KernelError::NotPermitted.sysret();
+    if !inheritable.is_subset(&old_cred.cap_permitted)
+        || !permitted.is_subset(&old_cred.cap_permitted)
+        || !effective.is_subset(&permitted)
+    {
+        return Err(KernelError::NotPermitted);
     }
 
     // Create new credentials with updated capabilities
@@ -1161,14 +1138,8 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
     new_cred.cap_permitted = permitted;
     new_cred.cap_inheritable = inheritable;
     // Note: bset and ambient are not modified by capset
-
-    // Commit the new credentials
-    match try_arc(new_cred) {
-        Ok(c) => super::commit_creds(c),
-        Err(e) => return e.sysret(),
-    }
-
-    0
+    super::commit_creds(try_arc(new_cred)?);
+    Ok(())
 }
 
 // ============================================================================

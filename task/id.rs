@@ -7,7 +7,8 @@
 //! - setresuid, setresgid, getresuid, getresgid (real/effective/saved IDs)
 //! - setfsuid, setfsgid (filesystem user/group IDs)
 
-use crate::util::error::KernelError;
+use crate::uaccess::UserPtr;
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
 
 /// sys_getpid: the caller's process id in its pid namespace (Linux
@@ -83,26 +84,20 @@ pub fn sys_getegid(egid: u32) -> i64 {
 /// This matches setuid(2) with _POSIX_SAVED_IDS:
 /// - Privileged: sets uid, suid, euid, fsuid (permanently drops privileges)
 /// - Unprivileged: sets only euid, fsuid (can switch between uid and suid)
-pub fn sys_setuid(uid: u32, current_cred: super::Cred) -> i64 {
+pub fn sys_setuid(uid: u32, current_cred: super::Cred) -> KernelResult<()> {
     // Privileged: CAP_SETUID (Linux __sys_setuid: ns_capable_setid)
     if super::capable(super::CAP_SETUID) {
         // Set all UIDs: uid, suid, euid, fsuid - permanently drops root
-        return match super::percpu::set_current_uid_all(uid) {
-            Ok(()) => 0,
-            Err(e) => e.sysret(),
-        };
+        return super::percpu::set_current_uid_all(uid);
     }
 
     // Unprivileged: can only set euid to uid or suid
     if uid == current_cred.uid || uid == current_cred.suid {
-        return match super::percpu::set_current_euid(uid) {
-            Ok(()) => 0,
-            Err(e) => e.sysret(),
-        };
+        return super::percpu::set_current_euid(uid);
     }
 
     // Not permitted
-    KernelError::NotPermitted.sysret()
+    Err(KernelError::NotPermitted)
 }
 
 /// sys_setgid - set group identity (Linux-compatible)
@@ -126,26 +121,20 @@ pub fn sys_setuid(uid: u32, current_cred: super::Cred) -> i64 {
 /// This matches setgid(2) with _POSIX_SAVED_IDS:
 /// - Privileged: sets gid, sgid, egid, fsgid
 /// - Unprivileged: sets only egid, fsgid (can switch between gid and sgid)
-pub fn sys_setgid(gid: u32, current_cred: super::Cred) -> i64 {
+pub fn sys_setgid(gid: u32, current_cred: super::Cred) -> KernelResult<()> {
     // Privileged: CAP_SETGID (Linux __sys_setgid: ns_capable_setid)
     if super::capable(super::CAP_SETGID) {
         // Set all GIDs: gid, sgid, egid, fsgid
-        return match super::percpu::set_current_gid_all(gid) {
-            Ok(()) => 0,
-            Err(e) => e.sysret(),
-        };
+        return super::percpu::set_current_gid_all(gid);
     }
 
     // Unprivileged: can only set egid to gid or sgid
     if gid == current_cred.gid || gid == current_cred.sgid {
-        return match super::percpu::set_current_egid(gid) {
-            Ok(()) => 0,
-            Err(e) => e.sysret(),
-        };
+        return super::percpu::set_current_egid(gid);
     }
 
     // Not permitted
-    KernelError::NotPermitted.sysret()
+    Err(KernelError::NotPermitted)
 }
 
 /// sys_getresuid - get real, effective, and saved user IDs
@@ -167,36 +156,16 @@ pub fn sys_setgid(gid: u32, current_cred: super::Cred) -> i64 {
 /// None required - credentials are stable during syscall execution.
 /// Linux uses RCU for credential access; we use per-CPU cached credentials.
 pub fn sys_getresuid<A: crate::uaccess::UaccessArch>(
-    ruid_ptr: u64,
-    euid_ptr: u64,
-    suid_ptr: u64,
+    ruid_ptr: UserPtr<u32>,
+    euid_ptr: UserPtr<u32>,
+    suid_ptr: UserPtr<u32>,
     current_cred: super::Cred,
-) -> i64 {
+) -> KernelResult<()> {
     use crate::uaccess::put_user;
-
-    // Validate all pointers
-    if !A::access_ok(ruid_ptr, core::mem::size_of::<u32>()) {
-        return KernelError::BadAddress.sysret();
-    }
-    if !A::access_ok(euid_ptr, core::mem::size_of::<u32>()) {
-        return KernelError::BadAddress.sysret();
-    }
-    if !A::access_ok(suid_ptr, core::mem::size_of::<u32>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Write the three UIDs to user space
-    if put_user::<A, u32>(ruid_ptr, current_cred.uid).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-    if put_user::<A, u32>(euid_ptr, current_cred.euid).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-    if put_user::<A, u32>(suid_ptr, current_cred.suid).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    put_user::<A, u32>(ruid_ptr.addr(), current_cred.uid)?;
+    put_user::<A, u32>(euid_ptr.addr(), current_cred.euid)?;
+    put_user::<A, u32>(suid_ptr.addr(), current_cred.suid)?;
+    Ok(())
 }
 
 /// sys_getresgid - get real, effective, and saved group IDs
@@ -217,36 +186,16 @@ pub fn sys_getresuid<A: crate::uaccess::UaccessArch>(
 /// # Locking
 /// None required - credentials are stable during syscall execution.
 pub fn sys_getresgid<A: crate::uaccess::UaccessArch>(
-    rgid_ptr: u64,
-    egid_ptr: u64,
-    sgid_ptr: u64,
+    rgid_ptr: UserPtr<u32>,
+    egid_ptr: UserPtr<u32>,
+    sgid_ptr: UserPtr<u32>,
     current_cred: super::Cred,
-) -> i64 {
+) -> KernelResult<()> {
     use crate::uaccess::put_user;
-
-    // Validate all pointers
-    if !A::access_ok(rgid_ptr, core::mem::size_of::<u32>()) {
-        return KernelError::BadAddress.sysret();
-    }
-    if !A::access_ok(egid_ptr, core::mem::size_of::<u32>()) {
-        return KernelError::BadAddress.sysret();
-    }
-    if !A::access_ok(sgid_ptr, core::mem::size_of::<u32>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Write the three GIDs to user space
-    if put_user::<A, u32>(rgid_ptr, current_cred.gid).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-    if put_user::<A, u32>(egid_ptr, current_cred.egid).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-    if put_user::<A, u32>(sgid_ptr, current_cred.sgid).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    put_user::<A, u32>(rgid_ptr.addr(), current_cred.gid)?;
+    put_user::<A, u32>(egid_ptr.addr(), current_cred.egid)?;
+    put_user::<A, u32>(sgid_ptr.addr(), current_cred.sgid)?;
+    Ok(())
 }
 
 /// sys_setresuid - set real, effective, and saved user IDs
@@ -272,7 +221,12 @@ pub fn sys_getresgid<A: crate::uaccess::UaccessArch>(
 /// # Locking
 /// Per-CPU credential update is atomic. Linux uses prepare_creds/commit_creds
 /// for RCU-based credential replacement; we update per-CPU data directly.
-pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32, current_cred: super::Cred) -> i64 {
+pub fn sys_setresuid(
+    ruid: u32,
+    euid: u32,
+    suid: u32,
+    current_cred: super::Cred,
+) -> KernelResult<()> {
     const NO_CHANGE: u32 = 0xFFFFFFFF; // -1 as unsigned
 
     // Check permissions for each field that will be changed
@@ -287,13 +241,13 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32, current_cred: super::Cred)
 
     // Check each field
     if ruid != NO_CHANGE && !is_permitted(ruid) && !is_privileged() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     if euid != NO_CHANGE && !is_permitted(euid) && !is_privileged() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     if suid != NO_CHANGE && !is_permitted(suid) && !is_privileged() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Convert -1 to None (don't change)
@@ -302,10 +256,7 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32, current_cred: super::Cred)
     let suid_opt = if suid == NO_CHANGE { None } else { Some(suid) };
 
     // Apply the changes
-    match super::percpu::set_current_resuid(ruid_opt, euid_opt, suid_opt) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+    super::percpu::set_current_resuid(ruid_opt, euid_opt, suid_opt)
 }
 
 /// sys_setresgid - set real, effective, and saved group IDs
@@ -331,7 +282,12 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32, current_cred: super::Cred)
 ///
 /// # Locking
 /// Per-CPU credential update is atomic.
-pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32, current_cred: super::Cred) -> i64 {
+pub fn sys_setresgid(
+    rgid: u32,
+    egid: u32,
+    sgid: u32,
+    current_cred: super::Cred,
+) -> KernelResult<()> {
     const NO_CHANGE: u32 = 0xFFFFFFFF; // -1 as unsigned
 
     // Privileged: CAP_SETGID (Linux __sys_setresgid)
@@ -344,13 +300,13 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32, current_cred: super::Cred)
 
     // Check each field
     if rgid != NO_CHANGE && !is_permitted(rgid) && !is_privileged() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     if egid != NO_CHANGE && !is_permitted(egid) && !is_privileged() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     if sgid != NO_CHANGE && !is_permitted(sgid) && !is_privileged() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Convert -1 to None (don't change)
@@ -359,10 +315,7 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32, current_cred: super::Cred)
     let sgid_opt = if sgid == NO_CHANGE { None } else { Some(sgid) };
 
     // Apply the changes
-    match super::percpu::set_current_resgid(rgid_opt, egid_opt, sgid_opt) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+    super::percpu::set_current_resgid(rgid_opt, egid_opt, sgid_opt)
 }
 
 /// sys_setreuid - set real and effective user IDs
@@ -387,7 +340,7 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32, current_cred: super::Cred)
 ///
 /// # Locking
 /// Per-CPU credential update is atomic.
-pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> i64 {
+pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> KernelResult<()> {
     const NO_CHANGE: u32 = 0xFFFFFFFF; // -1 as unsigned
 
     // Privileged: CAP_SETUID (Linux __sys_setreuid)
@@ -399,7 +352,7 @@ pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> i64 {
         && ruid != current_cred.euid
         && !is_privileged()
     {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Permission check for euid: must be in {uid, euid, suid} or privileged
@@ -409,7 +362,7 @@ pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> i64 {
         && euid != current_cred.suid
         && !is_privileged()
     {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Determine what to set
@@ -429,10 +382,7 @@ pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> i64 {
     };
 
     // Apply the changes (fsuid follows euid in set_current_reuid)
-    match super::percpu::set_current_reuid(ruid_opt, euid_opt, new_suid) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+    super::percpu::set_current_reuid(ruid_opt, euid_opt, new_suid)
 }
 
 /// sys_setregid - set real and effective group IDs
@@ -458,7 +408,7 @@ pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> i64 {
 ///
 /// # Locking
 /// Per-CPU credential update is atomic.
-pub fn sys_setregid(rgid: u32, egid: u32, current_cred: super::Cred) -> i64 {
+pub fn sys_setregid(rgid: u32, egid: u32, current_cred: super::Cred) -> KernelResult<()> {
     const NO_CHANGE: u32 = 0xFFFFFFFF; // -1 as unsigned
 
     // Privileged: CAP_SETGID (Linux __sys_setregid)
@@ -470,7 +420,7 @@ pub fn sys_setregid(rgid: u32, egid: u32, current_cred: super::Cred) -> i64 {
         && rgid != current_cred.egid
         && !is_privileged()
     {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Permission check for egid: must be in {gid, egid, sgid} or privileged
@@ -480,7 +430,7 @@ pub fn sys_setregid(rgid: u32, egid: u32, current_cred: super::Cred) -> i64 {
         && egid != current_cred.sgid
         && !is_privileged()
     {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Determine what to set
@@ -500,10 +450,7 @@ pub fn sys_setregid(rgid: u32, egid: u32, current_cred: super::Cred) -> i64 {
     };
 
     // Apply the changes (fsgid follows egid in set_current_regid)
-    match super::percpu::set_current_regid(rgid_opt, egid_opt, new_sgid) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+    super::percpu::set_current_regid(rgid_opt, egid_opt, new_sgid)
 }
 
 /// sys_setfsuid - set filesystem UID
@@ -606,42 +553,43 @@ pub fn sys_setfsgid(gid: u32, current_cred: super::Cred) -> i64 {
 /// getgroups(size, list) (Linux kernel/groups.c): the supplementary
 /// groups; size 0 asks for the count only, a smaller nonzero size is
 /// EINVAL
-pub fn sys_getgroups<A: crate::uaccess::UaccessArch>(size: i32, list: u64) -> i64 {
+pub fn sys_getgroups<A: crate::uaccess::UaccessArch>(
+    size: i32,
+    list: UserPtr<u32>,
+) -> KernelResult<i64> {
     if size < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     let cred = super::current_cred();
     let groups = cred.groups.as_slice();
     if size == 0 {
-        return groups.len() as i64;
+        return Ok(groups.len() as i64);
     }
     if (size as usize) < groups.len() {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     let bytes: alloc::vec::Vec<u8> = groups.iter().flat_map(|g| g.to_ne_bytes()).collect();
-    if crate::uaccess::copy_to_user::<A>(list, &bytes).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-    groups.len() as i64
+    crate::uaccess::copy_to_user::<A>(list.addr(), &bytes)?;
+    Ok(groups.len() as i64)
 }
 
 /// setgroups(size, list) (Linux kernel/groups.c): replace the
 /// supplementary groups; CAP_SETGID (EPERM), at most NGROUPS_MAX and no
 /// invalid gid -1 (EINVAL)
-pub fn sys_setgroups<A: crate::uaccess::UaccessArch>(size: i32, list: u64) -> i64 {
+pub fn sys_setgroups<A: crate::uaccess::UaccessArch>(
+    size: i32,
+    list: UserPtr<u32>,
+) -> KernelResult<()> {
     if !super::capable(super::CAP_SETGID) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     if size < 0 || size as usize > super::NGROUPS_MAX {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     let n = size as usize;
-    let mut bytes = match crate::util::kmem::try_vec(n * 4, 0u8) {
-        Ok(b) => b,
-        Err(e) => return e.sysret(),
-    };
-    if n > 0 && crate::uaccess::copy_from_user::<A>(&mut bytes, list, n * 4).is_err() {
-        return KernelError::BadAddress.sysret();
+    let mut bytes = crate::util::kmem::try_vec(n * 4, 0u8)?;
+    if n > 0 {
+        crate::uaccess::copy_from_user::<A>(&mut bytes, list.addr(), n * 4)?;
     }
     let gids: alloc::vec::Vec<u32> = bytes
         .as_chunks::<4>()
@@ -650,14 +598,10 @@ pub fn sys_setgroups<A: crate::uaccess::UaccessArch>(size: i32, list: u64) -> i6
         .map(|b| u32::from_ne_bytes(*b))
         .collect();
     if gids.contains(&u32::MAX) {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     let mut new = super::prepare_creds();
     new.groups = super::GroupInfo::new(gids);
-    let new = match try_arc(new) {
-        Ok(c) => c,
-        Err(e) => return e.sysret(),
-    };
-    super::commit_creds(new);
-    0
+    super::commit_creds(try_arc(new)?);
+    Ok(())
 }
