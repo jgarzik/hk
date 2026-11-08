@@ -12,7 +12,7 @@
 //! ACKs are queued on the sender's receive queue.
 //!
 //! Every queued message is charged to the receiver's rcvbuf (`truesize`
-//! = payload + overhead), so per-socket memory is bounded by rcvbuf plus
+//! = buffer allocated + overhead), so per-socket memory is bounded by rcvbuf plus
 //! one message. Kernel messages (replies, ACKs, notifications) that do
 //! not fit are dropped and reported once as ENOBUFS (Linux
 //! netlink_overrun; not with NETLINK_NO_ENOBUFS); user-to-user unicast
@@ -212,11 +212,11 @@ pub struct NlSock {
     me: Weak<NlSock>,
 }
 
-/// Bytes charged to rcvbuf per queued message (Linux skb truesize:
-/// payload plus buffer overhead), so tiny messages cannot pin unbounded
-/// memory
-fn truesize(len: usize) -> usize {
-    len + 256
+/// Bytes charged to rcvbuf per queued message (Linux skb truesize: the
+/// buffer as allocated, not just its payload, plus overhead), so tiny
+/// messages in large buffers cannot pin unbounded memory
+fn truesize(data: &Vec<u8>) -> usize {
+    data.capacity() + 256
 }
 
 /// A dump producer (Linux netlink_callback.dump): appends the next
@@ -398,7 +398,7 @@ impl NlSock {
     /// netlink_attachskb: the first skb always fits, later ones while
     /// rmem stays within rcvbuf and the socket is not congested)
     fn charge(&self, skb: &NlSkb) -> bool {
-        let ts = truesize(skb.data.len());
+        let ts = truesize(&skb.data);
         let before = self.rmem.fetch_add(ts, Ordering::AcqRel);
         let limit = self.sk.rcvbuf() as usize;
         if (before == 0 || before + ts <= limit) && !self.congested.load(Ordering::Acquire) {
@@ -453,7 +453,7 @@ impl NlSock {
                 self.push(skb);
                 return Ok(());
             }
-            let ts = truesize(skb.data.len());
+            let ts = truesize(&skb.data);
             timeo = wait_on(&self.wait, timeo, || {
                 self.has_room(ts) || self.dead.load(Ordering::Acquire)
             })?;
@@ -509,8 +509,7 @@ impl NlSock {
             return q.front().cloned();
         }
         let skb = q.pop_front()?;
-        self.rmem
-            .fetch_sub(truesize(skb.data.len()), Ordering::AcqRel);
+        self.rmem.fetch_sub(truesize(&skb.data), Ordering::AcqRel);
         let empty = q.is_empty();
         drop(q);
         // Linux netlink_rcv_wake
@@ -552,6 +551,12 @@ impl NlSock {
     /// only moves forward, so objects removed mid-dump cannot stall it.
     /// Returns whether a part was queued.
     fn dump_step(&self) -> bool {
+        if self.dump.lock().is_none() {
+            return false;
+        }
+        // Allocated before NlSock.dump is taken (a spin lock): one part,
+        // NLMSG_DONE included (fill leaves room for it), one slab object
+        let mut buf = Vec::with_capacity(rtnetlink::DUMP_SIZE);
         let mut d = self.dump.lock();
         let Some(st) = d.as_mut() else {
             return false;
@@ -560,8 +565,6 @@ impl NlSock {
         if r != 0 && r >= self.sk.rcvbuf() as usize {
             return false;
         }
-        // One part plus NLMSG_DONE: fill stops at DUMP_SIZE
-        let mut buf = Vec::with_capacity(rtnetlink::DUMP_SIZE + attr::NLMSG_HDRLEN + 4);
         let done = match st.cb.fill(self, &mut buf) {
             Ok(false) => None,
             Ok(true) => Some(0),
@@ -577,7 +580,7 @@ impl NlSock {
         // rmem past rcvbuf, which Linux also allows for one skb). Queued
         // under the dump lock so parts stay in order; readers are woken
         // after it is dropped.
-        self.rmem.fetch_add(truesize(buf.len()), Ordering::AcqRel);
+        self.rmem.fetch_add(truesize(&buf), Ordering::AcqRel);
         self.enqueue(NlSkb::kernel(buf, 0));
         drop(d);
         self.sk.data_ready();
