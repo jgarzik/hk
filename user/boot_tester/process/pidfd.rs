@@ -26,15 +26,18 @@
 //! - PIDFD_OPEN_THREAD: pidfd_open of a non-leader thread without
 //!   PIDFD_THREAD fails (ENOENT since 6.16, EINVAL before)
 //! - PIDFD_OPEN_CLOEXEC: the new descriptor is close-on-exec
+//! - PIDFD_EMFILE: at RLIMIT_NOFILE, pidfd_open and pidfd_getfd fail
+//!   with EMFILE (Linux get_unused_fd_flags)
 
 use crate::harness::{fail_num, pass, verdict};
 use crate::helpers::{linux_at_least, msleep, print, print_num, println};
 use crate::mm::fork_mm::{join, spawn_thread};
 use hk_syscall::{
-    CloneArgs, O_NONBLOCK, P_PIDFD, POLLHUP, POLLIN, PollFd, SIGKILL, SigInfo, WEXITED, Zeroable,
-    sys_clone, sys_clone3, sys_close, sys_exit, sys_exit_group, sys_fcntl, sys_fork, sys_getpid,
-    sys_kill, sys_open, sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2,
-    sys_poll, sys_ptrace, sys_read, sys_rt_sigaction, sys_wait4, sys_waitid, sys_write,
+    CloneArgs, O_NONBLOCK, P_PIDFD, POLLHUP, POLLIN, PollFd, RLIMIT_NOFILE, RLimit, SIGKILL,
+    SigInfo, WEXITED, Zeroable, sys_clone, sys_clone3, sys_close, sys_exit, sys_exit_group,
+    sys_fcntl, sys_fork, sys_getpid, sys_getrlimit, sys_kill, sys_open, sys_pidfd_getfd,
+    sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2, sys_poll, sys_ptrace, sys_read,
+    sys_rt_sigaction, sys_setrlimit, sys_wait4, sys_waitid, sys_write,
 };
 
 /// Run all pidfd tests
@@ -55,6 +58,7 @@ pub fn run_tests() {
     test_pidfd_poll_group();
     test_pidfd_open_thread();
     test_pidfd_open_cloexec();
+    test_pidfd_emfile();
 }
 
 #[repr(C, align(16))]
@@ -201,6 +205,38 @@ fn test_pidfd_open_cloexec() {
         sys_close(fd as u64);
     }
     verdict(b"PIDFD_OPEN_CLOEXEC", fl == 1, fl);
+}
+
+/// In a child with RLIMIT_NOFILE just past its pidfd (every lower
+/// descriptor is open: the pidfd took the lowest free one), a second
+/// pidfd_open and a pidfd_getfd find no descriptor: EMFILE
+fn test_pidfd_emfile() {
+    let pid = sys_fork();
+    if pid == 0 {
+        let p = sys_pidfd_open(sys_getpid() as i32, 0);
+        let mut lim = RLimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if p < 0 || sys_getrlimit(RLIMIT_NOFILE, &mut lim) != 0 {
+            sys_exit(1);
+        }
+        lim.rlim_cur = p as u64 + 1;
+        if sys_setrlimit(RLIMIT_NOFILE, &lim) != 0 {
+            sys_exit(2);
+        }
+        if sys_pidfd_open(sys_getpid() as i32, 0) != -24 {
+            sys_exit(3);
+        }
+        sys_exit(if sys_pidfd_getfd(p as i32, p as i32, 0) == -24 {
+            0
+        } else {
+            4
+        });
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    verdict(b"PIDFD_EMFILE", st == 0, i64::from(st >> 8));
 }
 
 /// Test pidfd_open for current process
