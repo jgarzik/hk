@@ -53,24 +53,18 @@ pub struct UidGidExtent {
 ///
 /// Contains a set of extents that define the mapping between
 /// IDs in this namespace and IDs in the parent namespace.
+#[derive(Default)]
 pub struct UidGidMap {
     /// Mapping extents (Linux allows up to 340)
     extents: RwLock<Vec<UidGidExtent>>,
 }
 
 impl UidGidMap {
-    /// Create a new empty UID/GID map
-    pub fn new() -> Self {
-        Self {
-            extents: RwLock::new(Vec::new()),
-        }
-    }
-
     /// Create an identity map (for init namespace)
     ///
     /// Maps all IDs to themselves (0→0, 1→1, etc.)
     pub fn new_identity() -> Self {
-        let map = Self::new();
+        let map = Self::default();
         // Set identity mapping covering all possible IDs
         let _ = map.set_mapping(alloc::vec![UidGidExtent {
             first: 0,
@@ -192,8 +186,8 @@ impl UserNamespace {
         let inum = super::inum::Inum::alloc().map_err(|e| e.errno())?;
 
         try_arc(Self {
-            uid_map: UidGidMap::new(),
-            gid_map: UidGidMap::new(),
+            uid_map: UidGidMap::default(),
+            gid_map: UidGidMap::default(),
             level: parent.level + 1,
             parent: Some(parent.clone()),
             owner: cred.uid,

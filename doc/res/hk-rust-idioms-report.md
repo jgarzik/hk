@@ -11,7 +11,7 @@ belongs to doc/ROADMAP.md phase M1, the rest to S1.
 | # | Item | Lines saved | Risk | Prio |
 |---|------|-------------|------|------|
 | 2 | `SysRet` trait + `From<UaccessError>`: `?` in `sys_*` | about -750 | low-med (errno mapping) | high |
-| 5 | Struct update `..Default::default()` / `..zeroed()` | -300 (kernel) / -120 (user) | low | med |
+| 5 | Struct update `..Default::default()` in user/ | about -100 | low | med |
 | 7 | One `util/bytes` LE/BE reader on `first_chunk` | -40 | low | low |
 | 8 | `is_multiple_of` for `% a == 0` | 0 | 0 | low |
 | 9 | xhci MMIO through `IoMem` | 0 | 0 | low |
@@ -106,48 +106,20 @@ Order: 2 goes per subsystem (M1); let-else is done and linted
   - No locking impact: `?` drops guards in reverse order, exactly as the early
     `return` does now.
 
-## 5. Struct update syntax: `..Default::default()` / `..FromBytes::zeroed()`
+## 5. Struct update syntax in user/: `..Default::default()`
 
-- **Feature:** struct update (old) plus `#[derive(Default)]` with enum `#[default]` (1.62).
-- **Also:** the 7 non-const `new()`s that set every field to its default
-  become `#[derive(Default)]` (about -50).
-- **Evidence:**
-  - 882 `field: 0|false|None|[0; N]|Vec::new()` lines in kernel literals, 454 in user/.
-  - A scan for literals with 3 or more such fields finds about **544 removable lines
-    in kernel and 124 in user/**. Literals with 6 or more account for 298.
-  - Top kernel sites: net/tcp/cb.rs:698 `TcpCb::new` (50 zero fields);
-    task/percpu.rs:1237/1443/2109 `TaskInner` (22/19/15); task/misc.rs:80 `SysInfo`
-    (14); hw/usb/xhci.rs:753 (13); fs/stat.rs:370 `Statx` (13); ns/net.rs:105;
-    net/skb.rs:101.
-- `#[derive(Default)]` on `TcpCb` fails only because `TcpState` has no default. Adding `#[default] Closed` (net/tcp/cb.rs:48) makes the 62-line ctor about 10:
-  ```rust
-  pub fn new(cfg: Cfg) -> Self {
-      Self { cfg, snd_cap: 64 * 1024, rcv_cap: 64 * 1024, mss: MSS_DEFAULT,
-             peer_mss: MSS_DEFAULT, adv_mss: MSS_DEFAULT, path_mss: 65495,
-             rto: RTO_INIT, ..Default::default() }
-  }
-  ```
-- **ABI structs (`pod!` types):** use `..FromBytes::zeroed()`, which is safe and
-  already exists (util/pod.rs:27). `derive(Default)` fails on arrays longer than 32,
-  and that is why `NewUtsname`, `SigInfoFields` and `Timex` have hand-written
-  `Default`. Benefit beyond LOC: reserved and spare fields are zero by construction,
-  which is the Linux ABI rule for `statx.__spare*` and `siginfo` padding.
-  ```rust
-  Statx { stx_mask, stx_blksize: 4096, stx_nlink: attr.nlink, ..., ..FromBytes::zeroed() }
-  impl Default for SysInfo { fn default() -> Self { Self { mem_unit: 1, ..FromBytes::zeroed() } } } // 18 -> 3
-  ```
-- **user/:** the remaining zero-field literals from the scan above use
-  `..Default::default()`, or `..Zeroable::zeroed()` (user/syscall/types.rs) for
-  types that cannot derive `Default`.
-- **Limits and risk:**
-  - Not usable in `const` contexts: `Default` isn't const on stable, and
-    default-field-values (`a: u32 = 0`) is unstable. So `ZERO_CONTEXT` (arch/x86_64/context.rs:339) and the 25
-    all-default `const fn new()` stay.
-  - Semantic risk: a new field silently defaults to 0. Fine for counters and state;
-    review the `TaskInner` sites, where `exit_signal` and `leader` differ per path.
-  - For `TaskInner`, a base ctor taking the non-default fields (`page_table`,
-    `state`) is better than `Default`, because `ArchPageTable` has no meaningful
-    default.
+Kernel literals left as they are, on purpose: `const fn` ctors and
+`ZERO_CONTEXT` (`Default` isn't const on stable); types with a `Drop`
+(`NetNamespace`, `PollContext`) or a field with no meaningful default
+(`XhciController`'s `PciDevice`, `UsbDevice`'s `UsbSpeed`, the timer
+inners' `HrClock`, `Task`, `CloneConfig`); and structs holding more than
+one lock, since `derive(Default)` gives every lock in them the derive
+line as its lockdep class.
+
+- **user/:** the remaining zero-field literals use `..Default::default()`,
+  or `..Zeroable::zeroed()` (user/syscall/types.rs) for types that cannot
+  derive `Default`.
+
 
 ## 7. One LE/BE reader on `first_chunk` (1.77)
 

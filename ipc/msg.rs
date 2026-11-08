@@ -90,6 +90,7 @@ impl Search {
 
 /// Everything msgsnd, msgrcv and msgctl read or change, under one lock
 /// (Linux: the msq lock, ipc_lock_object(&msq->q_perm))
+#[derive(Default)]
 pub struct MsgState {
     /// Message list
     list: VecDeque<MsgMsg>,
@@ -129,15 +130,9 @@ impl MsgQueue {
         try_arc(Self {
             perm: KernIpcPerm::new(key, mode),
             q: Mutex::new(MsgState {
-                list: VecDeque::new(),
-                cbytes: 0,
-                qnum: 0,
                 qbytes: u64::from(ns.msg_ctlmnb),
-                stime: 0,
-                rtime: 0,
                 ctime: current_time_secs(),
-                lspid: 0,
-                lrpid: 0,
+                ..Default::default()
             }),
             waitq: WaitQueue::new(),
             ns,

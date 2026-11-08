@@ -45,10 +45,7 @@ impl LookupFlags {
     pub fn open() -> Self {
         Self {
             follow: true,
-            directory: false,
-            create: false,
-            no_xdev: false,
-            linkat_empty: false,
+            ..Default::default()
         }
     }
 
@@ -57,9 +54,7 @@ impl LookupFlags {
         Self {
             follow: true,
             directory: true,
-            create: false,
-            no_xdev: false,
-            linkat_empty: false,
+            ..Default::default()
         }
     }
 

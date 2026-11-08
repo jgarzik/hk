@@ -44,8 +44,9 @@ pub mod flags {
 
 /// Connection states (RFC 9293 3.3.2; values are Linux's TCP_* order is
 /// not kept: use `linux()` for /proc and TCP_INFO)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TcpState {
+    #[default]
     Closed,
     Listen,
     SynSent,
@@ -606,6 +607,7 @@ impl Ooo {
 }
 
 /// The control block
+#[derive(Default)]
 pub struct TcpCb {
     pub state: TcpState,
     pub cfg: Cfg,
@@ -725,10 +727,8 @@ pub struct TcpCb {
     pub(super) last_oow: Option<u64>,
     /// Counters (TCP_INFO)
     pub(super) stats: Stats,
-    /// Quanta held in the global TCP memory: the queues' bytes rounded
-    /// up, never more (Linux sk_forward_alloc, reclaimed below a page
-    /// on every uncharge)
-    held: usize,
+    /// Quanta held in the global TCP memory; counts the socket too
+    held: mem::Held,
 }
 
 /// Counters for TCP_INFO; the u32 ones wrap, as Linux tcp_info's
@@ -752,69 +752,16 @@ pub struct Stats {
 impl TcpCb {
     /// A closed control block
     pub fn new(cfg: Cfg) -> Self {
-        mem::socket_inc();
         Self {
-            state: TcpState::Closed,
             cfg,
-            opts: Opts::default(),
-            iss: 0,
-            snd_una: 0,
-            snd_nxt: 0,
-            snd_max: 0,
-            snd_wnd: 0,
-            snd_wl1: 0,
-            snd_wl2: 0,
-            max_wnd: 0,
-            sndq: VecDeque::new(),
-            sndq_seq: 0,
             snd_cap: 64 * 1024,
-            fin_queued: false,
-            snd_sml: 0,
-            irs: 0,
-            rcv_nxt: 0,
-            rcv_adv: 0,
-            rcv_wup: 0,
-            rcvq: VecDeque::new(),
-            ooo: Ooo::default(),
-            ooo_fin: None,
             rcv_cap: 64 * 1024,
-            rcv_locked: false,
-            rcv_shut: false,
-            snd_wscale: 0,
-            rcv_wscale: 0,
-            wscale_ok: false,
-            ts_ok: false,
-            ts_off: 0,
-            ts_recent: 0,
-            ts_stamp: 0,
-            clock: 0,
             mss: MSS_DEFAULT,
             peer_mss: MSS_DEFAULT,
             path_mss: 65495,
             adv_mss: MSS_DEFAULT,
-            srtt8: 0,
-            rttvar4: 0,
             rto: RTO_INIT,
-            backoff: 0,
-            probes: 0,
-            rtt_seq: None,
-            syn_rtx: false,
-            passive: false,
-            tmr: None,
-            wait_at: None,
-            keep_at: None,
-            rtx_stamp: None,
-            rcv_tstamp: 0,
-            lsndtime: 0,
-            cong: Cong::default(),
-            dack: Dack::default(),
-            orphan: false,
-            soft_err: None,
-            ack_now: false,
-            ack_nomem: false,
-            last_oow: None,
-            stats: Stats::default(),
-            held: 0,
+            ..Default::default()
         }
     }
 
@@ -996,7 +943,7 @@ impl TcpCb {
         if left > 0 {
             self.mem_force(left.min(n));
         }
-        n.min((self.held * mem::QUANTUM).saturating_sub(self.mem_used()))
+        n.min((self.held.0 * mem::QUANTUM).saturating_sub(self.mem_used()))
     }
 
     /// Room in the send queue (none while TCP_NOTSENT_LOWAT unsent
@@ -1311,13 +1258,13 @@ impl TcpCb {
     /// never all pass one check
     pub(super) fn mem_schedule(&mut self, size: usize, kind: MemKind) -> bool {
         let need = mem::quanta(self.mem_used() + size);
-        if need <= self.held {
+        if need <= self.held.0 {
             return true;
         }
-        let amt = need - self.held;
+        let amt = need - self.held.0;
         mem::add(amt);
         if self.mem_raise(mem::allocated(), size, kind) {
-            self.held = need;
+            self.held.0 = need;
             return true;
         }
         mem::sub(amt);
@@ -1350,7 +1297,7 @@ impl TcpCb {
             if floor {
                 return true;
             }
-            if !mem::under_pressure() || mem::limit(2) > mem::sockets() * self.held {
+            if !mem::under_pressure() || mem::limit(2) > mem::sockets() * self.held.0 {
                 return true;
             }
         }
@@ -1361,9 +1308,9 @@ impl TcpCb {
     /// sk_forced_mem_schedule)
     fn mem_force(&mut self, size: usize) {
         let need = mem::quanta(self.mem_used() + size);
-        if need > self.held {
-            mem::add(need - self.held);
-            self.held = need;
+        if need > self.held.0 {
+            mem::add(need - self.held.0);
+            self.held.0 = need;
         }
     }
 
@@ -1372,12 +1319,12 @@ impl TcpCb {
     /// sk_forced_mem_schedule)
     pub(super) fn mem_settle(&mut self) {
         let now = mem::quanta(self.mem_used());
-        if now >= self.held {
-            mem::add(now - self.held);
+        if now >= self.held.0 {
+            mem::add(now - self.held.0);
         } else {
-            mem::sub(self.held - now);
+            mem::sub(self.held.0 - now);
         }
-        self.held = now;
+        self.held.0 = now;
     }
 
     // --- timers --------------------------------------------------------------
@@ -1401,12 +1348,5 @@ impl TcpCb {
         self.wait_at = None;
         self.dack.at = None;
         self.keep_at = None;
-    }
-}
-
-impl Drop for TcpCb {
-    fn drop(&mut self) {
-        mem::sub(self.held);
-        mem::socket_dec();
     }
 }

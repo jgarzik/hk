@@ -131,12 +131,24 @@ pub fn sockets() -> usize {
     SOCKETS.load(Ordering::Relaxed)
 }
 
-pub fn socket_inc() {
-    SOCKETS.fetch_add(1, Ordering::Relaxed);
+/// A connection's quanta in the global count: the queues' bytes rounded
+/// up, never more (Linux sk_forward_alloc, reclaimed below a page on
+/// every uncharge). Counts the socket while it lives (Linux
+/// sk_sockets_allocated_inc/dec) and returns the quanta on drop.
+pub struct Held(pub usize);
+
+impl Default for Held {
+    fn default() -> Self {
+        SOCKETS.fetch_add(1, Ordering::Relaxed);
+        Self(0)
+    }
 }
 
-pub fn socket_dec() {
-    SOCKETS.fetch_sub(1, Ordering::Relaxed);
+impl Drop for Held {
+    fn drop(&mut self) {
+        sub(self.0);
+        SOCKETS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A connection with `wmem` bytes of its own queued while the total is

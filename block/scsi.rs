@@ -304,7 +304,7 @@ pub trait ScsiHost: Send + Sync {
 
 /// INQUIRY response data (standard 36 bytes)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct InquiryData {
     /// Peripheral device type and qualifier
     pub peripheral: u8,
@@ -419,18 +419,7 @@ pub fn test_unit_ready(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiRes
 /// Execute INQUIRY and return response data (read into the heap: the
 /// transport may DMA it, never from a kernel stack)
 pub fn inquiry(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResult<InquiryData> {
-    let mut data = try_box(InquiryData {
-        peripheral: 0,
-        rmb: 0,
-        version: 0,
-        response_format: 0,
-        additional_length: 0,
-        flags: [0; 3],
-        vendor: [0; 8],
-        product: [0; 16],
-        revision: [0; 4],
-    })
-    .map_err(|_| ScsiError::NoMemory)?;
+    let mut data = try_box(InquiryData::default()).map_err(|_| ScsiError::NoMemory)?;
 
     let cmd = ScsiCommand::read(Cdb::inquiry(36), (&raw mut *data).cast::<u8>(), 36, 5000);
 

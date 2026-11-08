@@ -288,6 +288,7 @@ impl FanotifyEvent {
 // =============================================================================
 
 /// Internal fanotify state
+#[derive(Default)]
 struct FanotifyInner {
     /// Inode marks: inode_number -> mark
     inode_marks: BTreeMap<u64, FanotifyMark>,
@@ -313,12 +314,7 @@ impl Fanotify {
     /// Create a new fanotify instance
     pub fn new(init_flags: u32) -> Result<Arc<Self>, KernelError> {
         try_arc(Self {
-            inner: IrqSpinlock::new(FanotifyInner {
-                inode_marks: BTreeMap::new(),
-                mount_marks: BTreeMap::new(),
-                fs_marks: BTreeMap::new(),
-                events: Vec::new(),
-            }),
+            inner: IrqSpinlock::new(FanotifyInner::default()),
             wait_queue: WaitQueue::new(),
             init_flags,
         })

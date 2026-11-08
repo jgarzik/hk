@@ -298,6 +298,7 @@ struct PendingOp {
 }
 
 /// Inner state protected by spinlock
+#[derive(Default)]
 struct IoUringInner {
     /// Ring parameters
     sq_entries: u32,
@@ -344,15 +345,10 @@ impl IoUringInner {
             cq_entries,
             sq_mask,
             cq_mask,
-            sq_head: 0,
-            cq_tail: 0,
             sq_array,
             sqes,
             cqes,
-            cq_overflow: 0,
-            sq_dropped: 0,
-            registered_files: None,
-            pending_ops: Vec::new(),
+            ..Default::default()
         })
     }
 

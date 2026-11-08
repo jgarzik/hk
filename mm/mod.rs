@@ -162,6 +162,7 @@ pub const STACK_GUARD_GAP: u64 = 256 * 1024;
 /// Per-task memory descriptor
 ///
 /// Manages the virtual memory areas (VMAs) for a task's address space.
+#[derive(Default)]
 pub struct MmStruct {
     /// List of VMAs, sorted by start address; each its own allocation
     /// (Linux vm_area_cachep: the VMA slab cache)
@@ -238,18 +239,8 @@ impl MmStruct {
     /// Create a new memory descriptor
     pub fn new(mmap_base: u64) -> Self {
         Self {
-            vmas: Vec::new(),
             mmap_base,
-            start_brk: 0,
-            brk: 0,
-            locked_vm: 0,
-            total_vm: 0,
-            def_flags: 0,
-            exe: None,
-            exe_deny: None,
-            args: MmLayout::default(),
-            owner: Weak::new(),
-            pgd: 0,
+            ..Default::default()
         }
     }
 

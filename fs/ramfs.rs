@@ -1145,12 +1145,8 @@ impl SuperOps for RamfsSuperOps {
         StatFs {
             f_type: RAMFS_MAGIC,
             f_bsize: 4096,
-            f_blocks: 0, // Unlimited (in-memory filesystem)
-            f_bfree: 0,
-            f_bavail: 0,
-            f_files: 0, // Unlimited inodes
-            f_ffree: 0,
             f_namelen: 255,
+            ..StatFs::default()
         }
     }
 

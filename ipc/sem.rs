@@ -106,6 +106,7 @@ pub struct SemQueue {
 type Waiter = (Arc<SemQueue>, usize);
 
 /// One semaphore's state (Linux struct sem)
+#[derive(Default)]
 struct PerSem {
     val: i32,
     /// Last modifier (sempid)
@@ -376,13 +377,7 @@ impl SemArray {
         let sems = (0..nsems)
             .map(|_| SemSlot {
                 lock: Mutex::new(()),
-                data: UnsafeCell::new(PerSem {
-                    val: 0,
-                    pid: 0,
-                    otime: 0,
-                    pending: VecDeque::new(),
-                    undo: BTreeMap::new(),
-                }),
+                data: UnsafeCell::new(PerSem::default()),
             })
             .collect();
         try_arc(Self {

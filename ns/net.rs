@@ -133,7 +133,7 @@ impl NetNamespace {
             devices: RwLock::new(Vec::new()),
             next_ifindex: AtomicU32::new(1),
             fib: Fib::new(),
-            nl: NlTable::new(),
+            nl: Default::default(),
             tcp: Default::default(),
             udp: UdpTable::default(),
             port_range: PortRange::default(),

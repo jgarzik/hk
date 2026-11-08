@@ -105,6 +105,7 @@ const KERNEL_PARAMS: &[&str] = &[
 /// unknown_bootoption): `rdinit=`, `init=`, words the kernel does not
 /// know and without '=' as extra argv, `name=value` ones without a '.'
 /// (module parameters) as extra envp; everything after `--` is argv
+#[derive(Default)]
 pub struct InitArgs {
     pub rdinit: Option<alloc::string::String>,
     pub init: Option<alloc::string::String>,
@@ -115,12 +116,7 @@ pub struct InitArgs {
 /// Split a command line into init's arguments (see [`InitArgs`])
 pub fn init_args(cmdline: &str) -> InitArgs {
     use alloc::string::ToString;
-    let mut a = InitArgs {
-        rdinit: None,
-        init: None,
-        argv: alloc::vec::Vec::new(),
-        envp: alloc::vec::Vec::new(),
-    };
+    let mut a = InitArgs::default();
     let mut words = cmdline.split_whitespace();
     for w in words.by_ref() {
         if w == "--" {

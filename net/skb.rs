@@ -45,6 +45,7 @@ pub const MAX_SKB_SIZE: usize = 65536 + 512;
 /// # Invariants
 /// `data <= tail <= buf.len()`; `mac` and `nh`, when set, are at most
 /// `tail` (moving `tail` below one clears it).
+#[derive(Default)]
 pub struct SkBuff {
     /// The buffer: headroom, packet data, tailroom
     buf: Box<[u8]>,
@@ -103,18 +104,7 @@ impl SkBuff {
             buf: v.into_boxed_slice(),
             data: headroom,
             tail: headroom,
-            protocol: EtherType::Unknown(0),
-            ip_protocol: 0,
-            dev: None,
-            saddr: None,
-            daddr: None,
-            pkt_type: PktType::Host,
-            ip_bcast: false,
-            ip_ttl: 0,
-            ip_tos: 0,
-            owner: 0,
-            mac: None,
-            nh: None,
+            ..Default::default()
         })
         .ok()
     }

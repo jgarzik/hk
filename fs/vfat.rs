@@ -2331,13 +2331,9 @@ impl SuperOps for VfatSuperOps {
         // For now, return minimal valid values
         StatFs {
             f_type: MSDOS_SUPER_MAGIC,
-            f_bsize: 4096, // Cluster size varies; use common value
-            f_blocks: 0,
-            f_bfree: 0,
-            f_bavail: 0,
-            f_files: 0, // FAT doesn't track inode count
-            f_ffree: 0,
+            f_bsize: 4096,  // Cluster size varies; use common value
             f_namelen: 255, // LFN max length
+            ..StatFs::default()
         }
     }
 

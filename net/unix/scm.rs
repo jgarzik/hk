@@ -50,7 +50,7 @@ const OVERFLOW_ID: u32 = 65534;
 
 /// Credentials carried by a message (Linux UNIXCB pid/uid/gid): the
 /// sender's struct pid, numbered only for a receiver (none: pid 0)
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Creds {
     pub pid: Option<Arc<crate::task::pid::Pid>>,
     pub uid: u32,

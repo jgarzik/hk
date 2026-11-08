@@ -2055,12 +2055,8 @@ impl SuperOps for ProcfsSuperOps {
         StatFs {
             f_type: PROC_SUPER_MAGIC,
             f_bsize: 4096,
-            f_blocks: 0,
-            f_bfree: 0,
-            f_bavail: 0,
-            f_files: 0,
-            f_ffree: 0,
             f_namelen: 255,
+            ..StatFs::default()
         }
     }
 

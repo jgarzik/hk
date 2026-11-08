@@ -22,19 +22,13 @@ pub struct DeviceInfo {
 }
 
 /// Registry of all discovered devices
+#[derive(Default)]
 pub struct DeviceRegistry {
     /// Devices indexed by path
     devices: BTreeMap<String, DeviceInfo>,
 }
 
 impl DeviceRegistry {
-    /// Create an empty registry
-    pub fn new() -> Self {
-        Self {
-            devices: BTreeMap::new(),
-        }
-    }
-
     /// Add a device to the registry
     pub fn add(&mut self, path: String, info: DeviceInfo) {
         self.devices.insert(path, info);

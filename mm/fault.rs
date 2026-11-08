@@ -52,6 +52,7 @@ pub enum VmFault {
 }
 
 /// What a fault needs of its VMA, copied out under the mm lock
+#[derive(Default)]
 struct Area {
     start: u64,
     end: u64,
@@ -731,14 +732,10 @@ pub fn unshare_for_write(
         start: page,
         end: page + PAGE_SIZE,
         prot,
-        shared: false,
         anon: anon_vma.is_some(),
-        thp: false,
-        offset: 0,
         pgoff: index,
-        file: None,
         anon_vma,
-        shmem: None,
+        ..Default::default()
     };
     do_wp_page(mm, ptep, pte, addr, &area)
 }

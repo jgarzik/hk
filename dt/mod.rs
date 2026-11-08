@@ -168,7 +168,7 @@ impl<'a> DeviceTree<'a> {
 
     /// Build a device registry from this device tree
     pub fn build_registry(&self) -> DeviceRegistry {
-        let mut registry = DeviceRegistry::new();
+        let mut registry = DeviceRegistry::default();
 
         if let Some(root) = self.root() {
             build_registry_recursive(&root, String::new(), &mut registry);

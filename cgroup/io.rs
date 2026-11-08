@@ -56,18 +56,12 @@ impl IoMax {
 /// throttled or accounted yet (BUGS "cgroup controller application");
 /// when it is, the token bucket lives under the queue's lock, as Linux
 /// blk-throttle under queue_lock.
+#[derive(Default)]
 pub struct IoState {
     devices: Mutex<BTreeMap<DevId, IoMax>>,
 }
 
 impl IoState {
-    /// Create a new IO state
-    pub fn new() -> Self {
-        Self {
-            devices: Mutex::new(BTreeMap::new()),
-        }
-    }
-
     /// The devices with limits, in device order
     pub fn limits(&self) -> Vec<(DevId, IoMax)> {
         self.devices
@@ -122,7 +116,7 @@ impl CgroupSubsysOps for IoController {
         parent_css: Option<&Arc<CgroupSubsysState>>,
     ) -> Result<Arc<dyn CssPrivate>, KernelError> {
         let _ = parent_css;
-        Ok(try_arc(IoState::new())?)
+        Ok(try_arc(IoState::default())?)
     }
 
     fn css_free(&self, _css: &CgroupSubsysState) {

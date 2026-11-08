@@ -221,7 +221,7 @@ pub const MREMAP_DONTUNMAP: u32 = 4;
 pub const PAGE_SIZE: u64 = 4096;
 
 /// Virtual Memory Area - describes a contiguous region of virtual memory
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Vma {
     /// Start address (page-aligned, inclusive)
     pub start: u64,
@@ -263,13 +263,8 @@ impl Vma {
             end,
             prot,
             flags,
-            file: None,
-            offset: 0,
-            anon_vma: None,
             pgoff: start / PAGE_SIZE,
-            mempolicy: None,
-            shmem: None,
-            shm: None,
+            ..Default::default()
         }
     }
 
@@ -283,17 +278,9 @@ impl Vma {
         offset: u64,
     ) -> Self {
         Self {
-            start,
-            end,
-            prot,
-            flags,
             file: Some(file),
             offset,
-            anon_vma: None,
-            pgoff: start / PAGE_SIZE,
-            mempolicy: None,
-            shmem: None,
-            shm: None,
+            ..Self::new(start, end, prot, flags)
         }
     }
 
@@ -303,17 +290,8 @@ impl Vma {
     /// reverse mapping support for swap-out.
     pub fn new_anon(start: u64, end: u64, prot: u32, flags: u32, anon_vma: Arc<AnonVma>) -> Self {
         Self {
-            start,
-            end,
-            prot,
-            flags,
-            file: None,
-            offset: 0,
             anon_vma: Some(anon_vma),
-            pgoff: start / PAGE_SIZE,
-            mempolicy: None,
-            shmem: None,
-            shm: None,
+            ..Self::new(start, end, prot, flags)
         }
     }
 

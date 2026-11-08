@@ -304,10 +304,7 @@ fn mss_default_without_option() {
         ack: 2,
         flags: flags::SYN | flags::ACK,
         wnd: 8000,
-        mss: None,
-        ws: None,
-        ts: None,
-        data: &[],
+        ..Default::default()
     };
     let mut out = Out::default();
     a.input(&synack, 5, &mut out);
@@ -653,13 +650,8 @@ fn rst_rules_rfc5961() {
     let nxt = p.a.rcv_nxt;
     let rst = |seq| SegIn {
         seq,
-        ack: 0,
         flags: flags::RST,
-        wnd: 0,
-        mss: None,
-        ws: None,
-        ts: None,
-        data: &[],
+        ..Default::default()
     };
     // In window, not exact: challenge ACK (spaced past the 500 ms
     // per-connection rate limit)
@@ -710,11 +702,7 @@ fn syn_sent_refused_and_bad_ack() {
         seq: 9,
         ack: 77,
         flags: flags::ACK,
-        wnd: 0,
-        mss: None,
-        ws: None,
-        ts: None,
-        data: &[],
+        ..Default::default()
     };
     let mut out = Out::default();
     a.input(&bad, 0, &mut out);
@@ -756,13 +744,8 @@ fn reset_errors_by_state() {
     assert_eq!(p.a.state, TcpState::CloseWait);
     let rst = SegIn {
         seq: p.a.rcv_nxt,
-        ack: 0,
         flags: flags::RST,
-        wnd: 0,
-        mss: None,
-        ws: None,
-        ts: None,
-        data: &[],
+        ..Default::default()
     };
     let mut out = Out::default();
     p.a.input(&rst, 0, &mut out);
@@ -896,10 +879,8 @@ fn ack_with_data_completes_handshake() {
         ack: 100,
         flags: flags::ACK | flags::PSH,
         wnd: 1000,
-        mss: None,
-        ws: None,
-        ts: None,
         data: b"payload",
+        ..Default::default()
     };
     let mut out = Out::default();
     b.input(&ack, 1, &mut out);
@@ -983,10 +964,8 @@ fn rcv_nxt_only_over_accepted_bytes() {
         ack: p.b.snd_una,
         flags: flags::ACK,
         wnd: 1000,
-        mss: None,
-        ws: None,
-        ts: None,
         data: &flood,
+        ..Default::default()
     };
     let (start, edge) = (p.b.rcv_nxt, p.b.rcv_nxt.wrapping_add(p.b.rcv_wnd()));
     assert_eq!(p.b.rcv_wnd(), 10_000);
@@ -1010,10 +989,8 @@ fn covered_ooo_intervals_do_not_block_fin() {
             ack,
             flags: flags::ACK | fl,
             wnd: 8000,
-            mss: None,
-            ws: None,
-            ts: None,
             data: &d,
+            ..Default::default()
         };
         let mut out = Out::default();
         b.input(&s, 0, &mut out);

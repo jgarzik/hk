@@ -229,6 +229,7 @@ impl UdpSock {
 
 /// Per-message IP parameters from sendmsg control data (Linux
 /// ip_cmsg_send: IP_PKTINFO, IP_TTL, IP_TOS)
+#[derive(Default)]
 pub struct TxCmsg {
     pub oif: u32,
     pub saddr: Ipv4Addr,
@@ -237,12 +238,7 @@ pub struct TxCmsg {
 }
 
 pub fn tx_cmsgs(c: &[u8]) -> Result<TxCmsg, KernelError> {
-    let mut t = TxCmsg {
-        oif: 0,
-        saddr: Ipv4Addr::default(),
-        ttl: None,
-        tos: None,
-    };
+    let mut t = TxCmsg::default();
     for r in cmsgs(c) {
         let (level, ty, d) = r?;
         if level == SOL_SOCKET {

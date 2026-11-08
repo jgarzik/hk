@@ -86,10 +86,9 @@ impl Aarch64TaskContext {
     pub fn new_kernel_thread(entry: usize, stack_top: u64) -> Self {
         Self {
             x19_x28: [entry as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0], // x19 = entry
-            fp: 0,
-            lr: kernel_thread_start as *const () as u64, // Return address
+            lr: kernel_thread_start as *const () as u64,        // Return address
             sp: stack_top,
-            d8_d15: [0; 8],
+            ..Default::default()
         }
     }
 
@@ -102,11 +101,9 @@ impl Aarch64TaskContext {
     /// which will restore the TrapFrame and ERET to user mode.
     pub fn new_clone_child(kstack_with_trapframe: u64) -> Self {
         Self {
-            x19_x28: [0; 10],
-            fp: 0,
             lr: clone_child_entry as *const () as u64, // Return address
             sp: kstack_with_trapframe,
-            d8_d15: [0; 8],
+            ..Default::default()
         }
     }
 }
