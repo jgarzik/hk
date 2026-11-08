@@ -14,7 +14,6 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-use crate::arch::Uaccess;
 use crate::ipc::util::{
     IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcOps, KernIpcPerm, ipc_checkperm, ipcget,
 };
@@ -26,8 +25,8 @@ use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{current_pid, current_tid};
 use crate::time::TIMEKEEPER;
-use crate::uaccess::{get_user, put_user};
-use crate::util::error::KernelError;
+use crate::uaccess::{UserPtr, UserSlice};
+use crate::util::error::{KernelError, KernelResult};
 
 /// Get current time in seconds
 fn current_time_secs() -> i64 {
@@ -373,7 +372,7 @@ fn update_queue(l: &mut SemLock<'_>, changed: impl IntoIterator<Item = usize>) -
 
 impl SemArray {
     /// Create a new semaphore array
-    pub fn new(key: i32, nsems: u32, mode: u16, ns: Arc<IpcNamespace>) -> Result<Arc<Self>, i32> {
+    pub fn new(key: i32, nsems: u32, mode: u16, ns: Arc<IpcNamespace>) -> KernelResult<Arc<Self>> {
         let sems = (0..nsems)
             .map(|_| SemSlot {
                 lock: Mutex::new(()),
@@ -393,7 +392,6 @@ impl SemArray {
             waitq: WaitQueue::new(),
             ns,
         })
-        .map_err(KernelError::errno)
     }
 
     /// The whole array, in complex mode (Linux sem_lock for nsops != 1
@@ -447,10 +445,10 @@ impl SemArray {
     }
 
     /// `lock_all`, or EIDRM once removed (Linux ipc_valid_object)
-    fn lock_valid(&self) -> Result<SemLock<'_>, i32> {
+    fn lock_valid(&self) -> KernelResult<SemLock<'_>> {
         let l = self.lock_all();
         if self.perm.is_deleted() {
-            return Err(KernelError::IdentifierRemoved.errno());
+            return Err(KernelError::IdentifierRemoved);
         }
         Ok(l)
     }
@@ -510,29 +508,17 @@ impl IpcObject for SemArray {
 // ============================================================================
 
 /// semget - get semaphore set
-/// Convert Result to syscall return value
-fn result_to_i64(res: Result<i32, i32>) -> i64 {
-    match res {
-        Ok(v) => i64::from(v),
-        Err(e) => -i64::from(e),
-    }
-}
-
 ///
 /// # Arguments
 /// * `key` - Key to identify semaphore set
 /// * `nsems` - Number of semaphores in set (for creation)
 /// * `semflg` - Flags (IPC_CREAT, IPC_EXCL, permission bits)
-pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> i64 {
-    result_to_i64(do_semget(key, nsems, semflg))
-}
-
-fn do_semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, i32> {
+pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> KernelResult<i32> {
     let ns = current_ipc_ns();
 
     // Validate nsems
     if nsems < 0 || nsems > ns.sem_ctls[0] {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
 
     let nsems_u32 = nsems as u32;
@@ -543,18 +529,18 @@ fn do_semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, i32> {
         // Linux newary: EINVAL for no semaphores, ENOSPC past SEMMNS
         new: move |k, mode| {
             if nsems_u32 == 0 {
-                return Err(KernelError::InvalidArgument.errno());
+                return Err(KernelError::InvalidArgument);
             }
             let used = u64::from(ns_clone.used_sems.load(Ordering::Relaxed));
             if used + u64::from(nsems_u32) > ns_clone.sem_ctls[1] as u64 {
-                return Err(KernelError::NoSpace.errno());
+                return Err(KernelError::NoSpace);
             }
             SemArray::new(k, nsems_u32, mode, ns_clone.clone())
         },
         // Linux sem_more_checks
         more_checks: |sem: &SemArray| {
             if nsems_u32 > sem.nsems {
-                return Err(KernelError::InvalidArgument.errno());
+                return Err(KernelError::InvalidArgument);
             }
             Ok(())
         },
@@ -566,9 +552,18 @@ fn do_semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, i32> {
 }
 
 /// semop - semaphore operations
-pub fn sys_semop(semid: i32, sops_ptr: u64, nsops: usize) -> i64 {
-    sys_semtimedop(semid, sops_ptr, nsops, 0)
+pub fn sys_semop(semid: i32, sops_ptr: UserPtr<Sembuf>, nsops: usize) -> KernelResult<i32> {
+    sys_semtimedop(semid, sops_ptr, nsops, UserPtr::new(0))
 }
+
+/// Timespec structure for semtimedop timeout (matches Linux ABI)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SemTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+crate::pod!(SemTimespec { tv_sec, tv_nsec });
 
 /// semtimedop - semaphore operations with timeout
 ///
@@ -576,44 +571,34 @@ pub fn sys_semop(semid: i32, sops_ptr: u64, nsops: usize) -> i64 {
 /// * `semid` - Semaphore set ID
 /// * `sops_ptr` - Pointer to array of sembuf operations
 /// * `nsops` - Number of operations
-/// * `timeout_ptr` - Timeout (0 = infinite)
-pub fn sys_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> i64 {
-    result_to_i64(do_semtimedop(semid, sops_ptr, nsops, timeout_ptr))
-}
-
-/// Timespec structure for semtimedop timeout (matches Linux ABI)
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct SemTimespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-crate::pod!(SemTimespec { tv_sec, tv_nsec });
-
-fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> Result<i32, i32> {
+/// * `timeout_ptr` - Timeout (NULL = infinite)
+pub fn sys_semtimedop(
+    semid: i32,
+    sops_ptr: UserPtr<Sembuf>,
+    nsops: usize,
+    timeout_ptr: UserPtr<SemTimespec>,
+) -> KernelResult<i32> {
     let ns = current_ipc_ns();
-    let einval = KernelError::InvalidArgument.errno();
+    let einval = KernelError::InvalidArgument;
 
     // Linux order: the timeout is copied in, then nsops (E2BIG, EINVAL),
     // the operations, semid and the timeout's validity
-    let ts = if timeout_ptr != 0 {
-        Some(
-            get_user::<Uaccess, SemTimespec>(timeout_ptr)
-                .map_err(|_| KernelError::BadAddress.errno())?,
-        )
-    } else {
+    let ts = if timeout_ptr.is_null() {
         None
+    } else {
+        Some(timeout_ptr.read()?)
     };
     if nsops > ns.sem_ctls[2] as usize {
-        return Err(KernelError::ArgListTooLong.errno());
+        return Err(KernelError::ArgListTooLong);
     }
     if nsops == 0 {
         return Err(einval);
     }
     let mut sops = vec![Sembuf::default(); nsops];
-    for (i, sop) in sops.iter_mut().enumerate() {
-        let offset = sops_ptr + (i * core::mem::size_of::<Sembuf>()) as u64;
-        *sop = get_user::<Uaccess, Sembuf>(offset).map_err(|_| KernelError::BadAddress.errno())?;
+    // At most SEMOPM operations: the size cannot overflow
+    let mut r = UserSlice::new(sops_ptr.addr(), nsops * core::mem::size_of::<Sembuf>()).reader();
+    for sop in sops.iter_mut() {
+        *sop = r.read()?;
     }
     if semid < 0 {
         return Err(einval);
@@ -637,7 +622,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
     let sem_array_ref = ns.sem_ids().find_by_id(semid).ok_or(einval)?;
     let sem_array: &SemArray = &sem_array_ref;
     if max >= sem_array.nsems {
-        return Err(KernelError::FileTooLarge.errno());
+        return Err(KernelError::FileTooLarge);
     }
     let access = if alter { IPC_PERM_WRITE } else { IPC_PERM_READ };
     ipc_checkperm(&sem_array.perm, access)?;
@@ -645,7 +630,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
     // The undo list knows the array before the array knows the list
     // (Linux find_alloc_undo), so exit finds every adjustment
     let undo = if has_undo {
-        let ul = get_or_create_undo_list(current_tid()).map_err(KernelError::errno)?;
+        let ul = get_or_create_undo_list(current_tid())?;
         ul.register(semid, &sem_array_ref);
         Some(ul.id)
     } else {
@@ -654,7 +639,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
     let pid = crate::task::pid::vnr(current_pid()) as i32;
     let mut l = sem_array.lock_for(&sops);
     if sem_array.perm.is_deleted() {
-        return Err(KernelError::IdentifierRemoved.errno());
+        return Err(KernelError::IdentifierRemoved);
     }
     let mut blocking = 0;
     let r = perform_atomic_semop(&mut l, &sops, pid, undo, &mut blocking);
@@ -664,10 +649,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
         } else {
             drop(l);
         }
-        if r < 0 {
-            return Err(-r);
-        }
-        return Ok(0);
+        return semop_status(r);
     }
 
     // Would block: queue it and sleep (Linux: the status is -EINTR until
@@ -680,8 +662,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
         alter,
         undo,
         status: AtomicI32::new(SEM_WAITING),
-    })
-    .map_err(KernelError::errno)?;
+    })?;
     let w = (queue.clone(), blocking);
     if queue.sops.len() == 1 {
         let n = queue.sops[0].sem_num as usize;
@@ -722,7 +703,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
         // Not completed: recheck under the locks, then unlink
         let mut l = sem_array.lock_for(&queue.sops);
         if sem_array.perm.is_deleted() {
-            return Err(KernelError::IdentifierRemoved.errno());
+            return Err(KernelError::IdentifierRemoved);
         }
         let status = queue.status.load(Ordering::Acquire);
         if status != SEM_WAITING {
@@ -735,13 +716,20 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
         };
         unlink(&mut l, &queue);
         return Err(if timed_out {
-            KernelError::WouldBlock.errno()
+            KernelError::WouldBlock
         } else {
-            KernelError::Interrupted.errno()
+            KernelError::Interrupted
         });
     };
-    if status < 0 {
-        return Err(-status);
+    semop_status(status)
+}
+
+/// A semop status (0 or a negative errno, as Linux keeps it in
+/// sem_queue.status) as the call's result
+fn semop_status(s: i32) -> KernelResult<i32> {
+    if s < 0 {
+        // Only ever set from a KernelError
+        return Err(KernelError::from_errno(-s).unwrap_or(KernelError::InvalidArgument));
     }
     Ok(0)
 }
@@ -763,11 +751,7 @@ fn unlink(l: &mut SemLock<'_>, q: &Arc<SemQueue>) {
 }
 
 /// semctl - semaphore control
-pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> i64 {
-    result_to_i64(do_semctl(semid, semnum, cmd, arg))
-}
-
-fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
+pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> KernelResult<i32> {
     let ns = current_ipc_ns();
     let cmd_only = cmd & !IPC_64;
 
@@ -776,7 +760,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
 
@@ -787,9 +771,9 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             sem_array.fill_semid64_ds(&mut l, &mut ds);
             drop(l);
 
-            if arg != 0 {
-                put_user::<Uaccess, Semid64Ds>(arg, ds)
-                    .map_err(|_| KernelError::BadAddress.errno())?;
+            let buf = UserPtr::<Semid64Ds>::new(arg);
+            if !buf.is_null() {
+                buf.write(&ds)?;
             }
 
             Ok(0)
@@ -798,20 +782,19 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
         IPC_SET => {
             // Copied in first, before the IPC locks (Linux: the copy
             // may fault)
-            let ds: Semid64Ds =
-                get_user::<Uaccess, Semid64Ds>(arg).map_err(|_| KernelError::BadAddress.errno())?;
+            let ds: Semid64Ds = UserPtr::<Semid64Ds>::new(arg).read()?;
             let _w = ns.sem_ids().rwsem.write();
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             let uid = crate::task::percpu::current_cred().euid;
             let perm = sem.perm();
             {
                 let mut p = perm.lock.lock();
                 if !KernIpcPerm::is_owner(&p, perm.cuid, uid) {
-                    return Err(KernelError::NotPermitted.errno());
+                    return Err(KernelError::NotPermitted);
                 }
                 p.uid = ds.sem_perm.uid;
                 p.gid = ds.sem_perm.gid;
@@ -829,12 +812,12 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             let uid = crate::task::percpu::current_cred().euid;
             let perm = sem.perm();
             if !KernIpcPerm::is_owner(&perm.lock.lock(), perm.cuid, uid) {
-                return Err(KernelError::NotPermitted.errno());
+                return Err(KernelError::NotPermitted);
             }
 
             if let Some(removed) = ns.sem_ids().remove(semid) {
@@ -848,14 +831,14 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
 
             let sem_array: &SemArray = &sem;
 
             if semnum < 0 || semnum as u32 >= sem_array.nsems {
-                return Err(KernelError::InvalidArgument.errno());
+                return Err(KernelError::InvalidArgument);
             }
 
             Ok(sem_array.lock_valid()?.sem(semnum as usize).val)
@@ -865,19 +848,19 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             ipc_checkperm(sem.perm(), IPC_PERM_WRITE)?;
 
             let sem_array: &SemArray = &sem;
 
             if semnum < 0 || semnum as u32 >= sem_array.nsems {
-                return Err(KernelError::InvalidArgument.errno());
+                return Err(KernelError::InvalidArgument);
             }
 
             let val = arg as i32;
             if !(0..=SEMVMX).contains(&val) {
-                return Err(KernelError::Range.errno());
+                return Err(KernelError::Range);
             }
 
             // Linux semctl_setval
@@ -898,7 +881,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
 
@@ -911,10 +894,10 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                     .map(|i| l.sem(i).val)
                     .collect()
             };
-            for (i, &v) in vals.iter().enumerate() {
-                let offset = arg + (i * 2) as u64;
-                put_user::<Uaccess, u16>(offset, v as u16)
-                    .map_err(|_| KernelError::BadAddress.errno())?;
+            // Values are at most SEMVMX: each fits a u16
+            let mut w = UserSlice::new(arg, vals.len() * 2).writer();
+            for &v in &vals {
+                w.write(&(v as u16))?;
             }
 
             Ok(0)
@@ -924,7 +907,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             ipc_checkperm(sem.perm(), IPC_PERM_WRITE)?;
 
@@ -933,14 +916,12 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             // Copied in and checked first, then set under the lock
             // (Linux semctl_main SETALL)
             let mut vals = vec![0i32; sem_array.nsems as usize];
-            for (i, v) in vals.iter_mut().enumerate() {
-                let offset = arg + (i * 2) as u64;
-                let val: u16 = get_user::<Uaccess, u16>(offset)
-                    .map_err(|_| KernelError::BadAddress.errno())?;
-                *v = i32::from(val);
+            let mut r = UserSlice::new(arg, vals.len() * 2).reader();
+            for v in vals.iter_mut() {
+                *v = i32::from(r.read::<u16>()?);
             }
             if vals.iter().any(|&v| v > SEMVMX) {
-                return Err(KernelError::Range.errno());
+                return Err(KernelError::Range);
             }
             let pid = crate::task::pid::vnr(current_pid()) as i32;
             let mut l = sem_array.lock_valid()?;
@@ -962,14 +943,14 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
 
             let sem_array: &SemArray = &sem;
 
             if semnum < 0 || semnum as u32 >= sem_array.nsems {
-                return Err(KernelError::InvalidArgument.errno());
+                return Err(KernelError::InvalidArgument);
             }
 
             Ok(sem_array.lock_valid()?.sem(semnum as usize).pid)
@@ -979,12 +960,12 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
             let sem_array: &SemArray = &sem;
             if semnum < 0 || semnum as u32 >= sem_array.nsems {
-                return Err(KernelError::InvalidArgument.errno());
+                return Err(KernelError::InvalidArgument);
             }
             // Linux count_semcnt: the waiters whose blocking operation is
             // on `semnum`, decrements for GETNCNT, waits-for-zero for
@@ -1007,7 +988,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             Ok(n as i32)
         }
 
-        _ => Err(KernelError::InvalidArgument.errno()),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
 

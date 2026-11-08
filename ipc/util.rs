@@ -12,7 +12,7 @@ use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::ipc::{IPC_CREAT, IPC_EXCL, IPC_PRIVATE};
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 
 // ============================================================================
 // ID Allocation Constants
@@ -240,11 +240,11 @@ impl<T: IpcObject> IpcIds<T> {
     /// Allocate a new ID for an object
     ///
     /// Returns the allocated ID on success
-    pub fn alloc_id(&self, obj: Arc<T>, max_ids: u32) -> Result<i32, i32> {
+    pub fn alloc_id(&self, obj: Arc<T>, max_ids: u32) -> KernelResult<i32> {
         let mut inner = self.inner.write();
 
         if inner.in_use >= max_ids || inner.in_use >= IPCMNI {
-            return Err(KernelError::NoSpace.errno());
+            return Err(KernelError::NoSpace);
         }
 
         // Find free index (cyclic allocation)
@@ -257,7 +257,7 @@ impl<T: IpcObject> IpcIds<T> {
                 break;
             }
             if idx == start_idx {
-                return Err(KernelError::NoSpace.errno());
+                return Err(KernelError::NoSpace);
             }
         }
 
@@ -359,7 +359,7 @@ pub const IPC_PERM_WRITE: u16 = 0o222;
 ///
 /// Acquires the lock internally, following Linux's pattern.
 /// Returns Ok(()) on success, Err(-EACCES) on failure
-pub fn ipc_checkperm(perm: &KernIpcPerm, flag: u16) -> Result<(), i32> {
+pub fn ipc_checkperm(perm: &KernIpcPerm, flag: u16) -> KernelResult<()> {
     let cred = crate::task::percpu::current_cred();
     let euid = cred.euid;
 
@@ -392,14 +392,14 @@ pub fn ipc_checkperm(perm: &KernIpcPerm, flag: u16) -> Result<(), i32> {
         return Ok(());
     }
 
-    Err(KernelError::PermissionDenied.errno())
+    Err(KernelError::PermissionDenied)
 }
 
 /// What ipcget needs from each IPC type (Linux struct ipc_ops)
 pub struct IpcOps<T, N, C, A>
 where
-    N: FnOnce(i32, u16) -> Result<Arc<T>, i32>,
-    C: FnOnce(&T) -> Result<(), i32>,
+    N: FnOnce(i32, u16) -> KernelResult<Arc<T>>,
+    C: FnOnce(&T) -> KernelResult<()>,
     A: FnOnce(&T),
 {
     /// Build a new object (Linux newary/newseg/newque up to ipc_addid):
@@ -423,10 +423,10 @@ pub fn ipcget<T: IpcObject + 'static, N, C, A>(
     flags: i32,
     max_ids: u32,
     ops: IpcOps<T, N, C, A>,
-) -> Result<i32, i32>
+) -> KernelResult<i32>
 where
-    N: FnOnce(i32, u16) -> Result<Arc<T>, i32>,
-    C: FnOnce(&T) -> Result<(), i32>,
+    N: FnOnce(i32, u16) -> KernelResult<Arc<T>>,
+    C: FnOnce(&T) -> KernelResult<()>,
     A: FnOnce(&T),
 {
     let mode = (flags as u16) & 0o777;
@@ -436,7 +436,7 @@ where
         && let Some(existing) = ids.find_by_key(key)
     {
         if flags & IPC_CREAT != 0 && flags & IPC_EXCL != 0 {
-            return Err(KernelError::AlreadyExists.errno());
+            return Err(KernelError::AlreadyExists);
         }
         // Linux ipc_check_perms: ipcperms on the caller's mode bits
         // (EACCES), then the type's own checks
@@ -446,7 +446,7 @@ where
         return Ok(perm.lock.lock().id);
     }
     if key != IPC_PRIVATE && flags & IPC_CREAT == 0 {
-        return Err(KernelError::NotFound.errno());
+        return Err(KernelError::NotFound);
     }
     let obj = (ops.new)(key, mode)?;
     let id = ids.alloc_id(obj.clone(), max_ids)?;

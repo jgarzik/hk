@@ -636,29 +636,53 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         )
         .ret() as u64,
         Sys::Mprotect => crate::mm::syscall::sys_mprotect(a[0], a[1], a[2] as u32).ret() as u64,
-        Sys::MqGetsetattr => crate::ipc::sys_mq_getsetattr(a[0] as i32, a[1], a[2]).ret() as u64,
-        Sys::MqNotify => crate::ipc::sys_mq_notify(a[0] as i32, a[1]).ret() as u64,
-        Sys::MqOpen => crate::ipc::sys_mq_open(a[0], a[1] as i32, a[2] as u32, a[3]).ret() as u64,
-        Sys::MqTimedreceive => {
-            crate::ipc::sys_mq_timedreceive(a[0] as i32, a[1], a[2] as usize, a[3], a[4]).ret()
+        Sys::MqGetsetattr => {
+            crate::ipc::sys_mq_getsetattr(a[0] as i32, UserPtr::new(a[1]), UserPtr::new(a[2])).ret()
                 as u64
         }
-        Sys::MqTimedsend => {
-            crate::ipc::sys_mq_timedsend(a[0] as i32, a[1], a[2] as usize, a[3] as u32, a[4]).ret()
-                as u64
-        }
-        Sys::MqUnlink => crate::ipc::sys_mq_unlink(a[0]).ret() as u64,
+        Sys::MqNotify => crate::ipc::sys_mq_notify(a[0] as i32, UserPtr::new(a[1])).ret() as u64,
+        Sys::MqOpen => crate::ipc::sys_mq_open(
+            UserPtr::new(a[0]),
+            a[1] as i32,
+            a[2] as u32,
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
+        Sys::MqTimedreceive => crate::ipc::sys_mq_timedreceive(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as usize,
+            UserPtr::new(a[3]),
+            UserPtr::new(a[4]),
+        )
+        .ret() as u64,
+        Sys::MqTimedsend => crate::ipc::sys_mq_timedsend(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as usize,
+            a[3] as u32,
+            UserPtr::new(a[4]),
+        )
+        .ret() as u64,
+        Sys::MqUnlink => crate::ipc::sys_mq_unlink(UserPtr::new(a[0])).ret() as u64,
         Sys::Mremap => {
             crate::mm::syscall::sys_mremap(a[0], a[1], a[2], a[3] as u32, a[4]).ret() as u64
         }
-        Sys::Msgctl => crate::ipc::sys_msgctl(a[0] as i32, a[1] as i32, a[2]).ret() as u64,
-        Sys::Msgget => crate::ipc::sys_msgget(a[0] as i32, a[1] as i32).ret() as u64,
-        Sys::Msgrcv => {
-            crate::ipc::sys_msgrcv(a[0] as i32, a[1], a[2] as usize, a[3] as i64, a[4] as i32)
-                as u64
+        Sys::Msgctl => {
+            crate::ipc::sys_msgctl(a[0] as i32, a[1] as i32, UserPtr::new(a[2])).ret() as u64
         }
+        Sys::Msgget => crate::ipc::sys_msgget(a[0] as i32, a[1] as i32).ret() as u64,
+        Sys::Msgrcv => crate::ipc::sys_msgrcv(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as usize,
+            a[3] as i64,
+            a[4] as i32,
+        )
+        .ret() as u64,
         Sys::Msgsnd => {
-            crate::ipc::sys_msgsnd(a[0] as i32, a[1], a[2] as usize, a[3] as i32).ret() as u64
+            crate::ipc::sys_msgsnd(a[0] as i32, UserPtr::new(a[1]), a[2] as usize, a[3] as i32)
+                .ret() as u64
         }
         Sys::Msync => crate::mm::syscall::sys_msync(a[0], a[1], a[2] as i32).ret() as u64,
         Sys::Munlock => crate::mm::syscall::sys_munlock(a[0], a[1]).ret() as u64,
@@ -850,10 +874,16 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::ipc::sys_semctl(a[0] as i32, a[1] as i32, a[2] as i32, a[3]).ret() as u64
         }
         Sys::Semget => crate::ipc::sys_semget(a[0] as i32, a[1] as i32, a[2] as i32).ret() as u64,
-        Sys::Semop => crate::ipc::sys_semop(a[0] as i32, a[1], a[2] as usize).ret() as u64,
-        Sys::Semtimedop => {
-            crate::ipc::sys_semtimedop(a[0] as i32, a[1], a[2] as usize, a[3]).ret() as u64
+        Sys::Semop => {
+            crate::ipc::sys_semop(a[0] as i32, UserPtr::new(a[1]), a[2] as usize).ret() as u64
         }
+        Sys::Semtimedop => crate::ipc::sys_semtimedop(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as usize,
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
         Sys::Sendfile => {
             crate::fs::splice::sys_sendfile64(a[0] as i32, a[1] as i32, a[2], a[3] as usize).ret()
                 as u64
@@ -964,7 +994,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::SetRobustList => crate::task::futex::sys_set_robust_list(a[0], a[1]).ret() as u64,
         Sys::SetTidAddress => crate::task::syscall::sys_set_tid_address(a[0]).ret() as u64,
         Sys::Shmat => crate::ipc::sys_shmat(a[0] as i32, a[1], a[2] as i32).ret() as u64,
-        Sys::Shmctl => crate::ipc::sys_shmctl(a[0] as i32, a[1] as i32, a[2]).ret() as u64,
+        Sys::Shmctl => {
+            crate::ipc::sys_shmctl(a[0] as i32, a[1] as i32, UserPtr::new(a[2])).ret() as u64
+        }
         Sys::Shmdt => crate::ipc::sys_shmdt(a[0]).ret() as u64,
         Sys::Shmget => crate::ipc::sys_shmget(a[0] as i32, a[1] as usize, a[2] as i32).ret() as u64,
         Sys::Shutdown => crate::net::syscall::sys_shutdown(a[0] as i32, a[1] as i32).ret() as u64,

@@ -23,8 +23,8 @@ use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::current_pid;
 use crate::time::TIMEKEEPER;
-use crate::uaccess::{copy_from_user, copy_to_user, get_user, put_user};
-use crate::util::error::KernelError;
+use crate::uaccess::{UserPtr, copy_from_user, copy_to_user};
+use crate::util::error::{KernelError, KernelResult};
 
 /// Get current time in seconds
 fn current_time_secs() -> i64 {
@@ -126,7 +126,7 @@ pub struct MsgQueue {
 
 impl MsgQueue {
     /// Create a new message queue
-    pub fn new(key: i32, mode: u16, ns: Arc<IpcNamespace>) -> Result<Arc<Self>, i32> {
+    pub fn new(key: i32, mode: u16, ns: Arc<IpcNamespace>) -> KernelResult<Arc<Self>> {
         try_arc(Self {
             perm: KernIpcPerm::new(key, mode),
             q: Mutex::new(MsgState {
@@ -137,7 +137,6 @@ impl MsgQueue {
             waitq: WaitQueue::new(),
             ns,
         })
-        .map_err(KernelError::errno)
     }
 
     /// A message matching `search` is queued
@@ -155,7 +154,7 @@ impl MsgQueue {
         msgsz: usize,
         noerror: bool,
         pid: i32,
-    ) -> Result<Option<MsgMsg>, i32> {
+    ) -> KernelResult<Option<MsgMsg>> {
         let mut q = self.q.lock();
         let mut found = q
             .list
@@ -171,7 +170,7 @@ impl MsgQueue {
             return Ok(None);
         };
         if q.list[i].mtext.len() > msgsz && !noerror {
-            return Err(KernelError::ArgListTooLong.errno());
+            return Err(KernelError::ArgListTooLong);
         }
         let msg = q.list.remove(i);
         if let Some(m) = &msg {
@@ -187,10 +186,10 @@ impl MsgQueue {
     /// pid and time recorded with the queue locked, so concurrent senders
     /// never pass qbytes and a removed queue takes nothing. A message that
     /// does not fit comes back
-    fn try_send(&self, msg: MsgMsg, pid: i32) -> Result<Option<MsgMsg>, i32> {
+    fn try_send(&self, msg: MsgMsg, pid: i32) -> KernelResult<Option<MsgMsg>> {
         let mut q = self.q.lock();
         if self.perm.is_deleted() {
-            return Err(KernelError::IdentifierRemoved.errno());
+            return Err(KernelError::IdentifierRemoved);
         }
         if !Self::fits(&q, msg.mtext.len()) {
             return Ok(Some(msg));
@@ -266,24 +265,12 @@ impl IpcObject for MsgQueue {
 // Syscalls
 // ============================================================================
 
-/// Convert Result to syscall return value
-fn result_to_i64(res: Result<i32, i32>) -> i64 {
-    match res {
-        Ok(v) => i64::from(v),
-        Err(e) => -i64::from(e),
-    }
-}
-
 /// msgget - get message queue
 ///
 /// # Arguments
 /// * `key` - Key to identify queue
 /// * `msgflg` - Flags (IPC_CREAT, IPC_EXCL, permission bits)
-pub fn sys_msgget(key: i32, msgflg: i32) -> i64 {
-    result_to_i64(do_msgget(key, msgflg))
-}
-
-fn do_msgget(key: i32, msgflg: i32) -> Result<i32, i32> {
+pub fn sys_msgget(key: i32, msgflg: i32) -> KernelResult<i32> {
     let ns = current_ipc_ns();
     let ns_clone = ns.clone();
 
@@ -302,32 +289,27 @@ fn do_msgget(key: i32, msgflg: i32) -> Result<i32, i32> {
 /// * `msgp` - Pointer to msgbuf (mtype + mtext)
 /// * `msgsz` - Size of mtext
 /// * `msgflg` - Flags (IPC_NOWAIT)
-pub fn sys_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> i64 {
-    result_to_i64(do_msgsnd(msqid, msgp, msgsz, msgflg))
-}
-
-fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i32> {
+pub fn sys_msgsnd(msqid: i32, msgp: UserPtr<i64>, msgsz: usize, msgflg: i32) -> KernelResult<()> {
     let ns = current_ipc_ns();
 
     // Linux do_msgsnd: a size past msgmax or negative as a long, or a
     // negative id, is EINVAL
     if msgsz > ns.msg_ctlmax as usize || (msgsz as i64) < 0 || msqid < 0 {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
 
     // Read message type
-    let mtype: i64 = get_user::<Uaccess, i64>(msgp).map_err(|_| KernelError::BadAddress.errno())?;
+    let mtype = msgp.read()?;
 
     if mtype <= 0 {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
 
     // Read message data
     let mut mtext = vec![0u8; msgsz];
     if msgsz > 0 {
-        let data_ptr = msgp + 8; // Skip mtype (i64 = 8 bytes)
-        copy_from_user::<Uaccess>(&mut mtext, data_ptr, msgsz)
-            .map_err(|_| KernelError::BadAddress.errno())?;
+        let data_ptr = msgp.addr() + 8; // Skip mtype (i64 = 8 bytes)
+        copy_from_user::<Uaccess>(&mut mtext, data_ptr, msgsz)?;
     }
 
     let msg = MsgMsg { mtype, mtext };
@@ -336,7 +318,7 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
     let queue = ns
         .msg_ids()
         .find_by_id(msqid)
-        .ok_or(KernelError::InvalidArgument.errno())?;
+        .ok_or(KernelError::InvalidArgument)?;
 
     // Check write permission
     ipc_checkperm(&queue.perm, IPC_PERM_WRITE)?;
@@ -348,7 +330,7 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
     while let Some(back) = queue.try_send(msg, pid)? {
         msg = back;
         if nowait {
-            return Err(KernelError::WouldBlock.errno());
+            return Err(KernelError::WouldBlock);
         }
         // Sleep until space or removal; a signal ends the call
         // (System V IPC is never restarted after a handler)
@@ -356,13 +338,13 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
         queue
             .waitq
             .wait_event_interruptible(room)
-            .map_err(|_| KernelError::RestartNoHand.errno())?;
+            .map_err(|_| KernelError::RestartNoHand)?;
         // Permissions may have changed while it slept (Linux rechecks)
         ipc_checkperm(&queue.perm, IPC_PERM_WRITE)?;
     }
     // Wake any waiting receivers
     queue.waitq.wake_all();
-    Ok(0)
+    Ok(())
 }
 
 /// msgrcv - receive message
@@ -373,14 +355,16 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
 /// * `msgsz` - Maximum size of mtext
 /// * `msgtyp` - Message type to receive
 /// * `msgflg` - Flags (IPC_NOWAIT, MSG_NOERROR, MSG_EXCEPT)
-pub fn sys_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> i64 {
-    result_to_i64(do_msgrcv(msqid, msgp, msgsz, msgtyp, msgflg))
-}
-
-fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> Result<i32, i32> {
+pub fn sys_msgrcv(
+    msqid: i32,
+    msgp: UserPtr<i64>,
+    msgsz: usize,
+    msgtyp: i64,
+    msgflg: i32,
+) -> KernelResult<usize> {
     // Linux do_msgrcv: a negative id or size (as a long) is EINVAL
     if msqid < 0 || (msgsz as i64) < 0 {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
     let ns = current_ipc_ns();
 
@@ -388,7 +372,7 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
     let queue = ns
         .msg_ids()
         .find_by_id(msqid)
-        .ok_or(KernelError::InvalidArgument.errno())?;
+        .ok_or(KernelError::InvalidArgument)?;
 
     // Check read permission
     ipc_checkperm(&queue.perm, IPC_PERM_READ)?;
@@ -401,36 +385,34 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
     loop {
         if let Some(msg) = queue.take_msg(search, msgsz, noerror, pid)? {
             // Copy to user
-            put_user::<Uaccess, i64>(msgp, msg.mtype)
-                .map_err(|_| KernelError::BadAddress.errno())?;
+            msgp.write(&msg.mtype)?;
 
             let copy_len = core::cmp::min(msg.mtext.len(), msgsz);
             if copy_len > 0 {
-                let data_ptr = msgp + 8;
-                copy_to_user::<Uaccess>(data_ptr, &msg.mtext[..copy_len])
-                    .map_err(|_| KernelError::BadAddress.errno())?;
+                let data_ptr = msgp.addr() + 8;
+                copy_to_user::<Uaccess>(data_ptr, &msg.mtext[..copy_len])?;
             }
 
             // Wake any waiting senders
             queue.waitq.wake_all();
 
-            return Ok(copy_len as i32);
+            return Ok(copy_len);
         }
 
         // No matching message
         if nowait {
-            return Err(KernelError::NoMessage.errno());
+            return Err(KernelError::NoMessage);
         }
 
         // Sleep until a matching message arrives or the queue is removed
         queue
             .waitq
             .wait_event_interruptible(|| queue.has_msg(search) || queue.perm.is_deleted())
-            .map_err(|_| KernelError::RestartNoHand.errno())?;
+            .map_err(|_| KernelError::RestartNoHand)?;
 
         // Check if queue was removed
         if queue.perm.is_deleted() {
-            return Err(KernelError::IdentifierRemoved.errno());
+            return Err(KernelError::IdentifierRemoved);
         }
         // Permissions may have changed while it slept (Linux rechecks)
         ipc_checkperm(&queue.perm, IPC_PERM_READ)?;
@@ -438,11 +420,7 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
 }
 
 /// msgctl - message queue control
-pub fn sys_msgctl(msqid: i32, cmd: i32, buf: u64) -> i64 {
-    result_to_i64(do_msgctl(msqid, cmd, buf))
-}
-
-fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
+pub fn sys_msgctl(msqid: i32, cmd: i32, buf: UserPtr<Msqid64Ds>) -> KernelResult<i32> {
     let ns = current_ipc_ns();
     let cmd_only = cmd & !IPC_64;
 
@@ -451,16 +429,15 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let queue = ns
                 .msg_ids()
                 .find_by_id(msqid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             ipc_checkperm(queue.perm(), IPC_PERM_READ)?;
 
             let mut ds = Msqid64Ds::default();
             queue.fill_msqid64_ds(&mut ds);
 
-            if buf != 0 {
-                put_user::<Uaccess, Msqid64Ds>(buf, ds)
-                    .map_err(|_| KernelError::BadAddress.errno())?;
+            if !buf.is_null() {
+                buf.write(&ds)?;
             }
 
             Ok(0)
@@ -469,25 +446,24 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
         IPC_SET => {
             // Copied in first, before the IPC locks (Linux: the copy
             // may fault)
-            let ds: Msqid64Ds =
-                get_user::<Uaccess, Msqid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
+            let ds = buf.read()?;
             let _w = ns.msg_ids().rwsem.write();
             let queue = ns
                 .msg_ids()
                 .find_by_id(msqid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             let uid = crate::task::percpu::current_cred().euid;
             let perm = queue.perm();
             if !KernIpcPerm::is_owner(&perm.lock.lock(), perm.cuid, uid) {
-                return Err(KernelError::NotPermitted.errno());
+                return Err(KernelError::NotPermitted);
             }
             // Linux msgctl_down: past MSGMNB needs CAP_SYS_RESOURCE; below
             // it anyone allowed to IPC_SET may lower or raise the limit
             if ds.msg_qbytes > u64::from(ns.msg_ctlmnb)
                 && !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
             {
-                return Err(KernelError::NotPermitted.errno());
+                return Err(KernelError::NotPermitted);
             }
             {
                 let mut q = queue.q.lock();
@@ -510,12 +486,12 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let queue = ns
                 .msg_ids()
                 .find_by_id(msqid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             let uid = crate::task::percpu::current_cred().euid;
             let perm = queue.perm();
             if !KernIpcPerm::is_owner(&perm.lock.lock(), perm.cuid, uid) {
-                return Err(KernelError::NotPermitted.errno());
+                return Err(KernelError::NotPermitted);
             }
 
             if let Some(removed) = ns.msg_ids().remove(msqid) {
@@ -525,6 +501,6 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             Ok(0)
         }
 
-        _ => Err(KernelError::InvalidArgument.errno()),
+        _ => Err(KernelError::InvalidArgument),
     }
 }

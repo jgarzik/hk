@@ -16,7 +16,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 
-use crate::arch::Uaccess;
 use crate::ipc::util::{
     IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcOps, KernIpcPerm, ipc_checkperm, ipcget,
 };
@@ -28,8 +27,8 @@ use crate::mm::vma::{
 use crate::mm::{Vma, get_task_mm};
 use crate::task::percpu::{current_pid, current_tid};
 use crate::time::TIMEKEEPER;
-use crate::uaccess::{get_user, put_user};
-use crate::util::error::KernelError;
+use crate::uaccess::UserPtr;
+use crate::util::error::{KernelError, KernelResult};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -96,7 +95,7 @@ pub struct ShmidKernel {
 impl ShmidKernel {
     /// Create a new shared memory segment
     /// (Pages are allocated as they are first touched.)
-    pub fn new(key: i32, size: usize, mode: u16, ns: Arc<IpcNamespace>) -> Result<Arc<Self>, i32> {
+    pub fn new(key: i32, size: usize, mode: u16, ns: Arc<IpcNamespace>) -> KernelResult<Arc<Self>> {
         let now = current_time_secs();
         let pid = current_pid() as i32;
 
@@ -109,11 +108,10 @@ impl ShmidKernel {
             ctim: AtomicI64::new(now),
             cpid: pid,
             lpid: AtomicI32::new(pid),
-            shmem: Shmem::new(size.div_ceil(PAGE_SIZE) as u64).map_err(|e| e.errno())?,
+            shmem: Shmem::new(size.div_ceil(PAGE_SIZE) as u64)?,
             destroyed: AtomicBool::new(false),
             ns,
         })
-        .map_err(KernelError::errno)
     }
 
     /// Fill shmid64_ds structure for IPC_STAT
@@ -233,38 +231,18 @@ impl Drop for ShmAttach {
 // Syscalls
 // ============================================================================
 
-/// Convert Result to syscall return value
-fn result_to_i64(res: Result<i32, i32>) -> i64 {
-    match res {
-        Ok(v) => i64::from(v),
-        Err(e) => -i64::from(e),
-    }
-}
-
-/// Convert Result<u64, i32> to syscall return value
-fn result_u64_to_i64(res: Result<u64, i32>) -> i64 {
-    match res {
-        Ok(v) => v as i64,
-        Err(e) => -i64::from(e),
-    }
-}
-
 /// shmget - get shared memory segment
 ///
 /// # Arguments
 /// * `key` - Key to identify segment (IPC_PRIVATE for new private segment)
 /// * `size` - Size of segment in bytes
 /// * `shmflg` - Flags (IPC_CREAT, IPC_EXCL, permission bits)
-pub fn sys_shmget(key: i32, size: usize, shmflg: i32) -> i64 {
-    result_to_i64(do_shmget(key, size, shmflg))
-}
-
-fn do_shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, i32> {
+pub fn sys_shmget(key: i32, size: usize, shmflg: i32) -> KernelResult<i32> {
     let ns = current_ipc_ns();
 
     // Validate size
     if size < SHMMIN || size > ns.shm_ctlmax {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
 
     let ns_clone = ns.clone();
@@ -276,26 +254,26 @@ fn do_shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, i32> {
             // Linux newseg: whole pages that cannot hold `size` (the
             // page-rounded size wraps), or past SHMALL, are ENOSPC
             if pages.checked_mul(PAGE_SIZE as u64).is_none() {
-                return Err(KernelError::NoSpace.errno());
+                return Err(KernelError::NoSpace);
             }
             let tot = ns_clone.shm_tot.load(Ordering::Relaxed);
             if tot
                 .checked_add(pages)
                 .is_none_or(|t| t > ns_clone.shm_ctlall as u64)
             {
-                return Err(KernelError::NoSpace.errno());
+                return Err(KernelError::NoSpace);
             }
             // The shmem file past the largest file size (Linux
             // __shmem_file_setup) is EINVAL
             if size as u64 > crate::fs::superblock::MAX_LFS_FILESIZE {
-                return Err(KernelError::InvalidArgument.errno());
+                return Err(KernelError::InvalidArgument);
             }
             ShmidKernel::new(k, size, mode, ns_clone.clone())
         },
         // Linux shm_more_checks
         more_checks: |shm: &ShmidKernel| {
             if shm.segsz < size {
-                return Err(KernelError::InvalidArgument.errno());
+                return Err(KernelError::InvalidArgument);
             }
             Ok(())
         },
@@ -315,14 +293,10 @@ fn do_shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, i32> {
 ///
 /// # Returns
 /// * Address where segment was attached
-pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> i64 {
-    result_u64_to_i64(do_shmat(shmid, shmaddr, shmflg))
-}
-
-fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
+pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> KernelResult<u64> {
     let ns = current_ipc_ns();
     let tid = current_tid();
-    let einval = KernelError::InvalidArgument.errno();
+    let einval = KernelError::InvalidArgument;
 
     let shm_obj = ns.shm_ids().find_by_id(shmid).ok_or(einval)?;
     let access = if shmflg & SHM_RDONLY != 0 {
@@ -339,22 +313,22 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
     if shmaddr == 0 && shmflg & SHM_REMAP != 0 {
         return Err(einval);
     }
-    let mm = get_task_mm(tid).ok_or(KernelError::OutOfMemory.errno())?;
+    let mm = get_task_mm(tid).ok_or(KernelError::OutOfMemory)?;
     let mut replaced = Vec::new();
     let mut mm_guard = mm
         .mmap_write_killable()
-        .map_err(|_| KernelError::Interrupted.errno())?;
+        .map_err(|_| KernelError::Interrupted)?;
     // RLIMIT_AS, as for any mapping (Linux may_expand_vm)
     let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_AS);
     if limit != crate::task::rlimit::RLIM_INFINITY
         && (mm_guard.total_vm() * PAGE_SIZE as u64).saturating_add(size) > limit
     {
-        return Err(KernelError::OutOfMemory.errno());
+        return Err(KernelError::OutOfMemory);
     }
     let addr = if shmaddr == 0 {
         mm_guard
             .find_free_area(size)
-            .ok_or(KernelError::OutOfMemory.errno())?
+            .ok_or(KernelError::OutOfMemory)?
     } else {
         let aligned = if shmflg & SHM_RND != 0 {
             shmaddr & !(PAGE_SIZE as u64 - 1)
@@ -369,7 +343,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
         if aligned.checked_add(size).is_none() {
             return Err(einval);
         }
-        crate::mm::check_fixed(aligned, size).map_err(|e| e.errno())?;
+        crate::mm::check_fixed(aligned, size)?;
         if mm_guard.overlaps(aligned, aligned + size) {
             if shmflg & SHM_REMAP == 0 {
                 return Err(einval);
@@ -397,24 +371,18 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
     Ok(addr)
 }
 
-/// shmdt - detach shared memory segment
+/// shmdt - detach shared memory segment (Linux ksys_shmdt)
 ///
-/// # Arguments
-/// * `shmaddr` - Address where segment is attached
-pub fn sys_shmdt(shmaddr: u64) -> i64 {
-    result_to_i64(do_shmdt(shmaddr))
-}
-
-/// Linux ksys_shmdt: unmap the attachment starting at `shmaddr`, all of
+/// Unmap the attachment starting at `shmaddr`, all of
 /// its VMAs (a split one included) up to the segment's size; dropping
 /// them updates shm_nattch
-fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
-    let einval = KernelError::InvalidArgument.errno();
+pub fn sys_shmdt(shmaddr: u64) -> KernelResult<()> {
+    let einval = KernelError::InvalidArgument;
     let mm = get_task_mm(current_tid()).ok_or(einval)?;
     let gone = {
         let mut map = mm
             .mmap_write_killable()
-            .map_err(|_| KernelError::Interrupted.errno())?;
+            .map_err(|_| KernelError::Interrupted)?;
         let first = map.find_vma(shmaddr).ok_or(einval)?;
         let att = first
             .shm
@@ -435,7 +403,7 @@ fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
     };
     // Dropped unlocked: the last detach may destroy the segment
     drop(gone);
-    Ok(0)
+    Ok(())
 }
 
 /// shmctl - shared memory control
@@ -444,11 +412,7 @@ fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
 /// * `shmid` - Segment ID
 /// * `cmd` - Command (IPC_STAT, IPC_SET, IPC_RMID, etc.)
 /// * `buf` - User buffer for data
-pub fn sys_shmctl(shmid: i32, cmd: i32, buf: u64) -> i64 {
-    result_to_i64(do_shmctl(shmid, cmd, buf))
-}
-
-fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
+pub fn sys_shmctl(shmid: i32, cmd: i32, buf: UserPtr<Shmid64Ds>) -> KernelResult<i32> {
     let ns = current_ipc_ns();
     let cmd_only = cmd & !IPC_64;
 
@@ -457,7 +421,7 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let shm = ns
                 .shm_ids()
                 .find_by_id(shmid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             // Check read permission
             ipc_checkperm(shm.perm(), IPC_PERM_READ)?;
@@ -467,9 +431,8 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
 
             shm.fill_shmid64_ds(&mut ds);
 
-            if buf != 0 {
-                put_user::<Uaccess, Shmid64Ds>(buf, ds)
-                    .map_err(|_| KernelError::BadAddress.errno())?;
+            if !buf.is_null() {
+                buf.write(&ds)?;
             }
 
             Ok(0)
@@ -478,13 +441,12 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
         IPC_SET => {
             // Copied in first, before the IPC locks (Linux: the copy
             // may fault)
-            let ds: Shmid64Ds =
-                get_user::<Uaccess, Shmid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
+            let ds = buf.read()?;
             let _w = ns.shm_ids().rwsem.write();
             let shm = ns
                 .shm_ids()
                 .find_by_id(shmid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             // Must be owner or have CAP_SYS_ADMIN; only uid, gid, mode
             // change
@@ -493,7 +455,7 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             {
                 let mut p = perm.lock.lock();
                 if !KernIpcPerm::is_owner(&p, perm.cuid, uid) {
-                    return Err(KernelError::NotPermitted.errno());
+                    return Err(KernelError::NotPermitted);
                 }
                 p.uid = ds.shm_perm.uid;
                 p.gid = ds.shm_perm.gid;
@@ -510,12 +472,12 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let shm = ns
                 .shm_ids()
                 .find_by_id(shmid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
 
             let uid = crate::task::percpu::current_cred().euid;
             let perm = shm.perm();
             if !KernIpcPerm::is_owner(&perm.lock.lock(), perm.cuid, uid) {
-                return Err(KernelError::NotPermitted.errno());
+                return Err(KernelError::NotPermitted);
             }
 
             // Remove from ID table (marks it deleted). With no attachment
@@ -538,17 +500,17 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let shm = ns
                 .shm_ids()
                 .find_by_id(shmid)
-                .ok_or(KernelError::InvalidArgument.errno())?;
+                .ok_or(KernelError::InvalidArgument)?;
             let uid = crate::task::percpu::current_cred().euid;
             let perm = shm.perm();
             let owner = perm.lock.lock().uid;
             if !crate::task::capable(crate::task::CAP_IPC_LOCK) && uid != owner && uid != perm.cuid
             {
-                return Err(KernelError::NotPermitted.errno());
+                return Err(KernelError::NotPermitted);
             }
             Ok(0)
         }
 
-        _ => Err(KernelError::InvalidArgument.errno()),
+        _ => Err(KernelError::InvalidArgument),
     }
 }

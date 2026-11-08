@@ -18,6 +18,17 @@ pub fn fget(fd: i32) -> Result<Arc<File>, KernelError> {
     current_fd_table().lock().get(fd).ok_or(KernelError::BadFd)
 }
 
+/// Install `file` at the current task's lowest free descriptor with fd
+/// flags `flags` (Linux get_unused_fd_flags + fd_install): EMFILE past
+/// RLIMIT_NOFILE, ENOMEM if the table cannot grow
+pub fn fd_install(file: Arc<File>, flags: u32) -> Result<i32, KernelError> {
+    let nofile = super::syscall::get_nofile_limit();
+    current_fd_table()
+        .lock()
+        .alloc_with_flags(file, flags, nofile)
+        .map_err(|e| KernelError::from_errno(e).unwrap_or(KernelError::ProcessFileLimit))
+}
+
 /// Bytes the segments cover, capped at MAX_RW_COUNT
 pub fn seg_len(segs: &[IoVec]) -> usize {
     let total = segs
