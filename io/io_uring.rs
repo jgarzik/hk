@@ -775,7 +775,14 @@ impl IoUring {
         let mask = sqe.len;
         let statx_buf = sqe.off;
 
-        crate::fs::syscall::sys_statx(dirfd, path_ptr, flags, mask, statx_buf) as i32
+        crate::fs::syscall::sys_statx(
+            dirfd,
+            UserPtr::new(path_ptr),
+            flags,
+            mask,
+            UserPtr::new(statx_buf),
+        )
+        .ret() as i32
     }
 
     /// Handle IORING_OP_FTRUNCATE

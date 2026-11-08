@@ -1013,3 +1013,6 @@ sigsp switch to the alt stack, __save_altstack fills uc_stack.
   refuses a child of a level-32 namespace; Linux create_user_ns refuses
   only past `parent_ns->level > 32`, so 33 levels nest. Not testable on
   both until uid_map is writable (Linux needs a mapping per level).
+- **fstat, fstatfs check the buffer before the fd** (fs/stat.rs): a
+  bad fd with a bad buffer is EFAULT; Linux newfstat and fstatfs look
+  the fd up first (EBADF) and copy out after.

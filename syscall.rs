@@ -391,12 +391,16 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Exit => crate::task::syscall::sys_exit(a[0] as i32),
         Sys::ExitGroup => crate::task::proc::sys_exit_group(a[0] as i32),
         Sys::Faccessat => {
-            crate::fs::syscall::sys_faccessat(a[0] as i32, a[1], a[2] as i32).ret() as u64
-        }
-        Sys::Faccessat2 => {
-            crate::fs::syscall::sys_faccessat2(a[0] as i32, a[1], a[2] as i32, a[3] as i32).ret()
+            crate::fs::syscall::sys_faccessat(a[0] as i32, UserPtr::new(a[1]), a[2] as i32).ret()
                 as u64
         }
+        Sys::Faccessat2 => crate::fs::syscall::sys_faccessat2(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as i32,
+            a[3] as i32,
+        )
+        .ret() as u64,
         Sys::Fadvise64 => {
             crate::fs::syscall::sys_fadvise64(a[0] as i32, a[1] as i64, a[2] as i64, a[3] as i32)
                 as u64
@@ -418,20 +422,26 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         .ret() as u64,
         Sys::Fchdir => crate::fs::syscall::sys_fchdir(a[0] as i32).ret() as u64,
         Sys::Fchmod => crate::fs::syscall::sys_fchmod(a[0] as i32, a[1] as u32).ret() as u64,
-        Sys::Fchmodat => {
-            crate::fs::syscall::sys_fchmodat(a[0] as i32, a[1], a[2] as u32, a[3] as i32).ret()
-                as u64
-        }
-        Sys::Fchmodat2 => {
-            crate::fs::syscall::sys_fchmodat2(a[0] as i32, a[1], a[2] as u32, a[3] as i32).ret()
-                as u64
-        }
+        Sys::Fchmodat => crate::fs::syscall::sys_fchmodat(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as u32,
+            a[3] as i32,
+        )
+        .ret() as u64,
+        Sys::Fchmodat2 => crate::fs::syscall::sys_fchmodat2(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as u32,
+            a[3] as i32,
+        )
+        .ret() as u64,
         Sys::Fchown => {
             crate::fs::syscall::sys_fchown(a[0] as i32, a[1] as u32, a[2] as u32).ret() as u64
         }
         Sys::Fchownat => crate::fs::syscall::sys_fchownat(
             a[0] as i32,
-            a[1],
+            UserPtr::new(a[1]),
             a[2] as u32,
             a[3] as u32,
             a[4] as i32,
@@ -449,8 +459,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::syscall::sys_fsetxattr(a[0] as i32, a[1], a[2], a[3], a[4] as i32).ret()
                 as u64
         }
-        Sys::Fstat => crate::fs::syscall::sys_fstat(a[0] as i32, a[1]).ret() as u64,
-        Sys::Fstatfs => crate::fs::syscall::sys_fstatfs(a[0] as i32, a[1]).ret() as u64,
+        Sys::Fstat => crate::fs::syscall::sys_fstat(a[0] as i32, UserPtr::new(a[1])).ret() as u64,
+        Sys::Fstatfs => {
+            crate::fs::syscall::sys_fstatfs(a[0] as i32, UserPtr::new(a[1])).ret() as u64
+        }
         Sys::Fsync => crate::fs::syscall::sys_fsync(a[0] as i32).ret() as u64,
         Sys::Ftruncate => crate::fs::syscall::sys_ftruncate(a[0] as i32, a[1] as i64).ret() as u64,
         Sys::Futex => {
@@ -719,9 +731,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::time::time_syscall::sys_nanosleep(UserPtr::new(a[0]), UserPtr::new(a[1])).ret()
                 as u64
         }
-        Sys::Newfstatat => {
-            crate::fs::stat::sys_fstatat(a[0] as i32, a[1], a[2], a[3] as i32).ret() as u64
-        }
+        Sys::Newfstatat => crate::fs::stat::sys_fstatat(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3] as i32,
+        )
+        .ret() as u64,
         Sys::Openat => crate::fs::syscall::sys_openat(
             a[0] as i32,
             UserPtr::new(a[1]),
@@ -1112,11 +1128,17 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[5] as u32,
         )
         .ret() as u64,
-        Sys::Statfs => crate::fs::syscall::sys_statfs(a[0], a[1]).ret() as u64,
-        Sys::Statx => {
-            crate::fs::syscall::sys_statx(a[0] as i32, a[1], a[2] as i32, a[3] as u32, a[4]).ret()
-                as u64
+        Sys::Statfs => {
+            crate::fs::syscall::sys_statfs(UserPtr::new(a[0]), UserPtr::new(a[1])).ret() as u64
         }
+        Sys::Statx => crate::fs::syscall::sys_statx(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as i32,
+            a[3] as u32,
+            UserPtr::new(a[4]),
+        )
+        .ret() as u64,
         Sys::Swapoff => crate::mm::sys_swapoff(UserPtr::new(a[0])).ret() as u64,
         Sys::Swapon => crate::mm::sys_swapon(UserPtr::new(a[0]), a[1] as i32).ret() as u64,
         Sys::Symlinkat => crate::fs::syscall::sys_symlinkat(a[0], a[1] as i32, a[2]).ret() as u64,
@@ -1192,9 +1214,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::syscall::sys_unlinkat(a[0] as i32, a[1], a[2] as i32).ret() as u64
         }
         Sys::Unshare => crate::ns::sys_unshare(a[0]).ret() as u64,
-        Sys::Utimensat => {
-            crate::fs::syscall::sys_utimensat(a[0] as i32, a[1], a[2], a[3] as i32).ret() as u64
-        }
+        Sys::Utimensat => crate::fs::syscall::sys_utimensat(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3] as i32,
+        )
+        .ret() as u64,
         Sys::Vhangup => crate::tty::sys_vhangup().ret() as u64,
         Sys::Vmsplice => crate::fs::splice::sys_vmsplice(
             a[0] as i32,

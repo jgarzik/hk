@@ -759,14 +759,19 @@ pub fn x86_64_syscall_dispatch(
 ) -> u64 {
     let args = [arg0, arg1, arg2, arg3, arg4, arg5];
     match num {
-        SYS_ACCESS => crate::fs::syscall::sys_access(args[0], args[1] as i32).ret() as u64,
+        SYS_ACCESS => {
+            crate::fs::syscall::sys_access(UserPtr::new(args[0]), args[1] as i32).ret() as u64
+        }
         SYS_ALARM => crate::time::posix_timer::sys_alarm(args[0] as u32).ret() as u64,
         SYS_ARCH_PRCTL => {
             crate::task::syscall::sys_arch_prctl(args[0] as i32, args[1]).ret() as u64
         }
-        SYS_CHMOD => crate::fs::syscall::sys_chmod(args[0], args[1] as u32).ret() as u64,
+        SYS_CHMOD => {
+            crate::fs::syscall::sys_chmod(UserPtr::new(args[0]), args[1] as u32).ret() as u64
+        }
         SYS_CHOWN => {
-            crate::fs::syscall::sys_chown(args[0], args[1] as u32, args[2] as u32).ret() as u64
+            crate::fs::syscall::sys_chown(UserPtr::new(args[0]), args[1] as u32, args[2] as u32)
+                .ret() as u64
         }
         SYS_DUP2 => crate::fs::syscall::sys_dup2(args[0] as i32, args[1] as i32).ret() as u64,
         SYS_EPOLL_CREATE => crate::io::epoll::sys_epoll_create(args[0] as i32).ret() as u64,
@@ -788,10 +793,13 @@ pub fn x86_64_syscall_dispatch(
         }
         SYS_IOPL => crate::task::syscall::sys_iopl(args[0] as u32).ret() as u64,
         SYS_LCHOWN => {
-            crate::fs::syscall::sys_lchown(args[0], args[1] as u32, args[2] as u32).ret() as u64
+            crate::fs::syscall::sys_lchown(UserPtr::new(args[0]), args[1] as u32, args[2] as u32)
+                .ret() as u64
         }
         SYS_LINK => crate::fs::syscall::sys_link(args[0], args[1]).ret() as u64,
-        SYS_LSTAT => crate::fs::syscall::sys_lstat(args[0], args[1]).ret() as u64,
+        SYS_LSTAT => {
+            crate::fs::syscall::sys_lstat(UserPtr::new(args[0]), UserPtr::new(args[1])).ret() as u64
+        }
         SYS_MKDIR => crate::fs::syscall::sys_mkdir(args[0], args[1] as u32).ret() as u64,
         SYS_MKNOD => crate::fs::syscall::sys_mknod(args[0], args[1] as u32, args[2]).ret() as u64,
         SYS_OPEN => {
@@ -817,14 +825,19 @@ pub fn x86_64_syscall_dispatch(
             args[2] as i32,
         )
         .ret() as u64,
-        SYS_STAT => crate::fs::syscall::sys_stat(args[0], args[1]).ret() as u64,
+        SYS_STAT => {
+            crate::fs::syscall::sys_stat(UserPtr::new(args[0]), UserPtr::new(args[1])).ret() as u64
+        }
         SYS_SYMLINK => crate::fs::syscall::sys_symlink(args[0], args[1]).ret() as u64,
         SYS_TIME => {
             crate::time::time_syscall::sys_time(crate::uaccess::UserPtr::new(args[0])).ret() as u64
         }
         SYS_UNLINK => crate::fs::syscall::sys_unlink(args[0]).ret() as u64,
-        SYS_UTIME => crate::fs::syscall::sys_utime(args[0], args[1]).ret() as u64,
-        SYS_UTIMES => crate::fs::syscall::sys_utimes(args[0], args[1]).ret() as u64,
+        SYS_UTIME => {
+            crate::fs::syscall::sys_utime(UserPtr::new(args[0]), UserPtr::new(args[1])).ret() as u64
+        }
+        SYS_UTIMES => crate::fs::syscall::sys_utimes(UserPtr::new(args[0]), UserPtr::new(args[1]))
+            .ret() as u64,
         SYS_VFORK => crate::task::syscall::sys_vfork().ret() as u64,
         _ => match sys_of(num) {
             Some(s) => crate::syscall::dispatch(s, args),
