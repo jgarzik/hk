@@ -2986,9 +2986,16 @@ child.shared_pending = SharedPending(Some(signal.clone()));
 **rt_sigaction(2):** Get/set signal handlers:
 ```rust
 let sighand = get_task_sighand(&current())?;  // cloned out under TASKLIST
+let ignores = new.ignores(sig);          // decided on the action installed
 let old = sighand.set_action(sig, new);  // SigHand.action (IrqSpinlock),
                                          // one hold: actions[sig.idx()]
+if ignores { flush_group_signal(sig) }   // TASKLIST, Task.sig: after
+else if old.is_ignore() { sig_unignore(sig) }
 ```
+Linux decides and flushes in one siglock hold; hk decides on the action
+it installed (never a later read another thread's sigaction may have
+changed) and flushes after the leaf `SigHand.action` is dropped, since
+the flush takes TASKLIST and `Task.sig`, which come before it.
 
 **rt_sigprocmask(2):** Modify blocked mask:
 ```rust

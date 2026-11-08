@@ -99,21 +99,33 @@ pub fn sys_rt_sigaction(
     }
 
     let sighand = get_task_sighand(&current()).ok_or(KernelError::NoProcess)?;
-    // The old action and the swap in one hold of the action lock
-    let changed = new.is_some();
-    let old = match new {
-        Some(a) => sighand.set_action(sig, a)?,
-        None => sighand.get_action(sig),
+    let Some(new) = new else {
+        let old = sighand.get_action(sig);
+        return write_oact(oact, &old);
     };
+    // Decided on the action this call installs, not on a later read of
+    // the table, which another thread's sigaction may have changed
+    // since (Linux do_sigaction decides in the same siglock hold). The
+    // flush and the timers take TASKLIST and Task.sig, which come
+    // before the leaf SigHand.action, so they act after it is dropped.
+    let ignores = new.ignores(sig);
+    // The old action and the swap in one hold of the action lock
+    let old = sighand.set_action(sig, new)?;
     // Ignored now: discarded pending; no longer ignored: interval timers
     // whose signal it ignored queue it (Linux do_sigaction)
-    if changed && sighand.get_action(sig).ignores(sig) {
+    if ignores {
         crate::signal::flush_group_signal(sig);
-    } else if changed && old.handler == crate::signal::SigHandler::Ignore {
+    } else if old.is_ignore() {
         crate::time::posix_timer::sig_unignore(sig);
     }
+    write_oact(oact, &old)
+}
+
+/// The old action to `oact` unless it is NULL, written after the action
+/// lock is dropped
+fn write_oact(oact: UserPtr<UserSigAction>, old: &SigAction) -> KernelResult<()> {
     if !oact.is_null() {
-        oact.write(&UserSigAction::from(&old))?;
+        oact.write(&UserSigAction::from(old))?;
     }
     Ok(())
 }
