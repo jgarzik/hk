@@ -268,7 +268,8 @@ fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> i64 {
     };
     match room {
         Ok(()) => {}
-        Err(24) => return KernelError::BadFd.sysret(), // EMFILE
+        // Past fs.nr_open: EBADF, not EMFILE (Linux ksys_dup3)
+        Err(e) if e == KernelError::ProcessFileLimit.errno() => return KernelError::BadFd.sysret(),
         Err(e) => return -i64::from(e),
     }
     table.close(newfd);

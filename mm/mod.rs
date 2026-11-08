@@ -644,7 +644,7 @@ impl MmStruct {
         // vm_pgoff): a VMA moved up by mremap keeps a small pgoff and
         // cannot grow below index 0 (Linux: grow <= vm_pgoff, ENOMEM)
         let Some(pgoff) = vma.pgoff.checked_sub(grow_pages) else {
-            return Err(12); // ENOMEM: the access is SIGSEGV
+            return Err(KernelError::OutOfMemory.errno()); // the access is SIGSEGV
         };
         let old_start = vma.start;
         vma.start = address;

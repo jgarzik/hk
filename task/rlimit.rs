@@ -181,7 +181,7 @@ pub fn get_task_rlimit(tid: Tid, resource: u32) -> Option<RLimit> {
 /// EPERM for an unprivileged raise of the hard limit); the limit it
 /// replaced, read in the same hold as the store
 pub fn set_task_rlimit(tid: Tid, resource: u32, new: RLimit) -> Result<RLimit, i32> {
-    let signal = get_task_signal_struct(tid).ok_or(-3)?; // ESRCH
+    let signal = get_task_signal_struct(tid).ok_or(KernelError::NoProcess.to_errno_neg())?;
     let old = signal.set_rlimit(resource, new)?;
     // A finite CPU limit is watched from now (Linux update_rlimit_cpu)
     if resource == RLIMIT_CPU {

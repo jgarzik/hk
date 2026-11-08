@@ -2179,22 +2179,22 @@ impl CloneConfig {
 /// yet takes only 1 (EINVAL)
 fn check_set_tid(ns: &crate::ns::PidNamespace, set_tid: &[u32]) -> Result<(), i32> {
     if set_tid.len() > ns.level as usize + 1 {
-        return Err(22); // EINVAL
+        return Err(KernelError::InvalidArgument.errno());
     }
     let mut level = Some(ns);
     for &nr in set_tid {
         if !(1..crate::task::pid::PID_MAX_LIMIT).contains(&nr) {
-            return Err(22);
+            return Err(KernelError::InvalidArgument.errno());
         }
-        let l = level.ok_or(22)?;
+        let l = level.ok_or(KernelError::InvalidArgument.errno())?;
         if nr != 1 && !crate::task::pid::ns_has_init(l) {
-            return Err(22);
+            return Err(KernelError::InvalidArgument.errno());
         }
         level = l.parent.as_deref();
         if !crate::task::capable(crate::task::CAP_CHECKPOINT_RESTORE)
             && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
         {
-            return Err(1); // EPERM
+            return Err(KernelError::NotPermitted.errno());
         }
     }
     Ok(())
@@ -2221,18 +2221,18 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Validate: CLONE_VM requires child_stack UNLESS CLONE_VFORK is also set
     // (vfork shares parent's stack with the child)
     if config.flags & CLONE_VM != 0 && config.child_stack == 0 && config.flags & CLONE_VFORK == 0 {
-        return Err(22); // EINVAL
+        return Err(KernelError::InvalidArgument.errno());
     }
 
     // CLONE_DETACHED is refused with CLONE_PIDFD (Linux copy_process)
     if config.flags & CLONE_PIDFD != 0 && config.flags & CLONE_DETACHED != 0 {
-        return Err(22); // EINVAL
+        return Err(KernelError::InvalidArgument.errno());
     }
 
     // Validate: CLONE_SIGHAND and CLONE_CLEAR_SIGHAND are mutually exclusive
     // (can't share handlers AND reset them at the same time)
     if config.flags & CLONE_SIGHAND != 0 && config.flags & CLONE_CLEAR_SIGHAND != 0 {
-        return Err(22); // EINVAL
+        return Err(KernelError::InvalidArgument.errno());
     }
 
     // RLIMIT_NPROC: every task, threads included, is charged to its
@@ -2247,13 +2247,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             .is_some_and(|t| t.task.has_flag(crate::task::pf::NPROC_EXCEEDED))
     };
     if crate::task::nproc_over(nproc.uid, nproc.count) {
-        return Err(11); // EAGAIN
+        return Err(KernelError::WouldBlock.errno());
     }
 
     // A TLS base the register cannot take (Linux copy_thread ->
     // set_new_tls -> do_arch_prctl_64)
     if config.flags & CLONE_SETTLS != 0 && !crate::arch::user_tls_ok(config.tls) {
-        return Err(1); // EPERM
+        return Err(KernelError::NotPermitted.errno());
     }
 
     // Get current CPU ID
@@ -2281,7 +2281,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_leader_exit_signal,
     ) = {
         let table = TASKLIST.read();
-        let parent = table.get(current_tid).ok_or(3)?; // ESRCH - no such process
+        let parent = table
+            .get(current_tid)
+            .ok_or(KernelError::NoProcess.errno())?;
         let leader_exit = table.get(parent.task.pid).map_or(0, |l| l.exit_signal);
         (
             parent.task.pid,
@@ -2328,7 +2330,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     if config.flags & CLONE_PARENT != 0
         && crate::signal::get_task_signal_struct(current_tid).is_some_and(|s| s.unkillable())
     {
-        return Err(22); // EINVAL
+        return Err(KernelError::InvalidArgument.errno());
     }
 
     // The child inherits the policy and priorities; with
@@ -2359,7 +2361,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         && (config.flags & (CLONE_NEWPID | CLONE_NEWUSER) != 0
             || !core::ptr::eq(Arc::as_ptr(&child_ns.pid_ns), me.task.pid_ns()))
     {
-        return Err(22); // EINVAL
+        return Err(KernelError::InvalidArgument.errno());
     }
     let into_cgroup = if config.flags & CLONE_INTO_CGROUP != 0 {
         Some(crate::task::cgroup_from_fd(current_tid, config.cgroup_fd)?)
@@ -2417,7 +2419,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         None => None,
         Some(pm) if config.flags & CLONE_VM != 0 => Some(pm),
         Some(pm) => {
-            let mut pt = ArchPageTable::new_user(frame_alloc).ok_or(12)?; // ENOMEM
+            let mut pt =
+                ArchPageTable::new_user(frame_alloc).ok_or(KernelError::OutOfMemory.errno())?;
             pt.copy_kernel_mappings();
             Some(crate::mm::dup_mm(&pm, pt.root_table_phys())?)
         }
@@ -2425,7 +2428,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let child_pgd = child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd());
 
     // The child's kernel stack (zeroed, guard gap below)
-    let stack = crate::mm::vmstack::alloc().ok_or(12)?; // ENOMEM
+    let stack = crate::mm::vmstack::alloc().ok_or(KernelError::OutOfMemory.errno())?;
     let kstack_top = stack.top();
 
     // Build child's TrapFrame at the top of the child's kernel stack (its
@@ -2627,7 +2630,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             if let Some(fd) = pidfd {
                 close_pidfd(fd);
             }
-            return Err(12); // ENOMEM
+            return Err(KernelError::OutOfMemory.errno());
         }
         if child_init {
             crate::task::pidns::attach_init(&mut table, &child_task);
@@ -2791,7 +2794,8 @@ fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Resul
     use crate::task::pidfd::pidfd_flags::PIDFD_THREAD;
     let flags = if thread { PIDFD_THREAD } else { 0 };
     let file = crate::task::pidfd::pidfd_file(pid, flags).map_err(|e| e.errno())?;
-    let files = crate::task::fdtable::get_task_fd(current_tid()).ok_or(9)?; // EBADF
+    let files =
+        crate::task::fdtable::get_task_fd(current_tid()).ok_or(KernelError::BadFd.errno())?;
     let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
     let fd = files
         .lock()
@@ -2799,7 +2803,7 @@ fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Resul
     if crate::uaccess::put_user::<crate::arch::Uaccess, i32>(ptr, fd).is_err() {
         // Released after the table lock (FilesGuard)
         files.lock().close(fd);
-        return Err(14); // EFAULT
+        return Err(KernelError::BadAddress.errno());
     }
     Ok(fd)
 }
@@ -4080,7 +4084,7 @@ fn move_queued_task(mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>, p: &
 pub fn set_cpus_allowed_ptr(p: &Task, mask: &crate::util::cpumask::CpuSet) -> Result<(), i32> {
     let allowed = mask.and(&sched_cpus());
     if mask.and(&crate::smp::active_cpus()).is_empty() {
-        return Err(22); // EINVAL
+        return Err(KernelError::InvalidArgument.errno());
     }
     let (cpu, dest) = {
         let _pi = p.pi_lock.lock();
@@ -4783,22 +4787,25 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
         base_policy,
         SCHED_NORMAL | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE
     ) {
-        return Err(22); // EINVAL
+        return Err(KernelError::InvalidArgument.errno());
     }
 
     // Validate rt_priority
     if is_rt_policy(base_policy) {
         if !(MIN_RT_PRIO..=MAX_RT_PRIO).contains(&rt_priority) {
-            return Err(22); // EINVAL
+            return Err(KernelError::InvalidArgument.errno());
         }
     } else if rt_priority != 0 {
-        return Err(22); // EINVAL - non-RT policies must have priority 0
+        return Err(KernelError::InvalidArgument.errno()); // non-RT policies must have priority 0
     }
 
-    let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
+    let task = TASKLIST
+        .read()
+        .task(pid)
+        .ok_or(KernelError::NoProcess.errno())?;
     // Not the stoppers nor an idle task (Linux: EINVAL for rq->stop)
     if matches!(task.se.class(), Class::Stop | Class::Idle) {
-        return Err(22);
+        return Err(KernelError::InvalidArgument.errno());
     }
     // Nothing changes (Linux __sched_setscheduler: same policy and
     // priority only updates reset-on-fork)
@@ -4835,10 +4842,13 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
 /// See [`set_cpus_allowed_ptr`]: a task on a CPU it may no longer use
 /// is moved before this returns.
 pub fn set_task_cpus_allowed(pid: Pid, mask: crate::util::cpumask::CpuSet) -> Result<(), i32> {
-    let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
+    let task = TASKLIST
+        .read()
+        .task(pid)
+        .ok_or(KernelError::NoProcess.errno())?;
     // Bound kernel threads (Linux sched_setaffinity: EINVAL)
     if task.has_flag(crate::task::pf::NO_SETAFFINITY) {
-        return Err(22);
+        return Err(KernelError::InvalidArgument.errno());
     }
     set_cpus_allowed_ptr(&task, &mask)
 }
@@ -4858,7 +4868,10 @@ pub fn task_count() -> usize {
 /// Error codes:
 /// - ESRCH (3): Process not found
 pub fn set_task_nice(pid: Pid, nice: i32) -> Result<(), i32> {
-    let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
+    let task = TASKLIST
+        .read()
+        .task(pid)
+        .ok_or(KernelError::NoProcess.errno())?;
     let static_prio = (i32::from(sched::DEFAULT_PRIO) + nice.clamp(-20, 19)) as u8;
     change_class(&task, |se| {
         se.set_params(se.class(), se.policy(), static_prio, se.rt_priority())
@@ -4950,20 +4963,20 @@ fn setpgid_who(
     if pid == caller_pid {
         return Ok(());
     }
-    let p = table.get(pid).ok_or(3)?; // ESRCH
+    let p = table.get(pid).ok_or(KernelError::NoProcess.errno())?;
     let child = p
         .real_parent
         .as_ref()
         .and_then(|w| w.upgrade())
         .is_some_and(|parent| parent.pid == caller_pid);
     if !child {
-        return Err(3); // ESRCH
+        return Err(KernelError::NoProcess.errno());
     }
     if p.task.sid() != caller_sid {
-        return Err(1); // EPERM
+        return Err(KernelError::NotPermitted.errno());
     }
     if !p.task.has_flag(crate::task::pf::FORKNOEXEC) {
-        return Err(13); // EACCES
+        return Err(KernelError::PermissionDenied.errno());
     }
     Ok(())
 }
@@ -4978,18 +4991,18 @@ fn setpgid_target(
     target: Option<&Arc<crate::task::pid::Pid>>,
     caller_sid: Pid,
 ) -> Result<Arc<crate::task::pid::Pid>, i32> {
-    let l = table.get(pid).ok_or(3)?; // ESRCH
+    let l = table.get(pid).ok_or(KernelError::NoProcess.errno())?;
     let sid = l.task.sid();
     if pid == sid || sid != caller_sid {
-        return Err(1); // EPERM
+        return Err(KernelError::NotPermitted.errno());
     }
     if pgid == pid {
-        return l.thread_pid.clone().ok_or(3);
+        return l.thread_pid.clone().ok_or(KernelError::NoProcess.errno());
     }
-    let pg = target.ok_or(1)?; // EPERM
+    let pg = target.ok_or(KernelError::NotPermitted.errno())?;
     match table.pgrp(pg).next() {
         Some(g) if g.task.sid() == caller_sid => Ok(pg.clone()),
-        _ => Err(1), // EPERM: no such group in the caller's session
+        _ => Err(KernelError::NotPermitted.errno()), // no such group in the caller's session
     }
 }
 
@@ -5003,12 +5016,14 @@ pub fn create_session(caller_pid: Pid) -> Result<Pid, i32> {
     let mut old = Vec::new();
     let mut table = TASKLIST.write();
     let pid = {
-        let l = table.get(caller_pid).ok_or(3)?; // ESRCH
-        let pid = l.thread_pid.clone().ok_or(3)?;
+        let l = table
+            .get(caller_pid)
+            .ok_or(KernelError::NoProcess.errno())?;
+        let pid = l.thread_pid.clone().ok_or(KernelError::NoProcess.errno())?;
         // A session leader already, or a process group with the
         // caller's id exists (Linux ksys_setsid)
         if l.task.sid() == caller_pid || table.pgrp(&pid).next().is_some() {
-            return Err(1); // EPERM
+            return Err(KernelError::NotPermitted.errno());
         }
         pid
     };

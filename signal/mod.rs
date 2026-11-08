@@ -484,10 +484,10 @@ impl SigHand {
     /// or cannot have its action changed (SIGKILL, SIGSTOP).
     pub fn set_action(&self, sig: u32, action: SigAction) -> Result<SigAction, i32> {
         if sig == 0 || sig > 64 {
-            return Err(22); // EINVAL
+            return Err(KernelError::InvalidArgument.errno());
         }
         if sig == SIGKILL || sig == SIGSTOP {
-            return Err(22); // EINVAL - can't change these
+            return Err(KernelError::InvalidArgument.errno()); // can't change these
         }
 
         let mut actions = self.action.lock();
@@ -3038,5 +3038,5 @@ pub fn force_sig_fault(info: SigInfo, trap: TrapSet, regs: &UserFrame) {
 /// with SIGSEGV. Returns -EFAULT for the (never seen) syscall result.
 pub fn sigreturn_badframe() -> i64 {
     force_sigsegv(crate::task::percpu::current_tid());
-    -14 // EFAULT
+    KernelError::BadAddress.sysret()
 }

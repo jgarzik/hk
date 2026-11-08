@@ -830,7 +830,7 @@ pub fn create_posix_timer(
                 return Err(KernelError::NotPermitted.to_errno_neg());
             }
         }
-        _ => cpu = Some(own_cpu_clock(clockid).ok_or(-22)?), // EINVAL
+        _ => cpu = Some(own_cpu_clock(clockid).ok_or(KernelError::InvalidArgument.to_errno_neg())?),
     }
 
     // Linux good_sigevent: SIGEV_THREAD_ID names a thread of the
@@ -866,7 +866,7 @@ pub fn create_posix_timer(
     // RLIMIT_SIGPENDING), then the timer in the registry
     let id = with_timers(tid, |reg| reg.alloc_id())
         .flatten()
-        .ok_or(-11)?;
+        .ok_or(KernelError::WouldBlock.to_errno_neg())?;
     if default_value {
         // Linux: sival_int = the timer id
         sev.sigev_value = u64::from(id as u32);
@@ -887,10 +887,11 @@ pub fn create_posix_timer(
             crate::signal::si_code::SI_TIMER,
             fields,
         );
-        let q = SigQueue::alloc_timer(info, Arc::downgrade(&t)).ok_or(-11)?;
+        let q = SigQueue::alloc_timer(info, Arc::downgrade(&t))
+            .ok_or(KernelError::WouldBlock.to_errno_neg())?;
         *t.sigq.lock() = Some(q);
     }
-    with_timers(tid, |reg| reg.add(t)).ok_or(-11)?;
+    with_timers(tid, |reg| reg.add(t)).ok_or(KernelError::WouldBlock.to_errno_neg())?;
     Ok(id)
 }
 

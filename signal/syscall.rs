@@ -313,7 +313,7 @@ impl Sender {
         if sig == SIGCONT && self.sid == t.task.sid() {
             return 0;
         }
-        -1 // EPERM
+        KernelError::NotPermitted.to_errno_neg()
     }
 }
 
@@ -420,8 +420,9 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
                         kill_proc_info(target_pid, sig, SendInfo::User);
                     }
                 }
-                -1 => matched = true, // permission denied, but it exists
-                _ => {}               // ESRCH: gone between listing and now
+                // Permission denied, but it exists
+                e if e == KernelError::NotPermitted.to_errno_neg() => matched = true,
+                _ => {} // ESRCH: gone between listing and now
             }
         }
         if matched {

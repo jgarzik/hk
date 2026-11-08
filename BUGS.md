@@ -933,3 +933,18 @@ adjtimex keeps and reports the NTP frequency (ADJ_FREQUENCY) and the
 tick, but neither changes how fast the clock runs (Linux
 ntp_update_frequency), and maxerror does not grow each second (Linux
 second_overflow).
+
+## Errno differs from Linux
+
+- **timerfd_create, eventfd2 return EMFILE for any create failure**
+  (time/time_syscall.rs): the create can only fail with ENOMEM;
+  Linux returns ENOMEM. The callee's error is dropped.
+- **unshare returns EINVAL for any NsProxy::copy failure** (ns/mod.rs):
+  Linux returns copy's error (ENOMEM, ENOSPC at the nesting limit).
+- **pid and user namespace nesting limits return EAGAIN** (ns/pid.rs,
+  ns/user.rs clone_ns): Linux create_pid_namespace and create_user_ns
+  return ENOSPC past MAX_*_NS_LEVEL.
+- **Fixed errnos in place of the callee's** in epoll_create1,
+  inotify_init1, fanotify_init, io_uring_setup and signalfd4
+  (`Err(_) => return <errno>`): the callee's KernelError is dropped,
+  so a new failure mode is silently remapped.

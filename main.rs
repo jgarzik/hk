@@ -549,7 +549,7 @@ fn run_init() -> ! {
     }
     for path in ["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"] {
         let e = try_init(path, &args);
-        if e != -2 {
+        if e != util::error::KernelError::NotFound.to_errno_neg() {
             printkln!(
                 "Starting init: {} exists but couldn't execute it (error {})",
                 path,

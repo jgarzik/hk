@@ -25,6 +25,7 @@
 //! - `UserNamespace.gid_map.extents`: RwLock
 
 use crate::sync::spin::RwLock;
+use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -116,7 +117,7 @@ impl UidGidMap {
     pub fn set_mapping(&self, new_extents: Vec<UidGidExtent>) -> Result<(), i32> {
         let mut extents = self.extents.write();
         if !extents.is_empty() {
-            return Err(1); // EPERM - already set
+            return Err(KernelError::NotPermitted.errno()); // already set
         }
         *extents = new_extents;
         Ok(())
@@ -183,7 +184,7 @@ impl UserNamespace {
     pub fn clone_ns(parent: &Arc<UserNamespace>) -> Result<Arc<Self>, i32> {
         // Check nesting level
         if parent.level >= MAX_USER_NS_LEVEL {
-            return Err(11); // EAGAIN - max nesting exceeded
+            return Err(KernelError::WouldBlock.errno()); // max nesting exceeded
         }
 
         // Get creator's credentials

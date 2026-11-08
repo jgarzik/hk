@@ -352,7 +352,7 @@ pub fn nproc_exec_check() -> Result<(), i32> {
         return Ok(());
     };
     if t.task.has_flag(crate::task::pf::NPROC_EXCEEDED) && over {
-        return Err(11); // EAGAIN
+        return Err(KernelError::WouldBlock.errno());
     }
     t.task.clear_flag(crate::task::pf::NPROC_EXCEEDED);
     Ok(())
@@ -743,14 +743,14 @@ impl<F> FdTable<F> {
         // RLIMIT_NOFILE enforcement
         if (fd as u64) >= nofile {
             self.defer(file);
-            return Err(24); // EMFILE - too many open files
+            return Err(KernelError::ProcessFileLimit.errno());
         }
         if fd < 0 || self.files.contains_key(&fd) {
             self.defer(file);
-            return Err(9); // EBADF - fd already in use
+            return Err(KernelError::BadFd.errno()); // fd already in use
         }
         if !self.install(fd, file, flags) {
-            return Err(12); // ENOMEM
+            return Err(KernelError::OutOfMemory.errno());
         }
         Ok(())
     }
