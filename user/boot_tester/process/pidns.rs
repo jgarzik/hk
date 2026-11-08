@@ -66,6 +66,7 @@ pub fn run_tests() {
     outer(b"PIDNS_SCM", scm);
     outer(b"PIDNS_UNSHARE", unshare);
     super::pidns_init::run_tests();
+    super::pidns_proc::run_tests();
 }
 
 /// Run `f` in a forked process X: its exit status is the failing step

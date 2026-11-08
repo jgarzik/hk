@@ -1709,6 +1709,14 @@ impl Task {
         self.pid_ns.as_deref().unwrap_or(&crate::ns::INIT_PID_NS)
     }
 
+    /// Its pid namespace, a counted reference (Linux
+    /// get_pid_ns(task_active_pid_ns(p)))
+    pub fn get_pid_ns(&self) -> Arc<crate::ns::PidNamespace> {
+        self.pid_ns
+            .clone()
+            .unwrap_or_else(|| crate::ns::INIT_PID_NS.clone())
+    }
+
     /// Take over thread ID `tid` (exec's exchange_tids, TASKLIST and
     /// the run-queue entry re-keyed by the caller)
     pub fn set_tid(&self, tid: Tid) {

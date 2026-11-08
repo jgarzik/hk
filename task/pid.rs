@@ -128,6 +128,11 @@ impl Pid {
         self.task.store(t.cast_mut(), Ordering::Release);
     }
 
+    /// Its numbers, one per level from the root (Linux pid->numbers)
+    pub fn numbers(&self) -> &[UPid] {
+        &self.numbers
+    }
+
     /// The namespace it was created in
     pub fn ns(&self) -> &Arc<PidNamespace> {
         &self.numbers[self.level as usize].ns
@@ -466,6 +471,12 @@ pub fn find_pgrp(ns: &PidNamespace, nr: u64) -> Option<Arc<Pid>> {
 /// lock-free, it cannot change while the task runs
 pub fn current_pid_ns() -> &'static PidNamespace {
     crate::task::percpu::current_pid_ns()
+}
+
+/// The caller's pid namespace, a counted reference to keep (Linux
+/// get_pid_ns(task_active_pid_ns(current)))
+pub fn get_current_pid_ns() -> Arc<PidNamespace> {
+    crate::task::percpu::current().get_pid_ns()
 }
 
 /// The caller has a number in `ns`: it is in `ns` or a namespace

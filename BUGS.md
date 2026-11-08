@@ -870,9 +870,7 @@ Tag = roadmap phase (doc/ROADMAP.md).
    allocator, cached sorted device list.
 6. **One AnonVma per fork family, Vec chain** (J).
    `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
-7. **Pid namespace gaps** (B4). Syscalls use the caller's pid
-   namespace, but /proc keeps the root one even when mounted inside a
-   namespace. reboot(2) inside a namespace checks
+7. **reboot(2) in a pid namespace checks `capable`** (B4). It checks
    CAP_SYS_BOOT with `capable`, not in the namespace's user namespace
    (Linux ns_capable(pid_ns->user_ns)): a pid namespace has no owning
    user namespace yet.

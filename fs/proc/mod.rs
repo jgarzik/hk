@@ -13,6 +13,16 @@
 //! - `/proc/<pid>/ns/user` - User namespace
 //!
 //! These files can be opened and passed to `setns(2)` to join namespaces.
+//!
+//! ## Pid namespaces
+//!
+//! A procfs shows the pid namespace of whoever mounted it (Linux
+//! proc_fs_info.pid_ns, `ProcOpts.pid_ns`, fixed at mount): its
+//! process directories are the tasks visible there, named by their
+//! numbers there, and the pids inside its files are numbered there.
+//! Inode data names a task by its root number (as Linux keeps the
+//! struct pid), translated from the mount's numbers at lookup and back
+//! when shown.
 
 mod array;
 mod mounts;
@@ -32,8 +42,10 @@ use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Times
 use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, PROC_SUPER_MAGIC, StatFs, SuperBlock, SuperOps};
 use crate::io::poll::{DEFAULT_POLLMASK, POLLIN, POLLRDNORM, PollTable};
+use crate::ns::PidNamespace;
 use crate::task::Cred;
 use crate::task::Pid;
+use crate::task::percpu::find_task_by_pid_ns;
 use crate::util::kalloc::try_arc;
 
 /// Get current timestamp for new inodes
@@ -43,9 +55,9 @@ fn current_time() -> Timespec {
     TIMEKEEPER.current_time()
 }
 
-/// The task procfs numbers `pid`: in the namespace of the mount, which
-/// is the root one (Linux proc_pid_lookup: find_task_by_pid_ns with
-/// the mount's pid namespace)
+/// The task of an inode's `pid`, a root number (the mount's number was
+/// translated at lookup: Linux proc_pid_lookup, find_task_by_pid_ns
+/// with the mount's pid namespace)
 fn find_task(pid: Pid) -> Option<crate::task::percpu::TaskRef> {
     crate::task::percpu::find_task_by_pid_ns(pid, &crate::ns::INIT_PID_NS)
 }
@@ -384,7 +396,7 @@ impl InodeOps for ProcfsInodeOps {
         };
         match l {
             Link::Pid(pid, target) => target(pid),
-            Link::Me => Ok(alloc::format!("{}", crate::task::percpu::current_pid()).into_bytes()),
+            Link::Me => self_link(inode),
             Link::Fixed(t) => Ok(t.to_vec()),
             Link::Fd(pid, fd) => fd_link(pid, fd),
         }
@@ -530,13 +542,14 @@ impl InodeOps for ProcfsInodeOps {
                     if name == "self" {
                         return create_self_link(dir);
                     }
-                    // This is /proc root - check for numeric PID lookup
-                    // hidepid=invisible: another user's process is not there
-                    if let Ok(pid) = name.parse::<u64>()
-                        && task_exists(pid)
-                        && opts::with(dir, |o| o.visible(pid)).unwrap_or(true)
+                    // A task by its number in the mount's pid namespace
+                    // (Linux proc_pid_lookup); hidepid=invisible: another
+                    // user's process is not there
+                    if let Ok(nr) = name.parse::<u64>()
+                        && let Some(t) = find_task_by_pid_ns(nr, &opts::pid_ns(dir))
+                        && opts::with(dir, |o| o.visible(t.tid())).unwrap_or(true)
                     {
-                        return create_pid_dir_inode(dir, pid);
+                        return create_pid_dir_inode(dir, t.tid());
                     }
                 }
 
@@ -546,12 +559,15 @@ impl InodeOps for ProcfsInodeOps {
             Dir::Ns(pid) => lookup_pid_ns_entry(dir, pid, name),
             Dir::Fd(pid) => lookup_pid_fd_entry(dir, pid, name),
             Dir::Task(pid) => {
-                let tid: crate::task::Tid = name.parse().map_err(|_| KernelError::NotFound)?;
-                if group_threads(pid).contains(&tid) {
-                    create_dir_inode(dir, pid_ino(tid, 0), ProcfsInodeData::new_pid_dir(pid))
-                } else {
-                    Err(KernelError::NotFound)
-                }
+                // A thread of the process by its number in the mount's
+                // namespace (Linux proc_task_lookup)
+                let nr: u64 = name.parse().map_err(|_| KernelError::NotFound)?;
+                let ns = opts::pid_ns(dir);
+                let tid = find_task_by_pid_ns(nr, &ns)
+                    .map(|t| t.tid())
+                    .filter(|&tid| group_threads(pid, &ns).iter().any(|&(t, _)| t == tid))
+                    .ok_or(KernelError::NotFound)?;
+                create_dir_inode(dir, pid_ino(tid, 0), ProcfsInodeData::new_pid_dir(pid))
             }
             Dir::Fdinfo(pid) => lookup_pid_fdinfo_entry(dir, pid, name),
         }
@@ -562,16 +578,16 @@ impl InodeOps for ProcfsInodeOps {
 // Per-PID Inode Creation Helpers
 // ============================================================================
 
-/// Create a /proc/<pid> directory inode
-/// The live threads (tids) of process `pid`
-fn group_threads(pid: Pid) -> alloc::vec::Vec<crate::task::Tid> {
-    use crate::task::percpu::TASKLIST;
-    let table = TASKLIST.read();
-    table
-        .threads(pid)
-        .filter(|t| !matches!(t.state, crate::task::TaskState::Zombie(_)))
-        .map(|t| t.task.tid())
-        .collect()
+/// The live threads of process `pid` visible in `ns`: their tids and
+/// their numbers in `ns`
+fn group_threads(pid: Pid, ns: &PidNamespace) -> Vec<(crate::task::Tid, u32)> {
+    crate::task::percpu::GlobalTaskTable::collect_threads(pid, |_, t| {
+        if matches!(t.state, crate::task::TaskState::Zombie(_)) {
+            return None;
+        }
+        let nr = t.thread_pid.as_ref()?.nr_in(ns)?;
+        Some((t.task.tid(), nr))
+    })
 }
 
 /// A procfs directory inode (r-xr-xr-x, root) with `data`
@@ -777,6 +793,17 @@ fn lookup_pid_ns_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
         ProcfsInodeData::new_ns_file(pid, ns_type),
     )))?);
     Ok(inode)
+}
+
+/// The target of /proc/self: the reader's process as the mount's pid
+/// namespace numbers it, ENOENT if it is not visible there (Linux
+/// proc_self_get_link)
+fn self_link(inode: &Inode) -> Result<Vec<u8>, KernelError> {
+    let ns = opts::pid_ns(inode);
+    match crate::task::pid::nr_ns(crate::task::percpu::current_pid(), &ns) {
+        0 => Err(KernelError::NotFound),
+        n => Ok(alloc::format!("{n}").into_bytes()),
+    }
 }
 
 /// /proc/self (resolved at readlink time to the reader's pid)
@@ -1018,6 +1045,9 @@ fn open_check(inode: &Inode) -> Option<OpenCheck> {
 pub enum PidGen {
     /// World-readable content of the process
     Pub(fn(Pid) -> Vec<u8>),
+    /// World-readable content with pids in it, numbered in the mount's
+    /// pid namespace (Linux proc_pid_ns(inode->i_sb))
+    Ns(fn(Pid, &PidNamespace) -> Vec<u8>),
     /// A mount table of the process (mounts, mountinfo): as `Pub`, and
     /// pollable (Linux mounts_poll)
     Mnt(fn(Pid) -> Vec<u8>),
@@ -1074,6 +1104,12 @@ fn proc_open(file: &File) -> Option<Arc<ProcOpen>> {
 fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, KernelError> {
     match g {
         PidGen::Pub(f) | PidGen::Mnt(f) => Ok(f(pid)),
+        PidGen::Ns(f) => {
+            let ns = file
+                .and_then(File::get_inode)
+                .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |i| opts::pid_ns(&i));
+            Ok(f(pid, &ns))
+        }
         PidGen::Mm(f) => {
             let mm = match file.and_then(proc_open) {
                 Some(p) => p.mm.clone(),
@@ -1102,8 +1138,8 @@ fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, Kern
 const PID_FILES: &[(&str, u64, u16, PidGen)] = &[
     ("cgroup", 102, 0o444, PidGen::Pub(gen_cgroup_content)),
     ("maps", 103, 0o444, PidGen::Mm(gen_maps)),
-    ("status", 105, 0o444, PidGen::Pub(array::gen_status)),
-    ("stat", 106, 0o444, PidGen::Pub(array::gen_stat)),
+    ("status", 105, 0o444, PidGen::Ns(array::gen_status)),
+    ("stat", 106, 0o444, PidGen::Ns(array::gen_stat)),
     ("cmdline", 107, 0o444, PidGen::Pub(array::gen_cmdline)),
     ("environ", 108, 0o400, PidGen::Mm(array::gen_environ)),
     ("mounts", 109, 0o444, PidGen::Mnt(mounts::show_mounts)),
@@ -1673,11 +1709,11 @@ impl FileOps for ProcfsFileOps {
             Dir::Ns(pid) => readdir_emit_ns_entries(pid, ctx)?,
             Dir::Fd(pid) => readdir_emit_fd_entries(pid, ctx)?,
             Dir::Task(pid) => {
-                for tid in group_threads(pid) {
+                for (tid, nr) in group_threads(pid, &opts::pid_ns(&inode)) {
                     let e = DirEntry {
                         ino: pid_ino(tid, 0),
                         file_type: FileType::Directory,
-                        name: Vec::from(alloc::format!("{tid}").as_bytes()),
+                        name: Vec::from(alloc::format!("{nr}").as_bytes()),
                     };
                     if !ctx.emit(e) {
                         break;
@@ -1695,33 +1731,34 @@ impl FileOps for ProcfsFileOps {
 /// FIRST_PROCESS_ENTRY): the static entries sit below it
 const PID_POS: u64 = 256;
 
-/// Emit PID directory entries for /proc readdir; a PID's position is
-/// PID_POS + pid (Linux proc_pid_readdir), stable while others exit
+/// Emit PID directory entries for /proc readdir: the processes visible
+/// in the mount's pid namespace, by their numbers there; a process's
+/// position is PID_POS + that number (Linux proc_pid_readdir, next_tgid),
+/// stable while others exit
 fn readdir_emit_pids(root: &Inode, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
-    use crate::task::percpu::TASKLIST;
-
-    // Collect PIDs first to release lock quickly (sorted, unique)
-    let pids: alloc::collections::BTreeSet<Pid> = {
-        let table = TASKLIST.read();
-        table
-            .iter()
-            .map(|t| t.task.pid)
-            .filter(|&p| p != 0)
-            .collect()
-    };
+    let ns = opts::pid_ns(root);
+    // Each group leader's (number in ns, root pid), gathered with no
+    // allocation under TASKLIST
+    let mut pids = crate::task::percpu::GlobalTaskTable::collect_tasks(|_, t| {
+        if t.task.tid() != t.task.pid || t.task.pid == 0 {
+            return None;
+        }
+        let nr = t.thread_pid.as_ref()?.nr_in(&ns)?;
+        Some((nr, t.task.pid))
+    });
+    pids.sort_unstable();
 
     // hidepid=invisible: other users' processes are left out
-    for pid in pids
+    for (nr, pid) in pids
         .into_iter()
-        .filter(|&p| opts::with(root, |o| o.visible(p)).unwrap_or(true))
+        .filter(|&(_, p)| opts::with(root, |o| o.visible(p)).unwrap_or(true))
     {
-        let name = alloc::format!("{}", pid);
         let e = DirEntry {
             ino: pid_ino(pid, 0),
             file_type: FileType::Directory,
-            name: Vec::from(name.as_bytes()),
+            name: Vec::from(alloc::format!("{nr}").as_bytes()),
         };
-        if !ctx.emit_at(PID_POS + pid, e) {
+        if !ctx.emit_at(PID_POS + u64::from(nr), e) {
             break;
         }
     }
@@ -2141,20 +2178,42 @@ static PROC_SBS: crate::sync::spin::Mutex<Vec<alloc::sync::Weak<SuperBlock>>> =
 
 /// A released task's /proc entries leave every procfs dcache (Linux
 /// proc_flush_pid): /proc/<tid>, and the process directory with it
-/// when the task was its leader, /proc/<pid>/task/<tid> otherwise
-pub fn proc_flush_pid(pid: Pid, tid: Pid) {
+/// when the task was its leader, /proc/<pid>/task/<tid> otherwise, each
+/// named as that procfs's pid namespace numbers it. TASKLIST not held.
+pub fn proc_flush_pid(t: &crate::task::Task) {
+    use crate::task::percpu::TASKLIST;
+    // Its struct pid and its leader's, whose numbers stay readable after
+    // they are given back; taken under TASKLIST, dropped after it
+    let (thread, leader) = {
+        let table = TASKLIST.read();
+        let thread = t
+            .inner()
+            .access(&table)
+            .as_ref()
+            .and_then(|i| i.thread_pid.clone());
+        let leader = if t.tid() == t.pid {
+            None
+        } else {
+            table.get(t.pid).and_then(|l| l.thread_pid.clone())
+        };
+        (thread, leader)
+    };
+    let Some(thread) = thread else {
+        return;
+    };
     let sbs: Vec<Arc<SuperBlock>> = {
         let mut v = PROC_SBS.lock();
         v.retain(|w| w.strong_count() != 0);
         v.iter().filter_map(alloc::sync::Weak::upgrade).collect()
     };
-    let name = |n: Pid| alloc::format!("{}", n).into_bytes();
+    let name = |n: u32| alloc::format!("{n}").into_bytes();
     for sb in sbs {
-        let Some(root) = sb.get_root() else {
+        let ns = opts::sb_pid_ns(&sb);
+        let (Some(root), Some(tid)) = (sb.get_root(), thread.nr_in(&ns)) else {
             continue;
         };
         root.remove_child(&name(tid));
-        if pid != tid
+        if let Some(pid) = leader.as_ref().and_then(|l| l.nr_in(&ns))
             && let Some(task) = root
                 .lookup_child(&name(pid))
                 .and_then(|d| d.lookup_child(b"task"))

@@ -2,6 +2,11 @@
 //! proc_pid_status / do_task_stat, fs/proc/base.c proc_pid_cmdline_read
 //! / environ_read)
 //!
+//! Pids are numbered in the pid namespace of the procfs read (Linux
+//! proc_pid_ns): translated under TASKLIST from the `Pid`s of the task,
+//! its leader, parent, tracer, group and session, which TASKLIST keeps
+//! listed meanwhile.
+//!
 //! Locking: the task's fields are copied under TASKLIST, which is
 //! dropped before anything else is taken; then, one at a time and never
 //! nested, the address space's mmap_lock (VM sizes, page counts and the
@@ -14,6 +19,8 @@ use core::fmt::Write;
 
 use crate::fs::KernelError;
 use crate::mm::{Mm, MmLayout, MmStruct, PROT_EXEC, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
+use crate::ns::PidNamespace;
+use crate::ns::pid::MAX_PID_NS_LEVEL;
 use crate::task::percpu::TASKLIST;
 use crate::task::{Cred, Pid, TaskKind, TaskState, Tid};
 
@@ -24,7 +31,11 @@ const PF_KTHREAD: u64 = 0x0020_0000;
 /// but exec caps the strings at 128 KiB)
 const ARGS_MAX: u64 = 128 * 1024;
 
-/// What /proc reads of a task, copied under TASKLIST
+/// Levels a task can have numbers at
+const LEVELS: usize = MAX_PID_NS_LEVEL as usize + 1;
+
+/// What /proc reads of a task, copied under TASKLIST; the pids as the
+/// reading procfs's namespace numbers them (0 if not visible there)
 struct Snap {
     pid: Pid,
     tid: Tid,
@@ -32,6 +43,10 @@ struct Snap {
     ppid: Pid,
     pgid: Pid,
     sid: Pid,
+    /// (tgid, pid, pgid, sid) in each namespace from the procfs's down
+    /// to the task's own (Linux NStgid, NSpid, NSpgid, NSsid)
+    ns_ids: [[u32; 4]; LEVELS],
+    levels: usize,
     comm: [u8; 16],
     state: TaskState,
     cred: Cred,
@@ -67,12 +82,34 @@ struct Snap {
     files: Option<Arc<crate::task::fdtable::Files>>,
 }
 
-/// Copy process `pid` (its first task, the leader) out of TASKLIST
-fn snap(pid: Pid) -> Option<Snap> {
+/// Copy task `pid` out of TASKLIST, its pids numbered in `ns` (Linux
+/// task_state, do_task_stat with proc_pid_ns)
+fn snap(pid: Pid, ns: &PidNamespace) -> Option<Snap> {
     let table = TASKLIST.read();
     let t = table.get(pid)?;
     let threads = table.threads(pid).count() as u64;
-    let tracer = t.tracer().map_or(0, |x| x.pid);
+    let nr = |p: Option<&Arc<crate::task::pid::Pid>>, n: &PidNamespace| p.map_or(0, |p| p.nr_ns(n));
+    // A listed task's process (by its root number) in `ns`
+    let task_nr = |root: Tid| {
+        u64::from(nr(
+            table.get(root).and_then(|x| x.fields().thread_pid.as_ref()),
+            ns,
+        ))
+    };
+    let me = t.thread_pid.as_ref();
+    let leader = table
+        .get(t.task.pid)
+        .and_then(|l| l.fields().thread_pid.as_ref());
+    let (pg, se) = (t.pgrp.as_ref(), t.session.as_ref());
+    let tracer = t.tracer().map_or(0, |x| task_nr(x.tid()));
+    let mut ns_ids = [[0u32; 4]; LEVELS];
+    let mut levels = 0;
+    if let Some(p) = me {
+        for u in p.numbers().iter().skip(ns.level as usize) {
+            ns_ids[levels] = [nr(leader, &u.ns), u.nr, nr(pg, &u.ns), nr(se, &u.ns)];
+            levels += 1;
+        }
+    }
     // comm and the resources together, under task_lock
     let (comm, fs, files) = {
         let a = t.task.task_lock();
@@ -85,12 +122,14 @@ fn snap(pid: Pid) -> Option<Snap> {
     // The whole thread group's CPU time (Linux do_task_stat with whole)
     let (utime, stime) = crate::task::percpu::group_times(&table, pid);
     Some(Snap {
-        pid,
+        pid: u64::from(nr(me, ns)),
         tid: t.task.tid(),
-        tgid: t.task.pid,
-        ppid: t.task.ppid(),
-        pgid: t.task.pgid(),
-        sid: t.task.sid(),
+        tgid: u64::from(nr(leader, ns)),
+        ppid: task_nr(t.task.ppid()),
+        pgid: u64::from(nr(pg, ns)),
+        sid: u64::from(nr(se, ns)),
+        ns_ids,
+        levels,
         comm,
         state: match t.state {
             // The run state as of its last switch (Linux task_state)
@@ -272,9 +311,9 @@ fn task_vm(tid: Tid) -> Option<VmStat> {
     Some(vm_stat(&mm, &m))
 }
 
-/// /proc/<pid>/status (Linux proc_pid_status)
-pub fn gen_status(pid: Pid) -> Vec<u8> {
-    let Some(s) = snap(pid) else {
+/// /proc/<pid>/status (Linux proc_pid_status), pids numbered in `ns`
+pub fn gen_status(pid: Pid, ns: &PidNamespace) -> Vec<u8> {
+    let Some(s) = snap(pid, ns) else {
         return Vec::new();
     };
     let mut o = Out(Vec::new());
@@ -297,8 +336,16 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
         let _ = write!(o, "{}{g}", if i > 0 { " " } else { "" });
     }
     let _ = writeln!(o, " ");
-    let _ = writeln!(o, "NStgid:\t{}\nNSpid:\t{}", s.tgid, s.pid);
-    let _ = writeln!(o, "NSpgid:\t{}\nNSsid:\t{}", s.pgid, s.sid);
+    for (i, key) in ["NStgid:", "NSpid:", "NSpgid:", "NSsid:"]
+        .iter()
+        .enumerate()
+    {
+        let _ = write!(o, "{key}");
+        for ids in &s.ns_ids[..s.levels] {
+            let _ = write!(o, "\t{}", ids[i]);
+        }
+        let _ = writeln!(o);
+    }
     let _ = writeln!(o, "Kthread:\t{}", u8::from(s.kthread));
     if let Some(v) = task_vm(s.tid) {
         status_mem(&mut o, &v);
@@ -382,8 +429,8 @@ fn status_sig(o: &mut Out, s: &Snap) {
 /// /proc/<pid>/stat (Linux do_task_stat, whole thread group): all 52
 /// fields; the address-space ones and exit_code only with ptrace-read
 /// access, as in Linux
-pub fn gen_stat(pid: Pid) -> Vec<u8> {
-    let Some(s) = snap(pid) else {
+pub fn gen_stat(pid: Pid, ns: &PidNamespace) -> Vec<u8> {
+    let Some(s) = snap(pid, ns) else {
         return Vec::new();
     };
     // The access decision and the mm it covers, as one (Linux holds
@@ -543,6 +590,8 @@ mod tests {
             ppid: 1,
             pgid: 40,
             sid: 30,
+            ns_ids: [[0; 4]; LEVELS],
+            levels: 0,
             comm: c,
             state: TaskState::Sleeping,
             cred: Cred::ROOT,

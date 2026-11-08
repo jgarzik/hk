@@ -808,6 +808,20 @@ impl GlobalTaskTable {
         )
     }
 
+    /// What `f` picks of every task, gathered as `collect_threads` does
+    pub fn collect_tasks<T>(f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>) -> Vec<T> {
+        Self::collect(
+            |table, visit| {
+                for t in table.iter() {
+                    if !visit(&t) {
+                        break;
+                    }
+                }
+            },
+            f,
+        )
+    }
+
     /// What `f` picks of the tasks `walk` visits (until a visit returns
     /// false), with no allocation under TASKLIST: sized under one read
     /// hold, filled under another, again if the set grew between
@@ -3032,7 +3046,7 @@ impl Unhashed {
     /// not held): a tracer or an exec (de_thread) waiting for the thread
     fn finish(self) {
         if let Some(t) = self.thread {
-            crate::fs::proc::proc_flush_pid(t.pid, t.tid());
+            crate::fs::proc::proc_flush_pid(&t);
             drop(t);
             crate::task::proc::CHILD_EXIT_WQ.wake_all();
         }
@@ -3222,7 +3236,7 @@ fn release(gone: Option<Reaped>) {
     let Some(Reaped { t, uid }) = gone else {
         return;
     };
-    crate::fs::proc::proc_flush_pid(t.pid, t.tid());
+    crate::fs::proc::proc_flush_pid(&t);
     crate::task::nproc_uncharge(uid);
     drop(t);
     crate::task::proc::CHILD_EXIT_WQ.wake_all();

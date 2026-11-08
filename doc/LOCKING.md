@@ -1937,8 +1937,19 @@ A cached child is revalidated (`InodeOps::revalidate`, Linux
 d_revalidate) after its d_lock is released, inside whatever i_rwsem the
 walk holds: procfs's takes TASKLIST (read) and the task's fd table
 lock. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
-collects the procfs superblocks under `PROC_SBS` (spin Mutex, leaf),
-releases it, then drops dentries (d_lock).
+clones the task's and its leader's `Pid` under TASKLIST's read lock
+(dropped after it), collects the procfs superblocks under `PROC_SBS`
+(spin Mutex, leaf), releases it, then drops dentries (d_lock), each
+named as that superblock's pid namespace numbers the task.
+
+A procfs superblock's pid namespace (`ProcOpts.pid_ns`, Linux
+proc_fs_info.pid_ns: the mounter's) is fixed at mount and read with no
+lock; inode data names tasks by root number, so lookup, readdir and
+the per-task files translate through the pid helpers (3.1.1 Pid
+namespaces): the hash, then TASKLIST's read lock to reach the task
+(readdir and /proc/<pid>/task gather under it with no allocation,
+`collect_tasks`/`collect_threads`); status and stat number every pid
+under that read lock from the `Pid`s it keeps listed (lock-free).
 
 An open procfs file's `ProcOpen.seq` (sync::Mutex, Linux seq_file
 m->lock) is held across generating its content (which takes

@@ -100,18 +100,15 @@ Validated sites whose bound allows order 4 use `kmem::try_vec`
   become one.
 - Separate issue: `add_entry` (`:212`) dedups with a linear scan, which is O(n²) in nfds.
 
-**4. `fs/proc/mod.rs:1296` global /proc generators run while holding the inode's spin
-`RwLock` read lock (`:336`, `crate::sync::spin::RwLock`).**
-- Every `String` / `Vec` growth in meminfo, slabinfo, net/*, mounts, etc. happens without
-  reclaim, and each `read()` regenerates the whole file.
-- The bigger fix is not a capacity change: copy the `generator` fn pointer and drop `data`
-  before calling it, as the `PidFile` branch already does at `:1289-1293`.
-- After that, pre-size the large generators from trusted counts:
-  - `fs/proc/mounts.rs:66,86`: `vis.len() * 64`;
-  - `mm/slab.rs` `slabinfo`: `SIZES.len()` × the line width;
-  - `fs/proc/mod.rs:1116`: per-entry count.
-- Benefit: medium; real for big files, and it removes high-order allocations under a
-  spinlock.
+**4. /proc generators grow their output one write at a time.**
+- They run with no lock held (`fs/proc/mod.rs` `proc_content` copies the generator out
+  of the inode data first; the process list is gathered under TASKLIST with no
+  allocation, `collect_tasks`), but every `String` / `Vec` in meminfo, slabinfo, net/*,
+  mounts, etc. starts empty and each `read()` regenerates the whole file.
+- Pre-size the large generators from trusted counts:
+  - `fs/proc/mounts.rs` `show_mounts`/`show_mountinfo`: the visible mounts × 64;
+  - `mm/slab.rs` `slabinfo`: `SIZES.len()` × the line width.
+- Benefit: medium; real for big files.
 
 **5. `fs/namei.rs:208` path walk: `split(..).filter(..).collect()` is not exact-size, so it
 starts at capacity 4 and grows for deeper paths.**
