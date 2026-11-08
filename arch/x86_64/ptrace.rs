@@ -93,7 +93,7 @@ pub fn get_user_regs(t: &Task) -> KernelResult<UserRegsStruct> {
     let task = table.view(t).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
-    if !matches!(task.state, crate::task::TaskState::Traced(_)) {
+    if !matches!(task.state(), crate::task::TaskState::Traced(_)) {
         return Err(KernelError::NoProcess); // not stopped
     }
 
@@ -143,7 +143,7 @@ pub fn set_user_regs(t: &Task, regs: &UserRegsStruct) -> KernelResult<()> {
     let task = table.view(t).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
-    if !matches!(task.state, crate::task::TaskState::Traced(_)) {
+    if !matches!(task.state(), crate::task::TaskState::Traced(_)) {
         return Err(KernelError::NoProcess); // not stopped
     }
 

@@ -345,7 +345,7 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie, mut entry: Entry) -> Told {
 /// status, and its CPU times (a leader's: its group's)
 fn chld_notice(table: &GlobalTaskTable, tid: Tid, ns: &crate::ns::PidNamespace) -> Option<SigInfo> {
     let t = table.get(tid)?;
-    let crate::task::TaskState::Zombie(own) = t.state else {
+    let crate::task::TaskState::Zombie(own) = t.state() else {
         return None;
     };
     let status = match t.signal().map(|s| s.group_exit()) {

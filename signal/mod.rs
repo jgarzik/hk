@@ -1184,7 +1184,7 @@ fn target_in(table: &crate::task::percpu::GlobalTaskTable, t: &Task) -> Option<T
         kthread: v.task.has_flag(crate::task::pf::KTHREAD),
         global: v.task.pid == 1,
         group_exit: sig.is_some_and(|s| matches!(s.group_exit(), GroupExit::Exit(_))),
-        stopped: matches!(v.state, crate::task::TaskState::Traced(_)),
+        stopped: matches!(v.state(), crate::task::TaskState::Traced(_)),
         uid: v.cred_arc().uid,
         limit: limit.map_or(0, |r| r.rlim_cur),
         sighand: v.sighand().cloned(),
@@ -1536,7 +1536,7 @@ fn pick_thread(
     let wants = |v: &crate::task::percpu::TaskView<'_>| {
         wants_signal(
             v.task,
-            matches!(v.state, crate::task::TaskState::Traced(_)),
+            matches!(v.state(), crate::task::TaskState::Traced(_)),
             sig,
         )
     };
@@ -1802,7 +1802,7 @@ fn group_kill(p: &Task, sig: Signal) {
             table
                 .threads(pid)
                 .any(|u| task_live(&u))
-                .then(|| (pid, t.ptrace != 0, group_signal(&table, pid)))
+                .then(|| (pid, t.ptrace() != 0, group_signal(&table, pid)))
         })
     };
     let Some((tgid, traced, Some(s))) = found else {
@@ -1816,7 +1816,7 @@ fn group_kill(p: &Task, sig: Signal) {
 /// `t` has not started exiting (Linux !PF_EXITING, not a zombie)
 pub fn task_live(t: &crate::task::percpu::TaskView<'_>) -> bool {
     !t.task.has_flag(crate::task::pf::EXITING)
-        && !matches!(t.state, crate::task::TaskState::Zombie(_))
+        && !matches!(t.state(), crate::task::TaskState::Zombie(_))
 }
 
 /// The SignalStruct of thread group `tgid` (its leader keeps it until
@@ -1883,9 +1883,8 @@ fn sigkill_task(t: &mut crate::task::percpu::TaskViewMut<'_>) {
     s.pending.add(SIGKILL);
     t.task.set_sigpending(true);
     drop(s);
-    if matches!(t.state, crate::task::TaskState::Traced(_)) && !t.ptrace_frozen {
-        t.state = crate::task::TaskState::Ready;
-        t.ptrace_code = 0;
+    if !t.ptrace_frozen() {
+        t.end_trace_stop();
     }
 }
 

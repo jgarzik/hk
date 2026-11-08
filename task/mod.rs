@@ -1139,7 +1139,7 @@ pub struct TaskInner {
     // Credentials (like Linux task_struct->cred)
     // =========================================================================
     /// Current state
-    pub state: TaskState,
+    state: TaskState,
     /// CPU affinity mask (bit N = CPU N is allowed)
     /// Top-level page table it runs on: its mm's, else the kernel's
     /// (`ArchPageTable::kernel_root`)
@@ -1216,7 +1216,7 @@ pub struct TaskInner {
     // =========================================================================
     /// Ptrace flags (PT_PTRACED, PT_SEIZED, PT_SYSCALL_TRACE, PT_SINGLESTEP)
     /// 0 = not traced, non-zero = traced with flags
-    pub ptrace: u32,
+    ptrace: u32,
 
     /// The tracer (Linux task->parent while traced): a task reference,
     /// so a recycled number never names it (under TASKLIST)
@@ -1257,7 +1257,7 @@ pub struct TaskInner {
     /// Its tracer is inside a ptrace request on it (Linux
     /// JOBCTL_PTRACE_FROZEN): a SIGKILL leaves its ptrace stop alone
     /// until the request ends
-    pub ptrace_frozen: bool,
+    ptrace_frozen: bool,
 }
 
 impl TaskInner {
@@ -1355,6 +1355,29 @@ impl TaskInner {
     /// Its real parent, if it has one that lives
     pub fn real_parent(&self) -> Option<percpu::TaskRef> {
         self.real_parent.as_ref().and_then(|w| w.upgrade())
+    }
+
+    /// Its current state
+    pub fn state(&self) -> TaskState {
+        self.state
+    }
+
+    /// Its ptrace flags (0: not traced)
+    pub fn ptrace(&self) -> u32 {
+        self.ptrace
+    }
+
+    /// Its tracer is inside a ptrace request on it
+    pub fn ptrace_frozen(&self) -> bool {
+        self.ptrace_frozen
+    }
+
+    /// End a ptrace stop it is in: ready, nothing for its tracer's wait
+    pub fn end_trace_stop(&mut self) {
+        if matches!(self.state, TaskState::Traced(_)) {
+            self.state = TaskState::Ready;
+            self.ptrace_code = 0;
+        }
     }
 }
 

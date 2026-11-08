@@ -657,7 +657,7 @@ fn group_threads(
     ns: &PidNamespace,
 ) -> Vec<(*const crate::task::Task, crate::task::Tid, u32)> {
     crate::task::percpu::GlobalTaskTable::collect_group(t, |_, x| {
-        if matches!(x.state, crate::task::TaskState::Zombie(_)) {
+        if matches!(x.state(), crate::task::TaskState::Zombie(_)) {
             return None;
         }
         let nr = x.thread_pid()?.nr_in(ns)?;

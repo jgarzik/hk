@@ -133,7 +133,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         ns_ids,
         levels,
         comm,
-        state: match t.state {
+        state: match t.state() {
             // The run state as of its last switch (Linux task_state)
             TaskState::Ready | TaskState::Running | TaskState::Sleeping => {
                 if t.task.se.state() != crate::task::percpu::SleepState::Running as u8 {

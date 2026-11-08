@@ -229,9 +229,8 @@ impl Drop for Frozen {
             };
             t.ptrace_frozen = false;
             let killed = signal::task_fatal_pending(&self.0);
-            if killed && matches!(t.state, TaskState::Traced(_)) {
-                t.state = TaskState::Ready;
-                t.ptrace_code = 0;
+            if killed {
+                t.end_trace_stop();
             }
             killed
         };
@@ -909,10 +908,7 @@ fn detach_live(me: &crate::task::Task) -> Option<(percpu::TaskRef, Option<signal
     };
     let mut v = table.view_mut(&t)?;
     ptrace_unlink(&mut v);
-    if matches!(v.state, TaskState::Traced(_)) {
-        v.state = TaskState::Ready;
-        v.ptrace_code = 0;
-    }
+    v.end_trace_stop();
     Some((t, kill))
 }
 
