@@ -368,10 +368,10 @@ pub fn fork_nsproxy(
     // permission check (Linux copy_process); the child's own copy
     // follows its new mounts
     if ns_flags & CLONE_NEWNS != 0 && flags & crate::task::clone_flags::CLONE_FS != 0 {
-        return Err(22);
+        return Err(KernelError::InvalidArgument.errno());
     }
     if !may_create_namespaces(ns_flags) {
-        return Err(EPERM as i32);
+        return Err(KernelError::NotPermitted.errno());
     }
     let parent_ns = get_task_ns(parent_tid).unwrap_or_else(|| INIT_NSPROXY.clone());
     if ns_flags == 0 {
@@ -432,10 +432,6 @@ pub fn current_net_ns() -> Arc<NetNamespace> {
 // Unshare Syscall
 // ============================================================================
 
-/// Error codes for namespace operations
-const EPERM: i64 = 1;
-const EINVAL: i64 = 22;
-
 /// Currently supported namespace flags for unshare
 ///
 /// We support UTS, mount, PID, user, IPC, and network namespaces.
@@ -482,11 +478,11 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
     // Check for unsupported namespace flags
     let unsupported = ns_flags & !SUPPORTED_NS_FLAGS;
     if unsupported != 0 {
-        return -EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     if !may_create_namespaces(ns_flags) {
-        return -EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Get current namespace proxy
@@ -512,7 +508,7 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
     };
     let new_ns = match current_ns.copy(ns_flags, fs.as_deref()) {
         Ok(ns) => ns,
-        Err(_) => return -EINVAL,
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Switch to new namespace (atomic via mutex)
@@ -532,10 +528,6 @@ pub fn switch_task_namespaces(tid: Tid, new_ns: Arc<NsProxy>) {
 // ============================================================================
 // Setns Syscall
 // ============================================================================
-
-/// Error codes for setns
-const EBADF: i64 = 9;
-const ESRCH: i64 = 3;
 
 /// sys_setns - reassociate thread with a namespace
 ///
@@ -561,23 +553,23 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
     // Get file from fd
     let fd_table = match get_task_fd(tid) {
         Some(t) => t,
-        None => return -EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
     let file = match fd_table.lock().get(fd) {
         Some(f) => f,
-        None => return -EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get inode from file
     let inode = match file.get_inode() {
         Some(i) => i,
-        None => return -EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get private data and check if it's a namespace file
     let private = match inode.get_private() {
         Some(p) => p,
-        None => return -EINVAL,
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     let wrapper = match private
@@ -586,26 +578,26 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
         .downcast_ref::<ProcfsInodeWrapper>()
     {
         Some(w) => w,
-        None => return -EINVAL, // Not a procfs file
+        None => return KernelError::InvalidArgument.sysret(), // Not a procfs file
     };
 
     // Copied out: the inode data's spin lock is not held for the rest
     let (target_pid, ns_type) = match &*wrapper.0.read() {
         ProcfsInodeData::NamespaceFile { pid, ns_type } => (pid.clone(), *ns_type),
-        _ => return -EINVAL, // Not a namespace file
+        _ => return KernelError::InvalidArgument.sysret(), // Not a namespace file
     };
 
     // Validate nstype if specified
     if nstype != 0 {
         let expected_flag = ns_type.clone_flag() as i32;
         if nstype != expected_flag {
-            return -EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
     }
 
     // The target task, pinned through its struct pid
     let Some(target) = target_pid.task() else {
-        return -ESRCH;
+        return KernelError::NoProcess.sysret();
     };
 
     // Linux ->install: CAP_SYS_ADMIN, and CAP_SYS_CHROOT for a mount
@@ -613,13 +605,13 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
     let chroot_ok =
         !matches!(ns_type, NamespaceType::Mnt) || crate::task::capable(crate::task::CAP_SYS_CHROOT);
     if !crate::task::capable(crate::task::CAP_SYS_ADMIN) || !chroot_ok {
-        return -EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // The target task's namespaces
     let target_ns = match crate::fs::proc::task_nsproxy(&target) {
         Some(ns) => ns,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     let current_ns = get_task_ns(tid).unwrap_or_else(|| INIT_NSPROXY.clone());
@@ -630,7 +622,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
         && crate::task::percpu::current_fs()
             .is_some_and(|fs| fs.users.load(core::sync::atomic::Ordering::SeqCst) != 1)
     {
-        return -EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Create new nsproxy with the target namespace for the specified type

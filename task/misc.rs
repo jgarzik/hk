@@ -1498,12 +1498,9 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
 pub fn sys_iopl(level: u32) -> i64 {
     use crate::task::{CAP_SYS_RAWIO, capable};
 
-    const EINVAL: i64 = 22;
-    const EPERM: i64 = 1;
-
     // Validate level (must be 0-3)
     if level > 3 {
-        return -EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get current IOPL level
@@ -1522,7 +1519,7 @@ pub fn sys_iopl(level: u32) -> i64 {
 
     // Raising privilege requires CAP_SYS_RAWIO
     if !capable(CAP_SYS_RAWIO) {
-        return -EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Set new level
@@ -1547,6 +1544,5 @@ pub fn sys_iopl(level: u32) -> i64 {
 /// This is not yet implemented. Use iopl(3) for full I/O port access.
 #[cfg(target_arch = "x86_64")]
 pub fn sys_ioperm(_from: u64, _num: u64, _turn_on: i32) -> i64 {
-    const ENOSYS: i64 = 38;
-    -ENOSYS
+    KernelError::NotImplemented.sysret()
 }

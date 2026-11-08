@@ -617,12 +617,10 @@ impl MmStruct {
     /// Called during page fault handling when an access occurs below a
     /// VM_GROWSDOWN VMA. The VMA's start address is extended downward.
     pub fn expand_downwards(&mut self, vma_idx: usize, address: u64) -> Result<(), i32> {
-        const EFAULT: i32 = 14; // Bad address
-
         let address = address & !0xFFF; // Page align down
 
         if vma_idx >= self.vmas.len() {
-            return Err(EFAULT);
+            return Err(KernelError::BadAddress.errno());
         }
 
         let vma = &mut self.vmas[vma_idx];
@@ -631,13 +629,13 @@ impl MmStruct {
         }
 
         if !vma.is_growsdown() {
-            return Err(EFAULT);
+            return Err(KernelError::BadAddress.errno());
         }
 
         // The stack may not grow past RLIMIT_STACK (Linux acct_stack_growth)
         let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
         if vma.end - address > limit {
-            return Err(EFAULT);
+            return Err(KernelError::BadAddress.errno());
         }
 
         let grow_pages = (vma.start - address) >> 12;

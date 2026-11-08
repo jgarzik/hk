@@ -116,6 +116,8 @@ pub enum KernelError {
     Overflow = 75,
     /// Bad message (EBADMSG)
     BadMessage = 74,
+    /// Accessing a corrupted shared library (ELIBBAD)
+    LibBad = 80,
 
     // =========================================================================
     // Network errno values (88-115)
@@ -260,6 +262,7 @@ impl KernelError {
             62 => Self::TimerExpired,
             75 => Self::Overflow,
             74 => Self::BadMessage,
+            80 => Self::LibBad,
             88 => Self::NotSocket,
             89 => Self::DestAddrRequired,
             90 => Self::MessageTooLong,

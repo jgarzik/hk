@@ -14,6 +14,7 @@ use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP};
 use crate::task::percpu::{self, TASKLIST};
 use crate::task::{CAP_SYS_PTRACE, Pid, TaskState, Tid, capable};
 use crate::uaccess::{copy_to_user, copy_val_from_user, copy_val_to_user};
+use crate::util::error::KernelError;
 
 // =============================================================================
 // Ptrace request codes (from Linux include/uapi/linux/ptrace.h)
@@ -158,16 +159,6 @@ pub const PTRACE_EVENT_SECCOMP: u32 = 7;
 pub const PTRACE_EVENT_STOP: u32 = 128;
 
 // =============================================================================
-// Error codes
-// =============================================================================
-
-const EPERM: i64 = 1;
-const ESRCH: i64 = 3;
-const EIO: i64 = 5;
-const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
-
-// =============================================================================
 // Helper functions
 // =============================================================================
 
@@ -195,25 +186,29 @@ fn attach_refused(target_tid: Tid) -> bool {
 fn ptrace_check_attach(target_tid: Tid) -> Result<Frozen, i64> {
     let task = {
         let mut table = TASKLIST.write();
-        let task = table.task(target_tid).ok_or(-ESRCH)?;
-        let mut target = table.get_mut(target_tid).ok_or(-ESRCH)?;
+        let task = table
+            .task(target_tid)
+            .ok_or(KernelError::NoProcess.sysret())?;
+        let mut target = table
+            .get_mut(target_tid)
+            .ok_or(KernelError::NoProcess.sysret())?;
 
         // Check if we are the tracer
         if !target.traced_by(&percpu::current()) {
-            return Err(-ESRCH);
+            return Err(KernelError::NoProcess.sysret());
         }
 
         // In a ptrace stop, and not killed (Linux ptrace_freeze_traced):
         // the stop then stays until the request ends
         if !matches!(target.state, TaskState::Traced(_)) || signal::task_fatal_pending(&task) {
-            return Err(-ESRCH);
+            return Err(KernelError::NoProcess.sysret());
         }
         target.ptrace_frozen = true;
         task
     };
     let frozen = Frozen(task);
     if !percpu::wait_task_inactive(&frozen.0) {
-        return Err(-ESRCH);
+        return Err(KernelError::NoProcess.sysret());
     }
     Ok(frozen)
 }
@@ -288,12 +283,12 @@ fn ptrace_traceme() -> i64 {
     let mut table = TASKLIST.write();
     let mut task = match table.get_mut(tid) {
         Some(t) => t,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Already being traced?
     if task.ptrace != 0 {
-        return -EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Set up tracing - parent becomes tracer
@@ -313,11 +308,11 @@ fn ptrace_traceme() -> i64 {
 fn ptrace_attach(target_pid: Pid) -> i64 {
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     if attach_refused(target_tid) {
-        return -EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Check permissions and attach under the target's cred_guard_mutex
@@ -327,19 +322,19 @@ fn ptrace_attach(target_pid: Pid) -> i64 {
         Err(e) => return e.sysret(),
     };
     if !ptrace_may_access(target_tid) {
-        return -EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     {
         let mut table = TASKLIST.write();
         let mut target = match table.get_mut(target_tid) {
             Some(t) => t,
-            None => return -ESRCH,
+            None => return KernelError::NoProcess.sysret(),
         };
 
         // Already being traced?
         if target.ptrace != 0 {
-            return -EPERM;
+            return KernelError::NotPermitted.sysret();
         }
 
         // Set up tracing
@@ -367,16 +362,16 @@ fn ptrace_attach(target_pid: Pid) -> i64 {
 fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
     // Validate options
     if options & !PTRACE_O_MASK != 0 {
-        return -EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     if attach_refused(target_tid) {
-        return -EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Check permissions and attach under the target's cred_guard_mutex
@@ -386,19 +381,19 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
         Err(e) => return e.sysret(),
     };
     if !ptrace_may_access(target_tid) {
-        return -EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     {
         let mut table = TASKLIST.write();
         let mut target = match table.get_mut(target_tid) {
             Some(t) => t,
-            None => return -ESRCH,
+            None => return KernelError::NoProcess.sysret(),
         };
 
         // Already being traced?
         if target.ptrace != 0 {
-            return -EPERM;
+            return KernelError::NotPermitted.sysret();
         }
 
         // Set up tracing with SEIZED flag
@@ -424,7 +419,7 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
 fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Verify we are the tracer
@@ -436,7 +431,7 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
     {
         let mut table = TASKLIST.write();
         if table.get(target_tid).is_none() {
-            return -ESRCH;
+            return KernelError::NoProcess.sysret();
         }
         ptrace_unlink(&mut table, target_tid);
     }
@@ -486,7 +481,7 @@ fn ptrace_wake(tid: Tid, sig: u32) {
 fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Verify we are the tracer and tracee is stopped
@@ -499,7 +494,7 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
         let mut table = TASKLIST.write();
         let mut target = match table.get_mut(target_tid) {
             Some(t) => t,
-            None => return -ESRCH,
+            None => return KernelError::NoProcess.sysret(),
         };
 
         // Update ptrace flags based on request
@@ -519,7 +514,7 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
                 target.ptrace &= !PT_SYSCALL_TRACE;
                 target.task.clear_tif(SYSCALL_TRACE);
             }
-            _ => return -EINVAL,
+            _ => return KernelError::InvalidArgument.sysret(),
         }
     }
 
@@ -542,7 +537,7 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
 fn ptrace_kill(target_pid: Pid) -> i64 {
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Verify we are the tracer
@@ -550,11 +545,11 @@ fn ptrace_kill(target_pid: Pid) -> i64 {
         let table = TASKLIST.read();
         let target = match table.get(target_tid) {
             Some(t) => t,
-            None => return -ESRCH,
+            None => return KernelError::NoProcess.sysret(),
         };
 
         if !target.traced_by(&percpu::current()) {
-            return -ESRCH;
+            return KernelError::NoProcess.sysret();
         }
     }
 
@@ -590,7 +585,7 @@ fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
 fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Verify we are the tracer
@@ -602,10 +597,10 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     // Get target's mm and page table
     let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
         Some(x) => x,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
     if !may_access_vm(&target_mm) {
-        return -EIO;
+        return KernelError::Io.sysret();
     }
 
     // Forced, as Linux ptrace_access_vm (FOLL_FORCE): any mapping reads
@@ -619,10 +614,10 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
                 u64::from_ne_bytes(buf),
             ) {
                 Ok(()) => 0,
-                Err(_) => -EFAULT,
+                Err(_) => KernelError::BadAddress.sysret(),
             }
         }
-        _ => -EIO,
+        _ => KernelError::Io.sysret(),
     }
 }
 
@@ -630,7 +625,7 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
 fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Verify we are the tracer
@@ -642,10 +637,10 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     // Get target's mm and page table
     let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
         Some(x) => x,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
     if !may_access_vm(&target_mm) {
-        return -EIO;
+        return KernelError::Io.sysret();
     }
 
     // Forced (FOLL_FORCE): a private read-only mapping, program text
@@ -653,7 +648,7 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     let buf = data.to_ne_bytes();
     match crate::mm::remote::access_remote_vm_write(&target_mm, addr, &buf, true) {
         Ok(8) => 0,
-        _ => -EIO,
+        _ => KernelError::Io.sysret(),
     }
 }
 
@@ -665,12 +660,12 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
 fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
     // Validate options
     if options & !PTRACE_O_MASK != 0 {
-        return -EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Verify we are the tracer
@@ -683,7 +678,7 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
         let mut table = TASKLIST.write();
         let mut target = match table.get_mut(target_tid) {
             Some(t) => t,
-            None => return -ESRCH,
+            None => return KernelError::NoProcess.sysret(),
         };
 
         target.ptrace_options = options;
@@ -701,7 +696,7 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
 /// (Linux ptrace_getsiginfo): EINVAL if the stop has none
 fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> i64 {
     let Some(tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) else {
-        return -ESRCH;
+        return KernelError::NoProcess.sysret();
     };
     let _frozen = match ptrace_check_attach(tid) {
         Ok(f) => f,
@@ -713,7 +708,7 @@ fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> i64 {
             Ok(()) => 0,
             Err(e) => e.sysret(),
         },
-        None => -EINVAL,
+        None => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -722,7 +717,7 @@ fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> i64 {
 /// tracer resumes it with that signal; EINVAL if the stop has none
 fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> i64 {
     let Some(tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) else {
-        return -ESRCH;
+        return KernelError::NoProcess.sysret();
     };
     let _frozen = match ptrace_check_attach(tid) {
         Ok(f) => f,
@@ -738,7 +733,7 @@ fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> i64 {
             t.last_siginfo = Some(info);
             0
         }
-        _ => -EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -748,7 +743,7 @@ fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> i64 {
 fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> i64 {
     const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
     let Some(tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) else {
-        return -ESRCH;
+        return KernelError::NoProcess.sysret();
     };
     let _frozen = match ptrace_check_attach(tid) {
         Ok(f) => f,
@@ -757,13 +752,13 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> i64 {
     // struct ptrace_peeksiginfo_args { u64 off; u32 flags; s32 nr; }
     let mut args = [0u8; 16];
     if crate::uaccess::copy_from_user::<crate::arch::Uaccess>(&mut args, addr, 16).is_err() {
-        return -EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     let off = u64::from_ne_bytes(args[..8].try_into().unwrap_or([0; 8]));
     let flags = u32::from_ne_bytes(args[8..12].try_into().unwrap_or([0; 4]));
     let nr = i32::from_ne_bytes(args[12..].try_into().unwrap_or([0; 4]));
     if flags & !PTRACE_PEEKSIGINFO_SHARED != 0 || nr < 0 {
-        return -EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     let shared = flags & PTRACE_PEEKSIGINFO_SHARED != 0;
     let mut copied = 0i64;
@@ -784,7 +779,11 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> i64 {
         };
         let to = data.wrapping_add(i * 128);
         if info.copy_to_user(to).is_err() {
-            return if copied > 0 { copied } else { -EFAULT };
+            return if copied > 0 {
+                copied
+            } else {
+                KernelError::BadAddress.sysret()
+            };
         }
         copied += 1;
         if crate::sync::waitqueue::signal_pending() {
@@ -797,7 +796,7 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> i64 {
 fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Verify we are the tracer
@@ -814,7 +813,7 @@ fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
     // Write message to user space
     let buf = message.to_ne_bytes();
     if copy_to_user::<crate::arch::Uaccess>(data, &buf).is_err() {
-        return -EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -828,7 +827,7 @@ fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
 fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Verify we are the tracer
@@ -841,7 +840,7 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
     match crate::arch::ptrace::get_user_regs(target_tid) {
         Ok(regs) => {
             if copy_val_to_user::<crate::arch::Uaccess, _>(data, &regs).is_err() {
-                return -EFAULT;
+                return KernelError::BadAddress.sysret();
             }
             0
         }
@@ -853,7 +852,7 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
 fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
     let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
-        None => return -ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Verify we are the tracer
@@ -864,7 +863,7 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
 
     let Ok(regs) = copy_val_from_user::<crate::arch::Uaccess, crate::arch::ptrace::UserRegs>(data)
     else {
-        return -EFAULT;
+        return KernelError::BadAddress.sysret();
     };
     match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
         Ok(()) => 0,
@@ -1115,7 +1114,9 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
 
         // Not yet implemented
         PTRACE_PEEKUSER | PTRACE_POKEUSER | PTRACE_GETFPREGS | PTRACE_SETFPREGS
-        | PTRACE_GETREGSET | PTRACE_SETREGSET | PTRACE_INTERRUPT | PTRACE_LISTEN => -EINVAL,
+        | PTRACE_GETREGSET | PTRACE_SETREGSET | PTRACE_INTERRUPT | PTRACE_LISTEN => {
+            KernelError::InvalidArgument.sysret()
+        }
 
         _ => ptrace_unknown(pid as Pid),
     }
@@ -1127,10 +1128,10 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
 /// number
 fn ptrace_unknown(pid: Pid) -> i64 {
     let Some(tid) = percpu::find_task_by_vpid(pid).map(|t| t.tid()) else {
-        return -ESRCH;
+        return KernelError::NoProcess.sysret();
     };
     match ptrace_check_attach(tid) {
-        Ok(_frozen) => -EIO,
+        Ok(_frozen) => KernelError::Io.sysret(),
         Err(e) => e,
     }
 }

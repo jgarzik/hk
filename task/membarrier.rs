@@ -69,9 +69,6 @@ const SUPPORTED_CMDS: i32 = MEMBARRIER_CMD_GLOBAL
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
     | MEMBARRIER_CMD_GET_REGISTRATIONS;
 
-const EINVAL: i64 = -22;
-const EPERM: i64 = -1;
-
 /// Serializes the commands that interrupt other CPUs (Linux
 /// membarrier_ipi_mutex): concurrent callers cannot multiply the IPIs.
 /// Held only while the IPIs are sent and waited for.
@@ -97,7 +94,7 @@ pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> i64 {
         _ => flags == 0,
     };
     if !flags_ok {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     match cmd {
         MEMBARRIER_CMD_QUERY => i64::from(SUPPORTED_CMDS),
@@ -122,7 +119,7 @@ pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> i64 {
             STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY,
         ),
         MEMBARRIER_CMD_GET_REGISTRATIONS => registrations(),
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -181,7 +178,7 @@ fn global() -> i64 {
 /// Linux membarrier_private_expedited (no FLAG_CPU: only RSEQ takes it)
 fn private_expedited(flags: u32) -> i64 {
     let Some(mm) = crate::task::percpu::current().mm() else {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     };
     let ready = if flags == FLAG_SYNC_CORE {
         STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY
@@ -189,7 +186,7 @@ fn private_expedited(flags: u32) -> i64 {
         STATE_PRIVATE_EXPEDITED_READY
     };
     if mm.membarrier_state().load(Ordering::Acquire) & ready == 0 {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
     // No other thread can run in it (Linux: mm_users == 1)
     if flags != FLAG_SYNC_CORE && mm.users() == 1 {
@@ -213,7 +210,7 @@ fn private_expedited(flags: u32) -> i64 {
 /// (Linux sync_runqueues_membarrier_state), then mark it ready
 fn register(set: u32, ready: u32) -> i64 {
     let Some(mm) = crate::task::percpu::current().mm() else {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     };
     let st = mm.membarrier_state();
     if st.load(Ordering::Acquire) & ready == ready {

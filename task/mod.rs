@@ -2668,22 +2668,23 @@ pub fn set_set_child_tid(tid: Tid, addr: u64) {
 /// for a removed one (css_tryget_online_from_dir)
 pub fn cgroup_from_fd(tid: Tid, fd: i32) -> Result<alloc::sync::Arc<crate::cgroup::Cgroup>, i32> {
     use crate::fs::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
-    const EBADF: i32 = 9;
-    const ENOENT: i32 = 2;
     let file = fdtable::get_task_fd(tid)
         .and_then(|t| t.lock().get(fd))
-        .ok_or(EBADF)?;
+        .ok_or(KernelError::BadFd.errno())?;
     let private = file
         .get_inode()
         .and_then(|i| i.get_private())
-        .ok_or(EBADF)?;
+        .ok_or(KernelError::BadFd.errno())?;
     let wrapper = private
         .as_any()
         .downcast_ref::<CgroupfsInodeWrapper>()
-        .ok_or(EBADF)?;
+        .ok_or(KernelError::BadFd.errno())?;
     let data = wrapper.0.read();
     let CgroupfsInodeData::Directory { cgroup } = &*data else {
-        return Err(EBADF);
+        return Err(KernelError::BadFd.errno());
     };
-    cgroup.upgrade().filter(|c| !c.is_dead()).ok_or(ENOENT)
+    cgroup
+        .upgrade()
+        .filter(|c| !c.is_dead())
+        .ok_or(KernelError::NotFound.errno())
 }

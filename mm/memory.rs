@@ -17,8 +17,7 @@ use super::{Mm, MmStruct, PAGE_SIZE, SwapEntry, Vma};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{Leaf, paging};
 use crate::mm::page::phys_to_page;
-
-const ENOMEM: i32 = 12;
+use crate::util::error::KernelError;
 
 /// Drop one mapping's reference to the 4KB user page `phys` (Linux
 /// zap_present_pte: rmap removal + put). The last reference frees it
@@ -269,7 +268,7 @@ impl PteWalk for CopyRange<'_> {
     type Err = i32;
 
     fn huge(&mut self, pmd: Pmd<'_>, _: u64, _: u64) -> Result<bool, i32> {
-        split_huge_pmd(self.src_mm, pmd).ok_or(ENOMEM)?;
+        split_huge_pmd(self.src_mm, pmd).ok_or(KernelError::OutOfMemory.errno())?;
         Ok(false)
     }
 
@@ -285,14 +284,18 @@ impl PteWalk for CopyRange<'_> {
         self.dst
             .pte_alloc(self.dst_mm, addr)
             .map(|_| ())
-            .ok_or(ENOMEM)
+            .ok_or(KernelError::OutOfMemory.errno())
     }
 
     fn ptes(&mut self, r: &PteRange<'_>) -> Result<(), i32> {
         if r.iter().all(|(_, e)| e.load(Ordering::Acquire) == 0) {
             return Ok(());
         }
-        let d = self.dst.pte(r.start).ok_or(ENOMEM)?.lock();
+        let d = self
+            .dst
+            .pte(r.start)
+            .ok_or(KernelError::OutOfMemory.errno())?
+            .lock();
         for (a, se) in r.iter() {
             self.wp |= copy_pte(d.entry(a), se, self.cow)?;
         }
@@ -314,7 +317,7 @@ fn copy_pte(dp: &AtomicU64, sp: &AtomicU64, cow: bool) -> Result<bool, i32> {
             // copy_nonpresent_pte: swap_duplicate); a full count is
             // ENOMEM (Linux would chain a count continuation)
             if !super::swap::swap_duplicate(SwapEntry::from_pte(pte)) {
-                return Err(ENOMEM);
+                return Err(KernelError::OutOfMemory.errno());
             }
             dp.store(pte, Ordering::Release);
         }

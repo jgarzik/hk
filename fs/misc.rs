@@ -18,13 +18,6 @@ use super::syscall::{PATH_MAX, current_fd_table};
 // mount, umount2 syscalls
 // ============================================================================
 
-/// Block device required
-pub const ENOTBLK: i64 = -15;
-/// Resource busy
-pub const EBUSY: i64 = -16;
-/// No such device or filesystem type
-pub const ENODEV: i64 = -19;
-
 /// mount(2) flags (Linux uapi/linux/mount.h)
 mod ms {
     pub const RDONLY: u64 = 1;

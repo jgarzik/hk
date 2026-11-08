@@ -16,6 +16,7 @@ use super::percpu;
 use crate::fs::{File, kernel_open_exec};
 use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
 use crate::util::elf::ElfExecutable;
+use crate::util::error::KernelError;
 
 pub use super::argstr::ArgStrings;
 
@@ -40,28 +41,14 @@ const STK_LIM: u64 = 8 << 20;
 /// setup_arg_pages: stack_expand)
 const STACK_EXPAND_PAGES: usize = 32;
 
-/// Error codes for execve
-pub const ENOENT: i32 = 2; // No such file or directory
-pub const EACCES: i32 = 13; // Permission denied
-pub const ENOEXEC: i32 = 8; // Exec format error
-pub const ENOMEM: i32 = 12; // Out of memory
-pub const EIO: i32 = 5; // I/O error
-pub const EFAULT: i32 = 14; // Bad address
-pub const E2BIG: i32 = 7; // Argument list too long
-pub const EAGAIN: i32 = 11; // Try again
-pub const EINVAL: i32 = 22; // Invalid argument
-pub const EEXIST: i32 = 17; // File exists
-pub const ELOOP: i32 = 40; // Too many levels of symbolic links
-pub const ELIBBAD: i32 = 80; // Accessing a corrupted shared library
-
 /// The user pointer `i` of a NULL-terminated array (Linux
 /// get_user_arg_ptr): EFAULT
 fn arg_ptr(argv: u64, i: usize) -> Result<u64, i32> {
     crate::uaccess::UserPtr::<u64>::new(argv)
         .offset(i)
-        .ok_or(EFAULT)?
+        .ok_or(KernelError::BadAddress.errno())?
         .read()
-        .map_err(|_| EFAULT)
+        .map_err(|_| KernelError::BadAddress.errno())
 }
 
 /// The strings in a NULL-terminated user array (Linux count): EFAULT,
@@ -73,11 +60,11 @@ fn count(argv: u64) -> Result<usize, i32> {
     let mut i = 0;
     while arg_ptr(argv, i)? != 0 {
         if i >= MAX_ARG_STRINGS {
-            return Err(E2BIG);
+            return Err(KernelError::ArgListTooLong.errno());
         }
         i += 1;
         if crate::signal::fatal_signal_pending() {
-            return Err(crate::util::error::KernelError::RestartNoHand.errno());
+            return Err(KernelError::RestartNoHand.errno());
         }
         percpu::cond_resched();
     }
@@ -96,8 +83,11 @@ fn arg_limit(argc: usize, envc: usize) -> Result<usize, i32> {
         .max(1)
         .checked_add(envc)
         .and_then(|n| n.checked_mul(8))
-        .ok_or(E2BIG)?;
-    limit.checked_sub(ptrs).filter(|&l| l > 0).ok_or(E2BIG)
+        .ok_or(KernelError::ArgListTooLong.errno())?;
+    limit
+        .checked_sub(ptrs)
+        .filter(|&l| l > 0)
+        .ok_or(KernelError::ArgListTooLong.errno())
 }
 
 /// Copy the `n` strings of user array `argv`, packed, each charged
@@ -108,12 +98,12 @@ fn copy_strings(argv: u64, n: usize, budget: &mut usize) -> Result<ArgStrings, i
     for i in 0..n {
         let p = arg_ptr(argv, i)?;
         if p == 0 {
-            return Err(EFAULT);
+            return Err(KernelError::BadAddress.errno());
         }
         out.push_user::<crate::arch::Uaccess>(p, MAX_ARG_STRLEN, budget)
             .map_err(|e| e.errno())?;
         if crate::signal::fatal_signal_pending() {
-            return Err(crate::util::error::KernelError::RestartNoHand.errno());
+            return Err(KernelError::RestartNoHand.errno());
         }
     }
     Ok(out)
@@ -127,7 +117,9 @@ fn copy_args(filename: &[u8], argv: u64, envp: u64) -> Result<(ArgStrings, ArgSt
     let argc = count(argv)?;
     let envc = count(envp)?;
     let mut budget = arg_limit(argc, envc)?;
-    budget = budget.checked_sub(filename.len() + 1).ok_or(E2BIG)?;
+    budget = budget
+        .checked_sub(filename.len() + 1)
+        .ok_or(KernelError::ArgListTooLong.errno())?;
     let envp = copy_strings(envp, envc, &mut budget)?;
     let argv = copy_strings(argv, argc, &mut budget)?;
     Ok((argv, envp))
@@ -161,7 +153,10 @@ impl StackWriter<'_> {
         while done < data.len() {
             let at = va + done as u64;
             let n = ((PAGE_SIZE - at % PAGE_SIZE) as usize).min(data.len() - done);
-            let phys = self.pt.translate(at).ok_or(EFAULT)?;
+            let phys = self
+                .pt
+                .translate(at)
+                .ok_or(KernelError::BadAddress.errno())?;
             // SAFETY: `phys` is a stack frame of the new address space,
             // mapped above, and `n` bytes stay within its page
             unsafe {
@@ -343,7 +338,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
             .is_err()
         {
             crate::FRAME_ALLOCATOR.free(frame);
-            return Err(ENOMEM);
+            return Err(KernelError::OutOfMemory.errno());
         }
     }
 
@@ -443,7 +438,7 @@ fn map_sigpage<FA: FrameAlloc<PhysAddr = u64>>(
     let Some(code) = crate::arch::signal::SIGPAGE else {
         return Ok(None);
     };
-    let va = free_page(vmas).ok_or(ENOMEM)?;
+    let va = free_page(vmas).ok_or(KernelError::OutOfMemory.errno())?;
     let frame = user_frame()?;
     let page = crate::arch::phys_to_virt(frame);
     // SAFETY: a fresh frame of PAGE_SIZE bytes, ours alone, through the
@@ -461,7 +456,7 @@ fn map_sigpage<FA: FrameAlloc<PhysAddr = u64>>(
         .is_err()
     {
         crate::FRAME_ALLOCATOR.free(frame);
-        return Err(ENOMEM);
+        return Err(KernelError::OutOfMemory.errno());
     }
     let mut vma = anon_vma(va, va + PAGE_SIZE, PROT_READ | PROT_EXEC);
     vma.flags |= VM_SIGPAGE;
@@ -476,15 +471,20 @@ fn map_sigpage<FA: FrameAlloc<PhysAddr = u64>>(
 /// of no return; hk refuses it before)
 fn check_segments(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Result<(), i32> {
     for seg in &elf.segments {
-        let va = seg.vaddr.checked_add(base).ok_or(EINVAL)?;
-        let end = va.checked_add(seg.mem_size as u64).ok_or(EINVAL)?;
+        let va = seg
+            .vaddr
+            .checked_add(base)
+            .ok_or(KernelError::InvalidArgument.errno())?;
+        let end = va
+            .checked_add(seg.mem_size as u64)
+            .ok_or(KernelError::InvalidArgument.errno())?;
         if end > crate::mm::TASK_SIZE {
-            return Err(EINVAL);
+            return Err(KernelError::InvalidArgument.errno());
         }
         let start = va & !(PAGE_SIZE - 1);
         crate::mm::check_fixed(start, end - start).map_err(|e| e.errno())?;
         if seg.mem_size > 0 && end > stack_bottom {
-            return Err(EEXIST);
+            return Err(KernelError::AlreadyExists.errno());
         }
     }
     if elf
@@ -492,7 +492,7 @@ fn check_segments(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Result<(
         .checked_add(base)
         .is_none_or(|e| e >= crate::mm::TASK_SIZE)
     {
-        return Err(EINVAL);
+        return Err(KernelError::InvalidArgument.errno());
     }
     // Segments are populated at exec: an image larger than free memory
     // is ENOMEM up front, not after exhausting it
@@ -502,7 +502,7 @@ fn check_segments(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Result<(
         .map(|s| (s.mem_size as u64).div_ceil(PAGE_SIZE) + 1)
         .sum();
     if pages > crate::FRAME_ALLOCATOR.free_frames() as u64 {
-        return Err(ENOMEM);
+        return Err(KernelError::OutOfMemory.errno());
     }
     Ok(())
 }
@@ -682,14 +682,14 @@ fn image_span(elf: &ElfExecutable) -> Option<(u64, u64)> {
 /// link address, EINVAL if that overlaps the program or the stack area
 /// (Linux would map it over them).
 fn interp_base(interp: &ElfExecutable, prog: &ElfExecutable, prog_base: u64) -> Result<u64, i32> {
-    let (lo, hi) = image_span(interp).ok_or(ENOEXEC)?;
-    let (plo, phi) = image_span(prog).ok_or(ENOEXEC)?;
+    let (lo, hi) = image_span(interp).ok_or(KernelError::ExecFormat.errno())?;
+    let (plo, phi) = image_span(prog).ok_or(KernelError::ExecFormat.errno())?;
     let (plo, phi) = (plo + prog_base, phi + prog_base);
     let top = crate::mm::mmap_base();
     let overlaps = |a: u64, b: u64| a < phi && plo < b;
     if !interp.is_pie {
         if overlaps(lo, hi) || hi > top {
-            return Err(EINVAL);
+            return Err(KernelError::InvalidArgument.errno());
         }
         return Ok(0);
     }
@@ -698,13 +698,13 @@ fn interp_base(interp: &ElfExecutable, prog: &ElfExecutable, prog_base: u64) -> 
     // keeps its offset modulo p_align), with the image ending at or
     // below `limit`
     let below = |limit: u64| limit.checked_sub(hi).map(|b| b & !(align - 1));
-    let mut bias = below(top).ok_or(ENOMEM)?;
+    let mut bias = below(top).ok_or(KernelError::OutOfMemory.errno())?;
     if overlaps(lo + bias, hi + bias) {
-        bias = below(plo).ok_or(ENOMEM)?;
+        bias = below(plo).ok_or(KernelError::OutOfMemory.errno())?;
     }
     // Keep clear of the lowest pages (mmap_min_addr)
     if lo + bias < PAGE_SIZE * 16 {
-        return Err(ENOMEM);
+        return Err(KernelError::OutOfMemory.errno());
     }
     Ok(bias)
 }
@@ -749,7 +749,7 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
                     .is_err()
                 {
                     crate::FRAME_ALLOCATOR.free(frame);
-                    return Err(ENOMEM);
+                    return Err(KernelError::OutOfMemory.errno());
                 }
             }
             va += PAGE_SIZE;
@@ -844,17 +844,17 @@ fn resolve_scripts(
         let head = {
             let image = FileImage::new(&file)?;
             let n = (image.size as usize).min(BINPRM_BUF_SIZE);
-            crate::util::elf::ElfSource::read_at(&image, 0, n).ok_or(EIO)?
+            crate::util::elf::ElfSource::read_at(&image, 0, n).ok_or(KernelError::Io.errno())?
         };
         let (interp, arg) = match parse(&head) {
             None => break,
             Some(r) => r?,
         };
         if depth >= MAX_DEPTH {
-            return Err(ELOOP);
+            return Err(KernelError::TooManySymlinks.errno());
         }
         if path_inaccessible {
-            return Err(ENOENT);
+            return Err(KernelError::NotFound.errno());
         }
         argv = rewrite_argv(&argv, interp, arg, &name).map_err(|e| e.errno())?;
         name = interp.to_vec();
@@ -871,9 +871,12 @@ struct FileImage<'a> {
 
 impl FileImage<'_> {
     fn new(file: &File) -> Result<FileImage<'_>, i32> {
-        let size = file.get_inode().ok_or(ENOENT)?.get_size();
+        let size = file
+            .get_inode()
+            .ok_or(KernelError::NotFound.errno())?
+            .get_size();
         if size == 0 {
-            return Err(ENOEXEC); // Empty file can't be executable
+            return Err(KernelError::ExecFormat.errno()); // Empty file can't be executable
         }
         Ok(FileImage { file, size })
     }
@@ -886,7 +889,7 @@ impl FileImage<'_> {
             let n = self
                 .file
                 .pread(&mut buf[done..], off + done as u64)
-                .map_err(|_| EIO)?;
+                .map_err(|_| KernelError::Io.errno())?;
             if n == 0 {
                 break;
             }
@@ -906,7 +909,7 @@ impl crate::util::elf::ElfSource for FileImage<'_> {
 /// A frame for the new image's user memory: stops at the kernel's
 /// reserve like any user page (`mm::fault::alloc_user`), ENOMEM then
 fn user_frame() -> Result<u64, i32> {
-    crate::mm::fault::alloc_user().ok_or(ENOMEM)
+    crate::mm::fault::alloc_user().ok_or(KernelError::OutOfMemory.errno())
 }
 
 /// The new image runs with privileges its caller lacks (Linux
@@ -971,7 +974,7 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
     };
     if percpu::exec_waits(tgid, tid) {
         if !sig.start_exec(tid) {
-            return Err(EAGAIN);
+            return Err(KernelError::WouldBlock.errno());
         }
         crate::signal::zap_group_others(tgid, tid);
         let wq = &crate::task::proc::CHILD_EXIT_WQ;
@@ -982,7 +985,7 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
                 break Ok(());
             }
             if crate::signal::fatal_signal_pending() {
-                break Err(EAGAIN);
+                break Err(KernelError::WouldBlock.errno());
             }
             schedule();
         };
@@ -1111,11 +1114,11 @@ where
     };
     let interp_image = match interp_file.as_deref().map(FileImage::new).transpose() {
         Ok(i) => i,
-        Err(_) => return -ELIBBAD,
+        Err(_) => return KernelError::LibBad.to_errno_neg(),
     };
     let interp = match interp_image.as_ref().map(ElfExecutable::parse).transpose() {
         Ok(i) => i,
-        Err(_) => return -ELIBBAD,
+        Err(_) => return KernelError::LibBad.to_errno_neg(),
     };
 
     // PIE images load at ELF_ET_DYN_BASE (aligned to their segments),
@@ -1150,7 +1153,7 @@ where
     // Create new page table for the process
     let mut new_page_table = match ArchPageTable::new_user(frame_alloc) {
         Some(pt) => pt,
-        None => return -ENOMEM,
+        None => return KernelError::OutOfMemory.to_errno_neg(),
     };
 
     // Link the kernel half (x86; arm64 keeps the kernel in TTBR1)
@@ -1382,7 +1385,7 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
     use crate::mm::frame_alloc::FrameAllocRef;
 
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
-        return -i64::from(EINVAL);
+        return KernelError::InvalidArgument.sysret();
     }
     let path = match crate::fs::namei::getname(pathname, flags & AT_EMPTY_PATH != 0) {
         Ok(p) => p,
