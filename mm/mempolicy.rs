@@ -5,8 +5,8 @@
 
 use crate::arch::Uaccess;
 use crate::mm::numa::NUMA_TOPOLOGY;
-use crate::uaccess::{UaccessArch, copy_to_user, get_user, put_user};
-use crate::util::error::KernelError;
+use crate::uaccess::{UaccessArch, UserPtr, copy_to_user};
+use crate::util::error::{KernelError, KernelResult};
 
 // ============================================================================
 // Policy modes (MPOL_*)
@@ -132,16 +132,16 @@ impl TaskMempolicy {
 /// # Returns
 /// 0 on success, negative errno on error
 pub fn sys_get_mempolicy(
-    policy_ptr: u64,
-    nmask_ptr: u64,
+    policy_ptr: UserPtr<i32>,
+    nmask_ptr: UserPtr<u64>,
     maxnode: u64,
     _addr: u64,
     flags: u64,
-) -> i64 {
+) -> KernelResult<()> {
     // Validate flags
     let valid_flags = MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED;
     if flags & !valid_flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // MPOL_F_NODE and MPOL_F_ADDR are mutually exclusive when no policy is set
@@ -150,11 +150,7 @@ pub fn sys_get_mempolicy(
     }
 
     // Return policy if requested
-    if policy_ptr != 0 {
-        if !Uaccess::access_ok(policy_ptr, core::mem::size_of::<i32>()) {
-            return KernelError::BadAddress.sysret();
-        }
-
+    if !policy_ptr.is_null() {
         // Default policy is MPOL_LOCAL (allocate on local node)
         let policy = if flags & MPOL_F_MEMS_ALLOWED != 0 {
             // Special case: return 0 for MEMS_ALLOWED query
@@ -163,23 +159,17 @@ pub fn sys_get_mempolicy(
             MPOL_LOCAL
         };
 
-        if put_user::<Uaccess, i32>(policy_ptr, policy).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        policy_ptr.write(&policy)?;
     }
 
     // Return node mask if requested
-    if nmask_ptr != 0 && maxnode > 0 {
+    if !nmask_ptr.is_null() && maxnode > 0 {
         // The copy is sized by the user: bound it (no huge allocation)
         if maxnode > MAX_MASK_BITS + 1 {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
         // Calculate mask size in bytes (rounded up to unsigned long boundary)
         let mask_bytes = maxnode.div_ceil(64) * 8;
-
-        if !Uaccess::access_ok(nmask_ptr, mask_bytes as usize) {
-            return KernelError::BadAddress.sysret();
-        }
 
         // Get the online node mask from real topology
         let online_mask = NUMA_TOPOLOGY.lock().online_mask();
@@ -189,12 +179,10 @@ pub fn sys_get_mempolicy(
         let mut words = alloc::vec![0u64; (mask_bytes / 8) as usize];
         words[0] = online_mask;
         let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        if copy_to_user::<Uaccess>(nmask_ptr, &bytes).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        copy_to_user::<Uaccess>(nmask_ptr.addr(), &bytes)?;
     }
 
-    0
+    Ok(())
 }
 
 /// sys_set_mempolicy - Set memory policy for process
@@ -209,67 +197,58 @@ pub fn sys_get_mempolicy(
 ///
 /// Validates nodemask against real online NUMA nodes; the policy is
 /// not stored yet (BUGS.md).
-pub fn sys_set_mempolicy(mode: i32, nmask_ptr: u64, maxnode: u64) -> i64 {
+pub fn sys_set_mempolicy(mode: i32, nmask_ptr: UserPtr<u64>, maxnode: u64) -> KernelResult<()> {
     // Extract mode and flags
     let policy_mode = mode & 0x7fff; // Lower 15 bits are mode
     let mode_flags = (mode as u64) & MPOL_MODE_FLAGS;
 
     // Validate policy mode
     if !(0..MPOL_MAX).contains(&policy_mode) {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // MPOL_DEFAULT doesn't use nodemask
     if policy_mode == MPOL_DEFAULT {
-        return 0;
+        return Ok(());
     }
 
     // MPOL_LOCAL doesn't use nodemask
     if policy_mode == MPOL_LOCAL {
-        return 0;
+        return Ok(());
     }
 
     // Other policies require a node mask
-    if nmask_ptr == 0 || maxnode == 0 {
-        return KernelError::InvalidArgument.sysret();
+    if nmask_ptr.is_null() || maxnode == 0 {
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Read node mask from user space
-    let mask_bytes = maxnode.min(64).div_ceil(64) * 8;
-    if !Uaccess::access_ok(nmask_ptr, mask_bytes as usize) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    let nodemask: u64 = match get_user::<Uaccess, u64>(nmask_ptr) {
-        Ok(m) => m,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
+    let nodemask = nmask_ptr.read()?;
 
     // Empty mask is invalid for most policies
     if nodemask == 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate that all specified nodes are online
     let online_mask = NUMA_TOPOLOGY.lock().online_mask();
     if nodemask & !online_mask != 0 {
         // Requested nodes that don't exist
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate mode flags combinations
     if mode_flags & MPOL_F_STATIC_NODES != 0 && mode_flags & MPOL_F_RELATIVE_NODES != 0 {
         // Mutually exclusive flags
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // For MPOL_PREFERRED, only one node should be set
     if policy_mode == MPOL_PREFERRED && nodemask.count_ones() > 1 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Valid, but not stored and not used by the allocator (BUGS.md)
-    0
+    Ok(())
 }
 
 /// sys_mbind - Set memory policy for a memory range
@@ -287,22 +266,29 @@ pub fn sys_set_mempolicy(mode: i32, nmask_ptr: u64, maxnode: u64) -> i64 {
 ///
 /// Validates nodemask against real online NUMA nodes; the policy is
 /// not stored yet (BUGS.md).
-pub fn sys_mbind(start: u64, len: u64, mode: u64, nmask_ptr: u64, maxnode: u64, flags: u32) -> i64 {
+pub fn sys_mbind(
+    start: u64,
+    len: u64,
+    mode: u64,
+    nmask_ptr: UserPtr<u64>,
+    maxnode: u64,
+    flags: u32,
+) -> KernelResult<()> {
     use super::PAGE_SIZE;
 
     // Validate flags
     if flags & !MPOL_MF_VALID != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate address alignment
     if start & (PAGE_SIZE - 1) != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Zero length is a no-op
     if len == 0 {
-        return 0;
+        return Ok(());
     }
 
     // Extract policy mode (lower bits)
@@ -310,46 +296,36 @@ pub fn sys_mbind(start: u64, len: u64, mode: u64, nmask_ptr: u64, maxnode: u64, 
 
     // Validate policy mode
     if !(0..MPOL_MAX).contains(&policy_mode) {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // MPOL_DEFAULT doesn't use nodemask
     if policy_mode != MPOL_DEFAULT && policy_mode != MPOL_LOCAL {
-        if nmask_ptr == 0 || maxnode == 0 {
-            return KernelError::InvalidArgument.sysret();
+        if nmask_ptr.is_null() || maxnode == 0 {
+            return Err(KernelError::InvalidArgument);
         }
 
-        // Validate node mask access
-        let mask_bytes = maxnode.min(64).div_ceil(64) * 8;
-        if !Uaccess::access_ok(nmask_ptr, mask_bytes as usize) {
-            return KernelError::BadAddress.sysret();
-        }
-
-        // Read node mask
-        let nodemask: u64 = match get_user::<Uaccess, u64>(nmask_ptr) {
-            Ok(m) => m,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        };
+        let nodemask = nmask_ptr.read()?;
 
         // Empty mask is invalid
         if nodemask == 0 {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
 
         // Validate that all specified nodes are online
         let online_mask = NUMA_TOPOLOGY.lock().online_mask();
         if nodemask & !online_mask != 0 {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
     }
 
     // MPOL_MF_MOVE_ALL requires CAP_SYS_NICE
     if flags & MPOL_MF_MOVE_ALL != 0 && !crate::task::capable(crate::task::CAP_SYS_NICE) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Valid, but not stored and nothing is migrated (BUGS.md)
-    0
+    Ok(())
 }
 
 /// The process migrate_pages and move_pages act on (Linux
@@ -392,54 +368,52 @@ fn mm_target(pid: i64) -> Result<(), KernelError> {
 /// target ([`mm_target`]: ESRCH, EPERM), then new nodes outside the
 /// online ones (cpuset_mems_allowed) need CAP_SYS_NICE (EPERM), and
 /// none online is EINVAL
-pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_ptr: u64) -> i64 {
+pub fn sys_migrate_pages(
+    pid: i64,
+    maxnode: u64,
+    old_nodes: UserPtr<u64>,
+    new_nodes: UserPtr<u64>,
+) -> KernelResult<u64> {
     // get_nodes: maxnode 0 leaves no bit count (EINVAL)
     if maxnode == 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     if maxnode > MAX_MASK_BITS + 1 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     let mask_bytes = maxnode.div_ceil(64) * 8;
     let online_mask = NUMA_TOPOLOGY.lock().online_mask();
 
     // Validate and read old_nodes if provided
-    if old_nodes_ptr != 0 {
-        if !Uaccess::access_ok(old_nodes_ptr, mask_bytes as usize) {
-            return KernelError::BadAddress.sysret();
+    if !old_nodes.is_null() {
+        if !Uaccess::access_ok(old_nodes.addr(), mask_bytes as usize) {
+            return Err(KernelError::BadAddress);
         }
-        if get_user::<Uaccess, u64>(old_nodes_ptr).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        old_nodes.read()?;
     }
 
     // Validate and read new_nodes if provided; NULL is an empty mask
     let mut new_mask: u64 = 0;
-    if new_nodes_ptr != 0 {
-        if !Uaccess::access_ok(new_nodes_ptr, mask_bytes as usize) {
-            return KernelError::BadAddress.sysret();
+    if !new_nodes.is_null() {
+        if !Uaccess::access_ok(new_nodes.addr(), mask_bytes as usize) {
+            return Err(KernelError::BadAddress);
         }
-        new_mask = match get_user::<Uaccess, u64>(new_nodes_ptr) {
-            Ok(m) => m,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        };
+        new_mask = new_nodes.read()?;
     }
 
-    if let Err(e) = mm_target(pid) {
-        return e.sysret();
-    }
+    mm_target(pid)?;
     // Nodes the target may not use (no cpusets: the online ones)
     if new_mask & !online_mask != 0 && !crate::task::capable(crate::task::CAP_SYS_NICE) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     // No allowed target node: EINVAL (Linux kernel_migrate_pages)
     if new_mask & online_mask == 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Nothing is migrated yet (BUGS.md): no page failed
-    0
+    Ok(0)
 }
 
 /// sys_move_pages - Move individual pages to specific NUMA nodes
@@ -465,31 +439,29 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
 pub fn sys_move_pages(
     pid: i64,
     nr_pages: u64,
-    pages_ptr: u64,
-    nodes_ptr: u64,
-    status_ptr: u64,
+    pages: UserPtr<u64>,
+    nodes: UserPtr<i32>,
+    status: UserPtr<i32>,
     flags: i32,
-) -> i64 {
+) -> KernelResult<()> {
     // Validate flags
     let valid_flags = MPOL_MF_MOVE | MPOL_MF_MOVE_ALL;
     if (flags as u32) & !valid_flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Permission check for MPOL_MF_MOVE_ALL
     if (flags as u32) & MPOL_MF_MOVE_ALL != 0 && !crate::task::capable(crate::task::CAP_SYS_NICE) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // The target before anything else (Linux kernel_move_pages ->
     // find_mm_struct)
-    if let Err(e) = mm_target(pid) {
-        return e.sysret();
-    }
+    mm_target(pid)?;
 
     // Zero pages is a no-op
     if nr_pages == 0 {
-        return 0;
+        return Ok(());
     }
 
     // Validate the user arrays; sizes are user-controlled, so an
@@ -499,11 +471,11 @@ pub fn sys_move_pages(
             .checked_mul(elem)
             .is_some_and(|size| ptr != 0 && Uaccess::access_ok(ptr, size as usize))
     };
-    if !array_ok(pages_ptr, 8) || !array_ok(status_ptr, 4) {
-        return KernelError::BadAddress.sysret();
+    if !array_ok(pages.addr(), 8) || !array_ok(status.addr(), 4) {
+        return Err(KernelError::BadAddress);
     }
-    if nodes_ptr != 0 && !array_ok(nodes_ptr, 4) {
-        return KernelError::BadAddress.sysret();
+    if !nodes.is_null() && !array_ok(nodes.addr(), 4) {
+        return Err(KernelError::BadAddress);
     }
 
     // Get online nodes mask
@@ -511,39 +483,39 @@ pub fn sys_move_pages(
 
     // Any invalid or offline target node fails the whole call with ENODEV
     // (Linux mm/migrate.c do_pages_move)
-    if nodes_ptr != 0 {
+    if !nodes.is_null() {
         for i in 0..nr_pages {
-            if let Err(e) = move_pages_resched(i) {
-                return e;
-            }
-            // In range: access_ok checked nodes_ptr + nr_pages * 4
-            let Ok(node) = get_user::<Uaccess, i32>(nodes_ptr + i * 4) else {
-                return KernelError::BadAddress.sysret();
-            };
+            move_pages_resched(i)?;
+            // In range: access_ok checked nodes + nr_pages * 4
+            let node = nth(nodes, i)?.read()?;
             if !(0..64).contains(&node) || online_mask & (1u64 << node) == 0 {
-                return KernelError::NoDevice.sysret();
+                return Err(KernelError::NoDevice);
             }
         }
     }
 
     // Write status for each page
     for i in 0..nr_pages {
-        if let Err(e) = move_pages_resched(i) {
-            return e;
-        }
-        let status: i32 = if nodes_ptr == 0 {
+        move_pages_resched(i)?;
+        let st: i32 = if nodes.is_null() {
             // Query mode: node 0, not the page's node (BUGS.md)
             0
         } else {
             // Move mode: nodes validated above, nothing moved (BUGS.md)
             0
         };
-        if put_user::<Uaccess, i32>(status_ptr + i * 4, status).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        nth(status, i)?.write(&st)?;
     }
 
-    0
+    Ok(())
+}
+
+/// Element `i` of a user array
+fn nth<T>(p: UserPtr<T>, i: u64) -> KernelResult<UserPtr<T>> {
+    usize::try_from(i)
+        .ok()
+        .and_then(|i| p.offset(i))
+        .ok_or(KernelError::BadAddress)
 }
 
 /// Entries handled between scheduling points in move_pages (Linux works
@@ -554,11 +526,11 @@ const MOVE_PAGES_CHUNK: u64 = 1024;
 /// not preemptive, so a huge user-supplied count would otherwise
 /// monopolize the CPU) and a stop for a pending signal (restartable: the
 /// work done so far is idempotent)
-fn move_pages_resched(i: u64) -> Result<(), i64> {
+fn move_pages_resched(i: u64) -> KernelResult<()> {
     if i > 0 && i.is_multiple_of(MOVE_PAGES_CHUNK) {
         crate::task::percpu::cond_resched();
         if crate::sync::waitqueue::signal_pending() {
-            return Err(KernelError::RestartSys.sysret());
+            return Err(KernelError::RestartSys);
         }
     }
     Ok(())

@@ -32,7 +32,8 @@ use crate::mm::page::frame_bytes;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
 use crate::task::{CAP_SYS_ADMIN, capable};
-use crate::util::error::KernelError;
+use crate::uaccess::UserPtr;
+use crate::util::error::{KernelError, KernelResult};
 
 /// 512-byte sectors per page
 const SECTORS_PER_PAGE: u64 = (PAGE_SIZE / 512) as u64;
@@ -400,8 +401,8 @@ pub fn free_swap_and_cache(e: SwapEntry) {
 // ============================================================================
 
 /// Read slot `entry` into the frame at `frame_phys` (may sleep)
-pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
-    let si = info_of(entry).ok_or(KernelError::InvalidArgument.sysret())?;
+pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
+    let si = info_of(entry).ok_or(KernelError::InvalidArgument)?;
     let off = entry.offset();
     if let Some(ref inode) = si.inode {
         inode
@@ -409,16 +410,16 @@ pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
             .aops()
             // SAFETY: the locked swap-cache page being filled
             .swap_rw(inode, off, unsafe { frame_bytes(frame_phys) }, false)
-            .map_err(|_| KernelError::Io.sysret())
+            .map_err(|_| KernelError::Io)
     } else if let Some(ref bdev) = si.bdev {
-        bdev_rw_frame(bdev, BioOp::Read, off * SECTORS_PER_PAGE, frame_phys).map_err(|e| e.sysret())
+        bdev_rw_frame(bdev, BioOp::Read, off * SECTORS_PER_PAGE, frame_phys)
     } else {
-        Err(KernelError::InvalidArgument.sysret())
+        Err(KernelError::InvalidArgument)
     }
 }
 
 /// Write the frame at `frame_phys` to slot `entry` (may sleep)
-pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
+pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
     // Allocations on the way to the device (bio, buffers, the file's
     // own) must not reclaim through swap I/O again (Linux: swap_writepage
     // under memalloc_noio / PF_MEMALLOC)
@@ -428,27 +429,26 @@ pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
 }
 
 /// `swap_write_page` with PF_MEMALLOC_NOIO set
-fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
-    let si = info_of(entry).ok_or(KernelError::InvalidArgument.sysret())?;
+fn write_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
+    let si = info_of(entry).ok_or(KernelError::InvalidArgument)?;
     let off = entry.offset();
     if let Some(ref inode) = si.inode {
         // Not from direct reclaim (PF_MEMALLOC): the file's writepage may
         // need filesystem locks the allocating task holds. A page already
         // in the swap cache of a swap file stays dirty and in memory.
         if crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC) {
-            return Err(KernelError::WouldBlock.sysret());
+            return Err(KernelError::WouldBlock);
         }
         inode
             .i_data
             .aops()
             // SAFETY: the locked swap-cache page being written
             .swap_rw(inode, off, unsafe { frame_bytes(frame_phys) }, true)
-            .map_err(|_| KernelError::Io.sysret())
+            .map_err(|_| KernelError::Io)
     } else if let Some(ref bdev) = si.bdev {
         bdev_rw_frame(bdev, BioOp::Write, off * SECTORS_PER_PAGE, frame_phys)
-            .map_err(|e| e.sysret())
     } else {
-        Err(KernelError::InvalidArgument.sysret())
+        Err(KernelError::InvalidArgument)
     }
 }
 
@@ -457,8 +457,8 @@ fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
 // ============================================================================
 
 /// The path argument of swapon/swapoff
-fn user_path(ptr: u64) -> Result<alloc::vec::Vec<u8>, KernelError> {
-    crate::fs::namei::getname(ptr, false)
+fn user_path(p: UserPtr<u8>) -> KernelResult<alloc::vec::Vec<u8>> {
+    crate::fs::namei::getname(p.addr(), false)
 }
 
 /// The slots of the area whose header page is `hdr` on a file or
@@ -485,18 +485,11 @@ fn parse_header(hdr: &[u8; PAGE_SIZE], size: u64) -> Result<u64, KernelError> {
 }
 
 /// swapon(2): activate a swap partition or file
-pub fn sys_swapon(path_ptr: u64, swap_flags: i32) -> i64 {
-    match swapon(path_ptr, swap_flags) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
-}
-
-fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
+pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
     if !capable(CAP_SYS_ADMIN) {
         return Err(KernelError::NotPermitted);
     }
-    let path = user_path(path_ptr)?;
+    let path = user_path(path)?;
     let inode = lookup_path(&path)
         .map_err(|_| KernelError::NotFound)?
         .get_inode()
@@ -568,18 +561,11 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
 
 /// swapoff(2): bring every page of a swap area back into memory and
 /// deactivate it (Linux try_to_unuse)
-pub fn sys_swapoff(path_ptr: u64) -> i64 {
-    match swapoff(path_ptr) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
-}
-
-fn swapoff(path_ptr: u64) -> Result<(), KernelError> {
+pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     if !capable(CAP_SYS_ADMIN) {
         return Err(KernelError::NotPermitted);
     }
-    let path = user_path(path_ptr)?;
+    let path = user_path(path)?;
     // A nonexistent file is ENOENT, an existing non-swap file EINVAL
     // (Linux swapoff: file_open_name first)
     lookup_path(&path)?;

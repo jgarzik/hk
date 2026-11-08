@@ -17,7 +17,7 @@ use super::{Mm, MmStruct, PAGE_SIZE, SwapEntry, Vma};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{Leaf, paging};
 use crate::mm::page::phys_to_page;
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 
 /// Drop one mapping's reference to the 4KB user page `phys` (Linux
 /// zap_present_pte: rmap removal + put). The last reference frees it
@@ -242,7 +242,7 @@ pub fn copy_page_range(
     src: PgTables<'_>,
     src_mm: &Mm,
     vma: &Vma,
-) -> Result<bool, i32> {
+) -> KernelResult<bool> {
     assert_eq!(src_mm.pgd(), src.pgd(), "tables of another mm");
     let mut c = CopyRange {
         dst,
@@ -265,10 +265,10 @@ struct CopyRange<'a> {
 }
 
 impl PteWalk for CopyRange<'_> {
-    type Err = i32;
+    type Err = KernelError;
 
-    fn huge(&mut self, pmd: Pmd<'_>, _: u64, _: u64) -> Result<bool, i32> {
-        split_huge_pmd(self.src_mm, pmd).ok_or(KernelError::OutOfMemory.errno())?;
+    fn huge(&mut self, pmd: Pmd<'_>, _: u64, _: u64) -> KernelResult<bool> {
+        split_huge_pmd(self.src_mm, pmd).ok_or(KernelError::OutOfMemory)?;
         Ok(false)
     }
 
@@ -280,21 +280,21 @@ impl PteWalk for CopyRange<'_> {
     /// The child's table, allocated before the parent's PTE lock is
     /// taken (Linux copy_pte_range: pte_alloc_map_lock of the child
     /// first)
-    fn prepare(&mut self, addr: u64, _end: u64) -> Result<(), i32> {
+    fn prepare(&mut self, addr: u64, _end: u64) -> KernelResult<()> {
         self.dst
             .pte_alloc(self.dst_mm, addr)
             .map(|_| ())
-            .ok_or(KernelError::OutOfMemory.errno())
+            .ok_or(KernelError::OutOfMemory)
     }
 
-    fn ptes(&mut self, r: &PteRange<'_>) -> Result<(), i32> {
+    fn ptes(&mut self, r: &PteRange<'_>) -> KernelResult<()> {
         if r.iter().all(|(_, e)| e.load(Ordering::Acquire) == 0) {
             return Ok(());
         }
         let d = self
             .dst
             .pte(r.start)
-            .ok_or(KernelError::OutOfMemory.errno())?
+            .ok_or(KernelError::OutOfMemory)?
             .lock();
         for (a, se) in r.iter() {
             self.wp |= copy_pte(d.entry(a), se, self.cow)?;
@@ -306,7 +306,7 @@ impl PteWalk for CopyRange<'_> {
 /// Copy the parent PTE `sp` into the child's `dp` (Linux
 /// copy_present_pte / copy_nonpresent_pte), both PTE locks held; true
 /// if the parent's entry was write-protected
-fn copy_pte(dp: &AtomicU64, sp: &AtomicU64, cow: bool) -> Result<bool, i32> {
+fn copy_pte(dp: &AtomicU64, sp: &AtomicU64, cow: bool) -> KernelResult<bool> {
     let mut pte = sp.load(Ordering::Acquire);
     if pte == 0 {
         return Ok(false);
@@ -317,7 +317,7 @@ fn copy_pte(dp: &AtomicU64, sp: &AtomicU64, cow: bool) -> Result<bool, i32> {
             // copy_nonpresent_pte: swap_duplicate); a full count is
             // ENOMEM (Linux would chain a count continuation)
             if !super::swap::swap_duplicate(SwapEntry::from_pte(pte)) {
-                return Err(KernelError::OutOfMemory.errno());
+                return Err(KernelError::OutOfMemory);
             }
             dp.store(pte, Ordering::Release);
         }

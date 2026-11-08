@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::spin::Mutex;
 use crate::sync::{RwSem, RwSemReadGuard, RwSemWriteGuard};
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 
 use crate::task::Tid;
 
@@ -607,11 +607,11 @@ impl MmStruct {
     ///
     /// Called during page fault handling when an access occurs below a
     /// VM_GROWSDOWN VMA. The VMA's start address is extended downward.
-    pub fn expand_downwards(&mut self, vma_idx: usize, address: u64) -> Result<(), i32> {
+    pub fn expand_downwards(&mut self, vma_idx: usize, address: u64) -> KernelResult<()> {
         let address = address & !0xFFF; // Page align down
 
         if vma_idx >= self.vmas.len() {
-            return Err(KernelError::BadAddress.errno());
+            return Err(KernelError::BadAddress);
         }
 
         let vma = &mut self.vmas[vma_idx];
@@ -620,13 +620,13 @@ impl MmStruct {
         }
 
         if !vma.is_growsdown() {
-            return Err(KernelError::BadAddress.errno());
+            return Err(KernelError::BadAddress);
         }
 
         // The stack may not grow past RLIMIT_STACK (Linux acct_stack_growth)
         let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
         if vma.end - address > limit {
-            return Err(KernelError::BadAddress.errno());
+            return Err(KernelError::BadAddress);
         }
 
         let grow_pages = (vma.start - address) >> 12;
@@ -635,7 +635,7 @@ impl MmStruct {
         // vm_pgoff): a VMA moved up by mremap keeps a small pgoff and
         // cannot grow below index 0 (Linux: grow <= vm_pgoff, ENOMEM)
         let Some(pgoff) = vma.pgoff.checked_sub(grow_pages) else {
-            return Err(KernelError::OutOfMemory.errno()); // the access is SIGSEGV
+            return Err(KernelError::OutOfMemory); // the access is SIGSEGV
         };
         let old_start = vma.start;
         vma.start = address;
@@ -1118,11 +1118,11 @@ fn vma_needs_copy(v: &Vma) -> bool {
     !(v.is_shared() && refaults)
 }
 
-pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
+pub fn dup_mm(parent: &MmRef, pgd: u64) -> KernelResult<MmRef> {
     let Ok(guard) = parent.mmap_write_killable() else {
         // The child mm was never built: its table is ours to free
         crate::FRAME_ALLOCATOR.free(pgd);
-        return Err(KernelError::Interrupted.errno());
+        return Err(KernelError::Interrupted);
     };
     let mut header = MmStruct::new(guard.mmap_base);
     header.start_brk = guard.start_brk;
@@ -1149,7 +1149,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
                 Ok(av) => v.anon_vma = Some(av),
                 Err(e) => {
                     // Not linked: the child is torn down below
-                    res = Err(e.errno());
+                    res = Err(e);
                     break;
                 }
             }

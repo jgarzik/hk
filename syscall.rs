@@ -524,9 +524,14 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::syscall::sys_getuid(crate::task::percpu::current_cred().uid).ret() as u64
         }
         Sys::Getxattr => crate::fs::syscall::sys_getxattr(a[0], a[1], a[2], a[3]).ret() as u64,
-        Sys::GetMempolicy => {
-            crate::mm::mempolicy::sys_get_mempolicy(a[0], a[1], a[2], a[3], a[4]).ret() as u64
-        }
+        Sys::GetMempolicy => crate::mm::mempolicy::sys_get_mempolicy(
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            a[2],
+            a[3],
+            a[4],
+        )
+        .ret() as u64,
         Sys::GetRobustList => {
             crate::task::futex::sys_get_robust_list(a[0] as i32, a[1], a[2]).ret() as u64
         }
@@ -590,17 +595,23 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         }
         Sys::Madvise => crate::mm::madvise::sys_madvise(a[0], a[1], a[2] as i32).ret() as u64,
         Sys::Mbind => {
-            crate::mm::mempolicy::sys_mbind(a[0], a[1], a[2], a[3], a[4], a[5] as u32).ret() as u64
+            crate::mm::mempolicy::sys_mbind(a[0], a[1], a[2], UserPtr::new(a[3]), a[4], a[5] as u32)
+                .ret() as u64
         }
         Sys::Membarrier => {
             crate::task::membarrier::sys_membarrier(a[0] as i32, a[1] as u32, a[2] as i32).ret()
                 as u64
         }
-        Sys::MigratePages => {
-            crate::mm::mempolicy::sys_migrate_pages(i64::from(a[0] as i32), a[1], a[2], a[3]).ret()
-                as u64
+        Sys::MigratePages => crate::mm::mempolicy::sys_migrate_pages(
+            i64::from(a[0] as i32),
+            a[1],
+            UserPtr::new(a[2]),
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
+        Sys::Mincore => {
+            crate::mm::syscall::sys_mincore(a[0], a[1], UserPtr::new(a[2])).ret() as u64
         }
-        Sys::Mincore => crate::mm::syscall::sys_mincore(a[0], a[1], a[2]).ret() as u64,
         Sys::Mkdirat => {
             crate::fs::syscall::sys_mkdirat(a[0] as i32, a[1], a[2] as u32).ret() as u64
         }
@@ -612,15 +623,15 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Mlockall => crate::mm::syscall::sys_mlockall(a[0] as i32).ret() as u64,
         Sys::Mmap => {
             crate::mm::syscall::sys_mmap(a[0], a[1], a[2] as u32, a[3] as u32, a[4] as i32, a[5])
-                as u64
+                .ret() as u64
         }
         Sys::Mount => crate::fs::syscall::sys_mount(a[0], a[1], a[2], a[3], a[4]).ret() as u64,
         Sys::MovePages => crate::mm::mempolicy::sys_move_pages(
             i64::from(a[0] as i32),
             a[1],
-            a[2],
-            a[3],
-            a[4],
+            UserPtr::new(a[2]),
+            UserPtr::new(a[3]),
+            UserPtr::new(a[4]),
             a[5] as i32,
         )
         .ret() as u64,
@@ -947,7 +958,8 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::syscall::sys_setxattr(a[0], a[1], a[2], a[3], a[4] as i32).ret() as u64
         }
         Sys::SetMempolicy => {
-            crate::mm::mempolicy::sys_set_mempolicy(a[0] as i32, a[1], a[2]).ret() as u64
+            crate::mm::mempolicy::sys_set_mempolicy(a[0] as i32, UserPtr::new(a[1]), a[2]).ret()
+                as u64
         }
         Sys::SetRobustList => crate::task::futex::sys_set_robust_list(a[0], a[1]).ret() as u64,
         Sys::SetTidAddress => crate::task::syscall::sys_set_tid_address(a[0]).ret() as u64,
@@ -984,8 +996,8 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::syscall::sys_statx(a[0] as i32, a[1], a[2] as i32, a[3] as u32, a[4]).ret()
                 as u64
         }
-        Sys::Swapoff => crate::mm::sys_swapoff(a[0]).ret() as u64,
-        Sys::Swapon => crate::mm::sys_swapon(a[0], a[1] as i32).ret() as u64,
+        Sys::Swapoff => crate::mm::sys_swapoff(UserPtr::new(a[0])).ret() as u64,
+        Sys::Swapon => crate::mm::sys_swapon(UserPtr::new(a[0]), a[1] as i32).ret() as u64,
         Sys::Symlinkat => crate::fs::syscall::sys_symlinkat(a[0], a[1] as i32, a[2]).ret() as u64,
         Sys::Sync => crate::fs::syscall::sys_sync().ret() as u64,
         Sys::Syncfs => crate::fs::syscall::sys_syncfs(a[0] as i32).ret() as u64,

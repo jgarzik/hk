@@ -2351,7 +2351,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             let mut pt =
                 ArchPageTable::new_user(frame_alloc).ok_or(KernelError::OutOfMemory.errno())?;
             pt.copy_kernel_mappings();
-            Some(crate::mm::dup_mm(&pm, pt.root_table_phys())?)
+            Some(crate::mm::dup_mm(&pm, pt.root_table_phys()).map_err(KernelError::errno)?)
         }
     };
     let child_pgd = child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd());
