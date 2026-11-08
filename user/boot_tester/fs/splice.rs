@@ -334,8 +334,7 @@ static mut VBUF: [u8; 8192] = [b'v'; 8192];
 fn vmsplice_wait() {
     let mut t = T::new(b"VMSPLICE_WAIT");
     let iov = |len| IoVec {
-        // SAFETY: only read, by the kernel
-        iov_base: unsafe { (&raw const VBUF).cast::<u8>() },
+        iov_base: (&raw const VBUF).cast::<u8>(),
         iov_len: len,
     };
     let f = full_pipe();
