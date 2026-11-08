@@ -197,7 +197,9 @@ each, as `LOCKDEP:FAIL` (so the boot test fails):
   `MIGHT_SLEEP:FAIL` check above.
 - **Lock order:** a lock's class is the source location of its `new()`
   (`#[track_caller]`, like Linux's static lock_class_key: all `TcpSock.cb`
-  share one class). Taking B while holding A records A -> B; taking B
+  share one class). A `#[derive(Default)]` struct's locks all get the
+  derive line as their class, so derive `Default` only on a struct with
+  at most one lock. Taking B while holding A records A -> B; taking B
   under A after A was taken under B reports both acquisitions. Only
   direct inversions (no transitive cycles); nesting within one class is
   not checked (listener -> child `cb`, `lock2` of two unix sockets).
@@ -3972,9 +3974,6 @@ pub fn preempt_disable();
 /// Enable preemption (decrement preempt_count)
 pub fn preempt_enable();
 
-/// Check if preemption is disabled
-pub fn preempt_disabled() -> bool;
-
 /// Get current preempt_count (debugging)
 pub fn preempt_count() -> u32;
 ```
@@ -4159,7 +4158,6 @@ uninterrupted by other tasks. What this changes, and why it holds:
 |-----------|------|
 | Disable preemption | `percpu::preempt_disable()` |
 | Enable preemption | `percpu::preempt_enable()` |
-| Check if disabled | `percpu::preempt_disabled()` |
 | Get count | `percpu::preempt_count()` |
 
 ### Atomic Operations
