@@ -206,9 +206,9 @@ fn walk(
         Some(p) if !path.starts_with(b"/") => p,
         _ => root.clone(),
     };
-    let mut rest = path;
-    while let Some((name, tail)) = next_comp(rest) {
-        rest = tail;
+    let mut next = next_comp(path);
+    while let Some((name, rest)) = next {
+        next = next_comp(rest);
         may_lookup(c, &cur.dentry)?;
         match name {
             b"." => continue,
@@ -224,7 +224,7 @@ fn walk(
         } else {
             follow_mount(child)
         };
-        let last = next_comp(rest).is_none();
+        let last = next.is_none();
         if (!last || flags.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
             return follow_link(c, &cur, &child.dentry, rest, flags, depth);
         }
@@ -243,13 +243,6 @@ fn next_comp(p: &[u8]) -> Option<(&[u8], &[u8])> {
     let p = &p[start..];
     let end = p.iter().position(|&c| c == b'/').unwrap_or(p.len());
     Some(p.split_at(end))
-}
-
-/// `p` without its leading and trailing slashes
-fn trim_slashes(p: &[u8]) -> &[u8] {
-    let s = p.iter().position(|&c| c != b'/').unwrap_or(p.len());
-    let e = p.iter().rposition(|&c| c != b'/').map_or(s, |i| i + 1);
-    &p[s..e]
 }
 
 /// The root absolute paths start at and ".." stops at (Linux nd->root):
@@ -296,9 +289,6 @@ fn follow_link(
     flags: LookupFlags,
     depth: usize,
 ) -> Result<Path, KernelError> {
-    // The components still to resolve, without the slashes around them
-    // (a trailing slash is already in `flags`)
-    let rest = trim_slashes(rest);
     let inode = link.get_inode().ok_or(KernelError::NotFound)?;
     // fs.protected_symlinks first, then a nosymfollow mount (Linux
     // pick_link: may_follow_link, then MNT_NOSYMFOLLOW on the link's
@@ -315,18 +305,16 @@ fn follow_link(
     if let Some(p) = inode.i_op.jump_link(&inode, &dir.mnt) {
         let p = p?;
         inode.touch_atime(&dir.mnt);
-        if !rest.is_empty() || flags.directory {
+        if next_comp(rest).is_some() || flags.directory {
             return Err(KernelError::NotDirectory);
         }
         return Ok(p);
     }
     let target = inode.i_op.readlink(&inode)?;
     inode.touch_atime(&dir.mnt);
+    // `rest` is empty or starts at a slash: the walk goes on through it
     let mut path = target;
-    if !rest.is_empty() {
-        path.push(b'/');
-        path.extend_from_slice(rest);
-    }
+    path.extend_from_slice(rest);
     walk(c, Some(dir.clone()), &path, flags, depth + 1)
 }
 
@@ -637,7 +625,7 @@ pub fn filename_create(dirfd: i32, path: &[u8], want_dir: bool) -> Result<Parent
 
 #[cfg(test)]
 mod tests {
-    use super::{next_comp, trim_slashes};
+    use super::next_comp;
 
     #[test]
     fn components() {
@@ -645,12 +633,5 @@ mod tests {
         assert_eq!(next_comp(b"//b/"), Some((&b"b"[..], &b"/"[..])));
         assert_eq!(next_comp(b"/"), None);
         assert_eq!(next_comp(b""), None);
-    }
-
-    #[test]
-    fn trim() {
-        assert_eq!(trim_slashes(b"//a//b/"), b"a//b");
-        assert_eq!(trim_slashes(b"///"), b"");
-        assert_eq!(trim_slashes(b"a"), b"a");
     }
 }
