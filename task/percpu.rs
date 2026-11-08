@@ -1389,50 +1389,10 @@ fn create_kernel_task(
     let stack = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
     let stack_top = stack.top();
 
-    let task_inner = crate::task::TaskInner {
-        thread_pid,
-        // In no process group or session (never signalled by group)
-        pgrp: None,
-        session: None,
-        pids_linked: false,
-        exit_code: 0,
-        exit_signal: 0, // Kernel threads don't send exit signals
-        parent_exec_id: 0,
-        pdeath_signal: 0,
-        state: TaskState::Ready,
-        pgd: ArchPageTable::kernel_root(),
-        // TLS fields (not used for idle task)
-        clear_child_tid: 0,
-        set_child_tid: 0,
-        // Shared resources (kernel threads don't have user-space resources)
-        sighand: None,
-        signal: None,
-        sysvsem: None,
-        // Per-task signal state
-        robust_list: 0,
-        // prctl state
-        prctl: crate::task::PrctlState::default(),
-        // Process personality (execution domain)
-        personality: 0,
-        // Seccomp state (kernel threads don't use seccomp)
-        seccomp_filter: None,
-        // I/O port permissions (x86-64 only, kernel threads don't use I/O ports)
-        #[cfg(target_arch = "x86_64")]
-        iopl_emul: 0,
-        leader: true,
-        // Ptrace state (kernel threads are not traced)
-        ptrace: 0,
-        ptracer: None,
-        real_parent: None,
-        children: crate::util::list::ArcList::new(),
-        in_children: false,
-        threads: crate::util::list::ArcList::new(),
-        ptrace_message: 0,
-        ptrace_options: 0,
-        ptrace_code: 0,
-        ptrace_frozen: false,
-        last_siginfo: None,
-    };
+    // In no process group or session (never signalled by group); no
+    // exit signal, no user-space resources, never traced
+    let task_inner =
+        crate::task::TaskInner::new(thread_pid, TaskState::Ready, ArchPageTable::kernel_root());
     let task = Task::new(
         tid,
         crate::task::TaskIds {
@@ -1603,47 +1563,16 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
 
     // Create Task entry
     let task_inner = crate::task::TaskInner {
-        thread_pid: Some(thread_pid),
         // The boot group and session, number 0 (Linux init_struct_pid)
         pgrp: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.pgid),
         session: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.sid),
-        pids_linked: false,
-        exit_code: 0,
-        exit_signal: crate::signal::SIGCHLD as i32, // Default: notify parent with SIGCHLD
-        parent_exec_id: 0,
-        pdeath_signal: 0,
-        state: TaskState::Running, // Will be running immediately
-        pgd: config.page_table.root_table_phys(),
-        // TLS fields (initialized to 0, set by syscalls)
-        clear_child_tid: 0,
-        set_child_tid: 0,
-        // Shared resources (will be initialized by caller via init_* functions)
-        sighand: None,
-        signal: None,
-        sysvsem: None,
-        // Per-task signal state
-        robust_list: 0,
-        prctl: crate::task::PrctlState::default(),
-        // Process personality (execution domain)
-        personality: 0,
-        // Seccomp state (disabled initially)
-        seccomp_filter: None,
-        // I/O port permissions (x86-64 only, no I/O port access initially)
-        #[cfg(target_arch = "x86_64")]
-        iopl_emul: 0,
-        leader: true,
-        // Ptrace state (not traced initially)
-        ptrace: 0,
-        ptracer: None,
-        real_parent: None,
-        children: crate::util::list::ArcList::new(),
-        in_children: false,
-        threads: crate::util::list::ArcList::new(),
-        ptrace_message: 0,
-        ptrace_options: 0,
-        ptrace_code: 0,
-        ptrace_frozen: false,
-        last_siginfo: None,
+        exit_signal: crate::signal::SIGCHLD as i32,
+        // Shared resources: set by the caller via init_* functions
+        ..crate::task::TaskInner::new(
+            Some(thread_pid),
+            TaskState::Running,
+            config.page_table.root_table_phys(),
+        )
     };
     // The boot-time init task: failure cannot be reported
     let task = arc_nofail(Task::new(
@@ -2468,14 +2397,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_pid // Normal case: we are the parent
     };
 
-    // Create child task
+    // Create child task: pgrp/session are set from the creator's under TASKLIST
+    // (`inherit_pids`); TLS fields and shared resources from the clone
+    // flags below; pdeath_signal is never inherited
     let child_task_inner = crate::task::TaskInner {
-        thread_pid: Some(child_thread_pid.clone()),
-        // Set from the creator's under TASKLIST (`inherit_pids`)
-        pgrp: None,
-        session: None,
-        pids_linked: false,
-        exit_code: 0,
         // Linux copy_process: a thread -1, a CLONE_PARENT child the
         // group leader's; their parent_exec_id the caller's, else the
         // caller's exec count
@@ -2491,18 +2416,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         } else {
             crate::task::self_exec_id(parent_pid)
         },
-        pdeath_signal: 0, // Never inherited, must be set explicitly via prctl
-        state: TaskState::Ready,
-        pgd: child_pgd,
-        // TLS fields - will be set based on clone flags below
-        clear_child_tid: 0,
-        set_child_tid: 0,
-        // Shared resources (will be cloned/shared based on clone flags below)
-        sighand: None,
-        signal: None,
-        sysvsem: None,
-        // Per-task signal state (always per-task, not shared)
-        robust_list: 0,
         // prctl state: the name is inherited (dumpability lives in the
         // mm: shared with CLONE_VM, copied by dup_mm)
         prctl: crate::task::PrctlState {
@@ -2550,14 +2463,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         } else {
             Some(Arc::downgrade(&task_ref(&current())))
         },
-        children: crate::util::list::ArcList::new(),
-        in_children: false,
-        threads: crate::util::list::ArcList::new(),
-        ptrace_message: 0,
-        ptrace_options: 0,
-        ptrace_code: 0,
-        ptrace_frozen: false,
-        last_siginfo: None,
+        ..crate::task::TaskInner::new(Some(child_thread_pid.clone()), TaskState::Ready, child_pgd)
     };
     let child_task = Task::new(
         child_tid,

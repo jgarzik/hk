@@ -1260,6 +1260,49 @@ pub struct TaskInner {
     pub ptrace_frozen: bool,
 }
 
+impl TaskInner {
+    /// A task in `state` on page table `pgd`: a leader with no exit
+    /// signal, nothing shared, not traced; each creation path sets the
+    /// rest (struct update)
+    pub fn new(thread_pid: Option<Arc<pid::Pid>>, state: TaskState, pgd: u64) -> Self {
+        Self {
+            thread_pid,
+            pgrp: None,
+            session: None,
+            pids_linked: false,
+            exit_code: 0,
+            exit_signal: 0,
+            parent_exec_id: 0,
+            pdeath_signal: 0,
+            state,
+            pgd,
+            clear_child_tid: 0,
+            set_child_tid: 0,
+            sighand: None,
+            signal: None,
+            sysvsem: None,
+            robust_list: 0,
+            prctl: PrctlState::default(),
+            personality: 0,
+            seccomp_filter: None,
+            #[cfg(target_arch = "x86_64")]
+            iopl_emul: 0,
+            leader: true,
+            ptrace: 0,
+            ptracer: None,
+            real_parent: None,
+            children: crate::util::list::ArcList::new(),
+            in_children: false,
+            threads: crate::util::list::ArcList::new(),
+            ptrace_message: 0,
+            ptrace_options: 0,
+            ptrace_code: 0,
+            last_siginfo: None,
+            ptrace_frozen: false,
+        }
+    }
+}
+
 /// Data owned by the TASKLIST lock: reached through a borrow of the
 /// locked table
 pub type TableCell<T> = crate::sync::LockedBy<T, crate::task::percpu::GlobalTaskTable>;
