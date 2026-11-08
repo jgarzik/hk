@@ -86,7 +86,7 @@ struct Snap {
 fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     let table = TASKLIST.read();
     // Still listed: then its tid names it for this read hold
-    let t = super::listed(&table, task)?;
+    let t = table.view(task)?;
     let pid = task.tid();
     let threads = table.threads(pid).count() as u64;
     let nr = |p: Option<&Arc<crate::task::pid::Pid>>, n: &PidNamespace| p.map_or(0, |p| p.nr_ns(n));

@@ -57,18 +57,9 @@ fn current_time() -> Timespec {
     TIMEKEEPER.current_time()
 }
 
-/// `t` as the locked table lists it, if it still is (a tid names it
-/// only while it is listed)
-fn listed<'a>(
-    table: &'a crate::task::percpu::GlobalTaskTable,
-    t: &'a crate::task::Task,
-) -> Option<crate::task::percpu::TaskView<'a>> {
-    table.view(t)
-}
-
 /// `t` is still in the task list (not reaped)
 fn alive(t: &crate::task::Task) -> bool {
-    listed(&crate::task::percpu::TASKLIST.read(), t).is_some()
+    crate::task::percpu::TASKLIST.read().view(t).is_some()
 }
 
 /// Task `t`'s descriptor table, fs struct, namespaces and address space
@@ -1345,7 +1336,8 @@ fn pid_file(name: &str) -> Option<(u64, u16, PidGen)> {
 fn dump_owner(task: &TaskRef) -> (u32, u32) {
     use crate::task::percpu::TASKLIST;
     let table = TASKLIST.read();
-    listed(&table, task)
+    table
+        .view(task)
         .filter(|t| {
             t.task
                 .task_lock()

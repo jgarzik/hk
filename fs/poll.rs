@@ -6,7 +6,6 @@ use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::io::poll::PollFd;
 use crate::signal::SigSet;
-use crate::task::percpu::current_tid;
 use crate::time::time_syscall::{LinuxTimespec, Timeval};
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
@@ -161,8 +160,6 @@ fn do_poll_internal(fds: UserPtr<PollFd>, nfds: u32, deadline: Deadline) -> Kern
     if u64::from(nfds) > crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE) {
         return Err(KernelError::InvalidArgument);
     }
-
-    let _tid = current_tid();
 
     // Empty poll: just sleep for the timeout (or until a signal)
     if nfds == 0 {

@@ -3255,8 +3255,9 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // A non-leader thread is released at exit (Linux autoreaps it):
         // its RLIMIT_NPROC charge goes now; a process's when it is reaped
         {
+            let me = current();
             let table = TASKLIST.read();
-            if let Some(task) = table.get(tid)
+            if let Some(task) = table.view(&me)
                 && task.task.tid() != task.task.pid
             {
                 crate::task::nproc_uncharge(task.cred().uid);
@@ -4675,7 +4676,7 @@ pub fn lookup_task_cpus_allowed(t: &Task) -> Option<crate::util::cpumask::CpuSet
 }
 
 /// ESRCH once task `t` is reaped
-fn listed(t: &Task) -> KernelResult<()> {
+fn esrch_if_reaped(t: &Task) -> KernelResult<()> {
     match TASKLIST.read().view(t) {
         Some(_) => Ok(()),
         None => Err(KernelError::NoProcess),
@@ -4724,7 +4725,7 @@ pub fn set_task_scheduler(task: &Task, policy: i32, rt_priority: i32) -> KernelR
         return Err(KernelError::InvalidArgument); // non-RT policies must have priority 0
     }
 
-    listed(task)?;
+    esrch_if_reaped(task)?;
     // Not the stoppers nor an idle task (Linux: EINVAL for rq->stop)
     if matches!(task.se.class(), Class::Stop | Class::Idle) {
         return Err(KernelError::InvalidArgument);
@@ -4761,7 +4762,7 @@ pub fn set_task_scheduler(task: &Task, policy: i32, rt_priority: i32) -> KernelR
 /// See [`set_cpus_allowed_ptr`]: a task on a CPU it may no longer use
 /// is moved before this returns.
 pub fn set_task_cpus_allowed(t: &Task, mask: crate::util::cpumask::CpuSet) -> KernelResult<()> {
-    listed(t)?;
+    esrch_if_reaped(t)?;
     // Bound kernel threads (Linux sched_setaffinity: EINVAL)
     if t.has_flag(crate::task::pf::NO_SETAFFINITY) {
         return Err(KernelError::InvalidArgument);
@@ -4783,7 +4784,7 @@ pub fn task_count() -> usize {
 ///
 /// ESRCH once it is reaped
 pub fn set_task_nice(t: &Task, nice: i32) -> KernelResult<()> {
-    listed(t)?;
+    esrch_if_reaped(t)?;
     let static_prio = (i32::from(sched::DEFAULT_PRIO) + nice.clamp(-20, 19)) as u8;
     change_class(t, |se| {
         se.set_params(se.class(), se.policy(), static_prio, se.rt_priority())

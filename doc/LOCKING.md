@@ -1969,7 +1969,7 @@ access, turned into a reference to the task (`Pid.task` under
 TASKLIST's read lock, never under the inode data's lock: Linux
 get_pid_task) that every helper then works on, never its number (a
 helper needing the task's locked fields finds it again under TASKLIST
-only if it is still that task, `listed`; its resources under its
+only if it is still that task, `GlobalTaskTable::view`; its resources under its
 alloc_lock); lookup, readdir and the per-task files
 translate through the pid helpers (3.1.1 Pid namespaces): the hash,
 then TASKLIST's read lock to reach the task
