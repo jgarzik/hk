@@ -25,6 +25,18 @@ const fn sig(n: u32) -> Signal {
     }
 }
 
+/// A raw signal argument (Linux valid_signal on an unsigned long):
+/// None past NSIG, Some(None) for 0 (a probe, "none" or "the default"),
+/// else its signal. Callers widen their ABI's type as Linux does and
+/// give their own errno.
+pub const fn valid_signal(n: u64) -> Option<Option<Signal>> {
+    if n > NSIG as u64 {
+        return None;
+    }
+    // n <= NSIG fits a u32
+    Some(Signal::new(n as u32))
+}
+
 impl Signal {
     /// `n` if it is a signal number, 1..=NSIG
     pub const fn new(n: u32) -> Option<Self> {
@@ -224,6 +236,17 @@ mod tests {
         assert_eq!(Signal::new(1).map(Signal::nr), Some(1));
         assert_eq!(Signal::new(64), Some(SIGRTMAX));
         assert_eq!(Signal::new(9), Some(SIGKILL));
+    }
+
+    /// 0 is valid but no signal; nothing past NSIG is valid, however
+    /// wide (a C int's -1 as an unsigned long)
+    #[test]
+    fn valid() {
+        assert_eq!(valid_signal(0), Some(None));
+        assert_eq!(valid_signal(64), Some(Some(SIGRTMAX)));
+        assert_eq!(valid_signal(65), None);
+        assert_eq!(valid_signal(1 << 32), None);
+        assert_eq!(valid_signal(-1i32 as u64), None);
     }
 
     /// The sigset bit and table slot are nr - 1

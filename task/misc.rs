@@ -423,10 +423,7 @@ pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> K
         PR_SET_PDEATHSIG => {
             // The signal sent when the parent dies, 0 for none; EINVAL
             // past NSIG, the whole unsigned long (Linux valid_signal)
-            let sig = match u32::try_from(arg2) {
-                Ok(n) if n <= crate::signal::NSIG => Signal::new(n),
-                _ => return Err(KernelError::InvalidArgument),
-            };
+            let sig = crate::signal::valid_signal(arg2).ok_or(KernelError::InvalidArgument)?;
 
             let mut table = TASKLIST.write();
             let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;

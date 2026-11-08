@@ -33,7 +33,7 @@ use crate::io::poll::{
 };
 use crate::signal::siginfo::{SigFields, SigInfo, si_code};
 use crate::signal::{
-    NSIG, SIGIO, SIGURG, SendInfo, Signal, group_task, send_group_signal, send_sig_info,
+    SIGIO, SIGURG, SendInfo, Signal, group_task, send_group_signal, send_sig_info, valid_signal,
 };
 use crate::sync::spin::Mutex;
 use crate::task::Uid;
@@ -252,12 +252,10 @@ pub fn f_getown_ex(file: &File, arg: u64) -> Result<(), KernelError> {
 
 /// F_SETSIG (Linux f_owner_sig): EINVAL past the last signal
 pub fn f_setsig(file: &File, sig: u64) -> Result<(), KernelError> {
-    // An int (Linux argi), so a negative one is out of range
-    let sig = u32::try_from(sig as i32).map_err(|_| KernelError::InvalidArgument)?;
-    if sig > NSIG {
-        return Err(KernelError::InvalidArgument);
-    }
-    file.f_owner_alloc()?.st.lock().signum = Signal::new(sig);
+    // An int (Linux argi) widened to valid_signal's unsigned long, so
+    // a negative one is out of range
+    let sig = valid_signal(sig as i32 as u64).ok_or(KernelError::InvalidArgument)?;
+    file.f_owner_alloc()?.st.lock().signum = sig;
     Ok(())
 }
 

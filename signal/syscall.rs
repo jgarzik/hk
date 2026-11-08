@@ -12,9 +12,8 @@
 //! Note: rt_sigreturn (15) is implemented in arch-specific signal.rs files
 
 use crate::signal::{
-    NSIG, SendInfo, SigAction, SigInfo, SigSet, Signal, UserSigInfo, dequeue_signal,
-    get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info, si_code,
-    with_task_signal_state,
+    SendInfo, SigAction, SigInfo, SigSet, Signal, UserSigInfo, dequeue_signal, get_task_sighand,
+    kill_pgrp, proc_target, send_group_signal, send_sig_info, si_code, with_task_signal_state,
 };
 use crate::task::percpu::{TaskRef, current, current_pgid, current_tid, get_all_pids};
 use crate::time::time_syscall::LinuxTimespec;
@@ -198,10 +197,7 @@ pub(crate) type KillSig = KernelResult<Option<Signal>>;
 
 /// `sig` as a [`KillSig`]
 pub(crate) fn kill_sig(sig: u32) -> KillSig {
-    if sig > NSIG {
-        return Err(KernelError::InvalidArgument);
-    }
-    Ok(Signal::new(sig))
+    crate::signal::valid_signal(u64::from(sig)).ok_or(KernelError::InvalidArgument)
 }
 
 /// The receiver of the caller's `sig` to process `pid` (Linux

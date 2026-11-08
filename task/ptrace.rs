@@ -395,10 +395,7 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> KernelResult<i64> {
 /// A resume's signal argument (Linux valid_signal): None for 0, EIO
 /// past NSIG
 fn resume_sig(data: u64) -> KernelResult<Option<Signal>> {
-    match u32::try_from(data) {
-        Ok(n) if n <= signal::NSIG => Ok(Signal::new(n)),
-        _ => Err(KernelError::Io),
-    }
+    signal::valid_signal(data).ok_or(KernelError::Io)
 }
 
 /// Let a stopped tracee go on with `sig` to deliver (Linux
