@@ -832,7 +832,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
   softnet/0 only; CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
-  (bpf, keys, mqueue, which wrap with no collision check): one
+  (bpf, mqueue, which wrap with no collision check): one
   IDR/IDA.
 - **procfs** (H): a file is generated whole (no seq_file records): an
   open file's reads continuing one another see one generation, where
