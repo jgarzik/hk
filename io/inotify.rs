@@ -320,37 +320,32 @@ struct Mark {
 /// Push `x` onto the vector under `m`, growing it with the lock released
 /// (nothing allocates under a spin lock): ENOMEM if it cannot grow
 fn push_grow<T>(m: &Mutex<Vec<T>>, x: T) -> Result<(), KernelError> {
-    let mut x = Some(x);
+    push_if(m, |v| v.push(x))
+}
+
+/// Under `m`, with room for one more item: `f` pushes it, or not;
+/// the vector grows with the lock released first if it is full
+/// (`kmem::spare`): ENOMEM if it cannot
+fn push_if<T>(m: &Mutex<Vec<T>>, f: impl FnOnce(&mut Vec<T>)) -> Result<(), KernelError> {
     loop {
         let cap = {
             let mut v = m.lock();
             if v.len() < v.capacity() {
-                if let Some(x) = x.take() {
-                    v.push(x);
-                }
+                f(&mut v);
                 return Ok(());
             }
             v.capacity()
         };
-        let mut bigger = Vec::new();
-        bigger
-            .try_reserve_exact((cap * 2).max(4))
-            .map_err(|_| KernelError::OutOfMemory)?;
-        let mut v = m.lock();
-        if v.len() < bigger.capacity() && v.capacity() < bigger.capacity() {
-            // Moved within the new capacity: no allocation
-            bigger.extend(v.drain(..));
-            core::mem::swap(&mut *v, &mut bigger);
-        }
-        drop(v);
+        let bigger = crate::util::kmem::spare(cap)?;
+        let old = crate::util::kmem::adopt(&mut m.lock(), bigger);
         // The old (or unused) buffer is freed with the lock released
-        drop(bigger);
+        drop(old);
     }
 }
 
 /// The watches on an inode (Linux inode->i_fsnotify_marks): `list` a
-/// spin leaf; `on_sb` set once the inode is on its superblock's
-/// `SbMarks` (it stays there until the inode dies)
+/// spin leaf; `on_sb` set, under the `SbMarks` lock, once the inode is
+/// on its superblock's `SbMarks` (it stays there until the inode dies)
 #[derive(Default)]
 pub struct Marks {
     list: Mutex<Vec<Mark>>,
@@ -386,28 +381,31 @@ impl Marks {
 pub struct SbMarks(Mutex<Vec<Weak<Inode>>>);
 
 impl SbMarks {
-    /// List `inode` if it is not yet; ENOMEM if the list cannot grow
+    /// List `inode` if it is not yet; ENOMEM if the list cannot grow.
+    /// `on_sb` is set only under the list's lock, by the adder that
+    /// pushes the inode, after the push: an adder that sees it set
+    /// knows the inode is listed, and a failed growth leaves it unset
+    /// for the next adder to try.
     fn add(&self, inode: &Arc<Inode>) -> Result<(), KernelError> {
-        if inode.fsnotify.on_sb.swap(true, Ordering::AcqRel) {
+        let on_sb = &inode.fsnotify.on_sb;
+        if on_sb.load(Ordering::Acquire) {
             return Ok(());
         }
-        let r = self.push(Arc::downgrade(inode));
-        if r.is_err() {
-            inode.fsnotify.on_sb.store(false, Ordering::Release);
-        }
-        r
-    }
-
-    /// Push `w`, first dropping dead inodes' entries if the list is full
-    /// (amortized: only before it would grow)
-    fn push(&self, w: Weak<Inode>) -> Result<(), KernelError> {
         {
+            // Dead inodes' entries go before the list would grow
+            // (amortized: only when it is full)
             let mut v = self.0.lock();
             if v.len() == v.capacity() {
                 v.retain(|w| w.strong_count() != 0);
             }
         }
-        push_grow(&self.0, w)
+        let w = Arc::downgrade(inode);
+        push_if(&self.0, |v| {
+            if !on_sb.load(Ordering::Relaxed) {
+                v.push(w);
+                on_sb.store(true, Ordering::Release);
+            }
+        })
     }
 
     /// The filesystem is shutting down (Linux fsnotify_sb_delete, from
