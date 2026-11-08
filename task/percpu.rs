@@ -1265,6 +1265,11 @@ impl Cur {
         unsafe { self.task.comm() }
     }
 
+    /// `t` is the running task (Linux `p == current`)
+    pub fn is(&self, t: &Task) -> bool {
+        core::ptr::eq(self.task, t)
+    }
+
     /// The task is a kernel thread or the boot task (no user context)
     pub fn is_kthread(&self) -> bool {
         self.task.has_flag(crate::task::pf::KTHREAD)
@@ -3270,7 +3275,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // used it for the robust list and CLEARTID): the last user tears it
     // down; its top-level table stays loaded here until we switched away
     let dead_mm = if tid != 0 {
-        crate::mm::exit_task_mm(tid)
+        crate::mm::exit_task_mm(&current())
     } else {
         None
     };

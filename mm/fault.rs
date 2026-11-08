@@ -676,13 +676,13 @@ fn reuse_swap_page(phys: u64) {
 /// in a loop and the kernel keeps its reserve. Interrupts enabled.
 pub fn pagefault_out_of_memory() -> ! {
     use crate::signal::SIGKILL;
-    use crate::task::percpu::current_tid;
 
-    let tid = current_tid();
     let me = crate::task::percpu::current();
     let (pid, name) = (me.pid, me.comm());
     let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-    let exe = super::get_task_mm(tid).and_then(|mm| mm.mmap_read().exe());
+    let exe = crate::task::percpu::current()
+        .mm()
+        .and_then(|mm| mm.mmap_read().exe());
     let comm: &[u8] = match &name[..len] {
         n if !n.is_empty() => n,
         _ => exe

@@ -18,8 +18,6 @@ use crate::sync::spin::Mutex;
 use crate::sync::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::util::error::{KernelError, KernelResult};
 
-use crate::task::Tid;
-
 pub mod anon_vma;
 #[cfg(any(test, target_arch = "aarch64"))]
 pub mod asid;
@@ -1056,33 +1054,26 @@ pub fn mmget_not_zero(mm: &Arc<Mm>) -> Option<MmRef> {
     None
 }
 
-use crate::task::percpu::with_task_lock;
-
-/// The address space of task `tid` (an mm_count reference; the task
+/// The address space of task `t` (an mm_count reference; the task
 /// itself holds the user reference, so it stays mapped while the task
-/// uses it)
-pub fn get_task_mm(tid: Tid) -> Option<Arc<Mm>> {
-    // The current task's own, lock-free (Linux current->mm)
-    let me = crate::task::percpu::current();
-    if me.tid() == tid {
-        return me.mm();
-    }
-    with_task_lock(tid, |a| a.mm().map(|m| m.arc().clone())).flatten()
+/// uses it). The current task's is `current().mm()`, lock-free.
+pub fn get_task_mm(t: &crate::task::Task) -> Option<Arc<Mm>> {
+    t.task_lock().mm().map(|m| m.arc().clone())
 }
 
-/// A user reference to task `tid`'s address space (Linux get_task_mm),
+/// A user reference to task `t`'s address space (Linux get_task_mm),
 /// None for a task without one or one exiting
-pub fn get_task_mm_users(tid: Tid) -> Option<MmRef> {
-    let mm = get_task_mm(tid)?;
+pub fn get_task_mm_users(t: &crate::task::Task) -> Option<MmRef> {
+    let mm = get_task_mm(t)?;
     mmget_not_zero(&mm)
 }
 
-/// Detach task `tid` from its address space (Linux exit_mm). The user
+/// Detach task `t` from its address space (Linux exit_mm). The user
 /// reference is dropped here (the last one tears the mappings down);
 /// the returned mm_count reference keeps the top-level table, still
 /// loaded on this CPU, until the task has switched away.
-pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
-    let mm = with_task_lock(tid, |a| a.set_mm(None)).flatten()?;
+pub fn exit_task_mm(t: &crate::task::Task) -> Option<Arc<Mm>> {
+    let mm = t.task_lock().set_mm(None)?;
     let keep = mm.arc().clone();
     drop(mm);
     Some(keep)

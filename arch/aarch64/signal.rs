@@ -283,8 +283,9 @@ pub fn setup_rt_frame(
     let restorer = if action.flags & sa_flags::SA_RESTORER != 0 {
         action.restorer
     } else {
-        let page =
-            crate::mm::get_task_mm(crate::task::percpu::current_tid()).map_or(0, |mm| mm.sigpage());
+        let page = crate::task::percpu::current()
+            .mm()
+            .map_or(0, |mm| mm.sigpage());
         if page == 0 {
             return Err(KernelError::InvalidArgument);
         }

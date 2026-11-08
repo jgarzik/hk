@@ -538,7 +538,8 @@ fn may_access_vm(mm: &crate::mm::MmRef) -> bool {
 fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
     // A user reference: the address space cannot be torn down while we
     // access it (Linux get_task_mm)
-    let mm = crate::mm::get_task_mm_users(target_tid)?;
+    let t = crate::task::percpu::find_task(target_tid)?;
+    let mm = crate::mm::get_task_mm_users(&t)?;
     let pgd = mm.pgd();
     Some((mm, pgd))
 }

@@ -309,9 +309,9 @@ impl TrapSet {
 /// bad_area_access_error): SEGV_ACCERR if a VMA of the current task
 /// covers it, else SEGV_MAPERR
 pub fn segv_code(addr: u64) -> i32 {
-    let tid = crate::task::percpu::current_tid();
-    let mapped =
-        crate::mm::get_task_mm(tid).is_some_and(|mm| mm.mmap_read().find_vma(addr).is_some());
+    let mapped = crate::task::percpu::current()
+        .mm()
+        .is_some_and(|mm| mm.mmap_read().find_vma(addr).is_some());
     if mapped {
         si_code::SEGV_ACCERR
     } else {

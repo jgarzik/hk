@@ -317,7 +317,7 @@ fn fault_access(iss: u64, insn: bool) -> Option<Access> {
 
 /// Resolve a fault on the user address `far` in the current address space
 fn mm_fault(far: u64, access: Access) -> Result<(), VmFault> {
-    let mm = crate::mm::get_task_mm(crate::task::percpu::current_tid()).ok_or(VmFault::Segv)?;
+    let mm = crate::task::percpu::current().mm().ok_or(VmFault::Segv)?;
     crate::mm::fault::handle_mm_fault(&mm, far, access)
 }
 

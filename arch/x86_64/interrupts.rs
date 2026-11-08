@@ -630,7 +630,7 @@ fn handle_page_fault(ec: u64, addr: u64) -> Result<(), VmFault> {
         _ if ec & 1 != 0 => return Err(VmFault::Segv),
         _ => Access::Read,
     };
-    let mm = crate::mm::get_task_mm(crate::task::percpu::current_tid()).ok_or(VmFault::Segv)?;
+    let mm = crate::task::percpu::current().mm().ok_or(VmFault::Segv)?;
     crate::mm::fault::handle_mm_fault(&mm, addr, access)
 }
 

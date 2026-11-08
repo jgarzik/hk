@@ -1113,10 +1113,11 @@ TASKLIST), so current is never missing. Read lock-free through it:
 under TASKLIST) and the alloc_lock fields but `io_context` (Linux
 current->mm/files/fs/nsproxy/comm: only the task itself changes them,
 or its creator before it first runs, under its alloc_lock; other tasks
-read them under it). `get_task_fd`, `get_task_mm`, `get_task_fs`,
-`get_task_ns` and `has_pending_signals` take this lock-free path for
-the current task (fget, the page-fault mm lookup, path walks,
-`signal_pending`).
+read them under it). `get_task_fd`, `get_task_fs`, `get_task_ns` and
+`has_pending_signals` take this lock-free path for the current task
+(fget, path walks, `signal_pending`); the current task's mm users (the
+page-fault lookup, mm syscalls) call `current().mm()`, and
+`get_task_mm(&Task)` is for another task (under its alloc_lock).
 
 The context switch takes no TASKLIST: `make_current` reads the next
 task's kernel stack, address space and TLS from the task (it is not

@@ -13,8 +13,8 @@ use crate::fs::iov::{IoVec, import_iovec};
 use crate::fs::syscall::IOV_MAX;
 use crate::mm::MmRef;
 use crate::mm::remote::{access_remote_vm_read, access_remote_vm_write};
-use crate::task::percpu::current_tid;
-use crate::task::{Pid, Tid};
+use crate::task::percpu::current;
+use crate::task::{Pid, Task};
 use crate::uaccess::{UaccessArch, UserPtr, UserSlice, copy_from_user, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 
@@ -120,10 +120,9 @@ fn process_vm_rw_core(
     if remote.iter().all(|v| v.iov_len == 0) {
         return Ok(0);
     }
-    let target = crate::task::percpu::find_task_by_vpid(pid as Pid)
-        .map(|t| t.tid())
-        .ok_or(KernelError::NoProcess)?;
-    let mm = access_mm(target)?;
+    let target =
+        crate::task::percpu::find_task_by_vpid(pid as Pid).ok_or(KernelError::NoProcess)?;
+    let mm = access_mm(&target)?;
     let mut buf = crate::util::kmem::try_vec(PVM_CHUNK, 0u8)?;
     // The target's mmap_lock is held per remote access only, never
     // across a local user copy (which can fault and sleep, and takes
@@ -192,19 +191,16 @@ fn copy_step(mm: &MmRef, laddr: u64, raddr: u64, buf: &mut [u8], write: bool) ->
 /// -> mm_access, PTRACE_MODE_ATTACH_REALCREDS): its own address space
 /// (any thread of it, or a CLONE_VM sharer), else the ptrace rules with
 /// the real ids
-fn check_process_vm_permission(target_tid: Tid) -> bool {
-    let me = current_tid();
-    if target_tid == me {
+fn check_process_vm_permission(target: &Task) -> bool {
+    let me = current();
+    if me.is(target) {
         return true;
     }
-    let same_mm = match (
-        crate::mm::get_task_mm(target_tid),
-        crate::mm::get_task_mm(me),
-    ) {
+    let same_mm = match (crate::mm::get_task_mm(target), me.mm()) {
         (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(&a, &b),
         _ => false,
     };
-    same_mm || crate::task::ptrace::may_access(|t| t.task.tid() == target_tid, false)
+    same_mm || crate::task::ptrace::may_access(|t| core::ptr::eq(t.task, target), false)
 }
 
 /// The target's address space if the caller may access it (Linux
@@ -212,10 +208,10 @@ fn check_process_vm_permission(target_tid: Tid) -> bool {
 /// cannot swap in a new mm or dumpability in between. A user
 /// reference: it cannot be torn down while we access it (Linux
 /// get_task_mm)
-fn access_mm(target_tid: Tid) -> Result<MmRef, KernelError> {
-    let _g = crate::signal::ExecUpdateRead::lock(target_tid);
-    if !check_process_vm_permission(target_tid) {
+fn access_mm(target: &Task) -> Result<MmRef, KernelError> {
+    let _g = crate::signal::ExecUpdateRead::lock(target.tid());
+    if !check_process_vm_permission(target) {
         return Err(KernelError::NotPermitted);
     }
-    crate::mm::get_task_mm_users(target_tid).ok_or(KernelError::NoProcess)
+    crate::mm::get_task_mm_users(target).ok_or(KernelError::NoProcess)
 }

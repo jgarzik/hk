@@ -468,13 +468,17 @@ pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> K
                 return Err(KernelError::InvalidArgument);
             }
             // On the mm, shared by every thread (Linux set_dumpable)
-            let mm = crate::mm::get_task_mm(tid).ok_or(KernelError::NoProcess)?;
+            let mm = crate::task::percpu::current()
+                .mm()
+                .ok_or(KernelError::NoProcess)?;
             mm.set_dumpable(arg2 as u8);
             Ok(0)
         }
 
         PR_GET_DUMPABLE => {
-            let mm = crate::mm::get_task_mm(tid).ok_or(KernelError::NoProcess)?;
+            let mm = crate::task::percpu::current()
+                .mm()
+                .ok_or(KernelError::NoProcess)?;
             Ok(i64::from(mm.dumpable()))
         }
 

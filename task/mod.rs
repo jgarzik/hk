@@ -2631,15 +2631,6 @@ pub const IOPRIO_WHO_USER: i32 = 3;
 // task itself (arch_prctl, the switch-out save) or its creator, read at
 // switch-in.
 
-/// The TLS pointer of task `tid` (None if unset)
-pub fn get_task_tls(tid: Tid) -> Option<u64> {
-    let table = percpu::TASKLIST.read();
-    table
-        .get(tid)
-        .map(|t| t.task.tls.load(Ordering::Relaxed))
-        .filter(|&v| v != 0)
-}
-
 /// Set the TLS pointer of task `tid` (the task itself, or ptrace on a
 /// stopped tracee)
 pub fn set_task_tls(tid: Tid, tls: u64) {
