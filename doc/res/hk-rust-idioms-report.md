@@ -98,8 +98,7 @@ Order: 2 goes per subsystem (M1); let-else is done and linted
     `get_task_fd(current_tid())` + `.lock().get(fd)` pairs (13+12+6 different spellings).
   - (b) Drop the `access_ok` pre-checks that come right before
     `put_user`/`copy_*_user`, since those already check: 14 sites, 3 lines each.
-- **Converted** (KernelResult + UserPtr): time/, signal/ (the signal
-  core's send paths still return 0 or -errno as i32), ns/, keys/, tty/,
+- **Converted** (KernelResult + UserPtr): time/, signal/, ns/, keys/, tty/,
   seccomp/, bpf/, power.rs, arch rt_sigreturn; task/ clone, fork,
   exec, wait, ids, credentials, groups, capabilities, pgrp/session,
   prctl, scheduling, rlimits, rusage, times, sysinfo, syslog, getrandom,

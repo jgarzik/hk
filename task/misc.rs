@@ -1060,35 +1060,25 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> KernelResult<i32> {
 /// * -EBADF: Invalid file descriptor
 /// * -EINVAL: Invalid signal number or flags
 /// * -ESRCH: Process no longer exists
-pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64 {
+pub fn sys_pidfd_send_signal(
+    pidfd: i32,
+    sig: i32,
+    info: UserPtr<crate::signal::SigInfo>,
+    flags: u32,
+) -> KernelResult<()> {
     const SCOPES: u32 =
         PIDFD_SIGNAL_THREAD | PIDFD_SIGNAL_THREAD_GROUP | PIDFD_SIGNAL_PROCESS_GROUP;
     if flags & !SCOPES != 0 || flags.count_ones() > 1 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate signal number (0 is allowed as a null signal for checking permissions)
     if !(0..=64).contains(&sig) {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Get the file from FD table
-    let current_tid = super::percpu::current_tid();
-    let Some(fd_table) = super::fdtable::get_task_fd(current_tid) else {
-        return KernelError::NoProcess.sysret();
-    };
-
-    let file = {
-        let table = fd_table.lock();
-        match table.get(pidfd) {
-            Some(file) => file,
-            None => return KernelError::BadFd.sysret(),
-        }
-    };
-
-    let Some(pidfd) = crate::task::pidfd::get_pidfd(&file) else {
-        return KernelError::BadFd.sysret();
-    };
+    let file = crate::fs::io::fget(pidfd)?;
+    let pidfd = crate::task::pidfd::get_pidfd(&file).ok_or(KernelError::BadFd)?;
     // The scope (Linux do_pidfd_send_signal's pid_type)
     let scope = match flags {
         PIDFD_SIGNAL_THREAD => Scope::Thread,
@@ -1097,17 +1087,14 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64
         _ if pidfd.thread() => Scope::Thread,
         _ => Scope::Process,
     };
-    let info = match pidfd_info(info, sig as u32, pidfd.pid(), scope) {
-        Ok(i) => i,
-        Err(e) => return e.sysret(),
-    };
+    let info = pidfd_info(info, sig as u32, pidfd.pid(), scope)?;
     // Permission check and send to the pidfd's struct pid itself (Linux
     // kill_pid_info_type, kill_pgrp_info), so a released task's reused
     // number never gets it. Signal 0 is a permission/existence probe.
     let me = crate::signal::syscall::Sender::current();
     let check = |t: &super::percpu::TaskView<'_>| me.may_kill(t, sig as u32);
     let (sig, pid) = (sig as u32, pidfd.pid_ref());
-    let r = match scope {
+    match scope {
         Scope::Thread => {
             crate::signal::kill_pid_info_type(pid, sig, info, crate::signal::PidType::Pid, check)
         }
@@ -1115,8 +1102,7 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64
             crate::signal::kill_pid_info_type(pid, sig, info, crate::signal::PidType::Tgid, check)
         }
         Scope::Pgrp => crate::signal::kill_pgrp_info(pid, sig, info, check),
-    };
-    i64::from(r)
+    }
 }
 
 /// pidfd_send_signal's scope flags (include/uapi/linux/pidfd.h)
@@ -1138,13 +1124,13 @@ enum Scope {
 /// for `sig` (EINVAL), with a code reserved to the kernel only to the
 /// caller's own thread or process (EPERM)
 fn pidfd_info(
-    uinfo: u64,
+    uinfo: UserPtr<crate::signal::SigInfo>,
     sig: u32,
     pid: u64,
     scope: Scope,
-) -> Result<crate::signal::SendInfo, KernelError> {
+) -> KernelResult<crate::signal::SendInfo> {
     use crate::signal::{SendInfo, SigInfo, si_code};
-    if uinfo == 0 {
+    if uinfo.is_null() {
         if scope != Scope::Thread {
             return Ok(SendInfo::User);
         }
@@ -1157,7 +1143,7 @@ fn pidfd_info(
             uid,
         )));
     }
-    let info = SigInfo::copy_from_user(uinfo)?;
+    let info = SigInfo::copy_from_user(uinfo.addr())?;
     if info.sig() != sig {
         return Err(KernelError::InvalidArgument);
     }

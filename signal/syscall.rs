@@ -203,14 +203,12 @@ pub fn sys_rt_sigpending(set: UserPtr<u64>, sigsetsize: u64) -> KernelResult<()>
 /// * `sig` - Signal number (SIGCONT has special handling)
 ///
 /// # Returns
-/// 0 if permitted, -1 (EPERM) if denied, -3 (ESRCH) if target not found
-fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
+/// EPERM if denied, ESRCH if target not found
+fn check_kill_permission(target_pid: u64, sig: u32) -> KernelResult<()> {
     let me = Sender::current();
     let table = crate::task::percpu::TASKLIST.read();
-    match table.get(target_pid) {
-        Some(t) => me.may_kill(&t, sig),
-        None => KernelError::NoProcess.to_errno_neg(), // no such process
-    }
+    let t = table.get(target_pid).ok_or(KernelError::NoProcess)?;
+    me.may_kill(&t, sig)
 }
 
 /// What the kill permission check needs of the caller, read before
@@ -234,21 +232,25 @@ impl Sender {
     /// thread group, CAP_KILL, a real or effective uid matching the
     /// target's real or saved one, or SIGCONT within the session; else
     /// EPERM
-    pub(crate) fn may_kill(&self, t: &crate::task::percpu::TaskView<'_>, sig: u32) -> i32 {
+    pub(crate) fn may_kill(
+        &self,
+        t: &crate::task::percpu::TaskView<'_>,
+        sig: u32,
+    ) -> KernelResult<()> {
         use crate::signal::SIGCONT;
         use crate::task::{CAP_KILL, capable};
         if self.tgid == t.task.pid || capable(CAP_KILL) {
-            return 0;
+            return Ok(());
         }
         let c = &self.cred;
         let tc = t.cred_arc();
         if c.euid == tc.suid || c.euid == tc.uid || c.uid == tc.suid || c.uid == tc.uid {
-            return 0;
+            return Ok(());
         }
         if sig == SIGCONT && self.sid == t.task.sid() {
-            return 0;
+            return Ok(());
         }
-        KernelError::NotPermitted.to_errno_neg()
+        Err(KernelError::NotPermitted)
     }
 }
 
@@ -256,16 +258,8 @@ impl Sender {
 /// the send (Linux group_send_sig_info). Every user-facing path goes
 /// through this or [`user_thread_send`], so none can forget the check.
 fn user_group_send(pid: u64, sig: u32, info: SendInfo) -> KernelResult<()> {
-    sent(check_kill_permission(pid, sig))?;
-    sent(kill_proc_info(pid, sig, info))
-}
-
-/// A send's 0 or -errno (the signal core's convention) as a result
-fn sent(r: i32) -> KernelResult<()> {
-    match r {
-        0 => Ok(()),
-        e => Err(KernelError::from_errno(-e).unwrap_or(KernelError::InvalidArgument)),
-    }
+    check_kill_permission(pid, sig)?;
+    kill_proc_info(pid, sig, info)
 }
 
 /// A user signal to one thread `tid`, which must be in group `tgid`
@@ -291,8 +285,8 @@ fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32, info: SendInfo) -> Ke
             return Err(KernelError::NoProcess);
         }
     }
-    sent(check_kill_permission(tid, sig))?;
-    sent(send_sig_info(tid, sig, info))
+    check_kill_permission(tid, sig)?;
+    send_sig_info(tid, sig, info)
 }
 
 /// What tkill and tgkill send: SI_TKILL from the caller's process and
@@ -316,16 +310,11 @@ pub fn sys_kill(pid: i64, sig: u32) -> KernelResult<()> {
     match pid {
         1.. => user_group_send(vpid(pid as u64)?, sig, SendInfo::User),
         // Every process in the caller's process group, once each
-        0 => sent(kill_pgrp(current_pgid(), sig, SendInfo::User, check)),
+        0 => kill_pgrp(current_pgid(), sig, SendInfo::User, check),
         -1 => kill_all(sig),
         // Every process in group -pid, once each (signal 0: does the
         // group exist, may we signal it)
-        _ => sent(kill_pgrp(
-            vpid(pid.unsigned_abs())?,
-            sig,
-            SendInfo::User,
-            check,
-        )),
+        _ => kill_pgrp(vpid(pid.unsigned_abs())?, sig, SendInfo::User, check),
     }
 }
 
@@ -346,15 +335,15 @@ fn kill_all(sig: u32) -> KernelResult<()> {
             continue;
         }
         match check_kill_permission(target_pid, sig) {
-            0 => {
+            Ok(()) => {
                 matched = true;
                 // Signal 0 is a validity check, don't actually send
                 if sig != 0 {
-                    kill_proc_info(target_pid, sig, SendInfo::User);
+                    let _ = kill_proc_info(target_pid, sig, SendInfo::User);
                 }
             }
             // Permission denied, but it exists
-            e if e == KernelError::NotPermitted.to_errno_neg() => matched = true,
+            Err(KernelError::NotPermitted) => matched = true,
             _ => {} // ESRCH: gone between listing and now
         }
     }

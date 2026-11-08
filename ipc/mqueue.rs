@@ -389,7 +389,7 @@ impl MqQueue {
             if n.sigev_notify == SIGEV_SIGNAL && live && sig != 0 {
                 let info = mesgq_info(sig, n.sigev_value, &n.owner);
                 // To the registrant's struct pid, never its number
-                crate::signal::kill_pid_info(&n.owner, sig, info, |_| 0);
+                let _ = crate::signal::kill_pid_info(&n.owner, sig, info, |_| Ok(()));
             }
         }
     }

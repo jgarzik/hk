@@ -818,7 +818,7 @@ impl Inode {
         let limit = rlimit(RLIMIT_FSIZE);
         if limit != RLIM_INFINITY {
             if pos >= limit {
-                crate::signal::send_signal(
+                let _ = crate::signal::send_signal(
                     crate::task::percpu::current_tid(),
                     crate::signal::SIGXFSZ,
                 );
@@ -843,7 +843,7 @@ impl Inode {
             // file (EFBIG, no signal), in Linux inode_newsize_ok's order
             let limit = rlimit(RLIMIT_FSIZE);
             if limit != RLIM_INFINITY && size > limit {
-                crate::signal::send_signal(
+                let _ = crate::signal::send_signal(
                     crate::task::percpu::current_tid(),
                     crate::signal::SIGXFSZ,
                 );

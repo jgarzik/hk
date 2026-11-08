@@ -25,7 +25,7 @@ pub mod syscall;
 pub use pending::{SigPending, SigQueue};
 
 use crate::sync::spin::Mutex;
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -1246,14 +1246,14 @@ impl SendInfo {
 /// return -ERESTART*/-EINTR and the signal is delivered on the way out.
 /// Process context only (takes TASKLIST).
 ///
-/// Returns 0 on success, negative errno on error.
-pub fn send_signal(tid: Tid, sig: u32) -> i32 {
+/// ESRCH, EINVAL, or EAGAIN as [`send_sig_info`].
+pub fn send_signal(tid: Tid, sig: u32) -> KernelResult<()> {
     send_sig_info(tid, sig, SendInfo::User)
 }
 
-/// Send `sig` with `info` to thread `tid` (Linux send_sig_info): 0,
+/// Send `sig` with `info` to thread `tid` (Linux send_sig_info):
 /// ESRCH, EINVAL, or EAGAIN when an RT signal's info cannot be queued
-pub fn send_sig_info(tid: Tid, sig: u32, info: SendInfo) -> i32 {
+pub fn send_sig_info(tid: Tid, sig: u32, info: SendInfo) -> KernelResult<()> {
     send_signal_force(tid, sig, info, PidType::Pid, false)
 }
 
@@ -1329,7 +1329,13 @@ enum Sent {
 }
 
 /// send_sig_info by number
-fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, ty: PidType, force: bool) -> i32 {
+fn send_signal_force(
+    tid: Tid,
+    sig: u32,
+    info: SendInfo,
+    ty: PidType,
+    force: bool,
+) -> KernelResult<()> {
     let me = crate::task::percpu::current();
     let t = if me.tid() == tid && tid != 0 {
         Some(crate::task::percpu::task_ref(&me))
@@ -1338,7 +1344,7 @@ fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, ty: PidType, force: boo
     };
     match t {
         Some(t) => send_task(&t, sig, info, ty, force),
-        None => KernelError::NoProcess.to_errno_neg(),
+        None => Err(KernelError::NoProcess),
     }
 }
 
@@ -1346,22 +1352,22 @@ fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, ty: PidType, force: boo
 /// group (Linux send_signal_locked, complete_signal); `force` (a
 /// kernel-forced signal, Linux force_sig) is delivered to a namespace
 /// init even with its action SIG_DFL
-fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) -> i32 {
+fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) -> KernelResult<()> {
     check_send_context();
     if sig > 64 {
-        return KernelError::InvalidArgument.to_errno_neg();
+        return Err(KernelError::InvalidArgument);
     }
     // Kernel threads ignore every signal (Linux ignore_signals in
     // kthreadd): they are processes now (pid == tid), reachable by
     // kill(-1) and kill(pid). One lookup also finds the global init.
     let Some(tg) = target(t) else {
-        return KernelError::NoProcess.to_errno_neg();
+        return Err(KernelError::NoProcess);
     };
     // Signal 0 only checks the task is there; a dying group takes no
     // more signals (Linux prepare_signal: SIGNAL_GROUP_EXIT; its threads
     // have SIGKILL)
     if sig == 0 || tg.kthread || tg.group_exit {
-        return 0;
+        return Ok(());
     }
     // A forced signal whose action is SIG_DFL (a blocked or ignored one
     // was reset by the caller) lifts a namespace init's protection
@@ -1394,7 +1400,7 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
     // prepare_signal and legacy_queue come before __sigqueue_alloc);
     // send_locked decides again under the lock
     if sig != SIGKILL && drops(t, &t.sig.lock(), sighand, &to) {
-        return 0;
+        return Ok(());
     }
 
     // The info's entry, made before the receiver's lock is taken; SIGKILL
@@ -1414,8 +1420,8 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
     drop(q);
 
     let wants = match sent {
-        Sent::Dropped => return 0,
-        Sent::Overflow => return KernelError::WouldBlock.to_errno_neg(),
+        Sent::Dropped => return Ok(()),
+        Sent::Overflow => return Err(KernelError::WouldBlock),
         Sent::Queued(w) => w,
     };
     // Signalfd readers of the target's handler table recheck (Linux
@@ -1424,7 +1430,7 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
         h.signalfd_wq.wake_all();
     }
     complete_signal(t, sig, ty, wants, sighand, to.init);
-    0
+    Ok(())
 }
 
 /// Signal `sig` with `info` to task `t` or its group (`ty`), queued
@@ -1745,19 +1751,19 @@ fn check_send_context() {
 ///
 /// It goes to the leader, or to a thread still running if the leader
 /// has exited (Linux complete_signal picks a thread that wants it).
-pub fn send_signal_to_process(pid: Pid, sig: u32) -> i32 {
+pub fn send_signal_to_process(pid: Pid, sig: u32) -> KernelResult<()> {
     kill_proc_info(pid, sig, SendInfo::User)
 }
 
 /// [`send_signal_to_process`] with `info` (Linux kill_proc_info)
-pub fn kill_proc_info(pid: Pid, sig: u32, info: SendInfo) -> i32 {
+pub fn kill_proc_info(pid: Pid, sig: u32, info: SendInfo) -> KernelResult<()> {
     let t = {
         let table = TASKLIST.read();
         group_task(&table, table.get(pid))
     };
     match t {
         Some(t) => send_task(&t, sig, info, PidType::Tgid, false),
-        None => KernelError::NoProcess.to_errno_neg(), // no such process
+        None => Err(KernelError::NoProcess), // no such process
     }
 }
 
@@ -1783,13 +1789,13 @@ pub fn group_task(
 
 /// `sig` with `info` to task `t`'s thread group (Linux
 /// group_send_sig_info, PIDTYPE_TGID, with no permission check)
-pub fn send_group_signal(t: &TaskRef, sig: u32, info: SendInfo) -> i32 {
+pub fn send_group_signal(t: &TaskRef, sig: u32, info: SendInfo) -> KernelResult<()> {
     send_task(t, sig, info, PidType::Tgid, false)
 }
 
 /// `sig` with `info` to task `t` alone (Linux do_send_sig_info,
 /// PIDTYPE_PID, with no permission check)
-pub fn send_thread_signal(t: &TaskRef, sig: u32, info: SendInfo) -> i32 {
+pub fn send_thread_signal(t: &TaskRef, sig: u32, info: SendInfo) -> KernelResult<()> {
     send_task(t, sig, info, PidType::Pid, false)
 }
 
@@ -1800,8 +1806,8 @@ pub fn kill_pid_info(
     pid: &crate::task::pid::Pid,
     sig: u32,
     info: SendInfo,
-    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> i32,
-) -> i32 {
+    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> KernelResult<()>,
+) -> KernelResult<()> {
     kill_pid_info_type(pid, sig, info, PidType::Tgid, check)
 }
 
@@ -1813,18 +1819,13 @@ pub fn kill_pid_info_type(
     sig: u32,
     info: SendInfo,
     ty: PidType,
-    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> i32,
-) -> i32 {
+    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> KernelResult<()>,
+) -> KernelResult<()> {
     let t = {
         let table = TASKLIST.read();
         let found = table.pid_tid(pid).and_then(|tid| table.get(tid));
-        let Some(v) = found else {
-            return KernelError::NoProcess.to_errno_neg();
-        };
-        let e = check(&v);
-        if e != 0 {
-            return e;
-        }
+        let v = found.ok_or(KernelError::NoProcess)?;
+        check(&v)?;
         match ty {
             PidType::Pid => table.task(v.task.tid()),
             PidType::Tgid => group_task(&table, Some(v)),
@@ -1832,7 +1833,7 @@ pub fn kill_pid_info_type(
     };
     match t {
         Some(t) => send_task(&t, sig, info, ty, false),
-        None => KernelError::NoProcess.to_errno_neg(),
+        None => Err(KernelError::NoProcess),
     }
 }
 
@@ -1845,22 +1846,22 @@ pub fn kill_pgrp_info(
     pg: &crate::task::pid::Pid,
     sig: u32,
     info: SendInfo,
-    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> i32,
-) -> i32 {
+    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> KernelResult<()>,
+) -> KernelResult<()> {
     let procs = crate::task::percpu::GlobalTaskTable::collect_pgrp(pg, |table, t| {
         Some((check(t), group_task(table, Some(*t))))
     });
-    let mut ret = -3; // ESRCH
+    let mut ret = Err(KernelError::NoProcess);
     let mut ok = false;
     for (e, t) in &procs {
-        ret = match t {
-            Some(t) if *e == 0 => send_task(t, sig, info, PidType::Tgid, false),
-            Some(_) => *e,
-            None => KernelError::NoProcess.to_errno_neg(),
+        ret = match (t, e) {
+            (Some(t), Ok(())) => send_task(t, sig, info, PidType::Tgid, false),
+            (Some(_), Err(e)) => Err(*e),
+            (None, _) => Err(KernelError::NoProcess),
         };
-        ok |= ret == 0;
+        ok |= ret.is_ok();
     }
-    if ok { 0 } else { ret }
+    if ok { Ok(()) } else { ret }
 }
 
 /// Send signal to all processes in a process group, from the kernel
@@ -1869,12 +1870,12 @@ pub fn kill_pgrp_info(
 /// This is used by TTY signal generation (SIGINT, SIGTSTP, etc.)
 /// when control characters are received.
 ///
-/// Returns 0 on success, negative errno on error.
-pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
+/// EINVAL for signal 0 or past 64, else as [`kill_pgrp`].
+pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> KernelResult<()> {
     if sig == 0 || sig > 64 {
-        return KernelError::InvalidArgument.to_errno_neg();
+        return Err(KernelError::InvalidArgument);
     }
-    kill_pgrp(pgid, sig, SendInfo::Kernel, |_| 0)
+    kill_pgrp(pgid, sig, SendInfo::Kernel, |_| Ok(()))
 }
 
 /// `sig` from the kernel to each process of the group `pg` names (Linux
@@ -1885,7 +1886,7 @@ pub fn kill_pgrp_pid(pg: &crate::task::pid::Pid, sig: u32) {
         group_task(table, Some(*t))
     });
     for t in &procs {
-        send_group_signal(t, sig, SendInfo::Kernel);
+        let _ = send_group_signal(t, sig, SendInfo::Kernel);
     }
 }
 
@@ -1893,17 +1894,22 @@ pub fn kill_pgrp_pid(pg: &crate::task::pid::Pid, sig: u32) {
 /// its leader on the group's list, the signal process-directed), after
 /// `check(pid)` allows it; signal 0 only checks. 0 if any process got
 /// it, else the last error (ESRCH for an empty group).
-pub fn kill_pgrp(pgid: Pid, sig: u32, info: SendInfo, check: impl Fn(Pid) -> i32) -> i32 {
-    let mut ret = -3; // ESRCH
+pub fn kill_pgrp(
+    pgid: Pid,
+    sig: u32,
+    info: SendInfo,
+    check: impl Fn(Pid) -> KernelResult<()>,
+) -> KernelResult<()> {
+    let mut ret = Err(KernelError::NoProcess);
     let mut ok = false;
     for pid in crate::task::percpu::pgrp_pids(pgid) {
         ret = match check(pid) {
-            0 if sig != 0 => kill_proc_info(pid, sig, info),
+            Ok(()) if sig != 0 => kill_proc_info(pid, sig, info),
             e => e,
         };
-        ok |= ret == 0;
+        ok |= ret.is_ok();
     }
-    if ok { 0 } else { ret }
+    if ok { Ok(()) } else { ret }
 }
 
 // =============================================================================
@@ -2696,7 +2702,7 @@ fn traced_signal(tid: Tid, info: SigInfo, action: SigAction) -> Option<(SigInfo,
     }
     let blocked = with_task_signal_state(tid, |state| state.blocked.contains(new)).unwrap_or(false);
     if blocked {
-        send_sig_info(tid, new, SendInfo::Info(info));
+        let _ = send_sig_info(tid, new, SendInfo::Info(info));
         return None;
     }
     let action = get_task_sighand(tid)?.get_action(new).unwrap_or_default();
@@ -2957,7 +2963,7 @@ fn force_send(tid: Tid, sig: u32, info: SendInfo) {
         }
         with_task_signal_state(tid, |s| s.blocked.remove(sig));
     }
-    send_signal_force(tid, sig, info, PidType::Pid, true);
+    let _ = send_signal_force(tid, sig, info, PidType::Pid, true);
 }
 
 /// Force delivery of SIGSEGV (for stack errors during signal setup)
@@ -2972,7 +2978,7 @@ pub fn force_sigsegv(tid: Tid) {
     with_task_signal_state(tid, |state| state.blocked.remove(SIGSEGV));
     // Send SIGSEGV to self, forced: it kills even a namespace init (Linux
     // force_sig_info_to_task clears SIGNAL_UNKILLABLE for SIG_DFL)
-    send_signal_force(tid, SIGSEGV, SendInfo::Kernel, PidType::Pid, true);
+    let _ = send_signal_force(tid, SIGSEGV, SendInfo::Kernel, PidType::Pid, true);
 }
 
 /// A synchronous fault in user mode (page fault, illegal instruction, ...)

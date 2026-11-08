@@ -844,10 +844,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::PidfdOpen => {
             crate::task::syscall::sys_pidfd_open(i64::from(a[0] as i32), a[1] as u32).ret() as u64
         }
-        Sys::PidfdSendSignal => {
-            crate::task::syscall::sys_pidfd_send_signal(a[0] as i32, a[1] as i32, a[2], a[3] as u32)
-                as u64
-        }
+        Sys::PidfdSendSignal => crate::task::syscall::sys_pidfd_send_signal(
+            a[0] as i32,
+            a[1] as i32,
+            UserPtr::new(a[2]),
+            a[3] as u32,
+        )
+        .ret() as u64,
         Sys::Pipe2 => crate::fs::syscall::sys_pipe2(UserPtr::new(a[0]), a[1] as u32).ret() as u64,
         Sys::PivotRoot => {
             crate::fs::syscall::sys_pivot_root(UserPtr::new(a[0]), UserPtr::new(a[1])).ret() as u64

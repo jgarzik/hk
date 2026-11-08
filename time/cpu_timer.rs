@@ -326,7 +326,7 @@ pub fn run() {
         match f {
             Fire::Timer(t) => t.queue_signal(),
             Fire::Process(s) => {
-                crate::signal::kill_proc_info(pid, s, crate::signal::SendInfo::Kernel);
+                let _ = crate::signal::kill_proc_info(pid, s, crate::signal::SendInfo::Kernel);
             }
             Fire::Wake(t) => t.wake_sleeper(),
         }

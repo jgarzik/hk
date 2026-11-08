@@ -35,7 +35,7 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> KernelRes
         let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_FSIZE);
         if limit != crate::task::rlimit::RLIM_INFINITY && length > limit {
             let tid = current_tid();
-            crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
+            let _ = crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
             return Err(KernelError::FileTooLarge);
         }
         if length > inode.maxbytes() {

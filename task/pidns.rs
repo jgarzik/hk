@@ -89,7 +89,7 @@ pub fn find_child_reaper(me: &TaskRef) {
 fn zap_pid_ns_processes(me: &TaskRef, ns: &PidNamespace) {
     crate::task::pid::disable_pid_allocation(ns);
     for t in ns_tasks(ns, me.pid) {
-        crate::signal::send_group_signal(
+        let _ = crate::signal::send_group_signal(
             &t,
             crate::signal::SIGKILL,
             crate::signal::SendInfo::Kernel,
@@ -131,7 +131,7 @@ pub fn reboot_pid_ns(cmd: u32) -> Option<crate::util::error::KernelError> {
         child_reaper(&table, ns)
     };
     if let Some(r) = reaper {
-        crate::signal::send_thread_signal(&r, SIGKILL, SendInfo::Kernel);
+        let _ = crate::signal::send_thread_signal(&r, SIGKILL, SendInfo::Kernel);
     }
     crate::task::proc::do_exit(0)
 }

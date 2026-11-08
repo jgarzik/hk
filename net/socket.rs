@@ -270,7 +270,7 @@ pub fn sock_sendmsg(
     let r = s.sendmsg(m, flags);
     if r == Err(KernelError::BrokenPipe) && flags & MSG_NOSIGNAL == 0 && s.sigpipe() {
         let tid = crate::task::percpu::current_tid();
-        crate::signal::send_signal(tid, crate::signal::SIGPIPE);
+        let _ = crate::signal::send_signal(tid, crate::signal::SIGPIPE);
     }
     r
 }

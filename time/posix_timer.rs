@@ -566,7 +566,7 @@ impl PosixTimer {
             // Linux it_real_fn: SEND_SIG_PRIV to the process
             let info = crate::signal::SendInfo::Kernel;
             if let Some(pid) = &self.target {
-                crate::signal::kill_pid_info(pid, SIGALRM, info, |_| 0);
+                let _ = crate::signal::kill_pid_info(pid, SIGALRM, info, |_| Ok(()));
             }
         } else if self.signals() {
             self.queue_signal();

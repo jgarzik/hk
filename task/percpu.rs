@@ -2767,7 +2767,7 @@ fn forget_original_parent() {
             Some((table.task(t.task.tid())?, t.pdeath_signal as u32))
         });
         for (t, sig) in deaths {
-            crate::signal::send_group_signal(&t, sig, crate::signal::SendInfo::User);
+            let _ = crate::signal::send_group_signal(&t, sig, crate::signal::SendInfo::User);
         }
     }
 }

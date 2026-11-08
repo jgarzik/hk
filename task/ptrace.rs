@@ -338,7 +338,7 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
 
     // Send SIGSTOP to the target to stop it (Linux ptrace_attach:
     // SEND_SIG_PRIV)
-    signal::send_sig_info(target_tid, SIGSTOP, signal::SendInfo::Kernel);
+    let _ = signal::send_sig_info(target_tid, SIGSTOP, signal::SendInfo::Kernel);
 
     Ok(0)
 }
@@ -516,7 +516,7 @@ fn ptrace_kill(target_pid: Pid) -> KernelResult<i64> {
     }
 
     // Send SIGKILL
-    signal::send_signal(target_tid, SIGKILL);
+    let _ = signal::send_signal(target_tid, SIGKILL);
 
     Ok(0)
 }
@@ -871,7 +871,7 @@ pub fn ptrace_report_syscall(entry: bool) {
     // Linux send_sig(exit_code, current, 1): SEND_SIG_PRIV
     let (sig, _) = ptrace_stop(code, Some(info));
     if sig != 0 {
-        signal::send_sig_info(tid, sig, signal::SendInfo::Kernel);
+        let _ = signal::send_sig_info(tid, sig, signal::SendInfo::Kernel);
     }
 }
 

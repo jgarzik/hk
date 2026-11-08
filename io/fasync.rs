@@ -422,11 +422,11 @@ fn sigio_to_task(o: &Owner, t: &TaskRef, fd: i32, reason: i32) {
             band: band(reason),
             fd,
         };
-        if send(sig, SendInfo::Info(SigInfo::new(sig, code, fields))) == 0 {
+        if send(sig, SendInfo::Info(SigInfo::new(sig, code, fields))).is_ok() {
             return;
         }
     }
-    send(SIGIO, SendInfo::Kernel);
+    let _ = send(SIGIO, SendInfo::Kernel);
 }
 
 /// Linux send_sigio: to the owner's thread or process, or once to each
