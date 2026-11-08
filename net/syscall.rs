@@ -38,15 +38,10 @@ fn nofile() -> u64 {
     }
 }
 
-/// Install `file` in a new descriptor (EMFILE at the limit)
+/// Install `file` in a new descriptor, close-on-exec if `cloexec`
 pub fn fd_install(file: Arc<File>, cloexec: bool) -> KernelResult<i32> {
-    let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
-        .ok_or(KernelError::BadFd)?;
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
-    table
-        .lock()
-        .alloc_with_flags(file, fl, nofile())
-        .map_err(|_| KernelError::ProcessFileLimit)
+    crate::fs::io::fd_install(file, fl)
 }
 
 /// SOCK_NONBLOCK / SOCK_CLOEXEC of a type or accept4 flags argument
