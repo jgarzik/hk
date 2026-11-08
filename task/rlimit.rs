@@ -18,8 +18,8 @@
 //! - prlimit64 can modify another process's rlimits
 
 use crate::signal::get_task_signal_struct;
-use crate::task::Tid;
-use crate::task::percpu::{current_cred, current_tid};
+use crate::task::Task;
+use crate::task::percpu::{current, current_cred};
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
 
@@ -159,30 +159,24 @@ pub fn init_rlimits() -> [RLimit; RLIM_NLIMITS] {
 // Task Accessor Functions
 // =============================================================================
 
-/// Get a task's resource limit
+/// Task `t`'s resource limit
 ///
 /// Returns the RLimit for the specified resource, or None if the task
-/// or resource doesn't exist.
-pub fn get_task_rlimit(tid: Tid, resource: u32) -> Option<RLimit> {
-    let signal = get_task_signal_struct(tid)?;
+/// is reaped or the resource doesn't exist.
+pub fn get_task_rlimit(t: &Task, resource: u32) -> Option<RLimit> {
+    let signal = get_task_signal_struct(t)?;
     signal.get_rlimit(resource)
 }
 
-/// Set a task's resource limit (`SignalStruct::set_rlimit`: EINVAL,
-/// EPERM for an unprivileged raise of the hard limit); the limit it
-/// replaced, read in the same hold as the store
-pub fn set_task_rlimit(tid: Tid, resource: u32, new: RLimit) -> KernelResult<RLimit> {
-    let signal = get_task_signal_struct(tid).ok_or(KernelError::NoProcess)?;
+/// Set task `t`'s resource limit (`SignalStruct::set_rlimit`: EINVAL,
+/// EPERM for an unprivileged raise of the hard limit; ESRCH once it is
+/// reaped); the limit it replaced, read in the same hold as the store
+pub fn set_task_rlimit(t: &Task, resource: u32, new: RLimit) -> KernelResult<RLimit> {
+    let signal = get_task_signal_struct(t).ok_or(KernelError::NoProcess)?;
     let old = signal.set_rlimit(resource, new)?;
     // A finite CPU limit is watched from now (Linux update_rlimit_cpu)
     if resource == RLIMIT_CPU {
-        let pid = crate::task::percpu::TASKLIST
-            .read()
-            .get(tid)
-            .map(|t| t.task.pid);
-        if let Some(pid) = pid {
-            crate::time::cpu_timer::rlimit_cpu_changed(&signal, pid);
-        }
+        crate::time::cpu_timer::rlimit_cpu_changed(&signal, t.pid);
     }
     Ok(old)
 }
@@ -191,8 +185,7 @@ pub fn set_task_rlimit(tid: Tid, resource: u32, new: RLimit) -> KernelResult<RLi
 ///
 /// Returns RLIM_INFINITY if the task or resource doesn't exist.
 pub fn rlimit(resource: u32) -> u64 {
-    let tid = current_tid();
-    get_task_rlimit(tid, resource)
+    get_task_rlimit(&current(), resource)
         .map(|r| r.rlim_cur)
         .unwrap_or(RLIM_INFINITY)
 }
@@ -216,7 +209,7 @@ pub fn sys_getrlimit(resource: u32, rlim_ptr: UserPtr<RLimit>) -> KernelResult<(
         return Err(KernelError::BadAddress);
     }
     // (None shouldn't happen for the current task)
-    let rlim = get_task_rlimit(current_tid(), resource).ok_or(KernelError::NoProcess)?;
+    let rlim = get_task_rlimit(&current(), resource).ok_or(KernelError::NoProcess)?;
     Ok(rlim_ptr.write(&rlim)?)
 }
 
@@ -234,7 +227,7 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: UserPtr<RLimit>) -> KernelResult<(
         return Err(KernelError::InvalidArgument);
     }
     check(resource, &new_rlim)?;
-    set_task_rlimit(current_tid(), resource, new_rlim)?;
+    set_task_rlimit(&current(), resource, new_rlim)?;
     Ok(())
 }
 
@@ -277,14 +270,12 @@ pub fn sys_prlimit64(
     } else {
         Some(new_rlim_ptr.read()?)
     };
-    let target_tid = if pid == 0 {
-        current_tid()
+    let target = if pid == 0 {
+        crate::task::percpu::task_ref(&current())
     } else {
-        crate::task::percpu::find_task_by_vpid(pid as u64)
-            .map(|t| t.tid())
-            .ok_or(KernelError::NoProcess)?
+        crate::task::percpu::find_task_by_vpid(pid as u64).ok_or(KernelError::NoProcess)?
     };
-    check_prlimit_permission(target_tid)?;
+    check_prlimit_permission(&target)?;
     if resource as usize >= RLIM_NLIMITS {
         return Err(KernelError::InvalidArgument);
     }
@@ -294,8 +285,8 @@ pub fn sys_prlimit64(
     // The old value is the one replaced (Linux do_prlimit reads it
     // under the same task_lock as the store)
     let old = match new {
-        Some(new) => set_task_rlimit(target_tid, resource, new)?,
-        None => get_task_rlimit(target_tid, resource).ok_or(KernelError::NoProcess)?,
+        Some(new) => set_task_rlimit(&target, resource, new)?,
+        None => get_task_rlimit(&target, resource).ok_or(KernelError::NoProcess)?,
     };
     if !old_rlim_ptr.is_null() {
         old_rlim_ptr.write(&old)?;
@@ -306,14 +297,14 @@ pub fn sys_prlimit64(
 /// Linux check_prlimit_permission: the caller itself, a task whose real,
 /// effective and saved ids all equal the caller's real ones, or
 /// CAP_SYS_RESOURCE; else EPERM
-fn check_prlimit_permission(target: crate::task::Tid) -> KernelResult<()> {
-    if target == current_tid() {
+fn check_prlimit_permission(target: &Task) -> KernelResult<()> {
+    if current().is(target) {
         return Ok(());
     }
     let me = current_cred();
     let t = crate::task::percpu::TASKLIST
         .read()
-        .get(target)
+        .view(target)
         .map(|t| t.cred())
         .ok_or(KernelError::NoProcess)?;
     let id_match = [t.uid, t.euid, t.suid].iter().all(|&u| u == me.uid)

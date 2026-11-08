@@ -759,6 +759,21 @@ impl GlobalTaskTable {
         me.lookup(tid).map(|t| unsafe { view_mut(me, t) })
     }
 
+    /// Task `t`, None once it is reaped (never a task reusing its tid)
+    pub fn view<'a>(&'a self, t: &'a Task) -> Option<TaskView<'a>> {
+        // `tasks_link` is on this list only, linked and unlinked under
+        // the write lock (`insert`, `remove_task`): read under the lock
+        // the borrow of `self` holds
+        t.tasks_link.is_linked().then(|| view(self, t))
+    }
+
+    /// Task `t`, writable; None once it is reaped
+    pub fn view_mut<'a>(&'a mut self, t: &'a Task) -> Option<TaskViewMut<'a>> {
+        let me = &*self;
+        // SAFETY: `me` comes from `&mut self`; one view is handed out
+        t.tasks_link.is_linked().then(|| unsafe { view_mut(me, t) })
+    }
+
     /// A reference to task `tid`
     pub fn task(&self, tid: Tid) -> Option<TaskRef> {
         self.lookup(tid).map(task_ref)
@@ -1633,7 +1648,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, &'static str>
     crate::ns::init_task_ns(&task, crate::ns::INIT_NSPROXY.clone());
 
     // Initialize signal handlers for the init task
-    crate::signal::init_task_signal(tid, arc_nofail(crate::signal::SigHand::new()));
+    crate::signal::init_task_signal(&task, arc_nofail(crate::signal::SigHand::new()));
 
     printkln!("USER_TASK_CREATED: pid={} tid={}", pid, tid);
     Ok(task)
@@ -2250,7 +2265,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // A pid namespace's init cannot make a sibling (Linux
     // copy_process: CLONE_PARENT with SIGNAL_UNKILLABLE)
     if config.flags & CLONE_PARENT != 0
-        && crate::signal::get_task_signal_struct(current_tid).is_some_and(|s| s.unkillable())
+        && crate::signal::get_task_signal_struct(&me).is_some_and(|s| s.unkillable())
     {
         return Err(KernelError::InvalidArgument);
     }
@@ -2298,7 +2313,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let child_cred = crate::task::copy_creds(config.flags, &parent_cred)?;
     let child_files = crate::task::fdtable::fork_task_fd(&me, config.flags & CLONE_FILES != 0)?;
     let (child_sig, child_signal) = crate::signal::fork_signal(
-        current_tid,
+        &me,
         config.flags & CLONE_SIGHAND != 0,
         config.flags & CLONE_THREAD != 0,
         config.flags & CLONE_CLEAR_SIGHAND != 0,
@@ -2562,9 +2577,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Otherwise, child gets a deep copy of handlers
     // If CLONE_CLEAR_SIGHAND is set, handlers are reset to default (except SIG_IGN)
     // CLONE_THREAD also implies sharing shared_pending
-    crate::signal::install_fork_signal(child_tid, child_signal);
+    crate::signal::install_fork_signal(&child_task, child_signal);
     if config.flags & CLONE_THREAD != 0 {
-        crate::signal::zap_new_thread(current_tid, child_tid);
+        crate::signal::zap_new_thread(&me, &child_task);
     }
 
     // Handle I/O context (CLONE_IO)
@@ -3180,8 +3195,8 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // Exactly one thread, the one taking the group's live count to
         // zero, does the group-level exit work (Linux do_exit:
         // group_dead = atomic_dec_and_test(&signal->live))
-        let group_dead =
-            crate::signal::get_task_signal_struct(tid).is_none_or(|s| s.thread_exiting(status));
+        let group_dead = crate::signal::get_task_signal_struct(&current())
+            .is_none_or(|s| s.thread_exiting(status));
 
         // Nothing reaps orphans or keeps userspace going without the
         // global init: its death is fatal, and loud (Linux do_exit:
@@ -3239,11 +3254,11 @@ pub fn exit_current(status: Option<i32>) -> ! {
         crate::ns::exit_task_ns(&current());
 
         // Clean up seccomp state for exiting task
-        crate::seccomp::exit_seccomp(tid);
+        crate::seccomp::exit_seccomp(&current());
 
         // The group's last thread deletes its timers (Linux exit_itimers
         // when group_dead)
-        if group_dead && let Some(sig) = crate::signal::get_task_signal_struct(tid) {
+        if group_dead && let Some(sig) = crate::signal::get_task_signal_struct(&current()) {
             crate::time::posix_timer::exit_itimers(&sig);
         }
 
@@ -3274,7 +3289,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // with: whether the process ignores SIGCHLD decides the fate of
         // a zombie tracee of its own (Linux keeps sighand until
         // __exit_signal, in release_task)
-        crate::signal::exit_task_signal(tid);
+        crate::signal::exit_task_signal(&current());
         // Out of its cgroup while still running, before it is a zombie
         // a waiting parent may reap at once (Linux do_exit: cgroup_exit
         // before exit_notify); TASKLIST is not held

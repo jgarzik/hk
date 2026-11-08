@@ -269,8 +269,7 @@ pub fn sock_sendmsg(
 ) -> Result<usize, KernelError> {
     let r = s.sendmsg(m, flags);
     if r == Err(KernelError::BrokenPipe) && flags & MSG_NOSIGNAL == 0 && s.sigpipe() {
-        let tid = crate::task::percpu::current_tid();
-        let _ = crate::signal::send_signal(tid, crate::signal::SIGPIPE);
+        let _ = crate::signal::send_signal(&crate::task::percpu::current(), crate::signal::SIGPIPE);
     }
     r
 }

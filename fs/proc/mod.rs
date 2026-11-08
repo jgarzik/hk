@@ -1178,7 +1178,7 @@ fn mm_access(t: &TaskRef) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
     // The check and the mm it covers under the process's
     // exec_update_lock: no exec of it switches mm or dumpability between;
     // check and mm both of that one pinned task
-    let _g = crate::signal::ExecUpdateRead::lock_task(t);
+    let _g = crate::signal::ExecUpdateRead::lock(t);
     if !crate::task::ptrace::may_read_ref(t) {
         return Err(KernelError::PermissionDenied);
     }

@@ -32,7 +32,7 @@ use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::signal::siginfo::Layout;
 use crate::signal::{SigFields, SigInfo, SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
-use crate::task::percpu::current_tid;
+use crate::task::percpu::current;
 use crate::util::pod::IntoBytes;
 
 /// Signalfd flags
@@ -161,7 +161,7 @@ impl Signalfd {
     /// Check if any monitored signals are pending
     fn has_pending_signals(&self) -> bool {
         let mask = self.inner.lock().mask;
-        with_task_signal_state(current_tid(), |state| {
+        with_task_signal_state(&current(), |state| {
             let shared = state.shared_pending.lock();
             let pending = state.pending.signal.union(&shared.signal);
             pending.intersect(&mask).any()
@@ -208,7 +208,7 @@ impl Signalfd {
             }
             // Wait on the caller's handler table for a matching signal
             // (a signal ends the wait)
-            let Some(sighand) = crate::signal::get_task_sighand(current_tid()) else {
+            let Some(sighand) = crate::signal::get_task_sighand(&current()) else {
                 return Err(KernelError::WouldBlock);
             };
             sighand
@@ -290,7 +290,7 @@ impl Signalfd {
         // stays registered on its queue (Linux instead detaches pollers
         // when it is freed, signalfd_cleanup)
         if let Some(poll_table) = pt
-            && let Some(sighand) = crate::signal::get_task_sighand(current_tid())
+            && let Some(sighand) = crate::signal::get_task_sighand(&current())
         {
             poll_table.hold(sighand.clone());
             poll_table.poll_wait(&sighand.signalfd_wq);

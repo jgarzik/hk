@@ -819,7 +819,7 @@ impl Inode {
         if limit != RLIM_INFINITY {
             if pos >= limit {
                 let _ = crate::signal::send_signal(
-                    crate::task::percpu::current_tid(),
+                    &crate::task::percpu::current(),
                     crate::signal::SIGXFSZ,
                 );
                 return Err(KernelError::FileTooLarge);
@@ -844,7 +844,7 @@ impl Inode {
             let limit = rlimit(RLIMIT_FSIZE);
             if limit != RLIM_INFINITY && size > limit {
                 let _ = crate::signal::send_signal(
-                    crate::task::percpu::current_tid(),
+                    &crate::task::percpu::current(),
                     crate::signal::SIGXFSZ,
                 );
                 return Err(KernelError::FileTooLarge);

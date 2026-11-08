@@ -122,15 +122,18 @@ fn set_one_prio(
     let Some(cur_nice) = super::percpu::lookup_task_nice(tid) else {
         return error;
     };
-    let target = super::percpu::TASKLIST.read().get(tid).map(|t| t.cred());
-    let Some(c) = target else {
+    let target = super::percpu::TASKLIST
+        .read()
+        .get(tid)
+        .map(|t| (t.cred(), super::percpu::task_ref(t.task)));
+    let Some((c, t)) = target else {
         return error;
     };
     if c.uid != caller_euid && c.euid != caller_euid && !capable(CAP_SYS_NICE) {
         return Err(KernelError::NotPermitted);
     }
     // Linux can_nice: 20 - nice within the target's RLIMIT_NICE
-    let rlim = crate::task::rlimit::get_task_rlimit(tid, crate::task::rlimit::RLIMIT_NICE)
+    let rlim = crate::task::rlimit::get_task_rlimit(&t, crate::task::rlimit::RLIMIT_NICE)
         .map_or(crate::task::rlimit::RLIM_INFINITY, |r| r.rlim_cur);
     let lower = niceval < cur_nice;
     if lower && (20 - niceval) as u64 > rlim && !capable(CAP_SYS_NICE) {
@@ -299,9 +302,10 @@ fn check_setscheduler(
             se.reset_on_fork(),
             i32::from(se.rt_priority()),
             se.nice(),
+            super::percpu::task_ref(t.task),
         )
     });
-    let Some((c, cur, cur_reset, cur_prio, nice)) = snap else {
+    let Some((c, cur, cur_reset, cur_prio, nice, t)) = snap else {
         return Err(KernelError::NoProcess);
     };
     if c.uid != euid && c.euid != euid {
@@ -311,7 +315,7 @@ fn check_setscheduler(
         return Err(KernelError::NotPermitted);
     }
     let limit = |r| {
-        crate::task::rlimit::get_task_rlimit(tid, r)
+        crate::task::rlimit::get_task_rlimit(&t, r)
             .map_or(0, |l: crate::task::rlimit::RLimit| l.rlim_cur)
     };
     if is_rt_policy(policy) {

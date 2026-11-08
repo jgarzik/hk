@@ -28,7 +28,7 @@ use crate::fs::file::File;
 use crate::ns::PidNamespace;
 use crate::sync::spin::Mutex;
 use crate::task::CAP_SYS_PACCT;
-use crate::task::{Task, Tid};
+use crate::task::Task;
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
 use crate::util::pod::IntoBytes;
@@ -222,7 +222,7 @@ fn set_acct_file(file: Option<Arc<File>>) {
 fn close(old: &File, ns: &PidNamespace) {
     let me = crate::task::percpu::current();
     let info = get_task_info(&me);
-    write_record(old, ns, me.tid(), &info, 0);
+    write_record(old, ns, &me, &info, 0);
 }
 
 /// Namespace `ns` is ending (its init is past the zap): its accounting
@@ -316,16 +316,16 @@ pub fn write_acct_record(exit_status: i32) {
         // Accounting on there? (the file is used with no lock held)
         if let Some(file) = n.bacct.get() {
             let i = info.get_or_insert_with(|| get_task_info(&me));
-            write_record(&file, n, me.tid(), i, exit_status);
+            write_record(&file, n, &me, i, exit_status);
         }
         ns = n.parent.as_deref();
     }
 }
 
-/// Write the record of the process of thread `tid` to `file`, the
+/// Write the record of the process of thread `t` to `file`, the
 /// accounting file of `ns`, which numbers it (Linux fill_ac: ac_pid
 /// and ac_ppid by task_tgid_nr_ns with acct->ns)
-fn write_record(file: &File, ns: &PidNamespace, tid: Tid, task_info: &TaskInfo, exit_status: i32) {
+fn write_record(file: &File, ns: &PidNamespace, t: &Task, task_info: &TaskInfo, exit_status: i32) {
     // Compute flags
     let mut ac_flag: u8 = 0;
 
@@ -376,7 +376,7 @@ fn write_record(file: &File, ns: &PidNamespace, tid: Tid, task_info: &TaskInfo, 
     // SIGXFSZ, no lost record): unlimited across the write (Linux
     // do_acct_process)
     use crate::task::rlimit::{RLIM_INFINITY, RLIMIT_FSIZE};
-    let sig = crate::signal::get_task_signal_struct(tid);
+    let sig = crate::signal::get_task_signal_struct(t);
     let old = sig
         .as_ref()
         .map(|s| s.swap_rlimit_cur(RLIMIT_FSIZE, RLIM_INFINITY));

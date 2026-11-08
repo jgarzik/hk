@@ -315,7 +315,11 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
 
     // Check permissions and attach under the target's cred_guard_mutex
     // (Linux ptrace_attach): no exec of it changes its dumpability between
-    let _guard = crate::signal::CredGuard::lock(target_tid)?;
+    let task = percpu::find_task(target_tid);
+    let _guard = task
+        .as_deref()
+        .map(crate::signal::CredGuard::lock)
+        .transpose()?;
     if !ptrace_may_access(target_tid) {
         return Err(KernelError::NotPermitted);
     }
@@ -338,7 +342,9 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
 
     // Send SIGSTOP to the target to stop it (Linux ptrace_attach:
     // SEND_SIG_PRIV)
-    let _ = signal::send_sig_info(target_tid, SIGSTOP, signal::SendInfo::Kernel);
+    if let Some(t) = &task {
+        let _ = signal::send_sig_info(t, SIGSTOP, signal::SendInfo::Kernel);
+    }
 
     Ok(0)
 }
@@ -365,7 +371,11 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> KernelResult<i64> {
 
     // Check permissions and attach under the target's cred_guard_mutex
     // (Linux ptrace_attach): no exec of it changes its dumpability between
-    let _guard = crate::signal::CredGuard::lock(target_tid)?;
+    let task = percpu::find_task(target_tid);
+    let _guard = task
+        .as_deref()
+        .map(crate::signal::CredGuard::lock)
+        .transpose()?;
     if !ptrace_may_access(target_tid) {
         return Err(KernelError::NotPermitted);
     }
@@ -516,7 +526,9 @@ fn ptrace_kill(target_pid: Pid) -> KernelResult<i64> {
     }
 
     // Send SIGKILL
-    let _ = signal::send_signal(target_tid, SIGKILL);
+    if let Some(t) = percpu::find_task(target_tid) {
+        let _ = signal::send_signal(&t, SIGKILL);
+    }
 
     Ok(0)
 }
@@ -673,18 +685,21 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> KernelResult<i64
     }
     let shared = flags & PTRACE_PEEKSIGINFO_SHARED != 0;
     let mut copied = 0i64;
+    let t = percpu::find_task(tid);
     for i in 0..u64::from(nr.unsigned_abs()) {
         let Some(n) = off.checked_add(i) else {
             break;
         };
-        let info = signal::with_task_signal_state(tid, |s| {
-            if shared {
-                s.shared_pending.lock().nth(n)
-            } else {
-                s.pending.nth(n)
-            }
-        })
-        .flatten();
+        let info = t.as_deref().and_then(|t| {
+            signal::with_task_signal_state(t, |s| {
+                if shared {
+                    s.shared_pending.lock().nth(n)
+                } else {
+                    s.pending.nth(n)
+                }
+            })
+            .flatten()
+        });
         let Some(info) = info else {
             break;
         };
@@ -788,7 +803,7 @@ pub fn ptrace_stop(
     // do_notify_parent_cldstop, CLD_TRAPPED)
     super::proc::CHILD_EXIT_WQ.wake_all();
     if let Some(tr) = tracer {
-        signal::notify::notify_tracer_trapped(tid, &tr, code);
+        signal::notify::notify_tracer_trapped(&percpu::current(), &tr, code);
     }
     loop {
         set_current_state(SleepState::Killable);
@@ -872,7 +887,7 @@ pub fn ptrace_report_syscall(entry: bool) {
     // Linux send_sig(exit_code, current, 1): SEND_SIG_PRIV
     let (sig, _) = ptrace_stop(code, Some(info));
     if sig != 0 {
-        let _ = signal::send_sig_info(tid, sig, signal::SendInfo::Kernel);
+        let _ = signal::send_sig_info(&percpu::current(), sig, signal::SendInfo::Kernel);
     }
 }
 

@@ -2,24 +2,24 @@
 //! do_notify_parent_cldstop in kernel/signal.c)
 
 use super::{SIGCHLD, SendInfo, SigFields, SigHandler, SigInfo, SigQueue, sa_flags};
-use crate::task::Tid;
 use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef};
+use crate::task::{Task, Tid};
 use alloc::boxed::Box;
 
-/// SIGCHLD info for child `tid` with `code` (CLD_*) and `status`: its
+/// SIGCHLD info for child `t` with `code` (CLD_*) and `status`: its
 /// pid, real uid and CPU time in clock ticks (Linux
 /// do_notify_parent_cldstop's fields). None once it is gone.
-fn chld_info(tid: Tid, code: i32, status: i32, ns: &crate::ns::PidNamespace) -> Option<SigInfo> {
+fn chld_info(t: &Task, code: i32, status: i32, ns: &crate::ns::PidNamespace) -> Option<SigInfo> {
     let (uid, (utime, stime)) = {
         let table = TASKLIST.read();
-        let t = table.get(tid)?;
+        let v = table.view(t)?;
         (
-            t.cred_arc().uid,
-            t.task.cputime(crate::time::monotonic_ns()),
+            v.cred_arc().uid,
+            v.task.cputime(crate::time::monotonic_ns()),
         )
     };
     let fields = SigFields::Chld {
-        pid: crate::task::pid::nr_ns(tid, ns) as i32,
+        pid: crate::task::pid::nr_ns(t.tid(), ns) as i32,
         uid,
         status,
         utime: crate::time::ns_to_clock_t(utime) as i64,
@@ -28,12 +28,12 @@ fn chld_info(tid: Tid, code: i32, status: i32, ns: &crate::ns::PidNamespace) -> 
     Some(SigInfo::new(SIGCHLD, code, fields))
 }
 
-/// The traced task `tid` stopped with `code` (its exit_code): SIGCHLD
+/// The traced task `t` stopped with `code` (its exit_code): SIGCHLD
 /// with CLD_TRAPPED to its `tracer`'s process, unless the tracer
 /// ignores SIGCHLD or set SA_NOCLDSTOP (Linux do_notify_parent_cldstop,
 /// for_ptracer)
-pub fn notify_tracer_trapped(tid: Tid, tracer: &TaskRef, code: u32) {
-    let quiet = super::get_task_sighand(tracer.tid())
+pub fn notify_tracer_trapped(t: &Task, tracer: &Task, code: u32) {
+    let quiet = super::get_task_sighand(tracer)
         .and_then(|h| h.get_action(SIGCHLD))
         .is_some_and(|a| a.handler == SigHandler::Ignore || a.flags & sa_flags::SA_NOCLDSTOP != 0);
     if quiet {
@@ -43,8 +43,8 @@ pub fn notify_tracer_trapped(tid: Tid, tracer: &TaskRef, code: u32) {
     // The tracee as its tracer's namespace numbers it (Linux
     // do_notify_parent_cldstop: task_pid_nr_ns(tsk, ns of parent))
     let ns = tracer.pid_ns();
-    if let Some(info) = chld_info(tid, super::si_code::CLD_TRAPPED, status, ns) {
-        let _ = super::kill_proc_info(tracer.pid, SIGCHLD, SendInfo::Info(info));
+    if let Some(info) = chld_info(t, super::si_code::CLD_TRAPPED, status, ns) {
+        let _ = super::group_send_sig_info(tracer, SIGCHLD, SendInfo::Info(info));
     }
 }
 
@@ -160,7 +160,7 @@ fn disposition(table: &GlobalTaskTable, to: &TaskRef, sig: u32) -> (u32, bool) {
         return (sig, false);
     }
     let action = table
-        .get(to.tid())
+        .view(to)
         .and_then(|v| v.sighand.as_ref().and_then(|h| h.get_action(SIGCHLD)));
     match action {
         Some(a) if a.handler == SigHandler::Ignore => (0, true),

@@ -966,19 +966,19 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
 /// arrives meanwhile (the caller then dies on its way out). Threads
 /// running user code end at their next syscall or fault (P7: IRQ
 /// return).
-fn de_thread(tid: crate::task::Tid) -> KernelResult<()> {
+fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
     use crate::sync::waitqueue::WaitEntry;
     use crate::task::percpu::{SleepState, schedule};
 
-    let tgid = percpu::current_pid();
-    let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
+    let (tgid, tid) = (me.pid, me.tid());
+    let Some(sig) = crate::signal::get_task_signal_struct(me) else {
         return Ok(());
     };
     if percpu::exec_waits(tgid, tid) {
-        if !sig.start_exec(tid) {
+        if !sig.start_exec(me) {
             return Err(KernelError::WouldBlock);
         }
-        crate::signal::zap_group_others(tgid, tid);
+        crate::signal::zap_group_others(me);
         let wq = &crate::task::proc::CHILD_EXIT_WQ;
         let w = core::pin::pin!(WaitEntry::new());
         let r = loop {
@@ -992,7 +992,7 @@ fn de_thread(tid: crate::task::Tid) -> KernelResult<()> {
             schedule();
         };
         wq.finish_wait(w.as_ref());
-        sig.end_exec(tid);
+        sig.end_exec(me);
         r?;
     }
     // Released after TASKLIST: the old leader and exited threads; a
@@ -1012,7 +1012,7 @@ fn de_thread(tid: crate::task::Tid) -> KernelResult<()> {
 /// already pending)
 fn exec_fatal() {
     if !crate::signal::fatal_signal_pending() {
-        crate::signal::force_sigsegv(percpu::current_tid());
+        crate::signal::force_sigsegv(&percpu::current());
     }
 }
 
@@ -1056,7 +1056,7 @@ where
     // the first credential check until the new image is in place, so
     // ptrace attach and mm_access never see the new mm with the old
     // dumpability or the reverse; dropped on every error return
-    let guard = crate::signal::CredGuard::lock(percpu::current_tid())?;
+    let guard = crate::signal::CredGuard::lock(&percpu::current())?;
     crate::task::nproc_exec_check()?;
     let pathname = &path[..];
     let file = open(pathname)?;
@@ -1204,15 +1204,13 @@ where
 
     let ident = exec_identity(pathname, &file);
 
-    let tid = percpu::current_tid();
-
     // The point of no return (Linux begin_new_exec sets
     // point_of_no_return before de_thread): from here a failure kills
     // the process instead of returning to the old image
 
     // The other threads end before the new image starts (Linux
     // begin_new_exec -> de_thread)
-    if let Err(e) = de_thread(tid) {
+    if let Err(e) = de_thread(&percpu::current()) {
         exec_fatal();
         return Err(e);
     }

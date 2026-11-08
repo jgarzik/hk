@@ -79,7 +79,9 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
     // TSYNC holds the group's cred_guard (Linux: killable) so no exec
     // changes the threads meanwhile
     let _guard = if tsync {
-        Some(crate::signal::CredGuard::lock(tid)?)
+        Some(crate::signal::CredGuard::lock(
+            &crate::task::percpu::current(),
+        )?)
     } else {
         None
     };

@@ -726,7 +726,7 @@ fn pipe_read_wait(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<u
 /// EPIPE's SIGPIPE to the writing thread
 pub fn sigpipe() {
     use crate::signal::{SIGPIPE, send_signal};
-    let _ = send_signal(crate::task::percpu::current_tid(), SIGPIPE);
+    let _ = send_signal(&crate::task::percpu::current(), SIGPIPE);
 }
 
 /// Linux pipe_write: a blocking writer stays until everything is

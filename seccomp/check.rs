@@ -120,7 +120,7 @@ pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
     }
     let filter = {
         let table = crate::task::percpu::TASKLIST.read();
-        table.get(me.tid())?.seccomp_filter.clone()
+        table.view(&me)?.seccomp_filter.clone()
     };
     match check_syscall(mode, filter.as_ref(), nr, regs.ip(), regs.syscall_args()) {
         Verdict::Allow => None,
@@ -129,7 +129,7 @@ pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
             // The handler sees the registers as at entry (Linux
             // syscall_rollback), and the syscall returns what they hold
             regs.syscall_rollback();
-            force_sigsys(me.tid(), regs, nr, data);
+            force_sigsys(&me, regs, nr, data);
             Some(regs.ret())
         }
         Verdict::KillThread => kill(crate::signal::SIGSYS, true),
@@ -143,7 +143,7 @@ pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
 /// SIGSYS for syscall `nr` a filter trapped with `data` (Linux
 /// force_sig_seccomp): SYS_SECCOMP, the data in si_errno, the calling
 /// instruction, the syscall and its AUDIT_ARCH
-fn force_sigsys(tid: crate::task::Tid, regs: &crate::arch::UserFrame, nr: u64, data: u32) {
+fn force_sigsys(me: &crate::task::Task, regs: &crate::arch::UserFrame, nr: u64, data: u32) {
     use crate::signal::{SIGSYS, SigFields, SigInfo, si_code};
     let fields = SigFields::Sys {
         call_addr: regs.ip(),
@@ -152,7 +152,7 @@ fn force_sigsys(tid: crate::task::Tid, regs: &crate::arch::UserFrame, nr: u64, d
     };
     let mut info = SigInfo::new(SIGSYS, si_code::SYS_SECCOMP, fields);
     info.errno = data as i32;
-    crate::signal::force_sig_info(tid, info);
+    crate::signal::force_sig_info(me, info);
 }
 
 /// End the thread by `sig` (`thread`, while another has not started
@@ -160,8 +160,8 @@ fn force_sigsys(tid: crate::task::Tid, regs: &crate::arch::UserFrame, nr: u64, d
 /// unless signal->live is 1, else force_sig_seccomp with the handler
 /// reset so the process dies)
 fn kill(sig: u32, thread: bool) -> ! {
-    let tid = crate::task::percpu::current_tid();
-    let others = crate::signal::get_task_signal_struct(tid).is_some_and(|s| s.live() > 1);
+    let me = crate::task::percpu::current();
+    let others = crate::signal::get_task_signal_struct(&me).is_some_and(|s| s.live() > 1);
     if thread && others {
         crate::task::proc::do_exit(sig as i32)
     }

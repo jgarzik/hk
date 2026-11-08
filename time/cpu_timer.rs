@@ -262,7 +262,7 @@ enum Fire {
 pub fn run() {
     use crate::task::percpu;
     let me = percpu::current();
-    let (tid, pid) = (me.tid(), percpu::current_pid());
+    let tid = me.tid();
     let Some(sig) = me.cpu_group().cloned() else {
         return;
     };
@@ -326,7 +326,7 @@ pub fn run() {
         match f {
             Fire::Timer(t) => t.queue_signal(),
             Fire::Process(s) => {
-                let _ = crate::signal::kill_proc_info(pid, s, crate::signal::SendInfo::Kernel);
+                let _ = crate::signal::group_send_sig_info(&me, s, crate::signal::SendInfo::Kernel);
             }
             Fire::Wake(t) => t.wake_sleeper(),
         }

@@ -165,19 +165,18 @@ pub const MAX_ERRNO: u32 = 4095;
 // Task Exit Cleanup
 // =============================================================================
 
-use crate::task::Tid;
 use crate::task::percpu::TASKLIST;
 
-/// Clean up seccomp state when a task exits
+/// Clean up task `t`'s seccomp state when it exits
 ///
 /// This releases the seccomp filter reference early (rather than waiting
 /// for the Task to be reaped). This follows the pattern used by other
 /// subsystems like namespaces and signal handling.
-pub fn exit_seccomp(tid: Tid) {
+pub fn exit_seccomp(t: &crate::task::Task) {
     // The filter is released after TASKLIST
     let _old = {
         let mut table = TASKLIST.write();
-        table.get_mut(tid).and_then(|mut task| {
+        table.view_mut(t).and_then(|mut task| {
             task.task
                 .seccomp_mode
                 .store(SECCOMP_MODE_DISABLED, core::sync::atomic::Ordering::Relaxed);

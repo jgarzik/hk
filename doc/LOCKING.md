@@ -988,7 +988,12 @@ the rest, `TaskInner`, in a `TableCell` (`sync::LockedBy` owned by
 reads it and `&mut table` writes it, checked by the compiler (the
 table is a `UniqueOwner`: TASKLIST holds the only one). The `Pid`
 process-group and session lists are owned the same way. A `TaskRef` cloned out of the table keeps the task alive but
-reads only its fixed and atomic fields without the lock.
+reads only its fixed and atomic fields without the lock. A helper
+given a task (`&Task`: the signal, seccomp and rlimit helpers) reads
+or writes its `TaskInner` through `GlobalTaskTable::view` /
+`view_mut`, which return None once the task is off the list (reaped:
+its `tasks_link`, changed only under the write lock, is unlinked); a
+tid is looked up only at the syscall boundary.
 
 **alloc_lock fields** (Linux task_lock(p), `p->alloc_lock`): `mm`,
 `files`, `fs`, `nsproxy`, `comm`, `mempolicy`, `io_context`.
@@ -1119,7 +1124,7 @@ or its creator before it first runs, under its alloc_lock; other tasks
 read them under it). The current task's users call `current().mm()`,
 `files()`, `fs()` (`percpu::current_fs`), `nsproxy()` (fget, path
 walks, the page-fault lookup, mm syscalls, `current_*_ns`), and
-`has_pending_signals` takes this path for `signal_pending`; the
+`signal_pending` reads `current().sigpending()`; the
 `&Task` helpers (`get_task_mm`, `get_task_fd`, `get_task_fs`,
 `get_task_ns`) take the task's alloc_lock.
 
@@ -2876,8 +2881,8 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 
 1. **Per-task signal state has its own lock** - `get_task_sighand`
    clones the `Arc<SigHand>` out under TASKLIST; `with_task_signal_state`
-   finds the task (the current one without TASKLIST, another under
-   TASKLIST's read lock) and runs its closure under `Task.sig` (no
+   checks the task is still listed (the current one without TASKLIST,
+   another under TASKLIST's read lock) and runs its closure under `Task.sig` (no
    sleeping, no user memory, no TASKLIST, nothing released in it).
    Deviation: Linux siglock is IRQ-safe and per thread group; hk's is
    per task, thread context only. Audit (T0): no interrupt handler
@@ -2977,7 +2982,7 @@ child.shared_pending = SharedPending(Some(signal.clone()));
 
 **rt_sigaction(2):** Get/set signal handlers:
 ```rust
-let sighand = get_task_sighand(tid)?;  // cloned out under TASKLIST
+let sighand = get_task_sighand(&current())?;  // cloned out under TASKLIST
 let actions = sighand.action.lock();    // IrqSpinlock
 let old = actions[sig].clone();
 actions[sig] = new_action;
@@ -2985,22 +2990,26 @@ actions[sig] = new_action;
 
 **rt_sigprocmask(2):** Modify blocked mask:
 ```rust
-with_task_signal_state(tid, |state| {   // Task.sig (current: no TASKLIST)
+with_task_signal_state(&current(), |state| {  // Task.sig, no TASKLIST
     state.blocked = new_mask;
 });                                     // TIF_SIGPENDING recomputed
 ```
 
-**kill(2)/tgkill(2):** Send signal to task (`send_signal`, process context
-only):
+**kill(2)/tgkill(2):** Send signal to task (`send_sig_info(&t, ..)`,
+process context only). The syscall finds the target once, under one
+TASKLIST read hold (the number, the permission check, a `TaskRef`);
+the send works on that task:
 ```rust
-let deliverable = with_task_signal_state(tid, |state| {  // TASKLIST read
-    if sig_ignored(..) { return false }   // to find tid, then Task.sig;
-    state.pending.add(sig);               // SIG_IGN / default-ignore: dropped
-    !state.blocked.contains(sig)
+let tg = target(t)?;                      // TASKLIST read: still listed,
+                                          // its handlers, group, limits
+let sent = with_sig(t, |t, state| {       // Task.sig
+    if sig_ignored(..) { return Dropped } // SIG_IGN / default-ignore
+    state.pending.add(sig);
+    Queued(wants)
 });                                       // TIF_SIGPENDING recomputed
-// both released, then:
-signal_wake_up(tid, WakeMode::Interruptible) // try_to_wake_up(&Task) or
-                                             // kick_process
+// both released, then (complete_signal):
+signal_wake_task(&c, WakeMode::Interruptible) // try_to_wake_up(&Task) or
+                                              // kick_process
 ```
 `with_task_signal_state` recomputes the task's TIF_SIGPENDING after every
 access (the one record of it: no copy in `TaskSignalState`), so it means
@@ -3032,12 +3041,12 @@ signal wins the swap; a fatal signal also overrides an exec's
 de_thread, exit_group does not.
 
 - `zap_threads` queues SIGKILL in each live thread's private pending
-  set and sets its TIF_SIGPENDING under TASKLIST, collects the tids,
-  drops TASKLIST, then wakes each (`WakeMode::Fatal`: interruptible
-  and killable sleeps), as `send_signal` does (TASKLIST is never held
-  across a wakeup where it can be dropped first).
+  set and sets its TIF_SIGPENDING under TASKLIST, collects the tasks,
+  drops TASKLIST, then wakes each still listed (`WakeMode::Fatal`:
+  interruptible and killable sleeps), as `send_signal` does (TASKLIST
+  is never held across a wakeup where it can be dropped first).
 - A thread cloned into a group whose state is set gets SIGKILL after
-  `clone_task_signal` set up its signal state (`zap_new_thread`): the
+  `install_fork_signal` set up its signal state (`zap_new_thread`): the
   state is set before a zap takes TASKLIST, so either the zap saw the
   new thread or the clone sees the state.
 - The zombie leader keeps its `SignalStruct` until reaped (the group's

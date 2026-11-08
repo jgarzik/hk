@@ -34,7 +34,7 @@ use core::pin::Pin;
 use crate::arch::IrqSpinlock;
 use crate::signal::{PidType, SIGALRM, SigQueue};
 use crate::sync::spin::Mutex;
-use crate::task::Tid;
+use crate::task::{Task, Tid};
 use crate::time::hrtimer::{HrClock, HrTimer};
 use crate::time::time_syscall::CLOCK_REALTIME;
 use crate::time::timerfd::ITimerSpec;
@@ -656,14 +656,14 @@ pub fn reclaim(q: Box<SigQueue>) {
 /// timers whose signal it ignored queue it now (Linux
 /// posixtimer_sig_unignore)
 pub fn sig_unignore(sig: u32) {
-    let tid = current_tid();
+    let me = current();
     let ignored =
         |t: &&Arc<PosixTimer>| t.sigevent.sigev_signo as u32 == sig && t.inner.lock().ignored;
     // Sized under one hold, filled under another: nothing allocates
     // under posix_timers
-    let n = with_timers(tid, |reg| reg.iter().filter(ignored).count()).unwrap_or(0);
+    let n = with_timers(&me, |reg| reg.iter().filter(ignored).count()).unwrap_or(0);
     let mut waiting = alloc::vec::Vec::with_capacity(n);
-    with_timers(tid, |reg| {
+    with_timers(&me, |reg| {
         for t in reg.iter().filter(ignored).take(n) {
             waiting.push(t.clone());
         }
@@ -683,8 +683,7 @@ pub fn sig_unignore(sig: u32) {
 /// ITIMER_REAL that is not running rearms a whole number of periods
 /// on (Linux posixtimer_rearm_itimer)
 pub fn rearm_itimer_real() {
-    let tid = current_tid();
-    let Some(t) = with_timers(tid, |reg| reg.get(ITIMER_REAL_ID)).flatten() else {
+    let Some(t) = with_timers(&current(), |reg| reg.get(ITIMER_REAL_ID)).flatten() else {
         return;
     };
     let mut i = t.inner.lock();
@@ -794,9 +793,9 @@ impl Drop for PosixTimerRegistry {
 // Per-process POSIX timer storage (Linux signal->posix_timers)
 // =============================================================================
 
-/// The timers of task `tid`'s thread group (its SignalStruct's)
-fn with_timers<R>(tid: Tid, f: impl FnOnce(&mut PosixTimerRegistry) -> R) -> Option<R> {
-    let sig = crate::signal::get_task_signal_struct(tid)?;
+/// The timers of task `t`'s thread group (its SignalStruct's)
+fn with_timers<R>(t: &Task, f: impl FnOnce(&mut PosixTimerRegistry) -> R) -> Option<R> {
+    let sig = crate::signal::get_task_signal_struct(t)?;
     let r = f(&mut sig.posix_timers.lock());
     Some(r)
 }
@@ -804,12 +803,12 @@ fn with_timers<R>(tid: Tid, f: impl FnOnce(&mut PosixTimerRegistry) -> R) -> Opt
 /// Create a new POSIX timer for a task
 ///
 /// # Arguments
-/// * `tid` - Owning task's TID
+/// * `me` - Owning task
 /// * `clockid` - CLOCK_REALTIME or CLOCK_MONOTONIC
 /// * `sigevent` - Notification settings (or None for default)
 ///
 pub fn create_posix_timer(
-    tid: Tid,
+    me: &Task,
     clockid: i32,
     sigevent: Option<SigEvent>,
 ) -> Result<TimerT, KernelError> {
@@ -855,13 +854,13 @@ pub fn create_posix_timer(
         SIGEV_THREAD_ID => {
             crate::task::pid::from_vnr(sev.sigev_notify_thread_id as Tid).unwrap_or(0)
         }
-        _ => tid,
+        _ => me.tid(),
     };
 
     // The id, then the timer and its signal entry outside the registry
     // lock (Linux posixtimer_init_sigqueue: EAGAIN past
     // RLIMIT_SIGPENDING), then the timer in the registry
-    let id = with_timers(tid, |reg| reg.alloc_id())
+    let id = with_timers(me, |reg| reg.alloc_id())
         .flatten()
         .ok_or(KernelError::WouldBlock)?;
     if default_value {
@@ -886,7 +885,7 @@ pub fn create_posix_timer(
         let q = SigQueue::alloc_timer(info, Arc::downgrade(&t)).ok_or(KernelError::WouldBlock)?;
         *t.sigq.lock() = Some(q);
     }
-    with_timers(tid, |reg| reg.add(t)).ok_or(KernelError::WouldBlock)?;
+    with_timers(me, |reg| reg.add(t)).ok_or(KernelError::WouldBlock)?;
     Ok(id)
 }
 
@@ -926,16 +925,17 @@ fn own_cpu_clock(clockid: i32) -> Option<crate::time::cpu_timer::CpuClock> {
 /// that clock (TIMER_ABSTIME) or that much more. On a signal, the time
 /// left is returned with the error (a relative sleep reports it).
 pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (KernelErrorT, u64)> {
-    use crate::task::percpu::{current_pid, current_tid};
+    use crate::task::percpu::current_pid;
     let Some(c) = own_cpu_clock(clockid).filter(|c| c.thread.is_none()) else {
         return Err((crate::util::error::KernelError::InvalidArgument, 0));
     };
-    let tid = current_tid();
+    let me = crate::task::percpu::current();
+    let tid = me.tid();
     let sev = SigEvent {
         sigev_notify: sigev_notify::SIGEV_NONE,
         ..SigEvent::default()
     };
-    let t = match with_timers(tid, |reg| {
+    let t = match with_timers(&me, |reg| {
         let id = reg.alloc_id().ok_or(KernelError::WouldBlock)?;
         let t = PosixTimer::with_cpu(id, clockid, tid, sev, Some(c), true)?;
         reg.add(t.clone());
@@ -956,29 +956,29 @@ pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (Kern
         Some(now) => t.cpu_expiry().map_or(0, |at| at.saturating_sub(now)),
         None => 0,
     };
-    let _ = with_timers(tid, |reg| reg.remove(t.timer_id));
+    let _ = with_timers(&me, |reg| reg.remove(t.timer_id));
     t.delete();
     r.map_err(|e| (e, left))
 }
 
 type KernelErrorT = crate::util::error::KernelError;
 
-/// Get a POSIX timer by ID
-pub fn get_posix_timer(tid: Tid, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
-    with_timers(tid, |reg| reg.get(timer_id)).flatten()
+/// Task `t`'s POSIX timer `timer_id`
+pub fn get_posix_timer(t: &Task, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
+    with_timers(t, |reg| reg.get(timer_id)).flatten()
 }
 
-/// A timer_create timer of `tid` (negative ids are internal: ITIMER_REAL)
-fn user_timer(tid: Tid, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
+/// A timer_create timer of `t` (negative ids are internal: ITIMER_REAL)
+fn user_timer(t: &Task, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
     if timer_id < 0 {
         return None;
     }
-    get_posix_timer(tid, timer_id).filter(|t| !t.sleeper)
+    get_posix_timer(t, timer_id).filter(|t| !t.sleeper)
 }
 
-/// Delete a POSIX timer: EINVAL if there is none
-pub fn delete_posix_timer(tid: Tid, timer_id: TimerT) -> Result<(), KernelError> {
-    let timer = with_timers(tid, |reg| reg.remove(timer_id)).flatten();
+/// Delete task `t`'s POSIX timer: EINVAL if there is none
+pub fn delete_posix_timer(t: &Task, timer_id: TimerT) -> Result<(), KernelError> {
+    let timer = with_timers(t, |reg| reg.remove(timer_id)).flatten();
     timer.ok_or(KernelError::InvalidArgument)?.delete();
     Ok(())
 }
@@ -1021,7 +1021,7 @@ pub fn exec_timers(sig: &crate::signal::SignalStruct) {
 // Syscall implementations
 // =============================================================================
 
-use crate::task::percpu::current_tid;
+use crate::task::percpu::current;
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
 
@@ -1032,16 +1032,16 @@ pub fn sys_timer_create(
     sevp: UserPtr<SigEvent>,
     timerid: UserPtr<TimerT>,
 ) -> KernelResult<()> {
-    let tid = current_tid();
+    let me = current();
     let sigevent = if sevp.is_null() {
         None
     } else {
         Some(sevp.read()?)
     };
-    let timer_id = create_posix_timer(tid, clockid, sigevent)?;
+    let timer_id = create_posix_timer(&me, clockid, sigevent)?;
     if !timerid.is_null() && timerid.write(&timer_id).is_err() {
         // Linux releases the new timer if the ID cannot be stored
-        let _ = delete_posix_timer(tid, timer_id);
+        let _ = delete_posix_timer(&me, timer_id);
         return Err(KernelError::BadAddress);
     }
     Ok(())
@@ -1057,7 +1057,7 @@ pub fn sys_timer_settime(
     if flags & !timer_flags::TIMER_ABSTIME != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let timer = user_timer(current_tid(), timerid).ok_or(KernelError::InvalidArgument)?;
+    let timer = user_timer(&current(), timerid).ok_or(KernelError::InvalidArgument)?;
     let new_spec = new_value.read()?;
     // Linux itimerspec64_valid: negative or unnormalized values -> EINVAL
     if !new_spec.is_valid() {
@@ -1083,13 +1083,13 @@ pub fn sys_timer_settime(
 
 /// timer_gettime(timerid, curr_value)
 pub fn sys_timer_gettime(timerid: TimerT, curr_value: UserPtr<ITimerSpec>) -> KernelResult<()> {
-    let timer = user_timer(current_tid(), timerid).ok_or(KernelError::InvalidArgument)?;
+    let timer = user_timer(&current(), timerid).ok_or(KernelError::InvalidArgument)?;
     Ok(curr_value.write(&timer.gettime())?)
 }
 
 /// timer_getoverrun(timerid): the overrun count
 pub fn sys_timer_getoverrun(timerid: TimerT) -> KernelResult<i32> {
-    let timer = user_timer(current_tid(), timerid).ok_or(KernelError::InvalidArgument)?;
+    let timer = user_timer(&current(), timerid).ok_or(KernelError::InvalidArgument)?;
     Ok(timer.getoverrun())
 }
 
@@ -1098,7 +1098,7 @@ pub fn sys_timer_delete(timerid: TimerT) -> KernelResult<()> {
     if timerid < 0 {
         return Err(KernelError::InvalidArgument); // not a timer_create id
     }
-    delete_posix_timer(current_tid(), timerid)
+    delete_posix_timer(&current(), timerid)
 }
 
 // =============================================================================
@@ -1135,8 +1135,9 @@ crate::pod!(ITimerVal {
 
 /// The current task's ITIMER_REAL timer, created on first use
 fn itimer_real() -> Arc<PosixTimer> {
-    let tid = current_tid();
-    with_timers(tid, |reg| {
+    let me = current();
+    let tid = me.tid();
+    with_timers(&me, |reg| {
         if let Some(t) = reg.get(ITIMER_REAL_ID) {
             return t;
         }
@@ -1155,7 +1156,8 @@ fn itimer(which: i32) -> Arc<PosixTimer> {
         ITIMER_PROF => (ITIMER_PROF_ID, Sample::Prof, crate::signal::SIGPROF),
         _ => return itimer_real(),
     };
-    let tid = current_tid();
+    let me = current();
+    let tid = me.tid();
     let make = || {
         let sev = SigEvent {
             sigev_signo: sig as i32,
@@ -1169,7 +1171,7 @@ fn itimer(which: i32) -> Arc<PosixTimer> {
         // CLOCK_PROCESS_CPUTIME_ID
         PosixTimer::itimer(id, 2, tid, sev, Some(clock))
     };
-    with_timers(tid, |reg| {
+    with_timers(&me, |reg| {
         if let Some(t) = reg.get(id) {
             return t;
         }

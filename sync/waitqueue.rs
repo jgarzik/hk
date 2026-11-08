@@ -74,8 +74,8 @@ use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use crate::arch::IrqSpinlock;
 use crate::task::Task;
 use crate::task::percpu::{
-    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, current_tid, schedule_timeout,
-    set_current_state, try_to_wake_up,
+    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, schedule_timeout, set_current_state,
+    try_to_wake_up,
 };
 use crate::time::hrtimer::HrClock;
 use crate::util::error::KernelError;
@@ -179,7 +179,7 @@ pub struct WaitQueue {
 
 /// True if the current task has a deliverable signal pending
 pub fn signal_pending() -> bool {
-    crate::signal::has_pending_signals(current_tid())
+    crate::task::percpu::current().sigpending()
 }
 
 impl WaitQueue {

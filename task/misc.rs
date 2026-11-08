@@ -542,14 +542,16 @@ pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> K
         PR_SET_CHILD_SUBREAPER => {
             // The process's flag (Linux signal->is_child_subreaper),
             // whichever thread sets it; arg2 nonzero sets it
-            let sig = crate::signal::get_task_signal_struct(tid).ok_or(KernelError::NoProcess)?;
+            let sig = crate::signal::get_task_signal_struct(&crate::task::percpu::current())
+                .ok_or(KernelError::NoProcess)?;
             sig.set_subreaper(&mut TASKLIST.write(), arg2 != 0);
             Ok(0)
         }
 
         PR_GET_CHILD_SUBREAPER => {
             // The process's flag, stored at arg2 (int *)
-            let sig = crate::signal::get_task_signal_struct(tid).ok_or(KernelError::NoProcess)?;
+            let sig = crate::signal::get_task_signal_struct(&crate::task::percpu::current())
+                .ok_or(KernelError::NoProcess)?;
             let is_subreaper = sig.subreaper(&TASKLIST.read());
             int_ptr.write(&i32::from(is_subreaper))?;
             Ok(0)
@@ -1198,14 +1200,15 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> KernelResult<i3
 fn pidfd_fget(pidfd_file: &File, targetfd: i32) -> KernelResult<alloc::sync::Arc<File>> {
     // The pidfd's process itself, while it is still there
     let target_tid = crate::task::pidfd::pidfd_tid(pidfd_file)?;
+    let target = super::percpu::find_task(target_tid);
 
-    let _exec = crate::signal::ExecUpdateRead::lock(target_tid);
+    let _exec = target.as_deref().map(crate::signal::ExecUpdateRead::lock);
     if !super::ptrace::may_access_tid(target_tid, false) {
         return Err(KernelError::NotPermitted);
     }
 
     // Get target's fd table (none: process exiting)
-    let target_fd_table = super::percpu::find_task(target_tid)
+    let target_fd_table = target
         .as_deref()
         .and_then(super::fdtable::get_task_fd)
         .ok_or(KernelError::NoProcess)?;

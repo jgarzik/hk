@@ -101,7 +101,7 @@ fn zap_pid_ns_processes(me: &TaskRef, ns: &PidNamespace) {
     // A reboot(2) inside sets what its parent sees
     let code = *ns.reboot.access(&TASKLIST.read());
     if code != 0
-        && let Some(s) = crate::signal::get_task_signal_struct(me.pid)
+        && let Some(s) = crate::signal::get_task_signal_struct(me)
     {
         s.set_exit_code(code);
     }
@@ -131,7 +131,7 @@ pub fn reboot_pid_ns(cmd: u32) -> Option<crate::util::error::KernelError> {
         child_reaper(&table, ns)
     };
     if let Some(r) = reaper {
-        let _ = crate::signal::send_thread_signal(&r, SIGKILL, SendInfo::Kernel);
+        let _ = crate::signal::send_sig_info(&r, SIGKILL, SendInfo::Kernel);
     }
     crate::task::proc::do_exit(0)
 }

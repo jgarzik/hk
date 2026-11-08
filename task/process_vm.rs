@@ -209,7 +209,7 @@ fn check_process_vm_permission(target: &Task) -> bool {
 /// reference: it cannot be torn down while we access it (Linux
 /// get_task_mm)
 fn access_mm(target: &Task) -> Result<MmRef, KernelError> {
-    let _g = crate::signal::ExecUpdateRead::lock(target.tid());
+    let _g = crate::signal::ExecUpdateRead::lock(target);
     if !check_process_vm_permission(target) {
         return Err(KernelError::NotPermitted);
     }

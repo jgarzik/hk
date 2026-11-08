@@ -32,7 +32,7 @@ use crate::io::poll::{
     POLLWRNORM,
 };
 use crate::signal::siginfo::{SigFields, SigInfo, si_code};
-use crate::signal::{SIGIO, SIGURG, SendInfo, group_task, send_group_signal, send_thread_signal};
+use crate::signal::{SIGIO, SIGURG, SendInfo, group_task, send_group_signal, send_sig_info};
 use crate::sync::spin::Mutex;
 use crate::task::Uid;
 use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef, TaskView};
@@ -406,7 +406,7 @@ fn sigio_target(table: &GlobalTaskTable, o: &Owner, t: &TaskView<'_>) -> Option<
 /// queued; thread-directed for a thread owner, else to its process
 fn sigio_to_task(o: &Owner, t: &TaskRef, fd: i32, reason: i32) {
     let send = |sig, info| match o.kind {
-        PidType::Tid => send_thread_signal(t, sig, info),
+        PidType::Tid => send_sig_info(t, sig, info),
         _ => send_group_signal(t, sig, info),
     };
     let sig = o.signum;
