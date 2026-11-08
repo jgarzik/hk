@@ -27,7 +27,10 @@
 //!   one; X's credentials reach Y as pid 0;
 //! - PIDNS_UNSHARE: after unshare(CLONE_NEWPID) the caller keeps its
 //!   pid, its next child is 1 there with parent 0; a thread cannot be
-//!   made in another namespace (EINVAL).
+//!   made in another namespace (EINVAL);
+//! - PIDNS_INIT_RETRY: a first fork that fails after taking pid 1
+//!   leaves the namespace to the next fork, whose child is pid 1
+//!   (Linux 7.1+; ENOMEM before).
 
 use crate::harness::report_step;
 use crate::helpers::println;
@@ -65,6 +68,7 @@ pub fn run_tests() {
     outer(b"PIDNS_PGRP", pgrp);
     outer(b"PIDNS_SCM", scm);
     outer(b"PIDNS_UNSHARE", unshare);
+    outer(b"PIDNS_INIT_RETRY", init_retry);
     super::pidns_init::run_tests();
     super::pidns_proc::run_tests();
 }
@@ -462,6 +466,45 @@ fn unshare() -> i32 {
     }
     let c = child(|| first_fail(&[sys_getpid() == 1, sys_getppid() == 0]));
     if c <= 1 || c == me {
+        return 4;
+    }
+    match status(c) {
+        0 => 0,
+        s => 10 + s as i32,
+    }
+}
+
+/// The first fork into a new namespace fails after its pid 1 was
+/// allocated (CLONE_PIDFD with a NULL pidfd: EFAULT): Linux 7.1+ lets
+/// the next fork make init again, pid 1 (free_pid keeps PIDNS_ADDING,
+/// alloc_pid resets the cursor); older Linux closed the namespace
+/// (ENOMEM)
+fn init_retry() -> i32 {
+    const CLONE_PIDFD: u64 = 0x1000;
+    const EFAULT: i64 = -14;
+    const ENOMEM: i64 = -12;
+    if sys_unshare(CLONE_NEWPID) != 0 {
+        return 1;
+    }
+    let args = CloneArgs {
+        flags: CLONE_PIDFD,
+        exit_signal: SIGCHLD,
+        pidfd: 0,
+        ..CloneArgs::default()
+    };
+    let r = sys_clone3(&args, core::mem::size_of::<CloneArgs>());
+    if r == 0 {
+        sys_exit(0);
+    }
+    if r != EFAULT {
+        status(r);
+        return 2;
+    }
+    let c = child(|| first_fail(&[sys_getpid() == 1, sys_getppid() == 0]));
+    if !crate::helpers::linux_at_least(7, 1) {
+        return if c == ENOMEM { 0 } else { 3 };
+    }
+    if c <= 0 {
         return 4;
     }
     match status(c) {

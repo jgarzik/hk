@@ -301,6 +301,7 @@ fn free_numbers(numbers: &[UPid]) {
 /// init's 1): EEXIST if one is taken. The caller checked them (at most
 /// one per level, each in 1..PID_MAX_LIMIT).
 pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>, KernelError> {
+    retry_init(ns);
     let mut chain = alloc::vec::Vec::new();
     let mut n = Some(ns.clone());
     while let Some(cur) = n {
@@ -363,6 +364,17 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>,
         b.store(core::ptr::from_ref::<UPid>(u).cast_mut(), Ordering::Release);
     }
     Ok(pid)
+}
+
+/// `ns` holds no pid and has had no init: an earlier attempt to make
+/// its init failed after taking pid 1 (its `uncount` kept NS_ADDING),
+/// so numbering starts over at 1 and the next fork makes init (Linux
+/// alloc_pid: idr_set_cursor(0) while pid_allocated == PIDNS_ADDING)
+fn retry_init(ns: &PidNamespace) {
+    let _g = PIDMAP_LOCK.lock();
+    if ns.alloc.load(Ordering::Relaxed) == crate::ns::pid::NS_ADDING {
+        ns.map.last.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Count `numbers` in their namespaces (Linux alloc_pid under
