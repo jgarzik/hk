@@ -29,15 +29,6 @@ fn sockfd(fd: i32) -> KernelResult<(Arc<File>, Arc<dyn ProtoOps>)> {
     Ok((file, s))
 }
 
-fn nofile() -> u64 {
-    let l = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-    if l == crate::task::rlimit::RLIM_INFINITY {
-        u64::MAX
-    } else {
-        l
-    }
-}
-
 /// Install `file` in a new descriptor, close-on-exec if `cloexec`
 pub fn fd_install(file: Arc<File>, cloexec: bool) -> KernelResult<i32> {
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
@@ -89,9 +80,10 @@ fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> KernelResult<[i32;
     let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
         .ok_or(KernelError::BadFd)?;
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
+    let max = crate::fs::syscall::get_nofile_limit();
     let mut t = table.lock();
-    let fd1 = t.alloc_with_flags(a, fl, nofile())?;
-    match t.alloc_with_flags(b, fl, nofile()) {
+    let fd1 = t.alloc_with_flags(a, fl, max)?;
+    match t.alloc_with_flags(b, fl, max) {
         Ok(fd2) => Ok([fd1, fd2]),
         Err(e) => {
             t.close(fd1);
