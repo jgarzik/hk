@@ -2,7 +2,7 @@
 //!
 //! Tests for cross-process memory access syscalls.
 
-use crate::harness::fail_num;
+use crate::harness::{T, fail_num};
 use crate::helpers::{print, print_num, println};
 use crate::mm::fork_mm::{join, spawn_thread};
 use core::sync::atomic::{AtomicI64, Ordering};
@@ -24,6 +24,7 @@ pub fn run_tests() {
     test_process_vm_invalid_flags();
     test_process_vm_zero_iovecs();
     test_process_vm_sibling();
+    test_process_vm_iov_limits();
 }
 
 static SIB_RESULT: AtomicI64 = AtomicI64::new(0);
@@ -241,4 +242,36 @@ fn test_process_vm_zero_iovecs() {
         print_num(ret);
         println(b")");
     }
+}
+
+/// PROCESS_VM_IOV_LIMITS: the iovecs are checked as Linux
+/// process_vm_rw does: a length negative as ssize_t is EINVAL, local or
+/// remote; the local count is an unsigned int (2^32 + 1 is 1); no
+/// remote byte to copy is 0 before the pid is looked up
+fn test_process_vm_iov_limits() {
+    let mut t = T::new(b"PROCESS_VM_IOV_LIMITS");
+    let src: [u8; 8] = *b"iovlimit";
+    let mut dst = [0u8; 8];
+    let iov = |p: *const u8, n: usize| IoVec {
+        iov_base: p,
+        iov_len: n,
+    };
+    let local = iov(dst.as_mut_ptr(), 8);
+    let remote = iov(src.as_ptr(), 8);
+    let neg = 1usize << 63;
+    let me = sys_getpid() as i32;
+    let r = sys_process_vm_readv(me, &iov(dst.as_mut_ptr(), neg), 1, &remote, 1, 0);
+    t.eq(b"negative local len", r, EINVAL);
+    let r = sys_process_vm_readv(me, &local, 1, &iov(src.as_ptr(), neg), 1, 0);
+    t.eq(b"negative remote len", r, EINVAL);
+    let r = sys_process_vm_writev(me, &local, 1, &iov(dst.as_mut_ptr(), neg), 1, 0);
+    t.eq(b"writev negative remote len", r, EINVAL);
+    let r = sys_process_vm_readv(me, &local, 1, &remote, 1025, 0);
+    t.eq(b"remote count past IOV_MAX", r, EINVAL);
+    let r = sys_process_vm_readv(me, &local, (1 << 32) + 1, &remote, 1, 0);
+    t.eq(b"local count 2^32 + 1", r, 8);
+    t.ok(b"bytes copied", dst == src, 0);
+    let r = sys_process_vm_readv(99999999, &local, 1, &iov(src.as_ptr(), 0), 1, 0);
+    t.eq(b"no remote byte, no such pid", r, 0);
+    t.done();
 }
