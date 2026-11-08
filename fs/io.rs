@@ -18,8 +18,10 @@ fn fget(fd: i32) -> Result<Arc<File>, KernelError> {
 }
 
 /// Bytes the segments cover, capped at MAX_RW_COUNT
-fn seg_len(segs: &[IoVec]) -> usize {
-    let total = segs.iter().map(|s| s.iov_len as usize).sum::<usize>();
+pub fn seg_len(segs: &[IoVec]) -> usize {
+    let total = segs
+        .iter()
+        .fold(0usize, |t, s| t.saturating_add(s.iov_len as usize));
     total.min(MAX_RW_COUNT)
 }
 
@@ -53,7 +55,7 @@ fn reads_fully(file: &File) -> bool {
 
 /// Linux rw_verify_area: on a file with a position (regular, block
 /// device), `pos + count` must stay a valid offset (EINVAL)
-fn verify_area(file: &File, at: Option<u64>, count: usize) -> Result<(), KernelError> {
+pub fn verify_area(file: &File, at: Option<u64>, count: usize) -> Result<(), KernelError> {
     if !reads_fully(file) {
         return Ok(());
     }
@@ -125,16 +127,22 @@ pub fn do_writev(
     }
 }
 
-/// One user buffer as a segment, after the EFAULT check
-fn one_seg(buf: u64, count: u64) -> Result<[IoVec; 1], i64> {
+/// One user buffer as a segment, cut to MAX_RW_COUNT, after the EFAULT
+/// check (Linux import_ubuf)
+pub fn import_ubuf(buf: u64, count: u64) -> Result<[IoVec; 1], KernelError> {
     let count = (count as usize).min(MAX_RW_COUNT);
     if !Uaccess::access_ok(buf, count) {
-        return Err(KernelError::BadAddress.sysret());
+        return Err(KernelError::BadAddress);
     }
     Ok([IoVec {
         iov_base: buf,
         iov_len: count as u64,
     }])
+}
+
+/// [`import_ubuf`] with the errno
+fn one_seg(buf: u64, count: u64) -> Result<[IoVec; 1], i64> {
+    import_ubuf(buf, count).map_err(KernelError::sysret)
 }
 
 /// Explicit offset of pread/pwrite: negative is EINVAL
