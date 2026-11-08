@@ -273,12 +273,22 @@ fn do_shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, i32> {
     let ops = IpcOps {
         // Linux newseg: ENOSPC past SHMALL
         new: move |k, mode| {
+            // Linux newseg: whole pages that cannot hold `size` (the
+            // page-rounded size wraps), or past SHMALL, are ENOSPC
+            if pages.checked_mul(PAGE_SIZE as u64).is_none() {
+                return Err(KernelError::NoSpace.errno());
+            }
             let tot = ns_clone.shm_tot.load(Ordering::Relaxed);
             if tot
                 .checked_add(pages)
                 .is_none_or(|t| t > ns_clone.shm_ctlall as u64)
             {
                 return Err(KernelError::NoSpace.errno());
+            }
+            // The shmem file past the largest file size (Linux
+            // __shmem_file_setup) is EINVAL
+            if size as u64 > crate::fs::superblock::MAX_LFS_FILESIZE {
+                return Err(KernelError::InvalidArgument.errno());
             }
             ShmidKernel::new(k, size, mode, ns_clone.clone())
         },
