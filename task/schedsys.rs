@@ -655,30 +655,34 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
             let tid =
                 super::pid::from_vnr_or(who as u64, current_tid()).ok_or(KernelError::NoProcess)?;
             let t = super::percpu::find_task(tid).ok_or(KernelError::NoProcess)?;
-            if !ioprio_owner_ok(&t) {
-                return Err(KernelError::NotPermitted);
+            match ioprio_owner_ok(&t) {
+                None => Err(KernelError::NoProcess),
+                Some(false) => Err(KernelError::NotPermitted),
+                Some(true) => super::set_task_ioprio(&t, ioprio),
             }
-            // Get or create IoContext for the target
-            super::set_task_ioprio(&t, ioprio)?;
-            Ok(())
         }
         IOPRIO_WHO_PGRP => {
             // Set ioprio for all processes in a process group
             let pgid = super::pid::from_vnr_or(who as u64, super::percpu::current_pgid())
                 .ok_or(KernelError::NoProcess)?;
 
-            let tasks = super::percpu::pgrp_tasks(pgid);
-            if tasks.is_empty() {
-                return Err(KernelError::NoProcess);
-            }
-
-            for t in &tasks {
-                if !ioprio_owner_ok(t) {
-                    return Err(KernelError::NotPermitted);
+            // A thread reaped since the group was gathered is skipped
+            // (Linux walks the group under tasklist_lock and never sees
+            // it); ESRCH if none was left
+            let mut found = false;
+            for t in &super::percpu::pgrp_tasks(pgid) {
+                match ioprio_owner_ok(t) {
+                    None => continue,
+                    Some(false) => return Err(KernelError::NotPermitted),
+                    Some(true) => super::set_task_ioprio(t, ioprio)?,
                 }
-                super::set_task_ioprio(t, ioprio)?;
+                found = true;
             }
-            Ok(())
+            if found {
+                Ok(())
+            } else {
+                Err(KernelError::NoProcess)
+            }
         }
         IOPRIO_WHO_USER => {
             // Set ioprio for all processes of a user - not fully implemented
@@ -691,14 +695,14 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
 
 /// May the caller change task `t`'s I/O priority (Linux
 /// set_task_ioprio): its uid is the caller's euid or uid, or the caller
-/// has CAP_SYS_NICE
-fn ioprio_owner_ok(t: &Task) -> bool {
+/// has CAP_SYS_NICE; None once `t` is reaped
+fn ioprio_owner_ok(t: &Task) -> Option<bool> {
     let me = super::percpu::current_cred();
     let ok = super::percpu::TASKLIST
         .read()
         .view(t)
-        .is_some_and(|t| t.cred().uid == me.euid || t.cred().uid == me.uid);
-    ok || super::capable(super::CAP_SYS_NICE)
+        .map(|t| t.cred().uid == me.euid || t.cred().uid == me.uid)?;
+    Some(ok || super::capable(super::CAP_SYS_NICE))
 }
 
 /// sys_ioprio_get - get I/O scheduling class and priority

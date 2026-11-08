@@ -2580,16 +2580,27 @@ pub fn set_task_io_context(t: &Task, ctx: Arc<IoContext>) {
 
 /// Set task `t`'s I/O priority (Linux set_task_ioprio), making it an
 /// I/O context if it has none, but not once it is exiting (its context
-/// would outlive exit_io_context); ENOMEM if one cannot be made
+/// would outlive exit_io_context); ENOMEM if one cannot be made. The
+/// context is allocated only when `t` has none, outside its alloc_lock,
+/// and the lock retaken to recheck; a spare is dropped after unlocking.
 pub fn set_task_ioprio(t: &Task, ioprio: IoPrio) -> Result<(), KernelError> {
-    let new = try_arc(IoContext::new())?;
-    let mut a = t.task_lock();
-    if let Some(c) = a.io_context() {
+    if let Some(c) = t.task_lock().io_context() {
         c.set_ioprio(ioprio);
-    } else if !t.has_flag(pf::EXITING) {
-        new.set_ioprio(ioprio);
-        a.set_io_context(Some(new));
+        return Ok(());
     }
+    let new = try_arc(IoContext::with_ioprio(ioprio))?;
+    let mut a = t.task_lock();
+    let spare = if let Some(c) = a.io_context() {
+        c.set_ioprio(ioprio);
+        Some(new)
+    } else if t.has_flag(pf::EXITING) {
+        Some(new)
+    } else {
+        a.set_io_context(Some(new));
+        None
+    };
+    drop(a);
+    drop(spare);
     Ok(())
 }
 
