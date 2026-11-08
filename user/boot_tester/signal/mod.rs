@@ -8,4 +8,5 @@ pub mod seccomp;
 pub mod sigmask;
 pub mod signalfd;
 pub mod signals;
+pub mod signo;
 pub mod sigqueue;

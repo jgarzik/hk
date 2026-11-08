@@ -1078,12 +1078,6 @@ pub fn sys_pidfd_send_signal(
     if flags & !SCOPES != 0 || flags.count_ones() > 1 {
         return Err(KernelError::InvalidArgument);
     }
-
-    // Validate signal number (0 is allowed as a null signal for checking permissions)
-    if !(0..=64).contains(&sig) {
-        return Err(KernelError::InvalidArgument);
-    }
-
     let file = crate::fs::io::fget(pidfd)?;
     let pidfd = crate::task::pidfd::get_pidfd(&file).ok_or(KernelError::BadFd)?;
     // The scope (Linux do_pidfd_send_signal's pid_type)
@@ -1098,11 +1092,12 @@ pub fn sys_pidfd_send_signal(
     // Permission check and send to the pidfd's struct pid itself (Linux
     // kill_pid_info_type, kill_pgrp_info), so a released task's reused
     // number never gets it. Signal 0 (None) is a permission/existence
-    // probe.
-    let sig = u32::try_from(sig).ok().and_then(Signal::new);
+    // probe; a bad number (a negative one too) is EINVAL from the check,
+    // once the receiver is found, so it is never sent.
+    let ksig = crate::signal::syscall::kill_sig(u32::try_from(sig).unwrap_or(u32::MAX));
     let me = crate::signal::syscall::Sender::current();
-    let check = |t: &super::percpu::TaskView<'_>| me.may_kill(t, sig);
-    let pid = pidfd.pid_ref();
+    let check = |t: &super::percpu::TaskView<'_>| me.may_kill(t, ksig);
+    let (sig, pid) = (ksig.unwrap_or(None), pidfd.pid_ref());
     match scope {
         Scope::Thread => {
             crate::signal::kill_pid_info_type(pid, sig, info, crate::signal::PidType::Pid, check)

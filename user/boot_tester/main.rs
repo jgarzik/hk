@@ -272,6 +272,7 @@ pub fn run_all_tests() {
     fs::etxtbsy::run_tests();
     fs::cpio_nodes::run_tests();
     signal::signals::run_tests();
+    signal::signo::run_tests();
     signal::sigqueue::run_tests();
     signal::sigmask::run_tests();
     arch::fpu::run_tests();
