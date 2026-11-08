@@ -48,7 +48,9 @@ pub type UserRegs = UserPtRegs;
 /// from its pt_regs (the entry frame at the top of its kernel stack).
 pub fn get_user_regs(tid: Tid) -> Result<UserPtRegs, i32> {
     let table = TASKLIST.read();
-    let task = table.get(tid).ok_or(-3i32)?; // ESRCH
+    let task = table
+        .get(tid)
+        .ok_or(KernelError::NoProcess.to_errno_neg())?;
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
@@ -75,7 +77,9 @@ pub fn get_user_regs(tid: Tid) -> Result<UserPtRegs, i32> {
 /// registers take effect when it resumes.
 pub fn set_user_regs(tid: Tid, regs: &UserPtRegs) -> Result<(), i32> {
     let table = TASKLIST.read();
-    let task = table.get(tid).ok_or(-3i32)?; // ESRCH
+    let task = table
+        .get(tid)
+        .ok_or(KernelError::NoProcess.to_errno_neg())?;
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {

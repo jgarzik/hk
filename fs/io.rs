@@ -12,8 +12,9 @@ use super::iov_iter::{IovDest, IovSource};
 use super::iov::IoVec;
 use super::syscall::{MAX_RW_COUNT, current_fd_table};
 
-/// File of `fd`
-fn fget(fd: i32) -> Result<Arc<File>, KernelError> {
+/// The current task's file at `fd`, or EBADF (Linux fget/fdget): the
+/// fd table lock is dropped before return
+pub fn fget(fd: i32) -> Result<Arc<File>, KernelError> {
     current_fd_table().lock().get(fd).ok_or(KernelError::BadFd)
 }
 

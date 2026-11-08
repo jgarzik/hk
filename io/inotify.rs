@@ -1036,7 +1036,10 @@ fn resolve_path(pathname: &[u8], mask: u32) -> Result<Path, i64> {
     let path =
         crate::fs::namei::path_lookupat(crate::task::percpu::current_cwd(), pathname, lookup_flags)
             .map_err(|e| e.sysret())?;
-    let inode = path.dentry.get_inode().ok_or(-2i64)?; // ENOENT
+    let inode = path
+        .dentry
+        .get_inode()
+        .ok_or(KernelError::NotFound.sysret())?;
 
     // inotify_find_inode: the watched inode must be readable
     crate::fs::dac::permission(&inode, crate::fs::MAY_READ).map_err(|e| e.sysret())?;

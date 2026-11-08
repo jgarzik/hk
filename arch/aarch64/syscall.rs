@@ -9,6 +9,7 @@
 // Syscall numbers are a reference table for Linux ABI compatibility
 
 use crate::syscall::Sys;
+use crate::util::error::SysRet;
 
 // ============================================================================
 // AArch64 Linux syscall numbers (different from x86_64!)
@@ -533,7 +534,7 @@ pub fn aarch64_syscall_dispatch(
 ) -> u64 {
     let args = [arg0, arg1, arg2, arg3, arg4, arg5];
     match num {
-        SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn() as u64,
+        SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn().ret() as u64,
         _ => match sys_of(num) {
             Some(s) => crate::syscall::dispatch(s, args),
             None => crate::util::error::KernelError::NotImplemented.sysret() as u64,

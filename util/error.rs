@@ -327,3 +327,69 @@ impl KernelError {
 
 /// Result type alias for kernel operations
 pub type KernelResult<T> = Result<T, KernelError>;
+
+/// A syscall's result as its return register (Linux `long`: the value,
+/// or -errno). `sys_*` return a `KernelResult` and use `?`; dispatch
+/// calls `.ret()`
+pub trait SysRet {
+    fn ret(self) -> i64;
+}
+
+impl SysRet for i64 {
+    #[inline]
+    fn ret(self) -> i64 {
+        self
+    }
+}
+
+/// A raw -errno or value in an `i32` (sign-extended, as `as u64` did)
+impl SysRet for i32 {
+    #[inline]
+    fn ret(self) -> i64 {
+        i64::from(self)
+    }
+}
+
+impl SysRet for KernelResult<()> {
+    #[inline]
+    fn ret(self) -> i64 {
+        self.map_or_else(KernelError::sysret, |()| 0)
+    }
+}
+
+impl SysRet for KernelResult<i64> {
+    #[inline]
+    fn ret(self) -> i64 {
+        self.unwrap_or_else(KernelError::sysret)
+    }
+}
+
+impl SysRet for KernelResult<i32> {
+    #[inline]
+    fn ret(self) -> i64 {
+        self.map_or_else(KernelError::sysret, i64::from)
+    }
+}
+
+impl SysRet for KernelResult<u32> {
+    #[inline]
+    fn ret(self) -> i64 {
+        self.map_or_else(KernelError::sysret, i64::from)
+    }
+}
+
+/// Byte counts (capped at MAX_RW_COUNT) and user addresses (below
+/// TASK_SIZE) fit in the register's positive range
+impl SysRet for KernelResult<usize> {
+    #[inline]
+    fn ret(self) -> i64 {
+        self.map_or_else(KernelError::sysret, |n| n as i64)
+    }
+}
+
+impl SysRet for KernelResult<u64> {
+    #[inline]
+    fn ret(self) -> i64 {
+        self.map_or_else(KernelError::sysret, |n| n as i64)
+    }
+}

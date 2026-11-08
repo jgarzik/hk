@@ -10,6 +10,7 @@
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::syscall::Sys;
+use crate::util::error::SysRet;
 
 use super::cpu::{KERNEL_CODE_SELECTOR, USER_DATA_SELECTOR};
 
@@ -757,54 +758,68 @@ pub fn x86_64_syscall_dispatch(
 ) -> u64 {
     let args = [arg0, arg1, arg2, arg3, arg4, arg5];
     match num {
-        SYS_ACCESS => crate::fs::syscall::sys_access(args[0], args[1] as i32) as u64,
-        SYS_ALARM => crate::time::posix_timer::sys_alarm(args[0] as u32) as u64,
-        SYS_ARCH_PRCTL => crate::task::syscall::sys_arch_prctl(args[0] as i32, args[1]) as u64,
-        SYS_CHMOD => crate::fs::syscall::sys_chmod(args[0], args[1] as u32) as u64,
-        SYS_CHOWN => crate::fs::syscall::sys_chown(args[0], args[1] as u32, args[2] as u32) as u64,
-        SYS_DUP2 => crate::fs::syscall::sys_dup2(args[0] as i32, args[1] as i32) as u64,
-        SYS_EPOLL_CREATE => crate::io::epoll::sys_epoll_create(args[0] as i32) as u64,
+        SYS_ACCESS => crate::fs::syscall::sys_access(args[0], args[1] as i32).ret() as u64,
+        SYS_ALARM => crate::time::posix_timer::sys_alarm(args[0] as u32).ret() as u64,
+        SYS_ARCH_PRCTL => {
+            crate::task::syscall::sys_arch_prctl(args[0] as i32, args[1]).ret() as u64
+        }
+        SYS_CHMOD => crate::fs::syscall::sys_chmod(args[0], args[1] as u32).ret() as u64,
+        SYS_CHOWN => {
+            crate::fs::syscall::sys_chown(args[0], args[1] as u32, args[2] as u32).ret() as u64
+        }
+        SYS_DUP2 => crate::fs::syscall::sys_dup2(args[0] as i32, args[1] as i32).ret() as u64,
+        SYS_EPOLL_CREATE => crate::io::epoll::sys_epoll_create(args[0] as i32).ret() as u64,
         SYS_EPOLL_WAIT => crate::io::epoll::sys_epoll_wait(
             args[0] as i32,
             args[1],
             args[2] as i32,
             args[3] as i32,
-        ) as u64,
-        SYS_EVENTFD => crate::time::time_syscall::sys_eventfd(args[0] as u32) as u64,
-        SYS_FORK => crate::task::syscall::sys_fork() as u64,
-        SYS_GETDENTS => crate::fs::syscall::sys_getdents(args[0] as i32, args[1], args[2]) as u64,
-        SYS_INOTIFY_INIT => crate::io::inotify::sys_inotify_init() as u64,
-        SYS_IOPERM => crate::task::syscall::sys_ioperm(args[0], args[1], args[2] as i32) as u64,
-        SYS_IOPL => crate::task::syscall::sys_iopl(args[0] as u32) as u64,
-        SYS_LCHOWN => {
-            crate::fs::syscall::sys_lchown(args[0], args[1] as u32, args[2] as u32) as u64
+        )
+        .ret() as u64,
+        SYS_EVENTFD => crate::time::time_syscall::sys_eventfd(args[0] as u32).ret() as u64,
+        SYS_FORK => crate::task::syscall::sys_fork().ret() as u64,
+        SYS_GETDENTS => {
+            crate::fs::syscall::sys_getdents(args[0] as i32, args[1], args[2]).ret() as u64
         }
-        SYS_LINK => crate::fs::syscall::sys_link(args[0], args[1]) as u64,
-        SYS_LSTAT => crate::fs::syscall::sys_lstat(args[0], args[1]) as u64,
-        SYS_MKDIR => crate::fs::syscall::sys_mkdir(args[0], args[1] as u32) as u64,
-        SYS_MKNOD => crate::fs::syscall::sys_mknod(args[0], args[1] as u32, args[2]) as u64,
-        SYS_OPEN => crate::fs::syscall::sys_open(args[0], args[1] as u32, args[2] as u32) as u64,
-        SYS_PAUSE => crate::signal::syscall::sys_pause() as u64,
-        SYS_PIPE => crate::fs::syscall::sys_pipe(args[0]) as u64,
-        SYS_POLL => crate::fs::syscall::sys_poll(args[0], args[1] as u32, args[2] as i32) as u64,
-        SYS_READLINK => crate::fs::syscall::sys_readlink(args[0], args[1], args[2]) as u64,
-        SYS_RENAME => crate::fs::syscall::sys_rename(args[0], args[1]) as u64,
-        SYS_RMDIR => crate::fs::syscall::sys_rmdir(args[0]) as u64,
-        SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn() as u64,
+        SYS_INOTIFY_INIT => crate::io::inotify::sys_inotify_init().ret() as u64,
+        SYS_IOPERM => {
+            crate::task::syscall::sys_ioperm(args[0], args[1], args[2] as i32).ret() as u64
+        }
+        SYS_IOPL => crate::task::syscall::sys_iopl(args[0] as u32).ret() as u64,
+        SYS_LCHOWN => {
+            crate::fs::syscall::sys_lchown(args[0], args[1] as u32, args[2] as u32).ret() as u64
+        }
+        SYS_LINK => crate::fs::syscall::sys_link(args[0], args[1]).ret() as u64,
+        SYS_LSTAT => crate::fs::syscall::sys_lstat(args[0], args[1]).ret() as u64,
+        SYS_MKDIR => crate::fs::syscall::sys_mkdir(args[0], args[1] as u32).ret() as u64,
+        SYS_MKNOD => crate::fs::syscall::sys_mknod(args[0], args[1] as u32, args[2]).ret() as u64,
+        SYS_OPEN => {
+            crate::fs::syscall::sys_open(args[0], args[1] as u32, args[2] as u32).ret() as u64
+        }
+        SYS_PAUSE => crate::signal::syscall::sys_pause().ret() as u64,
+        SYS_PIPE => crate::fs::syscall::sys_pipe(args[0]).ret() as u64,
+        SYS_POLL => {
+            crate::fs::syscall::sys_poll(args[0], args[1] as u32, args[2] as i32).ret() as u64
+        }
+        SYS_READLINK => crate::fs::syscall::sys_readlink(args[0], args[1], args[2]).ret() as u64,
+        SYS_RENAME => crate::fs::syscall::sys_rename(args[0], args[1]).ret() as u64,
+        SYS_RMDIR => crate::fs::syscall::sys_rmdir(args[0]).ret() as u64,
+        SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn().ret() as u64,
         SYS_SELECT => {
             crate::fs::syscall::sys_select(args[0] as i32, args[1], args[2], args[3], args[4])
                 as u64
         }
         SYS_SIGNALFD => {
-            crate::signal::syscall::sys_signalfd(args[0] as i32, args[1], args[2] as i32) as u64
+            crate::signal::syscall::sys_signalfd(args[0] as i32, args[1], args[2] as i32).ret()
+                as u64
         }
-        SYS_STAT => crate::fs::syscall::sys_stat(args[0], args[1]) as u64,
-        SYS_SYMLINK => crate::fs::syscall::sys_symlink(args[0], args[1]) as u64,
-        SYS_TIME => crate::time::time_syscall::sys_time(args[0]) as u64,
-        SYS_UNLINK => crate::fs::syscall::sys_unlink(args[0]) as u64,
-        SYS_UTIME => crate::fs::syscall::sys_utime(args[0], args[1]) as u64,
-        SYS_UTIMES => crate::fs::syscall::sys_utimes(args[0], args[1]) as u64,
-        SYS_VFORK => crate::task::syscall::sys_vfork() as u64,
+        SYS_STAT => crate::fs::syscall::sys_stat(args[0], args[1]).ret() as u64,
+        SYS_SYMLINK => crate::fs::syscall::sys_symlink(args[0], args[1]).ret() as u64,
+        SYS_TIME => crate::time::time_syscall::sys_time(args[0]).ret() as u64,
+        SYS_UNLINK => crate::fs::syscall::sys_unlink(args[0]).ret() as u64,
+        SYS_UTIME => crate::fs::syscall::sys_utime(args[0], args[1]).ret() as u64,
+        SYS_UTIMES => crate::fs::syscall::sys_utimes(args[0], args[1]).ret() as u64,
+        SYS_VFORK => crate::task::syscall::sys_vfork().ret() as u64,
         _ => match sys_of(num) {
             Some(s) => crate::syscall::dispatch(s, args),
             None => crate::util::error::KernelError::NotImplemented.sysret() as u64,

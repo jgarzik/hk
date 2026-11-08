@@ -351,7 +351,7 @@ fn check_prlimit_permission(target: crate::task::Tid) -> Result<(), i64> {
         .read()
         .get(target)
         .map(|t| t.cred())
-        .ok_or(-3i64)?; // ESRCH
+        .ok_or(KernelError::NoProcess.sysret())?;
     let id_match = [t.uid, t.euid, t.suid].iter().all(|&u| u == me.uid)
         && [t.gid, t.egid, t.sgid].iter().all(|&g| g == me.gid);
     if !id_match && !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
