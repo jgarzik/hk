@@ -33,8 +33,8 @@ use core::any::Any;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use crate::sync::spin::{Mutex, RwLock};
-use spin::Lazy;
+use crate::sync::RwSem;
+use crate::sync::spin::Mutex;
 
 use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
@@ -504,8 +504,9 @@ impl FileOps for MqFileOps {
 // Global Registry
 // ============================================================================
 
-static MQ_REGISTRY: Lazy<RwLock<BTreeMap<FileName, Arc<MqQueue>>>> =
-    Lazy::new(|| RwLock::new(BTreeMap::new()));
+/// The queues by name (Linux: the mqueue root directory, under its
+/// i_rwsem): sleeping, as a create allocates the queue under it
+static MQ_REGISTRY: RwSem<BTreeMap<FileName, Arc<MqQueue>>> = RwSem::new(BTreeMap::new());
 
 static MQ_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -523,12 +524,14 @@ const MSG_TREE_NODE_SIZE: u64 = 48;
 /// leaf, taken under `MQ_REGISTRY` by a create and by a queue's Drop
 struct MqAcct {
     queues: u32,
-    bytes: BTreeMap<u32, u64>,
+    /// (uid, bytes) of each user with a charge; grown with the lock
+    /// released (`kmem::spare`): nothing allocates under it
+    bytes: Vec<(u32, u64)>,
 }
 
 static MQ_ACCT: Mutex<MqAcct> = Mutex::new(MqAcct {
     queues: 0,
-    bytes: BTreeMap::new(),
+    bytes: Vec::new(),
 });
 
 /// What a queue of `maxmsg` messages of `msgsize` bytes charges its
@@ -542,32 +545,54 @@ fn mq_bytes(maxmsg: i64, msgsize: i64) -> u64 {
 /// Charge a new queue of `bytes` to the caller's real uid (Linux
 /// mqueue_create_attr, mqueue_get_inode): ENOSPC past QUEUES_MAX
 /// without CAP_SYS_RESOURCE, EMFILE past `limit` (the caller's
-/// RLIMIT_MSGQUEUE); the charge
+/// RLIMIT_MSGQUEUE), ENOMEM; the charge. A user's first charge needs
+/// room in the list: it is made with `MQ_ACCT` released and the check
+/// repeated (Linux charges the cred's ucounts, made before)
 fn mq_charge(bytes: u64, limit: u64) -> Result<(u32, u64), KernelError> {
     let uid = crate::task::percpu::current_cred().uid;
     let cap = crate::task::capable(crate::task::CAP_SYS_RESOURCE);
-    let mut a = MQ_ACCT.lock();
-    if a.queues >= QUEUES_MAX && !cap {
-        return Err(KernelError::NoSpace);
+    loop {
+        let full = 'locked: {
+            let mut a = MQ_ACCT.lock();
+            if a.queues >= QUEUES_MAX && !cap {
+                return Err(KernelError::NoSpace);
+            }
+            let i = a.bytes.iter().position(|e| e.0 == uid);
+            let cur = i.map_or(0, |i| a.bytes[i].1);
+            let new = cur
+                .checked_add(bytes)
+                .filter(|&n| limit == rlimit::RLIM_INFINITY || n <= limit)
+                .ok_or(KernelError::ProcessFileLimit)?;
+            match i {
+                Some(i) => a.bytes[i].1 = new,
+                None if a.bytes.len() < a.bytes.capacity() => a.bytes.push((uid, new)),
+                None => break 'locked a.bytes.capacity(),
+            }
+            a.queues += 1;
+            return Ok((uid, bytes));
+        };
+        mq_grow(full)?;
     }
-    let cur = a.bytes.get(&uid).copied().unwrap_or(0);
-    let new = cur
-        .checked_add(bytes)
-        .filter(|&n| limit == rlimit::RLIM_INFINITY || n <= limit)
-        .ok_or(KernelError::ProcessFileLimit)?;
-    a.queues += 1;
-    a.bytes.insert(uid, new);
-    Ok((uid, bytes))
+}
+
+/// Room for one more user in `MQ_ACCT` if its list is still full at
+/// `cap`: allocated, and the old list freed, with the lock released
+fn mq_grow(cap: usize) -> Result<(), KernelError> {
+    let bigger = crate::util::kmem::spare(cap)?;
+    let old = crate::util::kmem::adopt(&mut MQ_ACCT.lock().bytes, bigger);
+    drop(old);
+    Ok(())
 }
 
 /// Return a queue's charge
 fn mq_uncharge(uid: u32, bytes: u64) {
     let mut a = MQ_ACCT.lock();
     a.queues = a.queues.saturating_sub(1);
-    if let Some(b) = a.bytes.get_mut(&uid) {
+    if let Some(i) = a.bytes.iter().position(|e| e.0 == uid) {
+        let b = &mut a.bytes[i].1;
         *b = b.saturating_sub(bytes);
         if *b == 0 {
-            a.bytes.remove(&uid);
+            a.bytes.swap_remove(i);
         }
     }
 }

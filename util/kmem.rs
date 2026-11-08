@@ -68,6 +68,33 @@ pub fn try_to_vec<T: Copy>(s: &[T]) -> Result<Vec<T>, KernelError> {
     Ok(v.into_vec())
 }
 
+/// An empty buffer twice `cap` (at least 4), made before taking the
+/// spin lock of a vector that was full at `cap`: [`adopt`] moves the
+/// vector into it under the lock, so nothing allocates there (Linux
+/// allocates before the lock, as simple_xattr_alloc and alloc_ucounts
+/// do); ENOMEM
+pub fn spare<T>(cap: usize) -> Result<Vec<T>, KernelError> {
+    let n = cap.saturating_mul(2).max(4);
+    fits::<T>(n)?;
+    inject()?;
+    let mut v = Vec::new();
+    v.try_reserve_exact(n)
+        .map_err(|_| KernelError::OutOfMemory)?;
+    Ok(v)
+}
+
+/// Under the lock: move `v`'s items into `bigger` if that holds more
+/// (no allocation) and make it the vector; the buffer left over (the
+/// old one, or `bigger` unused) is returned to free after the unlock
+#[must_use]
+pub fn adopt<T>(v: &mut Vec<T>, mut bigger: Vec<T>) -> Vec<T> {
+    if bigger.capacity() > v.capacity() {
+        bigger.append(v);
+        core::mem::swap(v, &mut bigger);
+    }
+    bigger
+}
+
 /// A `Vec` whose every growth is fallible (ENOMEM, capped at
 /// [`MAX_KMALLOC`]): hand an untrusted length to one of these and the
 /// worst case is an error, not a kernel panic.
