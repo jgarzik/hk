@@ -1004,15 +1004,17 @@ rule (`OwnCell`): only the task itself changes them (or its creator
 before it first runs: fork attaches the child's fs, files, nsproxy
 and I/O context after inserting it), always under its alloc_lock; the
 task reads its own lock-free (`current().mm()`, `files()`, `fs()`,
-`nsproxy()`, `comm()`; Linux current->mm etc.); others read them under
-the lock (`Task::task_lock()` on a `TaskRef` the caller holds: a pid
-lookup takes TASKLIST only to find the task; procfs, kcmp, acct,
-ptrace access checks, and the `&Task` helpers `get_task_mm`,
-`get_task_fd`, `get_task_fs`, `get_task_ns`, `get_task_io_context`;
-fork's `fork_fs`, `fork_task_fd`, `fork_nsproxy` and `fork_io` read
-the parent's, its own, through them too).
+`nsproxy()`, `comm()`; Linux current->mm etc.; fork's `fork_fs`,
+`fork_task_fd` and `fork_nsproxy` read the parent's, which is current,
+this way, as Linux copy_fs, copy_files and copy_namespaces read
+current->fs etc.); others read them under the lock
+(`Task::task_lock()` on a `TaskRef` the caller holds: a pid lookup
+takes TASKLIST only to find the task; procfs, kcmp, acct, ptrace
+access checks, and the `&Task` helpers `get_task_mm`, `get_task_fd`,
+`get_task_fs`, `get_task_ns`, `get_task_io_context`).
 `io_context` is the exception: ioprio_set installs one in another
-task, so it is read under the lock only. Exec swaps the mm and comm in
+task, so it is read under the lock only, by its own task too (fork's
+`fork_io`). Exec swaps the mm and comm in
 one alloc_lock section (under `exec_update` and TASKLIST, which it
 holds for the page table), so a reader sees the old name with the old
 mm or the new with the new (Linux exec_mmap, __set_task_comm). Order:

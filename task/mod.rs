@@ -2612,10 +2612,12 @@ pub fn remove_task_io_context(t: &Task) {
 /// The I/O context for a new task, built before it exists (installed
 /// with `set_task_io_context`)
 ///
-/// If `share` is true (CLONE_IO set), child shares `parent`'s Arc<IoContext>.
-/// Otherwise, child gets a new IoContext inheriting parent's ioprio value.
-pub fn fork_io(parent: &Task, share: bool) -> Result<Arc<IoContext>, KernelError> {
-    match get_task_io_context(parent) {
+/// If `share` is true (CLONE_IO set), the child shares the caller's
+/// Arc<IoContext>; otherwise it gets a new one inheriting the caller's
+/// ioprio. Read under the caller's alloc_lock: ioprio_set may install
+/// one in it meanwhile.
+pub fn fork_io(share: bool) -> Result<Arc<IoContext>, KernelError> {
+    match get_task_io_context(&percpu::current()) {
         // CLONE_IO: share the same context
         Some(parent_ctx) if share => Ok(parent_ctx),
         // No CLONE_IO: create new context with inherited ioprio

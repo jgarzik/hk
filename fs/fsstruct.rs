@@ -233,12 +233,13 @@ pub fn exit_task_fs(t: &Task) {
     drop(fs);
 }
 
-/// The fs context a child of `parent` gets (Linux copy_fs): the
-/// parent's own with CLONE_FS, else a copy (a parent without one: a new
-/// one at the root). Nothing is counted yet, so a fork that fails
-/// afterwards just drops it. ENOMEM if the copy cannot be made.
-pub fn fork_fs(parent: &Task, share: bool) -> Result<Option<Arc<FsStruct>>, KernelError> {
-    Ok(match get_task_fs(parent) {
+/// The fs context a child of the caller gets (Linux copy_fs, reading
+/// current->fs lock-free): the caller's own with CLONE_FS, else a copy
+/// (a caller without one: a new one at the root). Nothing is counted
+/// yet, so a fork that fails afterwards just drops it. ENOMEM if the
+/// copy cannot be made.
+pub fn fork_fs(share: bool) -> Result<Option<Arc<FsStruct>>, KernelError> {
+    Ok(match crate::task::percpu::current().fs() {
         Some(fs) if share => Some(fs),
         Some(fs) => Some(fs.copy()?),
         None => FsStruct::new_root(),

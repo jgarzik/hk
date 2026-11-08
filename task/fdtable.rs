@@ -213,11 +213,11 @@ pub fn unshare_task_fd() -> Result<Arc<Files>, KernelError> {
     Ok(new)
 }
 
-/// The table for a new task, built before it exists (Linux copy_files;
-/// installed with `init_task_fd`): `parent`'s with CLONE_FILES
-/// (`share`), else a copy; ENOMEM
-pub fn fork_task_fd(parent: &Task, share: bool) -> Result<Arc<Files>, KernelError> {
-    match get_task_fd(parent) {
+/// The table for a new task, built before it exists (Linux copy_files,
+/// reading current->files lock-free; installed with `init_task_fd`):
+/// the caller's with CLONE_FILES (`share`), else a copy; ENOMEM
+pub fn fork_task_fd(share: bool) -> Result<Arc<Files>, KernelError> {
+    match crate::task::percpu::current().files() {
         Some(p) if share => Ok(p),
         Some(p) => try_arc(Files::new(p.lock().deep_clone())),
         None => try_arc(Files::new(FdTable::new())),

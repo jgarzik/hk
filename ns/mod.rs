@@ -349,13 +349,13 @@ fn may_create_namespaces(ns_flags: u64) -> bool {
     ns_flags & !CLONE_NEWUSER == 0 || crate::task::capable(crate::task::CAP_SYS_ADMIN)
 }
 
-/// The namespaces a child of `parent` gets (Linux copy_namespaces):
-/// new ones for the CLONE_NEW* flags, else the parent's. `child_fs` is
+/// The namespaces a child of the caller gets (Linux copy_namespaces,
+/// reading current->nsproxy lock-free): new ones for the CLONE_NEW*
+/// flags, else the caller's. `child_fs` is
 /// the child's fs context, moved to the copies of its root's and cwd's
 /// mounts in a new mount namespace. Built before the child is visible,
 /// so a failure leaves nothing behind.
 pub fn fork_nsproxy(
-    parent: &Task,
     flags: u64,
     child_fs: Option<&crate::fs::FsStruct>,
 ) -> KernelResult<Arc<NsProxy>> {
@@ -369,7 +369,7 @@ pub fn fork_nsproxy(
     if !may_create_namespaces(ns_flags) {
         return Err(KernelError::NotPermitted);
     }
-    let parent_ns = get_task_ns(parent).unwrap_or_else(|| INIT_NSPROXY.clone());
+    let parent_ns = current().nsproxy().unwrap_or_else(|| INIT_NSPROXY.clone());
     if ns_flags == 0 {
         return Ok(parent_ns);
     }

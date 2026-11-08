@@ -2324,8 +2324,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // child is attached): its fs context, its namespaces (a new mount
     // namespace moves that fs context) and the target cgroup (a bad fd
     // is EBADF)
-    let child_fs = crate::fs::fsstruct::fork_fs(&me, config.flags & CLONE_FS != 0)?;
-    let child_ns = crate::ns::fork_nsproxy(&me, config.flags, child_fs.as_deref())?;
+    let child_fs = crate::fs::fsstruct::fork_fs(config.flags & CLONE_FS != 0)?;
+    let child_ns = crate::ns::fork_nsproxy(config.flags, child_fs.as_deref())?;
     // A thread stays in its group's pid namespace (Linux copy_process:
     // CLONE_THREAD with CLONE_NEWPID or CLONE_NEWUSER, or after an
     // unshare(CLONE_NEWPID), is EINVAL)
@@ -2347,7 +2347,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Its credentials, files, signal state and CLONE_IO context (Linux
     // copy_creds, copy_files, copy_sighand, copy_signal, copy_io): ENOMEM
     let child_cred = crate::task::copy_creds(config.flags, &parent_cred)?;
-    let child_files = crate::task::fdtable::fork_task_fd(&me, config.flags & CLONE_FILES != 0)?;
+    let child_files = crate::task::fdtable::fork_task_fd(config.flags & CLONE_FILES != 0)?;
     let (child_sig, child_signal) = crate::signal::fork_signal(
         &me,
         config.flags & CLONE_SIGHAND != 0,
@@ -2355,7 +2355,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.flags & CLONE_CLEAR_SIGHAND != 0,
     )?;
     let child_io = if config.flags & CLONE_IO != 0 {
-        Some(crate::task::fork_io(&me, true)?)
+        Some(crate::task::fork_io(true)?)
     } else {
         None
     };
