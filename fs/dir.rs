@@ -8,10 +8,13 @@ use alloc::vec::Vec;
 
 use crate::fs::{DevId, DirContext, DirEntry, FileType, InodeMode, KernelError, dac};
 use crate::task::CAP_MKNOD;
-use crate::uaccess::{UaccessArch, copy_to_user};
+use crate::uaccess::{UaccessArch, UserPtr, UserSlice};
+use crate::util::error::KernelResult;
 
 use super::file::flags::AT_FDCWD;
-use super::syscall::{MAX_RW_COUNT, current_fd_table};
+use super::io::fget;
+use super::link::no_op_eperm;
+use super::syscall::MAX_RW_COUNT;
 
 /// Linux dirent64 structure for getdents64
 #[repr(C, packed)]
@@ -94,12 +97,12 @@ fn put_dirent(buf: &mut Vec<u8>, limit: usize, e: &DirEntry, d_off: u64, fmt: Fm
 /// iterate_dir): resumes at the file position, which ends up just past
 /// the last entry returned (the d_off cookie); 0 at the end. EINVAL if
 /// `count` cannot hold the next entry.
-pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
+pub fn sys_getdents64(fd: i32, dirp: UserPtr<u8>, count: u64) -> KernelResult<usize> {
     getdents(fd, dirp, count, Fmt::Dirent64)
 }
 
 /// sys_getdents - legacy getdents with struct linux_dirent (x86-64)
-pub fn sys_getdents(fd: i32, dirp: u64, count: u64) -> i64 {
+pub fn sys_getdents(fd: i32, dirp: UserPtr<u8>, count: u64) -> KernelResult<usize> {
     getdents(fd, dirp, count, Fmt::Dirent)
 }
 
@@ -107,18 +110,16 @@ pub fn sys_getdents(fd: i32, dirp: u64, count: u64) -> i64 {
 /// (spinlocks in hk), so records are gathered into a kernel buffer of
 /// at most GETDENTS_CHUNK bytes and copied to user space only after
 /// `readdir` returned and every lock is dropped.
-fn getdents(fd: i32, dirp: u64, count: u64, fmt: Fmt) -> i64 {
+fn getdents(fd: i32, dirp: UserPtr<u8>, count: u64, fmt: Fmt) -> KernelResult<usize> {
     // count is an unsigned int (Linux getdents64): the high bits of the
     // register are not part of it
     let count = core::cmp::min(count as u32 as usize, MAX_RW_COUNT);
-    if !Uaccess::access_ok(dirp, count) {
-        return KernelError::BadAddress.sysret();
+    if !Uaccess::access_ok(dirp.addr(), count) {
+        return Err(KernelError::BadAddress);
     }
-    let Some(file) = current_fd_table().lock().get(fd) else {
-        return KernelError::BadFd.sysret();
-    };
+    let file = fget(fd)?;
     if !file.is_dir() {
-        return KernelError::NotDirectory.sysret();
+        return Err(KernelError::NotDirectory);
     }
 
     let _pos = file.pos_lock();
@@ -140,19 +141,20 @@ fn getdents(fd: i32, dirp: u64, count: u64, fmt: Fmt) -> i64 {
     let pos = ctx.pos;
 
     if buf.is_empty() {
-        return match r {
-            Err(e) => e.sysret(),
-            // The next entry does not fit in `count`
-            Ok(()) if full => KernelError::InvalidArgument.sysret(),
-            Ok(()) => 0,
+        r?;
+        // The next entry does not fit in `count`
+        return if full {
+            Err(KernelError::InvalidArgument)
+        } else {
+            Ok(0)
         };
     }
-    if copy_to_user::<Uaccess>(dirp, &buf).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
+    UserSlice::new(dirp.addr(), count)
+        .writer()
+        .write_slice(&buf)?;
     // Entries already gathered win over a later error (Linux)
     file.set_pos(pos);
-    buf.len() as i64
+    Ok(buf.len())
 }
 
 /// sys_mkdir - create a directory
@@ -163,9 +165,7 @@ fn getdents(fd: i32, dirp: u64, count: u64, fmt: Fmt) -> i64 {
 /// * `pathname_ptr` - User pointer to path string
 /// * `mode` - Permission bits for the new directory
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_mkdir(pathname_ptr: u64, mode: u32) -> i64 {
+pub fn sys_mkdir(pathname_ptr: UserPtr<u8>, mode: u32) -> KernelResult<()> {
     sys_mkdirat(AT_FDCWD, pathname_ptr, mode)
 }
 
@@ -176,33 +176,21 @@ pub fn sys_mkdir(pathname_ptr: u64, mode: u32) -> i64 {
 /// * `pathname_ptr` - User pointer to path string
 /// * `mode` - Permission bits for the new directory
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_mkdirat(dirfd: i32, pathname_ptr: u64, mode: u32) -> i64 {
-    match do_mkdirat(dirfd, pathname_ptr, mode) {
-        Ok(()) => 0,
-        Err(KernelError::OperationNotSupported) => KernelError::NotPermitted.sysret(),
-        Err(e) => e.sysret(),
-    }
-}
-
-fn do_mkdirat(dirfd: i32, pathname_ptr: u64, mode: u32) -> Result<(), KernelError> {
-    let p = filename_create(dirfd, &getname(pathname_ptr, false)?, true)?;
+pub fn sys_mkdirat(dirfd: i32, pathname_ptr: UserPtr<u8>, mode: u32) -> KernelResult<()> {
+    let p = filename_create(dirfd, &getname(pathname_ptr.addr(), false)?, true)?;
     // vfs_mkdir: permission and sticky bits only, then umask; init_owner
     // adds S_ISGID under a SGID parent
     create_entry(&p, |dir, c| {
         let perm = dac::create_mode(c, dir, (mode & 0o1777) as u16);
         dir.i_op.mkdir(dir, &p.name, InodeMode::directory(perm))
-    })?;
+    })
+    .map_err(no_op_eperm)?;
     Ok(())
 }
 
 /// sys_rmdir - remove an empty directory
-pub fn sys_rmdir(pathname_ptr: u64) -> i64 {
-    match getname(pathname_ptr, false).and_then(|path| do_rmdir(AT_FDCWD, &path)) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+pub fn sys_rmdir(pathname_ptr: UserPtr<u8>) -> KernelResult<()> {
+    do_rmdir(AT_FDCWD, &getname(pathname_ptr.addr(), false)?)
 }
 
 /// rmdir / unlinkat(AT_REMOVEDIR) (Linux do_rmdir): a last name of ".."
@@ -219,7 +207,7 @@ pub fn do_rmdir(dirfd: i32, path: &[u8]) -> Result<(), KernelError> {
 }
 
 /// sys_mknod - create a special or ordinary file
-pub fn sys_mknod(pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
+pub fn sys_mknod(pathname_ptr: UserPtr<u8>, mode: u32, dev: u64) -> KernelResult<()> {
     sys_mknodat(AT_FDCWD, pathname_ptr, mode, dev)
 }
 
@@ -229,7 +217,7 @@ pub fn sys_mknod(pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
 /// like vfs_mknod). Sockets get an S_IFSOCK inode (connectable only
 /// once an AF_UNIX socket binds it, so a mknod'ed one refuses
 /// connections); FIFOs are created as regular files for now.
-pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
+pub fn sys_mknodat(dirfd: i32, pathname_ptr: UserPtr<u8>, mode: u32, dev: u64) -> KernelResult<()> {
     const S_IFREG: u32 = 0o100000;
     const S_IFCHR: u32 = 0o020000;
     const S_IFBLK: u32 = 0o060000;
@@ -243,17 +231,13 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
     let is_dev = match ty {
         S_IFREG | 0 | S_IFIFO | S_IFSOCK => false,
         S_IFCHR | S_IFBLK => true,
-        S_IFDIR => return KernelError::NotPermitted.sysret(),
-        _ => return KernelError::InvalidArgument.sysret(),
+        S_IFDIR => return Err(KernelError::NotPermitted),
+        _ => return Err(KernelError::InvalidArgument),
     };
 
-    let p = match getname(pathname_ptr, false).and_then(|path| filename_create(dirfd, &path, false))
-    {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
+    let p = filename_create(dirfd, &getname(pathname_ptr.addr(), false)?, false)?;
     let name = p.name.as_slice();
-    let r = create_entry(&p, |dir, c| {
+    create_entry(&p, |dir, c| {
         if is_dev && !dac::capable(c, CAP_MKNOD) {
             return Err(KernelError::NotPermitted);
         }
@@ -273,12 +257,9 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
                 .mknod(dir, name, InodeMode::fifo(perm), DevId::from_user(0)),
             _ => dir.i_op.create(dir, name, InodeMode::regular(perm)),
         }
-    });
-    match r {
-        Ok(_) => 0,
-        Err(KernelError::OperationNotSupported) => KernelError::NotPermitted.sysret(),
-        Err(e) => e.sysret(),
-    }
+    })
+    .map_err(no_op_eperm)?;
+    Ok(())
 }
 
 /// Create the socket inode an AF_UNIX bind names (Linux unix_bind_bsd:
@@ -287,15 +268,12 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
 /// EEXIST; returns the new dentry
 pub fn mknod_sock(path: &[u8], perm: u16) -> Result<alloc::sync::Arc<super::Dentry>, KernelError> {
     let p = filename_create(AT_FDCWD, path, false)?;
-    let r = create_entry(&p, |dir, c| {
+    create_entry(&p, |dir, c| {
         let perm = dac::create_mode(c, dir, perm);
         dir.i_op
             .mknod(dir, &p.name, InodeMode::socket(perm), DevId::from_user(0))
-    });
-    match r {
-        Err(KernelError::OperationNotSupported) => Err(KernelError::NotPermitted),
-        r => r,
-    }
+    })
+    .map_err(no_op_eperm)
 }
 
 /// Remove the entry `mknod_sock` created when the bind then failed

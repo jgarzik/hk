@@ -305,8 +305,8 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Brk => crate::mm::syscall::sys_brk(a[0]).ret() as u64,
         Sys::Capget => crate::task::syscall::sys_capget::<Uaccess>(a[0], a[1]).ret() as u64,
         Sys::Capset => crate::task::syscall::sys_capset::<Uaccess>(a[0], a[1]).ret() as u64,
-        Sys::Chdir => crate::fs::syscall::sys_chdir(a[0]).ret() as u64,
-        Sys::Chroot => crate::fs::syscall::sys_chroot(a[0]).ret() as u64,
+        Sys::Chdir => crate::fs::syscall::sys_chdir(UserPtr::new(a[0])).ret() as u64,
+        Sys::Chroot => crate::fs::syscall::sys_chroot(UserPtr::new(a[0])).ret() as u64,
         Sys::ClockGetres => {
             crate::time::time_syscall::sys_clock_getres(a[0] as i32, UserPtr::new(a[1])).ret()
                 as u64
@@ -477,8 +477,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::syscall::sys_getcpu::<Uaccess>(crate::cpu::this_id(), a[0], a[1]).ret()
                 as u64
         }
-        Sys::Getcwd => crate::fs::syscall::sys_getcwd(a[0], a[1]).ret() as u64,
-        Sys::Getdents64 => crate::fs::syscall::sys_getdents64(a[0] as i32, a[1], a[2]).ret() as u64,
+        Sys::Getcwd => crate::fs::syscall::sys_getcwd(UserPtr::new(a[0]), a[1]).ret() as u64,
+        Sys::Getdents64 => {
+            crate::fs::syscall::sys_getdents64(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
+        }
         Sys::Getegid => {
             crate::task::syscall::sys_getegid(crate::task::percpu::current_cred().egid).ret() as u64
         }
@@ -618,10 +620,14 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::signal::syscall::sys_kill(i64::from(a[0] as i32), a[1] as u32).ret() as u64
         }
         Sys::Lgetxattr => crate::fs::syscall::sys_lgetxattr(a[0], a[1], a[2], a[3]).ret() as u64,
-        Sys::Linkat => {
-            crate::fs::syscall::sys_linkat(a[0] as i32, a[1], a[2] as i32, a[3], a[4] as i32).ret()
-                as u64
-        }
+        Sys::Linkat => crate::fs::syscall::sys_linkat(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as i32,
+            UserPtr::new(a[3]),
+            a[4] as i32,
+        )
+        .ret() as u64,
         Sys::Listen => crate::net::syscall::sys_listen(a[0] as i32, a[1] as i32).ret() as u64,
         Sys::Listxattr => crate::fs::syscall::sys_listxattr(a[0], a[1], a[2]).ret() as u64,
         Sys::Llistxattr => crate::fs::syscall::sys_llistxattr(a[0], a[1], a[2]).ret() as u64,
@@ -652,10 +658,12 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::mm::syscall::sys_mincore(a[0], a[1], UserPtr::new(a[2])).ret() as u64
         }
         Sys::Mkdirat => {
-            crate::fs::syscall::sys_mkdirat(a[0] as i32, a[1], a[2] as u32).ret() as u64
+            crate::fs::syscall::sys_mkdirat(a[0] as i32, UserPtr::new(a[1]), a[2] as u32).ret()
+                as u64
         }
         Sys::Mknodat => {
-            crate::fs::syscall::sys_mknodat(a[0] as i32, a[1], a[2] as u32, a[3]).ret() as u64
+            crate::fs::syscall::sys_mknodat(a[0] as i32, UserPtr::new(a[1]), a[2] as u32, a[3])
+                .ret() as u64
         }
         Sys::Mlock => crate::mm::syscall::sys_mlock(a[0], a[1]).ret() as u64,
         Sys::Mlock2 => crate::mm::syscall::sys_mlock2(a[0], a[1], a[2] as i32).ret() as u64,
@@ -833,9 +841,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Readahead => {
             crate::fs::syscall::sys_readahead(a[0] as i32, a[1] as i64, a[2] as usize).ret() as u64
         }
-        Sys::Readlinkat => {
-            crate::fs::syscall::sys_readlinkat(a[0] as i32, a[1], a[2], a[3]).ret() as u64
-        }
+        Sys::Readlinkat => crate::fs::syscall::sys_readlinkat(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+        )
+        .ret() as u64,
         Sys::Readv => {
             crate::fs::syscall::sys_readv(a[0] as i32, UserPtr::new(a[1]), a[2] as i32).ret() as u64
         }
@@ -864,13 +876,21 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
                 as u64
         }
         Sys::Removexattr => crate::fs::syscall::sys_removexattr(a[0], a[1]).ret() as u64,
-        Sys::Renameat => {
-            crate::fs::syscall::sys_renameat(a[0] as i32, a[1], a[2] as i32, a[3]).ret() as u64
-        }
-        Sys::Renameat2 => {
-            crate::fs::syscall::sys_renameat2(a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32)
-                as u64
-        }
+        Sys::Renameat => crate::fs::syscall::sys_renameat(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as i32,
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
+        Sys::Renameat2 => crate::fs::syscall::sys_renameat2(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as i32,
+            UserPtr::new(a[3]),
+            a[4] as u32,
+        )
+        .ret() as u64,
         Sys::RequestKey => crate::keys::sys_request_key(
             UserPtr::new(a[0]),
             UserPtr::new(a[1]),
@@ -1141,7 +1161,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         .ret() as u64,
         Sys::Swapoff => crate::mm::sys_swapoff(UserPtr::new(a[0])).ret() as u64,
         Sys::Swapon => crate::mm::sys_swapon(UserPtr::new(a[0]), a[1] as i32).ret() as u64,
-        Sys::Symlinkat => crate::fs::syscall::sys_symlinkat(a[0], a[1] as i32, a[2]).ret() as u64,
+        Sys::Symlinkat => {
+            crate::fs::syscall::sys_symlinkat(UserPtr::new(a[0]), a[1] as i32, UserPtr::new(a[2]))
+                .ret() as u64
+        }
         Sys::Sync => crate::fs::syscall::sys_sync().ret() as u64,
         Sys::Syncfs => crate::fs::syscall::sys_syncfs(a[0] as i32).ret() as u64,
         Sys::SyncFileRange => crate::fs::syscall::sys_sync_file_range(
@@ -1211,7 +1234,8 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Umount2 => crate::fs::syscall::sys_umount2(a[0], a[1] as i32).ret() as u64,
         Sys::Uname => crate::ns::uts::sys_uname(UserPtr::new(a[0])).ret() as u64,
         Sys::Unlinkat => {
-            crate::fs::syscall::sys_unlinkat(a[0] as i32, a[1], a[2] as i32).ret() as u64
+            crate::fs::syscall::sys_unlinkat(a[0] as i32, UserPtr::new(a[1]), a[2] as i32).ret()
+                as u64
         }
         Sys::Unshare => crate::ns::sys_unshare(a[0]).ret() as u64,
         Sys::Utimensat => crate::fs::syscall::sys_utimensat(
