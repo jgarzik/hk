@@ -254,7 +254,7 @@ impl SigInfo {
     /// Its signal; None for an si_signo that is no signal (a tracer's
     /// PTRACE_SETSIGINFO may set any)
     pub fn sig(&self) -> Option<Signal> {
-        u32::try_from(self.signo).ok().and_then(Signal::new)
+        Signal::from_int(self.signo)
     }
 
     /// The same info for `sig`

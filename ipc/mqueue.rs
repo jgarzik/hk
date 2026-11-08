@@ -900,7 +900,7 @@ fn notify_event(sev: SigEvent) -> KernelResult<(SigEvent, Option<Signal>)> {
     match sev.sigev_notify {
         SIGEV_NONE => Ok((sev, None)),
         SIGEV_SIGNAL => {
-            let sig = u32::try_from(sev.sigev_signo).ok().and_then(Signal::new);
+            let sig = Signal::from_int(sev.sigev_signo);
             Ok((sev, Some(sig.ok_or(KernelError::InvalidArgument)?)))
         }
         // Linux mqueue notify does not take SIGEV_THREAD_ID (only

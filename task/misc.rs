@@ -1133,7 +1133,7 @@ fn pidfd_info(
     use crate::signal::{SendInfo, SigInfo, si_code};
     if uinfo.is_null() {
         // Kill's info, none to make for a probe (0), which sends nothing
-        let sig = u32::try_from(sig).ok().and_then(Signal::new);
+        let sig = Signal::from_int(sig);
         let Some(sig) = sig.filter(|_| scope == Scope::Thread) else {
             return Ok(SendInfo::User);
         };

@@ -139,12 +139,20 @@ impl ExitSignal {
     /// The signal it sends: None for a thread's, 0, or past NSIG (Linux
     /// do_notify_parent: valid_signal(sig) && sig)
     pub fn signal(self) -> Option<Signal> {
-        u32::try_from(self.0).ok().and_then(Signal::new)
+        Signal::from_int(self.0.into())
     }
 
     /// The number Linux stores (/proc/PID/stat's exit_signal)
     pub const fn raw(self) -> i32 {
         self.0 as i32
+    }
+}
+
+impl Signal {
+    /// A C int as a signal: None for 0, a negative number or one past
+    /// NSIG
+    pub fn from_int(n: i32) -> Option<Self> {
+        u32::try_from(n).ok().and_then(Self::new)
     }
 }
 
@@ -247,6 +255,15 @@ mod tests {
         assert_eq!(valid_signal(65), None);
         assert_eq!(valid_signal(1 << 32), None);
         assert_eq!(valid_signal(-1i32 as u64), None);
+    }
+
+    /// A C int is a signal only in 1..=NSIG
+    #[test]
+    fn from_int() {
+        assert_eq!(Signal::from_int(-1), None);
+        assert_eq!(Signal::from_int(0), None);
+        assert_eq!(Signal::from_int(65), None);
+        assert_eq!(Signal::from_int(17), Some(SIGCHLD));
     }
 
     /// The sigset bit and table slot are nr - 1

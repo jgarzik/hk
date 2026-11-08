@@ -89,7 +89,7 @@ impl SigEvent {
     /// Its signal: None for 0 or a number no signal has (a SIGEV_NONE
     /// timer's, unchecked by timer_create)
     pub fn signal(&self) -> Option<Signal> {
-        u32::try_from(self.sigev_signo).ok().and_then(Signal::new)
+        Signal::from_int(self.sigev_signo)
     }
 }
 
