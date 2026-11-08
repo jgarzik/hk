@@ -24,4 +24,5 @@ pub mod rlimit;
 pub mod sched_ids;
 pub mod setpgid;
 pub mod startup;
+pub mod uptr_top;
 pub mod wake_storm;

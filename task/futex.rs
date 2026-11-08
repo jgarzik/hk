@@ -411,6 +411,7 @@ use crate::task::percpu::TASKLIST;
 
 /// Robust list head structure (matches Linux ABI)
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct RobustListHead {
     /// The head of the list. Points back to itself if empty.
     pub list: u64,
@@ -419,6 +420,12 @@ pub struct RobustListHead {
     /// Address of lock being acquired (for race with exit)
     pub list_op_pending: u64,
 }
+
+crate::pod!(RobustListHead {
+    list,
+    futex_offset,
+    list_op_pending
+});
 
 impl RobustListHead {
     /// Size of the robust list head structure
@@ -467,9 +474,10 @@ fn read_user_timeout(timeout_ptr: u64) -> Result<Option<u64>, i32> {
         return Ok(None);
     }
 
-    // Read tv_sec and tv_nsec
-    let tv_sec = read_user_u64(timeout_ptr)?;
-    let tv_nsec = read_user_u64(timeout_ptr + 8)?;
+    // struct timespec read whole: no field address is computed from
+    // the user pointer
+    let [tv_sec, tv_nsec] = crate::uaccess::copy_val_from_user::<Uaccess, [u64; 2]>(timeout_ptr)
+        .map_err(|_| KernelError::BadAddress.to_errno_neg())?;
 
     // Validate
     if tv_nsec >= 1_000_000_000 {
@@ -921,21 +929,13 @@ pub fn exit_robust_list(tid: Tid) {
         None => return, // No robust list registered
     };
 
-    // Read robust list head from user memory
-    let list_ptr = match read_user_u64(head_addr) {
-        Ok(v) => v,
-        Err(_) => return,
+    // The robust list head, read whole (Linux fetch_robust_entry and
+    // get_user of each field, from one checked struct address)
+    let Ok(head) = crate::uaccess::copy_val_from_user::<Uaccess, RobustListHead>(head_addr) else {
+        return;
     };
-
-    let futex_offset = match read_user_u64(head_addr + 8) {
-        Ok(v) => v as i64,
-        Err(_) => return,
-    };
-
-    let pending_ptr = match read_user_u64(head_addr + 16) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+    let (list_ptr, futex_offset, pending_ptr) =
+        (head.list, head.futex_offset, head.list_op_pending);
 
     // Linux exit_robust_list: bit 0 of an entry marks a PI futex; the
     // pending op (a lock being taken or released) is handled last
@@ -1131,6 +1131,12 @@ struct UserFutexWaitv {
     flags: u32,
     __reserved: u32,
 }
+crate::pod!(UserFutexWaitv {
+    val,
+    uaddr,
+    flags,
+    __reserved
+});
 
 /// Kernel-side futex_waitv entry with additional tracking state
 struct FutexWaitvEntry {
@@ -1203,28 +1209,15 @@ pub fn sys_futex_waitv(
 
     // Copy and validate waiters from userspace
     let mut entries: Vec<FutexWaitvEntry> = Vec::with_capacity(nr_futexes as usize);
-    let entry_size = core::mem::size_of::<UserFutexWaitv>() as u64;
+    let waiters = crate::uaccess::UserPtr::<UserFutexWaitv>::new(waiters_ptr);
 
     for i in 0..nr_futexes {
-        let entry_ptr = waiters_ptr + u64::from(i) * entry_size;
-
-        // Read the futex_waitv struct from userspace
-        let val = match read_user_u64(entry_ptr) {
-            Ok(v) => v,
-            Err(e) => return e,
+        // Each struct futex_waitv read whole; an array running past the
+        // top of the address space is EFAULT
+        let Some(w) = waiters.offset(i as usize).and_then(|p| p.read().ok()) else {
+            return KernelError::BadAddress.to_errno_neg();
         };
-        let uaddr = match read_user_u64(entry_ptr + 8) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let flags_field = match read_user_u32(entry_ptr + 16) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let reserved = match read_user_u32(entry_ptr + 20) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
+        let (val, uaddr, flags_field, reserved) = (w.val, w.uaddr, w.flags, w.__reserved);
 
         // Reserved field must be 0
         if reserved != 0 {

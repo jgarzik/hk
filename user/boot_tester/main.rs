@@ -341,6 +341,7 @@ pub fn run_all_tests() {
     time::adjtimex::run_tests();
     isolated(b"SETTIME", time::settime::run_tests);
     isolated(b"SECCOMP", signal::seccomp::run_tests);
+    isolated(b"UPTR_TOP", process::uptr_top::run_tests);
     isolated(b"SCHED_IDS", process::sched_ids::run_tests);
     io::errno_pass::run_tests();
     isolated(b"CPU_ACCT", proc::cpu_acct::run_tests);

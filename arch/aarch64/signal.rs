@@ -429,7 +429,8 @@ fn parse_reserved(addr: u64) -> Option<FpsimdContext> {
     let mut off = 0usize;
     let mut fpsimd = None;
     while off + 8 <= RESERVED_SIZE {
-        let head: CtxHead = read_user(addr + off as u64)?;
+        let at = addr.checked_add(off as u64)?;
+        let head: CtxHead = read_user(at)?;
         let size = head.size as usize;
         match head.magic {
             0 if size == 0 => return fpsimd,
@@ -437,7 +438,7 @@ fn parse_reserved(addr: u64) -> Option<FpsimdContext> {
                 if off + size > RESERVED_SIZE {
                     return None;
                 }
-                fpsimd = Some(read_user::<FpsimdContext>(addr + off as u64)?);
+                fpsimd = Some(read_user::<FpsimdContext>(at)?);
             }
             ESR_MAGIC if size == 16 => {}
             _ => return None,

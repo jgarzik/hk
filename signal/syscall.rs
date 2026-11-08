@@ -659,13 +659,11 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
 
     // Read timeout if provided
     let timeout_ns = if ts_ptr != 0 {
-        let tv_sec = match get_user::<Uaccess, i64>(ts_ptr) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
-        };
-        let tv_nsec = match get_user::<Uaccess, i64>(ts_ptr + 8) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
+        // struct timespec read whole, never field by field from a
+        // computed user address
+        let Ok([tv_sec, tv_nsec]) = crate::uaccess::copy_val_from_user::<Uaccess, [i64; 2]>(ts_ptr)
+        else {
+            return KernelError::BadAddress.sysret();
         };
 
         // Validate timeout
