@@ -601,7 +601,10 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
         PR_SET_SECCOMP => {
             // Delegate to seccomp module
             // arg2 = mode, _arg3 = filter (for FILTER mode)
-            crate::seccomp::prctl_set_seccomp(arg2, _arg3)
+            crate::util::error::SysRet::ret(crate::seccomp::prctl_set_seccomp(
+                arg2,
+                UserPtr::new(_arg3),
+            ))
         }
 
         PR_SET_KEEPCAPS => {

@@ -4,7 +4,7 @@
 
 use crate::task::percpu::TASKLIST;
 use crate::uaccess::UserPtr;
-use crate::util::error::{KernelError, KernelResult, SysRet};
+use crate::util::error::{KernelError, KernelResult};
 
 use super::filter::{SeccompFilter, SockFprog, create_filter_from_user};
 use super::{
@@ -196,11 +196,11 @@ pub fn prctl_get_seccomp() -> i64 {
 /// * `filter` - Filter program pointer (for FILTER mode)
 ///
 /// # Returns
-/// 0 on success, negative errno on error
-pub fn prctl_set_seccomp(mode: u64, filter: u64) -> i64 {
+/// 0 on success
+pub fn prctl_set_seccomp(mode: u64, filter: UserPtr<SockFprog>) -> KernelResult<i64> {
     match mode as u8 {
-        SECCOMP_MODE_STRICT => set_seccomp_strict().ret(),
-        SECCOMP_MODE_FILTER => set_seccomp_filter(UserPtr::new(filter), false, false).ret(),
-        _ => KernelError::InvalidArgument.sysret(),
+        SECCOMP_MODE_STRICT => set_seccomp_strict().map(|()| 0),
+        SECCOMP_MODE_FILTER => set_seccomp_filter(filter, false, false),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
