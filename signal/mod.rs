@@ -1143,8 +1143,9 @@ pub fn send_signal(t: &Task, sig: Signal) -> KernelResult<()> {
 }
 
 /// Send `sig` with `info` to task `t` alone (Linux send_sig_info,
-/// PIDTYPE_PID, with no permission check): ESRCH (reaped), EINVAL, or
-/// EAGAIN when an RT signal's info cannot be queued
+/// PIDTYPE_PID, with no permission check): ESRCH (reaped), or EAGAIN
+/// when an RT signal's info cannot be queued; a [`Signal`] is always
+/// a valid number
 pub fn send_sig_info(t: &Task, sig: Signal, info: SendInfo) -> KernelResult<()> {
     send_task(t, sig, info, PidType::Pid, false)
 }
