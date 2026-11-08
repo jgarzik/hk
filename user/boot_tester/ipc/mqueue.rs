@@ -17,6 +17,10 @@
 //!   close), so the parent may register (no EBUSY)
 //! - MQ_LEN_UNSIGNED: message lengths compare as size_t: a send of
 //!   SIZE_MAX bytes is EMSGSIZE, a receive into SIZE_MAX bytes is not
+//! - MQ_RLIMIT: a queue charges its creator's real uid maxmsg * (msgsize
+//!   + overhead) bytes against RLIMIT_MSGQUEUE (EMFILE past it), and an
+//!   unprivileged user meets queues_max (ENOSPC) (Linux
+//!   mqueue_get_inode, mqueue_create_attr)
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -59,6 +63,7 @@ pub fn run_tests() {
     test_mq_notify_owner_exit();
     test_mq_read_status();
     test_mq_len_unsigned();
+    test_mq_rlimit();
 }
 
 fn test_mq_len_unsigned() {
@@ -82,6 +87,71 @@ fn test_mq_len_unsigned() {
         b"MQ_LEN_UNSIGNED",
         fd >= 0 && s == EMSGSIZE && r == EAGAIN,
         s * 1000 + r,
+    );
+}
+
+/// In a child as uid 4242: [the 1st and 2nd default queue under a
+/// 100000-byte RLIMIT_MSGQUEUE, the first refusal among 300 tiny
+/// queues, how many came before it]
+fn mq_rlimit_child() -> i64 {
+    use hk_syscall::{RLIMIT_MSGQUEUE, RLimit, sys_setresuid, sys_setrlimit};
+    let lim = RLimit {
+        rlim_cur: 100_000,
+        rlim_max: 100_000,
+    };
+    if sys_setrlimit(RLIMIT_MSGQUEUE, &lim) != 0 || sys_setresuid(4242, 4242, 4242) != 0 {
+        return 1;
+    }
+    let flags = O_RDWR as i32 | O_CREAT as i32;
+    // One default queue (10 * (8192 + 96) = 82880 bytes) fits, two not
+    let a = sys_mq_open(b"mq_rl_a\0".as_ptr(), flags, 0o600, core::ptr::null());
+    let b = sys_mq_open(b"mq_rl_b\0".as_ptr(), flags, 0o600, core::ptr::null());
+    sys_mq_unlink(b"mq_rl_a\0".as_ptr());
+    sys_mq_unlink(b"mq_rl_b\0".as_ptr());
+    if a < 0 || b != -24 {
+        return 2;
+    }
+    sys_close(a as u64);
+    // queues_max (256 in the namespace): tiny queues until refused
+    let attr = MqAttr::new(1, 1);
+    let mut name = *b"mq_rl_000\0";
+    let mut first_err = 0;
+    let mut made = 0;
+    for i in 0..300u32 {
+        name[6] = b'0' + (i / 100) as u8;
+        name[7] = b'0' + (i / 10 % 10) as u8;
+        name[8] = b'0' + (i % 10) as u8;
+        let fd = sys_mq_open(name.as_ptr(), flags, 0o600, &attr);
+        if fd < 0 {
+            first_err = fd;
+            break;
+        }
+        sys_close(fd as u64);
+        made += 1;
+    }
+    for i in 0..made {
+        name[6] = b'0' + (i / 100) as u8;
+        name[7] = b'0' + (i / 10 % 10) as u8;
+        name[8] = b'0' + (i % 10) as u8;
+        sys_mq_unlink(name.as_ptr());
+    }
+    const ENOSPC: i64 = -28;
+    if first_err != ENOSPC || made == 0 || made > 256 {
+        return 3;
+    }
+    0
+}
+
+fn test_mq_rlimit() {
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        hk_syscall::sys_exit(mq_rlimit_child() as u64);
+    }
+    let mut st = 0i32;
+    hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+    crate::harness::report_step(
+        b"MQ_RLIMIT",
+        i64::from(st >> 8) + i64::from(st & 0x7f) * 100,
     );
 }
 

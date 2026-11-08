@@ -183,6 +183,17 @@ pub struct MqQueue {
     notify: Mutex<Option<MqNotify>>,
     waitq_send: WaitQueue,
     waitq_recv: WaitQueue,
+    /// The creator's real uid and the bytes charged to it (Linux
+    /// info->ucounts, mq_bytes), returned when the queue is freed
+    charge: (u32, u64),
+}
+
+impl Drop for MqQueue {
+    /// The queue is gone (unlinked, last file closed): its charges go
+    /// (Linux mqueue_evict_inode)
+    fn drop(&mut self) {
+        mq_uncharge(self.charge.0, self.charge.1);
+    }
 }
 
 impl MqQueue {
@@ -209,7 +220,8 @@ impl MqQueue {
         )
     }
 
-    fn new(name: FileName, mode: u32, maxmsg: i64, msgsize: i64) -> Self {
+    /// A queue charged as `charge` (see [`mq_charge`])
+    fn new(name: FileName, mode: u32, maxmsg: i64, msgsize: i64, charge: (u32, u64)) -> Self {
         // Get current task's effective uid/gid as owner
         let cred = crate::task::percpu::current_cred();
         Self {
@@ -225,6 +237,7 @@ impl MqQueue {
             notify: Mutex::new(None),
             waitq_send: WaitQueue::new(),
             waitq_recv: WaitQueue::new(),
+            charge,
         }
     }
 
@@ -496,6 +509,69 @@ static MQ_REGISTRY: Lazy<RwLock<BTreeMap<FileName, Arc<MqQueue>>>> =
 
 static MQ_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Queues in the system without CAP_SYS_RESOURCE (Linux
+/// DFLT_QUEUESMAX, fs.mqueue.queues_max)
+const QUEUES_MAX: u32 = 256;
+
+/// sizeof(struct msg_msg) and sizeof(struct posix_msg_tree_node) on
+/// 64-bit Linux: the per-message overhead in a queue's charge
+const MSG_MSG_SIZE: u64 = 48;
+const MSG_TREE_NODE_SIZE: u64 = 48;
+
+/// The queue count and each user's queue bytes (Linux mq_lock over
+/// ipc_ns->mq_queues_count and the UCOUNT_RLIMIT_MSGQUEUE ucounts); a
+/// leaf, taken under `MQ_REGISTRY` by a create and by a queue's Drop
+struct MqAcct {
+    queues: u32,
+    bytes: BTreeMap<u32, u64>,
+}
+
+static MQ_ACCT: Mutex<MqAcct> = Mutex::new(MqAcct {
+    queues: 0,
+    bytes: BTreeMap::new(),
+});
+
+/// What a queue of `maxmsg` messages of `msgsize` bytes charges its
+/// creator against RLIMIT_MSGQUEUE (Linux mqueue_get_inode's mq_bytes);
+/// both positive and capped by mq_attr_ok, so the sum fits
+fn mq_bytes(maxmsg: i64, msgsize: i64) -> u64 {
+    let (m, s) = (maxmsg as u64, msgsize as u64);
+    m * MSG_MSG_SIZE + m.min(u64::from(MQ_PRIO_MAX)) * MSG_TREE_NODE_SIZE + m * s
+}
+
+/// Charge a new queue of `bytes` to the caller's real uid (Linux
+/// mqueue_create_attr, mqueue_get_inode): ENOSPC past QUEUES_MAX
+/// without CAP_SYS_RESOURCE, EMFILE past `limit` (the caller's
+/// RLIMIT_MSGQUEUE); the charge
+fn mq_charge(bytes: u64, limit: u64) -> Result<(u32, u64), KernelError> {
+    let uid = crate::task::percpu::current_cred().uid;
+    let cap = crate::task::capable(crate::task::CAP_SYS_RESOURCE);
+    let mut a = MQ_ACCT.lock();
+    if a.queues >= QUEUES_MAX && !cap {
+        return Err(KernelError::NoSpace);
+    }
+    let cur = a.bytes.get(&uid).copied().unwrap_or(0);
+    let new = cur
+        .checked_add(bytes)
+        .filter(|&n| limit == rlimit::RLIM_INFINITY || n <= limit)
+        .ok_or(KernelError::ProcessFileLimit)?;
+    a.queues += 1;
+    a.bytes.insert(uid, new);
+    Ok((uid, bytes))
+}
+
+/// Return a queue's charge
+fn mq_uncharge(uid: u32, bytes: u64) {
+    let mut a = MQ_ACCT.lock();
+    a.queues = a.queues.saturating_sub(1);
+    if let Some(b) = a.bytes.get_mut(&uid) {
+        *b = b.saturating_sub(bytes);
+        if *b == 0 {
+            a.bytes.remove(&uid);
+        }
+    }
+}
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -619,6 +695,9 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
         None
     };
 
+    // Read before the registry's spin lock
+    let msgq_limit = rlimit::rlimit(rlimit::RLIMIT_MSGQUEUE);
+
     // Try to find or create queue
     let queue = {
         let mut registry = MQ_REGISTRY.write();
@@ -646,11 +725,17 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
                 None => (DFLT_MSGMAX, DFLT_MSGSIZEMAX),
             };
 
+            let charge = match mq_charge(mq_bytes(maxmsg, msgsize), msgq_limit) {
+                Ok(c) => c,
+                Err(e) => return e.sysret(),
+            };
+            // A queue that cannot be made returns its charge as it drops
             let queue = match try_arc(MqQueue::new(
                 queue_name.clone().into(),
                 mode,
                 maxmsg,
                 msgsize,
+                charge,
             )) {
                 Ok(q) => q,
                 Err(e) => return e.sysret(),
