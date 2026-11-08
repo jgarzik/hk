@@ -721,7 +721,6 @@ pub trait LocalTimerOps {
 ///
 /// Abstracts timekeeping hardware - high-resolution cycle counters
 /// (TSC on x86, generic timer on ARM) and real-time clocks.
-#[expect(dead_code)]
 pub trait TimekeeperOps {
     /// Clock source type (TSC info on x86, etc.)
     type ClockSource;
@@ -733,12 +732,6 @@ pub trait TimekeeperOps {
 
     /// Get the clock source frequency in Hz
     fn clock_frequency(source: &Self::ClockSource) -> u64;
-
-    /// Check if the clock source is reliable
-    ///
-    /// Returns false if the clock may drift or be unreliable
-    /// (e.g., TSC on older CPUs that don't support invariant TSC).
-    fn clock_is_reliable(source: &Self::ClockSource) -> bool;
 
     /// Read the current cycle count
     ///

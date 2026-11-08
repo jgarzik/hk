@@ -63,18 +63,6 @@ pub struct CpuInfo {
     pub is_bsp: bool,
 }
 
-/// Information about an I/O APIC found in MADT
-#[derive(Debug, Clone, Copy)]
-#[expect(dead_code)] // Fields used for future I/O APIC configuration
-pub struct IoApicInfo {
-    /// I/O APIC ID
-    pub id: u8,
-    /// Physical base address
-    pub address: u32,
-    /// Global System Interrupt base
-    pub gsi_base: u32,
-}
-
 /// ACPI information extracted from tables
 #[derive(Debug)]
 pub struct AcpiInfo {
@@ -82,8 +70,6 @@ pub struct AcpiInfo {
     pub lapic_base: u64,
     /// List of CPUs found
     pub cpus: Vec<CpuInfo>,
-    /// List of I/O APICs found
-    pub ioapics: Vec<IoApicInfo>,
     /// Bootstrap processor's APIC ID (32-bit for X2APIC support)
     pub bsp_apic_id: u32,
     /// Power management information (for shutdown/reboot)
@@ -413,7 +399,6 @@ fn parse_madt(t: &[u8]) -> Result<AcpiInfo, &'static str> {
     let mut info = AcpiInfo {
         lapic_base: u64::from(le32(t, 36).ok_or(BAD)?),
         cpus: Vec::new(),
-        ioapics: Vec::new(),
         bsp_apic_id: 0,   // Will be set after LAPIC is mapped
         power_info: None, // Will be set after FADT parsing
     };
@@ -453,25 +438,14 @@ fn parse_madt(t: &[u8]) -> Result<AcpiInfo, &'static str> {
                     });
                 }
             }
-            MADT_ENTRY_IOAPIC => {
-                // header (2) + id (1) + reserved (1) + address (4) + gsi_base (4)
-                if e.len() < 12 {
-                    return Err(BAD);
-                }
-                info.ioapics.push(IoApicInfo {
-                    id: e[2],
-                    address: le32(e, 4).ok_or(BAD)?,
-                    gsi_base: le32(e, 8).ok_or(BAD)?,
-                });
-            }
             MADT_ENTRY_LAPIC_64 => {
                 // header (2) + reserved (2) + address (8)
                 let b = e.get(4..12).ok_or(BAD)?;
                 info.lapic_base = u64::from_le_bytes(b.try_into().map_err(|_| BAD)?);
             }
-            // Interrupt source overrides, LAPIC NMIs and the rest are not
-            // needed for basic SMP boot
-            MADT_ENTRY_ISO | MADT_ENTRY_LAPIC_NMI => {}
+            // I/O APICs, interrupt source overrides, LAPIC NMIs and the
+            // rest are not used: device IRQs go through the 8259 PIC
+            MADT_ENTRY_IOAPIC | MADT_ENTRY_ISO | MADT_ENTRY_LAPIC_NMI => {}
             _ => {}
         }
     }
@@ -1003,7 +977,6 @@ mod tests {
         let i = parse_madt(&table(44, &[&MADT_LAPIC, &MADT_IOAPIC, &[0x7f, 2]])).unwrap();
         assert_eq!(i.lapic_base, 0xfee0_0000);
         assert_eq!((i.cpus.len(), i.cpus[0].apic_id), (1, 3));
-        assert_eq!((i.ioapics[0].id, i.ioapics[0].address), (2, 0xfec0_0000));
         // trailing bytes too short for an entry header end the walk
         assert!(parse_madt(&table(44, &[&MADT_LAPIC, &[0]])).is_ok());
     }
@@ -1020,7 +993,6 @@ mod tests {
         zero[1] = 0;
         assert!(parse_madt(&table(44, &[&MADT_LAPIC, &zero])).is_err());
         // entries too short for their type
-        assert!(parse_madt(&table(44, &[&MADT_LAPIC, &[MADT_ENTRY_IOAPIC, 2]])).is_err());
         assert!(parse_madt(&table(44, &[&[MADT_ENTRY_LAPIC, 4, 0, 3]])).is_err());
         assert!(
             parse_madt(&table(

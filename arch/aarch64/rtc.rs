@@ -6,7 +6,6 @@
 //! Register map:
 //! - RTCDR (0x000): Data Register - read returns current time in seconds
 //! - RTCMR (0x004): Match Register - for alarms (not used)
-//! - RTCLR (0x008): Load Register - write to set time
 //! - RTCCR (0x00C): Control Register - bit 0 enables the RTC
 //! - RTCIMSC (0x010): Interrupt Mask Set/Clear
 //! - RTCRIS (0x014): Raw Interrupt Status
@@ -21,7 +20,6 @@ const PL031_BASE: usize = super::paging::io_va(0x0901_0000) as usize;
 
 /// Register offsets
 const RTCDR: usize = 0x000; // Data Register (read-only current time)
-const RTCLR: usize = 0x008; // Load Register (write to set time)
 const RTCCR: usize = 0x00C; // Control Register
 
 /// Read the current time from the PL031 RTC
@@ -45,14 +43,6 @@ pub fn init() {
         if ctrl & 1 == 0 {
             ptr::write_volatile((PL031_BASE + RTCCR) as *mut u32, ctrl | 1);
         }
-    }
-}
-
-/// Set the RTC time (optional - typically set by firmware/hypervisor)
-#[expect(dead_code)]
-pub fn set_rtc(seconds_since_epoch: u32) {
-    unsafe {
-        ptr::write_volatile((PL031_BASE + RTCLR) as *mut u32, seconds_since_epoch);
     }
 }
 

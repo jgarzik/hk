@@ -164,9 +164,6 @@ const INOTIFY_EVENT_HEADER_SIZE: usize = core::mem::size_of::<InotifyEventHeader
 
 /// An inotify watch on a specific path
 struct InotifyWatch {
-    /// Watch descriptor (unique within instance)
-    #[expect(dead_code)]
-    wd: i32,
     /// Events to watch for
     mask: u32,
     /// The watched inode, held while the watch lives (Linux: the mark
@@ -237,9 +234,6 @@ struct InotifyInner {
     watches: BTreeMap<i32, InotifyWatch>,
     /// Queued events
     events: Vec<QueuedEvent>,
-    /// Cookie counter for rename events (reserved for future use)
-    #[expect(dead_code)]
-    next_cookie: u32,
 }
 
 impl InotifyInner {
@@ -555,7 +549,6 @@ impl Inotify {
                 next_wd: 1,
                 watches: BTreeMap::new(),
                 events: Vec::new(),
-                next_cookie: 0,
             }),
             uid: crate::task::percpu::current_cred().euid,
             wait_queue: WaitQueue::new(),
@@ -610,7 +603,6 @@ impl Inotify {
             return undo(e);
         }
         let watch = InotifyWatch {
-            wd,
             mask: mask & IN_ALL_EVENTS,
             inode: inode.clone(),
         };

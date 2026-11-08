@@ -269,16 +269,6 @@ unsafe fn init_distributor() {
     printkln!("GIC distributor initialized");
 }
 
-/// SPI trigger mode (GICD_ICFGR)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Trigger {
-    /// Level-sensitive (PCI INTx, most device lines)
-    Level,
-    /// Edge-triggered (platform devices; PCI INTx is level)
-    #[expect(dead_code)]
-    Edge,
-}
-
 /// Wait for a distributor register write to take effect (GICD_CTLR.RWP)
 ///
 /// # Safety
@@ -292,25 +282,20 @@ unsafe fn gicd_wait_rwp() {
 
 /// Configure and enable an SPI (INTID 32..1019)
 ///
-/// Sets the trigger mode, priority 0x80 and Group 1 (init already did
+/// Sets level trigger, priority 0x80 and Group 1 (init already did
 /// those two for all SPIs), routes it to CPU 0 (whose tick and threads
 /// handle device interrupts for now) and unmasks it at the distributor.
 /// Safe to call again for an already enabled SPI. Process context.
-pub fn enable_spi(intid: u32, trigger: Trigger) {
+pub fn enable_spi(intid: u32) {
     if !(32..1020).contains(&intid) {
         return;
     }
     let n = u64::from(intid);
     {
-        // Trigger: bit 1 of the 2-bit field (1 = edge, 0 = level)
+        // Level trigger: clear bit 1 of the 2-bit field (1 = edge)
         let cfg_reg = GICD_ICFGR + (n / 16) * 4;
         let shift = (n % 16) * 2 + 1;
-        let mut cfg = read32(cfg_reg);
-        match trigger {
-            Trigger::Edge => cfg |= 1 << shift,
-            Trigger::Level => cfg &= !(1 << shift),
-        }
-        write32(cfg_reg, cfg);
+        write32(cfg_reg, read32(cfg_reg) & !(1 << shift));
 
         // Priority (byte-addressed)
         write8(GICD_IPRIORITYR + n, 0x80);

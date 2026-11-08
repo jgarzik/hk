@@ -761,7 +761,6 @@ pub mod tests {
     #[test]
     fn named_caches_take_their_exact_layout() {
         #[repr(align(64))]
-        #[expect(dead_code)]
         struct Odd([u8; 200]);
         assert_eq!(arc_of::<Odd>(), (320, 64));
         assert_eq!(arc_of::<u8>(), (24, 8));

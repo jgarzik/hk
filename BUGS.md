@@ -190,6 +190,14 @@ getcpu reports it; nothing else uses it. Missing (Linux
   node,nodeid=0,memdev=m0,cpus=0-1 -numa node,nodeid=1,memdev=m1,cpus=2-3"
   make check`).
 
+## arm64 SPIs are all level-triggered
+
+**Location**: `arch/aarch64/gic.rs` (`enable_spi`), `arch/aarch64/irq.rs`
+
+Every SPI is configured level-sensitive; the trigger type in the
+device tree `interrupts` cell is ignored (Linux gic_irq_domain_translate
+and gic_set_type). Fine on QEMU virt, whose devices are all level.
+
 ## arm64 SMP assumes one-cell, Aff0-only CPU ids
 
 **Location**: `arch/aarch64/dtb.rs` (`parse_dtb`), `arch/aarch64/smp.rs`
@@ -249,6 +257,16 @@ which has no control queue: QEMU then delivers all frames).
 PACKET_AUXDATA reports TP_STATUS_CSUM_VALID only for frames received on
 lo (hk has no checksum offload states).
 
+## fanotify gaps
+
+**Location**: `io/fanotify.rs`
+
+- Events carry FAN_NOFD: read opens no file with fanotify_init's
+  event_f_flags (Linux copy_event_to_user / create_fd).
+- fanotify_mark keeps only the mask: FAN_MARK_IGNORED_MASK,
+  FAN_MARK_IGNORE, FAN_MARK_IGNORED_SURV_MODIFY and FAN_MARK_EVICTABLE
+  are accepted but have no effect (Linux fanotify_add_mark).
+
 ## File lock gaps
 
 **Location**: `fs/locks.rs`, `fs/posix_lock.rs`
@@ -263,6 +281,14 @@ No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS as with no tracer), no
 user notification (SECCOMP_RET_USER_NOTIF, SECCOMP_GET_NOTIF_SIZES), no
 FLAG_TSYNC_ESRCH / FLAG_SPEC_ALLOW / FLAG_WAIT_KILLABLE_RECV, and
 nothing is logged for RET_LOG or FLAG_LOG.
+
+## Pipe size is fixed
+
+**Location**: `io/pipe.rs`, `fs/fd.rs` (`sys_fcntl`)
+
+Every pipe holds 16 buffers; fcntl F_GETPIPE_SZ and F_SETPIPE_SZ are
+EINVAL and there is no /proc/sys/fs/pipe-max-size (Linux pipe_fcntl,
+pipe_set_size).
 
 ## vmsplice from a pipe is not done
 
@@ -342,6 +368,9 @@ EACCES (`ipc/mqueue.rs`): hk has no 01777 `/dev/mqueue`, so only root
 creates queues, where Linux lets any user. mq_attr_ok's soft caps
 (msgsize_max 8192, msg_max 10 without CAP_SYS_RESOURCE) are therefore
 unreachable today.
+There is no mqueue filesystem at all: queues live only in a kernel
+table, so they cannot be listed or read as files under /dev/mqueue
+(Linux mqueue_fs_type).
 
 ## sysfs gaps
 
@@ -359,6 +388,8 @@ unreachable today.
   PNP0501 device), PL011/PL031 are platform devices (Linux: amba bus),
   SCSI disks of USB storage are virtual (Linux: host/target/device
   below the interface), RAM disks are rdN (Linux brd: ramN).
+- SCSI disks: no device/vendor, device/model or other scsi_device
+  attributes (Linux sdev_attrs: sdev_show_vendor, sdev_show_model).
 - PCI: no resource/resourceN/rom/enable/numa_node/local_cpus files;
   config is 256 bytes even for PCIe functions (no extended space).
 - cpu: no cpuN/topology, cache/ or online files and no MODALIAS
@@ -418,6 +449,8 @@ unreachable today.
 **Location:** `task/futex.rs`
 
 - **FUTEX_WAKE_OP and PI futexes** are missing.
+- **futex_waitv flags:** FUTEX2_NUMA and FUTEX2_MPOL are EINVAL;
+  Linux accepts them (futex_parse_waitv, FUTEX2_VALID_MASK).
 - **MAP_PRIVATE file mappings:** a shared futex there is keyed by
   (mm, address) from the VMA; Linux keys a page still in the page
   cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
@@ -608,6 +641,15 @@ cgroup (say memory.max 64MB) at any RAM size, and on Linux too,
 instead of filling all of RAM and being skipped above 4GB
 (`user/boot_tester/mm/mm_oom.rs`).
 
+## BPF map update flags are not checked
+
+**Location**: `bpf/map.rs`, `bpf/syscall.rs`
+
+BPF_MAP_UPDATE_ELEM treats any flags value but BPF_NOEXIST and
+BPF_EXIST as BPF_ANY; Linux returns EINVAL for flags above BPF_EXIST
+and for BPF_F_LOCK on a map without a bpf_spin_lock
+(bpf_map_update_value, htab_map_update_elem).
+
 ## BPF map memory is not charged
 
 **Location**: `bpf/map.rs`
@@ -741,7 +783,8 @@ line firmware wrote into each function's Interrupt Line register (PIC
 mode, legacy BIOS boot), delivered to the boot CPU only. Real hardware
 in APIC mode (UEFI boot; Linux on the Dell uses IOAPIC 16-23 and MSI)
 needs IOAPIC with ACPI `_PRT` routing, or MSI/MSI-X, which xHCI, AHCI
-and r8169 all support.
+and r8169 all support. The MADT parser skips IOAPIC entries (Linux
+acpi_parse_ioapic registers them).
 
 ## ACPI power management gaps
 
@@ -816,7 +859,8 @@ Designs that grew one commit at a time. Tag = roadmap phase
 
 - **Syscalls that do not deliver** (H/C): inotify queues only
   IN_DELETE_SELF, IN_UNMOUNT and IN_IGNORED, fanotify nothing (no
-  fsnotify hooks in the VFS operations); waitid without WEXITED is
+  fsnotify hooks in the VFS operations); rename has no
+  IN_MOVED_FROM/IN_MOVED_TO cookie pairing (Linux fsnotify_get_cookie); waitid without WEXITED is
   EINVAL (C).
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in five
   places; four `current_time`s; about ten user-timespec readers each validating
@@ -905,6 +949,15 @@ Tag = roadmap phase (doc/ROADMAP.md).
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
 
+## DRM dumb buffers are the boot framebuffer only
+
+**Location**: `hw/gfx/simplegfx.rs` (`create_dumb`)
+
+DRM_IOCTL_MODE_CREATE_DUMB returns the firmware framebuffer when the
+size and depth match it, else ENOMEM; Linux simpledrm allocates any
+dumb buffer from shmem and blits it on page flip
+(drm_gem_shmem_dumb_create).
+
 ## Namespace files are not nsfs
 
 **Location**: `fs/proc/mod.rs` (`ns_file`), `ns/mod.rs` (`sys_setns`)
@@ -924,6 +977,15 @@ open(O_CREAT) through a link does not follow it.
 mounts and mountinfo poll readable only: a change of the mount table
 never reports POLLERR|POLLPRI (Linux mounts_poll: the namespace's
 event count against the reader's).
+
+## TSC trusted without the invariant flag
+
+**Location**: `arch/x86_64/tsc.rs`
+
+A TSC without the invariant flag only logs a warning and stays the
+clocksource. Linux marks it unstable (check_system_tsc_reliable,
+mark_tsc_unstable, the clocksource watchdog) and falls back to HPET or
+the ACPI PM timer, which hk lacks.
 
 ## adjtimex does not steer the clock
 

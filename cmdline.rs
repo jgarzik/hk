@@ -225,30 +225,6 @@ pub fn is_cmdline_console(name: &str) -> bool {
         .any(|spec| spec.matches(name))
 }
 
-/// Get the number of console specifications
-#[expect(dead_code)]
-pub fn cmdline_console_count() -> usize {
-    CMDLINE_CONSOLE.lock().count
-}
-
-/// Get a console specification by index
-///
-/// Returns None if index is out of bounds
-#[expect(dead_code)]
-pub fn get_cmdline_console(index: usize) -> Option<ConsoleSpec> {
-    let console = CMDLINE_CONSOLE.lock();
-    (index < console.count).then(|| console.specs[index])
-}
-
-/// Get the primary (last specified) console device name
-///
-/// Returns None if no console= was specified
-#[expect(dead_code)]
-pub fn primary_cmdline_console() -> Option<ConsoleSpec> {
-    let console = CMDLINE_CONSOLE.lock();
-    (console.count > 0).then(|| console.specs[console.count - 1])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

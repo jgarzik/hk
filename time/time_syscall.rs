@@ -951,8 +951,6 @@ impl Default for Timex {
 }
 
 /// ADJ_* mode flags for adjtimex
-#[expect(dead_code)]
-pub const ADJ_OFFSET: u32 = 0x0001;
 pub const ADJ_FREQUENCY: u32 = 0x0002;
 pub const ADJ_MAXERROR: u32 = 0x0004;
 pub const ADJ_ESTERROR: u32 = 0x0008;
@@ -966,14 +964,6 @@ pub const ADJ_TICK: u32 = 0x4000;
 
 /// Clock time states (return values)
 pub const TIME_OK: i32 = 0;
-#[expect(dead_code)]
-pub const TIME_INS: i32 = 1;
-#[expect(dead_code)]
-pub const TIME_DEL: i32 = 2;
-#[expect(dead_code)]
-pub const TIME_OOP: i32 = 3;
-#[expect(dead_code)]
-pub const TIME_WAIT: i32 = 4;
 pub const TIME_ERROR: i32 = 5;
 
 /// Largest time constant (Linux MAXTC)

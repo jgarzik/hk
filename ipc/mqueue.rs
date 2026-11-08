@@ -171,8 +171,6 @@ struct MqNotify {
 
 /// Message queue
 pub struct MqQueue {
-    #[expect(dead_code)] // Used for debugging and future /dev/mqueue filesystem
-    name: FileName,
     maxmsg: i64,
     msgsize: i64,
     messages: Mutex<Vec<MqMessage>>,
@@ -221,11 +219,10 @@ impl MqQueue {
     }
 
     /// A queue charged as `charge` (see [`mq_charge`])
-    fn new(name: FileName, mode: u32, maxmsg: i64, msgsize: i64, charge: (u32, u64)) -> Self {
+    fn new(mode: u32, maxmsg: i64, msgsize: i64, charge: (u32, u64)) -> Self {
         // Get current task's effective uid/gid as owner
         let cred = crate::task::percpu::current_cred();
         Self {
-            name,
             maxmsg,
             msgsize,
             messages: Mutex::new(Vec::new()),
@@ -269,12 +266,6 @@ impl MqQueue {
     fn may_unlink(&self) -> bool {
         let cred = crate::task::percpu::current_cred();
         cred.fsuid == self.uid || cred.fsuid == 0 || crate::task::capable(crate::task::CAP_FOWNER)
-    }
-
-    /// Get the queue name (for debugging and future /dev/mqueue filesystem)
-    #[expect(dead_code)]
-    fn name(&self) -> &[u8] {
-        &self.name
     }
 
     fn get_attr(&self) -> MqAttr {
@@ -755,13 +746,7 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
                 Err(e) => return e.sysret(),
             };
             // A queue that cannot be made returns its charge as it drops
-            let queue = match try_arc(MqQueue::new(
-                queue_name.clone().into(),
-                mode,
-                maxmsg,
-                msgsize,
-                charge,
-            )) {
+            let queue = match try_arc(MqQueue::new(mode, maxmsg, msgsize, charge)) {
                 Ok(q) => q,
                 Err(e) => return e.sysret(),
             };

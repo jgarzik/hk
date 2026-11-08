@@ -50,9 +50,6 @@ struct SimpleGfxState {
     next_fb_id: u32,
     /// The firmware framebuffer info
     fb_info: FramebufferInfo,
-    /// Dumb buffer handle counter (for future use)
-    #[expect(dead_code)]
-    next_handle: u32,
     /// Dumb buffers (handle -> DumbBuffer)
     dumb_buffers: Vec<(u32, DumbBuffer)>,
 }
@@ -137,7 +134,6 @@ impl SimpleGfxDevice {
             framebuffers: vec![boot_fb],
             next_fb_id: Self::BOOT_FB_ID + 1,
             fb_info,
-            next_handle: Self::BOOT_HANDLE + 1,
             dumb_buffers: vec![(Self::BOOT_HANDLE, boot_dumb)],
         };
 

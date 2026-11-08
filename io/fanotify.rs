@@ -29,7 +29,6 @@
 
 use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -119,10 +118,6 @@ pub const FAN_MARK_FILESYSTEM: u32 = 0x00000100;
 pub const FAN_MARK_EVICTABLE: u32 = 0x00000200;
 /// Ignore mark (newer form)
 pub const FAN_MARK_IGNORE: u32 = 0x00000400;
-
-/// Mark type mask
-#[expect(dead_code)]
-const FAN_MARK_TYPE_MASK: u32 = FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM;
 
 /// Mark inode (default, no flag set)
 pub const FAN_MARK_INODE: u32 = 0x00000000;
@@ -256,18 +251,14 @@ const FANOTIFY_MAX_QUEUED_EVENTS: usize = 16384;
 struct FanotifyMark {
     /// Events to watch for
     mask: u64,
-    /// Flags from mark operation
-    #[expect(dead_code)]
-    flags: u32,
     /// Ignored event mask
     ignored_mask: u64,
 }
 
 impl FanotifyMark {
-    fn new(mask: u64, flags: u32) -> Self {
+    fn new(mask: u64) -> Self {
         Self {
             mask,
-            flags,
             ignored_mask: 0,
         }
     }
@@ -283,12 +274,6 @@ struct FanotifyEvent {
     mask: u64,
     /// PID of process causing event
     pid: i32,
-    /// Path to file (for opening fd when event is read)
-    #[expect(dead_code)]
-    path: Option<String>,
-    /// Inode number (for matching)
-    #[expect(dead_code)]
-    ino: u64,
 }
 
 impl FanotifyEvent {
@@ -322,14 +307,11 @@ pub struct Fanotify {
     wait_queue: WaitQueue,
     /// Init flags
     init_flags: u32,
-    /// Event file flags (O_RDONLY, O_RDWR, etc.)
-    #[expect(dead_code)]
-    event_f_flags: u32,
 }
 
 impl Fanotify {
     /// Create a new fanotify instance
-    pub fn new(init_flags: u32, event_f_flags: u32) -> Result<Arc<Self>, KernelError> {
+    pub fn new(init_flags: u32) -> Result<Arc<Self>, KernelError> {
         try_arc(Self {
             inner: IrqSpinlock::new(FanotifyInner {
                 inode_marks: BTreeMap::new(),
@@ -339,7 +321,6 @@ impl Fanotify {
             }),
             wait_queue: WaitQueue::new(),
             init_flags,
-            event_f_flags,
         })
     }
 
@@ -360,7 +341,7 @@ impl Fanotify {
             existing.mask |= mask;
         } else {
             // Create new mark
-            marks.insert(target_id, FanotifyMark::new(mask, mark_flags));
+            marks.insert(target_id, FanotifyMark::new(mask));
         }
 
         Ok(())
@@ -404,16 +385,11 @@ impl Fanotify {
     }
 
     /// Queue an event
-    pub fn queue_event(&self, mask: u64, pid: i32, path: Option<String>, ino: u64) {
+    pub fn queue_event(&self, mask: u64, pid: i32) {
         let mut inner = self.inner.lock();
 
         if inner.events.len() < FANOTIFY_MAX_QUEUED_EVENTS {
-            inner.events.push(FanotifyEvent {
-                mask,
-                pid,
-                path,
-                ino,
-            });
+            inner.events.push(FanotifyEvent { mask, pid });
         } else if inner.events.is_empty()
             || inner.events.last().map(|e| e.mask) != Some(FAN_Q_OVERFLOW)
         {
@@ -421,8 +397,6 @@ impl Fanotify {
             inner.events.push(FanotifyEvent {
                 mask: FAN_Q_OVERFLOW,
                 pid: 0,
-                path: None,
-                ino: 0,
             });
         }
 
@@ -470,8 +444,6 @@ impl Fanotify {
                 Err(_) if done > 0 => return Ok(done),
                 Err(e) => return Err(e),
             };
-            // Note: In a full implementation, we would open the file here
-            // and pass the fd. For now, we pass -1 (FAN_NOFD equivalent).
             let metadata = FanotifyEventMetadata {
                 event_len: FANOTIFY_METADATA_SIZE as u32,
                 vers: FANOTIFY_METADATA_VERSION,
@@ -560,8 +532,8 @@ impl FileOps for FanotifyFileOps {
 // =============================================================================
 
 /// Create a new fanotify instance
-pub fn create_fanotify(init_flags: u32, event_f_flags: u32) -> Result<Arc<File>, KernelError> {
-    let fanotify = Fanotify::new(init_flags, event_f_flags)?;
+pub fn create_fanotify(init_flags: u32) -> Result<Arc<File>, KernelError> {
+    let fanotify = Fanotify::new(init_flags)?;
 
     // Create dummy dentry for fanotify
 
@@ -636,7 +608,7 @@ pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
     }
 
     // Create fanotify file
-    let Ok(file) = create_fanotify(init_flags, event_f_flags) else {
+    let Ok(file) = create_fanotify(init_flags) else {
         return KernelError::OutOfMemory.sysret();
     };
 

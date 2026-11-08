@@ -365,15 +365,6 @@ pub fn preempt_enable() {
     }
 }
 
-/// Check if preemption is currently disabled
-#[inline]
-#[expect(dead_code)] // Utility function for future use and debugging
-pub fn preempt_disabled() -> bool {
-    try_current_cpu()
-        .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed) > 0)
-        .unwrap_or(true) // Conservative: assume disabled if no per-CPU data
-}
-
 /// Get the current preempt_count value (for debugging)
 #[inline]
 pub fn preempt_count() -> u32 {

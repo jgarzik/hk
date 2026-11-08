@@ -103,12 +103,6 @@ pub struct ScsiDisk {
     capacity_sectors: u64,
     /// Sector size in bytes (typically 512)
     sector_size: u32,
-    /// Vendor identification
-    #[expect(dead_code)]
-    vendor: [u8; 8],
-    /// Product identification
-    #[expect(dead_code)]
-    product: [u8; 16],
 }
 
 impl ScsiDisk {
@@ -159,8 +153,6 @@ impl ScsiDisk {
             state: Mutex::new(ScsiDeviceState::Running),
             capacity_sectors,
             sector_size,
-            vendor: inq.vendor,
-            product: inq.product,
         })
     }
 

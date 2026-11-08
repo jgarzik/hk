@@ -12,9 +12,6 @@ use crate::printkln;
 pub struct TscClockSource {
     /// Calibrated TSC frequency in Hz
     frequency_hz: u64,
-    /// Whether this TSC has invariant flag (reliable across power states)
-    #[expect(dead_code)] // Used via TimekeeperOps trait (future API)
-    invariant: bool,
 }
 
 impl TscClockSource {
@@ -23,25 +20,14 @@ impl TscClockSource {
     /// Always succeeds on x86-64 (TSC is mandatory). Logs a warning if
     /// invariant TSC is not available (may drift with CPU power states).
     pub fn new() -> Option<Self> {
-        let invariant = has_invariant_tsc();
-
-        if !invariant {
+        if !has_invariant_tsc() {
             printkln!("TSC: Warning - invariant TSC not detected, clock may drift");
         }
 
         // Calibrate TSC frequency against PIT
         let frequency_hz = calibrate_tsc_frequency();
 
-        Some(Self {
-            frequency_hz,
-            invariant,
-        })
-    }
-
-    /// Returns true if this TSC has the invariant flag
-    #[expect(dead_code)] // Used via TimekeeperOps::clock_is_reliable
-    pub fn is_invariant(&self) -> bool {
-        self.invariant
+        Some(Self { frequency_hz })
     }
 
     /// Get the calibrated TSC frequency in Hz

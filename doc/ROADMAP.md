@@ -194,7 +194,7 @@ and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
   setns) split into per-command or per-step helpers.
 - S1 O(n²) VMA loops to iterators; sentinels to Option;
   `from_ne_bytes(..try_into().unwrap())` to `pod!`; `current_mm()`;
-  stale `allow(dead_code)` removed; struct-update syntax;
+  struct-update syntax;
   one LE/BE byte reader, no slice `unwrap` on
   device or disk data; pointer-cast lints.
 - S2 `# Arguments`/`# Returns` blocks and `// ====` banners removed;

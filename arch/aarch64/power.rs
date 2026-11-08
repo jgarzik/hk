@@ -5,14 +5,11 @@
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 /// PSCI function IDs (SMCCC compliant)
-#[expect(dead_code)]
 pub mod psci {
     /// PSCI version
     pub const PSCI_VERSION: u32 = 0x84000000;
     /// CPU_ON (64-bit)
     pub const CPU_ON_64: u32 = 0xC4000003;
-    /// CPU_OFF
-    pub const CPU_OFF: u32 = 0x84000002;
     /// System off
     pub const SYSTEM_OFF: u32 = 0x84000008;
     /// System reset
@@ -20,12 +17,7 @@ pub mod psci {
 
     /// PSCI return codes
     pub const SUCCESS: i64 = 0;
-    pub const NOT_SUPPORTED: i64 = -1;
-    pub const INVALID_PARAMS: i64 = -2;
-    pub const DENIED: i64 = -3;
     pub const ALREADY_ON: i64 = -4;
-    pub const ON_PENDING: i64 = -5;
-    pub const INTERNAL_FAILURE: i64 = -6;
 }
 
 /// Query PSCI version to test if PSCI is working

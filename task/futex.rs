@@ -1098,13 +1098,8 @@ const FUTEX_WAITV_MAX: usize = 128;
 
 /// FUTEX2 size flags
 mod futex2 {
-    #![expect(dead_code)]
-    pub const SIZE_U8: u32 = 0x00;
-    pub const SIZE_U16: u32 = 0x01;
     pub const SIZE_U32: u32 = 0x02;
-    pub const SIZE_U64: u32 = 0x03;
     pub const SIZE_MASK: u32 = 0x03;
-    pub const NUMA: u32 = 0x04;
     pub const PRIVATE: u32 = 128;
     /// Valid mask for futex2 flags (size + private only for now)
     pub const VALID_MASK: u32 = SIZE_MASK | PRIVATE;

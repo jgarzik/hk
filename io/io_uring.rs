@@ -174,10 +174,6 @@ pub const IORING_REGISTER_FILES_UPDATE: u32 = 6;
 /// Maximum ring size
 const IORING_MAX_ENTRIES: u32 = 32768;
 
-/// Minimum ring size (used for validation)
-#[expect(dead_code)] // Used in future phases
-const IORING_MIN_ENTRIES: u32 = 1;
-
 // ============================================================================
 // io_uring data structures (Linux ABI compatible)
 // ============================================================================
@@ -294,18 +290,9 @@ pub struct IoUringCqe {
 // io_uring implementation
 // ============================================================================
 
-/// Pending operation types for async operations
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum PendingOpType {
-    Poll { fd: i32, events: u32 },
-    Timeout { deadline_ns: u64 },
-}
-
 /// Pending operation that hasn't completed yet
 struct PendingOp {
     user_data: u64,
-    #[expect(dead_code)] // Used for async completion handling
-    op_type: PendingOpType,
     cancelled: bool,
 }
 
@@ -337,9 +324,6 @@ struct IoUringInner {
 
     /// Pending operations (Phase 5)
     pending_ops: Vec<PendingOp>,
-
-    /// Next pending op ID counter
-    next_pending_id: u64,
 }
 
 impl IoUringInner {
@@ -368,7 +352,6 @@ impl IoUringInner {
             sq_dropped: 0,
             registered_files: None,
             pending_ops: Vec::new(),
-            next_pending_id: 0,
         })
     }
 
@@ -395,13 +378,11 @@ impl IoUringInner {
     }
 
     /// Add a pending operation
-    fn add_pending(&mut self, user_data: u64, op_type: PendingOpType) {
+    fn add_pending(&mut self, user_data: u64) {
         self.pending_ops.push(PendingOp {
             user_data,
-            op_type,
             cancelled: false,
         });
-        self.next_pending_id += 1;
     }
 
     /// Cancel a pending operation by user_data
@@ -428,25 +409,6 @@ impl IoUringInner {
         });
         cancelled
     }
-
-    /// Find and remove a pending poll by fd
-    #[expect(dead_code)] // Will be used for poll completion
-    fn find_poll_by_fd(&mut self, fd: i32) -> Option<u64> {
-        let mut found_idx = None;
-        for (i, op) in self.pending_ops.iter().enumerate() {
-            if let PendingOpType::Poll { fd: poll_fd, .. } = op.op_type
-                && poll_fd == fd
-                && !op.cancelled
-            {
-                found_idx = Some(i);
-                break;
-            }
-        }
-        found_idx.map(|i| {
-            let op = self.pending_ops.remove(i);
-            op.user_data
-        })
-    }
 }
 
 /// Main io_uring instance
@@ -456,12 +418,6 @@ pub struct IoUring {
 
     /// Wait queue for blocking waits
     wq: WaitQueue,
-
-    /// Ring sizes (immutable after creation, used for mmap)
-    #[expect(dead_code)] // Used for mmap in future
-    sq_entries: u32,
-    #[expect(dead_code)] // Used for mmap in future
-    cq_entries: u32,
 
     /// Physical addresses for mmap (set during setup)
     rings_size: usize,
@@ -478,8 +434,6 @@ impl IoUring {
         try_arc(Self {
             inner: IrqSpinlock::new(IoUringInner::new(sq_entries, cq_entries)?),
             wq: WaitQueue::new(),
-            sq_entries,
-            cq_entries,
             rings_size,
             sqes_size,
         })
@@ -992,7 +946,7 @@ impl IoUring {
         // Not ready - add to pending operations
         // In a full implementation, we'd register with the file's wait queue
         // and complete the CQE when events fire. For now, we track it.
-        inner.add_pending(sqe.user_data, PendingOpType::Poll { fd, events });
+        inner.add_pending(sqe.user_data);
 
         // Return a special value indicating "pending" - don't post CQE yet
         // We use EAGAIN to indicate async completion later
@@ -1070,7 +1024,7 @@ impl IoUring {
         }
 
         // Add to pending operations
-        inner.add_pending(sqe.user_data, PendingOpType::Timeout { deadline_ns });
+        inner.add_pending(sqe.user_data);
 
         // For now, we can't actually wait asynchronously, so check immediately
         // In a full implementation, we'd use a timer and complete later

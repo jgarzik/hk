@@ -30,7 +30,10 @@ use crate::util::error::KernelError;
 static RTNL: Mutex<()> = Mutex::new(());
 
 /// Proof that RTNL is held
-pub struct RtnlGuard(#[expect(dead_code)] MutexGuard<'static, ()>);
+pub struct RtnlGuard(
+    #[expect(dead_code, reason = "held only for its Drop, which releases RTNL")]
+    MutexGuard<'static, ()>,
+);
 
 /// Take RTNL (Linux rtnl_lock)
 pub fn lock() -> RtnlGuard {

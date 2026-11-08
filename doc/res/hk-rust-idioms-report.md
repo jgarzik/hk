@@ -11,14 +11,13 @@ belongs to doc/ROADMAP.md phase M1, the rest to S1.
 | # | Item | Lines saved | Risk | Prio |
 |---|------|-------------|------|------|
 | 2 | `SysRet` trait + `From<UaccessError>`: `?` in `sys_*` | about -750 | low-med (errno mapping) | high |
-| 4 | Delete the dead code behind `expect(dead_code)` | about -100 | ~0 | high |
 | 5 | Struct update `..Default::default()` / `..zeroed()` | -300 (kernel) / -120 (user) | low | med |
 | 7 | One `util/bytes` LE/BE reader on `first_chunk` | -40 | low | low |
 | 8 | `is_multiple_of` for `% a == 0` | 0 | 0 | low |
 | 9 | xhci MMIO through `IoMem` | 0 | 0 | low |
 
-Order: 4 is mechanical, one commit. 2 goes per subsystem (M1); let-else
-is done and linted (`manual_let_else`), so its error exits become `?`.
+Order: 2 goes per subsystem (M1); let-else is done and linted
+(`manual_let_else`), so its error exits become `?`.
 
 ---
 
@@ -106,19 +105,6 @@ is done and linted (`manual_let_else`), so its error exits become `?`.
     strncpy TooLong).
   - No locking impact: `?` drops guards in reverse order, exactly as the early
     `return` does now.
-
-## 4. Deleting what `expect(dead_code)` hides
-
-- **Evidence:** 56 `#[expect(dead_code)]` remain (the stale allows are gone; the
-  lint now proves each one hides something). STYLE.md says "No dead or speculative
-  code". Examples: `ADJ_OFFSET`, `TIME_INS..WAIT` (time/time_syscall.rs);
-  `gfx_io/ior/iow` (gfx/ioctl.rs); `cmdline_console_count`/`get_cmdline_console`/
-  `primary_cmdline_console` (cmdline.rs); `get_last_cluster`,
-  `update_dir_entry_size` (fs/vfat.rs); unused fields in io/inotify.rs,
-  io/fanotify.rs, ipc/msg.rs.
-- **Action:** delete the dead items (about -100 lines); what stays for ABI
-  completeness gets `reason = "uapi constant"`.
-- **Risk:** none. Check `cargo test` (host) as well, since tests can be the only user.
 
 ## 5. Struct update syntax: `..Default::default()` / `..FromBytes::zeroed()`
 

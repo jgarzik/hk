@@ -9,10 +9,6 @@
 //! - Platform drivers (PIC, PIT, Serial)
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-// Note: no_std is inherited from the kernel crate
-
-extern crate alloc;
-
 pub mod acpi;
 pub mod barrier;
 pub mod context;
@@ -313,7 +309,6 @@ impl SmpOps for X86_64Arch {
                     is_bsp: cpu.is_bsp,
                 })
                 .collect(),
-            ioapics: alloc::vec::Vec::new(), // I/O APICs not needed for SMP init
             bsp_apic_id: acpi.bsp_cpu_id,
             power_info: acpi.power_info,
         };
@@ -361,10 +356,6 @@ impl TimekeeperOps for X86_64Arch {
 
     fn clock_frequency(source: &Self::ClockSource) -> u64 {
         source.frequency_hz()
-    }
-
-    fn clock_is_reliable(source: &Self::ClockSource) -> bool {
-        source.is_invariant()
     }
 
     fn read_cycles() -> u64 {

@@ -17,8 +17,6 @@
 //! - Fork creates independent rlimit copies
 //! - prlimit64 can modify another process's rlimits
 
-#![expect(dead_code)]
-
 use crate::arch::Uaccess;
 use crate::signal::get_task_signal_struct;
 use crate::task::Tid;
@@ -38,8 +36,6 @@ pub const RLIMIT_FSIZE: u32 = 1;
 pub const RLIMIT_DATA: u32 = 2;
 /// Maximum stack size (bytes)
 pub const RLIMIT_STACK: u32 = 3;
-/// Maximum core file size (bytes)
-pub const RLIMIT_CORE: u32 = 4;
 /// Maximum resident set size (bytes, unused on modern Linux)
 pub const RLIMIT_RSS: u32 = 5;
 /// Maximum number of processes per user
@@ -50,8 +46,6 @@ pub const RLIMIT_NOFILE: u32 = 7;
 pub const RLIMIT_MEMLOCK: u32 = 8;
 /// Maximum address space size (bytes)
 pub const RLIMIT_AS: u32 = 9;
-/// Maximum file locks held
-pub const RLIMIT_LOCKS: u32 = 10;
 /// Maximum number of pending signals
 pub const RLIMIT_SIGPENDING: u32 = 11;
 /// Maximum bytes in POSIX message queues
@@ -60,8 +54,6 @@ pub const RLIMIT_MSGQUEUE: u32 = 12;
 pub const RLIMIT_NICE: u32 = 13;
 /// Maximum realtime priority allowed
 pub const RLIMIT_RTPRIO: u32 = 14;
-/// Maximum realtime CPU time (microseconds)
-pub const RLIMIT_RTTIME: u32 = 15;
 
 /// Number of resource limits
 pub const RLIM_NLIMITS: usize = 16;
@@ -203,17 +195,6 @@ pub fn rlimit(resource: u32) -> u64 {
     let tid = current_tid();
     get_task_rlimit(tid, resource)
         .map(|r| r.rlim_cur)
-        .unwrap_or(RLIM_INFINITY)
-}
-
-/// Convenience function: get hard limit for current task
-///
-/// Returns RLIM_INFINITY if the task or resource doesn't exist.
-#[expect(dead_code)]
-pub fn rlimit_max(resource: u32) -> u64 {
-    let tid = current_tid();
-    get_task_rlimit(tid, resource)
-        .map(|r| r.rlim_max)
         .unwrap_or(RLIM_INFINITY)
 }
 

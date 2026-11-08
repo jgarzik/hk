@@ -431,11 +431,11 @@ mod trb_type {
 ///
 /// Tracks the Device Context, Input Context, and Transfer Rings for each endpoint.
 struct DeviceState {
-    /// Slot ID assigned by xHCI
-    #[expect(dead_code)]
-    slot_id: u8,
     /// Output Device Context (xHCI writes device state here)
-    #[expect(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "owns the DMA buffer the DCBAA entry points the controller at"
+    )]
     output_ctx: OutputDeviceContext,
     /// Input Context (for Address Device and Configure Endpoint)
     input_ctx: InputContext,
@@ -1264,7 +1264,6 @@ impl XhciController {
         transfer_rings.insert(1, ep0_ring); // DCI 1 = EP0
 
         let state = DeviceState {
-            slot_id,
             output_ctx,
             input_ctx,
             transfer_rings,

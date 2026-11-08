@@ -12,8 +12,6 @@
 //! When the handler returns, it executes the trampoline which calls rt_sigreturn
 //! to restore the original context.
 
-#![expect(dead_code)]
-
 use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
@@ -121,8 +119,6 @@ crate::pod!(StackT {
 
 /// Alternate stack is disabled
 pub const SS_DISABLE: i32 = 2;
-/// Currently executing on alternate stack
-pub const SS_ONSTACK: i32 = 1;
 
 // =============================================================================
 // User Context (ucontext_t)

@@ -1188,10 +1188,6 @@ fn read_directory_entries(
 // Directory Entry Write Operations
 // ============================================================================
 
-/// Characters invalid in FAT short names
-#[expect(dead_code)]
-const INVALID_SHORT_CHARS: &[u8] = b" .\"*+,/:;<=>?[\\]|";
-
 /// Generate an 8.3 short name from a long filename
 ///
 /// Returns an 11-byte array with 8 chars for name + 3 chars for extension,
@@ -1502,53 +1498,6 @@ fn create_dir_entry_with_lfn(
     write_raw_dir_entry(sb_data, parent_cluster, short_entry_index, &short_bytes)?;
 
     Ok(short_name)
-}
-
-/// Update the file size in a directory entry
-#[expect(dead_code)]
-fn update_dir_entry_size(
-    sb_data: &VfatSbData,
-    parent_cluster: u32,
-    name: &str,
-    new_size: u32,
-) -> Result<(), KernelError> {
-    let chain = read_cluster_chain(sb_data, parent_cluster)?;
-    let entries_per_cluster = sb_data.cluster_size as usize / 32;
-
-    // Search for the entry
-    for &cluster in chain.iter() {
-        let cluster_offset = cluster_to_offset(sb_data, cluster);
-
-        for i in 0..entries_per_cluster {
-            let entry_offset = cluster_offset + (i as u64 * 32);
-            let mut buf = [0u8; 32];
-            read_bytes(&sb_data.bdev, entry_offset, &mut buf)?;
-
-            // Skip free/deleted entries
-            if buf[0] == END_MARKER || buf[0] == DELETED_MARKER {
-                continue;
-            }
-
-            // Skip LFN entries
-            if buf[11] == attr::LONG_NAME {
-                continue;
-            }
-
-            // Check if this matches our name (case-insensitive)
-            let short_name = short_name_to_string(
-                buf[0..8].try_into().unwrap(),
-                buf[8..11].try_into().unwrap(),
-            );
-            if short_name.eq_ignore_ascii_case(name) {
-                // Update size field at offset 28
-                buf[28..32].copy_from_slice(&new_size.to_le_bytes());
-                write_bytes(&sb_data.bdev, entry_offset, &buf)?;
-                return Ok(());
-            }
-        }
-    }
-
-    Err(KernelError::NotFound)
 }
 
 /// Update directory entry metadata (start_cluster and file_size) by short name
