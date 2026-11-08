@@ -124,7 +124,9 @@ fn getdents(fd: i32, dirp: u64, count: u64, fmt: Fmt) -> i64 {
 
     let _pos = file.pos_lock();
     let limit = count.min(GETDENTS_CHUNK);
-    let mut buf = Vec::new();
+    // Sized up front: the actor runs under the directory locks, where
+    // growing the buffer would be an atomic allocation
+    let mut buf = Vec::with_capacity(limit);
     let mut full = false;
     let mut actor = |e: &DirEntry, d_off: u64| {
         full = !put_dirent(&mut buf, limit, e, d_off, fmt);
