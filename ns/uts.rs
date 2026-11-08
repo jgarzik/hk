@@ -19,9 +19,8 @@ use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use spin::Lazy;
 
-use crate::arch::Uaccess;
-use crate::uaccess::{UaccessArch, copy_from_user};
-use crate::util::error::KernelError;
+use crate::uaccess::{UserPtr, UserSlice};
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::FromBytes;
 
 /// Maximum string length for UTS fields (not including NUL terminator)
@@ -147,17 +146,16 @@ impl UtsNamespace {
     /// Creates a new UTS namespace with a copy of the current
     /// name values. Changes in the new namespace won't affect
     /// the original (and vice versa).
-    pub fn clone_ns(&self) -> Result<Arc<Self>, i32> {
+    pub fn clone_ns(&self) -> Result<Arc<Self>, KernelError> {
         // Copy current name values
         let name_copy = *self.name.read();
 
-        let inum = super::inum::Inum::alloc().map_err(|e| e.errno())?;
+        let inum = super::inum::Inum::alloc()?;
         try_arc(Self {
             name: RwLock::new(name_copy),
             user_ns: self.user_ns.clone(),
             inum,
         })
-        .map_err(|e| e.errno())
     }
 }
 
@@ -185,125 +183,41 @@ fn copy_str(dest: &mut [u8], src: &[u8]) {
 // Syscall Handlers (Phase 2)
 // ============================================================================
 
-/// sys_uname - get system identification
-///
-/// Copies the UTS name structure to userspace.
-///
-/// # Arguments
-/// * `buf` - User pointer to `struct utsname`
-///
-/// # Returns
-/// * 0 on success
-/// * -EFAULT if user pointer is invalid
-pub fn sys_uname(buf: u64) -> i64 {
-    // Validate user buffer
-    if !Uaccess::access_ok(buf, core::mem::size_of::<NewUtsname>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Get current task's UTS namespace
-    let uts_ns = super::current_uts_ns();
-
-    // Read lock - copy to temp to minimize lock hold time
-    let tmp: NewUtsname = *uts_ns.name.read();
-
-    // Copy to user space
-    if crate::uaccess::copy_val_to_user::<Uaccess, NewUtsname>(buf, &tmp).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+/// uname(buf)
+pub fn sys_uname(buf: UserPtr<NewUtsname>) -> KernelResult<()> {
+    // Copied out first: no user access under the name lock
+    let tmp: NewUtsname = *super::current_uts_ns().name.read();
+    Ok(buf.write(&tmp)?)
 }
 
-/// sys_sethostname - set hostname
-///
-/// Sets the hostname (nodename) in the current UTS namespace.
-/// Requires CAP_SYS_ADMIN.
-///
-/// # Arguments
-/// * `name` - User pointer to hostname string
-/// * `len` - Length of hostname (max 64)
-///
-/// # Returns
-/// * 0 on success
-/// * -EPERM if not privileged
-/// * -EINVAL if len > 64
-/// * -EFAULT if user pointer is invalid
-pub fn sys_sethostname(name: u64, len: u64) -> i64 {
-    // Linux sethostname: CAP_SYS_ADMIN (in the UTS namespace's user
-    // namespace; hk has one set of capabilities)
+/// The new value of a UTS name field from `name`, `len` bytes (Linux
+/// sethostname/setdomainname): CAP_SYS_ADMIN (in the UTS namespace's
+/// user namespace; hk has one set of capabilities), at most 64 bytes
+fn uts_field(name: UserPtr<u8>, len: u64) -> KernelResult<[u8; UTS_FIELD_SIZE]> {
     if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
-
     let len = len as usize;
     if len > __NEW_UTS_LEN {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    if !Uaccess::access_ok(name, len) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Copy from user
     let mut tmp = [0u8; UTS_FIELD_SIZE];
-    if copy_from_user::<Uaccess>(&mut tmp, name, len).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Get UTS namespace and update
-    let uts_ns = super::current_uts_ns();
-
-    {
-        let mut guard = uts_ns.name.write();
-        guard.nodename = tmp;
-    }
-
-    0
+    UserSlice::new(name.addr(), len)
+        .reader()
+        .read_slice(&mut tmp[..len])?;
+    Ok(tmp)
 }
 
-/// sys_setdomainname - set NIS domain name
-///
-/// Sets the domainname in the current UTS namespace.
-/// Requires CAP_SYS_ADMIN.
-///
-/// # Arguments
-/// * `name` - User pointer to domainname string
-/// * `len` - Length of domainname (max 64)
-///
-/// # Returns
-/// * 0 on success
-/// * -EPERM if not privileged
-/// * -EINVAL if len > 64
-/// * -EFAULT if user pointer is invalid
-pub fn sys_setdomainname(name: u64, len: u64) -> i64 {
-    // Linux setdomainname: CAP_SYS_ADMIN, as sethostname
-    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-        return KernelError::NotPermitted.sysret();
-    }
+/// sethostname(name, len)
+pub fn sys_sethostname(name: UserPtr<u8>, len: u64) -> KernelResult<()> {
+    let tmp = uts_field(name, len)?;
+    super::current_uts_ns().name.write().nodename = tmp;
+    Ok(())
+}
 
-    let len = len as usize;
-    if len > __NEW_UTS_LEN {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    if !Uaccess::access_ok(name, len) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Copy from user
-    let mut tmp = [0u8; UTS_FIELD_SIZE];
-    if copy_from_user::<Uaccess>(&mut tmp, name, len).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Get UTS namespace and update
-    let uts_ns = super::current_uts_ns();
-
-    {
-        let mut guard = uts_ns.name.write();
-        guard.domainname = tmp;
-    }
-
-    0
+/// setdomainname(name, len)
+pub fn sys_setdomainname(name: UserPtr<u8>, len: u64) -> KernelResult<()> {
+    let tmp = uts_field(name, len)?;
+    super::current_uts_ns().name.write().domainname = tmp;
+    Ok(())
 }

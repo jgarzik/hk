@@ -25,6 +25,7 @@ pub fn run_tests() {
     test_unshare_newnet();
     test_unshare_newpid();
     test_unshare_newuser();
+    in_child(b"PIDNS_ENOSPC", pidns_depth);
     test_unshare_newns();
     test_setns_ebadf();
     test_setns_uts();
@@ -345,6 +346,32 @@ fn test_unshare_newpid() {
             fail_num(b"UNSHARE_NEWPID:FAIL exit_status=", exit_status as i64);
         }
     }
+}
+
+/// unshare(CLONE_NEWPID) nested past MAX_PID_NS_LEVEL (32) levels is
+/// ENOSPC (Linux create_pid_namespace). Each level forks into the
+/// namespace it made and passes the deepest one's exit status up.
+fn pidns_depth() -> i32 {
+    const ENOSPC: i64 = -28;
+    for level in 0..40 {
+        match sys_unshare(CLONE_NEWPID) {
+            0 => {}
+            ENOSPC if level == 32 => return 0,
+            _ => return 1 + level,
+        }
+        let pid = sys_fork();
+        if pid < 0 {
+            return 50;
+        }
+        if pid > 0 {
+            let mut ws: i32 = 0;
+            if sys_wait4(pid, &mut ws, 0, 0) != pid || ws & 0x7f != 0 {
+                return 51;
+            }
+            return (ws >> 8) & 0xff;
+        }
+    }
+    52
 }
 
 /// Test: unshare(CLONE_NEWUSER) creates new user namespace

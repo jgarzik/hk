@@ -2282,7 +2282,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // is EBADF)
     let child_fs = crate::fs::fsstruct::fork_fs(current_tid, config.flags & CLONE_FS != 0)
         .map_err(|e| e.errno())?;
-    let child_ns = crate::ns::fork_nsproxy(current_tid, config.flags, child_fs.as_deref())?;
+    let child_ns = crate::ns::fork_nsproxy(current_tid, config.flags, child_fs.as_deref())
+        .map_err(KernelError::errno)?;
     // A thread stays in its group's pid namespace (Linux copy_process:
     // CLONE_THREAD with CLONE_NEWPID or CLONE_NEWUSER, or after an
     // unshare(CLONE_NEWPID), is EINVAL)

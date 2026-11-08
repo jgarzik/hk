@@ -108,10 +108,10 @@ impl UidGidMap {
     /// # Returns
     /// * `Ok(())` - Mapping set successfully
     /// * `Err(errno)` - If mapping already set or invalid
-    pub fn set_mapping(&self, new_extents: Vec<UidGidExtent>) -> Result<(), i32> {
+    pub fn set_mapping(&self, new_extents: Vec<UidGidExtent>) -> Result<(), KernelError> {
         let mut extents = self.extents.write();
         if !extents.is_empty() {
-            return Err(KernelError::NotPermitted.errno()); // already set
+            return Err(KernelError::NotPermitted); // already set
         }
         *extents = new_extents;
         Ok(())
@@ -174,16 +174,16 @@ impl UserNamespace {
     ///
     /// # Returns
     /// * `Ok(Arc<UserNamespace>)` - New child namespace
-    /// * `Err(errno)` - If max nesting level exceeded
-    pub fn clone_ns(parent: &Arc<UserNamespace>) -> Result<Arc<Self>, i32> {
-        // Check nesting level
+    /// * `Err(ENOSPC)` - If max nesting level exceeded (Linux
+    ///   create_user_ns)
+    pub fn clone_ns(parent: &Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
         if parent.level >= MAX_USER_NS_LEVEL {
-            return Err(KernelError::WouldBlock.errno()); // max nesting exceeded
+            return Err(KernelError::NoSpace);
         }
 
         // Get creator's credentials
         let cred = percpu::current_cred();
-        let inum = super::inum::Inum::alloc().map_err(|e| e.errno())?;
+        let inum = super::inum::Inum::alloc()?;
 
         try_arc(Self {
             uid_map: UidGidMap::default(),
@@ -194,7 +194,6 @@ impl UserNamespace {
             group: cred.gid,
             inum,
         })
-        .map_err(|e| e.errno())
     }
 
     /// Check if this namespace is an ancestor of another

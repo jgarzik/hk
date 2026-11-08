@@ -30,7 +30,7 @@ pub mod user;
 pub mod uts;
 
 use crate::sync::spin::RwLock;
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use spin::Lazy;
@@ -127,11 +127,11 @@ impl MntNamespace {
     /// an independent view of the filesystem hierarchy.
     /// `fs` (the new task's, or the unsharer's own) moves its root and
     /// pwd to the copies of their mounts (Linux copy_mnt_ns)
-    pub fn clone_ns(&self, fs: Option<&crate::fs::FsStruct>) -> Result<Arc<Self>, i32> {
-        let new_ns = Self::new().map_err(|e| e.errno())?;
+    pub fn clone_ns(&self, fs: Option<&crate::fs::FsStruct>) -> KernelResult<Arc<Self>> {
+        let new_ns = Self::new()?;
         let old_root = self.root.read().clone();
         if let Some(old_root) = old_root {
-            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id)?;
+            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id);
             *new_ns.root.write() = Some(new_root);
             if let Some(fs) = fs {
                 fs.repoint(&map);
@@ -239,7 +239,7 @@ impl NsProxy {
     /// # Returns
     /// * `Ok(Arc<NsProxy>)` - New nsproxy (may share namespaces with self)
     /// * `Err(errno)` - On allocation failure
-    pub fn copy(&self, flags: u64, fs: Option<&crate::fs::FsStruct>) -> Result<Arc<Self>, i32> {
+    pub fn copy(&self, flags: u64, fs: Option<&crate::fs::FsStruct>) -> KernelResult<Arc<Self>> {
         let uts_ns = if flags & CLONE_NEWUTS != 0 {
             self.uts_ns.clone_ns()?
         } else {
@@ -265,7 +265,10 @@ impl NsProxy {
         };
 
         let ipc_ns = if flags & CLONE_NEWIPC != 0 {
-            self.ipc_ns.clone_ns()?
+            // ipc's clone_ns still returns a positive errno
+            self.ipc_ns
+                .clone_ns()
+                .map_err(|e| KernelError::from_errno(e).unwrap_or(KernelError::OutOfMemory))?
         } else {
             self.ipc_ns.clone()
         };
@@ -293,7 +296,6 @@ impl NsProxy {
             net_ns,
             cgroup_ns,
         })
-        .map_err(|e| e.errno())
     }
 }
 
@@ -362,16 +364,16 @@ pub fn fork_nsproxy(
     parent_tid: Tid,
     flags: u64,
     child_fs: Option<&crate::fs::FsStruct>,
-) -> Result<Arc<NsProxy>, i32> {
+) -> KernelResult<Arc<NsProxy>> {
     let ns_flags = flags & CLONE_NS_FLAGS;
     // CLONE_NEWNS with a shared fs struct is EINVAL, before any
     // permission check (Linux copy_process); the child's own copy
     // follows its new mounts
     if ns_flags & CLONE_NEWNS != 0 && flags & crate::task::clone_flags::CLONE_FS != 0 {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
     if !may_create_namespaces(ns_flags) {
-        return Err(KernelError::NotPermitted.errno());
+        return Err(KernelError::NotPermitted);
     }
     let parent_ns = get_task_ns(parent_tid).unwrap_or_else(|| INIT_NSPROXY.clone());
     if ns_flags == 0 {
@@ -438,6 +440,9 @@ pub fn current_net_ns() -> Arc<NetNamespace> {
 const SUPPORTED_NS_FLAGS: u64 =
     CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER | CLONE_NEWIPC | CLONE_NEWNET;
 
+/// CLONE_SYSVSEM flag - used by unshare to detach from shared semundo
+const CLONE_SYSVSEM: u64 = 0x00040000;
+
 /// sys_unshare - disassociate parts of the process execution context
 ///
 /// Creates new namespaces for the calling process, disassociating from
@@ -454,10 +459,7 @@ const SUPPORTED_NS_FLAGS: u64 =
 /// # Notes
 /// Unlike clone(), unshare() always affects the calling thread.
 /// The new namespace takes effect immediately.
-/// CLONE_SYSVSEM flag - used by unshare to detach from shared semundo
-const CLONE_SYSVSEM: u64 = 0x00040000;
-
-pub fn sys_unshare(unshare_flags: u64) -> i64 {
+pub fn sys_unshare(unshare_flags: u64) -> KernelResult<()> {
     let tid = crate::task::percpu::current_tid();
     let ns_flags = unshare_flags & CLONE_NS_FLAGS;
     let sysvsem_flag = unshare_flags & CLONE_SYSVSEM;
@@ -472,17 +474,15 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
 
     // No namespace flags - nothing more to do
     if ns_flags == 0 {
-        return 0;
+        return Ok(());
     }
 
     // Check for unsupported namespace flags
-    let unsupported = ns_flags & !SUPPORTED_NS_FLAGS;
-    if unsupported != 0 {
-        return KernelError::InvalidArgument.sysret();
+    if ns_flags & !SUPPORTED_NS_FLAGS != 0 {
+        return Err(KernelError::InvalidArgument);
     }
-
     if !may_create_namespaces(ns_flags) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Get current namespace proxy
@@ -492,13 +492,9 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
     // CLONE_NEWNS implies CLONE_FS (Linux unshare): a private fs
     // struct, moved to the copies of its mounts
     let fs = if ns_flags & CLONE_NEWNS != 0 {
-        let fs = match crate::task::percpu::current_fs()
+        let fs = crate::task::percpu::current_fs()
             .map(|f| f.copy())
-            .transpose()
-        {
-            Ok(fs) => fs,
-            Err(e) => return e.sysret(),
-        };
+            .transpose()?;
         if let Some(f) = &fs {
             crate::fs::init_task_fs(tid, f.clone());
         }
@@ -506,14 +502,11 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
     } else {
         None
     };
-    let Ok(new_ns) = current_ns.copy(ns_flags, fs.as_deref()) else {
-        return KernelError::InvalidArgument.sysret();
-    };
+    let new_ns = current_ns.copy(ns_flags, fs.as_deref())?;
 
     // Switch to new namespace (atomic via mutex)
     switch_task_namespaces(tid, new_ns);
-
-    0
+    Ok(())
 }
 
 /// Switch a task's namespace to a new nsproxy
@@ -542,72 +535,43 @@ pub fn switch_task_namespaces(tid: Tid, new_ns: Arc<NsProxy>) {
 /// * -EBADF if fd is invalid or not a namespace file
 /// * -EINVAL if nstype doesn't match the namespace type
 /// * -EPERM if permission denied
-pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
+pub fn sys_setns(fd: i32, nstype: i32) -> KernelResult<()> {
     use crate::fs::proc::{NamespaceType, ProcfsInodeData, ProcfsInodeWrapper};
-    use crate::task::fdtable::get_task_fd;
-    use crate::task::percpu::current_tid;
+    let tid = crate::task::percpu::current_tid();
 
-    let tid = current_tid();
-
-    // Get file from fd
-    let Some(fd_table) = get_task_fd(tid) else {
-        return KernelError::BadFd.sysret();
-    };
-    let Some(file) = fd_table.lock().get(fd) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Get inode from file
-    let Some(inode) = file.get_inode() else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Get private data and check if it's a namespace file
-    let Some(private) = inode.get_private() else {
-        return KernelError::InvalidArgument.sysret();
-    };
-
-    let Some(wrapper) = private
+    let file = crate::fs::io::fget(fd)?;
+    let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+    // A namespace file: procfs private data naming one
+    let private = inode.get_private().ok_or(KernelError::InvalidArgument)?;
+    let wrapper = private
         .as_ref()
         .as_any()
         .downcast_ref::<ProcfsInodeWrapper>()
-    else {
-        // Not a procfs file
-        return KernelError::InvalidArgument.sysret();
-    };
-
+        .ok_or(KernelError::InvalidArgument)?;
     // Copied out: the inode data's spin lock is not held for the rest
     let (target_pid, ns_type) = match &*wrapper.0.read() {
         ProcfsInodeData::NamespaceFile { pid, ns_type } => (pid.clone(), *ns_type),
-        _ => return KernelError::InvalidArgument.sysret(), // Not a namespace file
+        _ => return Err(KernelError::InvalidArgument),
     };
 
     // Validate nstype if specified
-    if nstype != 0 {
-        let expected_flag = ns_type.clone_flag() as i32;
-        if nstype != expected_flag {
-            return KernelError::InvalidArgument.sysret();
-        }
+    if nstype != 0 && nstype != ns_type.clone_flag() as i32 {
+        return Err(KernelError::InvalidArgument);
     }
 
     // The target task, pinned through its struct pid
-    let Some(target) = target_pid.task() else {
-        return KernelError::NoProcess.sysret();
-    };
+    let target = target_pid.task().ok_or(KernelError::NoProcess)?;
 
     // Linux ->install: CAP_SYS_ADMIN, and CAP_SYS_CHROOT for a mount
     // namespace (mntns_install)
     let chroot_ok =
         !matches!(ns_type, NamespaceType::Mnt) || crate::task::capable(crate::task::CAP_SYS_CHROOT);
     if !crate::task::capable(crate::task::CAP_SYS_ADMIN) || !chroot_ok {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // The target task's namespaces
-    let Some(target_ns) = crate::fs::proc::task_nsproxy(&target) else {
-        return KernelError::NoProcess.sysret();
-    };
-
+    let target_ns = crate::fs::proc::task_nsproxy(&target).ok_or(KernelError::NoProcess)?;
     let current_ns = get_task_ns(tid).unwrap_or_else(|| INIT_NSPROXY.clone());
 
     // A mount namespace moves root and cwd: not with an fs struct
@@ -616,7 +580,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
         && crate::task::percpu::current_fs()
             .is_some_and(|fs| fs.users.load(core::sync::atomic::Ordering::SeqCst) != 1)
     {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Create new nsproxy with the target namespace for the specified type
@@ -676,10 +640,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             cgroup_ns: current_ns.cgroup_ns.clone(),
         },
     };
-    let new_ns = match try_arc(new_ns) {
-        Ok(n) => n,
-        Err(e) => return e.sysret(),
-    };
+    let new_ns = try_arc(new_ns)?;
 
     let mnt_root = matches!(ns_type, NamespaceType::Mnt)
         .then(|| new_ns.mnt_ns.root_path())
@@ -691,5 +652,5 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
         fs.set_root(root.clone());
         fs.set_pwd(root);
     }
-    0
+    Ok(())
 }

@@ -289,7 +289,14 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         )
         .ret() as u64,
         Sys::Acct => crate::task::acct::sys_acct(a[0]).ret() as u64,
-        Sys::AddKey => crate::keys::sys_add_key(a[0], a[1], a[2], a[3], a[4] as i32).ret() as u64,
+        Sys::AddKey => crate::keys::sys_add_key(
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+            a[4] as i32,
+        )
+        .ret() as u64,
         Sys::Adjtimex => crate::time::time_syscall::sys_adjtimex(UserPtr::new(a[0])).ret() as u64,
         Sys::Bind => {
             crate::net::syscall::sys_bind(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
@@ -831,7 +838,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::syscall::sys_renameat2(a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32)
                 as u64
         }
-        Sys::RequestKey => crate::keys::sys_request_key(a[0], a[1], a[2], a[3] as i32).ret() as u64,
+        Sys::RequestKey => crate::keys::sys_request_key(
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3] as i32,
+        )
+        .ret() as u64,
         Sys::Rseq => KernelError::NotImplemented.sysret() as u64,
         Sys::RtSigaction => crate::signal::syscall::sys_rt_sigaction(
             a[0] as u32,
@@ -949,7 +962,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[5],
         )
         .ret() as u64,
-        Sys::Setdomainname => crate::ns::uts::sys_setdomainname(a[0], a[1]).ret() as u64,
+        Sys::Setdomainname => {
+            crate::ns::uts::sys_setdomainname(UserPtr::new(a[0]), a[1]).ret() as u64
+        }
         Sys::Setfsgid => {
             crate::task::syscall::sys_setfsgid(a[0] as u32, crate::task::percpu::current_cred())
                 as u64
@@ -965,7 +980,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Setgroups => {
             crate::task::syscall::sys_setgroups::<Uaccess>(a[0] as i32, a[1]).ret() as u64
         }
-        Sys::Sethostname => crate::ns::uts::sys_sethostname(a[0], a[1]).ret() as u64,
+        Sys::Sethostname => crate::ns::uts::sys_sethostname(UserPtr::new(a[0]), a[1]).ret() as u64,
         Sys::Setitimer => crate::time::posix_timer::sys_setitimer(
             a[0] as i32,
             UserPtr::new(a[1]),
@@ -1150,7 +1165,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Truncate => crate::fs::syscall::sys_truncate(a[0], a[1] as i64).ret() as u64,
         Sys::Umask => crate::fs::syscall::sys_umask(a[0] as u32).ret() as u64,
         Sys::Umount2 => crate::fs::syscall::sys_umount2(a[0], a[1] as i32).ret() as u64,
-        Sys::Uname => crate::ns::uts::sys_uname(a[0]).ret() as u64,
+        Sys::Uname => crate::ns::uts::sys_uname(UserPtr::new(a[0])).ret() as u64,
         Sys::Unlinkat => {
             crate::fs::syscall::sys_unlinkat(a[0] as i32, a[1], a[2] as i32).ret() as u64
         }

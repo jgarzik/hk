@@ -21,15 +21,15 @@ pub trait KeyType: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Instantiate a key with the given payload
-    fn instantiate(&self, key: &Key, data: &[u8]) -> Result<(), i64>;
+    fn instantiate(&self, key: &Key, data: &[u8]) -> Result<(), KernelError>;
 
     /// Read the key's payload into the buffer
     ///
     /// Returns the total payload size (may be larger than buffer if truncated)
-    fn read(&self, key: &Key, buffer: &mut [u8]) -> Result<usize, i64>;
+    fn read(&self, key: &Key, buffer: &mut [u8]) -> Result<usize, KernelError>;
 
     /// Update the key's payload
-    fn update(&self, key: &Key, data: &[u8]) -> Result<(), i64>;
+    fn update(&self, key: &Key, data: &[u8]) -> Result<(), KernelError>;
 
     /// Get the key's description string for KEYCTL_DESCRIBE
     ///
@@ -55,13 +55,13 @@ impl KeyType for UserKeyType {
         "user"
     }
 
-    fn instantiate(&self, key: &Key, data: &[u8]) -> Result<(), i64> {
-        key.instantiate(data.to_vec()).map_err(|e| e.sysret())
+    fn instantiate(&self, key: &Key, data: &[u8]) -> Result<(), KernelError> {
+        key.instantiate(data.to_vec())
     }
 
-    fn read(&self, key: &Key, buffer: &mut [u8]) -> Result<usize, i64> {
+    fn read(&self, key: &Key, buffer: &mut [u8]) -> Result<usize, KernelError> {
         if key.is_revoked() {
-            return Err(KernelError::KeyRevoked.sysret());
+            return Err(KernelError::KeyRevoked);
         }
 
         if let Some(payload) = key.read_payload() {
@@ -73,8 +73,8 @@ impl KeyType for UserKeyType {
         }
     }
 
-    fn update(&self, key: &Key, data: &[u8]) -> Result<(), i64> {
-        key.update(data.to_vec()).map_err(|e| e.sysret())
+    fn update(&self, key: &Key, data: &[u8]) -> Result<(), KernelError> {
+        key.update(data.to_vec())
     }
 
     fn describe(&self, key: &Key) -> String {
@@ -110,14 +110,14 @@ impl KeyType for KeyringKeyType {
         "keyring"
     }
 
-    fn instantiate(&self, _key: &Key, _data: &[u8]) -> Result<(), i64> {
+    fn instantiate(&self, _key: &Key, _data: &[u8]) -> Result<(), KernelError> {
         // Keyrings have no payload; create_keyring instantiates them
         Ok(())
     }
 
-    fn read(&self, key: &Key, buffer: &mut [u8]) -> Result<usize, i64> {
+    fn read(&self, key: &Key, buffer: &mut [u8]) -> Result<usize, KernelError> {
         if key.is_revoked() {
-            return Err(KernelError::KeyRevoked.sysret());
+            return Err(KernelError::KeyRevoked);
         }
 
         // Return list of key serial numbers as i32 array
@@ -134,9 +134,9 @@ impl KeyType for KeyringKeyType {
         Ok(needed)
     }
 
-    fn update(&self, _key: &Key, _data: &[u8]) -> Result<(), i64> {
+    fn update(&self, _key: &Key, _data: &[u8]) -> Result<(), KernelError> {
         // Keyrings cannot be updated via KEYCTL_UPDATE
-        Err(KernelError::OperationNotSupported.sysret())
+        Err(KernelError::OperationNotSupported)
     }
 
     fn describe(&self, key: &Key) -> String {

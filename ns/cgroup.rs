@@ -58,8 +58,8 @@ impl CgroupNamespace {
     ///
     /// Creates a new cgroup namespace rooted at the given cgroup.
     /// Typically called with the current task's cgroup.
-    pub fn clone_ns(&self, new_root: Arc<Cgroup>) -> Result<Arc<Self>, i32> {
-        Self::new(new_root).map_err(|e| e.errno())
+    pub fn clone_ns(&self, new_root: Arc<Cgroup>) -> Result<Arc<Self>, KernelError> {
+        Self::new(new_root)
     }
 
     /// Translate an absolute cgroup path to a namespace-relative path
