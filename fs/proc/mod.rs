@@ -47,7 +47,7 @@ use crate::io::poll::{DEFAULT_POLLMASK, POLLIN, POLLRDNORM, PollTable};
 use crate::ns::PidNamespace;
 use crate::task::Cred;
 use crate::task::Pid;
-use crate::task::percpu::{TaskRef, find_task_by_pid_ns};
+use crate::task::percpu::TaskRef;
 use crate::util::kalloc::try_arc;
 
 /// Get current timestamp for new inodes
@@ -592,9 +592,12 @@ impl InodeOps for ProcfsInodeOps {
                 // A thread of the process by its number in the mount's
                 // namespace (Linux proc_task_lookup)
                 let t = p.task().ok_or(KernelError::NotFound)?;
-                let nr: u64 = name.parse().map_err(|_| KernelError::NotFound)?;
+                let nr: u32 = name.parse().map_err(|_| KernelError::NotFound)?;
                 let ns = opts::pid_ns(dir);
-                let thread = find_task_by_pid_ns(nr, &ns).ok_or(KernelError::NotFound)?;
+                // The thread's own struct pid: its directory describes
+                // that thread, not the leader
+                let tp = ProcPid(crate::task::pid::find_pid(&ns, nr).ok_or(KernelError::NotFound)?);
+                let thread = tp.task().ok_or(KernelError::NotFound)?;
                 let mine = group_threads(&t, &ns)
                     .iter()
                     .any(|&(x, _, _)| core::ptr::eq(x, Arc::as_ptr(&thread)));
@@ -604,7 +607,7 @@ impl InodeOps for ProcfsInodeOps {
                 create_dir_inode(
                     dir,
                     pid_ino(thread.tid(), 0),
-                    ProcfsInodeData::new_pid_dir(p),
+                    ProcfsInodeData::new_pid_dir(tp),
                 )
             }
             Dir::Fdinfo(p) => lookup_pid_fdinfo_entry(dir, &p, name),
