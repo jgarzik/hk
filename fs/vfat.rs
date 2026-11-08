@@ -513,6 +513,8 @@ pub struct VfatSbData {
     pub fat_start_sector: u64,
     /// Size of each FAT in sectors
     pub fat_sectors: u64,
+    /// Number of FAT copies, each written on a change (Linux sbi->fats)
+    pub num_fats: u64,
     /// First sector of the data region
     pub data_start_sector: u64,
     /// Root directory cluster
@@ -872,9 +874,8 @@ fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), K
     let new_value = (existing & 0xF000_0000) | (value & 0x0FFF_FFFF);
     let buf = new_value.to_le_bytes();
 
-    // Write to all FAT copies (typically 2)
-    let num_fats = 2u64; // FAT32 standard
-    for fat_num in 0..num_fats {
+    // Every FAT copy the boot sector declares (Linux fat_mirror_bhs)
+    for fat_num in 0..sb_data.num_fats {
         let fat_start = sb_data.fat_start_sector + fat_num * sb_data.fat_sectors;
         let byte_offset = fat_start * u64::from(sb_data.bytes_per_sector) + offset_in_fat;
         write_bytes(&sb_data.bdev, byte_offset, &buf)?;
@@ -2536,6 +2537,7 @@ fn vfat_mount_dev(
         sectors_per_cluster: u32::from(boot_sector.sectors_per_cluster),
         fat_start_sector,
         fat_sectors,
+        num_fats,
         data_start_sector,
         root_cluster: boot_sector.root_cluster,
         max_cluster: (total_clusters + 2) as u32,
