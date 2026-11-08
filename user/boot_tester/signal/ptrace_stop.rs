@@ -15,6 +15,8 @@
 //!   sees, still read-only to it (its own write faults); without force,
 //!   process_vm_writev there is EFAULT, and process_vm_readv of a page
 //!   never touched reads zeros (both fault pages in: Linux GUP)
+//! - PTRACE_UNKNOWN_EIO: an unknown request is ESRCH for a process the
+//!   caller does not trace, EIO for its stopped tracee
 
 use crate::harness::T;
 use hk_syscall::{
@@ -36,6 +38,7 @@ pub fn run_tests() {
     test_stop_kill();
     test_peek_dumpable();
     test_poke_text();
+    test_unknown_request();
 }
 
 /// Never called: the text word POKETEXT writes
@@ -300,5 +303,30 @@ fn test_peek_dumpable() {
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
     t.eq(b"tracer status", st as i64, 0);
+    t.done();
+}
+
+/// PTRACE_UNKNOWN_EIO: a request ptrace does not know is ESRCH for a
+/// process the caller does not trace, EIO for its stopped tracee
+/// (Linux sys_ptrace: ptrace_check_attach, then ptrace_request's
+/// default)
+fn test_unknown_request() {
+    const UNKNOWN: i64 = 0x7777;
+    const ESRCH: i64 = -3;
+    const EIO: i64 = -5;
+    let mut t = T::new(b"PTRACE_UNKNOWN_EIO");
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+        sys_kill(sys_getpid(), SIGSTOP);
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    t.ok(b"stopped", st & 0xff == 0x7f, i64::from(st));
+    t.eq(b"untraced", sys_ptrace(UNKNOWN, 1, 0, 0), ESRCH);
+    t.eq(b"stopped tracee", sys_ptrace(UNKNOWN, pid, 0, 0), EIO);
+    sys_kill(pid, SIGKILL);
+    sys_wait4(pid, &mut st, 0, 0);
     t.done();
 }

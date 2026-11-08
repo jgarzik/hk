@@ -9,12 +9,11 @@
 //! This implementation follows the Linux ptrace ABI for both x86-64 and aarch64.
 //! Not all ptrace operations are implemented; this focuses on the core subset
 //! needed for basic debugging and tracing.
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP};
 use crate::task::percpu::{self, TASKLIST};
 use crate::task::{CAP_SYS_PTRACE, Pid, TaskState, Tid, capable};
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_to_user, copy_val_from_user, copy_val_to_user};
 
 // =============================================================================
 // Ptrace request codes (from Linux include/uapi/linux/ptrace.h)
@@ -841,13 +840,7 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
     // Architecture-specific implementation
     match crate::arch::ptrace::get_user_regs(target_tid) {
         Ok(regs) => {
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&raw const regs).cast::<u8>(),
-                    core::mem::size_of_val(&regs),
-                )
-            };
-            if copy_to_user::<crate::arch::Uaccess>(data, bytes).is_err() {
+            if copy_val_to_user::<crate::arch::Uaccess, _>(data, &regs).is_err() {
                 return -EFAULT;
             }
             0
@@ -869,41 +862,13 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
         Err(e) => return e,
     };
 
-    // Architecture-specific implementation
-    #[cfg(target_arch = "x86_64")]
-    {
-        let mut regs = crate::arch::ptrace::UserRegsStruct::default();
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                (&raw mut regs).cast::<u8>(),
-                core::mem::size_of_val(&regs),
-            )
-        };
-        if copy_from_user::<crate::arch::Uaccess>(bytes, data, bytes.len()).is_err() {
-            return -EFAULT;
-        }
-        match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
-            Ok(()) => 0,
-            Err(e) => i64::from(e),
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        let mut regs = crate::arch::ptrace::UserPtRegs::default();
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                (&raw mut regs).cast::<u8>(),
-                core::mem::size_of_val(&regs),
-            )
-        };
-        if copy_from_user::<crate::arch::Uaccess>(bytes, data, bytes.len()).is_err() {
-            return -EFAULT;
-        }
-        match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
-            Ok(()) => 0,
-            Err(e) => i64::from(e),
-        }
+    let Ok(regs) = copy_val_from_user::<crate::arch::Uaccess, crate::arch::ptrace::UserRegs>(data)
+    else {
+        return -EFAULT;
+    };
+    match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
+        Ok(()) => 0,
+        Err(e) => i64::from(e),
     }
 }
 
@@ -1150,15 +1115,23 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
 
         // Not yet implemented
         PTRACE_PEEKUSER | PTRACE_POKEUSER | PTRACE_GETFPREGS | PTRACE_SETFPREGS
-        | PTRACE_GETREGSET | PTRACE_SETREGSET | PTRACE_INTERRUPT | PTRACE_LISTEN => {
-            crate::printkln!("ptrace: unimplemented request {}", request);
-            -EINVAL
-        }
+        | PTRACE_GETREGSET | PTRACE_SETREGSET | PTRACE_INTERRUPT | PTRACE_LISTEN => -EINVAL,
 
-        _ => {
-            crate::printkln!("ptrace: unknown request {}", request);
-            -EINVAL
-        }
+        _ => ptrace_unknown(pid as Pid),
+    }
+}
+
+/// A request ptrace does not know (Linux sys_ptrace: ptrace_check_attach,
+/// then ptrace_request's default): ESRCH unless the caller traces `pid`
+/// and it is stopped, else EIO; nothing is logged, a user can send any
+/// number
+fn ptrace_unknown(pid: Pid) -> i64 {
+    let Some(tid) = percpu::find_task_by_vpid(pid).map(|t| t.tid()) else {
+        return -ESRCH;
+    };
+    match ptrace_check_attach(tid) {
+        Ok(_frozen) => -EIO,
+        Err(e) => e,
     }
 }
 
