@@ -6,6 +6,10 @@
 //!
 //! Runs before ETH0_DNS configures the Ethernet link, so it starts
 //! unconfigured; every test leaves it down without addresses.
+//!
+//! - NL_AUTOBIND_PIDNS: in a new pid and network namespace, the
+//!   autobound port id is the caller's pid there (Linux netlink_autobind:
+//!   task_tgid_vnr), 1 for the namespace's init
 
 use hk_syscall::{
     _LINUX_CAPABILITY_VERSION_3, CapUserData, CapUserHeader, IoVec, MsgHdr, SOCK_DGRAM, SOCK_RAW,
@@ -50,6 +54,7 @@ pub fn run_tests() {
     println(b"=== Netlink Tests ===");
     test_socket();
     test_autobind();
+    test_autobind_pidns();
     test_link_dump();
     test_unconfigured();
     test_getlink();
@@ -110,6 +115,36 @@ fn sockname(fd: i32) -> (u16, u32, u32) {
         u32::from_ne_bytes([a[4], a[5], a[6], a[7]]),
         u32::from_ne_bytes([a[8], a[9], a[10], a[11]]),
     )
+}
+
+/// A namespace's init autobinds to port 1
+fn test_autobind_pidns() {
+    const CLONE_NEWPID: u64 = 0x2000_0000;
+    const CLONE_NEWNET: u64 = 0x4000_0000;
+    const SIGCHLD: u64 = 17;
+    let y = hk_syscall::sys_clone(CLONE_NEWPID | CLONE_NEWNET | SIGCHLD, 0, 0, 0, 0);
+    if y == 0 {
+        let fd = sys_socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) as i32;
+        let any = nladdr(0, 0);
+        let r = sys_bind(fd, any.as_ptr(), 12);
+        let port = sockname(fd).1;
+        let step = [fd >= 0, r == 0, sys_getpid() == 1, port == 1]
+            .iter()
+            .position(|ok| !ok)
+            .map_or(0, |i| i + 1);
+        sys_exit(step as u64);
+    }
+    let mut st = 0;
+    let w = sys_wait4(y, &mut st, 0, 0);
+    // The failed step, 100 + a killing signal, 99 if the wait failed
+    let step = if w != y {
+        99
+    } else if st & 0x7f != 0 {
+        100 + i64::from(st & 0x7f)
+    } else {
+        i64::from((st >> 8) & 0xff)
+    };
+    crate::harness::report_step(b"NL_AUTOBIND_PIDNS", step);
 }
 
 fn test_autobind() {
