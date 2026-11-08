@@ -502,10 +502,12 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::futex::sys_futex_waitv(a[0], a[1] as u32, a[2] as u32, a[3], a[4] as i32)
                 as u64
         }
-        Sys::Getcpu => {
-            crate::task::syscall::sys_getcpu::<Uaccess>(crate::cpu::this_id(), a[0], a[1]).ret()
-                as u64
-        }
+        Sys::Getcpu => crate::task::syscall::sys_getcpu::<Uaccess>(
+            crate::cpu::this_id(),
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+        )
+        .ret() as u64,
         Sys::Getcwd => crate::fs::syscall::sys_getcwd(UserPtr::new(a[0]), a[1]).ret() as u64,
         Sys::Getdents64 => {
             crate::fs::syscall::sys_getdents64(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
@@ -1020,34 +1022,37 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::SchedGetaffinity => crate::task::syscall::sys_sched_getaffinity::<Uaccess>(
             i64::from(a[0] as i32),
             a[1],
-            a[2],
+            UserPtr::new(a[2]),
         )
         .ret() as u64,
-        Sys::SchedGetparam => {
-            crate::task::syscall::sys_sched_getparam::<Uaccess>(i64::from(a[0] as i32), a[1]).ret()
-                as u64
-        }
+        Sys::SchedGetparam => crate::task::syscall::sys_sched_getparam::<Uaccess>(
+            i64::from(a[0] as i32),
+            UserPtr::new(a[1]),
+        )
+        .ret() as u64,
         Sys::SchedGetscheduler => {
             crate::task::syscall::sys_sched_getscheduler(i64::from(a[0] as i32)).ret() as u64
         }
-        Sys::SchedRrGetInterval => {
-            crate::task::syscall::sys_sched_rr_get_interval::<Uaccess>(i64::from(a[0] as i32), a[1])
-                as u64
-        }
+        Sys::SchedRrGetInterval => crate::task::syscall::sys_sched_rr_get_interval::<Uaccess>(
+            i64::from(a[0] as i32),
+            UserPtr::new(a[1]),
+        )
+        .ret() as u64,
         Sys::SchedSetaffinity => crate::task::syscall::sys_sched_setaffinity::<Uaccess>(
             i64::from(a[0] as i32),
             a[1],
-            a[2],
+            UserPtr::new(a[2]),
         )
         .ret() as u64,
-        Sys::SchedSetparam => {
-            crate::task::syscall::sys_sched_setparam::<Uaccess>(i64::from(a[0] as i32), a[1]).ret()
-                as u64
-        }
+        Sys::SchedSetparam => crate::task::syscall::sys_sched_setparam::<Uaccess>(
+            i64::from(a[0] as i32),
+            UserPtr::new(a[1]),
+        )
+        .ret() as u64,
         Sys::SchedSetscheduler => crate::task::syscall::sys_sched_setscheduler::<Uaccess>(
             i64::from(a[0] as i32),
             a[1] as i32,
-            a[2],
+            UserPtr::new(a[2]),
         )
         .ret() as u64,
         Sys::SchedYield => {

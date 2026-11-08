@@ -3979,10 +3979,10 @@ fn move_queued_task(mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>, p: &
 /// it (the caller sleeps meanwhile, which for a task restricting itself
 /// is what lets the stopper find it off the CPU). EINVAL if no active
 /// CPU is in `mask`.
-pub fn set_cpus_allowed_ptr(p: &Task, mask: &crate::util::cpumask::CpuSet) -> Result<(), i32> {
+pub fn set_cpus_allowed_ptr(p: &Task, mask: &crate::util::cpumask::CpuSet) -> KernelResult<()> {
     let allowed = mask.and(&sched_cpus());
     if mask.and(&crate::smp::active_cpus()).is_empty() {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
     let (cpu, dest) = {
         let _pi = p.pi_lock.lock();
@@ -4661,16 +4661,13 @@ pub fn lookup_task_cpus_allowed(pid: Pid) -> Option<crate::util::cpumask::CpuSet
 /// * `policy` - New scheduling policy (may include SCHED_RESET_ON_FORK flag)
 /// * `rt_priority` - New real-time priority (1-99 for SCHED_FIFO/RR, 0 otherwise)
 ///
-/// # Returns
-/// * Ok(()) on success
-/// * Err(errno) on failure:
-///   - ESRCH (3): Process not found
-///   - EINVAL (22): Invalid policy or priority
+/// # Errors
+/// ESRCH: process not found; EINVAL: invalid policy or priority
 ///
 /// # Locking
 /// The task's pi_lock and rq lock (`change_class`): a queued task moves
 /// to its new class's list at once.
-pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(), i32> {
+pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> KernelResult<()> {
     use crate::task::{
         MAX_RT_PRIO, MIN_RT_PRIO, SCHED_BATCH, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL,
         SCHED_RESET_ON_FORK, SCHED_RR, is_rt_policy,
@@ -4685,25 +4682,22 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
         base_policy,
         SCHED_NORMAL | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE
     ) {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate rt_priority
     if is_rt_policy(base_policy) {
         if !(MIN_RT_PRIO..=MAX_RT_PRIO).contains(&rt_priority) {
-            return Err(KernelError::InvalidArgument.errno());
+            return Err(KernelError::InvalidArgument);
         }
     } else if rt_priority != 0 {
-        return Err(KernelError::InvalidArgument.errno()); // non-RT policies must have priority 0
+        return Err(KernelError::InvalidArgument); // non-RT policies must have priority 0
     }
 
-    let task = TASKLIST
-        .read()
-        .task(pid)
-        .ok_or(KernelError::NoProcess.errno())?;
+    let task = TASKLIST.read().task(pid).ok_or(KernelError::NoProcess)?;
     // Not the stoppers nor an idle task (Linux: EINVAL for rq->stop)
     if matches!(task.se.class(), Class::Stop | Class::Idle) {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
     // Nothing changes (Linux __sched_setscheduler: same policy and
     // priority only updates reset-on-fork)
@@ -4730,23 +4724,17 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
 /// * `pid` - Target process ID
 /// * `mask` - New CPU affinity mask (bit N = CPU N is allowed)
 ///
-/// # Returns
-/// * Ok(()) on success
-/// * Err(errno) on failure:
-///   - ESRCH (3): Process not found
-///   - EINVAL (22): Empty mask (no CPUs allowed)
+/// # Errors
+/// ESRCH: process not found; EINVAL: empty mask (no CPUs allowed)
 ///
 /// # Locking
 /// See [`set_cpus_allowed_ptr`]: a task on a CPU it may no longer use
 /// is moved before this returns.
-pub fn set_task_cpus_allowed(pid: Pid, mask: crate::util::cpumask::CpuSet) -> Result<(), i32> {
-    let task = TASKLIST
-        .read()
-        .task(pid)
-        .ok_or(KernelError::NoProcess.errno())?;
+pub fn set_task_cpus_allowed(pid: Pid, mask: crate::util::cpumask::CpuSet) -> KernelResult<()> {
+    let task = TASKLIST.read().task(pid).ok_or(KernelError::NoProcess)?;
     // Bound kernel threads (Linux sched_setaffinity: EINVAL)
     if task.has_flag(crate::task::pf::NO_SETAFFINITY) {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
     set_cpus_allowed_ptr(&task, &mask)
 }
@@ -4763,13 +4751,9 @@ pub fn task_count() -> usize {
 /// Set a task's nice value by PID (Linux set_user_nice: static_prio,
 /// whatever its policy; it counts for the fair class)
 ///
-/// Error codes:
-/// - ESRCH (3): Process not found
-pub fn set_task_nice(pid: Pid, nice: i32) -> Result<(), i32> {
-    let task = TASKLIST
-        .read()
-        .task(pid)
-        .ok_or(KernelError::NoProcess.errno())?;
+/// ESRCH if the process is not found
+pub fn set_task_nice(pid: Pid, nice: i32) -> KernelResult<()> {
+    let task = TASKLIST.read().task(pid).ok_or(KernelError::NoProcess)?;
     let static_prio = (i32::from(sched::DEFAULT_PRIO) + nice.clamp(-20, 19)) as u8;
     change_class(&task, |se| {
         se.set_params(se.class(), se.policy(), static_prio, se.rt_priority())

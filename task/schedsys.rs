@@ -10,9 +10,11 @@
 //! - getcpu
 
 use super::percpu::current_tid;
-use crate::util::error::KernelError;
+use crate::uaccess::UserPtr;
+use crate::util::error::{KernelError, KernelResult};
 
-use super::Pid;
+use super::{Pid, SchedParam};
+use crate::time::time_syscall::LinuxTimespec;
 
 /// sys_getcpu - get CPU and NUMA node for calling thread
 ///
@@ -23,38 +25,29 @@ use super::Pid;
 /// * `cpup` - Optional user pointer to store CPU number (can be 0/NULL)
 /// * `nodep` - Optional user pointer to store NUMA node (can be 0/NULL)
 ///
-/// Returns 0 on success, -EFAULT if copy to user space fails.
+/// EFAULT if a copy to user space fails.
 ///
 /// # Locking
 /// None required - reads per-CPU data which is stable during syscall execution.
 /// This matches Linux's implementation which uses raw_smp_processor_id().
-pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(cpu: u32, cpup: u64, nodep: u64) -> i64 {
+pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(
+    cpu: u32,
+    cpup: UserPtr<u32>,
+    nodep: UserPtr<u32>,
+) -> KernelResult<()> {
     use crate::mm::numa::NUMA_TOPOLOGY;
     use crate::uaccess::put_user;
 
     // Write CPU number if pointer provided
-    if cpup != 0 {
-        if !A::access_ok(cpup, core::mem::size_of::<u32>()) {
-            return KernelError::BadAddress.sysret();
-        }
-        if put_user::<A, u32>(cpup, cpu).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+    if !cpup.is_null() {
+        put_user::<A, u32>(cpup.addr(), cpu)?;
     }
-
-    // Write NUMA node if pointer provided
-    if nodep != 0 {
-        if !A::access_ok(nodep, core::mem::size_of::<u32>()) {
-            return KernelError::BadAddress.sysret();
-        }
-        // Look up NUMA node for this CPU from the topology
+    // Write NUMA node if pointer provided, from the topology
+    if !nodep.is_null() {
         let node = NUMA_TOPOLOGY.lock().cpu_to_node(cpu);
-        if put_user::<A, u32>(nodep, node).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        put_user::<A, u32>(nodep.addr(), node)?;
     }
-
-    0
+    Ok(())
 }
 
 /// sys_getpriority - get program scheduling priority
@@ -69,47 +62,34 @@ pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(cpu: u32, cpup: u64, nodep: u6
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read priority.
-pub fn sys_getpriority(which: i32, who: i32) -> i64 {
+pub fn sys_getpriority(which: i32, who: i32) -> KernelResult<i64> {
     use super::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
 
     // `who` is an int (id_t of a pid or pgid): a negative one names none
     if which != PRIO_USER && who < 0 {
-        return KernelError::NoProcess.sysret();
+        return Err(KernelError::NoProcess);
     }
     let who = u64::from(who as u32);
-    match which {
+    // 20 - nice (range 1-40) to avoid negative return values; of a
+    // group, the highest (Linux: the largest 20 - nice)
+    let tids = match which {
+        // 0 is the calling thread (Linux: current)
         PRIO_PROCESS => {
-            // 0 is the calling thread (Linux: current)
-            let Some(target_pid) = super::pid::from_vnr_or(who, current_tid()) else {
-                return KernelError::NoProcess.sysret();
-            };
-            match super::percpu::lookup_task_nice(target_pid) {
-                // 20 - nice (range 1-40) to avoid negative return values
-                Some(nice) => i64::from(20 - nice),
-                None => KernelError::NoProcess.sysret(),
-            }
+            alloc::vec![super::pid::from_vnr_or(who, current_tid()).ok_or(KernelError::NoProcess)?]
         }
         PRIO_PGRP => {
-            // The highest priority of any thread in the group (Linux:
-            // the largest 20 - nice)
-            let Some(pgid) = super::pid::from_vnr_or(who, super::percpu::current_pgid()) else {
-                return KernelError::NoProcess.sysret();
-            };
+            let pgid = super::pid::from_vnr_or(who, super::percpu::current_pgid())
+                .ok_or(KernelError::NoProcess)?;
             super::percpu::get_tids_by_pgid(pgid)
-                .into_iter()
-                .filter_map(super::percpu::lookup_task_nice)
-                .map(|n| i64::from(20 - n))
-                .max()
-                .unwrap_or(KernelError::NoProcess.sysret())
         }
-        PRIO_USER => tids_of_user(who)
-            .into_iter()
-            .filter_map(super::percpu::lookup_task_nice)
-            .map(|n| i64::from(20 - n))
-            .max()
-            .unwrap_or(KernelError::NoProcess.sysret()),
-        _ => KernelError::InvalidArgument.sysret(),
-    }
+        PRIO_USER => tids_of_user(who),
+        _ => return Err(KernelError::InvalidArgument),
+    };
+    tids.into_iter()
+        .filter_map(super::percpu::lookup_task_nice)
+        .map(|n| i64::from(20 - n))
+        .max()
+        .ok_or(KernelError::NoProcess)
 }
 
 /// The threads whose real uid is `who` (0: the caller's), for PRIO_USER
@@ -131,8 +111,13 @@ fn tids_of_user(who: u64) -> alloc::vec::Vec<Pid> {
 /// Set task `tid`'s nice value (Linux set_one_prio): EPERM unless the
 /// caller's euid is its uid or euid or the caller has CAP_SYS_NICE;
 /// EACCES for a lower nice beyond RLIMIT_NICE without CAP_SYS_NICE.
-/// `error` is the result so far: a success turns ESRCH into 0.
-fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> i64 {
+/// `error` is the result so far: a success turns ESRCH into Ok.
+fn set_one_prio(
+    tid: Pid,
+    niceval: i32,
+    caller_euid: super::Uid,
+    error: KernelResult<()>,
+) -> KernelResult<()> {
     use super::{CAP_SYS_NICE, capable};
     let Some(cur_nice) = super::percpu::lookup_task_nice(tid) else {
         return error;
@@ -142,19 +127,19 @@ fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> 
         return error;
     };
     if c.uid != caller_euid && c.euid != caller_euid && !capable(CAP_SYS_NICE) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     // Linux can_nice: 20 - nice within the target's RLIMIT_NICE
     let rlim = crate::task::rlimit::get_task_rlimit(tid, crate::task::rlimit::RLIMIT_NICE)
         .map_or(crate::task::rlimit::RLIM_INFINITY, |r| r.rlim_cur);
     let lower = niceval < cur_nice;
     if lower && (20 - niceval) as u64 > rlim && !capable(CAP_SYS_NICE) {
-        return KernelError::PermissionDenied.sysret();
+        return Err(KernelError::PermissionDenied);
     }
-    match super::percpu::set_task_nice(tid, niceval) {
-        Ok(()) if error == KernelError::NoProcess.sysret() => 0,
-        Ok(()) => error,
-        Err(errno) => -i64::from(errno),
+    super::percpu::set_task_nice(tid, niceval)?;
+    match error {
+        Err(KernelError::NoProcess) => Ok(()),
+        e => e,
     }
 }
 
@@ -175,50 +160,36 @@ fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> 
 /// # Permission Model
 /// - Root (euid=0): Can set any priority for any process
 /// - Non-root: Can only lower priority (increase nice value), not raise it
-pub fn sys_setpriority(which: i32, who: i32, niceval: i32) -> i64 {
+pub fn sys_setpriority(which: i32, who: i32, niceval: i32) -> KernelResult<()> {
     use super::{PRIO_MAX, PRIO_MIN, PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
 
     // Clamp nice value to valid range (Linux does this)
     let niceval = niceval.clamp(PRIO_MIN, PRIO_MAX);
     if which != PRIO_USER && who < 0 {
-        return KernelError::NoProcess.sysret();
+        return Err(KernelError::NoProcess);
     }
     let who = u64::from(who as u32);
     let caller_euid = super::percpu::current_cred().euid;
 
-    match which {
+    // Every thread named (Linux set_one_prio each): the first success
+    // clears ESRCH, an error stays
+    let tids = match which {
         PRIO_PROCESS => {
-            let Some(target_pid) = super::pid::from_vnr_or(who, current_tid()) else {
-                return KernelError::NoProcess.sysret();
-            };
-            set_one_prio(
-                target_pid,
-                niceval,
-                caller_euid,
-                KernelError::NoProcess.sysret(),
-            )
+            alloc::vec![super::pid::from_vnr_or(who, current_tid()).ok_or(KernelError::NoProcess)?]
         }
         PRIO_PGRP => {
-            // Every thread of the group (Linux set_one_prio each): the
-            // first success clears ESRCH, an error stays
-            let Some(pgid) = super::pid::from_vnr_or(who, super::percpu::current_pgid()) else {
-                return KernelError::NoProcess.sysret();
-            };
-            let mut ret = KernelError::NoProcess.sysret();
-            for tid in super::percpu::get_tids_by_pgid(pgid) {
-                ret = set_one_prio(tid, niceval, caller_euid, ret);
-            }
-            ret
+            let pgid = super::pid::from_vnr_or(who, super::percpu::current_pgid())
+                .ok_or(KernelError::NoProcess)?;
+            super::percpu::get_tids_by_pgid(pgid)
         }
-        PRIO_USER => {
-            let mut ret = KernelError::NoProcess.sysret();
-            for tid in tids_of_user(who) {
-                ret = set_one_prio(tid, niceval, caller_euid, ret);
-            }
-            ret
-        }
-        _ => KernelError::InvalidArgument.sysret(),
+        PRIO_USER => tids_of_user(who),
+        _ => return Err(KernelError::InvalidArgument),
+    };
+    let mut ret = Err(KernelError::NoProcess);
+    for tid in tids {
+        ret = set_one_prio(tid, niceval, caller_euid, ret);
     }
+    ret
 }
 
 /// sys_sched_getscheduler - get scheduling policy
@@ -235,20 +206,17 @@ pub fn sys_setpriority(which: i32, who: i32, niceval: i32) -> i64 {
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read policy.
-pub fn sys_sched_getscheduler(pid: i64) -> i64 {
+pub fn sys_sched_getscheduler(pid: i64) -> KernelResult<i64> {
     // pid < 0 is invalid
     if pid < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let target_pid =
+        super::pid::from_vnr_or(pid as u64, current_tid()).ok_or(KernelError::NoProcess)?;
 
-    match super::percpu::lookup_task_policy(target_pid) {
-        Some(policy) => i64::from(policy),
-        None => KernelError::NoProcess.sysret(),
-    }
+    let policy = super::percpu::lookup_task_policy(target_pid).ok_or(KernelError::NoProcess)?;
+    Ok(i64::from(policy))
 }
 
 /// sys_sched_setscheduler - set scheduling policy and parameters
@@ -274,48 +242,33 @@ pub fn sys_sched_getscheduler(pid: i64) -> i64 {
 pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
     pid: i64,
     policy: i32,
-    param_ptr: u64,
-) -> i64 {
-    use super::SchedParam;
+    param_ptr: UserPtr<SchedParam>,
+) -> KernelResult<()> {
     use crate::uaccess::get_user;
 
     // pid < 0 is invalid
     if pid < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Validate param_ptr
-    if param_ptr == 0 {
-        return KernelError::InvalidArgument.sysret();
+    // Validate param_ptr, read sched_param from user space
+    if param_ptr.is_null() {
+        return Err(KernelError::InvalidArgument);
     }
-    if !A::access_ok(param_ptr, core::mem::size_of::<SchedParam>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Read sched_param from user space
-    let param: SchedParam = match get_user::<A, SchedParam>(param_ptr) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
+    let param: SchedParam = get_user::<A, SchedParam>(param_ptr.addr())?;
 
     // Validate policy
     if !super::is_valid_policy(policy) {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let target_pid =
+        super::pid::from_vnr_or(pid as u64, current_tid()).ok_or(KernelError::NoProcess)?;
     let euid = super::percpu::current_cred().euid;
-    if let Err(e) = check_setscheduler(target_pid, policy, param.sched_priority, euid) {
-        return e.sysret();
-    }
+    check_setscheduler(target_pid, policy, param.sched_priority, euid)?;
 
     // Set the scheduler
-    match super::percpu::set_task_scheduler(target_pid, policy, param.sched_priority) {
-        Ok(()) => 0,
-        Err(errno) => -i64::from(errno),
-    }
+    super::percpu::set_task_scheduler(target_pid, policy, param.sched_priority)
 }
 
 /// May the caller give task `tid` `policy` at rt priority `prio` (Linux
@@ -394,42 +347,38 @@ fn check_setscheduler(
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read parameters.
-pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u64) -> i64 {
-    use super::SchedParam;
+pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
+    pid: i64,
+    param_ptr: UserPtr<SchedParam>,
+) -> KernelResult<()> {
     use crate::uaccess::put_user;
 
     // pid < 0 is invalid
     if pid < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Validate param_ptr
-    if param_ptr == 0 {
-        return KernelError::InvalidArgument.sysret();
+    // Validate param_ptr (EFAULT before ESRCH)
+    if param_ptr.is_null() {
+        return Err(KernelError::InvalidArgument);
     }
-    if !A::access_ok(param_ptr, core::mem::size_of::<SchedParam>()) {
-        return KernelError::BadAddress.sysret();
+    if !A::access_ok(param_ptr.addr(), core::mem::size_of::<SchedParam>()) {
+        return Err(KernelError::BadAddress);
     }
 
-    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let target_pid =
+        super::pid::from_vnr_or(pid as u64, current_tid()).ok_or(KernelError::NoProcess)?;
 
     // Get the RT priority (0 for non-RT tasks)
-    let Some(rt_prio) = super::percpu::lookup_task_rt_priority(target_pid) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let rt_prio =
+        super::percpu::lookup_task_rt_priority(target_pid).ok_or(KernelError::NoProcess)?;
 
     let param = SchedParam {
         sched_priority: rt_prio,
     };
 
-    // Copy to user space
-    if put_user::<A, SchedParam>(param_ptr, param).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    put_user::<A, SchedParam>(param_ptr.addr(), param)?;
+    Ok(())
 }
 
 /// sys_sched_setparam - set scheduling parameters
@@ -452,52 +401,39 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u
 ///
 /// # Locking
 /// Acquires TASKLIST lock to modify parameters.
-pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u64) -> i64 {
-    use super::SchedParam;
+pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
+    pid: i64,
+    param_ptr: UserPtr<SchedParam>,
+) -> KernelResult<()> {
     use crate::uaccess::get_user;
 
     // pid < 0 is invalid
     if pid < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Validate param_ptr
-    if param_ptr == 0 {
-        return KernelError::InvalidArgument.sysret();
+    // Validate param_ptr, read sched_param from user space
+    if param_ptr.is_null() {
+        return Err(KernelError::InvalidArgument);
     }
-    if !A::access_ok(param_ptr, core::mem::size_of::<SchedParam>()) {
-        return KernelError::BadAddress.sysret();
-    }
+    let param: SchedParam = get_user::<A, SchedParam>(param_ptr.addr())?;
 
-    // Read sched_param from user space
-    let param: SchedParam = match get_user::<A, SchedParam>(param_ptr) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let target_pid =
+        super::pid::from_vnr_or(pid as u64, current_tid()).ok_or(KernelError::NoProcess)?;
 
     // Get current policy to preserve it
-    let Some(current_policy) = super::percpu::lookup_task_policy(target_pid) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let current_policy =
+        super::percpu::lookup_task_policy(target_pid).ok_or(KernelError::NoProcess)?;
 
-    if let Err(e) = check_setscheduler(
+    check_setscheduler(
         target_pid,
         current_policy,
         param.sched_priority,
         super::percpu::current_cred().euid,
-    ) {
-        return e.sysret();
-    }
+    )?;
 
     // Set the scheduler with current policy
-    match super::percpu::set_task_scheduler(target_pid, current_policy, param.sched_priority) {
-        Ok(()) => 0,
-        Err(errno) => -i64::from(errno),
-    }
+    super::percpu::set_task_scheduler(target_pid, current_policy, param.sched_priority)
 }
 
 /// sys_sched_getaffinity - get CPU affinity mask
@@ -519,31 +455,29 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u
 pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
     pid: i64,
     cpusetsize: u64,
-    mask_ptr: u64,
-) -> i64 {
+    mask_ptr: UserPtr<u8>,
+) -> KernelResult<i64> {
     use crate::uaccess::copy_to_user;
 
     // pid < 0 is invalid
     if pid < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Room for nr_cpu_ids bits, in whole longs (Linux)
     if cpusetsize.saturating_mul(8) < u64::from(crate::cpu::nr_cpu_ids())
         || !cpusetsize.is_multiple_of(8)
     {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let target_pid =
+        super::pid::from_vnr_or(pid as u64, current_tid()).ok_or(KernelError::NoProcess)?;
 
     // The allowed CPUs that are up (Linux: & cpu_active_mask)
-    let mask = match super::percpu::lookup_task_cpus_allowed(target_pid) {
-        Some(m) => m.and(&crate::smp::active_cpus()),
-        None => return KernelError::NoProcess.sysret(),
-    };
+    let mask = super::percpu::lookup_task_cpus_allowed(target_pid)
+        .ok_or(KernelError::NoProcess)?
+        .and(&crate::smp::active_cpus());
 
     // min(len, cpumask_size()) bytes
     let len = (cpusetsize as usize).min(cpumask_size());
@@ -551,10 +485,8 @@ pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
     for w in mask.words() {
         bytes.extend_from_slice(&w.to_ne_bytes());
     }
-    if copy_to_user::<A>(mask_ptr, &bytes[..len]).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-    len as i64
+    copy_to_user::<A>(mask_ptr.addr(), &bytes[..len])?;
+    Ok(len as i64)
 }
 
 /// Bytes of a kernel cpumask: nr_cpu_ids bits in whole longs (Linux
@@ -586,22 +518,20 @@ fn cpumask_size() -> usize {
 pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
     pid: i64,
     cpusetsize: u64,
-    mask_ptr: u64,
-) -> i64 {
+    mask_ptr: UserPtr<u8>,
+) -> KernelResult<()> {
     use crate::uaccess::copy_from_user;
 
     // pid < 0 is invalid
     if pid < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Up to cpumask_size() bytes; a shorter mask is zero-extended
     // (Linux get_user_cpu_mask)
     let len = (cpusetsize as usize).min(cpumask_size());
     let mut bytes = alloc::vec![0u8; cpumask_size()];
-    if copy_from_user::<A>(&mut bytes[..len], mask_ptr, len).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
+    copy_from_user::<A>(&mut bytes[..len], mask_ptr.addr(), len)?;
     let words: alloc::vec::Vec<u64> = bytes
         .as_chunks::<8>()
         .0
@@ -610,9 +540,8 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
         .collect();
     let mask = crate::util::cpumask::CpuSet::from_words(&words);
 
-    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let target_pid =
+        super::pid::from_vnr_or(pid as u64, current_tid()).ok_or(KernelError::NoProcess)?;
 
     // Linux sched_setaffinity: the caller's own tasks (check_same_owner:
     // its euid is their uid or euid) or CAP_SYS_NICE
@@ -622,19 +551,12 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
         .get(target_pid)
         .map(|t| t.cred())
         .map(|c| c.uid == euid || c.euid == euid);
-    match owner {
-        None => return KernelError::NoProcess.sysret(),
-        Some(false) if !super::capable(super::CAP_SYS_NICE) => {
-            return KernelError::NotPermitted.sysret();
-        }
-        _ => {}
+    if !owner.ok_or(KernelError::NoProcess)? && !super::capable(super::CAP_SYS_NICE) {
+        return Err(KernelError::NotPermitted);
     }
 
     // Set the CPU affinity mask
-    match super::percpu::set_task_cpus_allowed(target_pid, mask) {
-        Ok(()) => 0,
-        Err(errno) => -i64::from(errno),
-    }
+    super::percpu::set_task_cpus_allowed(target_pid, mask)
 }
 
 /// sys_sched_rr_get_interval - get round-robin time quantum
@@ -654,39 +576,30 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read policy.
-pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(pid: i64, tp_ptr: u64) -> i64 {
+pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
+    pid: i64,
+    tp_ptr: UserPtr<LinuxTimespec>,
+) -> KernelResult<()> {
     use crate::uaccess::put_user;
-
-    // Timespec structure for return value
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Timespec {
-        tv_sec: i64,
-        tv_nsec: i64,
-    }
-    crate::pod!(Timespec { tv_sec, tv_nsec });
 
     // pid < 0 is invalid
     if pid < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Validate tp_ptr
-    if tp_ptr == 0 {
-        return KernelError::InvalidArgument.sysret();
+    // Validate tp_ptr (EFAULT before ESRCH)
+    if tp_ptr.is_null() {
+        return Err(KernelError::InvalidArgument);
     }
-    if !A::access_ok(tp_ptr, core::mem::size_of::<Timespec>()) {
-        return KernelError::BadAddress.sysret();
+    if !A::access_ok(tp_ptr.addr(), core::mem::size_of::<LinuxTimespec>()) {
+        return Err(KernelError::BadAddress);
     }
 
-    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let target_pid =
+        super::pid::from_vnr_or(pid as u64, current_tid()).ok_or(KernelError::NoProcess)?;
 
     // Get the scheduling policy
-    let Some(policy) = super::percpu::lookup_task_policy(target_pid) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let policy = super::percpu::lookup_task_policy(target_pid).ok_or(KernelError::NoProcess)?;
 
     // Only SCHED_RR has a meaningful time quantum
     let base_policy = policy & !super::SCHED_RESET_ON_FORK;
@@ -696,18 +609,10 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(pid: i64, tp_pt
         0
     };
 
-    // Convert nanoseconds to timespec
-    let ts = Timespec {
-        tv_sec: (time_slice_ns / 1_000_000_000) as i64,
-        tv_nsec: (time_slice_ns % 1_000_000_000) as i64,
-    };
+    let ts = LinuxTimespec::from_ns(time_slice_ns);
 
-    // Copy to user space
-    if put_user::<A, Timespec>(tp_ptr, ts).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    put_user::<A, LinuxTimespec>(tp_ptr.addr(), ts)?;
+    Ok(())
 }
 
 // =============================================================================
@@ -726,7 +631,7 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(pid: i64, tp_pt
 /// * -EINVAL for invalid arguments
 /// * -ESRCH if target not found
 /// * -EPERM if not permitted
-pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
+pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
     use super::{
         IOPRIO_CLASS_RT, IOPRIO_WHO_PGRP, IOPRIO_WHO_PROCESS, IOPRIO_WHO_USER, ioprio_prio_class,
         ioprio_valid,
@@ -736,7 +641,7 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
 
     // Validate ioprio
     if !ioprio_valid(ioprio) {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     let class = ioprio_prio_class(ioprio);
@@ -747,61 +652,51 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
         && !super::capable(super::CAP_SYS_NICE)
         && !super::capable(super::CAP_SYS_ADMIN)
     {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     match which {
         IOPRIO_WHO_PROCESS => {
-            let Some(tid) = super::pid::from_vnr_or(who as u64, current_tid()) else {
-                return KernelError::NoProcess.sysret();
-            };
+            let tid =
+                super::pid::from_vnr_or(who as u64, current_tid()).ok_or(KernelError::NoProcess)?;
 
             if !super::percpu::task_exists(tid) {
-                return KernelError::NoProcess.sysret();
+                return Err(KernelError::NoProcess);
             }
             if !ioprio_owner_ok(tid) {
-                return KernelError::NotPermitted.sysret();
+                return Err(KernelError::NotPermitted);
             }
             // Get or create IoContext for the target
-            let ctx = match super::task_io_context(tid) {
-                Ok(Some(c)) => c,
-                Ok(None) => return KernelError::NoProcess.sysret(),
-                Err(e) => return e.sysret(),
-            };
-
+            let ctx = super::task_io_context(tid)?.ok_or(KernelError::NoProcess)?;
             ctx.set_ioprio(ioprio);
-            0
+            Ok(())
         }
         IOPRIO_WHO_PGRP => {
             // Set ioprio for all processes in a process group
-            let Some(pgid) = super::pid::from_vnr_or(who as u64, super::percpu::current_pgid())
-            else {
-                return KernelError::NoProcess.sysret();
-            };
+            let pgid = super::pid::from_vnr_or(who as u64, super::percpu::current_pgid())
+                .ok_or(KernelError::NoProcess)?;
 
             let tids = super::percpu::get_tids_by_pgid(pgid);
             if tids.is_empty() {
-                return KernelError::NoProcess.sysret();
+                return Err(KernelError::NoProcess);
             }
 
             for tid in tids {
                 if !ioprio_owner_ok(tid) {
-                    return KernelError::NotPermitted.sysret();
+                    return Err(KernelError::NotPermitted);
                 }
-                match super::task_io_context(tid) {
-                    Ok(Some(ctx)) => ctx.set_ioprio(ioprio),
-                    Ok(None) => {}
-                    Err(e) => return e.sysret(),
+                if let Some(ctx) = super::task_io_context(tid)? {
+                    ctx.set_ioprio(ioprio);
                 }
             }
-            0
+            Ok(())
         }
         IOPRIO_WHO_USER => {
             // Set ioprio for all processes of a user - not fully implemented
             // Just return success for simplicity
-            0
+            Ok(())
         }
-        _ => KernelError::InvalidArgument.sysret(),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
 
@@ -827,36 +722,31 @@ fn ioprio_owner_ok(tid: Pid) -> bool {
 /// * I/O priority value on success (class << 13 | level)
 /// * -EINVAL for invalid arguments
 /// * -ESRCH if target not found
-pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
+pub fn sys_ioprio_get(which: i32, who: i32) -> KernelResult<i64> {
     use super::{
         IOPRIO_DEFAULT, IOPRIO_WHO_PGRP, IOPRIO_WHO_PROCESS, IOPRIO_WHO_USER, get_task_io_context,
     };
 
     match which {
         IOPRIO_WHO_PROCESS => {
-            let Some(tid) = super::pid::from_vnr_or(who as u64, current_tid()) else {
-                return KernelError::NoProcess.sysret();
-            };
+            let tid =
+                super::pid::from_vnr_or(who as u64, current_tid()).ok_or(KernelError::NoProcess)?;
 
             // Check if task exists
             if !super::percpu::task_exists(tid) {
-                return KernelError::NoProcess.sysret();
+                return Err(KernelError::NoProcess);
             }
 
-            match get_task_io_context(tid) {
-                Some(ctx) => i64::from(ctx.get_ioprio()),
-                None => i64::from(IOPRIO_DEFAULT),
-            }
+            let ioprio = get_task_io_context(tid).map_or(IOPRIO_DEFAULT, |c| c.get_ioprio());
+            Ok(i64::from(ioprio))
         }
         IOPRIO_WHO_PGRP => {
-            let Some(pgid) = super::pid::from_vnr_or(who as u64, super::percpu::current_pgid())
-            else {
-                return KernelError::NoProcess.sysret();
-            };
+            let pgid = super::pid::from_vnr_or(who as u64, super::percpu::current_pgid())
+                .ok_or(KernelError::NoProcess)?;
 
             let tids = super::percpu::get_tids_by_pgid(pgid);
             if tids.is_empty() {
-                return KernelError::NoProcess.sysret();
+                return Err(KernelError::NoProcess);
             }
 
             // Return the highest priority (lowest class value, then highest level)
@@ -870,13 +760,13 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
                     }
                 }
             }
-            i64::from(best_ioprio)
+            Ok(i64::from(best_ioprio))
         }
         IOPRIO_WHO_USER => {
             // Get highest ioprio for all processes of a user - not fully implemented
             // Return default for simplicity
-            i64::from(IOPRIO_DEFAULT)
+            Ok(i64::from(IOPRIO_DEFAULT))
         }
-        _ => KernelError::InvalidArgument.sysret(),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
