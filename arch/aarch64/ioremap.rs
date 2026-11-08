@@ -217,13 +217,15 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
 
     // The device window already maps physical 0-1GB
     if phys_addr + size <= IO_SIZE {
-        return Ok(io_va(phys_addr) as *mut u8);
+        return Ok(core::ptr::with_exposed_provenance_mut(
+            io_va(phys_addr) as usize
+        ));
     }
 
     // For other addresses, allocate from ioremap region and map
     let offset = phys_addr & (PAGE_SIZE - 1);
     let aligned_phys = phys_addr & !(PAGE_SIZE - 1);
-    let aligned_size = (size + offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let aligned_size = (size + offset).next_multiple_of(PAGE_SIZE);
     let num_pages = (aligned_size / PAGE_SIZE) as usize;
 
     // Allocate virtual address range
@@ -255,7 +257,9 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
     // used before is already gone: iounmap flushed it)
     flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
 
-    Ok((virt_base + offset) as *mut u8)
+    Ok(core::ptr::with_exposed_provenance_mut(
+        (virt_base + offset) as usize,
+    ))
 }
 
 /// Point the ioremap page at `va` to `pa` instead (TLB self-test):
@@ -300,7 +304,7 @@ pub unsafe fn iounmap(virt_addr: *mut u8, size: u64) {
 
     let offset = virt & (PAGE_SIZE - 1);
     let aligned_virt = virt & !(PAGE_SIZE - 1);
-    let aligned_size = (size + offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let aligned_size = (size + offset).next_multiple_of(PAGE_SIZE);
     let num_pages = (aligned_size / PAGE_SIZE) as usize;
 
     // Unmap pages, then flush every CPU before the range can be reused

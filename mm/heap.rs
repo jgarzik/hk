@@ -106,6 +106,8 @@ impl HeapAllocator {
 const GRAIN: usize = 16;
 const HDR: usize = core::mem::size_of::<Block>();
 
+/// `n` rounded up to `a`, a power of two (a mask, not `next_multiple_of`:
+/// `a` is a run-time alignment on the allocation path)
 const fn round_up(n: usize, a: usize) -> usize {
     (n + a - 1) & !(a - 1)
 }

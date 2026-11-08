@@ -108,7 +108,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     }
 
     // Round up length to page boundary
-    let length = (length + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let length = page_align(length);
 
     // Validate offset alignment
     if offset & (PAGE_SIZE - 1) != 0 {
@@ -1325,8 +1325,8 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     if new_len == 0 || new_len > super::TASK_SIZE || old_len > super::TASK_SIZE {
         return KernelError::InvalidArgument.sysret();
     }
-    let old_len = (old_len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let new_len_aligned = (new_len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let old_len = page_align(old_len);
+    let new_len_aligned = page_align(new_len);
 
     // old_len == 0 is special: creates new mapping at old_addr (deprecated, return KernelError::InvalidArgument.sysret())
     if old_len == 0 {

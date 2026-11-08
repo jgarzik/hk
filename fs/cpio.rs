@@ -81,7 +81,7 @@ fn parse(data: &[u8], off: usize) -> Result<Entry<'_>, CpioError> {
         .get(name_start..name_start + namesize - 1)
         .ok_or(CpioError::BufferTooSmall)?;
     let name = name_bytes;
-    let body_start = align_up(name_start + namesize, 4);
+    let body_start = (name_start + namesize).next_multiple_of(4);
     let body = data
         .get(body_start..body_start + filesize)
         .ok_or(CpioError::BufferTooSmall)?;
@@ -96,7 +96,7 @@ fn parse(data: &[u8], off: usize) -> Result<Entry<'_>, CpioError> {
         rdev: (f(9)?, f(10)?),
         name,
         body,
-        next: align_up(body_start + filesize, 4),
+        next: (body_start + filesize).next_multiple_of(4),
     })
 }
 
@@ -249,11 +249,6 @@ fn clean_path(parent: &Arc<Dentry>, dir: &Inode, name: &[u8], ty: u32) -> Option
 fn parse_hex(data: &[u8]) -> Result<u32, CpioError> {
     let s = core::str::from_utf8(data).map_err(|_| CpioError::InvalidHeader)?;
     u32::from_str_radix(s, 16).map_err(|_| CpioError::InvalidHeader)
-}
-
-/// Align a value up to the given alignment
-fn align_up(value: usize, align: usize) -> usize {
-    (value + align - 1) & !(align - 1)
 }
 
 #[cfg(test)]

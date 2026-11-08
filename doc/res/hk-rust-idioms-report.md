@@ -15,8 +15,8 @@ belongs to doc/ROADMAP.md phase M1, the rest to S1.
 | 4 | Delete the dead code behind `expect(dead_code)` | about -100 | ~0 | high |
 | 5 | Struct update `..Default::default()` / `..zeroed()` | -300 (kernel) / -120 (user) | low | med |
 | 7 | One `util/bytes` LE/BE reader on `first_chunk` | -40 | low | low |
-| 8 | `next_power_of_two` / `next_multiple_of` for hand-rolled ones | -25 | low (overflow) | low |
-| 9 | Last pointer-API gaps (`addr_of!`, `phys_to_virt` provenance, xhci MMIO) | 0 | 0 | low |
+| 8 | `is_multiple_of` for `% a == 0` | 0 | 0 | low |
+| 9 | xhci MMIO through `IoMem` | 0 | 0 | low |
 
 Order: 4 is mechanical, one commit. 2 goes per subsystem (M1) and also
 removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
@@ -212,29 +212,18 @@ removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
   STYLE requires ("No panics on user input").
 - **Risk:** low. Callers that index trusted kernel buffers may keep the infallible form.
 
-## 8. Integer helpers: `next_power_of_two`, `next_multiple_of` (1.73), `is_multiple_of` (1.87)
+## 8. `is_multiple_of` (1.87)
 
-- io/io_uring.rs:1368 `round_up_pow2` (12 lines of bit-smearing) becomes
-  `n.max(1).next_power_of_two()`. Callers must bound `n`, since it panics in debug
-  above 2^31.
-- `align_up`/`round_up` (fs/cpio.rs:255, mm/heap.rs:103) and 14 open-coded
-  `(x + a - 1) & !(a - 1)` become `x.next_multiple_of(a)`. It is a `const fn`, so
-  `const` uses are fine. Use `checked_next_multiple_of` on user values.
-- **Keep** mm/syscall.rs:358 `page_align`: it wraps on purpose (Linux PAGE_ALIGN),
-  while `next_multiple_of` panics on overflow in debug builds.
-- With a variable `a`, `next_multiple_of` compiles to a division. Keep the mask form
-  on hot paths with a runtime power-of-two.
-- `is_multiple_of`: 27 `% a == 0` / `& (a-1) == 0` sites. Readability only, 0 LOC.
+27 `% a == 0` / `& (a-1) == 0` sites. Readability only, 0 LOC. Hand-rolled
+round-ups are gone, except `mm/heap.rs round_up` (run-time power-of-two
+alignment on the allocation path: a mask, not a division), the wrapping
+`mm/syscall.rs page_align` (Linux PAGE_ALIGN) and `mm/huge_page.rs` (mask
+helpers next to their align-down twins).
 
-## 9. Pointer APIs: the last rule-7 gaps (0 LOC)
+## 9. xhci MMIO (rule 8)
 
-The pointer lints (`borrow_as_ptr`, `ptr_as_ptr`, `ref_as_ptr`,
-`ptr_cast_constness`) are on. Left:
-- One `addr_of!` at hw/usb/xhci.rs:610; rule 7 forbids it.
-- The `phys_to_virt` chokepoints (arch/x86_64/paging.rs, arch/aarch64/paging.rs)
-  do `(phys + PAGE_OFFSET) as *mut u8`; rule 7 says `with_exposed_provenance_mut`.
-- hw/usb/xhci.rs does MMIO through `(base + off) as *const u32` integers, not
-  `IoMem` (rule 8 / rule 2 wrapper).
+hw/usb/xhci.rs does MMIO through `(base + off) as *const u32` integers, not
+`IoMem` (rule 8 / rule 2 wrapper).
 
 ## Smaller, optional
 

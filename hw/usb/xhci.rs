@@ -608,7 +608,7 @@ impl EventRing {
         // flags, rmb, fields): read in one go, the parameter could predate
         // the controller's write of the control word that made it valid,
         // and a completion would not match its TRB
-        let control = unsafe { read_volatile(core::ptr::addr_of!((*trb_ptr).control)) };
+        let control = unsafe { read_volatile(&raw const (*trb_ptr).control) };
         if (control & 1 != 0) != self.cycle {
             return None;
         }

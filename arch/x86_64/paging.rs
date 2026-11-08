@@ -65,7 +65,7 @@ pub const KERNEL_PML4_START: usize = 256;
 /// Convert physical address to virtual address (direct map; Linux __va)
 #[inline]
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
-    (phys + PAGE_OFFSET) as *mut u8
+    core::ptr::with_exposed_provenance_mut((phys + PAGE_OFFSET) as usize)
 }
 
 /// Convert a direct-map or kernel-image address to physical (Linux __pa)
