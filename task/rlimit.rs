@@ -174,7 +174,9 @@ pub fn get_task_rlimit(tid: Tid, resource: u32) -> Option<RLimit> {
 /// replaced, read in the same hold as the store
 pub fn set_task_rlimit(tid: Tid, resource: u32, new: RLimit) -> Result<RLimit, i32> {
     let signal = get_task_signal_struct(tid).ok_or(KernelError::NoProcess.to_errno_neg())?;
-    let old = signal.set_rlimit(resource, new)?;
+    let old = signal
+        .set_rlimit(resource, new)
+        .map_err(KernelError::to_errno_neg)?;
     // A finite CPU limit is watched from now (Linux update_rlimit_cpu)
     if resource == RLIMIT_CPU {
         let pid = crate::task::percpu::TASKLIST

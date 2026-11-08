@@ -809,10 +809,12 @@ pub fn x86_64_syscall_dispatch(
             crate::fs::syscall::sys_select(args[0] as i32, args[1], args[2], args[3], args[4])
                 as u64
         }
-        SYS_SIGNALFD => {
-            crate::signal::syscall::sys_signalfd(args[0] as i32, args[1], args[2] as i32).ret()
-                as u64
-        }
+        SYS_SIGNALFD => crate::signal::syscall::sys_signalfd(
+            args[0] as i32,
+            crate::uaccess::UserPtr::new(args[1]),
+            args[2] as i32,
+        )
+        .ret() as u64,
         SYS_STAT => crate::fs::syscall::sys_stat(args[0], args[1]).ret() as u64,
         SYS_SYMLINK => crate::fs::syscall::sys_symlink(args[0], args[1]).ret() as u64,
         SYS_TIME => {

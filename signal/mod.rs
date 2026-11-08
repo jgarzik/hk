@@ -255,7 +255,7 @@ pub mod sa_flags {
 // Signal information (siginfo)
 // =============================================================================
 
-pub use siginfo::{SigFields, SigInfo, si_code};
+pub use siginfo::{SigFields, SigInfo, UserSigInfo, si_code};
 
 /// A thread's last fault's arch details, which every signal frame's
 /// sigcontext reports, not siginfo (Linux thread.trap_nr, error_code
@@ -482,12 +482,9 @@ impl SigHand {
     ///
     /// Returns the old action on success, or EINVAL if signal is invalid
     /// or cannot have its action changed (SIGKILL, SIGSTOP).
-    pub fn set_action(&self, sig: u32, action: SigAction) -> Result<SigAction, i32> {
-        if sig == 0 || sig > 64 {
-            return Err(KernelError::InvalidArgument.errno());
-        }
-        if sig == SIGKILL || sig == SIGSTOP {
-            return Err(KernelError::InvalidArgument.errno()); // can't change these
+    pub fn set_action(&self, sig: u32, action: SigAction) -> Result<SigAction, KernelError> {
+        if sig == 0 || sig > 64 || sig == SIGKILL || sig == SIGSTOP {
+            return Err(KernelError::InvalidArgument);
         }
 
         let mut actions = self.action.lock();
@@ -2601,15 +2598,15 @@ impl SignalStruct {
     /// racing change cannot slip a raise past the check (capable()
     /// takes no lock: a credential reference and a task flag). Returns
     /// the limit replaced.
-    pub fn set_rlimit(&self, resource: u32, new: RLimit) -> Result<RLimit, i32> {
+    pub fn set_rlimit(&self, resource: u32, new: RLimit) -> Result<RLimit, KernelError> {
         let r = resource as usize;
         if r >= RLIM_NLIMITS || new.rlim_cur > new.rlim_max {
-            return Err(KernelError::InvalidArgument.to_errno_neg());
+            return Err(KernelError::InvalidArgument);
         }
         let mut rlim = self.rlim.lock();
         let old = rlim[r];
         if new.rlim_max > old.rlim_max && !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
-            return Err(KernelError::NotPermitted.to_errno_neg());
+            return Err(KernelError::NotPermitted);
         }
         rlim[r] = new;
         Ok(old)

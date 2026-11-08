@@ -833,26 +833,44 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         }
         Sys::RequestKey => crate::keys::sys_request_key(a[0], a[1], a[2], a[3] as i32).ret() as u64,
         Sys::Rseq => KernelError::NotImplemented.sysret() as u64,
-        Sys::RtSigaction => {
-            crate::signal::syscall::sys_rt_sigaction(a[0] as u32, a[1], a[2], a[3]).ret() as u64
+        Sys::RtSigaction => crate::signal::syscall::sys_rt_sigaction(
+            a[0] as u32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+        )
+        .ret() as u64,
+        Sys::RtSigpending => {
+            crate::signal::syscall::sys_rt_sigpending(UserPtr::new(a[0]), a[1]).ret() as u64
         }
-        Sys::RtSigpending => crate::signal::syscall::sys_rt_sigpending(a[0], a[1]).ret() as u64,
-        Sys::RtSigprocmask => {
-            crate::signal::syscall::sys_rt_sigprocmask(a[0] as i32, a[1], a[2], a[3]).ret() as u64
+        Sys::RtSigprocmask => crate::signal::syscall::sys_rt_sigprocmask(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+        )
+        .ret() as u64,
+        Sys::RtSigqueueinfo => crate::signal::syscall::sys_rt_sigqueueinfo(
+            i64::from(a[0] as i32),
+            a[1] as u32,
+            UserPtr::new(a[2]),
+        )
+        .ret() as u64,
+        Sys::RtSigsuspend => {
+            crate::signal::syscall::sys_rt_sigsuspend(UserPtr::new(a[0]), a[1]).ret() as u64
         }
-        Sys::RtSigqueueinfo => {
-            crate::signal::syscall::sys_rt_sigqueueinfo(i64::from(a[0] as i32), a[1] as u32, a[2])
-                as u64
-        }
-        Sys::RtSigsuspend => crate::signal::syscall::sys_rt_sigsuspend(a[0], a[1]).ret() as u64,
-        Sys::RtSigtimedwait => {
-            crate::signal::syscall::sys_rt_sigtimedwait(a[0], a[1], a[2], a[3]).ret() as u64
-        }
+        Sys::RtSigtimedwait => crate::signal::syscall::sys_rt_sigtimedwait(
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+        )
+        .ret() as u64,
         Sys::RtTgsigqueueinfo => crate::signal::syscall::sys_rt_tgsigqueueinfo(
             i64::from(a[0] as i32),
             i64::from(a[1] as i32),
             a[2] as u32,
-            a[3],
+            UserPtr::new(a[3]),
         )
         .ret() as u64,
         Sys::SchedGetaffinity => crate::task::syscall::sys_sched_getaffinity::<Uaccess>(
@@ -1029,10 +1047,17 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Shmdt => crate::ipc::sys_shmdt(a[0]).ret() as u64,
         Sys::Shmget => crate::ipc::sys_shmget(a[0] as i32, a[1] as usize, a[2] as i32).ret() as u64,
         Sys::Shutdown => crate::net::syscall::sys_shutdown(a[0] as i32, a[1] as i32).ret() as u64,
-        Sys::Sigaltstack => crate::signal::syscall::sys_sigaltstack(a[0], a[1]).ret() as u64,
-        Sys::Signalfd4 => {
-            crate::signal::syscall::sys_signalfd4(a[0] as i32, a[1], a[2], a[3] as i32).ret() as u64
+        Sys::Sigaltstack => {
+            crate::signal::syscall::sys_sigaltstack(UserPtr::new(a[0]), UserPtr::new(a[1])).ret()
+                as u64
         }
+        Sys::Signalfd4 => crate::signal::syscall::sys_signalfd4(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2],
+            a[3] as i32,
+        )
+        .ret() as u64,
         Sys::Socket => {
             crate::net::syscall::sys_socket(a[0] as i32, a[1] as i32, a[2] as i32).ret() as u64
         }

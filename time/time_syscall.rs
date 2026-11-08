@@ -240,8 +240,9 @@ impl LinuxTimespec {
         }
     }
 
-    /// A sleep length in ns; EINVAL if negative or unnormalized
-    fn to_ns(self) -> KernelResult<u64> {
+    /// A sleep length or timeout in ns; EINVAL if negative or
+    /// unnormalized
+    pub fn to_ns(self) -> KernelResult<u64> {
         if self.tv_sec < 0 || !(0..1_000_000_000).contains(&self.tv_nsec) {
             return Err(KernelError::InvalidArgument);
         }
@@ -463,7 +464,7 @@ use crate::time::timerfd::{ITimerSpec, create_timerfd, get_timerfd, tfd_flags, t
 
 /// Install `file` at the caller's lowest free descriptor (Linux
 /// get_unused_fd_flags + fd_install): EMFILE past RLIMIT_NOFILE
-fn install_fd(file: alloc::sync::Arc<File>, cloexec: bool) -> KernelResult<i32> {
+pub(crate) fn install_fd(file: alloc::sync::Arc<File>, cloexec: bool) -> KernelResult<i32> {
     let flags = if cloexec { FD_CLOEXEC } else { 0 };
     let nofile = crate::fs::syscall::get_nofile_limit();
     crate::fs::syscall::current_fd_table()

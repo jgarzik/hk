@@ -1012,6 +1012,3 @@ sigsp switch to the alt stack, __save_altstack fills uc_stack.
 - **pid and user namespace nesting limits return EAGAIN** (ns/pid.rs,
   ns/user.rs clone_ns): Linux create_pid_namespace and create_user_ns
   return ENOSPC past MAX_*_NS_LEVEL.
-- **Fixed errnos in place of the callee's** in signalfd4
-  (`Err(_) => return <errno>`): the callee's KernelError is dropped,
-  so a new failure mode is silently remapped.
