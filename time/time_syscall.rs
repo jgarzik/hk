@@ -457,20 +457,13 @@ pub fn sys_settimeofday(tv: UserPtr<Timeval>, tz: UserPtr<Timezone>) -> KernelRe
 // Timerfd syscalls
 // =============================================================================
 
-use crate::fs::File;
 use crate::io::eventfd::{create_eventfd, efd_flags};
 use crate::io::pipe::FD_CLOEXEC;
 use crate::time::timerfd::{ITimerSpec, create_timerfd, get_timerfd, tfd_flags, tfd_timer_flags};
 
-/// Install `file` at the caller's lowest free descriptor (Linux
-/// get_unused_fd_flags + fd_install): EMFILE past RLIMIT_NOFILE
-pub(crate) fn install_fd(file: alloc::sync::Arc<File>, cloexec: bool) -> KernelResult<i32> {
-    let flags = if cloexec { FD_CLOEXEC } else { 0 };
-    let nofile = crate::fs::syscall::get_nofile_limit();
-    crate::fs::syscall::current_fd_table()
-        .lock()
-        .alloc_with_flags(file, flags, nofile)
-        .map_err(|e| KernelError::from_errno(e).unwrap_or(KernelError::ProcessFileLimit))
+/// fd flags for a new descriptor: close-on-exec if `on`
+pub(crate) fn cloexec(on: bool) -> u32 {
+    if on { FD_CLOEXEC } else { 0 }
 }
 
 /// timerfd_create(clockid, flags): the new descriptor
@@ -490,7 +483,7 @@ pub fn sys_timerfd_create(clockid: i32, flags: i32) -> KernelResult<i32> {
         return Err(KernelError::InvalidArgument);
     }
     let file = create_timerfd(clockid, flags)?;
-    install_fd(file, flags & tfd_flags::TFD_CLOEXEC != 0)
+    crate::fs::io::fd_install(file, cloexec(flags & tfd_flags::TFD_CLOEXEC != 0))
 }
 
 /// timerfd_settime(fd, flags, new_value, old_value)
@@ -539,7 +532,7 @@ pub fn sys_eventfd2(initval: u32, flags: i32) -> KernelResult<i32> {
         return Err(KernelError::InvalidArgument);
     }
     let file = create_eventfd(u64::from(initval), flags)?;
-    install_fd(file, flags & efd_flags::EFD_CLOEXEC != 0)
+    crate::fs::io::fd_install(file, cloexec(flags & efd_flags::EFD_CLOEXEC != 0))
 }
 
 /// eventfd(initval): eventfd2 without flags (x86-64 only)

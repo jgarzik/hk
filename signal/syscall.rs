@@ -653,7 +653,10 @@ pub fn sys_signalfd4(fd: i32, mask: UserPtr<u64>, sizemask: u64, flags: i32) -> 
     let mask = SigSet::from_bits(mask.read()?);
     if fd == -1 {
         let file = create_signalfd(mask, flags)?;
-        return crate::time::time_syscall::install_fd(file, flags & sfd_flags::SFD_CLOEXEC != 0);
+        return crate::fs::io::fd_install(
+            file,
+            crate::time::time_syscall::cloexec(flags & sfd_flags::SFD_CLOEXEC != 0),
+        );
     }
     let file = crate::fs::io::fget(fd)?;
     let signalfd = get_signalfd(&file).ok_or(KernelError::InvalidArgument)?; // not a signalfd
