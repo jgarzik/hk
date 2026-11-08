@@ -155,6 +155,9 @@ pub struct UserNamespace {
 
     /// Creator's GID in the parent namespace
     pub group: u32,
+
+    /// Its inode number (Linux ns.inum)
+    pub inum: super::inum::Inum,
 }
 
 impl UserNamespace {
@@ -168,6 +171,7 @@ impl UserNamespace {
             parent: None,
             owner: 0,
             group: 0,
+            inum: super::inum::Inum::fixed(super::inum::USER_INIT),
         })
     }
 
@@ -190,6 +194,7 @@ impl UserNamespace {
 
         // Get creator's credentials
         let cred = percpu::current_cred();
+        let inum = super::inum::Inum::alloc().map_err(|e| e.errno())?;
 
         try_arc(Self {
             uid_map: UidGidMap::new(),
@@ -198,6 +203,7 @@ impl UserNamespace {
             parent: Some(parent.clone()),
             owner: cred.uid,
             group: cred.gid,
+            inum,
         })
         .map_err(|e| e.errno())
     }

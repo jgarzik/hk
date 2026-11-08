@@ -29,7 +29,7 @@ use crate::net::netlink::NlTable;
 use crate::net::udp::UdpTable;
 use crate::util::error::KernelError;
 
-/// Next network namespace id (Linux ns_common.inum, never reused)
+/// Next network namespace id (never reused)
 static NEXT_NET_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Network namespace - isolates network stack per-namespace
@@ -50,6 +50,9 @@ static NEXT_NET_ID: AtomicU64 = AtomicU64::new(1);
 pub struct NetNamespace {
     /// Unique id: the sysfs namespace tag of its devices
     pub id: u64,
+
+    /// Its inode number (Linux ns.inum)
+    pub inum: super::inum::Inum,
 
     /// Network devices in this namespace (registration = ifindex order)
     devices: RwLock<Vec<Arc<NetDevice>>>,
@@ -111,21 +114,22 @@ impl NetNamespace {
     pub fn new() -> Result<Arc<Self>, KernelError> {
         // The device first: nothing to undo but itself
         let lo = try_arc(loopback_device(try_arc(LoopbackOps)?))?;
-        let ns = try_arc(Self::fresh())?;
+        let ns = try_arc(Self::fresh(super::inum::Inum::alloc()?))?;
         Ok(Self::attach(ns, lo))
     }
 
     /// The initial namespace (boot: failure cannot be reported)
     fn new_init() -> Arc<Self> {
-        let ns = arc_nofail(Self::fresh());
+        let ns = arc_nofail(Self::fresh(super::inum::Inum::fixed(super::inum::NET_INIT)));
         let lo = arc_nofail(loopback_device(arc_nofail(LoopbackOps)));
         Self::attach(ns, lo)
     }
 
     /// A namespace's state, before it is listed and has its loopback
-    fn fresh() -> Self {
+    fn fresh(inum: super::inum::Inum) -> Self {
         Self {
             id: NEXT_NET_ID.fetch_add(1, Ordering::Relaxed),
+            inum,
             devices: RwLock::new(Vec::new()),
             next_ifindex: AtomicU32::new(1),
             fib: Fib::new(),

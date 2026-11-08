@@ -23,17 +23,26 @@ impl Ida {
 
     /// The lowest free id (Linux ida_alloc); thread context
     pub fn alloc(&self) -> u32 {
+        // A device index: boot and probe time, a handful of ids
+        self.try_alloc().expect("ida: out of memory")
+    }
+
+    /// [`alloc`](Self::alloc), or ENOMEM if the bitmap cannot grow
+    pub fn try_alloc(&self) -> Result<u32, crate::util::error::KernelError> {
         loop {
             let mut w = self.0.lock();
             if let Some((i, word)) = w.iter_mut().enumerate().find(|(_, x)| **x != !0) {
                 let b = (!*word).trailing_zeros();
                 *word |= 1 << b;
-                return i as u32 * 64 + b;
+                return Ok(i as u32 * 64 + b);
             }
             let n = w.len();
             drop(w);
             // Full: a bigger bitmap, allocated with the lock dropped
-            let mut bigger = Vec::with_capacity(n + 1);
+            let mut bigger = Vec::new();
+            bigger
+                .try_reserve_exact(n + 1)
+                .map_err(|_| crate::util::error::KernelError::OutOfMemory)?;
             let mut w = self.0.lock();
             if w.len() == n {
                 bigger.extend_from_slice(&w);

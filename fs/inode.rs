@@ -234,6 +234,19 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
+    /// Where symlink `inode` (on mount `mnt`) leads if it is a magic
+    /// link, one that goes to an object rather than to the path its
+    /// readlink shows (Linux get_link + nd_jump_link); None for a plain
+    /// symlink
+    fn jump_link(
+        &self,
+        inode: &Inode,
+        mnt: &Arc<super::mount::Mount>,
+    ) -> Option<Result<super::Path, KernelError>> {
+        let _ = (inode, mnt);
+        None
+    }
+
     /// Create a symbolic link
     fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, target);

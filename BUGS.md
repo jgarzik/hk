@@ -899,6 +899,18 @@ Tag = roadmap phase (doc/ROADMAP.md).
    the child's write, or the child failed). Not reproduced in two
    reruns; investigate when it repeats.
 
+## Namespace files are not nsfs
+
+**Location**: `fs/proc/mod.rs` (`ns_file`), `ns/mod.rs` (`sys_setns`)
+
+/proc/<pid>/ns/<type> leads to a procfs inode numbered as the
+namespace, not to an nsfs inode: st_dev is procfs's, and the file names
+the task and the type, so setns joins the namespace that task is in at
+setns time (Linux: the open file pins the namespace itself, and a bind
+mount of it keeps the namespace alive). No cgroup, time,
+pid_for_children or time_for_children links, no NS_GET_* ioctls, and
+open(O_CREAT) through a link does not follow it.
+
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 
 **Location**: `fs/proc/mod.rs` (`ProcfsFileOps::poll`)

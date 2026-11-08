@@ -123,6 +123,9 @@ pub struct UtsNamespace {
     /// None = init user namespace (root always has CAP_SYS_ADMIN)
     /// Future: proper user namespace with capability checking
     user_ns: Option<Arc<super::UserNamespace>>,
+
+    /// Its inode number (Linux ns.inum)
+    pub inum: super::inum::Inum,
 }
 
 impl UtsNamespace {
@@ -147,6 +150,7 @@ impl UtsNamespace {
         Self {
             name: RwLock::new(name),
             user_ns: None,
+            inum: super::inum::Inum::fixed(super::inum::UTS_INIT),
         }
     }
 
@@ -159,9 +163,11 @@ impl UtsNamespace {
         // Copy current name values
         let name_copy = *self.name.read();
 
+        let inum = super::inum::Inum::alloc().map_err(|e| e.errno())?;
         try_arc(Self {
             name: RwLock::new(name_copy),
             user_ns: self.user_ns.clone(),
+            inum,
         })
         .map_err(|e| e.errno())
     }

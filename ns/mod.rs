@@ -23,6 +23,7 @@
 //! VFS locks → Namespace locks → Filesystem context → Per-CPU scheduler → TASKLIST
 
 pub mod cgroup;
+pub mod inum;
 pub mod net;
 pub mod pid;
 pub mod user;
@@ -96,17 +97,28 @@ pub struct MntNamespace {
     pub id: u64,
     /// Root mount of this namespace
     pub root: RwLock<Option<Arc<Mount>>>,
+    /// Its inode number (Linux ns.inum)
+    pub inum: inum::Inum,
 }
 
 impl MntNamespace {
     /// Create a new empty mount namespace, or ENOMEM
     pub fn new() -> Result<Arc<Self>, KernelError> {
-        try_arc(Self::default())
+        try_arc(Self::with(inum::Inum::alloc()?))
     }
 
     /// Create initial mount namespace (boot: failure cannot be reported)
     fn new_init() -> Arc<Self> {
-        arc_nofail(Self::default())
+        arc_nofail(Self::with(inum::Inum::fixed(inum::MNT_INIT)))
+    }
+
+    /// An empty namespace numbered `inum`
+    fn with(inum: inum::Inum) -> Self {
+        Self {
+            id: NEXT_MNT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            root: RwLock::new(None),
+            inum,
+        }
     }
 
     /// Clone this namespace (for CLONE_NEWNS)
@@ -152,15 +164,6 @@ impl MntNamespace {
             m.clone(),
             m.root.clone(),
         )))
-    }
-}
-
-impl Default for MntNamespace {
-    fn default() -> Self {
-        Self {
-            id: NEXT_MNT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-            root: RwLock::new(None),
-        }
     }
 }
 

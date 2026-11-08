@@ -292,6 +292,17 @@ fn follow_link(
     if dir.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
         return Err(KernelError::TooManySymlinks);
     }
+    // A magic link jumps to its object (Linux nd_jump_link). The ones
+    // that do (namespace files) lead to no directory: a component or
+    // a trailing slash after one is ENOTDIR, as Linux's walk finds
+    if let Some(p) = inode.i_op.jump_link(&inode, &dir.mnt) {
+        let p = p?;
+        inode.touch_atime(&dir.mnt);
+        if !rest.is_empty() || flags.directory {
+            return Err(KernelError::NotDirectory);
+        }
+        return Ok(p);
+    }
     let target = inode.i_op.readlink(&inode)?;
     inode.touch_atime(&dir.mnt);
     let mut path = target;

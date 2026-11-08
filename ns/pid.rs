@@ -31,6 +31,9 @@ pub struct PidNamespace {
     /// Nesting level (0 = init_pid_ns, increases with each child)
     pub level: u32,
 
+    /// Its inode number (Linux ns.inum)
+    pub inum: super::inum::Inum,
+
     /// Parent namespace (None for init_pid_ns)
     pub parent: Option<Arc<PidNamespace>>,
 
@@ -64,6 +67,7 @@ impl PidNamespace {
         // child_reaper is set from the start
         arc_nofail(Self {
             level: 0,
+            inum: super::inum::Inum::fixed(super::inum::PID_INIT),
             parent: None,
             map: crate::task::pid::PidMap::new(),
             alloc: AtomicU32::new(NS_ADDING | NS_INIT),
@@ -80,8 +84,10 @@ impl PidNamespace {
         if parent.level >= MAX_PID_NS_LEVEL {
             return Err(11); // EAGAIN - max nesting exceeded
         }
+        let inum = super::inum::Inum::alloc().map_err(|e| e.errno())?;
         try_arc(Self {
             level: parent.level + 1,
+            inum,
             parent: Some(parent.clone()),
             map: crate::task::pid::PidMap::new(),
             alloc: AtomicU32::new(NS_ADDING),

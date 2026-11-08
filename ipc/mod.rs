@@ -105,11 +105,14 @@ pub struct IpcNamespace {
     pub shm_ctlall: usize, // Total max memory (SHMALL)
     pub shm_tot: AtomicU64,
     pub shm_ctlmni: u32, // Max segments (SHMMNI)
+
+    /// Its inode number (Linux ns.inum)
+    pub inum: crate::ns::inum::Inum,
 }
 
 impl IpcNamespace {
-    /// Create a new IPC namespace with default limits
-    pub fn new() -> Self {
+    /// The initial IPC namespace, with default limits
+    fn new_init() -> Self {
         Self {
             sem_ids: IpcIds::new(),
             msg_ids: IpcIds::new(),
@@ -136,6 +139,7 @@ impl IpcNamespace {
             shm_ctlall: usize::MAX - (1 << 24), // SHMALL (pages)
             shm_tot: AtomicU64::new(0),
             shm_ctlmni: 4096, // SHMMNI
+            inum: crate::ns::inum::Inum::fixed(crate::ns::inum::IPC_INIT),
         }
     }
 
@@ -144,6 +148,7 @@ impl IpcNamespace {
     /// Creates a new empty namespace with same limits.
     /// IPC objects are NOT copied - new namespace starts empty.
     pub fn clone_ns(&self) -> Result<Arc<Self>, i32> {
+        let inum = crate::ns::inum::Inum::alloc().map_err(KernelError::errno)?;
         try_arc(Self {
             sem_ids: IpcIds::new(),
             msg_ids: IpcIds::new(),
@@ -159,6 +164,7 @@ impl IpcNamespace {
             shm_ctlall: self.shm_ctlall,
             shm_tot: AtomicU64::new(0),
             shm_ctlmni: self.shm_ctlmni,
+            inum,
         })
         .map_err(KernelError::errno)
     }
@@ -182,14 +188,9 @@ impl IpcNamespace {
     }
 }
 
-impl Default for IpcNamespace {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Initial (root) IPC namespace
-pub static INIT_IPC_NS: Lazy<Arc<IpcNamespace>> = Lazy::new(|| arc_nofail(IpcNamespace::new()));
+pub static INIT_IPC_NS: Lazy<Arc<IpcNamespace>> =
+    Lazy::new(|| arc_nofail(IpcNamespace::new_init()));
 
 // ============================================================================
 // User-space ABI structures (must match Linux exactly)

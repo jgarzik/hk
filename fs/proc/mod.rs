@@ -184,6 +184,19 @@ impl NamespaceType {
         }
     }
 
+    /// The inode number of `ns`'s namespace of this type (Linux
+    /// ns.inum)
+    pub fn inum(&self, ns: &crate::ns::NsProxy) -> u32 {
+        match self {
+            Self::Uts => ns.uts_ns.inum.get(),
+            Self::Mnt => ns.mnt_ns.inum.get(),
+            Self::Pid => ns.pid_ns.inum.get(),
+            Self::User => ns.user_ns.inum.get(),
+            Self::Ipc => ns.ipc_ns.inum.get(),
+            Self::Net => ns.net_ns.inum.get(),
+        }
+    }
+
     /// List of all supported namespace types
     pub fn all() -> &'static [NamespaceType] {
         &[
@@ -414,12 +427,14 @@ impl InodeOps for ProcfsInodeOps {
             Me,
             Fixed(&'static [u8]),
             Fd(ProcPid, i32),
+            Ns(ProcPid, NamespaceType),
         }
         let l = match &*wrapper.0.read() {
             ProcfsInodeData::PidLink { pid, target } => Link::Pid(pid.clone(), *target),
             ProcfsInodeData::SelfLink => Link::Me,
             ProcfsInodeData::FixedLink(t) => Link::Fixed(t),
             ProcfsInodeData::FdSymlink { pid, fd } => Link::Fd(pid.clone(), *fd),
+            ProcfsInodeData::NamespaceFile { pid, ns_type } => Link::Ns(pid.clone(), *ns_type),
             _ => return Err(KernelError::InvalidArgument),
         };
         match l {
@@ -427,7 +442,32 @@ impl InodeOps for ProcfsInodeOps {
             Link::Me => self_link(inode),
             Link::Fixed(t) => Ok(t.to_vec()),
             Link::Fd(pid, fd) => fd_link(&pid.task().ok_or(KernelError::NotFound)?, fd),
+            Link::Ns(pid, ns_type) => {
+                let inum = ns_inum(&pid, ns_type)?;
+                Ok(alloc::format!("{}:[{inum}]", ns_type.as_str()).into_bytes())
+            }
         }
+    }
+
+    /// /proc/<pid>/ns/<type> leads to the namespace's file (Linux
+    /// proc_ns_get_link: ns_get_path, nd_jump_link)
+    fn jump_link(
+        &self,
+        inode: &Inode,
+        mnt: &Arc<crate::fs::mount::Mount>,
+    ) -> Option<Result<crate::fs::Path, KernelError>> {
+        let wrapper = inode.get_private()?;
+        let wrapper = wrapper
+            .as_ref()
+            .as_any()
+            .downcast_ref::<ProcfsInodeWrapper>()?;
+        let (pid, ns_type) = match &*wrapper.0.read() {
+            ProcfsInodeData::NamespaceFile { pid, ns_type } if inode.mode().is_symlink() => {
+                (pid.clone(), *ns_type)
+            }
+            _ => return None,
+        };
+        Some(ns_file(inode, mnt, pid, ns_type))
     }
 
     /// /proc/sys files: Linux proc_sys_permission (never executable,
@@ -824,9 +864,11 @@ fn lookup_pid_ns_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode
         NamespaceType::Net => 7,
     };
 
+    // A magic link to the namespace (Linux proc_ns_dir_operations:
+    // S_IFLNK | 0777)
     let inode = try_arc(Inode::new(
         pid_ino(pid, offset),
-        InodeMode::regular(0o444), // r--r--r--
+        InodeMode::symlink(),
         0,
         0,
         0,
@@ -1004,18 +1046,53 @@ fn gen_fdinfo_content(t: &TaskRef, fd: i32, ns: &PidNamespace) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// Generate content for namespace files
-///
-/// Returns a string identifying the namespace, similar to Linux's
-/// "ns:[inode]" format but simplified.
-fn gen_namespace_content(t: &TaskRef, ns_type: NamespaceType) -> Vec<u8> {
-    use alloc::fmt::Write;
-    let mut output = String::new();
+/// The task `pid` names, if the caller may see its namespaces (Linux
+/// proc_ns_get_link / proc_ns_readlink: EACCES once it is gone or
+/// without PTRACE_MODE_READ_FSCREDS access)
+fn ns_task(pid: &ProcPid) -> Result<TaskRef, KernelError> {
+    let t = pid.task().ok_or(KernelError::PermissionDenied)?;
+    if !crate::task::ptrace::may_read_ref(&t) {
+        return Err(KernelError::PermissionDenied);
+    }
+    Ok(t)
+}
 
-    // Format: <type>:[<pid>]
-    // This identifies which namespace instance the task is in
-    let _ = writeln!(output, "{}:[{}]", ns_type.as_str(), t.pid);
-    Vec::from(output.as_bytes())
+/// The inode number of the `ns_type` namespace of the task `pid` names
+/// (Linux ns_get_name)
+fn ns_inum(pid: &ProcPid, ns_type: NamespaceType) -> Result<u32, KernelError> {
+    let t = ns_task(pid)?;
+    let ns = task_nsproxy(&t).ok_or(KernelError::PermissionDenied)?;
+    Ok(ns_type.inum(&ns))
+}
+
+/// The file of the `ns_type` namespace of the task `pid` names, where
+/// its /proc link `link` (on `mnt`) leads: a read-only inode numbered
+/// as the namespace (Linux ns_get_path: the nsfs inode, ino ns.inum),
+/// which setns takes
+fn ns_file(
+    link: &Inode,
+    mnt: &Arc<crate::fs::mount::Mount>,
+    pid: ProcPid,
+    ns_type: NamespaceType,
+) -> Result<crate::fs::Path, KernelError> {
+    let inum = ns_inum(&pid, ns_type)?;
+    let sb = link.superblock().ok_or(KernelError::Io)?;
+    let inode = try_arc(Inode::new(
+        u64::from(inum),
+        InodeMode::regular(0o444),
+        0,
+        0,
+        0,
+        current_time(),
+        Arc::downgrade(&sb),
+        &PROCFS_INODE_OPS,
+    ))?;
+    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
+        ProcfsInodeData::new_ns_file(pid, ns_type),
+    )))?);
+    let name = alloc::format!("{}:[{inum}]", ns_type.as_str()).into_bytes();
+    let dentry = try_arc(Dentry::new_anonymous(name.into(), Some(inode)))?;
+    Ok(crate::fs::Path::new(mnt.clone(), dentry))
 }
 
 /// Generate content for /proc/<pid>/cgroup
@@ -1434,7 +1511,6 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
     enum Gen {
         Pid(ProcPid, PidGen),
         File(ContentGenerator),
-        Ns(ProcPid, NamespaceType),
         Fdinfo(ProcPid, i32),
         Sysctl(&'static crate::sysctl::Ctl),
         FailNth(ProcPid),
@@ -1442,7 +1518,8 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
     let g = match &*wrapper.0.read() {
         ProcfsInodeData::PidFile { pid, generator } => Gen::Pid(pid.clone(), *generator),
         ProcfsInodeData::File { generator } => Gen::File(*generator),
-        ProcfsInodeData::NamespaceFile { pid, ns_type } => Gen::Ns(pid.clone(), *ns_type),
+        // A namespace file has no read (Linux ns_file_operations)
+        ProcfsInodeData::NamespaceFile { .. } => return Err(KernelError::InvalidArgument),
         ProcfsInodeData::FdinfoFile { pid, fd } => Gen::Fdinfo(pid.clone(), *fd),
         ProcfsInodeData::Sysctl { ctl } => Gen::Sysctl(ctl),
         ProcfsInodeData::FailNth { pid } => Gen::FailNth(pid.clone()),
@@ -1463,7 +1540,6 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
     Ok(match g {
         Gen::Pid(p, g) => return pid_content(Some(file), &task(&p)?, g),
         Gen::File(generator) => generator(),
-        Gen::Ns(p, ns_type) => gen_namespace_content(&task(&p)?, ns_type),
         Gen::Fdinfo(p, fd) => gen_fdinfo_content(&task(&p)?, fd, &opts::pid_ns(&inode)),
         Gen::Sysctl(ctl) => crate::sysctl::read(ctl),
         Gen::FailNth(p) => {
@@ -1866,7 +1942,7 @@ fn readdir_emit_ns_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), Ker
     for (idx, ns_type) in NamespaceType::all().iter().enumerate() {
         let should_continue = ctx.emit(DirEntry {
             ino: pid_ino(pid, 2 + idx as u64),
-            file_type: FileType::Regular, // Namespace files appear as regular files
+            file_type: FileType::Symlink,
             name: Vec::from(ns_type.as_str().as_bytes()),
         });
 
