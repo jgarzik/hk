@@ -5,8 +5,9 @@
 //! before it dies (zap_pid_ns_processes).
 //!
 //! Locking (doc/LOCKING.md, "A pid namespace's init"):
-//! `PidNamespace.reaper` and `reboot` are TASKLIST's; `PidNamespace.alloc` (pid
-//! count, adding) is PIDMAP_LOCK's (`task::pid`).
+//! `PidNamespace.reaper` and `reboot` are TASKLIST's;
+//! `PidNamespace.alloc` (pid count, adding, init) is PIDMAP_LOCK's
+//! (`task::pid`).
 
 use crate::ns::PidNamespace;
 use crate::task::Task;
@@ -43,10 +44,13 @@ pub fn set_reaper(
 
 /// The init `t` (a new process numbered 1 in its namespace) joins the
 /// task list (TASKLIST held for writing): it is the namespace's child
-/// reaper (Linux copy_process: is_child_reaper)
+/// reaper, and other numbers may now be made there (Linux copy_process:
+/// is_child_reaper)
 pub fn attach_init(table: &mut GlobalTaskTable, t: &TaskRef) {
-    let old = set_reaper(table, t.pid_ns(), t);
+    let ns = t.pid_ns();
+    let old = set_reaper(table, ns, t);
     debug_assert!(old.is_none(), "pidns: a second init");
+    crate::task::pid::set_ns_init(ns);
 }
 
 /// Linux find_child_reaper, as `me` exits (before its children are

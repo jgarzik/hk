@@ -361,12 +361,16 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>,
 }
 
 /// Count `numbers` in their namespaces (Linux alloc_pid under
-/// pidmap_lock): ENOMEM if one takes no new pids (its init died:
-/// PIDNS_ADDING cleared)
+/// pidmap_lock): EINVAL if a namespace with no init yet would get a
+/// number other than 1 (pid 1 is made first), ENOMEM if one takes no
+/// new pids (its init died: PIDNS_ADDING cleared)
 fn admit(numbers: &[UPid]) -> Result<(), KernelError> {
-    use crate::ns::pid::NS_ADDING;
+    use crate::ns::pid::{NS_ADDING, NS_INIT};
     let _g = PIDMAP_LOCK.lock();
     let state = |u: &UPid| u.ns.alloc.load(Ordering::Relaxed);
+    if numbers.iter().any(|u| u.nr != 1 && state(u) & NS_INIT == 0) {
+        return Err(KernelError::InvalidArgument);
+    }
     if numbers.iter().any(|u| state(u) & NS_ADDING == 0) {
         return Err(KernelError::OutOfMemory);
     }
@@ -403,6 +407,21 @@ pub fn ns_adding(ns: &PidNamespace) -> bool {
 pub fn ns_pids(ns: &PidNamespace) -> u32 {
     let _g = PIDMAP_LOCK.lock();
     ns.alloc.load(Ordering::Relaxed) & crate::ns::pid::NS_PIDS
+}
+
+/// `ns` has had its init (Linux child_reaper set): a number other than
+/// 1 may be made there
+pub fn ns_has_init(ns: &PidNamespace) -> bool {
+    let _g = PIDMAP_LOCK.lock();
+    ns.alloc.load(Ordering::Relaxed) & crate::ns::pid::NS_INIT != 0
+}
+
+/// `ns`'s init joined the task list (Linux copy_process sets
+/// child_reaper)
+pub fn set_ns_init(ns: &PidNamespace) {
+    let _g = PIDMAP_LOCK.lock();
+    ns.alloc
+        .fetch_or(crate::ns::pid::NS_INIT, Ordering::Relaxed);
 }
 
 /// One pid fewer in `ns` (PIDMAP_LOCK held): true if it is dying and

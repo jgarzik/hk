@@ -4,7 +4,7 @@
 - [x] fork (x86-64 only, legacy; use clone)
 - [x] vfork (x86-64 only, legacy; use clone with CLONE_VFORK)
 - [x] clone (Linux thread/process creation; CLONE_PIDFD returns the pidfd at parent_tid)
-- [x] clone3 (set_tid, CLONE_INTO_CGROUP)
+- [x] clone3 (set_tid: a namespace with no init yet takes only 1; CLONE_INTO_CGROUP)
 - [x] execve (ELF, #! scripts up to 5 levels)
 - [x] execveat (dirfd, AT_EMPTY_PATH for fexecve, AT_SYMLINK_NOFOLLOW)
 - [x] _exit

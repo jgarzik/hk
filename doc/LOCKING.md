@@ -897,8 +897,10 @@ TASKLIST's read lock only to take a reference from `Pid.task`, the
 **A pid namespace's init** (`task/pidns.rs`; Linux child_reaper,
 pid_allocated, find_child_reaper, zap_pid_ns_processes): no new lock.
 `PidNamespace.alloc` (atomic, changed under PIDMAP_LOCK: thread
-context, a leaf) counts the pids numbered there with a flag,
-NS_ADDING (pids may be made; cleared when its init dies).
+context, a leaf) counts the pids numbered there with two flags,
+NS_ADDING (pids may be made; cleared when its init dies) and NS_INIT
+(its init has joined the task list, set in that TASKLIST write
+section; until then only 1 may be made: EINVAL).
 `alloc_pid` admits a new `Pid` under PIDMAP_LOCK before it is built
 (ENOMEM once NS_ADDING is clear) and `release_numbers` uncounts it; a
 dying namespace down to its init's pids wakes CHILD_EXIT_WQ after
@@ -2523,7 +2525,7 @@ tasks can share the same `NsProxy` (e.g., threads created without CLONE_NEW* fla
 | `MntNamespace.root` | `RwLock<Option<Arc<Mount>>>` | Mount tree root (3.3) |
 | `UserNamespace.uid_map.extents` | `RwLock<Vec<UidGidExtent>>` | UID mapping extents |
 | `UserNamespace.gid_map.extents` | `RwLock<Vec<UidGidExtent>>` | GID mapping extents |
-| `PidNamespace.alloc` | `AtomicU32` changed under PIDMAP_LOCK | Pid count, NS_ADDING (3.1.1, "A pid namespace's init") |
+| `PidNamespace.alloc` | `AtomicU32` changed under PIDMAP_LOCK | Pid count, NS_ADDING, NS_INIT (3.1.1, "A pid namespace's init") |
 | `PidNamespace.reaper`, `reboot` | `TableCell` (TASKLIST) | Child reaper, reboot(2) status (3.1.1) |
 
 `CgroupNamespace`, and a `PidNamespace`'s level, parent and number

@@ -1,5 +1,6 @@
 //! A pid namespace's init (Linux kernel/exit.c find_child_reaper,
-//! kernel/pid_namespace.c zap_pid_ns_processes, reboot_pid_ns)
+//! kernel/pid_namespace.c zap_pid_ns_processes, reboot_pid_ns,
+//! kernel/pid.c alloc_pid)
 //!
 //! As in `pidns`, each test runs in a forked process X whose child Y
 //! is pid 1 of a new namespace.
@@ -10,19 +11,24 @@
 //!   EOF); after a namespace's init died, fork into it is ENOMEM;
 //! - PIDNS_REBOOT: reboot(2) inside kills Y, which X sees killed by
 //!   SIGHUP (restart) or SIGINT (power off); an unknown command is
-//!   EINVAL there. Only ever called inside a namespace.
+//!   EINVAL there. Only ever called inside a namespace;
+//! - PIDNS_SET_TID_1: clone3 set_tid into a namespace with no init yet
+//!   must name 1 (another number is EINVAL); once its init runs, a free
+//!   number works and 1 is EEXIST.
 
 use super::pidns::{child, first_fail, ns_child, outer, status};
 use crate::helpers::{msleep, println};
 use hk_syscall::{
-    CLONE_NEWPID, LINUX_REBOOT_CMD_POWER_OFF, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, O_NONBLOCK,
-    sys_close, sys_exit, sys_fork, sys_getpid, sys_getppid, sys_pipe2, sys_read, sys_reboot_ret,
-    sys_unshare, sys_wait4,
+    CLONE_NEWPID, CloneArgs, LINUX_REBOOT_CMD_POWER_OFF, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+    O_NONBLOCK, sys_clone3, sys_close, sys_exit, sys_fork, sys_getpid, sys_getppid, sys_pipe2,
+    sys_read, sys_reboot_ret, sys_unshare, sys_wait4, sys_write,
 };
 
+const SIGCHLD: u64 = 17;
 const SIGHUP: i64 = 1;
 const SIGINT: i64 = 2;
 const ENOMEM: i64 = -12;
+const EEXIST: i64 = -17;
 const EINVAL: i64 = -22;
 const LINUX_REBOOT_CMD_RESTART: u64 = 0x0123_4567;
 const LINUX_REBOOT_CMD_CAD_ON: u64 = 0x89ab_cdef;
@@ -32,6 +38,7 @@ pub fn run_tests() {
     outer(b"PIDNS_REAPER", reaper);
     outer(b"PIDNS_INIT_EXIT", init_exit);
     outer(b"PIDNS_REBOOT", reboot);
+    outer(b"PIDNS_SET_TID_1", set_tid_1);
 }
 
 /// Sleep until killed
@@ -150,4 +157,68 @@ fn rebooter_restart() -> i32 {
 
 fn rebooter_off() -> i32 {
     rebooter(LINUX_REBOOT_CMD_POWER_OFF)
+}
+
+/// clone3 with `flags` and the one set_tid number `nr`
+fn clone_tid(flags: u64, nr: i32) -> i64 {
+    let tids = [nr];
+    let args = CloneArgs {
+        flags,
+        exit_signal: SIGCHLD,
+        set_tid: tids.as_ptr() as u64,
+        set_tid_size: 1,
+        ..CloneArgs::default()
+    };
+    let p = sys_clone3(&args, core::mem::size_of::<CloneArgs>());
+    if p == 0 {
+        sys_exit(u64::from(sys_getpid() != i64::from(nr)));
+    }
+    p
+}
+
+/// X's pipe, held by the namespace's init until X writes
+static mut GATE: [i32; 2] = [-1, -1];
+
+fn gate(i: usize) -> u64 {
+    // SAFETY: written by X before its children exist
+    unsafe { core::ptr::read_volatile(&raw const GATE)[i] as u64 }
+}
+
+fn set_tid_1() -> i32 {
+    // A new namespace starts at 1
+    let two = clone_tid(CLONE_NEWPID, 2);
+    let one = clone_tid(CLONE_NEWPID, 1);
+    let s1 = status(one);
+    if two > 0 {
+        status(two);
+    }
+    // After unshare, the namespace has no init until its first child
+    if sys_unshare(CLONE_NEWPID) != 0 || sys_pipe2((&raw mut GATE).cast::<i32>(), 0) != 0 {
+        return 20;
+    }
+    let early = clone_tid(0, 3);
+    if early > 0 {
+        status(early);
+    }
+    let init = child(|| {
+        let mut b = [0u8; 1];
+        sys_read(gate(0), b.as_mut_ptr(), 1);
+        0
+    });
+    let seven = clone_tid(0, 7);
+    let s7 = status(seven);
+    let dup = clone_tid(0, 1);
+    if dup > 0 {
+        status(dup);
+    }
+    sys_write(gate(1), b"x".as_ptr(), 1);
+    let si = status(init);
+    first_fail(&[
+        two == EINVAL,
+        one > 0 && s1 == 0,
+        early == EINVAL,
+        init > 0 && si == 0,
+        seven > 0 && s7 == 0,
+        dup == EEXIST,
+    ])
 }

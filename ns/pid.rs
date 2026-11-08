@@ -19,8 +19,11 @@ pub const MAX_PID_NS_LEVEL: u32 = 32;
 /// `PidNamespace.alloc`: new pids may be made (Linux PIDNS_ADDING),
 /// until its init dies
 pub const NS_ADDING: u32 = 1 << 31;
+/// `PidNamespace.alloc`: its init (pid 1) has been in the task list
+/// (Linux child_reaper != NULL); until then only 1 may be made
+pub const NS_INIT: u32 = 1 << 30;
 /// `PidNamespace.alloc`: the count of its pids (Linux pid_allocated)
-pub const NS_PIDS: u32 = NS_ADDING - 1;
+pub const NS_PIDS: u32 = NS_INIT - 1;
 
 /// PID namespace: its level, parent and number bitmap are fixed at
 /// creation; the init state below is locked
@@ -34,7 +37,7 @@ pub struct PidNamespace {
     /// Its numbers (Linux pid_namespace->pidmap)
     pub map: crate::task::pid::PidMap,
 
-    /// Its pids, with `NS_ADDING` (Linux pid_allocated):
+    /// Its pids, with `NS_ADDING` and `NS_INIT` (Linux pid_allocated):
     /// changed under PIDMAP_LOCK (`task::pid`)
     pub alloc: AtomicU32,
 
@@ -53,12 +56,13 @@ pub struct PidNamespace {
 impl PidNamespace {
     /// Create the initial (root) PID namespace
     fn new_init() -> Arc<Self> {
-        // Boot: failure cannot be reported
+        // Boot: failure cannot be reported. Linux init_pid_ns: its
+        // child_reaper is set from the start
         arc_nofail(Self {
             level: 0,
             parent: None,
             map: crate::task::pid::PidMap::new(),
-            alloc: AtomicU32::new(NS_ADDING),
+            alloc: AtomicU32::new(NS_ADDING | NS_INIT),
             reaper: TableCell::new(None),
             reboot: TableCell::new(0),
         })

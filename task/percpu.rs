@@ -2144,15 +2144,22 @@ impl CloneConfig {
 /// clone3's set_tid numbers for a child in `ns` (Linux alloc_pid): no
 /// more than its levels and each a valid number (EINVAL), and the
 /// right to choose them (EPERM: CAP_CHECKPOINT_RESTORE or
-/// CAP_SYS_ADMIN, checkpoint_restore_ns_capable)
+/// CAP_SYS_ADMIN, checkpoint_restore_ns_capable); a level with no init
+/// yet takes only 1 (EINVAL)
 fn check_set_tid(ns: &crate::ns::PidNamespace, set_tid: &[u32]) -> Result<(), i32> {
     if set_tid.len() > ns.level as usize + 1 {
         return Err(22); // EINVAL
     }
+    let mut level = Some(ns);
     for &nr in set_tid {
         if !(1..crate::task::pid::PID_MAX_LIMIT).contains(&nr) {
             return Err(22);
         }
+        let l = level.ok_or(22)?;
+        if nr != 1 && !crate::task::pid::ns_has_init(l) {
+            return Err(22);
+        }
+        level = l.parent.as_deref();
         if !crate::task::capable(crate::task::CAP_CHECKPOINT_RESTORE)
             && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
         {
