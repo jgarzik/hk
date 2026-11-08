@@ -112,10 +112,7 @@ pub fn sys_clone(
 /// frame allocator): the child's tid, or -errno
 fn clone(config: super::percpu::CloneConfig) -> i64 {
     let mut frame_alloc = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
-    match super::percpu::do_clone(config, &mut frame_alloc) {
-        Ok(child_tid) => child_tid as i64,
-        Err(errno) => -i64::from(errno),
-    }
+    super::percpu::do_clone(config, &mut frame_alloc).map_or_else(KernelError::sysret, |t| t as i64)
 }
 
 /// sys_fork - create a new process (classic fork)

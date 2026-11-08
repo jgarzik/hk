@@ -265,10 +265,7 @@ impl NsProxy {
         };
 
         let ipc_ns = if flags & CLONE_NEWIPC != 0 {
-            // ipc's clone_ns still returns a positive errno
-            self.ipc_ns
-                .clone_ns()
-                .map_err(|e| KernelError::from_errno(e).unwrap_or(KernelError::OutOfMemory))?
+            self.ipc_ns.clone_ns()?
         } else {
             self.ipc_ns.clone()
         };

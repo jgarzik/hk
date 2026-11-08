@@ -2709,25 +2709,25 @@ pub fn set_set_child_tid(tid: Tid, addr: u64) {
 /// The cgroup a CLONE_INTO_CGROUP fd names (Linux cgroup_get_from_file):
 /// EBADF for no file or a file that is not a cgroup directory, ENOENT
 /// for a removed one (css_tryget_online_from_dir)
-pub fn cgroup_from_fd(tid: Tid, fd: i32) -> Result<alloc::sync::Arc<crate::cgroup::Cgroup>, i32> {
+pub fn cgroup_from_fd(tid: Tid, fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
     use crate::fs::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
     let file = fdtable::get_task_fd(tid)
         .and_then(|t| t.lock().get(fd))
-        .ok_or(KernelError::BadFd.errno())?;
+        .ok_or(KernelError::BadFd)?;
     let private = file
         .get_inode()
         .and_then(|i| i.get_private())
-        .ok_or(KernelError::BadFd.errno())?;
+        .ok_or(KernelError::BadFd)?;
     let wrapper = private
         .as_any()
         .downcast_ref::<CgroupfsInodeWrapper>()
-        .ok_or(KernelError::BadFd.errno())?;
+        .ok_or(KernelError::BadFd)?;
     let data = wrapper.0.read();
     let CgroupfsInodeData::Directory { cgroup } = &*data else {
-        return Err(KernelError::BadFd.errno());
+        return Err(KernelError::BadFd);
     };
     cgroup
         .upgrade()
         .filter(|c| !c.is_dead())
-        .ok_or(KernelError::NotFound.errno())
+        .ok_or(KernelError::NotFound)
 }

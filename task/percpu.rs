@@ -28,7 +28,7 @@ use crate::signal::notify::{Entry, Told, Zombie, notify};
 use crate::sync::spin::RwLock;
 use crate::task::sched::{self, Class, ClassQueues};
 use crate::task::{Cred, PRIORITY_IDLE, Pid, Priority, Task, TaskKind, TaskState, Tid};
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 
 /// Clear the child TID and wake futex waiters
 ///
@@ -2106,24 +2106,24 @@ impl CloneConfig {
 /// right to choose them (EPERM: CAP_CHECKPOINT_RESTORE or
 /// CAP_SYS_ADMIN, checkpoint_restore_ns_capable); a level with no init
 /// yet takes only 1 (EINVAL)
-fn check_set_tid(ns: &crate::ns::PidNamespace, set_tid: &[u32]) -> Result<(), i32> {
+fn check_set_tid(ns: &crate::ns::PidNamespace, set_tid: &[u32]) -> KernelResult<()> {
     if set_tid.len() > ns.level as usize + 1 {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
     let mut level = Some(ns);
     for &nr in set_tid {
         if !(1..crate::task::pid::PID_MAX_LIMIT).contains(&nr) {
-            return Err(KernelError::InvalidArgument.errno());
+            return Err(KernelError::InvalidArgument);
         }
-        let l = level.ok_or(KernelError::InvalidArgument.errno())?;
+        let l = level.ok_or(KernelError::InvalidArgument)?;
         if nr != 1 && !crate::task::pid::ns_has_init(l) {
-            return Err(KernelError::InvalidArgument.errno());
+            return Err(KernelError::InvalidArgument);
         }
         level = l.parent.as_deref();
         if !crate::task::capable(crate::task::CAP_CHECKPOINT_RESTORE)
             && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
         {
-            return Err(KernelError::NotPermitted.errno());
+            return Err(KernelError::NotPermitted);
         }
     }
     Ok(())
@@ -2137,31 +2137,31 @@ fn check_set_tid(ns: &crate::ns::PidNamespace, set_tid: &[u32]) -> Result<(), i3
 ///
 /// # Returns
 /// * Ok(child_tid) on success (returned to parent)
-/// * Err(errno) on failure
+/// * Err(e) on failure
 ///
 /// The child will return 0 when scheduled.
 pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     config: CloneConfig,
     frame_alloc: &mut FA,
-) -> Result<Tid, i32> {
+) -> KernelResult<Tid> {
     use crate::arch::Arch;
     use crate::task::clone_flags::*;
 
     // Validate: CLONE_VM requires child_stack UNLESS CLONE_VFORK is also set
     // (vfork shares parent's stack with the child)
     if config.flags & CLONE_VM != 0 && config.child_stack == 0 && config.flags & CLONE_VFORK == 0 {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
 
     // CLONE_DETACHED is refused with CLONE_PIDFD (Linux copy_process)
     if config.flags & CLONE_PIDFD != 0 && config.flags & CLONE_DETACHED != 0 {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate: CLONE_SIGHAND and CLONE_CLEAR_SIGHAND are mutually exclusive
     // (can't share handlers AND reset them at the same time)
     if config.flags & CLONE_SIGHAND != 0 && config.flags & CLONE_CLEAR_SIGHAND != 0 {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
 
     // RLIMIT_NPROC: every task, threads included, is charged to its
@@ -2176,13 +2176,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             .is_some_and(|t| t.task.has_flag(crate::task::pf::NPROC_EXCEEDED))
     };
     if crate::task::nproc_over(nproc.uid, nproc.count) {
-        return Err(KernelError::WouldBlock.errno());
+        return Err(KernelError::WouldBlock);
     }
 
     // A TLS base the register cannot take (Linux copy_thread ->
     // set_new_tls -> do_arch_prctl_64)
     if config.flags & CLONE_SETTLS != 0 && !crate::arch::user_tls_ok(config.tls) {
-        return Err(KernelError::NotPermitted.errno());
+        return Err(KernelError::NotPermitted);
     }
 
     // Get current CPU ID
@@ -2210,9 +2210,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_leader_exit_signal,
     ) = {
         let table = TASKLIST.read();
-        let parent = table
-            .get(current_tid)
-            .ok_or(KernelError::NoProcess.errno())?;
+        let parent = table.get(current_tid).ok_or(KernelError::NoProcess)?;
         let leader_exit = table.get(parent.task.pid).map_or(0, |l| l.exit_signal);
         (
             parent.task.pid,
@@ -2259,7 +2257,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     if config.flags & CLONE_PARENT != 0
         && crate::signal::get_task_signal_struct(current_tid).is_some_and(|s| s.unkillable())
     {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
 
     // The child inherits the policy and priorities; with
@@ -2280,10 +2278,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // child is attached): its fs context, its namespaces (a new mount
     // namespace moves that fs context) and the target cgroup (a bad fd
     // is EBADF)
-    let child_fs = crate::fs::fsstruct::fork_fs(current_tid, config.flags & CLONE_FS != 0)
-        .map_err(|e| e.errno())?;
-    let child_ns = crate::ns::fork_nsproxy(current_tid, config.flags, child_fs.as_deref())
-        .map_err(KernelError::errno)?;
+    let child_fs = crate::fs::fsstruct::fork_fs(current_tid, config.flags & CLONE_FS != 0)?;
+    let child_ns = crate::ns::fork_nsproxy(current_tid, config.flags, child_fs.as_deref())?;
     // A thread stays in its group's pid namespace (Linux copy_process:
     // CLONE_THREAD with CLONE_NEWPID or CLONE_NEWUSER, or after an
     // unshare(CLONE_NEWPID), is EINVAL)
@@ -2291,7 +2287,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         && (config.flags & (CLONE_NEWPID | CLONE_NEWUSER) != 0
             || !core::ptr::eq(Arc::as_ptr(&child_ns.pid_ns), me.task.pid_ns()))
     {
-        return Err(KernelError::InvalidArgument.errno());
+        return Err(KernelError::InvalidArgument);
     }
     let into_cgroup = if config.flags & CLONE_INTO_CGROUP != 0 {
         Some(crate::task::cgroup_from_fd(current_tid, config.cgroup_fd)?)
@@ -2301,22 +2297,20 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Admitted into the target cgroup now (Linux cgroup_can_fork: the
     // pids limit is charged here, EAGAIN past it); an error below gives
     // the charge back when `fork_cg` drops
-    let fork_cg = crate::cgroup::can_fork(into_cgroup).map_err(|e| e.errno())?;
+    let fork_cg = crate::cgroup::can_fork(into_cgroup)?;
     // Its credentials, files, signal state and CLONE_IO context (Linux
     // copy_creds, copy_files, copy_sighand, copy_signal, copy_io): ENOMEM
-    let child_cred = crate::task::copy_creds(config.flags, &parent_cred).map_err(|e| e.errno())?;
+    let child_cred = crate::task::copy_creds(config.flags, &parent_cred)?;
     let child_files =
-        crate::task::fdtable::fork_task_fd(current_tid, config.flags & CLONE_FILES != 0)
-            .map_err(|e| e.errno())?;
+        crate::task::fdtable::fork_task_fd(current_tid, config.flags & CLONE_FILES != 0)?;
     let (child_sig, child_signal) = crate::signal::fork_signal(
         current_tid,
         config.flags & CLONE_SIGHAND != 0,
         config.flags & CLONE_THREAD != 0,
         config.flags & CLONE_CLEAR_SIGHAND != 0,
-    )
-    .map_err(|e| e.errno())?;
+    )?;
     let child_io = if config.flags & CLONE_IO != 0 {
-        Some(crate::task::fork_io(current_tid, true).map_err(|e| e.errno())?)
+        Some(crate::task::fork_io(current_tid, true)?)
     } else {
         None
     };
@@ -2328,8 +2322,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // group's. EAGAIN with no number left, ENOMEM
     let set_tid = &config.set_tid[..config.set_tid_size];
     check_set_tid(&child_ns.pid_ns, set_tid)?;
-    let child_thread_pid =
-        crate::task::pid::alloc_pid_nr(&child_ns.pid_ns, set_tid).map_err(|e| e.errno())?;
+    let child_thread_pid = crate::task::pid::alloc_pid_nr(&child_ns.pid_ns, set_tid)?;
     let child_tid = Tid::from(child_thread_pid.nr());
     // A new process numbered 1 is its namespace's init (Linux
     // copy_process: is_child_reaper)
@@ -2349,16 +2342,15 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         None => None,
         Some(pm) if config.flags & CLONE_VM != 0 => Some(pm),
         Some(pm) => {
-            let mut pt =
-                ArchPageTable::new_user(frame_alloc).ok_or(KernelError::OutOfMemory.errno())?;
+            let mut pt = ArchPageTable::new_user(frame_alloc).ok_or(KernelError::OutOfMemory)?;
             pt.copy_kernel_mappings();
-            Some(crate::mm::dup_mm(&pm, pt.root_table_phys()).map_err(KernelError::errno)?)
+            Some(crate::mm::dup_mm(&pm, pt.root_table_phys())?)
         }
     };
     let child_pgd = child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd());
 
     // The child's kernel stack (zeroed, guard gap below)
-    let stack = crate::mm::vmstack::alloc().ok_or(KernelError::OutOfMemory.errno())?;
+    let stack = crate::mm::vmstack::alloc().ok_or(KernelError::OutOfMemory)?;
     let kstack_top = stack.top();
 
     // Build child's TrapFrame at the top of the child's kernel stack (its
@@ -2489,7 +2481,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     child_task.se.stack.set(stack);
     // On failure the stack goes with the unbuilt task, like its pid
     // and mm
-    let child_task = try_arc(child_task).map_err(|e| e.errno())?;
+    let child_task = try_arc(child_task)?;
     if parent_nproc_exceeded {
         child_task.set_flag(crate::task::pf::NPROC_EXCEEDED);
     }
@@ -2537,7 +2529,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             if let Some(fd) = pidfd {
                 close_pidfd(fd);
             }
-            return Err(KernelError::OutOfMemory.errno());
+            return Err(KernelError::OutOfMemory);
         }
         if child_init {
             crate::task::pidns::attach_init(&mut table, &child_task);
@@ -2697,21 +2689,19 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 /// descriptor closed again). The child does not exist yet: nothing
 /// but the caller's threads can see the descriptor before clone
 /// returns (Linux reserves it and installs it at the end).
-fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Result<i32, i32> {
+fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> KernelResult<i32> {
     use crate::task::pidfd::pidfd_flags::PIDFD_THREAD;
     let flags = if thread { PIDFD_THREAD } else { 0 };
-    let file = crate::task::pidfd::pidfd_file(pid, flags).map_err(|e| e.errno())?;
-    let files =
-        crate::task::fdtable::get_task_fd(current_tid()).ok_or(KernelError::BadFd.errno())?;
+    let file = crate::task::pidfd::pidfd_file(pid, flags)?;
+    let files = crate::task::fdtable::get_task_fd(current_tid()).ok_or(KernelError::BadFd)?;
     let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
     let fd = files
         .lock()
-        .alloc_with_flags(file, crate::task::FD_CLOEXEC, nofile)
-        .map_err(KernelError::errno)?;
+        .alloc_with_flags(file, crate::task::FD_CLOEXEC, nofile)?;
     if crate::uaccess::put_user::<crate::arch::Uaccess, i32>(ptr, fd).is_err() {
         // Released after the table lock (FilesGuard)
         files.lock().close(fd);
-        return Err(KernelError::BadAddress.errno());
+        return Err(KernelError::BadAddress);
     }
     Ok(fd)
 }
