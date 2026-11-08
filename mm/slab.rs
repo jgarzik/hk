@@ -593,11 +593,14 @@ pub fn fits(old: usize, new: usize, align: usize) -> bool {
 /// those cached in per-CPU arrays, as Linux SLAB counted them)
 pub fn slabinfo() -> alloc::vec::Vec<u8> {
     use core::fmt::Write;
-    let mut out = alloc::string::String::from(
-        "slabinfo - version: 2.1\n# name            <active_objs> <num_objs> <objsize> \
+    const HEAD: &str = "slabinfo - version: 2.1\n# name            <active_objs> <num_objs> <objsize> \
          <objperslab> <pagesperslab> : tunables <limit> <batchcount> <sharedfactor> \
-         : slabdata <active_slabs> <num_slabs> <sharedavail>\n",
-    );
+         : slabdata <active_slabs> <num_slabs> <sharedavail>\n";
+    // Each cache line below is about 110 bytes
+    const LINE: usize = 112;
+    let mut out =
+        alloc::string::String::with_capacity(HEAD.len() + (NAMED.len() + KMALLOC.len()) * LINE);
+    out.push_str(HEAD);
     for c in NAMED.iter().copied().chain(KMALLOC.iter()) {
         let active = c.list_lock.lock().active;
         let slabs = c.nr_slabs.load(Ordering::Relaxed);

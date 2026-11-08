@@ -84,12 +84,21 @@ impl Msg {
     /// Attribute with a raw payload (skipped if it cannot be encoded,
     /// like nla_put's EMSGSIZE)
     pub fn attr(&mut self, ty: u16, data: &[u8]) -> &mut Self {
-        let Ok(len) = u16::try_from(NLA_HDRLEN + data.len()) else {
-            return self;
+        if self.hdr(ty, data.len()) {
+            self.put(data);
+        }
+        self
+    }
+
+    /// Attribute header for a `len`-byte payload; false (nothing
+    /// written) if nla_len cannot hold it
+    fn hdr(&mut self, ty: u16, len: usize) -> bool {
+        let Ok(len) = u16::try_from(NLA_HDRLEN + len) else {
+            return false;
         };
         self.buf.extend_from_slice(&len.to_ne_bytes());
         self.buf.extend_from_slice(&ty.to_ne_bytes());
-        self.put(data)
+        true
     }
 
     pub fn u8(&mut self, ty: u16, v: u8) -> &mut Self {
@@ -102,10 +111,11 @@ impl Msg {
 
     /// NUL-terminated string attribute
     pub fn str(&mut self, ty: u16, s: &str) -> &mut Self {
-        let mut v = Vec::with_capacity(s.len() + 1);
-        v.extend_from_slice(s.as_bytes());
-        v.push(0);
-        self.attr(ty, &v)
+        if self.hdr(ty, s.len() + 1) {
+            self.buf.extend_from_slice(s.as_bytes());
+            self.put(&[0]);
+        }
+        self
     }
 
     /// Open a nested attribute; returns its offset for `nest_end`

@@ -25,6 +25,14 @@ The rules for `unsafe` are in `doc/UNSAFE.md` and the locking rules in
   built up over time. Never `vec![x; n]`, `with_capacity`, `push`,
   `extend`, `resize` or `reserve` on a length the kernel does not bound
   itself. A stream of bytes is a queue of bounded chunks, not one buffer.
+- **Allocate once, outside locks.** Under any spinlock or in softirq an
+  allocation cannot reclaim or fall back to vmalloc, so order 4 (64 KiB)
+  and up can fail under fragmentation, and an infallible one then panics.
+  When a buffer's size is known or tightly bounded and it is filled at
+  once (above all under a lock or in a callback that runs under one), size
+  it before taking the lock: one allocation, no allocator work inside.
+  Don't pre-size long-lived, slowly growing tables or usually-empty lists,
+  and `collect()` from an exact-size iterator already allocates once.
 - **Types carry meaning.** Use newtypes for addresses and numbers that
   must not be mixed up (`PhysAddr`, `VirtAddr`, `Pfn`, device numbers,
   fds), `bitflags` for flag words, and enums for closed sets.

@@ -206,13 +206,11 @@ fn walk(
         Some(p) if !path.starts_with(b"/") => p,
         _ => root.clone(),
     };
-    let comps: Vec<&[u8]> = path
-        .split(|&c| c == b'/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    for (i, name) in comps.iter().enumerate() {
+    let mut next = next_comp(path);
+    while let Some((name, rest)) = next {
+        next = next_comp(rest);
         may_lookup(c, &cur.dentry)?;
-        match *name {
+        match name {
             b"." => continue,
             b".." => {
                 cur = follow_dotdot(cur, &root);
@@ -226,9 +224,9 @@ fn walk(
         } else {
             follow_mount(child)
         };
-        let last = i + 1 == comps.len();
+        let last = next.is_none();
         if (!last || flags.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
-            return follow_link(c, &cur, &child.dentry, &comps[i + 1..], flags, depth);
+            return follow_link(c, &cur, &child.dentry, rest, flags, depth);
         }
         cur = child;
     }
@@ -236,6 +234,15 @@ fn walk(
         return Err(KernelError::NotDirectory);
     }
     Ok(cur)
+}
+
+/// The next component of `p` and what follows it, skipping slashes
+/// (no allocation: the walk steps through the path in place)
+fn next_comp(p: &[u8]) -> Option<(&[u8], &[u8])> {
+    let start = p.iter().position(|&c| c != b'/')?;
+    let p = &p[start..];
+    let end = p.iter().position(|&c| c == b'/').unwrap_or(p.len());
+    Some(p.split_at(end))
 }
 
 /// The root absolute paths start at and ".." stops at (Linux nd->root):
@@ -278,7 +285,7 @@ fn follow_link(
     c: &Cred,
     dir: &Path,
     link: &Dentry,
-    rest: &[&[u8]],
+    rest: &[u8],
     flags: LookupFlags,
     depth: usize,
 ) -> Result<Path, KernelError> {
@@ -298,18 +305,16 @@ fn follow_link(
     if let Some(p) = inode.i_op.jump_link(&inode, &dir.mnt) {
         let p = p?;
         inode.touch_atime(&dir.mnt);
-        if !rest.is_empty() || flags.directory {
+        if next_comp(rest).is_some() || flags.directory {
             return Err(KernelError::NotDirectory);
         }
         return Ok(p);
     }
     let target = inode.i_op.readlink(&inode)?;
     inode.touch_atime(&dir.mnt);
+    // `rest` is empty or starts at a slash: the walk goes on through it
     let mut path = target;
-    for comp in rest {
-        path.push(b'/');
-        path.extend_from_slice(comp);
-    }
+    path.extend_from_slice(rest);
     walk(c, Some(dir.clone()), &path, flags, depth + 1)
 }
 
@@ -616,4 +621,17 @@ pub fn filename_create(dirfd: i32, path: &[u8], want_dir: bool) -> Result<Parent
         p.slash = false;
     }
     Ok(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_comp;
+
+    #[test]
+    fn components() {
+        assert_eq!(next_comp(b"//a//b/"), Some((&b"a"[..], &b"//b/"[..])));
+        assert_eq!(next_comp(b"//b/"), Some((&b"b"[..], &b"/"[..])));
+        assert_eq!(next_comp(b"/"), None);
+        assert_eq!(next_comp(b""), None);
+    }
 }

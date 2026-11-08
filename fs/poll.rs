@@ -186,8 +186,14 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    // Create poll context (wait queue registrations, dropped at return)
-    let mut ctx = PollContext::new(tid);
+    // Create poll context (wait queue registrations, dropped at return;
+    // only a poll that may sleep registers)
+    let regs = if deadline == Some(0) {
+        0
+    } else {
+        pollfds.iter().filter(|p| p.fd >= 0).count()
+    };
+    let mut ctx = PollContext::sized(tid, regs);
     let mut first_pass = true;
     let mut ready_count;
 
@@ -250,6 +256,11 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
         if ready_count > 0 || deadline == Some(0) {
             set_current_state(SleepState::Running);
             break;
+        }
+        // Nothing ready and a registration failed (Linux do_poll)
+        if let Some(e) = ctx.error() {
+            set_current_state(SleepState::Running);
+            return e.sysret();
         }
 
         match poll_sleep(deadline) {
@@ -483,7 +494,24 @@ fn do_select_internal(
     };
     let bit = |v: &[u64], fd: usize| v.get(fd / 64).is_some_and(|w| w & (1 << (fd % 64)) != 0);
 
-    let mut ctx = PollContext::new(current_tid());
+    // Sized for the fds asked about (not nfds: select(FD_SETSIZE) with a
+    // few bits set is the common case); only a select that may sleep
+    // registers
+    let asked = || {
+        // Bits at or past n in the last word are not polled
+        let mask = |i: usize| {
+            if (i + 1) * 64 > n {
+                (1u64 << (n % 64)) - 1
+            } else {
+                !0
+            }
+        };
+        (0..words)
+            .map(|i| ((rd[i] | wr[i] | ex[i]) & mask(i)).count_ones() as usize)
+            .sum::<usize>()
+    };
+    let regs = if deadline == Some(0) { 0 } else { asked() };
+    let mut ctx = PollContext::sized(current_tid(), regs);
     let mut first_pass = true;
     let mut ready_count;
     let fd_table = current_fd_table();
@@ -544,6 +572,11 @@ fn do_select_internal(
         if ready_count > 0 || deadline == Some(0) {
             set_current_state(SleepState::Running);
             break;
+        }
+        // Nothing ready and a registration failed (Linux do_select)
+        if let Some(e) = ctx.error() {
+            set_current_state(SleepState::Running);
+            return e.sysret();
         }
         match poll_sleep(deadline) {
             Some(0) => break,

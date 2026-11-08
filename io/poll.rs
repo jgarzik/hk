@@ -37,6 +37,8 @@ use core::pin::Pin;
 use crate::fs::File;
 use crate::sync::waitqueue::{WaitEntry, WaitQueue};
 use crate::task::Tid;
+use crate::util::error::KernelError;
+use crate::util::kalloc::try_box;
 
 // =============================================================================
 // Poll Event Masks (from include/uapi/asm-generic/poll.h)
@@ -193,31 +195,71 @@ pub struct PollContext {
     /// Other owners of wait queues registered on (a signalfd's poll
     /// registers on the caller's SigHand), kept alive likewise
     owners: Vec<Arc<dyn core::any::Any + Send + Sync>>,
+    /// A registration failed for memory (Linux poll_wqueues.error): no
+    /// more are made, and a poll that finds nothing ready returns it
+    /// instead of sleeping on queues it may have missed
+    error: Option<KernelError>,
 }
 
 impl PollContext {
-    /// Create a new poll context for the current task
-    pub fn new(tid: Tid) -> Self {
-        Self {
+    /// A context for about `n` registering files, sized up front when
+    /// memory allows so the first scan does not grow it one fd at a
+    /// time (failing that, it grows as fds register)
+    pub fn sized(tid: Tid, n: usize) -> Self {
+        let mut c = Self {
             task: tid,
             entries: Vec::new(),
             files: Vec::new(),
             owners: Vec::new(),
+            error: None,
+        };
+        let _ = c.entries.try_reserve_exact(n);
+        let _ = c.files.try_reserve_exact(n);
+        c
+    }
+
+    /// The registration failure, if any (Linux poll_wqueues.error)
+    pub fn error(&self) -> Option<KernelError> {
+        self.error
+    }
+
+    /// Room for one more in `v`, or record ENOMEM and refuse (also once
+    /// an earlier registration failed)
+    fn room<T>(v: &mut Vec<T>, error: &mut Option<KernelError>) -> bool {
+        if error.is_none() && v.try_reserve(1).is_err() {
+            *error = Some(KernelError::OutOfMemory);
         }
+        error.is_none()
     }
 
     /// Keep `file` alive for the lifetime of this context (call before
     /// polling it with a registering table)
     pub fn hold_file(&mut self, file: Arc<File>) {
-        self.files.push(file);
+        if Self::room(&mut self.files, &mut self.error) {
+            self.files.push(file);
+        }
     }
 
-    /// Register the polling task on `wq`
+    /// Keep `owner` alive likewise
+    fn hold_owner(&mut self, owner: Arc<dyn core::any::Any + Send + Sync>) {
+        if Self::room(&mut self.owners, &mut self.error) {
+            self.owners.push(owner);
+        }
+    }
+
+    /// Register the polling task on `wq`: one entry per call, even for a
+    /// queue already registered on (Linux __pollwait; each wakes the
+    /// poller, which re-scans), so registering stays O(1) per fd
     fn add_entry(&mut self, wq: &WaitQueue) {
-        if self.entries.iter().any(|(q, _)| core::ptr::eq(*q, wq)) {
+        // Never register on a queue whose owner could not be held
+        if !Self::room(&mut self.entries, &mut self.error) {
             return;
         }
-        let entry = Box::pin(WaitEntry::new());
+        let Ok(entry) = try_box(WaitEntry::new()) else {
+            self.error = Some(KernelError::OutOfMemory);
+            return;
+        };
+        let entry = Box::into_pin(entry);
         wq.add_wait_queue(entry.as_ref());
         self.entries
             .push((core::ptr::from_ref::<WaitQueue>(wq), entry));
@@ -322,7 +364,7 @@ impl<'a> PollTable<'a> {
     pub fn hold(&mut self, owner: Arc<dyn core::any::Any + Send + Sync>) {
         if self.qproc_enabled {
             match &mut self.target {
-                Target::Ctx(c) => c.owners.push(owner),
+                Target::Ctx(c) => c.hold_owner(owner),
                 Target::Ep(r) => r.hold(owner),
             }
         }
