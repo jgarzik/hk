@@ -815,7 +815,9 @@ pub fn x86_64_syscall_dispatch(
         }
         SYS_STAT => crate::fs::syscall::sys_stat(args[0], args[1]).ret() as u64,
         SYS_SYMLINK => crate::fs::syscall::sys_symlink(args[0], args[1]).ret() as u64,
-        SYS_TIME => crate::time::time_syscall::sys_time(args[0]).ret() as u64,
+        SYS_TIME => {
+            crate::time::time_syscall::sys_time(crate::uaccess::UserPtr::new(args[0])).ret() as u64
+        }
         SYS_UNLINK => crate::fs::syscall::sys_unlink(args[0]).ret() as u64,
         SYS_UTIME => crate::fs::syscall::sys_utime(args[0], args[1]).ret() as u64,
         SYS_UTIMES => crate::fs::syscall::sys_utimes(args[0], args[1]).ret() as u64,

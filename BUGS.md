@@ -1007,9 +1007,6 @@ sigsp switch to the alt stack, __save_altstack fills uc_stack.
 
 ## Errno differs from Linux
 
-- **timerfd_create, eventfd2 return EMFILE for any create failure**
-  (time/time_syscall.rs): the create can only fail with ENOMEM;
-  Linux returns ENOMEM. The callee's error is dropped.
 - **unshare returns EINVAL for any NsProxy::copy failure** (ns/mod.rs):
   Linux returns copy's error (ENOMEM, ENOSPC at the nesting limit).
 - **pid and user namespace nesting limits return EAGAIN** (ns/pid.rs,

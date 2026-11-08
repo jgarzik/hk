@@ -8,8 +8,8 @@
 use crate::arch::Uaccess;
 use crate::time::hrtimer::HrClock;
 use crate::time::{ClockId, STA_NANO, STA_UNSYNC, TIMEKEEPER};
-use crate::uaccess::{UaccessArch, get_user, put_user};
-use crate::util::error::KernelError;
+use crate::uaccess::{UaccessArch, UserPtr};
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::FromBytes;
 
 /// Linux clock IDs
@@ -199,33 +199,23 @@ fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64,
 /// relative sleep interrupted by a signal writes the CPU time left to
 /// `rem` and is ERESTART_RESTARTBLOCK-like (hk restarts with the
 /// original request: ERESTARTNOHAND); an absolute one restarts as is
-fn cpu_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 {
-    if req == 0 || !Uaccess::access_ok(req, core::mem::size_of::<LinuxTimespec>()) {
-        return KernelError::BadAddress.sysret();
-    }
-    let Ok(request) = get_user::<Uaccess, LinuxTimespec>(req) else {
-        return KernelError::BadAddress.sysret();
-    };
-    if request.tv_sec < 0 || request.tv_nsec < 0 || request.tv_nsec >= 1_000_000_000 {
-        return KernelError::InvalidArgument.sysret();
-    }
-    let ns = crate::time::timespec_to_ns(request.tv_sec, request.tv_nsec);
+fn cpu_nanosleep(
+    clockid: i32,
+    flags: i32,
+    req: UserPtr<LinuxTimespec>,
+    rem: UserPtr<LinuxTimespec>,
+) -> KernelResult<()> {
+    let ns = req.read()?.to_ns()?;
     let abs = flags & TIMER_ABSTIME != 0;
     match crate::time::posix_timer::cpu_nanosleep(clockid, abs, ns) {
-        Ok(()) => 0,
+        Ok(()) => Ok(()),
         Err((KernelError::Interrupted, left)) => {
-            if !abs && rem != 0 {
-                let ts = LinuxTimespec {
-                    tv_sec: (left / 1_000_000_000) as i64,
-                    tv_nsec: (left % 1_000_000_000) as i64,
-                };
-                if put_user::<Uaccess, LinuxTimespec>(rem, ts).is_err() {
-                    return KernelError::BadAddress.sysret();
-                }
+            if !abs && !rem.is_null() {
+                rem.write(&LinuxTimespec::from_ns(left))?;
             }
-            KernelError::RestartNoHand.sysret()
+            Err(KernelError::RestartNoHand)
         }
-        Err((e, _)) => e.sysret(),
+        Err((e, _)) => Err(e),
     }
 }
 
@@ -240,6 +230,24 @@ pub struct LinuxTimespec {
     pub tv_nsec: i64,
 }
 crate::pod!(LinuxTimespec { tv_sec, tv_nsec });
+
+impl LinuxTimespec {
+    /// `ns` nanoseconds
+    pub fn from_ns(ns: u64) -> Self {
+        Self {
+            tv_sec: (ns / 1_000_000_000) as i64,
+            tv_nsec: (ns % 1_000_000_000) as i64,
+        }
+    }
+
+    /// A sleep length in ns; EINVAL if negative or unnormalized
+    fn to_ns(self) -> KernelResult<u64> {
+        if self.tv_sec < 0 || !(0..1_000_000_000).contains(&self.tv_nsec) {
+            return Err(KernelError::InvalidArgument);
+        }
+        Ok(crate::time::timespec_to_ns(self.tv_sec, self.tv_nsec))
+    }
+}
 
 /// Linux timeval structure (gettimeofday, itimerval)
 #[repr(C)]
@@ -262,149 +270,73 @@ crate::pod!(Timezone {
     tz_dsttime
 });
 
-/// sys_clock_gettime - get time from specified clock
-///
-/// # Arguments
-/// * `clockid` - Clock identifier (CLOCK_REALTIME or CLOCK_MONOTONIC)
-/// * `tp` - Pointer to user space timespec structure
-///
-/// Returns 0 on success, negative errno on error.
-pub fn sys_clock_gettime(clockid: i32, tp: u64) -> i64 {
-    // Validate user buffer address
-    if tp == 0 || !Uaccess::access_ok(tp, core::mem::size_of::<LinuxTimespec>()) {
-        return KernelError::BadAddress.sysret();
+/// clock_gettime(clockid, tp)
+pub fn sys_clock_gettime(clockid: i32, tp: UserPtr<LinuxTimespec>) -> KernelResult<()> {
+    if !user_ok(tp) {
+        return Err(KernelError::BadAddress);
     }
-
     let Some(Ok(ns)) = PosixClock::decode(clockid).map(PosixClock::now_ns) else {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     };
     let ts = crate::time::Timespec::from_nanos(ns);
     let result = LinuxTimespec {
         tv_sec: ts.sec,
         tv_nsec: i64::from(ts.nsec),
     };
-
-    // Copy to user space using put_user
-    if put_user::<Uaccess, LinuxTimespec>(tp, result).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    Ok(tp.write(&result)?)
 }
 
-/// sys_gettimeofday - get wall-clock time
-///
-/// # Arguments
-/// * `tv` - Pointer to user space timeval structure (may be NULL)
-/// * `tz` - Pointer to user space timezone structure (may be NULL, deprecated)
-///
-/// Returns 0 on success, negative errno on error.
-pub fn sys_gettimeofday(tv: u64, tz: u64) -> i64 {
-    // Get wall-clock time (realtime)
-    if tv != 0 {
-        // Validate user buffer address
-        if !Uaccess::access_ok(tv, core::mem::size_of::<Timeval>()) {
-            return KernelError::BadAddress.sysret();
-        }
+/// `p` is non-NULL and in user space (checked ahead of other errors)
+fn user_ok<T>(p: UserPtr<T>) -> bool {
+    !p.is_null() && Uaccess::access_ok(p.addr(), core::mem::size_of::<T>())
+}
 
+/// gettimeofday(tv, tz): either may be NULL; the timezone reads as
+/// zeros
+pub fn sys_gettimeofday(tv: UserPtr<Timeval>, tz: UserPtr<Timezone>) -> KernelResult<()> {
+    if !tv.is_null() {
         let ts = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
-
         let result = Timeval {
             tv_sec: ts.sec,
-            tv_usec: i64::from(ts.nsec) / 1000, // Convert ns to us
+            tv_usec: i64::from(ts.nsec) / 1000,
         };
-
-        // Copy to user space
-        if put_user::<Uaccess, Timeval>(tv, result).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        tv.write(&result)?;
     }
-
-    // Timezone is deprecated; if provided, return zeros
-    if tz != 0 {
-        // Validate user buffer address
-        if !Uaccess::access_ok(tz, core::mem::size_of::<Timezone>()) {
-            return KernelError::BadAddress.sysret();
-        }
-
-        if put_user::<Uaccess, Timezone>(tz, Timezone::zeroed()).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+    if !tz.is_null() {
+        tz.write(&Timezone::zeroed())?;
     }
-
-    0
+    Ok(())
 }
 
-/// sys_nanosleep - high-resolution sleep
-///
-/// # Arguments
-/// * `req` - Pointer to user space timespec with requested sleep duration
-/// * `rem` - Pointer to user space timespec to store remaining time (may be NULL)
-///
-/// Returns 0 on success, -EINTR if interrupted (with remaining time in rem),
-/// or negative errno on error.
-pub fn sys_nanosleep(req: u64, rem: u64) -> i64 {
-    // Validate and read request timespec
-    if req == 0 || !Uaccess::access_ok(req, core::mem::size_of::<LinuxTimespec>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    let request: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(req) {
-        Ok(ts) => ts,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate timespec values
-    if request.tv_sec < 0 || request.tv_nsec < 0 || request.tv_nsec >= 1_000_000_000 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    let total_ns = crate::time::timespec_to_ns(request.tv_sec, request.tv_nsec);
+/// nanosleep(req, rem): -ERESTARTNOHAND on a signal, with the time left
+/// in `rem` (if non-NULL)
+pub fn sys_nanosleep(req: UserPtr<LinuxTimespec>, rem: UserPtr<LinuxTimespec>) -> KernelResult<()> {
+    let total_ns = req.read()?.to_ns()?;
     let deadline = crate::time::deadline_after(crate::time::monotonic_ns(), total_ns);
     do_nanosleep(deadline, rem)
 }
 
-/// sys_clock_nanosleep - high-resolution sleep with specified clock
-///
-/// # Arguments
-/// * `clockid` - Clock to use (CLOCK_REALTIME or CLOCK_MONOTONIC)
-/// * `flags` - Flags (TIMER_ABSTIME for absolute time)
-/// * `req` - Pointer to user space timespec with sleep time
-/// * `rem` - Pointer to user space timespec to store remaining time (may be NULL)
-///
-/// Returns 0 on success, or negative errno on error.
-pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 {
+/// clock_nanosleep(clockid, flags, req, rem)
+pub fn sys_clock_nanosleep(
+    clockid: i32,
+    flags: i32,
+    req: UserPtr<LinuxTimespec>,
+    rem: UserPtr<LinuxTimespec>,
+) -> KernelResult<()> {
     // Linux: an unknown clock is EINVAL, one that cannot sleep
     // EOPNOTSUPP (coarse, raw, thread CPU clocks: no nsleep); a process
     // CPU clock sleeps until that process has used the time
     // (posix_cpu_nsleep; the caller's own process here, BUGS.md)
-    let Some(pclock) = PosixClock::decode(clockid) else {
-        return KernelError::InvalidArgument.sysret();
-    };
+    let pclock = PosixClock::decode(clockid).ok_or(KernelError::InvalidArgument)?;
     let base = match pclock.timer_base() {
         Some(b) => b,
         None if matches!(pclock, PosixClock::Cpu { thread: false, .. }) => {
             return cpu_nanosleep(clockid, flags, req, rem);
         }
-        None => return KernelError::OperationNotSupported.sysret(),
+        None => return Err(KernelError::OperationNotSupported),
     };
 
-    // Validate and read request timespec
-    if req == 0 || !Uaccess::access_ok(req, core::mem::size_of::<LinuxTimespec>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    let request: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(req) {
-        Ok(ts) => ts,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate timespec values
-    if request.tv_sec < 0 || request.tv_nsec < 0 || request.tv_nsec >= 1_000_000_000 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    let req_ns = crate::time::timespec_to_ns(request.tv_sec, request.tv_nsec);
+    let req_ns = req.read()?.to_ns()?;
     if flags & TIMER_ABSTIME != 0 {
         // Absolute time on `clockid`, kept on that clock: a realtime
         // sleep follows clock_settime (Linux hrtimer_nanosleep)
@@ -415,80 +347,38 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 
             req_ns
         };
         // Absolute sleeps are restarted unchanged; no remaining time
-        match crate::task::percpu::sleep_until(deadline, base, true) {
-            Ok(()) => 0,
-            Err(_) => KernelError::RestartNoHand.sysret(),
-        }
+        crate::task::percpu::sleep_until(deadline, base, true)
+            .map_err(|_| KernelError::RestartNoHand)
     } else {
         let now = crate::time::monotonic_ns();
         do_nanosleep(crate::time::deadline_after(now, req_ns), rem)
     }
 }
 
-/// sys_clock_getres - get resolution of specified clock
-///
-/// # Arguments
-/// * `clockid` - Clock identifier (CLOCK_REALTIME or CLOCK_MONOTONIC)
-/// * `res` - Pointer to user space timespec structure (may be NULL)
-///
-/// Returns 0 on success, negative errno on error.
-pub fn sys_clock_getres(clockid: i32, res: u64) -> i64 {
-    // Validate clock ID first (even if res is NULL per POSIX); a CPU
-    // clock's task must exist
-    let pclock = match PosixClock::decode(clockid) {
-        Some(c) if c.getres_ok() => c,
-        _ => return KernelError::InvalidArgument.sysret(),
-    };
-
-    // If res is NULL, just return success (validates clock ID only)
-    if res == 0 {
-        return 0;
+/// clock_getres(clockid, res): `res` may be NULL (the clock id is
+/// still checked)
+pub fn sys_clock_getres(clockid: i32, res: UserPtr<LinuxTimespec>) -> KernelResult<()> {
+    // A CPU clock's task must exist
+    let pclock = PosixClock::decode(clockid)
+        .filter(|c| c.getres_ok())
+        .ok_or(KernelError::InvalidArgument)?;
+    if res.is_null() {
+        return Ok(());
     }
-
-    // Validate user buffer address
-    if !Uaccess::access_ok(res, core::mem::size_of::<LinuxTimespec>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    let res_ns = pclock.res_ns();
-    let result = LinuxTimespec {
-        tv_sec: (res_ns / 1_000_000_000) as i64,
-        tv_nsec: (res_ns % 1_000_000_000) as i64,
-    };
-
-    if put_user::<Uaccess, LinuxTimespec>(res, result).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    Ok(res.write(&LinuxTimespec::from_ns(pclock.res_ns()))?)
 }
 
-/// sys_time - get time in seconds since epoch (x86_64 only)
-///
-/// # Arguments
-/// * `tloc` - Pointer to user space time_t (may be NULL)
-///
-/// Returns seconds since epoch on success, negative errno on error.
-///
-/// Note: This is a legacy syscall. aarch64 uses clock_gettime instead.
+/// time(tloc): seconds since the epoch, also stored at `tloc` if
+/// non-NULL (x86-64 only; aarch64 has clock_gettime)
 #[cfg(target_arch = "x86_64")]
-pub fn sys_time(tloc: u64) -> i64 {
-    // Get current real time
-    let ts = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
-    let seconds = ts.sec;
-
-    // If tloc is provided, write time to user space
-    if tloc != 0 {
-        if !Uaccess::access_ok(tloc, core::mem::size_of::<i64>()) {
-            return KernelError::BadAddress.sysret();
-        }
-        if put_user::<Uaccess, i64>(tloc, seconds).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+pub fn sys_time(tloc: UserPtr<i64>) -> KernelResult<i64> {
+    let seconds = TIMEKEEPER
+        .read(ClockId::Realtime, TIMEKEEPER.get_read_cycles())
+        .sec;
+    if !tloc.is_null() {
+        tloc.write(&seconds)?;
     }
-
-    // Return seconds since epoch
-    seconds
+    Ok(seconds)
 }
 
 /// Sleep until the CLOCK_MONOTONIC `deadline`, interruptibly
@@ -497,356 +387,163 @@ pub fn sys_time(tloc: u64) -> i64 {
 /// -ERESTARTNOHAND: -EINTR once a handler runs (Linux returns
 /// -ERESTART_RESTARTBLOCK and restarts with the remaining time when no
 /// handler runs; hk restarts with the original request).
-fn do_nanosleep(deadline: u64, rem: u64) -> i64 {
-    match crate::task::percpu::sleep_until_ns(deadline, true) {
-        Ok(()) => 0,
-        Err(left) => {
-            if rem != 0 {
-                let ts = LinuxTimespec {
-                    tv_sec: (left / 1_000_000_000) as i64,
-                    tv_nsec: (left % 1_000_000_000) as i64,
-                };
-                if put_user::<Uaccess, LinuxTimespec>(rem, ts).is_err() {
-                    return KernelError::BadAddress.sysret();
-                }
-            }
-            KernelError::RestartNoHand.sysret()
-        }
+fn do_nanosleep(deadline: u64, rem: UserPtr<LinuxTimespec>) -> KernelResult<()> {
+    let Err(left) = crate::task::percpu::sleep_until_ns(deadline, true) else {
+        return Ok(());
+    };
+    if !rem.is_null() {
+        rem.write(&LinuxTimespec::from_ns(left))?;
     }
+    Err(KernelError::RestartNoHand)
 }
 
-/// sys_clock_settime - set time for specified clock
-///
-/// # Arguments
-/// * `clockid` - Clock identifier (only CLOCK_REALTIME can be set)
-/// * `tp` - Pointer to user space timespec structure with new time
-///
-/// Returns 0 on success, negative errno on error.
-///
-/// # Errors
-/// - EINVAL: Invalid clock ID (CLOCK_MONOTONIC cannot be set)
-/// - EINVAL: Invalid timespec (tv_nsec out of range)
-/// - EFAULT: Invalid tp pointer
-pub fn sys_clock_settime(clockid: i32, tp: u64) -> i64 {
-    // Only CLOCK_REALTIME can be set (Linux: no clock_set is EINVAL,
-    // before the copy)
+/// clock_settime(clockid, tp): only CLOCK_REALTIME can be set
+pub fn sys_clock_settime(clockid: i32, tp: UserPtr<LinuxTimespec>) -> KernelResult<()> {
+    // Linux: no clock_set is EINVAL, before the copy
     if clockid != CLOCK_REALTIME {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Validate user buffer address
-    if tp == 0 || !Uaccess::access_ok(tp, core::mem::size_of::<LinuxTimespec>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Read timespec from user space
-    let ts: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(tp) {
-        Ok(ts) => ts,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate timespec values
-    if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-        return KernelError::InvalidArgument.sysret();
+    let ts = tp.read()?;
+    if !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return Err(KernelError::InvalidArgument);
     }
     // Linux do_sys_settimeofday64 -> security_settime64 (cap_settime)
     if !crate::task::capable(crate::task::CAP_SYS_TIME) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
-
-    // Convert to Timespec and set
     let new_time = crate::time::Timespec {
         sec: ts.tv_sec,
         nsec: ts.tv_nsec as u32,
     };
+    set_realtime(new_time)
+}
 
-    if TIMEKEEPER.set_realtime(new_time) {
-        0
+/// Set the wall clock; EINVAL before the timekeeper is up
+fn set_realtime(t: crate::time::Timespec) -> KernelResult<()> {
+    if TIMEKEEPER.set_realtime(t) {
+        Ok(())
     } else {
-        // Timekeeper not initialized
-        KernelError::InvalidArgument.sysret()
+        Err(KernelError::InvalidArgument)
     }
 }
 
-/// sys_settimeofday - set wall-clock time (x86_64 only)
-///
-/// # Arguments
-/// * `tv` - Pointer to user space timeval structure (may be NULL)
-/// * `tz` - Pointer to user space timezone structure (may be NULL, deprecated)
-///
-/// Returns 0 on success, negative errno on error.
-///
-/// # Errors
-/// - EINVAL: tv_usec out of range [0, 999999]
-/// - EFAULT: Invalid pointer
-///
-pub fn sys_settimeofday(tv: u64, tz: u64) -> i64 {
-    // If tv is provided, set the time
-    if tv != 0 {
-        // Validate user buffer address
-        if !Uaccess::access_ok(tv, core::mem::size_of::<Timeval>()) {
-            return KernelError::BadAddress.sysret();
+/// settimeofday(tv, tz): either may be NULL; the timezone is ignored
+pub fn sys_settimeofday(tv: UserPtr<Timeval>, tz: UserPtr<Timezone>) -> KernelResult<()> {
+    let new_time = if tv.is_null() {
+        None
+    } else {
+        let timeval = tv.read()?;
+        if !(0..1_000_000).contains(&timeval.tv_usec) {
+            return Err(KernelError::InvalidArgument);
         }
-
-        let timeval: Timeval = match get_user::<Uaccess, Timeval>(tv) {
-            Ok(tv) => tv,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        };
-
-        // Validate timeval values
-        if timeval.tv_usec < 0 || timeval.tv_usec >= 1_000_000 {
-            return KernelError::InvalidArgument.sysret();
-        }
-
-        // Convert timeval to Timespec (us -> ns)
-        let new_time = crate::time::Timespec {
+        Some(crate::time::Timespec {
             sec: timeval.tv_sec,
             nsec: (timeval.tv_usec * 1000) as u32,
-        };
-
-        // Linux copies the timezone, then checks CAP_SYS_TIME
-        // (security_settime64)
-        if tz != 0 && !Uaccess::access_ok(tz, core::mem::size_of::<Timezone>()) {
-            return KernelError::BadAddress.sysret();
-        }
-        if !crate::task::capable(crate::task::CAP_SYS_TIME) {
-            return KernelError::NotPermitted.sysret();
-        }
-        if !TIMEKEEPER.set_realtime(new_time) {
-            return KernelError::InvalidArgument.sysret(); // Timekeeper not initialized
-        }
-        return 0;
+        })
+    };
+    // Linux copies the timezone, then checks CAP_SYS_TIME
+    // (security_settime64), even for a timezone-only (or empty) call
+    if !tz.is_null() && !Uaccess::access_ok(tz.addr(), core::mem::size_of::<Timezone>()) {
+        return Err(KernelError::BadAddress);
     }
-
-    // Timezone is deprecated; we accept but ignore it
-    // Just validate the pointer if provided
-    if tz != 0 && !Uaccess::access_ok(tz, core::mem::size_of::<Timezone>()) {
-        return KernelError::BadAddress.sysret();
-    }
-    // Linux: even a timezone-only (or empty) call needs CAP_SYS_TIME
     if !crate::task::capable(crate::task::CAP_SYS_TIME) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
-
-    0
+    new_time.map_or(Ok(()), set_realtime)
 }
 
 // =============================================================================
 // Timerfd syscalls
 // =============================================================================
 
+use crate::fs::File;
 use crate::io::eventfd::{create_eventfd, efd_flags};
 use crate::io::pipe::FD_CLOEXEC;
-use crate::task::fdtable::get_task_fd;
-use crate::task::percpu::current_tid;
 use crate::time::timerfd::{ITimerSpec, create_timerfd, get_timerfd, tfd_flags, tfd_timer_flags};
 
-/// Get the RLIMIT_NOFILE limit for the current task
-fn get_nofile_limit() -> u64 {
-    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-    if limit == crate::task::rlimit::RLIM_INFINITY {
-        u64::MAX
-    } else {
-        limit
-    }
+/// Install `file` at the caller's lowest free descriptor (Linux
+/// get_unused_fd_flags + fd_install): EMFILE past RLIMIT_NOFILE
+fn install_fd(file: alloc::sync::Arc<File>, cloexec: bool) -> KernelResult<i32> {
+    let flags = if cloexec { FD_CLOEXEC } else { 0 };
+    let nofile = crate::fs::syscall::get_nofile_limit();
+    crate::fs::syscall::current_fd_table()
+        .lock()
+        .alloc_with_flags(file, flags, nofile)
+        .map_err(|e| KernelError::from_errno(e).unwrap_or(KernelError::ProcessFileLimit))
 }
 
-/// sys_timerfd_create - create a timerfd file descriptor
-///
-/// # Arguments
-/// * `clockid` - Clock to use (CLOCK_REALTIME or CLOCK_MONOTONIC)
-/// * `flags` - TFD_CLOEXEC | TFD_NONBLOCK
-///
-/// Returns fd on success, negative errno on error.
-pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
+/// timerfd_create(clockid, flags): the new descriptor
+pub fn sys_timerfd_create(clockid: i32, flags: i32) -> KernelResult<i32> {
     // Linux timerfd_create: realtime, monotonic, boottime and the two
     // alarm clocks (CAP_WAKE_ALARM, else EPERM)
     match clockid {
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME => {}
         CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM => {
             if !crate::task::capable(crate::task::CAP_WAKE_ALARM) {
-                return KernelError::NotPermitted.sysret();
+                return Err(KernelError::NotPermitted);
             }
         }
-        _ => return KernelError::InvalidArgument.sysret(),
+        _ => return Err(KernelError::InvalidArgument),
     }
-
-    // Validate flags (only TFD_CLOEXEC and TFD_NONBLOCK are allowed)
-    let valid_flags = tfd_flags::TFD_CLOEXEC | tfd_flags::TFD_NONBLOCK;
-    if flags & !valid_flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+    if flags & !(tfd_flags::TFD_CLOEXEC | tfd_flags::TFD_NONBLOCK) != 0 {
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Create the timerfd file
-    let Ok(file) = create_timerfd(clockid, flags) else {
-        return KernelError::ProcessFileLimit.sysret();
-    };
-
-    // Get the FD table and allocate a file descriptor
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::ProcessFileLimit.sysret();
-    };
-    let mut table = fd_table.lock();
-    let fd_flags = if flags & tfd_flags::TFD_CLOEXEC != 0 {
-        FD_CLOEXEC
-    } else {
-        0
-    };
-
-    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
-        Ok(fd) => i64::from(fd),
-        Err(e) => -i64::from(e),
-    }
+    let file = create_timerfd(clockid, flags)?;
+    install_fd(file, flags & tfd_flags::TFD_CLOEXEC != 0)
 }
 
-/// sys_timerfd_settime - arm/disarm a timerfd
-///
-/// # Arguments
-/// * `fd` - Timerfd file descriptor
-/// * `flags` - TFD_TIMER_ABSTIME for absolute time
-/// * `new_value` - Pointer to new itimerspec
-/// * `old_value` - Pointer to store old itimerspec (may be NULL)
-///
-/// Returns 0 on success, negative errno on error.
-pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: u64, old_value: u64) -> i64 {
-    // Validate flags
+/// timerfd_settime(fd, flags, new_value, old_value)
+pub fn sys_timerfd_settime(
+    fd: i32,
+    flags: i32,
+    new_value: UserPtr<ITimerSpec>,
+    old_value: UserPtr<ITimerSpec>,
+) -> KernelResult<()> {
     let valid_flags = tfd_timer_flags::TFD_TIMER_ABSTIME | tfd_timer_flags::TFD_TIMER_CANCEL_ON_SET;
     if flags & !valid_flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Validate new_value pointer
-    if new_value == 0 || !Uaccess::access_ok(new_value, core::mem::size_of::<ITimerSpec>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Read new_value from user space
-    let new_spec: ITimerSpec = match get_user::<Uaccess, ITimerSpec>(new_value) {
-        Ok(spec) => spec,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate timespec values (Linux itimerspec64_valid)
+    let new_spec = new_value.read()?;
+    // Linux itimerspec64_valid
     if !new_spec.is_valid() {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Get the file from fd
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::BadFd.sysret();
-    };
-    let Some(file) = fd_table.lock().get(fd) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Get the timerfd from the file
-    let Some(timerfd) = get_timerfd(&file) else {
-        // Not a timerfd
-        return KernelError::BadFd.sysret();
-    };
-
-    // Set the timer and get the old value
+    let file = crate::fs::io::fget(fd)?;
+    let timerfd = get_timerfd(&file).ok_or(KernelError::BadFd)?;
     let old_spec = timerfd.settime(&new_spec, flags);
-
-    // Write old_value if provided
-    if old_value != 0 {
-        if !Uaccess::access_ok(old_value, core::mem::size_of::<ITimerSpec>()) {
-            return KernelError::BadAddress.sysret();
-        }
-        if put_user::<Uaccess, ITimerSpec>(old_value, old_spec).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+    if !old_value.is_null() {
+        old_value.write(&old_spec)?;
     }
-
-    0
+    Ok(())
 }
 
-/// sys_timerfd_gettime - get current timer value
-///
-/// # Arguments
-/// * `fd` - Timerfd file descriptor
-/// * `curr_value` - Pointer to store current itimerspec
-///
-/// Returns 0 on success, negative errno on error.
-pub fn sys_timerfd_gettime(fd: i32, curr_value: u64) -> i64 {
-    // Validate curr_value pointer
-    if curr_value == 0 || !Uaccess::access_ok(curr_value, core::mem::size_of::<ITimerSpec>()) {
-        return KernelError::BadAddress.sysret();
+/// timerfd_gettime(fd, curr_value)
+pub fn sys_timerfd_gettime(fd: i32, curr_value: UserPtr<ITimerSpec>) -> KernelResult<()> {
+    if !user_ok(curr_value) {
+        return Err(KernelError::BadAddress);
     }
-
-    // Get the file from fd
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::BadFd.sysret();
-    };
-    let Some(file) = fd_table.lock().get(fd) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Get the timerfd from the file
-    let Some(timerfd) = get_timerfd(&file) else {
-        // Not a timerfd
-        return KernelError::BadFd.sysret();
-    };
-
-    // Get current timer value
-    let curr_spec = timerfd.gettime();
-
-    // Write to user space
-    if put_user::<Uaccess, ITimerSpec>(curr_value, curr_spec).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    let file = crate::fs::io::fget(fd)?;
+    let timerfd = get_timerfd(&file).ok_or(KernelError::BadFd)?;
+    Ok(curr_value.write(&timerfd.gettime())?)
 }
 
 // ============================================================================
 // eventfd syscalls
 // ============================================================================
 
-/// sys_eventfd2 - create an eventfd file descriptor
-///
-/// # Arguments
-/// * `initval` - Initial value for the counter
-/// * `flags` - EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE
-///
-/// Returns fd on success, negative errno on error.
-pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
-    // Validate flags (only EFD_CLOEXEC, EFD_NONBLOCK, and EFD_SEMAPHORE are allowed)
+/// eventfd2(initval, flags): the new descriptor
+pub fn sys_eventfd2(initval: u32, flags: i32) -> KernelResult<i32> {
     let valid_flags = efd_flags::EFD_CLOEXEC | efd_flags::EFD_NONBLOCK | efd_flags::EFD_SEMAPHORE;
     if flags & !valid_flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Create the eventfd file
-    let Ok(file) = create_eventfd(u64::from(initval), flags) else {
-        return KernelError::ProcessFileLimit.sysret();
-    };
-
-    // Get the FD table and allocate a file descriptor
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::ProcessFileLimit.sysret();
-    };
-    let mut table = fd_table.lock();
-    let fd_flags = if flags & efd_flags::EFD_CLOEXEC != 0 {
-        FD_CLOEXEC
-    } else {
-        0
-    };
-
-    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
-        Ok(fd) => i64::from(fd),
-        Err(e) => -i64::from(e),
-    }
+    let file = create_eventfd(u64::from(initval), flags)?;
+    install_fd(file, flags & efd_flags::EFD_CLOEXEC != 0)
 }
 
-/// sys_eventfd - create an eventfd file descriptor (legacy, x86_64 only)
-///
-/// # Arguments
-/// * `initval` - Initial value for the counter
-///
-/// Returns fd on success, negative errno on error.
+/// eventfd(initval): eventfd2 without flags (x86-64 only)
 #[cfg(target_arch = "x86_64")]
-pub fn sys_eventfd(initval: u32) -> i64 {
+pub fn sys_eventfd(initval: u32) -> KernelResult<i32> {
     sys_eventfd2(initval, 0)
 }
 
@@ -1001,17 +698,8 @@ const STA_RW_MASK: i32 = crate::time::STA_PLL
 /// # Privilege
 /// Reading (modes=0) is always allowed.
 /// Setting values requires CAP_SYS_TIME capability.
-pub fn sys_adjtimex(txc_p: u64) -> i64 {
-    // Validate user buffer
-    if txc_p == 0 || !Uaccess::access_ok(txc_p, core::mem::size_of::<Timex>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Read timex from user space
-    let mut txc: Timex = match get_user::<Uaccess, Timex>(txc_p) {
-        Ok(t) => t,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
+pub fn sys_adjtimex(txc_p: UserPtr<Timex>) -> KernelResult<i32> {
+    let mut txc = txc_p.read()?;
 
     // Check if any modifications are requested
     let is_read_only = txc.modes == 0;
@@ -1025,37 +713,37 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
     let cap = || crate::task::capable(crate::task::CAP_SYS_TIME);
     if txc.modes & ADJ_ADJTIME != 0 {
         if txc.modes & ADJ_OFFSET_SINGLESHOT == 0 {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
         if txc.modes & ADJ_OFFSET_READONLY == 0 && !cap() {
-            return KernelError::NotPermitted.sysret();
+            return Err(KernelError::NotPermitted);
         }
     } else if txc.modes != 0 && !cap() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     if txc.modes & ADJ_SETOFFSET != 0 && !cap() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     if !is_read_only {
         // Validate tick range if being set
         if txc.modes & ADJ_TICK != 0 {
             // Tick must be within 10% of nominal (10000 usec = 10ms for 100Hz)
             if txc.tick < 9000 || txc.tick > 11000 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
         }
 
         // Validate offset if ADJ_SETOFFSET is used
         if txc.modes & ADJ_SETOFFSET != 0 {
             if txc.time.tv_usec < 0 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
             if txc.modes & ADJ_NANO != 0 {
                 if txc.time.tv_usec >= 1_000_000_000 {
-                    return KernelError::InvalidArgument.sysret();
+                    return Err(KernelError::InvalidArgument);
                 }
             } else if txc.time.tv_usec >= 1_000_000 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
         }
     }
@@ -1082,7 +770,7 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
                 .saturating_add(txc.time.tv_usec.saturating_mul(1000))
         };
         if !TIMEKEEPER.inject_offset(offset_ns) {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
     }
 
@@ -1155,16 +843,14 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
 
     // Copy result back to user space
     txc.modes = user_modes;
-    if put_user::<Uaccess, Timex>(txc_p, txc).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
+    txc_p.write(&txc)?;
 
     // Return clock state
-    if status & STA_UNSYNC != 0 {
-        i64::from(TIME_ERROR)
+    Ok(if status & STA_UNSYNC != 0 {
+        TIME_ERROR
     } else {
-        i64::from(TIME_OK)
-    }
+        TIME_OK
+    })
 }
 
 #[cfg(test)]

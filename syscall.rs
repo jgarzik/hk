@@ -290,7 +290,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         .ret() as u64,
         Sys::Acct => crate::task::acct::sys_acct(a[0]).ret() as u64,
         Sys::AddKey => crate::keys::sys_add_key(a[0], a[1], a[2], a[3], a[4] as i32).ret() as u64,
-        Sys::Adjtimex => crate::time::time_syscall::sys_adjtimex(a[0]).ret() as u64,
+        Sys::Adjtimex => crate::time::time_syscall::sys_adjtimex(UserPtr::new(a[0])).ret() as u64,
         Sys::Bind => {
             crate::net::syscall::sys_bind(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
         }
@@ -301,17 +301,23 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Chdir => crate::fs::syscall::sys_chdir(a[0]).ret() as u64,
         Sys::Chroot => crate::fs::syscall::sys_chroot(a[0]).ret() as u64,
         Sys::ClockGetres => {
-            crate::time::time_syscall::sys_clock_getres(a[0] as i32, a[1]).ret() as u64
-        }
-        Sys::ClockGettime => {
-            crate::time::time_syscall::sys_clock_gettime(a[0] as i32, a[1]).ret() as u64
-        }
-        Sys::ClockNanosleep => {
-            crate::time::time_syscall::sys_clock_nanosleep(a[0] as i32, a[1] as i32, a[2], a[3])
+            crate::time::time_syscall::sys_clock_getres(a[0] as i32, UserPtr::new(a[1])).ret()
                 as u64
         }
+        Sys::ClockGettime => {
+            crate::time::time_syscall::sys_clock_gettime(a[0] as i32, UserPtr::new(a[1])).ret()
+                as u64
+        }
+        Sys::ClockNanosleep => crate::time::time_syscall::sys_clock_nanosleep(
+            a[0] as i32,
+            a[1] as i32,
+            UserPtr::new(a[2]),
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
         Sys::ClockSettime => {
-            crate::time::time_syscall::sys_clock_settime(a[0] as i32, a[1]).ret() as u64
+            crate::time::time_syscall::sys_clock_settime(a[0] as i32, UserPtr::new(a[1])).ret()
+                as u64
         }
         Sys::Clone => {
             let (ctid, tls) = if crate::arch::CLONE_BACKWARDS {
@@ -466,7 +472,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Getgroups => {
             crate::task::syscall::sys_getgroups::<Uaccess>(a[0] as i32, a[1]).ret() as u64
         }
-        Sys::Getitimer => crate::time::posix_timer::sys_getitimer(a[0] as i32, a[1]).ret() as u64,
+        Sys::Getitimer => {
+            crate::time::posix_timer::sys_getitimer(a[0] as i32, UserPtr::new(a[1])).ret() as u64
+        }
         Sys::Getpeername => crate::net::syscall::sys_getpeername(
             a[0] as i32,
             UserPtr::new(a[1]),
@@ -527,7 +535,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         )
         .ret() as u64,
         Sys::Gettid => crate::task::syscall::sys_gettid().ret() as u64,
-        Sys::Gettimeofday => crate::time::time_syscall::sys_gettimeofday(a[0], a[1]).ret() as u64,
+        Sys::Gettimeofday => {
+            crate::time::time_syscall::sys_gettimeofday(UserPtr::new(a[0]), UserPtr::new(a[1]))
+                .ret() as u64
+        }
         Sys::Getuid => {
             crate::task::syscall::sys_getuid(crate::task::percpu::current_cred().uid).ret() as u64
         }
@@ -697,7 +708,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Munlock => crate::mm::syscall::sys_munlock(a[0], a[1]).ret() as u64,
         Sys::Munlockall => crate::mm::syscall::sys_munlockall().ret() as u64,
         Sys::Munmap => crate::mm::syscall::sys_munmap(a[0], a[1]).ret() as u64,
-        Sys::Nanosleep => crate::time::time_syscall::sys_nanosleep(a[0], a[1]).ret() as u64,
+        Sys::Nanosleep => {
+            crate::time::time_syscall::sys_nanosleep(UserPtr::new(a[0]), UserPtr::new(a[1])).ret()
+                as u64
+        }
         Sys::Newfstatat => {
             crate::fs::stat::sys_fstatat(a[0] as i32, a[1], a[2], a[3] as i32).ret() as u64
         }
@@ -934,9 +948,12 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::syscall::sys_setgroups::<Uaccess>(a[0] as i32, a[1]).ret() as u64
         }
         Sys::Sethostname => crate::ns::uts::sys_sethostname(a[0], a[1]).ret() as u64,
-        Sys::Setitimer => {
-            crate::time::posix_timer::sys_setitimer(a[0] as i32, a[1], a[2]).ret() as u64
-        }
+        Sys::Setitimer => crate::time::posix_timer::sys_setitimer(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+        )
+        .ret() as u64,
         Sys::Setns => crate::ns::sys_setns(a[0] as i32, a[1] as i32).ret() as u64,
         Sys::Setpgid => crate::task::syscall::sys_setpgid(
             a[0] as i32,
@@ -988,7 +1005,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[4] as i32,
         )
         .ret() as u64,
-        Sys::Settimeofday => crate::time::time_syscall::sys_settimeofday(a[0], a[1]).ret() as u64,
+        Sys::Settimeofday => {
+            crate::time::time_syscall::sys_settimeofday(UserPtr::new(a[0]), UserPtr::new(a[1]))
+                .ret() as u64
+        }
         Sys::Setuid => {
             crate::task::syscall::sys_setuid(a[0] as u32, crate::task::percpu::current_cred())
                 as u64
@@ -1067,26 +1087,37 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::time::time_syscall::sys_timerfd_create(a[0] as i32, a[1] as i32).ret() as u64
         }
         Sys::TimerfdGettime => {
-            crate::time::time_syscall::sys_timerfd_gettime(a[0] as i32, a[1]).ret() as u64
-        }
-        Sys::TimerfdSettime => {
-            crate::time::time_syscall::sys_timerfd_settime(a[0] as i32, a[1] as i32, a[2], a[3])
+            crate::time::time_syscall::sys_timerfd_gettime(a[0] as i32, UserPtr::new(a[1])).ret()
                 as u64
         }
-        Sys::TimerCreate => {
-            crate::time::posix_timer::sys_timer_create(a[0] as i32, a[1], a[2]).ret() as u64
-        }
+        Sys::TimerfdSettime => crate::time::time_syscall::sys_timerfd_settime(
+            a[0] as i32,
+            a[1] as i32,
+            UserPtr::new(a[2]),
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
+        Sys::TimerCreate => crate::time::posix_timer::sys_timer_create(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+        )
+        .ret() as u64,
         Sys::TimerDelete => crate::time::posix_timer::sys_timer_delete(a[0] as i32).ret() as u64,
         Sys::TimerGetoverrun => {
             crate::time::posix_timer::sys_timer_getoverrun(a[0] as i32).ret() as u64
         }
         Sys::TimerGettime => {
-            crate::time::posix_timer::sys_timer_gettime(a[0] as i32, a[1]).ret() as u64
-        }
-        Sys::TimerSettime => {
-            crate::time::posix_timer::sys_timer_settime(a[0] as i32, a[1] as i32, a[2], a[3]).ret()
+            crate::time::posix_timer::sys_timer_gettime(a[0] as i32, UserPtr::new(a[1])).ret()
                 as u64
         }
+        Sys::TimerSettime => crate::time::posix_timer::sys_timer_settime(
+            a[0] as i32,
+            a[1] as i32,
+            UserPtr::new(a[2]),
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
         Sys::Times => crate::task::syscall::sys_times::<Uaccess>(a[0]).ret() as u64,
         Sys::Tkill => {
             crate::signal::syscall::sys_tkill(i64::from(a[0] as i32), a[1] as u32).ret() as u64
