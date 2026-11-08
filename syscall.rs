@@ -343,23 +343,31 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::syscall::sys_dup3(a[0] as i32, a[1] as i32, a[2] as u32).ret() as u64
         }
         Sys::EpollCreate1 => crate::io::epoll::sys_epoll_create1(a[0] as i32).ret() as u64,
-        Sys::EpollCtl => {
-            crate::io::epoll::sys_epoll_ctl(a[0] as i32, a[1] as i32, a[2] as i32, a[3]).ret()
-                as u64
-        }
+        Sys::EpollCtl => crate::io::epoll::sys_epoll_ctl(
+            a[0] as i32,
+            a[1] as i32,
+            a[2] as i32,
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
         Sys::EpollPwait => crate::io::epoll::sys_epoll_pwait(
             a[0] as i32,
-            a[1],
+            UserPtr::new(a[1]),
             a[2] as i32,
             a[3] as i32,
-            a[4],
+            UserPtr::new(a[4]),
             a[5],
         )
         .ret() as u64,
-        Sys::EpollPwait2 => {
-            crate::io::epoll::sys_epoll_pwait2(a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5])
-                as u64
-        }
+        Sys::EpollPwait2 => crate::io::epoll::sys_epoll_pwait2(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as i32,
+            UserPtr::new(a[3]),
+            UserPtr::new(a[4]),
+            a[5],
+        )
+        .ret() as u64,
         Sys::Eventfd2 => {
             crate::time::time_syscall::sys_eventfd2(a[0] as u32, a[1] as i32).ret() as u64
         }
@@ -392,7 +400,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[1] as u32,
             a[2],
             a[3] as i32,
-            a[4],
+            UserPtr::new(a[4]),
         )
         .ret() as u64,
         Sys::Fchdir => crate::fs::syscall::sys_fchdir(a[0] as i32).ret() as u64,
@@ -536,7 +544,8 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::futex::sys_get_robust_list(a[0] as i32, a[1], a[2]).ret() as u64
         }
         Sys::InotifyAddWatch => {
-            crate::io::inotify::sys_inotify_add_watch(a[0] as i32, a[1], a[2] as u32).ret() as u64
+            crate::io::inotify::sys_inotify_add_watch(a[0] as i32, UserPtr::new(a[1]), a[2] as u32)
+                .ret() as u64
         }
         Sys::InotifyInit1 => crate::io::inotify::sys_inotify_init1(a[0] as i32).ret() as u64,
         Sys::InotifyRmWatch => {
@@ -560,10 +569,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         .ret() as u64,
         Sys::IoUringRegister => {
             crate::io::io_uring::sys_io_uring_register(a[0] as u32, a[1] as u32, a[2], a[3] as u32)
-                as u64
+                .ret() as u64
         }
         Sys::IoUringSetup => {
-            crate::io::io_uring::sys_io_uring_setup(a[0] as u32, a[1]).ret() as u64
+            crate::io::io_uring::sys_io_uring_setup(a[0] as u32, UserPtr::new(a[1])).ret() as u64
         }
         Sys::Kcmp => crate::task::kcmp::sys_kcmp(a[0] as i32, a[1] as i32, a[2] as i32, a[3], a[4])
             .ret() as u64,

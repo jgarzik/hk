@@ -46,6 +46,8 @@ use crate::io::fasync::{FasyncList, POLL_IN, fasync_helper, kill_fasync};
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
+use crate::uaccess::UserPtr;
+use crate::util::error::KernelResult;
 use crate::util::pod::IntoBytes;
 
 // =============================================================================
@@ -254,13 +256,13 @@ impl InotifyInner {
 
     /// Change the existing watch on `inode`, if any: its result (EEXIST
     /// for IN_MASK_CREATE; IN_MASK_ADD adds to the mask, else replaces)
-    fn update_watch(&mut self, mask: u32, inode: &Arc<Inode>) -> Option<Result<i32, i32>> {
+    fn update_watch(&mut self, mask: u32, inode: &Arc<Inode>) -> Option<KernelResult<i32>> {
         let (wd, watch) = self
             .watches
             .iter_mut()
             .find(|(_, w)| Arc::ptr_eq(&w.inode, inode))?;
         if mask & IN_MASK_CREATE != 0 {
-            return Some(Err(KernelError::AlreadyExists.to_errno_neg()));
+            return Some(Err(KernelError::AlreadyExists));
         }
         if mask & IN_MASK_ADD != 0 {
             watch.mask |= mask & IN_ALL_EVENTS;
@@ -567,12 +569,9 @@ impl Inotify {
     /// shut down nor the dentry let go of the inode meanwhile: no
     /// removal of its marks can run before the mark is on.
     ///
-    /// Returns the watch descriptor on success, or negative errno on error.
-    pub fn add_watch(self: &Arc<Self>, path: &Path, mask: u32) -> Result<i32, i32> {
-        let inode = path
-            .dentry
-            .get_inode()
-            .ok_or(KernelError::NotFound.to_errno_neg())?;
+    /// Returns the watch descriptor.
+    pub fn add_watch(self: &Arc<Self>, path: &Path, mask: u32) -> KernelResult<i32> {
+        let inode = path.dentry.get_inode().ok_or(KernelError::NotFound)?;
         // One add at a time per group (Linux group->mark_mutex): the wd
         // picked below stays free until inserted, only an add inserts
         let _m = self.mark_mutex.lock();
@@ -581,10 +580,10 @@ impl Inotify {
         }
         // A new watch: charged to the creator first (ENOSPC past
         // max_user_watches), outside the group's lock
-        watch_charge(self.uid).map_err(|e| e.to_errno_neg())?;
+        watch_charge(self.uid)?;
         let undo = |e: KernelError| {
             watch_uncharge(self.uid, 1);
-            Err(e.to_errno_neg())
+            Err(e)
         };
         let Some(wd) = self.inner.lock().alloc_wd() else {
             return undo(KernelError::NoSpace);
@@ -662,8 +661,8 @@ impl Inotify {
 
     /// Remove a watch by descriptor
     ///
-    /// Returns 0 on success, negative errno on error.
-    pub fn rm_watch(&self, wd: i32) -> Result<(), i32> {
+    /// EINVAL if there is no such watch.
+    pub fn rm_watch(&self, wd: i32) -> KernelResult<()> {
         let mut inner = self.inner.lock();
 
         if let Some(gone) = inner.watches.remove(&wd) {
@@ -686,7 +685,7 @@ impl Inotify {
             self.wait_queue.wake_all();
             Ok(())
         } else {
-            Err(KernelError::InvalidArgument.to_errno_neg())
+            Err(KernelError::InvalidArgument)
         }
     }
 
@@ -891,139 +890,69 @@ pub fn generate_cookie() -> u32 {
 // =============================================================================
 
 /// sys_inotify_init() - create inotify instance (legacy, no flags)
-pub fn sys_inotify_init() -> i64 {
+pub fn sys_inotify_init() -> KernelResult<i32> {
     sys_inotify_init1(0)
 }
 
 /// sys_inotify_init1(flags) - create inotify instance
-pub fn sys_inotify_init1(in_flags: i32) -> i64 {
+pub fn sys_inotify_init1(in_flags: i32) -> KernelResult<i32> {
     use crate::io::pipe::FD_CLOEXEC;
-    use crate::task::fdtable::get_task_fd;
-    use crate::task::percpu::current_tid;
 
     // Validate flags
     let valid_flags = in_flags::IN_CLOEXEC | in_flags::IN_NONBLOCK;
     if in_flags & !valid_flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Create inotify file
-    let Ok(file) = create_inotify(in_flags) else {
-        return KernelError::OutOfMemory.sysret();
-    };
-
-    // Allocate fd
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::ProcessFileLimit.sysret();
-    };
-
-    let mut table = fd_table.lock();
+    let file = create_inotify(in_flags)?;
     let fd_flags = if in_flags & in_flags::IN_CLOEXEC != 0 {
         FD_CLOEXEC
     } else {
         0
     };
+    crate::fs::io::fd_install(file, fd_flags)
+}
 
-    // Get RLIMIT_NOFILE
-    let nofile_limit = {
-        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-        if limit == crate::task::rlimit::RLIM_INFINITY {
-            u64::MAX
-        } else {
-            limit
-        }
-    };
-
-    match table.alloc_with_flags(file, fd_flags, nofile_limit) {
-        Ok(fd) => i64::from(fd),
-        Err(e) => -i64::from(e),
-    }
+/// The inotify instance open at `fd`: EBADF, or EINVAL for another file
+fn inotify_of(fd: i32) -> KernelResult<Arc<Inotify>> {
+    let file = crate::fs::io::fget(fd)?;
+    get_inotify(&file).ok_or(KernelError::InvalidArgument)
 }
 
 /// sys_inotify_add_watch(fd, pathname, mask) - add watch to inotify instance
-pub fn sys_inotify_add_watch(fd: i32, pathname_ptr: u64, mask: u32) -> i64 {
-    use crate::task::fdtable::get_task_fd;
-    use crate::task::percpu::current_tid;
-
+pub fn sys_inotify_add_watch(fd: i32, pathname_ptr: UserPtr<u8>, mask: u32) -> KernelResult<i32> {
     // Validate mask
     if mask == 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // IN_MASK_ADD and IN_MASK_CREATE are mutually exclusive
     if (mask & IN_MASK_ADD) != 0 && (mask & IN_MASK_CREATE) != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Get fd table
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Get file
-    let Some(file) = fd_table.lock().get(fd) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Verify it's an inotify fd
-    let Some(inotify) = get_inotify(&file) else {
-        return KernelError::InvalidArgument.sysret();
-    };
-
-    // Copy pathname from user
-    let pathname = match crate::fs::namei::getname(pathname_ptr, false) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
+    let inotify = inotify_of(fd)?;
+    let pathname = crate::fs::namei::getname(pathname_ptr.addr(), false)?;
 
     // Resolve the path, held until the watch is on
-    let path = match resolve_path(&pathname, mask) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+    let path = resolve_path(&pathname, mask)?;
 
     // Check IN_ONLYDIR
     if (mask & IN_ONLYDIR) != 0 && !path.dentry.get_inode().is_some_and(|i| i.mode().is_dir()) {
-        return KernelError::NotDirectory.sysret();
+        return Err(KernelError::NotDirectory);
     }
 
-    // Add watch
-    match inotify.add_watch(&path, mask) {
-        Ok(wd) => i64::from(wd),
-        Err(e) => i64::from(e),
-    }
+    inotify.add_watch(&path, mask)
 }
 
 /// sys_inotify_rm_watch(fd, wd) - remove watch from inotify instance
-pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
-    use crate::task::fdtable::get_task_fd;
-    use crate::task::percpu::current_tid;
-
-    // Get fd table
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Get file
-    let Some(file) = fd_table.lock().get(fd) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Verify it's an inotify fd
-    let Some(inotify) = get_inotify(&file) else {
-        return KernelError::InvalidArgument.sysret();
-    };
-
-    // Remove watch
-    match inotify.rm_watch(wd) {
-        Ok(()) => 0,
-        Err(e) => i64::from(e),
-    }
+pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> KernelResult<()> {
+    inotify_of(fd)?.rm_watch(wd)
 }
 
 /// The path a watch on `pathname` goes on (Linux inotify_find_inode):
-/// its inode must be readable; or a negative errno
-fn resolve_path(pathname: &[u8], mask: u32) -> Result<Path, i64> {
+/// its inode must be readable
+fn resolve_path(pathname: &[u8], mask: u32) -> KernelResult<Path> {
     use crate::fs::LookupFlags;
 
     // Set up lookup flags
@@ -1033,15 +962,14 @@ fn resolve_path(pathname: &[u8], mask: u32) -> Result<Path, i64> {
     }
 
     // Any lookup error as is (Linux user_path_at)
-    let path =
-        crate::fs::namei::path_lookupat(crate::task::percpu::current_cwd(), pathname, lookup_flags)
-            .map_err(|e| e.sysret())?;
-    let inode = path
-        .dentry
-        .get_inode()
-        .ok_or(KernelError::NotFound.sysret())?;
+    let path = crate::fs::namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        pathname,
+        lookup_flags,
+    )?;
+    let inode = path.dentry.get_inode().ok_or(KernelError::NotFound)?;
 
     // inotify_find_inode: the watched inode must be readable
-    crate::fs::dac::permission(&inode, crate::fs::MAY_READ).map_err(|e| e.sysret())?;
+    crate::fs::dac::permission(&inode, crate::fs::MAY_READ)?;
     Ok(path)
 }

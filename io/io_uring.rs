@@ -54,8 +54,8 @@ use crate::mm::PAGE_SIZE;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::uaccess::{UserPtr, copy_from_user, copy_val_from_user, get_user, put_user};
-use crate::util::error::SysRet;
+use crate::uaccess::{UserPtr, copy_from_user, copy_val_from_user};
+use crate::util::error::{KernelResult, SysRet};
 
 // ============================================================================
 // io_uring constants
@@ -449,7 +449,7 @@ impl IoUring {
     }
 
     /// Submit operations from the SQ ring
-    pub fn submit(&self, nr: u32) -> i64 {
+    pub fn submit(&self, nr: u32) -> u32 {
         let mut inner = self.inner.lock();
         let mut submitted = 0u32;
         let mut link_failed = false;
@@ -538,7 +538,7 @@ impl IoUring {
             self.wq.wake_poll(u32::from(crate::io::poll::POLLIN));
         }
 
-        i64::from(submitted)
+        submitted
     }
 
     /// Process a single SQE
@@ -787,7 +787,7 @@ impl IoUring {
     }
 
     /// Wait for completions
-    pub fn wait_completions(&self, min_complete: u32, _timeout_ms: i32) -> i64 {
+    pub fn wait_completions(&self, min_complete: u32, _timeout_ms: i32) -> u32 {
         let inner = self.inner.lock();
 
         // For now, just return the number of CQEs available
@@ -795,11 +795,11 @@ impl IoUring {
         let available = inner.cq_tail; // Simplified - should compare with user's CQ head
 
         if available >= min_complete {
-            return i64::from(available);
+            return available;
         }
 
         // TODO: Implement proper blocking wait
-        i64::from(available)
+        available
     }
 
     /// Get mmap size for the given offset
@@ -816,22 +816,17 @@ impl IoUring {
     // =========================================================================
 
     /// Register files for fixed file access
-    pub fn register_files(&self, fds: &[i32]) -> i64 {
+    pub fn register_files(&self, fds: &[i32]) -> KernelResult<()> {
         // Reserve the table before any lock, so the allocation never
         // runs under the inner IrqSpinlock (IRQs off)
-        let mut files = match crate::util::kmem::KVec::try_with_capacity(fds.len()) {
-            Ok(v) => v,
-            Err(e) => return e.sysret(),
-        };
-        let Some(fd_table) = get_task_fd(current_tid()) else {
-            return KernelError::BadFd.sysret();
-        };
+        let mut files = crate::util::kmem::KVec::try_with_capacity(fds.len())?;
+        let fd_table = get_task_fd(current_tid()).ok_or(KernelError::BadFd)?;
 
         let mut inner = self.inner.lock();
 
         // Can't register if already registered
         if inner.registered_files.is_some() {
-            return KernelError::Busy.sysret();
+            return Err(KernelError::Busy);
         }
 
         let fd_table_locked = fd_table.lock();
@@ -839,10 +834,7 @@ impl IoUring {
             let slot = if fd == -1 {
                 None
             } else {
-                match fd_table_locked.get(fd) {
-                    Some(f) => Some(f),
-                    None => return KernelError::BadFd.sysret(),
-                }
+                Some(fd_table_locked.get(fd).ok_or(KernelError::BadFd)?)
             };
             // Capacity is reserved; this cannot fail
             let _ = files.try_push(slot);
@@ -850,38 +842,37 @@ impl IoUring {
         let files = files.into_vec();
 
         inner.registered_files = Some(files);
-        0
+        Ok(())
     }
 
     /// Unregister previously registered files
-    pub fn unregister_files(&self) -> i64 {
+    pub fn unregister_files(&self) -> KernelResult<()> {
         let mut inner = self.inner.lock();
 
         if inner.registered_files.is_none() {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
 
         inner.registered_files = None;
-        0
+        Ok(())
     }
 
     /// Update registered files
-    pub fn update_files(&self, offset: u32, fds: &[i32]) -> i64 {
+    pub fn update_files(&self, offset: u32, fds: &[i32]) -> KernelResult<usize> {
         let mut inner = self.inner.lock();
 
-        let Some(registered) = inner.registered_files.as_mut() else {
-            return KernelError::InvalidArgument.sysret();
-        };
+        let registered = inner
+            .registered_files
+            .as_mut()
+            .ok_or(KernelError::InvalidArgument)?;
 
         let offset = offset as usize;
         if offset + fds.len() > registered.len() {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
 
         // Resolve fds to File references
-        let Some(fd_table) = get_task_fd(current_tid()) else {
-            return KernelError::BadFd.sysret();
-        };
+        let fd_table = get_task_fd(current_tid()).ok_or(KernelError::BadFd)?;
 
         let fd_table_locked = fd_table.lock();
 
@@ -889,14 +880,11 @@ impl IoUring {
             if fd == -1 {
                 registered[offset + i] = None;
             } else {
-                match fd_table_locked.get(fd) {
-                    Some(f) => registered[offset + i] = Some(f),
-                    None => return KernelError::BadFd.sysret(),
-                }
+                registered[offset + i] = Some(fd_table_locked.get(fd).ok_or(KernelError::BadFd)?);
             }
         }
 
-        fds.len() as i64
+        Ok(fds.len())
     }
 
     /// Get a registered file by fixed file index
@@ -1257,7 +1245,7 @@ fn rw_one(file: &File, segs: &[IoVec], offset: u64, write: bool) -> i32 {
     };
     match r {
         Ok(n) => n as i32,
-        Err(e) => fs_error_to_errno(e) as i32,
+        Err(e) => e.to_errno_neg(),
     }
 }
 
@@ -1273,34 +1261,18 @@ fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
     let mut fds = crate::util::kmem::try_vec(n, 0i32)?;
     // SAFETY: byte view of the `n` initialized i32 elements of `fds`
     let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr().cast::<u8>(), n * 4) };
-    copy_from_user::<Uaccess>(bytes, arg, n * 4).map_err(|_| KernelError::BadAddress)?;
+    copy_from_user::<Uaccess>(bytes, arg, n * 4)?;
     Ok(fds)
 }
 
 /// Get file from fd for current task
 fn get_file_from_fd(fd: i32) -> Option<Arc<File>> {
-    let fd_table = get_task_fd(current_tid())?;
-    fd_table.lock().get(fd)
-}
-
-/// Convert KernelError to negative errno value
-fn fs_error_to_errno(e: KernelError) -> i64 {
-    e.sysret()
+    crate::fs::io::fget(fd).ok()
 }
 
 // ============================================================================
 // Syscall implementations
 // ============================================================================
-
-/// Get RLIMIT_NOFILE for fd allocation
-fn get_nofile_limit() -> u64 {
-    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-    if limit == crate::task::rlimit::RLIM_INFINITY {
-        u64::MAX
-    } else {
-        limit
-    }
-}
 
 /// sys_io_uring_setup - Set up an io_uring instance
 ///
@@ -1310,40 +1282,37 @@ fn get_nofile_limit() -> u64 {
 ///
 /// # Returns
 /// File descriptor on success, negative errno on failure
-pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
+pub fn sys_io_uring_setup(entries: u32, params_ptr: UserPtr<IoUringParams>) -> KernelResult<i32> {
     // Validate entries (oversize is checked below, CLAMP may allow it)
     if entries == 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    if params_ptr == 0 {
-        return KernelError::BadAddress.sysret();
+    if params_ptr.is_null() {
+        return Err(KernelError::BadAddress);
     }
 
     // Read params from user space
-    let mut params: IoUringParams = match get_user::<Uaccess, IoUringParams>(params_ptr) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
+    let mut params = params_ptr.read()?;
 
     // Check reserved fields are zero
     for r in &params.resv {
         if *r != 0 {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
     }
 
     // Validate flags - we only support a subset for now
     let supported_flags = IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP;
     if params.flags & !supported_flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Sizes round up to a power of 2; oversize is EINVAL unless CLAMP
     // (Linux io_uring/io_uring.c io_uring_fill_params)
     let clamp = params.flags & IORING_SETUP_CLAMP != 0;
     if entries > IORING_MAX_ENTRIES && !clamp {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     let sq_entries = core::cmp::min(entries, IORING_MAX_ENTRIES).next_power_of_two();
 
@@ -1351,11 +1320,11 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
     let cq_entries = if params.flags & IORING_SETUP_CQSIZE != 0 {
         let cq = params.cq_entries;
         if cq == 0 || (cq > IORING_MAX_ENTRIES * 2 && !clamp) {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
         let cq = core::cmp::min(cq, IORING_MAX_ENTRIES * 2).next_power_of_two();
         if cq < sq_entries {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
         cq
     } else {
@@ -1363,10 +1332,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
     };
 
     // Create io_uring instance
-    let ring = match IoUring::new(sq_entries, cq_entries) {
-        Ok(r) => r,
-        Err(e) => return e.sysret(),
-    };
+    let ring = IoUring::new(sq_entries, cq_entries)?;
 
     // Fill in params
     params.sq_entries = sq_entries;
@@ -1399,32 +1365,17 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
         ..FromBytes::zeroed()
     };
 
-    // Create file
-    let Ok(file) = create_io_uring_file(ring) else {
-        return KernelError::OutOfMemory.sysret();
-    };
-
-    // Allocate fd
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::OutOfMemory.sysret();
-    };
-
-    let fd = match fd_table
-        .lock()
-        .alloc_with_flags(file, FD_CLOEXEC, get_nofile_limit())
-    {
-        Ok(fd) => fd,
-        Err(e) => return -i64::from(e),
-    };
+    let file = create_io_uring_file(ring)?;
+    let fd = crate::fs::io::fd_install(file, FD_CLOEXEC)?;
 
     // Write params back to user space
-    if put_user::<Uaccess, IoUringParams>(params_ptr, params).is_err() {
+    if let Err(e) = params_ptr.write(&params) {
         // Close the fd we just allocated
-        fd_table.lock().close(fd);
-        return KernelError::BadAddress.sysret();
+        crate::fs::syscall::current_fd_table().lock().close(fd);
+        return Err(e.into());
     }
 
-    i64::from(fd)
+    Ok(fd)
 }
 
 /// sys_io_uring_enter - Submit I/O and/or wait for completions
@@ -1446,46 +1397,33 @@ pub fn sys_io_uring_enter(
     flags: u32,
     _argp: u64,
     _argsz: usize,
-) -> i64 {
+) -> KernelResult<u32> {
     // Validate flags
     let supported = IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP | IORING_ENTER_SQ_WAIT;
     if flags & !supported != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
+    let ring = ring_of(fd)?;
 
-    // Get io_uring from fd
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    let Some(file) = fd_table.lock().get(fd as i32) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    let Some(ring) = get_io_uring(&file) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    let mut ret = 0i64;
+    let mut ret = 0;
 
     // Submit SQEs
     if to_submit > 0 {
         ret = ring.submit(to_submit);
-        if ret < 0 {
-            return ret;
-        }
     }
 
     // Wait for completions
     if flags & IORING_ENTER_GETEVENTS != 0 && min_complete > 0 {
-        let wait_ret = ring.wait_completions(min_complete, -1);
-        if wait_ret < 0 {
-            return wait_ret;
-        }
-        ret = wait_ret;
+        ret = ring.wait_completions(min_complete, -1);
     }
 
-    ret
+    Ok(ret)
+}
+
+/// The io_uring open at `fd` (EBADF if it is none)
+fn ring_of(fd: u32) -> KernelResult<Arc<IoUring>> {
+    let file = crate::fs::io::fget(fd as i32)?;
+    get_io_uring(&file).ok_or(KernelError::BadFd)
 }
 
 /// sys_io_uring_register - Register resources with an io_uring instance
@@ -1497,71 +1435,38 @@ pub fn sys_io_uring_enter(
 /// * `nr_args` - Number of arguments
 ///
 /// # Returns
-/// 0 on success, or negative errno
-pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i64 {
-    // Get io_uring from fd
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::BadFd.sysret();
-    };
+/// 0 on success (the number updated for IORING_REGISTER_FILES_UPDATE)
+pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> KernelResult<usize> {
+    let ring = ring_of(fd)?;
 
-    let Some(file) = fd_table.lock().get(fd as i32) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    let Some(ring) = get_io_uring(&file) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Handle register operations
     match opcode {
-        IORING_REGISTER_BUFFERS => {
-            // Buffer registration not yet implemented (requires different data structure)
-            KernelError::OperationNotSupported.sysret()
-        }
-
-        IORING_UNREGISTER_BUFFERS => {
-            // Buffer unregistration not yet implemented
-            KernelError::OperationNotSupported.sysret()
-        }
+        // Buffer and eventfd registration are not implemented yet
+        IORING_REGISTER_BUFFERS
+        | IORING_UNREGISTER_BUFFERS
+        | IORING_REGISTER_EVENTFD
+        | IORING_UNREGISTER_EVENTFD => Err(KernelError::OperationNotSupported),
 
         IORING_REGISTER_FILES => {
             if nr_args == 0 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-
-            // Read fd array from userspace
-            let fds = match read_user_fds(arg, nr_args as usize) {
-                Ok(f) => f,
-                Err(e) => return e.sysret(),
-            };
-
-            ring.register_files(&fds)
+            let fds = read_user_fds(arg, nr_args as usize)?;
+            ring.register_files(&fds).map(|()| 0)
         }
 
-        IORING_UNREGISTER_FILES => ring.unregister_files(),
+        IORING_UNREGISTER_FILES => ring.unregister_files().map(|()| 0),
 
         IORING_REGISTER_FILES_UPDATE => {
             // struct io_uring_files_update { u32 offset; u32 resv; i64 fds; };
             // For simplicity, we expect arg to point to the fds array directly
             // with offset = 0. Full implementation would parse the struct.
             if nr_args == 0 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-
-            // Read fd array from userspace
-            let fds = match read_user_fds(arg, nr_args as usize) {
-                Ok(f) => f,
-                Err(e) => return e.sysret(),
-            };
-
+            let fds = read_user_fds(arg, nr_args as usize)?;
             ring.update_files(0, &fds)
         }
 
-        IORING_REGISTER_EVENTFD | IORING_UNREGISTER_EVENTFD => {
-            // Eventfd registration not yet implemented
-            KernelError::OperationNotSupported.sysret()
-        }
-
-        _ => KernelError::InvalidArgument.sysret(),
+        _ => Err(KernelError::InvalidArgument),
     }
 }

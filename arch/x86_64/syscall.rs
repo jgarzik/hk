@@ -771,7 +771,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_EPOLL_CREATE => crate::io::epoll::sys_epoll_create(args[0] as i32).ret() as u64,
         SYS_EPOLL_WAIT => crate::io::epoll::sys_epoll_wait(
             args[0] as i32,
-            args[1],
+            crate::uaccess::UserPtr::new(args[1]),
             args[2] as i32,
             args[3] as i32,
         )

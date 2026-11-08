@@ -93,7 +93,8 @@ Order: 2 goes per subsystem (M1); let-else is done and linted
   - (b) Drop the `access_ok` pre-checks that come right before
     `put_user`/`copy_*_user`, since those already check: 14 sites, 3 lines each.
 - **Estimate:** about **-750** (let-else already took the `match` shapes).
-- **Done:** mm/, ipc/ (sys_* return `KernelResult`, user pointers typed).
+- **Done:** mm/, ipc/, io/ epoll, inotify, fanotify, io_uring (sys_* return
+  `KernelResult`, user pointers typed).
 - **ABI/correctness notes:**
   - The bits returned to user space don't change. `Ok(v)` is still `v`; `Err(e)` is
     still `-errno`. Negative success values, such as `F_GETOWN` returning `-pgrp`,

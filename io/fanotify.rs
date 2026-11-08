@@ -38,6 +38,8 @@ use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
 use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
+use crate::uaccess::UserPtr;
+use crate::util::error::KernelResult;
 use crate::util::pod::IntoBytes;
 
 // =============================================================================
@@ -321,7 +323,7 @@ impl Fanotify {
     }
 
     /// Add or update a mark
-    pub fn add_mark(&self, mark_flags: u32, mask: u64, target_id: u64) -> Result<(), i32> {
+    pub fn add_mark(&self, mark_flags: u32, mask: u64, target_id: u64) {
         let mut inner = self.inner.lock();
 
         let marks = if (mark_flags & FAN_MARK_FILESYSTEM) != 0 {
@@ -339,12 +341,10 @@ impl Fanotify {
             // Create new mark
             marks.insert(target_id, FanotifyMark::new(mask));
         }
-
-        Ok(())
     }
 
     /// Remove mask bits from a mark
-    pub fn remove_mark(&self, mark_flags: u32, mask: u64, target_id: u64) -> Result<(), i32> {
+    pub fn remove_mark(&self, mark_flags: u32, mask: u64, target_id: u64) {
         let mut inner = self.inner.lock();
 
         let marks = if (mark_flags & FAN_MARK_FILESYSTEM) != 0 {
@@ -361,12 +361,10 @@ impl Fanotify {
                 marks.remove(&target_id);
             }
         }
-
-        Ok(())
     }
 
     /// Flush all marks of a given type
-    pub fn flush_marks(&self, mark_flags: u32) -> Result<(), i32> {
+    pub fn flush_marks(&self, mark_flags: u32) {
         let mut inner = self.inner.lock();
 
         if (mark_flags & FAN_MARK_FILESYSTEM) != 0 {
@@ -376,8 +374,6 @@ impl Fanotify {
         } else {
             inner.inode_marks.clear();
         }
-
-        Ok(())
     }
 
     /// Queue an event
@@ -558,105 +554,69 @@ pub fn get_fanotify(file: &File) -> Option<Arc<Fanotify>> {
 // =============================================================================
 
 /// sys_fanotify_init(flags, event_f_flags) - create fanotify instance
-pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
+pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> KernelResult<i32> {
     use crate::io::pipe::FD_CLOEXEC;
-    use crate::task::fdtable::get_task_fd;
-    use crate::task::percpu::current_tid;
 
     // Validate init_flags
     if init_flags & !FAN_INIT_VALID != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Check for mutually exclusive flags
     if (init_flags & FAN_REPORT_PIDFD) != 0 && (init_flags & FAN_REPORT_TID) != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // FAN_REPORT_NAME requires FAN_REPORT_DIR_FID
     if (init_flags & FAN_REPORT_NAME) != 0 && (init_flags & FAN_REPORT_DIR_FID) == 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // FAN_REPORT_TARGET_FID requires FAN_REPORT_NAME and FAN_REPORT_FID
     if (init_flags & FAN_REPORT_TARGET_FID) != 0
         && ((init_flags & FAN_REPORT_NAME) == 0 || (init_flags & FAN_REPORT_FID) == 0)
     {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Privileged flags check
     let has_privileged_flags =
         (init_flags & !FAN_INIT_VALID_UNPRIVILEGED) != 0 || (init_flags & FAN_CLASS_MASK) != 0;
 
-    if has_privileged_flags {
-        // Check CAP_SYS_ADMIN
-        if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-            return KernelError::NotPermitted.sysret();
-        }
+    if has_privileged_flags && !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        return Err(KernelError::NotPermitted);
     }
 
     // Validate event_f_flags (O_RDONLY, O_WRONLY, O_RDWR, O_LARGEFILE, O_CLOEXEC, O_APPEND)
     let access_mode = event_f_flags & 0o3; // O_ACCMODE
     if access_mode != 0o0 && access_mode != 0o1 && access_mode != 0o2 {
         // O_RDONLY, O_WRONLY, O_RDWR
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Create fanotify file
-    let Ok(file) = create_fanotify(init_flags) else {
-        return KernelError::OutOfMemory.sysret();
-    };
-
-    // Allocate fd
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::ProcessFileLimit.sysret();
-    };
-
-    let mut table = fd_table.lock();
+    let file = create_fanotify(init_flags)?;
     let fd_flags = if init_flags & FAN_CLOEXEC != 0 {
         FD_CLOEXEC
     } else {
         0
     };
-
-    // Get RLIMIT_NOFILE
-    let nofile_limit = {
-        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-        if limit == crate::task::rlimit::RLIM_INFINITY {
-            u64::MAX
-        } else {
-            limit
-        }
-    };
-
-    match table.alloc_with_flags(file, fd_flags, nofile_limit) {
-        Ok(fd) => i64::from(fd),
-        Err(e) => -i64::from(e),
-    }
+    crate::fs::io::fd_install(file, fd_flags)
 }
 
 /// sys_fanotify_mark(fd, flags, mask, dirfd, pathname) - add/remove/flush marks
-pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathname: u64) -> i64 {
+pub fn sys_fanotify_mark(
+    fd: i32,
+    mark_flags: u32,
+    mask: u64,
+    dirfd: i32,
+    pathname: UserPtr<u8>,
+) -> KernelResult<()> {
+    use crate::fs::io::fget;
     use crate::fs::path_ref::Path;
     use crate::fs::{LookupFlags, lookup_path_at};
-    use crate::task::fdtable::get_task_fd;
-    use crate::task::percpu::current_tid;
 
-    // Get fd table
-    let Some(fd_table) = get_task_fd(current_tid()) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Get fanotify file
-    let Some(file) = fd_table.lock().get(fd) else {
-        return KernelError::BadFd.sysret();
-    };
-
-    // Verify it's a fanotify fd
-    let Some(fanotify) = get_fanotify(&file) else {
-        return KernelError::BadFd.sysret();
-    };
+    let file = fget(fd)?;
+    let fanotify = get_fanotify(&file).ok_or(KernelError::BadFd)?;
 
     // Determine operation
     let is_add = (mark_flags & FAN_MARK_ADD) != 0;
@@ -666,134 +626,79 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
     // Exactly one of ADD, REMOVE, FLUSH must be set (or none for flush compatibility)
     let op_count = u32::from(is_add) + u32::from(is_remove) + u32::from(is_flush);
     if op_count > 1 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Handle FLUSH - doesn't need path
-    if is_flush {
-        return match fanotify.flush_marks(mark_flags) {
-            Ok(()) => 0,
-            Err(e) => i64::from(e),
-        };
-    }
-
-    // For ADD and REMOVE, we need a path (unless FAN_MARK_FLUSH only)
-    if op_count == 0 && pathname == 0 {
-        // Treat as flush
-        return match fanotify.flush_marks(mark_flags) {
-            Ok(()) => 0,
-            Err(e) => i64::from(e),
-        };
+    // FLUSH needs no path; neither does no operation without a path
+    if is_flush || (op_count == 0 && pathname.is_null()) {
+        fanotify.flush_marks(mark_flags);
+        return Ok(());
     }
 
     // Validate mask for ADD/REMOVE
     if mask == 0 && is_add {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Check for privileged mark types
     if (mark_flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM)) != 0
         && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
     {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
-    // Resolve path to get target ID
-    let target_id = if pathname != 0 {
-        // Copy pathname from user
-        let pathname_str = match crate::fs::namei::getname(pathname, false) {
-            Ok(p) => p,
-            Err(e) => return e.sysret(),
-        };
+    // pathname required for ADD/REMOVE
+    if pathname.is_null() {
+        return Err(KernelError::InvalidArgument);
+    }
+    let pathname_str = crate::fs::namei::getname(pathname.addr(), false)?;
 
-        // Get starting directory
-        let start: Option<Path> = if pathname_str.starts_with(b"/") {
-            None // Absolute path
-        } else if dirfd == -100 {
-            // AT_FDCWD
-            crate::task::percpu::current_cwd()
-        } else {
-            // Get dentry from dirfd
-            match fd_table.lock().get(dirfd) {
-                Some(f) => f.f_path(),
-                None => return KernelError::BadFd.sysret(),
-            }
-        };
-
-        // Set up lookup flags
-        let mut lookup_flags = LookupFlags::open();
-        if (mark_flags & FAN_MARK_DONT_FOLLOW) != 0 {
-            lookup_flags.follow = false;
-        }
-
-        // Lookup path
-        let dentry = match lookup_path_at(start, &pathname_str, lookup_flags) {
-            Ok(d) => d,
-            // Any lookup error as is (Linux fanotify_find_path)
-            Err(e) => return e.sysret(),
-        };
-
-        // Check ONLYDIR
-        if (mark_flags & FAN_MARK_ONLYDIR) != 0
-            && let Some(inode) = dentry.get_inode()
-            && !inode.mode().is_dir()
-        {
-            return KernelError::NotDirectory.sysret();
-        }
-
-        // fanotify_find_path: the marked object must be readable
-        if let Some(inode) = dentry.get_inode()
-            && let Err(e) = crate::fs::dac::permission(&inode, crate::fs::MAY_READ)
-        {
-            return e.sysret();
-        }
-
-        // Get target ID based on mark type
-        if (mark_flags & FAN_MARK_FILESYSTEM) != 0 {
-            // Use superblock ID (use dev_id from superblock)
-            if let Some(inode) = dentry.get_inode() {
-                if let Some(sb) = inode.sb.upgrade() {
-                    sb.dev_id
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        } else if (mark_flags & FAN_MARK_MOUNT) != 0 {
-            // Use mount ID (simplified: use dev_id from superblock)
-            if let Some(inode) = dentry.get_inode() {
-                if let Some(sb) = inode.sb.upgrade() {
-                    sb.dev_id
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        } else {
-            // Use inode number
-            if let Some(inode) = dentry.get_inode() {
-                inode.ino
-            } else {
-                return KernelError::NotFound.sysret();
-            }
-        }
+    // Get starting directory
+    let start: Option<Path> = if pathname_str.starts_with(b"/") {
+        None // Absolute path
+    } else if dirfd == -100 {
+        // AT_FDCWD
+        crate::task::percpu::current_cwd()
     } else {
-        return KernelError::InvalidArgument.sysret(); // pathname required for ADD/REMOVE
+        fget(dirfd)?.f_path()
     };
 
-    // Perform operation
+    // Set up lookup flags
+    let mut lookup_flags = LookupFlags::open();
+    if (mark_flags & FAN_MARK_DONT_FOLLOW) != 0 {
+        lookup_flags.follow = false;
+    }
+
+    // Any lookup error as is (Linux fanotify_find_path)
+    let dentry = lookup_path_at(start, &pathname_str, lookup_flags)?;
+
+    // Check ONLYDIR
+    if (mark_flags & FAN_MARK_ONLYDIR) != 0
+        && let Some(inode) = dentry.get_inode()
+        && !inode.mode().is_dir()
+    {
+        return Err(KernelError::NotDirectory);
+    }
+
+    // fanotify_find_path: the marked object must be readable
+    if let Some(inode) = dentry.get_inode() {
+        crate::fs::dac::permission(&inode, crate::fs::MAY_READ)?;
+    }
+
+    // Target ID by mark type: the superblock's dev_id for a filesystem
+    // or (simplified) a mount mark, else the inode number
+    let inode = dentry.get_inode();
+    let target_id = if (mark_flags & (FAN_MARK_FILESYSTEM | FAN_MARK_MOUNT)) != 0 {
+        inode.and_then(|i| i.sb.upgrade()).map_or(0, |sb| sb.dev_id)
+    } else {
+        inode.ok_or(KernelError::NotFound)?.ino
+    };
+
     if is_remove {
-        match fanotify.remove_mark(mark_flags, mask, target_id) {
-            Ok(()) => 0,
-            Err(e) => i64::from(e),
-        }
+        fanotify.remove_mark(mark_flags, mask, target_id);
     } else {
         // ADD (default if no op specified and pathname given)
-        match fanotify.add_mark(mark_flags, mask, target_id) {
-            Ok(()) => 0,
-            Err(e) => i64::from(e),
-        }
+        fanotify.add_mark(mark_flags, mask, target_id);
     }
+    Ok(())
 }
