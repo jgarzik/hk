@@ -968,8 +968,9 @@ fn lookup_pid_fdinfo_entry(
 
 /// /proc/<pid>/fdinfo/<n> (Linux seq_show): position, open flags
 /// (O_CLOEXEC added for a close-on-exec descriptor) in octal with a
-/// leading 0, the mount id, the inode number; then the file's own lines
-fn gen_fdinfo_content(t: &TaskRef, fd: i32) -> Vec<u8> {
+/// leading 0, the mount id, the inode number; then the file's own lines,
+/// a pidfd's pids numbered in the mount's pid namespace `ns`
+fn gen_fdinfo_content(t: &TaskRef, fd: i32, ns: &PidNamespace) -> Vec<u8> {
     use alloc::fmt::Write;
     let Some(table) = task_files(t) else {
         return Vec::new();
@@ -996,9 +997,7 @@ fn gen_fdinfo_content(t: &TaskRef, fd: i32) -> Vec<u8> {
         mnt_id,
         ino
     );
-    if let Some(target) = crate::task::pidfd::get_pidfd_pid(&file) {
-        let _ = writeln!(out, "Pid:\t{}", target);
-    }
+    crate::task::pidfd::show_fdinfo(&file, ns, &mut out);
     out.into_bytes()
 }
 
@@ -1462,7 +1461,7 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
         Gen::Pid(p, g) => return pid_content(Some(file), &task(&p)?, g),
         Gen::File(generator) => generator(),
         Gen::Ns(p, ns_type) => gen_namespace_content(&task(&p)?, ns_type),
-        Gen::Fdinfo(p, fd) => gen_fdinfo_content(&task(&p)?, fd),
+        Gen::Fdinfo(p, fd) => gen_fdinfo_content(&task(&p)?, fd, &opts::pid_ns(&inode)),
         Gen::Sysctl(ctl) => crate::sysctl::read(ctl),
         Gen::FailNth(p) => {
             let n = task(&p)?

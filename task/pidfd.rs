@@ -152,6 +152,35 @@ pub fn get_pidfd_pid(file: &File) -> Option<Pid> {
     get_pidfd(file).map(|pidfd| pidfd.pid())
 }
 
+/// A pidfd's fdinfo lines as a procfs of pid namespace `ns` shows them
+/// (Linux pidfd_show_fdinfo): `Pid:` its number there (0 if not visible
+/// there, -1 once it names no task), `NSpid:` the same, then, if it is
+/// visible, its numbers in each namespace below. False for another file.
+pub fn show_fdinfo(
+    file: &File,
+    ns: &crate::ns::PidNamespace,
+    out: &mut alloc::string::String,
+) -> bool {
+    use core::fmt::Write;
+    let Some(pidfd) = get_pidfd(file) else {
+        return false;
+    };
+    let pid = &pidfd.pid;
+    let nr = if pid.task().is_null() {
+        -1
+    } else {
+        i64::from(pid.nr_ns(ns))
+    };
+    let _ = write!(out, "Pid:\t{nr}\nNSpid:\t{nr}");
+    if nr > 0 {
+        for u in pid.numbers().iter().skip(ns.level as usize + 1) {
+            let _ = write!(out, "\t{}", u.nr);
+        }
+    }
+    out.push('\n');
+    true
+}
+
 /// The tid of a pidfd's process (Linux pidfd_get_task): from its struct
 /// pid under TASKLIST, never by number, so a reused number never
 /// reaches another process; EBADF for another file, ESRCH once gone

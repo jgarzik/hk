@@ -1,5 +1,6 @@
 //! Pid numbers in procfs (Linux fs/proc/root.c, base.c, array.c: a
-//! procfs belongs to the pid namespace of whoever mounted it)
+//! procfs belongs to the pid namespace of whoever mounted it) and in a
+//! pidfd's fdinfo (fs/pidfs.c)
 //!
 //! As in `pidns`, each test runs in a forked process X whose child Y
 //! is pid 1 of a new namespace, here with a new mount namespace too and
@@ -12,14 +13,16 @@
 //!   NSpgid X then 0 (X's group is outside); through MP one number,
 //!   PPid 0 for Y, 1 for its child;
 //! - PIDNS_PROC_STAT: MP/1/stat names pid 1, ppid, pgrp and session 0;
-//!   MP/2/stat ppid 1; /proc/self/stat Y's outer pid, ppid and pgrp X.
+//!   MP/2/stat ppid 1; /proc/self/stat Y's outer pid, ppid and pgrp X;
+//! - PIDNS_PIDFD_FDINFO: a pidfd's fdinfo gives Pid: and NSpid: from
+//!   the reading procfs's namespace down (outer: two numbers; MP: 1).
 
 use super::pidns::{child, first_fail, outer, status};
 use crate::helpers::{msleep, println, read_file};
 use hk_syscall::{
     CLONE_NEWNS, CLONE_NEWPID, O_DIRECTORY, O_RDONLY, SIGKILL, sys_clone, sys_close, sys_exit,
-    sys_getdents64, sys_getpid, sys_kill, sys_mkdir, sys_mount, sys_open, sys_readlink, sys_rmdir,
-    sys_setsid, sys_umount2,
+    sys_getdents64, sys_getpid, sys_kill, sys_mkdir, sys_mount, sys_open, sys_pidfd_open,
+    sys_readlink, sys_rmdir, sys_setsid, sys_umount2,
 };
 
 const SIGCHLD: u64 = 17;
@@ -36,6 +39,7 @@ pub fn run_tests() {
     outer(b"PIDNS_PROC_MOUNT", || in_ns(proc_mount));
     outer(b"PIDNS_PROC_STATUS_NSPID", || in_ns(status_nspid));
     outer(b"PIDNS_PROC_STAT", || in_ns(stat));
+    outer(b"PIDNS_PIDFD_FDINFO", || in_ns(pidfd_fdinfo));
     sys_rmdir(MP.as_ptr());
 }
 
@@ -285,4 +289,46 @@ fn stat(_z: i64) -> i32 {
         kid[0] == 2 && kid[1] == 1,
         outer[0] > 1 && outer[1] == x_pid() && outer[2] == x_pid(),
     ])
+}
+
+fn pidfd_fdinfo(_z: i64) -> i32 {
+    let fd = sys_pidfd_open(1, 0);
+    if fd < 0 {
+        return 20;
+    }
+    // "/self/fdinfo/<fd>"
+    let mut rest = [0u8; 32];
+    let pre = b"/self/fdinfo/";
+    rest[..pre.len()].copy_from_slice(pre);
+    let mut k = pre.len();
+    let mut d = [0u8; 4];
+    let (mut v, mut m) = (fd as u32, 0);
+    loop {
+        d[m] = b'0' + (v % 10) as u8;
+        m += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..m {
+        rest[k] = d[m - 1 - i];
+        k += 1;
+    }
+    let mut outer = [0u8; 40];
+    outer[..5].copy_from_slice(b"/proc");
+    outer[5..5 + k].copy_from_slice(&rest[..k]);
+    let mut b = [0u8; 1024];
+    let n = read(&outer[..6 + k], &mut b);
+    let o = &b[..n];
+    let (pid, _) = nums(line(o, b"Pid:"));
+    let (nspid, nn) = nums(line(o, b"NSpid:"));
+    let outer_ok = pid[0] > 1 && nn == 2 && nspid[0] == pid[0] && nspid[1] == 1;
+    let mut c = [0u8; 1024];
+    let n = read_mp(&rest[..k + 1], &mut c);
+    let i = &c[..n];
+    let inner_ok = nums(line(i, b"Pid:")) == ([1, -1, -1, -1], 1)
+        && nums(line(i, b"NSpid:")) == ([1, -1, -1, -1], 1);
+    sys_close(fd as u64);
+    first_fail(&[outer_ok, inner_ok])
 }
