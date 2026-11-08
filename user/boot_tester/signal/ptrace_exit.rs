@@ -13,6 +13,9 @@
 //!   real parent gets SIGCHLD and reaps it
 //! - PTRACE_EXITKILL: a tracee seized with PTRACE_O_EXITKILL dies of
 //!   SIGKILL when its tracer exits (Linux exit_ptrace)
+//! - PTRACE_EXIT_IGNORED_ZOMBIE: a tracer ignoring SIGCHLD that exits
+//!   with its own traced child a zombie releases it (exit_ptrace runs
+//!   before the children are handed on); the subreaper never sees it
 
 use crate::harness::verdict;
 use crate::helpers::{read_file, sleep_ms};
@@ -34,6 +37,7 @@ pub fn run_tests() {
     test_zombie_reap();
     test_real_parent_notify();
     in_child(b"PTRACE_EXITKILL", exitkill);
+    in_child(b"PTRACE_EXIT_IGNORED_ZOMBIE", exit_ignored_zombie);
 }
 
 /// PTRACE_EXITKILL: a middle process seizes its sleeping child with
@@ -440,5 +444,43 @@ fn tracer(c: i64, exits: bool, cmd: [i32; 2], up: [i32; 2]) -> i32 {
     match reap_within(c, 0) {
         (r, st) if r == c && st == 7 << 8 => 0,
         _ => 2,
+    }
+}
+
+/// PTRACE_EXIT_IGNORED_ZOMBIE: a tracer that ignores SIGCHLD exits
+/// leaving its own child, a traced zombie, unreaped. Linux
+/// forget_original_parent runs exit_ptrace first, while the child's
+/// real parent is still the tracer, so __ptrace_detach releases it
+/// (ignoring_children); the subreaper above never sees it (ECHILD once
+/// the tracer is reaped)
+fn exit_ignored_zombie() -> i32 {
+    use hk_syscall::{P_PID, WEXITED, sys_rt_sigaction, sys_waitid};
+    const WNOWAIT: i32 = 0x0100_0000;
+    const PTRACE_TRACEME: i64 = 0;
+    const SIG_IGN: u64 = 1;
+    const ECHILD: i64 = -10;
+    sys_prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    let tracer = sys_fork();
+    if tracer == 0 {
+        let ign: [u64; 4] = [SIG_IGN, 0, 0, 0];
+        sys_rt_sigaction(SIGCHLD, ign.as_ptr() as u64, 0, 8);
+        let child = sys_fork();
+        if child == 0 {
+            sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+            sys_exit(0);
+        }
+        // Its zombie, left in place (a tracee's exit is not autoreaped)
+        // SAFETY: SigInfo is plain integers
+        let mut info: SigInfo = unsafe { core::mem::zeroed() };
+        let r = sys_waitid(P_PID, child as u64, &mut info, WEXITED | WNOWAIT, 0);
+        sys_exit(if r == 0 { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    if sys_wait4(tracer, &mut st, 0, 0) != tracer || st != 0 {
+        return 2;
+    }
+    match sys_wait4(-1, &mut st, 0, 0) {
+        ECHILD => 0,
+        _ => 3,
     }
 }

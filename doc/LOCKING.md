@@ -931,7 +931,8 @@ numbers, so a recycled tid cannot inherit a parent or tracer link. A
 group leader is on its real parent's `children` (intrusive `ArcList`,
 link `Task.sibling`, one strong reference each; Linux only lists
 leaders); `link_child` at fork and exec's leader change, unlinked at
-reap. An exiting task first hands its children to another live thread
+reap. An exiting task first detaches its tracees (exit_ptrace), then
+hands its children to another live thread
 of its group, else a live thread of the nearest ancestor process in
 its pid namespace that is a child subreaper
 (`SignalStruct.subreaper`), else its namespace's reaper

@@ -2795,11 +2795,15 @@ pub fn current_exiting() -> bool {
 /// Hand the current task's children to a new parent before it dies
 /// (Linux forget_original_parent): another live thread of its group,
 /// else a live thread of the nearest PR_SET_CHILD_SUBREAPER ancestor
-/// process in its pid namespace, else that namespace's init. A dying
-/// namespace init first kills and reaps the rest of its namespace
-/// (find_child_reaper).
+/// process in its pid namespace, else that namespace's init. Its
+/// tracees are detached first (exit_ptrace), while it is still the
+/// real parent of those that are its children: a zombie one is then
+/// released or told to it as Linux __ptrace_detach does, before any
+/// is handed on. A dying namespace init then kills and reaps the rest
+/// of its namespace (find_child_reaper).
 #[inline(never)]
 fn forget_original_parent() {
+    crate::task::ptrace::exit_ptrace();
     let me = task_ref(&current());
     crate::task::pidns::find_child_reaper(&me);
     // Room for every child first: nothing allocates under TASKLIST
@@ -3316,9 +3320,6 @@ pub fn exit_current(status: Option<i32>) -> ! {
             crate::time::posix_timer::exit_itimers(&sig);
         }
 
-        // Clean up signal state for exiting task
-        crate::signal::exit_task_signal(tid);
-
         // Clean up robust futex list for exiting task
         crate::task::futex::exit_robust_list(tid);
 
@@ -3342,7 +3343,11 @@ pub fn exit_current(status: Option<i32>) -> ! {
     };
     if tid != 0 {
         forget_original_parent();
-        crate::task::ptrace::exit_ptrace();
+        // Its signal state goes once its tracees and children are dealt
+        // with: whether the process ignores SIGCHLD decides the fate of
+        // a zombie tracee of its own (Linux keeps sighand until
+        // __exit_signal, in release_task)
+        crate::signal::exit_task_signal(tid);
         // Out of its cgroup while still running, before it is a zombie
         // a waiting parent may reap at once (Linux do_exit: cgroup_exit
         // before exit_notify); TASKLIST is not held
