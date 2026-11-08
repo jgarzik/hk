@@ -289,6 +289,7 @@ pub fn run_all_tests() {
     isolated(b"LAYOUT", mm::layout::run_tests);
     isolated(b"STARTUP", process::startup::run_tests);
     isolated(b"ELF_EXEC", exec::elf_exec::run_tests);
+    isolated(b"EXEC_ARGS", exec::exec_args::run_tests);
     isolated(b"EXEC_IDENTITY", exec::exec_identity::run_tests);
     isolated(b"EXEC_RACE", exec::exec_race::run_tests);
     isolated(b"PROCFS_ACCESS", proc::procfs_access::run_tests);

@@ -29,8 +29,23 @@ const USER_STACK_PAGES: usize = 256;
 /// Maximum number of pages for user stack (8MB, matching default RLIMIT_STACK)
 const MAX_STACK_PAGES: usize = 2048;
 
-/// Maximum combined size of argv + envp (128KB like Linux's MAX_ARG_STRLEN * MAX_ARG_STRINGS)
-const MAX_ARG_PAGES: usize = 32;
+/// Room for argument and environment strings whatever RLIMIT_STACK
+/// (Linux ARG_MAX: 32 pages)
+const ARG_MAX: usize = 32 * PAGE_SIZE as usize;
+
+/// Longest argument or environment string, NUL included (Linux
+/// MAX_ARG_STRLEN: 32 pages)
+const MAX_ARG_STRLEN: usize = 32 * PAGE_SIZE as usize;
+
+/// Most argument or environment strings (Linux MAX_ARG_STRINGS)
+const MAX_ARG_STRINGS: usize = 0x7FFF_FFFF;
+
+/// The stack limit the strings may take at most 3/4 of (Linux _STK_LIM)
+const STK_LIM: u64 = 8 << 20;
+
+/// Stack room above the arguments in the initial stack VMA (Linux
+/// setup_arg_pages: stack_expand)
+const STACK_EXPAND_PAGES: usize = 32;
 
 /// Error codes for execve
 pub const ENOENT: i32 = 2; // No such file or directory
@@ -45,9 +60,6 @@ pub const EINVAL: i32 = 22; // Invalid argument
 pub const ELOOP: i32 = 40; // Too many levels of symbolic links
 pub const ELIBBAD: i32 = 80; // Accessing a corrupted shared library
 
-/// Maximum path length (matching Linux PATH_MAX)
-const PATH_MAX: usize = 4096;
-
 /// Copy a null-terminated string from user space (through uaccess, so
 /// SMAP/PAN stay enforced and a bad pointer is EFAULT, not a kernel fault)
 fn copy_string_from_user(ptr: u64, max_len: usize) -> Result<Vec<u8>, i32> {
@@ -58,34 +70,88 @@ fn copy_string_from_user(ptr: u64, max_len: usize) -> Result<Vec<u8>, i32> {
     })
 }
 
-/// Copy a null-terminated array of string pointers from user space
-///
-/// Returns a Vec of strings, or an error.
-fn copy_string_array_from_user(
-    argv_ptr: u64,
-    max_strings: usize,
-    budget: &mut usize,
-) -> Result<Vec<Vec<u8>>, i32> {
-    if argv_ptr == 0 {
-        return Ok(Vec::new());
-    }
+/// Argument or environment strings, without their NULs
+type Strings = Vec<Vec<u8>>;
 
-    let mut result = Vec::new();
-    for i in 0..max_strings as u64 {
-        let slot = argv_ptr.checked_add(i * 8).ok_or(EFAULT)?;
-        let str_ptr =
-            crate::uaccess::get_user::<crate::arch::Uaccess, u64>(slot).map_err(|_| EFAULT)?;
-        if str_ptr == 0 {
-            break;
+/// The user pointer `i` of a NULL-terminated array (Linux
+/// get_user_arg_ptr): EFAULT
+fn arg_ptr(argv: u64, i: usize) -> Result<u64, i32> {
+    crate::uaccess::UserPtr::<u64>::new(argv)
+        .offset(i)
+        .ok_or(EFAULT)?
+        .read()
+        .map_err(|_| EFAULT)
+}
+
+/// The strings in a NULL-terminated user array (Linux count): EFAULT,
+/// E2BIG past MAX_ARG_STRINGS; a fatal signal ends the walk
+fn count(argv: u64) -> Result<usize, i32> {
+    if argv == 0 {
+        return Ok(0);
+    }
+    let mut i = 0;
+    while arg_ptr(argv, i)? != 0 {
+        if i >= MAX_ARG_STRINGS {
+            return Err(E2BIG);
         }
-        let s = copy_string_from_user(str_ptr, PATH_MAX)?;
-        // Charge against the combined argv+envp budget as we go (Linux
-        // copy_strings), so a huge list is E2BIG before it is all copied
-        *budget = budget.checked_sub(s.len() + 1).ok_or(E2BIG)?;
-        result.push(s);
+        i += 1;
+        if crate::signal::fatal_signal_pending() {
+            return Err(crate::util::error::KernelError::RestartNoHand.errno());
+        }
+        percpu::cond_resched();
     }
+    Ok(i)
+}
 
-    Ok(result)
+/// Bytes the strings may take on the new stack (Linux
+/// bprm_stack_limits): a quarter of RLIMIT_STACK, at most 3/4 of
+/// _STK_LIM and at least ARG_MAX, less the argv and envp pointers
+/// (argc counted as at least 1); E2BIG if they leave nothing
+fn arg_limit(argc: usize, envc: usize) -> Result<usize, i32> {
+    use crate::task::rlimit::{RLIMIT_STACK, rlimit};
+    let quarter = usize::try_from(rlimit(RLIMIT_STACK) / 4).unwrap_or(usize::MAX);
+    let limit = ((STK_LIM / 4 * 3) as usize).min(quarter).max(ARG_MAX);
+    let ptrs = argc
+        .max(1)
+        .checked_add(envc)
+        .and_then(|n| n.checked_mul(8))
+        .ok_or(E2BIG)?;
+    limit.checked_sub(ptrs).filter(|&l| l > 0).ok_or(E2BIG)
+}
+
+/// Copy the `n` strings of user array `argv`, each charged with its
+/// NUL against `budget` (Linux copy_strings): one longer than
+/// MAX_ARG_STRLEN, or past the budget, is E2BIG; EFAULT
+fn copy_strings(argv: u64, n: usize, budget: &mut usize) -> Result<Strings, i32> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(n).map_err(|_| ENOMEM)?;
+    for i in 0..n {
+        let p = arg_ptr(argv, i)?;
+        if p == 0 {
+            return Err(EFAULT);
+        }
+        let s = copy_string_from_user(p, MAX_ARG_STRLEN)?;
+        *budget = budget.checked_sub(s.len() + 1).ok_or(E2BIG)?;
+        out.push(s);
+        if crate::signal::fatal_signal_pending() {
+            return Err(crate::util::error::KernelError::RestartNoHand.errno());
+        }
+    }
+    Ok(out)
+}
+
+/// The argument and environment strings of an exec of `filename`
+/// (Linux do_execveat_common): both arrays counted, the room for them
+/// worked out from RLIMIT_STACK, then the file name, the environment
+/// and the arguments copied against it
+fn copy_args(filename: &[u8], argv: u64, envp: u64) -> Result<(Strings, Strings), i32> {
+    let argc = count(argv)?;
+    let envc = count(envp)?;
+    let mut budget = arg_limit(argc, envc)?;
+    budget = budget.checked_sub(filename.len() + 1).ok_or(E2BIG)?;
+    let envp = copy_strings(envp, envc, &mut budget)?;
+    let argv = copy_strings(argv, argc, &mut budget)?;
+    Ok((argv, envp))
 }
 
 /// What the new image tells the program through the auxiliary vector
@@ -110,11 +176,19 @@ struct StackWriter<'a> {
 }
 
 impl StackWriter<'_> {
-    /// Copy `data` to user address `va`
+    /// Copy `data` to user address `va`, a page at a time
     fn write(&self, va: u64, data: &[u8]) -> Result<(), i32> {
-        for (i, &b) in data.iter().enumerate() {
-            let phys = self.pt.translate(va + i as u64).ok_or(EFAULT)?;
-            unsafe { core::ptr::write(phys_to_virt(phys), b) };
+        let mut done = 0;
+        while done < data.len() {
+            let at = va + done as u64;
+            let n = ((PAGE_SIZE - at % PAGE_SIZE) as usize).min(data.len() - done);
+            let phys = self.pt.translate(at).ok_or(EFAULT)?;
+            // SAFETY: `phys` is a stack frame of the new address space,
+            // mapped above, and `n` bytes stay within its page
+            unsafe {
+                core::ptr::copy_nonoverlapping(data[done..].as_ptr(), phys_to_virt(phys), n);
+            }
+            done += n;
         }
         Ok(())
     }
@@ -205,17 +279,17 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     } else {
         ((stack_limit / PAGE_SIZE) as usize).clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
     };
-    // Everything must fit in the stack, with room to run
+    // What the initial stack holds: its strings were bounded by
+    // copy_args (Linux bprm_stack_limits), plus a script's interpreter
     let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum();
     let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * AUXV_LEN;
     let need = strings + info.execfn.len() + 64 + 16 + words * 8 + 64;
-    if need > stack_pages * PAGE_SIZE as usize / 2 {
-        return Err(E2BIG);
-    }
 
     // Map only what the arguments use (Linux setup_arg_pages: the rest
-    // of the stack VMA faults in on first touch)
+    // of the stack VMA faults in on first touch), and give the VMA room
+    // to run above them (stack_expand)
     let mapped = need.div_ceil(PAGE_SIZE as usize) + 1;
+    let stack_pages = stack_pages.max(mapped + STACK_EXPAND_PAGES);
     let map_bottom = STACK_TOP - (mapped as u64 * PAGE_SIZE);
     for i in 0..mapped {
         let va = map_bottom + (i as u64 * PAGE_SIZE);
@@ -1210,16 +1284,8 @@ pub fn sys_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
         Err(e) => return e.sysret(),
     };
 
-    // Copy argv from user space
-    let mut budget = MAX_ARG_PAGES * PAGE_SIZE as usize;
-    let argv = match copy_string_array_from_user(argv_ptr, 1024, &mut budget) {
+    let (argv, envp) = match copy_args(&path, argv_ptr, envp_ptr) {
         Ok(a) => a,
-        Err(e) => return -i64::from(e),
-    };
-
-    // Copy envp from user space
-    let envp = match copy_string_array_from_user(envp_ptr, 1024, &mut budget) {
-        Ok(e) => e,
         Err(e) => return -i64::from(e),
     };
 
@@ -1255,16 +1321,11 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
         Ok(p) => p,
         Err(e) => return e.sysret(),
     };
-    let mut budget = MAX_ARG_PAGES * PAGE_SIZE as usize;
-    let argv = match copy_string_array_from_user(argv_ptr, 1024, &mut budget) {
+    let name = exec_name(dirfd, &path);
+    let (argv, envp) = match copy_args(&name, argv_ptr, envp_ptr) {
         Ok(a) => a,
         Err(e) => return -i64::from(e),
     };
-    let envp = match copy_string_array_from_user(envp_ptr, 1024, &mut budget) {
-        Ok(e) => e,
-        Err(e) => return -i64::from(e),
-    };
-    let name = exec_name(dirfd, &path);
     // Linux BINPRM_FLAGS_PATH_INACCESSIBLE: the program came through a
     // close-on-exec fd, so a script's interpreter could not open it
     let via_fd = dirfd != AT_FDCWD && path.first() != Some(&b'/');
