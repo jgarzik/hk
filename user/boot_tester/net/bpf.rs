@@ -9,6 +9,8 @@
 //! - Test BPF program load
 //! - Test invalid map type
 //! - Test invalid fd
+//! - BPF_HASH_BUDGET: a hash map whose full size cannot be had is ENOMEM
+//!   at create (Linux preallocates its elements)
 //! - BPF_MAP_INFO: BPF_OBJ_GET_INFO_BY_FD fills struct bpf_map_info,
 //!   writes the length it used back to attr.info.info_len, takes a
 //!   larger buffer whose extra bytes are zero, and is E2BIG when they
@@ -102,6 +104,7 @@ pub fn run_tests() {
     test_prog_load_big();
     test_invalid_map_type();
     test_invalid_fd();
+    test_hash_budget();
     test_map_info();
 }
 
@@ -124,6 +127,16 @@ fn map_create(attr: &MapCreateAttr) -> i64 {
         attr as *const _ as u64,
         size_of::<MapCreateAttr>() as u32,
     )
+}
+
+fn test_hash_budget() {
+    const ENOMEM: i64 = -12;
+    // 2^20 elements of 64 KB: 64 GB
+    let fd = map_create(&hash_attr(256, 65536, 1 << 20));
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    crate::harness::verdict(b"BPF_HASH_BUDGET", fd == ENOMEM, fd);
 }
 
 /// union bpf_attr's info member
