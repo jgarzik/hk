@@ -427,14 +427,14 @@ use crate::task::prctl_ops::{PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSE
 /// - PR_SET_NO_NEW_PRIVS (38): Disable privilege escalation (arg2 = 1, irreversible)
 /// - PR_GET_NO_NEW_PRIVS (39): Get no_new_privs flag (returns 0 or 1)
 ///
-/// Returns 0 on success (or value for GET operations), negative errno on error.
-pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
-    use crate::arch::Uaccess;
+/// Returns 0 on success, or the value for GET operations. arg2 is a
+/// number or a user pointer, by option.
+pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> KernelResult<i64> {
     use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_USER};
     use crate::task::percpu::{TASKLIST, current_tid};
-    use crate::uaccess::{get_user, put_user};
 
     let tid = current_tid();
+    let int_ptr = UserPtr::<i32>::new(arg2);
 
     match option {
         PR_SET_PDEATHSIG => {
@@ -444,241 +444,139 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
 
             // Validate signal number (0 is valid - means disable)
             if !(0..=64).contains(&sig) {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
 
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.pdeath_signal = sig;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            task.pdeath_signal = sig;
+            Ok(0)
         }
 
         PR_GET_PDEATHSIG => {
-            // Get current parent death signal
-            // arg2 is pointer to int where result is stored
+            // Get current parent death signal, stored at arg2 (int *)
             let sig = {
                 let table = TASKLIST.read();
-                match table.get(tid) {
-                    Some(task) => task.pdeath_signal,
-                    None => return KernelError::NoProcess.sysret(),
-                }
+                table.get(tid).ok_or(KernelError::NoProcess)?.pdeath_signal
             };
-
-            // Write signal to user-space pointer
-            if put_user::<Uaccess, i32>(arg2, sig).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
+            int_ptr.write(&sig)?;
+            Ok(0)
         }
 
         PR_SET_NAME => {
-            // Set thread name from user-space string (max 16 bytes including null)
-            let mut name = [0u8; 16];
-
-            // Read up to 16 bytes from user space
-            for (i, slot) in name.iter_mut().enumerate() {
-                match get_user::<Uaccess, u8>(arg2 + i as u64) {
-                    Ok(byte) => {
-                        *slot = byte;
-                        if byte == 0 {
-                            break; // Null terminator found
-                        }
-                    }
-                    Err(_) => return KernelError::BadAddress.sysret(),
-                }
-            }
-            // Ensure null termination
-            name[15] = 0;
-
             // Rename the calling thread under its task_lock (Linux
             // set_task_comm)
-            let me = super::percpu::current();
-            me.task_lock().set_comm(name);
-            0
+            let name = read_comm(arg2)?;
+            super::percpu::current().task_lock().set_comm(name);
+            Ok(0)
         }
 
         PR_GET_NAME => {
-            // Get thread name and write to user buffer
+            // Get thread name and write to user buffer (16 bytes)
             let name = super::percpu::current().comm();
-
-            // Write name to user space (16 bytes)
-            for (i, &byte) in name.iter().enumerate() {
-                if put_user::<Uaccess, u8>(arg2 + i as u64, byte).is_err() {
-                    return KernelError::BadAddress.sysret();
-                }
-            }
-            0
+            crate::uaccess::copy_to_user::<crate::arch::Uaccess>(arg2, &name)?;
+            Ok(0)
         }
 
         PR_SET_DUMPABLE => {
             // Only 0/1 are settable; SUID_DUMP_ROOT (2) is reserved to the
             // suid_dumpable sysctl (Linux kernel/sys.c PR_SET_DUMPABLE)
             if arg2 != u64::from(SUID_DUMP_DISABLE) && arg2 != u64::from(SUID_DUMP_USER) {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-            let value = arg2 as u8;
-
             // On the mm, shared by every thread (Linux set_dumpable)
-            match crate::mm::get_task_mm(tid) {
-                Some(mm) => {
-                    mm.set_dumpable(value);
-                    0
-                }
-                None => KernelError::NoProcess.sysret(),
-            }
+            let mm = crate::mm::get_task_mm(tid).ok_or(KernelError::NoProcess)?;
+            mm.set_dumpable(arg2 as u8);
+            Ok(0)
         }
 
         PR_GET_DUMPABLE => {
-            // Return dumpable flag value
-            match crate::mm::get_task_mm(tid) {
-                Some(mm) => i64::from(mm.dumpable()),
-                None => KernelError::NoProcess.sysret(),
-            }
+            let mm = crate::mm::get_task_mm(tid).ok_or(KernelError::NoProcess)?;
+            Ok(i64::from(mm.dumpable()))
         }
 
         PR_SET_NO_NEW_PRIVS => {
             // Set no_new_privs flag (irreversible once set)
             // arg2 must be 1 to enable, any other value is EINVAL
             if arg2 != 1 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.no_new_privs = true;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            task.prctl.no_new_privs = true;
+            Ok(0)
         }
 
         PR_GET_NO_NEW_PRIVS => {
-            // Return no_new_privs flag (0 or 1)
             let table = TASKLIST.read();
-            match table.get(tid) {
-                Some(task) => {
-                    if task.prctl.no_new_privs {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                None => KernelError::NoProcess.sysret(),
-            }
+            let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+            Ok(i64::from(task.prctl.no_new_privs))
         }
 
         PR_SET_TIMERSLACK => {
             // Set timer slack in nanoseconds
             // arg2 of 0 resets to default (50,000 ns)
             let slack = if arg2 == 0 { 50_000 } else { arg2 };
-
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.timer_slack_ns = slack;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            task.prctl.timer_slack_ns = slack;
+            Ok(0)
         }
 
         PR_GET_TIMERSLACK => {
-            // Return timer slack in nanoseconds
             let table = TASKLIST.read();
-            match table.get(tid) {
-                Some(task) => task.prctl.timer_slack_ns as i64,
-                None => KernelError::NoProcess.sysret(),
-            }
+            let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+            Ok(task.prctl.timer_slack_ns as i64)
         }
 
-        PR_GET_SECCOMP => {
-            // Delegate to seccomp module
-            crate::seccomp::prctl_get_seccomp()
-        }
+        PR_GET_SECCOMP => Ok(crate::seccomp::prctl_get_seccomp()),
 
-        PR_SET_SECCOMP => {
-            // Delegate to seccomp module
-            // arg2 = mode, _arg3 = filter (for FILTER mode)
-            crate::util::error::SysRet::ret(crate::seccomp::prctl_set_seccomp(
-                arg2,
-                UserPtr::new(_arg3),
-            ))
-        }
+        // arg2 = mode, arg3 = filter (for FILTER mode)
+        PR_SET_SECCOMP => crate::seccomp::prctl_set_seccomp(arg2, UserPtr::new(arg3)),
 
         PR_SET_KEEPCAPS => {
             // Set keep capabilities flag
             // arg2 must be 0 or 1
             if arg2 > 1 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.keep_caps = arg2 != 0;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            task.prctl.keep_caps = arg2 != 0;
+            Ok(0)
         }
 
         PR_GET_KEEPCAPS => {
-            // Return keep capabilities flag (0 or 1)
             let table = TASKLIST.read();
-            match table.get(tid) {
-                Some(task) => {
-                    if task.prctl.keep_caps {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                None => KernelError::NoProcess.sysret(),
-            }
+            let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+            Ok(i64::from(task.prctl.keep_caps))
         }
 
         PR_SET_CHILD_SUBREAPER => {
             // The process's flag (Linux signal->is_child_subreaper),
             // whichever thread sets it; arg2 nonzero sets it
-            let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
-                return KernelError::NoProcess.sysret();
-            };
+            let sig = crate::signal::get_task_signal_struct(tid).ok_or(KernelError::NoProcess)?;
             sig.set_subreaper(&mut TASKLIST.write(), arg2 != 0);
-            0
+            Ok(0)
         }
 
         PR_GET_CHILD_SUBREAPER => {
             // The process's flag, stored at arg2 (int *)
-            let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
-                return KernelError::NoProcess.sysret();
-            };
+            let sig = crate::signal::get_task_signal_struct(tid).ok_or(KernelError::NoProcess)?;
             let is_subreaper = sig.subreaper(&TASKLIST.read());
-
-            // Write result to user-space pointer
-            let value: i32 = if is_subreaper { 1 } else { 0 };
-            if put_user::<Uaccess, i32>(arg2, value).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
+            int_ptr.write(&i32::from(is_subreaper))?;
+            Ok(0)
         }
 
         #[cfg(target_arch = "x86_64")]
         PR_GET_TSC => {
-            // Get TSC mode (x86-64 only)
-            // arg2 = pointer to int for result
+            // Get TSC mode (x86-64 only), stored at arg2 (int *)
             let tsc_mode = {
                 let table = TASKLIST.read();
-                match table.get(tid) {
-                    Some(task) => task.prctl.tsc_mode,
-                    None => return KernelError::NoProcess.sysret(),
-                }
+                table.get(tid).ok_or(KernelError::NoProcess)?.prctl.tsc_mode
             };
-
-            if put_user::<Uaccess, i32>(arg2, i32::from(tsc_mode)).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
+            int_ptr.write(&i32::from(tsc_mode))?;
+            Ok(0)
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -687,48 +585,47 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             // arg2: PR_TSC_ENABLE (1) or PR_TSC_SIGSEGV (2)
             let mode = arg2 as i32;
             if mode != PR_TSC_ENABLE && mode != PR_TSC_SIGSEGV {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.tsc_mode = mode as u8;
-                // Note: Actually enabling TSC faulting requires CR4.TSD manipulation
-                // For now, just store the preference
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            // Note: Actually enabling TSC faulting requires CR4.TSD manipulation
+            // For now, just store the preference
+            task.prctl.tsc_mode = mode as u8;
+            Ok(0)
         }
 
         PR_SET_THP_DISABLE => {
             // Disable transparent huge pages for this process
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.thp_disable = arg2 != 0;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            task.prctl.thp_disable = arg2 != 0;
+            Ok(0)
         }
 
         PR_GET_THP_DISABLE => {
-            // Get THP disable flag (returns 0 or 1)
             let table = TASKLIST.read();
-            match table.get(tid) {
-                Some(task) => {
-                    if task.prctl.thp_disable {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                None => KernelError::NoProcess.sysret(),
-            }
+            let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+            Ok(i64::from(task.prctl.thp_disable))
         }
 
-        _ => KernelError::InvalidArgument.sysret(), // unsupported operation
+        _ => Err(KernelError::InvalidArgument), // unsupported operation
     }
+}
+
+/// PR_SET_NAME's name: up to 16 bytes from `addr`, stopping at a NUL,
+/// the last always NUL; EFAULT
+fn read_comm(addr: u64) -> KernelResult<[u8; 16]> {
+    let mut name = [0u8; 16];
+    for (i, slot) in name.iter_mut().enumerate() {
+        let p = UserPtr::<u8>::new(addr).offset(i);
+        *slot = p.ok_or(KernelError::BadAddress)?.read()?;
+        if *slot == 0 {
+            break;
+        }
+    }
+    name[15] = 0;
+    Ok(name)
 }
 
 // =============================================================================
