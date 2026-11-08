@@ -762,7 +762,6 @@ fn expire_busy() -> R {
         let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
         check(b"used: marked again", r == EAGAIN, r)?;
         // A path lookup is a use too (path_put), not only an open file
-        // SAFETY: Stat is plain integers
         let mut st = Stat::default();
         sys_stat(b"/tmp/exb/f\0".as_ptr(), &mut st);
         let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);

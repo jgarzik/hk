@@ -469,7 +469,6 @@ fn exit_ignored_zombie() -> i32 {
             sys_exit(0);
         }
         // Its zombie, left in place (a tracee's exit is not autoreaped)
-        // SAFETY: SigInfo is plain integers
         let mut info = SigInfo::zeroed();
         let r = sys_waitid(P_PID, child as u64, &mut info, WEXITED | WNOWAIT, 0);
         sys_exit(if r == 0 { 0 } else { 1 });

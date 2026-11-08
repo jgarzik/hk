@@ -1409,12 +1409,7 @@ fn test_ptrace_siginfo() {
         && info.si_status == 55;
     // struct ptrace_peeksiginfo_args: off 0, flags SHARED, nr 4
     let args: [u32; 4] = [0, 0, 1, 4];
-    let mut peek = [
-        SigInfo::zeroed(),
-        SigInfo::zeroed(),
-        SigInfo::zeroed(),
-        SigInfo::zeroed(),
-    ];
+    let mut peek: [SigInfo; 4] = core::array::from_fn(|_| SigInfo::zeroed());
     let n = sys_ptrace(
         PTRACE_PEEKSIGINFO,
         c,
