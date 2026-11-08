@@ -618,28 +618,25 @@ pub fn cgroup_init() {
 /// is skipped, never re-attached
 pub fn migrate_thread_group(target: &Arc<Cgroup>, pid: Pid) -> Result<(), KernelError> {
     let root = CGROUP_ROOT.clone();
-    let tids = thread_group(pid)?;
+    let threads = thread_group(pid)?;
     let ctrls: Vec<_> = target
         .enabled_controllers()
         .into_iter()
         .filter_map(|c| Some((target.css(c)?, root.get_controller(c)?)))
         .collect();
-    for &tid in &tids {
+    for t in &threads {
         for (css, ops) in &ctrls {
-            ops.can_attach(css, tid as Pid)?;
+            ops.can_attach(css, t.tid() as Pid)?;
         }
     }
-    for tid in tids {
-        migrate_one(&root, target, tid);
+    for t in &threads {
+        migrate_one(&root, target, t);
     }
     Ok(())
 }
 
-/// One thread's move (Linux cgroup_migrate_execute for one task)
-fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, tid: Tid) {
-    let Some(t) = crate::task::percpu::find_task(tid) else {
-        return;
-    };
+/// Thread `t`'s move (Linux cgroup_migrate_execute for one task)
+fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, t: &Task) {
     let mut slot = t.cgroup.lock();
     // Exiting: exit owns it (Linux skips PF_EXITING). Exit sets the flag
     // before it detaches under this lock, so a thread seen live here is
@@ -647,7 +644,7 @@ fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, tid: Tid) {
     if t.has_flag(crate::task::pf::EXITING) {
         return;
     }
-    let pid = tid as Pid;
+    let pid = t.tid() as Pid;
     if let Some(old) = slot.clone() {
         if Arc::ptr_eq(&old, target) {
             return;
@@ -704,7 +701,7 @@ pub static CGROUP_THREADGROUP_RWSEM: crate::sync::RwSem<()> = crate::sync::RwSem
 /// The threads of the process `pid` names (any of its threads; 0: the
 /// caller's): ESRCH if none (Linux cgroup_procs_write_start finds the
 /// task, then its group leader's whole group)
-pub fn thread_group(pid: Pid) -> Result<Vec<Tid>, KernelError> {
+pub fn thread_group(pid: Pid) -> Result<Vec<crate::task::percpu::TaskRef>, KernelError> {
     let table = crate::task::percpu::TASKLIST.read();
     let tid = if pid == 0 {
         crate::task::percpu::current_tid()
@@ -715,7 +712,7 @@ pub fn thread_group(pid: Pid) -> Result<Vec<Tid>, KernelError> {
     Ok(table
         .iter()
         .filter(|t| t.task.pid == tgid && !t.task.has_flag(crate::task::pf::EXITING))
-        .map(|t| t.task.tid())
+        .map(|t| crate::task::percpu::task_ref(t.task))
         .collect())
 }
 

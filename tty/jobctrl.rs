@@ -20,7 +20,7 @@ use crate::fs::File;
 use crate::fs::flags::{O_ACCMODE, O_WRONLY};
 use crate::signal::{SIGCONT, SIGHUP, kill_pgrp_pid};
 use crate::sync::spin::Mutex;
-use crate::task::percpu::{GlobalTaskTable, TASKLIST, current_pid, current_sid, current_tid};
+use crate::task::percpu::{GlobalTaskTable, TASKLIST, current_pid, current_sid};
 use crate::task::pid::Pid;
 use crate::util::error::KernelError;
 
@@ -30,7 +30,8 @@ static CTTY_LOCK: Mutex<()> = Mutex::new(());
 /// The caller's process group and session (Linux task_pgrp,
 /// task_session); None for a kernel thread
 fn pids(table: &GlobalTaskTable) -> Option<(Arc<Pid>, Arc<Pid>)> {
-    let t = table.get(current_tid())?;
+    let me = crate::task::percpu::current();
+    let t = table.view(&me)?;
     Some((t.pgrp.clone()?, t.session.clone()?))
 }
 

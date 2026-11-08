@@ -36,11 +36,11 @@ use crate::util::error::{KernelError, KernelResult};
 /// 1. Gets and clears the clear_child_tid address from the Task struct
 /// 2. Writes 0 to that address
 /// 3. Calls futex_wake on that address to wake pthread_join waiters
-fn do_clear_child_tid(tid: Tid) {
+fn do_clear_child_tid(me: &Task) {
     // Get and clear the address from the Task struct directly
     let addr = {
         let mut table = TASKLIST.write();
-        if let Some(mut task) = table.get_mut(tid) {
+        if let Some(mut task) = table.view_mut(me) {
             let addr = task.clear_child_tid;
             task.clear_child_tid = 0;
             (addr != 0).then_some(addr)
@@ -826,7 +826,7 @@ impl GlobalTaskTable {
     ) -> Vec<T> {
         Self::collect(
             |table, visit| {
-                if !table.get(t.tid()).is_some_and(|v| core::ptr::eq(v.task, t)) {
+                if table.view(t).is_none() {
                     return;
                 }
                 for x in table.threads(t.pid) {
@@ -1814,7 +1814,9 @@ fn wait_zombie(
         if !entry.fits(table, z) {
             return Err(z);
         }
-        crate::task::ptrace::ptrace_unlink(table, tid);
+        if let Some(mut v) = table.get_mut(tid) {
+            crate::task::ptrace::ptrace_unlink(&mut v);
+        }
         let (told, gone) = tell(table, Some(z), entry);
         let done = Unhashed {
             thread: None,
@@ -1837,7 +1839,7 @@ fn wait_zombie(
         return Ok(Some((report, unhash_thread(table, tid, z, entry))));
     }
     // The reaper's cutime/cstime
-    if let Some(s) = table.get(current_tid()).and_then(|t| t.signal.clone()) {
+    if let Some(s) = table.view(&current()).and_then(|t| t.signal.clone()) {
         s.add_child_times((report.2, report.3));
     }
     let gone = reap_locked(table, tid);
@@ -1878,19 +1880,19 @@ fn zombie_report(table: &GlobalTaskTable, z: &TaskView<'_>) -> WaitReport {
 /// thread's release_task, then the leader's exit_state): any other
 /// thread still listed, a traced zombie until its tracer releases it,
 /// but the leader once it is a zombie
-pub fn exec_waits(tgid: Pid, tid: Tid) -> bool {
-    TASKLIST
-        .read()
-        .threads(tgid)
-        .any(|u| u.task.tid() != tid && !(u.leader && matches!(u.state, TaskState::Zombie(_))))
+pub fn exec_waits(me: &Task) -> bool {
+    TASKLIST.read().threads(me.pid).any(|u| {
+        !core::ptr::eq(u.task, me) && !(u.leader && matches!(u.state, TaskState::Zombie(_)))
+    })
 }
 
-/// After de_thread: `tid` is the only thread of `tgid` left running and
-/// becomes its leader, taking the old leader's place (Linux de_thread:
+/// After de_thread: `caller` is the only thread of its group left
+/// running and becomes its leader, taking the old leader's place (Linux de_thread:
 /// its parent, exit signal and start time); the exited threads are
 /// removed from the table and returned, to be released by the caller
 /// after TASKLIST
-pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
+pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
+    let (tgid, tid) = (caller.pid, caller.tid());
     let mut table = TASKLIST.write();
     let Some(l) = table.find(|t| t.task.pid == tgid && t.leader) else {
         return Vec::new();
@@ -1928,7 +1930,7 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         .collect();
     let removed = gone.len();
     gone.extend(dead);
-    let Some(me) = table.task(tid) else {
+    let Some(me) = table.view(caller).map(|v| task_ref(v.task)) else {
         for t in &gone[..removed] {
             table.release_pids(t);
         }
@@ -2182,7 +2184,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let parent_nproc_exceeded = {
         let table = TASKLIST.read();
         table
-            .get(current_tid())
+            .view(&current())
             .is_some_and(|t| t.task.has_flag(crate::task::pf::NPROC_EXCEEDED))
     };
     if crate::task::nproc_over(nproc.uid, nproc.count) {
@@ -2416,7 +2418,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_exec_id: if config.flags & (CLONE_PARENT | CLONE_THREAD) != 0 {
             parent_parent_exec_id
         } else {
-            crate::task::self_exec_id(parent_pid)
+            crate::task::self_exec_id(&me)
         },
         // prctl state: the name is inherited (dumpability lives in the
         // mm: shared with CLONE_VM, copied by dup_mm)
@@ -2594,7 +2596,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // If CLONE_SYSVSEM is set, child shares parent's semaphore undo list
     // Otherwise, child starts with no undo list (allocated on first SEM_UNDO operation)
     if config.flags & CLONE_SYSVSEM != 0 {
-        crate::ipc::sem::clone_task_semundo(current_tid, child_tid, true);
+        crate::ipc::sem::clone_task_semundo(&me, &child_task, true);
     }
 
     // Handle CLONE_SETTLS: set child's TLS pointer
@@ -2644,14 +2646,14 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             }
         } else {
             // Separate address space (fork) - store for clone_child_entry to write
-            crate::task::set_set_child_tid(child_tid, config.child_tidptr);
+            crate::task::set_set_child_tid(&child_task, config.child_tidptr);
         }
     }
 
     // Handle CLONE_CHILD_CLEARTID: store address to clear and wake on exit
     // This enables pthread_join to work by waking when thread exits
     if config.flags & CLONE_CHILD_CLEARTID != 0 && config.child_tidptr != 0 {
-        crate::task::set_clear_child_tid(child_tid, config.child_tidptr);
+        crate::task::set_clear_child_tid(&child_task, config.child_tidptr);
     }
 
     // The return value: the child's pid (a new process's pid is its
@@ -2752,10 +2754,7 @@ fn forget_original_parent() {
     let mut moved = Vec::new();
     let mut entry = Entry::default();
     loop {
-        let n = TASKLIST
-            .read()
-            .get(me.tid())
-            .map_or(0, |t| t.children.len());
+        let n = TASKLIST.read().view(&me).map_or(0, |t| t.children.len());
         moved.reserve(n + 1);
         match reparent_children(&me, &mut moved, &mut entry) {
             Moved::All => break,
@@ -2771,9 +2770,9 @@ fn forget_original_parent() {
     // Then, with TASKLIST dropped (Linux forget_original_parent): each
     // moved child's threads get their pdeath_signal, from this task
     for c in &moved {
-        let deaths = GlobalTaskTable::collect_threads(c.pid, |table, t| {
+        let deaths = GlobalTaskTable::collect_threads(c.pid, |_, t| {
             (t.pdeath_signal > 0).then_some(())?;
-            Some((table.task(t.task.tid())?, t.pdeath_signal as u32))
+            Some((task_ref(t.task), t.pdeath_signal as u32))
         });
         for (t, sig) in deaths {
             let _ = crate::signal::send_group_signal(&t, sig, crate::signal::SendInfo::User);
@@ -2800,7 +2799,7 @@ enum Moved {
 /// with `entry`; one such move ends the pass.
 fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>, entry: &mut Entry) -> Moved {
     let mut table = TASKLIST.write();
-    if table.get(me.tid()).is_none_or(|t| t.children.is_empty()) {
+    if table.view(me).is_none_or(|t| t.children.is_empty()) {
         return Moved::All;
     }
     let Some(reaper) = find_reaper(&table, me) else {
@@ -2815,7 +2814,7 @@ fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>, entry: &mut Entry) 
             return Moved::Full;
         }
         let Some(c) = table
-            .get(me.tid())
+            .view(me)
             .and_then(|t| t.children.front().map(task_ref))
         else {
             return Moved::All;
@@ -2850,7 +2849,7 @@ fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
     if let Some(t) = live_thread(table, me.pid) {
         return Some(t);
     }
-    let v = table.get(me.tid())?;
+    let v = table.view(me)?;
     let level = v.thread_pid.as_ref().map(|p| p.level);
     let mut p = v.real_parent.clone();
     while let Some(t) = p.and_then(|w| w.upgrade()) {
@@ -2858,7 +2857,7 @@ fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
         // ends the walk: the namespace's init adopts (Linux
         // find_new_reaper ends at the child_reaper, by
         // task_pid(reaper)->level)
-        let Some(v) = table.get(t.tid()) else { break };
+        let Some(v) = table.view(&t) else { break };
         if v.thread_pid.as_ref().map(|p| p.level) != level {
             break;
         }
@@ -3065,7 +3064,9 @@ fn detach_zombie(
     {
         return Err(z);
     }
-    crate::task::ptrace::ptrace_unlink(table, tid);
+    if let Some(mut v) = table.get_mut(tid) {
+        crate::task::ptrace::ptrace_unlink(&mut v);
+    }
     if !leader {
         return Ok(Some(unhash_thread(table, tid, z, entry)));
     }
@@ -3245,7 +3246,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // Clean up SysV semaphore undo list for exiting task
         // This may apply undo operations if this is the last holder
         // MUST be done BEFORE exit_task_ns() since exit_sem needs IPC namespace
-        crate::ipc::sem::exit_sem(tid);
+        crate::ipc::sem::exit_sem(&current());
 
         // Clean up I/O context for exiting task
         crate::task::remove_task_io_context(&current());
@@ -3263,12 +3264,12 @@ pub fn exit_current(status: Option<i32>) -> ! {
         }
 
         // Clean up robust futex list for exiting task
-        crate::task::futex::exit_robust_list(tid);
+        crate::task::futex::exit_robust_list(&current());
 
         // Handle CLONE_CHILD_CLEARTID: write 0 and wake futex waiters
         // This must be done before switching away since we need to be in
         // the task's address space to write to user memory
-        do_clear_child_tid(tid);
+        do_clear_child_tid(&current());
 
         // Signal vfork completion if parent is waiting
         // This must be done after CLEARTID but before we switch away
@@ -4267,16 +4268,16 @@ pub fn finish_context_switch() {
 /// For threads (CLONE_VM), the TID was already written in do_clone().
 #[unsafe(no_mangle)]
 pub extern "C" fn write_child_tid_if_needed() {
-    let tid = current_tid();
-    if tid == 0 {
+    let me = current();
+    if me.tid() == 0 {
         return;
     }
-    if let Some(addr) = crate::task::get_set_child_tid(tid) {
+    if let Some(addr) = crate::task::get_set_child_tid(&me) {
         use crate::arch::Uaccess;
         use crate::uaccess::put_user;
         // Its own number, in its namespace (Linux schedule_tail:
         // task_pid_vnr(current))
-        let nr = crate::task::pid::vnr(tid) as i32;
+        let nr = crate::task::pid::vnr(me.tid()) as i32;
         if put_user::<Uaccess, i32>(addr, nr).is_err() {
             printkln!("CLONE: CLONE_CHILD_SETTID write failed in child");
         }
@@ -4428,12 +4429,12 @@ pub fn increment_maj_flt() {
 }
 
 /// Every thread of every process in group `pgid` (its pid links)
-pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
+pub fn pgrp_tasks(pgid: Pid) -> alloc::vec::Vec<TaskRef> {
     let Some(pg) = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid) else {
         return alloc::vec::Vec::new();
     };
     let table = TASKLIST.read();
-    table.pgrp_threads(&pg).map(|t| t.task.tid()).collect()
+    table.pgrp_threads(&pg).map(|t| task_ref(t.task)).collect()
 }
 
 /// The processes of group `pgid`, by pid (their leaders on its list;
@@ -4463,7 +4464,7 @@ pub fn pgrp_orphaned(pg: &crate::task::pid::Pid) -> bool {
         if parent.pid == 1 {
             return false;
         }
-        let Some(p) = table.get(parent.tid()) else {
+        let Some(p) = table.view(&parent) else {
             return false;
         };
         let Some(ms) = m.session.as_deref() else {
@@ -4539,21 +4540,17 @@ pub fn lookup_task_sid(pid: Pid) -> Option<u32> {
     Some(s)
 }
 
-/// Look up a task's nice value by PID
-///
-/// Returns None if the process is not found.
-pub fn lookup_task_nice(pid: Pid) -> Option<i32> {
+/// Task `t`'s nice value; None once it is reaped
+pub fn lookup_task_nice(t: &Task) -> Option<i32> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.se.nice())
+    table.view(t).map(|t| t.task.se.nice())
 }
 
-/// Look up a task's scheduling policy by PID
-///
-/// Returns None if the process is not found.
-/// The returned policy includes SCHED_RESET_ON_FORK flag if set.
-pub fn lookup_task_policy(pid: Pid) -> Option<i32> {
+/// Task `t`'s scheduling policy, with SCHED_RESET_ON_FORK if set; None
+/// once it is reaped
+pub fn lookup_task_policy(t: &Task) -> Option<i32> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| {
+    table.view(t).map(|t| {
         let mut policy = t.task.se.policy();
         if t.task.se.reset_on_fork() {
             policy |= crate::task::SCHED_RESET_ON_FORK;
@@ -4562,26 +4559,18 @@ pub fn lookup_task_policy(pid: Pid) -> Option<i32> {
     })
 }
 
-/// Look up a task's real-time priority by PID
-///
-/// Returns None if the process is not found.
-/// For SCHED_NORMAL tasks, returns 0.
-pub fn lookup_task_rt_priority(pid: Pid) -> Option<i32> {
+/// Task `t`'s real-time priority (0 for SCHED_NORMAL); None once it is
+/// reaped
+pub fn lookup_task_rt_priority(t: &Task) -> Option<i32> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| i32::from(t.task.se.rt_priority()))
+    table.view(t).map(|t| i32::from(t.task.se.rt_priority()))
 }
 
-/// Get a task's CPU time statistics by TID
-///
-/// Returns (utime_ns, stime_ns) for the specified task.
-/// Returns (0, 0) if the task is not found.
-pub fn get_task_times(tid: Tid) -> (u64, u64) {
+/// Task `t`'s (utime_ns, stime_ns); (0, 0) once it is reaped
+pub fn get_task_times(t: &Task) -> (u64, u64) {
     let table = TASKLIST.read();
     let now = crate::time::monotonic_ns();
-    table
-        .get(tid)
-        .map(|t| t.task.cputime(now))
-        .unwrap_or((0, 0))
+    table.view(t).map_or((0, 0), |t| t.task.cputime(now))
 }
 
 /// Get aggregate CPU times for a process (all threads)
@@ -4622,7 +4611,7 @@ pub fn group_times(table: &GlobalTaskTable, pid: Pid) -> (u64, u64) {
 pub fn children_times() -> (u64, u64) {
     let table = TASKLIST.read();
     table
-        .get(current_tid())
+        .view(&current())
         .and_then(|t| t.signal.clone())
         .map_or((0, 0), |s| s.child_times())
 }
@@ -4647,20 +4636,26 @@ fn account_current(kernel: bool) {
     }
 }
 
-/// Look up a task's CPU affinity mask by PID
-///
-/// Returns None if the process is not found.
-pub fn lookup_task_cpus_allowed(pid: Pid) -> Option<crate::util::cpumask::CpuSet> {
+/// Task `t`'s CPU affinity mask; None once it is reaped
+pub fn lookup_task_cpus_allowed(t: &Task) -> Option<crate::util::cpumask::CpuSet> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.cpus_mask.snapshot())
+    table.view(t).map(|t| t.task.cpus_mask.snapshot())
 }
 
-/// Set a task's scheduling policy and priority by PID
+/// ESRCH once task `t` is reaped
+fn listed(t: &Task) -> KernelResult<()> {
+    match TASKLIST.read().view(t) {
+        Some(_) => Ok(()),
+        None => Err(KernelError::NoProcess),
+    }
+}
+
+/// Set task `t`'s scheduling policy and priority
 ///
 /// This is the core implementation for sched_setscheduler/sched_setparam.
 ///
 /// # Arguments
-/// * `pid` - Target process ID
+/// * `task` - Target task
 /// * `policy` - New scheduling policy (may include SCHED_RESET_ON_FORK flag)
 /// * `rt_priority` - New real-time priority (1-99 for SCHED_FIFO/RR, 0 otherwise)
 ///
@@ -4670,7 +4665,7 @@ pub fn lookup_task_cpus_allowed(pid: Pid) -> Option<crate::util::cpumask::CpuSet
 /// # Locking
 /// The task's pi_lock and rq lock (`change_class`): a queued task moves
 /// to its new class's list at once.
-pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> KernelResult<()> {
+pub fn set_task_scheduler(task: &Task, policy: i32, rt_priority: i32) -> KernelResult<()> {
     use crate::task::{
         MAX_RT_PRIO, MIN_RT_PRIO, SCHED_BATCH, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL,
         SCHED_RESET_ON_FORK, SCHED_RR, is_rt_policy,
@@ -4697,7 +4692,7 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> KernelResu
         return Err(KernelError::InvalidArgument); // non-RT policies must have priority 0
     }
 
-    let task = TASKLIST.read().task(pid).ok_or(KernelError::NoProcess)?;
+    listed(task)?;
     // Not the stoppers nor an idle task (Linux: EINVAL for rq->stop)
     if matches!(task.se.class(), Class::Stop | Class::Idle) {
         return Err(KernelError::InvalidArgument);
@@ -4709,7 +4704,7 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> KernelResu
         return Ok(());
     }
     let static_prio = task.se.static_prio();
-    change_class(&task, |se| {
+    change_class(task, |se| {
         se.set_params(
             policy_class(base_policy),
             base_policy,
@@ -4721,25 +4716,25 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> KernelResu
     Ok(())
 }
 
-/// Set a task's CPU affinity mask by PID
+/// Set task `t`'s CPU affinity mask
 ///
 /// # Arguments
-/// * `pid` - Target process ID
+/// * `t` - Target task
 /// * `mask` - New CPU affinity mask (bit N = CPU N is allowed)
 ///
 /// # Errors
-/// ESRCH: process not found; EINVAL: empty mask (no CPUs allowed)
+/// ESRCH: task reaped; EINVAL: empty mask (no CPUs allowed)
 ///
 /// # Locking
 /// See [`set_cpus_allowed_ptr`]: a task on a CPU it may no longer use
 /// is moved before this returns.
-pub fn set_task_cpus_allowed(pid: Pid, mask: crate::util::cpumask::CpuSet) -> KernelResult<()> {
-    let task = TASKLIST.read().task(pid).ok_or(KernelError::NoProcess)?;
+pub fn set_task_cpus_allowed(t: &Task, mask: crate::util::cpumask::CpuSet) -> KernelResult<()> {
+    listed(t)?;
     // Bound kernel threads (Linux sched_setaffinity: EINVAL)
-    if task.has_flag(crate::task::pf::NO_SETAFFINITY) {
+    if t.has_flag(crate::task::pf::NO_SETAFFINITY) {
         return Err(KernelError::InvalidArgument);
     }
-    set_cpus_allowed_ptr(&task, &mask)
+    set_cpus_allowed_ptr(t, &mask)
 }
 
 /// Get the total number of tasks in the system
@@ -4751,14 +4746,14 @@ pub fn task_count() -> usize {
     table.len()
 }
 
-/// Set a task's nice value by PID (Linux set_user_nice: static_prio,
+/// Set task `t`'s nice value (Linux set_user_nice: static_prio,
 /// whatever its policy; it counts for the fair class)
 ///
-/// ESRCH if the process is not found
-pub fn set_task_nice(pid: Pid, nice: i32) -> KernelResult<()> {
-    let task = TASKLIST.read().task(pid).ok_or(KernelError::NoProcess)?;
+/// ESRCH once it is reaped
+pub fn set_task_nice(t: &Task, nice: i32) -> KernelResult<()> {
+    listed(t)?;
     let static_prio = (i32::from(sched::DEFAULT_PRIO) + nice.clamp(-20, 19)) as u8;
-    change_class(&task, |se| {
+    change_class(t, |se| {
         se.set_params(se.class(), se.policy(), static_prio, se.rt_priority())
     });
     Ok(())
@@ -4941,7 +4936,7 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
     // old ones are freed after it (only memory)
     let old = {
         let mut table = TASKLIST.write();
-        table.get_mut(me.tid()).and_then(|mut t| {
+        table.view_mut(&me).and_then(|mut t| {
             // SAFETY: the task itself
             if ids_changed && let Some(mm) = unsafe { me.task.mm() } {
                 // On the mm: every thread sharing it (Linux set_dumpable(
@@ -4987,8 +4982,10 @@ fn commit_uid_change(mut new_cred: crate::task::Cred) -> Result<(), KernelError>
 
 /// PR_SET_KEEPCAPS of the current task
 fn current_keep_caps() -> bool {
-    let tid = current_tid();
-    TASKLIST.read().get(tid).is_some_and(|t| t.prctl.keep_caps)
+    TASKLIST
+        .read()
+        .view(&current())
+        .is_some_and(|t| t.prctl.keep_caps)
 }
 
 /// Update current task's effective UID only (euid and fsuid)
@@ -5212,7 +5209,7 @@ pub fn exec_replace_image(
     ident: crate::task::exec::ExecIdentity,
     guard: crate::signal::CredGuard,
 ) -> ! {
-    let tid = current_tid();
+    let me = current();
     let new = mm.arc().clone();
 
     // The new mm, name and dumpability together (Linux exec_mmap, then
@@ -5220,7 +5217,7 @@ pub fn exec_replace_image(
     // exec_update_lock
     let old = guard.exec_update(|| {
         let mut table = TASKLIST.write();
-        let task = table.get_mut(tid);
+        let task = table.view_mut(&me);
         let mut task = task.expect("exec: current task not in the task table");
         task.pgd = new.pgd();
         new.set_dumpable(ident.dumpable);
@@ -5252,7 +5249,7 @@ pub fn exec_replace_image(
     // Get kernel stack for syscall/interrupt return
     let kstack_top = {
         let table = TASKLIST.read();
-        table.get(tid).map(|t| t.task.kstack_top).unwrap_or(0)
+        table.view(&me).map_or(0, |t| t.task.kstack_top)
     };
 
     // Jump to user mode at the new entry point
@@ -5296,16 +5293,15 @@ pub fn try_schedule() {
 ///
 /// Default is 0 (PER_LINUX).
 pub fn get_current_personality() -> u32 {
-    let tid = current_tid();
     let table = TASKLIST.read();
-    table.get(tid).map(|t| t.personality).unwrap_or(0)
+    table.view(&current()).map_or(0, |t| t.personality)
 }
 
 /// Set the current task's personality value
 pub fn set_current_personality(personality: u32) {
-    let tid = current_tid();
+    let me = current();
     let mut table = TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
+    if let Some(mut task) = table.view_mut(&me) {
         task.personality = personality;
     }
 }
@@ -5319,9 +5315,8 @@ pub fn set_current_personality(personality: u32) {
 /// Returns 0-3, where 3 grants full I/O port access.
 #[cfg(target_arch = "x86_64")]
 pub fn current_iopl_emul() -> u8 {
-    let tid = current_tid();
     let table = TASKLIST.read();
-    table.get(tid).map(|t| t.iopl_emul).unwrap_or(0)
+    table.view(&current()).map_or(0, |t| t.iopl_emul)
 }
 
 /// Set the current task's emulated IOPL level (x86-64 only)
@@ -5329,9 +5324,9 @@ pub fn current_iopl_emul() -> u8 {
 /// Level must be 0-3. Caller is responsible for privilege checks.
 #[cfg(target_arch = "x86_64")]
 pub fn set_current_iopl_emul(level: u8) {
-    let tid = current_tid();
+    let me = current();
     let mut table = TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
+    if let Some(mut task) = table.view_mut(&me) {
         task.iopl_emul = level;
     }
 }

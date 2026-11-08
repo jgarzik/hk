@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 /// `ns`'s child reaper, if listed (Linux pid_ns->child_reaper)
 pub fn child_reaper(table: &GlobalTaskTable, ns: &PidNamespace) -> Option<TaskRef> {
     let t = ns.reaper.access(table).as_ref()?.upgrade()?;
-    table.task(t.tid()).filter(|l| Arc::ptr_eq(l, &t))
+    table.view(&t).is_some().then_some(t)
 }
 
 /// `t` is `ns`'s child reaper (TASKLIST held)

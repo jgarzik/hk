@@ -23,7 +23,7 @@ use crate::ipc::{
 };
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
-use crate::task::percpu::{current_pid, current_tid};
+use crate::task::percpu::current_pid;
 use crate::time::TIMEKEEPER;
 use crate::uaccess::{UserPtr, UserSlice};
 use crate::util::error::{KernelError, KernelResult};
@@ -630,7 +630,7 @@ pub fn sys_semtimedop(
     // The undo list knows the array before the array knows the list
     // (Linux find_alloc_undo), so exit finds every adjustment
     let undo = if has_undo {
-        let ul = get_or_create_undo_list(current_tid())?;
+        let ul = get_or_create_undo_list(&crate::task::percpu::current())?;
         ul.register(semid, &sem_array_ref);
         Some(ul.id)
     } else {
@@ -996,7 +996,7 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> KernelResult<i
 // SEM_UNDO Support - Automatic semaphore adjustment on process exit
 // ============================================================================
 
-use crate::task::Tid;
+use crate::task::Task;
 use alloc::sync::Weak;
 
 /// Undo list ids (never reused, so a stale entry cannot alias a new list)
@@ -1043,10 +1043,10 @@ impl SemUndoList {
 
 use crate::task::percpu::TASKLIST;
 
-/// Get the undo list for a task, creating if necessary
-pub fn get_or_create_undo_list(tid: Tid) -> Result<Arc<SemUndoList>, KernelError> {
+/// Task `t`'s undo list, created if it has none
+pub fn get_or_create_undo_list(t: &Task) -> Result<Arc<SemUndoList>, KernelError> {
     let mut table = TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
+    if let Some(mut task) = table.view_mut(t) {
         if let Some(ul) = &task.sysvsem {
             return Ok(ul.clone());
         }
@@ -1059,23 +1059,22 @@ pub fn get_or_create_undo_list(tid: Tid) -> Result<Arc<SemUndoList>, KernelError
     }
 }
 
-/// Get the undo list for a task (if it exists)
-pub fn get_undo_list(tid: Tid) -> Option<Arc<SemUndoList>> {
-    let table = TASKLIST.read();
-    table.get(tid).and_then(|t| t.sysvsem.clone())
+/// Task `t`'s undo list, if it has one
+pub fn get_undo_list(t: &Task) -> Option<Arc<SemUndoList>> {
+    TASKLIST.read().view(t)?.sysvsem.clone()
 }
 
 /// Clone semaphore undo list for a new task
 ///
 /// If `share` is true (CLONE_SYSVSEM set), child shares parent's Arc<SemUndoList>.
 /// Otherwise, child starts with None (lazy allocation on first SEM_UNDO operation).
-pub fn clone_task_semundo(parent_tid: Tid, child_tid: Tid, share: bool) {
+pub fn clone_task_semundo(parent: &Task, child: &Task, share: bool) {
     if share {
         // CLONE_SYSVSEM: share the same undo list
-        let parent_undo = get_undo_list(parent_tid);
+        let parent_undo = get_undo_list(parent);
         if let Some(undo) = parent_undo {
             let mut table = TASKLIST.write();
-            if let Some(mut child) = table.get_mut(child_tid) {
+            if let Some(mut child) = table.view_mut(child) {
                 child.sysvsem = Some(undo);
             }
         }
@@ -1085,16 +1084,16 @@ pub fn clone_task_semundo(parent_tid: Tid, child_tid: Tid, share: bool) {
     // It will be created lazily if the child uses SEM_UNDO
 }
 
-/// Apply all semaphore undo operations for a task on exit (Linux
-/// exit_sem)
+/// Apply all of task `t`'s semaphore undo operations on its exit
+/// (Linux exit_sem)
 ///
 /// If the task's undo list is shared (via CLONE_SYSVSEM), the
 /// adjustments are only applied when the last sharing task exits (its
 /// drop is the one `Arc::into_inner` gives the list to).
-pub fn exit_sem(tid: Tid) {
+pub fn exit_sem(t: &Task) {
     let undo_list = {
         let mut table = TASKLIST.write();
-        table.get_mut(tid).and_then(|mut t| t.sysvsem.take())
+        table.view_mut(t).and_then(|mut t| t.sysvsem.take())
     };
     // The last sharer's drop gives the list back, exactly once even when
     // CLONE_SYSVSEM sharers exit together (Linux refcount_dec_and_test)

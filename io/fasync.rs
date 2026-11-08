@@ -396,7 +396,7 @@ fn sigio_target(table: &GlobalTaskTable, o: &Owner, t: &TaskView<'_>) -> Option<
         return None;
     }
     match o.kind {
-        PidType::Tid => table.task(t.task.tid()),
+        PidType::Tid => Some(crate::task::percpu::task_ref(t.task)),
         _ => group_task(table, Some(*t)),
     }
 }

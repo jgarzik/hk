@@ -970,11 +970,10 @@ fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
     use crate::sync::waitqueue::WaitEntry;
     use crate::task::percpu::{SleepState, schedule};
 
-    let (tgid, tid) = (me.pid, me.tid());
     let Some(sig) = crate::signal::get_task_signal_struct(me) else {
         return Ok(());
     };
-    if percpu::exec_waits(tgid, tid) {
+    if percpu::exec_waits(me) {
         if !sig.start_exec(me) {
             return Err(KernelError::WouldBlock);
         }
@@ -983,7 +982,7 @@ fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
         let w = core::pin::pin!(WaitEntry::new());
         let r = loop {
             wq.prepare_to_wait(w.as_ref(), SleepState::Killable);
-            if !percpu::exec_waits(tgid, tid) {
+            if !percpu::exec_waits(me) {
                 break Ok(());
             }
             if crate::signal::fatal_signal_pending() {
@@ -998,7 +997,7 @@ fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
     // Released after TASKLIST: the old leader and exited threads; a
     // tracer waiting for the old leader rechecks (Linux de_thread:
     // __wake_up_parent before its silent release)
-    let gone = percpu::take_leadership(tgid, tid);
+    let gone = percpu::take_leadership(me);
     if !gone.is_empty() {
         drop(gone);
         crate::task::proc::CHILD_EXIT_WQ.wake_all();

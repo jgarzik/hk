@@ -36,7 +36,6 @@ use core::pin::Pin;
 
 use crate::fs::File;
 use crate::sync::waitqueue::{WaitEntry, WaitQueue};
-use crate::task::Tid;
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_box;
 
@@ -180,8 +179,6 @@ impl FdSet {
 /// keep the wait queues alive. Dropping the context removes all
 /// registrations.
 pub struct PollContext {
-    /// Task ID of the polling task
-    pub task: Tid,
     /// Registered (wait queue, entry) pairs
     entries: Vec<(*const WaitQueue, Pin<Box<WaitEntry>>)>,
     /// Files whose wait queues we registered on (keeps them alive)
@@ -199,9 +196,8 @@ impl PollContext {
     /// A context for about `n` registering files, sized up front when
     /// memory allows so the first scan does not grow it one fd at a
     /// time (failing that, it grows as fds register)
-    pub fn sized(tid: Tid, n: usize) -> Self {
+    pub fn sized(n: usize) -> Self {
         let mut c = Self {
-            task: tid,
             entries: Vec::new(),
             files: Vec::new(),
             owners: Vec::new(),

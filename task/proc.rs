@@ -478,9 +478,9 @@ pub fn sys_waitid(
 ///
 /// Returns the caller's thread ID.
 pub fn sys_set_tid_address(tidptr: UserPtr<i32>) -> i64 {
-    let tid = super::percpu::current_tid();
-    crate::task::set_clear_child_tid(tid, tidptr.addr());
-    tid as i64
+    let me = super::percpu::current();
+    crate::task::set_clear_child_tid(&me, tidptr.addr());
+    me.tid() as i64
 }
 
 // =============================================================================

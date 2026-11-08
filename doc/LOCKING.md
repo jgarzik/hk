@@ -989,7 +989,8 @@ reads it and `&mut table` writes it, checked by the compiler (the
 table is a `UniqueOwner`: TASKLIST holds the only one). The `Pid`
 process-group and session lists are owned the same way. A `TaskRef` cloned out of the table keeps the task alive but
 reads only its fixed and atomic fields without the lock. A helper
-given a task (`&Task`: the signal, seccomp and rlimit helpers) reads
+given a task (`&Task`: the signal, seccomp, rlimit, ptrace, sched,
+SysV undo, robust-list and child-tid helpers) reads
 or writes its `TaskInner` through `GlobalTaskTable::view` /
 `view_mut`, which return None once the task is off the list (reaped:
 its `tasks_link`, changed only under the write lock, is unlinked); a
@@ -1172,8 +1173,8 @@ signal_wake_up(fatal) clearing JOBCTL_TRACED), so a wait after the
 kill never reports the stop. A tracer's request holds the stop while it
 runs (`TaskInner.ptrace_frozen`, Linux JOBCTL_PTRACE_FROZEN): set under
 the write lock by `ptrace_check_attach` (in the stop, no SIGKILL
-pending), cleared under it when the request's `Frozen` guard drops (if the
-listed task is still the same `Task`, not one that reused its tid),
+pending), cleared under it when the request's `Frozen` guard drops (if
+the tracee is still listed: `view_mut`),
 and whenever a stop begins or ends (resume, detach, the tracer's exit,
 the tracee leaving `ptrace_stop`), so no stale flag outlives a stop;
 while it is set, SIGKILL leaves the stop alone (`sigkill_task`, and the

@@ -61,9 +61,9 @@ fn current_time() -> Timespec {
 /// only while it is listed)
 fn listed<'a>(
     table: &'a crate::task::percpu::GlobalTaskTable,
-    t: &crate::task::Task,
+    t: &'a crate::task::Task,
 ) -> Option<crate::task::percpu::TaskView<'a>> {
-    table.get(t.tid()).filter(|v| core::ptr::eq(v.task, t))
+    table.view(t)
 }
 
 /// `t` is still in the task list (not reaped)
@@ -1831,12 +1831,12 @@ fn readdir_emit_pids(root: &Inode, ctx: &mut DirContext<'_>) -> Result<(), Kerne
     let ns = opts::pid_ns(root);
     // Each group leader, by its number in ns, gathered with no
     // allocation under TASKLIST (references dropped after it)
-    let mut pids = crate::task::percpu::GlobalTaskTable::collect_tasks(|table, t| {
+    let mut pids = crate::task::percpu::GlobalTaskTable::collect_tasks(|_, t| {
         if t.task.tid() != t.task.pid || t.task.pid == 0 {
             return None;
         }
         let nr = t.thread_pid.as_ref()?.nr_in(&ns)?;
-        Some((nr, table.task(t.task.tid())?))
+        Some((nr, crate::task::percpu::task_ref(t.task)))
     });
     pids.sort_unstable_by_key(|&(nr, _)| nr);
 

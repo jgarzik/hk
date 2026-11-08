@@ -823,10 +823,10 @@ pub fn sys_set_robust_list(head: UserPtr<RobustListHead>, len: u64) -> KernelRes
         return Err(KernelError::InvalidArgument);
     }
 
-    let tid = crate::task::percpu::current_tid();
+    let me = crate::task::percpu::current();
 
     let mut table = TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
+    if let Some(mut task) = table.view_mut(&me) {
         task.robust_list = head.addr();
     }
     Ok(())
@@ -846,25 +846,12 @@ pub fn sys_get_robust_list(
     head_ptr: UserPtr<u64>,
     len_ptr: UserPtr<u64>,
 ) -> KernelResult<()> {
-    let current_tid = crate::task::percpu::current_tid();
-
-    // Determine target TID
-    let target_tid = if pid == 0 {
-        current_tid
-    } else {
-        // For non-zero pid, we'd need to look up the task
-        // For now, only support current task
-        if pid as Tid != u64::from(crate::task::pid::vnr(current_tid)) {
-            return Err(KernelError::NoProcess);
-        }
-        current_tid
-    };
-
-    let head = TASKLIST
-        .read()
-        .get(target_tid)
-        .map(|t| t.robust_list)
-        .unwrap_or(0);
+    let me = crate::task::percpu::current();
+    // Only the caller itself for now: pid 0 or its own number
+    if pid != 0 && pid as Tid != u64::from(crate::task::pid::vnr(me.tid())) {
+        return Err(KernelError::NoProcess);
+    }
+    let head = TASKLIST.read().view(&me).map_or(0, |t| t.robust_list);
 
     // Write head pointer and length to user memory
     if !head_ptr.is_null() {
@@ -883,12 +870,13 @@ pub fn sys_get_robust_list(
 /// 2. For each held futex, set FUTEX_OWNER_DIED and wake one waiter
 ///
 /// # Arguments
-/// * `tid` - Thread ID of exiting task
-pub fn exit_robust_list(tid: Tid) {
+/// * `me` - The exiting task
+pub fn exit_robust_list(me: &crate::task::Task) {
+    let tid = me.tid();
     // Get and remove robust list for this task
     let head_addr = {
         let mut table = TASKLIST.write();
-        if let Some(mut task) = table.get_mut(tid) {
+        if let Some(mut task) = table.view_mut(me) {
             let addr = task.robust_list;
             task.robust_list = 0;
             (addr != 0).then_some(addr)

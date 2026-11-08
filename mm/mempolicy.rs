@@ -340,7 +340,7 @@ fn mm_target(pid: i64) -> Result<(), KernelError> {
     }
     let t = crate::task::percpu::find_task_by_vpid(pid as u64).ok_or(KernelError::NoProcess)?;
     let _g = crate::signal::ExecUpdateRead::lock(&t);
-    if !crate::task::ptrace::may_access_tid(t.tid(), false) {
+    if !crate::task::ptrace::may_access_task(&t, false) {
         return Err(KernelError::NotPermitted);
     }
     crate::mm::get_task_mm(&t)

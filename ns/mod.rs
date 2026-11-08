@@ -454,7 +454,7 @@ const CLONE_SYSVSEM: u64 = 0x00040000;
 /// Unlike clone(), unshare() always affects the calling thread.
 /// The new namespace takes effect immediately.
 pub fn sys_unshare(unshare_flags: u64) -> KernelResult<()> {
-    let tid = crate::task::percpu::current_tid();
+    let _tid = crate::task::percpu::current_tid();
     let ns_flags = unshare_flags & CLONE_NS_FLAGS;
     let sysvsem_flag = unshare_flags & CLONE_SYSVSEM;
 
@@ -463,7 +463,7 @@ pub fn sys_unshare(unshare_flags: u64) -> KernelResult<()> {
     if sysvsem_flag != 0 {
         // Detach from any shared undo list by exiting and re-creating
         // This applies any pending undos if we're the last holder
-        crate::ipc::sem::exit_sem(tid);
+        crate::ipc::sem::exit_sem(&crate::task::percpu::current());
     }
 
     // No namespace flags - nothing more to do

@@ -2954,7 +2954,7 @@ pub fn force_sig_fault(info: SigInfo, trap: TrapSet, regs: &UserFrame) {
     // tracer sees its signal-delivery stop first (Linux force_sig_fault
     // -> get_signal -> ptrace_signal); delivered on the way back to user
     // space, it is unblocked and not ignored, as force_sig makes it
-    if crate::task::ptrace::is_traced(me.tid()) {
+    if crate::task::ptrace::is_traced(&me) {
         force_sig_info(&me, info);
         return;
     }

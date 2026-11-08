@@ -54,10 +54,9 @@ pub fn avenrun() -> [u64; 3] {
 /// idr_get_cursor(&task_active_pid_ns(current)->idr) - 1): a reader in
 /// a child namespace learns nothing of its parent's
 fn last_pid() -> u32 {
-    let tid = super::percpu::current_tid();
     let table = super::percpu::TASKLIST.read();
     table
-        .get(tid)
+        .view(&super::percpu::current())
         .and_then(|t| t.thread_pid.as_ref().map(|p| p.ns().map.last()))
         .unwrap_or_else(|| crate::ns::INIT_PID_NS.map.last())
 }

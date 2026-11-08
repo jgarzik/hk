@@ -317,7 +317,7 @@ pub fn sys_kill(pid: i64, sig: u32) -> KernelResult<()> {
 fn kill_all(sig: u32) -> KernelResult<()> {
     let self_tgid = {
         let table = crate::task::percpu::TASKLIST.read();
-        table.get(current_tid()).map(|t| t.task.pid).unwrap_or(0)
+        table.view(&current()).map_or(0, |t| t.task.pid)
     };
     // Only processes the caller's namespace numbers, but its init
     // (Linux kill_something_info: task_pid_vnr(p) > 1)

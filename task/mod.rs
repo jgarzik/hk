@@ -343,12 +343,12 @@ pub fn commit_creds(new: Arc<Cred>) {
 /// real-uid change flagged the task and it is still over; else the flag
 /// is cleared
 pub fn nproc_exec_check() -> KernelResult<()> {
-    let tid = percpu::current_tid();
+    let me = percpu::current();
     let uid = current_cred().uid;
     // rlimit() takes TASKLIST: decide before locking it
     let over = nproc_overlimit(nproc_count(uid));
     let table = percpu::TASKLIST.read();
-    let Some(t) = table.get(tid) else {
+    let Some(t) = table.view(&me) else {
         return Ok(());
     };
     if t.task.has_flag(crate::task::pf::NPROC_EXCEEDED) && over {
@@ -2289,10 +2289,11 @@ pub fn cap_fix_setuid(old: &Cred, new: &mut Cred, keep_caps: bool) {
     }
 }
 
-/// How many times process `pid` has exec'd (Linux self_exec_id: its
-/// struct pid's count, which an exec bumps), 0 if it is gone
-pub fn self_exec_id(pid: Pid) -> u64 {
-    u32::try_from(pid)
+/// How many times task `t`'s process has exec'd (Linux self_exec_id:
+/// the process's struct pid's count, which an exec bumps), 0 if it is
+/// gone
+pub fn self_exec_id(t: &Task) -> u64 {
+    u32::try_from(t.pid)
         .ok()
         .and_then(|n| crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, n))
         .map_or(0, |p| p.exec_gen())
@@ -2455,9 +2456,9 @@ pub fn nproc_move(old: Uid, new: Uid) {
 /// user never is); the flag is cleared otherwise
 fn flag_nproc_exceeded(new: Uid) {
     let over = new != 0 && nproc_overlimit(nproc_count(new));
-    let tid = percpu::current_tid();
+    let me = percpu::current();
     let table = percpu::TASKLIST.read();
-    if let Some(t) = table.get(tid) {
+    if let Some(t) = table.view(&me) {
         if over {
             t.task.set_flag(crate::task::pf::NPROC_EXCEEDED);
         } else {
@@ -2632,14 +2633,6 @@ pub const IOPRIO_WHO_USER: i32 = 3;
 // task itself (arch_prctl, the switch-out save) or its creator, read at
 // switch-in.
 
-/// Set the TLS pointer of task `tid` (the task itself, or ptrace on a
-/// stopped tracee)
-pub fn set_task_tls(tid: Tid, tls: u64) {
-    if let Some(t) = percpu::TASKLIST.read().get(tid) {
-        t.task.tls.store(tls, Ordering::Relaxed);
-    }
-}
-
 // =============================================================================
 // Per-task clear_child_tid pointer (for set_tid_address syscall)
 // =============================================================================
@@ -2647,19 +2640,10 @@ pub fn set_task_tls(tid: Tid, tls: u64) {
 // Stored directly in Task struct (clear_child_tid field), following Linux's
 // task_struct->clear_child_tid pattern.
 
-/// Get the clear_child_tid pointer for a task
-pub fn get_clear_child_tid(tid: Tid) -> Option<u64> {
-    let table = percpu::TASKLIST.read();
-    table
-        .get(tid)
-        .map(|t| t.clear_child_tid)
-        .filter(|&v| v != 0)
-}
-
-/// Set the clear_child_tid pointer for a task
-pub fn set_clear_child_tid(tid: Tid, addr: u64) {
+/// Set task `t`'s clear_child_tid pointer
+pub fn set_clear_child_tid(t: &Task, addr: u64) {
     let mut table = percpu::TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
+    if let Some(mut task) = table.view_mut(t) {
         task.clear_child_tid = addr;
     }
 }
@@ -2671,10 +2655,10 @@ pub fn set_clear_child_tid(tid: Tid, addr: u64) {
 // Stored directly in Task struct (set_child_tid field), following Linux's
 // task_struct->set_child_tid pattern.
 
-/// Get and remove the set_child_tid pointer for a task (one-time use)
-pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
+/// Get and remove task `t`'s set_child_tid pointer (one-time use)
+pub fn get_set_child_tid(t: &Task) -> Option<u64> {
     let mut table = percpu::TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
+    if let Some(mut task) = table.view_mut(t) {
         let addr = task.set_child_tid;
         if addr != 0 {
             task.set_child_tid = 0; // Consume (one-time use)
@@ -2684,11 +2668,11 @@ pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
     None
 }
 
-/// Set the set_child_tid pointer for a task
-pub fn set_set_child_tid(tid: Tid, addr: u64) {
+/// Set task `t`'s set_child_tid pointer
+pub fn set_set_child_tid(t: &Task, addr: u64) {
     if addr != 0 {
         let mut table = percpu::TASKLIST.write();
-        if let Some(mut task) = table.get_mut(tid) {
+        if let Some(mut task) = table.view_mut(t) {
             task.set_child_tid = addr;
         }
     }

@@ -300,8 +300,7 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(
     let usage = match who {
         RUSAGE_THREAD => {
             // RUSAGE_THREAD: return current thread's stats only
-            let tid = percpu::current_tid();
-            let (utime_ns, stime_ns) = percpu::get_task_times(tid);
+            let (utime_ns, stime_ns) = percpu::get_task_times(&percpu::current());
             Rusage {
                 ru_utime: timeval_from_ns(utime_ns),
                 ru_stime: timeval_from_ns(stime_ns),
@@ -1199,23 +1198,20 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> KernelResult<i3
 /// with PTRACE_MODE_ATTACH_REALCREDS access
 fn pidfd_fget(pidfd_file: &File, targetfd: i32) -> KernelResult<alloc::sync::Arc<File>> {
     // The pidfd's process itself, while it is still there
-    let target_tid = crate::task::pidfd::pidfd_tid(pidfd_file)?;
-    let target = super::percpu::find_task(target_tid);
+    let target = crate::task::pidfd::pidfd_task(pidfd_file)?;
 
-    let _exec = target.as_deref().map(crate::signal::ExecUpdateRead::lock);
-    if !super::ptrace::may_access_tid(target_tid, false) {
+    let _exec = crate::signal::ExecUpdateRead::lock(&target);
+    if !super::ptrace::may_access_task(&target, false) {
         return Err(KernelError::NotPermitted);
     }
 
     // Get target's fd table (none: process exiting)
-    let target_fd_table = target
-        .as_deref()
-        .and_then(super::fdtable::get_task_fd)
-        .ok_or(KernelError::NoProcess)?;
-    // Its process still being that task, every lookup by tid above
-    // found it (the tid is not freed while it is listed); else its
-    // files are gone (Linux fget_task: EBADF)
-    if crate::task::pidfd::pidfd_tid(pidfd_file) != Ok(target_tid) {
+    let target_fd_table = super::fdtable::get_task_fd(&target).ok_or(KernelError::NoProcess)?;
+    // Its process still being that task; else its files are gone
+    // (Linux fget_task: EBADF)
+    let same = crate::task::pidfd::pidfd_task(pidfd_file)
+        .is_ok_and(|t| alloc::sync::Arc::ptr_eq(&t, &target));
+    if !same {
         return Err(KernelError::BadFd);
     }
     target_fd_table

@@ -162,7 +162,7 @@ fn do_poll_internal(fds: UserPtr<PollFd>, nfds: u32, deadline: Deadline) -> Kern
         return Err(KernelError::InvalidArgument);
     }
 
-    let tid = current_tid();
+    let _tid = current_tid();
 
     // Empty poll: just sleep for the timeout (or until a signal)
     if nfds == 0 {
@@ -186,7 +186,7 @@ fn do_poll_internal(fds: UserPtr<PollFd>, nfds: u32, deadline: Deadline) -> Kern
     } else {
         pollfds.iter().filter(|p| p.fd >= 0).count()
     };
-    let mut ctx = PollContext::sized(tid, regs);
+    let mut ctx = PollContext::sized(regs);
     let mut first_pass = true;
     let mut ready_count;
 
@@ -469,7 +469,7 @@ fn do_select_internal(
             .sum::<usize>()
     };
     let regs = if deadline == Some(0) { 0 } else { asked() };
-    let mut ctx = PollContext::sized(current_tid(), regs);
+    let mut ctx = PollContext::sized(regs);
     let mut first_pass = true;
     let mut ready_count;
     let fd_table = current_fd_table();

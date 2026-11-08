@@ -129,7 +129,7 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
     let mut sig = if own { t.exit_signal as u32 } else { SIGCHLD };
     // A custom exit signal only to the image that asked for it (Linux:
     // parent_exec_id != parent->self_exec_id makes it SIGCHLD)
-    if sig != SIGCHLD && t.parent_exec_id != crate::task::self_exec_id(parent.pid) {
+    if sig != SIGCHLD && t.parent_exec_id != crate::task::self_exec_id(&parent) {
         sig = SIGCHLD;
     }
     if sig > 64 {

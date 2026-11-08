@@ -11,8 +11,9 @@
 //! needed for basic debugging and tracing.
 
 use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP};
+use crate::task::percpu::TaskRef;
 use crate::task::percpu::{self, TASKLIST};
-use crate::task::{CAP_SYS_PTRACE, Pid, TaskState, Tid, capable};
+use crate::task::{CAP_SYS_PTRACE, Pid, Task, TaskState, capable};
 use crate::uaccess::{UserPtr, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 
@@ -165,25 +166,23 @@ pub const PTRACE_EVENT_STOP: u32 = 128;
 /// May the caller attach to the target (Linux ptrace_attach ->
 /// __ptrace_may_access, PTRACE_MODE_ATTACH_REALCREDS): [`may_access`]
 /// with the caller's real ids
-fn ptrace_may_access(target_tid: Tid) -> bool {
-    may_access(|t| t.task.tid() == target_tid, false)
+fn ptrace_may_access(t: &Task) -> bool {
+    may_access_view(t, false)
 }
 
 /// Linux ptrace_attach's first refusals (EPERM): a kernel thread, or a
 /// thread of the caller's own thread group
-fn attach_refused(target_tid: Tid) -> bool {
+fn attach_refused(t: &Task) -> bool {
     let table = TASKLIST.read();
-    table.get(target_tid).is_none_or(|t| {
-        t.task.has_flag(crate::task::pf::KTHREAD) || t.task.pid == percpu::current_pid()
+    table.view(t).is_none_or(|v| {
+        v.task.has_flag(crate::task::pf::KTHREAD) || v.task.pid == percpu::current_pid()
     })
 }
 
 /// The thread `pid` names in the caller's pid namespace (Linux
 /// find_task_by_vpid): ESRCH if none
-fn tracee(pid: Pid) -> KernelResult<Tid> {
-    percpu::find_task_by_vpid(pid)
-        .map(|t| t.tid())
-        .ok_or(KernelError::NoProcess)
+fn tracee(pid: Pid) -> KernelResult<TaskRef> {
+    percpu::find_task_by_vpid(pid).ok_or(KernelError::NoProcess)
 }
 
 /// Check if tracee is stopped and caller is its tracer.
@@ -191,11 +190,10 @@ fn tracee(pid: Pid) -> KernelResult<Tid> {
 /// Most ptrace operations require the tracee to be in a ptrace-stop,
 /// and switched out: its CPU may still be on its way out of it, with
 /// its TLS and GS base not yet saved (Linux wait_task_inactive)
-fn ptrace_check_attach(target_tid: Tid) -> KernelResult<Frozen> {
-    let task = {
+fn ptrace_check_attach(task: &TaskRef) -> KernelResult<Frozen> {
+    {
         let mut table = TASKLIST.write();
-        let task = table.task(target_tid).ok_or(KernelError::NoProcess)?;
-        let mut target = table.get_mut(target_tid).ok_or(KernelError::NoProcess)?;
+        let mut target = table.view_mut(task).ok_or(KernelError::NoProcess)?;
 
         // Check if we are the tracer
         if !target.traced_by(&percpu::current()) {
@@ -204,13 +202,12 @@ fn ptrace_check_attach(target_tid: Tid) -> KernelResult<Frozen> {
 
         // In a ptrace stop, and not killed (Linux ptrace_freeze_traced):
         // the stop then stays until the request ends
-        if !matches!(target.state, TaskState::Traced(_)) || signal::task_fatal_pending(&task) {
+        if !matches!(target.state, TaskState::Traced(_)) || signal::task_fatal_pending(task) {
             return Err(KernelError::NoProcess);
         }
         target.ptrace_frozen = true;
-        task
-    };
-    let frozen = Frozen(task);
+    }
+    let frozen = Frozen(task.clone());
     if !percpu::wait_task_inactive(&frozen.0) {
         return Err(KernelError::NoProcess);
     }
@@ -221,17 +218,13 @@ fn ptrace_check_attach(target_tid: Tid) -> KernelResult<Frozen> {
 /// JOBCTL_PTRACE_FROZEN, set by ptrace_check_attach); dropped at the
 /// end of the request, it lets go (Linux ptrace_unfreeze_traced): a
 /// SIGKILL that came meanwhile ends the stop and wakes it
-struct Frozen(percpu::TaskRef);
+struct Frozen(TaskRef);
 
 impl Drop for Frozen {
     fn drop(&mut self) {
         let killed = {
             let mut table = TASKLIST.write();
-            // The same task, not another that took its reused tid
-            let Some(mut t) = table
-                .get_mut(self.0.tid())
-                .filter(|t| core::ptr::eq(t.task, alloc::sync::Arc::as_ptr(&self.0)))
-            else {
+            let Some(mut t) = table.view_mut(&self.0) else {
                 return;
             };
             t.ptrace_frozen = false;
@@ -250,28 +243,9 @@ impl Drop for Frozen {
     }
 }
 
-/// Check if a task is being traced
-pub fn is_traced(tid: Tid) -> bool {
-    let table = TASKLIST.read();
-    table.get(tid).map(|t| t.ptrace != 0).unwrap_or(false)
-}
-
-/// Check if syscall tracing is active for a task
-pub fn has_syscall_trace(tid: Tid) -> bool {
-    let table = TASKLIST.read();
-    table
-        .get(tid)
-        .map(|t| t.ptrace & PT_SYSCALL_TRACE != 0)
-        .unwrap_or(false)
-}
-
-/// Check if single-step is active for a task
-pub fn has_singlestep(tid: Tid) -> bool {
-    let table = TASKLIST.read();
-    table
-        .get(tid)
-        .map(|t| t.ptrace & PT_SINGLESTEP != 0)
-        .unwrap_or(false)
+/// Task `t` is being traced
+pub fn is_traced(t: &Task) -> bool {
+    TASKLIST.read().view(t).is_some_and(|v| v.ptrace != 0)
 }
 
 // =============================================================================
@@ -282,10 +256,10 @@ pub fn has_singlestep(tid: Tid) -> bool {
 ///
 /// This must be called before exec() to allow the parent to trace the child.
 fn ptrace_traceme() -> KernelResult<i64> {
-    let tid = percpu::current_tid();
+    let me = percpu::current();
 
     let mut table = TASKLIST.write();
-    let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+    let mut task = table.view_mut(&me).ok_or(KernelError::NoProcess)?;
 
     // Already being traced?
     if task.ptrace != 0 {
@@ -307,26 +281,22 @@ fn ptrace_traceme() -> KernelResult<i64> {
 ///
 /// This sends SIGSTOP to the target and makes the caller the tracer.
 fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
-    if attach_refused(target_tid) {
+    if attach_refused(&task) {
         return Err(KernelError::NotPermitted);
     }
 
     // Check permissions and attach under the target's cred_guard_mutex
     // (Linux ptrace_attach): no exec of it changes its dumpability between
-    let task = percpu::find_task(target_tid);
-    let _guard = task
-        .as_deref()
-        .map(crate::signal::CredGuard::lock)
-        .transpose()?;
-    if !ptrace_may_access(target_tid) {
+    let _guard = crate::signal::CredGuard::lock(&task)?;
+    if !ptrace_may_access(&task) {
         return Err(KernelError::NotPermitted);
     }
 
     {
         let mut table = TASKLIST.write();
-        let mut target = table.get_mut(target_tid).ok_or(KernelError::NoProcess)?;
+        let mut target = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
 
         // Already being traced?
         if target.ptrace != 0 {
@@ -342,9 +312,7 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
 
     // Send SIGSTOP to the target to stop it (Linux ptrace_attach:
     // SEND_SIG_PRIV)
-    if let Some(t) = &task {
-        let _ = signal::send_sig_info(t, SIGSTOP, signal::SendInfo::Kernel);
-    }
+    let _ = signal::send_sig_info(&task, SIGSTOP, signal::SendInfo::Kernel);
 
     Ok(0)
 }
@@ -363,26 +331,22 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> KernelResult<i64> {
         return Err(KernelError::InvalidArgument);
     }
 
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
-    if attach_refused(target_tid) {
+    if attach_refused(&task) {
         return Err(KernelError::NotPermitted);
     }
 
     // Check permissions and attach under the target's cred_guard_mutex
     // (Linux ptrace_attach): no exec of it changes its dumpability between
-    let task = percpu::find_task(target_tid);
-    let _guard = task
-        .as_deref()
-        .map(crate::signal::CredGuard::lock)
-        .transpose()?;
-    if !ptrace_may_access(target_tid) {
+    let _guard = crate::signal::CredGuard::lock(&task)?;
+    if !ptrace_may_access(&task) {
         return Err(KernelError::NotPermitted);
     }
 
     {
         let mut table = TASKLIST.write();
-        let mut target = table.get_mut(target_tid).ok_or(KernelError::NoProcess)?;
+        let mut target = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
 
         // Already being traced?
         if target.ptrace != 0 {
@@ -410,22 +374,20 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> KernelResult<i64> {
 ///
 /// The tracee is continued with an optional signal.
 fn ptrace_detach(target_pid: Pid, signal: u32) -> KernelResult<i64> {
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
     // Verify we are the tracer
-    let _frozen = ptrace_check_attach(target_tid)?;
+    let _frozen = ptrace_check_attach(&task)?;
 
     {
         let mut table = TASKLIST.write();
-        if table.get(target_tid).is_none() {
-            return Err(KernelError::NoProcess);
-        }
-        ptrace_unlink(&mut table, target_tid);
+        let mut t = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
+        ptrace_unlink(&mut t);
     }
-    crate::arch::ptrace::disable_single_step(target_tid);
+    crate::arch::ptrace::disable_single_step(&task);
 
     // Resume it, delivering `signal` (Linux ptrace_detach: exit_code)
-    ptrace_wake(target_tid, resume_sig(signal));
+    ptrace_wake(&task, resume_sig(signal));
     Ok(0)
 }
 
@@ -436,10 +398,10 @@ fn resume_sig(sig: u32) -> u32 {
 
 /// Let a stopped tracee go on with `sig` to deliver (Linux
 /// ptrace_resume: exit_code, wake_up_state(__TASK_TRACED))
-fn ptrace_wake(tid: Tid, sig: u32) {
-    let task = {
+fn ptrace_wake(task: &TaskRef, sig: u32) {
+    {
         let mut table = TASKLIST.write();
-        let Some(mut t) = table.get_mut(tid) else {
+        let Some(mut t) = table.view_mut(task) else {
             return;
         };
         if !matches!(t.state, TaskState::Traced(_)) {
@@ -448,11 +410,8 @@ fn ptrace_wake(tid: Tid, sig: u32) {
         t.state = TaskState::Ready;
         t.ptrace_frozen = false;
         t.ptrace_code = sig;
-        table.task(tid)
-    };
-    if let Some(t) = task {
-        percpu::try_to_wake_up(&t, percpu::WakeMode::Any);
     }
+    percpu::try_to_wake_up(task, percpu::WakeMode::Any);
 }
 
 // =============================================================================
@@ -466,14 +425,14 @@ fn ptrace_wake(tid: Tid, sig: u32) {
 /// * `request` - PTRACE_CONT, PTRACE_SYSCALL, or PTRACE_SINGLESTEP
 /// * `signal` - Signal to inject (0 for none)
 fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> KernelResult<i64> {
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
     // Verify we are the tracer and tracee is stopped
-    let _frozen = ptrace_check_attach(target_tid)?;
+    let _frozen = ptrace_check_attach(&task)?;
 
     {
         let mut table = TASKLIST.write();
-        let mut target = table.get_mut(target_tid).ok_or(KernelError::NoProcess)?;
+        let mut target = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
 
         // Update ptrace flags based on request
         use crate::task::tif::SYSCALL_TRACE;
@@ -498,12 +457,12 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> KernelResult<i64
 
     // The trap flag (these take TASKLIST themselves)
     if request == PTRACE_SINGLESTEP {
-        crate::arch::ptrace::enable_single_step(target_tid);
+        crate::arch::ptrace::enable_single_step(&task);
     } else {
-        crate::arch::ptrace::disable_single_step(target_tid);
+        crate::arch::ptrace::disable_single_step(&task);
     }
 
-    ptrace_wake(target_tid, resume_sig(signal));
+    ptrace_wake(&task, resume_sig(signal));
     Ok(0)
 }
 
@@ -513,12 +472,12 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> KernelResult<i64
 
 /// PTRACE_KILL - kill a traced process (deprecated, use PTRACE_CONT with SIGKILL).
 fn ptrace_kill(target_pid: Pid) -> KernelResult<i64> {
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
     // Verify we are the tracer
     {
         let table = TASKLIST.read();
-        let target = table.get(target_tid).ok_or(KernelError::NoProcess)?;
+        let target = table.view(&task).ok_or(KernelError::NoProcess)?;
 
         if !target.traced_by(&percpu::current()) {
             return Err(KernelError::NoProcess);
@@ -526,9 +485,7 @@ fn ptrace_kill(target_pid: Pid) -> KernelResult<i64> {
     }
 
     // Send SIGKILL
-    if let Some(t) = percpu::find_task(target_tid) {
-        let _ = signal::send_signal(&t, SIGKILL);
-    }
+    let _ = signal::send_signal(&task, SIGKILL);
 
     Ok(0)
 }
@@ -546,25 +503,16 @@ fn may_access_vm(mm: &crate::mm::MmRef) -> bool {
     mm.dumpable() == SUID_DUMP_USER || capable(CAP_SYS_PTRACE)
 }
 
-/// Get target's memory descriptor and page table root
-fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
-    // A user reference: the address space cannot be torn down while we
-    // access it (Linux get_task_mm)
-    let t = crate::task::percpu::find_task(target_tid)?;
-    let mm = crate::mm::get_task_mm_users(&t)?;
-    let pgd = mm.pgd();
-    Some((mm, pgd))
-}
-
 /// Read a word from tracee's memory.
 fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> KernelResult<i64> {
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
     // Verify we are the tracer
-    let _frozen = ptrace_check_attach(target_tid)?;
+    let _frozen = ptrace_check_attach(&task)?;
 
-    // Get target's mm and page table
-    let Some((target_mm, _)) = get_target_mm_and_pt(target_tid) else {
+    // A user reference: the address space cannot be torn down while we
+    // access it (Linux get_task_mm)
+    let Some(target_mm) = crate::mm::get_task_mm_users(&task) else {
         return Err(KernelError::NoProcess);
     };
     if !may_access_vm(&target_mm) {
@@ -586,13 +534,14 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> KernelResult<i64> 
 
 /// Write a word to tracee's memory.
 fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> KernelResult<i64> {
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
     // Verify we are the tracer
-    let _frozen = ptrace_check_attach(target_tid)?;
+    let _frozen = ptrace_check_attach(&task)?;
 
-    // Get target's mm and page table
-    let Some((target_mm, _)) = get_target_mm_and_pt(target_tid) else {
+    // A user reference: the address space cannot be torn down while we
+    // access it (Linux get_task_mm)
+    let Some(target_mm) = crate::mm::get_task_mm_users(&task) else {
         return Err(KernelError::NoProcess);
     };
     if !may_access_vm(&target_mm) {
@@ -619,14 +568,14 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> KernelResult<i64> {
         return Err(KernelError::InvalidArgument);
     }
 
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
     // Verify we are the tracer
-    let _frozen = ptrace_check_attach(target_tid)?;
+    let _frozen = ptrace_check_attach(&task)?;
 
     {
         let mut table = TASKLIST.write();
-        let mut target = table.get_mut(target_tid).ok_or(KernelError::NoProcess)?;
+        let mut target = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
 
         target.ptrace_options = options;
     }
@@ -642,9 +591,9 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> KernelResult<i64> {
 /// PTRACE_GETSIGINFO: the stopped tracee's stop siginfo to `data`
 /// (Linux ptrace_getsiginfo): EINVAL if the stop has none
 fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> KernelResult<i64> {
-    let tid = tracee(target_pid)?;
-    let _frozen = ptrace_check_attach(tid)?;
-    let info = TASKLIST.read().get(tid).and_then(|t| t.last_siginfo);
+    let task = tracee(target_pid)?;
+    let _frozen = ptrace_check_attach(&task)?;
+    let info = TASKLIST.read().view(&task).and_then(|t| t.last_siginfo);
     info.ok_or(KernelError::InvalidArgument)?
         .copy_to_user(data)?;
     Ok(0)
@@ -654,11 +603,11 @@ fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> KernelResult<i64> {
 /// the one at `data` (Linux ptrace_setsiginfo): what it delivers if the
 /// tracer resumes it with that signal; EINVAL if the stop has none
 fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> KernelResult<i64> {
-    let tid = tracee(target_pid)?;
-    let _frozen = ptrace_check_attach(tid)?;
+    let task = tracee(target_pid)?;
+    let _frozen = ptrace_check_attach(&task)?;
     let info = crate::signal::SigInfo::copy_from_user(data)?;
     let mut table = TASKLIST.write();
-    match table.get_mut(tid) {
+    match table.view_mut(&task) {
         Some(mut t) if t.last_siginfo.is_some() => {
             t.last_siginfo = Some(info);
             Ok(0)
@@ -672,8 +621,8 @@ fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> KernelResult<i64> {
 /// its group's, to `data` (Linux ptrace_peek_siginfo): how many
 fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> KernelResult<i64> {
     const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
-    let tid = tracee(target_pid)?;
-    let _frozen = ptrace_check_attach(tid)?;
+    let task = tracee(target_pid)?;
+    let _frozen = ptrace_check_attach(&task)?;
     // struct ptrace_peeksiginfo_args { u64 off; u32 flags; s32 nr; }
     let mut args = [0u8; 16];
     crate::uaccess::copy_from_user::<crate::arch::Uaccess>(&mut args, addr, 16)?;
@@ -685,21 +634,18 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> KernelResult<i64
     }
     let shared = flags & PTRACE_PEEKSIGINFO_SHARED != 0;
     let mut copied = 0i64;
-    let t = percpu::find_task(tid);
     for i in 0..u64::from(nr.unsigned_abs()) {
         let Some(n) = off.checked_add(i) else {
             break;
         };
-        let info = t.as_deref().and_then(|t| {
-            signal::with_task_signal_state(t, |s| {
-                if shared {
-                    s.shared_pending.lock().nth(n)
-                } else {
-                    s.pending.nth(n)
-                }
-            })
-            .flatten()
-        });
+        let info = signal::with_task_signal_state(&task, |s| {
+            if shared {
+                s.shared_pending.lock().nth(n)
+            } else {
+                s.pending.nth(n)
+            }
+        })
+        .flatten();
         let Some(info) = info else {
             break;
         };
@@ -720,14 +666,14 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> KernelResult<i64
 }
 
 fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> KernelResult<i64> {
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
     // Verify we are the tracer
-    let _frozen = ptrace_check_attach(target_tid)?;
+    let _frozen = ptrace_check_attach(&task)?;
 
     let message = {
         let table = TASKLIST.read();
-        table.get(target_tid).map(|t| t.ptrace_message).unwrap_or(0)
+        table.view(&task).map(|t| t.ptrace_message).unwrap_or(0)
     };
 
     // Write message to user space
@@ -743,26 +689,26 @@ fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> KernelResult<i64> {
 
 /// Get all general-purpose registers from tracee.
 fn ptrace_getregs(target_pid: Pid, data: u64) -> KernelResult<i64> {
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
     // Verify we are the tracer
-    let _frozen = ptrace_check_attach(target_tid)?;
+    let _frozen = ptrace_check_attach(&task)?;
 
     // Architecture-specific implementation
-    let regs = crate::arch::ptrace::get_user_regs(target_tid)?;
+    let regs = crate::arch::ptrace::get_user_regs(&task)?;
     UserPtr::new(data).write(&regs)?;
     Ok(0)
 }
 
 /// Set all general-purpose registers for tracee.
 fn ptrace_setregs(target_pid: Pid, data: u64) -> KernelResult<i64> {
-    let target_tid = tracee(target_pid)?;
+    let task = tracee(target_pid)?;
 
     // Verify we are the tracer
-    let _frozen = ptrace_check_attach(target_tid)?;
+    let _frozen = ptrace_check_attach(&task)?;
 
     let regs = UserPtr::<crate::arch::ptrace::UserRegs>::new(data).read()?;
-    crate::arch::ptrace::set_user_regs(target_tid, &regs)?;
+    crate::arch::ptrace::set_user_regs(&task, &regs)?;
     Ok(0)
 }
 
@@ -779,10 +725,10 @@ pub fn ptrace_stop(
     info: Option<crate::signal::SigInfo>,
 ) -> (u32, Option<crate::signal::SigInfo>) {
     use percpu::{SleepState, schedule, set_current_state};
-    let tid = percpu::current_tid();
+    let me = percpu::current();
     let tracer = {
         let mut table = TASKLIST.write();
-        let Some(mut t) = table.get_mut(tid) else {
+        let Some(mut t) = table.view_mut(&me) else {
             return (0, info);
         };
         if t.ptrace == 0 {
@@ -803,11 +749,11 @@ pub fn ptrace_stop(
     // do_notify_parent_cldstop, CLD_TRAPPED)
     super::proc::CHILD_EXIT_WQ.wake_all();
     if let Some(tr) = tracer {
-        signal::notify::notify_tracer_trapped(&percpu::current(), &tr, code);
+        signal::notify::notify_tracer_trapped(&me, &tr, code);
     }
     loop {
         set_current_state(SleepState::Killable);
-        let (st, frozen) = stop_state(tid);
+        let (st, frozen) = stop_state(&me);
         if !st {
             break;
         }
@@ -820,7 +766,7 @@ pub fn ptrace_stop(
             // wake a JOBCTL_PTRACE_FROZEN tracee); asleep first, then
             // checked, so that wakeup is never lost
             set_current_state(SleepState::Uninterruptible);
-            if stop_state(tid) != (true, true) {
+            if stop_state(&me) != (true, true) {
                 continue;
             }
         }
@@ -828,7 +774,7 @@ pub fn ptrace_stop(
     }
     set_current_state(SleepState::Running);
     let mut table = TASKLIST.write();
-    let Some(mut t) = table.get_mut(tid) else {
+    let Some(mut t) = table.view_mut(&me) else {
         return (0, None);
     };
     // The stop's siginfo, as the tracer left it (Linux: last_siginfo
@@ -848,9 +794,9 @@ pub fn ptrace_stop(
 
 /// The current task is in a ptrace stop, and its tracer inside a
 /// request on it (frozen)
-fn stop_state(tid: Tid) -> (bool, bool) {
+fn stop_state(me: &Task) -> (bool, bool) {
     let table = TASKLIST.read();
-    table.get(tid).map_or((false, false), |t| {
+    table.view(me).map_or((false, false), |t| {
         (matches!(t.state, TaskState::Traced(_)), t.ptrace_frozen)
     })
 }
@@ -859,10 +805,10 @@ fn stop_state(tid: Tid) -> (bool, bool) {
 /// ptrace_report_syscall): SIGTRAP, | 0x80 with PTRACE_O_TRACESYSGOOD; a
 /// signal the tracer leaves is sent to the task
 pub fn ptrace_report_syscall(entry: bool) {
-    let tid = percpu::current_tid();
+    let me = percpu::current();
     let options = {
         let mut table = TASKLIST.write();
-        let Some(mut t) = table.get_mut(tid) else {
+        let Some(mut t) = table.view_mut(&me) else {
             return;
         };
         if t.ptrace & PT_SYSCALL_TRACE == 0 {
@@ -881,13 +827,13 @@ pub fn ptrace_report_syscall(entry: bool) {
     let info = crate::signal::SigInfo::kill(
         SIGTRAP,
         code as i32,
-        crate::task::pid::vnr(tid) as i32,
+        crate::task::pid::vnr(me.tid()) as i32,
         crate::task::current_cred().uid,
     );
     // Linux send_sig(exit_code, current, 1): SEND_SIG_PRIV
     let (sig, _) = ptrace_stop(code, Some(info));
     if sig != 0 {
-        let _ = signal::send_sig_info(&percpu::current(), sig, signal::SendInfo::Kernel);
+        let _ = signal::send_sig_info(&me, sig, signal::SendInfo::Kernel);
     }
 }
 
@@ -895,7 +841,7 @@ pub fn ptrace_report_syscall(entry: bool) {
 /// (Linux ptrace_signal) and may cancel it (0) or change it
 pub fn ptrace_signal(info: &mut crate::signal::SigInfo) -> u32 {
     let sig = info.sig();
-    if !is_traced(percpu::current_tid()) {
+    if !is_traced(&percpu::current()) {
         return sig;
     }
     let (new, left) = ptrace_stop(sig, Some(*info));
@@ -905,12 +851,9 @@ pub fn ptrace_signal(info: &mut crate::signal::SigInfo) -> u32 {
     new
 }
 
-/// Task `tid` is no longer traced (Linux __ptrace_unlink), under
-/// TASKLIST's write lock
-pub(crate) fn ptrace_unlink(table: &mut percpu::GlobalTaskTable, tid: Tid) {
-    let Some(mut t) = table.get_mut(tid) else {
-        return;
-    };
+/// Task `t` is no longer traced (Linux __ptrace_unlink), under
+/// TASKLIST's write lock (the view borrows it)
+pub(crate) fn ptrace_unlink(t: &mut percpu::TaskViewMut<'_>) {
     t.ptrace = 0;
     t.ptrace_frozen = false;
     t.ptracer = None;
@@ -949,17 +892,16 @@ fn detach_live(me: &crate::task::Task) -> Option<(percpu::TaskRef, Option<signal
     let mut table = TASKLIST.write();
     let v = table
         .find(|t| t.ptrace != 0 && t.traced_by(me) && !matches!(t.state, TaskState::Zombie(_)))?;
-    let (tid, exitkill) = (v.task.tid(), v.ptrace_options & PTRACE_O_EXITKILL != 0);
-    let t = table.task(tid)?;
+    let exitkill = v.ptrace_options & PTRACE_O_EXITKILL != 0;
+    let t = percpu::task_ref(v.task);
     let kill = if exitkill {
         signal::sigkill_held(&table, &t)
     } else {
         None
     };
-    ptrace_unlink(&mut table, tid);
-    if let Some(mut v) = table.get_mut(tid)
-        && matches!(v.state, TaskState::Traced(_))
-    {
+    let mut v = table.view_mut(&t)?;
+    ptrace_unlink(&mut v);
+    if matches!(v.state, TaskState::Traced(_)) {
         v.state = TaskState::Ready;
         v.ptrace_code = 0;
     }
@@ -1022,8 +964,8 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> KernelResult<
 /// and it is stopped, else EIO; nothing is logged, a user can send any
 /// number
 fn ptrace_unknown(pid: Pid) -> KernelResult<i64> {
-    let tid = tracee(pid)?;
-    let _frozen = ptrace_check_attach(tid)?;
+    let task = tracee(pid)?;
+    let _frozen = ptrace_check_attach(&task)?;
     Err(KernelError::Io)
 }
 
@@ -1048,22 +990,19 @@ pub fn may_read_ref(t: &crate::task::Task) -> bool {
     may_access(|v| core::ptr::eq(v.task, t), true)
 }
 
-/// [`may_read_proc`] for task `tid` itself (tids are never reused): a
-/// caller that resolved a pid once checks the very task it then uses
-pub fn may_read_task(tid: Tid) -> bool {
-    may_access_tid(tid, true)
+/// Linux ptrace_may_access for task `t`: the caller's own thread
+/// group always (while `t` is listed), else [`may_access`] with its
+/// fsuid/fsgid (`fscreds`, PTRACE_MODE_*_FSCREDS) or its real ids
+/// (PTRACE_MODE_*_REALCREDS)
+pub fn may_access_task(t: &Task, fscreds: bool) -> bool {
+    let own = t.pid == percpu::current_pid() && TASKLIST.read().view(t).is_some();
+    own || may_access_view(t, fscreds)
 }
 
-/// Linux ptrace_may_access for task `tid`: the caller's own thread
-/// group always, else [`may_access`] with its fsuid/fsgid (`fscreds`,
-/// PTRACE_MODE_*_FSCREDS) or its real ids (PTRACE_MODE_*_REALCREDS)
-pub fn may_access_tid(tid: Tid, fscreds: bool) -> bool {
-    let me = percpu::current_pid();
-    let own = TASKLIST
-        .read()
-        .iter()
-        .any(|t| t.task.tid() == tid && t.task.pid == me);
-    own || may_access(|t| t.task.tid() == tid, fscreds)
+/// [`may_access`] for task `t` itself: false once it is reaped
+fn may_access_view(t: &Task, fscreds: bool) -> bool {
+    let target = TASKLIST.read().view(t).map(|v| access_ids(&v));
+    access_ok(target, fscreds)
 }
 
 /// Linux __ptrace_may_access for the first task `pick` selects: the
@@ -1072,14 +1011,20 @@ pub fn may_access_tid(tid: Tid, fscreds: bool) -> bool {
 /// caller has CAP_SYS_PTRACE; and a non-dumpable target with an address
 /// space needs CAP_SYS_PTRACE too (get_dumpable(mm) != SUID_DUMP_USER)
 pub fn may_access(pick: impl Fn(&percpu::TaskView<'_>) -> bool, fscreds: bool) -> bool {
+    let target = TASKLIST.read().find(|t| pick(t)).map(|v| access_ids(&v));
+    access_ok(target, fscreds)
+}
+
+/// What the access check reads of a target (TASKLIST held): its
+/// credentials and its address space's dumpability, if it has one
+fn access_ids(v: &percpu::TaskView<'_>) -> (crate::task::Cred, Option<u8>) {
+    (v.cred(), v.task.task_lock().mm().map(|m| m.dumpable()))
+}
+
+/// [`may_access`]'s decision on `target` ([`access_ids`]; None: no task)
+fn access_ok(target: Option<(crate::task::Cred, Option<u8>)>, fscreds: bool) -> bool {
     use crate::task::dumpable::SUID_DUMP_USER;
     let me = percpu::current_cred();
-    let target = {
-        let table = TASKLIST.read();
-        table
-            .find(|t| pick(t))
-            .map(|t| (t.cred(), t.task.task_lock().mm().map(|m| m.dumpable())))
-    };
     let Some((c, dumpable)) = target else {
         return false;
     };

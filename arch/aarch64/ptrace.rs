@@ -3,7 +3,7 @@
 //! This module provides aarch64-specific register structures and functions
 //! for ptrace operations.
 
-use crate::task::Tid;
+use crate::task::Task;
 use crate::task::percpu::TASKLIST;
 use crate::util::error::{KernelError, KernelResult};
 
@@ -46,9 +46,9 @@ pub type UserRegs = UserPtRegs;
 ///
 /// The tracee must be in Traced state. This reads its user registers
 /// from its pt_regs (the entry frame at the top of its kernel stack).
-pub fn get_user_regs(tid: Tid) -> KernelResult<UserPtRegs> {
+pub fn get_user_regs(t: &Task) -> KernelResult<UserPtRegs> {
     let table = TASKLIST.read();
-    let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+    let task = table.view(t).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
@@ -73,9 +73,9 @@ pub fn get_user_regs(tid: Tid) -> KernelResult<UserPtRegs> {
 ///
 /// The tracee must be in Traced state. This updates its pt_regs so the
 /// registers take effect when it resumes.
-pub fn set_user_regs(tid: Tid, regs: &UserPtRegs) -> KernelResult<()> {
+pub fn set_user_regs(t: &Task, regs: &UserPtRegs) -> KernelResult<()> {
     let table = TASKLIST.read();
-    let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+    let task = table.view(t).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
@@ -120,9 +120,9 @@ const PSTATE_SS: u64 = 1 << 21;
 /// 2. Set MDSCR_EL1.SS = 1 (handled by kernel debug setup)
 ///
 /// The CPU will generate a software step exception after one instruction.
-pub fn enable_single_step(tid: Tid) {
+pub fn enable_single_step(t: &Task) {
     let table = TASKLIST.read();
-    if let Some(task) = table.get(tid) {
+    if let Some(task) = table.view(t) {
         // Set SS bit in SPSR (will be loaded into PSTATE on exception return)
         // SAFETY: as in get_user_regs
         unsafe { (*crate::task::percpu::task_pt_regs(task.task)).spsr |= PSTATE_SS };
@@ -135,9 +135,9 @@ pub fn enable_single_step(tid: Tid) {
 /// Disable single-step mode for a task.
 ///
 /// Clears the SS bit in PSTATE.
-pub fn disable_single_step(tid: Tid) {
+pub fn disable_single_step(t: &Task) {
     let table = TASKLIST.read();
-    if let Some(task) = table.get(tid) {
+    if let Some(task) = table.view(t) {
         // SAFETY: as in get_user_regs
         unsafe { (*crate::task::percpu::task_pt_regs(task.task)).spsr &= !PSTATE_SS };
     }
