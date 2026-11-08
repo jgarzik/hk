@@ -588,7 +588,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
 
     // Copied out: the inode data's spin lock is not held for the rest
     let (target_pid, ns_type) = match &*wrapper.0.read() {
-        ProcfsInodeData::NamespaceFile { pid, ns_type } => (*pid, *ns_type),
+        ProcfsInodeData::NamespaceFile { pid, ns_type } => (pid.clone(), *ns_type),
         _ => return -EINVAL, // Not a namespace file
     };
 
@@ -601,7 +601,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
     }
 
     // Get the TID for the target PID
-    let target_tid = match crate::fs::proc::get_tid_for_pid(target_pid) {
+    let target_tid = match target_pid.tid() {
         Some(tid) => tid,
         None => return -ESRCH,
     };

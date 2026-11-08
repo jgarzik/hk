@@ -873,7 +873,7 @@ detach_pid), or at its last drop if no task ever left it. It is taken
 under nothing but may be taken under TASKLIST and, being a leaf, under
 any thread-context lock where a last `Arc<Pid>` reference may go (an
 AF_UNIX queue's SCM credentials and SO_PEERCRED, a tty's group, an
-F_SETOWN owner).
+F_SETOWN owner, a procfs inode).
 A process's pid is its leader's tid; an exec from a non-leader takes
 the leader's tid and `Pid` (`take_leadership`, Linux exchange_tids)
 under TASKLIST (the run queue knows tasks by reference, not by
@@ -1944,9 +1944,13 @@ named as that superblock's pid namespace numbers the task.
 
 A procfs superblock's pid namespace (`ProcOpts.pid_ns`, Linux
 proc_fs_info.pid_ns: the mounter's) is fixed at mount and read with no
-lock; inode data names tasks by root number, so lookup, readdir and
-the per-task files translate through the pid helpers (3.1.1 Pid
-namespaces): the hash, then TASKLIST's read lock to reach the task
+lock; inode data holds the task's `Pid` (`ProcPid`, an `Arc`, Linux
+proc_inode->pid; its last reference may go wherever the inode does,
+PIDMAP_LOCK being a leaf), copied out of the inode data and turned
+into the task's tid under TASKLIST's read lock at each access, never
+under the inode data's lock; lookup, readdir and the per-task files
+translate through the pid helpers (3.1.1 Pid namespaces): the hash,
+then TASKLIST's read lock to reach the task
 (readdir and /proc/<pid>/task gather under it with no allocation,
 `collect_tasks`/`collect_threads`); status and stat number every pid
 under that read lock from the `Pid`s it keeps listed (lock-free).

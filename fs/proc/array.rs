@@ -97,6 +97,10 @@ fn snap(pid: Pid, ns: &PidNamespace) -> Option<Snap> {
         ))
     };
     let me = t.thread_pid.as_ref();
+    // A task the namespace cannot see is not shown there (Linux reaches
+    // it only through a lookup in that namespace); then its levels from
+    // `ns` down are the namespaces of its own chain
+    me?.nr_in(ns)?;
     let leader = table
         .get(t.task.pid)
         .and_then(|l| l.fields().thread_pid.as_ref());
