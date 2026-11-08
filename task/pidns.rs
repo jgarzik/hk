@@ -105,6 +105,7 @@ fn zap_pid_ns_processes(me: &TaskRef, ns: &PidNamespace) {
     {
         s.set_exit_code(code);
     }
+    crate::task::acct::exit_ns(ns);
 }
 
 /// reboot(2) `cmd` from inside a child pid namespace ends that

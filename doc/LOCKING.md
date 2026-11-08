@@ -4044,7 +4044,7 @@ this is the interrupt-safety invariant:
 | `FsStruct.inner` | fs/fsstruct.rs | `Mutex` | Root, cwd, umask (leaf) |
 | `UCOUNTS` | task/mod.rs | `Mutex` | Per-real-uid counts: RLIMIT_NPROC tasks, RLIMIT_SIGPENDING queued signals (leaf: may be taken under TASKLIST, takes no lock) |
 | `MEMBLOCK` | mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
-| `ACCT_FILE` | task/acct.rs | `Mutex` | Process accounting file (leaf: cloned out, the record written and an old file released with no lock held) |
+| `PidNamespace.bacct` | task/acct.rs | `Mutex` | A pid namespace's process accounting file (Linux pid_namespace->bacct; leaf, thread context: cloned out, the record written and an old file released with no lock held; an exit walks its namespace and each parent, one lock at a time; taken out at the namespace's zap, after its other tasks are gone) |
 | All VFS locks | fs/*.rs | `RwLock` | Inodes, dentries, mounts |
 | Descriptor tables (`Files`) | task/fdtable.rs | `Mutex` | Per-task fd tables |
 | `RTNL` and every network `spin::Mutex`/`RwLock` | net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |

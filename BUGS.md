@@ -872,8 +872,7 @@ Tag = roadmap phase (doc/ROADMAP.md).
    `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 7. **Pid namespace gaps** (B4). Syscalls use the caller's pid
    namespace, but /proc keeps the root one even when mounted inside a
-   namespace, and acct records and a netlink socket's autobound port
-   id use root numbers. reboot(2) inside a namespace checks
+   namespace. reboot(2) inside a namespace checks
    CAP_SYS_BOOT with `capable`, not in the namespace's user namespace
    (Linux ns_capable(pid_ns->user_ns)): a pid namespace has no owning
    user namespace yet.

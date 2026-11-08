@@ -3272,7 +3272,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         if let Some(st) = status
             && group_dead
         {
-            crate::task::acct::write_acct_record(tid, current_pid(), st);
+            crate::task::acct::write_acct_record(tid, st);
         }
 
         // A non-leader thread is released at exit (Linux autoreaps it):

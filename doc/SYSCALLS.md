@@ -527,7 +527,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [x] reboot (inside a child pid namespace: RESTART/RESTART2 and POWER_OFF/HALT kill its init, reported as SIGHUP/SIGINT, other commands EINVAL)
 - [x] kexec_load (stub, returns -ENOSYS; requires CAP_SYS_BOOT)
 - [x] syslog (READ, READ_ALL, READ_CLEAR, CLEAR, SIZE_UNREAD, SIZE_BUFFER over the record log; console actions no-ops; CAP_SYSLOG for all, as with dmesg_restrict=1)
-- [x] acct
+- [x] acct (per pid namespace: an exit is recorded in its namespace's file and each parent's, numbered there)
 - [x] swapon
 - [x] swapoff
 - [x] getcpu

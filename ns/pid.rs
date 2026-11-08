@@ -51,6 +51,10 @@ pub struct PidNamespace {
     /// pid_ns->reboot: SIGHUP to restart, SIGINT to halt), 0 otherwise;
     /// under TASKLIST
     pub reboot: TableCell<i32>,
+
+    /// Its process accounting file (Linux pid_namespace->bacct): set by
+    /// acct(2) inside, ended with the namespace (`task::acct`)
+    pub bacct: crate::task::acct::Acct,
 }
 
 impl PidNamespace {
@@ -65,6 +69,7 @@ impl PidNamespace {
             alloc: AtomicU32::new(NS_ADDING | NS_INIT),
             reaper: TableCell::new(None),
             reboot: TableCell::new(0),
+            bacct: crate::task::acct::Acct::default(),
         })
     }
 
@@ -82,6 +87,7 @@ impl PidNamespace {
             alloc: AtomicU32::new(NS_ADDING),
             reaper: TableCell::new(None),
             reboot: TableCell::new(0),
+            bacct: crate::task::acct::Acct::default(),
         })
         .map_err(|e| e.errno())
     }
