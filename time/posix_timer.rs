@@ -852,9 +852,10 @@ pub fn create_posix_timer(
         SIGEV_NONE => {}
         _ => return Err(KernelError::InvalidArgument),
     }
-    if sev.sigev_notify != SIGEV_NONE && !(1..=64).contains(&sev.sigev_signo) {
-        return Err(KernelError::InvalidArgument);
-    }
+    // A signalling timer's signal, parsed once (not 0, not past NSIG)
+    let sig = (sev.sigev_notify != SIGEV_NONE)
+        .then(|| sev.signal().ok_or(KernelError::InvalidArgument))
+        .transpose()?;
     let owner = match sev.sigev_notify {
         // The caller's number (Linux good_sigevent: find_task_by_vpid);
         // one it does not see names no task (0), so EINVAL below
@@ -878,8 +879,7 @@ pub fn create_posix_timer(
     if sev.sigev_notify == SIGEV_THREAD_ID && !t.target_in_group() {
         return Err(KernelError::InvalidArgument);
     }
-    // Checked above: a signalling timer has a signal
-    if let Some(sig) = sev.signal().filter(|_| sev.sigev_notify != SIGEV_NONE) {
+    if let Some(sig) = sig {
         let fields = crate::signal::SigFields::Timer {
             tid: id,
             overrun: 0,
