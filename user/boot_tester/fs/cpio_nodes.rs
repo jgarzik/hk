@@ -68,8 +68,7 @@ fn report(name: &[u8], why: &[u8]) {
 }
 
 fn stat(path: &[u8]) -> Option<Stat> {
-    // SAFETY: plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     (sys_stat(path.as_ptr(), &mut st) == 0).then_some(st)
 }
 

@@ -13,8 +13,8 @@ use crate::harness::verdict;
 use crate::helpers::sleep_ms;
 use crate::mm::fork_mm::spawn_thread;
 use hk_syscall::{
-    P_PID, SigInfo, WEXITED, sys_close, sys_execve, sys_exit, sys_exit_group, sys_fork, sys_kill,
-    sys_pipe2, sys_read, sys_tgkill, sys_wait4, sys_waitid, sys_write,
+    P_PID, SigInfo, WEXITED, Zeroable, sys_close, sys_execve, sys_exit, sys_exit_group, sys_fork,
+    sys_kill, sys_pipe2, sys_read, sys_tgkill, sys_wait4, sys_waitid, sys_write,
 };
 
 const SIGKILL: u32 = 9;
@@ -322,7 +322,7 @@ fn peek_zombie(tid: i64) -> bool {
     const WNOWAIT: i32 = 0x0100_0000;
     const WALL: i32 = 0x4000_0000;
     for _ in 0..500 {
-        let mut info: SigInfo = unsafe { core::mem::zeroed() };
+        let mut info = SigInfo::zeroed();
         let r = sys_waitid(
             P_PID,
             tid as u64,

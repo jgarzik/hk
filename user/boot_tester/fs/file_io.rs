@@ -1228,7 +1228,7 @@ fn test_preadv2_rwf_nowait_pipe_eagain() {
 
 /// statfs() on root filesystem
 fn test_statfs_root() {
-    let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let mut buf = LinuxStatFs::default();
     let path = b"/\0";
 
     let ret = sys_statfs(path.as_ptr(), &mut buf);
@@ -1264,7 +1264,7 @@ fn test_statfs_root() {
 
 /// statfs() on /proc filesystem
 fn test_statfs_proc() {
-    let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let mut buf = LinuxStatFs::default();
     let path = b"/proc\0";
 
     let ret = sys_statfs(path.as_ptr(), &mut buf);
@@ -1288,7 +1288,7 @@ fn test_statfs_proc() {
 
 /// statfs() on nonexistent path returns -ENOENT
 fn test_statfs_enoent() {
-    let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let mut buf = LinuxStatFs::default();
     let path = b"/nonexistent_path_12345\0";
 
     let ret = sys_statfs(path.as_ptr(), &mut buf);
@@ -1310,7 +1310,7 @@ fn test_fstatfs() {
         return;
     }
 
-    let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let mut buf = LinuxStatFs::default();
     let ret = sys_fstatfs(fd as i32, &mut buf);
     sys_close(fd as u64);
 
@@ -1330,7 +1330,7 @@ fn test_fstatfs() {
 
 /// statx() basic usage
 fn test_statx_basic() {
-    let mut buf: Statx = unsafe { core::mem::zeroed() };
+    let mut buf = Statx::default();
     let path = b"/test.txt\0";
 
     let ret = sys_statx(AT_FDCWD, path.as_ptr(), 0, STATX_BASIC_STATS, &mut buf);
@@ -1383,7 +1383,7 @@ fn test_statx_at_empty_path() {
         return;
     }
 
-    let mut buf: Statx = unsafe { core::mem::zeroed() };
+    let mut buf = Statx::default();
     let empty = b"\0";
 
     // statx on the fd itself using AT_EMPTY_PATH

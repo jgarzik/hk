@@ -62,8 +62,7 @@ fn remount(target: &[u8], flags: u64) -> i64 {
 }
 
 fn rdonly(target: &[u8]) -> bool {
-    // SAFETY: LinuxStatFs is plain integers, valid all-zero
-    let mut st: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let mut st = LinuxStatFs::default();
     sys_statfs(target.as_ptr(), &mut st) == 0 && st.f_flags & ST_RDONLY != 0
 }
 

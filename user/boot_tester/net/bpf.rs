@@ -27,6 +27,7 @@ use hk_syscall::{
 
 /// Map creation attribute structure
 #[repr(C)]
+#[derive(Default)]
 struct MapCreateAttr {
     map_type: u32,
     key_size: u32,
@@ -50,6 +51,7 @@ struct MapElemAttr {
 
 /// Program load attribute structure
 #[repr(C)]
+#[derive(Default)]
 struct ProgLoadAttr {
     prog_type: u32,
     insn_cnt: u32,
@@ -114,10 +116,7 @@ fn hash_attr(key_size: u32, value_size: u32, max_entries: u32) -> MapCreateAttr 
         key_size,
         value_size,
         max_entries,
-        map_flags: 0,
-        inner_map_fd: 0,
-        numa_node: 0,
-        map_name: [0; 16],
+        ..Default::default()
     }
 }
 
@@ -203,10 +202,7 @@ fn test_hash_map_create() {
         key_size: 4,
         value_size: 8,
         max_entries: 10,
-        map_flags: 0,
-        inner_map_fd: 0,
-        numa_node: 0,
-        map_name: [0; 16],
+        ..Default::default()
     };
 
     let fd = sys_bpf(
@@ -238,10 +234,7 @@ fn test_array_map_create() {
         key_size: 4, // Array maps require key_size = 4
         value_size: 8,
         max_entries: 10,
-        map_flags: 0,
-        inner_map_fd: 0,
-        numa_node: 0,
-        map_name: [0; 16],
+        ..Default::default()
     };
 
     let fd = sys_bpf(
@@ -274,10 +267,7 @@ fn test_hash_map_ops() {
         key_size: 4,
         value_size: 8,
         max_entries: 10,
-        map_flags: 0,
-        inner_map_fd: 0,
-        numa_node: 0,
-        map_name: [0; 16],
+        ..Default::default()
     };
 
     let map_fd = sys_bpf(
@@ -394,10 +384,7 @@ fn test_array_map_ops() {
         key_size: 4,
         value_size: 8,
         max_entries: 10,
-        map_flags: 0,
-        inner_map_fd: 0,
-        numa_node: 0,
-        map_name: [0; 16],
+        ..Default::default()
     };
 
     let map_fd = sys_bpf(
@@ -502,10 +489,7 @@ fn test_map_iteration() {
         key_size: 4,
         value_size: 4,
         max_entries: 10,
-        map_flags: 0,
-        inner_map_fd: 0,
-        numa_node: 0,
-        map_name: [0; 16],
+        ..Default::default()
     };
 
     let map_fd = sys_bpf(
@@ -637,14 +621,7 @@ fn test_prog_load() {
         insn_cnt: 2,
         insns: insns.as_ptr() as u64,
         license: license.as_ptr() as u64,
-        log_level: 0,
-        log_size: 0,
-        log_buf: 0,
-        kern_version: 0,
-        prog_flags: 0,
-        prog_name: [0; 16],
-        prog_ifindex: 0,
-        expected_attach_type: 0,
+        ..Default::default()
     };
 
     let fd = sys_bpf(
@@ -690,14 +667,7 @@ fn test_prog_load_big() {
         insn_cnt: N as u32,
         insns: p as u64,
         license: license.as_ptr() as u64,
-        log_level: 0,
-        log_size: 0,
-        log_buf: 0,
-        kern_version: 0,
-        prog_flags: 0,
-        prog_name: [0; 16],
-        prog_ifindex: 0,
-        expected_attach_type: 0,
+        ..Default::default()
     };
     let fd = sys_bpf(
         BPF_PROG_LOAD,
@@ -720,10 +690,7 @@ fn test_invalid_map_type() {
         key_size: 4,
         value_size: 8,
         max_entries: 10,
-        map_flags: 0,
-        inner_map_fd: 0,
-        numa_node: 0,
-        map_name: [0; 16],
+        ..Default::default()
     };
 
     let fd = sys_bpf(

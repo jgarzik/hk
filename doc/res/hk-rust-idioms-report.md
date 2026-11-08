@@ -150,12 +150,9 @@ is done and linted (`manual_let_else`), so its error exits become `?`.
   Statx { stx_mask, stx_blksize: 4096, stx_nlink: attr.nlink, ..., ..FromBytes::zeroed() }
   impl Default for SysInfo { fn default() -> Self { Self { mem_unit: 1, ..FromBytes::zeroed() } } } // 18 -> 3
   ```
-- **user/:**
-  - 56 `let mut x: T = unsafe { mem::zeroed() };` become `T::default()`
-    (derive, arrays of 32 or less) or a safe `zeroed()` helper.
-  - Attr structs in tests (bpf.rs `MapCreateAttr` x many, `CloneArgs`, `SigInfo`) use
-    `..Default::default()`.
-  - This removes `unsafe` from tests too.
+- **user/:** the remaining zero-field literals from the scan above use
+  `..Default::default()`, or `..Zeroable::zeroed()` (user/syscall/types.rs) for
+  types that cannot derive `Default`.
 - **Limits and risk:**
   - Not usable in `const` contexts: `Default` isn't const on stable, and
     default-field-values (`a: u32 = 0`) is unstable. So `ZERO_CONTEXT` (arch/x86_64/context.rs:339) and the 25

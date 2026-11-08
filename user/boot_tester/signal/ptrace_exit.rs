@@ -20,9 +20,9 @@
 use crate::harness::verdict;
 use crate::helpers::{read_file, sleep_ms};
 use hk_syscall::{
-    SigInfo, sys_close, sys_exit, sys_exit_group, sys_fork, sys_kill, sys_pipe2, sys_prctl,
-    sys_ptrace, sys_read, sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_tgkill, sys_wait4,
-    sys_write,
+    SigInfo, Zeroable, sys_close, sys_exit, sys_exit_group, sys_fork, sys_kill, sys_pipe2,
+    sys_prctl, sys_ptrace, sys_read, sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_tgkill,
+    sys_wait4, sys_write,
 };
 
 const PTRACE_SEIZE: i64 = 0x4206;
@@ -141,8 +141,7 @@ fn block_chld() {
 fn take_chld(ms: i64) -> Option<i64> {
     let m: u64 = 1 << (SIGCHLD - 1);
     let ts = [ms / 1000, (ms % 1000) * 1_000_000];
-    // SAFETY: SigInfo is plain integers
-    let mut i: SigInfo = unsafe { core::mem::zeroed() };
+    let mut i = SigInfo::zeroed();
     let r = sys_rt_sigtimedwait(
         &m as *const u64 as u64,
         &mut i as *mut SigInfo as u64,
@@ -471,7 +470,7 @@ fn exit_ignored_zombie() -> i32 {
         }
         // Its zombie, left in place (a tracee's exit is not autoreaped)
         // SAFETY: SigInfo is plain integers
-        let mut info: SigInfo = unsafe { core::mem::zeroed() };
+        let mut info = SigInfo::zeroed();
         let r = sys_waitid(P_PID, child as u64, &mut info, WEXITED | WNOWAIT, 0);
         sys_exit(if r == 0 { 0 } else { 1 });
     }

@@ -142,7 +142,7 @@ fn unlink(p: &[u8]) {
 }
 
 fn mode_of(p: &[u8]) -> (i64, u32) {
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let r = sys_stat(cpath(p).as_ptr(), &mut st);
     (r, st.st_mode)
 }

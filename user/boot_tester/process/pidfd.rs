@@ -31,10 +31,10 @@ use crate::harness::{fail_num, pass, verdict};
 use crate::helpers::{linux_at_least, msleep, print, print_num, println};
 use crate::mm::fork_mm::{join, spawn_thread};
 use hk_syscall::{
-    CloneArgs, O_NONBLOCK, P_PIDFD, POLLHUP, POLLIN, PollFd, SIGKILL, SigInfo, WEXITED, sys_clone,
-    sys_clone3, sys_close, sys_exit, sys_exit_group, sys_fcntl, sys_fork, sys_getpid, sys_kill,
-    sys_open, sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2, sys_poll,
-    sys_ptrace, sys_read, sys_rt_sigaction, sys_wait4, sys_waitid, sys_write,
+    CloneArgs, O_NONBLOCK, P_PIDFD, POLLHUP, POLLIN, PollFd, SIGKILL, SigInfo, WEXITED, Zeroable,
+    sys_clone, sys_clone3, sys_close, sys_exit, sys_exit_group, sys_fcntl, sys_fork, sys_getpid,
+    sys_kill, sys_open, sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2,
+    sys_poll, sys_ptrace, sys_read, sys_rt_sigaction, sys_wait4, sys_waitid, sys_write,
 };
 
 /// Run all pidfd tests
@@ -478,16 +478,7 @@ fn test_waitid_p_pidfd() {
     }
 
     // Use waitid with P_PIDFD
-    let mut info = SigInfo {
-        si_signo: 0,
-        si_errno: 0,
-        si_code: 0,
-        _pad0: 0,
-        si_pid: 0,
-        si_uid: 0,
-        si_status: 0,
-        _pad: [0u8; 128 - 28],
-    };
+    let mut info = SigInfo::zeroed();
     let ret = sys_waitid(P_PIDFD, pidfd as u64, &mut info, WEXITED, 0);
 
     sys_close(pidfd as u64);
@@ -514,16 +505,7 @@ fn test_waitid_p_pidfd() {
 
 /// An empty siginfo for waitid
 fn siginfo() -> SigInfo {
-    SigInfo {
-        si_signo: 0,
-        si_errno: 0,
-        si_code: 0,
-        _pad0: 0,
-        si_pid: 0,
-        si_uid: 0,
-        si_status: 0,
-        _pad: [0u8; 128 - 28],
-    }
+    SigInfo::zeroed()
 }
 
 /// waitid(P_PIDFD) of an O_NONBLOCK pidfd (PIDFD_NONBLOCK) waits as

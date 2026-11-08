@@ -866,7 +866,7 @@ fn set_eff(on: bool) -> bool {
         version: _LINUX_CAPABILITY_VERSION_3,
         pid: 0,
     };
-    let mut d: [CapUserData; 2] = unsafe { core::mem::zeroed() };
+    let mut d = [CapUserData::default(); 2];
     if sys_capget(&mut h, d.as_mut_ptr()) != 0 {
         return false;
     }

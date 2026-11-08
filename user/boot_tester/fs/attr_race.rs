@@ -43,8 +43,7 @@ pub fn run_tests() {
 }
 
 fn stat(path: &[u8]) -> Option<Stat> {
-    // SAFETY: Stat is plain integers, valid all-zero
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     (sys_stat(path.as_ptr(), &mut st) == 0).then_some(st)
 }
 
@@ -146,8 +145,7 @@ fn size_publish() -> R {
     let mut bad = None;
     let end = CHUNKS * CHUNK as u64;
     loop {
-        // SAFETY: Stat is plain integers, valid all-zero
-        let mut st: Stat = unsafe { core::mem::zeroed() };
+        let mut st = Stat::default();
         sys_fstat(rd as i32, &mut st);
         let size = st.st_size as u64;
         if size >= CHUNK as u64 {
@@ -278,8 +276,7 @@ fn fallocate_race() -> R {
     let mut last = 0u64;
     let mut bad = None;
     while last < end {
-        // SAFETY: Stat is plain integers, valid all-zero
-        let mut st: Stat = unsafe { core::mem::zeroed() };
+        let mut st = Stat::default();
         sys_fstat(fd as i32, &mut st);
         let size = st.st_size as u64;
         if size < last {

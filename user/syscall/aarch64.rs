@@ -3034,6 +3034,7 @@ pub fn sys_bpf(cmd: i32, attr: u64, size: u32) -> i64 {
 
 /// `struct stat` (include/uapi/asm-generic/stat.h, used by arm64)
 #[repr(C)]
+#[derive(Default)]
 pub struct Stat {
     pub st_dev: u64,
     pub st_ino: u64,

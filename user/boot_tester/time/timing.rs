@@ -17,7 +17,7 @@ use crate::helpers::{print, print_num, println};
 use hk_syscall::{
     CLOCK_MONOTONIC, CLONE_VM, FUTEX_WAIT, FUTEX_WAKE, P_PID, PollFd, SA_RESTART, SA_RESTORER,
     SIG_DFL, SIG_SETMASK, SIG_UNBLOCK, SIGALRM, SIGCHLD, SIGKILL, SIGUSR1, SigInfo, Timespec,
-    sys_clock_gettime, sys_clone, sys_close, sys_exit, sys_fork, sys_futex, sys_kill,
+    Zeroable, sys_clock_gettime, sys_clone, sys_close, sys_exit, sys_fork, sys_futex, sys_kill,
     sys_nanosleep, sys_pause, sys_pipe, sys_poll, sys_read, sys_rt_sigaction, sys_rt_sigprocmask,
     sys_rt_sigsuspend, sys_wait4, sys_waitid, sys_write,
 };
@@ -433,10 +433,10 @@ fn test_waitid_cld_killed() {
     sleep_ms(150);
     sys_kill(pid, SIGKILL);
     let start = now_ms();
-    let mut info: SigInfo = unsafe { core::mem::zeroed() };
+    let mut info = SigInfo::zeroed();
     let mut got = false;
     while now_ms() - start < 3000 {
-        info = unsafe { core::mem::zeroed() };
+        info = SigInfo::zeroed();
         let r = sys_waitid(P_PID, pid as u64, &mut info, WEXITED | WNOHANG, 0);
         if r == 0 && info.si_pid as i64 == pid {
             got = true;

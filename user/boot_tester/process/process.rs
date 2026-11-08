@@ -8,6 +8,7 @@
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
+use hk_syscall::Zeroable;
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::sys_time;
 #[cfg(target_arch = "x86_64")]
@@ -475,16 +476,7 @@ fn test_waitid() {
         print(b"Parent: fork() returned child PID=");
         print_num(fork_ret3);
 
-        let mut info = SigInfo {
-            si_signo: 0,
-            si_errno: 0,
-            si_code: 0,
-            _pad0: 0,
-            si_pid: 0,
-            si_uid: 0,
-            si_status: 0,
-            _pad: [0; 128 - 28],
-        };
+        let mut info = SigInfo::zeroed();
 
         // 5th arg: struct rusage * (144 bytes). Pre-fill with a poison
         // pattern; the kernel must overwrite it with the child's usage.
@@ -540,16 +532,7 @@ fn test_waitid_pall() {
         sys_exit(33);
     } else {
         // Parent - use waitid with P_ALL
-        let mut info = SigInfo {
-            si_signo: 0,
-            si_errno: 0,
-            si_code: 0,
-            _pad0: 0,
-            si_pid: 0,
-            si_uid: 0,
-            si_status: 0,
-            _pad: [0; 128 - 28],
-        };
+        let mut info = SigInfo::zeroed();
 
         let waitid_ret = sys_waitid(P_ALL, 0, &mut info, WEXITED, 0);
         print(b"Parent: waitid(P_ALL) returned ");
@@ -580,7 +563,7 @@ fn test_waitid_wnowait() {
     if pid == 0 {
         sys_exit(21);
     }
-    let mut info: SigInfo = unsafe { core::mem::zeroed() };
+    let mut info = SigInfo::zeroed();
     let peek = sys_waitid(P_PID, pid as u64, &mut info, WEXITED | WNOWAIT, 0);
     let seen = (info.si_pid, info.si_status);
     let mut st = 0i32;

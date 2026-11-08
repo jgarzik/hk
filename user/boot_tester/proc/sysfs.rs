@@ -72,8 +72,7 @@ fn test_chmod_keep() {
 }
 
 fn stat(path: &[u8]) -> Result<Stat, i64> {
-    // SAFETY: Stat is plain data
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let r = sys_stat(path.as_ptr(), &mut st);
     if r < 0 { Err(r) } else { Ok(st) }
 }
@@ -112,8 +111,7 @@ pub fn each_entry(path: &[u8], f: &mut dyn FnMut(&[u8], u8)) -> i64 {
 /// Mount, attribute stat/read/lseek/open, directory nlink
 fn test_basic() {
     const N: &[u8] = b"SYSFS_BASIC";
-    // SAFETY: LinuxStatFs is plain data
-    let mut sf: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let mut sf = LinuxStatFs::default();
     let r = sys_statfs(b"/sys\0".as_ptr(), &mut sf);
     if r != 0 || sf.f_type != SYSFS_MAGIC {
         return fail_why(N, b"statfs magic", if r != 0 { r } else { sf.f_type });

@@ -155,7 +155,7 @@ fn names(d: &Disk) {
 fn nodes(d: &Disk) {
     for b in [d.whole, d.p1, d.p2, d.p3] {
         let mut p = [0u8; 48];
-        let mut st: Stat = unsafe { core::mem::zeroed() };
+        let mut st = Stat::default();
         let r = sys_stat(b.path(&mut p).as_ptr(), &mut st);
         let ok = r == 0
             && st.st_mode & S_IFMT == S_IFBLK
@@ -335,7 +335,7 @@ fn rrpart(d: &Disk) {
     sys_close(disk as u64);
     let again = find_disk().is_some_and(|n| n.p3.minor == d.p3.minor);
     let mut p = [0u8; 48];
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let node = sys_stat(d.p3.path(&mut p).as_ptr(), &mut st) == 0;
     let ok = busy == EBUSY && r == 0 && again && node;
     verdict(b"BLK_RRPART", ok, busy * 1000 + r);
@@ -370,7 +370,7 @@ fn vfat(d: &Disk) {
     let fd = sys_open(b"/mnt/vd1/NEW.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
     let w = sys_pwrite64(fd, b"written".as_ptr(), 7, 0);
     let f = sys_fsync(fd);
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let s = sys_fstat(fd, &mut st);
     sys_close(fd as u64);
     let n = read_file(b"/mnt/vd1/NEW.TXT\0", &mut b);
@@ -501,8 +501,7 @@ fn vfat_names(p1: &BlkDev) {
     let undec = sys_open(b"/mnt/vd1/q\xff\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
     let dot = sys_open(b"/mnt/vd1/dot.\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
     sys_close(dot as u64);
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let undotted = sys_stat(b"/mnt/vd1/dot\0".as_ptr(), &mut st);
     sys_unlink(b"/mnt/vd1/dot\0".as_ptr());
     sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
@@ -531,10 +530,8 @@ fn vfat_opts(p1: &BlkDev) {
         p1,
         b"iocharset=cp437,uid=1000,gid=1001,fmask=0133,dmask=0022\0",
     );
-    // SAFETY: Stat is plain integers
-    let mut f: Stat = unsafe { core::mem::zeroed() };
-    // SAFETY: as above
-    let mut d: Stat = unsafe { core::mem::zeroed() };
+    let mut f = Stat::default();
+    let mut d = Stat::default();
     let rf = sys_stat(b"/mnt/vd1/HKDISK.TXT\0".as_ptr(), &mut f);
     let rd = sys_stat(b"/mnt/vd1\0".as_ptr(), &mut d);
     sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
@@ -822,8 +819,8 @@ fn vfat_mmap_write() {
 fn vfat_rename_ino() {
     let fd = sys_open(b"/mnt/vd1/A.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
     let r = sys_rename(b"/mnt/vd1/A.TXT\0".as_ptr(), b"/mnt/vd1/B.TXT\0".as_ptr());
-    let mut a: Stat = unsafe { core::mem::zeroed() };
-    let mut b: Stat = unsafe { core::mem::zeroed() };
+    let mut a = Stat::default();
+    let mut b = Stat::default();
     sys_fstat(fd, &mut a);
     let s = sys_stat(b"/mnt/vd1/B.TXT\0".as_ptr(), &mut b);
     sys_close(fd as u64);
@@ -874,7 +871,7 @@ fn vfat_unlink_open() {
     sys_close(v as u64);
     buf.fill(0);
     let n = sys_pread64(fd, buf.as_mut_ptr(), buf.len() as u64, 0);
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     sys_fstat(fd, &mut st);
     sys_close(fd as u64);
     sys_unlink(b"/mnt/vd1/V.TXT\0".as_ptr());
@@ -908,8 +905,7 @@ fn swap(p2: &BlkDev) {
 /// no stale negative dentry)
 fn vfat_neg_case(p1: &BlkDev) {
     let r = mount_vd1(p1, b"iocharset=cp437\0");
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let miss = sys_stat(b"/mnt/vd1/NEGCASE.TXT\0".as_ptr(), &mut st);
     let miss2 = sys_stat(b"/mnt/vd1/td.\0".as_ptr(), &mut st);
     let fd = sys_open(
@@ -944,8 +940,7 @@ fn vfat_mount_alias(p1: &BlkDev) {
         0,
         0,
     );
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let lower = sys_stat(b"/mnt/vd1/al/under\0".as_ptr(), &mut st);
     let upper = sys_stat(b"/mnt/vd1/AL/under\0".as_ptr(), &mut st);
     sys_umount2(b"/mnt/vd1/al\0".as_ptr(), 0);

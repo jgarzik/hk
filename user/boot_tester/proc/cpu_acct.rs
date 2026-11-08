@@ -23,6 +23,7 @@ use hk_syscall::{Timespec, Timeval, sys_clock_gettime, sys_getrusage, sys_nanosl
 
 /// struct rusage: the two times, then 14 longs
 #[repr(C)]
+#[derive(Default)]
 struct Rusage {
     ru_utime: Timeval,
     ru_stime: Timeval,
@@ -114,8 +115,7 @@ fn stat_children_ticks() -> i64 {
 
 fn children() {
     use hk_syscall::{sys_exit, sys_fork, sys_times, sys_wait4};
-    // SAFETY: plain integers
-    let mut base: Rusage = unsafe { core::mem::zeroed() };
+    let mut base = Rusage::default();
     sys_getrusage(-1, &mut base as *mut Rusage as *mut u8);
     let base_ms = ms_of(&base.ru_utime) + ms_of(&base.ru_stime);
     let mut tb = [0i64; 4];
@@ -127,12 +127,10 @@ fn children() {
         sys_exit(0);
     }
     let mut st = 0i32;
-    // SAFETY: plain integers
-    let mut ru: Rusage = unsafe { core::mem::zeroed() };
+    let mut ru = Rusage::default();
     sys_wait4(pid, &mut st, 0, &mut ru as *mut Rusage as u64);
     let waited = ms_of(&ru.ru_utime) + ms_of(&ru.ru_stime);
-    // SAFETY: plain integers
-    let mut ch: Rusage = unsafe { core::mem::zeroed() };
+    let mut ch = Rusage::default();
     sys_getrusage(-1, &mut ch as *mut Rusage as *mut u8);
     let children = ms_of(&ch.ru_utime) + ms_of(&ch.ru_stime) - base_ms;
     let mut t = [0i64; 4];
@@ -163,8 +161,7 @@ fn nap(ms: i64) {
 
 /// System time so far, in ms
 fn stime_ms() -> i64 {
-    // SAFETY: plain integers
-    let mut ru: Rusage = unsafe { core::mem::zeroed() };
+    let mut ru = Rusage::default();
     sys_getrusage(RUSAGE_SELF, &mut ru as *mut Rusage as *mut u8);
     ru.ru_stime.tv_sec * 1000 + ru.ru_stime.tv_usec / 1000
 }
@@ -178,8 +175,7 @@ fn sleep() {
 
 /// User time so far, in ms
 fn utime_ms() -> i64 {
-    // SAFETY: plain integers
-    let mut ru: Rusage = unsafe { core::mem::zeroed() };
+    let mut ru = Rusage::default();
     sys_getrusage(RUSAGE_SELF, &mut ru as *mut Rusage as *mut u8);
     ru.ru_utime.tv_sec * 1000 + ru.ru_utime.tv_usec / 1000
 }

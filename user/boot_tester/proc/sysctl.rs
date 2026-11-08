@@ -187,7 +187,7 @@ fn test_perm_net_admin() {
             version: _LINUX_CAPABILITY_VERSION_3,
             pid: 0,
         };
-        let mut d: [CapUserData; 2] = unsafe { core::mem::zeroed() };
+        let mut d = [CapUserData::default(); 2];
         if sys_capget(&mut h, d.as_mut_ptr()) != 0 {
             sys_exit(91);
         }
@@ -247,7 +247,7 @@ fn test_proc_net_udp() {
     let (a, pa) = udp_lo();
     let (b, pb) = udp_lo();
     connect(b, LO, pa);
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     sys_fstat(a, &mut st);
     let mut buf = [0u8; 8192];
     let n = read_file(b"/proc/net/udp\0", &mut buf);

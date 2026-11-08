@@ -117,11 +117,11 @@ fn anon_link() {
 fn anon_shared() {
     let mut fds = [0i64; 6];
     open_anon(&mut fds);
-    let mut first = zst();
+    let mut first = Stat::default();
     let mut ok = sys_fstat(fds[0] as i32, &mut first) == 0;
     // pidfd moved to its own filesystem (pidfs) after Linux 6.8
     for &fd in &fds[1..5] {
-        let mut st = zst();
+        let mut st = Stat::default();
         if sys_fstat(fd as i32, &mut st) != 0 || st.st_ino != first.st_ino {
             ok = false;
         }
@@ -141,7 +141,7 @@ fn pipe_ino() {
         println(b"PIPE_INO:FAIL pipe2");
         return;
     }
-    let (mut sa, mut sa1, mut sb) = (zst(), zst(), zst());
+    let (mut sa, mut sa1, mut sb) = (Stat::default(), Stat::default(), Stat::default());
     sys_fstat(a[0], &mut sa);
     sys_fstat(a[1], &mut sa1);
     sys_fstat(b[0], &mut sb);
@@ -187,7 +187,7 @@ fn anon_setattr() {
     let a = sys_fchmod(fd as i32, 0o644);
     let b = sys_fchown(fd as i32, u32::MAX, u32::MAX);
     let c = sys_utimensat(fd as i32, core::ptr::null(), core::ptr::null(), 0);
-    let mut st = zst();
+    let mut st = Stat::default();
     sys_fstat(fd as i32, &mut st);
     sys_close(fd as u64);
     if a == EOPNOTSUPP && b == EOPNOTSUPP && c == EOPNOTSUPP && st.st_mode == 0o600 {
@@ -205,7 +205,7 @@ fn anon_setattr() {
 
 /// ctime as nanoseconds
 fn ctime_ns(path: &[u8]) -> i64 {
-    let mut st = zst();
+    let mut st = Stat::default();
     if sys_stat(path.as_ptr(), &mut st) != 0 {
         return -1;
     }
@@ -246,9 +246,4 @@ fn chmod_ctime() {
         print_num(t2 - t1);
         println(b"");
     }
-}
-
-fn zst() -> Stat {
-    // SAFETY: Stat is plain integers
-    unsafe { core::mem::zeroed() }
 }

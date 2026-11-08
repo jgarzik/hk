@@ -183,8 +183,7 @@ fn nonutf8_ops() -> Result<(), (&'static [u8], i64)> {
         return Err((b"create", fd));
     }
     sys_close(fd as u64);
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let r = sys_stat(f.as_ptr(), &mut st);
     if r != 0 {
         return Err((b"stat", r));

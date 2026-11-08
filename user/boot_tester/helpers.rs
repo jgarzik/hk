@@ -3,9 +3,9 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use hk_syscall::{
-    AF_INET, O_RDONLY, SIGKILL, SOCK_DGRAM, Timespec, UtsName, sys_close, sys_ioctl, sys_kill,
-    sys_mkdir, sys_mount, sys_nanosleep, sys_open, sys_read, sys_socket, sys_uname, sys_wait4,
-    sys_write,
+    AF_INET, O_RDONLY, SIGKILL, SOCK_DGRAM, Timespec, UtsName, Zeroable, sys_close, sys_ioctl,
+    sys_kill, sys_mkdir, sys_mount, sys_nanosleep, sys_open, sys_read, sys_socket, sys_uname,
+    sys_wait4, sys_write,
 };
 
 pub const STDOUT: u64 = 1;
@@ -15,7 +15,7 @@ static FAIL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Detect whether we run on hk or on a real Linux host (differential testing)
 pub fn init_host_mode() {
-    let mut uts: UtsName = unsafe { core::mem::zeroed() };
+    let mut uts = UtsName::zeroed();
     let on_hk = sys_uname(&mut uts) == 0 && starts_with(&uts.sysname, b"hk\0");
     HOST_MODE.store(!on_hk, Ordering::Relaxed);
 }
@@ -185,8 +185,7 @@ pub fn linux_at_least(major: u32, minor: u32) -> bool {
     if !host_mode() {
         return true;
     }
-    // SAFETY: UtsName is plain bytes
-    let mut uts: UtsName = unsafe { core::mem::zeroed() };
+    let mut uts = UtsName::zeroed();
     if sys_uname(&mut uts) != 0 {
         return true;
     }

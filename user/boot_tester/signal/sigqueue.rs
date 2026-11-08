@@ -55,8 +55,8 @@
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println, read_file, skip};
 use hk_syscall::{
-    MqAttr, O_CREAT, O_RDWR, SigEvent, SigVal, sys_mq_notify, sys_mq_open, sys_mq_timedsend,
-    sys_mq_unlink, sys_ptrace,
+    MqAttr, O_CREAT, O_RDWR, SigEvent, SigVal, Zeroable, sys_mq_notify, sys_mq_open,
+    sys_mq_timedsend, sys_mq_unlink, sys_ptrace,
 };
 use hk_syscall::{
     RLIMIT_SIGPENDING, RLimit, SA_RESTORER, SA_SIGINFO, SFD_NONBLOCK, SIG_DFL, SigInfo, sys_close,
@@ -130,11 +130,6 @@ fn setmask(mask: u64) {
     sys_rt_sigprocmask(SIG_SETMASK, &mask as *const u64 as u64, 0, 8);
 }
 
-fn zeroed() -> SigInfo {
-    // SAFETY: SigInfo is plain integers
-    unsafe { core::mem::zeroed() }
-}
-
 /// sigtimedwait for `mask` with a timeout in seconds; the signal or -errno
 fn wait_sig(mask: u64, secs: i64, info: &mut SigInfo) -> i64 {
     let ts = [secs, 0i64];
@@ -148,7 +143,7 @@ fn wait_sig(mask: u64, secs: i64, info: &mut SigInfo) -> i64 {
 
 /// rt_sigqueueinfo to self with si_value = `val` (SI_QUEUE)
 fn queue_self(sig: u32, val: i32) -> i64 {
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     info.si_signo = sig as i32;
     info.si_code = SI_QUEUE;
     info.si_pid = sys_getpid() as i32;
@@ -160,7 +155,7 @@ fn queue_self(sig: u32, val: i32) -> i64 {
 /// How many `sig` are pending (taken by sigtimedwait until EAGAIN)
 fn drain(sig: u32) -> i64 {
     let mut n = 0;
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     while wait_sig(bit(sig), 0, &mut info) == sig as i64 {
         n += 1;
     }
@@ -289,12 +284,12 @@ fn test_rt_queue() {
     let q = sigq().0 - q0;
     let mut got = [0i32; 3];
     for g in got.iter_mut() {
-        let mut info = zeroed();
+        let mut info = SigInfo::zeroed();
         if wait_sig(bit(SIGRT), 0, &mut info) == SIGRT as i64 && info.si_code == SI_QUEUE {
             *g = info.si_status;
         }
     }
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     let fourth = wait_sig(bit(SIGRT), 0, &mut info);
     setmask(old);
     if fail == 0 && q == 3 && got == [11, 22, 33] && fourth == EAGAIN {
@@ -319,9 +314,9 @@ fn test_legacy_collapse() {
     let old = block(bit(SIGUSR1));
     queue_self(SIGUSR1, 5);
     queue_self(SIGUSR1, 6);
-    let mut a = zeroed();
+    let mut a = SigInfo::zeroed();
     let first = wait_sig(bit(SIGUSR1), 0, &mut a);
-    let mut b = zeroed();
+    let mut b = SigInfo::zeroed();
     let second = wait_sig(bit(SIGUSR1), 0, &mut b);
     setmask(old);
     if first == SIGUSR1 as i64 && a.si_status == 5 && second == EAGAIN {
@@ -344,7 +339,7 @@ fn test_kill_info() {
     let parent = sys_getpid();
     let child = sys_fork();
     if child == 0 {
-        let mut info = zeroed();
+        let mut info = SigInfo::zeroed();
         let r = wait_sig(bit(SIGUSR1), 10, &mut info);
         let ok = r == SIGUSR1 as i64
             && info.si_code == SI_USER
@@ -370,7 +365,7 @@ fn test_sigchld_exit() {
     if child == 0 {
         sys_exit(7);
     }
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     let r = wait_sig(bit(SIGCHLD), 10, &mut info);
     let mut status = 0i32;
     sys_wait4(child, &mut status, 0, 0);
@@ -506,7 +501,7 @@ fn test_mq_info() {
     let n = sys_mq_notify(fd, &sev);
     let msg = *b"hi";
     let snd = sys_mq_timedsend(fd, msg.as_ptr(), 2, 0, core::ptr::null());
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     let r = wait_sig(bit(SIGRT), 1, &mut info);
     setmask(old);
     sys_close(fd as u64);
@@ -551,13 +546,13 @@ fn test_trapped_info() {
         sys_kill(sys_getpid(), SIGSTOP);
         sys_exit(0);
     }
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     let r = wait_sig(bit(SIGCHLD), 10, &mut info);
     sys_kill(child, SIGKILL);
     let mut st = 0i32;
     sys_wait4(child, &mut st, 0, 0);
     // The kill's SIGCHLD, if any, is not this test's
-    let mut rest = zeroed();
+    let mut rest = SigInfo::zeroed();
     wait_sig(bit(SIGCHLD), 0, &mut rest);
     setmask(old);
     if r == SIGCHLD as i64
@@ -602,7 +597,7 @@ fn test_sigchld_at_reap() {
                     sys_pause();
                 }
             }
-            let mut info = zeroed();
+            let mut info = SigInfo::zeroed();
             if traced {
                 // Its CLD_TRAPPED stop
                 wait_sig(bit(SIGCHLD), 10, &mut info);
@@ -836,9 +831,9 @@ fn test_timer_info() {
     let b = timer(SIGRT + 1, 77, 4, me); // SIGEV_THREAD_ID
     arm(a, 10, 0);
     arm(b, 10, 0);
-    let mut ia = zeroed();
+    let mut ia = SigInfo::zeroed();
     let ra = wait_sig(bit(SIGRT), 2, &mut ia);
-    let mut ib = zeroed();
+    let mut ib = SigInfo::zeroed();
     let rb = wait_sig(bit(SIGRT + 1), 2, &mut ib);
     hk_syscall::sys_timer_delete(a);
     hk_syscall::sys_timer_delete(b);
@@ -877,14 +872,14 @@ fn test_timer_overrun() {
     let id = timer(SIGRT, 1, 0, 0);
     arm(id, 10, 10);
     sleep_ms(105);
-    let mut i = zeroed();
+    let mut i = SigInfo::zeroed();
     let r = wait_sig(bit(SIGRT), 1, &mut i);
     let over = tid_overrun(&i).1;
     let get = hk_syscall::sys_timer_getoverrun(id);
-    let mut j = zeroed();
+    let mut j = SigInfo::zeroed();
     let again = wait_sig(bit(SIGRT), 0, &mut j);
     hk_syscall::sys_timer_delete(id);
-    let mut k = zeroed();
+    let mut k = SigInfo::zeroed();
     wait_sig(bit(SIGRT), 0, &mut k);
     setmask(old);
     if r == SIGRT as i64 && (5..=20).contains(&over) && get == over as i64 && again == EAGAIN {
@@ -917,7 +912,7 @@ fn test_timer_drop() {
     arm(a, 1, 0);
     sleep_ms(20);
     arm(a, 0, 0); // disarm: the queued signal goes
-    let mut i = zeroed();
+    let mut i = SigInfo::zeroed();
     let ra = wait_sig(bit(SIGRT), 0, &mut i);
     arm(a, 1, 0);
     sleep_ms(20);
@@ -952,7 +947,7 @@ fn test_timer_unignore() {
     arm(id, 0, 0);
     block(bit(SIGRT));
     sys_rt_sigaction(SIGRT, dfl.as_ptr() as u64, 0, 8);
-    let mut i = zeroed();
+    let mut i = SigInfo::zeroed();
     let r = wait_sig(bit(SIGRT), 0, &mut i);
     hk_syscall::sys_timer_delete(id);
     drain(SIGRT);
@@ -983,16 +978,16 @@ fn test_itimer_real() {
         it_value: tv(10_000),
     };
     hk_syscall::sys_setitimer(0, &it, core::ptr::null_mut());
-    let mut a = zeroed();
+    let mut a = SigInfo::zeroed();
     let ra = wait_sig(bit(SIGALRM), 2, &mut a);
-    let mut b = zeroed();
+    let mut b = SigInfo::zeroed();
     let rb = wait_sig(bit(SIGALRM), 2, &mut b);
     let off = hk_syscall::ITimerVal {
         it_interval: tv(0),
         it_value: tv(0),
     };
     hk_syscall::sys_setitimer(0, &off, core::ptr::null_mut());
-    let mut c = zeroed();
+    let mut c = SigInfo::zeroed();
     wait_sig(bit(SIGALRM), 0, &mut c);
     setmask(old);
     if ra == SIGALRM as i64 && a.si_code == SI_KERNEL && rb == SIGALRM as i64 {
@@ -1038,7 +1033,7 @@ fn test_autoreap() {
     ];
     sys_rt_sigaction(SIGCHLD, nowait.as_ptr() as u64, 0, 8);
     let (c2, w2) = child_exits_wait();
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     let r = wait_sig(bit(SIGCHLD), 2, &mut info);
     sys_rt_sigaction(SIGCHLD, dfl.as_ptr() as u64, 0, 8);
     setmask(old);
@@ -1077,7 +1072,7 @@ fn test_pdeath() {
             hk_syscall::sys_prctl(PR_SET_PDEATHSIG, SIGUSR1 as u64, 0, 0, 0);
             let pid = (sys_getpid() as u32).to_ne_bytes();
             hk_syscall::sys_write(fds[1] as u64, pid.as_ptr(), 4);
-            let mut info = zeroed();
+            let mut info = SigInfo::zeroed();
             let r = wait_sig(bit(SIGUSR1), 10, &mut info);
             let parent = hk_syscall::sys_getppid();
             let ok = r == SIGUSR1 as i64 && info.si_code == SI_USER && parent == 1;
@@ -1183,7 +1178,7 @@ fn test_timer_gone() {
         let joined = crate::mm::fork_mm::join(&raw mut GONE_CTID);
         arm(id, 5, 0);
         sleep_ms(50);
-        let mut info = zeroed();
+        let mut info = SigInfo::zeroed();
         let r = wait_sig(bit(SIGRT), 0, &mut info);
         let p = pending() & bit(SIGRT);
         setmask(old);
@@ -1261,7 +1256,7 @@ fn test_exit_signal_reparent() {
     // SIGCHLDs of others may come first: wait for the child's
     let mut got = 0i64;
     for _ in 0..20 {
-        let mut info = zeroed();
+        let mut info = SigInfo::zeroed();
         let r = wait_sig(bit(SIGCHLD) | bit(SIGUSR1), 2, &mut info);
         if r < 0 || info.si_pid as i64 == c {
             got = r;
@@ -1270,7 +1265,7 @@ fn test_exit_signal_reparent() {
     }
     let mut sc = 0i32;
     sys_wait4(c, &mut sc, 0x4000_0000, 0);
-    let mut rest = zeroed();
+    let mut rest = SigInfo::zeroed();
     while wait_sig(bit(SIGCHLD) | bit(SIGUSR1), 0, &mut rest) > 0 {}
     sys_close(fds[0] as u64);
     sys_close(fds[1] as u64);
@@ -1345,10 +1340,10 @@ fn exit_signal_traced() -> i32 {
         return 1 << 6;
     }
     hk_syscall::sys_write(seized[1] as u64, b"x".as_ptr(), 1);
-    let mut i = zeroed();
+    let mut i = SigInfo::zeroed();
     let first = wait_sig(bit(SIGCHLD) | bit(SIGUSR1), 5, &mut i);
     hk_syscall::sys_write(go[1] as u64, b"x".as_ptr(), 1);
-    let mut i2 = zeroed();
+    let mut i2 = SigInfo::zeroed();
     let second = wait_sig(bit(SIGCHLD) | bit(SIGUSR1), 5, &mut i2);
     let mut st = 0i32;
     let r = sys_wait4(c, &mut st, WALL, 0);
@@ -1406,7 +1401,7 @@ fn test_ptrace_siginfo() {
     let mut st = 0i32;
     sys_wait4(c, &mut st, 0, 0);
     let stopped = st & 0xff == 0x7f && (st >> 8) & 0xff == SIGUSR1 as i32;
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     let g = sys_ptrace(PTRACE_GETSIGINFO, c, 0, &mut info as *mut SigInfo as u64);
     let got = g == 0
         && info.si_signo == SIGUSR1 as i32
@@ -1414,7 +1409,12 @@ fn test_ptrace_siginfo() {
         && info.si_status == 55;
     // struct ptrace_peeksiginfo_args: off 0, flags SHARED, nr 4
     let args: [u32; 4] = [0, 0, 1, 4];
-    let mut peek = [zeroed(), zeroed(), zeroed(), zeroed()];
+    let mut peek = [
+        SigInfo::zeroed(),
+        SigInfo::zeroed(),
+        SigInfo::zeroed(),
+        SigInfo::zeroed(),
+    ];
     let n = sys_ptrace(
         PTRACE_PEEKSIGINFO,
         c,
@@ -1641,12 +1641,12 @@ fn test_reparent_traced_zombie() {
             sleep_ms(5);
         }
         // The tracee's exit notice
-        let mut i = zeroed();
+        let mut i = SigInfo::zeroed();
         wait_sig(bit(SIGCHLD), 1, &mut i);
         hk_syscall::sys_write(cgo[1] as u64, b"x".as_ptr(), 1);
         let mut st = 0i32;
         sys_wait4(c, &mut st, 0, 0);
-        let mut i = zeroed();
+        let mut i = SigInfo::zeroed();
         let r = wait_sig(bit(SIGCHLD), 1, &mut i);
         if r != SIGCHLD as i64 || i.si_pid as i64 != c {
             hk_syscall::sys_exit_group(3);
