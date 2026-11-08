@@ -183,10 +183,7 @@ getcpu reports it; nothing else uses it. Missing (Linux
   node-aware allocation, so no policy (BIND, PREFERRED, INTERLEAVE,
   local) affects where pages come from.
 - No page migration: migrate_pages and move_pages validate and move
-  nothing; move_pages query mode reports node 0 for every page. For
-  another process they take CAP_SYS_NICE instead of Linux's
-  ptrace_may_access(PTRACE_MODE_READ_REALCREDS) (move_pages: under its
-  exec_update_lock), which they need once pages move.
+  nothing; move_pages query mode reports node 0 for every page.
 - Nodemasks are one `u64` (64 nodes); the gate has no multi-node QEMU
   run (by hand: `QEMU_EXTRA="-object memory-backend-ram,id=m0,size=256M
   -object memory-backend-ram,id=m1,size=256M -numa

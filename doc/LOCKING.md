@@ -249,7 +249,8 @@ SignalStruct.cred_guard (sync::Mutex; Linux cred_guard_mutex; exec,
                          ptrace attach; outermost)
     ↓
 SignalStruct.exec_update (sync::RwSem; Linux exec_update_lock; write:
-                          exec installing the new mm; read: mm_access;
+                          exec installing the new mm; read: mm_access,
+                          migrate_pages/move_pages;
                           exec takes TASKLIST and then the task's
                           alloc_lock under it)
     ↓
@@ -1063,7 +1064,8 @@ taken, except `cred_guard` around `exec_update`):
   writing, inside `cred_guard`, while it installs the new mm, name and
   dumpability under TASKLIST and the task's alloc_lock; process_vm_readv/writev (`access_mm`),
   the /proc mm_access paths (maps, environ; the stat fields gated by
-  access), pidfd_getfd and kcmp hold it for reading
+  access), migrate_pages and move_pages (`mempolicy::mm_target`, Linux
+  find_mm_struct), pidfd_getfd and kcmp hold it for reading
   (`signal::ExecUpdateRead`) around the access decision and what it
   guards. kcmp holds two (Linux kcmp_lock): the lower thread-group id's
   first, one if both tasks share a group.
