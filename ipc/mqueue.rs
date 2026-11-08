@@ -163,7 +163,8 @@ struct MqNotify {
     /// The owner's exec generation when it registered
     exec_gen: u64,
     sigev_notify: i32,
-    sigev_signo: i32,
+    /// SIGEV_SIGNAL's signal (None for SIGEV_NONE)
+    sig: Option<Signal>,
     sigev_value: u64,
 }
 
@@ -200,11 +201,7 @@ impl MqQueue {
         let (notify, signo, pid) = match self.notify.lock().as_ref() {
             Some(n) => (
                 n.sigev_notify,
-                if n.sigev_notify == SIGEV_SIGNAL {
-                    n.sigev_signo
-                } else {
-                    0
-                },
+                n.sig.map_or(0, Signal::nr),
                 // In the reader's namespace (Linux mqueue_read_file:
                 // pid_vnr)
                 n.owner.vnr(),
@@ -386,8 +383,7 @@ impl MqQueue {
             // a released process has no task to send to); signal 0
             // sends nothing
             let live = n.owner.exec_gen() == n.exec_gen;
-            let sig = u32::try_from(n.sigev_signo).ok().and_then(Signal::new);
-            if let Some(sig) = sig.filter(|_| n.sigev_notify == SIGEV_SIGNAL && live) {
+            if let Some(sig) = n.sig.filter(|_| live) {
                 let info = mesgq_info(sig, n.sigev_value, &n.owner);
                 // To the registrant's struct pid, never its number
                 let _ = crate::signal::kill_pid_info(&n.owner, sig, info, |_| Ok(()));
@@ -849,12 +845,19 @@ pub fn sys_mq_timedreceive(
 
 /// mq_notify - register for notification
 pub fn sys_mq_notify(mqdes: i32, sevp_ptr: UserPtr<SigEvent>) -> KernelResult<()> {
+    // The sigevent is read and checked before the descriptor is looked
+    // up (Linux sys_mq_notify, do_mq_notify)
+    let sev = if sevp_ptr.is_null() {
+        None
+    } else {
+        Some(notify_event(sevp_ptr.read()?)?)
+    };
     let file = fget(mqdes)?;
     let mq_ops = mq_of(&file).ok_or(KernelError::BadFd)?;
 
     let current_pid = crate::task::percpu::current_pid();
 
-    if sevp_ptr.is_null() {
+    let Some((sev, sig)) = sev else {
         // Remove notification (only if we own it)
         let mut notify = mq_ops.queue.notify.lock();
         if notify
@@ -864,18 +867,7 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: UserPtr<SigEvent>) -> KernelResult<()
             *notify = None;
         }
         return Ok(()); // Not an error to remove non-existent
-    }
-
-    let sev = sevp_ptr.read()?;
-
-    // Validate notification type
-    match sev.sigev_notify {
-        SIGEV_NONE | SIGEV_SIGNAL => {}
-        // Linux mqueue notify does not take SIGEV_THREAD_ID (only
-        // timers do); SIGEV_THREAD is a user-space pthread mechanism
-        SIGEV_THREAD_ID | SIGEV_THREAD => return Err(KernelError::InvalidArgument),
-        _ => return Err(KernelError::InvalidArgument),
-    }
+    };
 
     // Check if already registered by another process
     let owner = u32::try_from(current_pid)
@@ -895,11 +887,27 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: UserPtr<SigEvent>) -> KernelResult<()
         exec_gen: owner.exec_gen(),
         owner,
         sigev_notify: sev.sigev_notify,
-        sigev_signo: sev.sigev_signo,
+        sig,
         sigev_value: sev.sigev_value,
     });
 
     Ok(())
+}
+
+/// mq_notify's sigevent and its signal, or EINVAL (Linux do_mq_notify):
+/// SIGEV_NONE, or SIGEV_SIGNAL with a signal (not 0, not past NSIG)
+fn notify_event(sev: SigEvent) -> KernelResult<(SigEvent, Option<Signal>)> {
+    match sev.sigev_notify {
+        SIGEV_NONE => Ok((sev, None)),
+        SIGEV_SIGNAL => {
+            let sig = u32::try_from(sev.sigev_signo).ok().and_then(Signal::new);
+            Ok((sev, Some(sig.ok_or(KernelError::InvalidArgument)?)))
+        }
+        // Linux mqueue notify does not take SIGEV_THREAD_ID (only
+        // timers do); SIGEV_THREAD (a netlink notice) is not supported
+        SIGEV_THREAD_ID | SIGEV_THREAD => Err(KernelError::InvalidArgument),
+        _ => Err(KernelError::InvalidArgument),
+    }
 }
 
 /// mq_getsetattr - get/set message queue attributes

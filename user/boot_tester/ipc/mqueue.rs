@@ -21,6 +21,9 @@
 //!   + overhead) bytes against RLIMIT_MSGQUEUE (EMFILE past it), and an
 //!   unprivileged user meets queues_max (ENOSPC) (Linux
 //!   mqueue_get_inode, mqueue_create_attr)
+//! - MQ_NOTIFY_SIGNO: SIGEV_SIGNAL needs a signal, 1.._NSIG (EINVAL;
+//!   0 since Linux 7.3), checked before the descriptor (EBADF) (Linux
+//!   do_mq_notify)
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -61,6 +64,7 @@ pub fn run_tests() {
     test_mq_name_toolong();
     test_mq_attr_limits();
     test_mq_notify_owner_exit();
+    test_mq_notify_signo();
     test_mq_read_status();
     test_mq_len_unsigned();
     test_mq_rlimit();
@@ -162,6 +166,38 @@ fn notify_none(fd: i32) -> i64 {
         ..hk_syscall::SigEvent::default()
     };
     hk_syscall::sys_mq_notify(fd, &sev)
+}
+
+fn test_mq_notify_signo() {
+    use hk_syscall::{SigEvent, sys_mq_notify};
+    let mut t = crate::harness::T::new(b"MQ_NOTIFY_SIGNO");
+    let name = b"test_mq_notify_signo\0";
+    let attr = MqAttr::new(4, 64);
+    let fd = sys_mq_open(name.as_ptr(), O_RDWR as i32 | O_CREAT as i32, 0o600, &attr) as i32;
+    if t.ok(b"open", fd >= 0, i64::from(fd)) {
+        t.eq(b"99", sys_mq_notify(fd, &SigEvent::signal(99)), EINVAL);
+        // Signal 0 is EINVAL since Linux 7.3 (accepted, never sent,
+        // before)
+        let zero = if crate::helpers::linux_at_least(7, 3) {
+            EINVAL
+        } else {
+            0
+        };
+        t.eq(b"0", sys_mq_notify(fd, &SigEvent::signal(0)), zero);
+        sys_mq_notify(fd, core::ptr::null());
+        t.eq(b"-1", sys_mq_notify(fd, &SigEvent::signal(-1)), EINVAL);
+        t.eq(
+            b"bad fd 99",
+            sys_mq_notify(9999, &SigEvent::signal(99)),
+            EINVAL,
+        );
+        t.eq(b"bad fd", sys_mq_notify(9999, &SigEvent::signal(10)), EBADF);
+        t.eq(b"sigusr1", sys_mq_notify(fd, &SigEvent::signal(10)), 0);
+        t.eq(b"unregister", sys_mq_notify(fd, core::ptr::null()), 0);
+        sys_close(fd as u64);
+        sys_mq_unlink(name.as_ptr());
+    }
+    t.done();
 }
 
 fn test_mq_notify_owner_exit() {
