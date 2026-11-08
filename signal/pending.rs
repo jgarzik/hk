@@ -18,6 +18,7 @@ use super::{SIGRTMIN, SYNCHRONOUS_MASK, SigInfo, SigSet, si_code};
 use crate::task::{Ucount, Uid, ucount_dec, ucount_inc};
 use crate::time::posix_timer::PosixTimer;
 use crate::util::kalloc::try_box;
+use crate::util::list::{BoxList, Link};
 use alloc::boxed::Box;
 use alloc::sync::Weak;
 
@@ -29,8 +30,11 @@ pub struct SigQueue {
     uid: Uid,
     /// The POSIX timer whose entry this is (Linux SIGQUEUE_PREALLOC)
     timer: Option<Weak<PosixTimer>>,
-    next: Option<Box<SigQueue>>,
+    /// On its SigPending's list (Linux sigqueue.list)
+    link: Link,
 }
+
+crate::adapter!(SigQueueLink, SigQueue, link);
 
 impl SigQueue {
     /// An entry for `info` charged to `uid`, the receiver's real uid
@@ -44,7 +48,7 @@ impl SigQueue {
             info,
             uid,
             timer: None,
-            next: None,
+            link: Link::new(),
         };
         if !override_rlimit && n > limit {
             return None;
@@ -131,7 +135,7 @@ impl Drop for Dequeued {
 pub struct SigPending {
     /// Bitmask of pending signals
     pub signal: SigSet,
-    list: Option<Box<SigQueue>>,
+    list: BoxList<SigQueueLink>,
 }
 
 impl SigPending {
@@ -139,7 +143,7 @@ impl SigPending {
     pub const fn new() -> Self {
         Self {
             signal: SigSet::EMPTY,
-            list: None,
+            list: BoxList::new(),
         }
     }
 
@@ -165,36 +169,20 @@ impl SigPending {
     }
 
     /// Queue `q` behind the others and mark its signal pending
-    pub fn queue(&mut self, mut q: Box<SigQueue>) {
-        q.next = None;
+    pub fn queue(&mut self, q: Box<SigQueue>) {
         self.signal.add(q.info.sig());
-        let mut cur = &mut self.list;
-        while let Some(next) = cur {
-            cur = &mut next.next;
-        }
-        *cur = Some(q);
+        self.list.push_back(q);
     }
 
     fn iter(&self) -> impl Iterator<Item = &SigQueue> {
-        core::iter::successors(self.list.as_deref(), |q| q.next.as_deref())
-    }
-
-    /// Unlink the first entry `f` picks
-    fn unlink(&mut self, f: impl Fn(&SigQueue) -> bool) -> Option<Box<SigQueue>> {
-        let mut cur = &mut self.list;
-        while cur.as_deref().is_some_and(|q| !f(q)) {
-            cur = &mut cur.as_mut()?.next;
-        }
-        let mut q = cur.take()?;
-        *cur = q.next.take();
-        Some(q)
+        self.list.iter()
     }
 
     /// Take `sig`'s first queued info (Linux collect_signal): it stays
     /// pending while another instance is queued; with none queued (it
     /// came without info) the info is SI_USER from pid 0
     fn collect(&mut self, sig: u32) -> Dequeued {
-        let q = self.unlink(|q| q.info.sig() == sig);
+        let q = self.list.remove_first(|q| q.info.sig() == sig);
         if q.is_none() || !self.iter().any(|e| e.info.sig() == sig) {
             self.signal.remove(sig);
         }
@@ -246,11 +234,10 @@ impl SigPending {
     /// the lock is released
     pub fn flush_timers(&mut self) -> SigPending {
         let mut gone = SigPending::new();
-        while let Some(q) = self.unlink(|q| q.info.code == si_code::SI_TIMER) {
-            self.signal.remove(q.info.sig());
-            gone.queue(q);
-        }
-        for q in core::iter::successors(self.list.as_deref(), |q| q.next.as_deref()) {
+        self.list
+            .drain_if(|q| q.info.code == si_code::SI_TIMER, |q| gone.queue(q));
+        self.signal = self.signal.subtract(&gone.signal);
+        for q in self.list.iter() {
             self.signal.add(q.info.sig());
         }
         gone
@@ -268,9 +255,8 @@ impl SigPending {
         let mut gone = SigPending::new();
         gone.signal = self.signal.intersect(mask);
         self.signal = self.signal.subtract(mask);
-        while let Some(q) = self.unlink(|q| mask.contains(q.info.sig())) {
-            gone.queue(q);
-        }
+        self.list
+            .drain_if(|q| mask.contains(q.info.sig()), |q| gone.queue(q));
         gone
     }
 }
@@ -279,9 +265,7 @@ impl Drop for SigPending {
     /// One entry at a time: a long queue must not recurse; a timer's
     /// goes back to it
     fn drop(&mut self) {
-        let mut cur = self.list.take();
-        while let Some(mut q) = cur {
-            cur = q.next.take();
+        while let Some(q) = self.list.pop_front() {
             release(q);
         }
     }

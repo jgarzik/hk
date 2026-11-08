@@ -11,6 +11,7 @@
 //! - [`ArcList`]: the list owns one strong reference per entry
 //!   (`Arc::into_raw` on insert, back on removal): run queues, children
 //!   and thread-group lists.
+//! - [`BoxList`]: the list owns each entry as a `Box`: queued signals.
 //!
 //! A list and the links of its entries are only touched under the lock
 //! that owns the list (the caller's: `&mut List` is that proof); the
@@ -18,6 +19,7 @@
 //! most one list per link: a link off every list holds [`UNLINKED`] (on
 //! a list, the ends hold null), which [`ArcList`] checks on insert.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::ptr::null_mut;
@@ -367,6 +369,97 @@ impl<A: Adapter> Drop for ArcList<A> {
     }
 }
 
+/// A [`List`] that owns each entry as a `Box` (Linux list_head of
+/// kmalloc'd entries: struct sigpending's sigqueues)
+///
+/// # Invariants
+/// Every item on `list` was inserted with `Box::into_raw`: the list owns
+/// it until it leaves through `from_raw`.
+pub struct BoxList<A: Adapter> {
+    list: List<A>,
+    /// It drops `Box<Item>`s wherever it goes: Send/Sync as Box's
+    _owns: PhantomData<Box<A::Item>>,
+}
+
+impl<A: Adapter> BoxList<A> {
+    pub const fn new() -> Self {
+        Self {
+            list: List::new(),
+            _owns: PhantomData,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// Append `item` (Linux list_add_tail); panics if it is on a list
+    /// through this link
+    pub fn push_back(&mut self, item: Box<A::Item>) {
+        assert!(A::link(&item).claim(), "BoxList: item already linked");
+        // SAFETY: unlinked and claimed for this insert (the CAS), and live
+        // while the list owns it
+        unsafe { self.list.push_back(Box::into_raw(item)) };
+    }
+
+    /// Remove and return the first entry
+    pub fn pop_front(&mut self) -> Option<Box<A::Item>> {
+        // SAFETY: entries were inserted with into_raw
+        self.list
+            .pop_front()
+            .map(|p| unsafe { Box::from_raw(p.cast_mut()) })
+    }
+
+    /// Unlink and return the first entry `f` picks
+    pub fn remove_first(&mut self, f: impl Fn(&A::Item) -> bool) -> Option<Box<A::Item>> {
+        let p = core::ptr::from_ref(self.list.iter().find(|i| f(i))?);
+        // SAFETY: found on this list, which owns it from into_raw
+        unsafe {
+            self.list.remove(p);
+            Some(Box::from_raw(p.cast_mut()))
+        }
+    }
+
+    /// Unlink every entry `f` picks, in one walk, handing each to `sink`
+    /// in list order
+    pub fn drain_if(&mut self, f: impl Fn(&A::Item) -> bool, mut sink: impl FnMut(Box<A::Item>)) {
+        let mut cur = self.list.front();
+        while let Some(p) = cur {
+            // SAFETY: `p` is on this list; its successor is read before
+            // `p` may leave it
+            cur = unsafe { self.list.next(p) };
+            // SAFETY: a live entry of this list
+            if f(unsafe { &*p }) {
+                // SAFETY: on this list, which owns it from into_raw
+                unsafe {
+                    self.list.remove(p);
+                    sink(Box::from_raw(p.cast_mut()));
+                }
+            }
+        }
+    }
+
+    pub fn iter(&self) -> Iter<'_, A> {
+        self.list.iter()
+    }
+}
+
+impl<A: Adapter> Default for BoxList<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A: Adapter> Drop for BoxList<A> {
+    fn drop(&mut self) {
+        while self.pop_front().is_some() {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +480,68 @@ mod tests {
 
     fn vals(l: &ArcList<NodeA>) -> Vec<u32> {
         l.iter().map(|n| n.v).collect()
+    }
+
+    struct BNode {
+        v: u32,
+        link: Link,
+        dropped: Option<Arc<core::sync::atomic::AtomicU32>>,
+    }
+    crate::adapter!(BNodeA, BNode, link);
+
+    impl Drop for BNode {
+        fn drop(&mut self) {
+            if let Some(d) = &self.dropped {
+                d.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    fn bnode(v: u32) -> Box<BNode> {
+        Box::new(BNode {
+            v,
+            link: Link::new(),
+            dropped: None,
+        })
+    }
+
+    fn bvals(l: &BoxList<BNodeA>) -> Vec<u32> {
+        l.iter().map(|n| n.v).collect()
+    }
+
+    #[test]
+    fn box_list_remove_first_and_drain() {
+        let mut l: BoxList<BNodeA> = BoxList::new();
+        for v in 1..=6 {
+            l.push_back(bnode(v));
+        }
+        assert_eq!(l.remove_first(|n| n.v % 2 == 0).map(|n| n.v), Some(2));
+        assert!(l.remove_first(|n| n.v == 9).is_none());
+        let mut got = Vec::new();
+        // Head, middle and tail all leave in one walk
+        l.drain_if(|n| n.v != 3, |n| got.push(n.v));
+        assert_eq!(got, [1, 4, 5, 6]);
+        assert_eq!(bvals(&l), [3]);
+        // A removed entry can be queued again
+        let n = l.pop_front().unwrap();
+        assert!(l.is_empty());
+        l.push_back(n);
+        l.push_back(bnode(7));
+        assert_eq!((bvals(&l), l.len()), (alloc::vec![3, 7], 2));
+    }
+
+    #[test]
+    fn box_list_drop_frees_entries() {
+        let d = Arc::new(core::sync::atomic::AtomicU32::new(0));
+        {
+            let mut l: BoxList<BNodeA> = BoxList::new();
+            for v in 0..3 {
+                let mut n = bnode(v);
+                n.dropped = Some(d.clone());
+                l.push_back(n);
+            }
+        }
+        assert_eq!(d.load(Relaxed), 3);
     }
 
     #[test]
