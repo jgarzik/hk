@@ -13,6 +13,9 @@
 //!   it checks the number (EINVAL)
 //! - SIGNO_PIDFD: pidfd_send_signal finds the pidfd (EBADF) before it
 //!   checks the number (EINVAL); signal 0 probes
+//! - SIGNO_PDEATHSIG: PR_SET_PDEATHSIG takes 0..=_NSIG of the whole
+//!   unsigned long (EINVAL past it); PR_GET_PDEATHSIG reads it back, 0
+//!   once cleared
 
 use crate::harness::T;
 use hk_syscall::{
@@ -36,6 +39,7 @@ pub fn run_tests() {
     test_sigqueue();
     test_sigaction();
     test_pidfd();
+    test_pdeathsig();
 }
 
 fn test_kill() {
@@ -104,5 +108,29 @@ fn test_pidfd() {
         t.eq(b"probe", sys_pidfd_send_signal(fd32, 0, none, 0), 0);
         sys_close(fd as u64);
     }
+    t.done();
+}
+
+fn test_pdeathsig() {
+    use hk_syscall::sys_prctl;
+    const PR_SET_PDEATHSIG: i32 = 1;
+    const PR_GET_PDEATHSIG: i32 = 2;
+    let mut t = T::new(b"SIGNO_PDEATHSIG");
+    let get = || {
+        let mut v = -1i32;
+        let r = sys_prctl(PR_GET_PDEATHSIG, &mut v as *mut i32 as u64, 0, 0, 0);
+        if r == 0 { i64::from(v) } else { r }
+    };
+    t.eq(
+        b"high bits",
+        sys_prctl(PR_SET_PDEATHSIG, 1 << 32 | 1, 0, 0, 0),
+        EINVAL,
+    );
+    t.eq(b"65", sys_prctl(PR_SET_PDEATHSIG, 65, 0, 0, 0), EINVAL);
+    t.eq(b"unchanged", get(), 0);
+    t.eq(b"set 64", sys_prctl(PR_SET_PDEATHSIG, 64, 0, 0, 0), 0);
+    t.eq(b"get 64", get(), 64);
+    t.eq(b"clear", sys_prctl(PR_SET_PDEATHSIG, 0, 0, 0, 0), 0);
+    t.eq(b"get 0", get(), 0);
     t.done();
 }

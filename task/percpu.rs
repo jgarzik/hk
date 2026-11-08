@@ -2805,9 +2805,7 @@ fn forget_original_parent() {
     // moved child's threads get their pdeath_signal, from this task
     for c in &moved {
         let deaths = GlobalTaskTable::collect_threads(c.pid, |_, t| {
-            let sig = u32::try_from(t.pdeath_signal)
-                .ok()
-                .and_then(crate::signal::Signal::new)?;
+            let sig = t.pdeath_signal?;
             Some((task_ref(t.task), sig))
         });
         for (t, sig) in deaths {
@@ -4981,7 +4979,7 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
             // Its parent no longer signals it at death (Linux
             // commit_creds)
             if ids_changed {
-                t.pdeath_signal = 0;
+                t.pdeath_signal = None;
             }
             t.set_cred(new)
         })
@@ -5260,7 +5258,7 @@ pub fn exec_replace_image(
         // exec is not signalled at its parent's death (begin_new_exec)
         task.exit_signal = i32::from(crate::signal::SIGCHLD);
         if ident.secure {
-            task.pdeath_signal = 0;
+            task.pdeath_signal = None;
         }
         // The mm and name change as one under task_lock (Linux
         // exec_mmap, __set_task_comm): a reader sees both or neither

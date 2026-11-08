@@ -1133,7 +1133,7 @@ pub struct TaskInner {
     /// a non-SIGCHLD exit signal is sent only to the image that set it
     pub parent_exec_id: u64,
     /// Signal to send when parent dies (set via prctl PR_SET_PDEATHSIG)
-    pub pdeath_signal: i32,
+    pub pdeath_signal: Option<crate::signal::Signal>,
 
     // =========================================================================
     // Credentials (like Linux task_struct->cred)
@@ -1273,7 +1273,7 @@ impl TaskInner {
             exit_code: 0,
             exit_signal: 0,
             parent_exec_id: 0,
-            pdeath_signal: 0,
+            pdeath_signal: None,
             state,
             pgd,
             clear_child_tid: 0,
