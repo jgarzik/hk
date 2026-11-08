@@ -163,7 +163,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         rt_priority: i32::from(t.task.se.rt_priority()),
         cpus: t.task.cpus_mask.snapshot(),
         cpu: t.task.cpu.load(core::sync::atomic::Ordering::Relaxed),
-        exit_signal: t.exit_signal,
+        exit_signal: t.exit_signal.raw(),
         exit_code: t.exit_code,
         threads,
         tracer,

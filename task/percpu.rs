@@ -975,7 +975,7 @@ impl GlobalTaskTable {
         // Linux reparent_leader: no custom exit signal to a new
         // parent process ("we don't want people slaying init")
         if other_group {
-            ci.exit_signal = i32::from(crate::signal::SIGCHLD);
+            ci.exit_signal = crate::signal::ExitSignal::SIGCHLD;
         }
         child.ppid.store(reaper.pid, Ordering::Relaxed);
         self.link_child(child);
@@ -1594,7 +1594,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, &'static str>
         // The boot group and session, number 0 (Linux init_struct_pid)
         pgrp: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.pgid),
         session: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.sid),
-        exit_signal: i32::from(crate::signal::SIGCHLD),
+        exit_signal: crate::signal::ExitSignal::SIGCHLD,
         // Shared resources: set by the caller via init_* functions
         ..crate::task::TaskInner::new(
             Some(thread_pid),
@@ -1700,12 +1700,12 @@ pub fn reap_zombie_child(parent_pid: Pid, target_pid: i64, wflags: i32) -> Optio
 /// (Linux kernel/exit.c eligible_child): __WALL waits for all children;
 /// otherwise "clone" children (exit_signal != SIGCHLD) are waited for only
 /// with __WCLONE, and normal children only without it.
-fn wait_eligible(exit_signal: i32, wflags: i32) -> bool {
+fn wait_eligible(exit_signal: crate::signal::ExitSignal, wflags: i32) -> bool {
     use super::wait_options::{__WALL, __WCLONE};
     if wflags & __WALL != 0 {
         return true;
     }
-    let is_clone = exit_signal != i32::from(crate::signal::SIGCHLD);
+    let is_clone = exit_signal != crate::signal::ExitSignal::SIGCHLD;
     is_clone == (wflags & __WCLONE != 0)
 }
 
@@ -2008,7 +2008,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
             .ppid
             .store(ppid, core::sync::atomic::Ordering::Relaxed);
         // Linux de_thread: the new leader's exit signal is SIGCHLD
-        m.exit_signal = i32::from(crate::signal::SIGCHLD);
+        m.exit_signal = crate::signal::ExitSignal::SIGCHLD;
         m.task.start_time.store(start, Ordering::Relaxed);
     }
     // ... and its place on the group's and session's lists (Linux
@@ -2131,8 +2131,9 @@ pub struct CloneConfig {
     pub tls: u64,
     /// User address to store pidfd (CLONE_PIDFD)
     pub pidfd_ptr: u64,
-    /// Exit signal for child (SIGCHLD for fork, 0 for threads)
-    pub exit_signal: i32,
+    /// Exit signal for child (SIGCHLD for fork; a thread's is
+    /// ExitSignal::THREAD whatever this says)
+    pub exit_signal: crate::signal::ExitSignal,
     /// Cgroup file descriptor (CLONE_INTO_CGROUP, clone3 only)
     pub cgroup_fd: i32,
     /// clone3 set_tid: the child's number in the innermost
@@ -2257,7 +2258,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     ) = {
         let table = TASKLIST.read();
         let parent = table.get(current_tid).ok_or(KernelError::NoProcess)?;
-        let leader_exit = table.get(parent.task.pid).map_or(0, |l| l.exit_signal);
+        let leader_exit = table
+            .get(parent.task.pid)
+            .map_or(crate::signal::ExitSignal::NONE, |l| l.exit_signal);
         (
             parent.task.pid,
             parent.task.ppid(),
@@ -2443,7 +2446,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // group leader's; their parent_exec_id the caller's, else the
         // caller's exec count
         exit_signal: if config.flags & CLONE_THREAD != 0 {
-            -1
+            crate::signal::ExitSignal::THREAD
         } else if config.flags & CLONE_PARENT != 0 {
             parent_leader_exit_signal
         } else {
@@ -5256,7 +5259,7 @@ pub fn exec_replace_image(
         new.set_dumpable(ident.dumpable);
         // A new execution domain (Linux de_thread): SIGCHLD; a secure
         // exec is not signalled at its parent's death (begin_new_exec)
-        task.exit_signal = i32::from(crate::signal::SIGCHLD);
+        task.exit_signal = crate::signal::ExitSignal::SIGCHLD;
         if ident.secure {
             task.pdeath_signal = None;
         }

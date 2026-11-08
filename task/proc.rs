@@ -81,8 +81,9 @@ pub fn sys_clone(
     // are only reachable through clone3().
     let flags = flags & 0xffff_ffff;
 
-    // Extract exit_signal from low 8 bits of flags (CSIGNAL mask = 0xff)
-    let exit_signal = (flags & 0xff) as i32;
+    // exit_signal: the low 8 bits of flags (CSIGNAL), as given (Linux
+    // kernel_clone checks no legacy clone's)
+    let exit_signal = crate::signal::ExitSignal::csignal(flags as u8);
 
     // CLONE_PIDFD stores the pidfd at parent_tid (Linux sys_clone: one
     // pointer for both), so CLONE_PARENT_SETTID with it is EINVAL
@@ -136,7 +137,7 @@ pub fn sys_fork() -> KernelResult<i64> {
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
-        exit_signal: i32::from(crate::signal::SIGCHLD), // fork sends SIGCHLD on exit
+        exit_signal: crate::signal::ExitSignal::SIGCHLD, // fork sends SIGCHLD on exit
         cgroup_fd: -1,
         set_tid: super::percpu::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
@@ -173,7 +174,7 @@ pub fn sys_vfork() -> KernelResult<i64> {
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
-        exit_signal: i32::from(crate::signal::SIGCHLD), // vfork sends SIGCHLD on exit
+        exit_signal: crate::signal::ExitSignal::SIGCHLD, // vfork sends SIGCHLD on exit
         cgroup_fd: -1,
         set_tid: super::percpu::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
@@ -579,10 +580,13 @@ pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
 
     // Validate clone3-specific constraints
 
-    // exit_signal must be valid (only low 8 bits used, must be valid signal or 0)
-    if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > 64 {
+    // exit_signal: CSIGNAL bits only, then a signal or 0 (Linux
+    // copy_clone_args_from_user, clone3_args_valid: valid_signal)
+    if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > u64::from(crate::signal::NSIG) {
         return Err(KernelError::InvalidArgument);
     }
+    // 0..=NSIG: fits the CSIGNAL byte
+    let exit_signal = crate::signal::ExitSignal::csignal(args.exit_signal as u8);
 
     // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
     let cgroup_fd = if (args.flags & CLONE_INTO_CGROUP) != 0 {
@@ -649,7 +653,7 @@ pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
         child_tidptr: args.child_tid,
         tls: args.tls,
         pidfd_ptr: args.pidfd,
-        exit_signal: args.exit_signal as i32,
+        exit_signal,
         cgroup_fd,
         set_tid,
         set_tid_size: n,

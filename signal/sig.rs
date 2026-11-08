@@ -99,6 +99,43 @@ impl Signal {
     }
 }
 
+/// A task's exit signal as Linux stores it (task_struct.exit_signal):
+/// -1 for a thread, else what clone gave, 0..=255 (legacy clone's
+/// CSIGNAL bits, never checked) or a valid number (clone3); /proc shows
+/// it as is, only a signal ([`ExitSignal::signal`]) is ever sent
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExitSignal(i16);
+
+impl ExitSignal {
+    /// A thread's (Linux -1): it never notifies a parent with it
+    pub const THREAD: Self = Self(-1);
+    /// None (Linux 0)
+    pub const NONE: Self = Self(0);
+    /// SIGCHLD, a fork's
+    pub const SIGCHLD: Self = Self::of(SIGCHLD);
+
+    /// `sig`
+    pub const fn of(sig: Signal) -> Self {
+        Self(sig.0.get() as i16)
+    }
+
+    /// Clone's CSIGNAL bits as given
+    pub const fn csignal(n: u8) -> Self {
+        Self(n as i16)
+    }
+
+    /// The signal it sends: None for a thread's, 0, or past NSIG (Linux
+    /// do_notify_parent: valid_signal(sig) && sig)
+    pub fn signal(self) -> Option<Signal> {
+        u32::try_from(self.0).ok().and_then(Signal::new)
+    }
+
+    /// The number Linux stores (/proc/PID/stat's exit_signal)
+    pub const fn raw(self) -> i32 {
+        self.0 as i32
+    }
+}
+
 impl From<Signal> for i32 {
     /// The number as a C int (si_signo, a wait status's low bits)
     fn from(s: Signal) -> i32 {
@@ -217,5 +254,17 @@ mod tests {
             assert!(!rt.kernel_only() && !rt.kernel_coredump());
             assert!(!rt.kernel_ignore() && !rt.kernel_stop());
         }
+    }
+
+    /// Linux's stored number shows as is; only 1..=NSIG is a signal
+    #[test]
+    fn exit_signal() {
+        assert_eq!(ExitSignal::THREAD.raw(), -1);
+        assert_eq!(ExitSignal::THREAD.signal(), None);
+        assert_eq!(ExitSignal::NONE.signal(), None);
+        assert_eq!(ExitSignal::SIGCHLD.signal(), Some(SIGCHLD));
+        assert_eq!(ExitSignal::csignal(200).raw(), 200);
+        assert_eq!(ExitSignal::csignal(200).signal(), None);
+        assert_eq!(ExitSignal::csignal(64).signal(), Some(SIGRTMAX));
     }
 }

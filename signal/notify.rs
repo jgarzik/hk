@@ -126,9 +126,11 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
         }
         Zombie::Leader(_) | Zombie::Detached(_) => true,
     };
-    // A thread's -1 is no signal (Linux: never notified with it)
-    let exit_signal = u32::try_from(t.exit_signal).ok().and_then(Signal::new);
-    let mut sig = if own { exit_signal } else { Some(SIGCHLD) };
+    let mut sig = if own {
+        t.exit_signal.signal()
+    } else {
+        Some(SIGCHLD)
+    };
     // A custom exit signal only to the image that asked for it (Linux:
     // parent_exec_id != parent->self_exec_id makes it SIGCHLD)
     if sig != Some(SIGCHLD) && t.parent_exec_id != crate::task::self_exec_id(&parent) {

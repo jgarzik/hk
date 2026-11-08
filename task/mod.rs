@@ -1128,7 +1128,7 @@ pub struct TaskInner {
     pub exit_code: i32,
     /// Signal to send to parent on exit (default SIGCHLD, from clone3
     /// exit_signal; -1 for a thread, Linux)
-    pub exit_signal: i32,
+    pub exit_signal: crate::signal::ExitSignal,
     /// Its parent's exec count when it was made (Linux parent_exec_id):
     /// a non-SIGCHLD exit signal is sent only to the image that set it
     pub parent_exec_id: u64,
@@ -1271,7 +1271,7 @@ impl TaskInner {
             session: None,
             pids_linked: false,
             exit_code: 0,
-            exit_signal: 0,
+            exit_signal: crate::signal::ExitSignal::NONE,
             parent_exec_id: 0,
             pdeath_signal: None,
             state,
