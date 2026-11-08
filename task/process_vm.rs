@@ -200,7 +200,7 @@ fn check_process_vm_permission(target: &Task) -> bool {
         (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(&a, &b),
         _ => false,
     };
-    same_mm || crate::task::ptrace::may_access(|t| core::ptr::eq(t.task, target), false)
+    same_mm || crate::task::ptrace::may_access_task(target, false)
 }
 
 /// The target's address space if the caller may access it (Linux

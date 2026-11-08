@@ -980,23 +980,23 @@ pub fn may_read_proc(pid: crate::task::Pid) -> bool {
     may_access(|t| t.task.pid == pid, true)
 }
 
-/// [`may_read_proc`] for the pinned task `t` itself (Linux
-/// ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS) on the task
-/// get_pid_task returned): its own thread group always
-pub fn may_read_ref(t: &crate::task::Task) -> bool {
-    if t.pid == percpu::current_pid() {
-        return true;
-    }
-    may_access(|v| core::ptr::eq(v.task, t), true)
-}
-
 /// Linux ptrace_may_access for task `t`: the caller's own thread
-/// group always (while `t` is listed), else [`may_access`] with its
-/// fsuid/fsgid (`fscreds`, PTRACE_MODE_*_FSCREDS) or its real ids
+/// group always (Linux __ptrace_may_access: same_thread_group, even
+/// once `t` is reaped), else [`may_access`] with its fsuid/fsgid
+/// (`fscreds`, PTRACE_MODE_*_FSCREDS) or its real ids
 /// (PTRACE_MODE_*_REALCREDS)
 pub fn may_access_task(t: &Task, fscreds: bool) -> bool {
-    let own = t.pid == percpu::current_pid() && TASKLIST.read().view(t).is_some();
-    own || may_access_view(t, fscreds)
+    same_thread_group(t) || may_access_view(t, fscreds)
+}
+
+/// Is `t` a thread of the caller's process (Linux same_thread_group:
+/// the same signal_struct, which a task keeps until it is freed)
+fn same_thread_group(t: &Task) -> bool {
+    let me = percpu::current();
+    match (t.cpu_group(), me.cpu_group()) {
+        (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(a, b),
+        _ => me.is(t),
+    }
 }
 
 /// [`may_access`] for task `t` itself: false once it is reaped

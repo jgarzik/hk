@@ -440,7 +440,7 @@ pub fn gen_stat(t: &TaskRef, ns: &PidNamespace) -> Vec<u8> {
     // The access decision and the mm it covers, as one (Linux holds
     // exec_update_lock across do_task_stat)
     let guard = crate::signal::ExecUpdateRead::lock(t);
-    let permitted = crate::task::ptrace::may_read_ref(t);
+    let permitted = crate::task::ptrace::may_access_task(t, true);
     let v = task_vm(t);
     drop(guard);
     fmt_stat(&s, v.as_ref(), permitted, ign_cgt(&s), rss_lim(&s))

@@ -492,7 +492,7 @@ impl InodeOps for ProcfsInodeOps {
         }
         // fd/ and fdinfo/: ptrace-read access (Linux proc_fd_permission)
         if let Some(OpenCheck::Fds(t)) = open_check(inode)
-            && !crate::task::ptrace::may_read_ref(&t)
+            && !crate::task::ptrace::may_access_task(&t, true)
         {
             return Err(KernelError::PermissionDenied);
         }
@@ -1051,7 +1051,7 @@ fn gen_fdinfo_content(t: &TaskRef, fd: i32, ns: &PidNamespace) -> Vec<u8> {
 /// without PTRACE_MODE_READ_FSCREDS access)
 fn ns_task(pid: &ProcPid) -> Result<TaskRef, KernelError> {
     let t = pid.task().ok_or(KernelError::PermissionDenied)?;
-    if !crate::task::ptrace::may_read_ref(&t) {
+    if !crate::task::ptrace::may_access_task(&t, true) {
         return Err(KernelError::PermissionDenied);
     }
     Ok(t)
@@ -1179,7 +1179,7 @@ fn mm_access(t: &TaskRef) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
     // exec_update_lock: no exec of it switches mm or dumpability between;
     // check and mm both of that one pinned task
     let _g = crate::signal::ExecUpdateRead::lock(t);
-    if !crate::task::ptrace::may_read_ref(t) {
+    if !crate::task::ptrace::may_access_task(t, true) {
         return Err(KernelError::PermissionDenied);
     }
     Ok(task_mm(t))
@@ -1373,7 +1373,7 @@ fn pid_file_pid(inode: &Inode) -> Option<TaskRef> {
 /// names it, EACCES without ptrace-read access (Linux
 /// proc_fd_access_allowed), ENOENT for a task without one
 fn fs_link(t: &TaskRef, root: bool) -> Result<Vec<u8>, KernelError> {
-    if !crate::task::ptrace::may_read_ref(t) {
+    if !crate::task::ptrace::may_access_task(t, true) {
         return Err(KernelError::PermissionDenied);
     }
     let fs = crate::fs::get_task_fs(t).ok_or(KernelError::NotFound)?;
@@ -1599,7 +1599,7 @@ impl FileOps for ProcfsFileOps {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let mm = match open_check(&inode) {
             Some(OpenCheck::Mm(t)) => mm_access(&t)?,
-            Some(OpenCheck::Fds(t)) if !crate::task::ptrace::may_read_ref(&t) => {
+            Some(OpenCheck::Fds(t)) if !crate::task::ptrace::may_access_task(&t, true) => {
                 return Err(KernelError::PermissionDenied);
             }
             _ => None,
