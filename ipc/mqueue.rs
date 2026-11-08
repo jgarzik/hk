@@ -386,7 +386,7 @@ impl MqQueue {
             if let Some(sig) = n.sig.filter(|_| live) {
                 let info = mesgq_info(sig, n.sigev_value, &n.owner);
                 // To the registrant's struct pid, never its number
-                let _ = crate::signal::kill_pid_info(&n.owner, sig, info, |_| Ok(()));
+                let _ = crate::signal::kill_pid_info(&n.owner, sig, info, |_, _| Ok(()));
             }
         }
     }

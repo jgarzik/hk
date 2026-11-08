@@ -12,8 +12,9 @@
 //! Note: rt_sigreturn (15) is implemented in arch-specific signal.rs files
 
 use crate::signal::{
-    SendInfo, SigAction, SigInfo, SigSet, Signal, UserSigInfo, dequeue_signal, get_task_sighand,
-    kill_pgrp, proc_target, send_group_signal, send_sig_info, si_code, with_task_signal_state,
+    KillSig, SendInfo, SigAction, SigInfo, SigSet, Signal, UserSigInfo, dequeue_signal,
+    get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info, si_code,
+    with_task_signal_state,
 };
 use crate::task::percpu::{TaskRef, current, current_pgid, current_tid, get_all_pids};
 use crate::time::time_syscall::LinuxTimespec;
@@ -190,11 +191,6 @@ pub fn sys_rt_sigpending(set: UserPtr<u64>, sigsetsize: u64) -> KernelResult<()>
 // Kill Permission Check
 // =============================================================================
 
-/// A kill-family signal number as given: None (0) probes; EINVAL past
-/// NSIG, reported where Linux checks it (check_kill_permission, once
-/// the receiver is found: no receiver is ESRCH whatever the number)
-pub(crate) type KillSig = KernelResult<Option<Signal>>;
-
 /// `sig` as a [`KillSig`]
 pub(crate) fn kill_sig(sig: u32) -> KillSig {
     crate::signal::valid_signal(u64::from(sig)).ok_or(KernelError::InvalidArgument)
@@ -206,7 +202,7 @@ pub(crate) fn kill_sig(sig: u32) -> KillSig {
 /// number, EPERM if the caller may not signal it
 fn group_target(pid: u64, sig: KillSig) -> KernelResult<TaskRef> {
     let me = Sender::current();
-    proc_target(pid, |v| me.may_kill(v, sig))
+    proc_target(pid, sig, |v, s| me.may_kill(v, s))
 }
 
 /// What the kill permission check needs of the caller, read before
@@ -226,18 +222,18 @@ impl Sender {
         }
     }
 
-    /// May it send `sig` to `t` (Linux check_kill_permission): EINVAL
-    /// for a bad number first; then same thread group, CAP_KILL, a real
-    /// or effective uid matching the target's real or saved one, or
-    /// SIGCONT within the session; else EPERM
+    /// May it send `sig` (None: a probe) to `t` (Linux
+    /// check_kill_permission past valid_signal, which the caller has
+    /// checked): same thread group, CAP_KILL, a real or effective uid
+    /// matching the target's real or saved one, or SIGCONT within the
+    /// session; else EPERM
     pub(crate) fn may_kill(
         &self,
         t: &crate::task::percpu::TaskView<'_>,
-        sig: KillSig,
+        sig: Option<Signal>,
     ) -> KernelResult<()> {
         use crate::signal::SIGCONT;
         use crate::task::{CAP_KILL, capable};
-        let sig = sig?;
         if self.tgid == t.task.pid || capable(CAP_KILL) {
             return Ok(());
         }
@@ -290,7 +286,8 @@ fn user_thread_send(
         if tgid.is_some_and(|g| v.task.pid != g) {
             return Err(KernelError::NoProcess);
         }
-        me.may_kill(&v, sig)?;
+        // A bad number is EINVAL once the thread is found
+        me.may_kill(&v, sig?)?;
         crate::task::percpu::task_ref(v.task)
     };
     // Checked: a signal or a probe
@@ -319,17 +316,15 @@ pub fn sys_kill(pid: i64, sig: u32) -> KernelResult<()> {
     // Numbers are the caller's (Linux find_vpid): none it sees is ESRCH
     let vpid = |nr: u64| crate::task::pid::from_vnr(nr).ok_or(KernelError::NoProcess);
     let me = Sender::current();
-    let check = |v: &crate::task::percpu::TaskView<'_>| me.may_kill(v, sig);
-    // A bad number fails `check` for every process: nothing is sent
-    let to_pgrp = sig.unwrap_or(None);
+    let check = |v: &crate::task::percpu::TaskView<'_>, s| me.may_kill(v, s);
     match pid {
         1.. => user_group_send(vpid(pid as u64)?, sig, SendInfo::User),
         // Every process in the caller's process group, once each
-        0 => kill_pgrp(current_pgid(), to_pgrp, SendInfo::User, check),
+        0 => kill_pgrp(current_pgid(), sig, SendInfo::User, check),
         -1 => kill_all(sig),
         // Every process in group -pid, once each (signal 0: does the
         // group exist, may we signal it)
-        _ => kill_pgrp(vpid(pid.unsigned_abs())?, to_pgrp, SendInfo::User, check),
+        _ => kill_pgrp(vpid(pid.unsigned_abs())?, sig, SendInfo::User, check),
     }
 }
 

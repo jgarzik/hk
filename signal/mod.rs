@@ -1597,28 +1597,35 @@ fn check_send_context() {
     }
 }
 
-/// The receiver of a group signal to process `pid` (a number a
+/// A kill-family signal number as given: None (0) probes; EINVAL past
+/// NSIG, reported where Linux checks it (check_kill_permission, once
+/// the receiver is found: no receiver is ESRCH whatever the number)
+pub type KillSig = KernelResult<Option<Signal>>;
+
+/// The receiver of a group signal `sig` to process `pid` (a number a
 /// syscall was given, Linux kill_proc_info's find_vpid), once `check`
-/// of it allows it ([`group_task`]): ESRCH, or `check`'s error
+/// of it allows it ([`group_task`]): ESRCH, EINVAL, or `check`'s error
 pub fn proc_target(
     pid: Pid,
-    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> KernelResult<()>,
+    sig: KillSig,
+    check: impl Fn(&crate::task::percpu::TaskView<'_>, Option<Signal>) -> KernelResult<()>,
 ) -> KernelResult<TaskRef> {
     let table = TASKLIST.read();
-    checked(&table, table.get(pid), PidType::Tgid, check)
+    checked(&table, table.get(pid), PidType::Tgid, sig, check)
 }
 
-/// The receiver of a signal to `v` (`ty` Pid) or its group (Tgid),
-/// once `check` of `v` allows it, under TASKLIST: ESRCH if there is
-/// none, or `check`'s error
+/// The receiver of `sig` to `v` (`ty` Pid) or its group (Tgid), under
+/// TASKLIST: ESRCH if there is none, then a bad number's EINVAL (Linux
+/// check_kill_permission: valid_signal first), then `check`'s error
 fn checked(
     table: &crate::task::percpu::GlobalTaskTable,
     v: Option<crate::task::percpu::TaskView<'_>>,
     ty: PidType,
-    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> KernelResult<()>,
+    sig: KillSig,
+    check: impl Fn(&crate::task::percpu::TaskView<'_>, Option<Signal>) -> KernelResult<()>,
 ) -> KernelResult<TaskRef> {
     let v = v.ok_or(KernelError::NoProcess)?;
-    check(&v)?;
+    check(&v, sig?)?;
     let t = match ty {
         PidType::Pid => Some(crate::task::percpu::task_ref(v.task)),
         PidType::Tgid => group_task(table, Some(v)),
@@ -1671,48 +1678,49 @@ pub fn kill_pid_info(
     pid: &crate::task::pid::Pid,
     sig: Signal,
     info: SendInfo,
-    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> KernelResult<()>,
+    check: impl Fn(&crate::task::percpu::TaskView<'_>, Option<Signal>) -> KernelResult<()>,
 ) -> KernelResult<()> {
-    kill_pid_info_type(pid, Some(sig), info, PidType::Tgid, check)
+    kill_pid_info_type(pid, Ok(Some(sig)), info, PidType::Tgid, check)
 }
 
 /// `sig` with `info` to the task struct pid `pid` names (`ty` Pid) or
 /// its thread group (`ty` Tgid), after `check` of that task allows it
-/// (Linux kill_pid_info_type); `sig` None only checks
+/// (Linux kill_pid_info_type); `sig` None only checks, a bad number is
+/// EINVAL once the task is found
 pub fn kill_pid_info_type(
     pid: &crate::task::pid::Pid,
-    sig: Option<Signal>,
+    sig: KillSig,
     info: SendInfo,
     ty: PidType,
-    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> KernelResult<()>,
+    check: impl Fn(&crate::task::percpu::TaskView<'_>, Option<Signal>) -> KernelResult<()>,
 ) -> KernelResult<()> {
     let t = {
         let table = TASKLIST.read();
         let found = table.pid_tid(pid).and_then(|tid| table.get(tid));
-        checked(&table, found, ty, check)?
+        checked(&table, found, ty, sig, check)?
     };
     send_or_probe(&t, sig, info, ty)
 }
 
 /// [`send_task`] of `sig` to `t`, found and checked; None is a probe
-/// that sends nothing (Linux: the null signal)
-fn send_or_probe(t: &Task, sig: Option<Signal>, info: SendInfo, ty: PidType) -> KernelResult<()> {
-    sig.map_or(Ok(()), |s| send_task(t, s, info, ty, false))
+/// that sends nothing (Linux: the null signal), a bad number EINVAL
+fn send_or_probe(t: &Task, sig: KillSig, info: SendInfo, ty: PidType) -> KernelResult<()> {
+    sig?.map_or(Ok(()), |s| send_task(t, s, info, ty, false))
 }
 
 /// `sig` with `info` once to each process of the group struct pid `pg`
 /// names, after `check` of its leader allows it (Linux kill_pgrp_info:
 /// the reference cannot come to name another group); `sig` None only
-/// checks. 0 if any process got it, else the last error (ESRCH for an
-/// empty group).
+/// checks, a bad number is EINVAL for each process. 0 if any process
+/// got it, else the last error (ESRCH for an empty group).
 pub fn kill_pgrp_info(
     pg: &crate::task::pid::Pid,
-    sig: Option<Signal>,
+    sig: KillSig,
     info: SendInfo,
-    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> KernelResult<()>,
+    check: impl Fn(&crate::task::percpu::TaskView<'_>, Option<Signal>) -> KernelResult<()>,
 ) -> KernelResult<()> {
     let procs = crate::task::percpu::GlobalTaskTable::collect_pgrp(pg, |table, t| {
-        Some((check(t), group_task(table, Some(*t))))
+        Some((sig.and_then(|s| check(t, s)), group_task(table, Some(*t))))
     });
     let mut ret = Err(KernelError::NoProcess);
     let mut ok = false;
@@ -1735,7 +1743,7 @@ pub fn kill_pgrp_info(
 ///
 /// As [`kill_pgrp`].
 pub fn send_signal_to_pgrp(pgid: Pid, sig: Signal) -> KernelResult<()> {
-    kill_pgrp(pgid, Some(sig), SendInfo::Kernel, |_| Ok(()))
+    kill_pgrp(pgid, Ok(Some(sig)), SendInfo::Kernel, |_, _| Ok(()))
 }
 
 /// `sig` from the kernel to each process of the group `pg` names (Linux
@@ -1752,18 +1760,20 @@ pub fn kill_pgrp_pid(pg: &crate::task::pid::Pid, sig: Signal) {
 
 /// `sig` with `info` once to each process of group `pgid` (Linux __kill_pgrp_info:
 /// its leader on the group's list, the signal process-directed), after
-/// `check` of it allows it; `sig` None only checks. 0 if any process got
-/// it, else the last error (ESRCH for an empty group).
+/// `check` of it allows it; `sig` None only checks, a bad number is
+/// EINVAL for each process. 0 if any process got it, else the last
+/// error (ESRCH for an empty group).
 pub fn kill_pgrp(
     pgid: Pid,
-    sig: Option<Signal>,
+    sig: KillSig,
     info: SendInfo,
-    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> KernelResult<()>,
+    check: impl Fn(&crate::task::percpu::TaskView<'_>, Option<Signal>) -> KernelResult<()>,
 ) -> KernelResult<()> {
     let mut ret = Err(KernelError::NoProcess);
     let mut ok = false;
     for pid in crate::task::percpu::pgrp_pids(pgid) {
-        ret = proc_target(pid, &check).and_then(|t| send_or_probe(&t, sig, info, PidType::Tgid));
+        ret =
+            proc_target(pid, sig, &check).and_then(|t| send_or_probe(&t, sig, info, PidType::Tgid));
         ok |= ret.is_ok();
     }
     if ok { Ok(()) } else { ret }
