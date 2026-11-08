@@ -108,7 +108,7 @@ impl Zombie {
 fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
     let tid = z.tid();
     let t = table.get(tid)?;
-    let real = t.real_parent.as_ref().and_then(|w| w.upgrade());
+    let real = t.real_parent();
     let tracer = match z {
         Zombie::Detached(_) => None,
         _ => t.tracer(),
@@ -120,7 +120,7 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
             // Linux ptrace_reparented: the tracer is not a thread of
             // the real parent's process
             let reparented = traced && real.as_ref().is_none_or(|r| r.pid != parent.pid);
-            t.leader
+            t.leader()
                 && !reparented
                 && !crate::task::percpu::group_pending(table, t.task.pid, &[tid])
         }
@@ -352,7 +352,7 @@ fn chld_notice(table: &GlobalTaskTable, tid: Tid, ns: &crate::ns::PidNamespace) 
         Some(super::GroupExit::Exit(code)) => code,
         _ => own,
     };
-    let (utime, stime) = if t.leader {
+    let (utime, stime) = if t.leader() {
         crate::task::percpu::group_times(table, t.task.pid)
     } else {
         t.task.cputime(crate::time::monotonic_ns())

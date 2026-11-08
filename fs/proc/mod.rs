@@ -660,7 +660,7 @@ fn group_threads(
         if matches!(x.state, crate::task::TaskState::Zombie(_)) {
             return None;
         }
-        let nr = x.thread_pid.as_ref()?.nr_in(ns)?;
+        let nr = x.thread_pid()?.nr_in(ns)?;
         Some((core::ptr::from_ref(x.task), x.task.tid(), nr))
     })
 }
@@ -1827,7 +1827,7 @@ fn readdir_emit_pids(root: &Inode, ctx: &mut DirContext<'_>) -> Result<(), Kerne
         if t.task.tid() != t.task.pid || t.task.pid == 0 {
             return None;
         }
-        let nr = t.thread_pid.as_ref()?.nr_in(&ns)?;
+        let nr = t.thread_pid()?.nr_in(&ns)?;
         Some((nr, crate::task::percpu::task_ref(t.task)))
     });
     pids.sort_unstable_by_key(|&(nr, _)| nr);
@@ -2277,11 +2277,11 @@ pub fn proc_flush_pid(t: &crate::task::Task) {
             .inner()
             .access(&table)
             .as_ref()
-            .and_then(|i| i.thread_pid.clone());
+            .and_then(|i| i.thread_pid().cloned());
         let leader = if t.tid() == t.pid {
             None
         } else {
-            table.get(t.pid).and_then(|l| l.thread_pid.clone())
+            table.get(t.pid).and_then(|l| l.thread_pid().cloned())
         };
         (thread, leader)
     };

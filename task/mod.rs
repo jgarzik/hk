@@ -1113,12 +1113,12 @@ pub struct Task {
 pub struct TaskInner {
     /// Its process identifier (Linux thread_pid; None for the idle
     /// tasks, tid 0)
-    pub thread_pid: Option<Arc<pid::Pid>>,
+    thread_pid: Option<Arc<pid::Pid>>,
     /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
     /// PIDTYPE_SID]): the same in every thread of the group, numbered
     /// by the `pgid`/`sid` atomics; None for kernel threads
-    pub pgrp: Option<Arc<pid::Pid>>,
-    pub session: Option<Arc<pid::Pid>>,
+    pgrp: Option<Arc<pid::Pid>>,
+    session: Option<Arc<pid::Pid>>,
     /// A group leader on its `pgrp`'s and `session`'s lists
     pub pids_linked: bool,
     // =========================================================================
@@ -1209,7 +1209,7 @@ pub struct TaskInner {
     /// CLONE_THREAD, or the thread whose exec ended the others
     /// (de_thread). Only leaders are waited for; a leader keeps its
     /// SignalStruct as a zombie, for the group's exit status.
-    pub leader: bool,
+    leader: bool,
 
     // =========================================================================
     // Ptrace state (like Linux task_struct ptrace fields)
@@ -1225,7 +1225,7 @@ pub struct TaskInner {
     /// The real parent (Linux real_parent): the task whose `children`
     /// list holds this one; None for init and kernel threads. Weak:
     /// exit reparents children first (under TASKLIST)
-    pub real_parent: Option<alloc::sync::Weak<Task>>,
+    real_parent: Option<alloc::sync::Weak<Task>>,
 
     /// Its children (Linux children; their `sibling` links): the thread
     /// group leaders it created, one strong reference each, until reaped
@@ -1330,6 +1330,31 @@ impl TaskInner {
     /// Detach its thread group's signal state
     pub fn take_signal(&mut self) -> Option<Arc<SignalStruct>> {
         self.signal.take()
+    }
+
+    /// Its process identifier (None for the idle tasks)
+    pub fn thread_pid(&self) -> Option<&Arc<pid::Pid>> {
+        self.thread_pid.as_ref()
+    }
+
+    /// Its process group (None for kernel threads)
+    pub fn pgrp(&self) -> Option<&Arc<pid::Pid>> {
+        self.pgrp.as_ref()
+    }
+
+    /// Its session (None for kernel threads)
+    pub fn session(&self) -> Option<&Arc<pid::Pid>> {
+        self.session.as_ref()
+    }
+
+    /// It is its thread group's leader
+    pub fn leader(&self) -> bool {
+        self.leader
+    }
+
+    /// Its real parent, if it has one that lives
+    pub fn real_parent(&self) -> Option<percpu::TaskRef> {
+        self.real_parent.as_ref().and_then(|w| w.upgrade())
     }
 }
 

@@ -903,7 +903,7 @@ pub fn exit_task_signal(t: &Task) {
             task.task.set_sigpending(false);
             // A zombie leader keeps the group's SignalStruct (its exit
             // status; Linux frees signal_struct with the reaped leader)
-            let signal = if task.leader {
+            let signal = if task.leader() {
                 None
             } else {
                 // Its CPU time stays the group's (Linux __exit_signal)

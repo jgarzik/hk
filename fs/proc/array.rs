@@ -93,19 +93,17 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     // A listed task's process (by its root number) in `ns`
     let task_nr = |root: Tid| {
         u64::from(nr(
-            table.get(root).and_then(|x| x.fields().thread_pid.as_ref()),
+            table.get(root).and_then(|x| x.fields().thread_pid()),
             ns,
         ))
     };
-    let me = t.thread_pid.as_ref();
+    let me = t.thread_pid();
     // A task the namespace cannot see is not shown there (Linux reaches
     // it only through a lookup in that namespace); then its levels from
     // `ns` down are the namespaces of its own chain
     me?.nr_in(ns)?;
-    let leader = table
-        .get(t.task.pid)
-        .and_then(|l| l.fields().thread_pid.as_ref());
-    let (pg, se) = (t.pgrp.as_ref(), t.session.as_ref());
+    let leader = table.get(t.task.pid).and_then(|l| l.fields().thread_pid());
+    let (pg, se) = (t.pgrp(), t.session());
     let tracer = t.tracer().map_or(0, |x| task_nr(x.tid()));
     let mut ns_ids = [[0u32; 4]; LEVELS];
     let mut levels = 0;

@@ -32,7 +32,7 @@ static CTTY_LOCK: Mutex<()> = Mutex::new(());
 fn pids(table: &GlobalTaskTable) -> Option<(Arc<Pid>, Arc<Pid>)> {
     let me = crate::task::percpu::current();
     let t = table.view(&me)?;
-    Some((t.pgrp.clone()?, t.session.clone()?))
+    Some((t.pgrp().cloned()?, t.session().cloned()?))
 }
 
 /// The caller's session
@@ -235,7 +235,7 @@ pub fn tiocspgrp(tty: &Tty, pgrp: i32) -> Result<(), KernelError> {
     let in_session = table
         .pgrp(&pg)
         .next()
-        .and_then(|m| m.session.clone())
+        .and_then(|m| m.session().cloned())
         .is_some_and(|ms| Arc::ptr_eq(&ms, &s));
     if !in_session {
         return Err(KernelError::NotPermitted);
