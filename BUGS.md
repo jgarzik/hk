@@ -18,13 +18,6 @@ infallible, so each one is investigated, not written off.
 
 ## Seen on hk only
 
-- **A process's wait status is its last thread's**: when every thread
-  ends with exit(2) (no exit_group), the thread taking the live count
-  to zero starts a group exit with its own code
-  (`SignalStruct::thread_exiting`), so wait4 reports that thread's
-  status. Linux sets no group exit there and reports the leader's
-  exit_code (wait_task_zombie).
-
 - **MM_FAULT_STORM once under LOCKDEP**: one x86 `make check LOCKDEP=1`
   run reported `MM_FAULT_STORM:FAIL got 0` (no wrong value: a thread did
   not finish within the 60 s join); three later LOCKDEP runs (x86 twice,
