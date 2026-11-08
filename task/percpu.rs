@@ -57,7 +57,7 @@ fn do_clear_child_tid(tid: Tid) {
         // Write 0 to the address
         if put_user::<Uaccess, i32>(addr, 0).is_ok() {
             // Wake one waiter, shared (Linux mm_release)
-            crate::task::futex::futex_wake(
+            let _ = crate::task::futex::futex_wake(
                 addr,
                 1,
                 crate::task::futex::futex_op::FUTEX_BITSET_MATCH_ANY,

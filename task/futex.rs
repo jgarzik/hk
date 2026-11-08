@@ -44,8 +44,9 @@ use crate::sync::spin::Mutex as SpinMutex;
 use crate::task::Task;
 use crate::task::Tid;
 use crate::task::percpu::WakeQ;
-use crate::uaccess::{get_user, put_user};
-use crate::util::error::KernelError;
+use crate::time::time_syscall::LinuxTimespec;
+use crate::uaccess::{UserPtr, get_user};
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::list::{Link, List};
 
 // Architecture-specific uaccess implementation
@@ -429,8 +430,8 @@ impl RobustListHead {
 /// Uses proper uaccess infrastructure which:
 /// - Validates address is in user space range
 /// - Handles SMAP protection on x86_64
-fn read_user_u32(addr: u64) -> Result<u32, i32> {
-    get_user::<Uaccess, u32>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
+fn read_user_u32(addr: u64) -> KernelResult<u32> {
+    Ok(get_user::<Uaccess, u32>(addr)?)
 }
 
 /// Read a futex word under a bucket lock (Linux
@@ -440,11 +441,11 @@ fn read_user_u32(addr: u64) -> Result<u32, i32> {
 /// it is read under the lock they report EAGAIN (userspace re-checks
 /// and retries, as after a value change) instead of retrying in the
 /// kernel like Linux.
-fn get_value_locked(addr: u64) -> Result<u32, i32> {
+fn get_value_locked(addr: u64) -> KernelResult<u32> {
     crate::uaccess::pagefault_disable();
     let r = get_user::<Uaccess, u32>(addr);
     crate::uaccess::pagefault_enable();
-    r.map_err(|_| KernelError::WouldBlock.to_errno_neg())
+    r.map_err(|_| KernelError::WouldBlock)
 }
 
 /// Read a u64 from user memory
@@ -452,24 +453,24 @@ fn get_value_locked(addr: u64) -> Result<u32, i32> {
 /// Uses proper uaccess infrastructure which:
 /// - Validates address is in user space range
 /// - Handles SMAP protection on x86_64
-fn read_user_u64(addr: u64) -> Result<u64, i32> {
-    get_user::<Uaccess, u64>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
+fn read_user_u64(addr: u64) -> KernelResult<u64> {
+    Ok(get_user::<Uaccess, u64>(addr)?)
 }
 
 /// Read a timespec from user memory and convert to nanoseconds
-fn read_user_timeout(timeout_ptr: u64) -> Result<Option<u64>, i32> {
-    if timeout_ptr == 0 {
+fn read_user_timeout(timeout_ptr: UserPtr<LinuxTimespec>) -> KernelResult<Option<u64>> {
+    if timeout_ptr.is_null() {
         return Ok(None);
     }
 
     // struct timespec read whole: no field address is computed from
     // the user pointer
-    let [tv_sec, tv_nsec] = crate::uaccess::copy_val_from_user::<Uaccess, [u64; 2]>(timeout_ptr)
-        .map_err(|_| KernelError::BadAddress.to_errno_neg())?;
+    let ts = timeout_ptr.read()?;
+    let (tv_sec, tv_nsec) = (ts.tv_sec as u64, ts.tv_nsec as u64);
 
     // Validate
     if tv_nsec >= 1_000_000_000 {
-        return Err(KernelError::InvalidArgument.to_errno_neg());
+        return Err(KernelError::InvalidArgument);
     }
 
     let ns = tv_sec.saturating_mul(1_000_000_000).saturating_add(tv_nsec);
@@ -486,11 +487,11 @@ fn read_user_timeout(timeout_ptr: u64) -> Result<Option<u64>, i32> {
 /// address) apart from private keys. EINVAL unless 4-byte aligned
 /// (checked first, as Linux), EFAULT without a mapping. Takes the
 /// mmap_lock (read) for a shared key, before any bucket lock.
-fn make_key(uaddr: u64, private: bool) -> Result<FutexKey, i32> {
+fn make_key(uaddr: u64, private: bool) -> KernelResult<FutexKey> {
     if !uaddr.is_multiple_of(4) {
-        return Err(KernelError::InvalidArgument.to_errno_neg());
+        return Err(KernelError::InvalidArgument);
     }
-    let efault = KernelError::BadAddress.to_errno_neg();
+    let efault = KernelError::BadAddress;
     let mm = crate::task::percpu::current().mm().ok_or(efault)?;
     let id = alloc::sync::Arc::as_ptr(&mm) as u64;
     let mm_key = |kind| FutexKey {
@@ -539,7 +540,7 @@ fn object_key(vma: &crate::mm::vma::Vma, uaddr: u64) -> Option<FutexKey> {
 /// # Returns
 /// * 0 on successful wake
 /// * -EAGAIN if value at uaddr != expected
-/// * KernelError::TimedOut.to_errno_neg() if timeout expired
+/// * ETIMEDOUT if timeout expired
 /// * -EINVAL if bitset is 0 or address is invalid
 pub fn futex_wait(
     uaddr: u64,
@@ -548,42 +549,35 @@ pub fn futex_wait(
     realtime: bool,
     bitset: u32,
     is_private: bool,
-) -> i32 {
+) -> KernelResult<()> {
     // Validate bitset (0 is invalid per Linux ABI)
     if bitset == 0 {
-        return KernelError::InvalidArgument.to_errno_neg();
+        return Err(KernelError::InvalidArgument);
     }
 
-    let key = match make_key(uaddr, is_private) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = make_key(uaddr, is_private)?;
     let bucket = futex_bucket(&key);
 
     // Fault the word in (a real EFAULT is reported here); it is read
     // again under the bucket lock with faults disabled
-    if let Err(e) = read_user_u32(uaddr) {
-        return e;
-    }
+    read_user_u32(uaddr)?;
 
     let q = core::pin::pin!(FutexQ::new(key, bitset));
-    if let Err(e) = queue_if(bucket, q.as_ref(), uaddr, expected) {
-        return e;
-    }
+    queue_if(bucket, q.as_ref(), uaddr, expected)?;
 
     let why = futex_sleep(|| q.queued(), deadline_ns, realtime);
 
     // Dequeue ourselves unless a waker already did
     if !q.unqueue() {
-        return 0; // woken by futex_wake (possibly racing a signal/timeout)
+        return Ok(()); // woken by futex_wake (possibly racing a signal/timeout)
     }
     match why {
-        FutexSleep::Woken => 0,
-        FutexSleep::Timeout => KernelError::TimedOut.to_errno_neg(),
+        FutexSleep::Woken => Ok(()),
+        FutexSleep::Timeout => Err(KernelError::TimedOut),
         // Linux: -ERESTARTSYS without timeout; with one it restarts via
         // restart_block, approximated here by -EINTR (callers retry)
-        FutexSleep::Signal if deadline_ns.is_none() => KernelError::RestartSys.to_errno_neg(),
-        FutexSleep::Signal => KernelError::Interrupted.to_errno_neg(),
+        FutexSleep::Signal if deadline_ns.is_none() => Err(KernelError::RestartSys),
+        FutexSleep::Signal => Err(KernelError::Interrupted),
     }
 }
 
@@ -595,13 +589,13 @@ fn queue_if(
     q: Pin<&FutexQ>,
     uaddr: u64,
     expected: u32,
-) -> Result<(), i32> {
+) -> KernelResult<()> {
     bucket.inc_waiters();
     core::sync::atomic::fence(Ordering::SeqCst);
     let mut list = bucket.waiters.lock();
     let r = match get_value_locked(uaddr) {
         Ok(v) if v == expected => Ok(()),
-        Ok(_) => Err(KernelError::WouldBlock.to_errno_neg()),
+        Ok(_) => Err(KernelError::WouldBlock),
         Err(e) => Err(e),
     };
     match r {
@@ -623,19 +617,16 @@ fn queue_if(
 ///
 /// # Returns
 /// Number of waiters woken (non-negative), or -EINVAL if bitset is 0
-pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i32 {
+pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> KernelResult<i32> {
     if num_wake <= 0 {
-        return 0;
+        return Ok(0);
     }
 
     if bitset == 0 {
-        return KernelError::InvalidArgument.to_errno_neg();
+        return Err(KernelError::InvalidArgument);
     }
 
-    let key = match make_key(uaddr, is_private) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = make_key(uaddr, is_private)?;
     let bucket = futex_bucket(&key);
 
     // Memory barrier paired with futex_wait's barrier
@@ -643,7 +634,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
 
     // Fast path: no waiters
     if !bucket.has_waiters() {
-        return 0;
+        return Ok(0);
     }
 
     let mut woken = 0i32;
@@ -669,7 +660,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
     // Wake tasks outside the bucket lock
     to_wake.wake_up();
 
-    woken
+    Ok(woken)
 }
 
 /// Requeue waiters from one futex to another
@@ -694,23 +685,19 @@ pub fn futex_requeue(
     nr_requeue: i32,
     cmpval: Option<u32>,
     is_private: bool,
-) -> i32 {
+) -> KernelResult<i32> {
     if nr_wake < 0 || nr_requeue < 0 {
-        return KernelError::InvalidArgument.to_errno_neg();
+        return Err(KernelError::InvalidArgument);
     }
 
-    let (key1, key2) = match (make_key(uaddr, is_private), make_key(uaddr2, is_private)) {
-        (Ok(k1), Ok(k2)) => (k1, k2),
-        (Err(e), _) | (_, Err(e)) => return e,
-    };
+    let key1 = make_key(uaddr, is_private)?;
+    let key2 = make_key(uaddr2, is_private)?;
     let b1 = futex_bucket(&key1);
     let b2 = futex_bucket(&key2);
 
     // CMP_REQUEUE: fault the word in before locking
-    if cmpval.is_some()
-        && let Err(e) = read_user_u32(uaddr)
-    {
-        return e;
+    if cmpval.is_some() {
+        read_user_u32(uaddr)?;
     }
 
     // Both buckets locked, in address order (Linux double_lock_hb), so a
@@ -774,13 +761,11 @@ impl Requeue {
         b2: &FutexHashBucket,
         mut l2: Option<&mut List<QAdapter>>,
         wq: &mut WakeQ,
-    ) -> i32 {
-        if let Some((uaddr, expected)) = self.cmp {
-            match get_value_locked(uaddr) {
-                Ok(v) if v == expected => {}
-                Ok(_) => return KernelError::WouldBlock.to_errno_neg(),
-                Err(e) => return e,
-            }
+    ) -> KernelResult<i32> {
+        if let Some((uaddr, expected)) = self.cmp
+            && get_value_locked(uaddr)? != expected
+        {
+            return Err(KernelError::WouldBlock);
         }
         let (mut woken, mut requeued) = (0i32, 0i32);
         let mut cur = l1.front();
@@ -817,7 +802,7 @@ impl Requeue {
                 break;
             }
         }
-        woken + requeued
+        Ok(woken + requeued)
     }
 }
 
@@ -833,19 +818,18 @@ impl Requeue {
 ///
 /// # Returns
 /// 0 on success, -EINVAL if len doesn't match
-pub fn sys_set_robust_list(head: u64, len: u64) -> i32 {
+pub fn sys_set_robust_list(head: UserPtr<RobustListHead>, len: u64) -> KernelResult<()> {
     if len as usize != RobustListHead::SIZE {
-        return KernelError::InvalidArgument.to_errno_neg();
+        return Err(KernelError::InvalidArgument);
     }
 
     let tid = crate::task::percpu::current_tid();
 
     let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
-        task.robust_list = head;
+        task.robust_list = head.addr();
     }
-
-    0
+    Ok(())
 }
 
 /// Get the robust list head for a task
@@ -857,7 +841,11 @@ pub fn sys_set_robust_list(head: u64, len: u64) -> i32 {
 ///
 /// # Returns
 /// 0 on success, -ESRCH if task not found, -EFAULT on bad address
-pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
+pub fn sys_get_robust_list(
+    pid: i32,
+    head_ptr: UserPtr<u64>,
+    len_ptr: UserPtr<u64>,
+) -> KernelResult<()> {
     let current_tid = crate::task::percpu::current_tid();
 
     // Determine target TID
@@ -867,7 +855,7 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
         // For non-zero pid, we'd need to look up the task
         // For now, only support current task
         if pid as Tid != u64::from(crate::task::pid::vnr(current_tid)) {
-            return KernelError::NoProcess.to_errno_neg();
+            return Err(KernelError::NoProcess);
         }
         current_tid
     };
@@ -878,17 +866,14 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
         .map(|t| t.robust_list)
         .unwrap_or(0);
 
-    // Write head pointer to user memory
-    if head_ptr != 0 && put_user::<Uaccess, u64>(head_ptr, head).is_err() {
-        return KernelError::BadAddress.to_errno_neg();
+    // Write head pointer and length to user memory
+    if !head_ptr.is_null() {
+        head_ptr.write(&head)?;
     }
-
-    // Write length to user memory
-    if len_ptr != 0 && put_user::<Uaccess, u64>(len_ptr, RobustListHead::SIZE as u64).is_err() {
-        return KernelError::BadAddress.to_errno_neg();
+    if !len_ptr.is_null() {
+        len_ptr.write(&(RobustListHead::SIZE as u64))?;
     }
-
-    0
+    Ok(())
 }
 
 /// Walk and cleanup robust futex list on task exit
@@ -979,7 +964,7 @@ fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid, pi: bool, pending
         if owner != crate::task::pid::vnr(tid) {
             let waiters = uval & futex_op::FUTEX_WAITERS != 0;
             if pending_op && !pi && (owner == 0 || !waiters) {
-                futex_wake(futex_addr, 1, any, false);
+                let _ = futex_wake(futex_addr, 1, any, false);
             }
             return;
         }
@@ -992,7 +977,7 @@ fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid, pi: bool, pending
         }
     };
     if !pi && uval & futex_op::FUTEX_WAITERS != 0 {
-        futex_wake(futex_addr, 1, any, false);
+        let _ = futex_wake(futex_addr, 1, any, false);
     }
 }
 
@@ -1016,26 +1001,26 @@ fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid, pi: bool, pending
 /// - FUTEX_WAKE: number of waiters woken
 /// - FUTEX_REQUEUE: number of waiters woken + requeued
 pub fn sys_futex(
-    uaddr: u64,
+    uaddr: UserPtr<u32>,
     futex_op: u32,
     val: u32,
     timeout_or_val2: u64,
-    uaddr2: u64,
+    uaddr2: UserPtr<u32>,
     val3: u32,
-) -> i32 {
+) -> KernelResult<i32> {
     use futex_op::*;
 
     let op = futex_op & FUTEX_CMD_MASK;
     let is_private = (futex_op & FUTEX_PRIVATE_FLAG) != 0;
     let use_realtime = (futex_op & FUTEX_CLOCK_REALTIME) != 0;
+    let (uaddr, uaddr2) = (uaddr.addr(), uaddr2.addr());
+    // A timeout pointer for the waits, a count for the requeues
+    let timeout = UserPtr::<LinuxTimespec>::new(timeout_or_val2);
 
     match op {
         FUTEX_WAIT => {
             // Relative timeout, always on CLOCK_MONOTONIC
-            let timeout = match read_user_timeout(timeout_or_val2) {
-                Ok(t) => t,
-                Err(e) => return e,
-            };
+            let timeout = read_user_timeout(timeout)?;
             let deadline = timeout.map(|ns| futex_clock_ns(false).saturating_add(ns));
             futex_wait(
                 uaddr,
@@ -1044,26 +1029,25 @@ pub fn sys_futex(
                 false,
                 FUTEX_BITSET_MATCH_ANY,
                 is_private,
-            )
+            )?;
+            Ok(0)
         }
 
         FUTEX_WAKE => futex_wake(uaddr, val as i32, FUTEX_BITSET_MATCH_ANY, is_private),
 
         FUTEX_WAIT_BITSET => {
             if val3 == 0 {
-                return KernelError::InvalidArgument.to_errno_neg();
+                return Err(KernelError::InvalidArgument);
             }
             // Absolute timeout on CLOCK_MONOTONIC (or REALTIME if flagged)
-            let deadline = match read_user_timeout(timeout_or_val2) {
-                Ok(t) => t,
-                Err(e) => return e,
-            };
-            futex_wait(uaddr, val, deadline, use_realtime, val3, is_private)
+            let deadline = read_user_timeout(timeout)?;
+            futex_wait(uaddr, val, deadline, use_realtime, val3, is_private)?;
+            Ok(0)
         }
 
         FUTEX_WAKE_BITSET => {
             if val3 == 0 {
-                return KernelError::InvalidArgument.to_errno_neg();
+                return Err(KernelError::InvalidArgument);
             }
             futex_wake(uaddr, val as i32, val3, is_private)
         }
@@ -1085,7 +1069,7 @@ pub fn sys_futex(
             )
         }
 
-        _ => KernelError::NotImplemented.to_errno_neg(),
+        _ => Err(KernelError::NotImplemented),
     }
 }
 
@@ -1108,7 +1092,7 @@ mod futex2 {
 /// struct futex_waitv from userspace
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct UserFutexWaitv {
+pub struct UserFutexWaitv {
     val: u64,
     uaddr: u64,
     flags: u32,
@@ -1147,80 +1131,71 @@ struct FutexWaitvEntry {
 /// * >= 0: Index of woken futex (hint - others may also be woken)
 /// * -EINVAL: Invalid arguments
 /// * -EFAULT: Bad memory access
-/// * KernelError::TimedOut.to_errno_neg(): Timeout expired
+/// * ETIMEDOUT: Timeout expired
 /// * -EAGAIN/-EWOULDBLOCK: Value mismatch at setup
 pub fn sys_futex_waitv(
-    waiters_ptr: u64,
+    waiters: UserPtr<UserFutexWaitv>,
     nr_futexes: u32,
     flags: u32,
-    timeout_ptr: u64,
+    timeout_ptr: UserPtr<LinuxTimespec>,
     clockid: i32,
-) -> i32 {
+) -> KernelResult<i32> {
     // Syscall flags must be 0
     if flags != 0 {
-        return KernelError::InvalidArgument.to_errno_neg();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate nr_futexes is in range [1, 128]
     if nr_futexes == 0 || nr_futexes as usize > FUTEX_WAITV_MAX {
-        return KernelError::InvalidArgument.to_errno_neg();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate waiters pointer
-    if waiters_ptr == 0 {
-        return KernelError::InvalidArgument.to_errno_neg();
+    if waiters.is_null() {
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate clockid
     const CLOCK_REALTIME: i32 = 0;
     const CLOCK_MONOTONIC: i32 = 1;
     if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-        return KernelError::InvalidArgument.to_errno_neg();
+        return Err(KernelError::InvalidArgument);
     }
     let use_realtime = clockid == CLOCK_REALTIME;
 
     // Parse timeout (absolute time)
-    let timeout_ns = if timeout_ptr != 0 {
-        match read_user_timeout(timeout_ptr) {
-            Ok(Some(ns)) => Some(ns),
-            Ok(None) => None,
-            Err(e) => return e,
-        }
-    } else {
-        None
-    };
+    let timeout_ns = read_user_timeout(timeout_ptr)?;
 
     // Copy and validate waiters from userspace
     let mut entries: Vec<FutexWaitvEntry> = Vec::with_capacity(nr_futexes as usize);
-    let waiters = crate::uaccess::UserPtr::<UserFutexWaitv>::new(waiters_ptr);
 
     for i in 0..nr_futexes {
         // Each struct futex_waitv read whole; an array running past the
         // top of the address space is EFAULT
         let Some(w) = waiters.offset(i as usize).and_then(|p| p.read().ok()) else {
-            return KernelError::BadAddress.to_errno_neg();
+            return Err(KernelError::BadAddress);
         };
         let (val, uaddr, flags_field, reserved) = (w.val, w.uaddr, w.flags, w.__reserved);
 
         // Reserved field must be 0
         if reserved != 0 {
-            return KernelError::InvalidArgument.to_errno_neg();
+            return Err(KernelError::InvalidArgument);
         }
 
         // Validate flags - only support SIZE_U32 and PRIVATE for now
         if (flags_field & !futex2::VALID_MASK) != 0 {
-            return KernelError::InvalidArgument.to_errno_neg();
+            return Err(KernelError::InvalidArgument);
         }
 
         // Check size - only support 32-bit futexes
         let size = flags_field & futex2::SIZE_MASK;
         if size != futex2::SIZE_U32 {
-            return KernelError::InvalidArgument.to_errno_neg();
+            return Err(KernelError::InvalidArgument);
         }
 
         // Check alignment (must be 4-byte aligned for u32)
         if uaddr % 4 != 0 {
-            return KernelError::InvalidArgument.to_errno_neg();
+            return Err(KernelError::InvalidArgument);
         }
 
         let is_private = (flags_field & futex2::PRIVATE) != 0;
@@ -1246,22 +1221,17 @@ fn futex_wait_multiple(
     entries: &[FutexWaitvEntry],
     timeout_ns: Option<u64>,
     use_realtime: bool,
-) -> i32 {
+) -> KernelResult<i32> {
     // Fault every word in (a real EFAULT is reported here); they are
     // read again under the bucket locks with faults disabled
     for entry in entries {
-        if let Err(e) = read_user_u32(entry.uaddr) {
-            return e;
-        }
+        read_user_u32(entry.uaddr)?;
     }
-    let keys: Result<Vec<FutexKey>, i32> = entries
+    let keys: KernelResult<Vec<FutexKey>> = entries
         .iter()
         .map(|e| make_key(e.uaddr, e.is_private))
         .collect();
-    let keys = match keys {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let keys = keys?;
 
     loop {
         let qs: alloc::boxed::Box<[FutexQ]> = keys
@@ -1275,9 +1245,7 @@ fn futex_wait_multiple(
         // `qs`, dequeuing those already queued
         for (i, e) in entries.iter().enumerate() {
             let bucket = futex_bucket(&qs[i].key());
-            if let Err(err) = queue_if(bucket, pinned(i), e.uaddr, e.val) {
-                return err;
-            }
+            queue_if(bucket, pinned(i), e.uaddr, e.val)?;
         }
 
         let why = futex_sleep(|| qs.iter().all(|q| q.queued()), timeout_ns, use_realtime);
@@ -1292,11 +1260,11 @@ fn futex_wait_multiple(
         }
 
         if woken_index >= 0 {
-            return woken_index;
+            return Ok(woken_index);
         }
         match why {
-            FutexSleep::Timeout => return KernelError::TimedOut.to_errno_neg(),
-            FutexSleep::Signal => return KernelError::RestartSys.to_errno_neg(),
+            FutexSleep::Timeout => return Err(KernelError::TimedOut),
+            FutexSleep::Signal => return Err(KernelError::RestartSys),
             FutexSleep::Woken => {}
         }
     }

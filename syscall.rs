@@ -288,7 +288,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[3] as i32,
         )
         .ret() as u64,
-        Sys::Acct => crate::task::acct::sys_acct(a[0]).ret() as u64,
+        Sys::Acct => crate::task::acct::sys_acct(UserPtr::new(a[0])).ret() as u64,
         Sys::AddKey => crate::keys::sys_add_key(
             UserPtr::new(a[0]),
             UserPtr::new(a[1]),
@@ -494,14 +494,23 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         }
         Sys::Fsync => crate::fs::syscall::sys_fsync(a[0] as i32).ret() as u64,
         Sys::Ftruncate => crate::fs::syscall::sys_ftruncate(a[0] as i32, a[1] as i64).ret() as u64,
-        Sys::Futex => {
-            crate::task::futex::sys_futex(a[0], a[1] as u32, a[2] as u32, a[3], a[4], a[5] as u32)
-                as u64
-        }
-        Sys::FutexWaitv => {
-            crate::task::futex::sys_futex_waitv(a[0], a[1] as u32, a[2] as u32, a[3], a[4] as i32)
-                as u64
-        }
+        Sys::Futex => crate::task::futex::sys_futex(
+            UserPtr::new(a[0]),
+            a[1] as u32,
+            a[2] as u32,
+            a[3],
+            UserPtr::new(a[4]),
+            a[5] as u32,
+        )
+        .ret() as u64,
+        Sys::FutexWaitv => crate::task::futex::sys_futex_waitv(
+            UserPtr::new(a[0]),
+            a[1] as u32,
+            a[2] as u32,
+            UserPtr::new(a[3]),
+            a[4] as i32,
+        )
+        .ret() as u64,
         Sys::Getcpu => crate::task::syscall::sys_getcpu::<Uaccess>(
             crate::cpu::this_id(),
             UserPtr::new(a[0]),
@@ -615,9 +624,12 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[4],
         )
         .ret() as u64,
-        Sys::GetRobustList => {
-            crate::task::futex::sys_get_robust_list(a[0] as i32, a[1], a[2]).ret() as u64
-        }
+        Sys::GetRobustList => crate::task::futex::sys_get_robust_list(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+        )
+        .ret() as u64,
         Sys::InotifyAddWatch => {
             crate::io::inotify::sys_inotify_add_watch(a[0] as i32, UserPtr::new(a[1]), a[2] as u32)
                 .ret() as u64
@@ -877,15 +889,20 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             UserPtr::new(a[3]),
         )
         .ret() as u64,
-        Sys::ProcessVmReadv => {
-            crate::task::process_vm::sys_process_vm_readv(a[0] as i32, a[1], a[2], a[3], a[4], a[5])
-                as u64
-        }
+        Sys::ProcessVmReadv => crate::task::process_vm::sys_process_vm_readv(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2],
+            UserPtr::new(a[3]),
+            a[4],
+            a[5],
+        )
+        .ret() as u64,
         Sys::ProcessVmWritev => crate::task::process_vm::sys_process_vm_writev(
             a[0] as i32,
-            a[1],
+            UserPtr::new(a[1]),
             a[2],
-            a[3],
+            UserPtr::new(a[3]),
             a[4],
             a[5],
         )
@@ -1209,7 +1226,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::mm::mempolicy::sys_set_mempolicy(a[0] as i32, UserPtr::new(a[1]), a[2]).ret()
                 as u64
         }
-        Sys::SetRobustList => crate::task::futex::sys_set_robust_list(a[0], a[1]).ret() as u64,
+        Sys::SetRobustList => {
+            crate::task::futex::sys_set_robust_list(UserPtr::new(a[0]), a[1]).ret() as u64
+        }
         Sys::SetTidAddress => {
             crate::task::syscall::sys_set_tid_address(UserPtr::new(a[0])).ret() as u64
         }

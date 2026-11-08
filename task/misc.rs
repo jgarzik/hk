@@ -635,69 +635,64 @@ use crate::arch::x86_64::percpu::{
 ///
 /// Returns 0 on success, negative errno on error.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
-    use crate::arch::Uaccess;
-    use crate::uaccess::put_user;
+pub fn sys_arch_prctl(code: i32, addr: u64) -> KernelResult<i64> {
+    // addr is a value for the SET codes, a u64 * for the GET ones
+    let out = UserPtr::<u64>::new(addr);
 
     match code {
         ARCH_SET_FS => {
             // Set FS base - user TLS pointer
             if !crate::arch::user_tls_ok(addr) {
-                return KernelError::NotPermitted.sysret();
+                return Err(KernelError::NotPermitted);
             }
             super::percpu::current()
                 .tls
                 .store(addr, core::sync::atomic::Ordering::Relaxed);
             write_fs_base(addr);
-            0
+            Ok(0)
         }
         ARCH_GET_FS => {
             // Get FS base - return via user pointer
             // The live register (user code may have changed it)
             let tls = read_fs_base();
 
-            // Write to user address
-            if put_user::<Uaccess, u64>(addr, tls).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
+            out.write(&tls)?;
+            Ok(0)
         }
         // CPUID faulting is not supported, so CPUID is always enabled.
         // Matches Linux on CPUs without X86_FEATURE_CPUID_FAULT
         // (arch/x86/kernel/process.c get_cpuid_mode/set_cpuid_mode).
-        ARCH_GET_CPUID => 1,
-        ARCH_SET_CPUID => KernelError::NoDevice.sysret(),
+        ARCH_GET_CPUID => Ok(1),
+        ARCH_SET_CPUID => Err(KernelError::NoDevice),
         ARCH_SET_GS => {
             // The user GS base (the kernel's per-CPU base is swapped in
             // on entry): null selector, then the base, like Linux
             // do_arch_prctl_64
             if !crate::arch::user_tls_ok(addr) {
-                return KernelError::NotPermitted.sysret();
+                return Err(KernelError::NotPermitted);
             }
             crate::arch::x86_64::percpu::load_user_gs_null();
             crate::arch::write_user_gsbase(addr);
             super::percpu::current()
                 .gsbase
                 .store(addr, core::sync::atomic::Ordering::Relaxed);
-            0
+            Ok(0)
         }
         ARCH_GET_GS => {
             // The live user base (`mov gs` may have changed it)
             let gs = crate::arch::read_user_gsbase();
-            if put_user::<Uaccess, u64>(addr, gs).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
+            out.write(&gs)?;
+            Ok(0)
         }
-        _ => KernelError::InvalidArgument.sysret(),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
 
 /// sys_arch_prctl stub for non-x86_64 architectures
 #[cfg(not(target_arch = "x86_64"))]
-pub fn sys_arch_prctl(_code: i32, _addr: u64) -> i64 {
+pub fn sys_arch_prctl(_code: i32, _addr: u64) -> KernelResult<i64> {
     // arch_prctl is x86_64-specific
-    KernelError::NotImplemented.sysret()
+    Err(KernelError::NotImplemented)
 }
 
 // =============================================================================
@@ -1040,38 +1035,13 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(
 /// * -ESRCH: No such process
 /// * -ENOENT: `pid` is a thread that does not lead its process, and no
 ///   PIDFD_THREAD
-pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
+pub fn sys_pidfd_open(pid: i64, flags: u32) -> KernelResult<i32> {
     use crate::task::pidfd::pidfd_flags::{PIDFD_NONBLOCK, PIDFD_THREAD};
     if flags & !(PIDFD_NONBLOCK | PIDFD_THREAD) != 0 || pid <= 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    let pidfd_file = match crate::task::pidfd::open_pidfd(pid as Pid, flags) {
-        Ok(file) => file,
-        Err(e) => return e.sysret(),
-    };
-
-    // Allocate FD in current task's FD table
-    let current_tid = super::percpu::current_tid();
-    let Some(fd_table) = super::fdtable::get_task_fd(current_tid) else {
-        return KernelError::NoProcess.sysret();
-    };
-
-    let mut table = fd_table.lock();
-
-    // Get NOFILE limit
-    let nofile = {
-        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-        if limit == crate::task::rlimit::RLIM_INFINITY {
-            u64::MAX
-        } else {
-            limit
-        }
-    };
-
-    match table.alloc_with_flags(pidfd_file, super::FD_CLOEXEC, nofile) {
-        Ok(fd) => i64::from(fd),
-        Err(e) => e.sysret(),
-    }
+    let pidfd_file = crate::task::pidfd::open_pidfd(pid as Pid, flags)?;
+    crate::fs::io::fd_install(pidfd_file, super::FD_CLOEXEC)
 }
 
 /// sys_pidfd_send_signal - send a signal to a process via a pidfd
@@ -1219,71 +1189,38 @@ fn pidfd_info(
 ///
 /// # Permission Model
 /// Simplified PTRACE_MODE_ATTACH: allow if caller has CAP_SYS_PTRACE or same euid.
-pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
+pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> KernelResult<i32> {
     // Validate flags (must be 0)
     if flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Get caller's fd table and the pidfd file
-    let caller_tid = super::percpu::current_tid();
-    let Some(caller_fd_table) = super::fdtable::get_task_fd(caller_tid) else {
-        return KernelError::NoProcess.sysret();
-    };
-
-    let pidfd_file = {
-        let table = caller_fd_table.lock();
-        match table.get(pidfd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
-        }
-    };
+    let pidfd_file = crate::fs::io::fget(pidfd)?;
 
     // The pidfd's process itself, while it is still there
-    let target_tid = match crate::task::pidfd::pidfd_tid(&pidfd_file) {
-        Ok(tid) => tid,
-        Err(e) => return e.sysret(),
-    };
+    let target_tid = crate::task::pidfd::pidfd_tid(&pidfd_file)?;
 
     // Linux __pidfd_fget: under the target's exec_update_lock,
     // ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS)
     let _exec = crate::signal::ExecUpdateRead::lock(target_tid);
     if !super::ptrace::may_access_tid(target_tid, false) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
-    // Get target's fd table
-    let Some(target_fd_table) = super::fdtable::get_task_fd(target_tid) else {
-        // Process exiting
-        return KernelError::NoProcess.sysret();
-    };
+    // Get target's fd table (none: process exiting)
+    let target_fd_table = super::fdtable::get_task_fd(target_tid).ok_or(KernelError::NoProcess)?;
     // Its process still being that task, every lookup by tid above
     // found it (the tid is not freed while it is listed); else its
     // files are gone (Linux fget_task: EBADF)
     if crate::task::pidfd::pidfd_tid(&pidfd_file) != Ok(target_tid) {
-        return KernelError::BadFd.sysret();
+        return Err(KernelError::BadFd);
     }
+    let target_file = target_fd_table
+        .lock()
+        .get(targetfd)
+        .ok_or(KernelError::BadFd)?;
 
-    // Get the file from target's fd table
-    let target_file = {
-        let table = target_fd_table.lock();
-        match table.get(targetfd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
-        }
-    };
-
-    // Allocate new fd in caller's fd table with FD_CLOEXEC
-    let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-    let new_fd = {
-        let mut table = caller_fd_table.lock();
-        match table.alloc_with_flags(target_file, super::FD_CLOEXEC, nofile) {
-            Ok(fd) => fd,
-            Err(e) => return e.sysret(),
-        }
-    };
-
-    i64::from(new_fd)
+    // A new fd in the caller's table with FD_CLOEXEC
+    crate::fs::io::fd_install(target_file, super::FD_CLOEXEC)
 }
 
 // =============================================================================
@@ -1311,12 +1248,12 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
 /// This is an emulated IOPL - it doesn't modify the CPU's actual IOPL register.
 /// The kernel stores the level per-task and uses it for permission checks.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_iopl(level: u32) -> i64 {
+pub fn sys_iopl(level: u32) -> KernelResult<()> {
     use crate::task::{CAP_SYS_RAWIO, capable};
 
     // Validate level (must be 0-3)
     if level > 3 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Get current IOPL level
@@ -1324,23 +1261,23 @@ pub fn sys_iopl(level: u32) -> i64 {
 
     // No change? Done.
     if level == u32::from(old) {
-        return 0;
+        return Ok(());
     }
 
     // Lowering privilege is always allowed
     if level < u32::from(old) {
         super::percpu::set_current_iopl_emul(level as u8);
-        return 0;
+        return Ok(());
     }
 
     // Raising privilege requires CAP_SYS_RAWIO
     if !capable(CAP_SYS_RAWIO) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Set new level
     super::percpu::set_current_iopl_emul(level as u8);
-    0
+    Ok(())
 }
 
 /// ioperm - Set port input/output permissions (x86-64 only, stub)
@@ -1359,6 +1296,6 @@ pub fn sys_iopl(level: u32) -> i64 {
 /// Full ioperm implementation requires per-task I/O permission bitmaps in the TSS.
 /// This is not yet implemented. Use iopl(3) for full I/O port access.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_ioperm(_from: u64, _num: u64, _turn_on: i32) -> i64 {
-    KernelError::NotImplemented.sysret()
+pub fn sys_ioperm(_from: u64, _num: u64, _turn_on: i32) -> KernelResult<()> {
+    Err(KernelError::NotImplemented)
 }

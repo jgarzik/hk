@@ -15,8 +15,8 @@ use crate::mm::MmRef;
 use crate::mm::remote::{access_remote_vm_read, access_remote_vm_write};
 use crate::task::percpu::current_tid;
 use crate::task::{Pid, Tid};
-use crate::uaccess::{UaccessArch, UserSliceReader, copy_from_user, copy_to_user};
-use crate::util::error::KernelError;
+use crate::uaccess::{UaccessArch, UserPtr, UserSlice, copy_from_user, copy_to_user};
+use crate::util::error::{KernelError, KernelResult};
 
 /// Bytes copied per step: the bounce buffer stays small whatever the
 /// iovec lengths (Linux copies page by page)
@@ -28,12 +28,12 @@ const PVM_CHUNK: usize = 64 * 1024;
 /// Returns the bytes copied, or a negative errno if none were
 pub fn sys_process_vm_readv(
     pid: i32,
-    local_iov: u64,
+    local_iov: UserPtr<IoVec>,
     liovcnt: u64,
-    remote_iov: u64,
+    remote_iov: UserPtr<IoVec>,
     riovcnt: u64,
     flags: u64,
-) -> i64 {
+) -> KernelResult<u64> {
     process_vm_rw(pid, local_iov, liovcnt, remote_iov, riovcnt, flags, false)
 }
 
@@ -43,12 +43,12 @@ pub fn sys_process_vm_readv(
 /// Returns the bytes copied, or a negative errno if none were
 pub fn sys_process_vm_writev(
     pid: i32,
-    local_iov: u64,
+    local_iov: UserPtr<IoVec>,
     liovcnt: u64,
-    remote_iov: u64,
+    remote_iov: UserPtr<IoVec>,
     riovcnt: u64,
     flags: u64,
-) -> i64 {
+) -> KernelResult<u64> {
     process_vm_rw(pid, local_iov, liovcnt, remote_iov, riovcnt, flags, true)
 }
 
@@ -59,37 +59,32 @@ pub fn sys_process_vm_writev(
 /// (iovec_from_user) and the copy
 fn process_vm_rw(
     pid: i32,
-    lvec: u64,
+    lvec: UserPtr<IoVec>,
     liovcnt: u64,
-    rvec: u64,
+    rvec: UserPtr<IoVec>,
     riovcnt: u64,
     flags: u64,
     write: bool,
-) -> i64 {
+) -> KernelResult<u64> {
     if flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     // import_iovec takes the count as an unsigned int: truncated on
     // purpose, as in Linux; above IOV_MAX it is EINVAL either way
     let lcnt = i32::try_from(liovcnt as u32).unwrap_or(-1);
-    let local = match import_iovec(lvec, lcnt) {
-        Ok(v) => v,
-        Err(e) => return e.sysret(),
-    };
+    let local = import_iovec(lvec.addr(), lcnt)?;
     if local.iter().all(|v| v.iov_len == 0) {
-        return 0;
+        return Ok(0);
     }
-    match remote_iovecs(rvec, riovcnt) {
-        Ok(remote) => process_vm_rw_core(pid, &local, &remote, write),
-        Err(e) => e.sysret(),
-    }
+    let remote = remote_iovecs(rvec, riovcnt)?;
+    process_vm_rw_core(pid, &local, &remote, write)
 }
 
 /// The remote iovecs (Linux iovec_from_user): none for a count of 0;
 /// more than IOV_MAX, or a length negative as ssize_t, EINVAL; an
 /// array outside user space EFAULT. Their addresses are the target's,
 /// checked only when copied.
-fn remote_iovecs(uvec: u64, n: u64) -> Result<Vec<IoVec>, KernelError> {
+fn remote_iovecs(uvec: UserPtr<IoVec>, n: u64) -> KernelResult<Vec<IoVec>> {
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -98,13 +93,13 @@ fn remote_iovecs(uvec: u64, n: u64) -> Result<Vec<IoVec>, KernelError> {
         .filter(|&n| n <= IOV_MAX)
         .ok_or(KernelError::InvalidArgument)?;
     let size = n * core::mem::size_of::<IoVec>();
-    if !Uaccess::access_ok(uvec, size) {
+    if !Uaccess::access_ok(uvec.addr(), size) {
         return Err(KernelError::BadAddress);
     }
     let mut v = crate::util::kmem::try_vec(n, IoVec::default())?;
-    let mut r = UserSliceReader::<Uaccess>::new(uvec, size);
+    let mut r = UserSlice::new(uvec.addr(), size).reader();
     for iov in &mut v {
-        *iov = r.read::<IoVec>().map_err(|_| KernelError::BadAddress)?;
+        *iov = r.read::<IoVec>()?;
         if i64::try_from(iov.iov_len).is_err() {
             return Err(KernelError::InvalidArgument);
         }
@@ -116,29 +111,28 @@ fn remote_iovecs(uvec: u64, n: u64) -> Result<Vec<IoVec>, KernelError> {
 /// byte; else the target (ESRCH), the caller's right to its memory
 /// (mm_access: EPERM), and the copy: the bytes copied, or EFAULT if a
 /// fault stopped it before the first
-fn process_vm_rw_core(pid: i32, local: &[IoVec], remote: &[IoVec], write: bool) -> i64 {
+fn process_vm_rw_core(
+    pid: i32,
+    local: &[IoVec],
+    remote: &[IoVec],
+    write: bool,
+) -> KernelResult<u64> {
     if remote.iter().all(|v| v.iov_len == 0) {
-        return 0;
+        return Ok(0);
     }
-    let Some(target) = crate::task::percpu::find_task_by_vpid(pid as Pid).map(|t| t.tid()) else {
-        return KernelError::NoProcess.sysret();
-    };
-    let mm = match access_mm(target) {
-        Ok(mm) => mm,
-        Err(e) => return e.sysret(),
-    };
-    let mut buf = match crate::util::kmem::try_vec(PVM_CHUNK, 0u8) {
-        Ok(b) => b,
-        Err(e) => return e.sysret(),
-    };
+    let target = crate::task::percpu::find_task_by_vpid(pid as Pid)
+        .map(|t| t.tid())
+        .ok_or(KernelError::NoProcess)?;
+    let mm = access_mm(target)?;
+    let mut buf = crate::util::kmem::try_vec(PVM_CHUNK, 0u8)?;
     // The target's mmap_lock is held per remote access only, never
     // across a local user copy (which can fault and sleep, and takes
     // our own mmap_lock if it does)
     let done = copy_vecs(&mm, local, remote, &mut buf, write);
     if done > 0 {
-        done as i64
+        Ok(done)
     } else {
-        KernelError::BadAddress.sysret()
+        Err(KernelError::BadAddress)
     }
 }
 

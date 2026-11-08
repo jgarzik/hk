@@ -15,7 +15,7 @@ use core::cmp::Ordering;
 
 use crate::task::Task;
 use crate::task::percpu::{TASKLIST, task_ref};
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 
 // KCMP comparison types
 /// Compare file descriptors
@@ -137,36 +137,32 @@ fn fd_key(t: &Task, idx: u64) -> Option<u64> {
 /// * 1 if first < second
 /// * 2 if first > second
 /// * Negative errno on error
-pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i64 {
+pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> KernelResult<i64> {
     // pid_t: a negative one names no task (Linux find_task_by_vpid)
     if pid1 <= 0 || pid2 <= 0 {
-        return KernelError::NoProcess.sysret();
+        return Err(KernelError::NoProcess);
     }
     // The caller's numbers (Linux find_task_by_vpid)
     let from = |p: i32| crate::task::pid::from_vnr(p as u64);
     let (Some(pid1), Some(pid2)) = (from(pid1), from(pid2)) else {
-        return KernelError::NoProcess.sysret();
+        return Err(KernelError::NoProcess);
     };
 
     // Validate type
     if !(0..KCMP_TYPES).contains(&kcmp_type) {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // KCMP_EPOLL_TFD is not supported (requires complex epoll internals)
     if kcmp_type == KCMP_EPOLL_TFD {
-        return KernelError::OperationNotSupported.sysret();
+        return Err(KernelError::OperationNotSupported);
     }
 
     // Look up both tasks
     let (t1, t2) = {
         let table = TASKLIST.read();
-        let Some(task1) = table.get(pid1) else {
-            return KernelError::NoProcess.sysret();
-        };
-        let Some(task2) = table.get(pid2) else {
-            return KernelError::NoProcess.sysret();
-        };
+        let task1 = table.get(pid1).ok_or(KernelError::NoProcess)?;
+        let task2 = table.get(pid2).ok_or(KernelError::NoProcess)?;
         (task_ref(task1.task), task_ref(task2.task))
     };
     // Both thread groups' exec_update_lock for reading across the access
@@ -189,7 +185,7 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
     let (sigs, sems) = {
         let table = TASKLIST.read();
         let (Some(a), Some(b)) = (table.get(t1.tid()), table.get(t2.tid())) else {
-            return KernelError::NoProcess.sysret();
+            return Err(KernelError::NoProcess);
         };
         (
             (arc_key(&a.sighand), arc_key(&b.sighand)),
@@ -200,31 +196,27 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
     if !crate::task::ptrace::may_access_tid(t1.tid(), false)
         || !crate::task::ptrace::may_access_tid(t2.tid(), false)
     {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     match kcmp_type {
         KCMP_FILE => {
             // Compare specific file descriptors; the tables are locked
             // after task_lock is dropped
-            let Some(ptr1) = fd_key(&t1, idx1) else {
-                return KernelError::BadFd.sysret();
-            };
-            let Some(ptr2) = fd_key(&t2, idx2) else {
-                return KernelError::BadFd.sysret();
-            };
-            kcmp_ptr(ptr1, ptr2, KCMP_FILE)
+            let ptr1 = fd_key(&t1, idx1).ok_or(KernelError::BadFd)?;
+            let ptr2 = fd_key(&t2, idx2).ok_or(KernelError::BadFd)?;
+            Ok(kcmp_ptr(ptr1, ptr2, KCMP_FILE))
         }
 
-        KCMP_SIGHAND => compare_key(sigs.0, sigs.1, KCMP_SIGHAND),
-        KCMP_SYSVSEM => compare_key(sems.0, sems.1, KCMP_SYSVSEM),
+        KCMP_SIGHAND => Ok(compare_key(sigs.0, sigs.1, KCMP_SIGHAND)),
+        KCMP_SYSVSEM => Ok(compare_key(sems.0, sems.1, KCMP_SYSVSEM)),
 
-        KCMP_VM | KCMP_FILES | KCMP_FS | KCMP_IO => compare_key(
+        KCMP_VM | KCMP_FILES | KCMP_FS | KCMP_IO => Ok(compare_key(
             lock_key(&t1, kcmp_type),
             lock_key(&t2, kcmp_type),
             kcmp_type,
-        ),
+        )),
 
-        _ => KernelError::InvalidArgument.sysret(),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
