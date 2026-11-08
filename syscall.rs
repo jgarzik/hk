@@ -815,9 +815,14 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::PivotRoot => {
             crate::fs::syscall::sys_pivot_root(UserPtr::new(a[0]), UserPtr::new(a[1])).ret() as u64
         }
-        Sys::Ppoll => {
-            crate::fs::syscall::sys_ppoll(a[0], a[1] as u32, a[2], a[3], a[4]).ret() as u64
-        }
+        Sys::Ppoll => crate::fs::syscall::sys_ppoll(
+            UserPtr::new(a[0]),
+            a[1] as u32,
+            UserPtr::new(a[2]),
+            UserPtr::new(a[3]),
+            a[4],
+        )
+        .ret() as u64,
         Sys::Prctl => {
             crate::task::syscall::sys_prctl(a[0] as i32, a[1], a[2], a[3], a[4]).ret() as u64
         }
@@ -856,9 +861,15 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[5],
         )
         .ret() as u64,
-        Sys::Pselect6 => {
-            crate::fs::syscall::sys_pselect6(a[0] as i32, a[1], a[2], a[3], a[4], a[5]).ret() as u64
-        }
+        Sys::Pselect6 => crate::fs::syscall::sys_pselect6(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            UserPtr::new(a[3]),
+            UserPtr::new(a[4]),
+            UserPtr::new(a[5]),
+        )
+        .ret() as u64,
         Sys::Ptrace => {
             crate::task::ptrace::sys_ptrace(a[0] as i64, i64::from(a[1] as i32), a[2], a[3]).ret()
                 as u64

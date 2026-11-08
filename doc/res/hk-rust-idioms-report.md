@@ -31,7 +31,8 @@ Order: 2 goes per subsystem (M1); let-else is done and linted
   open/close/dup/fcntl/pipe/truncate, stat/statx/statfs, access/chmod/chown/utimes,
   namei ops (mkdir/mknod/rmdir/unlink/link/symlink/readlink/rename), getdents,
   chdir/fchdir/chroot/getcwd, xattr, mount/umount2/pivot_root, ioctl, fallocate,
-  sync/fsync/syncfs/sync_file_range/fadvise64/readahead, flock.
+  sync/fsync/syncfs/sync_file_range/fadvise64/readahead, flock, poll/ppoll/
+  select/pselect6: all 102 fs `sys_*`.
 - **Evidence (counts):**
   - 81 x `let v = match f() { Ok(v) => v, Err(e) => return e.sysret(), };` (4 lines)
   - 22 x `if let Err(e) = f() { return e.sysret(); }` (3 lines)
@@ -41,8 +42,8 @@ Order: 2 goes per subsystem (M1); let-else is done and linted
   - 85 x `if put_user(..).is_err() { return KernelError::BadAddress.sysret(); }`
   - 61 x `.map_err(|_| KernelError::BadAddress)`. There is no
     `impl From<UaccessError> for KernelError` (uaccess.rs:67).
-  - 2 copies of a local `fn ret()` (fs/perm.rs:47, fs/stat.rs:73)
-  - 39 ad-hoc `Result<_, i64>` errno-as-error fns (fs/io.rs:198 `one_seg`, :210 `pos_arg`)
+  - 25 ad-hoc `Result<_, i64>` errno-as-error fns left (time/posix_timer.rs `which_ok`,
+    keys/key.rs `keyring_add`, ...)
   - 739 `return KernelError::X.sysret();`. These become `return Err(KernelError::X)`
     (same LOC) and type-check against the error enum.
 - **Design** (`util/error.rs`, next to `sysret`):

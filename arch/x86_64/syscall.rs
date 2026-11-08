@@ -815,7 +815,8 @@ pub fn x86_64_syscall_dispatch(
         SYS_PAUSE => crate::signal::syscall::sys_pause().ret() as u64,
         SYS_PIPE => crate::fs::syscall::sys_pipe(UserPtr::new(args[0])).ret() as u64,
         SYS_POLL => {
-            crate::fs::syscall::sys_poll(args[0], args[1] as u32, args[2] as i32).ret() as u64
+            crate::fs::syscall::sys_poll(UserPtr::new(args[0]), args[1] as u32, args[2] as i32)
+                .ret() as u64
         }
         SYS_READLINK => {
             crate::fs::syscall::sys_readlink(UserPtr::new(args[0]), UserPtr::new(args[1]), args[2])
@@ -825,10 +826,14 @@ pub fn x86_64_syscall_dispatch(
             .ret() as u64,
         SYS_RMDIR => crate::fs::syscall::sys_rmdir(UserPtr::new(args[0])).ret() as u64,
         SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn().ret() as u64,
-        SYS_SELECT => {
-            crate::fs::syscall::sys_select(args[0] as i32, args[1], args[2], args[3], args[4])
-                as u64
-        }
+        SYS_SELECT => crate::fs::syscall::sys_select(
+            args[0] as i32,
+            UserPtr::new(args[1]),
+            UserPtr::new(args[2]),
+            UserPtr::new(args[3]),
+            UserPtr::new(args[4]),
+        )
+        .ret() as u64,
         SYS_SIGNALFD => crate::signal::syscall::sys_signalfd(
             args[0] as i32,
             crate::uaccess::UserPtr::new(args[1]),
