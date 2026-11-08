@@ -1925,7 +1925,7 @@ global `RENAME_LOCK` (write; Linux rename_lock), with both parents'
 read parents and names under `RENAME_LOCK` (read), so they see one
 consistent tree. `d_path` also climbs mounts (`Mount.parent`, then
 `Mount.mountpoint`, each read and released) inside it: RENAME_LOCK ->
-Mount fields -> d_lock; nothing takes RENAME_LOCK under a Mount lock. `Dentry::alloc` inserts a child under the parent's
+Mount fields -> d_lock; nothing takes RENAME_LOCK under a Mount lock. `d_path` and `dentry_path` copy names into a PATH_MAX buffer allocated before RENAME_LOCK (Linux prepend_buffer): nothing allocates under it. `Dentry::alloc` inserts a child under the parent's
 `d_lock` unless one with that name is cached (Linux d_alloc + d_add):
 one dentry per name. Deviation: Linux readers retry a seqlock instead of
 taking a lock.

@@ -267,6 +267,7 @@ pub fn run_all_tests() {
     process::groups::run_tests();
     fs::fifo::run_tests();
     fs::splice::run_tests();
+    fs::deep_chain::run_tests();
     fs::anon_inode::run_tests();
     fs::etxtbsy::run_tests();
     fs::cpio_nodes::run_tests();

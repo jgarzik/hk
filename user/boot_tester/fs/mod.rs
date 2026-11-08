@@ -7,6 +7,7 @@ pub mod bigio;
 pub mod blk;
 pub mod cpio_nodes;
 pub mod dac;
+pub mod deep_chain;
 pub mod dirents;
 pub mod etxtbsy;
 pub mod fanotify;

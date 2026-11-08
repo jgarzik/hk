@@ -118,7 +118,7 @@ pub fn show_mountinfo(pid: Pid) -> Vec<u8> {
             dev & 0xff
         );
         out.extend_from_slice(head.as_bytes());
-        mangle(&mut out, &dentry_path(&m.root), ESC);
+        mangle(&mut out, &dentry_path(&m.root).unwrap_or_default(), ESC);
         out.push(b' ');
         mangle(&mut out, &mp, ESC);
         out.push(b' ');

@@ -816,10 +816,10 @@ fn fd_link(pid: Pid, fd: i32) -> Result<Vec<u8>, KernelError> {
         }
         return Ok([b"anon_inode:".as_slice(), &file.dentry.name()].concat());
     }
-    Ok(file
-        .f_path()
-        .map(|p| super::dentry::d_path_link(&p))
-        .unwrap_or_default())
+    match file.f_path() {
+        Some(p) => super::dentry::d_path_link(&p),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Look up entries in /proc/<pid>/fd/
@@ -1247,7 +1247,7 @@ fn fs_link(pid: Pid, root: bool) -> Result<Vec<u8>, KernelError> {
     }
     let fs = crate::fs::get_task_fs(tid).ok_or(KernelError::NotFound)?;
     let p = if root { fs.get_root() } else { fs.get_pwd() };
-    Ok(super::dentry::d_path_link(&p))
+    super::dentry::d_path_link(&p)
 }
 
 fn cwd_link(pid: Pid) -> Result<Vec<u8>, KernelError> {
@@ -1293,7 +1293,9 @@ fn maps_of(mm: &crate::mm::MmStruct) -> Vec<u8> {
                 // seq_file_path(m, file, "\n"): a newline in a name
                 // cannot start a forged line
                 let mut p = Vec::new();
-                let name = f.f_path().map(|fp| super::dentry::d_path_link(&fp));
+                let name = f
+                    .f_path()
+                    .and_then(|fp| super::dentry::d_path_link(&fp).ok());
                 super::name::mangle(&mut p, &name.unwrap_or_default(), b"\n");
                 (ino, "00:00", p)
             }
