@@ -399,6 +399,22 @@ impl SigHand {
         self.action.lock()[sig.idx()].clone()
     }
 
+    /// The (ignored, caught) masks: signals whose handler is SIG_IGN, and
+    /// those with a handler of their own (Linux collect_sigign_sigcatch),
+    /// read in one hold of the table
+    pub fn ign_cgt(&self) -> (u64, u64) {
+        let (mut ign, mut cgt) = (0, 0);
+        for (i, a) in self.action.lock().iter().enumerate() {
+            let bit = 1 << i;
+            match a.handler {
+                SigHandler::Ignore => ign |= bit,
+                SigHandler::Handler(_) => cgt |= bit,
+                SigHandler::Default => {}
+            }
+        }
+        (ign, cgt)
+    }
+
     /// Set `sig`'s action; the old one, or EINVAL for SIGKILL and
     /// SIGSTOP, whose action cannot change (Linux do_sigaction)
     pub fn set_action(&self, sig: Signal, action: SigAction) -> Result<SigAction, KernelError> {

@@ -215,19 +215,7 @@ impl core::fmt::Write for Out {
 
 /// (ignored, caught) signals (Linux collect_sigign_sigcatch)
 fn ign_cgt(s: &Snap) -> (u64, u64) {
-    use crate::signal::{NSIG, SigHandler, Signal};
-    let Some(h) = &s.sighand else {
-        return (0, 0);
-    };
-    let (mut ign, mut cgt) = (0, 0);
-    for sig in (1..=NSIG).filter_map(Signal::new) {
-        match h.get_action(sig).handler {
-            SigHandler::Ignore => ign |= sig.bit(),
-            SigHandler::Handler(_) => cgt |= sig.bit(),
-            SigHandler::Default => {}
-        }
-    }
-    (ign, cgt)
+    s.sighand.as_ref().map_or((0, 0), |h| h.ign_cgt())
 }
 
 /// Pending signals shared by the thread group
