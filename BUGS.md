@@ -864,8 +864,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   fsnotify hooks in the VFS operations); rename has no
   IN_MOVED_FROM/IN_MOVED_TO cookie pairing (Linux fsnotify_get_cookie); waitid without WEXITED is
   EINVAL (C).
-- **Copied helpers** (J, or as touched): `get_nofile_limit` in five
-  places; four `current_time`s; about ten user-timespec readers each validating
+- **Copied helpers** (J, or as touched): four `current_time`s; about ten user-timespec readers each validating
   (Linux get_timespec64); three iovec structs and five
   importers; three Timeval, two Timespec types.
 - **Error conventions** (M1): Result<_, KernelError> about a thousand
