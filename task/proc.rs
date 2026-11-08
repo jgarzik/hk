@@ -136,7 +136,7 @@ pub fn sys_fork() -> KernelResult<i64> {
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
-        exit_signal: crate::signal::SIGCHLD as i32, // fork sends SIGCHLD on exit
+        exit_signal: i32::from(crate::signal::SIGCHLD), // fork sends SIGCHLD on exit
         cgroup_fd: -1,
         set_tid: super::percpu::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
@@ -173,7 +173,7 @@ pub fn sys_vfork() -> KernelResult<i64> {
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
-        exit_signal: crate::signal::SIGCHLD as i32, // vfork sends SIGCHLD on exit
+        exit_signal: i32::from(crate::signal::SIGCHLD), // vfork sends SIGCHLD on exit
         cgroup_fd: -1,
         set_tid: super::percpu::CloneConfig::NO_SET_TID,
         set_tid_size: 0,

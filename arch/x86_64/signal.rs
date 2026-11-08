@@ -14,7 +14,7 @@
 
 use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
-use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
+use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::{FromBytes, IntoBytes};
@@ -236,7 +236,7 @@ const USER_SS: u16 = 0x1b; // RPL=3, index=3
 ///
 /// Returns Ok(()) on success, Err(errno) on failure.
 pub fn setup_rt_frame(
-    sig: u32,
+    sig: Signal,
     action: &SigAction,
     blocked: SigSet,
     info: &SigInfo,
@@ -371,7 +371,7 @@ pub fn setup_rt_frame(
     regs.rsp = frame_addr;
     regs.rip = handler;
     regs.rflags = user_rflags & !HANDLER_CLEAR_EFLAGS;
-    regs.rdi = u64::from(sig);
+    regs.rdi = u64::from(sig.nr());
     regs.rsi = info_addr;
     regs.rdx = uc_addr;
     // RAX = 0 for handlers without SA_SIGINFO (Linux: regs->ax = 0)

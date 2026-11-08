@@ -975,7 +975,7 @@ impl GlobalTaskTable {
         // Linux reparent_leader: no custom exit signal to a new
         // parent process ("we don't want people slaying init")
         if other_group {
-            ci.exit_signal = crate::signal::SIGCHLD as i32;
+            ci.exit_signal = i32::from(crate::signal::SIGCHLD);
         }
         child.ppid.store(reaper.pid, Ordering::Relaxed);
         self.link_child(child);
@@ -1594,7 +1594,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, &'static str>
         // The boot group and session, number 0 (Linux init_struct_pid)
         pgrp: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.pgid),
         session: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.sid),
-        exit_signal: crate::signal::SIGCHLD as i32,
+        exit_signal: i32::from(crate::signal::SIGCHLD),
         // Shared resources: set by the caller via init_* functions
         ..crate::task::TaskInner::new(
             Some(thread_pid),
@@ -1705,7 +1705,7 @@ fn wait_eligible(exit_signal: i32, wflags: i32) -> bool {
     if wflags & __WALL != 0 {
         return true;
     }
-    let is_clone = exit_signal != crate::signal::SIGCHLD as i32;
+    let is_clone = exit_signal != i32::from(crate::signal::SIGCHLD);
     is_clone == (wflags & __WCLONE != 0)
 }
 
@@ -2008,7 +2008,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
             .ppid
             .store(ppid, core::sync::atomic::Ordering::Relaxed);
         // Linux de_thread: the new leader's exit signal is SIGCHLD
-        m.exit_signal = crate::signal::SIGCHLD as i32;
+        m.exit_signal = i32::from(crate::signal::SIGCHLD);
         m.task.start_time.store(start, Ordering::Relaxed);
     }
     // ... and its place on the group's and session's lists (Linux
@@ -2805,8 +2805,10 @@ fn forget_original_parent() {
     // moved child's threads get their pdeath_signal, from this task
     for c in &moved {
         let deaths = GlobalTaskTable::collect_threads(c.pid, |_, t| {
-            (t.pdeath_signal > 0).then_some(())?;
-            Some((task_ref(t.task), t.pdeath_signal as u32))
+            let sig = u32::try_from(t.pdeath_signal)
+                .ok()
+                .and_then(crate::signal::Signal::new)?;
+            Some((task_ref(t.task), sig))
         });
         for (t, sig) in deaths {
             let _ = crate::signal::send_group_signal(&t, sig, crate::signal::SendInfo::User);
@@ -5256,7 +5258,7 @@ pub fn exec_replace_image(
         new.set_dumpable(ident.dumpable);
         // A new execution domain (Linux de_thread): SIGCHLD; a secure
         // exec is not signalled at its parent's death (begin_new_exec)
-        task.exit_signal = crate::signal::SIGCHLD as i32;
+        task.exit_signal = i32::from(crate::signal::SIGCHLD);
         if ident.secure {
             task.pdeath_signal = 0;
         }

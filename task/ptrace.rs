@@ -10,7 +10,7 @@
 //! Not all ptrace operations are implemented; this focuses on the core subset
 //! needed for basic debugging and tracing.
 
-use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP};
+use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP, Signal};
 use crate::task::percpu::TaskRef;
 use crate::task::percpu::{self, TASKLIST};
 use crate::task::{CAP_SYS_PTRACE, Pid, Task, TaskState, capable};
@@ -387,18 +387,13 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> KernelResult<i64> {
     crate::arch::ptrace::disable_single_step(&task);
 
     // Resume it, delivering `signal` (Linux ptrace_detach: exit_code)
-    ptrace_wake(&task, resume_sig(signal));
+    ptrace_wake(&task, Signal::new(signal));
     Ok(0)
-}
-
-/// A resume's signal argument: the signal to deliver, 0 for none
-fn resume_sig(sig: u32) -> u32 {
-    if sig < 65 { sig } else { 0 }
 }
 
 /// Let a stopped tracee go on with `sig` to deliver (Linux
 /// ptrace_resume: exit_code, wake_up_state(__TASK_TRACED))
-fn ptrace_wake(task: &TaskRef, sig: u32) {
+fn ptrace_wake(task: &TaskRef, sig: Option<Signal>) {
     {
         let mut table = TASKLIST.write();
         let Some(mut t) = table.view_mut(task) else {
@@ -409,7 +404,7 @@ fn ptrace_wake(task: &TaskRef, sig: u32) {
         }
         t.state = TaskState::Ready;
         t.ptrace_frozen = false;
-        t.ptrace_code = sig;
+        t.ptrace_code = sig.map_or(0, Signal::nr);
     }
     percpu::try_to_wake_up(task, percpu::WakeMode::Any);
 }
@@ -462,7 +457,7 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> KernelResult<i64
         crate::arch::ptrace::disable_single_step(&task);
     }
 
-    ptrace_wake(&task, resume_sig(signal));
+    ptrace_wake(&task, Signal::new(signal));
     Ok(0)
 }
 
@@ -719,20 +714,20 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> KernelResult<i64> {
 /// Stop for the tracer (Linux ptrace_stop): the stop is reported to its
 /// wait with `code`, and the task sleeps until the tracer resumes it,
 /// detaches or exits, or SIGKILL. Returns the signal the tracer left to
-/// deliver (0: none; always 0 when killed).
+/// deliver (none when killed); untraced, `code` read as one.
 pub fn ptrace_stop(
     code: u32,
     info: Option<crate::signal::SigInfo>,
-) -> (u32, Option<crate::signal::SigInfo>) {
+) -> (Option<Signal>, Option<crate::signal::SigInfo>) {
     use percpu::{SleepState, schedule, set_current_state};
     let me = percpu::current();
     let tracer = {
         let mut table = TASKLIST.write();
         let Some(mut t) = table.view_mut(&me) else {
-            return (0, info);
+            return (None, info);
         };
         if t.ptrace == 0 {
-            return (code, info);
+            return (Signal::new(code), info);
         }
         t.state = TaskState::Traced(code as i32);
         t.ptrace_frozen = false;
@@ -775,7 +770,7 @@ pub fn ptrace_stop(
     set_current_state(SleepState::Running);
     let mut table = TASKLIST.write();
     let Some(mut t) = table.view_mut(&me) else {
-        return (0, None);
+        return (None, None);
     };
     // The stop's siginfo, as the tracer left it (Linux: last_siginfo
     // cleared after the stop)
@@ -787,9 +782,10 @@ pub fn ptrace_stop(
     if matches!(t.state, TaskState::Traced(_)) {
         t.state = TaskState::Ready;
         t.ptrace_code = 0;
-        return (0, info);
+        return (None, info);
     }
-    (core::mem::take(&mut t.ptrace_code), info)
+    // A resume's signal (ptrace_wake)
+    (Signal::new(core::mem::take(&mut t.ptrace_code)), info)
 }
 
 /// The current task is in a ptrace stop, and its tracer inside a
@@ -818,9 +814,9 @@ pub fn ptrace_report_syscall(entry: bool) {
         t.ptrace_options
     };
     let code = if options & PTRACE_O_TRACESYSGOOD != 0 {
-        SIGTRAP | 0x80
+        SIGTRAP.nr() | 0x80
     } else {
-        SIGTRAP
+        SIGTRAP.nr()
     };
     // The stop's siginfo (Linux ptrace_do_notify): SIGTRAP, si_code the
     // stop code, from this thread
@@ -831,20 +827,19 @@ pub fn ptrace_report_syscall(entry: bool) {
         crate::task::current_cred().uid,
     );
     // Linux send_sig(exit_code, current, 1): SEND_SIG_PRIV
-    let (sig, _) = ptrace_stop(code, Some(info));
-    if sig != 0 {
+    if let (Some(sig), _) = ptrace_stop(code, Some(info)) {
         let _ = signal::send_sig_info(&me, sig, signal::SendInfo::Kernel);
     }
 }
 
-/// A traced task dequeued `sig` (not SIGKILL): the tracer sees it first
-/// (Linux ptrace_signal) and may cancel it (0) or change it
-pub fn ptrace_signal(info: &mut crate::signal::SigInfo) -> u32 {
-    let sig = info.sig();
+/// A traced task dequeued `sig` with `info` (not SIGKILL): the tracer
+/// sees it first (Linux ptrace_signal) and may cancel it (None) or
+/// change it
+pub fn ptrace_signal(info: &mut crate::signal::SigInfo, sig: Signal) -> Option<Signal> {
     if !is_traced(&percpu::current()) {
-        return sig;
+        return Some(sig);
     }
-    let (new, left) = ptrace_stop(sig, Some(*info));
+    let (new, left) = ptrace_stop(sig.nr(), Some(*info));
     if let Some(i) = left {
         *info = i;
     }

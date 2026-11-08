@@ -32,7 +32,9 @@ use crate::io::poll::{
     POLLWRNORM,
 };
 use crate::signal::siginfo::{SigFields, SigInfo, si_code};
-use crate::signal::{SIGIO, SIGURG, SendInfo, group_task, send_group_signal, send_sig_info};
+use crate::signal::{
+    NSIG, SIGIO, SIGURG, SendInfo, Signal, group_task, send_group_signal, send_sig_info,
+};
 use crate::sync::spin::Mutex;
 use crate::task::Uid;
 use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef, TaskView};
@@ -78,8 +80,8 @@ struct Owner {
     /// The setter's real and effective uid (sigio_perm)
     uid: Uid,
     euid: Uid,
-    /// F_SETSIG: 0 = SIGIO without info
-    signum: u32,
+    /// F_SETSIG: None (0) = SIGIO without info
+    signum: Option<Signal>,
 }
 
 /// A file's SIGIO owner (Linux struct fown_struct)
@@ -252,16 +254,17 @@ pub fn f_getown_ex(file: &File, arg: u64) -> Result<(), KernelError> {
 pub fn f_setsig(file: &File, sig: u64) -> Result<(), KernelError> {
     // An int (Linux argi), so a negative one is out of range
     let sig = u32::try_from(sig as i32).map_err(|_| KernelError::InvalidArgument)?;
-    if sig > 64 {
+    if sig > NSIG {
         return Err(KernelError::InvalidArgument);
     }
-    file.f_owner_alloc()?.st.lock().signum = sig;
+    file.f_owner_alloc()?.st.lock().signum = Signal::new(sig);
     Ok(())
 }
 
 /// F_GETSIG: 0 when never set
 pub fn f_getsig(file: &File) -> u32 {
-    file.f_owner().map_or(0, |own| own.st.lock().signum)
+    let sig = file.f_owner().and_then(|own| own.st.lock().signum);
+    sig.map_or(0, Signal::nr)
 }
 
 // =============================================================================
@@ -345,14 +348,14 @@ fn fasync_remove(list: &FasyncList, file: &File) -> bool {
 /// POLL_* code; Linux kill_fasync). `sig` SIGURG reaches only owners
 /// that chose a signal (SIGURG has its own path). Thread context, no
 /// spin lock held.
-pub fn kill_fasync(list: &FasyncList, sig: u32, band: i32) {
+pub fn kill_fasync(list: &FasyncList, sig: Signal, band: i32) {
     if !list.armed() {
         return;
     }
     let l = list.list.lock();
     for e in l.iter() {
         let o = e.owner.get();
-        if !(sig == SIGURG && o.signum == 0) {
+        if !(sig == SIGURG && o.signum.is_none()) {
             send_sigio(&o, e.fd, band);
         }
     }
@@ -409,8 +412,7 @@ fn sigio_to_task(o: &Owner, t: &TaskRef, fd: i32, reason: i32) {
         PidType::Tid => send_sig_info(t, sig, info),
         _ => send_group_signal(t, sig, info),
     };
-    let sig = o.signum;
-    if sig != 0 {
+    if let Some(sig) = o.signum {
         // A signal with its own positive codes gets SI_SIGIO, not the
         // ambiguous POLL_* (SIGPOLL itself keeps it)
         let code = if sig != SIGIO && crate::signal::siginfo::specific_codes(sig) {

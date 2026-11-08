@@ -31,7 +31,9 @@ use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
 use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::signal::siginfo::Layout;
-use crate::signal::{SigFields, SigInfo, SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
+use crate::signal::{
+    SigFields, SigInfo, SigSet, Signal, UNMASKABLE_SIGNALS, with_task_signal_state,
+};
 use crate::task::percpu::current;
 use crate::util::pod::IntoBytes;
 
@@ -170,7 +172,7 @@ impl Signalfd {
     }
 
     /// Dequeue a pending signal that matches our mask, with its info
-    fn dequeue_signal(&self) -> Option<SigInfo> {
+    fn dequeue_signal(&self) -> Option<(Signal, SigInfo)> {
         let mask = self.inner.lock().mask;
         crate::signal::dequeue_signal(&mask)
     }
@@ -191,10 +193,10 @@ impl Signalfd {
         let mut done = 0;
         loop {
             while to.len() >= SIGINFO_SIZE {
-                let Some(info) = self.dequeue_signal() else {
+                let Some((sig, info)) = self.dequeue_signal() else {
                     break;
                 };
-                match to.copy_to_full(self.build_siginfo(&info).as_bytes()) {
+                match to.copy_to_full(self.build_siginfo(sig, &info).as_bytes()) {
                     Ok(()) => done += SIGINFO_SIZE,
                     Err(_) if done > 0 => return Ok(done),
                     Err(e) => return Err(e),
@@ -217,11 +219,11 @@ impl Signalfd {
         }
     }
 
-    /// The signalfd_siginfo of `info` (Linux signalfd_copyinfo): the
-    /// fields its layout carries, the rest zero
-    fn build_siginfo(&self, info: &SigInfo) -> SignalfdSiginfo {
+    /// The signalfd_siginfo of `sig` with `info` (Linux
+    /// signalfd_copyinfo): the fields its layout carries, the rest zero
+    fn build_siginfo(&self, sig: Signal, info: &SigInfo) -> SignalfdSiginfo {
         let mut s = SignalfdSiginfo {
-            ssi_signo: info.sig(),
+            ssi_signo: sig.nr(),
             ssi_errno: info.errno,
             ssi_code: info.code,
             ..Default::default()

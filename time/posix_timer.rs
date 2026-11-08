@@ -32,7 +32,7 @@ use alloc::sync::Arc;
 use core::pin::Pin;
 
 use crate::arch::IrqSpinlock;
-use crate::signal::{PidType, SIGALRM, SigQueue};
+use crate::signal::{PidType, SIGALRM, SigQueue, Signal};
 use crate::sync::spin::Mutex;
 use crate::task::{Task, Tid};
 use crate::time::hrtimer::{HrClock, HrTimer};
@@ -85,10 +85,18 @@ crate::pod!(SigEvent {
     _pad
 });
 
+impl SigEvent {
+    /// Its signal: None for 0 or a number no signal has (a SIGEV_NONE
+    /// timer's, unchecked by timer_create)
+    pub fn signal(&self) -> Option<Signal> {
+        u32::try_from(self.sigev_signo).ok().and_then(Signal::new)
+    }
+}
+
 impl Default for SigEvent {
     fn default() -> Self {
         Self {
-            sigev_signo: SIGALRM as i32,
+            sigev_signo: i32::from(SIGALRM),
             sigev_notify: sigev_notify::SIGEV_SIGNAL,
             ..FromBytes::zeroed()
         }
@@ -420,7 +428,7 @@ impl PosixTimer {
             return None;
         }
         Some(if itimer {
-            Expired::Signal(self.sigevent.sigev_signo as u32)
+            Expired::Signal(self.sigevent.signal()?)
         } else {
             Expired::Queue
         })
@@ -522,7 +530,7 @@ impl PosixTimer {
         if let crate::signal::SigFields::Timer { overrun, .. } = &mut f {
             *overrun = value;
         }
-        *info = crate::signal::SigInfo::new(info.sig(), info.code, f);
+        *info = info.with_fields(f);
         true
     }
 
@@ -655,10 +663,9 @@ pub fn reclaim(q: Box<SigQueue>) {
 /// `sig`'s action no longer ignores it: the current process's interval
 /// timers whose signal it ignored queue it now (Linux
 /// posixtimer_sig_unignore)
-pub fn sig_unignore(sig: u32) {
+pub fn sig_unignore(sig: Signal) {
     let me = current();
-    let ignored =
-        |t: &&Arc<PosixTimer>| t.sigevent.sigev_signo as u32 == sig && t.inner.lock().ignored;
+    let ignored = |t: &&Arc<PosixTimer>| t.sigevent.signal() == Some(sig) && t.inner.lock().ignored;
     // Sized under one hold, filled under another: nothing allocates
     // under posix_timers
     let n = with_timers(&me, |reg| reg.iter().filter(ignored).count()).unwrap_or(0);
@@ -834,7 +841,7 @@ pub fn create_posix_timer(
     // signals like SIGEV_SIGNAL: glibc runs its threads itself)
     use sigev_notify::{SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID};
     let mut sev = sigevent.unwrap_or(SigEvent {
-        sigev_signo: SIGALRM as i32,
+        sigev_signo: i32::from(SIGALRM),
         ..SigEvent::default()
     });
     let default_value = sigevent.is_none();
@@ -871,18 +878,16 @@ pub fn create_posix_timer(
     if sev.sigev_notify == SIGEV_THREAD_ID && !t.target_in_group() {
         return Err(KernelError::InvalidArgument);
     }
-    if sev.sigev_notify != SIGEV_NONE {
+    // Checked above: a signalling timer has a signal
+    if let Some(sig) = sev.signal().filter(|_| sev.sigev_notify != SIGEV_NONE) {
         let fields = crate::signal::SigFields::Timer {
             tid: id,
             overrun: 0,
             value: sev.sigev_value,
         };
-        let info = crate::signal::SigInfo::new(
-            sev.sigev_signo as u32,
-            crate::signal::si_code::SI_TIMER,
-            fields,
-        );
-        let q = SigQueue::alloc_timer(info, Arc::downgrade(&t)).ok_or(KernelError::WouldBlock)?;
+        let info = crate::signal::SigInfo::new(sig, crate::signal::si_code::SI_TIMER, fields);
+        let q = SigQueue::alloc_timer(sig, info, Arc::downgrade(&t));
+        let q = q.ok_or(KernelError::WouldBlock)?;
         *t.sigq.lock() = Some(q);
     }
     with_timers(me, |reg| reg.add(t)).ok_or(KernelError::WouldBlock)?;
@@ -1160,7 +1165,7 @@ fn itimer(which: i32) -> Arc<PosixTimer> {
     let tid = me.tid();
     let make = || {
         let sev = SigEvent {
-            sigev_signo: sig as i32,
+            sigev_signo: sig.into(),
             sigev_notify: sigev_notify::SIGEV_SIGNAL,
             ..SigEvent::default()
         };

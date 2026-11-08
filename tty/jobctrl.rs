@@ -158,7 +158,7 @@ pub fn disassociate_ctty() {
 /// hk has no group stop, so where Linux would stop the group (SIG_DFL)
 /// the signal is sent and the call fails with EIO instead of
 /// restarting forever
-pub fn check_change(tty: &Tty, sig: u32) -> Result<(), KernelError> {
+pub fn check_change(tty: &Tty, sig: crate::signal::Signal) -> Result<(), KernelError> {
     use crate::signal::{Disposition, SIGTTIN, disposition};
     let Some((pg, s)) = pids(&TASKLIST.read()) else {
         return Ok(());

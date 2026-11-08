@@ -8,6 +8,7 @@
 //! - pidfd_open, pidfd_send_signal, pidfd_getfd (pidfd operations)
 
 use crate::fs::file::File;
+use crate::signal::Signal;
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
@@ -1093,13 +1094,15 @@ pub fn sys_pidfd_send_signal(
         _ if pidfd.thread() => Scope::Thread,
         _ => Scope::Process,
     };
-    let info = pidfd_info(info, sig as u32, pidfd.pid(), scope)?;
+    let info = pidfd_info(info, sig, pidfd.pid(), scope)?;
     // Permission check and send to the pidfd's struct pid itself (Linux
     // kill_pid_info_type, kill_pgrp_info), so a released task's reused
-    // number never gets it. Signal 0 is a permission/existence probe.
+    // number never gets it. Signal 0 (None) is a permission/existence
+    // probe.
+    let sig = u32::try_from(sig).ok().and_then(Signal::new);
     let me = crate::signal::syscall::Sender::current();
-    let check = |t: &super::percpu::TaskView<'_>| me.may_kill(t, sig as u32);
-    let (sig, pid) = (sig as u32, pidfd.pid_ref());
+    let check = |t: &super::percpu::TaskView<'_>| me.may_kill(t, sig);
+    let pid = pidfd.pid_ref();
     match scope {
         Scope::Thread => {
             crate::signal::kill_pid_info_type(pid, sig, info, crate::signal::PidType::Pid, check)
@@ -1127,19 +1130,21 @@ enum Scope {
 /// The info pidfd_send_signal sends to `pid`'s `scope` (Linux
 /// do_pidfd_send_signal): without `uinfo`, kill's (tkill's, SI_TKILL,
 /// to a thread: prepare_kill_siginfo); else that siginfo, which must be
-/// for `sig` (EINVAL), with a code reserved to the kernel only to the
-/// caller's own thread or process (EPERM)
+/// for `sig`, the number as given (EINVAL), with a code reserved to the
+/// kernel only to the caller's own thread or process (EPERM)
 fn pidfd_info(
     uinfo: UserPtr<crate::signal::SigInfo>,
-    sig: u32,
+    sig: i32,
     pid: u64,
     scope: Scope,
 ) -> KernelResult<crate::signal::SendInfo> {
     use crate::signal::{SendInfo, SigInfo, si_code};
     if uinfo.is_null() {
-        if scope != Scope::Thread {
+        // Kill's info, none to make for a probe (0), which sends nothing
+        let sig = u32::try_from(sig).ok().and_then(Signal::new);
+        let Some(sig) = sig.filter(|_| scope == Scope::Thread) else {
             return Ok(SendInfo::User);
-        }
+        };
         let me = super::pid::vnr(super::percpu::current_pid()) as i32;
         let uid = crate::task::current_cred().uid;
         return Ok(SendInfo::Info(SigInfo::kill(
@@ -1150,7 +1155,7 @@ fn pidfd_info(
         )));
     }
     let info = SigInfo::copy_from_user(uinfo.addr())?;
-    if info.sig() != sig {
+    if info.signo != sig {
         return Err(KernelError::InvalidArgument);
     }
     let me = super::percpu::current_tid();

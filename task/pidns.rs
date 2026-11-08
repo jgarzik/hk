@@ -127,7 +127,7 @@ pub fn reboot_pid_ns(cmd: u32) -> Option<crate::util::error::KernelError> {
     };
     let reaper = {
         let mut table = TASKLIST.write();
-        *ns.reboot.access_mut(&mut table) = sig as i32;
+        *ns.reboot.access_mut(&mut table) = sig.into();
         child_reaper(&table, ns)
     };
     if let Some(r) = reaper {

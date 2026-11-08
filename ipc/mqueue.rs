@@ -24,6 +24,7 @@
 //! - POSIX.1-2017 mq_overview(7)
 
 use crate::fs::name::FileName;
+use crate::signal::Signal;
 use crate::time::hrtimer::HrClock;
 use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
@@ -385,8 +386,8 @@ impl MqQueue {
             // a released process has no task to send to); signal 0
             // sends nothing
             let live = n.owner.exec_gen() == n.exec_gen;
-            let sig = n.sigev_signo as u32;
-            if n.sigev_notify == SIGEV_SIGNAL && live && sig != 0 {
+            let sig = u32::try_from(n.sigev_signo).ok().and_then(Signal::new);
+            if let Some(sig) = sig.filter(|_| n.sigev_notify == SIGEV_SIGNAL && live) {
                 let info = mesgq_info(sig, n.sigev_value, &n.owner);
                 // To the registrant's struct pid, never its number
                 let _ = crate::signal::kill_pid_info(&n.owner, sig, info, |_| Ok(()));
@@ -399,7 +400,7 @@ impl MqQueue {
 /// non-empty, as the registrant `owner`'s namespace numbers it, with its
 /// sigev_value (Linux __do_notify: task_tgid_nr_ns(current,
 /// ns_of_pid(notify_owner)))
-fn mesgq_info(sig: u32, value: u64, owner: &crate::task::pid::Pid) -> crate::signal::SendInfo {
+fn mesgq_info(sig: Signal, value: u64, owner: &crate::task::pid::Pid) -> crate::signal::SendInfo {
     use crate::signal::{SendInfo, SigFields, SigInfo, si_code};
     let me = crate::task::percpu::current_pid();
     let fields = SigFields::Rt {

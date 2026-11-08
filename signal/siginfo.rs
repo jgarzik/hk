@@ -6,6 +6,7 @@
 //! rt_sigqueueinfo reaches the receiver exactly as sent, whatever its
 //! layout. [`SigFields`] is the typed view, chosen by `siginfo_layout`.
 
+use super::Signal;
 use crate::arch::Uaccess;
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::util::error::KernelError;
@@ -164,10 +165,11 @@ pub enum SigFields {
 }
 
 /// Linux sig_sicodes: the signals whose positive codes are their own,
-/// with the highest code and its layout
-fn sig_sicodes(sig: u32) -> Option<(i32, Layout)> {
+/// with the highest code and its layout (none for a number that is no
+/// signal)
+fn sig_sicodes(sig: Option<Signal>) -> Option<(i32, Layout)> {
     use super::{SIGBUS, SIGCHLD, SIGFPE, SIGILL, SIGIO, SIGSEGV, SIGSYS, SIGTRAP};
-    Some(match sig {
+    Some(match sig? {
         SIGILL => (NSIGILL, Layout::Fault),
         SIGFPE => (NSIGFPE, Layout::Fault),
         SIGSEGV => (NSIGSEGV, Layout::Fault),
@@ -181,20 +183,21 @@ fn sig_sicodes(sig: u32) -> Option<(i32, Layout)> {
 }
 
 /// `sig` has positive codes of its own (Linux sig_specific_sicodes)
-pub fn specific_codes(sig: u32) -> bool {
-    sig_sicodes(sig).is_some()
+pub fn specific_codes(sig: Signal) -> bool {
+    sig_sicodes(Some(sig)).is_some()
 }
 
-/// The union member `sig` with `code` carries (Linux siginfo_layout)
-pub fn layout(sig: u32, code: i32) -> Layout {
+/// The union member `sig` with `code` carries (Linux siginfo_layout;
+/// `sig` None: an si_signo that is no signal)
+pub fn layout(sig: Option<Signal>, code: i32) -> Layout {
     use super::{SIGBUS, SIGSEGV, SIGTRAP};
     if code > SI_USER && code < SI_KERNEL {
         match sig_sicodes(sig) {
             Some((limit, l)) if code <= limit => match (sig, code) {
-                (SIGBUS, BUS_MCEERR_AR..=BUS_MCEERR_AO) => Layout::FaultMceerr,
-                (SIGSEGV, SEGV_BNDERR) => Layout::FaultBnderr,
-                (SIGSEGV, SEGV_PKUERR) => Layout::FaultPkuerr,
-                (SIGTRAP, TRAP_PERF) => Layout::FaultPerf,
+                (Some(SIGBUS), BUS_MCEERR_AR..=BUS_MCEERR_AO) => Layout::FaultMceerr,
+                (Some(SIGSEGV), SEGV_BNDERR) => Layout::FaultBnderr,
+                (Some(SIGSEGV), SEGV_PKUERR) => Layout::FaultPkuerr,
+                (Some(SIGTRAP), TRAP_PERF) => Layout::FaultPerf,
                 _ => l,
             },
             _ if code <= NSIGPOLL => Layout::Poll,
@@ -212,7 +215,7 @@ pub fn layout(sig: u32, code: i32) -> Layout {
 }
 
 /// Linux known_siginfo_layout: a code whose fields fit the kernel form
-fn known_layout(sig: u32, code: i32) -> bool {
+fn known_layout(sig: Option<Signal>, code: i32) -> bool {
     if code == SI_KERNEL {
         true
     } else if code > SI_USER {
@@ -228,9 +231,9 @@ fn known_layout(sig: u32, code: i32) -> bool {
 impl SigInfo {
     /// Info for `sig` with `code` and the union member `fields` (the rest
     /// zero, Linux clear_siginfo)
-    pub fn new(sig: u32, code: i32, fields: SigFields) -> Self {
+    pub fn new(sig: Signal, code: i32, fields: SigFields) -> Self {
         let mut s = Self {
-            signo: sig as i32,
+            signo: sig.into(),
             code,
             ..Self::default()
         };
@@ -239,18 +242,31 @@ impl SigInfo {
     }
 
     /// SI_USER or SI_TKILL info from sender `pid`, `uid`
-    pub fn kill(sig: u32, code: i32, pid: i32, uid: u32) -> Self {
+    pub fn kill(sig: Signal, code: i32, pid: i32, uid: u32) -> Self {
         Self::new(sig, code, SigFields::Kill { pid, uid })
     }
 
     /// A fault at `addr` (Linux force_sig_fault)
-    pub fn fault(sig: u32, code: i32, addr: u64) -> Self {
+    pub fn fault(sig: Signal, code: i32, addr: u64) -> Self {
         Self::new(sig, code, SigFields::Fault { addr, addr_lsb: 0 })
     }
 
-    /// The signal number
-    pub fn sig(&self) -> u32 {
-        self.signo as u32
+    /// Its signal; None for an si_signo that is no signal (a tracer's
+    /// PTRACE_SETSIGINFO may set any)
+    pub fn sig(&self) -> Option<Signal> {
+        u32::try_from(self.signo).ok().and_then(Signal::new)
+    }
+
+    /// The same info for `sig`
+    pub fn with_sig(mut self, sig: Signal) -> Self {
+        self.signo = sig.into();
+        self
+    }
+
+    /// The same info with the union member `fields`
+    pub fn with_fields(mut self, fields: SigFields) -> Self {
+        self.set_fields(fields);
+        self
     }
 
     /// The union member this info carries
@@ -447,7 +463,7 @@ mod tests {
     #[test]
     fn fields_round_trip() {
         let rt = SigInfo::new(
-            SIGRTMIN + 1,
+            SIGRTMIN,
             SI_QUEUE,
             SigFields::Rt {
                 pid: 7,
@@ -501,16 +517,18 @@ mod tests {
     /// Linux siginfo_layout's choices
     #[test]
     fn layouts() {
-        assert_eq!(layout(SIGUSR1, SI_USER), Layout::Kill);
-        assert_eq!(layout(SIGUSR1, SI_TKILL), Layout::Rt);
-        assert_eq!(layout(SIGUSR1, SI_TIMER), Layout::Timer);
-        assert_eq!(layout(SIGUSR1, SI_KERNEL), Layout::Kill);
-        assert_eq!(layout(SIGUSR1, 3), Layout::Poll);
-        assert_eq!(layout(SIGUSR1, 7), Layout::Kill);
-        assert_eq!(layout(SIGSEGV, SEGV_PKUERR), Layout::FaultPkuerr);
-        assert_eq!(layout(SIGCHLD, CLD_EXITED), Layout::Chld);
-        assert!(known_layout(SIGUSR1, SI_QUEUE));
-        assert!(!known_layout(SIGUSR1, -8));
-        assert!(!known_layout(SIGUSR1, 7));
+        let usr1 = Some(SIGUSR1);
+        assert_eq!(layout(usr1, SI_USER), Layout::Kill);
+        assert_eq!(layout(usr1, SI_TKILL), Layout::Rt);
+        assert_eq!(layout(usr1, SI_TIMER), Layout::Timer);
+        assert_eq!(layout(usr1, SI_KERNEL), Layout::Kill);
+        assert_eq!(layout(usr1, 3), Layout::Poll);
+        assert_eq!(layout(usr1, 7), Layout::Kill);
+        assert_eq!(layout(Some(SIGSEGV), SEGV_PKUERR), Layout::FaultPkuerr);
+        assert_eq!(layout(Some(SIGCHLD), CLD_EXITED), Layout::Chld);
+        assert_eq!(layout(None, 3), Layout::Poll);
+        assert!(known_layout(usr1, SI_QUEUE));
+        assert!(!known_layout(usr1, -8));
+        assert!(!known_layout(usr1, 7));
     }
 }

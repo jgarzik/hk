@@ -136,7 +136,7 @@ pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
         Verdict::KillProcess => kill(crate::signal::SIGSYS, false),
         // Linux __secure_computing_strict: do_exit(SIGKILL), the thread
         // alone even if it is the last
-        Verdict::Strict => crate::task::proc::do_exit(crate::signal::SIGKILL as i32),
+        Verdict::Strict => crate::task::proc::do_exit(i32::from(crate::signal::SIGKILL)),
     }
 }
 
@@ -152,18 +152,18 @@ fn force_sigsys(me: &crate::task::Task, regs: &crate::arch::UserFrame, nr: u64, 
     };
     let mut info = SigInfo::new(SIGSYS, si_code::SYS_SECCOMP, fields);
     info.errno = data as i32;
-    crate::signal::force_sig_info(me, info);
+    crate::signal::force_sig_info(me, SIGSYS, info);
 }
 
 /// End the thread by `sig` (`thread`, while another has not started
 /// exiting) or the whole process (Linux __seccomp_filter: do_exit(SIGSYS)
 /// unless signal->live is 1, else force_sig_seccomp with the handler
 /// reset so the process dies)
-fn kill(sig: u32, thread: bool) -> ! {
+fn kill(sig: crate::signal::Signal, thread: bool) -> ! {
     let me = crate::task::percpu::current();
     let others = crate::signal::get_task_signal_struct(&me).is_some_and(|s| s.live() > 1);
     if thread && others {
-        crate::task::proc::do_exit(sig as i32)
+        crate::task::proc::do_exit(sig.into())
     }
-    crate::signal::do_group_exit(sig as i32)
+    crate::signal::do_group_exit(sig.into())
 }

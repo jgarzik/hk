@@ -692,7 +692,7 @@ pub fn pagefault_out_of_memory() -> ! {
     };
     let comm = crate::fs::name::Escaped(comm);
     crate::printkln!("Out of memory: Killed process {} ({})", pid, comm);
-    crate::signal::do_group_exit(SIGKILL as i32)
+    crate::signal::do_group_exit(i32::from(SIGKILL))
 }
 
 /// Before a write into another process's private page by the kernel

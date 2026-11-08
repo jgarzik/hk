@@ -252,7 +252,7 @@ enum Fire {
     Timer(Arc<crate::time::posix_timer::PosixTimer>),
     /// Signal `sig` to the process from the kernel (an itimer,
     /// RLIMIT_CPU: Linux SEND_SIG_PRIV)
-    Process(u32),
+    Process(crate::signal::Signal),
     /// Wake a clock_nanosleep
     Wake(Arc<crate::time::posix_timer::PosixTimer>),
 }
@@ -389,7 +389,7 @@ pub fn rlimit_cpu_changed(sig: &crate::signal::SignalStruct, pid: crate::task::P
 /// What an expired CPU timer asks for
 pub enum Expired {
     /// An itimer's signal for the process
-    Signal(u32),
+    Signal(crate::signal::Signal),
     /// A timer_create timer's queued signal
     Queue,
     Wake,

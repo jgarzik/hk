@@ -24,7 +24,7 @@
 
 use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
-use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
+use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::{FromBytes, IntoBytes};
@@ -256,7 +256,7 @@ const PSTATE_BTYPE: u64 = 3 << 10;
 ///
 /// Returns Ok(()) on success, Err(errno) on failure.
 pub fn setup_rt_frame(
-    sig: u32,
+    sig: Signal,
     action: &SigAction,
     blocked: SigSet,
     info: &SigInfo,
@@ -390,7 +390,7 @@ pub fn setup_rt_frame(
     // The handler is not entered by an indirect branch (Linux
     // setup_return clears BTYPE)
     regs.spsr &= !PSTATE_BTYPE;
-    regs.x[0] = u64::from(sig); // x0 = signal number
+    regs.x[0] = u64::from(sig.nr()); // x0 = signal number
     regs.x[1] = info_addr; // x1 = &siginfo
     regs.x[2] = uc_addr; // x2 = &ucontext
     regs.x[29] = record_addr; // x29 = frame record
