@@ -1047,11 +1047,11 @@ use crate::task::percpu::TASKLIST;
 pub fn get_or_create_undo_list(t: &Task) -> Result<Arc<SemUndoList>, KernelError> {
     let mut table = TASKLIST.write();
     if let Some(mut task) = table.view_mut(t) {
-        if let Some(ul) = &task.sysvsem {
+        if let Some(ul) = task.sysvsem() {
             return Ok(ul.clone());
         }
         let ul = try_arc(SemUndoList::new())?;
-        task.sysvsem = Some(ul.clone());
+        task.set_sysvsem(ul.clone());
         Ok(ul)
     } else {
         // Task not found - shouldn't happen but return a new list
@@ -1061,7 +1061,7 @@ pub fn get_or_create_undo_list(t: &Task) -> Result<Arc<SemUndoList>, KernelError
 
 /// Task `t`'s undo list, if it has one
 pub fn get_undo_list(t: &Task) -> Option<Arc<SemUndoList>> {
-    TASKLIST.read().view(t)?.sysvsem.clone()
+    TASKLIST.read().view(t)?.sysvsem().cloned()
 }
 
 /// Clone semaphore undo list for a new task
@@ -1075,7 +1075,7 @@ pub fn clone_task_semundo(parent: &Task, child: &Task, share: bool) {
         if let Some(undo) = parent_undo {
             let mut table = TASKLIST.write();
             if let Some(mut child) = table.view_mut(child) {
-                child.sysvsem = Some(undo);
+                child.set_sysvsem(undo);
             }
         }
         // If parent has no undo list, child also starts with none (will be created on demand)
@@ -1093,7 +1093,7 @@ pub fn clone_task_semundo(parent: &Task, child: &Task, share: bool) {
 pub fn exit_sem(t: &Task) {
     let undo_list = {
         let mut table = TASKLIST.write();
-        table.view_mut(t).and_then(|mut t| t.sysvsem.take())
+        table.view_mut(t).and_then(|mut t| t.take_sysvsem())
     };
     // The last sharer's drop gives the list back, exactly once even when
     // CLONE_SYSVSEM sharers exit together (Linux refcount_dec_and_test)

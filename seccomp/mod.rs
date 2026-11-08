@@ -180,7 +180,7 @@ pub fn exit_seccomp(t: &crate::task::Task) {
             task.task
                 .seccomp_mode
                 .store(SECCOMP_MODE_DISABLED, core::sync::atomic::Ordering::Relaxed);
-            task.seccomp_filter.take()
+            task.take_seccomp_filter()
         })
     };
 }

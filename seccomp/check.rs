@@ -120,7 +120,7 @@ pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
     }
     let filter = {
         let table = crate::task::percpu::TASKLIST.read();
-        table.view(&me)?.seccomp_filter.clone()
+        table.view(&me)?.seccomp_filter().cloned()
     };
     match check_syscall(mode, filter.as_ref(), nr, regs.ip(), regs.syscall_args()) {
         Verdict::Allow => None,

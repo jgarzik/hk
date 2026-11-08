@@ -95,8 +95,8 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
             let table = TASKLIST.read();
             let task = table.view(&cur).ok_or(KernelError::NoProcess)?;
             (
-                task.seccomp_filter.clone(),
-                task.prctl.no_new_privs,
+                task.seccomp_filter().cloned(),
+                task.no_new_privs(),
                 crate::task::capable(crate::task::CAP_SYS_ADMIN),
             )
         };
@@ -110,7 +110,7 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
             create_filter_from_user::<Uaccess>(fprog.addr(), existing_filter.clone(), log)?;
         let table = TASKLIST.write();
         let me = table.view(&cur).ok_or(KernelError::NoProcess)?;
-        let same = match (&me.seccomp_filter, &existing_filter) {
+        let same = match (me.seccomp_filter(), &existing_filter) {
             (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(a, b),
             (None, None) => true,
             _ => false,
@@ -120,11 +120,7 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
         }
     };
     let me = table.view(&cur).ok_or(KernelError::NoProcess)?;
-    let (pid, mine, nnp) = (
-        me.task.pid,
-        me.seccomp_filter.clone(),
-        me.prctl.no_new_privs,
-    );
+    let (pid, mine, nnp) = (me.task.pid, me.seccomp_filter().cloned(), me.no_new_privs());
     let mut targets = alloc::vec![tid];
     if tsync {
         // Linux seccomp_can_sync_threads: every other thread's filter is
@@ -136,7 +132,7 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
         {
             let mode = t.task.seccomp_mode();
             let ok = (mode == SECCOMP_MODE_DISABLED || mode == SECCOMP_MODE_FILTER)
-                && SeccompFilter::is_ancestor_of(t.seccomp_filter.as_ref(), mine.as_ref());
+                && SeccompFilter::is_ancestor_of(t.seccomp_filter(), mine.as_ref());
             if !ok {
                 return Ok(t.task.tid() as i64);
             }
@@ -149,9 +145,9 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
         };
         // Filter first: syscall entry reads the mode lock-free, then
         // the filter under TASKLIST
-        task.seccomp_filter = Some(new_filter.clone());
+        task.set_seccomp_filter(new_filter.clone());
         if nnp {
-            task.prctl.no_new_privs = true;
+            task.set_no_new_privs();
         }
         task.task
             .seccomp_mode

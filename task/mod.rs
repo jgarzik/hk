@@ -1120,20 +1120,20 @@ pub struct TaskInner {
     pgrp: Option<Arc<pid::Pid>>,
     session: Option<Arc<pid::Pid>>,
     /// A group leader on its `pgrp`'s and `session`'s lists
-    pub pids_linked: bool,
+    pids_linked: bool,
     // =========================================================================
     // Exit handling (like Linux task_struct exit fields)
     // =========================================================================
     /// Exit status code (set when task becomes zombie)
-    pub exit_code: i32,
+    exit_code: i32,
     /// Signal to send to parent on exit (default SIGCHLD, from clone3
     /// exit_signal; -1 for a thread, Linux)
-    pub exit_signal: crate::signal::ExitSignal,
+    exit_signal: crate::signal::ExitSignal,
     /// Its parent's exec count when it was made (Linux parent_exec_id):
     /// a non-SIGCHLD exit signal is sent only to the image that set it
-    pub parent_exec_id: u64,
+    parent_exec_id: u64,
     /// Signal to send when parent dies (set via prctl PR_SET_PDEATHSIG)
-    pub pdeath_signal: Option<crate::signal::Signal>,
+    pdeath_signal: Option<crate::signal::Signal>,
 
     // =========================================================================
     // Credentials (like Linux task_struct->cred)
@@ -1143,18 +1143,18 @@ pub struct TaskInner {
     /// CPU affinity mask (bit N = CPU N is allowed)
     /// Top-level page table it runs on: its mm's, else the kernel's
     /// (`ArchPageTable::kernel_root`)
-    pub pgd: u64,
+    pgd: u64,
 
     // =========================================================================
     // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)
     // =========================================================================
     /// Address to clear and futex-wake on thread exit (set_tid_address syscall)
     /// Used by pthread library for thread cleanup notification.
-    pub clear_child_tid: u64,
+    clear_child_tid: u64,
 
     /// Address to write child TID on first schedule (CLONE_CHILD_SETTID for fork)
     /// Consumed after first use (one-time operation).
-    pub set_child_tid: u64,
+    set_child_tid: u64,
 
     // =========================================================================
     // Shared resources (Arc for clone-sharing, like Linux pointers)
@@ -1166,26 +1166,26 @@ pub struct TaskInner {
     signal: Option<Arc<SignalStruct>>,
 
     /// SysV semaphore undo list (shared when CLONE_SYSVSEM)
-    pub sysvsem: Option<Arc<SemUndoList>>,
+    sysvsem: Option<Arc<SemUndoList>>,
 
     // =========================================================================
     // Per-task signal state (not shared)
     // =========================================================================
     /// Robust futex list head address
-    pub robust_list: u64,
+    robust_list: u64,
 
     // =========================================================================
     // prctl state (not shared)
     // =========================================================================
     /// Per-task prctl state (name, dumpable, no_new_privs, timer_slack)
-    pub prctl: PrctlState,
+    prctl: PrctlState,
 
     // =========================================================================
     // Personality (execution domain)
     // =========================================================================
     /// Process personality (execution domain, affects syscall behavior)
     /// See personality(2). Default is 0 (PER_LINUX).
-    pub personality: u32,
+    personality: u32,
 
     // =========================================================================
     // Seccomp state (sandboxing)
@@ -1194,7 +1194,7 @@ pub struct TaskInner {
     /// Filters are chained: when a new filter is installed, it points to the previous.
     /// On syscall entry, filters are run in order (newest first), and the most
     /// restrictive result wins.
-    pub seccomp_filter: Option<Arc<SeccompFilter>>,
+    seccomp_filter: Option<Arc<SeccompFilter>>,
 
     // =========================================================================
     // I/O port permissions (x86-64 only)
@@ -1203,7 +1203,7 @@ pub struct TaskInner {
     /// 0-2 = no direct I/O access, 3 = full I/O port access
     /// This is an emulation of the CPU IOPL mechanism, stored per-task.
     #[cfg(target_arch = "x86_64")]
-    pub iopl_emul: u8,
+    iopl_emul: u8,
 
     /// Thread-group leader (Linux thread_group_leader): created without
     /// CLONE_THREAD, or the thread whose exec ended the others
@@ -1220,7 +1220,7 @@ pub struct TaskInner {
 
     /// The tracer (Linux task->parent while traced): a task reference,
     /// so a recycled number never names it (under TASKLIST)
-    pub ptracer: Option<alloc::sync::Weak<Task>>,
+    ptracer: Option<alloc::sync::Weak<Task>>,
 
     /// The real parent (Linux real_parent): the task whose `children`
     /// list holds this one; None for init and kernel threads. Weak:
@@ -1230,30 +1230,30 @@ pub struct TaskInner {
     /// Its children (Linux children; their `sibling` links): the thread
     /// group leaders it created, one strong reference each, until reaped
     /// or reparented (under TASKLIST)
-    pub children: crate::util::list::ArcList<Sibling>,
+    children: crate::util::list::ArcList<Sibling>,
 
     /// On its real parent's `children` (a group leader; Linux: only
     /// leaders are)
-    pub in_children: bool,
+    in_children: bool,
 
     /// A leader's thread group, itself included (Linux
     /// signal->thread_head; links `thread_node`), one strong reference
     /// each, until a thread leaves the task list (under TASKLIST)
-    pub threads: crate::util::list::ArcList<ThreadNode>,
+    threads: crate::util::list::ArcList<ThreadNode>,
 
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
-    pub ptrace_message: u64,
+    ptrace_message: u64,
 
     /// Ptrace options (PTRACE_O_TRACESYSGOOD, etc.)
-    pub ptrace_options: u32,
+    ptrace_options: u32,
     /// A ptrace stop's code (Linux exit_code): the stop's signal until
     /// the tracer's wait reports it (then 0), then the signal the
     /// tracer's resume leaves to deliver (0: none)
-    pub ptrace_code: u32,
+    ptrace_code: u32,
     /// The siginfo of the stop it is in, which PTRACE_GETSIGINFO reads
     /// and PTRACE_SETSIGINFO replaces (Linux task->last_siginfo); none
     /// outside a ptrace stop
-    pub last_siginfo: Option<crate::signal::SigInfo>,
+    last_siginfo: Option<crate::signal::SigInfo>,
     /// Its tracer is inside a ptrace request on it (Linux
     /// JOBCTL_PTRACE_FROZEN): a SIGKILL leaves its ptrace stop alone
     /// until the request ends
@@ -1378,6 +1378,61 @@ impl TaskInner {
             self.state = TaskState::Ready;
             self.ptrace_code = 0;
         }
+    }
+
+    /// Its exit status, once a zombie
+    pub fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+
+    /// The signal its exit sends its parent
+    pub fn exit_signal(&self) -> crate::signal::ExitSignal {
+        self.exit_signal
+    }
+
+    /// Its parent's exec count when it was made
+    pub fn parent_exec_id(&self) -> u64 {
+        self.parent_exec_id
+    }
+
+    /// Its no_new_privs bit
+    pub fn no_new_privs(&self) -> bool {
+        self.prctl.no_new_privs
+    }
+
+    /// Set its no_new_privs bit (never cleared)
+    pub fn set_no_new_privs(&mut self) {
+        self.prctl.no_new_privs = true;
+    }
+
+    /// Its seccomp filter chain's head
+    pub fn seccomp_filter(&self) -> Option<&Arc<SeccompFilter>> {
+        self.seccomp_filter.as_ref()
+    }
+
+    /// Install seccomp filter chain head `f`
+    pub fn set_seccomp_filter(&mut self, f: Arc<SeccompFilter>) {
+        self.seccomp_filter = Some(f);
+    }
+
+    /// Detach its seccomp filter chain
+    pub fn take_seccomp_filter(&mut self) -> Option<Arc<SeccompFilter>> {
+        self.seccomp_filter.take()
+    }
+
+    /// Its SysV semaphore undo list
+    pub fn sysvsem(&self) -> Option<&Arc<SemUndoList>> {
+        self.sysvsem.as_ref()
+    }
+
+    /// Install SysV semaphore undo list `u`
+    pub fn set_sysvsem(&mut self, u: Arc<SemUndoList>) {
+        self.sysvsem = Some(u);
+    }
+
+    /// Detach its SysV semaphore undo list
+    pub fn take_sysvsem(&mut self) -> Option<Arc<SemUndoList>> {
+        self.sysvsem.take()
     }
 }
 
