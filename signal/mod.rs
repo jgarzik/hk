@@ -1944,19 +1944,30 @@ fn group_signal(
 /// A thread running user code dies on its next return to user mode (a
 /// tick or a kick IPI interrupts it: `entry::exit_to_user_mode`).
 fn zap_threads(tgid: Pid, except: Option<&Task>) {
-    let zapped: alloc::vec::Vec<TaskRef> = {
+    // Room made before the write lock (nothing allocates under
+    // TASKLIST), again if the group grew
+    let mut room = TASKLIST.read().threads(tgid).count();
+    let zapped = loop {
+        let mut zapped: alloc::vec::Vec<TaskRef> = alloc::vec::Vec::with_capacity(room);
         let mut table = TASKLIST.write();
-        let zapped: alloc::vec::Vec<TaskRef> = table
-            .threads(tgid)
-            .filter(|t| !except.is_some_and(|e| core::ptr::eq(t.task, e)) && task_live(t))
-            .map(|t| crate::task::percpu::task_ref(t.task))
-            .collect();
+        let n = table.threads(tgid).count();
+        if n > room {
+            drop(table);
+            room = n;
+            continue;
+        }
+        for t in table.threads(tgid) {
+            if !except.is_some_and(|e| core::ptr::eq(t.task, e)) && task_live(&t) {
+                zapped.push(crate::task::percpu::task_ref(t.task));
+            }
+        }
         for t in &zapped {
             if let Some(mut v) = table.view_mut(t) {
                 sigkill_task(&mut v);
             }
         }
-        zapped
+        drop(table);
+        break zapped;
     };
     for t in &zapped {
         signal_wake_up(t, crate::task::percpu::WakeMode::Fatal);

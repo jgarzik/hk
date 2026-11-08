@@ -109,12 +109,10 @@ fn tasks_of_user(who: u64) -> alloc::vec::Vec<TaskRef> {
     } else {
         who as super::Uid
     };
-    super::percpu::TASKLIST
-        .read()
-        .iter()
-        .filter(|t| !t.task.has_flag(super::pf::KTHREAD) && t.cred().uid == uid)
-        .map(|t| super::percpu::task_ref(t.task))
-        .collect()
+    super::percpu::GlobalTaskTable::collect_tasks(|_, t| {
+        (!t.task.has_flag(super::pf::KTHREAD) && t.cred().uid == uid)
+            .then(|| super::percpu::task_ref(t.task))
+    })
 }
 
 /// Set task `t`'s nice value (Linux set_one_prio): EPERM unless the

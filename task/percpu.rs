@@ -816,6 +816,24 @@ impl GlobalTaskTable {
         )
     }
 
+    /// What `f` picks of each thread of every process of group `pg`,
+    /// gathered as `collect_threads` does
+    pub fn collect_pgrp_threads<T>(
+        pg: &crate::task::pid::Pid,
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Vec<T> {
+        Self::collect(
+            |table, visit| {
+                for t in table.pgrp_threads(pg) {
+                    if !visit(&t) {
+                        break;
+                    }
+                }
+            },
+            f,
+        )
+    }
+
     /// What `f` picks of each thread of task `t`'s process, gathered as
     /// `collect_threads` does, nothing once `t` is no longer listed (its
     /// group is found from `t` under each read hold, never by a number
@@ -1893,20 +1911,36 @@ pub fn exec_waits(me: &Task) -> bool {
 /// after TASKLIST
 pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     let (tgid, tid) = (caller.pid, caller.tid());
-    let mut table = TASKLIST.write();
-    let Some(l) = table.find(|t| t.task.pid == tgid && t.leader) else {
-        return Vec::new();
+    // Room made before the write lock (nothing allocates under
+    // TASKLIST): each thread of the group may be both a removed zombie
+    // and a reference on the old thread list; again if the group grew
+    let mut room = TASKLIST.read().threads(tgid).count();
+    let (mut gone_tids, mut gone, mut table) = loop {
+        let gone_tids: Vec<Tid> = Vec::with_capacity(room);
+        let gone: Vec<TaskRef> = Vec::with_capacity(2 * room);
+        let table = TASKLIST.write();
+        let n = table.threads(tgid).count();
+        if n <= room {
+            break (gone_tids, gone, table);
+        }
+        drop(table);
+        room = n;
+    };
+    let Some(l) = table.get(tgid).filter(|l| l.leader) else {
+        drop(table);
+        return gone;
     };
     let ltid = l.task.tid();
     if ltid == tid {
-        return Vec::new();
+        drop(table);
+        return gone;
     }
     let (ppid, start, uid) = (l.task.ppid(), l.task.start_time(), l.cred().uid);
-    let gone: Vec<Tid> = table
-        .threads(tgid)
-        .filter(|t| t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)))
-        .map(|t| t.task.tid())
-        .collect();
+    for t in table.threads(tgid) {
+        if t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)) {
+            gone_tids.push(t.task.tid());
+        }
+    }
     // The thread group moves to the caller: it is the only live thread
     // (Linux de_thread leaves only the exec'ing thread); the old list's
     // references go after TASKLIST
@@ -1915,30 +1949,30 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
         let li = table.inner_mut_of(&l);
         core::mem::swap(&mut li.threads, &mut old_threads);
     }
-    let mut dead: Vec<TaskRef> = Vec::new();
     while let Some(t) = old_threads.pop_front() {
-        dead.push(t);
+        gone.push(t);
     }
     // Their numbers go back only once the caller holds the leader's
     // pid and heads its group and session (Linux de_thread:
     // exchange_tids and transfer_pid first, free_pid when no task uses
     // a pid in any role): the leader's pid may be the group's or the
     // session's, which a removed thread still names
-    let mut gone: Vec<TaskRef> = gone
-        .into_iter()
-        .filter_map(|t| table.remove_task(t, false))
-        .collect();
     let removed = gone.len();
-    gone.extend(dead);
+    for &t in &gone_tids {
+        if let Some(r) = table.remove_task(t, false) {
+            gone.push(r);
+        }
+    }
     let Some(me) = table.view(caller).map(|v| task_ref(v.task)) else {
-        for t in &gone[..removed] {
+        for t in &gone[removed..] {
             table.release_pids(t);
         }
+        drop(table);
         return gone;
     };
     // exchange_tids: the caller takes the leader's tid and pid (Linux
     // de_thread), the old leader (released here) its own
-    if let Some(l) = gone[..removed].iter().find(|t| t.tid() == ltid) {
+    if let Some(l) = gone[removed..].iter().find(|t| t.tid() == ltid) {
         let (mi, li) = me.inner().access_pair_mut(l.inner(), &mut *table);
         if let (Some(mi), Some(li)) = (mi.as_mut(), li.as_mut()) {
             // The old leader's CPU time stays the group's (Linux
@@ -1982,7 +2016,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     table.attach_pids(&me);
     // Then the removed threads' numbers no task uses go back: the
     // caller's old one, now the old leader's, and exited threads' own
-    for t in &gone[..removed] {
+    for t in &gone[removed..] {
         table.release_pids(t);
     }
     drop(table);
@@ -4433,8 +4467,7 @@ pub fn pgrp_tasks(pgid: Pid) -> alloc::vec::Vec<TaskRef> {
     let Some(pg) = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid) else {
         return alloc::vec::Vec::new();
     };
-    let table = TASKLIST.read();
-    table.pgrp_threads(&pg).map(|t| task_ref(t.task)).collect()
+    GlobalTaskTable::collect_pgrp_threads(&pg, |_, t| Some(task_ref(t.task)))
 }
 
 /// The processes of group `pgid`, by pid (their leaders on its list;
@@ -4484,8 +4517,7 @@ pub fn pgrp_members(pg: &crate::task::pid::Pid) -> alloc::vec::Vec<Pid> {
 /// Returns a sorted, deduplicated list of all process IDs.
 /// Used by kill(-1, sig) to signal all processes.
 pub fn get_all_pids() -> alloc::vec::Vec<Pid> {
-    let table = TASKLIST.read();
-    let mut pids: alloc::vec::Vec<Pid> = table.iter().map(|t| t.task.pid).collect();
+    let mut pids = GlobalTaskTable::collect_tasks(|_, t| Some(t.task.pid));
     pids.sort();
     pids.dedup();
     pids
