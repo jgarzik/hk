@@ -1276,14 +1276,16 @@ fn exe_link(pid: Pid) -> Result<Vec<u8>, KernelError> {
 /// /proc/<pid>/maps: one line per VMA (Linux show_map_vma)
 fn gen_maps(m: &crate::mm::Mm) -> Result<Vec<u8>, KernelError> {
     let g = m.mmap_read_killable()?;
-    Ok(maps_of(&g))
+    maps_of(&g)
 }
 
-/// /proc/<pid>/maps of `mm`, its mmap_lock held
-fn maps_of(mm: &crate::mm::MmStruct) -> Vec<u8> {
+/// /proc/<pid>/maps of `mm`, its mmap_lock held: each line is bounded
+/// (a name is at most PATH_MAX), the whole grows with the VMA count
+/// through a fallible buffer (ENOMEM)
+fn maps_of(mm: &crate::mm::MmStruct) -> Result<Vec<u8>, KernelError> {
     use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
     use alloc::fmt::Write;
-    let mut out = Vec::new();
+    let mut out = crate::util::kmem::KVec::new();
     let (start_brk, brk) = (mm.get_start_brk(), mm.get_brk());
     for v in mm.iter() {
         let bit = |b: bool, c: char| if b { c } else { '-' };
@@ -1331,10 +1333,10 @@ fn maps_of(mm: &crate::mm::MmStruct) -> Vec<u8> {
         while line.last() == Some(&b' ') {
             line.pop();
         }
-        out.extend_from_slice(&line);
-        out.push(b'\n');
+        line.push(b'\n');
+        out.try_extend_from_slice(&line)?;
     }
-    out
+    Ok(out.into_vec())
 }
 
 /// Get the cgroup path for a task (virtualized to its namespace)

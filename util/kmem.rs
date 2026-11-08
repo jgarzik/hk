@@ -161,8 +161,15 @@ impl<T: Clone> KVec<T> {
 }
 
 impl<T: Copy> KVec<T> {
+    /// Append `s`; when it does not fit, the capacity at least doubles
+    /// (capped as [`KVec::try_push`]), so a loop of appends copies O(n)
     pub fn try_extend_from_slice(&mut self, s: &[T]) -> Result<(), KernelError> {
-        self.try_reserve(s.len())?;
+        let len = self.0.len();
+        if self.0.capacity() - len < s.len() {
+            let max = MAX_KMALLOC / core::mem::size_of::<T>().max(1);
+            let want = len.saturating_add(s.len());
+            self.try_reserve(grow(len, max).max(want) - len)?;
+        }
         self.0.extend_from_slice(s);
         Ok(())
     }
