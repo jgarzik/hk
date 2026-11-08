@@ -16,7 +16,7 @@
 //! - Name-based registry (single path component; '/' in a name is EACCES)
 //! - Priority-ordered message delivery (0 to MQ_PRIO_MAX-1)
 //! - Blocking/non-blocking send and receive with timeouts
-//! - SIGEV_SIGNAL and SIGEV_THREAD_ID notifications
+//! - SIGEV_SIGNAL and SIGEV_NONE notifications
 //!
 //! ## References
 //!
@@ -162,8 +162,7 @@ struct MqNotify {
     owner: Arc<crate::task::pid::Pid>,
     /// The owner's exec generation when it registered
     exec_gen: u64,
-    sigev_notify: i32,
-    /// SIGEV_SIGNAL's signal (None for SIGEV_NONE)
+    /// SIGEV_SIGNAL's signal; None is SIGEV_NONE
     sig: Option<Signal>,
     sigev_value: u64,
 }
@@ -200,7 +199,11 @@ impl MqQueue {
         let qsize: usize = self.messages.lock().iter().map(|m| m.data.len()).sum();
         let (notify, signo, pid) = match self.notify.lock().as_ref() {
             Some(n) => (
-                n.sigev_notify,
+                if n.sig.is_some() {
+                    SIGEV_SIGNAL
+                } else {
+                    SIGEV_NONE
+                },
                 n.sig.map_or(0, Signal::nr),
                 // In the reader's namespace (Linux mqueue_read_file:
                 // pid_vnr)
@@ -380,7 +383,7 @@ impl MqQueue {
             // __do_notify sends without the kill permission check), and
             // only to the process that registered: not after it exited
             // or exec'd (Linux __do_notify: pid_task and self_exec_id;
-            // a released process has no task to send to); signal 0
+            // a released process has no task to send to); SIGEV_NONE
             // sends nothing
             let live = n.owner.exec_gen() == n.exec_gen;
             if let Some(sig) = n.sig.filter(|_| live) {
@@ -886,7 +889,6 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: UserPtr<SigEvent>) -> KernelResult<()
     *notify = Some(MqNotify {
         exec_gen: owner.exec_gen(),
         owner,
-        sigev_notify: sev.sigev_notify,
         sig,
         sigev_value: sev.sigev_value,
     });
