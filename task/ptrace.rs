@@ -1146,6 +1146,16 @@ pub fn may_read_proc(pid: crate::task::Pid) -> bool {
     may_access(|t| t.task.pid == pid, true)
 }
 
+/// [`may_read_proc`] for the pinned task `t` itself (Linux
+/// ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS) on the task
+/// get_pid_task returned): its own thread group always
+pub fn may_read_ref(t: &crate::task::Task) -> bool {
+    if t.pid == percpu::current_pid() {
+        return true;
+    }
+    may_access(|v| core::ptr::eq(v.task, t), true)
+}
+
 /// [`may_read_proc`] for task `tid` itself (tids are never reused): a
 /// caller that resolved a pid once checks the very task it then uses
 pub fn may_read_task(tid: Tid) -> bool {

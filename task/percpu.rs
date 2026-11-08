@@ -808,6 +808,29 @@ impl GlobalTaskTable {
         )
     }
 
+    /// What `f` picks of each thread of task `t`'s process, gathered as
+    /// `collect_threads` does, nothing once `t` is no longer listed (its
+    /// group is found from `t` under each read hold, never by a number
+    /// taken earlier)
+    pub fn collect_group<T>(
+        t: &Task,
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Vec<T> {
+        Self::collect(
+            |table, visit| {
+                if !table.get(t.tid()).is_some_and(|v| core::ptr::eq(v.task, t)) {
+                    return;
+                }
+                for x in table.threads(t.pid) {
+                    if !visit(&x) {
+                        break;
+                    }
+                }
+            },
+            f,
+        )
+    }
+
     /// What `f` picks of every task, gathered as `collect_threads` does
     pub fn collect_tasks<T>(f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>) -> Vec<T> {
         Self::collect(

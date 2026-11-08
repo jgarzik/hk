@@ -600,10 +600,9 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
         }
     }
 
-    // Get the TID for the target PID
-    let target_tid = match target_pid.tid() {
-        Some(tid) => tid,
-        None => return -ESRCH,
+    // The target task, pinned through its struct pid
+    let Some(target) = target_pid.task() else {
+        return -ESRCH;
     };
 
     // Linux ->install: CAP_SYS_ADMIN, and CAP_SYS_CHROOT for a mount
@@ -614,8 +613,8 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
         return -EPERM;
     }
 
-    // Get target task's namespace using TID
-    let target_ns = match get_task_ns(target_tid) {
+    // The target task's namespaces
+    let target_ns = match crate::fs::proc::task_nsproxy(&target) {
         Some(ns) => ns,
         None => return -ESRCH,
     };

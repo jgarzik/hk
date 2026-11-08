@@ -222,6 +222,17 @@ pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
     })
 }
 
+/// [`get_task_fs`] of the pinned task `t` (under its task_lock; a
+/// kernel thread's is [`KTHREAD_FS`])
+pub fn task_fs(t: &crate::task::Task) -> Option<Arc<FsStruct>> {
+    let fs = t.task_lock().fs().cloned();
+    fs.or_else(|| {
+        matches!(t.kind, crate::task::TaskKind::KernelThread)
+            .then(|| KTHREAD_FS.get().cloned())
+            .flatten()
+    })
+}
+
 /// Remove filesystem context when task exits
 ///
 /// This decrements the Arc refcount. If this was the last reference

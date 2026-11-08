@@ -2348,6 +2348,22 @@ pub enum GroupExit {
 pub struct ExecUpdateRead(Option<Arc<SignalStruct>>);
 
 impl ExecUpdateRead {
+    /// Take the pinned task `t`'s (none once it is reaped or for a task
+    /// without a SignalStruct)
+    pub fn lock_task(t: &crate::task::Task) -> Self {
+        let s = {
+            let table = crate::task::percpu::TASKLIST.read();
+            table
+                .get(t.tid())
+                .filter(|v| core::ptr::eq(v.task, t))
+                .and_then(|v| v.signal.clone())
+        };
+        if let Some(s) = &s {
+            s.exec_update.down_read();
+        }
+        Self(s)
+    }
+
     /// Take task `tid`'s (none for a task without a SignalStruct)
     pub fn lock(tid: Tid) -> Self {
         let s = get_task_signal_struct(tid);

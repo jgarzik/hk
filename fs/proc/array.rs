@@ -21,8 +21,8 @@ use crate::fs::KernelError;
 use crate::mm::{Mm, MmLayout, MmStruct, PROT_EXEC, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
 use crate::ns::PidNamespace;
 use crate::ns::pid::MAX_PID_NS_LEVEL;
-use crate::task::percpu::TASKLIST;
-use crate::task::{Cred, Pid, TaskKind, TaskState, Tid};
+use crate::task::percpu::{TASKLIST, TaskRef};
+use crate::task::{Cred, Pid, Task, TaskKind, TaskState, Tid};
 
 /// Linux PF_KTHREAD / PF_EXITING (stat field 9)
 const PF_EXITING: u64 = 0x0000_0004;
@@ -38,7 +38,6 @@ const LEVELS: usize = MAX_PID_NS_LEVEL as usize + 1;
 /// reading procfs's namespace numbers them (0 if not visible there)
 struct Snap {
     pid: Pid,
-    tid: Tid,
     tgid: Pid,
     ppid: Pid,
     pgid: Pid,
@@ -84,9 +83,11 @@ struct Snap {
 
 /// Copy task `pid` out of TASKLIST, its pids numbered in `ns` (Linux
 /// task_state, do_task_stat with proc_pid_ns)
-fn snap(pid: Pid, ns: &PidNamespace) -> Option<Snap> {
+fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     let table = TASKLIST.read();
-    let t = table.get(pid)?;
+    // Still listed: then its tid names it for this read hold
+    let t = super::listed(&table, task)?;
+    let pid = task.tid();
     let threads = table.threads(pid).count() as u64;
     let nr = |p: Option<&Arc<crate::task::pid::Pid>>, n: &PidNamespace| p.map_or(0, |p| p.nr_ns(n));
     // A listed task's process (by its root number) in `ns`
@@ -127,7 +128,6 @@ fn snap(pid: Pid, ns: &PidNamespace) -> Option<Snap> {
     let (utime, stime) = crate::task::percpu::group_times(&table, pid);
     Some(Snap {
         pid: u64::from(nr(me, ns)),
-        tid: t.task.tid(),
         tgid: u64::from(nr(leader, ns)),
         ppid: task_nr(t.task.ppid()),
         pgid: u64::from(nr(pg, ns)),
@@ -309,15 +309,15 @@ fn vm_stat(mm: &Mm, m: &MmStruct) -> VmStat {
 }
 
 /// The figures of task `tid`'s address space, if it has a live one
-fn task_vm(tid: Tid) -> Option<VmStat> {
-    let mm = crate::mm::get_task_mm_users(tid)?;
+fn task_vm(t: &Task) -> Option<VmStat> {
+    let mm = crate::mm::mmget_not_zero(&super::task_mm(t)?)?;
     let m = mm.mmap_read_killable().ok()?;
     Some(vm_stat(&mm, &m))
 }
 
 /// /proc/<pid>/status (Linux proc_pid_status), pids numbered in `ns`
-pub fn gen_status(pid: Pid, ns: &PidNamespace) -> Vec<u8> {
-    let Some(s) = snap(pid, ns) else {
+pub fn gen_status(t: &TaskRef, ns: &PidNamespace) -> Vec<u8> {
+    let Some(s) = snap(t, ns) else {
         return Vec::new();
     };
     let mut o = Out(Vec::new());
@@ -351,7 +351,7 @@ pub fn gen_status(pid: Pid, ns: &PidNamespace) -> Vec<u8> {
         let _ = writeln!(o);
     }
     let _ = writeln!(o, "Kthread:\t{}", u8::from(s.kthread));
-    if let Some(v) = task_vm(s.tid) {
+    if let Some(v) = task_vm(t) {
         status_mem(&mut o, &v);
     }
     status_sig(&mut o, &s);
@@ -433,15 +433,15 @@ fn status_sig(o: &mut Out, s: &Snap) {
 /// /proc/<pid>/stat (Linux do_task_stat, whole thread group): all 52
 /// fields; the address-space ones and exit_code only with ptrace-read
 /// access, as in Linux
-pub fn gen_stat(pid: Pid, ns: &PidNamespace) -> Vec<u8> {
-    let Some(s) = snap(pid, ns) else {
+pub fn gen_stat(t: &TaskRef, ns: &PidNamespace) -> Vec<u8> {
+    let Some(s) = snap(t, ns) else {
         return Vec::new();
     };
     // The access decision and the mm it covers, as one (Linux holds
     // exec_update_lock across do_task_stat)
-    let guard = crate::signal::ExecUpdateRead::lock(s.tid);
-    let permitted = crate::task::ptrace::may_read_task(s.tid);
-    let v = task_vm(s.tid);
+    let guard = crate::signal::ExecUpdateRead::lock_task(t);
+    let permitted = crate::task::ptrace::may_read_ref(t);
+    let v = task_vm(t);
     drop(guard);
     fmt_stat(&s, v.as_ref(), permitted, ign_cgt(&s), rss_lim(&s))
 }
@@ -537,11 +537,8 @@ fn read_remote(mm: &Mm, start: u64, end: u64) -> Vec<u8> {
 /// /proc/<pid>/cmdline (Linux get_mm_cmdline): the argument strings;
 /// if the program overwrote the final NUL of its arguments
 /// (setproctitle), the area through the environment up to the first NUL
-pub fn gen_cmdline(pid: Pid) -> Vec<u8> {
-    let Some(tid) = super::get_tid_for_pid(pid) else {
-        return Vec::new();
-    };
-    let Some(mm) = crate::mm::get_task_mm_users(tid) else {
+pub fn gen_cmdline(t: &TaskRef) -> Vec<u8> {
+    let Some(mm) = super::task_mm(t).and_then(|m| crate::mm::mmget_not_zero(&m)) else {
         return Vec::new();
     };
     let a = match mm.mmap_read_killable() {
@@ -589,7 +586,6 @@ mod tests {
         c[..comm.len()].copy_from_slice(comm);
         core::mem::ManuallyDrop::new(Snap {
             pid: 42,
-            tid: 42,
             tgid: 42,
             ppid: 1,
             pgid: 40,

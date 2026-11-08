@@ -1946,9 +1946,13 @@ A procfs superblock's pid namespace (`ProcOpts.pid_ns`, Linux
 proc_fs_info.pid_ns: the mounter's) is fixed at mount and read with no
 lock; inode data holds the task's `Pid` (`ProcPid`, an `Arc`, Linux
 proc_inode->pid; its last reference may go wherever the inode does,
-PIDMAP_LOCK being a leaf), copied out of the inode data and turned
-into the task's tid under TASKLIST's read lock at each access, never
-under the inode data's lock; lookup, readdir and the per-task files
+PIDMAP_LOCK being a leaf), copied out of the inode data and, once per
+access, turned into a reference to the task (`Pid.task` under
+TASKLIST's read lock, never under the inode data's lock: Linux
+get_pid_task) that every helper then works on, never its number (a
+helper needing the task's locked fields finds it again under TASKLIST
+only if it is still that task, `listed`; its resources under its
+alloc_lock); lookup, readdir and the per-task files
 translate through the pid helpers (3.1.1 Pid namespaces): the hash,
 then TASKLIST's read lock to reach the task
 (readdir and /proc/<pid>/task gather under it with no allocation,

@@ -22,8 +22,9 @@
 //! numbers there, and the pids inside its files are numbered there.
 //! Inode data holds the task's struct pid (`ProcPid`, Linux
 //! proc_inode->pid), found from the mount's number at lookup; each
-//! access looks the task up through it, so a reused number never
-//! reaches another task, and a reaped one's files read ESRCH.
+//! access pins the task through it once (Linux get_pid_task) and works
+//! on that task, never on its number, so a reused number never reaches
+//! another task, and a reaped one's files read ESRCH.
 
 mod array;
 mod mounts;
@@ -46,7 +47,7 @@ use crate::io::poll::{DEFAULT_POLLMASK, POLLIN, POLLRDNORM, PollTable};
 use crate::ns::PidNamespace;
 use crate::task::Cred;
 use crate::task::Pid;
-use crate::task::percpu::find_task_by_pid_ns;
+use crate::task::percpu::{TaskRef, find_task_by_pid_ns};
 use crate::util::kalloc::try_arc;
 
 /// Get current timestamp for new inodes
@@ -56,28 +57,32 @@ fn current_time() -> Timespec {
     TIMEKEEPER.current_time()
 }
 
-/// The task root number `pid` names (a tid resolved from an inode's
-/// `ProcPid` for this access)
-fn find_task(pid: Pid) -> Option<crate::task::percpu::TaskRef> {
-    crate::task::percpu::find_task_by_pid_ns(pid, &crate::ns::INIT_PID_NS)
+/// `t` as the locked table lists it, if it still is (a tid names it
+/// only while it is listed)
+fn listed<'a>(
+    table: &'a crate::task::percpu::GlobalTaskTable,
+    t: &crate::task::Task,
+) -> Option<crate::task::percpu::TaskView<'a>> {
+    table.get(t.tid()).filter(|v| core::ptr::eq(v.task, t))
 }
 
-/// Check if a task with the given PID exists
-fn task_exists(pid: Pid) -> bool {
-    find_task(pid).is_some()
+/// `t` is still in the task list (not reaped)
+fn alive(t: &crate::task::Task) -> bool {
+    listed(&crate::task::percpu::TASKLIST.read(), t).is_some()
 }
 
-/// Public version of task_exists for use by setns
-pub fn task_exists_pub(pid: Pid) -> bool {
-    task_exists(pid)
+/// Task `t`'s descriptor table, fs struct, namespaces and address space
+/// (Linux get_files_struct, get_task_fs..., under task_lock)
+fn task_files(t: &crate::task::Task) -> Option<Arc<crate::task::fdtable::Files>> {
+    t.task_lock().files().cloned()
 }
 
-/// Get the TID for a task with the given PID
-///
-/// Looks up the PID in the global task table and returns the TID.
-/// Returns None if no task with the given PID exists.
-pub fn get_tid_for_pid(pid: Pid) -> Option<crate::task::Tid> {
-    find_task(pid).map(|t| t.tid())
+pub(crate) fn task_nsproxy(t: &crate::task::Task) -> Option<Arc<crate::ns::NsProxy>> {
+    t.task_lock().nsproxy().cloned()
+}
+
+pub(super) fn task_mm(t: &crate::task::Task) -> Option<Arc<crate::mm::Mm>> {
+    t.task_lock().mm().map(|m| m.arc().clone())
 }
 
 /// The task a /proc inode belongs to, by its struct pid (Linux
@@ -87,10 +92,11 @@ pub fn get_tid_for_pid(pid: Pid) -> Option<crate::task::Tid> {
 pub struct ProcPid(Arc<crate::task::pid::Pid>);
 
 impl ProcPid {
-    /// The task's tid (its root number) while the pid names one (Linux
-    /// get_pid_task), None once it is reaped; TASKLIST read only to look
-    pub fn tid(&self) -> Option<crate::task::Tid> {
-        crate::task::percpu::TASKLIST.read().pid_tid(&self.0)
+    /// The task, pinned, while the pid names one (Linux get_pid_task),
+    /// None once it is reaped; TASKLIST read only to take the reference.
+    /// Every per-process path works on this task, never on its number.
+    pub fn task(&self) -> Option<TaskRef> {
+        crate::task::percpu::TASKLIST.read().pid_task_ref(&self.0)
     }
 
     /// Its root number, for inode numbers (fixed)
@@ -417,10 +423,10 @@ impl InodeOps for ProcfsInodeOps {
             _ => return Err(KernelError::InvalidArgument),
         };
         match l {
-            Link::Pid(pid, target) => target(pid.tid().ok_or(KernelError::NotFound)?),
+            Link::Pid(pid, target) => target(&pid.task().ok_or(KernelError::NotFound)?),
             Link::Me => self_link(inode),
             Link::Fixed(t) => Ok(t.to_vec()),
-            Link::Fd(pid, fd) => fd_link(pid.tid().ok_or(KernelError::NotFound)?, fd),
+            Link::Fd(pid, fd) => fd_link(&pid.task().ok_or(KernelError::NotFound)?, fd),
         }
     }
 
@@ -432,7 +438,7 @@ impl InodeOps for ProcfsInodeOps {
     /// cached), consistent with readdir
     fn getattr_ok(&self, inode: &Inode) -> Result<(), KernelError> {
         match pid_dir_pid(inode) {
-            Some(pid) if !opts::with(inode, |o| o.visible(pid)).unwrap_or(true) => {
+            Some(t) if !opts::with(inode, |o| o.visible(&t)).unwrap_or(true) => {
                 Err(KernelError::NotFound)
             }
             _ => Ok(()),
@@ -441,19 +447,19 @@ impl InodeOps for ProcfsInodeOps {
 
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
         // A process directory hidepid= hides (Linux proc_pid_permission)
-        if let Some(pid) = pid_dir_pid(inode) {
-            opts::with(inode, |o| o.pid_permission(pid)).unwrap_or(Ok(()))?;
+        if let Some(t) = pid_dir_pid(inode) {
+            opts::with(inode, |o| o.pid_permission(&t)).unwrap_or(Ok(()))?;
         }
         // fd/ and fdinfo/: ptrace-read access (Linux proc_fd_permission)
-        if let Some(OpenCheck::Fds(pid)) = open_check(inode)
-            && !crate::task::ptrace::may_read_proc(pid)
+        if let Some(OpenCheck::Fds(t)) = open_check(inode)
+            && !crate::task::ptrace::may_read_ref(&t)
         {
             return Err(KernelError::PermissionDenied);
         }
         // The owner follows the task's identity and dumpability (Linux
         // pid_revalidate -> pid_update_inode)
-        if let Some(pid) = pid_file_pid(inode) {
-            let (uid, gid) = dump_owner(pid);
+        if let Some(t) = pid_file_pid(inode) {
+            let (uid, gid) = dump_owner(&t);
             inode.set_uid(uid);
             inode.set_gid(gid);
         }
@@ -491,18 +497,16 @@ impl InodeOps for ProcfsInodeOps {
             _ => None,
         };
         drop(data);
-        let Some(pid) = p.tid() else {
+        let Some(t) = p.task() else {
             return false;
         };
         if let Some(fd) = fd {
-            let open = get_tid_for_pid(pid)
-                .and_then(crate::task::fdtable::get_task_fd)
-                .is_some_and(|t| t.lock().get(fd).is_some());
+            let open = task_files(&t).is_some_and(|f| f.lock().get(fd).is_some());
             if !open {
                 return false;
             }
         }
-        let (uid, gid) = dump_owner(pid);
+        let (uid, gid) = dump_owner(&t);
         inode.set_uid(uid);
         inode.set_gid(gid);
         true
@@ -572,8 +576,8 @@ impl InodeOps for ProcfsInodeOps {
                         .ok()
                         .and_then(|nr| crate::task::pid::find_pid(&opts::pid_ns(dir), nr))
                         .map(ProcPid)
-                        && let Some(tid) = p.tid()
-                        && opts::with(dir, |o| o.visible(tid)).unwrap_or(true)
+                        && let Some(t) = p.task()
+                        && opts::with(dir, |o| o.visible(&t)).unwrap_or(true)
                     {
                         return create_pid_dir_inode(dir, p);
                     }
@@ -587,14 +591,21 @@ impl InodeOps for ProcfsInodeOps {
             Dir::Task(p) => {
                 // A thread of the process by its number in the mount's
                 // namespace (Linux proc_task_lookup)
-                let pid = p.tid().ok_or(KernelError::NotFound)?;
+                let t = p.task().ok_or(KernelError::NotFound)?;
                 let nr: u64 = name.parse().map_err(|_| KernelError::NotFound)?;
                 let ns = opts::pid_ns(dir);
-                let tid = find_task_by_pid_ns(nr, &ns)
-                    .map(|t| t.tid())
-                    .filter(|&tid| group_threads(pid, &ns).iter().any(|&(t, _)| t == tid))
-                    .ok_or(KernelError::NotFound)?;
-                create_dir_inode(dir, pid_ino(tid, 0), ProcfsInodeData::new_pid_dir(p))
+                let thread = find_task_by_pid_ns(nr, &ns).ok_or(KernelError::NotFound)?;
+                let mine = group_threads(&t, &ns)
+                    .iter()
+                    .any(|&(x, _, _)| core::ptr::eq(x, Arc::as_ptr(&thread)));
+                if !mine {
+                    return Err(KernelError::NotFound);
+                }
+                create_dir_inode(
+                    dir,
+                    pid_ino(thread.tid(), 0),
+                    ProcfsInodeData::new_pid_dir(p),
+                )
             }
             Dir::Fdinfo(p) => lookup_pid_fdinfo_entry(dir, &p, name),
         }
@@ -605,15 +616,18 @@ impl InodeOps for ProcfsInodeOps {
 // Per-PID Inode Creation Helpers
 // ============================================================================
 
-/// The live threads of process `pid` visible in `ns`: their tids and
-/// their numbers in `ns`
-fn group_threads(pid: Pid, ns: &PidNamespace) -> Vec<(crate::task::Tid, u32)> {
-    crate::task::percpu::GlobalTaskTable::collect_threads(pid, |_, t| {
-        if matches!(t.state, crate::task::TaskState::Zombie(_)) {
+/// The live threads of task `t`'s process visible in `ns`: each one
+/// (its address, only to compare), its tid and its number in `ns`
+fn group_threads(
+    t: &crate::task::Task,
+    ns: &PidNamespace,
+) -> Vec<(*const crate::task::Task, crate::task::Tid, u32)> {
+    crate::task::percpu::GlobalTaskTable::collect_group(t, |_, x| {
+        if matches!(x.state, crate::task::TaskState::Zombie(_)) {
             return None;
         }
-        let nr = t.thread_pid.as_ref()?.nr_in(ns)?;
-        Some((t.task.tid(), nr))
+        let nr = x.thread_pid.as_ref()?.nr_in(ns)?;
+        Some((core::ptr::from_ref(x.task), x.task.tid(), nr))
     })
 }
 
@@ -658,8 +672,9 @@ fn create_pid_dir_inode(parent: &Inode, pid: ProcPid) -> Result<Arc<Inode>, Kern
 
 /// Look up entries in /proc/<pid>/
 fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, KernelError> {
-    // The task, while its pid names one
-    let pid = p.tid().ok_or(KernelError::NotFound)?;
+    // The task, while its pid names one; its tid only numbers inodes
+    let t = p.task().ok_or(KernelError::NotFound)?;
+    let pid = t.tid();
 
     match name {
         "ns" => {
@@ -747,7 +762,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
         }
         "fail-nth" => {
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let (uid, gid) = dump_owner(pid);
+            let (uid, gid) = dump_owner(&t);
             let inode = try_arc(Inode::new(
                 pid_ino(pid, FAIL_NTH_INO),
                 InodeMode::regular(0o644),
@@ -766,7 +781,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
         name if pid_file(name).is_some() => {
             let (off, mode, generator) = pid_file(name).ok_or(KernelError::NotFound)?;
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let (uid, gid) = dump_owner(pid);
+            let (uid, gid) = dump_owner(&t);
             let inode = try_arc(Inode::new(
                 pid_ino(pid, off),
                 InodeMode::regular(mode),
@@ -788,8 +803,9 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
 
 /// Look up entries in /proc/<pid>/ns/
 fn lookup_pid_ns_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, KernelError> {
-    // The task, while its pid names one
-    let pid = p.tid().ok_or(KernelError::NotFound)?;
+    // The task, while its pid names one; its tid only numbers inodes
+    let t = p.task().ok_or(KernelError::NotFound)?;
+    let pid = t.tid();
 
     // Parse namespace type from name
     let ns_type = NamespaceType::parse(name).ok_or(KernelError::NotFound)?;
@@ -854,9 +870,8 @@ fn create_self_link(parent: &Inode) -> Result<Arc<Inode>, KernelError> {
 /// Target of /proc/<pid>/fd/<fd>: `socket:[ino]` / `pipe:[ino]` for
 /// sockets and pipes, `anon_inode:<name>` for other files without a
 /// filesystem, else the path
-fn fd_link(pid: Pid, fd: i32) -> Result<Vec<u8>, KernelError> {
-    let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
-    let table = crate::task::fdtable::get_task_fd(tid).ok_or(KernelError::NotFound)?;
+fn fd_link(t: &TaskRef, fd: i32) -> Result<Vec<u8>, KernelError> {
+    let table = task_files(t).ok_or(KernelError::NotFound)?;
     let file = table.lock().get(fd).ok_or(KernelError::NotFound)?;
     let inode = file.get_inode().ok_or(KernelError::NotFound)?;
     let mode = inode.mode();
@@ -877,8 +892,9 @@ fn fd_link(pid: Pid, fd: i32) -> Result<Vec<u8>, KernelError> {
 
 /// Look up entries in /proc/<pid>/fd/
 fn lookup_pid_fd_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, KernelError> {
-    // The task, while its pid names one
-    let pid = p.tid().ok_or(KernelError::NotFound)?;
+    // The task, while its pid names one; its tid only numbers inodes
+    let t = p.task().ok_or(KernelError::NotFound)?;
+    let pid = t.tid();
 
     // Parse fd number from name
     let fd: i32 = name.parse().map_err(|_| KernelError::NotFound)?;
@@ -887,15 +903,7 @@ fn lookup_pid_fd_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode
     }
 
     // Verify the FD exists for this task
-    let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
-    let fd_exists = {
-        if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
-            let table = table_arc.lock();
-            table.get(fd).is_some()
-        } else {
-            false
-        }
-    };
+    let fd_exists = task_files(&t).is_some_and(|f| f.lock().get(fd).is_some());
     if !fd_exists {
         return Err(KernelError::NotFound);
     }
@@ -924,8 +932,9 @@ fn lookup_pid_fdinfo_entry(
     p: &ProcPid,
     name: &str,
 ) -> Result<Arc<Inode>, KernelError> {
-    // The task, while its pid names one
-    let pid = p.tid().ok_or(KernelError::NotFound)?;
+    // The task, while its pid names one; its tid only numbers inodes
+    let t = p.task().ok_or(KernelError::NotFound)?;
+    let pid = t.tid();
 
     // Parse fd number from name
     let fd: i32 = name.parse().map_err(|_| KernelError::NotFound)?;
@@ -934,15 +943,7 @@ fn lookup_pid_fdinfo_entry(
     }
 
     // Verify the FD exists for this task
-    let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
-    let fd_exists = {
-        if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
-            let table = table_arc.lock();
-            table.get(fd).is_some()
-        } else {
-            false
-        }
-    };
+    let fd_exists = task_files(&t).is_some_and(|f| f.lock().get(fd).is_some());
     if !fd_exists {
         return Err(KernelError::NotFound);
     }
@@ -968,12 +969,9 @@ fn lookup_pid_fdinfo_entry(
 /// /proc/<pid>/fdinfo/<n> (Linux seq_show): position, open flags
 /// (O_CLOEXEC added for a close-on-exec descriptor) in octal with a
 /// leading 0, the mount id, the inode number; then the file's own lines
-fn gen_fdinfo_content(pid: Pid, fd: i32) -> Vec<u8> {
+fn gen_fdinfo_content(t: &TaskRef, fd: i32) -> Vec<u8> {
     use alloc::fmt::Write;
-    let Some(tid) = get_tid_for_pid(pid) else {
-        return Vec::new();
-    };
-    let Some(table) = crate::task::fdtable::get_task_fd(tid) else {
+    let Some(table) = task_files(t) else {
         return Vec::new();
     };
     let (file, cloexec) = {
@@ -1008,13 +1006,13 @@ fn gen_fdinfo_content(pid: Pid, fd: i32) -> Vec<u8> {
 ///
 /// Returns a string identifying the namespace, similar to Linux's
 /// "ns:[inode]" format but simplified.
-fn gen_namespace_content(pid: Pid, ns_type: NamespaceType) -> Vec<u8> {
+fn gen_namespace_content(t: &TaskRef, ns_type: NamespaceType) -> Vec<u8> {
     use alloc::fmt::Write;
     let mut output = String::new();
 
     // Format: <type>:[<pid>]
     // This identifies which namespace instance the task is in
-    let _ = writeln!(output, "{}:[{}]", ns_type.as_str(), pid);
+    let _ = writeln!(output, "{}:[{}]", ns_type.as_str(), t.pid);
     Vec::from(output.as_bytes())
 }
 
@@ -1023,12 +1021,12 @@ fn gen_namespace_content(pid: Pid, ns_type: NamespaceType) -> Vec<u8> {
 /// Returns the cgroup membership for the process.
 /// For cgroup v2, this is a single line: "0::<path>\n"
 /// The path is relative to the task's cgroup namespace root.
-fn gen_cgroup_content(pid: Pid) -> Vec<u8> {
+fn gen_cgroup_content(t: &TaskRef) -> Vec<u8> {
     use alloc::fmt::Write;
     let mut output = String::new();
 
     // Get the task's cgroup path (namespace-virtualized)
-    let cgroup_path = get_task_cgroup_path(pid);
+    let cgroup_path = get_task_cgroup_path(t);
 
     // cgroup v2 format: "0::<path>"
     // The "0" indicates the unified hierarchy (cgroup v2)
@@ -1041,10 +1039,10 @@ fn gen_cgroup_content(pid: Pid) -> Vec<u8> {
 /// Generated files in /proc/<pid>/: name, inode offset, generator
 /// Access checks a procfs file needs at open
 enum OpenCheck {
-    /// Address-space file of `pid`: pin its mm
-    Mm(Pid),
-    /// fd/ or fdinfo/ of `pid`
-    Fds(Pid),
+    /// Address-space file of the task: pin its mm
+    Mm(TaskRef),
+    /// fd/ or fdinfo/ of the task
+    Fds(TaskRef),
 }
 
 /// The open-time check of `inode`, if any
@@ -1065,11 +1063,11 @@ fn open_check(inode: &Inode) -> Option<OpenCheck> {
         }
         _ => return None,
     };
-    let pid = p.tid()?;
+    let t = p.task()?;
     Some(if mm {
-        OpenCheck::Mm(pid)
+        OpenCheck::Mm(t)
     } else {
-        OpenCheck::Fds(pid)
+        OpenCheck::Fds(t)
     })
 }
 
@@ -1077,13 +1075,13 @@ fn open_check(inode: &Inode) -> Option<OpenCheck> {
 #[derive(Clone, Copy)]
 pub enum PidGen {
     /// World-readable content of the process
-    Pub(fn(Pid) -> Vec<u8>),
+    Pub(fn(&TaskRef) -> Vec<u8>),
     /// World-readable content with pids in it, numbered in the mount's
     /// pid namespace (Linux proc_pid_ns(inode->i_sb))
-    Ns(fn(Pid, &PidNamespace) -> Vec<u8>),
+    Ns(fn(&TaskRef, &PidNamespace) -> Vec<u8>),
     /// A mount table of the process (mounts, mountinfo): as `Pub`, and
     /// pollable (Linux mounts_poll)
-    Mnt(fn(Pid) -> Vec<u8>),
+    Mnt(fn(&TaskRef) -> Vec<u8>),
     /// Private content of the address space: open needs ptrace-read
     /// access and pins the mm it reads from (Linux proc_mem_open: an
     /// mm_count reference)
@@ -1097,19 +1095,15 @@ pub enum PidGen {
 /// exec holds for writing while it installs the new mm and
 /// dumpability, so the result is never an mm the check did not cover
 /// (Linux mm_access)
-fn mm_access(pid: Pid) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
-    let Some(tid) = get_tid_for_pid(pid) else {
-        return Ok(None);
-    };
+fn mm_access(t: &TaskRef) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
     // The check and the mm it covers under the process's
-    // exec_update_lock: no exec of it switches mm or dumpability between
-    // exec_update_lock; check and mm both of that one task, so a pid
-    // reused meanwhile cannot split them
-    let _g = crate::signal::ExecUpdateRead::lock(tid);
-    if !crate::task::ptrace::may_read_task(tid) {
+    // exec_update_lock: no exec of it switches mm or dumpability between;
+    // check and mm both of that one pinned task
+    let _g = crate::signal::ExecUpdateRead::lock_task(t);
+    if !crate::task::ptrace::may_read_ref(t) {
         return Err(KernelError::PermissionDenied);
     }
-    Ok(crate::mm::get_task_mm(tid))
+    Ok(task_mm(t))
 }
 
 /// An open /proc file (Linux seq_file and the proc private data): the
@@ -1134,25 +1128,25 @@ fn proc_open(file: &File) -> Option<Arc<ProcOpen>> {
 
 /// Content of a per-process file for this open file (or, with none,
 /// checked afresh)
-fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, KernelError> {
+fn pid_content(file: Option<&File>, t: &TaskRef, g: PidGen) -> Result<Vec<u8>, KernelError> {
     match g {
-        PidGen::Pub(f) | PidGen::Mnt(f) => Ok(f(pid)),
+        PidGen::Pub(f) | PidGen::Mnt(f) => Ok(f(t)),
         PidGen::Ns(f) => {
             let ns = file
                 .and_then(File::get_inode)
                 .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |i| opts::pid_ns(&i));
-            Ok(f(pid, &ns))
+            Ok(f(t, &ns))
         }
         PidGen::Mm(f) => {
             let mm = match file.and_then(proc_open) {
                 Some(p) => p.mm.clone(),
-                None => mm_access(pid)?,
+                None => mm_access(t)?,
             };
             // The open file pins only the struct (mm_count); a read uses
             // the address space only while it still has users, else it
             // reads as empty; once the task is reaped it is ESRCH (Linux
             // m_start: get_proc_task, mmget_not_zero)
-            if get_tid_for_pid(pid).is_none() {
+            if !alive(t) {
                 return Err(KernelError::NoProcess);
             }
             let users = mm.as_ref().and_then(crate::mm::mmget_not_zero);
@@ -1227,7 +1221,7 @@ fn fail_nth_of(inode: &Inode) -> Option<ProcPid> {
 
 /// Set task `pid`'s countdown from a decimal (or 0x/0 prefixed) number
 /// (Linux proc_fail_nth_write: kstrtouint, any task the file names)
-fn write_fail_nth(pid: Pid, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+fn write_fail_nth(t: &TaskRef, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
     let mut buf = [0u8; 24];
     let len = from.len();
     if len > buf.len() {
@@ -1241,27 +1235,17 @@ fn write_fail_nth(pid: Pid, from: &mut IovSource<'_>) -> Result<usize, KernelErr
         None => text.parse::<u32>(),
     }
     .map_err(|_| KernelError::InvalidArgument)?;
-    fail_nth_task(pid)?
-        .fail_nth
-        .store(n, core::sync::atomic::Ordering::Relaxed);
+    t.fail_nth.store(n, core::sync::atomic::Ordering::Relaxed);
     Ok(len)
 }
 
 /// Inode offset of /proc/<pid>/fail-nth
 const FAIL_NTH_INO: u64 = 113;
 
-/// Task `pid`, for its fault-injection countdown
-fn fail_nth_task(pid: Pid) -> Result<crate::task::percpu::TaskRef, KernelError> {
-    crate::task::percpu::TASKLIST
-        .read()
-        .task(pid)
-        .ok_or(KernelError::NoProcess)
-}
-
 /// Per-process symlinks: name, inode offset, target (Linux
 /// proc_exe_link, proc_cwd_link, proc_root_link)
 /// The target of a per-process symlink
-type LinkFn = fn(Pid) -> Result<Vec<u8>, KernelError>;
+type LinkFn = fn(&TaskRef) -> Result<Vec<u8>, KernelError>;
 
 const PID_LINKS: &[(&str, u64, LinkFn)] = &[
     ("exe", 104, exe_link),
@@ -1279,11 +1263,10 @@ fn pid_file(name: &str) -> Option<(u64, u16, PidGen)> {
 /// Owner of a /proc/<pid>/ file (Linux task_dump_owner): the task's
 /// euid/egid while it is dumpable, else root, so a non-dumpable task's
 /// mode-0400 files are root's
-fn dump_owner(pid: Pid) -> (u32, u32) {
+fn dump_owner(task: &TaskRef) -> (u32, u32) {
     use crate::task::percpu::TASKLIST;
     let table = TASKLIST.read();
-    table
-        .get(pid)
+    listed(&table, task)
         .filter(|t| {
             t.task
                 .task_lock()
@@ -1294,7 +1277,7 @@ fn dump_owner(pid: Pid) -> (u32, u32) {
 }
 
 /// The process a per-process file belongs to
-fn pid_file_pid(inode: &Inode) -> Option<Pid> {
+fn pid_file_pid(inode: &Inode) -> Option<TaskRef> {
     let private = inode.get_private()?;
     let wrapper = private
         .as_ref()
@@ -1304,38 +1287,37 @@ fn pid_file_pid(inode: &Inode) -> Option<Pid> {
         ProcfsInodeData::PidFile { pid, .. } => pid.clone(),
         _ => return None,
     };
-    p.tid()
+    p.task()
 }
 
 /// /proc/<pid>/cwd and root: the task's fs pwd or root as the reader
 /// names it, EACCES without ptrace-read access (Linux
 /// proc_fd_access_allowed), ENOENT for a task without one
-fn fs_link(pid: Pid, root: bool) -> Result<Vec<u8>, KernelError> {
-    let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
-    if !crate::task::ptrace::may_read_task(tid) {
+fn fs_link(t: &TaskRef, root: bool) -> Result<Vec<u8>, KernelError> {
+    if !crate::task::ptrace::may_read_ref(t) {
         return Err(KernelError::PermissionDenied);
     }
-    let fs = crate::fs::get_task_fs(tid).ok_or(KernelError::NotFound)?;
+    let fs = crate::fs::task_fs(t).ok_or(KernelError::NotFound)?;
     let p = if root { fs.get_root() } else { fs.get_pwd() };
     super::dentry::d_path_link(&p)
 }
 
-fn cwd_link(pid: Pid) -> Result<Vec<u8>, KernelError> {
-    fs_link(pid, false)
+fn cwd_link(t: &TaskRef) -> Result<Vec<u8>, KernelError> {
+    fs_link(t, false)
 }
 
-fn root_link(pid: Pid) -> Result<Vec<u8>, KernelError> {
-    fs_link(pid, true)
+fn root_link(t: &TaskRef) -> Result<Vec<u8>, KernelError> {
+    fs_link(t, true)
 }
 
 /// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads,
 /// EACCES without ptrace-read access, Linux proc_fd_access_allowed)
-fn exe_link(pid: Pid) -> Result<Vec<u8>, KernelError> {
+fn exe_link(t: &TaskRef) -> Result<Vec<u8>, KernelError> {
     // Through mm_access, so the check and the image it reveals are one
     // (exec_update_lock read). An exec resolving /proc/self/exe (busybox
     // re-execs itself) holds only cred_guard while it walks paths: it
     // takes exec_update for writing later, in exec_replace_image
-    let mm = mm_access(pid)?.ok_or(KernelError::NotFound)?;
+    let mm = mm_access(t)?.ok_or(KernelError::NotFound)?;
     let exe = mm
         .mmap_read_killable()?
         .exe()
@@ -1410,26 +1392,11 @@ fn maps_of(mm: &crate::mm::MmStruct) -> Result<Vec<u8>, KernelError> {
 }
 
 /// Get the cgroup path for a task (virtualized to its namespace)
-fn get_task_cgroup_path(pid: Pid) -> String {
+fn get_task_cgroup_path(t: &TaskRef) -> String {
     use crate::ns::INIT_CGROUP_NS;
-    use crate::task::percpu::TASKLIST;
-
-    // Get the task's TID to look up its cgroup namespace
-    let tid = match get_tid_for_pid(pid) {
-        Some(t) => t,
-        None => return String::from("/"),
-    };
 
     // Get the task's cgroup
-    let task_cgroup = {
-        let table = TASKLIST.read();
-        if let Some(task) = table.get(tid) {
-            // Try to get from TASK_CGROUP mapping
-            task.task.cgroup.lock().clone()
-        } else {
-            None
-        }
-    };
+    let task_cgroup = t.cgroup.lock().clone();
 
     let cgroup = match task_cgroup {
         Some(cg) => cg,
@@ -1440,8 +1407,8 @@ fn get_task_cgroup_path(pid: Pid) -> String {
     };
 
     // Get the task's cgroup namespace
-    let cgroup_ns = crate::ns::get_task_ns(tid)
-        .map_or_else(|| INIT_CGROUP_NS.clone(), |ns| ns.cgroup_ns.clone());
+    let cgroup_ns =
+        task_nsproxy(t).map_or_else(|| INIT_CGROUP_NS.clone(), |ns| ns.cgroup_ns.clone());
 
     // Translate the cgroup path relative to the namespace root
     cgroup_ns.translate_path(&cgroup)
@@ -1490,15 +1457,15 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
     };
     // A per-process file of a reaped task reads ESRCH (Linux
     // proc_single_show: get_pid_task fails)
-    let alive = |p: &ProcPid| p.tid().ok_or(KernelError::NoProcess);
+    let task = |p: &ProcPid| p.task().ok_or(KernelError::NoProcess);
     Ok(match g {
-        Gen::Pid(p, g) => return pid_content(Some(file), alive(&p)?, g),
+        Gen::Pid(p, g) => return pid_content(Some(file), &task(&p)?, g),
         Gen::File(generator) => generator(),
-        Gen::Ns(p, ns_type) => gen_namespace_content(alive(&p)?, ns_type),
-        Gen::Fdinfo(p, fd) => gen_fdinfo_content(alive(&p)?, fd),
+        Gen::Ns(p, ns_type) => gen_namespace_content(&task(&p)?, ns_type),
+        Gen::Fdinfo(p, fd) => gen_fdinfo_content(&task(&p)?, fd),
         Gen::Sysctl(ctl) => crate::sysctl::read(ctl),
         Gen::FailNth(p) => {
-            let n = fail_nth_task(alive(&p)?)?
+            let n = task(&p)?
                 .fail_nth
                 .load(core::sync::atomic::Ordering::Relaxed);
             alloc::format!("{n}\n").into_bytes()
@@ -1556,8 +1523,8 @@ impl FileOps for ProcfsFileOps {
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let mm = match open_check(&inode) {
-            Some(OpenCheck::Mm(pid)) => mm_access(pid)?,
-            Some(OpenCheck::Fds(pid)) if !crate::task::ptrace::may_read_proc(pid) => {
+            Some(OpenCheck::Mm(t)) => mm_access(&t)?,
+            Some(OpenCheck::Fds(t)) if !crate::task::ptrace::may_read_ref(&t) => {
                 return Err(KernelError::PermissionDenied);
             }
             _ => None,
@@ -1624,7 +1591,7 @@ impl FileOps for ProcfsFileOps {
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         if let Some(p) = fail_nth_of(&inode) {
-            return write_fail_nth(p.tid().ok_or(KernelError::NoProcess)?, from);
+            return write_fail_nth(&p.task().ok_or(KernelError::NoProcess)?, from);
         }
         let ctl = sysctl_of(&inode).ok_or(KernelError::Io)?;
         crate::sysctl::permission(ctl, &crate::task::current_cred(), crate::fs::MAY_WRITE)?;
@@ -1684,12 +1651,13 @@ impl FileOps for ProcfsFileOps {
 
         // A reaped task's directory lists nothing, not even "." (Linux
         // proc_pident_readdir: ENOENT)
-        let tid = match &kind {
-            Dir::Static(_) => 0,
+        let task = match &kind {
+            Dir::Static(_) => None,
             Dir::Pid(p) | Dir::Ns(p) | Dir::Fd(p) | Dir::Task(p) | Dir::Fdinfo(p) => {
-                p.tid().ok_or(KernelError::NotFound)?
+                Some(p.task().ok_or(KernelError::NotFound)?)
             }
         };
+        let task = task.as_ref();
 
         // Emit "." and ".."
         let should_continue = ctx.emit(DirEntry {
@@ -1751,11 +1719,14 @@ impl FileOps for ProcfsFileOps {
                     readdir_emit_pids(&inode, ctx)?;
                 }
             }
-            Dir::Pid(_) => readdir_emit_pid_entries(tid, ctx)?,
-            Dir::Ns(_) => readdir_emit_ns_entries(tid, ctx)?,
-            Dir::Fd(_) => readdir_emit_fd_entries(tid, ctx)?,
+            Dir::Pid(_) => readdir_emit_pid_entries(task.map_or(0, |t| t.tid()), ctx)?,
+            Dir::Ns(_) => readdir_emit_ns_entries(task.map_or(0, |t| t.tid()), ctx)?,
+            Dir::Fd(_) => readdir_emit_fd_entries(task, ctx)?,
             Dir::Task(_) => {
-                for (tid, nr) in group_threads(tid, &opts::pid_ns(&inode)) {
+                let Some(t) = task else {
+                    return Ok(());
+                };
+                for (_, tid, nr) in group_threads(t, &opts::pid_ns(&inode)) {
                     let e = DirEntry {
                         ino: pid_ino(tid, 0),
                         file_type: FileType::Directory,
@@ -1766,7 +1737,7 @@ impl FileOps for ProcfsFileOps {
                     }
                 }
             }
-            Dir::Fdinfo(_) => readdir_emit_fdinfo_entries(tid, ctx)?,
+            Dir::Fdinfo(_) => readdir_emit_fdinfo_entries(task, ctx)?,
         }
 
         Ok(())
@@ -1783,24 +1754,24 @@ const PID_POS: u64 = 256;
 /// stable while others exit
 fn readdir_emit_pids(root: &Inode, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
     let ns = opts::pid_ns(root);
-    // Each group leader's (number in ns, root pid), gathered with no
-    // allocation under TASKLIST
-    let mut pids = crate::task::percpu::GlobalTaskTable::collect_tasks(|_, t| {
+    // Each group leader, by its number in ns, gathered with no
+    // allocation under TASKLIST (references dropped after it)
+    let mut pids = crate::task::percpu::GlobalTaskTable::collect_tasks(|table, t| {
         if t.task.tid() != t.task.pid || t.task.pid == 0 {
             return None;
         }
         let nr = t.thread_pid.as_ref()?.nr_in(&ns)?;
-        Some((nr, t.task.pid))
+        Some((nr, table.task(t.task.tid())?))
     });
-    pids.sort_unstable();
+    pids.sort_unstable_by_key(|&(nr, _)| nr);
 
     // hidepid=invisible: other users' processes are left out
-    for (nr, pid) in pids
+    for (nr, t) in pids
         .into_iter()
-        .filter(|&(_, p)| opts::with(root, |o| o.visible(p)).unwrap_or(true))
+        .filter(|(_, t)| opts::with(root, |o| o.visible(t)).unwrap_or(true))
     {
         let e = DirEntry {
-            ino: pid_ino(pid, 0),
+            ino: pid_ino(t.tid(), 0),
             file_type: FileType::Directory,
             name: Vec::from(alloc::format!("{nr}").as_bytes()),
         };
@@ -1906,16 +1877,19 @@ fn readdir_emit_ns_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), Ker
 }
 
 /// Emit entries for /proc/<pid>/fd/ directory
-fn readdir_emit_fd_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
-    // Get the task's TID
-    let tid = match get_tid_for_pid(pid) {
-        Some(t) => t,
-        None => return Ok(()),
+fn readdir_emit_fd_entries(
+    t: Option<&TaskRef>,
+    ctx: &mut DirContext<'_>,
+) -> Result<(), KernelError> {
+    let Some(t) = t else {
+        return Ok(());
     };
+    // Its tid only numbers the inodes
+    let pid = t.tid();
 
     // Get FDs from the task's FD table
     let fds: Vec<i32> = {
-        if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
+        if let Some(table_arc) = task_files(t) {
             let table = table_arc.lock();
             table.fds().copied().collect()
         } else {
@@ -1945,16 +1919,19 @@ fn readdir_emit_fd_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), Ker
 }
 
 /// Emit entries for /proc/<pid>/fdinfo/ directory
-fn readdir_emit_fdinfo_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
-    // Get the task's TID
-    let tid = match get_tid_for_pid(pid) {
-        Some(t) => t,
-        None => return Ok(()),
+fn readdir_emit_fdinfo_entries(
+    t: Option<&TaskRef>,
+    ctx: &mut DirContext<'_>,
+) -> Result<(), KernelError> {
+    let Some(t) = t else {
+        return Ok(());
     };
+    // Its tid only numbers the inodes
+    let pid = t.tid();
 
     // Get FDs from the task's FD table
     let fds: Vec<i32> = {
-        if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
+        if let Some(table_arc) = task_files(t) {
             let table = table_arc.lock();
             table.fds().copied().collect()
         } else {
@@ -2039,14 +2016,14 @@ impl SuperOps for ProcfsSuperOps {
 }
 
 /// The process of a /proc/<pid> or /proc/<pid>/task/<tid> directory
-fn pid_dir_pid(inode: &Inode) -> Option<Pid> {
+fn pid_dir_pid(inode: &Inode) -> Option<TaskRef> {
     let p = inode.get_private()?;
     let w = p.as_ref().as_any().downcast_ref::<ProcfsInodeWrapper>()?;
     let pid = match &*w.0.read() {
         ProcfsInodeData::PidDirectory { pid } => pid.clone(),
         _ => return None,
     };
-    pid.tid()
+    pid.task()
 }
 
 /// `data` from offset `pos` on into `to`

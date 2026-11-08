@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use crate::fs::Inode;
 use crate::fs::superblock::{SuperBlock, SuperBlockData};
 use crate::ns::PidNamespace;
-use crate::task::Pid;
+use crate::task::Task;
 use crate::util::error::KernelError;
 
 /// hidepid=: every /proc/<pid> visible and accessible (Linux HIDEPID_OFF)
@@ -149,10 +149,10 @@ impl ProcOpts {
     /// Linux has_pid_permissions: may the caller see process `pid` at
     /// hidepid level `min` (NO_ACCESS for its files, INVISIBLE for
     /// lookup and readdir)
-    fn allows(&self, pid: Pid, min: u8) -> bool {
+    fn allows(&self, t: &Task, min: u8) -> bool {
         let h = self.hidepid.load(Ordering::Relaxed);
         if h == HIDEPID_NOT_PTRACEABLE {
-            return crate::task::ptrace::may_read_proc(pid);
+            return crate::task::ptrace::may_read_ref(t);
         }
         if h < min {
             return true;
@@ -161,18 +161,18 @@ impl ProcOpts {
         if crate::fs::dac::in_group(&crate::fs::dac::cred(), gid) {
             return true;
         }
-        crate::task::ptrace::may_read_proc(pid)
+        crate::task::ptrace::may_read_ref(t)
     }
 
     /// The process shows in lookup and readdir
-    pub fn visible(&self, pid: Pid) -> bool {
-        self.allows(pid, HIDEPID_INVISIBLE)
+    pub fn visible(&self, t: &Task) -> bool {
+        self.allows(t, HIDEPID_INVISIBLE)
     }
 
     /// Linux proc_pid_permission: a process directory the options hide
     /// is ENOENT (invisible) or EPERM
-    pub fn pid_permission(&self, pid: Pid) -> Result<(), KernelError> {
-        if self.allows(pid, HIDEPID_NO_ACCESS) {
+    pub fn pid_permission(&self, t: &Task) -> Result<(), KernelError> {
+        if self.allows(t, HIDEPID_NO_ACCESS) {
             return Ok(());
         }
         if self.hidepid.load(Ordering::Relaxed) == HIDEPID_INVISIBLE {
