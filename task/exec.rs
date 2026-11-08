@@ -110,7 +110,7 @@ fn copy_strings(argv: UserPtr<u64>, n: usize, budget: &mut usize) -> KernelResul
 /// The argument and environment strings of an exec of `filename`
 /// (Linux do_execveat_common): both arrays counted, the room for them
 /// worked out from RLIMIT_STACK, then the file name, the environment
-/// and the arguments copied against it
+/// and the arguments (at least an empty argv[0]) copied against it
 fn copy_args(
     filename: &[u8],
     argv: UserPtr<u64>,
@@ -123,7 +123,13 @@ fn copy_args(
         .checked_sub(filename.len() + 1)
         .ok_or(KernelError::ArgListTooLong)?;
     let envp = copy_strings(envp, envc, &mut budget)?;
-    let argv = copy_strings(argv, argc, &mut budget)?;
+    let mut argv = copy_strings(argv, argc, &mut budget)?;
+    // No arguments: argv[0] is "", so a program reading from argv[1]
+    // does not walk into envp (Linux copy_string_kernel(""), charged)
+    if argc == 0 {
+        budget.checked_sub(1).ok_or(KernelError::ArgListTooLong)?;
+        argv.push(b"")?;
+    }
     Ok((argv, envp))
 }
 

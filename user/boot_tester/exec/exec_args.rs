@@ -11,6 +11,8 @@
 //! byte more is E2BIG
 //! EXEC_ARGS_RLIMIT_FITS / _OVER: with RLIMIT_STACK at 1 MiB (a 256 KiB limit), two
 //! 100 KiB arguments run and three are E2BIG
+//! EXEC_ARGC0_NULL / _EMPTY: argv NULL or {NULL} starts the program
+//! with argc 1 and argv[0] "" (Linux 5.18+), not argc 0
 
 use crate::harness::fail_num;
 use crate::helpers::{print, println};
@@ -28,6 +30,8 @@ static mut BIG: [u8; MAX_ARG_STRLEN + 1] = [b'a'; MAX_ARG_STRLEN + 1];
 static mut ARGV: [*const u8; MANY + 1] = [ptr::null(); MANY + 1];
 
 pub fn run_tests() {
+    argc0(b"EXEC_ARGC0_NULL", false);
+    argc0(b"EXEC_ARGC0_EMPTY", true);
     // sh -c SCRIPT $0 ARGS...: $# counts ARGS
     case(b"EXEC_ARGS_MANY", 0, |argv| {
         argv[0] = b"sh\0".as_ptr();
@@ -87,6 +91,27 @@ fn big(len: usize) -> *const u8 {
     b.fill(b'a');
     b[len] = 0;
     b.as_ptr()
+}
+
+/// Exec boot_tester2 with no arguments (a NULL `argv`, or an empty
+/// array if `array`): it exits 123 when it got argc 1, 7 for argc 0
+fn argc0(name: &[u8], array: bool) {
+    let pid = sys_fork();
+    if pid == 0 {
+        let empty: [*const u8; 1] = [ptr::null()];
+        let argv = if array { empty.as_ptr() } else { ptr::null() };
+        let envp: [*const u8; 1] = [ptr::null()];
+        let r = sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv, envp.as_ptr());
+        sys_exit((-r) as u64 & 0xff);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    print(name);
+    if st & 0x7f == 0 && (st >> 8) & 0xff == 123 {
+        println(b":OK");
+    } else {
+        fail_num(b":FAIL wstatus=", i64::from(st));
+    }
 }
 
 fn case(name: &[u8], want: i64, build: fn(&mut [*const u8]) -> usize) {

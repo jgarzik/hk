@@ -14,6 +14,7 @@
 //! `boot_tester2 comm`: exit 0 if the task name (PR_GET_NAME) is
 //! "boot_tester2"; `boot_tester2 dumpable`: exit with PR_GET_DUMPABLE.
 //! `boot_tester2 sleep`: write a byte to fd 3, then sleep until killed.
+//! Started with argc 0, it exits 7.
 
 #![no_std]
 #![no_main]
@@ -389,6 +390,11 @@ fn chldsig() -> ! {
 
 extern "C" fn rust_start(sp: *const u64) -> ! {
     const PR_GET_DUMPABLE: i32 = 3;
+    // An exec with no arguments still passes argv[0] "" (Linux
+    // do_execveat_common)
+    if unsafe { *sp } == 0 {
+        sys_exit(7);
+    }
     match arg1(sp) {
         b"fdcheck" => fdcheck(),
         b"auxv" => auxv_check(sp),
