@@ -599,12 +599,12 @@ fn tty_devnode(d: &Device) -> Option<DevNode> {
 /// For MVP, we implement the permission check and return success,
 /// as the boot_tester runs with full capabilities and doesn't rely
 /// on the terminal revocation behavior.
-pub fn sys_vhangup() -> i64 {
+pub fn sys_vhangup() -> crate::util::error::KernelResult<()> {
     use crate::task::{CAP_SYS_TTY_CONFIG, capable};
 
     // Requires CAP_SYS_TTY_CONFIG capability
     if !capable(CAP_SYS_TTY_CONFIG) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // MVP: Return success
@@ -613,5 +613,5 @@ pub fn sys_vhangup() -> i64 {
     // 2. Send SIGHUP to foreground process group
     // 3. Revoke terminal access for all users
     // 4. Clear session/ctty associations
-    0
+    Ok(())
 }

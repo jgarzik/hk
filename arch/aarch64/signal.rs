@@ -442,7 +442,7 @@ fn parse_reserved(addr: u64) -> Option<FpsimdContext> {
 ///
 /// Returns the value that should be in x0 (return value),
 /// or error code if restore fails.
-pub fn sys_rt_sigreturn() -> i64 {
+pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     let frame = crate::task::percpu::current_pt_regs();
     // A copy, written back once the whole context is restored
     let mut r = frame.get();
@@ -451,28 +451,28 @@ pub fn sys_rt_sigreturn() -> i64 {
     // The current SP points to the signal frame
     let frame_addr = tf.sp;
     if !frame_addr.is_multiple_of(SIGNAL_FRAME_ALIGN) {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     }
     let Some(end) = frame_addr.checked_add(signal_frame_size() as u64) else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
     if !Uaccess::access_ok(frame_addr, (end - frame_addr) as usize) {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     }
 
     let uc_addr = frame_addr + core::mem::offset_of!(RtSigFrame, uc) as u64;
     let Some(sigmask) =
         read_user::<SigSet>(uc_addr + core::mem::offset_of!(UContext, uc_sigmask) as u64)
     else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
     let Some(sc) =
         read_user::<SigContext>(uc_addr + core::mem::offset_of!(UContext, uc_mcontext) as u64)
     else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
     let Some(fpsimd) = parse_reserved(frame_addr + RESERVED_OFFSET as u64) else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
 
     // Restore blocked signal mask
@@ -497,5 +497,5 @@ pub fn sys_rt_sigreturn() -> i64 {
     frame.set(r);
 
     // Return x0 from saved context
-    sc.regs[0] as i64
+    Ok(sc.regs[0] as i64)
 }

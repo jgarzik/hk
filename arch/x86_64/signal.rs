@@ -426,7 +426,7 @@ fn restore_sigframe_fpu(fpstate: u64) -> bool {
 ///
 /// Returns the value that should be in RAX (usually -EINTR for interrupted syscall),
 /// or error code if restore fails.
-pub fn sys_rt_sigreturn() -> i64 {
+pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     let frame = crate::task::percpu::current_pt_regs();
     // A copy, written back once the whole context is restored
     let mut r = frame.get();
@@ -443,18 +443,12 @@ pub fn sys_rt_sigreturn() -> i64 {
         .checked_sub(8)
         .and_then(|frame| frame.checked_add(uc_offset as u64))
     else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
-    let uc_size = core::mem::size_of::<UContext>();
-
-    // Validate address
-    if !Uaccess::access_ok(uc_addr, uc_size) {
-        return crate::signal::sigreturn_badframe();
-    }
 
     // Read UContext from user stack (any alignment: copied as bytes)
     let Ok(uc) = crate::uaccess::copy_val_from_user::<Uaccess, UContext>(uc_addr) else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
     let sc = &uc.uc_mcontext;
 
@@ -462,7 +456,7 @@ pub fn sys_rt_sigreturn() -> i64 {
     // one makes the return's IRET fault, which entry.rs turns into the
     // task's #GP (SIGSEGV; fixup_bad_iret)
     if !restore_sigframe_fpu(sc.fpstate) {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     }
 
     // Restore blocked signal mask
@@ -500,5 +494,5 @@ pub fn sys_rt_sigreturn() -> i64 {
 
     // Return RAX from saved context
     // This allows signal handler to modify the return value
-    sc.rax as i64
+    Ok(sc.rax as i64)
 }

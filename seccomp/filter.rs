@@ -247,7 +247,7 @@ impl Drop for SeccompFilter {
 /// of instructions, padding, then the user address of the first
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct SockFprog {
+pub struct SockFprog {
     len: u16,
     _pad: [u16; 3],
     filter: u64,

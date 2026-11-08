@@ -3032,8 +3032,8 @@ pub fn force_sig_fault(info: SigInfo, trap: TrapSet, regs: &UserFrame) {
 }
 
 /// rt_sigreturn found an unusable frame (Linux badframe): kill the caller
-/// with SIGSEGV. Returns -EFAULT for the (never seen) syscall result.
-pub fn sigreturn_badframe() -> i64 {
+/// with SIGSEGV. Returns EFAULT for the (never seen) syscall result.
+pub fn sigreturn_badframe() -> KernelError {
     force_sigsegv(crate::task::percpu::current_tid());
-    KernelError::BadAddress.sysret()
+    KernelError::BadAddress
 }

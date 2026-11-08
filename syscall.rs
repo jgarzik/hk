@@ -301,7 +301,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Bind => {
             crate::net::syscall::sys_bind(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
         }
-        Sys::Bpf => crate::bpf::sys_bpf(a[0] as i32, a[1], a[2] as u32).ret() as u64,
+        Sys::Bpf => crate::bpf::sys_bpf(a[0] as i32, UserPtr::new(a[1]), a[2] as u32).ret() as u64,
         Sys::Brk => crate::mm::syscall::sys_brk(a[0]).ret() as u64,
         Sys::Capget => crate::task::syscall::sys_capget::<Uaccess>(a[0], a[1]).ret() as u64,
         Sys::Capset => crate::task::syscall::sys_capset::<Uaccess>(a[0], a[1]).ret() as u64,

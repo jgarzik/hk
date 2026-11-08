@@ -4,7 +4,7 @@
 //! implementation. Architecture-specific power operations are implemented in
 //! arch/<arch>/power.rs modules.
 
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 
 /// Linux reboot syscall command constants
 pub mod cmd {
@@ -44,15 +44,15 @@ static SYSTEM_TRANSITION: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 /// # Returns
 /// Does not return on success (system shuts down/reboots/halts).
 /// Returns -EINVAL on invalid magic numbers or unknown command.
-pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
+pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> KernelResult<()> {
     // The capability first, then the magic numbers (Linux)
     if !crate::task::capable(crate::task::CAP_SYS_BOOT) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Validate magic number 1
     if magic1 != cmd::LINUX_REBOOT_MAGIC1 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate magic number 2 (any of the valid variants)
@@ -61,13 +61,13 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
         && magic2 != cmd::LINUX_REBOOT_MAGIC2B
         && magic2 != cmd::LINUX_REBOOT_MAGIC2C
     {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Inside a child pid namespace the command ends the namespace, never
     // the machine (Linux reboot_pid_ns, before system_transition_mutex)
-    if let Some(r) = crate::task::pidns::reboot_pid_ns(cmd) {
-        return r;
+    if let Some(e) = crate::task::pidns::reboot_pid_ns(cmd) {
+        return Err(e);
     }
 
     // One transition at a time (Linux system_transition_mutex): a second
@@ -93,6 +93,6 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
         }
         cmd::RESTART => crate::arch::power::reboot(),
         cmd::HALT => crate::arch::power::halt(),
-        _ => KernelError::InvalidArgument.sysret(),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
