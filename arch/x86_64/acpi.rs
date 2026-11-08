@@ -443,8 +443,11 @@ fn parse_madt(t: &[u8]) -> Result<AcpiInfo, &'static str> {
                 let b = e.get(4..12).ok_or(BAD)?;
                 info.lapic_base = u64::from_le_bytes(b.try_into().map_err(|_| BAD)?);
             }
-            // I/O APICs, interrupt source overrides, LAPIC NMIs and the
-            // rest are not used: device IRQs go through the 8259 PIC
+            // header (2) + id (1) + reserved (1) + address (4) + gsi_base
+            // (4): a short one is a bad table (Linux BAD_MADT_ENTRY), though
+            // device IRQs go through the 8259 PIC, not the I/O APIC
+            MADT_ENTRY_IOAPIC if e.len() < 12 => return Err(BAD),
+            // Interrupt source overrides, LAPIC NMIs and the rest are not used
             MADT_ENTRY_IOAPIC | MADT_ENTRY_ISO | MADT_ENTRY_LAPIC_NMI => {}
             _ => {}
         }
@@ -994,6 +997,7 @@ mod tests {
         assert!(parse_madt(&table(44, &[&MADT_LAPIC, &zero])).is_err());
         // entries too short for their type
         assert!(parse_madt(&table(44, &[&[MADT_ENTRY_LAPIC, 4, 0, 3]])).is_err());
+        assert!(parse_madt(&table(44, &[&MADT_LAPIC, &[MADT_ENTRY_IOAPIC, 2]])).is_err());
         assert!(
             parse_madt(&table(
                 44,
