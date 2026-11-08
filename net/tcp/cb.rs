@@ -606,7 +606,8 @@ impl Ooo {
     }
 }
 
-/// The control block
+/// The control block. Build it with [`TcpCb::new`]: `Default` is only
+/// new()'s base (its MSS, RTO and queue caps are zero)
 #[derive(Default)]
 pub struct TcpCb {
     pub state: TcpState,
@@ -943,7 +944,7 @@ impl TcpCb {
         if left > 0 {
             self.mem_force(left.min(n));
         }
-        n.min((self.held.0 * mem::QUANTUM).saturating_sub(self.mem_used()))
+        n.min((self.held.get() * mem::QUANTUM).saturating_sub(self.mem_used()))
     }
 
     /// Room in the send queue (none while TCP_NOTSENT_LOWAT unsent
@@ -1258,13 +1259,13 @@ impl TcpCb {
     /// never all pass one check
     pub(super) fn mem_schedule(&mut self, size: usize, kind: MemKind) -> bool {
         let need = mem::quanta(self.mem_used() + size);
-        if need <= self.held.0 {
+        if need <= self.held.get() {
             return true;
         }
-        let amt = need - self.held.0;
+        let amt = need - self.held.get();
         mem::add(amt);
         if self.mem_raise(mem::allocated(), size, kind) {
-            self.held.0 = need;
+            self.held.set(need);
             return true;
         }
         mem::sub(amt);
@@ -1297,7 +1298,7 @@ impl TcpCb {
             if floor {
                 return true;
             }
-            if !mem::under_pressure() || mem::limit(2) > mem::sockets() * self.held.0 {
+            if !mem::under_pressure() || mem::limit(2) > mem::sockets() * self.held.get() {
                 return true;
             }
         }
@@ -1308,9 +1309,9 @@ impl TcpCb {
     /// sk_forced_mem_schedule)
     fn mem_force(&mut self, size: usize) {
         let need = mem::quanta(self.mem_used() + size);
-        if need > self.held.0 {
-            mem::add(need - self.held.0);
-            self.held.0 = need;
+        if need > self.held.get() {
+            mem::add(need - self.held.get());
+            self.held.set(need);
         }
     }
 
@@ -1319,12 +1320,12 @@ impl TcpCb {
     /// sk_forced_mem_schedule)
     pub(super) fn mem_settle(&mut self) {
         let now = mem::quanta(self.mem_used());
-        if now >= self.held.0 {
-            mem::add(now - self.held.0);
+        if now >= self.held.get() {
+            mem::add(now - self.held.get());
         } else {
-            mem::sub(self.held.0 - now);
+            mem::sub(self.held.get() - now);
         }
-        self.held.0 = now;
+        self.held.set(now);
     }
 
     // --- timers --------------------------------------------------------------

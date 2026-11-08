@@ -135,7 +135,19 @@ pub fn sockets() -> usize {
 /// up, never more (Linux sk_forward_alloc, reclaimed below a page on
 /// every uncharge). Counts the socket while it lives (Linux
 /// sk_sockets_allocated_inc/dec) and returns the quanta on drop.
-pub struct Held(pub usize);
+pub struct Held(usize);
+
+impl Held {
+    /// Quanta held
+    pub fn get(&self) -> usize {
+        self.0
+    }
+
+    /// Hold `n` quanta: the caller has added or subtracted the change
+    pub fn set(&mut self, n: usize) {
+        self.0 = n;
+    }
+}
 
 impl Default for Held {
     fn default() -> Self {
