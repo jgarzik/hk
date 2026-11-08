@@ -99,12 +99,6 @@ impl IoState {
     }
 }
 
-impl Default for IoState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CssPrivate for IoState {
     fn as_any(&self) -> &dyn Any {
         self

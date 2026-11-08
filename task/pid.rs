@@ -248,12 +248,6 @@ impl PidMap {
     }
 }
 
-impl Default for PidMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for PidMap {
     fn drop(&mut self) {
         for p in self.pages.iter() {

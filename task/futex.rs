@@ -155,12 +155,6 @@ impl KeySeq {
     }
 }
 
-impl Default for KeySeq {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // =============================================================================
 // Futex Queue Entry
 // =============================================================================
@@ -342,12 +336,6 @@ pub struct FutexHashBucket {
     waiters: SpinMutex<List<QAdapter>>,
     /// Waiter count for fast-path optimization
     waiter_count: AtomicU32,
-}
-
-impl Default for FutexHashBucket {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl FutexHashBucket {

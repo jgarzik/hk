@@ -65,12 +65,6 @@ impl Flip {
     }
 }
 
-impl Default for Flip {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Some flip buffer has input (set by handlers, cleared by the thread)
 static PENDING: AtomicBool = AtomicBool::new(false);
 

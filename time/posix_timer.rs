@@ -791,12 +791,6 @@ impl Drop for PosixTimerRegistry {
     }
 }
 
-impl Default for PosixTimerRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // =============================================================================
 // Per-process POSIX timer storage (Linux signal->posix_timers)
 // =============================================================================

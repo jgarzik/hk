@@ -305,12 +305,6 @@ impl PrintkWriter {
     }
 }
 
-impl Default for PrintkWriter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Write for PrintkWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         if self._guard.is_some() {

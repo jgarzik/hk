@@ -1061,12 +1061,6 @@ impl SemUndoList {
     }
 }
 
-impl Default for SemUndoList {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // =============================================================================
 // Task SemUndo accessors - uses Task.sysvsem field directly via TASKLIST
 // =============================================================================

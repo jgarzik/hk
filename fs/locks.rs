@@ -86,12 +86,6 @@ impl FileLockCtx {
     }
 }
 
-impl Default for FileLockCtx {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Linux MAX_DEADLK_ITERATIONS
 const MAX_DEADLK_ITERATIONS: usize = 10;
 

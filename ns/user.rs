@@ -128,12 +128,6 @@ impl UidGidMap {
     }
 }
 
-impl Default for UidGidMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// User namespace
 ///
 /// Provides isolation of user and group IDs.

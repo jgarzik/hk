@@ -65,12 +65,6 @@ pub struct LogBuf {
     next_seq: u64,
 }
 
-impl Default for LogBuf {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl LogBuf {
     pub const fn new() -> Self {
         Self {

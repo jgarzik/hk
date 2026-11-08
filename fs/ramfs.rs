@@ -289,12 +289,6 @@ impl Children {
     }
 }
 
-impl Default for Children {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RamfsInodeData {
     /// Create empty file data (the data lives in the inode's mapping)
     pub fn new_file() -> Self {

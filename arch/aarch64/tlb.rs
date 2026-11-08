@@ -84,12 +84,6 @@ pub fn init_cpu() {
     local_flush_all();
 }
 
-impl Default for ArchCtx {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// A range flush of more pages than this flushes the whole address
 /// space (Linux MAX_DVM_OPS = PTRS_PER_PTE)
 pub const FLUSH_CEILING: u64 = 512;

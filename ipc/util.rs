@@ -344,12 +344,6 @@ impl<T: IpcObject> IpcIds<T> {
     }
 }
 
-impl<T: IpcObject> Default for IpcIds<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ============================================================================
 // Permission Checking
 // ============================================================================

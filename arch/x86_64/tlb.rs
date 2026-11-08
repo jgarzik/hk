@@ -14,12 +14,6 @@ impl ArchCtx {
     }
 }
 
-impl Default for ArchCtx {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// A range flush of more pages than this flushes everything (Linux
 /// tlb_single_page_flush_ceiling)
 pub const FLUSH_CEILING: u64 = 33;

@@ -44,12 +44,6 @@ impl Monotonic {
     }
 }
 
-impl Default for Monotonic {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Clock for Monotonic {
     fn now_ns(&mut self) -> u64 {
         if self.timekeeper {

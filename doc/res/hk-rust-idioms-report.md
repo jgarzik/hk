@@ -2,7 +2,7 @@
 
 Idioms (stable Rust, edition 2024) that cut boilerplate in the kernel crate. The LOC
 is in **error plumbing at the syscall boundary** and in **lint-driven boilerplate**;
-`Default` pays in a few big constructors and by deleting `impl Default` boilerplate
+`Default` pays in a few big constructors
 (`Default` is not `const` on stable, so `const fn new()` stays for statics). Item 2
 belongs to doc/ROADMAP.md phase M1, the rest to S1.
 
@@ -10,7 +10,6 @@ belongs to doc/ROADMAP.md phase M1, the rest to S1.
 
 | # | Item | Lines saved | Risk | Prio |
 |---|------|-------------|------|------|
-| 1 | Drop `new_without_default` boilerplate | about -420 | ~0 (compiler-checked) | high |
 | 2 | `SysRet` trait + `From<UaccessError>`: `?` in `sys_*` | about -750 | low-med (errno mapping) | high |
 | 3 | let-else for `match {Some(x)=>x, None=>return}` | about -288 | ~0 | high |
 | 4 | Delete the dead code behind `expect(dead_code)` | about -100 | ~0 | high |
@@ -20,34 +19,10 @@ belongs to doc/ROADMAP.md phase M1, the rest to S1.
 | 8 | `next_power_of_two` / `next_multiple_of` for hand-rolled ones | -25 | low (overflow) | low |
 | 9 | Last pointer-API gaps (`addr_of!`, `phys_to_virt` provenance, xhci MMIO) | 0 | 0 | low |
 
-Order: 1 and 4 are mechanical, one commit each. 2 goes per subsystem (M1) and also
+Order: 4 is mechanical, one commit. 2 goes per subsystem (M1) and also
 removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
 
 ---
-
-## 1. Delete `impl Default { Self::new() }`: allow `clippy::new_without_default`
-
-- **Feature:** clippy lint config (workspace `[lints.clippy]`). Not a new Rust feature.
-- **Evidence:** about 90 `impl Default for`. Of these, about 73 are exactly
-  `fn default() -> Self { Self::new() }` (examples: `sync/waitqueue.rs`, `mm/heap.rs`,
-  `fs/dentry.rs`, `time/mod.rs`, `signal/mod.rs` x6). They exist only to quiet
-  `new_without_default`. Most are singletons (`KernelAlloc`, `DentryCache`,
-  `TimeKeeper`, `ConsoleRegistry`) that nothing ever builds through `Default`.
-- **Keep:** the 3 types that really use `Default`: `FileLock` (fs/locks.rs),
-  `TaskSignalState` and `SigAction` (signal/mod.rs). Remove the others and add
-  `new_without_default = "allow"`. Also turn the 7 non-const all-default `new()`s
-  into `derive(Default)` (about -50).
-- **Before/after**
-  ```rust
-  impl Default for WaitQueue {        // -6 lines, x70
-      fn default() -> Self {
-          Self::new()
-      }
-  }
-  ```
-  becomes nothing, plus one line in Cargo.toml: `new_without_default = "allow"`.
-- **Risk:** none at run time; a missing `Default` is a compile error. Generic code
-  that needs `T: Default` will have to add it back type by type.
 
 ## 2. Syscall returns: `SysRet` trait + `?` (the big one)
 

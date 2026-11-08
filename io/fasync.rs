@@ -306,12 +306,6 @@ impl FasyncList {
     }
 }
 
-impl Default for FasyncList {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Put `file` on `list` (`on`; an entry already there takes the new
 /// `fd`) or take it off (Linux fasync_helper); O_ASYNC follows. True if
 /// an entry was added or removed.

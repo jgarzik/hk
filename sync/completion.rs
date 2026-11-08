@@ -72,9 +72,3 @@ impl Completion {
         self.wait.wait_event_exclusive(|| self.try_wait());
     }
 }
-
-impl Default for Completion {
-    fn default() -> Self {
-        Self::new()
-    }
-}

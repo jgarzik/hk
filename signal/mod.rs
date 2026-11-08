@@ -536,12 +536,6 @@ impl SigHand {
     }
 }
 
-impl Default for SigHand {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // =============================================================================
 // Per-Task Signal State
 // =============================================================================
@@ -592,12 +586,6 @@ impl AltStack {
     /// Check if alternate stack is enabled
     pub fn is_enabled(&self) -> bool {
         self.ss_flags & ss_flags::SS_DISABLE == 0
-    }
-}
-
-impl Default for AltStack {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -716,12 +704,6 @@ impl TaskSignalState {
         // Check shared pending
         let shared = self.shared_pending.lock();
         shared.signal.subtract(&self.blocked).any()
-    }
-}
-
-impl Default for TaskSignalState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -2654,12 +2636,6 @@ impl SignalStruct {
             subreaper: crate::task::TableCell::new(false),
             unkillable: AtomicBool::new(false),
         })
-    }
-}
-
-impl Default for SignalStruct {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

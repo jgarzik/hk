@@ -598,12 +598,6 @@ impl RawPageTable {
     }
 }
 
-impl Default for RawPageTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RawPageTable {
     /// Get entry at index
     pub fn entry(&self, index: usize) -> &PageTableEntry {

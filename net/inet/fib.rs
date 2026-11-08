@@ -185,12 +185,6 @@ pub struct Fib {
     tables: RwLock<BTreeMap<u32, Vec<Arc<FibEntry>>>>,
 }
 
-impl Default for Fib {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Fib {
     pub fn new() -> Self {
         let mut t = BTreeMap::new();

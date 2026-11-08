@@ -882,12 +882,6 @@ impl Zone {
     }
 }
 
-impl Default for Zone {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

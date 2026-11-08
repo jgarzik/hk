@@ -169,12 +169,6 @@ impl AddressSpace {
     }
 }
 
-impl Default for AddressSpace {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for AddressSpace {
     fn drop(&mut self) {
         truncate_final(self);

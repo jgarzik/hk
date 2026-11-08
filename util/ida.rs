@@ -63,12 +63,6 @@ impl Ida {
     }
 }
 
-impl Default for Ida {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

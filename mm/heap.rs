@@ -251,12 +251,6 @@ impl KernelAlloc {
     }
 }
 
-impl Default for KernelAlloc {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Largest block the slab serves (its biggest page order)
 const SLAB_MAX: usize = 4096 << crate::mm::page_alloc::MAX_ORDER;
 
@@ -321,12 +315,6 @@ unsafe impl GlobalAlloc for KernelAlloc {
             }
             p
         }
-    }
-}
-
-impl Default for HeapAllocator {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

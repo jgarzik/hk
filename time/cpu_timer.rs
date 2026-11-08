@@ -146,12 +146,6 @@ impl GroupCputimer {
     }
 }
 
-impl Default for GroupCputimer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// The calling process's SignalStruct
 fn my_group() -> Option<Arc<crate::signal::SignalStruct>> {
     crate::task::percpu::current().cpu_group().cloned()

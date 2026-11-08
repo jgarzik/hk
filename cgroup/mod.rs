@@ -507,12 +507,6 @@ pub struct CgroupRoot {
     next_ino: AtomicU64,
 }
 
-impl Default for CgroupRoot {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CgroupRoot {
     /// Create a new cgroup hierarchy root
     pub const fn new() -> Self {

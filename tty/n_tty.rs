@@ -208,12 +208,6 @@ impl NTtyData {
     }
 }
 
-impl Default for NTtyData {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// What input processing produced, acted on once `ldata` is dropped
 #[derive(Default)]
 struct Effects {

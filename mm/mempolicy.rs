@@ -89,12 +89,6 @@ pub struct TaskMempolicy {
     pub preferred_node: i32,
 }
 
-impl Default for TaskMempolicy {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TaskMempolicy {
     /// Create a new default memory policy (MPOL_DEFAULT)
     pub const fn new() -> Self {

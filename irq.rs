@@ -84,12 +84,6 @@ impl Spurious {
     }
 }
 
-impl Default for Spurious {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Report a line `note` disabled (Linux __report_bad_irq); called after
 /// dropping `IRQ_TABLE`, which stays a leaf lock
 pub fn report_nobody_cared(irq: u32) {

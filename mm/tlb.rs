@@ -78,12 +78,6 @@ impl MmContext {
     }
 }
 
-impl Default for MmContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// One CPU's TLB state (Linux cpu_tlbstate). Written by its own CPU
 /// only, with interrupts disabled (the flush IPI handler runs there
 /// too); atomics so that no `unsafe` is needed, Relaxed since no other

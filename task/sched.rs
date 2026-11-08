@@ -325,12 +325,6 @@ impl<A: Adapter> PrioQueue<A> {
     }
 }
 
-impl<A: Adapter> Default for PrioQueue<A> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// A run queue's lists, one set per class (Linux rq->{stop, rt, cfs}):
 /// the stoppers, the rt priority levels (by rt_priority, 1..99), and the
 /// fair tasks in arrival order
@@ -459,12 +453,6 @@ impl<A: Adapter> ClassQueues<A> {
             }
         }
         n
-    }
-}
-
-impl<A: Adapter> Default for ClassQueues<A> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

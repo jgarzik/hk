@@ -57,12 +57,6 @@ impl RtBandwidth {
     }
 }
 
-impl Default for RtBandwidth {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

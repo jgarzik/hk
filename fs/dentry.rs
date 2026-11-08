@@ -587,12 +587,6 @@ impl DentryCache {
     }
 }
 
-impl Default for DentryCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Global dentry cache instance
 pub static DCACHE: DentryCache = DentryCache::new();
 

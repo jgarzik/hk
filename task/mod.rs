@@ -873,12 +873,6 @@ impl<F> FdTable<F> {
     }
 }
 
-impl<F> Default for FdTable<F> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Task flags (Linux PF_*, `Task.flags`): set by the task itself (or
 /// its creator before it runs), read lock-free by anyone
 pub mod pf {
@@ -2515,12 +2509,6 @@ impl IoContext {
     #[inline]
     pub fn set_ioprio(&self, ioprio: IoPrio) {
         self.ioprio.store(ioprio, Ordering::Relaxed);
-    }
-}
-
-impl Default for IoContext {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

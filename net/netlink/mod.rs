@@ -685,12 +685,6 @@ pub struct NlTable {
     socks: RwLock<BTreeMap<(i32, u32), Weak<NlSock>>>,
 }
 
-impl Default for NlTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NlTable {
     pub fn new() -> Self {
         Self {

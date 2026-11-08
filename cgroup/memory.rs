@@ -56,12 +56,6 @@ impl MemoryState {
     }
 }
 
-impl Default for MemoryState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CssPrivate for MemoryState {
     fn as_any(&self) -> &dyn Any {
         self

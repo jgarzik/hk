@@ -561,12 +561,6 @@ impl PerCpuScheduler {
     }
 }
 
-impl Default for PerCpuScheduler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Global per-CPU scheduler array
 ///
 /// Each CPU accesses its own entry by CPU ID.
@@ -4200,12 +4194,6 @@ impl WakeQ {
             t.se.wake_q.store(core::ptr::null_mut(), Ordering::Release);
             try_to_wake_up(&t, WakeMode::Any);
         }
-    }
-}
-
-impl Default for WakeQ {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -55,9 +55,3 @@ impl DeviceRegistry {
         self.devices.iter()
     }
 }
-
-impl Default for DeviceRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
