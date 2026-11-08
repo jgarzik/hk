@@ -934,11 +934,9 @@ pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
 /// Every task whose root or cwd is `old` moves to `new` (Linux
 /// chroot_fs_refs)
 fn chroot_fs_refs(old: &Path, new: &Path) {
-    let tasks: Vec<crate::task::percpu::TaskRef> = crate::task::percpu::TASKLIST
-        .read()
-        .iter()
-        .map(|t| crate::task::percpu::task_ref(t.task))
-        .collect();
+    use crate::task::percpu::{GlobalTaskTable, task_ref};
+    // Gathered with no allocation under TASKLIST
+    let tasks = GlobalTaskTable::collect_tasks(|_, t| Some(task_ref(t.task)));
     for t in tasks {
         let Some(fs) = super::get_task_fs(&t) else {
             continue;
