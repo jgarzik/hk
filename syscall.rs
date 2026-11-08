@@ -545,10 +545,12 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Getpriority => {
             crate::task::syscall::sys_getpriority(a[0] as i32, a[1] as i32).ret() as u64
         }
-        Sys::Getrandom => {
-            crate::task::syscall::sys_getrandom::<Uaccess>(a[0], a[1] as usize, a[2] as u32).ret()
-                as u64
-        }
+        Sys::Getrandom => crate::task::syscall::sys_getrandom::<Uaccess>(
+            UserPtr::new(a[0]),
+            a[1] as usize,
+            a[2] as u32,
+        )
+        .ret() as u64,
         Sys::Getresgid => crate::task::syscall::sys_getresgid::<Uaccess>(
             UserPtr::new(a[0]),
             UserPtr::new(a[1]),
@@ -563,9 +565,12 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::percpu::current_cred(),
         )
         .ret() as u64,
-        Sys::Getrlimit => crate::task::rlimit::sys_getrlimit(a[0] as u32, a[1]).ret() as u64,
+        Sys::Getrlimit => {
+            crate::task::rlimit::sys_getrlimit(a[0] as u32, UserPtr::new(a[1])).ret() as u64
+        }
         Sys::Getrusage => {
-            crate::task::syscall::sys_getrusage::<Uaccess>(a[0] as i32, a[1]).ret() as u64
+            crate::task::syscall::sys_getrusage::<Uaccess>(a[0] as i32, UserPtr::new(a[1])).ret()
+                as u64
         }
         Sys::Getsid => crate::task::syscall::sys_getsid(
             a[0] as i32,
@@ -865,9 +870,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[5] as i32,
         )
         .ret() as u64,
-        Sys::Prlimit64 => {
-            crate::task::rlimit::sys_prlimit64(a[0] as i32, a[1] as u32, a[2], a[3]).ret() as u64
-        }
+        Sys::Prlimit64 => crate::task::rlimit::sys_prlimit64(
+            a[0] as i32,
+            a[1] as u32,
+            UserPtr::new(a[2]),
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
         Sys::ProcessVmReadv => {
             crate::task::process_vm::sys_process_vm_readv(a[0] as i32, a[1], a[2], a[3], a[4], a[5])
                 as u64
@@ -1166,7 +1175,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::percpu::current_cred(),
         )
         .ret() as u64,
-        Sys::Setrlimit => crate::task::rlimit::sys_setrlimit(a[0] as u32, a[1]).ret() as u64,
+        Sys::Setrlimit => {
+            crate::task::rlimit::sys_setrlimit(a[0] as u32, UserPtr::new(a[1])).ret() as u64
+        }
         Sys::Setsid => {
             crate::task::syscall::sys_setsid(crate::task::percpu::current_pid()).ret() as u64
         }
@@ -1265,10 +1276,15 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[3] as u32,
         )
         .ret() as u64,
-        Sys::Sysinfo => crate::task::syscall::sys_sysinfo::<Uaccess>(a[0]).ret() as u64,
-        Sys::Syslog => {
-            crate::task::syscall::sys_syslog::<Uaccess>(a[0] as i32, a[1], a[2] as i32).ret() as u64
+        Sys::Sysinfo => {
+            crate::task::syscall::sys_sysinfo::<Uaccess>(UserPtr::new(a[0])).ret() as u64
         }
+        Sys::Syslog => crate::task::syscall::sys_syslog::<Uaccess>(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as i32,
+        )
+        .ret() as u64,
         Sys::Tee => {
             crate::fs::splice::sys_tee(a[0] as i32, a[1] as i32, a[2] as usize, a[3] as u32).ret()
                 as u64
@@ -1314,7 +1330,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             UserPtr::new(a[3]),
         )
         .ret() as u64,
-        Sys::Times => crate::task::syscall::sys_times::<Uaccess>(a[0]).ret() as u64,
+        Sys::Times => crate::task::syscall::sys_times::<Uaccess>(UserPtr::new(a[0])).ret() as u64,
         Sys::Tkill => {
             crate::signal::syscall::sys_tkill(i64::from(a[0] as i32), a[1] as u32).ret() as u64
         }

@@ -172,15 +172,10 @@ pub const RUSAGE_THREAD: i32 = 1;
 /// # Locking
 /// Reads memory stats and process count with brief lock holds.
 /// Reads time without locking (seqlock-protected).
-pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
+pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: UserPtr<SysInfo>) -> KernelResult<()> {
     use crate::FRAME_ALLOCATOR;
     use crate::time::{ClockId, TIMEKEEPER};
     use crate::uaccess::put_user;
-
-    // Validate user pointer
-    if !A::access_ok(info_ptr, core::mem::size_of::<SysInfo>()) {
-        return KernelError::BadAddress.sysret();
-    }
 
     // Get uptime (monotonic time since boot, in seconds)
     let mono = TIMEKEEPER.read(ClockId::Monotonic, TIMEKEEPER.get_read_cycles());
@@ -207,12 +202,8 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
         ..FromBytes::zeroed()
     };
 
-    // Copy to user space
-    if put_user::<A, SysInfo>(info_ptr, info).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    put_user::<A, SysInfo>(info_ptr.addr(), info)?;
+    Ok(())
 }
 
 /// Convert nanoseconds to Timeval
@@ -239,7 +230,7 @@ pub fn put_rusage_times(usage: UserPtr<Rusage>, utime_ns: u64, stime_ns: u64) ->
 /// struct tms (Linux include/uapi/linux/times.h), in clock ticks
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct Tms {
+pub struct Tms {
     tms_utime: i64,
     tms_stime: i64,
     tms_cutime: i64,
@@ -260,9 +251,9 @@ fn ns_to_clock_t(ns: u64) -> i64 {
 /// reaped children's user and system time into `buf` (if not NULL),
 /// and the clock ticks since boot (Linux jiffies in USER_HZ units,
 /// counted from 0 where Linux starts 5 minutes before the wrap)
-pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
+pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: UserPtr<Tms>) -> KernelResult<i64> {
     use crate::task::percpu;
-    if buf != 0 {
+    if !buf.is_null() {
         let (utime, stime) = percpu::get_process_times(percpu::current_pid());
         let (cutime, cstime) = percpu::children_times();
         let t = Tms {
@@ -271,11 +262,9 @@ pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
             tms_cutime: ns_to_clock_t(cutime),
             tms_cstime: ns_to_clock_t(cstime),
         };
-        if crate::uaccess::put_user::<A, Tms>(buf, t).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        crate::uaccess::put_user::<A, Tms>(buf.addr(), t)?;
     }
-    crate::time::ticks_to_clock_t(percpu::get_ticks()) as i64
+    Ok(crate::time::ticks_to_clock_t(percpu::get_ticks()) as i64)
 }
 
 /// sys_getrusage - get resource usage
@@ -298,20 +287,14 @@ pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
 /// Returns utime and stime for the current task/process. Other fields
 /// like maxrss, page faults, and context switches are also populated
 /// when available.
-pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -> i64 {
+pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(
+    who: i32,
+    usage_ptr: UserPtr<Rusage>,
+) -> KernelResult<()> {
     use crate::task::percpu;
     use crate::uaccess::put_user;
 
     // Validate who parameter
-    if who != RUSAGE_SELF && who != RUSAGE_CHILDREN && who != RUSAGE_THREAD {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Validate user pointer
-    if !A::access_ok(usage_ptr, core::mem::size_of::<Rusage>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
     // Build rusage structure
     let usage = match who {
         RUSAGE_THREAD => {
@@ -343,15 +326,10 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -
                 ..Rusage::default()
             }
         }
-        _ => return KernelError::InvalidArgument.sysret(),
+        _ => return Err(KernelError::InvalidArgument),
     };
-
-    // Copy to user space
-    if put_user::<A, Rusage>(usage_ptr, usage).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    put_user::<A, Rusage>(usage_ptr.addr(), usage)?;
+    Ok(())
 }
 
 /// sys_getrandom - get random bytes
@@ -369,28 +347,32 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -
 /// # Errors
 /// * EFAULT - Invalid buffer pointer
 /// * EINVAL - Invalid flags
-pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, flags: u32) -> i64 {
+pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(
+    buf: UserPtr<u8>,
+    buflen: usize,
+    flags: u32,
+) -> KernelResult<usize> {
     use crate::random;
     use crate::uaccess::copy_to_user;
 
     // Flags first (EINVAL even for an empty buffer, as on Linux)
-    if let Err(e) = random::get_random_bytes(&mut [], flags) {
-        return i64::from(e);
-    }
+    random::get_random_bytes(&mut [], flags)?;
     // Linux getrandom: at most MAX_RW_COUNT per call; a fault before
     // any byte is EFAULT, after some returns the count
     let len = buflen.min(crate::fs::syscall::MAX_RW_COUNT);
     if len == 0 {
-        return 0;
+        return Ok(0);
     }
-    if !A::access_ok(buf, len) {
-        return KernelError::BadAddress.sysret();
+    if !A::access_ok(buf.addr(), len) {
+        return Err(KernelError::BadAddress);
     }
-    let n = random::stream(len, |off, b| copy_to_user::<A>(buf + off as u64, b).is_ok());
+    let n = random::stream(len, |off, b| {
+        copy_to_user::<A>(buf.addr() + off as u64, b).is_ok()
+    });
     if n == 0 {
-        return KernelError::BadAddress.sysret();
+        return Err(KernelError::BadAddress);
     }
-    n as i64
+    Ok(n)
 }
 
 // =============================================================================
@@ -797,79 +779,78 @@ pub mod syslog_action {
 ///
 /// # Permissions
 /// Most operations require CAP_SYSLOG or CAP_SYS_ADMIN.
-pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32) -> i64 {
+pub fn sys_syslog<A: crate::uaccess::UaccessArch>(
+    type_: i32,
+    buf: UserPtr<u8>,
+    len: i32,
+) -> KernelResult<i64> {
     use syslog_action::*;
 
     // Basic validation
     if len < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Linux check_syslog_permissions with dmesg_restrict = 1
     // (syslog_action_restricted is then true for every action): all of
     // them need CAP_SYSLOG
     if !crate::kmsg::syslog_read_allowed() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     match type_ {
         SYSLOG_ACTION_CLOSE | SYSLOG_ACTION_OPEN => {
             // No-op, just return success
-            0
+            Ok(0)
         }
 
         SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
             // Read from kernel log buffer
-            if buf == 0 || len == 0 {
-                return KernelError::InvalidArgument.sysret();
+            if buf.is_null() || len == 0 {
+                return Err(KernelError::InvalidArgument);
             }
-            if !A::access_ok(buf, len as usize) {
-                return KernelError::BadAddress.sysret();
+            if !A::access_ok(buf.addr(), len as usize) {
+                return Err(KernelError::BadAddress);
             }
 
             let data = match type_ {
-                SYSLOG_ACTION_READ => match crate::kmsg::syslog_read(len as usize) {
-                    Ok(d) => d,
-                    Err(e) => return e.sysret(),
-                },
+                SYSLOG_ACTION_READ => crate::kmsg::syslog_read(len as usize)?,
                 _ => crate::kmsg::syslog_read_all(len as usize, type_ == SYSLOG_ACTION_READ_CLEAR),
             };
-            if crate::uaccess::copy_to_user::<A>(buf, &data).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            data.len() as i64
+            crate::uaccess::copy_to_user::<A>(buf.addr(), &data)?;
+            Ok(data.len() as i64)
         }
 
         SYSLOG_ACTION_CLEAR => {
             crate::kmsg::syslog_clear();
-            0
+            Ok(0)
         }
 
         SYSLOG_ACTION_CONSOLE_OFF => {
             // Disable console logging - no-op for now
-            0
+            Ok(0)
         }
 
         SYSLOG_ACTION_CONSOLE_ON => {
             // Enable console logging - no-op for now
-            0
+            Ok(0)
         }
 
         SYSLOG_ACTION_CONSOLE_LEVEL => {
             // Set console log level
             // len parameter is the log level (1-8 typically)
             if !(1..=8).contains(&len) {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
             // No-op for now
-            0
+            Ok(0)
         }
 
-        SYSLOG_ACTION_SIZE_UNREAD => crate::kmsg::syslog_size_unread() as i64,
+        SYSLOG_ACTION_SIZE_UNREAD => Ok(crate::kmsg::syslog_size_unread() as i64),
 
-        SYSLOG_ACTION_SIZE_BUFFER => crate::kmsg::syslog_size_buffer() as i64,
+        SYSLOG_ACTION_SIZE_BUFFER => Ok(crate::kmsg::syslog_size_buffer() as i64),
 
-        _ => KernelError::InvalidArgument.sysret(),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
 

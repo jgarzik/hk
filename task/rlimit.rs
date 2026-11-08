@@ -17,12 +17,11 @@
 //! - Fork creates independent rlimit copies
 //! - prlimit64 can modify another process's rlimits
 
-use crate::arch::Uaccess;
 use crate::signal::get_task_signal_struct;
 use crate::task::Tid;
 use crate::task::percpu::{current_cred, current_tid};
-use crate::uaccess::{copy_val_from_user, copy_val_to_user};
-use crate::util::error::KernelError;
+use crate::uaccess::UserPtr;
+use crate::util::error::{KernelError, KernelResult};
 
 // =============================================================================
 // Resource Limit Constants (Linux ABI)
@@ -172,11 +171,9 @@ pub fn get_task_rlimit(tid: Tid, resource: u32) -> Option<RLimit> {
 /// Set a task's resource limit (`SignalStruct::set_rlimit`: EINVAL,
 /// EPERM for an unprivileged raise of the hard limit); the limit it
 /// replaced, read in the same hold as the store
-pub fn set_task_rlimit(tid: Tid, resource: u32, new: RLimit) -> Result<RLimit, i32> {
-    let signal = get_task_signal_struct(tid).ok_or(KernelError::NoProcess.to_errno_neg())?;
-    let old = signal
-        .set_rlimit(resource, new)
-        .map_err(KernelError::to_errno_neg)?;
+pub fn set_task_rlimit(tid: Tid, resource: u32, new: RLimit) -> KernelResult<RLimit> {
+    let signal = get_task_signal_struct(tid).ok_or(KernelError::NoProcess)?;
+    let old = signal.set_rlimit(resource, new)?;
     // A finite CPU limit is watched from now (Linux update_rlimit_cpu)
     if resource == RLIMIT_CPU {
         let pid = crate::task::percpu::TASKLIST
@@ -211,28 +208,16 @@ pub fn rlimit(resource: u32) -> u64 {
 /// Arguments:
 /// - resource: Which resource limit to get (RLIMIT_*)
 /// - rlim_ptr: Pointer to user-space rlimit structure to fill
-///
-/// Returns: 0 on success, negative errno on error
-pub fn sys_getrlimit(resource: u32, rlim_ptr: u64) -> i64 {
+pub fn sys_getrlimit(resource: u32, rlim_ptr: UserPtr<RLimit>) -> KernelResult<()> {
     if resource as usize >= RLIM_NLIMITS {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    if rlim_ptr == 0 {
-        return KernelError::BadAddress.sysret();
+    if rlim_ptr.is_null() {
+        return Err(KernelError::BadAddress);
     }
-
-    let tid = current_tid();
-    let Some(rlim) = get_task_rlimit(tid, resource) else {
-        // (shouldn't happen for current task)
-        return KernelError::NoProcess.sysret();
-    };
-
-    // Copy to user (16 bytes: cur + max)
-    if copy_val_to_user::<Uaccess, RLimit>(rlim_ptr, &rlim).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-    0
+    // (None shouldn't happen for the current task)
+    let rlim = get_task_rlimit(current_tid(), resource).ok_or(KernelError::NoProcess)?;
+    Ok(rlim_ptr.write(&rlim)?)
 }
 
 /// sys_setrlimit - set resource limits
@@ -242,38 +227,26 @@ pub fn sys_getrlimit(resource: u32, rlim_ptr: u64) -> i64 {
 /// Arguments:
 /// - resource: Which resource limit to set (RLIMIT_*)
 /// - rlim_ptr: Pointer to user-space rlimit structure with new limits
-///
-/// Returns: 0 on success, negative errno on error
-pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
+pub fn sys_setrlimit(resource: u32, rlim_ptr: UserPtr<RLimit>) -> KernelResult<()> {
     // Linux sys_setrlimit: copied in first (EFAULT), then do_prlimit
-    let Ok(new_rlim) = copy_val_from_user::<Uaccess, RLimit>(rlim_ptr) else {
-        return KernelError::BadAddress.sysret();
-    };
+    let new_rlim = rlim_ptr.read()?;
     if resource as usize >= RLIM_NLIMITS {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    if let Err(e) = check(resource, &new_rlim) {
-        return e;
-    }
-
-    let tid = current_tid();
-
-    match set_task_rlimit(tid, resource, new_rlim) {
-        Ok(_) => 0,
-        Err(e) => i64::from(e),
-    }
+    check(resource, &new_rlim)?;
+    set_task_rlimit(current_tid(), resource, new_rlim)?;
+    Ok(())
 }
 
 /// Checks on a new limit before any permission check (Linux
 /// do_prlimit): cur above max is EINVAL; a RLIMIT_NOFILE hard limit
 /// above fs.nr_open is EPERM, even for CAP_SYS_RESOURCE
-fn check(resource: u32, new: &RLimit) -> Result<(), i64> {
+fn check(resource: u32, new: &RLimit) -> KernelResult<()> {
     if new.rlim_cur > new.rlim_max {
-        return Err(KernelError::InvalidArgument.sysret());
+        return Err(KernelError::InvalidArgument);
     }
     if resource == RLIMIT_NOFILE && new.rlim_max > crate::task::fdbits::nr_open() {
-        return Err(KernelError::NotPermitted.sysret());
+        return Err(KernelError::NotPermitted);
     }
     Ok(())
 }
@@ -290,61 +263,50 @@ fn check(resource: u32, new: &RLimit) -> Result<(), i64> {
 /// - resource: Which resource limit (RLIMIT_*)
 /// - new_rlim_ptr: Pointer to new limits (NULL to only get)
 /// - old_rlim_ptr: Pointer to store old limits (NULL to only set)
-///
-/// Returns: 0 on success, negative errno on error
-pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u64) -> i64 {
+pub fn sys_prlimit64(
+    pid: i32,
+    resource: u32,
+    new_rlim_ptr: UserPtr<RLimit>,
+    old_rlim_ptr: UserPtr<RLimit>,
+) -> KernelResult<()> {
     // Linux order: the new limit is copied in (EFAULT), the task found
     // (ESRCH) and the caller's right to it checked (EPERM), then
     // do_prlimit (EINVAL), and the old limit copied out last
-    let new = if new_rlim_ptr != 0 {
-        match copy_val_from_user::<Uaccess, RLimit>(new_rlim_ptr) {
-            Ok(r) => Some(r),
-            Err(_) => return KernelError::BadAddress.sysret(),
-        }
-    } else {
+    let new = if new_rlim_ptr.is_null() {
         None
+    } else {
+        Some(new_rlim_ptr.read()?)
     };
     let target_tid = if pid == 0 {
         current_tid()
     } else {
-        match crate::task::percpu::find_task_by_vpid(pid as u64).map(|t| t.tid()) {
-            Some(tid) => tid,
-            None => return KernelError::NoProcess.sysret(),
-        }
+        crate::task::percpu::find_task_by_vpid(pid as u64)
+            .map(|t| t.tid())
+            .ok_or(KernelError::NoProcess)?
     };
-    if let Err(e) = check_prlimit_permission(target_tid) {
-        return e;
-    }
+    check_prlimit_permission(target_tid)?;
     if resource as usize >= RLIM_NLIMITS {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    if let Some(new) = &new
-        && let Err(e) = check(resource, new)
-    {
-        return e;
+    if let Some(new) = &new {
+        check(resource, new)?;
     }
     // The old value is the one replaced (Linux do_prlimit reads it
     // under the same task_lock as the store)
     let old = match new {
-        Some(new) => match set_task_rlimit(target_tid, resource, new) {
-            Ok(old) => old,
-            Err(e) => return i64::from(e),
-        },
-        None => match get_task_rlimit(target_tid, resource) {
-            Some(r) => r,
-            None => return KernelError::NoProcess.sysret(),
-        },
+        Some(new) => set_task_rlimit(target_tid, resource, new)?,
+        None => get_task_rlimit(target_tid, resource).ok_or(KernelError::NoProcess)?,
     };
-    if old_rlim_ptr != 0 && copy_val_to_user::<Uaccess, RLimit>(old_rlim_ptr, &old).is_err() {
-        return KernelError::BadAddress.sysret();
+    if !old_rlim_ptr.is_null() {
+        old_rlim_ptr.write(&old)?;
     }
-    0
+    Ok(())
 }
 
 /// Linux check_prlimit_permission: the caller itself, a task whose real,
 /// effective and saved ids all equal the caller's real ones, or
 /// CAP_SYS_RESOURCE; else EPERM
-fn check_prlimit_permission(target: crate::task::Tid) -> Result<(), i64> {
+fn check_prlimit_permission(target: crate::task::Tid) -> KernelResult<()> {
     if target == current_tid() {
         return Ok(());
     }
@@ -353,11 +315,11 @@ fn check_prlimit_permission(target: crate::task::Tid) -> Result<(), i64> {
         .read()
         .get(target)
         .map(|t| t.cred())
-        .ok_or(KernelError::NoProcess.sysret())?;
+        .ok_or(KernelError::NoProcess)?;
     let id_match = [t.uid, t.euid, t.suid].iter().all(|&u| u == me.uid)
         && [t.gid, t.egid, t.sgid].iter().all(|&g| g == me.gid);
     if !id_match && !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
-        return Err(KernelError::NotPermitted.sysret());
+        return Err(KernelError::NotPermitted);
     }
     Ok(())
 }
