@@ -12,7 +12,7 @@ use super::flags::{
     O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC,
 };
 use super::mount::MNT_NODEV;
-use super::syscall::{current_fd_table, fd_err, get_nofile_limit};
+use super::syscall::{current_fd_table, get_nofile_limit};
 use crate::task::FD_CLOEXEC;
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
@@ -139,7 +139,6 @@ pub fn sys_openat(dirfd: i32, path_ptr: UserPtr<u8>, flags: u32, mode: u32) -> K
     current_fd_table()
         .lock()
         .alloc_with_flags(file, fd_flags, get_nofile_limit())
-        .map_err(fd_err)
 }
 
 /// Open `path` (relative to `start`) as a new file (Linux do_filp_open):

@@ -2706,7 +2706,8 @@ fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Resul
     let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
     let fd = files
         .lock()
-        .alloc_with_flags(file, crate::task::FD_CLOEXEC, nofile)?;
+        .alloc_with_flags(file, crate::task::FD_CLOEXEC, nofile)
+        .map_err(KernelError::errno)?;
     if crate::uaccess::put_user::<crate::arch::Uaccess, i32>(ptr, fd).is_err() {
         // Released after the table lock (FilesGuard)
         files.lock().close(fd);

@@ -27,7 +27,6 @@ pub fn fd_install(file: Arc<File>, flags: u32) -> Result<i32, KernelError> {
     current_fd_table()
         .lock()
         .alloc_with_flags(file, flags, nofile)
-        .map_err(|e| KernelError::from_errno(e).unwrap_or(KernelError::ProcessFileLimit))
 }
 
 /// Bytes the segments cover, capped at MAX_RW_COUNT

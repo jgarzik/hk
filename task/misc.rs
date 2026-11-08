@@ -1224,7 +1224,7 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 
     match table.alloc_with_flags(pidfd_file, super::FD_CLOEXEC, nofile) {
         Ok(fd) => i64::from(fd),
-        Err(e) => i64::from(e),
+        Err(e) => e.sysret(),
     }
 }
 
@@ -1433,7 +1433,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
         let mut table = caller_fd_table.lock();
         match table.alloc_with_flags(target_file, super::FD_CLOEXEC, nofile) {
             Ok(fd) => fd,
-            Err(e) => return i64::from(e),
+            Err(e) => return e.sysret(),
         }
     };
 

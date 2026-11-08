@@ -22,7 +22,6 @@ pub use super::sync::*;
 
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::util::error::KernelError;
 
 // =============================================================================
 // RWF flags for preadv2/pwritev2
@@ -66,12 +65,6 @@ pub const MAX_RW_COUNT: usize = 0x7fff_f000;
 
 /// Maximum number of iovec entries (Linux default)
 pub const IOV_MAX: usize = 1024;
-
-/// The error of a failed descriptor-table operation (its errno: EMFILE,
-/// EBADF, ENOMEM)
-pub fn fd_err(e: i32) -> KernelError {
-    KernelError::from_errno(e).unwrap_or(KernelError::Io)
-}
 
 // =============================================================================
 // RLIMIT_NOFILE enforcement helpers

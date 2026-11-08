@@ -115,7 +115,7 @@ pub mod wait_options {
     pub const P_PIDFD: i32 = 3;
 }
 
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -665,7 +665,7 @@ impl<F> FdTable<F> {
     /// would be >= nofile, returns Err(EMFILE). Pass `u64::MAX` to disable limit.
     ///
     /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation.
-    pub fn alloc(&mut self, file: Arc<F>, nofile: u64) -> Result<Fd, i32> {
+    pub fn alloc(&mut self, file: Arc<F>, nofile: u64) -> KernelResult<Fd> {
         self.alloc_at_or_above(file, 0, 0, nofile)
     }
 
@@ -683,7 +683,7 @@ impl<F> FdTable<F> {
 
     /// Make room for `fd` before installing it there (Linux
     /// expand_files): Err(EMFILE) at or past fs.nr_open, Err(ENOMEM)
-    pub fn expand(&mut self, fd: Fd) -> Result<(), i32> {
+    pub fn expand(&mut self, fd: Fd) -> KernelResult<()> {
         self.bits.reserve(fd as usize)
     }
 
@@ -723,7 +723,7 @@ impl<F> FdTable<F> {
     ///
     /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation,
     /// not as a separate pre-check. This avoids TOCTOU races.
-    pub fn alloc_with_flags(&mut self, file: Arc<F>, flags: u32, nofile: u64) -> Result<Fd, i32> {
+    pub fn alloc_with_flags(&mut self, file: Arc<F>, flags: u32, nofile: u64) -> KernelResult<Fd> {
         self.alloc_at_or_above(file, 0, flags, nofile)
     }
 
@@ -739,18 +739,18 @@ impl<F> FdTable<F> {
         file: Arc<F>,
         flags: u32,
         nofile: u64,
-    ) -> Result<(), i32> {
+    ) -> KernelResult<()> {
         // RLIMIT_NOFILE enforcement
         if (fd as u64) >= nofile {
             self.defer(file);
-            return Err(KernelError::ProcessFileLimit.errno());
+            return Err(KernelError::ProcessFileLimit);
         }
         if fd < 0 || self.files.contains_key(&fd) {
             self.defer(file);
-            return Err(KernelError::BadFd.errno()); // fd already in use
+            return Err(KernelError::BadFd); // fd already in use
         }
         if !self.install(fd, file, flags) {
-            return Err(KernelError::OutOfMemory.errno());
+            return Err(KernelError::OutOfMemory);
         }
         Ok(())
     }
@@ -769,7 +769,7 @@ impl<F> FdTable<F> {
         min_fd: Fd,
         flags: u32,
         nofile: u64,
-    ) -> Result<Fd, i32> {
+    ) -> KernelResult<Fd> {
         // RLIMIT_NOFILE enforced inside (EMFILE)
         let fd = match self.bits.alloc(min_fd.max(0) as usize, nofile) {
             Ok(fd) => fd as Fd,

@@ -16,7 +16,7 @@ use crate::util::error::KernelResult;
 use super::file::File;
 use super::io::fget;
 use super::posix_lock::{Flock, posix_getlk, posix_setlk, posix_setlkw};
-use super::syscall::{current_fd_table, fd_err, get_nofile_limit};
+use super::syscall::{current_fd_table, get_nofile_limit};
 
 // =============================================================================
 // truncate, ftruncate syscalls
@@ -150,7 +150,7 @@ pub fn sys_dup(oldfd: i32) -> KernelResult<i32> {
     let file = table.get(oldfd).ok_or(KernelError::BadFd)?;
 
     // Allocate fd (RLIMIT_NOFILE enforced inside alloc)
-    table.alloc(file, get_nofile_limit()).map_err(fd_err)
+    table.alloc(file, get_nofile_limit())
 }
 
 /// sys_dup2 - duplicate a file descriptor to a specific number
@@ -216,14 +216,12 @@ fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> KernelResult<i32> {
     let room = table.expand(newfd);
     let file = table.get(oldfd).ok_or(KernelError::BadFd)?;
     // Past fs.nr_open: EBADF, not EMFILE (Linux ksys_dup3)
-    room.map_err(|e| match fd_err(e) {
+    room.map_err(|e| match e {
         KernelError::ProcessFileLimit => KernelError::BadFd,
         e => e,
     })?;
     table.close(newfd);
-    table
-        .alloc_at_with_flags(newfd, file, fd_flags, nofile)
-        .map_err(fd_err)?;
+    table.alloc_at_with_flags(newfd, file, fd_flags, nofile)?;
     Ok(newfd)
 }
 
@@ -291,16 +289,14 @@ pub fn sys_pipe2(pipefd: UserPtr<[i32; 2]>, flags: u32) -> KernelResult<()> {
         0
     };
 
-    let read_fd = table
-        .alloc_with_flags(read_file, fd_flags, nofile)
-        .map_err(fd_err)?;
+    let read_fd = table.alloc_with_flags(read_file, fd_flags, nofile)?;
 
     let write_fd = match table.alloc_with_flags(write_file, fd_flags, nofile) {
         Ok(fd) => fd,
         Err(e) => {
             // Clean up read fd on failure
             table.close(read_fd);
-            return Err(fd_err(e));
+            return Err(e);
         }
     };
 
@@ -387,9 +383,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
                 0
             };
             // RLIMIT_NOFILE enforced inside alloc_at_or_above
-            let new_fd = table
-                .alloc_at_or_above(file, min_fd, fl, nofile)
-                .map_err(fd_err)?;
+            let new_fd = table.alloc_at_or_above(file, min_fd, fl, nofile)?;
             Ok(i64::from(new_fd))
         }
 

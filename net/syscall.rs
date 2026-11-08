@@ -90,14 +90,12 @@ fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> KernelResult<[i32;
         .ok_or(KernelError::BadFd)?;
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
     let mut t = table.lock();
-    let fd1 = t
-        .alloc_with_flags(a, fl, nofile())
-        .map_err(|_| KernelError::ProcessFileLimit)?;
+    let fd1 = t.alloc_with_flags(a, fl, nofile())?;
     match t.alloc_with_flags(b, fl, nofile()) {
         Ok(fd2) => Ok([fd1, fd2]),
-        Err(_) => {
+        Err(e) => {
             t.close(fd1);
-            Err(KernelError::ProcessFileLimit)
+            Err(e)
         }
     }
 }
