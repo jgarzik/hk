@@ -230,7 +230,8 @@ fn lru_ok(vma: &Vma) -> Result<(), KernelError> {
 /// madvise_cold_or_pageout_pte_range), mm lock held for reading: 2MB
 /// pages are split first, the pages taken off the LRU under each
 /// table's PTE lock, then reclaimed with no spinlock held (the swap
-/// writes sleep). Without swap, PAGEOUT leaves anonymous memory alone.
+/// writes sleep), one table's worth at a time like Linux's per-PMD
+/// reclaim_pages. Without swap, PAGEOUT leaves anonymous memory alone.
 fn cold_or_pageout(vma: &Vma, owner: &Mm, t: PgTables<'_>, start: u64, end: u64, pageout: bool) {
     if vma.anon_vma.is_none() || (pageout && super::swap::swap_totals().0 == 0) {
         return;
@@ -242,20 +243,43 @@ fn cold_or_pageout(vma: &Vma, owner: &Mm, t: PgTables<'_>, start: u64, end: u64,
         pages: Vec::new(),
     };
     let _ = super::pagewalk::walk_pte_range(t, start, end, &mut w);
-    if !w.pages.is_empty() {
-        super::vmscan::reclaim_pages(w.pages);
-    }
+    w.flush();
 }
 
-/// `cold_or_pageout`'s walk: the pages to reclaim
+/// Most pages one PTE table maps (a batch never grows under its lock)
+const PTRS_PER_PTE: usize = 512;
+
+/// `cold_or_pageout`'s walk: the pages isolated from the current table,
+/// in room reserved before its PTE lock
 struct Cold<'a> {
     mm: &'a Mm,
     pageout: bool,
     pages: Vec<u64>,
 }
 
+impl Cold<'_> {
+    /// Reclaim the batch (no spin lock held)
+    fn flush(&mut self) {
+        if !self.pages.is_empty() {
+            super::vmscan::reclaim_pages(core::mem::take(&mut self.pages));
+        }
+    }
+}
+
 impl super::pagewalk::PteWalk for Cold<'_> {
-    type Err = core::convert::Infallible;
+    type Err = KernelError;
+
+    /// Before each table's lock: reclaim the last table's pages and
+    /// reserve room for this one's (ENOMEM ends the walk)
+    fn prepare(&mut self, _addr: u64, _end: u64) -> Result<(), Self::Err> {
+        if !self.pageout {
+            return Ok(());
+        }
+        self.flush();
+        self.pages
+            .try_reserve_exact(PTRS_PER_PTE)
+            .map_err(|_| KernelError::OutOfMemory)
+    }
 
     fn huge(&mut self, pmd: super::pgtable::Pmd<'_>, _: u64, _: u64) -> Result<bool, Self::Err> {
         let _ = super::huge_page::split_huge_pmd(self.mm, pmd);
@@ -266,7 +290,8 @@ impl super::pagewalk::PteWalk for Cold<'_> {
         if let Some(phys) = own_page(e) {
             if !self.pageout {
                 super::lru::deactivate(phys);
-            } else if super::lru::isolate(phys) {
+            } else if self.pages.len() < self.pages.capacity() && super::lru::isolate(phys) {
+                // Within the room `prepare` reserved: no allocation here
                 self.pages.push(phys);
             }
         }
