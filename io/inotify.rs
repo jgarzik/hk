@@ -32,14 +32,16 @@
 use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
 use crate::arch::IrqSpinlock;
+use crate::fs::Inode;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
 use crate::fs::iov_iter::IovDest;
+use crate::fs::path_ref::Path;
 use crate::io::fasync::{FasyncList, POLL_IN, fasync_helper, kill_fasync};
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::spin::Mutex;
@@ -167,11 +169,10 @@ struct InotifyWatch {
     wd: i32,
     /// Events to watch for
     mask: u32,
-    /// Path being watched (for reference)
-    #[expect(dead_code)]
-    path: crate::fs::name::FileName,
-    /// Inode number of watched file/dir
-    ino: u64,
+    /// The watched inode, held while the watch lives (Linux: the mark
+    /// sits on the inode's fsnotify connector and pins it). Matched by
+    /// identity: inode numbers repeat across filesystems.
+    inode: Arc<Inode>,
 }
 
 // =============================================================================
@@ -242,10 +243,28 @@ struct InotifyInner {
 }
 
 impl InotifyInner {
-    /// Change the existing watch on `ino`, if any: its result (EEXIST
+    /// Queue `ev` if there is room, else one IN_Q_OVERFLOW (Linux
+    /// fsnotify_insert_event)
+    fn push(&mut self, ev: QueuedEvent) {
+        if self.events.len() < INOTIFY_MAX_QUEUED_EVENTS {
+            self.events.push(ev);
+        } else if self.events.last().map(|e| e.mask) != Some(IN_Q_OVERFLOW) {
+            self.events.push(QueuedEvent {
+                wd: -1,
+                mask: IN_Q_OVERFLOW,
+                cookie: 0,
+                name: None,
+            });
+        }
+    }
+
+    /// Change the existing watch on `inode`, if any: its result (EEXIST
     /// for IN_MASK_CREATE; IN_MASK_ADD adds to the mask, else replaces)
-    fn update_watch(&mut self, mask: u32, ino: u64) -> Option<Result<i32, i32>> {
-        let (wd, watch) = self.watches.iter_mut().find(|(_, w)| w.ino == ino)?;
+    fn update_watch(&mut self, mask: u32, inode: &Arc<Inode>) -> Option<Result<i32, i32>> {
+        let (wd, watch) = self
+            .watches
+            .iter_mut()
+            .find(|(_, w)| Arc::ptr_eq(&w.inode, inode))?;
         if mask & IN_MASK_CREATE != 0 {
             return Some(Err(KernelError::AlreadyExists.to_errno_neg()));
         }
@@ -274,10 +293,156 @@ impl InotifyInner {
 }
 
 impl Drop for Inotify {
-    /// The group's watches go with it (Linux inotify_free_mark)
+    /// The group's watches go with it (Linux inotify_free_mark): their
+    /// marks leave their inodes, which are released with no lock held
     fn drop(&mut self) {
-        let n = self.inner.lock().watches.len();
-        watch_uncharge(self.uid, n);
+        let watches = core::mem::take(&mut self.inner.lock().watches);
+        watch_uncharge(self.uid, watches.len());
+        let me: *const Inotify = self;
+        for (wd, w) in &watches {
+            w.inode.fsnotify.remove(me, *wd);
+        }
+        drop(watches);
+    }
+}
+
+// =============================================================================
+// Marks: the watches on an inode (Linux fsnotify connector)
+// =============================================================================
+
+/// One watch, as its inode knows it (Linux fsnotify_mark on the inode's
+/// connector)
+struct Mark {
+    group: Weak<Inotify>,
+    wd: i32,
+}
+
+/// Push `x` onto the vector under `m`, growing it with the lock released
+/// (nothing allocates under a spin lock): ENOMEM if it cannot grow
+fn push_grow<T>(m: &Mutex<Vec<T>>, x: T) -> Result<(), KernelError> {
+    let mut x = Some(x);
+    loop {
+        let cap = {
+            let mut v = m.lock();
+            if v.len() < v.capacity() {
+                if let Some(x) = x.take() {
+                    v.push(x);
+                }
+                return Ok(());
+            }
+            v.capacity()
+        };
+        let mut bigger = Vec::new();
+        bigger
+            .try_reserve_exact((cap * 2).max(4))
+            .map_err(|_| KernelError::OutOfMemory)?;
+        let mut v = m.lock();
+        if v.len() < bigger.capacity() && v.capacity() < bigger.capacity() {
+            // Moved within the new capacity: no allocation
+            bigger.extend(v.drain(..));
+            core::mem::swap(&mut *v, &mut bigger);
+        }
+        drop(v);
+        // The old (or unused) buffer is freed with the lock released
+        drop(bigger);
+    }
+}
+
+/// The watches on an inode (Linux inode->i_fsnotify_marks): `list` a
+/// spin leaf; `on_sb` set once the inode is on its superblock's
+/// `SbMarks` (it stays there until the inode dies)
+#[derive(Default)]
+pub struct Marks {
+    list: Mutex<Vec<Mark>>,
+    on_sb: core::sync::atomic::AtomicBool,
+}
+
+impl Marks {
+    /// The group's (by address) watch `wd` is on it
+    fn has(&self, group: *const Inotify, wd: i32) -> bool {
+        self.list
+            .lock()
+            .iter()
+            .any(|m| m.wd == wd && core::ptr::eq(m.group.as_ptr(), group))
+    }
+
+    /// Remove the group's (by address) watch `wd`
+    fn remove(&self, group: *const Inotify, wd: i32) {
+        self.list
+            .lock()
+            .retain(|m| !(m.wd == wd && core::ptr::eq(m.group.as_ptr(), group)));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.list.lock().is_empty()
+    }
+}
+
+/// The inodes of a superblock that have had watches (Linux
+/// sb->s_fsnotify_info's connector list), for its shutdown: a spin
+/// leaf. Each inode is listed once (`Marks.on_sb`); entries of dead
+/// inodes are dropped when the list would grow.
+#[derive(Default)]
+pub struct SbMarks(Mutex<Vec<Weak<Inode>>>);
+
+impl SbMarks {
+    /// List `inode` if it is not yet; ENOMEM if the list cannot grow
+    fn add(&self, inode: &Arc<Inode>) -> Result<(), KernelError> {
+        if inode.fsnotify.on_sb.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let r = self.push(Arc::downgrade(inode));
+        if r.is_err() {
+            inode.fsnotify.on_sb.store(false, Ordering::Release);
+        }
+        r
+    }
+
+    /// Push `w`, first dropping dead inodes' entries if the list is full
+    /// (amortized: only before it would grow)
+    fn push(&self, w: Weak<Inode>) -> Result<(), KernelError> {
+        {
+            let mut v = self.0.lock();
+            if v.len() == v.capacity() {
+                v.retain(|w| w.strong_count() != 0);
+            }
+        }
+        push_grow(&self.0, w)
+    }
+
+    /// The filesystem is shutting down (Linux fsnotify_sb_delete, from
+    /// generic_shutdown_super): every watch on its inodes gets
+    /// IN_UNMOUNT, then IN_IGNORED, and goes, releasing its inode
+    pub fn sb_delete(&mut self) {
+        for w in core::mem::take(self.0.get_mut()) {
+            if let Some(inode) = w.upgrade() {
+                destroy_marks(&inode, IN_UNMOUNT);
+            }
+        }
+    }
+}
+
+/// A dentry lets go of `inode` (Linux dentry_unlink_inode): if no name
+/// is left (nlink 0), its watches get IN_DELETE_SELF and IN_IGNORED and
+/// go (fsnotify_inoderemove). Any lock may be held but an inotify one;
+/// nothing here sleeps or allocates.
+pub fn d_iput(inode: &Inode) {
+    if inode.nlink.load(Ordering::Acquire) == 0 && !inode.fsnotify.is_empty() {
+        destroy_marks(inode, IN_DELETE_SELF);
+    }
+}
+
+/// Every watch on `inode` gets `mask` (IN_DELETE_SELF if it asked for
+/// it; IN_UNMOUNT always), with IN_ISDIR for a directory, then
+/// IN_IGNORED, and goes (Linux fsnotify_inode, then
+/// fsnotify_destroy_marks)
+fn destroy_marks(inode: &Inode, mask: u32) {
+    let marks = core::mem::take(&mut *inode.fsnotify.list.lock());
+    let isdir = if inode.mode().is_dir() { IN_ISDIR } else { 0 };
+    for m in &marks {
+        if let Some(g) = m.group.upgrade() {
+            g.destroy_watch(m.wd, inode, mask, isdir);
+        }
     }
 }
 
@@ -364,6 +529,11 @@ pub struct Inotify {
     wait_queue: WaitQueue,
     /// O_ASYNC files (Linux group->fsn_fa)
     fasync: FasyncList,
+    /// Serializes adding watches (Linux group->mark_mutex; sleeping,
+    /// taken before every other inotify lock)
+    mark_mutex: crate::sync::Mutex<()>,
+    /// Its SIGIO work for events queued where kill_fasync cannot sleep
+    sigio: Arc<Mutex<crate::task::workqueue::Work>>,
 }
 
 /// Global cookie counter for rename event pairing
@@ -372,7 +542,17 @@ static NEXT_RENAME_COOKIE: AtomicI32 = AtomicI32::new(1);
 impl Inotify {
     /// Create a new inotify instance
     pub fn new() -> Result<Arc<Self>, KernelError> {
-        try_arc(Self {
+        use crate::task::workqueue::Work;
+        // The SIGIO work item, made now so a removal under a spin lock
+        // allocates nothing; it finds the group through `me`
+        let me: Arc<spin::Once<Weak<Inotify>>> = try_arc(spin::Once::new())?;
+        let found = me.clone();
+        let sigio = try_arc(Mutex::new(Work::new(move || {
+            if let Some(g) = found.get().and_then(Weak::upgrade) {
+                kill_fasync(&g.fasync, crate::signal::SIGIO, POLL_IN);
+            }
+        })))?;
+        let g = try_arc(Self {
             inner: IrqSpinlock::new(InotifyInner {
                 next_wd: 1,
                 watches: BTreeMap::new(),
@@ -382,39 +562,112 @@ impl Inotify {
             uid: crate::task::percpu::current_cred().euid,
             wait_queue: WaitQueue::new(),
             fasync: FasyncList::new(),
-        })
+            mark_mutex: crate::sync::Mutex::new(()),
+            sigio,
+        })?;
+        me.call_once(|| Arc::downgrade(&g));
+        Ok(g)
     }
 
-    /// Add a watch on a path
+    /// Add a watch on `path`'s inode, which it holds; its mark goes on
+    /// the inode first, then the watch into the group (Linux
+    /// inotify_new_watch, fsnotify_add_inode_mark). The caller holds
+    /// `path` (its mount and dentry) throughout, so the filesystem cannot
+    /// shut down nor the dentry let go of the inode meanwhile: no
+    /// removal of its marks can run before the mark is on.
     ///
     /// Returns the watch descriptor on success, or negative errno on error.
-    pub fn add_watch(&self, path: &[u8], mask: u32, ino: u64) -> Result<i32, i32> {
-        if let Some(r) = self.inner.lock().update_watch(mask, ino) {
+    pub fn add_watch(self: &Arc<Self>, path: &Path, mask: u32) -> Result<i32, i32> {
+        let inode = path
+            .dentry
+            .get_inode()
+            .ok_or(KernelError::NotFound.to_errno_neg())?;
+        // One add at a time per group (Linux group->mark_mutex): the wd
+        // picked below stays free until inserted, only an add inserts
+        let _m = self.mark_mutex.lock();
+        if let Some(r) = self.inner.lock().update_watch(mask, &inode) {
             return r;
         }
         // A new watch: charged to the creator first (ENOSPC past
         // max_user_watches), outside the group's lock
         watch_charge(self.uid).map_err(|e| e.to_errno_neg())?;
-        let mut inner = self.inner.lock();
-        if let Some(r) = inner.update_watch(mask, ino) {
-            // Another thread added this inode meanwhile
-            drop(inner);
+        let undo = |e: KernelError| {
             watch_uncharge(self.uid, 1);
-            return r;
-        }
-        let Some(wd) = inner.alloc_wd() else {
-            drop(inner);
-            watch_uncharge(self.uid, 1);
-            return Err(KernelError::NoSpace.to_errno_neg());
+            Err(e.to_errno_neg())
         };
+        let Some(wd) = self.inner.lock().alloc_wd() else {
+            return undo(KernelError::NoSpace);
+        };
+        // The inode on its superblock's list, then the mark on the inode
+        if let Some(sb) = inode.sb.upgrade()
+            && let Err(e) = sb.s_fsnotify.add(&inode)
+        {
+            return undo(e);
+        }
+        let mark = Mark {
+            group: Arc::downgrade(self),
+            wd,
+        };
+        if let Err(e) = push_grow(&inode.fsnotify.list, mark) {
+            return undo(e);
+        }
         let watch = InotifyWatch {
             wd,
             mask: mask & IN_ALL_EVENTS,
-            path: path.into(),
-            ino,
+            inode: inode.clone(),
         };
+        // Published under the group's lock only if the mark is still on
+        // (order Inotify.inner -> Marks; a removal never holds Marks
+        // while taking Inotify.inner)
+        let mut inner = self.inner.lock();
+        if !inode.fsnotify.has(Arc::as_ptr(self), wd) {
+            drop(inner);
+            drop(watch);
+            return undo(KernelError::NotFound);
+        }
         inner.watches.insert(wd, watch);
         Ok(wd)
+    }
+
+    /// Watch `wd` on `inode` gets `mask` (if it asks for it, or it is
+    /// IN_UNMOUNT) with `isdir`, then IN_IGNORED, and goes; its inode is
+    /// released with the group's lock dropped. SIGIO waits for a worker:
+    /// the caller may hold spin locks.
+    fn destroy_watch(self: &Arc<Self>, wd: i32, inode: &Inode, mask: u32, isdir: u32) {
+        let mut inner = self.inner.lock();
+        let ours = inner
+            .watches
+            .get(&wd)
+            .is_some_and(|w| core::ptr::eq(Arc::as_ptr(&w.inode), inode));
+        let Some(gone) = ours.then(|| inner.watches.remove(&wd)).flatten() else {
+            return;
+        };
+        if gone.mask & mask != 0 || mask == IN_UNMOUNT {
+            inner.push(QueuedEvent {
+                wd,
+                mask: mask | isdir,
+                cookie: 0,
+                name: None,
+            });
+        }
+        inner.push(QueuedEvent {
+            wd,
+            mask: IN_IGNORED,
+            cookie: 0,
+            name: None,
+        });
+        drop(inner);
+        watch_uncharge(self.uid, 1);
+        self.wait_queue.wake_all();
+        self.sigio_later();
+        drop(gone);
+    }
+
+    /// SIGIO to the O_ASYNC files from a worker (kill_fasync sleeps)
+    fn sigio_later(&self) {
+        if self.fasync.armed() {
+            crate::task::workqueue::SYSTEM_WQ.queue_work(self.sigio.clone());
+        }
     }
 
     /// Remove a watch by descriptor
@@ -423,8 +676,9 @@ impl Inotify {
     pub fn rm_watch(&self, wd: i32) -> Result<(), i32> {
         let mut inner = self.inner.lock();
 
-        if inner.watches.remove(&wd).is_some() {
+        if let Some(gone) = inner.watches.remove(&wd) {
             let uid = self.uid;
+            let me: *const Inotify = self;
             // Queue IN_IGNORED event
             if inner.events.len() < INOTIFY_MAX_QUEUED_EVENTS {
                 inner.events.push(QueuedEvent {
@@ -435,6 +689,9 @@ impl Inotify {
                 });
             }
             drop(inner);
+            // Its mark leaves the inode, which goes with no lock held
+            gone.inode.fsnotify.remove(me, wd);
+            drop(gone);
             watch_uncharge(uid, 1);
             self.wait_queue.wake_all();
             Ok(())
@@ -735,19 +992,19 @@ pub fn sys_inotify_add_watch(fd: i32, pathname_ptr: u64, mask: u32) -> i64 {
         Err(e) => return e.sysret(),
     };
 
-    // Resolve path to get inode
-    let (ino, is_dir) = match resolve_path_to_ino(&pathname, mask) {
-        Ok(info) => info,
+    // Resolve the path, held until the watch is on
+    let path = match resolve_path(&pathname, mask) {
+        Ok(p) => p,
         Err(e) => return e,
     };
 
     // Check IN_ONLYDIR
-    if (mask & IN_ONLYDIR) != 0 && !is_dir {
+    if (mask & IN_ONLYDIR) != 0 && !path.dentry.get_inode().is_some_and(|i| i.mode().is_dir()) {
         return -20; // ENOTDIR
     }
 
     // Add watch
-    match inotify.add_watch(&pathname, mask, ino) {
+    match inotify.add_watch(&path, mask) {
         Ok(wd) => i64::from(wd),
         Err(e) => i64::from(e),
     }
@@ -783,21 +1040,10 @@ pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
     }
 }
 
-/// Resolve a path to its inode number
-///
-/// Returns (ino, is_dir) on success, negative errno on error.
-fn resolve_path_to_ino(pathname: &[u8], mask: u32) -> Result<(u64, bool), i64> {
-    use crate::fs::path_ref::Path;
-    use crate::fs::{LookupFlags, lookup_path_at};
-
-    // Get current working directory
-    let start: Option<Path> = if pathname.starts_with(b"/") {
-        // Absolute path
-        None
-    } else {
-        // Use current working directory
-        crate::task::percpu::current_cwd()
-    };
+/// The path a watch on `pathname` goes on (Linux inotify_find_inode):
+/// its inode must be readable; or a negative errno
+fn resolve_path(pathname: &[u8], mask: u32) -> Result<Path, i64> {
+    use crate::fs::LookupFlags;
 
     // Set up lookup flags
     let mut lookup_flags = LookupFlags::open();
@@ -805,25 +1051,13 @@ fn resolve_path_to_ino(pathname: &[u8], mask: u32) -> Result<(u64, bool), i64> {
         lookup_flags.follow = false;
     }
 
-    // Lookup path
-    let dentry = match lookup_path_at(start, pathname, lookup_flags) {
-        Ok(d) => d,
-        // Any lookup error as is (Linux user_path_at)
-        Err(e) => return Err(e.sysret()),
-    };
-
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return Err(-2), // ENOENT
-    };
+    // Any lookup error as is (Linux user_path_at)
+    let path =
+        crate::fs::namei::path_lookupat(crate::task::percpu::current_cwd(), pathname, lookup_flags)
+            .map_err(|e| e.sysret())?;
+    let inode = path.dentry.get_inode().ok_or(-2i64)?; // ENOENT
 
     // inotify_find_inode: the watched inode must be readable
-    if let Err(e) = crate::fs::dac::permission(&inode, crate::fs::MAY_READ) {
-        return Err(e.sysret());
-    }
-
-    let ino = inode.ino;
-    let is_dir = inode.mode().is_dir();
-
-    Ok((ino, is_dir))
+    crate::fs::dac::permission(&inode, crate::fs::MAY_READ).map_err(|e| e.sysret())?;
+    Ok(path)
 }

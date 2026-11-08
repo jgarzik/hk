@@ -515,6 +515,9 @@ pub struct Inode {
     /// The file's page cache (Linux i_data)
     pub i_data: crate::mm::filemap::AddressSpace,
 
+    /// The inotify watches on it (Linux i_fsnotify_marks)
+    pub fsnotify: crate::io::inotify::Marks,
+
     /// On its superblock's dirty list (Linux I_DIRTY_PAGES; fs_writeback)
     pub(crate) i_dirty: core::sync::atomic::AtomicBool,
 
@@ -573,6 +576,7 @@ impl Inode {
             i_hash: AtomicU64::new(0),
             i_hashed: core::sync::atomic::AtomicBool::new(false),
             i_data: crate::mm::filemap::AddressSpace::new(),
+            fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
@@ -617,6 +621,7 @@ impl Inode {
             i_hash: AtomicU64::new(0),
             i_hashed: core::sync::atomic::AtomicBool::new(false),
             i_data: crate::mm::filemap::AddressSpace::new(),
+            fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),

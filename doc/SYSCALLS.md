@@ -447,7 +447,7 @@ goes down later.
 
 - [x] inotify_init (x86-64 only, legacy; use inotify_init1)
 - [x] inotify_init1
-- [x] inotify_add_watch
+- [x] inotify_add_watch (a watch is on the inode, not its number: one per inode across filesystems; IN_DELETE_SELF, IN_UNMOUNT and IN_IGNORED are delivered, no other event yet)
 - [x] inotify_rm_watch
 - [x] fanotify_init
 - [x] fanotify_mark

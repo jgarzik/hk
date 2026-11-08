@@ -803,9 +803,10 @@ or discards the range).
 Designs that grew one commit at a time. Tag = roadmap phase
 (doc/ROADMAP.md).
 
-- **Syscalls that do not deliver** (H/C): inotify and fanotify never
-  queue an event (no fsnotify hooks in the VFS); waitid without
-  WEXITED is EINVAL (C).
+- **Syscalls that do not deliver** (H/C): inotify queues only
+  IN_DELETE_SELF, IN_UNMOUNT and IN_IGNORED, fanotify nothing (no
+  fsnotify hooks in the VFS operations); waitid without WEXITED is
+  EINVAL (C).
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in five
   places; four `current_time`s; about ten user-timespec readers each validating
   (Linux get_timespec64); three iovec structs and five

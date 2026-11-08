@@ -174,9 +174,10 @@ impl Dentry {
 
     /// The child `name` was unlinked (Linux d_delete): one no one but
     /// the caller (`held` references) holds becomes negative in place,
-    /// with what was cached under it dropped; a held one leaves the
-    /// tree. Decided under this parent's d_lock, where lookups take
-    /// their references.
+    /// with what was cached under it dropped, and lets go of its inode
+    /// after the locks (dentry_unlink_inode); a held one leaves the
+    /// tree, and lets go when its last holder does. Decided under this
+    /// parent's d_lock, where lookups take their references.
     pub fn d_delete(&self, name: &[u8], held: usize) {
         let mut p = self.d_lock.write();
         let Some(c) = p.children.get(name) else {
@@ -184,8 +185,13 @@ impl Dentry {
         };
         if Arc::strong_count(c) <= held + 1 {
             let mut ci = c.d_lock.write();
-            ci.inode = None;
+            let inode = ci.inode.take();
             ci.children.clear();
+            drop(ci);
+            drop(p);
+            if let Some(i) = inode {
+                crate::io::inotify::d_iput(&i);
+            }
         } else if let Some(c) = p.children.remove(name) {
             c.d_lock.write().flags.unhashed = true;
             drop(p);
@@ -368,6 +374,11 @@ impl Drop for Dentry {
     /// could make it
     fn drop(&mut self) {
         NR_DENTRY.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        // Its inode, if the last name of it is gone, takes its watches
+        // with it (Linux dentry_unlink_inode at the final dput)
+        if let Some(i) = self.d_lock.get_mut().inode.take() {
+            crate::io::inotify::d_iput(&i);
+        }
         let mut next = self.d_lock.get_mut().parent.take();
         while let Some(p) = next {
             next = Arc::into_inner(p).and_then(|mut d| d.d_lock.get_mut().parent.take());
