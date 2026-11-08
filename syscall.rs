@@ -406,7 +406,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
                 as u64
         }
         Sys::Fallocate => {
-            crate::fs::misc::sys_fallocate(a[0] as i32, a[1] as i32, a[2] as i64, a[3] as i64)
+            crate::fs::misc::sys_fallocate(a[0] as i32, a[1] as i32, a[2] as i64, a[3] as i64).ret()
                 as u64
         }
         Sys::FanotifyInit => {
@@ -449,16 +449,28 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         .ret() as u64,
         Sys::Fcntl => crate::fs::syscall::sys_fcntl(a[0] as i32, a[1] as i32, a[2]).ret() as u64,
         Sys::Fdatasync => crate::fs::syscall::sys_fdatasync(a[0] as i32).ret() as u64,
-        Sys::Fgetxattr => {
-            crate::fs::syscall::sys_fgetxattr(a[0] as i32, a[1], a[2], a[3]).ret() as u64
+        Sys::Fgetxattr => crate::fs::syscall::sys_fgetxattr(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+        )
+        .ret() as u64,
+        Sys::Flistxattr => {
+            crate::fs::syscall::sys_flistxattr(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
         }
-        Sys::Flistxattr => crate::fs::syscall::sys_flistxattr(a[0] as i32, a[1], a[2]).ret() as u64,
         Sys::Flock => crate::fs::flock::sys_flock(a[0] as i32, a[1] as i32).ret() as u64,
-        Sys::Fremovexattr => crate::fs::syscall::sys_fremovexattr(a[0] as i32, a[1]).ret() as u64,
-        Sys::Fsetxattr => {
-            crate::fs::syscall::sys_fsetxattr(a[0] as i32, a[1], a[2], a[3], a[4] as i32).ret()
-                as u64
+        Sys::Fremovexattr => {
+            crate::fs::syscall::sys_fremovexattr(a[0] as i32, UserPtr::new(a[1])).ret() as u64
         }
+        Sys::Fsetxattr => crate::fs::syscall::sys_fsetxattr(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+            a[4] as i32,
+        )
+        .ret() as u64,
         Sys::Fstat => crate::fs::syscall::sys_fstat(a[0] as i32, UserPtr::new(a[1])).ret() as u64,
         Sys::Fstatfs => {
             crate::fs::syscall::sys_fstatfs(a[0] as i32, UserPtr::new(a[1])).ret() as u64
@@ -563,7 +575,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Getuid => {
             crate::task::syscall::sys_getuid(crate::task::percpu::current_cred().uid).ret() as u64
         }
-        Sys::Getxattr => crate::fs::syscall::sys_getxattr(a[0], a[1], a[2], a[3]).ret() as u64,
+        Sys::Getxattr => crate::fs::syscall::sys_getxattr(
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+        )
+        .ret() as u64,
         Sys::GetMempolicy => crate::mm::mempolicy::sys_get_mempolicy(
             UserPtr::new(a[0]),
             UserPtr::new(a[1]),
@@ -619,7 +637,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Kill => {
             crate::signal::syscall::sys_kill(i64::from(a[0] as i32), a[1] as u32).ret() as u64
         }
-        Sys::Lgetxattr => crate::fs::syscall::sys_lgetxattr(a[0], a[1], a[2], a[3]).ret() as u64,
+        Sys::Lgetxattr => crate::fs::syscall::sys_lgetxattr(
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+        )
+        .ret() as u64,
         Sys::Linkat => crate::fs::syscall::sys_linkat(
             a[0] as i32,
             UserPtr::new(a[1]),
@@ -629,15 +653,29 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         )
         .ret() as u64,
         Sys::Listen => crate::net::syscall::sys_listen(a[0] as i32, a[1] as i32).ret() as u64,
-        Sys::Listxattr => crate::fs::syscall::sys_listxattr(a[0], a[1], a[2]).ret() as u64,
-        Sys::Llistxattr => crate::fs::syscall::sys_llistxattr(a[0], a[1], a[2]).ret() as u64,
-        Sys::Lremovexattr => crate::fs::syscall::sys_lremovexattr(a[0], a[1]).ret() as u64,
+        Sys::Listxattr => {
+            crate::fs::syscall::sys_listxattr(UserPtr::new(a[0]), UserPtr::new(a[1]), a[2]).ret()
+                as u64
+        }
+        Sys::Llistxattr => {
+            crate::fs::syscall::sys_llistxattr(UserPtr::new(a[0]), UserPtr::new(a[1]), a[2]).ret()
+                as u64
+        }
+        Sys::Lremovexattr => {
+            crate::fs::syscall::sys_lremovexattr(UserPtr::new(a[0]), UserPtr::new(a[1])).ret()
+                as u64
+        }
         Sys::Lseek => {
             crate::fs::syscall::sys_lseek(a[0] as i32, a[1] as i64, a[2] as i32).ret() as u64
         }
-        Sys::Lsetxattr => {
-            crate::fs::syscall::sys_lsetxattr(a[0], a[1], a[2], a[3], a[4] as i32).ret() as u64
-        }
+        Sys::Lsetxattr => crate::fs::syscall::sys_lsetxattr(
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+            a[4] as i32,
+        )
+        .ret() as u64,
         Sys::Madvise => crate::mm::madvise::sys_madvise(a[0], a[1], a[2] as i32).ret() as u64,
         Sys::Mbind => {
             crate::mm::mempolicy::sys_mbind(a[0], a[1], a[2], UserPtr::new(a[3]), a[4], a[5] as u32)
@@ -672,7 +710,14 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::mm::syscall::sys_mmap(a[0], a[1], a[2] as u32, a[3] as u32, a[4] as i32, a[5])
                 .ret() as u64
         }
-        Sys::Mount => crate::fs::syscall::sys_mount(a[0], a[1], a[2], a[3], a[4]).ret() as u64,
+        Sys::Mount => crate::fs::syscall::sys_mount(
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+            UserPtr::new(a[4]),
+        )
+        .ret() as u64,
         Sys::MovePages => crate::mm::mempolicy::sys_move_pages(
             i64::from(a[0] as i32),
             a[1],
@@ -767,7 +812,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
                 as u64
         }
         Sys::Pipe2 => crate::fs::syscall::sys_pipe2(UserPtr::new(a[0]), a[1] as u32).ret() as u64,
-        Sys::PivotRoot => crate::fs::syscall::sys_pivot_root(a[0], a[1]).ret() as u64,
+        Sys::PivotRoot => {
+            crate::fs::syscall::sys_pivot_root(UserPtr::new(a[0]), UserPtr::new(a[1])).ret() as u64
+        }
         Sys::Ppoll => {
             crate::fs::syscall::sys_ppoll(a[0], a[1] as u32, a[2], a[3], a[4]).ret() as u64
         }
@@ -875,7 +922,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::net::syscall::sys_recvmsg(a[0] as i32, UserPtr::new(a[1]), a[2] as i32).ret()
                 as u64
         }
-        Sys::Removexattr => crate::fs::syscall::sys_removexattr(a[0], a[1]).ret() as u64,
+        Sys::Removexattr => {
+            crate::fs::syscall::sys_removexattr(UserPtr::new(a[0]), UserPtr::new(a[1])).ret() as u64
+        }
         Sys::Renameat => crate::fs::syscall::sys_renameat(
             a[0] as i32,
             UserPtr::new(a[1]),
@@ -1102,9 +1151,14 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::syscall::sys_setuid(a[0] as u32, crate::task::percpu::current_cred())
                 as u64
         }
-        Sys::Setxattr => {
-            crate::fs::syscall::sys_setxattr(a[0], a[1], a[2], a[3], a[4] as i32).ret() as u64
-        }
+        Sys::Setxattr => crate::fs::syscall::sys_setxattr(
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3],
+            a[4] as i32,
+        )
+        .ret() as u64,
         Sys::SetMempolicy => {
             crate::mm::mempolicy::sys_set_mempolicy(a[0] as i32, UserPtr::new(a[1]), a[2]).ret()
                 as u64
@@ -1231,7 +1285,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::syscall::sys_truncate(UserPtr::new(a[0]), a[1] as i64).ret() as u64
         }
         Sys::Umask => crate::fs::syscall::sys_umask(a[0] as u32).ret() as u64,
-        Sys::Umount2 => crate::fs::syscall::sys_umount2(a[0], a[1] as i32).ret() as u64,
+        Sys::Umount2 => {
+            crate::fs::syscall::sys_umount2(UserPtr::new(a[0]), a[1] as i32).ret() as u64
+        }
         Sys::Uname => crate::ns::uts::sys_uname(UserPtr::new(a[0])).ret() as u64,
         Sys::Unlinkat => {
             crate::fs::syscall::sys_unlinkat(a[0] as i32, UserPtr::new(a[1]), a[2] as i32).ret()
