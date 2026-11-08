@@ -216,11 +216,10 @@ impl PollContext {
         self.files.push(file);
     }
 
-    /// Register the polling task on `wq`
+    /// Register the polling task on `wq`: one entry per call, even for a
+    /// queue already registered on (Linux __pollwait; each wakes the
+    /// poller, which re-scans), so registering stays O(1) per fd
     fn add_entry(&mut self, wq: &WaitQueue) {
-        if self.entries.iter().any(|(q, _)| core::ptr::eq(*q, wq)) {
-            return;
-        }
         let entry = Box::pin(WaitEntry::new());
         wq.add_wait_queue(entry.as_ref());
         self.entries
