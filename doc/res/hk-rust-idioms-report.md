@@ -123,6 +123,8 @@ is done and linted (`manual_let_else`), so its error exits become `?`.
 ## 5. Struct update syntax: `..Default::default()` / `..FromBytes::zeroed()`
 
 - **Feature:** struct update (old) plus `#[derive(Default)]` with enum `#[default]` (1.62).
+- **Also:** the 7 non-const `new()`s that set every field to its default
+  become `#[derive(Default)]` (about -50).
 - **Evidence:**
   - 882 `field: 0|false|None|[0; N]|Vec::new()` lines in kernel literals, 454 in user/.
   - A scan for literals with 3 or more such fields finds about **544 removable lines

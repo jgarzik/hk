@@ -1382,9 +1382,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
     if entries > IORING_MAX_ENTRIES && !clamp {
         return KernelError::InvalidArgument.sysret();
     }
-    let sq_entries = core::cmp::min(entries, IORING_MAX_ENTRIES)
-        .max(1)
-        .next_power_of_two();
+    let sq_entries = core::cmp::min(entries, IORING_MAX_ENTRIES).next_power_of_two();
 
     // Determine CQ entries (default 2x SQ, or custom if IORING_SETUP_CQSIZE)
     let cq_entries = if params.flags & IORING_SETUP_CQSIZE != 0 {
@@ -1392,9 +1390,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
         if cq == 0 || (cq > IORING_MAX_ENTRIES * 2 && !clamp) {
             return KernelError::InvalidArgument.sysret();
         }
-        let cq = core::cmp::min(cq, IORING_MAX_ENTRIES * 2)
-            .max(1)
-            .next_power_of_two();
+        let cq = core::cmp::min(cq, IORING_MAX_ENTRIES * 2).next_power_of_two();
         if cq < sq_entries {
             return KernelError::InvalidArgument.sysret();
         }
