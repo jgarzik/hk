@@ -37,6 +37,8 @@ use core::pin::Pin;
 use crate::fs::File;
 use crate::sync::waitqueue::{WaitEntry, WaitQueue};
 use crate::task::Tid;
+use crate::util::error::KernelError;
+use crate::util::kmem::KVec;
 
 // =============================================================================
 // Poll Event Masks (from include/uapi/asm-generic/poll.h)
@@ -196,14 +198,16 @@ pub struct PollContext {
 }
 
 impl PollContext {
-    /// Create a new poll context for the current task
-    pub fn new(tid: Tid) -> Self {
-        Self {
+    /// A context sized for `n` registering files, so the first scan
+    /// does not grow it one fd at a time; ENOMEM (Linux poll_get_entry
+    /// fails the poll the same way)
+    pub fn with_capacity(tid: Tid, n: usize) -> Result<Self, KernelError> {
+        Ok(Self {
             task: tid,
-            entries: Vec::new(),
-            files: Vec::new(),
+            entries: KVec::try_with_capacity(n)?.into_vec(),
+            files: KVec::try_with_capacity(n)?.into_vec(),
             owners: Vec::new(),
-        }
+        })
     }
 
     /// Keep `file` alive for the lifetime of this context (call before

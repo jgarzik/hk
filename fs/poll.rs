@@ -186,8 +186,17 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    // Create poll context (wait queue registrations, dropped at return)
-    let mut ctx = PollContext::new(tid);
+    // Create poll context (wait queue registrations, dropped at return;
+    // only a poll that may sleep registers)
+    let regs = if deadline == Some(0) {
+        0
+    } else {
+        pollfds.len()
+    };
+    let mut ctx = match PollContext::with_capacity(tid, regs) {
+        Ok(c) => c,
+        Err(e) => return e.sysret(),
+    };
     let mut first_pass = true;
     let mut ready_count;
 
@@ -483,7 +492,20 @@ fn do_select_internal(
     };
     let bit = |v: &[u64], fd: usize| v.get(fd / 64).is_some_and(|w| w & (1 << (fd % 64)) != 0);
 
-    let mut ctx = PollContext::new(current_tid());
+    // Sized for the fds asked about (not nfds: select(FD_SETSIZE) with a
+    // few bits set is the common case); only a select that may sleep
+    // registers
+    let asked = || {
+        let w = |v: &[u64], i: usize| v.get(i).copied().unwrap_or(0);
+        (0..words)
+            .map(|i| (w(&rd, i) | w(&wr, i) | w(&ex, i)).count_ones() as usize)
+            .sum()
+    };
+    let regs = if deadline == Some(0) { 0 } else { asked() };
+    let mut ctx = match PollContext::with_capacity(current_tid(), regs) {
+        Ok(c) => c,
+        Err(e) => return e.sysret(),
+    };
     let mut first_pass = true;
     let mut ready_count;
     let fd_table = current_fd_table();
