@@ -669,67 +669,59 @@ pub fn sys_vmsplice(
         return Err(KernelError::BadFd);
     }
 
-    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
-    let mut total = 0usize;
-
-    for seg in &segs {
-        if seg.iov_len == 0 {
-            continue;
-        }
-
-        // Allocate a pipe page
-        let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
-
-        // Copy user data to page (limited to PAGE_SIZE)
-        let to_copy = (seg.iov_len as usize).min(PAGE_SIZE);
-        // SAFETY: page.frame is a freshly allocated, kernel-mapped page of
-        // PAGE_SIZE bytes owned by this pipe buffer.
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), to_copy)
-        };
-        if copy_from_user::<Uaccess>(dst, seg.iov_base, to_copy).is_err() {
-            // Bytes already queued count as success (Linux iov_iter)
-            pipe.wake_readers();
-            return if total > 0 {
-                Ok(total)
-            } else {
-                Err(KernelError::BadAddress)
-            };
-        }
-
-        // Insert into pipe
-        let pipe_buf = PipeBuffer::new(
-            page,
-            0,
-            to_copy as u32,
-            pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
-        );
-
-        let mut inner = pipe.lock();
-        if inner.is_full() {
-            drop(inner);
-            if nonblock {
-                return if total > 0 {
-                    Ok(total)
-                } else {
-                    Err(KernelError::WouldBlock)
-                };
-            }
-            break;
-        }
-
-        if inner.push_buffer(pipe_buf).is_err() {
-            drop(inner);
-            break;
-        }
-        drop(inner);
-
-        total += to_copy;
+    // Linux vmsplice_to_pipe: wait for room, then fill what fits
+    let mut g = pipe.lock_room(flags & SPLICE_F_NONBLOCK != 0)?;
+    let r = iter_to_pipe(&mut g, &segs);
+    drop(g);
+    if matches!(r, Ok(n) if n > 0) {
+        pipe.wake_readers();
     }
+    r
+}
 
-    pipe.wake_readers();
-
+/// Copy the segments into pipe pages, a page at a time, until they or
+/// the room run out (Linux iter_to_pipe); a fault or no memory ends it,
+/// an error only if nothing was copied
+fn iter_to_pipe(g: &mut PipeGuard<'_>, segs: &[IoVec]) -> KernelResult<usize> {
+    let mut total = 0usize;
+    for seg in segs {
+        let mut off = 0u64;
+        while off < seg.iov_len {
+            if g.is_full() {
+                return Ok(total);
+            }
+            match page_from_user(seg.iov_base + off, seg.iov_len - off) {
+                Ok(pb) => {
+                    off += u64::from(pb.len);
+                    total += pb.len as usize;
+                    // Not full, under this lock: the push cannot fail
+                    if g.push_buffer(pb).is_err() {
+                        return Ok(total);
+                    }
+                }
+                Err(e) if total == 0 => return Err(e),
+                Err(_) => return Ok(total),
+            }
+        }
+    }
     Ok(total)
+}
+
+/// A pipe buffer holding up to a page of user memory at `addr` (`len`
+/// bytes left there): EFAULT, ENOMEM
+fn page_from_user(addr: u64, len: u64) -> KernelResult<PipeBuffer> {
+    let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
+    let n = len.min(PAGE_SIZE as u64) as usize;
+    // SAFETY: page.frame is a freshly allocated, kernel-mapped page of
+    // PAGE_SIZE bytes owned by this buffer, and `n <= PAGE_SIZE`
+    let dst = unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), n) };
+    copy_from_user::<Uaccess>(dst, addr, n).map_err(|_| KernelError::BadAddress)?;
+    Ok(PipeBuffer::new(
+        page,
+        0,
+        n as u32,
+        pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
+    ))
 }
 
 /// sys_sendfile64 - send file data to socket/file

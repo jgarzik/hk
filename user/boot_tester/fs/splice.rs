@@ -21,6 +21,9 @@
 //!   no reader it is EPIPE (SIGPIPE ignored); nonblocking, tee on an
 //!   empty pipe with a writer is EAGAIN and pipe to pipe from one with
 //!   no writer is 0
+//! - VMSPLICE_WAIT: vmsplice into a full pipe waits for room, into one
+//!   with no reader is EPIPE (Linux wait_for_space), and takes a
+//!   segment longer than a page whole (iter_to_pipe)
 
 use crate::harness::T;
 use hk_syscall::{
@@ -47,6 +50,7 @@ pub fn run_tests() {
     vmsplice_iov();
     copy_file_range_args();
     splice_wait();
+    vmsplice_wait();
     sys_unlink(SRC.as_ptr());
     sys_unlink(DST.as_ptr());
 }
@@ -322,5 +326,30 @@ fn splice_wait() {
     for fd in [p[0], p[1], f[1], out, src] {
         close(fd);
     }
+    t.done();
+}
+
+static mut VBUF: [u8; 8192] = [b'v'; 8192];
+
+fn vmsplice_wait() {
+    let mut t = T::new(b"VMSPLICE_WAIT");
+    let iov = |len| IoVec {
+        // SAFETY: only read, by the kernel
+        iov_base: unsafe { (&raw const VBUF).cast::<u8>() },
+        iov_len: len,
+    };
+    let f = full_pipe();
+    let pid = later(f[0], true);
+    t.eq(b"full", sys_vmsplice(f[1], &iov(16), 1, 0), 16);
+    reap(pid);
+    close(f[0]);
+    sigpipe(SIG_IGN);
+    t.eq(b"epipe", sys_vmsplice(f[1], &iov(16), 1, 0), EPIPE);
+    sigpipe(SIG_DFL);
+    close(f[1]);
+    let p = pipe();
+    t.eq(b"two pages", sys_vmsplice(p[1], &iov(8192), 1, 0), 8192);
+    close(p[0]);
+    close(p[1]);
     t.done();
 }
