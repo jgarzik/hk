@@ -258,11 +258,17 @@ impl SigInfo {
         layout(self.sig(), self.code)
     }
 
+    /// It names its sender: a kill, sigqueue or SIGCHLD info (Linux
+    /// has_si_pid_and_uid)
+    pub fn has_sender(&self) -> bool {
+        matches!(self.layout(), Layout::Kill | Layout::Rt | Layout::Chld)
+    }
+
     /// Sent by a task the receiver's pid namespace does not see: an
     /// info naming its sender (kill, sigqueue, SIGCHLD) names none
     /// (Linux send_signal_locked: si_pid 0 from an ancestor namespace)
     pub fn hide_sender(&mut self) {
-        if matches!(self.layout(), Layout::Kill | Layout::Rt | Layout::Chld) {
+        if self.has_sender() {
             self.f[..4].copy_from_slice(&0i32.to_ne_bytes());
         }
     }

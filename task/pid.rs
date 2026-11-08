@@ -468,6 +468,22 @@ pub fn current_pid_ns() -> &'static PidNamespace {
     crate::task::percpu::current_pid_ns()
 }
 
+/// The caller has a number in `ns`: it is in `ns` or a namespace
+/// below it (Linux task_pid_nr_ns(current, ns) != 0); lock-free
+pub fn current_in(ns: &PidNamespace) -> bool {
+    let mut n = Some(current_pid_ns());
+    while let Some(cur) = n {
+        if core::ptr::eq(cur, ns) {
+            return true;
+        }
+        if cur.level <= ns.level {
+            return false;
+        }
+        n = cur.parent.as_deref();
+    }
+    false
+}
+
 /// The live `Pid` numbered `nr` in the caller's namespace (Linux
 /// find_vpid)
 pub fn find_vpid(nr: u32) -> Option<Arc<Pid>> {

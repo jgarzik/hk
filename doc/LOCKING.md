@@ -2821,6 +2821,7 @@ state patterns.
 | `SigHand.action` | `IrqSpinlock<Box<[SigAction]>>` (65 entries) | Signal handler table |
 | `SignalStruct.rlim` | `IrqSpinlock<[RLimit; N]>` | Resource limits (leaf) |
 | `SignalStruct.subreaper` | `TableCell<bool>` (TASKLIST) | PR_SET_CHILD_SUBREAPER (Linux signal->is_child_subreaper): set by any thread under the write lock, read under the read lock by prctl and by the reparenting it decides (`find_reaper`, in `forget_original_parent`'s write section) |
+| `SignalStruct.unkillable` | `AtomicBool`, no lock | A pid namespace's init (Linux SIGNAL_UNKILLABLE): set before the group is visible (fork of a process numbered 1 in its namespace, the global init at boot), cleared once when the kernel forces a SIG_DFL signal on it; read by a send (`Target::protects`), CLONE_PARENT and delivery. A monotonic flag no other state is ordered with |
 
 #### Why SigHand.action Uses IrqSpinlock
 
@@ -2890,10 +2891,10 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    walked under TASKLIST (`signal::choose`: read lock; a send under the
    write lock, a child's notice, chooses in that section), each
    candidate's `Task.sig` taken alone to test wants_signal, and whether
-   it ends the group decided there, never for the protected global
-   init. The lock is dropped before the chosen thread's TIF_SIGPENDING
-   is recomputed under its `Task.sig` and it is woken (a decided group
-   kill done then too). A thread that blocks a group signal or starts
+   it ends the group decided there, never for an init its protection
+   covers (`Target::protects`). The lock is dropped before the chosen
+   thread's TIF_SIGPENDING is recomputed under its `Task.sig` and it is
+   woken (a decided group kill done then too). A thread that blocks a group signal or starts
    exiting hands it on the same way after dropping its own lock
    (retarget_shared_pending). A thread that changes its mask between
    the test and the wakeup sees the signal when it recomputes

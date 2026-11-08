@@ -29,7 +29,7 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::{IrqSpinlock, UserFrame};
 use crate::task::{Pid, Tid};
@@ -742,6 +742,8 @@ use crate::task::percpu::{TASKLIST, TaskRef};
 pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
     // Built before TASKLIST is taken, with init's limits (init_rlimits)
     let s = arc_nofail(SignalStruct::new());
+    // The global init (Linux init_signals: SIGNAL_UNKILLABLE)
+    s.set_unkillable();
     let state = TaskSignalState::with_shared(SharedPending(Some(s.clone())));
     let mut table = TASKLIST.write();
     if table.get(tid).is_some() {
@@ -980,6 +982,15 @@ pub fn fork_signal(
     Ok((child_state, fork))
 }
 
+impl ForkSignal {
+    /// The new process is its pid namespace's init (Linux
+    /// copy_process: SIGNAL_UNKILLABLE for is_child_reaper), set
+    /// before it is visible
+    pub fn set_unkillable(&self) {
+        self.signal.set_unkillable();
+    }
+}
+
 /// Attach a new task's shared signal objects, once it is in TASKLIST
 pub fn install_fork_signal(child_tid: Tid, f: ForkSignal) {
     if f.joined {
@@ -1153,23 +1164,19 @@ fn sig_ignored(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: u32
     }
 }
 
-/// The global init lost SIGNAL_UNKILLABLE (Linux
-/// force_sig_info_to_task clears it when the kernel forces a signal
-/// whose action is SIG_DFL): one flag, as there is one global init
-static INIT_KILLABLE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// Whether `tid` is a thread of the global init (pid 1 of the initial
-/// pid namespace; Linux is_global_init) and still SIGNAL_UNKILLABLE
-fn init_unkillable(tid: Tid) -> bool {
-    !INIT_KILLABLE.load(core::sync::atomic::Ordering::Acquire)
-        && TASKLIST.read().get(tid).is_some_and(|t| t.task.pid == 1)
+/// The current thread's group is a namespace init's, still
+/// SIGNAL_UNKILLABLE (Linux get_signal's check)
+fn current_unkillable(tid: Tid) -> bool {
+    get_task_signal_struct(tid).is_some_and(|s| s.unkillable())
 }
 
-/// Linux sig_task_ignored for the global init: SIGKILL and SIGSTOP never
-/// reach it, nor any signal whose action is SIG_DFL (so a stray SIGTERM
-/// or SIGPIPE does not kill it). A blocked signal is still queued (its
-/// action may change before it is unblocked). A kernel-forced signal
-/// never gets here: it lifts the protection (`send_signal_force`).
+/// Linux sig_task_ignored for a protected init (`Send.init`): SIGKILL
+/// and SIGSTOP never reach it, nor any signal whose action is SIG_DFL
+/// (so a stray SIGTERM or SIGPIPE does not kill it). A blocked signal
+/// is still queued (its action may change before it is unblocked). A
+/// kernel-forced signal never gets here: it lifts the protection
+/// (`send_signal_force`), and SIGKILL or SIGSTOP from an ancestor
+/// namespace is not protected against ([`Target::protects`]).
 fn init_ignores(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: u32) -> bool {
     let kernel_only = sig == SIGKILL || sig == SIGSTOP;
     if kernel_only {
@@ -1214,6 +1221,19 @@ impl SendInfo {
     /// [`resolve`](Self::resolve) for a send that checks its sender
     /// (Linux send_signal_locked): an info whose sender `ns` does not
     /// see names none
+    /// SIGKILL and SIGSTOP with it reach a namespace init (Linux
+    /// send_signal_locked's `force`): from the kernel, or from a sender
+    /// outside the receiver's namespace `ns` (an ancestor's), with an
+    /// info that names its sender
+    fn forces(&self, ns: &crate::ns::PidNamespace) -> bool {
+        let outside = || !crate::task::pid::current_in(ns);
+        match self {
+            Self::User => outside(),
+            Self::Kernel => true,
+            Self::Info(i) => i.has_sender() && (i.code == si_code::SI_KERNEL || outside()),
+        }
+    }
+
     fn resolve_checked(&self, sig: u32, ns: &crate::ns::PidNamespace) -> SigInfo {
         let mut i = self.resolve(sig, ns);
         if matches!(self, Self::Info(_))
@@ -1270,15 +1290,30 @@ pub enum PidType {
 /// The receiver of a send, read under TASKLIST while it is still listed
 /// (a reaped task is gone, whatever reuses its number): a kernel
 /// thread, the global init, its group exiting, in a ptrace stop, its
-/// real uid, RLIMIT_SIGPENDING and handlers
+/// real uid, RLIMIT_SIGPENDING, handlers and group
 struct Target {
     kthread: bool,
-    init: bool,
+    /// A thread of the global init (Linux is_global_init)
+    global: bool,
     group_exit: bool,
     stopped: bool,
     uid: crate::task::Uid,
     limit: u64,
     sighand: Option<Arc<SigHand>>,
+    signal: Option<Arc<SignalStruct>>,
+}
+
+impl Target {
+    /// An init's protection applies to `sig` (Linux sig_task_ignored):
+    /// SIGKILL and SIGSTOP never reach the global init; a
+    /// SIGNAL_UNKILLABLE group takes no signal whose action is SIG_DFL
+    /// but SIGKILL or SIGSTOP from the kernel or an ancestor namespace
+    /// (`forced`, [`SendInfo::forces`])
+    fn protects(&self, sig: u32, forced: bool) -> bool {
+        let kernel_only = sig == SIGKILL || sig == SIGSTOP;
+        let unkillable = self.signal.as_ref().is_some_and(|s| s.unkillable());
+        (self.global && kernel_only) || (unkillable && !(forced && kernel_only))
+    }
 }
 
 fn target(t: &TaskRef) -> Option<Target> {
@@ -1294,12 +1329,13 @@ fn target_in(table: &crate::task::percpu::GlobalTaskTable, t: &TaskRef) -> Optio
     let limit = sig.and_then(|s| s.get_rlimit(RLIMIT_SIGPENDING));
     Some(Target {
         kthread: v.task.has_flag(crate::task::pf::KTHREAD),
-        init: v.task.pid == 1,
+        global: v.task.pid == 1,
         group_exit: sig.is_some_and(|s| matches!(s.group_exit(), GroupExit::Exit(_))),
         stopped: matches!(v.state, crate::task::TaskState::Traced(_)),
         uid: v.cred_arc().uid,
         limit: limit.map_or(0, |r| r.rlim_cur),
         sighand: v.sighand.clone(),
+        signal: sig.cloned(),
     })
 }
 
@@ -1329,7 +1365,7 @@ fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, ty: PidType, force: boo
 
 /// Send `sig` with `info` to task `t`, for it (`ty` Pid) or its thread
 /// group (Linux send_signal_locked, complete_signal); `force` (a
-/// kernel-forced signal, Linux force_sig) is delivered to the global
+/// kernel-forced signal, Linux force_sig) is delivered to a namespace
 /// init even with its action SIG_DFL
 fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) -> i32 {
     check_send_context();
@@ -1349,21 +1385,23 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
         return 0;
     }
     // A forced signal whose action is SIG_DFL (a blocked or ignored one
-    // was reset by the caller) lifts the global init's protection (Linux
-    // force_sig_info_to_task); one init handles leaves it protected. The
-    // flag is read once here.
+    // was reset by the caller) lifts a namespace init's protection
+    // (Linux force_sig_info_to_task: SIGNAL_UNKILLABLE cleared); one
+    // init handles leaves it protected
     let dfl = || {
         tg.sighand
             .as_ref()
             .and_then(|h| h.get_action(sig))
             .is_none_or(|a| a.handler == SigHandler::Default)
     };
-    let init = if tg.init && force && dfl() {
-        INIT_KILLABLE.store(true, core::sync::atomic::Ordering::Release);
-        false
-    } else {
-        tg.init && !INIT_KILLABLE.load(core::sync::atomic::Ordering::Acquire)
-    };
+    if force
+        && let Some(s) = tg.signal.as_ref()
+        && s.unkillable()
+        && dfl()
+    {
+        s.clear_unkillable();
+    }
+    let init = tg.protects(sig, info.forces(t.pid_ns()));
 
     let sighand = tg.sighand.as_ref();
     let to = Send {
@@ -1433,7 +1471,7 @@ fn send_held(
     }
     let to = Send {
         sig,
-        init: tg.init && !INIT_KILLABLE.load(core::sync::atomic::Ordering::Acquire),
+        init: tg.protects(sig, info.forces(t.pid_ns())),
         info: &info,
         ty,
         stopped: tg.stopped,
@@ -1496,7 +1534,7 @@ impl Posted {
 /// What a send is, for its locked part
 struct Send<'a> {
     sig: u32,
-    /// The global init's protection applies
+    /// An init's protection applies (`Target::protects`)
     init: bool,
     info: &'a SendInfo,
     ty: PidType,
@@ -1581,7 +1619,7 @@ fn drops(
 
 /// Find a thread to take `sig` just queued for `p` and wake it (Linux
 /// complete_signal), the choice made under TASKLIST's read lock
-/// ([`choose`]); `init`: the global init's protection applied to the
+/// ([`choose`]); `init`: an init's protection applied to the
 /// send
 fn complete_signal(
     p: &TaskRef,
@@ -1605,7 +1643,7 @@ struct Chosen {
 /// Under TASKLIST: the thread to take `sig` just queued for `p` (Linux
 /// complete_signal): `p` if it wanted it when queued (`p_wants`), else
 /// for a group signal the next thread from the group's curr_target
-/// that does; a fatal one ends the group, never the global init's
+/// that does; a fatal one ends the group, never a protected init's
 /// while protected (`init`: Linux queues it a fatal signal only while
 /// blocked, which no thread wants)
 fn choose(
@@ -2171,7 +2209,7 @@ pub fn send_timer_sigqueue(
             if let Some(h) = sighand {
                 h.signalfd_wq.wake_all();
             }
-            let init = tg.init && !INIT_KILLABLE.load(core::sync::atomic::Ordering::Acquire);
+            let init = tg.protects(sig, false);
             complete_signal(&t, sig, ty, wants, sighand, init);
             Ok(())
         }
@@ -2284,6 +2322,12 @@ pub struct SignalStruct {
     /// under TASKLIST's write lock, read under its read lock by the
     /// reparenting it decides (find_reaper). Not inherited by fork.
     subreaper: crate::task::TableCell<bool>,
+    /// The group is a pid namespace's init and takes no signal whose
+    /// action is SIG_DFL from its namespace (Linux SIGNAL_UNKILLABLE):
+    /// set before the group is visible, cleared once and for good when
+    /// the kernel forces such a signal on it (force_sig_info_to_task).
+    /// A monotonic flag no other state is ordered with: an atomic.
+    unkillable: AtomicBool,
 }
 
 const GROUP_EXIT: u64 = 1 << 63;
@@ -2383,7 +2427,26 @@ impl SignalStruct {
             cputimer: crate::time::cpu_timer::GroupCputimer::new(),
             shared: Mutex::new(GroupPending::new()),
             subreaper: crate::task::TableCell::new(false),
+            unkillable: AtomicBool::new(false),
         }
+    }
+
+    /// The group is a pid namespace's init, protected from SIG_DFL
+    /// signals (Linux SIGNAL_UNKILLABLE)
+    pub fn unkillable(&self) -> bool {
+        self.unkillable.load(Ordering::Acquire)
+    }
+
+    /// Make the group a namespace init's, before it is visible (Linux
+    /// copy_process for is_child_reaper; the global init at boot)
+    pub fn set_unkillable(&self) {
+        self.unkillable.store(true, Ordering::Release);
+    }
+
+    /// The kernel forced a SIG_DFL signal on it: protected no more
+    /// (Linux force_sig_info_to_task)
+    fn clear_unkillable(&self) {
+        self.unkillable.store(false, Ordering::Release);
     }
 
     /// The group's wait status becomes `code` whatever ended it (Linux
@@ -2573,6 +2636,7 @@ impl SignalStruct {
             shared: Mutex::new(GroupPending::new()),
             // Linux copy_signal: is_child_subreaper is not inherited
             subreaper: crate::task::TableCell::new(false),
+            unkillable: AtomicBool::new(false),
         })
     }
 }
@@ -2716,10 +2780,14 @@ pub fn do_signal(regs: &UserFrame) {
         match action.handler {
             SigHandler::Ignore => continue,
             SigHandler::Default => match default_action(sig) {
-                // A signal queued while blocked does not kill the global
-                // init either (Linux get_signal: SIGNAL_UNKILLABLE),
-                // unless the kernel forced one (it lifts the protection)
-                DefaultAction::Terminate | DefaultAction::Core if init_unkillable(tid) => {
+                // A signal queued while blocked does not kill a
+                // namespace init either (Linux get_signal:
+                // SIGNAL_UNKILLABLE and not sig_kernel_only), unless the
+                // kernel forced one (it lifts the protection); SIGKILL
+                // here came from the kernel or an ancestor namespace
+                DefaultAction::Terminate | DefaultAction::Core
+                    if sig != SIGKILL && current_unkillable(tid) =>
+                {
                     continue;
                 }
                 DefaultAction::Terminate | DefaultAction::Core => {
@@ -2913,7 +2981,7 @@ pub fn force_sigsegv(tid: Tid) {
         let _ = sighand.set_action(SIGSEGV, SigAction::default());
     }
     with_task_signal_state(tid, |state| state.blocked.remove(SIGSEGV));
-    // Send SIGSEGV to self, forced: it kills even the global init (Linux
+    // Send SIGSEGV to self, forced: it kills even a namespace init (Linux
     // force_sig_info_to_task clears SIGNAL_UNKILLABLE for SIG_DFL)
     send_signal_force(tid, SIGSEGV, SendInfo::Kernel, PidType::Pid, true);
 }

@@ -2292,9 +2292,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         table.get(current_tid).map(|t| t.iopl_emul).unwrap_or(0)
     };
 
-    // Validate CLONE_PARENT: cannot be used by init process (pid 1)
-    // Linux checks for SIGNAL_UNKILLABLE flag, but we simplify to pid == 1
-    if config.flags & CLONE_PARENT != 0 && parent_pid == 1 {
+    // A pid namespace's init cannot make a sibling (Linux
+    // copy_process: CLONE_PARENT with SIGNAL_UNKILLABLE)
+    if config.flags & CLONE_PARENT != 0
+        && crate::signal::get_task_signal_struct(current_tid).is_some_and(|s| s.unkillable())
+    {
         return Err(22); // EINVAL
     }
 
@@ -2369,6 +2371,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // A new process numbered 1 is its namespace's init (Linux
     // copy_process: is_child_reaper)
     let child_init = config.flags & CLONE_THREAD == 0 && child_thread_pid.is_child_reaper();
+    if child_init {
+        child_signal.set_unkillable();
+    }
     let child_pid = if config.flags & CLONE_THREAD != 0 {
         parent_pid
     } else {
