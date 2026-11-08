@@ -265,11 +265,7 @@ impl NState {
             self.timer = None;
             return Act::Fail;
         }
-        self.timer = if self.state & nud::IN_TIMER != 0 {
-            Some(next.max(now + 10))
-        } else {
-            None
-        };
+        self.timer = (self.state & nud::IN_TIMER != 0).then(|| next.max(now + 10));
         if self.state & (nud::INCOMPLETE | nud::PROBE) != 0 {
             return self.probe(p);
         }

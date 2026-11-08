@@ -1231,13 +1231,8 @@ fn generate_short_name(long_name: &str, existing_short_names: &[[u8; 11]]) -> Op
     // Convert extension similarly
     let clean_ext: String = ext
         .chars()
-        .filter_map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                Some(c.to_ascii_uppercase())
-            } else {
-                None
-            }
-        })
+        .filter(|&c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        .map(|c| c.to_ascii_uppercase())
         .take(3)
         .collect();
 

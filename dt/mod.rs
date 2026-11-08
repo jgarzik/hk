@@ -340,11 +340,7 @@ impl<'a> Node<'a> {
     pub fn clock_frequency(&self) -> Option<u32> {
         let prop = self.property("clock-frequency")?;
         let data = prop.data();
-        if data.len() >= 4 {
-            Some(read_be32(data, 0))
-        } else {
-            None
-        }
+        (data.len() >= 4).then(|| read_be32(data, 0))
     }
 
     /// Iterate over properties of this node
@@ -450,21 +446,13 @@ impl<'a> Property<'a> {
     /// Try to interpret as a u32
     pub fn as_u32(&self) -> Option<u32> {
         let data = self.data();
-        if data.len() >= 4 {
-            Some(read_be32(data, 0))
-        } else {
-            None
-        }
+        (data.len() >= 4).then(|| read_be32(data, 0))
     }
 
     /// Try to interpret as a u64
     pub fn as_u64(&self) -> Option<u64> {
         let data = self.data();
-        if data.len() >= 8 {
-            Some(read_be64(data, 0))
-        } else {
-            None
-        }
+        (data.len() >= 8).then(|| read_be64(data, 0))
     }
 }
 

@@ -598,11 +598,7 @@ fn handle_setcrtc(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     }
 
     // Convert mode if valid
-    let mode = if crtc_cmd.mode_valid != 0 {
-        Some(modeinfo_to_drmmode(&crtc_cmd.mode))
-    } else {
-        None
-    };
+    let mode = (crtc_cmd.mode_valid != 0).then(|| modeinfo_to_drmmode(&crtc_cmd.mode));
 
     driver
         .set_crtc(

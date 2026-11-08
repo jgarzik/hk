@@ -196,7 +196,7 @@ and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
 - S1 O(n²) VMA loops to iterators; sentinels to Option;
   `from_ne_bytes(..try_into().unwrap())` to `pod!`; `current_mm()`;
   let-else; stale `allow(dead_code)` removed; struct-update syntax;
-  `then`/`then_some`; one LE/BE byte reader, no slice `unwrap` on
+  one LE/BE byte reader, no slice `unwrap` on
   device or disk data; `next_multiple_of`; pointer-cast lints.
 - S2 `# Arguments`/`# Returns` blocks and `// ====` banners removed;
   history and speculative comments rewritten to the current state;

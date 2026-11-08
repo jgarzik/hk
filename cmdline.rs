@@ -237,11 +237,7 @@ pub fn cmdline_console_count() -> usize {
 #[expect(dead_code)]
 pub fn get_cmdline_console(index: usize) -> Option<ConsoleSpec> {
     let console = CMDLINE_CONSOLE.lock();
-    if index < console.count {
-        Some(console.specs[index])
-    } else {
-        None
-    }
+    (index < console.count).then(|| console.specs[index])
 }
 
 /// Get the primary (last specified) console device name
@@ -250,11 +246,7 @@ pub fn get_cmdline_console(index: usize) -> Option<ConsoleSpec> {
 #[expect(dead_code)]
 pub fn primary_cmdline_console() -> Option<ConsoleSpec> {
     let console = CMDLINE_CONSOLE.lock();
-    if console.count > 0 {
-        Some(console.specs[console.count - 1])
-    } else {
-        None
-    }
+    (console.count > 0).then(|| console.specs[console.count - 1])
 }
 
 #[cfg(test)]

@@ -151,13 +151,7 @@ impl SerialTty {
 
     /// Read a byte if available
     fn read_byte(&self) -> Option<u8> {
-        unsafe {
-            if self.inb(regs::LSR) & lsr::DR != 0 {
-                Some(self.inb(regs::RBR))
-            } else {
-                None
-            }
-        }
+        unsafe { (self.inb(regs::LSR) & lsr::DR != 0).then(|| self.inb(regs::RBR)) }
     }
 
     /// Drain the receive FIFO into `tty`'s flip buffer (IRQ context;

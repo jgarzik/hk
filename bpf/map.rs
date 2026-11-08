@@ -332,11 +332,7 @@ impl BpfArrayMap {
             return None;
         }
         let index = u32::from_ne_bytes([key[0], key[1], key[2], key[3]]);
-        if index < self.max_entries {
-            Some(index)
-        } else {
-            None
-        }
+        (index < self.max_entries).then_some(index)
     }
 }
 
@@ -380,11 +376,7 @@ impl BpfMapOps for BpfArrayMap {
             }
         };
 
-        if next_index < self.max_entries {
-            Some(next_index.to_ne_bytes().to_vec())
-        } else {
-            None
-        }
+        (next_index < self.max_entries).then(|| next_index.to_ne_bytes().to_vec())
     }
 
     fn map_type(&self) -> u32 {

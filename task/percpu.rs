@@ -44,7 +44,7 @@ fn do_clear_child_tid(tid: Tid) {
         if let Some(mut task) = table.get_mut(tid) {
             let addr = task.clear_child_tid;
             task.clear_child_tid = 0;
-            if addr != 0 { Some(addr) } else { None }
+            (addr != 0).then_some(addr)
         } else {
             None
         }

@@ -906,7 +906,7 @@ pub fn exit_robust_list(tid: Tid) {
         if let Some(mut task) = table.get_mut(tid) {
             let addr = task.robust_list;
             task.robust_list = 0;
-            if addr != 0 { Some(addr) } else { None }
+            (addr != 0).then_some(addr)
         } else {
             None
         }

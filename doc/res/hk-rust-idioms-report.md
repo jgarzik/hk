@@ -14,7 +14,6 @@ belongs to doc/ROADMAP.md phase M1, the rest to S1.
 | 3 | let-else for `match {Some(x)=>x, None=>return}` | about -288 | ~0 | high |
 | 4 | Delete the dead code behind `expect(dead_code)` | about -100 | ~0 | high |
 | 5 | Struct update `..Default::default()` / `..zeroed()` | -300 (kernel) / -120 (user) | low | med |
-| 6 | `bool::then` / `then_some` for `if c {Some(x)} else {None}` | -70 | low (eager eval) | med |
 | 7 | One `util/bytes` LE/BE reader on `first_chunk` | -40 | low | low |
 | 8 | `next_power_of_two` / `next_multiple_of` for hand-rolled ones | -25 | low (overflow) | low |
 | 9 | Last pointer-API gaps (`addr_of!`, `phys_to_virt` provenance, xhci MMIO) | 0 | 0 | low |
@@ -189,18 +188,6 @@ removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
   - For `TaskInner`, a base ctor taking the non-default fields (`page_table`,
     `state`) is better than `Default`, because `ArchPageTable` has no meaningful
     default.
-
-## 6. `bool::then` (1.50) / `then_some` (1.62)
-
-- **Evidence:** 21 `if c {\n Some(x)\n} else {\n None\n}` (5 lines each); clippy
-  `if_then_some_else_none` finds 17. Examples: dt/mod.rs:266/328/435/445,
-  bpf/map.rs:310/358, net/core/neigh.rs:267, hw/virtio/pci.rs:465, hw/serial.rs:143.
-- **After:** `(index < self.max_entries).then_some(index)`. That is -4 each, about **-70**.
-- **Risk:** `then_some` evaluates its argument eagerly. hw/serial.rs:143
-  (`self.inb(RBR)`) must use `.then(|| ..)` or it reads RBR even when no data is
-  ready. That is a device side effect. Sites with `?` inside (fs/open.rs:162/169,
-  net/packet/mod.rs:329) need `.then(..).transpose()?`; leave those alone. The
-  dt/mod.rs sites are better done as item 7.
 
 ## 7. One LE/BE reader on `first_chunk` (1.77)
 

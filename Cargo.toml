@@ -53,6 +53,7 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
 new_without_default = "allow"
+if_then_some_else_none = "warn"
 missing_safety_doc = "deny"
 undocumented_unsafe_blocks = "deny"
 unnecessary_safety_comment = "deny"
