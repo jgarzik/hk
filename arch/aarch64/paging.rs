@@ -73,7 +73,7 @@ pub const fn io_va(phys: u64) -> u64 {
 /// Convert physical address to virtual address (linear map; Linux __va)
 #[inline]
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
-    (phys + PAGE_OFFSET) as *mut u8
+    core::ptr::with_exposed_provenance_mut((phys + PAGE_OFFSET) as usize)
 }
 
 /// Convert a linear-map or kernel-image address to physical (Linux __pa)
@@ -731,12 +731,6 @@ impl RawPageTable {
     #[inline]
     pub fn entry_mut(&mut self, index: usize) -> &mut PageTableEntry {
         &mut self.entries[index]
-    }
-}
-
-impl Default for RawPageTable {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

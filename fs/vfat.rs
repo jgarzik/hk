@@ -1188,10 +1188,6 @@ fn read_directory_entries(
 // Directory Entry Write Operations
 // ============================================================================
 
-/// Characters invalid in FAT short names
-#[expect(dead_code)]
-const INVALID_SHORT_CHARS: &[u8] = b" .\"*+,/:;<=>?[\\]|";
-
 /// Generate an 8.3 short name from a long filename
 ///
 /// Returns an 11-byte array with 8 chars for name + 3 chars for extension,
@@ -1231,13 +1227,8 @@ fn generate_short_name(long_name: &str, existing_short_names: &[[u8; 11]]) -> Op
     // Convert extension similarly
     let clean_ext: String = ext
         .chars()
-        .filter_map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                Some(c.to_ascii_uppercase())
-            } else {
-                None
-            }
-        })
+        .filter(|&c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        .map(|c| c.to_ascii_uppercase())
         .take(3)
         .collect();
 
@@ -1320,13 +1311,9 @@ fn create_lfn_entries(name: &str, short_name: &[u8; 11]) -> Vec<VfatLfnEntry> {
 
         let mut entry = VfatLfnEntry {
             order,
-            name1: [0u16; 5],
             attr: attr::LONG_NAME,
-            entry_type: 0,
             checksum,
-            name2: [0u16; 6],
-            first_cluster: 0,
-            name3: [0u16; 2],
+            ..FromBytes::zeroed()
         };
 
         // The name fields (packed: assigned by value)
@@ -1507,53 +1494,6 @@ fn create_dir_entry_with_lfn(
     write_raw_dir_entry(sb_data, parent_cluster, short_entry_index, &short_bytes)?;
 
     Ok(short_name)
-}
-
-/// Update the file size in a directory entry
-#[expect(dead_code)]
-fn update_dir_entry_size(
-    sb_data: &VfatSbData,
-    parent_cluster: u32,
-    name: &str,
-    new_size: u32,
-) -> Result<(), KernelError> {
-    let chain = read_cluster_chain(sb_data, parent_cluster)?;
-    let entries_per_cluster = sb_data.cluster_size as usize / 32;
-
-    // Search for the entry
-    for &cluster in chain.iter() {
-        let cluster_offset = cluster_to_offset(sb_data, cluster);
-
-        for i in 0..entries_per_cluster {
-            let entry_offset = cluster_offset + (i as u64 * 32);
-            let mut buf = [0u8; 32];
-            read_bytes(&sb_data.bdev, entry_offset, &mut buf)?;
-
-            // Skip free/deleted entries
-            if buf[0] == END_MARKER || buf[0] == DELETED_MARKER {
-                continue;
-            }
-
-            // Skip LFN entries
-            if buf[11] == attr::LONG_NAME {
-                continue;
-            }
-
-            // Check if this matches our name (case-insensitive)
-            let short_name = short_name_to_string(
-                buf[0..8].try_into().unwrap(),
-                buf[8..11].try_into().unwrap(),
-            );
-            if short_name.eq_ignore_ascii_case(name) {
-                // Update size field at offset 28
-                buf[28..32].copy_from_slice(&new_size.to_le_bytes());
-                write_bytes(&sb_data.bdev, entry_offset, &buf)?;
-                return Ok(());
-            }
-        }
-    }
-
-    Err(KernelError::NotFound)
 }
 
 /// Update directory entry metadata (start_cluster and file_size) by short name
@@ -2391,13 +2331,9 @@ impl SuperOps for VfatSuperOps {
         // For now, return minimal valid values
         StatFs {
             f_type: MSDOS_SUPER_MAGIC,
-            f_bsize: 4096, // Cluster size varies; use common value
-            f_blocks: 0,
-            f_bfree: 0,
-            f_bavail: 0,
-            f_files: 0, // FAT doesn't track inode count
-            f_ffree: 0,
+            f_bsize: 4096,  // Cluster size varies; use common value
             f_namelen: 255, // LFN max length
+            ..StatFs::default()
         }
     }
 

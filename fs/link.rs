@@ -5,7 +5,6 @@
 
 use alloc::sync::Arc;
 
-use crate::arch::Uaccess;
 use crate::fs::dentry::{d_exchange, d_move};
 use crate::fs::namei::{
     Last, Parent, create_entry, delete_entry, filename_create, filename_lookup, filename_parentat,
@@ -15,7 +14,8 @@ use crate::fs::{
     Inode, KernelError, LookupFlags, MAY_WRITE, Path, dac, is_subdir, lock_rename,
     lock_two_nondirs, lookup_one,
 };
-use crate::uaccess::copy_to_user;
+use crate::uaccess::{UserPtr, UserSlice};
+use crate::util::error::KernelResult;
 
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW};
 
@@ -31,9 +31,7 @@ use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLO
 /// * `target_ptr` - User pointer to target path string
 /// * `linkpath_ptr` - User pointer to link path string
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_symlink(target_ptr: u64, linkpath_ptr: u64) -> i64 {
+pub fn sys_symlink(target_ptr: UserPtr<u8>, linkpath_ptr: UserPtr<u8>) -> KernelResult<()> {
     sys_symlinkat(target_ptr, AT_FDCWD, linkpath_ptr)
 }
 
@@ -44,23 +42,28 @@ pub fn sys_symlink(target_ptr: u64, linkpath_ptr: u64) -> i64 {
 /// * `newdirfd` - Directory fd for linkpath, or AT_FDCWD
 /// * `linkpath_ptr` - User pointer to link path string
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> i64 {
-    match do_symlinkat(target_ptr, newdirfd, linkpath_ptr) {
-        Ok(()) => 0,
-        Err(KernelError::OperationNotSupported) => KernelError::NotPermitted.sysret(),
-        Err(e) => e.sysret(),
-    }
-}
-
+///
 /// Linux do_symlinkat: the target is a name too (ENOENT if empty), the
-/// link a new name (filename_create)
-fn do_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> Result<(), KernelError> {
+/// link a new name (filename_create); a file system without symlinks
+/// is EPERM (vfs_symlink)
+pub fn sys_symlinkat(
+    target_ptr: UserPtr<u8>,
+    newdirfd: i32,
+    linkpath_ptr: UserPtr<u8>,
+) -> KernelResult<()> {
     let target = getname(target_ptr, false)?;
     let p = filename_create(newdirfd, &getname(linkpath_ptr, false)?, false)?;
-    create_entry(&p, |dir, _| dir.i_op.symlink(dir, &p.name, &target))?;
+    create_entry(&p, |dir, _| dir.i_op.symlink(dir, &p.name, &target)).map_err(no_op_eperm)?;
     Ok(())
+}
+
+/// A missing inode op is EPERM (Linux vfs_symlink, vfs_link, vfs_mkdir,
+/// vfs_mknod)
+pub(super) fn no_op_eperm(e: KernelError) -> KernelError {
+    match e {
+        KernelError::OperationNotSupported => KernelError::NotPermitted,
+        e => e,
+    }
 }
 
 // =============================================================================
@@ -77,8 +80,12 @@ fn do_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> Result<(),
 /// * `bufsiz` - Size of the buffer
 ///
 /// # Returns
-/// Number of bytes placed in buffer (not null-terminated), negative errno on error
-pub fn sys_readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
+/// Number of bytes placed in buffer (not null-terminated)
+pub fn sys_readlink(
+    path_ptr: UserPtr<u8>,
+    buf_ptr: UserPtr<u8>,
+    bufsiz: u64,
+) -> KernelResult<usize> {
     sys_readlinkat(AT_FDCWD, path_ptr, buf_ptr, bufsiz)
 }
 
@@ -91,18 +98,18 @@ pub fn sys_readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
 /// * `bufsiz` - Size of the buffer
 ///
 /// # Returns
-/// Number of bytes placed in buffer (not null-terminated), negative errno on error
-pub fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
-    match do_readlinkat(dirfd, path_ptr, buf_ptr, bufsiz as i32) {
-        Ok(n) => n as i64,
-        Err(e) => e.sysret(),
-    }
-}
-
+/// Number of bytes placed in buffer (not null-terminated)
+///
 /// Linux do_readlinkat: bufsiz is an int (<= 0 is EINVAL); an empty path
 /// names dirfd itself (an O_PATH symlink), which if no symlink is ENOENT,
 /// any other non-symlink EINVAL; the target is copied unterminated
-fn do_readlinkat(dirfd: i32, path_ptr: u64, buf: u64, bufsiz: i32) -> Result<usize, KernelError> {
+pub fn sys_readlinkat(
+    dirfd: i32,
+    path_ptr: UserPtr<u8>,
+    buf: UserPtr<u8>,
+    bufsiz: u64,
+) -> KernelResult<usize> {
+    let bufsiz = bufsiz as i32;
     if bufsiz <= 0 {
         return Err(KernelError::InvalidArgument);
     }
@@ -127,7 +134,9 @@ fn do_readlinkat(dirfd: i32, path_ptr: u64, buf: u64, bufsiz: i32) -> Result<usi
         r => r?,
     };
     let n = target.len().min(bufsiz as usize);
-    copy_to_user::<Uaccess>(buf, &target[..n]).map_err(|_| KernelError::BadAddress)?;
+    UserSlice::new(buf.addr(), bufsiz as usize)
+        .writer()
+        .write_slice(&target[..n])?;
     inode.touch_atime(&dentry.mnt);
     Ok(n)
 }
@@ -144,9 +153,7 @@ fn do_readlinkat(dirfd: i32, path_ptr: u64, buf: u64, bufsiz: i32) -> Result<usi
 /// * `oldpath_ptr` - User pointer to existing path
 /// * `newpath_ptr` - User pointer to new path
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_link(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
+pub fn sys_link(oldpath_ptr: UserPtr<u8>, newpath_ptr: UserPtr<u8>) -> KernelResult<()> {
     sys_linkat(AT_FDCWD, oldpath_ptr, AT_FDCWD, newpath_ptr, 0)
 }
 
@@ -169,7 +176,7 @@ fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), 
 /// with AT_EMPTY_PATH names `dirfd` itself, whose opener creds must be
 /// the caller's (LookupFlags::linkat_empty); the final symlink is
 /// followed only with AT_SYMLINK_FOLLOW
-fn link_source(dirfd: i32, path_ptr: u64, flags: i32) -> Result<Path, KernelError> {
+fn link_source(dirfd: i32, path_ptr: UserPtr<u8>, flags: i32) -> KernelResult<Path> {
     let path = getname(path_ptr, flags & AT_EMPTY_PATH != 0)?;
     let lf = LookupFlags {
         follow: flags & AT_SYMLINK_FOLLOW != 0,
@@ -189,51 +196,36 @@ fn link_source(dirfd: i32, path_ptr: u64, flags: i32) -> Result<Path, KernelErro
 /// * `flags` - AT_SYMLINK_FOLLOW to follow a final symlink in oldpath,
 ///   AT_EMPTY_PATH to link `olddirfd` itself
 ///
-/// # Returns
-/// 0 on success, negative errno on error
 pub fn sys_linkat(
     olddirfd: i32,
-    oldpath_ptr: u64,
+    oldpath_ptr: UserPtr<u8>,
     newdirfd: i32,
-    newpath_ptr: u64,
+    newpath_ptr: UserPtr<u8>,
     flags: i32,
-) -> i64 {
+) -> KernelResult<()> {
     if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    let old = match link_source(olddirfd, oldpath_ptr, flags) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-    let Some(old_inode) = old.dentry.get_inode() else {
-        return KernelError::NotFound.sysret();
-    };
-    let p = match getname(newpath_ptr, false).and_then(|n| filename_create(newdirfd, &n, false)) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
+    let old = link_source(olddirfd, oldpath_ptr, flags)?;
+    let old_inode = old.dentry.get_inode().ok_or(KernelError::NotFound)?;
+    let p = filename_create(newdirfd, &getname(newpath_ptr, false)?, false)?;
     // EXDEV across mounts, even of one superblock
     if !Arc::ptr_eq(&old.mnt, &p.mnt) {
-        return KernelError::CrossDevice.sysret();
+        return Err(KernelError::CrossDevice);
     }
 
     // Linux do_linkat: may_linkat (fs.protected_hardlinks), then
     // vfs_link: may_create on the new parent, then no directories
-    if let Err(e) = crate::fs::dac::may_linkat(&crate::task::current_cred(), &old_inode) {
-        return e.sysret();
-    }
-    let r = create_entry(&p, |dir, _| {
+    crate::fs::dac::may_linkat(&crate::task::current_cred(), &old_inode)?;
+    create_entry(&p, |dir, _| {
         if old_inode.mode().is_dir() {
             return Err(KernelError::NotPermitted);
         }
         link_locked(dir, &p.name, &old_inode)?;
         Ok(old_inode.clone())
-    });
-    match r {
-        Ok(_) => 0,
-        Err(KernelError::OperationNotSupported) => KernelError::NotPermitted.sysret(),
-        Err(e) => e.sysret(),
-    }
+    })
+    .map_err(no_op_eperm)?;
+    Ok(())
 }
 
 // =============================================================================
@@ -248,9 +240,7 @@ pub fn sys_linkat(
 /// # Arguments
 /// * `pathname_ptr` - User pointer to path string
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_unlink(pathname_ptr: u64) -> i64 {
+pub fn sys_unlink(pathname_ptr: UserPtr<u8>) -> KernelResult<()> {
     sys_unlinkat(AT_FDCWD, pathname_ptr, 0)
 }
 
@@ -263,18 +253,10 @@ pub fn sys_unlink(pathname_ptr: u64) -> i64 {
 /// * `pathname_ptr` - User pointer to path string
 /// * `flags` - Flags (AT_REMOVEDIR to remove directory)
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_unlinkat(dirfd: i32, pathname_ptr: u64, flags: i32) -> i64 {
-    match do_unlinkat(dirfd, pathname_ptr, flags) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
-}
-
+///
 /// Linux unlinkat + do_unlinkat: only AT_REMOVEDIR is a flag; a last
 /// name of "/", "." or ".." is EISDIR
-fn do_unlinkat(dirfd: i32, pathname_ptr: u64, flags: i32) -> Result<(), KernelError> {
+pub fn sys_unlinkat(dirfd: i32, pathname_ptr: UserPtr<u8>, flags: i32) -> KernelResult<()> {
     if flags & !AT_REMOVEDIR != 0 {
         return Err(KernelError::InvalidArgument);
     }
@@ -313,9 +295,7 @@ fn rename_flags_ok(flags: u32) -> bool {
 /// * `oldpath_ptr` - User pointer to existing path
 /// * `newpath_ptr` - User pointer to new path
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_rename(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
+pub fn sys_rename(oldpath_ptr: UserPtr<u8>, newpath_ptr: UserPtr<u8>) -> KernelResult<()> {
     sys_renameat2(AT_FDCWD, oldpath_ptr, AT_FDCWD, newpath_ptr, 0)
 }
 
@@ -327,9 +307,12 @@ pub fn sys_rename(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
 /// * `newdirfd` - Directory fd for newpath, or AT_FDCWD
 /// * `newpath_ptr` - User pointer to new path
 ///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64) -> i64 {
+pub fn sys_renameat(
+    olddirfd: i32,
+    oldpath_ptr: UserPtr<u8>,
+    newdirfd: i32,
+    newpath_ptr: UserPtr<u8>,
+) -> KernelResult<()> {
     sys_renameat2(olddirfd, oldpath_ptr, newdirfd, newpath_ptr, 0)
 }
 
@@ -342,20 +325,18 @@ pub fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr:
 /// * `newpath_ptr` - User pointer to new path
 /// * `flags` - RENAME_NOREPLACE, RENAME_EXCHANGE, etc.
 ///
-/// # Returns
-/// 0 on success, negative errno on error
 pub fn sys_renameat2(
     olddirfd: i32,
-    oldpath_ptr: u64,
+    oldpath_ptr: UserPtr<u8>,
     newdirfd: i32,
-    newpath_ptr: u64,
+    newpath_ptr: UserPtr<u8>,
     flags: u32,
-) -> i64 {
-    match do_renameat2(olddirfd, oldpath_ptr, newdirfd, newpath_ptr, flags) {
-        Ok(()) => 0,
-        Err(KernelError::OperationNotSupported) => KernelError::InvalidArgument.sysret(),
-        Err(e) => e.sysret(),
-    }
+) -> KernelResult<()> {
+    // A flag the file system does not take: EINVAL (Linux vfs_rename)
+    do_renameat2(olddirfd, oldpath_ptr, newdirfd, newpath_ptr, flags).map_err(|e| match e {
+        KernelError::OperationNotSupported => KernelError::InvalidArgument,
+        e => e,
+    })
 }
 
 /// Linux filename_renameat2: both parents walked, EXDEV, then a last
@@ -364,11 +345,11 @@ pub fn sys_renameat2(
 /// locked
 fn do_renameat2(
     olddirfd: i32,
-    oldpath_ptr: u64,
+    oldpath_ptr: UserPtr<u8>,
     newdirfd: i32,
-    newpath_ptr: u64,
+    newpath_ptr: UserPtr<u8>,
     flags: u32,
-) -> Result<(), KernelError> {
+) -> KernelResult<()> {
     if !rename_flags_ok(flags) {
         return Err(KernelError::InvalidArgument);
     }

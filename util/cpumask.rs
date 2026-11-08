@@ -74,12 +74,6 @@ impl CpuMask {
     }
 }
 
-impl Default for CpuMask {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CpuSet {
     /// No CPUs
     pub const fn new() -> Self {

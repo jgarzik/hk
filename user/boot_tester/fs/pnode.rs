@@ -52,8 +52,7 @@ fn set(t: &[u8], flags: u64) -> i64 {
 }
 
 fn dev(p: &[u8]) -> Result<u64, i64> {
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     match sys_stat(p.as_ptr(), &mut st) {
         0 => Ok(st.st_dev),
         e => Err(e),

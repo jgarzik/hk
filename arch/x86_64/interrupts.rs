@@ -736,14 +736,11 @@ fn handle_apic_error() {
 /// LAPIC timer interrupt
 fn handle_lapic_timer() {
     // Track interrupt nesting depth
-    let percpu = match super::percpu::try_current_cpu() {
-        Some(p) => p,
-        None => {
-            // Per-CPU not set up yet: re-arm the one-shot timer, EOI
-            lapic::set_next_event(crate::task::percpu::TICK_NS);
-            lapic::eoi();
-            return;
-        }
+    let Some(percpu) = super::percpu::try_current_cpu() else {
+        // Per-CPU not set up yet: re-arm the one-shot timer, EOI
+        lapic::set_next_event(crate::task::percpu::TICK_NS);
+        lapic::eoi();
+        return;
     };
 
     // Increment interrupt depth

@@ -28,7 +28,7 @@ use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::PollTable;
 use crate::net::msg::{Dst, MSG_DONTWAIT, MSG_NOSIGNAL, RecvMsg, SendMsg, Src};
 use crate::net::sock::{Sock, TIMEO_FOREVER, sf};
-use crate::uaccess::{copy_from_user, copy_to_user, get_user, put_user};
+use crate::uaccess::{UserPtr, copy_from_user, copy_to_user, get_user, put_user};
 use crate::util::error::KernelError;
 
 /// Address families
@@ -270,7 +270,7 @@ pub fn sock_sendmsg(
     let r = s.sendmsg(m, flags);
     if r == Err(KernelError::BrokenPipe) && flags & MSG_NOSIGNAL == 0 && s.sigpipe() {
         let tid = crate::task::percpu::current_tid();
-        crate::signal::send_signal(tid, crate::signal::SIGPIPE);
+        let _ = crate::signal::send_signal(tid, crate::signal::SIGPIPE);
     }
     r
 }
@@ -658,16 +658,22 @@ pub fn peercred_bytes(c: Option<(i32, u32, u32)>) -> Vec<u8> {
 
 /// Copy a getsockopt result out: `len` is the user's (validated >= 0)
 /// buffer size; ints shorter than 4 bytes are truncated like Linux
-pub fn put_opt(out: OptOut, val: u64, lenp: u64, len: i32) -> Result<(), KernelError> {
+pub fn put_opt(
+    out: OptOut,
+    val: UserPtr<u8>,
+    lenp: UserPtr<u32>,
+    len: i32,
+) -> Result<(), KernelError> {
     let b = match out {
         OptOut::Int(v) => v.to_ne_bytes().to_vec(),
         OptOut::Bytes(b) => b,
     };
     let n = (len as usize).min(b.len());
     if n > 0 {
-        copy_to_user::<Uaccess>(val, &b[..n]).map_err(|_| KernelError::BadAddress)?;
+        copy_to_user::<Uaccess>(val.addr(), &b[..n])?;
     }
-    put_user::<Uaccess, i32>(lenp, n as i32).map_err(|_| KernelError::BadAddress)
+    lenp.write(&(n as u32))?;
+    Ok(())
 }
 
 /// Read a shutdown(2) `how` into shutdown bits (EINVAL otherwise)

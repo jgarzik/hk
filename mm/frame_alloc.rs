@@ -249,12 +249,6 @@ impl FrameAllocator {
     }
 }
 
-impl Default for FrameAllocator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Memory statistics from frame allocator
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryStats {

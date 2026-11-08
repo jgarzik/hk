@@ -39,8 +39,8 @@ use super::map::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BpfMapOps, create_map};
 use super::prog::BpfProg;
 use super::verifier::{Kind, verify};
 use crate::arch::Uaccess;
-use crate::uaccess::{copy_from_user, copy_to_user, put_user};
-use crate::util::error::KernelError;
+use crate::uaccess::{UserPtr, copy_from_user, copy_to_user, put_user};
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::FromBytes;
 
 // =============================================================================
@@ -344,214 +344,101 @@ crate::pod!(
 // Syscall Implementation
 // =============================================================================
 
-/// BPF syscall entry point
-///
-/// # Arguments
-/// * `cmd` - BPF command (BPF_MAP_CREATE, etc.)
-/// * `attr` - Pointer to bpf_attr union
-/// * `size` - Size of attr structure
-///
-/// # Returns
-/// File descriptor or 0 on success, negative errno on failure.
-pub fn sys_bpf(cmd: i32, attr: u64, size: u32) -> i64 {
-    // Validate size
+/// bpf(cmd, attr, size): a new descriptor (BPF_MAP_CREATE,
+/// BPF_PROG_LOAD) or 0
+pub fn sys_bpf(cmd: i32, attr: UserPtr<u8>, size: u32) -> KernelResult<i32> {
     if size == 0 || size as usize > BPF_ATTR_SIZE {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Copy attr from userspace into a buffer
     let mut attr_buf = [0u8; BPF_ATTR_SIZE];
-    let copy_size = core::cmp::min(size as usize, BPF_ATTR_SIZE);
-
-    if copy_from_user::<Uaccess>(&mut attr_buf[..copy_size], attr, copy_size).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
+    let n = size as usize;
+    copy_from_user::<Uaccess>(&mut attr_buf[..n], attr.addr(), n)?;
+    let done = |r: KernelResult<()>| r.map(|()| 0);
     match cmd {
         BPF_MAP_CREATE => bpf_map_create(&attr_buf),
-        BPF_MAP_LOOKUP_ELEM => bpf_map_lookup_elem(&attr_buf),
-        BPF_MAP_UPDATE_ELEM => bpf_map_update_elem(&attr_buf),
-        BPF_MAP_DELETE_ELEM => bpf_map_delete_elem(&attr_buf),
-        BPF_MAP_GET_NEXT_KEY => bpf_map_get_next_key(&attr_buf),
+        BPF_MAP_LOOKUP_ELEM => done(bpf_map_lookup_elem(&attr_buf)),
+        BPF_MAP_UPDATE_ELEM => done(bpf_map_update_elem(&attr_buf)),
+        BPF_MAP_DELETE_ELEM => done(bpf_map_delete_elem(&attr_buf)),
+        BPF_MAP_GET_NEXT_KEY => done(bpf_map_get_next_key(&attr_buf)),
         BPF_PROG_LOAD => bpf_prog_load(&attr_buf),
-        BPF_OBJ_GET_INFO_BY_FD => bpf_obj_get_info_by_fd(&attr_buf, attr),
-        _ => KernelError::InvalidArgument.sysret(),
+        BPF_OBJ_GET_INFO_BY_FD => done(bpf_obj_get_info_by_fd(&attr_buf, attr.addr())),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
 
-/// Create a BPF map
-fn bpf_map_create(attr_buf: &[u8]) -> i64 {
-    // Parse MapCreateAttr
-    if let Err(e) = unpriv_ok() {
-        return e.sysret();
-    }
-
-    let Some(attr) = MapCreateAttr::read_from(attr_buf) else {
-        return KernelError::InvalidArgument.sysret();
-    };
-
-    // Validate map type
+/// Create a BPF map: its descriptor
+fn bpf_map_create(attr_buf: &[u8]) -> KernelResult<i32> {
+    unpriv_ok()?;
+    let attr = MapCreateAttr::read_from(attr_buf).ok_or(KernelError::InvalidArgument)?;
     match attr.map_type {
         BPF_MAP_TYPE_HASH | BPF_MAP_TYPE_ARRAY => {}
-        _ => return KernelError::InvalidArgument.sysret(),
+        _ => return Err(KernelError::InvalidArgument),
     }
-
-    // Create the map
-    let map = match create_map(
+    let map = create_map(
         attr.map_type,
         attr.key_size,
         attr.value_size,
         attr.max_entries,
         attr.map_flags,
-    ) {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
+    )?;
+    create_bpf_map_fd(map)
+}
 
-    // Create file descriptor
-    match create_bpf_map_fd(map) {
-        Ok(fd) => i64::from(fd),
-        Err(e) => e.sysret(),
-    }
+/// `len` bytes from user address `at`
+fn user_bytes(at: u64, len: usize) -> KernelResult<Vec<u8>> {
+    let mut v = vec![0u8; len];
+    copy_from_user::<Uaccess>(&mut v, at, len)?;
+    Ok(v)
 }
 
 /// Look up an element in a map
-fn bpf_map_lookup_elem(attr_buf: &[u8]) -> i64 {
-    let Some(attr) = MapElemAttr::read_from(attr_buf) else {
-        return KernelError::InvalidArgument.sysret();
-    };
-
-    // Get map from fd
-    let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
-
-    // Read key from userspace
-    let key_size = map.key_size() as usize;
-    let mut key = vec![0u8; key_size];
-    if copy_from_user::<Uaccess>(&mut key, attr.key, key_size).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Lookup
-    match map.lookup(&key) {
-        Some(value) => {
-            // Copy value to userspace
-            if copy_to_user::<Uaccess>(attr.value, &value).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
-        }
-        None => KernelError::NotFound.sysret(),
-    }
+fn bpf_map_lookup_elem(attr_buf: &[u8]) -> KernelResult<()> {
+    let attr = MapElemAttr::read_from(attr_buf).ok_or(KernelError::InvalidArgument)?;
+    let map = get_bpf_map_from_fd(attr.map_fd as i32)?;
+    let key = user_bytes(attr.key, map.key_size() as usize)?;
+    let value = map.lookup(&key).ok_or(KernelError::NotFound)?;
+    copy_to_user::<Uaccess>(attr.value, &value)?;
+    Ok(())
 }
 
 /// Update an element in a map
-fn bpf_map_update_elem(attr_buf: &[u8]) -> i64 {
-    let Some(attr) = MapElemAttr::read_from(attr_buf) else {
-        return KernelError::InvalidArgument.sysret();
-    };
-
-    // Get map from fd
-    let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
-
-    // Read key from userspace
-    let key_size = map.key_size() as usize;
-    let mut key = vec![0u8; key_size];
-    if copy_from_user::<Uaccess>(&mut key, attr.key, key_size).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Read value from userspace
-    let value_size = map.value_size() as usize;
-    let mut value = vec![0u8; value_size];
-    if copy_from_user::<Uaccess>(&mut value, attr.value, value_size).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Update
-    match map.update(&key, &value, attr.flags) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+fn bpf_map_update_elem(attr_buf: &[u8]) -> KernelResult<()> {
+    let attr = MapElemAttr::read_from(attr_buf).ok_or(KernelError::InvalidArgument)?;
+    let map = get_bpf_map_from_fd(attr.map_fd as i32)?;
+    let key = user_bytes(attr.key, map.key_size() as usize)?;
+    let value = user_bytes(attr.value, map.value_size() as usize)?;
+    map.update(&key, &value, attr.flags)
 }
 
 /// Delete an element from a map
-fn bpf_map_delete_elem(attr_buf: &[u8]) -> i64 {
-    let Some(attr) = MapElemAttr::read_from(attr_buf) else {
-        return KernelError::InvalidArgument.sysret();
-    };
-
-    // Get map from fd
-    let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
-
-    // Read key from userspace
-    let key_size = map.key_size() as usize;
-    let mut key = vec![0u8; key_size];
-    if copy_from_user::<Uaccess>(&mut key, attr.key, key_size).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Delete
-    match map.delete(&key) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+fn bpf_map_delete_elem(attr_buf: &[u8]) -> KernelResult<()> {
+    let attr = MapElemAttr::read_from(attr_buf).ok_or(KernelError::InvalidArgument)?;
+    let map = get_bpf_map_from_fd(attr.map_fd as i32)?;
+    let key = user_bytes(attr.key, map.key_size() as usize)?;
+    map.delete(&key)
 }
 
-/// Get the next key in a map
-fn bpf_map_get_next_key(attr_buf: &[u8]) -> i64 {
-    let Some(attr) = MapElemAttr::read_from(attr_buf) else {
-        return KernelError::InvalidArgument.sysret();
-    };
-
-    // Get map from fd
-    let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
-
-    // Read current key from userspace (if non-null)
-    let key_size = map.key_size() as usize;
+/// Get the next key in a map (the first for a NULL key), stored at the
+/// value pointer
+fn bpf_map_get_next_key(attr_buf: &[u8]) -> KernelResult<()> {
+    let attr = MapElemAttr::read_from(attr_buf).ok_or(KernelError::InvalidArgument)?;
+    let map = get_bpf_map_from_fd(attr.map_fd as i32)?;
     let current_key = if attr.key == 0 {
         None
     } else {
-        let mut key = vec![0u8; key_size];
-        if copy_from_user::<Uaccess>(&mut key, attr.key, key_size).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-        Some(key)
+        Some(user_bytes(attr.key, map.key_size() as usize)?)
     };
-
-    // Get next key
-    match map.get_next_key(current_key.as_deref()) {
-        Some(next_key) => {
-            // Copy next key to userspace (stored in value field)
-            if copy_to_user::<Uaccess>(attr.value, &next_key).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
-        }
-        None => KernelError::NotFound.sysret(),
-    }
+    let next_key = map
+        .get_next_key(current_key.as_deref())
+        .ok_or(KernelError::NotFound)?;
+    copy_to_user::<Uaccess>(attr.value, &next_key)?;
+    Ok(())
 }
 
-/// Load a BPF program
-fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
-    let Some(attr) = ProgLoadAttr::read_from(attr_buf) else {
-        return KernelError::InvalidArgument.sysret();
-    };
-
-    if let Err(e) = unpriv_ok() {
-        return e.sysret();
-    }
+/// Load a BPF program: its descriptor
+fn bpf_prog_load(attr_buf: &[u8]) -> KernelResult<i32> {
+    let attr = ProgLoadAttr::read_from(attr_buf).ok_or(KernelError::InvalidArgument)?;
+    unpriv_ok()?;
     let max = if bpf_capable() {
         MAX_INSNS_CAP
     } else {
@@ -559,16 +446,13 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
     };
     let n = attr.insn_cnt as usize;
     if n == 0 || n > max {
-        return KernelError::ArgListTooLong.sysret();
+        return Err(KernelError::ArgListTooLong);
     }
     match attr.prog_type {
         BPF_PROG_TYPE_SOCKET_FILTER => {}
-        _ => return KernelError::InvalidArgument.sysret(),
+        _ => return Err(KernelError::InvalidArgument),
     }
-    let insns = match copy_insns(attr.insns, n) {
-        Ok(v) => v,
-        Err(e) => return e.sysret(),
-    };
+    let insns = copy_insns(attr.insns, n)?;
 
     // Nothing attaches a loaded program yet: no helpers, and the
     // context is a 64-byte placeholder for struct __sk_buff
@@ -577,21 +461,9 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
         helpers: &[],
         unreachable_ok: false,
     };
-    if let Err(e) = verify(&insns, &SOCKET_FILTER, max) {
-        return e.sysret();
-    }
-
-    // Create BPF program
-    let prog = match BpfProg::new(insns) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
-
-    // Create file descriptor
-    match create_bpf_prog_fd(prog, attr.prog_type) {
-        Ok(fd) => i64::from(fd),
-        Err(e) => e.sysret(),
-    }
+    verify(&insns, &SOCKET_FILTER, max)?;
+    let prog = BpfProg::new(insns)?;
+    create_bpf_prog_fd(prog, attr.prog_type)
 }
 
 /// The caller's info buffer, as much of it as the kernel knows
@@ -701,19 +573,13 @@ fn prog_info(
 }
 
 /// Get object info by fd
-fn bpf_obj_get_info_by_fd(attr_buf: &[u8], uattr: u64) -> i64 {
-    let Some(attr) = ObjGetInfoAttr::read_from(attr_buf) else {
-        return KernelError::InvalidArgument.sysret();
-    };
-    let r = if let Ok(map) = get_bpf_map_from_fd(attr.bpf_fd as i32) {
+fn bpf_obj_get_info_by_fd(attr_buf: &[u8], uattr: u64) -> KernelResult<()> {
+    let attr = ObjGetInfoAttr::read_from(attr_buf).ok_or(KernelError::InvalidArgument)?;
+    if let Ok(map) = get_bpf_map_from_fd(attr.bpf_fd as i32) {
         map_info(&map, &attr, uattr)
     } else if let Ok((prog, prog_type)) = get_bpf_prog_info_from_fd(attr.bpf_fd as i32) {
         prog_info(&prog, prog_type, &attr, uattr)
     } else {
         Err(KernelError::BadFd)
-    };
-    match r {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
     }
 }

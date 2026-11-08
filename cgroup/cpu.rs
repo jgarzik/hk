@@ -104,12 +104,6 @@ impl CpuState {
     }
 }
 
-impl Default for CpuState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CssPrivate for CpuState {
     fn as_any(&self) -> &dyn Any {
         self

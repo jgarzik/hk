@@ -16,6 +16,7 @@
 //! chunks. The segments themselves are read page by page straight into
 //! the user frames at exec, never as a whole-image copy.
 
+use crate::util::error::KernelError;
 use alloc::vec::Vec;
 
 /// Where an ELF image is read from: an open file at exec, bytes in the
@@ -246,13 +247,12 @@ pub enum ElfError {
     BadSegment,
 }
 
-impl ElfError {
-    /// Positive errno
-    pub fn errno(self) -> i32 {
-        match self {
-            ElfError::NotExecutable => 8, // ENOEXEC
-            ElfError::Truncated => 5,     // EIO
-            ElfError::BadSegment => 22,   // EINVAL
+impl From<ElfError> for KernelError {
+    fn from(e: ElfError) -> Self {
+        match e {
+            ElfError::NotExecutable => KernelError::ExecFormat,
+            ElfError::Truncated => KernelError::Io,
+            ElfError::BadSegment => KernelError::InvalidArgument,
         }
     }
 }

@@ -9,8 +9,10 @@ The rules for `unsafe` are in `doc/UNSAFE.md` and the locking rules in
   design (names, lock order, data structures) is the default unless Rust
   gives a clearly better form. Write any deviation down where the code is.
 - **Errors.** Return `Result<_, KernelError>` and propagate with `?`.
-  Convert to an errno only at the syscall boundary (`sysret`/`errno()`).
-  No raw errno numbers.
+  Convert to an errno only at the syscall boundary (`SysRet::ret` in
+  dispatch). No raw errno numbers.
+- **Syscalls.** `sys_*` return `KernelResult` and take user pointers as
+  `UserPtr`/`UserSlice`.
 - **No panics on user input.** `panic!`, `unwrap` and `expect` are only
   for kernel invariants: a state that cannot happen unless the kernel has
   a bug. Anything a user, a device or a disk can cause is an error return.

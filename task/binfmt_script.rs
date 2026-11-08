@@ -14,10 +14,8 @@ pub const BINPRM_BUF_SIZE: usize = 256;
 /// is ELOOP)
 pub const MAX_DEPTH: usize = 5;
 
-const ENOEXEC: i32 = 8;
-
 use super::argstr::ArgStrings;
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 
 fn spacetab(c: u8) -> bool {
     c == b' ' || c == b'\t'
@@ -35,7 +33,7 @@ fn terminator(c: u8) -> bool {
 /// Err(ENOEXEC) for a script whose first line names no interpreter, or
 /// whose interpreter path may be cut off by the buffer's end (Linux
 /// load_script)
-pub fn parse(head: &[u8]) -> Option<Result<Interp<'_>, i32>> {
+pub fn parse(head: &[u8]) -> Option<KernelResult<Interp<'_>>> {
     let head = &head[..head.len().min(BINPRM_BUF_SIZE)];
     if !head.starts_with(b"#!") {
         return None;
@@ -43,7 +41,7 @@ pub fn parse(head: &[u8]) -> Option<Result<Interp<'_>, i32>> {
     Some(parse_line(head))
 }
 
-fn parse_line(head: &[u8]) -> Result<Interp<'_>, i32> {
+fn parse_line(head: &[u8]) -> KernelResult<Interp<'_>> {
     let mut end = match head.iter().position(|&c| c == b'\n') {
         Some(nl) => nl,
         None => {
@@ -51,9 +49,9 @@ fn parse_line(head: &[u8]) -> Result<Interp<'_>, i32> {
             // before the buffer does (a space, tab or NUL after it)
             let start = (2..head.len())
                 .find(|&i| !spacetab(head[i]))
-                .ok_or(ENOEXEC)?;
+                .ok_or(KernelError::ExecFormat)?;
             if !head[start..].iter().any(|&c| terminator(c)) {
-                return Err(ENOEXEC);
+                return Err(KernelError::ExecFormat);
             }
             head.len()
         }
@@ -64,7 +62,7 @@ fn parse_line(head: &[u8]) -> Result<Interp<'_>, i32> {
     let line = &head[..end];
     let name_start = (2..line.len())
         .find(|&i| !spacetab(line[i]))
-        .ok_or(ENOEXEC)?;
+        .ok_or(KernelError::ExecFormat)?;
     let name_end = (name_start..line.len())
         .find(|&i| terminator(line[i]))
         .unwrap_or(line.len());
@@ -125,12 +123,12 @@ mod tests {
 
     #[test]
     fn bad_lines() {
-        assert_eq!(parse(b"#!\n"), Some(Err(ENOEXEC)));
-        assert_eq!(parse(b"#!   \t\n"), Some(Err(ENOEXEC)));
+        assert_eq!(parse(b"#!\n"), Some(Err(KernelError::ExecFormat)));
+        assert_eq!(parse(b"#!   \t\n"), Some(Err(KernelError::ExecFormat)));
         // No newline and no end of the path within the buffer
         let mut long = alloc::vec![b'#', b'!'];
         long.extend(core::iter::repeat_n(b'a', 300));
-        assert_eq!(parse(&long), Some(Err(ENOEXEC)));
+        assert_eq!(parse(&long), Some(Err(KernelError::ExecFormat)));
         // No newline but the path ends: the line runs to the buffer end
         let mut cut = alloc::vec::Vec::from(&b"#!/bin/sh "[..]);
         cut.extend(core::iter::repeat_n(b'x', 300));

@@ -26,6 +26,7 @@ use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_to_user};
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::{FromBytes, IntoBytes};
 
 // =============================================================================
@@ -119,19 +120,6 @@ crate::pod!(UContext {
     _pad,
     uc_mcontext
 });
-
-impl Default for UContext {
-    fn default() -> Self {
-        Self {
-            uc_flags: 0,
-            uc_link: 0,
-            uc_stack: StackT::default(),
-            uc_sigmask: SigSet::EMPTY,
-            _pad: [0; 128],
-            uc_mcontext: SigContext::default(),
-        }
-    }
-}
 
 // =============================================================================
 // RT Signal Frame
@@ -274,7 +262,7 @@ pub fn setup_rt_frame(
     info: &SigInfo,
     trap: &Trap,
     uframe: &crate::arch::UserFrame,
-) -> Result<(), i32> {
+) -> KernelResult<()> {
     // A copy, written back once the handler frame is in place
     let mut r = uframe.get();
     let regs = &mut r;
@@ -285,9 +273,9 @@ pub fn setup_rt_frame(
     let user_regs = regs.x;
 
     // Get handler address
-    let handler = match action.handler {
-        SigHandler::Handler(addr) => addr,
-        _ => return Err(-22), // EINVAL - not a handler
+    let SigHandler::Handler(handler) = action.handler else {
+        // not a handler
+        return Err(KernelError::InvalidArgument);
     };
 
     // The trampoline that calls rt_sigreturn: the handler's own, else
@@ -298,7 +286,7 @@ pub fn setup_rt_frame(
         let page =
             crate::mm::get_task_mm(crate::task::percpu::current_tid()).map_or(0, |mm| mm.sigpage());
         if page == 0 {
-            return Err(-22);
+            return Err(KernelError::InvalidArgument);
         }
         page
     };
@@ -311,18 +299,18 @@ pub fn setup_rt_frame(
         .checked_sub(16)
         .map(|a| a & !(SIGNAL_FRAME_ALIGN - 1))
     else {
-        return Err(-14);
+        return Err(KernelError::BadAddress);
     };
     let Some(frame_addr) = record_addr
         .checked_sub(frame_size)
         .map(|a| a & !(SIGNAL_FRAME_ALIGN - 1))
     else {
-        return Err(-14);
+        return Err(KernelError::BadAddress);
     };
 
     // Validate user stack address
     if !Uaccess::access_ok(frame_addr, (record_addr + 16 - frame_addr) as usize) {
-        return Err(-14); // EFAULT
+        return Err(KernelError::BadAddress);
     }
 
     // __reserved: the FP/SIMD record of the interrupted code, an
@@ -339,7 +327,7 @@ pub fn setup_rt_frame(
     let reserved_addr = frame_addr + RESERVED_OFFSET as u64;
     let mut end = reserved_addr + FPSIMD_SIZE as u64;
     if copy_to_user::<Uaccess>(reserved_addr, fpsimd.as_bytes()).is_err() {
-        return Err(-14);
+        return Err(KernelError::BadAddress);
     }
     if trap.error != 0 {
         let esr = EsrContext {
@@ -350,18 +338,18 @@ pub fn setup_rt_frame(
             esr: trap.error,
         };
         if copy_to_user::<Uaccess>(end, esr.as_bytes()).is_err() {
-            return Err(-14);
+            return Err(KernelError::BadAddress);
         }
         end += core::mem::size_of::<EsrContext>() as u64;
     }
     if copy_to_user::<Uaccess>(end, CtxHead::default().as_bytes()).is_err() {
-        return Err(-14);
+        return Err(KernelError::BadAddress);
     }
 
     // Frame record for unwinders: {x29, x30} of the interrupted code
     let record = [user_regs[29], user_regs[30]];
     if copy_to_user::<Uaccess>(record_addr, record.as_bytes()).is_err() {
-        return Err(-14);
+        return Err(KernelError::BadAddress);
     }
 
     // Build the frame header (siginfo + ucontext up to __reserved)
@@ -369,16 +357,11 @@ pub fn setup_rt_frame(
     let frame = RtSigFrame {
         info: info.to_user(),
         uc: UContext {
-            uc_flags: 0,
-            uc_link: 0,
             uc_stack: StackT {
-                ss_sp: 0,
                 ss_flags: SS_DISABLE,
-                _pad: 0,
-                ss_size: 0,
+                ..FromBytes::zeroed()
             },
             uc_sigmask: blocked,
-            _pad: [0; 128],
             uc_mcontext: SigContext {
                 // The last fault's FAR (Linux thread.fault_address)
                 fault_address,
@@ -388,10 +371,11 @@ pub fn setup_rt_frame(
                 pstate: user_spsr,
                 _pad: 0,
             },
+            ..FromBytes::zeroed()
         },
     };
     if copy_to_user::<Uaccess>(frame_addr, frame.as_bytes()).is_err() {
-        return Err(-14); // EFAULT
+        return Err(KernelError::BadAddress);
     }
 
     // Calculate addresses of info and ucontext within the frame
@@ -458,7 +442,7 @@ fn parse_reserved(addr: u64) -> Option<FpsimdContext> {
 ///
 /// Returns the value that should be in x0 (return value),
 /// or error code if restore fails.
-pub fn sys_rt_sigreturn() -> i64 {
+pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     let frame = crate::task::percpu::current_pt_regs();
     // A copy, written back once the whole context is restored
     let mut r = frame.get();
@@ -467,28 +451,28 @@ pub fn sys_rt_sigreturn() -> i64 {
     // The current SP points to the signal frame
     let frame_addr = tf.sp;
     if !frame_addr.is_multiple_of(SIGNAL_FRAME_ALIGN) {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     }
     let Some(end) = frame_addr.checked_add(signal_frame_size() as u64) else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
     if !Uaccess::access_ok(frame_addr, (end - frame_addr) as usize) {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     }
 
     let uc_addr = frame_addr + core::mem::offset_of!(RtSigFrame, uc) as u64;
     let Some(sigmask) =
         read_user::<SigSet>(uc_addr + core::mem::offset_of!(UContext, uc_sigmask) as u64)
     else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
     let Some(sc) =
         read_user::<SigContext>(uc_addr + core::mem::offset_of!(UContext, uc_mcontext) as u64)
     else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
     let Some(fpsimd) = parse_reserved(frame_addr + RESERVED_OFFSET as u64) else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
 
     // Restore blocked signal mask
@@ -513,5 +497,5 @@ pub fn sys_rt_sigreturn() -> i64 {
     frame.set(r);
 
     // Return x0 from saved context
-    sc.regs[0] as i64
+    Ok(sc.regs[0] as i64)
 }

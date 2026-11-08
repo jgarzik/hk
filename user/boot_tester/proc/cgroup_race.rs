@@ -134,16 +134,9 @@ fn clone_into(name: &[u8]) -> i64 {
     }
     let args = CloneArgs {
         flags: 0x2_0000_0000, // CLONE_INTO_CGROUP
-        pidfd: 0,
-        child_tid: 0,
-        parent_tid: 0,
         exit_signal: 17,
-        stack: 0,
-        stack_size: 0,
-        tls: 0,
-        set_tid: 0,
-        set_tid_size: 0,
         cgroup: fd as u64,
+        ..CloneArgs::default()
     };
     let r = sys_clone3(&args, core::mem::size_of::<CloneArgs>());
     if r == 0 {
@@ -418,16 +411,9 @@ fn pids_into_cgroup() -> i64 {
     }
     let args = CloneArgs {
         flags: 0x2_0000_0000, // CLONE_INTO_CGROUP
-        pidfd: 0,
-        child_tid: 0,
-        parent_tid: 0,
         exit_signal: 17,
-        stack: 0,
-        stack_size: 0,
-        tls: 0,
-        set_tid: 0,
-        set_tid_size: 0,
         cgroup: fd as u64,
+        ..CloneArgs::default()
     };
     let r = sys_clone3(&args, core::mem::size_of::<CloneArgs>());
     if r == 0 {
@@ -578,16 +564,9 @@ fn pids_exit_reap() -> i64 {
 fn clone3_into(fd: i64) -> i64 {
     let args = CloneArgs {
         flags: 0x2_0000_0000, // CLONE_INTO_CGROUP
-        pidfd: 0,
-        child_tid: 0,
-        parent_tid: 0,
         exit_signal: 17,
-        stack: 0,
-        stack_size: 0,
-        tls: 0,
-        set_tid: 0,
-        set_tid_size: 0,
         cgroup: fd as u64,
+        ..CloneArgs::default()
     };
     let r = sys_clone3(&args, core::mem::size_of::<CloneArgs>());
     if r == 0 {

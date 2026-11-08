@@ -22,8 +22,7 @@ use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 
 use crate::fs::File;
-use crate::fs::syscall::current_fd_table;
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 
 // =============================================================================
 // flock operation constants (Linux ABI)
@@ -225,25 +224,19 @@ impl Clone for FileLock {
 /// * `fd` - File descriptor
 /// * `operation` - Lock operation (LOCK_SH, LOCK_EX, LOCK_UN, optionally OR'd with LOCK_NB)
 ///
-/// # Returns
-/// 0 on success, negative errno on error:
-/// * -EBADF: fd is not an open file descriptor
-/// * -EINVAL: operation is invalid
-/// * -EWOULDBLOCK: LOCK_NB was specified and lock is held by another
-pub fn sys_flock(fd: i32, operation: i32) -> i64 {
+/// # Errors
+/// * EBADF: fd is not an open file descriptor
+/// * EINVAL: operation is invalid
+/// * EWOULDBLOCK: LOCK_NB was specified and lock is held by another
+pub fn sys_flock(fd: i32, operation: i32) -> KernelResult<()> {
     // Validate operation - must be exactly one of SH, EX, or UN, with optional NB
     let lock_op = operation & !LOCK_NB;
     let nonblock = operation & LOCK_NB != 0;
 
     if lock_op != LOCK_SH && lock_op != LOCK_EX && lock_op != LOCK_UN {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f.clone(),
-        None => return KernelError::BadFd.sysret(),
-    };
+    let file = crate::fs::io::fget(fd)?;
 
     // flock locks belong to the open file description (Linux fl_file):
     // every descriptor of it, in any process, holds the same lock
@@ -277,13 +270,8 @@ pub fn sys_flock(fd: i32, operation: i32) -> i64 {
             (r, dropped)
         });
         match (result, &ctx) {
-            (Ok(()), _) => return 0,
-            (Err(KernelError::WouldBlock), Some(i)) if !nonblock => {
-                if let Err(e) = i.i_flctx.wait_change(g) {
-                    return e.sysret();
-                }
-            }
-            (Err(e), _) => return e.sysret(),
+            (Err(KernelError::WouldBlock), Some(i)) if !nonblock => i.i_flctx.wait_change(g)?,
+            (r, _) => return r,
         }
     }
 }

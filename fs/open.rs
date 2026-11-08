@@ -14,6 +14,8 @@ use super::flags::{
 use super::mount::MNT_NODEV;
 use super::syscall::{current_fd_table, get_nofile_limit};
 use crate::task::FD_CLOEXEC;
+use crate::uaccess::UserPtr;
+use crate::util::error::KernelResult;
 use crate::util::kalloc::try_arc;
 
 /// Create regular file `name` in `parent` for O_CREAT (Linux
@@ -50,12 +52,9 @@ fn create_in(
     })()
 }
 
-/// sys_open - open a file
-///
-/// Returns a file descriptor on success, negative errno on error.
-/// This is a wrapper around sys_openat with AT_FDCWD.
-pub fn sys_open(path_ptr: u64, flags: u32, mode: u32) -> i64 {
-    sys_openat(AT_FDCWD, path_ptr, flags, mode)
+/// sys_open - open a file: sys_openat with AT_FDCWD
+pub fn sys_open(path: UserPtr<u8>, flags: u32, mode: u32) -> KernelResult<i32> {
+    sys_openat(AT_FDCWD, path, flags, mode)
 }
 
 /// Resolve the open target: an existing file, or (O_CREAT) a newly
@@ -126,15 +125,8 @@ fn open_target(
 /// * `mode` - File mode for O_CREAT (permission bits)
 ///
 /// # Returns
-/// File descriptor on success, negative errno on error.
-pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> i64 {
-    match do_openat(dirfd, path_ptr, flags, mode) {
-        Ok(fd) => fd,
-        Err(e) => e.sysret(),
-    }
-}
-
-fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, KernelError> {
+/// The new file descriptor
+pub fn sys_openat(dirfd: i32, path_ptr: UserPtr<u8>, flags: u32, mode: u32) -> KernelResult<i32> {
     let path = getname(path_ptr, false)?;
     let file = filp_open(dirfd, &path, flags, mode)?;
 
@@ -144,12 +136,9 @@ fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, Ke
     } else {
         0
     };
-    let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
-    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
-        Ok(fd) => Ok(i64::from(fd)),
-        Err(e) => Ok(-i64::from(e)),
-    }
+    current_fd_table()
+        .lock()
+        .alloc_with_flags(file, fd_flags, get_nofile_limit())
 }
 
 /// Open `path` (relative to `start`) as a new file (Linux do_filp_open):
@@ -232,12 +221,9 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
 /// Give init /dev/console as stdin, stdout and stderr (Linux
 /// console_on_rootfs); call in init's context before it runs
 pub fn console_on_rootfs() {
-    let file = match filp_open(AT_FDCWD, b"/dev/console", O_RDWR, 0) {
-        Ok(f) => f,
-        Err(_) => {
-            crate::printkln!("Warning: unable to open an initial console.");
-            return;
-        }
+    let Ok(file) = filp_open(AT_FDCWD, b"/dev/console", O_RDWR, 0) else {
+        crate::printkln!("Warning: unable to open an initial console.");
+        return;
     };
     let table = current_fd_table();
     let mut t = table.lock();
@@ -247,13 +233,11 @@ pub fn console_on_rootfs() {
 }
 
 /// sys_close - close a file descriptor
-///
-/// Returns 0 on success, negative errno on error.
-pub fn sys_close(fd: i32) -> i64 {
+pub fn sys_close(fd: i32) -> KernelResult<()> {
     if current_fd_table().lock().close(fd) {
-        0
+        Ok(())
     } else {
-        KernelError::BadFd.sysret()
+        Err(KernelError::BadFd)
     }
 }
 
@@ -265,21 +249,18 @@ pub const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
 /// CLOSE_RANGE_CLOEXEC mark close-on-exec, the open descriptors in
 /// fd..=max_fd; CLOSE_RANGE_UNSHARE first gives the caller a private
 /// table, so threads sharing the old one keep their descriptors
-pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> i64 {
+pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> KernelResult<()> {
     if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || fd > max_fd {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     let files = if flags & CLOSE_RANGE_UNSHARE != 0 {
-        match crate::task::fdtable::unshare_task_fd(crate::task::percpu::current_tid()) {
-            Ok(f) => f,
-            Err(e) => return e.sysret(),
-        }
+        crate::task::fdtable::unshare_task_fd(crate::task::percpu::current_tid())?
     } else {
         current_fd_table()
     };
     // Descriptors are i32: nothing is open above i32::MAX
     let Ok(lo) = i32::try_from(fd) else {
-        return 0;
+        return Ok(());
     };
     let hi = i32::try_from(max_fd).unwrap_or(i32::MAX);
     let mut t = files.lock();
@@ -288,5 +269,5 @@ pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> i64 {
     } else {
         t.close_range(lo, hi);
     }
-    0
+    Ok(())
 }

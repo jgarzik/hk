@@ -146,12 +146,6 @@ impl GroupCputimer {
     }
 }
 
-impl Default for GroupCputimer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// The calling process's SignalStruct
 fn my_group() -> Option<Arc<crate::signal::SignalStruct>> {
     crate::task::percpu::current().cpu_group().cloned()
@@ -332,7 +326,7 @@ pub fn run() {
         match f {
             Fire::Timer(t) => t.queue_signal(),
             Fire::Process(s) => {
-                crate::signal::kill_proc_info(pid, s, crate::signal::SendInfo::Kernel);
+                let _ = crate::signal::kill_proc_info(pid, s, crate::signal::SendInfo::Kernel);
             }
             Fire::Wake(t) => t.wake_sleeper(),
         }

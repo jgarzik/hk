@@ -12,13 +12,12 @@
 //! When the handler returns, it executes the trampoline which calls rt_sigreturn
 //! to restore the original context.
 
-#![expect(dead_code)]
-
 use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
-use crate::util::pod::IntoBytes;
+use crate::util::error::{KernelError, KernelResult};
+use crate::util::pod::{FromBytes, IntoBytes};
 
 // =============================================================================
 // Signal Context (sigcontext)
@@ -120,8 +119,6 @@ crate::pod!(StackT {
 
 /// Alternate stack is disabled
 pub const SS_DISABLE: i32 = 2;
-/// Currently executing on alternate stack
-pub const SS_ONSTACK: i32 = 1;
 
 // =============================================================================
 // User Context (ucontext_t)
@@ -152,18 +149,6 @@ crate::pod!(UContext {
     uc_mcontext,
     uc_sigmask
 });
-
-impl Default for UContext {
-    fn default() -> Self {
-        Self {
-            uc_flags: 0,
-            uc_link: 0,
-            uc_stack: StackT::default(),
-            uc_mcontext: SigContext::default(),
-            uc_sigmask: SigSet::EMPTY,
-        }
-    }
-}
 
 // =============================================================================
 // RT Signal Frame
@@ -257,7 +242,7 @@ pub fn setup_rt_frame(
     info: &SigInfo,
     trap: &Trap,
     uframe: &crate::arch::UserFrame,
-) -> Result<(), i32> {
+) -> KernelResult<()> {
     use super::fpu;
 
     // A copy, written back once the handler frame is in place
@@ -272,7 +257,7 @@ pub fn setup_rt_frame(
     // Get handler address
     let handler = match action.handler {
         SigHandler::Handler(addr) if addr < USER_ADDR_LIMIT => addr,
-        _ => return Err(-22), // EINVAL - not a (usable) handler
+        _ => return Err(KernelError::InvalidArgument), // not a (usable) handler
     };
 
     // Get restorer (trampoline that calls rt_sigreturn)
@@ -283,7 +268,7 @@ pub fn setup_rt_frame(
     } else {
         // No restorer provided - signal delivery will fail
         // In a real kernel we'd provide a VDSO trampoline
-        return Err(-22); // EINVAL
+        return Err(KernelError::InvalidArgument);
     };
 
     // user_rsp is user-controlled: an underflow means no room (EFAULT, and
@@ -291,19 +276,19 @@ pub fn setup_rt_frame(
     let frame_size = signal_frame_size();
     let fp_size = fpu::sigframe_size();
     let Some(fpstate_addr) = user_rsp.checked_sub(128 + fp_size as u64).map(|a| a & !63) else {
-        return Err(-14);
+        return Err(KernelError::BadAddress);
     };
     let Some(frame_addr) = fpstate_addr
         .checked_sub(frame_size as u64)
         .and_then(|a| (a & !0xF).checked_sub(8))
     else {
-        return Err(-14);
+        return Err(KernelError::BadAddress);
     };
     let total = (fpstate_addr + fp_size as u64 - frame_addr) as usize;
 
     // Validate user stack address
     if !Uaccess::access_ok(frame_addr, total) {
-        return Err(-14); // EFAULT
+        return Err(KernelError::BadAddress);
     }
 
     // FP image of the interrupted code (live in the registers: the kernel
@@ -311,7 +296,7 @@ pub fn setup_rt_frame(
     let mut fp_area = fpu::FpuArea::init();
     let fp_len = fpu::save_sigframe(&mut fp_area);
     if copy_to_user::<Uaccess>(fpstate_addr, &fp_area.0[..fp_len]).is_err() {
-        return Err(-14);
+        return Err(KernelError::BadAddress);
     }
 
     // Build SigContext from saved registers
@@ -335,23 +320,19 @@ pub fn setup_rt_frame(
         rip: user_rip,
         eflags: user_rflags,
         cs: USER_CS,
-        gs: 0,
-        fs: 0,
         ss: USER_SS,
         err: trap.error,
         trapno: trap.trapno,
         oldmask: blocked.bits(),
         cr2: trap.addr,
         fpstate: fpstate_addr,
-        reserved: [0; 8],
+        ..FromBytes::zeroed()
     };
 
     // Build StackT for ucontext (current stack info)
     let stack_t = StackT {
-        ss_sp: 0,
         ss_flags: SS_DISABLE,
-        _pad: 0,
-        ss_size: 0,
+        ..FromBytes::zeroed()
     };
 
     let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
@@ -374,7 +355,7 @@ pub fn setup_rt_frame(
 
     // Copy frame to user stack
     if copy_to_user::<Uaccess>(frame_addr, &frame.as_bytes()[..frame_size]).is_err() {
-        return Err(-14); // EFAULT
+        return Err(KernelError::BadAddress);
     }
 
     // Calculate addresses of info and ucontext within the frame
@@ -445,7 +426,7 @@ fn restore_sigframe_fpu(fpstate: u64) -> bool {
 ///
 /// Returns the value that should be in RAX (usually -EINTR for interrupted syscall),
 /// or error code if restore fails.
-pub fn sys_rt_sigreturn() -> i64 {
+pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     let frame = crate::task::percpu::current_pt_regs();
     // A copy, written back once the whole context is restored
     let mut r = frame.get();
@@ -462,18 +443,12 @@ pub fn sys_rt_sigreturn() -> i64 {
         .checked_sub(8)
         .and_then(|frame| frame.checked_add(uc_offset as u64))
     else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
-    let uc_size = core::mem::size_of::<UContext>();
-
-    // Validate address
-    if !Uaccess::access_ok(uc_addr, uc_size) {
-        return crate::signal::sigreturn_badframe();
-    }
 
     // Read UContext from user stack (any alignment: copied as bytes)
     let Ok(uc) = crate::uaccess::copy_val_from_user::<Uaccess, UContext>(uc_addr) else {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     };
     let sc = &uc.uc_mcontext;
 
@@ -481,7 +456,7 @@ pub fn sys_rt_sigreturn() -> i64 {
     // one makes the return's IRET fault, which entry.rs turns into the
     // task's #GP (SIGSEGV; fixup_bad_iret)
     if !restore_sigframe_fpu(sc.fpstate) {
-        return crate::signal::sigreturn_badframe();
+        return Err(crate::signal::sigreturn_badframe());
     }
 
     // Restore blocked signal mask
@@ -519,5 +494,5 @@ pub fn sys_rt_sigreturn() -> i64 {
 
     // Return RAX from saved context
     // This allows signal handler to modify the return value
-    sc.rax as i64
+    Ok(sc.rax as i64)
 }

@@ -7,8 +7,10 @@
 //! - capget, capset (capabilities)
 //! - pidfd_open, pidfd_send_signal, pidfd_getfd (pidfd operations)
 
-use crate::util::error::KernelError;
+use crate::uaccess::UserPtr;
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
+use crate::util::pod::FromBytes;
 
 use super::Pid;
 
@@ -75,28 +77,6 @@ crate::pod!(SysInfo {
 
 // Compile-time assertion that SysInfo is 112 bytes (matches Linux and userspace)
 const _: () = assert!(core::mem::size_of::<SysInfo>() == 112);
-
-impl Default for SysInfo {
-    fn default() -> Self {
-        Self {
-            uptime: 0,
-            loads: [0; 3],
-            totalram: 0,
-            freeram: 0,
-            sharedram: 0,
-            bufferram: 0,
-            totalswap: 0,
-            freeswap: 0,
-            procs: 0,
-            pad: 0,
-            _pad2: 0,
-            totalhigh: 0,
-            freehigh: 0,
-            mem_unit: 1,
-            _f: 0,
-        }
-    }
-}
 
 /// Timeval structure for rusage (matches Linux)
 #[repr(C)]
@@ -192,15 +172,10 @@ pub const RUSAGE_THREAD: i32 = 1;
 /// # Locking
 /// Reads memory stats and process count with brief lock holds.
 /// Reads time without locking (seqlock-protected).
-pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
+pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: UserPtr<SysInfo>) -> KernelResult<()> {
     use crate::FRAME_ALLOCATOR;
     use crate::time::{ClockId, TIMEKEEPER};
     use crate::uaccess::put_user;
-
-    // Validate user pointer
-    if !A::access_ok(info_ptr, core::mem::size_of::<SysInfo>()) {
-        return KernelError::BadAddress.sysret();
-    }
 
     // Get uptime (monotonic time since boot, in seconds)
     let mono = TIMEKEEPER.read(ClockId::Monotonic, TIMEKEEPER.get_read_cycles());
@@ -220,25 +195,15 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
         loads: crate::task::loadavg::avenrun().map(|a| a << (16 - crate::task::loadavg::FSHIFT)),
         totalram: mem_stats.total_bytes,
         freeram: mem_stats.free_bytes,
-        sharedram: 0,
-        bufferram: 0,
         totalswap: swap_total * 4096,
         freeswap: swap_free * 4096,
         procs,
-        pad: 0,
-        _pad2: 0,
-        totalhigh: 0,
-        freehigh: 0,
         mem_unit: 1, // All sizes in bytes
-        _f: 0,
+        ..FromBytes::zeroed()
     };
 
-    // Copy to user space
-    if put_user::<A, SysInfo>(info_ptr, info).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    put_user::<A, SysInfo>(info_ptr.addr(), info)?;
+    Ok(())
 }
 
 /// Convert nanoseconds to Timeval
@@ -253,26 +218,19 @@ fn timeval_from_ns(ns: u64) -> Timeval {
 ///
 /// Used by waitid()/wait4() to report a reaped child's resource usage.
 /// Fields other than utime/stime are not tracked and are zeroed.
-pub fn put_rusage_times<A: crate::uaccess::UaccessArch>(
-    usage_ptr: u64,
-    utime_ns: u64,
-    stime_ns: u64,
-) -> Result<(), KernelError> {
-    let usage = Rusage {
+pub fn put_rusage_times(usage: UserPtr<Rusage>, utime_ns: u64, stime_ns: u64) -> KernelResult<()> {
+    let r = Rusage {
         ru_utime: timeval_from_ns(utime_ns),
         ru_stime: timeval_from_ns(stime_ns),
         ..Rusage::default()
     };
-    if !A::access_ok(usage_ptr, core::mem::size_of::<Rusage>()) {
-        return Err(KernelError::BadAddress);
-    }
-    crate::uaccess::put_user::<A, Rusage>(usage_ptr, usage).map_err(|_| KernelError::BadAddress)
+    Ok(usage.write(&r)?)
 }
 
 /// struct tms (Linux include/uapi/linux/times.h), in clock ticks
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct Tms {
+pub struct Tms {
     tms_utime: i64,
     tms_stime: i64,
     tms_cutime: i64,
@@ -293,9 +251,9 @@ fn ns_to_clock_t(ns: u64) -> i64 {
 /// reaped children's user and system time into `buf` (if not NULL),
 /// and the clock ticks since boot (Linux jiffies in USER_HZ units,
 /// counted from 0 where Linux starts 5 minutes before the wrap)
-pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
+pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: UserPtr<Tms>) -> KernelResult<i64> {
     use crate::task::percpu;
-    if buf != 0 {
+    if !buf.is_null() {
         let (utime, stime) = percpu::get_process_times(percpu::current_pid());
         let (cutime, cstime) = percpu::children_times();
         let t = Tms {
@@ -304,11 +262,9 @@ pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
             tms_cutime: ns_to_clock_t(cutime),
             tms_cstime: ns_to_clock_t(cstime),
         };
-        if crate::uaccess::put_user::<A, Tms>(buf, t).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        crate::uaccess::put_user::<A, Tms>(buf.addr(), t)?;
     }
-    crate::time::ticks_to_clock_t(percpu::get_ticks()) as i64
+    Ok(crate::time::ticks_to_clock_t(percpu::get_ticks()) as i64)
 }
 
 /// sys_getrusage - get resource usage
@@ -331,20 +287,14 @@ pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
 /// Returns utime and stime for the current task/process. Other fields
 /// like maxrss, page faults, and context switches are also populated
 /// when available.
-pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -> i64 {
+pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(
+    who: i32,
+    usage_ptr: UserPtr<Rusage>,
+) -> KernelResult<()> {
     use crate::task::percpu;
     use crate::uaccess::put_user;
 
     // Validate who parameter
-    if who != RUSAGE_SELF && who != RUSAGE_CHILDREN && who != RUSAGE_THREAD {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Validate user pointer
-    if !A::access_ok(usage_ptr, core::mem::size_of::<Rusage>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
     // Build rusage structure
     let usage = match who {
         RUSAGE_THREAD => {
@@ -376,15 +326,10 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -
                 ..Rusage::default()
             }
         }
-        _ => return KernelError::InvalidArgument.sysret(),
+        _ => return Err(KernelError::InvalidArgument),
     };
-
-    // Copy to user space
-    if put_user::<A, Rusage>(usage_ptr, usage).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    put_user::<A, Rusage>(usage_ptr.addr(), usage)?;
+    Ok(())
 }
 
 /// sys_getrandom - get random bytes
@@ -402,28 +347,32 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -
 /// # Errors
 /// * EFAULT - Invalid buffer pointer
 /// * EINVAL - Invalid flags
-pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, flags: u32) -> i64 {
+pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(
+    buf: UserPtr<u8>,
+    buflen: usize,
+    flags: u32,
+) -> KernelResult<usize> {
     use crate::random;
     use crate::uaccess::copy_to_user;
 
     // Flags first (EINVAL even for an empty buffer, as on Linux)
-    if let Err(e) = random::get_random_bytes(&mut [], flags) {
-        return i64::from(e);
-    }
+    random::get_random_bytes(&mut [], flags)?;
     // Linux getrandom: at most MAX_RW_COUNT per call; a fault before
     // any byte is EFAULT, after some returns the count
     let len = buflen.min(crate::fs::syscall::MAX_RW_COUNT);
     if len == 0 {
-        return 0;
+        return Ok(0);
     }
-    if !A::access_ok(buf, len) {
-        return KernelError::BadAddress.sysret();
+    if !A::access_ok(buf.addr(), len) {
+        return Err(KernelError::BadAddress);
     }
-    let n = random::stream(len, |off, b| copy_to_user::<A>(buf + off as u64, b).is_ok());
+    let n = random::stream(len, |off, b| {
+        copy_to_user::<A>(buf.addr() + off as u64, b).is_ok()
+    });
     if n == 0 {
-        return KernelError::BadAddress.sysret();
+        return Err(KernelError::BadAddress);
     }
-    n as i64
+    Ok(n)
 }
 
 // =============================================================================
@@ -460,14 +409,14 @@ use crate::task::prctl_ops::{PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSE
 /// - PR_SET_NO_NEW_PRIVS (38): Disable privilege escalation (arg2 = 1, irreversible)
 /// - PR_GET_NO_NEW_PRIVS (39): Get no_new_privs flag (returns 0 or 1)
 ///
-/// Returns 0 on success (or value for GET operations), negative errno on error.
-pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
-    use crate::arch::Uaccess;
+/// Returns 0 on success, or the value for GET operations. arg2 is a
+/// number or a user pointer, by option.
+pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> KernelResult<i64> {
     use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_USER};
     use crate::task::percpu::{TASKLIST, current_tid};
-    use crate::uaccess::{get_user, put_user};
 
     let tid = current_tid();
+    let int_ptr = UserPtr::<i32>::new(arg2);
 
     match option {
         PR_SET_PDEATHSIG => {
@@ -477,238 +426,139 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
 
             // Validate signal number (0 is valid - means disable)
             if !(0..=64).contains(&sig) {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
 
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.pdeath_signal = sig;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            task.pdeath_signal = sig;
+            Ok(0)
         }
 
         PR_GET_PDEATHSIG => {
-            // Get current parent death signal
-            // arg2 is pointer to int where result is stored
+            // Get current parent death signal, stored at arg2 (int *)
             let sig = {
                 let table = TASKLIST.read();
-                match table.get(tid) {
-                    Some(task) => task.pdeath_signal,
-                    None => return KernelError::NoProcess.sysret(),
-                }
+                table.get(tid).ok_or(KernelError::NoProcess)?.pdeath_signal
             };
-
-            // Write signal to user-space pointer
-            if put_user::<Uaccess, i32>(arg2, sig).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
+            int_ptr.write(&sig)?;
+            Ok(0)
         }
 
         PR_SET_NAME => {
-            // Set thread name from user-space string (max 16 bytes including null)
-            let mut name = [0u8; 16];
-
-            // Read up to 16 bytes from user space
-            for (i, slot) in name.iter_mut().enumerate() {
-                match get_user::<Uaccess, u8>(arg2 + i as u64) {
-                    Ok(byte) => {
-                        *slot = byte;
-                        if byte == 0 {
-                            break; // Null terminator found
-                        }
-                    }
-                    Err(_) => return KernelError::BadAddress.sysret(),
-                }
-            }
-            // Ensure null termination
-            name[15] = 0;
-
             // Rename the calling thread under its task_lock (Linux
             // set_task_comm)
-            let me = super::percpu::current();
-            me.task_lock().set_comm(name);
-            0
+            let name = read_comm(arg2)?;
+            super::percpu::current().task_lock().set_comm(name);
+            Ok(0)
         }
 
         PR_GET_NAME => {
-            // Get thread name and write to user buffer
+            // Get thread name and write to user buffer (16 bytes)
             let name = super::percpu::current().comm();
-
-            // Write name to user space (16 bytes)
-            for (i, &byte) in name.iter().enumerate() {
-                if put_user::<Uaccess, u8>(arg2 + i as u64, byte).is_err() {
-                    return KernelError::BadAddress.sysret();
-                }
-            }
-            0
+            crate::uaccess::copy_to_user::<crate::arch::Uaccess>(arg2, &name)?;
+            Ok(0)
         }
 
         PR_SET_DUMPABLE => {
             // Only 0/1 are settable; SUID_DUMP_ROOT (2) is reserved to the
             // suid_dumpable sysctl (Linux kernel/sys.c PR_SET_DUMPABLE)
             if arg2 != u64::from(SUID_DUMP_DISABLE) && arg2 != u64::from(SUID_DUMP_USER) {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-            let value = arg2 as u8;
-
             // On the mm, shared by every thread (Linux set_dumpable)
-            match crate::mm::get_task_mm(tid) {
-                Some(mm) => {
-                    mm.set_dumpable(value);
-                    0
-                }
-                None => KernelError::NoProcess.sysret(),
-            }
+            let mm = crate::mm::get_task_mm(tid).ok_or(KernelError::NoProcess)?;
+            mm.set_dumpable(arg2 as u8);
+            Ok(0)
         }
 
         PR_GET_DUMPABLE => {
-            // Return dumpable flag value
-            match crate::mm::get_task_mm(tid) {
-                Some(mm) => i64::from(mm.dumpable()),
-                None => KernelError::NoProcess.sysret(),
-            }
+            let mm = crate::mm::get_task_mm(tid).ok_or(KernelError::NoProcess)?;
+            Ok(i64::from(mm.dumpable()))
         }
 
         PR_SET_NO_NEW_PRIVS => {
             // Set no_new_privs flag (irreversible once set)
             // arg2 must be 1 to enable, any other value is EINVAL
             if arg2 != 1 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.no_new_privs = true;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            task.prctl.no_new_privs = true;
+            Ok(0)
         }
 
         PR_GET_NO_NEW_PRIVS => {
-            // Return no_new_privs flag (0 or 1)
             let table = TASKLIST.read();
-            match table.get(tid) {
-                Some(task) => {
-                    if task.prctl.no_new_privs {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                None => KernelError::NoProcess.sysret(),
-            }
+            let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+            Ok(i64::from(task.prctl.no_new_privs))
         }
 
         PR_SET_TIMERSLACK => {
             // Set timer slack in nanoseconds
             // arg2 of 0 resets to default (50,000 ns)
             let slack = if arg2 == 0 { 50_000 } else { arg2 };
-
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.timer_slack_ns = slack;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            task.prctl.timer_slack_ns = slack;
+            Ok(0)
         }
 
         PR_GET_TIMERSLACK => {
-            // Return timer slack in nanoseconds
             let table = TASKLIST.read();
-            match table.get(tid) {
-                Some(task) => task.prctl.timer_slack_ns as i64,
-                None => KernelError::NoProcess.sysret(),
-            }
+            let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+            Ok(task.prctl.timer_slack_ns as i64)
         }
 
-        PR_GET_SECCOMP => {
-            // Delegate to seccomp module
-            crate::seccomp::prctl_get_seccomp()
-        }
+        PR_GET_SECCOMP => Ok(crate::seccomp::prctl_get_seccomp()),
 
-        PR_SET_SECCOMP => {
-            // Delegate to seccomp module
-            // arg2 = mode, _arg3 = filter (for FILTER mode)
-            crate::seccomp::prctl_set_seccomp(arg2, _arg3)
-        }
+        // arg2 = mode, arg3 = filter (for FILTER mode)
+        PR_SET_SECCOMP => crate::seccomp::prctl_set_seccomp(arg2, UserPtr::new(arg3)),
 
         PR_SET_KEEPCAPS => {
             // Set keep capabilities flag
             // arg2 must be 0 or 1
             if arg2 > 1 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.keep_caps = arg2 != 0;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            task.prctl.keep_caps = arg2 != 0;
+            Ok(0)
         }
 
         PR_GET_KEEPCAPS => {
-            // Return keep capabilities flag (0 or 1)
             let table = TASKLIST.read();
-            match table.get(tid) {
-                Some(task) => {
-                    if task.prctl.keep_caps {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                None => KernelError::NoProcess.sysret(),
-            }
+            let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+            Ok(i64::from(task.prctl.keep_caps))
         }
 
         PR_SET_CHILD_SUBREAPER => {
             // The process's flag (Linux signal->is_child_subreaper),
             // whichever thread sets it; arg2 nonzero sets it
-            let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
-                return KernelError::NoProcess.sysret();
-            };
+            let sig = crate::signal::get_task_signal_struct(tid).ok_or(KernelError::NoProcess)?;
             sig.set_subreaper(&mut TASKLIST.write(), arg2 != 0);
-            0
+            Ok(0)
         }
 
         PR_GET_CHILD_SUBREAPER => {
             // The process's flag, stored at arg2 (int *)
-            let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
-                return KernelError::NoProcess.sysret();
-            };
+            let sig = crate::signal::get_task_signal_struct(tid).ok_or(KernelError::NoProcess)?;
             let is_subreaper = sig.subreaper(&TASKLIST.read());
-
-            // Write result to user-space pointer
-            let value: i32 = if is_subreaper { 1 } else { 0 };
-            if put_user::<Uaccess, i32>(arg2, value).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
+            int_ptr.write(&i32::from(is_subreaper))?;
+            Ok(0)
         }
 
         #[cfg(target_arch = "x86_64")]
         PR_GET_TSC => {
-            // Get TSC mode (x86-64 only)
-            // arg2 = pointer to int for result
+            // Get TSC mode (x86-64 only), stored at arg2 (int *)
             let tsc_mode = {
                 let table = TASKLIST.read();
-                match table.get(tid) {
-                    Some(task) => task.prctl.tsc_mode,
-                    None => return KernelError::NoProcess.sysret(),
-                }
+                table.get(tid).ok_or(KernelError::NoProcess)?.prctl.tsc_mode
             };
-
-            if put_user::<Uaccess, i32>(arg2, i32::from(tsc_mode)).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
+            int_ptr.write(&i32::from(tsc_mode))?;
+            Ok(0)
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -717,48 +567,47 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             // arg2: PR_TSC_ENABLE (1) or PR_TSC_SIGSEGV (2)
             let mode = arg2 as i32;
             if mode != PR_TSC_ENABLE && mode != PR_TSC_SIGSEGV {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.tsc_mode = mode as u8;
-                // Note: Actually enabling TSC faulting requires CR4.TSD manipulation
-                // For now, just store the preference
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            // Note: Actually enabling TSC faulting requires CR4.TSD manipulation
+            // For now, just store the preference
+            task.prctl.tsc_mode = mode as u8;
+            Ok(0)
         }
 
         PR_SET_THP_DISABLE => {
             // Disable transparent huge pages for this process
             let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.thp_disable = arg2 != 0;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            let mut task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+            task.prctl.thp_disable = arg2 != 0;
+            Ok(0)
         }
 
         PR_GET_THP_DISABLE => {
-            // Get THP disable flag (returns 0 or 1)
             let table = TASKLIST.read();
-            match table.get(tid) {
-                Some(task) => {
-                    if task.prctl.thp_disable {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                None => KernelError::NoProcess.sysret(),
-            }
+            let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+            Ok(i64::from(task.prctl.thp_disable))
         }
 
-        _ => KernelError::InvalidArgument.sysret(), // unsupported operation
+        _ => Err(KernelError::InvalidArgument), // unsupported operation
     }
+}
+
+/// PR_SET_NAME's name: up to 16 bytes from `addr`, stopping at a NUL,
+/// the last always NUL; EFAULT
+fn read_comm(addr: u64) -> KernelResult<[u8; 16]> {
+    let mut name = [0u8; 16];
+    for (i, slot) in name.iter_mut().enumerate() {
+        let p = UserPtr::<u8>::new(addr).offset(i);
+        *slot = p.ok_or(KernelError::BadAddress)?.read()?;
+        if *slot == 0 {
+            break;
+        }
+    }
+    name[15] = 0;
+    Ok(name)
 }
 
 // =============================================================================
@@ -786,69 +635,64 @@ use crate::arch::x86_64::percpu::{
 ///
 /// Returns 0 on success, negative errno on error.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
-    use crate::arch::Uaccess;
-    use crate::uaccess::put_user;
+pub fn sys_arch_prctl(code: i32, addr: u64) -> KernelResult<i64> {
+    // addr is a value for the SET codes, a u64 * for the GET ones
+    let out = UserPtr::<u64>::new(addr);
 
     match code {
         ARCH_SET_FS => {
             // Set FS base - user TLS pointer
             if !crate::arch::user_tls_ok(addr) {
-                return KernelError::NotPermitted.sysret();
+                return Err(KernelError::NotPermitted);
             }
             super::percpu::current()
                 .tls
                 .store(addr, core::sync::atomic::Ordering::Relaxed);
             write_fs_base(addr);
-            0
+            Ok(0)
         }
         ARCH_GET_FS => {
             // Get FS base - return via user pointer
             // The live register (user code may have changed it)
             let tls = read_fs_base();
 
-            // Write to user address
-            if put_user::<Uaccess, u64>(addr, tls).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
+            out.write(&tls)?;
+            Ok(0)
         }
         // CPUID faulting is not supported, so CPUID is always enabled.
         // Matches Linux on CPUs without X86_FEATURE_CPUID_FAULT
         // (arch/x86/kernel/process.c get_cpuid_mode/set_cpuid_mode).
-        ARCH_GET_CPUID => 1,
-        ARCH_SET_CPUID => KernelError::NoDevice.sysret(),
+        ARCH_GET_CPUID => Ok(1),
+        ARCH_SET_CPUID => Err(KernelError::NoDevice),
         ARCH_SET_GS => {
             // The user GS base (the kernel's per-CPU base is swapped in
             // on entry): null selector, then the base, like Linux
             // do_arch_prctl_64
             if !crate::arch::user_tls_ok(addr) {
-                return KernelError::NotPermitted.sysret();
+                return Err(KernelError::NotPermitted);
             }
             crate::arch::x86_64::percpu::load_user_gs_null();
             crate::arch::write_user_gsbase(addr);
             super::percpu::current()
                 .gsbase
                 .store(addr, core::sync::atomic::Ordering::Relaxed);
-            0
+            Ok(0)
         }
         ARCH_GET_GS => {
             // The live user base (`mov gs` may have changed it)
             let gs = crate::arch::read_user_gsbase();
-            if put_user::<Uaccess, u64>(addr, gs).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            0
+            out.write(&gs)?;
+            Ok(0)
         }
-        _ => KernelError::InvalidArgument.sysret(),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
 
 /// sys_arch_prctl stub for non-x86_64 architectures
 #[cfg(not(target_arch = "x86_64"))]
-pub fn sys_arch_prctl(_code: i32, _addr: u64) -> i64 {
+pub fn sys_arch_prctl(_code: i32, _addr: u64) -> KernelResult<i64> {
     // arch_prctl is x86_64-specific
-    KernelError::NotImplemented.sysret()
+    Err(KernelError::NotImplemented)
 }
 
 // =============================================================================
@@ -930,79 +774,78 @@ pub mod syslog_action {
 ///
 /// # Permissions
 /// Most operations require CAP_SYSLOG or CAP_SYS_ADMIN.
-pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32) -> i64 {
+pub fn sys_syslog<A: crate::uaccess::UaccessArch>(
+    type_: i32,
+    buf: UserPtr<u8>,
+    len: i32,
+) -> KernelResult<i64> {
     use syslog_action::*;
 
     // Basic validation
     if len < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Linux check_syslog_permissions with dmesg_restrict = 1
     // (syslog_action_restricted is then true for every action): all of
     // them need CAP_SYSLOG
     if !crate::kmsg::syslog_read_allowed() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     match type_ {
         SYSLOG_ACTION_CLOSE | SYSLOG_ACTION_OPEN => {
             // No-op, just return success
-            0
+            Ok(0)
         }
 
         SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
             // Read from kernel log buffer
-            if buf == 0 || len == 0 {
-                return KernelError::InvalidArgument.sysret();
+            if buf.is_null() || len == 0 {
+                return Err(KernelError::InvalidArgument);
             }
-            if !A::access_ok(buf, len as usize) {
-                return KernelError::BadAddress.sysret();
+            if !A::access_ok(buf.addr(), len as usize) {
+                return Err(KernelError::BadAddress);
             }
 
             let data = match type_ {
-                SYSLOG_ACTION_READ => match crate::kmsg::syslog_read(len as usize) {
-                    Ok(d) => d,
-                    Err(e) => return e.sysret(),
-                },
+                SYSLOG_ACTION_READ => crate::kmsg::syslog_read(len as usize)?,
                 _ => crate::kmsg::syslog_read_all(len as usize, type_ == SYSLOG_ACTION_READ_CLEAR),
             };
-            if crate::uaccess::copy_to_user::<A>(buf, &data).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            data.len() as i64
+            crate::uaccess::copy_to_user::<A>(buf.addr(), &data)?;
+            Ok(data.len() as i64)
         }
 
         SYSLOG_ACTION_CLEAR => {
             crate::kmsg::syslog_clear();
-            0
+            Ok(0)
         }
 
         SYSLOG_ACTION_CONSOLE_OFF => {
             // Disable console logging - no-op for now
-            0
+            Ok(0)
         }
 
         SYSLOG_ACTION_CONSOLE_ON => {
             // Enable console logging - no-op for now
-            0
+            Ok(0)
         }
 
         SYSLOG_ACTION_CONSOLE_LEVEL => {
             // Set console log level
             // len parameter is the log level (1-8 typically)
             if !(1..=8).contains(&len) {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
             // No-op for now
-            0
+            Ok(0)
         }
 
-        SYSLOG_ACTION_SIZE_UNREAD => crate::kmsg::syslog_size_unread() as i64,
+        SYSLOG_ACTION_SIZE_UNREAD => Ok(crate::kmsg::syslog_size_unread() as i64),
 
-        SYSLOG_ACTION_SIZE_BUFFER => crate::kmsg::syslog_size_buffer() as i64,
+        SYSLOG_ACTION_SIZE_BUFFER => Ok(crate::kmsg::syslog_size_buffer() as i64),
 
-        _ => KernelError::InvalidArgument.sysret(),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
 
@@ -1018,33 +861,22 @@ use super::{
 /// Validate capability header version and return number of u32s to copy
 ///
 /// If the version is invalid, writes the current version back to the header
-/// and returns -EINVAL.
+/// and returns EINVAL.
 fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
-    header_addr: u64,
-) -> Result<(usize, i32), i64> {
+    header: UserPtr<CapUserHeader>,
+) -> KernelResult<(usize, i32)> {
     use crate::uaccess::{get_user, put_user};
 
-    if header_addr == 0 {
-        return Err(KernelError::BadAddress.sysret());
+    if header.is_null() {
+        return Err(KernelError::BadAddress);
     }
-
-    // Read header from user space
-    let hdr: CapUserHeader = match get_user::<A, CapUserHeader>(header_addr) {
-        Ok(h) => h,
-        Err(_) => return Err(KernelError::BadAddress.sysret()),
-    };
-
-    let version = hdr.version;
-    let pid = hdr.pid;
-
-    match version {
-        _LINUX_CAPABILITY_VERSION_1 => {
-            // Legacy 32-bit version - only 1 u32 per set
-            Ok((1, pid))
-        }
+    let hdr: CapUserHeader = get_user::<A, CapUserHeader>(header.addr())?;
+    match hdr.version {
+        // Legacy 32-bit version - only 1 u32 per set
+        _LINUX_CAPABILITY_VERSION_1 => Ok((1, hdr.pid)),
+        // 64-bit versions - 2 u32s per set
         _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
-            // 64-bit versions - 2 u32s per set
-            Ok((_LINUX_CAPABILITY_U32S_3, pid))
+            Ok((_LINUX_CAPABILITY_U32S_3, hdr.pid))
         }
         _ => {
             // Invalid version - write current version back and return EINVAL
@@ -1052,8 +884,8 @@ fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
                 version: _LINUX_CAPABILITY_VERSION_3,
                 pid: 0,
             };
-            let _ = put_user::<A, CapUserHeader>(header_addr, current_version);
-            Err(KernelError::InvalidArgument.sysret())
+            let _ = put_user::<A, CapUserHeader>(header.addr(), current_version);
+            Err(KernelError::InvalidArgument)
         }
     }
 }
@@ -1067,24 +899,23 @@ fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
 ///
 /// If dataptr is NULL and the version is valid, returns 0 (version query).
 /// Otherwise, copies capability data to userspace.
-pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u64) -> i64 {
+pub fn sys_capget<A: crate::uaccess::UaccessArch>(
+    header: UserPtr<CapUserHeader>,
+    data: UserPtr<CapUserData>,
+) -> KernelResult<()> {
     use crate::uaccess::put_user;
 
     // Validate version and get number of u32s to copy
-    let (tocopy, pid) = match cap_validate_magic::<A>(header_addr) {
-        Ok((n, p)) => (n, p),
-        Err(e) => {
-            // If dataptr is NULL and we got EINVAL, this is a version query
-            if data_addr == 0 && e == KernelError::InvalidArgument.sysret() {
-                return 0;
-            }
-            return e;
-        }
+    let (tocopy, pid) = match cap_validate_magic::<A>(header) {
+        Ok(r) => r,
+        // If dataptr is NULL and we got EINVAL, this is a version query
+        Err(KernelError::InvalidArgument) if data.is_null() => return Ok(()),
+        Err(e) => return Err(e),
     };
 
     // If dataptr is NULL, this is just a version query (already validated)
-    if data_addr == 0 {
-        return 0;
+    if data.is_null() {
+        return Ok(());
     }
 
     // Get current pid
@@ -1095,12 +926,12 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
         // Query our own capabilities
         super::current_cred()
     } else if pid < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     } else {
         // Query another process's capabilities
         // For now, only support querying current process
         // Full implementation would use find_task_by_vpid and RCU
-        return KernelError::NoProcess.sysret();
+        return Err(KernelError::NoProcess);
     };
 
     // Build capability data arrays
@@ -1115,13 +946,10 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
 
     // Copy to user space
     for (i, item) in kdata.iter().enumerate().take(tocopy) {
-        let dst = data_addr + (i * core::mem::size_of::<CapUserData>()) as u64;
-        if put_user::<A, CapUserData>(dst, *item).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        let dst = data.offset(i).ok_or(KernelError::BadAddress)?;
+        put_user::<A, CapUserData>(dst.addr(), *item)?;
     }
-
-    0
+    Ok(())
 }
 
 /// sys_capset - set capabilities of current process
@@ -1133,31 +961,28 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
 /// - I (inheritable): raised bits must be subset of old permitted
 /// - P (permitted): raised bits must be subset of old permitted
 /// - E (effective): must be subset of new permitted
-pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u64) -> i64 {
+pub fn sys_capset<A: crate::uaccess::UaccessArch>(
+    header: UserPtr<CapUserHeader>,
+    data: UserPtr<CapUserData>,
+) -> KernelResult<()> {
     use crate::uaccess::get_user;
 
     // Validate version and get number of u32s to copy
-    let (tocopy, pid) = match cap_validate_magic::<A>(header_addr) {
-        Ok((n, p)) => (n, p),
-        Err(e) => return e,
-    };
+    let (tocopy, pid) = cap_validate_magic::<A>(header)?;
 
     // Get current pid
     let current_pid = super::pid::vnr(super::percpu::current_pid()) as i32;
 
     // May only affect current process (Linux restriction since kernel 2.6.27)
     if pid != 0 && pid != current_pid {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     // Read capability data from user space
     let mut kdata = [CapUserData::default(); 2];
     for (i, item) in kdata.iter_mut().enumerate().take(tocopy) {
-        let src = data_addr + (i * core::mem::size_of::<CapUserData>()) as u64;
-        match get_user::<A, CapUserData>(src) {
-            Ok(d) => *item = d,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        }
+        let src = data.offset(i).ok_or(KernelError::BadAddress)?;
+        *item = get_user::<A, CapUserData>(src.addr())?;
     }
 
     // Combine 32-bit values into 64-bit capabilities
@@ -1172,20 +997,15 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
     //
     // 1. New inheritable must not add any capabilities not in old permitted
     //    (can only inherit what we're permitted to use)
-    if !inheritable.is_subset(&old_cred.cap_permitted) {
-        return KernelError::NotPermitted.sysret();
-    }
-
     // 2. New permitted must not add any capabilities not in old permitted
     //    (can't gain capabilities we don't already have)
-    if !permitted.is_subset(&old_cred.cap_permitted) {
-        return KernelError::NotPermitted.sysret();
-    }
-
     // 3. New effective must be subset of new permitted
     //    (can't use capabilities we're not permitted to use)
-    if !effective.is_subset(&permitted) {
-        return KernelError::NotPermitted.sysret();
+    if !inheritable.is_subset(&old_cred.cap_permitted)
+        || !permitted.is_subset(&old_cred.cap_permitted)
+        || !effective.is_subset(&permitted)
+    {
+        return Err(KernelError::NotPermitted);
     }
 
     // Create new credentials with updated capabilities
@@ -1194,14 +1014,8 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
     new_cred.cap_permitted = permitted;
     new_cred.cap_inheritable = inheritable;
     // Note: bset and ambient are not modified by capset
-
-    // Commit the new credentials
-    match try_arc(new_cred) {
-        Ok(c) => super::commit_creds(c),
-        Err(e) => return e.sysret(),
-    }
-
-    0
+    super::commit_creds(try_arc(new_cred)?);
+    Ok(())
 }
 
 // ============================================================================
@@ -1221,39 +1035,13 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
 /// * -ESRCH: No such process
 /// * -ENOENT: `pid` is a thread that does not lead its process, and no
 ///   PIDFD_THREAD
-pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
+pub fn sys_pidfd_open(pid: i64, flags: u32) -> KernelResult<i32> {
     use crate::task::pidfd::pidfd_flags::{PIDFD_NONBLOCK, PIDFD_THREAD};
     if flags & !(PIDFD_NONBLOCK | PIDFD_THREAD) != 0 || pid <= 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    let pidfd_file = match crate::task::pidfd::open_pidfd(pid as Pid, flags) {
-        Ok(file) => file,
-        Err(e) => return e.sysret(),
-    };
-
-    // Allocate FD in current task's FD table
-    let current_tid = super::percpu::current_tid();
-    let fd_table = match super::fdtable::get_task_fd(current_tid) {
-        Some(table) => table,
-        None => return KernelError::NoProcess.sysret(),
-    };
-
-    let mut table = fd_table.lock();
-
-    // Get NOFILE limit
-    let nofile = {
-        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-        if limit == crate::task::rlimit::RLIM_INFINITY {
-            u64::MAX
-        } else {
-            limit
-        }
-    };
-
-    match table.alloc_with_flags(pidfd_file, super::FD_CLOEXEC, nofile) {
-        Ok(fd) => i64::from(fd),
-        Err(e) => i64::from(e),
-    }
+    let pidfd_file = crate::task::pidfd::open_pidfd(pid as Pid, flags)?;
+    crate::fs::io::fd_install(pidfd_file, super::FD_CLOEXEC)
 }
 
 /// sys_pidfd_send_signal - send a signal to a process via a pidfd
@@ -1272,36 +1060,25 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 /// * -EBADF: Invalid file descriptor
 /// * -EINVAL: Invalid signal number or flags
 /// * -ESRCH: Process no longer exists
-pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64 {
+pub fn sys_pidfd_send_signal(
+    pidfd: i32,
+    sig: i32,
+    info: UserPtr<crate::signal::SigInfo>,
+    flags: u32,
+) -> KernelResult<()> {
     const SCOPES: u32 =
         PIDFD_SIGNAL_THREAD | PIDFD_SIGNAL_THREAD_GROUP | PIDFD_SIGNAL_PROCESS_GROUP;
     if flags & !SCOPES != 0 || flags.count_ones() > 1 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate signal number (0 is allowed as a null signal for checking permissions)
     if !(0..=64).contains(&sig) {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Get the file from FD table
-    let current_tid = super::percpu::current_tid();
-    let fd_table = match super::fdtable::get_task_fd(current_tid) {
-        Some(table) => table,
-        None => return KernelError::NoProcess.sysret(),
-    };
-
-    let file = {
-        let table = fd_table.lock();
-        match table.get(pidfd) {
-            Some(file) => file,
-            None => return KernelError::BadFd.sysret(),
-        }
-    };
-
-    let Some(pidfd) = crate::task::pidfd::get_pidfd(&file) else {
-        return KernelError::BadFd.sysret();
-    };
+    let file = crate::fs::io::fget(pidfd)?;
+    let pidfd = crate::task::pidfd::get_pidfd(&file).ok_or(KernelError::BadFd)?;
     // The scope (Linux do_pidfd_send_signal's pid_type)
     let scope = match flags {
         PIDFD_SIGNAL_THREAD => Scope::Thread,
@@ -1310,17 +1087,14 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64
         _ if pidfd.thread() => Scope::Thread,
         _ => Scope::Process,
     };
-    let info = match pidfd_info(info, sig as u32, pidfd.pid(), scope) {
-        Ok(i) => i,
-        Err(e) => return e.sysret(),
-    };
+    let info = pidfd_info(info, sig as u32, pidfd.pid(), scope)?;
     // Permission check and send to the pidfd's struct pid itself (Linux
     // kill_pid_info_type, kill_pgrp_info), so a released task's reused
     // number never gets it. Signal 0 is a permission/existence probe.
     let me = crate::signal::syscall::Sender::current();
     let check = |t: &super::percpu::TaskView<'_>| me.may_kill(t, sig as u32);
     let (sig, pid) = (sig as u32, pidfd.pid_ref());
-    let r = match scope {
+    match scope {
         Scope::Thread => {
             crate::signal::kill_pid_info_type(pid, sig, info, crate::signal::PidType::Pid, check)
         }
@@ -1328,8 +1102,7 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64
             crate::signal::kill_pid_info_type(pid, sig, info, crate::signal::PidType::Tgid, check)
         }
         Scope::Pgrp => crate::signal::kill_pgrp_info(pid, sig, info, check),
-    };
-    i64::from(r)
+    }
 }
 
 /// pidfd_send_signal's scope flags (include/uapi/linux/pidfd.h)
@@ -1351,13 +1124,13 @@ enum Scope {
 /// for `sig` (EINVAL), with a code reserved to the kernel only to the
 /// caller's own thread or process (EPERM)
 fn pidfd_info(
-    uinfo: u64,
+    uinfo: UserPtr<crate::signal::SigInfo>,
     sig: u32,
     pid: u64,
     scope: Scope,
-) -> Result<crate::signal::SendInfo, KernelError> {
+) -> KernelResult<crate::signal::SendInfo> {
     use crate::signal::{SendInfo, SigInfo, si_code};
-    if uinfo == 0 {
+    if uinfo.is_null() {
         if scope != Scope::Thread {
             return Ok(SendInfo::User);
         }
@@ -1370,7 +1143,7 @@ fn pidfd_info(
             uid,
         )));
     }
-    let info = SigInfo::copy_from_user(uinfo)?;
+    let info = SigInfo::copy_from_user(uinfo.addr())?;
     if info.sig() != sig {
         return Err(KernelError::InvalidArgument);
     }
@@ -1402,72 +1175,38 @@ fn pidfd_info(
 ///
 /// # Permission Model
 /// Simplified PTRACE_MODE_ATTACH: allow if caller has CAP_SYS_PTRACE or same euid.
-pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
+pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> KernelResult<i32> {
     // Validate flags (must be 0)
     if flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Get caller's fd table and the pidfd file
-    let caller_tid = super::percpu::current_tid();
-    let caller_fd_table = match super::fdtable::get_task_fd(caller_tid) {
-        Some(t) => t,
-        None => return KernelError::NoProcess.sysret(),
-    };
-
-    let pidfd_file = {
-        let table = caller_fd_table.lock();
-        match table.get(pidfd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
-        }
-    };
+    let pidfd_file = crate::fs::io::fget(pidfd)?;
 
     // The pidfd's process itself, while it is still there
-    let target_tid = match crate::task::pidfd::pidfd_tid(&pidfd_file) {
-        Ok(tid) => tid,
-        Err(e) => return e.sysret(),
-    };
+    let target_tid = crate::task::pidfd::pidfd_tid(&pidfd_file)?;
 
     // Linux __pidfd_fget: under the target's exec_update_lock,
     // ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS)
     let _exec = crate::signal::ExecUpdateRead::lock(target_tid);
     if !super::ptrace::may_access_tid(target_tid, false) {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
-    // Get target's fd table
-    let target_fd_table = match super::fdtable::get_task_fd(target_tid) {
-        Some(t) => t,
-        None => return KernelError::NoProcess.sysret(), // Process exiting
-    };
+    // Get target's fd table (none: process exiting)
+    let target_fd_table = super::fdtable::get_task_fd(target_tid).ok_or(KernelError::NoProcess)?;
     // Its process still being that task, every lookup by tid above
     // found it (the tid is not freed while it is listed); else its
     // files are gone (Linux fget_task: EBADF)
     if crate::task::pidfd::pidfd_tid(&pidfd_file) != Ok(target_tid) {
-        return KernelError::BadFd.sysret();
+        return Err(KernelError::BadFd);
     }
+    let target_file = target_fd_table
+        .lock()
+        .get(targetfd)
+        .ok_or(KernelError::BadFd)?;
 
-    // Get the file from target's fd table
-    let target_file = {
-        let table = target_fd_table.lock();
-        match table.get(targetfd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
-        }
-    };
-
-    // Allocate new fd in caller's fd table with FD_CLOEXEC
-    let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-    let new_fd = {
-        let mut table = caller_fd_table.lock();
-        match table.alloc_with_flags(target_file, super::FD_CLOEXEC, nofile) {
-            Ok(fd) => fd,
-            Err(e) => return i64::from(e),
-        }
-    };
-
-    i64::from(new_fd)
+    // A new fd in the caller's table with FD_CLOEXEC
+    crate::fs::io::fd_install(target_file, super::FD_CLOEXEC)
 }
 
 // =============================================================================
@@ -1495,15 +1234,12 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
 /// This is an emulated IOPL - it doesn't modify the CPU's actual IOPL register.
 /// The kernel stores the level per-task and uses it for permission checks.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_iopl(level: u32) -> i64 {
+pub fn sys_iopl(level: u32) -> KernelResult<()> {
     use crate::task::{CAP_SYS_RAWIO, capable};
-
-    const EINVAL: i64 = 22;
-    const EPERM: i64 = 1;
 
     // Validate level (must be 0-3)
     if level > 3 {
-        return -EINVAL;
+        return Err(KernelError::InvalidArgument);
     }
 
     // Get current IOPL level
@@ -1511,23 +1247,23 @@ pub fn sys_iopl(level: u32) -> i64 {
 
     // No change? Done.
     if level == u32::from(old) {
-        return 0;
+        return Ok(());
     }
 
     // Lowering privilege is always allowed
     if level < u32::from(old) {
         super::percpu::set_current_iopl_emul(level as u8);
-        return 0;
+        return Ok(());
     }
 
     // Raising privilege requires CAP_SYS_RAWIO
     if !capable(CAP_SYS_RAWIO) {
-        return -EPERM;
+        return Err(KernelError::NotPermitted);
     }
 
     // Set new level
     super::percpu::set_current_iopl_emul(level as u8);
-    0
+    Ok(())
 }
 
 /// ioperm - Set port input/output permissions (x86-64 only, stub)
@@ -1546,7 +1282,6 @@ pub fn sys_iopl(level: u32) -> i64 {
 /// Full ioperm implementation requires per-task I/O permission bitmaps in the TSS.
 /// This is not yet implemented. Use iopl(3) for full I/O port access.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_ioperm(_from: u64, _num: u64, _turn_on: i32) -> i64 {
-    const ENOSYS: i64 = 38;
-    -ENOSYS
+pub fn sys_ioperm(_from: u64, _num: u64, _turn_on: i32) -> KernelResult<()> {
+    Err(KernelError::NotImplemented)
 }

@@ -114,16 +114,10 @@ impl TaskContext {
         }
 
         Self {
-            // RSP points to r15 (top of pushed values)
+            // RSP points to r15 (top of pushed values); the rest is
+            // unused by the stack-based context switch
             rsp: stack_top - 56,
-            // These fields are unused when using stack-based context switch
-            rip: 0,
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            rbx: 0,
-            rbp: 0,
+            ..Default::default()
         }
     }
 }
@@ -248,16 +242,10 @@ impl TaskContext {
         }
 
         Self {
-            // RSP points to r15 (top of pushed values)
+            // RSP points to r15 (top of pushed values); the rest is
+            // unused by the stack-based context switch
             rsp: kstack_with_trapframe - 56,
-            // These fields are unused when using stack-based context switch
-            rip: 0,
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            rbx: 0,
-            rbp: 0,
+            ..Default::default()
         }
     }
 }

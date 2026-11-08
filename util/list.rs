@@ -60,12 +60,6 @@ impl Link {
     }
 }
 
-impl Default for Link {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Maps a list's items to their [`Link`] and back
 ///
 /// # Safety
@@ -266,12 +260,6 @@ impl<A: Adapter> List<A> {
     }
 }
 
-impl<A: Adapter> Default for List<A> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Iterator over a [`List`]'s items
 pub struct Iter<'a, A: Adapter> {
     cur: *mut Link,
@@ -370,12 +358,6 @@ impl<A: Adapter> ArcList<A> {
 
     pub fn iter(&self) -> Iter<'_, A> {
         self.list.iter()
-    }
-}
-
-impl<A: Adapter> Default for ArcList<A> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -30,6 +30,7 @@ pub use syscall::{sys_add_key, sys_keyctl, sys_request_key};
 pub use types::{KeyType, KeyringKeyType, UserKeyType};
 
 use crate::sync::spin::RwLock;
+use crate::util::error::KernelError;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -202,7 +203,7 @@ const KEY_ROOT_MAXBYTES: usize = 25_000_000;
 
 /// Charge one key of `bytes` to `uid`, or EDQUOT past its limit (Linux
 /// key_alloc / key_payload_reserve)
-pub fn key_user_charge(uid: u32, bytes: usize) -> Result<(), i64> {
+pub fn key_user_charge(uid: u32, bytes: usize) -> Result<(), KernelError> {
     let (maxk, maxb) = if uid == 0 {
         (KEY_ROOT_MAXKEYS, KEY_ROOT_MAXBYTES)
     } else {
@@ -211,7 +212,7 @@ pub fn key_user_charge(uid: u32, bytes: usize) -> Result<(), i64> {
     let mut users = KEY_USERS.write();
     let u = users.entry(uid).or_default();
     if u.nkeys + 1 > maxk || u.nbytes.saturating_add(bytes) > maxb {
-        return Err(crate::util::error::KernelError::QuotaExceeded.sysret());
+        return Err(KernelError::QuotaExceeded);
     }
     u.nkeys += 1;
     u.nbytes += bytes;
@@ -220,7 +221,7 @@ pub fn key_user_charge(uid: u32, bytes: usize) -> Result<(), i64> {
 
 /// Change a key's byte charge from `old` to `new` (Linux
 /// key_payload_reserve): EDQUOT if growing passes `uid`'s maxbytes
-pub fn key_user_resize(uid: u32, old: usize, new: usize) -> Result<(), i64> {
+pub fn key_user_resize(uid: u32, old: usize, new: usize) -> Result<(), KernelError> {
     let maxb = if uid == 0 {
         KEY_ROOT_MAXBYTES
     } else {
@@ -230,7 +231,7 @@ pub fn key_user_resize(uid: u32, old: usize, new: usize) -> Result<(), i64> {
     let u = users.entry(uid).or_default();
     let n = u.nbytes.saturating_sub(old).saturating_add(new);
     if new > old && n > maxb {
-        return Err(crate::util::error::KernelError::QuotaExceeded.sysret());
+        return Err(KernelError::QuotaExceeded);
     }
     u.nbytes = n;
     Ok(())

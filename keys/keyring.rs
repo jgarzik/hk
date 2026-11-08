@@ -139,14 +139,14 @@ fn slot_keyring(
     name: &str,
     uid: u32,
     gid: u32,
-) -> Result<Arc<Key>, i64> {
+) -> Result<Arc<Key>, KernelError> {
     if let Some(k) = slot.as_ref().filter(|k| k.state() != super::KeyState::Dead) {
         return Ok(k.clone());
     }
     if !create {
-        return Err(KernelError::NoKey.sysret());
+        return Err(KernelError::NoKey);
     }
-    let k = create_keyring(name, uid, gid).map_err(KernelError::sysret)?;
+    let k = create_keyring(name, uid, gid)?;
     // An invalidated keyring the slot held is dropped after the caller's
     // lock (returned to it below by replace)
     let _old = slot.replace(k.clone());
@@ -160,9 +160,9 @@ pub fn resolve_special_keyring(
     tid: u64,
     uid: u32,
     gid: u32,
-) -> Result<Arc<Key>, i64> {
+) -> Result<Arc<Key>, KernelError> {
     let task_slot = |pick: fn(&mut TaskKeyrings) -> &mut Option<Arc<Key>>, name| {
-        let t = task(tid).ok_or(KernelError::NoKey.sysret())?;
+        let t = task(tid).ok_or(KernelError::NoKey)?;
         let mut k = t.keyrings.lock();
         slot_keyring(pick(&mut k), create, name, uid, gid)
     };
@@ -177,19 +177,19 @@ pub fn resolve_special_keyring(
         KEY_SPEC_USER_KEYRING => user_slot(|k| &mut k.user_keyring, "_uid"),
         KEY_SPEC_USER_SESSION_KEYRING => user_slot(|k| &mut k.user_session_keyring, "_uid_ses"),
         // Positive serial: look up directly
-        serial if serial > 0 => lookup_key(serial).ok_or(KernelError::NoKey.sysret()),
+        serial if serial > 0 => lookup_key(serial).ok_or(KernelError::NoKey),
         // Invalid special ID
-        _ => Err(KernelError::NoKey.sysret()),
+        _ => Err(KernelError::NoKey),
     }
 }
 
 /// Link a key to a keyring
-pub fn keyring_link(keyring: &Key, key: &Arc<Key>) -> Result<(), i64> {
+pub fn keyring_link(keyring: &Key, key: &Arc<Key>) -> Result<(), KernelError> {
     keyring.keyring_add(key)
 }
 
 /// Unlink a key from a keyring
-pub fn keyring_unlink(keyring: &Key, key: &Key) -> Result<(), i64> {
+pub fn keyring_unlink(keyring: &Key, key: &Key) -> Result<(), KernelError> {
     keyring.keyring_remove(key.serial)
 }
 

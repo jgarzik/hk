@@ -352,12 +352,6 @@ impl ConsoleRegistry {
     }
 }
 
-impl Default for ConsoleRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Global console registry
 ///
 /// Uses IrqSpinlock to be IRQ-safe - console functions can be called from

@@ -24,35 +24,28 @@ use super::{
 };
 use crate::sync::{RwSemReadGuard, RwSemWriteGuard};
 use crate::task::percpu::current_tid;
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 
 /// A hole to punch in a shared object once the mm lock is dropped
 /// (MADV_REMOVE): the object and its page range [from, to)
 type Punch = (Arc<Shmem>, u64, u64);
 
 /// madvise(2): give advice about [start, start + len) (Linux do_madvise)
-pub fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
+pub fn sys_madvise(start: u64, len: u64, advice: i32) -> KernelResult<()> {
     if !valid(advice) {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    let end = match check_range(start, len) {
-        Ok(Some(end)) => end,
-        Ok(None) => return 0,
-        Err(e) => return e.sysret(),
+    let Some(end) = check_range(start, len)? else {
+        return Ok(());
     };
-    let Some(mm) = get_task_mm(current_tid()) else {
-        return KernelError::OutOfMemory.sysret();
-    };
+    let mm = get_task_mm(current_tid()).ok_or(KernelError::OutOfMemory)?;
     let mut punch = Vec::new();
     let map = if needs_write(advice) {
         mm.mmap_write_killable().map(Map::W)
     } else {
         mm.mmap_read_killable().map(Map::R)
     };
-    let mut map = match map {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
+    let mut map = map?;
     let r = walk(&mut map, &mm, start, end, advice, &mut punch);
     #[cfg(feature = "mmcheck")]
     super::check::verify(&mm, map.get(), "madvise");
@@ -62,10 +55,7 @@ pub fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
     for (sh, from, to) in punch {
         sh.punch(from, to);
     }
-    match r {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+    r
 }
 
 /// The mmap_lock as madvise holds it

@@ -38,7 +38,7 @@ fn test_console_fds() {
     let mut ok = true;
     let mut got = 0;
     for fd in 0..3 {
-        let mut st: Stat = unsafe { core::mem::zeroed() };
+        let mut st = Stat::default();
         let r = sys_fstat(fd, &mut st);
         if r != 0 || st.st_mode & S_IFMT != S_IFCHR {
             ok = false;

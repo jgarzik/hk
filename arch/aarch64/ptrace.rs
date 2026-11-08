@@ -5,6 +5,7 @@
 
 use crate::task::Tid;
 use crate::task::percpu::TASKLIST;
+use crate::util::error::{KernelError, KernelResult};
 
 // =============================================================================
 // User register structure (matches Linux struct user_pt_regs)
@@ -45,13 +46,13 @@ pub type UserRegs = UserPtRegs;
 ///
 /// The tracee must be in Traced state. This reads its user registers
 /// from its pt_regs (the entry frame at the top of its kernel stack).
-pub fn get_user_regs(tid: Tid) -> Result<UserPtRegs, i32> {
+pub fn get_user_regs(tid: Tid) -> KernelResult<UserPtRegs> {
     let table = TASKLIST.read();
-    let task = table.get(tid).ok_or(-3i32)?; // ESRCH
+    let task = table.get(tid).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
-        return Err(-3); // ESRCH - not stopped
+        return Err(KernelError::NoProcess); // not stopped
     }
 
     // Its pt_regs: the frame at the top of its kernel stack
@@ -72,13 +73,13 @@ pub fn get_user_regs(tid: Tid) -> Result<UserPtRegs, i32> {
 ///
 /// The tracee must be in Traced state. This updates its pt_regs so the
 /// registers take effect when it resumes.
-pub fn set_user_regs(tid: Tid, regs: &UserPtRegs) -> Result<(), i32> {
+pub fn set_user_regs(tid: Tid, regs: &UserPtRegs) -> KernelResult<()> {
     let table = TASKLIST.read();
-    let task = table.get(tid).ok_or(-3i32)?; // ESRCH
+    let task = table.get(tid).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
-        return Err(-3); // ESRCH - not stopped
+        return Err(KernelError::NoProcess); // not stopped
     }
 
     // Update its pt_regs with the new register values

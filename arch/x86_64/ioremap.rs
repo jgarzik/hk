@@ -231,7 +231,7 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
     // Calculate page-aligned range
     let offset = phys_addr & (PAGE_SIZE - 1);
     let aligned_phys = phys_addr & !(PAGE_SIZE - 1);
-    let aligned_size = (size + offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let aligned_size = (size + offset).next_multiple_of(PAGE_SIZE);
     let num_pages = (aligned_size / PAGE_SIZE) as usize;
 
     // Allocate virtual address range
@@ -268,7 +268,9 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
     // not-present entry) and iounmap flushed any earlier use of the range
 
     // Return virtual address with offset
-    Ok((virt_base + offset) as *mut u8)
+    Ok(core::ptr::with_exposed_provenance_mut(
+        (virt_base + offset) as usize,
+    ))
 }
 
 /// Point the ioremap page at `va` to `pa` instead (TLB self-test):
@@ -308,7 +310,7 @@ pub unsafe fn iounmap(virt_addr: *mut u8, size: u64) {
     // Calculate page-aligned range
     let offset = virt & (PAGE_SIZE - 1);
     let aligned_virt = virt & !(PAGE_SIZE - 1);
-    let aligned_size = (size + offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let aligned_size = (size + offset).next_multiple_of(PAGE_SIZE);
     let num_pages = (aligned_size / PAGE_SIZE) as usize;
 
     // Unmap pages, then flush every CPU before the range can be reused

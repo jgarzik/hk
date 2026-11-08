@@ -49,7 +49,7 @@ fn test_append_mmap() {
 }
 
 fn size_of(fd: i64) -> i64 {
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     if sys_fstat(fd as i32, &mut st) != 0 {
         return -1;
     }

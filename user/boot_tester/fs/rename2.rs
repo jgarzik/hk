@@ -61,7 +61,7 @@ fn rn(old: &[u8], new: &[u8], flags: u32) -> i64 {
 
 /// Inode number at `p`, or the errno
 fn ino(p: &[u8]) -> i64 {
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let r = sys_stat(p.as_ptr(), &mut st);
     if r < 0 { r } else { st.st_ino as i64 }
 }

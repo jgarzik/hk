@@ -117,14 +117,6 @@ impl Csw {
     }
 }
 
-/// CSW status values
-#[expect(dead_code)]
-mod csw_status {
-    pub const PASSED: u8 = 0;
-    pub const FAILED: u8 = 1;
-    pub const PHASE_ERROR: u8 = 2;
-}
-
 /// USB Mass Storage device state, held across each BOT transaction
 /// (Linux us->dev_mutex)
 struct UsbMscState {

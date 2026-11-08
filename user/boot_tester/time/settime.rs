@@ -61,27 +61,23 @@ fn child() -> u64 {
     if sys_settimeofday(&tv, core::ptr::null()) != EPERM {
         return 4;
     }
-    // SAFETY: plain integers
-    let mut tx: Timex = unsafe { core::mem::zeroed() };
+    let mut tx = Timex::default();
     tx.modes = ADJ_MAXERROR;
     tx.maxerror = 1000;
     if sys_adjtimex(&mut tx) != EPERM {
         return 5;
     }
-    // SAFETY: plain integers
-    let mut rd: Timex = unsafe { core::mem::zeroed() };
+    let mut rd = Timex::default();
     if sys_adjtimex(&mut rd) < 0 {
         return 6;
     }
-    // SAFETY: plain integers
-    let mut ss: Timex = unsafe { core::mem::zeroed() };
+    let mut ss = Timex::default();
     ss.modes = ADJ_OFFSET_SS_READ | ADJ_MAXERROR;
     ss.maxerror = rd.maxerror + 12345;
     if sys_adjtimex(&mut ss) < 0 {
         return 7;
     }
-    // SAFETY: plain integers
-    let mut after: Timex = unsafe { core::mem::zeroed() };
+    let mut after = Timex::default();
     sys_adjtimex(&mut after);
     // maxerror grows by itself over time; a jump by the value given is
     // the bypass

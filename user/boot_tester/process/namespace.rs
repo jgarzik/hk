@@ -25,6 +25,7 @@ pub fn run_tests() {
     test_unshare_newnet();
     test_unshare_newpid();
     test_unshare_newuser();
+    in_child(b"PIDNS_ENOSPC", pidns_depth);
     test_unshare_newns();
     test_setns_ebadf();
     test_setns_uts();
@@ -120,8 +121,7 @@ fn pivot_rootfs() -> i32 {
 }
 
 fn exists(path: &[u8]) -> bool {
-    // SAFETY: Stat is plain integers, valid all-zero
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     sys_stat(path.as_ptr(), &mut st) == 0
 }
 
@@ -230,15 +230,13 @@ fn ns_link(path: &[u8], ty: &[u8]) -> u64 {
 /// st_ino of what `path` leads to (0 on error) and whether `path`
 /// itself is a symlink
 fn ns_stat(path: &[u8]) -> (u64, bool) {
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let ino = if sys_stat(path.as_ptr(), &mut st) == 0 {
         st.st_ino
     } else {
         0
     };
-    // SAFETY: Stat is plain integers
-    let mut l: Stat = unsafe { core::mem::zeroed() };
+    let mut l = Stat::default();
     let link =
         hk_syscall::sys_lstat(path.as_ptr(), &mut l) == 0 && l.st_mode & 0o170000 == 0o120000;
     (ino, link)
@@ -348,6 +346,32 @@ fn test_unshare_newpid() {
             fail_num(b"UNSHARE_NEWPID:FAIL exit_status=", exit_status as i64);
         }
     }
+}
+
+/// unshare(CLONE_NEWPID) nested past MAX_PID_NS_LEVEL (32) levels is
+/// ENOSPC (Linux create_pid_namespace). Each level forks into the
+/// namespace it made and passes the deepest one's exit status up.
+fn pidns_depth() -> i32 {
+    const ENOSPC: i64 = -28;
+    for level in 0..40 {
+        match sys_unshare(CLONE_NEWPID) {
+            0 => {}
+            ENOSPC if level == 32 => return 0,
+            _ => return 1 + level,
+        }
+        let pid = sys_fork();
+        if pid < 0 {
+            return 50;
+        }
+        if pid > 0 {
+            let mut ws: i32 = 0;
+            if sys_wait4(pid, &mut ws, 0, 0) != pid || ws & 0x7f != 0 {
+                return 51;
+            }
+            return (ws >> 8) & 0xff;
+        }
+    }
+    52
 }
 
 /// Test: unshare(CLONE_NEWUSER) creates new user namespace

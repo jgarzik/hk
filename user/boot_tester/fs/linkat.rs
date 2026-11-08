@@ -75,7 +75,7 @@ fn link(dirfd: i32, old: &[u8], new: &[u8], flags: i32) -> i64 {
 
 /// (inode, file type) of `p` itself (`lstat`) or what it names
 fn st(p: &[u8], nofollow: bool) -> (i64, u32) {
-    let mut s: Stat = unsafe { core::mem::zeroed() };
+    let mut s = Stat::default();
     let r = if nofollow {
         sys_lstat(p.as_ptr(), &mut s)
     } else {
@@ -230,7 +230,7 @@ fn race_unlink() {
     }
     // Leave at most the names that exist, then compare
     let names = [R, E].iter().filter(|n| st(n, true).0 == ino).count() as u64;
-    let mut s: Stat = unsafe { core::mem::zeroed() };
+    let mut s = Stat::default();
     sys_fstat(fd, &mut s);
     let mut back = [0u8; 512];
     let n = sys_pread64(fd, back.as_mut_ptr(), back.len() as u64, 0);

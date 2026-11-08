@@ -10,8 +10,9 @@ use alloc::vec::Vec;
 
 use crate::arch::Uaccess;
 use crate::fs::iov_iter::{IovDest, IovSource};
-use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user, get_user, put_user};
+use crate::uaccess::{UaccessArch, UserPtr, copy_from_user, copy_to_user, get_user};
 use crate::util::error::KernelError;
+use core::mem::{offset_of, size_of};
 
 /// Most segments in one iovec array (Linux UIO_MAXIOV)
 pub const UIO_MAXIOV: usize = 1024;
@@ -156,48 +157,97 @@ pub const MSG_MORE: i32 = 0x8000;
 pub const MSG_WAITFORONE: i32 = 0x10000;
 pub const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 
-/// Offsets in the 64-bit struct msghdr
-const NAMELEN_OFF: u64 = 8;
-const CONTROLLEN_OFF: u64 = 40;
-const FLAGS_OFF: u64 = 48;
-/// sizeof(struct msghdr)
-pub const MSGHDR_SIZE: u64 = 56;
+/// The user struct msghdr (64-bit layout)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UserMsgHdr {
+    name: u64,
+    namelen: i32,
+    _pad0: u32,
+    iov: u64,
+    iovlen: u64,
+    control: u64,
+    controllen: u64,
+    flags: i32,
+    _pad1: u32,
+}
+crate::pod!(UserMsgHdr {
+    name,
+    namelen,
+    _pad0,
+    iov,
+    iovlen,
+    control,
+    controllen,
+    flags,
+    _pad1
+});
 
-/// A user struct msghdr (64-bit layout)
-#[derive(Clone, Copy, Debug, Default)]
+/// The user struct mmsghdr (sendmmsg/recvmmsg vector element)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MMsgHdr {
+    hdr: UserMsgHdr,
+    len: u32,
+    _pad: u32,
+}
+crate::pod!(MMsgHdr { hdr, len, _pad });
+const _: () = assert!(size_of::<UserMsgHdr>() == 56 && size_of::<MMsgHdr>() == 64);
+
+impl MMsgHdr {
+    /// Element `i` of the vector at `vec` (an address that wraps faults)
+    pub fn at(vec: UserPtr<Self>, i: usize) -> UserPtr<Self> {
+        UserPtr::new(vec.addr().wrapping_add((i * size_of::<Self>()) as u64))
+    }
+
+    /// Its msg_hdr
+    pub fn hdr(p: UserPtr<Self>) -> UserPtr<UserMsgHdr> {
+        p.cast()
+    }
+
+    /// Store msg_len
+    pub fn set_len(p: UserPtr<Self>, n: u32) -> Result<(), KernelError> {
+        field::<u32>(p.addr(), offset_of!(Self, len)).write(&n)?;
+        Ok(())
+    }
+}
+
+/// The field at `off` of the user struct at `base`
+fn field<T>(base: u64, off: usize) -> UserPtr<T> {
+    UserPtr::new(base.wrapping_add(off as u64))
+}
+
+/// A user struct msghdr, copied in
+#[derive(Clone, Copy, Debug)]
 pub struct MsgHdr {
-    pub name: u64,
+    pub name: UserPtr<u8>,
     pub namelen: u32,
     pub iov: u64,
     pub iovlen: usize,
-    pub control: u64,
+    pub control: UserPtr<u8>,
     pub controllen: usize,
 }
 
 impl MsgHdr {
     /// Copy in (Linux __copy_msghdr: msg_namelen clamped to
     /// sockaddr_storage, negative is EINVAL, no name means length 0)
-    pub fn read(addr: u64) -> Result<Self, KernelError> {
-        let mut b = [0u8; MSGHDR_SIZE as usize];
-        copy_from_user::<Uaccess>(&mut b, addr, MSGHDR_SIZE as usize)
-            .map_err(|_| KernelError::BadAddress)?;
-        let q = |o: usize| u64::from_ne_bytes(b[o..o + 8].try_into().unwrap());
-        let namelen = i32::from_ne_bytes(b[8..12].try_into().unwrap());
-        if namelen < 0 {
+    pub fn read(p: UserPtr<UserMsgHdr>) -> Result<Self, KernelError> {
+        let u = p.read()?;
+        if u.namelen < 0 {
             return Err(KernelError::InvalidArgument);
         }
-        let name = q(0);
+        let name = UserPtr::new(u.name);
         Ok(Self {
             name,
-            namelen: if name == 0 {
+            namelen: if name.is_null() {
                 0
             } else {
-                (namelen as u32).min(SOCKADDR_MAX as u32)
+                (u.namelen as u32).min(SOCKADDR_MAX as u32)
             },
-            iov: q(16),
-            iovlen: q(24) as usize,
-            control: q(32),
-            controllen: q(40) as usize,
+            iov: u.iov,
+            iovlen: u.iovlen as usize,
+            control: UserPtr::new(u.control),
+            controllen: u.controllen as usize,
         })
     }
 
@@ -220,51 +270,52 @@ impl MsgHdr {
             return Err(KernelError::NoBufferSpace);
         }
         let mut v = alloc::vec![0u8; self.controllen];
-        copy_from_user::<Uaccess>(&mut v, self.control, self.controllen)
-            .map_err(|_| KernelError::BadAddress)?;
+        copy_from_user::<Uaccess>(&mut v, self.control.addr(), self.controllen)?;
         Ok(v)
     }
 }
 
-/// Write back recvmsg results into the user msghdr at `addr`
+/// Write back recvmsg results into the user msghdr at `p`
 pub fn msghdr_out(
-    addr: u64,
+    p: UserPtr<UserMsgHdr>,
     namelen: u32,
     controllen: usize,
     flags: i32,
 ) -> Result<(), KernelError> {
-    let e = |_| KernelError::BadAddress;
-    put_user::<Uaccess, u32>(addr + NAMELEN_OFF, namelen).map_err(e)?;
-    put_user::<Uaccess, u64>(addr + CONTROLLEN_OFF, controllen as u64).map_err(e)?;
-    put_user::<Uaccess, i32>(addr + FLAGS_OFF, flags).map_err(e)
+    let a = p.addr();
+    field::<u32>(a, offset_of!(UserMsgHdr, namelen)).write(&namelen)?;
+    field::<u64>(a, offset_of!(UserMsgHdr, controllen)).write(&(controllen as u64))?;
+    field::<i32>(a, offset_of!(UserMsgHdr, flags)).write(&flags)?;
+    Ok(())
 }
 
 /// Copy in a socket address (Linux move_addr_to_kernel): `None` for no
 /// address; EINVAL if longer than sockaddr_storage
-pub fn addr_in(addr: u64, len: u64) -> Result<Option<Vec<u8>>, KernelError> {
-    if addr == 0 || len == 0 {
+pub fn addr_in(addr: UserPtr<u8>, len: u64) -> Result<Option<Vec<u8>>, KernelError> {
+    if addr.is_null() || len == 0 {
         return Ok(None);
     }
     if len > SOCKADDR_MAX as u64 {
         return Err(KernelError::InvalidArgument);
     }
     let mut v = alloc::vec![0u8; len as usize];
-    copy_from_user::<Uaccess>(&mut v, addr, len as usize).map_err(|_| KernelError::BadAddress)?;
+    copy_from_user::<Uaccess>(&mut v, addr.addr(), len as usize)?;
     Ok(Some(v))
 }
 
 /// Copy out a socket address (Linux move_addr_to_user): reads *lenp,
 /// copies min(*lenp, real) bytes and stores the real length
-pub fn addr_out(addr: u64, lenp: u64, a: &[u8]) -> Result<(), KernelError> {
-    let ulen = get_user::<Uaccess, i32>(lenp).map_err(|_| KernelError::BadAddress)?;
+pub fn addr_out(addr: UserPtr<u8>, lenp: UserPtr<u32>, a: &[u8]) -> Result<(), KernelError> {
+    let ulen = lenp.read()? as i32;
     if ulen < 0 {
         return Err(KernelError::InvalidArgument);
     }
     let n = (ulen as usize).min(a.len());
     if n > 0 {
-        copy_to_user::<Uaccess>(addr, &a[..n]).map_err(|_| KernelError::BadAddress)?;
+        copy_to_user::<Uaccess>(addr.addr(), &a[..n])?;
     }
-    put_user::<Uaccess, u32>(lenp, a.len() as u32).map_err(|_| KernelError::BadAddress)
+    lenp.write(&(a.len() as u32))?;
+    Ok(())
 }
 
 /// Data source of a send: a user vector (the send calls) or the

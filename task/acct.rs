@@ -29,6 +29,8 @@ use crate::ns::PidNamespace;
 use crate::sync::spin::Mutex;
 use crate::task::CAP_SYS_PACCT;
 use crate::task::Tid;
+use crate::uaccess::UserPtr;
+use crate::util::error::KernelResult;
 use crate::util::pod::IntoBytes;
 
 // =============================================================================
@@ -241,65 +243,49 @@ pub fn exit_ns(ns: &PidNamespace) {
 /// If filename is non-null: enable accounting, writing records to that file.
 /// If filename is null: disable accounting.
 ///
-/// Returns 0 on success, negative errno on error.
-pub fn sys_acct(filename_ptr: u64) -> i64 {
+pub fn sys_acct(filename: UserPtr<u8>) -> KernelResult<()> {
     // Check CAP_SYS_PACCT capability
     if !crate::task::capable(CAP_SYS_PACCT) {
-        return -1; // EPERM
+        return Err(KernelError::NotPermitted);
     }
 
-    // If filename_ptr == 0, disable accounting
-    if filename_ptr == 0 {
+    // A NULL filename disables accounting
+    if filename.is_null() {
         set_acct_file(None);
-        return 0;
+        return Ok(());
     }
 
-    // Copy filename from user
-    let filename = match crate::fs::namei::getname(filename_ptr, false) {
-        Ok(f) => f,
-        Err(e) => return e.sysret(),
-    };
-
-    // Open the file for appending
-    let file = match open_acct_file(&filename) {
-        Ok(f) => f,
-        Err(e) => return e,
-    };
-
-    set_acct_file(Some(file));
-
-    0
+    // Copy filename from user, open the file for appending
+    let filename = crate::fs::namei::getname(filename, false)?;
+    set_acct_file(Some(open_acct_file(&filename)?));
+    Ok(())
 }
 
 /// Open the accounting file
-fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
+fn open_acct_file(path: &[u8]) -> KernelResult<Arc<File>> {
     use crate::fs::file::flags;
     use crate::fs::{LookupFlags, dac};
 
-    // Lookup the file
-    let (mnt, dentry) = match crate::fs::namei::path_lookupat(
+    // Any lookup error as is (Linux filp_open)
+    let (mnt, dentry) = crate::fs::namei::path_lookupat(
         crate::task::percpu::current_cwd(),
         path,
         LookupFlags::open(),
-    ) {
-        Ok(p) => p.into_parts(),
-        // Any lookup error as is (Linux filp_open)
-        Err(e) => return Err(e.sysret()),
-    };
+    )?
+    .into_parts();
 
     // file_open_name(O_WRONLY | O_APPEND): may_open, then a regular file
     if let Some(inode) = dentry.get_inode() {
         let wflags = flags::O_WRONLY | flags::O_APPEND;
-        dac::may_open(&dac::cred(), &inode, dac::acc_mode(wflags), wflags)
-            .map_err(|e| e.sysret())?;
+        dac::may_open(&dac::cred(), &inode, dac::acc_mode(wflags), wflags)?;
         if !inode.mode().is_file() {
-            return Err(-13); // EACCES - not a regular file
+            return Err(KernelError::PermissionDenied); // not a regular file
         }
     }
 
     // Open for writing: hold write access (EROFS on a read-only fs)
     let w = match dentry.get_inode() {
-        Some(_) => Some(mnt.want_write().map_err(|e| e.sysret())?),
+        Some(_) => Some(mnt.want_write()?),
         None => None,
     };
     // The filesystem's file operations, as an open(2) of it gets
@@ -310,7 +296,7 @@ fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
         .unwrap_or(&crate::fs::ramfs::RAMFS_FILE_OPS);
     let mut file = File::new(dentry, Some(mnt), flags::O_WRONLY | flags::O_APPEND, f_op);
     file.write_access = w;
-    try_arc(file).map_err(|e| e.sysret())
+    try_arc(file)
 }
 
 // =============================================================================

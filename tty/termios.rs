@@ -78,12 +78,6 @@ impl Termios {
     }
 }
 
-impl Default for Termios {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Extended termios structure with explicit baud rates (Linux termios2)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

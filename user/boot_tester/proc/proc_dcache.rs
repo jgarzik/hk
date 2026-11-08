@@ -29,8 +29,7 @@ pub fn run_tests() {
 }
 
 fn stat(p: &[u8]) -> Result<Stat, i64> {
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     match sys_stat(p.as_ptr(), &mut st) {
         0 => Ok(st),
         e => Err(e),

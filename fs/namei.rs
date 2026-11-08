@@ -20,6 +20,7 @@ use super::path_ref::Path;
 use crate::fs::syscall::PATH_MAX;
 use crate::ns::current_mnt_ns;
 use crate::task::Cred;
+use crate::uaccess::UserPtr;
 
 /// Maximum number of symlinks to follow (prevent infinite loops)
 const MAX_SYMLINK_DEPTH: usize = 40;
@@ -45,10 +46,7 @@ impl LookupFlags {
     pub fn open() -> Self {
         Self {
             follow: true,
-            directory: false,
-            create: false,
-            no_xdev: false,
-            linkat_empty: false,
+            ..Default::default()
         }
     }
 
@@ -57,9 +55,7 @@ impl LookupFlags {
         Self {
             follow: true,
             directory: true,
-            create: false,
-            no_xdev: false,
-            linkat_empty: false,
+            ..Default::default()
         }
     }
 
@@ -410,12 +406,13 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
 /// Copy a path name in (Linux getname_flags): EFAULT for a bad pointer,
 /// ENAMETOOLONG without a NUL in PATH_MAX bytes, ENOENT for an empty name
 /// unless `empty_ok` (AT_EMPTY_PATH)
-pub fn getname(ptr: u64, empty_ok: bool) -> Result<Vec<u8>, KernelError> {
+pub fn getname(ptr: UserPtr<u8>, empty_ok: bool) -> Result<Vec<u8>, KernelError> {
     use crate::uaccess::{UaccessError, strndup_user_bytes};
-    let name = strndup_user_bytes::<crate::arch::Uaccess>(ptr, PATH_MAX).map_err(|e| match e {
-        UaccessError::TooLong => KernelError::NameTooLong,
-        _ => KernelError::BadAddress,
-    })?;
+    let name =
+        strndup_user_bytes::<crate::arch::Uaccess>(ptr.addr(), PATH_MAX).map_err(|e| match e {
+            UaccessError::TooLong => KernelError::NameTooLong,
+            _ => KernelError::BadAddress,
+        })?;
     if name.is_empty() && !empty_ok {
         return Err(KernelError::NotFound);
     }
@@ -424,9 +421,9 @@ pub fn getname(ptr: u64, empty_ok: bool) -> Result<Vec<u8>, KernelError> {
 
 /// getname for the calls where AT_EMPTY_PATH also takes a NULL name
 /// (Linux getname_maybe_null: statx, fstatat)
-pub fn getname_maybe_null(ptr: u64, at: i32) -> Result<Vec<u8>, KernelError> {
+pub fn getname_maybe_null(ptr: UserPtr<u8>, at: i32) -> Result<Vec<u8>, KernelError> {
     let empty_ok = at & AT_EMPTY_PATH != 0;
-    if ptr == 0 && empty_ok {
+    if ptr.is_null() && empty_ok {
         return Ok(Vec::new());
     }
     getname(ptr, empty_ok)
@@ -488,7 +485,7 @@ pub fn filename_lookup(dirfd: i32, path: &[u8], flags: LookupFlags) -> Result<Pa
 /// Copy in and resolve a path argument (Linux user_path_at)
 pub fn user_path_at(
     dirfd: i32,
-    ptr: u64,
+    ptr: UserPtr<u8>,
     flags: LookupFlags,
     empty_ok: bool,
 ) -> Result<Path, KernelError> {

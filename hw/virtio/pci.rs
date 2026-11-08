@@ -547,11 +547,8 @@ pub static VIRTIO_PCI_DRIVER: crate::base::Driver = crate::base::Driver::new(
 
 fn virtio_id(pci: &PciDevice) -> Option<u32> {
     let h = &pci.header;
-    if h.vendor_id == VENDOR_VIRTIO && (MODERN_BASE..=MODERN_LAST).contains(&h.device_id) {
-        Some(u32::from(h.device_id - MODERN_BASE))
-    } else {
-        None
-    }
+    (h.vendor_id == VENDOR_VIRTIO && (MODERN_BASE..=MODERN_LAST).contains(&h.device_id))
+        .then(|| u32::from(h.device_id - MODERN_BASE))
 }
 
 /// Map, reset and acknowledge (spec 3.1.1 steps 1-2; Linux

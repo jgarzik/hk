@@ -403,12 +403,9 @@ fn kmain() -> ! {
     // Its program is loaded into the address space made here once the
     // initramfs is unpacked (Linux kernel_init, then run_init_process).
     // ========================================================================
-    let mut user_pt = match ArchPageTable::new_user(&mut frame_alloc) {
-        Some(pt) => pt,
-        None => {
-            printkln!("ERR: page table alloc");
-            CurrentArch::halt_loop();
-        }
+    let Some(mut user_pt) = ArchPageTable::new_user(&mut frame_alloc) else {
+        printkln!("ERR: page table alloc");
+        CurrentArch::halt_loop();
     };
     user_pt.copy_kernel_mappings();
     // Its stack comes with the program exec loads into it (run_init)
@@ -552,7 +549,7 @@ fn run_init() -> ! {
     }
     for path in ["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"] {
         let e = try_init(path, &args);
-        if e != -2 {
+        if e != util::error::KernelError::NotFound.to_errno_neg() {
             printkln!(
                 "Starting init: {} exists but couldn't execute it (error {})",
                 path,
@@ -581,7 +578,10 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
         return -e.errno();
     }
     let mut frame_alloc = mm::frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
-    task::exec::do_execve(path.as_bytes().to_vec(), argv, envp, &mut frame_alloc)
+    match task::exec::do_execve(path.as_bytes().to_vec(), argv, envp, &mut frame_alloc) {
+        Ok(never) => match never {},
+        Err(e) => e.to_errno_neg(),
+    }
 }
 
 /// Default RAM disk size in MB
@@ -643,9 +643,8 @@ pub fn init_vfat_ramdisk(
     use fs::ramfs_create_dir;
 
     // Look for vfat module loaded by bootloader
-    let vfat_data = match arch::x86_64::multiboot2::find_module("vfat") {
-        Some(data) => data,
-        None => return,
+    let Some(vfat_data) = arch::x86_64::multiboot2::find_module("vfat") else {
+        return;
     };
 
     // Ramdisk rd1 from the vfat image data (node in devtmpfs)

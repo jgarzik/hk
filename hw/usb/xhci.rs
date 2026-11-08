@@ -431,11 +431,11 @@ mod trb_type {
 ///
 /// Tracks the Device Context, Input Context, and Transfer Rings for each endpoint.
 struct DeviceState {
-    /// Slot ID assigned by xHCI
-    #[expect(dead_code)]
-    slot_id: u8,
     /// Output Device Context (xHCI writes device state here)
-    #[expect(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "owns the DMA buffer the DCBAA entry points the controller at"
+    )]
     output_ctx: OutputDeviceContext,
     /// Input Context (for Address Device and Configure Endpoint)
     input_ctx: InputContext,
@@ -608,7 +608,7 @@ impl EventRing {
         // flags, rmb, fields): read in one go, the parameter could predate
         // the controller's write of the control word that made it valid,
         // and a completion would not match its TRB
-        let control = unsafe { read_volatile(core::ptr::addr_of!((*trb_ptr).control)) };
+        let control = unsafe { read_volatile(&raw const (*trb_ptr).control) };
         if (control & 1 != 0) != self.cycle {
             return None;
         }
@@ -1264,7 +1264,6 @@ impl XhciController {
         transfer_rings.insert(1, ep0_ring); // DCI 1 = EP0
 
         let state = DeviceState {
-            slot_id,
             output_ctx,
             input_ctx,
             transfer_rings,
@@ -1944,9 +1943,9 @@ impl XhciController {
     /// Issues STOP_ENDPOINT commands for each configured endpoint.
     /// This ensures no pending transfers complete after device removal.
     fn stop_device_endpoints(&mut self, slot_id: u8) -> Result<(), UsbError> {
-        let state = match self.device_states.get(&slot_id) {
-            Some(s) => s,
-            None => return Ok(()), // No state = nothing to stop
+        let Some(state) = self.device_states.get(&slot_id) else {
+            // No state = nothing to stop
+            return Ok(());
         };
 
         // Get list of configured endpoint DCIs
@@ -1956,9 +1955,8 @@ impl XhciController {
             printkln!("xHCI: Stopping endpoint DCI {} for slot {}", dci, slot_id);
 
             // Issue STOP_ENDPOINT command
-            let cmd_ring = match self.cmd_ring.as_mut() {
-                Some(r) => r,
-                None => return Err(UsbError::NoResources),
+            let Some(cmd_ring) = self.cmd_ring.as_mut() else {
+                return Err(UsbError::NoResources);
             };
 
             let mut trb = Trb::new();
@@ -1982,9 +1980,8 @@ impl XhciController {
     fn disable_slot(&mut self, slot_id: u8) -> Result<(), UsbError> {
         printkln!("xHCI: Disabling slot {}", slot_id);
 
-        let cmd_ring = match self.cmd_ring.as_mut() {
-            Some(r) => r,
-            None => return Err(UsbError::NoResources),
+        let Some(cmd_ring) = self.cmd_ring.as_mut() else {
+            return Err(UsbError::NoResources);
         };
 
         let mut trb = Trb::new();

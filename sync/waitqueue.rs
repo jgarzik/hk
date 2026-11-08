@@ -152,12 +152,6 @@ impl WaitEntry {
     }
 }
 
-impl Default for WaitEntry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for WaitEntry {
     fn drop(&mut self) {
         let wq = self.wq.load(Ordering::Acquire);
@@ -586,12 +580,6 @@ fn interrupted(state: SleepState) -> bool {
         SleepState::Interruptible => signal_pending(),
         SleepState::Killable => crate::signal::fatal_signal_pending(),
         _ => false,
-    }
-}
-
-impl Default for WaitQueue {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

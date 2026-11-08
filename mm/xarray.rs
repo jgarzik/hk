@@ -517,12 +517,6 @@ impl XArray {
     }
 }
 
-impl Default for XArray {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for XArray {
     fn drop(&mut self) {
         debug_assert!(self.height == 0, "xarray dropped with nodes");

@@ -127,7 +127,7 @@ fn mkdirm(path: &[u8], mode: u32, uid: u32) {
 }
 
 fn mode_of(path: &[u8]) -> i64 {
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     if sys_stat(path.as_ptr(), &mut st) != 0 {
         return -1;
     }
@@ -135,7 +135,7 @@ fn mode_of(path: &[u8]) -> i64 {
 }
 
 fn owner_of(path: &[u8]) -> (i64, i64) {
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     if sys_stat(path.as_ptr(), &mut st) != 0 {
         return (-1, -1);
     }
@@ -244,7 +244,7 @@ fn t_open(n: &[u8]) -> u64 {
 
 /// Path walk needs search (x) on every directory
 fn t_search(n: &[u8]) -> u64 {
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let mut f = 0;
     f += chk(
         n,
@@ -649,7 +649,7 @@ fn creat_race() {
             if fd < 0 {
                 continue;
             }
-            let mut st: Stat = unsafe { core::mem::zeroed() };
+            let mut st = Stat::default();
             sys_fstat(fd as i32, &mut st);
             sys_close(fd as u64);
             if st.st_uid != USER {

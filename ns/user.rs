@@ -25,6 +25,7 @@
 //! - `UserNamespace.gid_map.extents`: RwLock
 
 use crate::sync::spin::RwLock;
+use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -52,24 +53,18 @@ pub struct UidGidExtent {
 ///
 /// Contains a set of extents that define the mapping between
 /// IDs in this namespace and IDs in the parent namespace.
+#[derive(Default)]
 pub struct UidGidMap {
     /// Mapping extents (Linux allows up to 340)
     extents: RwLock<Vec<UidGidExtent>>,
 }
 
 impl UidGidMap {
-    /// Create a new empty UID/GID map
-    pub fn new() -> Self {
-        Self {
-            extents: RwLock::new(Vec::new()),
-        }
-    }
-
     /// Create an identity map (for init namespace)
     ///
     /// Maps all IDs to themselves (0→0, 1→1, etc.)
     pub fn new_identity() -> Self {
-        let map = Self::new();
+        let map = Self::default();
         // Set identity mapping covering all possible IDs
         let _ = map.set_mapping(alloc::vec![UidGidExtent {
             first: 0,
@@ -113,10 +108,10 @@ impl UidGidMap {
     /// # Returns
     /// * `Ok(())` - Mapping set successfully
     /// * `Err(errno)` - If mapping already set or invalid
-    pub fn set_mapping(&self, new_extents: Vec<UidGidExtent>) -> Result<(), i32> {
+    pub fn set_mapping(&self, new_extents: Vec<UidGidExtent>) -> Result<(), KernelError> {
         let mut extents = self.extents.write();
         if !extents.is_empty() {
-            return Err(1); // EPERM - already set
+            return Err(KernelError::NotPermitted); // already set
         }
         *extents = new_extents;
         Ok(())
@@ -125,12 +120,6 @@ impl UidGidMap {
     /// Check if the map has any extents defined
     pub fn is_set(&self) -> bool {
         !self.extents.read().is_empty()
-    }
-}
-
-impl Default for UidGidMap {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -185,27 +174,26 @@ impl UserNamespace {
     ///
     /// # Returns
     /// * `Ok(Arc<UserNamespace>)` - New child namespace
-    /// * `Err(errno)` - If max nesting level exceeded
-    pub fn clone_ns(parent: &Arc<UserNamespace>) -> Result<Arc<Self>, i32> {
-        // Check nesting level
+    /// * `Err(ENOSPC)` - If max nesting level exceeded (Linux
+    ///   create_user_ns)
+    pub fn clone_ns(parent: &Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
         if parent.level >= MAX_USER_NS_LEVEL {
-            return Err(11); // EAGAIN - max nesting exceeded
+            return Err(KernelError::NoSpace);
         }
 
         // Get creator's credentials
         let cred = percpu::current_cred();
-        let inum = super::inum::Inum::alloc().map_err(|e| e.errno())?;
+        let inum = super::inum::Inum::alloc()?;
 
         try_arc(Self {
-            uid_map: UidGidMap::new(),
-            gid_map: UidGidMap::new(),
+            uid_map: UidGidMap::default(),
+            gid_map: UidGidMap::default(),
             level: parent.level + 1,
             parent: Some(parent.clone()),
             owner: cred.uid,
             group: cred.gid,
             inum,
         })
-        .map_err(|e| e.errno())
     }
 
     /// Check if this namespace is an ancestor of another

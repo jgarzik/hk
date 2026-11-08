@@ -55,12 +55,6 @@ impl SeqLock {
     }
 }
 
-impl Default for SeqLock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for SeqWriteGuard<'_> {
     /// Linux write_sequnlock: the writer's stores before the counter
     /// goes even (smp_wmb, then the increment), then the lock

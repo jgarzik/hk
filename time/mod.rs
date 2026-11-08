@@ -196,12 +196,6 @@ pub struct TimeKeeper {
     read_cycles_fn: spin::Once<fn() -> u64>,
 }
 
-impl Default for TimeKeeper {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TimeKeeper {
     /// Create a new uninitialized timekeeper
     pub const fn new() -> Self {

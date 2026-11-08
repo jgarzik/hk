@@ -97,6 +97,7 @@ struct Added {
 pub type DevData = Arc<dyn Any + Send + Sync>;
 
 /// What `device_create` registers
+#[derive(Default)]
 pub struct DeviceInfo<'a> {
     pub name: String,
     pub parent: Option<&'a Arc<Device>>,
@@ -126,15 +127,7 @@ impl DeviceInfo<'_> {
     pub fn named(name: &str) -> Self {
         Self {
             name: name.into(),
-            parent: None,
-            bus: None,
-            class: None,
-            devt: None,
-            devtype: None,
-            data: None,
-            attrs: None,
-            ns: 0,
-            dir: None,
+            ..Default::default()
         }
     }
 }

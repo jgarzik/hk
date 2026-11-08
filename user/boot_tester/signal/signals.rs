@@ -367,16 +367,8 @@ fn test_clone_clear_sighand() {
     // 2) clone3(): CLONE_CLEAR_SIGHAND resets handlers to SIG_DFL in child
     let args = CloneArgs {
         flags: CLONE_CLEAR_SIGHAND,
-        pidfd: 0,
-        child_tid: 0,
-        parent_tid: 0,
         exit_signal: SIGCHLD as u64,
-        stack: 0,
-        stack_size: 0,
-        tls: 0,
-        set_tid: 0,
-        set_tid_size: 0,
-        cgroup: 0,
+        ..CloneArgs::default()
     };
     let ret = sys_clone3(&args, CLONE_ARGS_SIZE_VER0);
     if ret == 0 {

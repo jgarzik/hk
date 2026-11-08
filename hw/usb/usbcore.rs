@@ -277,12 +277,8 @@ fn root_hub() -> UsbDevice {
         max_power: 0,
     };
     d.interfaces.push(UsbInterface {
-        number: 0,
-        alternate_setting: 0,
         num_endpoints: 1,
         class: class::HUB,
-        subclass: 0,
-        protocol: 0,
         endpoints: alloc::vec![UsbEndpoint {
             address: 0x81,
             ep_type: EndpointType::Interrupt,
@@ -292,6 +288,7 @@ fn root_hub() -> UsbDevice {
             max_burst: 0,
             bytes_per_interval: 0,
         }],
+        ..Default::default()
     });
     d
 }
@@ -431,11 +428,7 @@ mod tests {
         UsbInterface {
             number,
             alternate_setting,
-            num_endpoints: 0,
-            class: 0,
-            subclass: 0,
-            protocol: 0,
-            endpoints: Vec::new(),
+            ..Default::default()
         }
     }
 

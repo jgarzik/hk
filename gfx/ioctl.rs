@@ -14,27 +14,7 @@ use core::mem::size_of;
 /// DRM ioctl base (from Linux)
 const GFX_IOCTL_BASE: u8 = b'd';
 
-/// Build a DRM ioctl number
-#[expect(dead_code)]
-const fn gfx_io(nr: u8) -> u32 {
-    // _IO('d', nr)
-    ((GFX_IOCTL_BASE as u32) << 8) | (nr as u32)
-}
-
-#[expect(dead_code)]
-const fn gfx_ior<T>(nr: u8) -> u32 {
-    // _IOR('d', nr, type) - direction bit 2 (read from kernel)
-    let size = size_of::<T>() as u32;
-    (2 << 30) | ((GFX_IOCTL_BASE as u32) << 8) | (nr as u32) | (size << 16)
-}
-
-#[expect(dead_code)]
-const fn gfx_iow<T>(nr: u8) -> u32 {
-    // _IOW('d', nr, type) - direction bit 1 (write to kernel)
-    let size = size_of::<T>() as u32;
-    (1 << 30) | ((GFX_IOCTL_BASE as u32) << 8) | (nr as u32) | (size << 16)
-}
-
+/// Build a DRM _IOWR ioctl number
 const fn gfx_iowr<T>(nr: u8) -> u32 {
     // _IOWR('d', nr, type) - direction bits 3 (read/write)
     let size = size_of::<T>() as u32;
@@ -598,11 +578,7 @@ fn handle_setcrtc(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     }
 
     // Convert mode if valid
-    let mode = if crtc_cmd.mode_valid != 0 {
-        Some(modeinfo_to_drmmode(&crtc_cmd.mode))
-    } else {
-        None
-    };
+    let mode = (crtc_cmd.mode_valid != 0).then(|| modeinfo_to_drmmode(&crtc_cmd.mode));
 
     driver
         .set_crtc(

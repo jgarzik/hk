@@ -50,7 +50,7 @@ const OVERFLOW_ID: u32 = 65534;
 
 /// Credentials carried by a message (Linux UNIXCB pid/uid/gid): the
 /// sender's struct pid, numbered only for a receiver (none: pid 0)
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Creds {
     pub pid: Option<Arc<crate::task::pid::Pid>>,
     pub uid: u32,
@@ -364,7 +364,7 @@ fn put_fds(m: &mut RecvMsg<'_>, fpl: FpList) {
     // reference under the table lock
     for f in files.iter().take(max) {
         match crate::net::syscall::fd_install(f.clone(), cloexec) {
-            Ok(fd) => fds.extend_from_slice(&(fd as i32).to_ne_bytes()),
+            Ok(fd) => fds.extend_from_slice(&fd.to_ne_bytes()),
             Err(_) => break,
         }
     }

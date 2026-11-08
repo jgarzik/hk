@@ -22,9 +22,6 @@ use crate::util::error::KernelError;
 // Map Type Constants (Linux ABI)
 // =============================================================================
 
-/// Unspecified map type
-#[expect(dead_code)]
-pub const BPF_MAP_TYPE_UNSPEC: u32 = 0;
 /// Hash table map
 pub const BPF_MAP_TYPE_HASH: u32 = 1;
 /// Array map (indexed by u32)
@@ -35,15 +32,12 @@ pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 // =============================================================================
 
 /// Create new element or update existing
-#[allow(dead_code, reason = "UAPI flag value; BPF_ANY is the zero default")]
+#[cfg(test)]
 pub const BPF_ANY: u64 = 0;
 /// Create new element only if it doesn't exist
 pub const BPF_NOEXIST: u64 = 1;
 /// Update existing element only
 pub const BPF_EXIST: u64 = 2;
-/// Update with spin_lock held
-#[expect(dead_code)]
-pub const BPF_F_LOCK: u64 = 4;
 
 // =============================================================================
 // Map Limits
@@ -332,11 +326,7 @@ impl BpfArrayMap {
             return None;
         }
         let index = u32::from_ne_bytes([key[0], key[1], key[2], key[3]]);
-        if index < self.max_entries {
-            Some(index)
-        } else {
-            None
-        }
+        (index < self.max_entries).then_some(index)
     }
 }
 
@@ -380,11 +370,7 @@ impl BpfMapOps for BpfArrayMap {
             }
         };
 
-        if next_index < self.max_entries {
-            Some(next_index.to_ne_bytes().to_vec())
-        } else {
-            None
-        }
+        (next_index < self.max_entries).then(|| next_index.to_ne_bytes().to_vec())
     }
 
     fn map_type(&self) -> u32 {

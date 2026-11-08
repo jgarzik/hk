@@ -239,12 +239,6 @@ impl PipeInner {
         }
     }
 
-    /// Number of free buffer slots
-    #[expect(dead_code)]
-    fn free_slots(&self) -> usize {
-        PIPE_BUFFERS - self.buffer_count()
-    }
-
     /// Bytes available for reading
     pub fn bytes_available(&self) -> usize {
         self.total_len

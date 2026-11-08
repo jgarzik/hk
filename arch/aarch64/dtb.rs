@@ -86,9 +86,8 @@ fn extract_gic_base(dt: &DeviceTree<'_>) -> Option<u64> {
 fn extract_cpus(dt: &DeviceTree<'_>) -> Vec<CpuInfo> {
     let mut cpus = Vec::new();
 
-    let cpus_node = match dt.find_node("/cpus") {
-        Some(node) => node,
-        None => return cpus,
+    let Some(cpus_node) = dt.find_node("/cpus") else {
+        return cpus;
     };
 
     for cpu_child in cpus_node.children() {
@@ -360,9 +359,8 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
         return Ok(false);
     };
 
-    let dt = match DeviceTree::from_fdt(dtb_data) {
-        Ok(dt) => dt,
-        Err(_) => return Ok(false),
+    let Ok(dt) = DeviceTree::from_fdt(dtb_data) else {
+        return Ok(false);
     };
 
     let mut found_numa = false;
@@ -370,9 +368,8 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
 
     // Extract memory nodes with numa-node-id
     // Memory nodes can be /memory or /memory@ADDR
-    let root = match dt.find_node("/") {
-        Some(root) => root,
-        None => return Ok(false),
+    let Some(root) = dt.find_node("/") else {
+        return Ok(false);
     };
 
     for child in root.children() {

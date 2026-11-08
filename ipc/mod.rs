@@ -31,7 +31,7 @@ pub mod sem;
 pub mod shm;
 mod util;
 
-use crate::util::error::KernelError;
+use crate::util::error::KernelResult;
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64};
@@ -147,8 +147,8 @@ impl IpcNamespace {
     ///
     /// Creates a new empty namespace with same limits.
     /// IPC objects are NOT copied - new namespace starts empty.
-    pub fn clone_ns(&self) -> Result<Arc<Self>, i32> {
-        let inum = crate::ns::inum::Inum::alloc().map_err(KernelError::errno)?;
+    pub fn clone_ns(&self) -> KernelResult<Arc<Self>> {
+        let inum = crate::ns::inum::Inum::alloc()?;
         try_arc(Self {
             sem_ids: IpcIds::new(),
             msg_ids: IpcIds::new(),
@@ -166,7 +166,6 @@ impl IpcNamespace {
             shm_ctlmni: self.shm_ctlmni,
             inum,
         })
-        .map_err(KernelError::errno)
     }
 
     /// Get semaphore IDs table

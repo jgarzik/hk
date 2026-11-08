@@ -1,5 +1,30 @@
 //! Common types used by syscalls (architecture-independent)
 
+/// The all-zero value is valid (kernel util/pod.rs `FromBytes::zeroed`)
+///
+/// For ABI structs that cannot derive `Default` (arrays past 32, unions)
+/// or whose every byte, padding included, must be zero.
+///
+/// # Safety
+/// All-zero bytes are a valid value of the type.
+pub unsafe trait Zeroable: Sized {
+    /// The all-zero value
+    fn zeroed() -> Self {
+        // SAFETY: all-zero bytes are a valid Self (trait contract)
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+macro_rules! zeroable {
+    ($($t:ty),* $(,)?) => {
+        // SAFETY: repr(C) structs and unions of integers, raw pointers and
+        // arrays of them, all valid when zero
+        $(unsafe impl Zeroable for $t {})*
+    };
+}
+
+zeroable!(SigInfo, UtsName, SigEvent, Timex, IoUringParams);
+
 // ============================================================================
 // Time structures
 // ============================================================================
@@ -790,7 +815,7 @@ pub const MSG_COPY: i32 = 0o40000;
 
 /// Linux statfs structure (64-bit)
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct LinuxStatFs {
     /// Filesystem type magic
     pub f_type: i64,
@@ -838,7 +863,7 @@ pub struct StatxTimestamp {
 
 /// Linux statx structure (256 bytes)
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Statx {
     /// What results were written
     pub stx_mask: u32,
@@ -1696,7 +1721,7 @@ pub struct Timex {
 
 impl Default for Timex {
     fn default() -> Self {
-        unsafe { core::mem::zeroed() }
+        Self::zeroed()
     }
 }
 
@@ -1867,7 +1892,7 @@ pub struct IoUringParams {
 
 impl Default for IoUringParams {
     fn default() -> Self {
-        unsafe { core::mem::zeroed() }
+        Self::zeroed()
     }
 }
 

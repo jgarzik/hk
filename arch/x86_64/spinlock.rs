@@ -284,7 +284,6 @@ pub fn irqs_disabled() -> bool {
 }
 
 #[cfg(test)]
-#[allow(dead_code, reason = "host-test stub")]
 pub fn irqs_disabled() -> bool {
     false
 }

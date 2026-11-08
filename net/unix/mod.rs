@@ -256,10 +256,6 @@ struct Tables {
 }
 
 impl UnixTable {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     fn insert(&self, s: &Arc<UnixSock>) {
         self.st.write().socks.insert(s.id(), Arc::downgrade(s));
     }

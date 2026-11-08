@@ -36,7 +36,7 @@ const S_IFMT: u32 = 0o170000;
 const S_IFSOCK: u32 = 0o140000;
 
 fn ino(fd: i32) -> (i64, u32, u64) {
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let r = sys_fstat(fd, &mut st);
     (r, st.st_mode, st.st_ino)
 }

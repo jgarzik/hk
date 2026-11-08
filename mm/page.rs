@@ -291,12 +291,6 @@ impl Page {
     }
 }
 
-impl Default for Page {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ============================================================================
 // Page lock (Linux folio_lock: PG_locked, hashed wait queues)
 // ============================================================================

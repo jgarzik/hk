@@ -6,8 +6,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::File;
-use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
+use crate::uaccess::UserPtr;
 
 use super::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK,
@@ -16,7 +16,7 @@ use super::{
     PROT_WRITE, TASK_SIZE, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_NORESERVE,
     VM_SHARED, Vma, anon_vma::AnonVma, get_task_mm,
 };
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 
 // ============================================================================
 // mlock flags (user-visible)
@@ -98,27 +98,34 @@ fn file_mmap_ok(f: &File, pgoff: u64, len: u64) -> bool {
     len <= max && pgoff <= (max - len) / PAGE_SIZE
 }
 
-pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: u64) -> i64 {
+pub fn sys_mmap(
+    addr: u64,
+    length: u64,
+    prot: u32,
+    flags: u32,
+    fd: i32,
+    offset: u64,
+) -> KernelResult<u64> {
     // Validate length
     if length == 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     if length > super::TASK_SIZE {
-        return KernelError::OutOfMemory.sysret();
+        return Err(KernelError::OutOfMemory);
     }
 
     // Round up length to page boundary
-    let length = (length + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let length = page_align(length);
 
     // Validate offset alignment
     if offset & (PAGE_SIZE - 1) != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     // The pages may not wrap past the end of the offset space (Linux
     // do_mmap: EOVERFLOW)
     let pgoff = offset / PAGE_SIZE;
     if pgoff.checked_add(length / PAGE_SIZE).is_none() {
-        return KernelError::Overflow.sysret();
+        return Err(KernelError::Overflow);
     }
 
     let is_anonymous = flags & MAP_ANONYMOUS != 0;
@@ -136,11 +143,11 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
             // MAP_SHARED_VALIDATE - shared with strict validation
             // If MAP_SYNC is requested, we must reject since we don't support DAX
             if flags & super::MAP_SYNC != 0 {
-                return -95_i64; // EOPNOTSUPP - no DAX filesystem support
+                return Err(KernelError::OperationNotSupported); // EOPNOTSUPP - no DAX filesystem support
             }
             (true, true)
         }
-        _ => return KernelError::InvalidArgument.sysret(), // 0x00 = neither specified
+        _ => return Err(KernelError::InvalidArgument), // 0x00 = neither specified
     };
     let is_private = !is_shared;
     // Suppress unused warning - is_shared_validate is for future validation
@@ -148,36 +155,25 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
 
     // Get file if not anonymous
     let file: Option<Arc<File>> = if !is_anonymous {
-        if fd < 0 {
-            return KernelError::BadFd.sysret();
-        }
-        let tid = current_tid();
-        let fd_table = match get_task_fd(tid) {
-            Some(t) => t,
-            None => return KernelError::BadFd.sysret(),
-        };
-        match fd_table.lock().get(fd) {
-            Some(f) => Some(f),
-            None => return KernelError::BadFd.sysret(),
-        }
+        Some(crate::fs::io::fget(fd)?)
     } else {
         None
     };
     if let Some(f) = &file
         && !file_mmap_ok(f, pgoff, length)
     {
-        return KernelError::Overflow.sysret();
+        return Err(KernelError::Overflow);
     }
     if let Some(f) = &file
         && let Err(e) = mmap_file_ok(f, prot, is_shared).and_then(|()| f.f_op.mmap(f, is_shared))
     {
-        return e.sysret();
+        return Err(e);
     }
     // PROT_EXEC of a file on a noexec mount (its own mount: Linux
     // path_noexec): EPERM; without it the mapping never gets it later
     let noexec = file.as_ref().is_some_and(|f| f.noexec());
     if noexec && prot & super::PROT_EXEC != 0 {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     // A regular file's mmap is an access (Linux generic_file_mmap:
     // file_accessed)
@@ -189,38 +185,31 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
 
     // Every user task has an address space; kernel threads have none
     let tid = current_tid();
-    let Some(mm) = get_task_mm(tid) else {
-        return KernelError::OutOfMemory.sysret();
-    };
+    let mm = get_task_mm(tid).ok_or(KernelError::OutOfMemory)?;
 
     // Mappings replaced by MAP_FIXED: declared first so that they are
     // dropped after the lock on every return
     let mut replaced = Vec::new();
-    let mut mm_guard = match mm.mmap_write_killable() {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
+    let mut mm_guard = mm.mmap_write_killable()?;
 
     if !mm_guard.may_map() {
-        return KernelError::OutOfMemory.sysret();
+        return Err(KernelError::OutOfMemory);
     }
 
     // Determine mapping address
     let map_addr = if is_fixed || is_fixed_noreplace {
         // MAP_FIXED or MAP_FIXED_NOREPLACE: use exact address
         if addr & (PAGE_SIZE - 1) != 0 {
-            return KernelError::InvalidArgument.sysret(); // Must be page-aligned
+            return Err(KernelError::InvalidArgument); // Must be page-aligned
         }
-        if let Err(e) = super::check_fixed(addr, length) {
-            return e.sysret();
-        }
+        super::check_fixed(addr, length)?;
         // MAP_FIXED_NOREPLACE: fail if address range overlaps existing mapping
         if is_fixed_noreplace && mm_guard.overlaps(addr, addr + length) {
-            return KernelError::AlreadyExists.sysret();
+            return Err(KernelError::AlreadyExists);
         }
         // MAP_FIXED: unmap whatever was there (dropped after unlocking)
         if is_fixed && !mm_guard.may_unmap(addr, addr + length) {
-            return KernelError::OutOfMemory.sysret();
+            return Err(KernelError::OutOfMemory);
         }
         if is_fixed {
             replaced = munmap_locked(&mut mm_guard, &mm, addr, addr + length);
@@ -232,17 +221,15 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         if !mm_guard.overlaps(aligned, aligned + length) {
             aligned
         } else {
-            match mm_guard.find_free_area(length) {
-                Some(a) => a,
-                None => return KernelError::OutOfMemory.sysret(),
-            }
+            mm_guard
+                .find_free_area(length)
+                .ok_or(KernelError::OutOfMemory)?
         }
     } else {
         // No hint - find free area
-        match mm_guard.find_free_area(length) {
-            Some(a) => a,
-            None => return KernelError::OutOfMemory.sysret(),
-        }
+        mm_guard
+            .find_free_area(length)
+            .ok_or(KernelError::OutOfMemory)?
     };
 
     // Check RLIMIT_AS (address space limit) before creating VMA
@@ -250,7 +237,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     if limit != crate::task::rlimit::RLIM_INFINITY {
         let current_bytes = mm_guard.total_vm() * PAGE_SIZE;
         if current_bytes.saturating_add(length) > limit {
-            return KernelError::OutOfMemory.sysret();
+            return Err(KernelError::OutOfMemory);
         }
     }
 
@@ -271,9 +258,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         } else {
             super::shmem::Shmem::new(length / PAGE_SIZE).map(|s| v.shmem = Some(s))
         };
-        if let Err(e) = made {
-            return e.sysret();
-        }
+        made?;
         v
     };
 
@@ -303,7 +288,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     if is_map_locked {
         // Permission check
         if !can_do_mlock() {
-            return KernelError::NotPermitted.sysret();
+            return Err(KernelError::NotPermitted);
         }
 
         // Check RLIMIT_MEMLOCK (CAP_IPC_LOCK bypasses limit)
@@ -314,7 +299,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
                 let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
                 let requested_bytes = pages * PAGE_SIZE;
                 if current_bytes.saturating_add(requested_bytes) > limit {
-                    return KernelError::WouldBlock.sysret();
+                    return Err(KernelError::WouldBlock);
                 }
             }
         }
@@ -338,7 +323,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
                 let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
                 let requested_bytes = pages * PAGE_SIZE;
                 if current_bytes.saturating_add(requested_bytes) > limit {
-                    return KernelError::WouldBlock.sysret();
+                    return Err(KernelError::WouldBlock);
                 }
             }
         }
@@ -376,7 +361,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     // Note: Pages are allocated on demand in the page fault handler
     // (unless we just populated them above for MCL_FUTURE)
 
-    map_addr as i64
+    Ok(map_addr)
 }
 
 /// munmap syscall (Linux do_vmi_munmap): EINVAL for an unaligned start,
@@ -385,33 +370,30 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
 /// # Returns
 /// 0 on success (also for a range with nothing mapped), negative errno
 /// on failure
-pub fn sys_munmap(addr: u64, length: u64) -> i64 {
+pub fn sys_munmap(addr: u64, length: u64) -> KernelResult<()> {
     if addr & (PAGE_SIZE - 1) != 0 || addr > TASK_SIZE || length > TASK_SIZE - addr {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     let end = addr + page_align(length);
     if end == addr {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return 0, // No mm, nothing to unmap
+    let Some(mm) = get_task_mm(tid) else {
+        // No mm, nothing to unmap
+        return Ok(());
     };
 
-    let mut mm_guard = match mm.mmap_write_killable() {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
+    let mut mm_guard = mm.mmap_write_killable()?;
     if !mm_guard.may_unmap(addr, end) {
-        return KernelError::OutOfMemory.sysret();
+        return Err(KernelError::OutOfMemory);
     }
     let removed = munmap_locked(&mut mm_guard, &mm, addr, end);
     drop(mm_guard);
     // The VMAs may hold the last reference to a mapped file
     drop(removed);
-    0
+    Ok(())
 }
 
 /// `x` rounded up to a page, wrapping like Linux PAGE_ALIGN
@@ -458,42 +440,42 @@ pub(crate) fn munmap_locked(
 /// nothing mapped there, or a growth that does not fit (past TASK_SIZE,
 /// a rounded break that wraps, within a page of the next mapping, past
 /// RLIMIT_AS). `brk(0)` queries.
-pub fn sys_brk(brk: u64) -> i64 {
+pub fn sys_brk(brk: u64) -> KernelResult<u64> {
     let Some(mm) = get_task_mm(current_tid()) else {
-        return 0;
+        return Ok(0);
     };
     let Ok(mut map) = mm.mmap_write_killable() else {
-        return KernelError::Interrupted.sysret();
+        return Err(KernelError::Interrupted);
     };
     let cur = map.get_brk();
     if brk < map.get_start_brk() || !data_ok(&map, brk) {
-        return cur as i64;
+        return Ok(cur);
     }
     let (old, new) = (page_align(cur), page_align(brk));
     if old == new {
         map.update_brk(brk);
-        return brk as i64;
+        return Ok(brk);
     }
     if brk <= cur {
         // Shrinking: only a heap that is still mapped
         if !map.overlaps(new, old) {
-            return cur as i64;
+            return Ok(cur);
         }
         let removed = munmap_locked(&mut map, &mm, new, old);
         map.update_brk(brk);
         drop(map);
         drop(removed);
-        return brk as i64;
+        return Ok(brk);
     }
     if !brk_fits(&map, old, new) || !map.may_map() {
-        return cur as i64;
+        return Ok(cur);
     }
     // Without memory the break stays (Linux brk: the old one returned)
     if brk_grow(&mut map, old, new).is_err() {
-        return cur as i64;
+        return Ok(cur);
     }
     map.update_brk(brk);
-    brk as i64
+    Ok(brk)
 }
 
 /// A break at `brk` fits RLIMIT_DATA (Linux check_data_rlimit; hk does
@@ -671,7 +653,7 @@ fn populate_pages(
 ///
 /// # Returns
 /// 0 on success, negative errno on failure
-pub fn sys_mlock(addr: u64, len: u64) -> i64 {
+pub fn sys_mlock(addr: u64, len: u64) -> KernelResult<()> {
     do_mlock(addr, len, VM_LOCKED)
 }
 
@@ -687,10 +669,10 @@ pub fn sys_mlock(addr: u64, len: u64) -> i64 {
 ///
 /// # Returns
 /// 0 on success, negative errno on failure
-pub fn sys_mlock2(addr: u64, len: u64, flags: i32) -> i64 {
+pub fn sys_mlock2(addr: u64, len: u64, flags: i32) -> KernelResult<()> {
     // Validate flags - only MLOCK_ONFAULT is allowed
     if flags & !MLOCK_ONFAULT != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     let mut vm_flags = VM_LOCKED;
@@ -706,40 +688,32 @@ pub fn sys_mlock2(addr: u64, len: u64, flags: i32) -> i64 {
 /// nothing), checked against RLIMIT_MEMLOCK (ENOMEM; pages already
 /// locked in it do not count again), locked VMA part by VMA part, then
 /// faulted in unless MLOCK_ONFAULT
-fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
+fn do_mlock(start: u64, len: u64, vm_flags: u32) -> KernelResult<()> {
     if !can_do_mlock() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
     let (start, len) = lock_range(start, len);
-    let Some(mm) = get_task_mm(current_tid()) else {
-        return KernelError::OutOfMemory.sysret();
-    };
-    let mut map = match mm.mmap_write_killable() {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
+    let mm = get_task_mm(current_tid()).ok_or(KernelError::OutOfMemory)?;
+    let mut map = mm.mmap_write_killable()?;
     let r = if memlock_room(&map, start, len) {
         mlock_vmas(&mut map, start, len, vm_flags)
     } else {
         Err(KernelError::OutOfMemory)
     };
     drop(map);
-    if let Err(e) = r {
-        return e.sysret();
-    }
+    r?;
     // Linux __mlock_posix_error_return: out of memory faulting the
     // pages in is EAGAIN, an unfaultable page ENOMEM, SIGKILL EINTR
     if vm_flags & VM_LOCKONFAULT == 0
         && let Err(e) = populate_range(start, len, false)
     {
-        return match e {
+        return Err(match e {
             KernelError::OutOfMemory => KernelError::WouldBlock,
             KernelError::BadAddress => KernelError::OutOfMemory,
             e => e,
-        }
-        .sysret();
+        });
     }
-    0
+    Ok(())
 }
 
 /// [start, start + len) widened to whole pages, as Linux computes it:
@@ -837,20 +811,13 @@ fn mlock_fixup(
 ///
 /// # Returns
 /// 0 on success, negative errno on failure
-pub fn sys_munlock(addr: u64, len: u64) -> i64 {
+pub fn sys_munlock(addr: u64, len: u64) -> KernelResult<()> {
     let (start, len) = lock_range(addr, len);
     let Some(mm) = get_task_mm(current_tid()) else {
-        return 0;
+        return Ok(());
     };
-    let mut map = match mm.mmap_write_killable() {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
-    let r = mlock_vmas(&mut map, start, len, 0);
-    match r {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+    let mut map = mm.mmap_write_killable()?;
+    mlock_vmas(&mut map, start, len, 0)
 }
 
 /// mlockall syscall - Lock all current and/or future mappings
@@ -862,34 +829,28 @@ pub fn sys_munlock(addr: u64, len: u64) -> i64 {
 ///
 /// # Returns
 /// 0 on success, negative errno on failure
-pub fn sys_mlockall(flags: i32) -> i64 {
+pub fn sys_mlockall(flags: i32) -> KernelResult<()> {
     // Validate flags
     if flags == 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     if flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     // MCL_ONFAULT alone is invalid
     if flags == MCL_ONFAULT {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Permission check
     if !can_do_mlock() {
-        return KernelError::NotPermitted.sysret();
+        return Err(KernelError::NotPermitted);
     }
 
     let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return KernelError::OutOfMemory.sysret(),
-    };
+    let mm = get_task_mm(tid).ok_or(KernelError::OutOfMemory)?;
 
-    let mut mm_guard = match mm.mmap_write_killable() {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
+    let mut mm_guard = mm.mmap_write_killable()?;
 
     // Clear old def_flags
     mm_guard.set_def_flags(0);
@@ -904,7 +865,7 @@ pub fn sys_mlockall(flags: i32) -> i64 {
 
         // If only MCL_FUTURE (without MCL_CURRENT), we're done
         if flags & MCL_CURRENT == 0 {
-            return 0;
+            return Ok(());
         }
     }
 
@@ -935,7 +896,7 @@ pub fn sys_mlockall(flags: i32) -> i64 {
                 let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
                 let requested_bytes = pages_to_add * PAGE_SIZE;
                 if current_bytes.saturating_add(requested_bytes) > limit {
-                    return KernelError::WouldBlock.sysret();
+                    return Err(KernelError::WouldBlock);
                 }
             }
         }
@@ -967,7 +928,7 @@ pub fn sys_mlockall(flags: i32) -> i64 {
         }
     }
 
-    0
+    Ok(())
 }
 
 /// munlockall syscall - Unlock all mappings
@@ -976,17 +937,14 @@ pub fn sys_mlockall(flags: i32) -> i64 {
 ///
 /// # Returns
 /// 0 on success, negative errno on failure
-pub fn sys_munlockall() -> i64 {
+pub fn sys_munlockall() -> KernelResult<()> {
     let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return 0, // No mm, nothing to unlock
+    let Some(mm) = get_task_mm(tid) else {
+        // No mm, nothing to unlock
+        return Ok(());
     };
 
-    let mut mm_guard = match mm.mmap_write_killable() {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
+    let mut mm_guard = mm.mmap_write_killable()?;
 
     // Clear def_flags (undo MCL_FUTURE)
     mm_guard.set_def_flags(0);
@@ -1001,7 +959,7 @@ pub fn sys_munlockall() -> i64 {
     // Reset locked_vm counter
     mm_guard.reset_locked_vm();
 
-    0
+    Ok(())
 }
 
 // ============================================================================
@@ -1021,41 +979,31 @@ pub fn sys_munlockall() -> i64 {
 ///
 /// # Returns
 /// 0 on success, negative errno on failure
-pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
+pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> KernelResult<()> {
     let grows = prot & (PROT_GROWSDOWN | PROT_GROWSUP);
     let prot = prot & !(PROT_GROWSDOWN | PROT_GROWSUP);
     if grows == (PROT_GROWSDOWN | PROT_GROWSUP) || addr & (PAGE_SIZE - 1) != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     if len == 0 {
-        return 0;
+        return Ok(());
     }
     let end = addr.wrapping_add(page_align(len));
     if end <= addr {
-        return KernelError::OutOfMemory.sysret();
+        return Err(KernelError::OutOfMemory);
     }
     // PROT_SEM is accepted but is a no-op on x86-64/aarch64 (Linux)
     if prot & !(PROT_READ | PROT_WRITE | super::PROT_EXEC | super::PROT_SEM) != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    let Some(mm) = get_task_mm(current_tid()) else {
-        return KernelError::InvalidArgument.sysret();
-    };
-    let mut map = match mm.mmap_write_killable() {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
-    let start = match mprotect_start(&map, addr, end, grows) {
-        Ok(s) => s,
-        Err(e) => return e.sysret(),
-    };
+    let mm = get_task_mm(current_tid()).ok_or(KernelError::InvalidArgument)?;
+    let mut map = mm.mmap_write_killable()?;
+    let start = mprotect_start(&map, addr, end, grows)?;
 
     // 2MB pages that cannot keep one entry are split before anything
     // changes: ENOMEM leaves the range as it was
     let t = super::pgtable::PgTables::new(&mm, &map);
-    if let Err(e) = super::mprotect::split_huge(&mm, t, start, mapped_end(&map, start, end), prot) {
-        return e.sysret();
-    }
+    super::mprotect::split_huge(&mm, t, start, mapped_end(&map, start, end), prot)?;
 
     // Each VMA in the range in turn (Linux mprotect_fixup): split at the
     // range edges, take the new protection, and have the PTEs it maps
@@ -1067,10 +1015,7 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     #[cfg(feature = "mmcheck")]
     super::check::verify(&mm, &map, "mprotect");
     drop(map);
-    match r {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+    r
 }
 
 /// Where the change of [addr, end) starts (Linux do_mprotect_pkey): the
@@ -1215,27 +1160,22 @@ fn mprotect_fixup(
 ///
 /// # Returns
 /// 0 on success, negative errno on failure
-pub fn sys_msync(addr: u64, length: u64, flags: i32) -> i64 {
+pub fn sys_msync(addr: u64, length: u64, flags: i32) -> KernelResult<()> {
     if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
         || addr & (PAGE_SIZE - 1) != 0
         || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0)
     {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     let end = addr.wrapping_add(page_align(length));
     if end < addr {
-        return KernelError::OutOfMemory.sysret();
+        return Err(KernelError::OutOfMemory);
     }
     if end == addr {
-        return 0;
+        return Ok(());
     }
-    let Some(mm) = get_task_mm(current_tid()) else {
-        return KernelError::OutOfMemory.sysret();
-    };
-    match msync_vmas(&mm, addr, end, flags) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+    let mm = get_task_mm(current_tid()).ok_or(KernelError::OutOfMemory)?;
+    msync_vmas(&mm, addr, end, flags)
 }
 
 /// The msync walk over [start, end) (Linux msync): VMA by VMA, looked up
@@ -1293,7 +1233,13 @@ fn msync_vmas(mm: &super::Mm, mut start: u64, end: u64, flags: i32) -> Result<()
 ///
 /// # Returns
 /// New address on success, negative errno on failure
-pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_addr: u64) -> i64 {
+pub fn sys_mremap(
+    old_addr: u64,
+    old_len: u64,
+    new_len: u64,
+    flags: u32,
+    new_addr: u64,
+) -> KernelResult<u64> {
     // Validate flags
     let may_move = flags & MREMAP_MAYMOVE != 0;
     let fixed = flags & MREMAP_FIXED != 0;
@@ -1302,92 +1248,83 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     // Check for invalid flag combinations
     let valid_flags = MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP;
     if flags & !valid_flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // MREMAP_FIXED implies MREMAP_MAYMOVE (Linux behavior)
     if fixed && !may_move {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // MREMAP_DONTUNMAP requires MREMAP_MAYMOVE
     if dontunmap && !may_move {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Validate address alignment
     if old_addr & (PAGE_SIZE - 1) != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Lengths at most TASK_SIZE once page-aligned, the new one not zero
     // (Linux check_mremap_params; rounding cannot wrap below that)
     if new_len == 0 || new_len > super::TASK_SIZE || old_len > super::TASK_SIZE {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    let old_len = (old_len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let new_len_aligned = (new_len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let old_len = page_align(old_len);
+    let new_len_aligned = page_align(new_len);
 
-    // old_len == 0 is special: creates new mapping at old_addr (deprecated, return KernelError::InvalidArgument.sysret())
+    // old_len == 0 (a deprecated duplicate of a shared mapping): EINVAL
     if old_len == 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // Check for overflow
     if old_addr.checked_add(old_len).is_none() {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // MREMAP_FIXED: validate new_addr
     if fixed {
         if new_addr & (PAGE_SIZE - 1) != 0 {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
         // The new range must not overlap the old one (Linux
         // vrm_overlaps, MREMAP_DONTUNMAP included) and must end in
         // user space
-        let new_end = match new_addr.checked_add(new_len_aligned) {
-            Some(e) => e,
-            None => return KernelError::InvalidArgument.sysret(),
-        };
+        let new_end = new_addr
+            .checked_add(new_len_aligned)
+            .ok_or(KernelError::InvalidArgument)?;
         if (new_end > old_addr && new_addr < old_addr + old_len) || new_end > super::TASK_SIZE {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
-        if let Err(e) = super::check_fixed(new_addr, new_len_aligned) {
-            return e.sysret();
-        }
+        super::check_fixed(new_addr, new_len_aligned)?;
     }
 
     // MREMAP_DONTUNMAP requires old_len == new_len
     if dontunmap && old_len != new_len_aligned {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return KernelError::BadAddress.sysret(),
-    };
+    let mm = get_task_mm(tid).ok_or(KernelError::BadAddress)?;
 
     // VMAs unmapped or moved away: dropped after the lock on every return
     let mut gone: Vec<Vma> = Vec::new();
-    let mut mm_guard = match mm.mmap_write_killable() {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
+    let mut mm_guard = mm.mmap_write_killable()?;
 
     // The VMA containing old_addr must cover the old range (it may
     // start before old_addr: only the moves split it, Linux
     // vma_to_resize)
-    let Some(vma_idx) = mm_guard.find_vma_index(old_addr) else {
-        return KernelError::BadAddress.sysret();
-    };
+    let vma_idx = mm_guard
+        .find_vma_index(old_addr)
+        .ok_or(KernelError::BadAddress)?;
     // A shrink's unmapped tail may cross VMAs and gaps (Linux
     // check_prep_vma): only what stays must lie in the VMA
     let kept = old_addr + old_len.min(new_len_aligned);
     let vma_end = match mm_guard.get_vma(vma_idx) {
         Some(v) if v.end >= kept => v.end,
-        _ => return KernelError::BadAddress.sysret(),
+        _ => return Err(KernelError::BadAddress),
     };
 
     let moves = fixed || dontunmap;
@@ -1398,7 +1335,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     if new_len_aligned < old_len
         && !mm_guard.may_unmap(old_addr + new_len_aligned, old_addr + old_len)
     {
-        return KernelError::OutOfMemory.sysret();
+        return Err(KernelError::OutOfMemory);
     }
     if new_len_aligned < old_len {
         gone = munmap_locked(
@@ -1413,7 +1350,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             super::check::verify(&mm, &mm_guard, "mremap shrink");
             drop(mm_guard);
             drop(gone);
-            return old_addr as i64;
+            return Ok(old_addr);
         }
     }
 
@@ -1429,7 +1366,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_AS);
     let total = (mm_guard.total_vm() * PAGE_SIZE).saturating_add(charge);
     if charge > 0 && limit != crate::task::rlimit::RLIM_INFINITY && total > limit {
-        return KernelError::OutOfMemory.sysret();
+        return Err(KernelError::OutOfMemory);
     }
     let locked = mm_guard.get_vma(vma_idx).is_some_and(|v| v.is_locked());
     // What grows is faulted in, unless locked on fault (Linux
@@ -1439,7 +1376,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             .get_vma(vma_idx)
             .is_some_and(|v| v.flags & super::vma::VM_LOCKONFAULT == 0);
     if locked && new_len_aligned > old_len && !memlock_ok(&mm_guard, new_len_aligned - old_len) {
-        return KernelError::WouldBlock.sysret();
+        return Err(KernelError::WouldBlock);
     }
 
     if new_len_aligned > old_len {
@@ -1457,21 +1394,21 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             if populate {
                 populate_grown(old_addr, old_len, new_len_aligned);
             }
-            return old_addr as i64;
+            return Ok(old_addr);
         }
         if !may_move {
-            return KernelError::OutOfMemory.sysret();
+            return Err(KernelError::OutOfMemory);
         }
     } else if !moves {
         // Same size, nothing to move
-        return old_addr as i64;
+        return Ok(old_addr);
     }
 
     // A move may add up to three VMAs (Linux move_vma: refused within
     // 3 of vm.max_map_count)
     if mm_guard.map_count() + 3 >= super::MAX_MAP_COUNT.load(core::sync::atomic::Ordering::Relaxed)
     {
-        return KernelError::OutOfMemory.sysret();
+        return Err(KernelError::OutOfMemory);
     }
     // Move: MREMAP_FIXED unmaps its target first, in this same mm lock
     // hold; else a free range is found
@@ -1484,15 +1421,12 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         ));
         new_addr
     } else {
-        match mm_guard.find_free_area(new_len_aligned) {
-            Some(a) => a,
-            None => return KernelError::OutOfMemory.sysret(),
-        }
+        mm_guard
+            .find_free_area(new_len_aligned)
+            .ok_or(KernelError::OutOfMemory)?
     };
     let (from, to) = ((old_addr, old_len), (target, new_len_aligned));
-    if let Err(e) = move_mapping(&mut mm_guard, &mm, from, to, dontunmap, &mut gone) {
-        return e.sysret();
-    }
+    move_mapping(&mut mm_guard, &mm, from, to, dontunmap, &mut gone)?;
     #[cfg(feature = "mmcheck")]
     super::check::verify(&mm, &mm_guard, "mremap move");
     drop(mm_guard);
@@ -1500,7 +1434,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     if populate {
         populate_grown(target, old_len, new_len_aligned);
     }
-    target as i64
+    Ok(target)
 }
 
 /// A locked mapping that mremap grew at `addr` from `old_len` to
@@ -1626,27 +1560,22 @@ fn move_mapping(
 ///
 /// # Returns
 /// 0 on success, negative errno on failure
-pub fn sys_mincore(addr: u64, length: u64, vec: u64) -> i64 {
+pub fn sys_mincore(addr: u64, length: u64, vec: UserPtr<u8>) -> KernelResult<()> {
     use crate::uaccess::UaccessArch;
     type U = crate::arch::Uaccess;
     if addr & (PAGE_SIZE - 1) != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     if !U::access_ok(addr, length as usize) {
-        return KernelError::OutOfMemory.sysret();
+        return Err(KernelError::OutOfMemory);
     }
     // No overflow: the range is inside user space
     let pages = length.div_ceil(PAGE_SIZE);
-    if !U::access_ok(vec, pages as usize) {
-        return KernelError::BadAddress.sysret();
+    if !U::access_ok(vec.addr(), pages as usize) {
+        return Err(KernelError::BadAddress);
     }
-    let Some(mm) = get_task_mm(current_tid()) else {
-        return KernelError::OutOfMemory.sysret();
-    };
-    match mincore_chunks(&mm, addr, pages, vec) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
+    let mm = get_task_mm(current_tid()).ok_or(KernelError::OutOfMemory)?;
+    mincore_chunks(&mm, addr, pages, vec.addr())
 }
 
 /// Fill `vec` for `pages` pages from `addr`, chunk by chunk
@@ -1659,8 +1588,7 @@ fn mincore_chunks(
     let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
     while pages > 0 {
         let n = mincore_chunk(mm, addr, pages.min(PAGE_SIZE), &mut buf)?;
-        crate::uaccess::copy_to_user::<crate::arch::Uaccess>(vec, &buf[..n])
-            .map_err(|_| KernelError::BadAddress)?;
+        crate::uaccess::copy_to_user::<crate::arch::Uaccess>(vec, &buf[..n])?;
         pages -= n as u64;
         vec += n as u64;
         addr += n as u64 * PAGE_SIZE;

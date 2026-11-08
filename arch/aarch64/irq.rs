@@ -17,7 +17,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::gic::{self, Trigger};
+use super::gic;
 use crate::arch::IrqSpinlock;
 use crate::irq::IrqHandler;
 
@@ -90,7 +90,7 @@ pub fn register_irq_handler(
         line.handlers.len() == 1
     };
     if first {
-        gic::enable_spi(irq, Trigger::Level);
+        gic::enable_spi(irq);
     }
     Ok(())
 }

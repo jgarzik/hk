@@ -6,6 +6,7 @@
 //! descriptor skips full words through `full`, so it reads about one
 //! `full` word per 4096 open descriptors instead of probing each fd.
 
+use crate::util::error::{KernelError, KernelResult};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -113,14 +114,14 @@ impl OpenFds {
     /// Claim the lowest free descriptor at or above `start` and below
     /// `limit` (Linux alloc_fd): Err(EMFILE) past the limit or
     /// fs.nr_open, Err(ENOMEM) if the bitmap cannot grow
-    pub fn alloc(&mut self, start: usize, limit: u64) -> Result<usize, i32> {
+    pub fn alloc(&mut self, start: usize, limit: u64) -> KernelResult<usize> {
         let fd = self.find(start);
         if fd as u64 >= limit.min(nr_open()) {
-            return Err(24); // EMFILE
+            return Err(KernelError::ProcessFileLimit);
         }
         let lowest = start <= self.next;
         if !self.set(fd) {
-            return Err(12); // ENOMEM
+            return Err(KernelError::OutOfMemory);
         }
         // Searched from `next`: nothing below `fd` is free now
         if lowest {
@@ -133,13 +134,13 @@ impl OpenFds {
     /// fs.nr_open, Err(ENOMEM) if the bitmap cannot grow. Unlike Linux,
     /// whose table may already cover a descriptor past a lowered
     /// fs.nr_open, the cap always applies.
-    pub fn reserve(&mut self, fd: usize) -> Result<(), i32> {
+    pub fn reserve(&mut self, fd: usize) -> KernelResult<()> {
         if fd as u64 >= nr_open() {
-            return Err(24); // EMFILE
+            return Err(KernelError::ProcessFileLimit);
         }
         let w = fd / BITS;
         if !grow(&mut self.open, w) || !grow(&mut self.full, w / BITS) {
-            return Err(12); // ENOMEM
+            return Err(KernelError::OutOfMemory);
         }
         Ok(())
     }
@@ -185,12 +186,6 @@ impl OpenFds {
     }
 }
 
-impl Default for OpenFds {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,10 +222,10 @@ mod tests {
     fn nr_open_cap() {
         let mut b = OpenFds::new();
         let cap = nr_open() as usize;
-        assert_eq!(b.reserve(cap), Err(24));
+        assert_eq!(b.reserve(cap), Err(KernelError::ProcessFileLimit));
         assert_eq!(b.reserve(cap - 1), Ok(()));
         assert!(!b.test(cap - 1));
-        assert_eq!(b.alloc(cap, u64::MAX), Err(24));
+        assert_eq!(b.alloc(cap, u64::MAX), Err(KernelError::ProcessFileLimit));
     }
 
     #[test]
@@ -238,10 +233,10 @@ mod tests {
         let mut b = OpenFds::new();
         assert_eq!(b.alloc(0, 3), Ok(0));
         assert_eq!(b.alloc(0, 3), Ok(1));
-        assert_eq!(b.alloc(10, 3), Err(24));
+        assert_eq!(b.alloc(10, 3), Err(KernelError::ProcessFileLimit));
         assert_eq!(b.alloc(10, 100), Ok(10));
         assert_eq!(b.alloc(0, 100), Ok(2));
-        assert_eq!(b.alloc(0, 3), Err(24));
+        assert_eq!(b.alloc(0, 3), Err(KernelError::ProcessFileLimit));
         b.clear(1);
         assert_eq!(b.alloc(0, 3), Ok(1));
         assert!(!b.test(3) && b.test(10));
@@ -279,7 +274,10 @@ mod tests {
             t.alloc_at_with_flags(11, f.clone(), FD_CLOEXEC, u64::MAX),
             Ok(())
         );
-        assert_eq!(t.alloc_at_with_flags(11, f.clone(), 0, u64::MAX), Err(9));
+        assert_eq!(
+            t.alloc_at_with_flags(11, f.clone(), 0, u64::MAX),
+            Err(KernelError::BadFd)
+        );
         assert!(t.alloc_at(300, f.clone()));
         let c = t.deep_clone();
         assert_eq!(c.count(), t.count());
@@ -289,7 +287,10 @@ mod tests {
         assert_eq!(e.alloc(f.clone(), u64::MAX), Ok(12));
         assert_eq!(e.alloc_at_or_above(f.clone(), 100, 0, u64::MAX), Ok(150));
         assert_eq!(t.alloc_at_or_above(f.clone(), 100, 0, u64::MAX), Ok(200));
-        assert_eq!(t.alloc_at_or_above(f.clone(), 100, 0, 201), Err(24));
+        assert_eq!(
+            t.alloc_at_or_above(f.clone(), 100, 0, 201),
+            Err(KernelError::ProcessFileLimit)
+        );
         t.close_range(0, i32::MAX);
         assert_eq!(t.count(), 0);
         assert_eq!(t.alloc(f.clone(), u64::MAX), Ok(0));

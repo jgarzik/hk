@@ -6,24 +6,23 @@
 //! - xattr syscalls (extended attributes)
 //! - readahead (file readahead)
 
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::arch::Uaccess;
-use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
-use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user, strncpy_from_user_str};
+use crate::fs::{Inode, KernelError, LookupFlags, lookup_path_flags};
+use crate::uaccess::{
+    UaccessArch, UserPtr, copy_to_user, strncpy_from_user, strncpy_from_user_str,
+};
+use crate::util::error::KernelResult;
 
+use super::io::fget;
 use super::syscall::{PATH_MAX, current_fd_table};
 
 // ============================================================================
 // mount, umount2 syscalls
 // ============================================================================
-
-/// Block device required
-pub const ENOTBLK: i64 = -15;
-/// Resource busy
-pub const EBUSY: i64 = -16;
-/// No such device or filesystem type
-pub const ENODEV: i64 = -19;
 
 /// mount(2) flags (Linux uapi/linux/mount.h)
 mod ms {
@@ -235,20 +234,13 @@ fn mount_at(target: &super::Path) -> Result<Arc<super::mount::Mount>, KernelErro
 /// MS_NOUSER (EINVAL) and CAP_SYS_ADMIN (EPERM), then path_mount's
 /// dispatch: MS_REMOUNT|MS_BIND, MS_REMOUNT, MS_BIND, the propagation
 /// types, MS_MOVE, else a new mount. Unsupported flags are EINVAL.
-pub fn sys_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64, data: u64) -> i64 {
-    match path_mount(source_ptr, target_ptr, fstype_ptr, flags, data) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
-}
-
-fn path_mount(
-    source_ptr: u64,
-    target_ptr: u64,
-    fstype_ptr: u64,
+pub fn sys_mount(
+    source_ptr: UserPtr<u8>,
+    target_ptr: UserPtr<u8>,
+    fstype_ptr: UserPtr<u8>,
     mut flags: u64,
-    data_ptr: u64,
-) -> Result<(), KernelError> {
+    data_ptr: UserPtr<u8>,
+) -> KernelResult<()> {
     use crate::uaccess::UaccessError;
     // Linux copy_mount_string (strndup_user): EFAULT, EINVAL if too long;
     // type, then source, then the target as a path name. Source and type
@@ -258,8 +250,8 @@ fn path_mount(
         UaccessError::TooLong => KernelError::InvalidArgument,
         _ => KernelError::BadAddress,
     };
-    let fstype = if fstype_ptr != 0 {
-        match strncpy_from_user_str::<Uaccess>(fstype_ptr, PATH_MAX) {
+    let fstype = if !fstype_ptr.is_null() {
+        match strncpy_from_user_str::<Uaccess>(fstype_ptr.addr(), PATH_MAX) {
             Ok(s) => s,
             Err(UaccessError::Encoding) => return Err(KernelError::NoDevice),
             Err(e) => return Err(too_long(e)),
@@ -267,14 +259,14 @@ fn path_mount(
     } else {
         Default::default()
     };
-    let source = if source_ptr != 0 {
-        strncpy_from_user::<Uaccess>(source_ptr, PATH_MAX).map_err(too_long)?
+    let source = if !source_ptr.is_null() {
+        strncpy_from_user::<Uaccess>(source_ptr.addr(), PATH_MAX).map_err(too_long)?
     } else {
         Default::default()
     };
     // Linux copy_mount_options: the options string, within a page
-    let data = if data_ptr != 0 {
-        strncpy_from_user::<Uaccess>(data_ptr, 4096).map_err(too_long)?
+    let data = if !data_ptr.is_null() {
+        strncpy_from_user::<Uaccess>(data_ptr.addr(), 4096).map_err(too_long)?
     } else {
         Default::default()
     };
@@ -394,52 +386,44 @@ fn new_mount(
 /// sys_umount2 (Linux ksys_umount): flags, the target (a mount's root,
 /// followed unless UMOUNT_NOFOLLOW), CAP_SYS_ADMIN after the lookup,
 /// then do_umount
-pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
+pub fn sys_umount2(target_ptr: UserPtr<u8>, flags: i32) -> KernelResult<()> {
     use super::mount::umount_flags::{MNT_DETACH, MNT_EXPIRE, MNT_FORCE, UMOUNT_NOFOLLOW};
-    let r = (|| {
-        if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
-            return Err(KernelError::InvalidArgument);
-        }
-        let target = crate::fs::namei::getname(target_ptr, false)?;
-        let lf = LookupFlags {
-            follow: flags & UMOUNT_NOFOLLOW == 0,
-            ..LookupFlags::open()
-        };
-        let target =
-            crate::fs::namei::path_lookupat(crate::task::percpu::current_cwd(), &target, lf)?;
-        if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-            return Err(KernelError::NotPermitted);
-        }
-        // The lookup is not a use that clears an MNT_EXPIRE mark (Linux
-        // path_umount: mntput_no_expire)
-        let m = mount_at(&target)?;
-        drop(target.into_mnt_noexpire());
-        super::mount::do_umount(m, flags)
-    })();
-    match r {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
+    if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
+        return Err(KernelError::InvalidArgument);
     }
+    let target = crate::fs::namei::getname(target_ptr, false)?;
+    let lf = LookupFlags {
+        follow: flags & UMOUNT_NOFOLLOW == 0,
+        ..LookupFlags::open()
+    };
+    let target = crate::fs::namei::path_lookupat(crate::task::percpu::current_cwd(), &target, lf)?;
+    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        return Err(KernelError::NotPermitted);
+    }
+    // The lookup is not a use that clears an MNT_EXPIRE mark (Linux
+    // path_umount: mntput_no_expire)
+    let m = mount_at(&target)?;
+    drop(target.into_mnt_noexpire());
+    super::mount::do_umount(m, flags)
 }
 
 /// pivot_root(new_root, put_old) (Linux: may_mount, both paths as
 /// directories, then the mount rules of do_pivot_root)
-pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
-    let r = (|| {
-        if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-            return Err(KernelError::NotPermitted);
-        }
-        let cwd = crate::task::percpu::current_cwd;
-        let new = crate::fs::namei::getname(new_root_ptr, false)?;
-        let new = crate::fs::namei::path_lookupat(cwd(), &new, LookupFlags::opendir())?;
-        let old = crate::fs::namei::getname(put_old_ptr, false)?;
-        let old = crate::fs::namei::path_lookupat(cwd(), &old, LookupFlags::opendir())?;
-        super::mount::do_pivot_root(&new, &old)
-    })();
-    match r {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
+pub fn sys_pivot_root(new_root_ptr: UserPtr<u8>, put_old_ptr: UserPtr<u8>) -> KernelResult<()> {
+    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        return Err(KernelError::NotPermitted);
     }
+    let dir = |p: UserPtr<u8>| {
+        let name = crate::fs::namei::getname(p, false)?;
+        crate::fs::namei::path_lookupat(
+            crate::task::percpu::current_cwd(),
+            &name,
+            LookupFlags::opendir(),
+        )
+    };
+    let new = dir(new_root_ptr)?;
+    let old = dir(put_old_ptr)?;
+    super::mount::do_pivot_root(&new, &old)
 }
 
 /// sys_ioctl - device control
@@ -452,10 +436,8 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
 /// * `arg` - Command-specific argument (often a pointer)
 ///
 /// # Returns
-/// 0 on success, negative errno on error.
-pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
-    use crate::uaccess::get_user;
-
+/// The command's value (0 for most)
+pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> KernelResult<i64> {
     // Generic ioctl constants (work on any fd)
     const FIONBIO: u32 = 0x5421; // Set/clear non-blocking mode
     const FIOASYNC: u32 = 0x5452; // Enable async I/O notification
@@ -463,60 +445,46 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
     const FIONCLEX: u32 = 0x5450; // Clear close-on-exec flag
     use crate::fs::file::FIONREAD;
 
-    // Get file from fd
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f.clone(),
-        None => return KernelError::BadFd.sysret(),
-    };
+    let file = fget(fd)?;
 
     // Handle generic ioctls first (work on any fd type)
     match cmd {
         FIONBIO => {
             // Set/clear non-blocking mode
             if arg == 0 {
-                return KernelError::BadAddress.sysret();
+                return Err(KernelError::BadAddress);
             }
-            let enable: i32 = match get_user::<Uaccess, i32>(arg) {
-                Ok(v) => v,
-                Err(_) => return KernelError::BadAddress.sysret(),
-            };
+            let enable = UserPtr::<i32>::new(arg).read()?;
             let current_flags = file.get_flags();
             if enable != 0 {
                 file.set_status_flags(current_flags | crate::fs::flags::O_NONBLOCK);
             } else {
                 file.set_status_flags(current_flags & !crate::fs::flags::O_NONBLOCK);
             }
-            return 0;
+            return Ok(0);
         }
         // Linux ioctl_fioasync: a change of O_ASYNC goes through
         // ->fasync, ENOTTY without one
         FIOASYNC => {
-            let on: i32 = match get_user::<Uaccess, i32>(arg) {
-                Ok(v) => v,
-                Err(_) => return KernelError::BadAddress.sysret(),
-            };
-            let on = on != 0;
+            let on = UserPtr::<i32>::new(arg).read()? != 0;
             let async_now = file.get_flags() & crate::fs::flags::O_ASYNC != 0;
             if on == async_now {
-                return 0;
+                return Ok(0);
             }
-            return match file.fasync(fd, on) {
-                Some(Ok(())) => 0,
-                Some(Err(e)) => e.sysret(),
-                None => KernelError::NotTty.sysret(),
-            };
+            file.fasync(fd, on).ok_or(KernelError::NotTty)??;
+            return Ok(0);
         }
         FIOCLEX => {
             // Set close-on-exec flag
             current_fd_table()
                 .lock()
                 .set_fd_flags(fd, crate::task::FD_CLOEXEC);
-            return 0;
+            return Ok(0);
         }
         FIONCLEX => {
             // Clear close-on-exec flag
             current_fd_table().lock().set_fd_flags(fd, 0);
-            return 0;
+            return Ok(0);
         }
         // A regular file: size - position (Linux do_vfs_ioctl); the
         // rest is the file's own (pipes, sockets, ttys, inotify), ENOTTY
@@ -524,10 +492,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
         FIONREAD => {
             if let Some(i) = file.get_inode().filter(|i| i.mode().is_file()) {
                 let n = i.get_size() as i64 - file.get_pos() as i64;
-                return match crate::fs::file::put_fionread(arg, n) {
-                    Ok(v) => v,
-                    Err(e) => e.sysret(),
-                };
+                return crate::fs::file::put_fionread(arg, n);
             }
         }
         _ => {} // Fall through to device-specific handling
@@ -535,10 +500,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
 
     // Everything else is the file's own (Linux vfs_ioctl ->
     // f_op->unlocked_ioctl): devices, sockets, ...
-    match file.ops().ioctl(&file, cmd, arg) {
-        Ok(v) => v,
-        Err(e) => e.sysret(),
-    }
+    file.ops().ioctl(&file, cmd, arg)
 }
 
 // =============================================================================
@@ -557,47 +519,83 @@ pub const XATTR_SIZE_MAX: usize = 65536;
 /// Largest listxattr buffer (Linux XATTR_LIST_MAX)
 pub const XATTR_LIST_MAX: usize = 65536;
 
-/// Helper to convert KernelError to errno for xattr operations
-fn xattr_error_to_errno(e: KernelError) -> i64 {
+/// errno of a failed xattr inode op: the ones a caller can act on as
+/// they are, EACCES as EPERM, anything else EINVAL
+fn xattr_err(e: KernelError) -> KernelError {
     match e {
-        KernelError::NotFound => KernelError::NotFound.sysret(),
-        KernelError::NoData => KernelError::NoData.sysret(),
-        KernelError::AlreadyExists => KernelError::AlreadyExists.sysret(),
-        KernelError::Range => KernelError::Range.sysret(),
-        KernelError::OperationNotSupported => KernelError::OperationNotSupported.sysret(),
-        KernelError::PermissionDenied => KernelError::NotPermitted.sysret(),
-        KernelError::Io => KernelError::Io.sysret(),
+        KernelError::NotFound
+        | KernelError::NoData
+        | KernelError::AlreadyExists
+        | KernelError::Range
+        | KernelError::OperationNotSupported
+        | KernelError::Io => e,
+        KernelError::PermissionDenied => KernelError::NotPermitted,
         // A file system out of xattr space or memory (Linux: ENOSPC,
         // ENOMEM from the handler)
-        KernelError::NoSpace | KernelError::OutOfMemory => e.sysret(),
-        _ => KernelError::InvalidArgument.sysret(),
+        KernelError::NoSpace | KernelError::OutOfMemory => e,
+        _ => KernelError::InvalidArgument,
+    }
+}
+
+/// An xattr name: any copy failure is EFAULT, an empty or too long
+/// name ERANGE (BUGS.md: Linux import_xattr_name)
+fn xattr_name(ptr: UserPtr<u8>) -> KernelResult<String> {
+    let name = strncpy_from_user_str::<Uaccess>(ptr.addr(), XATTR_NAME_MAX + 1)
+        .map_err(|_| KernelError::BadAddress)?;
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return Err(KernelError::Range);
+    }
+    Ok(name)
+}
+
+/// Lookup flags of the path xattr calls (the l* ones do not follow)
+fn xattr_lookup(follow: bool) -> LookupFlags {
+    LookupFlags {
+        follow,
+        ..LookupFlags::open()
     }
 }
 
 /// Copy xattr value from user space
-fn copy_xattr_value_from_user(value_ptr: u64, size: u64) -> Result<alloc::vec::Vec<u8>, i64> {
+fn copy_xattr_value_from_user(value_ptr: UserPtr<u8>, size: u64) -> KernelResult<Vec<u8>> {
     use crate::uaccess::copy_from_user;
 
     // Linux setxattr_copy: E2BIG
     if size > XATTR_SIZE_MAX as u64 {
-        return Err(KernelError::ArgListTooLong.sysret());
+        return Err(KernelError::ArgListTooLong);
     }
 
     if size == 0 {
-        return Ok(alloc::vec::Vec::new());
+        return Ok(Vec::new());
     }
 
-    // Validate user buffer
-    if !Uaccess::access_ok(value_ptr, size as usize) {
-        return Err(KernelError::BadAddress.sysret());
+    // Validate user buffer (EFAULT before ENOMEM)
+    if !Uaccess::access_ok(value_ptr.addr(), size as usize) {
+        return Err(KernelError::BadAddress);
     }
 
     // Allocate (ENOMEM, Linux kvmalloc) and copy value from user space
-    let mut value = crate::util::kmem::try_vec(size as usize, 0u8).map_err(|e| e.sysret())?;
-    if copy_from_user::<Uaccess>(&mut value, value_ptr, size as usize).is_err() {
-        return Err(KernelError::BadAddress.sysret());
-    }
+    let mut value = crate::util::kmem::try_vec(size as usize, 0u8)?;
+    copy_from_user::<Uaccess>(&mut value, value_ptr.addr(), size as usize)?;
     Ok(value)
+}
+
+/// Linux vfs_setxattr, write access already held: the permission
+/// check, then the file system's op
+fn setxattr_inode(inode: &Arc<Inode>, name: &str, value: &[u8], flags: i32) -> KernelResult<()> {
+    super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
+    inode
+        .i_op
+        .setxattr(inode, name, value, flags as u32)
+        .map_err(xattr_err)
+}
+
+/// XATTR_CREATE / XATTR_REPLACE only
+fn xattr_flags_ok(flags: i32) -> KernelResult<()> {
+    if flags as u32 & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(())
 }
 
 /// sys_setxattr - set an extended attribute value
@@ -608,145 +606,96 @@ fn copy_xattr_value_from_user(value_ptr: u64, size: u64) -> Result<alloc::vec::V
 /// * `value_ptr` - User pointer to attribute value
 /// * `size` - Size of the value
 /// * `flags` - XATTR_CREATE or XATTR_REPLACE
-///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_setxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64, flags: i32) -> i64 {
+pub fn sys_setxattr(
+    path_ptr: UserPtr<u8>,
+    name_ptr: UserPtr<u8>,
+    value_ptr: UserPtr<u8>,
+    size: u64,
+    flags: i32,
+) -> KernelResult<()> {
     do_setxattr(path_ptr, name_ptr, value_ptr, size, flags, true)
 }
 
 /// sys_lsetxattr - set an extended attribute value (don't follow symlinks)
-pub fn sys_lsetxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64, flags: i32) -> i64 {
+pub fn sys_lsetxattr(
+    path_ptr: UserPtr<u8>,
+    name_ptr: UserPtr<u8>,
+    value_ptr: UserPtr<u8>,
+    size: u64,
+    flags: i32,
+) -> KernelResult<()> {
     do_setxattr(path_ptr, name_ptr, value_ptr, size, flags, false)
 }
 
 /// Internal helper for setxattr/lsetxattr
 fn do_setxattr(
-    path_ptr: u64,
-    name_ptr: u64,
-    value_ptr: u64,
+    path_ptr: UserPtr<u8>,
+    name_ptr: UserPtr<u8>,
+    value_ptr: UserPtr<u8>,
     size: u64,
     flags: i32,
-    follow_symlinks: bool,
-) -> i64 {
-    // Validate flags
-    if flags as u32 & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Copy path from user
-    let path = match crate::fs::namei::getname(path_ptr, false) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
-
-    // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate name length
-    if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return KernelError::Range.sysret();
-    }
-
-    // Copy value from user
-    let value = match copy_xattr_value_from_user(value_ptr, size) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    // Lookup path
-    let lookup_flags = if follow_symlinks {
-        LookupFlags::open()
-    } else {
-        LookupFlags {
-            follow: false,
-            ..LookupFlags::open()
-        }
-    };
-
-    let fpath = match crate::fs::namei::path_lookupat(
+    follow: bool,
+) -> KernelResult<()> {
+    xattr_flags_ok(flags)?;
+    let path = crate::fs::namei::getname(path_ptr, false)?;
+    let name = xattr_name(name_ptr)?;
+    let value = copy_xattr_value_from_user(value_ptr, size)?;
+    let fpath = crate::fs::namei::path_lookupat(
         crate::task::percpu::current_cwd(),
         &path,
-        lookup_flags,
-    ) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
-    let dentry = fpath.dentry.clone();
-
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
+        xattr_lookup(follow),
+    )?;
+    let inode = fpath.dentry.get_inode().ok_or(KernelError::NotFound)?;
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match fpath.mnt.want_write() {
-        Ok(w) => w,
-        Err(e) => return e.sysret(),
-    };
-    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
-        return e.sysret();
-    }
-
-    // Call inode operation
-    match inode.i_op.setxattr(&inode, &name, &value, flags as u32) {
-        Ok(()) => 0,
-        Err(e) => xattr_error_to_errno(e),
-    }
+    let _w = fpath.mnt.want_write()?;
+    setxattr_inode(&inode, &name, &value, flags)
 }
 
 /// sys_fsetxattr - set an extended attribute value on a file descriptor
-pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i32) -> i64 {
-    // Validate flags
-    if flags as u32 & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate name length
-    if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return KernelError::Range.sysret();
-    }
-
-    // Copy value from user
-    let value = match copy_xattr_value_from_user(value_ptr, size) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
-    };
-
+pub fn sys_fsetxattr(
+    fd: i32,
+    name_ptr: UserPtr<u8>,
+    value_ptr: UserPtr<u8>,
+    size: u64,
+    flags: i32,
+) -> KernelResult<()> {
+    xattr_flags_ok(flags)?;
+    let file = fget(fd)?;
+    let name = xattr_name(name_ptr)?;
+    let value = copy_xattr_value_from_user(value_ptr, size)?;
+    let inode = file.get_inode().ok_or(KernelError::BadFd)?;
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match file.want_write() {
-        Ok(w) => w,
-        Err(e) => return e.sysret(),
-    };
-    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
-        return e.sysret();
-    }
+    let _w = file.want_write()?;
+    setxattr_inode(&inode, &name, &value, flags)
+}
 
-    // Call inode operation
-    match inode.i_op.setxattr(&inode, &name, &value, flags as u32) {
-        Ok(()) => 0,
-        Err(e) => xattr_error_to_errno(e),
+/// Linux do_getxattr: the permission check, then the value into the
+/// `size`-byte user buffer (size 0: only its length); ERANGE from the
+/// file system when the buffer is too small
+fn getxattr_inode(
+    inode: &Arc<Inode>,
+    name: &str,
+    value_ptr: UserPtr<u8>,
+    size: u64,
+) -> KernelResult<usize> {
+    super::dac::xattr_permission(inode, name, super::dac::MAY_READ)?;
+    if size == 0 {
+        return inode.i_op.getxattr(inode, name, &mut []).map_err(xattr_err);
     }
+    // A larger buffer is clamped (Linux do_getxattr): no value is longer
+    let size = size.min(XATTR_SIZE_MAX as u64) as usize;
+    // EFAULT before ENOMEM
+    if !Uaccess::access_ok(value_ptr.addr(), size) {
+        return Err(KernelError::BadAddress);
+    }
+    // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
+    let mut value = crate::util::kmem::try_vec(size, 0u8)?;
+    let n = inode
+        .i_op
+        .getxattr(inode, name, &mut value)
+        .map_err(xattr_err)?;
+    copy_to_user::<Uaccess>(value_ptr.addr(), &value[..n])?;
+    Ok(n)
 }
 
 /// sys_getxattr - get an extended attribute value
@@ -758,163 +707,69 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
 /// * `size` - Size of the buffer (0 to query size needed)
 ///
 /// # Returns
-/// Size of attribute value on success, negative errno on error
-pub fn sys_getxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
+/// Size of attribute value
+pub fn sys_getxattr(
+    path_ptr: UserPtr<u8>,
+    name_ptr: UserPtr<u8>,
+    value_ptr: UserPtr<u8>,
+    size: u64,
+) -> KernelResult<usize> {
     do_getxattr(path_ptr, name_ptr, value_ptr, size, true)
 }
 
 /// sys_lgetxattr - get an extended attribute value (don't follow symlinks)
-pub fn sys_lgetxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
+pub fn sys_lgetxattr(
+    path_ptr: UserPtr<u8>,
+    name_ptr: UserPtr<u8>,
+    value_ptr: UserPtr<u8>,
+    size: u64,
+) -> KernelResult<usize> {
     do_getxattr(path_ptr, name_ptr, value_ptr, size, false)
 }
 
 /// Internal helper for getxattr/lgetxattr
 fn do_getxattr(
-    path_ptr: u64,
-    name_ptr: u64,
-    value_ptr: u64,
+    path_ptr: UserPtr<u8>,
+    name_ptr: UserPtr<u8>,
+    value_ptr: UserPtr<u8>,
     size: u64,
-    follow_symlinks: bool,
-) -> i64 {
-    // Copy path from user
-    let path = match crate::fs::namei::getname(path_ptr, false) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
-
-    // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate name length
-    if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return KernelError::Range.sysret();
-    }
-
-    // Lookup path
-    let lookup_flags = if follow_symlinks {
-        LookupFlags::open()
-    } else {
-        LookupFlags {
-            follow: false,
-            ..LookupFlags::open()
-        }
-    };
-
-    let dentry = match lookup_path_flags(&path, lookup_flags) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_READ) {
-        return e.sysret();
-    }
-
-    // If size is 0, query the size needed
-    if size == 0 {
-        let mut empty_buf: [u8; 0] = [];
-        match inode.i_op.getxattr(&inode, &name, &mut empty_buf) {
-            Ok(attr_size) => return attr_size as i64,
-            Err(e) => return xattr_error_to_errno(e),
-        }
-    }
-
-    // A larger buffer is clamped (Linux do_getxattr): no value is longer
-    let size = size.min(XATTR_SIZE_MAX as u64);
-
-    // Validate user buffer
-    if !Uaccess::access_ok(value_ptr, size as usize) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
-    let mut value = match crate::util::kmem::try_vec(size as usize, 0u8) {
-        Ok(v) => v,
-        Err(e) => return e.sysret(),
-    };
-
-    // Get the attribute
-    match inode.i_op.getxattr(&inode, &name, &mut value) {
-        Ok(attr_size) => {
-            // Copy to user
-            if copy_to_user::<Uaccess>(value_ptr, &value[..attr_size]).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            attr_size as i64
-        }
-        Err(e) => xattr_error_to_errno(e),
-    }
+    follow: bool,
+) -> KernelResult<usize> {
+    let path = crate::fs::namei::getname(path_ptr, false)?;
+    let name = xattr_name(name_ptr)?;
+    let dentry = lookup_path_flags(&path, xattr_lookup(follow))?;
+    let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
+    getxattr_inode(&inode, &name, value_ptr, size)
 }
 
 /// sys_fgetxattr - get an extended attribute value from a file descriptor
-pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
-    // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
+pub fn sys_fgetxattr(
+    fd: i32,
+    name_ptr: UserPtr<u8>,
+    value_ptr: UserPtr<u8>,
+    size: u64,
+) -> KernelResult<usize> {
+    let file = fget(fd)?;
+    let name = xattr_name(name_ptr)?;
+    let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+    getxattr_inode(&inode, &name, value_ptr, size)
+}
 
-    // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate name length
-    if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return KernelError::Range.sysret();
-    }
-
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_READ) {
-        return e.sysret();
-    }
-
-    // If size is 0, query the size needed
+/// Linux listxattr: the NUL-separated names into the `size`-byte user
+/// buffer (size 0: only their length)
+fn listxattr_inode(inode: &Arc<Inode>, list_ptr: UserPtr<u8>, size: u64) -> KernelResult<usize> {
     if size == 0 {
-        let mut empty_buf: [u8; 0] = [];
-        match inode.i_op.getxattr(&inode, &name, &mut empty_buf) {
-            Ok(attr_size) => return attr_size as i64,
-            Err(e) => return xattr_error_to_errno(e),
-        }
+        return inode.i_op.listxattr(inode, &mut []).map_err(xattr_err);
     }
-
-    // A larger buffer is clamped (Linux do_getxattr): no value is longer
-    let size = size.min(XATTR_SIZE_MAX as u64);
-
-    // Validate user buffer
-    if !Uaccess::access_ok(value_ptr, size as usize) {
-        return KernelError::BadAddress.sysret();
+    // EFAULT before ENOMEM
+    if !Uaccess::access_ok(list_ptr.addr(), size as usize) {
+        return Err(KernelError::BadAddress);
     }
-
-    // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
-    let mut value = match crate::util::kmem::try_vec(size as usize, 0u8) {
-        Ok(v) => v,
-        Err(e) => return e.sysret(),
-    };
-
-    // Get the attribute
-    match inode.i_op.getxattr(&inode, &name, &mut value) {
-        Ok(attr_size) => {
-            // Copy to user
-            if copy_to_user::<Uaccess>(value_ptr, &value[..attr_size]).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            attr_size as i64
-        }
-        Err(e) => xattr_error_to_errno(e),
-    }
+    // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer
+    let mut list = crate::util::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8)?;
+    let n = inode.i_op.listxattr(inode, &mut list).map_err(xattr_err)?;
+    copy_to_user::<Uaccess>(list_ptr.addr(), &list[..n])?;
+    Ok(n)
 }
 
 /// sys_listxattr - list extended attribute names
@@ -925,121 +780,47 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
 /// * `size` - Size of the buffer (0 to query size needed)
 ///
 /// # Returns
-/// Total size of attribute names on success, negative errno on error
-pub fn sys_listxattr(path_ptr: u64, list_ptr: u64, size: u64) -> i64 {
+/// Total size of attribute names
+pub fn sys_listxattr(
+    path_ptr: UserPtr<u8>,
+    list_ptr: UserPtr<u8>,
+    size: u64,
+) -> KernelResult<usize> {
     do_listxattr(path_ptr, list_ptr, size, true)
 }
 
 /// sys_llistxattr - list extended attribute names (don't follow symlinks)
-pub fn sys_llistxattr(path_ptr: u64, list_ptr: u64, size: u64) -> i64 {
+pub fn sys_llistxattr(
+    path_ptr: UserPtr<u8>,
+    list_ptr: UserPtr<u8>,
+    size: u64,
+) -> KernelResult<usize> {
     do_listxattr(path_ptr, list_ptr, size, false)
 }
 
 /// Internal helper for listxattr/llistxattr
-fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) -> i64 {
-    // Copy path from user
-    let path = match crate::fs::namei::getname(path_ptr, false) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
-
-    // Lookup path
-    let lookup_flags = if follow_symlinks {
-        LookupFlags::open()
-    } else {
-        LookupFlags {
-            follow: false,
-            ..LookupFlags::open()
-        }
-    };
-
-    let dentry = match lookup_path_flags(&path, lookup_flags) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // If size is 0, query the size needed
-    if size == 0 {
-        let mut empty_buf: [u8; 0] = [];
-        match inode.i_op.listxattr(&inode, &mut empty_buf) {
-            Ok(list_size) => return list_size as i64,
-            Err(e) => return xattr_error_to_errno(e),
-        }
-    }
-
-    // Validate user buffer
-    if !Uaccess::access_ok(list_ptr, size as usize) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer
-    let mut list = match crate::util::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8) {
-        Ok(l) => l,
-        Err(e) => return e.sysret(),
-    };
-
-    // Get the list
-    match inode.i_op.listxattr(&inode, &mut list) {
-        Ok(list_size) => {
-            // Copy to user
-            if copy_to_user::<Uaccess>(list_ptr, &list[..list_size]).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            list_size as i64
-        }
-        Err(e) => xattr_error_to_errno(e),
-    }
+fn do_listxattr(
+    path_ptr: UserPtr<u8>,
+    list_ptr: UserPtr<u8>,
+    size: u64,
+    follow: bool,
+) -> KernelResult<usize> {
+    let path = crate::fs::namei::getname(path_ptr, false)?;
+    let dentry = lookup_path_flags(&path, xattr_lookup(follow))?;
+    let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
+    listxattr_inode(&inode, list_ptr, size)
 }
 
 /// sys_flistxattr - list extended attribute names from a file descriptor
-pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
-    // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
+pub fn sys_flistxattr(fd: i32, list_ptr: UserPtr<u8>, size: u64) -> KernelResult<usize> {
+    let inode = fget(fd)?.get_inode().ok_or(KernelError::BadFd)?;
+    listxattr_inode(&inode, list_ptr, size)
+}
 
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // If size is 0, query the size needed
-    if size == 0 {
-        let mut empty_buf: [u8; 0] = [];
-        match inode.i_op.listxattr(&inode, &mut empty_buf) {
-            Ok(list_size) => return list_size as i64,
-            Err(e) => return xattr_error_to_errno(e),
-        }
-    }
-
-    // Validate user buffer
-    if !Uaccess::access_ok(list_ptr, size as usize) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer
-    let mut list = match crate::util::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8) {
-        Ok(l) => l,
-        Err(e) => return e.sysret(),
-    };
-
-    // Get the list
-    match inode.i_op.listxattr(&inode, &mut list) {
-        Ok(list_size) => {
-            // Copy to user
-            if copy_to_user::<Uaccess>(list_ptr, &list[..list_size]).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            list_size as i64
-        }
-        Err(e) => xattr_error_to_errno(e),
-    }
+/// Linux vfs_removexattr, write access already held
+fn removexattr_inode(inode: &Arc<Inode>, name: &str) -> KernelResult<()> {
+    super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
+    inode.i_op.removexattr(inode, name).map_err(xattr_err)
 }
 
 /// sys_removexattr - remove an extended attribute
@@ -1047,116 +828,38 @@ pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
 /// # Arguments
 /// * `path_ptr` - User pointer to path string
 /// * `name_ptr` - User pointer to attribute name string
-///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_removexattr(path_ptr: u64, name_ptr: u64) -> i64 {
+pub fn sys_removexattr(path_ptr: UserPtr<u8>, name_ptr: UserPtr<u8>) -> KernelResult<()> {
     do_removexattr(path_ptr, name_ptr, true)
 }
 
 /// sys_lremovexattr - remove an extended attribute (don't follow symlinks)
-pub fn sys_lremovexattr(path_ptr: u64, name_ptr: u64) -> i64 {
+pub fn sys_lremovexattr(path_ptr: UserPtr<u8>, name_ptr: UserPtr<u8>) -> KernelResult<()> {
     do_removexattr(path_ptr, name_ptr, false)
 }
 
 /// Internal helper for removexattr/lremovexattr
-fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
-    // Copy path from user
-    let path = match crate::fs::namei::getname(path_ptr, false) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
-
-    // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate name length
-    if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return KernelError::Range.sysret();
-    }
-
-    // Lookup path
-    let lookup_flags = if follow_symlinks {
-        LookupFlags::open()
-    } else {
-        LookupFlags {
-            follow: false,
-            ..LookupFlags::open()
-        }
-    };
-
-    let fpath = match crate::fs::namei::path_lookupat(
+fn do_removexattr(path_ptr: UserPtr<u8>, name_ptr: UserPtr<u8>, follow: bool) -> KernelResult<()> {
+    let path = crate::fs::namei::getname(path_ptr, false)?;
+    let name = xattr_name(name_ptr)?;
+    let fpath = crate::fs::namei::path_lookupat(
         crate::task::percpu::current_cwd(),
         &path,
-        lookup_flags,
-    ) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
-    let dentry = fpath.dentry.clone();
-
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
+        xattr_lookup(follow),
+    )?;
+    let inode = fpath.dentry.get_inode().ok_or(KernelError::NotFound)?;
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match fpath.mnt.want_write() {
-        Ok(w) => w,
-        Err(e) => return e.sysret(),
-    };
-    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
-        return e.sysret();
-    }
-
-    // Call inode operation
-    match inode.i_op.removexattr(&inode, &name) {
-        Ok(()) => 0,
-        Err(e) => xattr_error_to_errno(e),
-    }
+    let _w = fpath.mnt.want_write()?;
+    removexattr_inode(&inode, &name)
 }
 
 /// sys_fremovexattr - remove an extended attribute from a file descriptor
-pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
-    // Get file from fd table
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Copy attribute name from user
-    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
-        Ok(n) => n,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate name length
-    if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return KernelError::Range.sysret();
-    }
-
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
-    };
-
+pub fn sys_fremovexattr(fd: i32, name_ptr: UserPtr<u8>) -> KernelResult<()> {
+    let file = fget(fd)?;
+    let name = xattr_name(name_ptr)?;
+    let inode = file.get_inode().ok_or(KernelError::BadFd)?;
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match file.want_write() {
-        Ok(w) => w,
-        Err(e) => return e.sysret(),
-    };
-    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
-        return e.sysret();
-    }
-
-    // Call inode operation
-    match inode.i_op.removexattr(&inode, &name) {
-        Ok(()) => 0,
-        Err(e) => xattr_error_to_errno(e),
-    }
+    let _w = file.want_write()?;
+    removexattr_inode(&inode, &name)
 }
 
 // =============================================================================
@@ -1197,29 +900,19 @@ pub mod falloc_mode {
 /// * `offset` - Starting offset in file
 /// * `len` - Length of region to manipulate
 ///
-/// # Returns
-/// 0 on success, negative errno on error:
+/// # Errors
 /// * -EBADF: fd is not a valid file descriptor or not open for writing
 /// * -EINVAL: Invalid mode, offset, or len
 /// * -ENODEV: fd does not refer to a regular file
 /// * -ESPIPE: fd refers to a pipe or socket
 /// * -ENOSPC: Not enough space on device
 /// * -EOPNOTSUPP: Filesystem does not support this operation
-pub fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i64 {
-    match do_fallocate(fd, mode, offset, len) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
-}
-
+///
 /// Linux ksys_fallocate + vfs_fallocate: the argument and file checks in
 /// Linux's order, then the filesystem's op under i_rwsem
-fn do_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> Result<(), KernelError> {
+pub fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> KernelResult<()> {
     use falloc_mode::*;
-    let file = current_fd_table()
-        .lock()
-        .get(fd)
-        .ok_or(KernelError::BadFd)?;
+    let file = fget(fd)?;
     if offset < 0 || len <= 0 {
         return Err(KernelError::InvalidArgument);
     }

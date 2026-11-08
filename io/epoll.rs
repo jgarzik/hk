@@ -39,14 +39,15 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
+use crate::fs::io::fget;
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::waitqueue::{WaitEntry, WaitQueue};
 use crate::task::Fd;
-use crate::task::fdtable::get_task_fd;
-use crate::task::percpu::{WakeMode, current_tid};
+use crate::task::percpu::WakeMode;
 use crate::time::Deadline;
-use crate::uaccess::{UaccessArch, get_user, put_user};
+use crate::uaccess::{UaccessArch, UserPtr};
+use crate::util::error::KernelResult;
 use crate::util::list::{ArcList, Link};
 
 /// epoll_ctl operations
@@ -727,70 +728,42 @@ pub fn get_eventpoll(file: &File) -> Option<Arc<Eventpoll>> {
 // ============================================================================
 
 /// sys_epoll_create(size): size is ignored but must be positive
-pub fn sys_epoll_create(size: i32) -> i64 {
+pub fn sys_epoll_create(size: i32) -> KernelResult<i32> {
     if size <= 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     sys_epoll_create1(0)
 }
 
-fn get_nofile_limit() -> u64 {
-    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-    if limit == crate::task::rlimit::RLIM_INFINITY {
-        u64::MAX
-    } else {
-        limit
-    }
-}
-
 /// sys_epoll_create1(flags): EPOLL_CLOEXEC or 0
-pub fn sys_epoll_create1(eflags: i32) -> i64 {
+pub fn sys_epoll_create1(eflags: i32) -> KernelResult<i32> {
     if eflags & !EPOLL_CLOEXEC != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    let file = match create_epoll_file(eflags) {
-        Ok(f) => f,
-        Err(_) => return KernelError::OutOfMemory.sysret(),
-    };
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::OutOfMemory.sysret(),
-    };
-    let mut table = fd_table.lock();
+    let file = create_epoll_file(eflags)?;
     let fd_flags = if eflags & EPOLL_CLOEXEC != 0 {
         FD_CLOEXEC
     } else {
         0
     };
-    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
-        Ok(fd) => i64::from(fd),
-        Err(e) => -i64::from(e),
-    }
+    crate::fs::io::fd_install(file, fd_flags)
 }
 
 /// sys_epoll_ctl(epfd, op, fd, event) (Linux do_epoll_ctl)
-pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> i64 {
-    match epoll_ctl(epfd, op, fd, event_ptr) {
-        Ok(()) => 0,
-        Err(e) => e.sysret(),
-    }
-}
-
-fn epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> Result<(), KernelError> {
+pub fn sys_epoll_ctl(
+    epfd: i32,
+    op: i32,
+    fd: i32,
+    event_ptr: UserPtr<EpollEvent>,
+) -> KernelResult<()> {
     // The event is read first (Linux copy_from_user before fdget)
     let mut ev = if op != EPOLL_CTL_DEL {
-        get_user::<Uaccess, EpollEvent>(event_ptr).map_err(|_| KernelError::BadAddress)?
+        event_ptr.read()?
     } else {
         EpollEvent::default()
     };
-    let (ep_file, tf) = {
-        let table = get_task_fd(current_tid()).ok_or(KernelError::BadFd)?;
-        let t = table.lock();
-        (
-            t.get(epfd).ok_or(KernelError::BadFd)?,
-            t.get(fd).ok_or(KernelError::BadFd)?,
-        )
-    };
+    let ep_file = fget(epfd)?;
+    let tf = fget(fd)?;
     // The target must poll, before the epoll checks (Linux do_epoll_ctl)
     if !tf.f_op.can_poll(&tf) {
         return Err(KernelError::NotPermitted);
@@ -836,8 +809,13 @@ fn epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> Result<(), KernelEr
 }
 
 /// sys_epoll_wait(epfd, events, maxevents, timeout)
-pub fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout: i32) -> i64 {
-    sys_epoll_pwait(epfd, events_ptr, maxevents, timeout, 0, 0)
+pub fn sys_epoll_wait(
+    epfd: i32,
+    events_ptr: UserPtr<EpollEvent>,
+    maxevents: i32,
+    timeout: i32,
+) -> KernelResult<usize> {
+    sys_epoll_pwait(epfd, events_ptr, maxevents, timeout, UserPtr::new(0), 0)
 }
 
 /// sys_epoll_pwait: `sigmask` (if not null) is the blocked mask during
@@ -845,32 +823,27 @@ pub fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout: i32) 
 /// (Linux do_epoll_pwait)
 pub fn sys_epoll_pwait(
     epfd: i32,
-    events_ptr: u64,
+    events_ptr: UserPtr<EpollEvent>,
     maxevents: i32,
     timeout: i32,
-    sigmask: u64,
+    sigmask: UserPtr<u64>,
     sigsetsize: u64,
-) -> i64 {
+) -> KernelResult<usize> {
     let deadline = crate::time::deadline_ms(timeout);
     do_epoll_pwait(epfd, events_ptr, maxevents, deadline, sigmask, sigsetsize)
 }
 
 fn do_epoll_pwait(
     epfd: i32,
-    events_ptr: u64,
+    events_ptr: UserPtr<EpollEvent>,
     maxevents: i32,
     deadline: Deadline,
-    sigmask: u64,
+    sigmask: UserPtr<u64>,
     sigsetsize: u64,
-) -> i64 {
-    if let Err(e) = crate::signal::set_user_sigmask(sigmask, sigsetsize) {
-        return e.sysret();
-    }
-    let r = match do_epoll_wait(epfd, events_ptr, maxevents, deadline) {
-        Ok(n) => n as i64,
-        Err(e) => e.sysret(),
-    };
-    crate::signal::restore_saved_sigmask_unless(r == KernelError::Interrupted.sysret());
+) -> KernelResult<usize> {
+    crate::signal::set_user_sigmask(sigmask.addr(), sigsetsize)?;
+    let r = do_epoll_wait(epfd, events_ptr, maxevents, deadline);
+    crate::signal::restore_saved_sigmask_unless(r == Err(KernelError::Interrupted));
     r
 }
 
@@ -878,26 +851,22 @@ fn do_epoll_pwait(
 /// do_epoll_wait / ep_send_events): no kernel buffer of maxevents
 fn do_epoll_wait(
     epfd: i32,
-    events_ptr: u64,
+    events_ptr: UserPtr<EpollEvent>,
     maxevents: i32,
     deadline: Deadline,
-) -> Result<usize, KernelError> {
+) -> KernelResult<usize> {
     let size = core::mem::size_of::<EpollEvent>();
     let max = usize::try_from(maxevents).map_err(|_| KernelError::InvalidArgument)?;
     if max == 0 || max > EP_MAX_EVENTS {
         return Err(KernelError::InvalidArgument);
     }
-    if !Uaccess::access_ok(events_ptr, max * size) {
+    if !Uaccess::access_ok(events_ptr.addr(), max * size) {
         return Err(KernelError::BadAddress);
     }
-    let ep_file = get_task_fd(current_tid())
-        .ok_or(KernelError::BadFd)?
-        .lock()
-        .get(epfd)
-        .ok_or(KernelError::BadFd)?;
+    let ep_file = fget(epfd)?;
     let ep = get_eventpoll(&ep_file).ok_or(KernelError::InvalidArgument)?;
     ep.wait(max, deadline, |i, ev| {
-        put_user::<Uaccess, EpollEvent>(events_ptr + (i * size) as u64, ev).is_ok()
+        events_ptr.offset(i).is_some_and(|p| p.write(&ev).is_ok())
     })
 }
 
@@ -905,24 +874,17 @@ fn do_epoll_wait(
 /// (NULL waits forever; ns precision, Linux ep_timeout_to_timespec)
 pub fn sys_epoll_pwait2(
     epfd: i32,
-    events_ptr: u64,
+    events_ptr: UserPtr<EpollEvent>,
     maxevents: i32,
-    timeout_ptr: u64,
-    sigmask: u64,
+    timeout_ptr: UserPtr<crate::time::time_syscall::LinuxTimespec>,
+    sigmask: UserPtr<u64>,
     sigsetsize: u64,
-) -> i64 {
-    use crate::time::time_syscall::LinuxTimespec;
-    let deadline = if timeout_ptr == 0 {
+) -> KernelResult<usize> {
+    let deadline = if timeout_ptr.is_null() {
         None
     } else {
-        let ts: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(timeout_ptr) {
-            Ok(ts) => ts,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        };
-        match crate::time::deadline_ts(ts.tv_sec, ts.tv_nsec) {
-            Ok(d) => d,
-            Err(e) => return e.sysret(),
-        }
+        let ts = timeout_ptr.read()?;
+        crate::time::deadline_ts(ts.tv_sec, ts.tv_nsec)?
     };
     do_epoll_pwait(epfd, events_ptr, maxevents, deadline, sigmask, sigsetsize)
 }

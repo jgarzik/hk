@@ -117,12 +117,6 @@ impl RangeSet {
     }
 }
 
-impl Default for RangeSet {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Highest physical address memblock tracks (52 bits: x86-64 and arm64
 /// LPA maximum); firmware values past it are clipped
 pub const PHYS_LIMIT: u64 = 1 << 52;
@@ -270,12 +264,6 @@ impl Memblock {
             (Some(a), Some(b)) => (a.base, b.end),
             _ => (0, 0),
         }
-    }
-}
-
-impl Default for Memblock {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

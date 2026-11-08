@@ -47,11 +47,7 @@ loading); HADL itself waits for the owner's go-ahead.
   `exit_signal`/`pdeath_signal` become `Option<Signal>`; FutexKey
   fields private.
 - M1 non-generic `get_user`/`put_user`/`copy_*` (no `::<Uaccess,`
-  turbofish); `From<UaccessError> for KernelError`; IoremapError and
-  IRQ string errors become KernelError; a `SysRet` trait so `sys_*`
-  return `KernelResult` with `?`; one public `fget` for the open-coded
-  fd lookups; redundant `access_ok` checks dropped; raw errno literals
-  replaced.
+  turbofish); IoremapError and IRQ string errors become KernelError.
 
 ## 4. M2 — arch dedup and the IRQ table
 
@@ -195,10 +191,9 @@ and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
   setns) split into per-command or per-step helpers.
 - S1 O(n²) VMA loops to iterators; sentinels to Option;
   `from_ne_bytes(..try_into().unwrap())` to `pod!`; `current_mm()`;
-  `new_without_default` allowed and the trivial `impl Default` deleted;
-  let-else; stale `allow(dead_code)` removed; struct-update syntax;
-  `then`/`then_some`; one LE/BE byte reader, no slice `unwrap` on
-  device or disk data; `next_multiple_of`; pointer-cast lints.
+  struct-update syntax in user/;
+  one LE/BE byte reader, no slice `unwrap` on
+  device or disk data; pointer-cast lints.
 - S2 `# Arguments`/`# Returns` blocks and `// ====` banners removed;
   history and speculative comments rewritten to the current state;
   `TODO(unsafe)` lines kept.

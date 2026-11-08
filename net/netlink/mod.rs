@@ -133,11 +133,7 @@ impl NlSkb {
             data,
             portid: 0,
             group,
-            creds: Creds {
-                pid: None,
-                uid: 0,
-                gid: 0,
-            },
+            creds: Creds::default(),
         }
     }
 }
@@ -681,23 +677,12 @@ pub fn broadcast(net: &NetNamespace, protocol: i32, skb: NlSkb, exclude: u32) {
 }
 
 /// Bound netlink sockets of a namespace by (protocol, portid)
+#[derive(Default)]
 pub struct NlTable {
     socks: RwLock<BTreeMap<(i32, u32), Weak<NlSock>>>,
 }
 
-impl Default for NlTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NlTable {
-    pub fn new() -> Self {
-        Self {
-            socks: RwLock::new(BTreeMap::new()),
-        }
-    }
-
     /// Bind `s` to `portid`: EBUSY if it is bound already (checked and
     /// published under the write lock), EADDRINUSE if the id is taken
     fn insert(&self, protocol: i32, portid: u32, s: &Arc<NlSock>) -> Result<(), KernelError> {

@@ -46,14 +46,9 @@ fn want(what: &'static [u8], got: i64, want: i64) -> R {
     }
 }
 
-fn zst() -> Stat {
-    // SAFETY: Stat is plain integers
-    unsafe { core::mem::zeroed() }
-}
-
 fn check_empty() -> R {
     let e = b"\0".as_ptr();
-    let mut st = zst();
+    let mut st = Stat::default();
     want(b"stat", sys_stat(e, &mut st), ENOENT)?;
     want(b"chdir", sys_chdir(e), ENOENT)?;
     want(b"mkdir", sys_mkdir(e, 0o755), ENOENT)?;
@@ -109,7 +104,7 @@ fn check_toolong() -> R {
     // PATH_MAX bytes and no NUL among them; then one 256-byte component
     let mut p = [b'a'; 4097];
     p[4096] = 0;
-    let mut st = zst();
+    let mut st = Stat::default();
     want(b"stat", sys_stat(p.as_ptr(), &mut st), ENAMETOOLONG)?;
     want(
         b"open",
@@ -155,7 +150,7 @@ fn trailing() -> R {
 
 fn trailing_ops() -> R {
     let fs = b"/tmp/ts_f/\0".as_ptr();
-    let mut st = zst();
+    let mut st = Stat::default();
     want(b"stat file/", sys_stat(fs, &mut st), ENOTDIR)?;
     want(b"open file/", sys_open(fs, O_RDONLY, 0), ENOTDIR)?;
     want(
@@ -249,7 +244,7 @@ fn dots_ops() -> R {
 /// name, a create, mkdir, symlink or rename to it is found; after an
 /// unlink the name is ENOENT again (Linux negative dentries)
 fn negative() -> R {
-    let mut st = zst();
+    let mut st = Stat::default();
     let p = b"/tmp/nd_x\0".as_ptr();
     let r = (|| {
         want(b"absent", sys_stat(p, &mut st), ENOENT)?;
@@ -309,7 +304,7 @@ fn creat_dangling() -> R {
     if fd >= 0 {
         sys_close(fd as u64);
     }
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let made = sys_stat(target.as_ptr(), &mut st);
     sys_unlink(link.as_ptr());
     sys_unlink(target.as_ptr());

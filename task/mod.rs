@@ -115,7 +115,7 @@ pub mod wait_options {
     pub const P_PIDFD: i32 = 3;
 }
 
-use crate::util::error::KernelError;
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -342,7 +342,7 @@ pub fn commit_creds(new: Arc<Cred>) {
 /// execve's RLIMIT_NPROC check (Linux do_execveat_common): EAGAIN if a
 /// real-uid change flagged the task and it is still over; else the flag
 /// is cleared
-pub fn nproc_exec_check() -> Result<(), i32> {
+pub fn nproc_exec_check() -> KernelResult<()> {
     let tid = percpu::current_tid();
     let uid = current_cred().uid;
     // rlimit() takes TASKLIST: decide before locking it
@@ -352,7 +352,7 @@ pub fn nproc_exec_check() -> Result<(), i32> {
         return Ok(());
     };
     if t.task.has_flag(crate::task::pf::NPROC_EXCEEDED) && over {
-        return Err(11); // EAGAIN
+        return Err(KernelError::WouldBlock);
     }
     t.task.clear_flag(crate::task::pf::NPROC_EXCEEDED);
     Ok(())
@@ -665,7 +665,7 @@ impl<F> FdTable<F> {
     /// would be >= nofile, returns Err(EMFILE). Pass `u64::MAX` to disable limit.
     ///
     /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation.
-    pub fn alloc(&mut self, file: Arc<F>, nofile: u64) -> Result<Fd, i32> {
+    pub fn alloc(&mut self, file: Arc<F>, nofile: u64) -> KernelResult<Fd> {
         self.alloc_at_or_above(file, 0, 0, nofile)
     }
 
@@ -683,7 +683,7 @@ impl<F> FdTable<F> {
 
     /// Make room for `fd` before installing it there (Linux
     /// expand_files): Err(EMFILE) at or past fs.nr_open, Err(ENOMEM)
-    pub fn expand(&mut self, fd: Fd) -> Result<(), i32> {
+    pub fn expand(&mut self, fd: Fd) -> KernelResult<()> {
         self.bits.reserve(fd as usize)
     }
 
@@ -723,7 +723,7 @@ impl<F> FdTable<F> {
     ///
     /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation,
     /// not as a separate pre-check. This avoids TOCTOU races.
-    pub fn alloc_with_flags(&mut self, file: Arc<F>, flags: u32, nofile: u64) -> Result<Fd, i32> {
+    pub fn alloc_with_flags(&mut self, file: Arc<F>, flags: u32, nofile: u64) -> KernelResult<Fd> {
         self.alloc_at_or_above(file, 0, flags, nofile)
     }
 
@@ -739,18 +739,18 @@ impl<F> FdTable<F> {
         file: Arc<F>,
         flags: u32,
         nofile: u64,
-    ) -> Result<(), i32> {
+    ) -> KernelResult<()> {
         // RLIMIT_NOFILE enforcement
         if (fd as u64) >= nofile {
             self.defer(file);
-            return Err(24); // EMFILE - too many open files
+            return Err(KernelError::ProcessFileLimit);
         }
         if fd < 0 || self.files.contains_key(&fd) {
             self.defer(file);
-            return Err(9); // EBADF - fd already in use
+            return Err(KernelError::BadFd); // fd already in use
         }
         if !self.install(fd, file, flags) {
-            return Err(12); // ENOMEM
+            return Err(KernelError::OutOfMemory);
         }
         Ok(())
     }
@@ -769,7 +769,7 @@ impl<F> FdTable<F> {
         min_fd: Fd,
         flags: u32,
         nofile: u64,
-    ) -> Result<Fd, i32> {
+    ) -> KernelResult<Fd> {
         // RLIMIT_NOFILE enforced inside (EMFILE)
         let fd = match self.bits.alloc(min_fd.max(0) as usize, nofile) {
             Ok(fd) => fd as Fd,
@@ -870,12 +870,6 @@ impl<F> FdTable<F> {
     /// Get the number of open file descriptors
     pub fn count(&self) -> usize {
         self.files.len()
-    }
-}
-
-impl<F> Default for FdTable<F> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1264,6 +1258,49 @@ pub struct TaskInner {
     /// JOBCTL_PTRACE_FROZEN): a SIGKILL leaves its ptrace stop alone
     /// until the request ends
     pub ptrace_frozen: bool,
+}
+
+impl TaskInner {
+    /// A task in `state` on page table `pgd`: a leader with no exit
+    /// signal, nothing shared, not traced; each creation path sets the
+    /// rest (struct update)
+    pub fn new(thread_pid: Option<Arc<pid::Pid>>, state: TaskState, pgd: u64) -> Self {
+        Self {
+            thread_pid,
+            pgrp: None,
+            session: None,
+            pids_linked: false,
+            exit_code: 0,
+            exit_signal: 0,
+            parent_exec_id: 0,
+            pdeath_signal: 0,
+            state,
+            pgd,
+            clear_child_tid: 0,
+            set_child_tid: 0,
+            sighand: None,
+            signal: None,
+            sysvsem: None,
+            robust_list: 0,
+            prctl: PrctlState::default(),
+            personality: 0,
+            seccomp_filter: None,
+            #[cfg(target_arch = "x86_64")]
+            iopl_emul: 0,
+            leader: true,
+            ptrace: 0,
+            ptracer: None,
+            real_parent: None,
+            children: crate::util::list::ArcList::new(),
+            in_children: false,
+            threads: crate::util::list::ArcList::new(),
+            ptrace_message: 0,
+            ptrace_options: 0,
+            ptrace_code: 0,
+            last_siginfo: None,
+            ptrace_frozen: false,
+        }
+    }
 }
 
 /// Data owned by the TASKLIST lock: reached through a borrow of the
@@ -2518,12 +2555,6 @@ impl IoContext {
     }
 }
 
-impl Default for IoContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Clone for IoContext {
     fn clone(&self) -> Self {
         Self {
@@ -2678,24 +2709,25 @@ pub fn set_set_child_tid(tid: Tid, addr: u64) {
 /// The cgroup a CLONE_INTO_CGROUP fd names (Linux cgroup_get_from_file):
 /// EBADF for no file or a file that is not a cgroup directory, ENOENT
 /// for a removed one (css_tryget_online_from_dir)
-pub fn cgroup_from_fd(tid: Tid, fd: i32) -> Result<alloc::sync::Arc<crate::cgroup::Cgroup>, i32> {
+pub fn cgroup_from_fd(tid: Tid, fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
     use crate::fs::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
-    const EBADF: i32 = 9;
-    const ENOENT: i32 = 2;
     let file = fdtable::get_task_fd(tid)
         .and_then(|t| t.lock().get(fd))
-        .ok_or(EBADF)?;
+        .ok_or(KernelError::BadFd)?;
     let private = file
         .get_inode()
         .and_then(|i| i.get_private())
-        .ok_or(EBADF)?;
+        .ok_or(KernelError::BadFd)?;
     let wrapper = private
         .as_any()
         .downcast_ref::<CgroupfsInodeWrapper>()
-        .ok_or(EBADF)?;
+        .ok_or(KernelError::BadFd)?;
     let data = wrapper.0.read();
     let CgroupfsInodeData::Directory { cgroup } = &*data else {
-        return Err(EBADF);
+        return Err(KernelError::BadFd);
     };
-    cgroup.upgrade().filter(|c| !c.is_dead()).ok_or(ENOENT)
+    cgroup
+        .upgrade()
+        .filter(|c| !c.is_dead())
+        .ok_or(KernelError::NotFound)
 }

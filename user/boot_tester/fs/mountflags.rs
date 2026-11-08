@@ -353,7 +353,7 @@ fn remount(target: &[u8], flags: u64) -> i64 {
 }
 
 fn st_flags(path: &[u8]) -> i64 {
-    let mut st: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let mut st = LinuxStatFs::default();
     if sys_statfs(path.as_ptr(), &mut st) != 0 {
         return -1;
     }

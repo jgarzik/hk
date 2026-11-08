@@ -64,8 +64,7 @@ fn ramfs(target: &[u8]) -> i64 {
 
 /// st_dev of `p`, or the errno
 fn dev(p: &[u8]) -> Result<u64, i64> {
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     match sys_stat(p.as_ptr(), &mut st) {
         0 => Ok(st.st_dev),
         e => Err(e),
@@ -229,8 +228,7 @@ fn ancestor_mount_ops() -> R {
 
 /// st_dev and st_ino of `p`
 fn id(p: &[u8]) -> Result<(u64, u64), i64> {
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     match sys_stat(p.as_ptr(), &mut st) {
         0 => Ok((st.st_dev, st.st_ino)),
         e => Err(e),
@@ -699,8 +697,7 @@ fn ramfs_mode() -> R {
         0,
         opts.as_ptr() as u64,
     );
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let s = sys_stat(d.as_ptr(), &mut st);
     sys_umount2(d.as_ptr(), 0);
     sys_rmdir(d.as_ptr());
@@ -765,8 +762,7 @@ fn expire_busy() -> R {
         let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
         check(b"used: marked again", r == EAGAIN, r)?;
         // A path lookup is a use too (path_put), not only an open file
-        // SAFETY: Stat is plain integers
-        let mut st: Stat = unsafe { core::mem::zeroed() };
+        let mut st = Stat::default();
         sys_stat(b"/tmp/exb/f\0".as_ptr(), &mut st);
         let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
         check(b"stat: marked again", r == EAGAIN, r)?;

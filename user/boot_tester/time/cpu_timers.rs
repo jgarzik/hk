@@ -26,7 +26,7 @@ use crate::mm::fork_mm::{join, spawn_thread};
 use crate::signal::signals::restorer_addr;
 use core::sync::atomic::{AtomicU32, Ordering};
 use hk_syscall::{
-    ITimerSpec, ITimerVal, SA_RESTORER, SigEvent, Timespec, Timeval, sys_clock_gettime,
+    ITimerSpec, ITimerVal, SA_RESTORER, SigEvent, Timespec, Timeval, Zeroable, sys_clock_gettime,
     sys_clock_nanosleep, sys_exit, sys_fork, sys_getitimer, sys_rt_sigaction, sys_setitimer,
     sys_timer_create, sys_timer_delete, sys_timer_settime, sys_wait4,
 };
@@ -106,8 +106,7 @@ fn spec(value_ms: i64, interval_ms: i64) -> ITimerSpec {
 
 /// A SIGUSR2 timer on `clock`; its id
 fn timer(clock: i32) -> i64 {
-    // SAFETY: plain integers
-    let mut sev: SigEvent = unsafe { core::mem::zeroed() };
+    let mut sev = SigEvent::zeroed();
     sev.sigev_signo = SIGUSR2 as i32;
     sev.sigev_notify = SIGEV_SIGNAL;
     let mut id = -1i32;
@@ -167,8 +166,7 @@ fn tai() {
     if id < 0 {
         return verdict(b"TIMER_CREATE_TAI", false, id);
     }
-    // SAFETY: plain integers
-    let mut tx: Timex = unsafe { core::mem::zeroed() };
+    let mut tx = Timex::default();
     tx.modes = ADJ_TAI;
     tx.constant = 37;
     sys_adjtimex(&mut tx);
@@ -238,8 +236,7 @@ fn itimer_hits(which: i32, sig: u32, clock: i32) -> (u32, i64) {
         },
     };
     sys_setitimer(which, &v, core::ptr::null_mut());
-    // SAFETY: plain integers
-    let mut cur: ITimerVal = unsafe { core::mem::zeroed() };
+    let mut cur = ITimerVal::default();
     sys_getitimer(which, &mut cur);
     let left = cur.it_value.tv_usec;
     burn_until(clock, 1, 2000);

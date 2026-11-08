@@ -5,6 +5,7 @@
 
 use crate::task::Tid;
 use crate::task::percpu::TASKLIST;
+use crate::util::error::{KernelError, KernelResult};
 
 // =============================================================================
 // User register structure (matches Linux struct user_regs_struct)
@@ -87,13 +88,13 @@ pub type UserRegs = UserRegsStruct;
 ///
 /// The tracee must be in Traced state. This reads its user registers
 /// from its pt_regs (the entry frame at the top of its kernel stack).
-pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
+pub fn get_user_regs(tid: Tid) -> KernelResult<UserRegsStruct> {
     let table = TASKLIST.read();
-    let task = table.get(tid).ok_or(-3i32)?; // ESRCH
+    let task = table.get(tid).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
-        return Err(-3); // ESRCH - not stopped
+        return Err(KernelError::NoProcess); // not stopped
     }
 
     // Its pt_regs: the frame at the top of its kernel stack
@@ -137,24 +138,24 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
 ///
 /// The tracee must be in Traced state. This updates its pt_regs so the
 /// registers take effect when it resumes.
-pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
+pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> KernelResult<()> {
     let table = TASKLIST.read();
-    let task = table.get(tid).ok_or(-3i32)?; // ESRCH
+    let task = table.get(tid).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
-        return Err(-3); // ESRCH - not stopped
+        return Err(KernelError::NoProcess); // not stopped
     }
 
     // A non-canonical RIP would fault on the return to user mode in ring
     // 0 (SYSRET with the user stack loaded): refused (EIO). Linux takes
     // it and returns through IRET, which delivers SIGSEGV.
     if regs.rip >= 0x0000_8000_0000_0000 {
-        return Err(-5);
+        return Err(KernelError::Io);
     }
     // Linux putreg: a base at or above TASK_SIZE_MAX is EIO
     if !super::percpu::fs_base_ok(regs.fs_base) || !super::percpu::fs_base_ok(regs.gs_base) {
-        return Err(-5);
+        return Err(KernelError::Io);
     }
 
     // Update its pt_regs with the new register values

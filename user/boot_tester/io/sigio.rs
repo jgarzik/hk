@@ -28,7 +28,7 @@
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
     AF_INET, AF_UNIX, FIOASYNC, O_CREAT, O_NONBLOCK, O_RDWR, SOCK_STREAM, SigInfo, SockAddrIn,
-    htonl, make_ipv4, sys_accept, sys_bind, sys_close, sys_connect, sys_dup, sys_exit,
+    Zeroable, htonl, make_ipv4, sys_accept, sys_bind, sys_close, sys_connect, sys_dup, sys_exit,
     sys_fanotify_init, sys_fcntl, sys_fork, sys_getpid, sys_getsockname, sys_gettid,
     sys_inotify_init1, sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe2, sys_read,
     sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid, sys_setresuid, sys_setsid, sys_socket,
@@ -93,11 +93,6 @@ fn setmask(mask: u64) {
     sys_rt_sigprocmask(SIG_SETMASK, &mask as *const u64 as u64, 0, 8);
 }
 
-fn zeroed() -> SigInfo {
-    // SAFETY: SigInfo is plain integers
-    unsafe { core::mem::zeroed() }
-}
-
 /// sigtimedwait with a timeout in seconds; the signal or -errno
 fn wait_sig(mask: u64, secs: i64, info: &mut SigInfo) -> i64 {
     let ts = [secs, 0i64];
@@ -111,7 +106,7 @@ fn wait_sig(mask: u64, secs: i64, info: &mut SigInfo) -> i64 {
 
 /// `sig` within `secs` seconds: the signal or -errno
 fn take_wait(sig: u32, secs: i64) -> i64 {
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     wait_sig(bit(sig), secs, &mut info)
 }
 
@@ -204,7 +199,7 @@ fn test_setsig_info() {
     arm(p[0]);
     let set = sys_fcntl(p[0], F_SETSIG, SIGRT as u64);
     sys_write(p[1] as u64, b"x".as_ptr(), 1);
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     let got = wait_sig(bit(SIGRT), 2, &mut info);
     let plain = take(SIGIO);
     close2(p);
@@ -272,7 +267,7 @@ fn test_writer() {
     sys_write(p[1] as u64, b"x".as_ptr(), 1);
     let mut b = [0u8; 1];
     sys_read(p[0] as u64, b.as_mut_ptr(), 1);
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     let got = wait_sig(bit(SIGRT), 2, &mut info);
     close2(p);
     setmask(old);
@@ -321,7 +316,7 @@ fn test_close() {
     let d = sys_dup(p[0]);
     sys_close(p[0] as u64);
     sys_write(p[1] as u64, b"x".as_ptr(), 1);
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     let got = wait_sig(bit(SIGRT), 0, &mut info);
     sys_close(d as u64);
     sys_write(p[1] as u64, b"x".as_ptr(), 1);
@@ -482,7 +477,7 @@ fn test_sock_out() {
         }
     }
     while sys_read(sv[1] as u64, buf.as_mut_ptr(), buf.len() as u64) > 0 {}
-    let mut info = zeroed();
+    let mut info = SigInfo::zeroed();
     let got = wait_sig(bit(SIGRT), 2, &mut info);
     drain_sig(SIGRT);
     sys_close(sv[0] as u64);
@@ -511,7 +506,7 @@ fn test_sock_out() {
 /// Wait up to 2 s for SIGRT with `code` from `fd`
 fn wait_from(fd: i32, code: i32) -> bool {
     for _ in 0..8 {
-        let mut info = zeroed();
+        let mut info = SigInfo::zeroed();
         let ts = [0i64, 250_000_000];
         let m = bit(SIGRT);
         let r = sys_rt_sigtimedwait(
@@ -551,7 +546,7 @@ fn test_tcp() {
     let mut lis = false;
     let mut conn = false;
     for _ in 0..16 {
-        let mut info = zeroed();
+        let mut info = SigInfo::zeroed();
         let ts = [0i64, 250_000_000];
         let m = bit(SIGRT);
         let r = sys_rt_sigtimedwait(

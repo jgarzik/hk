@@ -6,59 +6,42 @@
 //! fadvise and readahead act on a file's page cache. All I/O here is
 //! synchronous: a write that was asked for has completed on return.
 
-use alloc::sync::Arc;
-
-use super::file::File;
 use super::inode::Inode;
-use super::syscall::current_fd_table;
+use super::io::fget;
 use crate::mm::filemap::{self, PAGE_SIZE};
-use crate::util::error::KernelError;
-
-/// The open file `fd`, or EBADF
-fn fd_file(fd: i32) -> Result<Arc<File>, KernelError> {
-    current_fd_table().lock().get(fd).ok_or(KernelError::BadFd)
-}
+use crate::util::error::{KernelError, KernelResult};
 
 /// sync(2) (Linux ksys_sync): every filesystem's dirty inodes, then
 /// every block device's cache, written and waited for
-pub fn sys_sync() -> i64 {
+pub fn sys_sync() -> KernelResult<()> {
     crate::mm::writeback::sync_all();
-    0
+    Ok(())
 }
 
-/// fsync(2): the file's data and metadata (Linux vfs_fsync -> ->fsync)
-pub fn sys_fsync(fd: i32) -> i64 {
-    let file = match fd_file(fd) {
-        Ok(f) => f,
-        Err(e) => return e.sysret(),
-    };
-    match file.f_op.fsync(&file) {
-        Ok(()) => 0,
-        Err(KernelError::Io) => KernelError::Io.sysret(),
-        Err(_) => KernelError::InvalidArgument.sysret(),
-    }
+/// fsync(2): the file's data and metadata (Linux vfs_fsync -> ->fsync);
+/// EIO for a write error, else EINVAL (no ->fsync)
+pub fn sys_fsync(fd: i32) -> KernelResult<()> {
+    let file = fget(fd)?;
+    file.f_op.fsync(&file).map_err(|e| match e {
+        KernelError::Io => e,
+        _ => KernelError::InvalidArgument,
+    })
 }
 
 /// fdatasync(2): as fsync (hk's filesystems write no metadata that
 /// fdatasync could skip)
-pub fn sys_fdatasync(fd: i32) -> i64 {
+pub fn sys_fdatasync(fd: i32) -> KernelResult<()> {
     sys_fsync(fd)
 }
 
 /// syncfs(2) (Linux sync_filesystem of the file's superblock): its
-/// dirty inodes, then its device's cache; a write error is returned
-pub fn sys_syncfs(fd: i32) -> i64 {
-    let file = match fd_file(fd) {
-        Ok(f) => f,
-        Err(e) => return e.sysret(),
-    };
+/// dirty inodes, then its device's cache; a write error is EIO
+pub fn sys_syncfs(fd: i32) -> KernelResult<()> {
+    let file = fget(fd)?;
     let Some(sb) = file.get_inode().and_then(|i| i.superblock()) else {
-        return 0;
+        return Ok(());
     };
-    match super::fs_writeback::writeback_sb(&sb) {
-        Ok(()) => 0,
-        Err(_) => KernelError::Io.sysret(),
-    }
+    super::fs_writeback::writeback_sb(&sb).map_err(|_| KernelError::Io)
 }
 
 /// sync_file_range flags (Linux include/uapi/linux/fs.h)
@@ -81,33 +64,26 @@ fn page_range(offset: u64, nbytes: u64) -> (u64, u64) {
 /// SYNC_FILE_RANGE_WRITE, write the dirty pages of the range; the waits
 /// have nothing to wait for (hk's writeback is synchronous). No
 /// metadata and no disk flush, as on Linux.
-pub fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i64 {
+pub fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> KernelResult<()> {
     let all = SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
     if flags & !all != 0 || offset < 0 || nbytes < 0 || offset.checked_add(nbytes).is_none() {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    let file = match fd_file(fd) {
-        Ok(f) => f,
-        Err(e) => return e.sysret(),
-    };
-    let Some(inode) = file.get_inode() else {
-        return KernelError::IllegalSeek.sysret();
-    };
+    let file = fget(fd)?;
+    let inode = file.get_inode().ok_or(KernelError::IllegalSeek)?;
     let m = inode.mode();
     if !m.is_file() && !m.is_blkdev() && !m.is_dir() && !m.is_symlink() {
-        return KernelError::IllegalSeek.sysret();
+        return Err(KernelError::IllegalSeek);
     }
     if flags & SYNC_FILE_RANGE_WRITE == 0 {
-        return 0;
+        return Ok(());
     }
     let Some(host) = file.mapping_inode() else {
-        return 0;
+        return Ok(());
     };
     let (first, last) = page_range(offset as u64, nbytes as u64);
-    match filemap::write_range(&host, first, last) {
-        Ok(()) => 0,
-        Err(_) => KernelError::Io.sysret(),
-    }
+    // A write error is EIO
+    filemap::write_range(&host, first, last).map_err(|_| KernelError::Io)
 }
 
 /// fadvise advice (Linux include/uapi/linux/fadvise.h; DONTNEED and
@@ -135,20 +111,17 @@ fn willneed(inode: &Inode, first: u64, last: u64) {
 /// the cache, DONTNEED writes back and drops its whole pages that no one
 /// maps; the access-pattern hints are accepted (hk has no readahead
 /// window to tune). A pipe is ESPIPE.
-pub fn sys_fadvise64(fd: i32, offset: i64, len: i64, advice: i32) -> i64 {
-    let file = match fd_file(fd) {
-        Ok(f) => f,
-        Err(e) => return e.sysret(),
-    };
+pub fn sys_fadvise64(fd: i32, offset: i64, len: i64, advice: i32) -> KernelResult<()> {
+    let file = fget(fd)?;
     let inode = file.get_inode();
     if inode.as_ref().is_none_or(|i| i.mode().is_fifo()) {
-        return KernelError::IllegalSeek.sysret();
+        return Err(KernelError::IllegalSeek);
     }
     if !(POSIX_FADV_NORMAL..=POSIX_FADV_NOREUSE).contains(&advice) || len < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     let Some(host) = file.mapping_inode() else {
-        return 0;
+        return Ok(());
     };
     let off = offset.max(0) as u64;
     let (first, last) = page_range(off, len as u64);
@@ -169,31 +142,26 @@ pub fn sys_fadvise64(fd: i32, offset: i64, len: i64, advice: i32) -> i64 {
         }
         _ => {}
     }
-    0
+    Ok(())
 }
 
 /// readahead(2) (Linux ksys_readahead): a regular file or block device
 /// open for reading; reads the range into the cache (WILLNEED)
-pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
-    let file = match fd_file(fd) {
-        Ok(f) => f,
-        Err(e) => return e.sysret(),
-    };
+pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> KernelResult<()> {
+    let file = fget(fd)?;
     if !file.is_readable() {
-        return KernelError::BadFd.sysret();
+        return Err(KernelError::BadFd);
     }
-    let Some(inode) = file.get_inode() else {
-        return KernelError::InvalidArgument.sysret();
-    };
+    let inode = file.get_inode().ok_or(KernelError::InvalidArgument)?;
     let m = inode.mode();
     // The count reaches fadvise as a loff_t: past i64::MAX it is a
     // negative length, EINVAL (Linux vfs_fadvise)
     if (!m.is_file() && !m.is_blkdev()) || offset < 0 || (count as i64) < 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
     if let Some(host) = file.mapping_inode() {
         let (first, last) = page_range(offset as u64, count as u64);
         willneed(&host, first, last);
     }
-    0
+    Ok(())
 }

@@ -44,7 +44,7 @@ pub fn notify_tracer_trapped(tid: Tid, tracer: &TaskRef, code: u32) {
     // do_notify_parent_cldstop: task_pid_nr_ns(tsk, ns of parent))
     let ns = tracer.pid_ns();
     if let Some(info) = chld_info(tid, super::si_code::CLD_TRAPPED, status, ns) {
-        super::kill_proc_info(tracer.pid, SIGCHLD, SendInfo::Info(info));
+        let _ = super::kill_proc_info(tracer.pid, SIGCHLD, SendInfo::Info(info));
     }
 }
 

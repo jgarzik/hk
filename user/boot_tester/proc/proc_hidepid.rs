@@ -55,8 +55,7 @@ fn mount(flags: u64, opts: &[u8]) -> i64 {
 }
 
 fn stat(p: &[u8]) -> i64 {
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     sys_stat(p.as_ptr(), &mut st)
 }
 

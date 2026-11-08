@@ -59,7 +59,7 @@ fn test_chmod() {
             print_num(ret);
         } else {
             // Verify with stat
-            let mut statbuf: Stat = unsafe { core::mem::zeroed() };
+            let mut statbuf = Stat::default();
             let ret = sys_stat(chmod_test_file.as_ptr(), &mut statbuf as *mut Stat);
             if ret != 0 {
                 print(b"CHMOD:FAIL: stat returned ");
@@ -95,7 +95,7 @@ fn test_fchmod() {
             print_num(ret);
         } else {
             // Verify with stat
-            let mut statbuf: Stat = unsafe { core::mem::zeroed() };
+            let mut statbuf = Stat::default();
             let ret = sys_stat(fchmod_test_file.as_ptr(), &mut statbuf as *mut Stat);
             if ret != 0 {
                 print(b"FCHMOD:FAIL: stat returned ");
@@ -143,7 +143,7 @@ fn test_chown() {
             print_num(ret);
         } else {
             // Verify with stat
-            let mut stat_buf: Stat = unsafe { core::mem::zeroed() };
+            let mut stat_buf = Stat::default();
             let ret = sys_stat(chown_test_file.as_ptr(), &mut stat_buf as *mut Stat);
             if ret != 0 {
                 print(b"CHOWN:FAIL: stat returned ");
@@ -173,7 +173,7 @@ fn test_fchown() {
             print_num(ret);
         } else {
             // Verify with stat
-            let mut stat_buf: Stat = unsafe { core::mem::zeroed() };
+            let mut stat_buf = Stat::default();
             let ret = sys_stat(fchown_test_file.as_ptr(), &mut stat_buf as *mut Stat);
             if ret != 0 {
                 print(b"FCHOWN:FAIL: stat returned ");
@@ -224,7 +224,7 @@ fn test_lchown() {
                 print_num(ret);
             } else {
                 // Use lstat to check symlink ownership
-                let mut stat_buf: Stat = unsafe { core::mem::zeroed() };
+                let mut stat_buf = Stat::default();
                 let ret = sys_lstat(lchown_link.as_ptr(), &mut stat_buf as *mut Stat);
                 if ret != 0 {
                     print(b"LCHOWN:FAIL: lstat returned ");
@@ -260,7 +260,7 @@ fn test_chown_minus1() {
             print(b"CHOWN_MINUS1:FAIL: chown returned ");
             print_num(ret);
         } else {
-            let mut stat_buf: Stat = unsafe { core::mem::zeroed() };
+            let mut stat_buf = Stat::default();
             let ret = sys_stat(chown_minus1_file.as_ptr(), &mut stat_buf as *mut Stat);
             if ret != 0 {
                 print(b"CHOWN_MINUS1:FAIL: stat returned ");
@@ -380,7 +380,7 @@ fn test_fchmodat2() {
     }
 
     // Verify with stat
-    let mut statbuf: Stat = unsafe { core::mem::zeroed() };
+    let mut statbuf = Stat::default();
     let ret = sys_stat(fchmodat2_file.as_ptr(), &mut statbuf as *mut Stat);
     if ret != 0 {
         print(b"FCHMODAT2:FAIL: stat returned ");

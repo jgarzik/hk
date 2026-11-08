@@ -198,6 +198,7 @@ pub fn selftest() -> Option<&'static str> {
         // Swap-like values: no frame behind them, nothing to free
         p.lock().store(a, (i as u64 + 1) << 12);
     }
+    #[derive(Default)]
     struct Seen {
         tables: u32,
         found: [u64; 4],
@@ -216,21 +217,13 @@ pub fn selftest() -> Option<&'static str> {
             Ok(())
         }
     }
-    let mut s = Seen {
-        tables: 0,
-        found: [0; 4],
-        n: 0,
-    };
+    let mut s = Seen::default();
     let ok = walk_pte_range(tables, PAGE_SIZE, 0x1_0000_0000, &mut s).is_ok()
         && s.tables == 2
         && s.n == 4
         && s.found == addrs;
     // A walk inside one table, starting mid-table, sees only its part
-    let mut t = Seen {
-        tables: 0,
-        found: [0; 4],
-        n: 0,
-    };
+    let mut t = Seen::default();
     let part = walk_pte_range(tables, B + PAGE_SIZE, B + 6 * PAGE_SIZE, &mut t).is_ok()
         && t.tables == 1
         && t.n == 1

@@ -247,8 +247,7 @@ impl Key {
         let old = self.quota_bytes.load(Ordering::Relaxed);
         if old > 0 {
             let new = self.description.len() + 1 + data.len();
-            super::key_user_resize(self.quota_uid.load(Ordering::Relaxed), old, new)
-                .map_err(|_| KernelError::QuotaExceeded)?;
+            super::key_user_resize(self.quota_uid.load(Ordering::Relaxed), old, new)?;
             self.quota_bytes.store(new, Ordering::Relaxed);
         }
         *payload = Some(data);
@@ -414,13 +413,13 @@ impl Key {
     // ==========================================================================
 
     /// Link `key` into this keyring (if this is a keyring)
-    pub fn keyring_add(&self, key: &Arc<Key>) -> Result<(), i64> {
+    pub fn keyring_add(&self, key: &Arc<Key>) -> Result<(), KernelError> {
         if !self.is_keyring() {
-            return Err(KernelError::NotDirectory.sysret());
+            return Err(KernelError::NotDirectory);
         }
 
         if key.serial == self.serial {
-            return Err(KernelError::Deadlock.sysret());
+            return Err(KernelError::Deadlock);
         }
         // A keyring may not be linked into one it already reaches (Linux
         // keyring_detect_cycle: EDEADLK; past the search depth ELOOP), or
@@ -432,8 +431,8 @@ impl Key {
         if key.is_keyring() {
             match key.reaches(self.serial, KEYRING_SEARCH_MAX_DEPTH, true) {
                 Ok(false) => {}
-                Ok(true) => return Err(KernelError::Deadlock.sysret()),
-                Err(e) => return Err(e.sysret()),
+                Ok(true) => return Err(KernelError::Deadlock),
+                Err(e) => return Err(e),
             }
         }
 
@@ -441,16 +440,15 @@ impl Key {
         if keys.iter().any(|k| k.serial == key.serial) {
             return Ok(()); // Already linked, success
         }
-        keys.try_reserve(1)
-            .map_err(|_| KernelError::OutOfMemory.sysret())?;
+        keys.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
         keys.push(key.clone());
         Ok(())
     }
 
     /// Unlink the key `key_serial` from this keyring
-    pub fn keyring_remove(&self, key_serial: KeySerial) -> Result<(), i64> {
+    pub fn keyring_remove(&self, key_serial: KeySerial) -> Result<(), KernelError> {
         if !self.is_keyring() {
-            return Err(KernelError::NotDirectory.sysret());
+            return Err(KernelError::NotDirectory);
         }
         let gone = {
             let mut keys = self.keyring_keys.write();
@@ -463,14 +461,14 @@ impl Key {
                 drop(k);
                 Ok(())
             }
-            None => Err(KernelError::NotFound.sysret()),
+            None => Err(KernelError::NotFound),
         }
     }
 
     /// Unlink every key from this keyring
-    pub fn keyring_clear(&self) -> Result<(), i64> {
+    pub fn keyring_clear(&self) -> Result<(), KernelError> {
         if !self.is_keyring() {
-            return Err(KernelError::NotDirectory.sysret());
+            return Err(KernelError::NotDirectory);
         }
         let gone = core::mem::take(&mut *self.keyring_keys.write());
         drop(gone);

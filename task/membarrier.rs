@@ -14,6 +14,7 @@ use crate::mm::Mm;
 use crate::sync::Mutex;
 use crate::task::percpu::PerCpuScheduler;
 use crate::util::cpumask::CpuSet;
+use crate::util::error::{KernelError, KernelResult};
 
 // =============================================================================
 // membarrier commands (Linux ABI)
@@ -68,9 +69,6 @@ const SUPPORTED_CMDS: i32 = MEMBARRIER_CMD_GLOBAL
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
     | MEMBARRIER_CMD_GET_REGISTRATIONS;
 
-const EINVAL: i64 = -22;
-const EPERM: i64 = -1;
-
 /// Serializes the commands that interrupt other CPUs (Linux
 /// membarrier_ipi_mutex): concurrent callers cannot multiply the IPIs.
 /// Held only while the IPIs are sent and waited for.
@@ -90,39 +88,39 @@ static GLOBAL_MUTEX: Mutex<()> = Mutex::new(());
 /// RCU, so it interrupts every CPU running a user address space and
 /// then sleeps a tick under its own pacing mutex, which keeps it as slow
 /// as a grace period and bounds the IPIs any caller can cause.
-pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> i64 {
+pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> KernelResult<i64> {
     let flags_ok = match cmd {
         MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => flags == 0 || flags == MEMBARRIER_CMD_FLAG_CPU,
         _ => flags == 0,
     };
     if !flags_ok {
-        return EINVAL;
+        return Err(KernelError::InvalidArgument);
     }
     match cmd {
-        MEMBARRIER_CMD_QUERY => i64::from(SUPPORTED_CMDS),
-        MEMBARRIER_CMD_GLOBAL => global(),
+        MEMBARRIER_CMD_QUERY => return Ok(i64::from(SUPPORTED_CMDS)),
+        MEMBARRIER_CMD_GET_REGISTRATIONS => return Ok(registrations()),
+        MEMBARRIER_CMD_GLOBAL => global()?,
         MEMBARRIER_CMD_GLOBAL_EXPEDITED => {
             let _g = IPI_MUTEX.lock();
             barrier_cpus(ipi_mb, |s| {
                 s.membarrier_state.load(Ordering::Relaxed) & STATE_GLOBAL_EXPEDITED != 0
             });
-            0
         }
         MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED => {
-            register(STATE_GLOBAL_EXPEDITED, STATE_GLOBAL_EXPEDITED_READY)
+            register(STATE_GLOBAL_EXPEDITED, STATE_GLOBAL_EXPEDITED_READY)?
         }
-        MEMBARRIER_CMD_PRIVATE_EXPEDITED => private_expedited(0),
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED => private_expedited(0)?,
         MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED => {
-            register(STATE_PRIVATE_EXPEDITED, STATE_PRIVATE_EXPEDITED_READY)
+            register(STATE_PRIVATE_EXPEDITED, STATE_PRIVATE_EXPEDITED_READY)?
         }
-        MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => private_expedited(FLAG_SYNC_CORE),
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => private_expedited(FLAG_SYNC_CORE)?,
         MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => register(
             STATE_PRIVATE_EXPEDITED | STATE_PRIVATE_EXPEDITED_SYNC_CORE,
             STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY,
-        ),
-        MEMBARRIER_CMD_GET_REGISTRATIONS => registrations(),
-        _ => EINVAL,
+        )?,
+        _ => return Err(KernelError::InvalidArgument),
     }
+    Ok(0)
 }
 
 /// Full barrier, run on each interrupted CPU (Linux ipi_mb)
@@ -165,22 +163,22 @@ fn barrier_cpus(f: fn(usize), pick: impl Fn(&PerCpuScheduler) -> bool) {
 
 /// MEMBARRIER_CMD_GLOBAL (see `sys_membarrier`); EINTR if killed while
 /// waiting its turn
-fn global() -> i64 {
+fn global() -> KernelResult<()> {
     let Ok(_pace) = GLOBAL_MUTEX.lock_killable() else {
-        return -4;
+        return Err(KernelError::Interrupted);
     };
     {
         let _g = IPI_MUTEX.lock();
         barrier_cpus(ipi_mb, |s| s.curr_mm.load(Ordering::Relaxed) != 0);
     }
     crate::task::percpu::sleep_current_until(crate::task::percpu::get_ticks() + 1);
-    0
+    Ok(())
 }
 
 /// Linux membarrier_private_expedited (no FLAG_CPU: only RSEQ takes it)
-fn private_expedited(flags: u32) -> i64 {
+fn private_expedited(flags: u32) -> KernelResult<()> {
     let Some(mm) = crate::task::percpu::current().mm() else {
-        return EINVAL;
+        return Err(KernelError::InvalidArgument);
     };
     let ready = if flags == FLAG_SYNC_CORE {
         STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY
@@ -188,11 +186,11 @@ fn private_expedited(flags: u32) -> i64 {
         STATE_PRIVATE_EXPEDITED_READY
     };
     if mm.membarrier_state().load(Ordering::Acquire) & ready == 0 {
-        return EPERM;
+        return Err(KernelError::NotPermitted);
     }
     // No other thread can run in it (Linux: mm_users == 1)
     if flags != FLAG_SYNC_CORE && mm.users() == 1 {
-        return 0;
+        return Ok(());
     }
     let me = Arc::as_ptr(&mm) as usize;
     let _g = IPI_MUTEX.lock();
@@ -204,19 +202,19 @@ fn private_expedited(flags: u32) -> i64 {
     } else {
         barrier_cpus(ipi_mb, |s| s.curr_mm.load(Ordering::Relaxed) == me);
     }
-    0
+    Ok(())
 }
 
 /// Linux membarrier_register_{private,global}_expedited: set the state
 /// bits, update the cached copy of every CPU running the address space
 /// (Linux sync_runqueues_membarrier_state), then mark it ready
-fn register(set: u32, ready: u32) -> i64 {
+fn register(set: u32, ready: u32) -> KernelResult<()> {
     let Some(mm) = crate::task::percpu::current().mm() else {
-        return EINVAL;
+        return Err(KernelError::InvalidArgument);
     };
     let st = mm.membarrier_state();
     if st.load(Ordering::Acquire) & ready == ready {
-        return 0;
+        return Ok(());
     }
     st.fetch_or(set, Ordering::AcqRel);
     let me = Arc::as_ptr(&mm) as usize;
@@ -235,7 +233,7 @@ fn register(set: u32, ready: u32) -> i64 {
         crate::smp::smp_call_many_ref(&mask, ipi_sync_state, &*mm);
     }
     st.fetch_or(ready, Ordering::AcqRel);
-    0
+    Ok(())
 }
 
 /// Linux membarrier_get_registrations

@@ -3,9 +3,10 @@
 //! This module implements the seccomp(2) syscall and prctl(2) integration.
 
 use crate::task::percpu::TASKLIST;
-use crate::util::error::KernelError;
+use crate::uaccess::UserPtr;
+use crate::util::error::{KernelError, KernelResult};
 
-use super::filter::{SeccompFilter, create_filter_from_user};
+use super::filter::{SeccompFilter, SockFprog, create_filter_from_user};
 use super::{
     SECCOMP_FILTER_FLAG_LOG, SECCOMP_FILTER_FLAG_TSYNC, SECCOMP_GET_ACTION_AVAIL,
     SECCOMP_GET_NOTIF_SIZES, SECCOMP_MODE_DISABLED, SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT,
@@ -14,85 +15,63 @@ use super::{
     SECCOMP_SET_MODE_STRICT,
 };
 
-/// seccomp(2) syscall handler
-///
-/// # Arguments
-/// * `op` - Operation (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER, etc.)
-/// * `flags` - Flags for the operation
-/// * `args` - Arguments (depends on operation)
-///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_seccomp(op: u64, flags: u64, args: u64) -> i64 {
+/// seccomp(op, flags, args)
+pub fn sys_seccomp(op: u64, flags: u64, args: u64) -> KernelResult<i64> {
     match op as u32 {
         SECCOMP_SET_MODE_STRICT => {
             if flags != 0 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-            set_seccomp_strict()
+            set_seccomp_strict().map(|()| 0)
         }
-
         SECCOMP_SET_MODE_FILTER => {
-            let log = (flags as u32 & SECCOMP_FILTER_FLAG_LOG) != 0;
-            let tsync = (flags as u32 & SECCOMP_FILTER_FLAG_TSYNC) != 0;
-
-            // Check for unsupported flags
             let known_flags = SECCOMP_FILTER_FLAG_LOG | SECCOMP_FILTER_FLAG_TSYNC;
-            if (flags as u32 & !known_flags) != 0 {
-                return KernelError::InvalidArgument.sysret();
+            if flags as u32 & !known_flags != 0 {
+                return Err(KernelError::InvalidArgument);
             }
-
-            set_seccomp_filter(args, log, tsync)
+            let log = flags as u32 & SECCOMP_FILTER_FLAG_LOG != 0;
+            let tsync = flags as u32 & SECCOMP_FILTER_FLAG_TSYNC != 0;
+            set_seccomp_filter(UserPtr::new(args), log, tsync)
         }
-
         SECCOMP_GET_ACTION_AVAIL => {
-            // Check if an action is available
             if flags != 0 {
-                return KernelError::InvalidArgument.sysret();
+                return Err(KernelError::InvalidArgument);
             }
-            get_action_avail(args)
+            get_action_avail(args).map(|()| 0)
         }
-
-        SECCOMP_GET_NOTIF_SIZES => {
-            // Return notification structure sizes (not implemented)
-            KernelError::OperationNotSupported.sysret()
-        }
-
-        _ => KernelError::InvalidArgument.sysret(),
+        // No user notification
+        SECCOMP_GET_NOTIF_SIZES => Err(KernelError::OperationNotSupported),
+        _ => Err(KernelError::InvalidArgument),
     }
 }
 
 /// Enable STRICT seccomp mode
-fn set_seccomp_strict() -> i64 {
+fn set_seccomp_strict() -> KernelResult<()> {
     let tid = crate::task::percpu::current_tid();
 
     {
         let mut table = TASKLIST.write();
-        let task = match table.get_mut(tid) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.sysret(),
-        };
-
+        let task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
         // Can only enable seccomp, not change modes once enabled
         if task.task.seccomp_mode() != SECCOMP_MODE_DISABLED {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
 
         task.task
             .seccomp_mode
             .store(SECCOMP_MODE_STRICT, core::sync::atomic::Ordering::Relaxed);
     }
-
-    0
+    Ok(())
 }
 
 /// Enable FILTER seccomp mode with a BPF program; `tsync` puts it on
-/// every thread of the group (Linux SECCOMP_FILTER_FLAG_TSYNC)
-fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
+/// every thread of the group (Linux SECCOMP_FILTER_FLAG_TSYNC): 0, or
+/// with TSYNC the tid of a thread that cannot take it
+fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> KernelResult<i64> {
     use crate::arch::Uaccess;
 
-    if fprog_ptr == 0 {
-        return KernelError::InvalidArgument.sysret();
+    if fprog.is_null() {
+        return Err(KernelError::InvalidArgument);
     }
 
     let tid = crate::task::percpu::current_tid();
@@ -100,10 +79,7 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
     // TSYNC holds the group's cred_guard (Linux: killable) so no exec
     // changes the threads meanwhile
     let _guard = if tsync {
-        match crate::signal::CredGuard::lock(tid) {
-            Ok(g) => Some(g),
-            Err(e) => return e.sysret(),
-        }
+        Some(crate::signal::CredGuard::lock(tid)?)
     } else {
         None
     };
@@ -116,10 +92,7 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
         // Get current task's existing filter and check no_new_privs
         let (existing_filter, has_no_new_privs, is_privileged) = {
             let table = TASKLIST.read();
-            let task = match table.get(tid) {
-                Some(t) => t,
-                None => return KernelError::NoProcess.sysret(),
-            };
+            let task = table.get(tid).ok_or(KernelError::NoProcess)?;
             (
                 task.seccomp_filter.clone(),
                 task.prctl.no_new_privs,
@@ -129,19 +102,13 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
 
         // Must have no_new_privs set or be privileged (CAP_SYS_ADMIN)
         if !has_no_new_privs && !is_privileged {
-            return KernelError::PermissionDenied.sysret();
+            return Err(KernelError::PermissionDenied);
         }
 
-        // Create new filter from userspace program
         let new_filter =
-            match create_filter_from_user::<Uaccess>(fprog_ptr, existing_filter.clone(), log) {
-                Ok(f) => f,
-                Err(e) => return -(e as i64),
-            };
+            create_filter_from_user::<Uaccess>(fprog.addr(), existing_filter.clone(), log)?;
         let table = TASKLIST.write();
-        let Some(me) = table.get(tid) else {
-            return KernelError::NoProcess.sysret();
-        };
+        let me = table.get(tid).ok_or(KernelError::NoProcess)?;
         let same = match (&me.seccomp_filter, &existing_filter) {
             (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(a, b),
             (None, None) => true,
@@ -151,9 +118,7 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
             break (new_filter, table);
         }
     };
-    let Some(me) = table.get(tid) else {
-        return KernelError::NoProcess.sysret();
-    };
+    let me = table.get(tid).ok_or(KernelError::NoProcess)?;
     let (pid, mine, nnp) = (
         me.task.pid,
         me.seccomp_filter.clone(),
@@ -172,7 +137,7 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
             let ok = (mode == SECCOMP_MODE_DISABLED || mode == SECCOMP_MODE_FILTER)
                 && SeccompFilter::is_ancestor_of(t.seccomp_filter.as_ref(), mine.as_ref());
             if !ok {
-                return t.task.tid() as i64;
+                return Ok(t.task.tid() as i64);
             }
             targets.push(t.task.tid());
         }
@@ -191,11 +156,11 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
             .seccomp_mode
             .store(SECCOMP_MODE_FILTER, core::sync::atomic::Ordering::Release);
     }
-    0
+    Ok(0)
 }
 
 /// Check if an action is available
-fn get_action_avail(action: u64) -> i64 {
+fn get_action_avail(action: u64) -> KernelResult<()> {
     // Check if we support this action
     match action as u32 {
         SECCOMP_RET_KILL_PROCESS
@@ -204,10 +169,10 @@ fn get_action_avail(action: u64) -> i64 {
         | SECCOMP_RET_ERRNO
         | SECCOMP_RET_TRACE
         | SECCOMP_RET_LOG
-        | SECCOMP_RET_ALLOW => 0, // Supported
+        | SECCOMP_RET_ALLOW => Ok(()),
 
         // USER_NOTIF not supported yet
-        _ => KernelError::OperationNotSupported.sysret(),
+        _ => Err(KernelError::OperationNotSupported),
     }
 }
 
@@ -231,18 +196,11 @@ pub fn prctl_get_seccomp() -> i64 {
 /// * `filter` - Filter program pointer (for FILTER mode)
 ///
 /// # Returns
-/// 0 on success, negative errno on error
-pub fn prctl_set_seccomp(mode: u64, filter: u64) -> i64 {
+/// 0 on success
+pub fn prctl_set_seccomp(mode: u64, filter: UserPtr<SockFprog>) -> KernelResult<i64> {
     match mode as u8 {
-        SECCOMP_MODE_STRICT => set_seccomp_strict(),
-
-        SECCOMP_MODE_FILTER => {
-            if filter == 0 {
-                return KernelError::InvalidArgument.sysret();
-            }
-            set_seccomp_filter(filter, false, false)
-        }
-
-        _ => KernelError::InvalidArgument.sysret(),
+        SECCOMP_MODE_STRICT => set_seccomp_strict().map(|()| 0),
+        SECCOMP_MODE_FILTER => set_seccomp_filter(filter, false, false),
+        _ => Err(KernelError::InvalidArgument),
     }
 }

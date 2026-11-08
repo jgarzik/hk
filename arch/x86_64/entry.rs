@@ -20,9 +20,7 @@
 use super::PtRegs;
 use super::cpu::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use super::percpu::PerCpu;
-
-/// -ENOSYS: the syscall frame's ax until the syscall returns
-const ENOSYS: i64 = -38;
+use crate::util::error::KernelError;
 
 /// RFLAGS.TF and RFLAGS.RF: SYSRET cannot restore them (Linux
 /// syscall_return_via_sysret check)
@@ -101,7 +99,7 @@ pub unsafe extern "C" fn syscall_entry() {
         top = const core::mem::offset_of!(PerCpu, top_of_stack),
         uds = const USER_DATA_SELECTOR as u64,
         ucs = const USER_CODE_SELECTOR as u64,
-        enosys = const ENOSYS,
+        enosys = const KernelError::NotImplemented.sysret(),
         do_syscall = sym do_syscall_64,
         iret = sym irq_return,
     );

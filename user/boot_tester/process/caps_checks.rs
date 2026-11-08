@@ -882,16 +882,9 @@ fn clone3_error_no_leak() -> u64 {
     }
     let mut args = hk_syscall::CloneArgs {
         flags: CLONE_INTO_CGROUP,
-        pidfd: 0,
-        child_tid: 0,
-        parent_tid: 0,
         exit_signal: SIGCHLD,
-        stack: 0,
-        stack_size: 0,
-        tls: 0,
-        set_tid: 0,
-        set_tid_size: 0,
         cgroup: fd as u64,
+        ..Default::default()
     };
     let size = core::mem::size_of::<hk_syscall::CloneArgs>();
     let r = hk_syscall::sys_clone3(&args, size);

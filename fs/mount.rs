@@ -403,26 +403,21 @@ impl Mount {
     ///
     /// This is used by CLONE_NEWNS to give a new mount namespace its
     /// own view of the mount hierarchy.
-    pub fn clone_tree(root: &Arc<Mount>, ns: u64) -> Result<(Arc<Mount>, MountMap), i32> {
+    pub fn clone_tree(root: &Arc<Mount>, ns: u64) -> (Arc<Mount>, MountMap) {
         let _ns = NAMESPACE_SEM.write();
         let new_root = root.copy(ns);
 
         // Recursively clone children
         let mut map = alloc::vec![(root.clone(), new_root.clone())];
         for child in root.children.read().iter() {
-            Self::clone_subtree(&new_root, child, ns, &mut map)?;
+            Self::clone_subtree(&new_root, child, ns, &mut map);
         }
 
-        Ok((new_root, map))
+        (new_root, map)
     }
 
     /// Clone a subtree and attach it to a parent
-    fn clone_subtree(
-        new_parent: &Arc<Mount>,
-        old_mount: &Arc<Mount>,
-        ns: u64,
-        map: &mut MountMap,
-    ) -> Result<(), i32> {
+    fn clone_subtree(new_parent: &Arc<Mount>, old_mount: &Arc<Mount>, ns: u64, map: &mut MountMap) {
         let new_mount = old_mount.copy(ns);
         if let Some(mp) = old_mount.get_mountpoint() {
             new_mount.set_mountpoint(mp);
@@ -435,10 +430,8 @@ impl Mount {
 
         // Recursively clone this mount's children
         for child in old_mount.children.read().iter() {
-            Self::clone_subtree(&new_mount, child, ns, map)?;
+            Self::clone_subtree(&new_mount, child, ns, map);
         }
-
-        Ok(())
     }
 }
 

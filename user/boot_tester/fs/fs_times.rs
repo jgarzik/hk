@@ -45,8 +45,7 @@ pub fn run_tests() {
 }
 
 fn lstat(p: &[u8]) -> Stat {
-    // SAFETY: Stat is plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     sys_lstat(p.as_ptr(), &mut st);
     st
 }
@@ -247,8 +246,7 @@ fn atime_of(p: &[u8]) -> i64 {
 
 /// statfs f_flags of MP, atime bits only
 fn st_atime_flags() -> i64 {
-    // SAFETY: LinuxStatFs is plain integers
-    let mut st: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let mut st = LinuxStatFs::default();
     sys_statfs(MP.as_ptr(), &mut st);
     st.f_flags & (ST_NOATIME | ST_NODIRATIME | ST_RELATIME)
 }

@@ -69,7 +69,7 @@ pub fn cache_clean_range(addr: *const u8, len: usize) {
     }
 
     let start = (addr as usize) & !(CACHE_LINE_SIZE - 1);
-    let end = ((addr as usize) + len + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+    let end = (addr as usize + len).next_multiple_of(CACHE_LINE_SIZE);
 
     let mut current = start;
     while current < end {
@@ -99,7 +99,7 @@ pub fn cache_invalidate_range(addr: *const u8, len: usize) {
     }
 
     let start = (addr as usize) & !(CACHE_LINE_SIZE - 1);
-    let end = ((addr as usize) + len + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+    let end = (addr as usize + len).next_multiple_of(CACHE_LINE_SIZE);
 
     let mut current = start;
     while current < end {

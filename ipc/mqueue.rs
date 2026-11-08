@@ -40,17 +40,14 @@ use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
+use crate::fs::io::{fd_install, fget};
 use crate::fs::iov_iter::IovDest;
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
-use crate::task::fdtable::get_task_fd;
-use crate::task::percpu::current_tid;
 use crate::task::rlimit;
-use crate::uaccess::{
-    UaccessArch, copy_from_user, copy_to_user, get_user, put_user, strncpy_from_user,
-};
-use crate::util::error::KernelError;
+use crate::uaccess::{UserPtr, copy_from_user, copy_to_user, strncpy_from_user};
+use crate::util::error::{KernelError, KernelResult};
 
 // ============================================================================
 // Constants (Linux ABI compatible)
@@ -171,8 +168,6 @@ struct MqNotify {
 
 /// Message queue
 pub struct MqQueue {
-    #[expect(dead_code)] // Used for debugging and future /dev/mqueue filesystem
-    name: FileName,
     maxmsg: i64,
     msgsize: i64,
     messages: Mutex<Vec<MqMessage>>,
@@ -221,11 +216,10 @@ impl MqQueue {
     }
 
     /// A queue charged as `charge` (see [`mq_charge`])
-    fn new(name: FileName, mode: u32, maxmsg: i64, msgsize: i64, charge: (u32, u64)) -> Self {
+    fn new(mode: u32, maxmsg: i64, msgsize: i64, charge: (u32, u64)) -> Self {
         // Get current task's effective uid/gid as owner
         let cred = crate::task::percpu::current_cred();
         Self {
-            name,
             maxmsg,
             msgsize,
             messages: Mutex::new(Vec::new()),
@@ -271,12 +265,6 @@ impl MqQueue {
         cred.fsuid == self.uid || cred.fsuid == 0 || crate::task::capable(crate::task::CAP_FOWNER)
     }
 
-    /// Get the queue name (for debugging and future /dev/mqueue filesystem)
-    #[expect(dead_code)]
-    fn name(&self) -> &[u8] {
-        &self.name
-    }
-
     fn get_attr(&self) -> MqAttr {
         let msgs = self.messages.lock();
         MqAttr {
@@ -304,7 +292,7 @@ impl MqQueue {
         priority: u32,
         nonblock: bool,
         deadline: Option<u64>,
-    ) -> Result<(), i64> {
+    ) -> KernelResult<()> {
         loop {
             {
                 let mut msgs = self.messages.lock();
@@ -334,7 +322,7 @@ impl MqQueue {
             }
 
             if nonblock || self.is_nonblocking() {
-                return Err(KernelError::WouldBlock.sysret());
+                return Err(KernelError::WouldBlock);
             }
 
             // Wait for space (Linux wq_sleep: ERESTARTSYS, ETIMEDOUT)
@@ -345,13 +333,13 @@ impl MqQueue {
                 HrClock::Realtime,
             ) {
                 Ok(true) => {}
-                Ok(false) => return Err(KernelError::TimedOut.sysret()),
-                Err(e) => return Err(e.sysret()),
+                Ok(false) => return Err(KernelError::TimedOut),
+                Err(e) => return Err(e),
             }
         }
     }
 
-    fn receive(&self, nonblock: bool, deadline: Option<u64>) -> Result<(Vec<u8>, u32), i64> {
+    fn receive(&self, nonblock: bool, deadline: Option<u64>) -> KernelResult<(Vec<u8>, u32)> {
         loop {
             {
                 let mut msgs = self.messages.lock();
@@ -369,7 +357,7 @@ impl MqQueue {
             }
 
             if nonblock || self.is_nonblocking() {
-                return Err(KernelError::WouldBlock.sysret());
+                return Err(KernelError::WouldBlock);
             }
 
             // Wait for messages
@@ -380,8 +368,8 @@ impl MqQueue {
                 HrClock::Realtime,
             ) {
                 Ok(true) => {}
-                Ok(false) => return Err(KernelError::TimedOut.sysret()),
-                Err(e) => return Err(e.sysret()),
+                Ok(false) => return Err(KernelError::TimedOut),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -401,7 +389,7 @@ impl MqQueue {
             if n.sigev_notify == SIGEV_SIGNAL && live && sig != 0 {
                 let info = mesgq_info(sig, n.sigev_value, &n.owner);
                 // To the registrant's struct pid, never its number
-                crate::signal::kill_pid_info(&n.owner, sig, info, |_| 0);
+                let _ = crate::signal::kill_pid_info(&n.owner, sig, info, |_| Ok(()));
             }
         }
     }
@@ -597,20 +585,7 @@ fn mq_uncharge(uid: u32, bytes: u64) {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-fn get_nofile_limit() -> u64 {
-    let limit = rlimit::rlimit(rlimit::RLIMIT_NOFILE);
-    if limit == rlimit::RLIM_INFINITY {
-        u64::MAX
-    } else {
-        limit
-    }
-}
-
-fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<Arc<File>, i64> {
+fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> KernelResult<Arc<File>> {
     // Create anonymous inode
     let mode = InodeMode::regular(0o644);
     let inode = try_arc(Inode::new(
@@ -622,11 +597,9 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<A
         InodeTimespec::from_secs(0), // mtime
         Weak::new(),                 // no superblock
         &NULL_INODE_OPS,
-    ))
-    .map_err(KernelError::sysret)?;
+    ))?;
 
-    let dentry = try_arc(Dentry::new_anonymous("mqueue".into(), Some(inode)))
-        .map_err(KernelError::sysret)?;
+    let dentry = try_arc(Dentry::new_anonymous("mqueue".into(), Some(inode)))?;
 
     let mut file_flags = match access_mode {
         O_RDONLY => flags::O_RDONLY,
@@ -639,8 +612,8 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<A
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let private = try_arc(MqFile { queue, access_mode }).map_err(KernelError::sysret)?;
-    try_arc(File::new_anon(dentry, file_flags, &MQ_FOPS, private)).map_err(KernelError::sysret)
+    let private = try_arc(MqFile { queue, access_mode })?;
+    try_arc(File::new_anon(dentry, file_flags, &MQ_FOPS, private))
 }
 
 // ============================================================================
@@ -689,19 +662,16 @@ fn mq_attr_ok(maxmsg: i64, msgsize: i64) -> Result<(i64, i64), KernelError> {
     Ok((maxmsg, msgsize))
 }
 
-pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
-    // Read name from user space
+pub fn sys_mq_open(
+    name_ptr: UserPtr<u8>,
+    oflag: i32,
+    mode: u32,
+    attr_ptr: UserPtr<MqAttr>,
+) -> KernelResult<i32> {
     // Longer than NAME_MAX: ENAMETOOLONG (Linux: the lookup of the
     // name in the mqueue root)
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, NAME_MAX + 1) {
-        Ok(s) => s,
-        Err(crate::uaccess::UaccessError::TooLong) => return KernelError::NameTooLong.sysret(),
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    if let Err(e) = validate_mq_name(&name) {
-        return e.sysret();
-    }
+    let name = strncpy_from_user::<Uaccess>(name_ptr.addr(), NAME_MAX + 1)?;
+    validate_mq_name(&name)?;
     let queue_name = name;
     let access_mode = oflag & O_ACCMODE;
 
@@ -711,11 +681,8 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
 
     // Attributes are read before the registry is locked (Linux do_mq_open
     // copies them first; no user access under a spinlock)
-    let attr_in = if creating && attr_ptr != 0 {
-        match get_user::<Uaccess, MqAttr>(attr_ptr) {
-            Ok(a) => Some(a),
-            Err(_) => return KernelError::BadAddress.sysret(),
-        }
+    let attr_in = if creating && !attr_ptr.is_null() {
+        Some(attr_ptr.read()?)
     } else {
         None
     };
@@ -729,42 +696,27 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
 
         if let Some(q) = registry.get(queue_name.as_slice()) {
             if creating && exclusive {
-                return KernelError::AlreadyExists.sysret();
+                return Err(KernelError::AlreadyExists);
             }
             // Check access permissions
             if !q.check_access(access_mode) {
-                return KernelError::PermissionDenied.sysret();
+                return Err(KernelError::PermissionDenied);
             }
             q.clone()
         } else {
             if !creating {
-                return KernelError::NotFound.sysret();
+                return Err(KernelError::NotFound);
             }
 
             // Read attributes if provided (Linux mq_attr_ok)
             let (maxmsg, msgsize) = match attr_in {
-                Some(attr) => match mq_attr_ok(attr.mq_maxmsg, attr.mq_msgsize) {
-                    Ok(v) => v,
-                    Err(e) => return e.sysret(),
-                },
+                Some(attr) => mq_attr_ok(attr.mq_maxmsg, attr.mq_msgsize)?,
                 None => (DFLT_MSGMAX, DFLT_MSGSIZEMAX),
             };
 
-            let charge = match mq_charge(mq_bytes(maxmsg, msgsize), msgq_limit) {
-                Ok(c) => c,
-                Err(e) => return e.sysret(),
-            };
+            let charge = mq_charge(mq_bytes(maxmsg, msgsize), msgq_limit)?;
             // A queue that cannot be made returns its charge as it drops
-            let queue = match try_arc(MqQueue::new(
-                queue_name.clone().into(),
-                mode,
-                maxmsg,
-                msgsize,
-                charge,
-            )) {
-                Ok(q) => q,
-                Err(e) => return e.sysret(),
-            };
+            let queue = try_arc(MqQueue::new(mode, maxmsg, msgsize, charge))?;
 
             // Set initial flags
             if oflag & O_NONBLOCK != 0 {
@@ -776,69 +728,43 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
         }
     };
 
-    // Create file and allocate fd
-    let file = match create_mq_file(queue, access_mode, oflag) {
-        Ok(f) => f,
-        Err(e) => return e,
-    };
-
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::ProcessFileLimit.sysret(),
-    };
-
+    let file = create_mq_file(queue, access_mode, oflag)?;
     let fd_flags = if oflag & O_CLOEXEC != 0 {
         FD_CLOEXEC
     } else {
         0
     };
-
-    match fd_table
-        .lock()
-        .alloc_with_flags(file, fd_flags, get_nofile_limit())
-    {
-        Ok(fd) => i64::from(fd),
-        Err(e) => -i64::from(e),
-    }
+    fd_install(file, fd_flags)
 }
 
 /// mq_unlink - remove a message queue
-pub fn sys_mq_unlink(name_ptr: u64) -> i64 {
-    // Read name from user space
+pub fn sys_mq_unlink(name_ptr: UserPtr<u8>) -> KernelResult<()> {
     // Longer than NAME_MAX: ENAMETOOLONG (Linux: the lookup of the
     // name in the mqueue root)
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, NAME_MAX + 1) {
-        Ok(s) => s,
-        Err(crate::uaccess::UaccessError::TooLong) => return KernelError::NameTooLong.sysret(),
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    if let Err(e) = validate_mq_name(&name) {
-        return e.sysret();
-    }
+    let name = strncpy_from_user::<Uaccess>(name_ptr.addr(), NAME_MAX + 1)?;
+    validate_mq_name(&name)?;
     let queue_name = name;
 
     let mut registry = MQ_REGISTRY.write();
-    if let Some(q) = registry.get(queue_name.as_slice()) {
-        // The mqueue root's sticky bit (Linux may_delete): EPERM
-        if !q.may_unlink() {
-            return KernelError::NotPermitted.sysret();
-        }
-        registry.remove(queue_name.as_slice());
-        0
-    } else {
-        KernelError::NotFound.sysret()
+    let q = registry
+        .get(queue_name.as_slice())
+        .ok_or(KernelError::NotFound)?;
+    // The mqueue root's sticky bit (Linux may_delete): EPERM
+    if !q.may_unlink() {
+        return Err(KernelError::NotPermitted);
     }
+    registry.remove(queue_name.as_slice());
+    Ok(())
 }
 
 /// The absolute CLOCK_REALTIME deadline of a timeout (`struct timespec
-/// *`, 0 = none; EINVAL for a bad tv_nsec, EFAULT), kept on that clock so
-/// it follows clock_settime (Linux do_mq_timedsend: HRTIMER_MODE_ABS)
-fn mq_deadline(abs: u64) -> Result<Option<u64>, KernelError> {
-    if abs == 0 {
+/// *`, NULL = none; EINVAL for a bad tv_nsec, EFAULT), kept on that clock
+/// so it follows clock_settime (Linux do_mq_timedsend: HRTIMER_MODE_ABS)
+fn mq_deadline(abs: UserPtr<[i64; 2]>) -> KernelResult<Option<u64>> {
+    if abs.is_null() {
         return Ok(None);
     }
-    let [sec, nsec] = get_user::<Uaccess, [i64; 2]>(abs).map_err(|_| KernelError::BadAddress)?;
+    let [sec, nsec] = abs.read()?;
     if !(0..1_000_000_000).contains(&nsec) || sec < 0 {
         return Err(KernelError::InvalidArgument);
     }
@@ -848,154 +774,86 @@ fn mq_deadline(abs: u64) -> Result<Option<u64>, KernelError> {
 /// mq_timedsend - send a message to a queue
 pub fn sys_mq_timedsend(
     mqdes: i32,
-    msg_ptr: u64,
+    msg_ptr: UserPtr<u8>,
     msg_len: usize,
     msg_prio: u32,
-    abs_timeout: u64,
-) -> i64 {
+    abs_timeout: UserPtr<[i64; 2]>,
+) -> KernelResult<()> {
     // Validate priority
     if msg_prio >= MQ_PRIO_MAX {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-
-    // Get file from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    let file = match fd_table.lock().get(mqdes) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Get MqFileOps from file
-    let mq_ops = match mq_of(&file) {
-        Some(ops) => ops,
-        None => return KernelError::BadFd.sysret(),
-    };
+    let file = fget(mqdes)?;
+    let mq_ops = mq_of(&file).ok_or(KernelError::BadFd)?;
 
     // Check write permission
     if mq_ops.access_mode == O_RDONLY {
-        return KernelError::BadFd.sysret();
+        return Err(KernelError::BadFd);
     }
 
     // Check message size (msgsize is positive: mq_attr_ok)
     if msg_len > mq_ops.queue.msgsize as usize {
-        return KernelError::MessageTooLong.sysret();
+        return Err(KernelError::MessageTooLong);
     }
 
     // Read message from user space (bounded by msgsize, fallible)
-    let mut msg_buf = match crate::util::kmem::try_vec(msg_len, 0u8) {
-        Ok(b) => b,
-        Err(e) => return e.sysret(),
-    };
+    let mut msg_buf = crate::util::kmem::try_vec(msg_len, 0u8)?;
     if msg_len > 0 {
-        if !Uaccess::access_ok(msg_ptr, msg_len) {
-            return KernelError::BadAddress.sysret();
-        }
-        if copy_from_user::<Uaccess>(&mut msg_buf, msg_ptr, msg_len).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        copy_from_user::<Uaccess>(&mut msg_buf, msg_ptr.addr(), msg_len)?;
     }
 
-    let deadline = match mq_deadline(abs_timeout) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
+    let deadline = mq_deadline(abs_timeout)?;
     let nonblock = mq_ops.queue.is_nonblocking();
-    match mq_ops.queue.send(msg_buf, msg_prio, nonblock, deadline) {
-        Ok(()) => 0,
-        Err(e) => e,
-    }
+    mq_ops.queue.send(msg_buf, msg_prio, nonblock, deadline)
 }
 
 /// mq_timedreceive - receive a message from a queue
 pub fn sys_mq_timedreceive(
     mqdes: i32,
-    msg_ptr: u64,
+    msg_ptr: UserPtr<u8>,
     msg_len: usize,
-    prio_ptr: u64,
-    abs_timeout: u64,
-) -> i64 {
-    // Get file from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    let file = match fd_table.lock().get(mqdes) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Get MqFileOps from file
-    let mq_ops = match mq_of(&file) {
-        Some(ops) => ops,
-        None => return KernelError::BadFd.sysret(),
-    };
+    prio_ptr: UserPtr<u32>,
+    abs_timeout: UserPtr<[i64; 2]>,
+) -> KernelResult<usize> {
+    let file = fget(mqdes)?;
+    let mq_ops = mq_of(&file).ok_or(KernelError::BadFd)?;
 
     // Check read permission
     if mq_ops.access_mode == O_WRONLY {
-        return KernelError::BadFd.sysret();
+        return Err(KernelError::BadFd);
     }
 
     // Check buffer size (msgsize is positive: mq_attr_ok)
     if msg_len < mq_ops.queue.msgsize as usize {
-        return KernelError::MessageTooLong.sysret();
+        return Err(KernelError::MessageTooLong);
     }
 
-    let deadline = match mq_deadline(abs_timeout) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
+    let deadline = mq_deadline(abs_timeout)?;
     let nonblock = mq_ops.queue.is_nonblocking();
-    let (data, prio) = match mq_ops.queue.receive(nonblock, deadline) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+    let (data, prio) = mq_ops.queue.receive(nonblock, deadline)?;
     let len = data.len().min(msg_len);
 
     // Write message to user space
     if len > 0 {
-        if !Uaccess::access_ok(msg_ptr, len) {
-            return KernelError::BadAddress.sysret();
-        }
-        if copy_to_user::<Uaccess>(msg_ptr, &data[..len]).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+        copy_to_user::<Uaccess>(msg_ptr.addr(), &data[..len])?;
     }
 
     // Write priority if requested
-    if prio_ptr != 0 && put_user::<Uaccess, u32>(prio_ptr, prio).is_err() {
-        return KernelError::BadAddress.sysret();
+    if !prio_ptr.is_null() {
+        prio_ptr.write(&prio)?;
     }
 
-    len as i64
+    Ok(len)
 }
 
 /// mq_notify - register for notification
-pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
-    // Get file from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    let file = match fd_table.lock().get(mqdes) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Get MqFileOps from file
-    let mq_ops = match mq_of(&file) {
-        Some(ops) => ops,
-        None => return KernelError::BadFd.sysret(),
-    };
+pub fn sys_mq_notify(mqdes: i32, sevp_ptr: UserPtr<SigEvent>) -> KernelResult<()> {
+    let file = fget(mqdes)?;
+    let mq_ops = mq_of(&file).ok_or(KernelError::BadFd)?;
 
     let current_pid = crate::task::percpu::current_pid();
 
-    if sevp_ptr == 0 {
+    if sevp_ptr.is_null() {
         // Remove notification (only if we own it)
         let mut notify = mq_ops.queue.notify.lock();
         if notify
@@ -1004,37 +862,31 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
         {
             *notify = None;
         }
-        return 0; // Not an error to remove non-existent
+        return Ok(()); // Not an error to remove non-existent
     }
 
-    // Read sigevent from user
-    let sev: SigEvent = match get_user::<Uaccess, SigEvent>(sevp_ptr) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
+    let sev = sevp_ptr.read()?;
 
     // Validate notification type
     match sev.sigev_notify {
         SIGEV_NONE | SIGEV_SIGNAL => {}
         // Linux mqueue notify does not take SIGEV_THREAD_ID (only
         // timers do); SIGEV_THREAD is a user-space pthread mechanism
-        SIGEV_THREAD_ID | SIGEV_THREAD => return KernelError::InvalidArgument.sysret(),
-        _ => return KernelError::InvalidArgument.sysret(),
+        SIGEV_THREAD_ID | SIGEV_THREAD => return Err(KernelError::InvalidArgument),
+        _ => return Err(KernelError::InvalidArgument),
     }
 
     // Check if already registered by another process
-    let Some(owner) = u32::try_from(current_pid)
+    let owner = u32::try_from(current_pid)
         .ok()
         .and_then(|nr| crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr))
-    else {
-        return KernelError::NoProcess.sysret();
-    };
+        .ok_or(KernelError::NoProcess)?;
     let mut notify = mq_ops.queue.notify.lock();
     if notify
         .as_ref()
         .is_some_and(|n| u64::from(n.owner.nr()) != current_pid)
     {
-        return KernelError::Busy.sysret();
+        return Err(KernelError::Busy);
     }
 
     // Register notification
@@ -1046,45 +898,29 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
         sigev_value: sev.sigev_value,
     });
 
-    0
+    Ok(())
 }
 
 /// mq_getsetattr - get/set message queue attributes
-pub fn sys_mq_getsetattr(mqdes: i32, newattr_ptr: u64, oldattr_ptr: u64) -> i64 {
-    // Get file from fd
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    let file = match fd_table.lock().get(mqdes) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Get MqFileOps from file
-    let mq_ops = match mq_of(&file) {
-        Some(ops) => ops,
-        None => return KernelError::BadFd.sysret(),
-    };
+pub fn sys_mq_getsetattr(
+    mqdes: i32,
+    newattr_ptr: UserPtr<MqAttr>,
+    oldattr_ptr: UserPtr<MqAttr>,
+) -> KernelResult<()> {
+    let file = fget(mqdes)?;
+    let mq_ops = mq_of(&file).ok_or(KernelError::BadFd)?;
 
     // Get old attributes if requested
-    if oldattr_ptr != 0 {
-        let old_attr = mq_ops.queue.get_attr();
-        if put_user::<Uaccess, MqAttr>(oldattr_ptr, old_attr).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+    if !oldattr_ptr.is_null() {
+        oldattr_ptr.write(&mq_ops.queue.get_attr())?;
     }
 
     // Set new attributes if provided
-    if newattr_ptr != 0 {
-        let new_attr: MqAttr = match get_user::<Uaccess, MqAttr>(newattr_ptr) {
-            Ok(a) => a,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        };
+    if !newattr_ptr.is_null() {
+        let new_attr = newattr_ptr.read()?;
         // Only mq_flags (O_NONBLOCK) can be changed
         mq_ops.queue.set_flags(new_attr.mq_flags);
     }
 
-    0
+    Ok(())
 }

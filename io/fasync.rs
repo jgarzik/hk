@@ -83,18 +83,13 @@ struct Owner {
 }
 
 /// A file's SIGIO owner (Linux struct fown_struct)
+#[derive(Default)]
 pub struct FOwner {
     /// Spin leaf (Linux fown->lock), thread context
     st: Mutex<Owner>,
 }
 
 impl FOwner {
-    fn new() -> Self {
-        Self {
-            st: Mutex::new(Owner::default()),
-        }
-    }
-
     /// A copy of the state, the lock released
     fn get(&self) -> Owner {
         self.st.lock().clone()
@@ -129,7 +124,7 @@ impl File {
     /// The SIGIO owner, allocated on first use (Linux
     /// file_f_owner_allocate)
     fn f_owner_alloc(&self) -> Result<&Arc<FOwner>, KernelError> {
-        self.f_owner.try_call_once(|| try_arc(FOwner::new()))
+        self.f_owner.try_call_once(|| try_arc(FOwner::default()))
     }
 }
 
@@ -306,12 +301,6 @@ impl FasyncList {
     }
 }
 
-impl Default for FasyncList {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Put `file` on `list` (`on`; an entry already there takes the new
 /// `fd`) or take it off (Linux fasync_helper); O_ASYNC follows. True if
 /// an entry was added or removed.
@@ -433,11 +422,11 @@ fn sigio_to_task(o: &Owner, t: &TaskRef, fd: i32, reason: i32) {
             band: band(reason),
             fd,
         };
-        if send(sig, SendInfo::Info(SigInfo::new(sig, code, fields))) == 0 {
+        if send(sig, SendInfo::Info(SigInfo::new(sig, code, fields))).is_ok() {
             return;
         }
     }
-    send(SIGIO, SendInfo::Kernel);
+    let _ = send(SIGIO, SendInfo::Kernel);
 }
 
 /// Linux send_sigio: to the owner's thread or process, or once to each

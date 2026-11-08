@@ -24,6 +24,7 @@ extern crate alloc;
 use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
 
+use crate::util::error::KernelError;
 use crate::util::pod::{FromBytes, IntoBytes};
 
 /// Linux pagefault_disable: until `pagefault_enable`, a user access that
@@ -423,7 +424,7 @@ pub fn cmpxchg_user_u32<A: UaccessArch>(uaddr: u64, old: u32, new: u32) -> Uacce
     };
     match r {
         0 => Ok(cur),
-        -11 => Err(UaccessError::Again),
+        r if r == KernelError::WouldBlock.to_errno_neg() => Err(UaccessError::Again),
         _ => Err(UaccessError::Fault),
     }
 }

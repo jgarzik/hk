@@ -105,6 +105,7 @@ const KERNEL_PARAMS: &[&str] = &[
 /// unknown_bootoption): `rdinit=`, `init=`, words the kernel does not
 /// know and without '=' as extra argv, `name=value` ones without a '.'
 /// (module parameters) as extra envp; everything after `--` is argv
+#[derive(Default)]
 pub struct InitArgs {
     pub rdinit: Option<alloc::string::String>,
     pub init: Option<alloc::string::String>,
@@ -115,12 +116,7 @@ pub struct InitArgs {
 /// Split a command line into init's arguments (see [`InitArgs`])
 pub fn init_args(cmdline: &str) -> InitArgs {
     use alloc::string::ToString;
-    let mut a = InitArgs {
-        rdinit: None,
-        init: None,
-        argv: alloc::vec::Vec::new(),
-        envp: alloc::vec::Vec::new(),
-    };
+    let mut a = InitArgs::default();
     let mut words = cmdline.split_whitespace();
     for w in words.by_ref() {
         if w == "--" {
@@ -223,38 +219,6 @@ pub fn is_cmdline_console(name: &str) -> bool {
     console.specs[..console.count]
         .iter()
         .any(|spec| spec.matches(name))
-}
-
-/// Get the number of console specifications
-#[expect(dead_code)]
-pub fn cmdline_console_count() -> usize {
-    CMDLINE_CONSOLE.lock().count
-}
-
-/// Get a console specification by index
-///
-/// Returns None if index is out of bounds
-#[expect(dead_code)]
-pub fn get_cmdline_console(index: usize) -> Option<ConsoleSpec> {
-    let console = CMDLINE_CONSOLE.lock();
-    if index < console.count {
-        Some(console.specs[index])
-    } else {
-        None
-    }
-}
-
-/// Get the primary (last specified) console device name
-///
-/// Returns None if no console= was specified
-#[expect(dead_code)]
-pub fn primary_cmdline_console() -> Option<ConsoleSpec> {
-    let console = CMDLINE_CONSOLE.lock();
-    if console.count > 0 {
-        Some(console.specs[console.count - 1])
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

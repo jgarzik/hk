@@ -185,13 +185,11 @@ mod tests {
 
     fn intf(cl: u8, sc: u8, pr: u8) -> UsbInterface {
         UsbInterface {
-            number: 0,
-            alternate_setting: 0,
             num_endpoints: 2,
             class: cl,
             subclass: sc,
             protocol: pr,
-            endpoints: Vec::new(),
+            ..Default::default()
         }
     }
 

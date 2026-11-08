@@ -93,12 +93,6 @@ pub struct NumaTopology {
     nr_pxm: usize,
 }
 
-impl Default for NumaTopology {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NumaTopology {
     /// Create a new uninitialized NUMA topology
     pub const fn new() -> Self {

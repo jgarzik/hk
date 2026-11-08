@@ -288,7 +288,6 @@ pub fn irqs_disabled() -> bool {
 }
 
 #[cfg(test)]
-#[expect(dead_code)]
 pub fn irqs_disabled() -> bool {
     false
 }

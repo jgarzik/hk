@@ -164,8 +164,7 @@ fn check_mountinfo(id: u64) -> R {
 }
 
 fn statx(path: &[u8], mask: u32) -> Result<Statx, i64> {
-    // SAFETY: Statx is plain integers
-    let mut st: Statx = unsafe { core::mem::zeroed() };
+    let mut st = Statx::default();
     match sys_statx(AT_FDCWD, path.as_ptr(), 0, mask, &mut st) {
         0 => Ok(st),
         e => Err(e),

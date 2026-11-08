@@ -9,10 +9,6 @@
 //! - Platform drivers (PIC, PIT, Serial)
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-// Note: no_std is inherited from the kernel crate
-
-extern crate alloc;
-
 pub mod acpi;
 pub mod barrier;
 pub mod context;
@@ -313,7 +309,6 @@ impl SmpOps for X86_64Arch {
                     is_bsp: cpu.is_bsp,
                 })
                 .collect(),
-            ioapics: alloc::vec::Vec::new(), // I/O APICs not needed for SMP init
             bsp_apic_id: acpi.bsp_cpu_id,
             power_info: acpi.power_info,
         };
@@ -361,10 +356,6 @@ impl TimekeeperOps for X86_64Arch {
 
     fn clock_frequency(source: &Self::ClockSource) -> u64 {
         source.frequency_hz()
-    }
-
-    fn clock_is_reliable(source: &Self::ClockSource) -> bool {
-        source.is_invariant()
     }
 
     fn read_cycles() -> u64 {
@@ -458,13 +449,11 @@ impl VfsInitOps for X86_64Arch {
     fn init_vfs_extras() {
         // Initialize VFAT ramdisk from multiboot2 module
         // Look up the needed dentries via VFS
-        let root_dentry = match crate::fs::lookup_path(b"/") {
-            Ok(d) => d,
-            Err(_) => return,
+        let Ok(root_dentry) = crate::fs::lookup_path(b"/") else {
+            return;
         };
-        let dev_dentry = match crate::fs::lookup_path(b"/dev") {
-            Ok(d) => d,
-            Err(_) => return,
+        let Ok(dev_dentry) = crate::fs::lookup_path(b"/dev") else {
+            return;
         };
         crate::init_vfat_ramdisk(&root_dentry, &dev_dentry);
     }

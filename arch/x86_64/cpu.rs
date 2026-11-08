@@ -139,12 +139,6 @@ impl TaskStateSegment {
     }
 }
 
-impl Default for TaskStateSegment {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// GDT with null, kernel code/data, user code/data, and TSS
 #[repr(C, packed)]
 struct Gdt {

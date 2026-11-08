@@ -8,6 +8,7 @@
 //! (`task::pid::vnr`).
 
 use crate::task::TableCell;
+use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicU32;
@@ -79,12 +80,12 @@ impl PidNamespace {
 
     /// Create a child namespace (CLONE_NEWPID, unshare)
     ///
-    /// EAGAIN past MAX_PID_NS_LEVEL levels, like Linux create_pid_namespace.
-    pub fn clone_ns(parent: &Arc<PidNamespace>) -> Result<Arc<Self>, i32> {
+    /// ENOSPC past MAX_PID_NS_LEVEL levels, like Linux create_pid_namespace.
+    pub fn clone_ns(parent: &Arc<PidNamespace>) -> Result<Arc<Self>, KernelError> {
         if parent.level >= MAX_PID_NS_LEVEL {
-            return Err(11); // EAGAIN - max nesting exceeded
+            return Err(KernelError::NoSpace);
         }
-        let inum = super::inum::Inum::alloc().map_err(|e| e.errno())?;
+        let inum = super::inum::Inum::alloc()?;
         try_arc(Self {
             level: parent.level + 1,
             inum,
@@ -95,7 +96,6 @@ impl PidNamespace {
             reboot: TableCell::new(0),
             bacct: crate::task::acct::Acct::default(),
         })
-        .map_err(|e| e.errno())
     }
 }
 

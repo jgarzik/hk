@@ -86,10 +86,7 @@ pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
 
-    match table.alloc_with_flags(file, 0, get_nofile_limit()) {
-        Ok(fd) => Ok(fd),
-        Err(e) => Err(KernelError::from_errno(e).unwrap_or(KernelError::Io)),
-    }
+    table.alloc_with_flags(file, 0, get_nofile_limit())
 }
 
 /// Create a file descriptor for a BPF program
@@ -102,10 +99,7 @@ pub fn create_bpf_prog_fd(prog: Arc<BpfProg>, prog_type: u32) -> Result<i32, Ker
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
 
-    match table.alloc_with_flags(file, 0, get_nofile_limit()) {
-        Ok(fd) => Ok(fd),
-        Err(e) => Err(KernelError::from_errno(e).unwrap_or(KernelError::Io)),
-    }
+    table.alloc_with_flags(file, 0, get_nofile_limit())
 }
 
 // =============================================================================

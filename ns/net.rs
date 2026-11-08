@@ -133,7 +133,7 @@ impl NetNamespace {
             devices: RwLock::new(Vec::new()),
             next_ifindex: AtomicU32::new(1),
             fib: Fib::new(),
-            nl: NlTable::new(),
+            nl: Default::default(),
             tcp: Default::default(),
             udp: UdpTable::default(),
             port_range: PortRange::default(),
@@ -172,8 +172,8 @@ impl NetNamespace {
     ///
     /// Network namespaces don't copy state - new namespace starts fresh
     /// with only loopback device (unlike mount namespace which clones tree).
-    pub fn clone_ns(&self) -> Result<Arc<Self>, i32> {
-        Self::new().map_err(|e| e.errno())
+    pub fn clone_ns(&self) -> Result<Arc<Self>, KernelError> {
+        Self::new()
     }
 
     // ========================================================================

@@ -84,7 +84,7 @@ impl GfxModeInfo {
 }
 
 /// DRM Connector - represents a physical display output
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GfxConnector {
     /// Unique connector ID
     pub id: u32,
@@ -116,12 +116,8 @@ impl GfxConnector {
             connector_type,
             connector_type_id,
             connection: super::ioctl::GFX_MODE_DISCONNECTED,
-            encoder_id: 0,
-            encoder_ids: Vec::new(),
-            modes: Vec::new(),
-            mm_width: 0,
-            mm_height: 0,
-            subpixel: 0, // GFX_MODE_SUBPIXEL_UNKNOWN
+            // subpixel 0: GFX_MODE_SUBPIXEL_UNKNOWN
+            ..Default::default()
         }
     }
 
@@ -141,7 +137,7 @@ impl GfxConnector {
 }
 
 /// DRM Encoder - converts pixel data to connector-specific format
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GfxEncoder {
     /// Unique encoder ID
     pub id: u32,
@@ -161,15 +157,13 @@ impl GfxEncoder {
         Self {
             id,
             encoder_type,
-            crtc_id: 0,
-            possible_crtcs: 0,
-            possible_clones: 0,
+            ..Default::default()
         }
     }
 }
 
 /// DRM CRTC - display controller that scans out framebuffer
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GfxCrtc {
     /// Unique CRTC ID
     pub id: u32,
@@ -192,12 +186,8 @@ impl GfxCrtc {
     pub fn new(id: u32) -> Self {
         Self {
             id,
-            fb_id: 0,
-            x: 0,
-            y: 0,
             gamma_size: 256,
-            mode_valid: false,
-            mode: None,
+            ..Default::default()
         }
     }
 
@@ -279,14 +269,9 @@ impl GfxModeResources {
     /// Create new empty mode resources
     pub fn new() -> Self {
         Self {
-            connector_ids: Vec::new(),
-            encoder_ids: Vec::new(),
-            crtc_ids: Vec::new(),
-            fb_ids: Vec::new(),
-            min_width: 0,
             max_width: 8192,
-            min_height: 0,
             max_height: 8192,
+            ..Default::default()
         }
     }
 }

@@ -388,10 +388,6 @@ impl TimekeeperOps for Aarch64Arch {
         source.frequency
     }
 
-    fn clock_is_reliable(_source: &Self::ClockSource) -> bool {
-        true // ARM Generic Timer is always reliable
-    }
-
     fn read_cycles() -> u64 {
         let count: u64;
         unsafe {

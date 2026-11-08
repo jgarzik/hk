@@ -39,8 +39,8 @@ use crate::net::sk::{SOL_SOCKET, cmsg_find, recv_msg, send, setint};
 use crate::net::unix::send_cmsg;
 use hk_syscall::{
     AF_UNIX, CLONE_CHILD_SETTID, CLONE_NEWPID, CLONE_PARENT_SETTID, CloneArgs, P_PID, SOCK_DGRAM,
-    SigInfo, Timespec, WEXITED, sys_clone, sys_clone3, sys_exit, sys_fork, sys_getpgid, sys_getpid,
-    sys_getppid, sys_getsid, sys_getsockopt, sys_gettid, sys_kill, sys_pipe2, sys_read,
+    SigInfo, Timespec, WEXITED, Zeroable, sys_clone, sys_clone3, sys_exit, sys_fork, sys_getpgid,
+    sys_getpid, sys_getppid, sys_getsid, sys_getsockopt, sys_gettid, sys_kill, sys_pipe2, sys_read,
     sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid, sys_setsid, sys_socketpair, sys_tgkill,
     sys_unshare, sys_wait4, sys_waitid, sys_write,
 };
@@ -124,8 +124,7 @@ fn block(sig: u32) {
 /// Take blocked `sig` within 5 s: (return, info)
 fn take(sig: u32) -> (i64, SigInfo) {
     let set: u64 = 1 << (sig - 1);
-    // SAFETY: SigInfo is plain integers
-    let mut info: SigInfo = unsafe { core::mem::zeroed() };
+    let mut info = SigInfo::zeroed();
     let ts = Timespec {
         tv_sec: 5,
         tv_nsec: 0,
@@ -318,8 +317,7 @@ fn wait() -> i32 {
         let mut st = 0;
         let w = sys_wait4(-1, &mut st, 0, 0);
         let c2 = child(|| 0);
-        // SAFETY: SigInfo is plain integers
-        let mut wi: SigInfo = unsafe { core::mem::zeroed() };
+        let mut wi = SigInfo::zeroed();
         let wr = sys_waitid(P_PID, c2 as u64, &mut wi, WEXITED, 0);
         let c3 = child(|| 0);
         let w3 = sys_wait4(c3, core::ptr::null_mut(), 0, 0);
@@ -489,7 +487,6 @@ fn init_retry() -> i32 {
     let args = CloneArgs {
         flags: CLONE_PIDFD,
         exit_signal: SIGCHLD,
-        pidfd: 0,
         ..CloneArgs::default()
     };
     let r = sys_clone3(&args, core::mem::size_of::<CloneArgs>());

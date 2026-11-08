@@ -221,7 +221,7 @@ impl UsbEndpoint {
 }
 
 /// An interface setting (its interface descriptor and endpoints)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsbInterface {
     pub number: u8,
     pub alternate_setting: u8,

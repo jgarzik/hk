@@ -126,10 +126,6 @@ pub struct NetDeviceStats {
 }
 
 impl NetDeviceStats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn inc_rx_packets(&self) {
         self.rx_packets.fetch_add(1, Ordering::Relaxed);
     }
@@ -297,7 +293,7 @@ impl NetDevice {
             flags: AtomicU32::new(flags),
             ops: RwLock::new(Some(ops)),
             max_mtu,
-            stats: NetDeviceStats::new(),
+            stats: NetDeviceStats::default(),
             addrs: RwLock::new(IfAddrs::default()),
             net: RwLock::new(Weak::new()),
             carrier: AtomicBool::new(true),

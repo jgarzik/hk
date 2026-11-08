@@ -252,12 +252,6 @@ impl CharDeviceRegistry {
     }
 }
 
-impl Default for CharDeviceRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Global character device registry instance
 pub static CHARDEV_REGISTRY: RwLock<CharDeviceRegistry> = RwLock::new(CharDeviceRegistry::new());
 

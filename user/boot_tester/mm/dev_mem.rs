@@ -48,8 +48,7 @@ fn nodes() {
         (b"/dev/random\0", 8),
         (b"/dev/urandom\0", 9),
     ] {
-        // SAFETY: plain integers
-        let mut st: Stat = unsafe { core::mem::zeroed() };
+        let mut st = Stat::default();
         if sys_stat(path.as_ptr(), &mut st) != 0 {
             return report(b"DEV_MEM_NODES", b"stat");
         }

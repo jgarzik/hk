@@ -401,12 +401,9 @@ pub unsafe fn init_graphics_console() -> bool {
     // Map the framebuffer
     // SAFETY: the firmware framebuffer, video memory outside the RAM
     // memblock hands out
-    let fb_ptr = match unsafe { CurrentArch::ioremap(fb_info.phys_addr, fb_info.size) } {
-        Ok(ptr) => ptr,
-        Err(_) => {
-            crate::printkln!("graphics: failed to map framebuffer");
-            return false;
-        }
+    let Ok(fb_ptr) = (unsafe { CurrentArch::ioremap(fb_info.phys_addr, fb_info.size) }) else {
+        crate::printkln!("graphics: failed to map framebuffer");
+        return false;
     };
 
     // Create the scanout surface

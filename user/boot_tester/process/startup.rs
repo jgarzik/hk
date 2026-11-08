@@ -183,7 +183,7 @@ fn test_tls_switch() {
 
 /// newfstatat (fstatat on arm64) on a directory and a missing path
 fn test_newfstatat() {
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let r = sys_fstatat(AT_FDCWD, b"/\0".as_ptr(), &mut st, 0);
     let dir = r == 0 && st.st_mode & 0o170000 == 0o040000;
     let r2 = sys_fstatat(AT_FDCWD, b"/\0".as_ptr(), &mut st, AT_SYMLINK_NOFOLLOW);

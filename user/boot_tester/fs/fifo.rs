@@ -64,8 +64,7 @@ fn close(fd: i64) {
 }
 
 fn node() {
-    // SAFETY: plain integers
-    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let mut st = Stat::default();
     let r = sys_stat(PATH.as_ptr(), &mut st);
     report_step(
         b"FIFO_NODE",
