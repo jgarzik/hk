@@ -567,6 +567,9 @@ fn xattr_error_to_errno(e: KernelError) -> i64 {
         KernelError::OperationNotSupported => KernelError::OperationNotSupported.sysret(),
         KernelError::PermissionDenied => KernelError::NotPermitted.sysret(),
         KernelError::Io => KernelError::Io.sysret(),
+        // A file system out of xattr space or memory (Linux: ENOSPC,
+        // ENOMEM from the handler)
+        KernelError::NoSpace | KernelError::OutOfMemory => e.sysret(),
         _ => KernelError::InvalidArgument.sysret(),
     }
 }

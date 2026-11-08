@@ -21,10 +21,11 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 
 use super::name::FileName;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::spin::RwLock;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::mm::filemap::{self, Aops};
 
@@ -107,6 +108,35 @@ pub struct RamfsInodeData {
 
     /// Extended attributes (name -> value)
     pub xattrs: RwLock<BTreeMap<String, Vec<u8>>>,
+
+    /// The superblock's xattr space this inode's attributes are charged
+    /// to (set by the first charge) and how much they hold, returned
+    /// when the inode is freed (Linux shmem_evict_inode)
+    xattr_pool: spin::Once<Arc<AtomicU64>>,
+    xattr_bytes: AtomicU64,
+}
+
+impl Drop for RamfsInodeData {
+    fn drop(&mut self) {
+        if let Some(pool) = self.xattr_pool.get() {
+            pool.fetch_add(*self.xattr_bytes.get_mut(), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Space a user.* attribute takes from its file system (Linux
+/// simple_xattr_space: 40 + size + name length)
+fn xattr_space(name: &str, size: usize) -> u64 {
+    (40 + size + name.len()) as u64
+}
+
+/// Take `n` bytes of xattr space from `pool` (ENOSPC when short)
+fn xattr_reserve(pool: &AtomicU64, n: u64) -> Result<(), KernelError> {
+    pool.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        cur.checked_sub(n)
+    })
+    .map(|_| ())
+    .map_err(|_| KernelError::NoSpace)
 }
 
 /// Directory entries with stable readdir positions (Linux
@@ -185,6 +215,8 @@ impl RamfsInodeData {
             children: RwLock::new(Children::new()),
             symlink_target: None,
             xattrs: RwLock::new(BTreeMap::new()),
+            xattr_pool: spin::Once::new(),
+            xattr_bytes: AtomicU64::new(0),
         }
     }
 
@@ -194,6 +226,8 @@ impl RamfsInodeData {
             children: RwLock::new(Children::new()),
             symlink_target: None,
             xattrs: RwLock::new(BTreeMap::new()),
+            xattr_pool: spin::Once::new(),
+            xattr_bytes: AtomicU64::new(0),
         }
     }
 
@@ -203,6 +237,8 @@ impl RamfsInodeData {
             children: RwLock::new(Children::new()),
             symlink_target: Some(target),
             xattrs: RwLock::new(BTreeMap::new()),
+            xattr_pool: spin::Once::new(),
+            xattr_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -215,10 +251,33 @@ impl AsAny for RamfsInodeData {
 
 impl InodeData for RamfsInodeData {}
 
-/// Ramfs superblock private data
+/// Ramfs superblock private data: the space left for user.* extended
+/// attributes (Linux tmpfs sbinfo->free_ispace: nr_inodes, by default
+/// half of RAM's pages, times BOGO_INODE_SIZE), a lock-free counter
 pub struct RamfsSbData {
-    /// Weak reference to superblock for creating inodes
-    pub sb: RwLock<Option<Weak<SuperBlock>>>,
+    pub xattr_space: Arc<AtomicU64>,
+}
+
+impl RamfsSbData {
+    fn new() -> Result<Self, KernelError> {
+        // Linux shmem_default_max_inodes (totalram / 2) * 1024
+        #[cfg(not(test))]
+        let space =
+            crate::FRAME_ALLOCATOR.stats().total_bytes / filemap::PAGE_SIZE as u64 / 2 * 1024;
+        #[cfg(test)]
+        let space = u64::MAX;
+        Ok(Self {
+            xattr_space: try_arc(AtomicU64::new(space))?,
+        })
+    }
+}
+
+/// The xattr space of `inode`'s file system (None: not counted)
+fn xattr_pool(inode: &Inode) -> Option<Arc<AtomicU64>> {
+    let sb = inode.superblock()?;
+    let private = sb.get_private()?;
+    let d = private.as_ref().as_any().downcast_ref::<RamfsSbData>()?;
+    Some(d.xattr_space.clone())
 }
 
 impl SuperBlockData for RamfsSbData {}
@@ -819,23 +878,40 @@ impl InodeOps for RamfsInodeOps {
             .downcast_ref::<RamfsInodeData>()
             .ok_or(KernelError::Io)?;
 
-        let mut xattrs = ramfs_data.xattrs.write();
-
-        let exists = xattrs.contains_key(name);
-
-        // Check XATTR_CREATE flag - fail if exists
-        if (flags & XATTR_CREATE) != 0 && exists {
-            return Err(KernelError::AlreadyExists);
+        // The value is copied before the lock, fallibly; its space is
+        // taken from the file system's first (Linux
+        // shmem_xattr_handler_set: ENOSPC), the replaced value's
+        // returned after
+        let v = crate::util::kmem::try_to_vec(value)?;
+        let need = xattr_space(name, value.len());
+        let pool = xattr_pool(inode);
+        if let Some(p) = &pool {
+            xattr_reserve(p, need)?;
+            ramfs_data.xattr_pool.call_once(|| p.clone());
         }
-
-        // Check XATTR_REPLACE flag - fail if doesn't exist
-        if (flags & XATTR_REPLACE) != 0 && !exists {
-            return Err(KernelError::NoData);
+        let r = {
+            let mut xattrs = ramfs_data.xattrs.write();
+            let exists = xattrs.contains_key(name);
+            if (flags & XATTR_CREATE) != 0 && exists {
+                Err(KernelError::AlreadyExists)
+            } else if (flags & XATTR_REPLACE) != 0 && !exists {
+                Err(KernelError::NoData)
+            } else {
+                Ok(xattrs.insert(String::from(name), v))
+            }
+        };
+        let back = match &r {
+            Ok(old) => old.as_ref().map_or(0, |o| xattr_space(name, o.len())),
+            Err(_) => need,
+        };
+        if let Some(p) = &pool {
+            if r.is_ok() {
+                ramfs_data.xattr_bytes.fetch_add(need, Ordering::Relaxed);
+                ramfs_data.xattr_bytes.fetch_sub(back, Ordering::Relaxed);
+            }
+            p.fetch_add(back, Ordering::Relaxed);
         }
-
-        // Set the attribute
-        xattrs.insert(String::from(name), value.to_vec());
-        Ok(())
+        r.map(|_| ())
     }
 
     fn listxattr(&self, inode: &Inode, list: &mut [u8]) -> Result<usize, KernelError> {
@@ -893,12 +969,16 @@ impl InodeOps for RamfsInodeOps {
             .downcast_ref::<RamfsInodeData>()
             .ok_or(KernelError::Io)?;
 
-        let mut xattrs = ramfs_data.xattrs.write();
-
-        if xattrs.remove(name).is_none() {
-            return Err(KernelError::NoData);
+        let old = ramfs_data
+            .xattrs
+            .write()
+            .remove(name)
+            .ok_or(KernelError::NoData)?;
+        if let Some(p) = ramfs_data.xattr_pool.get() {
+            let n = xattr_space(name, old.len());
+            ramfs_data.xattr_bytes.fetch_sub(n, Ordering::Relaxed);
+            p.fetch_add(n, Ordering::Relaxed);
         }
-
         Ok(())
     }
 }
@@ -1083,6 +1163,7 @@ pub(crate) fn ramfs_mount(
     let mode = root_mode(opts)?;
     // Create superblock
     let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0)?;
+    sb.set_private(try_arc(RamfsSbData::new()?)?);
 
     // Create root inode (directory)
     let root_inode = try_arc(Inode::new(
