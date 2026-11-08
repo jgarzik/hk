@@ -7,6 +7,7 @@
 //! - capget, capset (capabilities)
 //! - pidfd_open, pidfd_send_signal, pidfd_getfd (pidfd operations)
 
+use crate::fs::file::File;
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
@@ -1181,12 +1182,19 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> KernelResult<i3
         return Err(KernelError::InvalidArgument);
     }
     let pidfd_file = crate::fs::io::fget(pidfd)?;
+    let target_file = pidfd_fget(&pidfd_file, targetfd)?;
+    // A new fd in the caller's table with FD_CLOEXEC, exec_update
+    // dropped (Linux pidfd_getfd: receive_fd after __pidfd_fget)
+    crate::fs::io::fd_install(target_file, super::FD_CLOEXEC)
+}
 
+/// File `targetfd` of the process `pidfd_file` refers to (Linux
+/// __pidfd_fget): looked up under that process's exec_update read lock,
+/// with PTRACE_MODE_ATTACH_REALCREDS access
+fn pidfd_fget(pidfd_file: &File, targetfd: i32) -> KernelResult<alloc::sync::Arc<File>> {
     // The pidfd's process itself, while it is still there
-    let target_tid = crate::task::pidfd::pidfd_tid(&pidfd_file)?;
+    let target_tid = crate::task::pidfd::pidfd_tid(pidfd_file)?;
 
-    // Linux __pidfd_fget: under the target's exec_update_lock,
-    // ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS)
     let _exec = crate::signal::ExecUpdateRead::lock(target_tid);
     if !super::ptrace::may_access_tid(target_tid, false) {
         return Err(KernelError::NotPermitted);
@@ -1197,16 +1205,13 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> KernelResult<i3
     // Its process still being that task, every lookup by tid above
     // found it (the tid is not freed while it is listed); else its
     // files are gone (Linux fget_task: EBADF)
-    if crate::task::pidfd::pidfd_tid(&pidfd_file) != Ok(target_tid) {
+    if crate::task::pidfd::pidfd_tid(pidfd_file) != Ok(target_tid) {
         return Err(KernelError::BadFd);
     }
-    let target_file = target_fd_table
+    target_fd_table
         .lock()
         .get(targetfd)
-        .ok_or(KernelError::BadFd)?;
-
-    // A new fd in the caller's table with FD_CLOEXEC
-    crate::fs::io::fd_install(target_file, super::FD_CLOEXEC)
+        .ok_or(KernelError::BadFd)
 }
 
 // =============================================================================
