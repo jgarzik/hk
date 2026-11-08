@@ -22,15 +22,6 @@ pub use super::argstr::ArgStrings;
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
 
-/// Pages of the main stack's initial VMA when RLIMIT_STACK is
-/// unlimited or small (1 MB); only the pages holding the arguments are
-/// mapped at exec, the rest fault in, and the VMA grows down on demand
-/// up to RLIMIT_STACK (mm::expand_downwards)
-const USER_STACK_PAGES: usize = 256;
-
-/// Maximum number of pages for user stack (8MB, matching default RLIMIT_STACK)
-const MAX_STACK_PAGES: usize = 2048;
-
 /// Room for argument and environment strings whatever RLIMIT_STACK
 /// (Linux ARG_MAX: 32 pages)
 const ARG_MAX: usize = 32 * PAGE_SIZE as usize;
@@ -301,21 +292,23 @@ struct StackSize {
 
 impl StackSize {
     fn new(argv: &ArgStrings, envp: &ArgStrings, execfn: &[u8]) -> Self {
-        let stack_limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
-        let pages = if stack_limit == crate::task::rlimit::RLIM_INFINITY {
-            USER_STACK_PAGES
-        } else {
-            ((stack_limit / PAGE_SIZE) as usize).clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
-        };
+        // RLIMIT_STACK in whole pages (Linux rlim_cur & PAGE_MASK)
+        let rlim = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK) / PAGE_SIZE;
+        let rlim = usize::try_from(rlim).unwrap_or(usize::MAX);
         // What the image holds: its strings were bounded by copy_args
         // (Linux bprm_stack_limits), plus a script's interpreter
         let strings = argv.bytes().len() + envp.bytes().len();
         let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * AUXV_LEN;
         let need = strings + execfn.len() + 64 + 16 + words * 8 + 64;
         let mapped = need.div_ceil(PAGE_SIZE as usize) + 1;
+        // The VMA is the image and stack_expand's room above it, never
+        // past RLIMIT_STACK, nor below the image (Linux setup_arg_pages:
+        // stack_expand = min(rlim_stack, stack_size + stack_expand), an
+        // expand_stack that only grows); faults grow it down from there
+        // up to RLIMIT_STACK (mm::expand_downwards)
         Self {
             mapped,
-            pages: pages.max(mapped + STACK_EXPAND_PAGES),
+            pages: (mapped + STACK_EXPAND_PAGES).min(rlim).max(mapped),
             words,
         }
     }

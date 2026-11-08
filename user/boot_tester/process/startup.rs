@@ -17,6 +17,7 @@ const SIG_UNBLOCK: i32 = 1;
 pub fn run_tests() {
     test_exec_mode(b"EXEC_AUXV", b"auxv\0");
     test_exec_mode(b"EXEC_STACK_LAZY", b"stack\0");
+    test_exec_stack_rlimit();
     test_exec_mode(b"PROC_SELF_EXE", b"exe\0");
     test_fork_tls();
     test_tls_switch();
@@ -56,6 +57,31 @@ fn test_exec_mode(name: &[u8], mode: &'static [u8]) {
         sys_exit(99);
     });
     verdict(name, st == 0, (st >> 8) as i64);
+}
+
+/// With RLIMIT_STACK at 64 KiB, the new image's stack VMA is no larger
+/// (Linux setup_arg_pages caps stack_expand at rlim_stack)
+fn test_exec_stack_rlimit() {
+    let st = in_child(|| {
+        let r = hk_syscall::RLimit {
+            rlim_cur: 64 * 1024,
+            rlim_max: u64::MAX,
+        };
+        hk_syscall::sys_setrlimit(hk_syscall::RLIMIT_STACK, &r);
+        let argv: [*const u8; 3] = [
+            b"boot_tester2\0".as_ptr(),
+            b"stackvma\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        sys_execve(
+            b"/bin/boot_tester2\0".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
+        sys_exit(99);
+    });
+    verdict(b"EXEC_STACK_RLIMIT", st == 0, (st >> 8) as i64);
 }
 
 /// The value the TLS register is set to before forking
