@@ -17,6 +17,9 @@
 //!   never touched reads zeros (both fault pages in: Linux GUP)
 //! - PTRACE_UNKNOWN_EIO: an unknown request is ESRCH for a process the
 //!   caller does not trace, EIO for its stopped tracee
+//! - PTRACE_RESUME_SIG_EIO: a resume or detach with a signal past _NSIG
+//!   is EIO (the whole word for a resume, Linux ptrace_resume; its low
+//!   32 bits for a detach, ptrace_detach) and leaves the tracee stopped
 
 use crate::harness::T;
 use hk_syscall::{
@@ -39,6 +42,7 @@ pub fn run_tests() {
     test_peek_dumpable();
     test_poke_text();
     test_unknown_request();
+    test_resume_sig_eio();
 }
 
 /// Never called: the text word POKETEXT writes
@@ -328,5 +332,28 @@ fn test_unknown_request() {
     t.eq(b"stopped tracee", sys_ptrace(UNKNOWN, pid, 0, 0), EIO);
     sys_kill(pid, SIGKILL);
     sys_wait4(pid, &mut st, 0, 0);
+    t.done();
+}
+
+fn test_resume_sig_eio() {
+    const PTRACE_DETACH: i64 = 17;
+    const EIO: i64 = -5;
+    let mut t = T::new(b"PTRACE_RESUME_SIG_EIO");
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+        sys_kill(sys_getpid(), SIGSTOP);
+        sys_exit(0);
+    }
+    t.eq(b"stop", stop_sig(pid) as i64, SIGSTOP as i64);
+    t.eq(b"cont 99", sys_ptrace(PTRACE_CONT, pid, 0, 99), EIO);
+    t.eq(b"cont 1<<32", sys_ptrace(PTRACE_CONT, pid, 0, 1 << 32), EIO);
+    t.eq(b"syscall 65", sys_ptrace(PTRACE_SYSCALL, pid, 0, 65), EIO);
+    t.eq(b"detach 99", sys_ptrace(PTRACE_DETACH, pid, 0, 99), EIO);
+    // Still stopped: this resume takes it
+    t.eq(b"cont 0", sys_ptrace(PTRACE_CONT, pid, 0, 0), 0);
+    let mut st = 0i32;
+    t.eq(b"wait", sys_wait4(pid, &mut st, 0, 0), pid);
+    t.eq(b"exit 0", i64::from(st), 0);
     t.done();
 }

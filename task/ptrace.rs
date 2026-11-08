@@ -372,12 +372,14 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> KernelResult<i64> {
 
 /// PTRACE_DETACH - detach from a traced process.
 ///
-/// The tracee is continued with an optional signal.
+/// The tracee is continued with an optional signal (its low 32 bits,
+/// Linux ptrace_detach's unsigned int): EIO past NSIG.
 fn ptrace_detach(target_pid: Pid, signal: u32) -> KernelResult<i64> {
     let task = tracee(target_pid)?;
 
     // Verify we are the tracer
     let _frozen = ptrace_check_attach(&task)?;
+    let sig = resume_sig(u64::from(signal))?;
 
     {
         let mut table = TASKLIST.write();
@@ -387,8 +389,17 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> KernelResult<i64> {
     crate::arch::ptrace::disable_single_step(&task);
 
     // Resume it, delivering `signal` (Linux ptrace_detach: exit_code)
-    ptrace_wake(&task, Signal::new(signal));
+    ptrace_wake(&task, sig);
     Ok(0)
+}
+
+/// A resume's signal argument (Linux valid_signal): None for 0, EIO
+/// past NSIG
+fn resume_sig(data: u64) -> KernelResult<Option<Signal>> {
+    match u32::try_from(data) {
+        Ok(n) if n <= signal::NSIG => Ok(Signal::new(n)),
+        _ => Err(KernelError::Io),
+    }
 }
 
 /// Let a stopped tracee go on with `sig` to deliver (Linux
@@ -418,12 +429,14 @@ fn ptrace_wake(task: &TaskRef, sig: Option<Signal>) {
 /// # Arguments
 /// * `target_pid` - PID of the tracee
 /// * `request` - PTRACE_CONT, PTRACE_SYSCALL, or PTRACE_SINGLESTEP
-/// * `signal` - Signal to inject (0 for none)
-fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> KernelResult<i64> {
+/// * `signal` - Signal to inject (0 for none; EIO past NSIG, the whole
+///   word: Linux ptrace_resume)
+fn ptrace_resume(target_pid: Pid, request: i64, signal: u64) -> KernelResult<i64> {
     let task = tracee(target_pid)?;
 
     // Verify we are the tracer and tracee is stopped
     let _frozen = ptrace_check_attach(&task)?;
+    let sig = resume_sig(signal)?;
 
     {
         let mut table = TASKLIST.write();
@@ -457,7 +470,7 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> KernelResult<i64
         crate::arch::ptrace::disable_single_step(&task);
     }
 
-    ptrace_wake(&task, Signal::new(signal));
+    ptrace_wake(&task, sig);
     Ok(0)
 }
 
@@ -929,7 +942,7 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> KernelResult<
         PTRACE_POKETEXT | PTRACE_POKEDATA => ptrace_poke_data(pid as Pid, addr, data),
 
         PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP => {
-            ptrace_resume(pid as Pid, request, data as u32)
+            ptrace_resume(pid as Pid, request, data)
         }
 
         PTRACE_KILL => ptrace_kill(pid as Pid),
