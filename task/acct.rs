@@ -245,7 +245,7 @@ pub fn exit_ns(ns: &PidNamespace) {
 pub fn sys_acct(filename_ptr: u64) -> i64 {
     // Check CAP_SYS_PACCT capability
     if !crate::task::capable(CAP_SYS_PACCT) {
-        return -1; // EPERM
+        return KernelError::NotPermitted.sysret();
     }
 
     // If filename_ptr == 0, disable accounting
@@ -293,7 +293,7 @@ fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
         dac::may_open(&dac::cred(), &inode, dac::acc_mode(wflags), wflags)
             .map_err(|e| e.sysret())?;
         if !inode.mode().is_file() {
-            return Err(-13); // EACCES - not a regular file
+            return Err(KernelError::PermissionDenied.sysret()); // not a regular file
         }
     }
 

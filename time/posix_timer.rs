@@ -827,7 +827,7 @@ pub fn create_posix_timer(
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => {}
         CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM => {
             if !crate::task::capable(crate::task::CAP_WAKE_ALARM) {
-                return Err(-1); // EPERM
+                return Err(KernelError::NotPermitted.to_errno_neg());
             }
         }
         _ => cpu = Some(own_cpu_clock(clockid).ok_or(-22)?), // EINVAL
@@ -847,10 +847,10 @@ pub fn create_posix_timer(
         SIGEV_THREAD_ID => {}
         SIGEV_SIGNAL | SIGEV_THREAD => sev.sigev_notify = SIGEV_SIGNAL,
         SIGEV_NONE => {}
-        _ => return Err(-22), // EINVAL
+        _ => return Err(KernelError::InvalidArgument.to_errno_neg()),
     }
     if sev.sigev_notify != SIGEV_NONE && !(1..=64).contains(&sev.sigev_signo) {
-        return Err(-22);
+        return Err(KernelError::InvalidArgument.to_errno_neg());
     }
     let owner = match sev.sigev_notify {
         // The caller's number (Linux good_sigevent: find_task_by_vpid);
@@ -874,7 +874,7 @@ pub fn create_posix_timer(
     let t =
         PosixTimer::with_cpu(id, clockid, owner, sev, cpu, false).map_err(|e| e.to_errno_neg())?;
     if sev.sigev_notify == SIGEV_THREAD_ID && !t.target_in_group() {
-        return Err(-22);
+        return Err(KernelError::InvalidArgument.to_errno_neg());
     }
     if sev.sigev_notify != SIGEV_NONE {
         let fields = crate::signal::SigFields::Timer {
@@ -992,7 +992,7 @@ pub fn delete_posix_timer(tid: Tid, timer_id: TimerT) -> Result<(), i32> {
             t.delete();
             Ok(())
         }
-        None => Err(-22), // EINVAL - timer not found
+        None => Err(KernelError::InvalidArgument.to_errno_neg()), // timer not found
     }
 }
 
@@ -1067,7 +1067,7 @@ pub fn sys_timer_create(clockid: i32, sevp: u64, timerid: u64) -> i64 {
             if timerid != 0 && put_user::<Uaccess, TimerT>(timerid, timer_id).is_err() {
                 // Linux releases the new timer if the ID cannot be stored
                 let _ = delete_posix_timer(tid, timer_id);
-                return -14; // EFAULT
+                return KernelError::BadAddress.sysret();
             }
             0
         }
@@ -1090,7 +1090,7 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
 
     // Validate flags
     if flags & !timer_flags::TIMER_ABSTIME != 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get the timer
@@ -1101,7 +1101,7 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
 
     // Read new value from user space
     if new_value == 0 {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
     let new_spec: ITimerSpec = match get_user::<Uaccess, ITimerSpec>(new_value) {
         Ok(v) => v,
@@ -1109,7 +1109,7 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
     };
     // Linux itimerspec64_valid: negative or unnormalized values -> EINVAL
     if !new_spec.is_valid() {
-        return -22;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // A thread CPU clock whose thread is gone: ESRCH (Linux
@@ -1119,7 +1119,7 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
     }) = timer.cpu
         && crate::time::cpu_timer::thread_sample(t).is_none()
     {
-        return -3;
+        return KernelError::NoProcess.sysret();
     }
 
     // Set the timer
@@ -1127,7 +1127,7 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
 
     // Write old value to user space if requested
     if old_value != 0 && put_user::<Uaccess, ITimerSpec>(old_value, old_spec).is_err() {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -1151,7 +1151,7 @@ pub fn sys_timer_gettime(timerid: TimerT, curr_value: u64) -> i64 {
     };
 
     if curr_value == 0 {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
 
     // Get current value
@@ -1159,7 +1159,7 @@ pub fn sys_timer_gettime(timerid: TimerT, curr_value: u64) -> i64 {
 
     // Write to user space
     if copy_val_to_user::<Uaccess, ITimerSpec>(curr_value, &curr_spec).is_err() {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -1195,7 +1195,7 @@ pub fn sys_timer_delete(timerid: TimerT) -> i64 {
     let tid = current_tid();
 
     if timerid < 0 {
-        return -22; // EINVAL: not a timer_create id
+        return KernelError::InvalidArgument.sysret(); // not a timer_create id
     }
     match delete_posix_timer(tid, timerid) {
         Ok(()) => 0,
@@ -1319,7 +1319,7 @@ fn to_itimerval(s: ITimerSpec) -> ITimerVal {
 fn which_ok(which: i32) -> Result<(), i64> {
     match which {
         ITIMER_REAL | ITIMER_VIRTUAL | ITIMER_PROF => Ok(()),
-        _ => Err(-22),
+        _ => Err(KernelError::InvalidArgument.sysret()),
     }
 }
 
@@ -1330,7 +1330,7 @@ pub fn sys_getitimer(which: i32, curr: u64) -> i64 {
     }
     let v = to_itimerval(itimer(which).gettime());
     if put_user::<Uaccess, ITimerVal>(curr, v).is_err() {
-        return -14;
+        return KernelError::BadAddress.sysret();
     }
     0
 }
@@ -1350,7 +1350,7 @@ pub fn sys_setitimer(which: i32, new: u64, old: u64) -> i64 {
         }
     };
     let (Some(interval), Some(value)) = (tv_to_ts(nv.it_interval), tv_to_ts(nv.it_value)) else {
-        return -22;
+        return KernelError::InvalidArgument.sysret();
     };
     let prev = itimer(which).settime(
         &ITimerSpec {
@@ -1360,7 +1360,7 @@ pub fn sys_setitimer(which: i32, new: u64, old: u64) -> i64 {
         0,
     );
     if old != 0 && put_user::<Uaccess, ITimerVal>(old, to_itimerval(prev)).is_err() {
-        return -14;
+        return KernelError::BadAddress.sysret();
     }
     0
 }

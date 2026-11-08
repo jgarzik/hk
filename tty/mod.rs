@@ -604,7 +604,7 @@ pub fn sys_vhangup() -> i64 {
 
     // Requires CAP_SYS_TTY_CONFIG capability
     if !capable(CAP_SYS_TTY_CONFIG) {
-        return -1; // EPERM
+        return KernelError::NotPermitted.sysret();
     }
 
     // MVP: Return success

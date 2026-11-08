@@ -26,6 +26,7 @@ use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_to_user};
+use crate::util::error::KernelError;
 use crate::util::pod::{FromBytes, IntoBytes};
 
 // =============================================================================
@@ -287,7 +288,7 @@ pub fn setup_rt_frame(
     // Get handler address
     let handler = match action.handler {
         SigHandler::Handler(addr) => addr,
-        _ => return Err(-22), // EINVAL - not a handler
+        _ => return Err(KernelError::InvalidArgument.to_errno_neg()), // not a handler
     };
 
     // The trampoline that calls rt_sigreturn: the handler's own, else
@@ -298,7 +299,7 @@ pub fn setup_rt_frame(
         let page =
             crate::mm::get_task_mm(crate::task::percpu::current_tid()).map_or(0, |mm| mm.sigpage());
         if page == 0 {
-            return Err(-22);
+            return Err(KernelError::InvalidArgument.to_errno_neg());
         }
         page
     };
@@ -311,18 +312,18 @@ pub fn setup_rt_frame(
         .checked_sub(16)
         .map(|a| a & !(SIGNAL_FRAME_ALIGN - 1))
     else {
-        return Err(-14);
+        return Err(KernelError::BadAddress.to_errno_neg());
     };
     let Some(frame_addr) = record_addr
         .checked_sub(frame_size)
         .map(|a| a & !(SIGNAL_FRAME_ALIGN - 1))
     else {
-        return Err(-14);
+        return Err(KernelError::BadAddress.to_errno_neg());
     };
 
     // Validate user stack address
     if !Uaccess::access_ok(frame_addr, (record_addr + 16 - frame_addr) as usize) {
-        return Err(-14); // EFAULT
+        return Err(KernelError::BadAddress.to_errno_neg());
     }
 
     // __reserved: the FP/SIMD record of the interrupted code, an
@@ -339,7 +340,7 @@ pub fn setup_rt_frame(
     let reserved_addr = frame_addr + RESERVED_OFFSET as u64;
     let mut end = reserved_addr + FPSIMD_SIZE as u64;
     if copy_to_user::<Uaccess>(reserved_addr, fpsimd.as_bytes()).is_err() {
-        return Err(-14);
+        return Err(KernelError::BadAddress.to_errno_neg());
     }
     if trap.error != 0 {
         let esr = EsrContext {
@@ -350,18 +351,18 @@ pub fn setup_rt_frame(
             esr: trap.error,
         };
         if copy_to_user::<Uaccess>(end, esr.as_bytes()).is_err() {
-            return Err(-14);
+            return Err(KernelError::BadAddress.to_errno_neg());
         }
         end += core::mem::size_of::<EsrContext>() as u64;
     }
     if copy_to_user::<Uaccess>(end, CtxHead::default().as_bytes()).is_err() {
-        return Err(-14);
+        return Err(KernelError::BadAddress.to_errno_neg());
     }
 
     // Frame record for unwinders: {x29, x30} of the interrupted code
     let record = [user_regs[29], user_regs[30]];
     if copy_to_user::<Uaccess>(record_addr, record.as_bytes()).is_err() {
-        return Err(-14);
+        return Err(KernelError::BadAddress.to_errno_neg());
     }
 
     // Build the frame header (siginfo + ucontext up to __reserved)
@@ -391,7 +392,7 @@ pub fn setup_rt_frame(
         },
     };
     if copy_to_user::<Uaccess>(frame_addr, frame.as_bytes()).is_err() {
-        return Err(-14); // EFAULT
+        return Err(KernelError::BadAddress.to_errno_neg());
     }
 
     // Calculate addresses of info and ucontext within the frame

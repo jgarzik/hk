@@ -18,6 +18,7 @@ use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
+use crate::util::error::KernelError;
 use crate::util::pod::IntoBytes;
 
 // =============================================================================
@@ -272,7 +273,7 @@ pub fn setup_rt_frame(
     // Get handler address
     let handler = match action.handler {
         SigHandler::Handler(addr) if addr < USER_ADDR_LIMIT => addr,
-        _ => return Err(-22), // EINVAL - not a (usable) handler
+        _ => return Err(KernelError::InvalidArgument.to_errno_neg()), // not a (usable) handler
     };
 
     // Get restorer (trampoline that calls rt_sigreturn)
@@ -283,7 +284,7 @@ pub fn setup_rt_frame(
     } else {
         // No restorer provided - signal delivery will fail
         // In a real kernel we'd provide a VDSO trampoline
-        return Err(-22); // EINVAL
+        return Err(KernelError::InvalidArgument.to_errno_neg());
     };
 
     // user_rsp is user-controlled: an underflow means no room (EFAULT, and
@@ -291,19 +292,19 @@ pub fn setup_rt_frame(
     let frame_size = signal_frame_size();
     let fp_size = fpu::sigframe_size();
     let Some(fpstate_addr) = user_rsp.checked_sub(128 + fp_size as u64).map(|a| a & !63) else {
-        return Err(-14);
+        return Err(KernelError::BadAddress.to_errno_neg());
     };
     let Some(frame_addr) = fpstate_addr
         .checked_sub(frame_size as u64)
         .and_then(|a| (a & !0xF).checked_sub(8))
     else {
-        return Err(-14);
+        return Err(KernelError::BadAddress.to_errno_neg());
     };
     let total = (fpstate_addr + fp_size as u64 - frame_addr) as usize;
 
     // Validate user stack address
     if !Uaccess::access_ok(frame_addr, total) {
-        return Err(-14); // EFAULT
+        return Err(KernelError::BadAddress.to_errno_neg());
     }
 
     // FP image of the interrupted code (live in the registers: the kernel
@@ -311,7 +312,7 @@ pub fn setup_rt_frame(
     let mut fp_area = fpu::FpuArea::init();
     let fp_len = fpu::save_sigframe(&mut fp_area);
     if copy_to_user::<Uaccess>(fpstate_addr, &fp_area.0[..fp_len]).is_err() {
-        return Err(-14);
+        return Err(KernelError::BadAddress.to_errno_neg());
     }
 
     // Build SigContext from saved registers
@@ -374,7 +375,7 @@ pub fn setup_rt_frame(
 
     // Copy frame to user stack
     if copy_to_user::<Uaccess>(frame_addr, &frame.as_bytes()[..frame_size]).is_err() {
-        return Err(-14); // EFAULT
+        return Err(KernelError::BadAddress.to_errno_neg());
     }
 
     // Calculate addresses of info and ucontext within the frame

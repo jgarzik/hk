@@ -5,6 +5,7 @@
 
 use crate::task::Tid;
 use crate::task::percpu::TASKLIST;
+use crate::util::error::KernelError;
 
 // =============================================================================
 // User register structure (matches Linux struct user_pt_regs)
@@ -51,7 +52,7 @@ pub fn get_user_regs(tid: Tid) -> Result<UserPtRegs, i32> {
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
-        return Err(-3); // ESRCH - not stopped
+        return Err(KernelError::NoProcess.to_errno_neg()); // not stopped
     }
 
     // Its pt_regs: the frame at the top of its kernel stack
@@ -78,7 +79,7 @@ pub fn set_user_regs(tid: Tid, regs: &UserPtRegs) -> Result<(), i32> {
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
-        return Err(-3); // ESRCH - not stopped
+        return Err(KernelError::NoProcess.to_errno_neg()); // not stopped
     }
 
     // Update its pt_regs with the new register values

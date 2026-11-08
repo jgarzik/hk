@@ -597,24 +597,24 @@ pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
 
     // Validate init_flags
     if init_flags & !FAN_INIT_VALID != 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Check for mutually exclusive flags
     if (init_flags & FAN_REPORT_PIDFD) != 0 && (init_flags & FAN_REPORT_TID) != 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // FAN_REPORT_NAME requires FAN_REPORT_DIR_FID
     if (init_flags & FAN_REPORT_NAME) != 0 && (init_flags & FAN_REPORT_DIR_FID) == 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // FAN_REPORT_TARGET_FID requires FAN_REPORT_NAME and FAN_REPORT_FID
     if (init_flags & FAN_REPORT_TARGET_FID) != 0
         && ((init_flags & FAN_REPORT_NAME) == 0 || (init_flags & FAN_REPORT_FID) == 0)
     {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Privileged flags check
@@ -624,7 +624,7 @@ pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
     if has_privileged_flags {
         // Check CAP_SYS_ADMIN
         if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-            return -1; // EPERM
+            return KernelError::NotPermitted.sysret();
         }
     }
 
@@ -632,7 +632,7 @@ pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
     let access_mode = event_f_flags & 0o3; // O_ACCMODE
     if access_mode != 0o0 && access_mode != 0o1 && access_mode != 0o2 {
         // O_RDONLY, O_WRONLY, O_RDWR
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Create fanotify file
@@ -703,7 +703,7 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
     // Exactly one of ADD, REMOVE, FLUSH must be set (or none for flush compatibility)
     let op_count = u32::from(is_add) + u32::from(is_remove) + u32::from(is_flush);
     if op_count > 1 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Handle FLUSH - doesn't need path
@@ -725,14 +725,14 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
 
     // Validate mask for ADD/REMOVE
     if mask == 0 && is_add {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Check for privileged mark types
     if (mark_flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM)) != 0
         && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
     {
-        return -1; // EPERM
+        return KernelError::NotPermitted.sysret();
     }
 
     // Resolve path to get target ID
@@ -775,7 +775,7 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
             && let Some(inode) = dentry.get_inode()
             && !inode.mode().is_dir()
         {
-            return -20; // ENOTDIR
+            return KernelError::NotDirectory.sysret();
         }
 
         // fanotify_find_path: the marked object must be readable
@@ -813,11 +813,11 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
             if let Some(inode) = dentry.get_inode() {
                 inode.ino
             } else {
-                return -2; // ENOENT
+                return KernelError::NotFound.sysret();
             }
         }
     } else {
-        return -22; // EINVAL - pathname required for ADD/REMOVE
+        return KernelError::InvalidArgument.sysret(); // pathname required for ADD/REMOVE
     };
 
     // Perform operation

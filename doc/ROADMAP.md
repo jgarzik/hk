@@ -50,8 +50,7 @@ loading); HADL itself waits for the owner's go-ahead.
   turbofish); `From<UaccessError> for KernelError`; IoremapError and
   IRQ string errors become KernelError; a `SysRet` trait so `sys_*`
   return `KernelResult` with `?`; one public `fget` for the open-coded
-  fd lookups; redundant `access_ok` checks dropped; raw errno literals
-  replaced.
+  fd lookups; redundant `access_ok` checks dropped.
 
 ## 4. M2 — arch dedup and the IRQ table
 

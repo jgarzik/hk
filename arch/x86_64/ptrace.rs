@@ -5,6 +5,7 @@
 
 use crate::task::Tid;
 use crate::task::percpu::TASKLIST;
+use crate::util::error::KernelError;
 
 // =============================================================================
 // User register structure (matches Linux struct user_regs_struct)
@@ -93,7 +94,7 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
-        return Err(-3); // ESRCH - not stopped
+        return Err(KernelError::NoProcess.to_errno_neg()); // not stopped
     }
 
     // Its pt_regs: the frame at the top of its kernel stack
@@ -143,18 +144,18 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
-        return Err(-3); // ESRCH - not stopped
+        return Err(KernelError::NoProcess.to_errno_neg()); // not stopped
     }
 
     // A non-canonical RIP would fault on the return to user mode in ring
     // 0 (SYSRET with the user stack loaded): refused (EIO). Linux takes
     // it and returns through IRET, which delivers SIGSEGV.
     if regs.rip >= 0x0000_8000_0000_0000 {
-        return Err(-5);
+        return Err(KernelError::Io.to_errno_neg());
     }
     // Linux putreg: a base at or above TASK_SIZE_MAX is EIO
     if !super::percpu::fs_base_ok(regs.fs_base) || !super::percpu::fs_base_ok(regs.gs_base) {
-        return Err(-5);
+        return Err(KernelError::Io.to_errno_neg());
     }
 
     // Update its pt_regs with the new register values

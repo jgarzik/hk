@@ -694,7 +694,7 @@ impl Inotify {
             self.wait_queue.wake_all();
             Ok(())
         } else {
-            Err(-22) // EINVAL
+            Err(KernelError::InvalidArgument.to_errno_neg())
         }
     }
 
@@ -913,7 +913,7 @@ pub fn sys_inotify_init1(in_flags: i32) -> i64 {
     // Validate flags
     let valid_flags = in_flags::IN_CLOEXEC | in_flags::IN_NONBLOCK;
     if in_flags & !valid_flags != 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Create inotify file
@@ -958,12 +958,12 @@ pub fn sys_inotify_add_watch(fd: i32, pathname_ptr: u64, mask: u32) -> i64 {
 
     // Validate mask
     if mask == 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // IN_MASK_ADD and IN_MASK_CREATE are mutually exclusive
     if (mask & IN_MASK_ADD) != 0 && (mask & IN_MASK_CREATE) != 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get fd table
@@ -998,7 +998,7 @@ pub fn sys_inotify_add_watch(fd: i32, pathname_ptr: u64, mask: u32) -> i64 {
 
     // Check IN_ONLYDIR
     if (mask & IN_ONLYDIR) != 0 && !path.dentry.get_inode().is_some_and(|i| i.mode().is_dir()) {
-        return -20; // ENOTDIR
+        return KernelError::NotDirectory.sysret();
     }
 
     // Add watch

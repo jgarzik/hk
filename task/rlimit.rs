@@ -24,6 +24,7 @@ use crate::signal::get_task_signal_struct;
 use crate::task::Tid;
 use crate::task::percpu::{current_cred, current_tid};
 use crate::uaccess::{copy_val_from_user, copy_val_to_user};
+use crate::util::error::KernelError;
 
 // =============================================================================
 // Resource Limit Constants (Linux ABI)
@@ -231,11 +232,11 @@ pub fn rlimit_max(resource: u32) -> u64 {
 /// Returns: 0 on success, negative errno on error
 pub fn sys_getrlimit(resource: u32, rlim_ptr: u64) -> i64 {
     if resource as usize >= RLIM_NLIMITS {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     if rlim_ptr == 0 {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
 
     let tid = current_tid();
@@ -246,7 +247,7 @@ pub fn sys_getrlimit(resource: u32, rlim_ptr: u64) -> i64 {
 
     // Copy to user (16 bytes: cur + max)
     if copy_val_to_user::<Uaccess, RLimit>(rlim_ptr, &rlim).is_err() {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
     0
 }
@@ -267,7 +268,7 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
         Err(_) => return -14, // EFAULT
     };
     if resource as usize >= RLIM_NLIMITS {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     if let Err(e) = check(resource, &new_rlim) {
@@ -287,10 +288,10 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
 /// above fs.nr_open is EPERM, even for CAP_SYS_RESOURCE
 fn check(resource: u32, new: &RLimit) -> Result<(), i64> {
     if new.rlim_cur > new.rlim_max {
-        return Err(-22); // EINVAL
+        return Err(KernelError::InvalidArgument.sysret());
     }
     if resource == RLIMIT_NOFILE && new.rlim_max > crate::task::fdbits::nr_open() {
-        return Err(-1); // EPERM
+        return Err(KernelError::NotPermitted.sysret());
     }
     Ok(())
 }
@@ -333,7 +334,7 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
         return e;
     }
     if resource as usize >= RLIM_NLIMITS {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
     if let Some(new) = &new
         && let Err(e) = check(resource, new)
@@ -353,7 +354,7 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
         },
     };
     if old_rlim_ptr != 0 && copy_val_to_user::<Uaccess, RLimit>(old_rlim_ptr, &old).is_err() {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
     0
 }
@@ -374,7 +375,7 @@ fn check_prlimit_permission(target: crate::task::Tid) -> Result<(), i64> {
     let id_match = [t.uid, t.euid, t.suid].iter().all(|&u| u == me.uid)
         && [t.gid, t.egid, t.sgid].iter().all(|&g| g == me.gid);
     if !id_match && !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
-        return Err(-1); // EPERM
+        return Err(KernelError::NotPermitted.sysret());
     }
     Ok(())
 }

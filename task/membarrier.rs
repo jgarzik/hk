@@ -14,6 +14,7 @@ use crate::mm::Mm;
 use crate::sync::Mutex;
 use crate::task::percpu::PerCpuScheduler;
 use crate::util::cpumask::CpuSet;
+use crate::util::error::KernelError;
 
 // =============================================================================
 // membarrier commands (Linux ABI)
@@ -167,7 +168,7 @@ fn barrier_cpus(f: fn(usize), pick: impl Fn(&PerCpuScheduler) -> bool) {
 /// waiting its turn
 fn global() -> i64 {
     let Ok(_pace) = GLOBAL_MUTEX.lock_killable() else {
-        return -4;
+        return KernelError::Interrupted.sysret();
     };
     {
         let _g = IPI_MUTEX.lock();

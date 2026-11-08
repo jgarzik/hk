@@ -27,6 +27,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::cpu::PerCpu;
+use crate::util::error::KernelError;
 
 /// Flags for getrandom syscall
 pub const GRND_NONBLOCK: u32 = 0x0001;
@@ -256,11 +257,11 @@ pub fn init() {
 /// * `Err(errno)` - Negative errno on error
 pub fn get_random_bytes(buf: &mut [u8], flags: u32) -> Result<usize, i32> {
     if flags & !GRND_VALID_FLAGS != 0 {
-        return Err(-22); // EINVAL
+        return Err(KernelError::InvalidArgument.to_errno_neg());
     }
     // Linux: GRND_INSECURE with GRND_RANDOM is EINVAL
     if flags & (GRND_INSECURE | GRND_RANDOM) == GRND_INSECURE | GRND_RANDOM {
-        return Err(-22);
+        return Err(KernelError::InvalidArgument.to_errno_neg());
     }
     if !buf.is_empty() {
         fill(buf);

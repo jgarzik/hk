@@ -1352,13 +1352,13 @@ fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, ty: PidType, force: boo
 fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) -> i32 {
     check_send_context();
     if sig > 64 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.to_errno_neg();
     }
     // Kernel threads ignore every signal (Linux ignore_signals in
     // kthreadd): they are processes now (pid == tid), reachable by
     // kill(-1) and kill(pid). One lookup also finds the global init.
     let Some(tg) = target(t) else {
-        return -3; // ESRCH
+        return KernelError::NoProcess.to_errno_neg();
     };
     // Signal 0 only checks the task is there; a dying group takes no
     // more signals (Linux prepare_signal: SIGNAL_GROUP_EXIT; its threads
@@ -1822,7 +1822,7 @@ pub fn kill_pid_info_type(
         let table = TASKLIST.read();
         let found = table.pid_tid(pid).and_then(|tid| table.get(tid));
         let Some(v) = found else {
-            return -3; // ESRCH
+            return KernelError::NoProcess.to_errno_neg();
         };
         let e = check(&v);
         if e != 0 {
@@ -1875,7 +1875,7 @@ pub fn kill_pgrp_info(
 /// Returns 0 on success, negative errno on error.
 pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
     if sig == 0 || sig > 64 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.to_errno_neg();
     }
     kill_pgrp(pgid, sig, SendInfo::Kernel, |_| 0)
 }
@@ -2604,12 +2604,12 @@ impl SignalStruct {
     pub fn set_rlimit(&self, resource: u32, new: RLimit) -> Result<RLimit, i32> {
         let r = resource as usize;
         if r >= RLIM_NLIMITS || new.rlim_cur > new.rlim_max {
-            return Err(-22); // EINVAL
+            return Err(KernelError::InvalidArgument.to_errno_neg());
         }
         let mut rlim = self.rlim.lock();
         let old = rlim[r];
         if new.rlim_max > old.rlim_max && !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
-            return Err(-1); // EPERM
+            return Err(KernelError::NotPermitted.to_errno_neg());
         }
         rlim[r] = new;
         Ok(old)

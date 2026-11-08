@@ -85,18 +85,18 @@ impl From<UserSigAction> for SigAction {
 pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) -> i64 {
     // Validate sigsetsize - must be 8 bytes (64-bit sigset_t)
     if sigsetsize != 8 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate signal number
     if sig == 0 || sig > 64 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // SIGKILL and SIGSTOP can be queried, not changed (Linux
     // do_sigaction: `act && sig_kernel_only(sig)`)
     if act_ptr != 0 && (sig == SIGKILL || sig == SIGSTOP) {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // The new action is read before the old one is written (Linux
@@ -113,7 +113,7 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
 
     let tid = current_tid();
     let Some(sighand) = get_task_sighand(tid) else {
-        return -3; // ESRCH
+        return KernelError::NoProcess.sysret();
     };
     // The old action and the swap in one hold of the action lock
     let changed = new.is_some();
@@ -139,7 +139,7 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
             .write(&UserSigAction::from(&old))
             .is_err()
     {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
     0
 }
@@ -170,7 +170,7 @@ fn handler_ignored(sighand: &crate::signal::SigHand, sig: u32) -> bool {
 /// 0 on success, negative errno on error
 pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64) -> i64 {
     if sigsetsize != 8 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     let tid = current_tid();
@@ -215,7 +215,7 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
 
     // Return old mask if requested
     if oset_ptr != 0 && put_user::<Uaccess, u64>(oset_ptr, old).is_err() {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
     0
 }
@@ -230,11 +230,11 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
 /// 0 on success, negative errno on error
 pub fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
     if sigsetsize != 8 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     if set_ptr == 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     let tid = current_tid();
@@ -245,12 +245,12 @@ pub fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
         state.pending.signal.union(&shared.signal).bits()
     });
     let Some(pending) = pending else {
-        return -3; // ESRCH
+        return KernelError::NoProcess.sysret();
     };
 
     // Written after the signal state is unlocked
     if put_user::<Uaccess, u64>(set_ptr, pending).is_err() {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
     0
 }
@@ -339,7 +339,7 @@ fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32, info: SendInfo) -> i3
         crate::task::pid::from_vnr(tid),
         tgid.map_or(Some(None), |g| crate::task::pid::from_vnr(g).map(Some)),
     ) else {
-        return -3; // ESRCH
+        return KernelError::NoProcess.to_errno_neg();
     };
     if let Some(tgid) = tgid {
         let in_group = TASKLIST
@@ -348,7 +348,7 @@ fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32, info: SendInfo) -> i3
             .map(|t| t.task.pid == tgid)
             .unwrap_or(false);
         if !in_group {
-            return -3; // ESRCH
+            return KernelError::NoProcess.to_errno_neg();
         }
     }
     let perm = check_kill_permission(tid, sig);
@@ -380,14 +380,14 @@ fn tkill_info(sig: u32) -> SendInfo {
 /// 0 on success, negative errno on error
 pub fn sys_kill(pid: i64, sig: u32) -> i64 {
     if sig > 64 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Numbers are the caller's (Linux find_vpid): none it sees is ESRCH
     let vpid = |nr: u64| crate::task::pid::from_vnr(nr);
     if pid > 0 {
         let Some(pid) = vpid(pid as u64) else {
-            return -3; // ESRCH
+            return KernelError::NoProcess.sysret();
         };
         i64::from(user_group_send(pid, sig, SendInfo::User))
     } else if pid == 0 {
@@ -429,7 +429,7 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         // pid < -1: every process in group -pid, once each (signal 0:
         // does the group exist, may we signal it)
         let Some(pgid) = vpid(pid.unsigned_abs()) else {
-            return -3; // ESRCH
+            return KernelError::NoProcess.sysret();
         };
         i64::from(kill_pgrp(pgid, sig, SendInfo::User, |p| {
             check_kill_permission(p, sig)
@@ -448,7 +448,7 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
 /// 0 on success, negative errno on error
 pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
     if sig > 64 || tid <= 0 || tgid <= 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     i64::from(user_thread_send(
@@ -465,7 +465,7 @@ pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
 /// Use tgkill instead for new code.
 pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
     if sig > 64 || tid <= 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
     i64::from(user_thread_send(None, tid as u64, sig, tkill_info(sig)))
 }
@@ -486,7 +486,7 @@ pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
 pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
     // Validate signal number
     if sig == 0 || sig > 64 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     let info = match read_info(uinfo, sig) {
@@ -499,11 +499,11 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
     // by a thread to its own number, never used to forge signals to
     // other processes
     if reserved_to_kernel(info.code) && pid != i64::from(crate::task::pid::vnr(current_tid())) {
-        return -1; // EPERM
+        return KernelError::NotPermitted.sysret();
     }
 
     let Some(pid) = crate::task::pid::from_vnr(pid as u64) else {
-        return -3; // ESRCH
+        return KernelError::NoProcess.sysret();
     };
     i64::from(user_group_send(pid, sig, SendInfo::Info(info)))
 }
@@ -525,11 +525,11 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
 pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
     // Validate arguments
     if tid <= 0 || tgid <= 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     if sig == 0 || sig > 64 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     let info = match read_info(uinfo, sig) {
@@ -541,7 +541,7 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
     // only when targeting the calling thread itself
     let caller_tid = i64::from(crate::task::pid::vnr(crate::task::percpu::current_tid()));
     if reserved_to_kernel(info.code) && tid != caller_tid {
-        return -1; // EPERM
+        return KernelError::NotPermitted.sysret();
     }
 
     i64::from(user_thread_send(
@@ -570,7 +570,7 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
 /// * -EFAULT: Bad mask_ptr pointer
 pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
     if sigsetsize != 8 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Read the new mask from user space
@@ -581,7 +581,7 @@ pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
 
     // Save old mask (restored on return to user) and install the new one
     if crate::signal::set_temp_sigmask(new_mask).is_none() {
-        return -3; // ESRCH
+        return KernelError::NoProcess.sysret();
     }
 
     // Sleep until a signal is deliverable under the temporary mask
@@ -648,7 +648,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
 
     // Validate sigsetsize
     if sigsetsize != 8 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Read the signal set to wait for
@@ -668,7 +668,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
 
         // Validate timeout
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
-            return -22; // EINVAL
+            return KernelError::InvalidArgument.sysret();
         }
 
         Some(crate::time::timespec_to_ns(tv_sec, tv_nsec))
@@ -804,7 +804,7 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
             // Validate flags - only SS_DISABLE and SS_FLAG_BITS are valid
             let mode = ss_flags_val & !ss_flags::SS_FLAG_BITS;
             if mode != 0 && mode != ss_flags::SS_DISABLE {
-                return Err(-22); // EINVAL
+                return Err(KernelError::InvalidArgument.sysret());
             }
 
             if mode == ss_flags::SS_DISABLE {
@@ -817,7 +817,7 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
             } else {
                 // Enable/update the alternate stack
                 if ss_size < MINSIGSTKSZ {
-                    return Err(-12); // ENOMEM
+                    return Err(KernelError::OutOfMemory.sysret());
                 }
 
                 state.altstack = AltStack {
@@ -841,7 +841,7 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
             || put_user::<Uaccess, i32>(oss_ptr.wrapping_add(8), old_flags).is_err()
             || put_user::<Uaccess, u64>(oss_ptr.wrapping_add(16), old.1 as u64).is_err())
     {
-        return -14; // EFAULT
+        return KernelError::BadAddress.sysret();
     }
     0
 }
@@ -863,13 +863,13 @@ pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
 
     // Validate sizemask
     if sizemask != 8 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate flags
     let valid_flags = sfd_flags::SFD_CLOEXEC | sfd_flags::SFD_NONBLOCK;
     if flags & !valid_flags != 0 {
-        return -22; // EINVAL
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Read mask from user space

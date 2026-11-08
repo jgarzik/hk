@@ -39,8 +39,6 @@ removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
     `impl From<UaccessError> for KernelError` (uaccess.rs:67).
   - 3 copies of a local `fn ret()` (fs/perm.rs:47, fs/stat.rs:73, net/syscall.rs:23)
   - 39 ad-hoc `Result<_, i64>` errno-as-error fns (fs/io.rs:198 `one_seg`, :210 `pos_arg`)
-  - 171 raw errno literals (`return -22; // EINVAL`, `-ESRCH`, `Err(-14)`), which
-    break the STYLE.md rule "No raw errno numbers"
   - 739 `return KernelError::X.sysret();`. These become `return Err(KernelError::X)`
     (same LOC) and type-check against the error enum.
 - **Design** (`util/error.rs`, next to `sysret`):
