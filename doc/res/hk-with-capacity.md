@@ -113,16 +113,7 @@ Validated sites whose bound allows order 4 use `kmem::try_vec`
 - Benefit: medium; real for big files, and it removes high-order allocations under a
   spinlock.
 
-**5. `fs/dentry.rs:229,248` d_path, and `:265,276` dentry_path: `names` and `out` both start
-empty.**
-- `out`: `Vec::with_capacity(names.iter().map(|n| n.len() + 1).sum())`, a kernel-internal
-  count, **trusted** (names are already in memory; each ≤ NAME_MAX).
-- `names`: leave as is; depth is unknown and usually small.
-- `d_path_link` (`:284`): `reserve(10)` before appending " (deleted)".
-- Benefit: medium. Hot for getcwd, `/proc/*/fd` readlink, mountinfo, and audit-style
-  readers.
-
-**6. `fs/namei.rs:208` path walk: `split(..).filter(..).collect()` is not exact-size, so it
+**5. `fs/namei.rs:208` path walk: `split(..).filter(..).collect()` is not exact-size, so it
 starts at capacity 4 and grows for deeper paths.**
 - Best: don't collect at all. Iterate with `peekable()` and test `peek().is_none()` for
   the last component.

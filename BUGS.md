@@ -612,8 +612,8 @@ instead of filling all of RAM and being skipped above 4GB
 
 **Location**: `bpf/map.rs`
 
-An array map refuses a preallocation over half of free memory, but
-nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
+An array or hash map refuses a size over half of free memory at
+creation, but nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
 bpf_map_charge_memlock / memcg accounting), so many maps can still use
 up memory.
 

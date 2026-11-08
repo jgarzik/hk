@@ -173,7 +173,7 @@ The streaming DMA API kept and typed (no raw physical addresses, unmap
 on completion), `DmaAddr` with a private constructor, `DmaRing<T: Pod>`
 with volatile access (e1000, then virtio, xHCI), xHCI rings through
 the DMA API, ordered IoMem writes plus `_relaxed` variants, PL011/
-PL031/xHCI registers on IoMem, xHCI quirks as bitflags; releases the
+PL031 registers and xHCI's interrupt handler on IoMem, xHCI quirks as bitflags; releases the
 matching BUGS.md "unsafe not yet wrapped" items.
 
 ## 15. D — Dell OptiPlex 3020 bring-up
