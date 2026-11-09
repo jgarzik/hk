@@ -2,6 +2,9 @@
 //!
 //! Mirrors arch/x86/include/uapi/asm/ in Linux.
 
+/// prctl PR_GET_TSC/PR_SET_TSC exist (Linux GET_TSC_CTL)
+pub const TSC_CTL: bool = true;
+
 /// uname(2) machine (Linux UTS_MACHINE)
 pub const UTS_MACHINE: &[u8] = b"x86_64";
 

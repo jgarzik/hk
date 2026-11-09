@@ -1122,7 +1122,8 @@ const ITIMER_REAL_ID: TimerT = -1;
 const ITIMER_VIRTUAL_ID: TimerT = -2;
 const ITIMER_PROF_ID: TimerT = -3;
 
-const ITIMER_REAL: i32 = 0;
+/// setitimer(2) `which`: real time (SIGALRM)
+pub const ITIMER_REAL: i32 = 0;
 const ITIMER_VIRTUAL: i32 = 1;
 const ITIMER_PROF: i32 = 2;
 
@@ -1130,8 +1131,8 @@ const ITIMER_PROF: i32 = 2;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ITimerVal {
-    it_interval: crate::time::time_syscall::Timeval,
-    it_value: crate::time::time_syscall::Timeval,
+    pub it_interval: crate::time::time_syscall::Timeval,
+    pub it_value: crate::time::time_syscall::Timeval,
 }
 crate::pod!(ITimerVal {
     it_interval,
@@ -1250,37 +1251,23 @@ pub fn sys_setitimer(
     let (Some(interval), Some(value)) = (tv_to_ts(nv.it_interval), tv_to_ts(nv.it_value)) else {
         return Err(KernelError::InvalidArgument);
     };
-    let prev = itimer(which).settime(
+    let prev = do_setitimer(
+        which,
         &ITimerSpec {
             it_interval: interval,
             it_value: value,
         },
-        0,
     );
     if !old.is_null() {
-        old.write(&to_itimerval(prev))?;
+        old.write(&prev)?;
     }
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
-/// alarm(seconds): arm ITIMER_REAL once, returning the seconds left on
-/// the previous alarm, rounded to the nearest second but at least 1 if
-/// one was pending (Linux alarm_setitimer)
-pub fn sys_alarm(seconds: u32) -> KernelResult<i64> {
-    let spec = ITimerSpec {
-        it_interval: crate::time::time_syscall::LinuxTimespec::default(),
-        it_value: crate::time::time_syscall::LinuxTimespec {
-            tv_sec: i64::from(seconds),
-            tv_nsec: 0,
-        },
-    };
-    let prev = to_itimerval(itimer_real().settime(&spec, 0)).it_value;
-    let mut secs = prev.tv_sec;
-    if (secs == 0 && prev.tv_usec != 0) || prev.tv_usec >= 500_000 {
-        secs += 1;
-    }
-    Ok(secs)
+/// Arm the current process's itimer `which` (a valid one) with `spec`,
+/// returning its previous setting (Linux do_setitimer)
+pub fn do_setitimer(which: i32, spec: &ITimerSpec) -> ITimerVal {
+    to_itimerval(itimer(which).settime(spec, 0))
 }
 
 #[cfg(test)]

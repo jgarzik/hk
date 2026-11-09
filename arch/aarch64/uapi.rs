@@ -3,6 +3,9 @@
 //! arm64 mostly uses the asm-generic UAPI (include/uapi/asm-generic/) plus
 //! overrides in arch/arm64/include/uapi/asm/ in Linux.
 
+/// prctl PR_GET_TSC/PR_SET_TSC exist (Linux GET_TSC_CTL)
+pub const TSC_CTL: bool = false;
+
 /// uname(2) machine (Linux UTS_MACHINE)
 pub const UTS_MACHINE: &[u8] = b"aarch64";
 

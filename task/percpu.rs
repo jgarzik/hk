@@ -2256,6 +2256,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_real_parent,
         parent_parent_exec_id,
         parent_leader_exit_signal,
+        parent_iopl_emul,
     ) = {
         let table = TASKLIST.read();
         let parent = table.get(current_tid).ok_or(KernelError::NoProcess)?;
@@ -2285,6 +2286,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.real_parent.clone(),
             parent.parent_exec_id,
             leader_exit,
+            parent.iopl_emul,
         )
     };
     // Its own alloc_lock fields (lock-free but the memory policy)
@@ -2294,13 +2296,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         mempolicy: me.task_lock().mempolicy(),
     };
     let parent_mm = me.mm_ref();
-
-    // Get parent iopl_emul (x86-64 only) - must be done in separate block
-    #[cfg(target_arch = "x86_64")]
-    let parent_iopl_emul = {
-        let table = TASKLIST.read();
-        table.get(current_tid).map(|t| t.iopl_emul).unwrap_or(0)
-    };
 
     // A pid namespace's init cannot make a sibling (Linux
     // copy_process: CLONE_PARENT with SIGNAL_UNKILLABLE)
@@ -2464,8 +2459,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             no_new_privs: parent_prctl.no_new_privs, // Inherited (irreversible)
             timer_slack_ns: parent_prctl.timer_slack_ns, // Inherited
             keep_caps: false,                        // Reset on fork
-            #[cfg(target_arch = "x86_64")]
-            tsc_mode: parent_prctl.tsc_mode, // Inherited
+            tsc_mode: parent_prctl.tsc_mode,         // Inherited
             thp_disable: parent_prctl.thp_disable,   // Inherited
         },
         // Process personality (inherited from parent)
@@ -2474,7 +2468,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // Seccomp filters are reference-counted, so this is cheap
         seccomp_filter: parent_seccomp_filter,
         // I/O port permissions (x86-64 only, inherited from parent)
-        #[cfg(target_arch = "x86_64")]
         iopl_emul: parent_iopl_emul,
         // Copied like the rest of task->flags (Linux dup_task_struct)
         leader: config.flags & CLONE_THREAD == 0,
@@ -5338,30 +5331,5 @@ pub fn set_current_personality(personality: u32) {
     let mut table = TASKLIST.write();
     if let Some(mut task) = table.view_mut(&me) {
         task.personality = personality;
-    }
-}
-
-// =============================================================================
-// I/O port permissions (x86-64 only)
-// =============================================================================
-
-/// Get the current task's emulated IOPL level (x86-64 only)
-///
-/// Returns 0-3, where 3 grants full I/O port access.
-#[cfg(target_arch = "x86_64")]
-pub fn current_iopl_emul() -> u8 {
-    let table = TASKLIST.read();
-    table.view(&current()).map_or(0, |t| t.iopl_emul)
-}
-
-/// Set the current task's emulated IOPL level (x86-64 only)
-///
-/// Level must be 0-3. Caller is responsible for privilege checks.
-#[cfg(target_arch = "x86_64")]
-pub fn set_current_iopl_emul(level: u8) {
-    let me = current();
-    let mut table = TASKLIST.write();
-    if let Some(mut task) = table.view_mut(&me) {
-        task.iopl_emul = level;
     }
 }

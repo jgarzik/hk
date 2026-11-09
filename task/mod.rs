@@ -557,9 +557,8 @@ pub struct PrctlState {
     /// Keep capabilities across setuid (PR_SET_KEEPCAPS)
     /// When set, capabilities are preserved when changing UIDs
     pub keep_caps: bool,
-    /// TSC mode (x86-64 only): PR_TSC_ENABLE or PR_TSC_SIGSEGV
-    /// Controls whether RDTSC instruction is allowed
-    #[cfg(target_arch = "x86_64")]
+    /// TSC mode: PR_TSC_ENABLE or PR_TSC_SIGSEGV (set only where the
+    /// arch has PR_SET_TSC, `uapi::TSC_CTL`): whether RDTSC is allowed
     pub tsc_mode: u8,
     /// Transparent Huge Pages disabled for this process
     pub thp_disable: bool,
@@ -571,7 +570,6 @@ impl Default for PrctlState {
             no_new_privs: false,
             timer_slack_ns: 50_000, // 50 microseconds default
             keep_caps: false,
-            #[cfg(target_arch = "x86_64")]
             tsc_mode: prctl_ops::PR_TSC_ENABLE as u8, // RDTSC allowed by default
             thp_disable: false,
         }
@@ -1199,11 +1197,10 @@ pub struct TaskInner {
     // =========================================================================
     // I/O port permissions (x86-64 only)
     // =========================================================================
-    /// Emulated I/O privilege level (x86-64 only)
+    /// Emulated I/O privilege level (x86-64 iopl(2), Linux
+    /// thread.iopl_emul; 0 elsewhere)
     /// 0-2 = no direct I/O access, 3 = full I/O port access
-    /// This is an emulation of the CPU IOPL mechanism, stored per-task.
-    #[cfg(target_arch = "x86_64")]
-    iopl_emul: u8,
+    pub(crate) iopl_emul: u8,
 
     /// Thread-group leader (Linux thread_group_leader): created without
     /// CLONE_THREAD, or the thread whose exec ended the others
@@ -1285,7 +1282,6 @@ impl TaskInner {
             prctl: PrctlState::default(),
             personality: 0,
             seccomp_filter: None,
-            #[cfg(target_arch = "x86_64")]
             iopl_emul: 0,
             leader: true,
             ptrace: 0,

@@ -368,19 +368,6 @@ pub fn sys_clock_getres(clockid: i32, res: UserPtr<LinuxTimespec>) -> KernelResu
     Ok(res.write(&LinuxTimespec::from_ns(pclock.res_ns()))?)
 }
 
-/// time(tloc): seconds since the epoch, also stored at `tloc` if
-/// non-NULL (x86-64 only; aarch64 has clock_gettime)
-#[cfg(target_arch = "x86_64")]
-pub fn sys_time(tloc: UserPtr<i64>) -> KernelResult<i64> {
-    let seconds = TIMEKEEPER
-        .read(ClockId::Realtime, TIMEKEEPER.get_read_cycles())
-        .sec;
-    if !tloc.is_null() {
-        tloc.write(&seconds)?;
-    }
-    Ok(seconds)
-}
-
 /// Sleep until the CLOCK_MONOTONIC `deadline`, interruptibly
 ///
 /// On a signal, stores the remaining time in `rem` (if non-NULL) and returns
@@ -532,12 +519,6 @@ pub fn sys_eventfd2(initval: u32, flags: i32) -> KernelResult<i32> {
     }
     let file = create_eventfd(u64::from(initval), flags)?;
     crate::fs::io::fd_install(file, cloexec(flags & efd_flags::EFD_CLOEXEC != 0))
-}
-
-/// eventfd(initval): eventfd2 without flags (x86-64 only)
-#[cfg(target_arch = "x86_64")]
-pub fn sys_eventfd(initval: u32) -> KernelResult<i32> {
-    sys_eventfd2(initval, 0)
 }
 
 // ============================================================================

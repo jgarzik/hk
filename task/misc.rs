@@ -379,7 +379,6 @@ use crate::task::prctl_ops::{
     PR_SET_CHILD_SUBREAPER, PR_SET_DUMPABLE, PR_SET_KEEPCAPS, PR_SET_NAME, PR_SET_NO_NEW_PRIVS,
     PR_SET_PDEATHSIG, PR_SET_SECCOMP, PR_SET_THP_DISABLE, PR_SET_TIMERSLACK,
 };
-#[cfg(target_arch = "x86_64")]
 use crate::task::prctl_ops::{PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSEGV};
 
 /// sys_prctl - Process/thread control operations
@@ -547,9 +546,9 @@ pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> K
             Ok(0)
         }
 
-        #[cfg(target_arch = "x86_64")]
-        PR_GET_TSC => {
-            // Get TSC mode (x86-64 only), stored at arg2 (int *)
+        // Only where the arch has it (Linux GET_TSC_CTL; EINVAL otherwise)
+        PR_GET_TSC if crate::arch::uapi::TSC_CTL => {
+            // Get TSC mode, stored at arg2 (int *)
             let tsc_mode = {
                 let table = TASKLIST.read();
                 table.get(tid).ok_or(KernelError::NoProcess)?.prctl.tsc_mode
@@ -558,9 +557,8 @@ pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> K
             Ok(0)
         }
 
-        #[cfg(target_arch = "x86_64")]
-        PR_SET_TSC => {
-            // Set TSC mode (x86-64 only)
+        PR_SET_TSC if crate::arch::uapi::TSC_CTL => {
+            // Set TSC mode
             // arg2: PR_TSC_ENABLE (1) or PR_TSC_SIGSEGV (2)
             let mode = arg2 as i32;
             if mode != PR_TSC_ENABLE && mode != PR_TSC_SIGSEGV {
@@ -610,87 +608,6 @@ fn read_comm(addr: u64) -> KernelResult<[u8; 16]> {
 // =============================================================================
 // Thread-Local Storage syscalls
 // =============================================================================
-
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::percpu::{
-    ARCH_GET_CPUID, ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_CPUID, ARCH_SET_FS, ARCH_SET_GS,
-    read_fs_base, write_fs_base,
-};
-
-/// sys_arch_prctl - Architecture-specific thread state (x86_64 only)
-///
-/// Controls architecture-specific thread state. On x86_64, this is used
-/// primarily for setting the FS and GS base registers for thread-local storage.
-///
-/// Supported operations:
-/// - ARCH_SET_FS (0x1002): Set FS base address (user TLS pointer)
-/// - ARCH_GET_FS (0x1003): Get FS base address
-/// - ARCH_SET_GS (0x1001): Set the user GS base
-/// - ARCH_GET_GS (0x1004): Get the user GS base
-/// - ARCH_GET_CPUID (0x1011): Returns 1 (CPUID enabled; no faulting support)
-/// - ARCH_SET_CPUID (0x1012): -ENODEV (CPUID faulting not supported)
-///
-/// Returns 0 on success, negative errno on error.
-#[cfg(target_arch = "x86_64")]
-pub fn sys_arch_prctl(code: i32, addr: u64) -> KernelResult<i64> {
-    // addr is a value for the SET codes, a u64 * for the GET ones
-    let out = UserPtr::<u64>::new(addr);
-
-    match code {
-        ARCH_SET_FS => {
-            // Set FS base - user TLS pointer
-            if !crate::arch::user_tls_ok(addr) {
-                return Err(KernelError::NotPermitted);
-            }
-            super::percpu::current()
-                .tls
-                .store(addr, core::sync::atomic::Ordering::Relaxed);
-            write_fs_base(addr);
-            Ok(0)
-        }
-        ARCH_GET_FS => {
-            // Get FS base - return via user pointer
-            // The live register (user code may have changed it)
-            let tls = read_fs_base();
-
-            out.write(&tls)?;
-            Ok(0)
-        }
-        // CPUID faulting is not supported, so CPUID is always enabled.
-        // Matches Linux on CPUs without X86_FEATURE_CPUID_FAULT
-        // (arch/x86/kernel/process.c get_cpuid_mode/set_cpuid_mode).
-        ARCH_GET_CPUID => Ok(1),
-        ARCH_SET_CPUID => Err(KernelError::NoDevice),
-        ARCH_SET_GS => {
-            // The user GS base (the kernel's per-CPU base is swapped in
-            // on entry): null selector, then the base, like Linux
-            // do_arch_prctl_64
-            if !crate::arch::user_tls_ok(addr) {
-                return Err(KernelError::NotPermitted);
-            }
-            crate::arch::x86_64::percpu::load_user_gs_null();
-            crate::arch::write_user_gsbase(addr);
-            super::percpu::current()
-                .gsbase
-                .store(addr, core::sync::atomic::Ordering::Relaxed);
-            Ok(0)
-        }
-        ARCH_GET_GS => {
-            // The live user base (`mov gs` may have changed it)
-            let gs = crate::arch::read_user_gsbase();
-            out.write(&gs)?;
-            Ok(0)
-        }
-        _ => Err(KernelError::InvalidArgument),
-    }
-}
-
-/// sys_arch_prctl stub for non-x86_64 architectures
-#[cfg(not(target_arch = "x86_64"))]
-pub fn sys_arch_prctl(_code: i32, _addr: u64) -> KernelResult<i64> {
-    // arch_prctl is x86_64-specific
-    Err(KernelError::NotImplemented)
-}
 
 // =============================================================================
 // personality syscall - Process execution domain
@@ -1196,81 +1113,4 @@ fn pidfd_fget(pidfd_file: &File, targetfd: i32) -> KernelResult<alloc::sync::Arc
         .lock()
         .get(targetfd)
         .ok_or(KernelError::BadFd)
-}
-
-// =============================================================================
-// I/O port permissions (x86-64 only)
-// =============================================================================
-
-/// iopl - Set I/O privilege level (x86-64 only)
-///
-/// Changes the I/O privilege level of the calling thread. The IOPL determines
-/// which I/O ports the thread can access.
-///
-/// # Arguments
-/// * `level` - The new IOPL level (0-3). Level 3 grants access to all I/O ports.
-///
-/// # Returns
-/// * 0 on success
-/// * -EINVAL if level > 3
-/// * -EPERM if trying to raise privilege without CAP_SYS_RAWIO
-///
-/// # Security
-/// Lowering the privilege level is always allowed. Raising it requires
-/// CAP_SYS_RAWIO capability.
-///
-/// # Note
-/// This is an emulated IOPL - it doesn't modify the CPU's actual IOPL register.
-/// The kernel stores the level per-task and uses it for permission checks.
-#[cfg(target_arch = "x86_64")]
-pub fn sys_iopl(level: u32) -> KernelResult<()> {
-    use crate::task::{CAP_SYS_RAWIO, capable};
-
-    // Validate level (must be 0-3)
-    if level > 3 {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    // Get current IOPL level
-    let old = super::percpu::current_iopl_emul();
-
-    // No change? Done.
-    if level == u32::from(old) {
-        return Ok(());
-    }
-
-    // Lowering privilege is always allowed
-    if level < u32::from(old) {
-        super::percpu::set_current_iopl_emul(level as u8);
-        return Ok(());
-    }
-
-    // Raising privilege requires CAP_SYS_RAWIO
-    if !capable(CAP_SYS_RAWIO) {
-        return Err(KernelError::NotPermitted);
-    }
-
-    // Set new level
-    super::percpu::set_current_iopl_emul(level as u8);
-    Ok(())
-}
-
-/// ioperm - Set port input/output permissions (x86-64 only, stub)
-///
-/// This syscall allows fine-grained control over individual I/O ports (0-0x3ff).
-///
-/// # Arguments
-/// * `from` - Starting port number
-/// * `num` - Number of ports
-/// * `turn_on` - 1 to enable access, 0 to disable
-///
-/// # Returns
-/// * -ENOSYS - Not implemented (requires TSS I/O bitmap infrastructure)
-///
-/// # Note
-/// Full ioperm implementation requires per-task I/O permission bitmaps in the TSS.
-/// This is not yet implemented. Use iopl(3) for full I/O port access.
-#[cfg(target_arch = "x86_64")]
-pub fn sys_ioperm(_from: u64, _num: u64, _turn_on: i32) -> KernelResult<()> {
-    Err(KernelError::NotImplemented)
 }

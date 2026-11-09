@@ -31,6 +31,7 @@ pub mod percpu;
 pub mod pic;
 pub mod pit;
 pub mod power;
+pub mod process;
 pub mod ptrace;
 pub mod rtc;
 pub mod signal;
