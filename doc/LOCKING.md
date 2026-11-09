@@ -36,19 +36,19 @@ The kernel uses several synchronization primitives, each suited for different us
 
 ### 1.1 IrqSpinlock<T>
 
-**Location:** `arch/x86_64/spinlock.rs`, `arch/aarch64/spinlock.rs`
+**Location:** `sync/irqspin.rs` (lock and guard), `sync/irqflags.rs`
+(`local_irq_save`/`local_irq_restore`/`irqs_disabled`) over the arch
+primitives `arch::IrqFlagsOps` (`arch/x86_64/irqflags.rs`: RFLAGS,
+`pushfq; cli` / `sti`; `arch/aarch64/irqflags.rs`: DAIF, `mrs daif;
+msr daifset, #2` / `msr daif`). Linux: generic `raw_spin_lock_irqsave`
+over `arch_local_irq_save`.
 
 An IRQ-safe spinlock that disables interrupts and preemption while held. This is
 the primary lock for code paths that may be entered from both interrupt and
 process context.
 
-**Cross-Architecture Consistency:** Both x86_64 and aarch64 implementations MUST:
-1. Disable interrupts while held
-2. Increment `preempt_count` (via `percpu::preempt_disable()`)
-3. Decrement `preempt_count` on release (via `percpu::preempt_enable()`)
-
 **Properties:**
-- Disables interrupts on lock acquisition (via `cli`)
+- Disables interrupts on lock acquisition
 - Increments `preempt_count` (prevents context switch)
 - Saves and restores interrupt state on unlock
 - Uses `AtomicBool` with compare-exchange for lock state
@@ -57,14 +57,16 @@ process context.
 **Semantics (Linux equivalent: `spin_lock_irqsave`):**
 ```rust
 // On lock():
-1. pushfq; cli              // Save flags, disable interrupts
+1. local_irq_save           // Save flags, disable interrupts
 2. preempt_count++          // Disable preemption
 3. atomic compare-exchange  // Acquire lock
+4. lockdep irqsafe_acquire
 
 // On drop()/unlock():
 1. atomic store(false)      // Release lock
 2. preempt_count--          // Re-enable preemption
-3. sti (if was enabled)     // Restore interrupt state
+3. lockdep irqsafe_release
+4. local_irq_restore        // Restore interrupt state (last)
 ```
 
 **Use cases:**
@@ -75,7 +77,9 @@ process context.
 **Methods:**
 ```rust
 fn lock(&self) -> IrqSpinlockGuard<'_, T>
-unsafe fn force_unlock(&self)  // For context switch only
+fn try_lock(&self) -> Option<IrqSpinlockGuard<'_, T>>
+unsafe fn assume_held(&self) -> IrqSpinlockGuard<'_, T>  // context switch only
+unsafe fn IrqSpinlockGuard::rebind(self, lock)           // context switch only
 ```
 
 **Example:**

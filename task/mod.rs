@@ -992,7 +992,7 @@ pub struct Task {
     pub started: AtomicBool,
     /// Serializes the task's wakers (Linux pi_lock): IrqSpinlock, taken
     /// before its CPU's rq lock (`try_to_wake_up`)
-    pub pi_lock: crate::arch::IrqSpinlock<()>,
+    pub pi_lock: crate::sync::IrqSpinlock<()>,
 
     /// Parent process ID (0 for init/orphans; written under TASKLIST)
     pub ppid: AtomicU64,
@@ -1757,7 +1757,7 @@ impl Task {
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(false),
-            pi_lock: crate::arch::IrqSpinlock::new(()),
+            pi_lock: crate::sync::IrqSpinlock::new(()),
             ppid: AtomicU64::new(ids.ppid),
             pgid: AtomicU64::new(ids.pgid),
             sid: AtomicU64::new(ids.sid),
@@ -1822,7 +1822,7 @@ impl Task {
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(true),
-            pi_lock: crate::arch::IrqSpinlock::new(()),
+            pi_lock: crate::sync::IrqSpinlock::new(()),
             ppid: AtomicU64::new(0),
             pgid: AtomicU64::new(0),
             sid: AtomicU64::new(0),

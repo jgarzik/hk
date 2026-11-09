@@ -31,7 +31,7 @@ are in BUGS.md ("Allocation sizing and pure-code gaps").
 
 Stubs in place:
 - `sync/spin.rs`: `preempt_disable/enable` are no-ops under test.
-- `arch/{x86_64,aarch64}/spinlock.rs`: `IrqSpinlock` IRQ save/restore and preempt are
+- `sync/irqflags.rs`, `sync/irqspin.rs`: `IrqSpinlock` IRQ save/restore and preempt are
   no-ops, `irqs_disabled()` is false. So IRQ-safe state is usable.
 - `cpu.rs`: `try_this_id()` is `None`, every `PerCpu` access uses slot 0.
 - `task::percpu::current()`: with `PERCPU_UP` false it returns `INIT_TASK`, so

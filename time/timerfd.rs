@@ -28,11 +28,11 @@ use crate::util::kalloc::try_arc;
 use alloc::sync::{Arc, Weak};
 use core::pin::Pin;
 
-use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
 use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::time::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
 use crate::time::time_syscall::LinuxTimespec;

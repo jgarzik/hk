@@ -20,9 +20,9 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::arch::{IrqSpinlock, local_irq_restore, local_irq_save};
 use crate::mm::page::{PG_SLAB, Page};
 use crate::mm::page_alloc::{Gfp, this_cpu};
+use crate::sync::{IrqSpinlock, local_irq_restore, local_irq_save};
 use crate::util::cpumask::NR_CPUS;
 
 /// Largest per-CPU array

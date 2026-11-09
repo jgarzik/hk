@@ -44,13 +44,13 @@ use crate::util::pod::FromBytes;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::iov::IoVec;
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::PollTable;
 use crate::mm::PAGE_SIZE;
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::current;
 use crate::uaccess::{UserPtr, copy_from_user, copy_val_from_user};

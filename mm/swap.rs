@@ -24,13 +24,13 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::spin::{Mutex, RwLock};
 
-use crate::arch::IrqSpinlock;
 use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
 use crate::fs::{Inode, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::mm::page::frame_bytes;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
+use crate::sync::IrqSpinlock;
 use crate::task::{CAP_SYS_ADMIN, capable};
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};

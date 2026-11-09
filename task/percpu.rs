@@ -18,12 +18,11 @@ use alloc::vec::Vec;
 
 use crate::arch::ArchPageTable;
 use crate::arch::CurrentArch;
-use crate::arch::{
-    ContextOps, CpuOps, FrameAlloc, IrqSpinlock, PerCpuOps, SchedArch, UserModeOps, UserRegs,
-};
+use crate::arch::{ContextOps, CpuOps, FrameAlloc, PerCpuOps, SchedArch, UserModeOps, UserRegs};
 use crate::cpu::PerCpu;
 use crate::printkln;
 use crate::signal::notify::{Entry, Told, Zombie, notify};
+use crate::sync::IrqSpinlock;
 use crate::sync::spin::RwLock;
 use crate::task::sched::{self, Class, ClassQueues};
 use crate::task::{Cred, PRIORITY_IDLE, Pid, Priority, Task, TaskKind, TaskState, Tid};
@@ -3455,7 +3454,7 @@ unsafe fn switch_mm(mm: *const crate::mm::Mm) {
 /// in its pt_regs, on its own kernel stack.
 fn context_switch_locked(
     sched: &PerCpuScheduler,
-    mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>,
+    mut rq: crate::sync::IrqSpinlockGuard<'_, CpuRunQueue>,
     prev: &Task,
     next: *const Task,
 ) {
@@ -3500,7 +3499,7 @@ fn context_switch_locked(
 /// (Linux finish_task_switch): the task switched away from is off its
 /// stack now, so its `on_cpu` clears; release the lock, then free what
 /// a task that exited here left
-fn finish_task_switch(mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>) {
+fn finish_task_switch(mut rq: crate::sync::IrqSpinlockGuard<'_, CpuRunQueue>) {
     // SAFETY: kept alive by the scheduler's reference or by `rq.dead`
     if let Some(prev) = unsafe { rq.prev.as_ref() } {
         prev.se.set_on_cpu(false);
@@ -3625,7 +3624,7 @@ fn process_timeout(t: &crate::time::timer::TimerList) {
 
 /// Lock the run queue `p` is on (Linux task_rq_lock): the CPU it names
 /// once the lock is held
-fn task_rq_lock(p: &Task) -> crate::arch::IrqSpinlockGuard<'static, CpuRunQueue> {
+fn task_rq_lock(p: &Task) -> crate::sync::IrqSpinlockGuard<'static, CpuRunQueue> {
     loop {
         let cpu = p.cpu();
         let rq = get_percpu_sched(cpu).lock.lock();
@@ -3850,8 +3849,8 @@ const NR_MIGRATE: usize = 32;
 /// first lock's turns them back on once both are free
 struct DoubleRq {
     /// Taken second: fields drop in declaration order
-    inner: crate::arch::IrqSpinlockGuard<'static, CpuRunQueue>,
-    outer: crate::arch::IrqSpinlockGuard<'static, CpuRunQueue>,
+    inner: crate::sync::IrqSpinlockGuard<'static, CpuRunQueue>,
+    outer: crate::sync::IrqSpinlockGuard<'static, CpuRunQueue>,
     /// `outer` is `b`'s
     swapped: bool,
 }
@@ -4009,7 +4008,7 @@ fn migration_cpu_stop(m: &Migration<'_>) {
 /// on the other, the two locks one after the other. In between it is on
 /// no list while `on_rq`: everything that touches a queued task on its
 /// run queue holds its pi_lock or found it on that list.
-fn move_queued_task(mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>, p: &Task, dest: u32) {
+fn move_queued_task(mut rq: crate::sync::IrqSpinlockGuard<'_, CpuRunQueue>, p: &Task, dest: u32) {
     rq.save_lag(p);
     rq.dequeue(p);
     rq.add_nr(-1);
@@ -4666,9 +4665,9 @@ fn account_current(kernel: bool) {
     let me = current();
     if me.tid() != 0 {
         // Interrupts off: the tick charges this task too (acct_seq)
-        let irq = crate::arch::local_irq_save();
+        let irq = crate::sync::local_irq_save();
         me.account(crate::time::monotonic_ns(), kernel);
-        crate::arch::local_irq_restore(irq);
+        crate::sync::local_irq_restore(irq);
     }
 }
 

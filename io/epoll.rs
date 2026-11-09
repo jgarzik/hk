@@ -36,12 +36,12 @@ use alloc::vec::Vec;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::io::fget;
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::{WaitEntry, WaitQueue};
 use crate::task::Fd;
 use crate::task::percpu::WakeMode;

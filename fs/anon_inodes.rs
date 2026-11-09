@@ -22,11 +22,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Once;
 
-use crate::arch::IrqSpinlock;
 use crate::cpu::PerCpu;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps};
 use crate::fs::inode::{Inode, InodeMode, InodeOps, Timespec};
+use crate::sync::IrqSpinlock;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
 

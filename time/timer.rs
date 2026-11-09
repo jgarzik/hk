@@ -28,8 +28,8 @@ use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use crate::arch::IrqSpinlock;
 use crate::cpu::PerCpu;
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{TICK_NS, get_ticks};
 use crate::util::list::{Link, List};

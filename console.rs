@@ -42,7 +42,7 @@
 //! serial output transitions to a proper console (graphics, USB serial, etc.)
 //! without duplicate output.
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 
 /// Maximum number of console drivers that can be registered
 const MAX_CONSOLES: usize = 8;

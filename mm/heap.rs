@@ -14,7 +14,7 @@
 //! a device must come from the DMA API (`hw::dma` asserts).
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 use ::core::alloc::{GlobalAlloc, Layout};
 
 /// Minimum allocation block size (must be at least size of usize for back-pointer)

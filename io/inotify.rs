@@ -37,7 +37,6 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
-use crate::arch::IrqSpinlock;
 use crate::fs::Inode;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
@@ -45,6 +44,7 @@ use crate::fs::iov_iter::IovDest;
 use crate::fs::path_ref::Path;
 use crate::io::fasync::{FasyncList, POLL_IN, fasync_helper, kill_fasync};
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
+use crate::sync::IrqSpinlock;
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::uaccess::UserPtr;

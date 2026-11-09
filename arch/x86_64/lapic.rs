@@ -298,7 +298,7 @@ use crate::hw::mmio::IoMem;
 /// x2apic_send_IPI). Any context: the ICR is written with interrupts
 /// off, so an interrupt handler's IPI cannot interleave with ours.
 pub fn send_ipi(apic_id: u32, vector: u8) {
-    let irq = super::spinlock::local_irq_save();
+    let irq = crate::sync::local_irq_save();
     if X2APIC.load(Ordering::Relaxed) {
         // WRMSR to the ICR is not serializing: earlier stores (the
         // queued call) first (Linux weak_wrmsr_fence)
@@ -323,7 +323,7 @@ pub fn send_ipi(apic_id: u32, vector: u8) {
         lapic.write(LAPIC_ICR_HIGH, apic_id << 24);
         lapic.write(LAPIC_ICR_LOW, ICR_DEST_FIELD | u32::from(vector));
     }
-    super::spinlock::local_irq_restore(irq);
+    crate::sync::local_irq_restore(irq);
 }
 
 /// Global function to send EOI (for use from interrupt handlers)

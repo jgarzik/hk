@@ -11,6 +11,8 @@
 pub mod completion;
 pub mod waitqueue;
 
+mod irqflags;
+mod irqspin;
 pub mod lockdep;
 mod locked_by;
 mod mutex;
@@ -19,6 +21,8 @@ mod rwsem;
 mod seqlock;
 pub mod spin;
 
+pub use irqflags::{IrqFlags, irqs_disabled, local_irq_restore, local_irq_save};
+pub use irqspin::{IrqSpinlock, IrqSpinlockGuard};
 pub use locked_by::{LockedBy, UniqueOwner};
 pub use mutex::{Mutex, MutexGuard};
 pub use racy::RacyCell;
@@ -53,9 +57,7 @@ pub fn might_sleep() {
 /// context must not sleep (Linux preempt_count() != 0 || irqs_disabled())
 pub fn in_atomic() -> bool {
     use crate::arch::{CurrentArch, PerCpuOps};
-    crate::arch::preempt_count() != 0
-        || crate::arch::irqs_disabled()
-        || CurrentArch::interrupt_depth() != 0
+    crate::arch::preempt_count() != 0 || irqs_disabled() || CurrentArch::interrupt_depth() != 0
 }
 
 #[cfg(not(feature = "lockdep"))]
@@ -72,7 +74,7 @@ fn atomic_sleep(at: &'static core::panic::Location<'static>) {
          (preempt count {}, irqs off {}, irq depth {}, tid {})",
         at,
         crate::arch::preempt_count(),
-        crate::arch::irqs_disabled(),
+        irqs_disabled(),
         CurrentArch::interrupt_depth(),
         crate::task::percpu::current_tid()
     );

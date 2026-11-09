@@ -236,8 +236,8 @@ fn ipi_count(_info: usize) {
 /// syscall: the wait polls this CPU's own queue), then one call
 /// everywhere including here
 fn ipi_stress_thread(_arg: usize) {
-    use crate::arch::{local_irq_restore, local_irq_save};
     use crate::smp::{active_cpus, on_each_cpu, smp_call_function_many};
+    use crate::sync::{local_irq_restore, local_irq_save};
     let all = active_cpus();
     for r in 0..IPI_ROUNDS {
         let wait = r % 4 != 3 || r == IPI_ROUNDS - 1;

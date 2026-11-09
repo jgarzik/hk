@@ -22,7 +22,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
 
-use crate::arch::{CurrentArch, HaltOps, PerCpuOps, local_irq_restore, local_irq_save};
+use crate::arch::{CurrentArch, HaltOps, PerCpuOps};
+use crate::sync::{local_irq_restore, local_irq_save};
 use alloc::boxed::Box;
 use spin::Once;
 
@@ -294,7 +295,7 @@ fn check_context() {
     // spin Mutex raises it too, but its waiters spin with interrupts on
     // and so answer the call (Linux flushes TLBs under spinlocks too)
     if CurrentArch::interrupt_depth() > 0
-        || (crate::arch::preempt_count() > 0 && crate::arch::irqs_disabled())
+        || (crate::arch::preempt_count() > 0 && crate::sync::irqs_disabled())
     {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {

@@ -26,11 +26,11 @@
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
-use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 
 /// Eventfd flags

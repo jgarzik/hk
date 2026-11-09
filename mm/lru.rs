@@ -24,9 +24,9 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::FRAME_ALLOCATOR;
-use crate::arch::IrqSpinlock;
 use crate::cpu::PerCpu;
 use crate::mm::page::{PG_ACTIVE, PG_LRU, Page, pfn_to_page, phys_to_page};
+use crate::sync::IrqSpinlock;
 
 /// The lists (Linux enum lru_list)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

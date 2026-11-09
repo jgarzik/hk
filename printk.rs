@@ -31,7 +31,7 @@ use ::core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::console;
-use crate::arch::IrqSpinlock;
+use crate::sync::{IrqSpinlock, IrqSpinlockGuard};
 
 /// Output lock - serializes all console/serial writes
 ///
@@ -279,10 +279,7 @@ fn direct_serial_write(bytes: &[u8]) {
 pub struct PrintkWriter {
     /// Lock guard (None if in panic mode and lock unavailable)
     /// Uses IrqSpinlockGuard for IRQ safety
-    #[cfg(target_arch = "x86_64")]
-    _guard: Option<crate::arch::x86_64::spinlock::IrqSpinlockGuard<'static, ()>>,
-    #[cfg(target_arch = "aarch64")]
-    _guard: Option<crate::arch::aarch64::spinlock::IrqSpinlockGuard<'static, ()>>,
+    _guard: Option<IrqSpinlockGuard<'static, ()>>,
 }
 
 impl PrintkWriter {

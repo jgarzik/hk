@@ -18,8 +18,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::gic;
-use crate::arch::IrqSpinlock;
 use crate::irq::IrqHandler;
+use crate::sync::IrqSpinlock;
 use crate::util::error::KernelError;
 
 /// Maximum number of SPI interrupts supported

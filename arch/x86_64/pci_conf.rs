@@ -33,7 +33,7 @@ impl PortIoConfigAccess {
 
 /// Serializes the CF8 address / CFC data pair (Linux pci_lock): another
 /// CPU's access between the two would redirect this one
-static PCI_LOCK: crate::arch::IrqSpinlock<()> = crate::arch::IrqSpinlock::new(());
+static PCI_LOCK: crate::sync::IrqSpinlock<()> = crate::sync::IrqSpinlock::new(());
 
 impl PortIoConfigAccess {
     /// Select the register; the data port then reads/writes it, at

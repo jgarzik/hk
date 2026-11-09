@@ -25,7 +25,6 @@
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
-use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
 use crate::fs::iov_iter::IovDest;
@@ -34,6 +33,7 @@ use crate::signal::siginfo::Layout;
 use crate::signal::{
     SigFields, SigInfo, SigSet, Signal, UNMASKABLE_SIGNALS, with_task_signal_state,
 };
+use crate::sync::IrqSpinlock;
 use crate::task::percpu::current;
 use crate::util::pod::IntoBytes;
 

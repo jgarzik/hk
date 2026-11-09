@@ -8,7 +8,7 @@
 //! Single-socket systems (or systems without NUMA tables) are represented
 //! as having a single NUMA node (node 0) containing all CPUs and memory.
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 use crate::util::cpumask::{CpuSet, NR_CPUS};
 
 /// Maximum number of NUMA nodes supported

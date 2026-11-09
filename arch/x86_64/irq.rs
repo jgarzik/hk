@@ -17,8 +17,8 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::arch::IrqSpinlock;
 use crate::irq::IrqHandler;
+use crate::sync::IrqSpinlock;
 use crate::util::error::KernelError;
 
 /// Number of legacy PIC lines

@@ -74,34 +74,23 @@ pub use x86_64::power;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::power;
 
-// IRQ-safe spinlock - architecture-specific implementation
+// Device I/O memory barriers (dma_wmb/dma_rmb/wmb)
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::barrier;
-/// Device IRQ registration (shareable handlers, PCI INTx routing)
-// Device I/O memory barriers (dma_wmb/dma_rmb/wmb)
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::barrier;
 
+/// Device IRQ registration (shareable handlers, PCI INTx routing)
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::irq;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::percpu::{preempt_count, preempt_disable, preempt_enable};
-#[cfg(target_arch = "x86_64")]
-#[allow(unused_imports, reason = "not every arch uses every re-export")]
-pub use x86_64::spinlock::{
-    IrqSpinlock, IrqSpinlockGuard, irqs_disabled, local_irq_restore, local_irq_save,
-};
 
 /// Device IRQ registration (shareable handlers, PCI INTx routing)
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::irq;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::percpu::{preempt_count, preempt_disable, preempt_enable};
-#[cfg(target_arch = "aarch64")]
-#[allow(unused_imports, reason = "not every arch uses every re-export")]
-pub use aarch64::spinlock::{
-    IrqSpinlock, IrqSpinlockGuard, irqs_disabled, local_irq_restore, local_irq_save,
-};
 
 // Ptrace architecture-specific support
 #[cfg(target_arch = "x86_64")]
@@ -431,6 +420,26 @@ pub trait CpuOps {
     /// This is the STI;HLT pattern on x86-64, which ensures no interrupt
     /// window between enabling and halting.
     fn enable_and_halt();
+}
+
+/// Interrupt flag primitives behind `sync::irqflags` (Linux
+/// arch_local_save_flags, arch_local_irq_save, arch_local_irq_restore,
+/// arch_irqs_disabled_flags)
+pub trait IrqFlagsOps {
+    /// This CPU's saved interrupt state (x86 RFLAGS, arm64 DAIF)
+    type Flags: Copy;
+
+    /// The current state, unchanged
+    fn local_save_flags() -> Self::Flags;
+
+    /// Mask interrupts on this CPU, returning the previous state
+    fn local_irq_save() -> Self::Flags;
+
+    /// Restore a state saved by `local_irq_save` on this CPU
+    fn local_irq_restore(flags: Self::Flags);
+
+    /// `flags` has interrupts masked
+    fn irqs_disabled_flags(flags: Self::Flags) -> bool;
 }
 
 /// Task context and context switching operations

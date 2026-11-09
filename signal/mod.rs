@@ -33,7 +33,8 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::arch::{IrqSpinlock, UserFrame};
+use crate::arch::UserFrame;
+use crate::sync::IrqSpinlock;
 use crate::task::{Pid, Tid};
 
 // =============================================================================

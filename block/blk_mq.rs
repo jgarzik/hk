@@ -43,7 +43,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 
 use super::blkdev::{Bio, BioList, bio_endio};

@@ -64,8 +64,8 @@ mod imp {
     use core::panic::Location;
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    use crate::arch::IrqSpinlock;
     use crate::cpu::PerCpu;
+    use crate::sync::IrqSpinlock;
 
     type Loc = &'static Location<'static>;
 
@@ -395,7 +395,7 @@ mod imp {
         // Syscalls and faults run with interrupts on: sleeping with them
         // off (and no spinlock owning them) is a bug (Linux might_sleep's
         // irqs_disabled check)
-        let irqs_off = crate::arch::irqs_disabled();
+        let irqs_off = crate::sync::irqs_disabled();
         let depth = c.depth.get().min(DEPTH);
         let irq = c.irq.get();
         if c.busy.get() || (depth == 0 && pc == 0 && irq == 0 && !irqs_off) {

@@ -31,8 +31,8 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::pin::Pin;
 
-use crate::arch::IrqSpinlock;
 use crate::signal::{PidType, SIGALRM, SigQueue, Signal};
+use crate::sync::IrqSpinlock;
 use crate::sync::spin::Mutex;
 use crate::task::{Task, Tid};
 use crate::time::hrtimer::{HrClock, HrTimer};

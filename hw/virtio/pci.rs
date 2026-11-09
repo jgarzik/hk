@@ -28,12 +28,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::ring::{self, Layout, Vring};
 use super::{VirtioIrq, status};
-use crate::arch::IrqSpinlock;
 use crate::arch::barrier::wmb;
 use crate::hw::dma::{DmaCoherent, DmaConfig, DmaDevice};
 use crate::hw::mmio::IoMem;
 use crate::hw::pci::{PciDevice, cap_id};
 use crate::printkln;
+use crate::sync::IrqSpinlock;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 

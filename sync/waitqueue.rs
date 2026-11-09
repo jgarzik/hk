@@ -71,7 +71,7 @@ use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 use crate::task::Task;
 use crate::task::percpu::{
     MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, schedule_timeout, set_current_state,
@@ -658,7 +658,7 @@ fn test_preempt_count_tracking() {
     );
 
     // Test IrqSpinlock preempt tracking
-    let test_lock = crate::arch::IrqSpinlock::new(42u32);
+    let test_lock = crate::sync::IrqSpinlock::new(42u32);
     let before_lock = percpu::preempt_count();
 
     {
@@ -742,7 +742,7 @@ fn test_page_wait_table_hash() {
 mod relock_tests {
     extern crate std;
     use super::Relock;
-    use crate::arch::IrqSpinlock;
+    use crate::sync::IrqSpinlock;
     use core::panic::AssertUnwindSafe;
 
     /// A closure that unwinds out of `unlocked` leaves the lock held

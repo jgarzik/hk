@@ -11,8 +11,8 @@
 //! - Cursor position: CRT registers 14 (high) and 15 (low)
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use crate::arch::IrqSpinlock;
 use crate::console::{ConsoleDriver, ConsoleFlags, ConsolePriority, register_console};
+use crate::sync::IrqSpinlock;
 
 use super::io::outb;
 
