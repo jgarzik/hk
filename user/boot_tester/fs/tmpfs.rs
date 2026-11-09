@@ -25,6 +25,9 @@
 //!   punches the hole (Linux madvise_remove -> shmem_fallocate): the
 //!   page reads zeros through the mapping and read(), the next one and
 //!   the size stay; on ramfs (no hole punching) EOPNOTSUPP
+//! - TMPFS_FALLOC: fallocate as Linux shmem_fallocate: KEEP_SIZE past
+//!   EOF takes blocks but not the size, a hole punched there gives them
+//!   back, ZERO_RANGE is EOPNOTSUPP
 //! - DEVTMPFS_TMPFS: devtmpfs is a tmpfs with mode=755 (Linux
 //!   devtmpfs_init); another mount shows the same superblock; a bad
 //!   option is EINVAL, size= is parsed and dropped (Linux 6.15+; up to
@@ -56,6 +59,7 @@ pub fn run_tests() {
     devtmpfs();
     tmpfile();
     madv_remove();
+    falloc();
     sys_rmdir(MP.as_ptr());
 }
 
@@ -531,5 +535,41 @@ fn madv_remove() {
         sys_unlink(b"/tmp/tmpfs_lim/r\0".as_ptr());
         sys_umount2(MP.as_ptr(), 0);
     }
+    t.done();
+}
+
+fn falloc() {
+    const KEEP_SIZE: i32 = 1;
+    const PUNCH_HOLE: i32 = 2;
+    const ZERO_RANGE: i32 = 0x10;
+    const EOPNOTSUPP: i64 = -95;
+    let mut t = T::new(b"TMPFS_FALLOC");
+    if !t.eq(b"mount", mount(b"size=16k\0"), 0) {
+        return t.done();
+    }
+    let fd = sys_open(b"/tmp/tmpfs_lim/f\0".as_ptr(), O_CREAT | O_RDWR, 0o644);
+    t.eq(
+        b"keep size",
+        sys_fallocate(fd as i32, KEEP_SIZE, 0, 8192),
+        0,
+    );
+    let mut s = Stat::default();
+    sys_stat(b"/tmp/tmpfs_lim/f\0".as_ptr(), &mut s);
+    t.eq(b"size kept", s.st_size, 0);
+    t.eq(b"blocks taken", statfs().f_bfree, 2);
+    t.eq(
+        b"punch",
+        sys_fallocate(fd as i32, PUNCH_HOLE | KEEP_SIZE, 0, 8192),
+        0,
+    );
+    t.eq(b"blocks back", statfs().f_bfree, 4);
+    t.eq(
+        b"zero range",
+        sys_fallocate(fd as i32, ZERO_RANGE, 0, 4096),
+        EOPNOTSUPP,
+    );
+    sys_close(fd as u64);
+    sys_unlink(b"/tmp/tmpfs_lim/f\0".as_ptr());
+    t.eq(b"umount", sys_umount2(MP.as_ptr(), 0), 0);
     t.done();
 }

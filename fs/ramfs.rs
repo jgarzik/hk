@@ -704,9 +704,9 @@ impl InodeOps for RamfsInodeOps {
             if sl & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
                 return Err(KernelError::NotPermitted);
             }
-            // Nothing is cached past i_size: only the part of the hole
-            // below it (a hole wholly past EOF changes nothing)
-            filemap::punch_range(inode, offset, end.min(inode.get_size()));
+            // The whole range: pages fallocated with KEEP_SIZE may lie
+            // past i_size (Linux shmem_truncate_range ignores it)
+            filemap::punch_range(inode, offset, end);
         } else {
             inode.newsize_ok(end)?;
             if sl & crate::mm::memfd::F_SEAL_GROW != 0 && end > inode.get_size() {
