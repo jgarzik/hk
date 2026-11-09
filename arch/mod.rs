@@ -464,7 +464,7 @@ pub trait IrqChipOps {
     const NR_IRQS: usize;
 
     /// Configure (trigger, routing) and unmask line `irq` (its first
-    /// handler came)
+    /// handler came, or a new one to a line masked as nobody cared)
     fn irq_unmask(irq: u32);
     /// Mask line `irq` (its last handler went, or nobody claims it)
     fn irq_mask(irq: u32);

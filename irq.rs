@@ -14,8 +14,9 @@
 //! forever. Out of every 100,000 interrupts on a line, more than 99,900
 //! unclaimed ones disable it ("nobody cared"). An unclaimed interrupt
 //! more than 100 ms after the previous one restarts the unclaimed count,
-//! so occasional strays on a busy line never add up. An interrupt on a
-//! line without handlers masks it.
+//! so occasional strays on a busy line never add up; a new handler on a
+//! line disabled so unmasks it again (Linux __setup_irq gives it
+//! another chance). An interrupt on a line without handlers masks it.
 //!
 //! Locking: each line's descriptor has its own `IrqSpinlock`
 //! (`IrqDesc.lock`, Linux desc->lock), taken by `handle_irq` in IRQ
@@ -153,6 +154,8 @@ impl IrqAction {
 struct Line {
     actions: BoxList<ActionAdapter>,
     spurious: Spurious,
+    /// Masked as nobody cared (Linux IRQS_SPURIOUS_DISABLED)
+    spurious_disabled: bool,
 }
 
 impl Line {
@@ -185,13 +188,15 @@ impl<C: IrqChipOps> IrqDesc<C> {
             lock: IrqSpinlock::new(Line {
                 actions: BoxList::new(),
                 spurious: Spurious::new(),
+                spurious_disabled: false,
             }),
             _chip: PhantomData,
         }
     }
 
-    /// Linux __setup_irq: the first handler starts the line. A handler
-    /// already on it: its node comes back to be freed unlocked
+    /// Linux __setup_irq: the first handler starts the line, and so does
+    /// one added to a line masked as nobody cared. A handler already on
+    /// it: its node comes back to be freed unlocked
     fn add(&self, irq: u32, a: Box<IrqAction>) -> Result<(), Box<IrqAction>> {
         let mut line = self.lock.lock();
         if line.has(cookie(&a.handler)) {
@@ -199,7 +204,8 @@ impl<C: IrqChipOps> IrqDesc<C> {
         }
         line.actions.push_back(a);
         line.spurious.reset();
-        if line.actions.len() == 1 {
+        if line.actions.len() == 1 || line.spurious_disabled {
+            line.spurious_disabled = false;
             C::irq_unmask(irq);
         }
         Ok(())
@@ -224,6 +230,7 @@ impl<C: IrqChipOps> IrqDesc<C> {
         let handled = line.run(irq);
         let empty = line.actions.is_empty();
         let bad = !empty && line.spurious.note(handled, now_ns);
+        line.spurious_disabled |= bad;
         if bad || empty {
             C::irq_mask(irq);
         }
@@ -462,6 +469,23 @@ mod tests {
         assert_eq!(TABLE.handle(13, || 0), (false, true));
         assert!(!unmasked(13));
         assert_eq!(calls(&r), WINDOW);
+    }
+
+    /// A handler added to a line nobody cared about unmasks it again
+    /// with a fresh count; the drops mask it
+    #[test]
+    fn nobody_cared_reenabled() {
+        let a = TABLE.request(14, dev(IrqReturn::None)).unwrap();
+        for _ in 1..WINDOW {
+            TABLE.handle(14, || 0);
+        }
+        assert_eq!(TABLE.handle(14, || 0), (false, true));
+        assert!(!unmasked(14));
+        let b = TABLE.request(14, dev(IrqReturn::Handled)).unwrap();
+        assert!(unmasked(14));
+        assert_eq!(TABLE.handle(14, || 0), (true, false));
+        drop((a, b));
+        assert!(!unmasked(14));
     }
 
     /// A stuck line, nothing claims it: disabled at the window's end

@@ -3393,7 +3393,8 @@ the line's `IrqDesc.lock` (Linux irq_startup/irq_shutdown under desc->lock). Eve
 handler of a shared line is called; an interrupt on a line without
 handlers masks it, and a line nobody claims more than 99,900 times in a
 100,000-interrupt window is masked (stuck level INTx), reported after the
-lock is dropped.
+lock is dropped; a handler added to such a line unmasks it again (Linux
+__setup_irq clearing IRQS_SPURIOUS_DISABLED).
 
 - aarch64: SPIs are configured on unmask by `gic::enable_spi` (level/edge
   in ICFGR, priority 0x80, Group 1, IROUTER -> CPU 0, ISENABLER); PCI INTx
