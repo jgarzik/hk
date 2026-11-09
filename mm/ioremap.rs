@@ -16,9 +16,9 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch::paging::{VMALLOC_START, phys_to_virt};
+use crate::arch::paging::{VMALLOC_START, phys_to_virt, phys_to_virt_table};
 use crate::arch::{CurrentArch, IoremapOps};
-use crate::mm::swapper::swapper_phys;
+use crate::mm::swapper::{self, idx, swapper_phys};
 use crate::mm::tlb::flush_tlb_kernel_range;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
@@ -312,16 +312,10 @@ pub(crate) unsafe fn vunmap_page(va: u64) -> Option<u64> {
 ///
 /// `table` is a kernel table frame under the swapper (never freed).
 unsafe fn entry(table: u64, idx: usize) -> &'static AtomicU64 {
-    let p = phys_to_virt(table).cast::<u64>().wrapping_add(idx & 511);
-    // SAFETY: an entry of a table frame that stays (the caller's
-    // guarantee), through the direct map; page-table entries are only
-    // accessed atomically
-    unsafe { AtomicU64::from_ptr(p) }
-}
-
-/// Index of `va` in its table at the level of `shift`
-fn idx(va: u64, shift: u32) -> usize {
-    ((va >> shift) & 511) as usize
+    // SAFETY: an entry (in bounds: mod 512) of a table frame that stays
+    // (the caller's guarantee), through the direct map; page-table
+    // entries are only accessed atomically
+    unsafe { AtomicU64::from_ptr(swapper::ent(phys_to_virt_table(table), idx & 511)) }
 }
 
 /// Map a single 4KB page in the vmalloc window of the swapper's kernel

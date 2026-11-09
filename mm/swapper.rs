@@ -81,7 +81,7 @@ fn pool_page() -> u64 {
 ///
 /// # Safety
 /// `table` is a live page table and `idx < 512`.
-unsafe fn ent(table: *mut RawPageTable, idx: usize) -> *mut u64 {
+pub unsafe fn ent(table: *mut RawPageTable, idx: usize) -> *mut u64 {
     // SAFETY: a page table is 512 u64 entries (the size assert; both
     // arches' entries are transparent u64s); in bounds (the caller's
     // guarantee)
