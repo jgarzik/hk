@@ -52,7 +52,7 @@ pub mod flags {
     /// Asynchronous I/O (generate SIGIO)
     pub const O_ASYNC: u32 = 0o20000;
     /// Must be a directory / don't follow symlinks (values differ per arch)
-    pub use crate::arch::uapi::{O_DIRECTORY, O_NOFOLLOW};
+    pub use crate::arch::uapi::{O_DIRECTORY, O_LARGEFILE, O_NOFOLLOW};
     /// Close on exec
     pub const O_CLOEXEC: u32 = 0o2000000;
     /// An unnamed file in the directory named (asm-generic __O_TMPFILE;

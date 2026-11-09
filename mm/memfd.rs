@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use crate::fs::File;
+use crate::fs::flags::{O_LARGEFILE, O_RDWR};
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
 
@@ -105,7 +106,7 @@ pub fn sys_memfd_create(uname: UserPtr<u8>, flags: u32) -> KernelResult<i32> {
     if flags & MFD_HUGETLB != 0 {
         return Err(KernelError::NotImplemented);
     }
-    let file = crate::fs::tmpfs::shmem_file_setup(&name, 0)?;
+    let file = crate::fs::tmpfs::shmem_file_setup(&name, 0, O_RDWR | O_LARGEFILE)?;
     let inode = file.get_inode().ok_or(KernelError::Io)?;
     if flags & MFD_NOEXEC_SEAL != 0 {
         inode.set_mode_perm(inode.mode().perm() & !0o111);

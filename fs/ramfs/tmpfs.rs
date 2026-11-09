@@ -539,17 +539,21 @@ pub fn shmem_init() -> Result<(), KernelError> {
 }
 
 /// An unnamed regular file of `size` bytes on the kernel's tmpfs, open
-/// for reading and writing (Linux shmem_file_setup: mode 0777, a pseudo
+/// with `flags` (O_RDWR, plus O_LARGEFILE for a memfd; Linux
+/// shmem_file_setup: mode 0777, a pseudo
 /// dentry `name` that /proc shows as "/<name> (deleted)")
-pub fn shmem_file_setup(name: &[u8], size: u64) -> Result<Arc<crate::fs::File>, KernelError> {
-    use crate::fs::flags::O_RDWR;
+pub fn shmem_file_setup(
+    name: &[u8],
+    size: u64,
+    flags: u32,
+) -> Result<Arc<crate::fs::File>, KernelError> {
     let mnt = SHM_MNT.get().ok_or(KernelError::NoDevice)?.clone();
     let inode = super::new_file(&mnt.sb, 0o777)?;
     inode.set_size(size);
     let dentry = crate::fs::Dentry::tmpfile_named(&mnt.root, name, inode.clone())?;
     let w = mnt.want_write()?;
     let iw = inode.get_write_access()?;
-    let mut f = crate::fs::File::new(dentry, Some(mnt), O_RDWR, &super::TMPFS_FILE_OPS);
+    let mut f = crate::fs::File::new(dentry, Some(mnt), flags, &super::TMPFS_FILE_OPS);
     f.write_access = Some(w);
     f.i_write = Some(iw);
     try_arc(f)
@@ -561,7 +565,7 @@ pub fn shmem_kernel_file_setup(
     name: &[u8],
     size: u64,
 ) -> Result<Arc<crate::fs::File>, KernelError> {
-    shmem_file_setup(name, size)
+    shmem_file_setup(name, size, crate::fs::flags::O_RDWR)
 }
 
 /// The tmpfs filesystem type (Linux shmem_fs_type)

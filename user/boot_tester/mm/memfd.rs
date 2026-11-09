@@ -1,6 +1,7 @@
 //! memfd_create and file seals (Linux mm/memfd.c, mm/shmem.c)
 //!
-//! - MEMFD_CREATE: "memfd:<name>" in /proc/self/fd, MFD_CLOEXEC, mode
+//! - MEMFD_CREATE: "memfd:<name>" in /proc/self/fd, open O_RDWR |
+//!   O_LARGEFILE, MFD_CLOEXEC, mode
 //!   0777 by default (vm.memfd_noexec 0), MFD_NOEXEC_SEAL drops the exec
 //!   bits and seals F_SEAL_EXEC; bad flags and long names EINVAL
 //! - MEMFD_SEALS: F_GET_SEALS / F_ADD_SEALS (F_SEAL_SEAL without
@@ -29,6 +30,7 @@ const MFD_EXEC: u32 = 0x10;
 const F_ADD_SEALS: i32 = 1033;
 const F_GET_SEALS: i32 = 1034;
 const F_GETFD: i32 = 1;
+const F_GETFL: i32 = 3;
 const SEAL: u64 = 1;
 const SHRINK: u64 = 2;
 const GROW: u64 = 4;
@@ -79,6 +81,13 @@ fn create() {
         return t.done();
     }
     t.eq(b"cloexec", sys_fcntl(fd as i32, F_GETFD, 0), 1);
+    // O_RDWR | O_LARGEFILE (Linux memfd_alloc_file)
+    let fl = sys_fcntl(fd as i32, F_GETFL, 0);
+    t.ok(
+        b"getfl",
+        fl & 3 == 2 && fl & i64::from(hk_syscall::O_LARGEFILE) != 0,
+        fl,
+    );
     let mut p = [0u8; 32];
     let mut name = [0u8; 64];
     let n = sys_readlink(fd_path(fd, &mut p).as_ptr(), name.as_mut_ptr(), 64);

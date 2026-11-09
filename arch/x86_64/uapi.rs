@@ -88,6 +88,9 @@ crate::pod!(Stat {
 // O_* flags whose values differ per arch (include/uapi/asm-generic/fcntl.h)
 /// Must be a directory
 pub const O_DIRECTORY: u32 = 0o200000;
+/// Large-file offsets (always on 64-bit; Linux sets it on every open
+/// file, force_o_largefile)
+pub const O_LARGEFILE: u32 = 0o100000;
 /// Don't follow a trailing symlink
 pub const O_NOFOLLOW: u32 = 0o400000;
 
