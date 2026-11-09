@@ -246,6 +246,24 @@ lo (hk has no checksum offload states).
 - fanotify_mark keeps only the mask: FAN_MARK_IGNORED_MASK,
   FAN_MARK_IGNORE, FAN_MARK_IGNORED_SURV_MODIFY and FAN_MARK_EVICTABLE
   are accepted but have no effect (Linux fanotify_add_mark).
+- A NULL pathname is EINVAL; Linux fanotify_find_path marks dfd's own
+  file (a descriptor, not a path-only one).
+
+## open and path-walk gaps
+
+**Location**: `fs/open.rs`, `fs/namei.rs`, `fs/proc/mod.rs`
+
+- O_EMPTYPATH (Linux 7.2) is not done: open(2) drops the bit and
+  openat2 refuses it (EINVAL), so an empty path stays ENOENT (Linux
+  LOOKUP_EMPTY: the open names dirfd itself; O_PATH keeps the flag).
+- O_DIRECT is kept in f_flags but does nothing; Linux do_dentry_open
+  refuses it (EINVAL) on a file without direct I/O (ramfs).
+- /proc/<pid>/fd/<n> of a pipe, socket or anonymous file is followed by
+  its text, not jumped to (fd_jump), so it cannot be opened again (Linux
+  proc_fd_link jumps to the pipefs/sockfs/anon file); /proc/<pid>/cwd,
+  root and exe are followed by their text too (`PidLink`), so they
+  resolve from the caller's root, not the target's (Linux
+  proc_pid_get_link jumps). Both are still magic links to RESOLVE_*.
 
 ## File lock gaps
 
@@ -529,6 +547,8 @@ Missing on top of that:
 - IORING_OP_LINK_TIMEOUT returns 0 without arming anything
 - poll ops never complete asynchronously; IOSQE_IO_DRAIN and ASYNC are
   ignored
+- IORING_OP_OPENAT2 is not handled (Linux io_openat2: the open_how
+  rules of `fs/open.rs` sys_openat2, without its page limit)
 
 The boot tests cover setup and enter return values only.
 
@@ -570,8 +590,7 @@ without THP, NUMA or CONFIG_TMPFS_QUOTA. inode32 is recorded and shown
 but inode numbers do not wrap at 2^32 (Linux shmem_reserve_inode).
 F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
-waiting). /proc/<pid>/fd/<n> of a directory, pipe or socket is followed
-by its text, not jumped to (`fs/proc/mod.rs` fd_jump).
+waiting).
 
 ## Kernel heap (slab) gaps
 
