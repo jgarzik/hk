@@ -1391,29 +1391,35 @@ fn idle_task_entry() -> ! {
 /// enable them. A kernel thread is its own process (pid == tid, Linux),
 /// created asleep (the creator finishes its setup, then wakes it); an
 /// `idle` task is tid 0, outside TASKLIST (Linux swapper/N), and becomes
-/// its CPU's idle task.
+/// its CPU's idle task. A failure is logged here: alloc_pid's error, or
+/// OutOfMemory for its credentials, stack or task.
 fn create_kernel_task(
     cpu_id: u32,
     name: &str,
     entry: usize,
     priority: Priority,
     idle: bool,
-) -> Result<TaskRef, &'static str> {
+) -> Result<TaskRef, KernelError> {
+    let fail = |why: &str, e: KernelError| {
+        printkln!("kthread {}: {}", name, why);
+        e
+    };
     let thread_pid = if idle {
         None
     } else {
         Some(
             crate::task::pid::alloc_pid(&crate::ns::INIT_PID_NS)
-                .map_err(|_| "No pid left for kernel thread")?,
+                .map_err(|e| fail("no pid left", e))?,
         )
     };
     let tid = thread_pid.as_ref().map_or(0, |p| Tid::from(p.nr()));
     let pid = tid;
 
-    const NOMEM: &str = "Out of memory for kernel thread";
-    let cred = try_arc(Cred::ROOT).map_err(|_| NOMEM)?;
+    let nomem = |_| fail("out of memory", KernelError::OutOfMemory);
+    let cred = try_arc(Cred::ROOT).map_err(nomem)?;
     let sig = crate::signal::TaskSignalState::new();
-    let stack = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
+    let stack =
+        crate::mm::vmstack::alloc().ok_or_else(|| fail("no stack", KernelError::OutOfMemory))?;
     let stack_top = stack.top();
 
     // In no process group or session (never signalled by group); no
@@ -1445,7 +1451,7 @@ fn create_kernel_task(
     unsafe { *task.se.ctx() = TaskContext::new_kernel_thread(entry, stack_top) };
     task.se.stack.set(stack);
     // On failure the stack goes with the task
-    let task = try_arc(task).map_err(|_| NOMEM)?;
+    let task = try_arc(task).map_err(nomem)?;
     if idle {
         set_idle(cpu_id, &task);
     } else {
@@ -1496,7 +1502,7 @@ fn wake_up_new_task(p: &TaskRef) {
 ///
 /// The idle task is always runnable at PRIORITY_IDLE (0). The CPU may enter
 /// the scheduler only once this is done, so `initialized` is set last.
-fn create_idle_task(cpu_id: u32) -> Result<(), &'static str> {
+fn create_idle_task(cpu_id: u32) -> Result<(), KernelError> {
     crate::time::timer::init_cpu(cpu_id);
     create_kernel_task(
         cpu_id,
@@ -1520,9 +1526,10 @@ pub fn create_kthread_task(
     name: &str,
     entry: usize,
     priority: Priority,
-) -> Result<TaskRef, &'static str> {
+) -> Result<TaskRef, KernelError> {
     if !get_percpu_sched(cpu_id).initialized.load(Ordering::Acquire) {
-        return Err("CPU has no scheduler");
+        printkln!("kthread {}: CPU {} has no scheduler", name, cpu_id);
+        return Err(KernelError::InvalidArgument);
     }
     create_kernel_task(cpu_id, name, entry, priority, false)
 }
@@ -1532,11 +1539,8 @@ pub fn create_kthread_task(
 pub fn init_ap_schedulers() {
     let bsp = crate::cpu::this_id();
     for (cpu, _) in PERCPU_SCHEDS.for_each_possible() {
-        if cpu != bsp
-            && CurrentArch::cpu_online(cpu)
-            && let Err(e) = create_idle_task(cpu)
-        {
-            printkln!("SCHED: no scheduler for CPU {}: {}", cpu, e);
+        if cpu != bsp && CurrentArch::cpu_online(cpu) && create_idle_task(cpu).is_err() {
+            printkln!("SCHED: no scheduler for CPU {}", cpu);
         }
     }
 }
@@ -1558,7 +1562,7 @@ pub fn init() {
     // Create idle task for BSP
     match create_idle_task(cpu_id) {
         Ok(_tid) => {}
-        Err(e) => panic!("Failed to create BSP idle task: {}", e),
+        Err(e) => panic!("Failed to create BSP idle task: {:?}", e),
     }
 }
 
@@ -1579,11 +1583,13 @@ pub fn can_sleep() -> bool {
 ///
 /// # Arguments
 /// * `config` - User task configuration (pid, tid, ppid, pgid, sid, priority, stacks, page table)
-pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, &'static str> {
+pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> {
     let cpu_id = crate::cpu::this_id();
     // init is pid 1 (Linux: the first pid of the root namespace)
-    let thread_pid = crate::task::pid::alloc_pid_nr(&crate::ns::INIT_PID_NS, &[1])
-        .map_err(|_| "init: pid 1 taken")?;
+    let thread_pid =
+        crate::task::pid::alloc_pid_nr(&crate::ns::INIT_PID_NS, &[1]).inspect_err(|_| {
+            printkln!("init: pid 1 taken");
+        })?;
     let (tid, pid): (Tid, Pid) = (1, 1);
     // The first address space owns the boot-built tables
     let mm = crate::mm::mm_alloc(config.page_table.root_table_phys());
