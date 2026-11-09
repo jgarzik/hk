@@ -88,7 +88,7 @@ impl PercpuCounter {
         let _irq = IrqOff::new();
         if let Some(p) = self.part() {
             let v = p.fetch_add(amount, Ordering::Relaxed) + amount;
-            if v.abs() < self.batch {
+            if v.unsigned_abs() < self.batch.unsigned_abs() {
                 return;
             }
             let _l = self.lock.lock();
@@ -123,7 +123,9 @@ impl PercpuCounter {
         if let Some(p) = part {
             let local = p.load(Ordering::Relaxed);
             let global = self.count.load(Ordering::Relaxed);
-            if (local + amount).abs() < self.batch && global + unknown <= limit {
+            if (local + amount).unsigned_abs() < self.batch.unsigned_abs()
+                && global + unknown <= limit
+            {
                 p.fetch_add(amount, Ordering::Relaxed);
                 return true;
             }
@@ -164,5 +166,15 @@ mod tests {
             assert!(c.limited_add(1000, 1));
         }
         assert_eq!(c.sum(), 100);
+    }
+
+    /// A part at i64::MIN folds; its magnitude never overflows
+    #[test]
+    fn extreme_part() {
+        let c = PercpuCounter::new().unwrap();
+        c.add(i64::MIN);
+        assert_eq!(c.sum(), i64::MIN);
+        c.add(i64::MAX);
+        assert_eq!(c.sum(), -1);
     }
 }
