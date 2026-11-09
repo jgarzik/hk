@@ -158,14 +158,14 @@ pub struct RamfsInodeData {
     /// The superblock's xattr space this inode's attributes are charged
     /// to (set by the first charge) and how much they hold, returned
     /// when the inode is freed (Linux shmem_evict_inode)
-    xattr_pool: spin::Once<Arc<AtomicU64>>,
+    xattr_pool: spin::Once<Arc<tmpfs::Acct>>,
     xattr_bytes: AtomicU64,
 }
 
 impl Drop for RamfsInodeData {
     fn drop(&mut self) {
         if let Some(pool) = self.xattr_pool.get() {
-            pool.fetch_add(*self.xattr_bytes.get_mut(), Ordering::Relaxed);
+            pool.give_ispace(*self.xattr_bytes.get_mut());
         }
     }
 }
@@ -262,15 +262,6 @@ const XATTR_REPLACE: u32 = 0x2;
 /// simple_xattr_space: 40 + size + name length)
 fn xattr_space(name: &[u8], size: usize) -> u64 {
     (40 + size + name.len()) as u64
-}
-
-/// Take `n` bytes of xattr space from `pool` (ENOSPC when short)
-fn xattr_reserve(pool: &AtomicU64, n: u64) -> Result<(), KernelError> {
-    pool.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-        cur.checked_sub(n)
-    })
-    .map(|_| ())
-    .map_err(|_| KernelError::NoSpace)
 }
 
 /// Directory entries with stable readdir positions (Linux
@@ -380,7 +371,7 @@ impl AsAny for RamfsInodeData {
 impl InodeData for RamfsInodeData {}
 
 /// The xattr space of `inode`'s file system (None: not counted)
-fn xattr_pool(inode: &Inode) -> Option<Arc<AtomicU64>> {
+fn xattr_pool(inode: &Inode) -> Option<Arc<tmpfs::Acct>> {
     let sb = inode.superblock()?;
     tmpfs::with(&sb, |t| t.xattr_pool())?
 }
@@ -971,7 +962,7 @@ impl InodeOps for RamfsInodeOps {
         let need = xattr_space(name, value.len());
         let pool = xattr_pool(inode);
         if let Some(p) = &pool {
-            xattr_reserve(p, need)?;
+            p.take_ispace(need)?;
             ramfs_data.xattr_pool.call_once(|| p.clone());
         }
         let r = ramfs_data.xattrs.set(name, v, flags);
@@ -984,7 +975,7 @@ impl InodeOps for RamfsInodeOps {
                 ramfs_data.xattr_bytes.fetch_add(need, Ordering::Relaxed);
                 ramfs_data.xattr_bytes.fetch_sub(back, Ordering::Relaxed);
             }
-            p.fetch_add(back, Ordering::Relaxed);
+            p.give_ispace(back);
         }
         r.map(|_| ())
     }
@@ -1031,7 +1022,7 @@ impl InodeOps for RamfsInodeOps {
         if let Some(p) = ramfs_data.xattr_pool.get() {
             let n = xattr_space(name, old.value.len());
             ramfs_data.xattr_bytes.fetch_sub(n, Ordering::Relaxed);
-            p.fetch_add(n, Ordering::Relaxed);
+            p.give_ispace(n);
         }
         Ok(())
     }

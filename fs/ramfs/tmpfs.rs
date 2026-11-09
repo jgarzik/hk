@@ -11,17 +11,17 @@
 //!
 //! ## Locking
 //!
-//! No lock (doc/LOCKING.md, tmpfs accounting): the free blocks and the
-//! free inode space are atomic counters whose limit check and update are
-//! one compare-exchange (Linux takes sbinfo->stat_lock and a percpu
-//! counter); a remount moves a limit by adding the difference to the
-//! free counter in one compare-exchange that fails if the use already
-//! exceeds the new limit, under s_umount. Charges run in any context
-//! (an inode's last reference) and never sleep.
+//! As Linux shmem (doc/LOCKING.md, tmpfs accounting): the inode space
+//! and the limits change under `Acct.stat` (Linux sbinfo->stat_lock, an
+//! IrqSpinlock leaf: an inode's last reference may come in any context);
+//! file pages are charged to a per-CPU counter (`PercpuCounter`, Linux
+//! used_blocks) whose limited add checks the block limit, read without
+//! the lock as Linux does. A remount checks and changes everything under
+//! the stat lock, all or nothing, holding s_umount. Nothing sleeps.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fs::KernelError;
 use crate::fs::inode::{AsAny, Gid, Uid};
@@ -29,7 +29,9 @@ use crate::fs::superblock::{
     FileSystemType, StatFs, SuperBlock, SuperBlockData, SuperOps, TMPFS_MAGIC, sb_flag_word,
 };
 use crate::mm::filemap::{self, PageAcct};
+use crate::sync::IrqSpinlock;
 use crate::util::kalloc::try_arc;
+use crate::util::percpu_counter::PercpuCounter;
 
 /// Inode space one inode takes (Linux BOGO_INODE_SIZE)
 const BOGO_INODE_SIZE: u64 = 1024;
@@ -65,66 +67,89 @@ fn default_inodes() -> u64 {
     (totalram_pages() / 2).min(u64::MAX / BOGO_INODE_SIZE)
 }
 
-/// The block limit file pages are charged to
-pub struct Blocks {
-    /// The limit in pages, 0 for none (Linux max_blocks)
-    max: AtomicU64,
-    /// Pages left under it (Linux max_blocks - used_blocks); not kept
-    /// while there is no limit
-    free: AtomicU64,
+/// The limits and inode space of a tmpfs, under `stat` (Linux
+/// sbinfo->stat_lock)
+struct Stat {
+    /// The inode limit, 0 for none (Linux max_inodes)
+    max_inodes: u64,
+    /// Inode space left: inodes times BOGO_INODE_SIZE, less xattrs
+    /// (Linux free_ispace); not kept while there is no inode limit
+    free_ispace: u64,
+    /// inode64 (Linux full_inums)
+    inode64: bool,
+    noswap: bool,
 }
 
-impl PageAcct for Blocks {
+/// A tmpfs's accounting (Linux shmem_sb_info's counters): file pages
+/// charged to `used_blocks` against `max_blocks`, inodes and xattrs to
+/// the inode space in `stat`
+pub struct Acct {
+    /// Linux stat_lock: the inode space and the limits change under it
+    stat: IrqSpinlock<Stat>,
+    /// The block limit in pages, 0 for none (Linux max_blocks): written
+    /// under `stat`, read without it by a charge, as Linux
+    max_blocks: AtomicU64,
+    /// Pages charged (Linux used_blocks, a percpu_counter); kept only
+    /// while there is a block limit
+    used_blocks: PercpuCounter,
+}
+
+impl PageAcct for Acct {
+    /// Linux shmem_inode_acct_blocks: ENOSPC past the limit
     fn charge(&self, pages: u64) -> Result<(), KernelError> {
-        if self.max.load(Ordering::Relaxed) == 0 {
+        let max = self.max_blocks.load(Ordering::Relaxed);
+        if max == 0 {
             return Ok(());
         }
-        take(&self.free, pages)
+        if self.used_blocks.limited_add(max as i64, pages as i64) {
+            Ok(())
+        } else {
+            Err(KernelError::NoSpace)
+        }
     }
 
+    /// Linux shmem_inode_unacct_blocks
     fn uncharge(&self, pages: u64) {
-        if self.max.load(Ordering::Relaxed) != 0 {
-            self.free.fetch_add(pages, Ordering::Relaxed);
+        if self.max_blocks.load(Ordering::Relaxed) != 0 {
+            self.used_blocks.add(-(pages as i64));
         }
     }
 }
 
-/// Take `n` from the counter `c` (NoSpace when short)
-fn take(c: &AtomicU64, n: u64) -> Result<(), KernelError> {
-    c.try_update(Ordering::Relaxed, Ordering::Relaxed, |f| f.checked_sub(n))
-        .map(|_| ())
-        .map_err(|_| KernelError::NoSpace)
-}
+impl Acct {
+    /// Take `n` bytes of inode space (an inode, an extra link, an xattr):
+    /// ENOSPC when short; nothing is counted without an inode limit
+    pub fn take_ispace(&self, n: u64) -> Result<(), KernelError> {
+        let mut st = self.stat.lock();
+        if st.max_inodes == 0 {
+            return Ok(());
+        }
+        st.free_ispace = st.free_ispace.checked_sub(n).ok_or(KernelError::NoSpace)?;
+        Ok(())
+    }
 
-/// Move the limit `max` with free counter `free` to `new` (not 0):
-/// EINVAL if more than `new` is in use (Linux shmem_reconfigure "Too
-/// small a size for current use"), the counter unchanged
-fn relimit(max: &AtomicU64, free: &AtomicU64, new: u64) -> Result<(), KernelError> {
-    let old = max.load(Ordering::Relaxed);
-    free.try_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
-        let used = old.saturating_sub(f);
-        new.checked_sub(used)
-    })
-    .map_err(|_| KernelError::InvalidArgument)?;
-    max.store(new, Ordering::Relaxed);
-    Ok(())
+    /// Give `n` bytes of inode space back
+    pub fn give_ispace(&self, n: u64) {
+        let mut st = self.stat.lock();
+        if st.max_inodes != 0 {
+            st.free_ispace += n;
+        }
+    }
+
+    /// An inode limit is set (xattrs are counted only then: Linux
+    /// shmem_xattr_handler_set)
+    fn limited_inodes(&self) -> bool {
+        self.stat.lock().max_inodes != 0
+    }
 }
 
 /// One tmpfs superblock's limits and options (Linux shmem_sb_info)
 pub struct ShmemSb {
-    blocks: Arc<Blocks>,
-    /// The inode limit, 0 for none (Linux max_inodes)
-    max_inodes: AtomicU64,
-    /// Inode space left: inodes times BOGO_INODE_SIZE, less xattrs
-    /// (Linux free_ispace); the xattr pool of its inodes
-    ispace: Arc<AtomicU64>,
+    acct: Arc<Acct>,
     /// The root's mode and owner (fixed at mount)
     mode: u16,
     uid: Uid,
     gid: Gid,
-    /// inode64 (Linux full_inums)
-    inode64: AtomicBool,
-    noswap: AtomicBool,
 }
 
 impl SuperBlockData for ShmemSb {}
@@ -143,7 +168,7 @@ pub fn with<R>(sb: &SuperBlock, f: impl FnOnce(&ShmemSb) -> R) -> Option<R> {
 
 /// The block limit of tmpfs `sb` (0: none); None if not a tmpfs
 pub fn max_blocks(sb: &SuperBlock) -> Option<u64> {
-    with(sb, |t| t.blocks.max.load(Ordering::Relaxed))
+    with(sb, |t| t.acct.max_blocks.load(Ordering::Relaxed))
 }
 
 impl ShmemSb {
@@ -151,48 +176,41 @@ impl ShmemSb {
         let blocks = o.blocks.unwrap_or_else(default_blocks);
         let inodes = o.inodes.unwrap_or_else(default_inodes);
         Ok(Self {
-            blocks: try_arc(Blocks {
-                max: AtomicU64::new(blocks),
-                free: AtomicU64::new(blocks),
+            acct: try_arc(Acct {
+                stat: IrqSpinlock::new(Stat {
+                    max_inodes: inodes,
+                    free_ispace: inodes * BOGO_INODE_SIZE,
+                    inode64: o.inode64.unwrap_or(true),
+                    noswap: o.noswap,
+                }),
+                max_blocks: AtomicU64::new(blocks),
+                used_blocks: PercpuCounter::new()?,
             })?,
-            max_inodes: AtomicU64::new(inodes),
-            ispace: try_arc(AtomicU64::new(inodes * BOGO_INODE_SIZE))?,
             mode: o.mode.unwrap_or(0o1777),
             uid: o.uid.unwrap_or(fs_ids().0),
             gid: o.gid.unwrap_or(fs_ids().1),
-            inode64: AtomicBool::new(o.inode64.unwrap_or(true)),
-            noswap: AtomicBool::new(o.noswap),
         })
-    }
-
-    fn limited_inodes(&self) -> bool {
-        self.max_inodes.load(Ordering::Relaxed) != 0
     }
 
     /// Where its file pages are charged
     pub fn page_acct(&self) -> Arc<dyn PageAcct> {
-        self.blocks.clone()
+        self.acct.clone()
     }
 
-    /// The xattr space (None: no inode limit, so none for xattrs;
-    /// Linux shmem_xattr_handler_set)
-    pub fn xattr_pool(&self) -> Option<Arc<AtomicU64>> {
-        self.limited_inodes().then(|| self.ispace.clone())
+    /// Where its xattrs are counted (None: no inode limit, so not
+    /// counted; Linux shmem_xattr_handler_set)
+    pub fn xattr_pool(&self) -> Option<Arc<Acct>> {
+        self.acct.limited_inodes().then(|| self.acct.clone())
     }
 
     /// Take an inode (Linux shmem_reserve_inode): ENOSPC when none left
     pub fn reserve_inode(&self) -> Result<(), KernelError> {
-        if !self.limited_inodes() {
-            return Ok(());
-        }
-        take(&self.ispace, BOGO_INODE_SIZE)
+        self.acct.take_ispace(BOGO_INODE_SIZE)
     }
 
     /// Give an inode back (Linux shmem_free_inode)
     pub fn free_inode(&self) {
-        if self.limited_inodes() {
-            self.ispace.fetch_add(BOGO_INODE_SIZE, Ordering::Relaxed);
-        }
+        self.acct.give_ispace(BOGO_INODE_SIZE);
     }
 
     /// Linux shmem_statfs: the limits and what is left under them; 0
@@ -204,67 +222,53 @@ impl ShmemSb {
             f_namelen: 255,
             ..StatFs::default()
         };
-        let max = self.blocks.max.load(Ordering::Relaxed);
+        let a = &self.acct;
+        let max = a.max_blocks.load(Ordering::Relaxed);
         if max != 0 {
+            let used = a.used_blocks.sum().max(0) as u64;
             st.f_blocks = max;
-            st.f_bfree = self.blocks.free.load(Ordering::Relaxed).min(max);
+            st.f_bfree = max.saturating_sub(used);
             st.f_bavail = st.f_bfree;
         }
-        let inodes = self.max_inodes.load(Ordering::Relaxed);
-        if inodes != 0 {
-            st.f_files = inodes;
-            st.f_ffree = self.ispace.load(Ordering::Relaxed) / BOGO_INODE_SIZE;
+        let s = a.stat.lock();
+        if s.max_inodes != 0 {
+            st.f_files = s.max_inodes;
+            st.f_ffree = s.free_ispace / BOGO_INODE_SIZE;
         }
         st
     }
 
-    /// Linux shmem_reconfigure: a new limit must cover what is in use
-    /// and cannot be put on an unlimited mount; noswap cannot be turned
-    /// on. Checked before anything changes. mode=, uid=, gid= are
-    /// parsed but change nothing.
+    /// Linux shmem_reconfigure, all or nothing under the stat lock: a
+    /// new limit must cover what is in use and cannot be put on an
+    /// unlimited mount, noswap cannot be turned on; then every change
+    /// is made. mode=, uid=, gid= are parsed but change nothing.
     fn reconfigure(&self, o: &Opts) -> Result<(), KernelError> {
-        let b = &self.blocks;
+        let a = &self.acct;
+        let mut st = a.stat.lock();
+        let used_isp = (st.max_inodes * BOGO_INODE_SIZE).saturating_sub(st.free_ispace);
         if let Some(n) = o.blocks.filter(|&n| n != 0) {
-            let max = b.max.load(Ordering::Relaxed);
-            let used = max.saturating_sub(b.free.load(Ordering::Relaxed));
-            if max == 0 || used > n {
+            let max = a.max_blocks.load(Ordering::Relaxed);
+            if max == 0 || a.used_blocks.sum() > n as i64 {
                 return Err(KernelError::InvalidArgument);
             }
         }
-        if let Some(n) = o.inodes.filter(|&n| n != 0) {
-            let max = self.max_inodes.load(Ordering::Relaxed);
-            let used = (max * BOGO_INODE_SIZE).saturating_sub(self.ispace.load(Ordering::Relaxed));
-            if max == 0 || n * BOGO_INODE_SIZE < used {
-                return Err(KernelError::InvalidArgument);
-            }
+        if let Some(n) = o.inodes.filter(|&n| n != 0)
+            && (st.max_inodes == 0 || n * BOGO_INODE_SIZE < used_isp)
+        {
+            return Err(KernelError::InvalidArgument);
         }
-        if o.noswap && !self.noswap.load(Ordering::Relaxed) {
+        if o.noswap && !st.noswap {
             return Err(KernelError::InvalidArgument);
         }
         if let Some(n) = o.blocks {
-            if n == 0 {
-                b.max.store(0, Ordering::Relaxed);
-            } else {
-                relimit(&b.max, &b.free, n)?;
-            }
+            a.max_blocks.store(n, Ordering::Relaxed);
         }
         if let Some(n) = o.inodes {
-            if n == 0 {
-                self.max_inodes.store(0, Ordering::Relaxed);
-            } else {
-                let (max, space) = (&self.max_inodes, &self.ispace);
-                let old = max.load(Ordering::Relaxed);
-                space
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
-                        let used = (old * BOGO_INODE_SIZE).saturating_sub(f);
-                        (n * BOGO_INODE_SIZE).checked_sub(used)
-                    })
-                    .map_err(|_| KernelError::InvalidArgument)?;
-                max.store(n, Ordering::Relaxed);
-            }
+            st.max_inodes = n;
+            st.free_ispace = (n * BOGO_INODE_SIZE).saturating_sub(used_isp);
         }
         if let Some(i) = o.inode64 {
-            self.inode64.store(i, Ordering::Relaxed);
+            st.inode64 = i;
         }
         Ok(())
     }
@@ -275,11 +279,14 @@ impl ShmemSb {
     fn show(&self, out: &mut Vec<u8>) {
         use core::fmt::Write;
         let mut s = alloc::string::String::new();
-        let blocks = self.blocks.max.load(Ordering::Relaxed);
+        let blocks = self.acct.max_blocks.load(Ordering::Relaxed);
+        let (inodes, inode64, noswap) = {
+            let st = self.acct.stat.lock();
+            (st.max_inodes, st.inode64, st.noswap)
+        };
         if blocks != default_blocks() {
             let _ = write!(s, ",size={}k", blocks * (filemap::PAGE_SIZE as u64 / 1024));
         }
-        let inodes = self.max_inodes.load(Ordering::Relaxed);
         if inodes != default_inodes() {
             let _ = write!(s, ",nr_inodes={inodes}");
         }
@@ -292,13 +299,9 @@ impl ShmemSb {
         if self.gid != 0 {
             let _ = write!(s, ",gid={}", self.gid);
         }
-        let bits = if self.inode64.load(Ordering::Relaxed) {
-            64
-        } else {
-            32
-        };
+        let bits = if inode64 { 64 } else { 32 };
         let _ = write!(s, ",inode{bits}");
-        if self.noswap.load(Ordering::Relaxed) {
+        if noswap {
             s.push_str(",noswap");
         }
         out.extend_from_slice(s.as_bytes());
@@ -642,5 +645,23 @@ mod tests {
         assert_eq!(t.statfs().f_bfree, 3);
         t.free_inode();
         assert_eq!(t.statfs().f_ffree, 1);
+    }
+
+    #[test]
+    fn reconfigure_all_or_nothing() {
+        let t = ShmemSb::new(&parse(b"nr_blocks=2,nr_inodes=2").unwrap()).unwrap();
+        assert!(t.reserve_inode().is_ok() && t.reserve_inode().is_ok());
+        // The size would fit, the inodes would not: nothing changes
+        assert!(
+            t.reconfigure(&parse(b"nr_blocks=8,nr_inodes=1").unwrap())
+                .is_err()
+        );
+        assert_eq!(t.statfs().f_blocks, 2);
+        assert!(
+            t.reconfigure(&parse(b"nr_blocks=8,nr_inodes=4").unwrap())
+                .is_ok()
+        );
+        let st = t.statfs();
+        assert_eq!((st.f_blocks, st.f_files, st.f_ffree), (8, 4, 2));
     }
 }

@@ -9,5 +9,6 @@ pub mod ida;
 pub mod kalloc;
 pub mod kmem;
 pub mod list;
+pub mod percpu_counter;
 pub mod pod;
 pub mod scope;
