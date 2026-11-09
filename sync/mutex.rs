@@ -32,7 +32,7 @@ use core::pin::{Pin, pin};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{IrqSpinlock, can_sleep, might_sleep, waiter_task, wake_waiter};
-use crate::sync::waitqueue::signal_pending;
+use crate::sync::waitqueue::signal_pending_state;
 use crate::task::Task;
 use crate::task::percpu::{SleepState, current_tid, schedule, set_current_state};
 use crate::util::error::KernelError;
@@ -112,15 +112,6 @@ unsafe impl<T: Send> Sync for Mutex<T> {}
 /// Owner id of the caller
 fn me() -> u64 {
     if can_sleep() { current_tid() } else { NO_TASK }
-}
-
-/// A pending signal ends a sleep in `state` (Linux signal_pending_state)
-fn interrupted(state: SleepState) -> bool {
-    match state {
-        SleepState::Interruptible => signal_pending(),
-        SleepState::Killable => crate::signal::fatal_signal_pending(),
-        _ => false,
-    }
 }
 
 impl<T> Mutex<T> {
@@ -261,7 +252,7 @@ impl<T> Mutex<T> {
             if self.trylock(me) {
                 break Ok(());
             }
-            if interrupted(state) {
+            if signal_pending_state(state) {
                 break Err(KernelError::Interrupted);
             }
             drop(list);

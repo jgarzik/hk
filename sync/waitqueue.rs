@@ -182,6 +182,17 @@ pub fn signal_pending() -> bool {
     crate::task::percpu::current().sigpending()
 }
 
+/// A pending signal ends a sleep in `state`: any signal an
+/// interruptible one, SIGKILL a killable one (Linux
+/// signal_pending_state)
+pub fn signal_pending_state(state: SleepState) -> bool {
+    match state {
+        SleepState::Interruptible => signal_pending(),
+        SleepState::Killable => crate::signal::fatal_signal_pending(),
+        _ => false,
+    }
+}
+
 impl WaitQueue {
     /// Create a new empty wait queue
     pub const fn new() -> Self {
@@ -393,7 +404,7 @@ impl WaitQueue {
             if cond() {
                 break Ok(true);
             }
-            if interrupted(state) {
+            if signal_pending_state(state) {
                 break Err(match state {
                     SleepState::Killable => KernelError::Interrupted,
                     _ => KernelError::RestartSys,
@@ -480,7 +491,7 @@ impl WaitQueue {
             if cond(ctx) {
                 break Ok(left.max(1));
             }
-            if interrupted(state) {
+            if signal_pending_state(state) {
                 break Err(match state {
                     SleepState::Killable => KernelError::Interrupted,
                     _ => KernelError::RestartSys,
@@ -571,15 +582,6 @@ impl WaitQueue {
     /// Get the number of waiters
     pub fn len(&self) -> usize {
         self.head.lock().len()
-    }
-}
-
-/// A pending signal ends a sleep in `state` (Linux signal_pending_state)
-fn interrupted(state: SleepState) -> bool {
-    match state {
-        SleepState::Interruptible => signal_pending(),
-        SleepState::Killable => crate::signal::fatal_signal_pending(),
-        _ => false,
     }
 }
 

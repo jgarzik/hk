@@ -36,7 +36,7 @@ use core::pin::{Pin, pin};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{IrqSpinlock, can_sleep, might_sleep, waiter_task, wake_waiter};
-use crate::sync::waitqueue::signal_pending;
+use crate::sync::waitqueue::signal_pending_state;
 use crate::task::Task;
 use crate::task::percpu::{SleepState, TICK_MS, get_ticks, schedule, set_current_state};
 use crate::util::error::KernelError;
@@ -350,15 +350,6 @@ impl<T: Default> Default for RwSem<T> {
     }
 }
 
-/// A pending signal ends a sleep in `state` (Linux signal_pending_state)
-fn interrupted(state: SleepState) -> bool {
-    match state {
-        SleepState::Interruptible => signal_pending(),
-        SleepState::Killable => crate::signal::fatal_signal_pending(),
-        _ => false,
-    }
-}
-
 impl<T> RwSem<T> {
     /// New unlocked semaphore guarding `v`
     pub const fn new(v: T) -> Self {
@@ -394,7 +385,7 @@ impl<T: ?Sized> RwSem<T> {
             if w.granted() {
                 break Ok(());
             }
-            if interrupted(state) {
+            if signal_pending_state(state) {
                 s.del_wake(&w, get_ticks(), &mut wake_task);
                 break Err(KernelError::Interrupted);
             }
@@ -432,7 +423,7 @@ impl<T: ?Sized> RwSem<T> {
             if s.try_write_lock(&w, get_ticks()) {
                 break Ok(());
             }
-            if interrupted(state) {
+            if signal_pending_state(state) {
                 s.del_wake(&w, get_ticks(), &mut wake_task);
                 break Err(KernelError::Interrupted);
             }
