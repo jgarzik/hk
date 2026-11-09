@@ -281,6 +281,7 @@ pub fn run_all_tests() {
     isolated(b"SIGALTSTACK", signal::sigaltstack::run_tests);
     ipc::ipc::run_tests();
     mm::mmap::run_tests();
+    mm::memfd::run_tests();
     isolated(b"MM_LIFE", mm::mm_life::run_tests);
     isolated(b"MM_OOM", mm::mm_oom::run_tests);
     isolated(b"FAULT_INJECT", io::fault_inject::run_tests);

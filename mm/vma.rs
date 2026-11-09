@@ -130,6 +130,10 @@ pub const VM_NOMAYEXEC: u32 = 0x1000_0000;
 /// mapping), shown as [sigpage] in /proc/<pid>/maps
 pub const VM_SIGPAGE: u32 = 0x2000_0000;
 
+/// A read-only shared mapping of a write-sealed memfd: never PROT_WRITE
+/// (Linux memfd_check_seals_mmap clears VM_MAYWRITE)
+pub const VM_NOMAYWRITE: u32 = 0x4000_0000;
+
 // ============================================================================
 // msync flags (MS_*)
 // ============================================================================
@@ -364,6 +368,15 @@ impl Vma {
     /// The inode of the mapped file (its i_mmap lists this VMA)
     pub fn inode(&self) -> Option<Arc<crate::fs::Inode>> {
         self.file.as_ref().and_then(|f| f.mapping_inode())
+    }
+
+    /// A shared mapping that may write its file (Linux
+    /// vma_is_shared_maywrite: VM_SHARED and VM_MAYWRITE, the file open
+    /// for writing and not write-sealed at mmap)
+    pub fn shared_maywrite(&self) -> bool {
+        self.flags & VM_SHARED != 0
+            && self.flags & VM_NOMAYWRITE == 0
+            && self.file.as_ref().is_some_and(|f| f.is_writable())
     }
 
     /// Check if this VMA is memory-locked

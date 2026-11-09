@@ -198,6 +198,13 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
+    /// chmod to `perm` may change the mode (after the owner check; Linux
+    /// ->setattr refusing ATTR_MODE); default yes
+    fn chmod_ok(&self, inode: &Inode, perm: u16) -> Result<(), KernelError> {
+        let _ = (inode, perm);
+        Ok(())
+    }
+
     /// A new regular file of `dir`'s file system with no name (nlink 0)
     /// for O_TMPFILE (Linux ->tmpfile); default EOPNOTSUPP
     fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {

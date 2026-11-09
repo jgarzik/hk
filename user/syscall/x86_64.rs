@@ -165,6 +165,7 @@ pub const SYS_POLL: u64 = 7;
 pub const SYS_PPOLL: u64 = 271;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_MMAP: u64 = 9;
+pub const SYS_MEMFD_CREATE: u64 = 319;
 pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MUNMAP: u64 = 11;
 pub const SYS_BRK: u64 = 12;
@@ -1401,6 +1402,11 @@ pub fn sys_pselect6(
 #[inline(always)]
 pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: u64) -> i64 {
     unsafe { syscall6!(SYS_MMAP, addr, length, prot, flags, fd, offset) }
+}
+
+#[inline(always)]
+pub fn sys_memfd_create(name: *const u8, flags: u32) -> i64 {
+    unsafe { syscall2!(SYS_MEMFD_CREATE, name, flags) }
 }
 
 #[inline(always)]

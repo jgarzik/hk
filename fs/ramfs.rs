@@ -59,13 +59,15 @@ impl Aops for RamfsAops {
 }
 
 /// Page-cache errors of ramfs and tmpfs writes: no memory for a new
-/// page is ENOMEM, a full tmpfs ENOSPC (Linux shmem_get_folio_gfp); a
-/// fault on the caller's buffer stays EFAULT
+/// page is ENOMEM, a full tmpfs ENOSPC (Linux shmem_get_folio_gfp), a
+/// sealed one EPERM; a fault on the caller's buffer stays EFAULT
 fn page_err(e: KernelError) -> KernelError {
     match e {
         KernelError::OutOfMemory => KernelError::OutOfMemory,
         KernelError::NoSpace => KernelError::NoSpace,
         KernelError::BadAddress => KernelError::BadAddress,
+        // A sealed tmpfs file (shmem_write_begin)
+        KernelError::NotPermitted => KernelError::NotPermitted,
         _ => KernelError::Io,
     }
 }
@@ -82,15 +84,45 @@ fn read_err(e: KernelError) -> KernelError {
 
 pub static RAMFS_AOPS: RamfsAops = RamfsAops;
 
+/// tmpfs page I/O: ramfs's, with the write seals (Linux
+/// shmem_write_begin: F_SEAL_WRITE / FUTURE_WRITE refuse a write,
+/// F_SEAL_GROW one past i_size, EPERM)
+pub struct TmpfsAops;
+
+impl Aops for TmpfsAops {
+    fn read_folio(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
+        RAMFS_AOPS.read_folio(inode, phys, index)
+    }
+
+    fn write_begin(&self, inode: &Inode, pos: u64, len: usize) -> Result<u64, KernelError> {
+        use crate::mm::memfd::{F_SEAL_FUTURE_WRITE, F_SEAL_GROW, F_SEAL_WRITE};
+        let sl = seals(inode);
+        if sl & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0
+            || (sl & F_SEAL_GROW != 0 && pos + len as u64 > inode.get_size())
+        {
+            return Err(KernelError::NotPermitted);
+        }
+        filemap::simple_write_begin(inode, pos, len)
+    }
+
+    fn can_dirty(&self) -> bool {
+        false
+    }
+}
+
+static TMPFS_AOPS: TmpfsAops = TmpfsAops;
+
 /// A new regular file's mapping: ramfs operations, never evicted (the
 /// cache is the only copy; Linux ramfs mapping_set_unevictable and
 /// tmpfs, which has no swap here)
 fn file_mapping(sb: &SuperBlock, inode: &Inode) {
-    inode.i_data.set_aops(&RAMFS_AOPS);
     inode.i_data.set_flags(filemap::AS_UNEVICTABLE);
     // tmpfs charges its pages (Linux shmem_inode_acct_blocks)
     if let Some(a) = super::tmpfs::with(sb, |t| t.page_acct()) {
+        inode.i_data.set_aops(&TMPFS_AOPS);
         inode.i_data.set_acct(a);
+    } else {
+        inode.i_data.set_aops(&RAMFS_AOPS);
     }
 }
 
@@ -118,6 +150,11 @@ pub struct RamfsInodeData {
     /// when the inode is freed (Linux shmem_evict_inode)
     xattr_pool: spin::Once<Arc<AtomicU64>>,
     xattr_bytes: AtomicU64,
+
+    /// F_SEAL_* of a tmpfs file (Linux shmem_inode_info.seals; every
+    /// tmpfs inode starts with F_SEAL_SEAL, memfd_create may clear it):
+    /// changed under the inode's i_rwsem, read lock-free
+    pub seals: core::sync::atomic::AtomicU32,
 }
 
 impl Drop for RamfsInodeData {
@@ -303,6 +340,7 @@ impl RamfsInodeData {
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
             xattr_bytes: AtomicU64::new(0),
+            seals: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -314,6 +352,7 @@ impl RamfsInodeData {
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
             xattr_bytes: AtomicU64::new(0),
+            seals: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -325,6 +364,7 @@ impl RamfsInodeData {
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
             xattr_bytes: AtomicU64::new(0),
+            seals: core::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -360,6 +400,28 @@ fn reserve_inode(sb: &SuperBlock) -> Result<(), KernelError> {
 /// Give one back (Linux shmem_free_inode)
 fn free_inode(sb: &SuperBlock) {
     super::tmpfs::with(sb, |t| t.free_inode());
+}
+
+/// `f` on the seals of `inode` if it is a tmpfs regular file (Linux
+/// memfd_file_seals_ptr: shmem files only), else None
+pub fn with_seals<R>(
+    inode: &Inode,
+    f: impl FnOnce(&core::sync::atomic::AtomicU32) -> R,
+) -> Option<R> {
+    let sb = inode.superblock()?;
+    if !inode.mode().is_file() || super::tmpfs::max_blocks(&sb).is_none() {
+        return None;
+    }
+    let p = inode.get_private()?;
+    p.as_ref()
+        .as_any()
+        .downcast_ref::<RamfsInodeData>()
+        .map(|d| f(&d.seals))
+}
+
+/// The seals of `inode` (0 when none can be set)
+fn seals(inode: &Inode) -> u32 {
+    with_seals(inode, |s| s.load(Ordering::Acquire)).unwrap_or(0)
 }
 
 /// One name of `inode` goes (Linux shmem_unlink): on tmpfs a name
@@ -514,6 +576,16 @@ impl InodeOps for RamfsInodeOps {
         true
     }
 
+    /// F_SEAL_EXEC keeps the exec bits (Linux shmem_setattr)
+    fn chmod_ok(&self, inode: &Inode, perm: u16) -> Result<(), KernelError> {
+        if seals(inode) & crate::mm::memfd::F_SEAL_EXEC != 0
+            && (inode.mode().perm() ^ perm) & 0o111 != 0
+        {
+            return Err(KernelError::NotPermitted);
+        }
+        Ok(())
+    }
+
     /// tmpfs gets the inode back (Linux shmem_evict_inode ->
     /// shmem_free_inode); a superblock already gone counts nothing
     fn evict_inode(&self, inode: &Inode) {
@@ -591,6 +663,13 @@ impl InodeOps for RamfsInodeOps {
         if inode.mode().is_dir() {
             return Err(KernelError::IsDirectory);
         }
+        // Linux shmem_setattr: a sealed size (EPERM)
+        let (old, sl) = (inode.get_size(), seals(inode));
+        if (length < old && sl & crate::mm::memfd::F_SEAL_SHRINK != 0)
+            || (length > old && sl & crate::mm::memfd::F_SEAL_GROW != 0)
+        {
+            return Err(KernelError::NotPermitted);
+        }
         filemap::truncate_setsize(inode, length);
         Ok(())
     }
@@ -618,12 +697,21 @@ impl InodeOps for RamfsInodeOps {
             return Err(KernelError::OperationNotSupported);
         }
         let end = offset + len;
+        let sl = seals(inode);
         if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+            // Linux shmem_fallocate: a write seal keeps the data
+            use crate::mm::memfd::{F_SEAL_FUTURE_WRITE, F_SEAL_WRITE};
+            if sl & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+                return Err(KernelError::NotPermitted);
+            }
             // Nothing is cached past i_size: only the part of the hole
             // below it (a hole wholly past EOF changes nothing)
             filemap::punch_range(inode, offset, end.min(inode.get_size()));
         } else {
             inode.newsize_ok(end)?;
+            if sl & crate::mm::memfd::F_SEAL_GROW != 0 && end > inode.get_size() {
+                return Err(KernelError::NotPermitted);
+            }
             shmem_falloc(inode, offset, end, max)?;
             if mode & FALLOC_FL_KEEP_SIZE == 0 && end > inode.get_size() {
                 inode.set_size(end);
@@ -1212,7 +1300,11 @@ fn new_inode(
     // From here the inode's drop gives the reservation back
     match kind {
         Kind::File => {
-            inode.set_private(try_arc(RamfsInodeData::new_file())?);
+            let mut d = RamfsInodeData::new_file();
+            if super::tmpfs::max_blocks(sb).is_some() {
+                *d.seals.get_mut() = crate::mm::memfd::F_SEAL_SEAL;
+            }
+            inode.set_private(try_arc(d)?);
             file_mapping(sb, &inode);
         }
         Kind::Dir => inode.set_private(try_arc(RamfsInodeData::new_dir())?),
@@ -1221,6 +1313,19 @@ fn new_inode(
         Kind::Dev(_) => {}
     }
     Ok(inode)
+}
+
+/// A new regular file of `sb` owned by root with permissions `perm`,
+/// in no directory (Linux shmem_get_inode for shmem_file_setup)
+pub fn new_file(sb: &Arc<SuperBlock>, perm: u16) -> Result<Arc<Inode>, KernelError> {
+    new_inode(
+        sb,
+        Kind::File,
+        InodeMode::regular(perm),
+        0,
+        0,
+        current_time(),
+    )
 }
 
 /// Make a new inode and enter it in `dir` as `name` (EEXIST if taken):

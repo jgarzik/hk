@@ -525,6 +525,36 @@ pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
     file_ops: &super::ramfs::TMPFS_FILE_OPS,
 };
 
+/// The kernel's own tmpfs (Linux shm_mnt, kern_mount: no limits, in
+/// no mount namespace): memfd_create's files
+static SHM_MNT: spin::Once<Arc<super::mount::Mount>> = spin::Once::new();
+
+/// Make the kernel's tmpfs (Linux shmem_init's kern_mount; mnt_init)
+pub fn shmem_init() -> Result<(), KernelError> {
+    let sb = tmpfs_mount(&TMPFS_TYPE, b"size=0,nr_inodes=0")?;
+    let root = sb.get_root().ok_or(KernelError::Io)?;
+    let m = super::mount::Mount::new(sb, root, 0, b"tmpfs".as_slice().into())?;
+    SHM_MNT.call_once(|| m);
+    Ok(())
+}
+
+/// An unnamed regular file of `size` bytes on the kernel's tmpfs, open
+/// for reading and writing (Linux shmem_file_setup: mode 0777, a pseudo
+/// dentry `name` that /proc shows as "/<name> (deleted)")
+pub fn shmem_file_setup(name: &[u8], size: u64) -> Result<Arc<super::File>, KernelError> {
+    use super::flags::O_RDWR;
+    let mnt = SHM_MNT.get().ok_or(KernelError::NoDevice)?.clone();
+    let inode = super::ramfs::new_file(&mnt.sb, 0o777)?;
+    inode.set_size(size);
+    let dentry = super::Dentry::tmpfile_named(&mnt.root, name, inode.clone())?;
+    let w = mnt.want_write()?;
+    let iw = inode.get_write_access()?;
+    let mut f = super::File::new(dentry, Some(mnt), O_RDWR, &super::ramfs::TMPFS_FILE_OPS);
+    f.write_access = Some(w);
+    f.i_write = Some(iw);
+    try_arc(f)
+}
+
 /// The tmpfs filesystem type (Linux shmem_fs_type)
 pub static TMPFS_TYPE: FileSystemType = FileSystemType {
     name: "tmpfs",

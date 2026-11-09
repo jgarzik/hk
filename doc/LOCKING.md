@@ -1860,6 +1860,13 @@ dropped before and after it is zeroed on the disk.)
   removed (truncate) under it. Order: i_rwsem -> page lock ->
   i_pages. Removal also needs `i_pages`; a lookup that then locks the
   page rechecks `Page.mapping` (truncated meanwhile: retry).
+- `AddressSpace.writable` (atomic, Linux i_mmap_writable): the
+  shared writable mappings (VM_SHARED, file open for writing, not
+  `VM_NOMAYWRITE`), counted by the VMA link/unlink (mmap_lock held for
+  writing) and held across an mmap's insertion (`map_writable`, EPERM
+  once denied); F_SEAL_WRITE denies it for good under the inode's
+  i_rwsem (`deny_writable`, EBUSY while one exists). memfd seals
+  (`RamfsInodeData.seals`) are added under i_rwsem and read lock-free.
 - A tmpfs mapping charges each page to its file system's block limit
   before inserting it (`AddressSpace.acct`, lock-free counters: 3.11
   tmpfs accounting) and returns it on removal; no lock is taken for it.

@@ -348,6 +348,7 @@ pub fn chmod(p: &super::Path, perm: u16) -> Result<(), KernelError> {
     if !in_group_or_capable(&c, inode.gid()) {
         perm &= !S_ISGID;
     }
+    inode.i_op.chmod_ok(inode, perm)?;
     inode.set_mode_perm(perm);
     inode.set_ctime(crate::time::TIMEKEEPER.current_time());
     inode.i_op.setattr_done(inode);

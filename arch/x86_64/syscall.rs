@@ -475,6 +475,8 @@ pub const SYS_RT_SIGSUSPEND: u64 = 130;
 pub const SYS_RT_TGSIGQUEUEINFO: u64 = 297;
 
 // Memory barrier (Section 13)
+/// memfd_create(name, flags)
+pub const SYS_MEMFD_CREATE: u64 = 319;
 /// membarrier(cmd, flags, cpu_id)
 pub const SYS_MEMBARRIER: u64 = 324;
 
@@ -971,6 +973,7 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_MADVISE => Sys::Madvise,
         SYS_MBIND => Sys::Mbind,
         SYS_MEMBARRIER => Sys::Membarrier,
+        SYS_MEMFD_CREATE => Sys::MemfdCreate,
         SYS_MIGRATE_PAGES => Sys::MigratePages,
         SYS_MINCORE => Sys::Mincore,
         SYS_MKDIRAT => Sys::Mkdirat,

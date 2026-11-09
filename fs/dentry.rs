@@ -120,11 +120,17 @@ impl Dentry {
     /// path reads " (deleted)")
     pub fn tmpfile(parent: &Arc<Dentry>, inode: Arc<Inode>) -> Result<Arc<Dentry>, KernelError> {
         let name = alloc::format!("#{}", inode.ino);
-        let d = try_arc(Self::with(
-            name.as_bytes().into(),
-            Some(inode),
-            parent.sb.clone(),
-        ))?;
+        Self::tmpfile_named(parent, name.as_bytes(), inode)
+    }
+
+    /// An unhashed dentry `name` of `inode` under `parent` (`tmpfile`;
+    /// Linux d_alloc_pseudo for an internal file such as a memfd)
+    pub fn tmpfile_named(
+        parent: &Arc<Dentry>,
+        name: &[u8],
+        inode: Arc<Inode>,
+    ) -> Result<Arc<Dentry>, KernelError> {
+        let d = try_arc(Self::with(name.into(), Some(inode), parent.sb.clone()))?;
         {
             let mut dl = d.d_lock.write();
             dl.parent = Some(parent.clone());

@@ -353,6 +353,7 @@ pub const SYS_PSELECT6: u64 = 72;
 pub const SYS_BRK: u64 = 214;
 pub const SYS_MUNMAP: u64 = 215;
 pub const SYS_MMAP: u64 = 222;
+pub const SYS_MEMFD_CREATE: u64 = 279;
 pub const SYS_MPROTECT: u64 = 226;
 pub const SYS_MLOCK: u64 = 228;
 pub const SYS_MUNLOCK: u64 = 229;
@@ -1568,6 +1569,11 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
 }
 
 /// mprotect(addr, len, prot) - change memory protection
+#[inline(always)]
+pub fn sys_memfd_create(name: *const u8, flags: u32) -> i64 {
+    unsafe { syscall2!(SYS_MEMFD_CREATE, name, flags) }
+}
+
 #[inline(always)]
 pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     unsafe { syscall3!(SYS_MPROTECT, addr, len, prot) }

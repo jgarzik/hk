@@ -60,7 +60,7 @@
 - [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)
 - [x] dup3
-- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETOWN_EX, F_SETOWN_EX, F_GETSIG, F_SETSIG; O_ASYNC raises SIGIO, or the F_SETSIG signal with POLL_* info, on pipes, FIFOs, ttys (input; FIOASYNC makes the foreground group or the caller owner), inotify and sockets (POLL_IN on input, POLL_OUT for room only after a send found none, POLL_ERR, POLL_HUP; TCP: POLL_OUT once connected))
+- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETOWN_EX, F_SETOWN_EX, F_GETSIG, F_SETSIG, F_ADD_SEALS, F_GET_SEALS (tmpfs files; all six seals enforced); O_ASYNC raises SIGIO, or the F_SETSIG signal with POLL_* info, on pipes, FIFOs, ttys (input; FIOASYNC makes the foreground group or the caller owner), inotify and sockets (POLL_IN on input, POLL_OUT for room only after a send found none, POLL_ERR, POLL_HUP; TCP: POLL_OUT once connected))
 
 2.2 Read/write + position
 
@@ -190,6 +190,7 @@ Extended attributes (Linux-specific):
 - [x] mlock2
 - [x] madvise
 - [x] mincore
+- [x] memfd_create (MFD_CLOEXEC, MFD_ALLOW_SEALING, MFD_NOEXEC_SEAL/MFD_EXEC with vm.memfd_noexec per pid namespace; MFD_HUGETLB ENOSYS: no hugetlbfs)
 - [ ] remap_file_pages (legacy)
 
 4.2 NUMA / memory policy (optional but Linuxy)

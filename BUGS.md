@@ -570,6 +570,10 @@ Linux swaps them, and noswap is only recorded). huge= takes only
 never, mpol= and the quota options are refused (EINVAL), as on a Linux
 without THP, NUMA or CONFIG_TMPFS_QUOTA. inode32 is recorded and shown
 but inode numbers do not wrap at 2^32 (Linux shmem_reserve_inode).
+F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
+pinned by other references (Linux memfd_wait_for_pins: EBUSY after
+waiting). /proc/<pid>/fd/<n> of a directory, pipe or socket is followed
+by its text, not jumped to (`fs/proc/mod.rs` fd_jump).
 
 ## Kernel heap (slab) gaps
 

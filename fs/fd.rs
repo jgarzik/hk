@@ -440,6 +440,13 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
             Ok(0)
         }
 
+        crate::mm::memfd::F_ADD_SEALS | crate::mm::memfd::F_GET_SEALS => {
+            let file = table.get(fd).ok_or(KernelError::BadFd)?;
+            // Adding takes the inode's sleeping lock
+            drop(table);
+            crate::mm::memfd::fcntl(&file, cmd, arg)
+        }
+
         F_SETOWN | F_GETOWN | F_SETOWN_EX | F_GETOWN_EX | F_SETSIG | F_GETSIG => {
             let file = table.get(fd).ok_or(KernelError::BadFd)?;
             // They allocate and copy to and from the user

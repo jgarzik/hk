@@ -30,6 +30,7 @@ pub mod ioremap;
 pub mod lru;
 pub mod madvise;
 pub mod memblock;
+pub mod memfd;
 pub mod memory;
 pub mod mempolicy;
 pub mod mprotect;
@@ -250,6 +251,9 @@ impl MmStruct {
             av.link(avc_of(&self.owner, self.pgd, v));
         }
         if let Some(i) = v.inode() {
+            if v.shared_maywrite() {
+                i.i_data.allow_writable();
+            }
             i.i_data.i_mmap.link(file_avc_of(&self.owner, self.pgd, v));
         }
     }
@@ -260,6 +264,9 @@ impl MmStruct {
             av.unlink(self.pgd, v.start);
         }
         if let Some(i) = v.inode() {
+            if v.shared_maywrite() {
+                i.i_data.unmap_writable();
+            }
             i.i_data.i_mmap.unlink(self.pgd, v.start);
         }
     }

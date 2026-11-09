@@ -138,6 +138,9 @@ pub struct AddressSpace {
     a_ops: Once<&'static dyn Aops>,
     /// Where its pages are charged (tmpfs; none: not counted)
     acct: Once<alloc::sync::Arc<dyn PageAcct>>,
+    /// Shared mappings that may write (VM_SHARED with VM_MAYWRITE), or
+    /// below 0 while F_SEAL_WRITE denies them (Linux i_mmap_writable)
+    writable: core::sync::atomic::AtomicI64,
     /// Every VMA mapping the file (Linux i_mmap + i_mmap_rwsem; the
     /// same chain type as an anon_vma's): written under the mmap_lock
     /// held for writing, read by truncate and the reverse map
@@ -153,6 +156,7 @@ impl AddressSpace {
             flags: AtomicU32::new(0),
             a_ops: Once::new(),
             acct: Once::new(),
+            writable: core::sync::atomic::AtomicI64::new(0),
             i_mmap: AnonVma::default(),
         }
     }
@@ -181,6 +185,45 @@ impl AddressSpace {
         {
             a.uncharge(pages);
         }
+    }
+
+    /// A new shared writable mapping may be made (Linux
+    /// mapping_map_writable): EPERM while denied
+    pub fn map_writable(&self) -> Result<(), KernelError> {
+        self.writable
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n >= 0).then_some(n + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| KernelError::NotPermitted)
+    }
+
+    /// One more shared writable mapping of an existing one (a split,
+    /// fork; Linux mapping_allow_writable)
+    pub fn allow_writable(&self) {
+        self.writable.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// One shared writable mapping fewer (Linux mapping_unmap_writable)
+    pub fn unmap_writable(&self) {
+        self.writable.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Deny new shared writable mappings for good (F_SEAL_WRITE; Linux
+    /// mapping_deny_writable): EBUSY while there is one
+    pub fn deny_writable(&self) -> Result<(), KernelError> {
+        self.writable
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n <= 0).then_some(n - 1)
+            })
+            .map(|_| ())
+            .map_err(|_| KernelError::Busy)
+    }
+
+    /// Undo a `deny_writable` (Linux mapping_allow_writable after a
+    /// failed seal)
+    pub fn undeny_writable(&self) {
+        self.writable.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn set_flags(&self, f: u32) {

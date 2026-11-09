@@ -243,9 +243,12 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
             return Err(KernelError::TextBusy);
         }
         dac::remove_privs(&inode);
-        // ATTR_MTIME | ATTR_CTIME, also for a file already empty
-        if inode.i_op.truncate(&inode, 0).is_ok() {
-            inode.touch_mc();
+        // ATTR_MTIME | ATTR_CTIME, also for a file already empty; a
+        // refusal (a sealed memfd: EPERM) fails the open
+        match inode.i_op.truncate(&inode, 0) {
+            Ok(()) => inode.touch_mc(),
+            Err(KernelError::OperationNotSupported) => {}
+            Err(e) => return Err(e),
         }
     }
 

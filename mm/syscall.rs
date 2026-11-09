@@ -84,6 +84,29 @@ fn mmap_file_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// A shared writable mapping counted on its file's mapping while it is
+/// made (Linux mapping_map_writable .. mapping_unmap_writable around
+/// vma_link, which counts it for good)
+struct WritableHold(Option<Arc<crate::fs::Inode>>);
+
+impl WritableHold {
+    fn new(v: &Vma) -> Result<Self, KernelError> {
+        let inode = v.inode().filter(|_| v.shared_maywrite());
+        if let Some(i) = &inode {
+            i.i_data.map_writable()?;
+        }
+        Ok(Self(inode))
+    }
+}
+
+impl Drop for WritableHold {
+    fn drop(&mut self) {
+        if let Some(i) = &self.0 {
+            i.i_data.unmap_writable();
+        }
+    }
+}
+
 /// The mapping stays inside the file's offset space (Linux
 /// file_mmap_ok): regular files, block devices and sockets end at
 /// MAX_LFS_FILESIZE, other files at 2^64
@@ -168,6 +191,12 @@ pub fn sys_mmap(
     {
         return Err(e);
     }
+    // A write-sealed memfd: no shared writable mapping, a read-only
+    // shared one never becomes writable (Linux memfd_check_seals_mmap)
+    let seal_flags = match &file {
+        Some(f) => super::memfd::check_seals_mmap(f, prot, is_shared)?,
+        None => 0,
+    };
     // PROT_EXEC of a file on a noexec mount (its own mount: Linux
     // path_noexec): EPERM; without it the mapping never gets it later
     let noexec = file.as_ref().is_some_and(|f| f.noexec());
@@ -266,6 +295,11 @@ pub fn sys_mmap(
     if is_shared {
         vma.flags |= VM_SHARED;
     }
+    vma.flags |= seal_flags;
+    // A shared writable mapping is counted on its file's mapping until
+    // the VMA is linked (Linux mmap_region: mapping_map_writable, EPERM
+    // once F_SEAL_WRITE denies it)
+    let _writable = WritableHold::new(&vma)?;
     if noexec {
         vma.flags |= super::vma::VM_NOMAYEXEC;
     }
@@ -1072,6 +1106,9 @@ fn prot_allowed(vma: &Vma, prot: u32) -> Result<(), KernelError> {
         return Err(KernelError::PermissionDenied);
     }
     if prot & PROT_WRITE != 0 && vma.shm.as_ref().is_some_and(|a| a.rdonly()) {
+        return Err(KernelError::PermissionDenied);
+    }
+    if prot & PROT_WRITE != 0 && vma.flags & super::vma::VM_NOMAYWRITE != 0 {
         return Err(KernelError::PermissionDenied);
     }
     Ok(())

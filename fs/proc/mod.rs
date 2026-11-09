@@ -441,7 +441,8 @@ impl InodeOps for ProcfsInodeOps {
     }
 
     /// /proc/<pid>/ns/<type> leads to the namespace's file (Linux
-    /// proc_ns_get_link: ns_get_path, nd_jump_link)
+    /// proc_ns_get_link: ns_get_path, nd_jump_link); /proc/<pid>/fd/<n>
+    /// to the open file's path (`fd_jump`)
     fn jump_link(
         &self,
         inode: &Inode,
@@ -456,6 +457,7 @@ impl InodeOps for ProcfsInodeOps {
             ProcfsInodeData::NamespaceFile { pid, ns_type } if inode.mode().is_symlink() => {
                 (pid.clone(), *ns_type)
             }
+            ProcfsInodeData::FdSymlink { pid, fd } => return fd_jump(pid, *fd),
             _ => return None,
         };
         Some(ns_file(inode, mnt, pid, ns_type))
@@ -924,6 +926,20 @@ fn fd_link(t: &TaskRef, fd: i32) -> Result<Vec<u8>, KernelError> {
         Some(p) => super::dentry::d_path_link(&p),
         None => Ok(Vec::new()),
     }
+}
+
+/// /proc/<pid>/fd/<fd> of a file system's non-directory leads to the
+/// open file itself (Linux proc_fd_link + nd_jump_link), so a deleted or
+/// unnamed one (O_TMPFILE, memfd) can be opened again; None (follow the
+/// text of `fd_link`) for a directory, a pipe, socket or anonymous file
+fn fd_jump(pid: &ProcPid, fd: i32) -> Option<Result<crate::fs::Path, KernelError>> {
+    let t = pid.task()?;
+    let file = task_files(&t)?.lock().get(fd)?;
+    let inode = file.get_inode()?;
+    if inode.mode().is_dir() || inode.mode().is_socket() || inode.superblock().is_none() {
+        return None;
+    }
+    file.f_path().map(Ok)
 }
 
 /// Look up entries in /proc/<pid>/fd/
