@@ -1049,7 +1049,7 @@ impl XhciController {
             .store(r.rt.addr() as u64, Ordering::Release);
 
         // Register IRQ handler with PCI device
-        let h = try_arc(crate::irq::IrqFn(xhci_irq_handler)).map_err(|_| KernelError::OutOfMemory);
+        let h = try_arc(crate::irq::IrqFn(xhci_irq_handler));
         match h.and_then(|h| self.pci_dev.register_irq_handler(h)) {
             Ok(irq) => {
                 self.irq = Some(irq);
