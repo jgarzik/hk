@@ -229,20 +229,30 @@ impl Drop for SemLock<'_> {
     }
 }
 
+/// What became of a semop's operations that did not fail
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Semop {
+    /// Applied, all of them
+    Done,
+    /// One would block; none applied
+    Blocks,
+}
+
 /// Apply `sops` in order, all or nothing (Linux
 /// perform_atomic_semop_slow, which also sums repeated operations on one
-/// semaphore): 0 when applied (sempid and otime updated), 1 when an
-/// operation would block (`blocking` is its index), or a negative errno
-/// (EAGAIN for a blocking operation with IPC_NOWAIT, ERANGE above SEMVMX
-/// or past the adjustment range). A SEM_UNDO operation also changes the
-/// `undo` list's adjustment by its negative. Undone on anything but 0.
+/// semaphore): Done when applied (sempid and otime updated), Blocks when
+/// an operation would block (`blocking` is its index), or an error
+/// (WouldBlock for a blocking operation with IPC_NOWAIT, Range above
+/// SEMVMX or past the adjustment range). A SEM_UNDO operation also
+/// changes the `undo` list's adjustment by its negative. Undone on
+/// anything but Done.
 fn perform_atomic_semop(
     l: &mut SemLock<'_>,
     sops: &[Sembuf],
     pid: i32,
     undo: Option<u64>,
     blocking: &mut usize,
-) -> i32 {
+) -> KernelResult<Semop> {
     let adj_of = |s: &PerSem| undo.and_then(|u| s.undo.get(&u).copied()).unwrap_or(0);
     for (n, sop) in sops.iter().enumerate() {
         let s = l.sem(sop.sem_num as usize);
@@ -251,12 +261,12 @@ fn perform_atomic_semop(
         let r = if (sop.sem_op == 0 && cur != 0) || result < 0 {
             *blocking = n;
             if sop.sem_flg & IPC_NOWAIT as i16 != 0 {
-                KernelError::WouldBlock.to_errno_neg()
+                Err(KernelError::WouldBlock)
             } else {
-                1
+                Ok(Semop::Blocks)
             }
         } else if result > SEMVMX {
-            KernelError::Range.to_errno_neg()
+            Err(KernelError::Range)
         } else if let (true, Some(u)) = (sop.sem_flg & SEM_UNDO != 0, undo) {
             // The adjustment must stay in -SEMAEM-1..=SEMAEM
             match i16::try_from(i32::from(adj_of(s)) - i32::from(sop.sem_op)) {
@@ -265,7 +275,7 @@ fn perform_atomic_semop(
                     s.val = result;
                     continue;
                 }
-                Err(_) => KernelError::Range.to_errno_neg(),
+                Err(_) => Err(KernelError::Range),
             }
         } else {
             s.val = result;
@@ -287,7 +297,12 @@ fn perform_atomic_semop(
         s.pid = pid;
         s.otime = now;
     }
-    0
+    Ok(Semop::Done)
+}
+
+/// A finished waiter's status (Linux q->status): 0 or a negative errno
+fn semop_errno(r: KernelResult<Semop>) -> i32 {
+    r.map_or_else(KernelError::to_errno_neg, |_| 0)
 }
 
 fn set_adj(s: &mut PerSem, undo: u64, v: i16) {
@@ -310,7 +325,7 @@ fn retry(l: &mut SemLock<'_>, q: &mut VecDeque<Waiter>, done: &mut Vec<usize>) -
         let w = q[i].0.clone();
         let mut blocking = 0;
         let r = perform_atomic_semop(l, &w.sops, w.pid, w.undo, &mut blocking);
-        if r == 1 {
+        if r == Ok(Semop::Blocks) {
             q[i].1 = blocking;
             i += 1;
             continue;
@@ -321,9 +336,9 @@ fn retry(l: &mut SemLock<'_>, q: &mut VecDeque<Waiter>, done: &mut Vec<usize>) -
         {
             g.complex_count -= 1;
         }
-        w.status.store(r, Ordering::Release);
+        w.status.store(semop_errno(r), Ordering::Release);
         woke = true;
-        if r == 0 && w.alter {
+        if r == Ok(Semop::Done) && w.alter {
             altered = true;
             done.extend(w.sops.iter().map(|s| s.sem_num as usize));
             i = 0;
@@ -643,13 +658,13 @@ pub fn sys_semtimedop(
     }
     let mut blocking = 0;
     let r = perform_atomic_semop(&mut l, &sops, pid, undo, &mut blocking);
-    if r <= 0 {
-        if r == 0 && alter {
+    if r != Ok(Semop::Blocks) {
+        if r == Ok(Semop::Done) && alter {
             sem_array.unlock_and_wake(l, sops.iter().map(|s| s.sem_num as usize));
         } else {
             drop(l);
         }
-        return semop_status(r);
+        return r.map(|_| 0);
     }
 
     // Would block: queue it and sleep (Linux: the status is -EINTR until
