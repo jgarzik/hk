@@ -274,8 +274,6 @@ No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS as with no tracer), no
 user notification (SECCOMP_RET_USER_NOTIF, SECCOMP_GET_NOTIF_SIZES), no
 FLAG_TSYNC_ESRCH / FLAG_SPEC_ALLOW / FLAG_WAIT_KILLABLE_RECV, and
 nothing is logged for RET_LOG or FLAG_LOG.
-SECCOMP_GET_ACTION_AVAIL takes `args` as the action itself; Linux
-reads a u32 action from the user pointer `args` (EFAULT if bad).
 
 ## Pipe size is fixed
 
