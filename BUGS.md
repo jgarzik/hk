@@ -255,12 +255,10 @@ lo (hk has no checksum offload states).
 
 - O_DIRECT is kept in f_flags but does nothing; Linux do_dentry_open
   refuses it (EINVAL) on a file without direct I/O (ramfs).
-- /proc/<pid>/fd/<n> of a pipe, socket or anonymous file is followed by
-  its text, not jumped to (fd_jump), so it cannot be opened again (Linux
-  proc_fd_link jumps to the pipefs/sockfs/anon file); /proc/<pid>/cwd,
-  root and exe are followed by their text too (`PidLink`), so they
-  resolve from the caller's root, not the target's (Linux
-  proc_pid_get_link jumps). Both are still magic links to RESOLVE_*.
+- /proc/<pid>/cwd, root and exe are followed by their text
+  (`PidLink`), so they resolve from the caller's root, not the target's
+  (Linux proc_pid_get_link jumps). They are still magic links to
+  RESOLVE_*.
 
 ## File lock gaps
 
@@ -369,7 +367,9 @@ creates queues, where Linux lets any user. mq_attr_ok's soft caps
 unreachable today.
 There is no mqueue filesystem at all: queues live only in a kernel
 table, so they cannot be listed or read as files under /dev/mqueue
-(Linux mqueue_fs_type).
+(Linux mqueue_fs_type), and an mq_open descriptor does not open again
+through /proc/<pid>/fd or O_EMPTYPATH (ENXIO; Linux opens the queue
+through the mqueue mount).
 mq_notify with SIGEV_THREAD is EINVAL: Linux delivers that notice as
 a message on a netlink socket the caller names (NETLINK_NOTIFY_COOKIE,
 glibc's helper thread), and hk has no such path.
@@ -931,9 +931,9 @@ dumb buffer from shmem and blits it on page flip
 
 **Location**: `fs/proc/mod.rs` (`ns_file`), `ns/mod.rs` (`sys_setns`)
 
-/proc/<pid>/ns/<type> leads to a procfs inode numbered as the
-namespace, not to an nsfs inode: st_dev is procfs's, and the file names
-the task and the type, so setns joins the namespace that task is in at
+/proc/<pid>/ns/<type> leads to an inode on the nsfs mount numbered as
+the namespace, but its operations are procfs's: the file names the
+task and the type, so setns joins the namespace that task is in at
 setns time (Linux: the open file pins the namespace itself, and a bind
 mount of it keeps the namespace alive). No cgroup, time,
 pid_for_children or time_for_children links, no NS_GET_* ioctls, and

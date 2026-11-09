@@ -115,6 +115,13 @@ impl Dentry {
         Self::with(name, inode, Weak::new())
     }
 
+    /// A dentry of `inode` on the pseudo filesystem `sb`, outside any
+    /// tree (Linux d_alloc_pseudo): a pipe's, socket's, anonymous
+    /// inode's or namespace file's
+    pub fn new_pseudo(name: FileName, inode: Arc<Inode>, sb: &Arc<SuperBlock>) -> Self {
+        Self::with(name, Some(inode), Arc::downgrade(sb))
+    }
+
     /// The child `name` of `parent` with `inode` (Linux d_alloc +
     /// d_add): the cached one if there is one (a negative one gets
     /// `inode`), so a name never has two dentries

@@ -3,8 +3,10 @@
 //!
 //! Files with no filesystem object behind them (eventfd, epoll,
 //! signalfd, timerfd, inotify, fanotify, pidfd, io_uring, bpf) share
-//! one inode, mode 0600 with no file type, like Linux's
-//! `anon_inode_inode`; each file's state lives in the File. The name
+//! one inode on anon_inodefs, mode 0600 with no file type, like Linux's
+//! `anon_inode_inode`; each file's state lives in the File, its path is
+//! anon_inodefs's mount and a pseudo dentry, and an open of that path
+//! (a /proc fd link, O_EMPTYPATH) is ENXIO (no_open_fops). The name
 //! given (`[eventfd]`) is what /proc/<pid>/fd shows as
 //! `anon_inode:[eventfd]`.
 //!
@@ -16,19 +18,18 @@
 //! sockets): each CPU takes a batch of numbers from a shared counter
 //! and hands them out without touching it (Linux LAST_INO_BATCH).
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Once;
 
 use crate::cpu::PerCpu;
-use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps};
 use crate::fs::inode::{Inode, InodeMode, InodeOps, Timespec};
 use crate::sync::IrqSpinlock;
 use crate::util::error::KernelError;
-use crate::util::kalloc::{arc_nofail, try_arc};
+use crate::util::kalloc::try_arc;
 
 /// Numbers one CPU takes from the shared counter at a time
 const LAST_INO_BATCH: u64 = 1024;
@@ -73,21 +74,24 @@ static ANON_INODE_OPS: AnonInodeOps = AnonInodeOps;
 /// The inode every anonymous file shares
 static ANON_INODE: Once<Arc<Inode>> = Once::new();
 
-fn anon_inode() -> Arc<Inode> {
-    ANON_INODE
-        .call_once(|| {
-            arc_nofail(Inode::new(
-                get_next_ino(),
-                InodeMode(0o600),
-                0,
-                0,
-                0,
-                Timespec::from_secs(0),
-                Weak::new(),
-                &ANON_INODE_OPS,
-            ))
-        })
-        .clone()
+/// anon_inodefs and its shared inode (Linux anon_inode_init, an fs
+/// initcall: kern_mount, then alloc_anon_inode)
+pub fn anon_inode_init() -> Result<(), KernelError> {
+    use crate::fs::pseudo::ANON_INODEFS;
+    ANON_INODEFS.init()?;
+    let sb = ANON_INODEFS.sb()?;
+    let inode = try_arc(Inode::new(
+        get_next_ino(),
+        InodeMode(0o600),
+        0,
+        0,
+        0,
+        Timespec::from_secs(0),
+        Arc::downgrade(&sb),
+        &ANON_INODE_OPS,
+    ))?;
+    ANON_INODE.call_once(|| inode);
+    Ok(())
 }
 
 /// A new file on the shared anonymous inode (Linux anon_inode_getfile):
@@ -98,6 +102,8 @@ pub fn anon_inode_getfile(
     private: Arc<dyn Any + Send + Sync>,
     flags: u32,
 ) -> Result<Arc<File>, KernelError> {
-    let dentry = try_arc(Dentry::new_anonymous(name.into(), Some(anon_inode())))?;
-    try_arc(File::new_anon(dentry, flags, f_op, private))
+    let inode = ANON_INODE.get().cloned().ok_or(KernelError::NoDevice)?;
+    let p = crate::fs::pseudo::ANON_INODEFS.path(name, inode)?;
+    let (mnt, dentry) = p.into_parts();
+    try_arc(File::new_anon(dentry, Some(mnt), flags, f_op, private))
 }

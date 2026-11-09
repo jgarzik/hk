@@ -478,7 +478,7 @@ impl InodeOps for ProcfsInodeOps {
     fn jump_link(
         &self,
         inode: &Inode,
-        mnt: &Arc<crate::fs::mount::Mount>,
+        _mnt: &Arc<crate::fs::mount::Mount>,
     ) -> Option<Result<crate::fs::Path, KernelError>> {
         let wrapper = inode.get_private()?;
         let wrapper = wrapper
@@ -492,7 +492,7 @@ impl InodeOps for ProcfsInodeOps {
             ProcfsInodeData::FdSymlink { pid, fd } => return fd_jump(pid, *fd),
             _ => return None,
         };
-        Some(ns_file(inode, mnt, pid, ns_type))
+        Some(ns_file(pid, ns_type))
     }
 
     /// /proc/sys files: Linux proc_sys_permission (never executable,
@@ -976,9 +976,8 @@ fn create_self_link(parent: &Inode) -> Result<Arc<Inode>, KernelError> {
     Ok(inode)
 }
 
-/// Target of /proc/<pid>/fd/<fd>: `socket:[ino]` / `pipe:[ino]` for
-/// sockets and pipes, `anon_inode:<name>` for other files without a
-/// filesystem, else the path; EACCES without ptrace-read access, checked
+/// Target of /proc/<pid>/fd/<fd>: `socket:[ino]`, `pipe:[ino]`,
+/// `anon_inode:<name>` for the pseudo filesystems' files, else the path; EACCES without ptrace-read access, checked
 /// at each read, not only at lookup in fd/ (Linux proc_pid_readlink,
 /// proc_fd_access_allowed)
 fn fd_link(pid: &ProcPid, fd: i32) -> Result<Vec<u8>, KernelError> {
@@ -986,14 +985,13 @@ fn fd_link(pid: &ProcPid, fd: i32) -> Result<Vec<u8>, KernelError> {
     let table = task_files(&t).ok_or(KernelError::NotFound)?;
     let file = table.lock().get(fd).ok_or(KernelError::NotFound)?;
     let inode = file.get_inode().ok_or(KernelError::NotFound)?;
-    let mode = inode.mode();
-    if mode.is_socket() {
-        return Ok(alloc::format!("socket:[{}]", inode.ino).into_bytes());
+    // A pipe, socket, anonymous or namespace file: its pseudo fs's name
+    // for it (Linux d_dname); a file of no filesystem (an mqueue) by
+    // its dentry's name
+    if let Some(n) = super::pseudo::dname(&file.dentry) {
+        return Ok(n);
     }
     if inode.superblock().is_none() {
-        if mode.file_type() == Some(crate::fs::inode::FileType::Fifo) {
-            return Ok(alloc::format!("pipe:[{}]", inode.ino).into_bytes());
-        }
         return Ok([b"anon_inode:".as_slice(), &file.dentry.name()].concat());
     }
     match file.f_path() {
@@ -1002,22 +1000,21 @@ fn fd_link(pid: &ProcPid, fd: i32) -> Result<Vec<u8>, KernelError> {
     }
 }
 
-/// /proc/<pid>/fd/<fd> of a file system's file leads to the open file
-/// itself (Linux proc_fd_link + nd_jump_link), so a deleted or unnamed
-/// one (O_TMPFILE, memfd) can be opened again, and the walk goes on
-/// from a directory; None (follow the text of `fd_link`) for a pipe,
-/// socket or anonymous file; EACCES without ptrace-read access, checked
-/// at each follow (Linux proc_pid_get_link, proc_fd_access_allowed)
+/// /proc/<pid>/fd/<fd> leads to the open file itself, its pseudo fs
+/// path for a pipe, socket or anonymous file (Linux proc_fd_link +
+/// nd_jump_link), so a deleted or unnamed one (O_TMPFILE, memfd) can be
+/// opened again, a pipe joined, and the walk goes on from a directory;
+/// None (follow the text of `fd_link`) for a file of no filesystem (an
+/// mqueue); EACCES without ptrace-read access, checked at each follow
+/// (Linux proc_pid_get_link, proc_fd_access_allowed)
 fn fd_jump(pid: &ProcPid, fd: i32) -> Option<Result<crate::fs::Path, KernelError>> {
     let t = match link_task(pid) {
         Ok(t) => t,
         Err(e) => return Some(Err(e)),
     };
     let file = task_files(&t)?.lock().get(fd)?;
-    let inode = file.get_inode()?;
-    if inode.mode().is_socket() || inode.superblock().is_none() {
-        return None;
-    }
+    // A file of no filesystem: followed by its text
+    file.get_inode()?.superblock()?;
     file.f_path().map(Ok)
 }
 
@@ -1170,17 +1167,11 @@ fn ns_inum(pid: &ProcPid, ns_type: NamespaceType) -> Result<u32, KernelError> {
 }
 
 /// The file of the `ns_type` namespace of the task `pid` names, where
-/// its /proc link `link` (on `mnt`) leads: a read-only inode numbered
-/// as the namespace (Linux ns_get_path: the nsfs inode, ino ns.inum),
-/// which setns takes
-fn ns_file(
-    link: &Inode,
-    mnt: &Arc<crate::fs::mount::Mount>,
-    pid: ProcPid,
-    ns_type: NamespaceType,
-) -> Result<crate::fs::Path, KernelError> {
+/// its /proc link leads: a read-only nsfs inode numbered as the
+/// namespace (Linux ns_get_path: ino ns.inum), which setns takes
+fn ns_file(pid: ProcPid, ns_type: NamespaceType) -> Result<crate::fs::Path, KernelError> {
     let inum = ns_inum(&pid, ns_type)?;
-    let sb = link.superblock().ok_or(KernelError::Io)?;
+    let sb = crate::fs::pseudo::NSFS.sb()?;
     let inode = try_arc(Inode::new(
         u64::from(inum),
         InodeMode::regular(0o444),
@@ -1194,9 +1185,9 @@ fn ns_file(
     inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_ns_file(pid, ns_type),
     )))?);
-    let name = alloc::format!("{}:[{inum}]", ns_type.as_str()).into_bytes();
-    let dentry = try_arc(Dentry::new_anonymous(name.into(), Some(inode)))?;
-    Ok(crate::fs::Path::new(mnt.clone(), dentry))
+    // On nsfs's mount (Linux ns_get_path: dname "<type>:[<inum>]")
+    let name = alloc::format!("{}:[{inum}]", ns_type.as_str());
+    crate::fs::pseudo::NSFS.path(&name, inode)
 }
 
 /// Generate content for /proc/<pid>/cgroup

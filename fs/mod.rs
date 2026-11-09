@@ -40,6 +40,7 @@ pub mod perm;
 #[path = "poll.rs"]
 pub mod pollsys;
 pub mod posix_lock;
+pub mod pseudo;
 pub mod stat;
 pub mod sync;
 

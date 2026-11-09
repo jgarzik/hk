@@ -868,10 +868,12 @@ impl FileOps for PipeReadFileOps {
         mask
     }
 
+    /// One reader fewer, and one file of the inode's pipe (Linux
+    /// pipe_release), as a FIFO's release
     fn release(&self, file: &File) -> Result<(), KernelError> {
         let pipe = pipe_of(file)?;
-        // Decrement reader count when file is closed
-        pipe.remove_reader();
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        fifo_put(&inode, pipe, flags::O_RDONLY);
         pipe.release_notify();
         Ok(())
     }
@@ -963,10 +965,12 @@ impl FileOps for PipeWriteFileOps {
         mask
     }
 
+    /// One writer fewer, and one file of the inode's pipe (Linux
+    /// pipe_release), as a FIFO's release
     fn release(&self, file: &File) -> Result<(), KernelError> {
         let pipe = pipe_of(file)?;
-        // Decrement writer count when file is closed
-        pipe.remove_writer();
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        fifo_put(&inode, pipe, flags::O_WRONLY);
         pipe.release_notify();
         Ok(())
     }
@@ -979,8 +983,6 @@ impl FileOps for PipeWriteFileOps {
 // =============================================================================
 // Pipe Creation
 // =============================================================================
-
-use crate::fs::dentry::Dentry;
 
 /// FIONREAD: the bytes buffered, under the pipe's lock (Linux
 /// pipe_ioctl); anything else ENOTTY
@@ -1241,23 +1243,28 @@ fn fifo_put(inode: &crate::fs::inode::Inode, pipe: &Pipe, mode: u32) {
 /// The returned files should be added to the process's fd table.
 pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelError> {
     let pipe = Pipe::new()?;
-
-    // We need a dummy dentry for pipe files
-    // Pipes don't have a filesystem path, but File requires a dentry
-    let dummy_dentry = create_pipe_dentry()?;
+    let (mnt, dentry) = create_pipe_path()?.into_parts();
+    // The inode holds the pipe while either file is open (Linux
+    // inode->i_pipe, pipe->files = 2), so an open of the pipe's path (a
+    // /proc fd link, O_EMPTYPATH) joins it as a FIFO open would
+    if let Some(i) = dentry.get_inode() {
+        *i.i_pipe.lock() = Some((pipe.clone(), 2));
+    }
 
     // Determine file flags
     let read_flags = flags::O_RDONLY | (pipe_flags & flags::O_NONBLOCK);
     let write_flags = flags::O_WRONLY | (pipe_flags & flags::O_NONBLOCK);
 
     let read_file = try_arc(File::new_anon(
-        Arc::clone(&dummy_dentry),
+        Arc::clone(&dentry),
+        Some(mnt.clone()),
         read_flags,
         &PIPE_READ_FOPS,
         pipe.clone(),
     ))?;
     let write_file = try_arc(File::new_anon(
-        dummy_dentry,
+        dentry,
+        Some(mnt),
         write_flags,
         &PIPE_WRITE_FOPS,
         pipe,
@@ -1266,17 +1273,13 @@ pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelErro
     Ok((read_file, write_file))
 }
 
-/// Create a dummy dentry for pipes
-///
-/// Pipes don't have a real filesystem entry, but our File struct
-/// requires a dentry. This creates a minimal anonymous dentry.
-fn create_pipe_dentry() -> Result<Arc<Dentry>, KernelError> {
-    use crate::fs::dentry::Dentry;
+/// A new pipefs inode and its path (Linux get_pipe_inode: its own
+/// number, the creator's fsuid/fsgid, the current time; then
+/// alloc_file_pseudo)
+fn create_pipe_path() -> Result<crate::fs::Path, KernelError> {
     use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS};
-    use alloc::sync::Weak;
+    use crate::fs::pseudo::PIPEFS;
 
-    // A pipefs inode (Linux get_pipe_inode): its own number, the
-    // creator's fsuid/fsgid, the current time
     let cred = crate::task::percpu::current_cred();
     let inode = try_arc(Inode::new(
         crate::fs::anon_inodes::get_next_ino(),
@@ -1285,14 +1288,10 @@ fn create_pipe_dentry() -> Result<Arc<Dentry>, KernelError> {
         cred.fsgid,
         0,
         crate::time::TIMEKEEPER.current_time(),
-        Weak::new(),
+        Arc::downgrade(&PIPEFS.sb()?),
         &NULL_INODE_OPS,
     ))?;
-
-    // Create anonymous dentry
-    let dentry = try_arc(Dentry::new_anonymous("pipe".into(), Some(inode)))?;
-
-    Ok(dentry)
+    PIPEFS.path("", inode)
 }
 
 // =============================================================================

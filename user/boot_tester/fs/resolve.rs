@@ -6,8 +6,9 @@
 //! - BENEATH: leaving dirfd ("..", an absolute path or symlink) is EXDEV
 //! - IN_ROOT: dirfd is the root: ".." stops there, absolute paths and
 //!   symlinks start there, O_CREAT included
-//! - NO_XDEV: crossing a mount, down, up, by symlink or magic link, is
-//!   EXDEV; a magic link within the mount is fine
+//! - NO_XDEV: crossing a mount, down, up, by symlink or magic link (to
+//!   /, a pipe on pipefs, a namespace on nsfs), is EXDEV; a magic link
+//!   within the mount is fine
 //! - NO_MAGICLINKS: a /proc magic link is ELOOP unless it is the last
 //!   component and not followed
 //! - NO_SYMLINKS: any symlink is ELOOP unless last and not followed
@@ -30,8 +31,8 @@
 use crate::harness::{R, check, report_r};
 use hk_syscall::{
     O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_PATH, O_RDONLY, O_WRONLY, Stat, sys_close, sys_dup,
-    sys_fstat, sys_getpid, sys_mkdir, sys_mount, sys_open, sys_openat, sys_openat2, sys_rmdir,
-    sys_symlink, sys_umount2,
+    sys_fstat, sys_getpid, sys_mkdir, sys_mount, sys_open, sys_openat, sys_openat2, sys_pipe2,
+    sys_rmdir, sys_symlink, sys_umount2,
 };
 
 const EXDEV: i64 = -18;
@@ -377,7 +378,28 @@ fn magic_xdev(rootfd: i32, proc: i32) -> R {
     sys_close(hard as u64);
     check(b"magic in /proc", fd >= 0, fd)?;
     let same = id(fd) == want_id(rootfd, Abs(b"/proc\0"));
-    check(b"magic in /proc: /proc", same, 0)
+    check(b"magic in /proc: /proc", same, 0)?;
+    magic_pseudo(proc)
+}
+
+/// Magic links to a pipe and to a namespace jump to their own mounts
+/// (pipefs, nsfs): EXDEV
+fn magic_pseudo(proc: i32) -> R {
+    let mut p = [0i32; 2];
+    let r = sys_pipe2(p.as_mut_ptr(), 0);
+    check(b"pipe", r == 0, r)?;
+    let mut name = *b"self/fd/\0\0\0\0\0\0";
+    let k = decimal(&mut name[8..], i64::from(p[0]));
+    name[8 + k] = 0;
+    let rp = open2(proc, &name, u64::from(O_PATH), 0, NO_XDEV);
+    let rn = open2(proc, b"self/ns/net\0", u64::from(O_PATH), 0, NO_XDEV);
+    for fd in [rp, rn, i64::from(p[0]), i64::from(p[1])] {
+        if fd >= 0 {
+            sys_close(fd as u64);
+        }
+    }
+    check(b"magic to pipefs", rp == EXDEV, rp)?;
+    check(b"magic to nsfs", rn == EXDEV, rn)
 }
 
 /// Decimal `v` into `b`: its length

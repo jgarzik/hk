@@ -34,6 +34,7 @@ pub mod pnode;
 pub mod posix_lock;
 pub mod pread_special;
 pub mod rename2;
+pub mod reopen;
 pub mod resolve;
 pub mod splice;
 pub mod sync;

@@ -492,16 +492,18 @@ impl File {
         }
     }
 
-    /// An anonymous-inode file whose shared state lives in `private`
-    /// (Linux anon_inode_getfile priv): the ops stay static, and the
-    /// state goes with the last reference to the file
+    /// A file whose shared state lives in `private` (Linux
+    /// anon_inode_getfile priv, alloc_file_pseudo): the ops stay static,
+    /// and the state goes with the last reference to the file; `mnt` is
+    /// its pseudo filesystem's mount
     pub fn new_anon(
         dentry: Arc<Dentry>,
+        mnt: Option<Arc<Mount>>,
         flags: u32,
         f_op: &'static dyn FileOps,
         private: Arc<dyn core::any::Any + Send + Sync>,
     ) -> Self {
-        let f = Self::new(dentry, None, flags, f_op);
+        let f = Self::new(dentry, mnt, flags, f_op);
         f.private.call_once(|| private);
         f
     }

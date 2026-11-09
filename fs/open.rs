@@ -421,8 +421,10 @@ fn filp_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, Kerne
     let acc = if created { 0 } else { op.acc };
     dac::may_open(&dac::cred(), &inode, acc, flags)?;
 
-    // A socket inode cannot be opened (Linux no_open_fops): ENXIO
-    if m.is_socket() {
+    // A socket inode cannot be opened (Linux sock_no_open): ENXIO; nor
+    // a file of no filesystem (an mqueue: Linux opens it through the
+    // mqueue mount, which hk lacks)
+    if m.is_socket() || dentry.superblock().is_none() {
         return Err(KernelError::NoDeviceOrAddress);
     }
 

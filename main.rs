@@ -297,11 +297,21 @@ pub(crate) fn kmain() -> ! {
     // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
     // (chr_dev_init), then device initcalls (bus probes below)
     mnt_init();
+    // start_kernel's nsfs_init, after proc_root_init
+    pseudo_init(&fs::pseudo::NSFS);
     fs::ramfs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();
+    // sock_init, a core initcall after kernel/'s (ksysfs)
+    pseudo_init(&fs::pseudo::SOCKFS);
     base::topology_init();
     net::sysfs::net_sysfs_init();
+    // fs initcalls: init_pipe_fs, anon_inode_init, then drivers/'s
+    // chr_dev_init
+    pseudo_init(&fs::pseudo::PIPEFS);
+    if let Err(e) = fs::anon_inodes::anon_inode_init() {
+        printkln!("ERR: anon_inodefs: {:?}", e);
+    }
     chr_dev_init();
 
     // Device initcalls (Linux order: buses scanned, drivers registered,
@@ -466,6 +476,13 @@ fn mnt_init() {
     };
     fs::DCACHE.set_root(root_mount.root.clone());
     let _ = ramfs_create_dir(&root_mount.root, b"dev");
+}
+
+/// Mount a pseudo filesystem for the kernel (Linux kern_mount)
+fn pseudo_init(p: &'static fs::pseudo::Pseudo) {
+    if let Err(e) = p.init() {
+        printkln!("ERR: pseudo fs: {:?}", e);
+    }
 }
 
 /// Memory and tty character devices (Linux chr_dev_init, fs_initcall)
