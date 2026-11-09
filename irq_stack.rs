@@ -5,7 +5,8 @@
 //! their CPU's own, not on the interrupted task's, so the deepest
 //! syscall and the deepest handler do not share one 16 KiB stack. Each
 //! CPU's is a `mm::vmstack` stack (`THREAD_SIZE`, Linux IRQ_STACK_SIZE),
-//! made by the arch `smp::init` before the CPU takes interrupts: a guard
+//! kept in [`IRQ_STACK`] (Linux hardirq_stack_ptr / irq_stack_ptr), given
+//! by the arch `smp::init` ([`set`]) before the CPU takes interrupts: a guard
 //! gap lies below it, arm64's entry overflow check holds on it, and an
 //! overflow into the gap says it was the IRQ stack ([`overflowed`]).
 //!
@@ -19,8 +20,35 @@
 //! stays there: `run` switches only when SP is not on it already (Linux
 //! hardirq_stack_inuse, on_thread_stack).
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::arch::{CurrentArch, IrqStackOps};
-use crate::mm::vmstack::{self, THREAD_SIZE};
+use crate::cpu::PerCpu;
+use crate::mm::vmstack::{self, THREAD_SIZE, VmStack};
+
+/// Each CPU's IRQ stack top, 0 until [`set`]: written once, for a CPU
+/// not running yet (its start orders the store before its reads) or by
+/// the CPU itself
+static IRQ_STACK: PerCpu<AtomicU64> = crate::percpu![AtomicU64::new(0)];
+
+/// Give CPU `cpu` (not running yet, or the caller) the IRQ stack `s`,
+/// for good (Linux irq_init_percpu_irqstack, init_irq_stacks)
+pub fn set(cpu: u32, s: VmStack) {
+    let top = s.leak() + THREAD_SIZE as u64;
+    IRQ_STACK.get(cpu).store(top, Ordering::Relaxed);
+}
+
+/// Give CPU `cpu` a new IRQ stack; false if out of memory
+pub fn init(cpu: u32) -> bool {
+    vmstack::alloc().map(|s| set(cpu, s)).is_some()
+}
+
+/// Top of this CPU's IRQ stack, 0 before it has one (or before per-CPU
+/// data exists)
+#[inline]
+pub fn top() -> u64 {
+    crate::cpu::try_this_id().map_or(0, |c| IRQ_STACK.get(c).load(Ordering::Relaxed))
+}
 
 /// `sp` is on the stack whose top is `top` (0: none)
 fn within(top: u64, sp: u64) -> bool {
@@ -29,13 +57,13 @@ fn within(top: u64, sp: u64) -> bool {
 
 /// SP is on this CPU's IRQ stack
 pub fn on_irq_stack() -> bool {
-    within(CurrentArch::irq_stack_top(), CurrentArch::stack_pointer())
+    within(top(), CurrentArch::stack_pointer())
 }
 
 /// Run `f`, an interrupt's handlers (interrupts off), on this CPU's IRQ
 /// stack: directly if SP is on it already, or before it has one
 pub fn run<F: FnOnce()>(f: F) {
-    let top = CurrentArch::irq_stack_top();
+    let top = top();
     if top == 0 || within(top, CurrentArch::stack_pointer()) {
         return f();
     }
@@ -61,7 +89,7 @@ extern "C" fn call_once<F: FnOnce()>(arg: *mut ()) {
 /// Which stack a fault at `addr` in a guard gap overflowed, for the
 /// panic message
 pub fn overflowed(addr: u64) -> &'static str {
-    let top = CurrentArch::irq_stack_top();
+    let top = top();
     if top != 0 && vmstack::overflowed(addr) == Some(top - THREAD_SIZE as u64) {
         "IRQ stack"
     } else {

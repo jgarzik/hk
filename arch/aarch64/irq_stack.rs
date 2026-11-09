@@ -1,28 +1,10 @@
 //! This CPU's IRQ stack (Linux arch/arm64/kernel/irq.c, entry.S
-//! call_on_irq_stack): `PerCpu.irq_stack`, and the switch onto it
-
-use core::sync::atomic::Ordering;
+//! call_on_irq_stack): the switch onto it
 
 use super::Aarch64Arch;
-use super::percpu::{get_percpu, try_current_cpu};
 use crate::arch::IrqStackOps;
 
-/// Give CPU `cpu` (not running yet, or the caller) its IRQ stack
-/// (Linux init_irq_stacks); false if out of memory
-pub fn init(cpu: u32) -> bool {
-    let Some(top) = crate::mm::vmstack::alloc_percpu() else {
-        return false;
-    };
-    get_percpu(cpu).irq_stack.store(top, Ordering::Relaxed);
-    true
-}
-
 impl IrqStackOps for Aarch64Arch {
-    #[inline]
-    fn irq_stack_top() -> u64 {
-        try_current_cpu().map_or(0, |p| p.irq_stack.load(Ordering::Relaxed))
-    }
-
     #[inline]
     fn stack_pointer() -> u64 {
         let sp: u64;

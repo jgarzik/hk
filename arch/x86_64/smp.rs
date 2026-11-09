@@ -57,7 +57,7 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
     percpu::init_bsp(bsp_apic_id as u8);
     printkln!("SMP_CPU_ONLINE: cpu=0 apic={}", bsp_apic_id);
     // Its IRQ stack, before it takes interrupts (Linux init_IRQ)
-    if !super::irq_stack::init(0) {
+    if !crate::irq_stack::init(0) {
         printkln!("SMP: Failed to allocate the IRQ stack for CPU 0");
     }
 
@@ -104,7 +104,7 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
             continue;
         }
         // Its IRQ stack (Linux irq_init_percpu_irqstack at bringup)
-        if !super::irq_stack::init(cpu_id) {
+        if !crate::irq_stack::init(cpu_id) {
             printkln!("SMP: Failed to allocate the IRQ stack for CPU {}", cpu_id);
             continue;
         }

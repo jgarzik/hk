@@ -39,10 +39,6 @@ pub struct PerCpu {
     /// cpu_tss_rw.x86_tss.sp2 scratch)
     pub user_rsp: AtomicU64,
 
-    /// Top of this CPU's IRQ stack (Linux hardirq_stack_ptr), 0 until
-    /// `irq_stack::init`
-    pub irq_stack: AtomicU64,
-
     /// Logical CPU ID (0 = BSP, 1+ = APs)
     pub cpu_id: AtomicU32,
 
@@ -83,7 +79,6 @@ impl PerCpu {
             self_ptr: AtomicPtr::new(core::ptr::null_mut()),
             top_of_stack: AtomicU64::new(0),
             user_rsp: AtomicU64::new(0),
-            irq_stack: AtomicU64::new(0),
             cpu_id: AtomicU32::new(0),
             apic_id: AtomicU32::new(0),
             is_bsp: AtomicBool::new(false),

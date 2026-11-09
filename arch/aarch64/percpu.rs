@@ -41,10 +41,6 @@ pub struct PerCpu {
     /// Kernel stack top for this CPU
     pub kernel_stack_top: AtomicU64,
 
-    /// Top of this CPU's IRQ stack (Linux irq_stack_ptr), 0 until
-    /// `irq_stack::init`
-    pub irq_stack: AtomicU64,
-
     /// Timer tick count for this CPU
     pub ticks: AtomicU64,
 
@@ -72,7 +68,6 @@ impl PerCpu {
             is_bsp: AtomicBool::new(false),
             is_online: AtomicBool::new(false),
             kernel_stack_top: AtomicU64::new(0),
-            irq_stack: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
             curr: AtomicUsize::new(0),
             interrupt_depth: AtomicU32::new(0),

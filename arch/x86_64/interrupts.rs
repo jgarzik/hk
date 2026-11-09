@@ -663,8 +663,7 @@ fn stack_of(sp: u64) -> core::ops::Range<u64> {
 /// If `stack` is this CPU's IRQ stack: the stack it was entered from,
 /// by the RSP `irq_stack::call_on_stack` left in its top word
 fn irq_stack_next(stack: &core::ops::Range<u64>) -> Option<core::ops::Range<u64>> {
-    use crate::arch::IrqStackOps;
-    let top = super::X86_64Arch::irq_stack_top();
+    let top = crate::irq_stack::top();
     if top == 0 || stack.end != top {
         return None;
     }

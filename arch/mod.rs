@@ -385,9 +385,6 @@ pub trait PerCpuOps {
 
 /// Per-CPU IRQ stacks (`crate::irq_stack`)
 pub trait IrqStackOps {
-    /// Top of this CPU's IRQ stack, 0 before it has one
-    fn irq_stack_top() -> u64;
-
     /// The stack pointer now
     fn stack_pointer() -> u64;
 

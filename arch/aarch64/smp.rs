@@ -78,7 +78,7 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
     percpu::init_bsp(bsp_mpidr, bsp_stack_top);
     set_overflow_stack(0);
     // Its IRQ stack, before it takes interrupts (Linux init_irq_stacks)
-    if !super::irq_stack::init(0) {
+    if !crate::irq_stack::init(0) {
         printkln!("SMP: Failed to allocate the IRQ stack for CPU 0");
     }
 
@@ -108,7 +108,7 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
         // Allocate stack for this AP (aligned like every EL1 stack:
         // vectors.S KERNEL_ENTRY), its overflow and IRQ stacks
         let Some(stack) = crate::mm::vmstack::alloc()
-            .filter(|_| set_overflow_stack(cpu_id) && super::irq_stack::init(cpu_id))
+            .filter(|_| set_overflow_stack(cpu_id) && crate::irq_stack::init(cpu_id))
         else {
             printkln!(
                 "SMP: Failed to allocate stack for CPU {}",
