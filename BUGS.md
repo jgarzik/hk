@@ -648,15 +648,6 @@ cgroup (say memory.max 64MB) at any RAM size, and on Linux too,
 instead of filling all of RAM and being skipped above 4GB
 (`user/boot_tester/mm/mm_oom.rs`).
 
-## BPF map update flags are not checked
-
-**Location**: `bpf/map.rs`, `bpf/syscall.rs`
-
-BPF_MAP_UPDATE_ELEM treats any flags value but BPF_NOEXIST and
-BPF_EXIST as BPF_ANY; Linux returns EINVAL for flags above BPF_EXIST
-and for BPF_F_LOCK on a map without a bpf_spin_lock
-(bpf_map_update_value, htab_map_update_elem).
-
 ## BPF map memory is not charged
 
 **Location**: `bpf/map.rs`

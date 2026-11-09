@@ -15,6 +15,8 @@
 //!   writes the length it used back to attr.info.info_len, takes a
 //!   larger buffer whose extra bytes are zero, and is E2BIG when they
 //!   are not (bpf_check_uarg_tail_zero)
+//! - BPF_UPDATE_FLAGS: BPF_MAP_UPDATE_ELEM flags errnos (EINVAL,
+//!   EEXIST, ENOENT, E2BIG) as Linux
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -108,6 +110,66 @@ pub fn run_tests() {
     test_invalid_fd();
     test_hash_budget();
     test_map_info();
+    test_update_flags();
+}
+
+/// BPF_MAP_UPDATE_ELEM of `key`/`value` with `flags`
+fn map_update(fd: i64, key: u32, value: u64, flags: u64) -> i64 {
+    let attr = MapElemAttr {
+        map_fd: fd as u32,
+        _pad0: 0,
+        key: &key as *const _ as u64,
+        value: &value as *const _ as u64,
+        flags,
+    };
+    sys_bpf(
+        BPF_MAP_UPDATE_ELEM,
+        &attr as *const _ as u64,
+        size_of::<MapElemAttr>() as u32,
+    )
+}
+
+/// Update flags as Linux checks them (bpf_map_update_value,
+/// htab_map_update_elem, array_map_update_elem): unknown flags and
+/// BPF_F_LOCK on a map without a bpf_spin_lock are EINVAL; a hash map's
+/// BPF_NOEXIST on a key it has is EEXIST, BPF_EXIST on one it lacks
+/// ENOENT; an array's BPF_NOEXIST is EEXIST, an index past it E2BIG
+fn test_update_flags() {
+    const EINVAL: i64 = -22;
+    const EEXIST: i64 = -17;
+    const ENOENT: i64 = -2;
+    const E2BIG: i64 = -7;
+    const NOEXIST: u64 = 1;
+    const EXIST: u64 = 2;
+    const F_LOCK: u64 = 4;
+    let mut t = crate::harness::T::new(b"BPF_UPDATE_FLAGS");
+    let h = map_create(&hash_attr(4, 8, 4));
+    let a = map_create(&MapCreateAttr {
+        map_type: BPF_MAP_TYPE_ARRAY,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 4,
+        ..Default::default()
+    });
+    t.ok(b"create", h >= 0 && a >= 0, h.min(a));
+    for fd in [h, a] {
+        t.eq(b"flags 3", map_update(fd, 1, 7, 3), EINVAL);
+        t.eq(b"flags 0x20", map_update(fd, 1, 7, 0x20), EINVAL);
+        t.eq(b"F_LOCK", map_update(fd, 1, 7, F_LOCK), EINVAL);
+    }
+    t.eq(b"hash exist missing", map_update(h, 1, 7, EXIST), ENOENT);
+    t.eq(b"hash noexist new", map_update(h, 1, 7, NOEXIST), 0);
+    t.eq(b"hash noexist again", map_update(h, 1, 8, NOEXIST), EEXIST);
+    t.eq(b"hash exist", map_update(h, 1, 9, EXIST), 0);
+    t.eq(b"array noexist", map_update(a, 1, 7, NOEXIST), EEXIST);
+    t.eq(b"array exist", map_update(a, 1, 7, EXIST), 0);
+    t.eq(b"array past end", map_update(a, 4, 7, 0), E2BIG);
+    for fd in [h, a] {
+        if fd >= 0 {
+            sys_close(fd as u64);
+        }
+    }
+    t.done();
 }
 
 fn hash_attr(key_size: u32, value_size: u32, max_entries: u32) -> MapCreateAttr {
