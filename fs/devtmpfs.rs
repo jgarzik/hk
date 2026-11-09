@@ -2,10 +2,14 @@
 //!
 //! Linux reference: drivers/base/devtmpfs.c.
 //!
-//! One internal ramfs superblock holds a node for every device passed to
-//! [`device_add`]; each mount of "devtmpfs" shows that same superblock
-//! (Linux mount_single). [`init`] runs in driver_init, before any device
-//! registers.
+//! One internal tmpfs superblock (mode=0755, tmpfs's default limits;
+//! Linux internal_fs_type with CONFIG_TMPFS) holds a node for every
+//! device passed to [`device_add`]; each mount of "devtmpfs" shows that
+//! same superblock, and its options (tmpfs's) are applied to it as a
+//! remount's would be (Linux public_dev_mount, reconfigure_single, as in
+//! the 6.8 reference and Debian's 6.12; 6.15 parses and drops them). A
+//! remount reconfigures it likewise. [`init`] runs in driver_init,
+//! before any device registers.
 //!
 //! ## Locking
 //!
@@ -33,8 +37,15 @@ fn root() -> Option<Arc<Dentry>> {
     DEVTMPFS.get()?.get_root()
 }
 
-fn mount(_t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
-    DEVTMPFS.get().cloned().ok_or(KernelError::NoDevice)
+/// A mount: the one superblock, reconfigured with `opts` under its
+/// s_umount (a bad option or a refused limit fails the mount, nothing
+/// changed)
+fn mount(_t: &'static FileSystemType, opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
+    let sb = DEVTMPFS.get().cloned().ok_or(KernelError::NoDevice)?;
+    let s = sb.s_umount.write();
+    sb.s_op.remount(&sb, opts)?;
+    drop(s);
+    Ok(sb)
 }
 
 /// The devtmpfs filesystem type
@@ -43,7 +54,7 @@ pub static DEVTMPFS_TYPE: FileSystemType = FileSystemType {
     fs_flags: 0,
     mount,
     mount_dev: None,
-    file_ops: &super::ramfs::RAMFS_FILE_OPS,
+    file_ops: &super::ramfs::TMPFS_FILE_OPS,
 };
 
 /// Create the node `name` for a device (Linux device_add ->
@@ -75,7 +86,7 @@ pub fn device_del(name: &str) {
 
 /// Create the superblock (Linux devtmpfs_init, in driver_init)
 pub fn init() {
-    match super::ramfs::ramfs_mount(&DEVTMPFS_TYPE, b"") {
+    match super::tmpfs::tmpfs_mount(&DEVTMPFS_TYPE, b"mode=0755") {
         Ok(sb) => {
             DEVTMPFS.call_once(|| sb);
         }

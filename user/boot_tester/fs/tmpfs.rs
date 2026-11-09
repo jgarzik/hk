@@ -16,6 +16,10 @@
 //!   CONFIG_TMPFS and no root=) limited to about half of RAM (Linux
 //!   sizes it before the initrd and init memory are freed); ramfs, which
 //!   it no longer is, has no xattrs or fallocate (EOPNOTSUPP)
+//! - DEVTMPFS_TMPFS: devtmpfs is a tmpfs with mode=755 (Linux
+//!   devtmpfs_init); another mount shows the same superblock and
+//!   reconfigures it with its options (Linux reconfigure_single, up to
+//!   6.14): a bad one is EINVAL, size= changes /dev's limit too
 
 use crate::exec::busybox::contains;
 use crate::harness::T;
@@ -40,6 +44,7 @@ pub fn run_tests() {
     remount();
     defaults();
     rootfs();
+    devtmpfs();
     sys_rmdir(MP.as_ptr());
 }
 
@@ -264,6 +269,73 @@ fn rootfs() {
         t.eq(b"ramfs setxattr", x, EOPNOTSUPP);
         sys_close(fd as u64);
         sys_unlink(b"/tmp/tmpfs_lim/f\0".as_ptr());
+        sys_umount2(MP.as_ptr(), 0);
+    }
+    t.done();
+}
+
+fn devtmpfs() {
+    let mut t = T::new(b"DEVTMPFS_TMPFS");
+    let mut dev = LinuxStatFs::default();
+    t.eq(b"statfs", sys_statfs(b"/dev\0".as_ptr(), &mut dev), 0);
+    t.eq(b"f_type", dev.f_type, TMPFS_MAGIC);
+    t.ok(
+        b"limited",
+        dev.f_blocks > 0 && dev.f_files > 0,
+        dev.f_blocks,
+    );
+    let mut s = Stat::default();
+    sys_stat(b"/dev\0".as_ptr(), &mut s);
+    t.eq(b"root mode", i64::from(s.st_mode), 0o40755);
+    let mut m = [0u8; 8192];
+    let n = read_file(b"/proc/mounts\0", &mut m).max(0) as usize;
+    t.ok(
+        b"mounts",
+        contains(&m[..n], b"devtmpfs /dev devtmpfs rw"),
+        n as i64,
+    );
+    t.ok(
+        b"mounts mode",
+        contains(&m[..n], b",mode=755,inode64"),
+        n as i64,
+    );
+    let dt = |opts: &[u8]| {
+        sys_mount(
+            b"devtmpfs\0".as_ptr(),
+            MP.as_ptr(),
+            b"devtmpfs\0".as_ptr(),
+            0,
+            opts.as_ptr() as u64,
+        )
+    };
+    t.eq(b"bad option", dt(b"bogus\0"), EINVAL);
+    if t.eq(b"mount", dt(b"size=1m\0"), 0) {
+        t.eq(b"size", statfs().f_blocks, 256);
+        let mut now = LinuxStatFs::default();
+        sys_statfs(b"/dev\0".as_ptr(), &mut now);
+        t.eq(b"same sb", now.f_blocks, 256);
+        let mut s2 = Stat::default();
+        sys_stat(b"/tmp/tmpfs_lim/null\0".as_ptr(), &mut s2);
+        t.eq(b"null", s2.st_rdev as i64, 0x103);
+        sys_umount2(MP.as_ptr(), 0);
+        // /dev's limit back
+        let mut opt = [0u8; 40];
+        opt[..10].copy_from_slice(b"nr_blocks=");
+        let (mut digits, mut n, mut v) = ([0u8; 20], 0, dev.f_blocks as u64);
+        loop {
+            digits[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        for i in 0..n {
+            opt[10 + i] = digits[n - 1 - i];
+        }
+        t.eq(b"restore", dt(&opt), 0);
+        sys_statfs(b"/dev\0".as_ptr(), &mut now);
+        t.eq(b"restored", now.f_blocks, dev.f_blocks);
         sys_umount2(MP.as_ptr(), 0);
     }
     t.done();

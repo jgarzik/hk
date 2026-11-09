@@ -458,9 +458,9 @@ tucks it under); a slave's master is its master's peer group, not one
 mount; copies of a namespace are always peers and not locked (see
 "Before user namespaces grant capabilities"). Mount options are
 parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
-cp437 only), ramfs (mode=), tmpfs (see "tmpfs gaps") and procfs
-(hidepid=, gid=, subset=pid); devtmpfs and cgroupfs ignore theirs, and
-only procfs and tmpfs apply options on a remount or show them in
+cp437 only), ramfs (mode=), tmpfs and devtmpfs (see "tmpfs gaps") and
+procfs (hidepid=, gid=, subset=pid); cgroupfs ignores its own, and only
+procfs, tmpfs and devtmpfs apply options on a remount or show them in
 /proc/mounts.
 Crossing into a mount scans the current mount's children (Linux hashes
 (parent, mountpoint): mount_hashtable).

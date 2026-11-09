@@ -3548,6 +3548,10 @@ Rules:
   the devtmpfs root's `i_rwsem`. No path holding a directory `i_rwsem`
   takes `open_mutex` (a block device is opened after the path walk), so
   `open_mutex -> i_rwsem` cannot invert.
+  The devtmpfs superblock is a tmpfs one (its limits: 3.11 tmpfs
+  accounting); a mount of devtmpfs reconfigures it with its options
+  under its `s_umount` held for writing, as a remount does (Linux
+  reconfigure_single), with no other lock held.
 - **Block device page cache (`BlockDevice.bd_inode`, Linux
   bd_mapping):** device-file I/O and vfat metadata go through it (3.2
   Per-inode page cache); pages are read and written synchronously
