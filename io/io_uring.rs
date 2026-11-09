@@ -54,7 +54,7 @@ use crate::mm::PAGE_SIZE;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::current;
 use crate::uaccess::{UserPtr, copy_from_user, copy_val_from_user};
-use crate::util::error::{KernelResult, SysRet};
+use crate::util::error::KernelResult;
 
 // ============================================================================
 // io_uring constants
@@ -491,22 +491,24 @@ impl IoUring {
             // Process the SQE (unless link chain has failed)
             let result = if link_failed && in_link && !is_hard_linked {
                 // Link chain has failed, skip this SQE
-                KernelError::Canceled.to_errno_neg()
+                Err(KernelError::Canceled)
             } else {
                 // Handle LINK_TIMEOUT specially
                 if sqe.opcode == IORING_OP_LINK_TIMEOUT {
                     // LINK_TIMEOUT is only valid in a link chain
                     if !in_link {
-                        KernelError::InvalidArgument.to_errno_neg()
+                        Err(KernelError::InvalidArgument)
                     } else {
                         // For now, just return success (proper implementation
                         // would set up a timeout for the linked operation)
-                        0
+                        Ok(0)
                     }
                 } else {
                     self.process_sqe(&sqe, &mut inner)
                 }
             };
+            // The CQE's result: the value, or the negative errno
+            let result = result.unwrap_or_else(KernelError::to_errno_neg);
 
             // Check if this operation failed (for link chain handling)
             let op_failed = result < 0;
@@ -541,15 +543,15 @@ impl IoUring {
     }
 
     /// Process a single SQE
-    fn process_sqe(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> i32 {
+    fn process_sqe(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> KernelResult<i32> {
         match sqe.opcode {
-            IORING_OP_NOP => 0, // Success
+            IORING_OP_NOP => Ok(0), // Success
 
             // Phase 2: File I/O
-            IORING_OP_READ => self.do_read(sqe),
-            IORING_OP_WRITE => self.do_write(sqe),
-            IORING_OP_READV => self.do_readv(sqe),
-            IORING_OP_WRITEV => self.do_writev(sqe),
+            IORING_OP_READ => self.do_rw(sqe, false),
+            IORING_OP_WRITE => self.do_rw(sqe, true),
+            IORING_OP_READV => self.do_rwv(sqe, false),
+            IORING_OP_WRITEV => self.do_rwv(sqe, true),
 
             // Phase 3: File management
             IORING_OP_OPENAT => self.do_openat(sqe),
@@ -574,152 +576,51 @@ impl IoUring {
             IORING_OP_RECVMSG => self.do_recvmsg(sqe),
             IORING_OP_SHUTDOWN => self.do_shutdown(sqe),
 
-            _ => KernelError::InvalidArgument.to_errno_neg(), // Unknown opcode
+            _ => Err(KernelError::InvalidArgument), // Unknown opcode
         }
     }
 
-    /// Handle IORING_OP_READ
-    fn do_read(&self, sqe: &IoUringSqe) -> i32 {
-        let fd = sqe.fd;
-        let buf_addr = sqe.addr;
-        let len = sqe.len as usize;
-        let offset = sqe.off;
-
-        // Get file - either from fixed file table or regular fd
-        let file = if sqe.flags & IOSQE_FIXED_FILE != 0 {
-            // Use fixed file from registered file table
-            match self.get_fixed_file(fd as u32) {
-                Some(f) => f,
-                None => return KernelError::BadFd.to_errno_neg(),
-            }
+    /// The SQE's file: a registered one with IOSQE_FIXED_FILE, else its
+    /// fd's; EBADF
+    fn sqe_file(&self, sqe: &IoUringSqe) -> KernelResult<Arc<File>> {
+        let f = if sqe.flags & IOSQE_FIXED_FILE != 0 {
+            self.get_fixed_file(sqe.fd as u32)
         } else {
-            // Use regular fd
-            match get_file_from_fd(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.to_errno_neg(),
-            }
+            get_file_from_fd(sqe.fd)
         };
-
-        // The fd's access mode, like read(2)/write(2) (EBADF)
-        if !file.is_readable() {
-            return KernelError::BadFd.to_errno_neg();
-        }
-
-        // Create buffer for read
-        if buf_addr == 0 || len == 0 {
-            return KernelError::InvalidArgument.to_errno_neg();
-        }
-
-        match crate::fs::io::import_ubuf(UserPtr::new(buf_addr), len as u64) {
-            Ok(seg) => rw_one(&file, &seg, offset, false),
-            Err(e) => e.to_errno_neg(),
-        }
+        f.ok_or(KernelError::BadFd)
     }
 
-    /// Handle IORING_OP_WRITE
-    fn do_write(&self, sqe: &IoUringSqe) -> i32 {
-        let fd = sqe.fd;
-        let buf_addr = sqe.addr;
-        let len = sqe.len as usize;
-        let offset = sqe.off;
-
-        // Get file - either from fixed file table or regular fd
-        let file = if sqe.flags & IOSQE_FIXED_FILE != 0 {
-            match self.get_fixed_file(fd as u32) {
-                Some(f) => f,
-                None => return KernelError::BadFd.to_errno_neg(),
-            }
+    /// The SQE's file, opened for reading (`write` false) or writing,
+    /// like read(2)/write(2) (EBADF), and a nonzero `addr` and `len`
+    /// (EINVAL)
+    fn rw_file(&self, sqe: &IoUringSqe, write: bool) -> KernelResult<Arc<File>> {
+        let file = self.sqe_file(sqe)?;
+        if !(if write {
+            file.is_writable()
         } else {
-            match get_file_from_fd(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.to_errno_neg(),
-            }
-        };
-
-        // The fd's access mode, like read(2)/write(2) (EBADF)
-        if !file.is_writable() {
-            return KernelError::BadFd.to_errno_neg();
+            file.is_readable()
+        }) {
+            return Err(KernelError::BadFd);
         }
-
-        // Validate buffer
-        if buf_addr == 0 || len == 0 {
-            return KernelError::InvalidArgument.to_errno_neg();
+        if sqe.addr == 0 || sqe.len == 0 {
+            return Err(KernelError::InvalidArgument);
         }
-
-        match crate::fs::io::import_ubuf(UserPtr::new(buf_addr), len as u64) {
-            Ok(seg) => rw_one(&file, &seg, offset, true),
-            Err(e) => e.to_errno_neg(),
-        }
+        Ok(file)
     }
 
-    /// Handle IORING_OP_READV (vectored read)
-    fn do_readv(&self, sqe: &IoUringSqe) -> i32 {
-        let fd = sqe.fd;
-        let iov_addr = sqe.addr;
-        let iov_count = sqe.len as usize;
-        let offset = sqe.off;
-
-        // Get file - either from fixed file table or regular fd
-        let file = if sqe.flags & IOSQE_FIXED_FILE != 0 {
-            match self.get_fixed_file(fd as u32) {
-                Some(f) => f,
-                None => return KernelError::BadFd.to_errno_neg(),
-            }
-        } else {
-            match get_file_from_fd(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.to_errno_neg(),
-            }
-        };
-
-        // The fd's access mode, like read(2)/write(2) (EBADF)
-        if !file.is_readable() {
-            return KernelError::BadFd.to_errno_neg();
-        }
-
-        if iov_addr == 0 || iov_count == 0 {
-            return KernelError::InvalidArgument.to_errno_neg();
-        }
-
-        match read_user_iovecs(iov_addr, iov_count) {
-            Ok(v) => rw_one(&file, &v, offset, false),
-            Err(e) => e.to_errno_neg(),
-        }
+    /// Handle IORING_OP_READ and IORING_OP_WRITE
+    fn do_rw(&self, sqe: &IoUringSqe, write: bool) -> KernelResult<i32> {
+        let file = self.rw_file(sqe, write)?;
+        let seg = crate::fs::io::import_ubuf(UserPtr::new(sqe.addr), u64::from(sqe.len))?;
+        rw_one(&file, &seg, sqe.off, write)
     }
 
-    /// Handle IORING_OP_WRITEV (vectored write)
-    fn do_writev(&self, sqe: &IoUringSqe) -> i32 {
-        let fd = sqe.fd;
-        let iov_addr = sqe.addr;
-        let iov_count = sqe.len as usize;
-        let offset = sqe.off;
-
-        // Get file - either from fixed file table or regular fd
-        let file = if sqe.flags & IOSQE_FIXED_FILE != 0 {
-            match self.get_fixed_file(fd as u32) {
-                Some(f) => f,
-                None => return KernelError::BadFd.to_errno_neg(),
-            }
-        } else {
-            match get_file_from_fd(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.to_errno_neg(),
-            }
-        };
-
-        // The fd's access mode, like read(2)/write(2) (EBADF)
-        if !file.is_writable() {
-            return KernelError::BadFd.to_errno_neg();
-        }
-
-        if iov_addr == 0 || iov_count == 0 {
-            return KernelError::InvalidArgument.to_errno_neg();
-        }
-
-        match read_user_iovecs(iov_addr, iov_count) {
-            Ok(v) => rw_one(&file, &v, offset, true),
-            Err(e) => e.to_errno_neg(),
-        }
+    /// Handle IORING_OP_READV and IORING_OP_WRITEV
+    fn do_rwv(&self, sqe: &IoUringSqe, write: bool) -> KernelResult<i32> {
+        let file = self.rw_file(sqe, write)?;
+        let v = read_user_iovecs(sqe.addr, sqe.len as usize)?;
+        rw_one(&file, &v, sqe.off, write)
     }
 
     // =========================================================================
@@ -727,7 +628,7 @@ impl IoUring {
     // =========================================================================
 
     /// Handle IORING_OP_OPENAT
-    fn do_openat(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_openat(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         // SQE fields for openat:
         // - fd: directory fd (AT_FDCWD = -100)
         // - addr: pathname pointer
@@ -738,30 +639,30 @@ impl IoUring {
         let flags = sqe.op_flags;
         let mode = sqe.len;
 
-        crate::fs::syscall::sys_openat(dirfd, UserPtr::new(path_ptr), flags, mode).ret() as i32
+        crate::fs::syscall::sys_openat(dirfd, UserPtr::new(path_ptr), flags, mode)
     }
 
     /// Handle IORING_OP_CLOSE
-    fn do_close(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_close(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         let fd = sqe.fd;
-        crate::fs::syscall::sys_close(fd).ret() as i32
+        crate::fs::syscall::sys_close(fd).map(|()| 0)
     }
 
     /// Handle IORING_OP_FSYNC
-    fn do_fsync(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_fsync(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         let fd = sqe.fd;
         // op_flags can have IORING_FSYNC_DATASYNC for fdatasync behavior
         let datasync = (sqe.op_flags & IORING_FSYNC_DATASYNC) != 0;
 
         if datasync {
-            crate::fs::syscall::sys_fdatasync(fd).ret() as i32
+            crate::fs::syscall::sys_fdatasync(fd).map(|()| 0)
         } else {
-            crate::fs::syscall::sys_fsync(fd).ret() as i32
+            crate::fs::syscall::sys_fsync(fd).map(|()| 0)
         }
     }
 
     /// Handle IORING_OP_STATX
-    fn do_statx(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_statx(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         // SQE fields for statx:
         // - fd: directory fd
         // - addr: pathname pointer
@@ -781,15 +682,15 @@ impl IoUring {
             mask,
             UserPtr::new(statx_buf),
         )
-        .ret() as i32
+        .map(|()| 0)
     }
 
     /// Handle IORING_OP_FTRUNCATE
-    fn do_ftruncate(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_ftruncate(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         let fd = sqe.fd;
         let length = sqe.off as i64;
 
-        crate::fs::syscall::sys_ftruncate(fd, length).ret() as i32
+        crate::fs::syscall::sys_ftruncate(fd, length).map(|()| 0)
     }
 
     /// Wait for completions
@@ -908,23 +809,12 @@ impl IoUring {
     // =========================================================================
 
     /// Handle IORING_OP_POLL_ADD - monitor fd for events
-    fn do_poll_add(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> i32 {
-        let fd = sqe.fd;
+    fn do_poll_add(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> KernelResult<i32> {
         // poll_events is in op_flags (or addr for some versions)
         let events = sqe.op_flags;
 
         // Get file to poll
-        let file = if sqe.flags & IOSQE_FIXED_FILE != 0 {
-            match self.get_fixed_file(fd as u32) {
-                Some(f) => f,
-                None => return KernelError::BadFd.to_errno_neg(),
-            }
-        } else {
-            match get_file_from_fd(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.to_errno_neg(),
-            }
-        };
+        let file = self.sqe_file(sqe)?;
 
         // Check if fd is already ready (synchronous completion)
         let ready = file.f_op.poll(&file, None);
@@ -932,7 +822,7 @@ impl IoUring {
 
         if ready & wanted != 0 {
             // Already ready - return the events
-            return i32::from(ready);
+            return Ok(i32::from(ready));
         }
 
         // Not ready - add to pending operations
@@ -944,11 +834,11 @@ impl IoUring {
         // We use EAGAIN to indicate async completion later
         // Actually, for poll_add, we should return 0 and post CQE later when ready
         // But since we don't have async infrastructure, we'll return the current state
-        0
+        Ok(0)
     }
 
     /// Handle IORING_OP_POLL_REMOVE - cancel a pending poll
-    fn do_poll_remove(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> i32 {
+    fn do_poll_remove(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> KernelResult<i32> {
         // addr contains the user_data of the poll to cancel
         let target_user_data = sqe.addr;
 
@@ -956,15 +846,14 @@ impl IoUring {
         if inner.cancel_pending(target_user_data) {
             // Post CQE for the cancelled operation
             inner.post_cqe(target_user_data, KernelError::Canceled.to_errno_neg(), 0);
-            0 // Success
+            Ok(0)
         } else {
-            // Not found
-            KernelError::NotFound.to_errno_neg()
+            Err(KernelError::NotFound)
         }
     }
 
     /// Handle IORING_OP_TIMEOUT - add a timeout
-    fn do_timeout(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> i32 {
+    fn do_timeout(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> KernelResult<i32> {
         // addr points to __kernel_timespec
         let ts_ptr = sqe.addr;
         // off contains the completion count to wait for (or 0)
@@ -972,18 +861,16 @@ impl IoUring {
         // op_flags contains IORING_TIMEOUT_ABS for absolute time
 
         if ts_ptr == 0 {
-            return KernelError::InvalidArgument.to_errno_neg();
+            return Err(KernelError::InvalidArgument);
         }
 
         // Read timespec from userspace
         // struct __kernel_timespec { i64 tv_sec; i64 tv_nsec; }
-        let Ok(ts) = copy_val_from_user::<[i64; 2]>(ts_ptr) else {
-            return KernelError::BadAddress.to_errno_neg();
-        };
+        let ts = copy_val_from_user::<[i64; 2]>(ts_ptr)?;
         let (tv_sec, tv_nsec) = (ts[0], ts[1]);
 
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
-            return KernelError::InvalidArgument.to_errno_neg();
+            return Err(KernelError::InvalidArgument);
         }
 
         // Calculate deadline in nanoseconds
@@ -1011,7 +898,7 @@ impl IoUring {
         if count == 0 {
             // Pure timeout - check if already expired
             if now_ns >= deadline_ns {
-                return KernelError::TimerExpired.to_errno_neg();
+                return Err(KernelError::TimerExpired);
             }
         }
 
@@ -1022,16 +909,16 @@ impl IoUring {
         // In a full implementation, we'd use a timer and complete later
         if now_ns >= deadline_ns {
             // Already expired
-            KernelError::TimerExpired.to_errno_neg()
+            Err(KernelError::TimerExpired)
         } else {
             // Still pending - return 0, CQE will be posted when timeout fires
             // Since we can't do async timers, return success
-            0
+            Ok(0)
         }
     }
 
     /// Handle IORING_OP_TIMEOUT_REMOVE - cancel a pending timeout
-    fn do_timeout_remove(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> i32 {
+    fn do_timeout_remove(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> KernelResult<i32> {
         // addr contains the user_data of the timeout to cancel
         let target_user_data = sqe.addr;
 
@@ -1039,15 +926,14 @@ impl IoUring {
         if inner.cancel_pending(target_user_data) {
             // Post CQE for the cancelled timeout with ECANCELED
             inner.post_cqe(target_user_data, KernelError::Canceled.to_errno_neg(), 0);
-            0 // Success
+            Ok(0)
         } else {
-            // Not found
-            KernelError::NotFound.to_errno_neg()
+            Err(KernelError::NotFound)
         }
     }
 
     /// Handle IORING_OP_ASYNC_CANCEL - cancel any pending operation
-    fn do_async_cancel(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> i32 {
+    fn do_async_cancel(&self, sqe: &IoUringSqe, inner: &mut IoUringInner) -> KernelResult<i32> {
         // addr contains the user_data of the operation to cancel
         let target_user_data = sqe.addr;
         // op_flags can contain IORING_ASYNC_CANCEL_ALL (0x1) to cancel all matching
@@ -1071,9 +957,9 @@ impl IoUring {
             }
 
             if cancelled_count > 0 {
-                cancelled_count
+                Ok(cancelled_count)
             } else {
-                KernelError::NotFound.to_errno_neg()
+                Err(KernelError::NotFound)
             }
         } else {
             // Cancel first matching operation
@@ -1082,9 +968,9 @@ impl IoUring {
                 for user_data in cancelled {
                     inner.post_cqe(user_data, KernelError::Canceled.to_errno_neg(), 0);
                 }
-                0 // Success
+                Ok(0)
             } else {
-                KernelError::NotFound.to_errno_neg()
+                Err(KernelError::NotFound)
             }
         }
     }
@@ -1094,7 +980,7 @@ impl IoUring {
     // =========================================================================
 
     /// Handle IORING_OP_ACCEPT - accept a connection
-    fn do_accept(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_accept(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         let fd = sqe.fd;
         let addr = sqe.addr;
         let addrlen = sqe.off; // off is used for addrlen pointer
@@ -1103,36 +989,34 @@ impl IoUring {
         // Use accept4 if flags are provided, otherwise accept
         if flags != 0 {
             crate::net::syscall::sys_accept4(fd, UserPtr::new(addr), UserPtr::new(addrlen), flags)
-                .ret() as i32
         } else {
-            crate::net::syscall::sys_accept(fd, UserPtr::new(addr), UserPtr::new(addrlen)).ret()
-                as i32
+            crate::net::syscall::sys_accept(fd, UserPtr::new(addr), UserPtr::new(addrlen))
         }
     }
 
     /// Handle IORING_OP_CONNECT - connect a socket
-    fn do_connect(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_connect(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         let fd = sqe.fd;
         let addr = sqe.addr;
         let addrlen = sqe.off;
 
-        crate::net::syscall::sys_connect(fd, UserPtr::new(addr), addrlen).ret() as i32
+        crate::net::syscall::sys_connect(fd, UserPtr::new(addr), addrlen).map(|()| 0)
     }
 
     /// Handle IORING_OP_SEND - send data on a socket
-    fn do_send(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_send(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         let fd = sqe.fd;
         let buf = sqe.addr;
         let len = u64::from(sqe.len);
         let flags = sqe.op_flags as i32;
 
         // send is equivalent to sendto with NULL destination
-        crate::net::syscall::sys_sendto(fd, UserPtr::new(buf), len, flags, UserPtr::new(0), 0).ret()
-            as i32
+        crate::net::syscall::sys_sendto(fd, UserPtr::new(buf), len, flags, UserPtr::new(0), 0)
+            .map(cqe_count)
     }
 
     /// Handle IORING_OP_RECV - receive data from a socket
-    fn do_recv(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_recv(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         let fd = sqe.fd;
         let buf = sqe.addr;
         let len = u64::from(sqe.len);
@@ -1147,33 +1031,33 @@ impl IoUring {
             UserPtr::new(0),
             UserPtr::new(0),
         )
-        .ret() as i32
+        .map(cqe_count)
     }
 
     /// Handle IORING_OP_SENDMSG - send a message on a socket
-    fn do_sendmsg(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_sendmsg(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         let fd = sqe.fd;
         let msg = sqe.addr;
         let flags = sqe.op_flags as i32;
 
-        crate::net::syscall::sys_sendmsg(fd, UserPtr::new(msg), flags).ret() as i32
+        crate::net::syscall::sys_sendmsg(fd, UserPtr::new(msg), flags).map(cqe_count)
     }
 
     /// Handle IORING_OP_RECVMSG - receive a message from a socket
-    fn do_recvmsg(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_recvmsg(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         let fd = sqe.fd;
         let msg = sqe.addr;
         let flags = sqe.op_flags as i32;
 
-        crate::net::syscall::sys_recvmsg(fd, UserPtr::new(msg), flags).ret() as i32
+        crate::net::syscall::sys_recvmsg(fd, UserPtr::new(msg), flags).map(cqe_count)
     }
 
     /// Handle IORING_OP_SHUTDOWN - shutdown part of a socket
-    fn do_shutdown(&self, sqe: &IoUringSqe) -> i32 {
+    fn do_shutdown(&self, sqe: &IoUringSqe) -> KernelResult<i32> {
         let fd = sqe.fd;
         let how = sqe.len as i32; // how is in len field
 
-        crate::net::syscall::sys_shutdown(fd, how).ret() as i32
+        crate::net::syscall::sys_shutdown(fd, how).map(|()| 0)
     }
 }
 
@@ -1232,27 +1116,28 @@ fn read_user_iovecs(iov_addr: u64, n: usize) -> Result<Vec<IoVec>, KernelError> 
 
 /// Read or write `segs` at `offset` (u64::MAX: the file position, under
 /// f_pos_lock) through the bounded read/write core
-fn rw_one(file: &File, segs: &[IoVec], offset: u64, write: bool) -> i32 {
+fn rw_one(file: &File, segs: &[IoVec], offset: u64, write: bool) -> KernelResult<i32> {
     use crate::fs::RwFlags;
     let at = (offset != u64::MAX).then_some(offset);
     // Any other negative offset is EINVAL, as is one the transfer would
     // carry past the largest offset (Linux rw_verify_area)
     if at.is_some_and(|o| o > i64::MAX as u64) {
-        return KernelError::InvalidArgument.to_errno_neg();
+        return Err(KernelError::InvalidArgument);
     }
     let _pos = at.is_none().then(|| file.pos_lock());
-    if let Err(e) = crate::fs::io::verify_area(file, at, crate::fs::io::seg_len(segs)) {
-        return e.to_errno_neg();
-    }
+    crate::fs::io::verify_area(file, at, crate::fs::io::seg_len(segs))?;
     let r = if write {
         crate::fs::io::file_writev(file, segs, at, RwFlags::empty(), None)
     } else {
         crate::fs::io::file_readv(file, segs, at, RwFlags::empty())
     };
-    match r {
-        Ok(n) => n as i32,
-        Err(e) => e.to_errno_neg(),
-    }
+    r.map(cqe_count)
+}
+
+/// A byte count as a CQE result: cqe.res is 32 bits, and a larger count
+/// truncates as Linux's (an int `ret`)
+fn cqe_count(n: usize) -> i32 {
+    n as i32
 }
 
 /// Most registered files (Linux IORING_MAX_FIXED_FILES)
