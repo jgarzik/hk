@@ -396,6 +396,38 @@ impl<T: IpcObject> IpcIds<T> {
             .map_or(-1, |&i| i as i32)
     }
 
+    /// `f` on every live object and its id, in index order, in one walk
+    /// under the table's read lock: `f` must not allocate or sleep
+    pub fn for_each(&self, mut f: impl FnMut(&T, i32)) {
+        let inner = self.inner.read();
+        for obj in inner.entries.values().filter(|o| !o.perm().is_deleted()) {
+            let id = obj.perm().lock.lock().id;
+            f(obj, id);
+        }
+    }
+
+    /// Every live object with its id, in index order: one walk under
+    /// the table's read lock into a buffer sized before taking it
+    /// (nothing allocates under the lock; a table that grew meanwhile
+    /// is walked again)
+    pub fn snapshot(&self) -> KernelResult<alloc::vec::Vec<(Arc<T>, i32)>> {
+        loop {
+            let n = self.inner.read().entries.len();
+            let mut v = alloc::vec::Vec::new();
+            v.try_reserve_exact(n)
+                .map_err(|_| KernelError::OutOfMemory)?;
+            let inner = self.inner.read();
+            if inner.entries.len() > v.capacity() {
+                continue;
+            }
+            for obj in inner.entries.values().filter(|o| !o.perm().is_deleted()) {
+                let id = obj.perm().lock.lock().id;
+                v.push((obj.clone(), id));
+            }
+            return Ok(v);
+        }
+    }
+
     /// Objects in the table (Linux ids->in_use)
     pub fn in_use(&self) -> u32 {
         self.inner.read().in_use

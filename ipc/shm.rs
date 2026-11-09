@@ -99,6 +99,8 @@ pub struct ShmidKernel {
     pub lpid: AtomicI32,
     /// The segment's file on the kernel's tmpfs (its pages)
     pub file: Arc<crate::fs::File>,
+    /// That file's inode (its resident pages, read under the table lock)
+    inode: Arc<crate::fs::Inode>,
     /// Destroyed (namespace totals given back): at most once
     destroyed: AtomicBool,
     /// Namespace this segment belongs to
@@ -111,6 +113,11 @@ impl ShmidKernel {
     pub fn new(key: i32, size: usize, mode: u16, ns: Arc<IpcNamespace>) -> KernelResult<Arc<Self>> {
         let now = current_time_secs();
         let pid = current_pid() as i32;
+        let file = crate::fs::ramfs::tmpfs::shmem_kernel_file_setup(
+            alloc::format!("SYSV{:08x}", key as u32).as_bytes(),
+            size as u64,
+        )?;
+        let inode = file.get_inode().ok_or(KernelError::Io)?;
 
         try_arc(Self {
             perm: KernIpcPerm::new(key, mode),
@@ -121,10 +128,8 @@ impl ShmidKernel {
             ctim: AtomicI64::new(now),
             cpid: pid,
             lpid: AtomicI32::new(pid),
-            file: crate::fs::ramfs::tmpfs::shmem_kernel_file_setup(
-                alloc::format!("SYSV{:08x}", key as u32).as_bytes(),
-                size as u64,
-            )?,
+            file,
+            inode,
             destroyed: AtomicBool::new(false),
             ns,
         })
@@ -631,16 +636,14 @@ crate::pod!(ShmInfo {
 /// The resident pages of a segment (Linux shm_add_rss_swap: its file's
 /// cached pages; none are swapped)
 fn rss(shm: &ShmidKernel) -> u64 {
-    shm.file.get_inode().map_or(0, |i| i.i_data.nrpages())
+    shm.inode.i_data.nrpages()
 }
 
 /// The resident pages of every segment of `ns` (Linux shm_get_stat)
 fn shm_rss(ns: &IpcNamespace) -> u64 {
-    let ids = ns.shm_ids();
-    (0..=ids.max_idx())
-        .filter_map(|i| ids.find_by_idx(i))
-        .map(|(s, _)| rss(&s))
-        .sum()
+    let mut n = 0;
+    ns.shm_ids().for_each(|s, _| n += rss(s));
+    n
 }
 
 /// /proc/sysvipc/shm of the reader's IPC namespace (Linux
@@ -652,7 +655,8 @@ pub fn proc_sysvipc_shm() -> Vec<u8> {
     let mut out = alloc::string::String::from(
         "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
     );
-    for (s, id) in (0..=ids.max_idx()).filter_map(|i| ids.find_by_idx(i)) {
+    // The segments taken in one walk of the table, printed after it
+    for (s, id) in ids.snapshot().unwrap_or_default() {
         let p = s.perm();
         let (uid, gid, mode) = {
             let l = p.lock.lock();
