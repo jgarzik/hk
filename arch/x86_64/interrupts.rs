@@ -774,7 +774,7 @@ fn handle_irq(irq: u64) {
         }
         _ => {
             // Dispatch to registered handlers
-            super::irq::dispatch_irq(irq);
+            crate::irq::handle_irq(u32::from(irq));
         }
     }
 

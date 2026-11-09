@@ -6,6 +6,8 @@
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::console::{ConsolePriority, register_console};
+use crate::irq::{IrqFn, IrqRegistration, IrqReturn};
+use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 
@@ -303,23 +305,19 @@ pub fn write_byte_com1(byte: u8) {
 }
 
 /// COM1's interrupt handler (IRQ context): input to ttyS0
-fn com1_irq(_irq: u32) -> bool {
-    SERIAL_DRIVER_S0.rx_chars(&SERIAL_TTY_S0)
+fn com1_irq(_irq: u32) -> IrqReturn {
+    SERIAL_DRIVER_S0.rx_chars(&SERIAL_TTY_S0).into()
 }
 
 /// Take COM1's input by interrupt (Linux serial8250_startup); `irq` is
-/// its PIC line. False without it
-fn rx_irq_init(irq: u32) -> bool {
-    let id = usize::from(ports::COM1);
-    let Ok(h) = try_arc(crate::irq::IrqFn(com1_irq)) else {
-        return false;
-    };
-    if let Err(e) = crate::arch::irq::register_irq_handler(irq, h, id) {
-        crate::printkln!("ttyS0: no IRQ {}: {:?}", irq, e);
-        return false;
-    }
+/// its PIC line. None without it
+fn rx_irq_init(irq: u32) -> Option<IrqRegistration<IrqFn>> {
+    let h = try_arc(IrqFn(com1_irq)).ok()?;
+    let reg = crate::irq::request_irq(irq, h)
+        .inspect_err(|e| crate::printkln!("ttyS0: no IRQ {}: {:?}", irq, e))
+        .ok()?;
     SERIAL_DRIVER_S0.enable_rx_irq();
-    true
+    Some(reg)
 }
 
 /// The serial ports' ttys (Linux serial8250 ports)
@@ -340,15 +338,16 @@ pub static SERIAL8250_DRIVER: crate::base::Driver = crate::base::Driver::new(
 
 /// Stop taking COM1's input by interrupt (Linux serial8250_shutdown:
 /// IER cleared, then free_irq, which waits out a running handler)
-fn rx_irq_exit(irq: u32) {
+fn rx_irq_exit(irq: IrqRegistration<IrqFn>) {
     // SAFETY: IER is a register of COM1
     unsafe { SERIAL_DRIVER_S0.outb(regs::IER, 0) };
-    let _ = crate::arch::irq::unregister_irq_handler(irq, usize::from(ports::COM1));
+    drop(irq);
 }
 
 /// A bound 8250 device: COM1's IRQ, its ports' tty devices
 struct Serial8250 {
-    irq: Option<u32>,
+    /// Set by probe, taken by remove (spin leaf: dropped unlocked)
+    irq: Mutex<Option<IrqRegistration<IrqFn>>>,
     ttys: alloc::vec::Vec<alloc::sync::Arc<crate::base::Device>>,
 }
 
@@ -365,7 +364,8 @@ impl crate::base::Bound for Serial8250 {
             t.del();
         }
         crate::console::unregister_console(SERIAL_TTY_S0.name());
-        if let Some(irq) = self.irq {
+        let irq = self.irq.lock().take();
+        if let Some(irq) = irq {
             rx_irq_exit(irq);
         }
     }
@@ -376,7 +376,7 @@ fn serial8250_probe(
 ) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
     // Allocated first, so ENOMEM leaves nothing registered
     let mut port = try_box(Serial8250 {
-        irq: None,
+        irq: Mutex::new(None),
         ttys: alloc::vec::Vec::new(),
     })?;
     // Registered at boot already, or again after an unbind (Linux
@@ -387,7 +387,7 @@ fn serial8250_probe(
         crate::console::ConsoleFlags::BOOT,
     );
     let irq = crate::base::platform::pdev(dev).and_then(|p| p.irq);
-    port.irq = irq.filter(|&irq| rx_irq_init(irq));
+    *port.irq.get_mut() = irq.and_then(rx_irq_init);
     port.ttys = serial_ttys()
         .iter()
         .filter_map(|t| crate::tty::tty_register_device(t, dev))

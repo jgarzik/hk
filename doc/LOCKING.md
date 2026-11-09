@@ -3369,32 +3369,37 @@ Device drivers use thread-context locks (Mutex, RwLock) for their state.
 ISRs only ack the device, set atomics and use IRQ-safe deferral
 (`napi_schedule`, `WaitQueue::wake_*`), deferring work to thread context.
 
-#### Device IRQ Registration (arch/{x86_64,aarch64}/irq.rs)
+#### Device IRQ Registration (irq.rs)
 
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
-| `IRQ_TABLE` (per arch) | `IrqSpinlock` | taken in IRQ (`dispatch_irq`) and process context (register/unregister) | leaf except for the interrupt-controller MMIO it programs; handlers run under it |
+| `IRQ_TABLE` (`irq.rs`) | `IrqSpinlock` | taken in IRQ (`handle_irq`) and process context (`request_irq`, a registration's drop) | leaf, except that the interrupt controller's line mask/unmask (`arch::IrqChipOps`: PIC port I/O, GIC distributor MMIO; no lock of their own) and the handlers run under it |
 
-Generic interface (`crate::arch::irq`): `register_irq_handler(irq,
-Arc<dyn crate::irq::IrqHandler>, id)` (shareable; first handler unmasks
-the line, last one masks it; the table holds the handler's device state
-while registered, `IrqFn` wraps a stateless fn), `unregister_irq_handler`
-(hands the reference back, dropped by the caller after the table lock),
-`pci_intx_irq(bus, dev, fn, pin, line)`. `PciDevice::register_irq_handler`
-uses these on both arches. Every handler of a shared line is called; a line
-nobody claims 100000 times in a row is masked (stuck level INTx).
+Generic interface (`crate::irq`): `request_irq(irq, Arc<T: IrqHandler>)
+-> IrqRegistration<T>` (shareable; the handler's address is its Linux
+dev_id, the same handler twice on a line is EBUSY; `IrqFn` wraps a
+stateless fn). Dropping the registration removes the handler; the table's
+reference is dropped after the lock. `pci_intx_irq(bus, dev, fn, pin,
+line)` routes PCI INTx; `PciDevice::request_irq` uses both. The first
+handler of a line unmasks it, the last one's removal masks it, both under
+`IRQ_TABLE` (Linux irq_startup/irq_shutdown under desc->lock). Every
+handler of a shared line is called; an interrupt on a line without
+handlers masks it, and a line nobody claims more than 99,900 times in a
+100,000-interrupt window is masked (stuck level INTx), reported after the
+lock is dropped.
 
-- aarch64: SPIs are configured by `gic::enable_spi` (level/edge in ICFGR,
-  priority 0x80, Group 1, IROUTER -> CPU 0, ISENABLER); PCI INTx comes from
-  the host bridge DT `interrupt-map`/`interrupt-map-mask` parsed at boot
-  (`arch/aarch64/pci_irq.rs`, matching in `hw/pci/intx.rs`), else the QEMU
-  virt swizzle INTID 35 + (slot + pin - 1) % 4.
+- aarch64: SPIs are configured on unmask by `gic::enable_spi` (level/edge
+  in ICFGR, priority 0x80, Group 1, IROUTER -> CPU 0, ISENABLER); PCI INTx
+  comes from the host bridge DT `interrupt-map`/`interrupt-map-mask` parsed
+  at boot (`arch/aarch64/pci_irq.rs`, matching in `hw/pci/intx.rs`), else
+  the QEMU virt swizzle INTID 35 + (slot + pin - 1) % 4.
 - x86-64: legacy 8259 PIC with the firmware-assigned config-space Interrupt
   Line (QEMU `pc`). Real hardware in APIC mode (Dell OptiPlex 3020 target)
   needs IOAPIC + ACPI `_PRT` routing (not implemented).
 - Handlers run in IRQ context with the table lock held: they must only ack
   the device, touch atomics/IrqSpinlocks and wake threads; they must not
-  register/unregister IRQs.
+  request or free IRQs. Once a registration's drop returns its handler is
+  not running (Linux free_irq's synchronize_irq).
 
 #### DMA API (hw/dma.rs)
 
@@ -3589,7 +3594,7 @@ not rely on either.
 | virtio-net `tx` queue | `spin::Mutex<Option<..>>` | thread only (xmit, poll reclaim, remove) | leaf; one descriptor per frame; ring full -> drop, `tx_dropped`, ENOBUFS; empty once removed |
 | virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx` |
 | virtio-PCI transport (`hw/virtio/pci.rs`) | none | probe and remove (under the virtio device's or the PCI function's `Device.lock`), then IRQ (ISR byte) | common config (status, features, queues, reset) written only under those device locks; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
-| `VirtioDevice.irq` (driver interrupt callbacks) | `IrqSpinlock<Option<Arc<dyn VirtioIrq>>>` | thread (`request_irq`, `free_irq`) and hardirq (`vp_interrupt`, under `IRQ_TABLE`) | leaf: the ISR clones the callbacks out and calls them after unlocking; `free_irq` unregisters the handler (`IRQ_TABLE`) before clearing it, so the ISR never drops the last reference |
+| Drivers' IRQ registrations: `VirtioDevice.irq` (the INTx handler owning the virtio driver's callbacks), the e1000 binding's `irq`, `Serial8250.irq`, `Pl011Port.irq` | spin `Mutex<Option<IrqRegistration<..>>>` | thread only (probe sets it, remove takes it; virtio: `request_irq`/`free_irq`) | leaf: the registration is dropped (`IRQ_TABLE`) after unlocking; the ISR never takes it (the handler holds its device state) |
 | PCI and USB `DYNIDS` (hw/pci/driver.rs, hw/usb/usbcore.rs; Linux dynids.lock) | spin Mutex | thread only | leaf: new_id/remove_id and each match take it alone; the probing after new_id runs with it dropped |
 | `ScsiDisk.state` (block/sd.rs, Linux sdev_state + state_mutex) | spin `Mutex<ScsiDeviceState>` | thread only | leaf: transitions (Linux's legal table) and each command's state check take it alone, never across I/O |
 | `util::ida::Ida` allocators: virtio, virtio-blk and sd indexes (Linux virtio_index_ida, vd_index_ida, sd_index_ida), namespace inode numbers (`ns::inum`, Linux proc_inum_ida) | `IrqSpinlock` | alloc thread only; free any context | leaf; nothing allocates under it (alloc grows the bitmap with it dropped, fallibly for `try_alloc`); a disk index is freed when the disk's last reference drops, a namespace's number when the namespace goes |
@@ -3672,8 +3677,8 @@ its addresses, routes and neighbours go and packet sockets lose it
 (NETDEV_UNREGISTER), RTM_DELLINK is sent and its sysfs device removed.
 The driver then disables a NAPI that is still enabled (`napi_disable`
 waits for a running poll), quiesces the hardware, frees its IRQ (no
-ISR runs after `unregister_irq_handler`, which takes the IRQ table
-lock every dispatch holds), `netif_napi_del`s and frees its DMA
+ISR runs after its `IrqRegistration` is dropped, which takes the IRQ
+table lock every dispatch holds), `netif_napi_del`s and frees its DMA
 memory. A `NetDevice` still referenced (queued skbs) stays down and
 driverless; hk cannot wait for those references (Linux
 netdev_wait_allrefs) because skbs in socket queues hold them.

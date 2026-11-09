@@ -1,4 +1,12 @@
-//! Generic IRQ-line bookkeeping shared by the arch dispatchers
+//! Device IRQs: the handler table and its dispatch (Linux
+//! kernel/irq/manage.c request_irq/free_irq, handle.c, spurious.c)
+//!
+//! Each device line (`arch::IrqChipOps`: x86 PIC lines 0-15, arm64 SPIs
+//! 32-287) has a list of handlers; several may share it (Linux
+//! IRQF_SHARED; each says whether its device raised the interrupt).
+//! `request_irq` adds one and returns an `IrqRegistration` whose drop
+//! removes it; the first handler unmasks the line, the last one masks
+//! it.
 //!
 //! Unclaimed-interrupt accounting (Linux kernel/irq/spurious.c
 //! note_interrupt): a line nobody claims - a device holding a shared
@@ -6,25 +14,244 @@
 //! forever. Out of every 100,000 interrupts on a line, more than 99,900
 //! unclaimed ones disable it ("nobody cared"). An unclaimed interrupt
 //! more than 100 ms after the previous one restarts the unclaimed count,
-//! so occasional strays on a busy line never add up.
+//! so occasional strays on a busy line never add up. An interrupt on a
+//! line without handlers masks it.
 //!
-//! Locking: none of its own; each line's state lives under its arch
-//! dispatcher's `IRQ_TABLE` lock.
+//! Locking: `IRQ_TABLE` is an `IrqSpinlock`, taken by `handle_irq` in
+//! IRQ context and by request and free in thread context. The chip's
+//! mask and unmask run under it (Linux irq_startup/irq_shutdown under
+//! desc->lock), and so do the handlers: once a registration's drop
+//! returns its handler is not running (Linux free_irq's
+//! synchronize_irq). Handlers must not request or free IRQs. The
+//! table's reference to a freed handler is dropped after unlocking.
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+
+use crate::arch::{CurrentArch, IrqChipOps};
+use crate::sync::IrqSpinlock;
+use crate::util::error::{KernelError, KernelResult};
+
+/// Whether a handler's device raised the interrupt (Linux irqreturn_t)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrqReturn {
+    /// Not this device's (a shared line)
+    None,
+    /// This device's, handled
+    Handled,
+}
+
+/// Linux IRQ_RETVAL
+impl From<bool> for IrqReturn {
+    fn from(handled: bool) -> Self {
+        if handled { Self::Handled } else { Self::None }
+    }
+}
 
 /// An interrupt handler with its device state (Linux irq_handler_t and
 /// its dev_id): the IRQ table holds a reference while it is registered
 pub trait IrqHandler: Send + Sync {
-    /// Handle interrupt `irq` (IRQ context, under the IRQ table lock);
-    /// true if this device raised it
-    fn handle(&self, irq: u32) -> bool;
+    /// Handle interrupt `irq` (IRQ context, under the IRQ table lock)
+    fn handle(&self, irq: u32) -> IrqReturn;
 }
 
 /// A handler with no state of its own
-pub struct IrqFn(pub fn(u32) -> bool);
+pub struct IrqFn(pub fn(u32) -> IrqReturn);
 
 impl IrqHandler for IrqFn {
-    fn handle(&self, irq: u32) -> bool {
+    fn handle(&self, irq: u32) -> IrqReturn {
         (self.0)(irq)
+    }
+}
+
+/// The table's device lines
+static IRQ_TABLE: IrqTable<CurrentArch, { <CurrentArch as IrqChipOps>::NR_IRQS }> = IrqTable::new();
+
+/// Add `handler` to line `irq` and unmask the line if it is the first
+/// (Linux request_irq with IRQF_SHARED; the handler's address is its
+/// dev_id). EINVAL for a line the controller lacks, EBUSY if `handler`
+/// is on it already
+pub fn request_irq<T: IrqHandler + 'static>(
+    irq: u32,
+    handler: Arc<T>,
+) -> KernelResult<IrqRegistration<T>> {
+    IRQ_TABLE.request(irq, handler)
+}
+
+/// Run the handlers of device line `irq` (IRQ context; Linux
+/// generic_handle_irq). True if one claimed it
+pub fn handle_irq(irq: u32) -> bool {
+    let (handled, bad) = IRQ_TABLE.handle(irq, crate::time::monotonic_ns);
+    if bad {
+        report_nobody_cared(irq);
+    }
+    handled
+}
+
+/// The IRQ of a PCI function's INTx `pin` (arch routing)
+pub fn pci_intx_irq(bus: u8, device: u8, function: u8, pin: u8, line: u8) -> Option<u32> {
+    CurrentArch::pci_intx_irq(bus, device, function, pin, line)
+}
+
+/// A handler on an IRQ line (Linux request_irq to free_irq): dropping it
+/// removes the handler, waiting out a running call
+#[must_use]
+pub struct IrqRegistration<T: IrqHandler + 'static> {
+    handler: Arc<T>,
+    irq: u32,
+    table: &'static dyn IrqFree,
+}
+
+impl<T: IrqHandler + 'static> IrqRegistration<T> {
+    /// The registered handler
+    pub fn handler(&self) -> &Arc<T> {
+        &self.handler
+    }
+
+    /// The line it is on
+    pub fn irq(&self) -> u32 {
+        self.irq
+    }
+}
+
+impl<T: IrqHandler + 'static> Drop for IrqRegistration<T> {
+    fn drop(&mut self) {
+        // Released here, with the table unlocked
+        drop(self.table.free(self.irq, cookie(&self.handler)));
+    }
+}
+
+/// A handler's identity on its line (Linux dev_id): its address
+fn cookie<T: ?Sized>(h: &Arc<T>) -> *const () {
+    Arc::as_ptr(h).cast()
+}
+
+/// Removing a handler from the table a registration came from
+trait IrqFree: Sync {
+    /// Take handler `cookie` off line `irq`, masking a line left empty;
+    /// the table's reference comes back for the caller to drop unlocked
+    fn free(&self, irq: u32, cookie: *const ()) -> Option<Arc<dyn IrqHandler>>;
+}
+
+/// One line (Linux irq_desc): its handlers (Linux irqaction list) and
+/// unclaimed-interrupt state
+struct IrqDesc {
+    actions: Vec<Arc<dyn IrqHandler>>,
+    spurious: Spurious,
+}
+
+impl IrqDesc {
+    const fn new() -> Self {
+        Self {
+            actions: Vec::new(),
+            spurious: Spurious::new(),
+        }
+    }
+
+    fn find(&self, cookie: *const ()) -> Option<usize> {
+        self.actions.iter().position(|h| self::cookie(h) == cookie)
+    }
+
+    /// Every handler of a shared line gets a look; true if one claimed
+    /// it (Linux __handle_irq_event_percpu)
+    fn run(&self, irq: u32) -> bool {
+        let mut handled = false;
+        for h in &self.actions {
+            crate::sync::lockdep::irq_enter();
+            handled |= h.handle(irq) == IrqReturn::Handled;
+            crate::sync::lockdep::irq_exit();
+        }
+        handled
+    }
+}
+
+/// The lines of controller `C`: `N` of them from `C::FIRST_IRQ`
+struct Descs<C, const N: usize> {
+    lines: [IrqDesc; N],
+    _chip: PhantomData<fn() -> C>,
+}
+
+impl<C: IrqChipOps, const N: usize> Descs<C, N> {
+    fn line(&mut self, irq: u32) -> KernelResult<&mut IrqDesc> {
+        let i = irq
+            .checked_sub(C::FIRST_IRQ)
+            .and_then(|i| usize::try_from(i).ok())
+            .ok_or(KernelError::InvalidArgument)?;
+        self.lines.get_mut(i).ok_or(KernelError::InvalidArgument)
+    }
+}
+
+/// An IRQ handler table over interrupt controller `C`
+struct IrqTable<C, const N: usize>(IrqSpinlock<Descs<C, N>>);
+
+impl<C: IrqChipOps + 'static, const N: usize> IrqTable<C, N> {
+    const fn new() -> Self {
+        Self(IrqSpinlock::new(Descs {
+            lines: [const { IrqDesc::new() }; N],
+            _chip: PhantomData,
+        }))
+    }
+
+    fn request<T: IrqHandler + 'static>(
+        &'static self,
+        irq: u32,
+        handler: Arc<T>,
+    ) -> KernelResult<IrqRegistration<T>> {
+        self.add(irq, handler.clone())?;
+        Ok(IrqRegistration {
+            handler,
+            irq,
+            table: self,
+        })
+    }
+
+    /// Linux __setup_irq: the first handler starts the line
+    fn add(&self, irq: u32, h: Arc<dyn IrqHandler>) -> KernelResult<()> {
+        let mut t = self.0.lock();
+        let line = t.line(irq)?;
+        if line.find(cookie(&h)).is_some() {
+            return Err(KernelError::Busy);
+        }
+        line.actions
+            .try_reserve(1)
+            .map_err(|_| KernelError::OutOfMemory)?;
+        line.actions.push(h);
+        line.spurious.reset();
+        if line.actions.len() == 1 {
+            C::irq_unmask(irq);
+        }
+        Ok(())
+    }
+
+    /// Linux handle_irq_event + note_interrupt; `now_ns` is read only
+    /// for an unclaimed interrupt. (claimed, line masked as nobody
+    /// cared): the caller reports that unlocked
+    fn handle(&self, irq: u32, now_ns: impl FnOnce() -> u64) -> (bool, bool) {
+        let mut t = self.0.lock();
+        let Ok(line) = t.line(irq) else {
+            return (false, false);
+        };
+        let handled = line.run(irq);
+        let empty = line.actions.is_empty();
+        let bad = !empty && line.spurious.note(handled, now_ns);
+        if bad || empty {
+            C::irq_mask(irq);
+        }
+        (handled, bad)
+    }
+}
+
+impl<C: IrqChipOps + 'static, const N: usize> IrqFree for IrqTable<C, N> {
+    /// Linux __free_irq: the last handler shuts the line down
+    fn free(&self, irq: u32, cookie: *const ()) -> Option<Arc<dyn IrqHandler>> {
+        let mut t = self.0.lock();
+        let line = t.line(irq).ok()?;
+        let h = line.actions.remove(line.find(cookie)?);
+        if line.actions.is_empty() {
+            C::irq_mask(irq);
+        }
+        Some(h)
     }
 }
 
@@ -40,14 +267,14 @@ const UNHANDLED_GAP_NS: u64 = 100_000_000;
 
 /// One line's unclaimed-interrupt state (Linux irq_desc irq_count,
 /// irqs_unhandled, last_unhandled)
-pub struct Spurious {
+struct Spurious {
     count: u32,
     unhandled: u32,
     last_unhandled_ns: u64,
 }
 
 impl Spurious {
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             count: 0,
             unhandled: 0,
@@ -56,14 +283,14 @@ impl Spurious {
     }
 
     /// Start over (a handler was added)
-    pub fn reset(&mut self) {
+    fn reset(&mut self) {
         *self = Self::new();
     }
 
     /// Account one interrupt; `now_ns` is read only for an unclaimed
     /// one (the claimed path stays cheap). True if the line must now be
     /// disabled (Linux note_interrupt)
-    pub fn note(&mut self, handled: bool, now_ns: impl FnOnce() -> u64) -> bool {
+    fn note(&mut self, handled: bool, now_ns: impl FnOnce() -> u64) -> bool {
         if !handled {
             let now_ns = now_ns();
             if now_ns.saturating_sub(self.last_unhandled_ns) > UNHANDLED_GAP_NS {
@@ -85,14 +312,139 @@ impl Spurious {
 }
 
 /// Report a line `note` disabled (Linux __report_bad_irq); called after
-/// dropping `IRQ_TABLE`, which stays a leaf lock
-pub fn report_nobody_cared(irq: u32) {
+/// dropping `IRQ_TABLE`
+fn report_nobody_cared(irq: u32) {
     crate::printkln!("irq {}: nobody cared, disabling it", irq);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// A controller with lines 8-15; bit n of `UNMASKED`: line n is on
+    struct Mock;
+
+    static UNMASKED: AtomicU32 = AtomicU32::new(0);
+
+    impl IrqChipOps for Mock {
+        const FIRST_IRQ: u32 = 8;
+        const NR_IRQS: usize = 8;
+        fn irq_unmask(irq: u32) {
+            UNMASKED.fetch_or(1 << irq, Ordering::SeqCst);
+        }
+        fn irq_mask(irq: u32) {
+            UNMASKED.fetch_and(!(1 << irq), Ordering::SeqCst);
+        }
+        fn pci_intx_irq(_: u8, _: u8, _: u8, _: u8, _: u8) -> Option<u32> {
+            None
+        }
+    }
+
+    /// Each test uses lines of its own
+    static TABLE: IrqTable<Mock, { Mock::NR_IRQS }> = IrqTable::new();
+
+    fn unmasked(irq: u32) -> bool {
+        UNMASKED.load(Ordering::SeqCst) & (1 << irq) != 0
+    }
+
+    /// A device that answers `ret` and counts its calls
+    struct Dev {
+        ret: IrqReturn,
+        calls: AtomicU32,
+    }
+
+    fn dev(ret: IrqReturn) -> Arc<Dev> {
+        Arc::new(Dev {
+            ret,
+            calls: AtomicU32::new(0),
+        })
+    }
+
+    impl IrqHandler for Dev {
+        fn handle(&self, _irq: u32) -> IrqReturn {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.ret
+        }
+    }
+
+    fn calls(r: &IrqRegistration<Dev>) -> u32 {
+        r.handler().calls.load(Ordering::SeqCst)
+    }
+
+    /// Lines outside the controller's range: EINVAL, never dispatched
+    #[test]
+    fn out_of_range() {
+        for irq in [0, 7, 16, u32::MAX] {
+            let r = TABLE.request(irq, dev(IrqReturn::Handled));
+            assert_eq!(r.err(), Some(KernelError::InvalidArgument));
+            assert_eq!(TABLE.handle(irq, || 0), (false, false));
+        }
+    }
+
+    /// Every handler of a shared line runs; the line is claimed if one
+    /// claims it; the first unmasks, the last one's drop masks
+    #[test]
+    fn shared_line() {
+        let a = TABLE.request(8, dev(IrqReturn::None)).unwrap();
+        assert!(unmasked(8));
+        assert_eq!(a.irq(), 8);
+        assert_eq!(TABLE.handle(8, || 0), (false, false));
+        let b = TABLE.request(8, dev(IrqReturn::Handled)).unwrap();
+        assert_eq!(TABLE.handle(8, || 0), (true, false));
+        assert_eq!((calls(&a), calls(&b)), (2, 1));
+        drop(b);
+        assert!(unmasked(8));
+        assert_eq!(TABLE.handle(8, || 0), (false, false));
+        assert_eq!(calls(&a), 3);
+        drop(a);
+        assert!(!unmasked(8));
+    }
+
+    /// One handler twice on a line: EBUSY; on another line it may be
+    #[test]
+    fn same_handler_busy() {
+        let d = dev(IrqReturn::Handled);
+        let r = TABLE.request(9, d.clone()).unwrap();
+        assert_eq!(TABLE.request(9, d.clone()).err(), Some(KernelError::Busy));
+        let r2 = TABLE.request(10, d.clone()).unwrap();
+        drop((r, r2));
+        assert!(!unmasked(9) && !unmasked(10));
+    }
+
+    /// The drop removes the handler and the table's reference
+    #[test]
+    fn drop_unregisters() {
+        let d = dev(IrqReturn::Handled);
+        let r = TABLE.request(11, d.clone()).unwrap();
+        assert_eq!(Arc::strong_count(&d), 3);
+        drop(r);
+        assert_eq!(Arc::strong_count(&d), 1);
+        assert_eq!(TABLE.handle(11, || 0), (false, false));
+        assert_eq!(d.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// An interrupt on a line without handlers masks it
+    #[test]
+    fn empty_line_masked() {
+        Mock::irq_unmask(12);
+        assert_eq!(TABLE.handle(12, || 0), (false, false));
+        assert!(!unmasked(12));
+    }
+
+    /// A line nobody claims is masked at the window's end; a new
+    /// handler restarts the count
+    #[test]
+    fn nobody_cared() {
+        let r = TABLE.request(13, dev(IrqReturn::None)).unwrap();
+        for _ in 1..WINDOW {
+            assert_eq!(TABLE.handle(13, || 0), (false, false));
+        }
+        assert!(unmasked(13));
+        assert_eq!(TABLE.handle(13, || 0), (false, true));
+        assert!(!unmasked(13));
+        assert_eq!(calls(&r), WINDOW);
+    }
 
     /// A stuck line, nothing claims it: disabled at the window's end
     #[test]

@@ -169,7 +169,7 @@ fn irq_dispatch() {
         }
         32..=1019 => {
             // SPI (Shared Peripheral Interrupt) - dispatch to registered handlers
-            if !super::irq::dispatch_irq(intid) {
+            if !crate::irq::handle_irq(intid) {
                 printkln!("Unhandled SPI: {}", intid);
             }
         }

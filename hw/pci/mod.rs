@@ -11,11 +11,13 @@ pub mod quirks;
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use spin::Once;
 
 use crate::hw::dma::{DmaConfig, DmaDevice};
+use crate::irq::{IrqHandler, IrqRegistration};
 use crate::printkln;
 use crate::util::error::KernelError;
 use crate::util::kalloc::box_nofail;
@@ -815,7 +817,7 @@ impl PciDevice {
     /// IRQ number of this device's INTx pin (arch routing: x86-64 legacy
     /// PIC line from config space; aarch64 DT interrupt-map / virt swizzle)
     pub fn intx_irq(&self) -> Option<u32> {
-        crate::arch::irq::pci_intx_irq(
+        crate::irq::pci_intx_irq(
             self.bus,
             self.device,
             self.function,
@@ -824,25 +826,21 @@ impl PciDevice {
         )
     }
 
-    /// Unique handler id for this device (bus/device/function)
-    fn irq_id(&self) -> usize {
-        ((self.bus as usize) << 16) | ((self.device as usize) << 8) | (self.function as usize)
-    }
-
-    /// Register a (shareable, level-triggered) INTx handler for this device
-    /// and enable INTx at the device
+    /// Request this device's (shareable, level-triggered) INTx line for
+    /// `handler` and enable INTx at the device (Linux request_irq on
+    /// pdev->irq; INTx is enabled as pci_enable_device does). Dropping
+    /// the registration frees the line (Linux free_irq; INTx stays
+    /// enabled at the device)
     ///
     /// # Returns
-    /// The IRQ number on success; NoDevice without an INTx line, the
-    /// IRQ table's error otherwise
-    pub fn register_irq_handler(
+    /// The registration; NoDevice without an INTx line, the IRQ table's
+    /// error otherwise
+    pub fn request_irq<T: IrqHandler + 'static>(
         &self,
-        handler: alloc::sync::Arc<dyn crate::irq::IrqHandler>,
-    ) -> Result<u32, KernelError> {
+        handler: Arc<T>,
+    ) -> Result<IrqRegistration<T>, KernelError> {
         let irq = self.intx_irq().ok_or(KernelError::NoDevice)?;
-        crate::arch::irq::register_irq_handler(irq, handler, self.irq_id())?;
-
-        // Clear INTERRUPT_DISABLE bit in command register to enable interrupts
+        let reg = crate::irq::request_irq(irq, handler)?;
         let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);
         pci_write16(
             self.bus,
@@ -851,34 +849,7 @@ impl PciDevice {
             offset::COMMAND,
             cmd & !command::INTERRUPT_DISABLE,
         );
-        Ok(irq)
-    }
-
-    /// Unregister this device's INTx handler (device removal / hotplug):
-    /// disables INTx at the device first
-    ///
-    /// # Returns
-    /// The IRQ number that was unregistered; NoDevice without an INTx
-    /// line, NotFound when no handler was registered
-    pub fn unregister_irq_handler(&self) -> Result<u32, KernelError> {
-        let irq = self.intx_irq().ok_or(KernelError::NoDevice)?;
-
-        // Disable interrupts at device level first (set INTERRUPT_DISABLE bit)
-        let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);
-        pci_write16(
-            self.bus,
-            self.device,
-            self.function,
-            offset::COMMAND,
-            cmd | command::INTERRUPT_DISABLE,
-        );
-
-        // The table's reference to the handler goes here, unlocked
-        drop(crate::arch::irq::unregister_irq_handler(
-            irq,
-            self.irq_id(),
-        )?);
-        Ok(irq)
+        Ok(reg)
     }
 
     /// Check if this is an xHCI USB controller

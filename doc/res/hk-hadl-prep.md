@@ -1,6 +1,6 @@
 # hk: preparing for HADL (loadable, description-driven drivers)
 
-Design and plan, from doc/ideas/HADL-driver-architecture-research.md. doc/ROADMAP.md schedules only the preparatory items (M2, M4, D; M1 is done); H2–H7 (HADL proper) are not scheduled.
+Design and plan, from doc/ideas/HADL-driver-architecture-research.md. doc/ROADMAP.md schedules only the preparatory items (M4, D; M1 and M2 are done); H2–H7 (HADL proper) are not scheduled.
 
 ## 0. Constraints
 
@@ -91,7 +91,7 @@ Size L; risk high (interrupt delivery is everything). Tests: MSI-X on virtio-net
 
 ### H1 — planned series items, shaped for HADL (M3/M4)
 - PCI ID tables carrying typed family data (`PciDeviceId<D> { ..., data: &'static D }`, `PciDriver<D>`, `PciDriverDyn`; the Linux-shaped untyped `PciDeviceId`/`PciIds` and dynamic ids exist), revision matching; PciFixup on the same matcher. This is the in-kernel form of the package `MATCH` section.
-- Typed `request_irq<T: IrqHandler>` RAII (`IrqReturn`, `IrqRegistration`), MSI-X vectors (H0.2) included.
+- MSI-X vectors (H0.2) as `IrqRegistration`s of the typed `request_irq`.
 - `DmaRing<T: Pod>` split into memory (volatile element/field access, `publish(i, v, own_field)`) and index/ownership state; `Field<T, F>` + `field!`; Le16/32/64 Pod newtypes.
 - IoMem ordered + `_relaxed` + a `RegIo` trait (engines generic over `R: RegIo = IoMem`), `MockRegs` for host tests.
 - DmaAddr private constructor (`hw/dma.rs`: `pub struct DmaAddr(pub u64)`), xhci quirks as `PciDeviceId<XhciQuirks>` data.

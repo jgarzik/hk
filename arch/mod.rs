@@ -18,6 +18,7 @@
 //! Additional traits for architecture-independent kernel initialization:
 //! - [`EarlyArchInit`] - Early hardware initialization (GDT, IDT, etc.)
 //! - [`IoremapOps`] - Kernel page-table primitives (ioremap, vmap)
+//! - [`IrqChipOps`] - Device interrupt controller lines (mask, unmask)
 //! - [`AcpiOps`] - Platform hardware discovery (ACPI/device tree)
 //! - [`SmpOps`] - Multi-processor initialization
 //! - [`LocalTimerOps`] - Per-CPU timer operations
@@ -80,15 +81,9 @@ pub use aarch64::barrier;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::barrier;
 
-/// Device IRQ registration (shareable handlers, PCI INTx routing)
-#[cfg(target_arch = "x86_64")]
-pub use x86_64::irq;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::percpu::{preempt_count, preempt_disable, preempt_enable};
 
-/// Device IRQ registration (shareable handlers, PCI INTx routing)
-#[cfg(target_arch = "aarch64")]
-pub use aarch64::irq;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::percpu::{preempt_count, preempt_disable, preempt_enable};
 
@@ -426,6 +421,27 @@ pub trait IrqFlagsOps {
 
     /// `flags` has interrupts masked
     fn irqs_disabled_flags(flags: Self::Flags) -> bool;
+}
+
+/// The device interrupt controller behind `crate::irq` (Linux struct
+/// irq_chip and the arch's PCI INTx routing): device IRQs are
+/// `FIRST_IRQ..FIRST_IRQ + NR_IRQS`. `irq_unmask` and `irq_mask` run
+/// under the IRQ table lock (Linux irq_startup/irq_shutdown under
+/// desc->lock), so they need no lock of their own
+pub trait IrqChipOps {
+    /// The first device IRQ number (x86 PIC line 0, arm64 SPI INTID 32)
+    const FIRST_IRQ: u32;
+    /// Device IRQ lines
+    const NR_IRQS: usize;
+
+    /// Configure (trigger, routing) and unmask line `irq` (its first
+    /// handler came)
+    fn irq_unmask(irq: u32);
+    /// Mask line `irq` (its last handler went, or nobody claims it)
+    fn irq_mask(irq: u32);
+    /// The IRQ of a PCI function's INTx `pin` (1 = INTA, 0 = none);
+    /// `line` is its config-space Interrupt Line
+    fn pci_intx_irq(bus: u8, device: u8, function: u8, pin: u8, line: u8) -> Option<u32>;
 }
 
 /// Task context and context switching operations
