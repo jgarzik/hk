@@ -51,8 +51,19 @@ impl FrameAllocator {
     /// Hand the free RAM [start, end) to the allocator (boot, from
     /// memblock); frames outside the span are ignored
     pub fn free_range(&self, start: u64, end: u64) {
-        self.zone
-            .free_range(start.div_ceil(FRAME_SIZE as u64), pfn(end));
+        self.free_reserved(start, end);
+    }
+
+    /// Give the whole pages of reserved boot memory [start, end) to the
+    /// allocator after boot (Linux free_reserved_area): they count in
+    /// the total from then on. Nothing may use them any more. The
+    /// number of pages freed.
+    pub fn free_reserved(&self, start: u64, end: u64) -> usize {
+        let (first, past) = (start.div_ceil(FRAME_SIZE as u64), pfn(end));
+        if first >= past {
+            return 0;
+        }
+        self.zone.free_range(first, past)
     }
 
     /// Boot is done handing out free memory: set the watermarks and

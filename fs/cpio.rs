@@ -23,6 +23,57 @@ use super::ramfs::{
 };
 use crate::fs::chardev::DevId;
 
+/// The initramfs image (Linux __initramfs_start or initrd_start)
+pub struct Initrd(Image);
+
+enum Image {
+    /// Built into the kernel image, which stays
+    Builtin(&'static [u8]),
+    /// Pages the boot loader filled, reserved since boot: physical
+    /// [start, end)
+    Loaded { start: u64, end: u64 },
+}
+
+impl Initrd {
+    /// An image built into the kernel
+    pub const fn builtin(data: &'static [u8]) -> Self {
+        Self(Image::Builtin(data))
+    }
+
+    /// The boot loader's image at physical [start, end)
+    ///
+    /// # Safety
+    /// [start, end) is RAM in the direct map, reserved from the page
+    /// allocator since boot, which nothing else reads or writes: its
+    /// whole pages go to the allocator at `free`.
+    pub const unsafe fn loaded(start: u64, end: u64) -> Self {
+        Self(Image::Loaded { start, end })
+    }
+
+    /// The archive's bytes, while the image is held
+    pub fn data(&self) -> &[u8] {
+        match self.0 {
+            Image::Builtin(d) => d,
+            Image::Loaded { start, end } => {
+                let p = crate::arch::phys_to_virt(start).cast_const();
+                // SAFETY: `loaded`'s contract: mapped, reserved, ours
+                // until `free` consumes `self`, which ends this borrow
+                unsafe { core::slice::from_raw_parts(p, (end - start) as usize) }
+            }
+        }
+    }
+
+    /// Done with it (Linux do_populate_rootfs -> free_initrd_mem): the
+    /// boot loader's pages go to the page allocator, a built-in image
+    /// stays with the kernel image
+    pub fn free(self) {
+        if let Image::Loaded { start, end } = self.0 {
+            let pages = crate::FRAME_ALLOCATOR.free_reserved(start, end);
+            crate::printkln!("Freeing initrd memory: {}K", pages * 4);
+        }
+    }
+}
+
 /// newc header length
 const HDR: usize = 110;
 

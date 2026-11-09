@@ -879,11 +879,9 @@ pub trait ExceptionOps {
 /// On x86_64 this uses multiboot2 module lookup.
 /// On aarch64 this uses DTB extraction or falls back to embedded initramfs.
 pub trait InitramfsOps {
-    /// Get initramfs data from boot information
-    ///
-    /// Returns a static slice containing the initramfs (cpio archive).
-    /// Panics if initramfs is not found (required for boot).
-    fn get_initramfs() -> &'static [u8];
+    /// The initramfs (cpio archive) from the boot information, freed
+    /// after unpacking. Panics if there is none (required for boot).
+    fn get_initramfs() -> crate::fs::cpio::Initrd;
 }
 
 /// Optional VFS initialization extensions

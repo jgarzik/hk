@@ -637,8 +637,8 @@ impl ExceptionOps for Aarch64Arch {
 }
 
 impl InitramfsOps for Aarch64Arch {
-    fn get_initramfs() -> &'static [u8] {
-        // Try to extract initramfs from DTB
+    fn get_initramfs() -> crate::fs::cpio::Initrd {
+        // The boot loader's, from the DTB
         if let Some(info) = dtb::extract_initramfs() {
             crate::printkln!(
                 "Found initramfs in DTB: 0x{:x}-0x{:x} ({} bytes)",
@@ -646,7 +646,9 @@ impl InitramfsOps for Aarch64Arch {
                 info.end,
                 info.size()
             );
-            return unsafe { info.as_slice() };
+            // SAFETY: the DTB's initrd range, reserved since boot
+            // (`memblock_init`) and read by nothing else
+            return unsafe { crate::fs::cpio::Initrd::loaded(info.start, info.end) };
         }
 
         // Fall back to embedded initramfs (built into kernel binary)
@@ -654,7 +656,7 @@ impl InitramfsOps for Aarch64Arch {
             "Using embedded initramfs ({} bytes)",
             EMBEDDED_INITRAMFS.len()
         );
-        EMBEDDED_INITRAMFS
+        crate::fs::cpio::Initrd::builtin(EMBEDDED_INITRAMFS)
     }
 }
 

@@ -759,9 +759,11 @@ impl Zone {
     // Boot and statistics
     // ------------------------------------------------------------------
 
-    /// Hand the free pfns [start, end) to the buddy lists (boot; Linux
-    /// memblock_free_all), in the largest aligned blocks that fit
-    pub fn free_range(&self, mut start: u64, end: u64) {
+    /// Hand the free pfns [start, end) to the buddy lists (boot, Linux
+    /// memblock_free_all; or reserved boot memory given up later, Linux
+    /// free_reserved_area), in the largest aligned blocks that fit: the
+    /// pages handed over
+    pub fn free_range(&self, mut start: u64, end: u64) -> usize {
         let (lo, hi) = (
             self.start.load(Ordering::Relaxed),
             self.end.load(Ordering::Relaxed),
@@ -769,6 +771,7 @@ impl Zone {
         start = start.max(lo);
         let end = end.min(hi);
         let mut fa = self.lock.lock();
+        let mut freed = 0;
         while start < end {
             let fit = 63 - (end - start).leading_zeros();
             let order = start.trailing_zeros().min(fit).min(MAX_ORDER);
@@ -783,8 +786,10 @@ impl Zone {
             }
             self.managed.fetch_add(1 << order, Ordering::Relaxed);
             self.free_one(&mut fa, start, order);
+            freed += 1 << order;
             start += 1 << order;
         }
+        freed
     }
 
     /// Size the per-CPU lists from the zone size (Linux zone_batchsize:

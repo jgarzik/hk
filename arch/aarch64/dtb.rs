@@ -3,7 +3,6 @@
 //! This module extracts hardware configuration from the Device Tree Blob (DTB)
 //! passed by the bootloader. It produces an AcpiInfo structure compatible with
 //! the architecture-independent kernel code.
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 extern crate alloc;
 
@@ -228,14 +227,6 @@ impl InitramfsInfo {
     /// Size of the initramfs in bytes
     pub fn size(&self) -> usize {
         (self.end - self.start) as usize
-    }
-
-    /// Get a slice pointing to the initramfs data
-    ///
-    /// # Safety
-    /// The start/end addresses must be valid and mapped.
-    pub unsafe fn as_slice(&self) -> &'static [u8] {
-        unsafe { core::slice::from_raw_parts(phys_to_virt(self.start), self.size()) }
     }
 }
 

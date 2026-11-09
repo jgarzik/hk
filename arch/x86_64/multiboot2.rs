@@ -29,7 +29,8 @@ static INFO_PHYS: AtomicU64 = AtomicU64::new(0);
 /// # Safety
 /// `pa` is 0, or the physical address of a multiboot2 info structure
 /// readable through the direct map; it and every module it lists stay
-/// reserved for the kernel's life (`boot_ranges`).
+/// reserved for the kernel's life (`boot_ranges`), but for the
+/// initramfs, freed once unpacked (`initrd_range`).
 pub unsafe fn set_boot(pa: u64) {
     INFO_PHYS.store(pa, Ordering::Relaxed);
 }
@@ -134,15 +135,38 @@ pub fn boot_ranges(mut f: impl FnMut(&'static str, u64, u64)) {
     }
 }
 
-/// Find a module loaded by the bootloader (GRUB `module2`) whose
-/// command line contains `name`; its data through the direct map
-pub fn find_module(name: &str) -> Option<&'static [u8]> {
+/// The physical range of the first module whose command line
+/// contains `name`
+fn module_range(name: &str) -> Option<(u64, u64)> {
     let (start, end, _) = tags_of(TAG_MODULE)
         .filter_map(module)
         .find(|&(s, e, c)| s < e && c.is_some_and(|c| c.contains(name)))?;
+    Some((start, end))
+}
+
+/// The initramfs module's physical range [start, end): its pages are
+/// freed once it is unpacked (`fs::cpio::Initrd`)
+pub fn initrd_range() -> Option<(u64, u64)> {
+    module_range(INITRD)
+}
+
+/// The command-line name of the initramfs module
+const INITRD: &str = "initramfs";
+
+/// Find a module loaded by the bootloader (GRUB `module2`) whose
+/// command line contains `name`, other than the initramfs (freed after
+/// boot, see `initrd_range`); its data through the direct map
+pub fn find_module(name: &str) -> Option<&'static [u8]> {
+    if name.contains(INITRD) {
+        return None;
+    }
+    let (start, end) = module_range(name)?;
+    if module_range(INITRD).is_some_and(|(s, e)| start < e && s < end) {
+        return None;
+    }
     let p = phys_to_virt(start).cast_const();
-    // SAFETY: a module the info structure lists, reserved for good
-    // (`set_boot`), `end - start` bytes
+    // SAFETY: a module the info structure lists and not the initramfs,
+    // reserved for good (`set_boot`), `end - start` bytes
     Some(unsafe { core::slice::from_raw_parts(p, (end - start) as usize) })
 }
 

@@ -334,19 +334,21 @@ pub(crate) fn kmain() -> ! {
     // ========================================================================
     // Phase 6: Initramfs Unpacking
     // ========================================================================
-    let initramfs_data = CurrentArch::get_initramfs();
+    let initrd = CurrentArch::get_initramfs();
     let root_dentry = crate::ns::init_mnt_ns()
         .root_path()
         .expect("VFS root not initialized")
         .dentry
         .clone();
-    match fs::unpack_cpio(initramfs_data, &root_dentry) {
+    match fs::unpack_cpio(initrd.data(), &root_dentry) {
         Ok(n) => printkln!("initramfs: {} files", n),
         Err(e) => {
             printkln!("ERR: initramfs: {:?}", e);
             CurrentArch::halt_loop();
         }
     }
+    // Everything was copied out (Linux do_populate_rootfs)
+    initrd.free();
 
     // ========================================================================
     // Phase 6b: Graphics Console Initialization
