@@ -199,7 +199,8 @@ pub fn init() {
 /// returns the physical address directly (already mapped with device attrs).
 /// For other addresses, allocates from the ioremap region.
 /// InvalidArgument for a zero `size`, OutOfMemory when the window or a
-/// page-table frame runs out.
+/// page-table frame runs out, Busy when a block entry already maps part
+/// of the window (a kernel bug).
 ///
 /// # Safety
 /// The range is device or firmware memory, not RAM the kernel uses.
@@ -353,8 +354,8 @@ unsafe fn entry(table: u64, idx: usize) -> &'static AtomicU64 {
     unsafe { AtomicU64::from_ptr(p) }
 }
 
-/// Table frame under an L0-L2 entry, added if invalid; an error for a
-/// block (never split here)
+/// Table frame under an L0-L2 entry, added if invalid; EBUSY for a
+/// block (never split here: a kernel bug to map inside one)
 ///
 /// # Safety
 ///
@@ -366,7 +367,11 @@ unsafe fn table(e: &AtomicU64) -> Result<u64, KernelError> {
         return Ok(v.addr());
     }
     if v.is_valid() {
-        return Err(KernelError::OutOfMemory);
+        crate::printkln!(
+            "WARNING: ioremap: window already mapped by block {:#x}",
+            v.0
+        );
+        return Err(KernelError::Busy);
     }
     let t = alloc_page_table()?;
     let mut n = PageTableEntry::empty();

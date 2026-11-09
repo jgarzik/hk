@@ -19,7 +19,7 @@ use crate::util::scope::ScopeGuard;
 
 use super::kmap::swapper_phys;
 use super::paging::{
-    PAGE_CACHE_DISABLE, PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
+    PAGE_CACHE_DISABLE, PAGE_HUGE, PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
     PAGE_WRITE_THROUGH, PTE_ADDR_MASK, VMALLOC_START, phys_to_virt,
 };
 use crate::mm::tlb::flush_tlb_kernel_range;
@@ -210,7 +210,8 @@ pub fn init() {
 /// # Returns
 /// Virtual address pointer (with same offset as physical address had);
 /// InvalidArgument for a zero `size`, OutOfMemory when the
-/// window or a page-table frame runs out
+/// window or a page-table frame runs out, Busy when a huge page already
+/// maps part of the window (a kernel bug)
 ///
 /// # Safety
 /// The range is MMIO or firmware memory, not RAM the kernel uses (an
@@ -384,7 +385,8 @@ unsafe fn map_page(va: u64, pa: u64, flags: u64) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Table frame under a PDPT or PD entry, added if absent
+/// Table frame under a PDPT or PD entry, added if absent; EBUSY for a
+/// huge page (never split here: a kernel bug to map inside one)
 ///
 /// # Safety
 ///
@@ -392,6 +394,10 @@ unsafe fn map_page(va: u64, pa: u64, flags: u64) -> Result<(), KernelError> {
 /// KTABLES held.
 unsafe fn table(e: &AtomicU64) -> Result<u64, KernelError> {
     let v = e.load(Ordering::Acquire);
+    if v & (PAGE_PRESENT | PAGE_HUGE) == PAGE_PRESENT | PAGE_HUGE {
+        crate::printkln!("WARNING: ioremap: window already mapped by huge page {v:#x}");
+        return Err(KernelError::Busy);
+    }
     if v & PAGE_PRESENT != 0 {
         return Ok(v & PTE_ADDR_MASK);
     }
@@ -416,7 +422,7 @@ unsafe fn unmap_page(va: u64) -> Option<u64> {
         // freed; read atomically (KTABLES not needed: an upper entry is
         // only ever added, under it)
         let e = unsafe { entry(table, idx) }.load(Ordering::Acquire);
-        if e & PAGE_PRESENT == 0 {
+        if e & PAGE_PRESENT == 0 || e & PAGE_HUGE != 0 {
             return None;
         }
         table = e & PTE_ADDR_MASK;
