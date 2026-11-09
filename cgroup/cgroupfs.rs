@@ -633,7 +633,7 @@ impl FileOps for CgroupfsFileOps {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait {
+        if rw.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let content = cgroupfs_content(file)?;
@@ -659,7 +659,7 @@ impl FileOps for CgroupfsFileOps {
         _at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait {
+        if rw.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let mut buf = crate::util::kmem::try_vec(from.len().min(WRITE_CHUNK), 0u8)?;

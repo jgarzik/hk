@@ -401,7 +401,7 @@ impl FileOps for KernfsFops {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait {
+        if rw.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let off = at.unwrap_or_else(|| file.get_pos());
@@ -419,7 +419,7 @@ impl FileOps for KernfsFops {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait {
+        if rw.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let off = at.unwrap_or_else(|| file.get_pos());

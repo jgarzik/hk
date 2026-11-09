@@ -133,7 +133,7 @@ fn rwf_check(flags: i32) -> KernelResult<RwFlags> {
         return Err(KernelError::OperationNotSupported);
     }
     Ok(if flags & RWF_NOWAIT != 0 {
-        RwFlags::with_nowait()
+        RwFlags::NOWAIT
     } else {
         RwFlags::empty()
     })

@@ -249,12 +249,14 @@ lo (hk has no checksum offload states).
 - A NULL pathname is EINVAL; Linux fanotify_find_path marks dfd's own
   file (a descriptor, not a path-only one).
 
-## open and path-walk gaps
+## O_DIRECT I/O is buffered
 
-**Location**: `fs/open.rs`
+**Location**: `fs/blkdev_ops.rs`, `fs/vfat.rs`, `fs/ramfs/mod.rs`
 
-- O_DIRECT is kept in f_flags but does nothing; Linux do_dentry_open
-  refuses it (EINVAL) on a file without direct I/O (ramfs).
+Files that take O_DIRECT (`FileOps::can_odirect`) still read and write
+through the page cache: no alignment checks (EINVAL), no cache bypass
+(Linux blkdev_direct_IO, fat_direct_IO; tmpfs is buffered in Linux
+too).
 
 ## File lock gaps
 

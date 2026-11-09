@@ -1660,7 +1660,7 @@ impl FileOps for ProcfsFileOps {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait {
+        if rw.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let pos = at.unwrap_or_else(|| file.get_pos());
@@ -1696,7 +1696,7 @@ impl FileOps for ProcfsFileOps {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait {
+        if rw.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;

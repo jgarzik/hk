@@ -10,9 +10,9 @@ use crate::fs::{
 
 use super::file::flags::AT_FDCWD;
 use super::flags::{
-    __O_SYNC, __O_TMPFILE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_DSYNC, O_EMPTYPATH,
-    O_EXCL, O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_PATH, O_PATH_FLAGS, O_RDONLY, O_RDWR, O_TRUNC,
-    VALID_OPEN_FLAGS,
+    __O_SYNC, __O_TMPFILE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_DSYNC,
+    O_EMPTYPATH, O_EXCL, O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_PATH, O_PATH_FLAGS, O_RDONLY, O_RDWR,
+    O_TRUNC, VALID_OPEN_FLAGS,
 };
 use super::mount::MNT_NODEV;
 use super::syscall::{current_fd_table, get_nofile_limit};
@@ -398,10 +398,15 @@ fn do_o_path(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, Kerne
 }
 
 /// The end of an open (Linux do_dentry_open): `->open`, then the flags
-/// that only steered the open leave f_flags
+/// that only steered the open leave f_flags; O_DIRECT on a file that
+/// cannot take it is EINVAL, after `->open` (the file is released)
 fn dentry_open(mut file: File) -> Result<Arc<File>, KernelError> {
     file.f_op.open(&file)?;
+    file.set_can_odirect();
     file.clear_flags(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
+    if file.get_flags() & O_DIRECT != 0 && !file.can_odirect() {
+        return Err(KernelError::InvalidArgument);
+    }
     try_arc(file)
 }
 

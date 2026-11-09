@@ -4,7 +4,6 @@ pub mod anon_inode;
 pub mod append;
 pub mod attr_race;
 pub mod bigio;
-pub mod blk;
 pub mod cpio_nodes;
 pub mod dac;
 pub mod deep_chain;

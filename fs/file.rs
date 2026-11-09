@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::spin::Mutex;
-use ::core::sync::atomic::{AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync;
 
@@ -123,22 +123,51 @@ pub mod seek {
     pub const SEEK_HOLE: i32 = 4;
 }
 
-/// Flags for read/write operations (preadv2/pwritev2 RWF_* flags)
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RwFlags {
-    /// RWF_NOWAIT - return EAGAIN if operation would block
-    pub nowait: bool,
+bitflags::bitflags! {
+    /// Flags of one read or write (Linux kiocb ki_flags, IOCB_*): the
+    /// file's own (`File::iocb_flags`, from O_APPEND, O_DIRECT,
+    /// O_DSYNC, __O_SYNC) and the call's RWF_* ones; the values are
+    /// Linux's, where the RWF_* flags share them
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct RwFlags: u32 {
+        /// RWF_HIPRI: poll for completion
+        const HIPRI = 1 << 0;
+        /// O_DSYNC / RWF_DSYNC: the data reaches storage before return
+        const DSYNC = 1 << 1;
+        /// __O_SYNC / RWF_SYNC: the file's metadata too
+        const SYNC = 1 << 2;
+        /// RWF_NOWAIT: EAGAIN rather than block
+        const NOWAIT = 1 << 3;
+        /// O_APPEND
+        const APPEND = 1 << 4;
+        /// O_DIRECT: bypass the page cache
+        const DIRECT = 1 << 17;
+    }
 }
 
 impl RwFlags {
-    /// Create empty flags (no special behavior)
-    pub const fn empty() -> Self {
-        Self { nowait: false }
+    /// RWF_NOWAIT
+    #[inline]
+    pub const fn nowait(self) -> bool {
+        self.contains(Self::NOWAIT)
     }
 
-    /// Create flags with NOWAIT set
-    pub const fn with_nowait() -> Self {
-        Self { nowait: true }
+    /// The file flags' part (Linux iocb_flags)
+    pub const fn from_file(f: u32) -> Self {
+        let mut r = Self::empty();
+        if f & flags::O_APPEND != 0 {
+            r = r.union(Self::APPEND);
+        }
+        if f & flags::O_DIRECT != 0 {
+            r = r.union(Self::DIRECT);
+        }
+        if f & flags::O_DSYNC != 0 {
+            r = r.union(Self::DSYNC);
+        }
+        if f & flags::__O_SYNC != 0 {
+            r = r.union(Self::SYNC);
+        }
+        r
     }
 }
 
@@ -239,7 +268,7 @@ pub fn generic_llseek(
 /// RWF_NOWAIT is EOPNOTSUPP, which the syscalls report as ESPIPE resp.
 /// EOPNOTSUPP
 pub fn stream_rw(at: Option<u64>, flags: RwFlags) -> Result<(), KernelError> {
-    if at.is_some() || flags.nowait {
+    if at.is_some() || flags.nowait() {
         return Err(KernelError::OperationNotSupported);
     }
     Ok(())
@@ -249,7 +278,7 @@ pub fn stream_rw(at: Option<u64>, flags: RwFlags) -> Result<(), KernelError> {
 /// (Linux vfs_read without read_iter), and positioned I/O or RWF_NOWAIT
 /// EOPNOTSUPP (the syscalls report ESPIPE resp. EOPNOTSUPP)
 fn no_rw(at: Option<u64>, flags: RwFlags) -> Result<usize, KernelError> {
-    if at.is_some() || flags.nowait {
+    if at.is_some() || flags.nowait() {
         return Err(KernelError::OperationNotSupported);
     }
     Err(KernelError::InvalidArgument)
@@ -263,7 +292,7 @@ pub fn nowait_rw(file: &File, at: Option<u64>, flags: RwFlags) -> Result<bool, K
     if at.is_some() {
         return Err(KernelError::OperationNotSupported);
     }
-    Ok(flags.nowait || file.get_flags() & self::flags::O_NONBLOCK != 0)
+    Ok(flags.nowait() || file.get_flags() & self::flags::O_NONBLOCK != 0)
 }
 
 /// File operations trait - filesystem-specific behavior for open files
@@ -370,6 +399,13 @@ pub trait FileOps: Send + Sync {
         DEFAULT_POLLMASK
     }
 
+    /// O_DIRECT may be set on `file`, asked once at the end of its open
+    /// (Linux FMODE_CAN_ODIRECT: the mapping has ->direct_IO, or ->open
+    /// sets it). Default: no.
+    fn can_odirect(&self, _file: &File) -> bool {
+        false
+    }
+
     /// The file has a poll of its own (Linux file_can_poll: f_op->poll
     /// set): epoll accepts only these (EPERM otherwise); poll and select
     /// see `poll`'s DEFAULT_POLLMASK either way (Linux vfs_poll)
@@ -401,6 +437,17 @@ pub struct File {
 
     /// Open flags (protected by f_lock, like Linux)
     f_lock: Mutex<u32>,
+
+    /// The flags' I/O part (Linux f_iocb_flags, `RwFlags::from_file`):
+    /// written under `f_lock` with the flags, read lock-free by each
+    /// read and write (a racing F_SETFL may or may not apply to an I/O
+    /// already started, as in Linux)
+    f_iocb: AtomicU32,
+
+    /// O_DIRECT may be set (Linux FMODE_CAN_ODIRECT): fixed by
+    /// `open::dentry_open` from `FileOps::can_odirect`; false for a file
+    /// made without an open (memfd, pipe, socket)
+    can_odirect: bool,
 
     /// File operations
     pub f_op: &'static dyn FileOps,
@@ -482,6 +529,8 @@ impl File {
             f_pos_lock: sync::Mutex::new(()),
             f_ep: Mutex::new(alloc::vec::Vec::new()),
             f_lock: Mutex::new(flags),
+            f_iocb: AtomicU32::new(RwFlags::from_file(flags).bits()),
+            can_odirect: false,
             f_op,
             path_only: flags & flags::O_PATH != 0,
             f_owner: spin::Once::new(),
@@ -566,14 +615,34 @@ impl File {
         *self.f_lock.lock()
     }
 
-    /// Set status flags (for F_SETFL)
-    ///
-    /// Only O_APPEND, O_NONBLOCK and O_NOATIME can be modified. Access
-    /// mode is preserved.
+    /// Set the status flags F_SETFL may change (Linux SETFL_MASK:
+    /// O_APPEND, O_NONBLOCK, O_DIRECT, O_NOATIME), the I/O flags with
+    /// them under `f_lock` (Linux setfl)
     pub fn set_status_flags(&self, new_status: u32) {
-        const SETTABLE_FLAGS: u32 = flags::O_APPEND | flags::O_NONBLOCK | super::dac::O_NOATIME;
+        const SETFL_MASK: u32 =
+            flags::O_APPEND | flags::O_NONBLOCK | flags::O_DIRECT | super::dac::O_NOATIME;
         let mut guard = self.f_lock.lock();
-        *guard = (*guard & !SETTABLE_FLAGS) | (new_status & SETTABLE_FLAGS);
+        *guard = (*guard & !SETFL_MASK) | (new_status & SETFL_MASK);
+        self.f_iocb
+            .store(RwFlags::from_file(*guard).bits(), Ordering::Relaxed);
+    }
+
+    /// The file's I/O flags (Linux f_iocb_flags)
+    #[inline]
+    pub fn iocb_flags(&self) -> RwFlags {
+        RwFlags::from_bits_retain(self.f_iocb.load(Ordering::Relaxed))
+    }
+
+    /// O_DIRECT may be set on the file (Linux FMODE_CAN_ODIRECT)
+    #[inline]
+    pub fn can_odirect(&self) -> bool {
+        self.can_odirect
+    }
+
+    /// Fix FMODE_CAN_ODIRECT at the end of the open, before the file is
+    /// shared (`open::dentry_open`)
+    pub fn set_can_odirect(&mut self) {
+        self.can_odirect = self.f_op.can_odirect(self);
     }
 
     /// A path-only (O_PATH) file (Linux FMODE_PATH): it names a place
@@ -647,6 +716,7 @@ impl File {
             return Err(KernelError::PermissionDenied);
         }
         let want = !to.is_empty();
+        let flags = flags | self.iocb_flags();
         let r = self.f_op.read_iter(self, to, at, flags);
         // A regular file read asking for data (Linux filemap_read)
         if want && let Some(i) = self.get_inode().filter(|i| i.mode().is_file()) {
@@ -727,11 +797,12 @@ impl File {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
+        let flags = flags | self.iocb_flags();
         let inode = match self.get_inode() {
             Some(i) if i.mode().is_file() => i,
             _ => return self.f_op.write_iter(self, from, at, flags),
         };
-        let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
+        let append = append.unwrap_or(flags.contains(RwFlags::APPEND));
         let lock = inode.lock();
         let n = (|| {
             // An active swap file (Linux generic_write_checks:
@@ -766,8 +837,7 @@ impl File {
         // after i_rwsem is released)
         // Only a write that wrote, and the superblock only without O_DSYNC
         let sync = || {
-            self.get_flags() & flags::O_DSYNC != 0
-                || inode.superblock().is_some_and(|sb| sb.synchronous())
+            flags.contains(RwFlags::DSYNC) || inode.superblock().is_some_and(|sb| sb.synchronous())
         };
         if n > 0 && sync() {
             self.f_op.fsync(self)?;
@@ -940,7 +1010,7 @@ impl FileOps for CharDevFileOps {
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
         let dev = Self::dev(file)?;
-        if (at.is_some() && !dev.positional()) || flags.nowait {
+        if (at.is_some() && !dev.positional()) || flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         dev.read(file, to)
@@ -955,7 +1025,7 @@ impl FileOps for CharDevFileOps {
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
         let dev = Self::dev(file)?;
-        if (at.is_some() && !dev.positional()) || flags.nowait {
+        if (at.is_some() && !dev.positional()) || flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         dev.write(file, from)

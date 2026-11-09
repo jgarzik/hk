@@ -1031,9 +1031,10 @@ impl InodeOps for RamfsInodeOps {
 /// Static ramfs inode ops
 pub static RAMFS_INODE_OPS: RamfsInodeOps = RamfsInodeOps;
 
-/// Ramfs file operations; tmpfs's read a hole without caching a page
+/// Ramfs file operations; tmpfs's (Linux shmem) read a hole without
+/// caching a page and take O_DIRECT
 pub struct RamfsFileOps {
-    holes: bool,
+    shmem: bool,
 }
 
 impl FileOps for RamfsFileOps {
@@ -1044,6 +1045,13 @@ impl FileOps for RamfsFileOps {
     /// No poll (Linux ramfs/shmem file and dir operations)
     fn can_poll(&self, _file: &File) -> bool {
         false
+    }
+
+    /// A tmpfs regular file (Linux shmem_file_open sets
+    /// FMODE_CAN_ODIRECT; shmem_dir_operations and ramfs have no such
+    /// open, ramfs_aops no ->direct_IO)
+    fn can_odirect(&self, file: &File) -> bool {
+        self.shmem && file.get_inode().is_some_and(|i| i.mode().is_file())
     }
 
     /// Regular files map their data (Linux generic_file_mmap);
@@ -1065,12 +1073,12 @@ impl FileOps for RamfsFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if flags.nowait {
+        if flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let pos = at.unwrap_or_else(|| file.get_pos());
-        let n = if self.holes {
+        let n = if self.shmem {
             filemap::read_iter_holes(&inode, to, pos)
         } else {
             filemap::read_iter(&inode, to, pos)
@@ -1091,7 +1099,7 @@ impl FileOps for RamfsFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if flags.nowait {
+        if flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
@@ -1152,11 +1160,11 @@ fn dot(name: &[u8], ino: u64) -> DirEntry {
 }
 
 /// Static ramfs file ops
-pub static RAMFS_FILE_OPS: RamfsFileOps = RamfsFileOps { holes: false };
+pub static RAMFS_FILE_OPS: RamfsFileOps = RamfsFileOps { shmem: false };
 
 /// tmpfs file ops (Linux shmem_file_operations: shmem_file_read_iter
 /// reads a hole as zeros)
-pub static TMPFS_FILE_OPS: RamfsFileOps = RamfsFileOps { holes: true };
+pub static TMPFS_FILE_OPS: RamfsFileOps = RamfsFileOps { shmem: true };
 
 /// Ramfs superblock operations
 pub struct RamfsSuperOps;

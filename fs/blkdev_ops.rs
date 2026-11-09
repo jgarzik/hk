@@ -322,6 +322,11 @@ impl FileOps for BlockFileOps {
         false
     }
 
+    /// Always (Linux bdev_open sets FMODE_CAN_ODIRECT)
+    fn can_odirect(&self, _file: &File) -> bool {
+        true
+    }
+
     /// The device's page cache maps (Linux blkdev_mmap); a read-only
     /// device only privately or through a read-only file (Linux
     /// generic_file_readonly_mmap: no shared mapping that may write)
@@ -356,7 +361,7 @@ impl FileOps for BlockFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if flags.nowait {
+        if flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let n = read_at(file, to, at.unwrap_or_else(|| file.get_pos()))?;
@@ -374,7 +379,7 @@ impl FileOps for BlockFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if flags.nowait {
+        if flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let n = write_at(file, from, at.unwrap_or_else(|| file.get_pos()))?;

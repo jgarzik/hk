@@ -2207,6 +2207,12 @@ impl FileOps for VfatFileOps {
         false
     }
 
+    /// Regular files (Linux fat_aops has ->direct_IO; directories keep
+    /// empty_aops)
+    fn can_odirect(&self, file: &File) -> bool {
+        file.get_inode().is_some_and(|i| i.mode().is_file())
+    }
+
     /// Regular files map their data (Linux generic_file_mmap);
     /// directories have no mmap
     fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
@@ -2225,7 +2231,7 @@ impl FileOps for VfatFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if flags.nowait {
+        if flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
@@ -2244,7 +2250,7 @@ impl FileOps for VfatFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if flags.nowait {
+        if flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;

@@ -53,7 +53,7 @@
 2.1 FD lifecycle
 
 - [x] open (x86-64 only, legacy; use openat)
-- [x] openat (O_TMPFILE on tmpfs and ramfs: unnamed, linkable unless O_EXCL; O_PATH: path-only descriptors; O_EMPTYPATH: an empty path reopens dirfd's file)
+- [x] openat (O_TMPFILE on tmpfs and ramfs: unnamed, linkable unless O_EXCL; O_PATH: path-only descriptors; O_EMPTYPATH: an empty path reopens dirfd's file; O_DIRECT only on tmpfs and vfat regular files and block devices, else EINVAL after ->open; still buffered underneath)
 - [x] openat2 (open_how size rules, OPENAT2_REGULAR, O_EMPTYPATH, every RESOLVE_* flag)
 - [x] close
 - [x] close_range (CLOSE_RANGE_UNSHARE, CLOSE_RANGE_CLOEXEC)
@@ -61,7 +61,7 @@
 - [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)
 - [x] dup3
-- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETOWN_EX, F_SETOWN_EX, F_GETSIG, F_SETSIG, F_ADD_SEALS, F_GET_SEALS (tmpfs files; all six seals enforced); O_ASYNC raises SIGIO, or the F_SETSIG signal with POLL_* info, on pipes, FIFOs, ttys (input; FIOASYNC makes the foreground group or the caller owner), inotify and sockets (POLL_IN on input, POLL_OUT for room only after a send found none, POLL_ERR, POLL_HUP; TCP: POLL_OUT once connected))
+- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL (O_APPEND, O_NONBLOCK, O_NOATIME, O_DIRECT where open would take it), F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETOWN_EX, F_SETOWN_EX, F_GETSIG, F_SETSIG, F_ADD_SEALS, F_GET_SEALS (tmpfs files; all six seals enforced); O_ASYNC raises SIGIO, or the F_SETSIG signal with POLL_* info, on pipes, FIFOs, ttys (input; FIOASYNC makes the foreground group or the caller owner), inotify and sockets (POLL_IN on input, POLL_OUT for room only after a send found none, POLL_ERR, POLL_HUP; TCP: POLL_OUT once connected))
 
 2.2 Read/write + position
 

@@ -457,11 +457,12 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
     }
 }
 
-/// Linux setfl: O_NOATIME needs the owner or CAP_FOWNER; a change of
-/// O_ASYNC goes through ->fasync, which sets the bit (a file without one
-/// keeps it clear), before the other flags change
+/// Linux setfl: O_NOATIME needs the owner or CAP_FOWNER, O_DIRECT a
+/// file that can take it (EINVAL); a change of O_ASYNC goes through
+/// ->fasync, which sets the bit (a file without one keeps it clear),
+/// before the other flags change
 fn setfl(fd: i32, file: &File, arg: u32) -> Result<(), KernelError> {
-    use crate::fs::flags::O_ASYNC;
+    use crate::fs::flags::{O_ASYNC, O_DIRECT};
     let noatime = super::dac::O_NOATIME;
     if arg & noatime != 0
         && file.get_flags() & noatime == 0
@@ -470,6 +471,14 @@ fn setfl(fd: i32, file: &File, arg: u32) -> Result<(), KernelError> {
             .is_some_and(|i| super::dac::owner_or_capable(&super::dac::cred(), &i))
     {
         return Err(KernelError::NotPermitted);
+    }
+    // O_DIRECT where open could have set it; on a pipe or FIFO it is
+    // packet mode
+    if arg & O_DIRECT != 0
+        && !file.can_odirect()
+        && !file.get_inode().is_some_and(|i| i.mode().is_fifo())
+    {
+        return Err(KernelError::InvalidArgument);
     }
     if (arg ^ file.get_flags()) & O_ASYNC != 0
         && let Some(r) = file.fasync(fd, arg & O_ASYNC != 0)

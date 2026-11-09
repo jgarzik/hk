@@ -843,7 +843,7 @@ impl FileOps for PipeReadFileOps {
         if at.is_some() {
             return Err(KernelError::OperationNotSupported);
         }
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait;
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait();
         pipe_read(pipe_of(file)?, to, nonblock)
     }
 
@@ -938,7 +938,7 @@ impl FileOps for PipeWriteFileOps {
         if at.is_some() {
             return Err(KernelError::OperationNotSupported);
         }
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait;
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait();
         pipe_write(pipe_of(file)?, from, nonblock)
     }
 
@@ -1144,7 +1144,7 @@ impl FileOps for FifoFileOps {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait || at.is_some() {
+        if rw.nowait() || at.is_some() {
             return Err(KernelError::OperationNotSupported);
         }
         if file.get_flags() & flags::O_ACCMODE == flags::O_WRONLY {
@@ -1161,7 +1161,7 @@ impl FileOps for FifoFileOps {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait || at.is_some() {
+        if rw.nowait() || at.is_some() {
             return Err(KernelError::OperationNotSupported);
         }
         if file.get_flags() & flags::O_ACCMODE == flags::O_RDONLY {

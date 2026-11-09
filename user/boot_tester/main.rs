@@ -6,6 +6,7 @@
 #![no_main]
 
 pub mod arch;
+pub mod blk;
 pub mod exec;
 pub mod fs;
 pub mod harness;
@@ -348,7 +349,8 @@ pub fn run_all_tests() {
     process::pidfd::run_tests();
     process::pidfd_thread::run_tests();
     mm::swap::run_tests();
-    isolated(b"BLK", fs::blk::run_tests);
+    isolated(b"BLK", blk::disk::run_tests);
+    blk::odirect::run_tests();
     isolated(b"SWAPOUT", mm::swapout::run_tests);
     time::adjtimex::run_tests();
     isolated(b"SETTIME", time::settime::run_tests);

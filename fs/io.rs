@@ -96,7 +96,7 @@ pub fn verify_area(file: &File, at: Option<u64>, count: usize) -> Result<(), Ker
 fn rw_err(e: KernelError, at: Option<u64>, flags: RwFlags) -> KernelError {
     match e {
         KernelError::PermissionDenied => KernelError::BadFd,
-        KernelError::OperationNotSupported if !flags.nowait => match at {
+        KernelError::OperationNotSupported if !flags.nowait() => match at {
             Some(_) => KernelError::IllegalSeek,
             None => KernelError::InvalidArgument,
         },
