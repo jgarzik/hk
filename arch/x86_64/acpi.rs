@@ -170,7 +170,10 @@ fn map_acpi_table(phys_addr: u64) -> Result<*mut u8, KernelError> {
 /// Parse ACPI tables and extract SMP and power information
 pub fn parse_acpi() -> Result<AcpiInfo, KernelError> {
     // Find RSDP (in low memory, read through the direct map)
-    let rsdp = find_rsdp()?;
+    let Some(rsdp) = find_rsdp() else {
+        crate::printkln!("ACPI Error: RSDP not found");
+        return Err(KernelError::NoDevice);
+    };
 
     // Get RSDT or XSDT address (physical address, may be above 512MB!)
     let (sdt_phys, is_xsdt) = unsafe {
@@ -207,9 +210,9 @@ pub fn parse_acpi() -> Result<AcpiInfo, KernelError> {
     Ok(info)
 }
 
-/// Find the RSDP by searching known memory locations; NoDevice without
-/// one (Linux: -ENODEV for an absent table)
-fn find_rsdp() -> Result<*const Rsdp, KernelError> {
+/// Find the RSDP by searching known memory locations; None without one
+/// (the caller reports it)
+fn find_rsdp() -> Option<*const Rsdp> {
     // Search EBDA (Extended BIOS Data Area)
     // The EBDA segment is stored at physical address 0x40E
     let ebda_segment =
@@ -220,16 +223,11 @@ fn find_rsdp() -> Result<*const Rsdp, KernelError> {
         && ebda_addr < 0xA0000
         && let Some(rsdp) = search_rsdp(ebda_addr, 1024)
     {
-        return Ok(rsdp);
+        return Some(rsdp);
     }
 
     // Search BIOS ROM area: 0xE0000 - 0xFFFFF
-    if let Some(rsdp) = search_rsdp(0xE0000, 0x20000) {
-        return Ok(rsdp);
-    }
-
-    crate::printkln!("ACPI Error: RSDP not found");
-    Err(KernelError::NoDevice)
+    search_rsdp(0xE0000, 0x20000)
 }
 
 /// Search for RSDP signature in a memory region
@@ -697,14 +695,16 @@ fn srat_entry_pxm(e: &[u8]) -> Option<u32> {
 
 /// Initialize NUMA topology from ACPI SRAT/SLIT tables
 ///
-/// Called early in boot to discover NUMA topology. If SRAT is not found,
-/// returns Ok(false) and caller should use single-node fallback. An
+/// Called early in boot to discover NUMA topology. Without an RSDP or
+/// SRAT, returns Ok(false) and caller should use single-node fallback. An
 /// unusable SRAT is an error, its reason logged here.
 pub fn init_numa_topology() -> Result<bool, KernelError> {
     use crate::mm::numa::{LOCAL_DISTANCE, MAX_NUMA_NODES, NUMA_TOPOLOGY, REMOTE_DISTANCE};
 
-    // Find RSDP
-    let rsdp = find_rsdp()?;
+    // No RSDP is no SRAT: one node (parse_acpi reports it)
+    let Some(rsdp) = find_rsdp() else {
+        return Ok(false);
+    };
 
     // Get RSDT or XSDT address
     let (sdt_phys, is_xsdt) = unsafe {
