@@ -137,18 +137,18 @@ mod tests {
 
     #[test]
     fn user_strings_charged_and_bounded() {
-        let s = b"hello\0";
+        let s = crate::uaccess::UserMem::with(b"hello\0", 100);
         let mut a = ArgStrings::new();
         let mut budget = 100;
-        a.push_user(s.as_ptr() as u64, 6, &mut budget).unwrap();
+        a.push_user(s.addr(), 6, &mut budget).unwrap();
         assert_eq!(budget, 94);
         assert_eq!(strs(&a), [&b"hello"[..]]);
         // NUL included, longer than max: E2BIG
-        let r = a.push_user(s.as_ptr() as u64, 5, &mut budget);
+        let r = a.push_user(s.addr(), 5, &mut budget);
         assert_eq!(r, Err(KernelError::ArgListTooLong));
         // Past the budget: E2BIG
         let mut small = 3;
-        let r = a.push_user(s.as_ptr() as u64, 100, &mut small);
+        let r = a.push_user(s.addr(), 100, &mut small);
         assert_eq!(r, Err(KernelError::ArgListTooLong));
     }
 }

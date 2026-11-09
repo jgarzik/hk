@@ -752,25 +752,48 @@ pub fn copy_struct_from_user<T: FromBytes + IntoBytes>(
 }
 
 /// A uaccess "architecture" over the host's own memory, for host unit
-/// tests of code that copies from and to user space: user addresses are
-/// host pointers
+/// tests of code that copies from and to user space. User space is the
+/// [`UserMem`] buffers the current thread holds: an address outside them
+/// fails `access_ok` (EFAULT), as an address outside user space does on
+/// the machine.
 #[cfg(test)]
 pub struct HostUaccess;
+
+#[cfg(test)]
+std::thread_local! {
+    /// The [start, end) of each live [`UserMem`] this thread created
+    static USER_WINDOWS: core::cell::RefCell<alloc::vec::Vec<(u64, u64)>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+}
 
 #[cfg(test)]
 impl UaccessArch for HostUaccess {
     const TASK_SIZE: u64 = u64::MAX;
 
+    /// [addr, addr + size) lies inside one of this thread's [`UserMem`]s
+    fn access_ok(addr: u64, size: usize) -> bool {
+        let Some(end) = addr.checked_add(size as u64) else {
+            return false;
+        };
+        USER_WINDOWS.with_borrow(|w| w.iter().any(|&(s, e)| s <= addr && end <= e))
+    }
+
     unsafe fn user_access_begin() {}
 
     unsafe fn copy_user_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
-        // SAFETY: test "user" addresses are live host buffers
+        // SAFETY: the caller passed the user side through access_ok, so
+        // it lies inside a UserMem allocation of this thread, live
+        // (deregistered before it is freed) and reached by no reference
+        // (UserMem hands out copies only); the kernel side is valid for
+        // `len` bytes (the caller); `copy` allows overlap
         unsafe { core::ptr::copy(src, dst, len) };
         0
     }
 
     unsafe fn cmpxchg_user_raw(uaddr: *mut u32, old: u32, new: u32, cur: *mut u32) -> i32 {
-        // SAFETY: as above; aligned (the caller checked)
+        // SAFETY: `uaddr` passed access_ok for 4 bytes (inside a live
+        // UserMem allocation of this thread, as in copy_user_raw) and is
+        // aligned (the caller checked)
         let a = unsafe { core::sync::atomic::AtomicU32::from_ptr(uaddr) };
         let v = match a.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(v) | Err(v) => v,
@@ -783,18 +806,109 @@ impl UaccessArch for HostUaccess {
     unsafe fn user_access_end() {}
 }
 
+/// "User memory" for a host unit test: a zeroed, 16-byte aligned heap
+/// buffer that is user space (passes `access_ok`) on the creating thread
+/// while it lives. It is read and written only by copy, so the uaccess
+/// copies into it never alias a reference.
+///
+/// # Invariants
+/// `ptr` is an allocation of `layout`, owned, registered in this
+/// thread's `USER_WINDOWS` until drop. `!Send` (raw pointer): dropped on
+/// the thread whose window it removes.
+#[cfg(test)]
+pub struct UserMem {
+    ptr: *mut u8,
+    layout: core::alloc::Layout,
+}
+
+#[cfg(test)]
+impl UserMem {
+    /// `len` zero bytes
+    pub fn zeroed(len: usize) -> Self {
+        let layout = core::alloc::Layout::from_size_align(len.max(1), 16).unwrap();
+        // SAFETY: `layout` has a nonzero size
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+        let start = ptr.expose_provenance() as u64;
+        // INVARIANT: registered until drop
+        USER_WINDOWS.with_borrow_mut(|w| w.push((start, start + len as u64)));
+        Self { ptr, layout }
+    }
+
+    /// `data` followed by `pad` zero bytes (room for the chunked string
+    /// readers, which read ahead up to their limit)
+    pub fn with(data: &[u8], pad: usize) -> Self {
+        let m = Self::zeroed(data.len() + pad);
+        m.write(0, data);
+        m
+    }
+
+    /// The user address of the first byte
+    pub fn addr(&self) -> u64 {
+        self.ptr.addr() as u64
+    }
+
+    /// The user address `off` bytes in
+    pub fn at(&self, off: usize) -> u64 {
+        self.addr() + off as u64
+    }
+
+    /// A copy of `len` bytes from offset `off`
+    pub fn read(&self, off: usize, len: usize) -> alloc::vec::Vec<u8> {
+        assert!(
+            off.checked_add(len)
+                .is_some_and(|e| e <= self.layout.size())
+        );
+        let mut v = alloc::vec![0u8; len];
+        // SAFETY: in bounds (asserted) of the owned allocation (type
+        // invariant); `v` is a separate buffer
+        unsafe { core::ptr::copy_nonoverlapping(self.ptr.add(off), v.as_mut_ptr(), len) };
+        v
+    }
+
+    /// The `T` at offset `off`
+    pub fn get<T: FromBytes>(&self, off: usize) -> T {
+        let b = self.read(off, core::mem::size_of::<T>());
+        // SAFETY: `b` holds size_of::<T>() bytes; any bit pattern is a
+        // valid T (FromBytes); unaligned read
+        unsafe { b.as_ptr().cast::<T>().read_unaligned() }
+    }
+
+    /// Copy `data` in at offset `off`
+    pub fn write(&self, off: usize, data: &[u8]) {
+        assert!(
+            off.checked_add(data.len())
+                .is_some_and(|e| e <= self.layout.size())
+        );
+        // SAFETY: in bounds (asserted) of the owned allocation (type
+        // invariant), which no reference reaches; `data` is elsewhere
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(off), data.len()) };
+    }
+}
+
+#[cfg(test)]
+impl Drop for UserMem {
+    fn drop(&mut self) {
+        let start = self.addr();
+        USER_WINDOWS.with_borrow_mut(|w| {
+            let i = w.iter().position(|&(s, _)| s == start).unwrap();
+            w.swap_remove(i);
+        });
+        // SAFETY: allocated with `layout` (type invariant), no longer
+        // user space, freed once
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ua<T>(p: &T) -> u64 {
-        core::ptr::from_ref(p).addr() as u64
-    }
-
     #[test]
     fn reader_moves_forward_once() {
-        let buf: [u32; 3] = [1, 2, 3];
-        let mut r = UserSliceReader::new(ua(&buf), 12);
+        let m = UserMem::zeroed(12);
+        m.write(0, [1u32, 2, 3].as_bytes());
+        let mut r = UserSliceReader::new(m.addr(), 12);
         assert_eq!(r.read::<u32>(), Ok(1));
         assert_eq!(r.read::<u64>(), Ok(2 | (3 << 32)));
         assert!(r.is_empty());
@@ -803,38 +917,61 @@ mod tests {
 
     #[test]
     fn writer_bounds() {
-        let mut buf = [0u8; 6];
-        let mut w = UserSliceWriter::new(buf.as_mut_ptr().addr() as u64, 6);
+        let m = UserMem::zeroed(6);
+        let mut w = UserSliceWriter::new(m.addr(), 6);
         w.write(&0x0403_0201u32).unwrap();
         assert_eq!(w.write(&0u32), Err(UaccessError::Overflow));
         w.write_slice(&[5, 6]).unwrap();
-        assert_eq!(buf, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(m.read(0, 6), [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
     fn struct_versions() {
         // Shorter user struct: the tail stays zero
-        let short: [u32; 1] = [7];
-        let v = copy_struct_from_user::<[u32; 2]>(ua(&short), 4);
+        let m = UserMem::with([7u32].as_bytes(), 0);
+        let v = copy_struct_from_user::<[u32; 2]>(m.addr(), 4);
         assert_eq!(v, Ok([7, 0]));
         // Longer with a zero tail: accepted
-        let long: [u32; 3] = [7, 8, 0];
-        let v = copy_struct_from_user::<[u32; 2]>(ua(&long), 12);
+        let m = UserMem::with([7u32, 8, 0].as_bytes(), 0);
+        let v = copy_struct_from_user::<[u32; 2]>(m.addr(), 12);
         assert_eq!(v, Ok([7, 8]));
         // Longer with a nonzero tail: E2BIG
-        let long: [u32; 3] = [7, 8, 9];
-        let v = copy_struct_from_user::<[u32; 2]>(ua(&long), 12);
+        let m = UserMem::with([7u32, 8, 9].as_bytes(), 0);
+        let v = copy_struct_from_user::<[u32; 2]>(m.addr(), 12);
         assert_eq!(v, Err(None));
     }
 
     #[test]
     fn strings_and_cmpxchg() {
-        let s = *b"hello\0world";
-        assert_eq!(strndup_user_bytes(ua(&s), 64).unwrap(), b"hello");
-        assert_eq!(strndup_user_bytes(ua(&s), 3), Err(UaccessError::TooLong));
-        let mut w = 5u32;
-        let wa = core::ptr::from_mut(&mut w).addr() as u64;
-        assert_eq!(cmpxchg_user_u32(wa, 5, 9), Ok(5));
-        assert_eq!(cmpxchg_user_u32(wa, 5, 1), Ok(9));
+        let s = UserMem::with(b"hello\0world", 64);
+        assert_eq!(strndup_user_bytes(s.addr(), 64).unwrap(), b"hello");
+        assert_eq!(strndup_user_bytes(s.addr(), 3), Err(UaccessError::TooLong));
+        let w = UserMem::with(&5u32.to_ne_bytes(), 0);
+        assert_eq!(cmpxchg_user_u32(w.addr(), 5, 9), Ok(5));
+        assert_eq!(cmpxchg_user_u32(w.addr(), 5, 1), Ok(9));
+        assert_eq!(w.get::<u32>(0), 9);
+    }
+
+    #[test]
+    fn outside_user_memory_faults() {
+        // A kernel (host stack) address is not user space
+        let k = [0u8; 8];
+        let ka = k.as_ptr().addr() as u64;
+        assert_eq!(get_user::<u64>(ka), Err(UaccessError::BadAddress));
+        assert_eq!(put_user(ka, 1u64), Err(UaccessError::BadAddress));
+        assert_eq!(copy_to_user(ka, &[1]), Err(UaccessError::BadAddress));
+        // Straddling the end of user memory, or past it
+        let m = UserMem::zeroed(8);
+        assert_eq!(get_user::<u64>(m.at(4)), Err(UaccessError::BadAddress));
+        assert_eq!(copy_from_user_some(&mut [0; 4], m.at(8)), 0);
+        assert_eq!(get_user::<u32>(m.at(4)), Ok(0));
+        // Gone once dropped
+        let a = m.addr();
+        drop(m);
+        assert!(!access_ok(a, 1));
+        // Another thread's user memory is not this thread's
+        let m = UserMem::zeroed(8);
+        let a = m.addr();
+        assert!(std::thread::spawn(move || !access_ok(a, 8)).join().unwrap());
     }
 }

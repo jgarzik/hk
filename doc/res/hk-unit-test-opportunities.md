@@ -43,8 +43,8 @@ Stubs in place:
 - Ad hoc cfg(test) shims in `mm/ptl.rs`, `mm/anon_vma.rs`, `mm/page_alloc.rs`,
   `mm/xarray.rs`, `mm/slab.rs`, `net/inet/port.rs`.
 - `SkBuff::alloc` works on the host (used by `net/skb.rs` tests).
-- User memory: under test, uaccess copies through host memory (`HostUaccess`):
-  a user address is a host pointer.
+- User memory: under test, user space is the `uaccess::UserMem` buffers the
+  test thread holds (`HostUaccess`); any other address is EFAULT.
 
 Blocks:
 - Page tables, `FRAME_ALLOCATOR`, TLB, fault handling.
