@@ -11,13 +11,18 @@
 //! Locking: `lock` is an IrqSpinlock leaf (adds may come from any
 //! context, e.g. an inode's last reference) under which `count` changes;
 //! `count` is read without it where an estimate does (Linux reads
-//! fbc->count unlocked). The parts are atomics, so a part is never torn
-//! by an interrupt on its CPU or a fold from another.
+//! fbc->count unlocked). The parts are atomics, so a fold from another
+//! CPU never tears one. Choosing the calling CPU's part, reading,
+//! checking and adding to it run with interrupts off (Linux
+//! local_irq_save in percpu_counter_limited_add), so no interrupt or
+//! migration on that CPU can slip an add in between and push the part
+//! past the batch, the bound `limited_add` relies on.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI64, Ordering};
 
 use crate::sync::IrqSpinlock;
+use crate::sync::{IrqFlags, local_irq_restore, local_irq_save};
 use crate::util::error::KernelError;
 
 /// One CPU's part, alone on its cache line
@@ -28,6 +33,24 @@ struct Part(AtomicI64);
 impl Clone for Part {
     fn clone(&self) -> Self {
         Self(AtomicI64::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+/// Interrupts off on this CPU until dropped (Linux local_irq_save /
+/// local_irq_restore around a part's read-check-add)
+struct IrqOff(Option<IrqFlags>);
+
+impl IrqOff {
+    fn new() -> Self {
+        Self(Some(local_irq_save()))
+    }
+}
+
+impl Drop for IrqOff {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            local_irq_restore(f);
+        }
     }
 }
 
@@ -62,6 +85,7 @@ impl PercpuCounter {
 
     /// Add `amount` (Linux percpu_counter_add_batch)
     pub fn add(&self, amount: i64) {
+        let _irq = IrqOff::new();
         if let Some(p) = self.part() {
             let v = p.fetch_add(amount, Ordering::Relaxed) + amount;
             if v.abs() < self.batch {
@@ -93,6 +117,7 @@ impl PercpuCounter {
             return true;
         }
         let unknown = self.batch * self.parts.len() as i64;
+        let _irq = IrqOff::new();
         let part = self.part();
         // Clearly inside: the calling CPU's part, no lock
         if let Some(p) = part {
