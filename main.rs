@@ -215,22 +215,17 @@ fn init_numa_topology() {
             Ok(false) => {
                 // No SRAT table, use single-node fallback
             }
-            Err(e) => {
-                printkln!("NUMA: ACPI parse error: {}", e);
+            Err(_) => {
+                printkln!("NUMA: ACPI topology unusable, using one node");
             }
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        match arch::aarch64::dtb::init_numa_topology() {
-            Ok(true) => return,
-            Ok(false) => {
-                // No numa-node-id properties, use single-node fallback
-            }
-            Err(e) => {
-                printkln!("NUMA: DTB parse error: {}", e);
-            }
+        // No numa-node-id properties: single-node fallback
+        if arch::aarch64::dtb::init_numa_topology() {
+            return;
         }
     }
 
