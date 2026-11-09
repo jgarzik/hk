@@ -69,6 +69,7 @@ mod cfg {
     pub const SEG_MAX: u32 = 12;
     pub const BLK_SIZE: u32 = 20;
     pub const PHYS_EXP: u32 = 24;
+    pub const MIN_IO_SIZE: u32 = 26;
     pub const NUM_QUEUES: u32 = 34;
 }
 
@@ -375,6 +376,12 @@ fn limits(vdev: &VirtioDevice, ring: u16) -> QueueLimits {
     } else {
         lbs
     };
+    // Linux virtblk_probe: min_io_size in logical blocks
+    let io_min = if f(feature::TOPOLOGY) {
+        lbs.saturating_mul(u32::from(vdev.read_config(|d| d.cfg16(cfg::MIN_IO_SIZE))))
+    } else {
+        0
+    };
     let seg_max = if f(feature::SEG_MAX) {
         vdev.read_config(|d| d.cfg32(cfg::SEG_MAX)).max(1)
     } else {
@@ -393,6 +400,8 @@ fn limits(vdev: &VirtioDevice, ring: u16) -> QueueLimits {
         max_segments: seg_max.min(MAX_SEGS as u32).min(u32::from(ring) - 2),
         max_segment_size: size_max,
         rotational: true,
+        io_min,
+        ..QueueLimits::default()
     }
 }
 

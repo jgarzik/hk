@@ -131,7 +131,7 @@ New kernels mostly use statx; older ones use stat/lstat/fstat.
 - [x] newfstatat (fstatat on aarch64)
 - [x] statfs
 - [x] fstatfs
-- [x] statx (modern richer interface)
+- [x] statx (modern richer interface; STATX_DIOALIGN and io_min as stx_blksize for block devices)
 
 Permissions and ownership:
 

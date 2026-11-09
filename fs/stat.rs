@@ -1,6 +1,6 @@
 //! File status syscalls (stat, fstat, fstatat, lstat, statfs, fstatfs, statx)
 
-use crate::arch::uapi::{Stat, st_nlink};
+use crate::arch::uapi::{Stat, st_blksize, st_nlink};
 use crate::fs::namei::{filename_lookup, getname_maybe_null, user_path_at};
 use crate::fs::{Inode, KernelError, LinuxStatFs, LookupFlags};
 use crate::uaccess::UserPtr;
@@ -13,6 +13,21 @@ use super::io::fget_raw;
 // =============================================================================
 // Stat structure and helpers
 // =============================================================================
+
+/// The block device a device node names, if it exists (Linux
+/// blkdev_get_no_open by i_rdev in bdev_statx)
+fn bdev_of(attr: &super::inode::InodeAttr) -> Option<alloc::sync::Arc<crate::block::BlockDevice>> {
+    attr.mode
+        .is_blkdev()
+        .then(|| crate::block::get_blkdev(attr.rdev))
+        .flatten()
+}
+
+/// The preferred I/O size: a block device's io_min (Linux bdev_statx),
+/// else the page size (i_blocksize of every hk file system)
+fn blksize(bdev: Option<&crate::block::BlockDevice>) -> u32 {
+    bdev.map_or(4096, |b| b.io_min())
+}
 
 /// Fill a Stat structure from an inode
 fn fill_stat(inode: &Inode) -> Result<Stat, KernelError> {
@@ -39,7 +54,7 @@ fn fill_stat(inode: &Inode) -> Result<Stat, KernelError> {
         st_gid: attr.gid,
         st_rdev,
         st_size: attr.size as i64,
-        st_blksize: 4096,
+        st_blksize: st_blksize(blksize(bdev_of(&attr).as_deref())),
         st_blocks: attr.size.div_ceil(512) as i64,
         st_atime: attr.atime.sec,
         st_atime_nsec: attr.atime.nsec.into(),
@@ -263,6 +278,9 @@ pub const STATX_BASIC_STATS: u32 = 0x07ff;
 pub const STATX_BTIME: u32 = 0x0800;
 /// Got stx_mnt_id
 pub const STATX_MNT_ID: u32 = 0x1000;
+/// Want/got direct I/O alignment (stx_dio_mem_align,
+/// stx_dio_offset_align)
+pub const STATX_DIOALIGN: u32 = 0x2000;
 /// Got the never-reused mount id in stx_mnt_id
 pub const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
 
@@ -354,8 +372,9 @@ fn fill_statx(
     } else {
         0
     };
+    let bdev = bdev_of(&attr);
 
-    Ok(Statx {
+    let mut stx = Statx {
         // Basic stats, and the mount id: the unique one if asked for
         // (Linux vfs_getattr: STATX_MNT_ID_UNIQUE), else the reused one
         stx_mask: STATX_BASIC_STATS
@@ -364,7 +383,7 @@ fn fill_statx(
             } else {
                 STATX_MNT_ID
             },
-        stx_blksize: 4096,
+        stx_blksize: blksize(bdev.as_deref()),
         stx_nlink: attr.nlink,
         stx_uid: attr.uid,
         stx_gid: attr.gid,
@@ -386,7 +405,14 @@ fn fill_statx(
             None => 0,
         },
         ..FromBytes::zeroed()
-    })
+    };
+    // Direct I/O alignment of a block device (Linux bdev_statx)
+    if let Some(b) = bdev.filter(|_| mask & STATX_DIOALIGN != 0) {
+        stx.stx_dio_mem_align = b.dma_alignment() + 1;
+        stx.stx_dio_offset_align = b.logical_block_size();
+        stx.stx_mask |= STATX_DIOALIGN;
+    }
+    Ok(stx)
 }
 
 /// sys_statx - get extended file status (Linux do_statx + vfs_statx)

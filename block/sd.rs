@@ -418,9 +418,12 @@ pub fn create_scsi_disk(
     let i = index.0;
     register_blkdev(major::SCSI_DISK, "sd")?;
     let ss = scsi_disk.sector_size();
+    // DMA alignment of a sector (Linux libata's ata_scsi_dev_config,
+    // usb-storage's 511)
     let limits = QueueLimits {
         logical_block_size: ss,
         physical_block_size: ss,
+        dma_alignment: ss.saturating_sub(1),
         ..QueueLimits::default()
     };
     let q = RequestQueue::new_bio(

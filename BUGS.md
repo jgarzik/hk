@@ -780,6 +780,9 @@ size. Linux
 fat_get_cluster keeps a per-inode cache of chain positions
 (fat_cache); one is needed before large vfat files or vfat swap files.
 
+st_blksize and stx_blksize of a vfat file are the page size; Linux
+fat_getattr reports the cluster size (`fs/stat.rs` `blksize`).
+
 ## Block layer gaps
 
 **Location**: `block/`, `hw/virtio/blk.rs`,

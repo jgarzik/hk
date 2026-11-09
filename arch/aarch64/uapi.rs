@@ -37,6 +37,12 @@ pub const SECCOMP_STRICT: [i32; 5] = {
     ]
 };
 
+/// `st_blksize` from a block size; the field is i32 on this arch (a
+/// block size is at most a few MiB)
+pub fn st_blksize(n: u32) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
 /// `st_nlink` from an inode link count; the field is u32 on this arch
 pub fn st_nlink(n: u32) -> u32 {
     n

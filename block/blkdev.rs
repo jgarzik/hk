@@ -261,6 +261,20 @@ pub struct QueueLimits {
     pub max_segment_size: u32,
     /// Seeks cost (Linux !QUEUE_FLAG_NONROT)
     pub rotational: bool,
+    /// Mask a DMA buffer's address and length must clear (Linux
+    /// dma_alignment; default SECTOR_SIZE - 1)
+    pub dma_alignment: u32,
+    /// Smallest efficient I/O in bytes as the device reports it, 0 if it
+    /// does not (`io_min` raises it to the physical block size)
+    pub io_min: u32,
+}
+
+impl QueueLimits {
+    /// Smallest efficient I/O (Linux io_min after blk_validate_limits:
+    /// at least the physical block size)
+    pub fn io_min(&self) -> u32 {
+        self.io_min.max(self.physical_block_size)
+    }
 }
 
 impl Default for QueueLimits {
@@ -272,6 +286,8 @@ impl Default for QueueLimits {
             max_segments: 32,
             max_segment_size: PAGE as u32,
             rotational: true,
+            dma_alignment: SECTOR_SIZE as u32 - 1,
+            io_min: 0,
         }
     }
 }
@@ -499,6 +515,16 @@ impl BlockDevice {
 
     pub fn physical_block_size(&self) -> u32 {
         self.disk.queue.limits.physical_block_size
+    }
+
+    /// Linux bdev_dma_alignment
+    pub fn dma_alignment(&self) -> u32 {
+        self.disk.queue.limits.dma_alignment
+    }
+
+    /// Linux bdev_io_min
+    pub fn io_min(&self) -> u32 {
+        self.disk.queue.limits.io_min()
     }
 
     pub fn ro(&self) -> bool {
