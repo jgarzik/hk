@@ -27,7 +27,7 @@ infallible, so each one is investigated, not written off.
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
-There are 56 files with `#![expect(clippy::undocumented_unsafe_blocks)]
+There are 50 files with `#![expect(clippy::undocumented_unsafe_blocks)]
 // TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`). Most of their
 blocks belong in a missing wrapper:
 

@@ -151,19 +151,20 @@ fn unmapped(phys: u64, e: KernelError) -> KernelError {
 /// Map an entire ACPI table given its physical address
 /// Returns mapped pointer or error. Caller must iounmap when done.
 fn map_acpi_table(phys_addr: u64) -> Result<*mut u8, KernelError> {
-    unsafe {
-        // First map just the header to read the length
-        let header_size = core::mem::size_of::<SdtHeader>() as u64;
-        let ptr = ioremap(phys_addr, header_size).map_err(|e| unmapped(phys_addr, e))?;
-
-        // Read length field using read_unaligned (packed struct)
-        let length_ptr = ptr.cast_const().add(4).cast::<u32>(); // offset of length field
-        let length = core::ptr::read_unaligned(length_ptr);
-        iounmap(ptr, header_size);
-
-        // Now map the full table
-        ioremap(phys_addr, u64::from(length)).map_err(|e| unmapped(phys_addr, e))
-    }
+    // First map just the header to read the length
+    let header_size = core::mem::size_of::<SdtHeader>() as u64;
+    // SAFETY: an ACPI table address comes from the RSDP/RSDT/XSDT chain:
+    // firmware (ACPI reclaim/NVS) memory, not RAM the kernel allocates
+    let ptr = unsafe { ioremap(phys_addr, header_size) }.map_err(|e| unmapped(phys_addr, e))?;
+    // SAFETY: the mapping covers the header, whose u32 length field is
+    // at offset 4 (packed: unaligned read)
+    let length = unsafe { ptr.cast_const().add(4).cast::<u32>().read_unaligned() };
+    // SAFETY: the header mapping just made, with its size; `ptr` is not
+    // used after
+    unsafe { iounmap(ptr, header_size) };
+    // Now map the full table
+    // SAFETY: as the header mapping above: firmware memory
+    unsafe { ioremap(phys_addr, u64::from(length)) }.map_err(|e| unmapped(phys_addr, e))
 }
 
 /// Parse ACPI tables and extract SMP and power information

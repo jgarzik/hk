@@ -17,7 +17,6 @@
 //!
 //! Functions return the number of bytes that could NOT be copied (0 = success),
 //! following the Linux kernel convention. This allows partial copies to be detected.
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 extern crate alloc;
 
@@ -184,6 +183,9 @@ pub fn copy_to_user(to: u64, from: &[u8]) -> UaccessResult<usize> {
     }
 
     // Perform the copy with SMAP protection disabled
+    // SAFETY: `to` passed access_ok for `len` bytes (a fault is caught
+    // by the fixup and counted); `from` is a kernel slice of `len`
+    // bytes; begin/end paired
     let left = unsafe {
         Arch::user_access_begin();
         let left = Arch::copy_user_raw(to as *mut u8, from.as_ptr(), len);
@@ -222,6 +224,9 @@ pub fn copy_from_user(to: &mut [u8], from: u64, len: usize) -> UaccessResult<usi
     }
 
     // Perform the copy with SMAP protection disabled
+    // SAFETY: `from` passed access_ok for `len` bytes (a fault is caught
+    // by the fixup and counted); `to` is a kernel slice of at least
+    // `len` bytes (checked above); begin/end paired
     let left = unsafe {
         Arch::user_access_begin();
         let left = Arch::copy_user_raw(to.as_mut_ptr(), from as *const u8, len);
