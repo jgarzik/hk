@@ -549,12 +549,16 @@ pub fn shrink_dcache(budget: usize) -> usize {
 fn unhook(d: &Arc<Dentry>) -> Option<(Arc<Dentry>, FileName)> {
     let parent = d.get_parent()?;
     let name = d.name();
-    let mut p = parent.d_lock.write();
-    if p.children.get(&name).is_some_and(|c| Arc::ptr_eq(c, d)) {
-        p.children.remove(&name);
-    }
-    drop(p);
+    unhook_from(d, &parent, &name);
     Some((parent, name))
+}
+
+/// Take `d` off `parent`'s children, if it is the one cached as `name`
+fn unhook_from(d: &Arc<Dentry>, parent: &Dentry, name: &FileName) {
+    let mut p = parent.d_lock.write();
+    if p.children.get(name).is_some_and(|c| Arc::ptr_eq(c, d)) {
+        p.children.remove(name);
+    }
 }
 
 /// Re-hang `d` as `name` under `parent`
@@ -586,12 +590,16 @@ pub fn d_move(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: &[u8]) {
 }
 
 /// RENAME_EXCHANGE swapped `a` and `b` (Linux d_exchange): each takes
-/// the other's name and parent
+/// the other's name and parent. Neither may be a root (Linux WARN_ON
+/// IS_ROOT); if one is, nothing changes.
 pub fn d_exchange(a: &Arc<Dentry>, b: &Arc<Dentry>) {
     let _w = RENAME_LOCK.write();
-    let (Some((pa, na)), Some((pb, nb))) = (unhook(a), unhook(b)) else {
+    let (Some(pa), Some(pb)) = (a.get_parent(), b.get_parent()) else {
         return;
     };
+    let (na, nb) = (a.name(), b.name());
+    unhook_from(a, &pa, &na);
+    unhook_from(b, &pb, &nb);
     rehook(a, &pb, nb);
     rehook(b, &pa, na);
 }
@@ -657,4 +665,47 @@ pub fn is_subdir(child: &Arc<Dentry>, ancestor: &Arc<Dentry>) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::inode::{InodeMode, NULL_INODE_OPS, Timespec};
+
+    fn inode() -> Arc<Inode> {
+        try_arc(Inode::new(
+            1,
+            InodeMode::directory(0o755),
+            0,
+            0,
+            0,
+            Timespec::from_secs(0),
+            Weak::new(),
+            &NULL_INODE_OPS,
+        ))
+        .unwrap()
+    }
+
+    /// An exchange with a root changes nothing: the other dentry stays
+    /// where it was, cached under its parent
+    #[test]
+    fn exchange_with_root_is_noop() {
+        let r = try_arc(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        let other = try_arc(Dentry::new_root(inode(), Weak::new())).unwrap();
+        d_exchange(&a, &other);
+        assert!(r.lookup_child(b"a").is_some_and(|c| Arc::ptr_eq(&c, &a)));
+        assert!(a.get_parent().is_some_and(|p| Arc::ptr_eq(&p, &r)));
+    }
+
+    /// A real exchange swaps names and parents
+    #[test]
+    fn exchange_swaps() {
+        let r = try_arc(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        let b = Dentry::alloc(&r, b"b", Some(inode())).unwrap();
+        d_exchange(&a, &b);
+        assert!(r.lookup_child(b"b").is_some_and(|c| Arc::ptr_eq(&c, &a)));
+        assert!(r.lookup_child(b"a").is_some_and(|c| Arc::ptr_eq(&c, &b)));
+    }
 }
