@@ -18,10 +18,6 @@ impl IoremapOps for Aarch64Arch {
     const PROT_DEVICE: u64 = AF | SH_INNER | ATTR_IDX_DEVICE | AP_EL1_RW | PXN | UXN;
     const FLUSH_NEW: bool = true;
 
-    fn swapper_phys() -> u64 {
-        super::kmap::swapper_phys()
-    }
-
     fn pte_present(e: u64) -> bool {
         PageTableEntry(e).is_valid()
     }

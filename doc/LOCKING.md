@@ -1684,8 +1684,9 @@ reschedule (`resched_curr` after queueing a task on its run queue,
 
 #### Kernel Page Tables (kernel half)
 
-**Location:** `arch/x86_64/kmap.rs`, `arch/aarch64/kmap.rs`,
-`mm/ioremap.rs` (entry encoding: `arch/*/ioremap.rs`);
+**Location:** `mm/swapper.rs` (top-level table, boot helpers),
+`arch/x86_64/kmap.rs`, `arch/aarch64/kmap.rs` (layout), `mm/ioremap.rs`
+(entry encoding: `arch/*/ioremap.rs`, `arch/*/kmap.rs`);
 layout in `doc/MEMORY.md`
 
 - The kernel half (direct map of RAM, kernel image, vmalloc/ioremap

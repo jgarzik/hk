@@ -392,24 +392,16 @@ impl MemoryLayoutOps for X86_64Arch {
             }
         });
         // Frames are used through the direct map
-        let end = kmap::direct_end();
+        let end = crate::mm::swapper::direct_end();
         let mut mb = memblock::MEMBLOCK.lock();
         mb.remove(end, u64::MAX);
         mb.set_limit(end);
         // The first 1MB: BIOS data, EBDA, the AP trampoline (Linux
         // reserves it all, arch/x86/realmode)
         mb.reserve(0, 1 << 20);
-        let (start, end) = kmap::image_range();
+        let (start, end) = crate::mm::swapper::image_range();
         mb.reserve(start, end - start);
         crate::arch::x86_64::multiboot2::boot_ranges(|_, s, e| mb.reserve(s, e.saturating_sub(s)));
-    }
-
-    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
-        unsafe { kmap::map_page(va, pa, table) }
-    }
-
-    unsafe fn map_kernel_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
-        unsafe { kmap::map_pmd(va, pa, table) }
     }
 }
 

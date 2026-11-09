@@ -604,8 +604,8 @@ impl MemoryLayoutOps for Aarch64Arch {
         // RAM was added by `kmap::init` (it linear-maps every range)
         let dtb = dtb::boot_phys();
         let mut mb = crate::mm::memblock::MEMBLOCK.lock();
-        mb.set_limit(kmap::direct_end());
-        let (start, end) = kmap::image_range();
+        mb.set_limit(crate::mm::swapper::direct_end());
+        let (start, end) = crate::mm::swapper::image_range();
         mb.reserve(start, end - start);
         if let Some(n) = dtb::total_size() {
             mb.reserve(dtb, n as u64);
@@ -614,14 +614,6 @@ impl MemoryLayoutOps for Aarch64Arch {
             mb.reserve(i.start, i.end.saturating_sub(i.start));
         }
         dtb::for_each_firmware_reserved(|base, size| mb.reserve(base, size));
-    }
-
-    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
-        unsafe { kmap::map_page(va, pa, table) }
-    }
-
-    unsafe fn map_kernel_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
-        unsafe { kmap::map_pmd(va, pa, table) }
     }
 }
 

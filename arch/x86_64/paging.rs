@@ -646,7 +646,7 @@ impl X86_64PageTable {
     /// The kernel page table's (swapper's) root: kernel threads run on
     /// it. Only its address: a value of this type could map into it
     pub fn kernel_root() -> u64 {
-        super::kmap::swapper_phys()
+        crate::mm::swapper::swapper_phys()
     }
 
     /// Create a new user page table (allocates PML4)
@@ -778,7 +778,7 @@ impl X86_64PageTable {
         // (type invariant), reached through the direct map; the kernel
         // half is only read from the swapper
         unsafe {
-            let kernel_pml4 = phys_to_virt_table_const(super::kmap::swapper_phys());
+            let kernel_pml4 = phys_to_virt_table_const(crate::mm::swapper::swapper_phys());
             let pml4 = phys_to_virt_table(self.pml4_phys);
             for i in KERNEL_PML4_START..ENTRIES_PER_TABLE {
                 (*pml4).entries[i] = (*kernel_pml4).entries[i];

@@ -18,6 +18,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::paging::{VMALLOC_START, phys_to_virt};
 use crate::arch::{CurrentArch, IoremapOps};
+use crate::mm::swapper::swapper_phys;
 use crate::mm::tlb::flush_tlb_kernel_range;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
@@ -334,7 +335,7 @@ fn idx(va: u64, shift: u32) -> usize {
 unsafe fn map_page(va: u64, pa: u64, prot: u64) -> Result<(), KernelError> {
     let _tables = KTABLES.lock();
     // SAFETY: the swapper root, live forever
-    let top = unsafe { entry(CurrentArch::swapper_phys(), idx(va, 39)) }.load(Ordering::Acquire);
+    let top = unsafe { entry(swapper_phys(), idx(va, 39)) }.load(Ordering::Acquire);
     // The window's top-level entry exists from boot (kmap::init)
     assert!(CurrentArch::pte_is_table(top), "ioremap: no vmalloc table");
     let mut t = CurrentArch::pte_addr(top);
@@ -381,7 +382,7 @@ unsafe fn table(e: &AtomicU64) -> Result<u64, KernelError> {
 /// `va` is a page of a vmalloc-window range the caller holds alone,
 /// which nothing uses any more.
 unsafe fn unmap_page(va: u64) -> Option<u64> {
-    let mut t = CurrentArch::swapper_phys();
+    let mut t = swapper_phys();
     for shift in [39, 30, 21] {
         // SAFETY: the swapper root or a kernel table under it, never
         // freed; read atomically (KTABLES not needed: an upper entry is

@@ -48,6 +48,7 @@ pub mod slab;
 pub mod swap;
 pub mod swap_entry;
 pub mod swap_state;
+pub mod swapper;
 pub mod syscall;
 pub mod tlb;
 pub mod vma;

@@ -567,8 +567,6 @@ pub trait IoremapOps {
     /// A new ioremap mapping is flushed from every CPU before use
     const FLUSH_NEW: bool;
 
-    /// Physical address of the swapper's top-level table
-    fn swapper_phys() -> u64;
     /// The entry is valid (a table, a huge/block entry or a page)
     fn pte_present(e: u64) -> bool;
     /// The upper entry points to a next-level table
@@ -590,6 +588,20 @@ pub trait IoremapOps {
     fn in_io_window(_va: u64) -> bool {
         false
     }
+}
+
+/// Boot page-table primitives behind `mm::swapper`, with which each
+/// arch's `kmap::init` (Linux paging_init) builds the kernel half
+pub trait KmapOps: IoremapOps {
+    /// Kernel image virtual minus physical address (`pa_symbol`)
+    const KIMAGE_OFFSET: u64;
+    /// Page-table pages in the static boot pool
+    const POOL_PAGES: usize;
+    /// A 2MB leaf entry mapping `pa` with `prot`
+    fn mk_pmd(pa: u64, prot: u64) -> u64;
+    /// Make kernel table writes visible to the walker before the first
+    /// access (arm64 `dsb ishst; isb`)
+    fn kmap_sync() {}
 }
 
 // ============================================================================
@@ -781,21 +793,6 @@ pub trait MemoryLayoutOps {
     /// (kernel image, boot modules, DTB, initrd, firmware-reserved
     /// ranges)
     fn memblock_init();
-
-    /// Map the kernel page `va` to RAM at `pa` (writable, never
-    /// executable; the vmemmap); missing tables come from `table`, the
-    /// physical address of a zeroed frame
-    ///
-    /// # Safety
-    /// Boot CPU, before SMP; `va` is unmapped and not in use.
-    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64);
-
-    /// Map the 2MB of kernel addresses at `va` to RAM at `pa` (both 2MB
-    /// aligned) with one block entry, otherwise as `map_kernel_page`
-    ///
-    /// # Safety
-    /// As for `map_kernel_page`; no table exists for the 2MB at `va`.
-    unsafe fn map_kernel_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64);
 }
 
 /// Exception and interrupt controller initialization

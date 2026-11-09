@@ -17,10 +17,6 @@ impl IoremapOps for X86_64Arch {
     /// x86 caches no not-present entry
     const FLUSH_NEW: bool = false;
 
-    fn swapper_phys() -> u64 {
-        super::kmap::swapper_phys()
-    }
-
     fn pte_present(e: u64) -> bool {
         e & PAGE_PRESENT != 0
     }
