@@ -30,6 +30,8 @@
 //!   RET X, a load of an unstored M[] slot, a jump past the end)
 //! - SECCOMP_PATH_ENOMEM: 4096-instruction filters stack 7 deep; the
 //!   8th passes MAX_INSNS_PER_PATH and is ENOMEM
+//! - SECCOMP_ACTION_AVAIL: GET_ACTION_AVAIL reads a u32 through its
+//!   pointer; STRICT with args is EINVAL
 
 use crate::harness::fail_num;
 use crate::helpers::{print, println};
@@ -152,6 +154,48 @@ pub fn run_tests() {
     scratch();
     rejects();
     path_enomem();
+    action_avail();
+}
+
+/// SECCOMP_GET_ACTION_AVAIL reads the action from the user pointer
+/// (EFAULT), knows the actions Linux knows (EOPNOTSUPP else) and takes
+/// no flags; SECCOMP_SET_MODE_STRICT takes no args (Linux do_seccomp)
+fn action_avail() {
+    const GET_ACTION_AVAIL: u32 = 2;
+    const EINVAL: i64 = -22;
+    const EFAULT: i64 = -14;
+    const EOPNOTSUPP: i64 = -95;
+    let mut t = crate::harness::T::new(b"SECCOMP_ACTION_AVAIL");
+    let avail = |a: &u32, flags: u32| sys_seccomp(GET_ACTION_AVAIL, flags, a as *const u32 as u64);
+    for a in [
+        RET_KILL_PROCESS,
+        RET_KILL_THREAD,
+        RET_TRAP,
+        RET_ERRNO,
+        RET_TRACE,
+        RET_ALLOW,
+    ] {
+        t.eq(b"known", avail(&a, 0), 0);
+    }
+    t.eq(b"log", avail(&0x7ffc_0000, 0), 0);
+    t.eq(b"user notif", avail(&0x7fc0_0000, 0), 0);
+    t.eq(b"unknown", avail(&0x1234_5678, 0), EOPNOTSUPP);
+    t.eq(b"flags", avail(&RET_ALLOW, 1), EINVAL);
+    let bad = usize::MAX & !0xfff;
+    t.eq(
+        b"fault",
+        sys_seccomp(GET_ACTION_AVAIL, 0, bad as u64),
+        EFAULT,
+    );
+    let st = child(|| {
+        if sys_seccomp(SECCOMP_SET_MODE_STRICT, 0, 8) == EINVAL {
+            0
+        } else {
+            1
+        }
+    });
+    t.eq(b"strict args", i64::from(st), 0);
+    t.done();
 }
 
 fn errno() {
