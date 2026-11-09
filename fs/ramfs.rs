@@ -83,10 +83,15 @@ fn read_err(e: KernelError) -> KernelError {
 pub static RAMFS_AOPS: RamfsAops = RamfsAops;
 
 /// A new regular file's mapping: ramfs operations, never evicted (the
-/// cache is the only copy; Linux ramfs mapping_set_unevictable)
-fn file_mapping(inode: &Inode) {
+/// cache is the only copy; Linux ramfs mapping_set_unevictable and
+/// tmpfs, which has no swap here)
+fn file_mapping(sb: &SuperBlock, inode: &Inode) {
     inode.i_data.set_aops(&RAMFS_AOPS);
     inode.i_data.set_flags(filemap::AS_UNEVICTABLE);
+    // tmpfs charges its pages (Linux shmem_inode_acct_blocks)
+    if let Some(a) = super::tmpfs::with(sb, |t| t.page_acct()) {
+        inode.i_data.set_acct(a);
+    }
 }
 
 /// Get current timestamp for new inodes
@@ -356,9 +361,47 @@ impl RamfsSbData {
 /// The xattr space of `inode`'s file system (None: not counted)
 fn xattr_pool(inode: &Inode) -> Option<Arc<AtomicU64>> {
     let sb = inode.superblock()?;
+    if let Some(p) = super::tmpfs::with(&sb, |t| t.xattr_pool()) {
+        return p;
+    }
     let private = sb.get_private()?;
     let d = private.as_ref().as_any().downcast_ref::<RamfsSbData>()?;
     Some(d.xattr_space.clone())
+}
+
+/// Take one of the file system's inodes (tmpfs: ENOSPC when none is
+/// left, Linux shmem_reserve_inode; ramfs counts none)
+fn reserve_inode(sb: &SuperBlock) -> Result<(), KernelError> {
+    super::tmpfs::with(sb, |t| t.reserve_inode()).unwrap_or(Ok(()))
+}
+
+/// Give one back (Linux shmem_free_inode)
+fn free_inode(sb: &SuperBlock) {
+    super::tmpfs::with(sb, |t| t.free_inode());
+}
+
+/// One name of `inode` goes (Linux shmem_unlink): on tmpfs a name
+/// beyond the first gives back the inode it took
+fn drop_link(inode: &Inode) {
+    if inode.get_nlink() > 1
+        && !inode.mode().is_dir()
+        && let Some(sb) = inode.superblock()
+    {
+        free_inode(&sb);
+    }
+    inode.dec_nlink();
+}
+
+/// fallocate's allocation on tmpfs (Linux shmem_fallocate), the file
+/// system's block limit `max` (0: none): the pages of [start, end),
+/// ENOSPC at once if more than the whole limit
+fn shmem_falloc(inode: &Inode, start: u64, end: u64, max: u64) -> Result<(), KernelError> {
+    let ps = filemap::PAGE_SIZE as u64;
+    let aligned = end.checked_add(ps - 1).ok_or(KernelError::FileTooLarge)?;
+    if max != 0 && aligned / ps - start / ps > max {
+        return Err(KernelError::NoSpace);
+    }
+    filemap::falloc_range(inode, start, end)
 }
 
 impl SuperBlockData for RamfsSbData {}
@@ -433,7 +476,7 @@ impl RamfsInodeOps {
                         return Err(KernelError::DirectoryNotEmpty);
                     }
                 }
-                old_target.dec_nlink();
+                drop_link(&old_target);
             }
 
             // Insert at new location
@@ -462,43 +505,9 @@ impl InodeOps for RamfsInodeOps {
     }
 
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        let private = dir.get_private().ok_or(KernelError::Io)?;
-        let dir_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        // Check if already exists
-        if dir_data.children.read().contains_key(name) {
-            return Err(KernelError::AlreadyExists);
-        }
-
         // Owner from the caller's fs ids (inode_init_owner)
-        let ino = sb.alloc_ino();
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-
-        let new_inode = try_arc(Inode::new(
-            ino,
-            mode,
-            uid,
-            gid,
-            0,
-            current_time(),
-            Arc::downgrade(&sb),
-            &RAMFS_INODE_OPS,
-        ))?;
-        new_inode.set_private(try_arc(RamfsInodeData::new_file())?);
-        file_mapping(&new_inode);
-
-        // Add to directory
-        dir_data
-            .children
-            .write()
-            .insert(FileName::from(name), new_inode.clone());
-
-        Ok(new_inode)
+        add_new(dir, name, Kind::File, mode, uid, gid, current_time())
     }
 
     fn mknod(
@@ -508,73 +517,25 @@ impl InodeOps for RamfsInodeOps {
         mode: InodeMode,
         rdev: DevId,
     ) -> Result<Arc<Inode>, KernelError> {
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        let private = dir.get_private().ok_or(KernelError::Io)?;
-        let dir_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-        if dir_data.children.read().contains_key(name) {
-            return Err(KernelError::AlreadyExists);
-        }
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-        let inode = try_arc(Inode::new_device(
-            sb.alloc_ino(),
-            mode,
-            uid,
-            gid,
-            rdev,
-            current_time(),
-            Arc::downgrade(&sb),
-            &RAMFS_INODE_OPS,
-        ))?;
-        dir_data
-            .children
-            .write()
-            .insert(FileName::from(name), inode.clone());
-        Ok(inode)
+        add_new(dir, name, Kind::Dev(rdev), mode, uid, gid, current_time())
     }
 
     fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        let private = dir.get_private().ok_or(KernelError::Io)?;
-        let dir_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        // Check if already exists
-        if dir_data.children.read().contains_key(name) {
-            return Err(KernelError::AlreadyExists);
-        }
-
-        // Owner from the caller's fs ids (inode_init_owner)
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-        let new_inode = try_arc(Inode::new(
-            sb.alloc_ino(),
-            mode,
-            uid,
-            gid,
-            0,
-            current_time(),
-            Arc::downgrade(&sb),
-            &RAMFS_INODE_OPS,
-        ))?;
-        new_inode.set_private(try_arc(RamfsInodeData::new_dir())?);
-
-        // Add to parent directory
-        dir_data
-            .children
-            .write()
-            .insert(FileName::from(name), new_inode.clone());
-
-        Ok(new_inode)
+        add_new(dir, name, Kind::Dir, mode, uid, gid, current_time())
     }
 
     fn maps_cache(&self) -> bool {
         true
+    }
+
+    /// tmpfs gets the inode back (Linux shmem_evict_inode ->
+    /// shmem_free_inode); a superblock already gone counts nothing
+    fn evict_inode(&self, inode: &Inode) {
+        if let Some(sb) = inode.superblock() {
+            free_inode(&sb);
+        }
     }
 
     fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {
@@ -599,44 +560,10 @@ impl InodeOps for RamfsInodeOps {
     }
 
     fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<Arc<Inode>, KernelError> {
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        let private = dir.get_private().ok_or(KernelError::Io)?;
-        let dir_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        // Check if already exists
-        if dir_data.children.read().contains_key(name) {
-            return Err(KernelError::AlreadyExists);
-        }
-
-        // Create symlink inode (mode = S_IFLNK | 0777)
+        // S_IFLNK | 0777, the target inline (not in the page cache)
         let (uid, gid, mode) = super::dac::init_owner(dir, InodeMode::symlink());
-        let new_inode = try_arc(Inode::new(
-            sb.alloc_ino(),
-            mode,
-            uid,
-            gid,
-            target.len() as u64, // size = target length
-            current_time(),
-            Arc::downgrade(&sb),
-            &RAMFS_INODE_OPS,
-        ))?;
-
-        // Store target inline (not in page cache)
-        new_inode.set_private(try_arc(RamfsInodeData::new_symlink(FileName::from(
-            target,
-        )))?);
-
-        // Add to directory
-        dir_data
-            .children
-            .write()
-            .insert(FileName::from(name), new_inode.clone());
-
-        Ok(new_inode)
+        let kind = Kind::Symlink(FileName::from(target));
+        add_new(dir, name, kind, mode, uid, gid, current_time())
     }
 
     fn link(&self, dir: &Inode, name: &[u8], target_inode: &Arc<Inode>) -> Result<(), KernelError> {
@@ -657,7 +584,11 @@ impl InodeOps for RamfsInodeOps {
             return Err(KernelError::AlreadyExists);
         }
 
-        // Increment link count on target
+        // tmpfs counts each extra name as an inode (Linux shmem_link:
+        // tmpfs dentries pin memory until unlinked)
+        if let Some(sb) = dir.superblock() {
+            reserve_inode(&sb)?;
+        }
         target_inode.inc_nlink();
 
         // Add new directory entry pointing to existing inode
@@ -677,10 +608,11 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    /// As Linux shmem_fallocate (hk's ramfs stands in for tmpfs, the
-    /// Linux rootfs): allocate, KEEP_SIZE and PUNCH_HOLE only; the cache
-    /// is the only copy, so a hole reads back as zeroes. On success the
-    /// file counts as modified (Linux file_modified).
+    /// As Linux shmem_fallocate: allocate, KEEP_SIZE and PUNCH_HOLE
+    /// only; the cache is the only copy, so a hole reads back as zeroes.
+    /// tmpfs allocates (and charges) the pages; ramfs, which stands in
+    /// for it as the rootfs, only sets the size. On success the file
+    /// counts as modified (Linux file_modified).
     fn fallocate(
         &self,
         inode: &Arc<Inode>,
@@ -699,6 +631,12 @@ impl InodeOps for RamfsInodeOps {
             filemap::punch_range(inode, offset, end.min(inode.get_size()));
         } else {
             inode.newsize_ok(end)?;
+            if let Some(blocks) = inode
+                .superblock()
+                .and_then(|sb| super::tmpfs::max_blocks(&sb))
+            {
+                shmem_falloc(inode, offset, end, blocks)?;
+            }
             if mode & FALLOC_FL_KEEP_SIZE == 0 && end > inode.get_size() {
                 inode.set_size(end);
             }
@@ -724,10 +662,8 @@ impl InodeOps for RamfsInodeOps {
             children.remove(name).ok_or(KernelError::NotFound)?
         };
 
-        // Decrement link count
-        // Note: actual file deletion happens when Arc refcount reaches 0
-        // and nlink is 0 (handled automatically by Arc drop)
-        removed_inode.dec_nlink();
+        // The inode goes with its last reference (Arc drop)
+        drop_link(&removed_inode);
 
         Ok(())
     }
@@ -820,7 +756,7 @@ impl InodeOps for RamfsInodeOps {
                             return Err(KernelError::DirectoryNotEmpty);
                         }
                     }
-                    old_target.dec_nlink();
+                    drop_link(&old_target);
                 }
 
                 // Insert at new name
@@ -1022,8 +958,10 @@ impl InodeOps for RamfsInodeOps {
 /// Static ramfs inode ops
 pub static RAMFS_INODE_OPS: RamfsInodeOps = RamfsInodeOps;
 
-/// Ramfs file operations
-pub struct RamfsFileOps;
+/// Ramfs file operations; tmpfs's read a hole without caching a page
+pub struct RamfsFileOps {
+    holes: bool,
+}
 
 impl FileOps for RamfsFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -1044,7 +982,8 @@ impl FileOps for RamfsFileOps {
         }
     }
 
-    /// Straight from the page cache (Linux filemap_read). No RWF_NOWAIT
+    /// Straight from the page cache (Linux filemap_read; tmpfs
+    /// shmem_file_read_iter). No RWF_NOWAIT
     /// (EOPNOTSUPP): like Linux ramfs/tmpfs, no FMODE_NOWAIT.
     fn read_iter(
         &self,
@@ -1058,7 +997,12 @@ impl FileOps for RamfsFileOps {
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let pos = at.unwrap_or_else(|| file.get_pos());
-        let n = filemap::read_iter(&inode, to, pos).map_err(read_err)?;
+        let n = if self.holes {
+            filemap::read_iter_holes(&inode, to, pos)
+        } else {
+            filemap::read_iter(&inode, to, pos)
+        }
+        .map_err(read_err)?;
         if at.is_none() {
             file.advance_pos(n as u64);
         }
@@ -1135,13 +1079,17 @@ fn dot(name: &[u8], ino: u64) -> DirEntry {
 }
 
 /// Static ramfs file ops
-pub static RAMFS_FILE_OPS: RamfsFileOps = RamfsFileOps;
+pub static RAMFS_FILE_OPS: RamfsFileOps = RamfsFileOps { holes: false };
+
+/// tmpfs file ops (Linux shmem_file_operations: shmem_file_read_iter
+/// reads a hole as zeros)
+pub static TMPFS_FILE_OPS: RamfsFileOps = RamfsFileOps { holes: true };
 
 /// Ramfs superblock operations
 pub struct RamfsSuperOps;
 
 impl SuperOps for RamfsSuperOps {
-    fn statfs(&self) -> StatFs {
+    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
         StatFs {
             f_type: RAMFS_MAGIC,
             f_bsize: 4096,
@@ -1154,33 +1102,9 @@ impl SuperOps for RamfsSuperOps {
         &self,
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
-        i_op: &'static dyn InodeOps,
+        _i_op: &'static dyn InodeOps,
     ) -> Result<Arc<Inode>, KernelError> {
-        let ino = sb.alloc_ino();
-
-        let inode = try_arc(Inode::new(
-            ino,
-            mode,
-            0, // uid: default to root
-            0, // gid: default to root
-            0,
-            current_time(),
-            Arc::downgrade(sb),
-            i_op,
-        ))?;
-
-        // Set up private data based on file type
-        if mode.is_dir() {
-            inode.set_private(try_arc(RamfsInodeData::new_dir())?);
-        } else if mode.is_symlink() {
-            // Symlinks need to be set up with a target later
-            inode.set_private(try_arc(RamfsInodeData::new_symlink(FileName::default()))?);
-        } else {
-            inode.set_private(try_arc(RamfsInodeData::new_file())?);
-            file_mapping(&inode);
-        }
-
-        Ok(inode)
+        new_inode(sb, Kind::of(mode), mode, 0, 0, current_time())
     }
 }
 
@@ -1193,30 +1117,30 @@ pub(crate) fn ramfs_mount(
     opts: &[u8],
 ) -> Result<Arc<SuperBlock>, KernelError> {
     let mode = root_mode(opts)?;
-    // Create superblock
     let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0)?;
     sb.set_private(try_arc(RamfsSbData::new()?)?);
-
-    // Create root inode (directory)
-    let root_inode = try_arc(Inode::new(
-        sb.alloc_ino(),
-        InodeMode::directory(mode),
-        0, // uid: root
-        0, // gid: root
-        0,
-        current_time(),
-        Arc::downgrade(&sb),
-        &RAMFS_INODE_OPS,
-    ))?;
-    root_inode.set_private(try_arc(RamfsInodeData::new_dir())?);
-
-    // Create root dentry
-    let root_dentry = try_arc(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
-
-    // Set root in superblock
-    sb.set_root(root_dentry);
-
+    fill_root(&sb, mode, 0, 0)?;
     Ok(sb)
+}
+
+/// Give a new superblock its root directory (Linux ramfs_fill_super,
+/// shmem_fill_super: d_make_root of a new directory inode)
+pub(crate) fn fill_root(
+    sb: &Arc<SuperBlock>,
+    mode: u16,
+    uid: Uid,
+    gid: Gid,
+) -> Result<(), KernelError> {
+    let inode = new_inode(
+        sb,
+        Kind::Dir,
+        InodeMode::directory(mode),
+        uid,
+        gid,
+        current_time(),
+    )?;
+    sb.set_root(try_arc(Dentry::new_root(inode, Arc::downgrade(sb)))?);
+    Ok(())
 }
 
 /// Ramfs filesystem type
@@ -1243,53 +1167,117 @@ pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
 
 use super::inode::{Gid, Uid};
 
-/// Create a directory in ramfs with ownership
-pub fn ramfs_create_dir_with_owner(
-    parent: &Arc<Dentry>,
-    name: &[u8],
+/// What a new ramfs inode is
+enum Kind {
+    File,
+    Dir,
+    /// The target, stored inline
+    Symlink(FileName),
+    /// A device, FIFO or socket node
+    Dev(DevId),
+}
+
+impl Kind {
+    /// The kind of an inode of `mode` (no symlink target yet)
+    fn of(mode: InodeMode) -> Self {
+        if mode.is_dir() {
+            Self::Dir
+        } else if mode.is_symlink() {
+            Self::Symlink(FileName::default())
+        } else if mode.is_file() {
+            Self::File
+        } else {
+            Self::Dev(DevId::null())
+        }
+    }
+}
+
+/// A new inode of `sb` (Linux ramfs_get_inode, shmem_get_inode): on
+/// tmpfs one of its inodes is taken first (ENOSPC), given back when the
+/// inode goes (`evict_inode`)
+fn new_inode(
+    sb: &Arc<SuperBlock>,
+    kind: Kind,
     mode: InodeMode,
     uid: Uid,
     gid: Gid,
-) -> Result<Arc<Dentry>, KernelError> {
-    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
+    time: Timespec,
+) -> Result<Arc<Inode>, KernelError> {
+    reserve_inode(sb)?;
+    let (ino, w) = (sb.alloc_ino(), Arc::downgrade(sb));
+    let ops = &RAMFS_INODE_OPS;
+    let inode = match &kind {
+        Kind::Dev(rdev) => try_arc(Inode::new_device(ino, mode, uid, gid, *rdev, time, w, ops)),
+        Kind::Symlink(t) => try_arc(Inode::new(
+            ino,
+            mode,
+            uid,
+            gid,
+            t.len() as u64,
+            time,
+            w,
+            ops,
+        )),
+        _ => try_arc(Inode::new(ino, mode, uid, gid, 0, time, w, ops)),
+    }
+    .inspect_err(|_| free_inode(sb))?;
+    // From here the inode's drop gives the reservation back
+    match kind {
+        Kind::File => {
+            inode.set_private(try_arc(RamfsInodeData::new_file())?);
+            file_mapping(sb, &inode);
+        }
+        Kind::Dir => inode.set_private(try_arc(RamfsInodeData::new_dir())?),
+        Kind::Symlink(t) => inode.set_private(try_arc(RamfsInodeData::new_symlink(t))?),
+        // Devices use the block or char layer, no ramfs data
+        Kind::Dev(_) => {}
+    }
+    Ok(inode)
+}
 
-    // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
-    let parent_data = private
+/// Make a new inode and enter it in `dir` as `name` (EEXIST if taken):
+/// the common part of create, mkdir, mknod, symlink. The caller holds
+/// `dir`'s i_rwsem (or owns a directory nobody else sees yet).
+fn add_new(
+    dir: &Inode,
+    name: &[u8],
+    kind: Kind,
+    mode: InodeMode,
+    uid: Uid,
+    gid: Gid,
+    time: Timespec,
+) -> Result<Arc<Inode>, KernelError> {
+    let sb = dir.superblock().ok_or(KernelError::Io)?;
+    let private = dir.get_private().ok_or(KernelError::Io)?;
+    let dir_data = private
         .as_ref()
         .as_any()
         .downcast_ref::<RamfsInodeData>()
         .ok_or(KernelError::Io)?;
-
-    // Check if already exists
-    if parent_data.children.read().contains_key(name) {
+    if dir_data.children.read().contains_key(name) {
         return Err(KernelError::AlreadyExists);
     }
-
-    // Create new directory inode
-    let new_inode = try_arc(Inode::new(
-        sb.alloc_ino(),
-        mode,
-        uid,
-        gid,
-        0,
-        current_time(),
-        Arc::downgrade(&sb),
-        &RAMFS_INODE_OPS,
-    ))?;
-    new_inode.set_private(try_arc(RamfsInodeData::new_dir())?);
-
-    // Add to parent directory
-    parent_data
+    let inode = new_inode(&sb, kind, mode, uid, gid, time)?;
+    dir_data
         .children
         .write()
-        .insert(FileName::from(name), new_inode.clone());
+        .insert(FileName::from(name), inode.clone());
+    Ok(inode)
+}
 
-    // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
-
-    Ok(new_dentry)
+/// `add_new` under the dentry `parent`, with the new child's dentry
+fn add_dentry(
+    parent: &Arc<Dentry>,
+    name: &[u8],
+    kind: Kind,
+    mode: InodeMode,
+    uid: Uid,
+    gid: Gid,
+    time: Timespec,
+) -> Result<Arc<Dentry>, KernelError> {
+    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
+    let inode = add_new(&dir, name, kind, mode, uid, gid, time)?;
+    Dentry::alloc(parent, name, Some(inode))
 }
 
 /// The root's mode from ramfs options (Linux ramfs_parse_param):
@@ -1318,7 +1306,8 @@ pub(crate) fn parse_octal(v: &[u8]) -> Option<u16> {
 
 /// Create a directory in ramfs with default ownership (root:root, mode 0755)
 pub fn ramfs_create_dir(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
-    ramfs_create_dir_with_owner(parent, name, InodeMode::directory(0o755), 0, 0)
+    let mode = InodeMode::directory(0o755);
+    add_dentry(parent, name, Kind::Dir, mode, 0, 0, current_time())
 }
 
 /// Create a file in ramfs with initial content, ownership, and explicit timestamp
@@ -1331,49 +1320,26 @@ pub fn ramfs_create_file_with_timestamp(
     gid: Gid,
     mtime: Timespec,
 ) -> Result<Arc<Dentry>, KernelError> {
-    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
-
-    // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
-    let parent_data = private
+    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
+    let private = dir.get_private().ok_or(KernelError::Io)?;
+    let dir_data = private
         .as_ref()
         .as_any()
         .downcast_ref::<RamfsInodeData>()
         .ok_or(KernelError::Io)?;
-
-    // Check if already exists
-    if parent_data.children.read().contains_key(name) {
+    if dir_data.children.read().contains_key(name) {
         return Err(KernelError::AlreadyExists);
     }
-
-    // Create new file inode with content and explicit timestamp
-    let ino = sb.alloc_ino();
-
-    let new_inode = try_arc(Inode::new(
-        ino,
-        mode,
-        uid,
-        gid,
-        content.len() as u64,
-        mtime,
-        Arc::downgrade(&sb),
-        &RAMFS_INODE_OPS,
-    ))?;
-    new_inode.set_private(try_arc(RamfsInodeData::new_file())?);
-    file_mapping(&new_inode);
-    fill_pages(&new_inode, content)?;
-
-    // Add to parent directory
-    parent_data
+    // Filled before it is entered: a failure leaves no partial file
+    let sb = dir.superblock().ok_or(KernelError::Io)?;
+    let inode = new_inode(&sb, Kind::File, mode, uid, gid, mtime)?;
+    fill_pages(&inode, content)?;
+    inode.set_size(content.len() as u64);
+    dir_data
         .children
         .write()
-        .insert(FileName::from(name), new_inode.clone());
-
-    // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
-
-    Ok(new_dentry)
+        .insert(FileName::from(name), inode.clone());
+    Dentry::alloc(parent, name, Some(inode))
 }
 
 /// Write `content` at offset 0 of a ramfs file's pages
@@ -1411,45 +1377,7 @@ pub fn ramfs_create_dir_with_timestamp(
     gid: Gid,
     mtime: Timespec,
 ) -> Result<Arc<Dentry>, KernelError> {
-    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
-
-    // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
-    let parent_data = private
-        .as_ref()
-        .as_any()
-        .downcast_ref::<RamfsInodeData>()
-        .ok_or(KernelError::Io)?;
-
-    // Check if already exists
-    if parent_data.children.read().contains_key(name) {
-        return Err(KernelError::AlreadyExists);
-    }
-
-    // Create new directory inode with explicit timestamp
-    let new_inode = try_arc(Inode::new(
-        sb.alloc_ino(),
-        mode,
-        uid,
-        gid,
-        0,
-        mtime,
-        Arc::downgrade(&sb),
-        &RAMFS_INODE_OPS,
-    ))?;
-    new_inode.set_private(try_arc(RamfsInodeData::new_dir())?);
-
-    // Add to parent directory
-    parent_data
-        .children
-        .write()
-        .insert(FileName::from(name), new_inode.clone());
-
-    // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
-
-    Ok(new_dentry)
+    add_dentry(parent, name, Kind::Dir, mode, uid, gid, mtime)
 }
 
 /// Create nested directory path in ramfs with specified ownership and timestamp.
@@ -1495,165 +1423,30 @@ pub fn ramfs_create_symlink_with_timestamp(
     gid: Gid,
     mtime: Timespec,
 ) -> Result<Arc<Dentry>, KernelError> {
-    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
-
-    // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
-    let parent_data = private
-        .as_ref()
-        .as_any()
-        .downcast_ref::<RamfsInodeData>()
-        .ok_or(KernelError::Io)?;
-
-    // Check if already exists
-    if parent_data.children.read().contains_key(name) {
-        return Err(KernelError::AlreadyExists);
-    }
-
-    // Create symlink inode (mode = S_IFLNK | 0777)
-    let new_inode = try_arc(Inode::new(
-        sb.alloc_ino(),
-        InodeMode::symlink(),
-        uid,
-        gid,
-        target.len() as u64, // size = target length
-        mtime,
-        Arc::downgrade(&sb),
-        &RAMFS_INODE_OPS,
-    ))?;
-
-    // Store target inline (not in page cache)
-    new_inode.set_private(try_arc(RamfsInodeData::new_symlink(FileName::from(
-        target,
-    )))?);
-
-    // Add to parent directory
-    parent_data
-        .children
-        .write()
-        .insert(FileName::from(name), new_inode.clone());
-
-    // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
-
-    Ok(new_dentry)
+    let kind = Kind::Symlink(FileName::from(target));
+    add_dentry(parent, name, kind, InodeMode::symlink(), uid, gid, mtime)
 }
 
-/// Create a block device node in ramfs
-///
-/// Creates a block device special file in the given parent directory.
-///
-/// # Arguments
-/// * `parent` - Parent directory dentry
-/// * `name` - Name of the device node
-/// * `rdev` - Device ID (major/minor)
-/// * `mode` - Permission bits (e.g., 0o660)
-///
-/// # Returns
-/// The dentry of the created block device node on success.
+/// Create the block device node `name` (device `rdev`, permissions
+/// `mode`, owned by root) in `parent`
 pub fn ramfs_create_blkdev(
     parent: &Arc<Dentry>,
     name: &[u8],
     rdev: DevId,
     mode: u16,
 ) -> Result<Arc<Dentry>, KernelError> {
-    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
-
-    // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
-    let parent_data = private
-        .as_ref()
-        .as_any()
-        .downcast_ref::<RamfsInodeData>()
-        .ok_or(KernelError::Io)?;
-
-    // Check if already exists
-    if parent_data.children.read().contains_key(name) {
-        return Err(KernelError::AlreadyExists);
-    }
-
-    // Create new block device inode
-    let new_inode = try_arc(Inode::new_device(
-        sb.alloc_ino(),
-        InodeMode::blockdev(mode),
-        0, // uid = root
-        0, // gid = root
-        rdev,
-        current_time(),
-        Arc::downgrade(&sb),
-        &RAMFS_INODE_OPS,
-    ))?;
-    // Block devices don't need RamfsInodeData - they use the block layer
-
-    // Add to parent directory
-    parent_data
-        .children
-        .write()
-        .insert(FileName::from(name), new_inode.clone());
-
-    // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
-
-    Ok(new_dentry)
+    let mode = InodeMode::blockdev(mode);
+    add_dentry(parent, name, Kind::Dev(rdev), mode, 0, 0, current_time())
 }
 
-/// Create a character device node in ramfs
-///
-/// Creates a character device special file in the given parent directory.
-///
-/// # Arguments
-/// * `parent` - Parent directory dentry
-/// * `name` - Name of the device node
-/// * `rdev` - Device ID (major/minor)
-/// * `mode` - Permission bits (e.g., 0o666)
-///
-/// # Returns
-/// The dentry of the created character device node on success.
+/// Create the character device node `name` (device `rdev`, permissions
+/// `mode`, owned by root) in `parent`
 pub fn ramfs_create_chrdev(
     parent: &Arc<Dentry>,
     name: &[u8],
     rdev: DevId,
     mode: u16,
 ) -> Result<Arc<Dentry>, KernelError> {
-    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
-
-    // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
-    let parent_data = private
-        .as_ref()
-        .as_any()
-        .downcast_ref::<RamfsInodeData>()
-        .ok_or(KernelError::Io)?;
-
-    // Check if already exists
-    if parent_data.children.read().contains_key(name) {
-        return Err(KernelError::AlreadyExists);
-    }
-
-    // Create new character device inode
-    let new_inode = try_arc(Inode::new_device(
-        sb.alloc_ino(),
-        InodeMode::chardev(mode),
-        0, // uid = root
-        0, // gid = root
-        rdev,
-        current_time(),
-        Arc::downgrade(&sb),
-        &RAMFS_INODE_OPS,
-    ))?;
-    // Character devices don't need RamfsInodeData - they use the chardev layer
-
-    // Add to parent directory
-    parent_data
-        .children
-        .write()
-        .insert(FileName::from(name), new_inode.clone());
-
-    // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
-
-    Ok(new_dentry)
+    let mode = InodeMode::chardev(mode);
+    add_dentry(parent, name, Kind::Dev(rdev), mode, 0, 0, current_time())
 }

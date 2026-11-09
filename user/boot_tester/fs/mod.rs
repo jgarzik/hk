@@ -32,5 +32,6 @@ pub mod pread_special;
 pub mod rename2;
 pub mod splice;
 pub mod sync;
+pub mod tmpfs;
 pub mod vfs;
 pub mod xattr;

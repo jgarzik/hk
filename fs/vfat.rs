@@ -2326,7 +2326,7 @@ pub static VFAT_FILE_OPS: VfatFileOps = VfatFileOps;
 pub struct VfatSuperOps;
 
 impl SuperOps for VfatSuperOps {
-    fn statfs(&self) -> StatFs {
+    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
         // TODO: Could provide actual block counts from VfatSbData if available
         // For now, return minimal valid values
         StatFs {

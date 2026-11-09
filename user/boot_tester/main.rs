@@ -322,6 +322,7 @@ pub fn run_all_tests() {
     fs::attr_race::run_tests();
     process::caps_checks::run_tests();
     fs::mount_race::run_tests();
+    fs::tmpfs::run_tests();
     time::timerfd::run_tests();
     time::posix_timer::run_tests();
     fs::xattr::run_tests();

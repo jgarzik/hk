@@ -34,7 +34,7 @@ pub trait SuperOps: Send + Sync {
     }
 
     /// Get filesystem statistics
-    fn statfs(&self) -> StatFs {
+    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
         StatFs::default()
     }
 
@@ -50,6 +50,24 @@ pub trait SuperOps: Send + Sync {
     fn show_options(&self, sb: &SuperBlock, out: &mut alloc::vec::Vec<u8>) {
         let _ = (sb, out);
     }
+}
+
+/// Linux vfs_parse_sb_flag: generic words every filesystem takes in its
+/// options (their effect comes from mount(2)'s flags)
+pub fn sb_flag_word(w: &[u8]) -> bool {
+    matches!(
+        w,
+        b"ro"
+            | b"rw"
+            | b"sync"
+            | b"async"
+            | b"dirsync"
+            | b"lazytime"
+            | b"nolazytime"
+            | b"mand"
+            | b"nomand"
+            | b"posixacl"
+    )
 }
 
 /// Filesystem statistics (like Linux statfs)
@@ -627,6 +645,7 @@ pub fn find_filesystem(name: &str) -> Option<&'static FileSystemType> {
 /// Should be called during VFS initialization before any mounts.
 pub fn init_fs_registry() {
     register_filesystem(&super::ramfs::RAMFS_TYPE);
+    register_filesystem(&super::tmpfs::TMPFS_TYPE);
     register_filesystem(&super::proc::PROCFS_TYPE);
     register_filesystem(&super::vfat::VFAT_TYPE);
     register_filesystem(&super::cgroupfs::CGROUPFS_TYPE);

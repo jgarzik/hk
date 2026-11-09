@@ -286,7 +286,7 @@ pub fn sys_statfs(path_ptr: UserPtr<u8>, buf: UserPtr<LinuxStatFs>) -> KernelRes
     let sb = path.dentry.superblock().ok_or(KernelError::NotFound)?;
     let st = sb
         .s_op
-        .statfs()
+        .statfs(&sb)
         .to_linux(sb.dev_id, st_flags(path.mnt.flags(), &sb));
     Ok(buf.write(&st)?)
 }
@@ -326,7 +326,7 @@ pub fn sys_fstatfs(fd: i32, buf: UserPtr<LinuxStatFs>) -> KernelResult<()> {
     let sb = file.dentry.superblock().ok_or(KernelError::BadFd)?;
 
     // Get stats
-    let statfs = sb.s_op.statfs();
+    let statfs = sb.s_op.statfs(&sb);
     let linux_statfs = statfs.to_linux(
         sb.dev_id,
         st_flags(file.f_path().map_or(0, |p| p.mnt.flags()), &sb),

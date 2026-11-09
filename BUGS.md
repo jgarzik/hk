@@ -458,9 +458,10 @@ tucks it under); a slave's master is its master's peer group, not one
 mount; copies of a namespace are always peers and not locked (see
 "Before user namespaces grant capabilities"). Mount options are
 parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
-cp437 only), ramfs (mode=) and procfs (hidepid=, gid=, subset=pid);
-devtmpfs and cgroupfs ignore theirs, and only procfs applies options
-on a remount or shows them in /proc/mounts.
+cp437 only), ramfs (mode=), tmpfs (see "tmpfs gaps") and procfs
+(hidepid=, gid=, subset=pid); devtmpfs and cgroupfs ignore theirs, and
+only procfs and tmpfs apply options on a remount or show them in
+/proc/mounts.
 Crossing into a mount scans the current mount's children (Linux hashes
 (parent, mountpoint): mount_hashtable).
 
@@ -561,6 +562,16 @@ One "KERNEL PANIC" from the arm64 `exceptions.rs` kernel instruction
 abort handler, rare across many `make check-arm` runs (QEMU neoverse-n1
 with PAN, -smp 4);
 ELR/FAR were not captured. Next occurrence: capture the Message line.
+
+## tmpfs gaps
+
+**Location**: `fs/tmpfs.rs`, `fs/ramfs.rs`
+
+tmpfs pages never go to swap (the mapping is unevictable, like ramfs;
+Linux swaps them, and noswap is only recorded). huge= takes only
+never, mpol= and the quota options are refused (EINVAL), as on a Linux
+without THP, NUMA or CONFIG_TMPFS_QUOTA. inode32 is recorded and shown
+but inode numbers do not wrap at 2^32 (Linux shmem_reserve_inode).
 
 ## ramfs has no size limit
 

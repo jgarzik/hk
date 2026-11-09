@@ -756,7 +756,7 @@ pub static CGROUPFS_FILE_OPS: CgroupfsFileOps = CgroupfsFileOps;
 pub struct CgroupfsSuperOps;
 
 impl SuperOps for CgroupfsSuperOps {
-    fn statfs(&self) -> StatFs {
+    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
         StatFs {
             f_type: CGROUP2_SUPER_MAGIC,
             f_bsize: 4096,

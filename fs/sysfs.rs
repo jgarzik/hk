@@ -53,7 +53,7 @@ impl SuperOps for SysfsSops {
         Err(KernelError::OperationNotSupported)
     }
 
-    fn statfs(&self) -> StatFs {
+    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
         StatFs {
             f_type: SYSFS_MAGIC,
             f_bsize: 4096,
