@@ -269,7 +269,7 @@ pub fn write_user_gsbase(addr: u64) {
 /// `swapgs`, with interrupts off. It may change the user base, which
 /// the caller sets next.
 pub fn load_user_gs_null() {
-    let irq = crate::arch::local_irq_save();
+    let irq = crate::sync::local_irq_save();
     // SAFETY: interrupts off; the second swapgs restores the kernel GS
     unsafe {
         ::core::arch::asm!(
@@ -280,7 +280,7 @@ pub fn load_user_gs_null() {
             options(nostack, preserves_flags)
         );
     }
-    crate::arch::local_irq_restore(irq);
+    crate::sync::local_irq_restore(irq);
 }
 
 // ============================================================================

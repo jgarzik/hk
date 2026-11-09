@@ -3,7 +3,7 @@
 //! This module provides x86-64 specific register structures and functions
 //! for ptrace operations.
 
-use crate::task::Tid;
+use crate::task::Task;
 use crate::task::percpu::TASKLIST;
 use crate::util::error::{KernelError, KernelResult};
 
@@ -88,12 +88,12 @@ pub type UserRegs = UserRegsStruct;
 ///
 /// The tracee must be in Traced state. This reads its user registers
 /// from its pt_regs (the entry frame at the top of its kernel stack).
-pub fn get_user_regs(tid: Tid) -> KernelResult<UserRegsStruct> {
+pub fn get_user_regs(t: &Task) -> KernelResult<UserRegsStruct> {
     let table = TASKLIST.read();
-    let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+    let task = table.view(t).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
-    if !matches!(task.state, crate::task::TaskState::Traced(_)) {
+    if !matches!(task.state(), crate::task::TaskState::Traced(_)) {
         return Err(KernelError::NoProcess); // not stopped
     }
 
@@ -138,12 +138,12 @@ pub fn get_user_regs(tid: Tid) -> KernelResult<UserRegsStruct> {
 ///
 /// The tracee must be in Traced state. This updates its pt_regs so the
 /// registers take effect when it resumes.
-pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> KernelResult<()> {
+pub fn set_user_regs(t: &Task, regs: &UserRegsStruct) -> KernelResult<()> {
     let table = TASKLIST.read();
-    let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+    let task = table.view(t).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
-    if !matches!(task.state, crate::task::TaskState::Traced(_)) {
+    if !matches!(task.state(), crate::task::TaskState::Traced(_)) {
         return Err(KernelError::NoProcess); // not stopped
     }
 
@@ -216,9 +216,9 @@ const RFLAGS_TF: u64 = 0x100;
 ///
 /// Sets the TF (Trap Flag) in RFLAGS so the CPU generates a debug exception
 /// after executing one instruction.
-pub fn enable_single_step(tid: Tid) {
+pub fn enable_single_step(t: &Task) {
     let table = TASKLIST.read();
-    if let Some(task) = table.get(tid) {
+    if let Some(task) = table.view(t) {
         // SAFETY: as in get_user_regs
         unsafe { (*crate::task::percpu::task_pt_regs(task.task)).rflags |= RFLAGS_TF };
     }
@@ -227,9 +227,9 @@ pub fn enable_single_step(tid: Tid) {
 /// Disable single-step mode for a task.
 ///
 /// Clears the TF (Trap Flag) in RFLAGS.
-pub fn disable_single_step(tid: Tid) {
+pub fn disable_single_step(t: &Task) {
     let table = TASKLIST.read();
-    if let Some(task) = table.get(tid) {
+    if let Some(task) = table.view(t) {
         // SAFETY: as in get_user_regs
         unsafe { (*crate::task::percpu::task_pt_regs(task.task)).rflags &= !RFLAGS_TF };
     }

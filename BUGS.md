@@ -27,7 +27,7 @@ infallible, so each one is investigated, not written off.
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
-There are 56 files with `#![expect(clippy::undocumented_unsafe_blocks)]
+There are 50 files with `#![expect(clippy::undocumented_unsafe_blocks)]
 // TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`). Most of their
 blocks belong in a missing wrapper:
 
@@ -373,6 +373,9 @@ unreachable today.
 There is no mqueue filesystem at all: queues live only in a kernel
 table, so they cannot be listed or read as files under /dev/mqueue
 (Linux mqueue_fs_type).
+mq_notify with SIGEV_THREAD is EINVAL: Linux delivers that notice as
+a message on a netlink socket the caller names (NETLINK_NOTIFY_COOKIE,
+glibc's helper thread), and hk has no such path.
 
 ## sysfs gaps
 
@@ -493,7 +496,7 @@ the internal superblock (d791606bb915), and nothing marks knullfs's
 root as unmountable (e22e69c2ad88: dont_mount). The rootfs is
 always a ramfs; Linux fills it as tmpfs when it has CONFIG_TMPFS
 (Ubuntu does), so statfs("/") on the initramfs differs until hk has a
-tmpfs (doc/ROADMAP.md phase 6). Kernel code that resolves a path from a kernel thread finds nothing
+tmpfs (doc/ROADMAP.md phase F). Kernel code that resolves a path from a kernel thread finds nothing
 (knullfs); hk has none today, and has no scoped_with_init_fs for one
 that would need init's root.
 
@@ -864,14 +867,9 @@ Designs that grew one commit at a time. Tag = roadmap phase
   fsnotify hooks in the VFS operations); rename has no
   IN_MOVED_FROM/IN_MOVED_TO cookie pairing (Linux fsnotify_get_cookie); waitid without WEXITED is
   EINVAL (C).
-- **Copied helpers** (J, or as touched): `get_nofile_limit` in five
-  places; four `current_time`s; about ten user-timespec readers each validating
+- **Copied helpers** (J, or as touched): four `current_time`s; about ten user-timespec readers each validating
   (Linux get_timespec64); three iovec structs and five
   importers; three Timeval, two Timespec types.
-- **Error conventions** (M1): Result<_, KernelError> about a thousand
-  times beside Result<_, i32> (both signs used) and Result<_, i64>
-  over a hundred and fifty; raw errno numbers and local errno
-  constants in the hundreds.
 - **Process-wide state per thread** (C): pgid/sid copied into every
   thread; one global CHILD_EXIT_WQ wakes every waiting parent on every
   exit.
@@ -879,11 +877,6 @@ Designs that grew one commit at a time. Tag = roadmap phase
   do_clone (523 lines), exit, wait, credential setters, five sleep
   APIs. Split like Linux (sched/core, fork, exit, cred). Other giants:
   sys_prctl, do_semctl, sys_mmap, exec_file, sys_fcntl.
-- **Arch code in generic files** (M2): over a hundred
-  `cfg(target_arch)` outside `arch/` (main.rs, hw/dma.rs, percpu.rs,
-  misc, pci, seccomp's audit arch), dozens of direct
-  `arch::x86_64::`/`aarch64::` references, three `CurrentArch`
-  redefinitions.
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
   softnet/0 only; CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters

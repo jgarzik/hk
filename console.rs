@@ -42,7 +42,8 @@
 //! serial output transitions to a proper console (graphics, USB serial, etc.)
 //! without duplicate output.
 
-use crate::arch::IrqSpinlock;
+use crate::arch::{CurrentArch, EarlyConOps};
+use crate::sync::IrqSpinlock;
 
 /// Maximum number of console drivers that can be registered
 const MAX_CONSOLES: usize = 8;
@@ -444,15 +445,8 @@ pub fn console_write(data: &[u8]) {
         if !registry.has_console() {
             // No console yet: the early UART (an earlycon, over once a
             // console registers; with the last one removed, nothing)
-            #[cfg(target_arch = "aarch64")]
-            if registry.is_early() {
-                if let Ok(s) = core::str::from_utf8(data) {
-                    crate::arch::aarch64::serial::write_str(s);
-                } else {
-                    for &b in data {
-                        crate::arch::aarch64::serial::write_byte(b);
-                    }
-                }
+            if CurrentArch::EARLYCON && registry.is_early() {
+                CurrentArch::early_write(data);
             }
             return;
         }

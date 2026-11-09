@@ -14,25 +14,6 @@ use super::{
     SECCOMP_RET_USER_NOTIF, SeccompData, current_audit_arch,
 };
 
-// Syscall numbers for STRICT mode whitelist
-#[cfg(target_arch = "x86_64")]
-mod strict_syscalls {
-    pub const SYS_READ: i32 = 0;
-    pub const SYS_WRITE: i32 = 1;
-    pub const SYS_EXIT: i32 = 60;
-    pub const SYS_EXIT_GROUP: i32 = 231;
-    pub const SYS_RT_SIGRETURN: i32 = 15;
-}
-
-#[cfg(target_arch = "aarch64")]
-mod strict_syscalls {
-    pub const SYS_READ: i32 = 63;
-    pub const SYS_WRITE: i32 = 64;
-    pub const SYS_EXIT: i32 = 93;
-    pub const SYS_EXIT_GROUP: i32 = 94;
-    pub const SYS_RT_SIGRETURN: i32 = 139;
-}
-
 /// What seccomp decides for one syscall (Linux __seccomp_filter,
 /// __secure_computing_strict)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,12 +47,11 @@ pub fn check_syscall(
     match mode {
         SECCOMP_MODE_DISABLED => Verdict::Allow,
         SECCOMP_MODE_STRICT => {
-            use strict_syscalls::*;
-            match nr as i32 {
-                SYS_READ | SYS_WRITE | SYS_EXIT | SYS_EXIT_GROUP | SYS_RT_SIGRETURN => {
-                    Verdict::Allow
-                }
-                _ => Verdict::Strict,
+            // Linux compares the number as an int
+            if crate::arch::uapi::SECCOMP_STRICT.contains(&(nr as i32)) {
+                Verdict::Allow
+            } else {
+                Verdict::Strict
             }
         }
         SECCOMP_MODE_FILTER => {
@@ -120,7 +100,7 @@ pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
     }
     let filter = {
         let table = crate::task::percpu::TASKLIST.read();
-        table.get(me.tid())?.seccomp_filter.clone()
+        table.view(&me)?.seccomp_filter().cloned()
     };
     match check_syscall(mode, filter.as_ref(), nr, regs.ip(), regs.syscall_args()) {
         Verdict::Allow => None,
@@ -129,21 +109,21 @@ pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
             // The handler sees the registers as at entry (Linux
             // syscall_rollback), and the syscall returns what they hold
             regs.syscall_rollback();
-            force_sigsys(me.tid(), regs, nr, data);
+            force_sigsys(&me, regs, nr, data);
             Some(regs.ret())
         }
         Verdict::KillThread => kill(crate::signal::SIGSYS, true),
         Verdict::KillProcess => kill(crate::signal::SIGSYS, false),
         // Linux __secure_computing_strict: do_exit(SIGKILL), the thread
         // alone even if it is the last
-        Verdict::Strict => crate::task::proc::do_exit(crate::signal::SIGKILL as i32),
+        Verdict::Strict => crate::task::proc::do_exit(i32::from(crate::signal::SIGKILL)),
     }
 }
 
 /// SIGSYS for syscall `nr` a filter trapped with `data` (Linux
 /// force_sig_seccomp): SYS_SECCOMP, the data in si_errno, the calling
 /// instruction, the syscall and its AUDIT_ARCH
-fn force_sigsys(tid: crate::task::Tid, regs: &crate::arch::UserFrame, nr: u64, data: u32) {
+fn force_sigsys(me: &crate::task::Task, regs: &crate::arch::UserFrame, nr: u64, data: u32) {
     use crate::signal::{SIGSYS, SigFields, SigInfo, si_code};
     let fields = SigFields::Sys {
         call_addr: regs.ip(),
@@ -152,18 +132,18 @@ fn force_sigsys(tid: crate::task::Tid, regs: &crate::arch::UserFrame, nr: u64, d
     };
     let mut info = SigInfo::new(SIGSYS, si_code::SYS_SECCOMP, fields);
     info.errno = data as i32;
-    crate::signal::force_sig_info(tid, info);
+    crate::signal::force_sig_info(me, SIGSYS, info);
 }
 
 /// End the thread by `sig` (`thread`, while another has not started
 /// exiting) or the whole process (Linux __seccomp_filter: do_exit(SIGSYS)
 /// unless signal->live is 1, else force_sig_seccomp with the handler
 /// reset so the process dies)
-fn kill(sig: u32, thread: bool) -> ! {
-    let tid = crate::task::percpu::current_tid();
-    let others = crate::signal::get_task_signal_struct(tid).is_some_and(|s| s.live() > 1);
+fn kill(sig: crate::signal::Signal, thread: bool) -> ! {
+    let me = crate::task::percpu::current();
+    let others = crate::signal::get_task_signal_struct(&me).is_some_and(|s| s.live() > 1);
     if thread && others {
-        crate::task::proc::do_exit(sig as i32)
+        crate::task::proc::do_exit(sig.into())
     }
-    crate::signal::do_group_exit(sig as i32)
+    crate::signal::do_group_exit(sig.into())
 }

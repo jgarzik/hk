@@ -20,10 +20,9 @@ use super::{
     MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
     MADV_REMOVE, MADV_SEQUENTIAL, MADV_WILLNEED, MADV_WIPEONFORK, Mm, MmStruct, PAGE_SIZE,
     VM_DONTCOPY, VM_DONTDUMP, VM_HUGEPAGE, VM_NOHUGEPAGE, VM_RAND_READ, VM_SEQ_READ, VM_WIPEONFORK,
-    Vma, get_task_mm,
+    Vma,
 };
 use crate::sync::{RwSemReadGuard, RwSemWriteGuard};
-use crate::task::percpu::current_tid;
 use crate::util::error::{KernelError, KernelResult};
 
 /// A hole to punch in a shared object once the mm lock is dropped
@@ -38,7 +37,9 @@ pub fn sys_madvise(start: u64, len: u64, advice: i32) -> KernelResult<()> {
     let Some(end) = check_range(start, len)? else {
         return Ok(());
     };
-    let mm = get_task_mm(current_tid()).ok_or(KernelError::OutOfMemory)?;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::OutOfMemory)?;
     let mut punch = Vec::new();
     let map = if needs_write(advice) {
         mm.mmap_write_killable().map(Map::W)

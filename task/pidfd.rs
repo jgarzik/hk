@@ -184,11 +184,11 @@ pub fn show_fdinfo(
 /// The tid of a pidfd's process (Linux pidfd_get_task): from its struct
 /// pid under TASKLIST, never by number, so a reused number never
 /// reaches another process; EBADF for another file, ESRCH once gone
-pub fn pidfd_tid(file: &File) -> Result<crate::task::Tid, KernelError> {
+pub fn pidfd_task(file: &File) -> Result<crate::task::percpu::TaskRef, KernelError> {
     let pidfd = get_pidfd(file).ok_or(KernelError::BadFd)?;
     crate::task::percpu::TASKLIST
         .read()
-        .pid_tid(&pidfd.pid)
+        .pid_task_ref(&pidfd.pid)
         .ok_or(KernelError::NoProcess)
 }
 

@@ -13,7 +13,7 @@ use super::lapic;
 use super::pic;
 use crate::arch::UserFrame;
 use crate::mm::fault::{Access, VmFault};
-use crate::signal::{SigInfo, Trap, TrapSet, si_code};
+use crate::signal::{Signal, Trap, TrapSet, si_code};
 use crate::uaccess::pagefault_disabled;
 use crate::{printk, printkln};
 
@@ -379,8 +379,8 @@ fn pf_signal_error(addr: u64, error: u64) -> u64 {
 /// Deliver a synchronous fault signal (force_sig_fault) for the user
 /// context in `frame`: the task's pt_regs (an entry from user mode), so
 /// a handler's frame is set up there and IRETQ enters it
-fn user_fault(frame: &UserFrame, info: SigInfo, trap: TrapSet) {
-    crate::signal::force_sig_fault(info, trap, frame);
+fn user_fault(frame: &UserFrame, sig: Signal, code: i32, addr: u64, trap: TrapSet) {
+    crate::signal::force_sig_fault(sig, code, addr, trap, frame);
 }
 
 /// Rust exception handler (interrupts off: interrupt gates); it returns
@@ -431,7 +431,7 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
                 error: pf_signal_error(cr2, error_code),
                 addr: cr2,
             });
-            user_fault(uframe, SigInfo::fault(sig, code, cr2), trap);
+            user_fault(uframe, sig, code, cr2, trap);
             return;
         }
         // Kernel-mode fault inside a user-copy routine (out of memory
@@ -480,7 +480,7 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
             trapno: vector,
             error: error_code,
         };
-        user_fault(uframe, SigInfo::fault(sig, code, addr), trap);
+        user_fault(uframe, sig, code, addr, trap);
         return;
     }
 
@@ -630,7 +630,7 @@ fn handle_page_fault(ec: u64, addr: u64) -> Result<(), VmFault> {
         _ if ec & 1 != 0 => return Err(VmFault::Segv),
         _ => Access::Read,
     };
-    let mm = crate::mm::get_task_mm(crate::task::percpu::current_tid()).ok_or(VmFault::Segv)?;
+    let mm = crate::task::percpu::current().mm().ok_or(VmFault::Segv)?;
     crate::mm::fault::handle_mm_fault(&mm, addr, access)
 }
 
@@ -774,7 +774,7 @@ fn handle_irq(irq: u64) {
         }
         _ => {
             // Dispatch to registered handlers
-            super::irq::dispatch_irq(irq);
+            crate::irq::handle_irq(u32::from(irq));
         }
     }
 

@@ -8,9 +8,7 @@ use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-#[cfg(target_arch = "x86_64")]
-use crate::arch::PageTable;
-use crate::arch::{FrameAlloc, PageFlags, phys_to_virt};
+use crate::arch::{FrameAlloc, PageFlags, PageTable, phys_to_virt};
 
 use super::percpu;
 use crate::fs::{File, kernel_open_exec};
@@ -99,7 +97,7 @@ fn copy_strings(argv: UserPtr<u64>, n: usize, budget: &mut usize) -> KernelResul
         if p == 0 {
             return Err(KernelError::BadAddress);
         }
-        out.push_user::<crate::arch::Uaccess>(p, MAX_ARG_STRLEN, budget)?;
+        out.push_user(p, MAX_ARG_STRLEN, budget)?;
         if crate::signal::fatal_signal_pending() {
             return Err(KernelError::RestartNoHand);
         }
@@ -110,7 +108,7 @@ fn copy_strings(argv: UserPtr<u64>, n: usize, budget: &mut usize) -> KernelResul
 /// The argument and environment strings of an exec of `filename`
 /// (Linux do_execveat_common): both arrays counted, the room for them
 /// worked out from RLIMIT_STACK, then the file name, the environment
-/// and the arguments copied against it
+/// and the arguments (at least an empty argv[0]) copied against it
 fn copy_args(
     filename: &[u8],
     argv: UserPtr<u64>,
@@ -123,7 +121,13 @@ fn copy_args(
         .checked_sub(filename.len() + 1)
         .ok_or(KernelError::ArgListTooLong)?;
     let envp = copy_strings(envp, envc, &mut budget)?;
-    let argv = copy_strings(argv, argc, &mut budget)?;
+    let mut argv = copy_strings(argv, argc, &mut budget)?;
+    // No arguments: argv[0] is "", so a program reading from argv[1]
+    // does not walk into envp (Linux copy_string_kernel(""), charged)
+    if argc == 0 {
+        budget.checked_sub(1).ok_or(KernelError::ArgListTooLong)?;
+        argv.push(b"")?;
+    }
     Ok((argv, envp))
 }
 
@@ -960,24 +964,23 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
 /// arrives meanwhile (the caller then dies on its way out). Threads
 /// running user code end at their next syscall or fault (P7: IRQ
 /// return).
-fn de_thread(tid: crate::task::Tid) -> KernelResult<()> {
+fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
     use crate::sync::waitqueue::WaitEntry;
     use crate::task::percpu::{SleepState, schedule};
 
-    let tgid = percpu::current_pid();
-    let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
+    let Some(sig) = crate::signal::get_task_signal_struct(me) else {
         return Ok(());
     };
-    if percpu::exec_waits(tgid, tid) {
-        if !sig.start_exec(tid) {
+    if percpu::exec_waits(me) {
+        if !sig.start_exec(me) {
             return Err(KernelError::WouldBlock);
         }
-        crate::signal::zap_group_others(tgid, tid);
+        crate::signal::zap_group_others(me);
         let wq = &crate::task::proc::CHILD_EXIT_WQ;
         let w = core::pin::pin!(WaitEntry::new());
         let r = loop {
             wq.prepare_to_wait(w.as_ref(), SleepState::Killable);
-            if !percpu::exec_waits(tgid, tid) {
+            if !percpu::exec_waits(me) {
                 break Ok(());
             }
             if crate::signal::fatal_signal_pending() {
@@ -986,13 +989,13 @@ fn de_thread(tid: crate::task::Tid) -> KernelResult<()> {
             schedule();
         };
         wq.finish_wait(w.as_ref());
-        sig.end_exec(tid);
+        sig.end_exec(me);
         r?;
     }
     // Released after TASKLIST: the old leader and exited threads; a
     // tracer waiting for the old leader rechecks (Linux de_thread:
     // __wake_up_parent before its silent release)
-    let gone = percpu::take_leadership(tgid, tid);
+    let gone = percpu::take_leadership(me);
     if !gone.is_empty() {
         drop(gone);
         crate::task::proc::CHILD_EXIT_WQ.wake_all();
@@ -1006,7 +1009,7 @@ fn de_thread(tid: crate::task::Tid) -> KernelResult<()> {
 /// already pending)
 fn exec_fatal() {
     if !crate::signal::fatal_signal_pending() {
-        crate::signal::force_sigsegv(percpu::current_tid());
+        crate::signal::force_sigsegv(&percpu::current());
     }
 }
 
@@ -1050,7 +1053,7 @@ where
     // the first credential check until the new image is in place, so
     // ptrace attach and mm_access never see the new mm with the old
     // dumpability or the reverse; dropped on every error return
-    let guard = crate::signal::CredGuard::lock(percpu::current_tid())?;
+    let guard = crate::signal::CredGuard::lock(&percpu::current())?;
     crate::task::nproc_exec_check()?;
     let pathname = &path[..];
     let file = open(pathname)?;
@@ -1198,15 +1201,13 @@ where
 
     let ident = exec_identity(pathname, &file);
 
-    let tid = percpu::current_tid();
-
     // The point of no return (Linux begin_new_exec sets
     // point_of_no_return before de_thread): from here a failure kills
     // the process instead of returning to the old image
 
     // The other threads end before the new image starts (Linux
     // begin_new_exec -> de_thread)
-    if let Err(e) = de_thread(tid) {
+    if let Err(e) = de_thread(&percpu::current()) {
         exec_fatal();
         return Err(e);
     }
@@ -1220,7 +1221,7 @@ where
 
     // The thread and process keyrings are not for the new image (Linux
     // prepare_exec_creds)
-    crate::keys::keyring::exec_keyrings(percpu::current_tid());
+    crate::keys::keyring::exec_keyrings(&percpu::current());
 
     // What the process registered before (an mq_notify) is not for the
     // new image (Linux setup_new_exec: self_exec_id++); after de_thread
@@ -1237,7 +1238,7 @@ where
     percpu::current().clear_flag(crate::task::pf::FORKNOEXEC);
 
     // Private fd table without the close-on-exec descriptors
-    crate::task::fdtable::exec_task_fd(percpu::current_tid());
+    crate::task::fdtable::exec_task_fd();
 
     // Signal vfork completion if parent is waiting
     // Must be done before we switch address spaces since parent may be blocked

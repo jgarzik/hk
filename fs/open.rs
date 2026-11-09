@@ -254,7 +254,7 @@ pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> KernelResult<()> {
         return Err(KernelError::InvalidArgument);
     }
     let files = if flags & CLOSE_RANGE_UNSHARE != 0 {
-        crate::task::fdtable::unshare_task_fd(crate::task::percpu::current_tid())?
+        crate::task::fdtable::unshare_task_fd()?
     } else {
         current_fd_table()
     };

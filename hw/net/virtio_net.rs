@@ -414,6 +414,9 @@ impl crate::base::Bound for VirtioNetWrapper {
         if !off {
             napi_disable(&d.napi);
         }
+        // Quiet before its IRQ goes (Linux remove_vq_common: reset,
+        // then del_vqs frees the IRQ)
+        let reset = d.vdev.reset();
         d.vdev.free_irq();
         netif_napi_del(&d.napi);
         let rx = d.rx.lock().take();
@@ -421,7 +424,7 @@ impl crate::base::Bound for VirtioNetWrapper {
         let (Some(rx), Some(tx)) = (rx, tx) else {
             return;
         };
-        if d.vdev.reset().is_err() {
+        if reset.is_err() {
             // The device may still use the memory: leak it
             printkln!("virtio-net: {}: reset failed", self.netdev.name());
             return;
@@ -510,7 +513,7 @@ impl VirtioDriver for VirtioNetDriver {
         let irq = vdev
             .request_irq(Arc::clone(&device) as Arc<dyn VirtioIrq>)
             .map_err(|e| {
-                printkln!("virtio-net: no IRQ ({})", e);
+                printkln!("virtio-net: no IRQ ({:?})", e);
                 KernelError::NoDevice
             })?;
         vdev.ready();

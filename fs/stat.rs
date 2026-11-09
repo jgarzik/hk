@@ -1,10 +1,9 @@
 //! File status syscalls (stat, fstat, fstatat, lstat, statfs, fstatfs, statx)
 
-use crate::arch::Uaccess;
 use crate::arch::uapi::{Stat, st_nlink};
 use crate::fs::namei::{filename_lookup, getname_maybe_null, user_path_at};
 use crate::fs::{Inode, KernelError, LinuxStatFs, LookupFlags};
-use crate::uaccess::{UaccessArch, UserPtr};
+use crate::uaccess::{UserPtr, access_ok};
 use crate::util::error::KernelResult;
 use crate::util::pod::FromBytes;
 
@@ -82,7 +81,7 @@ fn stat_path(
 pub fn sys_fstat(fd: i32, statbuf: UserPtr<Stat>) -> KernelResult<()> {
     // The buffer is checked before the fd (Linux checks the fd first:
     // BUGS.md)
-    if !Uaccess::access_ok(statbuf.addr(), core::mem::size_of::<Stat>()) {
+    if !access_ok(statbuf.addr(), core::mem::size_of::<Stat>()) {
         return Err(KernelError::BadAddress);
     }
     let inode = fget(fd)?.get_inode().ok_or(KernelError::BadFd)?;
@@ -327,7 +326,7 @@ fn st_flags(mnt_flags: u32, sb: &super::SuperBlock) -> u64 {
 pub fn sys_fstatfs(fd: i32, buf: UserPtr<LinuxStatFs>) -> KernelResult<()> {
     // The buffer is checked before the fd (Linux checks the fd first:
     // BUGS.md)
-    if !Uaccess::access_ok(buf.addr(), core::mem::size_of::<LinuxStatFs>()) {
+    if !access_ok(buf.addr(), core::mem::size_of::<LinuxStatFs>()) {
         return Err(KernelError::BadAddress);
     }
     let file = fget(fd)?;

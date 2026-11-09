@@ -454,7 +454,6 @@ fn next_ram_section(after: Option<u64>) -> Option<u64> {
 /// page allocator frees what memblock left free. Boot CPU, before SMP
 /// and before memblock's free ranges are handed out.
 pub fn vmemmap_init() {
-    use crate::arch::{CurrentArch, MemoryLayoutOps};
     let mut cur = None;
     while let Some(sec) = next_ram_section(cur) {
         cur = Some(sec);
@@ -468,13 +467,13 @@ pub fn vmemmap_init() {
         if let Some(pa) = block {
             init_pages(pa, SECTION_MAP);
             // SAFETY: boot CPU, before SMP; the vmemmap range is unused
-            unsafe { CurrentArch::map_kernel_pmd(va, pa, &mut zeroed_frame) };
+            unsafe { crate::mm::swapper::map_pmd(va, pa, &mut zeroed_frame) };
         } else {
             for off in (0..SECTION_MAP).step_by(4096) {
                 let pa = crate::mm::memblock::alloc(4096, 4096);
                 init_pages(pa, 4096);
                 // SAFETY: as above
-                unsafe { CurrentArch::map_kernel_page(va + off, pa, &mut zeroed_frame) };
+                unsafe { crate::mm::swapper::map_page(va + off, pa, &mut zeroed_frame) };
             }
         }
         let s = sec as usize;

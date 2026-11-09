@@ -20,6 +20,7 @@ pub mod io;
 pub mod ioremap;
 pub mod ipi;
 pub mod irq;
+pub mod irqflags;
 pub mod kmap;
 pub mod lapic;
 pub mod msr;
@@ -30,11 +31,11 @@ pub mod percpu;
 pub mod pic;
 pub mod pit;
 pub mod power;
+pub mod process;
 pub mod ptrace;
 pub mod rtc;
 pub mod signal;
 pub mod smp;
-pub mod spinlock;
 pub mod syscall;
 pub mod tlb;
 pub mod tsc;
@@ -227,12 +228,74 @@ impl SchedArch for X86_64Arch {
 // ============================================================================
 
 use crate::arch::{
-    AcpiInfo, AcpiOps, ArchBusOps, CpuInfo, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps,
-    IoremapOps, LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, TimekeeperOps,
-    VfsInitOps,
+    AcpiInfo, AcpiOps, ArchBusOps, CpuInfo, EarlyConOps, ExceptionOps, HaltOps, InitramfsOps,
+    LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, TimekeeperOps, VfsInitOps,
 };
 
 impl HaltOps for X86_64Arch {
+    /// Registers and a frame-pointer backtrace of the kernel stack
+    fn dump_stack() {
+        // Print basic register state
+        let rsp: u64;
+        let rbp: u64;
+        let rflags: u64;
+        // SAFETY: register reads only
+        unsafe {
+            ::core::arch::asm!(
+                "mov {}, rsp",
+                "mov {}, rbp",
+                "pushfq",
+                "pop {}",
+                out(reg) rsp,
+                out(reg) rbp,
+                out(reg) rflags,
+                options(nomem, preserves_flags)
+            );
+        }
+        crate::printkln!("\nRegisters:");
+        crate::printkln!("  RSP: {:#018x}", rsp);
+        crate::printkln!("  RBP: {:#018x}", rbp);
+        crate::printkln!("  RFLAGS: {:#018x}", rflags);
+
+        // Simple stack backtrace using frame pointers
+        crate::printkln!("\nStack backtrace:");
+        let mut frame_ptr = rbp;
+        let mut frame_count = 0;
+        const MAX_FRAMES: usize = 16;
+
+        while frame_ptr != 0 && frame_count < MAX_FRAMES {
+            // Only follow frames on the current kernel stack: RBP may hold a
+            // user value, and reading it would fault again under SMAP
+            if !(rsp..rsp.saturating_add(0x10000)).contains(&frame_ptr) {
+                break;
+            }
+
+            // Read return address (stored at frame_ptr + 8)
+            // SAFETY: frame_ptr lies within this kernel stack's 64KB
+            // (checked above), mapped memory; the panic path's best effort
+            let return_addr = unsafe { *((frame_ptr + 8) as *const u64) };
+            if return_addr == 0 {
+                break;
+            }
+
+            crate::printkln!("  #{}: {:#018x}", frame_count, return_addr);
+
+            // Move to previous frame
+            // SAFETY: as above
+            let prev_frame = unsafe { *(frame_ptr as *const u64) };
+            if prev_frame <= frame_ptr {
+                // Prevent infinite loops
+                break;
+            }
+            frame_ptr = prev_frame;
+            frame_count += 1;
+        }
+
+        if frame_count == 0 {
+            crate::printkln!("  <no frames available>");
+        }
+    }
+
     fn halt_loop() -> ! {
         unsafe {
             // Disable interrupts first to prevent waking from halt
@@ -246,31 +309,30 @@ impl HaltOps for X86_64Arch {
     }
 }
 
-impl EarlyArchInit for X86_64Arch {
-    fn early_init() {
-        early_init();
-    }
-}
+/// COM1 (the 8250 driver's port)
+impl EarlyConOps for X86_64Arch {
+    const EARLYCON: bool = false;
 
-impl IoremapOps for X86_64Arch {
-    type IoremapError = ioremap::IoremapError;
-
-    fn ioremap_init() {
-        ioremap::init();
-    }
-
-    unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, Self::IoremapError> {
-        // SAFETY: the trait's contract
-        unsafe { ioremap::ioremap(phys_addr, size) }
-    }
-
-    unsafe fn iounmap(virt_addr: *mut u8, size: u64) {
-        // SAFETY: the trait's contract
-        unsafe { ioremap::iounmap(virt_addr, size) };
+    fn early_write(bytes: &[u8]) {
+        for &b in bytes {
+            crate::hw::serial::write_byte_com1(b);
+        }
     }
 }
 
 impl AcpiOps for X86_64Arch {
+    fn numa_init() -> bool {
+        // No SRAT: one node
+        acpi::init_numa_topology().unwrap_or_else(|_| {
+            crate::printkln!("NUMA: ACPI topology unusable, using one node");
+            false
+        })
+    }
+
+    fn boot_framebuffer() -> Option<crate::gfx::FramebufferInfo> {
+        multiboot2::get_framebuffer()
+    }
+
     fn parse_acpi() -> Option<AcpiInfo> {
         let acpi_info = acpi::parse_acpi().ok()?;
 
@@ -391,9 +453,12 @@ impl ArchBusOps for X86_64Arch {
         crate::hw::serial::SERIAL8250_DRIVER.register();
     }
 
+    // Below the LAPIC/IOAPIC region, before typical BIOS allocations
+    const PCI_MMIO: (u64, u64) = (0xE000_0000, 0xFEB0_0000);
+
     /// Configuration mechanism #1 (ports 0xCF8/0xCFC)
     fn pci_config_init() {
-        crate::hw::pci::init_port_io();
+        crate::hw::pci::init_config(&pci_conf::PORT_IO);
         crate::printkln!("PCI: Using port I/O config access");
     }
 }
@@ -411,24 +476,16 @@ impl MemoryLayoutOps for X86_64Arch {
             }
         });
         // Frames are used through the direct map
-        let end = kmap::direct_end();
+        let end = crate::mm::swapper::direct_end();
         let mut mb = memblock::MEMBLOCK.lock();
         mb.remove(end, u64::MAX);
         mb.set_limit(end);
         // The first 1MB: BIOS data, EBDA, the AP trampoline (Linux
         // reserves it all, arch/x86/realmode)
         mb.reserve(0, 1 << 20);
-        let (start, end) = kmap::image_range();
+        let (start, end) = crate::mm::swapper::image_range();
         mb.reserve(start, end - start);
         crate::arch::x86_64::multiboot2::boot_ranges(|_, s, e| mb.reserve(s, e.saturating_sub(s)));
-    }
-
-    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
-        unsafe { kmap::map_page(va, pa, table) }
-    }
-
-    unsafe fn map_kernel_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
-        unsafe { kmap::map_pmd(va, pa, table) }
     }
 }
 
@@ -455,8 +512,79 @@ impl VfsInitOps for X86_64Arch {
         let Ok(dev_dentry) = crate::fs::lookup_path(b"/dev") else {
             return;
         };
-        crate::init_vfat_ramdisk(&root_dentry, &dev_dentry);
+        init_vfat_ramdisk(&root_dentry, &dev_dentry);
     }
+}
+
+/// Initialize VFAT ramdisk from multiboot2 module
+///
+/// This function:
+/// 1. Loads the "vfat" multiboot2 module
+/// 2. Creates a ramdisk (rd1) from the image data
+/// 3. Creates /dev/rd1 device node
+/// 4. Creates /vfat_test mount point
+///
+/// Note: The actual mount is performed by userspace init (boot_tester2)
+/// via the mount syscall, simulating how real init/systemd works.
+fn init_vfat_ramdisk(
+    root_dentry: &alloc::sync::Arc<crate::fs::Dentry>,
+    _dev_dentry: &alloc::sync::Arc<crate::fs::Dentry>,
+) {
+    use crate::block::create_ramdisk_from_data;
+    use crate::fs::ramfs_create_dir;
+
+    // Look for vfat module loaded by bootloader
+    let Some(vfat_data) = multiboot2::find_module("vfat") else {
+        return;
+    };
+
+    // Ramdisk rd1 from the vfat image data (node in devtmpfs)
+    let _ = create_ramdisk_from_data(1, vfat_data);
+
+    // Create /vfat_test mount point (userspace init will mount here)
+    let _ = ramfs_create_dir(root_dentry, b"vfat_test");
+}
+
+/// x86_64 Kernel entry point called by bootloader
+///
+/// multiboot_info: Pointer to multiboot2 info structure (passed in RDI)
+#[cfg(not(test))]
+#[unsafe(no_mangle)]
+pub extern "C" fn _start(multiboot_info: u64) -> ! {
+    // SAFETY: the bootloader's info structure (RDI), in memory the boot
+    // tables map; it and its modules are reserved (memblock_init)
+    unsafe { multiboot2::set_boot(multiboot_info) };
+    // Kernel page table first: the boot tables' identity map goes away
+    // SAFETY: once, first thing on the BSP, before SMP or any user mm
+    unsafe {
+        kmap::init();
+    }
+
+    // Messages before console attach are buffered
+    crate::printkln!("hk kernel starting...");
+
+    // Initialize VGA text console for early output
+    vgacon::init_vgacon();
+
+    // Initialize serial console (through TTY layer)
+    crate::hw::serial::init_serial_console();
+
+    // Flush buffered messages to console
+    crate::printk::flush();
+
+    // Print and parse kernel command line (if any)
+    if let Some(cmdline) = multiboot2::get_cmdline()
+        && !cmdline.is_empty()
+    {
+        crate::printkln!("Cmdline: {}", cmdline);
+        crate::cmdline::parse_cmdline(cmdline);
+    }
+
+    // Initialize architecture-specific code (GDT, IDT, PIC, PIT)
+    early_init();
+
+    // Continue to main kernel
+    crate::kmain()
 }
 
 /// Early architecture initialization (before heap)

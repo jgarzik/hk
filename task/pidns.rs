@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 /// `ns`'s child reaper, if listed (Linux pid_ns->child_reaper)
 pub fn child_reaper(table: &GlobalTaskTable, ns: &PidNamespace) -> Option<TaskRef> {
     let t = ns.reaper.access(table).as_ref()?.upgrade()?;
-    table.task(t.tid()).filter(|l| Arc::ptr_eq(l, &t))
+    table.view(&t).is_some().then_some(t)
 }
 
 /// `t` is `ns`'s child reaper (TASKLIST held)
@@ -101,7 +101,7 @@ fn zap_pid_ns_processes(me: &TaskRef, ns: &PidNamespace) {
     // A reboot(2) inside sets what its parent sees
     let code = *ns.reboot.access(&TASKLIST.read());
     if code != 0
-        && let Some(s) = crate::signal::get_task_signal_struct(me.pid)
+        && let Some(s) = crate::signal::get_task_signal_struct(me)
     {
         s.set_exit_code(code);
     }
@@ -127,11 +127,11 @@ pub fn reboot_pid_ns(cmd: u32) -> Option<crate::util::error::KernelError> {
     };
     let reaper = {
         let mut table = TASKLIST.write();
-        *ns.reboot.access_mut(&mut table) = sig as i32;
+        *ns.reboot.access_mut(&mut table) = sig.into();
         child_reaper(&table, ns)
     };
     if let Some(r) = reaper {
-        let _ = crate::signal::send_thread_signal(&r, SIGKILL, SendInfo::Kernel);
+        let _ = crate::signal::send_sig_info(&r, SIGKILL, SendInfo::Kernel);
     }
     crate::task::proc::do_exit(0)
 }

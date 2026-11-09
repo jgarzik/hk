@@ -15,6 +15,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 
+use crate::task::Task;
 use crate::util::error::KernelError;
 
 use super::key::{KEYRING_DEFAULT_PERM, Key};
@@ -60,25 +61,16 @@ struct UserKeyrings {
     user_session_keyring: Option<Arc<Key>>,
 }
 
-/// Task `tid` (its keyrings are `Task.keyrings`, Linux cred keyrings)
-fn task(tid: u64) -> Option<crate::task::percpu::TaskRef> {
-    crate::task::percpu::TASKLIST.read().task(tid)
+/// The keyrings of task `t` (`Task.keyrings`, Linux cred keyrings)
+pub fn get_task_keyrings(t: &Task) -> TaskKeyrings {
+    t.keyrings.lock().clone()
 }
 
-/// The keyrings of task `tid`
-pub fn get_task_keyrings(tid: u64) -> TaskKeyrings {
-    task(tid)
-        .map(|t| t.keyrings.lock().clone())
-        .unwrap_or_default()
-}
-
-/// Set the keyrings of task `tid`; the old ones are dropped after the
+/// Set the keyrings of task `t`; the old ones are dropped after the
 /// task's lock
-pub fn set_task_keyrings(tid: u64, keyrings: TaskKeyrings) {
-    if let Some(t) = task(tid) {
-        let old = core::mem::replace(&mut *t.keyrings.lock(), keyrings);
-        drop(old);
-    }
+pub fn set_task_keyrings(t: &Task, keyrings: TaskKeyrings) {
+    let old = core::mem::replace(&mut *t.keyrings.lock(), keyrings);
+    drop(old);
 }
 
 /// The keyrings of a new task (Linux copy_creds): the session keyring
@@ -97,13 +89,13 @@ pub fn fork_keyrings(parent: &TaskKeyrings, thread: bool, uid: u32, gid: u32) ->
     }
 }
 
-/// At exec's point of no return (Linux prepare_exec_creds): the thread
-/// and process keyrings go, the session keyring stays
-pub fn exec_keyrings(tid: u64) {
-    let mut k = get_task_keyrings(tid);
+/// At exec's point of no return (Linux prepare_exec_creds): `t`'s
+/// thread and process keyrings go, the session keyring stays
+pub fn exec_keyrings(t: &Task) {
+    let mut k = get_task_keyrings(t);
     k.thread_keyring = None;
     k.process_keyring = None;
-    set_task_keyrings(tid, k);
+    set_task_keyrings(t, k);
 }
 
 /// Create a new keyring with the given description
@@ -153,16 +145,16 @@ fn slot_keyring(
     Ok(k)
 }
 
-/// Resolve a special keyring ID to an actual keyring, optionally creating it
+/// Resolve a special keyring ID of task `t` to an actual keyring,
+/// optionally creating it
 pub fn resolve_special_keyring(
     special_id: i32,
     create: bool,
-    tid: u64,
+    t: &Task,
     uid: u32,
     gid: u32,
 ) -> Result<Arc<Key>, KernelError> {
     let task_slot = |pick: fn(&mut TaskKeyrings) -> &mut Option<Arc<Key>>, name| {
-        let t = task(tid).ok_or(KernelError::NoKey)?;
         let mut k = t.keyrings.lock();
         slot_keyring(pick(&mut k), create, name, uid, gid)
     };
@@ -193,13 +185,13 @@ pub fn keyring_unlink(keyring: &Key, key: &Key) -> Result<(), KernelError> {
     keyring.keyring_remove(key.serial)
 }
 
-/// Whether task `tid` possesses `key` (Linux: lookup_user_key finds it
+/// Whether task `t` possesses `key` (Linux: lookup_user_key finds it
 /// through search_process_keyrings): it is, or is reachable from, the
 /// thread, process or session keyring, or the user-session keyring when
 /// there is no session keyring
-pub fn possessed(key: &Key, tid: u64) -> bool {
+pub fn possessed(key: &Key, t: &Task) -> bool {
     use super::key::KEYRING_SEARCH_MAX_DEPTH;
-    let k = get_task_keyrings(tid);
+    let k = get_task_keyrings(t);
     let session = k.session_keyring.clone().or_else(|| {
         let uid = crate::task::percpu::current_cred().uid;
         USER_KEYRINGS
@@ -213,9 +205,9 @@ pub fn possessed(key: &Key, tid: u64) -> bool {
         .any(|r| r.keyring_reaches(key.serial, KEYRING_SEARCH_MAX_DEPTH))
 }
 
-/// Search all process keyrings for a key
-pub fn search_process_keyrings(type_name: &str, description: &str, tid: u64) -> Option<Arc<Key>> {
-    let k = get_task_keyrings(tid);
+/// Search all of task `t`'s process keyrings for a key
+pub fn search_process_keyrings(type_name: &str, description: &str, t: &Task) -> Option<Arc<Key>> {
+    let k = get_task_keyrings(t);
     [k.thread_keyring, k.process_keyring, k.session_keyring]
         .into_iter()
         .flatten()

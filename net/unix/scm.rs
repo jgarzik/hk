@@ -277,7 +277,8 @@ impl Scm {
         if n > SCM_MAX_FD || fpl.files.len() + n > SCM_MAX_FD {
             return Err(KernelError::InvalidArgument);
         }
-        let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
+        let table = crate::task::percpu::current()
+            .files()
             .ok_or(KernelError::BadFd)?;
         for c in data[..n * 4].as_chunks::<4>().0 {
             let fd = i32::from_ne_bytes(*c);

@@ -11,7 +11,7 @@
 
 use alloc::vec::Vec;
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 
 /// An id allocator (Linux struct ida)
 pub struct Ida(IrqSpinlock<Vec<u64>>);

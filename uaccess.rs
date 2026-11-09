@@ -17,7 +17,6 @@
 //!
 //! Functions return the number of bytes that could NOT be copied (0 = success),
 //! following the Linux kernel convention. This allows partial copies to be detected.
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 extern crate alloc;
 
@@ -150,6 +149,19 @@ pub trait UaccessArch {
     unsafe fn user_access_end();
 }
 
+/// The uaccess implementation: the architecture's; host unit tests copy
+/// through host memory instead
+#[cfg(not(test))]
+use crate::arch::Uaccess as Arch;
+#[cfg(test)]
+use HostUaccess as Arch;
+
+/// Linux access_ok: [addr, addr + size) lies in user space
+#[inline]
+pub fn access_ok(addr: u64, size: usize) -> bool {
+    Arch::access_ok(addr, size)
+}
+
 /// Copy data from kernel space to user space
 ///
 /// # Arguments
@@ -161,20 +173,23 @@ pub trait UaccessArch {
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 /// * `Err(UaccessError::Overflow)` if address range overflows
 #[track_caller]
-pub fn copy_to_user<A: UaccessArch>(to: u64, from: &[u8]) -> UaccessResult<usize> {
+pub fn copy_to_user(to: u64, from: &[u8]) -> UaccessResult<usize> {
     might_fault();
     let len = from.len();
 
     // Validate user address
-    if !A::access_ok(to, len) {
+    if !Arch::access_ok(to, len) {
         return Err(UaccessError::BadAddress);
     }
 
     // Perform the copy with SMAP protection disabled
+    // SAFETY: `to` passed access_ok for `len` bytes (a fault is caught
+    // by the fixup and counted); `from` is a kernel slice of `len`
+    // bytes; begin/end paired
     let left = unsafe {
-        A::user_access_begin();
-        let left = A::copy_user_raw(to as *mut u8, from.as_ptr(), len);
-        A::user_access_end();
+        Arch::user_access_begin();
+        let left = Arch::copy_user_raw(to as *mut u8, from.as_ptr(), len);
+        Arch::user_access_end();
         left
     };
 
@@ -196,14 +211,10 @@ pub fn copy_to_user<A: UaccessArch>(to: u64, from: &[u8]) -> UaccessResult<usize
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 /// * `Err(UaccessError::Overflow)` if address range overflows
 #[track_caller]
-pub fn copy_from_user<A: UaccessArch>(
-    to: &mut [u8],
-    from: u64,
-    len: usize,
-) -> UaccessResult<usize> {
+pub fn copy_from_user(to: &mut [u8], from: u64, len: usize) -> UaccessResult<usize> {
     might_fault();
     // Validate user address
-    if !A::access_ok(from, len) {
+    if !Arch::access_ok(from, len) {
         return Err(UaccessError::BadAddress);
     }
 
@@ -213,10 +224,13 @@ pub fn copy_from_user<A: UaccessArch>(
     }
 
     // Perform the copy with SMAP protection disabled
+    // SAFETY: `from` passed access_ok for `len` bytes (a fault is caught
+    // by the fixup and counted); `to` is a kernel slice of at least
+    // `len` bytes (checked above); begin/end paired
     let left = unsafe {
-        A::user_access_begin();
-        let left = A::copy_user_raw(to.as_mut_ptr(), from as *const u8, len);
-        A::user_access_end();
+        Arch::user_access_begin();
+        let left = Arch::copy_user_raw(to.as_mut_ptr(), from as *const u8, len);
+        Arch::user_access_end();
         left
     };
 
@@ -231,17 +245,17 @@ pub fn copy_from_user<A: UaccessArch>(
 /// stopped it, all of `from` on success, 0 for an address outside user
 /// space
 #[track_caller]
-pub fn copy_to_user_some<A: UaccessArch>(to: u64, from: &[u8]) -> usize {
+pub fn copy_to_user_some(to: u64, from: &[u8]) -> usize {
     might_fault();
-    if !A::access_ok(to, from.len()) {
+    if !Arch::access_ok(to, from.len()) {
         return 0;
     }
     // SAFETY: `to` passed access_ok for the length (a fault is caught by
     // the fixup and counted); `from` is a kernel slice; begin/end paired
     let left = unsafe {
-        A::user_access_begin();
-        let left = A::copy_user_raw(to as *mut u8, from.as_ptr(), from.len());
-        A::user_access_end();
+        Arch::user_access_begin();
+        let left = Arch::copy_user_raw(to as *mut u8, from.as_ptr(), from.len());
+        Arch::user_access_end();
         left
     };
     from.len() - left
@@ -250,16 +264,16 @@ pub fn copy_to_user_some<A: UaccessArch>(to: u64, from: &[u8]) -> usize {
 /// `copy_from_user` that reports progress: the bytes copied into the
 /// front of `to` before a fault stopped it (see [`copy_to_user_some`])
 #[track_caller]
-pub fn copy_from_user_some<A: UaccessArch>(to: &mut [u8], from: u64) -> usize {
+pub fn copy_from_user_some(to: &mut [u8], from: u64) -> usize {
     might_fault();
-    if !A::access_ok(from, to.len()) {
+    if !Arch::access_ok(from, to.len()) {
         return 0;
     }
     // SAFETY: as in copy_to_user_some, the other way
     let left = unsafe {
-        A::user_access_begin();
-        let left = A::copy_user_raw(to.as_mut_ptr(), from as *const u8, to.len());
-        A::user_access_end();
+        Arch::user_access_begin();
+        let left = Arch::copy_user_raw(to.as_mut_ptr(), from as *const u8, to.len());
+        Arch::user_access_end();
         left
     };
     to.len() - left
@@ -269,15 +283,15 @@ pub fn copy_from_user_some<A: UaccessArch>(to: &mut [u8], from: u64) -> usize {
 /// under: faults disabled for the copy, missing pages faulted in
 /// between tries (as `copy_from_user_atomic`); the bytes copied
 #[track_caller]
-pub fn copy_from_user_atomic_some<A: UaccessArch>(to: &mut [u8], from: u64) -> usize {
+pub fn copy_from_user_atomic_some(to: &mut [u8], from: u64) -> usize {
     let mut done = 0;
     while done < to.len() {
         pagefault_disable();
-        let c = copy_from_user_some::<A>(&mut to[done..], from + done as u64);
+        let c = copy_from_user_some(&mut to[done..], from + done as u64);
         pagefault_enable();
         done += c;
         let rest = to.len() - done;
-        if done < to.len() && c == 0 && fault_in_readable::<A>(from + done as u64, rest) == rest {
+        if done < to.len() && c == 0 && fault_in_readable(from + done as u64, rest) == rest {
             break;
         }
     }
@@ -289,11 +303,11 @@ pub fn copy_from_user_atomic_some<A: UaccessArch>(to: &mut [u8], from: u64) -> u
 /// Returns the bytes from the first page that could not be faulted in
 /// to the end (0: all present). Call with no spinlock and no mmap_lock
 /// held; i_rwsem may be held (i_rwsem -> mmap_lock).
-pub fn fault_in_readable<A: UaccessArch>(addr: u64, len: usize) -> usize {
+pub fn fault_in_readable(addr: u64, len: usize) -> usize {
     let end = addr.saturating_add(len as u64);
     let mut a = addr;
     while a < end {
-        if get_user::<A, u8>(a).is_err() {
+        if get_user::<u8>(a).is_err() {
             return (end - a) as usize;
         }
         a = (a & !0xfff) + 0x1000;
@@ -307,17 +321,13 @@ pub fn fault_in_readable<A: UaccessArch>(addr: u64, len: usize) -> usize {
 /// faulted in (`fault_in_readable`) and the copy retried, EFAULT if it
 /// cannot be
 #[track_caller]
-pub fn copy_from_user_atomic<A: UaccessArch>(
-    to: &mut [u8],
-    from: u64,
-    len: usize,
-) -> UaccessResult<usize> {
+pub fn copy_from_user_atomic(to: &mut [u8], from: u64, len: usize) -> UaccessResult<usize> {
     loop {
         pagefault_disable();
-        let r = copy_from_user::<A>(to, from, len);
+        let r = copy_from_user(to, from, len);
         pagefault_enable();
         match r {
-            Err(UaccessError::Fault) if fault_in_readable::<A>(from, len) == 0 => continue,
+            Err(UaccessError::Fault) if fault_in_readable(from, len) == 0 => continue,
             r => return r,
         }
     }
@@ -336,12 +346,12 @@ pub fn copy_from_user_atomic<A: UaccessArch>(
 /// * `Ok(())` on success
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 #[track_caller]
-pub fn put_user<A: UaccessArch, T: IntoBytes>(to: u64, value: T) -> UaccessResult<()> {
+pub fn put_user<T: IntoBytes>(to: u64, value: T) -> UaccessResult<()> {
     might_fault();
     let size = ::core::mem::size_of::<T>();
 
     // Validate user address
-    if !A::access_ok(to, size) {
+    if !Arch::access_ok(to, size) {
         return Err(UaccessError::BadAddress);
     }
 
@@ -350,9 +360,9 @@ pub fn put_user<A: UaccessArch, T: IntoBytes>(to: u64, value: T) -> UaccessResul
     // SAFETY: `to` passed access_ok for `size` bytes (a fault is caught
     // and counted); `src` is the value's `size` initialized bytes
     let left = unsafe {
-        A::user_access_begin();
-        let left = A::copy_user_raw(to as *mut u8, src.as_ptr(), size);
-        A::user_access_end();
+        Arch::user_access_begin();
+        let left = Arch::copy_user_raw(to as *mut u8, src.as_ptr(), size);
+        Arch::user_access_end();
         left
     };
 
@@ -374,12 +384,12 @@ pub fn put_user<A: UaccessArch, T: IntoBytes>(to: u64, value: T) -> UaccessResul
 /// * `Ok(value)` on success
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 #[track_caller]
-pub fn get_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessResult<T> {
+pub fn get_user<T: FromBytes>(from: u64) -> UaccessResult<T> {
     might_fault();
     let size = ::core::mem::size_of::<T>();
 
     // Validate user address
-    if !A::access_ok(from, size) {
+    if !Arch::access_ok(from, size) {
         return Err(UaccessError::BadAddress);
     }
 
@@ -388,9 +398,9 @@ pub fn get_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessResult<T> {
     // SAFETY: `from` passed access_ok for `size` bytes (a fault is caught
     // and counted); the destination is `value`'s `size` bytes
     let left = unsafe {
-        A::user_access_begin();
-        let left = A::copy_user_raw(value.as_mut_ptr().cast::<u8>(), from as *const u8, size);
-        A::user_access_end();
+        Arch::user_access_begin();
+        let left = Arch::copy_user_raw(value.as_mut_ptr().cast::<u8>(), from as *const u8, size);
+        Arch::user_access_end();
         left
     };
 
@@ -408,18 +418,18 @@ pub fn get_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessResult<T> {
 /// BadAddress outside user space or not 4-byte aligned; Fault for an
 /// unresolvable fault; Again when an exclusive store kept failing
 #[track_caller]
-pub fn cmpxchg_user_u32<A: UaccessArch>(uaddr: u64, old: u32, new: u32) -> UaccessResult<u32> {
+pub fn cmpxchg_user_u32(uaddr: u64, old: u32, new: u32) -> UaccessResult<u32> {
     might_fault();
-    if !A::access_ok(uaddr, 4) || !uaddr.is_multiple_of(4) {
+    if !Arch::access_ok(uaddr, 4) || !uaddr.is_multiple_of(4) {
         return Err(UaccessError::BadAddress);
     }
     let mut cur = 0u32;
     // SAFETY: `uaddr` passed access_ok for 4 bytes and is aligned (a
     // fault is caught by the fixup); `cur` is a local; begin/end paired
     let r = unsafe {
-        A::user_access_begin();
-        let r = A::cmpxchg_user_raw(uaddr as *mut u32, old, new, &raw mut cur);
-        A::user_access_end();
+        Arch::user_access_begin();
+        let r = Arch::cmpxchg_user_raw(uaddr as *mut u32, old, new, &raw mut cur);
+        Arch::user_access_end();
         r
     };
     match r {
@@ -431,20 +441,20 @@ pub fn cmpxchg_user_u32<A: UaccessArch>(uaddr: u64, old: u32, new: u32) -> Uacce
 
 /// Copy a plain-data value from user space; for user structs such as
 /// `struct timespec[2]`
-pub fn copy_val_from_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessResult<T> {
+pub fn copy_val_from_user<T: FromBytes>(from: u64) -> UaccessResult<T> {
     let mut value = MaybeUninit::<T>::zeroed();
     let size = ::core::mem::size_of::<T>();
     // SAFETY: `value`'s own bytes, all initialized (zeroed)
     let bytes = unsafe { ::core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size) };
-    copy_from_user::<A>(bytes, from, size)?;
+    copy_from_user(bytes, from, size)?;
     // SAFETY: any bit pattern is a valid T (FromBytes)
     Ok(unsafe { value.assume_init() })
 }
 
 /// Copy a plain-data value to user space; `T` has no padding, which
 /// would leak kernel stack bytes
-pub fn copy_val_to_user<A: UaccessArch, T: IntoBytes>(to: u64, value: &T) -> UaccessResult<()> {
-    copy_to_user::<A>(to, value.as_bytes())?;
+pub fn copy_val_to_user<T: IntoBytes>(to: u64, value: &T) -> UaccessResult<()> {
+    copy_to_user(to, value.as_bytes())?;
     Ok(())
 }
 
@@ -461,24 +471,18 @@ pub fn copy_val_to_user<A: UaccessArch, T: IntoBytes>(to: u64, value: &T) -> Uac
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 /// * `Err(UaccessError::TooLong)` if no NUL is found within `max_len` bytes
 #[track_caller]
-pub fn strncpy_from_user<A: UaccessArch>(
-    from: u64,
-    max_len: usize,
-) -> UaccessResult<alloc::vec::Vec<u8>> {
+pub fn strncpy_from_user(from: u64, max_len: usize) -> UaccessResult<alloc::vec::Vec<u8>> {
     might_fault();
     // Names are bytes (Linux getname): any but NUL
-    strndup_user_bytes::<A>(from, max_len)
+    strndup_user_bytes(from, max_len)
 }
 
 /// As [`strncpy_from_user`], for strings that are text by definition (key
 /// types, xattr names, filesystem type names): not valid UTF-8 is
 /// `UaccessError::Encoding`
 #[track_caller]
-pub fn strncpy_from_user_str<A: UaccessArch>(
-    from: u64,
-    max_len: usize,
-) -> UaccessResult<alloc::string::String> {
-    let bytes = strncpy_from_user::<A>(from, max_len)?;
+pub fn strncpy_from_user_str(from: u64, max_len: usize) -> UaccessResult<alloc::string::String> {
+    let bytes = strncpy_from_user(from, max_len)?;
     alloc::string::String::from_utf8(bytes).map_err(|_| UaccessError::Encoding)
 }
 
@@ -492,10 +496,7 @@ pub fn strncpy_from_user_str<A: UaccessArch>(
 /// * `Ok(bytes)` without the terminator
 /// * `Err(BadAddress)` / `Err(Fault)` for an invalid or unmapped address
 /// * `Err(TooLong)` if no NUL is found within `max_len` bytes
-pub fn strndup_user_bytes<A: UaccessArch>(
-    from: u64,
-    max_len: usize,
-) -> UaccessResult<alloc::vec::Vec<u8>> {
+pub fn strndup_user_bytes(from: u64, max_len: usize) -> UaccessResult<alloc::vec::Vec<u8>> {
     const PAGE: u64 = 4096;
     let mut out = alloc::vec::Vec::new();
     let mut ptr = from;
@@ -503,7 +504,7 @@ pub fn strndup_user_bytes<A: UaccessArch>(
     while out.len() < max_len {
         let to_page_end = (PAGE - (ptr % PAGE)) as usize;
         let n = chunk.len().min(to_page_end).min(max_len - out.len());
-        copy_from_user::<A>(&mut chunk[..n], ptr, n)?;
+        copy_from_user(&mut chunk[..n], ptr, n)?;
         if let Some(z) = chunk[..n].iter().position(|&b| b == 0) {
             out.extend_from_slice(&chunk[..z]);
             return Ok(out);
@@ -588,7 +589,7 @@ impl<T: FromBytes> UserPtr<T> {
     /// The `T` at this address, read once
     #[track_caller]
     pub fn read(self) -> UaccessResult<T> {
-        get_user::<crate::arch::Uaccess, T>(self.addr)
+        get_user::<T>(self.addr)
     }
 }
 
@@ -596,7 +597,7 @@ impl<T: IntoBytes> UserPtr<T> {
     /// Store `v` at this address
     #[track_caller]
     pub fn write(self, v: &T) -> UaccessResult<()> {
-        copy_to_user::<crate::arch::Uaccess>(self.addr, v.as_bytes()).map(|_| ())
+        copy_to_user(self.addr, v.as_bytes()).map(|_| ())
     }
 }
 
@@ -616,29 +617,24 @@ impl UserSlice {
 
     /// Read the buffer front to back
     pub fn reader(self) -> UserSliceReader {
-        UserSliceReader::<crate::arch::Uaccess>::new(self.addr, self.len)
+        UserSliceReader::new(self.addr, self.len)
     }
 
     /// Write the buffer front to back
     pub fn writer(self) -> UserSliceWriter {
-        UserSliceWriter::<crate::arch::Uaccess>::new(self.addr, self.len)
+        UserSliceWriter::new(self.addr, self.len)
     }
 }
 
 /// The reading half of a [`UserSlice`]
-pub struct UserSliceReader<A: UaccessArch = crate::arch::Uaccess> {
+pub struct UserSliceReader {
     addr: u64,
     len: usize,
-    _a: core::marker::PhantomData<A>,
 }
 
-impl<A: UaccessArch> UserSliceReader<A> {
+impl UserSliceReader {
     pub const fn new(addr: u64, len: usize) -> Self {
-        Self {
-            addr,
-            len,
-            _a: core::marker::PhantomData,
-        }
+        Self { addr, len }
     }
 
     /// Bytes not read yet
@@ -657,7 +653,7 @@ impl<A: UaccessArch> UserSliceReader<A> {
         if out.len() > self.len {
             return Err(UaccessError::Overflow);
         }
-        copy_from_user::<A>(out, self.addr, out.len())?;
+        copy_from_user(out, self.addr, out.len())?;
         self.skip(out.len())
     }
 
@@ -692,19 +688,14 @@ impl<A: UaccessArch> UserSliceReader<A> {
 }
 
 /// The writing half of a [`UserSlice`]
-pub struct UserSliceWriter<A: UaccessArch = crate::arch::Uaccess> {
+pub struct UserSliceWriter {
     addr: u64,
     len: usize,
-    _a: core::marker::PhantomData<A>,
 }
 
-impl<A: UaccessArch> UserSliceWriter<A> {
+impl UserSliceWriter {
     pub const fn new(addr: u64, len: usize) -> Self {
-        Self {
-            addr,
-            len,
-            _a: core::marker::PhantomData,
-        }
+        Self { addr, len }
     }
 
     /// Room left
@@ -722,7 +713,7 @@ impl<A: UaccessArch> UserSliceWriter<A> {
         if data.len() > self.len {
             return Err(UaccessError::Overflow);
         }
-        copy_to_user::<A>(self.addr, data)?;
+        copy_to_user(self.addr, data)?;
         self.addr += data.len() as u64;
         self.len -= data.len();
         Ok(())
@@ -740,12 +731,12 @@ impl<A: UaccessArch> UserSliceWriter<A> {
 /// user struct leaves `dst`'s tail zero (older ABI); a longer one must
 /// be zero past `dst`'s size (newer ABI fields this kernel does not
 /// know), else `E2BIG` (`Err(None)`). A failed access is `Err(Some(e))`.
-pub fn copy_struct_from_user<A: UaccessArch, T: FromBytes + IntoBytes>(
+pub fn copy_struct_from_user<T: FromBytes + IntoBytes>(
     src: u64,
     usize: usize,
 ) -> Result<T, Option<UaccessError>> {
     let ksize = core::mem::size_of::<T>();
-    let mut r = UserSliceReader::<A>::new(src, usize);
+    let mut r = UserSliceReader::new(src, usize);
     let mut v = T::zeroed();
     // SAFETY: `v`'s own initialized bytes; any bytes leave a valid T
     let b =
@@ -766,25 +757,48 @@ pub fn copy_struct_from_user<A: UaccessArch, T: FromBytes + IntoBytes>(
 }
 
 /// A uaccess "architecture" over the host's own memory, for host unit
-/// tests of code that copies from and to user space: user addresses are
-/// host pointers
+/// tests of code that copies from and to user space. User space is the
+/// [`UserMem`] buffers the current thread holds: an address outside them
+/// fails `access_ok` (EFAULT), as an address outside user space does on
+/// the machine.
 #[cfg(test)]
 pub struct HostUaccess;
+
+#[cfg(test)]
+std::thread_local! {
+    /// The [start, end) of each live [`UserMem`] this thread created
+    static USER_WINDOWS: core::cell::RefCell<alloc::vec::Vec<(u64, u64)>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+}
 
 #[cfg(test)]
 impl UaccessArch for HostUaccess {
     const TASK_SIZE: u64 = u64::MAX;
 
+    /// [addr, addr + size) lies inside one of this thread's [`UserMem`]s
+    fn access_ok(addr: u64, size: usize) -> bool {
+        let Some(end) = addr.checked_add(size as u64) else {
+            return false;
+        };
+        USER_WINDOWS.with_borrow(|w| w.iter().any(|&(s, e)| s <= addr && end <= e))
+    }
+
     unsafe fn user_access_begin() {}
 
     unsafe fn copy_user_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
-        // SAFETY: test "user" addresses are live host buffers
+        // SAFETY: the caller passed the user side through access_ok, so
+        // it lies inside a UserMem allocation of this thread, live
+        // (deregistered before it is freed) and reached by no reference
+        // (UserMem hands out copies only); the kernel side is valid for
+        // `len` bytes (the caller); `copy` allows overlap
         unsafe { core::ptr::copy(src, dst, len) };
         0
     }
 
     unsafe fn cmpxchg_user_raw(uaddr: *mut u32, old: u32, new: u32, cur: *mut u32) -> i32 {
-        // SAFETY: as above; aligned (the caller checked)
+        // SAFETY: `uaddr` passed access_ok for 4 bytes (inside a live
+        // UserMem allocation of this thread, as in copy_user_raw) and is
+        // aligned (the caller checked)
         let a = unsafe { core::sync::atomic::AtomicU32::from_ptr(uaddr) };
         let v = match a.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(v) | Err(v) => v,
@@ -797,18 +811,109 @@ impl UaccessArch for HostUaccess {
     unsafe fn user_access_end() {}
 }
 
+/// "User memory" for a host unit test: a zeroed, 16-byte aligned heap
+/// buffer that is user space (passes `access_ok`) on the creating thread
+/// while it lives. It is read and written only by copy, so the uaccess
+/// copies into it never alias a reference.
+///
+/// # Invariants
+/// `ptr` is an allocation of `layout`, owned, registered in this
+/// thread's `USER_WINDOWS` until drop. `!Send` (raw pointer): dropped on
+/// the thread whose window it removes.
+#[cfg(test)]
+pub struct UserMem {
+    ptr: *mut u8,
+    layout: core::alloc::Layout,
+}
+
+#[cfg(test)]
+impl UserMem {
+    /// `len` zero bytes
+    pub fn zeroed(len: usize) -> Self {
+        let layout = core::alloc::Layout::from_size_align(len.max(1), 16).unwrap();
+        // SAFETY: `layout` has a nonzero size
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+        let start = ptr.expose_provenance() as u64;
+        // INVARIANT: registered until drop
+        USER_WINDOWS.with_borrow_mut(|w| w.push((start, start + len as u64)));
+        Self { ptr, layout }
+    }
+
+    /// `data` followed by `pad` zero bytes (room for the chunked string
+    /// readers, which read ahead up to their limit)
+    pub fn with(data: &[u8], pad: usize) -> Self {
+        let m = Self::zeroed(data.len() + pad);
+        m.write(0, data);
+        m
+    }
+
+    /// The user address of the first byte
+    pub fn addr(&self) -> u64 {
+        self.ptr.addr() as u64
+    }
+
+    /// The user address `off` bytes in
+    pub fn at(&self, off: usize) -> u64 {
+        self.addr() + off as u64
+    }
+
+    /// A copy of `len` bytes from offset `off`
+    pub fn read(&self, off: usize, len: usize) -> alloc::vec::Vec<u8> {
+        assert!(
+            off.checked_add(len)
+                .is_some_and(|e| e <= self.layout.size())
+        );
+        let mut v = alloc::vec![0u8; len];
+        // SAFETY: in bounds (asserted) of the owned allocation (type
+        // invariant); `v` is a separate buffer
+        unsafe { core::ptr::copy_nonoverlapping(self.ptr.add(off), v.as_mut_ptr(), len) };
+        v
+    }
+
+    /// The `T` at offset `off`
+    pub fn get<T: FromBytes>(&self, off: usize) -> T {
+        let b = self.read(off, core::mem::size_of::<T>());
+        // SAFETY: `b` holds size_of::<T>() bytes; any bit pattern is a
+        // valid T (FromBytes); unaligned read
+        unsafe { b.as_ptr().cast::<T>().read_unaligned() }
+    }
+
+    /// Copy `data` in at offset `off`
+    pub fn write(&self, off: usize, data: &[u8]) {
+        assert!(
+            off.checked_add(data.len())
+                .is_some_and(|e| e <= self.layout.size())
+        );
+        // SAFETY: in bounds (asserted) of the owned allocation (type
+        // invariant), which no reference reaches; `data` is elsewhere
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(off), data.len()) };
+    }
+}
+
+#[cfg(test)]
+impl Drop for UserMem {
+    fn drop(&mut self) {
+        let start = self.addr();
+        USER_WINDOWS.with_borrow_mut(|w| {
+            let i = w.iter().position(|&(s, _)| s == start).unwrap();
+            w.swap_remove(i);
+        });
+        // SAFETY: allocated with `layout` (type invariant), no longer
+        // user space, freed once
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ua<T>(p: &T) -> u64 {
-        core::ptr::from_ref(p).addr() as u64
-    }
-
     #[test]
     fn reader_moves_forward_once() {
-        let buf: [u32; 3] = [1, 2, 3];
-        let mut r = UserSliceReader::<HostUaccess>::new(ua(&buf), 12);
+        let m = UserMem::zeroed(12);
+        m.write(0, [1u32, 2, 3].as_bytes());
+        let mut r = UserSliceReader::new(m.addr(), 12);
         assert_eq!(r.read::<u32>(), Ok(1));
         assert_eq!(r.read::<u64>(), Ok(2 | (3 << 32)));
         assert!(r.is_empty());
@@ -817,44 +922,61 @@ mod tests {
 
     #[test]
     fn writer_bounds() {
-        let mut buf = [0u8; 6];
-        let mut w = UserSliceWriter::<HostUaccess>::new(buf.as_mut_ptr().addr() as u64, 6);
+        let m = UserMem::zeroed(6);
+        let mut w = UserSliceWriter::new(m.addr(), 6);
         w.write(&0x0403_0201u32).unwrap();
         assert_eq!(w.write(&0u32), Err(UaccessError::Overflow));
         w.write_slice(&[5, 6]).unwrap();
-        assert_eq!(buf, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(m.read(0, 6), [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
     fn struct_versions() {
         // Shorter user struct: the tail stays zero
-        let short: [u32; 1] = [7];
-        let v = copy_struct_from_user::<HostUaccess, [u32; 2]>(ua(&short), 4);
+        let m = UserMem::with([7u32].as_bytes(), 0);
+        let v = copy_struct_from_user::<[u32; 2]>(m.addr(), 4);
         assert_eq!(v, Ok([7, 0]));
         // Longer with a zero tail: accepted
-        let long: [u32; 3] = [7, 8, 0];
-        let v = copy_struct_from_user::<HostUaccess, [u32; 2]>(ua(&long), 12);
+        let m = UserMem::with([7u32, 8, 0].as_bytes(), 0);
+        let v = copy_struct_from_user::<[u32; 2]>(m.addr(), 12);
         assert_eq!(v, Ok([7, 8]));
         // Longer with a nonzero tail: E2BIG
-        let long: [u32; 3] = [7, 8, 9];
-        let v = copy_struct_from_user::<HostUaccess, [u32; 2]>(ua(&long), 12);
+        let m = UserMem::with([7u32, 8, 9].as_bytes(), 0);
+        let v = copy_struct_from_user::<[u32; 2]>(m.addr(), 12);
         assert_eq!(v, Err(None));
     }
 
     #[test]
     fn strings_and_cmpxchg() {
-        let s = *b"hello\0world";
-        assert_eq!(
-            strndup_user_bytes::<HostUaccess>(ua(&s), 64).unwrap(),
-            b"hello"
-        );
-        assert_eq!(
-            strndup_user_bytes::<HostUaccess>(ua(&s), 3),
-            Err(UaccessError::TooLong)
-        );
-        let mut w = 5u32;
-        let wa = core::ptr::from_mut(&mut w).addr() as u64;
-        assert_eq!(cmpxchg_user_u32::<HostUaccess>(wa, 5, 9), Ok(5));
-        assert_eq!(cmpxchg_user_u32::<HostUaccess>(wa, 5, 1), Ok(9));
+        let s = UserMem::with(b"hello\0world", 64);
+        assert_eq!(strndup_user_bytes(s.addr(), 64).unwrap(), b"hello");
+        assert_eq!(strndup_user_bytes(s.addr(), 3), Err(UaccessError::TooLong));
+        let w = UserMem::with(&5u32.to_ne_bytes(), 0);
+        assert_eq!(cmpxchg_user_u32(w.addr(), 5, 9), Ok(5));
+        assert_eq!(cmpxchg_user_u32(w.addr(), 5, 1), Ok(9));
+        assert_eq!(w.get::<u32>(0), 9);
+    }
+
+    #[test]
+    fn outside_user_memory_faults() {
+        // A kernel (host stack) address is not user space
+        let k = [0u8; 8];
+        let ka = k.as_ptr().addr() as u64;
+        assert_eq!(get_user::<u64>(ka), Err(UaccessError::BadAddress));
+        assert_eq!(put_user(ka, 1u64), Err(UaccessError::BadAddress));
+        assert_eq!(copy_to_user(ka, &[1]), Err(UaccessError::BadAddress));
+        // Straddling the end of user memory, or past it
+        let m = UserMem::zeroed(8);
+        assert_eq!(get_user::<u64>(m.at(4)), Err(UaccessError::BadAddress));
+        assert_eq!(copy_from_user_some(&mut [0; 4], m.at(8)), 0);
+        assert_eq!(get_user::<u32>(m.at(4)), Ok(0));
+        // Gone once dropped
+        let a = m.addr();
+        drop(m);
+        assert!(!access_ok(a, 1));
+        // Another thread's user memory is not this thread's
+        let m = UserMem::zeroed(8);
+        let a = m.addr();
+        assert!(std::thread::spawn(move || !access_ok(a, 8)).join().unwrap());
     }
 }

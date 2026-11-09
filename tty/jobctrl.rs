@@ -20,7 +20,7 @@ use crate::fs::File;
 use crate::fs::flags::{O_ACCMODE, O_WRONLY};
 use crate::signal::{SIGCONT, SIGHUP, kill_pgrp_pid};
 use crate::sync::spin::Mutex;
-use crate::task::percpu::{GlobalTaskTable, TASKLIST, current_pid, current_sid, current_tid};
+use crate::task::percpu::{GlobalTaskTable, TASKLIST, current_pid, current_sid};
 use crate::task::pid::Pid;
 use crate::util::error::KernelError;
 
@@ -30,8 +30,9 @@ static CTTY_LOCK: Mutex<()> = Mutex::new(());
 /// The caller's process group and session (Linux task_pgrp,
 /// task_session); None for a kernel thread
 fn pids(table: &GlobalTaskTable) -> Option<(Arc<Pid>, Arc<Pid>)> {
-    let t = table.get(current_tid())?;
-    Some((t.pgrp.clone()?, t.session.clone()?))
+    let me = crate::task::percpu::current();
+    let t = table.view(&me)?;
+    Some((t.pgrp().cloned()?, t.session().cloned()?))
 }
 
 /// The caller's session
@@ -157,7 +158,7 @@ pub fn disassociate_ctty() {
 /// hk has no group stop, so where Linux would stop the group (SIG_DFL)
 /// the signal is sent and the call fails with EIO instead of
 /// restarting forever
-pub fn check_change(tty: &Tty, sig: u32) -> Result<(), KernelError> {
+pub fn check_change(tty: &Tty, sig: crate::signal::Signal) -> Result<(), KernelError> {
     use crate::signal::{Disposition, SIGTTIN, disposition};
     let Some((pg, s)) = pids(&TASKLIST.read()) else {
         return Ok(());
@@ -234,7 +235,7 @@ pub fn tiocspgrp(tty: &Tty, pgrp: i32) -> Result<(), KernelError> {
     let in_session = table
         .pgrp(&pg)
         .next()
-        .and_then(|m| m.session.clone())
+        .and_then(|m| m.session().cloned())
         .is_some_and(|ms| Arc::ptr_eq(&ms, &s));
     if !in_session {
         return Err(KernelError::NotPermitted);

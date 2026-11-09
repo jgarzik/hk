@@ -5,9 +5,9 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use super::kmap::pa_symbol;
 use super::{cpu, exceptions, gic, percpu, power, timer};
 use crate::arch::{AcpiInfo, FrameAlloc};
+use crate::mm::swapper::pa_symbol;
 use crate::printkln;
 
 /// Stack size per AP (16KB)
@@ -123,7 +123,7 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
         unsafe {
             let boot_data = &mut (*AP_BOOT_DATA.get())[cpu_id as usize];
             boot_data.stack_top = stack_top;
-            boot_data.ttbr1 = super::kmap::swapper_phys();
+            boot_data.ttbr1 = crate::mm::swapper::swapper_phys();
             boot_data.entry_point = ap_rust_entry as *const () as u64;
             boot_data.mpidr = target_mpidr;
             boot_data.cpu_id = cpu_id;

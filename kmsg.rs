@@ -29,8 +29,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::vec::Vec;
 
-use crate::arch::IrqSpinlock;
 use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;

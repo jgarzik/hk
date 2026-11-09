@@ -47,11 +47,11 @@ pub fn sys_seccomp(op: u64, flags: u64, args: u64) -> KernelResult<i64> {
 
 /// Enable STRICT seccomp mode
 fn set_seccomp_strict() -> KernelResult<()> {
-    let tid = crate::task::percpu::current_tid();
+    let me = crate::task::percpu::current();
 
     {
         let mut table = TASKLIST.write();
-        let task = table.get_mut(tid).ok_or(KernelError::NoProcess)?;
+        let task = table.view_mut(&me).ok_or(KernelError::NoProcess)?;
         // Can only enable seccomp, not change modes once enabled
         if task.task.seccomp_mode() != SECCOMP_MODE_DISABLED {
             return Err(KernelError::InvalidArgument);
@@ -68,18 +68,17 @@ fn set_seccomp_strict() -> KernelResult<()> {
 /// every thread of the group (Linux SECCOMP_FILTER_FLAG_TSYNC): 0, or
 /// with TSYNC the tid of a thread that cannot take it
 fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> KernelResult<i64> {
-    use crate::arch::Uaccess;
-
     if fprog.is_null() {
         return Err(KernelError::InvalidArgument);
     }
 
-    let tid = crate::task::percpu::current_tid();
+    let cur = crate::task::percpu::current();
+    let tid = cur.tid();
 
     // TSYNC holds the group's cred_guard (Linux: killable) so no exec
     // changes the threads meanwhile
     let _guard = if tsync {
-        Some(crate::signal::CredGuard::lock(tid)?)
+        Some(crate::signal::CredGuard::lock(&cur)?)
     } else {
         None
     };
@@ -92,10 +91,10 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
         // Get current task's existing filter and check no_new_privs
         let (existing_filter, has_no_new_privs, is_privileged) = {
             let table = TASKLIST.read();
-            let task = table.get(tid).ok_or(KernelError::NoProcess)?;
+            let task = table.view(&cur).ok_or(KernelError::NoProcess)?;
             (
-                task.seccomp_filter.clone(),
-                task.prctl.no_new_privs,
+                task.seccomp_filter().cloned(),
+                task.no_new_privs(),
                 crate::task::capable(crate::task::CAP_SYS_ADMIN),
             )
         };
@@ -105,11 +104,10 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
             return Err(KernelError::PermissionDenied);
         }
 
-        let new_filter =
-            create_filter_from_user::<Uaccess>(fprog.addr(), existing_filter.clone(), log)?;
+        let new_filter = create_filter_from_user(fprog.addr(), existing_filter.clone(), log)?;
         let table = TASKLIST.write();
-        let me = table.get(tid).ok_or(KernelError::NoProcess)?;
-        let same = match (&me.seccomp_filter, &existing_filter) {
+        let me = table.view(&cur).ok_or(KernelError::NoProcess)?;
+        let same = match (me.seccomp_filter(), &existing_filter) {
             (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(a, b),
             (None, None) => true,
             _ => false,
@@ -118,12 +116,8 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
             break (new_filter, table);
         }
     };
-    let me = table.get(tid).ok_or(KernelError::NoProcess)?;
-    let (pid, mine, nnp) = (
-        me.task.pid,
-        me.seccomp_filter.clone(),
-        me.prctl.no_new_privs,
-    );
+    let me = table.view(&cur).ok_or(KernelError::NoProcess)?;
+    let (pid, mine, nnp) = (me.task.pid, me.seccomp_filter().cloned(), me.no_new_privs());
     let mut targets = alloc::vec![tid];
     if tsync {
         // Linux seccomp_can_sync_threads: every other thread's filter is
@@ -135,7 +129,7 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
         {
             let mode = t.task.seccomp_mode();
             let ok = (mode == SECCOMP_MODE_DISABLED || mode == SECCOMP_MODE_FILTER)
-                && SeccompFilter::is_ancestor_of(t.seccomp_filter.as_ref(), mine.as_ref());
+                && SeccompFilter::is_ancestor_of(t.seccomp_filter(), mine.as_ref());
             if !ok {
                 return Ok(t.task.tid() as i64);
             }
@@ -148,9 +142,9 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
         };
         // Filter first: syscall entry reads the mode lock-free, then
         // the filter under TASKLIST
-        task.seccomp_filter = Some(new_filter.clone());
+        task.set_seccomp_filter(new_filter.clone());
         if nnp {
-            task.prctl.no_new_privs = true;
+            task.set_no_new_privs();
         }
         task.task
             .seccomp_mode
@@ -180,10 +174,8 @@ fn get_action_avail(action: u64) -> KernelResult<()> {
 ///
 /// Returns the current seccomp mode.
 pub fn prctl_get_seccomp() -> i64 {
-    let tid = crate::task::percpu::current_tid();
-
     let table = TASKLIST.read();
-    match table.get(tid) {
+    match table.view(&crate::task::percpu::current()) {
         Some(task) => i64::from(task.task.seccomp_mode()),
         None => i64::from(SECCOMP_MODE_DISABLED),
     }

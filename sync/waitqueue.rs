@@ -71,11 +71,11 @@ use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 use crate::task::Task;
 use crate::task::percpu::{
-    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, current_tid, schedule_timeout,
-    set_current_state, try_to_wake_up,
+    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, schedule_timeout, set_current_state,
+    try_to_wake_up,
 };
 use crate::time::hrtimer::HrClock;
 use crate::util::error::KernelError;
@@ -179,7 +179,7 @@ pub struct WaitQueue {
 
 /// True if the current task has a deliverable signal pending
 pub fn signal_pending() -> bool {
-    crate::signal::has_pending_signals(current_tid())
+    crate::task::percpu::current().sigpending()
 }
 
 impl WaitQueue {
@@ -634,43 +634,40 @@ pub fn run_locking_tests() {
 fn test_preempt_count_tracking() {
     use crate::printkln;
 
-    #[cfg(target_arch = "aarch64")]
-    use crate::arch::aarch64::percpu;
-    #[cfg(target_arch = "x86_64")]
-    use crate::arch::x86_64::percpu;
+    use crate::arch::{preempt_count, preempt_disable, preempt_enable};
 
     // Get initial preempt_count
-    let initial_count = percpu::preempt_count();
+    let initial_count = preempt_count();
 
     // Test manual preempt_disable/enable
-    percpu::preempt_disable();
-    let after_disable = percpu::preempt_count();
+    preempt_disable();
+    let after_disable = preempt_count();
     assert!(
         after_disable == initial_count + 1,
         "preempt_disable should increment preempt_count"
     );
 
-    percpu::preempt_enable();
-    let after_enable = percpu::preempt_count();
+    preempt_enable();
+    let after_enable = preempt_count();
     assert!(
         after_enable == initial_count,
         "preempt_enable should restore preempt_count"
     );
 
     // Test IrqSpinlock preempt tracking
-    let test_lock = crate::arch::IrqSpinlock::new(42u32);
-    let before_lock = percpu::preempt_count();
+    let test_lock = crate::sync::IrqSpinlock::new(42u32);
+    let before_lock = preempt_count();
 
     {
         let _guard = test_lock.lock();
-        let during_lock = percpu::preempt_count();
+        let during_lock = preempt_count();
         assert!(
             during_lock == before_lock + 1,
             "IrqSpinlock::lock should increment preempt_count"
         );
     }
 
-    let after_drop = percpu::preempt_count();
+    let after_drop = preempt_count();
     assert!(
         after_drop == before_lock,
         "IrqSpinlock guard drop should restore preempt_count"
@@ -742,7 +739,7 @@ fn test_page_wait_table_hash() {
 mod relock_tests {
     extern crate std;
     use super::Relock;
-    use crate::arch::IrqSpinlock;
+    use crate::sync::IrqSpinlock;
     use core::panic::AssertUnwindSafe;
 
     /// A closure that unwinds out of `unlocked` leaves the lock held

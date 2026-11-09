@@ -57,18 +57,9 @@ fn current_time() -> Timespec {
     TIMEKEEPER.current_time()
 }
 
-/// `t` as the locked table lists it, if it still is (a tid names it
-/// only while it is listed)
-fn listed<'a>(
-    table: &'a crate::task::percpu::GlobalTaskTable,
-    t: &crate::task::Task,
-) -> Option<crate::task::percpu::TaskView<'a>> {
-    table.get(t.tid()).filter(|v| core::ptr::eq(v.task, t))
-}
-
 /// `t` is still in the task list (not reaped)
 fn alive(t: &crate::task::Task) -> bool {
-    listed(&crate::task::percpu::TASKLIST.read(), t).is_some()
+    crate::task::percpu::TASKLIST.read().view(t).is_some()
 }
 
 /// Task `t`'s descriptor table, fs struct, namespaces and address space
@@ -492,7 +483,7 @@ impl InodeOps for ProcfsInodeOps {
         }
         // fd/ and fdinfo/: ptrace-read access (Linux proc_fd_permission)
         if let Some(OpenCheck::Fds(t)) = open_check(inode)
-            && !crate::task::ptrace::may_read_ref(&t)
+            && !crate::task::ptrace::may_access_task(&t, true)
         {
             return Err(KernelError::PermissionDenied);
         }
@@ -666,10 +657,10 @@ fn group_threads(
     ns: &PidNamespace,
 ) -> Vec<(*const crate::task::Task, crate::task::Tid, u32)> {
     crate::task::percpu::GlobalTaskTable::collect_group(t, |_, x| {
-        if matches!(x.state, crate::task::TaskState::Zombie(_)) {
+        if matches!(x.state(), crate::task::TaskState::Zombie(_)) {
             return None;
         }
-        let nr = x.thread_pid.as_ref()?.nr_in(ns)?;
+        let nr = x.thread_pid()?.nr_in(ns)?;
         Some((core::ptr::from_ref(x.task), x.task.tid(), nr))
     })
 }
@@ -1051,7 +1042,7 @@ fn gen_fdinfo_content(t: &TaskRef, fd: i32, ns: &PidNamespace) -> Vec<u8> {
 /// without PTRACE_MODE_READ_FSCREDS access)
 fn ns_task(pid: &ProcPid) -> Result<TaskRef, KernelError> {
     let t = pid.task().ok_or(KernelError::PermissionDenied)?;
-    if !crate::task::ptrace::may_read_ref(&t) {
+    if !crate::task::ptrace::may_access_task(&t, true) {
         return Err(KernelError::PermissionDenied);
     }
     Ok(t)
@@ -1178,8 +1169,8 @@ fn mm_access(t: &TaskRef) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
     // The check and the mm it covers under the process's
     // exec_update_lock: no exec of it switches mm or dumpability between;
     // check and mm both of that one pinned task
-    let _g = crate::signal::ExecUpdateRead::lock_task(t);
-    if !crate::task::ptrace::may_read_ref(t) {
+    let _g = crate::signal::ExecUpdateRead::lock(t);
+    if !crate::task::ptrace::may_access_task(t, true) {
         return Err(KernelError::PermissionDenied);
     }
     Ok(task_mm(t))
@@ -1345,7 +1336,8 @@ fn pid_file(name: &str) -> Option<(u64, u16, PidGen)> {
 fn dump_owner(task: &TaskRef) -> (u32, u32) {
     use crate::task::percpu::TASKLIST;
     let table = TASKLIST.read();
-    listed(&table, task)
+    table
+        .view(task)
         .filter(|t| {
             t.task
                 .task_lock()
@@ -1373,10 +1365,10 @@ fn pid_file_pid(inode: &Inode) -> Option<TaskRef> {
 /// names it, EACCES without ptrace-read access (Linux
 /// proc_fd_access_allowed), ENOENT for a task without one
 fn fs_link(t: &TaskRef, root: bool) -> Result<Vec<u8>, KernelError> {
-    if !crate::task::ptrace::may_read_ref(t) {
+    if !crate::task::ptrace::may_access_task(t, true) {
         return Err(KernelError::PermissionDenied);
     }
-    let fs = crate::fs::task_fs(t).ok_or(KernelError::NotFound)?;
+    let fs = crate::fs::get_task_fs(t).ok_or(KernelError::NotFound)?;
     let p = if root { fs.get_root() } else { fs.get_pwd() };
     super::dentry::d_path_link(&p)
 }
@@ -1599,7 +1591,7 @@ impl FileOps for ProcfsFileOps {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let mm = match open_check(&inode) {
             Some(OpenCheck::Mm(t)) => mm_access(&t)?,
-            Some(OpenCheck::Fds(t)) if !crate::task::ptrace::may_read_ref(&t) => {
+            Some(OpenCheck::Fds(t)) if !crate::task::ptrace::may_access_task(&t, true) => {
                 return Err(KernelError::PermissionDenied);
             }
             _ => None,
@@ -1831,12 +1823,12 @@ fn readdir_emit_pids(root: &Inode, ctx: &mut DirContext<'_>) -> Result<(), Kerne
     let ns = opts::pid_ns(root);
     // Each group leader, by its number in ns, gathered with no
     // allocation under TASKLIST (references dropped after it)
-    let mut pids = crate::task::percpu::GlobalTaskTable::collect_tasks(|table, t| {
+    let mut pids = crate::task::percpu::GlobalTaskTable::collect_tasks(|_, t| {
         if t.task.tid() != t.task.pid || t.task.pid == 0 {
             return None;
         }
-        let nr = t.thread_pid.as_ref()?.nr_in(&ns)?;
-        Some((nr, table.task(t.task.tid())?))
+        let nr = t.thread_pid()?.nr_in(&ns)?;
+        Some((nr, crate::task::percpu::task_ref(t.task)))
     });
     pids.sort_unstable_by_key(|&(nr, _)| nr);
 
@@ -2285,11 +2277,11 @@ pub fn proc_flush_pid(t: &crate::task::Task) {
             .inner()
             .access(&table)
             .as_ref()
-            .and_then(|i| i.thread_pid.clone());
+            .and_then(|i| i.thread_pid().cloned());
         let leader = if t.tid() == t.pid {
             None
         } else {
-            table.get(t.pid).and_then(|l| l.thread_pid.clone())
+            table.get(t.pid).and_then(|l| l.thread_pid().cloned())
         };
         (thread, leader)
     };

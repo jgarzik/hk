@@ -20,13 +20,14 @@
 //! user mappings. Boot-time tables come from a static pool.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::sync::RacyCell;
+use crate::arch::KmapOps;
+use crate::mm::swapper::{idx, next, pa_symbol, set_direct_end, swapper, swapper_phys};
 
+use super::Aarch64Arch;
 use super::paging::{
     AF, AP_EL1_RO, AP_EL1_RW, ATTR_IDX_DEVICE, ATTR_IDX_NORMAL, IO_BASE, IO_SIZE, KIMAGE_OFFSET,
-    PAGE_OFFSET, PAGE_SIZE, PXN, RawPageTable, SH_INNER, UXN, VMEMMAP_START, phys_to_virt_table,
+    PAGE_OFFSET, PAGE_SIZE, PXN, PageTableEntry, RawPageTable, SH_INNER, UXN, VMEMMAP_START,
 };
 
 /// Page-table pages for the boot-built kernel tables
@@ -38,21 +39,25 @@ const SZ_1G: u64 = 1 << 30;
 /// RAM assumed when the DTB has no memory node (QEMU virt, -m 512M)
 const DEFAULT_RAM: (u64, u64) = (0x4000_0000, 512 << 20);
 
-#[repr(C, align(4096))]
-struct Pool([RawPageTable; POOL_PAGES]);
+impl KmapOps for Aarch64Arch {
+    const KIMAGE_OFFSET: u64 = KIMAGE_OFFSET;
+    const POOL_PAGES: usize = POOL_PAGES;
 
-static POOL: RacyCell<Pool> = RacyCell::new(Pool([const { RawPageTable::new() }; POOL_PAGES]));
-/// Pool pages handed out
-static POOL_USED: AtomicUsize = AtomicUsize::new(0);
+    fn mk_pmd(pa: u64, prot: u64) -> u64 {
+        let mut n = PageTableEntry::empty();
+        n.set_block(pa, prot);
+        n.0
+    }
 
-/// TTBR1 root (Linux: swapper_pg_dir)
-static SWAPPER: RacyCell<RawPageTable> = RacyCell::new(RawPageTable::new());
+    fn kmap_sync() {
+        // SAFETY: barriers only (nostack): the walker sees the entry
+        // before the first access
+        unsafe { asm!("dsb ishst", "isb", options(nostack)) };
+    }
+}
 
 /// Empty TTBR0 root for kernel threads (Linux: reserved_pg_dir)
 static RESERVED: RawPageTable = RawPageTable::new();
-
-/// Physical end of the linear map
-static DIRECT_END: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" {
     static _text: u8;
@@ -63,67 +68,14 @@ unsafe extern "C" {
     fn __replace_ttbr1(ttbr1: u64, ttbr0: u64);
 }
 
-/// Physical address of a kernel image symbol (Linux: __pa_symbol)
-pub fn pa_symbol(va: u64) -> u64 {
-    va - KIMAGE_OFFSET
-}
-
 /// Image virtual address of a physical address inside the image
 pub fn kimage_va(pa: u64) -> u64 {
     pa + KIMAGE_OFFSET
 }
 
-/// The kernel image in physical memory, as [start, end)
-pub fn image_range() -> (u64, u64) {
-    let start = pa_symbol(&raw const __kernel_start as u64);
-    (start, pa_symbol(&raw const __kernel_end as u64))
-}
-
-/// Physical address of the TTBR1 root
-pub fn swapper_phys() -> u64 {
-    pa_symbol(SWAPPER.get() as u64)
-}
-
 /// Physical address of the empty TTBR0 root
 pub fn reserved_phys() -> u64 {
     pa_symbol(&raw const RESERVED as u64)
-}
-
-/// Physical end of the linear map (0 before `init`)
-pub fn direct_end() -> u64 {
-    DIRECT_END.load(Ordering::Relaxed)
-}
-
-/// A zeroed page-table page from the pool, as its physical address
-fn pool_page() -> u64 {
-    let n = POOL_USED.fetch_add(1, Ordering::Relaxed);
-    assert!(n < POOL_PAGES, "kmap: page-table pool exhausted");
-    // SAFETY: page `n` of the pool, in bounds, handed out once (the
-    // counter); only its address is taken
-    let t = unsafe { &raw mut (*POOL.get()).0[n] };
-    pa_symbol(t as u64)
-}
-
-/// Next-level table under `table[idx]`, created if absent
-///
-/// # Safety
-/// `table` is a boot page table (swapper or pool page), during
-///  single-CPU early boot.
-unsafe fn next(table: *mut RawPageTable, idx: usize) -> *mut RawPageTable {
-    // SAFETY: `table` is a boot table no other CPU or reference reaches
-    // (the caller's guarantee); a missing entry gets a zeroed pool
-    // page, itself a boot table, reached through the linear map
-    unsafe {
-        let e = (*table).entry_mut(idx);
-        if !e.is_valid() {
-            e.set_table(pool_page());
-        }
-        phys_to_virt_table(e.addr())
-    }
-}
-
-fn idx(va: u64, shift: u32) -> usize {
-    ((va >> shift) & 511) as usize
 }
 
 /// Linear-map RAM [base, base + size): 1GB blocks where a whole
@@ -219,12 +171,12 @@ pub unsafe fn init() {
     // (identity-mapped) address; the tables it installs map the
     // running image and the linear map
     unsafe {
-        let root = SWAPPER.get();
+        let root = swapper();
         let mut end = 0;
         for r in memblock::MEMBLOCK.lock().memory.ranges() {
             end = end.max(map_linear(root, r.base, r.size()));
         }
-        DIRECT_END.store(end, Ordering::Relaxed);
+        set_direct_end(end);
         map_image(root);
         map_io(root);
         // vmemmap's top-level entry (filled by `map_page`)
@@ -239,62 +191,6 @@ pub unsafe fn init() {
         f(swapper_phys(), reserved_phys());
     }
     drop_idmap();
-}
-
-/// Map the kernel page `va` to `pa` (normal memory, writable, never
-/// executable) in TTBR1; missing tables come from `table` (the
-/// physical address of a zeroed frame)
-///
-/// # Safety
-/// Boot CPU, before SMP; `va` is unmapped and not in use.
-pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
-    // SAFETY: `walk`'s contract is this fn's; `va`'s entry, unmapped
-    // and unused, in a live swapper table; barriers only (nostack)
-    unsafe {
-        let t = walk(va, &[39, 30, 21], table);
-        (*t).entry_mut(idx(va, 12)).set_page(pa, KERNEL_RW);
-        // The walker sees the entry before the first access
-        asm!("dsb ishst", "isb", options(nostack));
-    }
-}
-
-/// `map_page` for a 2MB block: `va` and `pa` 2MB aligned, no table
-/// below that entry yet
-///
-/// # Safety
-/// As for `map_page`.
-pub unsafe fn map_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
-    // SAFETY: as in `map_page`
-    unsafe {
-        let t = walk(va, &[39, 30], table);
-        (*t).entry_mut(idx(va, 21)).set_block(pa, KERNEL_RW);
-        asm!("dsb ishst", "isb", options(nostack));
-    }
-}
-
-/// Kernel data: read-write, never executable
-const KERNEL_RW: u64 = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
-
-/// The table `shifts` lead to from TTBR1's root for `va`, missing ones
-/// from `table`
-///
-/// # Safety
-/// As for `map_page`.
-unsafe fn walk(va: u64, shifts: &[u32], table: &mut dyn FnMut() -> u64) -> *mut RawPageTable {
-    // SAFETY: the swapper and the kernel tables under it are live and,
-    // before SMP (the caller's guarantee), changed by this CPU only;
-    // `table` gives zeroed frames, reached through the linear map
-    unsafe {
-        let mut t = SWAPPER.get();
-        for &shift in shifts {
-            let e = (*t).entry_mut(idx(va, shift));
-            if !e.is_valid() {
-                e.set_table(table());
-            }
-            t = phys_to_virt_table(e.addr());
-        }
-        t
-    }
 }
 
 /// Leave the boot identity map on this CPU (APs, after reaching the

@@ -11,7 +11,7 @@
 
 use crate::syscall::Sys;
 use crate::uaccess::UserPtr;
-use crate::util::error::SysRet;
+use crate::util::error::{KernelResult, SysRet};
 
 use super::cpu::{KERNEL_CODE_SELECTOR, USER_DATA_SELECTOR};
 
@@ -762,10 +762,8 @@ pub fn x86_64_syscall_dispatch(
         SYS_ACCESS => {
             crate::fs::syscall::sys_access(UserPtr::new(args[0]), args[1] as i32).ret() as u64
         }
-        SYS_ALARM => crate::time::posix_timer::sys_alarm(args[0] as u32).ret() as u64,
-        SYS_ARCH_PRCTL => {
-            crate::task::syscall::sys_arch_prctl(args[0] as i32, args[1]).ret() as u64
-        }
+        SYS_ALARM => sys_alarm(args[0] as u32).ret() as u64,
+        SYS_ARCH_PRCTL => super::process::sys_arch_prctl(args[0] as i32, args[1]).ret() as u64,
         SYS_CHMOD => {
             crate::fs::syscall::sys_chmod(UserPtr::new(args[0]), args[1] as u32).ret() as u64
         }
@@ -782,17 +780,16 @@ pub fn x86_64_syscall_dispatch(
             args[3] as i32,
         )
         .ret() as u64,
-        SYS_EVENTFD => crate::time::time_syscall::sys_eventfd(args[0] as u32).ret() as u64,
+        // eventfd2 without flags
+        SYS_EVENTFD => crate::time::time_syscall::sys_eventfd2(args[0] as u32, 0).ret() as u64,
         SYS_FORK => crate::task::syscall::sys_fork().ret() as u64,
         SYS_GETDENTS => {
             crate::fs::syscall::sys_getdents(args[0] as i32, UserPtr::new(args[1]), args[2]).ret()
                 as u64
         }
         SYS_INOTIFY_INIT => crate::io::inotify::sys_inotify_init().ret() as u64,
-        SYS_IOPERM => {
-            crate::task::syscall::sys_ioperm(args[0], args[1], args[2] as i32).ret() as u64
-        }
-        SYS_IOPL => crate::task::syscall::sys_iopl(args[0] as u32).ret() as u64,
+        SYS_IOPERM => super::process::sys_ioperm(args[0], args[1], args[2] as i32).ret() as u64,
+        SYS_IOPL => super::process::sys_iopl(args[0] as u32).ret() as u64,
         SYS_LCHOWN => {
             crate::fs::syscall::sys_lchown(UserPtr::new(args[0]), args[1] as u32, args[2] as u32)
                 .ret() as u64
@@ -847,9 +844,7 @@ pub fn x86_64_syscall_dispatch(
             crate::fs::syscall::sys_symlink(UserPtr::new(args[0]), UserPtr::new(args[1])).ret()
                 as u64
         }
-        SYS_TIME => {
-            crate::time::time_syscall::sys_time(crate::uaccess::UserPtr::new(args[0])).ret() as u64
-        }
+        SYS_TIME => sys_time(UserPtr::new(args[0])).ret() as u64,
         SYS_UNLINK => crate::fs::syscall::sys_unlink(UserPtr::new(args[0])).ret() as u64,
         SYS_UTIME => {
             crate::fs::syscall::sys_utime(UserPtr::new(args[0]), UserPtr::new(args[1])).ret() as u64
@@ -1132,4 +1127,42 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_WRITEV => Sys::Writev,
         _ => return None,
     })
+}
+
+// =============================================================================
+// Syscalls only x86-64 has (Linux __ARCH_WANT_SYS_TIME, _ALARM)
+// =============================================================================
+
+/// time(tloc): seconds since the epoch, also stored at `tloc` if
+/// non-NULL (aarch64 has clock_gettime only)
+fn sys_time(tloc: UserPtr<i64>) -> KernelResult<i64> {
+    use crate::time::{ClockId, TIMEKEEPER};
+    let seconds = TIMEKEEPER
+        .read(ClockId::Realtime, TIMEKEEPER.get_read_cycles())
+        .sec;
+    if !tloc.is_null() {
+        tloc.write(&seconds)?;
+    }
+    Ok(seconds)
+}
+
+/// alarm(seconds): arm ITIMER_REAL once, returning the seconds left on
+/// the previous alarm, rounded to the nearest second but at least 1 if
+/// one was pending (Linux alarm_setitimer)
+fn sys_alarm(seconds: u32) -> KernelResult<i64> {
+    use crate::time::time_syscall::LinuxTimespec;
+    let spec = crate::time::timerfd::ITimerSpec {
+        it_interval: LinuxTimespec::default(),
+        it_value: LinuxTimespec {
+            tv_sec: i64::from(seconds),
+            tv_nsec: 0,
+        },
+    };
+    use crate::time::posix_timer::{ITIMER_REAL, do_setitimer};
+    let prev = do_setitimer(ITIMER_REAL, &spec).it_value;
+    let mut secs = prev.tv_sec;
+    if (secs == 0 && prev.tv_usec != 0) || prev.tv_usec >= 500_000 {
+        secs += 1;
+    }
+    Ok(secs)
 }

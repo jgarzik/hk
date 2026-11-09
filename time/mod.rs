@@ -28,7 +28,7 @@ pub mod watchdog;
 
 use ::core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 
 /// Filesystem timestamp (seconds + nanoseconds since Unix epoch)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

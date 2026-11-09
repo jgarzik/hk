@@ -25,14 +25,16 @@
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
-use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
 use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::signal::siginfo::Layout;
-use crate::signal::{SigFields, SigInfo, SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
-use crate::task::percpu::current_tid;
+use crate::signal::{
+    SigFields, SigInfo, SigSet, Signal, UNMASKABLE_SIGNALS, with_task_signal_state,
+};
+use crate::sync::IrqSpinlock;
+use crate::task::percpu::current;
 use crate::util::pod::IntoBytes;
 
 /// Signalfd flags
@@ -161,7 +163,7 @@ impl Signalfd {
     /// Check if any monitored signals are pending
     fn has_pending_signals(&self) -> bool {
         let mask = self.inner.lock().mask;
-        with_task_signal_state(current_tid(), |state| {
+        with_task_signal_state(&current(), |state| {
             let shared = state.shared_pending.lock();
             let pending = state.pending.signal.union(&shared.signal);
             pending.intersect(&mask).any()
@@ -170,7 +172,7 @@ impl Signalfd {
     }
 
     /// Dequeue a pending signal that matches our mask, with its info
-    fn dequeue_signal(&self) -> Option<SigInfo> {
+    fn dequeue_signal(&self) -> Option<(Signal, SigInfo)> {
         let mask = self.inner.lock().mask;
         crate::signal::dequeue_signal(&mask)
     }
@@ -191,10 +193,10 @@ impl Signalfd {
         let mut done = 0;
         loop {
             while to.len() >= SIGINFO_SIZE {
-                let Some(info) = self.dequeue_signal() else {
+                let Some((sig, info)) = self.dequeue_signal() else {
                     break;
                 };
-                match to.copy_to_full(self.build_siginfo(&info).as_bytes()) {
+                match to.copy_to_full(self.build_siginfo(sig, &info).as_bytes()) {
                     Ok(()) => done += SIGINFO_SIZE,
                     Err(_) if done > 0 => return Ok(done),
                     Err(e) => return Err(e),
@@ -208,7 +210,7 @@ impl Signalfd {
             }
             // Wait on the caller's handler table for a matching signal
             // (a signal ends the wait)
-            let Some(sighand) = crate::signal::get_task_sighand(current_tid()) else {
+            let Some(sighand) = crate::signal::get_task_sighand(&current()) else {
                 return Err(KernelError::WouldBlock);
             };
             sighand
@@ -217,11 +219,11 @@ impl Signalfd {
         }
     }
 
-    /// The signalfd_siginfo of `info` (Linux signalfd_copyinfo): the
-    /// fields its layout carries, the rest zero
-    fn build_siginfo(&self, info: &SigInfo) -> SignalfdSiginfo {
+    /// The signalfd_siginfo of `sig` with `info` (Linux
+    /// signalfd_copyinfo): the fields its layout carries, the rest zero
+    fn build_siginfo(&self, sig: Signal, info: &SigInfo) -> SignalfdSiginfo {
         let mut s = SignalfdSiginfo {
-            ssi_signo: info.sig(),
+            ssi_signo: sig.nr(),
             ssi_errno: info.errno,
             ssi_code: info.code,
             ..Default::default()
@@ -290,7 +292,7 @@ impl Signalfd {
         // stays registered on its queue (Linux instead detaches pollers
         // when it is freed, signalfd_cleanup)
         if let Some(poll_table) = pt
-            && let Some(sighand) = crate::signal::get_task_sighand(current_tid())
+            && let Some(sighand) = crate::signal::get_task_sighand(&current())
         {
             poll_table.hold(sighand.clone());
             poll_table.poll_wait(&sighand.signalfd_wq);

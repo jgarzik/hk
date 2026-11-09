@@ -284,7 +284,7 @@ pub fn enable_ap_scheduling() {
 pub extern "C" fn ap_entry(boot_cpu_id: u32, apic_id: u32) -> ! {
     // Leave the trampoline table (with its low identity map)
     unsafe {
-        core::arch::asm!("mov cr3, {}", in(reg) super::kmap::swapper_phys(), options(nostack));
+        core::arch::asm!("mov cr3, {}", in(reg) crate::mm::swapper::swapper_phys(), options(nostack));
     }
 
     // Its own GDT and TSS (the AP runs on the trampoline's minimal

@@ -8,9 +8,8 @@
 
 use alloc::vec::Vec;
 
-use crate::arch::Uaccess;
 use crate::fs::iov_iter::{IovDest, IovSource};
-use crate::uaccess::{UaccessArch, UserPtr, copy_from_user, copy_to_user, get_user};
+use crate::uaccess::{UserPtr, access_ok, copy_from_user, copy_to_user, get_user};
 use crate::util::error::KernelError;
 use core::mem::{offset_of, size_of};
 
@@ -63,9 +62,9 @@ impl Iov {
         };
         for i in 0..n as u64 {
             let at = ptr.checked_add(i * 16).ok_or(KernelError::BadAddress)?;
-            let base = get_user::<Uaccess, u64>(at).map_err(|_| KernelError::BadAddress)?;
+            let base = get_user::<u64>(at).map_err(|_| KernelError::BadAddress)?;
             let at8 = at.checked_add(8).ok_or(KernelError::BadAddress)?;
-            let len = get_user::<Uaccess, u64>(at8).map_err(|_| KernelError::BadAddress)?;
+            let len = get_user::<u64>(at8).map_err(|_| KernelError::BadAddress)?;
             v.push(base, len)?;
         }
         Ok(v)
@@ -73,7 +72,7 @@ impl Iov {
 
     fn push(&mut self, base: u64, len: u64) -> Result<(), KernelError> {
         // Like Linux access_ok, an empty segment is never checked
-        if len > isize::MAX as u64 || (len != 0 && !Uaccess::access_ok(base, len as usize)) {
+        if len > isize::MAX as u64 || (len != 0 && !access_ok(base, len as usize)) {
             return Err(KernelError::BadAddress);
         }
         let len = (len as usize).min(MAX_RW_COUNT - self.total);
@@ -101,7 +100,7 @@ impl Iov {
                 continue;
             }
             let n = (s.len - skip).min(want - off);
-            copy_from_user::<Uaccess>(&mut out[off..off + n], s.base + skip as u64, n)
+            copy_from_user(&mut out[off..off + n], s.base + skip as u64, n)
                 .map_err(|_| KernelError::BadAddress)?;
             skip = 0;
             off += n;
@@ -122,7 +121,7 @@ impl Iov {
                 continue;
             }
             let n = (s.len - skip).min(data.len() - done);
-            copy_to_user::<Uaccess>(s.base + skip as u64, &data[done..done + n])
+            copy_to_user(s.base + skip as u64, &data[done..done + n])
                 .map_err(|_| KernelError::BadAddress)?;
             skip = 0;
             done += n;
@@ -270,7 +269,7 @@ impl MsgHdr {
             return Err(KernelError::NoBufferSpace);
         }
         let mut v = alloc::vec![0u8; self.controllen];
-        copy_from_user::<Uaccess>(&mut v, self.control.addr(), self.controllen)?;
+        copy_from_user(&mut v, self.control.addr(), self.controllen)?;
         Ok(v)
     }
 }
@@ -299,7 +298,7 @@ pub fn addr_in(addr: UserPtr<u8>, len: u64) -> Result<Option<Vec<u8>>, KernelErr
         return Err(KernelError::InvalidArgument);
     }
     let mut v = alloc::vec![0u8; len as usize];
-    copy_from_user::<Uaccess>(&mut v, addr.addr(), len as usize)?;
+    copy_from_user(&mut v, addr.addr(), len as usize)?;
     Ok(Some(v))
 }
 
@@ -312,7 +311,7 @@ pub fn addr_out(addr: UserPtr<u8>, lenp: UserPtr<u32>, a: &[u8]) -> Result<(), K
     }
     let n = (ulen as usize).min(a.len());
     if n > 0 {
-        copy_to_user::<Uaccess>(addr.addr(), &a[..n])?;
+        copy_to_user(addr.addr(), &a[..n])?;
     }
     lenp.write(&(a.len() as u32))?;
     Ok(())

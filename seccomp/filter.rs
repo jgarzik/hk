@@ -256,7 +256,7 @@ crate::pod!(SockFprog { len, _pad, filter });
 
 /// Copy a struct sock_fprog from user memory and build a filter on
 /// `prev` (Linux seccomp_prepare_user_filter)
-pub fn create_filter_from_user<A: crate::uaccess::UaccessArch>(
+pub fn create_filter_from_user(
     fprog_ptr: u64,
     prev: Option<Arc<SeccompFilter>>,
     log: bool,
@@ -265,14 +265,13 @@ pub fn create_filter_from_user<A: crate::uaccess::UaccessArch>(
 
     // Read whole (Linux seccomp_prepare_user_filter: copy_from_user of
     // the struct), so no field address is computed from the pointer
-    let fprog =
-        copy_val_from_user::<A, SockFprog>(fprog_ptr).map_err(|_| KernelError::BadAddress)?;
+    let fprog = copy_val_from_user::<SockFprog>(fprog_ptr).map_err(|_| KernelError::BadAddress)?;
     let (len, ptr) = (usize::from(fprog.len), fprog.filter);
     if len == 0 || len > classic::BPF_MAXINSNS {
         return Err(KernelError::InvalidArgument);
     }
     let mut raw = crate::util::kmem::try_vec(len * 8, 0u8)?;
-    copy_from_user::<A>(&mut raw, ptr, len * 8).map_err(|_| KernelError::BadAddress)?;
+    copy_from_user(&mut raw, ptr, len * 8).map_err(|_| KernelError::BadAddress)?;
     let insns = raw
         .as_chunks::<8>()
         .0

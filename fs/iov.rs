@@ -2,9 +2,8 @@
 
 use alloc::vec;
 
-use crate::arch::Uaccess;
 use crate::fs::{KernelError, RwFlags};
-use crate::uaccess::{UaccessArch, UserPtr, copy_from_user};
+use crate::uaccess::{UserPtr, access_ok, copy_from_user};
 use crate::util::error::KernelResult;
 
 use super::io::{do_readv, do_writev, pos_arg};
@@ -52,7 +51,7 @@ pub fn import_iovec(
     let total_size = iovcnt * iov_size;
 
     // Validate iovec array pointer
-    if !Uaccess::access_ok(iov_ptr, total_size) {
+    if !access_ok(iov_ptr, total_size) {
         return Err(KernelError::BadAddress);
     }
 
@@ -62,7 +61,7 @@ pub fn import_iovec(
     // `iovcnt` initialized elements of `iovecs`.
     let bytes =
         unsafe { core::slice::from_raw_parts_mut(iovecs.as_mut_ptr().cast::<u8>(), total_size) };
-    if copy_from_user::<Uaccess>(bytes, iov_ptr, total_size).is_err() {
+    if copy_from_user(bytes, iov_ptr, total_size).is_err() {
         return Err(KernelError::BadAddress);
     }
 
@@ -81,7 +80,7 @@ pub fn import_iovec(
         if single {
             len = len.min(MAX_RW_COUNT);
         }
-        if len != 0 && !Uaccess::access_ok(iov.iov_base, len) {
+        if len != 0 && !access_ok(iov.iov_base, len) {
             return Err(KernelError::BadAddress);
         }
         len = len.min(MAX_RW_COUNT - total);

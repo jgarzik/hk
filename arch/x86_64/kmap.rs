@@ -18,10 +18,10 @@
 //! every address space (Linux: preallocate_vmalloc_pages). Boot-time
 //! tables come from a static pool (the frame allocator does not exist yet).
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::arch::{IoremapOps, KmapOps};
+use crate::mm::swapper::{idx, next, pa_symbol, set_direct_end, swapper, swapper_phys};
 
-use crate::sync::RacyCell;
-
+use super::X86_64Arch;
 use super::paging::{
     KERNEL_MAP, PAGE_HUGE, PAGE_NO_EXECUTE, PAGE_OFFSET, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
     RawPageTable, VMALLOC_START, VMEMMAP_START, phys_to_virt_table,
@@ -34,18 +34,14 @@ const POOL_PAGES: usize = 64;
 const SZ_2M: u64 = 2 << 20;
 const SZ_1G: u64 = 1 << 30;
 
-#[repr(C, align(4096))]
-struct Pool([RawPageTable; POOL_PAGES]);
+impl KmapOps for X86_64Arch {
+    const KIMAGE_OFFSET: u64 = KERNEL_MAP;
+    const POOL_PAGES: usize = POOL_PAGES;
 
-static POOL: RacyCell<Pool> = RacyCell::new(Pool([const { RawPageTable::new() }; POOL_PAGES]));
-/// Pool pages handed out
-static POOL_USED: AtomicUsize = AtomicUsize::new(0);
-
-/// The kernel's top-level table (Linux: swapper_pg_dir / init_top_pgt)
-static SWAPPER: RacyCell<RawPageTable> = RacyCell::new(RawPageTable::new());
-
-/// End of the direct map (physical): RAM above it is not mapped
-static DIRECT_END: AtomicU64 = AtomicU64::new(0);
+    fn mk_pmd(pa: u64, prot: u64) -> u64 {
+        Self::mk_pte(pa, prot) | PAGE_HUGE
+    }
+}
 
 unsafe extern "C" {
     static _text: u8;
@@ -55,60 +51,6 @@ unsafe extern "C" {
     static __kernel_start: u8;
     static __kernel_end: u8;
     static boot_pml4: u8;
-}
-
-/// Physical address of a kernel image symbol (Linux: __pa_symbol)
-pub fn pa_symbol(va: u64) -> u64 {
-    va - KERNEL_MAP
-}
-
-/// The kernel image in physical memory, as [start, end)
-pub fn image_range() -> (u64, u64) {
-    let start = pa_symbol(&raw const __kernel_start as u64);
-    (start, pa_symbol(&raw const __kernel_end as u64))
-}
-
-/// Physical address of the kernel top-level table
-pub fn swapper_phys() -> u64 {
-    pa_symbol(SWAPPER.get() as u64)
-}
-
-/// Physical end of the direct map
-pub fn direct_end() -> u64 {
-    DIRECT_END.load(Ordering::Relaxed)
-}
-
-/// A zeroed page-table page from the pool, as (virt, phys)
-fn pool_page() -> (*mut RawPageTable, u64) {
-    let n = POOL_USED.fetch_add(1, Ordering::Relaxed);
-    assert!(n < POOL_PAGES, "kmap: page-table pool exhausted");
-    // SAFETY: page `n` of the pool, in bounds, handed out once (the
-    // counter); no reference to the pool exists
-    let t = unsafe { &raw mut (*POOL.get()).0[n] };
-    (t, pa_symbol(t as u64))
-}
-
-/// Next-level table under `table[idx]`, created if absent
-///
-/// # Safety
-/// `table` is a boot page table (swapper or pool page), during
-/// single-CPU early boot.
-unsafe fn next(table: *mut RawPageTable, idx: usize) -> *mut RawPageTable {
-    // SAFETY: `table` is a boot table no other CPU or reference reaches
-    // (the caller's guarantee); a missing entry gets a zeroed pool
-    // page, itself a boot table, reached through the direct map
-    unsafe {
-        let e = (*table).entry_mut(idx);
-        if !e.is_present() {
-            let (_, phys) = pool_page();
-            e.set(phys, PAGE_PRESENT | PAGE_WRITABLE);
-        }
-        phys_to_virt_table(e.addr())
-    }
-}
-
-fn idx(va: u64, shift: u32) -> usize {
-    ((va >> shift) & 511) as usize
 }
 
 /// CPU supports 1GB pages (CPUID 0x80000001 EDX.Page1GB)
@@ -211,7 +153,7 @@ unsafe fn map_direct(pml4: *mut RawPageTable, ram: &dyn RamMap) {
             }
         }
     });
-    DIRECT_END.store(end, Ordering::Relaxed);
+    set_direct_end(end);
 }
 
 /// Map the kernel image with 4KB pages: text read-only executable,
@@ -257,7 +199,7 @@ pub unsafe fn init() {
     // it: it maps the running image and the direct map the boot code
     // uses (nostack: no stack use; memory ordering kept, no nomem)
     unsafe {
-        let pml4 = SWAPPER.get();
+        let pml4 = swapper();
         map_direct(pml4, &BootRam);
         map_image(pml4);
         // vmalloc/ioremap and vmemmap PDPTs: present before any address
@@ -265,62 +207,6 @@ pub unsafe fn init() {
         next(pml4, idx(VMALLOC_START, 39));
         next(pml4, idx(VMEMMAP_START, 39));
         core::arch::asm!("mov cr3, {}", in(reg) swapper_phys(), options(nostack));
-    }
-}
-
-/// Map the kernel page `va` to `pa` (writable, never executable) below
-/// a top-level entry `init` created; missing lower tables come from
-/// `table` (the physical address of a zeroed frame)
-///
-/// # Safety
-/// Boot CPU, before SMP; `va` is unmapped and not in use.
-pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
-    // SAFETY: `walk`'s contract is this fn's; `va`'s entry, unmapped
-    // and unused, in a live swapper table
-    unsafe {
-        let t = walk(va, &[39, 30, 21], table);
-        let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE;
-        (*t).entry_mut(idx(va, 12)).set(pa, flags);
-    }
-}
-
-/// `map_page` for a 2MB page: `va` and `pa` 2MB aligned, no page table
-/// below that entry yet
-///
-/// # Safety
-/// As for `map_page`.
-pub unsafe fn map_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
-    // SAFETY: as in `map_page`
-    unsafe {
-        let t = walk(va, &[39, 30], table);
-        let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE | PAGE_HUGE;
-        (*t).entry_mut(idx(va, 21)).set(pa, flags);
-    }
-}
-
-/// The table `shifts` lead to from the top level for `va`, missing ones
-/// from `table`
-///
-/// # Safety
-/// As for `map_page`.
-unsafe fn walk(va: u64, shifts: &[u32], table: &mut dyn FnMut() -> u64) -> *mut RawPageTable {
-    // SAFETY: the swapper and the kernel tables under it are live and,
-    // before SMP (the caller's guarantee), changed by this CPU only;
-    // `table` gives zeroed frames, reached through the direct map
-    unsafe {
-        let mut t = SWAPPER.get();
-        assert!(
-            (*t).entry(idx(va, 39)).is_present(),
-            "kmap: no top-level entry"
-        );
-        for &shift in shifts {
-            let e = (*t).entry_mut(idx(va, shift));
-            if !e.is_present() {
-                e.set(table(), PAGE_PRESENT | PAGE_WRITABLE);
-            }
-            t = phys_to_virt_table(e.addr());
-        }
-        t
     }
 }
 
@@ -334,9 +220,9 @@ pub fn trampoline_pgd() -> u64 {
     // swapper's kernel half is read only
     unsafe {
         let boot = phys_to_virt_table(phys);
-        let swapper = SWAPPER.get().cast_const();
+        let top = swapper().cast_const();
         for i in 256..512 {
-            *(*boot).entry_mut(i) = *(*swapper).entry(i);
+            *(*boot).entry_mut(i) = *(*top).entry(i);
         }
     }
     phys

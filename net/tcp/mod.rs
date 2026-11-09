@@ -1423,8 +1423,7 @@ impl ProtoOps for TcpSock {
             _ => return Err(KernelError::NotTty),
         };
         drop(g);
-        crate::uaccess::put_user::<crate::arch::Uaccess, i32>(arg, v as i32)
-            .map_err(|_| KernelError::BadAddress)?;
+        crate::uaccess::put_user::<i32>(arg, v as i32).map_err(|_| KernelError::BadAddress)?;
         Ok(0)
     }
 

@@ -390,8 +390,6 @@ static GRAPHICS_CONSOLE: spin::Once<GfxConsole> = spin::Once::new();
 /// Must be called after ioremap is initialized.
 /// The framebuffer must be properly reserved in the frame allocator.
 pub unsafe fn init_graphics_console() -> bool {
-    use crate::arch::CurrentArch;
-    use crate::arch::IoremapOps;
     use crate::gfx::BOOT_FRAMEBUFFER;
 
     let Some(fb_info) = BOOT_FRAMEBUFFER.get() else {
@@ -401,7 +399,8 @@ pub unsafe fn init_graphics_console() -> bool {
     // Map the framebuffer
     // SAFETY: the firmware framebuffer, video memory outside the RAM
     // memblock hands out
-    let Ok(fb_ptr) = (unsafe { CurrentArch::ioremap(fb_info.phys_addr, fb_info.size) }) else {
+    let Ok(fb_ptr) = (unsafe { crate::mm::ioremap::ioremap(fb_info.phys_addr, fb_info.size) })
+    else {
         crate::printkln!("graphics: failed to map framebuffer");
         return false;
     };

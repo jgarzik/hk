@@ -7,6 +7,8 @@
 use core::fmt;
 
 use crate::fs::chardev::{DevId, major};
+use crate::irq::{IrqFn, IrqRegistration, IrqReturn};
+use crate::sync::spin::Mutex;
 use crate::tty::{Tty, TtyDriver};
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
@@ -203,29 +205,39 @@ pub fn serial_ttys() -> &'static [&'static Tty] {
 }
 
 /// The PL011's interrupt handler (IRQ context): input to ttyAMA0
-fn pl011_irq(_irq: u32) -> bool {
-    UART.rx_chars(&TTY_AMA0)
+fn pl011_irq(_irq: u32) -> IrqReturn {
+    UART.rx_chars(&TTY_AMA0).into()
 }
 
 /// Take input by interrupt (Linux pl011_startup); `irq` is the GIC
-/// INTID. False without it
-fn rx_irq_init(irq: u32) -> bool {
-    let Ok(h) = try_arc(crate::irq::IrqFn(pl011_irq)) else {
-        return false;
-    };
-    if let Err(e) = crate::arch::irq::register_irq_handler(irq, h, PL011_BASE) {
-        crate::printkln!("ttyAMA0: no IRQ {}: {}", irq, e);
-        return false;
-    }
+/// INTID. None without it
+fn rx_irq_init(irq: u32) -> Option<IrqRegistration<IrqFn>> {
+    let h = try_arc(IrqFn(pl011_irq)).ok()?;
+    let reg = crate::irq::request_irq(irq, h)
+        .inspect_err(|e| crate::printkln!("ttyAMA0: no IRQ {}: {:?}", irq, e))
+        .ok()?;
     UART.write_reg(regs::IMSC, int::RX | int::RT);
-    true
+    Some(reg)
 }
 
 /// Stop taking input by interrupt (Linux pl011_shutdown: IMSC cleared,
 /// then free_irq, which waits out a running handler)
-fn rx_irq_exit(irq: u32) {
+fn rx_irq_exit(irq: IrqRegistration<IrqFn>) {
     UART.write_reg(regs::IMSC, 0);
-    let _ = crate::arch::irq::unregister_irq_handler(irq, PL011_BASE);
+    drop(irq);
+}
+
+/// The PL011 is the earlycon until ttyAMA0 registers
+impl crate::arch::EarlyConOps for super::Aarch64Arch {
+    const EARLYCON: bool = true;
+
+    fn early_write(bytes: &[u8]) {
+        if let Ok(s) = core::str::from_utf8(bytes) {
+            write_str(s);
+        } else {
+            bytes.iter().for_each(|&b| write_byte(b));
+        }
+    }
 }
 
 /// Make ttyAMA0 a console (Linux pl011 console; it is /dev/console's
@@ -296,7 +308,8 @@ pub static PL011_DRIVER: crate::base::Driver = crate::base::Driver::new(
 
 /// A bound PL011: its IRQ and tty device
 struct Pl011Port {
-    irq: Option<u32>,
+    /// Set by probe, taken by remove (spin leaf: dropped unlocked)
+    irq: Mutex<Option<IrqRegistration<IrqFn>>>,
     tty: Option<alloc::sync::Arc<crate::base::Device>>,
 }
 
@@ -313,7 +326,8 @@ impl crate::base::Bound for Pl011Port {
             t.del();
         }
         crate::console::unregister_console(TTY_AMA0.name());
-        if let Some(irq) = self.irq {
+        let irq = self.irq.lock().take();
+        if let Some(irq) = irq {
             rx_irq_exit(irq);
         }
     }
@@ -324,12 +338,12 @@ fn pl011_probe(
 ) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
     // Allocated first, so ENOMEM leaves nothing registered
     let mut port = try_box(Pl011Port {
-        irq: None,
+        irq: Mutex::new(None),
         tty: None,
     })?;
     register_console();
     let irq = crate::base::platform::pdev(dev).and_then(|p| p.irq);
-    port.irq = irq.filter(|&irq| rx_irq_init(irq));
+    *port.irq.get_mut() = irq.and_then(rx_irq_init);
     port.tty = crate::tty::tty_register_device(&TTY_AMA0, dev);
     Ok(port)
 }

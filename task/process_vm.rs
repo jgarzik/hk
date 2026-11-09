@@ -8,14 +8,13 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::arch::Uaccess;
 use crate::fs::iov::{IoVec, import_iovec};
 use crate::fs::syscall::IOV_MAX;
 use crate::mm::MmRef;
 use crate::mm::remote::{access_remote_vm_read, access_remote_vm_write};
-use crate::task::percpu::current_tid;
-use crate::task::{Pid, Tid};
-use crate::uaccess::{UaccessArch, UserPtr, UserSlice, copy_from_user, copy_to_user};
+use crate::task::percpu::current;
+use crate::task::{Pid, Task};
+use crate::uaccess::{UserPtr, UserSlice, access_ok, copy_from_user, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 
 /// Bytes copied per step: the bounce buffer stays small whatever the
@@ -93,7 +92,7 @@ fn remote_iovecs(uvec: UserPtr<IoVec>, n: u64) -> KernelResult<Vec<IoVec>> {
         .filter(|&n| n <= IOV_MAX)
         .ok_or(KernelError::InvalidArgument)?;
     let size = n * core::mem::size_of::<IoVec>();
-    if !Uaccess::access_ok(uvec.addr(), size) {
+    if !access_ok(uvec.addr(), size) {
         return Err(KernelError::BadAddress);
     }
     let mut v = crate::util::kmem::try_vec(n, IoVec::default())?;
@@ -120,10 +119,9 @@ fn process_vm_rw_core(
     if remote.iter().all(|v| v.iov_len == 0) {
         return Ok(0);
     }
-    let target = crate::task::percpu::find_task_by_vpid(pid as Pid)
-        .map(|t| t.tid())
-        .ok_or(KernelError::NoProcess)?;
-    let mm = access_mm(target)?;
+    let target =
+        crate::task::percpu::find_task_by_vpid(pid as Pid).ok_or(KernelError::NoProcess)?;
+    let mm = access_mm(&target)?;
     let mut buf = crate::util::kmem::try_vec(PVM_CHUNK, 0u8)?;
     // The target's mmap_lock is held per remote access only, never
     // across a local user copy (which can fault and sleep, and takes
@@ -175,13 +173,13 @@ fn copy_vecs(mm: &MmRef, local: &[IoVec], remote: &[IoVec], buf: &mut [u8], writ
 /// and the target's `raddr`; the bytes that made it all the way
 fn copy_step(mm: &MmRef, laddr: u64, raddr: u64, buf: &mut [u8], write: bool) -> usize {
     if write {
-        if copy_from_user::<Uaccess>(buf, laddr, buf.len()).is_err() {
+        if copy_from_user(buf, laddr, buf.len()).is_err() {
             return 0;
         }
         access_remote_vm_write(mm, raddr, buf, false).unwrap_or(0)
     } else {
         let got = access_remote_vm_read(mm, raddr, buf, false).unwrap_or(0);
-        match copy_to_user::<Uaccess>(laddr, &buf[..got]) {
+        match copy_to_user(laddr, &buf[..got]) {
             Ok(_) => got,
             Err(_) => 0,
         }
@@ -192,19 +190,16 @@ fn copy_step(mm: &MmRef, laddr: u64, raddr: u64, buf: &mut [u8], write: bool) ->
 /// -> mm_access, PTRACE_MODE_ATTACH_REALCREDS): its own address space
 /// (any thread of it, or a CLONE_VM sharer), else the ptrace rules with
 /// the real ids
-fn check_process_vm_permission(target_tid: Tid) -> bool {
-    let me = current_tid();
-    if target_tid == me {
+fn check_process_vm_permission(target: &Task) -> bool {
+    let me = current();
+    if me.is(target) {
         return true;
     }
-    let same_mm = match (
-        crate::mm::get_task_mm(target_tid),
-        crate::mm::get_task_mm(me),
-    ) {
+    let same_mm = match (crate::mm::get_task_mm(target), me.mm()) {
         (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(&a, &b),
         _ => false,
     };
-    same_mm || crate::task::ptrace::may_access(|t| t.task.tid() == target_tid, false)
+    same_mm || crate::task::ptrace::may_access_task(target, false)
 }
 
 /// The target's address space if the caller may access it (Linux
@@ -212,10 +207,10 @@ fn check_process_vm_permission(target_tid: Tid) -> bool {
 /// cannot swap in a new mm or dumpability in between. A user
 /// reference: it cannot be torn down while we access it (Linux
 /// get_task_mm)
-fn access_mm(target_tid: Tid) -> Result<MmRef, KernelError> {
-    let _g = crate::signal::ExecUpdateRead::lock(target_tid);
-    if !check_process_vm_permission(target_tid) {
+fn access_mm(target: &Task) -> Result<MmRef, KernelError> {
+    let _g = crate::signal::ExecUpdateRead::lock(target);
+    if !check_process_vm_permission(target) {
         return Err(KernelError::NotPermitted);
     }
-    crate::mm::get_task_mm_users(target_tid).ok_or(KernelError::NoProcess)
+    crate::mm::get_task_mm_users(target).ok_or(KernelError::NoProcess)
 }

@@ -2,7 +2,6 @@
 //! sys_call_table): [`Sys`] names a call, each arch maps its numbers
 //! to it (`arch::*::syscall::sys_of`).
 
-use crate::arch::Uaccess;
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, SysRet};
 
@@ -304,12 +303,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Bpf => crate::bpf::sys_bpf(a[0] as i32, UserPtr::new(a[1]), a[2] as u32).ret() as u64,
         Sys::Brk => crate::mm::syscall::sys_brk(a[0]).ret() as u64,
         Sys::Capget => {
-            crate::task::syscall::sys_capget::<Uaccess>(UserPtr::new(a[0]), UserPtr::new(a[1]))
-                .ret() as u64
+            crate::task::syscall::sys_capget(UserPtr::new(a[0]), UserPtr::new(a[1])).ret() as u64
         }
         Sys::Capset => {
-            crate::task::syscall::sys_capset::<Uaccess>(UserPtr::new(a[0]), UserPtr::new(a[1]))
-                .ret() as u64
+            crate::task::syscall::sys_capset(UserPtr::new(a[0]), UserPtr::new(a[1])).ret() as u64
         }
         Sys::Chdir => crate::fs::syscall::sys_chdir(UserPtr::new(a[0])).ret() as u64,
         Sys::Chroot => crate::fs::syscall::sys_chroot(UserPtr::new(a[0])).ret() as u64,
@@ -511,7 +508,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[4] as i32,
         )
         .ret() as u64,
-        Sys::Getcpu => crate::task::syscall::sys_getcpu::<Uaccess>(
+        Sys::Getcpu => crate::task::syscall::sys_getcpu(
             crate::cpu::this_id(),
             UserPtr::new(a[0]),
             UserPtr::new(a[1]),
@@ -531,8 +528,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::syscall::sys_getgid(crate::task::percpu::current_cred().gid).ret() as u64
         }
         Sys::Getgroups => {
-            crate::task::syscall::sys_getgroups::<Uaccess>(a[0] as i32, UserPtr::new(a[1])).ret()
-                as u64
+            crate::task::syscall::sys_getgroups(a[0] as i32, UserPtr::new(a[1])).ret() as u64
         }
         Sys::Getitimer => {
             crate::time::posix_timer::sys_getitimer(a[0] as i32, UserPtr::new(a[1])).ret() as u64
@@ -554,20 +550,18 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Getpriority => {
             crate::task::syscall::sys_getpriority(a[0] as i32, a[1] as i32).ret() as u64
         }
-        Sys::Getrandom => crate::task::syscall::sys_getrandom::<Uaccess>(
-            UserPtr::new(a[0]),
-            a[1] as usize,
-            a[2] as u32,
-        )
-        .ret() as u64,
-        Sys::Getresgid => crate::task::syscall::sys_getresgid::<Uaccess>(
+        Sys::Getrandom => {
+            crate::task::syscall::sys_getrandom(UserPtr::new(a[0]), a[1] as usize, a[2] as u32)
+                .ret() as u64
+        }
+        Sys::Getresgid => crate::task::syscall::sys_getresgid(
             UserPtr::new(a[0]),
             UserPtr::new(a[1]),
             UserPtr::new(a[2]),
             crate::task::percpu::current_cred(),
         )
         .ret() as u64,
-        Sys::Getresuid => crate::task::syscall::sys_getresuid::<Uaccess>(
+        Sys::Getresuid => crate::task::syscall::sys_getresuid(
             UserPtr::new(a[0]),
             UserPtr::new(a[1]),
             UserPtr::new(a[2]),
@@ -578,8 +572,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::rlimit::sys_getrlimit(a[0] as u32, UserPtr::new(a[1])).ret() as u64
         }
         Sys::Getrusage => {
-            crate::task::syscall::sys_getrusage::<Uaccess>(a[0] as i32, UserPtr::new(a[1])).ret()
-                as u64
+            crate::task::syscall::sys_getrusage(a[0] as i32, UserPtr::new(a[1])).ret() as u64
         }
         Sys::Getsid => crate::task::syscall::sys_getsid(
             a[0] as i32,
@@ -1048,37 +1041,35 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             UserPtr::new(a[3]),
         )
         .ret() as u64,
-        Sys::SchedGetaffinity => crate::task::syscall::sys_sched_getaffinity::<Uaccess>(
+        Sys::SchedGetaffinity => crate::task::syscall::sys_sched_getaffinity(
             i64::from(a[0] as i32),
             a[1],
             UserPtr::new(a[2]),
         )
         .ret() as u64,
-        Sys::SchedGetparam => crate::task::syscall::sys_sched_getparam::<Uaccess>(
-            i64::from(a[0] as i32),
-            UserPtr::new(a[1]),
-        )
-        .ret() as u64,
+        Sys::SchedGetparam => {
+            crate::task::syscall::sys_sched_getparam(i64::from(a[0] as i32), UserPtr::new(a[1]))
+                .ret() as u64
+        }
         Sys::SchedGetscheduler => {
             crate::task::syscall::sys_sched_getscheduler(i64::from(a[0] as i32)).ret() as u64
         }
-        Sys::SchedRrGetInterval => crate::task::syscall::sys_sched_rr_get_interval::<Uaccess>(
+        Sys::SchedRrGetInterval => crate::task::syscall::sys_sched_rr_get_interval(
             i64::from(a[0] as i32),
             UserPtr::new(a[1]),
         )
         .ret() as u64,
-        Sys::SchedSetaffinity => crate::task::syscall::sys_sched_setaffinity::<Uaccess>(
+        Sys::SchedSetaffinity => crate::task::syscall::sys_sched_setaffinity(
             i64::from(a[0] as i32),
             a[1],
             UserPtr::new(a[2]),
         )
         .ret() as u64,
-        Sys::SchedSetparam => crate::task::syscall::sys_sched_setparam::<Uaccess>(
-            i64::from(a[0] as i32),
-            UserPtr::new(a[1]),
-        )
-        .ret() as u64,
-        Sys::SchedSetscheduler => crate::task::syscall::sys_sched_setscheduler::<Uaccess>(
+        Sys::SchedSetparam => {
+            crate::task::syscall::sys_sched_setparam(i64::from(a[0] as i32), UserPtr::new(a[1]))
+                .ret() as u64
+        }
+        Sys::SchedSetscheduler => crate::task::syscall::sys_sched_setscheduler(
             i64::from(a[0] as i32),
             a[1] as i32,
             UserPtr::new(a[2]),
@@ -1146,8 +1137,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
                 as u64
         }
         Sys::Setgroups => {
-            crate::task::syscall::sys_setgroups::<Uaccess>(a[0] as i32, UserPtr::new(a[1])).ret()
-                as u64
+            crate::task::syscall::sys_setgroups(a[0] as i32, UserPtr::new(a[1])).ret() as u64
         }
         Sys::Sethostname => crate::ns::uts::sys_sethostname(UserPtr::new(a[0]), a[1]).ret() as u64,
         Sys::Setitimer => crate::time::posix_timer::sys_setitimer(
@@ -1298,15 +1288,11 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[3] as u32,
         )
         .ret() as u64,
-        Sys::Sysinfo => {
-            crate::task::syscall::sys_sysinfo::<Uaccess>(UserPtr::new(a[0])).ret() as u64
+        Sys::Sysinfo => crate::task::syscall::sys_sysinfo(UserPtr::new(a[0])).ret() as u64,
+        Sys::Syslog => {
+            crate::task::syscall::sys_syslog(a[0] as i32, UserPtr::new(a[1]), a[2] as i32).ret()
+                as u64
         }
-        Sys::Syslog => crate::task::syscall::sys_syslog::<Uaccess>(
-            a[0] as i32,
-            UserPtr::new(a[1]),
-            a[2] as i32,
-        )
-        .ret() as u64,
         Sys::Tee => {
             crate::fs::splice::sys_tee(a[0] as i32, a[1] as i32, a[2] as usize, a[3] as u32).ret()
                 as u64
@@ -1352,7 +1338,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             UserPtr::new(a[3]),
         )
         .ret() as u64,
-        Sys::Times => crate::task::syscall::sys_times::<Uaccess>(UserPtr::new(a[0])).ret() as u64,
+        Sys::Times => crate::task::syscall::sys_times(UserPtr::new(a[0])).ret() as u64,
         Sys::Tkill => {
             crate::signal::syscall::sys_tkill(i64::from(a[0] as i32), a[1] as u32).ret() as u64
         }

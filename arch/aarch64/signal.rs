@@ -22,10 +22,9 @@
 //! The FP/SIMD registers come from (and rt_sigreturn writes them back to)
 //! the task's EL0 trap frame, where they live while it is in the kernel.
 
-use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
-use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
-use crate::uaccess::{UaccessArch, copy_to_user};
+use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, sa_flags};
+use crate::uaccess::{access_ok, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::{FromBytes, IntoBytes};
 
@@ -256,7 +255,7 @@ const PSTATE_BTYPE: u64 = 3 << 10;
 ///
 /// Returns Ok(()) on success, Err(errno) on failure.
 pub fn setup_rt_frame(
-    sig: u32,
+    sig: Signal,
     action: &SigAction,
     blocked: SigSet,
     info: &SigInfo,
@@ -283,8 +282,9 @@ pub fn setup_rt_frame(
     let restorer = if action.flags & sa_flags::SA_RESTORER != 0 {
         action.restorer
     } else {
-        let page =
-            crate::mm::get_task_mm(crate::task::percpu::current_tid()).map_or(0, |mm| mm.sigpage());
+        let page = crate::task::percpu::current()
+            .mm()
+            .map_or(0, |mm| mm.sigpage());
         if page == 0 {
             return Err(KernelError::InvalidArgument);
         }
@@ -309,7 +309,7 @@ pub fn setup_rt_frame(
     };
 
     // Validate user stack address
-    if !Uaccess::access_ok(frame_addr, (record_addr + 16 - frame_addr) as usize) {
+    if !access_ok(frame_addr, (record_addr + 16 - frame_addr) as usize) {
         return Err(KernelError::BadAddress);
     }
 
@@ -326,7 +326,7 @@ pub fn setup_rt_frame(
     };
     let reserved_addr = frame_addr + RESERVED_OFFSET as u64;
     let mut end = reserved_addr + FPSIMD_SIZE as u64;
-    if copy_to_user::<Uaccess>(reserved_addr, fpsimd.as_bytes()).is_err() {
+    if copy_to_user(reserved_addr, fpsimd.as_bytes()).is_err() {
         return Err(KernelError::BadAddress);
     }
     if trap.error != 0 {
@@ -337,18 +337,18 @@ pub fn setup_rt_frame(
             },
             esr: trap.error,
         };
-        if copy_to_user::<Uaccess>(end, esr.as_bytes()).is_err() {
+        if copy_to_user(end, esr.as_bytes()).is_err() {
             return Err(KernelError::BadAddress);
         }
         end += core::mem::size_of::<EsrContext>() as u64;
     }
-    if copy_to_user::<Uaccess>(end, CtxHead::default().as_bytes()).is_err() {
+    if copy_to_user(end, CtxHead::default().as_bytes()).is_err() {
         return Err(KernelError::BadAddress);
     }
 
     // Frame record for unwinders: {x29, x30} of the interrupted code
     let record = [user_regs[29], user_regs[30]];
-    if copy_to_user::<Uaccess>(record_addr, record.as_bytes()).is_err() {
+    if copy_to_user(record_addr, record.as_bytes()).is_err() {
         return Err(KernelError::BadAddress);
     }
 
@@ -374,7 +374,7 @@ pub fn setup_rt_frame(
             ..FromBytes::zeroed()
         },
     };
-    if copy_to_user::<Uaccess>(frame_addr, frame.as_bytes()).is_err() {
+    if copy_to_user(frame_addr, frame.as_bytes()).is_err() {
         return Err(KernelError::BadAddress);
     }
 
@@ -389,7 +389,7 @@ pub fn setup_rt_frame(
     // The handler is not entered by an indirect branch (Linux
     // setup_return clears BTYPE)
     regs.spsr &= !PSTATE_BTYPE;
-    regs.x[0] = u64::from(sig); // x0 = signal number
+    regs.x[0] = u64::from(sig.nr()); // x0 = signal number
     regs.x[1] = info_addr; // x1 = &siginfo
     regs.x[2] = uc_addr; // x2 = &ucontext
     regs.x[29] = record_addr; // x29 = frame record
@@ -403,7 +403,7 @@ pub fn setup_rt_frame(
 
 /// Read a plain-data `T` from user memory
 fn read_user<T: FromBytes>(addr: u64) -> Option<T> {
-    crate::uaccess::copy_val_from_user::<Uaccess, T>(addr).ok()
+    crate::uaccess::copy_val_from_user::<T>(addr).ok()
 }
 
 /// Walk the `__reserved` records at `addr` (Linux parse_user_sigframe):
@@ -456,7 +456,7 @@ pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     let Some(end) = frame_addr.checked_add(signal_frame_size() as u64) else {
         return Err(crate::signal::sigreturn_badframe());
     };
-    if !Uaccess::access_ok(frame_addr, (end - frame_addr) as usize) {
+    if !access_ok(frame_addr, (end - frame_addr) as usize) {
         return Err(crate::signal::sigreturn_badframe());
     }
 
@@ -476,8 +476,7 @@ pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     };
 
     // Restore blocked signal mask
-    let tid = crate::task::percpu::current_tid();
-    crate::signal::with_task_signal_state(tid, |state| {
+    crate::signal::with_task_signal_state(&crate::task::percpu::current(), |state| {
         // SIGKILL/SIGSTOP can never be blocked, even via a crafted frame
         state.blocked = sigmask.blockable();
     });

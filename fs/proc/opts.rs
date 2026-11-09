@@ -152,7 +152,7 @@ impl ProcOpts {
     fn allows(&self, t: &Task, min: u8) -> bool {
         let h = self.hidepid.load(Ordering::Relaxed);
         if h == HIDEPID_NOT_PTRACEABLE {
-            return crate::task::ptrace::may_read_ref(t);
+            return crate::task::ptrace::may_access_task(t, true);
         }
         if h < min {
             return true;
@@ -161,7 +161,7 @@ impl ProcOpts {
         if crate::fs::dac::in_group(&crate::fs::dac::cred(), gid) {
             return true;
         }
-        crate::task::ptrace::may_read_ref(t)
+        crate::task::ptrace::may_access_task(t, true)
     }
 
     /// The process shows in lookup and readdir

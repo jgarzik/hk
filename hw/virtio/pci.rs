@@ -15,10 +15,12 @@
 //! or the PCI function's (transport probe and remove). Otherwise the
 //! transport touches lock-free state only: config reads
 //! (generation-checked), notify writes (under the caller's queue lock)
-//! and the ISR byte (IRQ context). The driver's interrupt callbacks
-//! (`VirtioDevice.irq`) are an `IrqSpinlock` leaf: set by
-//! `request_irq`, cleared by `free_irq` after the handler is
-//! unregistered, read (cloned) by the handler under `IRQ_TABLE`.
+//! and the ISR byte (IRQ context). The INTx registration
+//! (`VirtioDevice.irq`, which owns the driver's interrupt callbacks) is
+//! a spin leaf, thread context only: claimed, then set, by `request_irq`
+//! (driver probe; it registers between the two, unlocked) and taken by
+//! `free_irq` (driver remove, transport remove), which drops it
+//! (`IrqDesc.lock`) after unlocking.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -28,12 +30,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::ring::{self, Layout, Vring};
 use super::{VirtioIrq, status};
-use crate::arch::IrqSpinlock;
 use crate::arch::barrier::wmb;
 use crate::hw::dma::{DmaCoherent, DmaConfig, DmaDevice};
 use crate::hw::mmio::IoMem;
 use crate::hw::pci::{PciDevice, cap_id};
+use crate::irq::{IrqHandler, IrqRegistration, IrqReturn};
 use crate::printkln;
+use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 
@@ -161,11 +164,34 @@ pub struct VirtioDevice {
     /// read by the bound driver and the sysfs `features` file (Linux
     /// vdev->features, a plain field under the same rule)
     features: AtomicU64,
-    /// The bound driver's interrupt callbacks (Linux vq->callback and
-    /// config_changed): between `request_irq` and `free_irq`
-    irq: IrqSpinlock<Option<Arc<dyn VirtioIrq>>>,
+    /// The INTx handler with the bound driver's interrupt callbacks
+    /// (Linux vq->callback and config_changed): between `request_irq`
+    /// and `free_irq`
+    irq: Mutex<IrqSlot>,
     /// Interrupts that were ours (stats)
     irqs: AtomicU64,
+}
+
+/// `VirtioDevice.irq`: the INTx registration, or who may make it
+enum IrqSlot {
+    Free,
+    /// A `request_irq` is registering, unlocked
+    Claimed,
+    Held(IrqRegistration<VpIntx>),
+}
+
+impl IrqSlot {
+    /// The registration, leaving the slot free (a claim stays: its
+    /// `request_irq` finishes it)
+    fn take(&mut self) -> Option<IrqRegistration<VpIntx>> {
+        if !matches!(self, Self::Held(_)) {
+            return None;
+        }
+        match core::mem::replace(self, Self::Free) {
+            Self::Held(r) => Some(r),
+            _ => None,
+        }
+    }
 }
 
 impl VirtioDevice {
@@ -195,7 +221,7 @@ impl VirtioDevice {
             notify,
             notify_mul: caps.notify_mul,
             features: AtomicU64::new(0),
-            irq: IrqSpinlock::new(None),
+            irq: Mutex::new(IrqSlot::Free),
             irqs: AtomicU64::new(0),
         })
     }
@@ -384,22 +410,36 @@ impl VirtioDevice {
     }
 
     /// Register the driver's interrupt callbacks and enable INTx (Linux
-    /// find_vqs: vp_request_intx); EBUSY-like error if registered
-    pub fn request_irq(self: &Arc<Self>, cb: Arc<dyn VirtioIrq>) -> Result<u32, &'static str> {
+    /// find_vqs: vp_request_intx); Busy if already requested or being
+    /// requested. The slot is claimed first, so of two callers only
+    /// one registers
+    pub fn request_irq(self: &Arc<Self>, cb: Arc<dyn VirtioIrq>) -> Result<u32, KernelError> {
         {
-            let mut irq = self.irq.lock();
-            if irq.is_some() {
-                return Err("virtio IRQ already requested");
+            let mut s = self.irq.lock();
+            if !matches!(*s, IrqSlot::Free) {
+                return Err(KernelError::Busy);
             }
-            *irq = Some(cb);
+            *s = IrqSlot::Claimed;
         }
-        // The IRQ table holds a reference until `free_irq` (the driver's
-        // remove)
-        let r = self.pci.register_irq_handler(self.clone());
-        if r.is_err() {
-            self.irq.lock().take();
+        // Holds the device until `free_irq` (the driver's remove)
+        let reg = try_arc(VpIntx {
+            vdev: self.clone(),
+            cb,
+        })
+        .and_then(|h| self.pci.request_irq(h));
+        let mut s = self.irq.lock();
+        // Replaces `Claimed`: no registration is dropped under the lock
+        match reg {
+            Ok(reg) => {
+                let irq = reg.irq();
+                *s = IrqSlot::Held(reg);
+                Ok(irq)
+            }
+            Err(e) => {
+                *s = IrqSlot::Free;
+                Err(e)
+            }
         }
-        r
     }
 
     /// Reset the device, then free the rings of `vqs` (Linux del_vqs:
@@ -423,18 +463,13 @@ impl VirtioDevice {
 
     /// Unregister the interrupt handler and drop the driver's callbacks
     /// (Linux del_vqs: vp_del_vqs -> free_irq); a later bind may
-    /// `request_irq` again. Handlers run under the IRQ table lock that
-    /// unregistering takes, so none is running once it returns.
+    /// `request_irq` again. No handler is running once it returns. The
+    /// caller resets the device first, so it is not left asserting a
+    /// shared level-triggered line nobody acks.
     pub fn free_irq(&self) {
-        if self.irq.lock().is_none() {
-            return;
-        }
-        if let Err(e) = self.pci.unregister_irq_handler() {
-            printkln!("virtio-pci: {}: free_irq: {}", self.bus_id(), e);
-        }
         // Dropped outside the lock: the callbacks may own the driver
-        let cb = self.irq.lock().take();
-        drop(cb);
+        let irq = self.irq.lock().take();
+        drop(irq);
     }
 
     /// Interrupts handled (stats)
@@ -458,32 +493,33 @@ impl DmaDevice for VirtioDevice {
     }
 }
 
-impl crate::irq::IrqHandler for VirtioDevice {
-    fn handle(&self, _irq: u32) -> bool {
-        vp_interrupt(self)
+/// The transport's INTx handler: the device and its driver's callbacks
+struct VpIntx {
+    vdev: Arc<VirtioDevice>,
+    cb: Arc<dyn VirtioIrq>,
+}
+
+impl IrqHandler for VpIntx {
+    fn handle(&self, _irq: u32) -> IrqReturn {
+        vp_interrupt(&self.vdev, &*self.cb)
     }
 }
 
 /// Transport interrupt handler (Linux vp_interrupt; IRQ context)
-fn vp_interrupt(vdev: &VirtioDevice) -> bool {
+fn vp_interrupt(vdev: &VirtioDevice, cb: &dyn VirtioIrq) -> IrqReturn {
     // Read-to-clear; deasserts the level-triggered line
     let isr = vdev.isr.read8(0);
     if isr == 0 {
-        return false; // shared line: not ours
+        return IrqReturn::None; // shared line: not ours
     }
     vdev.irqs.fetch_add(1, Ordering::Relaxed);
-    // Cloned out: the callbacks take other locks; never the last
-    // reference (`free_irq` drops it after unregistering this handler)
-    let cb = vdev.irq.lock().clone();
-    if let Some(cb) = cb {
-        if isr & isr::CONFIG != 0 {
-            cb.config_changed();
-        }
-        if isr & isr::QUEUE != 0 {
-            cb.vq_interrupt();
-        }
+    if isr & isr::CONFIG != 0 {
+        cb.config_changed();
     }
-    true
+    if isr & isr::QUEUE != 0 {
+        cb.vq_interrupt();
+    }
+    IrqReturn::Handled
 }
 
 /// A split virtqueue in coherent DMA memory with its doorbell
@@ -585,8 +621,8 @@ impl crate::base::Bound for VirtioPciDev {
     fn remove(&self) {
         self.dev.del();
         super::free_index(self.index);
-        self.vdev.free_irq();
         let _ = self.vdev.reset();
+        self.vdev.free_irq();
         let cmd = self.pci.cfg_read16(PCI_COMMAND);
         self.pci
             .cfg_write16(PCI_COMMAND, cmd & !crate::hw::pci::command::BUS_MASTER);

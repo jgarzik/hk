@@ -39,7 +39,7 @@ use alloc::sync::Arc;
 
 use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 

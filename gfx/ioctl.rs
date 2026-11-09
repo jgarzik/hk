@@ -7,7 +7,6 @@ use alloc::string::ToString;
 
 use super::mode::GfxModeInfo;
 use super::{GfxDriver, GfxError};
-use crate::arch::Uaccess;
 use crate::uaccess::{copy_to_user, copy_val_from_user, copy_val_to_user};
 use core::mem::size_of;
 
@@ -416,18 +415,18 @@ pub fn dispatch_ioctl(driver: &dyn GfxDriver, cmd: u32, arg: u64) -> Result<i64,
 
 /// Copy an ioctl argument struct in from user space
 fn read_arg<T: crate::util::pod::FromBytes>(addr: u64) -> Result<T, GfxError> {
-    copy_val_from_user::<Uaccess, T>(addr).map_err(|_| GfxError::Fault)
+    copy_val_from_user::<T>(addr).map_err(|_| GfxError::Fault)
 }
 
 /// Copy an ioctl argument struct back out to user space
 fn write_arg<T: crate::util::pod::IntoBytes>(addr: u64, val: &T) -> Result<(), GfxError> {
-    copy_val_to_user::<Uaccess, T>(addr, val).map_err(|_| GfxError::Fault)
+    copy_val_to_user::<T>(addr, val).map_err(|_| GfxError::Fault)
 }
 
 /// Copy an object-ID array out to a user `u32 *`
 fn write_ids(addr: u64, ids: &[u32]) -> Result<(), GfxError> {
     let bytes: alloc::vec::Vec<u8> = ids.iter().flat_map(|id| id.to_ne_bytes()).collect();
-    copy_to_user::<Uaccess>(addr, &bytes).map_err(|_| GfxError::Fault)?;
+    copy_to_user(addr, &bytes).map_err(|_| GfxError::Fault)?;
     Ok(())
 }
 
@@ -451,8 +450,7 @@ fn handle_version(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     let name = driver.name();
     if ver.name != 0 && ver.name_len > 0 {
         let copy_len = (ver.name_len as usize).min(name.len());
-        copy_to_user::<Uaccess>(ver.name, &name.as_bytes()[..copy_len])
-            .map_err(|_| GfxError::Fault)?;
+        copy_to_user(ver.name, &name.as_bytes()[..copy_len]).map_err(|_| GfxError::Fault)?;
     }
     ver.name_len = name.len() as u64;
 
@@ -460,8 +458,7 @@ fn handle_version(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     let date = driver.date();
     if ver.date != 0 && ver.date_len > 0 {
         let copy_len = (ver.date_len as usize).min(date.len());
-        copy_to_user::<Uaccess>(ver.date, &date.as_bytes()[..copy_len])
-            .map_err(|_| GfxError::Fault)?;
+        copy_to_user(ver.date, &date.as_bytes()[..copy_len]).map_err(|_| GfxError::Fault)?;
     }
     ver.date_len = date.len() as u64;
 
@@ -469,8 +466,7 @@ fn handle_version(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     let desc = driver.desc();
     if ver.desc != 0 && ver.desc_len > 0 {
         let copy_len = (ver.desc_len as usize).min(desc.len());
-        copy_to_user::<Uaccess>(ver.desc, &desc.as_bytes()[..copy_len])
-            .map_err(|_| GfxError::Fault)?;
+        copy_to_user(ver.desc, &desc.as_bytes()[..copy_len]).map_err(|_| GfxError::Fault)?;
     }
     ver.desc_len = desc.len() as u64;
 

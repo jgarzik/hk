@@ -3,9 +3,8 @@
 
 use alloc::sync::Arc;
 
-use crate::arch::Uaccess;
 use crate::fs::{File, KernelError, RwFlags};
-use crate::uaccess::{UaccessArch, UserPtr};
+use crate::uaccess::{UserPtr, access_ok};
 use crate::util::error::KernelResult;
 
 use super::iov_iter::{IovDest, IovSource};
@@ -127,7 +126,7 @@ pub fn do_writev(
 /// check (Linux import_ubuf)
 pub fn import_ubuf(buf: UserPtr<u8>, count: u64) -> Result<[IoVec; 1], KernelError> {
     let count = (count as usize).min(MAX_RW_COUNT);
-    if !Uaccess::access_ok(buf.addr(), count) {
+    if !access_ok(buf.addr(), count) {
         return Err(KernelError::BadAddress);
     }
     Ok([IoVec {

@@ -343,12 +343,12 @@ pub fn commit_creds(new: Arc<Cred>) {
 /// real-uid change flagged the task and it is still over; else the flag
 /// is cleared
 pub fn nproc_exec_check() -> KernelResult<()> {
-    let tid = percpu::current_tid();
+    let me = percpu::current();
     let uid = current_cred().uid;
     // rlimit() takes TASKLIST: decide before locking it
     let over = nproc_overlimit(nproc_count(uid));
     let table = percpu::TASKLIST.read();
-    let Some(t) = table.get(tid) else {
+    let Some(t) = table.view(&me) else {
         return Ok(());
     };
     if t.task.has_flag(crate::task::pf::NPROC_EXCEEDED) && over {
@@ -557,9 +557,8 @@ pub struct PrctlState {
     /// Keep capabilities across setuid (PR_SET_KEEPCAPS)
     /// When set, capabilities are preserved when changing UIDs
     pub keep_caps: bool,
-    /// TSC mode (x86-64 only): PR_TSC_ENABLE or PR_TSC_SIGSEGV
-    /// Controls whether RDTSC instruction is allowed
-    #[cfg(target_arch = "x86_64")]
+    /// TSC mode: PR_TSC_ENABLE or PR_TSC_SIGSEGV (set only where the
+    /// arch has PR_SET_TSC, `uapi::TSC_CTL`): whether RDTSC is allowed
     pub tsc_mode: u8,
     /// Transparent Huge Pages disabled for this process
     pub thp_disable: bool,
@@ -571,7 +570,6 @@ impl Default for PrctlState {
             no_new_privs: false,
             timer_slack_ns: 50_000, // 50 microseconds default
             keep_caps: false,
-            #[cfg(target_arch = "x86_64")]
             tsc_mode: prctl_ops::PR_TSC_ENABLE as u8, // RDTSC allowed by default
             thp_disable: false,
         }
@@ -992,7 +990,7 @@ pub struct Task {
     pub started: AtomicBool,
     /// Serializes the task's wakers (Linux pi_lock): IrqSpinlock, taken
     /// before its CPU's rq lock (`try_to_wake_up`)
-    pub pi_lock: crate::arch::IrqSpinlock<()>,
+    pub pi_lock: crate::sync::IrqSpinlock<()>,
 
     /// Parent process ID (0 for init/orphans; written under TASKLIST)
     pub ppid: AtomicU64,
@@ -1113,79 +1111,79 @@ pub struct Task {
 pub struct TaskInner {
     /// Its process identifier (Linux thread_pid; None for the idle
     /// tasks, tid 0)
-    pub thread_pid: Option<Arc<pid::Pid>>,
+    thread_pid: Option<Arc<pid::Pid>>,
     /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
     /// PIDTYPE_SID]): the same in every thread of the group, numbered
     /// by the `pgid`/`sid` atomics; None for kernel threads
-    pub pgrp: Option<Arc<pid::Pid>>,
-    pub session: Option<Arc<pid::Pid>>,
+    pgrp: Option<Arc<pid::Pid>>,
+    session: Option<Arc<pid::Pid>>,
     /// A group leader on its `pgrp`'s and `session`'s lists
-    pub pids_linked: bool,
+    pids_linked: bool,
     // =========================================================================
     // Exit handling (like Linux task_struct exit fields)
     // =========================================================================
     /// Exit status code (set when task becomes zombie)
-    pub exit_code: i32,
+    exit_code: i32,
     /// Signal to send to parent on exit (default SIGCHLD, from clone3
     /// exit_signal; -1 for a thread, Linux)
-    pub exit_signal: i32,
+    exit_signal: crate::signal::ExitSignal,
     /// Its parent's exec count when it was made (Linux parent_exec_id):
     /// a non-SIGCHLD exit signal is sent only to the image that set it
-    pub parent_exec_id: u64,
+    parent_exec_id: u64,
     /// Signal to send when parent dies (set via prctl PR_SET_PDEATHSIG)
-    pub pdeath_signal: i32,
+    pdeath_signal: Option<crate::signal::Signal>,
 
     // =========================================================================
     // Credentials (like Linux task_struct->cred)
     // =========================================================================
     /// Current state
-    pub state: TaskState,
+    state: TaskState,
     /// CPU affinity mask (bit N = CPU N is allowed)
     /// Top-level page table it runs on: its mm's, else the kernel's
     /// (`ArchPageTable::kernel_root`)
-    pub pgd: u64,
+    pgd: u64,
 
     // =========================================================================
     // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)
     // =========================================================================
     /// Address to clear and futex-wake on thread exit (set_tid_address syscall)
     /// Used by pthread library for thread cleanup notification.
-    pub clear_child_tid: u64,
+    clear_child_tid: u64,
 
     /// Address to write child TID on first schedule (CLONE_CHILD_SETTID for fork)
     /// Consumed after first use (one-time operation).
-    pub set_child_tid: u64,
+    set_child_tid: u64,
 
     // =========================================================================
     // Shared resources (Arc for clone-sharing, like Linux pointers)
     // =========================================================================
     /// Signal handlers (shared when CLONE_SIGHAND)
-    pub sighand: Option<Arc<SigHand>>,
+    sighand: Option<Arc<SigHand>>,
 
     /// Thread-group signal state (shared when CLONE_THREAD)
-    pub signal: Option<Arc<SignalStruct>>,
+    signal: Option<Arc<SignalStruct>>,
 
     /// SysV semaphore undo list (shared when CLONE_SYSVSEM)
-    pub sysvsem: Option<Arc<SemUndoList>>,
+    sysvsem: Option<Arc<SemUndoList>>,
 
     // =========================================================================
     // Per-task signal state (not shared)
     // =========================================================================
     /// Robust futex list head address
-    pub robust_list: u64,
+    robust_list: u64,
 
     // =========================================================================
     // prctl state (not shared)
     // =========================================================================
     /// Per-task prctl state (name, dumpable, no_new_privs, timer_slack)
-    pub prctl: PrctlState,
+    prctl: PrctlState,
 
     // =========================================================================
     // Personality (execution domain)
     // =========================================================================
     /// Process personality (execution domain, affects syscall behavior)
     /// See personality(2). Default is 0 (PER_LINUX).
-    pub personality: u32,
+    personality: u32,
 
     // =========================================================================
     // Seccomp state (sandboxing)
@@ -1194,70 +1192,69 @@ pub struct TaskInner {
     /// Filters are chained: when a new filter is installed, it points to the previous.
     /// On syscall entry, filters are run in order (newest first), and the most
     /// restrictive result wins.
-    pub seccomp_filter: Option<Arc<SeccompFilter>>,
+    seccomp_filter: Option<Arc<SeccompFilter>>,
 
     // =========================================================================
     // I/O port permissions (x86-64 only)
     // =========================================================================
-    /// Emulated I/O privilege level (x86-64 only)
+    /// Emulated I/O privilege level (x86-64 iopl(2), Linux
+    /// thread.iopl_emul; 0 elsewhere)
     /// 0-2 = no direct I/O access, 3 = full I/O port access
-    /// This is an emulation of the CPU IOPL mechanism, stored per-task.
-    #[cfg(target_arch = "x86_64")]
-    pub iopl_emul: u8,
+    pub(crate) iopl_emul: u8,
 
     /// Thread-group leader (Linux thread_group_leader): created without
     /// CLONE_THREAD, or the thread whose exec ended the others
     /// (de_thread). Only leaders are waited for; a leader keeps its
     /// SignalStruct as a zombie, for the group's exit status.
-    pub leader: bool,
+    leader: bool,
 
     // =========================================================================
     // Ptrace state (like Linux task_struct ptrace fields)
     // =========================================================================
     /// Ptrace flags (PT_PTRACED, PT_SEIZED, PT_SYSCALL_TRACE, PT_SINGLESTEP)
     /// 0 = not traced, non-zero = traced with flags
-    pub ptrace: u32,
+    ptrace: u32,
 
     /// The tracer (Linux task->parent while traced): a task reference,
     /// so a recycled number never names it (under TASKLIST)
-    pub ptracer: Option<alloc::sync::Weak<Task>>,
+    ptracer: Option<alloc::sync::Weak<Task>>,
 
     /// The real parent (Linux real_parent): the task whose `children`
     /// list holds this one; None for init and kernel threads. Weak:
     /// exit reparents children first (under TASKLIST)
-    pub real_parent: Option<alloc::sync::Weak<Task>>,
+    real_parent: Option<alloc::sync::Weak<Task>>,
 
     /// Its children (Linux children; their `sibling` links): the thread
     /// group leaders it created, one strong reference each, until reaped
     /// or reparented (under TASKLIST)
-    pub children: crate::util::list::ArcList<Sibling>,
+    children: crate::util::list::ArcList<Sibling>,
 
     /// On its real parent's `children` (a group leader; Linux: only
     /// leaders are)
-    pub in_children: bool,
+    in_children: bool,
 
     /// A leader's thread group, itself included (Linux
     /// signal->thread_head; links `thread_node`), one strong reference
     /// each, until a thread leaves the task list (under TASKLIST)
-    pub threads: crate::util::list::ArcList<ThreadNode>,
+    threads: crate::util::list::ArcList<ThreadNode>,
 
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
-    pub ptrace_message: u64,
+    ptrace_message: u64,
 
     /// Ptrace options (PTRACE_O_TRACESYSGOOD, etc.)
-    pub ptrace_options: u32,
+    ptrace_options: u32,
     /// A ptrace stop's code (Linux exit_code): the stop's signal until
     /// the tracer's wait reports it (then 0), then the signal the
     /// tracer's resume leaves to deliver (0: none)
-    pub ptrace_code: u32,
+    ptrace_code: u32,
     /// The siginfo of the stop it is in, which PTRACE_GETSIGINFO reads
     /// and PTRACE_SETSIGINFO replaces (Linux task->last_siginfo); none
     /// outside a ptrace stop
-    pub last_siginfo: Option<crate::signal::SigInfo>,
+    last_siginfo: Option<crate::signal::SigInfo>,
     /// Its tracer is inside a ptrace request on it (Linux
     /// JOBCTL_PTRACE_FROZEN): a SIGKILL leaves its ptrace stop alone
     /// until the request ends
-    pub ptrace_frozen: bool,
+    ptrace_frozen: bool,
 }
 
 impl TaskInner {
@@ -1271,9 +1268,9 @@ impl TaskInner {
             session: None,
             pids_linked: false,
             exit_code: 0,
-            exit_signal: 0,
+            exit_signal: crate::signal::ExitSignal::NONE,
             parent_exec_id: 0,
-            pdeath_signal: 0,
+            pdeath_signal: None,
             state,
             pgd,
             clear_child_tid: 0,
@@ -1285,7 +1282,6 @@ impl TaskInner {
             prctl: PrctlState::default(),
             personality: 0,
             seccomp_filter: None,
-            #[cfg(target_arch = "x86_64")]
             iopl_emul: 0,
             leader: true,
             ptrace: 0,
@@ -1300,6 +1296,139 @@ impl TaskInner {
             last_siginfo: None,
             ptrace_frozen: false,
         }
+    }
+
+    /// Its signal handlers (none once it exits)
+    pub fn sighand(&self) -> Option<&Arc<SigHand>> {
+        self.sighand.as_ref()
+    }
+
+    /// Install signal handlers `h`; returns the old ones
+    pub fn set_sighand(&mut self, h: Arc<SigHand>) -> Option<Arc<SigHand>> {
+        self.sighand.replace(h)
+    }
+
+    /// Detach its signal handlers
+    pub fn take_sighand(&mut self) -> Option<Arc<SigHand>> {
+        self.sighand.take()
+    }
+
+    /// Its thread group's signal state (none once it is reaped)
+    pub fn signal(&self) -> Option<&Arc<SignalStruct>> {
+        self.signal.as_ref()
+    }
+
+    /// Install thread-group signal state `s`
+    pub fn set_signal(&mut self, s: Arc<SignalStruct>) {
+        self.signal = Some(s);
+    }
+
+    /// Detach its thread group's signal state
+    pub fn take_signal(&mut self) -> Option<Arc<SignalStruct>> {
+        self.signal.take()
+    }
+
+    /// Its process identifier (None for the idle tasks)
+    pub fn thread_pid(&self) -> Option<&Arc<pid::Pid>> {
+        self.thread_pid.as_ref()
+    }
+
+    /// Its process group (None for kernel threads)
+    pub fn pgrp(&self) -> Option<&Arc<pid::Pid>> {
+        self.pgrp.as_ref()
+    }
+
+    /// Its session (None for kernel threads)
+    pub fn session(&self) -> Option<&Arc<pid::Pid>> {
+        self.session.as_ref()
+    }
+
+    /// It is its thread group's leader
+    pub fn leader(&self) -> bool {
+        self.leader
+    }
+
+    /// Its real parent, if it has one that lives
+    pub fn real_parent(&self) -> Option<percpu::TaskRef> {
+        self.real_parent.as_ref().and_then(|w| w.upgrade())
+    }
+
+    /// Its current state
+    pub fn state(&self) -> TaskState {
+        self.state
+    }
+
+    /// Its ptrace flags (0: not traced)
+    pub fn ptrace(&self) -> u32 {
+        self.ptrace
+    }
+
+    /// Its tracer is inside a ptrace request on it
+    pub fn ptrace_frozen(&self) -> bool {
+        self.ptrace_frozen
+    }
+
+    /// End a ptrace stop it is in: ready, nothing for its tracer's wait
+    pub fn end_trace_stop(&mut self) {
+        if matches!(self.state, TaskState::Traced(_)) {
+            self.state = TaskState::Ready;
+            self.ptrace_code = 0;
+        }
+    }
+
+    /// Its exit status, once a zombie
+    pub fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+
+    /// The signal its exit sends its parent
+    pub fn exit_signal(&self) -> crate::signal::ExitSignal {
+        self.exit_signal
+    }
+
+    /// Its parent's exec count when it was made
+    pub fn parent_exec_id(&self) -> u64 {
+        self.parent_exec_id
+    }
+
+    /// Its no_new_privs bit
+    pub fn no_new_privs(&self) -> bool {
+        self.prctl.no_new_privs
+    }
+
+    /// Set its no_new_privs bit (never cleared)
+    pub fn set_no_new_privs(&mut self) {
+        self.prctl.no_new_privs = true;
+    }
+
+    /// Its seccomp filter chain's head
+    pub fn seccomp_filter(&self) -> Option<&Arc<SeccompFilter>> {
+        self.seccomp_filter.as_ref()
+    }
+
+    /// Install seccomp filter chain head `f`
+    pub fn set_seccomp_filter(&mut self, f: Arc<SeccompFilter>) {
+        self.seccomp_filter = Some(f);
+    }
+
+    /// Detach its seccomp filter chain
+    pub fn take_seccomp_filter(&mut self) -> Option<Arc<SeccompFilter>> {
+        self.seccomp_filter.take()
+    }
+
+    /// Its SysV semaphore undo list
+    pub fn sysvsem(&self) -> Option<&Arc<SemUndoList>> {
+        self.sysvsem.as_ref()
+    }
+
+    /// Install SysV semaphore undo list `u`
+    pub fn set_sysvsem(&mut self, u: Arc<SemUndoList>) {
+        self.sysvsem = Some(u);
+    }
+
+    /// Detach its SysV semaphore undo list
+    pub fn take_sysvsem(&mut self) -> Option<Arc<SemUndoList>> {
+        self.sysvsem.take()
     }
 }
 
@@ -1624,7 +1753,7 @@ impl Task {
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(false),
-            pi_lock: crate::arch::IrqSpinlock::new(()),
+            pi_lock: crate::sync::IrqSpinlock::new(()),
             ppid: AtomicU64::new(ids.ppid),
             pgid: AtomicU64::new(ids.pgid),
             sid: AtomicU64::new(ids.sid),
@@ -1689,7 +1818,7 @@ impl Task {
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(true),
-            pi_lock: crate::arch::IrqSpinlock::new(()),
+            pi_lock: crate::sync::IrqSpinlock::new(()),
             ppid: AtomicU64::new(0),
             pgid: AtomicU64::new(0),
             sid: AtomicU64::new(0),
@@ -2289,10 +2418,11 @@ pub fn cap_fix_setuid(old: &Cred, new: &mut Cred, keep_caps: bool) {
     }
 }
 
-/// How many times process `pid` has exec'd (Linux self_exec_id: its
-/// struct pid's count, which an exec bumps), 0 if it is gone
-pub fn self_exec_id(pid: Pid) -> u64 {
-    u32::try_from(pid)
+/// How many times task `t`'s process has exec'd (Linux self_exec_id:
+/// the process's struct pid's count, which an exec bumps), 0 if it is
+/// gone
+pub fn self_exec_id(t: &Task) -> u64 {
+    u32::try_from(t.pid)
         .ok()
         .and_then(|n| crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, n))
         .map_or(0, |p| p.exec_gen())
@@ -2455,9 +2585,9 @@ pub fn nproc_move(old: Uid, new: Uid) {
 /// user never is); the flag is cleared otherwise
 fn flag_nproc_exceeded(new: Uid) {
     let over = new != 0 && nproc_overlimit(nproc_count(new));
-    let tid = percpu::current_tid();
+    let me = percpu::current();
     let table = percpu::TASKLIST.read();
-    if let Some(t) = table.get(tid) {
+    if let Some(t) = table.view(&me) {
         if over {
             t.task.set_flag(crate::task::pf::NPROC_EXCEEDED);
         } else {
@@ -2567,42 +2697,56 @@ impl Clone for IoContext {
 // Task I/O context accessors - Task.io_context under its alloc_lock
 // =============================================================================
 
-/// Get the I/O context for a task
-pub fn get_task_io_context(tid: Tid) -> Option<Arc<IoContext>> {
-    percpu::with_task_lock(tid, |a| a.io_context().cloned()).flatten()
+/// The I/O context of task `t`
+pub fn get_task_io_context(t: &Task) -> Option<Arc<IoContext>> {
+    t.task_lock().io_context().cloned()
 }
 
-/// Set the I/O context for a task (its old one dropped after the lock)
-pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
-    drop(percpu::with_task_lock(tid, |a| a.set_io_context(Some(ctx))));
+/// Set the I/O context of task `t` (its old one dropped after the lock)
+pub fn set_task_io_context(t: &Task, ctx: Arc<IoContext>) {
+    drop(t.task_lock().set_io_context(Some(ctx)));
 }
 
-/// The I/O context of a task, a new one if it has none (Linux
-/// set_task_ioprio's alloc_io_context under task_lock); None if there
-/// is no such task, ENOMEM if one cannot be made
-pub fn task_io_context(tid: Tid) -> Result<Option<Arc<IoContext>>, KernelError> {
-    let new = try_arc(IoContext::new())?;
-    Ok(percpu::with_task_lock(tid, |a| match a.io_context() {
-        Some(c) => c.clone(),
-        None => {
-            a.set_io_context(Some(new.clone()));
-            new
-        }
-    }))
+/// Set task `t`'s I/O priority (Linux set_task_ioprio), making it an
+/// I/O context if it has none, but not once it is exiting (its context
+/// would outlive exit_io_context); ENOMEM if one cannot be made. The
+/// context is allocated only when `t` has none, outside its alloc_lock,
+/// and the lock retaken to recheck; a spare is dropped after unlocking.
+pub fn set_task_ioprio(t: &Task, ioprio: IoPrio) -> Result<(), KernelError> {
+    if let Some(c) = t.task_lock().io_context() {
+        c.set_ioprio(ioprio);
+        return Ok(());
+    }
+    let new = try_arc(IoContext::with_ioprio(ioprio))?;
+    let mut a = t.task_lock();
+    let spare = if let Some(c) = a.io_context() {
+        c.set_ioprio(ioprio);
+        Some(new)
+    } else if t.has_flag(pf::EXITING) {
+        Some(new)
+    } else {
+        a.set_io_context(Some(new));
+        None
+    };
+    drop(a);
+    drop(spare);
+    Ok(())
 }
 
-/// Remove the I/O context for a task (on exit)
-pub fn remove_task_io_context(tid: Tid) {
-    drop(percpu::with_task_lock(tid, |a| a.set_io_context(None)));
+/// Remove the I/O context of task `t` (on exit)
+pub fn remove_task_io_context(t: &Task) {
+    drop(t.task_lock().set_io_context(None));
 }
 
 /// The I/O context for a new task, built before it exists (installed
 /// with `set_task_io_context`)
 ///
-/// If `share` is true (CLONE_IO set), child shares parent's Arc<IoContext>.
-/// Otherwise, child gets a new IoContext inheriting parent's ioprio value.
-pub fn fork_io(parent_tid: Tid, share: bool) -> Result<Arc<IoContext>, KernelError> {
-    match get_task_io_context(parent_tid) {
+/// If `share` is true (CLONE_IO set), the child shares the caller's
+/// Arc<IoContext>; otherwise it gets a new one inheriting the caller's
+/// ioprio. Read under the caller's alloc_lock: ioprio_set may install
+/// one in it meanwhile.
+pub fn fork_io(share: bool) -> Result<Arc<IoContext>, KernelError> {
+    match get_task_io_context(&percpu::current()) {
         // CLONE_IO: share the same context
         Some(parent_ctx) if share => Ok(parent_ctx),
         // No CLONE_IO: create new context with inherited ioprio
@@ -2631,23 +2775,6 @@ pub const IOPRIO_WHO_USER: i32 = 3;
 // task itself (arch_prctl, the switch-out save) or its creator, read at
 // switch-in.
 
-/// The TLS pointer of task `tid` (None if unset)
-pub fn get_task_tls(tid: Tid) -> Option<u64> {
-    let table = percpu::TASKLIST.read();
-    table
-        .get(tid)
-        .map(|t| t.task.tls.load(Ordering::Relaxed))
-        .filter(|&v| v != 0)
-}
-
-/// Set the TLS pointer of task `tid` (the task itself, or ptrace on a
-/// stopped tracee)
-pub fn set_task_tls(tid: Tid, tls: u64) {
-    if let Some(t) = percpu::TASKLIST.read().get(tid) {
-        t.task.tls.store(tls, Ordering::Relaxed);
-    }
-}
-
 // =============================================================================
 // Per-task clear_child_tid pointer (for set_tid_address syscall)
 // =============================================================================
@@ -2655,19 +2782,10 @@ pub fn set_task_tls(tid: Tid, tls: u64) {
 // Stored directly in Task struct (clear_child_tid field), following Linux's
 // task_struct->clear_child_tid pattern.
 
-/// Get the clear_child_tid pointer for a task
-pub fn get_clear_child_tid(tid: Tid) -> Option<u64> {
-    let table = percpu::TASKLIST.read();
-    table
-        .get(tid)
-        .map(|t| t.clear_child_tid)
-        .filter(|&v| v != 0)
-}
-
-/// Set the clear_child_tid pointer for a task
-pub fn set_clear_child_tid(tid: Tid, addr: u64) {
+/// Set task `t`'s clear_child_tid pointer
+pub fn set_clear_child_tid(t: &Task, addr: u64) {
     let mut table = percpu::TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
+    if let Some(mut task) = table.view_mut(t) {
         task.clear_child_tid = addr;
     }
 }
@@ -2679,10 +2797,10 @@ pub fn set_clear_child_tid(tid: Tid, addr: u64) {
 // Stored directly in Task struct (set_child_tid field), following Linux's
 // task_struct->set_child_tid pattern.
 
-/// Get and remove the set_child_tid pointer for a task (one-time use)
-pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
+/// Get and remove task `t`'s set_child_tid pointer (one-time use)
+pub fn get_set_child_tid(t: &Task) -> Option<u64> {
     let mut table = percpu::TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
+    if let Some(mut task) = table.view_mut(t) {
         let addr = task.set_child_tid;
         if addr != 0 {
             task.set_child_tid = 0; // Consume (one-time use)
@@ -2692,11 +2810,11 @@ pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
     None
 }
 
-/// Set the set_child_tid pointer for a task
-pub fn set_set_child_tid(tid: Tid, addr: u64) {
+/// Set task `t`'s set_child_tid pointer
+pub fn set_set_child_tid(t: &Task, addr: u64) {
     if addr != 0 {
         let mut table = percpu::TASKLIST.write();
-        if let Some(mut task) = table.get_mut(tid) {
+        if let Some(mut task) = table.view_mut(t) {
             task.set_child_tid = addr;
         }
     }
@@ -2706,12 +2824,14 @@ pub fn set_set_child_tid(tid: Tid, addr: u64) {
 // Cgroup file descriptor lookup (for CLONE_INTO_CGROUP)
 // =============================================================================
 
-/// The cgroup a CLONE_INTO_CGROUP fd names (Linux cgroup_get_from_file):
-/// EBADF for no file or a file that is not a cgroup directory, ENOENT
-/// for a removed one (css_tryget_online_from_dir)
-pub fn cgroup_from_fd(tid: Tid, fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
+/// The cgroup the caller's CLONE_INTO_CGROUP fd names (Linux
+/// cgroup_get_from_file): EBADF for no file or a file that is not a
+/// cgroup directory, ENOENT for a removed one
+/// (css_tryget_online_from_dir)
+pub fn cgroup_from_fd(fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
     use crate::fs::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
-    let file = fdtable::get_task_fd(tid)
+    let file = percpu::current()
+        .files()
         .and_then(|t| t.lock().get(fd))
         .ok_or(KernelError::BadFd)?;
     let private = file

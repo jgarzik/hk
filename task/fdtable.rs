@@ -22,8 +22,8 @@ use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
-use super::percpu::with_task_lock;
-use super::{FdTable, Tid};
+use super::percpu::current;
+use super::{FdTable, Task};
 use crate::fs::File;
 use crate::util::error::KernelError;
 
@@ -119,33 +119,29 @@ impl Drop for FilesGuard<'_> {
     }
 }
 
-/// Point `tid` (the task itself, or a child not yet run) at `files`;
+/// Point `t` (the task itself, or a child not yet run) at `files`;
 /// the table it had is dropped after its alloc_lock is released
-pub fn init_task_fd(tid: Tid, files: Arc<Files>) {
+pub fn init_task_fd(t: &Task, files: Arc<Files>) {
     use core::sync::atomic::Ordering;
     files.users.fetch_add(1, Ordering::AcqRel);
-    let old = with_task_lock(tid, |a| a.set_files(Some(files))).flatten();
+    let old = t.task_lock().set_files(Some(files));
     if let Some(o) = &old {
         o.users.fetch_sub(1, Ordering::AcqRel);
     }
     drop(old);
 }
 
-/// The descriptor table of `tid` (lock-free for the current task, Linux
-/// current->files)
-pub fn get_task_fd(tid: Tid) -> Option<Arc<Files>> {
-    let me = super::percpu::current();
-    if me.tid() == tid {
-        return me.files();
-    }
-    with_task_lock(tid, |a| a.files().cloned()).flatten()
+/// The descriptor table of `t` (under its alloc_lock; the current
+/// task's is `current().files()`, lock-free)
+pub fn get_task_fd(t: &Task) -> Option<Arc<Files>> {
+    t.task_lock().files().cloned()
 }
 
 /// Exit (Linux exit_files): drop the task's reference; the last one
 /// closes every descriptor, after its alloc_lock is released
 /// (releasing a socket can sleep)
-pub fn exit_task_fd(tid: Tid) {
-    let files = with_task_lock(tid, |a| a.set_files(None)).flatten();
+pub fn exit_task_fd(t: &Task) {
+    let files = t.task_lock().set_files(None);
     if let Some(f) = &files {
         f.users.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
     }
@@ -153,13 +149,14 @@ pub fn exit_task_fd(tid: Tid) {
     drop(files);
 }
 
-/// At exec's point of no return: give the task a private table without
-/// its close-on-exec descriptors (Linux unshare_files, then
+/// At exec's point of no return: give the calling task a private table
+/// without its close-on-exec descriptors (Linux unshare_files, then
 /// do_close_on_exec). A table shared through CLONE_FILES stays intact
 /// for the other tasks; the closed files are released after every lock
 /// is dropped.
-pub fn exec_task_fd(tid: Tid) {
-    let Some(old) = get_task_fd(tid) else {
+pub fn exec_task_fd() {
+    let me = current();
+    let Some(old) = me.files() else {
         return;
     };
     // Not shared: the table itself loses its close-on-exec descriptors,
@@ -187,10 +184,10 @@ pub fn exec_task_fd(tid: Tid) {
         // Past exec's point of no return: failure cannot be reported
         (arc_nofail(Files::new(t.exec_copy())), cloexec)
     };
-    init_task_fd(tid, new);
+    init_task_fd(&me, new);
     // Linux do_close_on_exec closes them (filp_close): their POSIX locks
     // go and they are flushed; every other lock stays across the exec
-    let owner = get_task_fd(tid).map_or(0, |f| f.id());
+    let owner = me.files().map_or(0, |f| f.id());
     for f in &cloexec {
         crate::fs::file::filp_flush(f, owner);
     }
@@ -198,27 +195,29 @@ pub fn exec_task_fd(tid: Tid) {
     drop(old);
 }
 
-/// Give `tid` a private copy of its table (Linux unshare_fd): the new
-/// table is installed and returned, while tasks still sharing the old
-/// one through CLONE_FILES keep it. EBADF if it has none, ENOMEM.
-pub fn unshare_task_fd(tid: Tid) -> Result<Arc<Files>, KernelError> {
-    let old = get_task_fd(tid).ok_or(KernelError::BadFd)?;
+/// Give the calling task a private copy of its table (Linux
+/// unshare_fd): the new table is installed and returned, while tasks
+/// still sharing the old one through CLONE_FILES keep it. EBADF if it
+/// has none, ENOMEM.
+pub fn unshare_task_fd() -> Result<Arc<Files>, KernelError> {
+    let me = current();
+    let old = me.files().ok_or(KernelError::BadFd)?;
     // Only a shared table is copied (Linux unshare_fd: count > 1), so a
     // private one keeps its lock-owner identity
     if !old.shared() {
         return Ok(old);
     }
     let new = try_arc(Files::new(old.lock().deep_clone()))?;
-    init_task_fd(tid, new.clone());
+    init_task_fd(&me, new.clone());
     drop(old);
     Ok(new)
 }
 
-/// The table for a new task, built before it exists (Linux copy_files;
-/// installed with `init_task_fd`): shared with CLONE_FILES (`share`),
-/// else a copy; ENOMEM
-pub fn fork_task_fd(parent_tid: Tid, share: bool) -> Result<Arc<Files>, KernelError> {
-    match get_task_fd(parent_tid) {
+/// The table for a new task, built before it exists (Linux copy_files,
+/// reading current->files lock-free; installed with `init_task_fd`):
+/// the caller's with CLONE_FILES (`share`), else a copy; ENOMEM
+pub fn fork_task_fd(share: bool) -> Result<Arc<Files>, KernelError> {
+    match crate::task::percpu::current().files() {
         Some(p) if share => Ok(p),
         Some(p) => try_arc(Files::new(p.lock().deep_clone())),
         None => try_arc(Files::new(FdTable::new())),

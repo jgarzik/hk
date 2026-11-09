@@ -65,6 +65,13 @@ pub const VMEMMAP_START: u64 = 0xFFFF_FC00_0000_0000;
 /// End of user space: all of TTBR0 (48-bit)
 pub const TASK_SIZE: u64 = 1 << 48;
 
+/// Top of the initial user stack (Linux STACK_TOP, no randomization)
+pub const STACK_TOP: u64 = TASK_SIZE;
+
+/// Load address of PIE executables (Linux ELF_ET_DYN_BASE, 2/3 of
+/// TASK_SIZE, without randomization)
+pub const ELF_ET_DYN_BASE: u64 = 0xAAAA_AAAA_0000;
+
 /// Device-window address of a low physical MMIO address
 pub const fn io_va(phys: u64) -> u64 {
     IO_BASE + phys
@@ -888,9 +895,18 @@ impl Aarch64PageTable {
 
         Ok(())
     }
+}
+
+// ============================================================================
+// PageTable Trait Implementation
+// ============================================================================
+
+impl PageTable for Aarch64PageTable {
+    type VirtAddr = u64;
+    type PhysAddr = u64;
 
     /// Translate a virtual address to physical address
-    pub fn translate(&self, va: u64) -> Option<u64> {
+    fn translate(&self, va: Self::VirtAddr) -> Option<Self::PhysAddr> {
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
         let offset = va & 0xFFF;
 
@@ -935,19 +951,6 @@ impl Aarch64PageTable {
 
             Some(l3_entry.addr() | offset)
         }
-    }
-}
-
-// ============================================================================
-// PageTable Trait Implementation
-// ============================================================================
-
-impl PageTable for Aarch64PageTable {
-    type VirtAddr = u64;
-    type PhysAddr = u64;
-
-    fn translate(&self, va: Self::VirtAddr) -> Option<Self::PhysAddr> {
-        Aarch64PageTable::translate(self, va)
     }
 
     fn map_with_alloc<FA: FrameAlloc<PhysAddr = Self::PhysAddr>>(

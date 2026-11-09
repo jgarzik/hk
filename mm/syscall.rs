@@ -6,15 +6,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::File;
-use crate::task::percpu::current_tid;
-use crate::uaccess::UserPtr;
+use crate::uaccess::{UserPtr, access_ok};
 
 use super::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK,
     MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE,
     MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ,
     PROT_WRITE, TASK_SIZE, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_NORESERVE,
-    VM_SHARED, Vma, anon_vma::AnonVma, get_task_mm,
+    VM_SHARED, Vma, anon_vma::AnonVma,
 };
 use crate::util::error::{KernelError, KernelResult};
 
@@ -184,8 +183,9 @@ pub fn sys_mmap(
     }
 
     // Every user task has an address space; kernel threads have none
-    let tid = current_tid();
-    let mm = get_task_mm(tid).ok_or(KernelError::OutOfMemory)?;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::OutOfMemory)?;
 
     // Mappings replaced by MAP_FIXED: declared first so that they are
     // dropped after the lock on every return
@@ -379,8 +379,7 @@ pub fn sys_munmap(addr: u64, length: u64) -> KernelResult<()> {
         return Err(KernelError::InvalidArgument);
     }
 
-    let tid = current_tid();
-    let Some(mm) = get_task_mm(tid) else {
+    let Some(mm) = crate::task::percpu::current().mm() else {
         // No mm, nothing to unmap
         return Ok(());
     };
@@ -441,7 +440,7 @@ pub(crate) fn munmap_locked(
 /// a rounded break that wraps, within a page of the next mapping, past
 /// RLIMIT_AS). `brk(0)` queries.
 pub fn sys_brk(brk: u64) -> KernelResult<u64> {
-    let Some(mm) = get_task_mm(current_tid()) else {
+    let Some(mm) = crate::task::percpu::current().mm() else {
         return Ok(0);
     };
     let Ok(mut map) = mm.mmap_write_killable() else {
@@ -574,7 +573,7 @@ fn can_do_mlock() -> bool {
 /// The mm lock is not held between faults (the kernel is preemptible:
 /// no cond_resched needed); a VMA changed meanwhile is looked up again.
 fn populate_range(start: u64, len: u64, ignore_errors: bool) -> Result<(), KernelError> {
-    let Some(mm) = get_task_mm(current_tid()) else {
+    let Some(mm) = crate::task::percpu::current().mm() else {
         return Ok(());
     };
     let end = start.saturating_add(len).min(TASK_SIZE);
@@ -693,7 +692,9 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> KernelResult<()> {
         return Err(KernelError::NotPermitted);
     }
     let (start, len) = lock_range(start, len);
-    let mm = get_task_mm(current_tid()).ok_or(KernelError::OutOfMemory)?;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::OutOfMemory)?;
     let mut map = mm.mmap_write_killable()?;
     let r = if memlock_room(&map, start, len) {
         mlock_vmas(&mut map, start, len, vm_flags)
@@ -813,7 +814,7 @@ fn mlock_fixup(
 /// 0 on success, negative errno on failure
 pub fn sys_munlock(addr: u64, len: u64) -> KernelResult<()> {
     let (start, len) = lock_range(addr, len);
-    let Some(mm) = get_task_mm(current_tid()) else {
+    let Some(mm) = crate::task::percpu::current().mm() else {
         return Ok(());
     };
     let mut map = mm.mmap_write_killable()?;
@@ -847,8 +848,9 @@ pub fn sys_mlockall(flags: i32) -> KernelResult<()> {
         return Err(KernelError::NotPermitted);
     }
 
-    let tid = current_tid();
-    let mm = get_task_mm(tid).ok_or(KernelError::OutOfMemory)?;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::OutOfMemory)?;
 
     let mut mm_guard = mm.mmap_write_killable()?;
 
@@ -938,8 +940,7 @@ pub fn sys_mlockall(flags: i32) -> KernelResult<()> {
 /// # Returns
 /// 0 on success, negative errno on failure
 pub fn sys_munlockall() -> KernelResult<()> {
-    let tid = current_tid();
-    let Some(mm) = get_task_mm(tid) else {
+    let Some(mm) = crate::task::percpu::current().mm() else {
         // No mm, nothing to unlock
         return Ok(());
     };
@@ -996,7 +997,9 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> KernelResult<()> {
     if prot & !(PROT_READ | PROT_WRITE | super::PROT_EXEC | super::PROT_SEM) != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let mm = get_task_mm(current_tid()).ok_or(KernelError::InvalidArgument)?;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::InvalidArgument)?;
     let mut map = mm.mmap_write_killable()?;
     let start = mprotect_start(&map, addr, end, grows)?;
 
@@ -1174,7 +1177,9 @@ pub fn sys_msync(addr: u64, length: u64, flags: i32) -> KernelResult<()> {
     if end == addr {
         return Ok(());
     }
-    let mm = get_task_mm(current_tid()).ok_or(KernelError::OutOfMemory)?;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::OutOfMemory)?;
     msync_vmas(&mm, addr, end, flags)
 }
 
@@ -1306,8 +1311,9 @@ pub fn sys_mremap(
         return Err(KernelError::InvalidArgument);
     }
 
-    let tid = current_tid();
-    let mm = get_task_mm(tid).ok_or(KernelError::BadAddress)?;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::BadAddress)?;
 
     // VMAs unmapped or moved away: dropped after the lock on every return
     let mut gone: Vec<Vma> = Vec::new();
@@ -1561,20 +1567,20 @@ fn move_mapping(
 /// # Returns
 /// 0 on success, negative errno on failure
 pub fn sys_mincore(addr: u64, length: u64, vec: UserPtr<u8>) -> KernelResult<()> {
-    use crate::uaccess::UaccessArch;
-    type U = crate::arch::Uaccess;
     if addr & (PAGE_SIZE - 1) != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    if !U::access_ok(addr, length as usize) {
+    if !access_ok(addr, length as usize) {
         return Err(KernelError::OutOfMemory);
     }
     // No overflow: the range is inside user space
     let pages = length.div_ceil(PAGE_SIZE);
-    if !U::access_ok(vec.addr(), pages as usize) {
+    if !access_ok(vec.addr(), pages as usize) {
         return Err(KernelError::BadAddress);
     }
-    let mm = get_task_mm(current_tid()).ok_or(KernelError::OutOfMemory)?;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::OutOfMemory)?;
     mincore_chunks(&mm, addr, pages, vec.addr())
 }
 
@@ -1588,7 +1594,7 @@ fn mincore_chunks(
     let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
     while pages > 0 {
         let n = mincore_chunk(mm, addr, pages.min(PAGE_SIZE), &mut buf)?;
-        crate::uaccess::copy_to_user::<crate::arch::Uaccess>(vec, &buf[..n])?;
+        crate::uaccess::copy_to_user(vec, &buf[..n])?;
         pages -= n as u64;
         vec += n as u64;
         addr += n as u64 * PAGE_SIZE;

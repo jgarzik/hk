@@ -155,16 +155,16 @@ pub fn sys_setgid(gid: u32, current_cred: super::Cred) -> KernelResult<()> {
 /// # Locking
 /// None required - credentials are stable during syscall execution.
 /// Linux uses RCU for credential access; we use per-CPU cached credentials.
-pub fn sys_getresuid<A: crate::uaccess::UaccessArch>(
+pub fn sys_getresuid(
     ruid_ptr: UserPtr<u32>,
     euid_ptr: UserPtr<u32>,
     suid_ptr: UserPtr<u32>,
     current_cred: super::Cred,
 ) -> KernelResult<()> {
     use crate::uaccess::put_user;
-    put_user::<A, u32>(ruid_ptr.addr(), current_cred.uid)?;
-    put_user::<A, u32>(euid_ptr.addr(), current_cred.euid)?;
-    put_user::<A, u32>(suid_ptr.addr(), current_cred.suid)?;
+    put_user::<u32>(ruid_ptr.addr(), current_cred.uid)?;
+    put_user::<u32>(euid_ptr.addr(), current_cred.euid)?;
+    put_user::<u32>(suid_ptr.addr(), current_cred.suid)?;
     Ok(())
 }
 
@@ -185,16 +185,16 @@ pub fn sys_getresuid<A: crate::uaccess::UaccessArch>(
 ///
 /// # Locking
 /// None required - credentials are stable during syscall execution.
-pub fn sys_getresgid<A: crate::uaccess::UaccessArch>(
+pub fn sys_getresgid(
     rgid_ptr: UserPtr<u32>,
     egid_ptr: UserPtr<u32>,
     sgid_ptr: UserPtr<u32>,
     current_cred: super::Cred,
 ) -> KernelResult<()> {
     use crate::uaccess::put_user;
-    put_user::<A, u32>(rgid_ptr.addr(), current_cred.gid)?;
-    put_user::<A, u32>(egid_ptr.addr(), current_cred.egid)?;
-    put_user::<A, u32>(sgid_ptr.addr(), current_cred.sgid)?;
+    put_user::<u32>(rgid_ptr.addr(), current_cred.gid)?;
+    put_user::<u32>(egid_ptr.addr(), current_cred.egid)?;
+    put_user::<u32>(sgid_ptr.addr(), current_cred.sgid)?;
     Ok(())
 }
 
@@ -553,10 +553,7 @@ pub fn sys_setfsgid(gid: u32, current_cred: super::Cred) -> i64 {
 /// getgroups(size, list) (Linux kernel/groups.c): the supplementary
 /// groups; size 0 asks for the count only, a smaller nonzero size is
 /// EINVAL
-pub fn sys_getgroups<A: crate::uaccess::UaccessArch>(
-    size: i32,
-    list: UserPtr<u32>,
-) -> KernelResult<i64> {
+pub fn sys_getgroups(size: i32, list: UserPtr<u32>) -> KernelResult<i64> {
     if size < 0 {
         return Err(KernelError::InvalidArgument);
     }
@@ -569,17 +566,14 @@ pub fn sys_getgroups<A: crate::uaccess::UaccessArch>(
         return Err(KernelError::InvalidArgument);
     }
     let bytes: alloc::vec::Vec<u8> = groups.iter().flat_map(|g| g.to_ne_bytes()).collect();
-    crate::uaccess::copy_to_user::<A>(list.addr(), &bytes)?;
+    crate::uaccess::copy_to_user(list.addr(), &bytes)?;
     Ok(groups.len() as i64)
 }
 
 /// setgroups(size, list) (Linux kernel/groups.c): replace the
 /// supplementary groups; CAP_SETGID (EPERM), at most NGROUPS_MAX and no
 /// invalid gid -1 (EINVAL)
-pub fn sys_setgroups<A: crate::uaccess::UaccessArch>(
-    size: i32,
-    list: UserPtr<u32>,
-) -> KernelResult<()> {
+pub fn sys_setgroups(size: i32, list: UserPtr<u32>) -> KernelResult<()> {
     if !super::capable(super::CAP_SETGID) {
         return Err(KernelError::NotPermitted);
     }
@@ -589,7 +583,7 @@ pub fn sys_setgroups<A: crate::uaccess::UaccessArch>(
     let n = size as usize;
     let mut bytes = crate::util::kmem::try_vec(n * 4, 0u8)?;
     if n > 0 {
-        crate::uaccess::copy_from_user::<A>(&mut bytes, list.addr(), n * 4)?;
+        crate::uaccess::copy_from_user(&mut bytes, list.addr(), n * 4)?;
     }
     let gids: alloc::vec::Vec<u32> = bytes
         .as_chunks::<4>()

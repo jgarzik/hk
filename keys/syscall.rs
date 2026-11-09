@@ -5,7 +5,6 @@
 //! - request_key: Search for a key, optionally requesting construction
 //! - keyctl: Multiplex control operations on keys
 
-use crate::arch::Uaccess;
 use crate::task::percpu;
 use crate::uaccess::{UserPtr, UserSlice, strncpy_from_user_str};
 use crate::util::error::{KernelError, KernelResult};
@@ -27,7 +26,7 @@ const MAX_PAYLOAD_SIZE: usize = 1024 * 1024 - 1;
 /// over-long string included, is EFAULT here (Linux: EINVAL when too
 /// long)
 pub(super) fn user_str(p: UserPtr<u8>, max: usize) -> KernelResult<alloc::string::String> {
-    strncpy_from_user_str::<Uaccess>(p.addr(), max).map_err(|_| KernelError::BadAddress)
+    strncpy_from_user_str(p.addr(), max).map_err(|_| KernelError::BadAddress)
 }
 
 /// add_key(type, description, payload, plen, keyring): a new key of
@@ -57,9 +56,9 @@ pub fn sys_add_key(
     };
 
     let cred = percpu::current_cred();
-    let tid = percpu::current_tid() as u64;
     // Resolve destination keyring (create if needed for special IDs)
-    let dest_keyring = resolve_special_keyring(keyring, true, tid, cred.uid, cred.gid)?;
+    let dest_keyring =
+        resolve_special_keyring(keyring, true, &percpu::current(), cred.uid, cred.gid)?;
     if !dest_keyring.is_keyring() {
         return Err(KernelError::NotDirectory);
     }
@@ -106,8 +105,8 @@ pub fn sys_request_key(
     let type_name = user_str(type_ptr, MAX_TYPE_LEN)?;
     let description = user_str(desc_ptr, MAX_DESC_LEN)?;
     let cred = percpu::current_cred();
-    let tid = percpu::current_tid() as u64;
-    let key = search_process_keyrings(&type_name, &description, tid).ok_or(KernelError::NoKey)?;
+    let me = percpu::current();
+    let key = search_process_keyrings(&type_name, &description, &me).ok_or(KernelError::NoKey)?;
     if key.is_revoked() {
         return Err(KernelError::KeyRevoked);
     }
@@ -115,7 +114,7 @@ pub fn sys_request_key(
     // on the destination (Linux request_key -> construct_get_dest_keyring
     // / lookup_user_key)
     if dest_keyring != 0
-        && let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, cred.uid, cred.gid)
+        && let Ok(dest) = resolve_special_keyring(dest_keyring, false, &me, cred.uid, cred.gid)
         && super::key::check_key_permission(&key, super::key::KEY_NEED_LINK)
         && super::key::check_key_permission(&dest, super::key::KEY_NEED_WRITE)
     {

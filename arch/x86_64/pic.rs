@@ -7,6 +7,12 @@
 //! conflicts with CPU exceptions. We remap them to vectors 32-47.
 
 use super::io::{inb, io_wait, outb};
+use crate::sync::IrqSpinlock;
+
+/// The mask registers' read-modify-writes (Linux i8259A_lock): lines
+/// are masked and unmasked under their own descriptors' locks, so two
+/// lines' updates can race. A leaf
+static I8259A_LOCK: IrqSpinlock<()> = IrqSpinlock::new(());
 
 /// Master PIC I/O ports
 const PIC1_COMMAND: u16 = 0x20;
@@ -74,6 +80,7 @@ pub fn init() {
 
 /// Enable a specific IRQ
 pub fn enable_irq(irq: u8) {
+    let _imr = I8259A_LOCK.lock();
     if irq < 8 {
         // Master PIC
         let mask = inb(PIC1_DATA);
@@ -92,6 +99,7 @@ pub fn enable_irq(irq: u8) {
 
 /// Mask a specific IRQ
 pub fn disable_irq(irq: u8) {
+    let _imr = I8259A_LOCK.lock();
     if irq < 8 {
         let mask = inb(PIC1_DATA);
         outb(PIC1_DATA, mask | (1 << irq));

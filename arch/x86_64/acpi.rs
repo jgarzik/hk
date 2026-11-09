@@ -12,10 +12,11 @@
 //! accessing them.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use super::ioremap::{ioremap, iounmap};
 use crate::arch::PowerInfo;
 use crate::hw::acpi::aml::{self, SleepType};
 use crate::hw::acpi::hw::{PmRegs, ResetReg, Space};
+use crate::mm::ioremap::{ioremap, iounmap};
+use crate::util::error::KernelError;
 use alloc::vec::Vec;
 
 /// RSDP signature "RSD PTR "
@@ -134,28 +135,45 @@ struct MadtHeader {
 // - LAPIC_64 (type 5): header (2) + reserved (2) + address (8)
 //
 
+/// Log why firmware's table is unusable; InvalidArgument (Linux: -EINVAL
+/// for a malformed table)
+fn bad(why: &str) -> KernelError {
+    crate::printkln!("ACPI Error: {}", why);
+    KernelError::InvalidArgument
+}
+
+/// Log that the table at `phys` could not be mapped; ioremap's error
+fn unmapped(phys: u64, e: KernelError) -> KernelError {
+    crate::printkln!("ACPI Error: cannot map table at {:#x}: {:?}", phys, e);
+    e
+}
+
 /// Map an entire ACPI table given its physical address
 /// Returns mapped pointer or error. Caller must iounmap when done.
-fn map_acpi_table(phys_addr: u64) -> Result<*mut u8, &'static str> {
-    unsafe {
-        // First map just the header to read the length
-        let header_size = core::mem::size_of::<SdtHeader>() as u64;
-        let ptr = ioremap(phys_addr, header_size).map_err(|_| "Failed to ioremap SDT header")?;
-
-        // Read length field using read_unaligned (packed struct)
-        let length_ptr = ptr.cast_const().add(4).cast::<u32>(); // offset of length field
-        let length = core::ptr::read_unaligned(length_ptr);
-        iounmap(ptr, header_size);
-
-        // Now map the full table
-        ioremap(phys_addr, u64::from(length)).map_err(|_| "Failed to ioremap ACPI table")
-    }
+fn map_acpi_table(phys_addr: u64) -> Result<*mut u8, KernelError> {
+    // First map just the header to read the length
+    let header_size = core::mem::size_of::<SdtHeader>() as u64;
+    // SAFETY: an ACPI table address comes from the RSDP/RSDT/XSDT chain:
+    // firmware (ACPI reclaim/NVS) memory, not RAM the kernel allocates
+    let ptr = unsafe { ioremap(phys_addr, header_size) }.map_err(|e| unmapped(phys_addr, e))?;
+    // SAFETY: the mapping covers the header, whose u32 length field is
+    // at offset 4 (packed: unaligned read)
+    let length = unsafe { ptr.cast_const().add(4).cast::<u32>().read_unaligned() };
+    // SAFETY: the header mapping just made, with its size; `ptr` is not
+    // used after
+    unsafe { iounmap(ptr, header_size) };
+    // Now map the full table
+    // SAFETY: as the header mapping above: firmware memory
+    unsafe { ioremap(phys_addr, u64::from(length)) }.map_err(|e| unmapped(phys_addr, e))
 }
 
 /// Parse ACPI tables and extract SMP and power information
-pub fn parse_acpi() -> Result<AcpiInfo, &'static str> {
+pub fn parse_acpi() -> Result<AcpiInfo, KernelError> {
     // Find RSDP (in low memory, read through the direct map)
-    let rsdp = find_rsdp()?;
+    let Some(rsdp) = find_rsdp() else {
+        crate::printkln!("ACPI Error: RSDP not found");
+        return Err(KernelError::NoDevice);
+    };
 
     // Get RSDT or XSDT address (physical address, may be above 512MB!)
     let (sdt_phys, is_xsdt) = unsafe {
@@ -172,7 +190,11 @@ pub fn parse_acpi() -> Result<AcpiInfo, &'static str> {
     };
 
     // Map and find MADT in RSDT/XSDT
-    let madt_phys = find_madt_phys(sdt_phys, is_xsdt)?;
+    let madt_phys = find_madt_phys(sdt_phys, is_xsdt).inspect_err(|e| {
+        if *e == KernelError::NoDevice {
+            crate::printkln!("ACPI Error: no MADT");
+        }
+    })?;
 
     // Map and parse MADT
     let mut info = parse_madt_mapped(madt_phys)?;
@@ -188,8 +210,9 @@ pub fn parse_acpi() -> Result<AcpiInfo, &'static str> {
     Ok(info)
 }
 
-/// Find the RSDP by searching known memory locations
-fn find_rsdp() -> Result<*const Rsdp, &'static str> {
+/// Find the RSDP by searching known memory locations; None without one
+/// (the caller reports it)
+fn find_rsdp() -> Option<*const Rsdp> {
     // Search EBDA (Extended BIOS Data Area)
     // The EBDA segment is stored at physical address 0x40E
     let ebda_segment =
@@ -200,15 +223,11 @@ fn find_rsdp() -> Result<*const Rsdp, &'static str> {
         && ebda_addr < 0xA0000
         && let Some(rsdp) = search_rsdp(ebda_addr, 1024)
     {
-        return Ok(rsdp);
+        return Some(rsdp);
     }
 
     // Search BIOS ROM area: 0xE0000 - 0xFFFFF
-    if let Some(rsdp) = search_rsdp(0xE0000, 0x20000) {
-        return Ok(rsdp);
-    }
-
-    Err("RSDP not found")
+    search_rsdp(0xE0000, 0x20000)
 }
 
 /// Search for RSDP signature in a memory region
@@ -272,23 +291,25 @@ fn validate_table_checksum(ptr: *const u8, len: usize, table_name: &str) -> bool
 }
 
 /// Find MADT physical address in RSDT or XSDT (uses ioremap)
-fn find_madt_phys(sdt_phys: u64, is_xsdt: bool) -> Result<u64, &'static str> {
+fn find_madt_phys(sdt_phys: u64, is_xsdt: bool) -> Result<u64, KernelError> {
     find_table_phys(sdt_phys, is_xsdt, MADT_SIGNATURE)
 }
 
 /// Find FADT physical address in RSDT or XSDT (uses ioremap)
-fn find_fadt_phys(sdt_phys: u64, is_xsdt: bool) -> Result<u64, &'static str> {
+fn find_fadt_phys(sdt_phys: u64, is_xsdt: bool) -> Result<u64, KernelError> {
     find_table_phys(sdt_phys, is_xsdt, FADT_SIGNATURE)
 }
 
-/// Find a table's physical address in RSDT or XSDT by signature (uses ioremap)
-fn find_table_phys(sdt_phys: u64, is_xsdt: bool, signature: &[u8; 4]) -> Result<u64, &'static str> {
+/// Find a table's physical address in RSDT or XSDT by signature (uses
+/// ioremap); NoDevice, not logged, when absent (Linux acpi_table_parse:
+/// -ENODEV, a debug message only: most tables are optional)
+fn find_table_phys(sdt_phys: u64, is_xsdt: bool, signature: &[u8; 4]) -> Result<u64, KernelError> {
     let mut found = None;
     for_each_table(sdt_phys, is_xsdt, signature, |phys| {
         found = Some(phys);
         false
     })?;
-    found.ok_or("Table not found in RSDT/XSDT")
+    found.ok_or(KernelError::NoDevice)
 }
 
 /// Call `f` with the physical address of each RSDT/XSDT table whose
@@ -298,7 +319,7 @@ fn for_each_table(
     is_xsdt: bool,
     signature: &[u8; 4],
     mut f: impl FnMut(u64) -> bool,
-) -> Result<(), &'static str> {
+) -> Result<(), KernelError> {
     unsafe {
         // Map the RSDT/XSDT
         let sdt_ptr = map_acpi_table(sdt_phys)?;
@@ -349,7 +370,7 @@ fn table_signature(phys: u64) -> Option<[u8; 4]> {
 }
 
 /// Parse MADT and extract CPU/APIC information (uses ioremap)
-fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
+fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, KernelError> {
     let ptr = map_acpi_table(madt_phys)?;
     // SAFETY: map_acpi_table mapped the table, header included
     let len = unsafe { core::ptr::read_unaligned(ptr.add(4).cast::<u32>()) } as usize;
@@ -372,13 +393,14 @@ fn le32(b: &[u8], off: usize) -> Option<u32> {
 /// The subtables of an ACPI table's body (MADT: `[type, length, ...]`
 /// each). A length under 2 or past the table is an error, as in Linux
 /// acpi_parse_entries_array ("Invalid zero length", an entry past the
-/// table end); trailing bytes too short for a header end the walk.
-fn subtables(mut b: &[u8]) -> impl Iterator<Item = Result<&[u8], &'static str>> {
+/// table end): InvalidArgument, logged by the caller, which names the
+/// table; trailing bytes too short for a header end the walk.
+fn subtables(mut b: &[u8]) -> impl Iterator<Item = Result<&[u8], KernelError>> {
     core::iter::from_fn(move || {
         let len = usize::from(*b.get(1)?);
         if len < 2 || len > b.len() {
             b = &[];
-            return Some(Err("MADT entry length invalid"));
+            return Some(Err(KernelError::InvalidArgument));
         }
         let (e, rest) = b.split_at(len);
         b = rest;
@@ -389,15 +411,16 @@ fn subtables(mut b: &[u8]) -> impl Iterator<Item = Result<&[u8], &'static str>> 
 /// The CPUs and I/O APICs of a MADT (`t`: the whole table). Each entry
 /// is read only inside the table and only if long enough for its type:
 /// a short one fails the table (Linux BAD_MADT_ENTRY in the
-/// acpi_parse_lapic/x2apic/ioapic handlers).
-fn parse_madt(t: &[u8]) -> Result<AcpiInfo, &'static str> {
-    const BAD: &str = "MADT entry too short";
+/// acpi_parse_lapic/x2apic/ioapic handlers): InvalidArgument; no CPU
+/// is NoDevice (Linux acpi_parse_madt_lapic_entries: -ENODEV).
+fn parse_madt(t: &[u8]) -> Result<AcpiInfo, KernelError> {
+    let short = || bad("MADT entry too short");
     let hdr = core::mem::size_of::<MadtHeader>();
     if t.len() < hdr {
-        return Err("MADT shorter than its header");
+        return Err(bad("MADT shorter than its header"));
     }
     let mut info = AcpiInfo {
-        lapic_base: u64::from(le32(t, 36).ok_or(BAD)?),
+        lapic_base: u64::from(le32(t, 36).ok_or_else(short)?),
         cpus: Vec::new(),
         bsp_apic_id: 0,   // Will be set after LAPIC is mapped
         power_info: None, // Will be set after FADT parsing
@@ -405,11 +428,11 @@ fn parse_madt(t: &[u8]) -> Result<AcpiInfo, &'static str> {
     // Track if we found LAPIC entries (for X2APIC duplicate filtering)
     let mut has_lapic_cpus = false;
     for e in subtables(&t[hdr..]) {
-        let e = e?;
+        let e = e.map_err(|_| bad("MADT entry length invalid"))?;
         match e[0] {
             MADT_ENTRY_LAPIC => {
                 // header (2) + processor_id (1) + apic_id (1) + flags (4)
-                let flags = le32(e, 4).ok_or(BAD)?;
+                let flags = le32(e, 4).ok_or_else(short)?;
                 // Bit 0: Processor Enabled; bit 1: Online Capable (ACPI 6.3+)
                 if flags & 0x3 != 0 {
                     has_lapic_cpus = true;
@@ -423,10 +446,10 @@ fn parse_madt(t: &[u8]) -> Result<AcpiInfo, &'static str> {
             MADT_ENTRY_X2APIC => {
                 // header (2) + reserved (2) + x2apic_id (4) + flags (4) + uid (4)
                 if e.len() < 16 {
-                    return Err(BAD);
+                    return Err(short());
                 }
-                let x2apic_id = le32(e, 4).ok_or(BAD)?;
-                let flags = le32(e, 8).ok_or(BAD)?;
+                let x2apic_id = le32(e, 4).ok_or_else(short)?;
+                let flags = le32(e, 8).ok_or_else(short)?;
                 // Ignore the invalid id; per the ACPI spec, with LAPIC
                 // entries present an X2APIC id below 0xff is a duplicate
                 let dup = x2apic_id == 0xffff_ffff || (has_lapic_cpus && x2apic_id < 0xff);
@@ -440,20 +463,21 @@ fn parse_madt(t: &[u8]) -> Result<AcpiInfo, &'static str> {
             }
             MADT_ENTRY_LAPIC_64 => {
                 // header (2) + reserved (2) + address (8)
-                let b = e.get(4..12).ok_or(BAD)?;
-                info.lapic_base = u64::from_le_bytes(b.try_into().map_err(|_| BAD)?);
+                let b = e.get(4..12).ok_or_else(short)?;
+                info.lapic_base = u64::from_le_bytes(b.try_into().map_err(|_| short())?);
             }
             // header (2) + id (1) + reserved (1) + address (4) + gsi_base
             // (4): a short one is a bad table (Linux BAD_MADT_ENTRY), though
             // device IRQs go through the 8259 PIC, not the I/O APIC
-            MADT_ENTRY_IOAPIC if e.len() < 12 => return Err(BAD),
+            MADT_ENTRY_IOAPIC if e.len() < 12 => return Err(short()),
             // Interrupt source overrides, LAPIC NMIs and the rest are not used
             MADT_ENTRY_IOAPIC | MADT_ENTRY_ISO | MADT_ENTRY_LAPIC_NMI => {}
             _ => {}
         }
     }
     if info.cpus.is_empty() {
-        return Err("No CPUs found in MADT");
+        crate::printkln!("ACPI Error: no CPUs in MADT");
+        return Err(KernelError::NoDevice);
     }
     Ok(info)
 }
@@ -521,7 +545,7 @@ impl Table {
 /// Parse FADT: power management registers, the reset register, and
 /// the DSDT's physical address (X_DSDT if set, as Linux prefers it); S5
 /// is left for the caller (uses ioremap)
-fn parse_fadt_mapped(fadt_phys: u64) -> Result<(PowerInfo, u64), &'static str> {
+fn parse_fadt_mapped(fadt_phys: u64) -> Result<(PowerInfo, u64), KernelError> {
     let ptr = map_acpi_table(fadt_phys)?;
     // SAFETY: the header is mapped
     let len = unsafe { core::ptr::read_unaligned(ptr.add(4) as *const u32) } as usize;
@@ -671,13 +695,16 @@ fn srat_entry_pxm(e: &[u8]) -> Option<u32> {
 
 /// Initialize NUMA topology from ACPI SRAT/SLIT tables
 ///
-/// Called early in boot to discover NUMA topology. If SRAT is not found,
-/// returns Ok(false) and caller should use single-node fallback.
-pub fn init_numa_topology() -> Result<bool, &'static str> {
+/// Called early in boot to discover NUMA topology. Without an RSDP or
+/// SRAT, returns Ok(false) and caller should use single-node fallback. An
+/// unusable SRAT is an error, its reason logged here.
+pub fn init_numa_topology() -> Result<bool, KernelError> {
     use crate::mm::numa::{LOCAL_DISTANCE, MAX_NUMA_NODES, NUMA_TOPOLOGY, REMOTE_DISTANCE};
 
-    // Find RSDP
-    let rsdp = find_rsdp()?;
+    // No RSDP is no SRAT: one node (parse_acpi reports it)
+    let Some(rsdp) = find_rsdp() else {
+        return Ok(false);
+    };
 
     // Get RSDT or XSDT address
     let (sdt_phys, is_xsdt) = unsafe {
@@ -704,8 +731,8 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
 
     // Optionally parse SLIT for distance matrix
     if let Ok(slit_phys) = find_table_phys(sdt_phys, is_xsdt, SLIT_SIGNATURE) {
-        if let Err(e) = parse_slit_mapped(slit_phys) {
-            crate::printkln!("NUMA: SLIT parse error (using default distances): {}", e);
+        if parse_slit_mapped(slit_phys).is_err() {
+            crate::printkln!("NUMA: SLIT unusable, using default distances");
         }
     } else {
         // No SLIT, initialize default distances
@@ -731,7 +758,7 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
 }
 
 /// Parse SRAT table and populate NUMA topology
-fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
+fn parse_srat_mapped(srat_phys: u64) -> Result<(), KernelError> {
     let ptr = map_acpi_table(srat_phys)?;
     // SAFETY: map_acpi_table mapped the table, header included
     let len = unsafe { core::ptr::read_unaligned(ptr.add(4).cast::<u32>()) } as usize;
@@ -749,11 +776,14 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
 /// 12 reserved bytes), each long enough for its type. A bad entry
 /// length, or an affinity entry shorter than its structure, rejects the
 /// whole table, as Linux's bad_srat() turns SRAT NUMA off
-/// (acpi_numa_memory_affinity_init, acpi_numa_processor_affinity_init).
-fn srat_body(t: &[u8]) -> Result<&[u8], &'static str> {
-    let body = t.get(48..).ok_or("SRAT shorter than its header")?;
+/// (acpi_numa_memory_affinity_init, acpi_numa_processor_affinity_init):
+/// InvalidArgument.
+fn srat_body(t: &[u8]) -> Result<&[u8], KernelError> {
+    let body = t
+        .get(48..)
+        .ok_or_else(|| bad("SRAT shorter than its header"))?;
     for e in subtables(body) {
-        let e = e.map_err(|_| "SRAT entry length invalid")?;
+        let e = e.map_err(|_| bad("SRAT entry length invalid"))?;
         let need = match e[0] {
             SRAT_ENTRY_LAPIC_AFFINITY => 16,
             SRAT_ENTRY_MEMORY_AFFINITY => 40,
@@ -761,14 +791,15 @@ fn srat_body(t: &[u8]) -> Result<&[u8], &'static str> {
             _ => 2,
         };
         if e.len() < need {
-            return Err("SRAT entry too short");
+            return Err(bad("SRAT entry too short"));
         }
     }
     Ok(body)
 }
 
-/// Fill NUMA_TOPOLOGY from a SRAT (`t`: the whole table)
-fn parse_srat(t: &[u8]) -> Result<(), &'static str> {
+/// Fill NUMA_TOPOLOGY from a SRAT (`t`: the whole table); NotFound when
+/// it has no usable node (Linux acpi_numa_init: -ENOENT)
+fn parse_srat(t: &[u8]) -> Result<(), KernelError> {
     use crate::mm::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode};
 
     let entries = srat_body(t)?;
@@ -845,14 +876,15 @@ fn parse_srat(t: &[u8]) -> Result<(), &'static str> {
     topology.nr_nodes = topology.node_online_mask.count_ones() as usize;
 
     if topology.nr_nodes == 0 {
-        return Err("SRAT contained no valid nodes");
+        crate::printkln!("ACPI Error: SRAT has no usable node");
+        return Err(KernelError::NotFound);
     }
 
     Ok(())
 }
 
 /// Parse SLIT table for inter-node distance matrix
-fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
+fn parse_slit_mapped(slit_phys: u64) -> Result<(), KernelError> {
     use crate::mm::numa::NUMA_TOPOLOGY;
 
     unsafe {
@@ -876,7 +908,7 @@ fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
             .is_none_or(|end| end > slit_length)
         {
             iounmap(slit_ptr, slit_length as u64);
-            return Err("SLIT shorter than its matrix");
+            return Err(bad("SLIT shorter than its matrix"));
         }
         let matrix_start = slit_ptr.add(44);
 

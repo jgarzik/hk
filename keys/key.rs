@@ -576,7 +576,7 @@ pub fn check_key_permission(key: &Key, needed: u32) -> bool {
     if k & needed & 0xff == needed {
         return true;
     }
-    if super::keyring::possessed(key, crate::task::percpu::current_tid()) {
+    if super::keyring::possessed(key, &crate::task::percpu::current()) {
         k |= perm >> 24;
     }
     k & needed & 0xff == needed

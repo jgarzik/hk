@@ -28,7 +28,7 @@
 //!
 //! Locking: `AREA` is a spin leaf, thread context (bitmap updates only:
 //! no mapping, flush or allocation under it); `FLUSH` (sleeping) keeps
-//! one purge at a time; mapping takes the arch's KTABLES and the frame
+//! one purge at a time; mapping takes `ioremap::KTABLES` and the frame
 //! allocator outside both.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
@@ -222,7 +222,7 @@ impl VmArea {
         // SAFETY: a page of this area, held alone (type invariant), the
         // only map of page `i` before its unmap; `pa` as the caller
         // guarantees
-        unsafe { crate::arch::vmap_page(self.va(i), pa) }.is_ok()
+        unsafe { crate::mm::ioremap::vmap_page(self.va(i), pa) }.is_ok()
     }
 
     /// Unmap page `i`, flushing this CPU's TLB entry: the frame it
@@ -233,7 +233,7 @@ impl VmArea {
         // SAFETY: a page of this area, held alone (type invariant):
         // only its holder uses it, and a reference into it was made by
         // `unsafe` code bound to keep the mapping
-        let pa = unsafe { crate::arch::vunmap_page(va) }?;
+        let pa = unsafe { crate::mm::ioremap::vunmap_page(va) }?;
         crate::arch::tlb::local_flush_one(va);
         Some(pa)
     }

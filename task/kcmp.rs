@@ -176,8 +176,8 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> K
         } else {
             (&t2, &t1)
         };
-        let a = ExecUpdateRead::lock(first.tid());
-        let b = (first.pid != second.pid).then(|| ExecUpdateRead::lock(second.tid()));
+        let a = ExecUpdateRead::lock(first);
+        let b = (first.pid != second.pid).then(|| ExecUpdateRead::lock(second));
         (a, b)
     };
     // The signal handlers and undo lists, read under TASKLIST with the
@@ -193,8 +193,8 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> K
         )
     };
     // Linux: ptrace_may_access(PTRACE_MODE_READ_REALCREDS) on both
-    if !crate::task::ptrace::may_access_tid(t1.tid(), false)
-        || !crate::task::ptrace::may_access_tid(t2.tid(), false)
+    if !crate::task::ptrace::may_access_task(&t1, false)
+        || !crate::task::ptrace::may_access_task(&t2, false)
     {
         return Err(KernelError::NotPermitted);
     }

@@ -29,6 +29,9 @@
 //! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim).
 //!   Taken under socket/ARP locks (end of the network lock order). Leaf.
 //!   Empty once removed.
+//! - The binding's `irq` (the INTx registration): `crate::sync::spin::Mutex`,
+//!   thread context only (probe sets it, remove takes it). Leaf: the
+//!   registration is dropped (`IrqDesc.lock`) after unlocking.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
@@ -39,6 +42,7 @@ use core::mem::MaybeUninit;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::irq::{IrqHandler, IrqRegistration, IrqReturn};
 use crate::sync::spin::Mutex;
 use spin::Once;
 
@@ -482,25 +486,25 @@ impl E1000 {
     }
 }
 
-impl crate::irq::IrqHandler for E1000 {
-    fn handle(&self, _irq: u32) -> bool {
+impl IrqHandler for E1000 {
+    fn handle(&self, _irq: u32) -> IrqReturn {
         e1000_isr(self)
     }
 }
 
 /// Interrupt handler (IRQ context): ack, mask, schedule NAPI
-fn e1000_isr(dev: &E1000) -> bool {
+fn e1000_isr(dev: &E1000) -> IrqReturn {
     let icr = dev.read_reg(reg::ICR); // read-to-clear
     if icr == 0 {
         // Shared line: another device's interrupt
         dev.irqs_not_ours.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return IrqReturn::None;
     }
     dev.irqs.fetch_add(1, Ordering::Relaxed);
     dev.write_reg(reg::IMC, 0xFFFF_FFFF);
     dev.pending_icr.fetch_or(icr, Ordering::AcqRel);
     napi_schedule(&dev.napi);
-    true
+    IrqReturn::Handled
 }
 
 impl NapiPoll for E1000 {
@@ -644,6 +648,8 @@ impl NetDeviceOps for E1000Ops {
 struct E1000DeviceWrapper {
     netdev: Arc<NetDevice>,
     device: Arc<E1000>,
+    /// The INTx handler, freed by remove
+    irq: Mutex<Option<IrqRegistration<E1000>>>,
 }
 
 impl crate::base::Bound for E1000DeviceWrapper {
@@ -674,9 +680,8 @@ impl crate::base::Bound for E1000DeviceWrapper {
         }
         // Masks every cause and stops RX/TX DMA
         d.reset();
-        if let Err(e) = d.pci.unregister_irq_handler() {
-            printkln!("e1000: {}: free IRQ: {}", self.netdev.name(), e);
-        }
+        let irq = self.irq.lock().take();
+        drop(irq);
         netif_napi_del(&d.napi);
         d.free_rings();
     }
@@ -806,19 +811,27 @@ fn e1000_probe(
 
     // Shareable level-triggered INTx; the device's interrupts stay
     // masked until userspace brings the interface up (open())
-    match pci.register_irq_handler(device.clone()) {
-        Ok(irq) => printkln!("e1000: IRQ {}", irq),
+    let irq = match pci.request_irq(device.clone()) {
+        Ok(irq) => irq,
         Err(e) => {
-            printkln!("e1000: no IRQ ({}), RX disabled", e);
+            printkln!("e1000: no IRQ ({:?}), RX disabled", e);
             device.reset();
             device.free_rings();
             netif_napi_del(&device.napi);
             return Err(KernelError::NoDevice);
         }
-    }
+    };
+    printkln!("e1000: IRQ {}", irq.irq());
 
     netdev.parent.call_once(|| pdev.clone());
     net::register_netdev(rtnl, Arc::clone(&netdev));
 
-    Ok(Box::write(slot, E1000DeviceWrapper { netdev, device }))
+    Ok(Box::write(
+        slot,
+        E1000DeviceWrapper {
+            netdev,
+            device,
+            irq: Mutex::new(Some(irq)),
+        },
+    ))
 }

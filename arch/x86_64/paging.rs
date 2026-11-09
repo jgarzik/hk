@@ -59,6 +59,13 @@ pub const VMEMMAP_START: u64 = 0xFFFF_EA00_0000_0000;
 /// non-canonical hole)
 pub const TASK_SIZE: u64 = 0x0000_7FFF_FFFF_F000;
 
+/// Top of the initial user stack (Linux STACK_TOP, no randomization)
+pub const STACK_TOP: u64 = 0x7FFF_FFFF_F000;
+
+/// Load address of PIE executables (Linux ELF_ET_DYN_BASE, 2/3 of
+/// TASK_SIZE, without randomization)
+pub const ELF_ET_DYN_BASE: u64 = 0x5555_5555_4000;
+
 /// First PML4 entry of the kernel half
 pub const KERNEL_PML4_START: usize = 256;
 
@@ -646,7 +653,7 @@ impl X86_64PageTable {
     /// The kernel page table's (swapper's) root: kernel threads run on
     /// it. Only its address: a value of this type could map into it
     pub fn kernel_root() -> u64 {
-        super::kmap::swapper_phys()
+        crate::mm::swapper::swapper_phys()
     }
 
     /// Create a new user page table (allocates PML4)
@@ -778,7 +785,7 @@ impl X86_64PageTable {
         // (type invariant), reached through the direct map; the kernel
         // half is only read from the swapper
         unsafe {
-            let kernel_pml4 = phys_to_virt_table_const(super::kmap::swapper_phys());
+            let kernel_pml4 = phys_to_virt_table_const(crate::mm::swapper::swapper_phys());
             let pml4 = phys_to_virt_table(self.pml4_phys);
             for i in KERNEL_PML4_START..ENTRIES_PER_TABLE {
                 (*pml4).entries[i] = (*kernel_pml4).entries[i];

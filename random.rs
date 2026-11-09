@@ -25,8 +25,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch::IrqSpinlock;
 use crate::cpu::PerCpu;
+use crate::sync::IrqSpinlock;
 use crate::util::error::{KernelError, KernelResult};
 
 /// Flags for getrandom syscall

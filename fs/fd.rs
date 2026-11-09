@@ -9,7 +9,6 @@
 use alloc::sync::Arc;
 
 use crate::fs::{KernelError, LookupFlags};
-use crate::task::percpu::current_tid;
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
 
@@ -34,8 +33,8 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> KernelRes
     if length > current_size {
         let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_FSIZE);
         if limit != crate::task::rlimit::RLIM_INFINITY && length > limit {
-            let tid = current_tid();
-            let _ = crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
+            let _ =
+                crate::signal::send_signal(&crate::task::percpu::current(), crate::signal::SIGXFSZ);
             return Err(KernelError::FileTooLarge);
         }
         if length > inode.maxbytes() {

@@ -2,6 +2,36 @@
 //!
 //! Mirrors arch/x86/include/uapi/asm/ in Linux.
 
+/// prctl PR_GET_TSC/PR_SET_TSC exist (Linux GET_TSC_CTL)
+pub const TSC_CTL: bool = true;
+
+/// uname(2) machine (Linux UTS_MACHINE)
+pub const UTS_MACHINE: &[u8] = b"x86_64";
+
+/// The syscall ABI's audit and seccomp_data arch (Linux syscall_get_arch)
+pub const AUDIT_ARCH: u32 = crate::seccomp::AUDIT_ARCH_X86_64;
+
+/// ELF e_machine of native executables (Linux ELF_ARCH)
+pub const ELF_ARCH: u16 = crate::util::elf::EM_X86_64;
+
+/// The RELATIVE relocation type (Linux R_X86_64_RELATIVE)
+pub const R_RELATIVE: u32 = crate::util::elf::R_X86_64_RELATIVE;
+
+/// The syscalls seccomp strict mode allows: read, write, exit,
+/// exit_group, rt_sigreturn (Linux __NR_seccomp_*; an int, like the
+/// number seccomp checks)
+pub const SECCOMP_STRICT: [i32; 5] = {
+    use super::syscall::{SYS_EXIT, SYS_EXIT_GROUP, SYS_READ, SYS_RT_SIGRETURN, SYS_WRITE};
+    // Syscall numbers fit an int
+    [
+        SYS_READ as i32,
+        SYS_WRITE as i32,
+        SYS_EXIT as i32,
+        SYS_EXIT_GROUP as i32,
+        SYS_RT_SIGRETURN as i32,
+    ]
+};
+
 /// `st_nlink` from an inode link count; the field is u64 on this arch
 pub fn st_nlink(n: u32) -> u64 {
     u64::from(n)

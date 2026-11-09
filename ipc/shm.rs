@@ -20,12 +20,12 @@ use crate::ipc::util::{
     IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcOps, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{IPC_64, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Shmid64Ds, current_ipc_ns};
+use crate::mm::Vma;
 use crate::mm::shmem::Shmem;
 use crate::mm::vma::{
     MAP_SHARED, PROT_READ as VMA_PROT_READ, PROT_WRITE as VMA_PROT_WRITE, VM_SHARED, VM_SHM,
 };
-use crate::mm::{Vma, get_task_mm};
-use crate::task::percpu::{current_pid, current_tid};
+use crate::task::percpu::current_pid;
 use crate::time::TIMEKEEPER;
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
@@ -295,7 +295,6 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: i32) -> KernelResult<i32> {
 /// * Address where segment was attached
 pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> KernelResult<u64> {
     let ns = current_ipc_ns();
-    let tid = current_tid();
     let einval = KernelError::InvalidArgument;
 
     let shm_obj = ns.shm_ids().find_by_id(shmid).ok_or(einval)?;
@@ -313,7 +312,9 @@ pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> KernelResult<u64> {
     if shmaddr == 0 && shmflg & SHM_REMAP != 0 {
         return Err(einval);
     }
-    let mm = get_task_mm(tid).ok_or(KernelError::OutOfMemory)?;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::OutOfMemory)?;
     let mut replaced = Vec::new();
     let mut mm_guard = mm
         .mmap_write_killable()
@@ -378,7 +379,7 @@ pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> KernelResult<u64> {
 /// them updates shm_nattch
 pub fn sys_shmdt(shmaddr: u64) -> KernelResult<()> {
     let einval = KernelError::InvalidArgument;
-    let mm = get_task_mm(current_tid()).ok_or(einval)?;
+    let mm = crate::task::percpu::current().mm().ok_or(einval)?;
     let gone = {
         let mut map = mm
             .mmap_write_killable()

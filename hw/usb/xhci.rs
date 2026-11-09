@@ -17,9 +17,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use crate::sync::spin::Mutex;
 
 use crate::arch::FrameAlloc;
-use crate::arch::{CurrentArch, IoremapOps, phys_to_virt};
+use crate::arch::phys_to_virt;
 use crate::hw::mmio::IoMem;
 use crate::hw::pci::PciDevice;
+use crate::irq::{IrqFn, IrqRegistration, IrqReturn};
 use crate::printkln;
 use crate::time::delay::{poll_timeout, udelay};
 use crate::util::error::KernelError;
@@ -147,8 +148,8 @@ static TRANSFER_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// xHCI interrupt handler
 ///
 /// Called from the IRQ dispatch system when the xHCI's IRQ fires.
-fn xhci_irq_handler(_irq: u32) -> bool {
-    xhci_irq_handler_common()
+fn xhci_irq_handler(_irq: u32) -> IrqReturn {
+    xhci_irq_handler_common().into()
 }
 
 /// Common IRQ handler logic (arch-independent)
@@ -712,8 +713,8 @@ pub struct XhciController {
     devices: Vec<UsbDevice>,
     /// Per-device state (slot_id -> DeviceState)
     device_states: BTreeMap<u8, DeviceState>,
-    /// Assigned IRQ (if interrupt mode enabled)
-    irq: Option<u32>,
+    /// The INTx handler (if interrupt mode enabled)
+    irq: Option<IrqRegistration<IrqFn>>,
     /// Size of the register mapping at `mmio_base` (0: not mapped)
     mmio_len: u64,
     /// Scratchpad frames: the array, then its buffers
@@ -820,7 +821,7 @@ impl XhciController {
         let bar_size = self.pci_dev.bar_size(0);
 
         // SAFETY: BAR0 of this xHCI, its register space
-        match unsafe { CurrentArch::ioremap(self.mmio_base, bar_size) } {
+        match unsafe { crate::mm::ioremap::ioremap(self.mmio_base, bar_size) } {
             Ok(virt) => {
                 // Update all base addresses to virtual address
                 let virt_base = virt as u64;
@@ -1049,11 +1050,11 @@ impl XhciController {
             .store(r.rt.addr() as u64, Ordering::Release);
 
         // Register IRQ handler with PCI device
-        let h = try_arc(crate::irq::IrqFn(xhci_irq_handler)).map_err(|_| "out of memory");
-        match h.and_then(|h| self.pci_dev.register_irq_handler(h)) {
+        let h = try_arc(IrqFn(xhci_irq_handler));
+        match h.and_then(|h| self.pci_dev.request_irq(h)) {
             Ok(irq) => {
+                printkln!("xHCI: Registered IRQ {}", irq.irq());
                 self.irq = Some(irq);
-                printkln!("xHCI: Registered IRQ {}", irq);
 
                 // Enable USBCMD.INTE (Interrupter Enable) - bit 2
                 let cmd = self.read_op(0x00);
@@ -1063,7 +1064,7 @@ impl XhciController {
                 XHCI_IRQ_STATE.enabled.store(true, Ordering::Release);
             }
             Err(e) => {
-                printkln!("xHCI: Failed to register IRQ handler: {}", e);
+                printkln!("xHCI: Failed to register IRQ handler: {:?}", e);
                 // Not fatal - we can fall back to polling
             }
         }
@@ -2075,11 +2076,7 @@ impl XhciController {
             let _ = self.reset_controller(XHCI_RESET_SHORT_US);
         }
         XHCI_IRQ_STATE.enabled.store(false, Ordering::Release);
-        if self.irq.take().is_some()
-            && let Err(e) = self.pci_dev.unregister_irq_handler()
-        {
-            printkln!("xHCI: Failed to unregister IRQ: {}", e);
-        }
+        self.irq = None;
         XHCI_IRQ_STATE.op_regs.store(0, Ordering::Release);
         XHCI_IRQ_STATE.rt_regs.store(0, Ordering::Release);
         // The windows go before mem_cleanup unmaps what they cover
@@ -2116,7 +2113,7 @@ impl XhciController {
         if self.mmio_len != 0 {
             // SAFETY: the controller's registers, mapped at probe and
             // no longer used (the device is stopped)
-            unsafe { CurrentArch::iounmap(self.mmio_base as *mut u8, self.mmio_len) };
+            unsafe { crate::mm::ioremap::iounmap(self.mmio_base as *mut u8, self.mmio_len) };
             self.mmio_len = 0;
         }
     }

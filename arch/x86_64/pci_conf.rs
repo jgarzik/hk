@@ -11,7 +11,7 @@ const PCI_CONFIG_ADDR: u16 = 0x0CF8;
 /// PCI configuration data port
 const PCI_CONFIG_DATA: u16 = 0x0CFC;
 
-/// The port I/O accessor (installed by `hw::pci::init_port_io`)
+/// The port I/O accessor (installed by `hw::pci::init_config`)
 pub static PORT_IO: PortIoConfigAccess = PortIoConfigAccess;
 
 /// Port I/O based PCI config access (x86 legacy)
@@ -33,7 +33,7 @@ impl PortIoConfigAccess {
 
 /// Serializes the CF8 address / CFC data pair (Linux pci_lock): another
 /// CPU's access between the two would redirect this one
-static PCI_LOCK: crate::arch::IrqSpinlock<()> = crate::arch::IrqSpinlock::new(());
+static PCI_LOCK: crate::sync::IrqSpinlock<()> = crate::sync::IrqSpinlock::new(());
 
 impl PortIoConfigAccess {
     /// Select the register; the data port then reads/writes it, at

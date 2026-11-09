@@ -81,8 +81,9 @@ pub fn sys_clone(
     // are only reachable through clone3().
     let flags = flags & 0xffff_ffff;
 
-    // Extract exit_signal from low 8 bits of flags (CSIGNAL mask = 0xff)
-    let exit_signal = (flags & 0xff) as i32;
+    // exit_signal: the low 8 bits of flags (CSIGNAL), as given (Linux
+    // kernel_clone checks no legacy clone's)
+    let exit_signal = crate::signal::ExitSignal::csignal(flags as u8);
 
     // CLONE_PIDFD stores the pidfd at parent_tid (Linux sys_clone: one
     // pointer for both), so CLONE_PARENT_SETTID with it is EINVAL
@@ -136,7 +137,7 @@ pub fn sys_fork() -> KernelResult<i64> {
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
-        exit_signal: crate::signal::SIGCHLD as i32, // fork sends SIGCHLD on exit
+        exit_signal: crate::signal::ExitSignal::SIGCHLD, // fork sends SIGCHLD on exit
         cgroup_fd: -1,
         set_tid: super::percpu::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
@@ -173,7 +174,7 @@ pub fn sys_vfork() -> KernelResult<i64> {
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
-        exit_signal: crate::signal::SIGCHLD as i32, // vfork sends SIGCHLD on exit
+        exit_signal: crate::signal::ExitSignal::SIGCHLD, // vfork sends SIGCHLD on exit
         cgroup_fd: -1,
         set_tid: super::percpu::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
@@ -305,7 +306,7 @@ fn put_waitid_info(infop: UserPtr<SigInfo>, info: &SigInfo) -> KernelResult<()> 
         return Ok(());
     }
     let head = &info.as_bytes()[..WAITID_INFO];
-    crate::uaccess::copy_to_user::<crate::arch::Uaccess>(infop.addr(), head)?;
+    crate::uaccess::copy_to_user(infop.addr(), head)?;
     Ok(())
 }
 
@@ -346,14 +347,14 @@ pub fn sys_waitid(
     rusage: UserPtr<Rusage>,
 ) -> KernelResult<i64> {
     use super::wait_options::{P_ALL, P_PGID, P_PID, P_PIDFD, WEXITED, WNOHANG};
-    use crate::arch::Uaccess;
+
     use crate::signal::si_code;
-    use crate::uaccess::UaccessArch;
+    use crate::uaccess::access_ok;
 
     let current_pid = super::percpu::current_pid();
 
     // Validate infop pointer if non-null
-    if !infop.is_null() && !Uaccess::access_ok(infop.addr(), WAITID_INFO) {
+    if !infop.is_null() && !access_ok(infop.addr(), WAITID_INFO) {
         return Err(KernelError::BadAddress);
     }
 
@@ -478,9 +479,9 @@ pub fn sys_waitid(
 ///
 /// Returns the caller's thread ID.
 pub fn sys_set_tid_address(tidptr: UserPtr<i32>) -> i64 {
-    let tid = super::percpu::current_tid();
-    crate::task::set_clear_child_tid(tid, tidptr.addr());
-    tid as i64
+    let me = super::percpu::current();
+    crate::task::set_clear_child_tid(&me, tidptr.addr());
+    me.tid() as i64
 }
 
 // =============================================================================
@@ -560,7 +561,7 @@ const CSIGNAL: u64 = 0x000000ff;
 /// * < 0: Error code
 pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
     use super::percpu::CloneConfig;
-    use crate::arch::Uaccess;
+
     use crate::uaccess::copy_struct_from_user;
 
     // Linux clone3: more than a page is E2BIG, less than VER0 EINVAL
@@ -571,7 +572,7 @@ pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
         return Err(KernelError::InvalidArgument);
     }
     // A larger struct than this kernel's must be zero past it (E2BIG)
-    let args = match copy_struct_from_user::<Uaccess, CloneArgs>(uargs.addr(), size as usize) {
+    let args = match copy_struct_from_user::<CloneArgs>(uargs.addr(), size as usize) {
         Ok(a) => a,
         Err(None) => return Err(KernelError::ArgListTooLong),
         Err(Some(_)) => return Err(KernelError::BadAddress),
@@ -579,10 +580,13 @@ pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
 
     // Validate clone3-specific constraints
 
-    // exit_signal must be valid (only low 8 bits used, must be valid signal or 0)
-    if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > 64 {
+    // exit_signal: CSIGNAL bits only, then a signal or 0 (Linux
+    // copy_clone_args_from_user, clone3_args_valid: valid_signal)
+    if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > u64::from(crate::signal::NSIG) {
         return Err(KernelError::InvalidArgument);
     }
+    // 0..=NSIG: fits the CSIGNAL byte
+    let exit_signal = crate::signal::ExitSignal::csignal(args.exit_signal as u8);
 
     // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
     let cgroup_fd = if (args.flags & CLONE_INTO_CGROUP) != 0 {
@@ -605,7 +609,7 @@ pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
     let mut set_tid = CloneConfig::NO_SET_TID;
     if n > 0 {
         let mut b = [0u8; 4 * crate::ns::pid::MAX_PID_NS_LEVEL as usize];
-        crate::uaccess::copy_from_user::<Uaccess>(&mut b[..n * 4], args.set_tid, n * 4)?;
+        crate::uaccess::copy_from_user(&mut b[..n * 4], args.set_tid, n * 4)?;
         for (t, c) in set_tid.iter_mut().zip(b[..n * 4].as_chunks::<4>().0) {
             *t = u32::from_ne_bytes(*c);
         }
@@ -649,7 +653,7 @@ pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
         child_tidptr: args.child_tid,
         tls: args.tls,
         pidfd_ptr: args.pidfd,
-        exit_signal: args.exit_signal as i32,
+        exit_signal,
         cgroup_fd,
         set_tid,
         set_tid_size: n,

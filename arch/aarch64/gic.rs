@@ -11,6 +11,12 @@ use core::arch::asm;
 use core::ptr::NonNull;
 
 use crate::hw::mmio::IoMem;
+use crate::sync::IrqSpinlock;
+
+/// GICD_ICFGR read-modify-writes, 16 SPIs per register (Linux
+/// irq-gic-common.c irq_controller_lock): SPIs are configured under
+/// their own descriptors' locks, so two lines' updates can race. A leaf
+static IRQ_CONTROLLER_LOCK: IrqSpinlock<()> = IrqSpinlock::new(());
 
 // QEMU virt GICv3 base addresses
 const GICD_BASE: u64 = super::paging::io_va(0x0800_0000);
@@ -295,7 +301,9 @@ pub fn enable_spi(intid: u32) {
         // Level trigger: clear bit 1 of the 2-bit field (1 = edge)
         let cfg_reg = GICD_ICFGR + (n / 16) * 4;
         let shift = (n % 16) * 2 + 1;
+        let cfg = IRQ_CONTROLLER_LOCK.lock();
         write32(cfg_reg, read32(cfg_reg) & !(1 << shift));
+        drop(cfg);
 
         // Priority (byte-addressed)
         write8(GICD_IPRIORITYR + n, 0x80);

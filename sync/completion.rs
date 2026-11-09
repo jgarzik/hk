@@ -13,7 +13,7 @@
 //! touches the completion and it may live on the waiter's stack.
 //! Order: `done` -> wait queue head -> run-queue lock (the wake path).
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 
 /// `complete_all` marks the completion done for every present and

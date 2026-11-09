@@ -16,8 +16,10 @@
 //! # Kernel Initialization Traits
 //!
 //! Additional traits for architecture-independent kernel initialization:
-//! - [`EarlyArchInit`] - Early hardware initialization (GDT, IDT, etc.)
-//! - [`IoremapOps`] - MMIO mapping operations
+//! - [`IoremapOps`] - Kernel page-table primitives (ioremap, vmap)
+//! - [`EarlyConOps`] - Boot UART output (earlycon, panic)
+//! - [`IrqChipOps`] - Device interrupt controller lines (mask, unmask)
+//! - [`DmaSyncOps`] - Cache maintenance for streaming DMA
 //! - [`AcpiOps`] - Platform hardware discovery (ACPI/device tree)
 //! - [`SmpOps`] - Multi-processor initialization
 //! - [`LocalTimerOps`] - Per-CPU timer operations
@@ -74,34 +76,17 @@ pub use x86_64::power;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::power;
 
-// IRQ-safe spinlock - architecture-specific implementation
+// Device I/O memory barriers (dma_wmb/dma_rmb/wmb)
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::barrier;
-/// Device IRQ registration (shareable handlers, PCI INTx routing)
-// Device I/O memory barriers (dma_wmb/dma_rmb/wmb)
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::barrier;
 
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::irq;
-#[cfg(target_arch = "x86_64")]
 pub use x86_64::percpu::{preempt_count, preempt_disable, preempt_enable};
-#[cfg(target_arch = "x86_64")]
-#[allow(unused_imports, reason = "not every arch uses every re-export")]
-pub use x86_64::spinlock::{
-    IrqSpinlock, IrqSpinlockGuard, irqs_disabled, local_irq_restore, local_irq_save,
-};
 
-/// Device IRQ registration (shareable handlers, PCI INTx routing)
-#[cfg(target_arch = "aarch64")]
-pub use aarch64::irq;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::percpu::{preempt_count, preempt_disable, preempt_enable};
-#[cfg(target_arch = "aarch64")]
-#[allow(unused_imports, reason = "not every arch uses every re-export")]
-pub use aarch64::spinlock::{
-    IrqSpinlock, IrqSpinlockGuard, irqs_disabled, local_irq_restore, local_irq_save,
-};
 
 // Ptrace architecture-specific support
 #[cfg(target_arch = "x86_64")]
@@ -185,20 +170,6 @@ pub use aarch64::paging::{self, phys_to_virt, virt_to_phys};
 // TLB primitives behind mm::tlb
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::tlb;
-
-// Kernel pages in the vmalloc area (mm::vmstack)
-#[cfg(target_arch = "x86_64")]
-pub(crate) use x86_64::ioremap::{vmap_page, vunmap_page};
-
-#[cfg(target_arch = "aarch64")]
-pub(crate) use aarch64::ioremap::{vmap_page, vunmap_page};
-
-// TLB self-test hook (kselftest, LOCKDEP builds)
-#[cfg(all(feature = "lockdep", target_arch = "x86_64"))]
-pub use x86_64::ioremap::retarget as ioremap_retarget;
-
-#[cfg(all(feature = "lockdep", target_arch = "aarch64"))]
-pub use aarch64::ioremap::retarget as ioremap_retarget;
 
 // IPIs behind smp
 #[cfg(target_arch = "x86_64")]
@@ -433,6 +404,75 @@ pub trait CpuOps {
     fn enable_and_halt();
 }
 
+/// Interrupt flag primitives behind `sync::irqflags` (Linux
+/// arch_local_save_flags, arch_local_irq_save, arch_local_irq_restore,
+/// arch_irqs_disabled_flags)
+pub trait IrqFlagsOps {
+    /// This CPU's saved interrupt state (x86 RFLAGS, arm64 DAIF)
+    type Flags: Copy;
+
+    /// The current state, unchanged
+    fn local_save_flags() -> Self::Flags;
+
+    /// Mask interrupts on this CPU, returning the previous state
+    fn local_irq_save() -> Self::Flags;
+
+    /// Restore a state saved by `local_irq_save` on this CPU
+    fn local_irq_restore(flags: Self::Flags);
+
+    /// `flags` has interrupts masked
+    fn irqs_disabled_flags(flags: Self::Flags) -> bool;
+}
+
+/// The boot UART's direct output behind printk (Linux earlycon, and
+/// the panic path's lockless UART writes)
+pub trait EarlyConOps {
+    /// printk writes the boot UART while no console is registered
+    /// (Linux earlycon: arm64's PL011; x86's COM1 is a console from the
+    /// start)
+    const EARLYCON: bool;
+
+    /// Write `bytes` to the boot UART, taking no lock (early boot,
+    /// panic)
+    fn early_write(bytes: &[u8]);
+}
+
+/// CPU cache maintenance for streaming DMA behind `hw::dma` (Linux
+/// arch_sync_dma_for_device / arch_sync_dma_for_cpu); `va` is the
+/// buffer's direct-map address. Coherent arches need none (default)
+pub trait DmaSyncOps {
+    /// A buffer is mapped for the device (dma_map_single)
+    fn dma_map(_va: *const u8, _size: usize, _dir: crate::hw::dma::DmaDirection) {}
+    /// A buffer is unmapped (dma_unmap_single)
+    fn dma_unmap(_va: *const u8, _size: usize, _dir: crate::hw::dma::DmaDirection) {}
+    /// The CPU takes a mapped buffer back (dma_sync_single_for_cpu)
+    fn dma_sync_for_cpu(_va: *const u8, _size: usize, _dir: crate::hw::dma::DmaDirection) {}
+    /// The device gets a mapped buffer again (dma_sync_single_for_device)
+    fn dma_sync_for_device(_va: *const u8, _size: usize, _dir: crate::hw::dma::DmaDirection) {}
+}
+
+/// The device interrupt controller behind `crate::irq` (Linux struct
+/// irq_chip and the arch's PCI INTx routing): device IRQs are
+/// `FIRST_IRQ..FIRST_IRQ + NR_IRQS`. `irq_unmask` and `irq_mask` run
+/// under the line's descriptor lock (Linux irq_startup/irq_shutdown
+/// under desc->lock); state shared between lines (a mask or trigger
+/// register) needs a leaf lock of the chip's
+pub trait IrqChipOps {
+    /// The first device IRQ number (x86 PIC line 0, arm64 SPI INTID 32)
+    const FIRST_IRQ: u32;
+    /// Device IRQ lines
+    const NR_IRQS: usize;
+
+    /// Configure (trigger, routing) and unmask line `irq` (its first
+    /// handler came, or a new one to a line masked as nobody cared)
+    fn irq_unmask(irq: u32);
+    /// Mask line `irq` (its last handler went, or nobody claims it)
+    fn irq_mask(irq: u32);
+    /// The IRQ of a PCI function's INTx `pin` (1 = INTA, 0 = none);
+    /// `line` is its config-space Interrupt Line
+    fn pci_intx_irq(bus: u8, device: u8, function: u8, pin: u8, line: u8) -> Option<u32>;
+}
+
 /// Task context and context switching operations
 ///
 /// This trait abstracts the task context structure and context switch mechanism.
@@ -547,54 +587,58 @@ pub trait HaltOps {
     /// This function never returns. It disables interrupts and enters
     /// an infinite halt loop.
     fn halt_loop() -> !;
+
+    /// Print this CPU's registers and stack at a panic (Linux
+    /// dump_stack); nothing where the arch has no unwinder
+    fn dump_stack() {}
 }
 
-/// Early architecture initialization
-///
-/// Called early in boot before the kernel heap is available.
-/// Initializes fundamental hardware needed for kernel operation.
-pub trait EarlyArchInit {
-    /// Initialize architecture-specific hardware
-    ///
-    /// On x86-64: GDT, TSS, IDT, PIC, PIT, syscall MSRs, FPU/SSE, SMEP/SMAP
-    /// On aarch64: Exception vectors, MMU setup, GIC init
-    fn early_init();
-}
-
-/// MMIO mapping operations
-///
-/// Provides architecture-independent interface for mapping device memory
-/// into the kernel's virtual address space.
+/// Kernel page-table primitives behind `mm::ioremap` and vmap (the
+/// swapper's kernel half; Linux's per-arch pgtable helpers and the
+/// PAGE_KERNEL / ioremap protections)
 pub trait IoremapOps {
-    /// Error type for ioremap operations
-    type IoremapError: core::fmt::Debug;
+    /// A kernel RAM page: writable, never executable (Linux PAGE_KERNEL)
+    const PROT_KERNEL: u64;
+    /// A device page (x86 uncached, arm64 Device-nGnRE)
+    const PROT_DEVICE: u64;
+    /// A new ioremap mapping is flushed from every CPU before use
+    const FLUSH_NEW: bool;
 
-    /// Initialize the ioremap subsystem
-    fn ioremap_init();
+    /// The entry is valid (a table, a huge/block entry or a page)
+    fn pte_present(e: u64) -> bool;
+    /// The upper entry points to a next-level table
+    fn pte_is_table(e: u64) -> bool;
+    /// The physical address an entry holds
+    fn pte_addr(e: u64) -> u64;
+    /// An upper entry pointing to the table frame `t`
+    fn mk_table(t: u64) -> u64;
+    /// A last-level entry mapping `pa` with `prot`
+    fn mk_pte(pa: u64, prot: u64) -> u64;
+    /// Make a changed last-level entry visible to the table walker
+    fn sync_pte(_e: &core::sync::atomic::AtomicU64) {}
+    /// A permanent device mapping of [phys, phys + size), if the arch
+    /// has one (arm64's device window)
+    fn io_window(_phys: u64, _size: u64) -> Option<u64> {
+        None
+    }
+    /// `va` is in that permanent window (iounmap keeps it)
+    fn in_io_window(_va: u64) -> bool {
+        false
+    }
+}
 
-    /// Map physical device memory into kernel virtual address space
-    ///
-    /// # Arguments
-    /// * `phys_addr` - Physical address of device memory
-    /// * `size` - Size of the region to map in bytes
-    ///
-    /// # Returns
-    /// Virtual address pointer to the mapped region, or error
-    ///
-    /// # Safety
-    /// [phys_addr, phys_addr + size) is device memory or firmware-owned
-    /// memory (ACPI tables), not RAM the kernel uses: an uncached alias
-    /// of direct-mapped RAM corrupts it.
-    unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, Self::IoremapError>;
-
-    /// Unmap a previously mapped device memory region
-    ///
-    /// # Safety
-    ///
-    /// `virt_addr` and `size` are a mapping `ioremap` returned (with that
-    /// size) that the caller owns, and nothing uses it any more: no
-    /// reference into it or accessor of it (`IoMem`) is left.
-    unsafe fn iounmap(virt_addr: *mut u8, size: u64);
+/// Boot page-table primitives behind `mm::swapper`, with which each
+/// arch's `kmap::init` (Linux paging_init) builds the kernel half
+pub trait KmapOps: IoremapOps {
+    /// Kernel image virtual minus physical address (`pa_symbol`)
+    const KIMAGE_OFFSET: u64;
+    /// Page-table pages in the static boot pool
+    const POOL_PAGES: usize;
+    /// A 2MB leaf entry mapping `pa` with `prot`
+    fn mk_pmd(pa: u64, prot: u64) -> u64;
+    /// Make kernel table writes visible to the walker before the first
+    /// access (arm64 `dsb ishst; isb`)
+    fn kmap_sync() {}
 }
 
 // ============================================================================
@@ -652,6 +696,14 @@ pub trait AcpiOps {
     ///
     /// Returns None if parsing fails or tables are not available.
     fn parse_acpi() -> Option<AcpiInfo>;
+
+    /// Set up the NUMA topology from firmware (ACPI SRAT/SLIT, DT
+    /// numa-node-id); false if it describes none (one node then)
+    fn numa_init() -> bool;
+
+    /// The boot framebuffer the firmware set up (multiboot2 tag, DT
+    /// simple-framebuffer)
+    fn boot_framebuffer() -> Option<crate::gfx::FramebufferInfo>;
 }
 
 /// Symmetric Multi-Processing operations
@@ -770,6 +822,11 @@ pub trait ArchBusOps {
     /// Set up PCI configuration space access (Linux raw_pci_ops on x86,
     /// the host bridge's ECAM window on arm64)
     fn pci_config_init();
+
+    /// Window for the BARs the firmware left unassigned, [start, end)
+    /// (x86: below the LAPIC/IOAPIC region, a fallback since the BIOS
+    /// assigns them; arm64: the QEMU virt PCI MMIO window)
+    const PCI_MMIO: (u64, u64);
 }
 
 // ============================================================================
@@ -786,21 +843,6 @@ pub trait MemoryLayoutOps {
     /// (kernel image, boot modules, DTB, initrd, firmware-reserved
     /// ranges)
     fn memblock_init();
-
-    /// Map the kernel page `va` to RAM at `pa` (writable, never
-    /// executable; the vmemmap); missing tables come from `table`, the
-    /// physical address of a zeroed frame
-    ///
-    /// # Safety
-    /// Boot CPU, before SMP; `va` is unmapped and not in use.
-    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64);
-
-    /// Map the 2MB of kernel addresses at `va` to RAM at `pa` (both 2MB
-    /// aligned) with one block entry, otherwise as `map_kernel_page`
-    ///
-    /// # Safety
-    /// As for `map_kernel_page`; no table exists for the 2MB at `va`.
-    unsafe fn map_kernel_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64);
 }
 
 /// Exception and interrupt controller initialization

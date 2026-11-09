@@ -26,7 +26,6 @@
 
 use alloc::sync::Arc;
 
-use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::fs::file::File;
 use crate::fs::io::fget;
@@ -36,7 +35,8 @@ use crate::fs::superblock::MAX_LFS_FILESIZE;
 use crate::fs::syscall::MAX_RW_COUNT;
 use crate::io::pipe::PipePage;
 use crate::io::pipe::{
-    PIPE_RING, Pipe, PipeBuffer, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags,
+    PIPE_RING, Pipe, PipeBuffer, PipeGuard, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags,
+    sigpipe,
 };
 use crate::mm::filemap::PAGE_SIZE;
 use crate::uaccess::{UserPtr, copy_from_user};
@@ -133,32 +133,16 @@ pub fn splice_to_pipe(
 /// # Returns
 /// Number of bytes tee'd
 pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usize, KernelError> {
-    // Lock both pipes in consistent order to prevent deadlock
-    // Use pointer addresses to determine order
-    let src_addr = core::ptr::from_ref::<Pipe>(src) as usize;
-    let dst_addr = core::ptr::from_ref::<Pipe>(dst) as usize;
-
-    if src_addr == dst_addr {
+    if core::ptr::eq(src, dst) {
         return Err(KernelError::InvalidArgument);
     }
-
-    // Lock in address order
-    let (src_guard, mut dst_guard) = if src_addr < dst_addr {
-        let s = src.lock();
-        let d = dst.lock();
-        (s, d)
-    } else {
-        let d = dst.lock();
-        let s = src.lock();
-        (s, d)
-    };
-
-    if src_guard.is_empty() {
-        return Ok(0);
-    }
-
-    if dst_guard.is_full() {
-        return Err(KernelError::WouldBlock);
+    let (src_guard, mut dst_guard) = lock_both(src, dst);
+    // No reader: EPIPE; nothing to read or no room (after tee's waits)
+    // links nothing: 0 (Linux link_pipe)
+    if !dst.has_readers() {
+        drop((src_guard, dst_guard));
+        sigpipe();
+        return Err(KernelError::BrokenPipe);
     }
 
     let mut copied = 0;
@@ -295,7 +279,6 @@ pub fn sys_splice(
 
     // Linux do_splice: O_NONBLOCK on the pipe side's file (either, for
     // pipe to pipe) makes the splice nonblocking
-    let nb = |f: &File| f.get_flags() & crate::fs::file::flags::O_NONBLOCK != 0;
     let len = len.min(MAX_RW_COUNT);
 
     // Pipe-to-pipe splice: neither side has an offset
@@ -347,30 +330,56 @@ pub fn sys_splice(
     Err(KernelError::InvalidArgument)
 }
 
-/// Splice from pipe to pipe (move buffers)
-fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> KernelResult<usize> {
-    let src_addr = core::ptr::from_ref::<Pipe>(src) as usize;
-    let dst_addr = core::ptr::from_ref::<Pipe>(dst) as usize;
+/// Both pipes locked, in address order (Linux pipe_double_lock)
+fn lock_both<'a>(a: &'a Pipe, b: &'a Pipe) -> (PipeGuard<'a>, PipeGuard<'a>) {
+    if core::ptr::from_ref(a) < core::ptr::from_ref(b) {
+        let ga = a.lock();
+        (ga, b.lock())
+    } else {
+        let gb = b.lock();
+        (a.lock(), gb)
+    }
+}
 
-    if src_addr == dst_addr {
+/// Splice from pipe to pipe, moving buffers (Linux
+/// splice_pipe_to_pipe): wait for data in `src` and room in `dst` one
+/// at a time, then look again under both locks, retrying until one of
+/// them gives an answer
+fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> KernelResult<usize> {
+    if core::ptr::eq(src, dst) {
         return Err(KernelError::InvalidArgument);
     }
-
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
-
-    // Lock in address order to prevent deadlock
-    let (mut src_guard, mut dst_guard) = if src_addr < dst_addr {
-        (src.lock(), dst.lock())
-    } else {
-        let d = dst.lock();
-        let s = src.lock();
-        (s, d)
-    };
-
-    if src_guard.is_empty() || dst_guard.is_full() {
-        return would_block(nonblock);
+    loop {
+        drop(src.lock_data(nonblock)?);
+        drop(dst.lock_room(nonblock)?);
+        let (src_guard, dst_guard) = lock_both(src, dst);
+        if !dst.has_readers() {
+            drop((src_guard, dst_guard));
+            sigpipe();
+            return Err(KernelError::BrokenPipe);
+        }
+        if src_guard.is_empty() && !src.has_writers() {
+            return Ok(0);
+        }
+        if src_guard.is_empty() || dst_guard.is_full() {
+            if nonblock {
+                return Err(KernelError::WouldBlock);
+            }
+            continue;
+        }
+        return Ok(move_bufs(src, src_guard, dst, dst_guard, len));
     }
+}
 
+/// Move up to `len` bytes of buffers from `src` to `dst`, both locked
+fn move_bufs(
+    src: &Pipe,
+    mut src_guard: PipeGuard<'_>,
+    dst: &Pipe,
+    mut dst_guard: PipeGuard<'_>,
+    len: usize,
+) -> usize {
     let mut moved = 0;
 
     while moved < len && !src_guard.is_empty() && !dst_guard.is_full() {
@@ -419,8 +428,7 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> Ker
     // Wake up waiters
     src.wake_writers();
     dst.wake_readers();
-
-    Ok(moved)
+    moved
 }
 
 /// errno of a failed read feeding a splice: the read's own, except that
@@ -433,16 +441,15 @@ fn read_err(e: KernelError) -> KernelError {
     }
 }
 
-/// Nothing to move: EAGAIN when nonblocking, else 0 bytes
-fn would_block(nonblock: bool) -> KernelResult<usize> {
-    if nonblock {
-        Err(KernelError::WouldBlock)
-    } else {
-        Ok(0)
-    }
+/// O_NONBLOCK on `f`, which makes a splice or tee of its pipe
+/// nonblocking (Linux do_splice, do_tee)
+fn nb(f: &File) -> bool {
+    f.get_flags() & crate::fs::file::flags::O_NONBLOCK != 0
 }
 
-/// Splice from file to pipe (read file into pipe)
+/// Splice from file to pipe (Linux splice_file_to_pipe): once the
+/// pipe has room, the file is read under its lock, so nothing read can
+/// find the pipe full
 fn do_splice_file_to_pipe(
     file: &Arc<File>,
     off_in: Option<u64>,
@@ -450,67 +457,41 @@ fn do_splice_file_to_pipe(
     len: usize,
     flags: u32,
 ) -> KernelResult<usize> {
-    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
+    let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
+    let mut g = pipe.lock_room(flags & SPLICE_F_NONBLOCK != 0)?;
 
-    // Check pipe has space
-    if pipe.lock().is_full() {
-        return would_block(nonblock);
-    }
-
-    // For simplicity, we'll read into a temporary buffer and then copy to pipe
-    // This isn't true zero-copy, but works for all file types
-    // A proper implementation would use page cache pages directly
+    // A copy through a buffer, not page cache pages: works for every file
     let mut buf = [0u8; PAGE_SIZE];
     let to_read = len.min(PAGE_SIZE);
-
-    // Read from file
     // pread at the offset, else read (advances the file position)
-    let r = match off_in {
+    let n = match off_in {
         Some(off_in) => file.pread(&mut buf[..to_read], off_in),
         None => file.read(&mut buf[..to_read]),
-    };
-    let bytes_read = match r {
-        Ok(n) => n,
-        Err(KernelError::WouldBlock) => return would_block(nonblock),
-        Err(e) => return Err(read_err(e)),
-    };
-
-    if bytes_read == 0 {
+    }
+    .map_err(read_err)?;
+    if n == 0 {
         return Ok(0);
     }
 
-    // Allocate a pipe page and copy data
-    let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
-
-    // Copy data to page
     // SAFETY: `page` is a fresh, kernel-mapped frame of PAGE_SIZE bytes
-    // owned by this call; `bytes_read <= to_read <= PAGE_SIZE` bytes of
-    // `buf` are copied in
+    // owned by this call; `n <= to_read <= PAGE_SIZE` bytes of `buf` are
+    // copied in
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            buf.as_ptr(),
-            crate::arch::phys_to_virt(page.frame),
-            bytes_read,
-        );
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), crate::arch::phys_to_virt(page.frame), n);
     }
-
-    // Insert into pipe
-    let pipe_buf = PipeBuffer::new(
+    let pb = PipeBuffer::new(
         page,
         0,
-        bytes_read as u32,
+        n as u32,
         pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
     );
-
-    let mut inner = pipe.lock();
-    if inner.push_buffer(pipe_buf).is_err() {
-        return would_block(nonblock);
+    // Room was seen under this lock: the push cannot fail
+    if g.push_buffer(pb).is_err() {
+        return Err(KernelError::WouldBlock);
     }
-    drop(inner);
-
+    drop(g);
     pipe.wake_readers();
-
-    Ok(bytes_read)
+    Ok(n)
 }
 
 /// Splice from pipe to file (write pipe contents to file)
@@ -523,18 +504,13 @@ fn do_splice_pipe_to_file(
 ) -> KernelResult<usize> {
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
 
-    // Check if pipe has data
-    if pipe.lock().is_empty() {
-        if !pipe.has_writers() {
-            return Ok(0); // EOF
-        }
-        return would_block(nonblock);
-    }
-
-    // The pipe stays locked across the writes, and each buffer gives up
-    // only the bytes written (Linux iter_file_splice_write under
-    // pipe_lock): a short write or `len` leaves the rest in the pipe
-    let mut g = pipe.lock();
+    // Data, or EOF, decided under the lock the writes keep. The pipe
+    // stays locked across the writes, and each buffer gives up only the
+    // bytes written (Linux iter_file_splice_write under pipe_lock): a
+    // short write or `len` leaves the rest in the pipe
+    let Some(mut g) = pipe.lock_data(nonblock)? else {
+        return Ok(0);
+    };
     let mut written = 0;
     let mut err = None;
     while written < len && !g.is_empty() {
@@ -646,10 +622,18 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> KernelResult<
         return Err(KernelError::InvalidArgument);
     }
 
-    match link_pipe(&in_pipe, &out_pipe, len, flags) {
-        Err(KernelError::WouldBlock) => would_block(flags & SPLICE_F_NONBLOCK != 0),
-        r => r,
-    }
+    // Linux do_tee: O_NONBLOCK on either file, then wait for data and
+    // for room (ipipe_prep, opipe_prep) before linking
+    let flags = flags
+        | if nb(&in_file) || nb(&out_file) {
+            SPLICE_F_NONBLOCK
+        } else {
+            0
+        };
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
+    drop(in_pipe.lock_data(nonblock)?);
+    drop(out_pipe.lock_room(nonblock)?);
+    link_pipe(&in_pipe, &out_pipe, len, flags)
 }
 
 /// sys_vmsplice - splice user pages into pipe
@@ -684,67 +668,59 @@ pub fn sys_vmsplice(
         return Err(KernelError::BadFd);
     }
 
-    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
-    let mut total = 0usize;
-
-    for seg in &segs {
-        if seg.iov_len == 0 {
-            continue;
-        }
-
-        // Allocate a pipe page
-        let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
-
-        // Copy user data to page (limited to PAGE_SIZE)
-        let to_copy = (seg.iov_len as usize).min(PAGE_SIZE);
-        // SAFETY: page.frame is a freshly allocated, kernel-mapped page of
-        // PAGE_SIZE bytes owned by this pipe buffer.
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), to_copy)
-        };
-        if copy_from_user::<Uaccess>(dst, seg.iov_base, to_copy).is_err() {
-            // Bytes already queued count as success (Linux iov_iter)
-            pipe.wake_readers();
-            return if total > 0 {
-                Ok(total)
-            } else {
-                Err(KernelError::BadAddress)
-            };
-        }
-
-        // Insert into pipe
-        let pipe_buf = PipeBuffer::new(
-            page,
-            0,
-            to_copy as u32,
-            pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
-        );
-
-        let mut inner = pipe.lock();
-        if inner.is_full() {
-            drop(inner);
-            if nonblock {
-                return if total > 0 {
-                    Ok(total)
-                } else {
-                    Err(KernelError::WouldBlock)
-                };
-            }
-            break;
-        }
-
-        if inner.push_buffer(pipe_buf).is_err() {
-            drop(inner);
-            break;
-        }
-        drop(inner);
-
-        total += to_copy;
+    // Linux vmsplice_to_pipe: wait for room, then fill what fits
+    let mut g = pipe.lock_room(flags & SPLICE_F_NONBLOCK != 0)?;
+    let r = iter_to_pipe(&mut g, &segs);
+    drop(g);
+    if matches!(r, Ok(n) if n > 0) {
+        pipe.wake_readers();
     }
+    r
+}
 
-    pipe.wake_readers();
-
+/// Copy the segments into pipe pages, a page at a time, until they or
+/// the room run out (Linux iter_to_pipe); a fault or no memory ends it,
+/// an error only if nothing was copied
+fn iter_to_pipe(g: &mut PipeGuard<'_>, segs: &[IoVec]) -> KernelResult<usize> {
+    let mut total = 0usize;
+    for seg in segs {
+        let mut off = 0u64;
+        while off < seg.iov_len {
+            if g.is_full() {
+                return Ok(total);
+            }
+            match page_from_user(seg.iov_base + off, seg.iov_len - off) {
+                Ok(pb) => {
+                    off += u64::from(pb.len);
+                    total += pb.len as usize;
+                    // Not full, under this lock: the push cannot fail
+                    if g.push_buffer(pb).is_err() {
+                        return Ok(total);
+                    }
+                }
+                Err(e) if total == 0 => return Err(e),
+                Err(_) => return Ok(total),
+            }
+        }
+    }
     Ok(total)
+}
+
+/// A pipe buffer holding up to a page of user memory at `addr` (`len`
+/// bytes left there): EFAULT, ENOMEM
+fn page_from_user(addr: u64, len: u64) -> KernelResult<PipeBuffer> {
+    let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
+    let n = len.min(PAGE_SIZE as u64) as usize;
+    // SAFETY: page.frame is a freshly allocated, kernel-mapped page of
+    // PAGE_SIZE bytes owned by this buffer, and `n <= PAGE_SIZE`
+    let dst = unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), n) };
+    copy_from_user(dst, addr, n).map_err(|_| KernelError::BadAddress)?;
+    Ok(PipeBuffer::new(
+        page,
+        0,
+        n as u32,
+        pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
+    ))
 }
 
 /// sys_sendfile64 - send file data to socket/file

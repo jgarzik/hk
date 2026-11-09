@@ -14,37 +14,50 @@
 //! (`posix_timer::reclaim`), which also decides at dequeue whether the
 //! signal still counts and rearms an interval timer.
 
-use super::{SIGRTMIN, SYNCHRONOUS_MASK, SigInfo, SigSet, si_code};
+use super::{SYNCHRONOUS_MASK, SigInfo, SigSet, Signal, si_code};
 use crate::task::{Ucount, Uid, ucount_dec, ucount_inc};
 use crate::time::posix_timer::PosixTimer;
 use crate::util::kalloc::try_box;
+use crate::util::list::{BoxList, Link};
 use alloc::boxed::Box;
 use alloc::sync::Weak;
 
-/// One queued signal (Linux struct sigqueue): its info, charged to the
-/// receiving user's RLIMIT_SIGPENDING count until freed
+/// One queued signal (Linux struct sigqueue): its signal and info,
+/// charged to the receiving user's RLIMIT_SIGPENDING count until freed
 pub struct SigQueue {
+    sig: Signal,
+    /// Its si_signo is `sig`
     info: SigInfo,
     /// The user charged (Linux sigqueue.ucounts)
     uid: Uid,
     /// The POSIX timer whose entry this is (Linux SIGQUEUE_PREALLOC)
     timer: Option<Weak<PosixTimer>>,
-    next: Option<Box<SigQueue>>,
+    /// On its SigPending's list (Linux sigqueue.list)
+    link: Link,
 }
 
+crate::adapter!(SigQueueLink, SigQueue, link);
+
 impl SigQueue {
-    /// An entry for `info` charged to `uid`, the receiver's real uid
-    /// (Linux sigqueue_alloc): none if that takes the user past `limit`
-    /// (its RLIMIT_SIGPENDING) unless `override_rlimit`, or without
-    /// memory. Thread context, no spin lock held.
-    pub fn alloc(info: SigInfo, uid: Uid, limit: u64, override_rlimit: bool) -> Option<Box<Self>> {
+    /// An entry for `sig` with `info` charged to `uid`, the receiver's
+    /// real uid (Linux sigqueue_alloc): none if that takes the user past
+    /// `limit` (its RLIMIT_SIGPENDING) unless `override_rlimit`, or
+    /// without memory. Thread context, no spin lock held.
+    pub fn alloc(
+        sig: Signal,
+        info: SigInfo,
+        uid: Uid,
+        limit: u64,
+        override_rlimit: bool,
+    ) -> Option<Box<Self>> {
         let n = ucount_inc(uid, Ucount::Sigpending);
         // Holds the charge from here: dropped, it gives it back
         let q = Self {
-            info,
+            sig,
+            info: info.with_sig(sig),
             uid,
             timer: None,
-            next: None,
+            link: Link::new(),
         };
         if !override_rlimit && n > limit {
             return None;
@@ -52,19 +65,26 @@ impl SigQueue {
         try_box(q).ok()
     }
 
-    /// POSIX timer `timer`'s entry, charged to the current task's user
-    /// within its RLIMIT_SIGPENDING (Linux posixtimer_init_sigqueue)
-    pub fn alloc_timer(info: SigInfo, timer: Weak<PosixTimer>) -> Option<Box<Self>> {
+    /// POSIX timer `timer`'s entry for `sig`, charged to the current
+    /// task's user within its RLIMIT_SIGPENDING (Linux
+    /// posixtimer_init_sigqueue)
+    pub fn alloc_timer(sig: Signal, info: SigInfo, timer: Weak<PosixTimer>) -> Option<Box<Self>> {
         let uid = crate::task::current_cred().uid;
         let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_SIGPENDING);
-        let mut q = Self::alloc(info, uid, limit, false)?;
+        let mut q = Self::alloc(sig, info, uid, limit, false)?;
         q.timer = Some(timer);
         Some(q)
     }
 
-    /// Fill in its info (an entry made before the info was known)
+    /// Fill in its info (an entry made before the info was known), for
+    /// its signal
     pub fn set_info(&mut self, info: SigInfo) {
-        self.info = info;
+        self.info = info.with_sig(self.sig);
+    }
+
+    /// Its signal
+    pub fn sig(&self) -> Signal {
+        self.sig
     }
 
     /// Its info
@@ -96,14 +116,15 @@ impl Drop for SigQueue {
 /// spin lock held)
 #[must_use]
 pub struct Dequeued {
+    sig: Signal,
     info: SigInfo,
     q: Option<Box<SigQueue>>,
 }
 
 impl Dequeued {
-    /// The signal number
-    pub fn sig(&self) -> u32 {
-        self.info.sig()
+    /// The signal
+    pub fn sig(&self) -> Signal {
+        self.sig
     }
 
     /// The info, freeing the entry (call with no spin lock held); None
@@ -131,7 +152,7 @@ impl Drop for Dequeued {
 pub struct SigPending {
     /// Bitmask of pending signals
     pub signal: SigSet,
-    list: Option<Box<SigQueue>>,
+    list: BoxList<SigQueueLink>,
 }
 
 impl SigPending {
@@ -139,7 +160,7 @@ impl SigPending {
     pub const fn new() -> Self {
         Self {
             signal: SigSet::EMPTY,
-            list: None,
+            list: BoxList::new(),
         }
     }
 
@@ -149,66 +170,50 @@ impl SigPending {
     }
 
     /// Mark `sig` pending with no info queued (SIGKILL needs none)
-    pub fn add(&mut self, sig: u32) {
+    pub fn add(&mut self, sig: Signal) {
         self.signal.add(sig);
     }
 
-    /// Check if a specific signal is pending
-    pub fn is_pending(&self, sig: u32) -> bool {
+    /// `sig` is pending
+    pub fn is_pending(&self, sig: Signal) -> bool {
         self.signal.contains(sig)
     }
 
     /// A non-RT signal already pending is not queued again (Linux
     /// legacy_queue): one instance, the first sender's info
-    pub fn legacy(&self, sig: u32) -> bool {
-        sig < SIGRTMIN && self.signal.contains(sig)
+    pub fn legacy(&self, sig: Signal) -> bool {
+        !sig.is_rt() && self.signal.contains(sig)
     }
 
     /// Queue `q` behind the others and mark its signal pending
-    pub fn queue(&mut self, mut q: Box<SigQueue>) {
-        q.next = None;
-        self.signal.add(q.info.sig());
-        let mut cur = &mut self.list;
-        while let Some(next) = cur {
-            cur = &mut next.next;
-        }
-        *cur = Some(q);
+    pub fn queue(&mut self, q: Box<SigQueue>) {
+        self.signal.add(q.sig);
+        self.list.push_back(q);
     }
 
     fn iter(&self) -> impl Iterator<Item = &SigQueue> {
-        core::iter::successors(self.list.as_deref(), |q| q.next.as_deref())
-    }
-
-    /// Unlink the first entry `f` picks
-    fn unlink(&mut self, f: impl Fn(&SigQueue) -> bool) -> Option<Box<SigQueue>> {
-        let mut cur = &mut self.list;
-        while cur.as_deref().is_some_and(|q| !f(q)) {
-            cur = &mut cur.as_mut()?.next;
-        }
-        let mut q = cur.take()?;
-        *cur = q.next.take();
-        Some(q)
+        self.list.iter()
     }
 
     /// Take `sig`'s first queued info (Linux collect_signal): it stays
     /// pending while another instance is queued; with none queued (it
     /// came without info) the info is SI_USER from pid 0
-    fn collect(&mut self, sig: u32) -> Dequeued {
-        let q = self.unlink(|q| q.info.sig() == sig);
-        if q.is_none() || !self.iter().any(|e| e.info.sig() == sig) {
+    fn collect(&mut self, sig: Signal) -> Dequeued {
+        let q = self.list.remove_first(|q| q.sig == sig);
+        if q.is_none() || !self.iter().any(|e| e.sig == sig) {
             self.signal.remove(sig);
         }
         let info = match &q {
             Some(q) => q.info,
             None => SigInfo::kill(sig, si_code::SI_USER, 0, 0),
         };
-        Dequeued { info, q }
+        Dequeued { sig, info, q }
     }
 
     /// The next signal not in `skip` (Linux next_signal): a
     /// synchronous one (SEGV, BUS, ILL, TRAP, FPE, SYS: a fault of the
     /// task's own) first, else the lowest-numbered
-    fn next(&self, skip: &SigSet) -> Option<u32> {
+    fn next(&self, skip: &SigSet) -> Option<Signal> {
         let take = self.signal.subtract(skip);
         let sync = SigSet(take.0 & SYNCHRONOUS_MASK);
         if sync.any() { sync } else { take }.first()
@@ -229,12 +234,11 @@ impl SigPending {
             return None;
         }
         let sync = |q: &SigQueue| {
-            let s = q.info.sig();
             q.info.code > si_code::SI_USER
-                && SigSet(SYNCHRONOUS_MASK).contains(s)
-                && !blocked.contains(s)
+                && SigSet(SYNCHRONOUS_MASK).contains(q.sig)
+                && !blocked.contains(q.sig)
         };
-        let sig = self.iter().find(|q| sync(q))?.info.sig();
+        let sig = self.iter().find(|q| sync(q))?.sig;
         Some(self.collect(sig))
     }
 }
@@ -246,12 +250,11 @@ impl SigPending {
     /// the lock is released
     pub fn flush_timers(&mut self) -> SigPending {
         let mut gone = SigPending::new();
-        while let Some(q) = self.unlink(|q| q.info.code == si_code::SI_TIMER) {
-            self.signal.remove(q.info.sig());
-            gone.queue(q);
-        }
-        for q in core::iter::successors(self.list.as_deref(), |q| q.next.as_deref()) {
-            self.signal.add(q.info.sig());
+        self.list
+            .drain_if(|q| q.info.code == si_code::SI_TIMER, |q| gone.queue(q));
+        self.signal = self.signal.subtract(&gone.signal);
+        for q in self.list.iter() {
+            self.signal.add(q.sig);
         }
         gone
     }
@@ -268,9 +271,8 @@ impl SigPending {
         let mut gone = SigPending::new();
         gone.signal = self.signal.intersect(mask);
         self.signal = self.signal.subtract(mask);
-        while let Some(q) = self.unlink(|q| mask.contains(q.info.sig())) {
-            gone.queue(q);
-        }
+        self.list
+            .drain_if(|q| mask.contains(q.sig), |q| gone.queue(q));
         gone
     }
 }
@@ -279,9 +281,7 @@ impl Drop for SigPending {
     /// One entry at a time: a long queue must not recurse; a timer's
     /// goes back to it
     fn drop(&mut self) {
-        let mut cur = self.list.take();
-        while let Some(mut q) = cur {
-            cur = q.next.take();
+        while let Some(q) = self.list.pop_front() {
             release(q);
         }
     }
@@ -290,24 +290,29 @@ impl Drop for SigPending {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signal::{SIGBUS, SIGFPE, SIGHUP, SIGSEGV, SIGUSR1, SigFields};
+    use crate::signal::{SIGBUS, SIGFPE, SIGHUP, SIGRTMIN, SIGSEGV, SIGUSR1, SigFields};
 
     const NONE: SigSet = SigSet::EMPTY;
 
-    fn rt(sig: u32, value: u64) -> Box<SigQueue> {
+    /// SIGRTMIN + `n`
+    fn rtsig(n: u32) -> Signal {
+        Signal::new(SIGRTMIN.nr() + n).unwrap()
+    }
+
+    fn rt(sig: Signal, value: u64) -> Box<SigQueue> {
         rt_as(4242, sig, value)
     }
 
     /// An RT entry charged to `uid` (each test its own uid: they run in
     /// parallel on one count table)
-    fn rt_as(uid: Uid, sig: u32, value: u64) -> Box<SigQueue> {
+    fn rt_as(uid: Uid, sig: Signal, value: u64) -> Box<SigQueue> {
         let f = SigFields::Rt {
             pid: 1,
             uid: 0,
             value,
         };
         let info = SigInfo::new(sig, si_code::SI_QUEUE, f);
-        SigQueue::alloc(info, uid, u64::MAX, false).unwrap()
+        SigQueue::alloc(sig, info, uid, u64::MAX, false).unwrap()
     }
 
     fn value(d: Dequeued) -> u64 {
@@ -341,7 +346,7 @@ mod tests {
     /// stays pending until the last; each entry holds a charge
     #[test]
     fn rt_queue_order() {
-        let sig = SIGRTMIN + 3;
+        let sig = rtsig(3);
         let mut p = SigPending::new();
         for v in 1..=3 {
             p.queue(rt(sig, v));
@@ -359,10 +364,10 @@ mod tests {
     /// flush_mask takes the signal and every queued instance, nothing else
     #[test]
     fn flush() {
-        let sig = SIGRTMIN + 5;
+        let sig = rtsig(5);
         let mut p = SigPending::new();
         p.queue(rt_as(4244, sig, 1));
-        p.queue(rt_as(4244, SIGRTMIN + 6, 2));
+        p.queue(rt_as(4244, rtsig(6), 2));
         p.queue(rt_as(4244, sig, 3));
         let mut m = SigSet::EMPTY;
         m.add(sig);
@@ -379,8 +384,8 @@ mod tests {
         let mut p = SigPending::new();
         p.add(SIGHUP);
         let segv = SigInfo::fault(SIGSEGV, si_code::SEGV_MAPERR, 0x1000);
-        p.queue(SigQueue::alloc(segv, 4243, 1, false).unwrap());
-        assert!(SigQueue::alloc(segv, 4243, 1, false).is_none());
+        p.queue(SigQueue::alloc(SIGSEGV, segv, 4243, 1, false).unwrap());
+        assert!(SigQueue::alloc(SIGSEGV, segv, 4243, 1, false).is_none());
         let d = p.dequeue_sync(&NONE).unwrap();
         assert_eq!(d.info(), Some(segv));
         assert!(p.dequeue_sync(&NONE).is_none());

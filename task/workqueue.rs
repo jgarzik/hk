@@ -48,7 +48,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::sync::spin::Mutex;
 
-use crate::arch::IrqSpinlock;
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::Tid;
 use crate::task::percpu::get_ticks;

@@ -51,6 +51,7 @@
 //! - Linux fs/pipe.c
 
 use crate::sync::{Mutex, MutexGuard};
+use crate::util::error::KernelResult;
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use core::ops::{Deref, DerefMut};
@@ -488,6 +489,51 @@ impl Pipe {
         !self.ring_full() || !self.has_readers()
     }
 
+    /// Locked with data in the ring, for a splice or tee reading it
+    /// (Linux splice_from_pipe_next, ipipe_prep): None when it is empty
+    /// with no writer (EOF, decided under the lock); else empty waits,
+    /// EAGAIN if `nonblock`; a signal ends the wait
+    pub fn lock_data(&self, nonblock: bool) -> KernelResult<Option<PipeGuard<'_>>> {
+        loop {
+            let g = self.lock();
+            if !g.is_empty() {
+                return Ok(Some(g));
+            }
+            if !self.has_writers() {
+                return Ok(None);
+            }
+            drop(g);
+            if nonblock {
+                return Err(KernelError::WouldBlock);
+            }
+            self.wait_queue
+                .wait_event_interruptible(|| self.readable())?;
+        }
+    }
+
+    /// Locked with room in the ring, for a splice, tee or vmsplice
+    /// filling it (Linux wait_for_space, opipe_prep): no reader is
+    /// SIGPIPE and EPIPE; else full waits, EAGAIN if `nonblock`; a signal
+    /// ends the wait
+    pub fn lock_room(&self, nonblock: bool) -> KernelResult<PipeGuard<'_>> {
+        loop {
+            if !self.has_readers() {
+                sigpipe();
+                return Err(KernelError::BrokenPipe);
+            }
+            let g = self.lock();
+            if !g.is_full() {
+                return Ok(g);
+            }
+            drop(g);
+            if nonblock {
+                return Err(KernelError::WouldBlock);
+            }
+            self.wait_queue
+                .wait_event_interruptible(|| self.writable())?;
+        }
+    }
+
     /// Check if there are any readers
     pub fn has_readers(&self) -> bool {
         self.readers.load(Ordering::Acquire) > 0
@@ -678,9 +724,9 @@ fn pipe_read_wait(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<u
 }
 
 /// EPIPE's SIGPIPE to the writing thread
-fn sigpipe() {
+pub fn sigpipe() {
     use crate::signal::{SIGPIPE, send_signal};
-    let _ = send_signal(crate::task::percpu::current_tid(), SIGPIPE);
+    let _ = send_signal(&crate::task::percpu::current(), SIGPIPE);
 }
 
 /// Linux pipe_write: a blocking writer stays until everything is

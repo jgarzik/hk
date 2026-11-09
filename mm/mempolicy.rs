@@ -3,9 +3,8 @@
 //! Implements get_mempolicy, set_mempolicy, mbind, migrate_pages, and move_pages.
 //! Uses the NUMA topology discovered from ACPI SRAT (x86-64) or device tree (aarch64).
 
-use crate::arch::Uaccess;
 use crate::mm::numa::NUMA_TOPOLOGY;
-use crate::uaccess::{UaccessArch, UserPtr, copy_to_user};
+use crate::uaccess::{UserPtr, access_ok, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 
 // ============================================================================
@@ -179,7 +178,7 @@ pub fn sys_get_mempolicy(
         let mut words = alloc::vec![0u64; (mask_bytes / 8) as usize];
         words[0] = online_mask;
         let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        copy_to_user::<Uaccess>(nmask_ptr.addr(), &bytes)?;
+        copy_to_user(nmask_ptr.addr(), &bytes)?;
     }
 
     Ok(())
@@ -338,14 +337,12 @@ fn mm_target(pid: i64) -> Result<(), KernelError> {
     if pid == 0 {
         return Ok(());
     }
-    let tid = crate::task::percpu::find_task_by_vpid(pid as u64)
-        .map(|t| t.tid())
-        .ok_or(KernelError::NoProcess)?;
-    let _g = crate::signal::ExecUpdateRead::lock(tid);
-    if !crate::task::ptrace::may_access_tid(tid, false) {
+    let t = crate::task::percpu::find_task_by_vpid(pid as u64).ok_or(KernelError::NoProcess)?;
+    let _g = crate::signal::ExecUpdateRead::lock(&t);
+    if !crate::task::ptrace::may_access_task(&t, false) {
         return Err(KernelError::NotPermitted);
     }
-    crate::mm::get_task_mm(tid)
+    crate::mm::get_task_mm(&t)
         .map(|_| ())
         .ok_or(KernelError::InvalidArgument)
 }
@@ -387,7 +384,7 @@ pub fn sys_migrate_pages(
 
     // Validate and read old_nodes if provided
     if !old_nodes.is_null() {
-        if !Uaccess::access_ok(old_nodes.addr(), mask_bytes as usize) {
+        if !access_ok(old_nodes.addr(), mask_bytes as usize) {
             return Err(KernelError::BadAddress);
         }
         old_nodes.read()?;
@@ -396,7 +393,7 @@ pub fn sys_migrate_pages(
     // Validate and read new_nodes if provided; NULL is an empty mask
     let mut new_mask: u64 = 0;
     if !new_nodes.is_null() {
-        if !Uaccess::access_ok(new_nodes.addr(), mask_bytes as usize) {
+        if !access_ok(new_nodes.addr(), mask_bytes as usize) {
             return Err(KernelError::BadAddress);
         }
         new_mask = new_nodes.read()?;
@@ -469,7 +466,7 @@ pub fn sys_move_pages(
     let array_ok = |ptr: u64, elem: u64| {
         nr_pages
             .checked_mul(elem)
-            .is_some_and(|size| ptr != 0 && Uaccess::access_ok(ptr, size as usize))
+            .is_some_and(|size| ptr != 0 && access_ok(ptr, size as usize))
     };
     if !array_ok(pages.addr(), 8) || !array_ok(status.addr(), 4) {
         return Err(KernelError::BadAddress);

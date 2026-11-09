@@ -15,8 +15,8 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::arch::IrqSpinlock;
 use crate::cpu::PerCpu;
+use crate::sync::IrqSpinlock;
 use crate::sync::Mutex;
 use crate::sync::completion::Completion;
 use crate::sync::waitqueue::WaitQueue;

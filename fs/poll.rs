@@ -2,11 +2,9 @@
 
 use alloc::vec::Vec;
 
-use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::io::poll::PollFd;
 use crate::signal::SigSet;
-use crate::task::percpu::current_tid;
 use crate::time::time_syscall::{LinuxTimespec, Timeval};
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
@@ -162,8 +160,6 @@ fn do_poll_internal(fds: UserPtr<PollFd>, nfds: u32, deadline: Deadline) -> Kern
         return Err(KernelError::InvalidArgument);
     }
 
-    let tid = current_tid();
-
     // Empty poll: just sleep for the timeout (or until a signal)
     if nfds == 0 {
         if deadline == Some(0) {
@@ -177,7 +173,7 @@ fn do_poll_internal(fds: UserPtr<PollFd>, nfds: u32, deadline: Deadline) -> Kern
     let total_size = pollfd_size * nfds as usize;
     let mut pollfds = crate::util::kmem::try_vec(nfds as usize, PollFd::default())?;
     let bytes_slice = crate::util::pod::slice_bytes_mut(&mut pollfds);
-    copy_from_user::<Uaccess>(bytes_slice, fds.addr(), total_size)?;
+    copy_from_user(bytes_slice, fds.addr(), total_size)?;
 
     // Create poll context (wait queue registrations, dropped at return;
     // only a poll that may sleep registers)
@@ -186,7 +182,7 @@ fn do_poll_internal(fds: UserPtr<PollFd>, nfds: u32, deadline: Deadline) -> Kern
     } else {
         pollfds.iter().filter(|p| p.fd >= 0).count()
     };
-    let mut ctx = PollContext::sized(tid, regs);
+    let mut ctx = PollContext::sized(regs);
     let mut first_pass = true;
     let mut ready_count;
 
@@ -262,7 +258,7 @@ fn do_poll_internal(fds: UserPtr<PollFd>, nfds: u32, deadline: Deadline) -> Kern
     drop(ctx);
 
     // Copy results back to user space
-    copy_to_user::<Uaccess>(fds.addr(), crate::util::pod::slice_bytes(&pollfds))?;
+    copy_to_user(fds.addr(), crate::util::pod::slice_bytes(&pollfds))?;
     Ok(ready_count)
 }
 
@@ -469,7 +465,7 @@ fn do_select_internal(
             .sum::<usize>()
     };
     let regs = if deadline == Some(0) { 0 } else { asked() };
-    let mut ctx = PollContext::sized(current_tid(), regs);
+    let mut ctx = PollContext::sized(regs);
     let mut first_pass = true;
     let mut ready_count;
     let fd_table = current_fd_table();
@@ -558,7 +554,7 @@ fn get_fd_set(ptr: UserPtr<u64>, n: usize) -> KernelResult<Vec<u64>> {
     let mut v = try_vec(words, 0u64)?;
     if !ptr.is_null() && words > 0 {
         let mut raw = try_vec(words * 8, 0u8)?;
-        crate::uaccess::copy_from_user::<Uaccess>(&mut raw, ptr.addr(), words * 8)?;
+        crate::uaccess::copy_from_user(&mut raw, ptr.addr(), words * 8)?;
         for (w, b) in v.iter_mut().zip(raw.as_chunks::<8>().0) {
             *w = u64::from_ne_bytes(*b);
         }
@@ -575,6 +571,6 @@ fn set_fd_set(ptr: UserPtr<u64>, v: &[u64]) -> KernelResult<()> {
     for (b, w) in raw.as_chunks_mut::<8>().0.iter_mut().zip(v) {
         *b = w.to_ne_bytes();
     }
-    crate::uaccess::copy_to_user::<Uaccess>(ptr.addr(), &raw)?;
+    crate::uaccess::copy_to_user(ptr.addr(), &raw)?;
     Ok(())
 }

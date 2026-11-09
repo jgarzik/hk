@@ -11,12 +11,15 @@ pub mod quirks;
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use spin::Once;
 
 use crate::hw::dma::{DmaConfig, DmaDevice};
+use crate::irq::{IrqHandler, IrqRegistration};
 use crate::printkln;
+use crate::util::error::KernelError;
 use crate::util::kalloc::box_nofail;
 
 // ============================================================================
@@ -33,21 +36,12 @@ use crate::util::kalloc::box_nofail;
 mod bar_alloc {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    // Platform-specific MMIO regions for PCI BAR allocation
-    //
-    // These ranges must not conflict with other memory mappings.
-    // On x86, BIOS typically assigns BARs, so this is a fallback.
-    // On ARM QEMU virt, this is the primary PCI MMIO window.
+    use crate::arch::{ArchBusOps, CurrentArch};
 
-    #[cfg(target_arch = "x86_64")]
-    const MMIO_START: u64 = 0xE000_0000; // Below LAPIC/IOAPIC region
-    #[cfg(target_arch = "x86_64")]
-    const MMIO_END: u64 = 0xFEB0_0000; // Before typical BIOS allocations
-
-    #[cfg(target_arch = "aarch64")]
-    const MMIO_START: u64 = 0x1000_0000; // QEMU virt PCI MMIO window
-    #[cfg(target_arch = "aarch64")]
-    const MMIO_END: u64 = 0x3F00_0000;
+    // The platform's MMIO window for BARs (must not overlap other
+    // mappings)
+    const MMIO_START: u64 = CurrentArch::PCI_MMIO.0;
+    const MMIO_END: u64 = CurrentArch::PCI_MMIO.1;
 
     /// Current allocation pointer (atomic for thread-safety)
     static NEXT_ADDR: AtomicU64 = AtomicU64::new(MMIO_START);
@@ -321,10 +315,9 @@ impl PciConfigAccess for EcamConfigAccess {
 /// Global PCI config access mechanism
 static PCI_CONFIG: Once<&'static dyn PciConfigAccess> = Once::new();
 
-/// Initialize PCI config access with port I/O (x86 legacy)
-#[cfg(target_arch = "x86_64")]
-pub fn init_port_io() {
-    PCI_CONFIG.call_once(|| &crate::arch::x86_64::pci_conf::PORT_IO);
+/// Initialize PCI config access with a static accessor (x86 port I/O)
+pub fn init_config(access: &'static dyn PciConfigAccess) {
+    PCI_CONFIG.call_once(|| access);
 }
 
 /// Initialize PCI config access with ECAM (memory-mapped)
@@ -349,7 +342,7 @@ pub fn is_initialized() -> bool {
 fn config() -> &'static dyn PciConfigAccess {
     *PCI_CONFIG
         .get()
-        .expect("PCI config access not initialized - call init_port_io() or init_ecam() first")
+        .expect("PCI config access not initialized - call init_config() or init_ecam() first")
 }
 
 // ============================================================================
@@ -814,7 +807,7 @@ impl PciDevice {
     /// IRQ number of this device's INTx pin (arch routing: x86-64 legacy
     /// PIC line from config space; aarch64 DT interrupt-map / virt swizzle)
     pub fn intx_irq(&self) -> Option<u32> {
-        crate::arch::irq::pci_intx_irq(
+        crate::irq::pci_intx_irq(
             self.bus,
             self.device,
             self.function,
@@ -823,24 +816,23 @@ impl PciDevice {
         )
     }
 
-    /// Unique handler id for this device (bus/device/function)
-    fn irq_id(&self) -> usize {
-        ((self.bus as usize) << 16) | ((self.device as usize) << 8) | (self.function as usize)
-    }
-
-    /// Register a (shareable, level-triggered) INTx handler for this device
-    /// and enable INTx at the device
+    /// Request this device's (shareable, level-triggered) INTx line for
+    /// `handler` and enable INTx at the device (Linux request_irq on
+    /// pdev->irq; INTx is enabled as pci_enable_device does). Dropping
+    /// the registration frees the line (Linux free_irq; INTx stays
+    /// enabled at the device, so the driver first stops the device
+    /// interrupting: a shared level-triggered line left asserted with
+    /// no handler to ack it is disabled as nobody cared)
     ///
     /// # Returns
-    /// The IRQ number on success, or an error description
-    pub fn register_irq_handler(
+    /// The registration; NoDevice without an INTx line, the IRQ table's
+    /// error otherwise
+    pub fn request_irq<T: IrqHandler + 'static>(
         &self,
-        handler: alloc::sync::Arc<dyn crate::irq::IrqHandler>,
-    ) -> Result<u32, &'static str> {
-        let irq = self.intx_irq().ok_or("No valid IRQ assigned to device")?;
-        crate::arch::irq::register_irq_handler(irq, handler, self.irq_id())?;
-
-        // Clear INTERRUPT_DISABLE bit in command register to enable interrupts
+        handler: Arc<T>,
+    ) -> Result<IrqRegistration<T>, KernelError> {
+        let irq = self.intx_irq().ok_or(KernelError::NoDevice)?;
+        let reg = crate::irq::request_irq(irq, handler)?;
         let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);
         pci_write16(
             self.bus,
@@ -849,33 +841,7 @@ impl PciDevice {
             offset::COMMAND,
             cmd & !command::INTERRUPT_DISABLE,
         );
-        Ok(irq)
-    }
-
-    /// Unregister this device's INTx handler (device removal / hotplug):
-    /// disables INTx at the device first
-    ///
-    /// # Returns
-    /// The IRQ number that was unregistered, or an error
-    pub fn unregister_irq_handler(&self) -> Result<u32, &'static str> {
-        let irq = self.intx_irq().ok_or("No valid IRQ assigned to device")?;
-
-        // Disable interrupts at device level first (set INTERRUPT_DISABLE bit)
-        let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);
-        pci_write16(
-            self.bus,
-            self.device,
-            self.function,
-            offset::COMMAND,
-            cmd | command::INTERRUPT_DISABLE,
-        );
-
-        // The table's reference to the handler goes here, unlocked
-        drop(crate::arch::irq::unregister_irq_handler(
-            irq,
-            self.irq_id(),
-        )?);
-        Ok(irq)
+        Ok(reg)
     }
 
     /// Check if this is an xHCI USB controller

@@ -5,7 +5,7 @@
 
 use alloc::vec::Vec;
 
-use crate::uaccess::{UaccessArch, UaccessError, copy_from_user};
+use crate::uaccess::{UaccessError, copy_from_user};
 use crate::util::error::KernelError;
 
 /// Strings, each with its NUL, in order
@@ -66,7 +66,7 @@ impl ArgStrings {
     /// bytes (Linux strnlen_user + valid_arg_len), and charge its bytes
     /// with the NUL to `budget` (bprm_hit_stack_limit): E2BIG past
     /// either, EFAULT for an unreadable byte, ENOMEM
-    pub fn push_user<A: UaccessArch>(
+    pub fn push_user(
         &mut self,
         ptr: u64,
         max: usize,
@@ -82,7 +82,7 @@ impl ArgStrings {
             }
             let to_page_end = (PAGE - at % PAGE) as usize;
             let n = chunk.len().min(to_page_end).min(max - got);
-            copy_from_user::<A>(&mut chunk[..n], at, n).map_err(|e| match e {
+            copy_from_user(&mut chunk[..n], at, n).map_err(|e| match e {
                 UaccessError::TooLong => KernelError::ArgListTooLong,
                 _ => KernelError::BadAddress,
             })?;
@@ -113,7 +113,6 @@ impl ArgStrings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uaccess::HostUaccess;
 
     fn strs(v: &ArgStrings) -> Vec<&[u8]> {
         v.iter().collect()
@@ -138,19 +137,18 @@ mod tests {
 
     #[test]
     fn user_strings_charged_and_bounded() {
-        let s = b"hello\0";
+        let s = crate::uaccess::UserMem::with(b"hello\0", 100);
         let mut a = ArgStrings::new();
         let mut budget = 100;
-        a.push_user::<HostUaccess>(s.as_ptr() as u64, 6, &mut budget)
-            .unwrap();
+        a.push_user(s.addr(), 6, &mut budget).unwrap();
         assert_eq!(budget, 94);
         assert_eq!(strs(&a), [&b"hello"[..]]);
         // NUL included, longer than max: E2BIG
-        let r = a.push_user::<HostUaccess>(s.as_ptr() as u64, 5, &mut budget);
+        let r = a.push_user(s.addr(), 5, &mut budget);
         assert_eq!(r, Err(KernelError::ArgListTooLong));
         // Past the budget: E2BIG
         let mut small = 3;
-        let r = a.push_user::<HostUaccess>(s.as_ptr() as u64, 100, &mut small);
+        let r = a.push_user(s.addr(), 100, &mut small);
         assert_eq!(r, Err(KernelError::ArgListTooLong));
     }
 }

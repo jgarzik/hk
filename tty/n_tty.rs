@@ -212,7 +212,7 @@ impl NTtyData {
 #[derive(Default)]
 struct Effects {
     echo: Vec<u8>,
-    sigs: Vec<u32>,
+    sigs: Vec<crate::signal::Signal>,
     /// Input became readable: SIGIO POLL_IN (Linux kill_fasync at a
     /// canonical line end, or after non-canonical input)
     kill: bool,
@@ -270,7 +270,7 @@ fn map_input(c: u8, t: &Termios) -> Option<u8> {
 }
 
 /// The signal a character raises under ISIG
-fn signal_char(c: u8, t: &Termios) -> Option<u32> {
+fn signal_char(c: u8, t: &Termios) -> Option<crate::signal::Signal> {
     use crate::signal::{SIGINT, SIGQUIT, SIGTSTP};
     [(VINTR, SIGINT), (VQUIT, SIGQUIT), (VSUSP, SIGTSTP)]
         .into_iter()

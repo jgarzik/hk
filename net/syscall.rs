@@ -29,15 +29,6 @@ fn sockfd(fd: i32) -> KernelResult<(Arc<File>, Arc<dyn ProtoOps>)> {
     Ok((file, s))
 }
 
-fn nofile() -> u64 {
-    let l = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-    if l == crate::task::rlimit::RLIM_INFINITY {
-        u64::MAX
-    } else {
-        l
-    }
-}
-
 /// Install `file` in a new descriptor, close-on-exec if `cloexec`
 pub fn fd_install(file: Arc<File>, cloexec: bool) -> KernelResult<i32> {
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
@@ -86,12 +77,14 @@ pub fn sys_socketpair(
 /// Install two files in new descriptors, or neither (the table
 /// releases undone and refused files after its lock is dropped)
 fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> KernelResult<[i32; 2]> {
-    let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
+    let table = crate::task::percpu::current()
+        .files()
         .ok_or(KernelError::BadFd)?;
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
+    let max = crate::fs::syscall::get_nofile_limit();
     let mut t = table.lock();
-    let fd1 = t.alloc_with_flags(a, fl, nofile())?;
-    match t.alloc_with_flags(b, fl, nofile()) {
+    let fd1 = t.alloc_with_flags(a, fl, max)?;
+    match t.alloc_with_flags(b, fl, max) {
         Ok(fd2) => Ok([fd1, fd2]),
         Err(e) => {
             t.close(fd1);
@@ -301,11 +294,11 @@ fn recvmsg_one(
     let mut namelen = 0;
     if let (Some(a), false) = (&m.name, h.name.is_null()) {
         let k = (h.namelen as usize).min(a.len());
-        copy_to_user::<crate::arch::Uaccess>(h.name.addr(), &a[..k])?;
+        copy_to_user(h.name.addr(), &a[..k])?;
         namelen = a.len() as u32;
     }
     if !m.cmsg.buf.is_empty() {
-        copy_to_user::<crate::arch::Uaccess>(h.control.addr(), &m.cmsg.buf)?;
+        copy_to_user(h.control.addr(), &m.cmsg.buf)?;
     }
     let mut fl = m.flags;
     if m.cmsg.trunc {

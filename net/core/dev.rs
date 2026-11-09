@@ -44,11 +44,11 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::sync::spin::{Mutex, RwLock};
 use spin::Once;
 
-use crate::arch::IrqSpinlock;
 use crate::cpu::PerCpu;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{self, PktType};
 use crate::net::skb::SkBuff;
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::kthread::KThread;
 use crate::task::percpu::cpu_has_scheduler;

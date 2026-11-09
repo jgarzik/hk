@@ -71,11 +71,6 @@ impl KThread {
 /// Registry of live kernel threads (process context only)
 static KTHREADS: Mutex<Vec<Arc<KThread>>> = Mutex::new(Vec::new());
 
-/// `tid` is a kernel thread started by [`kthread_run`]
-pub fn is_kthread_tid(tid: Tid) -> bool {
-    KTHREADS.lock().iter().any(|k| k.tid() == tid)
-}
-
 /// Round-robin cursor for unbound threads
 static NEXT_CPU: AtomicU32 = AtomicU32::new(0);
 
@@ -123,8 +118,7 @@ pub fn kthread_run_prio(
         ack: WaitQueue::new(),
     })?;
     // The task is created asleep: register it before it can look itself up
-    let task = create_kthread_task(cpu, name, kthread_entry as *const () as usize, priority)
-        .map_err(|_| KernelError::OutOfMemory)?;
+    let task = create_kthread_task(cpu, name, kthread_entry as *const () as usize, priority)?;
     k.task.call_once(|| task);
     KTHREADS.lock().push(k.clone());
     k.wake();

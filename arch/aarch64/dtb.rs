@@ -348,19 +348,19 @@ pub fn extract_simple_framebuffer() -> Option<crate::gfx::FramebufferInfo> {
 /// Initialize NUMA topology from device tree numa-node-id properties
 ///
 /// Looks for `numa-node-id` properties on `/memory` and `/cpus/cpu@N` nodes.
-/// Returns Ok(true) if NUMA topology was found, Ok(false) if no NUMA info
-/// (caller should use single-node fallback).
-pub fn init_numa_topology() -> Result<bool, &'static str> {
+/// True if NUMA topology was found, false if no NUMA info (caller should
+/// use single-node fallback).
+pub fn init_numa_topology() -> bool {
     use crate::mm::numa::{
         LOCAL_DISTANCE, MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode, REMOTE_DISTANCE,
     };
 
     let Some(dtb_data) = blob() else {
-        return Ok(false);
+        return false;
     };
 
     let Ok(dt) = DeviceTree::from_fdt(dtb_data) else {
-        return Ok(false);
+        return false;
     };
 
     let mut found_numa = false;
@@ -369,7 +369,7 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
     // Extract memory nodes with numa-node-id
     // Memory nodes can be /memory or /memory@ADDR
     let Some(root) = dt.find_node("/") else {
-        return Ok(false);
+        return false;
     };
 
     for child in root.children() {
@@ -457,7 +457,7 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
     }
 
     if !found_numa {
-        return Ok(false);
+        return false;
     }
 
     // Update node count
@@ -516,7 +516,7 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
     // Mark as initialized
     topology.set_initialized();
 
-    Ok(true)
+    true
 }
 
 #[cfg(test)]

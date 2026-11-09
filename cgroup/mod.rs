@@ -32,7 +32,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Lazy;
 
-use crate::task::Pid;
+use crate::task::{Pid, Task};
 use crate::util::error::KernelError;
 
 pub mod subsys;
@@ -564,27 +564,20 @@ impl CgroupRoot {
 /// Global unified cgroup hierarchy root
 pub static CGROUP_ROOT: Lazy<Arc<CgroupRoot>> = Lazy::new(|| arc_nofail(CgroupRoot::new()));
 
-/// Task `tid` (its cgroup is `Task.cgroup`, Linux task->cgroups)
-fn task(tid: Pid) -> Option<crate::task::percpu::TaskRef> {
-    crate::task::percpu::TASKLIST.read().task(tid)
+/// The cgroup of task `t` (`Task.cgroup`, Linux task->cgroups)
+pub fn get_task_cgroup(t: &Task) -> Option<Arc<Cgroup>> {
+    t.cgroup.lock().clone()
 }
 
-/// Get the cgroup for a task
-pub fn get_task_cgroup(tid: Pid) -> Option<Arc<Cgroup>> {
-    task(tid).and_then(|t| t.cgroup.lock().clone())
+/// Set the cgroup of task `t` (the old one is dropped after its lock)
+pub fn set_task_cgroup(t: &Task, cgroup: Arc<Cgroup>) {
+    let old = t.cgroup.lock().replace(cgroup);
+    drop(old);
 }
 
-/// Set the cgroup for a task (the old one is dropped after its lock)
-pub fn set_task_cgroup(tid: Pid, cgroup: Arc<Cgroup>) {
-    if let Some(t) = task(tid) {
-        let old = t.cgroup.lock().replace(cgroup);
-        drop(old);
-    }
-}
-
-/// Remove cgroup mapping for a task
-pub fn remove_task_cgroup(tid: Pid) -> Option<Arc<Cgroup>> {
-    task(tid).and_then(|t| t.cgroup.lock().take())
+/// Take task `t` out of its cgroup pointer
+pub fn remove_task_cgroup(t: &Task) -> Option<Arc<Cgroup>> {
+    t.cgroup.lock().take()
 }
 
 /// Initialize the cgroup subsystem
@@ -625,28 +618,25 @@ pub fn cgroup_init() {
 /// is skipped, never re-attached
 pub fn migrate_thread_group(target: &Arc<Cgroup>, pid: Pid) -> Result<(), KernelError> {
     let root = CGROUP_ROOT.clone();
-    let tids = thread_group(pid)?;
+    let threads = thread_group(pid)?;
     let ctrls: Vec<_> = target
         .enabled_controllers()
         .into_iter()
         .filter_map(|c| Some((target.css(c)?, root.get_controller(c)?)))
         .collect();
-    for &tid in &tids {
+    for t in &threads {
         for (css, ops) in &ctrls {
-            ops.can_attach(css, tid as Pid)?;
+            ops.can_attach(css, t.tid() as Pid)?;
         }
     }
-    for tid in tids {
-        migrate_one(&root, target, tid);
+    for t in &threads {
+        migrate_one(&root, target, t);
     }
     Ok(())
 }
 
-/// One thread's move (Linux cgroup_migrate_execute for one task)
-fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, tid: Tid) {
-    let Some(t) = task(tid as Pid) else {
-        return;
-    };
+/// Thread `t`'s move (Linux cgroup_migrate_execute for one task)
+fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, t: &Task) {
     let mut slot = t.cgroup.lock();
     // Exiting: exit owns it (Linux skips PF_EXITING). Exit sets the flag
     // before it detaches under this lock, so a thread seen live here is
@@ -654,7 +644,7 @@ fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, tid: Tid) {
     if t.has_flag(crate::task::pf::EXITING) {
         return;
     }
-    let pid = tid as Pid;
+    let pid = t.tid() as Pid;
     if let Some(old) = slot.clone() {
         if Arc::ptr_eq(&old, target) {
             return;
@@ -675,11 +665,13 @@ fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, tid: Tid) {
     *slot = Some(target.clone());
 }
 
-/// Detach a task from its cgroup (on exit)
-pub fn cgroup_exit_task(pid: Pid) {
+/// Detach the exiting task `t` from its cgroup (Linux cgroup_exit):
+/// from exit_current while it still runs, before it is a zombie, so no
+/// reap can remove it from the task list first
+pub fn detach_task(t: &Task) {
     let root = CGROUP_ROOT.clone();
-
-    if let Some(cg) = remove_task_cgroup(pid) {
+    let pid = t.tid();
+    if let Some(cg) = remove_task_cgroup(t) {
         for controller in cg.enabled_controllers() {
             if let Some(css) = cg.css(controller)
                 && let Some(ops) = root.get_controller(controller)
@@ -706,22 +698,20 @@ pub static CGROUP_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 /// CGROUP_MUTEX; above TASKLIST and the cgroup spin locks.
 pub static CGROUP_THREADGROUP_RWSEM: crate::sync::RwSem<()> = crate::sync::RwSem::new(());
 
-/// The threads of the process `pid` names (any of its threads; 0: the
-/// caller's): ESRCH if none (Linux cgroup_procs_write_start finds the
-/// task, then its group leader's whole group)
-pub fn thread_group(pid: Pid) -> Result<Vec<Tid>, KernelError> {
-    let table = crate::task::percpu::TASKLIST.read();
-    let tid = if pid == 0 {
-        crate::task::percpu::current_tid()
+/// The threads of the process `pid` names in the caller's pid
+/// namespace (any of its threads; 0: the caller's): ESRCH if none
+/// (Linux cgroup_procs_write_start finds the task by find_task_by_vpid,
+/// then its group leader's whole group; exiting threads are skipped)
+pub fn thread_group(pid: Pid) -> Result<Vec<crate::task::percpu::TaskRef>, KernelError> {
+    use crate::task::percpu::{GlobalTaskTable, current, find_task_by_vpid, task_ref};
+    let t = if pid == 0 {
+        task_ref(&current())
     } else {
-        pid as Tid
+        find_task_by_vpid(pid).ok_or(KernelError::NoProcess)?
     };
-    let tgid = table.get(tid).ok_or(KernelError::NoProcess)?.task.pid;
-    Ok(table
-        .iter()
-        .filter(|t| t.task.pid == tgid && !t.task.has_flag(crate::task::pf::EXITING))
-        .map(|t| t.task.tid())
-        .collect())
+    Ok(GlobalTaskTable::collect_group(&t, |_, x| {
+        (!x.task.has_flag(crate::task::pf::EXITING)).then(|| task_ref(x.task))
+    }))
 }
 
 /// Create a child cgroup (Linux cgroup_mkdir: ENODEV in a removed
@@ -796,8 +786,6 @@ pub fn cgroup_rmdir(parent: &Arc<Cgroup>, name: &str) -> Result<(), KernelError>
 // Helper functions for task integration (clone/exit)
 // ============================================================================
 
-use crate::task::Tid;
-
 /// A child admitted into its cgroup before it exists (Linux
 /// cgroup_can_fork .. cgroup_post_fork / cgroup_cancel_fork): the
 /// controllers' charges are held; dropping it (the fork failed) gives
@@ -827,7 +815,7 @@ pub fn can_fork(into: Option<Arc<Cgroup>>) -> Result<Option<ForkCg>, KernelError
     let cg = match into {
         Some(cg) if cg.is_dead() => return Err(KernelError::NoDevice),
         Some(cg) => cg,
-        None => match get_task_cgroup(crate::task::percpu::current_tid() as Pid) {
+        None => match get_task_cgroup(&crate::task::percpu::current()) {
             Some(cg) => cg,
             None => return Ok(None),
         },
@@ -852,10 +840,10 @@ pub fn can_fork(into: Option<Arc<Cgroup>>) -> Result<Option<ForkCg>, KernelError
 impl ForkCg {
     /// The child exists: it joins the cgroup, keeping the charges
     /// (Linux cgroup_post_fork)
-    pub fn post_fork(mut self, tid: Tid) {
+    pub fn post_fork(mut self, child: &Task) {
         self.charged.clear();
-        self.cg.add_task(tid);
-        set_task_cgroup(tid, self.cg.clone());
+        self.cg.add_task(child.tid());
+        set_task_cgroup(child, self.cg.clone());
     }
 }
 
@@ -870,12 +858,4 @@ impl Drop for ForkCg {
             }
         }
     }
-}
-
-/// Detach the exiting task `tid` from its cgroup (Linux cgroup_exit):
-/// from exit_current while it still runs, before it is a zombie, so no
-/// reap can remove it from the task list first
-pub fn detach_task(tid: Tid) {
-    // Use the existing cgroup_exit_task implementation
-    cgroup_exit_task(tid);
 }

@@ -31,6 +31,11 @@
 //!   is moved by its remaining thread: the exited leader is skipped
 //!   (Linux: PF_EXITING), so once the process is gone the cgroup is
 //!   empty (rmdir works) and its pids charge is back to 0.
+//! - CGROUP_PROCS_PIDNS: a number written to cgroup.procs is the
+//!   writer's (Linux cgroup_procs_write_start: find_task_by_vpid): pid 1
+//!   of a new pid namespace writing "1" moves itself, not the global
+//!   init. Afterwards the boot tester is put back in the root cgroup in
+//!   case the wrong process was moved.
 //! - CGROUP_SUBTREE_CONTROL: a cgroup may enable for its children only a
 //!   controller it has itself (ENOENT otherwise); an unknown token is
 //!   EINVAL (Linux cgroup_subtree_control_write).
@@ -57,9 +62,10 @@ use core::sync::atomic::{AtomicI32, Ordering};
 
 use crate::harness::report_step;
 use hk_syscall::{
-    CloneArgs, MAP_ANONYMOUS, MAP_SHARED, O_DIRECTORY, O_RDONLY, O_WRONLY, PROT_READ, PROT_WRITE,
-    sys_clone3, sys_close, sys_exit, sys_fork, sys_getpid, sys_kill, sys_mkdir, sys_mmap,
-    sys_munmap, sys_open, sys_pause, sys_read, sys_rmdir, sys_sched_yield, sys_wait4, sys_write,
+    CLONE_NEWPID, CloneArgs, MAP_ANONYMOUS, MAP_SHARED, O_DIRECTORY, O_RDONLY, O_WRONLY, PROT_READ,
+    PROT_WRITE, sys_clone3, sys_close, sys_exit, sys_fork, sys_getpid, sys_kill, sys_mkdir,
+    sys_mmap, sys_munmap, sys_open, sys_pause, sys_read, sys_rmdir, sys_sched_yield, sys_unshare,
+    sys_wait4, sys_write,
 };
 
 const EAGAIN: i64 = -11;
@@ -74,6 +80,7 @@ pub fn run_tests() {
     report_step(b"CGROUP_RMDIR_RACE", cgroup_rmdir_race());
     report_step(b"CGROUP_PROCS_TGID", in_child(cgroup_procs_tgid));
     report_step(b"CGROUP_PROCS_EXITED_LEADER", procs_exited_leader());
+    report_step(b"CGROUP_PROCS_PIDNS", procs_pidns());
     report_step(b"CGROUP_SUBTREE_CONTROL", subtree_control());
     // Hierarchical pids.events and pids.events.local: Linux 6.11
     // (3f26a885a068); CI's reference kernel may be older
@@ -84,6 +91,54 @@ pub fn run_tests() {
     }
     report_step(b"CPU_MAX_RW", cpu_max_rw());
     report_step(b"PIDS_MAX_BOUNDS", pids_max_bounds());
+}
+
+/// In a child's new pid namespace, its init writes "1" to cgroup.procs
+fn procs_pidns() -> i64 {
+    const C: &[u8] = b"pl_ns";
+    let mut b = [0u8; 96];
+    sys_mkdir(path(&mut b, C, b"").as_ptr(), 0o755);
+    let step = in_child(|| {
+        if sys_unshare(CLONE_NEWPID) != 0 {
+            return 1;
+        }
+        let pid = sys_fork();
+        if pid == 0 {
+            let step = if sys_getpid() != 1 {
+                2
+            } else if write_file(C, b"cgroup.procs", b"1") <= 0 {
+                3
+            } else if !self_in(b"/pl_ns\n") {
+                4
+            } else {
+                0
+            };
+            sys_exit(step);
+        }
+        let mut ws = 0;
+        sys_wait4(pid, &mut ws, 0, 0);
+        if ws & 0x7f != 0 {
+            5
+        } else {
+            (ws >> 8) as i64 & 0xff
+        }
+    });
+    // Undo a move of the wrong process (the global init is this one)
+    join(b"");
+    remove_cgroup(C);
+    step
+}
+
+/// /proc/self/cgroup ends with `tail`
+fn self_in(tail: &[u8]) -> bool {
+    let fd = sys_open(b"/proc/self/cgroup\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    let mut d = [0u8; 64];
+    let n = sys_read(fd as u64, d.as_mut_ptr(), d.len() as u64);
+    sys_close(fd as u64);
+    n > 0 && d[..n as usize].ends_with(tail)
 }
 
 fn pids_max_bounds() -> i64 {

@@ -86,26 +86,24 @@ struct Snap {
 fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     let table = TASKLIST.read();
     // Still listed: then its tid names it for this read hold
-    let t = super::listed(&table, task)?;
+    let t = table.view(task)?;
     let pid = task.tid();
     let threads = table.threads(pid).count() as u64;
     let nr = |p: Option<&Arc<crate::task::pid::Pid>>, n: &PidNamespace| p.map_or(0, |p| p.nr_ns(n));
     // A listed task's process (by its root number) in `ns`
     let task_nr = |root: Tid| {
         u64::from(nr(
-            table.get(root).and_then(|x| x.fields().thread_pid.as_ref()),
+            table.get(root).and_then(|x| x.fields().thread_pid()),
             ns,
         ))
     };
-    let me = t.thread_pid.as_ref();
+    let me = t.thread_pid();
     // A task the namespace cannot see is not shown there (Linux reaches
     // it only through a lookup in that namespace); then its levels from
     // `ns` down are the namespaces of its own chain
     me?.nr_in(ns)?;
-    let leader = table
-        .get(t.task.pid)
-        .and_then(|l| l.fields().thread_pid.as_ref());
-    let (pg, se) = (t.pgrp.as_ref(), t.session.as_ref());
+    let leader = table.get(t.task.pid).and_then(|l| l.fields().thread_pid());
+    let (pg, se) = (t.pgrp(), t.session());
     let tracer = t.tracer().map_or(0, |x| task_nr(x.tid()));
     let mut ns_ids = [[0u32; 4]; LEVELS];
     let mut levels = 0;
@@ -135,7 +133,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         ns_ids,
         levels,
         comm,
-        state: match t.state {
+        state: match t.state() {
             // The run state as of its last switch (Linux task_state)
             TaskState::Ready | TaskState::Running | TaskState::Sleeping => {
                 if t.task.se.state() != crate::task::percpu::SleepState::Running as u8 {
@@ -151,8 +149,8 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         exiting: t.task.has_flag(crate::task::pf::EXITING),
         utime,
         stime,
-        cutime: t.signal.as_ref().map_or(0, |s| s.child_times().0),
-        cstime: t.signal.as_ref().map_or(0, |s| s.child_times().1),
+        cutime: t.signal().map_or(0, |s| s.child_times().0),
+        cstime: t.signal().map_or(0, |s| s.child_times().1),
         start: t.task.start_time(),
         nvcsw: t.task.nvcsw.load(core::sync::atomic::Ordering::Relaxed),
         nivcsw: t.task.nivcsw.load(core::sync::atomic::Ordering::Relaxed),
@@ -163,17 +161,17 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         rt_priority: i32::from(t.task.se.rt_priority()),
         cpus: t.task.cpus_mask.snapshot(),
         cpu: t.task.cpu.load(core::sync::atomic::Ordering::Relaxed),
-        exit_signal: t.exit_signal,
-        exit_code: t.exit_code,
+        exit_signal: t.exit_signal().raw(),
+        exit_code: t.exit_code(),
         threads,
         tracer,
-        no_new_privs: t.prctl.no_new_privs,
+        no_new_privs: t.no_new_privs(),
         seccomp: t.task.seccomp_mode(),
         blocked,
         pending,
         shared: Some(shared),
-        sighand: t.sighand.clone(),
-        signal: t.signal.clone(),
+        sighand: t.sighand().cloned(),
+        signal: t.signal().cloned(),
         fs,
         files,
     })
@@ -217,19 +215,7 @@ impl core::fmt::Write for Out {
 
 /// (ignored, caught) signals (Linux collect_sigign_sigcatch)
 fn ign_cgt(s: &Snap) -> (u64, u64) {
-    use crate::signal::SigHandler;
-    let Some(h) = &s.sighand else {
-        return (0, 0);
-    };
-    let (mut ign, mut cgt) = (0, 0);
-    for sig in 1..=64u32 {
-        match h.get_action(sig).map(|a| a.handler) {
-            Some(SigHandler::Ignore) => ign |= 1u64 << (sig - 1),
-            Some(SigHandler::Handler(_)) => cgt |= 1u64 << (sig - 1),
-            _ => {}
-        }
-    }
-    (ign, cgt)
+    s.sighand.as_ref().map_or((0, 0), |h| h.ign_cgt())
 }
 
 /// Pending signals shared by the thread group
@@ -439,8 +425,8 @@ pub fn gen_stat(t: &TaskRef, ns: &PidNamespace) -> Vec<u8> {
     };
     // The access decision and the mm it covers, as one (Linux holds
     // exec_update_lock across do_task_stat)
-    let guard = crate::signal::ExecUpdateRead::lock_task(t);
-    let permitted = crate::task::ptrace::may_read_ref(t);
+    let guard = crate::signal::ExecUpdateRead::lock(t);
+    let permitted = crate::task::ptrace::may_access_task(t, true);
     let v = task_vm(t);
     drop(guard);
     fmt_stat(&s, v.as_ref(), permitted, ign_cgt(&s), rss_lim(&s))

@@ -2,7 +2,7 @@
 //!
 //! Matching of a device-tree `interrupt-map` (IEEE 1275 PCI binding) and
 //! the QEMU `virt` fixed swizzle. The arch layer parses the DTB and owns the
-//! table; see `arch::aarch64::pci_irq`.
+//! table; see arch/aarch64/pci_irq.rs.
 
 /// One `interrupt-map` entry, child address/pin already masked
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,6 +1,5 @@
 //! Directory navigation syscalls (chdir, fchdir, chroot, getcwd)
 
-use crate::arch::Uaccess;
 use crate::fs::dac::{self, MAY_CHDIR, MAY_EXEC};
 use crate::fs::namei::{getname, path_lookupat};
 use crate::fs::{Dentry, KernelError, LookupFlags, Path};
@@ -110,6 +109,6 @@ pub fn sys_getcwd(buf: UserPtr<u8>, size: u64) -> KernelResult<usize> {
     // Copy path to user buffer (with null terminator)
     let mut path_bytes = path_str;
     path_bytes.push(0);
-    copy_to_user::<Uaccess>(buf.addr(), &path_bytes)?;
+    copy_to_user(buf.addr(), &path_bytes)?;
     Ok(path_len)
 }

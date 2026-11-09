@@ -12,7 +12,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use crate::arch::Uaccess;
 use crate::ipc::util::{
     IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcOps, KernIpcPerm, ipc_checkperm, ipcget,
 };
@@ -309,7 +308,7 @@ pub fn sys_msgsnd(msqid: i32, msgp: UserPtr<i64>, msgsz: usize, msgflg: i32) -> 
     let mut mtext = vec![0u8; msgsz];
     if msgsz > 0 {
         let data_ptr = msgp.addr() + 8; // Skip mtype (i64 = 8 bytes)
-        copy_from_user::<Uaccess>(&mut mtext, data_ptr, msgsz)?;
+        copy_from_user(&mut mtext, data_ptr, msgsz)?;
     }
 
     let msg = MsgMsg { mtype, mtext };
@@ -390,7 +389,7 @@ pub fn sys_msgrcv(
             let copy_len = core::cmp::min(msg.mtext.len(), msgsz);
             if copy_len > 0 {
                 let data_ptr = msgp.addr() + 8;
-                copy_to_user::<Uaccess>(data_ptr, &msg.mtext[..copy_len])?;
+                copy_to_user(data_ptr, &msg.mtext[..copy_len])?;
             }
 
             // Wake any waiting senders

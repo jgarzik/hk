@@ -10,11 +10,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::arch::Uaccess;
 use crate::fs::{Inode, KernelError, LookupFlags, lookup_path_flags};
-use crate::uaccess::{
-    UaccessArch, UserPtr, copy_to_user, strncpy_from_user, strncpy_from_user_str,
-};
+use crate::uaccess::{UserPtr, access_ok, copy_to_user, strncpy_from_user, strncpy_from_user_str};
 use crate::util::error::KernelResult;
 
 use super::io::fget;
@@ -251,7 +248,7 @@ pub fn sys_mount(
         _ => KernelError::BadAddress,
     };
     let fstype = if !fstype_ptr.is_null() {
-        match strncpy_from_user_str::<Uaccess>(fstype_ptr.addr(), PATH_MAX) {
+        match strncpy_from_user_str(fstype_ptr.addr(), PATH_MAX) {
             Ok(s) => s,
             Err(UaccessError::Encoding) => return Err(KernelError::NoDevice),
             Err(e) => return Err(too_long(e)),
@@ -260,13 +257,13 @@ pub fn sys_mount(
         Default::default()
     };
     let source = if !source_ptr.is_null() {
-        strncpy_from_user::<Uaccess>(source_ptr.addr(), PATH_MAX).map_err(too_long)?
+        strncpy_from_user(source_ptr.addr(), PATH_MAX).map_err(too_long)?
     } else {
         Default::default()
     };
     // Linux copy_mount_options: the options string, within a page
     let data = if !data_ptr.is_null() {
-        strncpy_from_user::<Uaccess>(data_ptr.addr(), 4096).map_err(too_long)?
+        strncpy_from_user(data_ptr.addr(), 4096).map_err(too_long)?
     } else {
         Default::default()
     };
@@ -540,7 +537,7 @@ fn xattr_err(e: KernelError) -> KernelError {
 /// An xattr name: any copy failure is EFAULT, an empty or too long
 /// name ERANGE (BUGS.md: Linux import_xattr_name)
 fn xattr_name(ptr: UserPtr<u8>) -> KernelResult<String> {
-    let name = strncpy_from_user_str::<Uaccess>(ptr.addr(), XATTR_NAME_MAX + 1)
+    let name = strncpy_from_user_str(ptr.addr(), XATTR_NAME_MAX + 1)
         .map_err(|_| KernelError::BadAddress)?;
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
         return Err(KernelError::Range);
@@ -570,13 +567,13 @@ fn copy_xattr_value_from_user(value_ptr: UserPtr<u8>, size: u64) -> KernelResult
     }
 
     // Validate user buffer (EFAULT before ENOMEM)
-    if !Uaccess::access_ok(value_ptr.addr(), size as usize) {
+    if !access_ok(value_ptr.addr(), size as usize) {
         return Err(KernelError::BadAddress);
     }
 
     // Allocate (ENOMEM, Linux kvmalloc) and copy value from user space
     let mut value = crate::util::kmem::try_vec(size as usize, 0u8)?;
-    copy_from_user::<Uaccess>(&mut value, value_ptr.addr(), size as usize)?;
+    copy_from_user(&mut value, value_ptr.addr(), size as usize)?;
     Ok(value)
 }
 
@@ -685,7 +682,7 @@ fn getxattr_inode(
     // A larger buffer is clamped (Linux do_getxattr): no value is longer
     let size = size.min(XATTR_SIZE_MAX as u64) as usize;
     // EFAULT before ENOMEM
-    if !Uaccess::access_ok(value_ptr.addr(), size) {
+    if !access_ok(value_ptr.addr(), size) {
         return Err(KernelError::BadAddress);
     }
     // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
@@ -694,7 +691,7 @@ fn getxattr_inode(
         .i_op
         .getxattr(inode, name, &mut value)
         .map_err(xattr_err)?;
-    copy_to_user::<Uaccess>(value_ptr.addr(), &value[..n])?;
+    copy_to_user(value_ptr.addr(), &value[..n])?;
     Ok(n)
 }
 
@@ -762,13 +759,13 @@ fn listxattr_inode(inode: &Arc<Inode>, list_ptr: UserPtr<u8>, size: u64) -> Kern
         return inode.i_op.listxattr(inode, &mut []).map_err(xattr_err);
     }
     // EFAULT before ENOMEM
-    if !Uaccess::access_ok(list_ptr.addr(), size as usize) {
+    if !access_ok(list_ptr.addr(), size as usize) {
         return Err(KernelError::BadAddress);
     }
     // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer
     let mut list = crate::util::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8)?;
     let n = inode.i_op.listxattr(inode, &mut list).map_err(xattr_err)?;
-    copy_to_user::<Uaccess>(list_ptr.addr(), &list[..n])?;
+    copy_to_user(list_ptr.addr(), &list[..n])?;
     Ok(n)
 }
 

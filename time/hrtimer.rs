@@ -35,8 +35,8 @@ use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use crate::arch::{IrqSpinlock, IrqSpinlockGuard};
 use crate::cpu::PerCpu;
+use crate::sync::{IrqSpinlock, IrqSpinlockGuard};
 use crate::task::percpu::TICK_NS;
 use crate::util::list::{Link, List};
 
@@ -160,7 +160,7 @@ impl HrTimer {
     pub fn start(self: Pin<&Self>, expires: u64, clock: HrClock) -> bool {
         // Interrupts off: no migration or timer interrupt between
         // queueing and programming this CPU's clock event
-        let flags = crate::arch::local_irq_save();
+        let flags = crate::sync::local_irq_save();
         self.home();
         let (mut base, mut q) = self.lock_base().expect("hrtimer: no base");
         let was = q.detach(&self);
@@ -187,7 +187,7 @@ impl HrTimer {
         if crate::cpu::try_this_id() == Some(cpu) {
             reprogram(cpu);
         }
-        crate::arch::local_irq_restore(flags);
+        crate::sync::local_irq_restore(flags);
         was
     }
 
@@ -456,10 +456,10 @@ pub fn soft_due(cpu: u32) -> bool {
 /// again (Linux hrtimer_run_softirq)
 pub fn run_soft(cpu: u32) {
     BASES.get(cpu)[1].run();
-    let flags = crate::arch::local_irq_save();
+    let flags = crate::sync::local_irq_save();
     SOFT_ACTIVATED.get(cpu).store(false, Ordering::Relaxed);
     reprogram(cpu);
-    crate::arch::local_irq_restore(flags);
+    crate::sync::local_irq_restore(flags);
 }
 
 /// Sleep until woken or `deadline` ns on `clock` passes (Linux
