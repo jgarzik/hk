@@ -9,8 +9,8 @@ use crate::fs::{
 
 use super::file::flags::AT_FDCWD;
 use super::flags::{
-    __O_TMPFILE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR,
-    O_TRUNC,
+    __O_SYNC, __O_TMPFILE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_DSYNC, O_EXCL,
+    O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC, VALID_OPEN_FLAGS,
 };
 use super::mount::MNT_NODEV;
 use super::syscall::{current_fd_table, get_nofile_limit};
@@ -58,22 +58,107 @@ pub fn sys_open(path: UserPtr<u8>, flags: u32, mode: u32) -> KernelResult<i32> {
     sys_openat(AT_FDCWD, path, flags, mode)
 }
 
+/// Permission bits a new file may get (Linux S_IALLUGO)
+const S_IALLUGO: u64 = 0o7777;
+
+/// An open's request (Linux struct open_how, include/uapi/linux/openat2.h)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenHow {
+    pub flags: u64,
+    pub mode: u64,
+    pub resolve: u64,
+}
+
+/// What an open does (Linux struct open_flags, fs/internal.h)
+pub struct OpenFlags {
+    /// The new file's f_flags before do_dentry_open's strip (O_CLOEXEC
+    /// is the descriptor's, not the file's)
+    flags: u32,
+    /// Permission bits of a file this open creates
+    mode: u32,
+    /// MAY_* the open asks of an existing file
+    acc: u32,
+    lookup: LookupFlags,
+}
+
+/// The request of open(2)/openat(2) (Linux build_open_how): unknown
+/// flags are dropped, the mode counts only for a create
+pub fn build_open_how(flags: u32, mode: u32) -> OpenHow {
+    let flags = flags & VALID_OPEN_FLAGS;
+    let mode = if will_create(flags) {
+        u64::from(mode) & S_IALLUGO
+    } else {
+        0
+    };
+    OpenHow {
+        flags: u64::from(flags),
+        mode,
+        resolve: 0,
+    }
+}
+
+/// O_CREAT or O_TMPFILE: the open may make a file (Linux WILL_CREATE)
+fn will_create(flags: u32) -> bool {
+    flags & (O_CREAT | __O_TMPFILE) != 0
+}
+
+/// MAY_* of an access mode (Linux ACC_MODE)
+fn acc_bits(flags: u32) -> u32 {
+    dac::acc_mode(flags & O_ACCMODE)
+}
+
+/// Check `how` and work out the open (Linux build_open_flags)
+pub fn build_open_flags(how: &OpenHow) -> Result<OpenFlags, KernelError> {
+    let flags = how.flags & !u64::from(O_CLOEXEC);
+    let mut flags = u32::try_from(flags)
+        .ok()
+        .filter(|f| f & !VALID_OPEN_FLAGS == 0)
+        .ok_or(KernelError::InvalidArgument)?;
+    let mode = if will_create(flags) {
+        if how.mode & !S_IALLUGO != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        how.mode as u32 // S_IALLUGO bits: lossless
+    } else if how.mode != 0 {
+        return Err(KernelError::InvalidArgument);
+    } else {
+        0
+    };
+    if flags & (O_DIRECTORY | O_CREAT) == O_DIRECTORY | O_CREAT {
+        return Err(KernelError::InvalidArgument);
+    }
+    if flags & __O_TMPFILE != 0
+        && (flags & O_DIRECTORY == 0 || acc_bits(flags) & dac::MAY_WRITE == 0)
+    {
+        return Err(KernelError::InvalidArgument);
+    }
+    // O_SYNC is __O_SYNC|O_DSYNC: syncing code looks at O_DSYNC only
+    if flags & __O_SYNC != 0 {
+        flags |= O_DSYNC;
+    }
+    Ok(OpenFlags {
+        flags,
+        mode,
+        acc: dac::acc_mode(flags),
+        lookup: open_lookup(flags),
+    })
+}
+
+/// The walk of an open (Linux build_open_flags' lookup_flags):
+/// O_CREAT|O_EXCL never follows a final symlink (it is EEXIST)
+fn open_lookup(flags: u32) -> LookupFlags {
+    let excl = flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL;
+    LookupFlags {
+        directory: flags & O_DIRECTORY != 0,
+        follow: flags & O_NOFOLLOW == 0 && !excl,
+        ..LookupFlags::default()
+    }
+}
+
 /// Resolve the open target: an existing file, or (O_CREAT) a newly
 /// created one; the bool says it was created by this call
-fn open_target(
-    dirfd: i32,
-    path: &[u8],
-    flags: u32,
-    mode: u32,
-) -> Result<(Path, bool), KernelError> {
-    let mut lf = LookupFlags::open();
-    if flags & O_DIRECTORY != 0 {
-        lf.directory = true;
-    }
-    // O_CREAT|O_EXCL never follows a final symlink (it is EEXIST)
-    if flags & O_NOFOLLOW != 0 || flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL {
-        lf.follow = false;
-    }
+fn open_target(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), KernelError> {
+    let (flags, lf) = (op.flags, op.lookup);
     if flags & O_CREAT == 0 {
         return Ok((filename_lookup(dirfd, path, lf)?, false));
     }
@@ -95,7 +180,7 @@ fn open_target(
     let (d, created) = match path_lookupat(Some(dir), &p.name, lf) {
         Ok(d) => (d, false),
         Err(KernelError::NotFound) => {
-            let (d, c) = create_in(&p.mnt, &p.dir, &p.name, mode)?;
+            let (d, c) = create_in(&p.mnt, &p.dir, &p.name, op.mode)?;
             (Path::new(p.mnt.clone(), d), c)
         }
         Err(e) => return Err(e),
@@ -118,6 +203,7 @@ fn open_target(
 }
 
 /// sys_openat - open a file relative to a directory file descriptor
+/// (64-bit: every file is O_LARGEFILE, Linux force_o_largefile)
 ///
 /// # Arguments
 /// * `dirfd` - Directory file descriptor, or AT_FDCWD for current directory
@@ -128,11 +214,17 @@ fn open_target(
 /// # Returns
 /// The new file descriptor
 pub fn sys_openat(dirfd: i32, path_ptr: UserPtr<u8>, flags: u32, mode: u32) -> KernelResult<i32> {
-    let path = getname(path_ptr, false)?;
-    let file = filp_open(dirfd, &path, flags, mode)?;
+    do_sys_openat2(dirfd, path_ptr, &build_open_how(flags | O_LARGEFILE, mode))
+}
 
-    // Allocate file descriptor (RLIMIT_NOFILE enforced inside alloc)
-    let fd_flags = if flags & O_CLOEXEC != 0 {
+/// Open as `how` asks and install the file (Linux do_sys_openat2): the
+/// request is checked before the name is copied in
+fn do_sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: &OpenHow) -> KernelResult<i32> {
+    let op = build_open_flags(how)?;
+    let path = getname(path_ptr, false)?;
+    let file = filp_open(dirfd, &path, &op)?;
+    // RLIMIT_NOFILE enforced inside alloc
+    let fd_flags = if how.flags & u64::from(O_CLOEXEC) != 0 {
         FD_CLOEXEC
     } else {
         0
@@ -142,40 +234,25 @@ pub fn sys_openat(dirfd: i32, path_ptr: UserPtr<u8>, flags: u32, mode: u32) -> K
         .alloc_with_flags(file, fd_flags, get_nofile_limit())
 }
 
-/// The open flag checks of Linux build_open_flags that hk makes:
-/// O_DIRECTORY with O_CREAT is EINVAL, and __O_TMPFILE needs
-/// O_DIRECTORY and write access
-fn check_flags(flags: u32) -> Result<(), KernelError> {
-    if flags & (O_DIRECTORY | O_CREAT) == O_DIRECTORY | O_CREAT {
-        return Err(KernelError::InvalidArgument);
-    }
-    if flags & __O_TMPFILE != 0
-        && (flags & O_DIRECTORY == 0 || dac::acc_mode(flags & O_ACCMODE) & dac::MAY_WRITE == 0)
-    {
-        return Err(KernelError::InvalidArgument);
-    }
-    Ok(())
-}
-
 /// O_TMPFILE (Linux do_tmpfile, vfs_tmpfile): an unnamed regular file in
 /// the directory `path`; ENOTDIR or ENOENT from the walk, EROFS, then
 /// write and search on the directory (EACCES), EOPNOTSUPP from a file
 /// system without tmpfile. Linkable unless O_EXCL.
-fn tmpfile_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>, KernelError> {
+fn tmpfile_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, KernelError> {
     let lf = LookupFlags {
         directory: true,
-        ..LookupFlags::open()
+        ..op.lookup
     };
     let dir = filename_lookup(dirfd, path, lf)?;
     let dir_inode = dir.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let w = dir.mnt.want_write()?;
     let c = dac::cred();
     dac::may_create(&c, &dir_inode)?;
-    let perm = dac::create_mode(&c, &dir_inode, (mode & 0o7777) as u16);
+    let perm = dac::create_mode(&c, &dir_inode, (op.mode & 0o7777) as u16);
     let inode = dir_inode
         .i_op
         .tmpfile(&dir_inode, InodeMode::regular(perm))?;
-    if flags & O_EXCL == 0 {
+    if op.flags & O_EXCL == 0 {
         inode
             .i_linkable
             .store(true, core::sync::atomic::Ordering::Relaxed);
@@ -186,21 +263,28 @@ fn tmpfile_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<Fi
         .superblock()
         .map(|sb| sb.fs_type.file_ops)
         .unwrap_or(&RAMFS_FILE_OPS);
-    let mut file = File::new(dentry, Some(dir.mnt.clone()), flags, f_op);
+    let mut file = File::new(dentry, Some(dir.mnt.clone()), op.flags, f_op);
     file.write_access = Some(w);
     file.i_write = Some(iw);
-    f_op.open(&file)?;
+    dentry_open(file)
+}
+
+/// The end of an open (Linux do_dentry_open): `->open`, then the flags
+/// that only steered the open leave f_flags
+fn dentry_open(mut file: File) -> Result<Arc<File>, KernelError> {
+    file.f_op.open(&file)?;
+    file.clear_flags(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
     try_arc(file)
 }
 
 /// Open `path` (relative to `start`) as a new file (Linux do_filp_open):
 /// resolve or create the target, may_open, O_TRUNC, then the file object
-fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>, KernelError> {
-    check_flags(flags)?;
+fn filp_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, KernelError> {
+    let flags = op.flags;
     if flags & __O_TMPFILE != 0 {
-        return tmpfile_open(dirfd, path, flags, mode);
+        return tmpfile_open(dirfd, path, op);
     }
-    let (path, created) = open_target(dirfd, path, flags, mode)?;
+    let (path, created) = open_target(dirfd, path, op)?;
     let dentry = path.dentry.clone();
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
 
@@ -211,7 +295,7 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
     }
 
     // O_NOFOLLOW on a trailing symlink: ELOOP (may_open's symlink case)
-    let acc = if created { 0 } else { dac::acc_mode(flags) };
+    let acc = if created { 0 } else { op.acc };
     dac::may_open(&dac::cred(), &inode, acc, flags)?;
 
     // A socket inode cannot be opened (Linux no_open_fops): ENXIO
@@ -273,14 +357,14 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
         file.write_access = w;
         file.i_write = iw;
     }
-    f_op.open(&file)?;
-    try_arc(file)
+    dentry_open(file)
 }
 
 /// Give init /dev/console as stdin, stdout and stderr (Linux
 /// console_on_rootfs); call in init's context before it runs
 pub fn console_on_rootfs() {
-    let Ok(file) = filp_open(AT_FDCWD, b"/dev/console", O_RDWR, 0) else {
+    let op = build_open_flags(&build_open_how(O_RDWR, 0));
+    let Ok(file) = op.and_then(|op| filp_open(AT_FDCWD, b"/dev/console", &op)) else {
         crate::printkln!("Warning: unable to open an initial console.");
         return;
     };

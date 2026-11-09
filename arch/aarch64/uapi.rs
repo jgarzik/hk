@@ -96,6 +96,8 @@ pub const O_DIRECTORY: u32 = 0o40000;
 /// Large-file offsets (always on 64-bit; Linux sets it on every open
 /// file, force_o_largefile)
 pub const O_LARGEFILE: u32 = 0o400000;
+/// Direct I/O, bypassing the page cache
+pub const O_DIRECT: u32 = 0o200000;
 /// Don't follow a trailing symlink
 pub const O_NOFOLLOW: u32 = 0o100000;
 

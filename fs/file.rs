@@ -52,12 +52,36 @@ pub mod flags {
     /// Asynchronous I/O (generate SIGIO)
     pub const O_ASYNC: u32 = 0o20000;
     /// Must be a directory / don't follow symlinks (values differ per arch)
-    pub use crate::arch::uapi::{O_DIRECTORY, O_LARGEFILE, O_NOFOLLOW};
+    pub use crate::arch::uapi::{O_DIRECT, O_DIRECTORY, O_LARGEFILE, O_NOFOLLOW};
+    /// Don't update the access time
+    pub const O_NOATIME: u32 = 0o1000000;
     /// Close on exec
     pub const O_CLOEXEC: u32 = 0o2000000;
+    /// File integrity sync (O_SYNC is it with O_DSYNC)
+    pub const __O_SYNC: u32 = 0o4000000;
     /// An unnamed file in the directory named (asm-generic __O_TMPFILE;
     /// O_TMPFILE is it with O_DIRECTORY)
     pub const __O_TMPFILE: u32 = 0o20000000;
+
+    /// Every flag open(2) knows (Linux VALID_OPEN_FLAGS; O_NDELAY is
+    /// O_NONBLOCK); the old calls drop the rest
+    pub const VALID_OPEN_FLAGS: u32 = O_ACCMODE
+        | O_CREAT
+        | O_EXCL
+        | O_NOCTTY
+        | O_TRUNC
+        | O_APPEND
+        | O_NONBLOCK
+        | __O_SYNC
+        | O_DSYNC
+        | O_ASYNC
+        | O_DIRECT
+        | O_LARGEFILE
+        | O_DIRECTORY
+        | O_NOFOLLOW
+        | O_NOATIME
+        | O_CLOEXEC
+        | __O_TMPFILE;
 
     /// The *at() calls' dirfd for the current directory
     pub const AT_FDCWD: i32 = -100;
@@ -512,6 +536,12 @@ impl File {
     /// Advance file position by n bytes
     pub fn advance_pos(&self, n: u64) -> u64 {
         self.pos.fetch_add(n, Ordering::Relaxed)
+    }
+
+    /// Drop open-only flags before the file is shared (Linux
+    /// do_dentry_open's f_flags strip)
+    pub fn clear_flags(&mut self, f: u32) {
+        *self.f_lock.get_mut() &= !f;
     }
 
     /// Get current flags

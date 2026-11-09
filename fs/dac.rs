@@ -34,8 +34,7 @@ pub const MAY_OPEN: u32 = 32;
 /// Permission mask: check comes from chdir()
 pub const MAY_CHDIR: u32 = 64;
 
-/// O_NOATIME (same value on every arch)
-pub const O_NOATIME: u32 = 0o1000000;
+pub use super::file::flags::O_NOATIME;
 
 const S_ISUID: u16 = 0o4000;
 const S_ISGID: u16 = 0o2000;
