@@ -347,14 +347,14 @@ pub fn sys_waitid(
     rusage: UserPtr<Rusage>,
 ) -> KernelResult<i64> {
     use super::wait_options::{P_ALL, P_PGID, P_PID, P_PIDFD, WEXITED, WNOHANG};
-    use crate::arch::Uaccess;
+
     use crate::signal::si_code;
-    use crate::uaccess::UaccessArch;
+    use crate::uaccess::access_ok;
 
     let current_pid = super::percpu::current_pid();
 
     // Validate infop pointer if non-null
-    if !infop.is_null() && !Uaccess::access_ok(infop.addr(), WAITID_INFO) {
+    if !infop.is_null() && !access_ok(infop.addr(), WAITID_INFO) {
         return Err(KernelError::BadAddress);
     }
 

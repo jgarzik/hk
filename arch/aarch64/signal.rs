@@ -25,7 +25,7 @@
 use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, sa_flags};
-use crate::uaccess::{UaccessArch, copy_to_user};
+use crate::uaccess::{access_ok, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::{FromBytes, IntoBytes};
 
@@ -310,7 +310,7 @@ pub fn setup_rt_frame(
     };
 
     // Validate user stack address
-    if !Uaccess::access_ok(frame_addr, (record_addr + 16 - frame_addr) as usize) {
+    if !access_ok(frame_addr, (record_addr + 16 - frame_addr) as usize) {
         return Err(KernelError::BadAddress);
     }
 
@@ -457,7 +457,7 @@ pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     let Some(end) = frame_addr.checked_add(signal_frame_size() as u64) else {
         return Err(crate::signal::sigreturn_badframe());
     };
-    if !Uaccess::access_ok(frame_addr, (end - frame_addr) as usize) {
+    if !access_ok(frame_addr, (end - frame_addr) as usize) {
         return Err(crate::signal::sigreturn_badframe());
     }
 

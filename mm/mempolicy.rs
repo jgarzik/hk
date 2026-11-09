@@ -5,7 +5,7 @@
 
 use crate::arch::Uaccess;
 use crate::mm::numa::NUMA_TOPOLOGY;
-use crate::uaccess::{UaccessArch, UserPtr, copy_to_user};
+use crate::uaccess::{UserPtr, access_ok, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 
 // ============================================================================
@@ -385,7 +385,7 @@ pub fn sys_migrate_pages(
 
     // Validate and read old_nodes if provided
     if !old_nodes.is_null() {
-        if !Uaccess::access_ok(old_nodes.addr(), mask_bytes as usize) {
+        if !access_ok(old_nodes.addr(), mask_bytes as usize) {
             return Err(KernelError::BadAddress);
         }
         old_nodes.read()?;
@@ -394,7 +394,7 @@ pub fn sys_migrate_pages(
     // Validate and read new_nodes if provided; NULL is an empty mask
     let mut new_mask: u64 = 0;
     if !new_nodes.is_null() {
-        if !Uaccess::access_ok(new_nodes.addr(), mask_bytes as usize) {
+        if !access_ok(new_nodes.addr(), mask_bytes as usize) {
             return Err(KernelError::BadAddress);
         }
         new_mask = new_nodes.read()?;
@@ -467,7 +467,7 @@ pub fn sys_move_pages(
     let array_ok = |ptr: u64, elem: u64| {
         nr_pages
             .checked_mul(elem)
-            .is_some_and(|size| ptr != 0 && Uaccess::access_ok(ptr, size as usize))
+            .is_some_and(|size| ptr != 0 && access_ok(ptr, size as usize))
     };
     if !array_ok(pages.addr(), 8) || !array_ok(status.addr(), 4) {
         return Err(KernelError::BadAddress);

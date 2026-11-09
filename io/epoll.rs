@@ -36,7 +36,7 @@ use alloc::vec::Vec;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::arch::{IrqSpinlock, Uaccess};
+use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::io::fget;
@@ -46,7 +46,7 @@ use crate::sync::waitqueue::{WaitEntry, WaitQueue};
 use crate::task::Fd;
 use crate::task::percpu::WakeMode;
 use crate::time::Deadline;
-use crate::uaccess::{UaccessArch, UserPtr};
+use crate::uaccess::{UserPtr, access_ok};
 use crate::util::error::KernelResult;
 use crate::util::list::{ArcList, Link};
 
@@ -860,7 +860,7 @@ fn do_epoll_wait(
     if max == 0 || max > EP_MAX_EVENTS {
         return Err(KernelError::InvalidArgument);
     }
-    if !Uaccess::access_ok(events_ptr.addr(), max * size) {
+    if !access_ok(events_ptr.addr(), max * size) {
         return Err(KernelError::BadAddress);
     }
     let ep_file = fget(epfd)?;

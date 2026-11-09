@@ -6,7 +6,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::File;
-use crate::uaccess::UserPtr;
+use crate::uaccess::{UserPtr, access_ok};
 
 use super::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK,
@@ -1567,17 +1567,15 @@ fn move_mapping(
 /// # Returns
 /// 0 on success, negative errno on failure
 pub fn sys_mincore(addr: u64, length: u64, vec: UserPtr<u8>) -> KernelResult<()> {
-    use crate::uaccess::UaccessArch;
-    type U = crate::arch::Uaccess;
     if addr & (PAGE_SIZE - 1) != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    if !U::access_ok(addr, length as usize) {
+    if !access_ok(addr, length as usize) {
         return Err(KernelError::OutOfMemory);
     }
     // No overflow: the range is inside user space
     let pages = length.div_ceil(PAGE_SIZE);
-    if !U::access_ok(vec.addr(), pages as usize) {
+    if !access_ok(vec.addr(), pages as usize) {
         return Err(KernelError::BadAddress);
     }
     let mm = crate::task::percpu::current()

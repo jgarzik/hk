@@ -12,9 +12,7 @@ use alloc::vec::Vec;
 
 use crate::arch::Uaccess;
 use crate::fs::{Inode, KernelError, LookupFlags, lookup_path_flags};
-use crate::uaccess::{
-    UaccessArch, UserPtr, copy_to_user, strncpy_from_user, strncpy_from_user_str,
-};
+use crate::uaccess::{UserPtr, access_ok, copy_to_user, strncpy_from_user, strncpy_from_user_str};
 use crate::util::error::KernelResult;
 
 use super::io::fget;
@@ -570,7 +568,7 @@ fn copy_xattr_value_from_user(value_ptr: UserPtr<u8>, size: u64) -> KernelResult
     }
 
     // Validate user buffer (EFAULT before ENOMEM)
-    if !Uaccess::access_ok(value_ptr.addr(), size as usize) {
+    if !access_ok(value_ptr.addr(), size as usize) {
         return Err(KernelError::BadAddress);
     }
 
@@ -685,7 +683,7 @@ fn getxattr_inode(
     // A larger buffer is clamped (Linux do_getxattr): no value is longer
     let size = size.min(XATTR_SIZE_MAX as u64) as usize;
     // EFAULT before ENOMEM
-    if !Uaccess::access_ok(value_ptr.addr(), size) {
+    if !access_ok(value_ptr.addr(), size) {
         return Err(KernelError::BadAddress);
     }
     // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
@@ -762,7 +760,7 @@ fn listxattr_inode(inode: &Arc<Inode>, list_ptr: UserPtr<u8>, size: u64) -> Kern
         return inode.i_op.listxattr(inode, &mut []).map_err(xattr_err);
     }
     // EFAULT before ENOMEM
-    if !Uaccess::access_ok(list_ptr.addr(), size as usize) {
+    if !access_ok(list_ptr.addr(), size as usize) {
         return Err(KernelError::BadAddress);
     }
     // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer

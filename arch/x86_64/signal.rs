@@ -15,7 +15,7 @@
 use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, sa_flags};
-use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
+use crate::uaccess::{access_ok, copy_from_user, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::{FromBytes, IntoBytes};
 
@@ -287,7 +287,7 @@ pub fn setup_rt_frame(
     let total = (fpstate_addr + fp_size as u64 - frame_addr) as usize;
 
     // Validate user stack address
-    if !Uaccess::access_ok(frame_addr, total) {
+    if !access_ok(frame_addr, total) {
         return Err(KernelError::BadAddress);
     }
 

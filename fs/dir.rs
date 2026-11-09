@@ -1,6 +1,5 @@
 //! Directory syscalls (getdents, getdents64, mkdir, mkdirat, rmdir, mknod, mknodat)
 
-use crate::arch::Uaccess;
 use crate::fs::namei::{
     Last, create_entry, delete_entry, filename_create, filename_parentat, getname,
 };
@@ -8,7 +7,7 @@ use alloc::vec::Vec;
 
 use crate::fs::{DevId, DirContext, DirEntry, FileType, InodeMode, KernelError, dac};
 use crate::task::CAP_MKNOD;
-use crate::uaccess::{UaccessArch, UserPtr, UserSlice};
+use crate::uaccess::{UserPtr, UserSlice, access_ok};
 use crate::util::error::KernelResult;
 
 use super::file::flags::AT_FDCWD;
@@ -114,7 +113,7 @@ fn getdents(fd: i32, dirp: UserPtr<u8>, count: u64, fmt: Fmt) -> KernelResult<us
     // count is an unsigned int (Linux getdents64): the high bits of the
     // register are not part of it
     let count = core::cmp::min(count as u32 as usize, MAX_RW_COUNT);
-    if !Uaccess::access_ok(dirp.addr(), count) {
+    if !access_ok(dirp.addr(), count) {
         return Err(KernelError::BadAddress);
     }
     let file = fget(fd)?;

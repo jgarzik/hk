@@ -15,7 +15,7 @@ use crate::mm::MmRef;
 use crate::mm::remote::{access_remote_vm_read, access_remote_vm_write};
 use crate::task::percpu::current;
 use crate::task::{Pid, Task};
-use crate::uaccess::{UaccessArch, UserPtr, UserSlice, copy_from_user, copy_to_user};
+use crate::uaccess::{UserPtr, UserSlice, access_ok, copy_from_user, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 
 /// Bytes copied per step: the bounce buffer stays small whatever the
@@ -93,7 +93,7 @@ fn remote_iovecs(uvec: UserPtr<IoVec>, n: u64) -> KernelResult<Vec<IoVec>> {
         .filter(|&n| n <= IOV_MAX)
         .ok_or(KernelError::InvalidArgument)?;
     let size = n * core::mem::size_of::<IoVec>();
-    if !Uaccess::access_ok(uvec.addr(), size) {
+    if !access_ok(uvec.addr(), size) {
         return Err(KernelError::BadAddress);
     }
     let mut v = crate::util::kmem::try_vec(n, IoVec::default())?;

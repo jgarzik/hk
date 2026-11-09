@@ -150,6 +150,19 @@ pub trait UaccessArch {
     unsafe fn user_access_end();
 }
 
+/// The uaccess implementation: the architecture's; host unit tests copy
+/// through host memory instead
+#[cfg(not(test))]
+use crate::arch::Uaccess as Arch;
+#[cfg(test)]
+use HostUaccess as Arch;
+
+/// Linux access_ok: [addr, addr + size) lies in user space
+#[inline]
+pub fn access_ok(addr: u64, size: usize) -> bool {
+    Arch::access_ok(addr, size)
+}
+
 /// Copy data from kernel space to user space
 ///
 /// # Arguments

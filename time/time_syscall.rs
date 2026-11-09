@@ -5,10 +5,9 @@
 //! All syscalls that access user memory use the uaccess primitives from
 //! crate::uaccess to ensure proper validation and SMAP protection.
 
-use crate::arch::Uaccess;
 use crate::time::hrtimer::HrClock;
 use crate::time::{ClockId, STA_NANO, STA_UNSYNC, TIMEKEEPER};
-use crate::uaccess::{UaccessArch, UserPtr};
+use crate::uaccess::{UserPtr, access_ok};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::FromBytes;
 
@@ -289,7 +288,7 @@ pub fn sys_clock_gettime(clockid: i32, tp: UserPtr<LinuxTimespec>) -> KernelResu
 
 /// `p` is non-NULL and in user space (checked ahead of other errors)
 fn user_ok<T>(p: UserPtr<T>) -> bool {
-    !p.is_null() && Uaccess::access_ok(p.addr(), core::mem::size_of::<T>())
+    !p.is_null() && access_ok(p.addr(), core::mem::size_of::<T>())
 }
 
 /// gettimeofday(tv, tz): either may be NULL; the timezone reads as
@@ -444,7 +443,7 @@ pub fn sys_settimeofday(tv: UserPtr<Timeval>, tz: UserPtr<Timezone>) -> KernelRe
     };
     // Linux copies the timezone, then checks CAP_SYS_TIME
     // (security_settime64), even for a timezone-only (or empty) call
-    if !tz.is_null() && !Uaccess::access_ok(tz.addr(), core::mem::size_of::<Timezone>()) {
+    if !tz.is_null() && !access_ok(tz.addr(), core::mem::size_of::<Timezone>()) {
         return Err(KernelError::BadAddress);
     }
     if !crate::task::capable(crate::task::CAP_SYS_TIME) {
