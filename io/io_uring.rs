@@ -596,11 +596,12 @@ impl IoUring {
     /// (EINVAL)
     fn rw_file(&self, sqe: &IoUringSqe, write: bool) -> KernelResult<Arc<File>> {
         let file = self.sqe_file(sqe)?;
-        if !(if write {
+        let ok = if write {
             file.is_writable()
         } else {
             file.is_readable()
-        }) {
+        };
+        if !ok {
             return Err(KernelError::BadFd);
         }
         if sqe.addr == 0 || sqe.len == 0 {
