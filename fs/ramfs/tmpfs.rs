@@ -42,6 +42,18 @@ fn totalram_pages() -> u64 {
     return 1 << 20;
 }
 
+/// The mounter's fsuid and fsgid, the root's owner by default (Linux
+/// shmem_init_fs_context: current_fsuid, current_fsgid)
+fn fs_ids() -> (Uid, Gid) {
+    #[cfg(not(test))]
+    {
+        let c = crate::task::current_cred();
+        (c.fsuid, c.fsgid)
+    }
+    #[cfg(test)]
+    (0, 0)
+}
+
 /// Linux shmem_default_max_blocks: half of RAM
 fn default_blocks() -> u64 {
     totalram_pages() / 2
@@ -146,8 +158,8 @@ impl ShmemSb {
             max_inodes: AtomicU64::new(inodes),
             ispace: try_arc(AtomicU64::new(inodes * BOGO_INODE_SIZE))?,
             mode: o.mode.unwrap_or(0o1777),
-            uid: o.uid.unwrap_or(0),
-            gid: o.gid.unwrap_or(0),
+            uid: o.uid.unwrap_or(fs_ids().0),
+            gid: o.gid.unwrap_or(fs_ids().1),
             inode64: AtomicBool::new(o.inode64.unwrap_or(true)),
             noswap: AtomicBool::new(o.noswap),
         })

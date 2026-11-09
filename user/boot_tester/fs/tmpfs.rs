@@ -12,6 +12,8 @@
 //!   fits
 //! - TMPFS_DEFAULTS: a plain mount gets half of RAM (no size= shown),
 //!   size=0,nr_inodes=0 is unlimited (statfs zeros), bad options EINVAL
+//! - TMPFS_OWNER: without uid=/gid= the root belongs to the mounter's
+//!   fsuid/fsgid (Linux shmem_init_fs_context), shown in /proc/mounts
 //! - ROOTFS_TMPFS: the initramfs root is tmpfs (Linux rootfs with
 //!   CONFIG_TMPFS and no root=) limited to about half of RAM (Linux
 //!   sizes it before the initrd and init memory are freed); ramfs, which
@@ -55,6 +57,7 @@ pub fn run_tests() {
     limits();
     remount();
     defaults();
+    owner();
     rootfs();
     devtmpfs();
     tmpfile();
@@ -571,5 +574,37 @@ fn falloc() {
     sys_close(fd as u64);
     sys_unlink(b"/tmp/tmpfs_lim/f\0".as_ptr());
     t.eq(b"umount", sys_umount2(MP.as_ptr(), 0), 0);
+    t.done();
+}
+
+fn owner() {
+    let mut t = T::new(b"TMPFS_OWNER");
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        hk_syscall::sys_setfsgid(5678);
+        hk_syscall::sys_setfsuid(1234);
+        let code = if mount(b"\0") != 0 {
+            1
+        } else {
+            let mut s = Stat::default();
+            sys_stat(MP.as_ptr(), &mut s);
+            let mut m = [0u8; 8192];
+            let n = read_file(b"/proc/mounts\0", &mut m).max(0) as usize;
+            let want = b"tmpfs /tmp/tmpfs_lim tmpfs rw,relatime,uid=1234,gid=5678,inode64";
+            let c = if s.st_uid != 1234 || s.st_gid != 5678 {
+                2
+            } else if !contains(&m[..n], want) {
+                3
+            } else {
+                0
+            };
+            sys_umount2(MP.as_ptr(), 0);
+            c
+        };
+        hk_syscall::sys_exit(code);
+    }
+    let mut st = 0i32;
+    hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+    t.eq(b"child", i64::from((st >> 8) & 0xff), 0);
     t.done();
 }
