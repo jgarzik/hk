@@ -170,6 +170,14 @@ pub trait InodeOps: Send + Sync {
         true
     }
 
+    /// `revalidate` needs the ref-walk (Linux d_revalidate's -ECHILD
+    /// under LOOKUP_RCU), so a RESOLVE_CACHED walk stops there (EAGAIN).
+    /// Default no; kernfs, and procfs outside its process directories,
+    /// say yes.
+    fn revalidate_blocks(&self, _inode: &Inode) -> bool {
+        false
+    }
+
     /// Access check for `mask` (MAY_* bits) by `cred` (Linux
     /// ->permission). Default: generic_permission (mode bits plus
     /// capability overrides); /proc/sys overrides it with sysctl_perm.
@@ -246,6 +254,14 @@ pub trait InodeOps: Send + Sync {
     fn readlink(&self, inode: &Inode) -> Result<alloc::vec::Vec<u8>, KernelError> {
         let _ = inode;
         Err(KernelError::OperationNotSupported)
+    }
+
+    /// Symlink `inode` is a magic link, one whose get_link jumps
+    /// (Linux nd_jump_link): RESOLVE_NO_MAGICLINKS refuses it (ELOOP), a
+    /// scoped walk never takes it (EXDEV). Default no; procfs's fd,
+    /// cwd, root, exe and namespace links are.
+    fn magic_link(&self, _inode: &Inode) -> bool {
+        false
     }
 
     /// Where symlink `inode` (on mount `mnt`) leads if it is a magic
@@ -778,13 +794,26 @@ impl Inode {
     /// for a directory), or relatime and the atime is newer than mtime
     /// and ctime and under a day old. Unlocked, as Linux.
     pub fn touch_atime(&self, mnt: &super::mount::Mount) {
+        if let Some(now) = self.atime_update(mnt) {
+            self.atime.set(now);
+        }
+    }
+
+    /// An access through `mnt` would change the atime (Linux
+    /// atime_needs_update)
+    pub fn atime_needs_update(&self, mnt: &super::mount::Mount) -> bool {
+        self.atime_update(mnt).is_some()
+    }
+
+    /// The new atime an access through `mnt` sets, if any
+    fn atime_update(&self, mnt: &super::mount::Mount) -> Option<Timespec> {
         use super::mount::{MNT_NOATIME, MNT_NODIRATIME, MNT_RELATIME};
         let f = mnt.flags();
         if f & MNT_NOATIME != 0
             || (f & MNT_NODIRATIME != 0 && self.mode().is_dir())
             || mnt.is_readonly()
         {
-            return;
+            return None;
         }
         let now = crate::time::TIMEKEEPER.current_time();
         let atime = self.atime();
@@ -794,9 +823,9 @@ impl Inode {
             || now.sec.wrapping_sub(atime.sec) >= 24 * 60 * 60;
         if (f & MNT_RELATIME != 0 && !relatime_ok) || (now.sec, now.nsec) == (atime.sec, atime.nsec)
         {
-            return;
+            return None;
         }
-        self.atime.set(now);
+        Some(now)
     }
 
     /// ctime becomes the current time (Linux inode_set_ctime_current).

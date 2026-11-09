@@ -140,6 +140,11 @@ impl InodeOps for KernfsIops {
         knode(inode).is_some_and(|kn| !kn.removed())
     }
 
+    /// kernfs_dop_revalidate is -ECHILD in an RCU walk
+    fn revalidate_blocks(&self, _inode: &Inode) -> bool {
+        true
+    }
+
     fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {
         let kn = knode(inode).ok_or(KernelError::Io)?;
         let Kind::Link(t) = &kn.kind else {

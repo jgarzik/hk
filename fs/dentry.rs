@@ -41,6 +41,22 @@ pub struct DentryFlags {
 /// any d_lock.
 static RENAME_LOCK: RwLock<()> = RwLock::new(());
 
+/// Moves under RENAME_LOCK's write side (Linux rename_lock's seqcount):
+/// a scoped walk (RESOLVE_BENEATH / RESOLVE_IN_ROOT) samples it at its
+/// start and gives up (EAGAIN) if a ".." raced a rename
+static RENAME_SEQ: crate::sync::SeqCount = crate::sync::SeqCount::new();
+
+/// Sample the rename sequence (Linux path_init's r_seq)
+pub fn rename_seq_begin() -> u32 {
+    RENAME_SEQ.read_begin()
+}
+
+/// A rename happened since `start` (Linux read_seqcount_retry on
+/// rename_lock)
+pub fn rename_seq_retry(start: u32) -> bool {
+    RENAME_SEQ.read_retry(start)
+}
+
 /// Dentries alive (/proc/sys/fs/dentry-state nr_dentry)
 static NR_DENTRY: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 
@@ -560,14 +576,16 @@ fn rehook(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: FileName) {
 /// identity, so whoever holds it (a cwd, an fd, a mountpoint) follows
 /// it. Callers hold both parents' i_rwsem.
 pub fn d_move(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: &[u8]) {
-    let _w = RENAME_LOCK.write();
+    let w = RENAME_LOCK.write();
+    let seq = RENAME_SEQ.write();
     unhook(d);
     let t = parent.d_lock.write().children.remove(name);
     if let Some(t) = &t {
         t.d_lock.write().flags.unhashed = true;
     }
     rehook(d, parent, name.into());
-    drop(_w);
+    drop(seq);
+    drop(w);
     if let Some(t) = t {
         d_drop_tree(&t);
     }
@@ -577,6 +595,7 @@ pub fn d_move(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: &[u8]) {
 /// the other's name and parent
 pub fn d_exchange(a: &Arc<Dentry>, b: &Arc<Dentry>) {
     let _w = RENAME_LOCK.write();
+    let _seq = RENAME_SEQ.write();
     let (Some((pa, na)), Some((pb, nb))) = (unhook(a), unhook(b)) else {
         return;
     };

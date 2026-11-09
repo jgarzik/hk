@@ -6,6 +6,10 @@
 //! permission for the caller (Linux may_lookup), including for "." and
 //! "..". Creating and removing calls split off the last component
 //! instead ([`filename_parentat`]).
+//!
+//! What stays fixed along one lookup, symlinks included, is its [`Nd`]
+//! (Linux struct nameidata): the root and, for openat2's RESOLVE_*
+//! restrictions, the scoped lookup's sequences.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -15,7 +19,7 @@ use super::dac::{MAY_EXEC, cred, permission_as};
 use super::dentry::Dentry;
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use super::inode::Inode;
-use super::mount::{Mount, follow_mount};
+use super::mount::{MOUNT_LOCK, Mount, follow_mount, is_path_reachable};
 use super::path_ref::Path;
 use crate::fs::syscall::PATH_MAX;
 use crate::ns::current_mnt_ns;
@@ -39,6 +43,16 @@ pub struct LookupFlags {
     /// linkat AT_EMPTY_PATH (Linux LOOKUP_LINKAT_EMPTY): a walk from
     /// `dirfd` needs the opener's creds or CAP_DAC_READ_SEARCH
     pub linkat_empty: bool,
+    /// A magic link is ELOOP (Linux LOOKUP_NO_MAGICLINKS)
+    pub no_magiclinks: bool,
+    /// Any symlink is ELOOP (Linux LOOKUP_NO_SYMLINKS)
+    pub no_symlinks: bool,
+    /// The walk never leaves its start: EXDEV (Linux LOOKUP_BENEATH)
+    pub beneath: bool,
+    /// The start is the root (Linux LOOKUP_IN_ROOT)
+    pub in_root: bool,
+    /// The dcache alone, else EAGAIN (Linux LOOKUP_CACHED)
+    pub cached: bool,
 }
 
 impl LookupFlags {
@@ -65,6 +79,25 @@ impl LookupFlags {
         Self {
             follow: at & AT_SYMLINK_NOFOLLOW == 0,
             ..Self::open()
+        }
+    }
+
+    /// Scoped to the start (Linux LOOKUP_IS_SCOPED)
+    pub fn scoped(&self) -> bool {
+        self.beneath || self.in_root
+    }
+
+    /// The RESOLVE_* restrictions alone, for the walk of another part
+    /// of the same lookup (a parent, a symlink's target)
+    fn resolve(self) -> Self {
+        Self {
+            no_xdev: self.no_xdev,
+            no_magiclinks: self.no_magiclinks,
+            no_symlinks: self.no_symlinks,
+            beneath: self.beneath,
+            in_root: self.in_root,
+            cached: self.cached,
+            ..Self::default()
         }
     }
 }
@@ -97,7 +130,7 @@ pub fn path_lookupat(
     path: &[u8],
     flags: LookupFlags,
 ) -> Result<Path, KernelError> {
-    walk(&cred(), start, path, flags, 0)
+    Nd::new(&start, flags)?.lookup(start, path, flags)
 }
 
 /// Child `name` of directory `parent`: the dcache, else the file system
@@ -172,6 +205,19 @@ fn lookup_slow(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelE
     lookup_one(parent, name)
 }
 
+/// Child `name` from the dcache alone (Linux lookup_fast in an RCU walk
+/// with LOOKUP_CACHED): a miss, or an entry whose revalidation needs
+/// the ref-walk, is EAGAIN. hk caches a miss (a negative entry) only on
+/// in-memory filesystems, where Linux drops one at once
+/// (always_delete_dentry), so it is a miss here too.
+fn lookup_cached(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
+    let child = parent.lookup_child(name).ok_or(KernelError::WouldBlock)?;
+    match child.get_inode() {
+        Some(i) if !i.i_op.revalidate_blocks(&i) && i.i_op.revalidate(&i) => Ok(child),
+        _ => Err(KernelError::WouldBlock),
+    }
+}
+
 /// may_lookup: `dir` must be a searchable directory
 fn may_lookup(c: &Cred, dir: &Dentry) -> Result<(), KernelError> {
     let inode = dir.get_inode().ok_or(KernelError::NotFound)?;
@@ -181,55 +227,327 @@ fn may_lookup(c: &Cred, dir: &Dentry) -> Result<(), KernelError> {
     permission_as(c, &inode, MAY_EXEC)
 }
 
-fn walk(
-    c: &Cred,
-    start: Option<Path>,
-    path: &[u8],
-    mut flags: LookupFlags,
-    depth: usize,
-) -> Result<Path, KernelError> {
-    if depth > MAX_SYMLINK_DEPTH {
-        return Err(KernelError::TooManySymlinks);
+/// What is mounted on `p` (Linux handle_mounts): crossed, or EXDEV for
+/// a no-xdev walk
+fn step_mounts(p: Path, f: LookupFlags) -> Result<Path, KernelError> {
+    if !f.no_xdev {
+        return Ok(follow_mount(p));
     }
-    // A trailing slash asks for a directory, through a final symlink
-    // (Linux link_path_walk: LOOKUP_FOLLOW | LOOKUP_DIRECTORY)
-    if path.ends_with(b"/") {
-        flags.follow = true;
-        flags.directory = true;
+    let q = follow_mount(p.clone());
+    if q.same(&p) {
+        Ok(q)
+    } else {
+        Err(KernelError::CrossDevice)
     }
-    let root = nd_root()?;
-    let mut cur = match start {
-        Some(p) if !path.starts_with(b"/") => p,
-        _ => root.clone(),
-    };
-    let mut next = next_comp(path);
-    while let Some((name, rest)) = next {
-        next = next_comp(rest);
-        may_lookup(c, &cur.dentry)?;
-        match name {
-            b"." => continue,
-            b".." => {
-                cur = follow_dotdot(cur, &root);
-                continue;
-            }
-            _ => {}
-        }
-        let child = Path::new(cur.mnt.clone(), lookup_slow(&cur.dentry, name)?);
-        let child = if flags.no_xdev {
-            child
-        } else {
-            follow_mount(child)
+}
+
+/// What stays fixed along one lookup, symlinks included (Linux struct
+/// nameidata's root, m_seq and r_seq): the root absolute paths and ".."
+/// stop at (a scoped lookup's own start), and for a scoped lookup the
+/// mount and rename sequences sampled at its start
+pub struct Nd {
+    c: Cred,
+    root: Path,
+    seq: Option<(u32, u32)>,
+}
+
+impl Nd {
+    /// Linux path_init's root and sequences: a scoped lookup's root is
+    /// its start (dirfd or the cwd), any other the task's root
+    pub fn new(start: &Option<Path>, f: LookupFlags) -> Result<Self, KernelError> {
+        let seq = f
+            .scoped()
+            .then(|| (MOUNT_LOCK.read_begin(), super::dentry::rename_seq_begin()));
+        let root = match start {
+            Some(p) if f.scoped() => p.clone(),
+            _ => nd_root()?,
         };
-        let last = next.is_none();
-        if (!last || flags.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
-            return follow_link(c, &cur, &child.dentry, rest, flags, depth);
+        Ok(Self {
+            c: cred(),
+            root,
+            seq,
+        })
+    }
+
+    /// Walk `path` from `start` (Linux path_lookupat + complete_walk)
+    pub fn lookup(
+        &self,
+        start: Option<Path>,
+        path: &[u8],
+        f: LookupFlags,
+    ) -> Result<Path, KernelError> {
+        let p = self.walk(start, path, f, 0)?;
+        self.complete(p)
+    }
+
+    /// A scoped lookup's result must still be under its root, whatever
+    /// raced it (Linux complete_walk: path_is_under, EXDEV)
+    fn complete(&self, p: Path) -> Result<Path, KernelError> {
+        if self.seq.is_some() && !is_path_reachable(&p, &self.root) {
+            return Err(KernelError::CrossDevice);
         }
-        cur = child;
+        Ok(p)
     }
-    if flags.directory && cur.get_inode().is_some_and(|n| !n.mode().is_dir()) {
-        return Err(KernelError::NotDirectory);
+
+    /// A scoped lookup's ".." raced a mount change or a rename, so it
+    /// may have left the root (Linux handle_dots: EAGAIN, for user space
+    /// to retry)
+    fn recheck(&self) -> Result<(), KernelError> {
+        if let Some((m, r)) = self.seq
+            && (MOUNT_LOCK.read_retry(m) || super::dentry::rename_seq_retry(r))
+        {
+            return Err(KernelError::WouldBlock);
+        }
+        Ok(())
     }
-    Ok(cur)
+
+    /// An absolute symlink restarts at the root from `at` (Linux
+    /// nd_jump_root): EXDEV beneath, and for a no-xdev walk off the
+    /// root's mount
+    fn jump_root(&self, at: &Path, f: LookupFlags) -> Result<(), KernelError> {
+        if f.beneath || (f.no_xdev && !Arc::ptr_eq(&at.mnt, &self.root.mnt)) {
+            return Err(KernelError::CrossDevice);
+        }
+        Ok(())
+    }
+
+    /// A magic link's jump from `dir` to `to` (Linux nd_jump_link):
+    /// ELOOP under no-magiclinks; EXDEV to another mount under no-xdev,
+    /// and always for a scoped lookup
+    fn may_jump(&self, dir: &Path, to: Option<&Path>, f: LookupFlags) -> Result<(), KernelError> {
+        if f.no_magiclinks {
+            return Err(KernelError::TooManySymlinks);
+        }
+        let other = to.is_some_and(|p| !Arc::ptr_eq(&p.mnt, &dir.mnt));
+        if (f.no_xdev && other) || f.scoped() {
+            return Err(KernelError::CrossDevice);
+        }
+        Ok(())
+    }
+
+    fn walk(
+        &self,
+        start: Option<Path>,
+        path: &[u8],
+        mut f: LookupFlags,
+        depth: usize,
+    ) -> Result<Path, KernelError> {
+        if depth > MAX_SYMLINK_DEPTH {
+            return Err(KernelError::TooManySymlinks);
+        }
+        // A trailing slash asks for a directory, through a final symlink
+        // (Linux link_path_walk: LOOKUP_FOLLOW | LOOKUP_DIRECTORY)
+        if path.ends_with(b"/") {
+            f.follow = true;
+            f.directory = true;
+        }
+        // An absolute path starts at the root (nd_jump_root): never
+        // beneath dirfd
+        let abs = path.starts_with(b"/");
+        if abs && f.beneath {
+            return Err(KernelError::CrossDevice);
+        }
+        let mut cur = match start {
+            Some(p) if !abs => p,
+            _ => self.root.clone(),
+        };
+        let mut next = next_comp(path);
+        while let Some((name, rest)) = next {
+            next = next_comp(rest);
+            may_lookup(&self.c, &cur.dentry)?;
+            match name {
+                b"." => continue,
+                b".." => {
+                    cur = follow_dotdot(cur, &self.root, f)?;
+                    self.recheck()?;
+                    continue;
+                }
+                _ => {}
+            }
+            let d = if f.cached {
+                lookup_cached(&cur.dentry, name)?
+            } else {
+                lookup_slow(&cur.dentry, name)?
+            };
+            let child = step_mounts(Path::new(cur.mnt.clone(), d), f)?;
+            let last = next.is_none();
+            if (!last || f.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
+                return self.follow_link(&cur, &child, rest, f, depth);
+            }
+            cur = child;
+        }
+        if f.directory && cur.get_inode().is_some_and(|n| !n.mode().is_dir()) {
+            return Err(KernelError::NotDirectory);
+        }
+        Ok(cur)
+    }
+
+    /// Continue a walk through symlink `link` found in `dir`, with the
+    /// components `rest` still to resolve after it (Linux pick_link)
+    fn follow_link(
+        &self,
+        dir: &Path,
+        link: &Path,
+        rest: &[u8],
+        f: LookupFlags,
+        depth: usize,
+    ) -> Result<Path, KernelError> {
+        let inode = link.get_inode().ok_or(KernelError::NotFound)?;
+        // fs.protected_symlinks first, then RESOLVE_NO_SYMLINKS or a
+        // nosymfollow mount (Linux pick_link: may_follow_link, then
+        // LOOKUP_NO_SYMLINKS / MNT_NOSYMFOLLOW on the link's mount)
+        if let Some(d) = dir.dentry.get_inode() {
+            super::dac::may_follow_link(&self.c, &d, &inode)?;
+        }
+        if f.no_symlinks || link.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
+            return Err(KernelError::TooManySymlinks);
+        }
+        // An atime update or a magic link's get_link leaves the RCU
+        // walk, which LOOKUP_CACHED forbids (try_to_unlazy fails: EAGAIN)
+        let magic = inode.i_op.magic_link(&inode);
+        if f.cached && (magic || inode.atime_needs_update(&link.mnt)) {
+            return Err(KernelError::WouldBlock);
+        }
+        // A magic link jumps to its object (Linux nd_jump_link), after
+        // its own access check; one that cannot is followed by its text
+        let jump = inode.i_op.jump_link(&inode, &dir.mnt).transpose()?;
+        let target = match jump {
+            Some(_) => None,
+            None => Some(inode.i_op.readlink(&inode)?),
+        };
+        inode.touch_atime(&link.mnt);
+        if magic {
+            self.may_jump(dir, jump.as_ref(), f)?;
+        }
+        if let Some(p) = jump {
+            return self.walk_on(p, rest, f, depth);
+        }
+        let mut path = target.unwrap_or_default();
+        if path.starts_with(b"/") {
+            self.jump_root(dir, f)?;
+        }
+        // `rest` is empty or starts at a slash: the walk goes on through it
+        path.extend_from_slice(rest);
+        self.walk(Some(dir.clone()), &path, f, depth + 1)
+    }
+
+    /// Go on from a magic link's object `p` with what followed the link:
+    /// a component after a non-directory is ENOTDIR, as is a trailing
+    /// slash
+    fn walk_on(
+        &self,
+        p: Path,
+        rest: &[u8],
+        mut f: LookupFlags,
+        depth: usize,
+    ) -> Result<Path, KernelError> {
+        let from = rest.iter().position(|&c| c != b'/').unwrap_or(rest.len());
+        if from == rest.len() && !rest.is_empty() {
+            f.directory = true;
+        }
+        self.walk(Some(p), &rest[from..], f, depth + 1)
+    }
+
+    /// Walk all but the last component of `path` from `start` (Linux
+    /// path_parentat): the parent must be a searchable directory; the
+    /// last name is not looked up, only classified
+    pub fn parentat(
+        &self,
+        start: Option<Path>,
+        path: &[u8],
+        f: LookupFlags,
+    ) -> Result<Parent, KernelError> {
+        let end = path.iter().rposition(|&c| c != b'/').map_or(0, |i| i + 1);
+        let slash = end < path.len();
+        let trimmed = &path[..end];
+        if trimmed.is_empty() {
+            // Only slashes: the root, no last component
+            let (mnt, dir) = self.root.clone().into_parts();
+            return Ok(Parent {
+                dir,
+                mnt,
+                name: Vec::new(),
+                last: Last::Root,
+                slash: false,
+            });
+        }
+        let (dir_path, name): (&[u8], &[u8]) = match trimmed.iter().rposition(|&c| c == b'/') {
+            Some(i) => (&path[..=i], &trimmed[i + 1..]),
+            None => (b"", trimmed),
+        };
+        let dirf = LookupFlags {
+            follow: true,
+            directory: true,
+            ..f.resolve()
+        };
+        let (mnt, dir) = match (dir_path.is_empty(), start) {
+            (true, Some(p)) => p,
+            (_, start) => self.lookup(start, dir_path, dirf)?,
+        }
+        .into_parts();
+        // link_path_walk: search permission before the last component too
+        may_lookup(&self.c, &dir)?;
+        let last = match name {
+            b"." => Last::Dot,
+            b".." => Last::DotDot,
+            _ => Last::Norm,
+        };
+        Ok(Parent {
+            dir,
+            mnt,
+            name: name.to_vec(),
+            last,
+            slash,
+        })
+    }
+
+    /// Where an O_CREAT open of `p` lands (Linux open_last_lookups +
+    /// step_into on the last component): while the last name is a
+    /// symlink, its target's parent and last name, each link checked as
+    /// a walk checks it (fs.protected_symlinks, then RESOLVE_NO_SYMLINKS
+    /// or nosymfollow, then a magic link's and an absolute target's
+    /// jump); ELOOP past MAX_SYMLINKS. A target ending in '/', "." or
+    /// ".." is EISDIR.
+    pub fn last_links(&self, mut p: Parent, f: LookupFlags) -> Result<Parent, KernelError> {
+        const MAX_SYMLINKS: usize = 40;
+        for _ in 0..MAX_SYMLINKS {
+            let dir = Path::new(p.mnt.clone(), p.dir.clone());
+            let nofollow = LookupFlags {
+                follow: false,
+                ..f.resolve()
+            };
+            let found = match self.walk(Some(dir.clone()), &p.name, nofollow, 0) {
+                Ok(f) => f,
+                Err(KernelError::NotFound) => return Ok(p),
+                Err(e) => return Err(e),
+            };
+            let Some(inode) = found.get_inode().filter(|i| i.mode().is_symlink()) else {
+                return Ok(p);
+            };
+            if let Some(d) = p.dir.get_inode() {
+                super::dac::may_follow_link(&self.c, &d, &inode)?;
+            }
+            if f.no_symlinks || found.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
+                return Err(KernelError::TooManySymlinks);
+            }
+            let target = inode.i_op.readlink(&inode)?;
+            inode.touch_atime(&found.mnt);
+            if inode.i_op.magic_link(&inode) {
+                self.may_jump(&dir, None, f)?;
+            }
+            let start = if target.starts_with(b"/") {
+                self.jump_root(&dir, f)?;
+                None
+            } else {
+                Some(dir)
+            };
+            p = self.parentat(start, &target, f)?;
+            if p.last != Last::Norm || p.slash {
+                return Err(KernelError::IsDirectory);
+            }
+        }
+        Err(KernelError::TooManySymlinks)
+    }
 }
 
 /// The next component of `p` and what follows it, skipping slashes
@@ -251,67 +569,41 @@ pub fn nd_root() -> Result<Path, KernelError> {
     current_mnt_ns().root_path().ok_or(KernelError::NotFound)
 }
 
-/// ".." from `p` (Linux follow_dotdot): the root stays; at a mount's
-/// root, climb to its mountpoint (repeatedly, through stacked mounts)
-/// and take that one's parent; a detached or namespace root stays.
-/// Whatever is mounted on the result is crossed.
-fn follow_dotdot(p: Path, root: &Path) -> Path {
+/// ".." from `p` (Linux follow_dotdot): the root stays (EXDEV beneath);
+/// at a mount's root, climb to its mountpoint (repeatedly, through
+/// stacked mounts; EXDEV for a no-xdev walk) and take that one's
+/// parent; a detached or namespace root stays like the root. Whatever
+/// is mounted on the result is crossed (EXDEV for a no-xdev walk).
+fn follow_dotdot(p: Path, root: &Path, f: LookupFlags) -> Result<Path, KernelError> {
+    let in_root = |p: Path| {
+        if f.beneath {
+            Err(KernelError::CrossDevice)
+        } else {
+            Ok(p)
+        }
+    };
     let mut p = p;
+    let mut climbed = false;
     loop {
         if p.same(root) {
-            return p;
+            return in_root(p);
         }
         if !Arc::ptr_eq(&p.dentry, &p.mnt.root) {
             break;
         }
         match (p.mnt.get_parent(), p.mnt.get_mountpoint()) {
             (Some(m), Some(mp)) => p = Path::new(m, mp),
-            _ => return p,
+            _ => return in_root(p),
         }
+        climbed = true;
+    }
+    if climbed && f.no_xdev {
+        return Err(KernelError::CrossDevice);
     }
     match p.dentry.get_parent() {
-        Some(parent) => follow_mount(Path::new(p.mnt.clone(), parent)),
-        None => p,
+        Some(parent) => step_mounts(Path::new(p.mnt.clone(), parent), f),
+        None => Ok(p),
     }
-}
-
-/// Continue a walk through symlink `link` found in `dir`, with the
-/// components `rest` still to resolve after it
-fn follow_link(
-    c: &Cred,
-    dir: &Path,
-    link: &Dentry,
-    rest: &[u8],
-    flags: LookupFlags,
-    depth: usize,
-) -> Result<Path, KernelError> {
-    let inode = link.get_inode().ok_or(KernelError::NotFound)?;
-    // fs.protected_symlinks first, then a nosymfollow mount (Linux
-    // pick_link: may_follow_link, then MNT_NOSYMFOLLOW on the link's
-    // mount)
-    if let Some(d) = dir.dentry.get_inode() {
-        super::dac::may_follow_link(c, &d, &inode)?;
-    }
-    if dir.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
-        return Err(KernelError::TooManySymlinks);
-    }
-    // A magic link jumps to its object (Linux nd_jump_link). The ones
-    // that do (namespace files) lead to no directory: a component or
-    // a trailing slash after one is ENOTDIR, as Linux's walk finds
-    if let Some(p) = inode.i_op.jump_link(&inode, &dir.mnt) {
-        let p = p?;
-        inode.touch_atime(&dir.mnt);
-        if next_comp(rest).is_some() || flags.directory {
-            return Err(KernelError::NotDirectory);
-        }
-        return Ok(p);
-    }
-    let target = inode.i_op.readlink(&inode)?;
-    inode.touch_atime(&dir.mnt);
-    // `rest` is empty or starts at a slash: the walk goes on through it
-    let mut path = target;
-    path.extend_from_slice(rest);
-    walk(c, Some(dir.clone()), &path, flags, depth + 1)
 }
 
 /// Create the entry `p` names (Linux filename_create +
@@ -429,15 +721,15 @@ pub fn getname_maybe_null(ptr: UserPtr<u8>, at: i32) -> Result<Vec<u8>, KernelEr
 }
 
 /// Where a walk of `path` starts (Linux path_init): an absolute path at
-/// the root (dirfd unused), else the cwd or `dirfd`, which must be open
-/// (EBADF), pass the `linkat_empty` check (ENOENT) and, unless the path
-/// is empty, be a directory (ENOTDIR)
-pub fn path_start(
-    dirfd: i32,
-    path: &[u8],
-    linkat_empty: bool,
-) -> Result<Option<Path>, KernelError> {
-    if path.starts_with(b"/") {
+/// the root (dirfd unused; EXDEV beneath), else, and for an in-root
+/// lookup always, the cwd or `dirfd`, which must be open (EBADF), pass
+/// the `linkat_empty` check (ENOENT) and, unless the path is empty, be a
+/// directory (ENOTDIR)
+pub fn path_start(dirfd: i32, path: &[u8], f: LookupFlags) -> Result<Option<Path>, KernelError> {
+    if path.starts_with(b"/") && !f.in_root {
+        if f.beneath {
+            return Err(KernelError::CrossDevice);
+        }
         return Ok(None);
     }
     if dirfd == AT_FDCWD {
@@ -447,7 +739,7 @@ pub fn path_start(
         .lock()
         .get(dirfd)
         .ok_or(KernelError::BadFd)?;
-    if linkat_empty && !may_linkat_empty(&file) {
+    if f.linkat_empty && !may_linkat_empty(&file) {
         return Err(KernelError::NotFound);
     }
     if !path.is_empty() && !file.is_dir() {
@@ -471,7 +763,7 @@ fn may_linkat_empty(file: &crate::fs::File) -> bool {
 /// Resolve `path` relative to `dirfd` (Linux filename_lookup); an empty
 /// path (getname let it through: AT_EMPTY_PATH) names dirfd itself
 pub fn filename_lookup(dirfd: i32, path: &[u8], flags: LookupFlags) -> Result<Path, KernelError> {
-    let start = path_start(dirfd, path, flags.linkat_empty)?;
+    let start = path_start(dirfd, path, flags)?;
     if path.is_empty() {
         return match start {
             Some(p) => Ok(p),
@@ -514,95 +806,11 @@ pub struct Parent {
 }
 
 /// Walk all but the last component of `path` (Linux filename_parentat):
-/// the parent must be a searchable directory; the last name is not
-/// looked up, only classified
+/// see [`Nd::parentat`]
 pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError> {
-    path_parentat(path_start(dirfd, path, false)?, path)
-}
-
-/// `filename_parentat` from `start` (None: the root, as for an absolute
-/// path)
-fn path_parentat(start: Option<Path>, path: &[u8]) -> Result<Parent, KernelError> {
-    let end = path.iter().rposition(|&c| c != b'/').map_or(0, |i| i + 1);
-    let slash = end < path.len();
-    let trimmed = &path[..end];
-    if trimmed.is_empty() {
-        // Only slashes: the root, no last component
-        let (mnt, dir) = nd_root()?.into_parts();
-        return Ok(Parent {
-            dir,
-            mnt,
-            name: Vec::new(),
-            last: Last::Root,
-            slash: false,
-        });
-    }
-    let (dir_path, name): (&[u8], &[u8]) = match trimmed.iter().rposition(|&c| c == b'/') {
-        Some(i) => (&path[..=i], &trimmed[i + 1..]),
-        None => (b"", trimmed),
-    };
-    let (mnt, dir) = match (dir_path.is_empty(), start) {
-        (true, Some(p)) => p,
-        (_, start) => path_lookupat(start, dir_path, LookupFlags::opendir())?,
-    }
-    .into_parts();
-    // link_path_walk: search permission before the last component too
-    may_lookup(&cred(), &dir)?;
-    let last = match name {
-        b"." => Last::Dot,
-        b".." => Last::DotDot,
-        _ => Last::Norm,
-    };
-    Ok(Parent {
-        dir,
-        mnt,
-        name: name.to_vec(),
-        last,
-        slash,
-    })
-}
-
-/// Where an O_CREAT open of `p` lands (Linux open_last_lookups +
-/// step_into on the last component): while the last name is a
-/// symlink, its target's parent and last name, each link checked as a
-/// walk checks it (fs.protected_symlinks, then nosymfollow); ELOOP past
-/// MAX_SYMLINKS. A target ending in '/', "." or ".." is EISDIR.
-pub fn resolve_last_links(mut p: Parent) -> Result<Parent, KernelError> {
-    const MAX_SYMLINKS: usize = 40;
-    let c = cred();
-    for _ in 0..MAX_SYMLINKS {
-        let dir = Path::new(p.mnt.clone(), p.dir.clone());
-        let nofollow = LookupFlags {
-            follow: false,
-            ..LookupFlags::open()
-        };
-        let found = match path_lookupat(Some(dir.clone()), &p.name, nofollow) {
-            Ok(f) => f,
-            Err(KernelError::NotFound) => return Ok(p),
-            Err(e) => return Err(e),
-        };
-        let Some(inode) = found.get_inode().filter(|i| i.mode().is_symlink()) else {
-            return Ok(p);
-        };
-        if let Some(d) = p.dir.get_inode() {
-            super::dac::may_follow_link(&c, &d, &inode)?;
-        }
-        if p.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
-            return Err(KernelError::TooManySymlinks);
-        }
-        let target = inode.i_op.readlink(&inode)?;
-        inode.touch_atime(&found.mnt);
-        let start = if target.starts_with(b"/") {
-            None
-        } else {
-            Some(dir)
-        };
-        p = path_parentat(start, &target)?;
-        if p.last != Last::Norm || p.slash {
-            return Err(KernelError::IsDirectory);
-        }
-    }
-    Err(KernelError::TooManySymlinks)
+    let f = LookupFlags::default();
+    let start = path_start(dirfd, path, f)?;
+    Nd::new(&start, f)?.parentat(start, path, f)
 }
 
 /// The parent and new name for mkdir/mknod/symlink/link/bind (Linux

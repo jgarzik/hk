@@ -441,6 +441,37 @@ impl InodeOps for ProcfsInodeOps {
         }
     }
 
+    /// The links whose get_link jumps (Linux proc_pid_get_link for fd/N,
+    /// cwd, root, exe; proc_ns_get_link): /proc/self and FixedLink are
+    /// plain text
+    fn magic_link(&self, inode: &Inode) -> bool {
+        with_data(inode, |d| {
+            matches!(
+                d,
+                ProcfsInodeData::FdSymlink { .. }
+                    | ProcfsInodeData::PidLink { .. }
+                    | ProcfsInodeData::NamespaceFile { .. }
+            )
+        }) && inode.mode().is_symlink()
+    }
+
+    /// Linux tid_fd_revalidate, proc_sys_revalidate and
+    /// proc_misc_d_revalidate are -ECHILD in an RCU walk; pid_revalidate
+    /// is not
+    fn revalidate_blocks(&self, inode: &Inode) -> bool {
+        with_data(inode, |d| {
+            matches!(
+                d,
+                ProcfsInodeData::FdSymlink { .. }
+                    | ProcfsInodeData::FdinfoFile { .. }
+                    | ProcfsInodeData::Sysctl { .. }
+                    | ProcfsInodeData::File { .. }
+                    | ProcfsInodeData::Directory { .. }
+                    | ProcfsInodeData::FixedLink(_)
+            )
+        })
+    }
+
     /// /proc/<pid>/ns/<type> leads to the namespace's file (Linux
     /// proc_ns_get_link: ns_get_path, nd_jump_link); /proc/<pid>/fd/<n>
     /// to the open file's path (`fd_jump`)
@@ -554,6 +585,17 @@ impl InodeOps for ProcfsInodeOps {
         pid_update_inode(&inode);
         Ok(inode)
     }
+}
+
+/// `f` of the inode's procfs data; false for none
+fn with_data(inode: &Inode, f: impl FnOnce(&ProcfsInodeData) -> bool) -> bool {
+    let Some(p) = inode.get_private() else {
+        return false;
+    };
+    p.as_ref()
+        .as_any()
+        .downcast_ref::<ProcfsInodeWrapper>()
+        .is_some_and(|w| f(&w.0.read()))
 }
 
 /// The owner of a per-process inode follows the task's identity and
@@ -960,12 +1002,12 @@ fn fd_link(pid: &ProcPid, fd: i32) -> Result<Vec<u8>, KernelError> {
     }
 }
 
-/// /proc/<pid>/fd/<fd> of a file system's non-directory leads to the
-/// open file itself (Linux proc_fd_link + nd_jump_link), so a deleted or
-/// unnamed one (O_TMPFILE, memfd) can be opened again; None (follow the
-/// text of `fd_link`) for a directory, a pipe, socket or anonymous file;
-/// EACCES without ptrace-read access, checked at each follow (Linux
-/// proc_pid_get_link, proc_fd_access_allowed)
+/// /proc/<pid>/fd/<fd> of a file system's file leads to the open file
+/// itself (Linux proc_fd_link + nd_jump_link), so a deleted or unnamed
+/// one (O_TMPFILE, memfd) can be opened again, and the walk goes on
+/// from a directory; None (follow the text of `fd_link`) for a pipe,
+/// socket or anonymous file; EACCES without ptrace-read access, checked
+/// at each follow (Linux proc_pid_get_link, proc_fd_access_allowed)
 fn fd_jump(pid: &ProcPid, fd: i32) -> Option<Result<crate::fs::Path, KernelError>> {
     let t = match link_task(pid) {
         Ok(t) => t,
@@ -973,7 +1015,7 @@ fn fd_jump(pid: &ProcPid, fd: i32) -> Option<Result<crate::fs::Path, KernelError
     };
     let file = task_files(&t)?.lock().get(fd)?;
     let inode = file.get_inode()?;
-    if inode.mode().is_dir() || inode.mode().is_socket() || inode.superblock().is_none() {
+    if inode.mode().is_socket() || inode.superblock().is_none() {
         return None;
     }
     file.f_path().map(Ok)

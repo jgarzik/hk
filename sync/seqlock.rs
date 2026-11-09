@@ -1,42 +1,43 @@
-//! Sequence lock (Linux seqlock_t): writers serialize on a spin lock and
-//! bump a sequence counter around their change (odd while writing);
-//! lockless readers sample the counter, read, and retry if it moved or
-//! was odd. Thread context; not for IRQ handlers (the writer's lock is a
-//! plain spin lock, as Linux's mount_lock).
+//! Sequence counts and locks (Linux seqcount_t, seqlock_t): writers bump
+//! a sequence counter around their change (odd while writing); lockless
+//! readers sample the counter, read, and retry if it moved or was odd.
+//! A `SeqCount`'s writers serialize on a lock of their own; a `SeqLock`
+//! brings one, a spin lock. Thread context; not for IRQ handlers (as
+//! Linux's mount_lock and rename_lock).
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 
 use crate::sync::spin::{Mutex, MutexGuard};
 
-pub struct SeqLock {
-    lock: Mutex<()>,
+/// A sequence counter whose writers hold a lock of their own (Linux
+/// seqcount_t)
+pub struct SeqCount {
     seq: AtomicU32,
 }
 
-/// A held write side (Linux write_seqlock .. write_sequnlock)
-pub struct SeqWriteGuard<'a> {
-    s: &'a SeqLock,
-    _g: MutexGuard<'a, ()>,
-}
+/// A write section of a `SeqCount` (Linux write_seqcount_begin ..
+/// write_seqcount_end)
+#[must_use]
+pub struct SeqCountGuard<'a>(&'a SeqCount);
 
-impl SeqLock {
+impl SeqCount {
     pub const fn new() -> Self {
         Self {
-            lock: Mutex::new(()),
             seq: AtomicU32::new(0),
         }
     }
 
-    /// Take the write side (Linux write_seqlock): the counter goes odd
-    /// before any of the writer's stores (smp_wmb after the increment)
-    pub fn write(&self) -> SeqWriteGuard<'_> {
-        let g = self.lock.lock();
+    /// Begin a write, under the writers' lock (Linux
+    /// write_seqcount_begin): the counter goes odd before any of the
+    /// writer's stores (smp_wmb after the increment)
+    pub fn write(&self) -> SeqCountGuard<'_> {
         self.seq.fetch_add(1, Ordering::Relaxed);
         fence(Ordering::Release);
-        SeqWriteGuard { s: self, _g: g }
+        SeqCountGuard(self)
     }
 
-    /// Begin a lockless read (Linux read_seqbegin): waits out a writer
+    /// Begin a lockless read (Linux read_seqcount_begin): waits out a
+    /// writer
     pub fn read_begin(&self) -> u32 {
         loop {
             let s = self.seq.load(Ordering::Acquire);
@@ -48,17 +49,58 @@ impl SeqLock {
     }
 
     /// The read since `start` raced a writer and must be repeated (Linux
-    /// read_seqretry: smp_rmb, then the counter)
+    /// read_seqcount_retry: smp_rmb, then the counter)
     pub fn read_retry(&self, start: u32) -> bool {
         fence(Ordering::Acquire);
         self.seq.load(Ordering::Relaxed) != start
     }
 }
 
-impl Drop for SeqWriteGuard<'_> {
-    /// Linux write_sequnlock: the writer's stores before the counter
-    /// goes even (smp_wmb, then the increment), then the lock
+impl Drop for SeqCountGuard<'_> {
+    /// Linux write_seqcount_end: the writer's stores before the counter
+    /// goes even (smp_wmb, then the increment)
     fn drop(&mut self) {
-        self.s.seq.fetch_add(1, Ordering::Release);
+        self.0.seq.fetch_add(1, Ordering::Release);
+    }
+}
+
+pub struct SeqLock {
+    lock: Mutex<()>,
+    seq: SeqCount,
+}
+
+/// A held write side (Linux write_seqlock .. write_sequnlock): fields
+/// drop in order, so the count goes even before the lock is released
+pub struct SeqWriteGuard<'a> {
+    _c: SeqCountGuard<'a>,
+    _g: MutexGuard<'a, ()>,
+}
+
+impl SeqLock {
+    pub const fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            seq: SeqCount::new(),
+        }
+    }
+
+    /// Take the write side (Linux write_seqlock)
+    pub fn write(&self) -> SeqWriteGuard<'_> {
+        let g = self.lock.lock();
+        SeqWriteGuard {
+            _c: self.seq.write(),
+            _g: g,
+        }
+    }
+
+    /// Begin a lockless read (Linux read_seqbegin): waits out a writer
+    pub fn read_begin(&self) -> u32 {
+        self.seq.read_begin()
+    }
+
+    /// The read since `start` raced a writer and must be repeated (Linux
+    /// read_seqretry)
+    pub fn read_retry(&self, start: u32) -> bool {
+        self.seq.read_retry(start)
     }
 }

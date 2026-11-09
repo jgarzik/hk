@@ -3,7 +3,7 @@
 use alloc::sync::Arc;
 
 use super::file::EMPTY_FOPS;
-use crate::fs::namei::{Last, filename_lookup, filename_parentat, getname, path_lookupat};
+use crate::fs::namei::{Last, Nd, filename_lookup, getname, path_start};
 use crate::fs::{
     Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac, lookup_one,
 };
@@ -196,26 +196,30 @@ pub fn build_open_flags(how: &OpenHow) -> Result<OpenFlags, KernelError> {
     if how.resolve & RESOLVE_CACHED != 0 && flags & (O_TRUNC | O_CREAT | __O_TMPFILE) != 0 {
         return Err(KernelError::WouldBlock);
     }
-    // The walk does not take RESOLVE_* yet
-    if how.resolve != 0 {
-        return Err(KernelError::OperationNotSupported);
-    }
     Ok(OpenFlags {
         flags,
         mode,
         acc: if path { 0 } else { dac::acc_mode(flags) },
-        lookup: open_lookup(flags),
+        lookup: open_lookup(flags, how.resolve),
         regular,
     })
 }
 
 /// The walk of an open (Linux build_open_flags' lookup_flags):
-/// O_CREAT|O_EXCL never follows a final symlink (it is EEXIST)
-fn open_lookup(flags: u32) -> LookupFlags {
+/// O_CREAT|O_EXCL never follows a final symlink (it is EEXIST); the
+/// RESOLVE_* restrictions
+fn open_lookup(flags: u32, res: u64) -> LookupFlags {
+    use resolve::*;
     let excl = flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL;
     LookupFlags {
         directory: flags & O_DIRECTORY != 0,
         follow: flags & O_NOFOLLOW == 0 && !excl,
+        no_xdev: res & RESOLVE_NO_XDEV != 0,
+        no_magiclinks: res & RESOLVE_NO_MAGICLINKS != 0,
+        no_symlinks: res & RESOLVE_NO_SYMLINKS != 0,
+        beneath: res & RESOLVE_BENEATH != 0,
+        in_root: res & RESOLVE_IN_ROOT != 0,
+        cached: res & RESOLVE_CACHED != 0,
         ..LookupFlags::default()
     }
 }
@@ -229,20 +233,19 @@ fn open_target(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), 
     }
     // O_CREAT (Linux open_last_lookups): the parent is walked, then a
     // last name of "/", "." or ".." (a directory) or one with a trailing
-    // slash is EISDIR, existing or not
-    let p = filename_parentat(dirfd, path)?;
+    // slash is EISDIR, existing or not; one lookup (Nd) throughout, so
+    // RESOLVE_* holds for the parent, the symlinks and the last name
+    let start = path_start(dirfd, path, lf)?;
+    let nd = Nd::new(&start, lf)?;
+    let p = nd.parentat(start, path, lf)?;
     if p.last != Last::Norm || p.slash {
         return Err(KernelError::IsDirectory);
     }
     // A final symlink is followed to where the file is (or is made),
     // a dangling one included
-    let p = if lf.follow {
-        super::namei::resolve_last_links(p)?
-    } else {
-        p
-    };
+    let p = if lf.follow { nd.last_links(p, lf)? } else { p };
     let dir = Path::new(p.mnt.clone(), p.dir.clone());
-    let (d, created) = match path_lookupat(Some(dir), &p.name, lf) {
+    let (d, created) = match nd.lookup(Some(dir), &p.name, lf) {
         Ok(d) => (d, false),
         Err(KernelError::NotFound) => {
             let (d, c) = create_in(&p.mnt, &p.dir, &p.name, op.mode)?;
