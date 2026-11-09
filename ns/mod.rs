@@ -536,22 +536,18 @@ pub fn switch_task_namespaces(t: &Task, new_ns: Arc<NsProxy>) {
 /// * -EINVAL if nstype doesn't match the namespace type
 /// * -EPERM if permission denied
 pub fn sys_setns(fd: i32, nstype: i32) -> KernelResult<()> {
-    use crate::fs::proc::{NamespaceType, ProcfsInodeData, ProcfsInodeWrapper};
+    use crate::fs::proc::{NamespaceType, ProcfsInodeData, with_data};
 
     let file = crate::fs::io::fget(fd)?;
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-    // A namespace file: procfs private data naming one
-    let private = inode.get_private().ok_or(KernelError::InvalidArgument)?;
-    let wrapper = private
-        .as_ref()
-        .as_any()
-        .downcast_ref::<ProcfsInodeWrapper>()
-        .ok_or(KernelError::InvalidArgument)?;
-    // Copied out: the inode data's spin lock is not held for the rest
-    let (target_pid, ns_type) = match &*wrapper.0.read() {
-        ProcfsInodeData::NamespaceFile { pid, ns_type } => (pid.clone(), *ns_type),
-        _ => return Err(KernelError::InvalidArgument),
-    };
+    // A namespace file: procfs private data naming one, copied out (the
+    // inode data's spin lock is not held for the rest)
+    let (target_pid, ns_type) = with_data(&inode, |d| match d {
+        ProcfsInodeData::NamespaceFile { pid, ns_type } => Some((pid.clone(), *ns_type)),
+        _ => None,
+    })
+    .flatten()
+    .ok_or(KernelError::InvalidArgument)?;
 
     // Validate nstype if specified
     if nstype != 0 && nstype != ns_type.clone_flag() as i32 {
