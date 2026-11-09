@@ -7,7 +7,8 @@
 //! - MEMFD_SEALS: F_GET_SEALS / F_ADD_SEALS (F_SEAL_SEAL without
 //!   MFD_ALLOW_SEALING and on other tmpfs files, EINVAL on non-tmpfs,
 //!   EPERM read-only); SHRINK and GROW in truncate, write and fallocate;
-//!   WRITE: EBUSY while mapped shared writable, then write and writable
+//!   WRITE: EBUSY while mapped shared writable (whatever unknown mmap
+//!   flags came with the mapping), then write and writable
 //!   shared mmap EPERM, a read-only shared map cannot become writable;
 //!   FUTURE_WRITE leaves existing mappings writable; EXEC keeps the exec
 //!   bits and implies the write seals
@@ -204,6 +205,12 @@ fn seals() {
     t.ok(b"map", m > 0, m);
     t.eq(b"write busy", add(fd, WRITE), EBUSY);
     sys_munmap(m as u64, 4096);
+    // Unknown high mmap flags (MAP_HUGE_* size bits without MAP_HUGETLB)
+    // are ignored, never taken for kernel VMA state: still counted
+    let hm = map(fd, rw, MAP_SHARED | 0x4000_0000);
+    t.ok(b"map high bit", hm > 0, hm);
+    t.eq(b"high bit busy", add(fd, WRITE), EBUSY);
+    sys_munmap(hm as u64, 4096);
     t.eq(b"write seal", add(fd, WRITE), 0);
     t.eq(
         b"write sealed",

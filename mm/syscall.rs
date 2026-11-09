@@ -10,10 +10,10 @@ use crate::uaccess::{UserPtr, access_ok};
 
 use super::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK,
-    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE,
-    MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ,
-    PROT_WRITE, TASK_SIZE, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_NORESERVE,
-    VM_SHARED, Vma, anon_vma::AnonVma,
+    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_FIXED,
+    MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP,
+    PROT_READ, PROT_WRITE, TASK_SIZE, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT,
+    VM_NORESERVE, VM_SHARED, Vma, anon_vma::AnonVma,
 };
 use crate::util::error::{KernelError, KernelResult};
 
@@ -272,24 +272,21 @@ pub fn sys_mmap(
     // A shared mapping of /dev/zero is shared anonymous memory (Linux
     // mmap_zero -> shmem_zero_setup)
     let file = file.filter(|f| !(is_shared && crate::fs::chardev::maps_shared_anon(f)));
+    // The VMA's flags are built, never copied from the caller's (Linux
+    // calc_vm_flag_bits): the sharing type here, the VM_* bits below,
+    // so no mmap flag a caller sets can stand for kernel state
+    let share = if is_shared { MAP_SHARED } else { MAP_PRIVATE };
     // Create VMA
     let mut vma = if let Some(f) = file {
-        Vma::new_file(map_addr, map_addr + length, prot, flags, f, offset)
+        Vma::new_file(map_addr, map_addr + length, prot, share, f, offset)
     } else if is_shared {
         // Shared anonymous memory is a file of its size on the kernel's
         // tmpfs (Linux shmem_zero_setup: "/dev/zero (deleted)")
         let f = crate::fs::tmpfs::shmem_kernel_file_setup(b"dev/zero", length)?;
-        Vma::new_file(
-            map_addr,
-            map_addr + length,
-            prot,
-            flags & !MAP_ANONYMOUS,
-            f,
-            0,
-        )
+        Vma::new_file(map_addr, map_addr + length, prot, share, f, 0)
     } else {
         // Private anonymous memory, with an anon_vma for the reverse map
-        let mut v = Vma::new(map_addr, map_addr + length, prot, flags | MAP_ANONYMOUS);
+        let mut v = Vma::new(map_addr, map_addr + length, prot, share | MAP_ANONYMOUS);
         v.set_anon_vma(AnonVma::new()?);
         v
     };
