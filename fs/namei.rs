@@ -761,14 +761,20 @@ fn may_linkat_empty(file: &crate::fs::File) -> bool {
 }
 
 /// Resolve `path` relative to `dirfd` (Linux filename_lookup); an empty
-/// path (getname let it through: AT_EMPTY_PATH) names dirfd itself
+/// path (getname let it through: AT_EMPTY_PATH, O_EMPTYPATH) names
+/// dirfd itself
 pub fn filename_lookup(dirfd: i32, path: &[u8], flags: LookupFlags) -> Result<Path, KernelError> {
     let start = path_start(dirfd, path, flags)?;
     if path.is_empty() {
-        return match start {
-            Some(p) => Ok(p),
-            None => nd_root(),
+        let p = match start {
+            Some(p) => p,
+            None => nd_root()?,
         };
+        // Linux path_lookupat's LOOKUP_DIRECTORY check, walk or not
+        if flags.directory && p.get_inode().is_some_and(|n| !n.mode().is_dir()) {
+            return Err(KernelError::NotDirectory);
+        }
+        return Ok(p);
     }
     path_lookupat(start, path, flags)
 }

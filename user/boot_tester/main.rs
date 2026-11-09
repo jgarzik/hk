@@ -256,6 +256,7 @@ pub fn run_all_tests() {
     fs::o_path::run_tests();
     fs::openat2::run_tests();
     fs::resolve::run_tests();
+    fs::emptypath::run_tests();
     fs::permissions::run_tests();
     fs::dac::run_tests();
     fs::sync::run_tests();

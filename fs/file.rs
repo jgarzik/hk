@@ -62,6 +62,9 @@ pub mod flags {
     /// A path-only file: a place in the tree, no I/O (asm-generic,
     /// both arches)
     pub const O_PATH: u32 = 0o10000000;
+    /// An empty path names dirfd itself (asm-generic, both arches;
+    /// Linux 7.2 LOOKUP_EMPTY)
+    pub const O_EMPTYPATH: u32 = 1 << 26;
     /// An unnamed file in the directory named (asm-generic __O_TMPFILE;
     /// O_TMPFILE is it with O_DIRECTORY)
     pub const __O_TMPFILE: u32 = 0o20000000;
@@ -85,10 +88,11 @@ pub mod flags {
         | O_NOATIME
         | O_CLOEXEC
         | O_PATH
-        | __O_TMPFILE;
+        | __O_TMPFILE
+        | O_EMPTYPATH;
 
     /// What O_PATH keeps (Linux O_PATH_FLAGS)
-    pub const O_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC;
+    pub const O_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC | O_EMPTYPATH;
 
     /// The *at() calls' dirfd for the current directory
     pub const AT_FDCWD: i32 = -100;

@@ -253,9 +253,6 @@ lo (hk has no checksum offload states).
 
 **Location**: `fs/open.rs`, `fs/namei.rs`, `fs/proc/mod.rs`
 
-- O_EMPTYPATH (Linux 7.2) is not done: open(2) drops the bit and
-  openat2 refuses it (EINVAL), so an empty path stays ENOENT (Linux
-  LOOKUP_EMPTY: the open names dirfd itself; O_PATH keeps the flag).
 - O_DIRECT is kept in f_flags but does nothing; Linux do_dentry_open
   refuses it (EINVAL) on a file without direct I/O (ramfs).
 - /proc/<pid>/fd/<n> of a pipe, socket or anonymous file is followed by

@@ -10,8 +10,8 @@ use crate::fs::{
 
 use super::file::flags::AT_FDCWD;
 use super::flags::{
-    __O_SYNC, __O_TMPFILE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_DSYNC, O_EXCL,
-    O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_PATH, O_PATH_FLAGS, O_RDONLY, O_RDWR, O_TRUNC,
+    __O_SYNC, __O_TMPFILE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_DSYNC, O_EMPTYPATH,
+    O_EXCL, O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_PATH, O_PATH_FLAGS, O_RDONLY, O_RDWR, O_TRUNC,
     VALID_OPEN_FLAGS,
 };
 use super::mount::MNT_NODEV;
@@ -231,6 +231,19 @@ fn open_target(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), 
     if flags & O_CREAT == 0 {
         return Ok((filename_lookup(dirfd, path, lf)?, false));
     }
+    // O_CREAT|O_EMPTYPATH of an empty name: dirfd's own file, with
+    // do_open's O_CREAT checks (EEXIST, EISDIR); there is no last name,
+    // so no parent's sticky check (Linux nd->dir_mode is 0)
+    if path.is_empty() {
+        let d = filename_lookup(dirfd, path, lf)?;
+        if flags & O_EXCL != 0 {
+            return Err(KernelError::AlreadyExists);
+        }
+        if d.get_inode().is_some_and(|i| i.mode().is_dir()) {
+            return Err(KernelError::IsDirectory);
+        }
+        return Ok((d, false));
+    }
     // O_CREAT (Linux open_last_lookups): the parent is walked, then a
     // last name of "/", "." or ".." (a directory) or one with a trailing
     // slash is EISDIR, existing or not; one lookup (Nd) throughout, so
@@ -311,7 +324,8 @@ pub fn sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: u64, usize: usize) ->
 /// request is checked before the name is copied in
 fn do_sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: &OpenHow) -> KernelResult<i32> {
     let op = build_open_flags(how)?;
-    let path = getname(path_ptr, false)?;
+    // O_EMPTYPATH: an empty name is dirfd itself (Linux LOOKUP_EMPTY)
+    let path = getname(path_ptr, op.flags & O_EMPTYPATH != 0)?;
     let file = filp_open(dirfd, &path, &op)?;
     // RLIMIT_NOFILE enforced inside alloc
     let fd_flags = if how.flags & u64::from(O_CLOEXEC) != 0 {

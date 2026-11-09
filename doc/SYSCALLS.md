@@ -53,8 +53,8 @@
 2.1 FD lifecycle
 
 - [x] open (x86-64 only, legacy; use openat)
-- [x] openat (O_TMPFILE on tmpfs and ramfs: unnamed, linkable unless O_EXCL; O_PATH: path-only descriptors)
-- [x] openat2 (open_how size rules, OPENAT2_REGULAR, every RESOLVE_* flag)
+- [x] openat (O_TMPFILE on tmpfs and ramfs: unnamed, linkable unless O_EXCL; O_PATH: path-only descriptors; O_EMPTYPATH: an empty path reopens dirfd's file)
+- [x] openat2 (open_how size rules, OPENAT2_REGULAR, O_EMPTYPATH, every RESOLVE_* flag)
 - [x] close
 - [x] close_range (CLOSE_RANGE_UNSHARE, CLOSE_RANGE_CLOEXEC)
 - [ ] creat (x86-64 only, legacy; use openat with O_CREAT)
