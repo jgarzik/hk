@@ -196,6 +196,8 @@ pub enum KernelError {
     KeyRevoked = 128,
     /// Key was rejected by service (EKEYREJECTED)
     KeyRejected = 129,
+    /// Wrong file type for the intended operation (EFTYPE, asm-generic)
+    WrongFileType = 134,
 
     // =========================================================================
     // Kernel-internal restart codes (include/linux/errno.h); never reach
@@ -298,6 +300,7 @@ impl KernelError {
             127 => Self::KeyExpired,
             128 => Self::KeyRevoked,
             129 => Self::KeyRejected,
+            134 => Self::WrongFileType,
             512 => Self::RestartSys,
             513 => Self::RestartNoIntr,
             514 => Self::RestartNoHand,

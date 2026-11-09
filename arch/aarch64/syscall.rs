@@ -56,6 +56,7 @@ pub const SYS_FCHOWN: u64 = 55;
 pub const SYS_OPENAT: u64 = 56;
 pub const SYS_CLOSE: u64 = 57;
 pub const SYS_CLOSE_RANGE: u64 = 436;
+pub const SYS_OPENAT2: u64 = 437;
 pub const SYS_GETDENTS64: u64 = 61;
 pub const SYS_LSEEK: u64 = 62;
 pub const SYS_READ: u64 = 63;
@@ -567,6 +568,7 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_CLONE3 => Sys::Clone3,
         SYS_CLOSE => Sys::Close,
         SYS_CLOSE_RANGE => Sys::CloseRange,
+        SYS_OPENAT2 => Sys::Openat2,
         SYS_CONNECT => Sys::Connect,
         SYS_COPY_FILE_RANGE => Sys::CopyFileRange,
         SYS_DUP => Sys::Dup,

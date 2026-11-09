@@ -147,6 +147,7 @@ pub enum Sys {
     Nanosleep,
     Newfstatat,
     Openat,
+    Openat2,
     PerfEventOpen,
     Personality,
     PidfdGetfd,
@@ -832,6 +833,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[3] as u32,
         )
         .ret() as u64,
+        Sys::Openat2 => {
+            crate::fs::syscall::sys_openat2(a[0] as i32, UserPtr::new(a[1]), a[2], a[3] as usize)
+                .ret() as u64
+        }
         Sys::PerfEventOpen => KernelError::OperationNotSupported.sysret() as u64,
         Sys::Personality => crate::task::syscall::sys_personality(a[0] as u32).ret() as u64,
         Sys::PidfdGetfd => {

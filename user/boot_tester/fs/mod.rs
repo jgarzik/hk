@@ -27,6 +27,7 @@ pub mod mounts;
 pub mod namei;
 pub mod o_path;
 pub mod open_flags;
+pub mod openat2;
 pub mod permissions;
 pub mod pnode;
 pub mod posix_lock;

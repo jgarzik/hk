@@ -64,12 +64,43 @@ pub fn sys_open(path: UserPtr<u8>, flags: u32, mode: u32) -> KernelResult<i32> {
 const S_IALLUGO: u64 = 0o7777;
 
 /// An open's request (Linux struct open_how, include/uapi/linux/openat2.h)
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenHow {
     pub flags: u64,
     pub mode: u64,
     pub resolve: u64,
 }
+crate::pod!(OpenHow {
+    flags,
+    mode,
+    resolve
+});
+
+/// open_how.flags: only a regular file opens (EFTYPE); in the upper
+/// half, which open(2)'s int cannot reach (Linux OPENAT2_REGULAR)
+pub const OPENAT2_REGULAR: u64 = 1 << 32;
+
+/// open_how.resolve (Linux include/uapi/linux/openat2.h)
+pub mod resolve {
+    /// No mount crossing, symlinks and magic links included
+    pub const RESOLVE_NO_XDEV: u64 = 0x01;
+    /// No /proc-style magic links
+    pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    /// No symlinks at all (magic links included)
+    pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    /// Never leave dirfd (EXDEV)
+    pub const RESOLVE_BENEATH: u64 = 0x08;
+    /// dirfd is the root, as if chrooted there
+    pub const RESOLVE_IN_ROOT: u64 = 0x10;
+    /// Only what the dcache holds, else EAGAIN
+    pub const RESOLVE_CACHED: u64 = 0x20;
+    /// Every flag (Linux VALID_RESOLVE_FLAGS)
+    pub const VALID: u64 = 0x3f;
+}
+
+/// The first published open_how (Linux OPEN_HOW_SIZE_VER0)
+const OPEN_HOW_SIZE_VER0: usize = 24;
 
 /// What an open does (Linux struct open_flags, fs/internal.h)
 pub struct OpenFlags {
@@ -81,6 +112,8 @@ pub struct OpenFlags {
     /// MAY_* the open asks of an existing file
     acc: u32,
     lookup: LookupFlags,
+    /// OPENAT2_REGULAR (Linux __O_REGULAR, never in f_flags)
+    regular: bool,
 }
 
 /// The request of open(2)/openat(2) (Linux build_open_how): unknown
@@ -115,11 +148,20 @@ fn acc_bits(flags: u32) -> u32 {
 
 /// Check `how` and work out the open (Linux build_open_flags)
 pub fn build_open_flags(how: &OpenHow) -> Result<OpenFlags, KernelError> {
+    use resolve::*;
     let flags = how.flags & !u64::from(O_CLOEXEC);
-    let mut flags = u32::try_from(flags)
+    let regular = flags & OPENAT2_REGULAR != 0;
+    let mut flags = u32::try_from(flags & !OPENAT2_REGULAR)
         .ok()
         .filter(|f| f & !VALID_OPEN_FLAGS == 0)
         .ok_or(KernelError::InvalidArgument)?;
+    if how.resolve & !VALID != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    // The scoping flags exclude each other
+    if how.resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT) == RESOLVE_BENEATH | RESOLVE_IN_ROOT {
+        return Err(KernelError::InvalidArgument);
+    }
     let mode = if will_create(flags) {
         if how.mode & !S_IALLUGO != 0 {
             return Err(KernelError::InvalidArgument);
@@ -138,19 +180,32 @@ pub fn build_open_flags(how: &OpenHow) -> Result<OpenFlags, KernelError> {
     {
         return Err(KernelError::InvalidArgument);
     }
+    // A directory and a regular file at once is contradictory
+    if regular && flags & O_DIRECTORY != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
     let path = flags & O_PATH != 0;
-    if path && flags & !O_PATH_FLAGS != 0 {
+    if path && (regular || flags & !O_PATH_FLAGS != 0) {
         return Err(KernelError::InvalidArgument);
     }
     // O_SYNC is __O_SYNC|O_DSYNC: syncing code looks at O_DSYNC only
     if flags & __O_SYNC != 0 {
         flags |= O_DSYNC;
     }
+    // Not even tried for a create, truncate or tmpfile open
+    if how.resolve & RESOLVE_CACHED != 0 && flags & (O_TRUNC | O_CREAT | __O_TMPFILE) != 0 {
+        return Err(KernelError::WouldBlock);
+    }
+    // The walk does not take RESOLVE_* yet
+    if how.resolve != 0 {
+        return Err(KernelError::OperationNotSupported);
+    }
     Ok(OpenFlags {
         flags,
         mode,
         acc: if path { 0 } else { dac::acc_mode(flags) },
         lookup: open_lookup(flags),
+        regular,
     })
 }
 
@@ -225,6 +280,28 @@ fn open_target(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), 
 /// The new file descriptor
 pub fn sys_openat(dirfd: i32, path_ptr: UserPtr<u8>, flags: u32, mode: u32) -> KernelResult<i32> {
     do_sys_openat2(dirfd, path_ptr, &build_open_how(flags | O_LARGEFILE, mode))
+}
+
+/// sys_openat2 - openat with a size-versioned `struct open_how` (Linux
+/// openat2): every field checked (EINVAL), a struct shorter than the
+/// first version EINVAL, one over a page or with unknown nonzero
+/// fields E2BIG; O_LARGEFILE unless O_PATH
+pub fn sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: u64, usize: usize) -> KernelResult<i32> {
+    if usize < OPEN_HOW_SIZE_VER0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    if usize as u64 > crate::mm::PAGE_SIZE {
+        return Err(KernelError::ArgListTooLong);
+    }
+    let mut how = match crate::uaccess::copy_struct_from_user::<OpenHow>(how, usize) {
+        Ok(h) => h,
+        Err(None) => return Err(KernelError::ArgListTooLong),
+        Err(Some(_)) => return Err(KernelError::BadAddress),
+    };
+    if how.flags & u64::from(O_PATH) == 0 {
+        how.flags |= u64::from(O_LARGEFILE);
+    }
+    do_sys_openat2(dirfd, path_ptr, &how)
 }
 
 /// Open as `how` asks and install the file (Linux do_sys_openat2): the
@@ -310,6 +387,12 @@ fn filp_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, Kerne
     let (path, created) = open_target(dirfd, path, op)?;
     let dentry = path.dentry.clone();
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
+
+    // OPENAT2_REGULAR (Linux do_open): after O_CREAT's checks, before
+    // may_open's
+    if op.regular && !inode.mode().is_file() {
+        return Err(KernelError::WrongFileType);
+    }
 
     // may_open_dev: device nodes on a nodev mount cannot be opened
     let m = inode.mode();

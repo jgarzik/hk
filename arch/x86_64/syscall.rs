@@ -63,6 +63,8 @@ pub const SYS_PSELECT6: u64 = 270;
 pub const SYS_CLOSE: u64 = 3;
 /// close_range(fd, max_fd, flags)
 pub const SYS_CLOSE_RANGE: u64 = 436;
+/// openat2(dirfd, pathname, how, size)
+pub const SYS_OPENAT2: u64 = 437;
 /// stat(pathname, statbuf)
 pub const SYS_STAT: u64 = 4;
 /// fstat(fd, statbuf)
@@ -884,6 +886,7 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_CLONE3 => Sys::Clone3,
         SYS_CLOSE => Sys::Close,
         SYS_CLOSE_RANGE => Sys::CloseRange,
+        SYS_OPENAT2 => Sys::Openat2,
         SYS_CONNECT => Sys::Connect,
         SYS_COPY_FILE_RANGE => Sys::CopyFileRange,
         SYS_DUP => Sys::Dup,
