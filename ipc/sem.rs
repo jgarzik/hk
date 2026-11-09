@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ipc::util::{
     IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcOps, KernIpcPerm, ipc_checkperm, ipcget,
@@ -76,10 +76,6 @@ pub const SEMVMX: i32 = 32767;
 // release; the fast path rechecks it with acquire after its semaphore
 // lock (Linux SEM_BARRIER_1).
 
-/// A queued operation's status while it waits (Linux: the sleeper sets
-/// -EINTR, the waker stores the result with release)
-const SEM_WAITING: i32 = -(KernelError::Interrupted as i32);
-
 /// Global holds before complex mode is left (Linux
 /// USE_GLOBAL_LOCK_HYSTERESIS)
 const USE_GLOBAL_LOCK_HYSTERESIS: u32 = 10;
@@ -94,10 +90,11 @@ pub struct SemQueue {
     alter: bool,
     /// The caller's undo list (SEM_UNDO), whose adjustments it changes
     undo: Option<u64>,
-    /// `SEM_WAITING` until a waker completes it under the array's locks,
-    /// then 0 or a negative errno (Release; the sleeper reads it Acquire
-    /// without a lock, Linux q->status)
-    status: AtomicI32,
+    /// Unset while it waits; set once, by the waker that completes it
+    /// under the array's locks, to the operation's result (Release; the
+    /// sleeper reads it Acquire without a lock, Linux q->status: -EINTR
+    /// until set)
+    status: spin::Once<KernelResult<()>>,
 }
 
 /// A waiting operation and the index of the one it is blocked on
@@ -300,11 +297,6 @@ fn perform_atomic_semop(
     Ok(Semop::Done)
 }
 
-/// A finished waiter's status (Linux q->status): 0 or a negative errno
-fn semop_errno(r: KernelResult<Semop>) -> i32 {
-    r.map_or_else(KernelError::to_errno_neg, |_| 0)
-}
-
 fn set_adj(s: &mut PerSem, undo: u64, v: i16) {
     if v == 0 {
         s.undo.remove(&undo);
@@ -336,7 +328,7 @@ fn retry(l: &mut SemLock<'_>, q: &mut VecDeque<Waiter>, done: &mut Vec<usize>) -
         {
             g.complex_count -= 1;
         }
-        w.status.store(semop_errno(r), Ordering::Release);
+        w.status.call_once(|| r.map(|_| ()));
         woke = true;
         if r == Ok(Semop::Done) && w.alter {
             altered = true;
@@ -501,15 +493,15 @@ impl IpcObject for SemArray {
     fn destroy(&self) {
         {
             let mut l = self.lock_all();
-            let eidrm = KernelError::IdentifierRemoved.to_errno_neg();
+            let eidrm = Err(KernelError::IdentifierRemoved);
             let g = l.global().expect("complex mode");
             g.complex_count = 0;
             for (q, _) in g.pending.drain(..) {
-                q.status.store(eidrm, Ordering::Release);
+                q.status.call_once(|| eidrm);
             }
             for i in 0..self.nsems as usize {
                 for (q, _) in l.sem(i).pending.drain(..) {
-                    q.status.store(eidrm, Ordering::Release);
+                    q.status.call_once(|| eidrm);
                 }
             }
         }
@@ -676,7 +668,7 @@ pub fn sys_semtimedop(
         sops,
         alter,
         undo,
-        status: AtomicI32::new(SEM_WAITING),
+        status: spin::Once::new(),
     })?;
     let w = (queue.clone(), blocking);
     if queue.sops.len() == 1 {
@@ -707,12 +699,11 @@ pub fn sys_semtimedop(
         // Sleep until completed, the deadline or a signal (semop is
         // never restarted: EINTR)
         let r = sem_array.waitq.wait_event_interruptible_deadline(
-            || queue.status.load(Ordering::Acquire) != SEM_WAITING,
+            || queue.status.is_completed(),
             deadline_ns,
             crate::time::hrtimer::HrClock::Monotonic,
         );
-        let status = queue.status.load(Ordering::Acquire);
-        if status != SEM_WAITING {
+        if let Some(&status) = queue.status.get() {
             break status;
         }
         // Not completed: recheck under the locks, then unlink
@@ -720,8 +711,7 @@ pub fn sys_semtimedop(
         if sem_array.perm.is_deleted() {
             return Err(KernelError::IdentifierRemoved);
         }
-        let status = queue.status.load(Ordering::Acquire);
-        if status != SEM_WAITING {
+        if let Some(&status) = queue.status.get() {
             break status;
         }
         let timed_out = match r {
@@ -736,17 +726,7 @@ pub fn sys_semtimedop(
             KernelError::Interrupted
         });
     };
-    semop_status(status)
-}
-
-/// A semop status (0 or a negative errno, as Linux keeps it in
-/// sem_queue.status) as the call's result
-fn semop_status(s: i32) -> KernelResult<i32> {
-    if s < 0 {
-        // Only ever set from a KernelError
-        return Err(KernelError::from_errno(-s).unwrap_or(KernelError::InvalidArgument));
-    }
-    Ok(0)
+    status.map(|()| 0)
 }
 
 /// Take a waiter that gave up off its queue (Linux unlink_queue)
