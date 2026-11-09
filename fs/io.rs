@@ -12,9 +12,22 @@ use super::iov_iter::{IovDest, IovSource};
 use super::iov::IoVec;
 use super::syscall::{MAX_RW_COUNT, current_fd_table};
 
-/// The current task's file at `fd`, or EBADF (Linux fget/fdget): the
-/// fd table lock is dropped before return
+/// The current task's file at `fd`, or EBADF, a path-only (O_PATH)
+/// one included (Linux fget/fdget): the fd table lock is dropped before
+/// return
 pub fn fget(fd: i32) -> Result<Arc<File>, KernelError> {
+    fget_raw(fd).and_then(|f| {
+        if f.is_path() {
+            Err(KernelError::BadFd)
+        } else {
+            Ok(f)
+        }
+    })
+}
+
+/// As `fget`, a path-only file too (Linux fget_raw/fdget_raw): for the
+/// calls that only need where the file is (fstat, fstatfs, fchdir)
+pub fn fget_raw(fd: i32) -> Result<Arc<File>, KernelError> {
     current_fd_table().lock().get(fd).ok_or(KernelError::BadFd)
 }
 

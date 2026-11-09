@@ -8,7 +8,7 @@ use crate::util::error::KernelResult;
 use crate::util::pod::FromBytes;
 
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW};
-use super::io::fget;
+use super::io::fget_raw;
 
 // =============================================================================
 // Stat structure and helpers
@@ -81,7 +81,7 @@ fn stat_path(
 ///
 /// The fd first, the copy last (Linux newfstat: vfs_fstat, cp_new_stat)
 pub fn sys_fstat(fd: i32, statbuf: UserPtr<Stat>) -> KernelResult<()> {
-    let inode = fget(fd)?.get_inode().ok_or(KernelError::BadFd)?;
+    let inode = fget_raw(fd)?.get_inode().ok_or(KernelError::BadFd)?;
     Ok(statbuf.write(&fill_stat(&inode)?)?)
 }
 
@@ -322,7 +322,7 @@ fn st_flags(mnt_flags: u32, sb: &super::SuperBlock) -> u64 {
 ///
 /// The fd first, the copy last (Linux fstatfs: fd_statfs, copy_to_user)
 pub fn sys_fstatfs(fd: i32, buf: UserPtr<LinuxStatFs>) -> KernelResult<()> {
-    let file = fget(fd)?;
+    let file = fget_raw(fd)?;
     let sb = file.dentry.superblock().ok_or(KernelError::BadFd)?;
 
     // Get stats

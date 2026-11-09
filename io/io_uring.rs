@@ -742,7 +742,7 @@ impl IoUring {
             let slot = if fd == -1 {
                 None
             } else {
-                Some(fd_table_locked.get(fd).ok_or(KernelError::BadFd)?)
+                Some(reg_file(fd_table_locked.get(fd))?)
             };
             // Capacity is reserved; this cannot fail
             let _ = files.try_push(slot);
@@ -788,7 +788,7 @@ impl IoUring {
             if fd == -1 {
                 registered[offset + i] = None;
             } else {
-                registered[offset + i] = Some(fd_table_locked.get(fd).ok_or(KernelError::BadFd)?);
+                registered[offset + i] = Some(reg_file(fd_table_locked.get(fd))?);
             }
         }
 
@@ -1155,6 +1155,12 @@ fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
     let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr().cast::<u8>(), n * 4) };
     copy_from_user(bytes, arg, n * 4)?;
     Ok(fds)
+}
+
+/// A file to register: none, or a path-only one, is EBADF (Linux
+/// io_sqe_files_register: fget)
+fn reg_file(f: Option<Arc<File>>) -> KernelResult<Arc<File>> {
+    f.filter(|f| !f.is_path()).ok_or(KernelError::BadFd)
 }
 
 /// Get file from fd for current task

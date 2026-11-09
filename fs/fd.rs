@@ -352,6 +352,13 @@ fn setlk_recheck(fd: i32, file: &Arc<crate::fs::File>, flock: &Flock, range: (u6
     }
 }
 
+/// The commands a path-only (O_PATH) descriptor takes (Linux
+/// check_fcntl_cmd): it and its descriptor flags, not the file
+fn path_cmd(cmd: i32) -> bool {
+    use fcntl_cmd::*;
+    matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL)
+}
+
 /// sys_fcntl - file control operations
 ///
 /// # Returns
@@ -365,11 +372,16 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
 
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
+    // Any open file (Linux fdget_raw); a path-only one only for the
+    // descriptor commands (check_fcntl_cmd)
+    let file = table.get(fd).ok_or(KernelError::BadFd)?;
+    if file.is_path() && !path_cmd(cmd) {
+        return Err(KernelError::BadFd);
+    }
 
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             // Duplicate fd to lowest available >= arg
-            let file = table.get(fd).ok_or(KernelError::BadFd)?;
             let nofile = get_nofile_limit();
             let min_fd = arg as i32;
             // Linux: if (from >= nofile) return -EINVAL
@@ -386,13 +398,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
             Ok(i64::from(new_fd))
         }
 
-        F_GETFD => {
-            // Get fd flags (FD_CLOEXEC)
-            if !table.is_valid(fd) {
-                return Err(KernelError::BadFd);
-            }
-            Ok(i64::from(table.get_fd_flags(fd)))
-        }
+        // Get fd flags (FD_CLOEXEC)
+        F_GETFD => Ok(i64::from(table.get_fd_flags(fd))),
 
         F_SETFD => {
             // Set fd flags (only FD_CLOEXEC is valid)
@@ -402,13 +409,9 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
             Ok(0)
         }
 
-        F_GETFL => {
-            let file = table.get(fd).ok_or(KernelError::BadFd)?;
-            Ok(i64::from(file.get_flags()))
-        }
+        F_GETFL => Ok(i64::from(file.get_flags())),
 
         F_SETFL => {
-            let file = table.get(fd).ok_or(KernelError::BadFd)?;
             // ->fasync takes sleeping locks
             drop(table);
             setfl(fd, &file, arg as u32)?;
@@ -417,7 +420,6 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
 
         F_GETLK => {
             // Get lock info - test if a lock would block
-            let file = table.get(fd).ok_or(KernelError::BadFd)?;
             drop(table); // Release FD table lock before copying
             let uflock = UserPtr::<Flock>::new(arg);
             let mut flock = uflock.read()?;
@@ -428,7 +430,6 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
 
         F_SETLK | F_SETLKW => {
             // F_SETLKW: blocking - but we don't actually block, like flock
-            let file = table.get(fd).ok_or(KernelError::BadFd)?;
             drop(table);
             let flock = UserPtr::<Flock>::new(arg).read()?;
             let range = if cmd == F_SETLK {
@@ -441,14 +442,12 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
         }
 
         crate::mm::memfd::F_ADD_SEALS | crate::mm::memfd::F_GET_SEALS => {
-            let file = table.get(fd).ok_or(KernelError::BadFd)?;
             // Adding takes the inode's sleeping lock
             drop(table);
             crate::mm::memfd::fcntl(&file, cmd, arg)
         }
 
         F_SETOWN | F_GETOWN | F_SETOWN_EX | F_GETOWN_EX | F_SETSIG | F_GETSIG => {
-            let file = table.get(fd).ok_or(KernelError::BadFd)?;
             // They allocate and copy to and from the user
             drop(table);
             fcntl_owner(&file, cmd, arg)
@@ -495,4 +494,21 @@ fn fcntl_owner(file: &File, cmd: i32, arg: u64) -> KernelResult<i64> {
         _ => return Ok(i64::from(fasync::f_getsig(file))),
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fcntl_cmd::*;
+    use super::path_cmd;
+
+    /// Linux check_fcntl_cmd: an O_PATH descriptor takes only these
+    #[test]
+    fn path_cmds() {
+        for c in [F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL] {
+            assert!(path_cmd(c));
+        }
+        for c in [F_SETFL, F_GETLK, F_SETLK, F_SETLKW, F_SETOWN, F_GETOWN] {
+            assert!(!path_cmd(c));
+        }
+    }
 }

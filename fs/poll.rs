@@ -211,8 +211,8 @@ fn do_poll_internal(fds: UserPtr<PollFd>, nfds: u32, deadline: Deadline) -> Kern
                 continue;
             }
 
-            // Look up the file
-            let file = fd_table.lock().get(pollfd.fd);
+            // Look up the file; a path-only one is none (Linux fdget)
+            let file = fd_table.lock().get(pollfd.fd).filter(|f| !f.is_path());
             let Some(file) = file else {
                 // Invalid fd - set POLLNVAL
                 pollfd.revents = POLLNVAL as i16;
@@ -487,8 +487,9 @@ fn do_select_internal(
             if !r && !w && !x {
                 continue;
             }
-            // Looked up alone, polled with no lock held (a poll may sleep)
-            let file = fd_table.lock().get(fd as i32);
+            // Looked up alone, polled with no lock held (a poll may
+            // sleep); a path-only file is none (Linux fdget)
+            let file = fd_table.lock().get(fd as i32).filter(|f| !f.is_path());
             let Some(file) = file else {
                 set_current_state(SleepState::Running);
                 return Err(KernelError::BadFd);

@@ -59,6 +59,9 @@ pub mod flags {
     pub const O_CLOEXEC: u32 = 0o2000000;
     /// File integrity sync (O_SYNC is it with O_DSYNC)
     pub const __O_SYNC: u32 = 0o4000000;
+    /// A path-only file: a place in the tree, no I/O (asm-generic,
+    /// both arches)
+    pub const O_PATH: u32 = 0o10000000;
     /// An unnamed file in the directory named (asm-generic __O_TMPFILE;
     /// O_TMPFILE is it with O_DIRECTORY)
     pub const __O_TMPFILE: u32 = 0o20000000;
@@ -394,6 +397,9 @@ pub struct File {
     /// File operations
     pub f_op: &'static dyn FileOps,
 
+    /// Opened O_PATH (Linux FMODE_PATH): fixed at open
+    path_only: bool,
+
     /// SIGIO owner (Linux f_owner), allocated on first use
     /// (`io::fasync`)
     pub(crate) f_owner: spin::Once<Arc<crate::io::fasync::FOwner>>,
@@ -469,6 +475,7 @@ impl File {
             f_ep: Mutex::new(alloc::vec::Vec::new()),
             f_lock: Mutex::new(flags),
             f_op,
+            path_only: flags & flags::O_PATH != 0,
             f_owner: spin::Once::new(),
             write_access: None,
             i_write: None,
@@ -559,14 +566,28 @@ impl File {
         *guard = (*guard & !SETTABLE_FLAGS) | (new_status & SETTABLE_FLAGS);
     }
 
+    /// A path-only (O_PATH) file (Linux FMODE_PATH): it names a place
+    /// in the tree, for *at() calls, fstat, fchdir, dup; every other use
+    /// of the descriptor is EBADF
+    #[inline]
+    pub fn is_path(&self) -> bool {
+        self.path_only
+    }
+
     /// Check if file is readable
     pub fn is_readable(&self) -> bool {
+        if self.path_only {
+            return false;
+        }
         let mode = self.get_flags() & flags::O_ACCMODE;
         mode == flags::O_RDONLY || mode == flags::O_RDWR
     }
 
     /// Check if file is writable
     pub fn is_writable(&self) -> bool {
+        if self.path_only {
+            return false;
+        }
         let mode = self.get_flags() & flags::O_ACCMODE;
         mode == flags::O_WRONLY || mode == flags::O_RDWR
     }
