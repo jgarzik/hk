@@ -877,11 +877,6 @@ Designs that grew one commit at a time. Tag = roadmap phase
   do_clone (523 lines), exit, wait, credential setters, five sleep
   APIs. Split like Linux (sched/core, fork, exit, cred). Other giants:
   sys_prctl, do_semctl, sys_mmap, exec_file, sys_fcntl.
-- **Arch code in generic files** (M2): over a hundred
-  `cfg(target_arch)` outside `arch/` (main.rs, hw/dma.rs, percpu.rs,
-  misc, pci, seccomp's audit arch), dozens of direct
-  `arch::x86_64::`/`aarch64::` references, three `CurrentArch`
-  redefinitions.
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
   softnet/0 only; CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
