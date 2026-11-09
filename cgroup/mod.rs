@@ -313,6 +313,57 @@ impl Cgroup {
         path
     }
 
+    /// This cgroup or its ancestor at `level` (at most its own)
+    fn at_level(&self, anc: &[Weak<Cgroup>], level: u32) -> *const Cgroup {
+        if level == self.level {
+            core::ptr::from_ref(self)
+        } else {
+            anc.get(level as usize)
+                .map_or(core::ptr::null(), Weak::as_ptr)
+        }
+    }
+
+    /// The path to this cgroup from `from` (Linux kernfs_path_from_node,
+    /// as cgroup_path_ns uses it): "/" for `from` itself, else "/.." for
+    /// each level from `from` up to their common ancestor, then "/name"
+    /// for each level down to this one
+    pub fn path_from(&self, from: &Cgroup) -> Vec<u8> {
+        if core::ptr::eq(self, from) {
+            return Vec::from(b"/".as_slice());
+        }
+        let common = {
+            let mine = self.ancestors.read();
+            let theirs = from.ancestors.read();
+            (0..=self.level.min(from.level))
+                .take_while(|&l| self.at_level(&mine, l) == from.at_level(&theirs, l))
+                .last()
+        };
+        // Different hierarchies: the full path
+        let Some(common) = common else {
+            return self.path();
+        };
+        // The ancestors below the common one, nearest first
+        let mut up = Vec::new();
+        let mut cur = self.parent();
+        while let Some(c) = cur.filter(|c| c.level > common) {
+            cur = c.parent();
+            up.push(c);
+        }
+        let mut p = Vec::new();
+        for _ in common..from.level {
+            p.extend_from_slice(b"/..");
+        }
+        for c in up.iter().rev() {
+            p.push(b'/');
+            p.extend_from_slice(&c.name);
+        }
+        if common < self.level {
+            p.push(b'/');
+            p.extend_from_slice(&self.name);
+        }
+        p
+    }
+
     /// Check subtree_control for a controller
     pub fn subtree_control_enabled(&self, controller: ControllerType) -> bool {
         let mask = self.subtree_control.load(Ordering::Relaxed);

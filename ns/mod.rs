@@ -276,9 +276,11 @@ impl NsProxy {
         };
 
         let cgroup_ns = if flags & CLONE_NEWCGROUP != 0 {
-            // New cgroup namespace rooted at current task's cgroup
-            // For now, use the same root (proper implementation would get task's cgroup)
-            self.cgroup_ns.clone_ns(self.cgroup_ns.root())?
+            // Rooted at the caller's cgroup (Linux copy_cgroup_ns:
+            // current's css_set, the parent's for a clone)
+            let cg = crate::task::percpu::current().cgroup.lock().clone();
+            self.cgroup_ns
+                .clone_ns(cg.unwrap_or_else(|| self.cgroup_ns.root()))?
         } else {
             self.cgroup_ns.clone()
         };
@@ -431,8 +433,13 @@ pub fn current_net_ns() -> Arc<NetNamespace> {
 /// Currently supported namespace flags for unshare
 ///
 /// We support UTS, mount, PID, user, IPC, and network namespaces.
-const SUPPORTED_NS_FLAGS: u64 =
-    CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER | CLONE_NEWIPC | CLONE_NEWNET;
+const SUPPORTED_NS_FLAGS: u64 = CLONE_NEWUTS
+    | CLONE_NEWNS
+    | CLONE_NEWPID
+    | CLONE_NEWUSER
+    | CLONE_NEWIPC
+    | CLONE_NEWNET
+    | CLONE_NEWCGROUP;
 
 /// CLONE_SYSVSEM flag - used by unshare to detach from shared semundo
 const CLONE_SYSVSEM: u64 = 0x00040000;

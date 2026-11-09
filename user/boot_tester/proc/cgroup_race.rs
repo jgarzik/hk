@@ -58,6 +58,12 @@
 //! - CGROUP_NAME_BYTES: a cgroup name that is not UTF-8 works and shows
 //!   raw in /proc/self/cgroup; one with a newline is EINVAL.
 //!
+//! - CGROUP_NS_PATH: /proc/self/cgroup shows the path from the reader's
+//!   cgroup namespace root (Linux cgroup_path_ns, kernfs_path_from_node):
+//!   a namespace made in the root cgroup shows "/a" for /a; one rooted
+//!   at /nb shows "/" there, "/d" for /nb/d, "/../nc" for its sibling
+//!   /nc and "/.." for the root.
+//!
 //! Runs after cgroup.rs, which mounts cgroup2 at /sys/fs/cgroup and
 //! enables +pids at the root.
 
@@ -95,6 +101,54 @@ pub fn run_tests() {
     report_step(b"CPU_MAX_RW", cpu_max_rw());
     report_step(b"PIDS_MAX_BOUNDS", pids_max_bounds());
     report_step(b"CGROUP_NAME_BYTES", name_bytes());
+    report_step(b"CGROUP_NS_PATH", ns_path());
+}
+
+const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+
+/// Paths seen from a cgroup namespace (in children, which unshare it)
+fn ns_path() -> i64 {
+    let mut b = [0u8; 96];
+    for c in [&b"nsa"[..], b"nb", b"nb/d", b"nc"] {
+        sys_mkdir(path(&mut b, c, b"").as_ptr(), 0o755);
+    }
+    let rooted_at_root = in_child(|| {
+        if sys_unshare(CLONE_NEWCGROUP) != 0 {
+            1
+        } else if !self_in(b"0::/\n") {
+            2
+        } else if !join(b"nsa") || !self_in(b"0::/nsa\n") {
+            3
+        } else {
+            0
+        }
+    });
+    let rooted_below = in_child(|| {
+        let at = |c: &[u8], want: &[u8]| join(c) && self_in(want);
+        if !join(b"nb") || sys_unshare(CLONE_NEWCGROUP) != 0 {
+            1
+        } else if !self_in(b"0::/\n") {
+            2
+        } else if !at(b"nb/d", b"0::/d\n") {
+            3
+        } else if !at(b"nc", b"0::/../nc\n") {
+            4
+        } else if !at(b"", b"0::/..\n") {
+            5
+        } else {
+            0
+        }
+    });
+    for c in [&b"nb/d"[..], b"nb", b"nc", b"nsa"] {
+        remove_cgroup(c);
+    }
+    if rooted_at_root != 0 {
+        rooted_at_root
+    } else if rooted_below != 0 {
+        10 + rooted_below
+    } else {
+        0
+    }
 }
 
 /// A cgroup name is bytes (Linux kernfs): one that is not UTF-8 is

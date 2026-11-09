@@ -1457,7 +1457,7 @@ fn maps_of(mm: &crate::mm::MmStruct) -> Result<Vec<u8>, KernelError> {
     Ok(out.into_vec())
 }
 
-/// Get the cgroup path for a task (virtualized to its namespace)
+/// The cgroup path of task `t`, seen from the reader's cgroup namespace
 fn get_task_cgroup_path(t: &TaskRef) -> Vec<u8> {
     use crate::ns::INIT_CGROUP_NS;
 
@@ -1469,11 +1469,11 @@ fn get_task_cgroup_path(t: &TaskRef) -> Vec<u8> {
         return Vec::from(b"/".as_slice());
     };
 
-    // Get the task's cgroup namespace
-    let cgroup_ns =
-        task_nsproxy(t).map_or_else(|| INIT_CGROUP_NS.clone(), |ns| ns.cgroup_ns.clone());
-
-    // Translate the cgroup path relative to the namespace root
+    // Seen from the reader's cgroup namespace (Linux proc_cgroup_show:
+    // current->nsproxy->cgroup_ns)
+    let cgroup_ns = crate::task::percpu::current()
+        .nsproxy()
+        .map_or_else(|| INIT_CGROUP_NS.clone(), |ns| ns.cgroup_ns.clone());
     cgroup_ns.translate_path(&cgroup)
 }
 
