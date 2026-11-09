@@ -452,7 +452,7 @@ pub fn init_mount_tree() -> Result<Arc<Mount>, KernelError> {
         false,
         b"nullfs".as_slice().into(),
     )?;
-    let rootfs_type = &super::tmpfs::ROOTFS_TYPE;
+    let rootfs_type = &super::ramfs::tmpfs::ROOTFS_TYPE;
     let sb = (rootfs_type.mount)(rootfs_type, b"")?;
     let on = Path::new(null.clone(), null.root.clone());
     let rootfs = attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())?;

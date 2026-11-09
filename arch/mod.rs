@@ -881,7 +881,7 @@ pub trait ExceptionOps {
 pub trait InitramfsOps {
     /// The initramfs (cpio archive) from the boot information, freed
     /// after unpacking. Panics if there is none (required for boot).
-    fn get_initramfs() -> crate::fs::cpio::Initrd;
+    fn get_initramfs() -> crate::fs::ramfs::cpio::Initrd;
 }
 
 /// Optional VFS initialization extensions

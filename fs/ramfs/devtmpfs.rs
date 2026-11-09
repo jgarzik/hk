@@ -40,7 +40,7 @@ fn root() -> Option<Arc<Dentry>> {
 /// A mount: the one superblock; `opts` only parsed (a bad option fails
 /// the mount)
 fn mount(_t: &'static FileSystemType, opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
-    crate::fs::tmpfs::check_opts(opts)?;
+    crate::fs::ramfs::tmpfs::check_opts(opts)?;
     DEVTMPFS.get().cloned().ok_or(KernelError::NoDevice)
 }
 
@@ -82,7 +82,7 @@ pub fn device_del(name: &str) {
 
 /// Create the superblock (Linux devtmpfs_init, in driver_init)
 pub fn init() {
-    match crate::fs::tmpfs::tmpfs_mount(&DEVTMPFS_TYPE, b"mode=0755") {
+    match crate::fs::ramfs::tmpfs::tmpfs_mount(&DEVTMPFS_TYPE, b"mode=0755") {
         Ok(sb) => {
             DEVTMPFS.call_once(|| sb);
         }

@@ -2,7 +2,7 @@
 //!
 //! Ramfs stores file contents entirely in memory, with no limit and no
 //! xattrs (Linux fs/ramfs). Its inodes, directories and page-cache files
-//! are also tmpfs's (`fs::tmpfs`), which adds the limits and xattrs.
+//! are also tmpfs's (`fs::ramfs::tmpfs`), which adds the limits and xattrs.
 //!
 //! ## Locking Model
 //!
@@ -122,7 +122,7 @@ static TMPFS_AOPS: TmpfsAops = TmpfsAops;
 fn file_mapping(sb: &SuperBlock, inode: &Inode) {
     inode.i_data.set_flags(filemap::AS_UNEVICTABLE);
     // tmpfs charges its pages (Linux shmem_inode_acct_blocks)
-    if let Some(a) = super::tmpfs::with(sb, |t| t.page_acct()) {
+    if let Some(a) = tmpfs::with(sb, |t| t.page_acct()) {
         inode.i_data.set_aops(&TMPFS_AOPS);
         inode.i_data.set_acct(a);
     } else {
@@ -384,7 +384,7 @@ impl InodeData for RamfsInodeData {}
 /// The xattr space of `inode`'s file system (None: not counted)
 fn xattr_pool(inode: &Inode) -> Option<Arc<AtomicU64>> {
     let sb = inode.superblock()?;
-    super::tmpfs::with(&sb, |t| t.xattr_pool())?
+    tmpfs::with(&sb, |t| t.xattr_pool())?
 }
 
 /// The inode's file system has user.* xattrs: tmpfs does (Linux
@@ -392,18 +392,18 @@ fn xattr_pool(inode: &Inode) -> Option<Arc<AtomicU64>> {
 fn has_xattrs(inode: &Inode) -> bool {
     inode
         .superblock()
-        .is_some_and(|sb| super::tmpfs::with(&sb, |_| ()).is_some())
+        .is_some_and(|sb| tmpfs::with(&sb, |_| ()).is_some())
 }
 
 /// Take one of the file system's inodes (tmpfs: ENOSPC when none is
 /// left, Linux shmem_reserve_inode; ramfs counts none)
 fn reserve_inode(sb: &SuperBlock) -> Result<(), KernelError> {
-    super::tmpfs::with(sb, |t| t.reserve_inode()).unwrap_or(Ok(()))
+    tmpfs::with(sb, |t| t.reserve_inode()).unwrap_or(Ok(()))
 }
 
 /// Give one back (Linux shmem_free_inode)
 fn free_inode(sb: &SuperBlock) {
-    super::tmpfs::with(sb, |t| t.free_inode());
+    tmpfs::with(sb, |t| t.free_inode());
 }
 
 /// `f` on the seals of `inode` if it is a tmpfs regular file (Linux
@@ -413,7 +413,7 @@ pub fn with_seals<R>(
     f: impl FnOnce(&core::sync::atomic::AtomicU32) -> R,
 ) -> Option<R> {
     let sb = inode.superblock()?;
-    if !inode.mode().is_file() || super::tmpfs::max_blocks(&sb).is_none() {
+    if !inode.mode().is_file() || tmpfs::max_blocks(&sb).is_none() {
         return None;
     }
     let p = inode.get_private()?;
@@ -691,9 +691,7 @@ impl InodeOps for RamfsInodeOps {
     ) -> Result<(), KernelError> {
         use super::misc::falloc_mode::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
         // ramfs has no fallocate (Linux ramfs_file_operations)
-        let max = inode
-            .superblock()
-            .and_then(|sb| super::tmpfs::max_blocks(&sb));
+        let max = inode.superblock().and_then(|sb| tmpfs::max_blocks(&sb));
         let Some(max) = max else {
             return Err(KernelError::OperationNotSupported);
         };
@@ -1305,7 +1303,7 @@ fn new_inode(
     match kind {
         Kind::File => {
             let mut d = RamfsInodeData::new_file();
-            if super::tmpfs::max_blocks(sb).is_some() {
+            if tmpfs::max_blocks(sb).is_some() {
                 *d.seals.get_mut() = crate::mm::memfd::F_SEAL_SEAL;
             }
             inode.set_private(try_arc(d)?);

@@ -2835,7 +2835,7 @@ pub fn set_set_child_tid(t: &Task, addr: u64) {
 /// cgroup directory, ENOENT for a removed one
 /// (css_tryget_online_from_dir)
 pub fn cgroup_from_fd(fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
-    use crate::fs::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
+    use crate::cgroup::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
     let file = percpu::current()
         .files()
         .and_then(|t| t.lock().get(fd))

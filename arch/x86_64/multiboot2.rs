@@ -145,7 +145,7 @@ fn module_range(name: &str) -> Option<(u64, u64)> {
 }
 
 /// The initramfs module's physical range [start, end): its pages are
-/// freed once it is unpacked (`fs::cpio::Initrd`)
+/// freed once it is unpacked (`fs::ramfs::cpio::Initrd`)
 pub fn initrd_range() -> Option<(u64, u64)> {
     module_range(INITRD)
 }

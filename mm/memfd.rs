@@ -1,7 +1,7 @@
 //! memfd_create and file sealing (Linux mm/memfd.c)
 //!
 //! A memfd is an unnamed file on the kernel's tmpfs
-//! (`fs::tmpfs::shmem_file_setup`). Seals live with every tmpfs file
+//! (`fs::ramfs::tmpfs::shmem_file_setup`). Seals live with every tmpfs file
 //! (`RamfsInodeData.seals`, Linux shmem_inode_info.seals): each starts
 //! with F_SEAL_SEAL, which memfd_create clears for MFD_ALLOW_SEALING.
 //! They are enforced where Linux shmem does: write_begin (WRITE,
@@ -106,7 +106,7 @@ pub fn sys_memfd_create(uname: UserPtr<u8>, flags: u32) -> KernelResult<i32> {
     if flags & MFD_HUGETLB != 0 {
         return Err(KernelError::NotImplemented);
     }
-    let file = crate::fs::tmpfs::shmem_file_setup(&name, 0, O_RDWR | O_LARGEFILE)?;
+    let file = crate::fs::ramfs::tmpfs::shmem_file_setup(&name, 0, O_RDWR | O_LARGEFILE)?;
     let inode = file.get_inode().ok_or(KernelError::Io)?;
     if flags & MFD_NOEXEC_SEAL != 0 {
         inode.set_mode_perm(inode.mode().perm() & !0o111);

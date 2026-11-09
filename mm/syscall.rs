@@ -282,7 +282,7 @@ pub fn sys_mmap(
     } else if is_shared {
         // Shared anonymous memory is a file of its size on the kernel's
         // tmpfs (Linux shmem_zero_setup: "/dev/zero (deleted)")
-        let f = crate::fs::tmpfs::shmem_kernel_file_setup(b"dev/zero", length)?;
+        let f = crate::fs::ramfs::tmpfs::shmem_kernel_file_setup(b"dev/zero", length)?;
         Vma::new_file(map_addr, map_addr + length, prot, share, f, 0)
     } else {
         // Private anonymous memory, with an anon_vma for the reverse map

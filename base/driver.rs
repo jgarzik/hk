@@ -13,8 +13,8 @@ use spin::Once;
 use super::bus::{BusType, trim};
 use super::core::Device;
 use crate::fs::KernelError;
+use crate::fs::kernfs::sysfs;
 use crate::fs::kernfs::{Attr, KNode, SysBuf};
-use crate::fs::sysfs;
 use crate::util::kalloc::arc_nofail;
 
 /// A driver's id table, of its bus's type (`platform::Names`,

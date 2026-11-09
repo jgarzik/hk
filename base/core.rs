@@ -30,8 +30,8 @@ use super::class::Class;
 use super::driver::{Bound, Driver};
 use crate::fs::KernelError;
 use crate::fs::chardev::DevId;
+use crate::fs::kernfs::sysfs;
 use crate::fs::kernfs::{self, Attr, KNode, SysBuf};
-use crate::fs::sysfs;
 use crate::sync::Mutex;
 use crate::sync::spin::{Mutex as SpinMutex, RwLock};
 use crate::util::kalloc::{try_arc, try_arc_cyclic};
@@ -355,7 +355,7 @@ impl Device {
             self.added.lock().sys_dev = true;
             let n = self.devnode();
             let mode = if n.mode != 0 { n.mode } else { 0o600 };
-            crate::fs::devtmpfs::device_add(&n.name, dt, self.is_blk(), mode);
+            crate::fs::ramfs::devtmpfs::device_add(&n.name, dt, self.is_blk(), mode);
             self.added.lock().devnode = true;
         }
         if let Some(f) = self.attrs {
@@ -406,7 +406,7 @@ impl Device {
         }
         if let Some(dt) = self.devt {
             if a.devnode {
-                crate::fs::devtmpfs::device_del(&self.devnode().name);
+                crate::fs::ramfs::devtmpfs::device_del(&self.devnode().name);
             }
             if a.sys_dev {
                 let mm = alloc::format!("{}:{}", dt.major, dt.minor);

@@ -121,7 +121,7 @@ impl ShmidKernel {
             ctim: AtomicI64::new(now),
             cpid: pid,
             lpid: AtomicI32::new(pid),
-            file: crate::fs::tmpfs::shmem_kernel_file_setup(
+            file: crate::fs::ramfs::tmpfs::shmem_kernel_file_setup(
                 alloc::format!("SYSV{:08x}", key as u32).as_bytes(),
                 size as u64,
             )?,

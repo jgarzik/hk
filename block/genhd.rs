@@ -64,7 +64,7 @@ static SYS_BLOCK: Once<Arc<KNode>> = Once::new();
 /// Linux genhd_device_init: the class and /sys/block
 pub fn genhd_init() {
     BLOCK_CLASS.register();
-    SYS_BLOCK.call_once(|| crate::fs::sysfs::top_dir(b"block"));
+    SYS_BLOCK.call_once(|| crate::fs::kernfs::sysfs::top_dir(b"block"));
 }
 
 fn bdev_of(dev: &Device) -> Option<&BlockDevice> {

@@ -645,8 +645,8 @@ pub fn find_filesystem(name: &str) -> Option<&'static FileSystemType> {
 /// Should be called during VFS initialization before any mounts.
 pub fn init_fs_registry() {
     register_filesystem(&super::ramfs::RAMFS_TYPE);
-    register_filesystem(&super::tmpfs::TMPFS_TYPE);
+    register_filesystem(&super::ramfs::tmpfs::TMPFS_TYPE);
     register_filesystem(&super::proc::PROCFS_TYPE);
     register_filesystem(&super::vfat::VFAT_TYPE);
-    register_filesystem(&super::cgroupfs::CGROUPFS_TYPE);
+    register_filesystem(&crate::cgroup::cgroupfs::CGROUPFS_TYPE);
 }

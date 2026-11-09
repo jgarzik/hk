@@ -462,12 +462,12 @@ impl ExceptionOps for X86_64Arch {
 }
 
 impl InitramfsOps for X86_64Arch {
-    fn get_initramfs() -> crate::fs::cpio::Initrd {
+    fn get_initramfs() -> crate::fs::ramfs::cpio::Initrd {
         let (start, end) = crate::arch::x86_64::multiboot2::initrd_range()
             .expect("initramfs module not loaded by bootloader");
         // SAFETY: a module the info structure lists, reserved since
         // boot (`boot_ranges`); `find_module` never returns it
-        unsafe { crate::fs::cpio::Initrd::loaded(start, end) }
+        unsafe { crate::fs::ramfs::cpio::Initrd::loaded(start, end) }
     }
 }
 

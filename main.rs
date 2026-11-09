@@ -297,7 +297,7 @@ pub(crate) fn kmain() -> ! {
     // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
     // (chr_dev_init), then device initcalls (bus probes below)
     mnt_init();
-    fs::devtmpfs::init();
+    fs::ramfs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();
     base::topology_init();
@@ -340,7 +340,7 @@ pub(crate) fn kmain() -> ! {
         .expect("VFS root not initialized")
         .dentry
         .clone();
-    match fs::unpack_cpio(initrd.data(), &root_dentry) {
+    match fs::ramfs::cpio::unpack_cpio(initrd.data(), &root_dentry) {
         Ok(n) => printkln!("initramfs: {} files", n),
         Err(e) => {
             printkln!("ERR: initramfs: {:?}", e);
@@ -451,10 +451,10 @@ fn mnt_init() {
     use fs::{init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
-    fs::sysfs::init();
+    fs::kernfs::sysfs::init();
     // The kernel's tmpfs (Linux shmem_init, before init_rootfs and
     // init_mount_tree)
-    if let Err(e) = fs::tmpfs::shmem_init() {
+    if let Err(e) = fs::ramfs::tmpfs::shmem_init() {
         printkln!("ERR: tmpfs: {:?}", e);
     }
     let root_mount = match fs::mount::init_mount_tree() {

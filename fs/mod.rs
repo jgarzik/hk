@@ -49,19 +49,11 @@ pub mod nullfs;
 pub mod proc;
 pub mod ramfs;
 pub mod vfat;
-// Filesystems kept under their old paths: tmpfs, devtmpfs and the
-// initramfs unpacker live with ramfs, sysfs with kernfs, cgroupfs with
-// the cgroup core
-pub use crate::cgroup::cgroupfs;
-pub use kernfs::sysfs;
-pub use ramfs::{cpio, devtmpfs, tmpfs};
 
 // Re-exports for convenience
 pub use crate::util::error::KernelError;
 use crate::util::error::KernelResult;
 pub use blkdev_ops::BLOCK_FILE_OPS;
-pub use cgroupfs::{CGROUPFS_FILE_OPS, CGROUPFS_TYPE};
-pub use cpio::unpack_cpio;
 pub use dac::{MAY_EXEC, MAY_READ, MAY_WRITE};
 pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, RwFlags, flags, seek};
