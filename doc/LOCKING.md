@@ -217,11 +217,11 @@ the mmap_lock (`Mm.map`), `AnonVma.chain`; `Mutex`:
 Linux seqlock_t: `write()` takes a spin lock and keeps the sequence odd
 while held (Release fences around the writer's stores); lockless
 readers use `read_begin`/`read_retry` and repeat a read that raced a
-writer. Thread context only. Used for `MOUNT_LOCK`. `SeqCount` (Linux
-seqcount_t) is the sequence alone, for writers that already hold a
-lock of their own (spinning, so a reader's `read_begin` never waits on
-a sleeping writer): `dentry::RENAME_SEQ` under `RENAME_LOCK`'s write
-side.
+writer. Thread context only. Used for `MOUNT_LOCK`. `SeqRwLock` is the
+same with a spin RwLock (its write guard bumps the sequence): locking
+readers share it (Linux read_seqlock_excl excludes them), lockless ones
+sample the sequence. Used for `dentry::RENAME_LOCK` (Linux rename_lock).
+Both are built on `SeqCount` (Linux seqcount_t), the sequence alone.
 
 ### 1.5 Lockdep-lite (`sync::lockdep`, feature `lockdep`)
 
@@ -345,10 +345,9 @@ VFS locks (detailed order):
         → SuperBlock.s_mounts (spin leaf: a new mount, a read-only
                    remount's snapshot)
         ↓
-    dentry::RENAME_LOCK (spin RwLock, Linux rename_lock: write in
-                   d_move/d_exchange, read in is_subdir/d_path)
-        → dentry::RENAME_SEQ (SeqCount, written inside RENAME_LOCK's
-                   write side; read lock-free by scoped walks)
+    dentry::RENAME_LOCK (SeqRwLock, spin; Linux rename_lock: write in
+                   d_move/d_exchange, read in is_subdir/d_path, its
+                   sequence read lock-free by scoped walks)
         ↓
     MntNamespace.root, Mount.{children, parent, mountpoint} (spin;
                    d_path reads parent/mountpoint under RENAME_LOCK)
@@ -2003,8 +2002,8 @@ struct DentryInner {
 A rename moves the dentry itself (`d_move`, `d_exchange`) under the
 global `RENAME_LOCK` (write; Linux rename_lock), with both parents'
 `i_rwsem` held by the caller; each step takes one `d_lock` at a time
-(parent, then the moved or replaced child). Inside the write side the
-move bumps `RENAME_SEQ` (odd while it runs), which scoped walks check. `is_subdir` and `d_path`
+(parent, then the moved or replaced child). The
+write guard keeps the lock's sequence odd, which scoped walks check. `is_subdir` and `d_path`
 read parents and names under `RENAME_LOCK` (read), so they see one
 consistent tree. `d_path` also climbs mounts (`Mount.parent`, then
 `Mount.mountpoint`, each read and released) inside it: RENAME_LOCK ->
@@ -2174,7 +2173,7 @@ current mount's children (Linux lookup_mnt); ".." at a mount root
 reads `Mount.parent` and `Mount.mountpoint` (follow_dotdot).
 
 A scoped walk (openat2 RESOLVE_BENEATH / RESOLVE_IN_ROOT, `namei::Nd`;
-Linux nd->m_seq, nd->r_seq) samples `MOUNT_LOCK`'s and `RENAME_SEQ`'s
+Linux nd->m_seq, nd->r_seq) samples `MOUNT_LOCK`'s and `RENAME_LOCK`'s
 sequences at its start, holding no lock (`read_begin` spins out a
 writer, which holds only spin locks), and after each ".." gives up
 with EAGAIN if either moved: a rename or a mount change may have taken

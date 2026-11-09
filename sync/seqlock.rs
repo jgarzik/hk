@@ -2,12 +2,13 @@
 //! a sequence counter around their change (odd while writing); lockless
 //! readers sample the counter, read, and retry if it moved or was odd.
 //! A `SeqCount`'s writers serialize on a lock of their own; a `SeqLock`
-//! brings one, a spin lock. Thread context; not for IRQ handlers (as
-//! Linux's mount_lock and rename_lock).
+//! brings one, a spin lock, and a `SeqRwLock` a spin reader-writer lock
+//! whose readers see one consistent picture. Thread context; not for
+//! IRQ handlers (as Linux's mount_lock and rename_lock).
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 
-use crate::sync::spin::{Mutex, MutexGuard};
+use crate::sync::spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// A sequence counter whose writers hold a lock of their own (Linux
 /// seqcount_t)
@@ -100,6 +101,55 @@ impl SeqLock {
 
     /// The read since `start` raced a writer and must be repeated (Linux
     /// read_seqretry)
+    pub fn read_retry(&self, start: u32) -> bool {
+        self.seq.read_retry(start)
+    }
+}
+
+/// A spin reader-writer lock whose write side bumps a sequence (Linux
+/// rename_lock, a seqlock_t: locking readers here share the lock where
+/// Linux's read_seqlock_excl excludes them; lockless readers sample the
+/// sequence)
+pub struct SeqRwLock {
+    lock: RwLock<()>,
+    seq: SeqCount,
+}
+
+/// A held write side: fields drop in order, so the count goes even
+/// before the lock is released
+pub struct SeqRwWriteGuard<'a> {
+    _c: SeqCountGuard<'a>,
+    _g: RwLockWriteGuard<'a, ()>,
+}
+
+impl SeqRwLock {
+    pub const fn new() -> Self {
+        Self {
+            lock: RwLock::new(()),
+            seq: SeqCount::new(),
+        }
+    }
+
+    /// The write side (Linux write_seqlock): the sequence odd while held
+    pub fn write(&self) -> SeqRwWriteGuard<'_> {
+        let g = self.lock.write();
+        SeqRwWriteGuard {
+            _c: self.seq.write(),
+            _g: g,
+        }
+    }
+
+    /// A locking read: no writer while held (Linux read_seqlock_excl)
+    pub fn read(&self) -> RwLockReadGuard<'_, ()> {
+        self.lock.read()
+    }
+
+    /// Begin a lockless read (Linux read_seqbegin): waits out a writer
+    pub fn read_begin(&self) -> u32 {
+        self.seq.read_begin()
+    }
+
+    /// The read since `start` raced a writer (Linux read_seqretry)
     pub fn read_retry(&self, start: u32) -> bool {
         self.seq.read_retry(start)
     }
