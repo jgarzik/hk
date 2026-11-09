@@ -36,9 +36,9 @@ use alloc::vec;
 use core::arch::asm;
 
 use crate::arch::{
-    AcpiInfo, AcpiOps, Arch, ArchBusOps, ContextOps, CpuInfo, CpuOps, EarlyArchInit, ExceptionOps,
-    FrameAlloc, HaltOps, InitramfsOps, LocalTimerOps, MemoryLayoutOps, PerCpuOps, PowerInfo,
-    PowerOps, SchedArch, SmpOps, TimekeeperOps, UserModeOps, VfsInitOps,
+    AcpiInfo, AcpiOps, Arch, ArchBusOps, ContextOps, CpuInfo, CpuOps, ExceptionOps, FrameAlloc,
+    HaltOps, InitramfsOps, LocalTimerOps, MemoryLayoutOps, PerCpuOps, PowerInfo, PowerOps,
+    SchedArch, SmpOps, TimekeeperOps, UserModeOps, VfsInitOps,
 };
 
 /// AArch64 trap frame for saving/restoring CPU state on exception entry
@@ -209,28 +209,23 @@ impl HaltOps for Aarch64Arch {
     }
 }
 
-// ============================================================================
-// EarlyArchInit trait implementation
-// ============================================================================
+/// Early architecture initialization: UART, CPU features, RTC
+fn early_init() {
+    // Initialize PL011 serial for console output
+    // Note: On aarch64, serial is initialized separately in _start_rust
+    // before early_init() is called, so we can print debug messages.
+    // This is a no-op if already initialized.
+    serial::init();
 
-impl EarlyArchInit for Aarch64Arch {
-    fn early_init() {
-        // Initialize PL011 serial for console output
-        // Note: On aarch64, serial is initialized separately in _start_rust
-        // before early_init() is called, so we can print debug messages.
-        // This is a no-op if already initialized.
-        serial::init();
+    // Initialize CPU features (FPU, etc.)
+    cpu::init();
 
-        // Initialize CPU features (FPU, etc.)
-        cpu::init();
+    // Initialize PL031 RTC (ensure it's enabled)
+    rtc::init();
 
-        // Initialize PL031 RTC (ensure it's enabled)
-        rtc::init();
-
-        // Note: MMU is initialized explicitly via init_mmu() from _start_rust
-        // because it needs to happen before heap allocation but after serial init.
-        // Exception vectors and GIC are initialized later in kmain_aarch64.
-    }
+    // Note: MMU is initialized explicitly via init_mmu() from _start_rust
+    // because it needs to happen before heap allocation but after serial init.
+    // Exception vectors and GIC are initialized later in kmain_aarch64.
 }
 
 // ============================================================================
@@ -238,6 +233,14 @@ impl EarlyArchInit for Aarch64Arch {
 // ============================================================================
 
 impl AcpiOps for Aarch64Arch {
+    fn numa_init() -> bool {
+        dtb::init_numa_topology()
+    }
+
+    fn boot_framebuffer() -> Option<crate::gfx::FramebufferInfo> {
+        dtb::extract_simple_framebuffer()
+    }
+
     fn parse_acpi() -> Option<AcpiInfo> {
         if dtb::boot_phys() == 0 {
             // Fallback to hardcoded values if no DTB
@@ -644,11 +647,15 @@ impl InitramfsOps for Aarch64Arch {
         // Fall back to embedded initramfs (built into kernel binary)
         crate::printkln!(
             "Using embedded initramfs ({} bytes)",
-            crate::EMBEDDED_INITRAMFS.len()
+            EMBEDDED_INITRAMFS.len()
         );
-        crate::EMBEDDED_INITRAMFS
+        EMBEDDED_INITRAMFS
     }
 }
+
+/// Embedded initramfs for aarch64 (fallback when DTB doesn't provide initramfs)
+/// This embeds the initramfs directly into the kernel binary.
+static EMBEDDED_INITRAMFS: &[u8] = include_bytes!("../../user/initramfs-aarch64.cpio");
 
 impl VfsInitOps for Aarch64Arch {
     fn init_vfs_extras() {
@@ -658,4 +665,60 @@ impl VfsInitOps for Aarch64Arch {
             let _ = crate::fs::ramfs::ramfs_create_dir(&root_dentry, b"vfat_test");
         }
     }
+}
+
+/// AArch64 Kernel entry point called from boot.S
+///
+/// dtb_ptr: Pointer to Device Tree Blob (passed in x0)
+#[cfg(not(test))]
+#[unsafe(no_mangle)]
+pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
+    // Initialize serial FIRST before anything else
+    serial::init();
+
+    // SAFETY: the bootloader's DTB pointer (x0), in RAM the boot tables
+    // linear-map
+    unsafe { dtb::set_boot(dtb_ptr) };
+
+    // Direct serial output for early boot debugging (bypasses console subsystem)
+    serial::write_str("hk kernel starting... (aarch64)\r\n");
+
+    // Find DTB in memory (QEMU virt ELF boot places DTB at RAM start);
+    // the boot tables linear-map the first RAM gigabyte
+    {
+        const DTB_MAGIC_BE: u32 = 0xd00dfeed;
+        // SAFETY: the candidates are in the first RAM gigabyte, which the
+        // boot tables linear-map
+        let magic = |pa: u64| unsafe {
+            ::core::ptr::read_volatile(crate::arch::phys_to_virt(pa) as *const u32)
+        };
+        let found = [0x4000_0000, 0x4008_0000, 0x4400_0000, 0x4800_0000]
+            .into_iter()
+            .chain((0x4200_0000u64..0x6000_0000).step_by(0x1000))
+            .find(|&pa| magic(pa).swap_bytes() == DTB_MAGIC_BE);
+        if let Some(pa) = found {
+            // SAFETY: RAM (the first gigabyte, linear-mapped) with the FDT
+            // magic
+            unsafe { dtb::set_boot(pa) };
+        }
+    }
+
+    // Initialize architecture (CPU features, RTC, etc.)
+    early_init();
+
+    // Final kernel page tables (linear map of all RAM, which goes to
+    // memblock)
+    // SAFETY: once, on the BSP, before SMP or any user mm
+    unsafe { kmap::init() };
+
+    // Extract and parse kernel command line from DTB /chosen/bootargs
+    if let Some(cmdline) = dtb::extract_bootargs()
+        && !cmdline.is_empty()
+    {
+        crate::printkln!("Cmdline: {}", cmdline);
+        crate::cmdline::parse_cmdline(cmdline);
+    }
+
+    // Continue to unified main kernel
+    crate::kmain()
 }

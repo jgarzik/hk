@@ -16,7 +16,6 @@
 //! # Kernel Initialization Traits
 //!
 //! Additional traits for architecture-independent kernel initialization:
-//! - [`EarlyArchInit`] - Early hardware initialization (GDT, IDT, etc.)
 //! - [`IoremapOps`] - Kernel page-table primitives (ioremap, vmap)
 //! - [`EarlyConOps`] - Boot UART output (earlycon, panic)
 //! - [`IrqChipOps`] - Device interrupt controller lines (mask, unmask)
@@ -572,18 +571,10 @@ pub trait HaltOps {
     /// This function never returns. It disables interrupts and enters
     /// an infinite halt loop.
     fn halt_loop() -> !;
-}
 
-/// Early architecture initialization
-///
-/// Called early in boot before the kernel heap is available.
-/// Initializes fundamental hardware needed for kernel operation.
-pub trait EarlyArchInit {
-    /// Initialize architecture-specific hardware
-    ///
-    /// On x86-64: GDT, TSS, IDT, PIC, PIT, syscall MSRs, FPU/SSE, SMEP/SMAP
-    /// On aarch64: Exception vectors, MMU setup, GIC init
-    fn early_init();
+    /// Print this CPU's registers and stack at a panic (Linux
+    /// dump_stack); nothing where the arch has no unwinder
+    fn dump_stack() {}
 }
 
 /// Kernel page-table primitives behind `mm::ioremap` and vmap (the
@@ -689,6 +680,14 @@ pub trait AcpiOps {
     ///
     /// Returns None if parsing fails or tables are not available.
     fn parse_acpi() -> Option<AcpiInfo>;
+
+    /// Set up the NUMA topology from firmware (ACPI SRAT/SLIT, DT
+    /// numa-node-id); false if it describes none (one node then)
+    fn numa_init() -> bool;
+
+    /// The boot framebuffer the firmware set up (multiboot2 tag, DT
+    /// simple-framebuffer)
+    fn boot_framebuffer() -> Option<crate::gfx::FramebufferInfo>;
 }
 
 /// Symmetric Multi-Processing operations

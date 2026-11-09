@@ -74,8 +74,8 @@ use crate::arch::ArchBusOps;
 use crate::arch::ArchPageTable;
 use crate::arch::CurrentArch;
 use crate::arch::{
-    AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, LocalTimerOps,
-    MemoryLayoutOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps,
+    AcpiOps, CpuOps, ExceptionOps, HaltOps, InitramfsOps, LocalTimerOps, MemoryLayoutOps, PowerOps,
+    SmpOps, TimekeeperOps, VfsInitOps,
 };
 
 use crate::hw::dma::{DirectDmaOps, dma_init};
@@ -94,169 +94,25 @@ static FRAME_ALLOCATOR: mm::frame_alloc::FrameAllocator = mm::frame_alloc::Frame
 /// Global DMA operations (direct mapping backend)
 static DIRECT_DMA_OPS: DirectDmaOps = DirectDmaOps::new(&FRAME_ALLOCATOR);
 
-/// Embedded initramfs for aarch64 (fallback when DTB doesn't provide initramfs)
-/// This embeds the initramfs directly into the kernel binary.
-#[cfg(target_arch = "aarch64")]
-pub static EMBEDDED_INITRAMFS: &[u8] = include_bytes!("user/initramfs-aarch64.cpio");
-
-/// x86_64 Kernel entry point called by bootloader
-///
-/// multiboot_info: Pointer to multiboot2 info structure (passed in RDI)
-#[cfg(all(target_arch = "x86_64", not(test)))]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start(multiboot_info: u64) -> ! {
-    // SAFETY: the bootloader's info structure (RDI), in memory the boot
-    // tables map; it and its modules are reserved (memblock_init)
-    unsafe { arch::x86_64::multiboot2::set_boot(multiboot_info) };
-    // Kernel page table first: the boot tables' identity map goes away
-    // SAFETY: once, first thing on the BSP, before SMP or any user mm
-    unsafe {
-        arch::x86_64::kmap::init();
-    }
-
-    // Messages before console attach are buffered
-    printkln!("hk kernel starting...");
-
-    // Initialize VGA text console for early output
-    arch::x86_64::vgacon::init_vgacon();
-
-    // Initialize serial console (through TTY layer)
-    hw::serial::init_serial_console();
-
-    // Flush buffered messages to console
-    crate::printk::flush();
-
-    // Print and parse kernel command line (if any)
-    if let Some(cmdline) = arch::x86_64::multiboot2::get_cmdline()
-        && !cmdline.is_empty()
-    {
-        printkln!("Cmdline: {}", cmdline);
-        cmdline::parse_cmdline(cmdline);
-    }
-
-    // Initialize architecture-specific code (GDT, IDT, PIC, PIT)
-    CurrentArch::early_init();
-
-    // Continue to main kernel
-    kmain()
-}
-
-/// AArch64 Kernel entry point called from boot.S
-///
-/// dtb_ptr: Pointer to Device Tree Blob (passed in x0)
-#[cfg(all(target_arch = "aarch64", not(test)))]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
-    // Initialize serial FIRST before anything else
-    crate::arch::aarch64::serial::init();
-
-    // SAFETY: the bootloader's DTB pointer (x0), in RAM the boot tables
-    // linear-map
-    unsafe { crate::arch::aarch64::dtb::set_boot(dtb_ptr) };
-
-    // Direct serial output for early boot debugging (bypasses console subsystem)
-    crate::arch::aarch64::serial::write_str("hk kernel starting... (aarch64)\r\n");
-
-    // Find DTB in memory (QEMU virt ELF boot places DTB at RAM start);
-    // the boot tables linear-map the first RAM gigabyte
-    {
-        const DTB_MAGIC_BE: u32 = 0xd00dfeed;
-        // SAFETY: the candidates are in the first RAM gigabyte, which the
-        // boot tables linear-map
-        let magic = |pa: u64| unsafe {
-            ::core::ptr::read_volatile(crate::arch::phys_to_virt(pa) as *const u32)
-        };
-        let found = [0x4000_0000, 0x4008_0000, 0x4400_0000, 0x4800_0000]
-            .into_iter()
-            .chain((0x4200_0000u64..0x6000_0000).step_by(0x1000))
-            .find(|&pa| magic(pa).swap_bytes() == DTB_MAGIC_BE);
-        if let Some(pa) = found {
-            // SAFETY: RAM (the first gigabyte, linear-mapped) with the FDT
-            // magic
-            unsafe { crate::arch::aarch64::dtb::set_boot(pa) };
-        }
-    }
-
-    // Initialize architecture (CPU features, RTC, etc.)
-    CurrentArch::early_init();
-
-    // Final kernel page tables (linear map of all RAM, which goes to
-    // memblock)
-    // SAFETY: once, on the BSP, before SMP or any user mm
-    unsafe { crate::arch::aarch64::kmap::init() };
-
-    // Extract and parse kernel command line from DTB /chosen/bootargs
-    if let Some(cmdline) = crate::arch::aarch64::dtb::extract_bootargs()
-        && !cmdline.is_empty()
-    {
-        printkln!("Cmdline: {}", cmdline);
-        cmdline::parse_cmdline(cmdline);
-    }
-
-    // Continue to unified main kernel
-    kmain()
-}
-
 use crate::mm::STACK_TOP as USER_STACK_TOP;
 
-/// Initialize NUMA topology from firmware
-///
-/// On x86-64, parses ACPI SRAT/SLIT tables.
-/// On aarch64, extracts numa-node-id properties from device tree.
-///
-/// Falls back to single-node topology if no NUMA info is available.
+/// NUMA topology from firmware (ACPI SRAT/SLIT on x86-64, DT
+/// numa-node-id on aarch64), else one node
 fn init_numa_topology() {
+    if CurrentArch::numa_init() {
+        return;
+    }
     let total_pages = mm::memblock::MEMBLOCK.lock().memory.total() / 4096;
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        match arch::x86_64::acpi::init_numa_topology() {
-            Ok(true) => return,
-            Ok(false) => {
-                // No SRAT table, use single-node fallback
-            }
-            Err(_) => {
-                printkln!("NUMA: ACPI topology unusable, using one node");
-            }
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // No numa-node-id properties: single-node fallback
-        if arch::aarch64::dtb::init_numa_topology() {
-            return;
-        }
-    }
-
-    // Fallback to single-node topology
     mm::numa::init_single_node_fallback(total_pages);
 }
 
-/// Discover boot framebuffer from firmware
-///
-/// On x86-64, parses the multiboot2 framebuffer tag.
-/// On aarch64, parses the device tree simple-framebuffer node.
-///
-/// Stores the result in BOOT_FRAMEBUFFER and reserves the memory.
+/// Discover the boot framebuffer from firmware (multiboot2 tag on
+/// x86-64, DT simple-framebuffer on aarch64): stored in
+/// BOOT_FRAMEBUFFER, its memory reserved
 fn discover_boot_framebuffer() {
-    use gfx::{BOOT_FRAMEBUFFER, FramebufferInfo};
+    use gfx::BOOT_FRAMEBUFFER;
 
-    let fb_info: Option<FramebufferInfo>;
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Parse multiboot2 framebuffer tag
-        fb_info = arch::x86_64::multiboot2::get_framebuffer();
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Parse device tree simple-framebuffer node
-        fb_info = arch::aarch64::dtb::extract_simple_framebuffer();
-    }
-
-    if let Some(info) = fb_info {
+    if let Some(info) = CurrentArch::boot_framebuffer() {
         printkln!(
             "FB: {}x{} @ {:#x} ({} bytes, pitch={})",
             info.width,
@@ -275,7 +131,7 @@ fn discover_boot_framebuffer() {
 }
 
 /// Main kernel function (unified for all architectures)
-fn kmain() -> ! {
+pub(crate) fn kmain() -> ! {
     // ========================================================================
     // Phase 1: Memory Subsystem
     // ========================================================================
@@ -623,36 +479,6 @@ fn chr_dev_init() {
     printkln!("VFS: ok");
 }
 
-/// Initialize VFAT ramdisk from multiboot2 module
-///
-/// This function:
-/// 1. Loads the "vfat" multiboot2 module
-/// 2. Creates a ramdisk (rd1) from the image data
-/// 3. Creates /dev/rd1 device node
-/// 4. Creates /vfat_test mount point
-///
-/// Note: The actual mount is performed by userspace init (boot_tester2)
-/// via the mount syscall, simulating how real init/systemd works.
-#[cfg(target_arch = "x86_64")]
-pub fn init_vfat_ramdisk(
-    root_dentry: &alloc::sync::Arc<fs::Dentry>,
-    _dev_dentry: &alloc::sync::Arc<fs::Dentry>,
-) {
-    use crate::block::create_ramdisk_from_data;
-    use fs::ramfs_create_dir;
-
-    // Look for vfat module loaded by bootloader
-    let Some(vfat_data) = arch::x86_64::multiboot2::find_module("vfat") else {
-        return;
-    };
-
-    // Ramdisk rd1 from the vfat image data (node in devtmpfs)
-    let _ = create_ramdisk_from_data(1, vfat_data);
-
-    // Create /vfat_test mount point (userspace init will mount here)
-    let _ = ramfs_create_dir(root_dentry, b"vfat_test");
-}
-
 /// Panic handler (only for bare metal)
 #[cfg(not(test))]
 #[panic_handler]
@@ -683,68 +509,7 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     printkln!("Message: {}", info.message());
 
     // Architecture-specific register dump and backtrace
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Print basic register state
-        let rsp: u64;
-        let rbp: u64;
-        let rflags: u64;
-        // SAFETY: register reads only
-        unsafe {
-            ::core::arch::asm!(
-                "mov {}, rsp",
-                "mov {}, rbp",
-                "pushfq",
-                "pop {}",
-                out(reg) rsp,
-                out(reg) rbp,
-                out(reg) rflags,
-                options(nomem, preserves_flags)
-            );
-        }
-        printkln!("\nRegisters:");
-        printkln!("  RSP: {:#018x}", rsp);
-        printkln!("  RBP: {:#018x}", rbp);
-        printkln!("  RFLAGS: {:#018x}", rflags);
-
-        // Simple stack backtrace using frame pointers
-        printkln!("\nStack backtrace:");
-        let mut frame_ptr = rbp;
-        let mut frame_count = 0;
-        const MAX_FRAMES: usize = 16;
-
-        while frame_ptr != 0 && frame_count < MAX_FRAMES {
-            // Only follow frames on the current kernel stack: RBP may hold a
-            // user value, and reading it would fault again under SMAP
-            if !(rsp..rsp.saturating_add(0x10000)).contains(&frame_ptr) {
-                break;
-            }
-
-            // Read return address (stored at frame_ptr + 8)
-            // SAFETY: frame_ptr lies within this kernel stack's 64KB
-            // (checked above), mapped memory; the panic path's best effort
-            let return_addr = unsafe { *((frame_ptr + 8) as *const u64) };
-            if return_addr == 0 {
-                break;
-            }
-
-            printkln!("  #{}: {:#018x}", frame_count, return_addr);
-
-            // Move to previous frame
-            // SAFETY: as above
-            let prev_frame = unsafe { *(frame_ptr as *const u64) };
-            if prev_frame <= frame_ptr {
-                // Prevent infinite loops
-                break;
-            }
-            frame_ptr = prev_frame;
-            frame_count += 1;
-        }
-
-        if frame_count == 0 {
-            printkln!("  <no frames available>");
-        }
-    }
+    CurrentArch::dump_stack();
 
     // Print printk buffer stats
     let (used, total, overflow) = crate::printk::stats();
