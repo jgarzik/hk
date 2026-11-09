@@ -638,7 +638,7 @@ lists each lock allocated under once (`LOCKDEP:ATOMIC_ALLOC ... under
 <lock> (taken at ...)`; the shutdown summary counts them): mostly
 collections grown under spin mutexes, in fs, net, task and
 ipc (procfs: only its mount-time tree building). Each wants its allocation moved out of the
-lock (preallocate, or a sleeping lock as in Linux).
+lock (preallocate, or a sleeping lock as in Linux): ROADMAP phase A.
 
 ## Scheduler gaps (deviations from Linux)
 
