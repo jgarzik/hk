@@ -145,12 +145,25 @@ holder may sleep (page locks, block I/O, user page faults, blocking
 pipe/socket I/O). No optimistic spinning (hk cannot tell whether an
 owner is running).
 
+- Wait lock (both): a `sync::spin::Mutex` (Linux wait_lock; interrupts
+  stay on: these locks are thread context only and nothing under the
+  wait lock wakes a task). Lockdep class: the lock's construction site
+  (`Mutex::new`/`RwSem::new` are `#[track_caller]`): all
+  `Inode.i_rwsem` wait locks share one class. A
+  leaf: held only to queue, dequeue and grant, never across a sleep, and
+  nothing is taken under it. The waker queues the tasks to wake on a
+  `task::wake_q::WakeQ` (Linux wake_q: a task reference each, linked
+  through `Task.wake_q`, no allocation) and wakes them after dropping
+  the wait lock (`pi_lock`, run-queue locks). The reference is taken
+  while the waiter is still queued under the wait lock, before a reader
+  sees its grant (`granted`, Release/Acquire), so the waiter may return
+  (its on-stack node gone) and even exit before the wakeup. A task on
+  another `WakeQ` already is not queued twice: that wakeup comes after
+  the caller's store (full barriers on both sides, Linux
+  __wake_q_add), and every sleeping-lock wait rechecks its condition.
 - `Mutex<T>` (Linux kernel/locking/mutex.c): an owner word (the owner's
-  tid shifted past three flags) and a FIFO wait list under the lock's
-  own `IrqSpinlock` (Linux wait_lock: a leaf, held only to queue,
-  dequeue and wake, never across a sleep; the wakeup is issued under
-  it, so it orders before `pi_lock` and the run-queue lock, like a
-  `WaitQueue` head). Flags: `WAITERS` (list not empty: unlock takes
+  tid shifted past three flags) and a FIFO wait list under the wait
+  lock. Flags: `WAITERS` (list not empty: unlock takes
   the slow path and wakes the first waiter), `HANDOFF` (set by the
   first waiter when a retry after its wakeup fails: the next unlock
   hands the lock to it instead of releasing it), `PICKUP` (handed to
@@ -170,11 +183,11 @@ owner is running).
   `read_interruptible`/`write_interruptible` (Linux
   down_*_interruptible: any pending signal gives up with EINTR; no
   caller yet), `try_read`/`try_write`, and the raw `down_read`/`up_read`, `down_write`/
-  `up_write` pairs. Linux kernel/locking/rwsem.c policy: the reader
-  count, writer bit, `handoff` flag and a FIFO wait list of readers and
-  writers sit under one `IrqSpinlock` (Linux wait_lock with the count
-  it orders: a leaf, never held across a sleep; wakeups are issued
-  under it, before `pi_lock` and the run-queue lock). A free lock is
+  `up_write` pairs. Linux kernel/locking/rwsem.c: one atomic count
+  (writer bit, `WAITERS`, `HANDOFF`, reader count above bit 8): an
+  uncontended acquire or release is one atomic op; the wait lock and
+  its FIFO list of readers and writers are taken only when the count
+  says so (`WAITERS` and `HANDOFF` change only under it). A free lock is
   taken at once only while nobody queues (`try_*` likewise); otherwise
   the locker queues at the tail, except that a reader may steal a lock
   no reader or writer holds and no handoff guards (then granting the
@@ -183,10 +196,10 @@ owner is running).
   lock, or every queued reader (up to 256, writers skipped:
   phase-fair), granted the lock by the waker before it runs. A waiter
   past `RWSEM_WAIT_TIMEOUT` (4 ms, at least a tick; at once for an RT
-  writer) that still finds the lock held sets `handoff`: no stealing,
+  writer) that still finds the lock held sets `HANDOFF`: no stealing,
   and only the front waiter may take the lock, until it has. A front
   waiter that gives up (signal) wakes the waiters behind it; the last
-  waiter leaving clears `handoff`.
+  waiter leaving clears `HANDOFF`.
 - Rules: thread context only; never taken in IRQ context or while any
   spinlock is held (`might_sleep` asserts a zero preempt count in debug
   builds; `IrqSpinlock` raises it). Sleeping locks order ABOVE every
@@ -3789,6 +3802,7 @@ else is taken under it) unless an order is given. "spin" is the
 | Lock | Location | Class | Protects / order |
 |------|----------|-------|------------------|
 | `Task.vfork_done` | task/mod.rs | atomic pointer | the vforking parent's on-stack `Completion` (Linux vfork_done): set before the child runs, taken once by the child at exec/exit, which completes it; the parent waits uninterruptibly so the completion outlives that use |
+| `Task.wake_q` | task/mod.rs, task/wake_q.rs | atomic pointer | next task on the `WakeQ` it is queued on (Linux task->wake_q): claimed null -> tail by a compare-exchange after a full fence, so a task is on one queue at a time; only that queue's owner links and walks it; the waker clears it before `try_to_wake_up`, which may then queue it again |
 | `SignalStruct.posix_timers` | signal/mod.rs, time/posix_timer.rs | spin Mutex | the thread group's POSIX timers and itimers (Linux signal->posix_timers); thread context, never under TASKLIST; cpu_timer holds it around arming the group's CPU-timer state and its whole expiry pass (`PosixTimer.inner` and `SignalStruct.rlim` inside); deleted at the group's last exit (`exit_itimers`, timers stopped after the lock) or with the SignalStruct |
 | `PosixTimer.inner` | time/posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete). A CPU-time timer's clock value is read before it (that may take TASKLIST) |
 | `PosixTimer.sigq` | time/posix_timer.rs | spin Mutex | a timer_create timer's preallocated signal entry while it is not queued (Linux SIGQUEUE_PREALLOC); leaf, thread context: taken alone, never with `inner` or a signal lock. The entry is taken out to be queued by `signal::send_timer_sigqueue` with no lock held, and put back when its signal is dequeued (`posix_timer::deliver`, which rearms an interval timer under `inner`), flushed or refused (`reclaim`) |

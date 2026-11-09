@@ -11,8 +11,10 @@
 //! - `PICKUP`: the lock was handed to the tid in the word, which takes
 //!   it on its next try; nobody else can.
 //!
-//! Waiters queue FIFO on `wait`, a list guarded by an `IrqSpinlock`
-//! (Linux wait_lock) that is never held across a sleep. A woken waiter
+//! Waiters queue FIFO on `wait`, a list guarded by a spin lock (Linux
+//! wait_lock: a leaf, never held across a sleep, its lockdep class the
+//! mutex's construction site). The unlock queues the first waiter on a
+//! `WakeQ` under it and wakes it after dropping it. A woken waiter
 //! retries; the first waiter's failed retry sets `HANDOFF` (Linux
 //! __mutex_trylock_or_handoff). No optimistic spinning: hk cannot tell
 //! whether an owner is running on another CPU (Linux owner_on_cpu).
@@ -31,10 +33,13 @@ use core::ops::{Deref, DerefMut};
 use core::pin::{Pin, pin};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::{IrqSpinlock, can_sleep, might_sleep, waiter_task, wake_waiter};
-use crate::sync::waitqueue::signal_pending_state;
+use super::sched::{
+    WakeQ, can_sleep, current_tid, schedule, set_current_state, signal_pending_state, waiter_ref,
+    waiter_task,
+};
+use super::{might_sleep, spin};
 use crate::task::Task;
-use crate::task::percpu::{SleepState, current_tid, schedule, set_current_state};
+use crate::task::percpu::SleepState;
 use crate::util::error::KernelError;
 use crate::util::list::{Link, List};
 
@@ -69,7 +74,8 @@ struct Waiter {
 }
 
 // SAFETY: `task` is only followed under the wait lock, while the waiter
-// (and so its task, which is sleeping in `lock_slow`) is linked
+// (and so its task, which is sleeping in `lock_slow`) is linked, to take
+// a reference
 unsafe impl Sync for Waiter {}
 // SAFETY: as above
 unsafe impl Send for Waiter {}
@@ -100,7 +106,7 @@ type WaitList = List<WaiterAdapter>;
 /// first waiter's CAS.
 pub struct Mutex<T> {
     owner: AtomicU64,
-    wait: IrqSpinlock<WaitList>,
+    wait: spin::Mutex<WaitList>,
     data: UnsafeCell<T>,
 }
 
@@ -115,11 +121,13 @@ fn me() -> u64 {
 }
 
 impl<T> Mutex<T> {
-    /// New unlocked mutex
+    /// New unlocked mutex; its wait lock's lockdep class is the
+    /// caller's location
+    #[track_caller]
     pub const fn new(v: T) -> Self {
         Self {
             owner: AtomicU64::new(0),
-            wait: IrqSpinlock::new(List::new()),
+            wait: spin::Mutex::new(List::new()),
             data: UnsafeCell::new(v),
         }
     }
@@ -296,7 +304,8 @@ impl<T> Mutex<T> {
 
     /// Release with flags set (Linux __mutex_unlock_slowpath): unless a
     /// handoff is pending release the lock, keeping the flags; if there
-    /// are waiters, wake the first (and hand it the lock if asked)
+    /// are waiters, wake the first (and hand it the lock if asked) once
+    /// the wait lock is dropped
     #[cold]
     fn unlock_slow(&self) {
         let mut word = self.owner.load(Ordering::Relaxed);
@@ -316,6 +325,7 @@ impl<T> Mutex<T> {
                 Err(w) => word = w,
             }
         }
+        let mut q = WakeQ::new();
         let list = self.wait.lock();
         // SAFETY: linked waiters are live (type invariant of `Waiter`)
         let next = list.front().map(|p| unsafe { &*p });
@@ -323,10 +333,12 @@ impl<T> Mutex<T> {
             self.handoff(next.map_or(0, |n| n.id));
         }
         if let Some(n) = next {
-            // SAFETY: under the wait lock, like WaitQueue: the waiter
-            // cannot leave (and its task cannot exit) until it is dropped
-            unsafe { wake_waiter(n.task) };
+            // SAFETY: linked, under the wait lock: its task is asleep in
+            // `lock_slow` and cannot leave until the lock is dropped
+            q.add_safe(unsafe { waiter_ref(n.task) });
         }
+        drop(list);
+        q.wake();
     }
 
     /// Acquire, sleeping while contended

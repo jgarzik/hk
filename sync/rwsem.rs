@@ -2,11 +2,15 @@
 //! kernel/locking/rwsem.c)
 //!
 //! Many readers or one writer, guarding a `T` (`()` for a semaphore that
-//! guards what its owner says, like `i_rwsem`). The state (reader count,
-//! writer bit, `handoff` flag) and the FIFO wait list sit under one
-//! `IrqSpinlock` (Linux wait_lock plus the atomic count it orders),
-//! never held across a sleep. Linux's policy, without optimistic
-//! spinning (hk cannot tell whether an owner runs on another CPU):
+//! guards what its owner says, like `i_rwsem`). As Linux, one atomic
+//! count holds the writer bit, `WAITERS` and `HANDOFF` flags and the
+//! reader count: an uncontended acquire or release is one atomic op.
+//! The FIFO wait list sits under a spin lock (Linux wait_lock: a leaf,
+//! never held across a sleep, its lockdep class the semaphore's
+//! construction site), taken only when the count says so. Wakeups are
+//! queued on a `WakeQ` under it and issued after it is dropped. Linux's
+//! policy, without optimistic spinning (hk cannot tell whether an owner
+//! runs on another CPU):
 //!
 //! - A reader or writer takes a free lock only while nobody waits
 //!   (Linux fast paths); otherwise it queues at the tail. A reader may
@@ -18,9 +22,9 @@
 //!   `MAX_READERS_WAKEUP`, writers skipped: phase-fair) is granted the
 //!   lock by the waker before it runs.
 //! - A waiter that has waited over `RWSEM_WAIT_TIMEOUT` (at once for an
-//!   RT task, writers) and still finds the lock held sets `handoff`
-//!   (Linux RWSEM_FLAG_HANDOFF): no reader steals and no other waiter
-//!   takes the lock until the front waiter has it.
+//!   RT task, writers) and still finds the lock held sets `HANDOFF`: no
+//!   reader steals and no other waiter takes the lock until the front
+//!   waiter has it.
 //!
 //! `read`/`write` return guards; `*_interruptible` give up with
 //! `KernelError::Interrupted` (EINTR) once a signal is pending and
@@ -33,12 +37,15 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomPinned;
 use core::ops::{Deref, DerefMut};
 use core::pin::{Pin, pin};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-use super::{IrqSpinlock, can_sleep, might_sleep, waiter_task, wake_waiter};
-use crate::sync::waitqueue::signal_pending_state;
+use super::sched::{
+    WakeQ, can_sleep, current_rt, get_ticks, schedule, set_current_state, signal_pending_state,
+    waiter_ref, waiter_task,
+};
+use super::{might_sleep, spin};
 use crate::task::Task;
-use crate::task::percpu::{SleepState, TICK_MS, get_ticks, schedule, set_current_state};
+use crate::task::percpu::{SleepState, TICK_MS};
 use crate::util::error::KernelError;
 use crate::util::list::{Link, List};
 
@@ -48,7 +55,27 @@ const HZ: u64 = 1000 / TICK_MS;
 /// RWSEM_WAIT_TIMEOUT: 4 ms, at least a tick)
 const RWSEM_WAIT_TIMEOUT: u64 = HZ.div_ceil(250);
 /// Readers granted by one wakeup (Linux MAX_READERS_WAKEUP)
-const MAX_READERS_WAKEUP: u32 = 0x100;
+const MAX_READERS_WAKEUP: i64 = 0x100;
+
+/// A writer holds it (Linux RWSEM_WRITER_LOCKED)
+const WRITER_LOCKED: i64 = 1 << 0;
+/// The wait list is not empty (Linux RWSEM_FLAG_WAITERS)
+const WAITERS: i64 = 1 << 1;
+/// Only the front waiter may take it (Linux RWSEM_FLAG_HANDOFF)
+const HANDOFF: i64 = 1 << 2;
+const READER_SHIFT: u32 = 8;
+/// One reader holding or trying to take it (Linux RWSEM_READER_BIAS)
+const READER_BIAS: i64 = 1 << READER_SHIFT;
+const READER_MASK: i64 = !(READER_BIAS - 1);
+const LOCK_MASK: i64 = WRITER_LOCKED | READER_MASK;
+/// A reader that sees these takes the slow path (Linux
+/// RWSEM_READ_FAILED_MASK; the count never overflows into the sign)
+const READ_FAILED_MASK: i64 = WRITER_LOCKED | WAITERS | HANDOFF;
+
+/// Readers in a count, holders and those still trying
+fn readers(count: i64) -> i64 {
+    count >> READER_SHIFT
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -73,9 +100,10 @@ enum Wake {
 ///
 /// # Invariants
 /// Linked on its semaphore's wait list only while pinned on the waiting
-/// task's stack; it is unlinked under the semaphore's lock (by itself,
-/// or by the waker granting it the lock) before it goes, and the waiter
-/// reads `granted` under that lock.
+/// task's stack; it is unlinked under the wait lock (by itself, or by
+/// the waker granting it the lock) before it goes. A granting waker
+/// takes its task reference before it sets `granted` and touches the
+/// waiter no more after.
 struct Waiter {
     link: Link,
     task: *const Task,
@@ -84,7 +112,8 @@ struct Waiter {
     timeout: u64,
     /// RT task: may ask for a handoff at once
     rt: bool,
-    /// This waiter's wait set `handoff` (Linux waiter->handoff_set)
+    /// This waiter's wait set `HANDOFF` (Linux waiter->handoff_set);
+    /// changed under the wait lock
     handoff_set: AtomicBool,
     /// A reader granted the lock and unlinked by its waker (Linux
     /// waiter->task cleared)
@@ -93,20 +122,23 @@ struct Waiter {
 }
 
 // SAFETY: every field but `task` is atomic or immutable; `task` is only
-// followed under the semaphore's lock while the waiter is linked (its
-// task is then asleep in `RwSem::lock_*`)
+// followed under the wait lock while the waiter is linked (its task is
+// then asleep in `RwSem::*_slow`), to take a reference
 unsafe impl Sync for Waiter {}
 // SAFETY: as above
 unsafe impl Send for Waiter {}
 
 crate::adapter!(WaiterAdapter, Waiter, link);
 
+type WaitList = List<WaiterAdapter>;
+
 impl Waiter {
     /// A waiter of `kind` for the current task, queued at tick `now`
     fn new(kind: Kind, now: u64) -> Self {
-        let task = waiter_task();
-        // SAFETY: the current task, or null (host tests)
-        let rt = unsafe { task.as_ref() }.is_some_and(|t| crate::task::is_rt_policy(t.se.policy()));
+        Self::with(kind, now, waiter_task(), current_rt())
+    }
+
+    fn with(kind: Kind, now: u64, task: *const Task, rt: bool) -> Self {
         Self {
             link: Link::new(),
             task,
@@ -125,216 +157,34 @@ impl Waiter {
         now > self.timeout
     }
 
+    /// Granted the lock: its waker is done with it (pairs with the
+    /// Release in `mark_wake`)
     fn granted(&self) -> bool {
-        self.granted.load(Ordering::Relaxed)
+        self.granted.load(Ordering::Acquire)
     }
 }
 
-/// Wake a waiter's task: called under the semaphore's lock, so a woken
-/// waiter cannot leave, nor its task exit, before that is dropped
-fn wake_task(w: &Waiter) {
-    // SAFETY: a linked or just-granted waiter, its task asleep in
-    // `RwSem::lock_*` until it sees the lock (above)
-    unsafe { wake_waiter(w.task) };
+/// The front waiter of a wait list
+fn first(l: &WaitList) -> Option<&Waiter> {
+    // SAFETY: linked waiters are live (type invariant of `Waiter`)
+    l.front().map(|p| unsafe { &*p })
 }
 
-/// The lock word and wait list (Linux sem->count and sem->wait_list)
-///
-/// # Invariants
-/// Never `writer` and `readers > 0` at once; `handoff` only while
-/// `waiters` is not empty; `waiters` holds live pinned `Waiter`s.
-struct Sem {
-    readers: u32,
-    writer: bool,
-    /// Linux RWSEM_FLAG_HANDOFF
-    handoff: bool,
-    /// FIFO (Linux RWSEM_FLAG_WAITERS: not empty)
-    waiters: List<WaiterAdapter>,
-}
-
-impl Sem {
-    const fn new() -> Self {
-        Self {
-            readers: 0,
-            writer: false,
-            handoff: false,
-            waiters: List::new(),
-        }
-    }
-
-    fn first(&self) -> Option<&Waiter> {
-        // SAFETY: linked waiters are live (type invariant)
-        self.waiters.front().map(|p| unsafe { &*p })
-    }
-
-    fn is_first(&self, w: &Waiter) -> bool {
-        self.waiters.front() == Some(&raw const *w)
-    }
-
-    /// Read hold when no writer holds or waits and nobody queues (Linux
-    /// rwsem_read_trylock, __down_read_trylock)
-    fn read_fast(&mut self) -> bool {
-        let ok = !self.writer && !self.handoff && self.waiters.is_empty();
-        if ok {
-            self.readers += 1;
-        }
-        ok
-    }
-
-    /// Steal a lock nobody holds past the queue unless a handoff guards
-    /// it, granting the queued readers too (Linux reader optimistic lock
-    /// stealing in rwsem_down_read_slowpath); a lock other readers hold
-    /// is not stolen, so readers cannot starve a waiting writer
-    fn read_steal(&mut self, now: u64, wake: &mut impl FnMut(&Waiter)) -> bool {
-        if self.readers > 0 || self.writer || self.handoff {
-            return false;
-        }
-        self.readers = 1;
-        if !self.waiters.is_empty() {
-            self.mark_wake(Wake::ReadOwned, now, wake);
-        }
-        true
-    }
-
-    /// Write hold when the lock is free and nobody queues (Linux
-    /// rwsem_write_trylock)
-    fn write_fast(&mut self) -> bool {
-        let ok = self.readers == 0 && !self.writer && self.waiters.is_empty();
-        if ok {
-            self.writer = true;
-        }
-        ok
-    }
-
-    /// Write hold when free and no handoff guards it (Linux
-    /// rwsem_try_write_lock_unqueued): before tasks exist only
-    fn write_unqueued(&mut self) -> bool {
-        let ok = self.readers == 0 && !self.writer && !self.handoff;
-        if ok {
-            self.writer = true;
-        }
-        ok
-    }
-
-    /// Queue `w` last (Linux rwsem_add_waiter)
-    fn add(&mut self, w: Pin<&Waiter>) {
-        // SAFETY: pinned, on no list, and unlinked before it goes (type
-        // invariant of `Waiter`)
-        unsafe { self.waiters.push_back(&raw const *w) };
-    }
-
-    /// Unqueue `w`; true if waiters remain, else the handoff is over
-    /// (Linux rwsem_del_waiter)
-    fn del(&mut self, w: &Waiter) -> bool {
-        // SAFETY: `add` linked it here and nobody unlinked it
-        unsafe { self.waiters.remove(w) };
-        if self.waiters.is_empty() {
-            self.handoff = false;
-            return false;
-        }
-        true
-    }
-
-    /// A waiter gives up (signal): unqueue it; a front waiter's leaving
-    /// may let the next ones go (Linux rwsem_del_wake_waiter)
-    fn del_wake(&mut self, w: &Waiter, now: u64, wake: &mut impl FnMut(&Waiter)) {
-        let first = self.is_first(w);
-        if self.del(w) && first {
-            self.mark_wake(Wake::Any, now, wake);
-        }
-    }
-
-    /// Wake waiters a just-queued one may be blocking (Linux
-    /// rwsem_cond_wake_waiter)
-    fn cond_wake(&mut self, now: u64, wake: &mut impl FnMut(&Waiter)) {
-        if self.writer {
-            return;
-        }
-        let kind = if self.readers > 0 {
-            Wake::Readers
-        } else {
-            Wake::Any
-        };
-        self.mark_wake(kind, now, wake);
-    }
-
-    /// Wake the front waiter: a writer (`Wake::Any` only), which then
-    /// competes for the lock, or the queued readers, granted the lock
-    /// here (Linux rwsem_mark_wake). A reader front waiter that finds a
-    /// writer holding the lock past its timeout asks for a handoff.
-    fn mark_wake(&mut self, kind: Wake, now: u64, wake: &mut impl FnMut(&Waiter)) {
-        let Some(first) = self.first() else { return };
-        if first.kind == Kind::Write {
-            if kind == Wake::Any {
-                wake(first);
-            }
-            return;
-        }
-        if kind != Wake::ReadOwned && self.writer {
-            if first.expired(now) {
-                first.handoff_set.store(true, Ordering::Relaxed);
-                self.handoff = true;
-            }
-            return;
-        }
-        let mut woken = 0;
-        let mut cur = self.waiters.front();
-        while let Some(p) = cur {
-            // SAFETY: on the list; its next is read before it is unlinked
-            cur = unsafe { self.waiters.next(p) };
-            // SAFETY: linked waiters are live (type invariant)
-            let w = unsafe { &*p };
-            if w.kind == Kind::Write {
-                continue;
-            }
-            // SAFETY: on this list
-            unsafe { self.waiters.remove(p) };
-            self.readers += 1;
-            w.granted.store(true, Ordering::Relaxed);
-            wake(w);
-            woken += 1;
-            if woken >= MAX_READERS_WAKEUP {
-                break;
-            }
-        }
-        // A reader got the lock: no handoff is needed any more
-        if woken > 0 || self.waiters.is_empty() {
-            self.handoff = false;
-        }
-    }
-
-    /// The queued writer `w` takes the lock if free and not handed off
-    /// to another waiter (unqueueing itself), else, waited long enough,
-    /// asks for a handoff (Linux rwsem_try_write_lock)
-    fn try_write_lock(&mut self, w: &Waiter, now: u64) -> bool {
-        let Some(first) = self.first() else {
-            return false;
-        };
-        if self.handoff && first.handoff_set.load(Ordering::Relaxed) && !self.is_first(w) {
-            return false;
-        }
-        if self.readers > 0 || self.writer {
-            if self.handoff || (!w.rt && !w.expired(now)) {
-                return false;
-            }
-            first.handoff_set.store(true, Ordering::Relaxed);
-            self.handoff = true;
-            return false;
-        }
-        self.writer = true;
-        self.handoff = false;
-        self.del(w);
-        true
-    }
+fn is_first(l: &WaitList, w: &Waiter) -> bool {
+    l.front() == Some(&raw const *w)
 }
 
 /// Sleeping reader/writer lock over a `T`
 ///
 /// # Invariants
-/// `data` is shared by the `sem.readers` readers or held by the one
-/// writer (`sem.writer`), never both; `sem` changes only under its lock.
+/// `data` is shared by the readers counted in `count` or held by the
+/// one writer (`WRITER_LOCKED`), never both. `WAITERS` is set exactly
+/// while `wait` is not empty and `HANDOFF` only then, both changed under
+/// the wait lock (Linux keeps the same rules). A reader's bias may sit
+/// in the count for a moment while it fails: it then takes it out.
 pub struct RwSem<T: ?Sized = ()> {
-    sem: IrqSpinlock<Sem>,
+    count: AtomicI64,
+    wait: spin::Mutex<WaitList>,
     data: UnsafeCell<T>,
 }
 
@@ -345,93 +195,401 @@ unsafe impl<T: ?Sized + Send> Send for RwSem<T> {}
 unsafe impl<T: ?Sized + Send + Sync> Sync for RwSem<T> {}
 
 impl<T: Default> Default for RwSem<T> {
+    #[track_caller]
     fn default() -> Self {
         Self::new(T::default())
     }
 }
 
 impl<T> RwSem<T> {
-    /// New unlocked semaphore guarding `v`
+    /// New unlocked semaphore guarding `v`; its wait lock's lockdep
+    /// class is the caller's location
+    #[track_caller]
     pub const fn new(v: T) -> Self {
         Self {
-            sem: IrqSpinlock::new(Sem::new()),
+            count: AtomicI64::new(0),
+            wait: spin::Mutex::new(List::new()),
             data: UnsafeCell::new(v),
         }
     }
 }
 
 impl<T: ?Sized> RwSem<T> {
+    /// Add `v` to the count (Linux atomic_long_add_return); the new count
+    fn add(&self, v: i64, o: Ordering) -> i64 {
+        self.count.fetch_add(v, o).wrapping_add(v)
+    }
+
+    /// Read hold if no writer holds and nobody waits or is handed the
+    /// lock (Linux __down_read_trylock)
+    fn read_trylock(&self) -> bool {
+        let mut c = self.count.load(Ordering::Relaxed);
+        while c & READ_FAILED_MASK == 0 {
+            match self.count.compare_exchange_weak(
+                c,
+                c + READER_BIAS,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(v) => c = v,
+            }
+        }
+        false
+    }
+
+    /// Write hold if free with nobody waiting (Linux rwsem_write_trylock)
+    fn write_trylock(&self) -> bool {
+        self.count
+            .compare_exchange(0, WRITER_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Queue `w` last (Linux rwsem_add_waiter, the caller sets `WAITERS`
+    /// for a first waiter)
+    fn add_waiter(l: &mut WaitList, w: Pin<&Waiter>) {
+        // SAFETY: pinned, on no list, and unlinked before it goes (type
+        // invariant of `Waiter`)
+        unsafe { l.push_back(&raw const *w) };
+    }
+
+    /// Unqueue `w`; true if waiters remain, else the flags go (Linux
+    /// rwsem_del_waiter)
+    fn del_waiter(&self, l: &mut WaitList, w: &Waiter) -> bool {
+        // SAFETY: queued here by `add_waiter`, not unlinked since
+        unsafe { l.remove(w) };
+        if l.is_empty() {
+            self.count
+                .fetch_and(!(HANDOFF | WAITERS), Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// A waiter gives up (signal): unqueue it; a front waiter's leaving
+    /// may let the next ones go (Linux rwsem_del_wake_waiter)
+    fn del_wake_waiter(&self, l: &mut WaitList, w: &Waiter, now: u64, q: &mut WakeQ) {
+        let first = is_first(l, w);
+        if self.del_waiter(l, w) && first {
+            self.mark_wake(l, Wake::Any, now, q);
+        }
+    }
+
+    /// Wake waiters that a just-queued one, seeing `count`, may be
+    /// blocking (Linux rwsem_cond_wake_waiter)
+    fn cond_wake(&self, l: &mut WaitList, count: i64, now: u64, q: &mut WakeQ) {
+        if count & WRITER_LOCKED != 0 {
+            return;
+        }
+        let kind = if count & READER_MASK != 0 {
+            Wake::Readers
+        } else {
+            Wake::Any
+        };
+        self.mark_wake(l, kind, now, q);
+    }
+
+    /// Queue the front waiter's wakeup: a writer (`Wake::Any` only),
+    /// which then competes for the lock, or the queued readers, granted
+    /// the lock here (Linux rwsem_mark_wake). A reader front waiter that
+    /// finds a writer holding the lock past its timeout asks for a
+    /// handoff.
+    fn mark_wake(&self, l: &mut WaitList, kind: Wake, now: u64, q: &mut WakeQ) {
+        let Some(front) = first(l) else { return };
+        if front.kind == Kind::Write {
+            if kind == Wake::Any {
+                // SAFETY: linked, under the wait lock
+                q.add_safe(unsafe { waiter_ref(front.task) });
+            }
+            return;
+        }
+        let mut adj = 0;
+        if kind != Wake::ReadOwned {
+            // Take the read lock for the readers first: a writer may
+            // steal it meanwhile
+            adj = READER_BIAS;
+            let old = self.count.fetch_add(adj, Ordering::AcqRel);
+            if old & WRITER_LOCKED != 0 {
+                if front.expired(now) {
+                    if old & HANDOFF == 0 {
+                        adj -= HANDOFF;
+                    }
+                    front.handoff_set.store(true, Ordering::Relaxed);
+                }
+                self.count.fetch_sub(adj, Ordering::AcqRel);
+                return;
+            }
+        }
+        // Count the readers to grant (writers skipped) and whether any
+        // waiter stays
+        let mut woken = 0;
+        let mut stays = false;
+        for w in l.iter() {
+            if w.kind == Kind::Write {
+                stays = true;
+            } else if woken == MAX_READERS_WAKEUP {
+                stays = true;
+                break;
+            } else {
+                woken += 1;
+            }
+        }
+        let mut adj = woken * READER_BIAS - adj;
+        let old = self.count.load(Ordering::Relaxed);
+        if !stays {
+            adj -= WAITERS;
+        }
+        // A reader got the lock: no handoff is needed any more
+        if (woken > 0 || !stays) && old & HANDOFF != 0 {
+            adj -= HANDOFF;
+        }
+        if adj != 0 {
+            self.count.fetch_add(adj, Ordering::AcqRel);
+        }
+        self.grant(l, woken, q);
+    }
+
+    /// Unqueue the first `n` readers and hand them the lock their count
+    /// already holds, queueing their wakeups (second pass of Linux
+    /// rwsem_mark_wake)
+    fn grant(&self, l: &mut WaitList, mut n: i64, q: &mut WakeQ) {
+        let mut cur = l.front();
+        while let Some(p) = cur
+            && n > 0
+        {
+            // SAFETY: on the list; its next is read before it is unlinked
+            cur = unsafe { l.next(p) };
+            // SAFETY: linked waiters are live (type invariant)
+            let w = unsafe { &*p };
+            if w.kind == Kind::Write {
+                continue;
+            }
+            // SAFETY: on this list
+            unsafe { l.remove(p) };
+            // SAFETY: just unlinked under the wait lock, not yet granted:
+            // its task still waits
+            let t = unsafe { waiter_ref(w.task) };
+            // Last touch: the waiter may leave once it sees this
+            w.granted.store(true, Ordering::Release);
+            q.add_safe(t);
+            n -= 1;
+        }
+    }
+
+    /// The queued writer `w` takes the lock if free and not handed off
+    /// to another waiter (unqueueing itself), else, waited long enough,
+    /// asks for a handoff (Linux rwsem_try_write_lock)
+    fn try_write_lock(&self, l: &mut WaitList, w: &Waiter, now: u64) -> bool {
+        let Some(front) = first(l) else {
+            return false;
+        };
+        let mut c = self.count.load(Ordering::Relaxed);
+        let new = loop {
+            let handoff = c & HANDOFF != 0;
+            if handoff && front.handoff_set.load(Ordering::Relaxed) && !is_first(l, w) {
+                return false;
+            }
+            let mut new = c;
+            if c & LOCK_MASK != 0 {
+                if handoff || (!w.rt && !w.expired(now)) {
+                    return false;
+                }
+                new |= HANDOFF;
+            } else {
+                new |= WRITER_LOCKED;
+                new &= !HANDOFF;
+                if l.len() == 1 {
+                    new &= !WAITERS;
+                }
+            }
+            match self
+                .count
+                .compare_exchange(c, new, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => break new,
+                Err(v) => c = v,
+            }
+        };
+        if new & HANDOFF != 0 {
+            front.handoff_set.store(true, Ordering::Relaxed);
+            return false;
+        }
+        self.del_waiter(l, w);
+        true
+    }
+
+    /// Wake the front waiter after a release saw `WAITERS` (Linux
+    /// rwsem_wake)
+    #[cold]
+    fn wake(&self) {
+        let mut q = WakeQ::new();
+        let mut l = self.wait.lock();
+        if !l.is_empty() {
+            self.mark_wake(&mut l, Wake::Any, get_ticks(), &mut q);
+        }
+        drop(l);
+        q.wake();
+    }
+
     /// Read hold, sleeping in `state` while unavailable (Linux
-    /// __down_read_common and rwsem_down_read_slowpath)
+    /// __down_read_common)
     fn lock_read(&self, state: SleepState) -> Result<(), KernelError> {
-        let mut s = self.sem.lock();
-        if s.read_fast() || s.read_steal(get_ticks(), &mut wake_task) {
+        let c = self.add(READER_BIAS, Ordering::Acquire);
+        if c & READ_FAILED_MASK == 0 {
+            return Ok(());
+        }
+        self.read_slow(c, state)
+    }
+
+    /// The reader bias in `count` takes a lock no reader or writer holds
+    /// and no handoff guards, granting the queued readers too (Linux
+    /// reader optimistic lock stealing); a lock other readers hold is
+    /// not stolen, so readers cannot starve a waiting writer
+    fn read_steal(&self, count: i64) -> bool {
+        if count & (WRITER_LOCKED | HANDOFF) != 0 || readers(count) > 1 {
+            return false;
+        }
+        if count & WAITERS != 0 {
+            let mut q = WakeQ::new();
+            let mut l = self.wait.lock();
+            if !l.is_empty() {
+                self.mark_wake(&mut l, Wake::ReadOwned, get_ticks(), &mut q);
+            }
+            drop(l);
+            q.wake();
+        }
+        true
+    }
+
+    /// Read hold after the fast path's bias saw `count` (Linux
+    /// rwsem_down_read_slowpath)
+    #[cold]
+    fn read_slow(&self, count: i64, state: SleepState) -> Result<(), KernelError> {
+        if self.read_steal(count) {
             return Ok(());
         }
         if !can_sleep() {
             // Before tasks exist: nobody to queue behind
-            while !(s.read_fast() || s.read_steal(get_ticks(), &mut wake_task)) {
-                drop(s);
+            loop {
+                self.count.fetch_sub(READER_BIAS, Ordering::Relaxed);
                 core::hint::spin_loop();
-                s = self.sem.lock();
+                let c = self.add(READER_BIAS, Ordering::Acquire);
+                if c & READ_FAILED_MASK == 0 || self.read_steal(c) {
+                    return Ok(());
+                }
             }
-            return Ok(());
         }
         let w = pin!(Waiter::new(Kind::Read, get_ticks()));
-        s.add(w.as_ref());
-        s.cond_wake(get_ticks(), &mut wake_task);
+        let mut q = WakeQ::new();
+        let mut l = self.wait.lock();
+        let mut adj = -READER_BIAS;
+        if l.is_empty() {
+            // Nobody queues and no writer holds it: the bias holds it
+            if self.count.load(Ordering::Acquire) & WRITER_LOCKED == 0 {
+                return Ok(());
+            }
+            adj += WAITERS;
+        }
+        Self::add_waiter(&mut l, w.as_ref());
+        // Waiting now, no longer trying
+        let c = self.add(adj, Ordering::AcqRel);
+        self.cond_wake(&mut l, c, get_ticks(), &mut q);
+        drop(l);
+        q.wake();
         let r = loop {
             set_current_state(state);
             if w.granted() {
                 break Ok(());
             }
             if signal_pending_state(state) {
-                s.del_wake(&w, get_ticks(), &mut wake_task);
+                let mut l = self.wait.lock();
+                // Granted under the wait lock: no longer queued
+                if w.granted() {
+                    break Ok(());
+                }
+                self.del_wake_waiter(&mut l, &w, get_ticks(), &mut q);
+                drop(l);
+                q.wake();
                 break Err(KernelError::Interrupted);
             }
-            drop(s);
             schedule();
-            s = self.sem.lock();
         };
         set_current_state(SleepState::Running);
         r
     }
 
     /// Write hold, sleeping in `state` while unavailable (Linux
-    /// __down_write_common and rwsem_down_write_slowpath)
+    /// __down_write_common)
     fn lock_write(&self, state: SleepState) -> Result<(), KernelError> {
-        let mut s = self.sem.lock();
-        if s.write_fast() {
+        if self.write_trylock() {
             return Ok(());
         }
+        self.write_slow(state)
+    }
+
+    /// Write hold when free and no handoff guards it, waiters or not
+    /// (Linux rwsem_try_write_lock_unqueued): before tasks exist only
+    fn write_unqueued(&self) -> bool {
+        let mut c = self.count.load(Ordering::Relaxed);
+        while c & (LOCK_MASK | HANDOFF) == 0 {
+            match self.count.compare_exchange_weak(
+                c,
+                c | WRITER_LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(v) => c = v,
+            }
+        }
+        false
+    }
+
+    /// Queue and sleep for the write lock (Linux
+    /// rwsem_down_write_slowpath)
+    #[cold]
+    fn write_slow(&self, state: SleepState) -> Result<(), KernelError> {
         if !can_sleep() {
             // Before tasks exist: nobody to queue behind
-            while !s.write_unqueued() {
-                drop(s);
+            while !self.write_unqueued() {
                 core::hint::spin_loop();
-                s = self.sem.lock();
             }
             return Ok(());
         }
         let w = pin!(Waiter::new(Kind::Write, get_ticks()));
-        s.add(w.as_ref());
-        if !s.is_first(&w) {
-            s.cond_wake(get_ticks(), &mut wake_task);
+        let mut q = WakeQ::new();
+        let mut l = self.wait.lock();
+        if l.is_empty() {
+            Self::add_waiter(&mut l, w.as_ref());
+            self.count.fetch_or(WAITERS, Ordering::Relaxed);
+        } else {
+            Self::add_waiter(&mut l, w.as_ref());
+            let c = self.count.load(Ordering::Relaxed);
+            self.cond_wake(&mut l, c, get_ticks(), &mut q);
+            if !q.is_empty() {
+                drop(l);
+                q.wake();
+                l = self.wait.lock();
+            }
         }
+        set_current_state(state);
         let r = loop {
-            set_current_state(state);
-            if s.try_write_lock(&w, get_ticks()) {
+            if self.try_write_lock(&mut l, &w, get_ticks()) {
                 break Ok(());
             }
+            drop(l);
             if signal_pending_state(state) {
-                s.del_wake(&w, get_ticks(), &mut wake_task);
+                l = self.wait.lock();
+                self.del_wake_waiter(&mut l, &w, get_ticks(), &mut q);
                 break Err(KernelError::Interrupted);
             }
-            drop(s);
             schedule();
-            s = self.sem.lock();
+            set_current_state(state);
+            l = self.wait.lock();
         };
+        drop(l);
         set_current_state(SleepState::Running);
+        q.wake();
         r
     }
 
@@ -448,10 +606,9 @@ impl<T: ?Sized> RwSem<T> {
     /// # Safety
     /// The caller must hold the semaphore shared.
     pub unsafe fn up_read(&self) {
-        let mut s = self.sem.lock();
-        s.readers -= 1;
-        if s.readers == 0 {
-            s.mark_wake(Wake::Any, get_ticks(), &mut wake_task);
+        let c = self.add(-READER_BIAS, Ordering::Release);
+        if c & (LOCK_MASK | WAITERS) == WAITERS {
+            self.wake();
         }
     }
 
@@ -467,9 +624,10 @@ impl<T: ?Sized> RwSem<T> {
     /// # Safety
     /// The caller must hold the semaphore exclusively.
     pub unsafe fn up_write(&self) {
-        let mut s = self.sem.lock();
-        s.writer = false;
-        s.mark_wake(Wake::Any, get_ticks(), &mut wake_task);
+        let old = self.count.fetch_sub(WRITER_LOCKED, Ordering::Release);
+        if old & WAITERS != 0 {
+            self.wake();
+        }
     }
 
     /// Shared hold (Linux down_read)
@@ -525,19 +683,13 @@ impl<T: ?Sized> RwSem<T> {
     /// Shared hold if no writer holds or waits and nobody queues,
     /// without sleeping (Linux down_read_trylock)
     pub fn try_read(&self) -> Option<RwSemReadGuard<'_, T>> {
-        self.sem
-            .lock()
-            .read_fast()
-            .then(|| RwSemReadGuard { s: self })
+        self.read_trylock().then(|| RwSemReadGuard { s: self })
     }
 
     /// Exclusive hold if free and nobody queues, without sleeping (Linux
     /// down_write_trylock)
     pub fn try_write(&self) -> Option<RwSemWriteGuard<'_, T>> {
-        self.sem
-            .lock()
-            .write_fast()
-            .then(|| RwSemWriteGuard { s: self })
+        self.write_trylock().then(|| RwSemWriteGuard { s: self })
     }
 
     /// The data, through exclusive ownership (no locking)
@@ -603,47 +755,93 @@ impl<T: ?Sized> Drop for RwSemWriteGuard<'_, T> {
 mod tests {
     extern crate std;
     use super::*;
+    use std::boxed::Box;
     use std::vec::Vec;
 
-    /// Records who a wakeup woke
-    #[derive(Default)]
-    struct Woken(Vec<*const Waiter>);
-
-    impl Woken {
-        fn f(&mut self) -> impl FnMut(&Waiter) + '_ {
-            |w| self.0.push(w)
-        }
-        fn take(&mut self) -> Vec<*const Waiter> {
-            core::mem::take(&mut self.0)
-        }
-    }
-
-    fn ptr(w: &Pin<&mut Waiter>) -> *const Waiter {
-        &raw const **w
-    }
+    type Sem = RwSem<()>;
 
     const T0: u64 = 100;
     const LATE: u64 = T0 + RWSEM_WAIT_TIMEOUT + 1;
+
+    /// A waiter whose task is the tag `n`, as wakeups record it
+    fn waiter(kind: Kind, n: usize) -> Waiter {
+        Waiter::with(kind, T0, core::ptr::without_provenance(n), false)
+    }
+
+    fn tag(n: usize) -> *const Task {
+        core::ptr::without_provenance(n)
+    }
+
+    /// Queue `w` last, as the slow paths do
+    fn queue(s: &Sem, w: &Pin<&mut Waiter>) {
+        let mut l = s.wait.lock();
+        if l.is_empty() {
+            s.count.fetch_or(WAITERS, Ordering::Relaxed);
+        }
+        Sem::add_waiter(&mut l, w.as_ref());
+    }
+
+    fn count(s: &Sem) -> i64 {
+        s.count.load(Ordering::Relaxed)
+    }
+
+    /// Run `mark_wake`; whom it woke
+    fn mark_wake(s: &Sem, kind: Wake, now: u64) -> Vec<*const Task> {
+        let mut q = WakeQ::new();
+        s.mark_wake(&mut s.wait.lock(), kind, now, &mut q);
+        core::mem::take(&mut q.woken)
+    }
+
+    fn try_write_lock(s: &Sem, w: &Pin<&mut Waiter>, now: u64) -> bool {
+        s.try_write_lock(&mut s.wait.lock(), w, now)
+    }
+
+    fn is_first_w(s: &Sem, w: &Pin<&mut Waiter>) -> bool {
+        is_first(&s.wait.lock(), w)
+    }
+
+    /// Uncontended holds and releases only touch the count
+    #[test]
+    fn uncontended() {
+        let s = Sem::new(());
+        assert!(s.write_trylock());
+        assert_eq!(count(&s), WRITER_LOCKED);
+        assert!(!s.read_trylock() && !s.write_trylock());
+        // SAFETY: held
+        unsafe { s.up_write() };
+        assert!(s.read_trylock());
+        assert!(s.lock_read(SleepState::Uninterruptible).is_ok());
+        assert_eq!(count(&s), 2 * READER_BIAS);
+        assert!(!s.write_trylock());
+        // SAFETY: held twice
+        unsafe {
+            s.up_read();
+            s.up_read();
+        }
+        assert_eq!(count(&s), 0);
+        assert!(s.wait.lock().is_empty());
+    }
 
     /// A queued writer stops new readers (fast path and stealing while
     /// readers hold the lock); the last reader's release wakes it and
     /// it takes the lock
     #[test]
     fn writer_blocks_new_readers() {
-        let mut s = Sem::new();
-        let mut wk = Woken::default();
-        assert!(s.read_fast());
-        let w = pin!(Waiter::new(Kind::Write, T0));
-        assert!(!s.write_fast());
-        s.add(w.as_ref());
-        assert!(!s.read_fast());
-        assert!(!s.read_steal(T0, &mut wk.f()));
-        assert!(!s.try_write_lock(&w, T0));
-        s.readers -= 1;
-        s.mark_wake(Wake::Any, T0, &mut wk.f());
-        assert_eq!(wk.take(), [ptr(&w)]);
-        assert!(s.try_write_lock(&w, T0));
-        assert!(s.writer && s.waiters.is_empty());
+        let s = Sem::new(());
+        assert!(s.read_trylock());
+        let w = pin!(waiter(Kind::Write, 1));
+        assert!(!s.write_trylock());
+        queue(&s, &w);
+        assert!(!s.read_trylock());
+        let c = s.add(READER_BIAS, Ordering::Relaxed);
+        assert!(!s.read_steal(c), "stole a reader-held lock");
+        s.count.fetch_sub(READER_BIAS, Ordering::Relaxed);
+        assert!(!try_write_lock(&s, &w, T0));
+        s.count.fetch_sub(READER_BIAS, Ordering::Relaxed);
+        assert_eq!(mark_wake(&s, Wake::Any, T0), [tag(1)]);
+        assert!(try_write_lock(&s, &w, T0));
+        assert_eq!(count(&s), WRITER_LOCKED);
+        assert!(s.wait.lock().is_empty());
     }
 
     /// A writer's release grants every queued reader at once, writers
@@ -651,29 +849,27 @@ mod tests {
     /// them: a writer relocking at once queues behind the readers
     #[test]
     fn release_grants_readers_fifo() {
-        let mut s = Sem::new();
-        let mut wk = Woken::default();
-        assert!(s.write_fast());
-        let r1 = pin!(Waiter::new(Kind::Read, T0));
-        let w1 = pin!(Waiter::new(Kind::Write, T0));
-        let r2 = pin!(Waiter::new(Kind::Read, T0));
-        s.add(r1.as_ref());
-        s.add(w1.as_ref());
-        s.add(r2.as_ref());
-        s.writer = false;
-        s.mark_wake(Wake::Any, T0, &mut wk.f());
-        assert_eq!(wk.take(), [ptr(&r1), ptr(&r2)]);
+        let s = Sem::new(());
+        assert!(s.write_trylock());
+        let r1 = pin!(waiter(Kind::Read, 1));
+        let w1 = pin!(waiter(Kind::Write, 2));
+        let r2 = pin!(waiter(Kind::Read, 3));
+        queue(&s, &r1);
+        queue(&s, &w1);
+        queue(&s, &r2);
+        s.count.fetch_sub(WRITER_LOCKED, Ordering::Relaxed);
+        assert_eq!(mark_wake(&s, Wake::Any, T0), [tag(1), tag(3)]);
         assert!(r1.granted() && r2.granted() && !w1.granted());
-        assert_eq!(s.readers, 2);
+        assert_eq!(count(&s), 2 * READER_BIAS | WAITERS);
         // The old writer comes back: it cannot barge past the queue
-        assert!(!s.write_fast());
-        let w0 = pin!(Waiter::new(Kind::Write, T0));
-        s.add(w0.as_ref());
-        s.readers = 0;
-        s.mark_wake(Wake::Any, T0, &mut wk.f());
-        assert_eq!(wk.take(), [ptr(&w1)]);
-        assert!(s.try_write_lock(&w1, T0));
-        assert!(s.is_first(&w0));
+        assert!(!s.write_trylock());
+        let w0 = pin!(waiter(Kind::Write, 4));
+        queue(&s, &w0);
+        s.count.fetch_sub(2 * READER_BIAS, Ordering::Relaxed);
+        assert_eq!(mark_wake(&s, Wake::Any, T0), [tag(2)]);
+        assert!(try_write_lock(&s, &w1, T0));
+        assert!(is_first_w(&s, &w0));
+        assert_eq!(count(&s), WRITER_LOCKED | WAITERS);
     }
 
     /// A front writer that waited past the timeout sets the handoff:
@@ -681,49 +877,52 @@ mod tests {
     /// queued writers keep off; the front writer gets the lock
     #[test]
     fn writer_handoff() {
-        let mut s = Sem::new();
-        let mut wk = Woken::default();
-        assert!(s.read_fast());
-        let w = pin!(Waiter::new(Kind::Write, T0));
-        let w2 = pin!(Waiter::new(Kind::Write, T0));
-        s.add(w.as_ref());
-        s.add(w2.as_ref());
-        assert!(!s.try_write_lock(&w, T0 + RWSEM_WAIT_TIMEOUT));
-        assert!(!s.handoff, "handoff before the timeout");
-        assert!(!s.try_write_lock(&w, LATE));
-        assert!(s.handoff && w.handoff_set.load(Ordering::Relaxed));
-        s.readers = 0;
-        assert!(!s.read_steal(LATE, &mut wk.f()), "stole past a handoff");
-        assert!(!s.read_fast());
-        assert!(!s.try_write_lock(&w2, LATE), "took a handed-off lock");
-        assert!(s.try_write_lock(&w, LATE));
-        assert!(s.writer && !s.handoff);
-        assert!(s.is_first(&w2));
+        let s = Sem::new(());
+        assert!(s.read_trylock());
+        let w = pin!(waiter(Kind::Write, 1));
+        let w2 = pin!(waiter(Kind::Write, 2));
+        queue(&s, &w);
+        queue(&s, &w2);
+        assert!(!try_write_lock(&s, &w, T0 + RWSEM_WAIT_TIMEOUT));
+        assert_eq!(count(&s) & HANDOFF, 0, "handoff before the timeout");
+        assert!(!try_write_lock(&s, &w, LATE));
+        assert!(count(&s) & HANDOFF != 0 && w.handoff_set.load(Ordering::Relaxed));
+        s.count.fetch_sub(READER_BIAS, Ordering::Relaxed);
+        let c = s.add(READER_BIAS, Ordering::Relaxed);
+        assert!(!s.read_steal(c), "stole past a handoff");
+        s.count.fetch_sub(READER_BIAS, Ordering::Relaxed);
+        assert!(!s.read_trylock());
+        assert!(!s.write_unqueued());
+        assert!(!try_write_lock(&s, &w2, LATE), "took a handed-off lock");
+        assert!(try_write_lock(&s, &w, LATE));
+        assert_eq!(count(&s), WRITER_LOCKED | WAITERS);
+        assert!(is_first_w(&s, &w2));
     }
 
     /// Without a handoff a reader may steal a free lock past a woken
     /// writer; behind a front reader it grants the queued readers too
     #[test]
     fn reader_steal() {
-        let mut wk = Woken::default();
-        let mut s = Sem::new();
-        let w = pin!(Waiter::new(Kind::Write, T0));
-        let r = pin!(Waiter::new(Kind::Read, T0));
-        s.add(w.as_ref());
-        s.add(r.as_ref());
-        assert!(s.read_steal(T0, &mut wk.f()));
-        assert!(wk.take().is_empty(), "readers granted past a writer");
-        assert_eq!(s.readers, 1);
+        let s = Sem::new(());
+        let w = pin!(waiter(Kind::Write, 1));
+        let r = pin!(waiter(Kind::Read, 2));
+        queue(&s, &w);
+        queue(&s, &r);
+        let c = s.add(READER_BIAS, Ordering::Acquire);
+        assert!(s.read_steal(c));
+        assert!(!r.granted(), "readers granted past a writer");
+        assert_eq!(count(&s), READER_BIAS | WAITERS);
 
-        let mut s = Sem::new();
-        let r1 = pin!(Waiter::new(Kind::Read, T0));
-        let w1 = pin!(Waiter::new(Kind::Write, T0));
-        s.add(r1.as_ref());
-        s.add(w1.as_ref());
-        assert!(s.read_steal(T0, &mut wk.f()));
-        assert_eq!(wk.take(), [ptr(&r1)]);
-        assert_eq!(s.readers, 2);
-        assert!(s.is_first(&w1));
+        let s = Sem::new(());
+        let r1 = pin!(waiter(Kind::Read, 3));
+        let w1 = pin!(waiter(Kind::Write, 4));
+        queue(&s, &r1);
+        queue(&s, &w1);
+        let c = s.add(READER_BIAS, Ordering::Acquire);
+        assert!(s.read_steal(c));
+        assert!(r1.granted());
+        assert_eq!(count(&s), 2 * READER_BIAS | WAITERS);
+        assert!(is_first_w(&s, &w1));
     }
 
     /// A front reader that a writer has kept off past the timeout sets
@@ -731,42 +930,70 @@ mod tests {
     /// handoff
     #[test]
     fn reader_handoff() {
-        let mut s = Sem::new();
-        let mut wk = Woken::default();
-        assert!(s.write_fast());
-        let r = pin!(Waiter::new(Kind::Read, T0));
-        let w = pin!(Waiter::new(Kind::Write, T0));
-        s.add(r.as_ref());
-        s.add(w.as_ref());
-        s.mark_wake(Wake::Any, T0, &mut wk.f());
-        assert!(!s.handoff && wk.take().is_empty());
-        s.mark_wake(Wake::Any, LATE, &mut wk.f());
-        assert!(s.handoff && r.handoff_set.load(Ordering::Relaxed));
+        let s = Sem::new(());
+        assert!(s.write_trylock());
+        let r = pin!(waiter(Kind::Read, 1));
+        let w = pin!(waiter(Kind::Write, 2));
+        queue(&s, &r);
+        queue(&s, &w);
+        assert!(mark_wake(&s, Wake::Any, T0).is_empty());
+        assert_eq!(count(&s), WRITER_LOCKED | WAITERS);
+        assert!(mark_wake(&s, Wake::Any, LATE).is_empty());
+        assert_eq!(count(&s), WRITER_LOCKED | WAITERS | HANDOFF);
+        assert!(r.handoff_set.load(Ordering::Relaxed));
         // The writer waiter may not take it although it is next
-        s.writer = false;
-        assert!(!s.try_write_lock(&w, LATE));
-        s.mark_wake(Wake::Any, LATE, &mut wk.f());
-        assert_eq!(wk.take(), [ptr(&r)]);
-        assert!(!s.handoff && s.readers == 1);
+        s.count.fetch_sub(WRITER_LOCKED, Ordering::Relaxed);
+        assert!(!try_write_lock(&s, &w, LATE));
+        assert_eq!(mark_wake(&s, Wake::Any, LATE), [tag(1)]);
+        assert_eq!(count(&s), READER_BIAS | WAITERS);
     }
 
     /// A front writer that gives up lets the readers behind it go;
     /// the last waiter leaving ends a handoff
     #[test]
     fn front_waiter_leaves() {
-        let mut s = Sem::new();
-        let mut wk = Woken::default();
-        assert!(s.read_fast());
-        let w = pin!(Waiter::new(Kind::Write, T0));
-        let r = pin!(Waiter::new(Kind::Read, T0));
-        s.add(w.as_ref());
-        s.add(r.as_ref());
-        assert!(!s.try_write_lock(&w, LATE));
-        assert!(s.handoff);
-        s.del_wake(&w, LATE, &mut wk.f());
-        assert_eq!(wk.take(), [ptr(&r)]);
-        assert_eq!(s.readers, 2);
-        assert!(!s.handoff && s.waiters.is_empty());
+        let s = Sem::new(());
+        assert!(s.read_trylock());
+        let w = pin!(waiter(Kind::Write, 1));
+        let r = pin!(waiter(Kind::Read, 2));
+        queue(&s, &w);
+        queue(&s, &r);
+        assert!(!try_write_lock(&s, &w, LATE));
+        assert!(count(&s) & HANDOFF != 0);
+        let mut q = WakeQ::new();
+        s.del_wake_waiter(&mut s.wait.lock(), &w, LATE, &mut q);
+        assert_eq!(q.woken, [tag(2)]);
+        assert_eq!(count(&s), 2 * READER_BIAS);
+        assert!(s.wait.lock().is_empty());
+    }
+
+    /// One wakeup grants at most `MAX_READERS_WAKEUP` readers; the rest
+    /// stay queued
+    #[test]
+    fn reader_batch() {
+        let s = Sem::new(());
+        assert!(s.write_trylock());
+        let n = MAX_READERS_WAKEUP as usize + 3;
+        let ws: Vec<_> = (0..n)
+            .map(|i| Box::pin(waiter(Kind::Read, i + 1)))
+            .collect();
+        {
+            let mut l = s.wait.lock();
+            s.count.fetch_or(WAITERS, Ordering::Relaxed);
+            for w in &ws {
+                Sem::add_waiter(&mut l, w.as_ref());
+            }
+        }
+        s.count.fetch_sub(WRITER_LOCKED, Ordering::Relaxed);
+        assert_eq!(mark_wake(&s, Wake::Any, T0).len(), n - 3);
+        assert_eq!(count(&s), (n as i64 - 3) * READER_BIAS | WAITERS);
+        assert_eq!(s.wait.lock().len(), 3);
+        assert!(ws[n - 4].granted() && !ws[n - 3].granted());
+        let mut l = s.wait.lock();
+        for w in &ws[n - 3..] {
+            s.del_waiter(&mut l, w);
+        }
+        assert_eq!(count(&s), (n as i64 - 3) * READER_BIAS);
     }
 
     /// A failed `try_read` or `try_write` leaves the holders' lock alone
@@ -775,30 +1002,46 @@ mod tests {
         let l = RwSem::new(());
         let w = l.write();
         assert!(l.try_read().is_none() && l.try_write().is_none());
-        assert!(l.sem.lock().writer);
+        assert_eq!(l.count.load(Ordering::Relaxed), WRITER_LOCKED);
         drop(w);
         let r = l.read();
         assert!(l.try_write().is_none());
-        assert_eq!(l.sem.lock().readers, 1);
+        assert_eq!(l.count.load(Ordering::Relaxed), READER_BIAS);
         drop(r);
     }
 
-    /// Threads (spinning on the host) keep readers and writers apart
+    /// Threads (polling waiters on the host: `schedule` yields) keep
+    /// readers and writers apart through the queue and the fast paths,
+    /// and leave the lock free with nobody queued
     #[test]
     fn exclusion() {
         let l = std::sync::Arc::new(RwSem::new((0u64, 0u64)));
-        let ts: Vec<_> = (0..4)
+        let ts: Vec<_> = (0..8)
             .map(|i| {
                 let l = l.clone();
                 std::thread::spawn(move || {
-                    for _ in 0..5_000 {
-                        if i % 2 == 0 {
-                            let mut g = l.write();
-                            g.0 += 1;
-                            g.1 += 1;
-                        } else {
-                            let g = l.read();
-                            assert_eq!(g.0, g.1);
+                    for j in 0..5_000u32 {
+                        match (i % 4, j % 3) {
+                            (0 | 1, _) => {
+                                let mut g = l.write();
+                                g.0 += 1;
+                                g.1 += 1;
+                            }
+                            (2, 0) => {
+                                if let Some(mut g) = l.try_write() {
+                                    g.0 += 1;
+                                    g.1 += 1;
+                                }
+                            }
+                            (2, _) => {
+                                if let Some(g) = l.try_read() {
+                                    assert_eq!(g.0, g.1);
+                                }
+                            }
+                            _ => {
+                                let g = l.read();
+                                assert_eq!(g.0, g.1);
+                            }
                         }
                     }
                 })
@@ -807,6 +1050,10 @@ mod tests {
         for t in ts {
             t.join().unwrap();
         }
-        assert_eq!(l.read().0, 10_000);
+        let g = l.read();
+        assert!(g.0 >= 20_000 && g.0 == g.1);
+        drop(g);
+        assert_eq!(l.count.load(Ordering::Relaxed), 0);
+        assert!(l.wait.lock().is_empty());
     }
 }

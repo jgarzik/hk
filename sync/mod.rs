@@ -29,47 +29,115 @@ pub use racy::RacyCell;
 pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 pub use seqlock::{SeqLock, SeqWriteGuard};
 
-/// The caller is a task that may sleep (not tid 0: an idle task or the
-/// boot context, which never contend for a sleeping lock)
+/// What the sleeping locks take from the scheduler
 #[cfg(not(test))]
-fn can_sleep() -> bool {
-    crate::task::percpu::can_sleep()
+mod sched {
+    pub use crate::sync::waitqueue::signal_pending_state;
+    use crate::task::Task;
+    pub use crate::task::percpu::{TaskRef, current_tid, get_ticks, schedule, set_current_state};
+    pub use crate::task::wake_q::WakeQ;
+
+    /// The caller is a task that may sleep (not tid 0: an idle task or
+    /// the boot context, which never contend for a sleeping lock)
+    pub fn can_sleep() -> bool {
+        crate::task::percpu::can_sleep()
+    }
+
+    /// The current task, queued as a sleeping lock's waiter
+    pub fn waiter_task() -> *const Task {
+        &raw const *crate::task::percpu::current()
+    }
+
+    /// The current task has an RT policy (rwsem handoff at once)
+    pub fn current_rt() -> bool {
+        crate::task::is_rt_policy(crate::task::percpu::current().se.policy())
+    }
+
+    /// A reference to a waiter's task, to wake it after the wait lock
+    ///
+    /// # Safety
+    /// `t` is a `waiter_task()` whose waiter is still queued (the caller
+    /// holds the lock's wait lock), so the task is alive.
+    pub unsafe fn waiter_ref(t: *const Task) -> TaskRef {
+        // SAFETY: alive (the caller); a waiter is never the boot task
+        crate::task::percpu::task_ref(unsafe { &*t })
+    }
 }
 
-/// Host unit tests have no tasks: a contended sleeping lock spins
+/// Host unit tests: each thread is a task that never truly sleeps
+/// (`schedule` yields, so waiters poll) and is never signalled; a
+/// waiter's task is a tag that wakeups record
 #[cfg(test)]
-fn can_sleep() -> bool {
-    false
-}
+mod sched {
+    extern crate std;
+    use crate::task::Task;
+    use crate::task::percpu::SleepState;
+    use core::sync::atomic::{AtomicU64, Ordering};
 
-/// The current task, queued as a sleeping lock's waiter
-#[cfg(not(test))]
-fn waiter_task() -> *const crate::task::Task {
-    &raw const *crate::task::percpu::current()
-}
+    pub type TaskRef = *const Task;
 
-/// Host unit tests have no tasks (their waiters are never woken)
-#[cfg(test)]
-fn waiter_task() -> *const crate::task::Task {
-    core::ptr::null()
-}
+    pub fn can_sleep() -> bool {
+        true
+    }
 
-/// Wake a sleeping lock's waiter (Linux wake_up_process)
-///
-/// # Safety
-/// `t` is a `waiter_task()` whose waiter stays queued, or is granted
-/// the lock but cannot see it, until this returns (the caller holds the
-/// lock's wait lock), so the task cannot exit meanwhile.
-#[cfg(not(test))]
-unsafe fn wake_waiter(t: *const crate::task::Task) {
-    use crate::task::percpu::{WakeMode, try_to_wake_up};
-    // SAFETY: live until this returns (the caller)
-    try_to_wake_up(unsafe { &*t }, WakeMode::Any);
-}
+    /// A tid per thread
+    pub fn current_tid() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        std::thread_local!(static TID: u64 = NEXT.fetch_add(1, Ordering::Relaxed));
+        TID.with(|t| *t)
+    }
 
-/// Host unit tests: nobody to wake
-#[cfg(test)]
-unsafe fn wake_waiter(_: *const crate::task::Task) {}
+    /// Ticks advance on every look, so waits expire
+    pub fn get_ticks() -> u64 {
+        static TICKS: AtomicU64 = AtomicU64::new(0);
+        TICKS.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn schedule() {
+        std::thread::yield_now();
+    }
+
+    pub fn set_current_state(_: SleepState) {}
+
+    pub fn signal_pending_state(_: SleepState) -> bool {
+        false
+    }
+
+    pub fn waiter_task() -> *const Task {
+        core::ptr::null()
+    }
+
+    pub fn current_rt() -> bool {
+        false
+    }
+
+    /// # Safety
+    /// None needed: a tag
+    pub unsafe fn waiter_ref(t: *const Task) -> TaskRef {
+        t
+    }
+
+    /// Records whom it would wake
+    #[derive(Default)]
+    pub struct WakeQ {
+        pub woken: std::vec::Vec<TaskRef>,
+    }
+
+    impl WakeQ {
+        pub fn new() -> Self {
+            Self::default()
+        }
+        pub fn is_empty(&self) -> bool {
+            self.woken.is_empty()
+        }
+        pub fn add_safe(&mut self, t: TaskRef) {
+            self.woken.push(t);
+        }
+        pub fn wake(&mut self) {
+            self.woken.clear();
+        }
+    }
+}
 
 /// Linux might_sleep (CONFIG_DEBUG_ATOMIC_SLEEP): no spin lock may be
 /// held (every `IrqSpinlock` and `sync::spin` lock raises the preempt
@@ -83,8 +151,9 @@ unsafe fn wake_waiter(_: *const crate::task::Task) {}
 pub fn might_sleep() {
     #[cfg(feature = "lockdep")]
     lockdep::might_sleep();
-    #[cfg(not(feature = "lockdep"))]
-    if can_sleep() && in_atomic() {
+    // Host unit tests have no CPU state to check
+    #[cfg(not(any(feature = "lockdep", test)))]
+    if sched::can_sleep() && in_atomic() {
         atomic_sleep(core::panic::Location::caller());
     }
 }
@@ -96,7 +165,7 @@ pub fn in_atomic() -> bool {
     crate::arch::preempt_count() != 0 || irqs_disabled() || CurrentArch::interrupt_depth() != 0
 }
 
-#[cfg(not(feature = "lockdep"))]
+#[cfg(not(any(feature = "lockdep", test)))]
 #[cold]
 fn atomic_sleep(at: &'static core::panic::Location<'static>) {
     use crate::arch::{CurrentArch, PerCpuOps};

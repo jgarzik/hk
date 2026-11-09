@@ -8,6 +8,7 @@ pub mod kcmp;
 pub mod membarrier;
 pub mod pidfd;
 pub(crate) mod rlimit;
+pub mod wake_q;
 pub mod workqueue;
 
 pub mod exec;
@@ -1028,6 +1029,9 @@ pub struct Task {
     /// (Linux vfork_done): set by the parent before the task runs, taken
     /// once by the task
     pub vfork_done: AtomicPtr<crate::sync::completion::Completion>,
+    /// Next task on the `wake_q::WakeQ` it is queued on (Linux
+    /// task->wake_q): null when on none
+    pub wake_q: AtomicPtr<Task>,
     /// Credentials (Linux task->cred): read lock-free by the task, under
     /// TASKLIST by others; replaced only by the task (commit_creds)
     /// under TASKLIST
@@ -1765,6 +1769,7 @@ impl Task {
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
             vfork_done: AtomicPtr::new(core::ptr::null_mut()),
+            wake_q: AtomicPtr::new(core::ptr::null_mut()),
             cred: TaskCred::new(cred),
             alloc_lock: Mutex::new(()),
             mm: OwnCell::new(mm),
@@ -1830,6 +1835,7 @@ impl Task {
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
             vfork_done: AtomicPtr::new(core::ptr::null_mut()),
+            wake_q: AtomicPtr::new(core::ptr::null_mut()),
             cred: TaskCred::boot(),
             alloc_lock: Mutex::new(()),
             mm: OwnCell::new(None),
