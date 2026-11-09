@@ -299,7 +299,6 @@ pub fn init_serial_console() {
 ///
 /// This bypasses all locking and goes directly to hardware.
 /// Only use during panic when normal printk path may deadlock.
-#[cfg(target_arch = "x86_64")]
 pub fn write_byte_com1(byte: u8) {
     SERIAL_DRIVER_S0.write_byte(byte);
 }

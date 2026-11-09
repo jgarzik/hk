@@ -227,8 +227,9 @@ impl SchedArch for X86_64Arch {
 // ============================================================================
 
 use crate::arch::{
-    AcpiInfo, AcpiOps, ArchBusOps, CpuInfo, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps,
-    LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, TimekeeperOps, VfsInitOps,
+    AcpiInfo, AcpiOps, ArchBusOps, CpuInfo, EarlyArchInit, EarlyConOps, ExceptionOps, HaltOps,
+    InitramfsOps, LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, TimekeeperOps,
+    VfsInitOps,
 };
 
 impl HaltOps for X86_64Arch {
@@ -241,6 +242,17 @@ impl HaltOps for X86_64Arch {
             unsafe {
                 core::arch::asm!("hlt", options(nostack, preserves_flags));
             }
+        }
+    }
+}
+
+/// COM1 (the 8250 driver's port)
+impl EarlyConOps for X86_64Arch {
+    const EARLYCON: bool = false;
+
+    fn early_write(bytes: &[u8]) {
+        for &b in bytes {
+            crate::hw::serial::write_byte_com1(b);
         }
     }
 }

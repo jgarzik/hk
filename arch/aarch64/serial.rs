@@ -227,6 +227,19 @@ fn rx_irq_exit(irq: IrqRegistration<IrqFn>) {
     drop(irq);
 }
 
+/// The PL011 is the earlycon until ttyAMA0 registers
+impl crate::arch::EarlyConOps for super::Aarch64Arch {
+    const EARLYCON: bool = true;
+
+    fn early_write(bytes: &[u8]) {
+        if let Ok(s) = core::str::from_utf8(bytes) {
+            write_str(s);
+        } else {
+            bytes.iter().for_each(|&b| write_byte(b));
+        }
+    }
+}
+
 /// Make ttyAMA0 a console (Linux pl011 console; it is /dev/console's
 /// tty). Printk keeps writing the UART directly
 pub fn register_console() {

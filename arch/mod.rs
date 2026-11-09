@@ -18,6 +18,7 @@
 //! Additional traits for architecture-independent kernel initialization:
 //! - [`EarlyArchInit`] - Early hardware initialization (GDT, IDT, etc.)
 //! - [`IoremapOps`] - Kernel page-table primitives (ioremap, vmap)
+//! - [`EarlyConOps`] - Boot UART output (earlycon, panic)
 //! - [`IrqChipOps`] - Device interrupt controller lines (mask, unmask)
 //! - [`AcpiOps`] - Platform hardware discovery (ACPI/device tree)
 //! - [`SmpOps`] - Multi-processor initialization
@@ -421,6 +422,19 @@ pub trait IrqFlagsOps {
 
     /// `flags` has interrupts masked
     fn irqs_disabled_flags(flags: Self::Flags) -> bool;
+}
+
+/// The boot UART's direct output behind printk (Linux earlycon, and
+/// the panic path's lockless UART writes)
+pub trait EarlyConOps {
+    /// printk writes the boot UART while no console is registered
+    /// (Linux earlycon: arm64's PL011; x86's COM1 is a console from the
+    /// start)
+    const EARLYCON: bool;
+
+    /// Write `bytes` to the boot UART, taking no lock (early boot,
+    /// panic)
+    fn early_write(bytes: &[u8]);
 }
 
 /// The device interrupt controller behind `crate::irq` (Linux struct

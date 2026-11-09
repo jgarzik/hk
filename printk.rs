@@ -31,6 +31,7 @@ use ::core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::console;
+use crate::arch::{CurrentArch, EarlyConOps};
 use crate::sync::{IrqSpinlock, IrqSpinlockGuard};
 
 /// Output lock - serializes all console/serial writes
@@ -229,13 +230,9 @@ fn console_write_locked(bytes: &[u8]) {
     if should_write && console::has_console() {
         console::console_write(bytes);
     } else {
-        // Fallback: write directly to serial when no console available
-        // This is especially important for aarch64 which may not have console registered yet
-        #[cfg(target_arch = "aarch64")]
-        {
-            if let Ok(s) = core::str::from_utf8(bytes) {
-                crate::arch::aarch64::serial::write_str(s);
-            }
+        // No console yet: the earlycon, if the arch has one
+        if CurrentArch::EARLYCON {
+            CurrentArch::early_write(bytes);
         }
     }
 }
@@ -244,29 +241,7 @@ fn console_write_locked(bytes: &[u8]) {
 ///
 /// Used when OUTPUT_LOCK cannot be acquired during panic.
 fn direct_serial_write(bytes: &[u8]) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Use serial TTY driver directly
-        if let Ok(s) = core::str::from_utf8(bytes) {
-            for c in s.chars() {
-                crate::hw::serial::write_byte_com1(c as u8);
-            }
-        } else {
-            for &b in bytes {
-                crate::hw::serial::write_byte_com1(b);
-            }
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        if let Ok(s) = core::str::from_utf8(bytes) {
-            crate::arch::aarch64::serial::write_str(s);
-        } else {
-            for &b in bytes {
-                crate::arch::aarch64::serial::write_byte(b);
-            }
-        }
-    }
+    CurrentArch::early_write(bytes);
 }
 
 /// Printk writer for fmt::Write
