@@ -72,7 +72,7 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   SMEP) and UXN unless PROT_EXEC; kernel leaves have UXN. User leaves
   are non-global (nG) and tagged with their address space's ASID (in
   TTBR0, 16-bit when the CPU has it, else 8-bit; allocated by
-  generation, `mm::asid`); kernel leaves are global; ASID 0 is the
+  generation, `arch/aarch64/asid.rs`); kernel leaves are global; ASID 0 is the
   kernel threads' (empty TTBR0). A context switch does no TLB or
   instruction-cache maintenance: a page the kernel fills or copies is
   synced to the instruction caches when it is (or becomes) executable

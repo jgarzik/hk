@@ -20,8 +20,8 @@
 //! namespace and the slow path runs once per generation per address
 //! space.
 //!
-//! Generic so that the host unit tests can run it with a small ASID
-//! space; arm64 is its only user.
+//! Generic over the ASID count so that the host unit tests (`make
+//! test-arm`) can run it with a small ASID space.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

@@ -1597,7 +1597,7 @@ No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
   the flush and waited for (`smp_call_function_many`, Cross-CPU Calls:
   the wait answers this CPU's own queue, so it may run with interrupts
   off), their handler doing the same `flush_func`.
-- arm64 ASIDs (`mm/asid.rs`, `arch/aarch64/tlb.rs`, Linux
+- arm64 ASIDs (`arch/aarch64/asid.rs`, `arch/aarch64/tlb.rs`, Linux
   arch/arm64/mm/context.c): `MmContext.arch.id` (AtomicU64,
   generation | ASID), per-CPU `active` / `flush_pending` atomics, and one
   global **ASID lock** (`AsidAlloc.inner`, IrqSpinlock: bitmap,

@@ -19,8 +19,6 @@ use crate::sync::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::util::error::{KernelError, KernelResult};
 
 pub mod anon_vma;
-#[cfg(any(test, target_arch = "aarch64"))]
-pub mod asid;
 #[cfg(feature = "mmcheck")]
 pub mod check;
 pub mod fault;

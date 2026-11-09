@@ -8,9 +8,7 @@ use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-#[cfg(target_arch = "x86_64")]
-use crate::arch::PageTable;
-use crate::arch::{FrameAlloc, PageFlags, phys_to_virt};
+use crate::arch::{FrameAlloc, PageFlags, PageTable, phys_to_virt};
 
 use super::percpu;
 use crate::fs::{File, kernel_open_exec};

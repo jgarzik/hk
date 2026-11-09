@@ -6,7 +6,7 @@
 //! all of them have completed it, so no IPI and no wait on another CPU's
 //! software is ever needed (nor possible to deadlock).
 //!
-//! Address spaces are tagged with ASIDs (`mm::asid`, Linux
+//! Address spaces are tagged with ASIDs (`asid`, Linux
 //! arch/arm64/mm/context.c): TTBR0 carries the ASID (TCR_EL1.A1 = 0;
 //! Linux puts it in TTBR1 for KPTI/SW PAN, which hk has neither of), user
 //! entries are non-global (nG), so a switch flushes nothing; flushes of
@@ -17,7 +17,7 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::mm::asid::AsidAlloc;
+use super::asid::AsidAlloc;
 
 /// The machine's ASIDs (8-bit until `init_cpu` finds 16)
 static ASIDS: AsidAlloc = AsidAlloc::new(8);

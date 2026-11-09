@@ -895,9 +895,18 @@ impl Aarch64PageTable {
 
         Ok(())
     }
+}
+
+// ============================================================================
+// PageTable Trait Implementation
+// ============================================================================
+
+impl PageTable for Aarch64PageTable {
+    type VirtAddr = u64;
+    type PhysAddr = u64;
 
     /// Translate a virtual address to physical address
-    pub fn translate(&self, va: u64) -> Option<u64> {
+    fn translate(&self, va: Self::VirtAddr) -> Option<Self::PhysAddr> {
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
         let offset = va & 0xFFF;
 
@@ -942,19 +951,6 @@ impl Aarch64PageTable {
 
             Some(l3_entry.addr() | offset)
         }
-    }
-}
-
-// ============================================================================
-// PageTable Trait Implementation
-// ============================================================================
-
-impl PageTable for Aarch64PageTable {
-    type VirtAddr = u64;
-    type PhysAddr = u64;
-
-    fn translate(&self, va: Self::VirtAddr) -> Option<Self::PhysAddr> {
-        Aarch64PageTable::translate(self, va)
     }
 
     fn map_with_alloc<FA: FrameAlloc<PhysAddr = Self::PhysAddr>>(

@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+pub mod asid;
 pub mod barrier;
 pub mod cache;
 pub mod context;
