@@ -1023,7 +1023,8 @@ pub fn exit_task_signal(t: &Task) {
 /// a handler table shared with another process (CLONE_SIGHAND) is
 /// copied first (unshare_sighand: ENOMEM), then caught signals go back
 /// to SIG_DFL (flush_signal_handlers; ignored ones stay ignored), the
-/// alternate stack is forgotten (sas_ss_sp = 0), and the process's
+/// alternate stack is forgotten (sas_ss_sp and sas_ss_size 0, its
+/// flags kept), and the process's
 /// timer_create timers are deleted with their queued signals
 /// (posixtimer_exec). Blocked and pending signals stay. The caller is
 /// its process's only thread (after de_thread).
@@ -1057,7 +1058,13 @@ pub fn exec_signals() -> Result<(), KernelError> {
         crate::time::posix_timer::exec_timers(&sig);
     }
     let _gone = with_task_signal_state(&me, |s| {
-        s.altstack = AltStack::new();
+        // No stack, its flags kept (Linux begin_new_exec zeroes
+        // sas_ss_sp and sas_ss_size only)
+        s.altstack = AltStack {
+            ss_sp: 0,
+            ss_size: 0,
+            ..s.altstack
+        };
         let shared = s.shared_pending.lock().flush_timers();
         (s.pending.flush_timers(), shared)
     });

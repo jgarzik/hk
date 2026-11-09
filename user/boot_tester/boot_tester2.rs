@@ -334,6 +334,7 @@ fn sigexec() -> ! {
     const SIGUSR1: u64 = 10;
     const SIGUSR2: u64 = 12;
     const SS_DISABLE: i32 = 2;
+    const SS_AUTODISARM: i32 = 1 << 31;
     let mut bad = 0u64;
     let mut act = [0u64; 4];
     // A caught signal is SIG_DFL now, an ignored one still SIG_IGN
@@ -345,11 +346,17 @@ fn sigexec() -> ! {
     if act[0] != 1 {
         bad |= 2;
     }
-    // No alternate stack
+    // No alternate stack, its SS_AUTODISARM kept (Linux begin_new_exec
+    // zeroes sas_ss_sp and sas_ss_size only): setting that state again
+    // is no change, so no ENOMEM for its size
     let mut ss = [0u64; 3];
     hk_syscall::sys_sigaltstack(0, ss.as_mut_ptr() as u64);
-    if ss[1] as i32 & SS_DISABLE == 0 {
+    if ss[0] != 0 || ss[2] != 0 || ss[1] as i32 != SS_DISABLE | SS_AUTODISARM {
         bad |= 4;
+    }
+    let same: [u64; 3] = [0, SS_AUTODISARM as u32 as u64, 0];
+    if hk_syscall::sys_sigaltstack(same.as_ptr() as u64, 0) != 0 {
+        bad |= 128;
     }
     // The blocked mask stays (SIGRT 40 and 41 blocked)
     let mut old = 0u64;
