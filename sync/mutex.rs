@@ -363,7 +363,7 @@ impl<T> Mutex<T> {
 
     /// Acquire if free, without sleeping (Linux mutex_trylock)
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        self.trylock(me()).then_some(MutexGuard {
+        self.trylock(me()).then(|| MutexGuard {
             m: self,
             _not_send: PhantomData,
         })
@@ -517,6 +517,15 @@ mod tests {
         m.owner.fetch_or(HANDOFF, Ordering::Relaxed);
         m.unlock_as(A);
         assert_eq!(word(&m), (0, 0));
+    }
+
+    /// A failed `try_lock` leaves the holder's lock alone
+    #[test]
+    fn failed_try_lock_keeps_lock() {
+        let m = Mutex::new(());
+        assert!(m.trylock(A));
+        assert!(m.try_lock().is_none());
+        assert_eq!(word(&m), (A, 0));
     }
 
     /// Threads (spinning on the host) never share the lock

@@ -528,7 +528,7 @@ impl<T: ?Sized> RwSem<T> {
         self.sem
             .lock()
             .read_fast()
-            .then_some(RwSemReadGuard { s: self })
+            .then(|| RwSemReadGuard { s: self })
     }
 
     /// Exclusive hold if free and nobody queues, without sleeping (Linux
@@ -537,7 +537,7 @@ impl<T: ?Sized> RwSem<T> {
         self.sem
             .lock()
             .write_fast()
-            .then_some(RwSemWriteGuard { s: self })
+            .then(|| RwSemWriteGuard { s: self })
     }
 
     /// The data, through exclusive ownership (no locking)
@@ -767,6 +767,20 @@ mod tests {
         assert_eq!(wk.take(), [ptr(&r)]);
         assert_eq!(s.readers, 2);
         assert!(!s.handoff && s.waiters.is_empty());
+    }
+
+    /// A failed `try_read` or `try_write` leaves the holders' lock alone
+    #[test]
+    fn failed_try_keeps_lock() {
+        let l = RwSem::new(());
+        let w = l.write();
+        assert!(l.try_read().is_none() && l.try_write().is_none());
+        assert!(l.sem.lock().writer);
+        drop(w);
+        let r = l.read();
+        assert!(l.try_write().is_none());
+        assert_eq!(l.sem.lock().readers, 1);
+        drop(r);
     }
 
     /// Threads (spinning on the host) keep readers and writers apart
