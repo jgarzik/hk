@@ -125,6 +125,12 @@ fn file_mapping(sb: &SuperBlock, inode: &Inode) {
     if let Some(a) = tmpfs::with(sb, |t| t.page_acct()) {
         inode.i_data.set_aops(&TMPFS_AOPS);
         inode.i_data.set_acct(a);
+        // Every tmpfs file starts sealed against sealing (Linux
+        // shmem_get_inode); memfd_create may clear it
+        inode
+            .i_data
+            .seals
+            .store(crate::mm::memfd::F_SEAL_SEAL, Ordering::Relaxed);
     } else {
         inode.i_data.set_aops(&RAMFS_AOPS);
     }
@@ -154,11 +160,6 @@ pub struct RamfsInodeData {
     /// when the inode is freed (Linux shmem_evict_inode)
     xattr_pool: spin::Once<Arc<AtomicU64>>,
     xattr_bytes: AtomicU64,
-
-    /// F_SEAL_* of a tmpfs file (Linux shmem_inode_info.seals; every
-    /// tmpfs inode starts with F_SEAL_SEAL, memfd_create may clear it):
-    /// changed under the inode's i_rwsem, read lock-free
-    pub seals: core::sync::atomic::AtomicU32,
 }
 
 impl Drop for RamfsInodeData {
@@ -344,7 +345,6 @@ impl RamfsInodeData {
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
             xattr_bytes: AtomicU64::new(0),
-            seals: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -356,7 +356,6 @@ impl RamfsInodeData {
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
             xattr_bytes: AtomicU64::new(0),
-            seals: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -368,7 +367,6 @@ impl RamfsInodeData {
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
             xattr_bytes: AtomicU64::new(0),
-            seals: core::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -412,20 +410,12 @@ pub fn with_seals<R>(
     inode: &Inode,
     f: impl FnOnce(&core::sync::atomic::AtomicU32) -> R,
 ) -> Option<R> {
-    let sb = inode.superblock()?;
-    if !inode.mode().is_file() || tmpfs::max_blocks(&sb).is_none() {
-        return None;
-    }
-    let p = inode.get_private()?;
-    p.as_ref()
-        .as_any()
-        .downcast_ref::<RamfsInodeData>()
-        .map(|d| f(&d.seals))
+    (inode.mode().is_file() && inode.i_data.charged()).then(|| f(&inode.i_data.seals))
 }
 
-/// The seals of `inode` (0 when none can be set)
+/// The seals of `inode` (0 for any but a tmpfs file): one load
 fn seals(inode: &Inode) -> u32 {
-    with_seals(inode, |s| s.load(Ordering::Acquire)).unwrap_or(0)
+    inode.i_data.seals.load(Ordering::Acquire)
 }
 
 /// One name of `inode` goes (Linux shmem_unlink): on tmpfs a name
@@ -1302,11 +1292,7 @@ fn new_inode(
     // From here the inode's drop gives the reservation back
     match kind {
         Kind::File => {
-            let mut d = RamfsInodeData::new_file();
-            if tmpfs::max_blocks(sb).is_some() {
-                *d.seals.get_mut() = crate::mm::memfd::F_SEAL_SEAL;
-            }
-            inode.set_private(try_arc(d)?);
+            inode.set_private(try_arc(RamfsInodeData::new_file())?);
             file_mapping(sb, &inode);
         }
         Kind::Dir => inode.set_private(try_arc(RamfsInodeData::new_dir())?),

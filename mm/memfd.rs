@@ -2,7 +2,7 @@
 //!
 //! A memfd is an unnamed file on the kernel's tmpfs
 //! (`fs::ramfs::tmpfs::shmem_file_setup`). Seals live with every tmpfs file
-//! (`RamfsInodeData.seals`, Linux shmem_inode_info.seals): each starts
+//! (`AddressSpace.seals`, Linux shmem_inode_info.seals): each starts
 //! with F_SEAL_SEAL, which memfd_create clears for MFD_ALLOW_SEALING.
 //! They are enforced where Linux shmem does: write_begin (WRITE,
 //! FUTURE_WRITE, GROW), truncate (SHRINK, GROW), fallocate, chmod (EXEC)

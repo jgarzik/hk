@@ -138,6 +138,10 @@ pub struct AddressSpace {
     a_ops: Once<&'static dyn Aops>,
     /// Where its pages are charged (tmpfs; none: not counted)
     acct: Once<alloc::sync::Arc<dyn PageAcct>>,
+    /// F_SEAL_* of a tmpfs file (Linux shmem_inode_info.seals, kept
+    /// here so a write reaches them in one load; 0 elsewhere): changed
+    /// under the inode's i_rwsem, read lock-free
+    pub seals: AtomicU32,
     /// Shared mappings that may write (VM_SHARED with VM_MAYWRITE), or
     /// below 0 while F_SEAL_WRITE denies them (Linux i_mmap_writable)
     writable: core::sync::atomic::AtomicI64,
@@ -156,6 +160,7 @@ impl AddressSpace {
             flags: AtomicU32::new(0),
             a_ops: Once::new(),
             acct: Once::new(),
+            seals: AtomicU32::new(0),
             writable: core::sync::atomic::AtomicI64::new(0),
             i_mmap: AnonVma::default(),
         }
@@ -173,6 +178,11 @@ impl AddressSpace {
     /// Charge its pages to `a` (once, before any page is cached)
     pub fn set_acct(&self, a: alloc::sync::Arc<dyn PageAcct>) {
         self.acct.call_once(|| a);
+    }
+
+    /// Its pages are charged to a file system (a tmpfs file)
+    pub fn charged(&self) -> bool {
+        self.acct.get().is_some()
     }
 
     fn charge(&self) -> Result<(), KernelError> {

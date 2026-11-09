@@ -1863,7 +1863,7 @@ dropped before and after it is zeroed on the disk.)
   writing) and held across an mmap's insertion (`map_writable`, EPERM
   once denied); F_SEAL_WRITE denies it for good under the inode's
   i_rwsem (`deny_writable`, EBUSY while one exists). memfd seals
-  (`RamfsInodeData.seals`) are added under i_rwsem and read lock-free.
+  (`AddressSpace.seals`) are added under i_rwsem and read lock-free.
 - A tmpfs mapping charges each page to its file system's block limit
   before inserting it (`AddressSpace.acct`, lock-free counters: 3.11
   tmpfs accounting) and returns it on removal; no lock is taken for it.
