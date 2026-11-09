@@ -26,7 +26,6 @@
 use crate::sync::spin::{Mutex, RwLock};
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,14 +65,15 @@ pub struct Cgroup {
     /// Unique identifier for this cgroup
     pub id: CgroupId,
 
-    /// Name of this cgroup (directory name, empty for root)
-    pub name: String,
+    /// Name of this cgroup (directory name, empty for root): bytes, any
+    /// but '/', NUL and newline (Linux kernfs, cgroup_mkdir)
+    pub name: Vec<u8>,
 
     /// Parent cgroup (None for root)
     parent: RwLock<Option<Weak<Cgroup>>>,
 
     /// Child cgroups (name -> Cgroup)
-    children: RwLock<BTreeMap<String, Arc<Cgroup>>>,
+    children: RwLock<BTreeMap<Vec<u8>, Arc<Cgroup>>>,
 
     /// Reference to the root of this hierarchy
     root: Weak<CgroupRoot>,
@@ -112,7 +112,7 @@ impl Cgroup {
     /// Create a new cgroup as a child of parent, or ENOMEM
     pub fn new(
         id: CgroupId,
-        name: String,
+        name: Vec<u8>,
         parent: Option<&Arc<Cgroup>>,
         root: &Arc<CgroupRoot>,
     ) -> Result<Arc<Self>, KernelError> {
@@ -129,14 +129,14 @@ impl Cgroup {
     }
 
     /// A root cgroup made at boot (failure cannot be reported)
-    pub fn new_root(id: CgroupId, name: String, root: &Arc<CgroupRoot>) -> Arc<Self> {
+    pub fn new_root(id: CgroupId, name: Vec<u8>, root: &Arc<CgroupRoot>) -> Arc<Self> {
         arc_nofail(Self::fresh(id, name, None, root))
     }
 
     /// A cgroup's state, before its ancestor chain is built
     fn fresh(
         id: CgroupId,
-        name: String,
+        name: Vec<u8>,
         parent: Option<&Arc<Cgroup>>,
         root: &Arc<CgroupRoot>,
     ) -> Self {
@@ -194,7 +194,7 @@ impl Cgroup {
     }
 
     /// Lookup child by name
-    pub fn lookup_child(&self, name: &str) -> Option<Arc<Cgroup>> {
+    pub fn lookup_child(&self, name: &[u8]) -> Option<Arc<Cgroup>> {
         self.children.read().get(name).cloned()
     }
 
@@ -215,7 +215,7 @@ impl Cgroup {
     }
 
     /// Remove a child cgroup
-    pub fn remove_child(&self, name: &str) -> Option<Arc<Cgroup>> {
+    pub fn remove_child(&self, name: &[u8]) -> Option<Arc<Cgroup>> {
         self.children.write().remove(name)
     }
 
@@ -296,27 +296,20 @@ impl Cgroup {
         self.frozen.store(freeze, Ordering::Release);
     }
 
-    /// Get the full path of this cgroup
-    pub fn path(&self) -> String {
+    /// The full path of this cgroup, its names' bytes as they are
+    pub fn path(&self) -> Vec<u8> {
         if self.level == 0 {
-            return String::from("/");
+            return Vec::from(b"/".as_slice());
         }
-
-        let mut parts = Vec::new();
-        parts.push(self.name.clone());
-
-        let ancestors = self.ancestors.read();
-        for ancestor in ancestors.iter().rev() {
-            if let Some(cg) = ancestor.upgrade()
-                && cg.level > 0
-            {
-                parts.push(cg.name.clone());
+        let mut path = Vec::new();
+        for cg in self.ancestors.read().iter().filter_map(|a| a.upgrade()) {
+            if cg.level > 0 {
+                path.push(b'/');
+                path.extend_from_slice(&cg.name);
             }
         }
-
-        parts.reverse();
-        let mut path = String::from("/");
-        path.push_str(&parts.join("/"));
+        path.push(b'/');
+        path.extend_from_slice(&self.name);
         path
     }
 
@@ -587,7 +580,7 @@ pub fn cgroup_init() {
     let root = CGROUP_ROOT.clone();
 
     // Create root cgroup
-    let root_cg = Cgroup::new_root(root.alloc_cg_id(), String::new(), &root);
+    let root_cg = Cgroup::new_root(root.alloc_cg_id(), Vec::new(), &root);
 
     root.set_root_cgroup(root_cg.clone());
 
@@ -714,9 +707,13 @@ pub fn thread_group(pid: Pid) -> Result<Vec<crate::task::percpu::TaskRef>, Kerne
     }))
 }
 
-/// Create a child cgroup (Linux cgroup_mkdir: ENODEV in a removed
+/// Create a child cgroup (Linux cgroup_mkdir: EINVAL for a name with a
+/// newline, which would break /proc/<pid>/cgroup; ENODEV in a removed
 /// parent)
-pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, KernelError> {
+pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &[u8]) -> Result<Arc<Cgroup>, KernelError> {
+    if name.contains(&b'\n') {
+        return Err(KernelError::InvalidArgument);
+    }
     let _g = CGROUP_MUTEX.lock();
     if parent.is_dead() {
         return Err(KernelError::NoDevice);
@@ -729,7 +726,7 @@ pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, Ker
     }
 
     // Create new cgroup
-    let new_cg = Cgroup::new(root.alloc_cg_id(), String::from(name), Some(parent), &root)?;
+    let new_cg = Cgroup::new(root.alloc_cg_id(), Vec::from(name), Some(parent), &root)?;
 
     // Initialize CSS for controllers enabled in parent's subtree_control
     for controller in root.registered_controllers() {
@@ -756,7 +753,7 @@ pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, Ker
 /// Remove a cgroup (Linux cgroup_destroy_locked, under cgroup_mutex):
 /// EBUSY while it has tasks or children, else it is dead from here on,
 /// so no attach or CLONE_INTO_CGROUP can join it after the check
-pub fn cgroup_rmdir(parent: &Arc<Cgroup>, name: &str) -> Result<(), KernelError> {
+pub fn cgroup_rmdir(parent: &Arc<Cgroup>, name: &[u8]) -> Result<(), KernelError> {
     let _g = CGROUP_MUTEX.lock();
     let child = parent.lookup_child(name).ok_or(KernelError::NotFound)?;
 

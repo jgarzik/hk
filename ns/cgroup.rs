@@ -15,8 +15,8 @@
 
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
-use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use spin::Lazy;
 
 use crate::cgroup::{CGROUP_ROOT, Cgroup};
@@ -69,10 +69,10 @@ impl CgroupNamespace {
     ///
     /// Returns "/" if the cgroup is the namespace root.
     /// Returns "/../.." style path if the cgroup is an ancestor of the root.
-    pub fn translate_path(&self, cgroup: &Arc<Cgroup>) -> String {
+    pub fn translate_path(&self, cgroup: &Arc<Cgroup>) -> Vec<u8> {
         // If cgroup is the namespace root, return "/"
         if Arc::ptr_eq(cgroup, &self.root) {
-            return String::from("/");
+            return Vec::from(b"/".as_slice());
         }
 
         // Check if cgroup is a descendant of the namespace root
@@ -82,11 +82,11 @@ impl CgroupNamespace {
             let root_path = self.root.path();
 
             // Strip the root prefix
-            if let Some(relative) = cgroup_path.strip_prefix(&root_path) {
-                if relative.is_empty() || relative == "/" {
-                    return String::from("/");
+            if let Some(relative) = cgroup_path.strip_prefix(root_path.as_slice()) {
+                if relative.is_empty() || relative == b"/" {
+                    return Vec::from(b"/".as_slice());
                 }
-                return String::from(relative);
+                return Vec::from(relative);
             }
             return cgroup_path;
         }
@@ -108,11 +108,7 @@ impl CgroupNamespace {
 fn create_placeholder_root() -> Arc<Cgroup> {
     // This is called before cgroup_init(), so we create a minimal placeholder
     // It will be replaced when the real root is created
-    Cgroup::new_root(
-        0,
-        String::new(),
-        &arc_nofail(crate::cgroup::CgroupRoot::new()),
-    )
+    Cgroup::new_root(0, Vec::new(), &arc_nofail(crate::cgroup::CgroupRoot::new()))
 }
 
 /// Initial (root) cgroup namespace

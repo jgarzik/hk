@@ -46,13 +46,6 @@ Most of their blocks belong in a missing wrapper:
   without wait, `stop_one_cpu_nowait`, kthread `fn(usize)`) still carry
   integers or casts; the waiting forms have typed `_ref` variants.
 
-## cgroup names must be UTF-8
-
-**Location:** `fs/cgroupfs.rs`.
-
-mkdir of a name that is not valid UTF-8 is EINVAL; Linux kernfs takes
-any bytes.
-
 ## cgroup controller application gaps
 
 **Location**: `cgroup/mod.rs`, `fs/cgroupfs.rs`

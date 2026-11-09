@@ -55,6 +55,9 @@
 //!   0..PIDS_MAX (PID_MAX_LIMIT + 1): PID_MAX_LIMIT is the largest, one
 //!   more or a negative number is EINVAL (Linux pids_max_write).
 //!
+//! - CGROUP_NAME_BYTES: a cgroup name that is not UTF-8 works and shows
+//!   raw in /proc/self/cgroup; one with a newline is EINVAL.
+//!
 //! Runs after cgroup.rs, which mounts cgroup2 at /sys/fs/cgroup and
 //! enables +pids at the root.
 
@@ -91,6 +94,45 @@ pub fn run_tests() {
     }
     report_step(b"CPU_MAX_RW", cpu_max_rw());
     report_step(b"PIDS_MAX_BOUNDS", pids_max_bounds());
+    report_step(b"CGROUP_NAME_BYTES", name_bytes());
+}
+
+/// A cgroup name is bytes (Linux kernfs): one that is not UTF-8 is
+/// made, opened, joined and shown raw in /proc/self/cgroup, then
+/// removed; a name with a newline is EINVAL (Linux cgroup_mkdir)
+fn name_bytes() -> i64 {
+    const C: &[u8] = b"nb\xff\x80";
+    let mut b = [0u8; 96];
+    if sys_mkdir(path(&mut b, b"nb\nx", b"").as_ptr(), 0o755) != EINVAL {
+        remove_cgroup(b"nb\nx");
+        return 1;
+    }
+    if sys_mkdir(path(&mut b, C, b"").as_ptr(), 0o755) != 0 {
+        return 2;
+    }
+    let fd = sys_open(path(&mut b, C, b"").as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    if fd < 0 {
+        remove_cgroup(C);
+        return 3;
+    }
+    sys_close(fd as u64);
+    let step = in_child(|| {
+        if !join(C) {
+            1
+        } else if !self_in(b"/nb\xff\x80\n") {
+            2
+        } else {
+            0
+        }
+    });
+    if step != 0 {
+        remove_cgroup(C);
+        return 3 + step;
+    }
+    if sys_rmdir(path(&mut b, C, b"").as_ptr()) != 0 {
+        return 6;
+    }
+    0
 }
 
 /// In a child's new pid namespace, its init writes "1" to cgroup.procs

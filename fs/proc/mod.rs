@@ -1092,18 +1092,13 @@ fn ns_file(
 /// For cgroup v2, this is a single line: "0::<path>\n"
 /// The path is relative to the task's cgroup namespace root.
 fn gen_cgroup_content(t: &TaskRef) -> Vec<u8> {
-    use alloc::fmt::Write;
-    let mut output = String::new();
-
-    // Get the task's cgroup path (namespace-virtualized)
-    let cgroup_path = get_task_cgroup_path(t);
-
-    // cgroup v2 format: "0::<path>"
+    // cgroup v2 format: "0::<path>", the path's bytes as they are
     // The "0" indicates the unified hierarchy (cgroup v2)
     // The empty string between colons indicates no named controllers
-    let _ = writeln!(output, "0::{}", cgroup_path);
-
-    Vec::from(output.as_bytes())
+    let mut output = Vec::from(b"0::".as_slice());
+    output.extend_from_slice(&get_task_cgroup_path(t));
+    output.push(b'\n');
+    output
 }
 
 /// Generated files in /proc/<pid>/: name, inode offset, generator
@@ -1463,7 +1458,7 @@ fn maps_of(mm: &crate::mm::MmStruct) -> Result<Vec<u8>, KernelError> {
 }
 
 /// Get the cgroup path for a task (virtualized to its namespace)
-fn get_task_cgroup_path(t: &TaskRef) -> String {
+fn get_task_cgroup_path(t: &TaskRef) -> Vec<u8> {
     use crate::ns::INIT_CGROUP_NS;
 
     // Get the task's cgroup
@@ -1471,7 +1466,7 @@ fn get_task_cgroup_path(t: &TaskRef) -> String {
 
     let Some(cgroup) = task_cgroup else {
         // Task not in any cgroup - return root
-        return String::from("/");
+        return Vec::from(b"/".as_slice());
     };
 
     // Get the task's cgroup namespace

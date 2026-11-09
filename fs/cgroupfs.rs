@@ -168,8 +168,6 @@ pub struct CgroupfsInodeOps;
 
 impl InodeOps for CgroupfsInodeOps {
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
-        // cgroup names are text (Linux: any bytes); others name nothing
-        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
@@ -186,6 +184,11 @@ impl InodeOps for CgroupfsInodeOps {
                 if let Some(child) = cg.lookup_child(name) {
                     return create_cgroup_dir_inode(dir, &child);
                 }
+
+                // Control files have text names
+                let Ok(name) = core::str::from_utf8(name) else {
+                    return Err(KernelError::NotFound);
+                };
 
                 // Check for built-in control files
                 if let Some(file_type) = CgroupControlFileType::from_name(name) {
@@ -210,8 +213,6 @@ impl InodeOps for CgroupfsInodeOps {
     }
 
     fn mkdir(&self, dir: &Inode, name: &[u8], _mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
-        // hk keeps cgroup names as text (deviation: Linux takes any bytes)
-        let name = core::str::from_utf8(name).map_err(|_| KernelError::InvalidArgument)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
@@ -235,7 +236,6 @@ impl InodeOps for CgroupfsInodeOps {
     }
 
     fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
-        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
@@ -706,7 +706,7 @@ impl FileOps for CgroupfsFileOps {
                     if !ctx.emit(DirEntry {
                         ino: child.ino,
                         file_type: FileType::Directory,
-                        name: Vec::from(child.name.as_bytes()),
+                        name: child.name.clone(),
                     }) {
                         return Ok(());
                     }
