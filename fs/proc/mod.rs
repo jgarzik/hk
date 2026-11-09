@@ -535,10 +535,10 @@ impl InodeOps for ProcfsInodeOps {
             return false;
         };
         if let Some(fd) = fd {
-            let open = task_files(&t).is_some_and(|f| f.lock().get(fd).is_some());
-            if !open {
+            let Some(file) = task_files(&t).and_then(|f| f.lock().get(fd)) else {
                 return false;
-            }
+            };
+            fd_update_inode(inode, &file);
         }
         let (uid, gid) = dump_owner(&t);
         inode.set_uid(uid);
@@ -991,17 +991,16 @@ fn lookup_pid_fd_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode
         return Err(KernelError::NotFound);
     }
 
-    // Verify the FD exists for this task
-    let fd_exists = task_files(&t).is_some_and(|f| f.lock().get(fd).is_some());
-    if !fd_exists {
-        return Err(KernelError::NotFound);
-    }
+    // The file at the fd, if any
+    let file = task_files(&t)
+        .and_then(|f| f.lock().get(fd))
+        .ok_or(KernelError::NotFound)?;
 
     // Create symlink inode for /proc/<pid>/fd/<n>
     let sb = dir.superblock().ok_or(KernelError::Io)?;
     let inode = try_arc(Inode::new(
         pid_ino(pid, FD_INO + fd as u64), // fd symlinks
-        InodeMode::symlink(),             // lrwxrwxrwx
+        InodeMode::symlink(),
         0,
         0,
         0,
@@ -1009,10 +1008,28 @@ fn lookup_pid_fd_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
     ))?;
+    fd_update_inode(&inode, &file);
     inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_fd_symlink(p.clone(), fd),
     )))?);
     Ok(inode)
+}
+
+/// An fd/ link's mode follows the file's access (Linux
+/// tid_fd_update_inode): r-x for reading, -wx for writing, none for a
+/// path-only file; an fdinfo/ file keeps its own
+fn fd_update_inode(inode: &Inode, file: &File) {
+    if !inode.mode().is_symlink() {
+        return;
+    }
+    let mut perm = 0;
+    if file.is_readable() {
+        perm |= 0o500;
+    }
+    if file.is_writable() {
+        perm |= 0o300;
+    }
+    inode.set_mode_perm(perm);
 }
 
 /// Look up entries in /proc/<pid>/fdinfo/

@@ -5,9 +5,9 @@
 
 use crate::harness::verdict;
 use hk_syscall::{
-    O_DIRECTORY, O_RDONLY, Timespec, sys_close, sys_execve, sys_exit, sys_fork, sys_kill,
-    sys_nanosleep, sys_open, sys_pipe2, sys_prctl, sys_pread64, sys_read, sys_readlink,
-    sys_setresuid, sys_setuid, sys_wait4, sys_write,
+    O_DIRECTORY, O_NOFOLLOW, O_PATH, O_RDONLY, Timespec, sys_close, sys_execve, sys_exit, sys_fork,
+    sys_kill, sys_nanosleep, sys_open, sys_pipe2, sys_prctl, sys_pread64, sys_read, sys_readlink,
+    sys_readlinkat, sys_setresuid, sys_setuid, sys_wait4, sys_write,
 };
 
 const EACCES: i64 = -13;
@@ -366,6 +366,11 @@ fn fd_link_steps(a: i64, rd: i32, wr: i32) -> u64 {
     if sys_readlink(path(&mut b, a, b"fd/0").as_ptr(), l.as_mut_ptr(), 64) <= 0 {
         return 5;
     }
+    // A handle on the link itself, kept past the fd/ check
+    let h = sys_open(path(&mut b, a, b"fd/0").as_ptr(), O_PATH | O_NOFOLLOW, 0) as i32;
+    if h < 0 || sys_readlinkat(h, b"\0".as_ptr(), l.as_mut_ptr(), 64) <= 0 {
+        return 9;
+    }
     // The target turns non-dumpable
     sys_write(wr as u64, b"g".as_ptr(), 1);
     if sys_read(rd as u64, c.as_mut_ptr(), 1) != 1 {
@@ -376,6 +381,12 @@ fn fd_link_steps(a: i64, rd: i32, wr: i32) -> u64 {
     }
     if open_ret(path(&mut b, a, b"fd"), O_RDONLY | O_DIRECTORY) != EACCES {
         return 8;
+    }
+    // Each read of the link rechecks access (Linux proc_fd_access_allowed)
+    let r = sys_readlinkat(h, b"\0".as_ptr(), l.as_mut_ptr(), 64);
+    sys_close(h as u64);
+    if r != EACCES {
+        return 10;
     }
     0
 }

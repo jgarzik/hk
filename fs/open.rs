@@ -2,6 +2,7 @@
 
 use alloc::sync::Arc;
 
+use super::file::EMPTY_FOPS;
 use crate::fs::namei::{Last, filename_lookup, filename_parentat, getname, path_lookupat};
 use crate::fs::{
     Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac, lookup_one,
@@ -10,7 +11,8 @@ use crate::fs::{
 use super::file::flags::AT_FDCWD;
 use super::flags::{
     __O_SYNC, __O_TMPFILE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_DSYNC, O_EXCL,
-    O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC, VALID_OPEN_FLAGS,
+    O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_PATH, O_PATH_FLAGS, O_RDONLY, O_RDWR, O_TRUNC,
+    VALID_OPEN_FLAGS,
 };
 use super::mount::MNT_NODEV;
 use super::syscall::{current_fd_table, get_nofile_limit};
@@ -84,7 +86,11 @@ pub struct OpenFlags {
 /// The request of open(2)/openat(2) (Linux build_open_how): unknown
 /// flags are dropped, the mode counts only for a create
 pub fn build_open_how(flags: u32, mode: u32) -> OpenHow {
-    let flags = flags & VALID_OPEN_FLAGS;
+    let mut flags = flags & VALID_OPEN_FLAGS;
+    // O_PATH beats everything else
+    if flags & O_PATH != 0 {
+        flags &= O_PATH_FLAGS;
+    }
     let mode = if will_create(flags) {
         u64::from(mode) & S_IALLUGO
     } else {
@@ -132,6 +138,10 @@ pub fn build_open_flags(how: &OpenHow) -> Result<OpenFlags, KernelError> {
     {
         return Err(KernelError::InvalidArgument);
     }
+    let path = flags & O_PATH != 0;
+    if path && flags & !O_PATH_FLAGS != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
     // O_SYNC is __O_SYNC|O_DSYNC: syncing code looks at O_DSYNC only
     if flags & __O_SYNC != 0 {
         flags |= O_DSYNC;
@@ -139,7 +149,7 @@ pub fn build_open_flags(how: &OpenHow) -> Result<OpenFlags, KernelError> {
     Ok(OpenFlags {
         flags,
         mode,
-        acc: dac::acc_mode(flags),
+        acc: if path { 0 } else { dac::acc_mode(flags) },
         lookup: open_lookup(flags),
     })
 }
@@ -269,6 +279,16 @@ fn tmpfile_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, Ke
     dentry_open(file)
 }
 
+/// O_PATH (Linux do_o_path + do_dentry_open's FMODE_PATH branch): the
+/// walk alone (a final symlink with O_NOFOLLOW is the link itself,
+/// O_DIRECTORY is ENOTDIR on anything else), with no permission check,
+/// device or FIFO open, write access or ->open; the file does no I/O
+fn do_o_path(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, KernelError> {
+    let p = filename_lookup(dirfd, path, op.lookup)?;
+    let file = File::new(p.dentry.clone(), Some(p.mnt.clone()), op.flags, &EMPTY_FOPS);
+    try_arc(file)
+}
+
 /// The end of an open (Linux do_dentry_open): `->open`, then the flags
 /// that only steered the open leave f_flags
 fn dentry_open(mut file: File) -> Result<Arc<File>, KernelError> {
@@ -281,6 +301,9 @@ fn dentry_open(mut file: File) -> Result<Arc<File>, KernelError> {
 /// resolve or create the target, may_open, O_TRUNC, then the file object
 fn filp_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, KernelError> {
     let flags = op.flags;
+    if flags & O_PATH != 0 {
+        return do_o_path(dirfd, path, op);
+    }
     if flags & __O_TMPFILE != 0 {
         return tmpfile_open(dirfd, path, op);
     }

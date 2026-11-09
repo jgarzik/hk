@@ -497,6 +497,14 @@ pub fn sys_openat(dirfd: i32, path: *const u8, flags: u32, mode: u32) -> i64 {
     unsafe { syscall4!(SYS_OPENAT, dirfd, path, flags, mode) }
 }
 
+pub const SYS_OPENAT2: u64 = 437;
+
+/// openat2(dirfd, path, how, size)
+#[inline(always)]
+pub fn sys_openat2(dirfd: i32, path: *const u8, how: *const u8, size: usize) -> i64 {
+    unsafe { syscall4!(SYS_OPENAT2, dirfd, path, how, size) }
+}
+
 /// open(path, flags, mode) - compatibility wrapper using openat with AT_FDCWD
 #[inline(always)]
 pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> i64 {

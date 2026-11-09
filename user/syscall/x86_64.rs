@@ -597,6 +597,38 @@ pub fn sys_link(oldpath: *const u8, newpath: *const u8) -> i64 {
     unsafe { syscall2!(SYS_LINK, oldpath, newpath) }
 }
 
+pub const SYS_OPENAT: u64 = 257;
+pub const SYS_MKNODAT: u64 = 259;
+pub const SYS_FCHOWNAT: u64 = 260;
+pub const SYS_READLINKAT: u64 = 267;
+pub const SYS_OPENAT2: u64 = 437;
+
+#[inline(always)]
+pub fn sys_openat(dirfd: i32, path: *const u8, flags: u32, mode: u32) -> i64 {
+    unsafe { syscall4!(SYS_OPENAT, dirfd, path, flags, mode) }
+}
+
+/// openat2(dirfd, path, how, size)
+#[inline(always)]
+pub fn sys_openat2(dirfd: i32, path: *const u8, how: *const u8, size: usize) -> i64 {
+    unsafe { syscall4!(SYS_OPENAT2, dirfd, path, how, size) }
+}
+
+#[inline(always)]
+pub fn sys_mknodat(dirfd: i32, pathname: *const u8, mode: u32, dev: u64) -> i64 {
+    unsafe { syscall4!(SYS_MKNODAT, dirfd, pathname, mode, dev) }
+}
+
+#[inline(always)]
+pub fn sys_fchownat(dirfd: i32, pathname: *const u8, owner: u32, group: u32, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_FCHOWNAT, dirfd, pathname, owner, group, flags) }
+}
+
+#[inline(always)]
+pub fn sys_readlinkat(dirfd: i32, pathname: *const u8, buf: *mut u8, bufsiz: u64) -> i64 {
+    unsafe { syscall4!(SYS_READLINKAT, dirfd, pathname, buf, bufsiz) }
+}
+
 /// linkat(olddirfd, oldpath, newdirfd, newpath, flags)
 #[inline(always)]
 pub fn sys_linkat(

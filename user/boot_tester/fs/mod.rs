@@ -25,6 +25,7 @@ pub mod mountflags;
 pub mod mountinfo;
 pub mod mounts;
 pub mod namei;
+pub mod o_path;
 pub mod open_flags;
 pub mod permissions;
 pub mod pnode;

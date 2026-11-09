@@ -307,20 +307,6 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 Missing: immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE
 EPERM).
 
-## No O_PATH
-
-**Location**: `fs/open.rs`, `fs/file.rs`
-
-open() ignores O_PATH (Linux FMODE_PATH, empty_fops, fdget_raw): it
-opens for reading, so O_PATH|O_NOFOLLOW on a symlink is ELOOP and a
-path-only handle to an unreadable file is EACCES; readlinkat(fd, "")
-on a symlink handle is unreachable. With O_PATH, a handle to
-/proc/<pid>/fd/<n> outlives the fd/ permission check: `fs/proc/mod.rs`
-fd_link / fd_jump recheck access at each read and follow (Linux
-proc_fd_access_allowed), and the boot test should then cover
-readlinkat(handle, "") after the target turns non-dumpable (Linux:
-EACCES).
-
 ## Before user namespaces grant capabilities
 
 **Location**: `task/mod.rs` (`capable`), `fs/dac.rs`, `ns/mod.rs`,

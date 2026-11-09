@@ -84,7 +84,11 @@ pub mod flags {
         | O_NOFOLLOW
         | O_NOATIME
         | O_CLOEXEC
+        | O_PATH
         | __O_TMPFILE;
+
+    /// What O_PATH keeps (Linux O_PATH_FLAGS)
+    pub const O_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC;
 
     /// The *at() calls' dirfd for the current directory
     pub const AT_FDCWD: i32 = -100;
@@ -829,6 +833,18 @@ pub fn put_fionread(arg: u64, n: i64) -> Result<i64, KernelError> {
     Ok(0)
 }
 
+/// The operations of a path-only (O_PATH) file (Linux do_dentry_open's
+/// empty_fops): none, as no I/O reaches it
+pub struct EmptyFileOps;
+
+impl FileOps for EmptyFileOps {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub static EMPTY_FOPS: EmptyFileOps = EmptyFileOps;
+
 /// Null file ops - returns errors for all operations
 pub struct NullFileOps;
 
@@ -978,6 +994,10 @@ pub static CHAR_FILE_OPS: CharDevFileOps = CharDevFileOps;
 /// `owner` was closed (Linux filp_flush): that owner's POSIX locks on
 /// the inode go, then the file's own flush
 pub fn filp_flush(file: &File, owner: u64) {
-    crate::fs::posix_lock::release_posix_locks_on_close(file, owner);
+    // A path-only file holds no locks of the closer's (Linux filp_flush
+    // skips locks_remove_posix for FMODE_PATH)
+    if !file.is_path() {
+        crate::fs::posix_lock::release_posix_locks_on_close(file, owner);
+    }
     file.f_op.flush(file);
 }
