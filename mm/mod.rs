@@ -72,18 +72,7 @@ pub use crate::arch::paging::TASK_SIZE;
 /// Lowest mappable user address (Linux vm.mmap_min_addr default)
 pub const MMAP_MIN_ADDR: u64 = 65536;
 
-/// Top of the initial user stack (Linux STACK_TOP, no randomization)
-#[cfg(target_arch = "x86_64")]
-pub const STACK_TOP: u64 = 0x7FFF_FFFF_F000;
-#[cfg(target_arch = "aarch64")]
-pub const STACK_TOP: u64 = TASK_SIZE;
-
-/// Load address of PIE executables (Linux ELF_ET_DYN_BASE, 2/3 of
-/// TASK_SIZE, without randomization)
-#[cfg(target_arch = "x86_64")]
-pub const ELF_ET_DYN_BASE: u64 = 0x5555_5555_4000;
-#[cfg(target_arch = "aarch64")]
-pub const ELF_ET_DYN_BASE: u64 = 0xAAAA_AAAA_0000;
+pub use crate::arch::paging::{ELF_ET_DYN_BASE, STACK_TOP};
 
 /// Run `f` with task flag `flag` (PF_MEMALLOC, PF_MEMALLOC_NOIO) set,
 /// restoring it after (Linux memalloc_noreclaim_save / memalloc_noio_save)

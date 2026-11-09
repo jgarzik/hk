@@ -144,14 +144,7 @@ pub const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 /// Get the AUDIT_ARCH value for the current architecture
 #[inline]
 pub fn current_audit_arch() -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        AUDIT_ARCH_X86_64
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        AUDIT_ARCH_AARCH64
-    }
+    crate::arch::uapi::AUDIT_ARCH
 }
 
 // =============================================================================

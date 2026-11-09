@@ -14,25 +14,6 @@ use super::{
     SECCOMP_RET_USER_NOTIF, SeccompData, current_audit_arch,
 };
 
-// Syscall numbers for STRICT mode whitelist
-#[cfg(target_arch = "x86_64")]
-mod strict_syscalls {
-    pub const SYS_READ: i32 = 0;
-    pub const SYS_WRITE: i32 = 1;
-    pub const SYS_EXIT: i32 = 60;
-    pub const SYS_EXIT_GROUP: i32 = 231;
-    pub const SYS_RT_SIGRETURN: i32 = 15;
-}
-
-#[cfg(target_arch = "aarch64")]
-mod strict_syscalls {
-    pub const SYS_READ: i32 = 63;
-    pub const SYS_WRITE: i32 = 64;
-    pub const SYS_EXIT: i32 = 93;
-    pub const SYS_EXIT_GROUP: i32 = 94;
-    pub const SYS_RT_SIGRETURN: i32 = 139;
-}
-
 /// What seccomp decides for one syscall (Linux __seccomp_filter,
 /// __secure_computing_strict)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,12 +47,11 @@ pub fn check_syscall(
     match mode {
         SECCOMP_MODE_DISABLED => Verdict::Allow,
         SECCOMP_MODE_STRICT => {
-            use strict_syscalls::*;
-            match nr as i32 {
-                SYS_READ | SYS_WRITE | SYS_EXIT | SYS_EXIT_GROUP | SYS_RT_SIGRETURN => {
-                    Verdict::Allow
-                }
-                _ => Verdict::Strict,
+            // Linux compares the number as an int
+            if crate::arch::uapi::SECCOMP_STRICT.contains(&(nr as i32)) {
+                Verdict::Allow
+            } else {
+                Verdict::Strict
             }
         }
         SECCOMP_MODE_FILTER => {

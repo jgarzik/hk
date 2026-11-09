@@ -59,6 +59,13 @@ pub const VMEMMAP_START: u64 = 0xFFFF_EA00_0000_0000;
 /// non-canonical hole)
 pub const TASK_SIZE: u64 = 0x0000_7FFF_FFFF_F000;
 
+/// Top of the initial user stack (Linux STACK_TOP, no randomization)
+pub const STACK_TOP: u64 = 0x7FFF_FFFF_F000;
+
+/// Load address of PIE executables (Linux ELF_ET_DYN_BASE, 2/3 of
+/// TASK_SIZE, without randomization)
+pub const ELF_ET_DYN_BASE: u64 = 0x5555_5555_4000;
+
 /// First PML4 entry of the kernel half
 pub const KERNEL_PML4_START: usize = 256;
 

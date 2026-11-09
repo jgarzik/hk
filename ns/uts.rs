@@ -126,11 +126,7 @@ impl UtsNamespace {
         copy_str(&mut name.release, env!("CARGO_PKG_VERSION").as_bytes());
         copy_str(&mut name.version, b"#1 SMP");
 
-        // Architecture-specific machine name
-        #[cfg(target_arch = "x86_64")]
-        copy_str(&mut name.machine, b"x86_64");
-        #[cfg(target_arch = "aarch64")]
-        copy_str(&mut name.machine, b"aarch64");
+        copy_str(&mut name.machine, crate::arch::uapi::UTS_MACHINE);
 
         copy_str(&mut name.domainname, b"(none)");
 

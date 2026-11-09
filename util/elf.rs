@@ -70,16 +70,10 @@ pub const R_X86_64_RELATIVE: u32 = 8;
 pub const R_AARCH64_RELATIVE: u32 = 1027; // 0x403
 
 /// Expected ELF machine type for current architecture
-#[cfg(target_arch = "x86_64")]
-pub const EXPECTED_EM_MACHINE: u16 = EM_X86_64;
-#[cfg(target_arch = "aarch64")]
-pub const EXPECTED_EM_MACHINE: u16 = EM_AARCH64;
+pub const EXPECTED_EM_MACHINE: u16 = crate::arch::uapi::ELF_ARCH;
 
 /// Expected relocation type for RELATIVE relocations on current architecture
-#[cfg(target_arch = "x86_64")]
-pub const R_RELATIVE: u32 = R_X86_64_RELATIVE;
-#[cfg(target_arch = "aarch64")]
-pub const R_RELATIVE: u32 = R_AARCH64_RELATIVE;
+pub const R_RELATIVE: u32 = crate::arch::uapi::R_RELATIVE;
 
 /// Dynamic tag: DT_RELA - address of relocation table
 pub const DT_RELA: u64 = 7;
