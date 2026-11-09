@@ -1017,6 +1017,3 @@ sigsp switch to the alt stack, __save_altstack fills uc_stack.
   refuses a child of a level-32 namespace; Linux create_user_ns refuses
   only past `parent_ns->level > 32`, so 33 levels nest. Not testable on
   both until uid_map is writable (Linux needs a mapping per level).
-- **xattr names: EFAULT for a name too long or not UTF-8**
-  (fs/misc.rs xattr_name): Linux import_xattr_name returns ERANGE for
-  a name without a NUL in XATTR_NAME_MAX + 1 bytes and takes any bytes.

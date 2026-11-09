@@ -360,7 +360,7 @@ pub trait InodeOps: Send + Sync {
     /// # Returns
     /// The size of the attribute value on success.
     /// If `value` is empty, returns the size that would be needed.
-    fn getxattr(&self, inode: &Inode, name: &str, value: &mut [u8]) -> Result<usize, KernelError> {
+    fn getxattr(&self, inode: &Inode, name: &[u8], value: &mut [u8]) -> Result<usize, KernelError> {
         let _ = (inode, name, value);
         Err(KernelError::OperationNotSupported)
     }
@@ -375,7 +375,7 @@ pub trait InodeOps: Send + Sync {
     fn setxattr(
         &self,
         inode: &Inode,
-        name: &str,
+        name: &[u8],
         value: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
@@ -402,7 +402,7 @@ pub trait InodeOps: Send + Sync {
     /// # Arguments
     /// * `inode` - The inode to remove the attribute from
     /// * `name` - The attribute name to remove
-    fn removexattr(&self, inode: &Inode, name: &str) -> Result<(), KernelError> {
+    fn removexattr(&self, inode: &Inode, name: &[u8]) -> Result<(), KernelError> {
         let _ = (inode, name);
         Err(KernelError::OperationNotSupported)
     }

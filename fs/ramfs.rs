@@ -137,12 +137,12 @@ struct Xattr {
 pub struct Xattrs(RwLock<Vec<Xattr>>);
 
 impl Xattrs {
-    fn find(v: &[Xattr], name: &str) -> Result<usize, usize> {
-        v.binary_search_by(|x| x.name.as_slice().cmp(name.as_bytes()))
+    fn find(v: &[Xattr], name: &[u8]) -> Result<usize, usize> {
+        v.binary_search_by(|x| x.name.as_slice().cmp(name))
     }
 
     /// `f` on the value of `name`, if it has one
-    fn get<R>(&self, name: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    fn get<R>(&self, name: &[u8], f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let v = self.0.read();
         Self::find(&v, name).ok().map(|i| f(&v[i].value))
     }
@@ -150,9 +150,9 @@ impl Xattrs {
     /// Set `name` to `value` (a copy the caller made): EEXIST with
     /// XATTR_CREATE if it has one, ENODATA with XATTR_REPLACE if not,
     /// ENOMEM; the value replaced (Linux simple_xattr_set)
-    fn set(&self, name: &str, value: Vec<u8>, flags: u32) -> Result<Option<Vec<u8>>, KernelError> {
+    fn set(&self, name: &[u8], value: Vec<u8>, flags: u32) -> Result<Option<Vec<u8>>, KernelError> {
         let new = Xattr {
-            name: crate::util::kmem::try_to_vec(name.as_bytes())?,
+            name: crate::util::kmem::try_to_vec(name)?,
             value,
         };
         // Whatever is left of `new` and the replaced value are freed
@@ -178,7 +178,7 @@ impl Xattrs {
     }
 
     /// Remove `name`: its value, ENODATA if it has none
-    fn remove(&self, name: &str) -> Result<Xattr, KernelError> {
+    fn remove(&self, name: &[u8]) -> Result<Xattr, KernelError> {
         let mut v = self.0.write();
         let i = Self::find(&v, name).map_err(|_| KernelError::NoData)?;
         Ok(v.remove(i))
@@ -213,7 +213,7 @@ const XATTR_REPLACE: u32 = 0x2;
 
 /// Space a user.* attribute takes from its file system (Linux
 /// simple_xattr_space: 40 + size + name length)
-fn xattr_space(name: &str, size: usize) -> u64 {
+fn xattr_space(name: &[u8], size: usize) -> u64 {
     (40 + size + name.len()) as u64
 }
 
@@ -893,9 +893,9 @@ impl InodeOps for RamfsInodeOps {
     // Extended attribute operations
     // =========================================================================
 
-    fn getxattr(&self, inode: &Inode, name: &str, value: &mut [u8]) -> Result<usize, KernelError> {
+    fn getxattr(&self, inode: &Inode, name: &[u8], value: &mut [u8]) -> Result<usize, KernelError> {
         // Validate namespace - only user.* is supported for regular files/dirs
-        if !name.starts_with("user.") {
+        if !name.starts_with(b"user.") {
             return Err(KernelError::OperationNotSupported);
         }
 
@@ -931,12 +931,12 @@ impl InodeOps for RamfsInodeOps {
     fn setxattr(
         &self,
         inode: &Inode,
-        name: &str,
+        name: &[u8],
         value: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
         // Validate namespace - only user.* is supported for regular files/dirs
-        if !name.starts_with("user.") {
+        if !name.starts_with(b"user.") {
             return Err(KernelError::OperationNotSupported);
         }
 
@@ -990,9 +990,9 @@ impl InodeOps for RamfsInodeOps {
         ramfs_data.xattrs.list(list)
     }
 
-    fn removexattr(&self, inode: &Inode, name: &str) -> Result<(), KernelError> {
+    fn removexattr(&self, inode: &Inode, name: &[u8]) -> Result<(), KernelError> {
         // Validate namespace - only user.* is supported for regular files/dirs
-        if !name.starts_with("user.") {
+        if !name.starts_with(b"user.") {
             return Err(KernelError::OperationNotSupported);
         }
 

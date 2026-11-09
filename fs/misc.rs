@@ -6,12 +6,13 @@
 //! - xattr syscalls (extended attributes)
 //! - readahead (file readahead)
 
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::{Inode, KernelError, LookupFlags, lookup_path_flags};
-use crate::uaccess::{UserPtr, access_ok, copy_to_user, strncpy_from_user, strncpy_from_user_str};
+use crate::uaccess::{
+    UaccessError, UserPtr, access_ok, copy_to_user, strncpy_from_user, strncpy_from_user_str,
+};
 use crate::util::error::KernelResult;
 
 use super::io::fget;
@@ -238,7 +239,6 @@ pub fn sys_mount(
     mut flags: u64,
     data_ptr: UserPtr<u8>,
 ) -> KernelResult<()> {
-    use crate::uaccess::UaccessError;
     // Linux copy_mount_string (strndup_user): EFAULT, EINVAL if too long;
     // type, then source, then the target as a path name. Source and type
     // may be absent for remount / propagation changes; a type is a name
@@ -534,15 +534,16 @@ fn xattr_err(e: KernelError) -> KernelError {
     }
 }
 
-/// An xattr name: any copy failure is EFAULT, an empty or too long
-/// name ERANGE (BUGS.md: Linux import_xattr_name)
-fn xattr_name(ptr: UserPtr<u8>) -> KernelResult<String> {
-    let name = strncpy_from_user_str(ptr.addr(), XATTR_NAME_MAX + 1)
-        .map_err(|_| KernelError::BadAddress)?;
-    if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return Err(KernelError::Range);
+/// An xattr name, any bytes but NUL (Linux import_xattr_name): empty
+/// or without a NUL in XATTR_NAME_MAX + 1 bytes is ERANGE, a fault
+/// EFAULT
+fn xattr_name(ptr: UserPtr<u8>) -> KernelResult<Vec<u8>> {
+    match strncpy_from_user(ptr.addr(), XATTR_NAME_MAX + 1) {
+        Ok(name) if name.is_empty() => Err(KernelError::Range),
+        Ok(name) => Ok(name),
+        Err(UaccessError::TooLong) => Err(KernelError::Range),
+        Err(_) => Err(KernelError::BadAddress),
     }
-    Ok(name)
 }
 
 /// Lookup flags of the path xattr calls (the l* ones do not follow)
@@ -579,7 +580,7 @@ fn copy_xattr_value_from_user(value_ptr: UserPtr<u8>, size: u64) -> KernelResult
 
 /// Linux vfs_setxattr, write access already held: the permission
 /// check, then the file system's op
-fn setxattr_inode(inode: &Arc<Inode>, name: &str, value: &[u8], flags: i32) -> KernelResult<()> {
+fn setxattr_inode(inode: &Arc<Inode>, name: &[u8], value: &[u8], flags: i32) -> KernelResult<()> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
     inode
         .i_op
@@ -671,7 +672,7 @@ pub fn sys_fsetxattr(
 /// file system when the buffer is too small
 fn getxattr_inode(
     inode: &Arc<Inode>,
-    name: &str,
+    name: &[u8],
     value_ptr: UserPtr<u8>,
     size: u64,
 ) -> KernelResult<usize> {
@@ -815,7 +816,7 @@ pub fn sys_flistxattr(fd: i32, list_ptr: UserPtr<u8>, size: u64) -> KernelResult
 }
 
 /// Linux vfs_removexattr, write access already held
-fn removexattr_inode(inode: &Arc<Inode>, name: &str) -> KernelResult<()> {
+fn removexattr_inode(inode: &Arc<Inode>, name: &[u8]) -> KernelResult<()> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
     inode.i_op.removexattr(inode, name).map_err(xattr_err)
 }

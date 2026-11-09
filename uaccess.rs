@@ -478,7 +478,7 @@ pub fn strncpy_from_user(from: u64, max_len: usize) -> UaccessResult<alloc::vec:
 }
 
 /// As [`strncpy_from_user`], for strings that are text by definition (key
-/// types, xattr names, filesystem type names): not valid UTF-8 is
+/// types, filesystem type names): not valid UTF-8 is
 /// `UaccessError::Encoding`
 #[track_caller]
 pub fn strncpy_from_user_str(from: u64, max_len: usize) -> UaccessResult<alloc::string::String> {
