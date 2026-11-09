@@ -16,9 +16,9 @@
 //!
 //! Locking: runs during bus enumeration (single-threaded, boot).
 
-use crate::arch::{CurrentArch, IoremapOps};
 use crate::hw::pci;
 use crate::hw::pci::PciDevice;
+use crate::mm::ioremap::{ioremap, iounmap};
 use crate::printkln;
 use crate::time::delay::{Clock, Monotonic, poll_on};
 
@@ -96,7 +96,7 @@ impl Bar {
             return None;
         }
         // SAFETY: the controller's memory BAR (checked above)
-        let virt = unsafe { CurrentArch::ioremap(phys, len) }.ok()?;
+        let virt = unsafe { ioremap(phys, len) }.ok()?;
         Some(Self {
             virt,
             len: len as u32,
@@ -108,7 +108,7 @@ impl Drop for Bar {
     fn drop(&mut self) {
         // SAFETY: the mapping `map` made, owned by this `Bar` and used
         // only through it
-        unsafe { CurrentArch::iounmap(self.virt, u64::from(self.len)) };
+        unsafe { iounmap(self.virt, u64::from(self.len)) };
     }
 }
 

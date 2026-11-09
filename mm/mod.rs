@@ -28,6 +28,7 @@ pub mod fault_inject;
 pub mod filemap;
 pub mod gather;
 pub mod huge_page;
+pub mod ioremap;
 pub mod lru;
 pub mod madvise;
 pub mod memblock;

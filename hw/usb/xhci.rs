@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use crate::sync::spin::Mutex;
 
 use crate::arch::FrameAlloc;
-use crate::arch::{CurrentArch, IoremapOps, phys_to_virt};
+use crate::arch::phys_to_virt;
 use crate::hw::mmio::IoMem;
 use crate::hw::pci::PciDevice;
 use crate::printkln;
@@ -820,7 +820,7 @@ impl XhciController {
         let bar_size = self.pci_dev.bar_size(0);
 
         // SAFETY: BAR0 of this xHCI, its register space
-        match unsafe { CurrentArch::ioremap(self.mmio_base, bar_size) } {
+        match unsafe { crate::mm::ioremap::ioremap(self.mmio_base, bar_size) } {
             Ok(virt) => {
                 // Update all base addresses to virtual address
                 let virt_base = virt as u64;
@@ -2116,7 +2116,7 @@ impl XhciController {
         if self.mmio_len != 0 {
             // SAFETY: the controller's registers, mapped at probe and
             // no longer used (the device is stopped)
-            unsafe { CurrentArch::iounmap(self.mmio_base as *mut u8, self.mmio_len) };
+            unsafe { crate::mm::ioremap::iounmap(self.mmio_base as *mut u8, self.mmio_len) };
             self.mmio_len = 0;
         }
     }

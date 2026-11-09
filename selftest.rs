@@ -335,7 +335,7 @@ fn canary_wait(phase: u64) -> bool {
 }
 
 /// A kernel page (ioremap window) read on another CPU, then pointed at
-/// another frame (`ioremap_retarget`: clear, flush_tlb_kernel_range,
+/// another frame (`ioremap::retarget`: clear, flush_tlb_kernel_range,
 /// map): the reader must see the new frame. A missed cross-CPU flush
 /// leaves it reading the old one through its TLB (x86 under KVM).
 #[cfg(feature = "lockdep")]
@@ -369,11 +369,10 @@ fn tlb_canary() -> Result<(), (&'static str, u64)> {
 /// what it saw
 #[cfg(feature = "lockdep")]
 fn canary_run(f1: u64, f2: u64, cpu: u32) -> Result<(u64, u64), (&'static str, u64)> {
-    use crate::arch::{CurrentArch, IoremapOps};
+    use crate::mm::ioremap::{ioremap, iounmap, retarget};
     // SAFETY: a frame this test owns and does not touch through the
     // direct map while the uncached alias exists (lockdep self-test)
-    let va =
-        unsafe { CurrentArch::ioremap(f1, 4096) }.map_err(|_| ("tlb_canary_ioremap", 0))? as u64;
+    let va = unsafe { ioremap(f1, 4096) }.map_err(|_| ("tlb_canary_ioremap", 0))? as u64;
     CANARY_VA.store(va, Ordering::Release);
     CANARY_PHASE.store(0, Ordering::Release);
     let r = (|| {
@@ -384,7 +383,7 @@ fn canary_run(f1: u64, f2: u64, cpu: u32) -> Result<(u64, u64), (&'static str, u
         }
         // SAFETY: `va` is this test's ioremap page; `f2` a frame it owns
         // and touches through no other mapping meanwhile
-        unsafe { crate::arch::ioremap_retarget(va, f2) }.map_err(|_| ("tlb_canary_remap", 0))?;
+        unsafe { retarget(va, f2) }.map_err(|_| ("tlb_canary_remap", 0))?;
         CANARY_PHASE.store(2, Ordering::Release);
         if !canary_wait(3) {
             return Err(("tlb_canary_hang", 3));
@@ -396,7 +395,7 @@ fn canary_run(f1: u64, f2: u64, cpu: u32) -> Result<(u64, u64), (&'static str, u
     })();
     // SAFETY: this test's mapping, no longer used (the remote reader
     // is done or gave up)
-    unsafe { CurrentArch::iounmap(va as *mut u8, 4096) };
+    unsafe { iounmap(va as *mut u8, 4096) };
     r
 }
 

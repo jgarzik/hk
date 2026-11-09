@@ -10,7 +10,7 @@
 
 use core::ptr::{NonNull, read_volatile, write_volatile};
 
-use crate::arch::{CurrentArch, IoremapOps};
+use crate::mm::ioremap::ioremap;
 
 /// A mapped register window
 ///
@@ -48,7 +48,7 @@ impl IoMem {
     /// change memory the kernel uses.
     pub unsafe fn ioremap(phys: u64, len: usize) -> Option<Self> {
         // SAFETY: the caller's MMIO range (this fn's contract)
-        let p = unsafe { CurrentArch::ioremap(phys, len as u64) }.ok()?;
+        let p = unsafe { ioremap(phys, len as u64) }.ok()?;
         // SAFETY: ioremap mapped `len` bytes of the caller's MMIO range,
         // and hk never unmaps it
         Some(unsafe { Self::new(NonNull::new(p)?, len) })

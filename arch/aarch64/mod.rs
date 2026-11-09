@@ -37,8 +37,8 @@ use core::arch::asm;
 
 use crate::arch::{
     AcpiInfo, AcpiOps, Arch, ArchBusOps, ContextOps, CpuInfo, CpuOps, EarlyArchInit, ExceptionOps,
-    FrameAlloc, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps, MemoryLayoutOps, PerCpuOps,
-    PowerInfo, PowerOps, SchedArch, SmpOps, TimekeeperOps, UserModeOps, VfsInitOps,
+    FrameAlloc, HaltOps, InitramfsOps, LocalTimerOps, MemoryLayoutOps, PerCpuOps, PowerInfo,
+    PowerOps, SchedArch, SmpOps, TimekeeperOps, UserModeOps, VfsInitOps,
 };
 
 /// AArch64 trap frame for saving/restoring CPU state on exception entry
@@ -234,29 +234,6 @@ impl EarlyArchInit for Aarch64Arch {
 }
 
 // ============================================================================
-// IoremapOps trait implementation
-// ============================================================================
-
-impl IoremapOps for Aarch64Arch {
-    fn ioremap_init() {
-        ioremap::init();
-    }
-
-    unsafe fn ioremap(
-        phys_addr: u64,
-        size: u64,
-    ) -> Result<*mut u8, crate::util::error::KernelError> {
-        // SAFETY: the trait's contract
-        unsafe { ioremap::ioremap(phys_addr, size) }
-    }
-
-    unsafe fn iounmap(virt_addr: *mut u8, size: u64) {
-        // SAFETY: the trait's contract
-        unsafe { ioremap::iounmap(virt_addr, size) };
-    }
-}
-
-// ============================================================================
 // AcpiOps trait implementation (DTB parsing - stub for now)
 // ============================================================================
 
@@ -447,11 +424,10 @@ impl ArchBusOps for Aarch64Arch {
     /// QEMU virt's high ECAM window (DT reg <0x40 0x10000000 ...>), 1 MB
     /// for bus 0 (32 devices x 8 functions x 4 KB)
     fn pci_config_init() {
-        use crate::arch::IoremapOps;
         let ecam_phys = 0x40_1000_0000u64;
         let ecam_size = 0x10_0000u64;
         // SAFETY: QEMU virt's ECAM window, device memory
-        let ecam_virt = unsafe { Aarch64Arch::ioremap(ecam_phys, ecam_size) }
+        let ecam_virt = unsafe { crate::mm::ioremap::ioremap(ecam_phys, ecam_size) }
             .expect("PCI: Failed to ioremap ECAM region");
         // SAFETY: ecam_size bytes just mapped, never unmapped
         unsafe {

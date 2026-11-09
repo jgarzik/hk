@@ -228,8 +228,7 @@ impl SchedArch for X86_64Arch {
 
 use crate::arch::{
     AcpiInfo, AcpiOps, ArchBusOps, CpuInfo, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps,
-    IoremapOps, LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, TimekeeperOps,
-    VfsInitOps,
+    LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, TimekeeperOps, VfsInitOps,
 };
 
 impl HaltOps for X86_64Arch {
@@ -249,25 +248,6 @@ impl HaltOps for X86_64Arch {
 impl EarlyArchInit for X86_64Arch {
     fn early_init() {
         early_init();
-    }
-}
-
-impl IoremapOps for X86_64Arch {
-    fn ioremap_init() {
-        ioremap::init();
-    }
-
-    unsafe fn ioremap(
-        phys_addr: u64,
-        size: u64,
-    ) -> Result<*mut u8, crate::util::error::KernelError> {
-        // SAFETY: the trait's contract
-        unsafe { ioremap::ioremap(phys_addr, size) }
-    }
-
-    unsafe fn iounmap(virt_addr: *mut u8, size: u64) {
-        // SAFETY: the trait's contract
-        unsafe { ioremap::iounmap(virt_addr, size) };
     }
 }
 

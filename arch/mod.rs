@@ -17,7 +17,7 @@
 //!
 //! Additional traits for architecture-independent kernel initialization:
 //! - [`EarlyArchInit`] - Early hardware initialization (GDT, IDT, etc.)
-//! - [`IoremapOps`] - MMIO mapping operations
+//! - [`IoremapOps`] - Kernel page-table primitives (ioremap, vmap)
 //! - [`AcpiOps`] - Platform hardware discovery (ACPI/device tree)
 //! - [`SmpOps`] - Multi-processor initialization
 //! - [`LocalTimerOps`] - Per-CPU timer operations
@@ -174,20 +174,6 @@ pub use aarch64::paging::{self, phys_to_virt, virt_to_phys};
 // TLB primitives behind mm::tlb
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::tlb;
-
-// Kernel pages in the vmalloc area (mm::vmstack)
-#[cfg(target_arch = "x86_64")]
-pub(crate) use x86_64::ioremap::{vmap_page, vunmap_page};
-
-#[cfg(target_arch = "aarch64")]
-pub(crate) use aarch64::ioremap::{vmap_page, vunmap_page};
-
-// TLB self-test hook (kselftest, LOCKDEP builds)
-#[cfg(all(feature = "lockdep", target_arch = "x86_64"))]
-pub use x86_64::ioremap::retarget as ioremap_retarget;
-
-#[cfg(all(feature = "lockdep", target_arch = "aarch64"))]
-pub use aarch64::ioremap::retarget as ioremap_retarget;
 
 // IPIs behind smp
 #[cfg(target_arch = "x86_64")]
@@ -570,40 +556,40 @@ pub trait EarlyArchInit {
     fn early_init();
 }
 
-/// MMIO mapping operations
-///
-/// Provides architecture-independent interface for mapping device memory
-/// into the kernel's virtual address space.
+/// Kernel page-table primitives behind `mm::ioremap` and vmap (the
+/// swapper's kernel half; Linux's per-arch pgtable helpers and the
+/// PAGE_KERNEL / ioremap protections)
 pub trait IoremapOps {
-    /// Initialize the ioremap subsystem
-    fn ioremap_init();
+    /// A kernel RAM page: writable, never executable (Linux PAGE_KERNEL)
+    const PROT_KERNEL: u64;
+    /// A device page (x86 uncached, arm64 Device-nGnRE)
+    const PROT_DEVICE: u64;
+    /// A new ioremap mapping is flushed from every CPU before use
+    const FLUSH_NEW: bool;
 
-    /// Map physical device memory into kernel virtual address space
-    ///
-    /// # Arguments
-    /// * `phys_addr` - Physical address of device memory
-    /// * `size` - Size of the region to map in bytes
-    ///
-    /// # Returns
-    /// Virtual address pointer to the mapped region, or error
-    ///
-    /// # Safety
-    /// [phys_addr, phys_addr + size) is device memory or firmware-owned
-    /// memory (ACPI tables), not RAM the kernel uses: an uncached alias
-    /// of direct-mapped RAM corrupts it.
-    unsafe fn ioremap(
-        phys_addr: u64,
-        size: u64,
-    ) -> Result<*mut u8, crate::util::error::KernelError>;
-
-    /// Unmap a previously mapped device memory region
-    ///
-    /// # Safety
-    ///
-    /// `virt_addr` and `size` are a mapping `ioremap` returned (with that
-    /// size) that the caller owns, and nothing uses it any more: no
-    /// reference into it or accessor of it (`IoMem`) is left.
-    unsafe fn iounmap(virt_addr: *mut u8, size: u64);
+    /// Physical address of the swapper's top-level table
+    fn swapper_phys() -> u64;
+    /// The entry is valid (a table, a huge/block entry or a page)
+    fn pte_present(e: u64) -> bool;
+    /// The upper entry points to a next-level table
+    fn pte_is_table(e: u64) -> bool;
+    /// The physical address an entry holds
+    fn pte_addr(e: u64) -> u64;
+    /// An upper entry pointing to the table frame `t`
+    fn mk_table(t: u64) -> u64;
+    /// A last-level entry mapping `pa` with `prot`
+    fn mk_pte(pa: u64, prot: u64) -> u64;
+    /// Make a changed last-level entry visible to the table walker
+    fn sync_pte(_e: &core::sync::atomic::AtomicU64) {}
+    /// A permanent device mapping of [phys, phys + size), if the arch
+    /// has one (arm64's device window)
+    fn io_window(_phys: u64, _size: u64) -> Option<u64> {
+        None
+    }
+    /// `va` is in that permanent window (iounmap keeps it)
+    fn in_io_window(_va: u64) -> bool {
+        false
+    }
 }
 
 // ============================================================================

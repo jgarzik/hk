@@ -12,10 +12,10 @@
 //! accessing them.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use super::ioremap::{ioremap, iounmap};
 use crate::arch::PowerInfo;
 use crate::hw::acpi::aml::{self, SleepType};
 use crate::hw::acpi::hw::{PmRegs, ResetReg, Space};
+use crate::mm::ioremap::{ioremap, iounmap};
 use crate::util::error::KernelError;
 use alloc::vec::Vec;
 

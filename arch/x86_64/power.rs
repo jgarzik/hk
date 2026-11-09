@@ -12,10 +12,10 @@
 use core::arch::asm;
 
 use super::io::{inb, inw, outb, outw};
-use super::ioremap::ioremap;
 use crate::arch::PowerInfo;
 use crate::hw::acpi::aml::SleepType;
 use crate::hw::acpi::hw::{self, PmRegs, PortIo, ResetReg, Space};
+use crate::mm::ioremap::ioremap;
 use crate::printkln;
 use crate::time::delay::Monotonic;
 

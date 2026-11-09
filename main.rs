@@ -74,7 +74,7 @@ use crate::arch::ArchBusOps;
 use crate::arch::ArchPageTable;
 use crate::arch::CurrentArch;
 use crate::arch::{
-    AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
+    AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, LocalTimerOps,
     MemoryLayoutOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps,
 };
 
@@ -301,7 +301,7 @@ fn kmain() -> ! {
     // Run page cache self-tests (verifies locking correctness)
 
     // Initialize ioremap subsystem (MMIO virtual address management)
-    CurrentArch::ioremap_init();
+    crate::mm::ioremap::init();
 
     // ========================================================================
     // Phase 1b: NUMA Topology Discovery
@@ -334,7 +334,7 @@ fn kmain() -> ! {
 
         // Map local interrupt controller MMIO region
         // SAFETY: the interrupt controller's registers from ACPI/DTB
-        match unsafe { CurrentArch::ioremap(acpi_info.interrupt_controller_base, 4096) } {
+        match unsafe { crate::mm::ioremap::ioremap(acpi_info.interrupt_controller_base, 4096) } {
             Err(e) => {
                 printkln!("SMP: Failed to ioremap interrupt controller: {:?}", e);
             }

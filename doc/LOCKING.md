@@ -1684,8 +1684,8 @@ reschedule (`resched_curr` after queueing a task on its run queue,
 
 #### Kernel Page Tables (kernel half)
 
-**Location:** `arch/x86_64/kmap.rs`, `arch/x86_64/ioremap.rs`,
-`arch/aarch64/kmap.rs`, `arch/aarch64/ioremap.rs`;
+**Location:** `arch/x86_64/kmap.rs`, `arch/aarch64/kmap.rs`,
+`mm/ioremap.rs` (entry encoding: `arch/*/ioremap.rs`);
 layout in `doc/MEMORY.md`
 
 - The kernel half (direct map of RAM, kernel image, vmalloc/ioremap
@@ -1702,8 +1702,8 @@ layout in `doc/MEMORY.md`
   shared by every address space. Its virtual ranges are handed out
   under `IOREMAP` (ioremap) and `vmstack::SLOTS` (stacks), both
   `spin::Mutex` leaves, thread context only; a mapping adds missing
-  tables under `KTABLES` (`spin::Mutex` leaf, thread context, one per
-  arch in ioremap.rs; `FRAME_ALLOCATOR` is taken under it for table
+  tables under `KTABLES` (`spin::Mutex` leaf, thread context, in
+  `mm/ioremap.rs`; `FRAME_ALLOCATOR` is taken under it for table
   frames). Linux: `vmap_area_lock` + `init_mm.page_table_lock`. Their
   entries are only accessed atomically: an upper entry is only ever
   added (a release store under `KTABLES`), so a walker that does not
