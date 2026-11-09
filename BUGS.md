@@ -984,15 +984,6 @@ tick, but neither changes how fast the clock runs (Linux
 ntp_update_frequency), and maxerror does not grow each second (Linux
 second_overflow).
 
-## Signal delivery ignores sigaltstack
-
-sigaltstack() records the stack (signal/syscall.rs), but
-setup_rt_frame on both arches never reads it or SA_ONSTACK: the frame
-always goes on the current stack, and uc_stack reports SS_DISABLE.
-A SIGSEGV handler meant to catch stack overflow (Rust std, Go) faults
-on the overflowed stack and the process dies. Linux get_sigframe /
-sigsp switch to the alt stack, __save_altstack fills uc_stack.
-
 ## Errno differs from Linux
 
 - **User namespaces nest one level short** (ns/user.rs clone_ns): hk

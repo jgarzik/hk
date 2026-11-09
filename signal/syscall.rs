@@ -12,9 +12,9 @@
 //! Note: rt_sigreturn (15) is implemented in arch-specific signal.rs files
 
 use crate::signal::{
-    AltStack, KillSig, SendInfo, SigAction, SigInfo, SigSet, Signal, UserSigInfo, dequeue_signal,
-    get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info, si_code, ss_flags,
-    with_task_signal_state,
+    AltStack, KillSig, SendInfo, SigAction, SigInfo, SigSet, Signal, UserSigInfo, UserStack,
+    dequeue_signal, get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info,
+    si_code, ss_flags, with_task_signal_state,
 };
 use crate::task::percpu::{TaskRef, current, current_pgid, current_tid, get_all_pids};
 use crate::time::time_syscall::LinuxTimespec;
@@ -556,22 +556,6 @@ fn sleep_until_signal(deadline: Option<u64>) {
     set_current_state(SleepState::Running);
 }
 
-/// User `stack_t` (sigaltstack)
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct UserStack {
-    ss_sp: u64,
-    ss_flags: i32,
-    _pad: i32,
-    ss_size: u64,
-}
-crate::pod!(UserStack {
-    ss_sp,
-    ss_flags,
-    _pad,
-    ss_size
-});
-
 /// sigaltstack(ss, oss): set and/or read the alternate signal stack;
 /// either pointer may be NULL
 pub fn sys_sigaltstack(ss: UserPtr<UserStack>, oss: UserPtr<UserStack>) -> KernelResult<()> {
@@ -607,6 +591,15 @@ fn do_sigaltstack(
         state.altstack = sas_new(&alt, &new, user_sp)?;
     }
     Ok(old)
+}
+
+/// rt_sigreturn: the frame's `uc_stack` becomes the alternate stack
+/// again, judged from the restored `sp` (Linux restore_altstack: its
+/// errors are ignored)
+pub fn restore_altstack(uss: &UserStack, sp: u64) {
+    with_task_signal_state(&current(), |state| {
+        let _ = do_sigaltstack(state, Some(*uss), sp);
+    });
 }
 
 /// The alternate stack `new` asks for, replacing `alt` of a thread at

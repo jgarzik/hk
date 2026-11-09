@@ -498,6 +498,23 @@ pub mod ss_flags {
     pub const SS_FLAG_BITS: i32 = SS_AUTODISARM;
 }
 
+/// User `stack_t` (sigaltstack, ucontext uc_stack)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UserStack {
+    pub ss_sp: u64,
+    pub ss_flags: i32,
+    pub _pad: i32,
+    pub ss_size: u64,
+}
+crate::pod!(UserStack {
+    ss_sp,
+    ss_flags,
+    _pad,
+    ss_size
+});
+const _: () = assert!(core::mem::size_of::<UserStack>() == 24);
+
 /// Alternate signal stack state (Linux task sas_ss_sp, sas_ss_size,
 /// sas_ss_flags)
 #[derive(Clone, Copy, Debug)]
@@ -540,6 +557,33 @@ impl AltStack {
             ss_flags::SS_ONSTACK
         } else {
             0
+        }
+    }
+
+    /// Its top, where a handler's frame starts
+    pub fn top(&self) -> u64 {
+        self.ss_sp.wrapping_add(self.ss_size as u64)
+    }
+
+    /// The stack a handler with `sa_flags` starts on, interrupting `sp`
+    /// (Linux sigsp): the top of this one for SA_ONSTACK unless it is
+    /// absent or already in use
+    pub fn sigsp(&self, sp: u64, sa_flags: u64) -> u64 {
+        if sa_flags & sa_flags::SA_ONSTACK != 0 && self.flags_at(sp) == 0 {
+            self.top()
+        } else {
+            sp
+        }
+    }
+
+    /// Its `uc_stack` in a handler frame (Linux __save_altstack: the
+    /// stored flags, not whether the handler runs on it)
+    pub fn save(&self) -> UserStack {
+        UserStack {
+            ss_sp: self.ss_sp,
+            ss_flags: self.ss_flags,
+            _pad: 0,
+            ss_size: self.ss_size as u64,
         }
     }
 }
@@ -2765,17 +2809,17 @@ fn deliver_to_handler(
     // pre-syscall mask if a temporary one is in effect, else current
     // (Linux sigmask_to_save)
     let restore = me.has_tif(crate::task::tif::RESTORE_SIGMASK);
-    let (frame_mask, trap) = with_task_signal_state(me, |state| {
+    let (frame_mask, trap, alt) = with_task_signal_state(me, |state| {
         let mask = if restore {
             state.saved_sigmask
         } else {
             state.blocked
         };
-        (mask, state.trap)
+        (mask, state.trap, state.altstack)
     })
-    .unwrap_or_default();
+    .unwrap_or((SigSet::EMPTY, Trap::NONE, AltStack::new()));
 
-    match signal::setup_rt_frame(sig, action, frame_mask, info, &trap, regs) {
+    match signal::setup_rt_frame(sig, action, frame_mask, info, &trap, &alt, regs) {
         Ok(()) => {
             // The saved mask now lives in the frame (Linux
             // signal_delivered -> clear_restore_sigmask)
