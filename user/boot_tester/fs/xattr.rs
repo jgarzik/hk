@@ -19,6 +19,7 @@
 //! - XATTR_NAME_BYTES: a name that is not UTF-8 round-trips
 //! - XATTR_NAME_RANGE: empty and 256-byte names are ERANGE, unterminated
 //!   too; a shorter unterminated one running off the map is EFAULT
+//! - XATTR_BUF_AFTER: getxattr/listxattr check the buffer last
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -54,6 +55,26 @@ pub fn run_tests() {
     test_xattr_space();
     test_xattr_name_bytes();
     test_xattr_name_range();
+    test_xattr_buf_after();
+}
+
+/// getxattr/listxattr copy out after the file system's answer: a
+/// missing name into a bad buffer is ENODATA, an empty list into one
+/// is 0 (Linux do_getxattr, listxattr: no access_ok first)
+fn test_xattr_buf_after() {
+    let mut t = crate::harness::T::new(b"XATTR_BUF_AFTER");
+    let path = b"/tmp/xattr_buf\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
+    t.ok(b"open", fd >= 0, fd);
+    let bad = (usize::MAX & !0xfff) as *mut u8;
+    let r = sys_getxattr(path.as_ptr(), b"user.none\0".as_ptr(), bad, 64);
+    t.eq(b"get", r, ENODATA);
+    t.eq(b"list", sys_listxattr(path.as_ptr(), bad, 64), 0);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    hk_syscall::sys_unlink(path.as_ptr());
+    t.done();
 }
 
 /// A name with bytes that are not UTF-8 is a name like any other: set,

@@ -682,18 +682,32 @@ fn getxattr_inode(
     }
     // A larger buffer is clamped (Linux do_getxattr): no value is longer
     let size = size.min(XATTR_SIZE_MAX as u64) as usize;
-    // EFAULT before ENOMEM
-    if !access_ok(value_ptr.addr(), size) {
-        return Err(KernelError::BadAddress);
-    }
-    // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
+    // Allocate kernel buffer (ENOMEM, Linux kvzalloc); the user buffer
+    // is only touched by the copy
     let mut value = crate::util::kmem::try_vec(size, 0u8)?;
     let n = inode
         .i_op
         .getxattr(inode, name, &mut value)
-        .map_err(xattr_err)?;
-    copy_to_user(value_ptr.addr(), &value[..n])?;
-    Ok(n)
+        .map_err(|e| too_big(xattr_err(e), size, XATTR_SIZE_MAX))?;
+    copy_out(value_ptr, &value[..n])
+}
+
+/// ERANGE for a buffer of the largest size: what the file system has
+/// cannot be returned at all (Linux do_getxattr, listxattr: E2BIG)
+fn too_big(e: KernelError, size: usize, max: usize) -> KernelError {
+    if e == KernelError::Range && size >= max {
+        KernelError::ArgListTooLong
+    } else {
+        e
+    }
+}
+
+/// The `n` bytes of `buf` to user `ptr`, none touched when `n` is 0
+fn copy_out(ptr: UserPtr<u8>, buf: &[u8]) -> KernelResult<usize> {
+    if !buf.is_empty() {
+        copy_to_user(ptr.addr(), buf)?;
+    }
+    Ok(buf.len())
 }
 
 /// sys_getxattr - get an extended attribute value
@@ -759,15 +773,15 @@ fn listxattr_inode(inode: &Arc<Inode>, list_ptr: UserPtr<u8>, size: u64) -> Kern
     if size == 0 {
         return inode.i_op.listxattr(inode, &mut []).map_err(xattr_err);
     }
-    // EFAULT before ENOMEM
-    if !access_ok(list_ptr.addr(), size as usize) {
-        return Err(KernelError::BadAddress);
-    }
-    // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer
-    let mut list = crate::util::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8)?;
-    let n = inode.i_op.listxattr(inode, &mut list).map_err(xattr_err)?;
-    copy_to_user(list_ptr.addr(), &list[..n])?;
-    Ok(n)
+    // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer; the
+    // user buffer is only touched by the copy
+    let size = size.min(XATTR_LIST_MAX as u64) as usize;
+    let mut list = crate::util::kmem::try_vec(size, 0u8)?;
+    let n = inode
+        .i_op
+        .listxattr(inode, &mut list)
+        .map_err(|e| too_big(xattr_err(e), size, XATTR_LIST_MAX))?;
+    copy_out(list_ptr, &list[..n])
 }
 
 /// sys_listxattr - list extended attribute names
