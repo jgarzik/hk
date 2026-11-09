@@ -1,7 +1,7 @@
 //! memfd_create and file seals (Linux mm/memfd.c, mm/shmem.c)
 //!
 //! - MEMFD_CREATE: "memfd:<name>" in /proc/self/fd, open O_RDWR |
-//!   O_LARGEFILE, MFD_CLOEXEC, mode
+//!   O_LARGEFILE, owned by the creator (who may chmod it), MFD_CLOEXEC, mode
 //!   0777 by default (vm.memfd_noexec 0), MFD_NOEXEC_SEAL drops the exec
 //!   bits and seals F_SEAL_EXEC; bad flags and long names EINVAL
 //! - MEMFD_SEALS: F_GET_SEALS / F_ADD_SEALS (F_SEAL_SEAL without
@@ -128,6 +128,30 @@ fn create() {
     let fd = sys_memfd_create(long.as_ptr(), 0);
     t.ok(b"name 249", fd >= 0, fd);
     sys_close(fd as u64);
+    // Owned by the creator's fsuid/fsgid (Linux inode_init_owner), who
+    // may then chmod it
+    let pid = sys_fork();
+    if pid == 0 {
+        if hk_syscall::sys_setresgid(65534, 65534, 65534) != 0
+            || hk_syscall::sys_setresuid(65534, 65534, 65534) != 0
+        {
+            sys_exit(1);
+        }
+        let fd = sys_memfd_create(b"own\0".as_ptr(), 0);
+        let mut s = Stat::default();
+        sys_fstat(fd as i32, &mut s);
+        let code = if s.st_uid != 65534 || s.st_gid != 65534 {
+            2
+        } else if sys_fchmod(fd as i32, 0o600) != 0 {
+            3
+        } else {
+            0
+        };
+        sys_exit(code);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    t.eq(b"owner", i64::from((st >> 8) & 0xff), 0);
     // No hugetlbfs in hk (Linux hugetlb_file_setup without it: ENOSYS)
     if !crate::helpers::host_mode() {
         t.eq(

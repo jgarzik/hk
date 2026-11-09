@@ -1319,17 +1319,13 @@ fn new_inode(
     Ok(inode)
 }
 
-/// A new regular file of `sb` owned by root with permissions `perm`,
-/// in no directory (Linux shmem_get_inode for shmem_file_setup)
+/// A new regular file of `sb` with permissions `perm`, in no directory,
+/// owned by the caller's fsuid and fsgid (Linux shmem_get_inode for
+/// shmem_file_setup: inode_init_owner with no directory)
 pub fn new_file(sb: &Arc<SuperBlock>, perm: u16) -> Result<Arc<Inode>, KernelError> {
-    new_inode(
-        sb,
-        Kind::File,
-        InodeMode::regular(perm),
-        0,
-        0,
-        current_time(),
-    )
+    let c = crate::task::current_cred();
+    let mode = InodeMode::regular(perm);
+    new_inode(sb, Kind::File, mode, c.fsuid, c.fsgid, current_time())
 }
 
 /// Make a new inode and enter it in `dir` as `name` (EEXIST if taken):
