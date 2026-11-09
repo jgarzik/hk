@@ -649,17 +649,6 @@ collections grown under spin mutexes, in fs, net, task and
 ipc (procfs: only its mount-time tree building). Each wants its allocation moved out of the
 lock (preallocate, or a sleeping lock as in Linux).
 
-## Sleeping mutex has no handoff
-
-**Location**: `sync/mutex.rs`
-
-A woken waiter retries the CAS and sleeps again if it lost, so a task
-that unlocks and relocks at once can starve the sleepers indefinitely;
-Linux hands the lock to a waiter that has failed for over a jiffy
-(MUTEX_FLAG_HANDOFF). Seen with a test-only 300 us delay under
-`Pipe.inner` in pipe_read: a reader spinning in non-blocking reads kept
-the writer off the pipe for over 10 s.
-
 ## Scheduler gaps (deviations from Linux)
 
 **Location**: `task/fair.rs`, `task/percpu.rs`

@@ -31,9 +31,45 @@ pub use seqlock::{SeqLock, SeqWriteGuard};
 
 /// The caller is a task that may sleep (not tid 0: an idle task or the
 /// boot context, which never contend for a sleeping lock)
+#[cfg(not(test))]
 fn can_sleep() -> bool {
     crate::task::percpu::can_sleep()
 }
+
+/// Host unit tests have no tasks: a contended sleeping lock spins
+#[cfg(test)]
+fn can_sleep() -> bool {
+    false
+}
+
+/// The current task, queued as a sleeping lock's waiter
+#[cfg(not(test))]
+fn waiter_task() -> *const crate::task::Task {
+    &raw const *crate::task::percpu::current()
+}
+
+/// Host unit tests have no tasks (their waiters are never woken)
+#[cfg(test)]
+fn waiter_task() -> *const crate::task::Task {
+    core::ptr::null()
+}
+
+/// Wake a sleeping lock's waiter (Linux wake_up_process)
+///
+/// # Safety
+/// `t` is a `waiter_task()` whose waiter stays queued, or is granted
+/// the lock but cannot see it, until this returns (the caller holds the
+/// lock's wait lock), so the task cannot exit meanwhile.
+#[cfg(not(test))]
+unsafe fn wake_waiter(t: *const crate::task::Task) {
+    use crate::task::percpu::{WakeMode, try_to_wake_up};
+    // SAFETY: live until this returns (the caller)
+    try_to_wake_up(unsafe { &*t }, WakeMode::Any);
+}
+
+/// Host unit tests: nobody to wake
+#[cfg(test)]
+unsafe fn wake_waiter(_: *const crate::task::Task) {}
 
 /// Linux might_sleep (CONFIG_DEBUG_ATOMIC_SLEEP): no spin lock may be
 /// held (every `IrqSpinlock` and `sync::spin` lock raises the preempt

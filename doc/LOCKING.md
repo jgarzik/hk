@@ -139,16 +139,30 @@ fn write(&self) -> RwLockWriteGuard<'_, T>
 ### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (sync/)
 
 Linux `struct mutex` and `struct rw_semaphore`: a contended lock sleeps
-on the lock's `WaitQueue` instead of spinning (only a tid-0 caller, the
-boot context before pid 1 exists or an idle task, spins: neither ever
-meets contention), so the holder may sleep (page locks, block I/O,
-user page faults, blocking pipe/socket I/O).
+instead of spinning (only a tid-0 caller, the boot context before pid 1
+exists or an idle task, spins: neither ever meets contention), so the
+holder may sleep (page locks, block I/O, user page faults, blocking
+pipe/socket I/O). No optimistic spinning (hk cannot tell whether an
+owner is running).
 
-- `Mutex<T>`: owner tid recorded (debug builds catch recursive locking
-  and foreign unlocks); `unlock` wakes one waiter, which retries.
+- `Mutex<T>` (Linux kernel/locking/mutex.c): an owner word (the owner's
+  tid shifted past three flags) and a FIFO wait list under the lock's
+  own `IrqSpinlock` (Linux wait_lock: a leaf, held only to queue,
+  dequeue and wake, never across a sleep; the wakeup is issued under
+  it, so it orders before `pi_lock` and the run-queue lock, like a
+  `WaitQueue` head). Flags: `WAITERS` (list not empty: unlock takes
+  the slow path and wakes the first waiter), `HANDOFF` (set by the
+  first waiter when a retry after its wakeup fails: the next unlock
+  hands the lock to it instead of releasing it), `PICKUP` (handed to
+  the tid in the word; no one else may take it). So a task that
+  unlocks and relocks at once cannot starve a sleeper. Debug builds
+  catch recursive locking and foreign unlocks by the tid.
   `lock_interruptible`/`lock_killable` (Linux mutex_lock_interruptible/
   _killable) give up with EINTR on a signal (any, or SIGKILL) pending
-  while they wait; `try_lock` (mutex_trylock) never sleeps.
+  while they wait, after one more try under the wait lock (so a waiter
+  woken by an unlock never leaves the lock free with sleepers queued);
+  `try_lock` (mutex_trylock) never sleeps and never takes a lock handed
+  to another task.
 - `RwSem<T>` (typed; `RwSem<()>` guards what its owner says):
   `read`/`write` guards, `read_killable`/`write_killable` (Linux
   down_*_killable: a `Killable` sleep, woken by wakeups and SIGKILL
