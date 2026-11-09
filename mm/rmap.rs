@@ -90,11 +90,11 @@ pub fn try_to_unmap(phys: u64, e: crate::mm::SwapEntry) -> bool {
         if avc.locked || crate::mm::gup::maybe_dma_pinned(phys) {
             return false;
         }
-        if !crate::mm::swap::swap_duplicate(e) {
+        if !crate::mm::swap::swapfile::swap_duplicate(e) {
             return false;
         }
         if !unmap_one(t.entry(addr), pte, phys, e) {
-            crate::mm::swap::swap_free(e);
+            crate::mm::swap::swapfile::swap_free(e);
             return true;
         }
         // No longer mapped: a swap-in decides again whose it is

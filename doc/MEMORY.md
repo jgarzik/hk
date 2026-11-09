@@ -164,7 +164,7 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   included, go on to min; `__GFP_HIGH` ones to half of it, atomic ones
   (the heap in interrupt context) a quarter lower. A fault that finds
   free memory at low reclaims (direct reclaim: swaps the oldest
-  anonymous pages out, `mm/vmscan.rs`), with no spinlock held, then
+  anonymous pages out, `mm/swap/vmscan.rs`), with no spinlock held, then
   drains the per-CPU lists and retries while reclaim frees pages. User
   allocations stop at low until the OOM killer (P6); then Linux's min.
   A page read
@@ -326,8 +326,8 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   entry allows, and none may be executable by the kernel (arm64 PXN);
   a violation prints `MMCHECK:FAIL`.
 - **Swap (Linux mm/vmscan.c, swapfile.c, swap_state.c).** Private
-  anonymous pages sit on the LRU (`mm/lru.rs`). Reclaim
-  (`mm/vmscan.rs`; MADV_PAGEOUT, and the allocator's slow path) gives a
+  anonymous pages sit on the LRU (`mm/swap/lru.rs`). Reclaim
+  (`mm/swap/vmscan.rs`; MADV_PAGEOUT, and the allocator's slow path) gives a
   page a swap slot and a place in the device's swap cache, replaces
   every PTE mapping it by the swap entry through the reverse map,
   writes it out and frees it; a page still mapped somewhere, or busy,

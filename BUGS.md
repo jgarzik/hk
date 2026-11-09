@@ -904,7 +904,7 @@ Tag = roadmap phase (doc/ROADMAP.md).
    add batch, so swap-in makes needless COW copies. Linux drains and
    rechecks (wp_can_reuse_anon_folio).
 5. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
-   reclaimed page** (J). `mm/swap.rs` `alloc_slot`: cluster/free-hint
+   reclaimed page** (J). `mm/swap/swapfile.rs` `alloc_slot`: cluster/free-hint
    allocator, cached sorted device list.
 6. **One AnonVma per fork family, Vec chain** (J).
    `mm/anon_vma.rs` `AnonVma`: O(N×VMAs) under one family write lock.

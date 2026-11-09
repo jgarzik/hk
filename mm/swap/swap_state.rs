@@ -20,13 +20,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use super::fault::VmFault;
-use super::page::{PG_SWAPCACHE, lock_page, phys_to_page, trylock_page, unlock_page};
-use super::swap::{
+use super::swap_entry::SwapEntry;
+use super::swapfile::{
     SwapInfo, get_swap_info, swap_count, swap_read_page, swapcache_clear, swapcache_prepare,
 };
-use super::swap_entry::SwapEntry;
 use crate::FRAME_ALLOCATOR;
+use crate::mm::fault::VmFault;
+use crate::mm::page::{PG_SWAPCACHE, lock_page, phys_to_page, trylock_page, unlock_page};
 use crate::util::error::KernelError;
 
 /// The swap-cache page of `e`, with a reference (Linux
@@ -70,7 +70,7 @@ pub fn add(e: SwapEntry, phys: u64) -> bool {
     true
 }
 
-fn unhash(pg: &super::page::Page) {
+fn unhash(pg: &crate::mm::page::Page) {
     pg.clear_flag(PG_SWAPCACHE);
     pg.private.store(0, Ordering::Relaxed);
 }
@@ -185,7 +185,7 @@ pub fn read_swap_page(e: SwapEntry) -> Result<u64, VmFault> {
             // Another task is reading it in: sleep until its page
             // shows up or its claim goes (Linux: the racer sleeps on
             // the locked folio)
-            Err(true) => super::swap::swap_wait(e).wait_event(|| settled(e)),
+            Err(true) => super::swapfile::swap_wait(e).wait_event(|| settled(e)),
             Err(false) => return Err(VmFault::Retry),
         }
     }
@@ -198,13 +198,13 @@ fn settled(e: SwapEntry) -> bool {
         FRAME_ALLOCATOR.decref(phys);
         return true;
     }
-    !super::swap::swapcache_busy(e)
+    !super::swapfile::swapcache_busy(e)
 }
 
 /// Read `e`, whose slot this task claimed (SWAP_HAS_CACHE), into a new
 /// locked swap-cache page
 fn read_new(e: SwapEntry) -> Result<u64, VmFault> {
-    let Some(phys) = super::fault::alloc_user() else {
+    let Some(phys) = crate::mm::fault::alloc_user() else {
         swapcache_clear(e);
         return Err(VmFault::Oom);
     };
@@ -217,7 +217,7 @@ fn read_new(e: SwapEntry) -> Result<u64, VmFault> {
         return Err(VmFault::Oom);
     }
     // Racers waiting on the claim find the (locked) page now
-    super::swap::swap_wait(e).wake_all();
+    super::swapfile::swap_wait(e).wake_all();
     if swap_read_page(e, phys).is_err() {
         delete(e, phys);
         unlock_page(phys);
@@ -235,7 +235,7 @@ fn read_new(e: SwapEntry) -> Result<u64, VmFault> {
 pub fn try_to_unuse(si: &Arc<SwapInfo>) -> Result<(), KernelError> {
     for _ in 0..16 {
         for mm in all_mms() {
-            if let Some(mm) = super::mmget_not_zero(&mm) {
+            if let Some(mm) = crate::mm::mmget_not_zero(&mm) {
                 unuse_mm(&mm, si.swap_type)?;
             }
         }
@@ -251,8 +251,8 @@ pub fn try_to_unuse(si: &Arc<SwapInfo>) -> Result<(), KernelError> {
 }
 
 /// Every live address space (mm_count references)
-fn all_mms() -> Vec<Arc<super::Mm>> {
-    let mut v: Vec<Arc<super::Mm>> = Vec::new();
+fn all_mms() -> Vec<Arc<crate::mm::Mm>> {
+    let mut v: Vec<Arc<crate::mm::Mm>> = Vec::new();
     {
         let table = crate::task::percpu::TASKLIST.read();
         for t in table.iter() {
@@ -268,16 +268,17 @@ fn all_mms() -> Vec<Arc<super::Mm>> {
 }
 
 /// Fault in the swap PTEs of type `ty` in `mm`
-fn unuse_mm(mm: &super::Mm, ty: u8) -> Result<(), KernelError> {
+fn unuse_mm(mm: &crate::mm::Mm, ty: u8) -> Result<(), KernelError> {
     let map = mm.mmap_read_killable()?;
-    let t = super::pgtable::PgTables::new(mm, &map);
+    let t = crate::mm::pgtable::PgTables::new(mm, &map);
     for vma in map.iter().filter(|v| v.anon_vma.is_some()) {
         let mut addr = vma.start;
         while addr < vma.end {
-            match super::memory::next_swap_pte(t, addr, vma.end, ty) {
+            match crate::mm::memory::next_swap_pte(t, addr, vma.end, ty) {
                 Some(a) => {
-                    super::fault::unuse_pte(mm, t, vma, a).map_err(|_| KernelError::OutOfMemory)?;
-                    addr = a + super::PAGE_SIZE;
+                    crate::mm::fault::unuse_pte(mm, t, vma, a)
+                        .map_err(|_| KernelError::OutOfMemory)?;
+                    addr = a + crate::mm::PAGE_SIZE;
                 }
                 None => break,
             }
@@ -313,7 +314,7 @@ pub fn destroy_cache(si: &SwapInfo) {
 
 /// Pages in every swap cache (meminfo SwapCached)
 pub fn total_cached() -> u64 {
-    super::swap::SWAP_INFO
+    super::swapfile::SWAP_INFO
         .read()
         .iter()
         .flatten()

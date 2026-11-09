@@ -28,7 +28,6 @@ pub mod gather;
 pub mod gup;
 pub mod huge_page;
 pub mod ioremap;
-pub mod lru;
 pub mod madvise;
 pub mod memblock;
 pub mod memfd;
@@ -45,20 +44,17 @@ pub mod remote;
 pub mod rmap;
 pub mod slab;
 pub mod swap;
-pub mod swap_entry;
-pub mod swap_state;
 pub mod swapper;
 pub mod syscall;
 pub mod tlb;
 pub mod vma;
 pub mod vmalloc;
-pub mod vmscan;
 pub mod vmstack;
 pub mod writeback;
 pub mod xarray;
 
-pub use swap::{SWAP_FLAG_DISCARD, SWAP_FLAG_PREFER, sys_swapoff, sys_swapon};
-pub use swap_entry::SwapEntry;
+pub use swap::swap_entry::SwapEntry;
+pub use swap::swapfile::{SWAP_FLAG_DISCARD, SWAP_FLAG_PREFER, sys_swapoff, sys_swapon};
 
 pub use vma::*;
 

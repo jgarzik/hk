@@ -24,11 +24,11 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::spin::{Mutex, RwLock};
 
+use super::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
 use crate::fs::{Inode, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::mm::page::frame_bytes;
-use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
 use crate::sync::IrqSpinlock;
 use crate::task::{CAP_SYS_ADMIN, capable};
@@ -423,7 +423,7 @@ pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
     // Allocations on the way to the device (bio, buffers, the file's
     // own) must not reclaim through swap I/O again (Linux: swap_writepage
     // under memalloc_noio / PF_MEMALLOC)
-    super::memalloc_scope(crate::task::pf::MEMALLOC_NOIO, || {
+    crate::mm::memalloc_scope(crate::task::pf::MEMALLOC_NOIO, || {
         write_page(entry, frame_phys)
     })
 }

@@ -272,7 +272,7 @@ fn split_rmap(base: u64) {
             pg.index.store(index + i, Ordering::Relaxed);
             pg.mapcount.store(maps, Ordering::Relaxed);
         }
-        crate::mm::lru::lru_add(phys);
+        crate::mm::swap::lru::lru_add(phys);
     }
 }
 

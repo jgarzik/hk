@@ -1582,7 +1582,7 @@ pub struct Zone {
   completion in an interrupt handler must hand it to a thread (Linux
   bio_dirty_work).
 
-#### Swap (mm/swap.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
+#### Swap (mm/swap/swapfile.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
 
 - `SwapInfo.map` (`spin::Mutex`, Linux si->lock): a device's slot
   counts (swap PTEs + SWAP_HAS_CACHE) and allocation hint; swapoff
@@ -1611,7 +1611,7 @@ pub struct Zone {
   are dropped before any mm lock) with its mmap_lock held for reading, faulting the device's swap
   PTEs in.
 
-#### LRU (mm/lru.rs; Linux mm/swap.c lruvec)
+#### LRU (mm/swap/lru.rs; Linux mm/swap.c lruvec)
 
 - `Lruvec.lock` (`IrqSpinlock`, Linux lruvec->lru_lock): the LRU lists,
   linked through struct page (`next`/`prev`, owned by the list while
@@ -1632,7 +1632,7 @@ pub struct Zone {
   reached 0 is left for `page_freed`, which takes the lock and unlinks
   it. Reclaim never takes an mmap_lock while holding it.
 
-#### Reclaim (mm/vmscan.rs; Linux mm/vmscan.c)
+#### Reclaim (mm/swap/vmscan.rs; Linux mm/vmscan.c)
 
 - `shrink_folio_list` works on pages it isolated (each with a
   reference) and holds no lock between pages. Per page: page lock by

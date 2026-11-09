@@ -32,7 +32,7 @@ pub fn put_page(phys: u64) {
 /// leaves the cache when no swap PTE needs its slot either
 fn zap_page(phys: u64) {
     super::rmap::page_remove_rmap(phys);
-    super::swap_state::free_swap_cache(phys);
+    super::swap::swap_state::free_swap_cache(phys);
     crate::FRAME_ALLOCATOR.decref(phys);
 }
 
@@ -49,7 +49,7 @@ pub(super) fn zap_leaf(leaf: Leaf) {
         Leaf::Page(p) => zap_page(p),
         Leaf::Huge(p) => put_huge(p),
         Leaf::Swap(pte) if SwapEntry::is_swap_pte(pte) => {
-            super::swap::free_swap_and_cache(SwapEntry::from_pte(pte))
+            super::swap::swapfile::free_swap_and_cache(SwapEntry::from_pte(pte))
         }
         Leaf::Swap(_) => {}
     }
@@ -130,7 +130,7 @@ impl PteWalk for Zap<'_, '_> {
         if paging::pte_present(pte) {
             self.tlb.remove_page(addr, paging::pte_addr(pte));
         } else if SwapEntry::is_swap_pte(pte) {
-            super::swap::free_swap_and_cache(SwapEntry::from_pte(pte));
+            super::swap::swapfile::free_swap_and_cache(SwapEntry::from_pte(pte));
         }
         Ok(())
     }
@@ -372,7 +372,7 @@ fn copy_pinned(dp: &AtomicU64, sp: &AtomicU64, new: u64, addr: u64, vma: &Vma) {
         .filter(|_| phys_to_page(old).is_some_and(|p| p.is_anon()))
     {
         super::rmap::page_add_anon_rmap(new, av, vma.index_of(addr));
-        super::lru::lru_add(new);
+        super::swap::lru::lru_add(new);
     }
     if let Some(pg) = phys_to_page(new) {
         pg.set_anon_exclusive();
@@ -395,7 +395,7 @@ fn copy_pte(dp: &AtomicU64, sp: &AtomicU64, cow: bool) -> KernelResult<bool> {
             // The child's PTE references the slot too (Linux
             // copy_nonpresent_pte: swap_duplicate); a full count is
             // ENOMEM (Linux would chain a count continuation)
-            if !super::swap::swap_duplicate(SwapEntry::from_pte(pte)) {
+            if !super::swap::swapfile::swap_duplicate(SwapEntry::from_pte(pte)) {
                 return Err(KernelError::OutOfMemory);
             }
             dp.store(pte, Ordering::Release);

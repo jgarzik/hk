@@ -226,10 +226,10 @@ fn lru_ok(vma: &Vma) -> Result<(), KernelError> {
 /// writes sleep), one table's worth at a time like Linux's per-PMD
 /// reclaim_pages. Without swap, PAGEOUT leaves anonymous memory alone.
 fn cold_or_pageout(vma: &Vma, owner: &Mm, t: PgTables<'_>, start: u64, end: u64, pageout: bool) {
-    if vma.anon_vma.is_none() || (pageout && super::swap::swap_totals().0 == 0) {
+    if vma.anon_vma.is_none() || (pageout && super::swap::swapfile::swap_totals().0 == 0) {
         return;
     }
-    super::lru::lru_add_drain_all();
+    super::swap::lru::lru_add_drain_all();
     let mut w = Cold {
         mm: owner,
         pageout,
@@ -254,7 +254,7 @@ impl Cold<'_> {
     /// Reclaim the batch (no spin lock held)
     fn flush(&mut self) {
         if !self.pages.is_empty() {
-            super::vmscan::reclaim_pages(core::mem::take(&mut self.pages));
+            super::swap::vmscan::reclaim_pages(core::mem::take(&mut self.pages));
         }
     }
 }
@@ -282,8 +282,8 @@ impl super::pagewalk::PteWalk for Cold<'_> {
     fn pte(&mut self, e: &AtomicU64, _: u64) -> Result<(), Self::Err> {
         if let Some(phys) = own_page(e) {
             if !self.pageout {
-                super::lru::deactivate(phys);
-            } else if self.pages.len() < self.pages.capacity() && super::lru::isolate(phys) {
+                super::swap::lru::deactivate(phys);
+            } else if self.pages.len() < self.pages.capacity() && super::swap::lru::isolate(phys) {
                 // Within the room `prepare` reserved: no allocation here
                 self.pages.push(phys);
             }

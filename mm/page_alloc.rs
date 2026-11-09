@@ -179,7 +179,7 @@ fn direct_reclaim() -> usize {
         // Allocations made while reclaiming do not reclaim again
         // (Linux __perform_reclaim: memalloc_noreclaim_save)
         crate::mm::memalloc_scope(crate::task::pf::MEMALLOC, || {
-            crate::mm::vmscan::try_to_free_pages(crate::mm::vmscan::SWAP_CLUSTER_MAX)
+            crate::mm::swap::vmscan::try_to_free_pages(crate::mm::swap::vmscan::SWAP_CLUSTER_MAX)
         })
     }
     #[cfg(test)]
@@ -650,7 +650,7 @@ impl Zone {
         // (slab)
         #[cfg(not(test))]
         if order == 0 && self.sections.load(Ordering::Relaxed) {
-            crate::mm::lru::page_freed(pfn);
+            crate::mm::swap::lru::page_freed(pfn);
         }
         for i in 0..1u64 << order {
             let pg = self.page(pfn + i);

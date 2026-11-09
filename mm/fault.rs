@@ -148,7 +148,7 @@ fn add_anon(phys: u64, area: &Area, addr: u64) {
     if let Some(av) = &area.anon_vma {
         super::rmap::page_add_anon_rmap(phys, av, area.index(addr));
     }
-    super::lru::lru_add(phys);
+    super::swap::lru::lru_add(phys);
 }
 
 /// Resolve a fault at `addr` of the address space `mm` (the current
@@ -254,7 +254,7 @@ fn leaf<'a>(mm: &Mm, t: PgTables<'a>, addr: u64) -> Result<Pte<'a>, VmFault> {
         if still_huge(t, addr) {
             return Err(VmFault::Retry);
         }
-        if super::vmscan::try_to_free_pages(super::vmscan::SWAP_CLUSTER_MAX) == 0 {
+        if super::swap::vmscan::try_to_free_pages(super::swap::vmscan::SWAP_CLUSTER_MAX) == 0 {
             return Err(VmFault::Oom);
         }
     }
@@ -496,7 +496,7 @@ fn do_swap_page(
     access: Access,
 ) -> Result<(), VmFault> {
     let e = SwapEntry::from_pte(pte);
-    let page = match super::swap_state::read_swap_page(e) {
+    let page = match super::swap::swap_state::read_swap_page(e) {
         Err(VmFault::Retry) => return Ok(()),
         r => r?,
     };
@@ -522,12 +522,13 @@ fn map_swap_page(
         FRAME_ALLOCATOR.decref(page);
         return Ok(());
     }
-    super::swap::swap_free(SwapEntry::from_pte(pte));
+    super::swap::swapfile::swap_free(SwapEntry::from_pte(pte));
     // The cache lets the page go on a write, or when swap runs short
     // (Linux should_try_to_free_swap: vm_swap_full), if no other swap
     // PTE needs the slot; exclusive: then no reference but ours
     let write = access == Access::Write;
-    let freed = (write || super::swap::swap_full()) && super::swap_state::try_free_swap(page);
+    let freed = (write || super::swap::swapfile::swap_full())
+        && super::swap::swap_state::try_free_swap(page);
     let exclusive = write && freed && FRAME_ALLOCATOR.refcount(page) == 1;
     // A PROT_NONE VMA (swapoff's unuse_pte skips the access check) gets
     // a protnone entry from mk_pte, not a readable one
@@ -680,7 +681,7 @@ fn wp_locked(
 fn reuse_swap_page(phys: u64) {
     let cached = super::page::phys_to_page(phys).is_some_and(|p| p.is_swapcache());
     if cached && super::page::trylock_page(phys) {
-        super::swap_state::try_free_swap(phys);
+        super::swap::swap_state::try_free_swap(phys);
         super::page::unlock_page(phys);
     }
 }

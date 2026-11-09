@@ -2185,8 +2185,8 @@ fn gen_meminfo() -> Vec<u8> {
     let total = fa.stats().total_bytes >> 10;
     let free = (fa.free_frames() as u64 * 4096) >> 10;
     let slab = (crate::mm::slab::slab_bytes() as u64) >> 10;
-    let (swap_total, swap_free) = crate::mm::swap::swap_totals();
-    let swap_cached = crate::mm::swap_state::total_cached();
+    let (swap_total, swap_free) = crate::mm::swap::swapfile::swap_totals();
+    let swap_cached = crate::mm::swap::swap_state::total_cached();
     let mut out = String::new();
     use crate::mm::filemap;
     let file = filemap::nr_file_pages() * 4;

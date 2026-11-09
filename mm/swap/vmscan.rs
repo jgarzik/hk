@@ -25,10 +25,10 @@
 use alloc::vec::Vec;
 
 use super::lru::{self, Lru};
-use super::page::{PG_DIRTY, phys_to_page, trylock_page, unlock_page};
-use super::swap::get_swap_page;
 use super::swap_state;
+use super::swapfile::get_swap_page;
 use crate::FRAME_ALLOCATOR;
+use crate::mm::page::{PG_DIRTY, phys_to_page, trylock_page, unlock_page};
 
 /// Pages direct reclaim takes per pass (Linux SWAP_CLUSTER_MAX)
 pub const SWAP_CLUSTER_MAX: usize = 32;
@@ -72,7 +72,7 @@ fn shrink_page(phys: u64) -> Fate {
     }
     // A device may be reading or writing it (Linux: try_to_unmap fails
     // for a maybe-pinned page, folio_try_share_anon_rmap_pte)
-    if super::gup::maybe_dma_pinned(phys) {
+    if crate::mm::gup::maybe_dma_pinned(phys) {
         unlock_page(phys);
         return Fate::Keep { active: true };
     }
@@ -94,7 +94,7 @@ fn pageout(phys: u64) -> Fate {
             return Fate::Keep { active: true };
         };
         if !swap_state::add(e, phys) {
-            super::swap::swapcache_clear(e);
+            super::swapfile::swapcache_clear(e);
             return Fate::Keep { active: true };
         }
         pg.set_flag(PG_DIRTY);
@@ -102,14 +102,14 @@ fn pageout(phys: u64) -> Fate {
     let Some(e) = swap_state::entry_of(phys) else {
         return Fate::Keep { active: true };
     };
-    if pg.mapcount() > 0 && !super::rmap::try_to_unmap(phys, e) {
+    if pg.mapcount() > 0 && !crate::mm::rmap::try_to_unmap(phys, e) {
         return Fate::Keep { active: true };
     }
     // Written only if changed since the slot last held it (a page read
     // back from swap is mapped read-only while it stays in the cache)
     if pg.is_dirty() {
         pg.clear_flag(PG_DIRTY);
-        if super::swap::swap_write_page(e, phys).is_err() {
+        if super::swapfile::swap_write_page(e, phys).is_err() {
             pg.set_flag(PG_DIRTY);
             return Fate::Keep { active: true };
         }
@@ -136,7 +136,7 @@ pub fn reclaim_pages(pages: Vec<u64>) -> usize {
 pub fn try_to_free_pages(nr: usize) -> usize {
     // Clean page cache first: no I/O to free it (Linux balances the file
     // and anon LRUs; with no file LRU hk takes the cache first)
-    let cached = super::filemap::shrink_cache(nr);
+    let cached = crate::mm::filemap::shrink_cache(nr);
     if cached >= nr {
         return cached;
     }
@@ -144,8 +144,8 @@ pub fn try_to_free_pages(nr: usize) -> usize {
     // inodes only they hold; their memory is slab, not counted here
     crate::fs::dentry::shrink_dcache(nr.saturating_mul(16));
     let nr = nr - cached;
-    let (total, free) = super::swap::swap_totals();
-    if total == 0 || free == 0 || !super::swap::bdev_swap_active() {
+    let (total, free) = super::swapfile::swap_totals();
+    if total == 0 || free == 0 || !super::swapfile::bdev_swap_active() {
         return cached;
     }
     lru::lru_add_drain_all();
