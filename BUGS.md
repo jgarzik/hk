@@ -559,10 +559,12 @@ ELR/FAR were not captured. Next occurrence: capture the Message line.
 
 ## tmpfs gaps
 
-**Location**: `fs/ramfs/tmpfs.rs`, `fs/ramfs/mod.rs`
+**Location**: `fs/ramfs/tmpfs.rs`, `fs/ramfs/mod.rs`, `mm/filemap.rs`
 
-tmpfs pages never go to swap (the mapping is unevictable, like ramfs;
-Linux swaps them, and noswap is only recorded). huge= takes only
+tmpfs/shmem is not swap-backed (phase J): its pages, SysV shm and
+shared anonymous memory included, never go to swap (the mapping is
+unevictable, like ramfs; Linux shmem_writeout swaps them), and noswap
+is only recorded. huge= takes only
 never, mpol= and the quota options are refused (EINVAL), as on a Linux
 without THP, NUMA or CONFIG_TMPFS_QUOTA. inode32 is recorded and shown
 but inode numbers do not wrap at 2^32 (Linux shmem_reserve_inode).
