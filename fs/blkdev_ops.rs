@@ -71,10 +71,13 @@ const DIO_PAGES: usize = 256;
 /// bytes read, short at the end of the device or at the first page that
 /// cannot be pinned (that page's error if it is the first).
 fn dio_read(file: &File, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
-    // At or past the end nothing is pinned (Linux blkdev_read_iter)
-    if pos >= bdev(file)?.capacity() {
+    // At or past the end nothing is pinned, and nothing past it either
+    // (Linux blkdev_read_iter: iov_iter_truncate)
+    let size = bdev(file)?.capacity();
+    if pos >= size {
         return Ok(0);
     }
+    to.truncate((size - pos).min(usize::MAX as u64) as usize);
     let mut done = 0usize;
     while !to.is_empty() {
         let mut pp = match to.extract_pages(DIO_PAGES) {
@@ -108,6 +111,10 @@ fn dio_write(file: &File, from: &mut IovSource<'_>, pos: u64) -> Result<usize, K
     if !write_ok(file, from.len(), pos)? {
         return Ok(0);
     }
+    // Nothing past the end is pinned (Linux blkdev_write_iter:
+    // iov_iter_truncate)
+    let size = bdev(file)?.capacity();
+    from.truncate((size - pos).min(usize::MAX as u64) as usize);
     let mut done = 0usize;
     while !from.is_empty() {
         let pp = match from.extract_pages(DIO_PAGES) {
