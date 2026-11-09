@@ -10,11 +10,11 @@ use alloc::vec::Vec;
 
 use spin::Once;
 
-use super::KernelError;
-use super::dentry::Dentry;
-use super::inode::{Inode, InodeMode, InodeOps};
-use super::kernfs::{self, KNode};
-use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
+use crate::fs::KernelError;
+use crate::fs::dentry::Dentry;
+use crate::fs::inode::{Inode, InodeMode, InodeOps};
+use crate::fs::kernfs::{self, KNode};
+use crate::fs::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
 use crate::sync::spin::Mutex;
 use crate::util::kalloc::try_arc;
 
@@ -97,7 +97,7 @@ pub static SYSFS_TYPE: FileSystemType = FileSystemType {
 pub fn init() {
     let fs = top_dir(b"fs");
     mount_point(&fs, b"cgroup");
-    super::superblock::register_filesystem(&SYSFS_TYPE);
+    crate::fs::superblock::register_filesystem(&SYSFS_TYPE);
 }
 
 /// An empty directory something else mounts on (Linux

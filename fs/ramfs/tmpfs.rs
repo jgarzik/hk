@@ -23,9 +23,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::KernelError;
-use super::inode::{AsAny, Gid, Uid};
-use super::superblock::{
+use crate::fs::KernelError;
+use crate::fs::inode::{AsAny, Gid, Uid};
+use crate::fs::superblock::{
     FileSystemType, StatFs, SuperBlock, SuperBlockData, SuperOps, TMPFS_MAGIC, sb_flag_word,
 };
 use crate::mm::filemap::{self, PageAcct};
@@ -474,10 +474,10 @@ impl SuperOps for TmpfsSuperOps {
     fn alloc_inode(
         &self,
         sb: &Arc<SuperBlock>,
-        mode: super::inode::InodeMode,
-        i_op: &'static dyn super::inode::InodeOps,
-    ) -> Result<Arc<super::inode::Inode>, KernelError> {
-        super::ramfs::RAMFS_SUPER_OPS.alloc_inode(sb, mode, i_op)
+        mode: crate::fs::inode::InodeMode,
+        i_op: &'static dyn crate::fs::inode::InodeOps,
+    ) -> Result<Arc<crate::fs::inode::Inode>, KernelError> {
+        super::RAMFS_SUPER_OPS.alloc_inode(sb, mode, i_op)
     }
 
     fn statfs(&self, sb: &SuperBlock) -> StatFs {
@@ -507,7 +507,7 @@ pub(crate) fn tmpfs_mount(
     let (mode, uid, gid) = (t.mode, t.uid, t.gid);
     let sb = SuperBlock::new(fs_type, &TMPFS_SUPER_OPS, 0)?;
     sb.set_private(try_arc(t)?);
-    super::ramfs::fill_root(&sb, mode, uid, gid)?;
+    super::fill_root(&sb, mode, uid, gid)?;
     Ok(sb)
 }
 
@@ -522,18 +522,18 @@ pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
     fs_flags: 0,
     mount: tmpfs_mount,
     mount_dev: None,
-    file_ops: &super::ramfs::TMPFS_FILE_OPS,
+    file_ops: &super::TMPFS_FILE_OPS,
 };
 
 /// The kernel's own tmpfs (Linux shm_mnt, kern_mount: no limits, in
 /// no mount namespace): memfd_create's files
-static SHM_MNT: spin::Once<Arc<super::mount::Mount>> = spin::Once::new();
+static SHM_MNT: spin::Once<Arc<crate::fs::mount::Mount>> = spin::Once::new();
 
 /// Make the kernel's tmpfs (Linux shmem_init's kern_mount; mnt_init)
 pub fn shmem_init() -> Result<(), KernelError> {
     let sb = tmpfs_mount(&TMPFS_TYPE, b"size=0,nr_inodes=0")?;
     let root = sb.get_root().ok_or(KernelError::Io)?;
-    let m = super::mount::Mount::new(sb, root, 0, b"tmpfs".as_slice().into())?;
+    let m = crate::fs::mount::Mount::new(sb, root, 0, b"tmpfs".as_slice().into())?;
     SHM_MNT.call_once(|| m);
     Ok(())
 }
@@ -541,15 +541,15 @@ pub fn shmem_init() -> Result<(), KernelError> {
 /// An unnamed regular file of `size` bytes on the kernel's tmpfs, open
 /// for reading and writing (Linux shmem_file_setup: mode 0777, a pseudo
 /// dentry `name` that /proc shows as "/<name> (deleted)")
-pub fn shmem_file_setup(name: &[u8], size: u64) -> Result<Arc<super::File>, KernelError> {
-    use super::flags::O_RDWR;
+pub fn shmem_file_setup(name: &[u8], size: u64) -> Result<Arc<crate::fs::File>, KernelError> {
+    use crate::fs::flags::O_RDWR;
     let mnt = SHM_MNT.get().ok_or(KernelError::NoDevice)?.clone();
-    let inode = super::ramfs::new_file(&mnt.sb, 0o777)?;
+    let inode = super::new_file(&mnt.sb, 0o777)?;
     inode.set_size(size);
-    let dentry = super::Dentry::tmpfile_named(&mnt.root, name, inode.clone())?;
+    let dentry = crate::fs::Dentry::tmpfile_named(&mnt.root, name, inode.clone())?;
     let w = mnt.want_write()?;
     let iw = inode.get_write_access()?;
-    let mut f = super::File::new(dentry, Some(mnt), O_RDWR, &super::ramfs::TMPFS_FILE_OPS);
+    let mut f = crate::fs::File::new(dentry, Some(mnt), O_RDWR, &super::TMPFS_FILE_OPS);
     f.write_access = Some(w);
     f.i_write = Some(iw);
     try_arc(f)
@@ -557,7 +557,10 @@ pub fn shmem_file_setup(name: &[u8], size: u64) -> Result<Arc<super::File>, Kern
 
 /// The file of a SysV shm segment or of shared anonymous memory (Linux
 /// shmem_kernel_file_setup / shmem_zero_setup's "dev/zero")
-pub fn shmem_kernel_file_setup(name: &[u8], size: u64) -> Result<Arc<super::File>, KernelError> {
+pub fn shmem_kernel_file_setup(
+    name: &[u8],
+    size: u64,
+) -> Result<Arc<crate::fs::File>, KernelError> {
     shmem_file_setup(name, size)
 }
 
@@ -567,7 +570,7 @@ pub static TMPFS_TYPE: FileSystemType = FileSystemType {
     fs_flags: 0,
     mount: tmpfs_mount,
     mount_dev: None,
-    file_ops: &super::ramfs::TMPFS_FILE_OPS,
+    file_ops: &super::TMPFS_FILE_OPS,
 };
 
 #[cfg(test)]

@@ -35,6 +35,7 @@
 //!   rwsem (write), once per node. Drain waits on `KNode.drain` with no
 //!   lock held, woken when the count reaches the bias.
 
+pub mod sysfs;
 pub mod vfs;
 
 use alloc::collections::BTreeMap;

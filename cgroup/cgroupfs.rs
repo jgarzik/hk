@@ -24,12 +24,12 @@ use alloc::vec::Vec;
 
 use crate::sync::spin::RwLock;
 
-use super::KernelError;
-use super::dentry::Dentry;
-use super::file::{DirContext, DirEntry, File, FileOps, RwFlags, WRITE_CHUNK};
-use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
-use super::iov_iter::{IovDest, IovSource};
-use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
+use crate::fs::KernelError;
+use crate::fs::dentry::Dentry;
+use crate::fs::file::{DirContext, DirEntry, File, FileOps, RwFlags, WRITE_CHUNK};
+use crate::fs::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::fs::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 
 use crate::cgroup::{CGROUP_ROOT, Cgroup, ControllerType, cgroup_init, cgroup_mkdir, cgroup_rmdir};
 use crate::task::Pid;
@@ -842,7 +842,7 @@ fn cgroupfs_mount(
 /// Cgroupfs filesystem type
 pub static CGROUPFS_TYPE: FileSystemType = FileSystemType {
     name: "cgroup2",
-    fs_flags: super::superblock::fs_flags::FS_PSEUDO,
+    fs_flags: crate::fs::superblock::fs_flags::FS_PSEUDO,
     mount: cgroupfs_mount,
     mount_dev: None,
     file_ops: &CGROUPFS_FILE_OPS,

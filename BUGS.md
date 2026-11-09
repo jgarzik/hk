@@ -39,7 +39,7 @@ Most of their blocks belong in a missing wrapper:
 
 ## cgroup controller application gaps
 
-**Location**: `cgroup/mod.rs`, `fs/cgroupfs.rs`
+**Location**: `cgroup/mod.rs`, `cgroup/cgroupfs.rs`
 
 Enabling a controller in cgroup.subtree_control creates its state only
 for cgroups made afterwards (Linux cgroup_apply_control creates it for
@@ -361,7 +361,7 @@ glibc's helper thread), and hk has no such path.
 
 ## sysfs gaps
 
-**Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
+**Location**: `fs/kernfs/`, `fs/kernfs/sysfs.rs`, `base/`, `block/genhd.rs`,
 `net/sysfs.rs`, `hw/pci/driver.rs`
 
 - No power/ directories (Linux dpm_sysfs_add: control, runtime_status,
@@ -559,7 +559,7 @@ ELR/FAR were not captured. Next occurrence: capture the Message line.
 
 ## tmpfs gaps
 
-**Location**: `fs/tmpfs.rs`, `fs/ramfs.rs`
+**Location**: `fs/ramfs/tmpfs.rs`, `fs/ramfs/mod.rs`
 
 tmpfs pages never go to swap (the mapping is unevictable, like ramfs;
 Linux swaps them, and noswap is only recorded). huge= takes only

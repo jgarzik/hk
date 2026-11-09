@@ -18,6 +18,10 @@
 //! File data (`RamfsInodeData.data`) uses RwLock independently for concurrent
 //! read access and exclusive write access during file I/O.
 
+pub mod cpio;
+pub mod devtmpfs;
+pub mod tmpfs;
+
 use alloc::collections::BTreeMap;
 
 use super::name::FileName;

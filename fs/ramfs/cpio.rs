@@ -15,13 +15,13 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::dentry::Dentry;
-use super::inode::{Gid, Inode, InodeMode, Timespec, Uid};
-use super::ramfs::{
+use super::{
     ramfs_create_file_with_timestamp, ramfs_create_symlink_with_timestamp, ramfs_fill_file,
     ramfs_mkpath_with_timestamp,
 };
 use crate::fs::chardev::DevId;
+use crate::fs::dentry::Dentry;
+use crate::fs::inode::{Gid, Inode, InodeMode, Timespec, Uid};
 
 /// The initramfs image (Linux __initramfs_start or initrd_start)
 pub struct Initrd(Image);

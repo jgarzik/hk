@@ -26,9 +26,9 @@ use spin::Once;
 
 use crate::fs::chardev::DevId;
 
-use super::KernelError;
-use super::dentry::Dentry;
-use super::superblock::{FileSystemType, SuperBlock};
+use crate::fs::KernelError;
+use crate::fs::dentry::Dentry;
+use crate::fs::superblock::{FileSystemType, SuperBlock};
 
 /// The internal superblock
 static DEVTMPFS: Once<Arc<SuperBlock>> = Once::new();
@@ -40,7 +40,7 @@ fn root() -> Option<Arc<Dentry>> {
 /// A mount: the one superblock; `opts` only parsed (a bad option fails
 /// the mount)
 fn mount(_t: &'static FileSystemType, opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
-    super::tmpfs::check_opts(opts)?;
+    crate::fs::tmpfs::check_opts(opts)?;
     DEVTMPFS.get().cloned().ok_or(KernelError::NoDevice)
 }
 
@@ -50,7 +50,7 @@ pub static DEVTMPFS_TYPE: FileSystemType = FileSystemType {
     fs_flags: 0,
     mount,
     mount_dev: None,
-    file_ops: &super::ramfs::TMPFS_FILE_OPS,
+    file_ops: &super::TMPFS_FILE_OPS,
 };
 
 /// Create the node `name` for a device (Linux device_add ->
@@ -60,9 +60,9 @@ pub fn device_add(name: &str, dev: DevId, blk: bool, mode: u16) {
     let Some(dir) = root.get_inode() else { return };
     let lock = dir.lock();
     let r = if blk {
-        super::ramfs::ramfs_create_blkdev(&root, name.as_bytes(), dev, mode)
+        super::ramfs_create_blkdev(&root, name.as_bytes(), dev, mode)
     } else {
-        super::ramfs::ramfs_create_chrdev(&root, name.as_bytes(), dev, mode)
+        super::ramfs_create_chrdev(&root, name.as_bytes(), dev, mode)
     };
     drop(lock);
     if let Err(e) = r {
@@ -82,7 +82,7 @@ pub fn device_del(name: &str) {
 
 /// Create the superblock (Linux devtmpfs_init, in driver_init)
 pub fn init() {
-    match super::tmpfs::tmpfs_mount(&DEVTMPFS_TYPE, b"mode=0755") {
+    match crate::fs::tmpfs::tmpfs_mount(&DEVTMPFS_TYPE, b"mode=0755") {
         Ok(sb) => {
             DEVTMPFS.call_once(|| sb);
         }
@@ -91,5 +91,5 @@ pub fn init() {
             return;
         }
     }
-    super::superblock::register_filesystem(&DEVTMPFS_TYPE);
+    crate::fs::superblock::register_filesystem(&DEVTMPFS_TYPE);
 }

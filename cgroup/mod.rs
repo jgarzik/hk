@@ -36,6 +36,8 @@ use crate::util::error::KernelError;
 
 pub mod subsys;
 
+pub mod cgroupfs;
+
 // Re-export controller modules
 pub mod cpu;
 pub mod freezer;

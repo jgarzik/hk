@@ -44,16 +44,17 @@ pub mod stat;
 pub mod sync;
 
 // Filesystem implementations
-pub mod cgroupfs;
-pub mod cpio;
-pub mod devtmpfs;
 pub mod kernfs;
 pub mod nullfs;
 pub mod proc;
 pub mod ramfs;
-pub mod sysfs;
-pub mod tmpfs;
 pub mod vfat;
+// Filesystems kept under their old paths: tmpfs, devtmpfs and the
+// initramfs unpacker live with ramfs, sysfs with kernfs, cgroupfs with
+// the cgroup core
+pub use crate::cgroup::cgroupfs;
+pub use kernfs::sysfs;
+pub use ramfs::{cpio, devtmpfs, tmpfs};
 
 // Re-exports for convenience
 pub use crate::util::error::KernelError;

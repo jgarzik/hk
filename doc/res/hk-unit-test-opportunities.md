@@ -252,7 +252,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   `parse_max_u64(&str) -> Result<Option<u64>>` shared helper is both testable and
   removes duplication.
 - **ramfs fixture**: a test helper that builds a ramfs superblock and root dentry would
-  unlock `fs/cpio.rs` `unpack_cpio` (hard links, overwrite rules), `fs/dac.rs` inode
+  unlock `fs/ramfs/cpio.rs` `unpack_cpio` (hard links, overwrite rules), `fs/dac.rs` inode
   checks, and parts of namei (`walk`, `follow_dotdot`) if `FsStruct` root can be
   injected instead of read from the current task.
 - **vfat on a RAM block device**: cluster-chain and directory code in `fs/vfat.rs`
