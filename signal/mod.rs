@@ -566,13 +566,13 @@ impl AltStack {
     }
 
     /// The stack a handler with `sa_flags` starts on, interrupting `sp`
-    /// (Linux sigsp): the top of this one for SA_ONSTACK unless it is
-    /// absent or already in use
-    pub fn sigsp(&self, sp: u64, sa_flags: u64) -> u64 {
+    /// (Linux sigsp), and whether that enters this one: its top for
+    /// SA_ONSTACK unless it is absent or already in use
+    pub fn sigsp(&self, sp: u64, sa_flags: u64) -> (u64, bool) {
         if sa_flags & sa_flags::SA_ONSTACK != 0 && self.flags_at(sp) == 0 {
-            self.top()
+            (self.top(), true)
         } else {
-            sp
+            (sp, false)
         }
     }
 

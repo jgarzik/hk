@@ -360,7 +360,7 @@ pub fn setup_rt_frame(
 /// `sp` is user-controlled: an underflow or an unwritable range is EFAULT
 /// (the caller forces SIGSEGV), never a wrapped address.
 fn get_sigframe(sp: u64, action: &SigAction, alt: &AltStack) -> KernelResult<(u64, u64)> {
-    let top = alt.sigsp(sp, action.flags);
+    let (top, _) = alt.sigsp(sp, action.flags);
     let record = top
         .checked_sub(16)
         .map(|a| a & !(SIGNAL_FRAME_ALIGN - 1))

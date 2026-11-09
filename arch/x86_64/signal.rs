@@ -350,9 +350,8 @@ pub fn setup_rt_frame(
 /// overflow the alternate stack it is on or enters.
 fn get_sigframe(rsp: u64, action: &SigAction, alt: &AltStack) -> KernelResult<(u64, u64)> {
     let nested = alt.on(rsp);
-    let red = rsp.wrapping_sub(128);
-    let entering = action.flags & sa_flags::SA_ONSTACK != 0 && alt.flags_at(red) == 0;
-    let sp = if entering { alt.top() } else { red };
+    // Below the red zone, or the alternate stack
+    let (sp, entering) = alt.sigsp(rsp.wrapping_sub(128), action.flags);
     let fpstate = sp
         .checked_sub(super::fpu::sigframe_size() as u64)
         .map(|a| a & !63)
