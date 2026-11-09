@@ -254,7 +254,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 7.1 Pipes & simple IPC
 
 - [x] pipe (x86-64 only, legacy; use pipe2)
-- [x] pipe2
+- [x] pipe2 (O_CLOEXEC, O_NONBLOCK, O_DIRECT: packet mode, also by F_SETFL on a pipe or FIFO)
 - [x] eventfd (x86-64 only, legacy; use eventfd2)
 - [x] eventfd2
 - [x] pidfd_open (PIDFD_NONBLOCK, PIDFD_THREAD)

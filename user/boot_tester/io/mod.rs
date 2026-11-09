@@ -14,6 +14,7 @@ pub mod gencalls;
 pub mod io_uring;
 pub mod nonblock;
 pub mod nr_open;
+pub mod pipe_packet;
 pub mod poll;
 pub mod pollperm;
 pub mod sigio;

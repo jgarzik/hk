@@ -251,7 +251,7 @@ pub fn sys_pipe(pipefd: UserPtr<[i32; 2]>) -> KernelResult<()> {
 ///
 /// # Arguments
 /// * `pipefd` - Pointer to int[2] array
-/// * `flags` - O_CLOEXEC | O_NONBLOCK
+/// * `flags` - O_CLOEXEC | O_NONBLOCK | O_DIRECT (packet mode)
 ///
 /// # Returns
 /// * 0 on success
@@ -259,11 +259,11 @@ pub fn sys_pipe(pipefd: UserPtr<[i32; 2]>) -> KernelResult<()> {
 /// * -EINVAL if invalid flags
 /// * -EMFILE if too many file descriptors
 pub fn sys_pipe2(pipefd: UserPtr<[i32; 2]>, flags: u32) -> KernelResult<()> {
-    use crate::fs::file::flags::{O_CLOEXEC, O_NONBLOCK};
+    use crate::fs::file::flags::{O_CLOEXEC, O_DIRECT, O_NONBLOCK};
     use crate::io::pipe::{FD_CLOEXEC, create_pipe};
 
-    // Validate flags - only O_CLOEXEC and O_NONBLOCK are allowed
-    const VALID_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
+    // Linux do_pipe2 (no O_NOTIFICATION_PIPE: no watch queues)
+    const VALID_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK | O_DIRECT;
     if flags & !VALID_FLAGS != 0 {
         return Err(KernelError::InvalidArgument);
     }
@@ -273,7 +273,7 @@ pub fn sys_pipe2(pipefd: UserPtr<[i32; 2]>, flags: u32) -> KernelResult<()> {
         return Err(KernelError::BadAddress);
     }
 
-    let (read_file, write_file) = create_pipe(flags & O_NONBLOCK)?;
+    let (read_file, write_file) = create_pipe(flags & (O_NONBLOCK | O_DIRECT))?;
 
     // Allocate file descriptors (RLIMIT_NOFILE enforced inside alloc)
     // Following Linux pattern: each get_unused_fd_flags() call checks limit
