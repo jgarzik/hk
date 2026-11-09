@@ -103,21 +103,24 @@ pub fn sys_rt_sigaction(
         let old = sighand.get_action(sig);
         return write_oact(oact, &old);
     };
-    // Decided on the action this call installs, not on a later read of
-    // the table, which another thread's sigaction may have changed
-    // since (Linux do_sigaction decides in the same siglock hold). The
-    // flush and the timers take TASKLIST and Task.sig, which come
-    // before the leaf SigHand.action, so they act after it is dropped.
-    let ignores = new.ignores(sig);
-    // The old action and the swap in one hold of the action lock
-    let old = sighand.set_action(sig, new)?;
-    // Ignored now: discarded pending; no longer ignored: interval timers
-    // whose signal it ignored queue it (Linux do_sigaction)
-    if ignores {
-        crate::signal::flush_group_signal(sig);
-    } else if old.is_ignore() {
-        crate::time::posix_timer::sig_unignore(sig);
-    }
+    // The install and its flush as one step for other sigactions on
+    // this table (Linux do_sigaction holds siglock across both): none
+    // can install a handler, and let a signal be queued for it, before
+    // this flush has run. A send meanwhile sees the new action.
+    let old = {
+        let _update = sighand.lock_update();
+        let ignores = new.ignores(sig);
+        // The old action and the swap in one hold of the action lock
+        let old = sighand.set_action(sig, new)?;
+        // Ignored now: discarded pending; no longer ignored: interval
+        // timers whose signal it ignored queue it (Linux do_sigaction)
+        if ignores {
+            crate::signal::flush_group_signal(sig);
+        } else if old.is_ignore() {
+            crate::time::posix_timer::sig_unignore(sig);
+        }
+        old
+    };
     write_oact(oact, &old)
 }
 

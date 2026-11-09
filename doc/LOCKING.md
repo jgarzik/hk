@@ -407,7 +407,8 @@ Network locks (3.10 Network Subsystem has the full order):
     network lock or under `Files`/TASKLIST (3.3, 3.1.1).
 
 Tasks (3.1.1, 3.7; Linux tasklist_lock → pidmap_lock → task_lock →
-    siglock): TASKLIST (spin RwLock, thread context; also guards the
+    siglock): SigHand.update (sleeping Mutex, rt_sigaction only,
+    taken with no lock held) → TASKLIST (spin RwLock, thread context; also guards the
     `Pid.pgrp`/`session` lists, 3.1.1) → PIDMAP_LOCK
     (spin, thread context; hash chains; in practice a leaf) →
     Task.alloc_lock (spin Mutex, per task, thread context, not
@@ -1142,7 +1143,7 @@ from `Task.se`.
 |------------|---------|---------------|
 | `alloc_lock` (task_lock) | mm, files, fs, nsproxy, comm, mempolicy, io_context | `Task.alloc_lock` (spin Mutex, per task) |
 | `pi_lock` | Wakeups, state | `Task.pi_lock` (IrqSpinlock, per task; 3.1) |
-| `sighand->siglock` | Signal state, handlers | `Task.sig`, `SignalStruct.shared` (spin Mutex), `SigHand.action` (IrqSpinlock; 3.7) |
+| `sighand->siglock` | Signal state, handlers | `Task.sig`, `SignalStruct.shared` (spin Mutex), `SigHand.action` (IrqSpinlock), `SigHand.update` (sleeping Mutex, sigaction's install and flush; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
 | RCU (`cred`) | Credentials | lock-free for the task, TASKLIST for others |
 
@@ -2863,6 +2864,7 @@ state patterns.
 | `SignalStruct.shared` | `spin::Mutex<GroupPending>`, reached through `TaskSignalState.shared_pending` (the task's `Arc<SignalStruct>`); a flush on SIG_IGN (`flush_group_signal`) takes it alone, through the group's `SignalStruct` | Thread-group pending set and curr_target (Linux signal->shared_pending, curr_target) |
 | `SigPending` list | `Option<Box<SigQueue>>` under the set's lock | Queued siginfo (Linux sigpending.list of struct sigqueue) |
 | `SigHand.action` | `IrqSpinlock<Box<[SigAction]>>` (64 entries, `Signal::idx`) | Signal handler table |
+| `SigHand.update` | sleeping `sync::Mutex<()>`, thread context only (never from IRQ) | rt_sigaction's install of an action and the pending flush or timer requeue it makes, as one step for the table's other sigactions (Linux siglock held across do_sigaction). Outermost of the signal locks: taken with no lock held, before TASKLIST, `Task.sig`, `SignalStruct.shared`, `SignalStruct.posix_timers` and `SigHand.action`; never nested with itself (one lockdep class) |
 | `SignalStruct.rlim` | `IrqSpinlock<[RLimit; N]>` | Resource limits (leaf) |
 | `SignalStruct.subreaper` | `TableCell<bool>` (TASKLIST) | PR_SET_CHILD_SUBREAPER (Linux signal->is_child_subreaper): set by any thread under the write lock, read under the read lock by prctl and by the reparenting it decides (`find_reaper`, in `forget_original_parent`'s write section) |
 | `SignalStruct.unkillable` | `AtomicBool`, no lock | A pid namespace's init (Linux SIGNAL_UNKILLABLE): set before the group is visible (fork of a process numbered 1 in its namespace, the global init at boot), cleared once when the kernel forces a SIG_DFL signal on it; read by a send (`Target::protects`), CLONE_PARENT and delivery. A monotonic flag no other state is ordered with |
@@ -2947,6 +2949,8 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 #### Lock Order for Signal Operations
 
 ```
+0. SigHand.update (sleeping Mutex; rt_sigaction only, never nested)
+   ↓
 1. TASKLIST (Task.sighand; read lock to find a task)
    ↓
 2. Task.sig (spin Mutex, per task)
@@ -2986,16 +2990,18 @@ child.shared_pending = SharedPending(Some(signal.clone()));
 **rt_sigaction(2):** Get/set signal handlers:
 ```rust
 let sighand = get_task_sighand(&current())?;  // cloned out under TASKLIST
-let ignores = new.ignores(sig);          // decided on the action installed
+let _update = sighand.lock_update();     // SigHand.update (sleeping)
 let old = sighand.set_action(sig, new);  // SigHand.action (IrqSpinlock),
                                          // one hold: actions[sig.idx()]
-if ignores { flush_group_signal(sig) }   // TASKLIST, Task.sig: after
-else if old.is_ignore() { sig_unignore(sig) }
+if new.ignores(sig) { flush_group_signal(sig) }  // TASKLIST, Task.sig,
+else if old.is_ignore() { sig_unignore(sig) }    // SignalStruct.shared
+drop(_update);                           // then oact is written
 ```
-Linux decides and flushes in one siglock hold; hk decides on the action
-it installed (never a later read another thread's sigaction may have
-changed) and flushes after the leaf `SigHand.action` is dropped, since
-the flush takes TASKLIST and `Task.sig`, which come before it.
+As Linux do_sigaction under siglock, the install and its flush are one
+step for every other sigaction on the table: a second thread's install
+waits on `SigHand.update` until the flush is done, so no signal queued
+for its handler is discarded. A send between the install and the flush
+already sees the new action (`sig_ignored`) and is dropped, as in Linux.
 
 **rt_sigprocmask(2):** Modify blocked mask:
 ```rust

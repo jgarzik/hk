@@ -359,6 +359,12 @@ pub struct SigHand {
     /// action[sig - 1]), built in the heap: the array moved through
     /// fork's stack frames used ~9 KB of the 16 KB kernel stack
     action: IrqSpinlock<Box<[SigAction]>>,
+    /// Serializes sigaction's change of an action with the flush of
+    /// pending signals that change makes (Linux holds siglock across
+    /// both in do_sigaction): a thread's install waits until another's
+    /// flush is done. Sleeping (the flush allocates and frees queue
+    /// entries); taken before TASKLIST and every signal spin lock
+    update: crate::sync::Mutex<()>,
     /// Readers and pollers of a signalfd among the tasks sharing this
     /// table (Linux sighand->signalfd_wqh): woken by every signal sent
     /// to one of them
@@ -378,6 +384,7 @@ impl SigHand {
     pub fn new() -> Self {
         Self {
             action: IrqSpinlock::new(default_actions()),
+            update: crate::sync::Mutex::new(()),
             signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
             users: crate::task::TableCell::new(0),
         }
@@ -415,6 +422,12 @@ impl SigHand {
         (ign, cgt)
     }
 
+    /// Hold off other sigaction changes of this table while the caller
+    /// changes an action and flushes what it now ignores
+    pub fn lock_update(&self) -> crate::sync::MutexGuard<'_, ()> {
+        self.update.lock()
+    }
+
     /// Set `sig`'s action; the old one, or EINVAL for SIGKILL and
     /// SIGSTOP, whose action cannot change (Linux do_sigaction)
     pub fn set_action(&self, sig: Signal, action: SigAction) -> Result<SigAction, KernelError> {
@@ -434,6 +447,7 @@ impl SigHand {
         actions.clone_from_slice(&self.action.lock());
         try_arc(Self {
             action: IrqSpinlock::new(actions),
+            update: crate::sync::Mutex::new(()),
             signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
             users: crate::task::TableCell::new(0),
         })
