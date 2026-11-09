@@ -3380,8 +3380,10 @@ Generic interface (`crate::irq`): `request_irq(irq, Arc<T: IrqHandler>)
 -> IrqRegistration<T>` (shareable; the handler's address is its Linux
 dev_id, the same handler twice on a line is EBUSY; `IrqFn` wraps a
 stateless fn). The registration points at its line's descriptor; dropping
-it removes the handler, and the line's reference is dropped after the
-lock. Drivers stop their device interrupting before dropping it (INTx
+it removes the handler. Nothing allocates or frees under `IrqDesc.lock`:
+the handler's list node (Linux irqaction, in an intrusive `BoxList`) is
+allocated before the lock, and a removed or refused one is freed after
+it. Drivers stop their device interrupting before dropping it (INTx
 stays enabled at the device, as Linux free_irq leaves it). Lockdep does
 not track `IrqSpinlock` classes, so the per-line locks are covered by the
 rule that no code nests two of them. `pci_intx_irq(bus, dev, fn, pin,

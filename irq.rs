@@ -24,16 +24,19 @@
 //! under it (Linux irq_startup/irq_shutdown under desc->lock), and so do
 //! the handlers: once a registration's drop returns its handler is not
 //! running (Linux free_irq's synchronize_irq). Handlers must not request
-//! or free IRQs. The line's reference to a freed handler is dropped
-//! after unlocking.
+//! or free IRQs. Nothing allocates or frees under it: a handler's list
+//! node (Linux irqaction) is allocated before the lock is taken, and a
+//! removed or refused one is freed after unlocking.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use crate::arch::{CurrentArch, IrqChipOps};
 use crate::sync::IrqSpinlock;
 use crate::util::error::{KernelError, KernelResult};
+use crate::util::kalloc::try_box;
+use crate::util::list::{BoxList, Link};
 
 /// Whether a handler's device raised the interrupt (Linux irqreturn_t)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +123,7 @@ impl<T: IrqHandler + 'static, C: IrqChipOps + 'static> IrqRegistration<T, C> {
 
 impl<T: IrqHandler + 'static, C: IrqChipOps + 'static> Drop for IrqRegistration<T, C> {
     fn drop(&mut self) {
-        // Released here, with the line unlocked
+        // Freed here, with the line unlocked
         drop(self.desc.free(self.irq, cookie(&self.handler)));
     }
 }
@@ -130,25 +133,40 @@ fn cookie<T: ?Sized>(h: &Arc<T>) -> *const () {
     Arc::as_ptr(h).cast()
 }
 
-/// A line's handlers (Linux irqaction list) and unclaimed-interrupt
+/// One handler on a line (Linux irqaction): allocated before the
+/// line's lock is taken, so adding it never allocates under the lock
+struct IrqAction {
+    link: Link,
+    handler: Arc<dyn IrqHandler>,
+}
+
+crate::adapter!(ActionAdapter, IrqAction, link);
+
+impl IrqAction {
+    fn is(&self, cookie: *const ()) -> bool {
+        self::cookie(&self.handler) == cookie
+    }
+}
+
+/// A line's handlers (Linux irqaction chain) and unclaimed-interrupt
 /// state, under its descriptor's lock
 struct Line {
-    actions: Vec<Arc<dyn IrqHandler>>,
+    actions: BoxList<ActionAdapter>,
     spurious: Spurious,
 }
 
 impl Line {
-    fn find(&self, cookie: *const ()) -> Option<usize> {
-        self.actions.iter().position(|h| self::cookie(h) == cookie)
+    fn has(&self, cookie: *const ()) -> bool {
+        self.actions.iter().any(|a| a.is(cookie))
     }
 
     /// Every handler of a shared line gets a look; true if one claimed
     /// it (Linux __handle_irq_event_percpu)
     fn run(&self, irq: u32) -> bool {
         let mut handled = false;
-        for h in &self.actions {
+        for a in self.actions.iter() {
             crate::sync::lockdep::irq_enter();
-            handled |= h.handle(irq) == IrqReturn::Handled;
+            handled |= a.handler.handle(irq) == IrqReturn::Handled;
             crate::sync::lockdep::irq_exit();
         }
         handled
@@ -165,23 +183,21 @@ impl<C: IrqChipOps> IrqDesc<C> {
     const fn new() -> Self {
         Self {
             lock: IrqSpinlock::new(Line {
-                actions: Vec::new(),
+                actions: BoxList::new(),
                 spurious: Spurious::new(),
             }),
             _chip: PhantomData,
         }
     }
 
-    /// Linux __setup_irq: the first handler starts the line
-    fn add(&self, irq: u32, h: Arc<dyn IrqHandler>) -> KernelResult<()> {
+    /// Linux __setup_irq: the first handler starts the line. A handler
+    /// already on it: its node comes back to be freed unlocked
+    fn add(&self, irq: u32, a: Box<IrqAction>) -> Result<(), Box<IrqAction>> {
         let mut line = self.lock.lock();
-        if line.find(cookie(&h)).is_some() {
-            return Err(KernelError::Busy);
+        if line.has(cookie(&a.handler)) {
+            return Err(a);
         }
-        line.actions
-            .try_reserve(1)
-            .map_err(|_| KernelError::OutOfMemory)?;
-        line.actions.push(h);
+        line.actions.push_back(a);
         line.spurious.reset();
         if line.actions.len() == 1 {
             C::irq_unmask(irq);
@@ -189,16 +205,15 @@ impl<C: IrqChipOps> IrqDesc<C> {
         Ok(())
     }
 
-    /// Linux __free_irq: the last handler shuts the line down; its
-    /// reference comes back for the caller to drop unlocked
-    fn free(&self, irq: u32, cookie: *const ()) -> Option<Arc<dyn IrqHandler>> {
+    /// Linux __free_irq: the last handler shuts the line down; its node
+    /// comes back for the caller to free unlocked
+    fn free(&self, irq: u32, cookie: *const ()) -> Option<Box<IrqAction>> {
         let mut line = self.lock.lock();
-        let i = line.find(cookie)?;
-        let h = line.actions.remove(i);
+        let a = line.actions.remove_first(|a| a.is(cookie))?;
         if line.actions.is_empty() {
             C::irq_mask(irq);
         }
-        Some(h)
+        Some(a)
     }
 
     /// Linux handle_irq_event + note_interrupt; `now_ns` is read only
@@ -240,7 +255,12 @@ impl<C: IrqChipOps + 'static, const N: usize> IrqTable<C, N> {
         handler: Arc<T>,
     ) -> KernelResult<IrqRegistration<T, C>> {
         let desc = self.desc(irq)?;
-        desc.add(irq, handler.clone())?;
+        let a = try_box(IrqAction {
+            link: Link::new(),
+            handler: handler.clone(),
+        })?;
+        // A refused node is freed here, unlocked
+        desc.add(irq, a).map_err(|_| KernelError::Busy)?;
         Ok(IrqRegistration { handler, irq, desc })
     }
 
@@ -403,6 +423,8 @@ mod tests {
         let d = dev(IrqReturn::Handled);
         let r = TABLE.request(9, d.clone()).unwrap();
         assert_eq!(TABLE.request(9, d.clone()).err(), Some(KernelError::Busy));
+        // The refused node and its reference are gone
+        assert_eq!(Arc::strong_count(&d), 3);
         let r2 = TABLE.request(10, d.clone()).unwrap();
         drop((r, r2));
         assert!(!unmasked(9) && !unmasked(10));
