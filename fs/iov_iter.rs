@@ -13,7 +13,6 @@
 //! the source in first (`fault_in`), then copy with `copy_from_nofault`
 //! (Linux generic_perform_write).
 
-use crate::arch::Uaccess;
 use crate::uaccess::{
     copy_from_user_atomic_some, copy_from_user_some, copy_to_user_some, fault_in_readable,
     pagefault_disable, pagefault_enable,
@@ -84,7 +83,7 @@ impl<'a> Segs<'a> {
                 break;
             };
             let n = (s.iov_len as usize - off).min(want);
-            let left = fault_in_readable::<Uaccess>(s.iov_base + off as u64, n);
+            let left = fault_in_readable(s.iov_base + off as u64, n);
             if left > 0 {
                 return want - n + left;
             }
@@ -158,7 +157,7 @@ impl<'a> IovDest<'a> {
     pub fn copy_to(&mut self, data: &[u8]) -> Result<usize, KernelError> {
         let n = match &mut self.0 {
             Dest::User(s) => s.step(data.len(), &mut |a, n, at| {
-                copy_to_user_some::<Uaccess>(a, &data[at..at + n])
+                copy_to_user_some(a, &data[at..at + n])
             }),
             Dest::Kernel(b) => {
                 let n = data.len().min(b.len());
@@ -271,7 +270,7 @@ impl<'a> IovSource<'a> {
         match &mut self.0 {
             Source::User(s) => s.step(buf.len(), &mut |a, n, at| {
                 pagefault_disable();
-                let c = copy_from_user_some::<Uaccess>(&mut buf[at..at + n], a);
+                let c = copy_from_user_some(&mut buf[at..at + n], a);
                 pagefault_enable();
                 c
             }),
@@ -286,7 +285,7 @@ impl<'a> IovSource<'a> {
         let want = buf.len();
         let n = match &mut self.0 {
             Source::User(s) => s.step(want, &mut |a, n, at| {
-                copy_from_user_atomic_some::<Uaccess>(&mut buf[at..at + n], a)
+                copy_from_user_atomic_some(&mut buf[at..at + n], a)
             }),
             Source::Kernel(b, at) => {
                 let n = want.min(b.len() - *at);

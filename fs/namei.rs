@@ -408,11 +408,10 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
 /// unless `empty_ok` (AT_EMPTY_PATH)
 pub fn getname(ptr: UserPtr<u8>, empty_ok: bool) -> Result<Vec<u8>, KernelError> {
     use crate::uaccess::{UaccessError, strndup_user_bytes};
-    let name =
-        strndup_user_bytes::<crate::arch::Uaccess>(ptr.addr(), PATH_MAX).map_err(|e| match e {
-            UaccessError::TooLong => KernelError::NameTooLong,
-            _ => KernelError::BadAddress,
-        })?;
+    let name = strndup_user_bytes(ptr.addr(), PATH_MAX).map_err(|e| match e {
+        UaccessError::TooLong => KernelError::NameTooLong,
+        _ => KernelError::BadAddress,
+    })?;
     if name.is_empty() && !empty_ok {
         return Err(KernelError::NotFound);
     }

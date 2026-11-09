@@ -10,7 +10,7 @@
 //! - getcpu
 
 use super::percpu::{TaskRef, current_tid};
-use crate::uaccess::UserPtr;
+use crate::uaccess::{UserPtr, access_ok};
 use crate::util::error::{KernelError, KernelResult};
 
 use super::{SchedParam, Task};
@@ -30,22 +30,18 @@ use crate::time::time_syscall::LinuxTimespec;
 /// # Locking
 /// None required - reads per-CPU data which is stable during syscall execution.
 /// This matches Linux's implementation which uses raw_smp_processor_id().
-pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(
-    cpu: u32,
-    cpup: UserPtr<u32>,
-    nodep: UserPtr<u32>,
-) -> KernelResult<()> {
+pub fn sys_getcpu(cpu: u32, cpup: UserPtr<u32>, nodep: UserPtr<u32>) -> KernelResult<()> {
     use crate::mm::numa::NUMA_TOPOLOGY;
     use crate::uaccess::put_user;
 
     // Write CPU number if pointer provided
     if !cpup.is_null() {
-        put_user::<A, u32>(cpup.addr(), cpu)?;
+        put_user::<u32>(cpup.addr(), cpu)?;
     }
     // Write NUMA node if pointer provided, from the topology
     if !nodep.is_null() {
         let node = NUMA_TOPOLOGY.lock().cpu_to_node(cpu);
-        put_user::<A, u32>(nodep.addr(), node)?;
+        put_user::<u32>(nodep.addr(), node)?;
     }
     Ok(())
 }
@@ -233,7 +229,7 @@ pub fn sys_sched_getscheduler(pid: i64) -> KernelResult<i64> {
 ///
 /// # Locking
 /// Acquires TASKLIST lock to modify policy.
-pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
+pub fn sys_sched_setscheduler(
     pid: i64,
     policy: i32,
     param_ptr: UserPtr<SchedParam>,
@@ -249,7 +245,7 @@ pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
     if param_ptr.is_null() {
         return Err(KernelError::InvalidArgument);
     }
-    let param: SchedParam = get_user::<A, SchedParam>(param_ptr.addr())?;
+    let param: SchedParam = get_user::<SchedParam>(param_ptr.addr())?;
 
     // Validate policy
     if !super::is_valid_policy(policy) {
@@ -347,10 +343,7 @@ fn check_setscheduler(
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read parameters.
-pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
-    pid: i64,
-    param_ptr: UserPtr<SchedParam>,
-) -> KernelResult<()> {
+pub fn sys_sched_getparam(pid: i64, param_ptr: UserPtr<SchedParam>) -> KernelResult<()> {
     use crate::uaccess::put_user;
 
     // pid < 0 is invalid
@@ -362,7 +355,7 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
     if param_ptr.is_null() {
         return Err(KernelError::InvalidArgument);
     }
-    if !A::access_ok(param_ptr.addr(), core::mem::size_of::<SchedParam>()) {
+    if !access_ok(param_ptr.addr(), core::mem::size_of::<SchedParam>()) {
         return Err(KernelError::BadAddress);
     }
 
@@ -375,7 +368,7 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
         sched_priority: rt_prio,
     };
 
-    put_user::<A, SchedParam>(param_ptr.addr(), param)?;
+    put_user::<SchedParam>(param_ptr.addr(), param)?;
     Ok(())
 }
 
@@ -399,10 +392,7 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
 ///
 /// # Locking
 /// Acquires TASKLIST lock to modify parameters.
-pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
-    pid: i64,
-    param_ptr: UserPtr<SchedParam>,
-) -> KernelResult<()> {
+pub fn sys_sched_setparam(pid: i64, param_ptr: UserPtr<SchedParam>) -> KernelResult<()> {
     use crate::uaccess::get_user;
 
     // pid < 0 is invalid
@@ -414,7 +404,7 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
     if param_ptr.is_null() {
         return Err(KernelError::InvalidArgument);
     }
-    let param: SchedParam = get_user::<A, SchedParam>(param_ptr.addr())?;
+    let param: SchedParam = get_user::<SchedParam>(param_ptr.addr())?;
 
     let t = sched_target(pid)?;
 
@@ -448,7 +438,7 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read affinity mask.
-pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
+pub fn sys_sched_getaffinity(
     pid: i64,
     cpusetsize: u64,
     mask_ptr: UserPtr<u8>,
@@ -480,7 +470,7 @@ pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
     for w in mask.words() {
         bytes.extend_from_slice(&w.to_ne_bytes());
     }
-    copy_to_user::<A>(mask_ptr.addr(), &bytes[..len])?;
+    copy_to_user(mask_ptr.addr(), &bytes[..len])?;
     Ok(len as i64)
 }
 
@@ -510,11 +500,7 @@ fn cpumask_size() -> usize {
 ///
 /// # Locking
 /// Acquires TASKLIST lock to modify affinity mask.
-pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
-    pid: i64,
-    cpusetsize: u64,
-    mask_ptr: UserPtr<u8>,
-) -> KernelResult<()> {
+pub fn sys_sched_setaffinity(pid: i64, cpusetsize: u64, mask_ptr: UserPtr<u8>) -> KernelResult<()> {
     use crate::uaccess::copy_from_user;
 
     // pid < 0 is invalid
@@ -526,7 +512,7 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
     // (Linux get_user_cpu_mask)
     let len = (cpusetsize as usize).min(cpumask_size());
     let mut bytes = alloc::vec![0u8; cpumask_size()];
-    copy_from_user::<A>(&mut bytes[..len], mask_ptr.addr(), len)?;
+    copy_from_user(&mut bytes[..len], mask_ptr.addr(), len)?;
     let words: alloc::vec::Vec<u64> = bytes
         .as_chunks::<8>()
         .0
@@ -570,10 +556,7 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read policy.
-pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
-    pid: i64,
-    tp_ptr: UserPtr<LinuxTimespec>,
-) -> KernelResult<()> {
+pub fn sys_sched_rr_get_interval(pid: i64, tp_ptr: UserPtr<LinuxTimespec>) -> KernelResult<()> {
     use crate::uaccess::put_user;
 
     // pid < 0 is invalid
@@ -585,7 +568,7 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
     if tp_ptr.is_null() {
         return Err(KernelError::InvalidArgument);
     }
-    if !A::access_ok(tp_ptr.addr(), core::mem::size_of::<LinuxTimespec>()) {
+    if !access_ok(tp_ptr.addr(), core::mem::size_of::<LinuxTimespec>()) {
         return Err(KernelError::BadAddress);
     }
 
@@ -604,7 +587,7 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
 
     let ts = LinuxTimespec::from_ns(time_slice_ns);
 
-    put_user::<A, LinuxTimespec>(tp_ptr.addr(), ts)?;
+    put_user::<LinuxTimespec>(tp_ptr.addr(), ts)?;
     Ok(())
 }
 

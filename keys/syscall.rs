@@ -5,7 +5,6 @@
 //! - request_key: Search for a key, optionally requesting construction
 //! - keyctl: Multiplex control operations on keys
 
-use crate::arch::Uaccess;
 use crate::task::percpu;
 use crate::uaccess::{UserPtr, UserSlice, strncpy_from_user_str};
 use crate::util::error::{KernelError, KernelResult};
@@ -27,7 +26,7 @@ const MAX_PAYLOAD_SIZE: usize = 1024 * 1024 - 1;
 /// over-long string included, is EFAULT here (Linux: EINVAL when too
 /// long)
 pub(super) fn user_str(p: UserPtr<u8>, max: usize) -> KernelResult<alloc::string::String> {
-    strncpy_from_user_str::<Uaccess>(p.addr(), max).map_err(|_| KernelError::BadAddress)
+    strncpy_from_user_str(p.addr(), max).map_err(|_| KernelError::BadAddress)
 }
 
 /// add_key(type, description, payload, plen, keyring): a new key of

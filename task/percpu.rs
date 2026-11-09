@@ -50,11 +50,10 @@ fn do_clear_child_tid(me: &Task) {
     };
 
     if let Some(addr) = addr {
-        use crate::arch::Uaccess;
         use crate::uaccess::put_user;
 
         // Write 0 to the address
-        if put_user::<Uaccess, i32>(addr, 0).is_ok() {
+        if put_user::<i32>(addr, 0).is_ok() {
             // Wake one waiter, shared (Linux mm_release)
             let _ = crate::task::futex::futex_wake(
                 addr,
@@ -2660,9 +2659,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Handle CLONE_PARENT_SETTID: write child TID to parent's address space
     if config.flags & CLONE_PARENT_SETTID != 0 && config.parent_tidptr != 0 {
-        use crate::arch::Uaccess;
         use crate::uaccess::put_user;
-        if put_user::<Uaccess, i32>(config.parent_tidptr, child_vnr as i32).is_err() {
+        if put_user::<i32>(config.parent_tidptr, child_vnr as i32).is_err() {
             // Continue even if write fails - Linux does the same
             printkln!("CLONE: CLONE_PARENT_SETTID write failed");
         }
@@ -2675,10 +2673,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         if config.flags & CLONE_VM != 0 {
             // Shared address space - write directly, the child's own
             // number in its namespace (Linux schedule_tail writes it)
-            use crate::arch::Uaccess;
+
             use crate::uaccess::put_user;
             let own = crate::task::pid::nr_ns(child_tid, child_task.pid_ns()) as i32;
-            if put_user::<Uaccess, i32>(config.child_tidptr, own).is_err() {
+            if put_user::<i32>(config.child_tidptr, own).is_err() {
                 printkln!("CLONE: CLONE_CHILD_SETTID write failed");
             }
         } else {
@@ -2746,7 +2744,7 @@ fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Kerne
     let fd = files
         .lock()
         .alloc_with_flags(file, crate::task::FD_CLOEXEC, nofile)?;
-    if crate::uaccess::put_user::<crate::arch::Uaccess, i32>(ptr, fd).is_err() {
+    if crate::uaccess::put_user::<i32>(ptr, fd).is_err() {
         // Released after the table lock (FilesGuard)
         files.lock().close(fd);
         return Err(KernelError::BadAddress);
@@ -4311,12 +4309,11 @@ pub extern "C" fn write_child_tid_if_needed() {
         return;
     }
     if let Some(addr) = crate::task::get_set_child_tid(&me) {
-        use crate::arch::Uaccess;
         use crate::uaccess::put_user;
         // Its own number, in its namespace (Linux schedule_tail:
         // task_pid_vnr(current))
         let nr = crate::task::pid::vnr(me.tid()) as i32;
-        if put_user::<Uaccess, i32>(addr, nr).is_err() {
+        if put_user::<i32>(addr, nr).is_err() {
             printkln!("CLONE: CLONE_CHILD_SETTID write failed in child");
         }
     }

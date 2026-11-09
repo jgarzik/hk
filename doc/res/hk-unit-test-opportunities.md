@@ -43,11 +43,10 @@ Stubs in place:
 - Ad hoc cfg(test) shims in `mm/ptl.rs`, `mm/anon_vma.rs`, `mm/page_alloc.rs`,
   `mm/xarray.rs`, `mm/slab.rs`, `net/inet/port.rs`.
 - `SkBuff::alloc` works on the host (used by `net/skb.rs` tests).
+- User memory: under test, uaccess copies through host memory (`HostUaccess`):
+  a user address is a host pointer.
 
 Blocks:
-- User memory: `copy_from_user`/`get_user`/`put_user` go through the arch
-  `UaccessArch` impls; there is no host impl, so anything that copies from a user
-  pointer is out (29 functions are already generic over `A: UaccessArch`).
 - Page tables, `FRAME_ALLOCATOR`, TLB, fault handling.
 - Sleeping: `wait_event*`, `schedule`, blocking paths (non-blocking paths are fine).
 - Device registers, port I/O, MMIO, CMOS, PCI config.
@@ -242,11 +241,6 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
 
 ## Near-misses (need a pure core split out)
 
-- **Host `UaccessArch`** (`uaccess.rs:101` trait): a `#[cfg(test)]` impl whose
-  `access_ok` accepts addresses inside a registered test buffer and whose
-  `copy_user_raw` is a plain copy would unlock every `fn x<A: UaccessArch>` (29 of
-  them: seccomp `create_filter_from_user`, getresuid, sysinfo, capget/capset,
-  getrusage, syslog...). Biggest single enabler.
 - **Credential transitions** (`task/id.rs:86-590` `sys_set*id`): permission checks call
   `capable()` and then commit through per-CPU state. Split into
   `fn setresuid_new(old: &Cred, r, e, s, cap_setuid: bool) -> Result<Cred, KernelError>`

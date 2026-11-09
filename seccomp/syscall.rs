@@ -68,8 +68,6 @@ fn set_seccomp_strict() -> KernelResult<()> {
 /// every thread of the group (Linux SECCOMP_FILTER_FLAG_TSYNC): 0, or
 /// with TSYNC the tid of a thread that cannot take it
 fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> KernelResult<i64> {
-    use crate::arch::Uaccess;
-
     if fprog.is_null() {
         return Err(KernelError::InvalidArgument);
     }
@@ -106,8 +104,7 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
             return Err(KernelError::PermissionDenied);
         }
 
-        let new_filter =
-            create_filter_from_user::<Uaccess>(fprog.addr(), existing_filter.clone(), log)?;
+        let new_filter = create_filter_from_user(fprog.addr(), existing_filter.clone(), log)?;
         let table = TASKLIST.write();
         let me = table.view(&cur).ok_or(KernelError::NoProcess)?;
         let same = match (me.seccomp_filter(), &existing_filter) {

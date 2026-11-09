@@ -3,7 +3,6 @@
 //! Implements get_mempolicy, set_mempolicy, mbind, migrate_pages, and move_pages.
 //! Uses the NUMA topology discovered from ACPI SRAT (x86-64) or device tree (aarch64).
 
-use crate::arch::Uaccess;
 use crate::mm::numa::NUMA_TOPOLOGY;
 use crate::uaccess::{UserPtr, access_ok, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
@@ -179,7 +178,7 @@ pub fn sys_get_mempolicy(
         let mut words = alloc::vec![0u64; (mask_bytes / 8) as usize];
         words[0] = online_mask;
         let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        copy_to_user::<Uaccess>(nmask_ptr.addr(), &bytes)?;
+        copy_to_user(nmask_ptr.addr(), &bytes)?;
     }
 
     Ok(())

@@ -10,7 +10,6 @@
 
 use alloc::sync::Arc;
 
-use crate::arch::Uaccess;
 use crate::block::DevId;
 use crate::block::blkdev::{
     BioOp, BlockDevice, SECTOR_SHIFT, bdev_rw_bytes, bdev_rw_frame, blkdev_issue_flush, get_blkdev,
@@ -263,12 +262,12 @@ impl crate::fs::inode::InodeOps for BdevInodeOps {
 static BDEV_INODE_OPS: BdevInodeOps = BdevInodeOps;
 
 fn put_int(arg: u64, v: i32) -> Result<i64, KernelError> {
-    put_user::<Uaccess, i32>(arg, v).map_err(|_| KernelError::BadAddress)?;
+    put_user::<i32>(arg, v).map_err(|_| KernelError::BadAddress)?;
     Ok(0)
 }
 
 fn put_u64(arg: u64, v: u64) -> Result<i64, KernelError> {
-    put_user::<Uaccess, u64>(arg, v).map_err(|_| KernelError::BadAddress)?;
+    put_user::<u64>(arg, v).map_err(|_| KernelError::BadAddress)?;
     Ok(0)
 }
 
@@ -294,7 +293,7 @@ fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError>
             if arg == 0 {
                 return Err(KernelError::InvalidArgument);
             }
-            let n = get_user::<Uaccess, i32>(arg).map_err(|_| KernelError::BadAddress)?;
+            let n = get_user::<i32>(arg).map_err(|_| KernelError::BadAddress)?;
             b.set_block_size(n).map(|()| 0)
         }
         ioc::BLKRRPART => {

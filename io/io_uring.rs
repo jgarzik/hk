@@ -44,7 +44,7 @@ use crate::util::pod::FromBytes;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::arch::{IrqSpinlock, Uaccess};
+use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::iov::IoVec;
@@ -977,7 +977,7 @@ impl IoUring {
 
         // Read timespec from userspace
         // struct __kernel_timespec { i64 tv_sec; i64 tv_nsec; }
-        let Ok(ts) = copy_val_from_user::<Uaccess, [i64; 2]>(ts_ptr) else {
+        let Ok(ts) = copy_val_from_user::<[i64; 2]>(ts_ptr) else {
             return KernelError::BadAddress.to_errno_neg();
         };
         let (tv_sec, tv_nsec) = (ts[0], ts[1]);
@@ -1267,7 +1267,7 @@ fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
     let mut fds = crate::util::kmem::try_vec(n, 0i32)?;
     // SAFETY: byte view of the `n` initialized i32 elements of `fds`
     let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr().cast::<u8>(), n * 4) };
-    copy_from_user::<Uaccess>(bytes, arg, n * 4)?;
+    copy_from_user(bytes, arg, n * 4)?;
     Ok(fds)
 }
 

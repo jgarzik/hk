@@ -20,7 +20,6 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::Ordering;
 
-use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, RwFlags, flags as fflags, nowait_rw};
 use crate::fs::inode::{AsAny, Inode, InodeData, InodeMode, NULL_INODE_OPS};
@@ -70,14 +69,14 @@ impl OptIn {
         if self.len < 4 {
             return Err(KernelError::InvalidArgument);
         }
-        get_user::<Uaccess, i32>(self.ptr).map_err(|_| KernelError::BadAddress)
+        get_user::<i32>(self.ptr).map_err(|_| KernelError::BadAddress)
     }
 
     /// int or (shorter) single byte option (Linux do_ip_setsockopt)
     pub fn int_or_byte(&self) -> Result<i32, KernelError> {
         match self.len {
             0 => Err(KernelError::InvalidArgument),
-            1..=3 => get_user::<Uaccess, u8>(self.ptr)
+            1..=3 => get_user::<u8>(self.ptr)
                 .map(i32::from)
                 .map_err(|_| KernelError::BadAddress),
             _ => self.int(),
@@ -89,7 +88,7 @@ impl OptIn {
         let n = self.len.min(max);
         let mut v = alloc::vec![0u8; n];
         if n > 0 {
-            copy_from_user::<Uaccess>(&mut v, self.ptr, n).map_err(|_| KernelError::BadAddress)?;
+            copy_from_user(&mut v, self.ptr, n).map_err(|_| KernelError::BadAddress)?;
         }
         Ok(v)
     }
@@ -369,12 +368,12 @@ const SIOCGPGRP: u32 = 0x8904;
 fn sock_ioctl(s: &dyn ProtoOps, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
     match cmd {
         FIOSETOWN | SIOCSPGRP => {
-            let who = get_user::<Uaccess, i32>(arg).map_err(|_| KernelError::BadAddress)?;
+            let who = get_user::<i32>(arg).map_err(|_| KernelError::BadAddress)?;
             crate::io::fasync::f_setown(file, who, true)?;
             return Ok(0);
         }
         FIOGETOWN | SIOCGPGRP => {
-            put_user::<Uaccess, i32>(arg, crate::io::fasync::f_getown(file))
+            put_user::<i32>(arg, crate::io::fasync::f_getown(file))
                 .map_err(|_| KernelError::BadAddress)?;
             return Ok(0);
         }
@@ -502,7 +501,7 @@ pub fn sock_setsockopt(s: &dyn ProtoOps, opt: i32, v: OptIn) -> Result<(), Kerne
             if v.len < 8 {
                 return Err(KernelError::InvalidArgument);
             }
-            let secs = get_user::<Uaccess, i32>(v.ptr + 4).map_err(|_| KernelError::BadAddress)?;
+            let secs = get_user::<i32>(v.ptr + 4).map_err(|_| KernelError::BadAddress)?;
             sk.set_linger(val != 0, secs.max(0) as u32);
         }
         SO_RCVLOWAT => sk.set_rcvlowat(val),
@@ -533,8 +532,8 @@ fn read_timeval(v: OptIn) -> Result<u64, KernelError> {
     if v.len < 16 {
         return Err(KernelError::InvalidArgument);
     }
-    let sec = get_user::<Uaccess, i64>(v.ptr).map_err(|_| KernelError::BadAddress)?;
-    let usec = get_user::<Uaccess, i64>(v.ptr + 8).map_err(|_| KernelError::BadAddress)?;
+    let sec = get_user::<i64>(v.ptr).map_err(|_| KernelError::BadAddress)?;
+    let usec = get_user::<i64>(v.ptr + 8).map_err(|_| KernelError::BadAddress)?;
     if !(0..1_000_000).contains(&usec) {
         return Err(KernelError::MathDomain);
     }
@@ -669,7 +668,7 @@ pub fn put_opt(
     };
     let n = (len as usize).min(b.len());
     if n > 0 {
-        copy_to_user::<Uaccess>(val.addr(), &b[..n])?;
+        copy_to_user(val.addr(), &b[..n])?;
     }
     lenp.write(&(n as u32))?;
     Ok(())

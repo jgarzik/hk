@@ -7,7 +7,6 @@
 
 use super::termios::{CLOCAL, N_TTY, Termios, Winsize};
 use super::{Tty, jobctrl};
-use crate::arch::Uaccess;
 use crate::fs::File;
 use crate::uaccess::{get_user, put_user};
 use crate::util::error::KernelError;
@@ -98,13 +97,13 @@ pub const TIOCCBRK: u32 = 0x5428;
 
 /// Copy `v` out to the user pointer `arg` (EFAULT if bad)
 fn put<T: IntoBytes>(arg: u64, v: T) -> Result<i64, KernelError> {
-    put_user::<Uaccess, T>(arg, v).map_err(|_| KernelError::BadAddress)?;
+    put_user::<T>(arg, v).map_err(|_| KernelError::BadAddress)?;
     Ok(0)
 }
 
 /// Copy a `T` in from the user pointer `arg` (EFAULT if bad)
 fn get<T: FromBytes>(arg: u64) -> Result<T, KernelError> {
-    get_user::<Uaccess, T>(arg).map_err(|_| KernelError::BadAddress)
+    get_user::<T>(arg).map_err(|_| KernelError::BadAddress)
 }
 
 /// Wait until the output is sent (Linux tty_wait_until_sent); a

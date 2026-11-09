@@ -8,7 +8,6 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::arch::Uaccess;
 use crate::fs::iov::{IoVec, import_iovec};
 use crate::fs::syscall::IOV_MAX;
 use crate::mm::MmRef;
@@ -174,13 +173,13 @@ fn copy_vecs(mm: &MmRef, local: &[IoVec], remote: &[IoVec], buf: &mut [u8], writ
 /// and the target's `raddr`; the bytes that made it all the way
 fn copy_step(mm: &MmRef, laddr: u64, raddr: u64, buf: &mut [u8], write: bool) -> usize {
     if write {
-        if copy_from_user::<Uaccess>(buf, laddr, buf.len()).is_err() {
+        if copy_from_user(buf, laddr, buf.len()).is_err() {
             return 0;
         }
         access_remote_vm_write(mm, raddr, buf, false).unwrap_or(0)
     } else {
         let got = access_remote_vm_read(mm, raddr, buf, false).unwrap_or(0);
-        match copy_to_user::<Uaccess>(laddr, &buf[..got]) {
+        match copy_to_user(laddr, &buf[..got]) {
             Ok(_) => got,
             Err(_) => 0,
         }

@@ -26,7 +26,6 @@
 
 use alloc::sync::Arc;
 
-use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::fs::file::File;
 use crate::fs::io::fget;
@@ -715,7 +714,7 @@ fn page_from_user(addr: u64, len: u64) -> KernelResult<PipeBuffer> {
     // SAFETY: page.frame is a freshly allocated, kernel-mapped page of
     // PAGE_SIZE bytes owned by this buffer, and `n <= PAGE_SIZE`
     let dst = unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), n) };
-    copy_from_user::<Uaccess>(dst, addr, n).map_err(|_| KernelError::BadAddress)?;
+    copy_from_user(dst, addr, n).map_err(|_| KernelError::BadAddress)?;
     Ok(PipeBuffer::new(
         page,
         0,

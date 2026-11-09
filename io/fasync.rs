@@ -214,8 +214,7 @@ crate::pod!(FOwnerEx { kind, pid });
 /// F_SETOWN_EX (Linux f_setown_ex): EINVAL for an unknown type, ESRCH
 /// for a pid no task uses; pid 0 clears
 pub fn f_setown_ex(file: &File, arg: u64) -> Result<(), KernelError> {
-    let ex: FOwnerEx =
-        get_user::<crate::arch::Uaccess, _>(arg).map_err(|_| KernelError::BadAddress)?;
+    let ex: FOwnerEx = get_user(arg).map_err(|_| KernelError::BadAddress)?;
     let kind = match ex.kind {
         F_OWNER_TID => PidType::Tid,
         F_OWNER_PID => PidType::Tgid,
@@ -247,7 +246,7 @@ pub fn f_getown_ex(file: &File, arg: u64) -> Result<(), KernelError> {
         },
         pid: owner_nr(&o),
     };
-    put_user::<crate::arch::Uaccess, _>(arg, ex).map_err(|_| KernelError::BadAddress)
+    put_user(arg, ex).map_err(|_| KernelError::BadAddress)
 }
 
 /// F_SETSIG (Linux f_owner_sig): EINVAL past the last signal

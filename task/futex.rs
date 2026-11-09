@@ -50,10 +50,6 @@ use crate::util::error::{KernelError, KernelResult};
 use crate::util::list::{Link, List};
 
 // Architecture-specific uaccess implementation
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::uaccess::Aarch64Uaccess as Uaccess;
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::uaccess::X86_64Uaccess as Uaccess;
 
 // =============================================================================
 // Futex Operation Constants (Linux ABI compatible)
@@ -431,7 +427,7 @@ impl RobustListHead {
 /// - Validates address is in user space range
 /// - Handles SMAP protection on x86_64
 fn read_user_u32(addr: u64) -> KernelResult<u32> {
-    Ok(get_user::<Uaccess, u32>(addr)?)
+    Ok(get_user::<u32>(addr)?)
 }
 
 /// Read a futex word under a bucket lock (Linux
@@ -443,7 +439,7 @@ fn read_user_u32(addr: u64) -> KernelResult<u32> {
 /// kernel like Linux.
 fn get_value_locked(addr: u64) -> KernelResult<u32> {
     crate::uaccess::pagefault_disable();
-    let r = get_user::<Uaccess, u32>(addr);
+    let r = get_user::<u32>(addr);
     crate::uaccess::pagefault_enable();
     r.map_err(|_| KernelError::WouldBlock)
 }
@@ -454,7 +450,7 @@ fn get_value_locked(addr: u64) -> KernelResult<u32> {
 /// - Validates address is in user space range
 /// - Handles SMAP protection on x86_64
 fn read_user_u64(addr: u64) -> KernelResult<u64> {
-    Ok(get_user::<Uaccess, u64>(addr)?)
+    Ok(get_user::<u64>(addr)?)
 }
 
 /// Read a timespec from user memory and convert to nanoseconds
@@ -892,7 +888,7 @@ pub fn exit_robust_list(me: &crate::task::Task) {
 
     // The robust list head, read whole (Linux fetch_robust_entry and
     // get_user of each field, from one checked struct address)
-    let Ok(head) = crate::uaccess::copy_val_from_user::<Uaccess, RobustListHead>(head_addr) else {
+    let Ok(head) = crate::uaccess::copy_val_from_user::<RobustListHead>(head_addr) else {
         return;
     };
     let (list_ptr, futex_offset, pending_ptr) =
@@ -957,7 +953,7 @@ fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid, pi: bool, pending
             return;
         }
         let mval = (uval & futex_op::FUTEX_WAITERS) | futex_op::FUTEX_OWNER_DIED;
-        match crate::uaccess::cmpxchg_user_u32::<Uaccess>(futex_addr, uval, mval) {
+        match crate::uaccess::cmpxchg_user_u32(futex_addr, uval, mval) {
             Ok(nval) if nval == uval => break uval,
             Ok(_) => {}
             Err(crate::uaccess::UaccessError::Again) => crate::task::percpu::cond_resched(),

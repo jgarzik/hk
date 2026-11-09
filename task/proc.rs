@@ -306,7 +306,7 @@ fn put_waitid_info(infop: UserPtr<SigInfo>, info: &SigInfo) -> KernelResult<()> 
         return Ok(());
     }
     let head = &info.as_bytes()[..WAITID_INFO];
-    crate::uaccess::copy_to_user::<crate::arch::Uaccess>(infop.addr(), head)?;
+    crate::uaccess::copy_to_user(infop.addr(), head)?;
     Ok(())
 }
 
@@ -561,7 +561,7 @@ const CSIGNAL: u64 = 0x000000ff;
 /// * < 0: Error code
 pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
     use super::percpu::CloneConfig;
-    use crate::arch::Uaccess;
+
     use crate::uaccess::copy_struct_from_user;
 
     // Linux clone3: more than a page is E2BIG, less than VER0 EINVAL
@@ -572,7 +572,7 @@ pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
         return Err(KernelError::InvalidArgument);
     }
     // A larger struct than this kernel's must be zero past it (E2BIG)
-    let args = match copy_struct_from_user::<Uaccess, CloneArgs>(uargs.addr(), size as usize) {
+    let args = match copy_struct_from_user::<CloneArgs>(uargs.addr(), size as usize) {
         Ok(a) => a,
         Err(None) => return Err(KernelError::ArgListTooLong),
         Err(Some(_)) => return Err(KernelError::BadAddress),
@@ -609,7 +609,7 @@ pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
     let mut set_tid = CloneConfig::NO_SET_TID;
     if n > 0 {
         let mut b = [0u8; 4 * crate::ns::pid::MAX_PID_NS_LEVEL as usize];
-        crate::uaccess::copy_from_user::<Uaccess>(&mut b[..n * 4], args.set_tid, n * 4)?;
+        crate::uaccess::copy_from_user(&mut b[..n * 4], args.set_tid, n * 4)?;
         for (t, c) in set_tid.iter_mut().zip(b[..n * 4].as_chunks::<4>().0) {
             *t = u32::from_ne_bytes(*c);
         }

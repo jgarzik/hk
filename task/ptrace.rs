@@ -629,7 +629,7 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> KernelResult<i64
     let _frozen = ptrace_check_attach(&task)?;
     // struct ptrace_peeksiginfo_args { u64 off; u32 flags; s32 nr; }
     let mut args = [0u8; 16];
-    crate::uaccess::copy_from_user::<crate::arch::Uaccess>(&mut args, addr, 16)?;
+    crate::uaccess::copy_from_user(&mut args, addr, 16)?;
     let off = u64::from_ne_bytes(args[..8].try_into().unwrap_or([0; 8]));
     let flags = u32::from_ne_bytes(args[8..12].try_into().unwrap_or([0; 4]));
     let nr = i32::from_ne_bytes(args[12..].try_into().unwrap_or([0; 4]));
@@ -682,7 +682,7 @@ fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> KernelResult<i64> {
 
     // Write message to user space
     let buf = message.to_ne_bytes();
-    copy_to_user::<crate::arch::Uaccess>(data, &buf)?;
+    copy_to_user(data, &buf)?;
 
     Ok(0)
 }

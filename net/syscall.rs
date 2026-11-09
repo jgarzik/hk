@@ -294,11 +294,11 @@ fn recvmsg_one(
     let mut namelen = 0;
     if let (Some(a), false) = (&m.name, h.name.is_null()) {
         let k = (h.namelen as usize).min(a.len());
-        copy_to_user::<crate::arch::Uaccess>(h.name.addr(), &a[..k])?;
+        copy_to_user(h.name.addr(), &a[..k])?;
         namelen = a.len() as u32;
     }
     if !m.cmsg.buf.is_empty() {
-        copy_to_user::<crate::arch::Uaccess>(h.control.addr(), &m.cmsg.buf)?;
+        copy_to_user(h.control.addr(), &m.cmsg.buf)?;
     }
     let mut fl = m.flags;
     if m.cmsg.trunc {

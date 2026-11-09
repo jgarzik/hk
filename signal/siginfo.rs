@@ -7,7 +7,6 @@
 //! layout. [`SigFields`] is the typed view, chosen by `siginfo_layout`.
 
 use super::Signal;
-use crate::arch::Uaccess;
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::util::error::KernelError;
 use crate::util::pod::{FromBytes, IntoBytes};
@@ -413,7 +412,7 @@ impl SigInfo {
 
     /// Write the user `siginfo_t` at `to` (Linux copy_siginfo_to_user)
     pub fn copy_to_user(&self, to: u64) -> Result<(), KernelError> {
-        copy_to_user::<Uaccess>(to, self.to_user().as_bytes())
+        copy_to_user(to, self.to_user().as_bytes())
             .map(|_| ())
             .map_err(|_| KernelError::BadAddress)
     }
@@ -435,7 +434,7 @@ impl SigInfo {
     fn read_user(from: u64, sig: Option<i32>) -> Result<Self, KernelError> {
         let mut u = [0u8; 128];
         let k = core::mem::size_of::<SigInfo>();
-        copy_from_user::<Uaccess>(&mut u[..k], from, k).map_err(|_| KernelError::BadAddress)?;
+        copy_from_user(&mut u[..k], from, k).map_err(|_| KernelError::BadAddress)?;
         let mut s = <Self as FromBytes>::read_from(&u[..k]).ok_or(KernelError::BadAddress)?;
         s._pad = 0;
         if let Some(sig) = sig {
@@ -443,8 +442,7 @@ impl SigInfo {
         }
         if !known_layout(s.sig(), s.code) {
             let rest = from.checked_add(k as u64).ok_or(KernelError::BadAddress)?;
-            copy_from_user::<Uaccess>(&mut u[k..], rest, EXPANSION)
-                .map_err(|_| KernelError::BadAddress)?;
+            copy_from_user(&mut u[k..], rest, EXPANSION).map_err(|_| KernelError::BadAddress)?;
             if u[k..].iter().any(|&b| b != 0) {
                 return Err(KernelError::ArgListTooLong);
             }

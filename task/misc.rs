@@ -9,7 +9,7 @@
 
 use crate::fs::file::File;
 use crate::signal::Signal;
-use crate::uaccess::UserPtr;
+use crate::uaccess::{UserPtr, access_ok};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
 use crate::util::pod::FromBytes;
@@ -174,7 +174,7 @@ pub const RUSAGE_THREAD: i32 = 1;
 /// # Locking
 /// Reads memory stats and process count with brief lock holds.
 /// Reads time without locking (seqlock-protected).
-pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: UserPtr<SysInfo>) -> KernelResult<()> {
+pub fn sys_sysinfo(info_ptr: UserPtr<SysInfo>) -> KernelResult<()> {
     use crate::FRAME_ALLOCATOR;
     use crate::time::{ClockId, TIMEKEEPER};
     use crate::uaccess::put_user;
@@ -204,7 +204,7 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: UserPtr<SysInfo>) -
         ..FromBytes::zeroed()
     };
 
-    put_user::<A, SysInfo>(info_ptr.addr(), info)?;
+    put_user::<SysInfo>(info_ptr.addr(), info)?;
     Ok(())
 }
 
@@ -253,7 +253,7 @@ fn ns_to_clock_t(ns: u64) -> i64 {
 /// reaped children's user and system time into `buf` (if not NULL),
 /// and the clock ticks since boot (Linux jiffies in USER_HZ units,
 /// counted from 0 where Linux starts 5 minutes before the wrap)
-pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: UserPtr<Tms>) -> KernelResult<i64> {
+pub fn sys_times(buf: UserPtr<Tms>) -> KernelResult<i64> {
     use crate::task::percpu;
     if !buf.is_null() {
         let (utime, stime) = percpu::get_process_times(percpu::current_pid());
@@ -264,7 +264,7 @@ pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: UserPtr<Tms>) -> KernelRes
             tms_cutime: ns_to_clock_t(cutime),
             tms_cstime: ns_to_clock_t(cstime),
         };
-        crate::uaccess::put_user::<A, Tms>(buf.addr(), t)?;
+        crate::uaccess::put_user::<Tms>(buf.addr(), t)?;
     }
     Ok(crate::time::ticks_to_clock_t(percpu::get_ticks()) as i64)
 }
@@ -289,10 +289,7 @@ pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: UserPtr<Tms>) -> KernelRes
 /// Returns utime and stime for the current task/process. Other fields
 /// like maxrss, page faults, and context switches are also populated
 /// when available.
-pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(
-    who: i32,
-    usage_ptr: UserPtr<Rusage>,
-) -> KernelResult<()> {
+pub fn sys_getrusage(who: i32, usage_ptr: UserPtr<Rusage>) -> KernelResult<()> {
     use crate::task::percpu;
     use crate::uaccess::put_user;
 
@@ -329,7 +326,7 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(
         }
         _ => return Err(KernelError::InvalidArgument),
     };
-    put_user::<A, Rusage>(usage_ptr.addr(), usage)?;
+    put_user::<Rusage>(usage_ptr.addr(), usage)?;
     Ok(())
 }
 
@@ -348,11 +345,7 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(
 /// # Errors
 /// * EFAULT - Invalid buffer pointer
 /// * EINVAL - Invalid flags
-pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(
-    buf: UserPtr<u8>,
-    buflen: usize,
-    flags: u32,
-) -> KernelResult<usize> {
+pub fn sys_getrandom(buf: UserPtr<u8>, buflen: usize, flags: u32) -> KernelResult<usize> {
     use crate::random;
     use crate::uaccess::copy_to_user;
 
@@ -364,11 +357,11 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(
     if len == 0 {
         return Ok(0);
     }
-    if !A::access_ok(buf.addr(), len) {
+    if !access_ok(buf.addr(), len) {
         return Err(KernelError::BadAddress);
     }
     let n = random::stream(len, |off, b| {
-        copy_to_user::<A>(buf.addr() + off as u64, b).is_ok()
+        copy_to_user(buf.addr() + off as u64, b).is_ok()
     });
     if n == 0 {
         return Err(KernelError::BadAddress);
@@ -454,7 +447,7 @@ pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> K
         PR_GET_NAME => {
             // Get thread name and write to user buffer (16 bytes)
             let name = super::percpu::current().comm();
-            crate::uaccess::copy_to_user::<crate::arch::Uaccess>(arg2, &name)?;
+            crate::uaccess::copy_to_user(arg2, &name)?;
             Ok(0)
         }
 
@@ -778,11 +771,7 @@ pub mod syslog_action {
 ///
 /// # Permissions
 /// Most operations require CAP_SYSLOG or CAP_SYS_ADMIN.
-pub fn sys_syslog<A: crate::uaccess::UaccessArch>(
-    type_: i32,
-    buf: UserPtr<u8>,
-    len: i32,
-) -> KernelResult<i64> {
+pub fn sys_syslog(type_: i32, buf: UserPtr<u8>, len: i32) -> KernelResult<i64> {
     use syslog_action::*;
 
     // Basic validation
@@ -808,7 +797,7 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(
             if buf.is_null() || len == 0 {
                 return Err(KernelError::InvalidArgument);
             }
-            if !A::access_ok(buf.addr(), len as usize) {
+            if !access_ok(buf.addr(), len as usize) {
                 return Err(KernelError::BadAddress);
             }
 
@@ -816,7 +805,7 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(
                 SYSLOG_ACTION_READ => crate::kmsg::syslog_read(len as usize)?,
                 _ => crate::kmsg::syslog_read_all(len as usize, type_ == SYSLOG_ACTION_READ_CLEAR),
             };
-            crate::uaccess::copy_to_user::<A>(buf.addr(), &data)?;
+            crate::uaccess::copy_to_user(buf.addr(), &data)?;
             Ok(data.len() as i64)
         }
 
@@ -866,15 +855,13 @@ use super::{
 ///
 /// If the version is invalid, writes the current version back to the header
 /// and returns EINVAL.
-fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
-    header: UserPtr<CapUserHeader>,
-) -> KernelResult<(usize, i32)> {
+fn cap_validate_magic(header: UserPtr<CapUserHeader>) -> KernelResult<(usize, i32)> {
     use crate::uaccess::{get_user, put_user};
 
     if header.is_null() {
         return Err(KernelError::BadAddress);
     }
-    let hdr: CapUserHeader = get_user::<A, CapUserHeader>(header.addr())?;
+    let hdr: CapUserHeader = get_user::<CapUserHeader>(header.addr())?;
     match hdr.version {
         // Legacy 32-bit version - only 1 u32 per set
         _LINUX_CAPABILITY_VERSION_1 => Ok((1, hdr.pid)),
@@ -888,7 +875,7 @@ fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
                 version: _LINUX_CAPABILITY_VERSION_3,
                 pid: 0,
             };
-            let _ = put_user::<A, CapUserHeader>(header.addr(), current_version);
+            let _ = put_user::<CapUserHeader>(header.addr(), current_version);
             Err(KernelError::InvalidArgument)
         }
     }
@@ -903,14 +890,11 @@ fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
 ///
 /// If dataptr is NULL and the version is valid, returns 0 (version query).
 /// Otherwise, copies capability data to userspace.
-pub fn sys_capget<A: crate::uaccess::UaccessArch>(
-    header: UserPtr<CapUserHeader>,
-    data: UserPtr<CapUserData>,
-) -> KernelResult<()> {
+pub fn sys_capget(header: UserPtr<CapUserHeader>, data: UserPtr<CapUserData>) -> KernelResult<()> {
     use crate::uaccess::put_user;
 
     // Validate version and get number of u32s to copy
-    let (tocopy, pid) = match cap_validate_magic::<A>(header) {
+    let (tocopy, pid) = match cap_validate_magic(header) {
         Ok(r) => r,
         // If dataptr is NULL and we got EINVAL, this is a version query
         Err(KernelError::InvalidArgument) if data.is_null() => return Ok(()),
@@ -951,7 +935,7 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(
     // Copy to user space
     for (i, item) in kdata.iter().enumerate().take(tocopy) {
         let dst = data.offset(i).ok_or(KernelError::BadAddress)?;
-        put_user::<A, CapUserData>(dst.addr(), *item)?;
+        put_user::<CapUserData>(dst.addr(), *item)?;
     }
     Ok(())
 }
@@ -965,14 +949,11 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(
 /// - I (inheritable): raised bits must be subset of old permitted
 /// - P (permitted): raised bits must be subset of old permitted
 /// - E (effective): must be subset of new permitted
-pub fn sys_capset<A: crate::uaccess::UaccessArch>(
-    header: UserPtr<CapUserHeader>,
-    data: UserPtr<CapUserData>,
-) -> KernelResult<()> {
+pub fn sys_capset(header: UserPtr<CapUserHeader>, data: UserPtr<CapUserData>) -> KernelResult<()> {
     use crate::uaccess::get_user;
 
     // Validate version and get number of u32s to copy
-    let (tocopy, pid) = cap_validate_magic::<A>(header)?;
+    let (tocopy, pid) = cap_validate_magic(header)?;
 
     // Get current pid
     let current_pid = super::pid::vnr(super::percpu::current_pid()) as i32;
@@ -986,7 +967,7 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(
     let mut kdata = [CapUserData::default(); 2];
     for (i, item) in kdata.iter_mut().enumerate().take(tocopy) {
         let src = data.offset(i).ok_or(KernelError::BadAddress)?;
-        *item = get_user::<A, CapUserData>(src.addr())?;
+        *item = get_user::<CapUserData>(src.addr())?;
     }
 
     // Combine 32-bit values into 64-bit capabilities

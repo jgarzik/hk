@@ -22,11 +22,6 @@ use crate::net::rtnl;
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::util::error::KernelError;
 
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::uaccess::Aarch64Uaccess as Uaccess;
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::uaccess::X86_64Uaccess as Uaccess;
-
 pub const SIOCADDRT: u32 = 0x890B;
 pub const SIOCDELRT: u32 = 0x890C;
 pub const SIOCGIFNAME: u32 = 0x8910;
@@ -63,13 +58,13 @@ struct Ifreq {
 impl Ifreq {
     fn read(arg: u64) -> Result<Self, KernelError> {
         let mut raw = [0u8; IFREQ_LEN];
-        copy_from_user::<Uaccess>(&mut raw, arg, IFREQ_LEN).map_err(|_| KernelError::BadAddress)?;
+        copy_from_user(&mut raw, arg, IFREQ_LEN).map_err(|_| KernelError::BadAddress)?;
         raw[IFNAMSIZ - 1] = 0;
         Ok(Self { raw })
     }
 
     fn write(&self, arg: u64) -> Result<i64, KernelError> {
-        copy_to_user::<Uaccess>(arg, &self.raw).map_err(|_| KernelError::BadAddress)?;
+        copy_to_user(arg, &self.raw).map_err(|_| KernelError::BadAddress)?;
         Ok(0)
     }
 
@@ -197,7 +192,7 @@ fn dev_ifreq(net: &NetNamespace, cmd: u32, ifr: &mut Ifreq) -> Result<(), Kernel
 /// SIOCGIFCONF: one ifreq (label, sockaddr_in) per IPv4 address
 fn ifconf(net: &NetNamespace, arg: u64) -> Result<i64, KernelError> {
     let mut hdr = [0u8; 16];
-    copy_from_user::<Uaccess>(&mut hdr, arg, 16).map_err(|_| KernelError::BadAddress)?;
+    copy_from_user(&mut hdr, arg, 16).map_err(|_| KernelError::BadAddress)?;
     let len = i32::from_ne_bytes(hdr[..4].try_into().unwrap());
     let buf = u64::from_ne_bytes(hdr[8..16].try_into().unwrap());
     let mut out: Vec<u8> = Vec::new();
@@ -216,11 +211,10 @@ fn ifconf(net: &NetNamespace, arg: u64) -> Result<i64, KernelError> {
     } else {
         let room = (len.max(0) as usize / IFREQ_LEN) * IFREQ_LEN;
         let n = room.min(out.len());
-        copy_to_user::<Uaccess>(buf, &out[..n]).map_err(|_| KernelError::BadAddress)?;
+        copy_to_user(buf, &out[..n]).map_err(|_| KernelError::BadAddress)?;
         n
     };
-    copy_to_user::<Uaccess>(arg, &(total as i32).to_ne_bytes())
-        .map_err(|_| KernelError::BadAddress)?;
+    copy_to_user(arg, &(total as i32).to_ne_bytes()).map_err(|_| KernelError::BadAddress)?;
     Ok(0)
 }
 
@@ -380,7 +374,7 @@ fn bad_mask(mask: Ipv4Addr, addr: Ipv4Addr) -> Option<u8> {
 fn rt_ioctl(net: &NetNamespace, cmd: u32, arg: u64) -> Result<i64, KernelError> {
     need_admin()?;
     let mut rt = [0u8; RTENTRY_LEN];
-    copy_from_user::<Uaccess>(&mut rt, arg, RTENTRY_LEN).map_err(|_| KernelError::BadAddress)?;
+    copy_from_user(&mut rt, arg, RTENTRY_LEN).map_err(|_| KernelError::BadAddress)?;
     let r = rtnl::lock();
     let cfg = rtentry_cfg(net, cmd, &rt)?;
     if cmd == SIOCDELRT {
@@ -437,7 +431,7 @@ fn rtentry_cfg(net: &NetNamespace, cmd: u32, rt: &[u8]) -> Result<FibConfig, Ker
     cfg.rtype = RouteType::Unicast as u8;
     if devp != 0 {
         let mut name = [0u8; IFNAMSIZ];
-        copy_from_user::<Uaccess>(&mut name[..IFNAMSIZ - 1], devp, IFNAMSIZ - 1)
+        copy_from_user(&mut name[..IFNAMSIZ - 1], devp, IFNAMSIZ - 1)
             .map_err(|_| KernelError::BadAddress)?;
         let n = name.iter().position(|&c| c == 0).unwrap_or(IFNAMSIZ);
         let label = core::str::from_utf8(&name[..n]).map_err(|_| KernelError::NoDevice)?;

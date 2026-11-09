@@ -62,7 +62,6 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering}
 
 use crate::sync::spin::{Mutex, MutexGuard, RwLock};
 
-use crate::arch::Uaccess;
 use crate::fs::Dentry;
 use crate::io::fasync::{POLL_HUP, POLL_IN};
 use crate::net::NetNamespace;
@@ -765,8 +764,7 @@ impl ProtoOps for UnixSock {
             SIOCINQ => self.inq_len()?,
             _ => return Err(KernelError::NotTty),
         };
-        crate::uaccess::put_user::<Uaccess, i32>(arg, v as i32)
-            .map_err(|_| KernelError::BadAddress)?;
+        crate::uaccess::put_user::<i32>(arg, v as i32).map_err(|_| KernelError::BadAddress)?;
         Ok(0)
     }
 

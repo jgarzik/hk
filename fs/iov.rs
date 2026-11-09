@@ -2,7 +2,6 @@
 
 use alloc::vec;
 
-use crate::arch::Uaccess;
 use crate::fs::{KernelError, RwFlags};
 use crate::uaccess::{UserPtr, access_ok, copy_from_user};
 use crate::util::error::KernelResult;
@@ -62,7 +61,7 @@ pub fn import_iovec(
     // `iovcnt` initialized elements of `iovecs`.
     let bytes =
         unsafe { core::slice::from_raw_parts_mut(iovecs.as_mut_ptr().cast::<u8>(), total_size) };
-    if copy_from_user::<Uaccess>(bytes, iov_ptr, total_size).is_err() {
+    if copy_from_user(bytes, iov_ptr, total_size).is_err() {
         return Err(KernelError::BadAddress);
     }
 

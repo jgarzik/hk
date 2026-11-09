@@ -99,7 +99,7 @@ fn copy_strings(argv: UserPtr<u64>, n: usize, budget: &mut usize) -> KernelResul
         if p == 0 {
             return Err(KernelError::BadAddress);
         }
-        out.push_user::<crate::arch::Uaccess>(p, MAX_ARG_STRLEN, budget)?;
+        out.push_user(p, MAX_ARG_STRLEN, budget)?;
         if crate::signal::fatal_signal_pending() {
             return Err(KernelError::RestartNoHand);
         }

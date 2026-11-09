@@ -38,7 +38,6 @@ use super::insn::BpfInsn;
 use super::map::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BpfMapOps, create_map};
 use super::prog::BpfProg;
 use super::verifier::{Kind, verify};
-use crate::arch::Uaccess;
 use crate::uaccess::{UserPtr, copy_from_user, copy_to_user, put_user};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::FromBytes;
@@ -120,7 +119,7 @@ pub const BPF_PROG_TEST_RUN: i32 = 10;
 fn copy_insns(ptr: u64, n: usize) -> Result<Vec<BpfInsn>, KernelError> {
     let bytes = n * size_of::<BpfInsn>();
     let mut raw = crate::util::kmem::try_vec(bytes, 0u8)?;
-    copy_from_user::<Uaccess>(&mut raw, ptr, bytes).map_err(|_| KernelError::BadAddress)?;
+    copy_from_user(&mut raw, ptr, bytes).map_err(|_| KernelError::BadAddress)?;
     let mut insns = crate::util::kmem::try_vec(n, BpfInsn::default())?;
     for (i, b) in insns.iter_mut().zip(raw.as_chunks::<8>().0) {
         *i = BpfInsn::from_bytes(b);
@@ -352,7 +351,7 @@ pub fn sys_bpf(cmd: i32, attr: UserPtr<u8>, size: u32) -> KernelResult<i32> {
     }
     let mut attr_buf = [0u8; BPF_ATTR_SIZE];
     let n = size as usize;
-    copy_from_user::<Uaccess>(&mut attr_buf[..n], attr.addr(), n)?;
+    copy_from_user(&mut attr_buf[..n], attr.addr(), n)?;
     let done = |r: KernelResult<()>| r.map(|()| 0);
     match cmd {
         BPF_MAP_CREATE => bpf_map_create(&attr_buf),
@@ -387,7 +386,7 @@ fn bpf_map_create(attr_buf: &[u8]) -> KernelResult<i32> {
 /// `len` bytes from user address `at`
 fn user_bytes(at: u64, len: usize) -> KernelResult<Vec<u8>> {
     let mut v = vec![0u8; len];
-    copy_from_user::<Uaccess>(&mut v, at, len)?;
+    copy_from_user(&mut v, at, len)?;
     Ok(v)
 }
 
@@ -397,7 +396,7 @@ fn bpf_map_lookup_elem(attr_buf: &[u8]) -> KernelResult<()> {
     let map = get_bpf_map_from_fd(attr.map_fd as i32)?;
     let key = user_bytes(attr.key, map.key_size() as usize)?;
     let value = map.lookup(&key).ok_or(KernelError::NotFound)?;
-    copy_to_user::<Uaccess>(attr.value, &value)?;
+    copy_to_user(attr.value, &value)?;
     Ok(())
 }
 
@@ -431,7 +430,7 @@ fn bpf_map_get_next_key(attr_buf: &[u8]) -> KernelResult<()> {
     let next_key = map
         .get_next_key(current_key.as_deref())
         .ok_or(KernelError::NotFound)?;
-    copy_to_user::<Uaccess>(attr.value, &next_key)?;
+    copy_to_user(attr.value, &next_key)?;
     Ok(())
 }
 
@@ -482,8 +481,7 @@ fn info_in<T: crate::util::pod::Pod>(ptr: u64, info_len: u32) -> Result<(T, usiz
         while at < ulen {
             let n = (ulen - at).min(tail.len());
             let src = ptr.checked_add(at as u64).ok_or(KernelError::BadAddress)?;
-            copy_from_user::<Uaccess>(&mut tail[..n], src, n)
-                .map_err(|_| KernelError::BadAddress)?;
+            copy_from_user(&mut tail[..n], src, n).map_err(|_| KernelError::BadAddress)?;
             if tail[..n].iter().any(|&b| b != 0) {
                 return Err(KernelError::ArgListTooLong);
             }
@@ -491,7 +489,7 @@ fn info_in<T: crate::util::pod::Pod>(ptr: u64, info_len: u32) -> Result<(T, usiz
         }
     }
     let mut info = T::zeroed();
-    copy_from_user::<Uaccess>(&mut info.as_bytes_mut()[..len], ptr, len)
+    copy_from_user(&mut info.as_bytes_mut()[..len], ptr, len)
         .map_err(|_| KernelError::BadAddress)?;
     Ok((info, len))
 }
@@ -504,9 +502,9 @@ fn info_out<T: crate::util::pod::IntoBytes>(
     ptr: u64,
     uattr: u64,
 ) -> Result<(), KernelError> {
-    copy_to_user::<Uaccess>(ptr, &info.as_bytes()[..len]).map_err(|_| KernelError::BadAddress)?;
+    copy_to_user(ptr, &info.as_bytes()[..len]).map_err(|_| KernelError::BadAddress)?;
     let at = uattr.checked_add(4).ok_or(KernelError::BadAddress)?;
-    put_user::<Uaccess, u32>(at, len as u32).map_err(|_| KernelError::BadAddress)
+    put_user::<u32>(at, len as u32).map_err(|_| KernelError::BadAddress)
 }
 
 /// BPF_OBJ_GET_INFO_BY_FD on a map (Linux bpf_map_get_info_by_fd)
@@ -560,14 +558,13 @@ fn prog_info(
     info.xlated_prog_len = insns.len() as u32;
     if !insns.is_empty() && ulen != 0 && info.xlated_prog_insns != 0 {
         let n = ulen.min(insns.len());
-        copy_to_user::<Uaccess>(info.xlated_prog_insns, &insns[..n])
-            .map_err(|_| KernelError::BadAddress)?;
+        copy_to_user(info.xlated_prog_insns, &insns[..n]).map_err(|_| KernelError::BadAddress)?;
     }
     // One program, one tag (Linux: func_cnt or 1)
     let tags = info.nr_prog_tags;
     info.nr_prog_tags = 1;
     if tags != 0 && info.prog_tags != 0 {
-        copy_to_user::<Uaccess>(info.prog_tags, &[0u8; 8]).map_err(|_| KernelError::BadAddress)?;
+        copy_to_user(info.prog_tags, &[0u8; 8]).map_err(|_| KernelError::BadAddress)?;
     }
     info_out(&info, len, attr.info, uattr)
 }

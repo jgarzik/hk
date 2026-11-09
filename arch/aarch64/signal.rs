@@ -22,7 +22,6 @@
 //! The FP/SIMD registers come from (and rt_sigreturn writes them back to)
 //! the task's EL0 trap frame, where they live while it is in the kernel.
 
-use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, sa_flags};
 use crate::uaccess::{access_ok, copy_to_user};
@@ -327,7 +326,7 @@ pub fn setup_rt_frame(
     };
     let reserved_addr = frame_addr + RESERVED_OFFSET as u64;
     let mut end = reserved_addr + FPSIMD_SIZE as u64;
-    if copy_to_user::<Uaccess>(reserved_addr, fpsimd.as_bytes()).is_err() {
+    if copy_to_user(reserved_addr, fpsimd.as_bytes()).is_err() {
         return Err(KernelError::BadAddress);
     }
     if trap.error != 0 {
@@ -338,18 +337,18 @@ pub fn setup_rt_frame(
             },
             esr: trap.error,
         };
-        if copy_to_user::<Uaccess>(end, esr.as_bytes()).is_err() {
+        if copy_to_user(end, esr.as_bytes()).is_err() {
             return Err(KernelError::BadAddress);
         }
         end += core::mem::size_of::<EsrContext>() as u64;
     }
-    if copy_to_user::<Uaccess>(end, CtxHead::default().as_bytes()).is_err() {
+    if copy_to_user(end, CtxHead::default().as_bytes()).is_err() {
         return Err(KernelError::BadAddress);
     }
 
     // Frame record for unwinders: {x29, x30} of the interrupted code
     let record = [user_regs[29], user_regs[30]];
-    if copy_to_user::<Uaccess>(record_addr, record.as_bytes()).is_err() {
+    if copy_to_user(record_addr, record.as_bytes()).is_err() {
         return Err(KernelError::BadAddress);
     }
 
@@ -375,7 +374,7 @@ pub fn setup_rt_frame(
             ..FromBytes::zeroed()
         },
     };
-    if copy_to_user::<Uaccess>(frame_addr, frame.as_bytes()).is_err() {
+    if copy_to_user(frame_addr, frame.as_bytes()).is_err() {
         return Err(KernelError::BadAddress);
     }
 
@@ -404,7 +403,7 @@ pub fn setup_rt_frame(
 
 /// Read a plain-data `T` from user memory
 fn read_user<T: FromBytes>(addr: u64) -> Option<T> {
-    crate::uaccess::copy_val_from_user::<Uaccess, T>(addr).ok()
+    crate::uaccess::copy_val_from_user::<T>(addr).ok()
 }
 
 /// Walk the `__reserved` records at `addr` (Linux parse_user_sigframe):

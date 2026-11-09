@@ -37,7 +37,6 @@ use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::sync::RwSem;
 use crate::sync::spin::Mutex;
 
-use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -670,7 +669,7 @@ pub fn sys_mq_open(
 ) -> KernelResult<i32> {
     // Longer than NAME_MAX: ENAMETOOLONG (Linux: the lookup of the
     // name in the mqueue root)
-    let name = strncpy_from_user::<Uaccess>(name_ptr.addr(), NAME_MAX + 1)?;
+    let name = strncpy_from_user(name_ptr.addr(), NAME_MAX + 1)?;
     validate_mq_name(&name)?;
     let queue_name = name;
     let access_mode = oflag & O_ACCMODE;
@@ -741,7 +740,7 @@ pub fn sys_mq_open(
 pub fn sys_mq_unlink(name_ptr: UserPtr<u8>) -> KernelResult<()> {
     // Longer than NAME_MAX: ENAMETOOLONG (Linux: the lookup of the
     // name in the mqueue root)
-    let name = strncpy_from_user::<Uaccess>(name_ptr.addr(), NAME_MAX + 1)?;
+    let name = strncpy_from_user(name_ptr.addr(), NAME_MAX + 1)?;
     validate_mq_name(&name)?;
     let queue_name = name;
 
@@ -799,7 +798,7 @@ pub fn sys_mq_timedsend(
     // Read message from user space (bounded by msgsize, fallible)
     let mut msg_buf = crate::util::kmem::try_vec(msg_len, 0u8)?;
     if msg_len > 0 {
-        copy_from_user::<Uaccess>(&mut msg_buf, msg_ptr.addr(), msg_len)?;
+        copy_from_user(&mut msg_buf, msg_ptr.addr(), msg_len)?;
     }
 
     let deadline = mq_deadline(abs_timeout)?;
@@ -835,7 +834,7 @@ pub fn sys_mq_timedreceive(
 
     // Write message to user space
     if len > 0 {
-        copy_to_user::<Uaccess>(msg_ptr.addr(), &data[..len])?;
+        copy_to_user(msg_ptr.addr(), &data[..len])?;
     }
 
     // Write priority if requested

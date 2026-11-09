@@ -1594,7 +1594,7 @@ fn mincore_chunks(
     let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
     while pages > 0 {
         let n = mincore_chunk(mm, addr, pages.min(PAGE_SIZE), &mut buf)?;
-        crate::uaccess::copy_to_user::<crate::arch::Uaccess>(vec, &buf[..n])?;
+        crate::uaccess::copy_to_user(vec, &buf[..n])?;
         pages -= n as u64;
         vec += n as u64;
         addr += n as u64 * PAGE_SIZE;

@@ -12,7 +12,6 @@
 //! When the handler returns, it executes the trampoline which calls rt_sigreturn
 //! to restore the original context.
 
-use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, sa_flags};
 use crate::uaccess::{access_ok, copy_from_user, copy_to_user};
@@ -295,7 +294,7 @@ pub fn setup_rt_frame(
     // does not use them)
     let mut fp_area = fpu::FpuArea::init();
     let fp_len = fpu::save_sigframe(&mut fp_area);
-    if copy_to_user::<Uaccess>(fpstate_addr, &fp_area.0[..fp_len]).is_err() {
+    if copy_to_user(fpstate_addr, &fp_area.0[..fp_len]).is_err() {
         return Err(KernelError::BadAddress);
     }
 
@@ -354,7 +353,7 @@ pub fn setup_rt_frame(
     };
 
     // Copy frame to user stack
-    if copy_to_user::<Uaccess>(frame_addr, &frame.as_bytes()[..frame_size]).is_err() {
+    if copy_to_user(frame_addr, &frame.as_bytes()[..frame_size]).is_err() {
         return Err(KernelError::BadAddress);
     }
 
@@ -396,7 +395,7 @@ fn restore_sigframe_fpu(fpstate: u64) -> bool {
     }
     let mut area = fpu::FpuArea::init();
     // The legacy 512 bytes always; the XSAVE part if the frame says so
-    if copy_from_user::<Uaccess>(&mut area.0[..512], fpstate, 512).is_err() {
+    if copy_from_user(&mut area.0[..512], fpstate, 512).is_err() {
         return false;
     }
     let sw = &area.0[464..468];
@@ -405,7 +404,7 @@ fn restore_sigframe_fpu(fpstate: u64) -> bool {
         let Some(rest) = fpstate.checked_add(512) else {
             return false;
         };
-        if copy_from_user::<Uaccess>(&mut area.0[512..size], rest, size - 512).is_err() {
+        if copy_from_user(&mut area.0[512..size], rest, size - 512).is_err() {
             return false;
         }
     }
@@ -447,7 +446,7 @@ pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     };
 
     // Read UContext from user stack (any alignment: copied as bytes)
-    let Ok(uc) = crate::uaccess::copy_val_from_user::<Uaccess, UContext>(uc_addr) else {
+    let Ok(uc) = crate::uaccess::copy_val_from_user::<UContext>(uc_addr) else {
         return Err(crate::signal::sigreturn_badframe());
     };
     let sc = &uc.uc_mcontext;

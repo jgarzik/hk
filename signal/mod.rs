@@ -2712,8 +2712,7 @@ pub fn set_user_sigmask(
     if sigsetsize != 8 {
         return Err(KernelError::InvalidArgument);
     }
-    let bits = crate::uaccess::get_user::<crate::arch::Uaccess, u64>(umask)
-        .map_err(|_| KernelError::BadAddress)?;
+    let bits = crate::uaccess::get_user::<u64>(umask).map_err(|_| KernelError::BadAddress)?;
     set_temp_sigmask(SigSet::from_bits(bits));
     Ok(())
 }
