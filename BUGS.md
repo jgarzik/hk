@@ -870,10 +870,6 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **Copied helpers** (J, or as touched): four `current_time`s; about ten user-timespec readers each validating
   (Linux get_timespec64); three iovec structs and five
   importers; three Timeval, two Timespec types.
-- **Error conventions** (M1): Result<_, KernelError> about a thousand
-  times beside Result<_, i32> (both signs used) and Result<_, i64>
-  over a hundred and fifty; raw errno numbers and local errno
-  constants in the hundreds.
 - **Process-wide state per thread** (C): pgid/sid copied into every
   thread; one global CHILD_EXIT_WQ wakes every waiting parent on every
   exit.

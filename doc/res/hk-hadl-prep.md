@@ -1,6 +1,6 @@
 # hk: preparing for HADL (loadable, description-driven drivers)
 
-Design and plan, from doc/ideas/HADL-driver-architecture-research.md. doc/ROADMAP.md schedules only the preparatory items (M1, M2, M4, D); H2–H7 (HADL proper) are not scheduled.
+Design and plan, from doc/ideas/HADL-driver-architecture-research.md. doc/ROADMAP.md schedules only the preparatory items (M2, M4, D; M1 is done); H2–H7 (HADL proper) are not scheduled.
 
 ## 0. Constraints
 
