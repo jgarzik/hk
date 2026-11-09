@@ -971,9 +971,11 @@ impl FileOps for PipeWriteFileOps {
         if at.is_some() {
             return Err(KernelError::OperationNotSupported);
         }
-        let fl = file.get_flags();
-        let nonblock = fl & flags::O_NONBLOCK != 0 || rw.nowait();
-        pipe_write(pipe_of(file)?, from, nonblock, fl & flags::O_DIRECT != 0)
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait();
+        // Packet mode: the file's O_DIRECT (Linux is_packetized), in
+        // the I/O flags
+        let packet = rw.contains(RwFlags::DIRECT);
+        pipe_write(pipe_of(file)?, from, nonblock, packet)
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
@@ -1201,14 +1203,9 @@ impl FileOps for FifoFileOps {
         if file.get_flags() & flags::O_ACCMODE == flags::O_RDONLY {
             return Err(KernelError::BadFd);
         }
-        let fl = file.get_flags();
-        let nonblock = fl & flags::O_NONBLOCK != 0;
-        pipe_write(
-            &fifo_of(file)?.pipe,
-            from,
-            nonblock,
-            fl & flags::O_DIRECT != 0,
-        )
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
+        let packet = rw.contains(RwFlags::DIRECT);
+        pipe_write(&fifo_of(file)?.pipe, from, nonblock, packet)
     }
 
     fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
