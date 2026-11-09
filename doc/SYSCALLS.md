@@ -74,7 +74,7 @@
 - [x] preadv
 - [x] preadv2
 - [x] pwritev
-- [x] pwritev2
+- [x] pwritev2 (RWF_DSYNC, RWF_SYNC: synchronous where O_DSYNC would be: regular files, block devices)
 - [x] lseek
 - [x] truncate
 - [x] ftruncate

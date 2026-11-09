@@ -22,7 +22,7 @@ use crate::uaccess::{get_user, put_user};
 use crate::util::error::KernelError;
 use core::sync::atomic::Ordering;
 
-use super::file::{File, FileOps, RwFlags, seek};
+use super::file::{File, FileOps, RwFlags, generic_write_sync, seek};
 use super::iov_iter::{IovDest, IovSource};
 use crate::util::kalloc::arc_nofail;
 
@@ -371,7 +371,9 @@ impl FileOps for BlockFileOps {
         Ok(n)
     }
 
-    /// Through the device's page cache; no RWF_NOWAIT (EOPNOTSUPP)
+    /// Through the device's page cache, written back before return for
+    /// O_DSYNC, O_SYNC, RWF_DSYNC and RWF_SYNC (Linux blkdev_write_iter:
+    /// generic_write_sync); no RWF_NOWAIT (EOPNOTSUPP)
     fn write_iter(
         &self,
         file: &File,
@@ -386,7 +388,7 @@ impl FileOps for BlockFileOps {
         if at.is_none() {
             file.advance_pos(n as u64);
         }
-        Ok(n)
+        generic_write_sync(file, n, flags.contains(RwFlags::DSYNC))
     }
 
     /// Positions within the device only (Linux fixed_size_llseek)

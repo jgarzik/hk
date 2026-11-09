@@ -832,17 +832,10 @@ impl File {
             self.f_op.write_iter(self, from, at, flags)
         })()?;
         drop(lock);
-        // O_DSYNC/O_SYNC or a synchronous mount: the data reaches the
-        // storage before the write returns (Linux generic_write_sync,
-        // after i_rwsem is released)
-        // Only a write that wrote, and the superblock only without O_DSYNC
-        let sync = || {
-            flags.contains(RwFlags::DSYNC) || inode.superblock().is_some_and(|sb| sb.synchronous())
-        };
-        if n > 0 && sync() {
-            self.f_op.fsync(self)?;
-        }
-        Ok(n)
+        // After i_rwsem is released; a synchronous mount is Linux IS_SYNC
+        let sync =
+            flags.contains(RwFlags::DSYNC) || inode.superblock().is_some_and(|sb| sb.synchronous());
+        generic_write_sync(self, n, sync)
     }
 
     /// Seek
@@ -897,6 +890,17 @@ impl Drop for File {
             mnt.mntput();
         }
     }
+}
+
+/// After a write of `n` bytes to `file` that must be synchronous
+/// (`dsync`: IOCB_DSYNC, or the inode IS_SYNC), the data reaches the
+/// storage before the write returns, and an error doing so is the
+/// write's (Linux generic_write_sync)
+pub fn generic_write_sync(file: &File, n: usize, dsync: bool) -> Result<usize, KernelError> {
+    if n > 0 && dsync {
+        file.f_op.fsync(file)?;
+    }
+    Ok(n)
 }
 
 /// FIONREAD (Linux ioctl number): bytes ready to read
