@@ -536,27 +536,31 @@ fn run_init() -> ! {
     let rdinit = args.rdinit.as_deref().unwrap_or("/init");
     if fs::lookup_path(rdinit.as_bytes()).is_ok() {
         let e = try_init(rdinit, &args);
-        printkln!("Failed to execute {} (error {})", rdinit, e);
+        printkln!("Failed to execute {} (error {})", rdinit, e.to_errno_neg());
     }
     if let Some(init) = args.init.as_deref() {
         let e = try_init(init, &args);
-        panic!("Requested init {} failed (error {}).", init, e);
+        panic!(
+            "Requested init {} failed (error {}).",
+            init,
+            e.to_errno_neg()
+        );
     }
     for path in ["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"] {
         let e = try_init(path, &args);
-        if e != util::error::KernelError::NotFound.to_errno_neg() {
+        if e != util::error::KernelError::NotFound {
             printkln!(
                 "Starting init: {} exists but couldn't execute it (error {})",
                 path,
-                e
+                e.to_errno_neg()
             );
         }
     }
     panic!("No working init found.  Try passing init= option to kernel.");
 }
 
-/// execve `path` as init; returns only on failure, with the errno
-fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
+/// execve `path` as init; returns only on failure, with its error
+fn try_init(path: &str, args: &cmdline::InitArgs) -> util::error::KernelError {
     use task::exec::ArgStrings;
     let mut argv = ArgStrings::new();
     let mut envp = ArgStrings::new();
@@ -570,12 +574,12 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
                 .try_for_each(|e| envp.push(e.as_bytes()))
         });
     if let Err(e) = args_ok {
-        return -e.errno();
+        return e;
     }
     let mut frame_alloc = mm::frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
     match task::exec::do_execve(path.as_bytes().to_vec(), argv, envp, &mut frame_alloc) {
         Ok(never) => match never {},
-        Err(e) => e.to_errno_neg(),
+        Err(e) => e,
     }
 }
 
