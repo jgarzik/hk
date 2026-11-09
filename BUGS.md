@@ -138,15 +138,11 @@ Missing:
   and pipe allocations that may sleep reclaim directly; atomic heap
   allocations never do, so with anonymous memory filling RAM they fail
   at the low watermark until kswapd (J) keeps free memory above it.
-- SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
-  IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
-  by id still work there).
 - File mappings: no fault-around (Linux maps up to 16 cached pages
   per read fault); filesystems without a page cache (procfs) still
   map a private copy.
-- MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
-  holes); shmdt needs the address an attachment starts at (Linux also
-  finds a piece moved by mremap); SHM_EXEC is ignored.
+- shmdt needs the address an attachment starts at (Linux also finds a
+  piece moved by mremap); SHM_EXEC is ignored.
 - shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
   range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
   an address).
@@ -602,7 +598,7 @@ last page and bss of each segment (copied).
 
 ## The memory cgroup's memory.max is not enforced
 
-**Location**: `cgroup/memory.rs`, `mm/fault.rs`, `mm/shmem.rs`
+**Location**: `cgroup/memory.rs`, `mm/fault.rs`, `mm/filemap.rs`
 
 memory.max, memory.current and memory.events exist, but no page is
 charged: page faults (anonymous and shmem) and page tables are never

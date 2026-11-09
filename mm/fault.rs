@@ -20,7 +20,6 @@ use core::sync::atomic::Ordering;
 use super::anon_vma::AnonVma;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
 use super::pgtable::{PgTables, Pte, PteTable};
-use super::shmem::Shmem;
 use super::tlb::flush_tlb_page;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry};
 use crate::FRAME_ALLOCATOR;
@@ -65,7 +64,6 @@ struct Area {
     pgoff: u64,
     file: Option<Arc<File>>,
     anon_vma: Option<Arc<AnonVma>>,
-    shmem: Option<Arc<Shmem>>,
 }
 
 impl Area {
@@ -121,7 +119,6 @@ fn area_of(vma: &super::Vma) -> Area {
         pgoff: vma.pgoff,
         file: vma.file.clone(),
         anon_vma: vma.anon_vma.clone(),
-        shmem: vma.shmem.clone(),
     }
 }
 
@@ -347,21 +344,16 @@ fn do_huge_anon(mm: &Mm, t: PgTables<'_>, addr: u64, area: &Area) -> bool {
 }
 
 /// The page to map at `addr` of a VMA with no page there yet, with a
-/// reference for the new PTE: the shared object's page for shared
-/// anonymous memory (Linux shmem_fault), else a new page, zeroed for
-/// anonymous memory or holding a private copy of the file data (Linux
-/// do_anonymous_page, do_read_fault)
+/// reference for the new PTE: the page cache's for a file that maps its
+/// cache (tmpfs files of shared anonymous memory and SysV shm included,
+/// Linux shmem_fault), else a new page, zeroed for anonymous memory or
+/// holding a private copy of the file data (Linux do_anonymous_page,
+/// do_read_fault)
 /// Also whether the page comes locked (a page-cache page: unlocked
 /// once mapped) and whether it must be mapped read-only (a private
 /// mapping's page-cache page: a write copies it, Linux do_read_fault).
 fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool), VmFault> {
     let exec = area.prot & PROT_EXEC != 0;
-    if let Some(sh) = &area.shmem {
-        return sh
-            .get_page(area.pgoff(addr) / PAGE_SIZE)
-            .inspect(|&f| paging::sync_page(f, exec))
-            .map(|f| (f, false, false));
-    }
     if let (false, Some(f)) = (area.anon, &area.file)
         && let Some(r) = file_page(f, area.pgoff(addr), area, access)
     {

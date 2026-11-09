@@ -58,8 +58,9 @@ pub struct KernIpcPerm {
     pub lock: Mutex<KernIpcPermMutable>,
     /// Deletion marker (lock-free, checked under RCU-like patterns)
     pub deleted: AtomicBool,
-    /// User-supplied key (immutable after creation)
-    pub key: i32,
+    /// User-supplied key; IPC_PRIVATE once a removed shm segment lives
+    /// on (Linux ipc_set_key_private), changed under the table's lock
+    key: core::sync::atomic::AtomicI32,
     /// Creator UID (immutable after creation)
     pub cuid: u32,
     /// Creator GID (immutable after creation)
@@ -83,7 +84,7 @@ impl KernIpcPerm {
                 seq: 0,
             }),
             deleted: AtomicBool::new(false),
-            key,
+            key: core::sync::atomic::AtomicI32::new(key),
             cuid: uid,
             cgid: gid,
             refcount: AtomicU32::new(1),
@@ -123,6 +124,11 @@ impl KernIpcPerm {
         prev == 1
     }
 
+    /// The key (IPC_PRIVATE after `IpcIds::set_key_private`)
+    pub fn key(&self) -> i32 {
+        self.key.load(Ordering::Relaxed)
+    }
+
     /// Mark as deleted
     pub fn mark_deleted(&self) {
         self.deleted.store(true, Ordering::Release);
@@ -138,7 +144,7 @@ impl KernIpcPerm {
     /// Acquires the lock internally.
     pub fn fill_ipc64_perm(&self, out: &mut crate::ipc::Ipc64Perm) {
         let inner = self.lock.lock();
-        out.key = self.key;
+        out.key = self.key();
         out.uid = inner.uid;
         out.gid = inner.gid;
         out.cuid = self.cuid;
@@ -282,7 +288,7 @@ impl<T: IpcObject> IpcIds<T> {
         }
 
         // Insert into maps
-        let key = obj.perm().key;
+        let key = obj.perm().key();
         inner.entries.insert(idx, obj);
         if key != IPC_PRIVATE {
             inner.key_map.insert(key, idx);
@@ -331,7 +337,7 @@ impl<T: IpcObject> IpcIds<T> {
         let idx = (id as u32) & (IPCMNI - 1);
 
         if let Some(obj) = inner.entries.remove(&idx) {
-            let key = obj.perm().key;
+            let key = obj.perm().key();
             if key != IPC_PRIVATE {
                 inner.key_map.remove(&key);
             }
@@ -341,6 +347,58 @@ impl<T: IpcObject> IpcIds<T> {
         } else {
             None
         }
+    }
+
+    /// Remove `obj` (id `id`) if it is still the one in the table (a
+    /// removed shm segment's last detach)
+    pub fn remove_obj(&self, id: i32, obj: &Arc<T>) {
+        let idx = (id as u32) & (IPCMNI - 1);
+        let same = self
+            .inner
+            .read()
+            .entries
+            .get(&idx)
+            .is_some_and(|o| Arc::ptr_eq(o, obj));
+        if same {
+            self.remove(id);
+        }
+    }
+
+    /// Drop `obj`'s key so lookups by key miss it while it stays found
+    /// by id (Linux ipc_set_key_private)
+    pub fn set_key_private(&self, obj: &T) {
+        let mut inner = self.inner.write();
+        let key = obj.perm().key();
+        if key != IPC_PRIVATE {
+            inner.key_map.remove(&key);
+        }
+        obj.perm().key.store(IPC_PRIVATE, Ordering::Relaxed);
+    }
+
+    /// The object at table index `idx` and its id (SHM_STAT; Linux
+    /// ipc_obtain_object_idr)
+    pub fn find_by_idx(&self, idx: i32) -> Option<(IpcRef<T>, i32)> {
+        let idx = u32::try_from(idx).ok().filter(|&i| i < IPCMNI)?;
+        let inner = self.inner.read();
+        let obj = inner.entries.get(&idx)?;
+        let perm = obj.perm();
+        let id = perm.lock.lock().id;
+        (!perm.is_deleted() && perm.get_ref()).then(|| (IpcRef(obj.clone()), id))
+    }
+
+    /// The highest index in use, -1 if none (Linux ipc_get_maxidx)
+    pub fn max_idx(&self) -> i32 {
+        self.inner
+            .read()
+            .entries
+            .keys()
+            .next_back()
+            .map_or(-1, |&i| i as i32)
+    }
+
+    /// Objects in the table (Linux ids->in_use)
+    pub fn in_use(&self) -> u32 {
+        self.inner.read().in_use
     }
 }
 

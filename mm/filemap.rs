@@ -261,6 +261,9 @@ static NR_FILE: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
     crate::percpu![core::sync::atomic::AtomicI64::new(0)];
 static NR_UNEVICT: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
     crate::percpu![core::sync::atomic::AtomicI64::new(0)];
+/// tmpfs pages (Linux NR_SHMEM): those of a mapping charged to a tmpfs
+static NR_SHMEM: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
+    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
 
 fn sum(c: &crate::cpu::PerCpu<core::sync::atomic::AtomicI64>) -> u64 {
     c.for_each_possible()
@@ -275,6 +278,14 @@ fn count_file(m: &AddressSpace, d: i64) {
     if m.has_flag(AS_UNEVICTABLE) {
         NR_UNEVICT.this().fetch_add(d, Ordering::Relaxed);
     }
+    if m.acct.get().is_some() {
+        NR_SHMEM.this().fetch_add(d, Ordering::Relaxed);
+    }
+}
+
+/// tmpfs and shared memory pages (Linux NR_SHMEM): /proc/meminfo Shmem
+pub fn nr_shmem() -> u64 {
+    sum(&NR_SHMEM)
 }
 
 /// Page-cache pages (Linux NR_FILE_PAGES)

@@ -504,15 +504,13 @@ fn make_key(uaddr: u64, private: bool) -> KernelResult<FutexKey> {
 }
 
 /// The object key of `uaddr` in `vma`, if it is a shared mapping of a
-/// shared memory object or a file (both indexed from `vma.offset`)
+/// file (shared anonymous memory and SysV shm are tmpfs files): its
+/// inode and the offset (Linux get_futex_key: i_sequence, pgoff)
 fn object_key(vma: &crate::mm::vma::Vma, uaddr: u64) -> Option<FutexKey> {
     if !vma.is_shared() {
         return None;
     }
-    let id = match &vma.shmem {
-        Some(s) => s.seq.get(),
-        None => vma.file.as_ref()?.mapping_inode()?.i_sequence.get(),
-    };
+    let id = vma.file.as_ref()?.mapping_inode()?.i_sequence.get();
     Some(FutexKey {
         kind: KeyKind::Object,
         id,

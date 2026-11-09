@@ -42,7 +42,6 @@ pub mod pgtable;
 pub mod ptl;
 pub mod remote;
 pub mod rmap;
-pub mod shmem;
 pub mod slab;
 pub mod swap;
 pub mod swap_entry;
@@ -774,7 +773,7 @@ impl MmStruct {
             .checked_add((split_addr - vma.start) / PAGE_SIZE)?;
 
         // Adjust the offset into the backing file or shared object
-        if new_vma.file.is_some() || new_vma.shmem.is_some() {
+        if new_vma.file.is_some() {
             new_vma.offset += split_addr - vma.start;
         }
 
@@ -1097,11 +1096,11 @@ fn vma_needs_copy(v: &Vma) -> bool {
     if v.flags & VM_WIPEONFORK != 0 {
         return false;
     }
-    let refaults = v.shmem.is_some()
-        || v.file
-            .as_ref()
-            .and_then(|f| f.mapping_inode())
-            .is_some_and(|i| i.i_op.maps_cache());
+    let refaults = v
+        .file
+        .as_ref()
+        .and_then(|f| f.mapping_inode())
+        .is_some_and(|i| i.i_op.maps_cache());
     !(v.is_shared() && refaults)
 }
 

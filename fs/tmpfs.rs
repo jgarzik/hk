@@ -555,6 +555,12 @@ pub fn shmem_file_setup(name: &[u8], size: u64) -> Result<Arc<super::File>, Kern
     try_arc(f)
 }
 
+/// The file of a SysV shm segment or of shared anonymous memory (Linux
+/// shmem_kernel_file_setup / shmem_zero_setup's "dev/zero")
+pub fn shmem_kernel_file_setup(name: &[u8], size: u64) -> Result<Arc<super::File>, KernelError> {
+    shmem_file_setup(name, size)
+}
+
 /// The tmpfs filesystem type (Linux shmem_fs_type)
 pub static TMPFS_TYPE: FileSystemType = FileSystemType {
     name: "tmpfs",

@@ -923,8 +923,13 @@ pub mod falloc_mode {
 /// Linux ksys_fallocate + vfs_fallocate: the argument and file checks in
 /// Linux's order, then the filesystem's op under i_rwsem
 pub fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> KernelResult<()> {
-    use falloc_mode::*;
     let file = fget(fd)?;
+    vfs_fallocate(&file, mode, offset, len)
+}
+
+/// Linux vfs_fallocate on an open file (fallocate(2), MADV_REMOVE)
+pub fn vfs_fallocate(file: &super::File, mode: i32, offset: i64, len: i64) -> KernelResult<()> {
+    use falloc_mode::*;
     if offset < 0 || len <= 0 {
         return Err(KernelError::InvalidArgument);
     }

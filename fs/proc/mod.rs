@@ -2150,8 +2150,9 @@ fn gen_version() -> Vec<u8> {
 /// allocator's exact count; Buffers is the block devices' caches,
 /// Cached the rest of the page cache (ramfs included, as Linux counts
 /// tmpfs), Unevictable ramfs's, MemAvailable free plus the clean
-/// evictable cache. Writeback is 0 (writes are synchronous). Slab is
-/// the slab caches' pages.
+/// evictable cache. Writeback is 0 (writes are synchronous). Shmem is
+/// tmpfs's pages (SysV shm and shared anonymous memory included). Slab
+/// is the slab caches' pages.
 fn gen_meminfo() -> Vec<u8> {
     use alloc::fmt::Write;
     let fa = &crate::FRAME_ALLOCATOR;
@@ -2184,6 +2185,7 @@ fn gen_meminfo() -> Vec<u8> {
         ("SwapFree:", swap_free * 4),
         ("Dirty:", dirty),
         ("Writeback:", 0),
+        ("Shmem:", filemap::nr_shmem() * 4),
         ("Slab:", slab),
     ] {
         let _ = writeln!(out, "{label:<16}{kb:>8} kB");
@@ -2240,6 +2242,26 @@ fn subdir(sb: &Arc<SuperBlock>, dir: &Arc<Inode>, name: &str) -> Result<Arc<Inod
     let d = mk_inode(sb, InodeMode::directory(0o555), ProcfsInodeData::new_dir()?)?;
     children.insert(String::from(name), d.clone());
     Ok(d)
+}
+
+/// /proc/sysvipc (Linux ipc/util.c ipc_init_proc_interface): shm
+fn build_sysvipc(sb: &Arc<SuperBlock>, root: &Arc<Inode>) -> Result<(), KernelError> {
+    let dir = subdir(sb, root, "sysvipc")?;
+    let shm = mk_inode(
+        sb,
+        InodeMode::regular(0o444),
+        ProcfsInodeData::new_file(crate::ipc::shm::proc_sysvipc_shm),
+    )?;
+    let private = dir.get_private().ok_or(KernelError::Io)?;
+    let w = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<ProcfsInodeWrapper>()
+        .ok_or(KernelError::Io)?;
+    if let Some(c) = w.0.write().children_mut() {
+        c.insert(String::from("shm"), shm);
+    }
+    Ok(())
 }
 
 /// /proc/sys from the sysctl tables
@@ -2485,6 +2507,7 @@ fn procfs_mount(
     }
 
     build_sys(&sb, &root_inode)?;
+    build_sysvipc(&sb, &root_inode)?;
 
     // Create root dentry
     let root_dentry = try_arc(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;

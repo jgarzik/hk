@@ -16,8 +16,7 @@
 //! search skips unmarked subtrees.
 //!
 //! Locking: the tree has no lock of its own: its owner keeps it under
-//! one (Linux xa_lock), e.g. a mapping's `i_pages`, `Shmem.root`, the
-//! swap cache. Nodes come from the closure a store is given: under a
+//! one (Linux xa_lock), e.g. a mapping's `i_pages`, the swap cache. Nodes come from the closure a store is given: under a
 //! spinlock that is a [`Preload`] filled before taking the lock (Linux
 //! xas_nomem), so the allocation can sleep and reclaim.
 

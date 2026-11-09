@@ -204,22 +204,19 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   reverse map finds its address in each VMA of the chain directly; its
   map count counts the PTEs mapping it. Pages exec copies the image
   into are not on the reverse map.
-- **Shared anonymous memory.** A MAP_SHARED|MAP_ANONYMOUS mapping gets a
-  `Shmem` object (Linux shmem_zero_setup) holding its pages by index:
-  every VMA mapping it (fork's copies, split pieces, mremap) faults the
-  same page in, so pages first touched after fork are shared too, and
-  MADV_DONTNEED keeps the data (MADV_REMOVE clears it for every
-  mapping: a page mapped elsewhere is zeroed in place, others freed).
-  Its size is fixed at mmap (a page past it, after mremap grew the
-  mapping, is SIGBUS, as on Linux); its pages and its index (an `mm::xarray`, a 4-level
-  radix tree of 512-entry nodes, like a page table) are user memory
-  from frames, none from the kernel heap (they stop at the kernel's
-  reserve; a fault out of memory kills the process). The object holds
-  a reference on each page; it goes with its last VMA. A SysV shm
-  segment is such an object too: shmat maps it lazily, and each attach
-  VMA holds a `ShmAttach` counted in shm_nattch (Linux shm_open /
-  shm_close), so fork, split, munmap, shmdt, exit and exec keep the
-  count, and the last detach of a removed segment destroys it.
+- **Shared anonymous memory.** A MAP_SHARED|MAP_ANONYMOUS mapping (or a
+  shared one of /dev/zero) maps a file of its size on the kernel's
+  tmpfs (Linux shmem_zero_setup: "/dev/zero (deleted)" in maps): every
+  VMA mapping it (fork's copies, split pieces, mremap) faults the same
+  page-cache page in, so pages first touched after fork are shared too,
+  and MADV_DONTNEED keeps the data (MADV_REMOVE punches the hole for
+  every mapping). Its size is fixed at mmap (a page past it, after
+  mremap grew the mapping, is SIGBUS, as on Linux). A SysV shm segment
+  is such a file too ("SYSV<key>"): shmat maps it lazily, and each
+  attach VMA holds a `ShmAttach` counted in shm_nattch (Linux shm_open
+  / shm_close), so fork, split, munmap, shmdt, exit and exec keep the
+  count, and the last detach of a removed (SHM_DEST) segment destroys
+  it. memfd_create's files live on the same tmpfs.
 - **File mappings.** A MAP_SHARED mapping of a ramfs file maps the
   file's page-cache pages (`InodeOps::map_page`, Linux filemap_fault):
   every mapping, fork's copies and read()/write() see the same data, and

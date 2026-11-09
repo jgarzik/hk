@@ -272,7 +272,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] shmget
 - [x] shmat
 - [x] shmdt
-- [x] shmctl
+- [x] shmctl (IPC_STAT, IPC_SET, IPC_RMID (SHM_DEST while attached), IPC_INFO, SHM_INFO, SHM_STAT, SHM_STAT_ANY, SHM_LOCK, SHM_UNLOCK)
 - [x] semget
 - [x] semop
 - [x] semtimedop

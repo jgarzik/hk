@@ -21,6 +21,10 @@
 //!   unless opened O_EXCL (ENOENT); read-only, without O_DIRECTORY or
 //!   with O_CREAT is EINVAL, a file ENOTDIR, a missing one ENOENT, procfs
 //!   EOPNOTSUPP; on tmpfs it takes an inode (ENOSPC), its first link none
+//! - MADV_REMOVE_TMPFS: MADV_REMOVE of a shared mapping of a tmpfs file
+//!   punches the hole (Linux madvise_remove -> shmem_fallocate): the
+//!   page reads zeros through the mapping and read(), the next one and
+//!   the size stay; on ramfs (no hole punching) EOPNOTSUPP
 //! - DEVTMPFS_TMPFS: devtmpfs is a tmpfs with mode=755 (Linux
 //!   devtmpfs_init); another mount shows the same superblock; a bad
 //!   option is EINVAL, size= is parsed and dropped (Linux 6.15+; up to
@@ -51,6 +55,7 @@ pub fn run_tests() {
     rootfs();
     devtmpfs();
     tmpfile();
+    madv_remove();
     sys_rmdir(MP.as_ptr());
 }
 
@@ -470,6 +475,60 @@ fn tmpfile() {
         t.eq(b"ffree", statfs().f_ffree, 0);
         sys_close(fd as u64);
         sys_unlink(p.as_ptr());
+        sys_umount2(MP.as_ptr(), 0);
+    }
+    t.done();
+}
+
+fn madv_remove() {
+    use hk_syscall::{
+        MADV_REMOVE, MAP_SHARED, PROT_READ, PROT_WRITE, sys_madvise, sys_mmap, sys_munmap,
+    };
+    const EOPNOTSUPP: i64 = -95;
+    let mut t = T::new(b"MADV_REMOVE_TMPFS");
+    let path = b"/tmp/madv_rm\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR, 0o644);
+    let buf = [b'A'; 8192];
+    t.eq(b"write", sys_write(fd as u64, buf.as_ptr(), 8192), 8192);
+    let m = sys_mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd as i32, 0);
+    if !t.ok(b"mmap", m > 0, m) {
+        return t.done();
+    }
+    t.eq(b"remove", sys_madvise(m as u64, 4096, MADV_REMOVE), 0);
+    // SAFETY: the 8192-byte shared mapping made above
+    let (a, b) = unsafe {
+        (
+            (m as *const u8).read_volatile(),
+            ((m + 4096) as *const u8).read_volatile(),
+        )
+    };
+    t.eq(b"hole mapped", i64::from(a), 0);
+    t.eq(b"next page", i64::from(b), i64::from(b'A'));
+    let mut rd = [1u8; 1];
+    sys_pread64(fd as i32, rd.as_mut_ptr(), 1, 0);
+    t.eq(b"hole read", i64::from(rd[0]), 0);
+    let mut s = Stat::default();
+    sys_stat(path.as_ptr(), &mut s);
+    t.eq(b"size", s.st_size, 8192);
+    sys_munmap(m as u64, 8192);
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    if t.eq(
+        b"ramfs",
+        sys_mount(b"none\0".as_ptr(), MP.as_ptr(), b"ramfs\0".as_ptr(), 0, 0),
+        0,
+    ) {
+        let fd = sys_open(b"/tmp/tmpfs_lim/r\0".as_ptr(), O_CREAT | O_RDWR, 0o644);
+        sys_write(fd as u64, buf.as_ptr(), 4096);
+        let m = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd as i32, 0);
+        t.eq(
+            b"ramfs remove",
+            sys_madvise(m as u64, 4096, MADV_REMOVE),
+            EOPNOTSUPP,
+        );
+        sys_munmap(m as u64, 4096);
+        sys_close(fd as u64);
+        sys_unlink(b"/tmp/tmpfs_lim/r\0".as_ptr());
         sys_umount2(MP.as_ptr(), 0);
     }
     t.done();

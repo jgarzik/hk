@@ -14,7 +14,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::pgtable::PgTables;
-use super::shmem::Shmem;
 use super::{
     MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
     MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
@@ -25,9 +24,9 @@ use super::{
 use crate::sync::{RwSemReadGuard, RwSemWriteGuard};
 use crate::util::error::{KernelError, KernelResult};
 
-/// A hole to punch in a shared object once the mm lock is dropped
-/// (MADV_REMOVE): the object and its page range [from, to)
-type Punch = (Arc<Shmem>, u64, u64);
+/// A hole to punch in a file once the mm lock is dropped (MADV_REMOVE):
+/// the file, the byte offset and the length
+type Punch = (Arc<crate::fs::File>, u64, u64);
 
 /// madvise(2): give advice about [start, start + len) (Linux do_madvise)
 pub fn sys_madvise(start: u64, len: u64, advice: i32) -> KernelResult<()> {
@@ -51,10 +50,13 @@ pub fn sys_madvise(start: u64, len: u64, advice: i32) -> KernelResult<()> {
     #[cfg(feature = "mmcheck")]
     super::check::verify(&mm, map.get(), "madvise");
     drop(map);
-    // MADV_REMOVE frees the shared object's pages after the zap, also
-    // for the VMAs done before an error (Linux punches VMA by VMA)
-    for (sh, from, to) in punch {
-        sh.punch(from, to);
+    // MADV_REMOVE punches the holes with the mm lock dropped (Linux
+    // madvise_remove -> vfs_fallocate, VMA by VMA), also for the VMAs
+    // done before an error; the first failure ends it
+    use crate::fs::misc::falloc_mode::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
+    for (f, off, len) in punch {
+        let mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+        crate::fs::misc::vfs_fallocate(&f, mode, off as i64, len as i64)?;
     }
     r
 }
@@ -190,7 +192,7 @@ fn vma_advise(
         MADV_DONTNEED | MADV_FREE => {
             dontneed(vma, owner, PgTables::new(owner, mm), start, end, advice)
         }
-        MADV_REMOVE => remove(vma, owner, PgTables::new(owner, mm), start, end, punch),
+        MADV_REMOVE => remove(vma, start, end, punch),
         _ => {
             let flags = new_flags(vma, advice)?;
             match map {
@@ -204,7 +206,7 @@ fn vma_advise(
 /// Private anonymous memory: no file, shared object or SysV segment
 /// behind it (Linux vma_is_anonymous)
 fn is_anon(vma: &Vma) -> bool {
-    vma.file.is_none() && vma.shmem.is_none() && vma.shm.is_none()
+    vma.file.is_none() && vma.shm.is_none()
 }
 
 /// MADV_COLD / MADV_PAGEOUT: refused on locked memory (Linux
@@ -324,38 +326,20 @@ fn dontneed(
     Ok(())
 }
 
-/// MADV_REMOVE (Linux madvise_remove): only memory with a backing object
-/// that may be written through the mapping (EINVAL for locked or private
-/// anonymous memory; EACCES for a private file mapping, a shared one of
-/// a file not open for writing, or a SHM_RDONLY attachment; EOPNOTSUPP
-/// for a file, as for a Linux filesystem without hole punching, like
-/// ramfs). The range is zapped and its hole recorded in `punch`.
-fn remove(
-    vma: &Vma,
-    owner: &Mm,
-    t: PgTables<'_>,
-    start: u64,
-    end: u64,
-    punch: &mut Vec<Punch>,
-) -> Result<(), KernelError> {
-    if vma.is_locked() || (vma.file.is_none() && vma.shmem.is_none()) {
+/// MADV_REMOVE (Linux madvise_remove): only a file mapping that may
+/// write it (EINVAL for locked or anonymous memory; EACCES for a private
+/// mapping, a shared one of a file not open for writing, or a SHM_RDONLY
+/// attachment). The hole is recorded in `punch`, punched by the file
+/// system after the mm lock is dropped (tmpfs unmaps it everywhere; a
+/// file system without hole punching, like ramfs, is EOPNOTSUPP).
+fn remove(vma: &Vma, start: u64, end: u64, punch: &mut Vec<Punch>) -> Result<(), KernelError> {
+    let Some(f) = vma.file.as_ref().filter(|_| !vma.is_locked()) else {
         return Err(KernelError::InvalidArgument);
-    }
-    let maywrite = vma.is_shared()
-        && vma.file.as_ref().is_none_or(|f| f.is_writable())
-        && !vma.shm.as_ref().is_some_and(|a| a.rdonly());
-    if !maywrite {
+    };
+    if !vma.shared_maywrite() || vma.shm.as_ref().is_some_and(|a| a.rdonly()) {
         return Err(KernelError::PermissionDenied);
     }
-    if vma.file.is_some() {
-        return Err(KernelError::OperationNotSupported);
-    }
-    super::memory::zap_range(&mut super::gather::Gather::new(owner), t, start, end);
-    if let Some(sh) = &vma.shmem {
-        let first = vma.offset + start - vma.start;
-        let last = vma.offset + end - vma.start;
-        punch.push((sh.clone(), first / PAGE_SIZE, last / PAGE_SIZE));
-    }
+    punch.push((f.clone(), vma.offset + start - vma.start, end - start));
     Ok(())
 }
 

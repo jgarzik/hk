@@ -171,7 +171,6 @@ pub fn sys_mmap(
         }
         _ => return Err(KernelError::InvalidArgument), // 0x00 = neither specified
     };
-    let is_private = !is_shared;
     // Suppress unused warning - is_shared_validate is for future validation
     let _ = is_shared_validate;
 
@@ -276,18 +275,22 @@ pub fn sys_mmap(
     // Create VMA
     let mut vma = if let Some(f) = file {
         Vma::new_file(map_addr, map_addr + length, prot, flags, f, offset)
+    } else if is_shared {
+        // Shared anonymous memory is a file of its size on the kernel's
+        // tmpfs (Linux shmem_zero_setup: "/dev/zero (deleted)")
+        let f = crate::fs::tmpfs::shmem_kernel_file_setup(b"dev/zero", length)?;
+        Vma::new_file(
+            map_addr,
+            map_addr + length,
+            prot,
+            flags & !MAP_ANONYMOUS,
+            f,
+            0,
+        )
     } else {
-        // Anonymous mapping
+        // Private anonymous memory, with an anon_vma for the reverse map
         let mut v = Vma::new(map_addr, map_addr + length, prot, flags | MAP_ANONYMOUS);
-        // Set up anon_vma for private anonymous mappings (for swap-out
-        // reverse mapping); shared ones get a shared object for their
-        // pages (Linux shmem_zero_setup)
-        let made = if is_private {
-            AnonVma::new().map(|av| v.set_anon_vma(av))
-        } else {
-            super::shmem::Shmem::new(length / PAGE_SIZE).map(|s| v.shmem = Some(s))
-        };
-        made?;
+        v.set_anon_vma(AnonVma::new()?);
         v
     };
 
@@ -569,7 +572,7 @@ fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) -> Result<(), KernelEr
 /// A VMA the heap can grow into: private anonymous memory, no file
 /// or shared object behind it
 fn is_heap(v: &Vma) -> bool {
-    v.file.is_none() && v.shmem.is_none() && v.shm.is_none() && v.is_private()
+    v.file.is_none() && v.shm.is_none() && v.is_private()
 }
 
 // ============================================================================
