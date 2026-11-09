@@ -820,7 +820,9 @@ impl PciDevice {
     /// `handler` and enable INTx at the device (Linux request_irq on
     /// pdev->irq; INTx is enabled as pci_enable_device does). Dropping
     /// the registration frees the line (Linux free_irq; INTx stays
-    /// enabled at the device)
+    /// enabled at the device, so the driver first stops the device
+    /// interrupting: a shared level-triggered line left asserted with
+    /// no handler to ack it is disabled as nobody cared)
     ///
     /// # Returns
     /// The registration; NoDevice without an INTx line, the IRQ table's

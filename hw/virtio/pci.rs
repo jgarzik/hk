@@ -426,7 +426,9 @@ impl VirtioDevice {
 
     /// Unregister the interrupt handler and drop the driver's callbacks
     /// (Linux del_vqs: vp_del_vqs -> free_irq); a later bind may
-    /// `request_irq` again. No handler is running once it returns.
+    /// `request_irq` again. No handler is running once it returns. The
+    /// caller resets the device first, so it is not left asserting a
+    /// shared level-triggered line nobody acks.
     pub fn free_irq(&self) {
         // Dropped outside the lock: the callbacks may own the driver
         let irq = self.irq.lock().take();
@@ -582,8 +584,8 @@ impl crate::base::Bound for VirtioPciDev {
     fn remove(&self) {
         self.dev.del();
         super::free_index(self.index);
-        self.vdev.free_irq();
         let _ = self.vdev.reset();
+        self.vdev.free_irq();
         let cmd = self.pci.cfg_read16(PCI_COMMAND);
         self.pci
             .cfg_write16(PCI_COMMAND, cmd & !crate::hw::pci::command::BUS_MASTER);

@@ -307,6 +307,9 @@ impl crate::base::Bound for VirtioBlkDev {
         let b = &self.0;
         // Nothing in flight, nothing more started
         del_gendisk(&b.disk);
+        // Quiet before its IRQ goes (Linux: virtio_reset_device, then
+        // del_vqs frees the IRQ); `stop` frees the rings
+        let _ = b.vdev.reset();
         b.vdev.free_irq();
         let qs = b.disk.queue.mq().map_or(Vec::new(), |m| m.release());
         stop(&b.vdev, qs);
@@ -492,6 +495,7 @@ impl VirtioDriver for VirtioBlkDriver {
         })
         .inspect_err(|_| stop(&vdev, disk.queue.mq().map_or(Vec::new(), |m| m.release())))?;
         let fail = |e| {
+            let _ = vdev.reset();
             vdev.free_irq();
             stop(&vdev, disk.queue.mq().map_or(Vec::new(), |m| m.release()));
             e
