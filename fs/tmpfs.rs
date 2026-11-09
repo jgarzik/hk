@@ -457,6 +457,12 @@ fn parse(data: &[u8]) -> Result<Opts, KernelError> {
     Ok(o)
 }
 
+/// Check a tmpfs options string (EINVAL as `parse`) without using it
+/// (devtmpfs: a mount shows the one superblock, Linux devtmpfs_get_tree)
+pub fn check_opts(data: &[u8]) -> Result<(), KernelError> {
+    parse(data).map(|_| ())
+}
+
 // ============================================================================
 // The file system type
 // ============================================================================

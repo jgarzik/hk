@@ -17,9 +17,9 @@
 //!   sizes it before the initrd and init memory are freed); ramfs, which
 //!   it no longer is, has no xattrs or fallocate (EOPNOTSUPP)
 //! - DEVTMPFS_TMPFS: devtmpfs is a tmpfs with mode=755 (Linux
-//!   devtmpfs_init); another mount shows the same superblock and
-//!   reconfigures it with its options (Linux reconfigure_single, up to
-//!   6.14): a bad one is EINVAL, size= changes /dev's limit too
+//!   devtmpfs_init); another mount shows the same superblock; a bad
+//!   option is EINVAL, size= is parsed and dropped (Linux 6.15+; up to
+//!   6.14 reconfigure_single applied it to /dev too)
 
 use crate::exec::busybox::contains;
 use crate::harness::T;
@@ -310,33 +310,50 @@ fn devtmpfs() {
     };
     t.eq(b"bad option", dt(b"bogus\0"), EINVAL);
     if t.eq(b"mount", dt(b"size=1m\0"), 0) {
-        t.eq(b"size", statfs().f_blocks, 256);
-        let mut now = LinuxStatFs::default();
-        sys_statfs(b"/dev\0".as_ptr(), &mut now);
-        t.eq(b"same sb", now.f_blocks, 256);
         let mut s2 = Stat::default();
         sys_stat(b"/tmp/tmpfs_lim/null\0".as_ptr(), &mut s2);
         t.eq(b"null", s2.st_rdev as i64, 0x103);
-        sys_umount2(MP.as_ptr(), 0);
-        // /dev's limit back
-        let mut opt = [0u8; 40];
-        opt[..10].copy_from_slice(b"nr_blocks=");
-        let (mut digits, mut n, mut v) = ([0u8; 20], 0, dev.f_blocks as u64);
-        loop {
-            digits[n] = b'0' + (v % 10) as u8;
-            n += 1;
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
-        for i in 0..n {
-            opt[10 + i] = digits[n - 1 - i];
-        }
-        t.eq(b"restore", dt(&opt), 0);
+        let mut now = LinuxStatFs::default();
         sys_statfs(b"/dev\0".as_ptr(), &mut now);
-        t.eq(b"restored", now.f_blocks, dev.f_blocks);
-        sys_umount2(MP.as_ptr(), 0);
+        if crate::helpers::linux_at_least(6, 15) {
+            t.eq(b"size dropped", now.f_blocks, dev.f_blocks);
+            sys_umount2(MP.as_ptr(), 0);
+        } else {
+            t.eq(b"size applied", now.f_blocks, 256);
+            sys_umount2(MP.as_ptr(), 0);
+            restore_dev(&mut t, dev.f_blocks);
+        }
     }
     t.done();
+}
+
+/// /dev's block limit back to `blocks` after a pre-6.15 devtmpfs mount
+/// changed it
+fn restore_dev(t: &mut T, blocks: i64) {
+    let mut opt = [0u8; 40];
+    opt[..10].copy_from_slice(b"nr_blocks=");
+    let (mut digits, mut n, mut v) = ([0u8; 20], 0, blocks as u64);
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..n {
+        opt[10 + i] = digits[n - 1 - i];
+    }
+    let r = sys_mount(
+        b"devtmpfs\0".as_ptr(),
+        MP.as_ptr(),
+        b"devtmpfs\0".as_ptr(),
+        0,
+        opt.as_ptr() as u64,
+    );
+    t.eq(b"restore", r, 0);
+    sys_umount2(MP.as_ptr(), 0);
+    let mut now = LinuxStatFs::default();
+    sys_statfs(b"/dev\0".as_ptr(), &mut now);
+    t.eq(b"restored", now.f_blocks, blocks);
 }

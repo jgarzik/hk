@@ -459,7 +459,8 @@ mount; copies of a namespace are always peers and not locked (see
 "Before user namespaces grant capabilities"). Mount options are
 parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
 cp437 only), ramfs (mode=), tmpfs and devtmpfs (see "tmpfs gaps") and
-procfs (hidepid=, gid=, subset=pid); cgroupfs ignores its own, and only
+procfs (hidepid=, gid=, subset=pid; devtmpfs drops a new mount's after
+parsing them, as Linux 6.15+); cgroupfs ignores its own, and only
 procfs, tmpfs and devtmpfs apply options on a remount or show them in
 /proc/mounts.
 Crossing into a mount scans the current mount's children (Linux hashes

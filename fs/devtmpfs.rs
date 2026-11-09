@@ -5,11 +5,11 @@
 //! One internal tmpfs superblock (mode=0755, tmpfs's default limits;
 //! Linux internal_fs_type with CONFIG_TMPFS) holds a node for every
 //! device passed to [`device_add`]; each mount of "devtmpfs" shows that
-//! same superblock, and its options (tmpfs's) are applied to it as a
-//! remount's would be (Linux public_dev_mount, reconfigure_single, as in
-//! the 6.8 reference and Debian's 6.12; 6.15 parses and drops them). A
-//! remount reconfigures it likewise. [`init`] runs in driver_init,
-//! before any device registers.
+//! same superblock (Linux devtmpfs_get_tree): its options are tmpfs's,
+//! parsed (EINVAL) and dropped (Linux 6.15+; before, reconfigure_single
+//! applied them). A remount reconfigures the superblock (tmpfs's
+//! reconfigure). [`init`] runs in driver_init, before any device
+//! registers.
 //!
 //! ## Locking
 //!
@@ -37,15 +37,11 @@ fn root() -> Option<Arc<Dentry>> {
     DEVTMPFS.get()?.get_root()
 }
 
-/// A mount: the one superblock, reconfigured with `opts` under its
-/// s_umount (a bad option or a refused limit fails the mount, nothing
-/// changed)
+/// A mount: the one superblock; `opts` only parsed (a bad option fails
+/// the mount)
 fn mount(_t: &'static FileSystemType, opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
-    let sb = DEVTMPFS.get().cloned().ok_or(KernelError::NoDevice)?;
-    let s = sb.s_umount.write();
-    sb.s_op.remount(&sb, opts)?;
-    drop(s);
-    Ok(sb)
+    super::tmpfs::check_opts(opts)?;
+    DEVTMPFS.get().cloned().ok_or(KernelError::NoDevice)
 }
 
 /// The devtmpfs filesystem type
