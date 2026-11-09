@@ -1,7 +1,8 @@
 //! Ramfs - simple in-memory filesystem
 //!
-//! Ramfs stores file contents entirely in memory. It serves as the
-//! default root filesystem at boot.
+//! Ramfs stores file contents entirely in memory, with no limit and no
+//! xattrs (Linux fs/ramfs). Its inodes, directories and page-cache files
+//! are also tmpfs's (`fs::tmpfs`), which adds the limits and xattrs.
 //!
 //! ## Locking Model
 //!
@@ -33,9 +34,7 @@ use super::dentry::Dentry;
 use super::file::{DirContext, DirEntry, File, FileOps, RwFlags};
 use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::iov_iter::{IovDest, IovSource};
-use super::superblock::{
-    FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps,
-};
+use super::superblock::{FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperOps};
 use crate::util::kalloc::try_arc;
 
 // ============================================================================
@@ -59,12 +58,13 @@ impl Aops for RamfsAops {
     }
 }
 
-/// Page-cache errors of ramfs writes: no memory for a new page is
-/// ENOSPC (like a full tmpfs; the frame reserve is kept for the kernel);
-/// a fault on the caller's buffer stays EFAULT
+/// Page-cache errors of ramfs and tmpfs writes: no memory for a new
+/// page is ENOMEM, a full tmpfs ENOSPC (Linux shmem_get_folio_gfp); a
+/// fault on the caller's buffer stays EFAULT
 fn page_err(e: KernelError) -> KernelError {
     match e {
-        KernelError::OutOfMemory | KernelError::NoSpace => KernelError::NoSpace,
+        KernelError::OutOfMemory => KernelError::OutOfMemory,
+        KernelError::NoSpace => KernelError::NoSpace,
         KernelError::BadAddress => KernelError::BadAddress,
         _ => KernelError::Io,
     }
@@ -337,36 +337,18 @@ impl AsAny for RamfsInodeData {
 
 impl InodeData for RamfsInodeData {}
 
-/// Ramfs superblock private data: the space left for user.* extended
-/// attributes (Linux tmpfs sbinfo->free_ispace: nr_inodes, by default
-/// half of RAM's pages, times BOGO_INODE_SIZE), a lock-free counter
-pub struct RamfsSbData {
-    pub xattr_space: Arc<AtomicU64>,
-}
-
-impl RamfsSbData {
-    fn new() -> Result<Self, KernelError> {
-        // Linux shmem_default_max_inodes (totalram / 2) * 1024
-        #[cfg(not(test))]
-        let space =
-            crate::FRAME_ALLOCATOR.stats().total_bytes / filemap::PAGE_SIZE as u64 / 2 * 1024;
-        #[cfg(test)]
-        let space = u64::MAX;
-        Ok(Self {
-            xattr_space: try_arc(AtomicU64::new(space))?,
-        })
-    }
-}
-
 /// The xattr space of `inode`'s file system (None: not counted)
 fn xattr_pool(inode: &Inode) -> Option<Arc<AtomicU64>> {
     let sb = inode.superblock()?;
-    if let Some(p) = super::tmpfs::with(&sb, |t| t.xattr_pool()) {
-        return p;
-    }
-    let private = sb.get_private()?;
-    let d = private.as_ref().as_any().downcast_ref::<RamfsSbData>()?;
-    Some(d.xattr_space.clone())
+    super::tmpfs::with(&sb, |t| t.xattr_pool())?
+}
+
+/// The inode's file system has user.* xattrs: tmpfs does (Linux
+/// CONFIG_TMPFS_XATTR), ramfs has no xattr handlers (EOPNOTSUPP)
+fn has_xattrs(inode: &Inode) -> bool {
+    inode
+        .superblock()
+        .is_some_and(|sb| super::tmpfs::with(&sb, |_| ()).is_some())
 }
 
 /// Take one of the file system's inodes (tmpfs: ENOSPC when none is
@@ -402,14 +384,6 @@ fn shmem_falloc(inode: &Inode, start: u64, end: u64, max: u64) -> Result<(), Ker
         return Err(KernelError::NoSpace);
     }
     filemap::falloc_range(inode, start, end)
-}
-
-impl SuperBlockData for RamfsSbData {}
-
-impl AsAny for RamfsSbData {
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
 }
 
 /// Ramfs inode operations
@@ -608,11 +582,10 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    /// As Linux shmem_fallocate: allocate, KEEP_SIZE and PUNCH_HOLE
-    /// only; the cache is the only copy, so a hole reads back as zeroes.
-    /// tmpfs allocates (and charges) the pages; ramfs, which stands in
-    /// for it as the rootfs, only sets the size. On success the file
-    /// counts as modified (Linux file_modified).
+    /// tmpfs's, as Linux shmem_fallocate: allocate (and charge) the
+    /// pages, KEEP_SIZE and PUNCH_HOLE only; the cache is the only copy,
+    /// so a hole reads back as zeroes. On success the file counts as
+    /// modified (Linux file_modified). ramfs: EOPNOTSUPP.
     fn fallocate(
         &self,
         inode: &Arc<Inode>,
@@ -621,6 +594,13 @@ impl InodeOps for RamfsInodeOps {
         len: u64,
     ) -> Result<(), KernelError> {
         use super::misc::falloc_mode::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
+        // ramfs has no fallocate (Linux ramfs_file_operations)
+        let max = inode
+            .superblock()
+            .and_then(|sb| super::tmpfs::max_blocks(&sb));
+        let Some(max) = max else {
+            return Err(KernelError::OperationNotSupported);
+        };
         if mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) != 0 {
             return Err(KernelError::OperationNotSupported);
         }
@@ -631,12 +611,7 @@ impl InodeOps for RamfsInodeOps {
             filemap::punch_range(inode, offset, end.min(inode.get_size()));
         } else {
             inode.newsize_ok(end)?;
-            if let Some(blocks) = inode
-                .superblock()
-                .and_then(|sb| super::tmpfs::max_blocks(&sb))
-            {
-                shmem_falloc(inode, offset, end, blocks)?;
-            }
+            shmem_falloc(inode, offset, end, max)?;
             if mode & FALLOC_FL_KEEP_SIZE == 0 && end > inode.get_size() {
                 inode.set_size(end);
             }
@@ -830,6 +805,9 @@ impl InodeOps for RamfsInodeOps {
     // =========================================================================
 
     fn getxattr(&self, inode: &Inode, name: &[u8], value: &mut [u8]) -> Result<usize, KernelError> {
+        if !has_xattrs(inode) {
+            return Err(KernelError::OperationNotSupported);
+        }
         // Validate namespace - only user.* is supported for regular files/dirs
         if !name.starts_with(b"user.") {
             return Err(KernelError::OperationNotSupported);
@@ -871,6 +849,9 @@ impl InodeOps for RamfsInodeOps {
         value: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
+        if !has_xattrs(inode) {
+            return Err(KernelError::OperationNotSupported);
+        }
         // Validate namespace - only user.* is supported for regular files/dirs
         if !name.starts_with(b"user.") {
             return Err(KernelError::OperationNotSupported);
@@ -916,6 +897,11 @@ impl InodeOps for RamfsInodeOps {
     }
 
     fn listxattr(&self, inode: &Inode, list: &mut [u8]) -> Result<usize, KernelError> {
+        // No xattrs on ramfs: an empty list (Linux vfs_listxattr with
+        // no ->listxattr)
+        if !has_xattrs(inode) {
+            return Ok(0);
+        }
         let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
@@ -927,6 +913,9 @@ impl InodeOps for RamfsInodeOps {
     }
 
     fn removexattr(&self, inode: &Inode, name: &[u8]) -> Result<(), KernelError> {
+        if !has_xattrs(inode) {
+            return Err(KernelError::OperationNotSupported);
+        }
         // Validate namespace - only user.* is supported for regular files/dirs
         if !name.starts_with(b"user.") {
             return Err(KernelError::OperationNotSupported);
@@ -1118,7 +1107,6 @@ pub(crate) fn ramfs_mount(
 ) -> Result<Arc<SuperBlock>, KernelError> {
     let mode = root_mode(opts)?;
     let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0)?;
-    sb.set_private(try_arc(RamfsSbData::new()?)?);
     fill_root(&sb, mode, 0, 0)?;
     Ok(sb)
 }
@@ -1149,19 +1137,6 @@ pub static RAMFS_TYPE: FileSystemType = FileSystemType {
     fs_flags: 0,
     mount: ramfs_mount,
     mount_dev: None, // Ramfs doesn't use a backing device
-    file_ops: &RAMFS_FILE_OPS,
-};
-
-/// The rootfs filesystem type (Linux init/do_mounts.c rootfs_fs_type):
-/// the initramfs's, mounted on the nullfs root by init_mount_tree. A
-/// ramfs under its own name, which mountinfo and statfs callers see;
-/// Linux fills it as tmpfs when it has one, hk has only ramfs. Not
-/// registered, as Linux: mount(2) cannot name it.
-pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
-    name: "rootfs",
-    fs_flags: 0,
-    mount: ramfs_mount,
-    mount_dev: None,
     file_ops: &RAMFS_FILE_OPS,
 };
 

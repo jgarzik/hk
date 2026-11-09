@@ -477,10 +477,7 @@ namespaces, the nullfs that stands in for an unmounted mount and the
 empty immutable regular file. Locks are not refused with ENOLCK
 (31a1fb90624d), MS_REMOUNT and umount of the root are not refused on
 the internal superblock (d791606bb915), and nothing marks knullfs's
-root as unmountable (e22e69c2ad88: dont_mount). The rootfs is
-always a ramfs; Linux fills it as tmpfs when it has CONFIG_TMPFS
-(Ubuntu does), so statfs("/") on the initramfs differs until hk has a
-tmpfs (doc/ROADMAP.md phase F). Kernel code that resolves a path from a kernel thread finds nothing
+root as unmountable (e22e69c2ad88: dont_mount). Kernel code that resolves a path from a kernel thread finds nothing
 (knullfs); hk has none today, and has no scoped_with_init_fs for one
 that would need init's root.
 
@@ -572,20 +569,6 @@ Linux swaps them, and noswap is only recorded). huge= takes only
 never, mpol= and the quota options are refused (EINVAL), as on a Linux
 without THP, NUMA or CONFIG_TMPFS_QUOTA. inode32 is recorded and shown
 but inode numbers do not wrap at 2^32 (Linux shmem_reserve_inode).
-
-## ramfs has no size limit
-
-**Location**: `fs/ramfs.rs`, `mm/filemap.rs`,
-`mm/frame_alloc.rs`
-
-ramfs (the root filesystem and every ramfs mount) is bounded only by
-memory, for every user: writes fail with ENOSPC once free frames reach
-the low watermark (min_free_kbytes formula), and the memory comes back when the last link and the last
-open reference of a file are gone (or on truncate). Linux's rootfs is a
-tmpfs limited to half of RAM by default; tmpfs with `size=`/`nr_inodes=`
-limits (and per-user accounting) comes with phase F (tmpfs).
-Reads of holes need a zeroed page each and can fail with ENOMEM when
-memory is at the low watermark (Linux maps the shared zero page).
 
 ## Kernel heap (slab) gaps
 

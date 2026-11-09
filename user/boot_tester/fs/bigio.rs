@@ -151,9 +151,9 @@ fn test_ramfs_unlink() {
     verdict(b"BIGIO_RAMFS_UNLINK", why, st as i64);
 }
 
-/// Filling ramfs fails cleanly with ENOSPC (hk keeps a reserve for the
-/// kernel; Linux's rootfs tmpfs is limited to half of RAM), the kernel
-/// keeps working, and deleting the file makes the space usable again
+/// Filling the root fails cleanly with ENOSPC (the rootfs tmpfs is
+/// limited to half of RAM), the kernel keeps working, and deleting the
+/// file makes the space usable again
 fn test_ramfs_full() {
     if !exhaust_ok(b"BIGIO_RAMFS_FULL") {
         return;

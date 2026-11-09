@@ -505,6 +505,20 @@ pub(crate) fn tmpfs_mount(
     Ok(sb)
 }
 
+/// The rootfs filesystem type (Linux init/do_mounts.c rootfs_fs_type
+/// with CONFIG_TMPFS and no root=: rootfs_init_fs_context fills it as
+/// tmpfs): the initramfs's, mounted on the nullfs root by
+/// init_mount_tree, with tmpfs's default limits (half of RAM). A tmpfs
+/// under its own name, which mountinfo shows. Not registered, as
+/// Linux: mount(2) cannot name it.
+pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
+    name: "rootfs",
+    fs_flags: 0,
+    mount: tmpfs_mount,
+    mount_dev: None,
+    file_ops: &super::ramfs::TMPFS_FILE_OPS,
+};
+
 /// The tmpfs filesystem type (Linux shmem_fs_type)
 pub static TMPFS_TYPE: FileSystemType = FileSystemType {
     name: "tmpfs",

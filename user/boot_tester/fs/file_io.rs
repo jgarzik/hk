@@ -42,10 +42,10 @@ use crate::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, FIOCLEX, FIONBIO, FIONCLEX, IoVec, LinuxStatFs, MAP_ANONYMOUS,
     MAP_PRIVATE, MAP_SHARED, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC,
-    PROT_READ, RAMFS_MAGIC, STATX_BASIC_STATS, Stat, Statx, sys_close, sys_fcntl, sys_fstat,
-    sys_fstatfs, sys_ftruncate, sys_getrandom, sys_ioctl, sys_lseek, sys_mmap, sys_munmap,
-    sys_open, sys_pipe2, sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev,
-    sys_pwritev2, sys_read, sys_readv, sys_statfs, sys_statx, sys_unlink, sys_write, sys_writev,
+    PROT_READ, STATX_BASIC_STATS, Stat, Statx, sys_close, sys_fcntl, sys_fstat, sys_fstatfs,
+    sys_ftruncate, sys_getrandom, sys_ioctl, sys_lseek, sys_mmap, sys_munmap, sys_open, sys_pipe2,
+    sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
+    sys_readv, sys_statfs, sys_statx, sys_unlink, sys_write, sys_writev,
 };
 
 // RWF flags for preadv2/pwritev2
@@ -1240,10 +1240,10 @@ fn test_statfs_root() {
         return;
     }
 
-    // Verify we got valid data (ramfs magic; Linux's initramfs root is tmpfs)
-    if buf.f_type != RAMFS_MAGIC && !(host_mode() && buf.f_type == TMPFS_MAGIC) {
-        print(b"STATFS_ROOT:FAIL: expected ramfs magic ");
-        print_num(RAMFS_MAGIC);
+    // The initramfs root is tmpfs (Linux rootfs with CONFIG_TMPFS)
+    if buf.f_type != TMPFS_MAGIC {
+        print(b"STATFS_ROOT:FAIL: expected tmpfs magic ");
+        print_num(TMPFS_MAGIC);
         print(b", got ");
         print_num(buf.f_type);
         println(b"");
@@ -1322,9 +1322,9 @@ fn test_fstatfs() {
         return;
     }
 
-    // Verify we got ramfs magic (root fs; tmpfs on a Linux host)
-    if buf.f_type != RAMFS_MAGIC && !(host_mode() && buf.f_type == TMPFS_MAGIC) {
-        fail_num(b"FSTATFS:FAIL: expected ramfs magic, got ", buf.f_type);
+    // The root is tmpfs
+    if buf.f_type != TMPFS_MAGIC {
+        fail_num(b"FSTATFS:FAIL: expected tmpfs magic, got ", buf.f_type);
         return;
     }
 

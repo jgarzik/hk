@@ -12,6 +12,10 @@
 //!   fits
 //! - TMPFS_DEFAULTS: a plain mount gets half of RAM (no size= shown),
 //!   size=0,nr_inodes=0 is unlimited (statfs zeros), bad options EINVAL
+//! - ROOTFS_TMPFS: the initramfs root is tmpfs (Linux rootfs with
+//!   CONFIG_TMPFS and no root=) limited to about half of RAM (Linux
+//!   sizes it before the initrd and init memory are freed); ramfs, which
+//!   it no longer is, has no xattrs or fallocate (EOPNOTSUPP)
 
 use crate::exec::busybox::contains;
 use crate::harness::T;
@@ -35,6 +39,7 @@ pub fn run_tests() {
     limits();
     remount();
     defaults();
+    rootfs();
     sys_rmdir(MP.as_ptr());
 }
 
@@ -226,5 +231,40 @@ fn defaults() {
     t.eq(b"bad size", mount(b"size=12q\0"), EINVAL);
     t.eq(b"unknown", mount(b"bogus=1\0"), EINVAL);
     t.eq(b"empty", mount(b"nr_inodes=\0"), EINVAL);
+    t.done();
+}
+
+fn rootfs() {
+    const EOPNOTSUPP: i64 = -95;
+    let mut t = T::new(b"ROOTFS_TMPFS");
+    let mut st = LinuxStatFs::default();
+    t.eq(b"statfs", sys_statfs(b"/\0".as_ptr(), &mut st), 0);
+    t.eq(b"f_type", st.f_type, TMPFS_MAGIC);
+    let ram = sysinfo_ram(SI_TOTALRAM) as i64;
+    let size = st.f_blocks * 4096;
+    t.ok(
+        b"half of RAM",
+        size > ram * 2 / 5 && size <= ram * 11 / 20,
+        st.f_blocks,
+    );
+    t.ok(b"files", st.f_files > 0 && st.f_ffree > 0, st.f_files);
+    // ramfs keeps Linux ramfs's: no xattrs, no fallocate
+    if t.eq(
+        b"ramfs",
+        sys_mount(b"none\0".as_ptr(), MP.as_ptr(), b"ramfs\0".as_ptr(), 0, 0),
+        0,
+    ) {
+        let fd = sys_open(b"/tmp/tmpfs_lim/f\0".as_ptr(), O_CREAT | O_RDWR, 0o644);
+        t.eq(
+            b"ramfs fallocate",
+            sys_fallocate(fd as i32, 0, 0, 4096),
+            EOPNOTSUPP,
+        );
+        let x = hk_syscall::sys_fsetxattr(fd as i32, b"user.x\0".as_ptr(), b"v".as_ptr(), 1, 0);
+        t.eq(b"ramfs setxattr", x, EOPNOTSUPP);
+        sys_close(fd as u64);
+        sys_unlink(b"/tmp/tmpfs_lim/f\0".as_ptr());
+        sys_umount2(MP.as_ptr(), 0);
+    }
     t.done();
 }
