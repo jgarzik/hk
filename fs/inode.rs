@@ -198,6 +198,13 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
+    /// A new regular file of `dir`'s file system with no name (nlink 0)
+    /// for O_TMPFILE (Linux ->tmpfile); default EOPNOTSUPP
+    fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+        let _ = (dir, mode);
+        Err(KernelError::OperationNotSupported)
+    }
+
     /// Create a new directory
     fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
@@ -542,6 +549,10 @@ pub struct Inode {
     /// ETXTBSY
     pub i_swapfile: core::sync::atomic::AtomicBool,
 
+    /// An O_TMPFILE file not opened O_EXCL: linkat may give it its first
+    /// name though it has no link (Linux I_LINKABLE)
+    pub i_linkable: core::sync::atomic::AtomicBool,
+
     /// Its flock and POSIX locks (Linux i_flctx; `fs::locks`)
     pub i_flctx: super::locks::FileLockCtx,
 
@@ -593,6 +604,7 @@ impl Inode {
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
+            i_linkable: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
         }
@@ -638,6 +650,7 @@ impl Inode {
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
+            i_linkable: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
         }

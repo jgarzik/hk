@@ -158,18 +158,21 @@ pub fn sys_link(oldpath_ptr: UserPtr<u8>, newpath_ptr: UserPtr<u8>) -> KernelRes
 }
 
 /// vfs_link's part under the source inode's lock, itself inside the new
-/// parent's: an inode with no links left is not linked again (ENOENT),
+/// parent's: an inode with no links left is not linked again (ENOENT)
+/// unless it is a linkable O_TMPFILE file,
 /// and no unlink can drop its last link between that check and the link
 /// (Linux vfs_link: inode_lock(inode), i_nlink == 0 -> ENOENT)
 fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), KernelError> {
+    use core::sync::atomic::Ordering::Relaxed;
     let _lock = inode.lock();
-    if inode.get_nlink() == 0 {
-        Err(KernelError::NotFound)
-    } else {
-        dir.i_op
-            .link(dir, name, inode)
-            .inspect(|()| inode.touch_c())
+    // An O_TMPFILE file (I_LINKABLE) gets its first name once
+    if inode.get_nlink() == 0 && !inode.i_linkable.load(Relaxed) {
+        return Err(KernelError::NotFound);
     }
+    dir.i_op.link(dir, name, inode)?;
+    inode.i_linkable.store(false, Relaxed);
+    inode.touch_c();
+    Ok(())
 }
 
 /// The dentry linkat links to (Linux do_linkat, 6.10+): an empty path

@@ -9,7 +9,8 @@ use crate::fs::{
 
 use super::file::flags::AT_FDCWD;
 use super::flags::{
-    O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC,
+    __O_TMPFILE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR,
+    O_TRUNC,
 };
 use super::mount::MNT_NODEV;
 use super::syscall::{current_fd_table, get_nofile_limit};
@@ -141,9 +142,64 @@ pub fn sys_openat(dirfd: i32, path_ptr: UserPtr<u8>, flags: u32, mode: u32) -> K
         .alloc_with_flags(file, fd_flags, get_nofile_limit())
 }
 
+/// The open flag checks of Linux build_open_flags that hk makes:
+/// O_DIRECTORY with O_CREAT is EINVAL, and __O_TMPFILE needs
+/// O_DIRECTORY and write access
+fn check_flags(flags: u32) -> Result<(), KernelError> {
+    if flags & (O_DIRECTORY | O_CREAT) == O_DIRECTORY | O_CREAT {
+        return Err(KernelError::InvalidArgument);
+    }
+    if flags & __O_TMPFILE != 0
+        && (flags & O_DIRECTORY == 0 || dac::acc_mode(flags & O_ACCMODE) & dac::MAY_WRITE == 0)
+    {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// O_TMPFILE (Linux do_tmpfile, vfs_tmpfile): an unnamed regular file in
+/// the directory `path`; ENOTDIR or ENOENT from the walk, EROFS, then
+/// write and search on the directory (EACCES), EOPNOTSUPP from a file
+/// system without tmpfile. Linkable unless O_EXCL.
+fn tmpfile_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>, KernelError> {
+    let lf = LookupFlags {
+        directory: true,
+        ..LookupFlags::open()
+    };
+    let dir = filename_lookup(dirfd, path, lf)?;
+    let dir_inode = dir.dentry.get_inode().ok_or(KernelError::NotFound)?;
+    let w = dir.mnt.want_write()?;
+    let c = dac::cred();
+    dac::may_create(&c, &dir_inode)?;
+    let perm = dac::create_mode(&c, &dir_inode, (mode & 0o7777) as u16);
+    let inode = dir_inode
+        .i_op
+        .tmpfile(&dir_inode, InodeMode::regular(perm))?;
+    if flags & O_EXCL == 0 {
+        inode
+            .i_linkable
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    let dentry = Dentry::tmpfile(&dir.dentry, inode.clone())?;
+    let iw = inode.get_write_access()?;
+    let f_op = dentry
+        .superblock()
+        .map(|sb| sb.fs_type.file_ops)
+        .unwrap_or(&RAMFS_FILE_OPS);
+    let mut file = File::new(dentry, Some(dir.mnt.clone()), flags, f_op);
+    file.write_access = Some(w);
+    file.i_write = Some(iw);
+    f_op.open(&file)?;
+    try_arc(file)
+}
+
 /// Open `path` (relative to `start`) as a new file (Linux do_filp_open):
 /// resolve or create the target, may_open, O_TRUNC, then the file object
 fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>, KernelError> {
+    check_flags(flags)?;
+    if flags & __O_TMPFILE != 0 {
+        return tmpfile_open(dirfd, path, flags, mode);
+    }
     let (path, created) = open_target(dirfd, path, flags, mode)?;
     let dentry = path.dentry.clone();
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;

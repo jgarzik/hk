@@ -495,6 +495,16 @@ impl InodeOps for RamfsInodeOps {
         add_new(dir, name, Kind::Dev(rdev), mode, uid, gid, current_time())
     }
 
+    /// Linux ramfs_tmpfile, shmem_tmpfile (d_tmpfile drops the link);
+    /// on tmpfs it takes an inode like any file
+    fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
+        let inode = new_inode(&sb, Kind::File, mode, uid, gid, current_time())?;
+        inode.dec_nlink();
+        Ok(inode)
+    }
+
     fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
         add_new(dir, name, Kind::Dir, mode, uid, gid, current_time())
@@ -559,8 +569,11 @@ impl InodeOps for RamfsInodeOps {
         }
 
         // tmpfs counts each extra name as an inode (Linux shmem_link:
-        // tmpfs dentries pin memory until unlinked)
-        if let Some(sb) = dir.superblock() {
+        // tmpfs dentries pin memory until unlinked); an O_TMPFILE file's
+        // first name took its inode at creation
+        if target_inode.get_nlink() > 0
+            && let Some(sb) = dir.superblock()
+        {
             reserve_inode(&sb)?;
         }
         target_inode.inc_nlink();

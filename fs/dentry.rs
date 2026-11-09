@@ -115,6 +115,24 @@ impl Dentry {
         Ok(Self::add(parent, d, inode))
     }
 
+    /// The dentry of an O_TMPFILE file in `parent` (Linux d_tmpfile):
+    /// named "#<ino>", never in the tree (unhashed: lookups miss it, its
+    /// path reads " (deleted)")
+    pub fn tmpfile(parent: &Arc<Dentry>, inode: Arc<Inode>) -> Result<Arc<Dentry>, KernelError> {
+        let name = alloc::format!("#{}", inode.ino);
+        let d = try_arc(Self::with(
+            name.as_bytes().into(),
+            Some(inode),
+            parent.sb.clone(),
+        ))?;
+        {
+            let mut dl = d.d_lock.write();
+            dl.parent = Some(parent.clone());
+            dl.flags.unhashed = true;
+        }
+        Ok(d)
+    }
+
     /// A new child dentry of `parent`, not yet in the tree: the
     /// allocation a create does before the filesystem makes the entry
     /// (Linux d_alloc in lookup_create), so an ENOMEM leaves nothing

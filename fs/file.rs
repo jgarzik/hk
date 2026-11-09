@@ -55,6 +55,9 @@ pub mod flags {
     pub use crate::arch::uapi::{O_DIRECTORY, O_NOFOLLOW};
     /// Close on exec
     pub const O_CLOEXEC: u32 = 0o2000000;
+    /// An unnamed file in the directory named (asm-generic __O_TMPFILE;
+    /// O_TMPFILE is it with O_DIRECTORY)
+    pub const __O_TMPFILE: u32 = 0o20000000;
 
     /// The *at() calls' dirfd for the current directory
     pub const AT_FDCWD: i32 = -100;

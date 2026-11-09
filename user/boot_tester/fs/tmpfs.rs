@@ -16,6 +16,11 @@
 //!   CONFIG_TMPFS and no root=) limited to about half of RAM (Linux
 //!   sizes it before the initrd and init memory are freed); ramfs, which
 //!   it no longer is, has no xattrs or fallocate (EOPNOTSUPP)
+//! - TMPFILE_LINK: O_TMPFILE makes an unnamed file (nlink 0, "/tmp/#N
+//!   (deleted)" in /proc/self/fd) that linkat(AT_EMPTY_PATH) names,
+//!   unless opened O_EXCL (ENOENT); read-only, without O_DIRECTORY or
+//!   with O_CREAT is EINVAL, a file ENOTDIR, a missing one ENOENT, procfs
+//!   EOPNOTSUPP; on tmpfs it takes an inode (ENOSPC), its first link none
 //! - DEVTMPFS_TMPFS: devtmpfs is a tmpfs with mode=755 (Linux
 //!   devtmpfs_init); another mount shows the same superblock; a bad
 //!   option is EINVAL, size= is parsed and dropped (Linux 6.15+; up to
@@ -45,6 +50,7 @@ pub fn run_tests() {
     defaults();
     rootfs();
     devtmpfs();
+    tmpfile();
     sys_rmdir(MP.as_ptr());
 }
 
@@ -356,4 +362,115 @@ fn restore_dev(t: &mut T, blocks: i64) {
     let mut now = LinuxStatFs::default();
     sys_statfs(b"/dev\0".as_ptr(), &mut now);
     t.eq(b"restored", now.f_blocks, blocks);
+}
+
+/// O_TMPFILE | `acc`, in `dir`
+fn tmpf(dir: &[u8], acc: u32) -> i64 {
+    let tmp = hk_syscall::__O_TMPFILE | hk_syscall::O_DIRECTORY;
+    sys_open(dir.as_ptr(), tmp | acc, 0o600)
+}
+
+fn tmpfile() {
+    use hk_syscall::{
+        AT_EMPTY_PATH, O_EXCL, O_RDONLY, sys_fstat, sys_linkat, sys_read, sys_readlink,
+    };
+    const AT_FDCWD: i32 = -100;
+    const ENOENT: i64 = -2;
+    const ENOTDIR: i64 = -20;
+    const EOPNOTSUPP: i64 = -95;
+    let mut t = T::new(b"TMPFILE_LINK");
+    let fd = tmpf(b"/tmp\0", O_RDWR);
+    if !t.ok(b"open", fd >= 0, fd) {
+        return t.done();
+    }
+    let mut s = Stat::default();
+    sys_fstat(fd as i32, &mut s);
+    t.eq(b"nlink", s.st_nlink as i64, 0);
+    t.eq(b"mode", i64::from(s.st_mode), 0o100600);
+    t.eq(b"write", sys_write(fd as u64, b"hello".as_ptr(), 5), 5);
+    let mut buf = [0u8; 128];
+    let mut lp = *b"/proc/self/fd/\0\0\0\0";
+    let mut n = fd;
+    let mut digits = [0u8; 4];
+    let mut k = 0;
+    loop {
+        digits[k] = b'0' + (n % 10) as u8;
+        k += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for i in 0..k {
+        lp[14 + i] = digits[k - 1 - i];
+    }
+    let r = sys_readlink(lp.as_ptr(), buf.as_mut_ptr(), 128);
+    let name = &buf[..r.max(0) as usize];
+    t.ok(
+        b"fd link",
+        name.starts_with(b"/tmp/#") && name.ends_with(b" (deleted)"),
+        r,
+    );
+    let named = b"/tmp/tmpf_named\0";
+    let l = sys_linkat(
+        fd as i32,
+        b"\0".as_ptr(),
+        AT_FDCWD,
+        named.as_ptr(),
+        AT_EMPTY_PATH,
+    );
+    t.eq(b"linkat", l, 0);
+    sys_close(fd as u64);
+    let mut s = Stat::default();
+    sys_stat(named.as_ptr(), &mut s);
+    t.eq(b"linked nlink", s.st_nlink as i64, 1);
+    let rfd = sys_open(named.as_ptr(), O_RDONLY, 0);
+    let mut rb = [0u8; 8];
+    t.eq(b"content", sys_read(rfd as u64, rb.as_mut_ptr(), 8), 5);
+    t.ok(b"bytes", &rb[..5] == b"hello", 0);
+    sys_close(rfd as u64);
+    sys_unlink(named.as_ptr());
+
+    // O_EXCL: never linkable
+    let fd = tmpf(b"/tmp\0", O_RDWR | O_EXCL);
+    let l = sys_linkat(
+        fd as i32,
+        b"\0".as_ptr(),
+        AT_FDCWD,
+        named.as_ptr(),
+        AT_EMPTY_PATH,
+    );
+    t.eq(b"excl linkat", l, ENOENT);
+    sys_close(fd as u64);
+
+    t.eq(b"rdonly", tmpf(b"/tmp\0", O_RDONLY), EINVAL);
+    let no_dir = sys_open(b"/tmp\0".as_ptr(), hk_syscall::__O_TMPFILE | O_RDWR, 0o600);
+    t.eq(b"no O_DIRECTORY", no_dir, EINVAL);
+    t.eq(b"O_CREAT", tmpf(b"/tmp\0", O_RDWR | O_CREAT), EINVAL);
+    touch(b"/tmp/tmpf_file\0");
+    t.eq(b"file", tmpf(b"/tmp/tmpf_file\0", O_RDWR), ENOTDIR);
+    sys_unlink(b"/tmp/tmpf_file\0".as_ptr());
+    t.eq(b"missing", tmpf(b"/tmp/tmpf_none\0", O_RDWR), ENOENT);
+    t.eq(b"procfs", tmpf(b"/proc\0", O_RDWR), EOPNOTSUPP);
+
+    // tmpfs: the root and the tmpfile use both inodes; linking it takes none
+    if t.eq(b"mount", mount(b"nr_inodes=2\0"), 0) {
+        let fd = tmpf(MP, O_RDWR);
+        t.ok(b"tmpfs open", fd >= 0, fd);
+        t.eq(b"tmpfs full", tmpf(MP, O_RDWR), ENOSPC);
+        let p = b"/tmp/tmpfs_lim/n\0";
+        let l = sys_linkat(
+            fd as i32,
+            b"\0".as_ptr(),
+            AT_FDCWD,
+            p.as_ptr(),
+            AT_EMPTY_PATH,
+        );
+        t.eq(b"tmpfs link", l, 0);
+        t.eq(b"ffree", statfs().f_ffree, 0);
+        sys_close(fd as u64);
+        sys_unlink(p.as_ptr());
+        sys_umount2(MP.as_ptr(), 0);
+    }
+    t.done();
 }
