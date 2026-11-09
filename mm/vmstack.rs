@@ -321,12 +321,6 @@ pub fn bounds(addr: u64) -> Option<core::ops::Range<u64>> {
     Some(base..base + THREAD_SIZE as u64)
 }
 
-/// A stack a CPU keeps for good (its IRQ stack, arm64's overflow
-/// stack): its top. Thread context, like [`alloc`].
-pub fn alloc_percpu() -> Option<u64> {
-    alloc().map(|s| s.leak() + THREAD_SIZE as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

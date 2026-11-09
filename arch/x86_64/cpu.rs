@@ -235,20 +235,32 @@ fn set_ist(cpu: u32, tops: [u64; IST_COUNT]) {
 }
 
 /// Allocate the IST stacks of AP `cpu` before it starts (Linux
-/// cpu_entry_area exception stacks); false if out of memory
+/// cpu_entry_area exception stacks); false if out of memory, with
+/// nothing kept
 pub fn alloc_ist<F: crate::arch::FrameAlloc<PhysAddr = u64>>(cpu: u32, fa: &mut F) -> bool {
     let pages = IST_STACK_SIZE / 4096;
     let mut tops = [0u64; IST_COUNT];
-    for t in tops.iter_mut() {
+    for i in 0..IST_COUNT {
         let Some(phys) = fa.alloc_contig(pages) else {
+            for &t in &tops[..i] {
+                free_stack(fa, t - IST_STACK_SIZE as u64, IST_STACK_SIZE);
+            }
             return false;
         };
         let base = super::paging::phys_to_virt(phys);
         unsafe { core::ptr::write_bytes(base, 0, IST_STACK_SIZE) };
-        *t = base as u64 + IST_STACK_SIZE as u64;
+        tops[i] = base as u64 + IST_STACK_SIZE as u64;
     }
     set_ist(cpu, tops);
     true
+}
+
+/// Free the `size`-byte stack at linear-map address `base`, from
+/// `alloc_contig` (its frames are freed one by one)
+pub fn free_stack<F: crate::arch::FrameAlloc<PhysAddr = u64>>(fa: &mut F, base: u64, size: usize) {
+    for off in (0..size as u64).step_by(4096) {
+        fa.free_frame(super::paging::virt_to_phys(base + off));
+    }
 }
 
 /// Load CPU `cpu`'s GDT and TSS on this CPU (Linux cpu_init:
