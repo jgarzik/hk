@@ -2352,6 +2352,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.flags & CLONE_SIGHAND != 0,
         config.flags & CLONE_THREAD != 0,
         config.flags & CLONE_CLEAR_SIGHAND != 0,
+        config.flags & (CLONE_VM | CLONE_VFORK) == CLONE_VM,
     )?;
     let child_io = if config.flags & CLONE_IO != 0 {
         Some(crate::task::fork_io(true)?)

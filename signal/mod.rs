@@ -877,11 +877,16 @@ pub struct ForkSignal {
 ///
 /// If `clear_sighand` is true (CLONE_CLEAR_SIGHAND), reset all handlers to default
 /// after cloning (except SIG_IGN handlers which are preserved).
+///
+/// The child inherits the alternate stack unless `reset_sas` (Linux
+/// copy_process: a CLONE_VM child without CLONE_VFORK runs on the same
+/// memory at once, so it starts without one).
 pub fn fork_signal(
     parent: &Task,
     share_sighand: bool,
     share_pending: bool,
     clear_sighand: bool,
+    reset_sas: bool,
 ) -> Result<(TaskSignalState, ForkSignal), KernelError> {
     // Get parent's sighand and signal_state
     // The parent's blocked mask and shared set (no queued info is
@@ -893,7 +898,7 @@ pub fn fork_signal(
             parent.and_then(|p| p.sighand().cloned()),
             parent.map(|p| {
                 let s = p.task.sig.lock();
-                (s.blocked, s.trap)
+                (s.blocked, s.trap, s.altstack)
             }),
         )
     };
@@ -926,12 +931,12 @@ pub fn fork_signal(
     // Clone per-task signal state
     let shared_pending = SharedPending(Some(signal.clone()));
     let child_state = match parent_state {
-        Some((blocked, trap)) => TaskSignalState {
+        Some((blocked, trap, altstack)) => TaskSignalState {
             blocked, // Inherit blocked mask
             saved_sigmask: SigSet::EMPTY,
             pending: SigPending::new(), // Fresh private pending
             shared_pending,
-            altstack: AltStack::new(), // Child starts with no altstack
+            altstack: if reset_sas { AltStack::new() } else { altstack },
             real_blocked: SigSet::EMPTY,
             // The thread struct is copied (Linux arch_dup_task_struct)
             trap,
@@ -2833,6 +2838,12 @@ fn deliver_to_handler(
                 // SIGKILL/SIGSTOP are never blockable, whatever sa_mask
                 // or the signal is
                 state.blocked = state.blocked.blockable();
+                // SS_AUTODISARM gives the stack up while the handler
+                // runs (Linux signal_delivered -> sas_ss_reset);
+                // rt_sigreturn reinstalls it from uc_stack
+                if state.altstack.ss_flags & ss_flags::SS_AUTODISARM != 0 {
+                    state.altstack = AltStack::new();
+                }
             });
             true
         }

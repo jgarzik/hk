@@ -1,5 +1,5 @@
 //! Alternate signal stack (Linux kernel/signal.c do_sigaltstack,
-//! restore_altstack; arch get_sigframe)
+//! signal_delivered, restore_altstack; arch get_sigframe)
 //!
 //! Tests (run as an isolated group: a broken kernel kills a child, not init):
 //! - SIGALTSTACK_MODE_ONSTACK: ss_flags SS_ONSTACK enables the stack like
@@ -11,18 +11,23 @@
 //!   (Linux __save_altstack: the stored flags, no SS_ONSTACK)
 //! - SIGALTSTACK_ONSTACK_EPERM: on the stack, a change is EPERM and a
 //!   query reports SS_ONSTACK
+//! - SIGALTSTACK_AUTODISARM: with SS_AUTODISARM the handler finds it
+//!   disabled; rt_sigreturn puts it back
+//! - SIGALTSTACK_FORK: fork and vfork children inherit it; a CLONE_VM
+//!   thread starts without one
 //! - SIGALTSTACK_OVERFLOW: the SIGSEGV of a stack overflow into a guard
 //!   page is caught by an SA_ONSTACK handler
 
 use crate::harness::{R, check, report_r};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE, SA_ONSTACK, SA_RESTORER,
-    SA_SIGINFO, SIGSEGV, SIGUSR1, sys_exit_group, sys_fork, sys_getpid, sys_gettid, sys_mmap,
-    sys_mprotect, sys_rt_sigaction, sys_sigaltstack, sys_tgkill, sys_wait4,
+    SA_SIGINFO, SIGCHLD, SIGSEGV, SIGUSR1, sys_exit, sys_exit_group, sys_fork, sys_getpid,
+    sys_gettid, sys_mmap, sys_mprotect, sys_rt_sigaction, sys_sigaltstack, sys_tgkill, sys_wait4,
 };
 
 const SS_ONSTACK: i32 = 1;
 const SS_DISABLE: i32 = 2;
+const SS_AUTODISARM: i32 = 1 << 31;
 const EPERM: i64 = -1;
 const ENOMEM: i64 = -12;
 #[cfg(target_arch = "x86_64")]
@@ -36,6 +41,7 @@ const PAGE: u64 = 4096;
 #[repr(C, align(16))]
 struct Stack([u8; ALT_SIZE as usize]);
 static mut ALT: Stack = Stack([0; ALT_SIZE as usize]);
+static mut THREAD_STACK: Stack = Stack([0; ALT_SIZE as usize]);
 
 /// Linux stack_t
 #[repr(C)]
@@ -88,6 +94,8 @@ pub fn run_tests() {
     test_deliver();
     test_ucstack();
     test_onstack_eperm();
+    test_autodisarm();
+    test_fork();
     test_overflow();
     disable();
 }
@@ -271,6 +279,123 @@ fn onstack_eperm() -> R {
     check(b"query sp", s.query.ss_sp == alt(), s.query.ss_sp as i64)?;
     let q = get();
     check(b"after: flags", q.ss_flags == 0, q.ss_flags as i64)
+}
+
+fn test_autodisarm() {
+    report_r(b"SIGALTSTACK_AUTODISARM", autodisarm());
+    disable();
+}
+
+fn autodisarm() -> R {
+    let ss = StackT::new(alt(), SS_AUTODISARM, ALT_SIZE);
+    let r = want(ss);
+    check(b"set", r == 0, r)?;
+    let q = get();
+    check(
+        b"query flags",
+        q.ss_flags == SS_AUTODISARM,
+        q.ss_flags as i64,
+    )?;
+    // The handler re-installing it would hide the restore: it tries an
+    // invalid mode instead
+    unsafe { core::ptr::write_volatile(&raw mut WANT, StackT::new(0, 7, 0)) };
+    let s = raise(SA_ONSTACK);
+    check(b"ran", s.count == 1, s.count as i64)?;
+    check(b"sp on alt", in_alt(s.sp), s.sp as i64)?;
+    check(
+        b"inside: flags",
+        s.query.ss_flags == SS_DISABLE,
+        s.query.ss_flags as i64,
+    )?;
+    check(
+        b"inside: size",
+        s.query.ss_size == 0,
+        s.query.ss_size as i64,
+    )?;
+    check(
+        b"uc_stack flags",
+        s.uc.ss_flags == SS_AUTODISARM,
+        s.uc.ss_flags as i64,
+    )?;
+    let q = get();
+    check(b"after: sp", q.ss_sp == alt(), q.ss_sp as i64)?;
+    check(b"after: size", q.ss_size == ALT_SIZE, q.ss_size as i64)?;
+    check(
+        b"after: flags",
+        q.ss_flags == SS_AUTODISARM,
+        q.ss_flags as i64,
+    )
+}
+
+fn test_fork() {
+    report_r(b"SIGALTSTACK_FORK", fork());
+    disable();
+}
+
+/// What a vfork child or a thread found
+static mut CHILD_SAW: StackT = StackT::new(0, 0, 0);
+static mut CTID: u32 = 0;
+
+fn fork() -> R {
+    let ss = StackT::new(alt(), 0, ALT_SIZE);
+    let r = set(ss);
+    check(b"set", r == 0, r)?;
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(u64::from(get() != ss));
+    }
+    check(b"fork", pid > 0, pid)?;
+    let mut st = -1i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    check(b"fork child inherits", st == 0, st as i64)?;
+    vfork_child();
+    let saw = unsafe { core::ptr::read_volatile(&raw const CHILD_SAW) };
+    check(b"vfork child inherits", saw == ss, saw.ss_flags as i64)?;
+    let saw = thread_saw();
+    check(
+        b"thread flags",
+        saw.ss_flags == SS_DISABLE,
+        saw.ss_flags as i64,
+    )?;
+    check(b"thread size", saw.ss_size == 0, saw.ss_size as i64)
+}
+
+/// A CLONE_VM|CLONE_VFORK child records its stack in CHILD_SAW: it runs
+/// on the parent's stack, so it only makes raw syscalls
+fn vfork_child() {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_VFORK: u64 = 0x4000;
+    unsafe { core::ptr::write_volatile(&raw mut CHILD_SAW, StackT::default()) };
+    let c = hk_syscall::sys_clone(CLONE_VM | CLONE_VFORK | SIGCHLD as u64, 0, 0, 0, 0);
+    if c == 0 {
+        sys_sigaltstack(0, (&raw mut CHILD_SAW) as u64);
+        sys_exit(0);
+    }
+    if c > 0 {
+        let mut st = 0i32;
+        sys_wait4(c, &mut st, 0, 0);
+    }
+}
+
+extern "C" fn thread(_arg: u64) -> ! {
+    let mut oss = StackT::new(0, -1, 0);
+    sys_sigaltstack(0, &mut oss as *mut StackT as u64);
+    unsafe { core::ptr::write_volatile(&raw mut CHILD_SAW, oss) };
+    sys_exit(0)
+}
+
+/// What a new CLONE_VM thread finds
+fn thread_saw() -> StackT {
+    use crate::mm::fork_mm::{join, spawn_thread};
+    unsafe { core::ptr::write_volatile(&raw mut CHILD_SAW, StackT::new(0, -1, 0)) };
+    let top = (&raw mut THREAD_STACK) as u64 + ALT_SIZE;
+    // Cleared by the thread's exit (CLONE_CHILD_CLEARTID)
+    unsafe { core::ptr::write_volatile(&raw mut CTID, 1) };
+    let tid = unsafe { spawn_thread(top, thread, 0, &raw mut CTID) };
+    if tid <= 0 || !join(&raw mut CTID) {
+        return StackT::new(0, -100, 0);
+    }
+    unsafe { core::ptr::read_volatile(&raw const CHILD_SAW) }
 }
 
 /// The guard page below the overflowing stack
