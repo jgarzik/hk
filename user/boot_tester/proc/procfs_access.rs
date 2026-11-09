@@ -22,6 +22,7 @@ pub fn run_tests() {
     test_thread_nondumpable();
     test_suid_differs();
     test_maps_after_exec();
+    in_child(b"PROC_FD_LINK_ACCESS", fd_link_access);
 }
 
 /// Run `f` in a child; its exit code 0 is a pass, else the failed step
@@ -317,4 +318,64 @@ fn test_maps_after_exec() {
     const ESRCH: i64 = -3;
     let ok = fd >= 0 && n1 > 0 && (n2 == 0 || n2 == ESRCH || same) && (st >> 8) & 0xff == 123;
     verdict(b"PROC_MAPS_AFTER_EXEC", ok, n2);
+}
+
+/// A same-uid process's fd/ and its links are open to a non-root
+/// reader while the process is dumpable, and closed (EACCES) once it is
+/// not (Linux proc_fd_permission, proc_pid_readlink). A fresh fd/ inode
+/// is the process's from creation (Linux pid_update_inode). Both tasks
+/// are uid nobody, so CAP_SYS_PTRACE does not decide it.
+fn fd_link_access() -> u64 {
+    // Dumpable again after the uid change (Linux commit_creds)
+    if sys_setuid(NOBODY as u32) != 0 || sys_prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
+        return 1;
+    }
+    let mut p = [0i32; 2];
+    let mut q = [0i32; 2];
+    if sys_pipe2(p.as_mut_ptr(), 0) != 0 || sys_pipe2(q.as_mut_ptr(), 0) != 0 {
+        return 2;
+    }
+    let a = sys_fork();
+    if a == 0 {
+        let mut c = [0u8; 1];
+        sys_write(p[1] as u64, b"r".as_ptr(), 1);
+        sys_read(q[0] as u64, c.as_mut_ptr(), 1);
+        sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        sys_write(p[1] as u64, b"d".as_ptr(), 1);
+        sys_read(q[0] as u64, c.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    let r = fd_link_steps(a, p[0], q[1]);
+    sys_kill(a, SIGKILL);
+    sys_wait4(a, core::ptr::null_mut(), 0, 0);
+    r
+}
+
+/// The steps of `fd_link_access` against the target `a`, which reports
+/// on `rd` and waits on `wr`
+fn fd_link_steps(a: i64, rd: i32, wr: i32) -> u64 {
+    let mut c = [0u8; 1];
+    let mut b = [0u8; 64];
+    let mut l = [0u8; 64];
+    if sys_read(rd as u64, c.as_mut_ptr(), 1) != 1 {
+        return 3;
+    }
+    if open_ret(path(&mut b, a, b"fd"), O_RDONLY | O_DIRECTORY) < 0 {
+        return 4;
+    }
+    if sys_readlink(path(&mut b, a, b"fd/0").as_ptr(), l.as_mut_ptr(), 64) <= 0 {
+        return 5;
+    }
+    // The target turns non-dumpable
+    sys_write(wr as u64, b"g".as_ptr(), 1);
+    if sys_read(rd as u64, c.as_mut_ptr(), 1) != 1 {
+        return 6;
+    }
+    if sys_readlink(path(&mut b, a, b"fd/0").as_ptr(), l.as_mut_ptr(), 64) != EACCES {
+        return 7;
+    }
+    if open_ret(path(&mut b, a, b"fd"), O_RDONLY | O_DIRECTORY) != EACCES {
+        return 8;
+    }
+    0
 }

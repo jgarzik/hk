@@ -429,10 +429,11 @@ impl InodeOps for ProcfsInodeOps {
             _ => return Err(KernelError::InvalidArgument),
         };
         match l {
-            Link::Pid(pid, target) => target(&pid.task().ok_or(KernelError::NotFound)?),
+            // EACCES once the task is gone (Linux proc_fd_access_allowed)
+            Link::Pid(pid, target) => target(&pid.task().ok_or(KernelError::PermissionDenied)?),
             Link::Me => self_link(inode),
             Link::Fixed(t) => Ok(t.to_vec()),
-            Link::Fd(pid, fd) => fd_link(&pid.task().ok_or(KernelError::NotFound)?, fd),
+            Link::Fd(pid, fd) => fd_link(&pid, fd),
             Link::Ns(pid, ns_type) => {
                 let inum = ns_inum(&pid, ns_type)?;
                 Ok(alloc::format!("{}:[{inum}]", ns_type.as_str()).into_bytes())
@@ -545,106 +546,134 @@ impl InodeOps for ProcfsInodeOps {
         true
     }
 
+    /// A new per-process inode takes the task's owner (Linux
+    /// proc_pid_make_inode -> pid_update_inode), so its first permission
+    /// check sees it
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
-        // Every /proc name is text: anything else names nothing
-        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
-        let private = dir.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<ProcfsInodeWrapper>()
-            .ok_or(KernelError::Io)?;
+        let inode = proc_lookup(dir, name)?;
+        pid_update_inode(&inode);
+        Ok(inode)
+    }
+}
 
-        // What the directory is, copied out: lookups allocate inodes and
-        // take TASKLIST, so none runs under the inode data's spin lock
-        enum Dir {
-            Static(Option<Arc<Inode>>, bool),
-            Pid(ProcPid),
-            Ns(ProcPid),
-            Fd(ProcPid),
-            Task(ProcPid),
-            Fdinfo(ProcPid),
-        }
-        let kind = match &*wrapper.0.read() {
-            // A static child, and whether this is the root (it has
-            // "version")
-            ProcfsInodeData::Directory { children } => Dir::Static(
-                children.get(name).cloned(),
-                children.contains_key("version"),
-            ),
-            ProcfsInodeData::PidDirectory { pid } => Dir::Pid(pid.clone()),
-            ProcfsInodeData::PidNsDirectory { pid } => Dir::Ns(pid.clone()),
-            ProcfsInodeData::PidFdDirectory { pid } => Dir::Fd(pid.clone()),
-            ProcfsInodeData::PidTaskDirectory { pid } => Dir::Task(pid.clone()),
-            ProcfsInodeData::PidFdinfoDirectory { pid } => Dir::Fdinfo(pid.clone()),
-            ProcfsInodeData::File { .. }
-            | ProcfsInodeData::NamespaceFile { .. }
-            | ProcfsInodeData::FdSymlink { .. }
-            | ProcfsInodeData::PidLink { .. }
-            | ProcfsInodeData::SelfLink
-            | ProcfsInodeData::FixedLink(_)
-            | ProcfsInodeData::FdinfoFile { .. }
-            | ProcfsInodeData::PidFile { .. }
-            | ProcfsInodeData::FailNth { .. }
-            | ProcfsInodeData::Sysctl { .. } => return Err(KernelError::NotDirectory),
-        };
-        match kind {
-            Dir::Static(child, root) => {
-                // subset=pid: the root has only "self" and the processes
-                let pidonly = root && opts::with(dir, |o| o.pidonly()).unwrap_or(false);
-                // First check static children
-                if let Some(child) = child.filter(|_| !pidonly) {
-                    return Ok(child);
-                }
-                // The root also has self and the processes
-                if root {
-                    if name == "self" {
-                        return create_self_link(dir);
-                    }
-                    // A task by its number in the mount's pid namespace
-                    // (Linux proc_pid_lookup); hidepid=invisible: another
-                    // user's process is not there
-                    if let Some(p) = name
-                        .parse::<u32>()
-                        .ok()
-                        .and_then(|nr| crate::task::pid::find_pid(&opts::pid_ns(dir), nr))
-                        .map(ProcPid)
-                        && let Some(t) = p.task()
-                        && opts::with(dir, |o| o.visible(&t)).unwrap_or(true)
-                    {
-                        return create_pid_dir_inode(dir, p);
-                    }
-                }
+/// The owner of a per-process inode follows the task's identity and
+/// dumpability (Linux pid_update_inode, task_dump_owner)
+fn pid_update_inode(inode: &Inode) {
+    let Some(w) = inode.get_private() else {
+        return;
+    };
+    let Some(w) = w.as_ref().as_any().downcast_ref::<ProcfsInodeWrapper>() else {
+        return;
+    };
+    // Copied out: dump_owner takes TASKLIST, never under the data's lock
+    let p = w.0.read().pid();
+    if let Some(t) = p.and_then(|p| p.task()) {
+        let (uid, gid) = dump_owner(&t);
+        inode.set_uid(uid);
+        inode.set_gid(gid);
+    }
+}
 
-                Err(KernelError::NotFound)
+/// Look up `name` in the /proc directory `dir`
+fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    // Every /proc name is text: anything else names nothing
+    let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
+    let private = dir.get_private().ok_or(KernelError::Io)?;
+    let wrapper = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<ProcfsInodeWrapper>()
+        .ok_or(KernelError::Io)?;
+
+    // What the directory is, copied out: lookups allocate inodes and
+    // take TASKLIST, so none runs under the inode data's spin lock
+    enum Dir {
+        Static(Option<Arc<Inode>>, bool),
+        Pid(ProcPid),
+        Ns(ProcPid),
+        Fd(ProcPid),
+        Task(ProcPid),
+        Fdinfo(ProcPid),
+    }
+    let kind = match &*wrapper.0.read() {
+        // A static child, and whether this is the root (it has
+        // "version")
+        ProcfsInodeData::Directory { children } => Dir::Static(
+            children.get(name).cloned(),
+            children.contains_key("version"),
+        ),
+        ProcfsInodeData::PidDirectory { pid } => Dir::Pid(pid.clone()),
+        ProcfsInodeData::PidNsDirectory { pid } => Dir::Ns(pid.clone()),
+        ProcfsInodeData::PidFdDirectory { pid } => Dir::Fd(pid.clone()),
+        ProcfsInodeData::PidTaskDirectory { pid } => Dir::Task(pid.clone()),
+        ProcfsInodeData::PidFdinfoDirectory { pid } => Dir::Fdinfo(pid.clone()),
+        ProcfsInodeData::File { .. }
+        | ProcfsInodeData::NamespaceFile { .. }
+        | ProcfsInodeData::FdSymlink { .. }
+        | ProcfsInodeData::PidLink { .. }
+        | ProcfsInodeData::SelfLink
+        | ProcfsInodeData::FixedLink(_)
+        | ProcfsInodeData::FdinfoFile { .. }
+        | ProcfsInodeData::PidFile { .. }
+        | ProcfsInodeData::FailNth { .. }
+        | ProcfsInodeData::Sysctl { .. } => return Err(KernelError::NotDirectory),
+    };
+    match kind {
+        Dir::Static(child, root) => {
+            // subset=pid: the root has only "self" and the processes
+            let pidonly = root && opts::with(dir, |o| o.pidonly()).unwrap_or(false);
+            // First check static children
+            if let Some(child) = child.filter(|_| !pidonly) {
+                return Ok(child);
             }
-            Dir::Pid(p) => lookup_pid_entry(dir, &p, name),
-            Dir::Ns(p) => lookup_pid_ns_entry(dir, &p, name),
-            Dir::Fd(p) => lookup_pid_fd_entry(dir, &p, name),
-            Dir::Task(p) => {
-                // A thread of the process by its number in the mount's
-                // namespace (Linux proc_task_lookup)
-                let t = p.task().ok_or(KernelError::NotFound)?;
-                let nr: u32 = name.parse().map_err(|_| KernelError::NotFound)?;
-                let ns = opts::pid_ns(dir);
-                // The thread's own struct pid: its directory describes
-                // that thread, not the leader
-                let tp = ProcPid(crate::task::pid::find_pid(&ns, nr).ok_or(KernelError::NotFound)?);
-                let thread = tp.task().ok_or(KernelError::NotFound)?;
-                let mine = group_threads(&t, &ns)
-                    .iter()
-                    .any(|&(x, _, _)| core::ptr::eq(x, Arc::as_ptr(&thread)));
-                if !mine {
-                    return Err(KernelError::NotFound);
+            // The root also has self and the processes
+            if root {
+                if name == "self" {
+                    return create_self_link(dir);
                 }
-                create_dir_inode(
-                    dir,
-                    pid_ino(thread.tid(), 0),
-                    ProcfsInodeData::new_pid_dir(tp),
-                )
+                // A task by its number in the mount's pid namespace
+                // (Linux proc_pid_lookup); hidepid=invisible: another
+                // user's process is not there
+                if let Some(p) = name
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|nr| crate::task::pid::find_pid(&opts::pid_ns(dir), nr))
+                    .map(ProcPid)
+                    && let Some(t) = p.task()
+                    && opts::with(dir, |o| o.visible(&t)).unwrap_or(true)
+                {
+                    return create_pid_dir_inode(dir, p);
+                }
             }
-            Dir::Fdinfo(p) => lookup_pid_fdinfo_entry(dir, &p, name),
+
+            Err(KernelError::NotFound)
         }
+        Dir::Pid(p) => lookup_pid_entry(dir, &p, name),
+        Dir::Ns(p) => lookup_pid_ns_entry(dir, &p, name),
+        Dir::Fd(p) => lookup_pid_fd_entry(dir, &p, name),
+        Dir::Task(p) => {
+            // A thread of the process by its number in the mount's
+            // namespace (Linux proc_task_lookup)
+            let t = p.task().ok_or(KernelError::NotFound)?;
+            let nr: u32 = name.parse().map_err(|_| KernelError::NotFound)?;
+            let ns = opts::pid_ns(dir);
+            // The thread's own struct pid: its directory describes
+            // that thread, not the leader
+            let tp = ProcPid(crate::task::pid::find_pid(&ns, nr).ok_or(KernelError::NotFound)?);
+            let thread = tp.task().ok_or(KernelError::NotFound)?;
+            let mine = group_threads(&t, &ns)
+                .iter()
+                .any(|&(x, _, _)| core::ptr::eq(x, Arc::as_ptr(&thread)));
+            if !mine {
+                return Err(KernelError::NotFound);
+            }
+            create_dir_inode(
+                dir,
+                pid_ino(thread.tid(), 0),
+                ProcfsInodeData::new_pid_dir(tp),
+            )
+        }
+        Dir::Fdinfo(p) => lookup_pid_fdinfo_entry(dir, &p, name),
     }
 }
 
@@ -907,9 +936,12 @@ fn create_self_link(parent: &Inode) -> Result<Arc<Inode>, KernelError> {
 
 /// Target of /proc/<pid>/fd/<fd>: `socket:[ino]` / `pipe:[ino]` for
 /// sockets and pipes, `anon_inode:<name>` for other files without a
-/// filesystem, else the path
-fn fd_link(t: &TaskRef, fd: i32) -> Result<Vec<u8>, KernelError> {
-    let table = task_files(t).ok_or(KernelError::NotFound)?;
+/// filesystem, else the path; EACCES without ptrace-read access, checked
+/// at each read, not only at lookup in fd/ (Linux proc_pid_readlink,
+/// proc_fd_access_allowed)
+fn fd_link(pid: &ProcPid, fd: i32) -> Result<Vec<u8>, KernelError> {
+    let t = link_task(pid)?;
+    let table = task_files(&t).ok_or(KernelError::NotFound)?;
     let file = table.lock().get(fd).ok_or(KernelError::NotFound)?;
     let inode = file.get_inode().ok_or(KernelError::NotFound)?;
     let mode = inode.mode();
@@ -931,9 +963,14 @@ fn fd_link(t: &TaskRef, fd: i32) -> Result<Vec<u8>, KernelError> {
 /// /proc/<pid>/fd/<fd> of a file system's non-directory leads to the
 /// open file itself (Linux proc_fd_link + nd_jump_link), so a deleted or
 /// unnamed one (O_TMPFILE, memfd) can be opened again; None (follow the
-/// text of `fd_link`) for a directory, a pipe, socket or anonymous file
+/// text of `fd_link`) for a directory, a pipe, socket or anonymous file;
+/// EACCES without ptrace-read access, checked at each follow (Linux
+/// proc_pid_get_link, proc_fd_access_allowed)
 fn fd_jump(pid: &ProcPid, fd: i32) -> Option<Result<crate::fs::Path, KernelError>> {
-    let t = pid.task()?;
+    let t = match link_task(pid) {
+        Ok(t) => t,
+        Err(e) => return Some(Err(e)),
+    };
     let file = task_files(&t)?.lock().get(fd)?;
     let inode = file.get_inode()?;
     if inode.mode().is_dir() || inode.mode().is_socket() || inode.superblock().is_none() {
@@ -1053,10 +1090,11 @@ fn gen_fdinfo_content(t: &TaskRef, fd: i32, ns: &PidNamespace) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// The task `pid` names, if the caller may see its namespaces (Linux
-/// proc_ns_get_link / proc_ns_readlink: EACCES once it is gone or
-/// without PTRACE_MODE_READ_FSCREDS access)
-fn ns_task(pid: &ProcPid) -> Result<TaskRef, KernelError> {
+/// The task `pid` names, if the caller may follow or read its fd/ and
+/// ns/ links (Linux proc_fd_access_allowed, proc_ns_get_link /
+/// proc_ns_readlink): EACCES once it is gone or without
+/// PTRACE_MODE_READ_FSCREDS access
+fn link_task(pid: &ProcPid) -> Result<TaskRef, KernelError> {
     let t = pid.task().ok_or(KernelError::PermissionDenied)?;
     if !crate::task::ptrace::may_access_task(&t, true) {
         return Err(KernelError::PermissionDenied);
@@ -1067,7 +1105,7 @@ fn ns_task(pid: &ProcPid) -> Result<TaskRef, KernelError> {
 /// The inode number of the `ns_type` namespace of the task `pid` names
 /// (Linux ns_get_name)
 fn ns_inum(pid: &ProcPid, ns_type: NamespaceType) -> Result<u32, KernelError> {
-    let t = ns_task(pid)?;
+    let t = link_task(pid)?;
     let ns = task_nsproxy(&t).ok_or(KernelError::PermissionDenied)?;
     Ok(ns_type.inum(&ns))
 }
