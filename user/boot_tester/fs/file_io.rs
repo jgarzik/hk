@@ -38,7 +38,7 @@
 //!   EBADF (Linux looks the fd up before copying out)
 
 use crate::harness::{fail_num, pass};
-use crate::helpers::{host_mode, print, print_num, println};
+use crate::helpers::{print, print_num, println};
 use hk_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, FIOCLEX, FIONBIO, FIONCLEX, IoVec, LinuxStatFs, MAP_ANONYMOUS,
     MAP_PRIVATE, MAP_SHARED, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC,
