@@ -480,12 +480,6 @@ fn set_exclusive(phys: u64) {
     }
 }
 
-/// `phys` is a private mapping's own page, writable in place (Linux
-/// PageAnonExclusive; `Page::reusable`)
-fn is_exclusive(phys: u64) -> bool {
-    super::page::phys_to_page(phys).is_some_and(|pg| pg.reusable())
-}
-
 /// Map the page of the swap PTE `pte` at `ptep` (Linux do_swap_page),
 /// mm lock held for reading: the swap-cache page, or one read from the
 /// slot into the cache (may sleep). The PTE takes the slot's place: a
@@ -648,7 +642,7 @@ fn wp_locked(
     }
     // The mapping's own page, pinned or not, is reused in place (Linux
     // wp_can_reuse_anon_folio, PageAnonExclusive)
-    let excl = !area.shared && is_exclusive(old);
+    let excl = !area.shared && super::page::reusable(old);
     if area.shared || excl || FRAME_ALLOCATOR.refcount(old) <= 1 {
         if t.set(addr, pte, own(pte)) {
             if !area.shared {

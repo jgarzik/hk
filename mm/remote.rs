@@ -238,7 +238,7 @@ fn exclusive(pte: u64) -> bool {
     let phys = paging::pte_addr(pte);
     (paging::pte_present(pte) || paging::pte_protnone(pte))
         && (paging::pte_write(pte)
-            || crate::mm::page::phys_to_page(phys).is_some_and(|p| p.reusable())
+            || crate::mm::page::reusable(phys)
             || (!paging::pte_cow(pte) && crate::FRAME_ALLOCATOR.refcount(phys) == 1))
 }
 

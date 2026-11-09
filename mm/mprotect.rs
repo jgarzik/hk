@@ -103,9 +103,7 @@ fn change_pte(pte: &AtomicU64, prot: u32, shared: bool) {
         paging::sync_page(paging::pte_addr(old), true);
     }
     let phys = paging::pte_addr(old);
-    let write = shared
-        || FRAME_ALLOCATOR.refcount(phys) <= 1
-        || super::page::phys_to_page(phys).is_some_and(|p| p.reusable());
+    let write = shared || FRAME_ALLOCATOR.refcount(phys) <= 1 || super::page::reusable(phys);
     // Write implies read (x86, arm64): a page left read-only keeps it
     let prot = if write || prot & PROT_WRITE == 0 {
         prot

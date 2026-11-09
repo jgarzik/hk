@@ -339,6 +339,12 @@ pub fn lock_page(phys: u64) {
     }
 }
 
+/// The page at `phys` is a private mapping's own, writable in place
+/// whatever its count ([`Page::reusable`]; Linux PageAnonExclusive)
+pub fn reusable(phys: u64) -> bool {
+    phys_to_page(phys).is_some_and(|p| p.reusable())
+}
+
 /// Unlock the page at `phys` and wake its waiters (Linux folio_unlock)
 pub fn unlock_page(phys: u64) {
     if let Some(pg) = phys_to_page(phys) {
