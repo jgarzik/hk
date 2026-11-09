@@ -452,6 +452,11 @@ fn mnt_init() {
 
     init_fs_registry();
     fs::sysfs::init();
+    // The kernel's tmpfs (Linux shmem_init, before init_rootfs and
+    // init_mount_tree)
+    if let Err(e) = fs::tmpfs::shmem_init() {
+        printkln!("ERR: tmpfs: {:?}", e);
+    }
     let root_mount = match fs::mount::init_mount_tree() {
         Ok(m) => m,
         Err(e) => {
@@ -460,11 +465,6 @@ fn mnt_init() {
         }
     };
     fs::DCACHE.set_root(root_mount.root.clone());
-    // The kernel's tmpfs (Linux shmem_init); after the mount tree, so
-    // the namespace's mounts keep their ids
-    if let Err(e) = fs::tmpfs::shmem_init() {
-        printkln!("ERR: tmpfs: {:?}", e);
-    }
     let _ = ramfs_create_dir(&root_mount.root, b"dev");
 }
 

@@ -57,7 +57,8 @@ pub type MountMap = Vec<(Arc<Mount>, Arc<Mount>)>;
 /// s_umount, then the spinning Mount fields.
 pub static NAMESPACE_SEM: crate::sync::RwSem<()> = crate::sync::RwSem::new(());
 
-/// Mount ids (Linux mnt_id_ida): the lowest free one, from 1
+/// Mount ids: the lowest free one, from 0 (Linux mnt_id_xa, an
+/// XA_FLAGS_ALLOC xarray: the kernel's tmpfs gets 0, the nullfs root 1)
 struct MntIds {
     next: u32,
     free: alloc::collections::BTreeSet<u32>,
@@ -80,8 +81,9 @@ fn mnt_alloc_id() -> u32 {
     if let Some(id) = ids.free.pop_first() {
         return id;
     }
+    let id = ids.next;
     ids.next += 1;
-    ids.next
+    id
 }
 
 fn mnt_free_id(id: u32) {
