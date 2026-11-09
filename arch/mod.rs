@@ -454,8 +454,9 @@ pub trait DmaSyncOps {
 /// The device interrupt controller behind `crate::irq` (Linux struct
 /// irq_chip and the arch's PCI INTx routing): device IRQs are
 /// `FIRST_IRQ..FIRST_IRQ + NR_IRQS`. `irq_unmask` and `irq_mask` run
-/// under the IRQ table lock (Linux irq_startup/irq_shutdown under
-/// desc->lock), so they need no lock of their own
+/// under the line's descriptor lock (Linux irq_startup/irq_shutdown
+/// under desc->lock); state shared between lines (a mask or trigger
+/// register) needs a leaf lock of the chip's
 pub trait IrqChipOps {
     /// The first device IRQ number (x86 PIC line 0, arm64 SPI INTID 32)
     const FIRST_IRQ: u32;

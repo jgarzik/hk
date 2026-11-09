@@ -387,7 +387,7 @@ Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem → BLKDEV_REGISTRY,
     MAJORS; I/O sleeps under open_mutex only
     blk-mq software queue, hardware queue (IrqSpinlock leaves; the
-    hardware queue also from the driver ISR, under IRQ_TABLE)
+    hardware queue also from the driver ISR, under its line's IrqDesc.lock)
     Completion.done (IrqSpinlock) → wait queue head → run-queue lock
 
 Network locks (3.10 Network Subsystem has the full order):
@@ -468,7 +468,7 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     tty_bufhead.lock) → Tty.ldata: held by the flip thread across
     feeding input (including the echo's driver write) and by
     flush_input; Tty.flip (IrqSpinlock leaf,
-    also under IRQ_TABLE in the UART handler). No tty spin lock is held
+    also under IrqDesc.lock in the UART handler). No tty spin lock is held
     across a signal, a sleep or a driver write; Tty.buf_lock is (ISIG
     signals, and SIGIO: Tty.buf_lock → `Tty.fasync` FasyncList.list).
     tty_fasync reads Tty.ctrl (the foreground group) after
@@ -3295,12 +3295,12 @@ TIOCSWINSZ and the SIGHUP/SIGCONT of giving up a controlling tty are sent
 after `ctrl` is dropped. A reader's wait condition takes `ldata`.
 
 Input (`tty/flip.rs`, Linux tty_buffer.c): the UART handler (IRQ
-context, under `IRQ_TABLE`) drains its FIFO into `Tty.flip` (leaf), sets
+context, under its line's `IrqDesc.lock`) drains its FIFO into `Tty.flip` (leaf), sets
 `flip::PENDING` and wakes `flip::FLIP_WAIT`; the `ttyflip` kernel thread
 takes the bytes out (`flip`, released before the line discipline runs)
 and feeds them to N_TTY (`ldata`), then wakes `read_wait`. It is the only
-consumer, so input stays in order. Order: `IRQ_TABLE` → `Tty.flip`;
-`IRQ_TABLE` → wait queue head (the wakeup).
+consumer, so input stays in order. Order: `IrqDesc.lock` → `Tty.flip`;
+`IrqDesc.lock` → wait queue head (the wakeup).
 
 `tty::jobctrl::CTTY_LOCK` (spin `Mutex`, thread context; Linux tty_lock
 + siglock in `__proc_set_tty`/`session_clear_tty`) serializes giving and
@@ -3373,16 +3373,21 @@ ISRs only ack the device, set atomics and use IRQ-safe deferral
 
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
-| `IRQ_TABLE` (`irq.rs`) | `IrqSpinlock` | taken in IRQ (`handle_irq`) and process context (`request_irq`, a registration's drop) | leaf, except that the interrupt controller's line mask/unmask (`arch::IrqChipOps`: PIC port I/O, GIC distributor MMIO; no lock of their own) and the handlers run under it |
+| `IrqDesc.lock` (`irq.rs`; one per line of the static `IRQ_TABLE`, Linux desc->lock) | `IrqSpinlock` | taken in IRQ (`handle_irq`) and process context (`request_irq`, a registration's drop) | leaf, except that the interrupt controller's line mask/unmask (`arch::IrqChipOps`) and the line's handlers run under it. Lines never nest: no code holds two descriptors' locks |
+| `I8259A_LOCK` (`arch/x86_64/pic.rs`), `IRQ_CONTROLLER_LOCK` (`arch/aarch64/gic.rs`) | `IrqSpinlock<()>` | any context | leaf, under `IrqDesc.lock`: the chip state lines share (the PIC mask registers; GICD_ICFGR, 16 SPIs per register) changes under it (Linux i8259A_lock, irq-gic-common.c irq_controller_lock) |
 
 Generic interface (`crate::irq`): `request_irq(irq, Arc<T: IrqHandler>)
 -> IrqRegistration<T>` (shareable; the handler's address is its Linux
 dev_id, the same handler twice on a line is EBUSY; `IrqFn` wraps a
-stateless fn). Dropping the registration removes the handler; the table's
-reference is dropped after the lock. `pci_intx_irq(bus, dev, fn, pin,
+stateless fn). The registration points at its line's descriptor; dropping
+it removes the handler, and the line's reference is dropped after the
+lock. Drivers stop their device interrupting before dropping it (INTx
+stays enabled at the device, as Linux free_irq leaves it). Lockdep does
+not track `IrqSpinlock` classes, so the per-line locks are covered by the
+rule that no code nests two of them. `pci_intx_irq(bus, dev, fn, pin,
 line)` routes PCI INTx; `PciDevice::request_irq` uses both. The first
 handler of a line unmasks it, the last one's removal masks it, both under
-`IRQ_TABLE` (Linux irq_startup/irq_shutdown under desc->lock). Every
+the line's `IrqDesc.lock` (Linux irq_startup/irq_shutdown under desc->lock). Every
 handler of a shared line is called; an interrupt on a line without
 handlers masks it, and a line nobody claims more than 99,900 times in a
 100,000-interrupt window is masked (stuck level INTx), reported after the
@@ -3396,7 +3401,7 @@ lock is dropped.
 - x86-64: legacy 8259 PIC with the firmware-assigned config-space Interrupt
   Line (QEMU `pc`). Real hardware in APIC mode (Dell OptiPlex 3020 target)
   needs IOAPIC + ACPI `_PRT` routing (not implemented).
-- Handlers run in IRQ context with the table lock held: they must only ack
+- Handlers run in IRQ context with their line's lock held: they must only ack
   the device, touch atomics/IrqSpinlocks and wake threads; they must not
   request or free IRQs. Once a registration's drop returns its handler is
   not running (Linux free_irq's synchronize_irq).
@@ -3443,7 +3448,7 @@ del_gendisk, then `UsbMscDevice.state`; ftdi_sio: `CONSOLE_REGISTRY`,
 then `PORT`). The controller is then taken out of `USB_CONTROLLER`
 (drivers' transfers fail with no device from there on) and stopped
 with no lock held: slots disabled, halted, reset, the IRQ handler
-unregistered (`IRQ_TABLE`, which waits out a running handler), memory
+unregistered (`IrqDesc.lock`, which waits out a running handler), memory
 freed.
 
 **ISR Pattern:** The xHCI ISR sets `interrupt_pending` atomic but does NOT acquire
@@ -3467,7 +3472,7 @@ thread context, the driver completes it from its interrupt handler and
 | `BLKDEV_REGISTRY` | spin `RwLock` (dev_t -> block device; global like Linux's bdev map) | thread only | leaf |
 | `MAJORS` | spin `Mutex` (block majors, register_blkdev) | thread only | leaf |
 | blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held; its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
-| blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list, the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock), the in-flight count and the dying flag | thread (dispatch, drain, release) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under `IRQ_TABLE` in the ISR |
+| blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list, the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock), the in-flight count and the dying flag | thread (dispatch, drain, release) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under its line's `IrqDesc.lock` in the ISR |
 | `BlkMq.drained` | `WaitQueue` (Linux mq_freeze_wq) | woken from hardirq (the completion that empties a dying queue, after its lock is dropped); waited in thread context (`del_gendisk`, no lock held) | its head lock -> run-queue lock; the condition takes each hardware queue lock alone |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
 | `RamDisk.pages` | spin `Mutex` | thread only (bio-based driver) | leaf |
@@ -3594,7 +3599,7 @@ not rely on either.
 | virtio-net `tx` queue | `spin::Mutex<Option<..>>` | thread only (xmit, poll reclaim, remove) | leaf; one descriptor per frame; ring full -> drop, `tx_dropped`, ENOBUFS; empty once removed |
 | virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx` |
 | virtio-PCI transport (`hw/virtio/pci.rs`) | none | probe and remove (under the virtio device's or the PCI function's `Device.lock`), then IRQ (ISR byte) | common config (status, features, queues, reset) written only under those device locks; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
-| Drivers' IRQ registrations: `VirtioDevice.irq` (the INTx handler owning the virtio driver's callbacks), the e1000 binding's `irq`, `Serial8250.irq`, `Pl011Port.irq` | spin `Mutex<Option<IrqRegistration<..>>>` (virtio: `Mutex<IrqSlot>`) | thread only (probe sets it, remove takes it; virtio: `request_irq` claims the slot, registers unlocked, then stores it or frees the claim; `free_irq` takes it) | leaf: the registration is made and dropped (`IRQ_TABLE`) unlocked; the ISR never takes it (the handler holds its device state) |
+| Drivers' IRQ registrations: `VirtioDevice.irq` (the INTx handler owning the virtio driver's callbacks), the e1000 binding's `irq`, `Serial8250.irq`, `Pl011Port.irq` | spin `Mutex<Option<IrqRegistration<..>>>` (virtio: `Mutex<IrqSlot>`) | thread only (probe sets it, remove takes it; virtio: `request_irq` claims the slot, registers unlocked, then stores it or frees the claim; `free_irq` takes it) | leaf: the registration is made and dropped (`IrqDesc.lock`) unlocked; the ISR never takes it (the handler holds its device state) |
 | PCI and USB `DYNIDS` (hw/pci/driver.rs, hw/usb/usbcore.rs; Linux dynids.lock) | spin Mutex | thread only | leaf: new_id/remove_id and each match take it alone; the probing after new_id runs with it dropped |
 | `ScsiDisk.state` (block/sd.rs, Linux sdev_state + state_mutex) | spin `Mutex<ScsiDeviceState>` | thread only | leaf: transitions (Linux's legal table) and each command's state check take it alone, never across I/O |
 | `util::ida::Ida` allocators: virtio, virtio-blk and sd indexes (Linux virtio_index_ida, vd_index_ida, sd_index_ida), namespace inode numbers (`ns::inum`, Linux proc_inum_ida) | `IrqSpinlock` | alloc thread only; free any context | leaf; nothing allocates under it (alloc grows the bitmap with it dropped, fallibly for `try_alloc`); a disk index is freed when the disk's last reference drops, a namespace's number when the namespace goes |
@@ -3677,8 +3682,8 @@ its addresses, routes and neighbours go and packet sockets lose it
 (NETDEV_UNREGISTER), RTM_DELLINK is sent and its sysfs device removed.
 The driver then disables a NAPI that is still enabled (`napi_disable`
 waits for a running poll), quiesces the hardware, frees its IRQ (no
-ISR runs after its `IrqRegistration` is dropped, which takes the IRQ
-table lock every dispatch holds), `netif_napi_del`s and frees its DMA
+ISR runs after its `IrqRegistration` is dropped, which takes the
+line's `IrqDesc.lock` every dispatch of the line holds), `netif_napi_del`s and frees its DMA
 memory. A `NetDevice` still referenced (queued skbs) stays down and
 driverless; hk cannot wait for those references (Linux
 netdev_wait_allrefs) because skbs in socket queues hold them.
@@ -4129,7 +4134,7 @@ locks will never be interrupted by an ISR that also tries to acquire the same lo
 
 **Why this is safe**: ISRs in hk only perform the operations of 7.1:
 atomics, and IrqSpinlocks (run queues and pi locks, wait queue heads,
-`IRQ_TABLE`, the blk-mq hardware queue, `Completion.done`,
+`IrqDesc.lock`, the blk-mq hardware queue, `Completion.done`,
 `Softnet.poll_list`, the cross-CPU call queues, printk)
 
 ISRs NEVER perform:

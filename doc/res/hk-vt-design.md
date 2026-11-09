@@ -78,9 +78,9 @@ Design and plan for doc/ROADMAP.md phase V; its P0 prerequisites are in phases C
 | VT_EVENT | spin Mutex leaf + WaitQueue | thread | under CONSOLE_SEM |
 | INPUT_MUTEX | sync::Mutex | thread | outermost input |
 | InputDev.mutex, Evdev.mutex, Uinput.mutex | sync::Mutex | thread | INPUT_MUTEX → Uinput.mutex → InputDev.mutex → Evdev.mutex → event_lock |
-| InputDev.event_lock | IrqSpinlock | IRQ (i8042, virtio-input), timer (repeat), thread (USB HID, uinput, inject) | under driver IRQ_TABLE/I8042_LOCK; above KBD, EvdevClient.buf, waitqueue heads, queue_work; driver event callback must not sleep |
+| InputDev.event_lock | IrqSpinlock | IRQ (i8042, virtio-input), timer (repeat), thread (USB HID, uinput, inject) | under the driver line's IrqDesc.lock/I8042_LOCK; above KBD, EvdevClient.buf, waitqueue heads, queue_work; driver event callback must not sleep |
 | EvdevClient.buf | IrqSpinlock leaf | same | → waitqueue head |
-| I8042_LOCK | IrqSpinlock | IRQ + thread commands | IRQ_TABLE → I8042_LOCK → event_lock (serio_interrupt under it) |
+| I8042_LOCK | IrqSpinlock | IRQ + thread commands | IrqDesc.lock → I8042_LOCK → event_lock (serio_interrupt under it) |
 | HID state | atomics + thread-owned | xHCI event thread | xHCI locks (released) → event_lock |
 | Work list (P0c) | IrqSpinlock leaf | any | → waitqueue head |
 Rules: IRQ only try-locks CONSOLE_SEM; every Consw call under Vc.draw; signals/alloc/devtmpfs only under CONSOLE_SEM, never draw; Tty.ldata/termios/ctrl never held across con_write. Drain protocol (console_unlock): guard Drop drains VT_PRINTK_PENDING into fg VC under draw, releases, re-checks ring; repeat if non-empty and try_lock succeeds. Delete LOCKING §3.9 "Graphics Console Lock" row and the "Per-TTY locks → GfxConsole.state" order entry with GfxConsole. Globals justified (one keyboard state, screen set, fg console, as Linux); evdev rings per client. CONSOLE_SEM trylock from IRQ is safe with sync::Mutex (me() = NO_TASK; IRQ-safe WaitQueue unlock wake): document in §1.4 as the one try-only IRQ use (down_trylock).

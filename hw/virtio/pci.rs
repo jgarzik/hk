@@ -20,7 +20,7 @@
 //! a spin leaf, thread context only: claimed, then set, by `request_irq`
 //! (driver probe; it registers between the two, unlocked) and taken by
 //! `free_irq` (driver remove, transport remove), which drops it
-//! (`IRQ_TABLE`) after unlocking.
+//! (`IrqDesc.lock`) after unlocking.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

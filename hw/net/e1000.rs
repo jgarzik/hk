@@ -31,7 +31,7 @@
 //!   Empty once removed.
 //! - The binding's `irq` (the INTx registration): `crate::sync::spin::Mutex`,
 //!   thread context only (probe sets it, remove takes it). Leaf: the
-//!   registration is dropped (`IRQ_TABLE`) after unlocking.
+//!   registration is dropped (`IrqDesc.lock`) after unlocking.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
