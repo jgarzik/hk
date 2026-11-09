@@ -267,6 +267,35 @@ impl<'a> IovDest<'a> {
         Ok(n)
     }
 
+    /// Copy `n` bytes at `off` of the page frame `phys` (a page-cache
+    /// page) as `copy_to` would; pinned pages get a raw move, as the
+    /// frame may be one of them (a buffer mapping the very file range
+    /// read)
+    ///
+    /// # Safety
+    /// `phys` is a RAM frame the caller keeps referenced, [off, off + n)
+    /// lies in it, and the caller holds no reference to its bytes.
+    pub unsafe fn copy_from_page(
+        &mut self,
+        phys: u64,
+        off: usize,
+        n: usize,
+    ) -> Result<usize, KernelError> {
+        if let Dest::Pages(p) = &mut self.0 {
+            let pp = p.pp;
+            let src = phys + off as u64;
+            // SAFETY: the caller's contract, per piece of the frame
+            let c = p.step(n, &mut |i, at, k, from| unsafe {
+                pp.copy_from_frame(i, at, src + from as u64, k)
+            });
+            return Ok(c);
+        }
+        // SAFETY: the caller's contract; read only, as the frame's
+        // other readers
+        let bytes: &[u8] = unsafe { crate::mm::page::frame_bytes(phys) };
+        self.copy_to(&bytes[off..off + n])
+    }
+
     /// Copy all of `data`, EFAULT if it does not fit or a fault cuts it
     /// short (a record that must arrive whole: an event, a counter)
     pub fn copy_to_full(&mut self, data: &[u8]) -> Result<(), KernelError> {
@@ -392,6 +421,29 @@ impl<'a> IovSource<'a> {
             }),
             Source::Kernel(..) | Source::Pages(_) => self.copy_from(buf).unwrap_or(0),
         }
+    }
+
+    /// Fill `n` bytes at `off` of the locked page frame `phys` (a
+    /// page-cache page) as `copy_from_nofault` would; pinned pages give
+    /// a raw move, as the frame may be one of them (a buffer mapping the
+    /// very file range written)
+    ///
+    /// # Safety
+    /// `phys` is a RAM frame the caller keeps referenced and may write
+    /// (its page lock), [off, off + n) lies in it, and the caller holds
+    /// no reference to its bytes.
+    pub unsafe fn copy_to_page_nofault(&mut self, phys: u64, off: usize, n: usize) -> usize {
+        if let Source::Pages(p) = &mut self.0 {
+            let pp = p.pp;
+            let dst = phys + off as u64;
+            // SAFETY: the caller's contract, per piece of the frame
+            return p.step(n, &mut |i, at, k, to| unsafe {
+                pp.copy_to_frame(i, at, dst + to as u64, k)
+            });
+        }
+        // SAFETY: the caller's contract
+        let bytes = unsafe { crate::mm::page::frame_bytes(phys) };
+        self.copy_from_nofault(&mut bytes[off..off + n])
     }
 
     /// Fill as much of `buf` as there is data for (Linux

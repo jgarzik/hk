@@ -898,11 +898,10 @@ fn read_with(
             .min(size.saturating_sub(at) as usize);
         let r = match page {
             Some(phys) => {
-                // SAFETY: an uptodate page with our reference; writers
-                // hold its lock, a racing one gives torn data as on
-                // Linux, never UB here beyond the byte copy
-                let bytes: &[u8] = unsafe { frame_bytes(phys) };
-                let r = to.copy_to(&bytes[off..off + n]);
+                // SAFETY: an uptodate page with our reference, no
+                // reference to it held; writers hold its lock, a racing
+                // one gives torn data as on Linux
+                let r = unsafe { to.copy_from_page(phys, off, n) };
                 put_page(phys);
                 r
             }
@@ -976,9 +975,9 @@ fn copy_page(
     n: usize,
 ) -> Result<usize, usize> {
     let off = (at % PAGE_SIZE as u64) as usize;
-    // SAFETY: the locked page with our reference
-    let bytes = unsafe { frame_bytes(phys) };
-    let c = from.copy_from_nofault(&mut bytes[off..off + n]);
+    // SAFETY: the locked page with our reference, no reference to it
+    // held
+    let c = unsafe { from.copy_to_page_nofault(phys, off, n) };
     if c == 0 || (c < n && !uptodate(phys)) {
         from.revert(c);
         unlock_page(phys);

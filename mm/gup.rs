@@ -67,9 +67,9 @@ pub struct PageSeg {
 #[must_use]
 pub struct PinnedPages {
     segs: KVec<PageSeg>,
-    /// Page-cache pages of shared file mappings, by index in `segs`,
-    /// with their mapping's inode: a write into them dirties them there
-    cache: KVec<(usize, Arc<Inode>)>,
+    /// Per segment, the inode whose page cache its page belongs to (a
+    /// shared file mapping written through): a write dirties it there
+    owners: KVec<Option<Arc<Inode>>>,
     dirty: bool,
 }
 
@@ -78,7 +78,7 @@ impl PinnedPages {
     fn new(max: usize) -> Result<Self, KernelError> {
         Ok(Self {
             segs: KVec::try_with_capacity(max)?,
-            cache: KVec::new(),
+            owners: KVec::try_with_capacity(max)?,
             dirty: false,
         })
     }
@@ -103,39 +103,91 @@ impl PinnedPages {
         self.dirty = true;
     }
 
-    /// Copy `data` into segment `i` from byte `at` of it (the kernel
-    /// writing what a device would); the bytes copied
-    pub fn write(&self, i: usize, at: usize, data: &[u8]) -> usize {
+    /// Segment `i` from byte `at` on, at most `want` bytes: the direct
+    /// map address and the length (0 past the segment)
+    fn span(&self, i: usize, at: usize, want: usize) -> (*mut u8, usize) {
         let Some(s) = self.segs.get(i) else {
-            return 0;
+            return (core::ptr::null_mut(), 0);
         };
-        let n = data.len().min((s.len as usize).saturating_sub(at));
-        let dst = crate::arch::phys_to_virt(s.phys + u64::from(s.off) + at as u64);
-        // SAFETY: the page is pinned while `self` lives and [off + at,
-        // off + at + n) lies in it; a raw copy creates no reference to
-        // memory the process may access meanwhile (as a device's DMA)
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n) };
-        n
+        let n = want.min((s.len as usize).saturating_sub(at));
+        let va =
+            crate::arch::phys_to_virt(s.phys + u64::from(s.off) + at.min(s.len as usize) as u64);
+        (va, n)
+    }
+
+    /// Copy `data` into segment `i` from byte `at` of it (the kernel
+    /// writing what a device would); the bytes copied. `data` may be the
+    /// very bytes of the pinned page (a page-cache page the buffer maps):
+    /// then they already hold it; a slice overlapping them otherwise is
+    /// refused (0), as writing under it would break its borrow (page
+    /// copies between frames go through `copy_from_frame`).
+    pub fn write(&self, i: usize, at: usize, data: &[u8]) -> usize {
+        let (dst, n) = self.span(i, at, data.len());
+        match overlap(dst, data.as_ptr(), n) {
+            Overlap::Same => n,
+            Overlap::Partial => 0,
+            // SAFETY: the page is pinned while `self` lives and the n
+            // bytes at `dst` lie in it (`span`); `data` is other memory.
+            // A raw copy creates no reference to memory the process may
+            // access meanwhile (as a device's DMA).
+            Overlap::None => unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
+                n
+            },
+        }
     }
 
     /// Copy from segment `i`, byte `at` on, into `buf`; the bytes copied
+    /// (as `write`, the other way)
     pub fn read(&self, i: usize, at: usize, buf: &mut [u8]) -> usize {
-        let Some(s) = self.segs.get(i) else {
-            return 0;
-        };
-        let n = buf.len().min((s.len as usize).saturating_sub(at));
-        let src = crate::arch::phys_to_virt(s.phys + u64::from(s.off) + at as u64);
-        // SAFETY: as `write`, the other way
-        unsafe { core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n) };
+        let (src, n) = self.span(i, at, buf.len());
+        match overlap(src, buf.as_ptr(), n) {
+            Overlap::Same => n,
+            Overlap::Partial => 0,
+            // SAFETY: as `write`: the n bytes at `src` lie in the pinned
+            // page, `buf` is other memory
+            Overlap::None => unsafe {
+                core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+                n
+            },
+        }
+    }
+
+    /// Copy `n` bytes of the frame memory at physical `src` into segment
+    /// `i` from byte `at` of it (as `write`); the bytes copied. The two
+    /// may be the same page, overlapping (a buffer mapping the very file
+    /// range a read fills): a raw move, no reference to either.
+    ///
+    /// # Safety
+    /// [src, src + n) lies in a RAM frame the caller keeps referenced, and
+    /// the caller holds no reference to its bytes during the call.
+    pub unsafe fn copy_from_frame(&self, i: usize, at: usize, src: u64, n: usize) -> usize {
+        let (dst, n) = self.span(i, at, n);
+        // SAFETY: both ranges are frames kept alive (the pin, the
+        // caller's reference) and borrowed by no reference; `copy`
+        // allows them to overlap
+        unsafe { core::ptr::copy(crate::arch::phys_to_virt(src), dst, n) };
         n
     }
 
-    /// Mark segment `i`'s page dirty: anonymous memory by its flag, a
-    /// page-cache page in its mapping under the page lock (Linux
-    /// folio_mark_dirty)
-    fn dirty_seg(&self, i: usize, phys: u64) {
-        match self.cache.iter().find(|(k, _)| *k == i) {
-            Some((_, inode)) => {
+    /// Copy segment `i`, byte `at` on, into `n` bytes of the frame memory
+    /// at physical `dst` (`copy_from_frame` the other way)
+    ///
+    /// # Safety
+    /// As [`PinnedPages::copy_from_frame`], for `dst`.
+    pub unsafe fn copy_to_frame(&self, i: usize, at: usize, dst: u64, n: usize) -> usize {
+        let (src, n) = self.span(i, at, n);
+        // SAFETY: as `copy_from_frame`
+        unsafe { core::ptr::copy(src, crate::arch::phys_to_virt(dst), n) };
+        n
+    }
+
+    /// Mark the page at `phys` dirty: anonymous memory by its flag, a
+    /// page-cache page in its `owner`'s mapping under the page lock
+    /// (Linux folio_mark_dirty)
+    fn dirty_page(phys: u64, owner: Option<&Arc<Inode>>) {
+        match owner {
+            Some(inode) => {
                 super::page::lock_page(phys);
                 super::filemap::dirty_page(&inode.i_data, phys);
                 super::page::unlock_page(phys);
@@ -152,12 +204,33 @@ impl PinnedPages {
 
 impl Drop for PinnedPages {
     fn drop(&mut self) {
-        for (i, s) in self.segs.iter().enumerate() {
+        for (s, owner) in self.segs.iter().zip(self.owners.iter()) {
             if self.dirty {
-                self.dirty_seg(i, s.phys);
+                Self::dirty_page(s.phys, owner.as_ref());
             }
             unpin_page(s.phys);
         }
+    }
+}
+
+/// How a slice lies against `n` bytes of a pinned page at `page`
+enum Overlap {
+    /// Elsewhere
+    None,
+    /// Exactly those bytes
+    Same,
+    /// Some of them
+    Partial,
+}
+
+fn overlap(page: *const u8, other: *const u8, n: usize) -> Overlap {
+    let (a, b) = (page.addr(), other.addr());
+    if n == 0 || a.saturating_add(n) <= b || b.saturating_add(n) <= a {
+        Overlap::None
+    } else if a == b {
+        Overlap::Same
+    } else {
+        Overlap::Partial
     }
 }
 
@@ -252,38 +325,6 @@ fn fault_in(mm: &Mm, addr: u64, access: Access) -> Result<(), KernelError> {
     })
 }
 
-/// Pin the page `addr` of the current address space, to be written
-/// (`write`: a read from a device, Linux FOLL_WRITE) or read; its frame.
-/// Takes and drops the mmap_lock (for reading) itself.
-fn pin_one(mm: &Mm, addr: u64, write: bool) -> Result<(u64, Option<Arc<Inode>>), KernelError> {
-    loop {
-        let r = {
-            let map = mm.mmap_read();
-            let vma = pin_vma(&map, addr, write)?;
-            let t = PgTables::new(mm, &map);
-            match follow_pin(mm, t, vma, addr, write)? {
-                Follow::Pinned(phys) => return Ok((phys, cache_owner(vma, write))),
-                Follow::Unshare => {
-                    unshare_for_write(
-                        mm,
-                        t,
-                        addr,
-                        vma.anon_vma.clone(),
-                        vma.index_of(addr),
-                        vma.prot,
-                    )
-                    .map_err(|_| KernelError::OutOfMemory)?;
-                    None
-                }
-                Follow::Fault(a) => Some(a),
-            }
-        };
-        if let Some(a) = r {
-            fault_in(mm, addr, a)?;
-        }
-    }
-}
-
 /// The inode whose page cache a pinned page written through a shared
 /// file mapping belongs to
 fn cache_owner(vma: &Vma, write: bool) -> Option<Arc<Inode>> {
@@ -294,54 +335,104 @@ fn cache_owner(vma: &Vma, write: bool) -> Option<Arc<Inode>> {
     inode.i_op.maps_cache().then_some(inode)
 }
 
-/// Pin the pages of the current task's `len` bytes at `addr`, at most
-/// `max` pages, into `out` (Linux pin_user_pages_fast, FOLL_PIN, with
-/// FOLL_WRITE for `write`): the bytes pinned, short at the first page
-/// that cannot be pinned; that page's error if none was
-fn pin_user_range(
+/// What a run of pins under one mmap_lock hold ended with
+enum Step {
+    /// Done, or stopped (with the error if nothing was pinned)
+    Done(Result<usize, KernelError>),
+    /// The page at this address needs a fault for this access
+    Fault(u64, Access),
+}
+
+/// The bytes done, or `e` if none were
+fn partial(done: usize, e: KernelError) -> Result<usize, KernelError> {
+    if done > 0 { Ok(done) } else { Err(e) }
+}
+
+/// Pin the pages of the `len` bytes at `addr` of `mm` from byte `done`
+/// on, at most `max` pages in `out`, under one hold of its mmap_lock
+/// (`map`), the VMA kept while the pages are in it (Linux
+/// __get_user_pages); stops at a page that must be faulted in
+fn pin_locked(
     out: &mut PinnedPages,
-    addr: u64,
-    len: usize,
+    mm: &Mm,
+    map: &MmStruct,
+    (addr, len, mut done): (u64, usize, usize),
     write: bool,
     max: usize,
-) -> Result<usize, KernelError> {
-    let mm = crate::task::percpu::current()
-        .mm()
-        .ok_or(KernelError::BadAddress)?;
-    let mut done = 0usize;
+) -> Step {
+    let t = PgTables::new(mm, map);
+    let mut vma: Option<&Vma> = None;
     while done < len && out.segs.len() < max {
-        let a = addr
-            .checked_add(done as u64)
-            .ok_or(KernelError::BadAddress)?;
+        let Some(a) = addr.checked_add(done as u64) else {
+            return Step::Done(partial(done, KernelError::BadAddress));
+        };
+        let page = a & !(PAGE_SIZE - 1);
+        let v = match vma.filter(|v| v.contains(page)) {
+            Some(v) => v,
+            None => match pin_vma(map, page, write) {
+                Ok(v) => *vma.insert(v),
+                Err(e) => return Step::Done(partial(done, e)),
+            },
+        };
+        let phys = match follow_pin(mm, t, v, page, write) {
+            Ok(Follow::Pinned(phys)) => phys,
+            Ok(Follow::Fault(acc)) => return Step::Fault(page, acc),
+            Ok(Follow::Unshare) => {
+                let r =
+                    unshare_for_write(mm, t, page, v.anon_vma.clone(), v.index_of(page), v.prot);
+                if r.is_err() {
+                    return Step::Done(partial(done, KernelError::OutOfMemory));
+                }
+                continue;
+            }
+            Err(e) => return Step::Done(partial(done, e)),
+        };
         let off = (a & (PAGE_SIZE - 1)) as usize;
         let n = (len - done).min(PAGE_SIZE as usize - off);
-        let (phys, owner) = match pin_one(&mm, a & !(PAGE_SIZE - 1), write) {
-            Ok(p) => p,
-            Err(e) if done == 0 => return Err(e),
-            Err(_) => break,
-        };
         let seg = PageSeg {
             phys,
             // Within a page: lossless
             off: off as u32,
             len: n as u32,
         };
-        // Room was reserved for `max` pages
-        if out.segs.try_push(seg).is_err() {
-            unpin_page(phys);
-            break;
-        }
-        if let Some(i) = owner
-            && out.cache.try_push((out.segs.len() - 1, i)).is_err()
-        {
-            // Without its owner the page could not be dirtied: give it back
-            out.segs.pop();
+        // Room was reserved for `max` pages in both
+        if out.segs.try_push(seg).is_err() || out.owners.try_push(cache_owner(v, write)).is_err() {
+            if out.segs.len() > out.owners.len() {
+                out.segs.pop();
+            }
             unpin_page(phys);
             break;
         }
         done += n;
     }
-    Ok(done)
+    Step::Done(Ok(done))
+}
+
+/// Pin the pages of `mm`'s `len` bytes at `addr`, at most `max` pages,
+/// into `out` (Linux pin_user_pages_fast, FOLL_PIN, with FOLL_WRITE for
+/// `write`): the bytes pinned, short at the first page that cannot be
+/// pinned; that page's error if none was. The mmap_lock is held for
+/// reading across the run and dropped only to fault a page in.
+fn pin_user_range(
+    out: &mut PinnedPages,
+    mm: &Mm,
+    addr: u64,
+    len: usize,
+    write: bool,
+    max: usize,
+) -> Result<usize, KernelError> {
+    let mut done = 0;
+    loop {
+        let step = pin_locked(out, mm, &mm.mmap_read(), (addr, len, done), write, max);
+        let (page, acc) = match step {
+            Step::Done(r) => return r,
+            Step::Fault(page, acc) => (page, acc),
+        };
+        done = (page.max(addr) - addr) as usize;
+        if let Err(e) = fault_in(mm, page, acc) {
+            return partial(done, e);
+        }
+    }
 }
 
 /// A visitor of user runs: called with (address, length, offset into
@@ -358,13 +449,16 @@ pub fn pin_user_segs(
     write: bool,
     max: usize,
 ) -> Result<PinnedPages, KernelError> {
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::BadAddress)?;
     let mut out = PinnedPages::new(max)?;
     let mut err = None;
     segs(&mut |addr, len, _| {
         if err.is_some() || out.segs.len() >= max {
             return 0;
         }
-        match pin_user_range(&mut out, addr, len, write, max) {
+        match pin_user_range(&mut out, &mm, addr, len, write, max) {
             Ok(n) => n,
             Err(e) => {
                 err = Some(e);

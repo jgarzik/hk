@@ -1549,9 +1549,10 @@ pub struct Zone {
   `get_n` (refused for a free page or a count near saturation) and
   dropped at once by `put_n`, whose last reference frees the page.
   `maybe_dma_pinned` reads the count lock-free.
-- Pinning (`pin_one`) holds the mmap_lock for reading per page and
-  drops it to fault a page in (`handle_mm_fault` takes it), as remote
-  access does: mmap_lock (read) -> page_table_lock (a 2MB entry is
+- Pinning (`pin_user_range`) holds the mmap_lock for reading across a
+  run of pages, keeping the VMA while the pages are in it, and drops it
+  only to fault a page in (`handle_mm_fault` takes it; Linux
+  __get_user_pages): mmap_lock (read) -> page_table_lock (a 2MB entry is
   split first) -> PTE lock, under which the entry is checked and the
   count raised. A private anonymous page still shared copy-on-write is
   first given to the mapping (`unshare_for_write`, under the same mmap
