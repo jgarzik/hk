@@ -64,6 +64,15 @@ pub const PG_SLAB: u32 = 1 << 12;
 /// A page-cache page's data is valid (Linux PG_uptodate)
 pub const PG_UPTODATE: u32 = 1 << 13;
 
+/// A page of a private mapping that one PTE maps and no one shares
+/// copy-on-write (Linux PG_anon_exclusive): a write fault or mprotect
+/// may make it writable in place whatever its count (pins). Set when the
+/// mapping gets the page as its own (a fresh fault page, a copy-on-write
+/// copy or reuse, an exclusive swap-in, a pin of a writable entry);
+/// cleared when fork shares it and when reclaim unmaps it; the free
+/// resets it.
+pub const PG_ANON_EXCL: u32 = 1 << 14;
+
 /// Page frame size
 pub const PAGE_SHIFT: u32 = 12;
 
@@ -173,6 +182,28 @@ impl Page {
     #[inline]
     pub fn is_reserved(&self) -> bool {
         self.has(PG_RESERVED)
+    }
+
+    /// The private mapping that maps it owns it alone (Linux
+    /// PageAnonExclusive)
+    #[inline]
+    pub fn anon_exclusive(&self) -> bool {
+        self.has(PG_ANON_EXCL)
+    }
+
+    /// Its private mapping owns it alone (Linux SetPageAnonExclusive)
+    #[inline]
+    pub fn set_anon_exclusive(&self) {
+        self.set_flag(PG_ANON_EXCL);
+    }
+
+    /// Its private mapping may write it in place whatever its count:
+    /// owned alone and not in the swap cache (a cached page is a clean
+    /// copy of its slot, written back only if PG_DIRTY: it becomes
+    /// writable only once out of the cache)
+    #[inline]
+    pub fn reusable(&self) -> bool {
+        self.anon_exclusive() && !self.is_swapcache()
     }
 
     // ========================================================================
@@ -596,6 +627,19 @@ mod tests {
         assert!(!page.is_anon());
         page.clear_mapping();
         assert_eq!(Arc::strong_count(&av), 1);
+    }
+
+    #[test]
+    fn anon_exclusive_until_freed() {
+        let page = Page::new();
+        assert!(!page.anon_exclusive());
+        page.set_anon_exclusive();
+        assert!(page.anon_exclusive());
+        page.clear_flag(PG_ANON_EXCL);
+        assert!(!page.anon_exclusive());
+        page.set_anon_exclusive();
+        put_mapping(page.free_prepare());
+        assert!(!page.anon_exclusive());
     }
 
     #[test]

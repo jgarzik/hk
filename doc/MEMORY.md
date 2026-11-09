@@ -195,6 +195,19 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   holds its own on each of its pages, splitting a 2MB page gives each 4KB frame the head's count.
   Unmapping drops the reference and the last one frees the frame. Frames
   outside the allocator (MMIO) have no count and are never freed.
+- **Pins (Linux FOLL_PIN, `mm/gup.rs`).** Direct I/O pins the caller's
+  pages for the device: 1024 references per pin on the 4KB page (a 2MB
+  mapping is split first), dropped when the I/O is done, the page
+  dirtied first after a read. A page with that many references is
+  "maybe pinned": fork gives the child a copy of such a page the parent
+  owns alone (the parent keeps the page, writable), reclaim never swaps
+  one out, and munmap or exit leave it allocated until its last unpin.
+  A private mapping's own page carries `PG_ANON_EXCL` (Linux
+  PageAnonExclusive): a write fault or mprotect makes it writable in
+  place whatever its count (once out of the swap cache), so the
+  process keeps seeing the page the device uses. A pin of a page still shared copy-on-write first gives
+  the mapping its own (a write pin through a write fault, a read pin of
+  an anonymous page through an unshare).
 - **Reverse map (Linux anon_vma).** Every private anonymous VMA (mmap,
   brk, the image and stack) has an AnonVma, shared by fork's copies and
   the pieces of a split, whose chain lists each VMA with its range and
@@ -227,7 +240,9 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   PTEs: a MAP_SHARED mapping keeps sharing its pages (writes stay
   visible both ways); a private one shares them copy-on-write (both
   PTEs read-only and marked COW, also for pages read-only at fork, so a
-  later mprotect(PROT_WRITE) cannot make the shared page writable). A
+  later mprotect(PROT_WRITE) cannot make the shared page writable),
+  except a maybe-pinned page the parent owns alone, which the child
+  gets a copy of (Linux copy_present_page). A
   2MB page is split into 4KB PTEs in the parent first; a swap PTE is
   copied, its slot counting one more reference (Linux swap_duplicate). MADV_DONTFORK VMAs are left out of the
   child, MADV_WIPEONFORK ones start empty there, and memory locks

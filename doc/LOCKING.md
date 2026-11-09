@@ -1542,6 +1542,45 @@ pub struct Zone {
   switches away, so the flush reaches it (arm64 broadcast; x86 see TLB
   Flushing).
 
+#### Page pins (mm/gup.rs; Linux mm/gup.c FOLL_PIN)
+
+- A pin is `GUP_PIN_COUNTING_BIAS` (1024) references on a 4KB page's
+  atomic count (Linux's scheme for small folios), taken at once by
+  `get_n` (refused for a free page or a count near saturation) and
+  dropped at once by `put_n`, whose last reference frees the page.
+  `maybe_dma_pinned` reads the count lock-free.
+- Pinning (`pin_one`) holds the mmap_lock for reading per page and
+  drops it to fault a page in (`handle_mm_fault` takes it), as remote
+  access does: mmap_lock (read) -> page_table_lock (a 2MB entry is
+  split first) -> PTE lock, under which the entry is checked and the
+  count raised. A private anonymous page still shared copy-on-write is
+  first given to the mapping (`unshare_for_write`, under the same mmap
+  lock hold).
+- The PTE lock orders a pin against fork and reclaim, which decide
+  under it too: `memory::copy_pte` copies a maybe-pinned page the
+  parent owns alone for the child instead of sharing it (the copy's
+  page is allocated with no PTE lock held: the walk stops at that
+  entry, allocates under the mm locks only, and resumes there, Linux
+  copy_pte_range's -EAGAIN); `rmap::try_to_unmap` leaves a maybe-pinned
+  page mapped, and reclaim skips one before it starts. A pin that comes
+  after either sees the entry they left (a copy-on-write entry: a
+  write pin faults, a read pin unshares; a swap entry: it faults).
+- `PG_ANON_EXCL` (Linux PG_anon_exclusive) is an atomic flag bit set
+  and cleared only under the PTE lock of the entry mapping the page:
+  set by a fault mapping a private mapping's own page, a copy-on-write
+  copy or reuse, an exclusive swap-in and a pin of a writable private
+  entry; cleared by fork sharing the page and by reclaim unmapping it;
+  reset by the free. Read under the PTE lock by the write fault and
+  mprotect (reuse in place, for a page out of the swap cache:
+  `Page::reusable`), remote writes and fork.
+- Unpinning (`PinnedPages` drop) takes no lock for anonymous pages
+  (their dirty flag is an atomic bit; the count drop may free the page,
+  which the allocator allows in any context). A page-cache page written
+  through a shared mapping is dirtied under its page lock (sleeping),
+  so a `PinnedPages` with such pages is dropped in thread context; a
+  completion in an interrupt handler must hand it to a thread (Linux
+  bio_dirty_work).
+
 #### Swap (mm/swap.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
 
 - `SwapInfo.map` (`spin::Mutex`, Linux si->lock): a device's slot

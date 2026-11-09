@@ -462,10 +462,28 @@ fn do_fault(
     if area.anon_private() {
         add_anon(page, area, addr);
     }
+    // A private mapping's own page: fresh, not the page cache's
+    if !area.shared && !wp {
+        set_exclusive(page);
+    }
     flush_tlb_page(mm, addr);
     drop(l);
     increment_min_flt();
     Ok(())
+}
+
+/// The private mapping that just mapped `phys` owns it alone (Linux
+/// RMAP_EXCLUSIVE)
+fn set_exclusive(phys: u64) {
+    if let Some(pg) = super::page::phys_to_page(phys) {
+        pg.set_anon_exclusive();
+    }
+}
+
+/// `phys` is a private mapping's own page, writable in place (Linux
+/// PageAnonExclusive; `Page::reusable`)
+fn is_exclusive(phys: u64) -> bool {
+    super::page::phys_to_page(phys).is_some_and(|pg| pg.reusable())
 }
 
 /// Map the page of the swap PTE `pte` at `ptep` (Linux do_swap_page),
@@ -525,6 +543,9 @@ fn map_swap_page(
     }
     let ok = t.set(addr, pte, entry);
     debug_assert!(ok, "swap PTE changed under its PTE lock");
+    if exclusive {
+        set_exclusive(page);
+    }
     if let Some(av) = &area.anon_vma {
         super::rmap::page_add_anon_rmap(page, av, area.index(addr));
     }
@@ -625,8 +646,14 @@ fn wp_locked(
     if !area.shared && FRAME_ALLOCATOR.refcount(old) > 1 {
         reuse_swap_page(old);
     }
-    if area.shared || FRAME_ALLOCATOR.refcount(old) <= 1 {
+    // The mapping's own page, pinned or not, is reused in place (Linux
+    // wp_can_reuse_anon_folio, PageAnonExclusive)
+    let excl = !area.shared && is_exclusive(old);
+    if area.shared || excl || FRAME_ALLOCATOR.refcount(old) <= 1 {
         if t.set(addr, pte, own(pte)) {
+            if !area.shared {
+                set_exclusive(old);
+            }
             flush_tlb_page(mm, addr);
             increment_min_flt();
         }
@@ -644,6 +671,9 @@ fn wp_locked(
     }
     if area.anon_private() {
         add_anon(new, area, addr);
+    }
+    if !area.shared {
+        set_exclusive(new);
     }
     super::memory::put_page(old);
     increment_min_flt();

@@ -25,6 +25,7 @@ pub mod fault;
 pub mod fault_inject;
 pub mod filemap;
 pub mod gather;
+pub mod gup;
 pub mod huge_page;
 pub mod ioremap;
 pub mod lru;

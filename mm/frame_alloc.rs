@@ -139,6 +139,18 @@ impl FrameAllocator {
         self.ours(frame).is_some_and(|p| self.zone.put(p))
     }
 
+    /// Take `n` references at once (a pin, `mm::gup`) unless the frame
+    /// is free or its count near saturation; false for frames the
+    /// allocator does not manage
+    pub fn get_refs(&self, frame: u64, n: u32) -> bool {
+        self.ours(frame).is_some_and(|p| self.zone.get_n(p, n))
+    }
+
+    /// Drop `n` references at once; true if that freed the frame
+    pub fn put_refs(&self, frame: u64, n: u32) -> bool {
+        self.ours(frame).is_some_and(|p| self.zone.put_n(p, n))
+    }
+
     /// References to the frame (0 for frames the allocator does not
     /// manage, such as MMIO)
     pub fn refcount(&self, frame: u64) -> u32 {

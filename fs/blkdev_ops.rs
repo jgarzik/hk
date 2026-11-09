@@ -61,9 +61,93 @@ fn read_at(file: &File, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelE
     filemap::read_iter(&b.bd_inode, to, pos)
 }
 
+/// Pages pinned per step of O_DIRECT I/O (1 MiB)
+const DIO_PAGES: usize = 256;
+
+/// O_DIRECT read at `pos`: the caller's pages are pinned a batch at a
+/// time (Linux bio_iov_iter_get_pages) and filled from the device's page
+/// cache, until the zero-copy path sends the bios straight into them;
+/// kernel memory, which is not pinned, is read as without O_DIRECT. The
+/// bytes read, short at the end of the device or at the first page that
+/// cannot be pinned (that page's error if it is the first).
+fn dio_read(file: &File, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
+    // At or past the end nothing is pinned (Linux blkdev_read_iter)
+    if pos >= bdev(file)?.capacity() {
+        return Ok(0);
+    }
+    let mut done = 0usize;
+    while !to.is_empty() {
+        let mut pp = match to.extract_pages(DIO_PAGES) {
+            Ok(pp) => pp,
+            Err(KernelError::OperationNotSupported) if done == 0 => return read_at(file, to, pos),
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        let want = pp.len();
+        let n = match read_at(file, &mut IovDest::pinned(&pp), pos + done as u64) {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        if n > 0 {
+            pp.set_dirty();
+        }
+        done += n;
+        if n < want {
+            break;
+        }
+    }
+    Ok(done)
+}
+
+/// O_DIRECT write at `pos`, from the caller's pinned pages through the
+/// device's page cache (as `dio_read`)
+fn dio_write(file: &File, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
+    // The device's errors come before the buffer's (Linux
+    // blkdev_write_iter checks before blkdev_direct_IO)
+    if !write_ok(file, from.len(), pos)? {
+        return Ok(0);
+    }
+    let mut done = 0usize;
+    while !from.is_empty() {
+        let pp = match from.extract_pages(DIO_PAGES) {
+            Ok(pp) => pp,
+            Err(KernelError::OperationNotSupported) if done == 0 => {
+                return write_at(file, from, pos);
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        let want = pp.len();
+        let n = match write_at(file, &mut IovSource::pinned(&pp), pos + done as u64) {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        done += n;
+        if n < want {
+            break;
+        }
+    }
+    Ok(done)
+}
+
 /// Write at `pos`: EPERM if read-only, ENOSPC at or past the end, short
 /// at it (Linux blkdev_write_iter)
 fn write_at(file: &File, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
+    if !write_ok(file, from.len(), pos)? {
+        return Ok(0);
+    }
+    let b = bdev(file)?;
+    from.truncate((b.capacity() - pos).min(usize::MAX as u64) as usize);
+    filemap::write_iter(&b.bd_inode, from, pos)
+}
+
+/// The checks of a write of `len` bytes at `pos` (Linux
+/// blkdev_write_iter): EPERM if read-only, ETXTBSY for an active swap
+/// partition, then false (nothing to do) for no bytes, ENOSPC at or past
+/// the end
+fn write_ok(file: &File, len: usize, pos: u64) -> Result<bool, KernelError> {
     let b = bdev(file)?;
     if b.ro() {
         return Err(KernelError::NotPermitted);
@@ -72,15 +156,13 @@ fn write_at(file: &File, from: &mut IovSource<'_>, pos: u64) -> Result<usize, Ke
     if b.bd_inode.i_swapfile.load(Ordering::Acquire) {
         return Err(KernelError::TextBusy);
     }
-    if from.is_empty() {
-        return Ok(0);
+    if len == 0 {
+        return Ok(false);
     }
-    let size = b.capacity();
-    if pos >= size {
+    if pos >= b.capacity() {
         return Err(KernelError::NoSpace);
     }
-    from.truncate((size - pos).min(usize::MAX as u64) as usize);
-    filemap::write_iter(&b.bd_inode, from, pos)
+    Ok(true)
 }
 
 /// The pages of a block device's inode are its sectors (Linux
@@ -364,7 +446,12 @@ impl FileOps for BlockFileOps {
         if flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
-        let n = read_at(file, to, at.unwrap_or_else(|| file.get_pos()))?;
+        let pos = at.unwrap_or_else(|| file.get_pos());
+        let n = if flags.contains(RwFlags::DIRECT) {
+            dio_read(file, to, pos)?
+        } else {
+            read_at(file, to, pos)?
+        };
         if at.is_none() {
             file.advance_pos(n as u64);
         }
@@ -384,7 +471,12 @@ impl FileOps for BlockFileOps {
         if flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
-        let n = write_at(file, from, at.unwrap_or_else(|| file.get_pos()))?;
+        let pos = at.unwrap_or_else(|| file.get_pos());
+        let n = if flags.contains(RwFlags::DIRECT) {
+            dio_write(file, from, pos)?
+        } else {
+            write_at(file, from, pos)?
+        };
         if at.is_none() {
             file.advance_pos(n as u64);
         }

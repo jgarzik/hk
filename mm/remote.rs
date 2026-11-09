@@ -55,7 +55,7 @@ fn fault_in(target: &Mm, addr: u64, write: bool) -> Result<(), KernelError> {
 
 /// `phys` is in a frame of the allocator (a 4KB page, or a 2MB page by
 /// its head), not MMIO or other memory outside it
-fn ordinary(phys: u64) -> bool {
+pub(super) fn ordinary(phys: u64) -> bool {
     let fa = &crate::FRAME_ALLOCATOR;
     fa.refcount(phys & !(PAGE_SIZE - 1)) > 0 || fa.refcount_huge(phys & !((2 << 20) - 1)) > 0
 }
@@ -232,12 +232,14 @@ fn frame_of(pte: u64, addr: u64) -> Option<u64> {
 }
 
 /// A private 4KB entry `pte` maps a page this mapping alone owns:
-/// writable, or neither copy-on-write nor referenced elsewhere
+/// writable, marked its own (a pinned page), or neither copy-on-write
+/// nor referenced elsewhere
 fn exclusive(pte: u64) -> bool {
+    let phys = paging::pte_addr(pte);
     (paging::pte_present(pte) || paging::pte_protnone(pte))
         && (paging::pte_write(pte)
-            || (!paging::pte_cow(pte)
-                && crate::FRAME_ALLOCATOR.refcount(paging::pte_addr(pte)) == 1))
+            || crate::mm::page::phys_to_page(phys).is_some_and(|p| p.reusable())
+            || (!paging::pte_cow(pte) && crate::FRAME_ALLOCATOR.refcount(phys) == 1))
 }
 
 /// Copy `buf` to page `addr` under the entry's page-table lock; with

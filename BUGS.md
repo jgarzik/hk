@@ -141,6 +141,11 @@ Missing:
 - File mappings: no fault-around (Linux maps up to 16 cached pages
   per read fault); filesystems without a page cache (procfs) still
   map a private copy.
+- A MAP_PRIVATE file mapping's copy of a page (its write fault) is not
+  an anonymous page (no rmap, no LRU; Linux makes it one): a read pin
+  (`mm/gup.rs` `follow_pin`) of such a copy still shared copy-on-write
+  after fork pins it shared instead of first giving the mapping its own
+  (Linux gup_must_unshare).
 - shmdt needs the address an attachment starts at (Linux also finds a
   piece moved by mremap); SHM_EXEC is ignored.
 - shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
@@ -256,7 +261,15 @@ lo (hk has no checksum offload states).
 Files that take O_DIRECT (`FileOps::can_odirect`) still read and write
 through the page cache: no alignment checks (EINVAL), no cache bypass
 (Linux blkdev_direct_IO, fat_direct_IO; tmpfs is buffered in Linux
-too).
+too). Block devices pin the caller's pages (`blkdev_ops::dio_read`,
+`dio_write`) but copy between them and the cache; kernel buffers are
+not pinned (`IovDest::extract_pages`: EOPNOTSUPP) and take the cached
+path.
+Unpinning dirties a page-cache page under its page lock, so a
+`PinnedPages` (`mm/gup.rs`) holding one is dropped in thread context;
+nothing yet lets an I/O completing in an interrupt handler hand it to
+a thread (Linux bio_dirty_work): `Workqueue::queue_work` takes a spin
+Mutex and allocates.
 
 ## File lock gaps
 

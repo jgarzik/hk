@@ -90,9 +90,9 @@ pub(super) fn sync_huge(phys: u64) {
 
 /// Rewrite the entry `pte` for `prot` if it maps a page, its PTE lock
 /// held. A
-/// private page becomes writable only if no one else maps it (Linux
-/// can_change_pte_writable); one still shared is copied at its write
-/// fault.
+/// private page becomes writable only if no one else maps it, or it is
+/// the mapping's own (pinned) page (Linux can_change_pte_writable:
+/// PageAnonExclusive); one still shared is copied at its write fault.
 fn change_pte(pte: &AtomicU64, prot: u32, shared: bool) {
     let old = pte.load(Ordering::Acquire);
     if !paging::pte_present(old) {
@@ -102,7 +102,10 @@ fn change_pte(pte: &AtomicU64, prot: u32, shared: bool) {
         // Becomes executable: instruction caches see its data
         paging::sync_page(paging::pte_addr(old), true);
     }
-    let write = shared || FRAME_ALLOCATOR.refcount(paging::pte_addr(old)) <= 1;
+    let phys = paging::pte_addr(old);
+    let write = shared
+        || FRAME_ALLOCATOR.refcount(phys) <= 1
+        || super::page::phys_to_page(phys).is_some_and(|p| p.reusable());
     // Write implies read (x86, arm64): a page left read-only keeps it
     let prot = if write || prot & PROT_WRITE == 0 {
         prot

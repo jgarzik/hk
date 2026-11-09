@@ -723,6 +723,44 @@ impl Zone {
         true
     }
 
+    /// Take `n` references at once (a pin) unless the page is free or
+    /// the count would come near saturation (Linux try_grab_folio's
+    /// overflow check)
+    pub fn get_n(&self, pfn: u64, n: u32) -> bool {
+        let rc = &self.page(pfn).refcount;
+        let mut c = rc.load(Ordering::Relaxed);
+        loop {
+            if c == 0 || c >= u32::MAX / 2 {
+                return false;
+            }
+            match rc.compare_exchange_weak(c, c + n, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(cur) => c = cur,
+            }
+        }
+    }
+
+    /// Drop `n` references at once, freeing the page with the last (as
+    /// `put`); true if freed
+    pub fn put_n(&self, pfn: u64, n: u32) -> bool {
+        let rc = &self.page(pfn).refcount;
+        let mut c = rc.load(Ordering::Relaxed);
+        loop {
+            if c == 0 || c == u32::MAX {
+                return false;
+            }
+            debug_assert!(c >= n, "put_n: {n} of {c} references");
+            let left = c.saturating_sub(n);
+            match rc.compare_exchange_weak(c, left, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) if left == 0 => break,
+                Ok(_) => return false,
+                Err(cur) => c = cur,
+            }
+        }
+        self.release(pfn, self.order_of(pfn));
+        true
+    }
+
     /// Current reference count
     pub fn count(&self, pfn: u64) -> u32 {
         self.page(pfn).refcount.load(Ordering::Relaxed)
@@ -1020,6 +1058,30 @@ mod tests {
         let q = t.z.alloc_pages(0, Gfp::KERNEL).unwrap();
         assert!(t.z.put(q));
         assert!(!t.z.put(q));
+    }
+
+    /// A pin's references come and go at once, the last unpin freeing the
+    /// page (mm::gup); a free page, or one whose count nears saturation,
+    /// refuses a pin
+    #[test]
+    fn pin_refs() {
+        let t = zone(0, 16);
+        t.z.free_range(0, 16);
+        let p = t.z.alloc_pages(0, Gfp::KERNEL).unwrap();
+        assert!(t.z.get_n(p, 1024));
+        assert_eq!(t.z.count(p), 1025);
+        // The mapping goes first (munmap), the unpin frees
+        assert!(!t.z.put(p));
+        assert!(t.z.put_n(p, 1024));
+        assert_eq!(t.z.count(p), 0);
+        assert!(!t.z.get_n(p, 1024));
+        assert!(!t.z.put_n(p, 1024));
+        assert_eq!(t.z.count(p), 0);
+        let q = t.z.alloc_pages(0, Gfp::KERNEL).unwrap();
+        t.z.page(q).refcount.store(u32::MAX / 2, Ordering::Relaxed);
+        assert!(!t.z.get_n(q, 1024));
+        t.z.page(q).refcount.store(1, Ordering::Relaxed);
+        assert!(t.z.put(q));
     }
 
     /// A reference taken while another CPU drops the last one either

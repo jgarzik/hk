@@ -70,6 +70,12 @@ fn shrink_page(phys: u64) -> Fate {
     if !pg.is_anon() || !trylock_page(phys) {
         return Fate::Keep { active: false };
     }
+    // A device may be reading or writing it (Linux: try_to_unmap fails
+    // for a maybe-pinned page, folio_try_share_anon_rmap_pte)
+    if super::gup::maybe_dma_pinned(phys) {
+        unlock_page(phys);
+        return Fate::Keep { active: true };
+    }
     let fate = pageout(phys);
     if !matches!(fate, Fate::Freed) {
         unlock_page(phys);

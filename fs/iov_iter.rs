@@ -1,8 +1,10 @@
 //! I/O iterators (Linux struct iov_iter; Rust-for-Linux IovIterDest /
 //! IovIterSource): where a read puts its data and where a write takes
-//! it from, user segments or a kernel buffer, so a filesystem copies
-//! straight between its pages and the caller's memory (no bounce
-//! buffer) and in-kernel readers (exec, splice) use the same path.
+//! it from, user segments, a kernel buffer or pinned pages (ITER_BVEC),
+//! so a filesystem copies straight between its pages and the caller's
+//! memory (no bounce buffer) and in-kernel readers (exec, splice) use
+//! the same path. Direct I/O pins the pages of user segments
+//! (`extract_pages`, `mm::gup`).
 //!
 //! Both move forward (a write source can step back over what a failed
 //! page took, Linux iov_iter_revert). A user copy may fault and sleep:
@@ -20,6 +22,7 @@ use crate::uaccess::{
 use crate::util::error::KernelError;
 
 use super::iov::IoVec;
+use crate::mm::gup::{PinnedPages, pin_user_segs};
 
 /// Position in a list of user segments
 struct Segs<'a> {
@@ -110,9 +113,74 @@ impl<'a> Segs<'a> {
     }
 }
 
+/// Position in pinned pages (Linux ITER_BVEC)
+struct Pages<'a> {
+    pp: &'a PinnedPages,
+    i: usize,
+    at: usize,
+    left: usize,
+}
+
+impl<'a> Pages<'a> {
+    fn new(pp: &'a PinnedPages) -> Self {
+        Self {
+            pp,
+            i: 0,
+            at: 0,
+            left: pp.len(),
+        }
+    }
+
+    /// Visit up to `len` bytes segment by segment, as `step` on user
+    /// segments; `f` gets (segment, offset in it, length, offset into the
+    /// caller's buffer)
+    fn step(
+        &mut self,
+        len: usize,
+        f: &mut dyn FnMut(usize, usize, usize, usize) -> usize,
+    ) -> usize {
+        let mut done = 0;
+        let len = len.min(self.left);
+        while done < len {
+            let Some(s) = self.pp.segs().get(self.i) else {
+                break;
+            };
+            let n = (s.len as usize - self.at).min(len - done);
+            let moved = f(self.i, self.at, n, done);
+            self.at += moved;
+            done += moved;
+            self.left -= moved;
+            if moved < n {
+                break;
+            }
+            if self.at == s.len as usize {
+                self.i += 1;
+                self.at = 0;
+            }
+        }
+        done
+    }
+
+    /// Step back over the last `n` bytes moved
+    fn revert(&mut self, mut n: usize) {
+        self.left += n;
+        while n > 0 {
+            if self.at == 0 {
+                self.i -= 1;
+                self.at = self.pp.segs()[self.i].len as usize;
+                continue;
+            }
+            let k = self.at.min(n);
+            self.at -= k;
+            n -= k;
+        }
+    }
+}
+
 enum Dest<'a> {
     User(Segs<'a>),
     Kernel(&'a mut [u8]),
+    Pages(Pages<'a>),
 }
 
 /// Where a read puts its data (Linux ITER_DEST)
@@ -129,11 +197,18 @@ impl<'a> IovDest<'a> {
         Self(Dest::Kernel(buf))
     }
 
+    /// Pinned pages, the I/O a device would do into them (Linux
+    /// ITER_BVEC)
+    pub fn pinned(pp: &'a PinnedPages) -> Self {
+        Self(Dest::Pages(Pages::new(pp)))
+    }
+
     /// Room left
     pub fn len(&self) -> usize {
         match &self.0 {
             Dest::User(s) => s.left,
             Dest::Kernel(b) => b.len(),
+            Dest::Pages(p) => p.left,
         }
     }
 
@@ -149,6 +224,19 @@ impl<'a> IovDest<'a> {
                 let k = n.min(b.len());
                 *b = &mut core::mem::take(b)[..k];
             }
+            Dest::Pages(p) => p.left = p.left.min(n),
+        }
+    }
+
+    /// Pin the user pages of the next bytes, at most `max` pages, to be
+    /// written (a read from a device: Linux iov_iter_extract_pages with
+    /// FOLL_WRITE), and step over them: short at the first page that
+    /// cannot be pinned, that page's error if it is the first.
+    /// EOPNOTSUPP for kernel memory, which is not pinned.
+    pub fn extract_pages(&mut self, max: usize) -> Result<PinnedPages, KernelError> {
+        match &mut self.0 {
+            Dest::User(s) => pin_user_segs(&mut |f| s.step(usize::MAX, f), true, max),
+            _ => Err(KernelError::OperationNotSupported),
         }
     }
 
@@ -165,6 +253,12 @@ impl<'a> IovDest<'a> {
                 head.copy_from_slice(&data[..n]);
                 *b = tail;
                 n
+            }
+            Dest::Pages(p) => {
+                let pp = p.pp;
+                p.step(data.len(), &mut |i, at, n, from| {
+                    pp.write(i, at, &data[from..from + n])
+                })
             }
         };
         if n == 0 && !data.is_empty() && !self.is_empty() {
@@ -208,6 +302,7 @@ enum Source<'a> {
     User(Segs<'a>),
     /// The buffer and the bytes taken from it
     Kernel(&'a [u8], usize),
+    Pages(Pages<'a>),
 }
 
 /// Where a write takes its data from (Linux ITER_SOURCE)
@@ -224,11 +319,18 @@ impl<'a> IovSource<'a> {
         Self(Source::Kernel(buf, 0))
     }
 
+    /// Pinned pages, the I/O a device would do from them (Linux
+    /// ITER_BVEC)
+    pub fn pinned(pp: &'a PinnedPages) -> Self {
+        Self(Source::Pages(Pages::new(pp)))
+    }
+
     /// Bytes left
     pub fn len(&self) -> usize {
         match &self.0 {
             Source::User(s) => s.left,
             Source::Kernel(b, at) => b.len() - at,
+            Source::Pages(p) => p.left,
         }
     }
 
@@ -242,6 +344,19 @@ impl<'a> IovSource<'a> {
         match &mut self.0 {
             Source::User(s) => s.left = s.left.min(n),
             Source::Kernel(b, at) => *b = &b[..at.saturating_add(n).min(b.len())],
+            Source::Pages(p) => p.left = p.left.min(n),
+        }
+    }
+
+    /// Pin the user pages of the next bytes, at most `max` pages, to be
+    /// read (a write to a device: Linux iov_iter_extract_pages), and step
+    /// over them: short at the first page that cannot be pinned, that
+    /// page's error if it is the first. EOPNOTSUPP for kernel memory,
+    /// which is not pinned.
+    pub fn extract_pages(&mut self, max: usize) -> Result<PinnedPages, KernelError> {
+        match &mut self.0 {
+            Source::User(s) => pin_user_segs(&mut |f| s.step(usize::MAX, f), false, max),
+            _ => Err(KernelError::OperationNotSupported),
         }
     }
 
@@ -250,7 +365,7 @@ impl<'a> IovSource<'a> {
     pub fn fault_in(&self, n: usize) -> usize {
         match &self.0 {
             Source::User(s) => s.fault_in(n),
-            Source::Kernel(..) => 0,
+            Source::Kernel(..) | Source::Pages(_) => 0,
         }
     }
 
@@ -259,6 +374,7 @@ impl<'a> IovSource<'a> {
         match &mut self.0 {
             Source::User(s) => s.revert(n),
             Source::Kernel(_, at) => *at -= n,
+            Source::Pages(p) => p.revert(n),
         }
     }
 
@@ -274,7 +390,7 @@ impl<'a> IovSource<'a> {
                 pagefault_enable();
                 c
             }),
-            Source::Kernel(..) => self.copy_from(buf).unwrap_or(0),
+            Source::Kernel(..) | Source::Pages(_) => self.copy_from(buf).unwrap_or(0),
         }
     }
 
@@ -292,6 +408,12 @@ impl<'a> IovSource<'a> {
                 buf[..n].copy_from_slice(&b[*at..*at + n]);
                 *at += n;
                 n
+            }
+            Source::Pages(p) => {
+                let pp = p.pp;
+                p.step(want, &mut |i, at, n, to| {
+                    pp.read(i, at, &mut buf[to..to + n])
+                })
             }
         };
         if n == 0 && want != 0 && !self.is_empty() {
