@@ -56,6 +56,10 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
     // Note: percpu uses u8 APIC ID for xAPIC compatibility
     percpu::init_bsp(bsp_apic_id as u8);
     printkln!("SMP_CPU_ONLINE: cpu=0 apic={}", bsp_apic_id);
+    // Its IRQ stack, before it takes interrupts (Linux init_IRQ)
+    if !super::irq_stack::init(0) {
+        printkln!("SMP: Failed to allocate the IRQ stack for CPU 0");
+    }
 
     // Enable LAPIC on BSP; legacy PIC interrupts are delivered to it
     lapic.enable();
@@ -97,6 +101,11 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
         // Its IST stacks, in its TSS before it loads it
         if !cpu::alloc_ist(cpu_id, frame_alloc) {
             printkln!("SMP: Failed to allocate IST stacks for CPU {}", cpu_id);
+            continue;
+        }
+        // Its IRQ stack (Linux irq_init_percpu_irqstack at bringup)
+        if !super::irq_stack::init(cpu_id) {
+            printkln!("SMP: Failed to allocate the IRQ stack for CPU {}", cpu_id);
             continue;
         }
 

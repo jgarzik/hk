@@ -561,18 +561,6 @@ page tables hardest. Nothing in hk can avoid it. To do: check the BIOS
 for Intel default power/turbo settings and current microcode,
 stress-test CPUs 2 and 5, or keep gate QEMUs off them (taskset).
 
-## Interrupts run on the task stack (no IRQ stacks)
-
-**Location**: `arch/aarch64/vectors.S`, `arch/x86_64/`
-(IRQ entry)
-
-An interrupt pushes its trap frame (0x320 bytes on arm64, with the
-FP/SIMD registers) and handler frames onto whatever 16 KB task stack
-it lands on, so the deepest syscall path plus the deepest interrupt
-must fit in one stack. An overflow faults in the guard gap below the
-stack ("kernel stack overflow" panic, `mm::vmstack`). Linux has per-CPU IRQ stacks (x86 hardirq_stack,
-arm64 irq_stack).
-
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 
 **Location**: unknown (CPU 0, right after `FAULT_SEGV_ACCERR`, i.e. while

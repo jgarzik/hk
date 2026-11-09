@@ -9,7 +9,8 @@
 //! takes it as a double fault on an IST stack, arm64's exception entry
 //! sees SP leave the stack (bit 15 of SP set: slots are 64KB-aligned
 //! and no EL1 stack is larger than 32KB) and switches to this CPU's
-//! overflow stack. Both panic with "kernel stack overflow".
+//! overflow stack. Both panic with "kernel stack overflow". Each CPU's
+//! IRQ stack (`crate::irq_stack`) is one of these stacks too.
 //!
 //! Slot 0 is never used (the gap below slot 1's stack). A freed stack's
 //! pages are unmapped and freed at once, but its slot is reused only
@@ -303,6 +304,29 @@ pub fn in_guard(addr: u64) -> bool {
     contains(addr) && (addr - VMSTACK_START) % SLOT_SIZE >= THREAD_SIZE as u64
 }
 
+/// The base of the stack a fault at `addr` in a guard gap overflowed:
+/// the one in the slot above the gap
+pub fn overflowed(addr: u64) -> Option<u64> {
+    in_guard(addr)
+        .then(|| (addr - VMSTACK_START) / SLOT_SIZE * SLOT_SIZE + VMSTACK_START + SLOT_SIZE)
+}
+
+/// The bounds of the stack `addr` lies on, if it is one of this area's
+/// (mapped or not: a slot's stack part)
+pub fn bounds(addr: u64) -> Option<core::ops::Range<u64>> {
+    if !contains(addr) || in_guard(addr) {
+        return None;
+    }
+    let base = addr - (addr - VMSTACK_START) % SLOT_SIZE;
+    Some(base..base + THREAD_SIZE as u64)
+}
+
+/// A stack a CPU keeps for good (its IRQ stack, arm64's overflow
+/// stack): its top. Thread context, like [`alloc`].
+pub fn alloc_percpu() -> Option<u64> {
+    alloc().map(|s| s.leak() + THREAD_SIZE as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +359,11 @@ mod tests {
         assert!(in_guard(b + THREAD_SIZE as u64));
         assert!(in_guard(b - 8));
         assert!(!contains(VMSTACK_END));
+        // An overflow below slot 5's stack is slot 5's
+        assert_eq!(overflowed(b - 8), Some(b));
+        assert_eq!(overflowed(b + THREAD_SIZE as u64), Some(slot_base(6)));
+        assert_eq!(overflowed(b), None);
+        assert_eq!(bounds(b + 100), Some(b..b + THREAD_SIZE as u64));
+        assert_eq!(bounds(b - 8), None);
     }
 }

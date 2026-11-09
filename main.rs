@@ -27,6 +27,7 @@ pub mod console;
 pub mod cpu;
 pub mod entry;
 pub mod irq;
+pub mod irq_stack;
 mod ksysfs;
 pub mod printk;
 pub mod selftest;

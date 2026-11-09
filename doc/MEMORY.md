@@ -45,7 +45,8 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
   (`mm/vmstack.rs`, Linux VMAP_STACK) are 16 KB of single pages at the
   start of a 64 KB slot of their own area, the rest of the slot
   unmapped: an overflow faults in that gap (a double fault, on its IST
-  stack) and panics with "kernel stack overflow". They are not in the
+  stack) and panics with "kernel stack overflow". Each CPU's IRQ stack
+  (`irq_stack.rs`) is one of them. They are not in the
   direct map, so no DMA from the stack.
 
 ## arm64 (4KB granule, 48-bit virtual)

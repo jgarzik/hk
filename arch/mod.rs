@@ -383,6 +383,24 @@ pub trait PerCpuOps {
     fn cpu_online(cpu: u32) -> bool;
 }
 
+/// Per-CPU IRQ stacks (`crate::irq_stack`)
+pub trait IrqStackOps {
+    /// Top of this CPU's IRQ stack, 0 before it has one
+    fn irq_stack_top() -> u64;
+
+    /// The stack pointer now
+    fn stack_pointer() -> u64;
+
+    /// Call `f(arg)` on the stack whose top is `top`, back on this one
+    /// after, with the frame-pointer chain linked across (Linux x86
+    /// call_on_stack, arm64 call_on_irq_stack)
+    ///
+    /// # Safety
+    /// `top` is the 16-byte aligned top of a mapped kernel stack that
+    /// nothing else uses until this returns.
+    unsafe fn call_on_stack(top: u64, f: extern "C" fn(*mut ()), arg: *mut ());
+}
+
 /// CPU control operations
 ///
 /// This trait abstracts CPU-level operations like interrupt enable/disable

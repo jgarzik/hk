@@ -16,6 +16,7 @@ pub mod gic;
 pub mod ioremap;
 pub mod ipi;
 pub mod irq;
+pub mod irq_stack;
 pub mod irqflags;
 pub mod kmap;
 pub mod paging;

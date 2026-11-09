@@ -4182,8 +4182,11 @@ uninterrupted by other tasks. What this changes, and why it holds:
   exactly as for kernel threads, which always ran with interrupts on.
 - Sleeping with interrupts off is now a bug: `might_sleep` reports it
   under `LOCKDEP=1` (1.5).
-- Interrupt handlers nest on the interrupted task's kernel stack (no
-  separate IRQ stacks, unlike Linux): handlers stay shallow.
+- Interrupt handlers run on their CPU's IRQ stack (`irq_stack`, Linux
+  hardirq_stack/irq_stack: x86 for an interrupt from kernel mode, arm64
+  for any), not the interrupted task's; the return-to-user work after
+  them runs on the task stack. Nothing nests on the IRQ stack but
+  exceptions (handlers keep interrupts off).
 - IRQ toggles (`cli`/`sti`, `msr daifset/daifclr`, `local_irq_*`) are
   compiler barriers (no `nomem`), so no memory access moves across
   them.

@@ -77,6 +77,10 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
     // Initialize BSP per-CPU data
     percpu::init_bsp(bsp_mpidr, bsp_stack_top);
     set_overflow_stack(0);
+    // Its IRQ stack, before it takes interrupts (Linux init_irq_stacks)
+    if !super::irq_stack::init(0) {
+        printkln!("SMP: Failed to allocate the IRQ stack for CPU 0");
+    }
 
     // Test PSCI is working
     let psci_ver = power::psci_version();
@@ -102,8 +106,10 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
         }
 
         // Allocate stack for this AP (aligned like every EL1 stack:
-        // vectors.S KERNEL_ENTRY), and its overflow stack
-        let Some(stack) = crate::mm::vmstack::alloc().filter(|_| set_overflow_stack(cpu_id)) else {
+        // vectors.S KERNEL_ENTRY), its overflow and IRQ stacks
+        let Some(stack) = crate::mm::vmstack::alloc()
+            .filter(|_| set_overflow_stack(cpu_id) && super::irq_stack::init(cpu_id))
+        else {
             printkln!(
                 "SMP: Failed to allocate stack for CPU {}",
                 cpu_info.hw_cpu_id
@@ -175,14 +181,12 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
 /// stack overflow continues on (vectors.S `el1_stack_overflow`); false
 /// if out of memory
 fn set_overflow_stack(cpu: u32) -> bool {
-    // The CPU's for good
-    let Some(base) = crate::mm::vmstack::alloc().map(|s| s.leak()) else {
+    let Some(top) = crate::mm::vmstack::alloc_percpu() else {
         return false;
     };
-    percpu::get_percpu(cpu).overflow_stack.store(
-        base + crate::mm::vmstack::THREAD_SIZE as u64,
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    percpu::get_percpu(cpu)
+        .overflow_stack
+        .store(top, core::sync::atomic::Ordering::Relaxed);
     true
 }
 
