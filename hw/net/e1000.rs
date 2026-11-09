@@ -675,7 +675,7 @@ impl crate::base::Bound for E1000DeviceWrapper {
         // Masks every cause and stops RX/TX DMA
         d.reset();
         if let Err(e) = d.pci.unregister_irq_handler() {
-            printkln!("e1000: {}: free IRQ: {}", self.netdev.name(), e);
+            printkln!("e1000: {}: free IRQ: {:?}", self.netdev.name(), e);
         }
         netif_napi_del(&d.napi);
         d.free_rings();
@@ -809,7 +809,7 @@ fn e1000_probe(
     match pci.register_irq_handler(device.clone()) {
         Ok(irq) => printkln!("e1000: IRQ {}", irq),
         Err(e) => {
-            printkln!("e1000: no IRQ ({}), RX disabled", e);
+            printkln!("e1000: no IRQ ({:?}), RX disabled", e);
             device.reset();
             device.free_rings();
             netif_napi_del(&device.napi);

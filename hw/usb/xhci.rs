@@ -1049,7 +1049,7 @@ impl XhciController {
             .store(r.rt.addr() as u64, Ordering::Release);
 
         // Register IRQ handler with PCI device
-        let h = try_arc(crate::irq::IrqFn(xhci_irq_handler)).map_err(|_| "out of memory");
+        let h = try_arc(crate::irq::IrqFn(xhci_irq_handler)).map_err(|_| KernelError::OutOfMemory);
         match h.and_then(|h| self.pci_dev.register_irq_handler(h)) {
             Ok(irq) => {
                 self.irq = Some(irq);
@@ -1063,7 +1063,7 @@ impl XhciController {
                 XHCI_IRQ_STATE.enabled.store(true, Ordering::Release);
             }
             Err(e) => {
-                printkln!("xHCI: Failed to register IRQ handler: {}", e);
+                printkln!("xHCI: Failed to register IRQ handler: {:?}", e);
                 // Not fatal - we can fall back to polling
             }
         }
@@ -2078,7 +2078,7 @@ impl XhciController {
         if self.irq.take().is_some()
             && let Err(e) = self.pci_dev.unregister_irq_handler()
         {
-            printkln!("xHCI: Failed to unregister IRQ: {}", e);
+            printkln!("xHCI: Failed to unregister IRQ: {:?}", e);
         }
         XHCI_IRQ_STATE.op_regs.store(0, Ordering::Release);
         XHCI_IRQ_STATE.rt_regs.store(0, Ordering::Release);

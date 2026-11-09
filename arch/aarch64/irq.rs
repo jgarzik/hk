@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use super::gic;
 use crate::arch::IrqSpinlock;
 use crate::irq::IrqHandler;
+use crate::util::error::KernelError;
 
 /// Maximum number of SPI interrupts supported
 const MAX_SPI: usize = 256;
@@ -56,13 +57,13 @@ impl IrqTable {
 /// Global IRQ handler table for SPIs
 static IRQ_TABLE: IrqSpinlock<IrqTable> = IrqSpinlock::new(IrqTable::new());
 
-fn spi_index(irq: u32) -> Result<usize, &'static str> {
+fn spi_index(irq: u32) -> Result<usize, KernelError> {
     if irq < 32 {
-        return Err("only SPIs (>= 32) can be registered");
+        return Err(KernelError::InvalidArgument);
     }
     let index = (irq - 32) as usize;
     if index >= MAX_SPI {
-        return Err("IRQ number out of range");
+        return Err(KernelError::InvalidArgument);
     }
     Ok(index)
 }
@@ -77,13 +78,13 @@ pub fn register_irq_handler(
     irq: u32,
     handler: Arc<dyn IrqHandler>,
     id: usize,
-) -> Result<(), &'static str> {
+) -> Result<(), KernelError> {
     let index = spi_index(irq)?;
     let first = {
         let mut table = IRQ_TABLE.lock();
         let line = &mut table.lines[index];
         if line.handlers.iter().any(|e| e.id == id) {
-            return Err("Handler with this ID already registered");
+            return Err(KernelError::Busy);
         }
         line.handlers.push(IrqEntry { handler, id });
         line.spurious.reset();
@@ -96,7 +97,7 @@ pub fn register_irq_handler(
 }
 
 /// Unregister a handler; the SPI is masked when its last handler goes
-pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<Arc<dyn IrqHandler>, &'static str> {
+pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<Arc<dyn IrqHandler>, KernelError> {
     let index = spi_index(irq)?;
     let mut table = IRQ_TABLE.lock();
     let line = &mut table.lines[index];
@@ -104,7 +105,7 @@ pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<Arc<dyn IrqHandler>
         .handlers
         .iter()
         .position(|e| e.id == id)
-        .ok_or("Handler not found")?;
+        .ok_or(KernelError::NotFound)?;
     let e = line.handlers.remove(pos);
     if line.handlers.is_empty() {
         gic::disable_spi(irq);

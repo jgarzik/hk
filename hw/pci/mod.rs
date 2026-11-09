@@ -17,6 +17,7 @@ use spin::Once;
 
 use crate::hw::dma::{DmaConfig, DmaDevice};
 use crate::printkln;
+use crate::util::error::KernelError;
 use crate::util::kalloc::box_nofail;
 
 // ============================================================================
@@ -832,12 +833,13 @@ impl PciDevice {
     /// and enable INTx at the device
     ///
     /// # Returns
-    /// The IRQ number on success, or an error description
+    /// The IRQ number on success; NoDevice without an INTx line, the
+    /// IRQ table's error otherwise
     pub fn register_irq_handler(
         &self,
         handler: alloc::sync::Arc<dyn crate::irq::IrqHandler>,
-    ) -> Result<u32, &'static str> {
-        let irq = self.intx_irq().ok_or("No valid IRQ assigned to device")?;
+    ) -> Result<u32, KernelError> {
+        let irq = self.intx_irq().ok_or(KernelError::NoDevice)?;
         crate::arch::irq::register_irq_handler(irq, handler, self.irq_id())?;
 
         // Clear INTERRUPT_DISABLE bit in command register to enable interrupts
@@ -856,9 +858,10 @@ impl PciDevice {
     /// disables INTx at the device first
     ///
     /// # Returns
-    /// The IRQ number that was unregistered, or an error
-    pub fn unregister_irq_handler(&self) -> Result<u32, &'static str> {
-        let irq = self.intx_irq().ok_or("No valid IRQ assigned to device")?;
+    /// The IRQ number that was unregistered; NoDevice without an INTx
+    /// line, NotFound when no handler was registered
+    pub fn unregister_irq_handler(&self) -> Result<u32, KernelError> {
+        let irq = self.intx_irq().ok_or(KernelError::NoDevice)?;
 
         // Disable interrupts at device level first (set INTERRUPT_DISABLE bit)
         let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);

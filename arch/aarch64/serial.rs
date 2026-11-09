@@ -214,7 +214,7 @@ fn rx_irq_init(irq: u32) -> bool {
         return false;
     };
     if let Err(e) = crate::arch::irq::register_irq_handler(irq, h, PL011_BASE) {
-        crate::printkln!("ttyAMA0: no IRQ {}: {}", irq, e);
+        crate::printkln!("ttyAMA0: no IRQ {}: {:?}", irq, e);
         return false;
     }
     UART.write_reg(regs::IMSC, int::RX | int::RT);

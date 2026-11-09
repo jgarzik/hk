@@ -497,7 +497,7 @@ impl VirtioDriver for VirtioBlkDriver {
             e
         };
         if let Err(e) = vdev.request_irq(blk.clone() as Arc<dyn VirtioIrq>) {
-            printkln!("virtio-blk: no IRQ ({})", e);
+            printkln!("virtio-blk: no IRQ ({:?})", e);
             return Err(fail(KernelError::NoDevice));
         }
         vdev.ready();

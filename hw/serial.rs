@@ -315,7 +315,7 @@ fn rx_irq_init(irq: u32) -> bool {
         return false;
     };
     if let Err(e) = crate::arch::irq::register_irq_handler(irq, h, id) {
-        crate::printkln!("ttyS0: no IRQ {}: {}", irq, e);
+        crate::printkln!("ttyS0: no IRQ {}: {:?}", irq, e);
         return false;
     }
     SERIAL_DRIVER_S0.enable_rx_irq();

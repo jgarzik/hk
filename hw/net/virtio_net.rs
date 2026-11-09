@@ -510,7 +510,7 @@ impl VirtioDriver for VirtioNetDriver {
         let irq = vdev
             .request_irq(Arc::clone(&device) as Arc<dyn VirtioIrq>)
             .map_err(|e| {
-                printkln!("virtio-net: no IRQ ({})", e);
+                printkln!("virtio-net: no IRQ ({:?})", e);
                 KernelError::NoDevice
             })?;
         vdev.ready();

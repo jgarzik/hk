@@ -384,12 +384,12 @@ impl VirtioDevice {
     }
 
     /// Register the driver's interrupt callbacks and enable INTx (Linux
-    /// find_vqs: vp_request_intx); EBUSY-like error if registered
-    pub fn request_irq(self: &Arc<Self>, cb: Arc<dyn VirtioIrq>) -> Result<u32, &'static str> {
+    /// find_vqs: vp_request_intx); Busy if already requested
+    pub fn request_irq(self: &Arc<Self>, cb: Arc<dyn VirtioIrq>) -> Result<u32, KernelError> {
         {
             let mut irq = self.irq.lock();
             if irq.is_some() {
-                return Err("virtio IRQ already requested");
+                return Err(KernelError::Busy);
             }
             *irq = Some(cb);
         }
@@ -430,7 +430,7 @@ impl VirtioDevice {
             return;
         }
         if let Err(e) = self.pci.unregister_irq_handler() {
-            printkln!("virtio-pci: {}: free_irq: {}", self.bus_id(), e);
+            printkln!("virtio-pci: {}: free_irq: {:?}", self.bus_id(), e);
         }
         // Dropped outside the lock: the callbacks may own the driver
         let cb = self.irq.lock().take();

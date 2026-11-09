@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 
 use crate::arch::IrqSpinlock;
 use crate::irq::IrqHandler;
+use crate::util::error::KernelError;
 
 /// Number of legacy PIC lines
 const NR_IRQS: usize = 16;
@@ -60,14 +61,14 @@ pub fn register_irq_handler(
     irq: u32,
     handler: Arc<dyn IrqHandler>,
     id: usize,
-) -> Result<(), &'static str> {
+) -> Result<(), KernelError> {
     if irq as usize >= NR_IRQS {
-        return Err("IRQ number out of range (0-15)");
+        return Err(KernelError::InvalidArgument);
     }
     let mut table = IRQ_TABLE.lock();
     let line = &mut table.lines[irq as usize];
     if line.handlers.iter().any(|e| e.id == id) {
-        return Err("Handler with this ID already registered");
+        return Err(KernelError::Busy);
     }
     line.handlers.push(IrqEntry { handler, id });
     line.spurious.reset();
@@ -78,9 +79,9 @@ pub fn register_irq_handler(
 }
 
 /// Unregister a handler; the line is masked when its last handler goes
-pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<Arc<dyn IrqHandler>, &'static str> {
+pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<Arc<dyn IrqHandler>, KernelError> {
     if irq as usize >= NR_IRQS {
-        return Err("IRQ number out of range (0-15)");
+        return Err(KernelError::InvalidArgument);
     }
     let mut table = IRQ_TABLE.lock();
     let line = &mut table.lines[irq as usize];
@@ -88,7 +89,7 @@ pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<Arc<dyn IrqHandler>
         .handlers
         .iter()
         .position(|e| e.id == id)
-        .ok_or("Handler not found")?;
+        .ok_or(KernelError::NotFound)?;
     let e = line.handlers.remove(pos);
     if line.handlers.is_empty() {
         super::pic::disable_irq(irq as u8);
