@@ -12,8 +12,8 @@
 //! Note: rt_sigreturn (15) is implemented in arch-specific signal.rs files
 
 use crate::signal::{
-    KillSig, SendInfo, SigAction, SigInfo, SigSet, Signal, UserSigInfo, dequeue_signal,
-    get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info, si_code,
+    AltStack, KillSig, SendInfo, SigAction, SigInfo, SigSet, Signal, UserSigInfo, dequeue_signal,
+    get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info, si_code, ss_flags,
     with_task_signal_state,
 };
 use crate::task::percpu::{TaskRef, current, current_pgid, current_tid, get_all_pids};
@@ -589,53 +589,56 @@ pub fn sys_sigaltstack(ss: UserPtr<UserStack>, oss: UserPtr<UserStack>) -> Kerne
 }
 
 /// Install `new` (if any) as the alternate stack of a thread at
-/// `user_sp` (Linux do_sigaltstack); the stack it had
+/// `user_sp` (Linux do_sigaltstack); the stack it had. Errors: EPERM
+/// (running on it), EINVAL (mode), ENOMEM (below MINSIGSTKSZ).
 fn do_sigaltstack(
     state: &mut crate::signal::TaskSignalState,
     new: Option<UserStack>,
     user_sp: u64,
 ) -> KernelResult<UserStack> {
-    use crate::signal::{AltStack, MINSIGSTKSZ, ss_flags};
-    let alt = &state.altstack;
-    let on_stack = alt.is_enabled() && {
-        let end = alt.ss_sp.saturating_add(alt.ss_size as u64);
-        (alt.ss_sp..end).contains(&user_sp)
-    };
+    let alt = state.altstack;
     let old = UserStack {
         ss_sp: alt.ss_sp,
-        ss_flags: alt.ss_flags | if on_stack { ss_flags::SS_ONSTACK } else { 0 },
+        ss_flags: alt.flags_at(user_sp) | (alt.ss_flags & ss_flags::SS_FLAG_BITS),
         _pad: 0,
         ss_size: alt.ss_size as u64,
     };
-    let Some(new) = new else {
-        return Ok(old);
-    };
-    // Cannot change while on signal stack
-    if on_stack {
+    if let Some(new) = new {
+        state.altstack = sas_new(&alt, &new, user_sp)?;
+    }
+    Ok(old)
+}
+
+/// The alternate stack `new` asks for, replacing `alt` of a thread at
+/// `user_sp` (Linux do_sigaltstack's checks; SS_ONSTACK as the mode
+/// enables it like 0)
+fn sas_new(alt: &AltStack, new: &UserStack, user_sp: u64) -> KernelResult<AltStack> {
+    if alt.on(user_sp) {
         return Err(KernelError::NotPermitted);
     }
-    // Only SS_DISABLE and SS_FLAG_BITS are valid
     let mode = new.ss_flags & !ss_flags::SS_FLAG_BITS;
-    if mode != 0 && mode != ss_flags::SS_DISABLE {
+    if mode != 0 && mode != ss_flags::SS_ONSTACK && mode != ss_flags::SS_DISABLE {
         return Err(KernelError::InvalidArgument);
     }
-    state.altstack = if mode == ss_flags::SS_DISABLE {
-        AltStack {
+    // The same stack again is no change, whatever its size
+    if (alt.ss_sp, alt.ss_size as u64, alt.ss_flags) == (new.ss_sp, new.ss_size, new.ss_flags) {
+        return Ok(*alt);
+    }
+    if mode == ss_flags::SS_DISABLE {
+        return Ok(AltStack {
             ss_sp: 0,
             ss_size: 0,
-            ss_flags: ss_flags::SS_DISABLE,
-        }
-    } else {
-        if (new.ss_size as usize) < MINSIGSTKSZ {
-            return Err(KernelError::OutOfMemory);
-        }
-        AltStack {
-            ss_sp: new.ss_sp,
-            ss_size: new.ss_size as usize,
             ss_flags: new.ss_flags,
-        }
-    };
-    Ok(old)
+        });
+    }
+    if (new.ss_size as usize) < crate::arch::uapi::MINSIGSTKSZ {
+        return Err(KernelError::OutOfMemory);
+    }
+    Ok(AltStack {
+        ss_sp: new.ss_sp,
+        ss_size: new.ss_size as usize,
+        ss_flags: new.ss_flags,
+    })
 }
 
 /// signalfd4(fd, mask, sizemask, flags): a new signalfd (`fd` -1) or a

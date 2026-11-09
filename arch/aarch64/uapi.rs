@@ -15,6 +15,10 @@ pub const AUDIT_ARCH: u32 = crate::seccomp::AUDIT_ARCH_AARCH64;
 /// ELF e_machine of native executables (Linux ELF_ARCH)
 pub const ELF_ARCH: u16 = crate::util::elf::EM_AARCH64;
 
+/// The smallest alternate signal stack sigaltstack takes (Linux
+/// MINSIGSTKSZ, arch/arm64/include/uapi/asm/signal.h)
+pub const MINSIGSTKSZ: usize = 5120;
+
 /// The RELATIVE relocation type (Linux R_AARCH64_RELATIVE)
 pub const R_RELATIVE: u32 = crate::util::elf::R_AARCH64_RELATIVE;
 

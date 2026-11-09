@@ -278,6 +278,7 @@ pub fn run_all_tests() {
     arch::fpu::run_tests();
     process::preempt::run_tests();
     signal::fault_signals::run_tests();
+    isolated(b"SIGALTSTACK", signal::sigaltstack::run_tests);
     ipc::ipc::run_tests();
     mm::mmap::run_tests();
     isolated(b"MM_LIFE", mm::mm_life::run_tests);

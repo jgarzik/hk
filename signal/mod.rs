@@ -498,25 +498,20 @@ pub mod ss_flags {
     pub const SS_FLAG_BITS: i32 = SS_AUTODISARM;
 }
 
-/// Minimum signal stack size (MINSIGSTKSZ on Linux)
-pub const MINSIGSTKSZ: usize = 2048;
-
-/// Default signal stack size (SIGSTKSZ on Linux)
-pub const SIGSTKSZ: usize = 8192;
-
-/// Alternate signal stack state
-#[derive(Clone, Debug)]
+/// Alternate signal stack state (Linux task sas_ss_sp, sas_ss_size,
+/// sas_ss_flags)
+#[derive(Clone, Copy, Debug)]
 pub struct AltStack {
     /// Stack pointer (base address)
     pub ss_sp: u64,
-    /// Stack size
+    /// Stack size (0: none)
     pub ss_size: usize,
-    /// Flags (SS_DISABLE, SS_AUTODISARM, etc.)
+    /// The flags it was set with (mode word and SS_AUTODISARM)
     pub ss_flags: i32,
 }
 
 impl AltStack {
-    /// Create new disabled alternate stack
+    /// None (Linux sas_ss_reset)
     pub const fn new() -> Self {
         Self {
             ss_sp: 0,
@@ -525,9 +520,27 @@ impl AltStack {
         }
     }
 
-    /// Check if alternate stack is enabled
-    pub fn is_enabled(&self) -> bool {
-        self.ss_flags & ss_flags::SS_DISABLE == 0
+    /// `sp` lies on it (Linux __on_sig_stack; the stack grows down)
+    pub fn contains(&self, sp: u64) -> bool {
+        sp > self.ss_sp && sp - self.ss_sp <= self.ss_size as u64
+    }
+
+    /// A thread at `sp` runs on it (Linux on_sig_stack): never with
+    /// SS_AUTODISARM, which disarmed it on entry
+    pub fn on(&self, sp: u64) -> bool {
+        self.ss_flags & ss_flags::SS_AUTODISARM == 0 && self.contains(sp)
+    }
+
+    /// Its state seen from `sp` (Linux sas_ss_flags): SS_DISABLE,
+    /// SS_ONSTACK or 0
+    pub fn flags_at(&self, sp: u64) -> i32 {
+        if self.ss_size == 0 {
+            ss_flags::SS_DISABLE
+        } else if self.on(sp) {
+            ss_flags::SS_ONSTACK
+        } else {
+            0
+        }
     }
 }
 
