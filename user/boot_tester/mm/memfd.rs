@@ -198,6 +198,12 @@ fn seals() {
     let fd = sys_memfd_create(b"s\0".as_ptr(), MFD_ALLOW_SEALING);
     t.eq(b"sealable", get(fd), 0);
     t.eq(b"bad seal", add(fd, 0x100), EINVAL);
+    // The argument is an unsigned int: high bits are dropped (Linux
+    // memfd_fcntl), not refused
+    let hi = sys_memfd_create(b"hi\0".as_ptr(), MFD_ALLOW_SEALING);
+    t.eq(b"high arg", add(hi, (1 << 32) | GROW), 0);
+    t.eq(b"high arg seals", get(hi), GROW as i64);
+    sys_close(hi as u64);
     let mut p = [0u8; 32];
     let ro = sys_open(fd_path(fd, &mut p).as_ptr(), O_RDONLY, 0);
     t.eq(b"read-only add", add(ro, GROW), EPERM);

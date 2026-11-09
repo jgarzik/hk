@@ -140,7 +140,8 @@ pub fn fcntl(file: &Arc<File>, cmd: i32, arg: u64) -> KernelResult<i64> {
     if !file.is_writable() {
         return Err(KernelError::NotPermitted);
     }
-    let mut seals = u32::try_from(arg).map_err(|_| KernelError::InvalidArgument)?;
+    // An unsigned int (Linux memfd_fcntl): the high bits are dropped
+    let mut seals = arg as u32;
     if seals & !F_ALL_SEALS != 0 {
         return Err(KernelError::InvalidArgument);
     }
