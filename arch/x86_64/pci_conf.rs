@@ -11,7 +11,7 @@ const PCI_CONFIG_ADDR: u16 = 0x0CF8;
 /// PCI configuration data port
 const PCI_CONFIG_DATA: u16 = 0x0CFC;
 
-/// The port I/O accessor (installed by `hw::pci::init_port_io`)
+/// The port I/O accessor (installed by `hw::pci::init_config`)
 pub static PORT_IO: PortIoConfigAccess = PortIoConfigAccess;
 
 /// Port I/O based PCI config access (x86 legacy)

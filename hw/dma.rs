@@ -13,12 +13,9 @@
 //! - dma_map_sg / dma_unmap_sg for scatter-gather lists
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use alloc::vec::Vec;
-#[cfg(target_arch = "x86_64")]
-use core::sync::atomic::{Ordering, fence};
-
-use crate::arch::{phys_to_virt, virt_to_phys};
+use crate::arch::{CurrentArch, DmaSyncOps, phys_to_virt, virt_to_phys};
 use crate::mm::frame_alloc::{FRAME_SIZE, FrameAllocator};
+use alloc::vec::Vec;
 
 /// DMA address type - what devices see
 ///
@@ -402,24 +399,8 @@ impl DmaOps for DirectDmaOps {
             return None;
         }
 
-        // ARM requires cache maintenance before DMA
-        // - ToDevice: Clean cache to ensure device sees CPU writes
-        // - FromDevice: Invalidate cache (clean first for safety) to prepare for device writes
-        // - Bidirectional: Both operations
-        #[cfg(target_arch = "aarch64")]
-        {
-            use crate::arch::aarch64::cache;
-            match direction {
-                DmaDirection::ToDevice => cache::cache_clean_range(cpu_addr, size),
-                DmaDirection::FromDevice | DmaDirection::Bidirectional => {
-                    cache::cache_flush_range(cpu_addr, size)
-                }
-            }
-        }
-
-        // Suppress unused warning on x86
-        #[cfg(not(target_arch = "aarch64"))]
-        let _ = direction;
+        // The device sees what the CPU wrote, the CPU no stale lines
+        CurrentArch::dma_map(cpu_addr, size, direction);
 
         // Direct mapping: DMA addr == physical addr
         Some(DmaAddr(phys))
@@ -432,26 +413,8 @@ impl DmaOps for DirectDmaOps {
         size: usize,
         direction: DmaDirection,
     ) {
-        // ARM requires cache invalidation after device DMA writes to memory
-        // so CPU sees fresh data instead of stale cached values
-        #[cfg(target_arch = "aarch64")]
-        {
-            use crate::arch::aarch64::cache;
-            match direction {
-                DmaDirection::FromDevice | DmaDirection::Bidirectional => {
-                    cache::cache_invalidate_range(phys_to_virt(dma_addr.0), size);
-                }
-                DmaDirection::ToDevice => {
-                    // No invalidation needed - device only read the data
-                }
-            }
-        }
-
-        // Suppress unused warnings on x86
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let _ = (dma_addr, size, direction);
-        }
+        // The CPU sees what the device wrote
+        CurrentArch::dma_unmap(phys_to_virt(dma_addr.0), size, direction);
     }
 
     fn map_sg(
@@ -492,24 +455,7 @@ impl DmaOps for DirectDmaOps {
         size: usize,
         direction: DmaDirection,
     ) {
-        // On x86-64, cache is coherent - just need memory barrier
-        #[cfg(target_arch = "x86_64")]
-        {
-            let _ = (dma_addr, size, direction);
-            fence(Ordering::SeqCst);
-        }
-
-        // On ARM, invalidate cache to see device writes
-        #[cfg(target_arch = "aarch64")]
-        {
-            use crate::arch::aarch64::cache;
-            match direction {
-                DmaDirection::FromDevice | DmaDirection::Bidirectional => {
-                    cache::cache_invalidate_range(phys_to_virt(dma_addr.0), size);
-                }
-                DmaDirection::ToDevice => {}
-            }
-        }
+        CurrentArch::dma_sync_for_cpu(phys_to_virt(dma_addr.0), size, direction);
     }
 
     fn sync_for_device(
@@ -519,24 +465,7 @@ impl DmaOps for DirectDmaOps {
         size: usize,
         direction: DmaDirection,
     ) {
-        // On x86-64, cache is coherent - just need memory barrier
-        #[cfg(target_arch = "x86_64")]
-        {
-            let _ = (dma_addr, size, direction);
-            fence(Ordering::SeqCst);
-        }
-
-        // On ARM, clean cache to make CPU writes visible to device
-        #[cfg(target_arch = "aarch64")]
-        {
-            use crate::arch::aarch64::cache;
-            match direction {
-                DmaDirection::ToDevice | DmaDirection::Bidirectional => {
-                    cache::cache_clean_range(phys_to_virt(dma_addr.0), size);
-                }
-                DmaDirection::FromDevice => {}
-            }
-        }
+        CurrentArch::dma_sync_for_device(phys_to_virt(dma_addr.0), size, direction);
     }
 
     fn name(&self) -> &'static str {

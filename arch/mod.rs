@@ -19,6 +19,7 @@
 //! - [`IoremapOps`] - Kernel page-table primitives (ioremap, vmap)
 //! - [`EarlyConOps`] - Boot UART output (earlycon, panic)
 //! - [`IrqChipOps`] - Device interrupt controller lines (mask, unmask)
+//! - [`DmaSyncOps`] - Cache maintenance for streaming DMA
 //! - [`AcpiOps`] - Platform hardware discovery (ACPI/device tree)
 //! - [`SmpOps`] - Multi-processor initialization
 //! - [`LocalTimerOps`] - Per-CPU timer operations
@@ -436,6 +437,20 @@ pub trait EarlyConOps {
     fn early_write(bytes: &[u8]);
 }
 
+/// CPU cache maintenance for streaming DMA behind `hw::dma` (Linux
+/// arch_sync_dma_for_device / arch_sync_dma_for_cpu); `va` is the
+/// buffer's direct-map address. Coherent arches need none (default)
+pub trait DmaSyncOps {
+    /// A buffer is mapped for the device (dma_map_single)
+    fn dma_map(_va: *const u8, _size: usize, _dir: crate::hw::dma::DmaDirection) {}
+    /// A buffer is unmapped (dma_unmap_single)
+    fn dma_unmap(_va: *const u8, _size: usize, _dir: crate::hw::dma::DmaDirection) {}
+    /// The CPU takes a mapped buffer back (dma_sync_single_for_cpu)
+    fn dma_sync_for_cpu(_va: *const u8, _size: usize, _dir: crate::hw::dma::DmaDirection) {}
+    /// The device gets a mapped buffer again (dma_sync_single_for_device)
+    fn dma_sync_for_device(_va: *const u8, _size: usize, _dir: crate::hw::dma::DmaDirection) {}
+}
+
 /// The device interrupt controller behind `crate::irq` (Linux struct
 /// irq_chip and the arch's PCI INTx routing): device IRQs are
 /// `FIRST_IRQ..FIRST_IRQ + NR_IRQS`. `irq_unmask` and `irq_mask` run
@@ -806,6 +821,11 @@ pub trait ArchBusOps {
     /// Set up PCI configuration space access (Linux raw_pci_ops on x86,
     /// the host bridge's ECAM window on arm64)
     fn pci_config_init();
+
+    /// Window for the BARs the firmware left unassigned, [start, end)
+    /// (x86: below the LAPIC/IOAPIC region, a fallback since the BIOS
+    /// assigns them; arm64: the QEMU virt PCI MMIO window)
+    const PCI_MMIO: (u64, u64);
 }
 
 // ============================================================================

@@ -399,6 +399,9 @@ impl PowerOps for Aarch64Arch {
 // ============================================================================
 
 impl ArchBusOps for Aarch64Arch {
+    // The QEMU virt PCI MMIO window
+    const PCI_MMIO: (u64, u64) = (0x1000_0000, 0x3F00_0000);
+
     /// QEMU virt's PL011 and PL031 (the GIC is an irqchip set up at
     /// boot, not a device: Linux IRQCHIP_DECLARE)
     fn platform_init() {

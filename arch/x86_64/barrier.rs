@@ -4,7 +4,9 @@
 //! stores, so the DMA barriers only need to stop the compiler.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{Ordering, compiler_fence, fence};
+
+use crate::hw::dma::DmaDirection;
 
 /// Order CPU writes to coherent DMA memory (e.g. descriptor fields before
 /// the field that hands it to the device)
@@ -43,5 +45,17 @@ pub fn sync_core() {
             out("edx") _,
             options(nostack, preserves_flags)
         );
+    }
+}
+
+/// Caches are coherent with DMA: a full fence orders the CPU's accesses
+/// around a sync
+impl crate::arch::DmaSyncOps for super::X86_64Arch {
+    fn dma_sync_for_cpu(_va: *const u8, _size: usize, _dir: DmaDirection) {
+        fence(Ordering::SeqCst);
+    }
+
+    fn dma_sync_for_device(_va: *const u8, _size: usize, _dir: DmaDirection) {
+        fence(Ordering::SeqCst);
     }
 }

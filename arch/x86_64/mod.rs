@@ -452,9 +452,12 @@ impl ArchBusOps for X86_64Arch {
         crate::hw::serial::SERIAL8250_DRIVER.register();
     }
 
+    // Below the LAPIC/IOAPIC region, before typical BIOS allocations
+    const PCI_MMIO: (u64, u64) = (0xE000_0000, 0xFEB0_0000);
+
     /// Configuration mechanism #1 (ports 0xCF8/0xCFC)
     fn pci_config_init() {
-        crate::hw::pci::init_port_io();
+        crate::hw::pci::init_config(&pci_conf::PORT_IO);
         crate::printkln!("PCI: Using port I/O config access");
     }
 }

@@ -10,6 +10,8 @@
 
 use core::arch::asm;
 
+use crate::hw::dma::DmaDirection;
+
 /// Cache line size on typical ARM64 cores (64 bytes)
 const CACHE_LINE_SIZE: usize = 64;
 
@@ -185,4 +187,31 @@ pub fn clean_inval_pou(addr: *const u8, len: usize) {
 pub fn cache_flush_range(addr: *const u8, len: usize) {
     // CIVAC does both clean and invalidate
     cache_invalidate_range(addr, len);
+}
+
+/// Clean before the device reads, invalidate before the CPU reads what
+/// it wrote
+impl crate::arch::DmaSyncOps for super::Aarch64Arch {
+    fn dma_map(va: *const u8, size: usize, dir: DmaDirection) {
+        match dir {
+            DmaDirection::ToDevice => cache_clean_range(va, size),
+            DmaDirection::FromDevice | DmaDirection::Bidirectional => cache_flush_range(va, size),
+        }
+    }
+
+    fn dma_unmap(va: *const u8, size: usize, dir: DmaDirection) {
+        Self::dma_sync_for_cpu(va, size, dir);
+    }
+
+    fn dma_sync_for_cpu(va: *const u8, size: usize, dir: DmaDirection) {
+        if dir != DmaDirection::ToDevice {
+            cache_invalidate_range(va, size);
+        }
+    }
+
+    fn dma_sync_for_device(va: *const u8, size: usize, dir: DmaDirection) {
+        if dir != DmaDirection::FromDevice {
+            cache_clean_range(va, size);
+        }
+    }
 }

@@ -36,21 +36,12 @@ use crate::util::kalloc::box_nofail;
 mod bar_alloc {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    // Platform-specific MMIO regions for PCI BAR allocation
-    //
-    // These ranges must not conflict with other memory mappings.
-    // On x86, BIOS typically assigns BARs, so this is a fallback.
-    // On ARM QEMU virt, this is the primary PCI MMIO window.
+    use crate::arch::{ArchBusOps, CurrentArch};
 
-    #[cfg(target_arch = "x86_64")]
-    const MMIO_START: u64 = 0xE000_0000; // Below LAPIC/IOAPIC region
-    #[cfg(target_arch = "x86_64")]
-    const MMIO_END: u64 = 0xFEB0_0000; // Before typical BIOS allocations
-
-    #[cfg(target_arch = "aarch64")]
-    const MMIO_START: u64 = 0x1000_0000; // QEMU virt PCI MMIO window
-    #[cfg(target_arch = "aarch64")]
-    const MMIO_END: u64 = 0x3F00_0000;
+    // The platform's MMIO window for BARs (must not overlap other
+    // mappings)
+    const MMIO_START: u64 = CurrentArch::PCI_MMIO.0;
+    const MMIO_END: u64 = CurrentArch::PCI_MMIO.1;
 
     /// Current allocation pointer (atomic for thread-safety)
     static NEXT_ADDR: AtomicU64 = AtomicU64::new(MMIO_START);
@@ -324,10 +315,9 @@ impl PciConfigAccess for EcamConfigAccess {
 /// Global PCI config access mechanism
 static PCI_CONFIG: Once<&'static dyn PciConfigAccess> = Once::new();
 
-/// Initialize PCI config access with port I/O (x86 legacy)
-#[cfg(target_arch = "x86_64")]
-pub fn init_port_io() {
-    PCI_CONFIG.call_once(|| &crate::arch::x86_64::pci_conf::PORT_IO);
+/// Initialize PCI config access with a static accessor (x86 port I/O)
+pub fn init_config(access: &'static dyn PciConfigAccess) {
+    PCI_CONFIG.call_once(|| access);
 }
 
 /// Initialize PCI config access with ECAM (memory-mapped)
@@ -352,7 +342,7 @@ pub fn is_initialized() -> bool {
 fn config() -> &'static dyn PciConfigAccess {
     *PCI_CONFIG
         .get()
-        .expect("PCI config access not initialized - call init_port_io() or init_ecam() first")
+        .expect("PCI config access not initialized - call init_config() or init_ecam() first")
 }
 
 // ============================================================================
