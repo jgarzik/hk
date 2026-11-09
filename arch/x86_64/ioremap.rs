@@ -14,6 +14,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync::spin::Mutex;
+use crate::util::error::KernelError;
 use crate::util::scope::ScopeGuard;
 
 use super::kmap::swapper_phys;
@@ -49,17 +50,6 @@ const INTERMEDIATE_FLAGS: u64 = PAGE_PRESENT | PAGE_WRITABLE;
 
 /// Kernel RAM page flags (vmap): present, writable, no-execute
 const RAM_FLAGS: u64 = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE;
-
-/// ioremap error types
-#[derive(Debug, Clone, Copy)]
-pub enum IoremapError {
-    /// No contiguous virtual address space available
-    OutOfVirtualSpace,
-    /// Failed to allocate frame for page tables
-    FrameAllocationFailed,
-    /// Invalid size (zero or too large)
-    InvalidSize,
-}
 
 /// Global ioremap allocator
 static IOREMAP: Mutex<IoremapAllocator> = Mutex::new(IoremapAllocator::new());
@@ -218,14 +208,16 @@ pub fn init() {
 /// * `size` - Size in bytes to map
 ///
 /// # Returns
-/// Virtual address pointer (with same offset as physical address had)
+/// Virtual address pointer (with same offset as physical address had);
+/// InvalidArgument for a zero `size`, OutOfMemory when the
+/// window or a page-table frame runs out
 ///
 /// # Safety
 /// The range is MMIO or firmware memory, not RAM the kernel uses (an
 /// uncached alias of RAM conflicts with the direct map's attributes).
-pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
+pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, KernelError> {
     if size == 0 {
-        return Err(IoremapError::InvalidSize);
+        return Err(KernelError::InvalidArgument);
     }
 
     // Calculate page-aligned range
@@ -238,7 +230,7 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
     let virt_base = IOREMAP
         .lock()
         .alloc(num_pages)
-        .ok_or(IoremapError::OutOfVirtualSpace)?;
+        .ok_or(KernelError::OutOfMemory)?;
 
     // Map each page; on failure, unmap the ones mapped and free the range
     let mut mapped = ScopeGuard::new_with_data(0u64, |n| {
@@ -281,7 +273,7 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
 /// `va` is a page of the caller's ioremap mapping, and `pa` MMIO or a
 /// frame the caller owns and touches through no other mapping.
 #[cfg(feature = "lockdep")]
-pub unsafe fn retarget(va: u64, pa: u64) -> Result<(), IoremapError> {
+pub unsafe fn retarget(va: u64, pa: u64) -> Result<(), KernelError> {
     // SAFETY: the caller's page (the caller's guarantee)
     unsafe { unmap_page(va) };
     flush_tlb_kernel_range(va, va + PAGE_SIZE);
@@ -335,7 +327,7 @@ pub unsafe fn iounmap(virt_addr: *mut u8, size: u64) {
 /// `va` is an unmapped page of a vmalloc-area range the caller holds
 /// alone (`mm::vmalloc::VmArea`), and `pa` a free frame the caller
 /// owns and hands to that range.
-pub(crate) unsafe fn vmap_page(va: u64, pa: u64) -> Result<(), IoremapError> {
+pub(crate) unsafe fn vmap_page(va: u64, pa: u64) -> Result<(), KernelError> {
     // SAFETY: the caller's guarantee
     unsafe { map_page(va, pa, RAM_FLAGS) }
 }
@@ -374,7 +366,7 @@ unsafe fn entry(table: u64, idx: usize) -> &'static AtomicU64 {
 /// `va` is an unmapped page of a vmalloc-window range the caller holds
 /// alone, and `pa` a page the caller may map there (MMIO, or a frame it
 /// owns and hands over).
-unsafe fn map_page(va: u64, pa: u64, flags: u64) -> Result<(), IoremapError> {
+unsafe fn map_page(va: u64, pa: u64, flags: u64) -> Result<(), KernelError> {
     let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
     let _tables = KTABLES.lock();
     // SAFETY: the swapper root, live forever
@@ -398,7 +390,7 @@ unsafe fn map_page(va: u64, pa: u64, flags: u64) -> Result<(), IoremapError> {
 ///
 /// `e` is an upper entry of a kernel page table under the swapper,
 /// KTABLES held.
-unsafe fn table(e: &AtomicU64) -> Result<u64, IoremapError> {
+unsafe fn table(e: &AtomicU64) -> Result<u64, KernelError> {
     let v = e.load(Ordering::Acquire);
     if v & PAGE_PRESENT != 0 {
         return Ok(v & PTE_ADDR_MASK);
@@ -436,10 +428,10 @@ unsafe fn unmap_page(va: u64) -> Option<u64> {
 }
 
 /// Allocate a zeroed frame for page tables
-fn alloc_zeroed_frame() -> Result<u64, IoremapError> {
+fn alloc_zeroed_frame() -> Result<u64, KernelError> {
     let frame = crate::FRAME_ALLOCATOR
         .alloc()
-        .ok_or(IoremapError::FrameAllocationFailed)?;
+        .ok_or(KernelError::OutOfMemory)?;
     // SAFETY: a fresh frame, reached through the direct map
     unsafe { core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize) };
     Ok(frame)

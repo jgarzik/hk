@@ -566,9 +566,6 @@ pub trait EarlyArchInit {
 /// Provides architecture-independent interface for mapping device memory
 /// into the kernel's virtual address space.
 pub trait IoremapOps {
-    /// Error type for ioremap operations
-    type IoremapError: core::fmt::Debug;
-
     /// Initialize the ioremap subsystem
     fn ioremap_init();
 
@@ -585,7 +582,10 @@ pub trait IoremapOps {
     /// [phys_addr, phys_addr + size) is device memory or firmware-owned
     /// memory (ACPI tables), not RAM the kernel uses: an uncached alias
     /// of direct-mapped RAM corrupts it.
-    unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, Self::IoremapError>;
+    unsafe fn ioremap(
+        phys_addr: u64,
+        size: u64,
+    ) -> Result<*mut u8, crate::util::error::KernelError>;
 
     /// Unmap a previously mapped device memory region
     ///

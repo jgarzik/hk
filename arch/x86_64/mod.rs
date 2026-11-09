@@ -253,13 +253,14 @@ impl EarlyArchInit for X86_64Arch {
 }
 
 impl IoremapOps for X86_64Arch {
-    type IoremapError = ioremap::IoremapError;
-
     fn ioremap_init() {
         ioremap::init();
     }
 
-    unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, Self::IoremapError> {
+    unsafe fn ioremap(
+        phys_addr: u64,
+        size: u64,
+    ) -> Result<*mut u8, crate::util::error::KernelError> {
         // SAFETY: the trait's contract
         unsafe { ioremap::ioremap(phys_addr, size) }
     }
