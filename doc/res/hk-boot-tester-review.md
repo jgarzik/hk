@@ -1,48 +1,46 @@
 # hk: boot_tester review (accretion, scaling, target design)
 
-A top-down look at `user/boot_tester` (measured at e801500 from the tree and
-`target/qemu/` logs): does it show accretion disease, does "test everything on
-every boot" scale, and what do other kernels do. Ranked, with a migration plan.
+A top-down look at `user/boot_tester`: does it show accretion disease, does
+"test everything on every boot" scale, and what do other kernels do. Ranked,
+with a migration plan.
 
 ## Diagnosis: yes, accretion without a harness
 
-The suite works (about 1420 checks on x86, 1402 on arm64, 1384 on Linux, 0
-FAIL), but it is 156 flat files and 66k lines of copies of one print-and-grep
-pattern.
+The suite works (clean on x86, arm64 and Linux), but it is many files of
+copies of one print-and-grep pattern.
 
 1. **No assertion API.** `harness.rs` has the shared verdict printers
    (`verdict`, `verdict_detail`, `report_r`/`check`, `report_step`,
    `report_code`, `pass`, `fail_why`, `T`), but no assertions, no per-check
-   numbering, no plan. 15 files still define their own `fn report(`, 6
-   `fn verdict(`, 6 `fn check(` (bodies that differ), 5 a sleep helper, 6 a
-   reap helper, 22 a thread-stack struct; helpers.rs's `msleep(u64)` and
-   `sleep_ms(i64)` and net/nl.rs's `msleep(i64)` are one sleep under three
-   names (their callers pass different integer types).
-   1399 `:FAIL` literals, 480 of them through `fail_num`, the rest hand-printed;
-   564 verdicts pass through `pass()`, 113 `:OK` literals remain. Near-identical tests
-   (`process.rs` `test_getuid`/`geteuid`/`getgid`/`getegid`).
+   numbering, no plan. Many files still define their own `fn report(`,
+   `fn verdict(`, `fn check(` (bodies that differ), sleep and reap helpers and
+   thread-stack structs; helpers.rs's `msleep(u64)` and `sleep_ms(i64)` and
+   net/nl.rs's `msleep(i64)` are one sleep under three names (their callers
+   pass different integer types). Most `:FAIL` verdicts are hand-printed
+   rather than going through `fail_num`, and `:OK` literals remain beside
+   `pass()`. Near-identical tests (`process.rs`
+   `test_getuid`/`geteuid`/`getgid`/`getegid`).
 2. **Pass/fail by substring.** `helpers.rs` counts a failure when printed bytes
    contain "FAIL"; the Makefile greps `FAIL|KERNEL PANIC`. No structured result, no
    per-test duration, no "never ran" versus "passed"; no test name may contain
    "FAIL".
-3. **Grown by bug and date, not subsystem.** TCP/socket tests in 10 files
-   (`tcp`, `tcp_conn`, `tcp_xfer`, `tcp_close`, `tcp_opt`, `tcp_mem`, `sk`,
-   `sockets`, `sockcore`, `sockopts`); mm in 11; `*_race` files beside their
-   parents; one-check files (`errno_pass.rs`, 49 lines) next to 2500-line files
-   (`mmap.rs`).
-4. **Growth.** 48 files / 20k LOC (2025-12-29) to 156 / 66k (2026-11-05); 416 of
-   466 commits and 108 new files since 2026-10-01; `mod.rs` touched in 108 commits.
-5. **Isolation is the exception.** 32 of 152 suites run under `isolated()`; 120 run
-   in pid 1, whose panic handler exits init, so one fault loses every later result.
-   Tests assume pid 1 (`test_getpid`). No per-test timeout: a hang burns the 600 s
-   boot timeout without naming the test.
-6. **Hygiene.** 91 `static mut` in 41 files; 427 `unsafe` blocks, 100 `SAFETY:`
-   comments; 336 hard-coded `/tmp` paths and no per-test scratch directory; an
-   implicit, load-bearing order in `mod.rs`.
-7. **Weak or timing-based checks.** About 118 verdicts only test "returned >= 0";
-   216 sleep call sites (about 72 s of literal sleeps) and 49 `sched_yield` spins.
-   The known flakes (BUSYBOX_NC_LO, NICE_ADJACENT, SWAPOUT_PAGEOUT) are all timing or
-   ratio tests.
+3. **Grown by bug and date within subsystems.** The tests sit in subsystem
+   directories, but TCP/socket tests are spread over many `net/` files (`tcp`,
+   `tcp_conn`, `tcp_xfer`, `tcp_close`, `tcp_opt`, `tcp_mem`, `sk`, `sockets`,
+   `sockcore`, `sockopts`); `*_race` files sit beside their parents; tiny
+   one-check files (`io/errno_pass.rs`) sit beside huge ones (`mm/mmap.rs`).
+4. **Growth.** The suite has grown fast, mostly one bug file at a time, and the
+   suite list in `main.rs` `run_all_tests` is touched by most commits.
+5. **Isolation is the exception.** A minority of suites run under `isolated()`;
+   the rest run in pid 1, whose panic handler exits init, so one fault loses every
+   later result. Tests assume pid 1 (`test_getpid`). No per-test timeout: a hang
+   burns the 600 s boot timeout without naming the test.
+6. **Hygiene.** Many `static mut`; many `unsafe` blocks without a `SAFETY:`
+   comment; hard-coded `/tmp` paths and no per-test scratch directory; an
+   implicit, load-bearing suite order in `main.rs` `run_all_tests`.
+7. **Weak or timing-based checks.** Many verdicts only test "returned >= 0";
+   literal sleeps and `sched_yield` spins are common. The known flakes
+   (BUSYBOX_NC_LO, NICE_ADJACENT, SWAPOUT_PAGEOUT) are all timing or ratio tests.
 
 Keep: the dual run on hk and Linux (`check-linux*`), `host_mode()`/`skip()` with
 reasons, unique test names.
@@ -51,14 +49,14 @@ reasons, unique test names.
 
 Not for long; diagnosis and iteration cost more than wall time.
 
-- x86 KVM `check` 77 s, arm64 TCG 160 s; LOC tripled in five weeks, so arm64 heads
-  for 5 to 8 minutes and the 600 s cap.
-- One boot runs about 1400 verdicts in order; guest CPUs idle; no way to run one
+- arm64 TCG `check` is already minutes long and, at the suite's growth rate,
+  heads for the 600 s cap.
+- One boot runs every verdict in order; guest CPUs idle; no way to run one
   suite, so each edit costs a full boot.
 - One hang: 600 s and no attribution. One panic in a non-isolated suite: everything
   after it lost.
-- Any boot_tester change invalidates the `check-linux` cache (uncached arm64 Linux
-  run about 150 s).
+- Any boot_tester change invalidates the `check-linux` cache (an uncached arm64
+  Linux run takes minutes).
 
 ## Target design (ranked)
 
@@ -104,7 +102,7 @@ Not for long; diagnosis and iteration cost more than wall time.
   dynamic userland, and the fast no_std init boot is lost. Vendored selections can
   come later as an extra tier.
 - Do not weaken or drop `check-linux`.
-- No big-bang rewrite of 66k lines: wrap first, convert as touched.
+- No big-bang rewrite: wrap first, convert as touched.
 - No more ad hoc `isolated()` entries or one-bug files: new tests go into their
   subsystem's file through the harness.
 - No fixed sleeps or wider tolerances for flakes: event-based waits (pidfd, poll,

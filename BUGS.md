@@ -20,20 +20,20 @@ infallible, so each one is investigated, not written off.
 
 - **MM_FAULT_STORM once under LOCKDEP**: one x86 `make check LOCKDEP=1`
   run reported `MM_FAULT_STORM:FAIL got 0` (no wrong value: a thread did
-  not finish within the 60 s join); three later LOCKDEP runs (x86 twice,
-  arm64) passed. Either LOCKDEP slowness against the join timeout or a
+  not finish within the 60 s join); later LOCKDEP runs (x86 and arm64)
+  passed. Either LOCKDEP slowness against the join timeout or a
   missed wakeup on the contended mmap_lock; a recurrence should dump
   the stuck threads' state.
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
-There are 50 files with `#![expect(clippy::undocumented_unsafe_blocks)]
-// TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`). Most of their
-blocks belong in a missing wrapper:
+Files marked `#![expect(clippy::undocumented_unsafe_blocks)]
+// TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`) remain.
+Most of their blocks belong in a missing wrapper:
 
 - **Frames:** an owned / page-locked / PTL-held frame borrow type in
-  place of the `frame_bytes` unsafe fn (17 callers: vfat, pipe, splice,
-  exec, fault, filemap, swap).
+  place of the `mm/page.rs` `frame_bytes` unsafe fn (callers: vfat,
+  pipe, fault, filemap, swap, blkdev_ops).
 - **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
   `&T` into device-written memory: xhci rings and contexts, virtio
   rings and blk, e1000 descriptors, virtio-net buffers.
@@ -78,9 +78,9 @@ back up the hierarchy), the IO token bucket under the queue's lock
 
 ## user/ does not follow doc/UNSAFE.md
 
-The `user/syscall` wrappers are safe `pub fn`s, and about 330 of them take
+The `user/syscall` wrappers are safe `pub fn`s, and many of them take
 raw pointers, so `sys_read(fd, 0x1234 as *mut u8, n)` corrupts memory
-without `unsafe`. The boot tester uses about 80 `static mut`, open-codes
+without `unsafe`. The boot tester uses many `static mut`, open-codes
 volatile access to mmap'd memory, and defines `mem*` without
 `#![no_builtins]`.
 
@@ -332,7 +332,7 @@ EPERM).
 ## Before user namespaces grant capabilities
 
 **Location**: `task/mod.rs` (`capable`), `fs/dac.rs`, `ns/mod.rs`,
-`fs/mount.rs`, `net/netlink/rtnetlink.rs`
+`fs/mount.rs`, `fs/pnode.rs`, `net/netlink/rtnetlink.rs`
 
 Safe today only because a user namespace grants no capabilities. First:
 - each `capable()` becomes Linux's `ns_capable(<owner>->user_ns)` (or
@@ -344,6 +344,13 @@ Safe today only because a user namespace grants no capabilities. First:
   mounts into slaves (CL_SHARED_TO_SLAVE).
 - netlink newlink/setlink check CAP_NET_ADMIN in the target netns too
   once IFLA_NET_NS_PID/FD are implemented (`7b735ef81286`).
+- creating a namespace together with CLONE_NEWUSER checks capabilities
+  in the new user namespace, where the caller holds every capability
+  (today any namespace but a user namespace needs the caller's own
+  CAP_SYS_ADMIN, even with CLONE_NEWUSER), and /proc/<pid>/uid_map and
+  gid_map become writable.
+- mounts become user-namespace aware (plain `capable()` today): copies
+  of a namespace are always peers and never locked.
 
 ## Credentials have no identity
 
@@ -358,15 +365,12 @@ linked on hk without CAP_DAC_READ_SEARCH; Linux gives ENOENT. The
 capability is checked in the caller's namespace (Linux: the opener's
 `user_ns`); hk has one user namespace.
 
-User namespaces grant no capabilities: creating any namespace but a
-user namespace needs the caller's own CAP_SYS_ADMIN, even together with
-CLONE_NEWUSER (Linux checks in the new user namespace, where the caller
-holds every capability), and /proc/<pid>/uid_map and gid_map cannot be
-written.
+## POSIX mqueue gaps
 
+**Location**: `ipc/mqueue.rs`
 
 POSIX message queues reject creation by an unprivileged user with
-EACCES (`ipc/mqueue.rs`): hk has no 01777 `/dev/mqueue`, so only root
+EACCES: hk has no 01777 `/dev/mqueue`, so only root
 creates queues, where Linux lets any user. mq_attr_ok's soft caps
 (msgsize_max 8192, msg_max 10 without CAP_SYS_RESOURCE) are therefore
 unreachable today.
@@ -469,15 +473,12 @@ Accepted without effect: MS_SILENT, MS_MANDLOCK, MS_POSIXACL,
 MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated
 copy lands on top of what is already mounted at the target (Linux
 tucks it under); a slave's master is its master's peer group, not one
-mount; copies of a namespace are always peers and not locked (Linux
-copy_mnt_ns for a less privileged user namespace makes shared mounts
-slaves, CL_SHARED_TO_SLAVE, and locks them, lock_mnt_tree): harmless
-while CLONE_NEWNS needs root and mounts ignore user namespaces, but
-required before mounts become user-namespace aware. Mount options are
+mount; copies of a namespace are always peers and not locked (see
+"Before user namespaces grant capabilities"). Mount options are
 parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
 cp437 only), ramfs (mode=) and procfs (hidepid=, gid=, subset=pid);
 devtmpfs and cgroupfs ignore theirs, and only procfs applies options
-on a remount or shows them in /proc/mounts; mounts are not user-namespace aware (plain capable()).
+on a remount or shows them in /proc/mounts.
 Crossing into a mount scans the current mount's children (Linux hashes
 (parent, mountpoint): mount_hashtable).
 
@@ -560,7 +561,7 @@ The boot tests cover setup and enter return values only.
 host, `make check-arm`)
 
 qemu-system-aarch64 occasionally dies in the guest stage-1 page table
-walk (arm_ldq_ptw, target/arm/ptw.c:671; once S1_ptw_translate): the
+walk (arm_ldq_ptw in target/arm/ptw.c; once S1_ptw_translate): the
 fault address differs from the pointer the faulting load holds, so the
 host CPU computed a wrong address. The crashes run on CPUs 5 and 2,
 the favored cores, which also lead the host's segfault count for other
@@ -586,8 +587,9 @@ arm64 irq_stack).
 **Location**: unknown (CPU 0, right after `FAULT_SEGV_ACCERR`, i.e. while
 `FAULT_SIGILL` runs `udf` in user mode)
 
-One "KERNEL PANIC ... exceptions.rs:95" (kernel instruction abort) in
-about 190 `make check-arm` runs (QEMU neoverse-n1 with PAN, -smp 4);
+One "KERNEL PANIC" from the arm64 `exceptions.rs` kernel instruction
+abort handler, rare across many `make check-arm` runs (QEMU neoverse-n1
+with PAN, -smp 4);
 ELR/FAR were not captured. Next occurrence: capture the Message line.
 
 ## ramfs has no size limit
@@ -672,8 +674,8 @@ The heap picks GFP_ATOMIC by itself under a spin lock, so an allocation
 there takes the atomic reserve silently (Linux needs it named, and
 might_alloc reports a GFP_KERNEL one in atomic context). A LOCKDEP boot
 lists each lock allocated under once (`LOCKDEP:ATOMIC_ALLOC ... under
-<lock> (taken at ...)`; the shutdown summary counts them): 105 locks,
-mostly collections grown under spin mutexes, in fs, net, task and
+<lock> (taken at ...)`; the shutdown summary counts them): mostly
+collections grown under spin mutexes, in fs, net, task and
 ipc (procfs: only its mount-time tree building). Each wants its allocation moved out of the
 lock (preallocate, or a sleeping lock as in Linux).
 
@@ -813,7 +815,7 @@ a reset register in PCI configuration space is ignored.
 Every read_folio, writepage and swap_rw of a vfat file rebuilds its
 whole cluster chain from the FAT (through the device cache) to find a
 page's clusters, so reading or writing back a file is quadratic in its
-size (a 1GB file of 4KB clusters: about 3e10 FAT lookups). Linux
+size. Linux
 fat_get_cluster keeps a per-inode cache of chain positions
 (fat_cache); one is needed before large vfat files or vfat swap files.
 
@@ -863,25 +865,34 @@ Designs that grew one commit at a time. Tag = roadmap phase
 (doc/ROADMAP.md).
 
 - **Syscalls that do not deliver** (H/C): inotify queues only
-  IN_DELETE_SELF, IN_UNMOUNT and IN_IGNORED, fanotify nothing (no
-  fsnotify hooks in the VFS operations); rename has no
+  IN_DELETE_SELF, IN_UNMOUNT, IN_IGNORED and IN_Q_OVERFLOW, fanotify
+  nothing (the other events have no fsnotify hooks in the VFS
+  operations); rename has no
   IN_MOVED_FROM/IN_MOVED_TO cookie pairing (Linux fsnotify_get_cookie); waitid without WEXITED is
   EINVAL (C).
-- **Copied helpers** (J, or as touched): four `current_time`s; about ten user-timespec readers each validating
-  (Linux get_timespec64); three iovec structs and five
-  importers; three Timeval, two Timespec types.
+- **Copied helpers** (J, or as touched): `current_time` in cgroupfs,
+  perm, procfs and ramfs, `current_time_secs` in ipc msg/sem/shm;
+  user-timespec readers each validating (futex `read_user_timeout`,
+  poll `read_ts`, mqueue, posix_timer...; Linux get_timespec64);
+  iovec structs (`fs/iov.rs` `IoVec`, `net/msg.rs` `IoVec`/`Iov`) and
+  importers beside `import_iovec` (`net/msg.rs` `Iov::import`,
+  io_uring `read_user_iovecs`, process_vm `remote_iovecs`); Timespec
+  types `time::Timespec`, `LinuxTimespec` (time_syscall), `SemTimespec`
+  (ipc/sem); Timeval types in task/misc and time_syscall, plus
+  `TimexTimeval`.
 - **Process-wide state per thread** (C): pgid/sid copied into every
   thread; one global CHILD_EXIT_WQ wakes every waiting parent on every
   exit.
-- **`task/percpu.rs` is about 4,600 lines** (before C): scheduler core,
-  do_clone (523 lines), exit, wait, credential setters, five sleep
-  APIs. Split like Linux (sched/core, fork, exit, cred). Other giants:
-  sys_prctl, do_semctl, sys_mmap, exec_file, sys_fcntl.
+- **`task/percpu.rs` is the largest file** (before C): scheduler core,
+  do_clone, exit, wait, credential setters, several sleep APIs. Split
+  like Linux (sched/core, fork, exit, cred). Other giant functions:
+  do_clone, sys_prctl, sys_semctl, sys_mmap, exec_file, sys_fcntl.
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
   softnet/0 only; CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
-  (bpf, mqueue, which wrap with no collision check): one
-  IDR/IDA.
+  (bpf map ids, mqueue ids, which wrap with no collision check) move
+  onto `util/ida.rs` (or an IDR), as sd, virtio-blk, virtio and
+  ns/inum already do.
 - **procfs** (H): a file is generated whole (no seq_file records): an
   open file's reads continuing one another see one generation, where
   Linux generates record by record, so a long file's later chunks are
@@ -893,33 +904,33 @@ Designs that grew one commit at a time. Tag = roadmap phase
   reading or writing, not the one the file was opened in (Linux binds
   the file to the opener's namespace): an fd passed across namespaces
   reads and writes the other one's values.
-- **Stale comments and dead code** (as touched): 56 `#[expect(dead_code)]`
-  and over a hundred "for now"/TODO markers; comments that
-  contradict the code in `ns/mod.rs` (setns) and `task/misc.rs`.
+- **Stale comments** (as touched): "for now"/TODO markers; the
+  `ns/mod.rs` `sys_setns` doc says EBADF for a non-namespace fd, the
+  code returns EINVAL.
 
 ## Review gaps, by phase
 
 Tag = roadmap phase (doc/ROADMAP.md).
 
-1. **pcp_free drains the hot end** (J). `mm/page_alloc.rs:441`: a
+1. **pcp_free drains the hot end** (J). `mm/page_alloc.rs` `pcp_free`: a
    freed page is pushed at the head and a drain pops from the head;
    Linux returns the cold tail.
 2. **arm64 /reserved-memory no-map regions are linear-mapped** (D;
-   real HW). `arch/aarch64/dtb.rs:192`: Linux memblock_mark_nomap
+   real HW). `arch/aarch64/dtb.rs` `for_each_firmware_reserved`: Linux memblock_mark_nomap
    removes them (speculative access to secure carve-outs).
 3. **memblock does not grow its arrays** (J). `mm/memblock.rs`: 512
    ranges per set; RAM ranges past that are dropped with a warning (as
    Linux before memblock_allow_resize), but a reservation past it still
    panics; Linux doubles the arrays then (memblock_double_array).
-4. **LRU batch refs defeat exclusivity checks** (J). `mm/fault.rs:504`
-   / `:596`: refcount==1 tests fail while a page sits in the per-CPU
+4. **LRU batch refs defeat exclusivity checks** (J). `mm/fault.rs`
+   `map_swap_page` / `do_wp_page`: refcount==1 tests fail while a page sits in the per-CPU
    add batch, so swap-in makes needless COW copies. Linux drains and
    rechecks (wp_can_reuse_anon_folio).
 5. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
-   reclaimed page** (J). `mm/swap.rs:206`: cluster/free-hint
+   reclaimed page** (J). `mm/swap.rs` `alloc_slot`: cluster/free-hint
    allocator, cached sorted device list.
 6. **One AnonVma per fork family, Vec chain** (J).
-   `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
+   `mm/anon_vma.rs` `AnonVma`: O(N×VMAs) under one family write lock.
 7. **reboot(2) in a pid namespace checks `capable`** (B4). It checks
    CAP_SYS_BOOT with `capable`, not in the namespace's user namespace
    (Linux ns_capable(pid_ns->user_ns)): a pid namespace has no owning
@@ -937,7 +948,7 @@ Tag = roadmap phase (doc/ROADMAP.md).
    connect left SYN_SENT by a SYN-ACK or a SYN: something answered on
    the dead port. Not a self-connect: bind(0) gives the dead port an
    odd offset, connect takes even ones while any is free. Not
-   reproduced in 10000 looped runs (with SOCKCORE_PORT_PARITY before
+   reproduced in long looped runs (with SOCKCORE_PORT_PARITY before
    each; x86 and arm64 LOCKDEP e1000, 8 CPUs, CPU spinners, TIME_WAIT
    churn); LOCKDEP builds assert that a listener receiving a SYN owns
    its port in bhash (`TcpSock::assert_owner`). On failure the test

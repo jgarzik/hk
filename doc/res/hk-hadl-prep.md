@@ -1,6 +1,6 @@
 # hk: preparing for HADL (loadable, description-driven drivers)
 
-Design and plan, from doc/ideas/HADL-driver-architecture-research.md. doc/ROADMAP.md schedules only the preparatory items (M4, D; M1 and M2 are done); H2–H7 (HADL proper) are not scheduled.
+Design and plan, from doc/ideas/HADL-driver-architecture-research.md. doc/ROADMAP.md schedules only the preparatory items (M4; D's interrupt routing and firmware loading); H2–H7 (HADL proper) are not scheduled.
 
 ## 0. Constraints
 
@@ -26,10 +26,9 @@ Design and plan, from doc/ideas/HADL-driver-architecture-research.md. doc/ROADMA
 - e1000.rs and virtio_net.rs duplicate one NAPI skeleton (poll: swap causes, link, tx reclaim, rx under lock, deliver after unlock, napi_complete_done + rearm under rx with netif_running and MISSED recheck; open; stop; 2 KiB bounce per descriptor; Ops glue + wrapper). Per-chip: cause ack/mask, ring format and doorbell, link status. That is the engine boundary.
 - e1000 descriptors: raw volatile field writes through DmaCoherent::cpu_addr; publish-last coded by hand. Registers are bare consts (nothing says ICR is read-clear, IMC/IMS write-only). reset() spins a fixed iteration count without a time base (`hw/net/e1000.rs`).
 - xhci: two `Trb` types (`hw/usb/xhci.rs`, `hw/usb/transfer.rs`), three open-coded cycle-bit rings, u32 quirks + match, global USB_CONTROLLER.
-- IRQ: `fn(u32, *mut ()) -> bool` with raw `*mut ()` casts in ISRs (`arch/x86_64/irq.rs`).
 - Block: blk-mq `MqOps` (queue_rq/commit/complete in hardirq under hctx IrqSpinlock) is a sound engine boundary; block/scsi.rs `ScsiHost` (USB mass storage) is the base for libata/SAT.
 - Net: `SkBuff` (net/skb.rs), `netif_rx`/`netif_receive_skb` (net/core/dev.rs), `NetDeviceOps::xmit(Box<SkBuff>)`.
-- Helpers to build on: hw/pci/quirks.rs `PciFixup`, hw/virtio/ring.rs `Vring` + host `Fake` device (test template), arch barriers (dma_wmb/dma_rmb/wmb), util/pod.rs, bitflags, offset_of!.
+- Helpers to build on: hw/pci/quirks.rs `PciFixup`, hw/virtio/ring.rs `Vring` + host `Fake` device (test template), typed `request_irq`/`IrqRegistration` (irq.rs), arch barriers (dma_wmb/dma_rmb/wmb), util/pod.rs, bitflags, offset_of!.
 - Missing for the Dell: IOAPIC/MSI (BUGS.md), request_firmware, libata, RTL8168g driver, module loader.
 
 ## 2. Architecture
@@ -89,7 +88,7 @@ Lifecycle (doc §5.7, §7): `Loaded → Bound → Running → Quiescing → Revo
 - H0.3 request_firmware / release_firmware (Linux firmware_class semantics: /lib/firmware/updates, /lib/firmware, initramfs; uevent fallback off), firmware hash check when the package declares one.
 Size L; risk high (interrupt delivery is everything). Tests: MSI-X on virtio-net/virtio-blk in QEMU (x86 + arm64), firmware load boot test (on Linux and hk: a test firmware in initramfs read through a test hook, or via a driver that needs firmware).
 
-### H1 — planned series items, shaped for HADL (M3/M4)
+### H1 — planned series items, shaped for HADL (M4)
 - PCI ID tables carrying typed family data (`PciDeviceId<D> { ..., data: &'static D }`, `PciDriver<D>`, `PciDriverDyn`; the Linux-shaped untyped `PciDeviceId`/`PciIds` and dynamic ids exist), revision matching; PciFixup on the same matcher. This is the in-kernel form of the package `MATCH` section.
 - MSI-X vectors (H0.2) as `IrqRegistration`s of the typed `request_irq`.
 - `DmaRing<T: Pod>` split into memory (volatile element/field access, `publish(i, v, own_field)`) and index/ownership state; `Field<T, F>` + `field!`; Le16/32/64 Pod newtypes.
@@ -137,7 +136,7 @@ Bytecode/IR for complex escapes with a verifier; JIT only if measured; userspace
 1. H3 with e1000 + virtio-net (CI devices): engine boundary proven, zero-copy path in place, throughput not regressed.
 2. H4 e1000e (CI) + RTL8168g (Dell): cross-vendor (head/tail vs owner-bit rings), revisions, firmware.
 3. H5: the e1000e description loaded as a package from initramfs, unloaded, reloaded.
-Success: chip files contain no `unsafe`; e1000 ≤ ~300 lines (description + hooks), RTL8168g ≤ ~500 (excl. PHY tables); host tests for engine, rings, pools, package validator; no throughput/latency regression; LOCKING.md engine section; LOC ledger per doc §8 D; every commit gated.
+Success: chip files contain no `unsafe`; e1000 and RTL8168g reduced to description + hooks (RTL8168g excl. PHY tables); host tests for engine, rings, pools, package validator; no throughput/latency regression; LOCKING.md engine section; LOC ledger per doc §8 D; every commit gated.
 
 ## 6. Risks
 - Interrupt routing (H0) gates all real-hardware work; MSI-X on arm64 needs ITS/v2m.
