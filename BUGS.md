@@ -16,15 +16,6 @@ infallible, so each one is investigated, not written off.
   got 9` (SIGKILL where SIGXCPU was expected first); passed on rerun.
   Likely CPU-time accounting under a loaded host.
 
-## Seen on hk only
-
-- **MM_FAULT_STORM once under LOCKDEP**: one x86 `make check LOCKDEP=1`
-  run reported `MM_FAULT_STORM:FAIL got 0` (no wrong value: a thread did
-  not finish within the 60 s join); later LOCKDEP runs (x86 and arm64)
-  passed. Either LOCKDEP slowness against the join timeout or a
-  missed wakeup on the contended mmap_lock; a recurrence should dump
-  the stuck threads' state.
-
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
 Files marked `#![expect(clippy::undocumented_unsafe_blocks)]

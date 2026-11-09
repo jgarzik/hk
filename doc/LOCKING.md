@@ -170,10 +170,23 @@ owner is running).
   `read_interruptible`/`write_interruptible` (Linux
   down_*_interruptible: any pending signal gives up with EINTR; no
   caller yet), `try_read`/`try_write`, and the raw `down_read`/`up_read`, `down_write`/
-  `up_write` pairs; writer preference: once a writer waits, new readers
-  wait behind it (a killable writer that gives up wakes them). Its
-  count word is a short `spin::Mutex` leaf never held across a sleep;
-  release wakes all waiters (mixed conditions).
+  `up_write` pairs. Linux kernel/locking/rwsem.c policy: the reader
+  count, writer bit, `handoff` flag and a FIFO wait list of readers and
+  writers sit under one `IrqSpinlock` (Linux wait_lock with the count
+  it orders: a leaf, never held across a sleep; wakeups are issued
+  under it, before `pi_lock` and the run-queue lock). A free lock is
+  taken at once only while nobody queues (`try_*` likewise); otherwise
+  the locker queues at the tail, except that a reader may steal a lock
+  no reader or writer holds and no handoff guards (then granting the
+  queued readers too). Release (last reader, writer) wakes the front
+  waiter (`mark_wake`): a front writer, which then competes for the
+  lock, or every queued reader (up to 256, writers skipped:
+  phase-fair), granted the lock by the waker before it runs. A waiter
+  past `RWSEM_WAIT_TIMEOUT` (4 ms, at least a tick; at once for an RT
+  writer) that still finds the lock held sets `handoff`: no stealing,
+  and only the front waiter may take the lock, until it has. A front
+  waiter that gives up (signal) wakes the waiters behind it; the last
+  waiter leaving clears `handoff`.
 - Rules: thread context only; never taken in IRQ context or while any
   spinlock is held (`might_sleep` asserts a zero preempt count in debug
   builds; `IrqSpinlock` raises it). Sleeping locks order ABOVE every
