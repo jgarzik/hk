@@ -3,7 +3,7 @@
 use alloc::sync::Arc;
 
 use super::file::EMPTY_FOPS;
-use crate::fs::namei::{Last, Nd, filename_lookup, getname, path_start};
+use crate::fs::namei::{CreateAt, Last, Nd, filename_lookup, getname, path_start};
 use crate::fs::{
     Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac, lookup_one,
 };
@@ -231,18 +231,10 @@ fn open_target(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), 
     if flags & O_CREAT == 0 {
         return Ok((filename_lookup(dirfd, path, lf)?, false));
     }
-    // O_CREAT|O_EMPTYPATH of an empty name: dirfd's own file, with
-    // do_open's O_CREAT checks (EEXIST, EISDIR); there is no last name,
-    // so no parent's sticky check (Linux nd->dir_mode is 0)
+    // O_CREAT|O_EMPTYPATH of an empty name: dirfd's own file; there is
+    // no last name, so no parent's sticky check (Linux nd->dir_mode is 0)
     if path.is_empty() {
-        let d = filename_lookup(dirfd, path, lf)?;
-        if flags & O_EXCL != 0 {
-            return Err(KernelError::AlreadyExists);
-        }
-        if d.get_inode().is_some_and(|i| i.mode().is_dir()) {
-            return Err(KernelError::IsDirectory);
-        }
-        return Ok((d, false));
+        return creat_existing(filename_lookup(dirfd, path, lf)?, flags);
     }
     // O_CREAT (Linux open_last_lookups): the parent is walked, then a
     // last name of "/", "." or ".." (a directory) or one with a trailing
@@ -256,7 +248,16 @@ fn open_target(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), 
     }
     // A final symlink is followed to where the file is (or is made),
     // a dangling one included
-    let p = if lf.follow { nd.last_links(p, lf)? } else { p };
+    let p = if lf.follow {
+        nd.last_links(p, lf)?
+    } else {
+        CreateAt::Name(p)
+    };
+    let p = match p {
+        CreateAt::Name(p) => p,
+        // A magic link's object (Linux nd_jump_link): no name to make
+        CreateAt::Object(d) => return creat_existing(d, flags),
+    };
     let dir = Path::new(p.mnt.clone(), p.dir.clone());
     let (d, created) = match nd.lookup(Some(dir), &p.name, lf) {
         Ok(d) => (d, false),
@@ -281,6 +282,19 @@ fn open_target(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), 
         super::dac::may_create_in_sticky(&crate::task::current_cred(), &dir, &inode)?;
     }
     Ok((d, created))
+}
+
+/// O_CREAT landing on an existing object with no name to create (an
+/// empty name with O_EMPTYPATH, a magic link): do_open's O_CREAT checks
+/// (EEXIST with O_EXCL, EISDIR)
+fn creat_existing(d: Path, flags: u32) -> Result<(Path, bool), KernelError> {
+    if flags & O_EXCL != 0 {
+        return Err(KernelError::AlreadyExists);
+    }
+    if d.get_inode().is_some_and(|i| i.mode().is_dir()) {
+        return Err(KernelError::IsDirectory);
+    }
+    Ok((d, false))
 }
 
 /// sys_openat - open a file relative to a directory file descriptor

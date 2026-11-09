@@ -71,6 +71,8 @@ pub(super) fn exit_mmap(mm: &Mm) {
     // (Linux exit_mmap), so no `PgTables` of this mm lives meanwhile.
     let mut map = mm.mmap_write();
     let vmas: Vec<_> = map.take_vmas();
+    // The executable's path too (Linux mmput: set_mm_exe_file(mm, NULL))
+    let exe = map.take_exe();
     let mut tlb = Gather::new_full(mm);
     tlb.free_tables(super::pgtable::detach_user(mm, &mut map));
     drop(tlb);
@@ -78,6 +80,7 @@ pub(super) fn exit_mmap(mm: &Mm) {
     // VMAs go last, outside any lock: they may hold the last reference
     // to a mapped file
     drop(vmas);
+    drop(exe);
 }
 
 /// Clear the entries of [start, end) of `t`, the tables of the gather's

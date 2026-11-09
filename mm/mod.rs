@@ -170,8 +170,8 @@ pub struct MmStruct {
     /// Default flags for new VMAs (set by mlockall with MCL_FUTURE)
     /// Contains VM_LOCKED and/or VM_LOCKONFAULT when MCL_FUTURE is active
     def_flags: u32,
-    /// Path of the executable (Linux mm->exe_file), for /proc/<pid>/exe
-    exe: Option<crate::fs::name::FileName>,
+    /// The executable (Linux mm->exe_file's path), for /proc/<pid>/exe
+    exe: Option<crate::fs::Path>,
     /// Writes to the executable denied while this image runs (Linux
     /// mm->exe_file's deny_write_access)
     exe_deny: Option<crate::fs::inode::DenyWrite>,
@@ -307,18 +307,24 @@ impl MmStruct {
         self.args = a;
     }
 
-    /// Executable path (/proc/<pid>/exe)
-    pub fn exe(&self) -> Option<crate::fs::name::FileName> {
+    /// The executable's path (/proc/<pid>/exe)
+    pub fn exe(&self) -> Option<crate::fs::Path> {
         self.exe.clone()
+    }
+
+    /// Take the executable's path away (the last user's exit), to drop
+    /// it with no lock held
+    pub fn take_exe(&mut self) -> Option<crate::fs::Path> {
+        self.exe.take()
     }
 
     /// Record the executable at exec
     pub fn set_exe(
         &mut self,
-        path: crate::fs::name::FileName,
+        path: Option<crate::fs::Path>,
         deny: Option<crate::fs::inode::DenyWrite>,
     ) {
-        self.exe = Some(path);
+        self.exe = path;
         self.exe_deny = deny;
     }
 

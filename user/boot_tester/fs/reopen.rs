@@ -3,13 +3,18 @@
 //! names each, and opening one again through its path (a /proc/self/fd
 //! link, or O_EMPTYPATH since Linux 7.2) goes by its inode's rules: a
 //! pipe end joins the same pipe (fifo_open on i_pipe), a socket or an
-//! anonymous inode (eventfd) is ENXIO (sock_no_open, no_open_fops)
+//! anonymous inode (eventfd) is ENXIO (sock_no_open, no_open_fops).
+//! The /proc links jump to their objects (Linux nd_jump_link), also as
+//! an O_CREAT open's last component, and cwd/root/exe too: a deleted
+//! file or directory opens through them.
 
 use crate::harness::{R, check, report_r};
 use crate::helpers::linux_at_least;
 use hk_syscall::{
-    AF_UNIX, LinuxStatFs, O_RDONLY, O_RDWR, O_WRONLY, SOCK_STREAM, sys_close, sys_eventfd2,
-    sys_fstatfs, sys_open, sys_openat, sys_pipe2, sys_read, sys_socketpair, sys_write,
+    AF_UNIX, LinuxStatFs, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_WRONLY, SOCK_STREAM, Stat,
+    sys_chdir, sys_close, sys_eventfd2, sys_exit, sys_fork, sys_fstat, sys_fstatfs, sys_lstat,
+    sys_mkdir, sys_open, sys_openat, sys_pipe2, sys_read, sys_rmdir, sys_socketpair, sys_unlink,
+    sys_wait4, sys_write,
 };
 
 const ENXIO: i64 = -6;
@@ -25,6 +30,68 @@ pub fn run_tests() {
     report_r(b"REOPEN_SOCKET", socket());
     report_r(b"REOPEN_PIPE_PROC", pipe_proc());
     report_r(b"REOPEN_PIPE_EMPTYPATH", pipe_emptypath());
+    report_r(b"REOPEN_CREAT_DELETED", creat_deleted());
+    report_r(b"REOPEN_CWD_DELETED", child(cwd_deleted));
+}
+
+const DIR: &[u8] = b"/tmp/ro\0";
+const F: &[u8] = b"/tmp/ro/f\0";
+const GHOST: &[u8] = b"/tmp/ro/f (deleted)\0";
+const D: &[u8] = b"/tmp/ro/d\0";
+
+/// O_CREAT through /proc/self/fd of an unlinked file opens that file
+/// (the link jumps), making no "f (deleted)"
+fn creat_deleted() -> R {
+    sys_mkdir(DIR.as_ptr(), 0o755);
+    let fd = sys_open(F.as_ptr(), O_CREAT | O_RDWR, 0o644);
+    check(b"create", fd >= 0, fd)?;
+    sys_unlink(F.as_ptr());
+    let fd = fd as i32;
+    let r = proc_reopen(fd, O_RDWR | O_CREAT);
+    let (mut a, mut b) = (Stat::default(), Stat::default());
+    sys_fstat(fd, &mut a);
+    if r >= 0 {
+        sys_fstat(r as i32, &mut b);
+        sys_close(r as u64);
+    }
+    sys_close(fd as u64);
+    let ghost = sys_lstat(GHOST.as_ptr(), &mut Stat::default());
+    sys_unlink(GHOST.as_ptr());
+    sys_rmdir(DIR.as_ptr());
+    check(b"reopen", r >= 0, r)?;
+    check(b"same file", a.st_ino == b.st_ino, b.st_ino as i64)?;
+    check(b"no ghost", ghost == ENOENT, ghost)
+}
+
+/// Run `f` in a child: exit 0 passes, else the failed step
+fn child(f: fn() -> u64) -> R {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(f());
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    check(b"child step", st == 0, i64::from(st >> 8))
+}
+
+/// /proc/self/cwd of a removed directory still opens (Linux
+/// proc_cwd_link + nd_jump_link; its text ends in " (deleted)")
+fn cwd_deleted() -> u64 {
+    sys_mkdir(DIR.as_ptr(), 0o755);
+    if sys_mkdir(D.as_ptr(), 0o755) != 0 || sys_chdir(D.as_ptr()) != 0 {
+        return 1;
+    }
+    if sys_rmdir(D.as_ptr()) != 0 {
+        return 2;
+    }
+    let fd = sys_open(b"/proc/self/cwd\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    sys_chdir(b"/\0".as_ptr());
+    sys_rmdir(DIR.as_ptr());
+    if fd < 0 {
+        return 3;
+    }
+    sys_close(fd as u64);
+    0
 }
 
 /// "/proc/self/fd/<fd>\0" in `b`

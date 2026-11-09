@@ -1345,7 +1345,7 @@ pub struct Zone {
   `exit_mmap`, which, under the mm lock held for writing, takes the
   VMAs (dropping the rmap chains) and tears down the user half
   (`pgtable::detach_user`, a TLB flush, `UserTables::free`), then drops
-  the VMAs (file references) with no lock held. **Never drop an `MmRef`
+  the VMAs (file references) and the executable's path with no lock held. **Never drop an `MmRef`
   under a spinlock** (TASKLIST included): take it out (`Option::take`,
   `replace`) and drop it after unlocking. `mmget_not_zero` refuses an
   address space already being torn down.

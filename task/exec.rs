@@ -1255,11 +1255,7 @@ where
     {
         let mut m = mm.mmap_write();
         m.set_brk(start_brk);
-        let exe = match (file.f_path(), crate::fs::namei::nd_root()) {
-            (Some(p), Ok(root)) => crate::fs::dentry::d_path(&p, &root).0,
-            _ => alloc::vec::Vec::new(),
-        };
-        m.set_exe(exe.into(), deny);
+        m.set_exe(file.f_path(), deny);
         let code = image_layout(&elf, base_addr);
         m.set_args(MmLayout {
             start_code: code.start_code,

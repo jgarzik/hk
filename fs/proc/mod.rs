@@ -250,8 +250,8 @@ pub enum ProcfsInodeData {
     FdinfoFile { pid: ProcPid, fd: i32 },
     /// Generated per-process file (/proc/<pid>/cgroup, maps, ...)
     PidFile { pid: ProcPid, generator: PidGen },
-    /// Per-process symlink (/proc/<pid>/exe)
-    PidLink { pid: ProcPid, target: LinkFn },
+    /// Per-process symlink (/proc/<pid>/exe, cwd, root)
+    PidLink { pid: ProcPid, target: PidLinkKind },
     /// /proc/sys file (readable, maybe writable)
     Sysctl { ctl: &'static crate::sysctl::Ctl },
     /// /proc/<pid>/fail-nth: the task's fault-injection countdown
@@ -414,7 +414,7 @@ impl InodeOps for ProcfsInodeOps {
         // exec_update_lock) or allocate, so none is made under the inode
         // data's spinning read lock
         enum Link {
-            Pid(ProcPid, LinkFn),
+            Pid(ProcPid, PidLinkKind),
             Me,
             Fixed(&'static [u8]),
             Fd(ProcPid, i32),
@@ -430,7 +430,10 @@ impl InodeOps for ProcfsInodeOps {
         };
         match l {
             // EACCES once the task is gone (Linux proc_fd_access_allowed)
-            Link::Pid(pid, target) => target(&pid.task().ok_or(KernelError::PermissionDenied)?),
+            Link::Pid(pid, target) => {
+                let p = pid_link_path(&pid.task().ok_or(KernelError::PermissionDenied)?, target)?;
+                super::dentry::d_path_link(&p)
+            }
             Link::Me => self_link(inode),
             Link::Fixed(t) => Ok(t.to_vec()),
             Link::Fd(pid, fd) => fd_link(&pid, fd),
@@ -439,20 +442,6 @@ impl InodeOps for ProcfsInodeOps {
                 Ok(alloc::format!("{}:[{inum}]", ns_type.as_str()).into_bytes())
             }
         }
-    }
-
-    /// The links whose get_link jumps (Linux proc_pid_get_link for fd/N,
-    /// cwd, root, exe; proc_ns_get_link): /proc/self and FixedLink are
-    /// plain text
-    fn magic_link(&self, inode: &Inode) -> bool {
-        with_data(inode, |d| {
-            matches!(
-                d,
-                ProcfsInodeData::FdSymlink { .. }
-                    | ProcfsInodeData::PidLink { .. }
-                    | ProcfsInodeData::NamespaceFile { .. }
-            )
-        }) && inode.mode().is_symlink()
     }
 
     /// Linux tid_fd_revalidate, proc_sys_revalidate and
@@ -472,27 +461,38 @@ impl InodeOps for ProcfsInodeOps {
         })
     }
 
-    /// /proc/<pid>/ns/<type> leads to the namespace's file (Linux
-    /// proc_ns_get_link: ns_get_path, nd_jump_link); /proc/<pid>/fd/<n>
-    /// to the open file's path (`fd_jump`)
-    fn jump_link(
-        &self,
-        inode: &Inode,
-        _mnt: &Arc<crate::fs::mount::Mount>,
-    ) -> Option<Result<crate::fs::Path, KernelError>> {
-        let wrapper = inode.get_private()?;
-        let wrapper = wrapper
+    /// The magic links jump (Linux proc_pid_get_link, after
+    /// proc_fd_access_allowed: proc_fd_link, proc_cwd_link,
+    /// proc_root_link, proc_exe_link; proc_ns_get_link: ns_get_path);
+    /// /proc/self and the fixed links are text
+    fn get_link(&self, inode: &Inode) -> Result<crate::fs::inode::Link, KernelError> {
+        use crate::fs::inode::Link;
+        enum J {
+            Fd(ProcPid, i32),
+            Pid(ProcPid, PidLinkKind),
+            Ns(ProcPid, NamespaceType),
+            Text,
+        }
+        let private = inode.get_private().ok_or(KernelError::Io)?;
+        let wrapper = private
             .as_ref()
             .as_any()
-            .downcast_ref::<ProcfsInodeWrapper>()?;
-        let (pid, ns_type) = match &*wrapper.0.read() {
+            .downcast_ref::<ProcfsInodeWrapper>()
+            .ok_or(KernelError::Io)?;
+        let j = match &*wrapper.0.read() {
+            ProcfsInodeData::FdSymlink { pid, fd } => J::Fd(pid.clone(), *fd),
+            ProcfsInodeData::PidLink { pid, target } => J::Pid(pid.clone(), *target),
             ProcfsInodeData::NamespaceFile { pid, ns_type } if inode.mode().is_symlink() => {
-                (pid.clone(), *ns_type)
+                J::Ns(pid.clone(), *ns_type)
             }
-            ProcfsInodeData::FdSymlink { pid, fd } => return fd_jump(pid, *fd),
-            _ => return None,
+            _ => J::Text,
         };
-        Some(ns_file(pid, ns_type))
+        Ok(Link::Jump(match j {
+            J::Fd(pid, fd) => fd_jump(&pid, fd)?,
+            J::Pid(pid, k) => pid_link_path(&link_task(&pid)?, k)?,
+            J::Ns(pid, ns_type) => ns_file(pid, ns_type)?,
+            J::Text => return Ok(Link::Text(self.readlink(inode)?)),
+        }))
     }
 
     /// /proc/sys files: Linux proc_sys_permission (never executable,
@@ -1004,18 +1004,14 @@ fn fd_link(pid: &ProcPid, fd: i32) -> Result<Vec<u8>, KernelError> {
 /// path for a pipe, socket or anonymous file (Linux proc_fd_link +
 /// nd_jump_link), so a deleted or unnamed one (O_TMPFILE, memfd) can be
 /// opened again, a pipe joined, and the walk goes on from a directory;
-/// None (follow the text of `fd_link`) for a file of no filesystem (an
-/// mqueue); EACCES without ptrace-read access, checked at each follow
-/// (Linux proc_pid_get_link, proc_fd_access_allowed)
-fn fd_jump(pid: &ProcPid, fd: i32) -> Option<Result<crate::fs::Path, KernelError>> {
-    let t = match link_task(pid) {
-        Ok(t) => t,
-        Err(e) => return Some(Err(e)),
-    };
-    let file = task_files(&t)?.lock().get(fd)?;
-    // A file of no filesystem: followed by its text
-    file.get_inode()?.superblock()?;
-    file.f_path().map(Ok)
+/// EACCES without ptrace-read access, checked at each follow (Linux
+/// proc_pid_get_link, proc_fd_access_allowed); ENOENT once the fd is
+/// closed
+fn fd_jump(pid: &ProcPid, fd: i32) -> Result<crate::fs::Path, KernelError> {
+    let t = link_task(pid)?;
+    let table = task_files(&t).ok_or(KernelError::NotFound)?;
+    let file = table.lock().get(fd).ok_or(KernelError::NotFound)?;
+    file.f_path().ok_or(KernelError::NotFound)
 }
 
 /// Look up entries in /proc/<pid>/fd/
@@ -1411,15 +1407,20 @@ fn write_fail_nth(t: &TaskRef, from: &mut IovSource<'_>) -> Result<usize, Kernel
 /// Inode offset of /proc/<pid>/fail-nth
 const FAIL_NTH_INO: u64 = 113;
 
-/// Per-process symlinks: name, inode offset, target (Linux
-/// proc_exe_link, proc_cwd_link, proc_root_link)
-/// The target of a per-process symlink
-type LinkFn = fn(&TaskRef) -> Result<Vec<u8>, KernelError>;
+/// What a per-process symlink names (Linux proc_exe_link,
+/// proc_cwd_link, proc_root_link)
+#[derive(Clone, Copy, Debug)]
+pub enum PidLinkKind {
+    Exe,
+    Cwd,
+    Root,
+}
 
-const PID_LINKS: &[(&str, u64, LinkFn)] = &[
-    ("exe", 104, exe_link),
-    ("cwd", 111, cwd_link),
-    ("root", 112, root_link),
+/// Per-process symlinks: name, inode offset, what they name
+const PID_LINKS: &[(&str, u64, PidLinkKind)] = &[
+    ("exe", 104, PidLinkKind::Exe),
+    ("cwd", 111, PidLinkKind::Cwd),
+    ("root", 112, PidLinkKind::Root),
 ];
 
 fn pid_file(name: &str) -> Option<(u64, u16, PidGen)> {
@@ -1460,39 +1461,34 @@ fn pid_file_pid(inode: &Inode) -> Option<TaskRef> {
     p.task()
 }
 
-/// /proc/<pid>/cwd and root: the task's fs pwd or root as the reader
-/// names it, EACCES without ptrace-read access (Linux
-/// proc_fd_access_allowed), ENOENT for a task without one
-fn fs_link(t: &TaskRef, root: bool) -> Result<Vec<u8>, KernelError> {
+/// What /proc/<pid>/cwd, root or exe names: the task's fs pwd or root
+/// (ENOENT for a task without one), its executable (through
+/// mm_access, so the check and the image it reveals are one:
+/// exec_update_lock read; ENOENT for a kernel thread); EACCES without
+/// ptrace-read access (Linux proc_fd_access_allowed). readlink shows it
+/// as the reader names it, a follow jumps to it. An exec resolving
+/// /proc/self/exe (busybox re-execs itself) holds only cred_guard while
+/// it walks paths: it takes exec_update for writing later, in
+/// exec_replace_image.
+fn pid_link_path(t: &TaskRef, k: PidLinkKind) -> Result<crate::fs::Path, KernelError> {
     if !crate::task::ptrace::may_access_task(t, true) {
         return Err(KernelError::PermissionDenied);
     }
-    let fs = crate::fs::get_task_fs(t).ok_or(KernelError::NotFound)?;
-    let p = if root { fs.get_root() } else { fs.get_pwd() };
-    super::dentry::d_path_link(&p)
-}
-
-fn cwd_link(t: &TaskRef) -> Result<Vec<u8>, KernelError> {
-    fs_link(t, false)
-}
-
-fn root_link(t: &TaskRef) -> Result<Vec<u8>, KernelError> {
-    fs_link(t, true)
-}
-
-/// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads,
-/// EACCES without ptrace-read access, Linux proc_fd_access_allowed)
-fn exe_link(t: &TaskRef) -> Result<Vec<u8>, KernelError> {
-    // Through mm_access, so the check and the image it reveals are one
-    // (exec_update_lock read). An exec resolving /proc/self/exe (busybox
-    // re-execs itself) holds only cred_guard while it walks paths: it
-    // takes exec_update for writing later, in exec_replace_image
-    let mm = mm_access(t)?.ok_or(KernelError::NotFound)?;
-    let exe = mm
-        .mmap_read_killable()?
-        .exe()
-        .ok_or(KernelError::NotFound)?;
-    Ok(exe.into_vec())
+    match k {
+        PidLinkKind::Cwd | PidLinkKind::Root => {
+            let fs = crate::fs::get_task_fs(t).ok_or(KernelError::NotFound)?;
+            Ok(if matches!(k, PidLinkKind::Root) {
+                fs.get_root()
+            } else {
+                fs.get_pwd()
+            })
+        }
+        PidLinkKind::Exe => {
+            let mm = mm_access(t)?.ok_or(KernelError::NotFound)?;
+            let exe = mm.mmap_read_killable()?.exe();
+            exe.ok_or(KernelError::NotFound)
+        }
+    }
 }
 
 /// /proc/<pid>/maps: one line per VMA (Linux show_map_vma)

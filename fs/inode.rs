@@ -158,6 +158,14 @@ impl InodeMode {
     }
 }
 
+/// What following a symlink gives (Linux ->get_link)
+pub enum Link {
+    /// The path to walk on with
+    Text(alloc::vec::Vec<u8>),
+    /// The object a magic link leads to (Linux nd_jump_link)
+    Jump(super::Path),
+}
+
 /// Inode operations trait - filesystem-specific behavior
 pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
@@ -256,25 +264,13 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
-    /// Symlink `inode` is a magic link, one whose get_link jumps
-    /// (Linux nd_jump_link): RESOLVE_NO_MAGICLINKS refuses it (ELOOP), a
-    /// scoped walk never takes it (EXDEV). Default no; procfs's fd,
-    /// cwd, root, exe and namespace links are.
-    fn magic_link(&self, _inode: &Inode) -> bool {
-        false
-    }
-
-    /// Where symlink `inode` (on mount `mnt`) leads if it is a magic
-    /// link, one that goes to an object rather than to the path its
-    /// readlink shows (Linux get_link + nd_jump_link); None for a plain
-    /// symlink
-    fn jump_link(
-        &self,
-        inode: &Inode,
-        mnt: &Arc<super::mount::Mount>,
-    ) -> Option<Result<super::Path, KernelError>> {
-        let _ = (inode, mnt);
-        None
+    /// Follow symlink `inode` (Linux ->get_link): its text, or for a
+    /// magic link the object it jumps to (nd_jump_link), which
+    /// RESOLVE_NO_MAGICLINKS refuses (ELOOP) and a scoped walk never
+    /// takes (EXDEV). Default: the text `readlink` gives; procfs's fd,
+    /// cwd, root, exe and namespace links jump.
+    fn get_link(&self, inode: &Inode) -> Result<Link, KernelError> {
+        Ok(Link::Text(self.readlink(inode)?))
     }
 
     /// Create a symbolic link

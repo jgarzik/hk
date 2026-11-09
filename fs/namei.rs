@@ -18,7 +18,7 @@ use super::KernelError;
 use super::dac::{MAY_EXEC, cred, permission_as};
 use super::dentry::Dentry;
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
-use super::inode::Inode;
+use super::inode::{Inode, Link};
 use super::mount::{MOUNT_LOCK, Mount, follow_mount, is_path_reachable};
 use super::path_ref::Path;
 use crate::fs::syscall::PATH_MAX;
@@ -314,11 +314,11 @@ impl Nd {
     /// A magic link's jump from `dir` to `to` (Linux nd_jump_link):
     /// ELOOP under no-magiclinks; EXDEV to another mount under no-xdev,
     /// and always for a scoped lookup
-    fn may_jump(&self, dir: &Path, to: Option<&Path>, f: LookupFlags) -> Result<(), KernelError> {
+    fn may_jump(&self, dir: &Path, to: &Path, f: LookupFlags) -> Result<(), KernelError> {
         if f.no_magiclinks {
             return Err(KernelError::TooManySymlinks);
         }
-        let other = to.is_some_and(|p| !Arc::ptr_eq(&p.mnt, &dir.mnt));
+        let other = !Arc::ptr_eq(&to.mnt, &dir.mnt);
         if (f.no_xdev && other) || f.scoped() {
             return Err(KernelError::CrossDevice);
         }
@@ -402,27 +402,27 @@ impl Nd {
         if f.no_symlinks || link.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
             return Err(KernelError::TooManySymlinks);
         }
-        // An atime update or a magic link's get_link leaves the RCU
-        // walk, which LOOKUP_CACHED forbids (try_to_unlazy fails: EAGAIN)
-        let magic = inode.i_op.magic_link(&inode);
-        if f.cached && (magic || inode.atime_needs_update(&link.mnt)) {
+        // An atime update leaves the RCU walk, which LOOKUP_CACHED
+        // forbids (try_to_unlazy fails: EAGAIN)
+        if f.cached && inode.atime_needs_update(&link.mnt) {
             return Err(KernelError::WouldBlock);
         }
-        // A magic link jumps to its object (Linux nd_jump_link), after
-        // its own access check; one that cannot is followed by its text
-        let jump = inode.i_op.jump_link(&inode, &dir.mnt).transpose()?;
-        let target = match jump {
-            Some(_) => None,
-            None => Some(inode.i_op.readlink(&inode)?),
-        };
+        // A magic link's get_link needs the ref-walk too (procfs's is
+        // -ECHILD without a dentry): EAGAIN under LOOKUP_CACHED
+        let got = inode.i_op.get_link(&inode);
+        if f.cached && !matches!(got, Ok(Link::Text(_))) {
+            return Err(KernelError::WouldBlock);
+        }
+        let got = got?;
         inode.touch_atime(&link.mnt);
-        if magic {
-            self.may_jump(dir, jump.as_ref(), f)?;
-        }
-        if let Some(p) = jump {
-            return self.walk_on(p, rest, f, depth);
-        }
-        let mut path = target.unwrap_or_default();
+        let mut path = match got {
+            // A magic link: the walk goes on from its object
+            Link::Jump(p) => {
+                self.may_jump(dir, &p, f)?;
+                return self.walk_on(p, rest, f, depth);
+            }
+            Link::Text(t) => t,
+        };
         if path.starts_with(b"/") {
             self.jump_root(dir, f)?;
         }
@@ -505,10 +505,11 @@ impl Nd {
     /// step_into on the last component): while the last name is a
     /// symlink, its target's parent and last name, each link checked as
     /// a walk checks it (fs.protected_symlinks, then RESOLVE_NO_SYMLINKS
-    /// or nosymfollow, then a magic link's and an absolute target's
-    /// jump); ELOOP past MAX_SYMLINKS. A target ending in '/', "." or
-    /// ".." is EISDIR.
-    pub fn last_links(&self, mut p: Parent, f: LookupFlags) -> Result<Parent, KernelError> {
+    /// or nosymfollow, then an absolute target's jump); a magic link's
+    /// object itself (nd_jump_link: there is no name left to create);
+    /// ELOOP past MAX_SYMLINKS. A target ending in '/', "." or ".." is
+    /// EISDIR.
+    pub fn last_links(&self, mut p: Parent, f: LookupFlags) -> Result<CreateAt, KernelError> {
         const MAX_SYMLINKS: usize = 40;
         for _ in 0..MAX_SYMLINKS {
             let dir = Path::new(p.mnt.clone(), p.dir.clone());
@@ -518,11 +519,11 @@ impl Nd {
             };
             let found = match self.walk(Some(dir.clone()), &p.name, nofollow, 0) {
                 Ok(f) => f,
-                Err(KernelError::NotFound) => return Ok(p),
+                Err(KernelError::NotFound) => return Ok(CreateAt::Name(p)),
                 Err(e) => return Err(e),
             };
             let Some(inode) = found.get_inode().filter(|i| i.mode().is_symlink()) else {
-                return Ok(p);
+                return Ok(CreateAt::Name(p));
             };
             if let Some(d) = p.dir.get_inode() {
                 super::dac::may_follow_link(&self.c, &d, &inode)?;
@@ -530,11 +531,15 @@ impl Nd {
             if f.no_symlinks || found.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
                 return Err(KernelError::TooManySymlinks);
             }
-            let target = inode.i_op.readlink(&inode)?;
+            let got = inode.i_op.get_link(&inode)?;
             inode.touch_atime(&found.mnt);
-            if inode.i_op.magic_link(&inode) {
-                self.may_jump(&dir, None, f)?;
-            }
+            let target = match got {
+                Link::Jump(o) => {
+                    self.may_jump(&dir, &o, f)?;
+                    return Ok(CreateAt::Object(o));
+                }
+                Link::Text(t) => t,
+            };
             let start = if target.starts_with(b"/") {
                 self.jump_root(&dir, f)?;
                 None
@@ -548,6 +553,14 @@ impl Nd {
         }
         Err(KernelError::TooManySymlinks)
     }
+}
+
+/// Where an O_CREAT open lands ([`Nd::last_links`])
+pub enum CreateAt {
+    /// A name to look up or create in its parent
+    Name(Parent),
+    /// An existing object a magic link jumped to
+    Object(Path),
 }
 
 /// The next component of `p` and what follows it, skipping slashes
