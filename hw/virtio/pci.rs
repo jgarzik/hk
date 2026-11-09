@@ -17,9 +17,10 @@
 //! (generation-checked), notify writes (under the caller's queue lock)
 //! and the ISR byte (IRQ context). The INTx registration
 //! (`VirtioDevice.irq`, which owns the driver's interrupt callbacks) is
-//! a spin leaf, thread context only: set by `request_irq` (driver probe)
-//! and taken by `free_irq` (driver remove, transport remove), which
-//! drops it (`IRQ_TABLE`) after unlocking.
+//! a spin leaf, thread context only: claimed, then set, by `request_irq`
+//! (driver probe; it registers between the two, unlocked) and taken by
+//! `free_irq` (driver remove, transport remove), which drops it
+//! (`IRQ_TABLE`) after unlocking.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -166,9 +167,31 @@ pub struct VirtioDevice {
     /// The INTx handler with the bound driver's interrupt callbacks
     /// (Linux vq->callback and config_changed): between `request_irq`
     /// and `free_irq`
-    irq: Mutex<Option<IrqRegistration<VpIntx>>>,
+    irq: Mutex<IrqSlot>,
     /// Interrupts that were ours (stats)
     irqs: AtomicU64,
+}
+
+/// `VirtioDevice.irq`: the INTx registration, or who may make it
+enum IrqSlot {
+    Free,
+    /// A `request_irq` is registering, unlocked
+    Claimed,
+    Held(IrqRegistration<VpIntx>),
+}
+
+impl IrqSlot {
+    /// The registration, leaving the slot free (a claim stays: its
+    /// `request_irq` finishes it)
+    fn take(&mut self) -> Option<IrqRegistration<VpIntx>> {
+        if !matches!(self, Self::Held(_)) {
+            return None;
+        }
+        match core::mem::replace(self, Self::Free) {
+            Self::Held(r) => Some(r),
+            _ => None,
+        }
+    }
 }
 
 impl VirtioDevice {
@@ -198,7 +221,7 @@ impl VirtioDevice {
             notify,
             notify_mul: caps.notify_mul,
             features: AtomicU64::new(0),
-            irq: Mutex::new(None),
+            irq: Mutex::new(IrqSlot::Free),
             irqs: AtomicU64::new(0),
         })
     }
@@ -387,22 +410,36 @@ impl VirtioDevice {
     }
 
     /// Register the driver's interrupt callbacks and enable INTx (Linux
-    /// find_vqs: vp_request_intx); Busy if already requested. Probe and
-    /// remove, which request and free, are serialized by the virtio
-    /// device's lock
+    /// find_vqs: vp_request_intx); Busy if already requested or being
+    /// requested. The slot is claimed first, so of two callers only
+    /// one registers
     pub fn request_irq(self: &Arc<Self>, cb: Arc<dyn VirtioIrq>) -> Result<u32, KernelError> {
-        if self.irq.lock().is_some() {
-            return Err(KernelError::Busy);
+        {
+            let mut s = self.irq.lock();
+            if !matches!(*s, IrqSlot::Free) {
+                return Err(KernelError::Busy);
+            }
+            *s = IrqSlot::Claimed;
         }
-        let h = try_arc(VpIntx {
+        // Holds the device until `free_irq` (the driver's remove)
+        let reg = try_arc(VpIntx {
             vdev: self.clone(),
             cb,
-        })?;
-        // Holds the device until `free_irq` (the driver's remove)
-        let reg = self.pci.request_irq(h)?;
-        let irq = reg.irq();
-        *self.irq.lock() = Some(reg);
-        Ok(irq)
+        })
+        .and_then(|h| self.pci.request_irq(h));
+        let mut s = self.irq.lock();
+        // Replaces `Claimed`: no registration is dropped under the lock
+        match reg {
+            Ok(reg) => {
+                let irq = reg.irq();
+                *s = IrqSlot::Held(reg);
+                Ok(irq)
+            }
+            Err(e) => {
+                *s = IrqSlot::Free;
+                Err(e)
+            }
+        }
     }
 
     /// Reset the device, then free the rings of `vqs` (Linux del_vqs:
