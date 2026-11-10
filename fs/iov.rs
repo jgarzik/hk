@@ -6,7 +6,7 @@ use crate::fs::{KernelError, RwFlags};
 use crate::uaccess::{UserPtr, access_ok, copy_from_user};
 use crate::util::error::KernelResult;
 
-use super::io::{do_readv, do_writev, pos_arg};
+use super::io::{do_readv, do_writev, pos_arg, seg_len};
 use super::syscall::{
     IOV_MAX, MAX_RW_COUNT, RWF_APPEND, RWF_ATOMIC, RWF_DONTCACHE, RWF_DSYNC, RWF_HIPRI,
     RWF_NOAPPEND, RWF_NOWAIT, RWF_SUPPORTED, RWF_SYNC,
@@ -93,7 +93,13 @@ pub fn import_iovec(
 
 /// sys_readv - scatter read at the file position
 pub fn sys_readv(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32) -> KernelResult<usize> {
-    do_readv(fd, &import_iovec(iov, iovcnt)?, None, RwFlags::empty())
+    do_readv(
+        fd,
+        &import_iovec(iov, iovcnt)?,
+        None,
+        RwFlags::empty(),
+        true,
+    )
 }
 
 /// sys_writev - gather write at the file position (one write: atomic
@@ -105,13 +111,20 @@ pub fn sys_writev(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32) -> KernelResult<usi
         None,
         RwFlags::empty(),
         None,
+        true,
     )
 }
 
 /// sys_preadv - scatter read at an offset
 pub fn sys_preadv(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32, offset: i64) -> KernelResult<usize> {
     let at = pos_arg(offset)?;
-    do_readv(fd, &import_iovec(iov, iovcnt)?, Some(at), RwFlags::empty())
+    do_readv(
+        fd,
+        &import_iovec(iov, iovcnt)?,
+        Some(at),
+        RwFlags::empty(),
+        true,
+    )
 }
 
 /// sys_pwritev - gather write at an offset (O_APPEND still appends)
@@ -123,6 +136,7 @@ pub fn sys_pwritev(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32, offset: i64) -> Ke
         Some(at),
         RwFlags::empty(),
         None,
+        true,
     )
 }
 
@@ -171,9 +185,16 @@ pub fn sys_preadv2(
     offset: i64,
     flags: i32,
 ) -> KernelResult<usize> {
-    let f = rwf_check(flags)?;
     let at = pos2(offset)?;
-    do_readv(fd, &import_iovec(iov, iovcnt)?, at, f)
+    let segs = import_iovec(iov, iovcnt)?;
+    // Nothing to read is 0 before the flags are looked at (Linux
+    // vfs_readv before kiocb_set_rw_flags)
+    let f = if seg_len(&segs) == 0 {
+        RwFlags::empty()
+    } else {
+        rwf_check(flags)?
+    };
+    do_readv(fd, &segs, at, f, true)
 }
 
 /// sys_pwritev2 - pwritev with RWF_* flags (offset -1: file position;
@@ -193,7 +214,13 @@ pub fn sys_pwritev2(
     } else {
         None
     };
-    let f = rwf_check(flags)?;
     let at = pos2(offset)?;
-    do_writev(fd, &import_iovec(iov, iovcnt)?, at, f, append)
+    let segs = import_iovec(iov, iovcnt)?;
+    // As in sys_preadv2 (Linux vfs_writev)
+    let f = if seg_len(&segs) == 0 {
+        RwFlags::empty()
+    } else {
+        rwf_check(flags)?
+    };
+    do_writev(fd, &segs, at, f, append, true)
 }

@@ -1,7 +1,9 @@
 //! RWF_NOWAIT on a block device whose queue cannot honor it (Linux
 //! BLK_FEAT_NOWAIT unset: bdev_open leaves FMODE_NOWAIT off, so
 //! kiocb_set_rw_flags refuses RWF_NOWAIT): EOPNOTSUPP, direct or
-//! buffered, and the same read without RWF_NOWAIT returns the data.
+//! buffered, and the same read without RWF_NOWAIT returns the data. An
+//! empty read is 0 whatever the flags (Linux vfs_readv returns before
+//! kiocb_set_rw_flags).
 //! hk's sd driver is bio-based and does each request in the submitter,
 //! so sda is such a device. Linux references have no sda (no USB disk)
 //! and no such device: skipped there.
@@ -41,22 +43,46 @@ fn nowait_sync() -> R {
     r
 }
 
+/// (what, open flags, length, RWF flags, expected result)
+type Case = (&'static [u8], u32, u64, i32, i64);
+
 fn reads(buf: u64) -> R {
-    for (what, flags, ok) in [
-        (&b"nowait direct read"[..], O_RDONLY | O_DIRECT, false),
-        (b"nowait buffered read", O_RDONLY, false),
-        (b"direct read", O_RDONLY | O_DIRECT, true),
-    ] {
+    let cases: [Case; 5] = [
+        (
+            b"nowait direct read",
+            O_RDONLY | O_DIRECT,
+            PAGE,
+            RWF_NOWAIT,
+            EOPNOTSUPP,
+        ),
+        (
+            b"nowait buffered read",
+            O_RDONLY,
+            PAGE,
+            RWF_NOWAIT,
+            EOPNOTSUPP,
+        ),
+        // Linux vfs_readv: nothing to read is 0 before the flags are
+        // looked at (kiocb_set_rw_flags)
+        (
+            b"empty nowait direct read",
+            O_RDONLY | O_DIRECT,
+            0,
+            RWF_NOWAIT,
+            0,
+        ),
+        (b"empty nowait buffered read", O_RDONLY, 0, RWF_NOWAIT, 0),
+        (b"direct read", O_RDONLY | O_DIRECT, PAGE, 0, PAGE as i64),
+    ];
+    for (what, flags, len, rwf, want) in cases {
         let fd = sys_open(b"/dev/sda\0".as_ptr(), flags, 0);
         check(b"open sda", fd >= 0, fd)?;
         let iov = IoVec {
             iov_base: buf as *const u8,
-            iov_len: PAGE as usize,
+            iov_len: len as usize,
         };
-        let rwf = if ok { 0 } else { RWF_NOWAIT };
         let n = sys_preadv2(fd as i32, &iov, 1, 0, rwf);
         sys_close(fd as u64);
-        let want = if ok { PAGE as i64 } else { EOPNOTSUPP };
         check(what, n == want, n)?;
     }
     Ok(())
