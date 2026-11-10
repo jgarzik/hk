@@ -848,8 +848,12 @@ fn handle_irq(irq: u64) {
             // Timer interrupt (PIT): the LAPIC timer drives the tick
         }
         _ => {
-            // Dispatch to registered handlers
-            crate::irq::handle_irq(u32::from(irq));
+            // Dispatch to registered handlers, in interrupt context
+            // (`in_irq`: the interrupt depth the heap and lockdep read;
+            // arm64's irq_body raises it for every interrupt)
+            in_irq(|| {
+                crate::irq::handle_irq(u32::from(irq));
+            });
         }
     }
 
