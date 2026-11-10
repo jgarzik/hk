@@ -341,10 +341,13 @@ fn handle_interrupt(vector: u64) {
 
 /// An MSI line's interrupt (Linux common_interrupt, handle_edge_irq):
 /// edge-triggered, so acknowledged first; one raised while the handlers
-/// run comes again
+/// run comes again. Its handlers run as an interrupt (`in_irq`: the
+/// interrupt depth, which the heap's atomic choice and lockdep read)
 fn handle_msi(irq: u32) {
     lapic::eoi();
-    crate::irq::handle_irq(irq);
+    in_irq(|| {
+        crate::irq::handle_irq(irq);
+    });
 }
 
 /// si_code for a user x87 (#MF) or SIMD (#XM) floating-point exception
