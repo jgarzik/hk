@@ -171,6 +171,10 @@ pub struct Bio {
     /// chain): each ends on its own when the request does
     /// (`bio_endio`); blk-mq only
     pub merged: BioList,
+    /// Sectors and segments of the `merged` bios (a request's running
+    /// totals beyond its head, Linux __data_len, nr_phys_segments)
+    merged_sectors: u64,
+    merged_segs: usize,
     /// Address of the queue a plugged bio is for (`plug`)
     pub(super) plug_q: usize,
     /// Software queue (CPU) of its blk-mq request, set when the request
@@ -193,6 +197,8 @@ impl Bio {
             end_io: None,
             private: 0,
             merged: BioList::new(),
+            merged_sectors: 0,
+            merged_segs: 0,
             plug_q: 0,
             rq_ctx: 0,
             next: None,
@@ -232,12 +238,41 @@ impl Bio {
 
     /// The request's segment count (Linux blk_rq_nr_phys_segments)
     pub fn rq_nr_segs(&self) -> usize {
-        self.rq_bios().map(|b| b.segs.len()).sum()
+        self.segs.len() + self.merged_segs
     }
 
     /// The request's sectors (Linux blk_rq_sectors)
     pub fn rq_sectors(&self) -> u64 {
-        self.rq_bios().map(Bio::sectors).sum()
+        self.sectors() + self.merged_sectors
+    }
+
+    /// Merge `b` (a lone bio) behind the request this bio heads (Linux
+    /// bio_attempt_back_merge)
+    pub(super) fn rq_append(&mut self, b: Box<Bio>) {
+        self.merged_sectors += b.sectors();
+        self.merged_segs += b.segs.len();
+        self.merged.push(b);
+    }
+
+    /// Merge `b` (a lone bio) in front of the request this bio heads
+    /// (Linux bio_attempt_front_merge): `b`'s data takes the head's
+    /// place, the old head and the bios behind it follow. What the head
+    /// holds for the request stays: its software queue (whose hardware
+    /// queue counted its tag), its queue, its flags (Linux keeps mq_ctx
+    /// and cmd_flags), and the running totals grow by the old head
+    pub(super) fn rq_prepend(&mut self, mut b: Box<Bio>) {
+        core::mem::swap(self, &mut *b);
+        // `b` is the old head now, `self` the new bio's data
+        core::mem::swap(&mut self.rq_ctx, &mut b.rq_ctx);
+        core::mem::swap(&mut self.plug_q, &mut b.plug_q);
+        core::mem::swap(&mut self.flags, &mut b.flags);
+        self.merged_sectors = b.merged_sectors + b.sectors();
+        self.merged_segs = b.merged_segs + b.segs.len();
+        b.merged_sectors = 0;
+        b.merged_segs = 0;
+        let mut rest = core::mem::take(&mut b.merged);
+        self.merged.push(b);
+        self.merged.append(&mut rest);
     }
 }
 
@@ -336,11 +371,20 @@ impl BioList {
         Some(bio)
     }
 
-    /// Move all of `other` to the end of this list
+    /// Move all of `other` to the end of this list, in O(1)
     pub fn append(&mut self, other: &mut BioList) {
-        while let Some(b) = other.pop() {
-            self.push(b);
+        let Some(head) = other.head.take() else {
+            return;
+        };
+        if self.tail.is_null() {
+            self.head = Some(head);
+        } else {
+            // SAFETY: `tail` points into this list's last box, which
+            // `&mut self` owns
+            unsafe { (*self.tail).next = Some(head) };
         }
+        self.tail = other.tail;
+        other.tail = core::ptr::null_mut();
     }
 }
 

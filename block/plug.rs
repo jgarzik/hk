@@ -173,7 +173,7 @@ pub fn hold(q: &RequestQueue, mut bio: Box<Bio>) -> Result<(), Box<Bio>> {
 /// Merge `bio` into the request `rq` heads, behind it or in front,
 /// within `q`'s limits (Linux blk_rq_merge_ok, ll_back_merge_fn,
 /// ll_front_merge_fn); it comes back if it does not fit
-fn merge(q: &RequestQueue, rq: &mut Bio, mut bio: Box<Bio>) -> Result<(), Box<Bio>> {
+fn merge(q: &RequestQueue, rq: &mut Bio, bio: Box<Bio>) -> Result<(), Box<Bio>> {
     let lim = &q.limits;
     let ok = rq.op == bio.op
         && rq.op != BioOp::Flush
@@ -186,23 +186,11 @@ fn merge(q: &RequestQueue, rq: &mut Bio, mut bio: Box<Bio>) -> Result<(), Box<Bi
         return Err(bio);
     }
     if rq.sector + rq.rq_sectors() == bio.sector {
-        rq.merged.push(bio);
+        rq.rq_append(bio);
         return Ok(());
     }
     if bio.sector + bio.sectors() == rq.sector {
-        // `bio` heads the request: it takes the head's place in the
-        // plug, the old head and its merged bios follow it. What the
-        // head holds for the request stays the request's (Linux
-        // bio_attempt_front_merge: req->cmd_flags, mq_ctx unchanged): its
-        // software queue, whose hardware queue counted its tag, its
-        // queue and its flags
-        core::mem::swap(rq, &mut *bio);
-        core::mem::swap(&mut rq.rq_ctx, &mut bio.rq_ctx);
-        core::mem::swap(&mut rq.plug_q, &mut bio.plug_q);
-        core::mem::swap(&mut rq.flags, &mut bio.flags);
-        let mut rest = core::mem::take(&mut bio.merged);
-        rq.merged.push(bio);
-        rq.merged.append(&mut rest);
+        rq.rq_prepend(bio);
         return Ok(());
     }
     Err(bio)
