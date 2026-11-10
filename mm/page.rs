@@ -397,6 +397,26 @@ pub unsafe fn copy_page(dst: u64, src: u64) {
     unsafe { frame_bytes(dst).copy_from_slice(frame_bytes(src)) };
 }
 
+/// Copy the page frame `src`, which another party (user space, a
+/// device) may write meanwhile, to `dst` (Linux copy_user_highpage of a
+/// shared kernel page): word by word with volatile reads, so a racing
+/// write gives some mix of old and new bytes, never undefined behavior
+///
+/// # Safety
+/// As [`frame_bytes`] for `dst`; `src` is a different RAM frame that
+/// stays allocated meanwhile.
+pub unsafe fn copy_page_racy(dst: u64, src: u64) {
+    debug_assert_ne!(dst, src);
+    let words = (1usize << PAGE_SHIFT) / 8;
+    let s = crate::arch::phys_to_virt(src).cast::<u64>();
+    let d = crate::arch::phys_to_virt(dst).cast::<u64>();
+    for i in 0..words {
+        // SAFETY: word `i` of two allocated RAM frames (the caller's
+        // contract), page-aligned; `dst` is the caller's alone
+        unsafe { d.add(i).write(s.add(i).read_volatile()) };
+    }
+}
+
 /// Release a mapping word taken off a page: an anon_vma reference
 pub fn put_mapping(word: u64) {
     if word & 1 != 0 && word & !1 != 0 {

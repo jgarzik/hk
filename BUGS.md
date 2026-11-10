@@ -545,26 +545,31 @@ always infinite, promote_secondaries is off.
 RTM_NEWLINK/RTM_SETLINK ignore IFLA_NET_NS_PID/IFLA_NET_NS_FD: they
 return 0 without moving the device (Linux: moved, or an error).
 
-## io_uring has no shared rings
+## io_uring gaps
 
-**Location**: `io/io_uring.rs`
+**Location**: `io/io_uring/`
 
-io_uring_setup returns ring offsets, but nothing maps the SQ ring, the
-CQ ring or the SQE array (IORING_OFF_SQ_RING/CQ_RING/SQES), so user
-SQEs never reach the kernel and CQEs never reach user space: submit
-works on a kernel-side copy, and `post_cqe` assumes the CQ head is 0.
-Missing on top of that:
-- `io_uring_enter(IORING_ENTER_GETEVENTS)` never blocks (`wait_completions`
-  is a stub) and ignores IORING_ENTER_EXT_ARG
+- `io_uring_enter(IORING_ENTER_GETEVENTS)` never blocks (moves
+  overflowed CQEs only) and ignores IORING_ENTER_EXT_ARG
+- Every operation runs inline in io_uring_enter under the submission
+  lock: one that blocks (a read of an empty pipe or socket) blocks the
+  caller; Linux arms poll or punts it to io-wq threads. IOSQE_IO_DRAIN
+  and IOSQE_ASYNC are ignored
 - IORING_OP_TIMEOUT has no timer (nothing ever completes it), and has
   no count trigger, TIMEOUT_UPDATE or MULTISHOT
 - IORING_OP_LINK_TIMEOUT returns 0 without arming anything
-- poll ops never complete asynchronously; IOSQE_IO_DRAIN and ASYNC are
-  ignored
+- poll ops never complete asynchronously
 - IORING_OP_OPENAT2 is not handled (Linux io_openat2: the open_how
-  rules of `fs/open.rs` sys_openat2, without its page limit)
-
-The boot tests cover setup and enter return values only.
+  rules of `fs/open.rs` sys_openat2, without its page limit), nor
+  most opcodes past IORING_OP_SHUTDOWN (EINVAL CQEs)
+- Setup flags: no SQPOLL (Linux allows it unprivileged), SUBMIT_ALL,
+  COOP_TASKRUN, TASKRUN_FLAG, SINGLE_ISSUER, DEFER_TASKRUN,
+  NO_SQARRAY, SQE128/CQE32, NO_MMAP, REGISTERED_FD_ONLY, R_DISABLED,
+  ATTACH_WQ (EINVAL); no registered ring fds
+  (IORING_ENTER_REGISTERED_RING), personalities, provided buffers,
+  eventfd or registered buffers
+- The rings are not charged to the user's locked memory (Linux
+  __io_account_mem against RLIMIT_MEMLOCK without CAP_IPC_LOCK)
 
 ## Rare QEMU crash in the arm64 boot test (host CPU suspected)
 
@@ -856,7 +861,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   poll `read_ts`, mqueue, posix_timer...; Linux get_timespec64);
   iovec structs (`fs/iov.rs` `IoVec`, `net/msg.rs` `IoVec`/`Iov`) and
   importers beside `import_iovec` (`net/msg.rs` `Iov::import`,
-  io_uring `read_user_iovecs`, process_vm `remote_iovecs`); Timespec
+  process_vm `remote_iovecs`); Timespec
   types `time::Timespec`, `LinuxTimespec` (time_syscall), `SemTimespec`
   (ipc/sem); Timeval types in task/misc and time_syscall, plus
   `TimexTimeval`.

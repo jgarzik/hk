@@ -27,6 +27,7 @@ use crate::arch::{PageFlags, paging, phys_to_virt};
 use crate::fs::File;
 use crate::mm::page_alloc::Gfp;
 use crate::task::percpu::{increment_maj_flt, increment_min_flt};
+use crate::util::error::KernelError;
 
 /// The access that faulted
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -355,6 +356,13 @@ fn do_huge_anon(mm: &Mm, t: PgTables<'_>, addr: u64, area: &Area) -> bool {
 fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool), VmFault> {
     let exec = area.prot & PROT_EXEC != 0;
     if let (false, Some(f)) = (area.anon, &area.file)
+        && let Some(r) = f
+            .f_op
+            .map_page(f, area.offset, (addr - area.start) / PAGE_SIZE)
+    {
+        return driver_page(r, area, access);
+    }
+    if let (false, Some(f)) = (area.anon, &area.file)
         && let Some(r) = file_page(f, area.pgoff(addr), area, access)
     {
         return r;
@@ -374,6 +382,30 @@ fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool
         paging::sync_page(frame, exec);
     }
     Ok((frame, false, false))
+}
+
+/// A driver's page for a mapping (`FileOps::map_page`, with a
+/// reference for the PTE): a shared mapping maps it, a private one maps
+/// it read-only on a read and a copy of it on a write (Linux
+/// vm_insert_page into a private VMA: copy-on-write); SIGBUS if the
+/// driver has none there
+fn driver_page(
+    r: Result<u64, KernelError>,
+    area: &Area,
+    access: Access,
+) -> Result<(u64, bool, bool), VmFault> {
+    let page = r.map_err(|_| VmFault::Bus)?;
+    if area.shared || access != Access::Write {
+        return Ok((page, false, !area.shared));
+    }
+    let copy = alloc_user();
+    if let Some(new) = copy {
+        // SAFETY: the new frame is ours; `page` is referenced
+        unsafe { super::page::copy_page_racy(new, page) };
+        paging::sync_page(new, area.prot & PROT_EXEC != 0);
+    }
+    FRAME_ALLOCATOR.decref(page);
+    copy.map(|n| (n, false, false)).ok_or(VmFault::Oom)
 }
 
 /// The page-cache page at byte offset `off` of `file`, for a mapping

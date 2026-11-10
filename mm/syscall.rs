@@ -186,7 +186,9 @@ pub fn sys_mmap(
         return Err(KernelError::Overflow);
     }
     if let Some(f) = &file
-        && let Err(e) = mmap_file_ok(f, prot, is_shared).and_then(|()| f.f_op.mmap(f, is_shared))
+        && let Err(e) = mmap_file_ok(f, prot, is_shared)
+            .and_then(|()| f.f_op.mmap(f, is_shared))
+            .and_then(|()| f.f_op.mmap_offset(f, pgoff * PAGE_SIZE))
     {
         return Err(e);
     }

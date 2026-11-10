@@ -144,7 +144,7 @@ pub fn sys_pwritev(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32, offset: i64) -> Ke
 /// kiocb_set_rw_flags): unknown or unsupported ones are EOPNOTSUPP,
 /// RWF_APPEND with RWF_NOAPPEND EINVAL; RWF_SYNC implies RWF_DSYNC.
 /// RWF_APPEND and RWF_NOAPPEND go to `File::write_iter`'s `append`.
-fn rwf_check(flags: i32) -> KernelResult<RwFlags> {
+pub fn rwf_check(flags: i32) -> KernelResult<RwFlags> {
     if flags & !RWF_SUPPORTED != 0 {
         return Err(KernelError::OperationNotSupported);
     }
@@ -166,6 +166,17 @@ fn rwf_check(flags: i32) -> KernelResult<RwFlags> {
         }
     }
     Ok(f)
+}
+
+/// What RWF_APPEND / RWF_NOAPPEND say of O_APPEND for one write
+pub fn rwf_append(flags: i32) -> Option<bool> {
+    if flags & RWF_APPEND != 0 {
+        Some(true)
+    } else if flags & RWF_NOAPPEND != 0 {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Offset of preadv2/pwritev2: -1 is the file position
@@ -207,13 +218,7 @@ pub fn sys_pwritev2(
     offset: i64,
     flags: i32,
 ) -> KernelResult<usize> {
-    let append = if flags & RWF_APPEND != 0 {
-        Some(true)
-    } else if flags & RWF_NOAPPEND != 0 {
-        Some(false)
-    } else {
-        None
-    };
+    let append = rwf_append(flags);
     let at = pos2(offset)?;
     let segs = import_iovec(iov, iovcnt)?;
     // As in sys_preadv2 (Linux vfs_writev)

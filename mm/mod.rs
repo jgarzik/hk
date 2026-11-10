@@ -42,6 +42,7 @@ pub mod pgtable;
 pub mod ptl;
 pub mod remote;
 pub mod rmap;
+pub mod shared;
 pub mod slab;
 pub mod swap;
 pub mod swapper;

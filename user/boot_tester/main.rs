@@ -19,6 +19,7 @@ pub mod proc;
 pub mod process;
 pub mod signal;
 pub mod time;
+pub mod uring;
 
 use core::ffi::c_void;
 use core::panic::PanicInfo;
@@ -371,7 +372,7 @@ pub fn run_all_tests() {
     io::errno_pass::run_tests();
     isolated(b"CPU_ACCT", proc::cpu_acct::run_tests);
     isolated(b"CPU_TIMERS", time::cpu_timers::run_tests);
-    io::io_uring::run_tests();
+    uring::run_tests();
     net::tcp::run_tests();
     isolated(b"MEMCORE", mm::memcore::run_tests);
     isolated(b"MMLOCK", mm::mmlock::run_tests);

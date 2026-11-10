@@ -355,6 +355,22 @@ pub trait FileOps: Send + Sync {
         Err(KernelError::NoDevice)
     }
 
+    /// May a mapping start at byte `off` of the file (Linux f_op->mmap
+    /// looking at vm_pgoff, e.g. io_uring_validate_mmap_request)? Asked
+    /// after `mmap` accepted the mapping. Default: any offset.
+    fn mmap_offset(&self, _file: &File, _off: u64) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    /// The kernel page that page `idx` of a mapping made at byte `off`
+    /// of the file maps, with a reference taken for its PTE (Linux
+    /// vm_insert_pages from f_op->mmap: pages of the driver, not of a
+    /// page cache); an error is SIGBUS. None: the file maps the default
+    /// way (its page cache, or a private copy of its data).
+    fn map_page(&self, _file: &File, _off: u64, _idx: u64) -> Option<Result<u64, KernelError>> {
+        None
+    }
+
     /// Sync file data to backing store
     fn fsync(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
