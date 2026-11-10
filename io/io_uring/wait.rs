@@ -10,6 +10,7 @@
 //! wait, as pselect's.
 
 use core::pin::pin;
+use core::sync::atomic::Ordering;
 
 use super::IoRing;
 use super::abi::IORING_ENTER_EXT_ARG;
@@ -112,6 +113,10 @@ impl IoRing {
             self.flush_overflow();
             if self.cq_reached(target) {
                 break Ok(());
+            }
+            // A lost CQE is reported once (Linux IO_CHECK_CQ_DROPPED_BIT)
+            if self.dropped.load(Ordering::Acquire) {
+                break Err(KernelError::BadRequest);
             }
             // Only a real signal ends it (Linux task_sigpending)
             if current().sigpending() {

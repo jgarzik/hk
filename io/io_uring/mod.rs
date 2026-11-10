@@ -83,7 +83,8 @@ pub struct Submit {
     sq_head: u32,
     /// Registered files
     files: Option<Vec<Option<Arc<File>>>>,
-    /// user_data of poll and timeout requests noted but never completed
+    /// user_data of poll and timeout requests noted but never completed;
+    /// at most `cq_entries` (`note_pending`)
     pending: KVec<u64>,
 }
 
@@ -104,6 +105,10 @@ pub struct IoRing {
     /// cleared under `cq`, read lock-free by poll and GETEVENTS to skip
     /// the lock when nothing waits
     overflowed: AtomicBool,
+    /// A CQE was lost since GETEVENTS last said so (Linux
+    /// IO_CHECK_CQ_DROPPED_BIT): set under `cq`, cleared by the wait
+    /// that returns EBADR
+    dropped: AtomicBool,
     /// Pollers of the ring fd (Linux poll_wq)
     wq: WaitQueue,
     /// GETEVENTS waiters (Linux cq_wait), woken by every CQE posted
@@ -121,6 +126,18 @@ struct Link {
     failed: bool,
 }
 
+impl Submit {
+    /// Note a request that stays pending: at most `max` (the CQ size: the
+    /// CQEs they could ever post), EAGAIN past it (Linux: a request that
+    /// cannot be allocated)
+    pub fn note_pending(&mut self, user_data: u64, max: u32) -> KernelResult<()> {
+        if self.pending.len() >= max as usize {
+            return Err(KernelError::WouldBlock);
+        }
+        self.pending.try_push(user_data)
+    }
+}
+
 impl IoRing {
     fn new(sq: u32, cq: u32) -> KernelResult<Arc<Self>> {
         try_arc(Self {
@@ -135,6 +152,7 @@ impl IoRing {
                 overflow: KDeque::new(),
             }),
             overflowed: AtomicBool::new(false),
+            dropped: AtomicBool::new(false),
             wq: WaitQueue::new(),
             cq_wait: WaitQueue::new(),
         })
@@ -254,10 +272,17 @@ impl IoRing {
         tail.wrapping_sub(self.rings.cq_head()) < self.rings.cq_entries()
     }
 
-    /// Keep `cqe` until there is room (Linux io_cqring_event_overflow)
+    /// Keep `cqe` until there is room (Linux io_cqring_event_overflow):
+    /// at most as many as the CQ holds (Linux charges each to the memory
+    /// cgroup; hk has none, so the list is bounded instead), and one that
+    /// does not fit is lost: counted in cq_overflow, and the next
+    /// GETEVENTS wait says EBADR (Linux IO_CHECK_CQ_DROPPED_BIT)
     fn overflow(&self, cq: &mut Cq, cqe: IoUringCqe) {
-        if cq.overflow.try_push_back(cqe).is_err() {
+        if cq.overflow.len() >= self.rings.cq_entries() as usize
+            || cq.overflow.try_push_back(cqe).is_err()
+        {
             self.rings.inc_cq_overflow();
+            self.dropped.store(true, Ordering::Release);
             return;
         }
         if cq.overflow.len() == 1 {
@@ -357,6 +382,11 @@ impl IoRing {
         Ok(fds.len())
     }
 
+    /// Entries in the CQ
+    fn cq_entries(&self) -> u32 {
+        self.rings.cq_entries()
+    }
+
     /// The SQ head user space sees (the kernel's last published one)
     fn sq_head(&self) -> u32 {
         self.rings.sq_head()
@@ -449,10 +479,17 @@ fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
     Ok(fds)
 }
 
-/// A file to register: none, or a path-only one, is EBADF (Linux
-/// io_sqe_files_register: fget)
+/// A file to register: none, a path-only one or an io_uring is EBADF
+/// (Linux io_sqe_files_register: fget, io_is_uring_fops; a ring in a
+/// ring's table would keep both alive forever)
 fn reg_file(f: Option<Arc<File>>) -> KernelResult<Arc<File>> {
-    f.filter(|f| !f.is_path()).ok_or(KernelError::BadFd)
+    f.filter(|f| !f.is_path() && !is_uring(f))
+        .ok_or(KernelError::BadFd)
+}
+
+/// `f` is an io_uring (Linux io_is_uring_fops)
+pub fn is_uring(f: &File) -> bool {
+    f.f_op.as_any().is::<IoUringFileOps>()
 }
 
 // ============================================================================
@@ -531,6 +568,11 @@ pub fn sys_io_uring_enter(
         let r =
             wait::get_ext_arg(flags, argp, argsz).and_then(|ext| ring.cq_wait(min_complete, &ext));
         if ret == 0 {
+            // Told once: the drop is reported (Linux clears
+            // IO_CHECK_CQ_DROPPED_BIT on returning EBADR)
+            if r == Err(KernelError::BadRequest) {
+                ring.dropped.store(false, Ordering::Release);
+            }
             r?;
         }
     }

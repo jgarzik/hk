@@ -104,6 +104,8 @@ pub enum KernelError {
     NoMessage = 42,
     /// Identifier removed (EIDRM)
     IdentifierRemoved = 43,
+    /// Invalid request descriptor (EBADR)
+    BadRequest = 53,
     /// No data available (ENODATA)
     NoData = 61,
     /// Timer expired (ETIME)
@@ -258,6 +260,7 @@ impl KernelError {
             40 => Self::TooManySymlinks,
             42 => Self::NoMessage,
             43 => Self::IdentifierRemoved,
+            53 => Self::BadRequest,
             61 => Self::NoData,
             64 => Self::NoNetwork,
             71 => Self::ProtocolError,

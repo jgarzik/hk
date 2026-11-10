@@ -37,7 +37,7 @@ pub fn issue(r: &IoRing, s: &mut Submit, sqe: &IoUringSqe) -> Option<KernelResul
         }
         IORING_OP_POLL_ADD => poll_add(r, s, sqe),
         IORING_OP_POLL_REMOVE | IORING_OP_TIMEOUT_REMOVE => remove(r, s, sqe),
-        IORING_OP_TIMEOUT => timeout(s, sqe),
+        IORING_OP_TIMEOUT => timeout(r, s, sqe),
         IORING_OP_ASYNC_CANCEL => cancel(r, s, sqe),
         _ => return net(sqe),
     })
@@ -80,7 +80,7 @@ fn poll_add(r: &IoRing, s: &mut Submit, sqe: &IoUringSqe) -> KernelResult<i32> {
     if ready & wanted != 0 {
         return Ok(i32::from(ready));
     }
-    s.pending.try_push(sqe.user_data)?;
+    s.note_pending(sqe.user_data, r.cq_entries())?;
     Ok(0)
 }
 
@@ -100,7 +100,7 @@ fn remove(r: &IoRing, s: &mut Submit, sqe: &IoUringSqe) -> KernelResult<i32> {
 
 /// IORING_OP_TIMEOUT: noted as pending (no timer arms it: BUGS
 /// "io_uring gaps"); an expired pure timeout is ETIME
-fn timeout(s: &mut Submit, sqe: &IoUringSqe) -> KernelResult<i32> {
+fn timeout(r: &IoRing, s: &mut Submit, sqe: &IoUringSqe) -> KernelResult<i32> {
     if sqe.addr == 0 {
         return Err(KernelError::InvalidArgument);
     }
@@ -127,7 +127,7 @@ fn timeout(s: &mut Submit, sqe: &IoUringSqe) -> KernelResult<i32> {
     if now >= deadline {
         return Err(KernelError::TimerExpired);
     }
-    s.pending.try_push(sqe.user_data)?;
+    s.note_pending(sqe.user_data, r.cq_entries())?;
     Ok(0)
 }
 
