@@ -387,6 +387,9 @@ pub const PRIORITY_IDLE: Priority = 0;
 pub const PRIORITY_LOW: Priority = 64;
 /// Normal priority for regular tasks
 pub const PRIORITY_NORMAL: Priority = 128;
+/// SCHED_NORMAL at nice -20: a kernel thread that must run before
+/// ordinary ones (Linux the workqueue highpri pools, WQ_HIGHPRI)
+pub const PRIORITY_NICE_MIN: Priority = 160;
 /// High priority for important tasks
 pub const PRIORITY_HIGH: Priority = 192;
 /// Realtime priority - preempts everything else

@@ -105,8 +105,7 @@ fn send(q: usize, run: &mut BioList, from_schedule: bool) {
     // they complete), and they are still held
     let q = unsafe { &*(q as *const RequestQueue) };
     match q.mq_arc() {
-        Some(mq) if from_schedule => mq.submit_list_async(run),
-        Some(mq) => mq.submit_list(run),
+        Some(mq) => mq.submit_list(run, from_schedule),
         None => unreachable!("plugged bio for a bio-based queue"),
     }
 }

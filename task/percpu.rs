@@ -3650,14 +3650,18 @@ fn policy_class(policy: i32) -> Class {
 /// A kernel thread's class from its creator's priority hint: the idle
 /// task, the stoppers (Linux sched_set_stop_task, shown as FIFO 99),
 /// SCHED_FIFO 1 for the high ones (`ktimers/N`, as Linux PREEMPT_RT
-/// ktimers), the rest SCHED_NORMAL nice 0
+/// ktimers), SCHED_NORMAL nice -20 for the highpri workqueue workers,
+/// the rest SCHED_NORMAL nice 0
 fn set_kthread_class(se: &sched::SchedEntity, prio: Priority) {
-    use crate::task::{PRIORITY_HIGH, PRIORITY_REALTIME, SCHED_FIFO, SCHED_NORMAL};
+    use crate::task::{
+        PRIORITY_HIGH, PRIORITY_NICE_MIN, PRIORITY_REALTIME, SCHED_FIFO, SCHED_NORMAL,
+    };
     let d = sched::DEFAULT_PRIO;
     match prio {
         PRIORITY_IDLE => se.set_params(Class::Idle, SCHED_NORMAL, d, 0),
         PRIORITY_REALTIME => se.set_params(Class::Stop, SCHED_FIFO, d, 99),
         PRIORITY_HIGH => se.set_params(Class::Rt, SCHED_FIFO, d, 1),
+        PRIORITY_NICE_MIN => se.set_params(Class::Fair, SCHED_NORMAL, d - 20, 0),
         _ => se.set_params(Class::Fair, SCHED_NORMAL, d, 0),
     }
 }

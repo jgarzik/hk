@@ -70,6 +70,9 @@ pub mod work_flags {
     pub const WORK_PENDING: u32 = 1 << 0;
     /// Work is currently executing
     pub const WORK_RUNNING: u32 = 1 << 1;
+    /// Queued again (on any workqueue) while running: the running
+    /// worker runs it once more
+    pub const WORK_RERUN: u32 = 1 << 2;
 }
 
 // ============================================================================
@@ -139,25 +142,52 @@ impl Work {
 
     /// Start running: mark RUNNING, clear PENDING (so the function may
     /// re-queue the item) and hand out the callback
+    ///
+    /// None, with the item marked to run again, if it is running
+    /// already: work is non-reentrant across workqueues (Linux
+    /// find_worker_executing_work sends it to the worker running it),
+    /// and that worker runs it once more
     fn begin_run(&mut self) -> Option<WorkFn> {
-        self.state |= work_flags::WORK_RUNNING;
         self.clear_pending();
+        if self.state & work_flags::WORK_RUNNING != 0 {
+            self.state |= work_flags::WORK_RERUN;
+            return None;
+        }
+        self.state |= work_flags::WORK_RUNNING;
         self.func.take()
     }
 
-    /// Finish a run started with `begin_run`
-    fn end_run(&mut self, func: Option<WorkFn>) {
-        self.func = func;
+    /// Finish one run started with `begin_run`: true if it was queued
+    /// again meanwhile and must run once more (the callback stays out);
+    /// else the callback goes back (never over one already there) and
+    /// the item is idle
+    fn end_run(&mut self, func: &mut Option<WorkFn>) -> bool {
+        if self.state & work_flags::WORK_RERUN != 0 {
+            self.state &= !work_flags::WORK_RERUN;
+            return true;
+        }
+        if self.func.is_none() {
+            self.func = func.take();
+        }
         self.state &= !work_flags::WORK_RUNNING;
+        false
     }
 
-    /// Run the callback of `work` without holding its lock during the call
+    /// Run the callback of `work` without holding its lock during the
+    /// call, again for each queueing during it
     fn run(work: &Mutex<Work>) {
         let mut func = work.lock().begin_run();
-        if let Some(f) = func.as_mut() {
-            f();
+        if func.is_none() {
+            return;
         }
-        work.lock().end_run(func);
+        loop {
+            if let Some(f) = func.as_mut() {
+                f();
+            }
+            if !work.lock().end_run(&mut func) {
+                return;
+            }
+        }
     }
 
     /// Run a promoted delayed work item without holding its lock during
@@ -172,10 +202,17 @@ impl Work {
             }
             g.work.begin_run()
         };
-        if let Some(f) = func.as_mut() {
-            f();
+        if func.is_none() {
+            return;
         }
-        dw.lock().work.end_run(func);
+        loop {
+            if let Some(f) = func.as_mut() {
+                f();
+            }
+            if !dw.lock().work.end_run(&mut func) {
+                return;
+            }
+        }
     }
 }
 
@@ -585,12 +622,20 @@ impl Workqueue {
     /// Start this workqueue's worker kernel thread
     ///
     /// `cpu`: bind the worker to a CPU, or `None` for any (WQ_UNBOUND-like).
+    /// A WQ_HIGHPRI queue's worker runs at nice -20 (Linux the highpri
+    /// worker pools)
     pub fn start(&'static self, cpu: Option<u32>) -> Result<(), crate::util::error::KernelError> {
-        let k = crate::task::kthread::kthread_run(
+        let prio = if self.flags & wq_flags::WQ_HIGHPRI != 0 {
+            crate::task::PRIORITY_NICE_MIN
+        } else {
+            crate::task::PRIORITY_NORMAL
+        };
+        let k = crate::task::kthread::kthread_run_prio(
             self.name,
             worker_thread_fn,
             core::ptr::from_ref::<Workqueue>(self) as usize,
             cpu,
+            prio,
         )?;
         self.inner.lock().worker_tid = k.tid();
         self.mark_initialized();
@@ -669,6 +714,36 @@ mod tests {
 
     fn take_log() -> Vec<u32> {
         core::mem::take(&mut *LOG.lock())
+    }
+
+    /// Queued on another workqueue while it runs: the item is not run
+    /// twice at once there (Linux: non-reentrant), the running worker
+    /// runs it again, and its callback survives for later runs
+    #[test]
+    fn queued_elsewhere_while_running() {
+        use core::sync::atomic::AtomicU32;
+        static RUNS: AtomicU32 = AtomicU32::new(0);
+        static OTHER: Workqueue = Workqueue::new("other", 0);
+        static ME: spin::Once<Arc<Mutex<Work>>> = spin::Once::new();
+        let w = ME.call_once(|| {
+            Arc::new(Mutex::new(Work::new(|| {
+                if RUNS.fetch_add(1, Ordering::Relaxed) == 0 {
+                    // Queued again, elsewhere, while running: that
+                    // queue's worker finds it running
+                    let me = ME.get().unwrap().clone();
+                    assert!(OTHER.queue_work(me));
+                    assert_eq!(OTHER.process_pending(), 1);
+                }
+            })))
+        });
+        let wq = Workqueue::new("test2", 0);
+        assert!(wq.queue_work(w.clone()));
+        wq.process_pending();
+        assert_eq!(RUNS.load(Ordering::Relaxed), 2);
+        // Idle, callback in place: it runs again when queued
+        assert!(wq.queue_work(w.clone()));
+        wq.process_pending();
+        assert_eq!(RUNS.load(Ordering::Relaxed), 3);
     }
 
     /// The intrusive lists in one test (they share LOG): FIFO order, no

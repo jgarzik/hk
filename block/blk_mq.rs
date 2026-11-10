@@ -34,26 +34,30 @@
 //! ## Removal (Linux del_gendisk: blk_queue_start_drain,
 //! blk_mq_freeze_queue_wait; the driver's blk_mq_free_tag_set)
 //!
-//! `start_drain` marks every hardware queue dying under its lock: from
-//! then on nothing reaches `queue_rq` (pending and new bios end with
-//! EIO). `drain` sleeps on `drained` until the requests started before
-//! have completed (each hardware queue counts them under its lock; the
-//! completion that empties a dying queue wakes). `release` then hands
-//! the driver's queue state back to its remove, which stops the device
-//! and frees the rings.
+//! `start_drain` marks every hardware queue dying under its lock and
+//! runs it: from then on nothing reaches `queue_rq`, and every request
+//! not yet started (on a software queue, parked for kblockd, or on the
+//! dispatch list) ends with EIO, as do new ones. `drain` sleeps on
+//! `drained` until every request taken (`get_rq`, counted per hardware
+//! queue until its end: Linux q_usage_counter) has ended; the end that
+//! empties a count wakes. `release` then hands the driver's queue state
+//! back to its remove, which stops the device and frees the rings; a
+//! kblockd run still queued holds the `BlkMq` and finds no driver queue.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::sync::Arc;
 
+use crate::cpu::PerCpu;
 use crate::sync::IrqSpinlock;
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::workqueue::{Work, Workqueue, wq_flags::WQ_HIGHPRI, wq_flags::WQ_MEM_RECLAIM};
+use crate::util::cpumask::NR_CPUS;
 use crate::util::kalloc::try_arc;
-use crate::util::kmem::try_vec;
+use crate::util::kmem::KVec;
 
 use super::blkdev::{Bio, BioFlags, BioList, bio_endio, bio_io_error};
 use crate::util::error::KernelError;
@@ -91,8 +95,6 @@ struct HwState {
     dispatch: BioList,
     /// The driver's queue; None once released
     ops: Option<Box<dyn MqOps>>,
-    /// Started, not yet completed
-    inflight: usize,
     /// The disk is going away: nothing more is started (Linux
     /// QUEUE_FLAG_DYING with the queue frozen)
     dying: bool,
@@ -123,14 +125,8 @@ impl HwState {
             }
         }
         if n > 0 {
-            self.inflight += n;
             ops.commit();
         }
-    }
-
-    /// Dying with nothing in flight
-    fn drained(&self) -> bool {
-        self.dying && self.inflight == 0
     }
 }
 
@@ -160,51 +156,72 @@ pub struct BlkMq {
     /// depth; a NOWAIT bio finding them all taken ends with EAGAIN
     rqs: Vec<AtomicUsize>,
     depth: Vec<usize>,
-    /// Hardware queue runs handed to kblockd, and its work item (Linux
-    /// blk_mq_run_hw_queue(hctx, async): the hctx run_work)
-    kick: Arc<Mutex<Kick>>,
-    kick_work: Arc<Mutex<Work>>,
+    /// Per hardware queue, its kblockd run (Linux hctx->run_work)
+    runs: Vec<HctxRun>,
+    /// `start_drain` was called: the request that brings a hardware
+    /// queue's count to 0 wakes `drained` (set once)
+    dying: AtomicBool,
 }
 
-/// The block layer's workqueue (Linux kblockd_workqueue)
-pub static KBLOCKD: Workqueue = Workqueue::new("kblockd", WQ_MEM_RECLAIM | WQ_HIGHPRI);
+/// The block layer's workqueues: one worker per CPU, high priority
+/// (Linux kblockd_workqueue: per-CPU, WQ_MEM_RECLAIM | WQ_HIGHPRI, the
+/// highpri pool's nice -20 workers)
+static KBLOCKD: PerCpu<Workqueue> =
+    crate::percpu![Workqueue::new("kblockd", WQ_MEM_RECLAIM | WQ_HIGHPRI)];
 
-/// Start kblockd (Linux blk_dev_init); before any disk
+/// Start each CPU's kblockd worker, bound to it (Linux blk_dev_init);
+/// before any disk
 pub fn kblockd_init() {
-    if let Err(e) = KBLOCKD.start(None) {
-        crate::printkln!("blk-mq: no kblockd ({:?}): queue runs stay synchronous", e);
+    for cpu in 0..crate::cpu::nr_cpu_ids() {
+        if !crate::task::percpu::cpu_has_scheduler(cpu) {
+            continue;
+        }
+        if let Err(e) = KBLOCKD.get(cpu).start(Some(cpu)) {
+            crate::printkln!("blk-mq: no kblockd on CPU {} ({:?})", cpu, e);
+        }
     }
 }
 
-/// Hardware queues kblockd is to run, and the queues they belong to
-/// while any is marked (the work holds them until it has run)
-struct Kick {
-    mq: Option<Arc<BlkMq>>,
-    hctxs: Vec<bool>,
+/// CPU `cpu`'s kblockd, once its worker runs
+fn kblockd(cpu: u32) -> Option<&'static Workqueue> {
+    let wq = KBLOCKD.try_get(cpu)?;
+    wq.is_initialized().then_some(wq)
 }
 
-/// kblockd: run each marked hardware queue (Linux blk_mq_run_work_fn)
-fn kick_run(k: &Mutex<Kick>) {
-    loop {
-        let (mq, h) = {
-            let mut s = k.lock();
-            match s.hctxs.iter().position(|&m| m) {
-                Some(h) => {
-                    s.hctxs[h] = false;
-                    (s.mq.clone(), h)
-                }
-                None => {
-                    // Dropped unlocked: it may be the queues' last hold
-                    let mq = s.mq.take();
-                    drop(s);
-                    drop(mq);
-                    return;
-                }
+/// A hardware queue's kblockd run: the work item, and a hold on the
+/// queues while it is queued (the work drops it after the run)
+struct HctxRun {
+    work: Arc<Mutex<Work>>,
+    hold: Arc<Mutex<Option<Arc<BlkMq>>>>,
+}
+
+impl HctxRun {
+    fn new(h: usize) -> Result<Self, KernelError> {
+        let hold: Arc<Mutex<Option<Arc<BlkMq>>>> = try_arc(Mutex::new(None))?;
+        let k = hold.clone();
+        let work = try_arc(Mutex::new(Work::new(move || {
+            // Taken under the lock, run and dropped unlocked: it may be
+            // the queues' last hold
+            let mq = k.lock().take();
+            if let Some(mq) = mq {
+                mq.run(h);
             }
-        };
-        if let Some(mq) = mq {
-            mq.run(h);
-        }
+        })))?;
+        Ok(Self { work, hold })
+    }
+}
+
+/// A set of hardware queues (at most one per CPU)
+#[derive(Default)]
+struct HctxSet([u64; NR_CPUS.div_ceil(64)]);
+
+impl HctxSet {
+    fn add(&mut self, h: usize) {
+        self.0[h / 64] |= 1 << (h % 64);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..NR_CPUS).filter(|&h| self.0[h / 64] & (1 << (h % 64)) != 0)
     }
 }
 
@@ -217,15 +234,13 @@ impl BlkMq {
         }
         let n = crate::cpu::nr_cpu_ids() as usize;
         let words = n.div_ceil(ops.len()).div_ceil(64);
-        let kick = try_arc(Mutex::new(Kick {
-            mq: None,
-            hctxs: try_vec(ops.len(), false)?,
-        }))?;
-        let k = kick.clone();
-        let kick_work = try_arc(Mutex::new(Work::new(move || kick_run(&k))))?;
+        let mut runs = KVec::try_with_capacity(ops.len())?;
+        for h in 0..ops.len() {
+            runs.try_push(HctxRun::new(h)?)?;
+        }
         Ok(Self {
-            kick,
-            kick_work,
+            runs: runs.into_vec(),
+            dying: AtomicBool::new(false),
             rqs: ops.iter().map(|_| AtomicUsize::new(0)).collect(),
             depth: ops.iter().map(|o| o.depth().max(1)).collect(),
             ctxs: (0..n).map(|_| IrqSpinlock::new(BioList::new())).collect(),
@@ -238,7 +253,6 @@ impl BlkMq {
                     IrqSpinlock::new(HwState {
                         dispatch: BioList::new(),
                         ops: Some(ops),
-                        inflight: 0,
                         dying: false,
                     })
                 })
@@ -295,89 +309,88 @@ impl BlkMq {
         true
     }
 
-    /// `n` requests of hardware queue `h` ended
+    /// `n` requests of hardware queue `h` ended; the last of a dying
+    /// queue wakes `drain`
     fn put_rqs(&self, h: usize, n: usize) {
         if n > 0 {
-            let was = self.rqs[h].fetch_sub(n, Ordering::Relaxed);
+            let was = self.rqs[h].fetch_sub(n, Ordering::AcqRel);
             debug_assert!(
                 was >= n,
                 "hardware queue {h}: {n} requests ended, {was} taken"
             );
+            if was == n && self.dying.load(Ordering::Acquire) {
+                self.drained.wake_all();
+            }
         }
     }
 
     /// Take a request and queue it (from thread context, or from a
     /// completion with no queue lock held: a FUA write's data and its
     /// flush); a NOWAIT bio with no free tag ends with EAGAIN
-    pub fn submit(&self, mut bio: Box<Bio>) {
+    pub fn submit(self: &Arc<Self>, mut bio: Box<Bio>) {
         if !self.get_rq(&mut bio) {
             return bio_io_error(bio, KernelError::WouldBlock);
         }
         let mut l = BioList::new();
         l.push(bio);
-        self.submit_list(&mut l);
+        self.submit_list(&mut l, false);
     }
 
     /// Queue the requests of `l` (taken by `get_rq`; a plug's, Linux
-    /// blk_mq_flush_plug_list), each on its software queue, and run
-    /// their hardware queues once each run: one dispatch, one notify of
-    /// the device for the lot (Linux queue_rqs / commit_rqs)
-    pub fn submit_list(&self, l: &mut BioList) {
+    /// blk_mq_flush_plug_list), each on its software queue, then run
+    /// each hardware queue they reach once: one dispatch, one notify of
+    /// the device for the lot (Linux queue_rqs / commit_rqs). From a
+    /// task about to sleep (`from_schedule`) kblockd runs them, so
+    /// nothing is dispatched or ended inside `schedule()`
+    pub fn submit_list(self: &Arc<Self>, l: &mut BioList, from_schedule: bool) {
+        for h in self.insert(l).iter() {
+            if from_schedule {
+                self.run_async(h);
+            } else {
+                self.run(h);
+            }
+        }
+    }
+
+    /// Put the requests of `l` on their software queues: the hardware
+    /// queues they reach
+    fn insert(&self, l: &mut BioList) -> HctxSet {
+        let mut set = HctxSet::default();
         while let Some(first) = l.pop() {
             let cpu = usize::from(first.rq_ctx) % self.ctxs.len();
             let h = self.map(cpu);
             let (w, bit) = self.ctx_bit(cpu);
-            {
-                let mut ctx = self.ctxs[cpu].lock();
-                ctx.push(first);
-                while l.first_ctx() == Some(cpu) {
-                    if let Some(b) = l.pop() {
-                        ctx.push(b);
-                    }
+            let mut ctx = self.ctxs[cpu].lock();
+            ctx.push(first);
+            while l.first_ctx() == Some(cpu) {
+                if let Some(b) = l.pop() {
+                    ctx.push(b);
                 }
-                self.ctx_maps[h][w].fetch_or(bit, Ordering::Relaxed);
             }
-            self.run(h);
+            self.ctx_maps[h][w].fetch_or(bit, Ordering::Relaxed);
+            set.add(h);
         }
+        set
     }
 
-    /// `submit_list` from a task about to sleep (Linux
-    /// blk_mq_flush_plug_list from_schedule): the requests go on their
-    /// software queues, and kblockd runs the hardware queues, so nothing
-    /// is dispatched or ended inside `schedule()`
-    pub fn submit_list_async(self: &Arc<Self>, l: &mut BioList) {
-        while let Some(first) = l.pop() {
-            let cpu = usize::from(first.rq_ctx) % self.ctxs.len();
-            let h = self.map(cpu);
-            let (w, bit) = self.ctx_bit(cpu);
-            {
-                let mut ctx = self.ctxs[cpu].lock();
-                ctx.push(first);
-                while l.first_ctx() == Some(cpu) {
-                    if let Some(b) = l.pop() {
-                        ctx.push(b);
-                    }
-                }
-                self.ctx_maps[h][w].fetch_or(bit, Ordering::Relaxed);
-            }
-            self.run_async(h);
-        }
-    }
-
-    /// Have kblockd run hardware queue `h` (Linux blk_mq_run_hw_queue
-    /// with async); synchronously if kblockd is not running
+    /// Have kblockd run hardware queue `h` on the first CPU it serves,
+    /// always the same one (Linux blk_mq_run_hw_queue async,
+    /// kblockd_mod_delayed_work_on with blk_mq_hctx_next_cpu, which
+    /// stays on a CPU for a batch); synchronously if that kblockd is not
+    /// running
     fn run_async(self: &Arc<Self>, h: usize) {
-        if !KBLOCKD.is_initialized() {
+        let (n, g) = self.groups();
+        let Some(wq) = kblockd(first_cpu(h as u32, n, g)) else {
             return self.run(h);
-        }
+        };
+        let r = &self.runs[h];
         {
-            let mut s = self.kick.lock();
-            s.hctxs[h] = true;
-            if s.mq.is_none() {
-                s.mq = Some(self.clone());
+            let mut hold = r.hold.lock();
+            if hold.is_none() {
+                *hold = Some(self.clone());
             }
         }
-        KBLOCKD.queue_work(self.kick_work.clone());
+        wq.queue_work(r.work.clone());
     }
 
     /// The hardware queue this CPU submits to
@@ -416,7 +429,7 @@ impl BlkMq {
     /// end finished bios and restart dispatch into the freed room
     pub fn complete(&self, h: usize) {
         let mut done = BioList::new();
-        let wake = {
+        {
             let mut hw = self.hctxs[h].lock();
             let hw = &mut *hw;
             let Some(ops) = hw.ops.as_mut() else { return };
@@ -427,17 +440,12 @@ impl BlkMq {
                 done.push(b);
                 n += 1;
             }
-            hw.inflight = hw.inflight.saturating_sub(n);
             if n > 0 {
                 hw.dispatch(&mut done);
             }
-            n > 0 && hw.drained()
         };
         let n = end_all(&mut done);
         self.put_rqs(h, n);
-        if wake {
-            self.drained.wake_all();
-        }
     }
 
     /// Reap every hardware queue (polled completion before interrupts
@@ -448,26 +456,27 @@ impl BlkMq {
         }
     }
 
-    /// Start nothing more: bios not yet started end with EIO (Linux
-    /// blk_queue_start_drain on a dead disk)
+    /// Start nothing more: requests not yet started, on a software
+    /// queue (parked for kblockd too) or the dispatch list, end with
+    /// EIO (Linux blk_queue_start_drain on a dead disk)
     pub fn start_drain(&self) {
+        self.dying.store(true, Ordering::Release);
         for (h, hctx) in self.hctxs.iter().enumerate() {
-            let mut failed = BioList::new();
-            {
-                let mut hw = hctx.lock();
-                hw.dying = true;
-                hw.dispatch(&mut failed);
-            }
-            let n = end_all(&mut failed);
-            self.put_rqs(h, n);
+            hctx.lock().dying = true;
+            self.run(h);
         }
     }
 
-    /// Sleep until the requests started before `start_drain` have
-    /// completed (Linux blk_mq_freeze_queue_wait). Thread context.
+    /// No request taken is left: every one from `get_rq` has ended
+    fn idle(&self) -> bool {
+        self.rqs.iter().all(|n| n.load(Ordering::Acquire) == 0)
+    }
+
+    /// Sleep until every request taken has ended, started or not
+    /// (Linux blk_mq_freeze_queue_wait on q_usage_counter, taken in
+    /// submit_bio and dropped at the request's end). Thread context.
     pub fn drain(&self) {
-        self.drained
-            .wait_event(|| self.hctxs.iter().all(|h| h.lock().drained()));
+        self.drained.wait_event(|| self.idle());
     }
 
     /// Hand the driver's queue state back after `drain`, for its
@@ -525,5 +534,38 @@ mod tests {
         assert!(!mq.get_rq(&mut bio(true)));
         mq.put_rqs(0, 1);
         assert!(mq.get_rq(&mut bio(true)));
+    }
+
+    /// A request parked on its software queue (as for kblockd) and one
+    /// the driver refused (on the dispatch list) both count until they
+    /// end: draining fails them with EIO and only then finds the queue
+    /// idle (Linux freezes on q_usage_counter, taken in submit_bio)
+    #[test]
+    fn drain_waits_for_parked_requests() {
+        use core::sync::atomic::AtomicU32;
+        static EIO: AtomicU32 = AtomicU32::new(0);
+        fn done(b: Box<Bio>) {
+            if b.status == Err(KernelError::Io) {
+                EIO.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let mq = Arc::new(BlkMq::new(alloc::vec![Box::new(Full) as Box<dyn MqOps>]).unwrap());
+        let mut l = BioList::new();
+        for _ in 0..2 {
+            let mut b = bio(false);
+            b.end_io = Some(done);
+            assert!(mq.get_rq(&mut b));
+            l.push(b);
+        }
+        // One run reaches the driver (which refuses it), one stays parked
+        let mut first = BioList::new();
+        first.push(l.pop().unwrap());
+        mq.submit_list(&mut first, false);
+        let _ = mq.insert(&mut l);
+        assert!(!mq.idle());
+        mq.start_drain();
+        assert!(mq.idle());
+        assert_eq!(EIO.load(Ordering::Relaxed), 2);
+        mq.drain();
     }
 }
