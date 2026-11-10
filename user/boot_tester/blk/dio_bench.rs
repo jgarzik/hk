@@ -1,9 +1,10 @@
 //! Direct vs buffered read throughput on vda3, printed only (never a
 //! verdict): 1 MiB sequential reads and 4 KiB random reads at queue
 //! depth 1, the cache dropped (BLKFLSBUF) before each buffered run.
-//! `DIO_BENCH:` lines, to compare hk with Linux on the same QEMU.
+//! `DIO_BENCH:` lines, to compare hk with Linux on the same QEMU. Only
+//! when the kernel command line has `hk.bench` (`make check BENCH=1`).
 
-use crate::helpers::{find_blkdev, print, print_num, println};
+use crate::helpers::{find_blkdev, print, print_num, println, read_file};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, O_RDONLY, PROT_READ, PROT_WRITE, Timespec, sys_clock_gettime,
     sys_close, sys_ioctl, sys_mmap, sys_munmap, sys_open, sys_pread64,
@@ -18,7 +19,19 @@ const SEQ: u64 = 8 * MIB;
 /// Random 4 KiB reads per run
 const RAND: u64 = 512;
 
+/// The kernel command line asks for benchmarks
+fn wanted() -> bool {
+    let mut b = [0u8; 2048];
+    let n = read_file(b"/proc/cmdline\0", &mut b);
+    let line = &b[..n.max(0) as usize];
+    line.split(|c| c.is_ascii_whitespace())
+        .any(|w| w == b"hk.bench")
+}
+
 pub fn run_tests() {
+    if !wanted() {
+        return;
+    }
     let Some(p3) = find_blkdev(b"vd", 16384) else {
         println(b"DIO_BENCH: no vda3");
         return;
