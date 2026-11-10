@@ -9,6 +9,9 @@
 //! - IO_URING_DIO_CUR_POS: offset -1 reads at the file position, which a
 //!   request that went asynchronous does not move (Linux kiocb_done:
 //!   REQ_F_CUR_POS only for an inline completion)
+//! - IO_URING_DIO_HIPRI: RWF_HIPRI on a ring without IORING_SETUP_IOPOLL
+//!   is EINVAL (Linux io_rw_init_file: polled I/O only on an IOPOLL
+//!   ring)
 //!
 //! Reads use vda3's untouched first 7 MiB; writes 13..14 MiB.
 
@@ -29,10 +32,11 @@ pub fn run_tests() {
         report_r(b"IO_URING_DIO", check(b"no vda3", false, 0));
         return;
     };
-    let cases: [(&[u8], fn(&BlkDev) -> R); 3] = [
+    let cases: [(&[u8], fn(&BlkDev) -> R); 4] = [
         (b"IO_URING_DIO_ASYNC", async_reads),
         (b"IO_URING_DIO_WRITE", writes),
         (b"IO_URING_DIO_CUR_POS", cur_pos),
+        (b"IO_URING_DIO_HIPRI", hipri),
     ];
     for (name, t) in cases {
         report_r(name, t(&p3));
@@ -240,5 +244,20 @@ fn cur_pos(d: &BlkDev) -> R {
         check(b"data", is_pat(b.bytes(0, 4096), 65536), 0)?;
         let p = sys_lseek(fd, 0, SEEK_CUR);
         check(b"position", p == 65536, p)
+    })
+}
+
+fn hipri(d: &BlkDev) -> R {
+    with_fd(d, O_RDONLY | O_DIRECT, |fd| {
+        let mut r = Ring::simple(4).map_err(|e| (&b"ring"[..], e))?;
+        let b = Buf::new(4096)?;
+        let mut s = sqe(IORING_OP_READ, fd, b.addr(0), 4096, 0, 1);
+        // RWF_HIPRI
+        s.op_flags = 1;
+        r.push(s);
+        let n = r.submit_wait(1, 1);
+        check(b"enter", n == 1, n)?;
+        let c = r.pop().ok_or((&b"no cqe"[..], 0))?;
+        check(b"res", c.res == -22, i64::from(c.res))
     })
 }

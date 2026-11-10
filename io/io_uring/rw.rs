@@ -112,6 +112,10 @@ pub fn rw(
             return Some(Err(KernelError::OperationNotSupported));
         }
         flags |= RwFlags::HIPRI;
+    } else if flags.contains(RwFlags::HIPRI) {
+        // Polled I/O only on an IOPOLL ring (Linux io_rw_init_file:
+        // IOCB_HIPRI without IORING_SETUP_IOPOLL is EINVAL)
+        return Some(Err(KernelError::InvalidArgument));
     }
     let len = crate::fs::io::seg_len(&segs);
     if inline || len == 0 || !async_ok(&file) {
@@ -316,6 +320,8 @@ impl Req {
         self.nowait_issue.store(nowait, Ordering::Relaxed);
         let mut flags = self.flags;
         flags.set(RwFlags::NOWAIT, nowait || self.rwf_nowait);
+        // Polled only where GETEVENTS polls: an IOPOLL ring
+        flags.set(RwFlags::HIPRI, self.ring.iopoll);
         let io: Arc<dyn AsyncIo> = self.clone();
         self.file
             .f_op
