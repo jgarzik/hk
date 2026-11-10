@@ -1173,15 +1173,15 @@ fn mprotect_fixup(
     }
     let vma = mm.get_vma_mut(idx).ok_or(KernelError::OutOfMemory)?;
     vma.prot = prot;
-    // A dirty-tracked shared file mapping is written only after a write
-    // fault (which dirties the page): not made writable here
-    let (s, e, shared) = (
-        vma.start,
-        vma.end,
-        vma.is_shared() && !vma.wants_writenotify(),
-    );
+    use super::mprotect::WriteUpgrade;
+    let up = match (vma.is_shared(), vma.wants_writenotify()) {
+        (true, false) => WriteUpgrade::Shared,
+        (true, true) => WriteUpgrade::Dirty,
+        (false, _) => WriteUpgrade::Private,
+    };
+    let (s, e) = (vma.start, vma.end);
     let t = super::pgtable::PgTables::new(owner, mm);
-    super::mprotect::change_protection(owner, t, s, e, prot, shared);
+    super::mprotect::change_protection(owner, t, s, e, prot, up);
     Ok((idx, e))
 }
 

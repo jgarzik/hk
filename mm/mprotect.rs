@@ -55,11 +55,18 @@ pub fn split_huge(
 /// `mm`, after `split_huge`: a 2MB page left whole is changed in place,
 /// every mapped 4KB entry rewritten under its table's PTE lock. The
 /// caller flushes the TLB of the range.
-pub fn change_protection(mm: &Mm, t: PgTables<'_>, start: u64, end: u64, prot: u32, shared: bool) {
+pub fn change_protection(
+    mm: &Mm,
+    t: PgTables<'_>,
+    start: u64,
+    end: u64,
+    prot: u32,
+    up: WriteUpgrade,
+) {
     struct Change<'a> {
         mm: &'a Mm,
         prot: u32,
-        shared: bool,
+        up: WriteUpgrade,
     }
     impl PteWalk for Change<'_> {
         type Err = core::convert::Infallible;
@@ -74,11 +81,30 @@ pub fn change_protection(mm: &Mm, t: PgTables<'_>, start: u64, end: u64, prot: u
             Ok(true)
         }
         fn pte(&mut self, e: &AtomicU64, _: u64) -> Result<(), Self::Err> {
-            change_pte(e, self.prot, self.shared);
+            change_pte(e, self.prot, self.up);
             Ok(())
         }
     }
-    let _ = walk_pte_range(t, start, end, &mut Change { mm, prot, shared });
+    let _ = walk_pte_range(t, start, end, &mut Change { mm, prot, up });
+}
+
+/// Which entries a protection change with PROT_WRITE makes writable
+/// (Linux can_change_pte_writable)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WriteUpgrade {
+    /// A shared mapping that tracks no dirtying (tmpfs, ramfs, anonymous
+    /// shared memory): every entry
+    Shared,
+    /// A shared mapping that tracks dirtying (Linux
+    /// vma_wants_writenotify): only an entry already writable, whose
+    /// page is dirty (hk dirties a shared file page whenever it maps it
+    /// writable, so that is Linux's pte_dirty); a clean one stays
+    /// read-only and its first write faults and dirties the page
+    Dirty,
+    /// A private mapping: a page no one else maps, or the mapping's own
+    /// (pinned) one (PageAnonExclusive); one still shared is copied at
+    /// its write fault
+    Private,
 }
 
 /// A 2MB page at `phys` becomes executable: instruction caches see its
@@ -89,11 +115,8 @@ pub(super) fn sync_huge(phys: u64) {
 }
 
 /// Rewrite the entry `pte` for `prot` if it maps a page, its PTE lock
-/// held. A
-/// private page becomes writable only if no one else maps it, or it is
-/// the mapping's own (pinned) page (Linux can_change_pte_writable:
-/// PageAnonExclusive); one still shared is copied at its write fault.
-fn change_pte(pte: &AtomicU64, prot: u32, shared: bool) {
+/// held; writable as `up` allows
+fn change_pte(pte: &AtomicU64, prot: u32, up: WriteUpgrade) {
     let old = pte.load(Ordering::Acquire);
     if !paging::pte_present(old) {
         return; // none, or a swap entry: the fault uses the VMA's prot
@@ -103,7 +126,11 @@ fn change_pte(pte: &AtomicU64, prot: u32, shared: bool) {
         paging::sync_page(paging::pte_addr(old), true);
     }
     let phys = paging::pte_addr(old);
-    let write = shared || FRAME_ALLOCATOR.refcount(phys) <= 1 || super::page::reusable(phys);
+    let write = match up {
+        WriteUpgrade::Shared => true,
+        WriteUpgrade::Dirty => paging::pte_write(old),
+        WriteUpgrade::Private => FRAME_ALLOCATOR.refcount(phys) <= 1 || super::page::reusable(phys),
+    };
     // Write implies read (x86, arm64): a page left read-only keeps it
     let prot = if write || prot & PROT_WRITE == 0 {
         prot

@@ -7,4 +7,5 @@ pub mod dio_pin;
 pub mod dioalign;
 pub mod disk;
 pub mod dsync;
+pub mod mmap_dirty;
 pub mod odirect;

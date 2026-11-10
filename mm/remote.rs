@@ -221,7 +221,42 @@ fn write_page(
         )
         .map_err(|_| KernelError::OutOfMemory)?;
     }
+    if vma.wants_writenotify() {
+        return write_tracked(mm, t, vma, addr, buf);
+    }
     write_frame(mm, t, addr, buf, !vma.is_shared())
+}
+
+/// `write_frame` into a shared mapping that tracks dirtying: the page is
+/// dirtied after, under its page lock (Linux __access_remote_vm:
+/// set_page_dirty_lock), since its entry may be read-only and clean
+fn write_tracked(
+    mm: &Mm,
+    t: PgTables<'_>,
+    vma: &Vma,
+    addr: u64,
+    buf: &[u8],
+) -> Result<Wrote, KernelError> {
+    let mut page = None;
+    let r = with_frame(mm, t, addr, |phys| {
+        let r = copy_to_frame(phys, buf);
+        let p = phys & !(PAGE_SIZE - 1);
+        if r.is_ok() && crate::FRAME_ALLOCATOR.incref(p) {
+            page = Some(p);
+        }
+        r
+    })
+    .unwrap_or(Ok(Wrote::Absent));
+    if let Some(p) = page {
+        if let Some(inode) = vma.inode() {
+            crate::mm::page::lock_page(p);
+            crate::mm::filemap::dirty_page(&inode.i_data, p);
+            crate::mm::page::unlock_page(p);
+            crate::fs::fs_writeback::mark_inode_dirty(&inode);
+        }
+        crate::mm::filemap::put_page(p);
+    }
+    r
 }
 
 /// The byte of page `addr` a 4KB entry maps, also when it is PROT_NONE
