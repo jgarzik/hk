@@ -2138,6 +2138,9 @@ pub struct CloneConfig {
     /// `set_tid_size` levels of its pid namespace, its own first
     pub set_tid: [u32; crate::ns::pid::MAX_PID_NS_LEVEL as usize],
     pub set_tid_size: usize,
+    /// An io thread (`create_io_thread`): the child runs this in the
+    /// kernel instead of returning to user mode
+    pub io_thread: Option<crate::task::IoThreadFn>,
 }
 
 impl CloneConfig {
@@ -2194,7 +2197,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Validate: CLONE_VM requires child_stack UNLESS CLONE_VFORK is also set
     // (vfork shares parent's stack with the child)
-    if config.flags & CLONE_VM != 0 && config.child_stack == 0 && config.flags & CLONE_VFORK == 0 {
+    if config.flags & CLONE_VM != 0
+        && config.child_stack == 0
+        && config.flags & CLONE_VFORK == 0
+        && config.io_thread.is_none()
+    {
         return Err(KernelError::InvalidArgument);
     }
 
@@ -2421,7 +2428,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // the TrapFrame and the saved FP state
     // SAFETY: the child's TrapFrame, on its new kernel stack (not run)
     let frame_top = unsafe { CurrentArch::clone_child_fpu(trapframe_ptr) };
-    let context = CurrentArch::new_clone_child_context(frame_top);
+    // An io thread starts in the kernel, at its function (Linux
+    // copy_thread with args->fn); a user one returns to user mode
+    let context = if config.io_thread.is_some() {
+        CurrentArch::new_kernel_thread_context(io_thread_entry as *const () as usize, kstack_top)
+    } else {
+        CurrentArch::new_clone_child_context(frame_top)
+    };
 
     // Determine child's parent PID
     // CLONE_PARENT or CLONE_THREAD: child becomes sibling (same parent as caller)
@@ -2710,6 +2723,19 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Only a fully set up child becomes runnable (Linux: wake_up_new_task
     // at the end of kernel_clone); before this it has no mm, files or
     // signal state to run with
+    // An io thread: its function, PF_IO_WORKER, every signal but
+    // SIGKILL and SIGSTOP blocked (Linux copy_process with io_thread)
+    if let Some(f) = config.io_thread {
+        child_task.io_thread.call_once(|| f);
+        child_task.set_flag(crate::task::pf::IO_WORKER);
+        let mut keep = crate::signal::SigSet::new();
+        keep.add(crate::signal::SIGKILL);
+        keep.add(crate::signal::SIGSTOP);
+        child_task.sig.lock().blocked = crate::signal::SigSet::from_bits(!keep.bits());
+        let mut name = [0u8; 16];
+        io_thread_name(&mut name, current_tid);
+        child_task.task_lock().set_comm(name);
+    }
     wake_up_new_task(&child_task);
 
     // CLONE_VFORK: parent sleeps until the child exec()s or _exit()s
@@ -2751,6 +2777,76 @@ fn close_pidfd(fd: i32) {
     if let Some(files) = current().files() {
         // Released after the table lock (FilesGuard)
         files.lock().close(fd);
+    }
+}
+
+/// Start a thread of the current task's process that runs `f(arg)` in
+/// the kernel and never returns to user mode (Linux create_io_thread):
+/// it shares the mm, files, fs context, signal handlers and I/O context
+/// (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+/// CLONE_IO, untraced), is PF_IO_WORKER (no ptrace attach), blocks every
+/// signal but SIGKILL and SIGSTOP, shows as `iou-wrk-<creator tid>` in
+/// /proc, and exits when `f` returns
+pub fn create_io_thread(
+    f: fn(Arc<dyn core::any::Any + Send + Sync>),
+    arg: Arc<dyn core::any::Any + Send + Sync>,
+) -> KernelResult<Tid> {
+    use crate::task::clone_flags::*;
+    let config = CloneConfig {
+        flags: CLONE_VM
+            | CLONE_FS
+            | CLONE_FILES
+            | CLONE_SIGHAND
+            | CLONE_THREAD
+            | CLONE_IO
+            | CLONE_UNTRACED,
+        child_stack: 0,
+        parent_tidptr: 0,
+        child_tidptr: 0,
+        tls: 0,
+        pidfd_ptr: 0,
+        exit_signal: crate::signal::ExitSignal::NONE,
+        cgroup_fd: -1,
+        set_tid: CloneConfig::NO_SET_TID,
+        set_tid_size: 0,
+        io_thread: Some((f, arg)),
+    };
+    let mut fa = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
+    do_clone(config, &mut fa)
+}
+
+/// First code an io thread runs: its function, then a thread exit
+extern "C" fn io_thread_entry() -> ! {
+    // The switch that started it left interrupts disabled
+    CurrentArch::enable_interrupts();
+    let work = current().io_thread.get().cloned();
+    if let Some((f, arg)) = work {
+        f(arg);
+    }
+    crate::task::proc::do_exit(0)
+}
+
+/// "iou-wrk-<tid>" (Linux io_wq_worker: "iou-wrk-%d"), cut to 15 bytes
+fn io_thread_name(out: &mut [u8; 16], tid: Tid) {
+    let mut n = 0;
+    for &c in b"iou-wrk-" {
+        out[n] = c;
+        n += 1;
+    }
+    let mut digits = [0u8; 20];
+    let (mut v, mut k) = (tid, 0);
+    loop {
+        digits[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while k > 0 && n < 15 {
+        k -= 1;
+        out[n] = digits[k];
+        n += 1;
     }
 }
 

@@ -897,6 +897,9 @@ pub mod pf {
     pub const FORKNOEXEC: u32 = 0x0000_0040;
     /// Kernel thread (Linux PF_KTHREAD)
     pub const KTHREAD: u32 = 0x0020_0000;
+    /// An io thread (`create_io_thread`, Linux PF_IO_WORKER): a thread of
+    /// a user process that never returns to user mode; no ptrace attach
+    pub const IO_WORKER: u32 = 0x0000_0010;
     /// Used a capability (Linux PF_SUPERPRIV, set by ns_capable_common;
     /// not inherited by fork): the process accounting ASU flag
     pub const SUPERPRIV: u32 = 0x0000_0100;
@@ -904,6 +907,12 @@ pub mod pf {
     /// PF_NO_SETAFFINITY): every hk kernel thread is bound to its CPU
     pub const NO_SETAFFINITY: u32 = 0x0400_0000;
 }
+
+/// An io thread's function and its argument (`percpu::create_io_thread`)
+pub type IoThreadFn = (
+    fn(Arc<dyn core::any::Any + Send + Sync>),
+    Arc<dyn core::any::Any + Send + Sync>,
+);
 
 /// Thread flags (Linux TIF_*, `Task.thread_flags`): work to do on the way
 /// back to user mode, set by anyone, consumed by the task
@@ -1039,6 +1048,9 @@ pub struct Task {
     /// Callbacks queued to run in this task's context (Linux
     /// task_works; `task_work`)
     pub task_works: task_work::TaskWorks,
+    /// An io thread's function and argument (`create_io_thread`), set
+    /// before it runs
+    pub io_thread: spin::Once<IoThreadFn>,
     /// Its io_uring context, made by its first submission (Linux
     /// task->io_uring)
     pub io_uring: spin::Once<Arc<crate::io::io_uring::Tctx>>,
@@ -1787,6 +1799,7 @@ impl Task {
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
             task_works: task_work::TaskWorks::new(),
+            io_thread: spin::Once::new(),
             io_uring: spin::Once::new(),
             vfork_done: AtomicPtr::new(core::ptr::null_mut()),
             wake_q: AtomicPtr::new(core::ptr::null_mut()),
@@ -1856,6 +1869,7 @@ impl Task {
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
             task_works: task_work::TaskWorks::new(),
+            io_thread: spin::Once::new(),
             io_uring: spin::Once::new(),
             vfork_done: AtomicPtr::new(core::ptr::null_mut()),
             wake_q: AtomicPtr::new(core::ptr::null_mut()),
