@@ -442,11 +442,13 @@ pub struct InodeAttr {
     pub ctime: Timespec,
     /// Preferred I/O size (Linux kstat.blksize)
     pub blksize: u32,
+    /// 512-byte blocks allocated (Linux kstat.blocks)
+    pub blocks: u64,
 }
 
 /// The attributes as the inode holds them (Linux generic_fillattr);
 /// timestamps read lock-free. The block size is the page size, every hk
-/// file system's i_blocksize.
+/// file system's i_blocksize; the blocks are the size's.
 pub fn generic_fillattr(inode: &Inode) -> InodeAttr {
     InodeAttr {
         ino: inode.ino,
@@ -460,6 +462,8 @@ pub fn generic_fillattr(inode: &Inode) -> InodeAttr {
         mtime: inode.mtime(),
         ctime: inode.ctime(),
         blksize: crate::mm::PAGE_SIZE as u32,
+        // No hk file system keeps i_blocks: the size's 512-byte blocks
+        blocks: inode.get_size().div_ceil(512),
     }
 }
 

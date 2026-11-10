@@ -16,8 +16,8 @@ use crate::harness::{R, check, report_r};
 use crate::helpers::{BlkDev, find_blkdev};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, Stat, sys_close,
-    sys_fstat, sys_fsync, sys_ftruncate, sys_mkdir, sys_mmap, sys_mount, sys_munmap, sys_open,
-    sys_pread64, sys_pwrite64, sys_rmdir, sys_umount2, sys_unlink,
+    sys_fallocate, sys_fstat, sys_fsync, sys_ftruncate, sys_mkdir, sys_mmap, sys_mount, sys_munmap,
+    sys_open, sys_pread64, sys_pwrite64, sys_rmdir, sys_umount2, sys_unlink,
 };
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
@@ -52,6 +52,7 @@ pub fn run_tests() {
     report_r(b"VFAT_DIO_READ_DISK", read_disk(&p1));
     report_r(b"VFAT_DIO_FRAG", frag(&p1));
     report_r(b"VFAT_DIO_EOF_TAIL", eof_tail());
+    report_r(b"VFAT_WRITE_SHORT", write_short());
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
 }
@@ -459,4 +460,34 @@ fn eof_tail() -> R {
     })();
     sys_unlink(path(b"TAIL.BIN", &mut [0; 64]));
     r
+}
+
+/// A write that faults partway inside the file keeps the clusters
+/// fallocate gave past the end (Linux fat_write_failed acts only for a
+/// write past the size)
+fn write_short() -> R {
+    const KEEP_SIZE: i32 = 1;
+    let b = Buf::new(2 * 4096)?;
+    b.bytes(0, 8192).fill(b'S');
+    put(b"SHORT.BIN", b.bytes(0, 8192))?;
+    let fd = open(b"SHORT.BIN", O_RDWR);
+    check(b"open", fd >= 0, fd as i64)?;
+    let blocks = |fd| {
+        let mut st = Stat::default();
+        sys_fstat(fd, &mut st);
+        (st.st_blocks, st.st_size)
+    };
+    let f = sys_fallocate(fd, KEEP_SIZE, 0, 65536);
+    let before = blocks(fd);
+    // The second page of the source is gone: the write stops there
+    sys_munmap(b.at + 4096, 4096);
+    let w = sys_pwrite64(fd, b.ptr(0), 8192, 0);
+    let after = blocks(fd);
+    sys_close(fd as u64);
+    sys_unlink(path(b"SHORT.BIN", &mut [0; 64]));
+    check(b"fallocate", f == 0, f)?;
+    check(b"blocks before", before == (128, 8192), before.0)?;
+    check(b"short write", w == 4096, w)?;
+    check(b"size", after.1 == 8192, after.1)?;
+    check(b"blocks kept", after.0 == 128, after.0)
 }

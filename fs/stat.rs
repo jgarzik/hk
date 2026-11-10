@@ -55,7 +55,7 @@ fn fill_stat(inode: &Inode) -> Result<Stat, KernelError> {
         st_rdev,
         st_size: attr.size as i64,
         st_blksize: st_blksize(blksize(&attr, bdev_of(&attr).as_deref())),
-        st_blocks: attr.size.div_ceil(512) as i64,
+        st_blocks: attr.blocks as i64,
         st_atime: attr.atime.sec,
         st_atime_nsec: attr.atime.nsec.into(),
         st_mtime: attr.mtime.sec,
@@ -390,7 +390,7 @@ fn fill_statx(
         stx_mode: attr.mode.raw(),
         stx_ino: attr.ino,
         stx_size: attr.size,
-        stx_blocks: attr.size.div_ceil(512),
+        stx_blocks: attr.blocks,
         // Birth time not tracked: stx_btime stays zero
         stx_atime: attr.atime.into(),
         stx_ctime: attr.ctime.into(),

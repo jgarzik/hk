@@ -419,6 +419,7 @@ fn vfat(d: &Disk) {
     sys_close(disk as u64);
     verdict(b"BLK_RRPART_MOUNTED", busy == EBUSY, busy);
     vfat_blksize();
+    vfat_blocks();
     vfat_mmap_write();
     vfat_swapfile();
     drop_caches();
@@ -451,6 +452,32 @@ fn vfat_blksize() {
         got = if r != 0 { r } else { st.st_blksize as i64 };
     }
     verdict(b"VFAT_BLKSIZE", ok, got);
+}
+
+/// st_blocks of a vfat file counts its clusters (Linux i_blocks):
+/// those fallocate KEEP_SIZE gives past the end too, until a truncate
+/// frees them
+fn vfat_blocks() {
+    use hk_syscall::sys_fallocate;
+    const KEEP_SIZE: i32 = 1;
+    let path = b"/mnt/vd1/BLOCKS.BIN\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644) as i32;
+    let blocks = |fd| {
+        let mut st = Stat::default();
+        sys_fstat(fd, &mut st);
+        st.st_blocks as i64
+    };
+    let buf = [7u8; 1000];
+    let w = sys_pwrite64(fd, buf.as_ptr(), 1000, 0);
+    let b1 = blocks(fd);
+    let f = sys_fallocate(fd, KEEP_SIZE, 0, 8192);
+    let b2 = blocks(fd);
+    let t = hk_syscall::sys_ftruncate(fd, 600);
+    let b3 = blocks(fd);
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    let ok = fd >= 0 && w == 1000 && f == 0 && t == 0 && b1 == 2 && b2 == 16 && b3 == 2;
+    verdict(b"VFAT_STAT_BLOCKS", ok, b1 * 10000 + b2 * 100 + b3);
 }
 
 /// What was written through the page cache (write() and a shared

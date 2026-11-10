@@ -190,7 +190,8 @@ fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(),
             },
         )?;
     }
-    Ok(())
+    // Linux fat_chain_add: i_blocks counts them
+    with_vi(inode, |v| v.d.lock().clusters = need as u32)
 }
 
 /// Record the file's size in its directory entry
@@ -239,8 +240,10 @@ fn vfat_write(
         return Err(e);
     }
     let r = filemap::write_iter(inode, from, pos);
-    if !matches!(r, Ok(n) if n == len) {
-        // Linux fat_write_failed: best effort, like its void return
+    // Linux fat_write_failed acts only for a write past the size: an
+    // in-place one keeps the clusters (fallocate's past the end too)
+    if !matches!(r, Ok(n) if n == len) && end > inode.get_size() {
+        // Best effort, like its void return
         let _ = write_failed(inode, &sb_data);
     }
     let n = r?;
@@ -272,17 +275,18 @@ fn mmu_truncate(inode: &Inode, size: u64) -> Result<(), KernelError> {
     })
 }
 
-/// A write that came up short (a fault in the caller's buffer, no
-/// memory): the clusters past the end go again (Linux fat_write_failed
+/// A write past the size that came up short (a fault in the caller's
+/// buffer, no memory): the clusters past the end go again (Linux fat_write_failed
 /// -> fat_truncate_blocks)
 fn write_failed(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
     // No direct I/O still reads clusters about to be freed
     inode.inode_dio_wait();
     mmu_truncate(inode, inode.get_size())?;
-    let d = get_inode_data(inode)?;
+    let start0 = get_inode_data(inode)?.start_cluster;
     let keep = inode.get_size().div_ceil(u64::from(sb_data.cluster_size)) as usize;
-    let start = free_past(sb_data, inode, d.start_cluster, keep)?;
-    if start != d.start_cluster {
+    let start = free_past(sb_data, inode, start0, keep)?;
+    if start != start0 {
+        let d = get_inode_data(inode)?;
         set_inode_data(
             inode,
             VfatInodeData {
@@ -310,6 +314,7 @@ fn free_past(
     cache::inval(inode)?;
     if keep == 0 {
         free_cluster_chain(sb_data, start)?;
+        set_clusters(inode, 0)?;
         return Ok(0);
     }
     let want = u32::try_from(keep - 1).map_err(|_| KernelError::Io)?;
@@ -327,7 +332,16 @@ fn free_past(
         cache::inval(inode)?;
         free_cluster_chain(sb_data, next)?;
     }
+    set_clusters(inode, want + 1)?;
     Ok(start)
+}
+
+/// The file has `n` clusters left after a cut (Linux fat_free: i_blocks)
+fn set_clusters(inode: &Inode, n: u32) -> Result<(), KernelError> {
+    with_vi(inode, |v| {
+        let mut d = v.d.lock();
+        d.clusters = d.clusters.min(n);
+    })
 }
 
 // ============================================================================
@@ -758,6 +772,9 @@ pub struct VfatInodeData {
     /// by a truncate; a direct write past it goes through the cache.
     /// Changed under i_rwsem.
     pub mmu_private: u64,
+    /// Clusters the file has (Linux i_blocks in clusters): the size's
+    /// when read from disk, then counted as clusters are added and freed
+    pub clusters: u32,
 }
 
 /// A vfat inode's `Inode.private`: its data, changed in place (a
@@ -837,6 +854,16 @@ fn get_sb_data(sb: &Arc<SuperBlock>) -> Result<VfatSbData, KernelError> {
         .and_then(|p| p.as_any().downcast_ref::<VfatSbData>())
         .cloned()
         .ok_or(KernelError::Io)
+}
+
+/// The cluster size of `inode`'s filesystem, read in place
+fn cluster_size(inode: &Inode) -> Option<u32> {
+    let sb = inode.superblock()?;
+    let p = sb.private.read();
+    p.as_ref()?
+        .as_any()
+        .downcast_ref::<VfatSbData>()
+        .map(|d| d.cluster_size)
 }
 
 /// A copy of `inode`'s VFAT data
@@ -1735,10 +1762,15 @@ impl InodeOps for VfatInodeOps {
     /// The preferred I/O size is the cluster size (Linux fat_getattr)
     fn getattr(&self, inode: &Inode) -> super::inode::InodeAttr {
         let mut a = super::inode::generic_fillattr(inode);
-        if let Some(sb) = inode.superblock()
-            && let Ok(d) = get_sb_data(&sb)
+        let Some(cs) = cluster_size(inode) else {
+            return a;
+        };
+        a.blksize = cs;
+        // A file's blocks are its clusters (Linux i_blocks)
+        if a.mode.is_file()
+            && let Ok(d) = get_inode_data(inode)
         {
-            a.blksize = d.cluster_size;
+            a.blocks = u64::from(d.clusters) * u64::from(cs) / 512;
         }
         a
     }
@@ -1824,6 +1856,7 @@ impl InodeOps for VfatInodeOps {
             parent_cluster,
             short_name,
             mmu_private: 0,
+            clusters: 0,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
         dir_sync(&sb, &sb_data)?;
@@ -1910,6 +1943,7 @@ impl InodeOps for VfatInodeOps {
             parent_cluster,
             short_name,
             mmu_private: 0,
+            clusters: 0,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
         dir_sync(&sb, &sb_data)?;
@@ -2017,6 +2051,7 @@ impl InodeOps for VfatInodeOps {
             mmu_truncate(inode, length)?;
             let keep = length.div_ceil(cs) as usize;
             let start = free_past(&sb_data, inode, d.start_cluster, keep)?;
+            let d = get_inode_data(inode)?;
             // The clusters are freed on disk: the inode follows
             set_inode_data(
                 inode,
@@ -2274,6 +2309,8 @@ fn create_inode_for_entry(
         parent_cluster,
         short_name: entry.short_name,
         mmu_private: u64::from(entry.file_size),
+        // Linux fat_fill_inode: i_blocks from the size
+        clusters: entry.file_size.div_ceil(sb_data.cluster_size),
     })?);
 
     Ok(inode)
@@ -2608,6 +2645,7 @@ fn vfat_mount_dev(
         parent_cluster: 0,      // Root has no parent
         short_name: [b' '; 11], // Root has no short name
         mmu_private: 0,
+        clusters: 0,
     })?);
 
     // Create root dentry
