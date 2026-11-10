@@ -46,6 +46,8 @@ pub mod status {
 
 /// Device-independent feature bits (virtio 1.2 section 6)
 pub mod feature {
+    /// Indirect descriptor tables (VIRTIO_RING_F_INDIRECT_DESC)
+    pub const RING_INDIRECT_DESC: u32 = 28;
     pub const VERSION_1: u32 = 32;
     pub const ACCESS_PLATFORM: u32 = 33;
 }
@@ -61,9 +63,10 @@ pub mod id {
 /// VERSION_1 is required (no legacy). ACCESS_PLATFORM (the device's DMA
 /// goes through platform translation) is accepted when offered, as Linux
 /// does: every address hk gives a device comes from the DMA API, which is
-/// correct both with and without it.
+/// correct both with and without it. RING_INDIRECT_DESC is a ring
+/// feature every driver may use (Linux vring_transport_features).
 pub fn transport_features() -> u64 {
-    (1 << feature::VERSION_1) | (1 << feature::ACCESS_PLATFORM)
+    (1 << feature::VERSION_1) | (1 << feature::ACCESS_PLATFORM) | (1 << feature::RING_INDIRECT_DESC)
 }
 
 /// Features to accept: what both sides support

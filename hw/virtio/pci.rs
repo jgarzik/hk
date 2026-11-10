@@ -406,6 +406,7 @@ impl VirtioDevice {
             owner: core::ptr::from_ref::<Self>(self) as usize,
             index,
             notify,
+            indirect: self.has_feature(super::feature::RING_INDIRECT_DESC),
         })
     }
 
@@ -537,6 +538,8 @@ pub struct Virtqueue {
     index: u16,
     /// This queue's 2-byte doorbell
     notify: IoMem,
+    /// The device takes indirect descriptor tables
+    indirect: bool,
 }
 
 // SAFETY: the ring is DMA memory reached under the driver's queue lock
@@ -546,6 +549,11 @@ unsafe impl Send for Virtqueue {}
 unsafe impl Sync for Virtqueue {}
 
 impl Virtqueue {
+    /// Indirect descriptors were negotiated (Linux vq->indirect)
+    pub fn indirect(&self) -> bool {
+        self.indirect
+    }
+
     /// Notify the device of new buffers if it wants to be (Linux
     /// virtqueue_kick)
     pub fn kick(&self) {

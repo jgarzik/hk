@@ -1,6 +1,6 @@
 //! Split virtqueue ring logic (virtio 1.2 section 2.7)
 //!
-//! Linux reference: drivers/virtio/virtio_ring.c (split ring, no indirect
+//! Linux reference: drivers/virtio/virtio_ring.c (split ring, indirect
 //! descriptors, no event index).
 //!
 //! [`Vring`] works on raw ring memory the caller provides (coherent DMA
@@ -18,6 +18,12 @@
 //! The free list and descriptor chains are tracked in a driver-private
 //! shadow (`next`, Linux `desc_extra`): the driver never trusts link
 //! fields in memory the device can write.
+//!
+//! Indirect descriptors (VIRTIO_RING_F_INDIRECT_DESC, spec 2.7.5.3): a
+//! request's chain is written to a table of its own ([`set_chain`],
+//! Linux alloc_indirect_split), which the caller allocates and DMA-maps;
+//! one ring descriptor points at it ([`Vring::add_indirect`]), so a big
+//! request takes one ring slot instead of one per buffer.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec;
@@ -31,6 +37,8 @@ use crate::arch::barrier::{dma_rmb, dma_wmb};
 const VRING_DESC_F_NEXT: u16 = 1;
 /// Buffer is device-writable
 const VRING_DESC_F_WRITE: u16 = 2;
+/// Buffer is a table of descriptors
+const VRING_DESC_F_INDIRECT: u16 = 4;
 /// Driver: do not interrupt on used buffers (a hint)
 const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
 /// Device: do not notify on available buffers (a hint)
@@ -55,12 +63,54 @@ pub enum VqError {
     Empty,
 }
 
+/// One descriptor (struct vring_desc), little-endian: in the ring, or
+/// in an indirect table
 #[repr(C)]
-struct Desc {
+#[derive(Clone, Copy, Default)]
+pub struct Desc {
     addr: u64,
     len: u32,
     flags: u16,
     next: u16,
+}
+
+impl Desc {
+    /// The buffer it describes
+    pub fn sg(&self) -> Sg {
+        Sg {
+            addr: u64::from_le(self.addr),
+            len: u32::from_le(self.len),
+        }
+    }
+}
+
+/// Flags of descriptor `k` of a chain of `out` device-readable then
+/// device-writable buffers, `total` in all
+fn chain_flags(k: usize, out: usize, total: usize) -> u16 {
+    let mut flags = if k >= out { VRING_DESC_F_WRITE } else { 0 };
+    if k + 1 < total {
+        flags |= VRING_DESC_F_NEXT;
+    }
+    flags
+}
+
+/// Entry `k` of a chain written to `table`, which holds exactly the
+/// chain (Linux alloc_indirect_split + virtqueue_add_desc_split): buffer
+/// `sg`, device-writable if `write`, linked to entry k + 1 unless last.
+/// The device-readable buffers must come first
+pub fn set_chain(table: &mut [Desc], k: usize, sg: Sg, write: bool) {
+    let total = table.len();
+    let mut flags = if write { VRING_DESC_F_WRITE } else { 0 };
+    if k + 1 < total {
+        flags |= VRING_DESC_F_NEXT;
+    }
+    table[k] = Desc {
+        addr: sg.addr.to_le(),
+        len: sg.len.to_le(),
+        flags: flags.to_le(),
+        // Truncation only on the last entry, whose link is unused
+        next: ((k + 1) as u16).to_le(),
+    };
 }
 
 const _: () = assert!(core::mem::size_of::<Desc>() == 16);
@@ -200,14 +250,7 @@ impl Vring {
         let head = self.free_head;
         let mut i = head;
         for (k, sg) in out.iter().chain(inb).enumerate() {
-            let mut flags = if k >= out.len() {
-                VRING_DESC_F_WRITE
-            } else {
-                0
-            };
-            if k + 1 < total {
-                flags |= VRING_DESC_F_NEXT;
-            }
+            let flags = chain_flags(k, out.len(), total);
             let d = self.desc(i);
             unsafe {
                 write_volatile(&raw mut (*d).addr, sg.addr.to_le());
@@ -218,8 +261,65 @@ impl Vring {
             i = self.next[i as usize];
         }
         self.free_head = i;
-        self.num_free -= total as u16;
-        self.chain[head as usize] = total as u16;
+        self.publish(head, total as u16, token);
+        Ok(())
+    }
+
+    /// Expose a chain written by [`set_chain`] as direct ring
+    /// descriptors, for a device without indirect descriptors
+    pub fn add_chain(&mut self, table: &[Desc], token: usize) -> Result<(), VqError> {
+        let total = table.len();
+        if total == 0 {
+            return Err(VqError::Empty);
+        }
+        if total > self.num_free as usize {
+            return Err(VqError::NoSpace);
+        }
+        let head = self.free_head;
+        let mut i = head;
+        for t in table {
+            let d = self.desc(i);
+            unsafe {
+                write_volatile(&raw mut (*d).addr, t.addr);
+                write_volatile(&raw mut (*d).len, t.len);
+                write_volatile(&raw mut (*d).flags, t.flags);
+                write_volatile(&raw mut (*d).next, self.next[i as usize].to_le());
+            }
+            i = self.next[i as usize];
+        }
+        self.free_head = i;
+        self.publish(head, total as u16, token);
+        Ok(())
+    }
+
+    /// Expose an indirect table of `n` descriptors at DMA address
+    /// `table` (written by [`set_chain`], mapped for the device until
+    /// `token` comes back from [`Vring::get`]): one ring descriptor
+    pub fn add_indirect(&mut self, table: u64, n: u16, token: usize) -> Result<(), VqError> {
+        if n == 0 {
+            return Err(VqError::Empty);
+        }
+        if self.num_free == 0 {
+            return Err(VqError::NoSpace);
+        }
+        let head = self.free_head;
+        let d = self.desc(head);
+        unsafe {
+            write_volatile(&raw mut (*d).addr, table.to_le());
+            write_volatile(&raw mut (*d).len, (u32::from(n) * 16).to_le());
+            write_volatile(&raw mut (*d).flags, VRING_DESC_F_INDIRECT.to_le());
+            write_volatile(&raw mut (*d).next, 0);
+        }
+        self.free_head = self.next[head as usize];
+        self.publish(head, 1, token);
+        Ok(())
+    }
+
+    /// Account the chain of `n` ring descriptors at `head` and make it
+    /// available to the device
+    fn publish(&mut self, head: u16, n: u16, token: usize) {
+        self.num_free -= n;
+        self.chain[head as usize] = n;
         self.tokens[head as usize] = token;
 
         // Publish the head in the avail ring, then the index that covers
@@ -229,7 +329,6 @@ impl Vring {
         self.avail_idx = self.avail_idx.wrapping_add(1);
         dma_wmb();
         unsafe { write_volatile(self.avail16(1), self.avail_idx.to_le()) };
-        Ok(())
     }
 
     /// After [`Vring::add`]s: true if the device wants a notification
@@ -489,6 +588,57 @@ mod tests {
         assert!(want > 0x1_0000);
         assert_eq!(f.ring.avail_idx, f.dev_avail);
         assert_eq!(f.ring.last_used, f.dev_used);
+    }
+
+    /// A request's table: header out, data and status in
+    fn table3() -> [Desc; 3] {
+        let mut t = [Desc::default(); 3];
+        set_chain(&mut t, 0, sg(0x10, 16), false);
+        set_chain(&mut t, 1, sg(0x20, 512), true);
+        set_chain(&mut t, 2, sg(0x30, 1), true);
+        t
+    }
+
+    #[test]
+    fn indirect_takes_one_slot() {
+        let mut f = Fake::new(4);
+        let t = table3();
+        let e: Vec<(u64, u32, u16, u16)> =
+            t.iter().map(|d| (d.addr, d.len, d.flags, d.next)).collect();
+        let (n, w) = (VRING_DESC_F_NEXT, VRING_DESC_F_WRITE);
+        assert_eq!(
+            e,
+            [(0x10, 16, n, 1), (0x20, 512, n | w, 2), (0x30, 1, w, 3)]
+        );
+        assert_eq!(t[2].sg().addr, 0x30);
+        for k in 0..4 {
+            f.ring.add_indirect(0x9000 + k, 3, k as usize).unwrap();
+        }
+        assert_eq!(f.ring.add_indirect(0x9000, 3, 9), Err(VqError::NoSpace));
+        assert_eq!(f.ring.num_free(), 0);
+        let (h, c) = f.pop().unwrap();
+        assert_eq!(c, [(0x9000, 48, VRING_DESC_F_INDIRECT)]);
+        f.push(h, 0);
+        assert_eq!(f.ring.get(), Some((0, 0)));
+        assert_eq!(f.ring.num_free(), 1);
+        // The freed slot takes a direct chain of one
+        f.ring.add(&[sg(5, 5)], &[], 5).unwrap();
+        assert_eq!(f.ring.add_indirect(1, 0, 0), Err(VqError::Empty));
+    }
+
+    #[test]
+    fn table_as_direct_chain() {
+        let mut f = Fake::new(4);
+        let t = table3();
+        assert_eq!(f.ring.add_chain(&t[..0], 0), Err(VqError::Empty));
+        f.ring.add_chain(&t, 7).unwrap();
+        assert_eq!(f.ring.add_chain(&t, 8), Err(VqError::NoSpace));
+        let (h, c) = f.pop().unwrap();
+        let (n, w) = (VRING_DESC_F_NEXT, VRING_DESC_F_WRITE);
+        assert_eq!(c, [(0x10, 16, n), (0x20, 512, n | w), (0x30, 1, w)]);
+        f.push(h, 513);
+        assert_eq!(f.ring.get(), Some((7, 513)));
+        assert_eq!(f.ring.num_free(), 4);
     }
 
     #[test]
