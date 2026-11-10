@@ -85,7 +85,7 @@ pub fn p3_start() -> Option<i64> {
 }
 
 /// The pattern word bytes of vda3 at `off` (tools/mkdisk.sh)
-fn pat(off: i64) -> [u8; 8] {
+pub fn pat(off: i64) -> [u8; 8] {
     let mut b = [0u8; 8];
     for (i, x) in b.iter_mut().enumerate() {
         let o = off as u64 + i as u64;

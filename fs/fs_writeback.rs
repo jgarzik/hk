@@ -47,14 +47,18 @@ fn live_sbs() -> Vec<Arc<SuperBlock>> {
 
 /// `inode` has a new dirty page (Linux __mark_inode_dirty(I_DIRTY_PAGES)):
 /// the first time, put it on its superblock's dirty list and arm its
-/// device's periodic writeback
+/// device's periodic writeback (its mapping notes when it became dirty)
 pub fn mark_inode_dirty(inode: &Arc<Inode>) {
     if !inode.i_data.aops().can_dirty() || inode.i_dirty.swap(true, Ordering::AcqRel) {
         return;
     }
     let Some(sb) = inode.superblock() else {
-        // The bdev pseudo filesystem: its device writes it back
-        inode.i_dirty.store(false, Ordering::Release);
+        // The bdev pseudo filesystem: its device's own cache, written
+        // by the device's periodic writeback (Linux: the bdev inode on
+        // its disk's bdi_writeback)
+        if let Ok(b) = crate::fs::blkdev_ops::inode_bdev(inode) {
+            b.disk.bdi.kick(b.dev_id());
+        }
         return;
     };
     sb.s_dirty.lock().push(inode.clone());
@@ -107,11 +111,50 @@ pub fn sync_all_sbs() {
     }
 }
 
-/// The filesystems mounted from device `dev` (periodic writeback)
-pub fn writeback_dev(dev: crate::block::DevId) {
+/// Its pages became dirty at or before `cutoff` (monotonic ns)
+fn expired(inode: &Inode, cutoff: u64) -> bool {
+    inode.i_data.dirtied_when.load(Ordering::Acquire) <= cutoff
+}
+
+/// The periodic writeback of device `dev` (Linux wb_writeback): the
+/// dirty inodes of the filesystems mounted from it that became dirty at
+/// or before `cutoff` (kupdate: older than vm.dirty_expire_centisecs;
+/// background writeback passes `u64::MAX`), then the device's own cache
+/// if it did. True if dirty inodes are left for a later pass
+pub fn writeback_dev(dev: crate::block::DevId, cutoff: u64) -> bool {
+    let mut left = false;
     for sb in live_sbs() {
         if sb.bdev().is_some_and(|b| b.dev_id() == dev) {
-            let _ = writeback_sb(&sb);
+            left |= writeback_sb_expired(&sb, cutoff);
         }
     }
+    if let Some(b) = crate::block::get_blkdev(dev) {
+        let bi = &b.bd_inode;
+        if bi.i_dirty.load(Ordering::Acquire) {
+            if expired(bi, cutoff) {
+                // Clear before writing: a page dirtied meanwhile marks
+                // it again
+                bi.i_dirty.store(false, Ordering::Release);
+                let _ = crate::block::blkdev::sync_blockdev(&b);
+            } else {
+                left = true;
+            }
+        }
+    }
+    left
+}
+
+/// The dirty inodes of `sb` that became dirty at or before `cutoff`;
+/// true if others are left on its dirty list
+fn writeback_sb_expired(sb: &SuperBlock, cutoff: u64) -> bool {
+    let _pass = sb.s_wb_lock.lock();
+    let dirty = core::mem::take(&mut *sb.s_dirty.lock());
+    let (old, young): (Vec<_>, Vec<_>) = dirty.into_iter().partition(|i| expired(i, cutoff));
+    let left = !young.is_empty();
+    sb.s_dirty.lock().extend(young);
+    for inode in old {
+        inode.i_dirty.store(false, Ordering::Release);
+        let _ = writeback_inode(&inode);
+    }
+    left
 }

@@ -317,6 +317,9 @@ pub(crate) fn kmain() -> ! {
     // Device initcalls (Linux order: buses scanned, drivers registered,
     // each registration probing what it matches; a probe may register
     // child devices, probed in turn)
+    // Linux subsys_initcall order (mm/ before block/): default_bdi_init,
+    // then genhd_device_init
+    mm::writeback::default_bdi_init();
     block::genhd::genhd_init();
     CurrentArch::platform_init();
     hw::pci::pci_scan();

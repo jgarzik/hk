@@ -149,6 +149,11 @@ pub struct AddressSpace {
     /// same chain type as an anon_vma's): written under the mmap_lock
     /// held for writing, read by truncate and the reverse map
     pub i_mmap: AnonVma,
+    /// When its first dirty page since it was last clean came,
+    /// monotonic ns (Linux inode->dirtied_when, set as I_DIRTY_PAGES
+    /// is): written under the `i_pages` lock, read by the periodic
+    /// writeback (vm.dirty_expire_centisecs)
+    pub dirtied_when: AtomicU64,
 }
 
 impl AddressSpace {
@@ -163,6 +168,7 @@ impl AddressSpace {
             seals: AtomicU32::new(0),
             writable: core::sync::atomic::AtomicI64::new(0),
             i_mmap: AnonVma::default(),
+            dirtied_when: AtomicU64::new(0),
         }
     }
 
@@ -568,9 +574,12 @@ pub fn dirty_folio(m: &AddressSpace, phys: u64) {
         && pg.flags.fetch_or(PG_DIRTY, Ordering::AcqRel) & PG_DIRTY == 0
     {
         count_dirty(1);
-        m.i_pages
-            .lock()
-            .set_mark(pg.index.load(Ordering::Relaxed), MARK_DIRTY);
+        let mut pages = m.i_pages.lock();
+        if !pages.marked(MARK_DIRTY) {
+            m.dirtied_when
+                .store(crate::time::monotonic_ns(), Ordering::Release);
+        }
+        pages.set_mark(pg.index.load(Ordering::Relaxed), MARK_DIRTY);
     }
 }
 

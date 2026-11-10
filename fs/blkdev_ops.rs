@@ -278,7 +278,7 @@ struct BdevAops;
 
 /// The bdev inode's device: its own, never another one registered
 /// under the same number later; EIO once it is removed
-fn inode_bdev(inode: &Inode) -> Result<Arc<BlockDevice>, KernelError> {
+pub(crate) fn inode_bdev(inode: &Inode) -> Result<Arc<BlockDevice>, KernelError> {
     let p = inode.get_private().ok_or(KernelError::Io)?;
     let b = p
         .as_any()
@@ -349,7 +349,7 @@ pub fn bdev_write_meta(b: &BlockDevice, pos: u64, buf: &[u8]) -> Result<(), Kern
         filemap::put_page(phys);
         done += n;
     }
-    b.disk.bdi.kick(b.dev_id());
+    crate::fs::fs_writeback::mark_inode_dirty(&b.bd_inode);
     Ok(())
 }
 
@@ -600,7 +600,12 @@ impl FileOps for BlockFileOps {
         let n = if direct {
             dio_write(file, from, pos, flags)?
         } else {
-            filemap::write_iter(&b.bd_inode, from, pos)?
+            let n = filemap::write_iter(&b.bd_inode, from, pos)?;
+            // The cached write is the device's periodic writeback's
+            // (Linux generic_perform_write dirties the folio:
+            // __mark_inode_dirty, wb_wakeup_delayed)
+            crate::fs::fs_writeback::mark_inode_dirty(&b.bd_inode);
+            n
         };
         if at.is_none() {
             file.advance_pos(n as u64);
