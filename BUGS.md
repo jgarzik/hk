@@ -286,6 +286,19 @@ lo (hk has no checksum offload states).
 - FSYNC/FDSYNC and poll completion work run on `SYSTEM_WQ`'s single
   worker, one at a time; Linux's system_wq runs concurrency-managed
   pools.
+- An ended O_DIRECT request is released in thread context
+  (`Kiocb::put_any` -> `Kioctx::defer`: the reap list, drained by the
+  next io_submit/io_getevents or a delayed work item), not where its
+  bios end as Linux iocb_destroy (unpinning there unless pages must be
+  dirtied under their page lock: bio_check_pages_dirty; fput's
+  delayed_fput for a last file reference). Releasing there needs a
+  file put that is safe in hardirq, which `Arc<File>` cannot give
+  atomically (no "drop unless last"; the file must not move: its
+  address keys flock locks). AIO 4K QD1 (`make check BENCH=1`,
+  DIO_BENCH) is unexplained and noisy: 12k..81k IOPS across boots of
+  one kernel, Linux 15k..110k on the same host; with the request
+  spinning on the ring rather than sleeping, about 16.5 us per request
+  (submit about 3 us), sleeping adds about 5 us.
 
 ## File lock gaps
 
