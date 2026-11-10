@@ -15,7 +15,7 @@
 //!   (synchronous, as Linux), overwrites within the size and reads back
 //!   by AIO match a buffered read; a read at the end is 0; misaligned
 //!   memory is an EINVAL event
-//! - AIO_VFAT_APPEND: on a vda1 vfat file opened
+//! - AIO_VFAT_APPEND, IO_URING_VFAT_APPEND: on a vda1 vfat file opened
 //!   O_DIRECT, RWF_APPEND sends a write within the size to the end
 //!   (Linux kiocb_set_rw_flags: IOCB_APPEND), and RWF_NOAPPEND on an
 //!   O_APPEND one writes at the offset (Linux 6.9 on)
@@ -318,6 +318,7 @@ fn vfat(p1: &BlkDev) -> R {
     let r = vfat_io();
     sys_unlink(FILE.as_ptr());
     report_r(b"AIO_VFAT_APPEND", append(false));
+    report_r(b"IO_URING_VFAT_APPEND", append(true));
     sys_unlink(FILE.as_ptr());
     report_r(b"AIO_VFAT_DIO_CACHE", dio_cache());
     sys_unlink(FILE.as_ptr());

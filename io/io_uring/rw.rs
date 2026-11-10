@@ -186,10 +186,11 @@ enum Mem {
 }
 
 /// The I/O flags of a request: the file's (O_DIRECT, O_DSYNC, __O_SYNC,
-/// O_APPEND) and the SQE's RWF_* ones (Linux io_rw_init_file: ki_flags =
-/// iocb_flags(file), then kiocb_set_rw_flags)
-fn kiocb_flags(file: RwFlags, rwf: RwFlags) -> RwFlags {
-    file | rwf
+/// O_APPEND) and the SQE's RWF_* ones (`flags`, from the raw `rwf`),
+/// RWF_APPEND / RWF_NOAPPEND over O_APPEND (Linux io_rw_init_file:
+/// ki_flags = iocb_flags(file), then kiocb_set_rw_flags)
+fn kiocb_flags(file: RwFlags, flags: RwFlags, rwf: u32) -> RwFlags {
+    crate::fs::iov::rwf_set_append(file | flags, rwf as i32)
 }
 
 /// The nonblocking attempt of a read or write through the read/write
@@ -355,7 +356,7 @@ fn rw_async(
     {
         return Some(Err(e));
     }
-    let flags = kiocb_flags(file.iocb_flags(), flags);
+    let flags = kiocb_flags(file.iocb_flags(), flags, sqe.op_flags);
     let req = match Req::new(r, file, mem, sqe, write, flags) {
         Ok(req) => req,
         Err(e) => return Some(Err(e)),
@@ -588,9 +589,20 @@ mod tests {
 
     #[test]
     fn file_dsync_reaches_the_request() {
-        let f = kiocb_flags(RwFlags::DIRECT | RwFlags::DSYNC, RwFlags::empty());
+        let f = kiocb_flags(RwFlags::DIRECT | RwFlags::DSYNC, RwFlags::empty(), 0);
         assert!(f.contains(RwFlags::DSYNC) && f.contains(RwFlags::DIRECT));
-        let f = kiocb_flags(RwFlags::DIRECT | RwFlags::SYNC, RwFlags::NOWAIT);
+        let f = kiocb_flags(RwFlags::DIRECT | RwFlags::SYNC, RwFlags::NOWAIT, 0);
         assert!(f.contains(RwFlags::SYNC) && f.contains(RwFlags::NOWAIT));
+    }
+
+    #[test]
+    fn rwf_append_over_o_append() {
+        use crate::fs::syscall::{RWF_APPEND, RWF_NOAPPEND};
+        let f = kiocb_flags(RwFlags::DIRECT, RwFlags::empty(), RWF_APPEND as u32);
+        assert!(f.contains(RwFlags::APPEND));
+        let f = kiocb_flags(RwFlags::APPEND, RwFlags::empty(), RWF_NOAPPEND as u32);
+        assert!(!f.contains(RwFlags::APPEND));
+        let f = kiocb_flags(RwFlags::APPEND, RwFlags::empty(), 0);
+        assert!(f.contains(RwFlags::APPEND));
     }
 }
