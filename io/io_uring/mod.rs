@@ -25,6 +25,7 @@ pub mod abi;
 mod iowq;
 mod ops;
 mod rings;
+mod rsrc;
 mod rw;
 mod tctx;
 mod wait;
@@ -37,6 +38,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use abi::*;
 use rings::Rings;
+use rw::Kind;
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
@@ -87,6 +89,8 @@ pub struct Submit {
     sq_head: u32,
     /// Registered files
     files: Option<Vec<Option<Arc<File>>>>,
+    /// Registered buffers (Linux buf_table)
+    bufs: Option<Vec<Option<Arc<rsrc::RegBuf>>>>,
     /// user_data of poll and timeout requests noted but never completed;
     /// at most `cq_entries` (`note_pending`)
     pending: KVec<u64>,
@@ -103,6 +107,10 @@ struct Cq {
 /// One io_uring (Linux io_ring_ctx)
 pub struct IoRing {
     rings: Rings,
+    /// The user its locked memory is charged to (Linux ctx->user: none
+    /// with CAP_IPC_LOCK), and its rings' pages charged
+    acct: Option<crate::task::Uid>,
+    ring_pages: u64,
     submit: Mutex<Submit>,
     cq: crate::sync::spin::Mutex<Cq>,
     /// `cq.overflow` holds CQEs (Linux IO_CHECK_CQ_OVERFLOW_BIT): set and
@@ -135,6 +143,15 @@ struct Link {
 }
 
 impl Submit {
+    /// Registered buffer `i` (EFAULT for none: Linux io_import_reg_buf)
+    pub fn fixed_buf(&self, i: u16) -> KernelResult<&Arc<rsrc::RegBuf>> {
+        self.bufs
+            .as_ref()
+            .and_then(|t| t.get(usize::from(i)))
+            .and_then(Option::as_ref)
+            .ok_or(KernelError::BadAddress)
+    }
+
     /// Note a request that stays pending: at most `max` (the CQ size: the
     /// CQEs they could ever post), EAGAIN past it (Linux: a request that
     /// cannot be allocated)
@@ -148,11 +165,18 @@ impl Submit {
 
 impl IoRing {
     fn new(sq: u32, cq: u32) -> KernelResult<Arc<Self>> {
+        let rings = Rings::new(sq, cq)?;
+        let acct = rsrc::acct_user();
+        let ring_pages = rings.pages();
+        rsrc::account(acct, ring_pages)?;
         try_arc(Self {
-            rings: Rings::new(sq, cq)?,
+            rings,
+            acct,
+            ring_pages,
             submit: Mutex::new(Submit {
                 sq_head: 0,
                 files: None,
+                bufs: None,
                 pending: KVec::new(),
             }),
             cq: crate::sync::spin::Mutex::new(Cq {
@@ -166,6 +190,7 @@ impl IoRing {
             inflight: AtomicU32::new(0),
             idle: WaitQueue::new(),
         })
+        .inspect_err(|_| rsrc::unaccount(acct, ring_pages))
     }
 
     /// Consume up to `nr` published SQEs and run them (Linux
@@ -242,10 +267,12 @@ impl IoRing {
         inline: bool,
     ) -> Option<KernelResult<i32>> {
         Some(match sqe.opcode {
-            IORING_OP_READ => return rw::rw(self, s, sqe, false, false, inline),
-            IORING_OP_WRITE => return rw::rw(self, s, sqe, true, false, inline),
-            IORING_OP_READV => return rw::rw(self, s, sqe, false, true, inline),
-            IORING_OP_WRITEV => return rw::rw(self, s, sqe, true, true, inline),
+            IORING_OP_READ => return rw::rw(self, s, sqe, false, Kind::Buf, inline),
+            IORING_OP_WRITE => return rw::rw(self, s, sqe, true, Kind::Buf, inline),
+            IORING_OP_READV => return rw::rw(self, s, sqe, false, Kind::Vec, inline),
+            IORING_OP_WRITEV => return rw::rw(self, s, sqe, true, Kind::Vec, inline),
+            IORING_OP_READ_FIXED => return rw::rw(self, s, sqe, false, Kind::Fixed, inline),
+            IORING_OP_WRITE_FIXED => return rw::rw(self, s, sqe, true, Kind::Fixed, inline),
             // Valid only inside a chain; it arms nothing (BUGS "io_uring
             // gaps")
             IORING_OP_LINK_TIMEOUT if in_link => Ok(0),
@@ -407,6 +434,32 @@ impl IoRing {
         Ok(())
     }
 
+    /// Register `nr` buffers from the iovec array at `arg` (Linux
+    /// io_sqe_buffers_register): EINVAL for none or too many, EBUSY if
+    /// some are; each pinned and charged (`rsrc`)
+    fn register_buffers(&self, arg: u64, nr: u32) -> KernelResult<()> {
+        let n = nr as usize;
+        if n == 0 || n > rsrc::IORING_MAX_REG_BUFFERS {
+            return Err(KernelError::InvalidArgument);
+        }
+        let mut iovs = crate::util::kmem::try_vec(n, crate::fs::iov::IoVec::default())?;
+        copy_from_user(crate::util::pod::slice_bytes_mut(&mut iovs), arg, n * 16)?;
+        let mut s = self.submit.lock();
+        if s.bufs.is_some() {
+            return Err(KernelError::Busy);
+        }
+        s.bufs = Some(rsrc::register(&iovs, self.acct)?);
+        Ok(())
+    }
+
+    /// Drop the registered buffers (ENXIO if none, Linux
+    /// io_sqe_buffers_unregister); unpinned after the lock, or when the
+    /// last request using one ends
+    fn unregister_buffers(&self) -> KernelResult<()> {
+        let old = self.submit.lock().bufs.take();
+        old.map(drop).ok_or(KernelError::NoDeviceOrAddress)
+    }
+
     /// Drop the registered files (ENXIO if none, Linux
     /// io_sqe_files_unregister); released after the lock
     fn unregister_files(&self) -> KernelResult<()> {
@@ -461,6 +514,12 @@ fn init_check(sqe: &IoUringSqe) -> KernelResult<()> {
         return Err(KernelError::InvalidArgument);
     }
     Ok(())
+}
+
+impl Drop for IoRing {
+    fn drop(&mut self) {
+        rsrc::unaccount(self.acct, self.ring_pages);
+    }
 }
 
 // ============================================================================
@@ -671,11 +730,15 @@ pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> Ke
         }
         IORING_UNREGISTER_FILES if arg == 0 && nr_args == 0 => ring.unregister_files().map(|()| 0),
         IORING_UNREGISTER_FILES => Err(KernelError::InvalidArgument),
+        IORING_REGISTER_BUFFERS => ring.register_buffers(arg, nr_args).map(|()| 0),
+        IORING_UNREGISTER_BUFFERS if arg == 0 && nr_args == 0 => {
+            ring.unregister_buffers().map(|()| 0)
+        }
+        IORING_UNREGISTER_BUFFERS => Err(KernelError::InvalidArgument),
         // Not implemented yet
-        IORING_REGISTER_BUFFERS
-        | IORING_UNREGISTER_BUFFERS
-        | IORING_REGISTER_EVENTFD
-        | IORING_UNREGISTER_EVENTFD => Err(KernelError::OperationNotSupported),
+        IORING_REGISTER_EVENTFD | IORING_UNREGISTER_EVENTFD => {
+            Err(KernelError::OperationNotSupported)
+        }
         IORING_REGISTER_FILES_UPDATE => {
             if nr_args == 0 {
                 return Err(KernelError::InvalidArgument);

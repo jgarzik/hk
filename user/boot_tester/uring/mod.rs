@@ -2,6 +2,7 @@
 //! liburing's ring layout), raw syscalls only
 
 pub mod dio;
+pub mod fixed;
 pub mod ring;
 pub mod setup;
 pub mod wait;
@@ -22,6 +23,7 @@ pub fn run_tests() {
     ring::run_tests();
     wait::run_tests();
     dio::run_tests();
+    fixed::run_tests();
 }
 
 /// One mapped region

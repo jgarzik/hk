@@ -78,6 +78,11 @@ impl Rings {
         self.word(off).store(v, Ordering::Relaxed);
     }
 
+    /// Pages of both regions (charged as locked memory)
+    pub fn pages(&self) -> u64 {
+        (self.rings.pages() + self.sqes.pages()) as u64
+    }
+
     pub fn sq_entries(&self) -> u32 {
         self.sq_entries
     }

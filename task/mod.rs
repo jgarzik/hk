@@ -2495,7 +2495,7 @@ pub fn capable(cap: u32) -> bool {
 }
 
 // =============================================================================
-// Per-UID counts (RLIMIT_NPROC, RLIMIT_SIGPENDING)
+// Per-UID counts (RLIMIT_NPROC, RLIMIT_SIGPENDING, locked memory)
 // =============================================================================
 
 /// What a user's count counts (Linux enum ucount_type, the rlimit ones)
@@ -2508,20 +2508,58 @@ pub enum Ucount {
     /// Queued signals (UCOUNT_RLIMIT_SIGPENDING): charged to the
     /// receiver's real uid while queued
     Sigpending,
+    /// Pages pinned for io_uring (Linux user_struct.locked_vm: rings and
+    /// registered buffers), against RLIMIT_MEMLOCK (`locked_vm_charge`)
+    LockedVm,
 }
+
+/// Counts per user
+const NR_UCOUNTS: usize = 3;
 
 /// Each real uid's counts (Linux ucounts, one per user in the initial
 /// user namespace), indexed by `Ucount`: an entry lives while any count
 /// is non-zero, so a user's signals find it made by its tasks
-static UCOUNTS: Mutex<BTreeMap<Uid, [u64; 2]>> = Mutex::new(BTreeMap::new());
+static UCOUNTS: Mutex<BTreeMap<Uid, [u64; NR_UCOUNTS]>> = Mutex::new(BTreeMap::new());
 
 /// Charge one to `uid`'s `kind`; the new count (Linux
 /// inc_rlimit_ucounts)
 pub fn ucount_inc(uid: Uid, kind: Ucount) -> u64 {
     let mut counts = UCOUNTS.lock();
-    let c = &mut counts.entry(uid).or_insert([0; 2])[kind as usize];
+    let c = &mut counts.entry(uid).or_insert([0; NR_UCOUNTS])[kind as usize];
     *c += 1;
     *c
+}
+
+/// Charge `pages` locked pages to `uid` unless that passes `limit`
+/// pages (Linux __io_account_mem against RLIMIT_MEMLOCK): false then
+pub fn locked_vm_charge(uid: Uid, pages: u64, limit: u64) -> bool {
+    let mut counts = UCOUNTS.lock();
+    let e = counts.entry(uid).or_insert([0; NR_UCOUNTS]);
+    let c = &mut e[Ucount::LockedVm as usize];
+    match c.checked_add(pages) {
+        Some(n) if n <= limit => {
+            *c = n;
+            true
+        }
+        _ => {
+            if *e == [0; NR_UCOUNTS] {
+                counts.remove(&uid);
+            }
+            false
+        }
+    }
+}
+
+/// Release `pages` locked pages of `uid` (Linux __io_unaccount_mem)
+pub fn locked_vm_uncharge(uid: Uid, pages: u64) {
+    let mut counts = UCOUNTS.lock();
+    if let Some(c) = counts.get_mut(&uid) {
+        let v = &mut c[Ucount::LockedVm as usize];
+        *v = v.saturating_sub(pages);
+        if *c == [0; NR_UCOUNTS] {
+            counts.remove(&uid);
+        }
+    }
 }
 
 /// Release one of `uid`'s `kind` (Linux dec_rlimit_ucounts)
@@ -2529,7 +2567,7 @@ pub fn ucount_dec(uid: Uid, kind: Ucount) {
     let mut counts = UCOUNTS.lock();
     if let Some(c) = counts.get_mut(&uid) {
         c[kind as usize] = c[kind as usize].saturating_sub(1);
-        if *c == [0; 2] {
+        if *c == [0; NR_UCOUNTS] {
             counts.remove(&uid);
         }
     }

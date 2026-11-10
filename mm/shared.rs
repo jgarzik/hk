@@ -46,6 +46,11 @@ impl SharedRegion {
         Ok(Self { phys, pages })
     }
 
+    /// Its size in pages
+    pub fn pages(&self) -> usize {
+        self.pages
+    }
+
     /// Its size in bytes
     fn len(&self) -> usize {
         self.pages * PAGE_SIZE as usize

@@ -259,10 +259,11 @@ lo (hk has no checksum offload states).
 **Location**: `fs/blkdev_ops.rs`, `block/dio.rs`, `block/blkdev.rs`,
 `fs/vfat/`
 
-- Block-device and vfat O_DIRECT from kernel memory (a kernel
+- Block-device and vfat O_DIRECT from kernel virtual memory (a kernel
   `IovDest` or `IovSource`) is not pinned (`get_pages`: EOPNOTSUPP)
-  and takes the cached path; Linux sends bios from it (ITER_KVEC,
-  ITER_BVEC) with the same alignment rules.
+  and takes the cached path; Linux sends bios from it (ITER_KVEC) with
+  the same alignment rules. Pinned pages (Linux ITER_BVEC: io_uring's
+  registered buffers) go to bios through `dio::submit_async`.
 - vfat writes a file page back whole (`VfatAops::writepage`); Linux
   writes only its dirty blocks (buffer heads), so a block of the page
   changed on disk behind the cache (a raw device write) is overwritten
@@ -578,9 +579,12 @@ return 0 without moving the device (Linux: moved, or an error).
   NO_SQARRAY, SQE128/CQE32, NO_MMAP, REGISTERED_FD_ONLY, R_DISABLED,
   ATTACH_WQ (EINVAL); no registered ring fds
   (IORING_ENTER_REGISTERED_RING), personalities, provided buffers,
-  eventfd or registered buffers
-- The rings are not charged to the user's locked memory (Linux
-  __io_account_mem against RLIMIT_MEMLOCK without CAP_IPC_LOCK)
+  eventfd, buffer updates or tags (IORING_REGISTER_BUFFERS2,
+  BUFFERS_UPDATE)
+- READ_FIXED/WRITE_FIXED that run inline (a file without asynchronous
+  O_DIRECT, a chain or drain member) go through the buffer's user
+  addresses, not its pinned pages (Linux's bvec iterator works after
+  the range is unmapped)
 
 ## Rare QEMU crash in the arm64 boot test (host CPU suspected)
 

@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use super::abi::{IOSQE_ASYNC, IOSQE_CQE_SKIP_SUCCESS, IoUringSqe};
 use super::ops::cqe_count;
+use super::rsrc::RegBuf;
 use super::tctx::{Tctx, tctx};
 use super::{IoRing, Submit};
 use crate::block::dio::AsyncIo;
@@ -30,6 +31,7 @@ use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
 use crate::util::list::Link;
+use crate::util::smallvec::SmallVec;
 
 /// The SQE's file, opened for reading (`write` false) or writing, like
 /// read(2)/write(2) (EBADF)
@@ -52,11 +54,23 @@ fn rw_flags(sqe: &IoUringSqe) -> KernelResult<RwFlags> {
     crate::fs::iov::rwf_check(sqe.op_flags as i32)
 }
 
-/// The user memory of a READ/WRITE (`len` bytes at `addr`) or a
-/// READV/WRITEV (`len` iovecs at `addr`, checked and cut like readv's:
+/// How a read or write names its memory
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// `len` bytes at `addr` (READ, WRITE)
+    Buf,
+    /// `len` iovecs at `addr` (READV, WRITEV)
+    Vec,
+    /// `len` bytes at `addr` of registered buffer `buf_index`
+    /// (READ_FIXED, WRITE_FIXED)
+    Fixed,
+}
+
+/// The user memory of a READ/WRITE or _FIXED (`len` bytes at `addr`) or
+/// a READV/WRITEV (`len` iovecs at `addr`, checked and cut like readv's:
 /// Linux io_import_iovec -> __import_iovec)
-fn import(sqe: &IoUringSqe, vec: bool) -> KernelResult<alloc::vec::Vec<IoVec>> {
-    if vec {
+fn import(sqe: &IoUringSqe, kind: Kind) -> KernelResult<alloc::vec::Vec<IoVec>> {
+    if kind == Kind::Vec {
         let n = i32::try_from(sqe.len).map_err(|_| KernelError::InvalidArgument)?;
         return crate::fs::iov::import_iovec(UserPtr::new(sqe.addr), n);
     }
@@ -64,22 +78,30 @@ fn import(sqe: &IoUringSqe, vec: bool) -> KernelResult<alloc::vec::Vec<IoVec>> {
     crate::util::kmem::try_to_vec(&seg)
 }
 
-/// IORING_OP_READ/WRITE (`vec` false) and READV/WRITEV: the result, or
-/// None when queued (its CQE comes when it ends). `inline`: run it
-/// through the blocking core (a chain or drain member)
+/// IORING_OP_READ/WRITE, READV/WRITEV and READ_FIXED/WRITE_FIXED: the
+/// result, or None when queued (its CQE comes when it ends). `inline`:
+/// run it through the blocking core (a chain or drain member; a fixed
+/// buffer then goes by its user addresses: BUGS)
 pub fn rw(
     r: &Arc<IoRing>,
     s: &Submit,
     sqe: &IoUringSqe,
     write: bool,
-    vec: bool,
+    kind: Kind,
     inline: bool,
 ) -> Option<KernelResult<i32>> {
     let prep = rw_file(r, s, sqe, write).and_then(|f| {
         let flags = rw_flags(sqe)?;
-        Ok((f, flags, import(sqe, vec)?))
+        let fixed = match kind {
+            Kind::Fixed => {
+                let b = s.fixed_buf(sqe.buf_index)?;
+                Some((b.clone(), b.slice(sqe.addr, sqe.len as usize)?))
+            }
+            _ => None,
+        };
+        Ok((f, flags, import(sqe, kind)?, fixed))
     });
-    let (file, flags, segs) = match prep {
+    let (file, flags, segs, fixed) = match prep {
         Ok(p) => p,
         Err(e) => return Some(Err(e)),
     };
@@ -87,7 +109,26 @@ pub fn rw(
     if inline || len == 0 || !async_ok(&file) {
         return Some(rw_one(&file, &segs, (sqe.off, sqe.op_flags), write, flags));
     }
-    rw_async(r, file, &segs, sqe, write, flags)
+    let mem = match fixed {
+        Some((b, f)) => Ok(Mem::Fixed { _held: b, segs: f }),
+        None => pin(&segs, write).map(Mem::Pinned),
+    };
+    match mem {
+        Ok(mem) => rw_async(r, file, mem, sqe, write, flags),
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// The memory of an asynchronous request: pinned for it, or pieces of
+/// a registered buffer, held (its pages stay pinned if it is
+/// unregistered meanwhile)
+enum Mem {
+    Pinned(PinnedPages),
+    /// The buffer is held only to keep its pages pinned
+    Fixed {
+        _held: Arc<RegBuf>,
+        segs: SmallVec<PageSeg, 4>,
+    },
 }
 
 /// The file takes asynchronous I/O for this request: O_DIRECT on a file
@@ -145,12 +186,12 @@ fn pin(segs: &[IoVec], write: bool) -> KernelResult<PinnedPages> {
 fn rw_async(
     r: &Arc<IoRing>,
     file: Arc<File>,
-    segs: &[IoVec],
+    mem: Mem,
     sqe: &IoUringSqe,
     write: bool,
     flags: RwFlags,
 ) -> Option<KernelResult<i32>> {
-    let req = match Req::new(r, file, segs, sqe, write, flags) {
+    let req = match Req::new(r, file, mem, sqe, write, flags) {
         Ok(req) => req,
         Err(e) => return Some(Err(e)),
     };
@@ -195,7 +236,7 @@ pub struct Req {
     flags: RwFlags,
     /// The SQE asked RWF_NOWAIT: EAGAIN is its result
     rwf_nowait: bool,
-    pins: PinnedPages,
+    mem: Mem,
     /// The CQE result, set when it ends
     res: AtomicI32,
     /// The current issue is the nonblocking one
@@ -208,12 +249,12 @@ pub struct Req {
 crate::adapter!(pub ReqAdapter, Req, link);
 
 impl Req {
-    /// A request for `segs` (pinned here) at the SQE's offset, counted in
-    /// flight on its ring and task
+    /// A request for `mem` at the SQE's offset, counted in flight on its
+    /// ring and task
     fn new(
         r: &Arc<IoRing>,
         file: Arc<File>,
-        segs: &[IoVec],
+        mem: Mem,
         sqe: &IoUringSqe,
         write: bool,
         flags: RwFlags,
@@ -223,9 +264,12 @@ impl Req {
             o if o > i64::MAX as u64 => return Err(KernelError::InvalidArgument),
             o => (o, false),
         };
-        crate::fs::io::verify_area(&file, Some(pos), crate::fs::io::seg_len(segs))?;
+        let len = match &mem {
+            Mem::Pinned(p) => p.len(),
+            Mem::Fixed { segs: f, .. } => f.iter().map(|s| s.len as usize).sum(),
+        };
+        crate::fs::io::verify_area(&file, Some(pos), len)?;
         let tctx = tctx()?;
-        let pins = pin(segs, write)?;
         let req = try_arc(Self {
             link: Link::new(),
             ring: r.clone(),
@@ -239,7 +283,7 @@ impl Req {
             write,
             rwf_nowait: flags.nowait(),
             flags,
-            pins,
+            mem,
             res: AtomicI32::new(0),
             nowait_issue: AtomicBool::new(false),
             reissue: AtomicBool::new(false),
@@ -293,7 +337,10 @@ impl Req {
 
 impl AsyncIo for Req {
     fn segs(&self) -> &[PageSeg] {
-        self.pins.segs()
+        match &self.mem {
+            Mem::Pinned(p) => p.segs(),
+            Mem::Fixed { segs: f, .. } => f,
+        }
     }
 
     /// The I/O ended (Linux io_complete_rw), in any context: EAGAIN of the
