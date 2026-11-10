@@ -2171,6 +2171,13 @@ fn gen_version() -> Vec<u8> {
     Vec::from(output.as_bytes())
 }
 
+/// /proc/cmdline: the kernel command line (Linux cmdline_proc_show)
+fn gen_cmdline() -> Vec<u8> {
+    let mut v = Vec::from(crate::cmdline::saved().as_bytes());
+    v.push(b'\n');
+    v
+}
+
 /// Generate /proc/meminfo content (Linux meminfo_proc_show subset:
 /// 16-column labels, values in kB). Free memory is the frame
 /// allocator's exact count; Buffers is the block devices' caches,
@@ -2507,6 +2514,12 @@ fn procfs_mount(
                     ProcfsInodeData::new_file(crate::block::genhd::proc_partitions),
                 )?;
                 children.insert(String::from("partitions"), parts);
+                let cmdline = mk_inode(
+                    &sb,
+                    InodeMode::regular(0o444),
+                    ProcfsInodeData::new_file(gen_cmdline),
+                )?;
+                children.insert(String::from("cmdline"), cmdline);
             }
             Ok(())
         })
