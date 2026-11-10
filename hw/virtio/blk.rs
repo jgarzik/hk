@@ -15,13 +15,19 @@
 //! - A blk-mq driver (`block::blk_mq`): each virtqueue is one hardware
 //!   queue. A request is `[header] [data...] [status]`; headers and
 //!   status bytes live in a per-queue coherent pool, one slot per tag.
-//!   The chain is written to the tag's table (Linux virtblk_req's sg
-//!   table, allocated with the tag set), sized for max_segments, which
-//!   is capped at `MAX_SEGS` so a table is one page; with indirect
-//!   descriptors the table goes to the device as one ring entry (Linux
-//!   virtqueue_add_sgs), else it is copied to the ring as a chain. Data
-//!   segments are the bio's, DMA-mapped in `queue_rq` and unmapped in
-//!   `complete` from the table (the DMA API is lock-free).
+//!   The chain is written to a table (Linux virtblk_req's sg table):
+//!   the tag's own small one for up to `INLINE_SEGS` segments (Linux
+//!   keeps two inline), else one of the queue's `BIG_TABLES` full-size
+//!   ones (max_segments, capped at `MAX_SEGS` so one is a page), all
+//!   allocated with the queue; a request needing a full-size table when
+//!   none is free stays on the dispatch list and is retried when a
+//!   request completes (Linux: GFP_ATOMIC failure, BLK_STS_RESOURCE).
+//!   With indirect descriptors the table goes to the device as one ring
+//!   entry (Linux virtqueue_add_sgs), else it is copied to the ring as a
+//!   chain. Data segments are the bio's, DMA-mapped in `queue_rq` and
+//!   unmapped in `complete` from the table (the DMA API is lock-free).
+//!   Memory per queue at 256 tags: 256 x 96 B small tables + 8 x 4 KiB
+//!   full-size ones = 56 KiB (3.5 MiB at 64 queues, 14 MiB at 256).
 //! - Interrupts: MSI-X when the transport has it, a vector per queue
 //!   aimed at the first CPU blk-mq maps to that queue (Linux managed
 //!   affinity, `util::group_cpus`), reaping that queue; else INTx, where
@@ -103,20 +109,56 @@ const SLOT: usize = 32;
 const PAGE: u32 = 4096;
 /// Minors per disk (Linux PART_BITS = 4)
 const VD_MINORS: u16 = 16;
-/// Most data segments per request: a tag's table of header, data and
-/// status descriptors is one 4 KiB page (QEMU's default seg_max for its
-/// 256-entry ring). Linux takes up to VIRTIO_BLK_MAX_SG_ELEMS - 2
-/// (32766), allocating each request's sg table and indirect table as
-/// it goes; hk sizes each tag's table up front, so it bounds them
+/// Most data segments per request: a full-size table of header, data
+/// and status descriptors is one 4 KiB page (QEMU's default seg_max for
+/// its 256-entry ring). Linux takes up to VIRTIO_BLK_MAX_SG_ELEMS - 2
+/// (32766), allocating each request's indirect table as it goes; hk
+/// allocates its tables with the queue, so it bounds them
 const MAX_SEGS: u32 = 4096 / 16 - 2;
+/// Data segments a tag's own table holds (a 4 KiB I/O, or a few merged
+/// or split pieces of one)
+const INLINE_SEGS: usize = 4;
+/// Full-size tables per hardware queue: as many big requests in flight
+const BIG_TABLES: usize = 8;
+
+/// A hardware queue's full-size descriptor tables (allocated with it;
+/// taking and putting back never allocate)
+struct BigTables {
+    free: Vec<Vec<Desc>>,
+}
+
+impl BigTables {
+    fn new(n: usize, entries: usize) -> Result<Self, KernelError> {
+        let mut free = KVec::try_with_capacity(n)?;
+        for _ in 0..n {
+            free.try_push(try_vec(entries, Desc::default())?)?;
+        }
+        Ok(Self {
+            free: free.into_vec(),
+        })
+    }
+
+    /// A free table, or None: the request waits for a completion
+    fn take(&mut self) -> Option<Vec<Desc>> {
+        self.free.pop()
+    }
+
+    /// A table back (room was reserved: no allocation)
+    fn put(&mut self, t: Vec<Desc>) {
+        self.free.push(t);
+    }
+}
 
 /// A started request: its bio and descriptor table
 struct Slot {
     bio: Option<Box<Bio>>,
     /// `[header, data..., status]` with the data's DMA mappings (Linux
     /// virtblk_req's sg table, and the indirect table built from it):
-    /// room for max_segments, allocated with the tag
+    /// the tag's own small table, or a full-size one while the request
+    /// that needed it is in flight
     table: Vec<Desc>,
+    /// The tag's own small table while `table` is a full-size one
+    small: Option<Vec<Desc>>,
     /// Entries of `table` in use
     n: usize,
     /// DMA address of the mapped table (an indirect request)
@@ -131,6 +173,7 @@ struct VbQueue {
     slots: Vec<Slot>,
     /// Free tags (capacity reserved: push/pop never allocate)
     free: Vec<u16>,
+    big: BigTables,
     /// Most data segments per request (max_segments)
     max_segs: usize,
 }
@@ -158,7 +201,8 @@ impl VbQueue {
         for _ in 0..tags {
             slots.try_push(Slot {
                 bio: None,
-                table: try_vec(max_segs + 2, Desc::default())?,
+                table: try_vec(INLINE_SEGS.min(max_segs) + 2, Desc::default())?,
+                small: None,
                 n: 0,
                 table_dma: None,
             })?;
@@ -173,6 +217,7 @@ impl VbQueue {
             pool,
             slots: slots.into_vec(),
             free: free.into_vec(),
+            big: BigTables::new(BIG_TABLES, max_segs + 2)?,
             max_segs,
         })
     }
@@ -228,6 +273,15 @@ impl VbQueue {
         };
         set_chain(table, table.len() - 1, st, true);
         true
+    }
+
+    /// Give back a table `queue_rq` took for tag `t` and did not use
+    fn put_table(&mut self, t: u16, table: Vec<Desc>, big: bool) {
+        if big {
+            self.big.put(table);
+        } else {
+            self.slots[t as usize].table = table;
+        }
     }
 
     /// Unmap the data entries `data` of a table
@@ -287,8 +341,19 @@ impl MqOps for VbQueue {
         let Some(t) = self.free.pop() else {
             return Queued::Busy(bio);
         };
-        // The tag's table, out of its slot while it is filled (a move)
-        let mut table = core::mem::take(&mut self.slots[t as usize].table);
+        // The tag's small table, or a full-size one for more segments:
+        // none free, the request waits for a completion to put one back
+        // (Linux BLK_STS_RESOURCE); out of the slot while filled (a move)
+        let big = n > INLINE_SEGS;
+        let mut table = if big {
+            let Some(b) = self.big.take() else {
+                self.free.push(t);
+                return Queued::Busy(bio);
+            };
+            b
+        } else {
+            core::mem::take(&mut self.slots[t as usize].table)
+        };
         let ty = match bio.op {
             BioOp::Read => T_IN,
             BioOp::Write => T_OUT,
@@ -296,20 +361,24 @@ impl MqOps for VbQueue {
         };
         self.write_hdr(t, ty, bio.sector);
         if !self.fill(t, &bio, &mut table[..n + 2]) {
-            self.slots[t as usize].table = table;
+            self.put_table(t, table, big);
             self.free.push(t);
             return Queued::Failed(bio, KernelError::Io);
         }
         let added = self.add(t, &table[..n + 2]);
         let Ok(table_dma) = added else {
             self.unmap(&table[1..=n], bio.op);
-            self.slots[t as usize].table = table;
+            self.put_table(t, table, big);
             self.free.push(t);
             return Queued::Busy(bio);
         };
         let s = &mut self.slots[t as usize];
         s.bio = Some(bio);
-        s.table = table;
+        if big {
+            s.small = Some(core::mem::replace(&mut s.table, table));
+        } else {
+            s.table = table;
+        }
         s.n = n + 2;
         s.table_dma = table_dma;
         Queued::Started
@@ -333,6 +402,13 @@ impl MqOps for VbQueue {
             }
             let s = &self.slots[t as usize];
             self.unmap(&s.table[1..n - 1], bio.op);
+            // A full-size table goes back to the queue, the small one to
+            // the slot
+            let s = &mut self.slots[t as usize];
+            if let Some(small) = s.small.take() {
+                let b = core::mem::replace(&mut s.table, small);
+                self.big.put(b);
+            }
             bio.status = match unsafe { core::ptr::read_volatile(self.status(t)) } {
                 S_OK => Ok(()),
                 S_UNSUPP => Err(KernelError::OperationNotSupported),
@@ -671,3 +747,27 @@ pub static VIRTIO_BLK_DRIVER: crate::base::Driver = crate::base::Driver::new(
     },
     virtio::virtio_dev_probe,
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The full-size tables run out after BIG_TABLES requests and come
+    /// back as those complete; nothing allocates in between
+    #[test]
+    fn big_tables_bounded() {
+        let mut b = BigTables::new(BIG_TABLES, 256).unwrap();
+        let mut taken = Vec::new();
+        for _ in 0..BIG_TABLES {
+            let t = b.take().unwrap();
+            assert_eq!(t.len(), 256);
+            taken.push(t);
+        }
+        assert!(b.take().is_none());
+        let cap = b.free.capacity();
+        b.put(taken.pop().unwrap());
+        assert_eq!(b.free.capacity(), cap);
+        assert!(b.take().is_some());
+        assert!(b.take().is_none());
+    }
+}

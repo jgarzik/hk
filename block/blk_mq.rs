@@ -568,4 +568,64 @@ mod tests {
         assert_eq!(EIO.load(Ordering::Relaxed), 2);
         mq.drain();
     }
+
+    /// A driver queue with room for one request: others are refused
+    /// (Busy) until it completes
+    struct One {
+        busy: Option<Box<Bio>>,
+    }
+
+    impl MqOps for One {
+        fn queue_rq(&mut self, bio: Box<Bio>) -> Queued {
+            if self.busy.is_some() {
+                return Queued::Busy(bio);
+            }
+            self.busy = Some(bio);
+            Queued::Started
+        }
+        fn commit(&mut self) {}
+        /// The started request is done
+        fn complete(&mut self, done: &mut BioList) {
+            if let Some(b) = self.busy.take() {
+                done.push(b);
+            }
+        }
+        fn depth(&self) -> usize {
+            4
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn core::any::Any + Send> {
+            self
+        }
+    }
+
+    /// A request the driver refuses for want of room (virtio-blk: no
+    /// free full-size table) waits on the dispatch list and starts when
+    /// a completion makes room (Linux BLK_STS_RESOURCE, rerun on
+    /// completion)
+    #[test]
+    fn refused_request_restarts_on_completion() {
+        use core::sync::atomic::AtomicU32;
+        static ENDED: AtomicU32 = AtomicU32::new(0);
+        fn done(_b: Box<Bio>) {
+            ENDED.fetch_add(1, Ordering::Relaxed);
+        }
+        let ops = One { busy: None };
+        let mq = Arc::new(BlkMq::new(alloc::vec![Box::new(ops) as Box<dyn MqOps>]).unwrap());
+        for _ in 0..2 {
+            let mut b = bio(false);
+            b.end_io = Some(done);
+            mq.submit(b);
+        }
+        // One started, one refused and waiting
+        assert_eq!(mq.rqs[0].load(Ordering::Relaxed), 2);
+        assert!(!mq.hctxs[0].lock().dispatch.is_empty());
+        // The first completes: it ends and the waiting one starts
+        mq.complete(0);
+        assert_eq!(ENDED.load(Ordering::Relaxed), 1);
+        assert!(mq.hctxs[0].lock().dispatch.is_empty());
+        assert_eq!(mq.rqs[0].load(Ordering::Relaxed), 1);
+        mq.complete(0);
+        assert_eq!(ENDED.load(Ordering::Relaxed), 2);
+        assert!(mq.idle());
+    }
 }
