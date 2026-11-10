@@ -175,7 +175,8 @@ pub struct Bio {
     /// totals beyond its head, Linux __data_len, nr_phys_segments)
     merged_sectors: u64,
     merged_segs: usize,
-    /// Address of the queue a plugged bio is for (`plug`)
+    /// Address of the queue a bio is held for on a plug (`plug`), or a
+    /// shared flush is out for (`FqState::kick`)
     pub(super) plug_q: usize,
     /// Software queue (CPU) of its blk-mq request, set when the request
     /// is taken (Linux rq->mq_ctx)
@@ -555,11 +556,6 @@ impl RequestQueue {
         }
     }
 
-    /// The blk-mq queues, to take a request for a bio about to be held
-    pub(super) fn mq_queues(&self) -> Option<&BlkMq> {
-        self.mq()
-    }
-
     /// A submitted bio: on the task's plug if it has one, the queue is
     /// blk-mq and it is no flush (Linux blk_mq_submit_bio), else
     /// dispatched
@@ -597,8 +593,6 @@ struct FqState {
     /// The flush, allocated with the queue, while not in flight (Linux
     /// fq->flush_rq)
     flush: Option<Box<Bio>>,
-    /// Address of the queue, for the flush (set by each write)
-    q: usize,
 }
 
 impl FlushQueue {
@@ -609,7 +603,6 @@ impl FlushQueue {
             running: BioList::new(),
             data_in_flight: 0,
             flush: Some(Bio::new(BioOp::Flush, 0)),
-            q: 0,
         }))
     }
 }
@@ -623,8 +616,9 @@ impl FqState {
     /// The flush to send, if one should go now (Linux blk_kick_flush):
     /// none in flight (C1), writes waiting, and no FUA data in flight
     /// that it could also serve (C2) unless the oldest waited too long
-    /// (C3). Its writes move to `running`
-    fn kick(&mut self, fq: &FlushQueue) -> Option<(Box<Bio>, usize)> {
+    /// (C3). Its writes move to `running`; the flush carries its flush
+    /// queue and `q`, the queue that owns it
+    fn kick(&mut self, fq: &FlushQueue, q: usize) -> Option<Box<Bio>> {
         if self.flush.is_none() || self.pending.is_empty() {
             return None;
         }
@@ -638,16 +632,18 @@ impl FqState {
         f.status = Ok(());
         f.end_io = Some(fq_flush_done);
         f.private = core::ptr::from_ref(fq) as usize;
-        Some((f, self.q))
+        f.plug_q = q;
+        Some(f)
     }
 }
 
 /// Send a flush `kick` picked (no flush queue lock held)
-fn send_flush(f: Option<(Box<Bio>, usize)>) {
-    if let Some((f, q)) = f {
-        // SAFETY: a write set `q` from its live queue, whose disk outlives
-        // the bios submitted to it, this flush's writes among them
-        let q = unsafe { &*(q as *const RequestQueue) };
+fn send_flush(f: Option<Box<Bio>>) {
+    if let Some(f) = f {
+        // SAFETY: `kick` took `plug_q` from a write's live queue, whose
+        // disk outlives the bios submitted to it, this flush's writes
+        // among them
+        let q = unsafe { &*(f.plug_q as *const RequestQueue) };
         // A blk-mq dispatch only takes IRQ-safe queue locks: fine in
         // hardirq
         q.dispatch(f);
@@ -662,20 +658,19 @@ impl RequestQueue {
     /// queue). The sequence is allocated here, in the submitter's
     /// context, so completions allocate nothing.
     fn postflush(&self, mut bio: Box<Bio>) {
-        let h = self.mq().map_or(0, BlkMq::this_hctx);
-        let fq = &self.fqs[h.min(self.fqs.len() - 1)];
+        let h = self
+            .mq()
+            .map_or(0, BlkMq::this_hctx)
+            .min(self.fqs.len() - 1);
         let seq = box_nofail(FlushSeq {
             end_io: bio.end_io.take(),
             private: bio.private,
-            fq: core::ptr::from_ref(fq) as usize,
+            q: core::ptr::from_ref(self) as usize,
+            h,
         });
         bio.end_io = Some(flushseq_data_done);
         bio.private = Box::into_raw(seq) as usize;
-        {
-            let mut st = fq.0.lock();
-            st.data_in_flight += 1;
-            st.q = core::ptr::from_ref(self) as usize;
-        }
+        self.fqs[h].0.lock().data_in_flight += 1;
         self.dispatch(bio);
     }
 }
@@ -685,8 +680,10 @@ struct FlushSeq {
     /// The write's own completion, restored before it runs
     end_io: Option<EndIo>,
     private: usize,
-    /// Address of its flush queue, in its queue (which outlives it)
-    fq: usize,
+    /// Address of its queue (which outlives it) and its flush queue
+    /// there
+    q: usize,
+    h: usize,
 }
 
 /// The data of a post-flush write is done (any context): a failed write
@@ -695,7 +692,13 @@ struct FlushSeq {
 fn flushseq_data_done(bio: Box<Bio>) {
     // SAFETY: `postflush` made `private` a leaked FlushSeq, owned by this
     // write until it ends
-    let fq = unsafe { &*((*(bio.private as *const FlushSeq)).fq as *const FlushQueue) };
+    let (q, h) = unsafe {
+        let seq = &*(bio.private as *const FlushSeq);
+        (seq.q, seq.h)
+    };
+    // SAFETY: the queue outlives its bios (FlushSeq.q)
+    let rq = unsafe { &*(q as *const RequestQueue) };
+    let fq = &rq.fqs[h];
     let failed = bio.status.is_err();
     let (f, bio) = {
         let mut st = fq.0.lock();
@@ -709,7 +712,7 @@ fn flushseq_data_done(bio: Box<Bio>) {
             st.pending.push(bio);
             None
         };
-        (st.kick(fq), bio)
+        (st.kick(fq, q), bio)
     };
     send_flush(f);
     if let Some(bio) = bio {
@@ -723,12 +726,12 @@ fn flushseq_data_done(bio: Box<Bio>) {
 fn fq_flush_done(f: Box<Bio>) {
     // SAFETY: `kick` made `private` the flush queue, in its queue
     let fq = unsafe { &*(f.private as *const FlushQueue) };
-    let status = f.status;
+    let (status, q) = (f.status, f.plug_q);
     let (mut done, next) = {
         let mut st = fq.0.lock();
         st.flush = Some(f);
         let done = core::mem::take(&mut st.running);
-        (done, st.kick(fq))
+        (done, st.kick(fq, q))
     };
     send_flush(next);
     while let Some(mut bio) = done.pop() {

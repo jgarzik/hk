@@ -144,7 +144,7 @@ pub fn hold(q: &RequestQueue, mut bio: Box<Bio>) -> Result<(), Box<Bio>> {
     };
     // The request is taken before it is held (Linux
     // blk_mq_get_new_requests before blk_add_rq_to_plug)
-    if let Some(mq) = q.mq_queues()
+    if let Some(mq) = q.mq()
         && !mq.get_rq(&mut bio)
     {
         crate::block::blkdev::bio_io_error(bio, crate::util::error::KernelError::WouldBlock);

@@ -151,7 +151,6 @@ struct Dio<'a> {
     /// FUA for an O_DSYNC write (Linux dio_bio_write_op), NOWAIT for
     /// RWF_NOWAIT (Linux REQ_NOWAIT)
     bflags: BioFlags,
-    nowait: bool,
     /// First sector
     sector: u64,
 }
@@ -162,15 +161,19 @@ impl<'a> Dio<'a> {
         Self {
             b,
             op: if I::READ { BioOp::Read } else { BioOp::Write },
-            bflags: match (!I::READ && dsync, flags.nowait()) {
-                (true, true) => BioFlags::FUA | BioFlags::NOWAIT,
-                (true, false) => BioFlags::FUA,
-                (false, true) => BioFlags::NOWAIT,
-                (false, false) => BioFlags::empty(),
+            bflags: {
+                let mut f = BioFlags::empty();
+                f.set(BioFlags::FUA, !I::READ && dsync);
+                f.set(BioFlags::NOWAIT, flags.nowait());
+                f
             },
-            nowait: flags.nowait(),
             sector: pos >> SECTOR_SHIFT,
         }
+    }
+
+    /// RWF_NOWAIT
+    fn nowait(&self) -> bool {
+        self.bflags.contains(BioFlags::NOWAIT)
     }
 
     /// Pin the next bio's worth of `it`, at most `max` pages
@@ -232,7 +235,7 @@ impl<'a> Dio<'a> {
                 }
             };
             // Another bio would follow (Linux: EAGAIN, nothing sent)
-            if self.nowait && it.count() > 0 {
+            if self.nowait() && it.count() > 0 {
                 ret = Err(KernelError::WouldBlock);
                 break;
             }
@@ -289,7 +292,7 @@ impl<'a> Dio<'a> {
                     break;
                 }
             };
-            if self.nowait && sent == 0 && !cur.done(segs) {
+            if self.nowait() && sent == 0 && !cur.done(segs) {
                 return Err(KernelError::WouldBlock);
             }
             bio.flags = self.bflags;
