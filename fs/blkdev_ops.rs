@@ -430,7 +430,7 @@ pub fn bdev_inode(dev: DevId, size: u64) -> Arc<Inode> {
         &BDEV_INODE_OPS,
     ));
     inode.set_size(size);
-    inode.i_data.set_aops(&BDEV_AOPS);
+    inode.i_data.set_aops(&BDEV_AOPS, Some(&inode));
     inode
 }
 
@@ -600,12 +600,9 @@ impl FileOps for BlockFileOps {
         let n = if direct {
             dio_write(file, from, pos, flags)?
         } else {
-            let n = filemap::write_iter(&b.bd_inode, from, pos)?;
-            // The cached write is the device's periodic writeback's
-            // (Linux generic_perform_write dirties the folio:
-            // __mark_inode_dirty, wb_wakeup_delayed)
-            crate::fs::fs_writeback::mark_inode_dirty(&b.bd_inode);
-            n
+            // Its dirtied pages mark the device's inode dirty, for its
+            // periodic writeback (`filemap::dirty_page`)
+            filemap::write_iter(&b.bd_inode, from, pos)?
         };
         if at.is_none() {
             file.advance_pos(n as u64);

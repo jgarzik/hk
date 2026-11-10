@@ -252,7 +252,6 @@ fn write_tracked(
             crate::mm::page::lock_page(p);
             crate::mm::filemap::dirty_page(&inode.i_data, p);
             crate::mm::page::unlock_page(p);
-            crate::fs::fs_writeback::mark_inode_dirty(&inode);
         }
         crate::mm::filemap::put_page(p);
     }

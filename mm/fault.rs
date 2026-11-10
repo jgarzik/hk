@@ -420,7 +420,6 @@ fn file_page(
         let notify = area.prot & PROT_WRITE != 0 && inode.i_data.aops().can_dirty();
         if notify && access == Access::Write {
             super::filemap::dirty_page(&inode.i_data, page);
-            crate::fs::fs_writeback::mark_inode_dirty(&inode);
         }
         return Some(Ok((page, true, notify && access != Access::Write)));
     }
@@ -601,7 +600,6 @@ fn do_wp_page(mm: &Mm, ptep: Pte<'_>, pte: u64, addr: u64, area: &Area) -> Resul
         super::filemap::dirty_page(&inode.i_data, phys);
         super::page::unlock_page(phys);
         FRAME_ALLOCATOR.decref(phys);
-        crate::fs::fs_writeback::mark_inode_dirty(&inode);
         super::writeback::balance_dirty_pages(&inode);
         return r;
     }

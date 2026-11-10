@@ -138,7 +138,6 @@ impl PinnedPages {
                 super::page::lock_page(phys);
                 super::filemap::dirty_page(&inode.i_data, phys);
                 super::page::unlock_page(phys);
-                crate::fs::fs_writeback::mark_inode_dirty(inode);
             }
             None => {
                 if let Some(pg) = super::page::phys_to_page(phys) {

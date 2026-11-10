@@ -154,6 +154,9 @@ pub struct AddressSpace {
     /// is): written under the `i_pages` lock, read by the periodic
     /// writeback (vm.dirty_expire_centisecs)
     pub dirtied_when: AtomicU64,
+    /// The inode it belongs to, for page dirtying to mark it dirty
+    /// (Linux mapping->host; set with the aops by `set_aops`)
+    host: Once<alloc::sync::Weak<Inode>>,
 }
 
 impl AddressSpace {
@@ -169,12 +172,18 @@ impl AddressSpace {
             writable: core::sync::atomic::AtomicI64::new(0),
             i_mmap: AnonVma::default(),
             dirtied_when: AtomicU64::new(0),
+            host: Once::new(),
         }
     }
 
-    /// Set the filesystem's operations (once, before any page is cached)
-    pub fn set_aops(&self, a: &'static dyn Aops) {
+    /// Set the filesystem's operations and, for a mapping whose pages
+    /// get dirty, the inode it belongs to (once, before any page is
+    /// cached; Linux inode->i_mapping->a_ops, mapping->host)
+    pub fn set_aops(&self, a: &'static dyn Aops, host: Option<&alloc::sync::Arc<Inode>>) {
         self.a_ops.call_once(|| a);
+        if let Some(h) = host {
+            self.host.call_once(|| alloc::sync::Arc::downgrade(h));
+        }
     }
 
     pub fn aops(&self) -> &'static dyn Aops {
@@ -557,13 +566,18 @@ fn truncate_final(m: &AddressSpace) {
     m.nrpages.store(0, Ordering::Relaxed);
 }
 
-/// Set the page's dirty bit and the mapping's DIRTY mark (Linux
-/// filemap_dirty_folio)
+/// Set the page's dirty bit and the mapping's DIRTY mark, and mark its
+/// inode dirty (Linux folio_mark_dirty: ->dirty_folio, whose
+/// __folio_mark_dirty calls __mark_inode_dirty(I_DIRTY_PAGES)). Under
+/// the page lock at most
 pub fn dirty_page(m: &AddressSpace, phys: u64) {
     if !m.aops().can_dirty() {
         return;
     }
     m.aops().dirty_folio(m, phys);
+    if let Some(inode) = m.host.get().and_then(alloc::sync::Weak::upgrade) {
+        crate::fs::fs_writeback::mark_inode_dirty(&inode);
+    }
 }
 
 /// The generic dirtying (Linux filemap_dirty_folio): PG_dirty and the

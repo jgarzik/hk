@@ -123,7 +123,7 @@ fn file_mapping(sb: &SuperBlock, inode: &Inode) {
     inode.i_data.set_flags(filemap::AS_UNEVICTABLE);
     // tmpfs charges its pages (Linux shmem_inode_acct_blocks)
     if let Some(a) = tmpfs::with(sb, |t| t.page_acct()) {
-        inode.i_data.set_aops(&TMPFS_AOPS);
+        inode.i_data.set_aops(&TMPFS_AOPS, None);
         inode.i_data.set_acct(a);
         // Every tmpfs file starts sealed against sealing (Linux
         // shmem_get_inode); memfd_create may clear it
@@ -132,7 +132,7 @@ fn file_mapping(sb: &SuperBlock, inode: &Inode) {
             .seals
             .store(crate::mm::memfd::F_SEAL_SEAL, Ordering::Relaxed);
     } else {
-        inode.i_data.set_aops(&RAMFS_AOPS);
+        inode.i_data.set_aops(&RAMFS_AOPS, None);
     }
 }
 

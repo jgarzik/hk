@@ -244,7 +244,6 @@ fn vfat_write(
         let _ = write_failed(inode, &sb_data);
     }
     let n = r?;
-    super::fs_writeback::mark_inode_dirty(inode);
     crate::mm::writeback::balance_dirty_pages(inode);
     if inode.get_size() != old {
         update_size(inode, &sb_data)?;
@@ -1748,7 +1747,7 @@ impl InodeOps for VfatInodeOps {
             Arc::downgrade(&sb),
             &VFAT_INODE_OPS,
         ))?;
-        inode.i_data.set_aops(&VFAT_FILE_AOPS);
+        inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
 
         inode.set_private(new_private(VfatInodeData {
             start_cluster,
@@ -1833,7 +1832,7 @@ impl InodeOps for VfatInodeOps {
             Arc::downgrade(&sb),
             &VFAT_INODE_OPS,
         ))?;
-        inode.i_data.set_aops(&VFAT_FILE_AOPS);
+        inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
 
         inode.set_private(new_private(VfatInodeData {
             start_cluster: new_cluster,
@@ -2177,7 +2176,7 @@ fn create_inode_for_entry(
         Arc::downgrade(sb),
         &VFAT_INODE_OPS,
     ))?;
-    inode.i_data.set_aops(&VFAT_FILE_AOPS);
+    inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
 
     inode.set_private(new_private(VfatInodeData {
         start_cluster: entry.start_cluster,
@@ -2496,7 +2495,9 @@ fn vfat_mount_dev(
         Arc::downgrade(&sb),
         &VFAT_INODE_OPS,
     ))?;
-    root_inode.i_data.set_aops(&VFAT_FILE_AOPS);
+    root_inode
+        .i_data
+        .set_aops(&VFAT_FILE_AOPS, Some(&root_inode));
 
     root_inode.set_private(new_private(VfatInodeData {
         start_cluster: boot_sector.root_cluster,
