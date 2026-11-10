@@ -686,6 +686,13 @@ lock (preallocate, or a sleeping lock as in Linux): ROADMAP phase A.
   SCHED_DEADLINE (EINVAL).
 - Kernel preemption is off: a long kernel path delays a woken task of
   a higher class until its next scheduling point.
+- The idle loop (`idle_task_entry`) halts at once: no polling before
+  the halt (TIF_POLLING_NRFLAG, haltpoll), so every remote wakeup pays
+  an IPI and the exit from HLT/WFI. It also runs `yield_now` and
+  `sched_balance_rq` on every pass.
+- `select_idle_sibling` has no wake_affine and no recent_used_cpu: a
+  woken task moves between CPUs from one wakeup to the next, and with
+  it the blk-mq hardware queue its I/O goes to.
 
 ## xHCI driver gaps on real hardware
 
