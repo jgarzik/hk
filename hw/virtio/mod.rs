@@ -4,7 +4,8 @@
 //!
 //! Transports (`pci`: modern virtio-PCI only, no legacy) register each
 //! device as virtio<N> on the virtio bus; binding negotiates features
-//! against the matching driver and hands it an `Arc<VirtioDevice>`. Drivers set up their queues
+//! against the matching driver and hands it an `Arc<VirtioDevice>`. Drivers may ask for MSI-X
+//! vectors (`alloc_vectors`), set up their queues
 //! (`setup_vq`), register an interrupt callback (`request_irq`) and call
 //! `ready()` (DRIVER_OK). Their remove resets the device (`reset`), frees
 //! the interrupt (`free_irq`) and drops their queues; the bus then
@@ -80,8 +81,9 @@ pub fn negotiate(device: u64, driver: u64) -> Result<u64, KernelError> {
 
 /// Interrupt callbacks of a virtio driver (IRQ context: lock-free only)
 pub trait VirtioIrq: Send + Sync {
-    /// A used buffer may be available on some queue
-    fn vq_interrupt(&self);
+    /// A used buffer may be available on queue `vq` (MSI-X), or on any
+    /// queue (None: INTx)
+    fn vq_interrupt(&self, vq: Option<u16>);
     /// The device configuration changed
     fn config_changed(&self);
 }

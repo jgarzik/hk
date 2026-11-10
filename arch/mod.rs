@@ -486,6 +486,13 @@ pub trait IrqChipOps {
     /// The IRQ of a PCI function's INTx `pin` (1 = INTA, 0 = none);
     /// `line` is its config-space Interrupt Line
     fn pci_intx_irq(bus: u8, device: u8, function: u8, pin: u8, line: u8) -> Option<u32>;
+    /// A free MSI line aimed at `cpu`, and the message that raises it
+    /// (Linux irq_domain_alloc_irqs on the MSI parent domain, then
+    /// irq_chip_compose_msi_msg); None when there is no room, or the
+    /// controller takes no MSI. Thread context
+    fn msi_alloc(cpu: u32) -> Option<(u32, crate::irq::MsiMsg)>;
+    /// Free an MSI line of `msi_alloc` (its handlers are gone)
+    fn msi_free(irq: u32);
 }
 
 /// Task context and context switching operations

@@ -5,7 +5,9 @@
 //!
 //! A submitter puts its bio on its CPU's software queue (Linux
 //! blk_mq_ctx), then runs the hardware queue that CPU maps to (Linux
-//! blk_mq_hw_ctx; `cpu % nr_hw`): the software queues of that hardware
+//! blk_mq_hw_ctx; consecutive CPUs share one, `util::group_cpus`, as
+//! Linux blk_mq_map_queues and a driver's interrupt affinity map them):
+//! the software queues of that hardware
 //! queue with bios pending (its `ctx_map` bitmap, Linux
 //! blk_mq_hctx_mark_pending / flush_busy_ctxs) are spliced onto its
 //! dispatch list and the driver's `queue_rq` takes bios until it is
@@ -49,6 +51,7 @@ use crate::sync::waitqueue::WaitQueue;
 
 use super::blkdev::{Bio, BioList, bio_endio};
 use crate::util::error::KernelError;
+use crate::util::group_cpus::{first_cpu, group_of};
 
 /// Result of `MqOps::queue_rq` (Linux blk_status_t of queue_rq)
 pub enum Queued {
@@ -136,16 +139,16 @@ pub struct BlkMq {
     /// Never empty (`new` refuses that): `map` divides by its length
     hctxs: Vec<IrqSpinlock<HwState>>,
     /// Per hardware queue, a bit per software queue mapped to it with
-    /// bios pending (bit `cpu / nr_hw`; Linux hctx->ctx_map)
+    /// bios pending (bit `cpu - ` its group's first CPU; Linux
+    /// hctx->ctx_map)
     ctx_maps: Vec<Box<[AtomicU64]>>,
     /// `drain` waits here (Linux mq_freeze_wq)
     drained: WaitQueue,
 }
 
 impl BlkMq {
-    /// One hardware queue per element of `ops`; EINVAL for none (CPUs
-    /// are mapped `cpu % nr_hw`: Linux blk_mq_alloc_tag_set refuses
-    /// nr_hw_queues 0)
+    /// One hardware queue per element of `ops`; EINVAL for none (Linux
+    /// blk_mq_alloc_tag_set refuses nr_hw_queues 0)
     pub fn new(ops: Vec<Box<dyn MqOps>>) -> Result<Self, KernelError> {
         if ops.is_empty() {
             return Err(KernelError::InvalidArgument);
@@ -176,14 +179,22 @@ impl BlkMq {
         self.hctxs.len()
     }
 
+    /// CPUs and hardware queues, for `util::group_cpus`
+    fn groups(&self) -> (u32, u32) {
+        // Both are at most NR_CPUS resp. a driver's u16 queue count
+        (self.ctxs.len() as u32, self.hctxs.len() as u32)
+    }
+
     /// Hardware queue of `cpu` (Linux blk_mq_map_queues)
     fn map(&self, cpu: usize) -> usize {
-        cpu % self.hctxs.len()
+        let (n, g) = self.groups();
+        group_of(cpu as u32, n, g) as usize
     }
 
     /// `cpu`'s word and bit in its hardware queue's `ctx_map`
     fn ctx_bit(&self, cpu: usize) -> (usize, u64) {
-        let i = cpu / self.hctxs.len();
+        let (n, g) = self.groups();
+        let i = cpu - first_cpu(self.map(cpu) as u32, n, g) as usize;
         (i / 64, 1 << (i % 64))
     }
 
@@ -205,13 +216,14 @@ impl BlkMq {
     /// pending, then dispatch (Linux blk_mq_run_hw_queue)
     fn run(&self, h: usize) {
         let mut batch = BioList::new();
-        let nr_hw = self.hctxs.len();
+        let (n, g) = self.groups();
+        let first = first_cpu(h as u32, n, g) as usize;
         for (w, word) in self.ctx_maps[h].iter().enumerate() {
             let mut bits = word.load(Ordering::Relaxed);
             while bits != 0 {
                 let b = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let cpu = (w * 64 + b) * nr_hw + h;
+                let cpu = first + w * 64 + b;
                 let mut ctx = self.ctxs[cpu].lock();
                 batch.append(&mut ctx);
                 word.fetch_and(!(1 << b), Ordering::Relaxed);

@@ -331,8 +331,20 @@ fn handle_interrupt(vector: u64) {
         v if v == u64::from(CALL_FUNCTION_VECTOR) => handle_call_function(),
         v if v == u64::from(RESCHEDULE_VECTOR) => handle_reschedule(),
         v if v == u64::from(lapic::ERROR_APIC_VECTOR) => in_irq(handle_apic_error),
-        v => in_irq(|| handle_spurious(v as u8)),
+        // Vectors are below 256: `as u8` keeps them
+        v => match super::irq::vector_irq(v as u8) {
+            Some(irq) => handle_msi(irq),
+            None => in_irq(|| handle_spurious(v as u8)),
+        },
     }
+}
+
+/// An MSI line's interrupt (Linux common_interrupt, handle_edge_irq):
+/// edge-triggered, so acknowledged first; one raised while the handlers
+/// run comes again
+fn handle_msi(irq: u32) {
+    lapic::eoi();
+    crate::irq::handle_irq(irq);
 }
 
 /// si_code for a user x87 (#MF) or SIMD (#XM) floating-point exception

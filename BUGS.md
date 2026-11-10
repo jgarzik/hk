@@ -774,7 +774,10 @@ line firmware wrote into each function's Interrupt Line register (PIC
 mode, legacy BIOS boot), delivered to the boot CPU only. Real hardware
 in APIC mode (UEFI boot; Linux on the Dell uses IOAPIC 16-23 and MSI)
 needs IOAPIC with ACPI `_PRT` routing, or MSI/MSI-X, which xHCI, AHCI
-and r8169 all support. The MADT parser skips IOAPIC entries (Linux
+and r8169 all support: MSI-X exists (`hw/pci/msix.rs`, x86 vectors in
+`arch/x86_64/irq.rs`) but only virtio-blk uses it, and plain MSI (the
+MSI capability, which RTL8168g and some AHCI parts offer alone) is
+missing. The MADT parser skips IOAPIC entries (Linux
 acpi_parse_ioapic registers them).
 
 ## ACPI power management gaps
@@ -824,7 +827,8 @@ fat_getattr reports the cluster size (`fs/stat.rs` `blksize`).
   BLKROSET, BLKDISCARD, BLKZEROOUT, BLKIOMIN/OPT, BLKALIGNOFF,
   BLKSECTGET, HDIO_GETGEO and the BLKPG partition ioctls are ENOTTY.
 - virtio-blk: modern devices only (QEMU needs `disable-legacy=on`;
-  Linux also drives transitional devices), INTx only (no MSI-X),
+  Linux also drives transitional devices), INTx on arm64 (no MSI: the
+  GICv3 ITS has no driver; Linux uses it on QEMU virt),
   capacity changes (config interrupts) are ignored, no DISCARD,
   WRITE_ZEROES, GET_ID (serial) or secure erase. The disk's queues are
   fixed at probe.

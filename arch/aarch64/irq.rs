@@ -28,4 +28,12 @@ impl IrqChipOps for Aarch64Arch {
     fn pci_intx_irq(bus: u8, device: u8, function: u8, pin: u8, _line: u8) -> Option<u32> {
         super::pci_irq::intx_to_intid(bus, device, function, pin)
     }
+
+    /// MSI needs the GICv3 ITS (or a GICv2m frame), which hk does not
+    /// drive: PCI functions stay on INTx
+    fn msi_alloc(_cpu: u32) -> Option<(u32, crate::irq::MsiMsg)> {
+        None
+    }
+
+    fn msi_free(_irq: u32) {}
 }

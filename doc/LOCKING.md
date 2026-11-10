@@ -3482,6 +3482,7 @@ ISRs only ack the device, set atomics and use IRQ-safe deferral
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
 | `IrqDesc.lock` (`irq.rs`; one per line of the static `IRQ_TABLE`, Linux desc->lock) | `IrqSpinlock` | taken in IRQ (`handle_irq`) and process context (`request_irq`, a registration's drop) | leaf, except that the interrupt controller's line mask/unmask (`arch::IrqChipOps`) and the line's handlers run under it. Lines never nest: no code holds two descriptors' locks |
+| `MATRIX` (`arch/x86_64/irq.rs`, Linux vector_lock over the irq_matrix) | spin `Mutex` | thread only (`msi_alloc`, `msi_free`: a driver's probe and remove) | leaf: hands out MSI lines and per-CPU device vectors and writes each CPU's `VECTOR_IRQ` table (atomics, read lock-free with acquire by the interrupt entry on that CPU, Linux per-CPU vector_irq) |
 | `I8259A_LOCK` (`arch/x86_64/pic.rs`), `IRQ_CONTROLLER_LOCK` (`arch/aarch64/gic.rs`) | `IrqSpinlock<()>` | any context | leaf, under `IrqDesc.lock`: the chip state lines share (the PIC mask registers; GICD_ICFGR, 16 SPIs per register) changes under it (Linux i8259A_lock, irq-gic-common.c irq_controller_lock) |
 
 Generic interface (`crate::irq`): `request_irq(irq, Arc<T: IrqHandler>)
@@ -3511,7 +3512,13 @@ __setup_irq clearing IRQS_SPURIOUS_DISABLED).
   the QEMU virt swizzle INTID 35 + (slot + pin - 1) % 4.
 - x86-64: legacy 8259 PIC with the firmware-assigned config-space Interrupt
   Line (QEMU `pc`). Real hardware in APIC mode (Dell OptiPlex 3020 target)
-  needs IOAPIC + ACPI `_PRT` routing (not implemented).
+  needs IOAPIC + ACPI `_PRT` routing (not implemented). MSI lines (16 and
+  up) are one LAPIC vector of one CPU each (`msi_alloc`, an `MsiIrq` freed
+  on drop); the chip's mask/unmask leave them alone, the device's MSI-X
+  entry is their mask (`hw/pci/msix.rs`: unmasked after `request`,
+  masked before the handler is dropped, under no lock). The entry acks
+  the LAPIC, then runs `handle_irq` (edge).
+- aarch64 has no MSI (no GICv3 ITS driver): `msi_alloc` is None.
 - Handlers run in IRQ context with their line's lock held: they must only ack
   the device, touch atomics/IrqSpinlocks and wake threads; they must not
   request or free IRQs. Once a registration's drop returns its handler is
@@ -3737,7 +3744,7 @@ not rely on either.
 | virtio-net `tx` queue | `spin::Mutex<Option<..>>` | thread only (xmit, poll reclaim, remove) | leaf; one descriptor per frame; ring full -> drop, `tx_dropped`, ENOBUFS; empty once removed |
 | virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx` |
 | virtio-PCI transport (`hw/virtio/pci.rs`) | none | probe and remove (under the virtio device's or the PCI function's `Device.lock`), then IRQ (ISR byte) | common config (status, features, queues, reset) written only under those device locks; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
-| Drivers' IRQ registrations: `VirtioDevice.irq` (the INTx handler owning the virtio driver's callbacks), the e1000 binding's `irq`, `Serial8250.irq`, `Pl011Port.irq` | spin `Mutex<Option<IrqRegistration<..>>>` (virtio: `Mutex<IrqSlot>`) | thread only (probe sets it, remove takes it; virtio: `request_irq` claims the slot, registers unlocked, then stores it or frees the claim; `free_irq` takes it) | leaf: the registration is made and dropped (`IrqDesc.lock`) unlocked; the ISR never takes it (the handler holds its device state) |
+| Drivers' IRQ registrations: `VirtioDevice.irq` (MSI-X vectors, then their per-vector handlers or the INTx handler, owning the virtio driver's callbacks), the e1000 binding's `irq`, `Serial8250.irq`, `Pl011Port.irq` | spin `Mutex<Option<IrqRegistration<..>>>` (virtio: `Mutex<IrqSlot>`) | thread only (probe sets it, remove takes it; virtio: `alloc_vectors` enables MSI-X unlocked and stores the vectors, `setup_vq` writes a queue's vector under it, `request_irq` claims the slot, registers unlocked, then stores it or frees the claim; `free_irq` takes it) | leaf: vectors are enabled, registrations made and dropped (`IrqDesc.lock`, `MATRIX`) unlocked; the ISR never takes it (the handler holds its device state) |
 | PCI and USB `DYNIDS` (hw/pci/driver.rs, hw/usb/usbcore.rs; Linux dynids.lock) | spin Mutex | thread only | leaf: new_id/remove_id and each match take it alone; the probing after new_id runs with it dropped |
 | `ScsiDisk.state` (block/sd.rs, Linux sdev_state + state_mutex) | spin `Mutex<ScsiDeviceState>` | thread only | leaf: transitions (Linux's legal table) and each command's state check take it alone, never across I/O |
 | `util::ida::Ida` allocators: virtio, virtio-blk and sd indexes (Linux virtio_index_ida, vd_index_ida, sd_index_ida), namespace inode numbers (`ns::inum`, Linux proc_inum_ida) | `IrqSpinlock` | alloc thread only; free any context | leaf; nothing allocates under it (alloc grows the bitmap with it dropped, fallibly for `try_alloc`); a disk index is freed when the disk's last reference drops, a namespace's number when the namespace goes |
@@ -4210,7 +4217,8 @@ is `SCHED:FAIL scheduling while atomic`).
   as above); a no-op while the NAPI is scheduled or disabled
 - Workqueues have no IRQ-side work: the worker thread promotes expired
   delayed work itself, sleeping with a timeout until the next deadline
-- Block completion (virtio-blk ISR): the blk-mq hardware queue lock
+- Block completion (virtio-blk ISR: per queue on MSI-X, every queue on
+  INTx): the blk-mq hardware queue lock
   (`IrqSpinlock`, leaf) to reap the virtqueue and restart dispatch, then
   `bio_endio` with no lock held; `end_io` completes a `Completion`
   (`IrqSpinlock` -> wait queue wakeup); the lock-free DMA API unmaps

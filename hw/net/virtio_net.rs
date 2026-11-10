@@ -288,7 +288,7 @@ impl VirtioNet {
 }
 
 impl VirtioIrq for VirtioNet {
-    fn vq_interrupt(&self) {
+    fn vq_interrupt(&self, _vq: Option<u16>) {
         self.rx_cb.disable();
         napi_schedule(&self.napi);
     }

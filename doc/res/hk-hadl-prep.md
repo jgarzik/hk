@@ -84,7 +84,7 @@ Lifecycle (doc §5.7, §7): `Loaded → Bound → Running → Quiescing → Revo
 
 ### H0 — interrupt routing and firmware (prerequisites, Dell UEFI)
 - H0.1 IOAPIC (ACPI MADT, _PRT routing via ACPI tables), x86 IRQ domain; PIC only as fallback.
-- H0.2 MSI and MSI-X (PCI capability parsing, x86 LAPIC message address/data, arm64 GICv3 ITS / GICv2m on QEMU virt), per-vector registration in the generic IRQ table.
+- H0.2 MSI and MSI-X: MSI-X with x86 LAPIC messages is in (`hw/pci/msix.rs`, `arch/x86_64/irq.rs`, used by virtio-blk); left: plain MSI, arm64 GICv3 ITS / GICv2m on QEMU virt, MSI-X for virtio-net and the other drivers.
 - H0.3 request_firmware / release_firmware (Linux firmware_class semantics: /lib/firmware/updates, /lib/firmware, initramfs; uevent fallback off), firmware hash check when the package declares one.
 Size L; risk high (interrupt delivery is everything). Tests: MSI-X on virtio-net/virtio-blk in QEMU (x86 + arm64), firmware load boot test (on Linux and hk: a test firmware in initramfs read through a test hook, or via a driver that needs firmware).
 

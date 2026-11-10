@@ -22,9 +22,12 @@
 //!   device as one ring entry (Linux virtqueue_add_sgs), else as a
 //!   chain. Data segments are the bio's, DMA-mapped in `queue_rq` and
 //!   unmapped in `complete` from the table (the DMA API is lock-free).
-//! - Interrupts (transport INTx): a queue interrupt reaps every hardware
-//!   queue (the ISR status does not say which queue fired); completions
-//!   restart dispatch of bios that waited for room.
+//! - Interrupts: MSI-X when the transport has it, a vector per queue
+//!   aimed at the first CPU blk-mq maps to that queue (Linux managed
+//!   affinity, `util::group_cpus`), reaping that queue; else INTx, where
+//!   an interrupt reaps every hardware queue (the ISR status does not
+//!   say which queue fired). Completions restart dispatch of bios that
+//!   waited for room.
 //! - Disks: vda, vdb, ... on one dynamic major ("virtblk"), 16 minors
 //!   each (Linux PART_BITS 4); the index is freed with the disk, after
 //!   its last reference (Linux virtblk_free_disk).
@@ -63,6 +66,7 @@ use crate::hw::virtio::ring::{Desc, Sg, set_chain};
 use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
 use crate::printkln;
 use crate::util::error::KernelError;
+use crate::util::group_cpus::first_cpu;
 use crate::util::ida::Ida;
 use crate::util::kalloc::{try_arc, try_box};
 use crate::util::kmem::{KVec, try_vec};
@@ -374,9 +378,15 @@ struct VirtioBlk {
 }
 
 impl VirtioIrq for VirtioBlk {
-    fn vq_interrupt(&self) {
-        if let Some(mq) = self.disk.queue.mq() {
-            mq.poll();
+    /// Linux virtblk_done: one queue's completions (MSI-X), or every
+    /// queue's (INTx)
+    fn vq_interrupt(&self, vq: Option<u16>) {
+        let Some(mq) = self.disk.queue.mq() else {
+            return;
+        };
+        match vq {
+            Some(q) => mq.complete(usize::from(q)),
+            None => mq.poll(),
         }
     }
 
@@ -536,13 +546,28 @@ fn nr_queues(vdev: &VirtioDevice) -> Result<u16, KernelError> {
     }
 }
 
+/// MSI-X vectors for `nq` queues, queue i's aimed at the first CPU of
+/// the CPUs blk-mq maps to it (Linux virtio_find_vqs with an
+/// irq_affinity: managed vectors spread by group_cpus_evenly, which
+/// blk_mq_map_hw_queues then follows); INTx if there are none
+fn vectors(vdev: &VirtioDevice, nq: u16) -> Result<(), KernelError> {
+    let n = crate::cpu::nr_cpu_ids();
+    let mut cpus = KVec::try_with_capacity(usize::from(nq))?;
+    for i in 0..u32::from(nq) {
+        cpus.try_push(first_cpu(i, n, u32::from(nq)))?;
+    }
+    vdev.alloc_vectors(&cpus).map(|_| ())
+}
+
 /// Virtqueues (Linux init_vq) and their hardware queues, within the
 /// limits read once they are known (the ring sizes bound them)
 fn setup_queues(vdev: &Arc<VirtioDevice>) -> Result<(BlkMq, QueueLimits), KernelError> {
     let mut vqs: Vec<Virtqueue> = Vec::new();
     let mut ring = u16::MAX;
     let r = (|| {
-        for i in 0..nr_queues(vdev)? {
+        let nq = nr_queues(vdev)?;
+        vectors(vdev, nq)?;
+        for i in 0..nq {
             let vq = vdev.setup_vq(i)?;
             ring = ring.min(vq.num());
             vqs.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
@@ -592,12 +617,13 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
     )?;
     disk.private.call_once(|| private);
     printkln!(
-        "virtio-blk: {} {} sectors, {}/{} bytes, {} queues{}{}",
+        "virtio-blk: {} {} sectors, {}/{} bytes, {} queues ({}){}{}",
         disk.name,
         cap,
         lim.logical_block_size,
         lim.physical_block_size,
         nq,
+        if vdev.msix() { "MSI-X" } else { "INTx" },
         if wc { ", write cache" } else { "" },
         if disk.ro() { ", read-only" } else { "" },
     );
@@ -626,7 +652,8 @@ impl VirtioDriver for VirtioBlkDriver {
     ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
         // The binding's memory first: nothing to undo should it fail
         let slot = try_box(MaybeUninit::<VirtioBlkDev>::uninit())?;
-        let disk = new_disk(&vdev)?;
+        // Vectors taken before the queues go with a failed setup
+        let disk = new_disk(&vdev).inspect_err(|_| vdev.free_irq())?;
         let blk = try_arc(VirtioBlk {
             vdev: vdev.clone(),
             disk: disk.clone(),

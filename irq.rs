@@ -1,8 +1,8 @@
 //! Device IRQs: the handler table and its dispatch (Linux
 //! kernel/irq/manage.c request_irq/free_irq, handle.c, spurious.c)
 //!
-//! Each device line (`arch::IrqChipOps`: x86 PIC lines 0-15, arm64 SPIs
-//! 32-287) has a descriptor with a list of handlers; several may share
+//! Each device line (`arch::IrqChipOps`: x86 PIC lines 0-15 and MSI
+//! lines from 16, arm64 SPIs 32-287) has a descriptor with a list of handlers; several may share
 //! it (Linux IRQF_SHARED; each says whether its device raised the
 //! interrupt). `request_irq` adds one and returns an `IrqRegistration`
 //! whose drop removes it; the first handler unmasks the line, the last
@@ -93,6 +93,48 @@ pub fn handle_irq(irq: u32) -> bool {
         report_nobody_cared(irq);
     }
     handled
+}
+
+/// An MSI message: the write that raises an interrupt (Linux struct
+/// msi_msg)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsiMsg {
+    pub addr: u64,
+    pub data: u32,
+}
+
+/// An MSI line aimed at one CPU, freed on drop (Linux an MSI irq_desc
+/// with managed affinity, from pci_alloc_irq_vectors_affinity to
+/// pci_free_irq_vectors). Its handlers must be gone first: an
+/// `MsixHandler` holds the vectors that own it
+pub struct MsiIrq {
+    irq: u32,
+    msg: MsiMsg,
+}
+
+impl MsiIrq {
+    /// Its line, for `request_irq`
+    pub fn irq(&self) -> u32 {
+        self.irq
+    }
+
+    /// The message the device sends
+    pub fn msg(&self) -> MsiMsg {
+        self.msg
+    }
+}
+
+impl Drop for MsiIrq {
+    fn drop(&mut self) {
+        CurrentArch::msi_free(self.irq);
+    }
+}
+
+/// An MSI line aimed at `cpu`; None if the controller has no room or
+/// no MSI (arch `msi_alloc`). Thread context
+pub fn msi_alloc(cpu: u32) -> Option<MsiIrq> {
+    let (irq, msg) = CurrentArch::msi_alloc(cpu)?;
+    Some(MsiIrq { irq, msg })
 }
 
 /// The IRQ of a PCI function's INTx `pin` (arch routing)
@@ -362,6 +404,10 @@ mod tests {
         fn pci_intx_irq(_: u8, _: u8, _: u8, _: u8, _: u8) -> Option<u32> {
             None
         }
+        fn msi_alloc(_: u32) -> Option<(u32, MsiMsg)> {
+            None
+        }
+        fn msi_free(_: u32) {}
     }
 
     /// Each test uses lines of its own
