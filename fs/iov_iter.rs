@@ -107,7 +107,8 @@ impl<'a> Segs<'a> {
         Some((s.iov_base + self.off as u64, s.iov_len as usize - self.off))
     }
 
-    /// Step over `n` bytes of the current segment
+    /// Step over `n` bytes of the current segment, and past it and the
+    /// empty ones after it if that ends it (Linux iov_iter_iovec_advance)
     fn advance(&mut self, n: usize) {
         self.off += n;
         self.left -= n;
@@ -116,8 +117,11 @@ impl<'a> Segs<'a> {
             .get(self.i)
             .is_some_and(|s| self.off == s.iov_len as usize)
         {
-            self.i += 1;
             self.off = 0;
+            self.i += 1;
+            while self.segs.get(self.i).is_some_and(|s| s.iov_len == 0) {
+                self.i += 1;
+            }
         }
     }
 
@@ -550,6 +554,26 @@ mod tests {
             n
         });
         assert_eq!(runs, [(0x1002, 1), (0x3000, 5)]);
+    }
+
+    #[test]
+    fn advance_skips_empty() {
+        let seg = |b, l| IoVec {
+            iov_base: b,
+            iov_len: l,
+        };
+        let segs = [
+            seg(0x1000, 3),
+            seg(0x2001, 0),
+            seg(0x3001, 0),
+            seg(0x4000, 5),
+        ];
+        let mut s = Segs::new(&segs, usize::MAX);
+        s.advance(3);
+        assert_eq!((s.i, s.off, s.left), (3, 0, 5));
+        assert_eq!(s.cur(), Some((0x4000, 5)));
+        s.revert(3);
+        assert_eq!((s.i, s.off, s.left), (0, 0, 8));
     }
 
     #[test]

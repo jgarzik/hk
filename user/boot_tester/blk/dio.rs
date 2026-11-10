@@ -15,7 +15,7 @@
 
 use crate::blk::dsync::p3_start;
 use crate::harness::{R, check, report_r};
-use crate::helpers::{BlkDev, find_blkdev};
+use crate::helpers::{BlkDev, find_blkdev, linux_at_least};
 use hk_syscall::{
     IoVec, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, O_RDONLY, O_RDWR, PROT_READ, PROT_WRITE,
     sys_close, sys_mmap, sys_munmap, sys_open, sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64,
@@ -325,7 +325,8 @@ fn coherent(f: &Fds) -> R {
 
 /// Mixed segment sizes and offsets (each 512-aligned, some across a page
 /// boundary) for readv and writev; a segment whose length or address is
-/// not 512-aligned is EINVAL even when the total is
+/// not 512-aligned is EINVAL even when the total is, unless it is empty
+/// (stepped over since Linux 6.18)
 fn readv(f: &Fds) -> R {
     const SEGS: [(u64, u64); 5] = [
         (512, 512),
@@ -371,6 +372,31 @@ fn readv(f: &Fds) -> R {
     ];
     let n = sys_preadv(f.d, bad.as_ptr(), 2, RD as i64);
     check(b"segment address", n == EINVAL, n)?;
+    // An empty segment between two full ones is skipped, whatever its
+    // address
+    let gap = [
+        IoVec {
+            iov_base: a.ptr(0),
+            iov_len: PAGE as usize,
+        },
+        IoVec {
+            iov_base: a.ptr(PAGE + 1),
+            iov_len: 0,
+        },
+        IoVec {
+            iov_base: a.ptr(2 * PAGE),
+            iov_len: PAGE as usize,
+        },
+    ];
+    let n = sys_preadv(f.d, gap.as_ptr(), 3, RD as i64);
+    // Before 6.18 every segment's address was checked up front
+    // (bdev_iter_is_aligned), the empty one's too
+    if linux_at_least(6, 18) {
+        check(b"empty segment", n == 2 * PAGE as i64, n)?;
+        is_pat(b"empty segment data", a.bytes(2 * PAGE, PAGE), RD + PAGE)?;
+    } else {
+        check(b"empty segment (< 6.18)", n == EINVAL, n)?;
+    }
     // writev of the same layout, read back in one piece
     for (i, (o, len)) in SEGS.into_iter().enumerate() {
         fill_data(a.bytes(o, len), i as u8 * 17 + 1);
