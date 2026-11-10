@@ -31,8 +31,9 @@
 //! RWF_NOWAIT: an I/O needing a second bio, Linux's or one split off
 //! it, is EAGAIN before anything is submitted (Linux: EAGAIN from the
 //! loop, or from bio_split_rw_at on a REQ_NOWAIT bio). Its one bio is
-//! NOWAIT: a queue with no free tag, or a driver that would do the I/O
-//! in the submitter, ends it with EAGAIN (Linux REQ_NOWAIT).
+//! NOWAIT: a queue with no free tag ends it with EAGAIN (Linux
+//! REQ_NOWAIT); a queue without NOWAIT support never gets here (the
+//! file refuses RWF_NOWAIT, EOPNOTSUPP).
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 

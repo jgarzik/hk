@@ -1,9 +1,10 @@
-//! RWF_NOWAIT direct I/O to a driver that would block: EAGAIN, never a
-//! wait (Linux REQ_NOWAIT, bio_wouldblock_error). hk's sd driver does
-//! each request synchronously in the submitter (it stands in for a
-//! blk-mq SCSI queue whose tags are all taken), so a NOWAIT direct read
-//! of sda is EAGAIN, and the same read without RWF_NOWAIT returns the
-//! data. Linux references have no sda (no USB disk): skipped there.
+//! RWF_NOWAIT on a block device whose queue cannot honor it (Linux
+//! BLK_FEAT_NOWAIT unset: bdev_open leaves FMODE_NOWAIT off, so
+//! kiocb_set_rw_flags refuses RWF_NOWAIT): EOPNOTSUPP, direct or
+//! buffered, and the same read without RWF_NOWAIT returns the data.
+//! hk's sd driver is bio-based and does each request in the submitter,
+//! so sda is such a device. Linux references have no sda (no USB disk)
+//! and no such device: skipped there.
 
 use crate::harness::{R, check, report_r};
 use crate::helpers::{host_mode, skip};
@@ -14,7 +15,7 @@ use hk_syscall::{
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
 const RWF_NOWAIT: i32 = 8;
-const EAGAIN: i64 = -11;
+const EOPNOTSUPP: i64 = -95;
 const PAGE: u64 = 4096;
 
 pub fn run_tests() {
@@ -26,8 +27,6 @@ pub fn run_tests() {
 }
 
 fn nowait_sync() -> R {
-    let fd = sys_open(b"/dev/sda\0".as_ptr(), O_RDONLY | O_DIRECT, 0);
-    check(b"open sda", fd >= 0, fd)?;
     let buf = sys_mmap(
         0,
         PAGE,
@@ -36,25 +35,29 @@ fn nowait_sync() -> R {
         -1,
         0,
     );
-    let r = if buf <= 0 {
-        check(b"mmap", false, buf)
-    } else {
-        reads(fd as i32, buf as u64)
-    };
-    if buf > 0 {
-        sys_munmap(buf as u64, PAGE);
-    }
-    sys_close(fd as u64);
+    check(b"mmap", buf > 0, buf)?;
+    let r = reads(buf as u64);
+    sys_munmap(buf as u64, PAGE);
     r
 }
 
-fn reads(fd: i32, buf: u64) -> R {
-    let iov = IoVec {
-        iov_base: buf as *const u8,
-        iov_len: PAGE as usize,
-    };
-    let n = sys_preadv2(fd, &iov, 1, 0, RWF_NOWAIT);
-    check(b"nowait read", n == EAGAIN, n)?;
-    let n = sys_preadv2(fd, &iov, 1, 0, 0);
-    check(b"blocking read", n == PAGE as i64, n)
+fn reads(buf: u64) -> R {
+    for (what, flags, ok) in [
+        (&b"nowait direct read"[..], O_RDONLY | O_DIRECT, false),
+        (b"nowait buffered read", O_RDONLY, false),
+        (b"direct read", O_RDONLY | O_DIRECT, true),
+    ] {
+        let fd = sys_open(b"/dev/sda\0".as_ptr(), flags, 0);
+        check(b"open sda", fd >= 0, fd)?;
+        let iov = IoVec {
+            iov_base: buf as *const u8,
+            iov_len: PAGE as usize,
+        };
+        let rwf = if ok { 0 } else { RWF_NOWAIT };
+        let n = sys_preadv2(fd as i32, &iov, 1, 0, rwf);
+        sys_close(fd as u64);
+        let want = if ok { PAGE as i64 } else { EOPNOTSUPP };
+        check(what, n == want, n)?;
+    }
+    Ok(())
 }

@@ -500,6 +500,16 @@ fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError>
     }
 }
 
+/// RWF_NOWAIT on a device whose queue cannot honor it is EOPNOTSUPP
+/// (Linux: bdev_open sets FMODE_NOWAIT only for bdev_nowait, and
+/// kiocb_set_rw_flags refuses RWF_NOWAIT without it)
+fn nowait_ok(file: &File, flags: RwFlags) -> Result<(), KernelError> {
+    if flags.nowait() && !bdev(file)?.disk.queue.nowait() {
+        return Err(KernelError::OperationNotSupported);
+    }
+    Ok(())
+}
+
 impl FileOps for BlockFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
@@ -551,6 +561,7 @@ impl FileOps for BlockFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
+        nowait_ok(file, flags)?;
         let pos = at.unwrap_or_else(|| file.get_pos());
         let n = if flags.contains(RwFlags::DIRECT) && to.user_backed() {
             dio_read(file, to, pos, flags)?
@@ -575,6 +586,7 @@ impl FileOps for BlockFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
+        nowait_ok(file, flags)?;
         let pos = at.unwrap_or_else(|| file.get_pos());
         if !write_ok(file, from.len(), pos)? {
             return Ok(0);

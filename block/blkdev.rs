@@ -126,8 +126,9 @@ bitflags::bitflags! {
         /// with a flush
         const FUA = 1 << 0;
         /// Never wait in the block layer or driver: a bio that would
-        /// (no free tag; a driver that does its I/O in the submitter)
-        /// ends with EAGAIN (Linux REQ_NOWAIT, bio_wouldblock_error)
+        /// (no free tag) ends with EAGAIN (Linux REQ_NOWAIT,
+        /// bio_wouldblock_error); a queue without NOWAIT support ends
+        /// it with EOPNOTSUPP
         const NOWAIT = 1 << 1;
     }
 }
@@ -451,6 +452,16 @@ impl RequestQueue {
         }
     }
 
+    /// It takes NOWAIT bios (Linux bdev_nowait: BLK_FEAT_NOWAIT, which
+    /// every blk-mq queue has); hk's bio-based drivers without it (sd) do
+    /// their I/O in the submitter
+    pub fn nowait(&self) -> bool {
+        match self.kind {
+            QueueKind::Mq(_) => true,
+            QueueKind::Bio(_) => self.limits.nowait,
+        }
+    }
+
     /// The blk-mq queues (for the driver's interrupt handler)
     pub fn mq(&self) -> Option<&BlkMq> {
         match &self.kind {
@@ -483,14 +494,10 @@ impl RequestQueue {
         if bio.op == BioOp::Flush && !self.write_cache {
             return bio_endio(bio);
         }
-        // hk's bio-based drivers without it do their I/O in the
-        // submitter: a NOWAIT bio would wait there (Linux: a blk-mq SCSI
-        // queue, EAGAIN when it would wait for a tag)
-        if bio.flags.contains(BioFlags::NOWAIT)
-            && matches!(self.kind, QueueKind::Bio(_))
-            && !self.limits.nowait
-        {
-            return bio_io_error(bio, KernelError::WouldBlock);
+        // A queue that cannot honor NOWAIT refuses it (Linux
+        // submit_bio_noacct: not_supported, BLK_STS_NOTSUPP)
+        if bio.flags.contains(BioFlags::NOWAIT) && !self.nowait() {
+            return bio_io_error(bio, KernelError::OperationNotSupported);
         }
         if bio.flags.contains(BioFlags::FUA) && !self.fua {
             bio.flags.remove(BioFlags::FUA);
