@@ -518,7 +518,7 @@ impl VirtioDriver for VirtioNetDriver {
             })?;
         vdev.ready();
         // Buffers were posted before DRIVER_OK; notify only now (spec 3.1.1)
-        if let Some(rx) = device.rx.lock().as_ref() {
+        if let Some(rx) = device.rx.lock().as_mut() {
             rx.vq.kick();
         }
 

@@ -434,10 +434,14 @@ impl VirtioDevice {
         self.w64(common::Q_AVAIL, d + lay.avail as u64);
         self.w64(common::Q_USED, d + lay.used as u64);
         self.w16(common::Q_ENABLE, 1);
+        // SAFETY: `mem` is zeroed DMA memory of `lay.size` bytes for
+        // `num` entries, owned by the queue (`mem`) for the ring's life
+        let mut ring = unsafe { Vring::new(mem.cpu_addr(), num) };
+        if self.has_feature(super::feature::RING_EVENT_IDX) {
+            ring.set_event_idx();
+        }
         Ok(Virtqueue {
-            // SAFETY: `mem` is zeroed DMA memory of `lay.size` bytes for
-            // `num` entries, owned by the queue (`mem`) for the ring's life
-            ring: unsafe { Vring::new(mem.cpu_addr(), num) },
+            ring,
             mem,
             owner: core::ptr::from_ref::<Self>(self) as usize,
             index,
@@ -737,7 +741,7 @@ impl Virtqueue {
 
     /// Notify the device of new buffers if it wants to be (Linux
     /// virtqueue_kick)
-    pub fn kick(&self) {
+    pub fn kick(&mut self) {
         if self.ring.needs_notify() {
             // Ring writes before the doorbell MMIO write
             wmb();
