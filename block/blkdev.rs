@@ -44,6 +44,7 @@ pub use crate::fs::chardev::{DevId, DevMajor, DevMinor};
 use crate::mm::writeback::{BdiWriteback, bdi_register, bdi_unregister};
 use crate::util::error::KernelError;
 use crate::util::kalloc::{box_nofail, try_arc};
+use crate::util::smallvec::SmallVec;
 
 use super::blk_mq::BlkMq;
 
@@ -124,13 +125,20 @@ bitflags::bitflags! {
 }
 
 /// One segment: part of a physical frame
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BioSeg {
     /// Physical address of the frame
     pub frame: u64,
     pub offset: usize,
     pub len: usize,
 }
+
+/// Segments a bio keeps inline (Linux BIO_INLINE_VECS): more go to
+/// the heap
+pub const BIO_INLINE_VECS: usize = 4;
+
+/// A bio's segments
+pub type BioSegs = SmallVec<BioSeg, BIO_INLINE_VECS>;
 
 /// Completion callback; called once with the finished bio, possibly in
 /// hardirq context (module docs)
@@ -144,7 +152,7 @@ pub struct Bio {
     /// First sector; relative to the block device on submission, to the
     /// disk after the partition remap
     pub sector: u64,
-    pub segs: Vec<BioSeg>,
+    pub segs: BioSegs,
     /// Result, set by the driver before `bio_endio` (Linux bi_status)
     pub status: Result<(), KernelError>,
     pub end_io: Option<EndIo>,
@@ -162,7 +170,7 @@ impl Bio {
             op,
             flags: BioFlags::empty(),
             sector,
-            segs: Vec::new(),
+            segs: BioSegs::new(),
             status: Ok(()),
             end_io: None,
             private: 0,

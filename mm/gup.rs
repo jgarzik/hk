@@ -32,7 +32,7 @@ use crate::FRAME_ALLOCATOR;
 use crate::arch::paging;
 use crate::fs::Inode;
 use crate::util::error::KernelError;
-use crate::util::kmem::KVec;
+use crate::util::smallvec::SmallVec;
 
 /// References one pin takes (Linux GUP_PIN_COUNTING_BIAS)
 pub const GUP_PIN_COUNTING_BIAS: u32 = 1024;
@@ -51,7 +51,7 @@ fn unpin_page(phys: u64) {
 }
 
 /// `len` bytes at `off` in the page at `phys` (Linux bio_vec)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageSeg {
     pub phys: u64,
     pub off: u32,
@@ -66,19 +66,22 @@ pub struct PageSeg {
 /// dirtying a page-cache page takes its page lock.
 #[must_use]
 pub struct PinnedPages {
-    segs: KVec<PageSeg>,
+    segs: SmallVec<PageSeg, INLINE_PAGES>,
     /// Per segment, the inode whose page cache its page belongs to (a
     /// shared file mapping written through): a write dirties it there
-    owners: KVec<Option<Arc<Inode>>>,
+    owners: SmallVec<Option<Arc<Inode>>, INLINE_PAGES>,
     dirty: bool,
 }
 
+/// Pages kept without a heap allocation (Linux DIO_INLINE_BIO_VECS)
+const INLINE_PAGES: usize = 4;
+
 impl PinnedPages {
-    /// Room for `max` pages
+    /// Room for `max` pages: no allocation up to `INLINE_PAGES`
     fn new(max: usize) -> Result<Self, KernelError> {
         Ok(Self {
-            segs: KVec::try_with_capacity(max)?,
-            owners: KVec::try_with_capacity(max)?,
+            segs: SmallVec::try_with_capacity(max)?,
+            owners: SmallVec::try_with_capacity(max)?,
             dirty: false,
         })
     }
@@ -395,14 +398,9 @@ fn pin_locked(
             off: off as u32,
             len: n as u32,
         };
-        // Room was reserved for `max` pages in both
-        if out.segs.try_push(seg).is_err() || out.owners.try_push(cache_owner(v, write)).is_err() {
-            if out.segs.len() > out.owners.len() {
-                out.segs.pop();
-            }
-            unpin_page(phys);
-            break;
-        }
+        // Room was reserved for `max` pages in both: no allocation
+        out.segs.push(seg);
+        out.owners.push(cache_owner(v, write));
         done += n;
     }
     Step::Done(Ok(done))
