@@ -112,6 +112,17 @@ impl BioOp {
     }
 }
 
+bitflags::bitflags! {
+    /// Modifiers of a bio's operation (Linux blk_opf_t REQ_* flags)
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct BioFlags: u32 {
+        /// The written data is durable when the bio completes (Linux
+        /// REQ_FUA): a queue with a volatile cache but no FUA follows it
+        /// with a flush
+        const FUA = 1 << 0;
+    }
+}
+
 /// One segment: part of a physical frame
 #[derive(Debug, Clone, Copy)]
 pub struct BioSeg {
@@ -129,6 +140,7 @@ pub type EndIo = fn(Box<Bio>);
 /// memory (Linux struct bio)
 pub struct Bio {
     pub op: BioOp,
+    pub flags: BioFlags,
     /// First sector; relative to the block device on submission, to the
     /// disk after the partition remap
     pub sector: u64,
@@ -148,6 +160,7 @@ impl Bio {
     pub fn new(op: BioOp, sector: u64) -> Box<Self> {
         box_nofail(Self {
             op,
+            flags: BioFlags::empty(),
             sector,
             segs: Vec::new(),
             status: Ok(()),
@@ -311,6 +324,9 @@ pub struct RequestQueue {
     /// The device has a volatile write cache: flushes reach the driver
     /// (Linux QUEUE_FLAG_WC); without one they complete at once
     write_cache: bool,
+    /// The device takes FUA writes (Linux BLK_FEAT_FUA); no driver does
+    /// yet, so a FUA write to a cache is followed by a flush
+    fua: bool,
 }
 
 impl RequestQueue {
@@ -320,6 +336,7 @@ impl RequestQueue {
             limits,
             kind: QueueKind::Bio(driver),
             write_cache,
+            fua: false,
         }
     }
 
@@ -329,6 +346,7 @@ impl RequestQueue {
             limits,
             kind: QueueKind::Mq(mq),
             write_cache,
+            fua: false,
         }
     }
 
@@ -356,15 +374,108 @@ impl RequestQueue {
         }
     }
 
-    fn submit(&self, bio: Box<Bio>) {
+    /// Pass `bio` to the driver; a flush without a write cache completes
+    /// at once, and FUA is dropped there too or, on a cache without FUA,
+    /// becomes a flush after the write (Linux submit_bio_noacct,
+    /// blk_insert_flush)
+    fn submit(&self, mut bio: Box<Bio>) {
         if bio.op == BioOp::Flush && !self.write_cache {
             return bio_endio(bio);
         }
+        if bio.flags.contains(BioFlags::FUA) && !self.fua {
+            bio.flags.remove(BioFlags::FUA);
+            if self.write_cache {
+                return self.postflush(bio);
+            }
+        }
+        self.dispatch(bio);
+    }
+
+    fn dispatch(&self, bio: Box<Bio>) {
         match &self.kind {
             QueueKind::Bio(d) => d.submit_bio(bio),
             QueueKind::Mq(m) => m.submit(bio),
         }
     }
+}
+
+impl RequestQueue {
+    /// A FUA write on a cache without FUA: the write, then a flush, then
+    /// the owner's completion with the first error (Linux blk-flush.c:
+    /// REQ_FSEQ_DATA | REQ_FSEQ_POSTFLUSH). The flush is allocated here,
+    /// in the submitter's context, so the completion allocates nothing.
+    fn postflush(&self, mut bio: Box<Bio>) {
+        let seq = box_nofail(FlushSeq {
+            end_io: bio.end_io.take(),
+            private: bio.private,
+            q: core::ptr::from_ref(self),
+            flush: Some(Bio::new(BioOp::Flush, 0)),
+            data: None,
+        });
+        bio.end_io = Some(flushseq_data_done);
+        bio.private = Box::into_raw(seq) as usize;
+        self.dispatch(bio);
+    }
+}
+
+/// A FUA write's post-flush sequence, owned by the bio in flight
+struct FlushSeq {
+    /// The write's own completion, restored before it runs
+    end_io: Option<EndIo>,
+    private: usize,
+    /// The queue; the disk holding it outlives the bios submitted to it
+    /// (their submitter keeps its block device until they complete)
+    q: *const RequestQueue,
+    /// The flush, until sent
+    flush: Option<Box<Bio>>,
+    /// The write while its flush runs
+    data: Option<Box<Bio>>,
+}
+
+/// The write of a post-flush sequence is done (any context): a failed
+/// write completes now, else the flush goes out
+fn flushseq_data_done(bio: Box<Bio>) {
+    let p = bio.private as *mut FlushSeq;
+    if bio.status.is_err() {
+        // SAFETY: `postflush` made `private` a leaked FlushSeq, owned by
+        // this bio's single completion
+        let seq = unsafe { Box::from_raw(p) };
+        return flushseq_end(bio, *seq);
+    }
+    // SAFETY: as above; nothing else holds the sequence until the flush
+    // completes
+    let seq = unsafe { &mut *p };
+    let Some(mut f) = seq.flush.take() else {
+        unreachable!("post-flush sent twice")
+    };
+    f.end_io = Some(flushseq_flush_done);
+    f.private = p as usize;
+    seq.data = Some(bio);
+    // SAFETY: the queue outlives the bios submitted to it (FlushSeq.q)
+    let q = unsafe { &*seq.q };
+    // A blk-mq dispatch only takes IRQ-safe queue locks: fine in hardirq
+    q.dispatch(f);
+}
+
+/// The flush of a post-flush sequence is done (any context): the write
+/// completes, with the flush's error if the write had none
+fn flushseq_flush_done(f: Box<Bio>) {
+    // SAFETY: `flushseq_data_done` made `private` the sequence, now owned
+    // by this completion alone
+    let mut seq = unsafe { Box::from_raw(f.private as *mut FlushSeq) };
+    let Some(mut bio) = seq.data.take() else {
+        unreachable!("post-flush without its write")
+    };
+    bio.status = f.status;
+    drop(f);
+    flushseq_end(bio, *seq);
+}
+
+/// Give the write its own completion back and run it
+fn flushseq_end(mut bio: Box<Bio>, seq: FlushSeq) {
+    bio.end_io = seq.end_io;
+    bio.private = seq.private;
+    bio_endio(bio);
 }
 
 // ============================================================================
@@ -693,7 +804,8 @@ pub(super) fn disk_release(disk: &Disk) {
 // ============================================================================
 
 /// Submit `bio` for `bdev` (Linux submit_bio): checked against the end
-/// of the device, remapped to the disk; completes through `end_io`
+/// of the device, remapped to the disk; completes through `end_io`. The
+/// caller keeps `bdev` (so its disk and queue) until then.
 pub fn submit_bio(bdev: &BlockDevice, mut bio: Box<Bio>) {
     // A removed disk's I/O fails with EIO (Linux bio_queue_enter on a
     // dead disk: bio_io_error)
@@ -999,6 +1111,78 @@ mod tests {
         assert_eq!(l.pop().unwrap().sector, 7);
         assert_eq!(l.pop().unwrap().sector, 8);
         assert!(l.pop().is_none());
+    }
+
+    /// A bio-based driver that logs each bio's operation and flags, and
+    /// fails the ones in `fail`
+    struct LogDrv {
+        log: Mutex<Vec<(BioOp, BioFlags)>>,
+        fail: Vec<BioOp>,
+    }
+
+    impl BlockDriver for LogDrv {
+        fn submit_bio(&self, mut bio: Box<Bio>) {
+            self.log.lock().push((bio.op, bio.flags));
+            if self.fail.contains(&bio.op) {
+                bio.status = Err(KernelError::Io);
+            }
+            bio_endio(bio);
+        }
+    }
+
+    /// The owner's view of a completion: (calls, last status)
+    static DONE: Mutex<(u32, Option<Result<(), KernelError>>)> = Mutex::new((0, None));
+
+    fn owner_done(bio: Box<Bio>) {
+        assert_eq!(bio.private, 77);
+        let mut d = DONE.lock();
+        d.0 += 1;
+        d.1 = Some(bio.status);
+    }
+
+    /// One FUA write through a queue: what the driver saw and what the
+    /// owner got
+    fn fua_write(
+        write_cache: bool,
+        fail: Vec<BioOp>,
+    ) -> (
+        Vec<(BioOp, BioFlags)>,
+        (u32, Option<Result<(), KernelError>>),
+    ) {
+        let drv = Arc::new(LogDrv {
+            log: Mutex::new(Vec::new()),
+            fail,
+        });
+        let q = RequestQueue::new_bio(drv.clone(), QueueLimits::default(), write_cache);
+        *DONE.lock() = (0, None);
+        let mut b = Bio::new(BioOp::Write, 8);
+        b.flags = BioFlags::FUA;
+        b.end_io = Some(owner_done);
+        b.private = 77;
+        q.submit(b);
+        let log = drv.log.lock().clone();
+        (log, *DONE.lock())
+    }
+
+    #[test]
+    fn fua_becomes_postflush() {
+        let w = (BioOp::Write, BioFlags::empty());
+        let f = (BioOp::Flush, BioFlags::empty());
+        // A cache without FUA: the write, then a flush, then the owner
+        let (log, done) = fua_write(true, Vec::new());
+        assert_eq!(log, [w, f]);
+        assert_eq!(done, (1, Some(Ok(()))));
+        // No cache: FUA means nothing
+        let (log, done) = fua_write(false, Vec::new());
+        assert_eq!(log, [w]);
+        assert_eq!(done, (1, Some(Ok(()))));
+        // A failed write is not flushed; a failed flush fails the write
+        let (log, done) = fua_write(true, alloc::vec![BioOp::Write]);
+        assert_eq!(log, [w]);
+        assert_eq!(done, (1, Some(Err(KernelError::Io))));
+        let (log, done) = fua_write(true, alloc::vec![BioOp::Flush]);
+        assert_eq!(log, [w, f]);
+        assert_eq!(done, (1, Some(Err(KernelError::Io))));
     }
 
     #[test]

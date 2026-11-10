@@ -16,7 +16,8 @@
 //!
 //! ## Locking (doc/LOCKING.md 3.10)
 //!
-//! - Software queue (`ctx`): `IrqSpinlock<BioList>`, one per CPU, leaf.
+//! - Software queue (`ctx`): `IrqSpinlock<BioList>`, one per CPU, leaf;
+//!   taken by submitters, and by a completion that sends a post-flush.
 //!   Its pending bit in the hardware queue's `ctx_map` is set and
 //!   cleared under it; a run that misses a bit being set is followed by
 //!   the submitter's own run.
@@ -186,7 +187,8 @@ impl BlkMq {
         (i / 64, 1 << (i % 64))
     }
 
-    /// Queue a bio from thread context and run its hardware queue
+    /// Queue a bio and run its hardware queue: from thread context, or
+    /// from a completion with no queue lock held (a FUA write's flush)
     pub fn submit(&self, bio: Box<Bio>) {
         let cpu = crate::cpu::this_id() as usize % self.ctxs.len();
         let h = self.map(cpu);

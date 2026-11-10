@@ -3581,7 +3581,7 @@ thread context, the driver completes it from its interrupt handler and
 | `Disk.open_mutex` | `sync::Mutex<OpenState>` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock; holds the count of open partitions (Linux open_partitions, plain), and each `BlockDevice.openers` (an atomic on the device, as Linux bd_openers) and soft block size (BLKBSZSET) change only under it: block device open/release (files, and the kernel opens of a mount (`SuperBlock.s_bdev`) and of active swap: `BdevHandle`), partition scans (and rescans, BLKRRPART), disk removal (`del_gendisk` drops its devices under it); I/O, `BLKDEV_REGISTRY`, `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
 | `BLKDEV_REGISTRY` | spin `RwLock` (dev_t -> block device; global like Linux's bdev map) | thread only | leaf |
 | `MAJORS` | spin `Mutex` (block majors, register_blkdev) | thread only | leaf |
-| blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held; its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
+| blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) and hardirq (a FUA write's post-flush, sent from the write's completion after the hardware queue lock is dropped) | leaf: never taken with the hardware queue lock held; its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
 | blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list, the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock), the in-flight count and the dying flag | thread (dispatch, drain, release) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under its line's `IrqDesc.lock` in the ISR |
 | `BlkMq.drained` | `WaitQueue` (Linux mq_freeze_wq) | woken from hardirq (the completion that empties a dying queue, after its lock is dropped); waited in thread context (`del_gendisk`, no lock held) | its head lock -> run-queue lock; the condition takes each hardware queue lock alone |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
@@ -3600,6 +3600,13 @@ Rules:
   thread (bio-based drivers: ramdisk, USB sd). It may only complete a
   `Completion`, touch atomics and wake; the bios are ended after the
   hardware queue lock is dropped, so `end_io` can resubmit.
+  A FUA write on a queue with a volatile cache but no FUA (every
+  queue now; Linux blk_insert_flush, REQ_FSEQ_POSTFLUSH) carries a
+  `FlushSeq`, allocated at submission with its flush bio: the write's
+  completion sends the flush from its own context (blk-mq: the
+  software and hardware queue locks, IRQ-safe leaves, taken in
+  hardirq), the flush's completion runs the owner's `end_io`. The
+  sequence is owned by the one bio in flight at a time; no lock.
   `submit_bio_wait`'s `end_io` hands the bio back and completes last:
   once `Completion::wait` returns the waker no longer touches the
   waiter's stack.
