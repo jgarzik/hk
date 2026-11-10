@@ -31,19 +31,26 @@
 //! Each started workqueue has one worker kernel thread (`kworker/<name>`).
 //! The worker moves expired delayed work to the pending queue itself and
 //! sleeps on `wait` with a timeout until the earliest delay expires, so
-//! nothing runs in IRQ context. `inner` is an `IrqSpinlock` (leaf); the
+//! nothing runs in IRQ context. `inner` is an `IrqSpinlock`; the
 //! per-item `Mutex` is never held while the work function runs, so work may
 //! re-queue itself. Queueing, `mod_delayed_work` and
 //! `cancel_delayed_work` are process-context only (they take the item's
 //! Mutex, under `inner` for delayed work).
+//!
+//! The pending and delayed lists are intrusive (Linux work_struct.entry
+//! on the pool's worklist, the delayed_work timer): each item links to
+//! the next through its own `next` / `dnext` field, a reference the list
+//! owns while it is queued, so queueing never allocates and may be done
+//! from anywhere a spin lock may be taken (`schedule()` on the way to
+//! sleep, for the block layer's kblockd). Linking takes one item's Mutex
+//! at a time under `inner` (order: `inner` -> item); nobody waits for
+//! `inner` holding an item's Mutex.
 
 extern crate alloc;
 
-use crate::util::kalloc::{arc_nofail, box_nofail};
+use crate::util::kalloc::box_nofail;
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::sync::spin::Mutex;
@@ -98,6 +105,8 @@ pub struct Work {
     func: Option<WorkFn>,
     /// WORK_PENDING, WORK_RUNNING
     state: u32,
+    /// The next item on the pending list it is on (Linux entry)
+    next: Option<Item>,
 }
 
 impl Work {
@@ -108,6 +117,7 @@ impl Work {
             // callers (and DelayedWork's) have no error path
             func: Some(box_nofail(func)),
             state: 0,
+            next: None,
         }
     }
 
@@ -151,12 +161,13 @@ impl Work {
     }
 
     /// Run a promoted delayed work item without holding its lock during
-    /// the call; nothing if it was re-timed or cancelled after `seq`
-    /// was taken (Linux: try_to_grab_pending stole it off the worklist)
-    fn run_delayed(dw: &Mutex<DelayedWork>, seq: u64) {
+    /// the call; nothing if it was re-timed or cancelled after it was
+    /// promoted (Linux: try_to_grab_pending stole it off the worklist)
+    fn run_delayed(dw: &Mutex<DelayedWork>) {
         let mut func = {
             let mut g = dw.lock();
-            if g.seq != seq {
+            g.on_pending = false;
+            if g.seq != g.queued_seq {
                 return;
             }
             g.work.begin_run()
@@ -183,9 +194,15 @@ pub struct DelayedWork {
     work: Work,
     /// The tick it is due at while on the delayed list; 0 when not on it
     wake_tick: u64,
-    /// Bumped when a promoted copy on the pending list must not run
-    /// (re-timed or cancelled before the worker reached it)
+    /// Bumped when its entry on the pending list must not run (re-timed
+    /// or cancelled before the worker reached it)
     seq: u64,
+    /// `seq` when it was last promoted to the pending list
+    queued_seq: u64,
+    /// On the pending list (through `work.next`)
+    on_pending: bool,
+    /// The next item on the delayed list it is on
+    dnext: Option<Arc<Mutex<DelayedWork>>>,
 }
 
 impl DelayedWork {
@@ -195,6 +212,9 @@ impl DelayedWork {
             work: Work::new(func),
             wake_tick: 0,
             seq: 0,
+            queued_seq: 0,
+            on_pending: false,
+            dnext: None,
         }
     }
 
@@ -213,16 +233,116 @@ impl DelayedWork {
 // Workqueue
 // ============================================================================
 
+/// An item on a pending list
+#[derive(Clone)]
+enum Item {
+    Work(Arc<Mutex<Work>>),
+    /// A promoted delayed item
+    Delayed(Arc<Mutex<DelayedWork>>),
+}
+
+impl Item {
+    fn set_next(&self, n: Option<Item>) {
+        match self {
+            Self::Work(w) => w.lock().next = n,
+            Self::Delayed(d) => d.lock().work.next = n,
+        }
+    }
+
+    fn take_next(&self) -> Option<Item> {
+        match self {
+            Self::Work(w) => w.lock().next.take(),
+            Self::Delayed(d) => d.lock().work.next.take(),
+        }
+    }
+
+    fn run(&self) {
+        match self {
+            Self::Work(w) => Work::run(w),
+            Self::Delayed(d) => Work::run_delayed(d),
+        }
+    }
+}
+
+/// The pending list: items linked through their `next` (FIFO)
+struct PendList {
+    head: Option<Item>,
+    tail: Option<Item>,
+}
+
+impl PendList {
+    const fn new() -> Self {
+        Self {
+            head: None,
+            tail: None,
+        }
+    }
+
+    /// Append `it` (not on any pending list): no allocation
+    fn push(&mut self, it: Item) {
+        it.set_next(None);
+        match &self.tail {
+            Some(t) => t.set_next(Some(it.clone())),
+            None => self.head = Some(it.clone()),
+        }
+        self.tail = Some(it);
+    }
+
+    fn pop(&mut self) -> Option<Item> {
+        let h = self.head.take()?;
+        self.head = h.take_next();
+        if self.head.is_none() {
+            self.tail = None;
+        }
+        Some(h)
+    }
+}
+
 /// Inner state protected by IrqSpinlock
 struct WorkqueueInner {
-    /// Pending immediate work items
-    pending: VecDeque<Arc<Mutex<Work>>>,
-    /// Pending delayed work items (not sorted - we scan linearly)
-    delayed: Vec<Arc<Mutex<DelayedWork>>>,
+    /// Pending items, in queueing order
+    pending: PendList,
+    /// Timed delayed items, linked through `dnext` (unsorted: scanned)
+    delayed: Option<Arc<Mutex<DelayedWork>>>,
     /// Worker thread TID (0 = not started)
     worker_tid: Tid,
     /// Flag indicating work is available
     has_work: bool,
+}
+
+impl WorkqueueInner {
+    /// Put `d` on the delayed list (not on it): no allocation
+    fn delay(&mut self, d: Arc<Mutex<DelayedWork>>) {
+        let next = self.delayed.take();
+        d.lock().dnext = next;
+        self.delayed = Some(d);
+    }
+
+    /// Take the whole delayed list apart, giving `f` each item; those
+    /// for which it returns true go back on it
+    fn sweep(&mut self, mut f: impl FnMut(&Arc<Mutex<DelayedWork>>) -> bool) {
+        let mut cur = self.delayed.take();
+        while let Some(d) = cur {
+            cur = d.lock().dnext.take();
+            if f(&d) {
+                self.delay(d);
+            }
+        }
+    }
+
+    /// Queue the promoted delayed item `d` to run (its entry, if one is
+    /// still on the list, now runs with the current `seq`)
+    fn promote(&mut self, d: &Arc<Mutex<DelayedWork>>) {
+        let push = {
+            let mut g = d.lock();
+            g.queued_seq = g.seq;
+            !core::mem::replace(&mut g.on_pending, true)
+        };
+        if push {
+            self.pending.push(Item::Delayed(d.clone()));
+        }
+        self.has_work = true;
+    }
 }
 
 /// A workqueue for executing deferred work
@@ -254,8 +374,8 @@ impl Workqueue {
             name,
             flags,
             inner: IrqSpinlock::new(WorkqueueInner {
-                pending: VecDeque::new(),
-                delayed: Vec::new(),
+                pending: PendList::new(),
+                delayed: None,
                 worker_tid: 0,
                 has_work: false,
             }),
@@ -287,7 +407,7 @@ impl Workqueue {
         // Add to pending queue
         {
             let mut inner = self.inner.lock();
-            inner.pending.push_back(work);
+            inner.pending.push(Item::Work(work));
             inner.has_work = true;
         }
 
@@ -309,7 +429,7 @@ impl Workqueue {
             }
             g.wake_tick = wake_tick;
             drop(g);
-            inner.delayed.push(work);
+            inner.delay(work);
         }
         self.kick_delayed();
         true
@@ -332,13 +452,17 @@ impl Workqueue {
                 // worklist), so repeated kicks never void a queued run
                 return true;
             }
-            if g.wake_tick == 0 {
-                // Promoted (its copy must not run) or idle: onto the list
+            let onto = g.wake_tick == 0;
+            if onto {
+                // Promoted (its entry must not run) or idle: onto the list
                 g.seq += 1;
                 g.work.try_set_pending();
-                inner.delayed.push(work.clone());
             }
             g.wake_tick = wake_tick;
+            drop(g);
+            if onto {
+                inner.delay(work.clone());
+            }
             was
         };
         self.kick_delayed();
@@ -354,13 +478,17 @@ impl Workqueue {
         if !g.work.is_pending() {
             return false;
         }
-        if g.wake_tick != 0 {
-            inner.delayed.retain(|d| !Arc::ptr_eq(d, work));
+        let timed = g.wake_tick != 0;
+        if timed {
             g.wake_tick = 0;
         } else {
             g.seq += 1;
         }
         g.work.clear_pending();
+        drop(g);
+        if timed {
+            inner.sweep(|d| !Arc::ptr_eq(d, work));
+        }
         true
     }
 
@@ -370,32 +498,32 @@ impl Workqueue {
         self.wait.wake_one();
     }
 
-    /// Move expired delayed work to the pending queue (worker thread)
+    /// Move expired delayed work to the pending queue (worker thread;
+    /// Linux delayed_work_timer_fn queues the item itself)
     ///
     /// Returns the earliest remaining wake tick, if any.
     fn promote_delayed(&self, current_tick: u64) -> Option<u64> {
         let mut inner = self.inner.lock();
         let mut next: Option<u64> = None;
-        let mut i = 0;
-        while i < inner.delayed.len() {
-            let mut g = inner.delayed[i].lock();
-            let wake_tick = g.wake_tick;
-            if wake_tick <= current_tick {
+        let mut due = None::<Arc<Mutex<DelayedWork>>>;
+        inner.sweep(|d| {
+            let mut g = d.lock();
+            if g.wake_tick <= current_tick {
                 g.wake_tick = 0;
-                let seq = g.seq;
+                // Chained through `dnext`, which the sweep just cleared
+                g.dnext = due.take();
                 drop(g);
-                let dw = inner.delayed.remove(i);
-                let mut work = Work::new(move || Work::run_delayed(&dw, seq));
-                // The wrapper is fresh: mark it pending like queue_work
-                work.try_set_pending();
-                // The worker thread: failure cannot be reported
-                inner.pending.push_back(arc_nofail(Mutex::new(work)));
-                inner.has_work = true;
+                due = Some(d.clone());
+                false
             } else {
-                drop(g);
-                next = Some(next.map_or(wake_tick, |n: u64| n.min(wake_tick)));
-                i += 1;
+                let t = g.wake_tick;
+                next = Some(next.map_or(t, |n: u64| n.min(t)));
+                true
             }
+        });
+        while let Some(d) = due {
+            due = d.lock().dnext.take();
+            inner.promote(&d);
         }
         next
     }
@@ -405,29 +533,24 @@ impl Workqueue {
     /// Returns the number of work items processed.
     fn process_pending(&self) -> usize {
         let mut processed = 0;
-
         loop {
             // Pop one work item
-            let work = {
+            let it = {
                 let mut inner = self.inner.lock();
-                inner.pending.pop_front()
+                let it = inner.pending.pop();
+                if it.is_none() {
+                    inner.has_work = false;
+                }
+                it
             };
-
-            match work {
-                Some(w) => {
-                    Work::run(&w);
+            match it {
+                Some(it) => {
+                    it.run();
                     processed += 1;
                 }
                 None => break,
             }
         }
-
-        // Clear has_work flag
-        {
-            let mut inner = self.inner.lock();
-            inner.has_work = !inner.pending.is_empty();
-        }
-
         processed
     }
 
@@ -526,5 +649,68 @@ pub fn init() {
 pub fn flush_workqueue(wq: &Workqueue) {
     while wq.has_pending() {
         wq.process_pending();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    static LOG: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    fn work(n: u32) -> Arc<Mutex<Work>> {
+        Arc::new(Mutex::new(Work::new(move || LOG.lock().push(n))))
+    }
+
+    fn delayed(n: u32) -> Arc<Mutex<DelayedWork>> {
+        Arc::new(Mutex::new(DelayedWork::new(move || LOG.lock().push(n))))
+    }
+
+    fn take_log() -> Vec<u32> {
+        core::mem::take(&mut *LOG.lock())
+    }
+
+    /// The intrusive lists in one test (they share LOG): FIFO order, no
+    /// double queueing, an item re-queued after its run, and delayed
+    /// items promoted, re-timed and cancelled
+    #[test]
+    fn intrusive_lists() {
+        let wq = Workqueue::new("test", 0);
+        let (a, b, c) = (work(1), work(2), work(3));
+        assert!(wq.queue_work(a.clone()));
+        assert!(wq.queue_work(b.clone()));
+        assert!(!wq.queue_work(a.clone()));
+        assert!(wq.queue_work(c.clone()));
+        assert_eq!(wq.process_pending(), 3);
+        assert_eq!(take_log(), [1, 2, 3]);
+        assert!(!wq.has_pending());
+        // Queued again after running; the lists hold no stale links
+        assert!(wq.queue_work(b.clone()));
+        assert_eq!(wq.process_pending(), 1);
+        assert_eq!(take_log(), [2]);
+        assert_eq!(Arc::strong_count(&b), 1);
+
+        let now = get_ticks();
+        let (d, e, f) = (delayed(10), delayed(11), delayed(12));
+        assert!(wq.queue_delayed_work(d.clone(), 5));
+        assert!(wq.queue_delayed_work(e.clone(), 50));
+        assert!(wq.queue_delayed_work(f.clone(), 5));
+        assert!(!wq.queue_delayed_work(d.clone(), 5));
+        // f cancelled while timed: off the delayed list
+        assert!(wq.cancel_delayed_work(&f));
+        assert_eq!(wq.promote_delayed(now + 10), Some(now + 50));
+        // d promoted, then cancelled before it ran: its entry is void
+        assert!(wq.cancel_delayed_work(&d));
+        assert_eq!(wq.process_pending(), 1);
+        assert!(take_log().is_empty());
+        // e re-timed to now: promoted and run once
+        assert!(wq.mod_delayed_work(&e, 0));
+        assert_eq!(wq.promote_delayed(now + 10), None);
+        wq.process_pending();
+        assert_eq!(take_log(), [11]);
+        for x in [&d, &e, &f] {
+            assert_eq!(Arc::strong_count(x), 1);
+        }
     }
 }
