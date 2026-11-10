@@ -549,8 +549,8 @@ return 0 without moving the device (Linux: moved, or an error).
 
 **Location**: `io/io_uring/`
 
-- `io_uring_enter(IORING_ENTER_GETEVENTS)` never blocks (moves
-  overflowed CQEs only) and ignores IORING_ENTER_EXT_ARG
+- GETEVENTS ignores io_uring_getevents_arg's min_wait_usec (Linux
+  IORING_FEAT_MIN_TIMEOUT) and IORING_ENTER_ABS_TIMER (EINVAL)
 - Every operation runs inline in io_uring_enter under the submission
   lock: one that blocks (a read of an empty pipe or socket) blocks the
   caller; Linux arms poll or punts it to io-wq threads. IOSQE_IO_DRAIN

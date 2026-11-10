@@ -457,7 +457,7 @@ goes down later.
 9.3 io_uring (modern async I/O)
 
 - [x] io_uring_setup (rings mapped at IORING_OFF_SQ_RING/CQ_RING/SQES, one region: IORING_FEAT_SINGLE_MMAP; IORING_SETUP_CQSIZE, CLAMP; no SQPOLL)
-- [x] io_uring_enter (SQEs read from the shared SQ, CQEs posted to the shared CQ, overflow kept: IORING_FEAT_NODROP)
+- [x] io_uring_enter (SQEs read from the shared SQ, CQEs posted to the shared CQ, overflow kept: IORING_FEAT_NODROP; GETEVENTS sleeps interruptibly for min_complete, IORING_ENTER_EXT_ARG timeout and sigmask)
 - [x] io_uring_register (FILES, UNREGISTER_FILES, FILES_UPDATE)
 
 10. Credentials, security, keyrings

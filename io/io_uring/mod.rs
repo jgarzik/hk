@@ -25,6 +25,7 @@ pub mod abi;
 mod ops;
 mod rings;
 mod rw;
+mod wait;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -65,6 +66,7 @@ const FEATURES: u32 = IORING_FEAT_SINGLE_MMAP
     | IORING_FEAT_SUBMIT_STABLE
     | IORING_FEAT_RW_CUR_POS
     | IORING_FEAT_CUR_PERSONALITY
+    | IORING_FEAT_EXT_ARG
     | IORING_FEAT_CQE_SKIP;
 
 /// Setup flags hk implements
@@ -72,7 +74,8 @@ const SETUP_FLAGS: u32 = IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP;
 
 /// io_uring_enter flags hk accepts; SQ_WAKEUP and SQ_WAIT do nothing on
 /// a ring without SQPOLL (Linux)
-const ENTER_FLAGS: u32 = IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP | IORING_ENTER_SQ_WAIT;
+const ENTER_FLAGS: u32 =
+    IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP | IORING_ENTER_SQ_WAIT | IORING_ENTER_EXT_ARG;
 
 /// The submission side, under `IoRing.submit` (Linux uring_lock)
 pub struct Submit {
@@ -103,6 +106,8 @@ pub struct IoRing {
     overflowed: AtomicBool,
     /// Pollers of the ring fd (Linux poll_wq)
     wq: WaitQueue,
+    /// GETEVENTS waiters (Linux cq_wait), woken by every CQE posted
+    cq_wait: WaitQueue,
 }
 
 /// The SQEs' link state across one submission: chains run in order,
@@ -131,6 +136,7 @@ impl IoRing {
             }),
             overflowed: AtomicBool::new(false),
             wq: WaitQueue::new(),
+            cq_wait: WaitQueue::new(),
         })
     }
 
@@ -234,6 +240,12 @@ impl IoRing {
                 self.overflow(&mut cq, cqe);
             }
         }
+        self.cq_wake();
+    }
+
+    /// Wake GETEVENTS waiters and pollers (Linux io_cqring_wake)
+    fn cq_wake(&self) {
+        self.cq_wait.wake_all();
         self.wq.wake_poll(u32::from(POLLIN | POLLRDNORM));
     }
 
@@ -494,14 +506,15 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: UserPtr<IoUringParams>) -> K
 /// io_uring_enter(fd, to_submit, min_complete, flags, argp, argsz):
 /// consume up to `to_submit` SQEs, the number consumed (Linux
 /// io_uring_enter); with IORING_ENTER_GETEVENTS, after a full
-/// submission, overflowed CQEs move into the CQ
+/// submission, wait for `min_complete` CQEs (`wait`), whose error is
+/// returned if nothing was submitted
 pub fn sys_io_uring_enter(
     fd: u32,
     to_submit: u32,
-    _min_complete: u32,
+    min_complete: u32,
     flags: u32,
-    _argp: u64,
-    _argsz: usize,
+    argp: u64,
+    argsz: usize,
 ) -> KernelResult<u32> {
     if flags & !ENTER_FLAGS != 0 {
         return Err(KernelError::InvalidArgument);
@@ -515,7 +528,11 @@ pub fn sys_io_uring_enter(
         }
     }
     if flags & IORING_ENTER_GETEVENTS != 0 {
-        ring.flush_overflow();
+        let r =
+            wait::get_ext_arg(flags, argp, argsz).and_then(|ext| ring.cq_wait(min_complete, &ext));
+        if ret == 0 {
+            r?;
+        }
     }
     Ok(ret)
 }

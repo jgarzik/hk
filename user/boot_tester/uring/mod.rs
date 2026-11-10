@@ -3,6 +3,7 @@
 
 pub mod ring;
 pub mod setup;
+pub mod wait;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -18,6 +19,7 @@ pub const EOPNOTSUPP: i64 = -95;
 pub fn run_tests() {
     setup::run_tests();
     ring::run_tests();
+    wait::run_tests();
 }
 
 /// One mapped region
