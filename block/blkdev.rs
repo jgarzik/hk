@@ -37,6 +37,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
+use crate::sync::IrqSpinlock;
 use crate::sync::completion::Completion;
 use crate::sync::spin::{Mutex, RwLock};
 
@@ -405,6 +406,8 @@ pub struct RequestQueue {
     /// The device takes FUA writes (Linux BLK_FEAT_FUA); no driver does
     /// yet, so a FUA write to a cache is followed by a flush
     fua: bool,
+    /// Post-flush state per hardware queue
+    fqs: Vec<FlushQueue>,
 }
 
 impl RequestQueue {
@@ -415,16 +418,19 @@ impl RequestQueue {
             kind: QueueKind::Bio(driver),
             write_cache,
             fua: false,
+            fqs: flush_queues(1),
         }
     }
 
     /// Queue of a blk-mq driver
     pub fn new_mq(mq: BlkMq, limits: QueueLimits, write_cache: bool) -> Self {
+        let fqs = flush_queues(mq.nr_hw_queues());
         Self {
             limits,
             kind: QueueKind::Mq(mq),
             write_cache,
             fua: false,
+            fqs,
         }
     }
 
@@ -491,80 +497,173 @@ impl RequestQueue {
     }
 }
 
+/// How long written data may wait for others' data before its flush
+/// goes out anyway (Linux FLUSH_PENDING_TIMEOUT, 5 s)
+const FLUSH_PENDING_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// One hardware queue's post-flush state (Linux struct blk_flush_queue,
+/// one per hctx): FUA writes whose data is done share flushes
+pub(super) struct FlushQueue(IrqSpinlock<FqState>);
+
+struct FqState {
+    /// Writes whose data is done, waiting for the next flush (Linux
+    /// flush_queue[flush_pending_idx])
+    pending: BioList,
+    /// When the first of `pending` came (Linux flush_pending_since)
+    since: u64,
+    /// Writes the flush in flight serves (Linux
+    /// flush_queue[flush_running_idx])
+    running: BioList,
+    /// FUA writes whose data is in flight (Linux flush_data_in_flight)
+    data_in_flight: usize,
+    /// The flush, allocated with the queue, while not in flight (Linux
+    /// fq->flush_rq)
+    flush: Option<Box<Bio>>,
+    /// Address of the queue, for the flush (set by each write)
+    q: usize,
+}
+
+impl FlushQueue {
+    fn new() -> Self {
+        Self(IrqSpinlock::new(FqState {
+            pending: BioList::new(),
+            since: 0,
+            running: BioList::new(),
+            data_in_flight: 0,
+            flush: Some(Bio::new(BioOp::Flush, 0)),
+            q: 0,
+        }))
+    }
+}
+
+/// One flush queue per hardware queue (one for a bio-based queue)
+fn flush_queues(n: usize) -> Vec<FlushQueue> {
+    (0..n.max(1)).map(|_| FlushQueue::new()).collect()
+}
+
+impl FqState {
+    /// The flush to send, if one should go now (Linux blk_kick_flush):
+    /// none in flight (C1), writes waiting, and no FUA data in flight
+    /// that it could also serve (C2) unless the oldest waited too long
+    /// (C3). Its writes move to `running`
+    fn kick(&mut self, fq: &FlushQueue) -> Option<(Box<Bio>, usize)> {
+        if self.flush.is_none() || self.pending.is_empty() {
+            return None;
+        }
+        if self.data_in_flight > 0
+            && crate::time::monotonic_ns().saturating_sub(self.since) < FLUSH_PENDING_TIMEOUT_NS
+        {
+            return None;
+        }
+        self.running = core::mem::take(&mut self.pending);
+        let mut f = self.flush.take()?;
+        f.status = Ok(());
+        f.end_io = Some(fq_flush_done);
+        f.private = core::ptr::from_ref(fq) as usize;
+        Some((f, self.q))
+    }
+}
+
+/// Send a flush `kick` picked (no flush queue lock held)
+fn send_flush(f: Option<(Box<Bio>, usize)>) {
+    if let Some((f, q)) = f {
+        // SAFETY: a write set `q` from its live queue, whose disk outlives
+        // the bios submitted to it, this flush's writes among them
+        let q = unsafe { &*(q as *const RequestQueue) };
+        // A blk-mq dispatch only takes IRQ-safe queue locks: fine in
+        // hardirq
+        q.dispatch(f);
+    }
+}
+
 impl RequestQueue {
-    /// A FUA write on a cache without FUA: the write, then a flush, then
-    /// the owner's completion with the first error (Linux blk-flush.c:
-    /// REQ_FSEQ_DATA | REQ_FSEQ_POSTFLUSH). The flush is allocated here,
-    /// in the submitter's context, so the completion allocates nothing.
+    /// A FUA write on a cache without FUA: the write, then a flush it
+    /// shares with the writes done meanwhile, then the owner's
+    /// completion with the first error (Linux blk-flush.c: REQ_FSEQ_DATA
+    /// | REQ_FSEQ_POSTFLUSH through the submitting CPU's hctx flush
+    /// queue). The sequence is allocated here, in the submitter's
+    /// context, so completions allocate nothing.
     fn postflush(&self, mut bio: Box<Bio>) {
+        let h = self.mq().map_or(0, BlkMq::this_hctx);
+        let fq = &self.fqs[h.min(self.fqs.len() - 1)];
         let seq = box_nofail(FlushSeq {
             end_io: bio.end_io.take(),
             private: bio.private,
-            q: core::ptr::from_ref(self),
-            flush: Some(Bio::new(BioOp::Flush, 0)),
-            data: None,
+            fq: core::ptr::from_ref(fq) as usize,
         });
         bio.end_io = Some(flushseq_data_done);
         bio.private = Box::into_raw(seq) as usize;
+        {
+            let mut st = fq.0.lock();
+            st.data_in_flight += 1;
+            st.q = core::ptr::from_ref(self) as usize;
+        }
         self.dispatch(bio);
     }
 }
 
-/// A FUA write's post-flush sequence, owned by the bio in flight
+/// A FUA write's sequence, owned by the write until it ends
 struct FlushSeq {
     /// The write's own completion, restored before it runs
     end_io: Option<EndIo>,
     private: usize,
-    /// The queue; the disk holding it outlives the bios submitted to it
-    /// (their submitter keeps its block device until they complete)
-    q: *const RequestQueue,
-    /// The flush, until sent
-    flush: Option<Box<Bio>>,
-    /// The write while its flush runs
-    data: Option<Box<Bio>>,
+    /// Address of its flush queue, in its queue (which outlives it)
+    fq: usize,
 }
 
-/// The write of a post-flush sequence is done (any context): a failed
-/// write completes now, else the flush goes out
+/// The data of a post-flush write is done (any context): a failed write
+/// ends now, a good one waits for the next flush (Linux
+/// mq_flush_data_end_io, blk_flush_complete_seq)
 fn flushseq_data_done(bio: Box<Bio>) {
-    let p = bio.private as *mut FlushSeq;
-    if bio.status.is_err() {
-        // SAFETY: `postflush` made `private` a leaked FlushSeq, owned by
-        // this bio's single completion
-        let seq = unsafe { Box::from_raw(p) };
-        return flushseq_end(bio, *seq);
-    }
-    // SAFETY: as above; nothing else holds the sequence until the flush
-    // completes
-    let seq = unsafe { &mut *p };
-    let Some(mut f) = seq.flush.take() else {
-        unreachable!("post-flush sent twice")
+    // SAFETY: `postflush` made `private` a leaked FlushSeq, owned by this
+    // write until it ends
+    let fq = unsafe { &*((*(bio.private as *const FlushSeq)).fq as *const FlushQueue) };
+    let failed = bio.status.is_err();
+    let (f, bio) = {
+        let mut st = fq.0.lock();
+        st.data_in_flight -= 1;
+        let bio = if failed {
+            Some(bio)
+        } else {
+            if st.pending.is_empty() {
+                st.since = crate::time::monotonic_ns();
+            }
+            st.pending.push(bio);
+            None
+        };
+        (st.kick(fq), bio)
     };
-    f.end_io = Some(flushseq_flush_done);
-    f.private = p as usize;
-    seq.data = Some(bio);
-    // SAFETY: the queue outlives the bios submitted to it (FlushSeq.q)
-    let q = unsafe { &*seq.q };
-    // A blk-mq dispatch only takes IRQ-safe queue locks: fine in hardirq
-    q.dispatch(f);
+    send_flush(f);
+    if let Some(bio) = bio {
+        flushseq_end(bio);
+    }
 }
 
-/// The flush of a post-flush sequence is done (any context): the write
-/// completes, with the flush's error if the write had none
-fn flushseq_flush_done(f: Box<Bio>) {
-    // SAFETY: `flushseq_data_done` made `private` the sequence, now owned
-    // by this completion alone
-    let mut seq = unsafe { Box::from_raw(f.private as *mut FlushSeq) };
-    let Some(mut bio) = seq.data.take() else {
-        unreachable!("post-flush without its write")
+/// A shared flush is done (any context): the writes it served end, with
+/// its error if any, and the next goes out if writes wait (Linux
+/// flush_end_io)
+fn fq_flush_done(f: Box<Bio>) {
+    // SAFETY: `kick` made `private` the flush queue, in its queue
+    let fq = unsafe { &*(f.private as *const FlushQueue) };
+    let status = f.status;
+    let (mut done, next) = {
+        let mut st = fq.0.lock();
+        st.flush = Some(f);
+        let done = core::mem::take(&mut st.running);
+        (done, st.kick(fq))
     };
-    bio.status = f.status;
-    drop(f);
-    flushseq_end(bio, *seq);
+    send_flush(next);
+    while let Some(mut bio) = done.pop() {
+        bio.status = status;
+        flushseq_end(bio);
+    }
 }
 
 /// Give the write its own completion back and run it
-fn flushseq_end(mut bio: Box<Bio>, seq: FlushSeq) {
+fn flushseq_end(mut bio: Box<Bio>) {
+    // SAFETY: `postflush` made `private` the leaked sequence, which ends
+    // with the write here
+    let seq = unsafe { Box::from_raw(bio.private as *mut FlushSeq) };
     bio.end_io = seq.end_io;
     bio.private = seq.private;
     bio_endio(bio);
@@ -1275,6 +1374,69 @@ mod tests {
         let (log, done) = fua_write(true, alloc::vec![BioOp::Flush]);
         assert_eq!(log, [w, f]);
         assert_eq!(done, (1, Some(Err(KernelError::Io))));
+    }
+
+    /// A bio-based driver that logs each bio and holds it for the test
+    /// to end
+    struct HoldDrv {
+        held: Mutex<Vec<Box<Bio>>>,
+        log: Mutex<Vec<BioOp>>,
+    }
+
+    impl BlockDriver for HoldDrv {
+        fn submit_bio(&self, bio: Box<Bio>) {
+            self.log.lock().push(bio.op);
+            self.held.lock().push(bio);
+        }
+    }
+
+    static OWNED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+    fn owner_seen(bio: Box<Bio>) {
+        assert!(bio.status.is_ok());
+        OWNED.lock().push(bio.sector);
+    }
+
+    #[test]
+    fn postflushes_coalesce() {
+        let drv = Arc::new(HoldDrv {
+            held: Mutex::new(Vec::new()),
+            log: Mutex::new(Vec::new()),
+        });
+        let q = RequestQueue::new_bio(drv.clone(), QueueLimits::default(), true);
+        let write = |sector| {
+            let mut b = Bio::new(BioOp::Write, sector);
+            b.flags = BioFlags::FUA;
+            b.end_io = Some(owner_seen);
+            q.submit(b);
+        };
+        // End the held bio for `sector` (a flush is at sector 0)
+        let end = |sector: u64| {
+            let b = {
+                let mut h = drv.held.lock();
+                let i = h.iter().position(|b| b.sector == sector).unwrap();
+                h.remove(i)
+            };
+            bio_endio(b);
+        };
+        let (w, f) = (BioOp::Write, BioOp::Flush);
+        write(8);
+        write(16);
+        end(8);
+        // 16's data is in flight: 8 waits to share its flush
+        assert_eq!(*drv.log.lock(), [w, w]);
+        end(16);
+        assert_eq!(*drv.log.lock(), [w, w, f]);
+        // One flush at a time: 24 waits for the next
+        write(24);
+        end(24);
+        assert_eq!(*drv.log.lock(), [w, w, f, w]);
+        end(0);
+        assert_eq!(*OWNED.lock(), [8, 16]);
+        assert_eq!(*drv.log.lock(), [w, w, f, w, f]);
+        end(0);
+        assert_eq!(*OWNED.lock(), [8, 16, 24]);
+        assert!(drv.held.lock().is_empty());
     }
 
     #[test]

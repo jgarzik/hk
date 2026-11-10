@@ -271,9 +271,6 @@ lo (hk has no checksum offload states).
 - No REQ_NOWAIT on bios: an RWF_NOWAIT direct I/O to a bio-based
   driver (USB sd: synchronous) may block in it, where Linux refuses
   such a queue (EOPNOTSUPP without BLK_FEAT_NOWAIT).
-- A FUA write's post-flush is not merged with others in flight (Linux
-  blk-flush coalesces them): an O_DSYNC direct write split into many
-  bios flushes once per bio.
 - Unpinning dirties a page-cache page under its page lock, so a
   `PinnedPages` (`mm/gup.rs`) holding one is dropped in thread context
   (the synchronous paths do); nothing yet lets an I/O completing in an
