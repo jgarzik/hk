@@ -46,8 +46,14 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use alloc::sync::Arc;
+
 use crate::sync::IrqSpinlock;
+use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
+use crate::task::workqueue::{Work, Workqueue, wq_flags::WQ_HIGHPRI, wq_flags::WQ_MEM_RECLAIM};
+use crate::util::kalloc::try_arc;
+use crate::util::kmem::try_vec;
 
 use super::blkdev::{Bio, BioFlags, BioList, bio_endio, bio_io_error};
 use crate::util::error::KernelError;
@@ -154,6 +160,52 @@ pub struct BlkMq {
     /// depth; a NOWAIT bio finding them all taken ends with EAGAIN
     rqs: Vec<AtomicUsize>,
     depth: Vec<usize>,
+    /// Hardware queue runs handed to kblockd, and its work item (Linux
+    /// blk_mq_run_hw_queue(hctx, async): the hctx run_work)
+    kick: Arc<Mutex<Kick>>,
+    kick_work: Arc<Mutex<Work>>,
+}
+
+/// The block layer's workqueue (Linux kblockd_workqueue)
+pub static KBLOCKD: Workqueue = Workqueue::new("kblockd", WQ_MEM_RECLAIM | WQ_HIGHPRI);
+
+/// Start kblockd (Linux blk_dev_init); before any disk
+pub fn kblockd_init() {
+    if let Err(e) = KBLOCKD.start(None) {
+        crate::printkln!("blk-mq: no kblockd ({:?}): queue runs stay synchronous", e);
+    }
+}
+
+/// Hardware queues kblockd is to run, and the queues they belong to
+/// while any is marked (the work holds them until it has run)
+struct Kick {
+    mq: Option<Arc<BlkMq>>,
+    hctxs: Vec<bool>,
+}
+
+/// kblockd: run each marked hardware queue (Linux blk_mq_run_work_fn)
+fn kick_run(k: &Mutex<Kick>) {
+    loop {
+        let (mq, h) = {
+            let mut s = k.lock();
+            match s.hctxs.iter().position(|&m| m) {
+                Some(h) => {
+                    s.hctxs[h] = false;
+                    (s.mq.clone(), h)
+                }
+                None => {
+                    // Dropped unlocked: it may be the queues' last hold
+                    let mq = s.mq.take();
+                    drop(s);
+                    drop(mq);
+                    return;
+                }
+            }
+        };
+        if let Some(mq) = mq {
+            mq.run(h);
+        }
+    }
 }
 
 impl BlkMq {
@@ -165,7 +217,15 @@ impl BlkMq {
         }
         let n = crate::cpu::nr_cpu_ids() as usize;
         let words = n.div_ceil(ops.len()).div_ceil(64);
+        let kick = try_arc(Mutex::new(Kick {
+            mq: None,
+            hctxs: try_vec(ops.len(), false)?,
+        }))?;
+        let k = kick.clone();
+        let kick_work = try_arc(Mutex::new(Work::new(move || kick_run(&k))))?;
         Ok(Self {
+            kick,
+            kick_work,
             rqs: ops.iter().map(|_| AtomicUsize::new(0)).collect(),
             depth: ops.iter().map(|o| o.depth().max(1)).collect(),
             ctxs: (0..n).map(|_| IrqSpinlock::new(BioList::new())).collect(),
@@ -279,6 +339,45 @@ impl BlkMq {
             }
             self.run(h);
         }
+    }
+
+    /// `submit_list` from a task about to sleep (Linux
+    /// blk_mq_flush_plug_list from_schedule): the requests go on their
+    /// software queues, and kblockd runs the hardware queues, so nothing
+    /// is dispatched or ended inside `schedule()`
+    pub fn submit_list_async(self: &Arc<Self>, l: &mut BioList) {
+        while let Some(first) = l.pop() {
+            let cpu = usize::from(first.rq_ctx) % self.ctxs.len();
+            let h = self.map(cpu);
+            let (w, bit) = self.ctx_bit(cpu);
+            {
+                let mut ctx = self.ctxs[cpu].lock();
+                ctx.push(first);
+                while l.first_ctx() == Some(cpu) {
+                    if let Some(b) = l.pop() {
+                        ctx.push(b);
+                    }
+                }
+                self.ctx_maps[h][w].fetch_or(bit, Ordering::Relaxed);
+            }
+            self.run_async(h);
+        }
+    }
+
+    /// Have kblockd run hardware queue `h` (Linux blk_mq_run_hw_queue
+    /// with async); synchronously if kblockd is not running
+    fn run_async(self: &Arc<Self>, h: usize) {
+        if !KBLOCKD.is_initialized() {
+            return self.run(h);
+        }
+        {
+            let mut s = self.kick.lock();
+            s.hctxs[h] = true;
+            if s.mq.is_none() {
+                s.mq = Some(self.clone());
+            }
+        }
+        KBLOCKD.queue_work(self.kick_work.clone());
     }
 
     /// The hardware queue this CPU submits to

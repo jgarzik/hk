@@ -44,7 +44,7 @@ use crate::sync::spin::{Mutex, RwLock};
 pub use crate::fs::chardev::{DevId, DevMajor, DevMinor};
 use crate::mm::writeback::{BdiWriteback, bdi_register, bdi_unregister};
 use crate::util::error::KernelError;
-use crate::util::kalloc::{box_nofail, try_arc};
+use crate::util::kalloc::{arc_nofail, box_nofail, try_arc};
 use crate::util::smallvec::SmallVec;
 
 use super::blk_mq::BlkMq;
@@ -452,7 +452,7 @@ pub trait BlockDriver: Send + Sync {
 
 enum QueueKind {
     Bio(Arc<dyn BlockDriver>),
-    Mq(BlkMq),
+    Mq(Arc<BlkMq>),
 }
 
 /// Request queue of a disk (Linux struct request_queue)
@@ -486,7 +486,7 @@ impl RequestQueue {
         let fqs = flush_queues(mq.nr_hw_queues());
         Self {
             limits,
-            kind: QueueKind::Mq(mq),
+            kind: QueueKind::Mq(arc_nofail(mq)),
             write_cache,
             fua: false,
             fqs,
@@ -505,6 +505,14 @@ impl RequestQueue {
 
     /// The blk-mq queues (for the driver's interrupt handler)
     pub fn mq(&self) -> Option<&BlkMq> {
+        match &self.kind {
+            QueueKind::Mq(m) => Some(&**m),
+            QueueKind::Bio(_) => None,
+        }
+    }
+
+    /// The blk-mq queues, shared with kblockd (`plug`)
+    pub(super) fn mq_arc(&self) -> Option<&Arc<BlkMq>> {
         match &self.kind {
             QueueKind::Mq(m) => Some(m),
             QueueKind::Bio(_) => None,

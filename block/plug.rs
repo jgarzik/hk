@@ -14,7 +14,9 @@
 //! the task is about to sleep (Linux sched_submit_work: a task may wait
 //! for something only its held bios would bring). Going out queues each
 //! queue's run of bios on the CPU's software queue at once, so the
-//! hardware queue is dispatched and the device notified once.
+//! hardware queue is dispatched and the device notified once; on the
+//! way to sleep kblockd does that run (Linux blk_flush_plug(plug,
+//! true)), so no driver call or end_io runs inside `schedule()`.
 //!
 //! Bio-based queues, flushes and the writes of a FUA sequence are never
 //! plugged (Linux: blk_mq_submit_bio only, op_is_flush bypasses it).
@@ -68,7 +70,7 @@ pub fn blk_plug<R>(f: impl FnOnce() -> R) -> R {
     let r = f();
     // SAFETY: `plug` is alive in this frame; the task's pointer, the
     // only other way to it, is used by this task alone and not now
-    flush(unsafe { &mut *p });
+    flush(unsafe { &mut *p }, false);
     current()
         .plug
         .store(core::ptr::null_mut(), Ordering::Relaxed);
@@ -76,8 +78,9 @@ pub fn blk_plug<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Send what a plug holds (Linux blk_mq_flush_plug_list): each queue's
-/// consecutive bios as one batch
-fn flush(p: &mut BlkPlug) {
+/// consecutive bios as one batch; from a task about to sleep
+/// (`from_schedule`) kblockd runs the hardware queues
+fn flush(p: &mut BlkPlug, from_schedule: bool) {
     let mut l = core::mem::take(&mut p.list);
     p.count = 0;
     p.multiple_queues = false;
@@ -85,30 +88,33 @@ fn flush(p: &mut BlkPlug) {
     let mut q = 0;
     while let Some(b) = l.pop() {
         if b.plug_q != q && !run.is_empty() {
-            send(q, &mut run);
+            send(q, &mut run, from_schedule);
         }
         q = b.plug_q;
         run.push(b);
     }
     if !run.is_empty() {
-        send(q, &mut run);
+        send(q, &mut run, from_schedule);
     }
 }
 
 /// Queue `run`, bios for the queue at address `q`
-fn send(q: usize, run: &mut BioList) {
+fn send(q: usize, run: &mut BioList, from_schedule: bool) {
     // SAFETY: `hold` took `q` from a live queue; its disk outlives the
     // bios submitted to it (the submitter keeps its block device until
     // they complete), and they are still held
     let q = unsafe { &*(q as *const RequestQueue) };
-    match q.mq() {
+    match q.mq_arc() {
+        Some(mq) if from_schedule => mq.submit_list_async(run),
         Some(mq) => mq.submit_list(run),
         None => unreachable!("plugged bio for a bio-based queue"),
     }
 }
 
 /// The current task is about to sleep: send its plug (Linux
-/// sched_submit_work -> blk_flush_plug). The plug stays active
+/// sched_submit_work -> blk_flush_plug(plug, true)): its requests go on
+/// their software queues and kblockd dispatches them, so no driver
+/// call or end_io runs inside `schedule()`. The plug stays active
 pub fn flush_on_sleep() {
     let p = current().plug.load(Ordering::Relaxed);
     if p.is_null() {
@@ -119,7 +125,7 @@ pub fn flush_on_sleep() {
     // in the scheduler, not in a plug operation (none sleeps)
     let p = unsafe { &mut *p };
     if p.count > 0 {
-        flush(p);
+        flush(p, true);
     }
 }
 
@@ -160,7 +166,7 @@ pub fn hold(q: &RequestQueue, mut bio: Box<Bio>) -> Result<(), Box<Bio>> {
         .last_mut()
         .is_some_and(|l| l.rq_sectors() << 9 >= BLK_PLUG_FLUSH_SIZE);
     if p.count >= limit || big {
-        flush(p);
+        flush(p, false);
     }
     if p.list.last_mut().is_some_and(|l| l.plug_q != bio.plug_q) {
         p.multiple_queues = true;
