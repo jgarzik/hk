@@ -30,7 +30,7 @@
 use alloc::boxed::Box;
 use core::sync::atomic::Ordering;
 
-use super::blkdev::{Bio, BioList, BioOp, RequestQueue};
+use super::blkdev::{Bio, BioFlags, BioList, BioOp, RequestQueue};
 use crate::task::percpu::current;
 
 /// Requests a plug holds before it goes out (Linux BLK_MAX_REQUEST_COUNT,
@@ -135,13 +135,21 @@ pub fn hold(q: &RequestQueue, mut bio: Box<Bio>) -> Result<(), Box<Bio>> {
     // sleeping, so nothing else uses the plug meanwhile
     let p = unsafe { &mut *p };
     bio.plug_q = core::ptr::from_ref(q) as usize;
-    let bio = match p.list.last_mut() {
+    let mut bio = match p.list.last_mut() {
         Some(last) if last.plug_q == bio.plug_q => match merge(q, last, bio) {
             Ok(()) => return Ok(()),
             Err(b) => b,
         },
         _ => bio,
     };
+    // The request is taken before it is held (Linux
+    // blk_mq_get_new_requests before blk_add_rq_to_plug)
+    if let Some(mq) = q.mq_queues()
+        && !mq.get_rq(&mut bio)
+    {
+        crate::block::blkdev::bio_io_error(bio, crate::util::error::KernelError::WouldBlock);
+        return Ok(());
+    }
     let limit = if p.multiple_queues {
         2 * BLK_MAX_REQUEST_COUNT
     } else {
@@ -169,7 +177,9 @@ fn merge(q: &RequestQueue, rq: &mut Bio, mut bio: Box<Bio>) -> Result<(), Box<Bi
     let lim = &q.limits;
     let ok = rq.op == bio.op
         && rq.op != BioOp::Flush
-        && rq.flags == bio.flags
+        && (rq.flags ^ bio.flags)
+            .difference(BioFlags::NOWAIT)
+            .is_empty()
         && rq.rq_sectors() + bio.sectors() <= u64::from(lim.max_sectors)
         && rq.rq_nr_segs() + bio.segs.len() <= lim.max_segments as usize;
     if !ok {
@@ -243,8 +253,12 @@ mod tests {
         w.op = BioOp::Write;
         assert!(merge(&q, &mut rq, w).is_err());
         let mut f = bio(40, 1);
-        f.flags = crate::block::blkdev::BioFlags::FUA;
+        f.flags = BioFlags::FUA;
         assert!(merge(&q, &mut rq, f).is_err());
+        // NOWAIT does not keep bios apart
+        let mut n = bio(40, 1);
+        n.flags = BioFlags::NOWAIT;
+        assert!(merge(&q, &mut rq, n).is_ok());
     }
 
     #[test]

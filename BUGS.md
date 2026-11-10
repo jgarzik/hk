@@ -268,9 +268,6 @@ lo (hk has no checksum offload states).
 - A post-direct-write invalidation failure only prints (Linux
   dio_warn_stale_pagecache also sets the mapping's writeback error,
   which the next fsync reports): no errseq on `AddressSpace`.
-- No REQ_NOWAIT on bios: an RWF_NOWAIT direct I/O to a bio-based
-  driver (USB sd: synchronous) may block in it, where Linux refuses
-  such a queue (EOPNOTSUPP without BLK_FEAT_NOWAIT).
 - Unpinning dirties a page-cache page under its page lock, so a
   `PinnedPages` (`mm/gup.rs`) holding one is dropped in thread context
   (the synchronous paths do); nothing yet lets an I/O completing in an

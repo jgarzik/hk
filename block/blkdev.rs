@@ -125,6 +125,10 @@ bitflags::bitflags! {
         /// REQ_FUA): a queue with a volatile cache but no FUA follows it
         /// with a flush
         const FUA = 1 << 0;
+        /// Never wait in the block layer or driver: a bio that would
+        /// (no free tag; a driver that does its I/O in the submitter)
+        /// ends with EAGAIN (Linux REQ_NOWAIT, bio_wouldblock_error)
+        const NOWAIT = 1 << 1;
     }
 }
 
@@ -168,6 +172,9 @@ pub struct Bio {
     pub merged: BioList,
     /// Address of the queue a plugged bio is for (`plug`)
     pub(super) plug_q: usize,
+    /// Software queue (CPU) of its blk-mq request, set when the request
+    /// is taken (Linux rq->mq_ctx)
+    pub(super) rq_ctx: u16,
     /// Link in a [`BioList`]
     next: Option<Box<Bio>>,
 }
@@ -186,6 +193,7 @@ impl Bio {
             private: 0,
             merged: BioList::new(),
             plug_q: 0,
+            rq_ctx: 0,
             next: None,
         })
     }
@@ -305,6 +313,11 @@ impl BioList {
         self.head = Some(bio);
     }
 
+    /// The software queue of the first bio's request
+    pub(super) fn first_ctx(&self) -> Option<usize> {
+        self.head.as_ref().map(|b| usize::from(b.rq_ctx))
+    }
+
     /// The last bio
     pub fn last_mut(&mut self) -> Option<&mut Bio> {
         // SAFETY: `tail` is null or points into the last box of the
@@ -358,6 +371,9 @@ pub struct QueueLimits {
     /// Smallest efficient I/O in bytes as the device reports it, 0 if it
     /// does not (`io_min` raises it to the physical block size)
     pub io_min: u32,
+    /// A bio-based driver that never waits takes NOWAIT bios (Linux
+    /// BLK_FEAT_NOWAIT, which blk-mq queues always have)
+    pub nowait: bool,
 }
 
 impl QueueLimits {
@@ -380,6 +396,7 @@ impl Default for QueueLimits {
             rotational: true,
             dma_alignment: SECTOR_SIZE as u32 - 1,
             io_min: 0,
+            nowait: false,
         }
     }
 }
@@ -466,6 +483,15 @@ impl RequestQueue {
         if bio.op == BioOp::Flush && !self.write_cache {
             return bio_endio(bio);
         }
+        // hk's bio-based drivers without it do their I/O in the
+        // submitter: a NOWAIT bio would wait there (Linux: a blk-mq SCSI
+        // queue, EAGAIN when it would wait for a tag)
+        if bio.flags.contains(BioFlags::NOWAIT)
+            && matches!(self.kind, QueueKind::Bio(_))
+            && !self.limits.nowait
+        {
+            return bio_io_error(bio, KernelError::WouldBlock);
+        }
         if bio.flags.contains(BioFlags::FUA) && !self.fua {
             bio.flags.remove(BioFlags::FUA);
             if self.write_cache {
@@ -480,6 +506,11 @@ impl RequestQueue {
             QueueKind::Bio(d) => d.submit_bio(bio),
             QueueKind::Mq(m) => m.submit(bio),
         }
+    }
+
+    /// The blk-mq queues, to take a request for a bio about to be held
+    pub(super) fn mq_queues(&self) -> Option<&BlkMq> {
+        self.mq()
     }
 
     /// A submitted bio: on the task's plug if it has one, the queue is

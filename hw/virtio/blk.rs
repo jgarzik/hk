@@ -366,6 +366,10 @@ impl MqOps for VbQueue {
         }
     }
 
+    fn depth(&self) -> usize {
+        self.slots.len()
+    }
+
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
         self
     }

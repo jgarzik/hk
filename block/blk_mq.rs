@@ -44,12 +44,12 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 
-use super::blkdev::{Bio, BioList, rq_end};
+use super::blkdev::{Bio, BioFlags, BioList, bio_io_error, rq_end};
 use crate::util::error::KernelError;
 use crate::util::group_cpus::{first_cpu, group_of};
 
@@ -74,6 +74,8 @@ pub trait MqOps: Send {
     fn commit(&mut self);
     /// Move finished bios, status set, to `done`
     fn complete(&mut self, done: &mut BioList);
+    /// Requests it can have started at once (Linux tag set queue_depth)
+    fn depth(&self) -> usize;
     /// The driver's own type, for its remove to take apart (`release`)
     fn into_any(self: Box<Self>) -> Box<dyn core::any::Any + Send>;
 }
@@ -126,11 +128,14 @@ impl HwState {
     }
 }
 
-/// End every bio of `l` (no queue lock held)
-fn end_all(l: &mut BioList) {
+/// End every request of `l` (no queue lock held): how many
+fn end_all(l: &mut BioList) -> usize {
+    let mut n = 0;
     while let Some(bio) = l.pop() {
         rq_end(bio);
+        n += 1;
     }
+    n
 }
 
 /// The software and hardware queues of one request queue
@@ -144,6 +149,11 @@ pub struct BlkMq {
     ctx_maps: Vec<Box<[AtomicU64]>>,
     /// `drain` waits here (Linux mq_freeze_wq)
     drained: WaitQueue,
+    /// Per hardware queue, requests taken and not yet ended (Linux tags
+    /// in use: a lock-free count, as Linux's sbitmap), and the driver's
+    /// depth; a NOWAIT bio finding them all taken ends with EAGAIN
+    rqs: Vec<AtomicUsize>,
+    depth: Vec<usize>,
 }
 
 impl BlkMq {
@@ -156,6 +166,8 @@ impl BlkMq {
         let n = crate::cpu::nr_cpu_ids() as usize;
         let words = n.div_ceil(ops.len()).div_ceil(64);
         Ok(Self {
+            rqs: ops.iter().map(|_| AtomicUsize::new(0)).collect(),
+            depth: ops.iter().map(|o| o.depth().max(1)).collect(),
             ctxs: (0..n).map(|_| IrqSpinlock::new(BioList::new())).collect(),
             ctx_maps: (0..ops.len())
                 .map(|_| (0..words).map(|_| AtomicU64::new(0)).collect())
@@ -198,27 +210,71 @@ impl BlkMq {
         (i / 64, 1 << (i % 64))
     }
 
-    /// Queue a bio and run its hardware queue: from thread context, or
-    /// from a completion with no queue lock held (a FUA write's flush)
-    pub fn submit(&self, bio: Box<Bio>) {
+    /// Take a request for `bio` on this CPU's hardware queue (Linux
+    /// blk_mq_get_new_requests, BLK_MQ_REQ_NOWAIT for a NOWAIT bio):
+    /// false if it is NOWAIT and every tag is taken. Others always get
+    /// one and wait in the queue for the driver's room
+    pub fn get_rq(&self, bio: &mut Bio) -> bool {
+        let cpu = crate::cpu::this_id() as usize % self.ctxs.len();
+        let h = self.map(cpu);
+        let n = &self.rqs[h];
+        if bio.flags.contains(BioFlags::NOWAIT) {
+            let depth = self.depth[h];
+            if n.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (v < depth).then_some(v + 1)
+            })
+            .is_err()
+            {
+                return false;
+            }
+        } else {
+            n.fetch_add(1, Ordering::Relaxed);
+        }
+        // cpu < NR_CPUS (256)
+        bio.rq_ctx = cpu as u16;
+        true
+    }
+
+    /// `n` requests of hardware queue `h` ended
+    fn put_rqs(&self, h: usize, n: usize) {
+        if n > 0 {
+            self.rqs[h].fetch_sub(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Take a request and queue it (from thread context, or from a
+    /// completion with no queue lock held: a FUA write's data and its
+    /// flush); a NOWAIT bio with no free tag ends with EAGAIN
+    pub fn submit(&self, mut bio: Box<Bio>) {
+        if !self.get_rq(&mut bio) {
+            return bio_io_error(bio, KernelError::WouldBlock);
+        }
         let mut l = BioList::new();
         l.push(bio);
         self.submit_list(&mut l);
     }
 
-    /// Queue the bios of `l` (a plug's, Linux blk_mq_flush_plug_list)
-    /// and run their hardware queue once: one dispatch, one notify of
+    /// Queue the requests of `l` (taken by `get_rq`; a plug's, Linux
+    /// blk_mq_flush_plug_list), each on its software queue, and run
+    /// their hardware queues once each run: one dispatch, one notify of
     /// the device for the lot (Linux queue_rqs / commit_rqs)
     pub fn submit_list(&self, l: &mut BioList) {
-        let cpu = crate::cpu::this_id() as usize % self.ctxs.len();
-        let h = self.map(cpu);
-        let (w, bit) = self.ctx_bit(cpu);
-        {
-            let mut ctx = self.ctxs[cpu].lock();
-            ctx.append(l);
-            self.ctx_maps[h][w].fetch_or(bit, Ordering::Relaxed);
+        while let Some(first) = l.pop() {
+            let cpu = usize::from(first.rq_ctx) % self.ctxs.len();
+            let h = self.map(cpu);
+            let (w, bit) = self.ctx_bit(cpu);
+            {
+                let mut ctx = self.ctxs[cpu].lock();
+                ctx.push(first);
+                while l.first_ctx() == Some(cpu) {
+                    if let Some(b) = l.pop() {
+                        ctx.push(b);
+                    }
+                }
+                self.ctx_maps[h][w].fetch_or(bit, Ordering::Relaxed);
+            }
+            self.run(h);
         }
-        self.run(h);
     }
 
     /// The hardware queue this CPU submits to
@@ -249,7 +305,8 @@ impl BlkMq {
             hw.dispatch.append(&mut batch);
             hw.dispatch(&mut failed);
         }
-        end_all(&mut failed);
+        let n = end_all(&mut failed);
+        self.put_rqs(h, n);
     }
 
     /// Reap hardware queue `h` (the driver's IRQ handler, or polling):
@@ -273,7 +330,8 @@ impl BlkMq {
             }
             n > 0 && hw.drained()
         };
-        end_all(&mut done);
+        let n = end_all(&mut done);
+        self.put_rqs(h, n);
         if wake {
             self.drained.wake_all();
         }
@@ -290,14 +348,15 @@ impl BlkMq {
     /// Start nothing more: bios not yet started end with EIO (Linux
     /// blk_queue_start_drain on a dead disk)
     pub fn start_drain(&self) {
-        for hctx in &self.hctxs {
+        for (h, hctx) in self.hctxs.iter().enumerate() {
             let mut failed = BioList::new();
             {
                 let mut hw = hctx.lock();
                 hw.dying = true;
                 hw.dispatch(&mut failed);
             }
-            end_all(&mut failed);
+            let n = end_all(&mut failed);
+            self.put_rqs(h, n);
         }
     }
 
@@ -317,5 +376,51 @@ impl BlkMq {
             .iter()
             .filter_map(|h| h.lock().ops.take())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::blkdev::BioOp;
+
+    /// A driver queue of depth 2 that starts nothing
+    struct Full;
+
+    impl MqOps for Full {
+        fn queue_rq(&mut self, bio: Box<Bio>) -> Queued {
+            Queued::Busy(bio)
+        }
+        fn commit(&mut self) {}
+        fn complete(&mut self, _done: &mut BioList) {}
+        fn depth(&self) -> usize {
+            2
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn core::any::Any + Send> {
+            self
+        }
+    }
+
+    fn bio(nowait: bool) -> Box<Bio> {
+        let mut b = Bio::new(BioOp::Read, 0);
+        if nowait {
+            b.flags = BioFlags::NOWAIT;
+        }
+        b
+    }
+
+    /// A NOWAIT bio finds no request once the depth's worth are taken;
+    /// others still get one; an ended request frees one
+    #[test]
+    fn nowait_requests_bounded_by_depth() {
+        let mq = BlkMq::new(alloc::vec![Box::new(Full) as Box<dyn MqOps>]).unwrap();
+        assert!(mq.get_rq(&mut bio(true)));
+        assert!(mq.get_rq(&mut bio(true)));
+        assert!(!mq.get_rq(&mut bio(true)));
+        assert!(mq.get_rq(&mut bio(false)));
+        mq.put_rqs(0, 1);
+        assert!(!mq.get_rq(&mut bio(true)));
+        mq.put_rqs(0, 1);
+        assert!(mq.get_rq(&mut bio(true)));
     }
 }

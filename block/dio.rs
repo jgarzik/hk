@@ -30,7 +30,9 @@
 //!
 //! RWF_NOWAIT: an I/O needing a second bio, Linux's or one split off
 //! it, is EAGAIN before anything is submitted (Linux: EAGAIN from the
-//! loop, or from bio_split_rw_at on a REQ_NOWAIT bio).
+//! loop, or from bio_split_rw_at on a REQ_NOWAIT bio). Its one bio is
+//! NOWAIT: a queue with no free tag, or a driver that would do the I/O
+//! in the submitter, ends it with EAGAIN (Linux REQ_NOWAIT).
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
@@ -145,7 +147,8 @@ pub fn direct_io<I: DioIter>(
 struct Dio<'a> {
     b: &'a BlockDevice,
     op: BioOp,
-    /// FUA for an O_DSYNC write (Linux dio_bio_write_op)
+    /// FUA for an O_DSYNC write (Linux dio_bio_write_op), NOWAIT for
+    /// RWF_NOWAIT (Linux REQ_NOWAIT)
     bflags: BioFlags,
     nowait: bool,
     /// First sector
@@ -158,10 +161,11 @@ impl<'a> Dio<'a> {
         Self {
             b,
             op: if I::READ { BioOp::Read } else { BioOp::Write },
-            bflags: if !I::READ && dsync {
-                BioFlags::FUA
-            } else {
-                BioFlags::empty()
+            bflags: match (!I::READ && dsync, flags.nowait()) {
+                (true, true) => BioFlags::FUA | BioFlags::NOWAIT,
+                (true, false) => BioFlags::FUA,
+                (false, true) => BioFlags::NOWAIT,
+                (false, false) => BioFlags::empty(),
             },
             nowait: flags.nowait(),
             sector: pos >> SECTOR_SHIFT,
