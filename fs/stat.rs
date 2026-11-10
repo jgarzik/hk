@@ -24,9 +24,9 @@ fn bdev_of(attr: &super::inode::InodeAttr) -> Option<alloc::sync::Arc<crate::blo
 }
 
 /// The preferred I/O size: a block device's io_min (Linux bdev_statx),
-/// else the page size (i_blocksize of every hk file system)
-fn blksize(bdev: Option<&crate::block::BlockDevice>) -> u32 {
-    bdev.map_or(4096, |b| b.io_min())
+/// else what the file system's getattr gave
+fn blksize(attr: &super::inode::InodeAttr, bdev: Option<&crate::block::BlockDevice>) -> u32 {
+    bdev.map_or(attr.blksize, |b| b.io_min())
 }
 
 /// Fill a Stat structure from an inode
@@ -54,7 +54,7 @@ fn fill_stat(inode: &Inode) -> Result<Stat, KernelError> {
         st_gid: attr.gid,
         st_rdev,
         st_size: attr.size as i64,
-        st_blksize: st_blksize(blksize(bdev_of(&attr).as_deref())),
+        st_blksize: st_blksize(blksize(&attr, bdev_of(&attr).as_deref())),
         st_blocks: attr.size.div_ceil(512) as i64,
         st_atime: attr.atime.sec,
         st_atime_nsec: attr.atime.nsec.into(),
@@ -383,7 +383,7 @@ fn fill_statx(
             } else {
                 STATX_MNT_ID
             },
-        stx_blksize: blksize(bdev.as_deref()),
+        stx_blksize: blksize(&attr, bdev.as_deref()),
         stx_nlink: attr.nlink,
         stx_uid: attr.uid,
         stx_gid: attr.gid,

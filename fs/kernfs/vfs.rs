@@ -163,16 +163,8 @@ impl InodeOps for KernfsIops {
             _ => 1,
         };
         InodeAttr {
-            ino: inode.ino,
-            mode: inode.mode(),
-            uid: inode.uid(),
-            gid: inode.gid(),
-            size: inode.get_size(),
             nlink,
-            rdev: inode.rdev,
-            atime: inode.atime(),
-            mtime: inode.mtime(),
-            ctime: inode.ctime(),
+            ..crate::fs::inode::generic_fillattr(inode)
         }
     }
 }

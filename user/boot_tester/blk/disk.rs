@@ -418,6 +418,7 @@ fn vfat(d: &Disk) {
     let busy = sys_ioctl(disk, BLKRRPART, 0);
     sys_close(disk as u64);
     verdict(b"BLK_RRPART_MOUNTED", busy == EBUSY, busy);
+    vfat_blksize();
     vfat_mmap_write();
     vfat_swapfile();
     drop_caches();
@@ -433,6 +434,23 @@ fn vfat(d: &Disk) {
     vfat_mount_alias(p1);
     vfat_sync(p1);
     vfat_corrupt_chain(p1);
+}
+
+/// st_blksize and stx_blksize of vfat files and directories are the
+/// cluster size (Linux fat_getattr), 512 on vda1
+fn vfat_blksize() {
+    use hk_syscall::{AT_FDCWD, Statx, sys_statx};
+    let mut ok = true;
+    let mut got = 0;
+    for path in [&b"/mnt/vd1/HKDISK.TXT\0"[..], b"/mnt/vd1\0"] {
+        let mut st = Stat::default();
+        let r = sys_stat(path.as_ptr(), &mut st);
+        let mut stx = Statx::default();
+        let x = sys_statx(AT_FDCWD, path.as_ptr(), 0, 0x7ff, &mut stx);
+        ok &= r == 0 && x == 0 && st.st_blksize == 512 && stx.stx_blksize == 512;
+        got = if r != 0 { r } else { st.st_blksize as i64 };
+    }
+    verdict(b"VFAT_BLKSIZE", ok, got);
 }
 
 /// What was written through the page cache (write() and a shared

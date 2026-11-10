@@ -1676,6 +1676,17 @@ impl InodeOps for VfatInodeOps {
         true
     }
 
+    /// The preferred I/O size is the cluster size (Linux fat_getattr)
+    fn getattr(&self, inode: &Inode) -> super::inode::InodeAttr {
+        let mut a = super::inode::generic_fillattr(inode);
+        if let Some(sb) = inode.superblock()
+            && let Ok(d) = get_sb_data(&sb)
+        {
+            a.blksize = d.cluster_size;
+        }
+        a
+    }
+
     /// An unlinked file's clusters are freed with its inode (Linux
     /// fat_evict_inode), on the system workqueue: the last reference can
     /// go where no I/O may be done

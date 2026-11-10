@@ -354,22 +354,10 @@ pub trait InodeOps: Send + Sync {
         Ok(())
     }
 
-    /// Get file size (may be dynamically computed for procfs)
-    ///
-    /// Timestamps are read lock-free (Linux generic_fillattr).
+    /// The attributes stat reports (Linux ->getattr); default
+    /// `generic_fillattr`
     fn getattr(&self, inode: &Inode) -> InodeAttr {
-        InodeAttr {
-            ino: inode.ino,
-            mode: inode.mode(),
-            uid: inode.uid(),
-            gid: inode.gid(),
-            size: inode.get_size(),
-            nlink: inode.get_nlink(),
-            rdev: inode.rdev,
-            atime: inode.atime(),
-            mtime: inode.mtime(),
-            ctime: inode.ctime(),
-        }
+        generic_fillattr(inode)
     }
 
     // =========================================================================
@@ -451,6 +439,27 @@ pub struct InodeAttr {
     pub mtime: Timespec,
     /// Last status change time
     pub ctime: Timespec,
+    /// Preferred I/O size (Linux kstat.blksize)
+    pub blksize: u32,
+}
+
+/// The attributes as the inode holds them (Linux generic_fillattr);
+/// timestamps read lock-free. The block size is the page size, every hk
+/// file system's i_blocksize.
+pub fn generic_fillattr(inode: &Inode) -> InodeAttr {
+    InodeAttr {
+        ino: inode.ino,
+        mode: inode.mode(),
+        uid: inode.uid(),
+        gid: inode.gid(),
+        size: inode.get_size(),
+        nlink: inode.get_nlink(),
+        rdev: inode.rdev,
+        atime: inode.atime(),
+        mtime: inode.mtime(),
+        ctime: inode.ctime(),
+        blksize: crate::mm::PAGE_SIZE as u32,
+    }
 }
 
 /// Filesystem-specific data attached to an inode

@@ -796,13 +796,6 @@ mode, a short power-button press does nothing). Only the 32-bit FADT
 block fields are read (no X_ GAS forms, no hardware-reduced ACPI), and
 a reset register in PCI configuration space is ignored.
 
-## vfat st_blksize
-
-**Location**: `fs/stat.rs` (`blksize`)
-
-st_blksize and stx_blksize of a vfat file are the page size; Linux
-fat_getattr reports the cluster size (`fs/stat.rs` `blksize`).
-
 ## Block layer gaps
 
 **Location**: `block/`, `hw/virtio/blk.rs`,
