@@ -53,7 +53,7 @@
 2.1 FD lifecycle
 
 - [x] open (x86-64 only, legacy; use openat)
-- [x] openat (O_TMPFILE on tmpfs and ramfs: unnamed, linkable unless O_EXCL; O_PATH: path-only descriptors; O_EMPTYPATH: an empty path reopens dirfd's file; O_DIRECT only on tmpfs and vfat regular files and block devices, else EINVAL after ->open; still buffered underneath)
+- [x] openat (O_TMPFILE on tmpfs and ramfs: unnamed, linkable unless O_EXCL; O_PATH: path-only descriptors; O_EMPTYPATH: an empty path reopens dirfd's file; O_DIRECT only on tmpfs and vfat regular files and block devices, else EINVAL after ->open; zero-copy on block devices, still buffered on vfat and tmpfs)
 - [x] openat2 (open_how size rules, OPENAT2_REGULAR, O_EMPTYPATH, every RESOLVE_* flag)
 - [x] close
 - [x] close_range (CLOSE_RANGE_UNSHARE, CLOSE_RANGE_CLOEXEC)
@@ -72,9 +72,9 @@
 - [x] readv
 - [x] writev
 - [x] preadv
-- [x] preadv2
+- [x] preadv2 (RWF_NOWAIT on block devices: direct I/O and cached data, EAGAIN where it would wait)
 - [x] pwritev
-- [x] pwritev2 (RWF_DSYNC, RWF_SYNC: synchronous where O_DSYNC would be: regular files, block devices)
+- [x] pwritev2 (RWF_DSYNC, RWF_SYNC: synchronous where O_DSYNC would be: regular files, block devices; RWF_NOWAIT for direct writes to block devices)
 - [x] lseek
 - [x] truncate
 - [x] ftruncate

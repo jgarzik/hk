@@ -254,22 +254,32 @@ lo (hk has no checksum offload states).
 - A NULL pathname is EINVAL; Linux fanotify_find_path marks dfd's own
   file (a descriptor, not a path-only one).
 
-## O_DIRECT I/O is buffered
+## O_DIRECT gaps
 
-**Location**: `fs/blkdev_ops.rs`, `fs/vfat.rs`, `fs/ramfs/mod.rs`
+**Location**: `fs/blkdev_ops.rs`, `block/dio.rs`, `block/blkdev.rs`,
+`fs/vfat.rs`
 
-Files that take O_DIRECT (`FileOps::can_odirect`) still read and write
-through the page cache: no alignment checks (EINVAL), no cache bypass
-(Linux blkdev_direct_IO, fat_direct_IO; tmpfs is buffered in Linux
-too). Block devices pin the caller's pages (`blkdev_ops::dio_read`,
-`dio_write`) but copy between them and the cache; kernel buffers are
-not pinned (`IovDest::extract_pages`: EOPNOTSUPP) and take the cached
-path.
-Unpinning dirties a page-cache page under its page lock, so a
-`PinnedPages` (`mm/gup.rs`) holding one is dropped in thread context;
-nothing yet lets an I/O completing in an interrupt handler hand it to
-a thread (Linux bio_dirty_work): `Workqueue::queue_work` takes a spin
-Mutex and allocates.
+- vfat O_DIRECT still reads and writes through the page cache: no
+  alignment checks (EINVAL), no cache bypass (Linux fat_direct_IO).
+- Block-device O_DIRECT from kernel memory (a kernel `IovDest` or
+  `IovSource`) is not pinned (`get_pages`: EOPNOTSUPP) and takes the
+  cached path; Linux sends bios from it (ITER_KVEC, ITER_BVEC) with the
+  same alignment rules.
+- A post-direct-write invalidation failure only prints (Linux
+  dio_warn_stale_pagecache also sets the mapping's writeback error,
+  which the next fsync reports): no errseq on `AddressSpace`.
+- No REQ_NOWAIT on bios: an RWF_NOWAIT direct I/O to a bio-based
+  driver (USB sd: synchronous) may block in it, where Linux refuses
+  such a queue (EOPNOTSUPP without BLK_FEAT_NOWAIT).
+- A FUA write's post-flush is not merged with others in flight (Linux
+  blk-flush coalesces them): an O_DSYNC direct write split into many
+  bios flushes once per bio.
+- Unpinning dirties a page-cache page under its page lock, so a
+  `PinnedPages` (`mm/gup.rs`) holding one is dropped in thread context
+  (the synchronous paths do); nothing yet lets an I/O completing in an
+  interrupt handler hand it to a thread (Linux bio_dirty_work), as
+  asynchronous direct I/O will need: `Workqueue::queue_work` takes a
+  spin Mutex and allocates.
 
 ## File lock gaps
 

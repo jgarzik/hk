@@ -676,6 +676,118 @@ pub fn write_range(inode: &Inode, first: u64, last: u64) -> Result<(), KernelErr
     err
 }
 
+/// Write back the dirty pages holding bytes [start, end] of `inode` and
+/// wait (Linux filemap_write_and_wait_range): nothing to do in an empty
+/// mapping
+pub fn write_and_wait_range(inode: &Inode, start: u64, end: u64) -> Result<(), KernelError> {
+    if end < start || inode.i_data.nrpages() == 0 {
+        return Ok(());
+    }
+    let p = PAGE_SIZE as u64;
+    write_range(inode, start / p, end / p)
+}
+
+/// A page is cached for bytes [start, end] (Linux
+/// filemap_range_has_page)
+pub fn range_has_page(m: &AddressSpace, start: u64, end: u64) -> bool {
+    let p = PAGE_SIZE as u64;
+    end >= start && m.i_pages.lock().find(start / p, end / p, None).is_some()
+}
+
+/// A page for bytes [start, end] is dirty, locked or under writeback:
+/// direct I/O there would first wait for it (Linux
+/// filemap_range_needs_writeback). The flags are read without a
+/// reference (a racing change is a stale answer, as Linux under RCU).
+pub fn range_needs_writeback(m: &AddressSpace, start: u64, end: u64) -> bool {
+    if end < start || m.nrpages() == 0 {
+        return false;
+    }
+    let (first, last) = (start / PAGE_SIZE as u64, end / PAGE_SIZE as u64);
+    {
+        let pages = m.i_pages.lock();
+        if !pages.marked(MARK_DIRTY) && !pages.marked(MARK_WRITEBACK) {
+            return false;
+        }
+    }
+    let mut at = first;
+    loop {
+        let next = {
+            let pages = m.i_pages.lock();
+            pages
+                .find(at, last, None)
+                .map(|(i, phys)| (i, phys, pages.get_mark(i, MARK_WRITEBACK)))
+        };
+        let Some((index, phys, wb)) = next else {
+            return false;
+        };
+        if wb || page(phys).flags.load(Ordering::Acquire) & (PG_DIRTY | PG_LOCKED) != 0 {
+            return true;
+        }
+        match index.checked_add(1) {
+            Some(n) => at = n,
+            None => return false,
+        }
+    }
+}
+
+/// Drop the pages of `inode` with index in [first, last], unmapping them
+/// from every mapping first (Linux invalidate_inode_pages2_range): EBUSY
+/// if one could not go, the others still do. Sleeps (page locks).
+pub fn invalidate_pages2(inode: &Inode, first: u64, last: u64) -> Result<(), KernelError> {
+    let m = &inode.i_data;
+    if m.nrpages() == 0 {
+        return Ok(());
+    }
+    let (mut ret, mut unmapped, mut at) = (Ok(()), false, first);
+    while at <= last {
+        let next = {
+            let pages = m.i_pages.lock();
+            pages
+                .find(at, last, None)
+                .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
+        };
+        let Some((index, phys)) = next else {
+            break;
+        };
+        // A mapped file: the rest of the range is unmapped at once first
+        // (Linux: at the first mapped folio)
+        if !unmapped && !m.i_mmap.is_empty() {
+            unmap_pages(m, index, last);
+            unmapped = true;
+        }
+        lock_page(phys);
+        if page(phys).mapping.load(Ordering::Acquire) == m.key()
+            && let Err(e) = unmap_invalidate(m, phys, index)
+        {
+            ret = Err(e);
+        }
+        unlock_page(phys);
+        put_page(phys);
+        match index.checked_add(1) {
+            Some(n) => at = n,
+            None => break,
+        }
+    }
+    ret
+}
+
+/// Drop the locked page `phys`, index `index` of `m`, unmapped first
+/// (Linux folio_unmap_invalidate): EBUSY if it is dirty (no
+/// ->launder_folio; a device page's dirty sectors are Linux's dirty
+/// buffers, which try_to_free_buffers keeps). Unmapped again under the
+/// page lock: a fault maps a file page under it, so none can have
+/// mapped it since.
+fn unmap_invalidate(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
+    if !m.i_mmap.is_empty() {
+        unmap_pages(m, index, index);
+    }
+    if page(phys).flags.load(Ordering::Acquire) & PG_DIRTY != 0 {
+        return Err(KernelError::Busy);
+    }
+    remove(m, phys);
+    Ok(())
+}
+
 /// Wait for the pages with index in [first, last] that another thread
 /// is writing back (Linux filemap_fdatawait_range): it holds each one's
 /// page lock across the write
@@ -851,6 +963,24 @@ pub fn read(inode: &Inode, buf: &mut [u8], pos: u64) -> Result<usize, KernelErro
 /// while it is copied out
 pub fn read_iter(inode: &Inode, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
     read_with(inode, to, pos, &|i| read_page(inode, i).map(Some))
+}
+
+/// `read_iter` that waits for no I/O (Linux filemap_read with
+/// IOCB_NOWAIT): only cached, uptodate pages are copied; EAGAIN at the
+/// first other one if nothing was read
+pub fn read_iter_nowait(
+    inode: &Inode,
+    to: &mut IovDest<'_>,
+    pos: u64,
+) -> Result<usize, KernelError> {
+    read_with(inode, to, pos, &|i| match find_get(&inode.i_data, i) {
+        Some(p) if uptodate(p) => Ok(Some(p)),
+        Some(p) => {
+            put_page(p);
+            Err(KernelError::WouldBlock)
+        }
+        None => Err(KernelError::WouldBlock),
+    })
 }
 
 /// `read_iter` of a file whose cache is its only copy (Linux

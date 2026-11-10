@@ -198,7 +198,10 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
 - **Pins (Linux FOLL_PIN, `mm/gup.rs`).** Direct I/O pins the caller's
   pages for the device: 1024 references per pin on the 4KB page (a 2MB
   mapping is split first), dropped when the I/O is done, the page
-  dirtied first after a read. A page with that many references is
+  dirtied first after a read. Block-device direct I/O (`block/dio.rs`)
+  sends bios straight to and from them, a bio's worth (256 pages)
+  pinned at a time; the submitter dirties and unpins them after its
+  wait, in thread context. A page with that many references is
   "maybe pinned": fork gives the child a copy of such a page the parent
   owns alone (the parent keeps the page, writable), reclaim never swaps
   one out, and munmap or exit leave it allocated until its last unpin.

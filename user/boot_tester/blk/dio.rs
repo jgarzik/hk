@@ -18,15 +18,19 @@ use crate::harness::{R, check, report_r};
 use crate::helpers::{BlkDev, find_blkdev};
 use hk_syscall::{
     IoVec, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, O_RDONLY, O_RDWR, PROT_READ, PROT_WRITE,
-    sys_close, sys_mmap, sys_munmap, sys_open, sys_pread64, sys_preadv2, sys_pwrite64,
-    sys_pwritev2,
+    sys_close, sys_mmap, sys_munmap, sys_open, sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64,
+    sys_pwritev, sys_pwritev2,
 };
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
 const O_DSYNC: u32 = 0o10000;
+const EAGAIN: i64 = -11;
 const EFAULT: i64 = -14;
+const EINVAL: i64 = -22;
 const ENOSPC: i64 = -28;
+const EOPNOTSUPP: i64 = -95;
 const RWF_DSYNC: i32 = 2;
+const RWF_NOWAIT: i32 = 8;
 
 const PAGE: u64 = 4096;
 const MIB: u64 = 1 << 20;
@@ -44,11 +48,14 @@ pub fn run_tests() {
     let d = open(&p3, O_RDWR | O_DIRECT);
     let b = open(&p3, O_RDWR);
     let f = Fds { d, b };
-    let cases: [(&[u8], fn(&Fds) -> R); 6] = [
+    let cases: [(&[u8], fn(&Fds) -> R); 9] = [
         (b"BLK_DIO_RW", rw),
+        (b"BLK_DIO_ALIGN", align),
         (b"BLK_DIO_EOF", eof),
         (b"BLK_DIO_COHERENT", coherent),
+        (b"BLK_DIO_READV", readv),
         (b"BLK_DIO_FAULT", fault),
+        (b"BLK_DIO_NOWAIT", nowait),
         (b"BLK_DIO_LARGE", large),
         (b"BLK_DIO_RESTORED", restored),
     ];
@@ -197,6 +204,44 @@ fn rw(f: &Fds) -> R {
     is_pat(b"restored", c.bytes(0, N), WR)
 }
 
+/// Position and length in logical blocks, segment memory 512-aligned:
+/// EINVAL otherwise, with nothing written; a 512-aligned buffer that is
+/// not page-aligned is fine
+fn align(f: &Fds) -> R {
+    let a = Buf::new(3 * PAGE)?;
+    let p = |o: u64| a.ptr(o);
+    let r = pread(f.d, p(0), PAGE, RD + 1);
+    check(b"read pos", r == EINVAL, r)?;
+    let r = pread(f.d, p(0), PAGE + 1, RD);
+    check(b"read len", r == EINVAL, r)?;
+    let r = pread(f.d, p(0), 100, RD);
+    check(b"read short len", r == EINVAL, r)?;
+    let r = pread(f.d, p(1), PAGE, RD);
+    check(b"read buf", r == EINVAL, r)?;
+    let r = pread(f.d, p(256), 512, RD);
+    check(b"read buf 256", r == EINVAL, r)?;
+    let r = pread(f.d, p(512), PAGE, RD);
+    check(b"read buf 512", r == PAGE as i64, r)?;
+    is_pat(b"read buf 512 data", a.bytes(512, PAGE), RD)?;
+    fill_data(a.bytes(0, 3 * PAGE), 0x33);
+    let r = pwrite(f.d, p(0), PAGE, WR + 1);
+    check(b"write pos", r == EINVAL, r)?;
+    let r = pwrite(f.d, p(0), 100, WR);
+    check(b"write len", r == EINVAL, r)?;
+    let r = pwrite(f.d, p(1), PAGE, WR);
+    check(b"write buf", r == EINVAL, r)?;
+    let c = Buf::new(2 * PAGE)?;
+    let n = pread(f.d, c.ptr(0), 2 * PAGE, WR);
+    check(b"read after", n == 2 * PAGE as i64, n)?;
+    is_pat(b"nothing written", c.bytes(0, 2 * PAGE), WR)?;
+    fill_pat(a.bytes(512, PAGE), WR);
+    let r = pwrite(f.d, p(512), PAGE, WR);
+    check(b"write buf 512", r == PAGE as i64, r)?;
+    let n = pread(f.d, c.ptr(0), PAGE, WR);
+    check(b"read back", n == PAGE as i64, n)?;
+    is_pat(b"back", c.bytes(0, PAGE), WR)
+}
+
 /// The end of the device: a read there or past it is 0, one across it
 /// stops there (its own length truncated before the alignment check), a
 /// write there ENOSPC, one across it short; no bytes is 0 whatever the
@@ -278,6 +323,71 @@ fn coherent(f: &Fds) -> R {
     restore(f, WR, 3 * 65536)
 }
 
+/// Mixed segment sizes and offsets (each 512-aligned, some across a page
+/// boundary) for readv and writev; a segment whose length or address is
+/// not 512-aligned is EINVAL even when the total is
+fn readv(f: &Fds) -> R {
+    const SEGS: [(u64, u64); 5] = [
+        (512, 512),
+        (2048, 1024),
+        (8192, 4096),
+        (13824, 1536),
+        (19456, 3072),
+    ];
+    const TOTAL: u64 = 10240;
+    let a = Buf::new(8 * PAGE)?;
+    let iov = SEGS.map(|(o, n)| IoVec {
+        iov_base: a.ptr(o),
+        iov_len: n as usize,
+    });
+    let n = sys_preadv(f.d, iov.as_ptr(), 5, (RD + PAGE) as i64);
+    check(b"preadv", n == TOTAL as i64, n)?;
+    let mut at = RD + PAGE;
+    for (o, len) in SEGS {
+        is_pat(b"preadv data", a.bytes(o, len), at)?;
+        at += len;
+    }
+    let bad = [
+        IoVec {
+            iov_base: a.ptr(0),
+            iov_len: 600,
+        },
+        IoVec {
+            iov_base: a.ptr(PAGE),
+            iov_len: 424,
+        },
+    ];
+    let n = sys_preadv(f.d, bad.as_ptr(), 2, RD as i64);
+    check(b"segment len", n == EINVAL, n)?;
+    let bad = [
+        IoVec {
+            iov_base: a.ptr(0),
+            iov_len: 512,
+        },
+        IoVec {
+            iov_base: a.ptr(PAGE + 256),
+            iov_len: 512,
+        },
+    ];
+    let n = sys_preadv(f.d, bad.as_ptr(), 2, RD as i64);
+    check(b"segment address", n == EINVAL, n)?;
+    // writev of the same layout, read back in one piece
+    for (i, (o, len)) in SEGS.into_iter().enumerate() {
+        fill_data(a.bytes(o, len), i as u8 * 17 + 1);
+    }
+    let w = sys_pwritev(f.d, iov.as_ptr(), 5, WR as i64);
+    check(b"pwritev", w == TOTAL as i64, w)?;
+    let c = Buf::new(3 * PAGE)?;
+    let n = pread(f.d, c.ptr(0), TOTAL, WR);
+    check(b"read back", n == TOTAL as i64, n)?;
+    let mut at = 0;
+    for (o, len) in SEGS {
+        same(b"pwritev data", c.bytes(at, len), a.bytes(o, len))?;
+        at += len;
+    }
+    restore(f, WR, 3 * PAGE)
+}
+
 /// A buffer whose second page is not mapped: the direct I/O does the
 /// first page, the rest falls back to the cache and faults, so the count
 /// is the first page's; a buffer whose first page is not mapped is EFAULT
@@ -302,6 +412,54 @@ fn fault(f: &Fds) -> R {
     check(b"read unmapped", r == EFAULT, r)?;
     let r = pwrite(f.d, e.ptr(0), 2 * PAGE, WR);
     check(b"write unmapped", r == EFAULT, r)
+}
+
+/// RWF_NOWAIT: a direct read with nothing to write back and a direct
+/// write with nothing cached go ahead; a dirty page in a read's range,
+/// any cached page in a write's, or an I/O needing more than one bio is
+/// EAGAIN. Buffered: a write is EOPNOTSUPP, a read of cached data goes
+/// ahead and of uncached data is EAGAIN.
+fn nowait(f: &Fds) -> R {
+    let a = Buf::new(PAGE)?;
+    let r = rw2(f.d, a.ptr(0), PAGE, RD + MIB, RWF_NOWAIT, false);
+    check(b"clean read", r == PAGE as i64, r)?;
+    is_pat(b"clean read data", a.bytes(0, PAGE), RD + MIB)?;
+    // Dirty in the cache: the read would write it back first
+    let off = WR + 4 * 65536;
+    fill_data(a.bytes(0, PAGE), 0x42);
+    let w = pwrite(f.b, a.ptr(0), PAGE, off);
+    check(b"dirty it", w == PAGE as i64, w)?;
+    let c = Buf::new(PAGE)?;
+    let r = rw2(f.d, c.ptr(0), PAGE, off, RWF_NOWAIT, false);
+    check(b"dirty read", r == EAGAIN, r)?;
+    let r = rw2(f.d, c.ptr(0), PAGE, off, 0, false);
+    check(b"read", r == PAGE as i64, r)?;
+    same(b"read data", c.bytes(0, PAGE), a.bytes(0, PAGE))?;
+    // Cached (clean): the write would drop it first
+    let off2 = WR + 5 * 65536;
+    let n = pread(f.b, c.ptr(0), PAGE, off2);
+    check(b"cache it", n == PAGE as i64, n)?;
+    let r = rw2(f.d, a.ptr(0), PAGE, off2, RWF_NOWAIT, true);
+    check(b"cached write", r == EAGAIN, r)?;
+    restore(f, off, 2 * 65536)?;
+    // Nothing cached any more: a direct write goes ahead
+    fill_pat(a.bytes(0, PAGE), off2);
+    let r = rw2(f.d, a.ptr(0), PAGE, off2, RWF_NOWAIT, true);
+    check(b"uncached write", r == PAGE as i64, r)?;
+    // More than one bio's worth
+    let big = Buf::new(4 * MIB)?;
+    let r = rw2(f.d, big.ptr(0), 4 * MIB, 0, RWF_NOWAIT, false);
+    check(b"large read", r == EAGAIN, r)?;
+    // Buffered
+    let r = rw2(f.b, a.ptr(0), PAGE, off2, RWF_NOWAIT, true);
+    check(b"buffered write", r == EOPNOTSUPP, r)?;
+    let n = pread(f.b, c.ptr(0), PAGE, 3 * MIB);
+    check(b"cache read", n == PAGE as i64, n)?;
+    let r = rw2(f.b, c.ptr(0), PAGE, 3 * MIB, RWF_NOWAIT, false);
+    check(b"buffered cached read", r == PAGE as i64, r)?;
+    is_pat(b"buffered cached data", c.bytes(0, PAGE), 3 * MIB)?;
+    let r = rw2(f.b, c.ptr(0), PAGE, 6 * MIB + MIB / 2, RWF_NOWAIT, false);
+    check(b"buffered uncached read", r == EAGAIN, r)
 }
 
 /// Direct I/O over many bios: 1 MiB and 3 MiB reads, a 1.5 MiB write

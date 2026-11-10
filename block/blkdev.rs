@@ -178,6 +178,13 @@ impl Bio {
         })
     }
 
+    /// `new` with room for `n` segments (ENOMEM past the inline ones)
+    pub fn with_segs(op: BioOp, sector: u64, n: usize) -> Result<Box<Self>, KernelError> {
+        let mut b = Self::new(op, sector);
+        b.segs = BioSegs::try_with_capacity(n)?;
+        Ok(b)
+    }
+
     pub fn add_seg(&mut self, frame: u64, offset: usize, len: usize) {
         self.segs.push(BioSeg { frame, offset, len });
     }

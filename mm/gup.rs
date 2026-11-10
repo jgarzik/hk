@@ -78,7 +78,7 @@ const INLINE_PAGES: usize = 4;
 
 impl PinnedPages {
     /// Room for `max` pages: no allocation up to `INLINE_PAGES`
-    fn new(max: usize) -> Result<Self, KernelError> {
+    pub fn new(max: usize) -> Result<Self, KernelError> {
         Ok(Self {
             segs: SmallVec::try_with_capacity(max)?,
             owners: SmallVec::try_with_capacity(max)?,
@@ -100,89 +100,35 @@ impl PinnedPages {
         self.segs.is_empty()
     }
 
+    /// Pages pinned (one per piece)
+    pub fn nr_pages(&self) -> usize {
+        self.segs.len()
+    }
+
+    /// Give back the last `n` bytes, unpinning the pages left with none
+    /// (Linux bio_iov_iter_align_down)
+    pub fn trim(&mut self, mut n: usize) {
+        while n > 0 {
+            let Some(last) = self.segs.last_mut() else {
+                return;
+            };
+            if last.len as usize > n {
+                // Less than a page: lossless
+                last.len -= n as u32;
+                return;
+            }
+            n -= last.len as usize;
+            if let Some(s) = self.segs.pop() {
+                self.owners.pop();
+                unpin_page(s.phys);
+            }
+        }
+    }
+
     /// The pages were written (a read from the device): dirty them when
     /// unpinned
     pub fn set_dirty(&mut self) {
         self.dirty = true;
-    }
-
-    /// Segment `i` from byte `at` on, at most `want` bytes: the direct
-    /// map address and the length (0 past the segment)
-    fn span(&self, i: usize, at: usize, want: usize) -> (*mut u8, usize) {
-        let Some(s) = self.segs.get(i) else {
-            return (core::ptr::null_mut(), 0);
-        };
-        let n = want.min((s.len as usize).saturating_sub(at));
-        let va =
-            crate::arch::phys_to_virt(s.phys + u64::from(s.off) + at.min(s.len as usize) as u64);
-        (va, n)
-    }
-
-    /// Copy `data` into segment `i` from byte `at` of it (the kernel
-    /// writing what a device would); the bytes copied. `data` may be the
-    /// very bytes of the pinned page (a page-cache page the buffer maps):
-    /// then they already hold it; a slice overlapping them otherwise is
-    /// refused (0), as writing under it would break its borrow (page
-    /// copies between frames go through `copy_from_frame`).
-    pub fn write(&self, i: usize, at: usize, data: &[u8]) -> usize {
-        let (dst, n) = self.span(i, at, data.len());
-        match overlap(dst, data.as_ptr(), n) {
-            Overlap::Same => n,
-            Overlap::Partial => 0,
-            // SAFETY: the page is pinned while `self` lives and the n
-            // bytes at `dst` lie in it (`span`); `data` is other memory.
-            // A raw copy creates no reference to memory the process may
-            // access meanwhile (as a device's DMA).
-            Overlap::None => unsafe {
-                core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
-                n
-            },
-        }
-    }
-
-    /// Copy from segment `i`, byte `at` on, into `buf`; the bytes copied
-    /// (as `write`, the other way)
-    pub fn read(&self, i: usize, at: usize, buf: &mut [u8]) -> usize {
-        let (src, n) = self.span(i, at, buf.len());
-        match overlap(src, buf.as_ptr(), n) {
-            Overlap::Same => n,
-            Overlap::Partial => 0,
-            // SAFETY: as `write`: the n bytes at `src` lie in the pinned
-            // page, `buf` is other memory
-            Overlap::None => unsafe {
-                core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
-                n
-            },
-        }
-    }
-
-    /// Copy `n` bytes of the frame memory at physical `src` into segment
-    /// `i` from byte `at` of it (as `write`); the bytes copied. The two
-    /// may be the same page, overlapping (a buffer mapping the very file
-    /// range a read fills): a raw move, no reference to either.
-    ///
-    /// # Safety
-    /// [src, src + n) lies in a RAM frame the caller keeps referenced, and
-    /// the caller holds no reference to its bytes during the call.
-    pub unsafe fn copy_from_frame(&self, i: usize, at: usize, src: u64, n: usize) -> usize {
-        let (dst, n) = self.span(i, at, n);
-        // SAFETY: both ranges are frames kept alive (the pin, the
-        // caller's reference) and borrowed by no reference; `copy`
-        // allows them to overlap
-        unsafe { core::ptr::copy(crate::arch::phys_to_virt(src), dst, n) };
-        n
-    }
-
-    /// Copy segment `i`, byte `at` on, into `n` bytes of the frame memory
-    /// at physical `dst` (`copy_from_frame` the other way)
-    ///
-    /// # Safety
-    /// As [`PinnedPages::copy_from_frame`], for `dst`.
-    pub unsafe fn copy_to_frame(&self, i: usize, at: usize, dst: u64, n: usize) -> usize {
-        let (src, n) = self.span(i, at, n);
-        // SAFETY: as `copy_from_frame`
-        unsafe { core::ptr::copy(src, crate::arch::phys_to_virt(dst), n) };
-        n
     }
 
     /// Mark the page at `phys` dirty: anonymous memory by its flag, a
@@ -213,27 +159,6 @@ impl Drop for PinnedPages {
             }
             unpin_page(s.phys);
         }
-    }
-}
-
-/// How a slice lies against `n` bytes of a pinned page at `page`
-enum Overlap {
-    /// Elsewhere
-    None,
-    /// Exactly those bytes
-    Same,
-    /// Some of them
-    Partial,
-}
-
-fn overlap(page: *const u8, other: *const u8, n: usize) -> Overlap {
-    let (a, b) = (page.addr(), other.addr());
-    if n == 0 || a.saturating_add(n) <= b || b.saturating_add(n) <= a {
-        Overlap::None
-    } else if a == b {
-        Overlap::Same
-    } else {
-        Overlap::Partial
     }
 }
 
@@ -433,39 +358,20 @@ fn pin_user_range(
     }
 }
 
-/// A visitor of user runs: called with (address, length, offset into
-/// the caller's buffer), returns the bytes it took (`iov_iter::Segs`)
-pub type RunFn<'a> = dyn FnMut(u64, usize, usize) -> usize + 'a;
-
-/// Pin the user pages of up to `max` pages' worth of `segs` (user
-/// address, length) runs, in order, for `write` (Linux
-/// iov_iter_extract_pages over an ITER_IOVEC): the pinned pages and the
-/// bytes they cover, short at the first page that cannot be pinned;
-/// that page's error if it is the first
-pub fn pin_user_segs(
-    segs: &mut dyn FnMut(&mut RunFn<'_>) -> usize,
+/// Pin the current task's pages of the `len` bytes at `addr`, at most
+/// `max` pages in all in `out`, for `write` (Linux pin_user_pages_fast,
+/// FOLL_PIN, with FOLL_WRITE for a read from a device): the bytes
+/// pinned, short at the first page that cannot be pinned; that page's
+/// error if none was
+pub fn pin_user(
+    out: &mut PinnedPages,
+    addr: u64,
+    len: usize,
     write: bool,
     max: usize,
-) -> Result<PinnedPages, KernelError> {
+) -> Result<usize, KernelError> {
     let mm = crate::task::percpu::current()
         .mm()
         .ok_or(KernelError::BadAddress)?;
-    let mut out = PinnedPages::new(max)?;
-    let mut err = None;
-    segs(&mut |addr, len, _| {
-        if err.is_some() || out.segs.len() >= max {
-            return 0;
-        }
-        match pin_user_range(&mut out, &mm, addr, len, write, max) {
-            Ok(n) => n,
-            Err(e) => {
-                err = Some(e);
-                0
-            }
-        }
-    });
-    match err {
-        Some(e) if out.is_empty() => Err(e),
-        _ => Ok(out),
-    }
+    pin_user_range(out, &mm, addr, len, write, max)
 }

@@ -5,6 +5,10 @@
 //! Linux bd_mapping), shared with filesystems' metadata on the device
 //! (vfat), written back by fsync, sync, BLKFLSBUF and the last close,
 //! which also drops it (Linux blkdev_flush_mapping). mmap maps it.
+//! O_DIRECT I/O from user memory bypasses it (`block::dio`): the range
+//! is written back first, and for a write dropped before and after;
+//! what the bios could not take goes through the cache. No i_rwsem, as
+//! Linux (block devices are not regular files).
 //! The open file holds its block device (`File.private`), counted as an
 //! opener (BLKRRPART, BLKBSZGET's initial value).
 
@@ -24,6 +28,7 @@ use core::sync::atomic::Ordering;
 
 use super::file::{File, FileOps, RwFlags, generic_write_sync, seek};
 use super::iov_iter::{IovDest, IovSource};
+use crate::block::dio;
 use crate::util::kalloc::arc_nofail;
 
 /// Block device ioctls (Linux include/uapi/linux/fs.h)
@@ -50,104 +55,190 @@ fn bdev(file: &File) -> Result<Arc<BlockDevice>, KernelError> {
         .ok_or(KernelError::NoDeviceOrAddress)
 }
 
-/// Read at `pos`: short at the end, 0 past it (Linux blkdev_read_iter)
-fn read_at(file: &File, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
+/// Read at `pos` through the cache: short at the end, 0 past it (Linux
+/// blkdev_read_iter); with RWF_NOWAIT only what is cached already
+fn read_at(
+    file: &File,
+    to: &mut IovDest<'_>,
+    pos: u64,
+    nowait: bool,
+) -> Result<usize, KernelError> {
     let b = bdev(file)?;
     let size = b.capacity();
     if pos >= size || to.is_empty() {
         return Ok(0);
     }
     to.truncate((size - pos).min(usize::MAX as u64) as usize);
-    filemap::read_iter(&b.bd_inode, to, pos)
+    cache_read(&b, to, pos, nowait)
 }
 
-/// Pages pinned per step of O_DIRECT I/O (1 MiB)
-const DIO_PAGES: usize = 256;
+/// Linux filemap_read, with IOCB_NOWAIT for `nowait`
+fn cache_read(
+    b: &BlockDevice,
+    to: &mut IovDest<'_>,
+    pos: u64,
+    nowait: bool,
+) -> Result<usize, KernelError> {
+    if nowait {
+        filemap::read_iter_nowait(&b.bd_inode, to, pos)
+    } else {
+        filemap::read_iter(&b.bd_inode, to, pos)
+    }
+}
 
-/// O_DIRECT read at `pos`: the caller's pages are pinned a batch at a
-/// time (Linux bio_iov_iter_get_pages) and filled from the device's page
-/// cache, until the zero-copy path sends the bios straight into them;
-/// kernel memory, which is not pinned, is read as without O_DIRECT. The
-/// bytes read, short at the end of the device or at the first page that
-/// cannot be pinned (that page's error if it is the first).
-fn dio_read(file: &File, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
-    // At or past the end nothing is pinned, and nothing past it either
-    // (Linux blkdev_read_iter: iov_iter_truncate)
-    let size = bdev(file)?.capacity();
+/// O_DIRECT read at `pos` (Linux blkdev_read_iter with IOCB_DIRECT): the
+/// cache over the range written back first, then bios into the caller's
+/// pinned pages (`dio::direct_io`); what they could not take (a buffer
+/// that could not be pinned to its end) is read through the cache.
+/// RWF_NOWAIT: EAGAIN where that would wait.
+fn dio_read(
+    file: &File,
+    to: &mut IovDest<'_>,
+    pos: u64,
+    flags: RwFlags,
+) -> Result<usize, KernelError> {
+    let b = bdev(file)?;
+    let size = b.capacity();
     if pos >= size {
         return Ok(0);
     }
     to.truncate((size - pos).min(usize::MAX as u64) as usize);
-    let mut done = 0usize;
-    while !to.is_empty() {
-        let mut pp = match to.extract_pages(DIO_PAGES) {
-            Ok(pp) => pp,
-            Err(KernelError::OperationNotSupported) if done == 0 => return read_at(file, to, pos),
-            Err(e) if done == 0 => return Err(e),
-            Err(_) => break,
-        };
-        let want = pp.len();
-        let n = match read_at(file, &mut IovDest::pinned(&pp), pos + done as u64) {
-            Ok(n) => n,
-            Err(e) if done == 0 => return Err(e),
-            Err(_) => break,
-        };
-        if n > 0 {
-            pp.set_dirty();
-        }
-        done += n;
-        if n < want {
-            break;
-        }
-    }
-    Ok(done)
-}
-
-/// O_DIRECT write at `pos`, from the caller's pinned pages through the
-/// device's page cache (as `dio_read`)
-fn dio_write(file: &File, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
-    // The device's errors come before the buffer's (Linux
-    // blkdev_write_iter checks before blkdev_direct_IO)
-    if !write_ok(file, from.len(), pos)? {
+    let count = to.len();
+    if count == 0 {
         return Ok(0);
     }
-    // Nothing past the end is pinned (Linux blkdev_write_iter:
-    // iov_iter_truncate)
-    let size = bdev(file)?.capacity();
-    from.truncate((size - pos).min(usize::MAX as u64) as usize);
-    let mut done = 0usize;
-    while !from.is_empty() {
-        let pp = match from.extract_pages(DIO_PAGES) {
-            Ok(pp) => pp,
-            Err(KernelError::OperationNotSupported) if done == 0 => {
-                return write_at(file, from, pos);
-            }
-            Err(e) if done == 0 => return Err(e),
-            Err(_) => break,
-        };
-        let want = pp.len();
-        let n = match write_at(file, &mut IovSource::pinned(&pp), pos + done as u64) {
-            Ok(n) => n,
-            Err(e) if done == 0 => return Err(e),
-            Err(_) => break,
-        };
-        done += n;
-        if n < want {
-            break;
-        }
+    write_and_wait(&b, pos, count, flags.nowait())?;
+    let n = dio::direct_io(&b, to, pos, flags)?;
+    if n == count {
+        return Ok(n);
     }
-    Ok(done)
+    match cache_read(&b, to, pos + n as u64, flags.nowait()) {
+        Ok(m) => Ok(n + m),
+        Err(e) if n == 0 => Err(e),
+        Err(_) => Ok(n),
+    }
 }
 
-/// Write at `pos`: EPERM if read-only, ENOSPC at or past the end, short
-/// at it (Linux blkdev_write_iter)
-fn write_at(file: &File, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
-    if !write_ok(file, from.len(), pos)? {
-        return Ok(0);
+/// Last byte of `count` (> 0) bytes at `pos`
+fn last(pos: u64, count: usize) -> u64 {
+    pos + count as u64 - 1
+}
+
+/// Write back the cached pages over the `count` bytes at `pos` before
+/// direct I/O there (Linux kiocb_write_and_wait); RWF_NOWAIT: EAGAIN if
+/// that needs I/O
+fn write_and_wait(
+    b: &BlockDevice,
+    pos: u64,
+    count: usize,
+    nowait: bool,
+) -> Result<(), KernelError> {
+    let end = last(pos, count);
+    if !nowait {
+        return filemap::write_and_wait_range(&b.bd_inode, pos, end);
     }
+    if filemap::range_needs_writeback(&b.bd_inode.i_data, pos, end) {
+        return Err(KernelError::WouldBlock);
+    }
+    Ok(())
+}
+
+/// Write back and drop the cached pages over the `count` bytes at `pos`
+/// before a direct write there (Linux kiocb_invalidate_pages); RWF_NOWAIT:
+/// EAGAIN if a page is cached. EBUSY if one could not be dropped.
+fn invalidate_pages(
+    b: &BlockDevice,
+    pos: u64,
+    count: usize,
+    nowait: bool,
+) -> Result<(), KernelError> {
+    let end = last(pos, count);
+    if nowait {
+        if filemap::range_has_page(&b.bd_inode.i_data, pos, end) {
+            return Err(KernelError::WouldBlock);
+        }
+    } else {
+        filemap::write_and_wait_range(&b.bd_inode, pos, end)?;
+    }
+    let p = PAGE_SIZE as u64;
+    filemap::invalidate_pages2(&b.bd_inode, pos / p, end / p)
+}
+
+/// Drop what a read cached over the range during a direct write (Linux
+/// kiocb_invalidate_post_direct_write): a page left is reported (Linux
+/// dio_warn_stale_pagecache), not an error
+fn invalidate_post(b: &BlockDevice, pos: u64, count: usize) {
+    let p = PAGE_SIZE as u64;
+    if b.bd_inode.i_data.nrpages() != 0
+        && filemap::invalidate_pages2(&b.bd_inode, pos / p, last(pos, count) / p).is_err()
+    {
+        crate::printkln!(
+            "Page cache invalidation failure on direct I/O.  Possible data corruption due to collision with buffered I/O!"
+        );
+    }
+}
+
+/// The direct part of an O_DIRECT write (Linux blkdev_direct_write): the
+/// range dropped from the cache first (a page that cannot be: 0 bytes,
+/// all left to the cache), the bios, the range dropped again
+fn direct_write(
+    b: &BlockDevice,
+    from: &mut IovSource<'_>,
+    pos: u64,
+    flags: RwFlags,
+) -> Result<usize, KernelError> {
+    let count = from.len();
+    match invalidate_pages(b, pos, count, flags.nowait()) {
+        Err(KernelError::Busy) => return Ok(0),
+        r => r?,
+    }
+    let n = dio::direct_io(b, from, pos, flags)?;
+    if n > 0 {
+        invalidate_post(b, pos, count);
+    }
+    Ok(n)
+}
+
+/// The rest of an O_DIRECT write after `direct` bytes, through the cache,
+/// then written back and dropped so it still bypasses it (Linux
+/// direct_write_fallback over blkdev_buffered_write): all the bytes, or
+/// the direct ones if this part failed (its error if there were none)
+fn write_fallback(
+    b: &BlockDevice,
+    from: &mut IovSource<'_>,
+    pos: u64,
+    direct: usize,
+) -> Result<usize, KernelError> {
+    let short = |e| if direct > 0 { Ok(direct) } else { Err(e) };
+    let at = pos + direct as u64;
+    let n = match filemap::write_iter(&b.bd_inode, from, at) {
+        Ok(0) => return Ok(direct),
+        Ok(n) => n,
+        Err(e) => return short(e),
+    };
+    let end = last(at, n);
+    if let Err(e) = filemap::write_and_wait_range(&b.bd_inode, at, end) {
+        return short(e);
+    }
+    let p = PAGE_SIZE as u64;
+    filemap::invalidate_clean(&b.bd_inode, at / p, end / p);
+    Ok(direct + n)
+}
+
+/// O_DIRECT write at `pos` (Linux blkdev_write_iter with IOCB_DIRECT):
+/// bios from the caller's pinned pages, the rest through the cache
+fn dio_write(
+    file: &File,
+    from: &mut IovSource<'_>,
+    pos: u64,
+    flags: RwFlags,
+) -> Result<usize, KernelError> {
     let b = bdev(file)?;
-    from.truncate((b.capacity() - pos).min(usize::MAX as u64) as usize);
-    filemap::write_iter(&b.bd_inode, from, pos)
+    let n = direct_write(&b, from, pos, flags)?;
+    if from.is_empty() {
+        return Ok(n);
+    }
+    write_fallback(&b, from, pos, n)
 }
 
 /// The checks of a write of `len` bytes at `pos` (Linux
@@ -442,7 +533,9 @@ impl FileOps for BlockFileOps {
         Ok(())
     }
 
-    /// Through the device's page cache; no RWF_NOWAIT (EOPNOTSUPP)
+    /// O_DIRECT from user memory straight into it (`dio_read`), else
+    /// through the device's page cache; RWF_NOWAIT where nothing waits
+    /// (Linux blkdev_read_iter, FMODE_NOWAIT)
     fn read_iter(
         &self,
         file: &File,
@@ -450,14 +543,11 @@ impl FileOps for BlockFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if flags.nowait() {
-            return Err(KernelError::OperationNotSupported);
-        }
         let pos = at.unwrap_or_else(|| file.get_pos());
-        let n = if flags.contains(RwFlags::DIRECT) {
-            dio_read(file, to, pos)?
+        let n = if flags.contains(RwFlags::DIRECT) && to.user_backed() {
+            dio_read(file, to, pos, flags)?
         } else {
-            read_at(file, to, pos)?
+            read_at(file, to, pos, flags.nowait())?
         };
         if at.is_none() {
             file.advance_pos(n as u64);
@@ -465,9 +555,11 @@ impl FileOps for BlockFileOps {
         Ok(n)
     }
 
-    /// Through the device's page cache, written back before return for
-    /// O_DSYNC, O_SYNC, RWF_DSYNC and RWF_SYNC (Linux blkdev_write_iter:
-    /// generic_write_sync); no RWF_NOWAIT (EOPNOTSUPP)
+    /// O_DIRECT from user memory straight out of it (`dio_write`), else
+    /// through the device's page cache (RWF_NOWAIT: EOPNOTSUPP); on the
+    /// disk before return for O_DSYNC, O_SYNC, RWF_DSYNC and RWF_SYNC
+    /// (Linux blkdev_write_iter: generic_write_sync). No i_rwsem, as
+    /// Linux.
     fn write_iter(
         &self,
         file: &File,
@@ -475,14 +567,20 @@ impl FileOps for BlockFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if flags.nowait() {
+        let pos = at.unwrap_or_else(|| file.get_pos());
+        if !write_ok(file, from.len(), pos)? {
+            return Ok(0);
+        }
+        let direct = flags.contains(RwFlags::DIRECT) && from.user_backed();
+        if flags.nowait() && !direct {
             return Err(KernelError::OperationNotSupported);
         }
-        let pos = at.unwrap_or_else(|| file.get_pos());
-        let n = if flags.contains(RwFlags::DIRECT) {
-            dio_write(file, from, pos)?
+        let b = bdev(file)?;
+        from.truncate((b.capacity() - pos).min(usize::MAX as u64) as usize);
+        let n = if direct {
+            dio_write(file, from, pos, flags)?
         } else {
-            write_at(file, from, pos)?
+            filemap::write_iter(&b.bd_inode, from, pos)?
         };
         if at.is_none() {
             file.advance_pos(n as u64);

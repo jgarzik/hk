@@ -1580,7 +1580,8 @@ pub struct Zone {
   through a shared mapping is dirtied under its page lock (sleeping),
   so a `PinnedPages` with such pages is dropped in thread context; a
   completion in an interrupt handler must hand it to a thread (Linux
-  bio_dirty_work).
+  bio_dirty_work). Block-device direct I/O keeps its pins until the
+  submitter's wait returns and drops them there (3.10).
 
 #### Swap (mm/swap/swapfile.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
 
@@ -3567,7 +3568,7 @@ IRQ-safe.
 
 #### Block Device Subsystem
 
-**Location:** `block/` (`blkdev.rs`, `blk_mq.rs`, `genhd.rs`,
+**Location:** `block/` (`blkdev.rs`, `blk_mq.rs`, `dio.rs`, `genhd.rs`,
 `part/`), `hw/virtio/blk.rs`, `fs/blkdev_ops.rs`, `fs/ramfs/devtmpfs.rs`,
 `sync/completion.rs`
 
@@ -3610,6 +3611,23 @@ Rules:
   `submit_bio_wait`'s `end_io` hands the bio back and completes last:
   once `Completion::wait` returns the waker no longer touches the
   waiter's stack.
+- **Direct I/O (`block/dio.rs`, Linux __blkdev_direct_IO):** the bios
+  of one I/O count down a `DioWait` on the submitter's stack: `left`
+  (atomic, bios in flight plus one the submitter holds while it
+  submits), `err` (atomic, the first error's errno, compare-exchange
+  from 0) and a `Completion`. Each bio's `end_io` (hardirq) stores its
+  error, frees the bio, then decrements `left` (AcqRel); the one that
+  reaches 0 completes, last. The submitter drops its own count after
+  the last submit and waits only if a bio is still out, so once it
+  returns no `end_io` touches the frame (`Completion`'s rule). It then
+  dirties a read's pages and unpins them in thread context (page
+  lock; 3.2 Page pins). No lock is held across the I/O, and no
+  i_rwsem: block devices are not regular files (Linux
+  blkdev_read_iter/blkdev_write_iter take none for direct I/O). The
+  cache over the range is written back first (page lock -> i_pages,
+  the writeback's own order) and, for a write, dropped before and
+  after (`filemap::invalidate_pages2`: page lock -> i_mmap read -> PTE
+  lock to unmap, then i_pages; Linux invalidate_inode_pages2_range).
 - **Boot I/O sleeps:** the scheduler runs and interrupts are on before
   driver probe (main.rs: the boot context is pid 1 by then, Linux
   kernel_init), so the boot partition scan's `submit_bio_wait` sleeps on

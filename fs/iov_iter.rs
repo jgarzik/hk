@@ -1,10 +1,9 @@
 //! I/O iterators (Linux struct iov_iter; Rust-for-Linux IovIterDest /
 //! IovIterSource): where a read puts its data and where a write takes
-//! it from, user segments, a kernel buffer or pinned pages (ITER_BVEC),
-//! so a filesystem copies straight between its pages and the caller's
+//! it from, user segments or a kernel buffer, so a filesystem copies straight between its pages and the caller's
 //! memory (no bounce buffer) and in-kernel readers (exec, splice) use
 //! the same path. Direct I/O pins the pages of user segments
-//! (`extract_pages`, `mm::gup`).
+//! (`get_pages`, `mm::gup`).
 //!
 //! Both move forward (a write source can step back over what a failed
 //! page took, Linux iov_iter_revert). A user copy may fault and sleep:
@@ -22,7 +21,7 @@ use crate::uaccess::{
 use crate::util::error::KernelError;
 
 use super::iov::IoVec;
-use crate::mm::gup::{PinnedPages, pin_user_segs};
+use crate::mm::gup::{PinnedPages, pin_user};
 
 /// Position in a list of user segments
 struct Segs<'a> {
@@ -97,6 +96,99 @@ impl<'a> Segs<'a> {
         want
     }
 
+    /// The current segment from the position: its address and the bytes
+    /// left in it, whatever the total left (Linux iter_iov_addr,
+    /// iter_iov_len); None at the end
+    fn cur(&self) -> Option<(u64, usize)> {
+        if self.left == 0 {
+            return None;
+        }
+        let s = self.segs.get(self.i)?;
+        Some((s.iov_base + self.off as u64, s.iov_len as usize - self.off))
+    }
+
+    /// Step over `n` bytes of the current segment
+    fn advance(&mut self, n: usize) {
+        self.off += n;
+        self.left -= n;
+        if self
+            .segs
+            .get(self.i)
+            .is_some_and(|s| self.off == s.iov_len as usize)
+        {
+            self.i += 1;
+            self.off = 0;
+        }
+    }
+
+    /// Pages the bytes left span, at most `max` (Linux iov_iter_npages)
+    fn npages(&self, max: usize) -> usize {
+        const P: u64 = crate::mm::PAGE_SIZE;
+        let (mut i, mut off, mut left, mut n) = (self.i, self.off, self.left, 0usize);
+        while left > 0 && n < max {
+            let Some(s) = self.segs.get(i) else {
+                break;
+            };
+            let len = (s.iov_len as usize - off).min(left);
+            if len > 0 {
+                let a = s.iov_base + off as u64;
+                n = n.saturating_add(((a % P + len as u64).div_ceil(P)) as usize);
+            }
+            left -= len;
+            i += 1;
+            off = 0;
+        }
+        n.min(max)
+    }
+
+    /// Pin the next bytes, at most `max` pages, for `write` (Linux
+    /// bio_iov_iter_get_pages over an ITER_IOVEC): segment by segment,
+    /// each one's address and remaining length first checked against
+    /// `mem_mask` (EINVAL, the pins taken released); short at the first
+    /// page that cannot be pinned, that page's error if none was. The
+    /// bytes are then cut to a multiple of `len_mask` + 1, the iterator
+    /// stepping back over the rest (EFAULT if none are left).
+    fn get_pages(
+        &mut self,
+        write: bool,
+        max: usize,
+        mem_mask: usize,
+        len_mask: usize,
+    ) -> Result<PinnedPages, KernelError> {
+        let mut pp = PinnedPages::new(max)?;
+        while pp.nr_pages() < max {
+            let Some((addr, len)) = self.cur() else {
+                break;
+            };
+            if !mem_aligned(addr, len, mem_mask) {
+                return Err(KernelError::InvalidArgument);
+            }
+            let want = len.min(self.left);
+            if want == 0 {
+                self.i += 1;
+                self.off = 0;
+                continue;
+            }
+            match pin_user(&mut pp, addr, want, write, max) {
+                Ok(n) => {
+                    self.advance(n);
+                    if n < want {
+                        break;
+                    }
+                }
+                Err(e) if pp.is_empty() => return Err(e),
+                Err(_) => break,
+            }
+        }
+        let excess = pp.len() & len_mask;
+        pp.trim(excess);
+        self.revert(excess);
+        if pp.is_empty() {
+            return Err(KernelError::BadAddress);
+        }
+        Ok(pp)
+    }
+
     /// Step back over the last `n` bytes moved
     fn revert(&mut self, mut n: usize) {
         self.left += n;
@@ -113,74 +205,15 @@ impl<'a> Segs<'a> {
     }
 }
 
-/// Position in pinned pages (Linux ITER_BVEC)
-struct Pages<'a> {
-    pp: &'a PinnedPages,
-    i: usize,
-    at: usize,
-    left: usize,
-}
-
-impl<'a> Pages<'a> {
-    fn new(pp: &'a PinnedPages) -> Self {
-        Self {
-            pp,
-            i: 0,
-            at: 0,
-            left: pp.len(),
-        }
-    }
-
-    /// Visit up to `len` bytes segment by segment, as `step` on user
-    /// segments; `f` gets (segment, offset in it, length, offset into the
-    /// caller's buffer)
-    fn step(
-        &mut self,
-        len: usize,
-        f: &mut dyn FnMut(usize, usize, usize, usize) -> usize,
-    ) -> usize {
-        let mut done = 0;
-        let len = len.min(self.left);
-        while done < len {
-            let Some(s) = self.pp.segs().get(self.i) else {
-                break;
-            };
-            let n = (s.len as usize - self.at).min(len - done);
-            let moved = f(self.i, self.at, n, done);
-            self.at += moved;
-            done += moved;
-            self.left -= moved;
-            if moved < n {
-                break;
-            }
-            if self.at == s.len as usize {
-                self.i += 1;
-                self.at = 0;
-            }
-        }
-        done
-    }
-
-    /// Step back over the last `n` bytes moved
-    fn revert(&mut self, mut n: usize) {
-        self.left += n;
-        while n > 0 {
-            if self.at == 0 {
-                self.i -= 1;
-                self.at = self.pp.segs()[self.i].len as usize;
-                continue;
-            }
-            let k = self.at.min(n);
-            self.at -= k;
-            n -= k;
-        }
-    }
+/// DMA memory `len` bytes at `addr` meets the device's alignment mask
+/// (Linux iov_iter_extract_bvecs: `(start | len) & mem_align_mask`)
+pub fn mem_aligned(addr: u64, len: usize, mask: usize) -> bool {
+    (addr | len as u64) & mask as u64 == 0
 }
 
 enum Dest<'a> {
     User(Segs<'a>),
     Kernel(&'a mut [u8]),
-    Pages(Pages<'a>),
 }
 
 /// Where a read puts its data (Linux ITER_DEST)
@@ -197,18 +230,11 @@ impl<'a> IovDest<'a> {
         Self(Dest::Kernel(buf))
     }
 
-    /// Pinned pages, the I/O a device would do into them (Linux
-    /// ITER_BVEC)
-    pub fn pinned(pp: &'a PinnedPages) -> Self {
-        Self(Dest::Pages(Pages::new(pp)))
-    }
-
     /// Room left
     pub fn len(&self) -> usize {
         match &self.0 {
             Dest::User(s) => s.left,
             Dest::Kernel(b) => b.len(),
-            Dest::Pages(p) => p.left,
         }
     }
 
@@ -224,18 +250,34 @@ impl<'a> IovDest<'a> {
                 let k = n.min(b.len());
                 *b = &mut core::mem::take(b)[..k];
             }
-            Dest::Pages(p) => p.left = p.left.min(n),
         }
     }
 
-    /// Pin the user pages of the next bytes, at most `max` pages, to be
-    /// written (a read from a device: Linux iov_iter_extract_pages with
-    /// FOLL_WRITE), and step over them: short at the first page that
-    /// cannot be pinned, that page's error if it is the first.
-    /// EOPNOTSUPP for kernel memory, which is not pinned.
-    pub fn extract_pages(&mut self, max: usize) -> Result<PinnedPages, KernelError> {
+    /// User memory (Linux user_backed_iter): only that is pinned
+    pub fn user_backed(&self) -> bool {
+        matches!(self.0, Dest::User(_))
+    }
+
+    /// Pages the room left spans, at most `max` (Linux iov_iter_npages);
+    /// 0 for memory that is not pinned
+    pub fn npages(&self, max: usize) -> usize {
+        match &self.0 {
+            Dest::User(s) => s.npages(max),
+            _ => 0,
+        }
+    }
+
+    /// Pin the user pages of the next bytes to be written (a read from a
+    /// device; Linux bio_iov_iter_get_pages, FOLL_WRITE): see
+    /// `Segs::get_pages`. EOPNOTSUPP for memory that is not pinned.
+    pub fn get_pages(
+        &mut self,
+        max: usize,
+        mem_mask: usize,
+        len_mask: usize,
+    ) -> Result<PinnedPages, KernelError> {
         match &mut self.0 {
-            Dest::User(s) => pin_user_segs(&mut |f| s.step(usize::MAX, f), true, max),
+            Dest::User(s) => s.get_pages(true, max, mem_mask, len_mask),
             _ => Err(KernelError::OperationNotSupported),
         }
     }
@@ -254,12 +296,6 @@ impl<'a> IovDest<'a> {
                 *b = tail;
                 n
             }
-            Dest::Pages(p) => {
-                let pp = p.pp;
-                p.step(data.len(), &mut |i, at, n, from| {
-                    pp.write(i, at, &data[from..from + n])
-                })
-            }
         };
         if n == 0 && !data.is_empty() && !self.is_empty() {
             return Err(KernelError::BadAddress);
@@ -268,9 +304,7 @@ impl<'a> IovDest<'a> {
     }
 
     /// Copy `n` bytes at `off` of the page frame `phys` (a page-cache
-    /// page) as `copy_to` would; pinned pages get a raw move, as the
-    /// frame may be one of them (a buffer mapping the very file range
-    /// read)
+    /// page) as `copy_to` would
     ///
     /// # Safety
     /// `phys` is a RAM frame the caller keeps referenced, [off, off + n)
@@ -281,15 +315,6 @@ impl<'a> IovDest<'a> {
         off: usize,
         n: usize,
     ) -> Result<usize, KernelError> {
-        if let Dest::Pages(p) = &mut self.0 {
-            let pp = p.pp;
-            let src = phys + off as u64;
-            // SAFETY: the caller's contract, per piece of the frame
-            let c = p.step(n, &mut |i, at, k, from| unsafe {
-                pp.copy_from_frame(i, at, src + from as u64, k)
-            });
-            return Ok(c);
-        }
         // SAFETY: the caller's contract; read only, as the frame's
         // other readers
         let bytes: &[u8] = unsafe { crate::mm::page::frame_bytes(phys) };
@@ -331,7 +356,6 @@ enum Source<'a> {
     User(Segs<'a>),
     /// The buffer and the bytes taken from it
     Kernel(&'a [u8], usize),
-    Pages(Pages<'a>),
 }
 
 /// Where a write takes its data from (Linux ITER_SOURCE)
@@ -348,18 +372,11 @@ impl<'a> IovSource<'a> {
         Self(Source::Kernel(buf, 0))
     }
 
-    /// Pinned pages, the I/O a device would do from them (Linux
-    /// ITER_BVEC)
-    pub fn pinned(pp: &'a PinnedPages) -> Self {
-        Self(Source::Pages(Pages::new(pp)))
-    }
-
     /// Bytes left
     pub fn len(&self) -> usize {
         match &self.0 {
             Source::User(s) => s.left,
             Source::Kernel(b, at) => b.len() - at,
-            Source::Pages(p) => p.left,
         }
     }
 
@@ -373,18 +390,34 @@ impl<'a> IovSource<'a> {
         match &mut self.0 {
             Source::User(s) => s.left = s.left.min(n),
             Source::Kernel(b, at) => *b = &b[..at.saturating_add(n).min(b.len())],
-            Source::Pages(p) => p.left = p.left.min(n),
         }
     }
 
-    /// Pin the user pages of the next bytes, at most `max` pages, to be
-    /// read (a write to a device: Linux iov_iter_extract_pages), and step
-    /// over them: short at the first page that cannot be pinned, that
-    /// page's error if it is the first. EOPNOTSUPP for kernel memory,
-    /// which is not pinned.
-    pub fn extract_pages(&mut self, max: usize) -> Result<PinnedPages, KernelError> {
+    /// User memory (Linux user_backed_iter): only that is pinned
+    pub fn user_backed(&self) -> bool {
+        matches!(self.0, Source::User(_))
+    }
+
+    /// Pages the bytes left span, at most `max` (Linux iov_iter_npages);
+    /// 0 for memory that is not pinned
+    pub fn npages(&self, max: usize) -> usize {
+        match &self.0 {
+            Source::User(s) => s.npages(max),
+            _ => 0,
+        }
+    }
+
+    /// Pin the user pages of the next bytes to be read (a write to a
+    /// device; Linux bio_iov_iter_get_pages): see `Segs::get_pages`.
+    /// EOPNOTSUPP for memory that is not pinned.
+    pub fn get_pages(
+        &mut self,
+        max: usize,
+        mem_mask: usize,
+        len_mask: usize,
+    ) -> Result<PinnedPages, KernelError> {
         match &mut self.0 {
-            Source::User(s) => pin_user_segs(&mut |f| s.step(usize::MAX, f), false, max),
+            Source::User(s) => s.get_pages(false, max, mem_mask, len_mask),
             _ => Err(KernelError::OperationNotSupported),
         }
     }
@@ -394,7 +427,7 @@ impl<'a> IovSource<'a> {
     pub fn fault_in(&self, n: usize) -> usize {
         match &self.0 {
             Source::User(s) => s.fault_in(n),
-            Source::Kernel(..) | Source::Pages(_) => 0,
+            Source::Kernel(..) => 0,
         }
     }
 
@@ -403,7 +436,6 @@ impl<'a> IovSource<'a> {
         match &mut self.0 {
             Source::User(s) => s.revert(n),
             Source::Kernel(_, at) => *at -= n,
-            Source::Pages(p) => p.revert(n),
         }
     }
 
@@ -419,28 +451,18 @@ impl<'a> IovSource<'a> {
                 pagefault_enable();
                 c
             }),
-            Source::Kernel(..) | Source::Pages(_) => self.copy_from(buf).unwrap_or(0),
+            Source::Kernel(..) => self.copy_from(buf).unwrap_or(0),
         }
     }
 
     /// Fill `n` bytes at `off` of the locked page frame `phys` (a
-    /// page-cache page) as `copy_from_nofault` would; pinned pages give
-    /// a raw move, as the frame may be one of them (a buffer mapping the
-    /// very file range written)
+    /// page-cache page) as `copy_from_nofault` would
     ///
     /// # Safety
     /// `phys` is a RAM frame the caller keeps referenced and may write
     /// (its page lock), [off, off + n) lies in it, and the caller holds
     /// no reference to its bytes.
     pub unsafe fn copy_to_page_nofault(&mut self, phys: u64, off: usize, n: usize) -> usize {
-        if let Source::Pages(p) = &mut self.0 {
-            let pp = p.pp;
-            let dst = phys + off as u64;
-            // SAFETY: the caller's contract, per piece of the frame
-            return p.step(n, &mut |i, at, k, to| unsafe {
-                pp.copy_to_frame(i, at, dst + to as u64, k)
-            });
-        }
         // SAFETY: the caller's contract
         let bytes = unsafe { crate::mm::page::frame_bytes(phys) };
         self.copy_from_nofault(&mut bytes[off..off + n])
@@ -460,12 +482,6 @@ impl<'a> IovSource<'a> {
                 buf[..n].copy_from_slice(&b[*at..*at + n]);
                 *at += n;
                 n
-            }
-            Source::Pages(p) => {
-                let pp = p.pp;
-                p.step(want, &mut |i, at, n, to| {
-                    pp.read(i, at, &mut buf[to..to + n])
-                })
             }
         };
         if n == 0 && want != 0 && !self.is_empty() {
