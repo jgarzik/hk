@@ -103,9 +103,8 @@ impl RegBuf {
             user,
         })
         .map(Some)
-        // The charge goes with the pins if the allocation fails: both
-        // are dropped here
-        .inspect_err(|_| unaccount(user, n as u64))
+        // A failed allocation drops the buffer it was given, whose Drop
+        // gives the charge back: nothing to undo here
     }
 
     /// The pieces of the `len` bytes at user address `addr` (Linux

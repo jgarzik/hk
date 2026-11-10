@@ -10,15 +10,21 @@
 //!   with none is ENXIO
 //! - IO_URING_MEMLOCK: without CAP_IPC_LOCK the pinned pages count
 //!   against RLIMIT_MEMLOCK (ENOMEM past it)
+//! - IO_URING_MEMLOCK_NTH (hk only: Linux 6.8 does not charge the
+//!   rings, and its fail-nth needs CONFIG_FAULT_INJECTION): a ring or a
+//!   buffer whose setup fails at any allocation gives back exactly what
+//!   it charged, so the limit still holds afterwards
 
 use super::dio::{Buf, is_pat, open, pat};
 use super::{Ring, sqe};
 use crate::harness::{R, check, report_code, report_r};
-use crate::helpers::{BlkDev, find_blkdev};
+use crate::helpers::{BlkDev, find_blkdev, host_mode, skip};
+use crate::io::fault_inject::{get, set};
 use hk_syscall::{
     IORING_OP_READ_FIXED, IORING_OP_WRITE_FIXED, IORING_REGISTER_BUFFERS,
-    IORING_UNREGISTER_BUFFERS, IoVec, O_RDWR, RLIMIT_MEMLOCK, RLimit, sys_close, sys_exit,
-    sys_fork, sys_io_uring_register, sys_setrlimit, sys_wait4,
+    IORING_UNREGISTER_BUFFERS, IoUringParams, IoVec, O_RDWR, RLIMIT_MEMLOCK, RLimit, sys_close,
+    sys_exit, sys_fork, sys_io_uring_register, sys_io_uring_setup, sys_open, sys_setrlimit,
+    sys_wait4,
 };
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
@@ -39,6 +45,14 @@ pub fn run_tests() {
     report_r(b"IO_URING_FIXED_EFAULT", efault());
     report_r(b"IO_URING_REG_BUFFERS", reg_errors());
     memlock();
+    if host_mode() {
+        skip(
+            b"IO_URING_MEMLOCK_NTH",
+            b"rings uncharged before Linux 6.13; fail-nth",
+        );
+    } else {
+        child(b"IO_URING_MEMLOCK_NTH", memlock_failnth_child);
+    }
 }
 
 fn register(r: &Ring, iov: &[IoVec]) -> i64 {
@@ -165,9 +179,14 @@ fn memlock_child() -> i64 {
 }
 
 fn memlock() {
+    child(b"IO_URING_MEMLOCK", memlock_child);
+}
+
+/// Run `f` in a child; report its exit code as `name`
+fn child(name: &[u8], f: fn() -> i64) {
     let pid = sys_fork();
     if pid == 0 {
-        sys_exit(memlock_child() as u64);
+        sys_exit(f() as u64);
     }
     let mut st = 0;
     let w = sys_wait4(pid, &mut st, 0, 0);
@@ -176,5 +195,66 @@ fn memlock() {
     } else {
         i64::from((st >> 8) & 0xff)
     };
-    report_code(b"IO_URING_MEMLOCK", code);
+    report_code(name, code);
+}
+
+/// `call` with each of its allocations failing in turn (fail-nth),
+/// until it runs past the last; `undo` releases what a success made.
+/// False if fail-nth cannot be used
+fn each_failure(call: &mut dyn FnMut() -> i64, undo: &mut dyn FnMut(i64)) -> bool {
+    let fd = sys_open(b"/proc/self/fail-nth\0".as_ptr(), O_RDWR, 0);
+    if fd < 0 {
+        return false;
+    }
+    let fd = fd as i32;
+    for nth in 1..64 {
+        set(fd, nth);
+        let r = call();
+        let left = get(fd);
+        set(fd, 0);
+        if r >= 0 {
+            undo(r);
+        }
+        if left != 0 {
+            break;
+        }
+    }
+    sys_close(fd as u64);
+    true
+}
+
+/// In a child: no capabilities, RLIMIT_MEMLOCK four pages, a ring of
+/// two pages charged. Rings and buffers made with each allocation
+/// failing in turn give back what they charged: two pages are left
+fn memlock_failnth_child() -> i64 {
+    let Ok(b) = Buf::new(4 * 4096) else { return 1 };
+    let lim = RLimit {
+        rlim_cur: 4 * 4096,
+        rlim_max: 4 * 4096,
+    };
+    if !crate::net::netlink::drop_caps() || sys_setrlimit(RLIMIT_MEMLOCK, &lim) != 0 {
+        return 2;
+    }
+    let Ok(r) = Ring::simple(4) else { return 3 };
+    let mut p = IoUringParams::default();
+    if !each_failure(&mut || sys_io_uring_setup(4, &mut p), &mut |fd| {
+        sys_close(fd as u64);
+    }) {
+        return 4;
+    }
+    // Two pages charged, two left: three more do not fit
+    if register(&r, &[iov(b.addr(0), 3 * 4096)]) != ENOMEM {
+        return 5;
+    }
+    let mut unreg = |_: i64| {
+        sys_io_uring_register(r.fd as u32, IORING_UNREGISTER_BUFFERS, 0, 0);
+    };
+    each_failure(&mut || register(&r, &[iov(b.addr(0), 4096)]), &mut unreg);
+    if register(&r, &[iov(b.addr(0), 3 * 4096)]) != ENOMEM {
+        return 6;
+    }
+    if register(&r, &[iov(b.addr(0), 4096)]) != 0 {
+        return 7;
+    }
+    0
 }

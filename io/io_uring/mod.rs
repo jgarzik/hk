@@ -198,7 +198,8 @@ impl IoRing {
             inflight: AtomicU32::new(0),
             idle: WaitQueue::new(),
         })
-        .inspect_err(|_| rsrc::unaccount(acct, ring_pages))
+        // A failed allocation drops the ring it was given, whose Drop
+        // gives the charge back: nothing to undo here
     }
 
     /// Consume up to `nr` published SQEs and run them (Linux
