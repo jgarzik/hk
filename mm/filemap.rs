@@ -1060,6 +1060,59 @@ pub fn perform_write(inode: &Inode, buf: &[u8], pos: u64) -> Result<usize, Kerne
 /// cannot be faulted in is EFAULT.
 pub fn write_iter(inode: &Inode, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
     let a = inode.i_data.aops();
+    write_with(inode, from, pos, &|at, n| a.write_begin(inode, at, n))
+}
+
+/// `write_iter` that waits for nothing (Linux generic_perform_write
+/// with IOCB_NOWAIT: FGP_NOWAIT pages): a page another holds locked,
+/// or one a partial write would first have to read, ends it with
+/// EAGAIN (the bytes before it written). For a mapping with the
+/// default write_begin (simple_write_begin): block devices.
+pub fn write_iter_nowait(
+    inode: &Inode,
+    from: &mut IovSource<'_>,
+    pos: u64,
+) -> Result<usize, KernelError> {
+    write_with(inode, from, pos, &|at, n| grab_nowait(inode, at, n))
+}
+
+/// simple_write_begin's page for a write of `n` bytes at `at`, without
+/// waiting: EAGAIN where that would wait for a page lock or a read
+fn grab_nowait(inode: &Inode, at: u64, n: usize) -> Result<u64, KernelError> {
+    let m = &inode.i_data;
+    let index = at / PAGE_SIZE as u64;
+    let whole = n == PAGE_SIZE || index * PAGE_SIZE as u64 >= inode.get_size();
+    let Some(phys) = find_get(m, index) else {
+        if !whole {
+            return Err(KernelError::WouldBlock);
+        }
+        return simple_write_begin(inode, at, n);
+    };
+    if !super::page::trylock_page(phys) {
+        put_page(phys);
+        return Err(KernelError::WouldBlock);
+    }
+    if page(phys).mapping.load(Ordering::Acquire) != m.key() || !(whole || uptodate(phys)) {
+        unlock_page(phys);
+        put_page(phys);
+        return Err(KernelError::WouldBlock);
+    }
+    if !uptodate(phys) && index * PAGE_SIZE as u64 >= inode.get_size() {
+        zero_page(phys, 0);
+        set_uptodate(phys);
+    }
+    Ok(phys)
+}
+
+/// The loop of `write_iter`: `begin` gives each page locked, with a
+/// reference (Linux ->write_begin)
+fn write_with(
+    inode: &Inode,
+    from: &mut IovSource<'_>,
+    pos: u64,
+    begin: &dyn Fn(u64, usize) -> Result<u64, KernelError>,
+) -> Result<usize, KernelError> {
+    let a = inode.i_data.aops();
     let mut done = 0;
     let mut limit = PAGE_SIZE;
     while !from.is_empty() {
@@ -1069,7 +1122,7 @@ pub fn write_iter(inode: &Inode, from: &mut IovSource<'_>, pos: u64) -> Result<u
         if from.fault_in(n) == n {
             return short(done, KernelError::BadAddress);
         }
-        let phys = match a.write_begin(inode, at, n) {
+        let phys = match begin(at, n) {
             Ok(p) => p,
             Err(e) => return short(done, e),
         };

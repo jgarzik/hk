@@ -208,10 +208,18 @@ fn write_fallback(
     from: &mut IovSource<'_>,
     pos: u64,
     direct: usize,
+    nowait: bool,
 ) -> Result<usize, KernelError> {
     let short = |e| if direct > 0 { Ok(direct) } else { Err(e) };
     let at = pos + direct as u64;
-    let n = match filemap::write_iter(&b.bd_inode, from, at) {
+    // RWF_NOWAIT holds for the buffered part too (Linux
+    // blkdev_buffered_write: IOCB_NOWAIT)
+    let r = if nowait {
+        filemap::write_iter_nowait(&b.bd_inode, from, at)
+    } else {
+        filemap::write_iter(&b.bd_inode, from, at)
+    };
+    let n = match r {
         Ok(0) => return Ok(direct),
         Ok(n) => n,
         Err(e) => return short(e),
@@ -238,7 +246,7 @@ fn dio_write(
     if from.is_empty() {
         return Ok(n);
     }
-    write_fallback(&b, from, pos, n)
+    write_fallback(&b, from, pos, n, flags.nowait())
 }
 
 /// The checks of a write of `len` bytes at `pos` (Linux
