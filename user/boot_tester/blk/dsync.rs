@@ -28,6 +28,43 @@ const MSG: [&[u8; 8]; 4] = [b"O_DSYNC!", b"O_SYNC!!", b"RWFDSYNC", b"RWF_SYNC"];
 
 pub fn run_tests() {
     report_r(b"BLK_DSYNC", dsync());
+    report_r(b"BLK_DSYNC_RANGE", dsync_range());
+}
+
+/// A synchronous write syncs its own bytes only (Linux
+/// generic_write_sync -> blkdev_fsync over the written range): a page
+/// dirtied elsewhere on the device stays in the cache
+fn dsync_range() -> R {
+    let (Some(vda), Some(p3), Some(start)) = (
+        find_blkdev(b"vd", 131072),
+        find_blkdev(b"vd", 16384),
+        p3_start(),
+    ) else {
+        return check(b"no vda3", false, 0);
+    };
+    const A: i64 = (12 << 20) + 262144;
+    const B: i64 = (12 << 20) + 327680;
+    let plain = open_dev(&p3, O_RDWR);
+    let ds = open_dev(&p3, O_RDWR | O_DSYNC);
+    check(b"open", plain >= 0 && ds >= 0, plain.min(ds))?;
+    let wa = sys_pwrite64(plain as i32, MSG[0].as_ptr(), 8, A);
+    let wb = sys_pwrite64(ds as i32, MSG[1].as_ptr(), 8, B);
+    let disk = open_dev(&vda, O_RDONLY);
+    let (mut a, mut b) = ([0u8; 8], [0u8; 8]);
+    sys_pread64(disk as i32, a.as_mut_ptr(), 8, start * 512 + A);
+    sys_pread64(disk as i32, b.as_mut_ptr(), 8, start * 512 + B);
+    sys_close(disk as u64);
+    for off in [A, B] {
+        sys_pwrite64(ds as i32, pat(off).as_ptr(), 8, off);
+    }
+    let disk = open_dev(&vda, O_RDONLY);
+    sys_ioctl(disk as i32, BLKFLSBUF, 0);
+    sys_close(disk as u64);
+    sys_close(plain as u64);
+    sys_close(ds as u64);
+    check(b"writes", wa == 8 && wb == 8, wa.min(wb))?;
+    check(b"synced write on disk", &b == MSG[1], i64::from(b[0]))?;
+    check(b"other page not synced", a == pat(A), i64::from(a[0]))
 }
 
 fn open_dev(d: &BlkDev, flags: u32) -> i64 {

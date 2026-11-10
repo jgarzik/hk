@@ -360,6 +360,13 @@ pub trait FileOps: Send + Sync {
         Ok(())
     }
 
+    /// Sync the data of bytes [start, end] (Linux f_op->fsync with a
+    /// range, from generic_write_sync); default: the whole file
+    fn fsync_range(&self, file: &File, start: u64, end: u64) -> Result<(), KernelError> {
+        let _ = (start, end);
+        self.fsync(file)
+    }
+
     /// A descriptor of the file is being closed (close, dup2 over it,
     /// close-on-exec, the closer's exit), in the closer's context (Linux
     /// f_op->flush): unlike `release`, on every close, not the last
@@ -804,7 +811,7 @@ impl File {
         };
         let append = append.unwrap_or(flags.contains(RwFlags::APPEND));
         let lock = inode.lock();
-        let n = (|| {
+        let (pos, n) = (|| {
             // An active swap file (Linux generic_write_checks:
             // IS_SWAPFILE), checked under i_rwsem: swapon sets it there
             if inode.i_swapfile.load(Ordering::Acquire) {
@@ -822,20 +829,22 @@ impl File {
             // A zero-length write checks nothing (Linux: count 0 returns
             // before generic_write_checks)
             if from.is_empty() {
-                return Ok(0);
+                return Ok((pos, 0));
             }
             from.truncate(inode.write_limit(pos, from.len())?);
             // file_modified: set-id bits go unless CAP_FSETID, then
             // mtime and ctime, before the data
             super::dac::remove_privs(&inode);
             inode.touch_mc();
-            self.f_op.write_iter(self, from, at, flags)
+            self.f_op
+                .write_iter(self, from, at, flags)
+                .map(|n| (pos, n))
         })()?;
         drop(lock);
         // After i_rwsem is released; a synchronous mount is Linux IS_SYNC
         let sync =
             flags.contains(RwFlags::DSYNC) || inode.superblock().is_some_and(|sb| sb.synchronous());
-        generic_write_sync(self, n, sync)
+        generic_write_sync(self, pos, n, sync)
     }
 
     /// Seek
@@ -892,13 +901,19 @@ impl Drop for File {
     }
 }
 
-/// After a write of `n` bytes to `file` that must be synchronous
-/// (`dsync`: IOCB_DSYNC, or the inode IS_SYNC), the data reaches the
-/// storage before the write returns, and an error doing so is the
-/// write's (Linux generic_write_sync)
-pub fn generic_write_sync(file: &File, n: usize, dsync: bool) -> Result<usize, KernelError> {
+/// After a write of `n` bytes at `pos` of `file` that must be
+/// synchronous (`dsync`: IOCB_DSYNC, or the inode IS_SYNC), those bytes
+/// reach the storage before the write returns, and an error doing so is
+/// the write's (Linux generic_write_sync: vfs_fsync_range over them)
+pub fn generic_write_sync(
+    file: &File,
+    pos: u64,
+    n: usize,
+    dsync: bool,
+) -> Result<usize, KernelError> {
     if n > 0 && dsync {
-        file.f_op.fsync(file)?;
+        file.f_op
+            .fsync_range(file, pos, pos.saturating_add(n as u64 - 1))?;
     }
     Ok(n)
 }

@@ -593,7 +593,7 @@ impl FileOps for BlockFileOps {
         if at.is_none() {
             file.advance_pos(n as u64);
         }
-        generic_write_sync(file, n, flags.contains(RwFlags::DSYNC))
+        generic_write_sync(file, pos, n, flags.contains(RwFlags::DSYNC))
     }
 
     /// Positions within the device only (Linux fixed_size_llseek)
@@ -616,11 +616,17 @@ impl FileOps for BlockFileOps {
         Ok(pos as u64)
     }
 
-    /// Write the cache back, then flush the disk's write cache (Linux
-    /// blkdev_fsync)
+    /// Write the whole cache back, then flush the disk's write cache
     fn fsync(&self, file: &File) -> Result<(), KernelError> {
+        self.fsync_range(file, 0, u64::MAX)
+    }
+
+    /// Write back the cache over bytes [start, end], then flush the
+    /// disk's write cache (Linux blkdev_fsync:
+    /// file_write_and_wait_range, blkdev_issue_flush)
+    fn fsync_range(&self, file: &File, start: u64, end: u64) -> Result<(), KernelError> {
         let b = bdev(file)?;
-        sync_blockdev(&b)?;
+        filemap::write_and_wait_range(&b.bd_inode, start, end)?;
         blkdev_issue_flush(&b)
     }
 
