@@ -159,7 +159,7 @@ impl IoRing {
 
     /// Reap the polled requests once; with none in flight the list
     /// empties
-    fn poll_once(&self) {
+    pub(super) fn poll_once(&self) {
         let mut l = self.poll_files.lock();
         if self.inflight.load(Ordering::Acquire) == 0 {
             // Released after the lock: a last file reference may sleep

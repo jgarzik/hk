@@ -220,6 +220,11 @@ fn rw_async(
         Ok(req) => req,
         Err(e) => return Some(Err(e)),
     };
+    if r.iopoll
+        && let Err(e) = req.tctx.note_polled(r)
+    {
+        return Some(Err(e));
+    }
     if sqe.flags & IOSQE_ASYNC != 0 {
         super::iowq::queue(req);
         return None;

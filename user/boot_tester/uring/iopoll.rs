@@ -6,14 +6,18 @@
 //! - IO_URING_IOPOLL_OPS: on an IOPOLL ring a NOP completes, a read of a
 //!   file without O_DIRECT is EOPNOTSUPP, an operation that cannot be
 //!   polled (FSYNC) fails with EINVAL
+//! - IO_URING_IOPOLL_EXIT: a process that exits with polled reads in
+//!   flight, never asking for their CQEs, is reaped (its exit polls them:
+//!   Linux io_uring_cancel_generic -> io_iopoll_try_reap_events)
 
 use super::dio::{Buf, is_pat, open};
 use super::{Ring, sqe};
 use crate::harness::{R, check, report_r};
+use crate::helpers::msleep;
 use crate::helpers::{BlkDev, find_blkdev};
 use hk_syscall::{
     IORING_OP_FSYNC, IORING_OP_NOP, IORING_OP_READ, IORING_SETUP_IOPOLL, IoUringParams, O_RDONLY,
-    sys_close, sys_memfd_create,
+    sys_close, sys_exit, sys_fork, sys_kill, sys_memfd_create, sys_wait4,
 };
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
@@ -26,6 +30,55 @@ pub fn run_tests() {
         None => report_r(b"IO_URING_IOPOLL_READ", check(b"no vda3", false, 0)),
     }
     report_r(b"IO_URING_IOPOLL_OPS", iopoll_ops());
+    match find_blkdev(b"vd", 16384) {
+        Some(p3) => report_r(b"IO_URING_IOPOLL_EXIT", iopoll_exit(&p3)),
+        None => report_r(b"IO_URING_IOPOLL_EXIT", check(b"no vda3", false, 0)),
+    }
+}
+
+/// In a child: polled reads issued, then exit without reaping
+fn exit_child(d: &BlkDev) -> u64 {
+    let Ok(fd) = open(d, O_RDONLY | O_DIRECT) else {
+        return 1;
+    };
+    let Ok(mut r) = ring(16) else { return 2 };
+    let Ok(b) = Buf::new(16 * 4096) else { return 3 };
+    for i in 0..16u64 {
+        r.push(sqe(
+            IORING_OP_READ,
+            fd,
+            b.addr(i as usize * 4096),
+            4096,
+            i * 4096,
+            i,
+        ));
+    }
+    if r.enter(16, 0, 0) != 16 {
+        return 4;
+    }
+    // Exit with them in flight, the ring and buffer still mapped
+    core::mem::forget(r);
+    core::mem::forget(b);
+    0
+}
+
+fn iopoll_exit(d: &BlkDev) -> R {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(exit_child(d));
+    }
+    check(b"fork", pid > 0, pid)?;
+    let mut st = 0;
+    // Up to 5 s for it to be reaped
+    for _ in 0..500 {
+        let w = sys_wait4(pid, &mut st, 1, 0); // WNOHANG
+        if w == pid {
+            return check(b"child status", st >> 8 == 0, i64::from(st >> 8));
+        }
+        msleep(10);
+    }
+    sys_kill(pid, 9);
+    check(b"child never exited", false, 0)
 }
 
 fn ring(entries: u32) -> Result<Ring, (&'static [u8], i64)> {

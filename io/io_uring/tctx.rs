@@ -16,6 +16,7 @@
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use super::IoRing;
 use super::rw::{Req, ReqAdapter};
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
@@ -23,6 +24,7 @@ use crate::task::percpu::current;
 use crate::task::task_work::{CallbackHead, TaskWork, task_work_add, task_work_run};
 use crate::util::error::KernelResult;
 use crate::util::kalloc::try_arc;
+use crate::util::kmem::KVec;
 use crate::util::list::ArcList;
 
 /// One task's io_uring state (Linux struct io_uring_task)
@@ -35,6 +37,10 @@ pub struct Tctx {
     inflight: AtomicU32,
     /// Woken when `inflight` drops to zero
     idle: WaitQueue,
+    /// IOPOLL rings it issued polled requests on: nothing but polling
+    /// ends those, so `cancel` polls them (Linux io_uring_cancel_generic
+    /// -> io_iopoll_try_reap_events)
+    polled: crate::sync::spin::Mutex<KVec<Weak<IoRing>>>,
 }
 
 impl TaskWork for Tctx {
@@ -56,6 +62,7 @@ impl Tctx {
             cb: cb.clone(),
             inflight: AtomicU32::new(0),
             idle: WaitQueue::new(),
+            polled: crate::sync::spin::Mutex::new(KVec::new()),
         })?;
         // Named weakly: a queued callback never keeps the context alive
         let weak: Weak<dyn TaskWork> = Arc::downgrade(&t) as Weak<Self>;
@@ -97,10 +104,37 @@ impl Tctx {
         l.push_back(req);
     }
 
-    /// Finish requests until none of the task's is in flight
+    /// Note that the task issued polled requests on `r`
+    pub fn note_polled(&self, r: &Arc<IoRing>) -> KernelResult<()> {
+        let mut l = self.polled.lock();
+        if !l.iter().any(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(r))) {
+            l.try_push(Arc::downgrade(r))?;
+        }
+        Ok(())
+    }
+
+    /// Poll the IOPOLL rings the task issued on, once
+    fn poll_rings(&self) {
+        let rings: KVec<Arc<IoRing>> = {
+            let l = self.polled.lock();
+            let mut v = KVec::new();
+            for r in l.iter().filter_map(Weak::upgrade) {
+                // Room is not reserved: a ring left out is polled next time
+                let _ = v.try_push(r);
+            }
+            v
+        };
+        for r in rings.iter() {
+            r.poll_once();
+        }
+    }
+
+    /// Finish requests until none of the task's is in flight, polling
+    /// its IOPOLL rings meanwhile
     fn cancel(&self) {
         loop {
             task_work_run();
+            self.poll_rings();
             self.run();
             if self.inflight.load(Ordering::Acquire) == 0 {
                 break;

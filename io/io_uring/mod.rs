@@ -311,6 +311,10 @@ impl IoRing {
             if self.inflight.load(Ordering::Acquire) == 0 {
                 break;
             }
+            // Polled requests end only by polling
+            if self.iopoll {
+                self.poll_once();
+            }
             // Woken at zero; a tick bounds the wait for the caller's own
             // ended requests, which kick its callback, not this queue
             let me = current();
