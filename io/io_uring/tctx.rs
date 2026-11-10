@@ -17,6 +17,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::IoRing;
+use super::iowq::IoWq;
 use super::rw::{Req, ReqAdapter};
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
@@ -41,6 +42,9 @@ pub struct Tctx {
     /// ends those, so `cancel` polls them (Linux io_uring_cancel_generic
     /// -> io_iopoll_try_reap_events)
     polled: crate::sync::spin::Mutex<KVec<Weak<IoRing>>>,
+    /// Its io-wq, made by its first request that needs one and gone at
+    /// exit or exec (Linux tctx->io_wq)
+    io_wq: crate::sync::spin::Mutex<Option<Arc<IoWq>>>,
 }
 
 impl TaskWork for Tctx {
@@ -63,6 +67,7 @@ impl Tctx {
             inflight: AtomicU32::new(0),
             idle: WaitQueue::new(),
             polled: crate::sync::spin::Mutex::new(KVec::new()),
+            io_wq: crate::sync::spin::Mutex::new(None),
         })?;
         // Named weakly: a queued callback never keeps the context alive
         let weak: Weak<dyn TaskWork> = Arc::downgrade(&t) as Weak<Self>;
@@ -104,6 +109,23 @@ impl Tctx {
         l.push_back(req);
     }
 
+    /// Its io-wq (made by the owner: the first caller is its
+    /// submission, as after an exec)
+    pub fn io_wq(&self) -> KernelResult<Arc<IoWq>> {
+        if let Some(wq) = self.io_wq.lock().as_ref() {
+            return Ok(wq.clone());
+        }
+        // Made unlocked (it allocates); a racing maker's wins
+        let new = IoWq::new()?;
+        Ok(self.io_wq.lock().get_or_insert(new).clone())
+    }
+
+    /// Its io-wq if it has one (from a context other than the owner's,
+    /// which cannot make one)
+    pub fn io_wq_get(&self) -> Option<Arc<IoWq>> {
+        self.io_wq.lock().clone()
+    }
+
     /// Note that the task issued polled requests on `r`
     pub fn note_polled(&self, r: &Arc<IoRing>) -> KernelResult<()> {
         note_live(&mut self.polled.lock(), r)
@@ -130,6 +152,12 @@ impl Tctx {
     /// Finish requests until none of the task's is in flight, polling
     /// its IOPOLL rings meanwhile
     fn cancel(&self) {
+        // Its workers first: queued work ends, running work is
+        // interrupted, and they are gone
+        let wq = self.io_wq.lock().take();
+        if let Some(wq) = wq {
+            wq.cancel();
+        }
         loop {
             task_work_run();
             self.poll_rings();

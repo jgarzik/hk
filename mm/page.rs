@@ -417,6 +417,40 @@ pub unsafe fn copy_page_racy(dst: u64, src: u64) {
     }
 }
 
+/// Copy `src` to byte `off` of the frame `phys`, which user space may
+/// access meanwhile (a pinned user page): volatile byte stores, so a
+/// racing access sees some mix of old and new bytes, never undefined
+/// behavior (Linux copy_to_page over a kmap)
+///
+/// # Safety
+/// `phys` is a RAM frame kept allocated meanwhile (pinned) and meant to
+/// be written (no kernel data); [off, off + src.len()) lies in it.
+pub unsafe fn copy_to_frame_racy(phys: u64, off: usize, src: &[u8]) {
+    debug_assert!(off + src.len() <= 1 << PAGE_SHIFT);
+    let d = crate::arch::phys_to_virt(phys).wrapping_add(off);
+    for (i, &b) in src.iter().enumerate() {
+        // SAFETY: byte `off + i` of the frame, in it (the caller's
+        // contract); volatile: another party may access it
+        unsafe { d.add(i).write_volatile(b) };
+    }
+}
+
+/// Fill `dst` from byte `off` of the frame `phys`, which user space may
+/// write meanwhile: volatile byte loads (as `copy_to_frame_racy`)
+///
+/// # Safety
+/// `phys` is a RAM frame kept allocated meanwhile (pinned);
+/// [off, off + dst.len()) lies in it.
+pub unsafe fn copy_from_frame_racy(dst: &mut [u8], phys: u64, off: usize) {
+    debug_assert!(off + dst.len() <= 1 << PAGE_SHIFT);
+    let s = crate::arch::phys_to_virt(phys).wrapping_add(off);
+    for (i, b) in dst.iter_mut().enumerate() {
+        // SAFETY: byte `off + i` of the frame, in it (the caller's
+        // contract)
+        *b = unsafe { s.add(i).read_volatile() };
+    }
+}
+
 /// Release a mapping word taken off a page: an anon_vma reference
 pub fn put_mapping(word: u64) {
     if word & 1 != 0 && word & !1 != 0 {

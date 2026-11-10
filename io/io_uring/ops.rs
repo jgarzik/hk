@@ -1,7 +1,9 @@
-//! The operations io_uring runs inline through the syscall paths: file
-//! management, sockets, and the poll/timeout/cancel bookkeeping (Linux
-//! io_uring/{openclose,sync,statx,truncate,net,poll,timeout,cancel}.c,
-//! which hk does not run asynchronously: BUGS "io_uring gaps")
+//! io_uring's operations other than reads and writes, through their
+//! syscalls (Linux io_uring/{openclose,sync,statx,truncate,net,poll,
+//! timeout,cancel}.c): how each is issued (`how`), inline, after a
+//! nonblocking attempt, or always in an io-wq worker as Linux does, and
+//! the poll/timeout/cancel bookkeeping that runs inline (it never
+//! completes asynchronously: BUGS "io_uring gaps")
 
 use super::abi::*;
 use super::{IoRing, Submit};
@@ -14,15 +16,75 @@ pub fn cqe_count(n: usize) -> i32 {
     n as i32
 }
 
-/// Run the inline operation of `sqe`; None for an opcode that is not
+/// recv/send: do not wait (MSG_DONTWAIT)
+const MSG_DONTWAIT: u32 = 0x40;
+
+/// How an operation is issued
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum How {
+    /// In io_uring_enter, to its end: it never blocks, or it is the
+    /// ring's own bookkeeping (needs the submission state)
+    Inline,
+    /// A nonblocking attempt first (MSG_DONTWAIT); EAGAIN goes to a
+    /// worker (Linux: -EAGAIN of an IO_URING_F_NONBLOCK issue)
+    TryNoWait,
+    /// Always a worker (Linux: no nonblocking path, the issue returns
+    /// -EAGAIN under IO_URING_F_NONBLOCK: fsync, statx, openat, ...)
+    Punt,
+}
+
+/// How the non-read/write opcode `op` is issued
+pub fn how(op: u8) -> How {
+    match op {
+        IORING_OP_OPENAT | IORING_OP_FSYNC | IORING_OP_STATX | IORING_OP_FTRUNCATE
+        | IORING_OP_ACCEPT | IORING_OP_CONNECT => How::Punt,
+        IORING_OP_SEND | IORING_OP_RECV | IORING_OP_SENDMSG | IORING_OP_RECVMSG => How::TryNoWait,
+        _ => How::Inline,
+    }
+}
+
+/// The operation may block for good (a socket): an unbounded worker
+pub fn unbound(op: u8) -> bool {
+    matches!(
+        op,
+        IORING_OP_ACCEPT
+            | IORING_OP_CONNECT
+            | IORING_OP_SEND
+            | IORING_OP_RECV
+            | IORING_OP_SENDMSG
+            | IORING_OP_RECVMSG
+    )
+}
+
+/// Run an inline operation of `sqe`; None for an opcode that is not
 /// one of them
 pub fn issue(r: &IoRing, s: &mut Submit, sqe: &IoUringSqe) -> Option<KernelResult<i32>> {
     Some(match sqe.opcode {
         IORING_OP_NOP => Ok(0),
+        IORING_OP_CLOSE => crate::fs::syscall::sys_close(sqe.fd).map(|()| 0),
+        IORING_OP_POLL_ADD => poll_add(r, s, sqe),
+        IORING_OP_POLL_REMOVE | IORING_OP_TIMEOUT_REMOVE => remove(r, s, sqe),
+        IORING_OP_TIMEOUT => timeout(r, s, sqe),
+        IORING_OP_ASYNC_CANCEL => cancel(r, s, sqe),
+        IORING_OP_SHUTDOWN => net(sqe, 0)?,
+        _ => return None,
+    })
+}
+
+/// The nonblocking attempt of a TryNoWait operation
+pub fn try_nowait(sqe: &IoUringSqe) -> KernelResult<i32> {
+    net(sqe, MSG_DONTWAIT).unwrap_or(Err(KernelError::InvalidArgument))
+}
+
+/// Run `sqe` to its end, blocking (an io-wq worker): a Punt or
+/// TryNoWait operation, or an inline one (in a chain)
+pub fn run_blocking(sqe: &IoUringSqe) -> KernelResult<i32> {
+    match sqe.opcode {
+        IORING_OP_NOP => Ok(0),
+        IORING_OP_CLOSE => crate::fs::syscall::sys_close(sqe.fd).map(|()| 0),
         IORING_OP_OPENAT => {
             crate::fs::syscall::sys_openat(sqe.fd, UserPtr::new(sqe.addr), sqe.op_flags, sqe.len)
         }
-        IORING_OP_CLOSE => crate::fs::syscall::sys_close(sqe.fd).map(|()| 0),
         IORING_OP_FSYNC => fsync(sqe),
         IORING_OP_STATX => crate::fs::syscall::sys_statx(
             sqe.fd,
@@ -35,12 +97,10 @@ pub fn issue(r: &IoRing, s: &mut Submit, sqe: &IoUringSqe) -> Option<KernelResul
         IORING_OP_FTRUNCATE => {
             crate::fs::syscall::sys_ftruncate(sqe.fd, sqe.off as i64).map(|()| 0)
         }
-        IORING_OP_POLL_ADD => poll_add(r, s, sqe),
-        IORING_OP_POLL_REMOVE | IORING_OP_TIMEOUT_REMOVE => remove(r, s, sqe),
-        IORING_OP_TIMEOUT => timeout(r, s, sqe),
-        IORING_OP_ASYNC_CANCEL => cancel(r, s, sqe),
-        _ => return net(sqe),
-    })
+        // Valid inside a chain; it arms nothing (BUGS "io_uring gaps")
+        IORING_OP_LINK_TIMEOUT => Ok(0),
+        _ => net(sqe, 0).unwrap_or(Err(KernelError::InvalidArgument)),
+    }
 }
 
 fn fsync(sqe: &IoUringSqe) -> KernelResult<i32> {
@@ -51,21 +111,24 @@ fn fsync(sqe: &IoUringSqe) -> KernelResult<i32> {
     }
 }
 
-/// The socket operations, through their syscalls
-fn net(sqe: &IoUringSqe) -> Option<KernelResult<i32>> {
+/// The socket operations, through their syscalls, `more` (MSG_*) added
+/// to the SQE's flags of a send or receive
+fn net(sqe: &IoUringSqe, more: u32) -> Option<KernelResult<i32>> {
     use crate::net::syscall as n;
-    let (fd, addr, flags) = (sqe.fd, UserPtr::new(sqe.addr), sqe.op_flags as i32);
+    let (fd, addr) = (sqe.fd, UserPtr::new(sqe.addr));
+    let flags = sqe.op_flags as i32;
+    let mflags = (sqe.op_flags | more) as i32;
     let len = u64::from(sqe.len);
     Some(match sqe.opcode {
         IORING_OP_ACCEPT if flags != 0 => n::sys_accept4(fd, addr, UserPtr::new(sqe.off), flags),
         IORING_OP_ACCEPT => n::sys_accept(fd, addr, UserPtr::new(sqe.off)),
         IORING_OP_CONNECT => n::sys_connect(fd, addr, sqe.off).map(|()| 0),
-        IORING_OP_SEND => n::sys_sendto(fd, addr, len, flags, UserPtr::new(0), 0).map(cqe_count),
+        IORING_OP_SEND => n::sys_sendto(fd, addr, len, mflags, UserPtr::new(0), 0).map(cqe_count),
         IORING_OP_RECV => {
-            n::sys_recvfrom(fd, addr, len, flags, UserPtr::new(0), UserPtr::new(0)).map(cqe_count)
+            n::sys_recvfrom(fd, addr, len, mflags, UserPtr::new(0), UserPtr::new(0)).map(cqe_count)
         }
-        IORING_OP_SENDMSG => n::sys_sendmsg(fd, UserPtr::new(sqe.addr), flags).map(cqe_count),
-        IORING_OP_RECVMSG => n::sys_recvmsg(fd, UserPtr::new(sqe.addr), flags).map(cqe_count),
+        IORING_OP_SENDMSG => n::sys_sendmsg(fd, UserPtr::new(sqe.addr), mflags).map(cqe_count),
+        IORING_OP_RECVMSG => n::sys_recvmsg(fd, UserPtr::new(sqe.addr), mflags).map(cqe_count),
         IORING_OP_SHUTDOWN => n::sys_shutdown(fd, sqe.len as i32).map(|()| 0),
         _ => return None,
     })

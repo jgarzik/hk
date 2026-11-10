@@ -8,14 +8,24 @@
 //! issued again, blocking, by an io-wq worker (Linux -EAGAIN ->
 //! io_queue_iowq), unless the SQE asked RWF_NOWAIT. The bios' end
 //! completes the request (`AsyncIo::complete`, Linux io_complete_rw),
-//! which is finished in the submitter's context (`Tctx`). Everything
-//! else, and requests in a link chain or behind a drain, runs inline
-//! through the read/write core.
+//! which is finished in the submitter's context (`Tctx`).
+//!
+//! Everything else tries a nonblocking issue (IOCB_NOWAIT) inline, and
+//! goes to an io-wq worker that runs it blocking if that would wait
+//! (EAGAIN, or EOPNOTSUPP from a file without nonblocking I/O: Linux
+//! io_file_supports_nowait), or at once with IOSQE_ASYNC. A registered
+//! buffer is read or written through its pinned pages (Linux ITER_BVEC),
+//! not its user addresses.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-use super::abi::{IOSQE_ASYNC, IOSQE_CQE_SKIP_SUCCESS, IoUringSqe};
+use super::abi::{
+    IORING_OP_READ_FIXED, IORING_OP_READV, IORING_OP_WRITE_FIXED, IORING_OP_WRITEV, IOSQE_ASYNC,
+    IOSQE_CQE_SKIP_SUCCESS, IoUringSqe,
+};
+use super::iowq::{Work, WorkKind};
+use super::opreq::{Body, OpReq, RwMem};
 use super::ops::cqe_count;
 use super::rsrc::RegBuf;
 use super::tctx::{Tctx, tctx};
@@ -24,7 +34,7 @@ use crate::block::dio::AsyncIo;
 use crate::fs::file::{File, RwFlags};
 use crate::fs::iov::IoVec;
 use crate::fs::iov_iter::{IovDest, IovSource};
-use crate::mm::gup::{PageSeg, PinnedPages};
+use crate::mm::gup::{PageSeg, PinnedPages, PinnedSlice};
 use crate::task::percpu::TaskRef;
 use crate::task::percpu::current;
 use crate::uaccess::UserPtr;
@@ -79,16 +89,13 @@ fn import(sqe: &IoUringSqe, kind: Kind) -> KernelResult<alloc::vec::Vec<IoVec>> 
 }
 
 /// IORING_OP_READ/WRITE, READV/WRITEV and READ_FIXED/WRITE_FIXED: the
-/// result, or None when queued (its CQE comes when it ends). `inline`:
-/// run it through the blocking core (a chain or drain member; a fixed
-/// buffer then goes by its user addresses: BUGS)
+/// result, or None when queued (its CQE comes when it ends)
 pub fn rw(
     r: &Arc<IoRing>,
     s: &Submit,
     sqe: &IoUringSqe,
     write: bool,
     kind: Kind,
-    inline: bool,
 ) -> Option<KernelResult<i32>> {
     let prep = rw_file(r, s, sqe, write).and_then(|f| {
         let flags = rw_flags(sqe)?;
@@ -118,17 +125,51 @@ pub fn rw(
         return Some(Err(KernelError::InvalidArgument));
     }
     let len = crate::fs::io::seg_len(&segs);
-    if inline || len == 0 || !async_ok(&file) {
-        return Some(rw_one(&file, &segs, (sqe.off, sqe.op_flags), write, flags));
+    if len == 0 || !async_ok(&file) {
+        let mem = match fixed {
+            Some((b, _)) => RwMem::Fixed(b),
+            None => RwMem::User(segs),
+        };
+        return rw_nowait(r, file, sqe, write, flags, mem);
     }
     let mem = match fixed {
-        Some((b, f)) => Ok(Mem::Fixed { _held: b, segs: f }),
+        Some((b, f)) => Ok(Mem::Fixed {
+            segs: f.into_segs(),
+            _held: b,
+        }),
         None => pin(&segs, write).map(Mem::Pinned),
     };
     match mem {
         Ok(mem) => rw_async(r, file, mem, sqe, write, flags),
         Err(e) => Some(Err(e)),
     }
+}
+
+/// What a worker needs to read or write for `sqe` (Linux io_prep_rw +
+/// io_import_iovec / io_import_reg_buf at submission): the file, the
+/// I/O flags, the iovecs copied or the registered buffer held
+pub fn prep_body(r: &Arc<IoRing>, s: &Submit, sqe: &IoUringSqe, write: bool) -> KernelResult<Body> {
+    let file = rw_file(r, s, sqe, write)?;
+    let flags = rw_flags(sqe)?;
+    if flags.contains(RwFlags::HIPRI) {
+        return Err(KernelError::InvalidArgument);
+    }
+    let mem = match sqe.opcode {
+        IORING_OP_READ_FIXED | IORING_OP_WRITE_FIXED => {
+            let b = s.fixed_buf(sqe.buf_index)?;
+            // In range now, as Linux checks at import
+            b.slice(sqe.addr, sqe.len as usize)?;
+            RwMem::Fixed(b.clone())
+        }
+        IORING_OP_READV | IORING_OP_WRITEV => RwMem::User(import(sqe, Kind::Vec)?),
+        _ => RwMem::User(import(sqe, Kind::Buf)?),
+    };
+    Ok(Body::Rw {
+        file,
+        write,
+        flags,
+        mem,
+    })
 }
 
 /// The memory of an asynchronous request: pinned for it, or pieces of
@@ -148,6 +189,104 @@ enum Mem {
 /// iocb_flags(file), then kiocb_set_rw_flags)
 fn kiocb_flags(file: RwFlags, rwf: RwFlags) -> RwFlags {
     file | rwf
+}
+
+/// The nonblocking attempt of a read or write through the read/write
+/// core (Linux io_read/io_write with IOCB_NOWAIT), else a worker:
+/// None when punted
+fn rw_nowait(
+    r: &Arc<IoRing>,
+    file: Arc<File>,
+    sqe: &IoUringSqe,
+    write: bool,
+    flags: RwFlags,
+    mem: RwMem,
+) -> Option<KernelResult<i32>> {
+    let rwf_nowait = flags.contains(RwFlags::NOWAIT);
+    if sqe.flags & IOSQE_ASYNC == 0 {
+        match run_blocking(&file, sqe, write, flags | RwFlags::NOWAIT, &mem) {
+            Err(KernelError::WouldBlock | KernelError::OperationNotSupported) if !rwf_nowait => {}
+            res => return Some(res),
+        }
+    }
+    let body = Body::Rw {
+        file,
+        write,
+        flags,
+        mem,
+    };
+    Some(punt(r, sqe, body)).flatten()
+}
+
+/// Queue `body` for `sqe` on the submitter's io-wq: None when queued,
+/// the error if it could not be
+pub fn punt(r: &Arc<IoRing>, sqe: &IoUringSqe, body: Body) -> Option<KernelResult<i32>> {
+    let prep = tctx().and_then(|t| t.io_wq().map(|wq| (t, wq)));
+    let (t, wq) = match prep {
+        Ok(x) => x,
+        Err(e) => return Some(Err(e)),
+    };
+    let mut o = OpReq::new(r, &t, *sqe, body);
+    let unbound = o.unbound();
+    o.count();
+    match Work::new(WorkKind::Op(o)) {
+        Ok(w) => {
+            wq.queue(w, unbound);
+            None
+        }
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// Read or write `mem` at the SQE's offset to its end, blocking (or not,
+/// with RWF_NOWAIT in `flags`): user iovecs through the read/write core,
+/// a registered buffer's range through its pinned pages
+pub fn run_blocking(
+    file: &File,
+    sqe: &IoUringSqe,
+    write: bool,
+    flags: RwFlags,
+    mem: &RwMem,
+) -> KernelResult<i32> {
+    match mem {
+        RwMem::User(segs) => rw_one(file, segs, (sqe.off, sqe.op_flags), write, flags),
+        RwMem::Fixed(b) => {
+            let slice = b.slice(sqe.addr, sqe.len as usize)?;
+            rw_pinned(file, &slice, (sqe.off, sqe.op_flags), write, flags)
+        }
+    }
+}
+
+/// Read or write pinned pages at `offset` (-1: the file position), as
+/// `rw_one` (Linux io_import_reg_buf: an ITER_BVEC iterator)
+fn rw_pinned(
+    file: &File,
+    p: &PinnedSlice<'_>,
+    (offset, rwf): (u64, u32),
+    write: bool,
+    flags: RwFlags,
+) -> KernelResult<i32> {
+    let at = (offset != u64::MAX).then_some(offset);
+    if at.is_some_and(|o| o > i64::MAX as u64) {
+        return Err(KernelError::InvalidArgument);
+    }
+    let len: usize = p.segs().iter().map(|s| s.len as usize).sum();
+    let _pos = at.is_none().then(|| file.pos_lock());
+    crate::fs::io::verify_area(file, at, len)?;
+    let r = if write {
+        let append = crate::fs::iov::rwf_append(rwf as i32);
+        file.write_iter(&mut IovSource::pinned(p), at, flags, append)
+    } else {
+        file.read_iter(&mut IovDest::pinned(p), at, flags)
+    };
+    r.map(cqe_count)
+}
+
+/// A regular file or a block device: its work is bounded (Linux io_wq:
+/// unbound_nonreg_file otherwise)
+pub fn bounded_file(file: &File) -> bool {
+    file.get_inode()
+        .is_some_and(|i| i.mode().is_file() || i.mode().is_blkdev())
 }
 
 /// The file takes asynchronous I/O for this request: O_DIRECT on a file
@@ -226,8 +365,7 @@ fn rw_async(
         return Some(Err(e));
     }
     if sqe.flags & IOSQE_ASYNC != 0 {
-        super::iowq::queue(req);
-        return None;
+        return req.clone().reissue();
     }
     match req.issue(true) {
         Ok(None) => None,
@@ -243,8 +381,7 @@ fn rw_async(
         // a worker then (Linux io_file_supports_nowait; __io_read retries
         // EOPNOTSUPP of an IOCB_NOWAIT issue from io-wq)
         Err(KernelError::WouldBlock | KernelError::OperationNotSupported) if !req.rwf_nowait => {
-            super::iowq::queue(req);
-            None
+            req.clone().reissue()
         }
         Err(e) => Some(Err(e)),
     }
@@ -344,6 +481,27 @@ impl Req {
             .dio_submit(&self.file, io, self.pos, self.write, flags)
     }
 
+    /// Queue it on its submitter's io-wq for a blocking issue: None when
+    /// queued, the error if it could not be (Linux io_queue_iowq)
+    fn reissue(self: Arc<Self>) -> Option<KernelResult<i32>> {
+        let wq = match self.tctx.io_wq() {
+            Ok(wq) => wq,
+            Err(e) => return Some(Err(e)),
+        };
+        match Work::new(WorkKind::Dio(self)) {
+            Ok(w) => {
+                wq.queue(w, false);
+                None
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// End it unissued (ECANCELED: its io-wq was cancelled)
+    pub fn cancel(self: Arc<Self>) {
+        self.complete(Err(KernelError::Canceled));
+    }
+
     /// Issue it blocking (an io-wq worker; Linux io_wq_submit_work): its
     /// end comes through `complete` either way
     pub fn issue_blocking(self: Arc<Self>) {
@@ -360,8 +518,11 @@ impl Req {
     /// last reference
     pub fn finish(self: Arc<Self>) {
         if self.reissue.swap(false, Ordering::Relaxed) {
-            super::iowq::queue(self);
-            return;
+            if let Some(Err(e)) = self.clone().reissue() {
+                self.res.store(e.to_errno_neg(), Ordering::Relaxed);
+            } else {
+                return;
+            }
         }
         let res = self.res.load(Ordering::Relaxed);
         if res < 0 || !self.skip_success {

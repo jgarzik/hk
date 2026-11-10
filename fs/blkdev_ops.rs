@@ -619,7 +619,7 @@ impl FileOps for BlockFileOps {
     ) -> Result<usize, KernelError> {
         nowait_ok(file, flags)?;
         let pos = at.unwrap_or_else(|| file.get_pos());
-        let n = if flags.contains(RwFlags::DIRECT) && to.user_backed() {
+        let n = if flags.contains(RwFlags::DIRECT) && to.pinnable() {
             dio_read(file, to, pos, flags)?
         } else {
             read_at(file, to, pos, flags.nowait())?
@@ -647,7 +647,7 @@ impl FileOps for BlockFileOps {
         if !write_ok(file, from.len(), pos)? {
             return Ok(0);
         }
-        let direct = flags.contains(RwFlags::DIRECT) && from.user_backed();
+        let direct = flags.contains(RwFlags::DIRECT) && from.pinnable();
         if flags.nowait() && !direct {
             return Err(KernelError::OperationNotSupported);
         }

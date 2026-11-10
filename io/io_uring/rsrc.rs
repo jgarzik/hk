@@ -14,10 +14,9 @@ use alloc::vec::Vec;
 
 use crate::fs::iov::IoVec;
 use crate::fs::iov_iter::IovDest;
-use crate::mm::gup::{PageSeg, PinnedPages};
+use crate::mm::gup::{PinnedPages, PinnedSlice};
 use crate::task::Uid;
 use crate::util::error::{KernelError, KernelResult};
-use crate::util::smallvec::SmallVec;
 
 /// Most registered buffers (Linux IORING_MAX_REG_BUFFERS)
 pub const IORING_MAX_REG_BUFFERS: usize = 1 << 14;
@@ -109,36 +108,14 @@ impl RegBuf {
 
     /// The pieces of the `len` bytes at user address `addr` (Linux
     /// io_import_reg_buf): EFAULT outside the buffer
-    pub fn slice(&self, addr: u64, len: usize) -> KernelResult<SmallVec<PageSeg, 4>> {
+    pub fn slice(&self, addr: u64, len: usize) -> KernelResult<PinnedSlice<'_>> {
         let end = addr
             .checked_add(len as u64)
             .ok_or(KernelError::BadAddress)?;
         if addr < self.ubuf || end > self.ubuf + self.len {
             return Err(KernelError::BadAddress);
         }
-        let segs = self.pins.segs();
-        // Every piece but the first starts a page: index straight in
-        let abs = u64::from(segs[0].off) + (addr - self.ubuf);
-        let (mut i, mut at) = ((abs / PAGE) as usize, (abs % PAGE) as u32);
-        if i == 0 {
-            at -= segs[0].off;
-        }
-        let mut out = SmallVec::try_with_capacity((len as u64).div_ceil(PAGE) as usize + 1)?;
-        let mut left = len;
-        while left > 0 {
-            let s = segs[i];
-            let n = ((s.len - at) as usize).min(left);
-            out.push(PageSeg {
-                phys: s.phys,
-                off: s.off + at,
-                // Within a page: lossless
-                len: n as u32,
-            });
-            left -= n;
-            i += 1;
-            at = 0;
-        }
-        Ok(out)
+        self.pins.slice((addr - self.ubuf) as usize, len)
     }
 }
 

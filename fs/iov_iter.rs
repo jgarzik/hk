@@ -21,7 +21,7 @@ use crate::uaccess::{
 use crate::util::error::KernelError;
 
 use super::iov::IoVec;
-use crate::mm::gup::{PinnedPages, pin_user};
+use crate::mm::gup::{PageSeg, PinnedPages, PinnedSlice, pin_user};
 use crate::util::seg::step_back;
 
 /// Position in a list of user segments
@@ -228,9 +228,106 @@ pub fn mem_aligned(addr: u64, len: usize, mask: usize) -> bool {
     (addr | len as u64) & mask as u64 == 0
 }
 
+/// Position in pinned page pieces (Linux ITER_BVEC): piece `i`, byte
+/// `at` of it, `left` bytes to go
+struct Pieces<'a> {
+    segs: &'a [PageSeg],
+    i: usize,
+    at: usize,
+    left: usize,
+}
+
+impl<'a> Pieces<'a> {
+    fn new(segs: &'a [PageSeg]) -> Self {
+        Self {
+            segs,
+            i: 0,
+            at: 0,
+            left: segs.iter().map(|s| s.len as usize).sum(),
+        }
+    }
+
+    /// Up to `len` bytes, a piece at a time: `f(phys, off, n, done)`
+    /// copies `n` bytes at `off` of frame `phys`; the bytes stepped over
+    fn step(&mut self, len: usize, f: &mut dyn FnMut(u64, usize, usize, usize)) -> usize {
+        let mut done = 0;
+        while done < len && self.left > 0 {
+            let s = self.segs[self.i];
+            let n = (s.len as usize - self.at).min(len - done);
+            f(s.phys, s.off as usize + self.at, n, done);
+            done += n;
+            self.left -= n;
+            self.at += n;
+            if self.at == s.len as usize {
+                self.i += 1;
+                self.at = 0;
+            }
+        }
+        done
+    }
+
+    /// The bytes left's page offsets and lengths ORed (Linux
+    /// iov_iter_alignment_bvec)
+    fn alignment(&self) -> u64 {
+        let (mut res, mut size, mut skip) = (0u64, self.left, self.at);
+        for s in &self.segs[self.i..] {
+            if size == 0 {
+                break;
+            }
+            let len = (s.len as usize - skip).min(size);
+            res |= (s.off as usize + skip) as u64 | len as u64;
+            size -= len;
+            skip = 0;
+        }
+        res
+    }
+
+    /// Step back over `n` bytes
+    fn revert(&mut self, n: usize) {
+        step_back(|k| self.segs[k].len as usize, &mut self.i, &mut self.at, n);
+        self.left += n;
+    }
+
+    /// Pin the next pieces again (a direct I/O), at most `max` pages,
+    /// as `Segs::get_pages`: memory aligned to `mem_mask`, the total
+    /// cut to a multiple of `len_mask` + 1
+    fn get_pages(
+        &mut self,
+        max: usize,
+        mem_mask: usize,
+        len_mask: usize,
+    ) -> Result<PinnedPages, KernelError> {
+        // The rest of the current piece first, then whole ones
+        let mut rest: crate::util::smallvec::SmallVec<PageSeg, 4> =
+            crate::util::smallvec::SmallVec::try_with_capacity(max.min(self.segs.len() - self.i))?;
+        let mut k = self.i;
+        let mut left = self.left;
+        let mut at = self.at;
+        while left > 0 && rest.len() < max {
+            let s = self.segs[k];
+            let n = (s.len as usize - at).min(left);
+            rest.push(PageSeg {
+                phys: s.phys,
+                // Within a page: lossless
+                off: s.off + at as u32,
+                len: n as u32,
+            });
+            left -= n;
+            k += 1;
+            at = 0;
+        }
+        let pp = crate::mm::gup::repin(&rest, max, mem_mask, len_mask)?;
+        let n = pp.len();
+        self.step(n, &mut |_, _, _, _| {});
+        Ok(pp)
+    }
+}
+
 enum Dest<'a> {
     User(Segs<'a>),
     Kernel(&'a mut [u8]),
+    /// Pinned pages (a registered buffer: Linux ITER_BVEC)
+    Pages(Pieces<'a>),
 }
 
 /// Where a read puts its data (Linux ITER_DEST)
@@ -247,11 +344,17 @@ impl<'a> IovDest<'a> {
         Self(Dest::Kernel(buf))
     }
 
+    /// Pinned pages, pinned as long as the borrow (Linux ITER_BVEC)
+    pub fn pinned(p: &'a PinnedSlice<'_>) -> Self {
+        Self(Dest::Pages(Pieces::new(p.segs())))
+    }
+
     /// Room left
     pub fn len(&self) -> usize {
         match &self.0 {
             Dest::User(s) => s.left,
             Dest::Kernel(b) => b.len(),
+            Dest::Pages(p) => p.left,
         }
     }
 
@@ -267,12 +370,19 @@ impl<'a> IovDest<'a> {
                 let k = n.min(b.len());
                 *b = &mut core::mem::take(b)[..k];
             }
+            Dest::Pages(p) => p.left = p.left.min(n),
         }
     }
 
-    /// User memory (Linux user_backed_iter): only that is pinned
+    /// User memory (Linux user_backed_iter)
     pub fn user_backed(&self) -> bool {
         matches!(self.0, Dest::User(_))
+    }
+
+    /// Memory `get_pages` can pin for direct I/O: user memory, or pages
+    /// pinned already (Linux: ITER_UBUF/IOVEC and ITER_BVEC)
+    pub fn pinnable(&self) -> bool {
+        matches!(self.0, Dest::User(_) | Dest::Pages(_))
     }
 
     /// Pages the room left spans, at most `max` (Linux iov_iter_npages);
@@ -280,7 +390,8 @@ impl<'a> IovDest<'a> {
     pub fn npages(&self, max: usize) -> usize {
         match &self.0 {
             Dest::User(s) => s.npages(max),
-            _ => 0,
+            Dest::Pages(p) => (p.segs.len() - p.i).min(max),
+            Dest::Kernel(_) => 0,
         }
     }
 
@@ -289,6 +400,7 @@ impl<'a> IovDest<'a> {
     pub fn alignment(&self) -> u64 {
         match &self.0 {
             Dest::User(s) => s.alignment(),
+            Dest::Pages(p) => p.alignment(),
             Dest::Kernel([]) => 0,
             Dest::Kernel(b) => b.as_ptr() as u64 | b.len() as u64,
         }
@@ -305,7 +417,8 @@ impl<'a> IovDest<'a> {
     ) -> Result<PinnedPages, KernelError> {
         match &mut self.0 {
             Dest::User(s) => s.get_pages(true, max, mem_mask, len_mask),
-            _ => Err(KernelError::OperationNotSupported),
+            Dest::Pages(p) => p.get_pages(max, mem_mask, len_mask),
+            Dest::Kernel(_) => Err(KernelError::OperationNotSupported),
         }
     }
 
@@ -323,6 +436,11 @@ impl<'a> IovDest<'a> {
                 *b = tail;
                 n
             }
+            Dest::Pages(p) => p.step(data.len(), &mut |phys, off, n, at| {
+                // SAFETY: a piece of pinned frames (`pinned`'s borrow),
+                // within its page
+                unsafe { crate::mm::page::copy_to_frame_racy(phys, off, &data[at..at + n]) }
+            }),
         };
         if n == 0 && !data.is_empty() && !self.is_empty() {
             return Err(KernelError::BadAddress);
@@ -383,6 +501,8 @@ enum Source<'a> {
     User(Segs<'a>),
     /// The buffer and the bytes taken from it
     Kernel(&'a [u8], usize),
+    /// Pinned pages (a registered buffer: Linux ITER_BVEC)
+    Pages(Pieces<'a>),
 }
 
 /// Where a write takes its data from (Linux ITER_SOURCE)
@@ -399,11 +519,17 @@ impl<'a> IovSource<'a> {
         Self(Source::Kernel(buf, 0))
     }
 
+    /// Pinned pages, pinned as long as the borrow (Linux ITER_BVEC)
+    pub fn pinned(p: &'a PinnedSlice<'_>) -> Self {
+        Self(Source::Pages(Pieces::new(p.segs())))
+    }
+
     /// Bytes left
     pub fn len(&self) -> usize {
         match &self.0 {
             Source::User(s) => s.left,
             Source::Kernel(b, at) => b.len() - at,
+            Source::Pages(p) => p.left,
         }
     }
 
@@ -417,12 +543,19 @@ impl<'a> IovSource<'a> {
         match &mut self.0 {
             Source::User(s) => s.left = s.left.min(n),
             Source::Kernel(b, at) => *b = &b[..at.saturating_add(n).min(b.len())],
+            Source::Pages(p) => p.left = p.left.min(n),
         }
     }
 
-    /// User memory (Linux user_backed_iter): only that is pinned
+    /// User memory (Linux user_backed_iter)
     pub fn user_backed(&self) -> bool {
         matches!(self.0, Source::User(_))
+    }
+
+    /// Memory `get_pages` can pin for direct I/O: user memory, or pages
+    /// pinned already (Linux: ITER_UBUF/IOVEC and ITER_BVEC)
+    pub fn pinnable(&self) -> bool {
+        matches!(self.0, Source::User(_) | Source::Pages(_))
     }
 
     /// Pages the bytes left span, at most `max` (Linux iov_iter_npages);
@@ -430,7 +563,8 @@ impl<'a> IovSource<'a> {
     pub fn npages(&self, max: usize) -> usize {
         match &self.0 {
             Source::User(s) => s.npages(max),
-            _ => 0,
+            Source::Pages(p) => (p.segs.len() - p.i).min(max),
+            Source::Kernel(..) => 0,
         }
     }
 
@@ -439,6 +573,7 @@ impl<'a> IovSource<'a> {
     pub fn alignment(&self) -> u64 {
         match &self.0 {
             Source::User(s) => s.alignment(),
+            Source::Pages(p) => p.alignment(),
             Source::Kernel(b, at) if *at == b.len() => 0,
             Source::Kernel(b, at) => (b.as_ptr() as u64 + *at as u64) | (b.len() - at) as u64,
         }
@@ -455,7 +590,8 @@ impl<'a> IovSource<'a> {
     ) -> Result<PinnedPages, KernelError> {
         match &mut self.0 {
             Source::User(s) => s.get_pages(false, max, mem_mask, len_mask),
-            _ => Err(KernelError::OperationNotSupported),
+            Source::Pages(p) => p.get_pages(max, mem_mask, len_mask),
+            Source::Kernel(..) => Err(KernelError::OperationNotSupported),
         }
     }
 
@@ -464,7 +600,7 @@ impl<'a> IovSource<'a> {
     pub fn fault_in(&self, n: usize) -> usize {
         match &self.0 {
             Source::User(s) => s.fault_in(n),
-            Source::Kernel(..) => 0,
+            Source::Kernel(..) | Source::Pages(_) => 0,
         }
     }
 
@@ -473,6 +609,7 @@ impl<'a> IovSource<'a> {
         match &mut self.0 {
             Source::User(s) => s.revert(n),
             Source::Kernel(_, at) => *at -= n,
+            Source::Pages(p) => p.revert(n),
         }
     }
 
@@ -488,7 +625,7 @@ impl<'a> IovSource<'a> {
                 pagefault_enable();
                 c
             }),
-            Source::Kernel(..) => self.copy_from(buf).unwrap_or(0),
+            Source::Kernel(..) | Source::Pages(_) => self.copy_from(buf).unwrap_or(0),
         }
     }
 
@@ -520,6 +657,11 @@ impl<'a> IovSource<'a> {
                 *at += n;
                 n
             }
+            Source::Pages(p) => p.step(want, &mut |phys, off, n, at| {
+                // SAFETY: a piece of pinned frames (`pinned`'s borrow),
+                // within its page
+                unsafe { crate::mm::page::copy_from_frame_racy(&mut buf[at..at + n], phys, off) }
+            }),
         };
         if n == 0 && want != 0 && !self.is_empty() {
             return Err(KernelError::BadAddress);

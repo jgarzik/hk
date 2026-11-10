@@ -49,7 +49,7 @@ struct GeteventsArg {
     ts: u64,
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     let mut t = Timespec {
         tv_sec: 0,
         tv_nsec: 0,

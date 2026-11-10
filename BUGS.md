@@ -554,15 +554,14 @@ return 0 without moving the device (Linux: moved, or an error).
 
 - GETEVENTS ignores io_uring_getevents_arg's min_wait_usec (Linux
   IORING_FEAT_MIN_TIMEOUT) and IORING_ENTER_ABS_TIMER (EINVAL)
-- Only O_DIRECT reads and writes of a block device run
-  asynchronously; every other operation runs inline in io_uring_enter
-  under the submission lock: one that blocks (a read of an empty pipe
-  or socket) blocks the caller; Linux arms poll or punts it to io-wq
-  threads, which share the submitter's mm (hk's workers are kernel
-  threads: create_io_thread is missing). IOSQE_ASYNC punts only those
-  O_DIRECT requests. A link chain runs inline, to each member's end; an
-  IOSQE_IO_DRAIN request waits in io_uring_enter for every request in
-  flight (Linux queues it and returns)
+- What would block goes to io-wq workers that block where Linux arms
+  poll (a read of an empty pipe or socket, Linux IORING_FEAT_FAST_POLL):
+  one worker per blocked request; on an O_NONBLOCK pipe or socket the
+  worker's read is EAGAIN (Linux polls until it is ready). Workers run
+  with the credentials the submitter had when they were made (Linux:
+  the submitter's at submission). Link chains run in a worker, not
+  issued inline one by one; a chain with poll/timeout bookkeeping runs
+  in io_uring_enter
 - An asynchronous O_DIRECT write whose range cannot be dropped from
   the cache ends with EBUSY (Linux direct_write_fallback writes it
   through the cache); a queued request with offset -1 does not move the
@@ -581,10 +580,6 @@ return 0 without moving the device (Linux: moved, or an error).
   (IORING_ENTER_REGISTERED_RING), personalities, provided buffers,
   eventfd, buffer updates or tags (IORING_REGISTER_BUFFERS2,
   BUFFERS_UPDATE)
-- READ_FIXED/WRITE_FIXED that run inline (a file without asynchronous
-  O_DIRECT, a chain or drain member) go through the buffer's user
-  addresses, not its pinned pages (Linux's bvec iterator works after
-  the range is unmapped)
 
 ## Rare QEMU crash in the arm64 boot test (host CPU suspected)
 

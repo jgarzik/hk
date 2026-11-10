@@ -23,6 +23,7 @@
 
 pub mod abi;
 mod iowq;
+mod opreq;
 mod ops;
 mod rings;
 mod rsrc;
@@ -133,19 +134,29 @@ pub struct IoRing {
     cq_wait: WaitQueue,
     /// Asynchronous requests in flight (Linux ctx->refs as a count)
     inflight: AtomicU32,
-    /// Woken when `inflight` drops to zero (an IOSQE_IO_DRAIN waits)
+    /// Woken when `inflight` drops to zero
     idle: WaitQueue,
+    /// Requests held back by a drain (Linux defer_list), in order
+    defer: crate::sync::spin::Mutex<KDeque<Deferred>>,
 }
 
-/// The SQEs' link state across one submission: chains run in order,
-/// and a failed member cancels the rest of its chain (Linux
-/// IOSQE_IO_LINK; a hard link keeps going)
+/// The SQEs' link state across one submission: a chain's members are
+/// gathered, then run in order (Linux IOSQE_IO_LINK; a failed member
+/// cancels the rest unless it is hard-linked)
 #[derive(Default)]
 struct Link {
     /// Inside a chain
     on: bool,
-    /// A member of this chain failed
-    failed: bool,
+    /// Its members so far
+    sqes: KVec<IoUringSqe>,
+}
+
+/// A request a drain held back (Linux io_defer_entry)
+struct Deferred {
+    op: opreq::OpReq,
+    /// It is itself an IOSQE_IO_DRAIN request: it runs alone, after
+    /// everything before it, and before everything after it
+    drain: bool,
 }
 
 impl Submit {
@@ -197,6 +208,7 @@ impl IoRing {
             cq_wait: WaitQueue::new(),
             inflight: AtomicU32::new(0),
             idle: WaitQueue::new(),
+            defer: crate::sync::spin::Mutex::new(KDeque::new()),
         })
         // A failed allocation drops the ring it was given, whose Drop
         // gives the charge back: nothing to undo here
@@ -233,61 +245,231 @@ impl IoRing {
 
     /// Run one SQE and post its CQE (when it ends, for one queued): false
     /// if it failed before running (Linux io_init_req), which ends the
-    /// batch. A chain member, or a drain (which first waits for every
-    /// request in flight: Linux IOSQE_IO_DRAIN), runs to its end inline.
+    /// batch. A chain's members are gathered and run together (`chain`);
+    /// a drain, and what follows it while one is held back, waits on the
+    /// defer list for the requests before it (Linux io_drain_req).
     fn submit_sqe(self: &Arc<Self>, s: &mut Submit, sqe: &IoUringSqe, link: &mut Link) -> bool {
         let linked = sqe.flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK) != 0;
-        let hard = sqe.flags & IOSQE_IO_HARDLINK != 0;
+        if let Err(e) = init_check(sqe, self.iopoll) {
+            self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
+            // The chain it ended is cancelled with it
+            for m in core::mem::take(link).sqes.iter() {
+                self.post_cqe(m.user_data, KernelError::Canceled.to_errno_neg(), 0);
+            }
+            return false;
+        }
+        if link.on || linked {
+            if let Err(e) = link.sqes.try_push(*sqe) {
+                self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
+            }
+            link.on = linked;
+            if !linked {
+                let sqes = core::mem::take(&mut link.sqes);
+                self.chain(s, sqes);
+            }
+            return true;
+        }
         let drain = sqe.flags & IOSQE_IO_DRAIN != 0;
-        let init = init_check(sqe, self.iopoll);
-        if init.is_ok() && drain {
-            self.drain_wait();
+        if (drain || !self.defer.lock().is_empty()) && self.defer_sqe(s, sqe, drain) {
+            return true;
         }
-        let res = match init {
-            Err(e) => Err(e),
-            Ok(()) if link.failed && link.on => Err(KernelError::Canceled),
-            Ok(()) => match self.issue(s, sqe, link.on, linked || link.on || drain) {
-                Some(r) => r,
-                None => return true,
-            },
-        };
-        let res = res.unwrap_or_else(KernelError::to_errno_neg);
-        if res < 0 && (linked || link.on) && !hard {
-            link.failed = true;
+        if let Some(res) = self.issue(s, sqe) {
+            let res = res.unwrap_or_else(KernelError::to_errno_neg);
+            if sqe.flags & IOSQE_CQE_SKIP_SUCCESS == 0 || res < 0 {
+                self.post_cqe(sqe.user_data, res, 0);
+            }
         }
-        if linked {
-            link.on = true;
-        } else {
-            *link = Link::default();
-        }
-        if sqe.flags & IOSQE_CQE_SKIP_SUCCESS == 0 || res < 0 {
-            self.post_cqe(sqe.user_data, res, 0);
-        }
-        init.is_ok()
+        true
     }
 
-    /// Run the operation of `sqe` (`in_link`: a later member of a chain;
-    /// `inline`: to its end, nothing queued): its result, None if queued
-    fn issue(
-        self: &Arc<Self>,
-        s: &mut Submit,
-        sqe: &IoUringSqe,
-        in_link: bool,
-        inline: bool,
-    ) -> Option<KernelResult<i32>> {
-        Some(match sqe.opcode {
-            IORING_OP_READ => return rw::rw(self, s, sqe, false, Kind::Buf, inline),
-            IORING_OP_WRITE => return rw::rw(self, s, sqe, true, Kind::Buf, inline),
-            IORING_OP_READV => return rw::rw(self, s, sqe, false, Kind::Vec, inline),
-            IORING_OP_WRITEV => return rw::rw(self, s, sqe, true, Kind::Vec, inline),
-            IORING_OP_READ_FIXED => return rw::rw(self, s, sqe, false, Kind::Fixed, inline),
-            IORING_OP_WRITE_FIXED => return rw::rw(self, s, sqe, true, Kind::Fixed, inline),
-            // Valid only inside a chain; it arms nothing (BUGS "io_uring
-            // gaps")
-            IORING_OP_LINK_TIMEOUT if in_link => Ok(0),
-            IORING_OP_LINK_TIMEOUT => Err(KernelError::InvalidArgument),
-            _ => ops::issue(self, s, sqe).unwrap_or(Err(KernelError::InvalidArgument)),
-        })
+    /// Run the operation of `sqe`: its result, None if queued
+    fn issue(self: &Arc<Self>, s: &mut Submit, sqe: &IoUringSqe) -> Option<KernelResult<i32>> {
+        match sqe.opcode {
+            IORING_OP_READ => return rw::rw(self, s, sqe, false, Kind::Buf),
+            IORING_OP_WRITE => return rw::rw(self, s, sqe, true, Kind::Buf),
+            IORING_OP_READV => return rw::rw(self, s, sqe, false, Kind::Vec),
+            IORING_OP_WRITEV => return rw::rw(self, s, sqe, true, Kind::Vec),
+            IORING_OP_READ_FIXED => return rw::rw(self, s, sqe, false, Kind::Fixed),
+            IORING_OP_WRITE_FIXED => return rw::rw(self, s, sqe, true, Kind::Fixed),
+            // Valid only inside a chain
+            IORING_OP_LINK_TIMEOUT => return Some(Err(KernelError::InvalidArgument)),
+            _ => {}
+        }
+        let force = sqe.flags & IOSQE_ASYNC != 0;
+        match ops::how(sqe.opcode) {
+            ops::How::Inline => {
+                Some(ops::issue(self, s, sqe).unwrap_or(Err(KernelError::InvalidArgument)))
+            }
+            ops::How::TryNoWait if !force => match ops::try_nowait(sqe) {
+                Err(KernelError::WouldBlock) => rw::punt(self, sqe, opreq::Body::Op),
+                r => Some(r),
+            },
+            ops::How::TryNoWait | ops::How::Punt => rw::punt(self, sqe, opreq::Body::Op),
+        }
+    }
+
+    /// A worker's request for `sqe`, not yet in flight: what it needs of
+    /// the submission resolved now (a read or write's file, iovecs or
+    /// registered buffer; Linux io_prep_rw), a failure kept as its result
+    fn prep(self: &Arc<Self>, s: &Submit, sqe: &IoUringSqe) -> KernelResult<opreq::OpReq> {
+        let t = tctx::tctx()?;
+        let rw = match sqe.opcode {
+            IORING_OP_READ | IORING_OP_READV | IORING_OP_READ_FIXED => Some(false),
+            IORING_OP_WRITE | IORING_OP_WRITEV | IORING_OP_WRITE_FIXED => Some(true),
+            _ => None,
+        };
+        let body = match rw {
+            Some(write) => rw::prep_body(self, s, sqe, write).unwrap_or_else(opreq::Body::Failed),
+            None => opreq::Body::Op,
+        };
+        Ok(opreq::OpReq::new(self, &t, *sqe, body))
+    }
+
+    /// Run a link chain (Linux IOSQE_IO_LINK): its members in order, in a
+    /// worker; with an operation that needs the submission state (the
+    /// poll/timeout bookkeeping) it runs here instead
+    fn chain(self: &Arc<Self>, s: &mut Submit, sqes: KVec<IoUringSqe>) {
+        if sqes.iter().any(|q| needs_submit(q.opcode)) {
+            return self.chain_inline(s, &sqes);
+        }
+        let mut c = match KVec::try_with_capacity(sqes.len()) {
+            Ok(c) => c,
+            Err(e) => return self.fail_all(&sqes, e),
+        };
+        let mut unbound = false;
+        for q in sqes.iter() {
+            match self.prep(s, q) {
+                Ok(mut o) => {
+                    unbound |= o.unbound();
+                    o.count();
+                    // Room was reserved
+                    let _ = c.try_push(o);
+                }
+                Err(e) => return self.fail_all(&sqes, e),
+            }
+        }
+        let wq = tctx::tctx().and_then(|t| t.io_wq());
+        match wq.and_then(|wq| iowq::Work::new(iowq::WorkKind::Chain(c)).map(|w| (wq, w))) {
+            Ok((wq, w)) => wq.queue(w, unbound),
+            Err(e) => self.fail_all(&sqes, e),
+        }
+    }
+
+    /// A chain run in io_uring_enter, its members to their ends in order
+    fn chain_inline(self: &Arc<Self>, s: &mut Submit, sqes: &[IoUringSqe]) {
+        let mut failed = false;
+        for q in sqes {
+            let res = if failed {
+                Err(KernelError::Canceled)
+            } else if q.opcode == IORING_OP_LINK_TIMEOUT {
+                // It arms nothing (BUGS "io_uring gaps")
+                Ok(0)
+            } else if ops::how(q.opcode) == ops::How::Inline {
+                ops::issue(self, s, q).unwrap_or(Err(KernelError::InvalidArgument))
+            } else {
+                // Anything else to its end, here (a read or write: a short
+                // one breaks the chain)
+                match self.prep(s, q) {
+                    Ok(o) => {
+                        failed = o.run_linked();
+                        continue;
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            let res = res.unwrap_or_else(KernelError::to_errno_neg);
+            if res < 0 && q.flags & IOSQE_IO_HARDLINK == 0 {
+                failed = true;
+            }
+            if q.flags & IOSQE_CQE_SKIP_SUCCESS == 0 || res < 0 {
+                self.post_cqe(q.user_data, res, 0);
+            }
+        }
+    }
+
+    /// Fail every SQE of `sqes` with `e`
+    fn fail_all(&self, sqes: &[IoUringSqe], e: KernelError) {
+        for q in sqes {
+            self.post_cqe(q.user_data, e.to_errno_neg(), 0);
+        }
+    }
+
+    /// Hold `sqe` back on the defer list (Linux io_drain_req): false if
+    /// it may run now (nothing in flight or held back)
+    fn defer_sqe(self: &Arc<Self>, s: &Submit, sqe: &IoUringSqe, drain: bool) -> bool {
+        {
+            let d = self.defer.lock();
+            if d.is_empty() && self.inflight.load(Ordering::Acquire) == 0 {
+                return false;
+            }
+        }
+        let o = match self.prep(s, sqe) {
+            Ok(o) => o,
+            Err(e) => {
+                self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
+                return true;
+            }
+        };
+        // Made in the owner now: the flush may come from anywhere
+        if let Err(e) = o.tctx().io_wq() {
+            self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
+            return true;
+        }
+        let pushed = self.defer.lock().try_push_back(Deferred { op: o, drain });
+        if let Err(e) = pushed {
+            self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
+            return true;
+        }
+        // Its predecessors may have ended meanwhile
+        self.flush_defer();
+        true
+    }
+
+    /// With nothing in flight, queue what the defer list holds up to the
+    /// next drain: a drain alone, else every request before the next one
+    /// (Linux io_queue_deferred)
+    fn flush_defer(&self) {
+        let first = {
+            let mut d = self.defer.lock();
+            if self.inflight.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            match d.pop_front() {
+                Some(f) => f,
+                None => return,
+            }
+        };
+        let drain = first.drain;
+        self.queue_deferred(first.op);
+        if drain {
+            return;
+        }
+        // In flight now: the rest before the next drain go too
+        loop {
+            let next = {
+                let mut d = self.defer.lock();
+                if d.front().is_none_or(|f| f.drain) {
+                    return;
+                }
+                d.pop_front()
+            };
+            if let Some(n) = next {
+                self.queue_deferred(n.op);
+            }
+        }
+    }
+
+    /// Queue a held-back request on its submitter's io-wq
+    fn queue_deferred(&self, mut o: opreq::OpReq) {
+        let unbound = o.unbound();
+        o.count();
+        let Some(wq) = o.tctx().io_wq_get() else {
+            return o.cancel();
+        };
+        // A failed box drops the request: its CQE is lost (no memory)
+        if let Ok(w) = iowq::Work::new(iowq::WorkKind::Op(o)) {
+            wq.queue(w, unbound);
+        }
     }
 
     /// One more asynchronous request in flight
@@ -295,36 +477,11 @@ impl IoRing {
         self.inflight.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One fewer; the last wakes a drain
+    /// One fewer; the last lets the held-back requests go
     fn inflight_put(&self) {
         if self.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.idle.wake_all();
-        }
-    }
-
-    /// Wait until no request is in flight (IOSQE_IO_DRAIN; Linux defers
-    /// the drained request instead of waiting: BUGS), finishing the
-    /// caller's own as they end
-    fn drain_wait(&self) {
-        loop {
-            crate::task::task_work::task_work_run();
-            if self.inflight.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            // Polled requests end only by polling
-            if self.iopoll {
-                self.poll_once();
-            }
-            // Woken at zero; a tick bounds the wait for the caller's own
-            // ended requests, which kick its callback, not this queue
-            let me = current();
-            self.idle.wait_event_timeout(
-                || {
-                    self.inflight.load(Ordering::Acquire) == 0
-                        || me.has_tif(crate::task::tif::NOTIFY_SIGNAL)
-                },
-                1,
-            );
+            self.flush_defer();
         }
     }
 
@@ -538,6 +695,18 @@ impl IoRing {
     fn sq_head(&self) -> u32 {
         self.rings.sq_head()
     }
+}
+
+/// The poll/timeout bookkeeping, which needs the submission state
+fn needs_submit(op: u8) -> bool {
+    matches!(
+        op,
+        IORING_OP_POLL_ADD
+            | IORING_OP_POLL_REMOVE
+            | IORING_OP_TIMEOUT
+            | IORING_OP_TIMEOUT_REMOVE
+            | IORING_OP_ASYNC_CANCEL
+    )
 }
 
 /// The checks an SQE fails before it is queued (Linux io_init_req):

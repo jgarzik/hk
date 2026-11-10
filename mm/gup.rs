@@ -159,6 +159,102 @@ impl Drop for PinnedPages {
     }
 }
 
+/// Part of a `PinnedPages`, the `len` bytes from byte `off` of its
+/// pieces (a registered buffer's range: Linux io_import_reg_buf's bvec):
+/// pinned as long as the borrow
+pub struct PinnedSlice<'a> {
+    segs: SmallVec<PageSeg, INLINE_PAGES>,
+    _pins: core::marker::PhantomData<&'a PinnedPages>,
+}
+
+impl PinnedSlice<'_> {
+    /// Its pieces
+    pub fn segs(&self) -> &[PageSeg] {
+        &self.segs
+    }
+
+    /// The pieces, owned: the caller keeps the `PinnedPages` alive as
+    /// long as it uses them (an asynchronous I/O holding its buffer)
+    pub fn into_segs(self) -> SmallVec<PageSeg, INLINE_PAGES> {
+        self.segs
+    }
+}
+
+impl PinnedPages {
+    /// The pieces of bytes [off, off + len) of what is pinned (EFAULT
+    /// past the end). Every piece but the first starts a page, so the
+    /// first one is found by index.
+    pub fn slice(&self, off: usize, len: usize) -> Result<PinnedSlice<'_>, KernelError> {
+        const P: usize = PAGE_SIZE as usize;
+        if off.checked_add(len).is_none_or(|e| e > self.len()) {
+            return Err(KernelError::BadAddress);
+        }
+        let mut out = SmallVec::try_with_capacity(len.div_ceil(P) + 1)?;
+        if len == 0 {
+            return Ok(PinnedSlice {
+                segs: out,
+                _pins: core::marker::PhantomData,
+            });
+        }
+        let first = self.segs[0].off as usize;
+        let abs = first + off;
+        let (mut i, mut at) = (abs / P, abs % P);
+        if i == 0 {
+            at -= first;
+        }
+        let mut left = len;
+        while left > 0 {
+            let s = self.segs[i];
+            let n = (s.len as usize - at).min(left);
+            out.push(PageSeg {
+                phys: s.phys,
+                // Within a page: lossless
+                off: s.off + at as u32,
+                len: n as u32,
+            });
+            left -= n;
+            i += 1;
+            at = 0;
+        }
+        Ok(PinnedSlice {
+            segs: out,
+            _pins: core::marker::PhantomData,
+        })
+    }
+}
+
+/// Pin again `segs`, at most `max` pages, pages already pinned (a
+/// registered buffer's) for one direct I/O that may outlive the first
+/// pin (Linux: a bvec's pages, referenced by the bio): each piece's
+/// memory aligned to `mem_mask` (EINVAL), the total cut to a multiple
+/// of `len_mask` + 1; the pins and the bytes they cover
+pub fn repin(
+    segs: &[PageSeg],
+    max: usize,
+    mem_mask: usize,
+    len_mask: usize,
+) -> Result<PinnedPages, KernelError> {
+    let n = segs.len().min(max);
+    let mut out = PinnedPages::new(n)?;
+    for s in &segs[..n] {
+        if (s.off as usize | s.len as usize) & mem_mask != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        if !FRAME_ALLOCATOR.get_refs(s.phys, GUP_PIN_COUNTING_BIAS) {
+            return Err(KernelError::OutOfMemory);
+        }
+        // Room was reserved for `n` pages in both: no allocation
+        out.segs.push(*s);
+        out.owners.push(None);
+    }
+    let excess = out.len() & len_mask;
+    out.trim(excess);
+    if out.is_empty() {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(out)
+}
+
 /// The VMA of `addr` if pages of it may be pinned (Linux
 /// check_vma_flags): a write needs a writable mapping, a read a readable
 /// one; EFAULT otherwise
