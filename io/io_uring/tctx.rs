@@ -23,7 +23,7 @@ use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::current;
 use crate::task::task_work::{CallbackHead, TaskWork, task_work_add, task_work_run};
-use crate::util::error::KernelResult;
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
 use crate::util::kmem::KVec;
 use crate::util::list::ArcList;
@@ -43,8 +43,83 @@ pub struct Tctx {
     /// -> io_iopoll_try_reap_events)
     polled: crate::sync::spin::Mutex<KVec<Weak<IoRing>>>,
     /// Its io-wq, made by its first request that needs one and gone at
-    /// exit or exec (Linux tctx->io_wq)
-    io_wq: crate::sync::spin::Mutex<Option<Arc<IoWq>>>,
+    /// exit or exec (Linux tctx->io_wq, tctx->in_cancel)
+    io_wq: WqSlot<IoWq>,
+}
+
+/// A task's io-wq and whether a cancel began (Linux tctx->io_wq,
+/// tctx->in_cancel). A cancel keeps the io-wq in place, refusing work
+/// (ECANCELED), until it is done; then it goes, and none is made again
+/// after exit (Linux io_queue_iowq: no io_wq, -ECANCELED); after exec
+/// the task may make a new one (Linux frees the tctx).
+struct WqSlot<T> {
+    s: crate::sync::spin::Mutex<SlotState<T>>,
+}
+
+struct SlotState<T> {
+    wq: Option<Arc<T>>,
+    in_cancel: bool,
+}
+
+impl<T> WqSlot<T> {
+    const fn new() -> Self {
+        Self {
+            s: crate::sync::spin::Mutex::new(SlotState {
+                wq: None,
+                in_cancel: false,
+            }),
+        }
+    }
+
+    /// The io-wq, made by `make` (unlocked: it allocates) if there is
+    /// none; ECANCELED during or after a cancel without one
+    fn get_or_make(&self, make: impl FnOnce() -> KernelResult<Arc<T>>) -> KernelResult<Arc<T>> {
+        if let Some(wq) = self.get_live()? {
+            return Ok(wq);
+        }
+        let new = make()?;
+        let mut s = self.s.lock();
+        if let Some(wq) = s.wq.as_ref() {
+            return Ok(wq.clone());
+        }
+        if s.in_cancel {
+            return Err(KernelError::Canceled);
+        }
+        s.wq = Some(new.clone());
+        Ok(new)
+    }
+
+    /// The io-wq if there is one; ECANCELED if none may be made
+    fn get_live(&self) -> KernelResult<Option<Arc<T>>> {
+        let s = self.s.lock();
+        match s.wq.as_ref() {
+            Some(wq) => Ok(Some(wq.clone())),
+            None if s.in_cancel => Err(KernelError::Canceled),
+            None => Ok(None),
+        }
+    }
+
+    fn get(&self) -> Option<Arc<T>> {
+        self.s.lock().wq.clone()
+    }
+
+    /// A cancel begins (Linux io_uring_cancel_generic: in_cancel): the
+    /// io-wq to cancel, which stays in place
+    fn cancel_start(&self) -> Option<Arc<T>> {
+        let mut s = self.s.lock();
+        s.in_cancel = true;
+        s.wq.clone()
+    }
+
+    /// The cancel is done (Linux io_uring_clean_tctx): the io-wq goes,
+    /// returned to drop unlocked; at exec (`exec`) a new one may be made
+    fn cancel_end(&self, exec: bool) -> Option<Arc<T>> {
+        let mut s = self.s.lock();
+        if exec {
+            s.in_cancel = false;
+        }
+        s.wq.take()
+    }
 }
 
 impl TaskWork for Tctx {
@@ -67,7 +142,7 @@ impl Tctx {
             inflight: AtomicU32::new(0),
             idle: WaitQueue::new(),
             polled: crate::sync::spin::Mutex::new(KVec::new()),
-            io_wq: crate::sync::spin::Mutex::new(None),
+            io_wq: WqSlot::new(),
         })?;
         // Named weakly: a queued callback never keeps the context alive
         let weak: Weak<dyn TaskWork> = Arc::downgrade(&t) as Weak<Self>;
@@ -110,20 +185,16 @@ impl Tctx {
     }
 
     /// Its io-wq (made by the owner: the first caller is its
-    /// submission, as after an exec)
+    /// submission, as after an exec); ECANCELED once the task's cancel
+    /// began without one
     pub fn io_wq(&self) -> KernelResult<Arc<IoWq>> {
-        if let Some(wq) = self.io_wq.lock().as_ref() {
-            return Ok(wq.clone());
-        }
-        // Made unlocked (it allocates); a racing maker's wins
-        let new = IoWq::new()?;
-        Ok(self.io_wq.lock().get_or_insert(new).clone())
+        self.io_wq.get_or_make(IoWq::new)
     }
 
     /// Its io-wq if it has one (from a context other than the owner's,
     /// which cannot make one)
     pub fn io_wq_get(&self) -> Option<Arc<IoWq>> {
-        self.io_wq.lock().clone()
+        self.io_wq.get()
     }
 
     /// Note that the task issued polled requests on `r`
@@ -150,12 +221,13 @@ impl Tctx {
     }
 
     /// Finish requests until none of the task's is in flight, polling
-    /// its IOPOLL rings meanwhile
-    fn cancel(&self) {
+    /// its IOPOLL rings meanwhile (`exec`: the task goes on)
+    fn cancel(&self, exec: bool) {
         // Its workers first: queued work ends, running work is
-        // interrupted, and they are gone
-        let wq = self.io_wq.lock().take();
-        if let Some(wq) = wq {
+        // interrupted, and they are gone. The io-wq stays, refusing
+        // work: a request queued meanwhile (a reissue as it ends) ends
+        // ECANCELED, and no new io-wq starts workers that outlive this
+        if let Some(wq) = self.io_wq.cancel_start() {
             wq.cancel();
         }
         loop {
@@ -172,14 +244,16 @@ impl Tctx {
                 1,
             );
         }
+        drop(self.io_wq.cancel_end(exec));
     }
 }
 
 /// Wait out the current task's requests in flight (Linux
-/// io_uring_files_cancel at exit, io_uring_task_cancel at exec)
-pub fn task_cancel() {
+/// io_uring_files_cancel at exit, io_uring_task_cancel at exec:
+/// `exec`)
+pub fn task_cancel(exec: bool) {
     if let Some(t) = current().io_uring.get() {
-        t.cancel();
+        t.cancel(exec);
     }
 }
 
@@ -223,5 +297,29 @@ mod tests {
         drop(keep);
         prune(&mut l);
         assert!(l.is_empty());
+    }
+
+    /// A request queued while (or after) the task cancels gets the
+    /// cancelled io-wq or ECANCELED, never a new one; exec allows one
+    #[test]
+    fn no_new_io_wq_in_cancel() {
+        let slot: WqSlot<u32> = WqSlot::new();
+        let first = slot.get_or_make(|| Ok(Arc::new(1))).unwrap();
+        let wq = slot.cancel_start().unwrap();
+        assert!(Arc::ptr_eq(&wq, &first));
+        let again = slot
+            .get_or_make(|| panic!("new io-wq during cancel"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&again, &first));
+        assert!(slot.cancel_end(false).is_some());
+        let after = slot.get_or_make(|| panic!("new io-wq after exit"));
+        assert_eq!(after.err(), Some(KernelError::Canceled));
+        // No io-wq when the cancel began: none is made during it either
+        let s2: WqSlot<u32> = WqSlot::new();
+        assert!(s2.cancel_start().is_none());
+        let r = s2.get_or_make(|| panic!("new io-wq during cancel"));
+        assert_eq!(r.err(), Some(KernelError::Canceled));
+        assert!(s2.cancel_end(true).is_none());
+        assert_eq!(*s2.get_or_make(|| Ok(Arc::new(2))).unwrap(), 2);
     }
 }

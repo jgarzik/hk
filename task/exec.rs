@@ -1213,7 +1213,7 @@ where
     }
     // Its io_uring requests end before the new image (Linux
     // begin_new_exec: io_uring_task_cancel)
-    crate::io::io_uring::task_cancel();
+    crate::io::io_uring::task_cancel(true);
     // Handlers, alternate stack and timers of the old image go
     if let Err(e) = crate::signal::exec_signals() {
         exec_fatal();
