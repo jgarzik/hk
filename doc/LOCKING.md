@@ -2006,7 +2006,7 @@ pub struct Inode {
 `Inode`. One `IrqSpinlock` per bucket (a RAM-sized table), a leaf:
 under it only the bucket vector, `Weak` counts and the filesystem's
 `test` (which may take `Inode.private`, a spin RwLock, then vfat's
-`VfatInode` data, a spin Mutex leaf held only to copy the data in or
+`VfatInode.d`, a spin Mutex leaf held only to copy the data in or
 out; never taken from an interrupt). IRQ-safe
 because a last reference could go anywhere. The hash holds `Weak`s;
 an inode upgraded under a bucket lock is never dropped there (its last
@@ -2019,6 +2019,17 @@ cluster freeing of an unlinked file on `SYSTEM_WQ`
 (`Workqueue.inner`, IrqSpinlock leaf). Deviation from Linux: no
 unused-inode LRU or I_NEW state (an inode is complete before it is
 hashed; the losing builder's inode is dropped unhashed).
+
+**vfat chain cache** (`fs/vfat/cache.rs`, Linux fs/fat/cache.c):
+`VfatInode.cache` (spin Mutex, Linux cache_lru_lock), a leaf in
+thread context only, held just to look up or add a run of the file's
+clusters, never together with `VfatInode.d` and never across the FAT
+reads: a walk (`read_folio`/`writepage` under a page lock, the write
+and truncate paths under `i_rwsem`) takes it to find where to start,
+reads the FAT through the device cache with no lock held, then takes
+it again to cache what it found. Cutting the chain (`free_past`, under
+`i_rwsem`) invalidates the cache first and bumps its id; a walk that
+began under the old id caches nothing.
 
 **Dentry** (`fs/dentry.rs`):
 

@@ -255,7 +255,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   unlock `fs/ramfs/cpio.rs` `unpack_cpio` (hard links, overwrite rules), `fs/dac.rs` inode
   checks, and parts of namei (`walk`, `follow_dotdot`) if `FsStruct` root can be
   injected instead of read from the current task.
-- **vfat on a RAM block device**: cluster-chain and directory code in `fs/vfat.rs`
+- **vfat on a RAM block device**: cluster-chain and directory code in `fs/vfat/`
   goes through `BlockDevice` reads; with `block/ramdisk.rs` and a tiny embedded FAT32
   image, `read_cluster_chain` (loop cap, bad cluster), `read_directory_entries` (LFN
   checksum mismatch, deleted entries) and `find_free_dir_slots` become testable.

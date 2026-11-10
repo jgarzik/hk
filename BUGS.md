@@ -257,7 +257,7 @@ lo (hk has no checksum offload states).
 ## O_DIRECT gaps
 
 **Location**: `fs/blkdev_ops.rs`, `block/dio.rs`, `block/blkdev.rs`,
-`fs/vfat.rs`
+`fs/vfat/`
 
 - vfat O_DIRECT still reads and writes through the page cache: no
   alignment checks (EINVAL), no cache bypass (Linux fat_direct_IO).
@@ -796,16 +796,9 @@ mode, a short power-button press does nothing). Only the 32-bit FADT
 block fields are read (no X_ GAS forms, no hardware-reduced ACPI), and
 a reset register in PCI configuration space is ignored.
 
-## vfat file I/O walks the whole cluster chain per page
+## vfat st_blksize
 
-**Location**: `fs/vfat.rs` (`page_runs`)
-
-Every read_folio, writepage and swap_rw of a vfat file rebuilds its
-whole cluster chain from the FAT (through the device cache) to find a
-page's clusters, so reading or writing back a file is quadratic in its
-size. Linux
-fat_get_cluster keeps a per-inode cache of chain positions
-(fat_cache); one is needed before large vfat files or vfat swap files.
+**Location**: `fs/stat.rs` (`blksize`)
 
 st_blksize and stx_blksize of a vfat file are the page size; Linux
 fat_getattr reports the cluster size (`fs/stat.rs` `blksize`).
@@ -813,7 +806,7 @@ fat_getattr reports the cluster size (`fs/stat.rs` `blksize`).
 ## Block layer gaps
 
 **Location**: `block/`, `hw/virtio/blk.rs`,
-`fs/blkdev_ops.rs`, `fs/vfat.rs`
+`fs/blkdev_ops.rs`, `fs/vfat/`
 
 - Partition tables are parsed in 512-byte sectors: on a disk with
   larger logical blocks, GPT LBAs and MBR sector counts are misread

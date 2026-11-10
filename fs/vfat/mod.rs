@@ -35,6 +35,8 @@ use super::superblock::{
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
 
+mod cache;
+
 // ============================================================================
 // VFAT file pages (Linux fat_aops: fat_read_folio, fat_writepages)
 // ============================================================================
@@ -45,44 +47,17 @@ use crate::util::kalloc::{arc_nofail, try_arc};
 /// allocated, Linux clean_bdev_aliases)
 pub struct VfatAops;
 
-/// The disk runs (byte offset, length) holding bytes [pos, pos + len)
-/// of the file whose cluster chain is `chain`, within its clusters
-fn disk_runs(sb: &VfatSbData, chain: &[u32], pos: u64, len: usize) -> Vec<(u64, usize)> {
-    let cs = u64::from(sb.cluster_size);
-    let mut runs: Vec<(u64, usize)> = Vec::new();
-    let mut at = pos;
-    let end = pos + len as u64;
-    while at < end {
-        let Some(&c) = chain.get((at / cs) as usize) else {
-            break;
-        };
-        let off = cluster_to_offset(sb, c) + at % cs;
-        let n = (cs - at % cs).min(end - at) as usize;
-        match runs.last_mut() {
-            Some((o, l)) if *o + *l as u64 == off => *l += n,
-            _ => runs.push((off, n)),
-        }
-        at += n as u64;
-    }
-    runs
-}
-
 /// A page's device and the disk runs holding its bytes
 type PageRuns = (Arc<BlockDevice>, Vec<(u64, usize)>);
 
-/// The runs on disk holding the page's bytes within the file
+/// The runs on disk holding the page's bytes within the file (one walk
+/// of its chain from the nearest cached position, `cache::extents`)
 fn page_runs(inode: &Inode, index: u64) -> Result<PageRuns, KernelError> {
     let sb = inode.superblock().ok_or(KernelError::Io)?;
     let sb_data = get_sb_data(&sb)?;
-    let d = get_inode_data(inode)?;
     let pos = index * PAGE_SIZE as u64;
     let valid = inode.get_size().saturating_sub(pos).min(PAGE_SIZE as u64) as usize;
-    let chain = if d.start_cluster == 0 || valid == 0 {
-        Vec::new()
-    } else {
-        read_cluster_chain(&sb_data, d.start_cluster)?
-    };
-    let runs = disk_runs(&sb_data, &chain, pos, valid);
+    let runs = cache::extents(&sb_data, inode, pos, valid)?;
     Ok((sb_data.bdev.clone(), runs))
 }
 
@@ -167,16 +142,15 @@ fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(),
     let d = get_inode_data(inode)?;
     let cs = u64::from(sb_data.cluster_size);
     let need = size.div_ceil(cs) as usize;
-    let chain = if d.start_cluster != 0 {
-        read_cluster_chain(sb_data, d.start_cluster)?
-    } else {
-        Vec::new()
+    // The chain's length and last cluster (Linux fat_chain_add)
+    let (have, last) = match cache::last_cluster(sb_data, inode)? {
+        Some((f, d)) => (f as usize + 1, d),
+        None => (0, 0),
     };
-    if need <= chain.len() {
+    if need <= have {
         return Ok(());
     }
-    let last = chain.last().copied().unwrap_or(0);
-    let first = extend_cluster_chain(sb_data, last, need - chain.len())?;
+    let first = extend_cluster_chain(sb_data, last, need - have)?;
     if d.start_cluster == 0 && first != 0 {
         if d.parent_cluster != 0 && inode.get_nlink() != 0 {
             update_dir_entry_by_short_name(
@@ -257,7 +231,7 @@ fn vfat_write(
 fn write_failed(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
     let d = get_inode_data(inode)?;
     let keep = inode.get_size().div_ceil(u64::from(sb_data.cluster_size)) as usize;
-    let start = free_past(sb_data, d.start_cluster, keep)?;
+    let start = free_past(sb_data, inode, d.start_cluster, keep)?;
     if start != d.start_cluster {
         set_inode_data(
             inode,
@@ -271,21 +245,34 @@ fn write_failed(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> 
     Ok(())
 }
 
-/// Free the clusters of the chain at `start` past its first `keep`
-/// (Linux fat_free_clusters from fat_truncate_blocks); the chain's new
-/// first cluster (0: none left)
-fn free_past(sb_data: &VfatSbData, start: u32, keep: usize) -> Result<u32, KernelError> {
+/// Free the clusters of `inode`'s chain at `start` past its first
+/// `keep`, its cached positions forgotten first (Linux fat_free from
+/// fat_truncate_blocks); the chain's new first cluster (0: none left)
+fn free_past(
+    sb_data: &VfatSbData,
+    inode: &Inode,
+    start: u32,
+    keep: usize,
+) -> Result<u32, KernelError> {
     if start == 0 {
         return Ok(0);
     }
+    cache::inval(inode)?;
     if keep == 0 {
         free_cluster_chain(sb_data, start)?;
         return Ok(0);
     }
-    let chain = read_cluster_chain(sb_data, start)?;
-    if keep < chain.len() {
-        set_fat_entry(sb_data, chain[keep - 1], FAT_EOC)?;
-        free_cluster_chain(sb_data, chain[keep])?;
+    let want = u32::try_from(keep - 1).map_err(|_| KernelError::Io)?;
+    let Some((f, last)) = cache::get_cluster(sb_data, inode, want)? else {
+        return Ok(start);
+    };
+    if f < want {
+        return Ok(start);
+    }
+    let next = get_fat_entry(sb_data, last)?;
+    if !is_end_of_chain(next) {
+        set_fat_entry(sb_data, last, FAT_EOC)?;
+        free_cluster_chain(sb_data, next)?;
     }
     Ok(start)
 }
@@ -717,7 +704,12 @@ pub struct VfatInodeData {
 /// A vfat inode's `Inode.private`: its data, changed in place (a
 /// cluster allocated or freed, a rename) so those paths allocate
 /// nothing; a leaf lock, held only to copy the data
-pub struct VfatInode(crate::sync::spin::Mutex<VfatInodeData>);
+pub struct VfatInode {
+    d: crate::sync::spin::Mutex<VfatInodeData>,
+    /// Cluster chain positions (Linux cache_lru_lock): a leaf, held
+    /// only to look a run up or add one, never with `d`
+    cache: crate::sync::spin::Mutex<cache::FatCache>,
+}
 
 impl InodeData for VfatInode {}
 
@@ -729,18 +721,25 @@ impl AsAny for VfatInode {
 
 /// A new inode's private data
 fn new_private(d: VfatInodeData) -> Result<Arc<VfatInode>, KernelError> {
-    try_arc(VfatInode(crate::sync::spin::Mutex::new(d)))
+    try_arc(VfatInode {
+        d: crate::sync::spin::Mutex::new(d),
+        cache: cache::new_cache(),
+    })
 }
 
 /// Replace `inode`'s data (Linux updates msdos_inode_info in place)
 fn set_inode_data(inode: &Inode, d: VfatInodeData) -> Result<(), KernelError> {
+    with_vi(inode, |v| *v.d.lock() = d)
+}
+
+/// Run `f` on `inode`'s `VfatInode`
+fn with_vi<R>(inode: &Inode, f: impl FnOnce(&VfatInode) -> R) -> Result<R, KernelError> {
     let private = inode.get_private().ok_or(KernelError::Io)?;
     let v = private
         .as_any()
         .downcast_ref::<VfatInode>()
         .ok_or(KernelError::Io)?;
-    *v.0.lock() = d;
-    Ok(())
+    Ok(f(v))
 }
 
 // ============================================================================
@@ -779,12 +778,7 @@ fn get_sb_data(sb: &Arc<SuperBlock>) -> Result<VfatSbData, KernelError> {
 
 /// A copy of `inode`'s VFAT data
 fn get_inode_data(inode: &Inode) -> Result<VfatInodeData, KernelError> {
-    let private = inode.get_private().ok_or(KernelError::Io)?;
-    let v = private
-        .as_any()
-        .downcast_ref::<VfatInode>()
-        .ok_or(KernelError::Io)?;
-    Ok(*v.0.lock())
+    with_vi(inode, |v| *v.d.lock())
 }
 
 /// Read a FAT entry for a cluster
@@ -1939,7 +1933,8 @@ impl InodeOps for VfatInodeOps {
         let cs = u64::from(sb_data.cluster_size);
         if length < old {
             filemap::truncate_setsize(inode, length);
-            let start = free_past(&sb_data, d.start_cluster, length.div_ceil(cs) as usize)?;
+            let keep = length.div_ceil(cs) as usize;
+            let start = free_past(&sb_data, inode, d.start_cluster, keep)?;
             // The clusters are freed on disk: the inode follows
             set_inode_data(
                 inode,
