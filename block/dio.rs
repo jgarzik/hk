@@ -366,30 +366,55 @@ impl Cursor {
     fn room(&self, segs: &[PageSeg], lim: &QueueLimits) -> usize {
         let mut n = 0;
         let mut c = *self;
-        c.fill(segs, lim, &mut |_| n += 1);
+        c.fill(segs, lim, &mut |_, grow| n += usize::from(!grow));
         n
     }
 
     /// Give `f` the next bio's segments of `segs`, as many as the limits
     /// allow (max_sectors, max_segments, segments of at most
-    /// max_segment_size), stepping over them; the bytes
-    fn fill(&mut self, segs: &[PageSeg], lim: &QueueLimits, f: &mut dyn FnMut(BioSeg)) -> usize {
+    /// max_segment_size), stepping over them; the bytes. A piece
+    /// physically contiguous with the last segment grows it, up to
+    /// max_segment_size (Linux biovec_phys_mergeable): `f` gets it with
+    /// `grow` set, and it takes no segment of its own
+    fn fill(
+        &mut self,
+        segs: &[PageSeg],
+        lim: &QueueLimits,
+        f: &mut dyn FnMut(BioSeg, bool),
+    ) -> usize {
         let max_bytes = (lim.max_sectors as usize) << SECTOR_SHIFT;
         let seg_max = (lim.max_segment_size as usize).max(1);
         let (mut bytes, mut nr) = (0, 0);
+        // The last segment's end address and length
+        let mut last: Option<(u64, usize)> = None;
         while let Some(s) = segs.get(self.i) {
-            if nr >= lim.max_segments as usize || bytes >= max_bytes {
+            if bytes >= max_bytes {
                 break;
             }
-            let n = (s.len as usize - self.at)
-                .min(seg_max)
-                .min(max_bytes - bytes);
-            f(BioSeg {
-                frame: s.phys,
-                offset: s.off as usize + self.at,
-                len: n,
-            });
-            nr += 1;
+            let at = s.phys + u64::from(s.off) + self.at as u64;
+            let left = (s.len as usize - self.at).min(max_bytes - bytes);
+            let room = match last {
+                Some((end, len)) if end == at => seg_max - len,
+                _ => 0,
+            };
+            let grow = room > 0;
+            if !grow && nr >= lim.max_segments as usize {
+                break;
+            }
+            let n = left.min(if grow { room } else { seg_max });
+            f(
+                BioSeg {
+                    frame: s.phys,
+                    offset: s.off as usize + self.at,
+                    len: n,
+                },
+                grow,
+            );
+            if !grow {
+                nr += 1;
+            }
+            let len = if grow { last.map_or(0, |l| l.1) + n } else { n };
+            last = Some((at + n as u64, len));
             bytes += n;
             self.at += n;
             if self.at == s.len as usize {
@@ -401,9 +426,9 @@ impl Cursor {
     }
 
     /// The next bio's segments of `segs` into `out`: as many bytes as
-    /// the limits allow (max_sectors, max_segments, segments of at most
-    /// max_segment_size), cut back to whole logical blocks (Linux
-    /// bio_split_rw_at); the bytes. EINVAL if not one block fits.
+    /// the limits allow (`fill`: physically contiguous pieces merged),
+    /// cut back to whole logical blocks (Linux bio_split_rw_at); the
+    /// bytes. EINVAL if not one block fits.
     pub fn next_bio(
         &mut self,
         segs: &[PageSeg],
@@ -411,7 +436,10 @@ impl Cursor {
         out: &mut BioSegs,
     ) -> Result<usize, KernelError> {
         out.clear();
-        let bytes = self.fill(segs, lim, &mut |s| out.push(s));
+        let bytes = self.fill(segs, lim, &mut |s, grow| match out.last_mut() {
+            Some(l) if grow => l.len += s.len,
+            _ => out.push(s),
+        });
         let excess = bytes % lim.logical_block_size as usize;
         step_back(|k| segs[k].len as usize, &mut self.i, &mut self.at, excess);
         trim_tail(out, excess, |s| s.len, |s, l| s.len = l, drop);
@@ -437,13 +465,13 @@ mod tests {
         }
     }
 
-    /// Pieces of `lens` bytes, page i at 0x1000 * (i + 1), at offset
-    /// `off` in the first page
+    /// Pieces of `lens` bytes, page i at 0x2000 * (i + 1) (never
+    /// contiguous), at offset `off` in the first page
     fn pieces(lens: &[u32], off: u32) -> Vec<PageSeg> {
         lens.iter()
             .enumerate()
             .map(|(i, &len)| PageSeg {
-                phys: 0x1000 * (i as u64 + 1),
+                phys: 0x2000 * (i as u64 + 1),
                 off: if i == 0 { off } else { 0 },
                 len,
             })
@@ -500,6 +528,30 @@ mod tests {
             bios(&segs, &lim(1024, 1, 4096, 4096)).err(),
             Some(KernelError::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn contiguous_pages_merge() {
+        // Pages 1, 2, 3 contiguous, then 5, 6
+        let segs: Vec<PageSeg> = [1u64, 2, 3, 5, 6]
+            .iter()
+            .map(|&p| PageSeg {
+                phys: p * 0x1000,
+                off: 0,
+                len: 4096,
+            })
+            .collect();
+        let b = bios(&segs, &lim(1024, 32, u32::MAX, 512)).unwrap();
+        assert_eq!(b, [(20480, alloc::vec![12288, 8192])]);
+        // Merged up to max_segment_size, then a segment of its own
+        let b = bios(&segs, &lim(1024, 32, 8192, 512)).unwrap();
+        assert_eq!(b[0].1, [8192, 4096, 8192]);
+        // A merge needs no free segment: one segment holds it all
+        let b = bios(&segs[..3], &lim(1024, 1, u32::MAX, 512)).unwrap();
+        assert_eq!(b, [(12288, alloc::vec![12288])]);
+        // max_sectors still cuts
+        let b = bios(&segs[..3], &lim(16, 32, u32::MAX, 512)).unwrap();
+        assert_eq!(b, [(8192, alloc::vec![8192]), (4096, alloc::vec![4096])]);
     }
 
     #[test]

@@ -155,7 +155,7 @@ fn disk_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
             format!("{}\n", b.disk.queue.limits.max_sectors / 2)
         }),
         (b"max_hw_sectors_kb", |b| {
-            format!("{}\n", b.disk.queue.limits.max_sectors / 2)
+            format!("{}\n", b.disk.queue.limits.max_hw_sectors / 2)
         }),
         (b"max_segments", |b| {
             format!("{}\n", b.disk.queue.limits.max_segments)

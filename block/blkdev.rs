@@ -66,6 +66,9 @@ pub mod major {
 pub const SECTOR_SIZE: u64 = 512;
 pub const SECTOR_SHIFT: u32 = 9;
 const PAGE: usize = 4096;
+/// Default cap on a request's sectors when the device has none (Linux
+/// BLK_DEF_MAX_SECTORS_CAP: 4 MiB)
+pub const BLK_DEF_MAX_SECTORS_CAP: u32 = (4 << 20) >> SECTOR_SHIFT;
 
 // ============================================================================
 // Major numbers (Linux register_blkdev)
@@ -283,8 +286,11 @@ impl BioList {
 pub struct QueueLimits {
     pub logical_block_size: u32,
     pub physical_block_size: u32,
-    /// Largest request in sectors
+    /// Largest request in sectors the block layer builds (Linux
+    /// max_sectors, from max_hw_sectors in blk_validate_limits)
     pub max_sectors: u32,
+    /// Largest request in sectors the device takes
+    pub max_hw_sectors: u32,
     pub max_segments: u32,
     pub max_segment_size: u32,
     /// Seeks cost (Linux !QUEUE_FLAG_NONROT)
@@ -311,6 +317,7 @@ impl Default for QueueLimits {
             logical_block_size: 512,
             physical_block_size: 512,
             max_sectors: 128, // 64 KiB
+            max_hw_sectors: 128,
             max_segments: 32,
             max_segment_size: PAGE as u32,
             rotational: true,
