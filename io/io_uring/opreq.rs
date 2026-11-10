@@ -18,6 +18,8 @@ use super::rsrc::RegBuf;
 use super::tctx::Tctx;
 use crate::fs::file::{File, RwFlags};
 use crate::fs::iov::IoVec;
+use crate::task::percpu::current;
+use crate::task::{Cred, override_creds};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kmem::KVec;
 
@@ -49,18 +51,23 @@ pub struct OpReq {
     tctx: Arc<Tctx>,
     pub sqe: IoUringSqe,
     body: Body,
+    /// The submitter's credentials at submission, which the worker runs
+    /// it with (Linux io_prep_async_work: req->creds, REQ_F_CREDS)
+    creds: Arc<Cred>,
     /// Counted in flight (`count`), given back at the drop
     counted: bool,
 }
 
 impl OpReq {
-    /// A request for `sqe` doing `body`, not yet in flight
+    /// A request for `sqe` doing `body`, not yet in flight; made by the
+    /// submitter, whose credentials it keeps
     pub fn new(ring: &Arc<IoRing>, tctx: &Arc<Tctx>, sqe: IoUringSqe, body: Body) -> Self {
         Self {
             ring: ring.clone(),
             tctx: tctx.clone(),
             sqe,
             body,
+            creds: current().cred_arc(),
             counted: false,
         }
     }
@@ -89,9 +96,12 @@ impl OpReq {
         }
     }
 
-    /// Run it, blocking: its result, a restart code as EINTR (Linux
-    /// io_fixup_restart_res: submitted SQEs cannot be restarted)
+    /// Run it, blocking, with the submitter's credentials (Linux
+    /// io_issue_sqe: override_creds(req->creds)): its result, a restart
+    /// code as EINTR (Linux io_fixup_restart_res: submitted SQEs cannot
+    /// be restarted)
     fn exec(&self) -> KernelResult<i32> {
+        let _creds = override_creds(self.creds.clone());
         let r = match &self.body {
             Body::Op => super::ops::run_blocking(&self.sqe),
             Body::Rw {

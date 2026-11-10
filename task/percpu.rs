@@ -1238,16 +1238,17 @@ impl core::ops::Deref for Cur {
 }
 
 impl Cur {
-    /// Its credentials, copied (Linux current_cred)
+    /// Its credentials, copied (Linux current_cred: an override in
+    /// force, `task::override_creds`, else its own)
     pub fn cred(&self) -> Cred {
         // SAFETY: the task itself
-        unsafe { self.task.cred() }
+        unsafe { self.task.subj_cred() }
     }
 
-    /// A reference to its credentials
+    /// A reference to its credentials (as `cred`)
     pub fn cred_arc(&self) -> Arc<Cred> {
         // SAFETY: the task itself
-        unsafe { self.task.cred_arc() }
+        unsafe { self.task.subj_cred_arc() }
     }
 
     /// Its address space (an mm_count reference)
@@ -5055,7 +5056,10 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
     if me.tid() == 0 {
         return; // The boot task keeps its static root credentials
     }
-    let old = me.cred();
+    // Its own credentials, not an override in force (Linux commit_creds
+    // replaces real_cred and cred together)
+    // SAFETY: the task itself
+    let old = unsafe { Task::cred(&me) };
 
     // Changing euid/egid/fsuid/fsgid makes the task non-dumpable
     // (suid_dumpable, default 0), so a less-privileged identity can't ptrace

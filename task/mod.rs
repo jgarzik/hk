@@ -1065,6 +1065,11 @@ pub struct Task {
     /// TASKLIST by others; replaced only by the task (commit_creds)
     /// under TASKLIST
     cred: TaskCred,
+    /// Subjective credentials in force over `cred` (Linux task->cred
+    /// when it differs from real_cred: override_creds), null for none;
+    /// the task's own checks use them, others see `cred`. Only the task
+    /// itself reads or writes it.
+    cred_override: CredOverride,
     /// Linux task_lock(p) (p->alloc_lock): guards the cells below. Spin
     /// Mutex, thread context only; order TASKLIST -> pidmap ->
     /// alloc_lock -> `sig`; only memory is freed under it (rule 4: the
@@ -1610,6 +1615,79 @@ impl Drop for TaskCred {
     }
 }
 
+/// A task's override credentials: an `Arc<Cred>` turned raw, or null
+/// (Linux task->cred while override_creds is in force). Only the task
+/// itself touches it, so the atomic is for the type only.
+struct CredOverride(AtomicPtr<Cred>);
+
+impl CredOverride {
+    const fn none() -> Self {
+        Self(AtomicPtr::new(core::ptr::null_mut()))
+    }
+
+    /// Install `p` (from `Arc::into_raw`, or null): the one in force
+    /// before, its count passed to the caller
+    fn swap(&self, p: *mut Cred) -> *mut Cred {
+        self.0.swap(p, Ordering::Relaxed)
+    }
+
+    /// # Safety
+    /// The caller is the task itself.
+    unsafe fn arc(&self) -> Option<Arc<Cred>> {
+        let p = self.0.load(Ordering::Relaxed);
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: `p` came from Arc::into_raw and holds the cell's
+        // count; only this task (the caller) could replace it
+        unsafe {
+            Arc::increment_strong_count(p);
+            Some(Arc::from_raw(p))
+        }
+    }
+}
+
+impl Drop for CredOverride {
+    fn drop(&mut self) {
+        let p = *self.0.get_mut();
+        if !p.is_null() {
+            // SAFETY: the cell's count (an override guard was forgotten)
+            drop(unsafe { Arc::from_raw(p) });
+        }
+    }
+}
+
+/// The current task's override credentials in force (Linux
+/// override_creds): reverted to those before when dropped
+/// (revert_creds). A forgotten guard leaves them in force.
+#[must_use]
+pub struct CredGuard {
+    /// The override before, with its count (null: none)
+    old: *mut Cred,
+}
+
+/// Run the current task's own checks with `c` until the guard drops
+/// (Linux override_creds); its objective credentials, which others see,
+/// stay as they are. Guards nest; the boot task keeps its static root
+/// credentials.
+pub fn override_creds(c: Arc<Cred>) -> CredGuard {
+    let me = percpu::current();
+    CredGuard {
+        old: me.cred_override.swap(Arc::into_raw(c).cast_mut()),
+    }
+}
+
+impl Drop for CredGuard {
+    fn drop(&mut self) {
+        let me = percpu::current();
+        let p = me.cred_override.swap(self.old);
+        if !p.is_null() {
+            // SAFETY: the count `override_creds` installed with it
+            drop(unsafe { Arc::from_raw(p) });
+        }
+    }
+}
+
 /// The initial `alloc_lock` fields of a new task (the resources are
 /// attached after it joins the table, before it first runs)
 pub struct TaskAlloc {
@@ -1804,6 +1882,7 @@ impl Task {
             vfork_done: AtomicPtr::new(core::ptr::null_mut()),
             wake_q: AtomicPtr::new(core::ptr::null_mut()),
             cred: TaskCred::new(cred),
+            cred_override: CredOverride::none(),
             alloc_lock: Mutex::new(()),
             mm: OwnCell::new(mm),
             files: OwnCell::new(None),
@@ -1874,6 +1953,7 @@ impl Task {
             vfork_done: AtomicPtr::new(core::ptr::null_mut()),
             wake_q: AtomicPtr::new(core::ptr::null_mut()),
             cred: TaskCred::boot(),
+            cred_override: CredOverride::none(),
             alloc_lock: Mutex::new(()),
             mm: OwnCell::new(None),
             files: OwnCell::new(None),
@@ -1970,6 +2050,33 @@ impl Task {
     pub unsafe fn cred_arc(&self) -> Arc<Cred> {
         // SAFETY: see above
         unsafe { self.cred.arc() }
+    }
+
+    /// The credentials its own checks use: an override in force, else
+    /// its credentials (Linux current_cred vs real_cred)
+    ///
+    /// # Safety
+    /// The caller is the task itself.
+    pub unsafe fn subj_cred_arc(&self) -> Arc<Cred> {
+        // SAFETY: the task itself (see above)
+        match unsafe { self.cred_override.arc() } {
+            Some(c) => c,
+            // SAFETY: as above
+            None => unsafe { self.cred.arc() },
+        }
+    }
+
+    /// As [`Task::subj_cred_arc`], copied
+    ///
+    /// # Safety
+    /// As [`Task::subj_cred_arc`].
+    pub unsafe fn subj_cred(&self) -> Cred {
+        // SAFETY: the task itself (see above)
+        match unsafe { self.cred_override.arc() } {
+            Some(c) => (*c).clone(),
+            // SAFETY: as above
+            None => unsafe { self.cred.get() },
+        }
     }
 
     /// Take its `alloc_lock` (Linux task_lock(p))

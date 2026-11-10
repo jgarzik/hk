@@ -14,6 +14,10 @@
 //! - IO_URING_FIXED_PAGES: READ_FIXED of a buffered file fills the
 //!   registered buffer's pinned pages, not whatever is mapped at its
 //!   address now (Linux ITER_BVEC)
+//! - IO_URING_WORKER_CRED: a request punted to a worker made while the
+//!   submitter was root runs with the submitter's credentials at
+//!   submission (Linux io_prep_async_work's req->creds): after a drop to
+//!   an unprivileged uid, an openat of a 0600 root file is EACCES
 
 use super::dio::Buf;
 use super::wait::now_ms;
@@ -21,24 +25,27 @@ use super::{Ring, sqe};
 use crate::harness::{R, check, report_r};
 use crate::helpers::{msleep, read_file};
 use hk_syscall::{
-    IORING_ENTER_GETEVENTS, IORING_OP_NOP, IORING_OP_READ, IORING_OP_READ_FIXED,
-    IORING_REGISTER_BUFFERS, IoVec, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ, PROT_WRITE,
-    sys_close, sys_exit, sys_fork, sys_io_uring_register, sys_kill, sys_memfd_create, sys_mmap,
-    sys_pipe2, sys_wait4, sys_write,
+    AT_FDCWD, IORING_ENTER_GETEVENTS, IORING_OP_NOP, IORING_OP_OPENAT, IORING_OP_READ,
+    IORING_OP_READ_FIXED, IORING_REGISTER_BUFFERS, IoVec, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE,
+    O_CREAT, O_RDONLY, O_WRONLY, PROT_READ, PROT_WRITE, sys_close, sys_exit, sys_fchmod, sys_fork,
+    sys_io_uring_register, sys_kill, sys_memfd_create, sys_mmap, sys_openat, sys_pipe2,
+    sys_setresuid, sys_unlink, sys_wait4, sys_write,
 };
 
 const IOSQE_IO_DRAIN: u8 = 1 << 1;
 const IOSQE_IO_LINK: u8 = 1 << 2;
 const IOSQE_ASYNC: u8 = 1 << 4;
+const EACCES: i64 = -13;
 
 pub fn run_tests() {
-    let cases: [(&[u8], fn() -> R); 6] = [
+    let cases: [(&[u8], fn() -> R); 7] = [
         (b"IO_URING_PUNT_PIPE", punt_pipe),
         (b"IO_URING_ASYNC_WORKER", async_worker),
         (b"IO_URING_PUNT_EXIT", punt_exit),
         (b"IO_URING_DRAIN", drain),
         (b"IO_URING_LINK", link),
         (b"IO_URING_FIXED_PAGES", fixed_pages),
+        (b"IO_URING_WORKER_CRED", worker_cred),
     ];
     for (name, t) in cases {
         report_r(name, t());
@@ -349,5 +356,72 @@ fn fixed_pages() -> R {
         )
     })();
     sys_close(fd as u64);
+    res
+}
+
+const CRED_OPEN: &[u8] = b"/tmp/uring_cred_open\0";
+const CRED_ROOT: &[u8] = b"/tmp/uring_cred_root\0";
+
+/// An IOSQE_ASYNC openat of `path` read-only through `r`: its result
+fn async_open(r: &mut Ring, path: &[u8], ud: u64) -> i64 {
+    let mut s = sqe(IORING_OP_OPENAT, AT_FDCWD, path.as_ptr() as u64, 0, 0, ud);
+    s.op_flags = O_RDONLY;
+    s.flags = IOSQE_ASYNC;
+    r.push(s);
+    if r.enter(1, 0, 0) != 1 || wait(r, 1) != 0 {
+        return -1000;
+    }
+    r.pop().map_or(-1001, |c| i64::from(c.res))
+}
+
+/// In a root child: a worker made by an openat as root, then a drop to
+/// uid 65534; exit code 0 if the punted openat of the root file is
+/// EACCES
+fn cred_child() -> u64 {
+    let Ok(mut r) = Ring::simple(4) else { return 1 };
+    let fd = async_open(&mut r, CRED_OPEN, 1);
+    if fd < 0 {
+        return 2;
+    }
+    sys_close(fd as u64);
+    if sys_setresuid(65534, 65534, 65534) != 0 {
+        return 3;
+    }
+    // The submitter itself is refused
+    let d = sys_openat(AT_FDCWD, CRED_ROOT.as_ptr(), O_RDONLY, 0);
+    if d != EACCES {
+        return 4;
+    }
+    match async_open(&mut r, CRED_ROOT, 2) {
+        EACCES => 0,
+        n if n >= 0 => 5,
+        _ => 6,
+    }
+}
+
+/// A file at `path` with `mode`, made as root
+fn make_file(path: &[u8], mode: u32) -> R {
+    let fd = sys_openat(AT_FDCWD, path.as_ptr(), O_CREAT | O_WRONLY, mode);
+    check(b"create", fd >= 0, fd)?;
+    sys_fchmod(fd as i32, mode);
+    sys_close(fd as u64);
+    Ok(())
+}
+
+fn worker_cred() -> R {
+    let res = (|| {
+        make_file(CRED_OPEN, 0o644)?;
+        make_file(CRED_ROOT, 0o600)?;
+        let pid = sys_fork();
+        if pid == 0 {
+            sys_exit(cred_child());
+        }
+        check(b"fork", pid > 0, pid)?;
+        let mut st = 0;
+        sys_wait4(pid, &mut st, 0, 0);
+        check(b"child", st >> 8 == 0, i64::from(st >> 8))
+    })();
+    sys_unlink(CRED_OPEN.as_ptr());
+    sys_unlink(CRED_ROOT.as_ptr());
     res
 }

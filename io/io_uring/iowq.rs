@@ -7,8 +7,12 @@
 //! back is queued on its submitter's io-wq and run to its end, blocking,
 //! by a worker (Linux io_queue_iowq -> io_wq_enqueue). Workers are io
 //! threads of the submitter's process (`task::percpu::create_io_thread`,
-//! Linux create_io_thread): they share its mm, descriptors, fs context
-//! and credentials, so they run any operation the submitter could.
+//! Linux create_io_thread): they share its mm, descriptors and fs
+//! context. Each request runs with the credentials its submitter had
+//! when it was queued (`task::override_creds`, Linux io_prep_async_work's
+//! req->creds and io_issue_sqe's override_creds), not the worker's own,
+//! which are the owner's at the worker's creation: a submitter that
+//! dropped privilege since does not get it back through a worker.
 //!
 //! Two pools (Linux io_wq_acct): bounded work (regular files and block
 //! devices), at most four workers per CPU, and unbounded work (pipes,

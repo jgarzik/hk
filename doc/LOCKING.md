@@ -915,6 +915,7 @@ serializes wakers (3.1), `Task.sig` holds the per-task signal state
 | `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task: an intrusive `ArcList` (Linux init_task.tasks) holding a `TaskRef` (`Arc<Task>`) each, found by tid through the pid hash (`Pid.task`, set and cleared under the write lock) |
 | Per-CPU `curr` | `*const Task` in PerCpu | The running task (no lock) |
 | `Task.cred` | `Arc<Cred>` (raw) | Reference-counted credentials |
+| `Task.cred_override` | `Arc<Cred>` (raw) or null | Override credentials, the task's own (no lock) |
 
 **Pids** (`task/pid.rs`, Linux 4.14 pidmap): a `Pid` holds one
 number per pid-namespace level. Numbers come from a lock-free bitmap
@@ -1106,6 +1107,12 @@ Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
    (`current().cred()`, Linux current_cred); other tasks read them under
    TASKLIST; only the task itself replaces them (`commit_creds`, under
    TASKLIST), so a lock-free owner read never races a writer
+4. **Override** - `Task.cred_override` (Linux task->cred apart from
+   real_cred) is touched by the task alone, no lock: `override_creds`
+   installs an `Arc<Cred>` its own checks use (`current().cred()`)
+   until the guard drops (revert_creds); others keep reading
+   `Task.cred`. io-wq workers run each request under the submitter's
+   credentials of its submission this way
 
 **Credential APIs (like Linux):**
 - `prepare_creds()` - Clone current credentials, return mutable copy

@@ -37,6 +37,7 @@ use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::mm::gup::{PageSeg, PinnedPages, PinnedSlice};
 use crate::task::percpu::TaskRef;
 use crate::task::percpu::current;
+use crate::task::{Cred, override_creds};
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
@@ -395,6 +396,9 @@ pub struct Req {
     tctx: Arc<Tctx>,
     /// The submitter: finishes the request in its context
     task: TaskRef,
+    /// The submitter's credentials at submission: a worker's blocking
+    /// issue runs with them (Linux req->creds)
+    creds: Arc<Cred>,
     user_data: u64,
     skip_success: bool,
     file: Arc<File>,
@@ -445,6 +449,7 @@ impl Req {
             ring: r.clone(),
             tctx: tctx.clone(),
             task: crate::task::percpu::task_ref(&current()),
+            creds: current().cred_arc(),
             user_data: sqe.user_data,
             skip_success: sqe.flags & IOSQE_CQE_SKIP_SUCCESS != 0,
             file: file.clone(),
@@ -505,7 +510,10 @@ impl Req {
     /// Issue it blocking (an io-wq worker; Linux io_wq_submit_work): its
     /// end comes through `complete` either way
     pub fn issue_blocking(self: Arc<Self>) {
-        match self.issue(false) {
+        let creds = override_creds(self.creds.clone());
+        let r = self.issue(false);
+        drop(creds);
+        match r {
             Ok(None) => {}
             Ok(Some(n)) => self.complete(Ok(n)),
             Err(e) => self.complete(Err(e)),
