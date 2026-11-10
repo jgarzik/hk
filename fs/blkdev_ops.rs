@@ -119,6 +119,40 @@ fn dio_read(
     }
 }
 
+/// O_DIRECT I/O of `io`'s pinned memory at `pos`, started without
+/// waiting (Linux blkdev_read_iter / blkdev_write_iter with an async
+/// IOCB_DIRECT kiocb: blkdev_direct_IO -> -EIOCBQUEUED): the checks of
+/// a read (0 at or past the end) or write (`write_ok`), cut at the end
+/// of the device, the cache over the range written back (a write: and
+/// dropped) first, then the bios (`dio::submit_async`). RWF_NOWAIT:
+/// EAGAIN where that would wait. A write whose range cannot be dropped
+/// from the cache is EBUSY (Linux falls back to a buffered write: BUGS)
+fn dio_submit_async(
+    file: &File,
+    io: Arc<dyn dio::AsyncIo>,
+    pos: u64,
+    write: bool,
+    flags: RwFlags,
+) -> Result<Option<usize>, KernelError> {
+    nowait_ok(file, flags)?;
+    let len: usize = io.segs().iter().map(|s| s.len as usize).sum();
+    let b = bdev(file)?;
+    if write {
+        if !write_ok(file, len, pos)? {
+            return Ok(Some(0));
+        }
+    } else if pos >= b.capacity() || len == 0 {
+        return Ok(Some(0));
+    }
+    let count = len.min((b.capacity() - pos).min(usize::MAX as u64) as usize);
+    if write {
+        invalidate_pages(&b, pos, count, flags.nowait())?;
+    } else {
+        write_and_wait(&b, pos, count, flags.nowait())?;
+    }
+    dio::submit_async(&b, io, pos, count, write, flags).map(|()| None)
+}
+
 /// Last byte of `count` (> 0) bytes at `pos`
 fn last(pos: u64, count: usize) -> u64 {
     pos + count as u64 - 1
@@ -523,6 +557,23 @@ impl FileOps for BlockFileOps {
     /// Always (Linux bdev_open sets FMODE_CAN_ODIRECT)
     fn can_odirect(&self, _file: &File) -> bool {
         true
+    }
+
+    /// Always (Linux __blkdev_direct_IO_async)
+    fn can_async_dio(&self, _file: &File) -> bool {
+        true
+    }
+
+    /// The asynchronous O_DIRECT path (`dio_submit_async`)
+    fn dio_submit(
+        &self,
+        file: &File,
+        io: Arc<dyn dio::AsyncIo>,
+        pos: u64,
+        write: bool,
+        flags: RwFlags,
+    ) -> Result<Option<usize>, KernelError> {
+        dio_submit_async(file, io, pos, write, flags)
     }
 
     /// The device's page cache maps (Linux blkdev_mmap); a read-only

@@ -3216,6 +3216,11 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
     // robust futexes), which needs this CPU's rq lock.
     if tid != 0 {
+        // Its io_uring requests end first, so none outlives the task
+        // (Linux do_exit: io_uring_files_cancel); then no callback can
+        // be queued on it any more (Linux exit_task_work)
+        crate::io::io_uring::task_cancel();
+        crate::task::task_work::exit_task_work();
         // Linux exit_signals sets PF_EXITING first, then hands the
         // group signals this thread would have taken to another
         set_exiting();

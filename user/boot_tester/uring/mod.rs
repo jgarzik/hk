@@ -1,6 +1,7 @@
 //! io_uring tests through the mapped rings (Linux io_uring/*.c,
 //! liburing's ring layout), raw syscalls only
 
+pub mod dio;
 pub mod ring;
 pub mod setup;
 pub mod wait;
@@ -20,6 +21,7 @@ pub fn run_tests() {
     setup::run_tests();
     ring::run_tests();
     wait::run_tests();
+    dio::run_tests();
 }
 
 /// One mapped region

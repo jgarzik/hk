@@ -8,6 +8,7 @@ pub mod kcmp;
 pub mod membarrier;
 pub mod pidfd;
 pub(crate) mod rlimit;
+pub mod task_work;
 pub mod wake_q;
 pub mod workqueue;
 
@@ -923,6 +924,10 @@ pub mod tif {
     /// (Linux SYSCALL_WORK_SYSCALL_TRACE; set and cleared by the tracer
     /// while the task is stopped)
     pub const SYSCALL_TRACE: u32 = 1 << 4;
+    /// Callbacks are queued (`task_work`): run them on the way back
+    /// to user mode; an interruptible sleep ends for it (Linux
+    /// TIF_NOTIFY_SIGNAL)
+    pub const NOTIFY_SIGNAL: u32 = 1 << 5;
 }
 
 /// A task (thread or process; Linux task_struct), shared as
@@ -1031,6 +1036,12 @@ pub struct Task {
     /// Files `defer_fput` still has to drop while an outer frame of this
     /// task drains (Linux task_work fput); only the task itself uses it
     pub fput_defer: crate::sync::spin::Mutex<Option<Vec<Arc<crate::fs::File>>>>,
+    /// Callbacks queued to run in this task's context (Linux
+    /// task_works; `task_work`)
+    pub task_works: task_work::TaskWorks,
+    /// Its io_uring context, made by its first submission (Linux
+    /// task->io_uring)
+    pub io_uring: spin::Once<Arc<crate::io::io_uring::Tctx>>,
     /// The vforking parent's completion until this task execs or exits
     /// (Linux vfork_done): set by the parent before the task runs, taken
     /// once by the task
@@ -1775,6 +1786,8 @@ impl Task {
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
+            task_works: task_work::TaskWorks::new(),
+            io_uring: spin::Once::new(),
             vfork_done: AtomicPtr::new(core::ptr::null_mut()),
             wake_q: AtomicPtr::new(core::ptr::null_mut()),
             cred: TaskCred::new(cred),
@@ -1842,6 +1855,8 @@ impl Task {
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
+            task_works: task_work::TaskWorks::new(),
+            io_uring: spin::Once::new(),
             vfork_done: AtomicPtr::new(core::ptr::null_mut()),
             wake_q: AtomicPtr::new(core::ptr::null_mut()),
             cred: TaskCred::boot(),

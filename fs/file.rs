@@ -422,6 +422,31 @@ pub trait FileOps: Send + Sync {
         DEFAULT_POLLMASK
     }
 
+    /// O_DIRECT I/O on `file` can be started without waiting
+    /// (`dio_submit`; Linux: ->read_iter/->write_iter return -EIOCBQUEUED
+    /// for an async IOCB_DIRECT kiocb). Default: no.
+    fn can_async_dio(&self, _file: &File) -> bool {
+        false
+    }
+
+    /// Start O_DIRECT I/O of `io`'s pinned memory at `pos`, a read from
+    /// the file or (`write`) a write to it, with the I/O flags `flags`
+    /// (Linux blkdev_direct_IO on an async kiocb): Ok(None) when queued
+    /// (`io` completes later, from any context), Ok(Some(n)) when done at
+    /// once (n bytes: nothing to do, the end of the file); an error means
+    /// nothing was started (EAGAIN with RWF_NOWAIT where it would wait).
+    /// Only called when `can_async_dio`.
+    fn dio_submit(
+        &self,
+        _file: &File,
+        _io: Arc<dyn crate::block::dio::AsyncIo>,
+        _pos: u64,
+        _write: bool,
+        _flags: RwFlags,
+    ) -> Result<Option<usize>, KernelError> {
+        Err(KernelError::OperationNotSupported)
+    }
+
     /// O_DIRECT may be set on `file`, asked once at the end of its open
     /// (Linux FMODE_CAN_ODIRECT: the mapping has ->direct_IO, or ->open
     /// sets it). Default: no.

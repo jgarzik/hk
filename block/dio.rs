@@ -35,18 +35,23 @@
 //! REQ_NOWAIT); a queue without NOWAIT support never gets here (the
 //! file refuses RWF_NOWAIT, EOPNOTSUPP).
 
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 use crate::fs::file::RwFlags;
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::mm::gup::{PageSeg, PinnedPages};
 use crate::sync::completion::Completion;
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_box as box_try;
 use crate::util::kmem::KVec;
 use crate::util::seg::{step_back, trim_tail};
+use crate::util::smallvec::SmallVec;
 
 use super::blkdev::{
-    Bio, BioFlags, BioOp, BioSeg, BioSegs, BlockDevice, QueueLimits, SECTOR_SHIFT, submit_bio,
+    Bio, BioFlags, BioOp, BioSeg, BioSegs, BlockDevice, EndIo, QueueLimits, SECTOR_SHIFT,
+    submit_bio,
 };
 
 /// Most pages one bio carries (Linux BIO_MAX_VECS)
@@ -213,13 +218,17 @@ struct Dio<'a> {
 
 impl<'a> Dio<'a> {
     fn new<I: DioIter>(b: &'a BlockDevice, flags: RwFlags) -> Self {
+        Self::new_rw(b, !I::READ, flags)
+    }
+
+    fn new_rw(b: &'a BlockDevice, write: bool, flags: RwFlags) -> Self {
         let dsync = flags.intersects(RwFlags::DSYNC | RwFlags::SYNC);
         Self {
             b,
-            op: if I::READ { BioOp::Read } else { BioOp::Write },
+            op: if write { BioOp::Write } else { BioOp::Read },
             bflags: {
                 let mut f = BioFlags::empty();
-                f.set(BioFlags::FUA, !I::READ && dsync);
+                f.set(BioFlags::FUA, write && dsync);
                 f.set(BioFlags::NOWAIT, flags.nowait());
                 f
             },
@@ -247,7 +256,7 @@ impl<'a> Dio<'a> {
     ) -> Result<usize, KernelError> {
         let pp = self.pin(it, nr)?;
         let w = DioWait::new();
-        let sent = self.send(&pp, map, &mut MapPos::default(), &w);
+        let sent = self.send(pp.segs(), map, &mut MapPos::default(), &w);
         let pp = self.sent(pp, &sent);
         let r = w.finish();
         drop(pp);
@@ -314,7 +323,7 @@ impl<'a> Dio<'a> {
                 return (done, Err(KernelError::WouldBlock));
             }
             let len = pp.len();
-            let sent = self.send(&pp, map, at, w);
+            let sent = self.send(pp.segs(), map, at, w);
             if let Some(pp) = self.sent(pp, &sent) {
                 // Room was reserved: no allocation, cannot fail
                 let _ = pins.try_push(pp);
@@ -347,13 +356,12 @@ impl<'a> Dio<'a> {
     /// error after some were sent is left in `w`.
     fn send(
         &self,
-        pp: &PinnedPages,
+        segs: &[PageSeg],
         map: &[Extent],
         at: &mut MapPos,
-        w: &DioWait,
+        w: &dyn BioCount,
     ) -> Result<usize, KernelError> {
         let lim = &self.b.disk.queue.limits;
-        let segs = pp.segs();
         let mut cur = Cursor::default();
         let mut sent = 0usize;
         while !cur.done(segs) {
@@ -379,15 +387,23 @@ impl<'a> Dio<'a> {
                 return Err(KernelError::WouldBlock);
             }
             bio.flags = self.bflags;
-            bio.end_io = Some(dio_endio);
-            bio.private = core::ptr::from_ref(w) as usize;
-            w.get();
+            (bio.end_io, bio.private) = w.get();
             submit_bio(self.b, bio);
             at.advance(map, n);
             sent += n;
         }
         Ok(sent)
     }
+}
+
+/// What the bios of one I/O count down, synchronous (`DioWait`) or not
+/// (`AsyncWait`)
+trait BioCount {
+    /// A bio is about to be submitted: the end_io and private word that
+    /// count it down
+    fn get(&self) -> (Option<EndIo>, usize);
+    /// Keep `e` if it is the first error
+    fn fail(&self, e: KernelError);
 }
 
 /// What the bios of one direct I/O count down (Linux struct blkdev_dio):
@@ -401,6 +417,19 @@ struct DioWait {
     done: Completion,
 }
 
+impl BioCount for DioWait {
+    fn get(&self) -> (Option<EndIo>, usize) {
+        self.left.fetch_add(1, Ordering::Relaxed);
+        (Some(dio_endio), core::ptr::from_ref(self) as usize)
+    }
+
+    fn fail(&self, e: KernelError) {
+        let _ = self
+            .err
+            .compare_exchange(0, e.errno(), Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
 impl DioWait {
     fn new() -> Self {
         Self {
@@ -408,18 +437,6 @@ impl DioWait {
             err: AtomicI32::new(0),
             done: Completion::new(),
         }
-    }
-
-    /// A bio is about to be submitted
-    fn get(&self) {
-        self.left.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Keep `e` if it is the first error
-    fn fail(&self, e: KernelError) {
-        let _ = self
-            .err
-            .compare_exchange(0, e.errno(), Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// A bio is done (any context); the last one wakes the submitter and
@@ -445,7 +462,7 @@ impl DioWait {
 
 /// end_io of a direct I/O's bios (hardirq for virtio-blk: atomics, the
 /// heap and `Completion::complete` only)
-fn dio_endio(bio: alloc::boxed::Box<Bio>) {
+fn dio_endio(bio: Box<Bio>) {
     // SAFETY: `send` set `private` to the I/O's DioWait, which stays on
     // the submitter's stack until `finish` sees this bio's `put`
     let w = unsafe { &*(bio.private as *const DioWait) };
@@ -454,6 +471,161 @@ fn dio_endio(bio: alloc::boxed::Box<Bio>) {
     }
     drop(bio);
     w.put();
+}
+
+// ============================================================================
+// Asynchronous direct I/O (Linux __blkdev_direct_IO_async, and
+// __blkdev_direct_IO with an async kiocb)
+// ============================================================================
+
+/// The memory and completion of an asynchronous direct I/O (Linux an
+/// async kiocb with its bvec iterator): pages pinned at least as long as
+/// the object lives, and the call that ends it
+pub trait AsyncIo: Send + Sync {
+    /// The I/O's memory: pinned pieces, in order
+    fn segs(&self) -> &[PageSeg];
+    /// The I/O ended (Linux ki_complete): the bytes done or the first
+    /// error. Any context, hardirq included: no sleeping, no allocation
+    fn complete(self: Arc<Self>, res: Result<usize, KernelError>);
+}
+
+/// What the bios of one asynchronous I/O count down (Linux struct
+/// blkdev_dio of an async kiocb): on the heap, freed by the last end
+struct AsyncWait {
+    /// Bios in flight, plus one the submitter holds until it is done
+    left: AtomicU32,
+    err: AtomicI32,
+    /// Bytes the bios carry (set before the submitter's count goes)
+    bytes: AtomicUsize,
+    io: Arc<dyn AsyncIo>,
+}
+
+impl BioCount for AsyncWait {
+    fn get(&self) -> (Option<EndIo>, usize) {
+        self.left.fetch_add(1, Ordering::Relaxed);
+        (Some(async_endio), core::ptr::from_ref(self) as usize)
+    }
+
+    fn fail(&self, e: KernelError) {
+        let _ = self
+            .err
+            .compare_exchange(0, e.errno(), Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+/// Drop one count of the AsyncWait at `p`; the last ends the I/O
+/// (`AsyncIo::complete`) and frees it
+///
+/// # Safety
+/// `p` came from `Box::into_raw` in `submit_async` and the caller holds
+/// one of its counts, given up here.
+unsafe fn async_put(p: *const AsyncWait) {
+    // SAFETY: live while the caller holds a count (the contract)
+    let w = unsafe { &*p };
+    if w.left.fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    // SAFETY: the last count: nothing else uses it; from Box::into_raw
+    let w = unsafe { Box::from_raw(p.cast_mut()) };
+    let res = match w.err.load(Ordering::Acquire) {
+        0 => Ok(w.bytes.load(Ordering::Relaxed)),
+        e => Err(KernelError::from_errno(e).unwrap_or(KernelError::Io)),
+    };
+    let AsyncWait { io, .. } = *w;
+    io.complete(res);
+}
+
+/// end_io of an asynchronous I/O's bios (hardirq for virtio-blk)
+fn async_endio(bio: Box<Bio>) {
+    let p = bio.private as *const AsyncWait;
+    // SAFETY: `submit_async` set `private` to the I/O's AsyncWait and
+    // took a count for this bio, which this end gives up
+    let w = unsafe { &*p };
+    if let Err(e) = bio.status {
+        w.fail(e);
+    }
+    drop(bio);
+    // SAFETY: as above: this bio's count
+    unsafe { async_put(p) };
+}
+
+/// The pieces' memory is aligned to `mask` + 1 (Linux: every iovec's
+/// base and length to the queue's dma_alignment; per page piece, as a
+/// piece boundary inside an iovec is page-aligned)
+fn segs_aligned(segs: &[PageSeg], mask: u32) -> bool {
+    segs.iter().all(|s| (s.off | s.len) & mask == 0)
+}
+
+/// The first `count` bytes of `segs`
+fn segs_prefix(segs: &[PageSeg], count: usize) -> Result<SmallVec<PageSeg, 4>, KernelError> {
+    let mut out = SmallVec::try_with_capacity(segs.len())?;
+    let mut left = count;
+    for s in segs {
+        if left == 0 {
+            break;
+        }
+        // Within a page: lossless
+        let n = (s.len as usize).min(left) as u32;
+        out.push(PageSeg { len: n, ..*s });
+        left -= n as usize;
+    }
+    Ok(out)
+}
+
+/// Start direct I/O of `count` bytes of `io`'s memory (count <= its
+/// length; `pos` within the device and the I/O ending at its end at the
+/// latest) without waiting (Linux __blkdev_direct_IO_async): `io`
+/// completes once every bio is done, with the bytes they carry (a
+/// memory that ends before `count` gives a short I/O) or the first
+/// error. EINVAL for a position, length or memory the queue cannot take
+/// (Linux blkdev_dio_invalid); with NOWAIT, EAGAIN if it takes more than
+/// one bio. On an error nothing was sent and `io` is not completed.
+pub fn submit_async(
+    b: &BlockDevice,
+    io: Arc<dyn AsyncIo>,
+    pos: u64,
+    count: usize,
+    write: bool,
+    flags: RwFlags,
+) -> Result<(), KernelError> {
+    if invalid(pos, count, b.logical_block_size()) || !segs_aligned(io.segs(), b.dma_alignment()) {
+        return Err(KernelError::InvalidArgument);
+    }
+    let total: usize = io.segs().iter().map(|s| s.len as usize).sum();
+    let short;
+    let segs = if total > count {
+        short = segs_prefix(io.segs(), count)?;
+        &short[..]
+    } else {
+        io.segs()
+    };
+    let d = Dio::new_rw(b, write, flags);
+    let w = Box::into_raw(box_try(AsyncWait {
+        left: AtomicU32::new(1),
+        err: AtomicI32::new(0),
+        bytes: AtomicUsize::new(0),
+        io: io.clone(),
+    })?);
+    // One extent: the device from `pos` on
+    let map = [(pos, count.min(segs.iter().map(|s| s.len as usize).sum()))];
+    // SAFETY: live until the submitter's count goes, below
+    let wr = unsafe { &*w };
+    let r = super::plug::blk_plug(|| d.send(segs, &map, &mut MapPos::default(), wr));
+    match r {
+        Err(e) => {
+            // Nothing sent: ours alone
+            // SAFETY: from Box::into_raw above, no bio holds it
+            drop(unsafe { Box::from_raw(w) });
+            Err(e)
+        }
+        Ok(n) => {
+            // SAFETY: live: the submitter's count is still held
+            unsafe { &*w }.bytes.store(n, Ordering::Relaxed);
+            // SAFETY: the submitter's count, given up
+            unsafe { async_put(w) };
+            Ok(())
+        }
+    }
 }
 
 /// A position in pinned page pieces: piece `i`, byte `at` of it

@@ -271,11 +271,13 @@ lo (hk has no checksum offload states).
   dio_warn_stale_pagecache also sets the mapping's writeback error,
   which the next fsync reports): no errseq on `AddressSpace`.
 - Unpinning dirties a page-cache page under its page lock, so a
-  `PinnedPages` (`mm/gup.rs`) holding one is dropped in thread context
-  (the synchronous paths do); nothing yet lets an I/O completing in an
-  interrupt handler hand it to a thread (Linux bio_dirty_work), as
-  asynchronous direct I/O will need: `Workqueue::queue_work` takes a
-  spin Mutex and allocates.
+  `PinnedPages` (`mm/gup.rs`) holding one is dropped in thread context:
+  io_uring requests hand theirs from the bio's end to the submitter
+  (`io/io_uring/tctx.rs`, task_work); an asynchronous I/O with no task
+  to finish it (Linux AIO, whose aio_complete runs in the interrupt
+  handler) has no way yet to defer the dirtying to a thread (Linux
+  bio_check_pages_dirty / bio_dirty_work): `Workqueue::queue_work` takes
+  a spin Mutex.
 
 ## File lock gaps
 
@@ -551,10 +553,19 @@ return 0 without moving the device (Linux: moved, or an error).
 
 - GETEVENTS ignores io_uring_getevents_arg's min_wait_usec (Linux
   IORING_FEAT_MIN_TIMEOUT) and IORING_ENTER_ABS_TIMER (EINVAL)
-- Every operation runs inline in io_uring_enter under the submission
-  lock: one that blocks (a read of an empty pipe or socket) blocks the
-  caller; Linux arms poll or punts it to io-wq threads. IOSQE_IO_DRAIN
-  and IOSQE_ASYNC are ignored
+- Only O_DIRECT reads and writes of a block device run
+  asynchronously; every other operation runs inline in io_uring_enter
+  under the submission lock: one that blocks (a read of an empty pipe
+  or socket) blocks the caller; Linux arms poll or punts it to io-wq
+  threads, which share the submitter's mm (hk's workers are kernel
+  threads: create_io_thread is missing). IOSQE_ASYNC punts only those
+  O_DIRECT requests. A link chain runs inline, to each member's end; an
+  IOSQE_IO_DRAIN request waits in io_uring_enter for every request in
+  flight (Linux queues it and returns)
+- An asynchronous O_DIRECT write whose range cannot be dropped from
+  the cache ends with EBUSY (Linux direct_write_fallback writes it
+  through the cache); a queued request with offset -1 does not move the
+  file position (as Linux), an inline one does
 - IORING_OP_TIMEOUT has no timer (nothing ever completes it), and has
   no count trigger, TIMEOUT_UPDATE or MULTISHOT
 - IORING_OP_LINK_TIMEOUT returns 0 without arming anything

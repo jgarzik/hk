@@ -22,14 +22,18 @@
 //!   it is released.
 
 pub mod abi;
+mod iowq;
 mod ops;
 mod rings;
 mod rw;
+mod tctx;
 mod wait;
+
+pub use tctx::{Tctx, task_cancel};
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use abi::*;
 use rings::Rings;
@@ -113,6 +117,10 @@ pub struct IoRing {
     wq: WaitQueue,
     /// GETEVENTS waiters (Linux cq_wait), woken by every CQE posted
     cq_wait: WaitQueue,
+    /// Asynchronous requests in flight (Linux ctx->refs as a count)
+    inflight: AtomicU32,
+    /// Woken when `inflight` drops to zero (an IOSQE_IO_DRAIN waits)
+    idle: WaitQueue,
 }
 
 /// The SQEs' link state across one submission: chains run in order,
@@ -155,6 +163,8 @@ impl IoRing {
             dropped: AtomicBool::new(false),
             wq: WaitQueue::new(),
             cq_wait: WaitQueue::new(),
+            inflight: AtomicU32::new(0),
+            idle: WaitQueue::new(),
         })
     }
 
@@ -162,7 +172,7 @@ impl IoRing {
     /// io_submit_sqes): the number consumed. An SQ array slot naming no
     /// SQE is dropped (sq_dropped) and ends the batch; so does an SQE
     /// that fails before it runs, counted.
-    fn submit(&self, nr: u32) -> u32 {
+    fn submit(self: &Arc<Self>, nr: u32) -> u32 {
         let mut s = self.submit.lock();
         let ready = self.rings.sq_tail().wrapping_sub(s.sq_head);
         let n = nr.min(ready.min(self.rings.sq_entries()));
@@ -187,16 +197,25 @@ impl IoRing {
         done
     }
 
-    /// Run one SQE and post its CQE: false if it failed before running
-    /// (Linux io_init_req), which ends the batch
-    fn submit_sqe(&self, s: &mut Submit, sqe: &IoUringSqe, link: &mut Link) -> bool {
+    /// Run one SQE and post its CQE (when it ends, for one queued): false
+    /// if it failed before running (Linux io_init_req), which ends the
+    /// batch. A chain member, or a drain (which first waits for every
+    /// request in flight: Linux IOSQE_IO_DRAIN), runs to its end inline.
+    fn submit_sqe(self: &Arc<Self>, s: &mut Submit, sqe: &IoUringSqe, link: &mut Link) -> bool {
         let linked = sqe.flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK) != 0;
         let hard = sqe.flags & IOSQE_IO_HARDLINK != 0;
+        let drain = sqe.flags & IOSQE_IO_DRAIN != 0;
         let init = init_check(sqe);
+        if init.is_ok() && drain {
+            self.drain_wait();
+        }
         let res = match init {
             Err(e) => Err(e),
             Ok(()) if link.failed && link.on => Err(KernelError::Canceled),
-            Ok(()) => self.issue(s, sqe, link.on),
+            Ok(()) => match self.issue(s, sqe, link.on, linked || link.on || drain) {
+                Some(r) => r,
+                None => return true,
+            },
         };
         let res = res.unwrap_or_else(KernelError::to_errno_neg);
         if res < 0 && (linked || link.on) && !hard {
@@ -213,18 +232,59 @@ impl IoRing {
         init.is_ok()
     }
 
-    /// Run the operation of `sqe` (`in_link`: a later member of a chain)
-    fn issue(&self, s: &mut Submit, sqe: &IoUringSqe, in_link: bool) -> KernelResult<i32> {
-        match sqe.opcode {
-            IORING_OP_READ => rw::rw(self, s, sqe, false),
-            IORING_OP_WRITE => rw::rw(self, s, sqe, true),
-            IORING_OP_READV => rw::rwv(self, s, sqe, false),
-            IORING_OP_WRITEV => rw::rwv(self, s, sqe, true),
+    /// Run the operation of `sqe` (`in_link`: a later member of a chain;
+    /// `inline`: to its end, nothing queued): its result, None if queued
+    fn issue(
+        self: &Arc<Self>,
+        s: &mut Submit,
+        sqe: &IoUringSqe,
+        in_link: bool,
+        inline: bool,
+    ) -> Option<KernelResult<i32>> {
+        Some(match sqe.opcode {
+            IORING_OP_READ => return rw::rw(self, s, sqe, false, false, inline),
+            IORING_OP_WRITE => return rw::rw(self, s, sqe, true, false, inline),
+            IORING_OP_READV => return rw::rw(self, s, sqe, false, true, inline),
+            IORING_OP_WRITEV => return rw::rw(self, s, sqe, true, true, inline),
             // Valid only inside a chain; it arms nothing (BUGS "io_uring
             // gaps")
             IORING_OP_LINK_TIMEOUT if in_link => Ok(0),
             IORING_OP_LINK_TIMEOUT => Err(KernelError::InvalidArgument),
             _ => ops::issue(self, s, sqe).unwrap_or(Err(KernelError::InvalidArgument)),
+        })
+    }
+
+    /// One more asynchronous request in flight
+    fn inflight_get(&self) {
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One fewer; the last wakes a drain
+    fn inflight_put(&self) {
+        if self.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.idle.wake_all();
+        }
+    }
+
+    /// Wait until no request is in flight (IOSQE_IO_DRAIN; Linux defers
+    /// the drained request instead of waiting: BUGS), finishing the
+    /// caller's own as they end
+    fn drain_wait(&self) {
+        loop {
+            crate::task::task_work::task_work_run();
+            if self.inflight.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            // Woken at zero; a tick bounds the wait for the caller's own
+            // ended requests, which kick its callback, not this queue
+            let me = current();
+            self.idle.wait_event_timeout(
+                || {
+                    self.inflight.load(Ordering::Acquire) == 0
+                        || me.has_tif(crate::task::tif::NOTIFY_SIGNAL)
+                },
+                1,
+            );
         }
     }
 

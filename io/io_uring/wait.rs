@@ -15,7 +15,8 @@ use core::sync::atomic::Ordering;
 use super::IoRing;
 use super::abi::IORING_ENTER_EXT_ARG;
 use crate::sync::waitqueue::WaitEntry;
-use crate::task::percpu::{SleepState, current};
+use crate::task::percpu::{SleepState, current, set_current_state};
+use crate::task::task_work::task_work_run;
 use crate::time::hrtimer::{HrClock, schedule_hrtimeout};
 use crate::uaccess::copy_val_from_user;
 use crate::util::error::{KernelError, KernelResult};
@@ -89,6 +90,7 @@ impl IoRing {
     /// Wait for `min` CQEs (Linux io_cqring_wait)
     pub fn cq_wait(&self, min: u32, ext: &ExtArg) -> KernelResult<()> {
         let min = min.min(self.rings.cq_entries());
+        task_work_run();
         self.flush_overflow();
         if self.cq_events() >= min {
             return Ok(());
@@ -110,6 +112,13 @@ impl IoRing {
         let r = loop {
             self.cq_wait
                 .prepare_to_wait(w.as_ref(), SleepState::Interruptible);
+            // Requests ended for this task post their CQEs here (Linux
+            // io_run_task_work in the wait loop)
+            if current().has_tif(crate::task::tif::NOTIFY_SIGNAL) {
+                set_current_state(SleepState::Running);
+                task_work_run();
+                continue;
+            }
             self.flush_overflow();
             if self.cq_reached(target) {
                 break Ok(());

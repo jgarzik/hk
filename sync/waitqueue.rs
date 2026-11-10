@@ -177,9 +177,12 @@ pub struct WaitQueue {
     head: IrqSpinlock<List<EntryAdapter>>,
 }
 
-/// True if the current task has a deliverable signal pending
+/// True if the current task has a deliverable signal pending, or
+/// callbacks to run (TIF_NOTIFY_SIGNAL: the sleep ends, the syscall
+/// restarts after them; Linux signal_pending)
 pub fn signal_pending() -> bool {
-    crate::task::percpu::current().sigpending()
+    use crate::task::tif;
+    crate::task::percpu::current().has_tif(tif::SIGPENDING | tif::NOTIFY_SIGNAL)
 }
 
 /// A pending signal ends a sleep in `state`: any signal an

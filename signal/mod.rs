@@ -2677,6 +2677,10 @@ pub fn do_signal(regs: &UserFrame) {
     const EINTR: u64 = KernelError::Interrupted.sysret() as u64;
 
     let me = crate::task::percpu::current();
+    // Queued callbacks run before any signal (Linux get_signal)
+    if me.has_tif(crate::task::tif::NOTIFY_SIGNAL) {
+        crate::task::task_work::task_work_run();
+    }
     let err = regs.ret() as i64;
     let restart = syscall_restarting(regs);
     regs.forget_syscall();
