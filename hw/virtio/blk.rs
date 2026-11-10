@@ -15,13 +15,13 @@
 //! - A blk-mq driver (`block::blk_mq`): each virtqueue is one hardware
 //!   queue. A request is `[header] [data...] [status]`; headers and
 //!   status bytes live in a per-queue coherent pool, one slot per tag.
-//!   The chain is written to a table (Linux virtblk_req's sg table)
-//!   allocated per request (Linux GFP_ATOMIC: in hardirq when restarted
-//!   from a completion), or the queue's spare full-size table when the
-//!   heap has none; with indirect descriptors the table goes to the
-//!   device as one ring entry (Linux virtqueue_add_sgs), else as a
-//!   chain. Data segments are the bio's, DMA-mapped in `queue_rq` and
-//!   unmapped in `complete` from the table (the DMA API is lock-free).
+//!   The chain is written to the tag's table (Linux virtblk_req's sg
+//!   table, allocated with the tag set), sized for max_segments, which
+//!   is capped at `MAX_SEGS` so a table is one page; with indirect
+//!   descriptors the table goes to the device as one ring entry (Linux
+//!   virtqueue_add_sgs), else it is copied to the ring as a chain. Data
+//!   segments are the bio's, DMA-mapped in `queue_rq` and unmapped in
+//!   `complete` from the table (the DMA API is lock-free).
 //! - Interrupts: MSI-X when the transport has it, a vector per queue
 //!   aimed at the first CPU blk-mq maps to that queue (Linux managed
 //!   affinity, `util::group_cpus`), reaping that queue; else INTx, where
@@ -41,9 +41,7 @@
 //! Each virtqueue and its slots are owned by the blk-mq hardware queue
 //! (`IrqSpinlock`, leaf; Linux virtio_blk_vq.lock): `queue_rq` runs in
 //! thread context or, restarting, in the IRQ handler; `complete` in the
-//! IRQ handler or a polling submitter. Neither sleeps; `queue_rq`'s
-//! table allocation is the heap's atomic one (IRQ-safe slab, falling
-//! back to the spare).
+//! IRQ handler or a polling submitter. Neither allocates nor sleeps.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
@@ -105,15 +103,19 @@ const SLOT: usize = 32;
 const PAGE: u32 = 4096;
 /// Minors per disk (Linux PART_BITS = 4)
 const VD_MINORS: u16 = 16;
-/// Most data segments a device may ask for (Linux
-/// VIRTIO_BLK_MAX_SG_ELEMS - 2: header and status take two)
-const MAX_SG_ELEMS: u32 = 32768 - 2;
+/// Most data segments per request: a tag's table of header, data and
+/// status descriptors is one 4 KiB page (QEMU's default seg_max for its
+/// 256-entry ring). Linux takes up to VIRTIO_BLK_MAX_SG_ELEMS - 2
+/// (32766), allocating each request's sg table and indirect table as
+/// it goes; hk sizes each tag's table up front, so it bounds them
+const MAX_SEGS: u32 = 4096 / 16 - 2;
 
 /// A started request: its bio and descriptor table
 struct Slot {
     bio: Option<Box<Bio>>,
     /// `[header, data..., status]` with the data's DMA mappings (Linux
-    /// virtblk_req's sg table, and the indirect table built from it)
+    /// virtblk_req's sg table, and the indirect table built from it):
+    /// room for max_segments, allocated with the tag
     table: Vec<Desc>,
     /// Entries of `table` in use
     n: usize,
@@ -129,10 +131,6 @@ struct VbQueue {
     slots: Vec<Slot>,
     /// Free tags (capacity reserved: push/pop never allocate)
     free: Vec<u16>,
-    /// A table of the most entries, used when the heap has none, so a
-    /// queue with nothing in flight always makes progress (Linux relies
-    /// on GFP_ATOMIC and a delayed queue rerun)
-    spare: Option<Vec<Desc>>,
     /// Most data segments per request (max_segments)
     max_segs: usize,
 }
@@ -160,7 +158,7 @@ impl VbQueue {
         for _ in 0..tags {
             slots.try_push(Slot {
                 bio: None,
-                table: Vec::new(),
+                table: try_vec(max_segs + 2, Desc::default())?,
                 n: 0,
                 table_dma: None,
             })?;
@@ -175,7 +173,6 @@ impl VbQueue {
             pool,
             slots: slots.into_vec(),
             free: free.into_vec(),
-            spare: Some(try_vec(max_segs + 2, Desc::default())?),
             max_segs,
         })
     }
@@ -196,21 +193,6 @@ impl VbQueue {
             core::ptr::write_volatile(h.add(4).cast::<u32>(), 0);
             core::ptr::write_volatile(h.add(8).cast::<u64>(), sector.to_le());
             core::ptr::write_volatile(self.status(t), 0xff);
-        }
-    }
-
-    /// A table of at least `n` entries: from the heap (Linux GFP_ATOMIC:
-    /// this may run in hardirq, small blocks only) or the spare
-    fn get_table(&mut self, n: usize) -> Option<Vec<Desc>> {
-        try_vec(n, Desc::default())
-            .ok()
-            .or_else(|| self.spare.take())
-    }
-
-    /// A finished request's table: back as the spare if that is out
-    fn put_table(&mut self, t: Vec<Desc>) {
-        if self.spare.is_none() && t.len() == self.max_segs + 2 {
-            self.spare = Some(t);
         }
     }
 
@@ -280,7 +262,7 @@ impl VbQueue {
             )
         }
         .ok_or(())?;
-        // n + 2 <= MAX_SG_ELEMS + 2 fits u16
+        // n + 2 <= MAX_SEGS + 2 fits u16
         if self
             .vq
             .add_indirect(a.0, table.len() as u16, t as usize)
@@ -305,12 +287,8 @@ impl MqOps for VbQueue {
         let Some(t) = self.free.pop() else {
             return Queued::Busy(bio);
         };
-        // Busy only with a request in flight (that has the spare), whose
-        // completion reruns the queue
-        let Some(mut table) = self.get_table(n + 2) else {
-            self.free.push(t);
-            return Queued::Busy(bio);
-        };
+        // The tag's table, out of its slot while it is filled (a move)
+        let mut table = core::mem::take(&mut self.slots[t as usize].table);
         let ty = match bio.op {
             BioOp::Read => T_IN,
             BioOp::Write => T_OUT,
@@ -318,14 +296,14 @@ impl MqOps for VbQueue {
         };
         self.write_hdr(t, ty, bio.sector);
         if !self.fill(t, &bio, &mut table[..n + 2]) {
-            self.put_table(table);
+            self.slots[t as usize].table = table;
             self.free.push(t);
             return Queued::Failed(bio, KernelError::Io);
         }
         let added = self.add(t, &table[..n + 2]);
         let Ok(table_dma) = added else {
             self.unmap(&table[1..=n], bio.op);
-            self.put_table(table);
+            self.slots[t as usize].table = table;
             self.free.push(t);
             return Queued::Busy(bio);
         };
@@ -348,14 +326,13 @@ impl MqOps for VbQueue {
             let Some(mut bio) = s.bio.take() else {
                 continue;
             };
-            let table = core::mem::take(&mut s.table);
             let (n, table_dma) = (s.n, s.table_dma.take());
             if let Some(a) = table_dma {
                 let len = n * core::mem::size_of::<Desc>();
                 dma_unmap_single(&*self.vdev, DmaAddr(a), len, DmaDirection::ToDevice);
             }
-            self.unmap(&table[1..n - 1], bio.op);
-            self.put_table(table);
+            let s = &self.slots[t as usize];
+            self.unmap(&s.table[1..n - 1], bio.op);
             bio.status = match unsafe { core::ptr::read_volatile(self.status(t)) } {
                 S_OK => Ok(()),
                 S_UNSUPP => Err(KernelError::OperationNotSupported),
@@ -499,7 +476,7 @@ fn limits(vdev: &VirtioDevice, ring: u16) -> Result<QueueLimits, KernelError> {
     // At least one, at most what a request can carry
     let mut seg_max = if f(feature::SEG_MAX) {
         vdev.read_config(|d| d.cfg32(cfg::SEG_MAX))
-            .clamp(1, MAX_SG_ELEMS)
+            .clamp(1, MAX_SEGS)
     } else {
         1
     };
