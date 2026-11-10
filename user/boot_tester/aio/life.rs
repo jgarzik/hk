@@ -5,11 +5,12 @@
 //!   drops
 //! - AIO_EXIT_INFLIGHT: a child exiting with reads in flight is reaped
 //!   (Linux exit_aio waits for them), and its context leaves aio-nr
-//! - AIO_FORK: a fork child has no ring at the context's address
+//! - AIO_FORK: MADV_DOFORK of the ring is EINVAL (VM_DONTEXPAND is
+//!   VM_SPECIAL, Linux 7.0 on); a fork child has no ring at the context's address
 //!   (VM_DONTCOPY, Linux 7.1 on) and no context there (EINVAL); where
-//!   it inherits the ring (older Linux, or MADV_DOFORK if that is let
-//!   through) mremap of it is EINVAL (the ring is no context of the
-//!   child's); the parent's still works at the same address
+//!   it inherits the ring (older Linux) mremap of it is EINVAL (the
+//!   ring is no context of the child's); the parent's still works at
+//!   the same address
 
 use super::*;
 use crate::harness::{R, check, report_r};
@@ -151,8 +152,14 @@ fn fork() -> R {
     let dontcopy = linux_at_least(7, 1);
     // The ring's bytes: its header and events, whole pages
     let len = (32 + u64::from(c.nr()) * 32).next_multiple_of(4096);
-    // MADV_DOFORK (Linux: EINVAL for the ring) would hand it down
-    let inherit = !dontcopy || sys_madvise(c.0, len, MADV_DOFORK) == 0;
+    // Not handed down by MADV_DOFORK either: the ring is VM_SPECIAL
+    // (Linux 7.0 on, 0b2758f48f22; the 6.8 references refuse VM_IO only,
+    // and hand the ring down anyway)
+    let d = sys_madvise(c.0, len, MADV_DOFORK);
+    if linux_at_least(7, 0) {
+        check(b"MADV_DOFORK of the ring", d == EINVAL, d)?;
+    }
+    let inherit = !dontcopy || d == 0;
     let pid = sys_fork();
     if pid == 0 {
         let code = fork_child(c.0, len, inherit);

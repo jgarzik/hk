@@ -105,6 +105,11 @@ pub const VM_DONTCOPY: u32 = 0x0040_0000;
 /// (Linux VM_DONTEXPAND: AIO's ring)
 pub const VM_DONTEXPAND: u32 = 0x0000_0400;
 
+/// Mappings whose pages are not ordinary memory, nor to be grown,
+/// merged or inherited as such (Linux VM_SPECIAL: VM_IO, VM_DONTEXPAND,
+/// VM_PFNMAP, VM_MIXEDMAP; hk has no VM_IO or VM_PFNMAP mappings)
+pub const VM_SPECIAL: u32 = VM_DONTEXPAND | VM_MIXEDMAP;
+
 /// VMA should not be included in core dumps (madvise MADV_DONTDUMP)
 pub const VM_DONTDUMP: u32 = 0x0080_0000;
 

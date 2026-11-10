@@ -18,8 +18,8 @@ use super::{
     MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
     MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
     MADV_REMOVE, MADV_SEQUENTIAL, MADV_WILLNEED, MADV_WIPEONFORK, Mm, MmStruct, PAGE_SIZE,
-    VM_DONTCOPY, VM_DONTDUMP, VM_HUGEPAGE, VM_NOHUGEPAGE, VM_RAND_READ, VM_SEQ_READ, VM_WIPEONFORK,
-    Vma,
+    VM_DONTCOPY, VM_DONTDUMP, VM_HUGEPAGE, VM_NOHUGEPAGE, VM_RAND_READ, VM_SEQ_READ, VM_SPECIAL,
+    VM_WIPEONFORK, Vma,
 };
 use crate::sync::{RwSemReadGuard, RwSemWriteGuard};
 use crate::util::error::{KernelError, KernelResult};
@@ -351,6 +351,8 @@ fn new_flags(vma: &Vma, advice: i32) -> Result<u32, KernelError> {
         MADV_RANDOM => (f & !VM_SEQ_READ) | VM_RAND_READ,
         MADV_SEQUENTIAL => (f & !VM_RAND_READ) | VM_SEQ_READ,
         MADV_DONTFORK => f | VM_DONTCOPY,
+        // A special mapping stays out of the child (Linux: EINVAL)
+        MADV_DOFORK if f & VM_SPECIAL != 0 => return Err(KernelError::InvalidArgument),
         MADV_DOFORK => f & !VM_DONTCOPY,
         MADV_DONTDUMP => f | VM_DONTDUMP,
         MADV_DODUMP => f & !VM_DONTDUMP,
