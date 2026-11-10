@@ -179,6 +179,17 @@ pub fn rwf_append(flags: i32) -> Option<bool> {
     }
 }
 
+/// `flags` (a file's I/O flags, its O_APPEND as APPEND) with the
+/// RWF_APPEND / RWF_NOAPPEND of `rwf` over APPEND (Linux
+/// kiocb_set_rw_flags: IOCB_APPEND set, or cleared), for an I/O that
+/// carries its flags whole (an asynchronous O_DIRECT one)
+pub fn rwf_set_append(mut flags: RwFlags, rwf: i32) -> RwFlags {
+    if let Some(a) = rwf_append(rwf) {
+        flags.set(RwFlags::APPEND, a);
+    }
+    flags
+}
+
 /// Offset of preadv2/pwritev2: -1 is the file position
 fn pos2(offset: i64) -> KernelResult<Option<u64>> {
     if offset == -1 {

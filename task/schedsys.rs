@@ -608,28 +608,10 @@ pub fn sys_sched_rr_get_interval(pid: i64, tp_ptr: UserPtr<LinuxTimespec>) -> Ke
 /// * -ESRCH if target not found
 /// * -EPERM if not permitted
 pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
-    use super::{
-        IOPRIO_CLASS_RT, IOPRIO_WHO_PGRP, IOPRIO_WHO_PROCESS, IOPRIO_WHO_USER, ioprio_prio_class,
-        ioprio_valid,
-    };
+    use super::{IOPRIO_WHO_PGRP, IOPRIO_WHO_PROCESS, IOPRIO_WHO_USER};
 
     let ioprio = ioprio as u16;
-
-    // Validate ioprio
-    if !ioprio_valid(ioprio) {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    let class = ioprio_prio_class(ioprio);
-
-    // Linux ioprio_check_cap: the RT class needs CAP_SYS_NICE or
-    // CAP_SYS_ADMIN; IDLE and BE anyone
-    if class == IOPRIO_CLASS_RT
-        && !super::capable(super::CAP_SYS_NICE)
-        && !super::capable(super::CAP_SYS_ADMIN)
-    {
-        return Err(KernelError::NotPermitted);
-    }
+    super::ioprio_check_cap(ioprio)?;
 
     match which {
         IOPRIO_WHO_PROCESS => {

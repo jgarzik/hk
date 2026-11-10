@@ -576,6 +576,11 @@ impl FileOps for BlockFileOps {
         dio_submit_async(file, io, pos, write, flags)
     }
 
+    /// Always (Linux def_blk_fops.iopoll)
+    fn can_iopoll(&self, _file: &File) -> bool {
+        true
+    }
+
     /// Its disk's poll queues (Linux iocb_bio_iopoll -> bio_poll)
     fn iopoll(&self, file: &File) -> bool {
         bdev(file).is_ok_and(|b| b.disk.queue.poll())

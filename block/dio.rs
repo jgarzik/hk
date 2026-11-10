@@ -598,7 +598,26 @@ pub fn submit_async(
     write: bool,
     flags: RwFlags,
 ) -> Result<(), KernelError> {
-    if invalid(pos, count, b.logical_block_size()) || !segs_aligned(io.segs(), b.dma_alignment()) {
+    if invalid(pos, count, b.logical_block_size()) {
+        return Err(KernelError::InvalidArgument);
+    }
+    // One extent: the device from `pos` on
+    submit_async_map(b, io, &[(pos, count)], count, write, flags)
+}
+
+/// As [`submit_async`], `count` bytes through the device extents `map`
+/// in order (a filesystem's mapping, Linux do_blockdev_direct_IO with an
+/// async kiocb), the alignment of positions and length checked by the
+/// caller; the memory's against the queue's DMA alignment here (EINVAL)
+pub fn submit_async_map(
+    b: &BlockDevice,
+    io: Arc<dyn AsyncIo>,
+    map: &[Extent],
+    count: usize,
+    write: bool,
+    flags: RwFlags,
+) -> Result<(), KernelError> {
+    if !segs_aligned(io.segs(), b.dma_alignment()) {
         return Err(KernelError::InvalidArgument);
     }
     let total: usize = io.segs().iter().map(|s| s.len as usize).sum();
@@ -616,11 +635,9 @@ pub fn submit_async(
         bytes: AtomicUsize::new(0),
         io: io.clone(),
     })?);
-    // One extent: the device from `pos` on
-    let map = [(pos, count.min(segs.iter().map(|s| s.len as usize).sum()))];
     // SAFETY: live until the submitter's count goes, below
     let wr = unsafe { &*w };
-    let r = super::plug::blk_plug(|| d.send(segs, &map, &mut MapPos::default(), wr));
+    let r = super::plug::blk_plug(|| d.send(segs, map, &mut MapPos::default(), wr));
     match r {
         Err(e) => {
             // Nothing sent: ours alone

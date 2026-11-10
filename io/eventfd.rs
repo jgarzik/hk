@@ -143,6 +143,18 @@ impl Eventfd {
         Ok(8)
     }
 
+    /// Add one to the counter, saturating, and wake the readers (Linux
+    /// eventfd_signal): any context, an interrupt handler's included
+    pub fn signal(&self) {
+        {
+            let mut inner = self.inner.lock();
+            if inner.count < ULLONG_MAX {
+                inner.count += 1;
+            }
+        }
+        self.wait_queue.wake_poll(u32::from(POLLIN));
+    }
+
     /// Poll for readiness
     pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {

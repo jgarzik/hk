@@ -889,9 +889,17 @@ pub struct Mm {
     /// signal delivery of a task using it, as Linux reads its word. An
     /// unmapped page is not forgotten (Linux neither).
     sigpage: AtomicU64,
+    /// Its AIO contexts (Linux mm->ioctx_table): torn down with the
+    /// last user (`MmRef`'s drop: exit_aio before exit_mmap)
+    ioctx: crate::io::aio::IoctxTable,
 }
 
 impl Mm {
+    /// Its AIO contexts (Linux mm->ioctx_table)
+    pub fn ioctx(&self) -> &crate::io::aio::IoctxTable {
+        &self.ioctx
+    }
+
     /// Where its signal return trampoline is (arm64: Linux
     /// mm->context.vdso's sigtramp): its [sigpage] page, wherever mremap
     /// moved it; 0 if there is none (another arch)
@@ -1002,6 +1010,7 @@ impl MmRef {
                 ctx: tlb::MmContext::new(),
                 membarrier: AtomicU32::new(0),
                 sigpage: AtomicU64::new(0),
+                ioctx: crate::io::aio::IoctxTable::new(),
             }
         }))
     }
@@ -1032,6 +1041,9 @@ impl Drop for MmRef {
     /// user reference under a spinlock: teardown drops file references.
     fn drop(&mut self) {
         if self.0.users.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Its AIO contexts first: their I/O ends before the memory
+            // goes (Linux __mmput: exit_aio, then exit_mmap)
+            crate::io::aio::exit_aio(&self.0.ioctx);
             memory::exit_mmap(&self.0);
         }
     }

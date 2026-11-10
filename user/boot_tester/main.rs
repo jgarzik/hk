@@ -5,6 +5,7 @@
 #![no_std]
 #![no_main]
 
+pub mod aio;
 pub mod arch;
 pub mod blk;
 pub mod exec;
@@ -373,6 +374,7 @@ pub fn run_all_tests() {
     isolated(b"CPU_ACCT", proc::cpu_acct::run_tests);
     isolated(b"CPU_TIMERS", time::cpu_timers::run_tests);
     uring::run_tests();
+    aio::run_tests();
     net::tcp::run_tests();
     isolated(b"MEMCORE", mm::memcore::run_tests);
     isolated(b"MMLOCK", mm::mmlock::run_tests);

@@ -2911,3 +2911,48 @@ pub const SYS_SCHED_YIELD: u64 = 24;
 pub fn sys_sched_yield() -> i64 {
     unsafe { syscall0!(SYS_SCHED_YIELD) }
 }
+
+// Linux native AIO (fs/aio.c)
+pub const SYS_IO_SETUP: u64 = 206;
+pub const SYS_IO_DESTROY: u64 = 207;
+pub const SYS_IO_GETEVENTS: u64 = 208;
+pub const SYS_IO_SUBMIT: u64 = 209;
+pub const SYS_IO_CANCEL: u64 = 210;
+pub const SYS_IO_PGETEVENTS: u64 = 333;
+
+/// io_setup(nr_events, ctxp)
+pub fn sys_io_setup(nr_events: u32, ctxp: *mut u64) -> i64 {
+    unsafe { syscall2!(SYS_IO_SETUP, nr_events, ctxp) }
+}
+
+/// io_destroy(ctx)
+pub fn sys_io_destroy(ctx: u64) -> i64 {
+    unsafe { syscall1!(SYS_IO_DESTROY, ctx) }
+}
+
+/// io_submit(ctx, nr, iocbpp)
+pub fn sys_io_submit(ctx: u64, nr: i64, iocbpp: *const u64) -> i64 {
+    unsafe { syscall3!(SYS_IO_SUBMIT, ctx, nr, iocbpp) }
+}
+
+/// io_cancel(ctx, iocb, result)
+pub fn sys_io_cancel(ctx: u64, iocb: u64, result: u64) -> i64 {
+    unsafe { syscall3!(SYS_IO_CANCEL, ctx, iocb, result) }
+}
+
+/// io_getevents(ctx, min_nr, nr, events, timeout)
+pub fn sys_io_getevents(ctx: u64, min_nr: i64, nr: i64, events: u64, timeout: u64) -> i64 {
+    unsafe { syscall5!(SYS_IO_GETEVENTS, ctx, min_nr, nr, events, timeout) }
+}
+
+/// io_pgetevents(ctx, min_nr, nr, events, timeout, usig)
+pub fn sys_io_pgetevents(
+    ctx: u64,
+    min_nr: i64,
+    nr: i64,
+    events: u64,
+    timeout: u64,
+    usig: u64,
+) -> i64 {
+    unsafe { syscall6!(SYS_IO_PGETEVENTS, ctx, min_nr, nr, events, timeout, usig) }
+}

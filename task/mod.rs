@@ -2807,6 +2807,10 @@ pub const IOPRIO_CLASS_SHIFT: u16 = 13;
 /// Mask for I/O priority data
 pub const IOPRIO_PRIO_MASK: u16 = (1 << IOPRIO_CLASS_SHIFT) - 1;
 
+/// The level bits of a priority's data (Linux IOPRIO_LEVEL_MASK); the
+/// bits above them up to the class are hints
+pub const IOPRIO_LEVEL_MASK: u16 = 7;
+
 /// Default I/O priority (best-effort class, level 4)
 pub const IOPRIO_DEFAULT: IoPrio = ioprio_prio_value(IOPRIO_CLASS_BE, 4);
 
@@ -2828,11 +2832,20 @@ pub const fn ioprio_prio_value(class: u16, data: u16) -> IoPrio {
     ((class & 0x7) << IOPRIO_CLASS_SHIFT) | (data & IOPRIO_PRIO_MASK)
 }
 
-/// Check if an ioprio value is valid
-#[inline]
-pub fn ioprio_valid(ioprio: IoPrio) -> bool {
-    let class = ioprio_prio_class(ioprio);
-    class <= IOPRIO_CLASS_IDLE
+/// An I/O priority a request may carry (Linux ioprio_check_cap): the
+/// RT class needs CAP_SYS_ADMIN or CAP_SYS_NICE (EPERM); BE and IDLE
+/// anyone; NONE only with level 0; any other class EINVAL
+pub fn ioprio_check_cap(ioprio: IoPrio) -> KernelResult<()> {
+    match ioprio_prio_class(ioprio) {
+        IOPRIO_CLASS_RT if !capable(CAP_SYS_ADMIN) && !capable(CAP_SYS_NICE) => {
+            Err(KernelError::NotPermitted)
+        }
+        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE | IOPRIO_CLASS_IDLE => Ok(()),
+        // Only the level must be 0: hint bits are accepted (Linux
+        // IOPRIO_PRIO_LEVEL)
+        IOPRIO_CLASS_NONE if ioprio & IOPRIO_LEVEL_MASK == 0 => Ok(()),
+        _ => Err(KernelError::InvalidArgument),
+    }
 }
 
 /// I/O context for a task (shareable via CLONE_IO)

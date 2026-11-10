@@ -101,6 +101,10 @@ pub const VM_SEQ_READ: u32 = 0x0020_0000;
 /// VMA should not be copied on fork (madvise MADV_DONTFORK)
 pub const VM_DONTCOPY: u32 = 0x0040_0000;
 
+/// mremap may not grow the mapping, nor keep it with MREMAP_DONTUNMAP
+/// (Linux VM_DONTEXPAND: AIO's ring)
+pub const VM_DONTEXPAND: u32 = 0x0000_0400;
+
 /// VMA should not be included in core dumps (madvise MADV_DONTDUMP)
 pub const VM_DONTDUMP: u32 = 0x0080_0000;
 

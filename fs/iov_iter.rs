@@ -349,6 +349,12 @@ impl<'a> IovDest<'a> {
         Self(Dest::Pages(Pieces::new(p.segs())))
     }
 
+    /// The memory of an asynchronous direct I/O, pinned while it lives
+    /// (`AsyncIo`'s contract), so as long as the borrow
+    pub fn async_io(io: &'a dyn crate::block::dio::AsyncIo) -> Self {
+        Self(Dest::Pages(Pieces::new(io.segs())))
+    }
+
     /// Room left
     pub fn len(&self) -> usize {
         match &self.0 {
@@ -522,6 +528,12 @@ impl<'a> IovSource<'a> {
     /// Pinned pages, pinned as long as the borrow (Linux ITER_BVEC)
     pub fn pinned(p: &'a PinnedSlice<'_>) -> Self {
         Self(Source::Pages(Pieces::new(p.segs())))
+    }
+
+    /// The memory of an asynchronous direct I/O, pinned while it lives
+    /// (`AsyncIo`'s contract), so as long as the borrow
+    pub fn async_io(io: &'a dyn crate::block::dio::AsyncIo) -> Self {
+        Self(Source::Pages(Pieces::new(io.segs())))
     }
 
     /// Bytes left

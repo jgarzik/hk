@@ -189,6 +189,20 @@ pub const SYS_EPOLL_CREATE1: u64 = 291;
 /// epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)
 pub const SYS_EPOLL_PWAIT2: u64 = 441;
 
+// Linux native AIO (Section 9.3)
+/// io_setup(nr_events, ctxp)
+pub const SYS_IO_SETUP: u64 = 206;
+/// io_destroy(ctx)
+pub const SYS_IO_DESTROY: u64 = 207;
+/// io_getevents(ctx, min_nr, nr, events, timeout)
+pub const SYS_IO_GETEVENTS: u64 = 208;
+/// io_submit(ctx, nr, iocbpp)
+pub const SYS_IO_SUBMIT: u64 = 209;
+/// io_cancel(ctx, iocb, result)
+pub const SYS_IO_CANCEL: u64 = 210;
+/// io_pgetevents(ctx, min_nr, nr, events, timeout, usig)
+pub const SYS_IO_PGETEVENTS: u64 = 333;
+
 // io_uring syscalls (Section 9.3)
 /// io_uring_setup(entries, params)
 pub const SYS_IO_URING_SETUP: u64 = 425;
@@ -960,6 +974,12 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_IOPRIO_SET => Sys::IoprioSet,
         SYS_IO_URING_ENTER => Sys::IoUringEnter,
         SYS_IO_URING_REGISTER => Sys::IoUringRegister,
+        SYS_IO_SETUP => Sys::IoSetup,
+        SYS_IO_DESTROY => Sys::IoDestroy,
+        SYS_IO_GETEVENTS => Sys::IoGetevents,
+        SYS_IO_SUBMIT => Sys::IoSubmit,
+        SYS_IO_CANCEL => Sys::IoCancel,
+        SYS_IO_PGETEVENTS => Sys::IoPgetevents,
         SYS_IO_URING_SETUP => Sys::IoUringSetup,
         SYS_KCMP => Sys::Kcmp,
         SYS_KEXEC_LOAD => Sys::KexecLoad,

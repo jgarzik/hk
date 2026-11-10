@@ -1,6 +1,7 @@
 //! fd-backed I/O and event objects: poll/select infrastructure, epoll,
 //! eventfd, signalfd, SIGIO (fasync), pipes, inotify/fanotify and io_uring
 
+pub mod aio;
 pub mod epoll;
 pub mod eventfd;
 pub mod fanotify;

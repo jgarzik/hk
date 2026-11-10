@@ -272,6 +272,24 @@ lo (hk has no checksum offload states).
   dio_warn_stale_pagecache also sets the mapping's writeback error,
   which the next fsync reports): no errseq on `AddressSpace`.
 
+## Linux AIO gaps
+
+**Location**: `io/aio/`
+
+- RWF_NOWAIT on a file without nonblocking I/O (Linux: no
+  FMODE_NOWAIT) fails the request's event with EOPNOTSUPP; Linux fails
+  the io_submit itself (kiocb_set_rw_flags). hk has no FMODE_NOWAIT.
+- IOCB_CMD_FSYNC/FDSYNC on a file without ->fsync (pipes, sockets) is
+  an event of 0: `FileOps::fsync` defaults to success (fsync(2) too);
+  Linux fails the io_submit with EINVAL (aio_fsync).
+- The ring is one physically contiguous `SharedRegion`: a large
+  io_setup (aio-max-nr's default allows 4 MiB) can fail with ENOMEM
+  under fragmentation; Linux's ring is separate pages
+  (`ring::AioRing`; io_uring's rings likewise).
+- FSYNC/FDSYNC and poll completion work run on `SYSTEM_WQ`'s single
+  worker, one at a time; Linux's system_wq runs concurrency-managed
+  pools.
+
 ## File lock gaps
 
 **Location**: `fs/locks.rs`, `fs/posix_lock.rs`

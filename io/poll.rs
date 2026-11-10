@@ -288,6 +288,8 @@ enum Target<'a> {
     Ctx(&'a mut PollContext),
     /// An epoll item: its callback entries (Linux ep_ptable_queue_proc)
     Ep(&'a mut crate::io::epoll::EpRegs),
+    /// An AIO poll request: its one entry (Linux aio_poll_queue_proc)
+    Aio(&'a mut crate::io::aio::poll::AioRegs),
 }
 
 pub struct PollTable<'a> {
@@ -318,6 +320,15 @@ impl<'a> PollTable<'a> {
         }
     }
 
+    /// A table registering an AIO poll request's entry
+    pub(crate) fn for_aio(regs: &'a mut crate::io::aio::poll::AioRegs) -> Self {
+        Self {
+            target: Target::Aio(regs),
+            key: 0,
+            qproc_enabled: true,
+        }
+    }
+
     /// Register interest in a wait queue
     ///
     /// Called by file->poll() implementations. The wait queue will wake
@@ -333,6 +344,7 @@ impl<'a> PollTable<'a> {
         match &mut self.target {
             Target::Ctx(c) => c.add_entry(wq),
             Target::Ep(r) => r.add(wq),
+            Target::Aio(r) => r.add(wq),
         }
     }
 
@@ -356,6 +368,7 @@ impl<'a> PollTable<'a> {
             match &mut self.target {
                 Target::Ctx(c) => c.hold_owner(owner),
                 Target::Ep(r) => r.hold(owner),
+                Target::Aio(r) => r.hold(owner),
             }
         }
     }

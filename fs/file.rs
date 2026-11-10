@@ -362,6 +362,20 @@ pub trait FileOps: Send + Sync {
         Ok(())
     }
 
+    /// A mapping of the file in address space `mm` moved to `start`,
+    /// `len` bytes, by mremap (Linux vm_ops->mremap, which has the vma's
+    /// vm_mm), before its entries move, the mmap_lock held for writing;
+    /// an error refuses the move. Default: any move.
+    fn mremap(
+        &self,
+        _file: &File,
+        _mm: &crate::mm::Mm,
+        _start: u64,
+        _len: u64,
+    ) -> Result<(), KernelError> {
+        Ok(())
+    }
+
     /// The file's mappings are its driver's pages, inserted at mmap
     /// (`map_page`; Linux vm_insert_pages from f_op->mmap). Default: no.
     fn maps_driver_pages(&self, _file: &File) -> bool {
@@ -449,11 +463,16 @@ pub trait FileOps: Send + Sync {
 
     /// Start O_DIRECT I/O of `io`'s pinned memory at `pos`, a read from
     /// the file or (`write`) a write to it, with the I/O flags `flags`
-    /// (Linux blkdev_direct_IO on an async kiocb): Ok(None) when queued
+    /// (the request's whole: the file's and its RWF_* ones, APPEND as
+    /// RWF_APPEND / RWF_NOAPPEND left it; Linux ki_flags) (Linux
+    /// blkdev_direct_IO on an async kiocb): Ok(None) when queued
     /// (`io` completes later, from any context), Ok(Some(n)) when done at
     /// once (n bytes: nothing to do, the end of the file); an error means
     /// nothing was started (EAGAIN with RWF_NOWAIT where it would wait).
-    /// Only called when `can_async_dio`.
+    /// Only called when `can_async_dio`; `io` holds `file` until it
+    /// completes (an implementation may drop its own references to the
+    /// file's inode in `complete`, any context, knowing they are not the
+    /// last).
     fn dio_submit(
         &self,
         _file: &File,
@@ -463,6 +482,12 @@ pub trait FileOps: Send + Sync {
         _flags: RwFlags,
     ) -> Result<Option<usize>, KernelError> {
         Err(KernelError::OperationNotSupported)
+    }
+
+    /// Polled I/O of the file can be reaped (`iopoll`; Linux
+    /// f_op->iopoll is set). Default: no.
+    fn can_iopoll(&self, _file: &File) -> bool {
+        false
     }
 
     /// Reap polled I/O of the file once (Linux f_op->iopoll): whether

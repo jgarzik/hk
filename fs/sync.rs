@@ -21,8 +21,15 @@ pub fn sys_sync() -> KernelResult<()> {
 /// fsync(2): the file's data and metadata (Linux vfs_fsync -> ->fsync);
 /// EIO for a write error, else EINVAL (no ->fsync)
 pub fn sys_fsync(fd: i32) -> KernelResult<()> {
-    let file = fget(fd)?;
-    file.f_op.fsync(&file).map_err(|e| match e {
+    vfs_fsync(&*fget(fd)?, false)
+}
+
+/// Sync `file`'s data and, unless `datasync`, its metadata (Linux
+/// vfs_fsync; hk's filesystems write no metadata fdatasync could skip):
+/// EIO for a write error, else EINVAL (no ->fsync)
+pub fn vfs_fsync(file: &crate::fs::file::File, datasync: bool) -> KernelResult<()> {
+    let _ = datasync;
+    file.f_op.fsync(file).map_err(|e| match e {
         KernelError::Io => e,
         _ => KernelError::InvalidArgument,
     })

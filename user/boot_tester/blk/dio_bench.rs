@@ -131,6 +131,7 @@ fn bench(b: i32, d: i32, buf: u64) {
     line(b"rand 4K QD8", &row, RAND_QD * 4096, RAND_QD);
     line(b"dsync 1M write", &[(b" direct ", dsync(d, buf))], DSYNC, 0);
     crate::uring::bench::bench(d);
+    crate::aio::bench::bench(d);
 }
 
 /// Bytes written by the O_DSYNC run (vda3 from 8 MiB)

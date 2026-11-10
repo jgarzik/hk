@@ -151,28 +151,22 @@ pub fn sys_mmap(
     }
 
     let is_anonymous = flags & MAP_ANONYMOUS != 0;
-    let is_fixed = flags & MAP_FIXED != 0;
-    let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
 
     // Check sharing mode: MAP_SHARED (0x01), MAP_PRIVATE (0x02), or MAP_SHARED_VALIDATE (0x03)
     // MAP_SHARED_VALIDATE is special - it's MAP_SHARED | MAP_PRIVATE bits together,
     // and means "shared mapping with strict flag validation"
     let share_mode = flags & super::MAP_SHARED_VALIDATE; // Mask to just these 2 bits
-    let (is_shared, is_shared_validate) = match share_mode {
-        0x01 => (true, false),  // MAP_SHARED
-        0x02 => (false, false), // MAP_PRIVATE
+    match share_mode {
+        0x01 | 0x02 => {} // MAP_SHARED, MAP_PRIVATE
         0x03 => {
             // MAP_SHARED_VALIDATE - shared with strict validation
             // If MAP_SYNC is requested, we must reject since we don't support DAX
             if flags & super::MAP_SYNC != 0 {
                 return Err(KernelError::OperationNotSupported); // EOPNOTSUPP - no DAX filesystem support
             }
-            (true, true)
         }
         _ => return Err(KernelError::InvalidArgument), // 0x00 = neither specified
-    };
-    // Suppress unused warning - is_shared_validate is for future validation
-    let _ = is_shared_validate;
+    }
 
     // Get file if not anonymous
     let file: Option<Arc<File>> = if !is_anonymous {
@@ -180,6 +174,27 @@ pub fn sys_mmap(
     } else {
         None
     };
+    do_mmap(addr, length, prot, flags, file, offset, 0)
+}
+
+/// Map `length` bytes (page-aligned, checked by the caller) of `file`
+/// at `offset`, or anonymous memory without one, near `addr` (Linux
+/// do_mmap): the mmap(2) work after its argument checks, for the kernel
+/// too (AIO's ring), with `vm_flags` added to the VMA's (Linux: a
+/// file's mmap_prepare setting VM_DONTCOPY, VM_DONTEXPAND)
+pub fn do_mmap(
+    addr: u64,
+    length: u64,
+    prot: u32,
+    flags: u32,
+    file: Option<Arc<File>>,
+    offset: u64,
+    vm_flags: u32,
+) -> KernelResult<u64> {
+    let pgoff = offset / PAGE_SIZE;
+    let is_fixed = flags & MAP_FIXED != 0;
+    let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+    let is_shared = flags & super::MAP_SHARED_VALIDATE != MAP_PRIVATE;
     if let Some(f) = &file
         && !file_mmap_ok(f, pgoff, length)
     {
@@ -298,7 +313,7 @@ pub fn sys_mmap(
     if is_shared {
         vma.flags |= VM_SHARED;
     }
-    vma.flags |= seal_flags;
+    vma.flags |= seal_flags | vm_flags;
     // A shared writable mapping is counted on its file's mapping until
     // the VMA is linked (Linux mmap_region: mapping_map_writable, EPERM
     // once F_SEAL_WRITE denies it)
@@ -1386,6 +1401,18 @@ pub fn sys_mremap(
         Some(v) if v.end >= kept => v.end,
         _ => return Err(KernelError::BadAddress),
     };
+    // A mapping that may not grow (Linux VM_DONTEXPAND: AIO's ring) is
+    // kept by no MREMAP_DONTUNMAP (EINVAL, check_prep_vma) and grown by
+    // no mremap (EFAULT, vma_to_resize)
+    let dontexpand = mm_guard
+        .get_vma(vma_idx)
+        .is_some_and(|v| v.flags & super::vma::VM_DONTEXPAND != 0);
+    if dontexpand && dontunmap {
+        return Err(KernelError::InvalidArgument);
+    }
+    if dontexpand && new_len_aligned > page_align(old_len) {
+        return Err(KernelError::BadAddress);
+    }
 
     let moves = fixed || dontunmap;
     // Shrinking: the tail is unmapped like munmap (Linux do_vmi_munmap;
@@ -1560,6 +1587,15 @@ fn move_mapping(
     let t = super::pgtable::PgTables::new(owner, mm);
     let mut alloc = |va| t.pte_alloc(owner, va).is_some();
     super::mremap::move_prep(owner, t, old_addr, new_addr, old_len, &mut alloc)?;
+    // The file's own say on the move (Linux vm_ops->mremap: AIO's ring
+    // takes its new address as the context id), before anything moves
+    if let Some(f) = mm
+        .find_vma_index(old_addr)
+        .and_then(|i| mm.get_vma(i))
+        .and_then(|v| v.file.clone())
+    {
+        f.f_op.mremap(&f, owner, new_addr, new_len)?;
+    }
     mm.split_at(old_addr);
     mm.split_at(old_addr + old_len);
     let mut new_vma = mm

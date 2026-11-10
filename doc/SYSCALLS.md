@@ -454,10 +454,17 @@ goes down later.
 - [x] fanotify_init
 - [x] fanotify_mark
 
-9.3 io_uring (modern async I/O)
+9.3 Linux native AIO and io_uring
+
+- [x] io_setup (the ring mapped shared at the context id, Linux's struct aio_ring layout read by libaio; twice the events asked, at least 4 per CPU, rounded up to whole pages; /proc/sys/fs/aio-nr, aio-max-nr: EAGAIN past it; mremap moves the ring and the id, growing it is EFAULT; not inherited by fork)
+- [x] io_destroy (waits for every request to end)
+- [x] io_submit (PREAD, PWRITE, PREADV, PWRITEV: O_DIRECT on block devices and vfat asynchronous, the rest completed within the call; FSYNC, FDSYNC in a workqueue worker with the submitter's credentials; POLL; IOCB_FLAG_RESFD, IOCB_FLAG_IOPRIO, RWF_* flags; NOOP is EINVAL as Linux)
+- [x] io_cancel (POLL requests only, EINPROGRESS; EINVAL for any other, as Linux)
+- [x] io_getevents
+- [x] io_pgetevents (sigmask; no io_pgetevents_time64 on 64-bit arches)
 
 - [x] io_uring_setup (rings mapped at IORING_OFF_SQ_RING/CQ_RING/SQES, one region: IORING_FEAT_SINGLE_MMAP; IORING_SETUP_CQSIZE, CLAMP, IOPOLL (O_DIRECT reads and writes polled on the disk's poll queues: virtio_blk.poll_queues=, default 0, EOPNOTSUPP without; other operations but NOP EINVAL); no SQPOLL)
-- [x] io_uring_enter (SQEs read from the shared SQ, CQEs posted to the shared CQ, overflow kept: IORING_FEAT_NODROP; GETEVENTS sleeps interruptibly for min_complete, IORING_ENTER_EXT_ARG timeout and sigmask; O_DIRECT READ/WRITE(V)/_FIXED on block devices asynchronous; what would block, IOSQE_ASYNC, fsync/statx/openat/ftruncate/accept/connect, link chains and drained requests run in io-wq worker threads of the process, iou-wrk-<tid>)
+- [x] io_uring_enter (SQEs read from the shared SQ, CQEs posted to the shared CQ, overflow kept: IORING_FEAT_NODROP; GETEVENTS sleeps interruptibly for min_complete, IORING_ENTER_EXT_ARG timeout and sigmask; O_DIRECT READ/WRITE(V)/_FIXED on block devices and vfat asynchronous; what would block, IOSQE_ASYNC, fsync/statx/openat/ftruncate/accept/connect, link chains and drained requests run in io-wq worker threads of the process, iou-wrk-<tid>)
 - [x] io_uring_register (FILES, UNREGISTER_FILES, FILES_UPDATE, BUFFERS, UNREGISTER_BUFFERS: pinned once, charged to RLIMIT_MEMLOCK without CAP_IPC_LOCK)
 
 10. Credentials, security, keyrings

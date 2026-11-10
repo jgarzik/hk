@@ -1,7 +1,7 @@
 //! IORING_OP_READ, WRITE, READV and WRITEV (Linux io_uring/rw.c)
 //!
 //! O_DIRECT I/O on a file that can start it without waiting (a block
-//! device: `FileOps::can_async_dio`) runs asynchronously: the memory is
+//! device, a vfat file: `FileOps::can_async_dio`) runs asynchronously: the memory is
 //! pinned in the submitter (Linux io_import_iovec + the bio's pin), the
 //! request issued with IOCB_NOWAIT (Linux io_read/io_write in the
 //! submitter, IO_URING_F_NONBLOCK); if that would wait (EAGAIN) it is
@@ -116,7 +116,7 @@ pub fn rw(
     // IOPOLL: O_DIRECT only, polled (Linux io_rw_init_file: IOCB_HIPRI,
     // EOPNOTSUPP without IOCB_DIRECT or ->iopoll)
     if r.iopoll {
-        if !async_ok(&file) {
+        if !async_ok(&file) || !file.f_op.can_iopoll(&file) {
             return Some(Err(KernelError::OperationNotSupported));
         }
         flags |= RwFlags::HIPRI;

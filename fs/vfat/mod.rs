@@ -2339,6 +2339,23 @@ impl FileOps for VfatFileOps {
         file.get_inode().is_some_and(|i| i.mode().is_file())
     }
 
+    /// Regular files (Linux do_blockdev_direct_IO with an async kiocb)
+    fn can_async_dio(&self, file: &File) -> bool {
+        self.can_odirect(file)
+    }
+
+    /// The asynchronous O_DIRECT path (`direct::submit`)
+    fn dio_submit(
+        &self,
+        file: &File,
+        io: Arc<dyn crate::block::dio::AsyncIo>,
+        pos: u64,
+        write: bool,
+        flags: RwFlags,
+    ) -> Result<Option<usize>, KernelError> {
+        direct::submit(file, io, pos, write, flags)
+    }
+
     /// Regular files map their data (Linux generic_file_mmap);
     /// directories have no mmap
     fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
@@ -2348,7 +2365,7 @@ impl FileOps for VfatFileOps {
         }
     }
 
-    /// O_DIRECT from user memory straight from the disk
+    /// O_DIRECT from user memory or pinned pages straight from the disk
     /// (`direct::read`), else from the page cache (Linux
     /// generic_file_read_iter); no RWF_NOWAIT (EOPNOTSUPP)
     fn read_iter(
@@ -2363,7 +2380,7 @@ impl FileOps for VfatFileOps {
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let pos = at.unwrap_or_else(|| file.get_pos());
-        let n = if flags.contains(RwFlags::DIRECT) && to.user_backed() && inode.mode().is_file() {
+        let n = if flags.contains(RwFlags::DIRECT) && to.pinnable() && inode.mode().is_file() {
             direct::read(&inode, to, pos)?
         } else {
             filemap::read_iter(&inode, to, pos)?
@@ -2374,7 +2391,8 @@ impl FileOps for VfatFileOps {
         Ok(n)
     }
 
-    /// O_DIRECT from user memory straight to the disk where it can
+    /// O_DIRECT from user memory or pinned pages straight to the disk
+    /// where it can
     /// (`direct::write`), else `vfat_write`; no RWF_NOWAIT (EOPNOTSUPP)
     fn write_iter(
         &self,
@@ -2388,7 +2406,7 @@ impl FileOps for VfatFileOps {
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let pos = at.unwrap_or_else(|| file.get_pos());
-        let n = if flags.contains(RwFlags::DIRECT) && from.user_backed() && !from.is_empty() {
+        let n = if flags.contains(RwFlags::DIRECT) && from.pinnable() && !from.is_empty() {
             direct::write(&inode, from, pos)?
         } else {
             vfat_write(&inode, from, pos)?
