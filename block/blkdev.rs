@@ -169,7 +169,7 @@ pub struct Bio {
     pub private: usize,
     /// Bios merged behind this one into one request (Linux rq->bio
     /// chain): each ends on its own when the request does
-    /// (`rq_end`); blk-mq only
+    /// (`bio_endio`); blk-mq only
     pub merged: BioList,
     /// Address of the queue a plugged bio is for (`plug`)
     pub(super) plug_q: usize,
@@ -241,19 +241,15 @@ impl Bio {
     }
 }
 
-/// Finish a request: the bios merged behind `bio` with its status, then
-/// `bio` (Linux blk_update_request, bio by bio). Any context.
-pub fn rq_end(mut bio: Box<Bio>) {
+/// Finish a bio: hand it to its `end_io` or free it (Linux bio_endio).
+/// A request's head ends the bios merged behind it first, with its
+/// status (Linux blk_mq_end_request: blk_update_request, bio by bio).
+/// Callable in hardirq context (the heap is IRQ-safe).
+pub fn bio_endio(mut bio: Box<Bio>) {
     while let Some(mut b) = bio.merged.pop() {
         b.status = bio.status;
         bio_endio(b);
     }
-    bio_endio(bio);
-}
-
-/// Finish a bio: hand it to its `end_io` or free it (Linux bio_endio).
-/// Callable in hardirq context (the heap is IRQ-safe).
-pub fn bio_endio(bio: Box<Bio>) {
     match bio.end_io {
         Some(f) => f(bio),
         None => drop(bio),

@@ -49,7 +49,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 
-use super::blkdev::{Bio, BioFlags, BioList, bio_io_error, rq_end};
+use super::blkdev::{Bio, BioFlags, BioList, bio_endio, bio_io_error};
 use crate::util::error::KernelError;
 use crate::util::group_cpus::{first_cpu, group_of};
 
@@ -132,7 +132,7 @@ impl HwState {
 fn end_all(l: &mut BioList) -> usize {
     let mut n = 0;
     while let Some(bio) = l.pop() {
-        rq_end(bio);
+        bio_endio(bio);
         n += 1;
     }
     n

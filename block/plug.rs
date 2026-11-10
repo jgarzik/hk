@@ -317,7 +317,15 @@ mod tests {
             assert!(merge(&q, &mut rq, b).is_ok());
         }
         rq.status = Err(crate::util::error::KernelError::Io);
-        crate::block::blkdev::rq_end(rq);
+        crate::block::blkdev::bio_endio(rq);
         assert_eq!(ENDED.load(Ordering::Relaxed), 3);
+        // bio_io_error too (Linux blk_mq_end_request with an error)
+        let mut rq = bio(0, 1);
+        rq.end_io = Some(done);
+        let mut b = bio(8, 1);
+        b.end_io = Some(done);
+        assert!(merge(&q, &mut rq, b).is_ok());
+        crate::block::blkdev::bio_io_error(rq, crate::util::error::KernelError::Io);
+        assert_eq!(ENDED.load(Ordering::Relaxed), 5);
     }
 }
