@@ -36,7 +36,7 @@ fn open_dev(d: &BlkDev, flags: u32) -> i64 {
 }
 
 /// vda3's first sector on vda (sysfs)
-fn p3_start() -> Option<i64> {
+pub fn p3_start() -> Option<i64> {
     let mut b = [0u8; 32];
     let n = read_file(b"/sys/class/block/vda3/start\0", &mut b);
     let s = b.get(..usize::try_from(n).ok()?)?;
