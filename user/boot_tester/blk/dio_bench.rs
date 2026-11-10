@@ -6,14 +6,18 @@
 //! with its own buffer, read in parallel): direct only. O_DSYNC
 //! direct 1 MiB writes put back what they overwrite (each chunk is read
 //! first, untimed). `DIO_BENCH:` lines, to compare hk with Linux on the
-//! same QEMU. Only when the kernel command line has `hk.bench` (`make
-//! check BENCH=1`).
+//! same QEMU. vfat rows: a 16 MiB file on vda1, 1 MiB sequential and
+//! 4 KiB random reads, buffered (page cache dropped first) and direct.
+//! Only when the kernel command line has `hk.bench` (`make check
+//! BENCH=1`).
 
 use crate::helpers::{find_blkdev, print, print_num, println, read_file};
 use hk_syscall::{
-    IoVec, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, O_RDONLY, O_RDWR, PROT_READ, PROT_WRITE,
-    Timespec, sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_ioctl, sys_mmap, sys_munmap,
-    sys_open, sys_pipe2, sys_pread64, sys_preadv2, sys_pwritev2, sys_read, sys_wait4, sys_write,
+    IoVec, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    PROT_READ, PROT_WRITE, Timespec, sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_fsync,
+    sys_ioctl, sys_mkdir, sys_mmap, sys_mount, sys_munmap, sys_open, sys_pipe2, sys_pread64,
+    sys_preadv2, sys_pwrite64, sys_pwritev2, sys_read, sys_rmdir, sys_umount2, sys_unlink,
+    sys_wait4, sys_write,
 };
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
@@ -75,6 +79,7 @@ pub fn run_tests() {
         println(b"DIO_BENCH: setup error");
     } else {
         bench(b, d, buf as u64);
+        vfat(buf as u64);
     }
     if buf > 0 {
         sys_munmap(buf as u64, MIB);
@@ -303,4 +308,96 @@ fn line(what: &[u8], row: &[(&[u8], i64)], bytes: u64, ios: u64) {
         }
     }
     println(b"");
+}
+
+/// The vfat file the vfat rows read (16 MiB on vda1, 512-byte clusters)
+const VFAT_FILE: &[u8] = b"/tmp/vfat_bench/BENCH.BIN\0";
+const VFAT_MNT: &[u8] = b"/tmp/vfat_bench\0";
+const VFAT_SIZE: u64 = 16 * MIB;
+
+/// Drop the clean page cache (vm.drop_caches 1): a cold buffered run
+fn drop_caches() {
+    let fd = sys_open(b"/proc/sys/vm/drop_caches\0".as_ptr(), O_WRONLY, 0);
+    if fd >= 0 {
+        sys_write(fd as u64, b"1\n".as_ptr(), 2);
+        sys_close(fd as u64);
+    }
+}
+
+/// vfat rows: a 16 MiB file on vda1, buffered (cold) and direct, 1 MiB
+/// sequential and 4 KiB random reads at depth 1
+fn vfat(buf: u64) {
+    let Some(p1) = find_blkdev(b"vd", 32768) else {
+        println(b"DIO_BENCH: no vda1");
+        return;
+    };
+    let mut p = [0u8; 48];
+    sys_mkdir(VFAT_MNT.as_ptr(), 0o755);
+    let m = sys_mount(
+        p1.path(&mut p).as_ptr(),
+        VFAT_MNT.as_ptr(),
+        b"vfat\0".as_ptr(),
+        0,
+        b"iocharset=cp437\0".as_ptr() as u64,
+    );
+    if m != 0 {
+        println(b"DIO_BENCH: vfat mount error");
+        return;
+    }
+    if vfat_fill(buf) {
+        let b = sys_open(VFAT_FILE.as_ptr(), O_RDONLY, 0) as i32;
+        let d = sys_open(VFAT_FILE.as_ptr(), O_RDONLY | O_DIRECT, 0) as i32;
+        let seq = Run {
+            len: MIB,
+            n: SEQ / MIB,
+            random: false,
+            flags: 0,
+        };
+        let rnd = Run {
+            len: 4096,
+            n: RAND,
+            random: true,
+            flags: 0,
+        };
+        let cold = |fd, r| {
+            drop_caches();
+            timed(fd, buf, r, false)
+        };
+        let row = [
+            (&b" buffered "[..], cold(b, seq)),
+            (b" direct ", timed(d, buf, seq, false)),
+        ];
+        line(b"vfat seq 1M QD1", &row, SEQ, 0);
+        let row = [
+            (&b" buffered "[..], cold(b, rnd)),
+            (b" direct ", timed(d, buf, rnd, false)),
+        ];
+        line(b"vfat rand 4K QD1", &row, RAND * 4096, RAND);
+        sys_close(b as u64);
+        sys_close(d as u64);
+    } else {
+        println(b"DIO_BENCH: vfat file error");
+    }
+    sys_unlink(VFAT_FILE.as_ptr());
+    sys_umount2(VFAT_MNT.as_ptr(), 0);
+    sys_rmdir(VFAT_MNT.as_ptr());
+}
+
+/// Write the vfat file, 1 MiB at a time through `buf`, and fsync it
+fn vfat_fill(buf: u64) -> bool {
+    let fd = sys_open(VFAT_FILE.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644) as i32;
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: the 1 MiB benchmark buffer
+    unsafe { core::ptr::write_bytes(buf as *mut u8, 0x5a, MIB as usize) };
+    let mut ok = true;
+    let mut off = 0;
+    while ok && off < VFAT_SIZE {
+        ok = sys_pwrite64(fd, buf as *const u8, MIB, off as i64) == MIB as i64;
+        off += MIB;
+    }
+    ok &= sys_fsync(fd) == 0;
+    sys_close(fd as u64);
+    ok
 }
