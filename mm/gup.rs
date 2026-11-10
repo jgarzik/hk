@@ -32,6 +32,7 @@ use crate::FRAME_ALLOCATOR;
 use crate::arch::paging;
 use crate::fs::Inode;
 use crate::util::error::KernelError;
+use crate::util::seg::trim_tail;
 use crate::util::smallvec::SmallVec;
 
 /// References one pin takes (Linux GUP_PIN_COUNTING_BIAS)
@@ -107,22 +108,19 @@ impl PinnedPages {
 
     /// Give back the last `n` bytes, unpinning the pages left with none
     /// (Linux bio_iov_iter_align_down)
-    pub fn trim(&mut self, mut n: usize) {
-        while n > 0 {
-            let Some(last) = self.segs.last_mut() else {
-                return;
-            };
-            if last.len as usize > n {
-                // Less than a page: lossless
-                last.len -= n as u32;
-                return;
-            }
-            n -= last.len as usize;
-            if let Some(s) = self.segs.pop() {
-                self.owners.pop();
+    pub fn trim(&mut self, n: usize) {
+        let owners = &mut self.owners;
+        trim_tail(
+            &mut self.segs,
+            n,
+            |s| s.len as usize,
+            // Less than a page: lossless
+            |s, l| s.len = l as u32,
+            |s| {
+                owners.pop();
                 unpin_page(s.phys);
-            }
-        }
+            },
+        );
     }
 
     /// The pages were written (a read from the device): dirty them when

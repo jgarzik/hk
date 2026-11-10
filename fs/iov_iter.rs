@@ -22,6 +22,7 @@ use crate::util::error::KernelError;
 
 use super::iov::IoVec;
 use crate::mm::gup::{PinnedPages, pin_user};
+use crate::util::seg::step_back;
 
 /// Position in a list of user segments
 struct Segs<'a> {
@@ -194,18 +195,10 @@ impl<'a> Segs<'a> {
     }
 
     /// Step back over the last `n` bytes moved
-    fn revert(&mut self, mut n: usize) {
+    fn revert(&mut self, n: usize) {
         self.left += n;
-        while n > 0 {
-            if self.off == 0 {
-                self.i -= 1;
-                self.off = self.segs[self.i].iov_len as usize;
-                continue;
-            }
-            let k = self.off.min(n);
-            self.off -= k;
-            n -= k;
-        }
+        let segs = self.segs;
+        step_back(|k| segs[k].iov_len as usize, &mut self.i, &mut self.off, n);
     }
 }
 

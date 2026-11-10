@@ -12,4 +12,5 @@ pub mod list;
 pub mod percpu_counter;
 pub mod pod;
 pub mod scope;
+pub mod seg;
 pub mod smallvec;

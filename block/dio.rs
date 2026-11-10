@@ -36,6 +36,7 @@ use crate::mm::gup::{PageSeg, PinnedPages};
 use crate::sync::completion::Completion;
 use crate::util::error::KernelError;
 use crate::util::kmem::KVec;
+use crate::util::seg::{step_back, trim_tail};
 
 use super::blkdev::{
     Bio, BioFlags, BioOp, BioSeg, BioSegs, BlockDevice, QueueLimits, SECTOR_SHIFT, submit_bio,
@@ -145,7 +146,6 @@ struct Dio<'a> {
     nowait: bool,
     /// First sector
     sector: u64,
-    read: bool,
 }
 
 impl<'a> Dio<'a> {
@@ -161,7 +161,6 @@ impl<'a> Dio<'a> {
             },
             nowait: flags.nowait(),
             sector: pos >> SECTOR_SHIFT,
-            read: I::READ,
         }
     }
 
@@ -174,15 +173,11 @@ impl<'a> Dio<'a> {
     /// Up to `BIO_MAX_VECS` pages, `nr` of them: pinned once (short if
     /// the pin is), one wait (Linux __blkdev_direct_IO_simple)
     fn simple<I: DioIter>(&self, it: &mut I, nr: usize) -> Result<usize, KernelError> {
-        let mut pp = self.pin(it, nr)?;
+        let pp = self.pin(it, nr)?;
         let w = DioWait::new();
         let sent = self.send(&pp, self.sector, &w);
+        let pp = self.sent(pp, &sent);
         let r = w.finish();
-        // Dirtied whatever the result (Linux bio_release_pages), unless
-        // nothing went out
-        if self.read && sent.is_ok() {
-            pp.set_dirty();
-        }
         drop(pp);
         let n = sent?;
         r.map(|()| n)
@@ -218,8 +213,10 @@ impl<'a> Dio<'a> {
                 break;
             }
             let sent = self.send(&pp, self.sector + (done as u64 >> SECTOR_SHIFT), &w);
-            // Room was reserved: no allocation, cannot fail
-            let _ = pins.try_push(pp);
+            if let Some(pp) = self.sent(pp, &sent) {
+                // Room was reserved: no allocation, cannot fail
+                let _ = pins.try_push(pp);
+            }
             match sent {
                 Ok(n) => done += n,
                 Err(e) => {
@@ -229,13 +226,22 @@ impl<'a> Dio<'a> {
             }
         }
         let r = w.finish();
-        while let Some(mut pp) = pins.pop() {
-            if self.read {
-                pp.set_dirty();
-            }
-        }
+        drop(pins);
         ret?;
         r.map(|()| done)
+    }
+
+    /// What of `pp` must stay pinned until the wait after `send` gave
+    /// `sent`: the bytes sent, dirtied for a read when unpinned (Linux
+    /// bio_release_pages, whatever the result); the rest is unpinned now,
+    /// clean (None if nothing went out)
+    fn sent(&self, mut pp: PinnedPages, sent: &Result<usize, KernelError>) -> Option<PinnedPages> {
+        let n = *sent.as_ref().ok()?;
+        pp.trim(pp.len() - n);
+        if self.op == BioOp::Read {
+            pp.set_dirty();
+        }
+        Some(pp)
     }
 
     /// Send `pp` from `sector` on as bios within the queue limits, each
@@ -355,13 +361,43 @@ impl Cursor {
         self.i >= segs.len()
     }
 
-    /// Bio segments the next bio may take (at most the queue's)
+    /// Bio segments the next bio takes before its cut back to whole
+    /// blocks (room to reserve)
     fn room(&self, segs: &[PageSeg], lim: &QueueLimits) -> usize {
-        let per = (crate::mm::PAGE_SIZE as usize).div_ceil((lim.max_segment_size as usize).max(1));
-        segs.len()
-            .saturating_sub(self.i)
-            .saturating_mul(per)
-            .min(lim.max_segments as usize)
+        let mut n = 0;
+        let mut c = *self;
+        c.fill(segs, lim, &mut |_| n += 1);
+        n
+    }
+
+    /// Give `f` the next bio's segments of `segs`, as many as the limits
+    /// allow (max_sectors, max_segments, segments of at most
+    /// max_segment_size), stepping over them; the bytes
+    fn fill(&mut self, segs: &[PageSeg], lim: &QueueLimits, f: &mut dyn FnMut(BioSeg)) -> usize {
+        let max_bytes = (lim.max_sectors as usize) << SECTOR_SHIFT;
+        let seg_max = (lim.max_segment_size as usize).max(1);
+        let (mut bytes, mut nr) = (0, 0);
+        while let Some(s) = segs.get(self.i) {
+            if nr >= lim.max_segments as usize || bytes >= max_bytes {
+                break;
+            }
+            let n = (s.len as usize - self.at)
+                .min(seg_max)
+                .min(max_bytes - bytes);
+            f(BioSeg {
+                frame: s.phys,
+                offset: s.off as usize + self.at,
+                len: n,
+            });
+            nr += 1;
+            bytes += n;
+            self.at += n;
+            if self.at == s.len as usize {
+                self.i += 1;
+                self.at = 0;
+            }
+        }
+        bytes
     }
 
     /// The next bio's segments of `segs` into `out`: as many bytes as
@@ -374,65 +410,15 @@ impl Cursor {
         lim: &QueueLimits,
         out: &mut BioSegs,
     ) -> Result<usize, KernelError> {
-        let max_bytes = (lim.max_sectors as usize) << SECTOR_SHIFT;
-        let seg_max = (lim.max_segment_size as usize).max(1);
-        let lbs = lim.logical_block_size as usize;
         out.clear();
-        let mut bytes = 0;
-        while let Some(s) = segs.get(self.i) {
-            if out.len() >= lim.max_segments as usize || bytes >= max_bytes {
-                break;
-            }
-            let n = (s.len as usize - self.at)
-                .min(seg_max)
-                .min(max_bytes - bytes);
-            out.push(BioSeg {
-                frame: s.phys,
-                offset: s.off as usize + self.at,
-                len: n,
-            });
-            bytes += n;
-            self.at += n;
-            if self.at == s.len as usize {
-                self.i += 1;
-                self.at = 0;
-            }
-        }
-        let excess = bytes % lbs;
-        self.back(segs, excess);
-        trim(out, excess);
+        let bytes = self.fill(segs, lim, &mut |s| out.push(s));
+        let excess = bytes % lim.logical_block_size as usize;
+        step_back(|k| segs[k].len as usize, &mut self.i, &mut self.at, excess);
+        trim_tail(out, excess, |s| s.len, |s, l| s.len = l, drop);
         match bytes - excess {
             0 => Err(KernelError::InvalidArgument),
             n => Ok(n),
         }
-    }
-
-    /// Step back `n` bytes
-    fn back(&mut self, segs: &[PageSeg], mut n: usize) {
-        while n > 0 {
-            if self.at == 0 {
-                self.i -= 1;
-                self.at = segs[self.i].len as usize;
-            }
-            let k = self.at.min(n);
-            self.at -= k;
-            n -= k;
-        }
-    }
-}
-
-/// Drop the last `n` bytes of `segs`
-fn trim(segs: &mut BioSegs, mut n: usize) {
-    while n > 0 {
-        let Some(last) = segs.last_mut() else {
-            return;
-        };
-        if last.len > n {
-            last.len -= n;
-            return;
-        }
-        n -= last.len;
-        segs.pop();
     }
 }
 
