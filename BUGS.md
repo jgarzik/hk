@@ -570,10 +570,8 @@ return 0 without moving the device (Linux: moved, or an error).
   worker's read is EAGAIN (Linux polls until it is ready). Link chains
   run in a worker, not issued inline one by one; a chain with
   poll/timeout bookkeeping runs in io_uring_enter
-- An asynchronous O_DIRECT write whose range cannot be dropped from
-  the cache ends with EBUSY (Linux direct_write_fallback writes it
-  through the cache); a queued request with offset -1 does not move the
-  file position (as Linux), an inline one does
+- A queued request with offset -1 does not move the file position (as
+  Linux), an inline one does
 - IORING_OP_TIMEOUT has no timer (nothing ever completes it), and has
   no count trigger, TIMEOUT_UPDATE or MULTISHOT
 - IORING_OP_LINK_TIMEOUT returns 0 without arming anything

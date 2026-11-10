@@ -6,6 +6,11 @@
 //!   read back by AIO, then the pattern put back (PWRITEV) and checked
 //! - AIO_RESFD: an eventfd named by IOCB_FLAG_RESFD counts the
 //!   completions
+//! - AIO_DIO_REDIRTY: O_DIRECT writes of a page another process keeps
+//!   writing through a shared mapping of the device: a page that cannot
+//!   be dropped from the cache sends the write through it (Linux
+//!   kiocb_invalidate_pages EBUSY -> direct_write_fallback), so every
+//!   event reports the whole write
 //! - AIO_VFAT_DIO: on a vda1 vfat file, an extending O_DIRECT write
 //!   (synchronous, as Linux), overwrites within the size and reads back
 //!   by AIO match a buffered read; a read at the end is 0; misaligned
@@ -27,6 +32,10 @@ use hk_syscall::{
     IoVec, O_CREAT, O_RDONLY, O_TRUNC, sys_eventfd2, sys_mkdir, sys_mount, sys_pread64, sys_read,
     sys_rmdir, sys_umount2, sys_unlink,
 };
+use hk_syscall::{
+    MAP_SHARED, PROT_READ, PROT_WRITE, sys_exit, sys_fork, sys_kill, sys_mmap, sys_pwrite64,
+    sys_wait4,
+};
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
 const PAGE: usize = 4096;
@@ -42,6 +51,7 @@ pub fn run_tests() {
     };
     report_r(b"AIO_DIO_RW", rw(&p3));
     report_r(b"AIO_RESFD", resfd(&p3));
+    report_r(b"AIO_DIO_REDIRTY", redirty(&p3));
     let Some(p1) = find_blkdev(b"vd", 32768) else {
         report_r(b"AIO_VFAT_DIO", check(b"no vda1", false, 0));
         return;
@@ -220,6 +230,75 @@ fn resfd(d: &BlkDev) -> R {
     }
     sys_close(fd as u64);
     r
+}
+
+/// The page the redirty test writes
+const RD_PAGE: u64 = WR + 512 * 1024;
+/// Writes it makes
+const REDIRTY_N: usize = 200;
+
+/// In a child: write vda3's page at `page` through a shared mapping
+/// until killed
+pub fn dirtier(d: &BlkDev, page: u64) -> ! {
+    let Ok(fd) = open(d, hk_syscall::O_RDWR) else {
+        sys_exit(1)
+    };
+    let m = sys_mmap(0, PAGE as u64, PROT_READ | PROT_WRITE, MAP_SHARED, fd, page);
+    if m <= 0 {
+        sys_exit(2);
+    }
+    let mut i = 0u8;
+    loop {
+        // SAFETY: inside the mapping
+        unsafe { core::ptr::write_volatile((m as *mut u8).add(usize::from(i) * 16), i) };
+        i = i.wrapping_add(1);
+    }
+}
+
+fn redirty(d: &BlkDev) -> R {
+    let pid = sys_fork();
+    if pid == 0 {
+        dirtier(d, RD_PAGE);
+    }
+    check(b"fork", pid > 0, pid)?;
+    let fd = open(d, hk_syscall::O_RDWR | O_DIRECT);
+    let r = fd.and_then(|fd| {
+        let r = (|| {
+            let c = Ctx::new(8)?;
+            let b = Buf::new(PAGE)?;
+            b.bytes(0, PAGE).fill(0x5a);
+            let cb = iocb(
+                IOCB_CMD_PWRITE,
+                fd,
+                b.addr(0),
+                PAGE as u64,
+                RD_PAGE as i64,
+                1,
+            );
+            let mut ev = [IoEvent::default(); 1];
+            for _ in 0..REDIRTY_N {
+                c.submit1(&cb)?;
+                c.get_all(&mut ev)?;
+                check(b"write res", ev[0].res == PAGE as i64, ev[0].res)?;
+            }
+            Ok(())
+        })();
+        sys_close(fd as u64);
+        r
+    });
+    sys_kill(pid, 9);
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    // The pattern back
+    let fd = open(d, hk_syscall::O_RDWR | O_DIRECT)?;
+    let b = Buf::new(PAGE)?;
+    for (k, v) in b.bytes(0, PAGE).iter_mut().enumerate() {
+        *v = pat(RD_PAGE + k as u64);
+    }
+    let w = sys_pwrite64(fd, b.p, PAGE as u64, RD_PAGE as i64);
+    sys_close(fd as u64);
+    r?;
+    check(b"restore", w == PAGE as i64, w)
 }
 
 const MNT: &[u8] = b"/tmp/aio_vfat\0";

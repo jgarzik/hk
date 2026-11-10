@@ -15,6 +15,10 @@
 //! - IO_URING_DIO_FUTEX: a timed futex wait while O_DIRECT reads end
 //!   (their completions are run by the waiting task) times out; it is
 //!   not ended with EINTR (Linux restarts it: -ERESTART_RESTARTBLOCK)
+//! - IO_URING_DIO_REDIRTY: O_DIRECT writes of a page another process
+//!   keeps writing through a shared mapping: the page that cannot be
+//!   dropped sends the write through the cache (Linux
+//!   direct_write_fallback), each CQE the whole write
 //! - IO_URING_DIO_NONOWAIT (hk only: no USB disk on the Linux
 //!   references): an O_DIRECT read of a disk that cannot honor
 //!   IOCB_NOWAIT (sda, bio-based) goes to a worker and completes (Linux
@@ -39,12 +43,13 @@ pub fn run_tests() {
         report_r(b"IO_URING_DIO", check(b"no vda3", false, 0));
         return;
     };
-    let cases: [(&[u8], fn(&BlkDev) -> R); 5] = [
+    let cases: [(&[u8], fn(&BlkDev) -> R); 6] = [
         (b"IO_URING_DIO_ASYNC", async_reads),
         (b"IO_URING_DIO_WRITE", writes),
         (b"IO_URING_DIO_CUR_POS", cur_pos),
         (b"IO_URING_DIO_HIPRI", hipri),
         (b"IO_URING_DIO_FUTEX", futex),
+        (b"IO_URING_DIO_REDIRTY", redirty),
     ];
     for (name, t) in cases {
         report_r(name, t(&p3));
@@ -329,4 +334,40 @@ fn nonowait() -> R {
     })();
     sys_close(fd as u64);
     r
+}
+
+/// The page `redirty` writes (13 MiB + 512 KiB)
+const RD_PAGE: u64 = WR + 512 * 1024;
+
+fn redirty(d: &BlkDev) -> R {
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        crate::aio::dio::dirtier(d, RD_PAGE);
+    }
+    check(b"fork", pid > 0, pid)?;
+    let r = with_fd(d, O_RDWR | O_DIRECT, |fd| {
+        let mut r = Ring::simple(4).map_err(|e| (&b"ring"[..], e))?;
+        let b = Buf::new(4096)?;
+        b.bytes(0, 4096).fill(0x5a);
+        for i in 0..200 {
+            r.push(sqe(IORING_OP_WRITE, fd, b.addr(0), 4096, RD_PAGE, i));
+            reap(&r, 1, 1, &mut |_, res| {
+                check(b"write res", res == 4096, i64::from(res))
+            })?;
+        }
+        Ok(())
+    });
+    hk_syscall::sys_kill(pid, 9);
+    let mut st = 0;
+    hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+    // The pattern back
+    let back = with_fd(d, O_RDWR | O_DIRECT, |fd| {
+        let b = Buf::new(4096)?;
+        for (k, v) in b.bytes(0, 4096).iter_mut().enumerate() {
+            *v = pat(RD_PAGE + k as u64);
+        }
+        let w = hk_syscall::sys_pwrite64(fd, b.p, 4096, RD_PAGE as i64);
+        check(b"restore", w == 4096, w)
+    });
+    r.and(back)
 }

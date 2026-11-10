@@ -126,7 +126,7 @@ fn dio_read(
 /// of the device, the cache over the range written back (a write: and
 /// dropped) first, then the bios (`dio::submit_async`). RWF_NOWAIT:
 /// EAGAIN where that would wait. A write whose range cannot be dropped
-/// from the cache is EBUSY (Linux falls back to a buffered write: BUGS)
+/// from the cache goes through it at once (`cache_fallback`)
 fn dio_submit_async(
     file: &File,
     io: Arc<dyn dio::AsyncIo>,
@@ -146,11 +146,35 @@ fn dio_submit_async(
     }
     let count = len.min((b.capacity() - pos).min(usize::MAX as u64) as usize);
     if write {
-        invalidate_pages(&b, pos, count, flags.nowait())?;
+        match invalidate_pages(&b, pos, count, flags.nowait()) {
+            Err(KernelError::Busy) => {
+                return cache_fallback(file, &b, &*io, pos, count, flags).map(Some);
+            }
+            r => r?,
+        }
     } else {
         write_and_wait(&b, pos, count, flags.nowait())?;
     }
     dio::submit_async(&b, io, pos, count, write, flags).map(|()| None)
+}
+
+/// An asynchronous O_DIRECT write of `count` bytes of `io`'s memory at
+/// `pos` whose range could not be dropped from the cache, done now
+/// through it, written back and dropped (Linux blkdev_direct_write
+/// returns 0 on EBUSY, and blkdev_write_iter's direct_write_fallback
+/// does the whole write buffered; then generic_write_sync): the bytes
+fn cache_fallback(
+    file: &File,
+    b: &BlockDevice,
+    io: &dyn dio::AsyncIo,
+    pos: u64,
+    count: usize,
+    flags: RwFlags,
+) -> Result<usize, KernelError> {
+    let mut from = IovSource::async_io(io);
+    from.truncate(count);
+    let n = write_fallback(b, &mut from, pos, 0, flags.nowait())?;
+    generic_write_sync(file, pos, n, flags.contains(RwFlags::DSYNC))
 }
 
 /// Last byte of `count` (> 0) bytes at `pos`
