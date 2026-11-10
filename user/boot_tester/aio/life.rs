@@ -5,6 +5,11 @@
 //!   drops
 //! - AIO_EXIT_INFLIGHT: a child exiting with reads in flight is reaped
 //!   (Linux exit_aio waits for them), and its context leaves aio-nr
+//! - AIO_CLOSE_INFLIGHT: the descriptor closed with 32 O_DIRECT reads
+//!   in flight (the requests hold the file's last references, dropped
+//!   where the bios end): every event comes, with the data, and the
+//!   file is released soon after (its flock lock goes: Linux
+//!   delayed_fput)
 //! - AIO_FORK: MADV_DOFORK of the ring is EINVAL (VM_DONTEXPAND is
 //!   VM_SPECIAL, Linux 7.0 on); a fork child has no ring at the context's address
 //!   (VM_DONTCOPY, Linux 7.1 on) and no context there (EINVAL); where
@@ -18,8 +23,8 @@ use crate::helpers::{BlkDev, find_blkdev, linux_at_least, msleep};
 use crate::uring::dio::{Buf, is_pat, open};
 use hk_syscall::{
     MADV_DOFORK, MAP_ANONYMOUS, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE, O_RDONLY, PROT_READ,
-    sys_exit, sys_fork, sys_kill, sys_madvise, sys_mincore, sys_mmap, sys_mremap, sys_unlink,
-    sys_wait4,
+    sys_exit, sys_flock, sys_fork, sys_kill, sys_madvise, sys_mincore, sys_mmap, sys_mremap,
+    sys_unlink, sys_wait4,
 };
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
@@ -34,6 +39,7 @@ pub fn run_tests() {
     };
     report_r(b"AIO_DESTROY_INFLIGHT", destroy(&p3));
     report_r(b"AIO_EXIT_INFLIGHT", exit(&p3));
+    report_r(b"AIO_CLOSE_INFLIGHT", close_inflight(&p3));
     report_r(b"AIO_FORK", fork());
 }
 
@@ -75,6 +81,44 @@ fn destroy(d: &BlkDev) -> R {
     })();
     sys_close(fd as u64);
     r
+}
+
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
+
+fn close_inflight(d: &BlkDev) -> R {
+    let fd = open(d, O_RDONLY | O_DIRECT)?;
+    let l = sys_flock(fd, LOCK_EX);
+    if l != 0 {
+        sys_close(fd as u64);
+        return check(b"flock", false, l);
+    }
+    let c = Ctx::new(64)?;
+    let b = Buf::new(N * MIB)?;
+    let mut cbs = [Iocb::default(); N];
+    let r = reads(&c, fd, &b, &mut cbs);
+    sys_close(fd as u64);
+    r?;
+    let mut ev = [IoEvent::default(); N];
+    c.get_all(&mut ev)?;
+    for e in &ev {
+        check(b"event res", e.res == MIB as i64, e.res)?;
+        let i = e.data as usize;
+        let ok = is_pat(b.bytes(i * MIB, MIB), ((i % 7) * MIB) as u64);
+        check(b"data", ok, i as i64)?;
+    }
+    // The last reference's release comes a tick or so later
+    let fd2 = open(d, O_RDONLY)?;
+    let mut got = -1;
+    for _ in 0..200 {
+        got = sys_flock(fd2, LOCK_EX | LOCK_NB);
+        if got == 0 {
+            break;
+        }
+        msleep(5);
+    }
+    sys_close(fd2 as u64);
+    check(b"file released (flock free)", got == 0, got)
 }
 
 /// In a child: reads in flight, then exit without io_destroy
