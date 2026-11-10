@@ -20,6 +20,7 @@ use crate::task::task_work::task_work_run;
 use crate::time::hrtimer::{HrClock, schedule_hrtimeout};
 use crate::uaccess::copy_val_from_user;
 use crate::util::error::{KernelError, KernelResult};
+use crate::util::kmem::KVec;
 
 /// struct io_uring_getevents_arg
 #[repr(C)]
@@ -143,5 +144,66 @@ impl IoRing {
     fn cq_reached(&self, target: u32) -> bool {
         // Wrapping distance, signed: at or past
         self.rings.cq_tail().wrapping_sub(target) as i32 >= 0
+    }
+}
+
+impl IoRing {
+    /// Note `f` as having polled requests in flight
+    pub(super) fn poll_add(&self, f: &alloc::sync::Arc<crate::fs::file::File>) -> KernelResult<()> {
+        let mut l = self.poll_files.lock();
+        if !l.iter().any(|x| alloc::sync::Arc::ptr_eq(x, f)) {
+            l.try_push(f.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Reap the polled requests once; with none in flight the list
+    /// empties
+    fn poll_once(&self) {
+        let mut l = self.poll_files.lock();
+        if self.inflight.load(Ordering::Acquire) == 0 {
+            // Released after the lock: a last file reference may sleep
+            let old = core::mem::replace(&mut *l, KVec::new());
+            drop(l);
+            drop(old);
+            return;
+        }
+        for f in l.iter() {
+            f.f_op.iopoll(f);
+        }
+    }
+
+    /// GETEVENTS on an IOPOLL ring (Linux io_iopoll_check): poll for
+    /// `min` CQEs; it returns early with nothing in flight, on a signal
+    /// (EINTR) or when the task should give up the CPU (0, as Linux on
+    /// need_resched)
+    pub fn iopoll_check(&self, min: u32) -> KernelResult<()> {
+        let min = min.min(self.rings.cq_entries());
+        task_work_run();
+        self.flush_overflow();
+        if self.dropped.load(Ordering::Acquire) {
+            return Err(KernelError::BadRequest);
+        }
+        if self.cq_events() != 0 {
+            return Ok(());
+        }
+        let me = current();
+        loop {
+            task_work_run();
+            if self.cq_events() >= min || self.inflight.load(Ordering::Acquire) == 0 {
+                return Ok(());
+            }
+            self.poll_once();
+            task_work_run();
+            if self.cq_events() >= min {
+                return Ok(());
+            }
+            if me.sigpending() {
+                return Err(KernelError::Interrupted);
+            }
+            if me.has_tif(crate::task::tif::NEED_RESCHED) {
+                return Ok(());
+            }
+        }
     }
 }

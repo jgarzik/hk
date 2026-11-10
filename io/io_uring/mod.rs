@@ -76,7 +76,7 @@ const FEATURES: u32 = IORING_FEAT_SINGLE_MMAP
     | IORING_FEAT_CQE_SKIP;
 
 /// Setup flags hk implements
-const SETUP_FLAGS: u32 = IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP;
+const SETUP_FLAGS: u32 = IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP | IORING_SETUP_IOPOLL;
 
 /// io_uring_enter flags hk accepts; SQ_WAKEUP and SQ_WAIT do nothing on
 /// a ring without SQPOLL (Linux)
@@ -107,6 +107,12 @@ struct Cq {
 /// One io_uring (Linux io_ring_ctx)
 pub struct IoRing {
     rings: Rings,
+    /// IORING_SETUP_IOPOLL: O_DIRECT only, completions polled for
+    iopoll: bool,
+    /// Files with polled requests issued (Linux iopoll_list, by file):
+    /// polled by GETEVENTS (`iopoll_check`); emptied once nothing is in
+    /// flight
+    poll_files: crate::sync::spin::Mutex<KVec<Arc<File>>>,
     /// The user its locked memory is charged to (Linux ctx->user: none
     /// with CAP_IPC_LOCK), and its rings' pages charged
     acct: Option<crate::task::Uid>,
@@ -164,13 +170,15 @@ impl Submit {
 }
 
 impl IoRing {
-    fn new(sq: u32, cq: u32) -> KernelResult<Arc<Self>> {
+    fn new(sq: u32, cq: u32, flags: u32) -> KernelResult<Arc<Self>> {
         let rings = Rings::new(sq, cq)?;
         let acct = rsrc::acct_user();
         let ring_pages = rings.pages();
         rsrc::account(acct, ring_pages)?;
         try_arc(Self {
             rings,
+            iopoll: flags & IORING_SETUP_IOPOLL != 0,
+            poll_files: crate::sync::spin::Mutex::new(KVec::new()),
             acct,
             ring_pages,
             submit: Mutex::new(Submit {
@@ -230,7 +238,7 @@ impl IoRing {
         let linked = sqe.flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK) != 0;
         let hard = sqe.flags & IOSQE_IO_HARDLINK != 0;
         let drain = sqe.flags & IOSQE_IO_DRAIN != 0;
-        let init = init_check(sqe);
+        let init = init_check(sqe, self.iopoll);
         if init.is_ok() && drain {
             self.drain_wait();
         }
@@ -508,9 +516,23 @@ impl IoRing {
 
 /// The checks an SQE fails before it is queued (Linux io_init_req):
 /// an opcode past the last, unknown SQE flags, a personality (none can
-/// be registered)
-fn init_check(sqe: &IoUringSqe) -> KernelResult<()> {
+/// be registered), and on an IOPOLL ring an operation that cannot be
+/// polled (Linux !def->iopoll)
+fn init_check(sqe: &IoUringSqe, iopoll: bool) -> KernelResult<()> {
     if sqe.opcode >= IORING_OP_LAST || sqe.flags & !SQE_VALID_FLAGS != 0 || sqe.personality != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let pollable = matches!(
+        sqe.opcode,
+        IORING_OP_NOP
+            | IORING_OP_READV
+            | IORING_OP_WRITEV
+            | IORING_OP_READ_FIXED
+            | IORING_OP_WRITE_FIXED
+            | IORING_OP_READ
+            | IORING_OP_WRITE
+    );
+    if iopoll && !pollable {
         return Err(KernelError::InvalidArgument);
     }
     Ok(())
@@ -644,7 +666,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: UserPtr<IoUringParams>) -> K
         return Err(KernelError::InvalidArgument);
     }
     let (sq, cq) = ring_sizes(entries, &p)?;
-    let ring = IoRing::new(sq, cq)?;
+    let ring = IoRing::new(sq, cq, p.flags)?;
     p.sq_entries = sq;
     p.cq_entries = cq;
     p.features = FEATURES;
@@ -684,8 +706,13 @@ pub fn sys_io_uring_enter(
         }
     }
     if flags & IORING_ENTER_GETEVENTS != 0 {
-        let r =
-            wait::get_ext_arg(flags, argp, argsz).and_then(|ext| ring.cq_wait(min_complete, &ext));
+        let r = wait::get_ext_arg(flags, argp, argsz).and_then(|ext| {
+            if ring.iopoll {
+                ring.iopoll_check(min_complete)
+            } else {
+                ring.cq_wait(min_complete, &ext)
+            }
+        });
         if ret == 0 {
             // Told once: the drop is reported (Linux clears
             // IO_CHECK_CQ_DROPPED_BIT on returning EBADR)

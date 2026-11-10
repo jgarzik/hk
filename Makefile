@@ -199,8 +199,11 @@ export NO_KVM LINUX_NOCACHE
 
 # BENCH=1: boot with hk.bench on the kernel command line (hk and the
 # Linux reference), which runs the boot tester's print-only benchmarks
-# (DIO_BENCH); extra words go in HK_CMDLINE
+# (DIO_BENCH); extra words go in HK_CMDLINE. Every boot gives virtio-blk
+# a poll queue (Linux's poll_queues module parameter; default 0), so the
+# io_uring IOPOLL tests poll on both kernels
 HK_CMDLINE ?=
+HK_CMDLINE += virtio_blk.poll_queues=1
 HK_CMDLINE += $(if $(BENCH),hk.bench)
 export HK_CMDLINE
 

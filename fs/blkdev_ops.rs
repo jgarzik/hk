@@ -576,6 +576,11 @@ impl FileOps for BlockFileOps {
         dio_submit_async(file, io, pos, write, flags)
     }
 
+    /// Its disk's poll queues (Linux iocb_bio_iopoll -> bio_poll)
+    fn iopoll(&self, file: &File) -> bool {
+        bdev(file).is_ok_and(|b| b.disk.queue.poll())
+    }
+
     /// The device's page cache maps (Linux blkdev_mmap); a read-only
     /// device only privately or through a read-only file (Linux
     /// generic_file_readonly_mmap: no shared mapping that may write)

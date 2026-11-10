@@ -616,16 +616,40 @@ fn vectors(vdev: &VirtioDevice, nq: u16) -> Result<(), KernelError> {
     vdev.alloc_vectors(&cpus).map(|_| ())
 }
 
+/// Poll queues each disk asks for (Linux virtio_blk's poll_queues
+/// module parameter, `virtio_blk.poll_queues=` on the command line;
+/// default 0)
+static POLL_QUEUES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `virtio_blk.poll_queues=n` (before the disks probe)
+pub fn set_poll_queues(n: u32) {
+    POLL_QUEUES.store(n, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Of `nq` queues, how many poll: at most all but one (Linux init_vq:
+/// num_poll_vqs = min(poll_queues, num_vqs - 1))
+fn nr_poll(nq: u16) -> u16 {
+    let want = POLL_QUEUES.load(core::sync::atomic::Ordering::Relaxed);
+    u16::try_from(want).unwrap_or(u16::MAX).min(nq - 1)
+}
+
 /// Virtqueues (Linux init_vq) and their hardware queues, within the
-/// limits read once they are known (the ring sizes bound them)
+/// limits read once they are known (the ring sizes bound them): the
+/// last `nr_poll` have no interrupt and become poll queues
 fn setup_queues(vdev: &Arc<VirtioDevice>) -> Result<(BlkMq, QueueLimits), KernelError> {
     let mut vqs: Vec<Virtqueue> = Vec::new();
     let mut ring = u16::MAX;
+    let mut npoll = 0;
     let r = (|| {
         let nq = nr_queues(vdev)?;
-        vectors(vdev, nq)?;
+        npoll = nr_poll(nq);
+        vectors(vdev, nq - npoll)?;
         for i in 0..nq {
-            let vq = vdev.setup_vq(i)?;
+            let vq = if i < nq - npoll {
+                vdev.setup_vq(i)?
+            } else {
+                vdev.setup_poll_vq(i)?
+            };
             ring = ring.min(vq.num());
             vqs.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
             vqs.push(vq);
@@ -643,10 +667,13 @@ fn setup_queues(vdev: &Arc<VirtioDevice>) -> Result<(BlkMq, QueueLimits), Kernel
         }
     };
     let mut ops: Vec<Box<dyn MqOps>> = Vec::new();
-    for vq in vqs {
-        ops.push(try_box(VbQueue::new(vdev, vq, lim.max_segments as usize)?)?);
+    let mut polls: Vec<Box<dyn MqOps>> = Vec::new();
+    let ndef = vqs.len() - usize::from(npoll);
+    for (i, vq) in vqs.into_iter().enumerate() {
+        let q = try_box(VbQueue::new(vdev, vq, lim.max_segments as usize)?)?;
+        if i < ndef { ops.push(q) } else { polls.push(q) }
     }
-    Ok((BlkMq::new(ops)?, lim))
+    Ok((BlkMq::with_polls(ops, polls)?, lim))
 }
 
 fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
@@ -661,6 +688,7 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
     let private = try_box(index)?;
     let (mq, lim) = setup_queues(vdev)?;
     let nq = mq.nr_hw_queues();
+    let npoll = mq.nr_poll_queues();
     let wc = vdev.has_feature(feature::FLUSH);
     let cap = vdev.read_config(|d| d.cfg64(cfg::CAPACITY));
     let disk = Disk::new(
@@ -674,13 +702,14 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
     )?;
     disk.private.call_once(|| private);
     printkln!(
-        "virtio-blk: {} {} sectors, {}/{} bytes, {} queues ({}){}{}",
+        "virtio-blk: {} {} sectors, {}/{} bytes, {} queues ({}), {} poll{}{}",
         disk.name,
         cap,
         lim.logical_block_size,
         lim.physical_block_size,
         nq,
         if vdev.msix() { "MSI-X" } else { "INTx" },
+        npoll,
         if wc { ", write cache" } else { "" },
         if disk.ro() { ", read-only" } else { "" },
     );

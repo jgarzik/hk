@@ -447,6 +447,12 @@ pub trait FileOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
+    /// Reap polled I/O of the file once (Linux f_op->iopoll): whether
+    /// anything ended. Default: nothing to poll.
+    fn iopoll(&self, _file: &File) -> bool {
+        false
+    }
+
     /// O_DIRECT may be set on `file`, asked once at the end of its open
     /// (Linux FMODE_CAN_ODIRECT: the mapping has ->direct_IO, or ->open
     /// sets it). Default: no.

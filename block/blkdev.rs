@@ -130,6 +130,10 @@ bitflags::bitflags! {
         /// bio_wouldblock_error); a queue without NOWAIT support ends
         /// it with EOPNOTSUPP
         const NOWAIT = 1 << 1;
+        /// Its end is found by polling (Linux REQ_POLLED, from
+        /// IOCB_HIPRI): it goes to a poll queue; a queue without them
+        /// ends it with EOPNOTSUPP (Linux since 6.11: no BLK_FEAT_POLL)
+        const POLLED = 1 << 2;
     }
 }
 
@@ -551,6 +555,16 @@ impl RequestQueue {
         if bio.flags.contains(BioFlags::NOWAIT) && !self.nowait() {
             return bio_io_error(bio, KernelError::OperationNotSupported);
         }
+        if bio.flags.contains(BioFlags::POLLED) {
+            match self.mq().filter(|m| m.can_poll()) {
+                None => return bio_io_error(bio, KernelError::OperationNotSupported),
+                // A write needing a post-flush ends by interrupt
+                Some(_) if bio.flags.contains(BioFlags::FUA) && !self.fua => {
+                    bio.flags.remove(BioFlags::POLLED);
+                }
+                Some(m) => return m.submit_polled(bio),
+            }
+        }
         if bio.flags.contains(BioFlags::FUA) && !self.fua {
             bio.flags.remove(BioFlags::FUA);
             if self.write_cache {
@@ -558,6 +572,12 @@ impl RequestQueue {
             }
         }
         self.submit_plugged(bio);
+    }
+
+    /// Reap its poll queues once (Linux bio_poll): whether anything
+    /// ended
+    pub fn poll(&self) -> bool {
+        self.mq().is_some_and(BlkMq::poll_queues)
     }
 
     fn dispatch(&self, bio: Box<Bio>) {

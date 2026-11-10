@@ -130,6 +130,15 @@ impl HwState {
     }
 }
 
+/// A hardware queue over the driver queue `ops`
+fn hw_state(ops: Box<dyn MqOps>) -> IrqSpinlock<HwState> {
+    IrqSpinlock::new(HwState {
+        dispatch: BioList::new(),
+        ops: Some(ops),
+        dying: false,
+    })
+}
+
 /// End every request of `l` (no queue lock held): how many
 fn end_all(l: &mut BioList) -> usize {
     let mut n = 0;
@@ -161,6 +170,12 @@ pub struct BlkMq {
     /// `start_drain` was called: the request that brings a hardware
     /// queue's count to 0 wakes `drained` (set once)
     dying: AtomicBool,
+    /// Poll queues (Linux HCTX_TYPE_POLL): no interrupt; a polled bio
+    /// goes straight to one (by CPU, no software queue), and its end is
+    /// found by `poll_queues`
+    polls: Vec<IrqSpinlock<HwState>>,
+    /// Polled requests not yet ended
+    poll_rqs: AtomicUsize,
 }
 
 /// The block layer's workqueues: one worker per CPU, high priority
@@ -229,6 +244,15 @@ impl BlkMq {
     /// One hardware queue per element of `ops`; EINVAL for none (Linux
     /// blk_mq_alloc_tag_set refuses nr_hw_queues 0)
     pub fn new(ops: Vec<Box<dyn MqOps>>) -> Result<Self, KernelError> {
+        Self::with_polls(ops, Vec::new())
+    }
+
+    /// `new`, plus a poll queue per element of `polls` (Linux the
+    /// HCTX_TYPE_POLL map)
+    pub fn with_polls(
+        ops: Vec<Box<dyn MqOps>>,
+        polls: Vec<Box<dyn MqOps>>,
+    ) -> Result<Self, KernelError> {
         if ops.is_empty() {
             return Err(KernelError::InvalidArgument);
         }
@@ -247,18 +271,66 @@ impl BlkMq {
             ctx_maps: (0..ops.len())
                 .map(|_| (0..words).map(|_| AtomicU64::new(0)).collect())
                 .collect(),
-            hctxs: ops
-                .into_iter()
-                .map(|ops| {
-                    IrqSpinlock::new(HwState {
-                        dispatch: BioList::new(),
-                        ops: Some(ops),
-                        dying: false,
-                    })
-                })
-                .collect(),
+            hctxs: ops.into_iter().map(hw_state).collect(),
             drained: WaitQueue::new(),
+            polls: polls.into_iter().map(hw_state).collect(),
+            poll_rqs: AtomicUsize::new(0),
         })
+    }
+
+    pub fn nr_poll_queues(&self) -> usize {
+        self.polls.len()
+    }
+
+    /// It has poll queues (Linux blk_mq_can_poll)
+    pub fn can_poll(&self) -> bool {
+        !self.polls.is_empty()
+    }
+
+    /// Queue the polled `bio` on this CPU's poll queue and dispatch it
+    /// (Linux blk_mq_submit_bio with REQ_POLLED: the HCTX_TYPE_POLL
+    /// hctx). Only for a queue that `can_poll`.
+    pub fn submit_polled(&self, bio: Box<Bio>) {
+        let h = crate::cpu::this_id() as usize % self.polls.len();
+        self.poll_rqs.fetch_add(1, Ordering::Relaxed);
+        let mut failed = BioList::new();
+        {
+            let mut hw = self.polls[h].lock();
+            hw.dispatch.push(bio);
+            hw.dispatch(&mut failed);
+        }
+        let n = end_all(&mut failed);
+        self.put_polled(n);
+    }
+
+    /// Reap every poll queue once, restarting dispatch into the freed
+    /// room (Linux blk_mq_poll); whether anything ended
+    pub fn poll_queues(&self) -> bool {
+        let mut n = 0;
+        for q in &self.polls {
+            let mut done = BioList::new();
+            {
+                let mut hw = q.lock();
+                let hw = &mut *hw;
+                if let Some(ops) = hw.ops.as_mut() {
+                    ops.complete(&mut done);
+                }
+                hw.dispatch(&mut done);
+            }
+            n += end_all(&mut done);
+        }
+        self.put_polled(n);
+        n > 0
+    }
+
+    /// `n` polled requests ended; the last of a dying queue wakes `drain`
+    fn put_polled(&self, n: usize) {
+        if n > 0
+            && self.poll_rqs.fetch_sub(n, Ordering::AcqRel) == n
+            && self.dying.load(Ordering::Acquire)
+        {
+            self.drained.wake_all();
+        }
     }
 
     pub fn nr_hw_queues(&self) -> usize {
@@ -465,18 +537,33 @@ impl BlkMq {
             hctx.lock().dying = true;
             self.run(h);
         }
+        for q in &self.polls {
+            q.lock().dying = true;
+        }
+        self.poll_queues();
     }
 
     /// No request taken is left: every one from `get_rq` has ended
     fn idle(&self) -> bool {
         self.rqs.iter().all(|n| n.load(Ordering::Acquire) == 0)
+            && self.poll_rqs.load(Ordering::Acquire) == 0
     }
 
     /// Sleep until every request taken has ended, started or not
     /// (Linux blk_mq_freeze_queue_wait on q_usage_counter, taken in
-    /// submit_bio and dropped at the request's end). Thread context.
+    /// submit_bio and dropped at the request's end), polling the poll
+    /// queues each tick, as nothing else ends their requests. Thread
+    /// context.
     pub fn drain(&self) {
-        self.drained.wait_event(|| self.idle());
+        while !self.idle() {
+            self.poll_queues();
+            let wait = if self.can_poll() {
+                1
+            } else {
+                crate::task::percpu::MAX_SCHEDULE_TIMEOUT
+            };
+            self.drained.wait_event_timeout(|| self.idle(), wait);
+        }
     }
 
     /// Hand the driver's queue state back after `drain`, for its
@@ -486,6 +573,7 @@ impl BlkMq {
     pub fn release(&self) -> Vec<Box<dyn MqOps>> {
         self.hctxs
             .iter()
+            .chain(self.polls.iter())
             .filter_map(|h| h.lock().ops.take())
             .collect()
     }

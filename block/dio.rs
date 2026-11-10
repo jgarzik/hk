@@ -217,8 +217,10 @@ struct Dio<'a> {
 }
 
 impl<'a> Dio<'a> {
+    /// RWF_HIPRI is ignored by synchronous direct I/O (Linux mainline
+    /// 9650b453a3d4: no polled sync I/O)
     fn new<I: DioIter>(b: &'a BlockDevice, flags: RwFlags) -> Self {
-        Self::new_rw(b, !I::READ, flags)
+        Self::new_rw(b, !I::READ, flags - RwFlags::HIPRI)
     }
 
     fn new_rw(b: &'a BlockDevice, write: bool, flags: RwFlags) -> Self {
@@ -230,6 +232,7 @@ impl<'a> Dio<'a> {
                 let mut f = BioFlags::empty();
                 f.set(BioFlags::FUA, write && dsync);
                 f.set(BioFlags::NOWAIT, flags.nowait());
+                f.set(BioFlags::POLLED, flags.contains(RwFlags::HIPRI));
                 f
             },
         }

@@ -3,6 +3,7 @@
 
 pub mod dio;
 pub mod fixed;
+pub mod iopoll;
 pub mod ring;
 pub mod setup;
 pub mod wait;
@@ -24,6 +25,7 @@ pub fn run_tests() {
     wait::run_tests();
     dio::run_tests();
     fixed::run_tests();
+    iopoll::run_tests();
 }
 
 /// One mapped region

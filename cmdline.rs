@@ -156,6 +156,10 @@ pub fn parse_cmdline(cmdline: &str) {
             usb::enable_usb_trace();
         } else if let Some(console_arg) = option.strip_prefix("console=") {
             parse_console_option(console_arg);
+        } else if let Some(n) = option.strip_prefix("virtio_blk.poll_queues=")
+            && let Ok(n) = n.parse()
+        {
+            crate::hw::virtio::blk::set_poll_queues(n);
         } else if let Some(s) = option.strip_prefix("watchdog_thresh=")
             && let Ok(s) = s.parse()
         {

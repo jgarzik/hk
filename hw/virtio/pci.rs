@@ -413,6 +413,17 @@ impl VirtioDevice {
 
     /// Set up queue `index` (spec 4.1.5.1.3); before `ready()`
     pub fn setup_vq(&self, index: u16) -> Result<Virtqueue, KernelError> {
+        self.setup_vq_cb(index, true)
+    }
+
+    /// Set up queue `index` with no interrupt: no MSI-X vector and used
+    /// buffers not signalled, its completions found by polling (Linux
+    /// vp_find_vqs with a NULL callback)
+    pub fn setup_poll_vq(&self, index: u16) -> Result<Virtqueue, KernelError> {
+        self.setup_vq_cb(index, false)
+    }
+
+    fn setup_vq_cb(&self, index: u16, cb: bool) -> Result<Virtqueue, KernelError> {
         if index >= self.num_queues() {
             return Err(KernelError::NoDevice);
         }
@@ -421,7 +432,11 @@ impl VirtioDevice {
             return Err(KernelError::Io);
         }
         let num = ring::pick_size(self.r16(common::Q_SIZE)).ok_or(KernelError::NoDevice)?;
-        self.queue_vector(index);
+        if cb {
+            self.queue_vector(index);
+        } else {
+            self.w16(common::Q_MSIX_VECTOR, NO_VECTOR);
+        }
         let off = self.r16(common::Q_NOFF) as usize * self.notify_mul as usize;
         let notify = self.notify.sub(off, 2).ok_or(KernelError::NoDevice)?;
         let lay = Layout::new(num);
@@ -439,6 +454,9 @@ impl VirtioDevice {
         let mut ring = unsafe { Vring::new(mem.cpu_addr(), num) };
         if self.has_feature(super::feature::RING_EVENT_IDX) {
             ring.set_event_idx();
+        }
+        if !cb {
+            ring.disable_cb();
         }
         Ok(Virtqueue {
             ring,

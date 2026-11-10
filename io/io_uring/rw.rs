@@ -101,10 +101,18 @@ pub fn rw(
         };
         Ok((f, flags, import(sqe, kind)?, fixed))
     });
-    let (file, flags, segs, fixed) = match prep {
+    let (file, mut flags, segs, fixed) = match prep {
         Ok(p) => p,
         Err(e) => return Some(Err(e)),
     };
+    // IOPOLL: O_DIRECT only, polled (Linux io_rw_init_file: IOCB_HIPRI,
+    // EOPNOTSUPP without IOCB_DIRECT or ->iopoll)
+    if r.iopoll {
+        if !async_ok(&file) {
+            return Some(Err(KernelError::OperationNotSupported));
+        }
+        flags |= RwFlags::HIPRI;
+    }
     let len = crate::fs::io::seg_len(&segs);
     if inline || len == 0 || !async_ok(&file) {
         return Some(rw_one(&file, &segs, (sqe.off, sqe.op_flags), write, flags));
@@ -191,6 +199,11 @@ fn rw_async(
     write: bool,
     flags: RwFlags,
 ) -> Option<KernelResult<i32>> {
+    if r.iopoll
+        && let Err(e) = r.poll_add(&file)
+    {
+        return Some(Err(e));
+    }
     let req = match Req::new(r, file, mem, sqe, write, flags) {
         Ok(req) => req,
         Err(e) => return Some(Err(e)),
