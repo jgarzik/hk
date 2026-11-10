@@ -286,6 +286,9 @@ pub fn bio_endio(mut bio: Box<Bio>) {
         b.status = bio.status;
         bio_endio(b);
     }
+    // The head ends as a lone bio
+    bio.merged_sectors = 0;
+    bio.merged_segs = 0;
     match bio.end_io {
         Some(f) => f(bio),
         None => drop(bio),

@@ -300,6 +300,8 @@ mod tests {
         static ENDED: AtomicU32 = AtomicU32::new(0);
         fn done(b: Box<Bio>) {
             assert_eq!(b.status, Err(crate::util::error::KernelError::Io));
+            // Each ends as a lone bio: no request totals left on the head
+            assert_eq!((b.rq_sectors(), b.rq_nr_segs()), (8, 1));
             ENDED.fetch_add(1, Ordering::Relaxed);
         }
         let q = queue(1024, 32);
