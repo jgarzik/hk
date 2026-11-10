@@ -271,14 +271,6 @@ lo (hk has no checksum offload states).
 - A post-direct-write invalidation failure only prints (Linux
   dio_warn_stale_pagecache also sets the mapping's writeback error,
   which the next fsync reports): no errseq on `AddressSpace`.
-- Unpinning dirties a page-cache page under its page lock, so a
-  `PinnedPages` (`mm/gup.rs`) holding one is dropped in thread context:
-  io_uring requests hand theirs from the bio's end to the submitter
-  (`io/io_uring/tctx.rs`, task_work); an asynchronous I/O with no task
-  to finish it (Linux AIO, whose aio_complete runs in the interrupt
-  handler) has no way yet to defer the dirtying to a thread (Linux
-  bio_check_pages_dirty / bio_dirty_work): `Workqueue::queue_work` takes
-  a spin Mutex.
 
 ## File lock gaps
 

@@ -1798,7 +1798,7 @@ impl InodeOps for VfatInodeOps {
             }
         });
         crate::task::workqueue::SYSTEM_WQ
-            .queue_work(arc_nofail(crate::sync::spin::Mutex::new(work)));
+            .queue_work(arc_nofail(crate::sync::IrqSpinlock::new(work)));
     }
 
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {

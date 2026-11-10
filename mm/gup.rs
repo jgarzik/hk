@@ -62,9 +62,11 @@ pub struct PageSeg {
 /// User memory pinned for DMA (Linux FOLL_PIN pages with their offsets
 /// and lengths, as iov_iter_extract_pages gives them): unpinned when
 /// dropped, and first marked dirty if `set_dirty` was called (Linux
-/// unpin_user_pages_dirty_lock). Dropped in thread context; a completion
-/// in an interrupt handler hands it to a thread (Linux bio_dirty_work):
-/// dirtying a page-cache page takes its page lock.
+/// unpin_user_pages_dirty_lock). Dropped in thread context: dirtying a
+/// page-cache page takes its page lock, so a completion in an interrupt
+/// handler hands it to a thread (Linux bio_check_pages_dirty ->
+/// bio_dirty_work): its submitter's task_work, or a work item, which
+/// `Workqueue::queue_work` queues from any context.
 #[must_use]
 pub struct PinnedPages {
     segs: SmallVec<PageSeg, INLINE_PAGES>,

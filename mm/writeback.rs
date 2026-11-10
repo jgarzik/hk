@@ -55,7 +55,7 @@ pub struct BdiWriteback {
     /// Devices of the disk with dirty data
     dirty: Mutex<BTreeSet<DevId>>,
     /// The periodic writeback
-    dwork: Arc<Mutex<DelayedWork>>,
+    dwork: Arc<crate::sync::IrqSpinlock<DelayedWork>>,
     /// The next pass writes everything, however young (background
     /// writeback past the background limit, Linux WB_REASON_BACKGROUND)
     background: AtomicBool,
@@ -64,7 +64,7 @@ pub struct BdiWriteback {
 impl BdiWriteback {
     fn new(dev_id: DevId) -> Self {
         // `bdi_register`'s: not plumbed
-        let dwork = arc_nofail(Mutex::new(DelayedWork::new(move || {
+        let dwork = arc_nofail(crate::sync::IrqSpinlock::new(DelayedWork::new(move || {
             do_device_writeback(dev_id);
         })));
         Self {

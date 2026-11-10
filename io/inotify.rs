@@ -587,7 +587,7 @@ pub struct Inotify {
     /// taken before every other inotify lock)
     mark_mutex: crate::sync::Mutex<()>,
     /// Its SIGIO work for events queued where kill_fasync cannot sleep
-    sigio: Arc<Mutex<crate::task::workqueue::Work>>,
+    sigio: Arc<crate::sync::IrqSpinlock<crate::task::workqueue::Work>>,
 }
 
 /// Global cookie counter for rename event pairing
@@ -601,7 +601,7 @@ impl Inotify {
         // allocates nothing; it finds the group through `me`
         let me: Arc<spin::Once<Weak<Inotify>>> = try_arc(spin::Once::new())?;
         let found = me.clone();
-        let sigio = try_arc(Mutex::new(Work::new(move || {
+        let sigio = try_arc(crate::sync::IrqSpinlock::new(Work::new(move || {
             if let Some(g) = found.get().and_then(Weak::upgrade) {
                 kill_fasync(&g.fasync, crate::signal::SIGIO, POLL_IN);
             }

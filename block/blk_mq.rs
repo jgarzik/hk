@@ -206,7 +206,7 @@ fn kblockd(cpu: u32) -> Option<&'static Workqueue> {
 /// A hardware queue's kblockd run: the work item, and a hold on the
 /// queues while it is queued (the work drops it after the run)
 struct HctxRun {
-    work: Arc<Mutex<Work>>,
+    work: Arc<crate::sync::IrqSpinlock<Work>>,
     hold: Arc<Mutex<Option<Arc<BlkMq>>>>,
 }
 
@@ -214,7 +214,7 @@ impl HctxRun {
     fn new(h: usize) -> Result<Self, KernelError> {
         let hold: Arc<Mutex<Option<Arc<BlkMq>>>> = try_arc(Mutex::new(None))?;
         let k = hold.clone();
-        let work = try_arc(Mutex::new(Work::new(move || {
+        let work = try_arc(crate::sync::IrqSpinlock::new(Work::new(move || {
             // Taken under the lock, run and dropped unlocked: it may be
             // the queues' last hold
             let mq = k.lock().take();

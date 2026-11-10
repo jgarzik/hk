@@ -8,9 +8,8 @@
 use crate::util::kalloc::arc_nofail;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::sync::spin::Mutex;
-
 use crate::printkln;
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::kthread::{
     kthread_park, kthread_parkme, kthread_run, kthread_should_park, kthread_should_stop,
@@ -55,7 +54,7 @@ fn selftest_thread(_arg: usize) {
     check("tick_rate", dk >= want * 3 / 4 && dk <= want * 3 / 2, dk);
 
     // 2. queue_work runs on the system workqueue worker
-    let work = arc_nofail(Mutex::new(Work::new(|| {
+    let work = arc_nofail(IrqSpinlock::new(Work::new(|| {
         WORK_RAN.store(true, Ordering::Release);
         EVENT_WQ.wake_all();
     })));
@@ -65,7 +64,7 @@ fn selftest_thread(_arg: usize) {
 
     // 3. Delayed work runs no earlier than its delay
     let t0 = get_ticks();
-    let dwork = arc_nofail(Mutex::new(DelayedWork::new(|| {
+    let dwork = arc_nofail(IrqSpinlock::new(DelayedWork::new(|| {
         DELAYED_RAN_TICK.store(get_ticks(), Ordering::Release);
         EVENT_WQ.wake_all();
     })));
@@ -78,7 +77,7 @@ fn selftest_thread(_arg: usize) {
     // 3b. mod_delayed_work (Linux semantics): an idle item is queued
     // (false); a timed one is re-timed to now (true) and runs once; a
     // cancelled one does not run
-    let mw = arc_nofail(Mutex::new(DelayedWork::new(|| {
+    let mw = arc_nofail(IrqSpinlock::new(DelayedWork::new(|| {
         MOD_RUNS.fetch_add(1, Ordering::AcqRel);
         EVENT_WQ.wake_all();
     })));
