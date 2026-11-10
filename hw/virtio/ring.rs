@@ -84,10 +84,10 @@ impl Desc {
     }
 }
 
-/// Flags of descriptor `k` of a chain of `out` device-readable then
-/// device-writable buffers, `total` in all
-fn chain_flags(k: usize, out: usize, total: usize) -> u16 {
-    let mut flags = if k >= out { VRING_DESC_F_WRITE } else { 0 };
+/// Flags of descriptor `k` of a chain of `total`: device-writable if
+/// `write`, linked to the next unless last
+fn chain_flags(write: bool, k: usize, total: usize) -> u16 {
+    let mut flags = if write { VRING_DESC_F_WRITE } else { 0 };
     if k + 1 < total {
         flags |= VRING_DESC_F_NEXT;
     }
@@ -99,11 +99,7 @@ fn chain_flags(k: usize, out: usize, total: usize) -> u16 {
 /// `sg`, device-writable if `write`, linked to entry k + 1 unless last.
 /// The device-readable buffers must come first
 pub fn set_chain(table: &mut [Desc], k: usize, sg: Sg, write: bool) {
-    let total = table.len();
-    let mut flags = if write { VRING_DESC_F_WRITE } else { 0 };
-    if k + 1 < total {
-        flags |= VRING_DESC_F_NEXT;
-    }
+    let flags = chain_flags(write, k, table.len());
     table[k] = Desc {
         addr: sg.addr.to_le(),
         len: sg.len.to_le(),
@@ -250,7 +246,7 @@ impl Vring {
         let head = self.free_head;
         let mut i = head;
         for (k, sg) in out.iter().chain(inb).enumerate() {
-            let flags = chain_flags(k, out.len(), total);
+            let flags = chain_flags(k >= out.len(), k, total);
             let d = self.desc(i);
             unsafe {
                 write_volatile(&raw mut (*d).addr, sg.addr.to_le());
