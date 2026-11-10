@@ -658,17 +658,19 @@ impl VirtioDriver for VirtioBlkDriver {
         let slot = try_box(MaybeUninit::<VirtioBlkDev>::uninit())?;
         // Vectors taken before the queues go with a failed setup
         let disk = new_disk(&vdev).inspect_err(|_| vdev.free_irq())?;
-        let blk = try_arc(VirtioBlk {
-            vdev: vdev.clone(),
-            disk: disk.clone(),
-        })
-        .inspect_err(|_| stop(&vdev, disk.queue.mq().map_or(Vec::new(), |m| m.release())))?;
+        // Undo the queues and the MSI-X vectors (Linux virtblk_probe's
+        // out_free_vq: del_vqs resets, then frees the IRQs)
         let fail = |e| {
             let _ = vdev.reset();
             vdev.free_irq();
             stop(&vdev, disk.queue.mq().map_or(Vec::new(), |m| m.release()));
             e
         };
+        let blk = try_arc(VirtioBlk {
+            vdev: vdev.clone(),
+            disk: disk.clone(),
+        })
+        .map_err(fail)?;
         if let Err(e) = vdev.request_irq(blk.clone() as Arc<dyn VirtioIrq>) {
             printkln!("virtio-blk: no IRQ ({:?})", e);
             return Err(fail(KernelError::NoDevice));
