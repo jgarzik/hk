@@ -1367,9 +1367,6 @@ fn idle_task_entry() -> ! {
         // sched_balance_newidle); a task pulled flags us to switch
         sched_balance_rq(crate::cpu::this_id());
 
-        // Flush console before halting to ensure all output is sent
-        crate::console::console_flush();
-
         // Halt until an interrupt unless a wakeup made a task runnable
         // since the yield (it flags the idle task, interrupts off
         // closes the window; the STI;HLT pattern enables them and halts
