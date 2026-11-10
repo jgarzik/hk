@@ -5,6 +5,7 @@
 pub mod cpumask;
 pub mod elf;
 pub mod error;
+pub mod errseq;
 pub mod group_cpus;
 pub mod ida;
 pub mod kalloc;

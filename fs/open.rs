@@ -402,6 +402,7 @@ fn do_o_path(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, Kerne
 /// cannot take it is EINVAL, after `->open` (the file is released)
 fn dentry_open(mut file: File) -> Result<Arc<File>, KernelError> {
     file.f_op.open(&file)?;
+    file.sample_wb_err();
     file.set_can_odirect();
     file.clear_flags(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
     if file.get_flags() & O_DIRECT != 0 && !file.can_odirect() {

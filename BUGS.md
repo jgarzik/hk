@@ -268,9 +268,6 @@ lo (hk has no checksum offload states).
   writes only its dirty blocks (buffer heads), so a block of the page
   changed on disk behind the cache (a raw device write) is overwritten
   by hk with the cached copy.
-- A post-direct-write invalidation failure only prints (Linux
-  dio_warn_stale_pagecache also sets the mapping's writeback error,
-  which the next fsync reports): no errseq on `AddressSpace`.
 
 ## Linux AIO gaps
 

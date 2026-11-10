@@ -392,6 +392,9 @@ pub struct SuperBlock {
     /// Remount and other changes of the superblock's state (Linux
     /// s_umount, a sleeping rw_semaphore): inside namespace_sem
     pub s_umount: sync::RwSem<()>,
+    /// Writeback errors of its files, reported once to each open file by
+    /// syncfs (Linux s_wb_err)
+    pub s_wb_err: crate::util::errseq::ErrSeq,
 }
 
 use super::inode::AsAny;
@@ -442,6 +445,7 @@ impl SuperBlock {
             s_fsnotify: crate::io::inotify::SbMarks::default(),
             s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
+            s_wb_err: crate::util::errseq::ErrSeq::new(),
             s_umount: sync::RwSem::new(()),
         })?;
         let mut all = ALL_SBS.lock();

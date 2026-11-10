@@ -157,6 +157,9 @@ pub struct AddressSpace {
     /// The inode it belongs to, for page dirtying to mark it dirty
     /// (Linux mapping->host; set with the aops by `set_aops`)
     host: Once<alloc::sync::Weak<Inode>>,
+    /// Writeback errors, reported once to each open file by fsync
+    /// (Linux mapping->wb_err)
+    pub wb_err: crate::util::errseq::ErrSeq,
 }
 
 impl AddressSpace {
@@ -173,6 +176,7 @@ impl AddressSpace {
             i_mmap: AnonVma::default(),
             dirtied_when: AtomicU64::new(0),
             host: Once::new(),
+            wb_err: crate::util::errseq::ErrSeq::new(),
         }
     }
 
@@ -641,11 +645,32 @@ fn mkclean(m: &AddressSpace, index: u64, phys: u64) {
     }
 }
 
+/// Record a writeback error of `inode`'s pages on its mapping and its
+/// filesystem, for fsync and syncfs to report (Linux mapping_set_error:
+/// wb_err and s_wb_err)
+pub fn mapping_set_error(inode: &Inode, e: KernelError) {
+    inode.i_data.wb_err.set(e);
+    if let Some(sb) = inode.superblock() {
+        sb.s_wb_err.set(e);
+    }
+}
+
+/// The pages over a direct write could not be dropped after it (Linux
+/// dio_warn_stale_pagecache): the mapping's writeback error is EIO,
+/// which the next fsync of each open file reports, and a warning
+pub fn dio_warn_stale_pagecache(inode: &Inode) {
+    inode.i_data.wb_err.set(KernelError::Io);
+    crate::printkln!(
+        "Page cache invalidation failure on direct I/O.  Possible data corruption due to collision with buffered I/O!"
+    );
+}
+
 /// Write every dirty page of `inode` and wait (Linux
 /// filemap_write_and_wait, synchronous I/O): each is locked, its dirty
 /// bit and mark cleared, then written. The first error is returned
-/// after the others were tried; a page that failed stays clean (Linux
-/// records the error on the mapping; the data is in the page still).
+/// after the others were tried, and each is recorded on the mapping
+/// (`mapping_set_error`); a page that failed stays clean (the data is
+/// in the page still, as Linux).
 pub fn write_and_wait(inode: &Inode) -> Result<(), KernelError> {
     write_range(inode, 0, u64::MAX)
 }
@@ -682,9 +707,11 @@ pub fn write_range(inode: &Inode, first: u64, last: u64) -> Result<(), KernelErr
             mkclean(m, index, phys);
             if test_clear_dirty(pg)
                 && let Err(e) = m.aops().writepage(inode, phys, index)
-                && err.is_ok()
             {
-                err = Err(e);
+                mapping_set_error(inode, e);
+                if err.is_ok() {
+                    err = Err(e);
+                }
             }
             m.i_pages.lock().clear_mark(index, MARK_WRITEBACK);
         }
@@ -865,6 +892,9 @@ pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), Kerne
             if test_clear_dirty(pg) {
                 m.i_pages.lock().clear_mark(index, MARK_DIRTY);
                 r = m.aops().writepage(inode, phys, index);
+                if let Err(e) = r {
+                    mapping_set_error(inode, e);
+                }
             }
             if r.is_ok() {
                 remove(m, phys);

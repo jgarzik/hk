@@ -1279,7 +1279,7 @@ fn msync_vmas(mm: &super::Mm, mut start: u64, end: u64, flags: i32) -> Result<()
         };
         // The whole file is written back (Linux: the range only)
         if let Some(f) = file {
-            f.f_op.fsync(&f)?;
+            crate::fs::sync::vfs_fsync(&f, false)?;
         }
     }
     if unmapped {

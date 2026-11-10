@@ -151,16 +151,14 @@ fn invalidate_pages(inode: &Inode, pos: u64, count: usize) -> Result<(), KernelE
 }
 
 /// Drop what was cached over the range during a direct write (Linux
-/// kiocb_invalidate_post_direct_write): a page left is reported (Linux
-/// dio_warn_stale_pagecache), not an error
+/// kiocb_invalidate_post_direct_write): a page left is not the write's
+/// error but the mapping's (`filemap::dio_warn_stale_pagecache`)
 fn invalidate_post(inode: &Inode, pos: u64, count: usize) {
     let p = PAGE_SIZE as u64;
     if inode.i_data.nrpages() != 0
         && filemap::invalidate_pages2(inode, pos / p, last(pos, count) / p).is_err()
     {
-        crate::printkln!(
-            "Page cache invalidation failure on direct I/O.  Possible data corruption due to collision with buffered I/O!"
-        );
+        filemap::dio_warn_stale_pagecache(inode);
     }
 }
 

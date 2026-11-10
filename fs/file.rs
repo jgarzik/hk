@@ -574,6 +574,12 @@ pub struct File {
     /// The epoll items watching this file (Linux f_ep), removed at its
     /// last close (spin leaf)
     pub f_ep: Mutex<alloc::vec::Vec<alloc::sync::Weak<crate::io::epoll::EpItem>>>,
+
+    /// The writeback errors of its mapping and filesystem it has seen
+    /// (Linux f_wb_err, f_sb_err): sampled at open, advanced by fsync
+    /// and syncfs under `f_lock`, read lock-free
+    f_wb_err: AtomicU32,
+    f_sb_err: AtomicU32,
 }
 
 impl File {
@@ -635,7 +641,49 @@ impl File {
             i_write: None,
             f_cred: crate::task::current_cred(),
             private: spin::Once::new(),
+            f_wb_err: AtomicU32::new(0),
+            f_sb_err: AtomicU32::new(0),
         }
+        .sampled()
+    }
+
+    /// With the writeback errors of its mapping and filesystem sampled
+    /// (Linux do_dentry_open: filemap_sample_wb_err, file_sample_sb_err)
+    fn sampled(self) -> Self {
+        self.sample_wb_err();
+        self
+    }
+
+    /// Sample its mapping's and filesystem's writeback errors: what came
+    /// before (and was seen) is not this file's to report (Linux
+    /// do_dentry_open; again after ->open, which may change the mapping:
+    /// blkdev_open)
+    pub fn sample_wb_err(&self) {
+        if let Some(i) = self.mapping_inode() {
+            self.f_wb_err
+                .store(i.i_data.wb_err.sample(), Ordering::Relaxed);
+        }
+        if let Some(sb) = self.dentry.get_inode().and_then(|i| i.superblock()) {
+            self.f_sb_err.store(sb.s_wb_err.sample(), Ordering::Relaxed);
+        }
+    }
+
+    /// A writeback error of its mapping since it last looked, once
+    /// (Linux file_check_and_advance_wb_err)
+    pub fn check_and_advance_wb_err(&self) -> Result<(), KernelError> {
+        let Some(i) = self.mapping_inode() else {
+            return Ok(());
+        };
+        advance(&i.i_data.wb_err, &self.f_wb_err, &self.f_lock)
+    }
+
+    /// A writeback error of its filesystem since it last looked, once
+    /// (Linux syncfs: errseq_check_and_advance of s_wb_err, f_sb_err)
+    pub fn check_and_advance_sb_err(&self) -> Result<(), KernelError> {
+        let Some(sb) = self.dentry.get_inode().and_then(|i| i.superblock()) else {
+            return Ok(());
+        };
+        advance(&sb.s_wb_err, &self.f_sb_err, &self.f_lock)
     }
 
     /// A file whose shared state lives in `private` (Linux
@@ -963,6 +1011,24 @@ impl File {
     }
 }
 
+/// Check `seq` against the file's `since` and advance it (lock-free when
+/// nothing changed, else under the file's `f_lock`: Linux
+/// file_check_and_advance_wb_err)
+fn advance(
+    seq: &crate::util::errseq::ErrSeq,
+    since: &AtomicU32,
+    lock: &Mutex<u32>,
+) -> Result<(), KernelError> {
+    if seq.check(since.load(Ordering::Relaxed)).is_none() {
+        return Ok(());
+    }
+    let _g = lock.lock();
+    let mut s = since.load(Ordering::Relaxed);
+    let e = seq.check_and_advance(&mut s);
+    since.store(s, Ordering::Relaxed);
+    e.map_or(Ok(()), Err)
+}
+
 impl Drop for File {
     fn drop(&mut self) {
         // Leave every epoll first, while the wait queues the items are
@@ -1002,8 +1068,7 @@ pub fn generic_write_sync(
     dsync: bool,
 ) -> Result<usize, KernelError> {
     if n > 0 && dsync {
-        file.f_op
-            .fsync_range(file, pos, pos.saturating_add(n as u64 - 1))?;
+        crate::fs::sync::vfs_fsync_range(file, pos, pos.saturating_add(n as u64 - 1))?;
     }
     Ok(n)
 }
