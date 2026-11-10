@@ -1,6 +1,7 @@
 //! io_uring tests through the mapped rings (Linux io_uring/*.c,
 //! liburing's ring layout), raw syscalls only
 
+pub mod bench;
 pub mod dio;
 pub mod fixed;
 pub mod iopoll;

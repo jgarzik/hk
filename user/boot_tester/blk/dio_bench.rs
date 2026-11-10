@@ -5,11 +5,11 @@
 //! queue polls). At depth > 1 (no async I/O: several processes, each
 //! with its own buffer, read in parallel): direct only. O_DSYNC
 //! direct 1 MiB writes put back what they overwrite (each chunk is read
-//! first, untimed). `DIO_BENCH:` lines, to compare hk with Linux on the
-//! same QEMU. vfat rows: a 16 MiB file on vda1, 1 MiB sequential and
-//! 4 KiB random reads, buffered (page cache dropped first) and direct.
-//! Only when the kernel command line has `hk.bench` (`make check
-//! BENCH=1`).
+//! first, untimed). Then io_uring's rows (`uring::bench`). vfat rows:
+//! a 16 MiB file on vda1, 1 MiB sequential and 4 KiB random reads,
+//! buffered (page cache dropped first) and direct. `DIO_BENCH:` lines,
+//! to compare hk with Linux on the same QEMU. Only when the kernel
+//! command line has `hk.bench` (`make check BENCH=1`).
 
 use crate::helpers::{find_blkdev, print, print_num, println, read_file};
 use hk_syscall::{
@@ -130,6 +130,7 @@ fn bench(b: i32, d: i32, buf: u64) {
     let row = [(&b" direct "[..], parallel(d, r, RAND_QDN))];
     line(b"rand 4K QD8", &row, RAND_QD * 4096, RAND_QD);
     line(b"dsync 1M write", &[(b" direct ", dsync(d, buf))], DSYNC, 0);
+    crate::uring::bench::bench(d);
 }
 
 /// Bytes written by the O_DSYNC run (vda3 from 8 MiB)
@@ -172,7 +173,7 @@ fn dsync(ro: i32, buf: u64) -> i64 {
     ns
 }
 
-fn now_ns() -> i64 {
+pub fn now_ns() -> i64 {
     let mut t = Timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -289,7 +290,7 @@ fn child(fd: i32, r: Run, k: u64, procs: u64, go: i32, ends: u64) -> u64 {
 }
 
 /// DIO_BENCH: <what> <name> <MB/s> MB/s [<IOPS> IOPS] ...
-fn line(what: &[u8], row: &[(&[u8], i64)], bytes: u64, ios: u64) {
+pub fn line(what: &[u8], row: &[(&[u8], i64)], bytes: u64, ios: u64) {
     print(b"DIO_BENCH: ");
     print(what);
     for &(name, ns) in row {
