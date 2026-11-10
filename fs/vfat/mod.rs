@@ -272,6 +272,9 @@ fn free_past(
     let next = get_fat_entry(sb_data, last)?;
     if !is_end_of_chain(next) {
         set_fat_entry(sb_data, last, FAT_EOC)?;
+        // Again once the chain is cut: a walk that began in between
+        // may have cached clusters past the new end
+        cache::inval(inode)?;
         free_cluster_chain(sb_data, next)?;
     }
     Ok(start)
@@ -723,13 +726,17 @@ impl AsAny for VfatInode {
 fn new_private(d: VfatInodeData) -> Result<Arc<VfatInode>, KernelError> {
     try_arc(VfatInode {
         d: crate::sync::spin::Mutex::new(d),
-        cache: cache::new_cache(),
+        cache: cache::new_cache(d.start_cluster),
     })
 }
 
 /// Replace `inode`'s data (Linux updates msdos_inode_info in place)
 fn set_inode_data(inode: &Inode, d: VfatInodeData) -> Result<(), KernelError> {
-    with_vi(inode, |v| *v.d.lock() = d)
+    with_vi(inode, |v| {
+        *v.d.lock() = d;
+        // After the data: a walk that sees the new id sees the new chain
+        v.cache.lock().set_start(d.start_cluster);
+    })
 }
 
 /// Run `f` on `inode`'s `VfatInode`
@@ -2153,7 +2160,14 @@ fn create_inode_for_entry(
     entry: &ParsedDirEntry,
     parent_cluster: u32,
 ) -> Result<Arc<Inode>, KernelError> {
-    let o = get_sb_data(sb)?.opts;
+    let sb_data = get_sb_data(sb)?;
+    // A directory points at a cluster of its own (Linux
+    // fat_validate_dir); a file's first cluster is checked when its
+    // chain is walked (`cache`, Linux fat_get_cluster)
+    if entry.is_dir() && (entry.start_cluster == 0 || entry.start_cluster == sb_data.root_cluster) {
+        return Err(KernelError::Io);
+    }
+    let o = sb_data.opts;
     let mode = if entry.is_dir() {
         o.dir_mode()
     } else {

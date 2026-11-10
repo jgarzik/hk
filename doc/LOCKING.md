@@ -2022,14 +2022,24 @@ hashed; the losing builder's inode is dropped unhashed).
 
 **vfat chain cache** (`fs/vfat/cache.rs`, Linux fs/fat/cache.c):
 `VfatInode.cache` (spin Mutex, Linux cache_lru_lock), a leaf in
-thread context only, held just to look up or add a run of the file's
-clusters, never together with `VfatInode.d` and never across the FAT
-reads: a walk (`read_folio`/`writepage` under a page lock, the write
-and truncate paths under `i_rwsem`) takes it to find where to start,
-reads the FAT through the device cache with no lock held, then takes
-it again to cache what it found. Cutting the chain (`free_past`, under
-`i_rwsem`) invalidates the cache first and bumps its id; a walk that
-began under the old id caches nothing.
+thread context only, never held with `VfatInode.d` and never across
+the FAT reads. It holds the cached runs, their id (Linux
+cache_valid_id) and the chain's first cluster, a copy of
+`VfatInodeData.start_cluster` that `set_inode_data` updates after the
+data. A walk (`read_folio`/`writepage`/`swap_rw` under a page lock,
+direct I/O, the write and truncate paths under `i_rwsem`) takes, in
+one hold, the first cluster, the id and its starting run, so the three
+always belong to one chain; it reads the FAT through the device cache
+with no lock held, then caches its run only if the id is unchanged. A
+new first cluster invalidates the cache (bumping the id); a cut that
+keeps the first cluster (`free_past`, under `i_rwsem`) invalidates it
+before touching the FAT and again once the new end is written, before
+the tail is freed: a walk that began before the second invalidation
+caches nothing, and one that begins after it stops at the new end, so
+no cached run can name a freed cluster. Walks that use what they find
+for I/O and can race a cut: writes, truncate and direct I/O are
+excluded by `i_rwsem`; page-cache reads past a shrinking end are the
+pages truncate drops first (`truncate_setsize` before `free_past`).
 
 **Dentry** (`fs/dentry.rs`):
 
