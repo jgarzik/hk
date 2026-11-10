@@ -106,17 +106,15 @@ impl Tctx {
 
     /// Note that the task issued polled requests on `r`
     pub fn note_polled(&self, r: &Arc<IoRing>) -> KernelResult<()> {
-        let mut l = self.polled.lock();
-        if !l.iter().any(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(r))) {
-            l.try_push(Arc::downgrade(r))?;
-        }
-        Ok(())
+        note_live(&mut self.polled.lock(), r)
     }
 
-    /// Poll the IOPOLL rings the task issued on, once
+    /// Poll the IOPOLL rings the task issued on, once; rings gone are
+    /// dropped from the list
     fn poll_rings(&self) {
         let rings: KVec<Arc<IoRing>> = {
-            let l = self.polled.lock();
+            let mut l = self.polled.lock();
+            prune(&mut l);
             let mut v = KVec::new();
             for r in l.iter().filter_map(Weak::upgrade) {
                 // Room is not reserved: a ring left out is polled next time
@@ -154,5 +152,48 @@ impl Tctx {
 pub fn task_cancel() {
     if let Some(t) = current().io_uring.get() {
         t.cancel();
+    }
+}
+
+/// Drop the entries of rings that are gone
+fn prune<T>(l: &mut KVec<Weak<T>>) {
+    let mut i = 0;
+    while i < l.len() {
+        if l[i].strong_count() == 0 {
+            l.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Add `r` to `l` once, the dead entries pruned first: the list holds
+/// live rings only, plus none dead (Linux io_uring_add_tctx_node, with
+/// the node removed when the ring goes)
+fn note_live<T>(l: &mut KVec<Weak<T>>, r: &Arc<T>) -> KernelResult<()> {
+    prune(l);
+    if !l.iter().any(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(r))) {
+        l.try_push(Arc::downgrade(r))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polled_list_stays_bounded() {
+        let mut l: KVec<Weak<u32>> = KVec::new();
+        let keep = Arc::new(0u32);
+        for i in 0..1000 {
+            let r = Arc::new(i);
+            note_live(&mut l, &r).unwrap();
+            note_live(&mut l, &keep).unwrap();
+            assert!(l.len() <= 2, "list grew to {}", l.len());
+        }
+        drop(keep);
+        prune(&mut l);
+        assert!(l.is_empty());
     }
 }
