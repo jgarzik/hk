@@ -14,6 +14,13 @@
 //!   (sq_dropped) and ends the batch
 //! - IO_URING_BADOP: an unknown opcode completes with EINVAL
 //! - IO_URING_NOT_RING: io_uring_enter on another fd is EOPNOTSUPP
+//! - IO_URING_MMAP_SPLIT: a CQ ring mapping split by munmap of its first
+//!   page still shows the right pages after it (Linux inserts the pages
+//!   at mmap)
+//! - IO_URING_FILES_UPDATE: IORING_REGISTER_FILES_UPDATE leaves an
+//!   IORING_REGISTER_FILES_SKIP slot as it is and stops at a bad fd: the
+//!   count done before it, EBADF if that is the first (Linux
+//!   __io_sqe_files_update)
 //! - IO_URING_REG_RING: an io_uring cannot be a registered file, its
 //!   own or another ring's (EBADF: Linux io_is_uring_fops; it would keep
 //!   the rings alive forever)
@@ -39,7 +46,7 @@ use hk_syscall::{
 };
 
 pub fn run_tests() {
-    let cases: [(&[u8], fn() -> R); 9] = [
+    let cases: [(&[u8], fn() -> R); 11] = [
         (b"IO_URING_MMAP", mmap),
         (b"IO_URING_NOP", nop),
         (b"IO_URING_READ", read),
@@ -49,6 +56,8 @@ pub fn run_tests() {
         (b"IO_URING_BADOP", badop),
         (b"IO_URING_NOT_RING", not_ring),
         (b"IO_URING_REG_RING", reg_ring),
+        (b"IO_URING_MMAP_SPLIT", mmap_split),
+        (b"IO_URING_FILES_UPDATE", files_update),
     ];
     for (name, t) in cases {
         report_r(name, t());
@@ -336,4 +345,70 @@ fn overflow_bound() -> R {
     check(b"first wait", n == EBADR, n)?;
     let n = wait();
     check(b"second wait", n == ETIME, n)
+}
+
+fn mmap_split() -> R {
+    let mut r = ring(256)?;
+    let cq = r.p.cq_off;
+    let len = u64::from(cq.cqes) + u64::from(r.p.cq_entries) * 16;
+    // Not populated: every page of this view is reached after the split
+    let p = sys_mmap(0, len, PROT_READ, MAP_SHARED, r.fd, IORING_OFF_CQ_RING);
+    check(b"mmap", p > 0, p)?;
+    let n = sys_munmap(p as u64, 4096);
+    let res = (|| {
+        check(b"munmap first page", n == 0, n)?;
+        // CQE 300 lies in the mapping's second page or later
+        for i in 0..301u64 {
+            r.push(sqe(IORING_OP_NOP, -1, 0, 0, 0, 1000 + i));
+            let k = r.enter(1, 0, 0);
+            check(b"enter", k == 1, k)?;
+            r.pop().ok_or((&b"no cqe"[..], i as i64))?;
+        }
+        let off = u64::from(cq.cqes) + 300 * 16;
+        // SAFETY: inside the part of the mapping left after the munmap
+        let ud = unsafe { ((p as u64 + off) as *const u64).read_volatile() };
+        check(b"cqe 300 user_data", ud == 1300, ud as i64)
+    })();
+    sys_munmap(p as u64 + 4096, len - 4096);
+    res
+}
+
+fn files_update() -> R {
+    let fd = data_file()?;
+    let r = files_update_in(fd);
+    sys_close(fd as u64);
+    r
+}
+
+fn files_update_in(fd: i32) -> R {
+    let mut r = ring(4)?;
+    let fds = [fd, -1];
+    let n = sys_io_uring_register(r.fd as u32, IORING_REGISTER_FILES, fds.as_ptr() as u64, 2);
+    check(b"register", n == 0, n)?;
+    let rfd = r.fd as u32;
+    let update = |fds: &[i32]| {
+        // struct io_uring_files_update { u32 offset; u32 resv; u64 fds; }
+        let up = [0u64, fds.as_ptr() as u64];
+        sys_io_uring_register(rfd, 6, up.as_ptr() as u64, fds.len() as u32)
+    };
+    let n = update(&[-2, 999]);
+    check(b"skip then bad fd", n == 1, n)?;
+    // Slot 0 still holds the file
+    let mut a = [0u8; 16];
+    let mut s = sqe(IORING_OP_READ, 0, a.as_mut_ptr() as u64, 16, 100, 1);
+    s.flags = 1; // IOSQE_FIXED_FILE
+    r.push(s);
+    let k = r.submit_wait(1, 1);
+    check(b"enter", k == 1, k)?;
+    let c = r.pop().ok_or((&b"no cqe"[..], 0))?;
+    check(b"fixed read", c.res == 16, i64::from(c.res))?;
+    check(b"data", is_data(&a, 100), 0)?;
+    // A bad fd first: EBADF, and its slot is left empty
+    let n = update(&[999]);
+    check(b"bad fd first", n == EBADF, n)?;
+    r.push(s);
+    let k = r.submit_wait(1, 1);
+    check(b"enter again", k == 1, k)?;
+    let c = r.pop().ok_or((&b"no second cqe"[..], 0))?;
+    check(b"emptied slot", i64::from(c.res) == EBADF, i64::from(c.res))
 }

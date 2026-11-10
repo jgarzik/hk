@@ -279,6 +279,7 @@ pub fn sys_mmap(
     // so no mmap flag a caller sets can stand for kernel state
     let share = if is_shared { MAP_SHARED } else { MAP_PRIVATE };
     // Create VMA
+    let driver = file.as_ref().is_some_and(|f| f.f_op.maps_driver_pages(f));
     let mut vma = if let Some(f) = file {
         Vma::new_file(map_addr, map_addr + length, prot, share, f, offset)
     } else if is_shared {
@@ -368,13 +369,27 @@ pub fn sys_mmap(
         mm_guard.add_locked_vm(pages);
     }
 
+    // A driver's pages are inserted now (Linux vm_insert_pages from
+    // f_op->mmap); the mapping never merges and refaults nothing
+    if driver {
+        vma.flags |= super::vma::VM_MIXEDMAP;
+    }
     let idx = mm_guard.insert_vma(vma);
 
     // Update total_vm for RLIMIT_AS tracking
     mm_guard.add_total_vm(length / PAGE_SIZE);
 
-    // Try to merge with adjacent VMAs (VMA merging optimization)
-    mm_guard.merge_adjacent(idx);
+    if driver {
+        // Out of page tables, the pages not inserted are SIGBUS, as a
+        // failed MAP_POPULATE leaves its pages to fault
+        if let (Some(mm), Some(v)) = (crate::task::percpu::current().mm(), mm_guard.get_vma(idx)) {
+            let v = v.clone();
+            let _ = super::fault::insert_driver_pages(&mm, &mm_guard, &v);
+        }
+    } else {
+        // Try to merge with adjacent VMAs (VMA merging optimization)
+        mm_guard.merge_adjacent(idx);
+    }
 
     // Populate pages if:
     // 1. MAP_LOCKED is set, or

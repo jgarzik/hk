@@ -133,6 +133,11 @@ pub const VM_SIGPAGE: u32 = 0x2000_0000;
 /// (Linux memfd_check_seals_mmap clears VM_MAYWRITE)
 pub const VM_NOMAYWRITE: u32 = 0x4000_0000;
 
+/// A driver's pages inserted at mmap (Linux VM_MIXEDMAP from
+/// vm_insert_pages): fork copies the entries, nothing faults back in
+/// (SIGBUS), it never merges with a neighbour
+pub const VM_MIXEDMAP: u32 = 0x8000_0000;
+
 // ============================================================================
 // msync flags (MS_*)
 // ============================================================================

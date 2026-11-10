@@ -65,6 +65,8 @@ struct Area {
     pgoff: u64,
     file: Option<Arc<File>>,
     anon_vma: Option<Arc<AnonVma>>,
+    /// The driver's pages were inserted at mmap (VM_MIXEDMAP)
+    mixed: bool,
 }
 
 impl Area {
@@ -120,7 +122,37 @@ fn area_of(vma: &super::Vma) -> Area {
         pgoff: vma.pgoff,
         file: vma.file.clone(),
         anon_vma: vma.anon_vma.clone(),
+        mixed: vma.flags & super::vma::VM_MIXEDMAP != 0,
     }
+}
+
+/// Map the driver's pages of the new mapping `vma` of `mm` (its
+/// `FileOps::map_page`, Linux vm_insert_pages from f_op->mmap), page
+/// `i` of it at `vma.start + i` pages, until the driver has no more;
+/// the mmap_lock held for writing (`map`). Read-only and copy-on-write
+/// in a private mapping. ENOMEM if a page table cannot be allocated.
+pub fn insert_driver_pages(mm: &Mm, map: &MmStruct, vma: &super::Vma) -> Result<(), KernelError> {
+    let area = area_of(vma);
+    let Some(f) = &area.file else { return Ok(()) };
+    let t = PgTables::new(mm, map);
+    let mut addr = area.start;
+    while addr < area.end {
+        let idx = (addr - area.start) / PAGE_SIZE;
+        // SAFETY: the page goes into this mapping's PTE with the
+        // reference map_page took, dropped when the entry goes
+        let Some(Ok(page)) = (unsafe { f.f_op.map_page(f, area.offset, idx) }) else {
+            break;
+        };
+        let Ok(ptep) = leaf(mm, t, addr) else {
+            FRAME_ALLOCATOR.decref(page);
+            return Err(KernelError::OutOfMemory);
+        };
+        if do_fault(mm, ptep, ptep.get(), page, addr, &area, !area.shared).is_err() {
+            return Err(KernelError::OutOfMemory);
+        }
+        addr += PAGE_SIZE;
+    }
+    Ok(())
 }
 
 /// A frame for user data: below the low watermark it reclaims (swaps
@@ -355,12 +387,10 @@ fn do_huge_anon(mm: &Mm, t: PgTables<'_>, addr: u64, area: &Area) -> bool {
 /// mapping's page-cache page: a write copies it, Linux do_read_fault).
 fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool), VmFault> {
     let exec = area.prot & PROT_EXEC != 0;
-    if let (false, Some(f)) = (area.anon, &area.file)
-        && let Some(r) = f
-            .f_op
-            .map_page(f, area.offset, (addr - area.start) / PAGE_SIZE)
-    {
-        return driver_page(r, area, access);
+    // A driver's pages are inserted at mmap (`insert_driver_pages`):
+    // nothing faults back in (Linux: no vm_ops->fault, SIGBUS)
+    if area.mixed {
+        return Err(VmFault::Bus);
     }
     if let (false, Some(f)) = (area.anon, &area.file)
         && let Some(r) = file_page(f, area.pgoff(addr), area, access)
@@ -382,30 +412,6 @@ fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool
         paging::sync_page(frame, exec);
     }
     Ok((frame, false, false))
-}
-
-/// A driver's page for a mapping (`FileOps::map_page`, with a
-/// reference for the PTE): a shared mapping maps it, a private one maps
-/// it read-only on a read and a copy of it on a write (Linux
-/// vm_insert_page into a private VMA: copy-on-write); SIGBUS if the
-/// driver has none there
-fn driver_page(
-    r: Result<u64, KernelError>,
-    area: &Area,
-    access: Access,
-) -> Result<(u64, bool, bool), VmFault> {
-    let page = r.map_err(|_| VmFault::Bus)?;
-    if area.shared || access != Access::Write {
-        return Ok((page, false, !area.shared));
-    }
-    let copy = alloc_user();
-    if let Some(new) = copy {
-        // SAFETY: the new frame is ours; `page` is referenced
-        unsafe { super::page::copy_page_racy(new, page) };
-        paging::sync_page(new, area.prot & PROT_EXEC != 0);
-    }
-    FRAME_ALLOCATOR.decref(page);
-    copy.map(|n| (n, false, false)).ok_or(VmFault::Oom)
 }
 
 /// The page-cache page at byte offset `off` of `file`, for a mapping

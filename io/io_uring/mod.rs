@@ -476,9 +476,13 @@ impl IoRing {
         old.map(drop).ok_or(KernelError::NoDeviceOrAddress)
     }
 
-    /// Replace registered files from `offset` on (-1 empties a slot):
-    /// the number updated (Linux __io_sqe_files_update)
+    /// Replace registered files from `offset` on (-1 empties a slot,
+    /// IORING_REGISTER_FILES_SKIP leaves it): the number done up to the
+    /// first bad fd, whose slot is left empty, its error if that is the
+    /// first (Linux __io_sqe_files_update)
     fn update_files(&self, offset: u32, fds: &[i32]) -> KernelResult<usize> {
+        /// Leave the slot as it is (Linux IORING_REGISTER_FILES_SKIP)
+        const SKIP: i32 = -2;
         // The replaced files are released after both locks
         let mut old = KVec::try_with_capacity(fds.len())?;
         let fd_table = current().files().ok_or(KernelError::BadFd)?;
@@ -489,19 +493,36 @@ impl IoRing {
             return Err(KernelError::InvalidArgument);
         }
         let t = fd_table.lock();
+        let (mut done, mut err) = (0, None);
         for (i, &fd) in fds.iter().enumerate() {
-            let new = if fd == -1 {
-                None
-            } else {
-                Some(reg_file(t.get(fd))?)
-            };
+            if fd == SKIP {
+                done += 1;
+                continue;
+            }
+            // The slot is emptied first, so a bad fd leaves it empty
+            // (Linux: io_reset_rsrc_node before the fget)
             // Capacity is reserved; this cannot fail
-            let _ = old.try_push(core::mem::replace(&mut reg[offset + i], new));
+            let _ = old.try_push(reg[offset + i].take());
+            if fd != -1 {
+                match reg_file(t.get(fd)) {
+                    Ok(f) => reg[offset + i] = Some(f),
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            done += 1;
         }
         drop(t);
         drop(s);
         drop(old);
-        Ok(fds.len())
+        // The count done, or the error if none was (Linux
+        // __io_sqe_files_update: done ? done : err)
+        match err {
+            Some(e) if done == 0 => Err(e),
+            _ => Ok(done),
+        }
     }
 
     /// Entries in the CQ
@@ -593,13 +614,20 @@ impl FileOps for IoUringFileOps {
             .ok_or(KernelError::InvalidArgument)
     }
 
+    fn maps_driver_pages(&self, _file: &File) -> bool {
+        true
+    }
+
     /// Page `idx` of the region the mapping's offset selects, whatever
     /// the offset's low bits (Linux io_region_mmap: vm_insert_pages from
-    /// the region's first page); past the region SIGBUS
-    fn map_page(&self, file: &File, off: u64, idx: u64) -> Option<Result<u64, KernelError>> {
+    /// the region's first page); none past the region
+    // SAFETY: the region's frames hold only the rings and SQEs shared
+    // with user space, and each one handed out carries a reference that
+    // keeps it allocated (`SharedRegion::map_page`)
+    unsafe fn map_page(&self, file: &File, off: u64, idx: u64) -> Option<Result<u64, KernelError>> {
         let r = file.private_ref::<IoRing>()?;
         let region = r.rings.region(off & IORING_OFF_MMAP_MASK)?;
-        Some(region.map_page(idx).ok_or(KernelError::BadAddress))
+        region.map_page(idx).map(Ok)
     }
 }
 

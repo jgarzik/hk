@@ -362,12 +362,30 @@ pub trait FileOps: Send + Sync {
         Ok(())
     }
 
+    /// The file's mappings are its driver's pages, inserted at mmap
+    /// (`map_page`; Linux vm_insert_pages from f_op->mmap). Default: no.
+    fn maps_driver_pages(&self, _file: &File) -> bool {
+        false
+    }
+
     /// The kernel page that page `idx` of a mapping made at byte `off`
     /// of the file maps, with a reference taken for its PTE (Linux
     /// vm_insert_pages from f_op->mmap: pages of the driver, not of a
-    /// page cache); an error is SIGBUS. None: the file maps the default
-    /// way (its page cache, or a private copy of its data).
-    fn map_page(&self, _file: &File, _off: u64, _idx: u64) -> Option<Result<u64, KernelError>> {
+    /// page cache); None past the driver's pages. Asked at mmap, only
+    /// for a file that `maps_driver_pages`.
+    ///
+    /// # Safety
+    /// The caller maps the page into user space with the reference
+    /// taken here and drops that reference when the mapping goes. The
+    /// implementor returns a RAM frame that stays allocated while the
+    /// reference is held and holds nothing but what user space may
+    /// read and write.
+    unsafe fn map_page(
+        &self,
+        _file: &File,
+        _off: u64,
+        _idx: u64,
+    ) -> Option<Result<u64, KernelError>> {
         None
     }
 
