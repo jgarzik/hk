@@ -135,14 +135,72 @@ pub fn direct_io<I: DioIter>(
     if invalid(pos, count, b.logical_block_size()) {
         return Err(KernelError::InvalidArgument);
     }
-    let d = Dio::new::<I>(b, pos, flags);
+    let d = Dio::new::<I>(b, flags);
+    // One extent: the device from `pos` on
+    let map = [(pos, count)];
     let nr = it.npages(BIO_MAX_VECS + 1);
     if nr <= BIO_MAX_VECS {
-        d.simple(it, nr)
+        d.simple(it, &map, nr)
     } else {
-        d.large(it)
+        d.large(it, &map)
     }
 }
+
+/// A run of a file's bytes on the device: byte offset there, length
+pub type Extent = (u64, usize);
+
+/// Direct I/O of `it` through the device extents `map`, in order, which
+/// cover exactly its bytes (Linux do_blockdev_direct_IO over a
+/// filesystem's get_block mappings): pinned a bio's worth at a time and
+/// sent as bios cut at each extent's end and at the queue limits, all
+/// plugged and counted in one wait, without FUA (an O_DSYNC write is
+/// the caller's generic_write_sync). `unlock` is dropped once every bio
+/// is submitted, before the wait (Linux DIO_LOCKING releases a read's
+/// i_rwsem there). The bytes done: a pin that faults after some were
+/// sent ends it short (Linux dio_complete ignores EFAULT then); any
+/// other error fails it, an I/O error included. The caller checked the
+/// alignment (Linux __blockdev_direct_IO).
+pub fn direct_io_map<I: DioIter, G>(
+    b: &BlockDevice,
+    it: &mut I,
+    map: &[Extent],
+    unlock: G,
+) -> Result<usize, KernelError> {
+    let d = Dio::new::<I>(b, RwFlags::empty());
+    let (done, ret, r) = d.plugged(it, map, unlock)?;
+    match ret {
+        Err(KernelError::BadAddress) if done > 0 => {}
+        r => r?,
+    }
+    r.map(|()| done)
+}
+
+/// A position in a list of extents: extent `i`, byte `at` of it
+#[derive(Default)]
+struct MapPos {
+    i: usize,
+    at: usize,
+}
+
+impl MapPos {
+    /// The device byte offset here and the bytes left in its extent
+    fn cur(&self, map: &[Extent]) -> Option<(u64, usize)> {
+        let &(off, len) = map.get(self.i)?;
+        Some((off + self.at as u64, len - self.at))
+    }
+
+    fn advance(&mut self, map: &[Extent], n: usize) {
+        self.at += n;
+        if map.get(self.i).is_some_and(|e| self.at >= e.1) {
+            self.i += 1;
+            self.at = 0;
+        }
+    }
+}
+
+/// A plugged I/O's bytes sent, its submission's first error and its
+/// I/O's
+type Outcome = (usize, Result<(), KernelError>, Result<(), KernelError>);
 
 /// One direct I/O's fixed parts
 struct Dio<'a> {
@@ -151,12 +209,10 @@ struct Dio<'a> {
     /// FUA for an O_DSYNC write (Linux dio_bio_write_op), NOWAIT for
     /// RWF_NOWAIT (Linux REQ_NOWAIT)
     bflags: BioFlags,
-    /// First sector
-    sector: u64,
 }
 
 impl<'a> Dio<'a> {
-    fn new<I: DioIter>(b: &'a BlockDevice, pos: u64, flags: RwFlags) -> Self {
+    fn new<I: DioIter>(b: &'a BlockDevice, flags: RwFlags) -> Self {
         let dsync = flags.intersects(RwFlags::DSYNC | RwFlags::SYNC);
         Self {
             b,
@@ -167,7 +223,6 @@ impl<'a> Dio<'a> {
                 f.set(BioFlags::NOWAIT, flags.nowait());
                 f
             },
-            sector: pos >> SECTOR_SHIFT,
         }
     }
 
@@ -184,10 +239,15 @@ impl<'a> Dio<'a> {
 
     /// Up to `BIO_MAX_VECS` pages, `nr` of them: pinned once (short if
     /// the pin is), one wait (Linux __blkdev_direct_IO_simple)
-    fn simple<I: DioIter>(&self, it: &mut I, nr: usize) -> Result<usize, KernelError> {
+    fn simple<I: DioIter>(
+        &self,
+        it: &mut I,
+        map: &[Extent],
+        nr: usize,
+    ) -> Result<usize, KernelError> {
         let pp = self.pin(it, nr)?;
         let w = DioWait::new();
-        let sent = self.send(&pp, self.sector, &w);
+        let sent = self.send(&pp, map, &mut MapPos::default(), &w);
         let pp = self.sent(pp, &sent);
         let r = w.finish();
         drop(pp);
@@ -198,61 +258,74 @@ impl<'a> Dio<'a> {
     /// More than `BIO_MAX_VECS` pages: a bio's worth pinned and sent at a
     /// time, all counted in one wait; a pin that fails after the first
     /// fails the I/O (Linux __blkdev_direct_IO)
-    fn large<I: DioIter>(&self, it: &mut I) -> Result<usize, KernelError> {
+    fn large<I: DioIter>(&self, it: &mut I, map: &[Extent]) -> Result<usize, KernelError> {
+        let (done, ret, r) = self.plugged(it, map, ())?;
+        ret?;
+        r.map(|()| done)
+    }
+
+    /// Every bio of `it` through `map`, plugged (`send_all`), then
+    /// `unlock` dropped and the wait: (bytes sent, the submission's
+    /// first error, the I/O's)
+    fn plugged<I: DioIter, G>(
+        &self,
+        it: &mut I,
+        map: &[Extent],
+        unlock: G,
+    ) -> Result<Outcome, KernelError> {
         // The pins of every bio sent are kept until the wait: room for
         // the usual count up front (a bio cut back to whole blocks
         // leaves a page for the next, so there may be more)
         let nr = it.npages(usize::MAX);
         let mut pins: KVec<PinnedPages> = KVec::try_with_capacity(nr.div_ceil(BIO_MAX_VECS) + 1)?;
         let w = DioWait::new();
-        let (done, ret) = super::plug::blk_plug(|| self.send_all(it, &mut pins, &w));
+        let mut at = MapPos::default();
+        let (done, ret) = super::plug::blk_plug(|| self.send_all(it, map, &mut at, &mut pins, &w));
+        drop(unlock);
         let r = w.finish();
         drop(pins);
-        ret?;
-        r.map(|()| done)
+        Ok((done, ret, r))
     }
 
-    /// The large path's bios, plugged: pinned and sent a bio's worth at
-    /// a time, the pins kept in `pins`; (bytes sent, the first error)
+    /// Pinned and sent a bio's worth at a time through `map` from `at`,
+    /// the pins kept in `pins`; (bytes sent, the first error). A bio
+    /// that could not be made after some went out stops it (the error
+    /// is in `w`).
     fn send_all<I: DioIter>(
         &self,
         it: &mut I,
+        map: &[Extent],
+        at: &mut MapPos,
         pins: &mut KVec<PinnedPages>,
         w: &DioWait,
     ) -> (usize, Result<(), KernelError>) {
-        let (mut done, mut ret) = (0usize, Ok(()));
+        let mut done = 0usize;
         while it.count() > 0 {
             // Room before the pin, so a sent bio's pins are always kept
             if let Err(e) = pins.try_reserve(1) {
-                ret = Err(e);
-                break;
+                return (done, Err(e));
             }
             let pp = match self.pin(it, BIO_MAX_VECS) {
                 Ok(pp) => pp,
-                Err(e) => {
-                    ret = Err(e);
-                    break;
-                }
+                Err(e) => return (done, Err(e)),
             };
             // Another bio would follow (Linux: EAGAIN, nothing sent)
             if self.nowait() && it.count() > 0 {
-                ret = Err(KernelError::WouldBlock);
-                break;
+                return (done, Err(KernelError::WouldBlock));
             }
-            let sent = self.send(&pp, self.sector + (done as u64 >> SECTOR_SHIFT), w);
+            let len = pp.len();
+            let sent = self.send(&pp, map, at, w);
             if let Some(pp) = self.sent(pp, &sent) {
                 // Room was reserved: no allocation, cannot fail
                 let _ = pins.try_push(pp);
             }
             match sent {
-                Ok(n) => done += n,
-                Err(e) => {
-                    ret = Err(e);
-                    break;
-                }
+                Ok(n) if n == len => done += n,
+                Ok(n) => return (done + n, Ok(())),
+                Err(e) => return (done, Err(e)),
             }
         }
-        (done, ret)
+        (done, Ok(()))
     }
 
     /// What of `pp` must stay pinned until the wait after `send` gave
@@ -268,22 +341,32 @@ impl<'a> Dio<'a> {
         Some(pp)
     }
 
-    /// Send `pp` from `sector` on as bios within the queue limits, each
-    /// counted in `w`: the bytes sent. EAGAIN for RWF_NOWAIT if it takes
-    /// more than one bio, before any is sent; an error after some were
-    /// sent is left in `w`.
-    fn send(&self, pp: &PinnedPages, sector: u64, w: &DioWait) -> Result<usize, KernelError> {
+    /// Send `pp` through `map` from `at` as bios within the queue limits
+    /// and the extents, each counted in `w`: the bytes sent. EAGAIN for
+    /// RWF_NOWAIT if it takes more than one bio, before any is sent; an
+    /// error after some were sent is left in `w`.
+    fn send(
+        &self,
+        pp: &PinnedPages,
+        map: &[Extent],
+        at: &mut MapPos,
+        w: &DioWait,
+    ) -> Result<usize, KernelError> {
         let lim = &self.b.disk.queue.limits;
         let segs = pp.segs();
         let mut cur = Cursor::default();
         let mut sent = 0usize;
         while !cur.done(segs) {
-            let r = Bio::with_segs(
-                self.op,
-                sector + (sent as u64 >> SECTOR_SHIFT),
-                cur.room(segs, lim),
-            )
-            .and_then(|mut bio| cur.next_bio(segs, lim, &mut bio.segs).map(|n| (bio, n)));
+            let r = at.cur(map).ok_or(KernelError::Io).and_then(|(off, left)| {
+                // No bio past the extent's end
+                let l = QueueLimits {
+                    max_sectors: (left >> SECTOR_SHIFT).min(lim.max_sectors as usize) as u32,
+                    ..*lim
+                };
+                let mut bio = Bio::with_segs(self.op, off >> SECTOR_SHIFT, cur.room(segs, &l))?;
+                let n = cur.next_bio(segs, &l, &mut bio.segs)?;
+                Ok((bio, n))
+            });
             let (mut bio, n) = match r {
                 Ok(x) => x,
                 Err(e) if sent == 0 => return Err(e),
@@ -300,6 +383,7 @@ impl<'a> Dio<'a> {
             bio.private = core::ptr::from_ref(w) as usize;
             w.get();
             submit_bio(self.b, bio);
+            at.advance(map, n);
             sent += n;
         }
         Ok(sent)

@@ -194,6 +194,26 @@ impl<'a> Segs<'a> {
         Ok(pp)
     }
 
+    /// The bits of the bytes left's addresses and lengths, ORed (Linux
+    /// iov_iter_alignment_iovec): segment by segment, the last cut to
+    /// what is left, empty ones skipped
+    fn alignment(&self) -> u64 {
+        let (mut res, mut size, mut skip) = (0u64, self.left, self.off);
+        for s in self.segs.get(self.i..).unwrap_or(&[]) {
+            if size == 0 {
+                break;
+            }
+            let len = (s.iov_len as usize).saturating_sub(skip);
+            if len > 0 {
+                let len = len.min(size);
+                res |= (s.iov_base + skip as u64) | len as u64;
+                size -= len;
+            }
+            skip = 0;
+        }
+        res
+    }
+
     /// Step back over the last `n` bytes moved
     fn revert(&mut self, n: usize) {
         self.left += n;
@@ -261,6 +281,16 @@ impl<'a> IovDest<'a> {
         match &self.0 {
             Dest::User(s) => s.npages(max),
             _ => 0,
+        }
+    }
+
+    /// The room left's addresses and lengths ORed, to test their
+    /// alignment (Linux iov_iter_alignment)
+    pub fn alignment(&self) -> u64 {
+        match &self.0 {
+            Dest::User(s) => s.alignment(),
+            Dest::Kernel([]) => 0,
+            Dest::Kernel(b) => b.as_ptr() as u64 | b.len() as u64,
         }
     }
 
@@ -401,6 +431,16 @@ impl<'a> IovSource<'a> {
         match &self.0 {
             Source::User(s) => s.npages(max),
             _ => 0,
+        }
+    }
+
+    /// The bytes left's addresses and lengths ORed, to test their
+    /// alignment (Linux iov_iter_alignment)
+    pub fn alignment(&self) -> u64 {
+        match &self.0 {
+            Source::User(s) => s.alignment(),
+            Source::Kernel(b, at) if *at == b.len() => 0,
+            Source::Kernel(b, at) => (b.as_ptr() as u64 + *at as u64) | (b.len() - at) as u64,
         }
     }
 
@@ -547,6 +587,27 @@ mod tests {
             n
         });
         assert_eq!(runs, [(0x1002, 1), (0x3000, 5)]);
+    }
+
+    #[test]
+    fn alignment_of_segments() {
+        let seg = |b, l| IoVec {
+            iov_base: b,
+            iov_len: l,
+        };
+        // An empty segment's odd address does not count
+        let segs = [seg(0x1000, 0x200), seg(0x2001, 0), seg(0x3000, 0x400)];
+        let s = Segs::new(&segs, usize::MAX);
+        assert_eq!(s.alignment() & 0x1ff, 0);
+        // The last segment counts only as far as the bytes left
+        let s = Segs::new(&segs, 0x300);
+        assert_eq!(s.alignment() & 0x1ff, 0x100);
+        // From the position: a consumed prefix's address is gone
+        let segs = [seg(0x1001, 0x201), seg(0x4000, 0x200)];
+        let mut s = Segs::new(&segs, usize::MAX);
+        assert_ne!(s.alignment() & 0x1ff, 0);
+        s.step(0x201, &mut |_, n, _| n);
+        assert_eq!(s.alignment() & 0x1ff, 0);
     }
 
     #[test]

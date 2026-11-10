@@ -10,4 +10,5 @@ pub mod disk;
 pub mod dsync;
 pub mod mmap_dirty;
 pub mod odirect;
+pub mod vfat_dio;
 pub mod writeback;

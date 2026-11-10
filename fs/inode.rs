@@ -9,6 +9,7 @@ use crate::sync::spin::RwLock;
 use ::core::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::RwSem;
+use crate::sync::waitqueue::var_waitqueue;
 
 use super::KernelError;
 use super::superblock::SuperBlock;
@@ -553,6 +554,10 @@ pub struct Inode {
     /// instead which handles proper lock ordering.
     i_rwsem: RwSem,
 
+    /// Direct I/Os in flight (Linux i_dio_count): `inode_dio_begin` /
+    /// `inode_dio_end`, waited for by `inode_dio_wait`
+    i_dio_count: AtomicU32,
+
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn InodeData>>>,
 
@@ -632,6 +637,7 @@ impl Inode {
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
+            i_dio_count: AtomicU32::new(0),
             i_linkable: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
@@ -678,6 +684,7 @@ impl Inode {
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
+            i_dio_count: AtomicU32::new(0),
             i_linkable: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
@@ -982,6 +989,58 @@ impl Drop for InodeLock<'_> {
     }
 }
 
+impl Inode {
+    /// A direct I/O on the inode starts (Linux inode_dio_begin)
+    pub fn inode_dio_begin(&self) {
+        self.i_dio_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A direct I/O on the inode is done, its last bio completed (Linux
+    /// inode_dio_end); the last one wakes `inode_dio_wait`. Any context:
+    /// the wakeup takes only the wait queue's IrqSpinlock.
+    pub fn inode_dio_end(&self) {
+        if self.i_dio_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            var_waitqueue(self.dio_key()).wake_all();
+        }
+    }
+
+    /// Sleep until no direct I/O is in flight (Linux inode_dio_wait).
+    /// The caller holds i_rwsem exclusive, so no new one can start on a
+    /// filesystem whose direct I/O takes it (vfat) before what it frees.
+    pub fn inode_dio_wait(&self) {
+        if self.dio_count() != 0 {
+            var_waitqueue(self.dio_key()).wait_event(|| self.dio_count() == 0);
+        }
+    }
+
+    /// Direct I/Os in flight (Linux inode_dio_finished's count)
+    pub fn dio_count(&self) -> u32 {
+        self.i_dio_count.load(Ordering::Acquire)
+    }
+
+    /// `inode_dio_begin` now, `inode_dio_end` when the guard drops
+    pub fn dio_guard(&self) -> DioGuard<'_> {
+        self.inode_dio_begin();
+        DioGuard(self)
+    }
+
+    /// The key of the shared wait queue `inode_dio_wait` sleeps on (Linux
+    /// wake_up_var(&inode->i_dio_count))
+    fn dio_key(&self) -> usize {
+        core::ptr::from_ref(&self.i_dio_count) as usize
+    }
+}
+
+/// A direct I/O counted in `Inode.i_dio_count` until dropped
+#[must_use]
+pub struct DioGuard<'a>(&'a Inode);
+
+impl Drop for DioGuard<'_> {
+    fn drop(&mut self) {
+        self.0.inode_dio_end();
+    }
+}
+
 /// [`InodeLock`] owning its inode reference ([`Inode::lock_arc`])
 #[must_use]
 pub struct InodeLockArc(Arc<Inode>);
@@ -1089,5 +1148,50 @@ impl Drop for DenyWrite {
 impl Drop for Inode {
     fn drop(&mut self) {
         super::icache::evict(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestOps;
+
+    impl InodeOps for TestOps {
+        fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+            Err(KernelError::NotFound)
+        }
+    }
+
+    static TEST_OPS: TestOps = TestOps;
+
+    #[test]
+    fn dio_count() {
+        let i = Inode::new(
+            1,
+            InodeMode::regular(0o644),
+            0,
+            0,
+            0,
+            Timespec::ZERO,
+            Weak::new(),
+            &TEST_OPS,
+        );
+        // None in flight: no wait
+        i.inode_dio_wait();
+        i.inode_dio_begin();
+        {
+            let _g = i.dio_guard();
+            assert_eq!(i.dio_count(), 2);
+        }
+        assert_eq!(i.dio_count(), 1);
+        i.inode_dio_end();
+        assert_eq!(i.dio_count(), 0);
+        i.inode_dio_wait();
+        // The wakeup's queue is the variable's, the same every time
+        assert!(core::ptr::eq(
+            var_waitqueue(i.dio_key()),
+            var_waitqueue(i.dio_key())
+        ));
     }
 }

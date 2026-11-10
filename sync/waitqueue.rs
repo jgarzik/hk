@@ -609,6 +609,24 @@ pub fn page_wait_queue(page_addr: u64) -> &'static WaitQueue {
     &PAGE_WAIT_TABLE[index]
 }
 
+/// Shared wait queues for waiting on a variable's value (Linux
+/// bit_wait_table behind wait_var_event / wake_up_var): an object with
+/// rare waiters (an inode's direct I/O count) needs no queue of its own.
+/// A queue may hold waiters for several variables: each re-checks its
+/// own condition.
+static VAR_WAIT_TABLE: [WaitQueue; VAR_WAIT_TABLE_SIZE] =
+    [const { WaitQueue::new() }; VAR_WAIT_TABLE_SIZE];
+
+const VAR_WAIT_TABLE_SIZE: usize = 256;
+
+/// The wait queue of the variable at address `addr` (Linux
+/// __var_waitqueue)
+pub fn var_waitqueue(addr: usize) -> &'static WaitQueue {
+    // Mix the bits above the alignment (Linux hash_ptr)
+    let h = (addr as u64 >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56;
+    &VAR_WAIT_TABLE[h as usize % VAR_WAIT_TABLE_SIZE]
+}
+
 // ============================================================================
 // Locking Self-Tests
 // ============================================================================

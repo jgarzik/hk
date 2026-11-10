@@ -36,6 +36,7 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
 
 mod cache;
+mod direct;
 
 // ============================================================================
 // VFAT file pages (Linux fat_aops: fat_read_folio, fat_writepages)
@@ -53,12 +54,26 @@ type PageRuns = (Arc<BlockDevice>, Vec<(u64, usize)>);
 /// The runs on disk holding the page's bytes within the file (one walk
 /// of its chain from the nearest cached position, `cache::extents`)
 fn page_runs(inode: &Inode, index: u64) -> Result<PageRuns, KernelError> {
+    page_runs_to(inode, index, false).map(|(r, _)| r)
+}
+
+/// `page_runs`, with `whole` the bytes in the page are taken to the end
+/// of the filesystem block holding the last; and that count before
+/// rounding (the bytes within the file)
+fn page_runs_to(inode: &Inode, index: u64, whole: bool) -> Result<(PageRuns, usize), KernelError> {
     let sb = inode.superblock().ok_or(KernelError::Io)?;
     let sb_data = get_sb_data(&sb)?;
     let pos = index * PAGE_SIZE as u64;
-    let valid = inode.get_size().saturating_sub(pos).min(PAGE_SIZE as u64) as usize;
-    let runs = cache::extents(&sb_data, inode, pos, valid)?;
-    Ok((sb_data.bdev.clone(), runs))
+    let valid = inode.get_size().saturating_sub(pos).min(PAGE_SIZE as u64);
+    let len = if whole {
+        valid
+            .next_multiple_of(u64::from(sb_data.bytes_per_sector))
+            .min(PAGE_SIZE as u64)
+    } else {
+        valid
+    };
+    let runs = cache::extents(&sb_data, inode, pos, len as usize)?;
+    Ok(((sb_data.bdev.clone(), runs), valid as usize))
 }
 
 /// Transfer `runs` between the disk and `page` (in order from its start)
@@ -109,10 +124,15 @@ impl Aops for VfatAops {
         page_io(&bdev, BioOp::Read, buf, &runs)
     }
 
+    /// The page's blocks within the file, the last one whole with the
+    /// page zeroed past the size first (Linux block_write_full_folio):
+    /// no stale bytes stay on the disk in a block below mmu_private
     fn writepage(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
-        let (bdev, runs) = page_runs(inode, index)?;
+        let ((bdev, runs), valid) = page_runs_to(inode, index, true)?;
         // SAFETY: the locked page with our reference
-        page_io(&bdev, BioOp::Write, unsafe { frame_bytes(phys) }, &runs)
+        let page = unsafe { frame_bytes(phys) };
+        page[valid..].fill(0);
+        page_io(&bdev, BioOp::Write, page, &runs)
     }
 }
 
@@ -209,8 +229,14 @@ fn vfat_write(
     }
     let old = inode.get_size();
     ensure_clusters(inode, &sb_data, end.max(old))?;
-    if pos > old {
-        cont_expand(inode, u64::from(sb_data.cluster_size), old, pos)?;
+    mmu_extend(inode, &sb_data, end)?;
+    // The gap zeroed: if that fails, mmu_private and the clusters go
+    // back to the size (Linux: a failed write_begin is fat_write_failed)
+    if pos > old
+        && let Err(e) = cont_expand(inode, u64::from(sb_data.cluster_size), old, pos)
+    {
+        let _ = write_failed(inode, &sb_data);
+        return Err(e);
     }
     let r = filemap::write_iter(inode, from, pos);
     if !matches!(r, Ok(n) if n == len) {
@@ -225,10 +251,34 @@ fn vfat_write(
     Ok(n)
 }
 
+/// A write or expanding truncate reached byte `end`: the blocks up to
+/// it are allocated and initialized (Linux cont_write_begin and
+/// __fat_get_block raise mmu_private to the end of the block)
+fn mmu_extend(inode: &Inode, sb_data: &VfatSbData, end: u64) -> Result<(), KernelError> {
+    let bs = u64::from(sb_data.bytes_per_sector);
+    with_vi(inode, |v| {
+        let mut d = v.d.lock();
+        if end > d.mmu_private {
+            d.mmu_private = end.next_multiple_of(bs);
+        }
+    })
+}
+
+/// The file was cut to `size` bytes (Linux fat_truncate_blocks)
+fn mmu_truncate(inode: &Inode, size: u64) -> Result<(), KernelError> {
+    with_vi(inode, |v| {
+        let mut d = v.d.lock();
+        d.mmu_private = d.mmu_private.min(size);
+    })
+}
+
 /// A write that came up short (a fault in the caller's buffer, no
 /// memory): the clusters past the end go again (Linux fat_write_failed
 /// -> fat_truncate_blocks)
 fn write_failed(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
+    // No direct I/O still reads clusters about to be freed
+    inode.inode_dio_wait();
+    mmu_truncate(inode, inode.get_size())?;
     let d = get_inode_data(inode)?;
     let keep = inode.get_size().div_ceil(u64::from(sb_data.cluster_size)) as usize;
     let start = free_past(sb_data, inode, d.start_cluster, keep)?;
@@ -702,6 +752,12 @@ pub struct VfatInodeData {
     pub parent_cluster: u32,
     /// Short name for directory entry lookup (8+3 format)
     pub short_name: [u8; 11],
+    /// Bytes from the start whose blocks are allocated and initialized
+    /// (Linux mmu_private): the size when read from disk, raised to the
+    /// end of the block a write or expanding truncate reaches, lowered
+    /// by a truncate; a direct write past it goes through the cache.
+    /// Changed under i_rwsem.
+    pub mmu_private: u64,
 }
 
 /// A vfat inode's `Inode.private`: its data, changed in place (a
@@ -1767,6 +1823,7 @@ impl InodeOps for VfatInodeOps {
             is_dir: false,
             parent_cluster,
             short_name,
+            mmu_private: 0,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
         dir_sync(&sb, &sb_data)?;
@@ -1852,6 +1909,7 @@ impl InodeOps for VfatInodeOps {
             is_dir: true,
             parent_cluster,
             short_name,
+            mmu_private: 0,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
         dir_sync(&sb, &sb_data)?;
@@ -1933,7 +1991,8 @@ impl InodeOps for VfatInodeOps {
         dir_sync(&sb, &sb_data)
     }
 
-    /// Linux fat_setattr(ATTR_SIZE): shrinking drops the pages past
+    /// Linux fat_setattr(ATTR_SIZE): direct I/O in flight waited for
+    /// (inode_dio_wait), then shrinking drops the pages past
     /// the end (truncate_setsize, mappings included) before the clusters
     /// go; growing zeroes the rest of the last cluster through the page
     /// cache and gives the file zeroed clusters. The VFS holds i_rwsem.
@@ -1947,10 +2006,15 @@ impl InodeOps for VfatInodeOps {
         if length > u64::from(u32::MAX) {
             return Err(KernelError::FileTooLarge);
         }
+        // Direct I/O in flight (a read past its lock) is done before the
+        // size or the chain changes (Linux fat_setattr)
+        inode.inode_dio_wait();
         let old = inode.get_size();
         let cs = u64::from(sb_data.cluster_size);
         if length < old {
             filemap::truncate_setsize(inode, length);
+            // Before anything is freed (Linux fat_truncate_blocks)
+            mmu_truncate(inode, length)?;
             let keep = length.div_ceil(cs) as usize;
             let start = free_past(&sb_data, inode, d.start_cluster, keep)?;
             // The clusters are freed on disk: the inode follows
@@ -1964,7 +2028,12 @@ impl InodeOps for VfatInodeOps {
             )?;
         } else if length > old {
             ensure_clusters(inode, &sb_data, length)?;
-            cont_expand(inode, cs, old, length)?;
+            mmu_extend(inode, &sb_data, length)?;
+            // Linux fat_cont_expand: a failure is fat_write_failed
+            if let Err(e) = cont_expand(inode, cs, old, length) {
+                let _ = write_failed(inode, &sb_data);
+                return Err(e);
+            }
             super::fs_writeback::mark_inode_dirty(inode);
             inode.set_size(length);
         }
@@ -2204,6 +2273,7 @@ fn create_inode_for_entry(
         is_dir: entry.is_dir(),
         parent_cluster,
         short_name: entry.short_name,
+        mmu_private: u64::from(entry.file_size),
     })?);
 
     Ok(inode)
@@ -2241,8 +2311,9 @@ impl FileOps for VfatFileOps {
         }
     }
 
-    /// Straight from the page cache (Linux filemap_read); no
-    /// RWF_NOWAIT (EOPNOTSUPP)
+    /// O_DIRECT from user memory straight from the disk
+    /// (`direct::read`), else from the page cache (Linux
+    /// generic_file_read_iter); no RWF_NOWAIT (EOPNOTSUPP)
     fn read_iter(
         &self,
         file: &File,
@@ -2254,14 +2325,20 @@ impl FileOps for VfatFileOps {
             return Err(KernelError::OperationNotSupported);
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let n = filemap::read_iter(&inode, to, at.unwrap_or_else(|| file.get_pos()))?;
+        let pos = at.unwrap_or_else(|| file.get_pos());
+        let n = if flags.contains(RwFlags::DIRECT) && to.user_backed() && inode.mode().is_file() {
+            direct::read(&inode, to, pos)?
+        } else {
+            filemap::read_iter(&inode, to, pos)?
+        };
         if at.is_none() {
             file.advance_pos(n as u64);
         }
         Ok(n)
     }
 
-    /// See `vfat_write`; no RWF_NOWAIT (EOPNOTSUPP)
+    /// O_DIRECT from user memory straight to the disk where it can
+    /// (`direct::write`), else `vfat_write`; no RWF_NOWAIT (EOPNOTSUPP)
     fn write_iter(
         &self,
         file: &File,
@@ -2273,7 +2350,12 @@ impl FileOps for VfatFileOps {
             return Err(KernelError::OperationNotSupported);
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let n = vfat_write(&inode, from, at.unwrap_or_else(|| file.get_pos()))?;
+        let pos = at.unwrap_or_else(|| file.get_pos());
+        let n = if flags.contains(RwFlags::DIRECT) && from.user_backed() && !from.is_empty() {
+            direct::write(&inode, from, pos)?
+        } else {
+            vfat_write(&inode, from, pos)?
+        };
         if at.is_none() {
             file.advance_pos(n as u64);
         }
@@ -2525,6 +2607,7 @@ fn vfat_mount_dev(
         is_dir: true,
         parent_cluster: 0,      // Root has no parent
         short_name: [b' '; 11], // Root has no short name
+        mmu_private: 0,
     })?);
 
     // Create root dentry

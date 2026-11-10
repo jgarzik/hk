@@ -357,6 +357,7 @@ pub fn run_all_tests() {
     blk::dio_pin::run_tests();
     blk::dio_alias::run_tests();
     blk::dio::run_tests();
+    blk::vfat_dio::run_tests();
     blk::mmap_dirty::run_tests();
     blk::dio_nowait::run_tests();
     blk::writeback::run_tests();

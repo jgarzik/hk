@@ -2483,7 +2483,10 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
   open files never overlap, and the data copy, the size update,
   RLIMIT_FSIZE check and set-id stripping are atomic with respect to
   other writers. `truncate`/`ftruncate`/O_TRUNC take it too (Linux
-  do_truncate). Reads do not take it (Linux generic_file_read_iter).
+  do_truncate). Reads do not take it (Linux generic_file_read_iter),
+  except a vfat O_DIRECT read, which holds it exclusive from its
+  end-of-file check until its last bio is submitted (3.10, Linux
+  DIO_LOCKING).
 - Data moves between user memory and the file through an iov_iter
   (`fs/iov_iter.rs`). Page-cache files (ramfs, vfat, block devices:
   `filemap::read_iter`/`write_iter`) copy straight between the
@@ -3670,6 +3673,36 @@ Rules:
   the writeback's own order) and, for a write, dropped before and
   after (`filemap::invalidate_pages2`: page lock -> i_mmap read -> PTE
   lock to unmap, then i_pages; Linux invalidate_inode_pages2_range).
+- **vfat direct I/O (`fs/vfat/direct.rs`, Linux fat_direct_IO over
+  __blockdev_direct_IO with DIO_LOCKING):** the same bios and
+  `DioWait` (`dio::direct_io_map`, through the file's disk extents),
+  under the file's `i_rwsem` held exclusive. A write runs under the
+  one `File::write_iter` holds for the whole call (invalidation, bios,
+  wait, size update, the buffered rest), as Linux
+  generic_file_write_iter. A read takes it itself after writing the
+  cache back unlocked (Linux kiocb_write_and_wait), and holds it over
+  the end-of-file check, a second write-back, the chain walk
+  (`VfatInode.cache`) and the pinning and submission of every bio
+  (plugged), dropping it after the plug is flushed and before the
+  wait (`direct_io_map`'s `unlock`); a buffered rest is read unlocked.
+  Order: `i_rwsem` -> page lock -> i_pages (write-back,
+  invalidation), `i_rwsem` -> mmap_lock (pinning faults the caller's
+  pages in; the fault path takes no `i_rwsem`).
+- **Direct I/O in flight (`Inode.i_dio_count`, Linux i_dio_count):**
+  an atomic counter, raised under `i_rwsem` before an I/O's first bio
+  (`inode_dio_begin`, or `dio_guard`) and lowered once its last bio
+  is done (`inode_dio_end`; any context, including a completion: the
+  last one wakes the variable's queue in `VAR_WAIT_TABLE`
+  (`sync/waitqueue.rs`, Linux bit_wait_table / wake_up_var), whose
+  lock is an IrqSpinlock taking only run-queue locks). The decrement
+  is AcqRel and the waiter re-checks the count (Acquire) after
+  queueing (`wait_event`), so no wakeup is lost. `inode_dio_wait`
+  sleeps until it is 0 with `i_rwsem` held exclusive, which keeps new
+  direct I/O out: vfat truncate (Linux fat_setattr) and a failed
+  write's trim wait before any cluster is freed, so a read that
+  dropped `i_rwsem` before its wait never reads a cluster another file
+  got. A shared queue may hold other variables' waiters; each
+  re-checks its own condition.
 - **Boot I/O sleeps:** the scheduler runs and interrupts are on before
   driver probe (main.rs: the boot context is pid 1 by then, Linux
   kernel_init), so the boot partition scan's `submit_bio_wait` sleeps on

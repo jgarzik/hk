@@ -259,12 +259,14 @@ lo (hk has no checksum offload states).
 **Location**: `fs/blkdev_ops.rs`, `block/dio.rs`, `block/blkdev.rs`,
 `fs/vfat/`
 
-- vfat O_DIRECT still reads and writes through the page cache: no
-  alignment checks (EINVAL), no cache bypass (Linux fat_direct_IO).
-- Block-device O_DIRECT from kernel memory (a kernel `IovDest` or
-  `IovSource`) is not pinned (`get_pages`: EOPNOTSUPP) and takes the
-  cached path; Linux sends bios from it (ITER_KVEC, ITER_BVEC) with the
-  same alignment rules.
+- Block-device and vfat O_DIRECT from kernel memory (a kernel
+  `IovDest` or `IovSource`) is not pinned (`get_pages`: EOPNOTSUPP)
+  and takes the cached path; Linux sends bios from it (ITER_KVEC,
+  ITER_BVEC) with the same alignment rules.
+- vfat writes a file page back whole (`VfatAops::writepage`); Linux
+  writes only its dirty blocks (buffer heads), so a block of the page
+  changed on disk behind the cache (a raw device write) is overwritten
+  by hk with the cached copy.
 - A post-direct-write invalidation failure only prints (Linux
   dio_warn_stale_pagecache also sets the mapping's writeback error,
   which the next fsync reports): no errseq on `AddressSpace`.
