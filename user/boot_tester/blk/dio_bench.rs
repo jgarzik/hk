@@ -11,9 +11,9 @@
 
 use crate::helpers::{find_blkdev, print, print_num, println, read_file};
 use hk_syscall::{
-    IoVec, MAP_ANONYMOUS, MAP_PRIVATE, O_RDONLY, O_RDWR, PROT_READ, PROT_WRITE, Timespec,
-    sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_ioctl, sys_mmap, sys_munmap, sys_open,
-    sys_pipe2, sys_pread64, sys_preadv2, sys_pwritev2, sys_read, sys_wait4, sys_write,
+    IoVec, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, O_RDONLY, O_RDWR, PROT_READ, PROT_WRITE,
+    Timespec, sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_ioctl, sys_mmap, sys_munmap,
+    sys_open, sys_pipe2, sys_pread64, sys_preadv2, sys_pwritev2, sys_read, sys_wait4, sys_write,
 };
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
@@ -213,21 +213,30 @@ fn reads(fd: i32, buf: u64, r: Run, k: u64, procs: u64) -> i64 {
 }
 
 /// Nanoseconds for `procs` processes (at most 8) running `r` at once,
-/// each with its own buffer, started together through a pipe; or an
+/// each with its own buffer faulted in beforehand, started together
+/// through a pipe: from the start to the last one's last read (each
+/// stores its end time in a shared page; exits are not timed); or an
 /// error
 fn parallel(fd: i32, r: Run, procs: u64) -> i64 {
+    let ends = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     let mut pfd = [0i32; 2];
-    if sys_pipe2(pfd.as_mut_ptr(), 0) < 0 {
+    if ends <= 0 || sys_pipe2(pfd.as_mut_ptr(), 0) < 0 {
         return -1;
     }
+    let ends = ends as u64;
     let mut pids = [0i64; 8];
     for (k, pid) in pids.iter_mut().enumerate().take(procs as usize) {
         *pid = sys_fork();
         if *pid == 0 {
             sys_close(pfd[1] as u64);
-            let mut go = 0u8;
-            sys_read(pfd[0] as u64, &mut go, 1);
-            sys_exit(child(fd, r, k as u64, procs));
+            sys_exit(child(fd, r, k as u64, procs, pfd[0], ends));
         }
     }
     sys_close(pfd[0] as u64);
@@ -239,13 +248,20 @@ fn parallel(fd: i32, r: Run, procs: u64) -> i64 {
         let mut st = 0i32;
         ok &= pid > 0 && sys_wait4(pid, &mut st, 0, 0) == pid && st == 0;
     }
-    let ns = now_ns() - t;
     sys_close(pfd[1] as u64);
-    if ok { ns } else { -1 }
+    let mut last = 0;
+    for k in 0..procs {
+        // SAFETY: the shared page, one slot per process, all exited
+        last = last.max(unsafe { core::ptr::read_volatile((ends as *const i64).add(k as usize)) });
+    }
+    sys_munmap(ends, 4096);
+    if ok { last - t } else { -1 }
 }
 
-/// A parallel run's process: exit status 0 if every read was whole
-fn child(fd: i32, r: Run, k: u64, procs: u64) -> u64 {
+/// A parallel run's process `k`: buffer faulted in, then the start
+/// (a byte on `go`), the reads, its end time in slot `k` of `ends`;
+/// exit status 0 if every read was whole
+fn child(fd: i32, r: Run, k: u64, procs: u64, go: i32, ends: u64) -> u64 {
     let buf = sys_mmap(
         0,
         r.len,
@@ -257,7 +273,14 @@ fn child(fd: i32, r: Run, k: u64, procs: u64) -> u64 {
     if buf <= 0 {
         return 1;
     }
-    u64::from(reads(fd, buf as u64, r, k, procs) != 0)
+    // SAFETY: the mapping just made, `r.len` bytes
+    unsafe { core::ptr::write_bytes(buf as *mut u8, 0, r.len as usize) };
+    let mut b = 0u8;
+    sys_read(go as u64, &mut b, 1);
+    let e = reads(fd, buf as u64, r, k, procs);
+    // SAFETY: slot `k` of the shared page (k < 8)
+    unsafe { core::ptr::write_volatile((ends as *mut i64).add(k as usize), now_ns()) };
+    u64::from(e != 0)
 }
 
 /// DIO_BENCH: <what> <name> <MB/s> MB/s [<IOPS> IOPS] ...
