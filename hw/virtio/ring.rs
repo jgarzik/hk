@@ -454,6 +454,7 @@ impl Vring {
     pub fn cb(&self) -> VringCb {
         VringCb {
             avail_flags: self.avail16(0),
+            used_event: self.event.then(|| self.used_event()),
         }
     }
 }
@@ -471,14 +472,24 @@ pub fn need_event(event: u16, new: u16, old: u16) -> bool {
 #[derive(Clone, Copy)]
 pub struct VringCb {
     avail_flags: *mut u16,
+    /// The ring's used_event, with the event index
+    used_event: Option<*mut u16>,
 }
 
 unsafe impl Send for VringCb {}
 unsafe impl Sync for VringCb {}
 
 impl VringCb {
+    /// Ask for no used-buffer interrupts (Linux
+    /// virtqueue_disable_cb_split): the flag, which also tells `get` not
+    /// to move used_event; with the event index, which makes the device
+    /// ignore the flag, used_event goes to 0, so the device interrupts
+    /// only when its used index wraps past it (Linux writes the same)
     pub fn disable(&self) {
         unsafe { write_volatile(self.avail_flags, VRING_AVAIL_F_NO_INTERRUPT.to_le()) };
+        if let Some(ue) = self.used_event {
+            unsafe { write_volatile(ue, 0) };
+        }
     }
 }
 
@@ -740,7 +751,7 @@ mod tests {
         f.ring.add(&[sg(5, 1)], &[], 5).unwrap();
         assert!(f.ring.needs_notify());
         // Consuming moves used_event to the next entry while callbacks
-        // are on; disabled, it stays
+        // are on; disabled, it is out of the way and stays there
         for _ in 0..5 {
             let (h, _) = f.pop().unwrap();
             f.push(h, 0);
@@ -749,13 +760,39 @@ mod tests {
         assert_eq!(f.rd16(used_event), 1);
         f.ring.disable_cb();
         assert!(f.ring.get().is_some());
-        assert_eq!(f.rd16(used_event), 1);
+        assert_eq!(f.rd16(used_event), 0);
         // Enabling asks for the next entry and reports what is pending
         assert!(!f.ring.enable_cb());
         assert_eq!(f.rd16(used_event), 2);
         while f.ring.get().is_some() {}
         assert_eq!(f.rd16(used_event), 5);
         assert!(f.ring.enable_cb());
+    }
+
+    /// With the event index, turning callbacks off moves used_event out
+    /// of the way (Linux virtqueue_disable_cb_split writes 0), from the
+    /// ring or the ISR's lock-free handle; consuming leaves it there and
+    /// enabling brings it back to the next entry
+    #[test]
+    fn event_idx_disable() {
+        let mut f = Fake::new(8);
+        f.ring.set_event_idx();
+        let used_event = f.ring.lay.avail + 4 + 2 * 8;
+        for t in 0..3 {
+            f.ring.add(&[sg(t, 1)], &[], t as usize).unwrap();
+            let (h, _) = f.pop().unwrap();
+            f.push(h, 0);
+        }
+        assert!(f.ring.get().is_some());
+        assert_eq!(f.rd16(used_event), 1);
+        f.ring.disable_cb();
+        assert_eq!(f.rd16(used_event), 0);
+        assert!(f.ring.get().is_some());
+        assert_eq!(f.rd16(used_event), 0);
+        assert!(!f.ring.enable_cb());
+        assert_eq!(f.rd16(used_event), 2);
+        f.ring.cb().disable();
+        assert_eq!(f.rd16(used_event), 0);
     }
 
     #[test]
