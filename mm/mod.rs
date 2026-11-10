@@ -25,11 +25,12 @@ pub mod fault;
 pub mod fault_inject;
 pub mod filemap;
 pub mod gather;
+pub mod gup;
 pub mod huge_page;
 pub mod ioremap;
-pub mod lru;
 pub mod madvise;
 pub mod memblock;
+pub mod memfd;
 pub mod memory;
 pub mod mempolicy;
 pub mod mprotect;
@@ -41,23 +42,20 @@ pub mod pgtable;
 pub mod ptl;
 pub mod remote;
 pub mod rmap;
-pub mod shmem;
+pub mod shared;
 pub mod slab;
 pub mod swap;
-pub mod swap_entry;
-pub mod swap_state;
 pub mod swapper;
 pub mod syscall;
 pub mod tlb;
 pub mod vma;
 pub mod vmalloc;
-pub mod vmscan;
 pub mod vmstack;
 pub mod writeback;
 pub mod xarray;
 
-pub use swap::{SWAP_FLAG_DISCARD, SWAP_FLAG_PREFER, sys_swapoff, sys_swapon};
-pub use swap_entry::SwapEntry;
+pub use swap::swap_entry::SwapEntry;
+pub use swap::swapfile::{SWAP_FLAG_DISCARD, SWAP_FLAG_PREFER, sys_swapoff, sys_swapon};
 
 pub use vma::*;
 
@@ -170,8 +168,8 @@ pub struct MmStruct {
     /// Default flags for new VMAs (set by mlockall with MCL_FUTURE)
     /// Contains VM_LOCKED and/or VM_LOCKONFAULT when MCL_FUTURE is active
     def_flags: u32,
-    /// Path of the executable (Linux mm->exe_file), for /proc/<pid>/exe
-    exe: Option<crate::fs::name::FileName>,
+    /// The executable (Linux mm->exe_file's path), for /proc/<pid>/exe
+    exe: Option<crate::fs::Path>,
     /// Writes to the executable denied while this image runs (Linux
     /// mm->exe_file's deny_write_access)
     exe_deny: Option<crate::fs::inode::DenyWrite>,
@@ -250,6 +248,9 @@ impl MmStruct {
             av.link(avc_of(&self.owner, self.pgd, v));
         }
         if let Some(i) = v.inode() {
+            if v.shared_maywrite() {
+                i.i_data.allow_writable();
+            }
             i.i_data.i_mmap.link(file_avc_of(&self.owner, self.pgd, v));
         }
     }
@@ -260,6 +261,9 @@ impl MmStruct {
             av.unlink(self.pgd, v.start);
         }
         if let Some(i) = v.inode() {
+            if v.shared_maywrite() {
+                i.i_data.unmap_writable();
+            }
             i.i_data.i_mmap.unlink(self.pgd, v.start);
         }
     }
@@ -301,18 +305,24 @@ impl MmStruct {
         self.args = a;
     }
 
-    /// Executable path (/proc/<pid>/exe)
-    pub fn exe(&self) -> Option<crate::fs::name::FileName> {
+    /// The executable's path (/proc/<pid>/exe)
+    pub fn exe(&self) -> Option<crate::fs::Path> {
         self.exe.clone()
+    }
+
+    /// Take the executable's path away (the last user's exit), to drop
+    /// it with no lock held
+    pub fn take_exe(&mut self) -> Option<crate::fs::Path> {
+        self.exe.take()
     }
 
     /// Record the executable at exec
     pub fn set_exe(
         &mut self,
-        path: crate::fs::name::FileName,
+        path: Option<crate::fs::Path>,
         deny: Option<crate::fs::inode::DenyWrite>,
     ) {
-        self.exe = Some(path);
+        self.exe = path;
         self.exe_deny = deny;
     }
 
@@ -767,7 +777,7 @@ impl MmStruct {
             .checked_add((split_addr - vma.start) / PAGE_SIZE)?;
 
         // Adjust the offset into the backing file or shared object
-        if new_vma.file.is_some() || new_vma.shmem.is_some() {
+        if new_vma.file.is_some() {
             new_vma.offset += split_addr - vma.start;
         }
 
@@ -879,9 +889,17 @@ pub struct Mm {
     /// signal delivery of a task using it, as Linux reads its word. An
     /// unmapped page is not forgotten (Linux neither).
     sigpage: AtomicU64,
+    /// Its AIO contexts (Linux mm->ioctx_table): torn down with the
+    /// last user (`MmRef`'s drop: exit_aio before exit_mmap)
+    ioctx: crate::io::aio::IoctxTable,
 }
 
 impl Mm {
+    /// Its AIO contexts (Linux mm->ioctx_table)
+    pub fn ioctx(&self) -> &crate::io::aio::IoctxTable {
+        &self.ioctx
+    }
+
     /// Where its signal return trampoline is (arm64: Linux
     /// mm->context.vdso's sigtramp): its [sigpage] page, wherever mremap
     /// moved it; 0 if there is none (another arch)
@@ -992,6 +1010,7 @@ impl MmRef {
                 ctx: tlb::MmContext::new(),
                 membarrier: AtomicU32::new(0),
                 sigpage: AtomicU64::new(0),
+                ioctx: crate::io::aio::IoctxTable::new(),
             }
         }))
     }
@@ -1022,6 +1041,9 @@ impl Drop for MmRef {
     /// user reference under a spinlock: teardown drops file references.
     fn drop(&mut self) {
         if self.0.users.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Its AIO contexts first: their I/O ends before the memory
+            // goes (Linux __mmput: exit_aio, then exit_mmap)
+            crate::io::aio::exit_aio(&self.0.ioctx);
             memory::exit_mmap(&self.0);
         }
     }
@@ -1090,11 +1112,11 @@ fn vma_needs_copy(v: &Vma) -> bool {
     if v.flags & VM_WIPEONFORK != 0 {
         return false;
     }
-    let refaults = v.shmem.is_some()
-        || v.file
-            .as_ref()
-            .and_then(|f| f.mapping_inode())
-            .is_some_and(|i| i.i_op.maps_cache());
+    let refaults = v
+        .file
+        .as_ref()
+        .and_then(|f| f.mapping_inode())
+        .is_some_and(|i| i.i_op.maps_cache());
     !(v.is_shared() && refaults)
 }
 

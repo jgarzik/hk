@@ -165,6 +165,7 @@ pub const SYS_POLL: u64 = 7;
 pub const SYS_PPOLL: u64 = 271;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_MMAP: u64 = 9;
+pub const SYS_MEMFD_CREATE: u64 = 319;
 pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MUNMAP: u64 = 11;
 pub const SYS_BRK: u64 = 12;
@@ -594,6 +595,38 @@ pub fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsiz: u64) -> i64 {
 #[inline(always)]
 pub fn sys_link(oldpath: *const u8, newpath: *const u8) -> i64 {
     unsafe { syscall2!(SYS_LINK, oldpath, newpath) }
+}
+
+pub const SYS_OPENAT: u64 = 257;
+pub const SYS_MKNODAT: u64 = 259;
+pub const SYS_FCHOWNAT: u64 = 260;
+pub const SYS_READLINKAT: u64 = 267;
+pub const SYS_OPENAT2: u64 = 437;
+
+#[inline(always)]
+pub fn sys_openat(dirfd: i32, path: *const u8, flags: u32, mode: u32) -> i64 {
+    unsafe { syscall4!(SYS_OPENAT, dirfd, path, flags, mode) }
+}
+
+/// openat2(dirfd, path, how, size)
+#[inline(always)]
+pub fn sys_openat2(dirfd: i32, path: *const u8, how: *const u8, size: usize) -> i64 {
+    unsafe { syscall4!(SYS_OPENAT2, dirfd, path, how, size) }
+}
+
+#[inline(always)]
+pub fn sys_mknodat(dirfd: i32, pathname: *const u8, mode: u32, dev: u64) -> i64 {
+    unsafe { syscall4!(SYS_MKNODAT, dirfd, pathname, mode, dev) }
+}
+
+#[inline(always)]
+pub fn sys_fchownat(dirfd: i32, pathname: *const u8, owner: u32, group: u32, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_FCHOWNAT, dirfd, pathname, owner, group, flags) }
+}
+
+#[inline(always)]
+pub fn sys_readlinkat(dirfd: i32, pathname: *const u8, buf: *mut u8, bufsiz: u64) -> i64 {
+    unsafe { syscall4!(SYS_READLINKAT, dirfd, pathname, buf, bufsiz) }
 }
 
 /// linkat(olddirfd, oldpath, newdirfd, newpath, flags)
@@ -1401,6 +1434,11 @@ pub fn sys_pselect6(
 #[inline(always)]
 pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: u64) -> i64 {
     unsafe { syscall6!(SYS_MMAP, addr, length, prot, flags, fd, offset) }
+}
+
+#[inline(always)]
+pub fn sys_memfd_create(name: *const u8, flags: u32) -> i64 {
+    unsafe { syscall2!(SYS_MEMFD_CREATE, name, flags) }
 }
 
 #[inline(always)]
@@ -2872,4 +2910,49 @@ pub const SYS_SCHED_YIELD: u64 = 24;
 #[inline(always)]
 pub fn sys_sched_yield() -> i64 {
     unsafe { syscall0!(SYS_SCHED_YIELD) }
+}
+
+// Linux native AIO (fs/aio.c)
+pub const SYS_IO_SETUP: u64 = 206;
+pub const SYS_IO_DESTROY: u64 = 207;
+pub const SYS_IO_GETEVENTS: u64 = 208;
+pub const SYS_IO_SUBMIT: u64 = 209;
+pub const SYS_IO_CANCEL: u64 = 210;
+pub const SYS_IO_PGETEVENTS: u64 = 333;
+
+/// io_setup(nr_events, ctxp)
+pub fn sys_io_setup(nr_events: u32, ctxp: *mut u64) -> i64 {
+    unsafe { syscall2!(SYS_IO_SETUP, nr_events, ctxp) }
+}
+
+/// io_destroy(ctx)
+pub fn sys_io_destroy(ctx: u64) -> i64 {
+    unsafe { syscall1!(SYS_IO_DESTROY, ctx) }
+}
+
+/// io_submit(ctx, nr, iocbpp)
+pub fn sys_io_submit(ctx: u64, nr: i64, iocbpp: *const u64) -> i64 {
+    unsafe { syscall3!(SYS_IO_SUBMIT, ctx, nr, iocbpp) }
+}
+
+/// io_cancel(ctx, iocb, result)
+pub fn sys_io_cancel(ctx: u64, iocb: u64, result: u64) -> i64 {
+    unsafe { syscall3!(SYS_IO_CANCEL, ctx, iocb, result) }
+}
+
+/// io_getevents(ctx, min_nr, nr, events, timeout)
+pub fn sys_io_getevents(ctx: u64, min_nr: i64, nr: i64, events: u64, timeout: u64) -> i64 {
+    unsafe { syscall5!(SYS_IO_GETEVENTS, ctx, min_nr, nr, events, timeout) }
+}
+
+/// io_pgetevents(ctx, min_nr, nr, events, timeout, usig)
+pub fn sys_io_pgetevents(
+    ctx: u64,
+    min_nr: i64,
+    nr: i64,
+    events: u64,
+    timeout: u64,
+    usig: u64,
+) -> i64 {
+    unsafe { syscall6!(SYS_IO_PGETEVENTS, ctx, min_nr, nr, events, timeout, usig) }
 }

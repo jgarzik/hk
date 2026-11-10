@@ -51,8 +51,19 @@ impl FrameAllocator {
     /// Hand the free RAM [start, end) to the allocator (boot, from
     /// memblock); frames outside the span are ignored
     pub fn free_range(&self, start: u64, end: u64) {
-        self.zone
-            .free_range(start.div_ceil(FRAME_SIZE as u64), pfn(end));
+        self.free_reserved(start, end);
+    }
+
+    /// Give the whole pages of reserved boot memory [start, end) to the
+    /// allocator after boot (Linux free_reserved_area): they count in
+    /// the total from then on. Nothing may use them any more. The
+    /// number of pages freed.
+    pub fn free_reserved(&self, start: u64, end: u64) -> usize {
+        let (first, past) = (start.div_ceil(FRAME_SIZE as u64), pfn(end));
+        if first >= past {
+            return 0;
+        }
+        self.zone.free_range(first, past)
     }
 
     /// Boot is done handing out free memory: set the watermarks and
@@ -126,6 +137,18 @@ impl FrameAllocator {
     /// Drop a reference; true if that freed the frame
     pub fn decref(&self, frame: u64) -> bool {
         self.ours(frame).is_some_and(|p| self.zone.put(p))
+    }
+
+    /// Take `n` references at once (a pin, `mm::gup`) unless the frame
+    /// is free or its count near saturation; false for frames the
+    /// allocator does not manage
+    pub fn get_refs(&self, frame: u64, n: u32) -> bool {
+        self.ours(frame).is_some_and(|p| self.zone.get_n(p, n))
+    }
+
+    /// Drop `n` references at once; true if that freed the frame
+    pub fn put_refs(&self, frame: u64, n: u32) -> bool {
+        self.ours(frame).is_some_and(|p| self.zone.put_n(p, n))
     }
 
     /// References to the frame (0 for frames the allocator does not

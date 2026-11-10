@@ -41,7 +41,7 @@
 //!   (PTRACE_PEEKSIGINFO, shared), and changes what is delivered
 //!   (PTRACE_SETSIGINFO)
 //! - exec resets caught handlers to SIG_DFL (ignored stay ignored),
-//!   forgets the alternate stack, deletes timer_create timers with their
+//!   forgets the alternate stack but keeps its SS_AUTODISARM, deletes timer_create timers with their
 //!   pending signals; the blocked mask, other pending signals and
 //!   ITIMER_REAL stay; a handler table shared (CLONE_SIGHAND) with
 //!   the exec'ing process is copied first, the other keeps its handlers
@@ -1447,8 +1447,8 @@ fn test_ptrace_siginfo() {
 
 static mut EXEC_ALTSTACK: [u8; 16384] = [0; 16384];
 
-/// In a child: a handler for SIGUSR1, SIGUSR2 ignored, an alternate
-/// stack, SIGRT and SIGRT + 1 blocked with SIGRT pending (kill) and a
+/// In a child: a handler for SIGUSR1, SIGUSR2 ignored, an SS_AUTODISARM
+/// alternate stack, SIGRT and SIGRT + 1 blocked with SIGRT pending (kill) and a
 /// timer's SIGRT + 1 pending, ITIMER_REAL armed; then exec
 /// boot_tester2 sigexec, which checks what is left
 fn test_exec_signals() {
@@ -1463,7 +1463,8 @@ fn test_exec_signals() {
         sys_rt_sigaction(SIGUSR1, act.as_ptr() as u64, 0, 8);
         let ign: [u64; 4] = [1, 0, 0, 0];
         sys_rt_sigaction(12, ign.as_ptr() as u64, 0, 8);
-        let ss: [u64; 3] = [(&raw mut EXEC_ALTSTACK) as u64, 0, 16384];
+        // SS_AUTODISARM: exec keeps the flags, not the stack
+        let ss: [u64; 3] = [(&raw mut EXEC_ALTSTACK) as u64, 1 << 31, 16384];
         hk_syscall::sys_sigaltstack(ss.as_ptr() as u64, 0);
         block(bit(SIGRT) | bit(SIGRT + 1));
         sys_kill(sys_getpid(), SIGRT);

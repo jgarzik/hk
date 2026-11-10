@@ -38,6 +38,20 @@ pub const BPF_ANY: u64 = 0;
 pub const BPF_NOEXIST: u64 = 1;
 /// Update existing element only
 pub const BPF_EXIST: u64 = 2;
+/// Update under the value's bpf_spin_lock
+pub const BPF_F_LOCK: u64 = 4;
+/// Percpu maps: the CPU in the upper 32 bits / every CPU
+pub const BPF_F_CPU: u64 = 8;
+pub const BPF_F_ALL_CPUS: u64 = 16;
+
+/// Flags no map op knows (Linux htab/array_map_update_elem: anything
+/// but BPF_F_LOCK above BPF_EXIST) are EINVAL
+fn update_flags_ok(flags: u64) -> Result<(), KernelError> {
+    if flags & !BPF_F_LOCK > BPF_EXIST {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(())
+}
 
 // =============================================================================
 // Map Limits
@@ -165,6 +179,7 @@ impl BpfMapOps for BpfHashMap {
     }
 
     fn update(&self, key: &[u8], value: &[u8], flags: u64) -> Result<(), KernelError> {
+        update_flags_ok(flags)?;
         if key.len() != self.key_size as usize {
             return Err(KernelError::InvalidArgument);
         }
@@ -178,14 +193,15 @@ impl BpfMapOps for BpfHashMap {
         let k = crate::util::kmem::try_to_vec(key)?;
         let v = crate::util::kmem::try_to_vec(value)?;
         let mut data = self.data.lock();
+        // Linux htab check_flags
         if let Some(old) = data.get_mut(key) {
-            if flags == BPF_NOEXIST {
+            if flags & !BPF_F_LOCK == BPF_NOEXIST {
                 return Err(KernelError::AlreadyExists);
             }
             old.copy_from_slice(value);
             return Ok(());
         }
-        if flags == BPF_EXIST {
+        if flags & !BPF_F_LOCK == BPF_EXIST {
             return Err(KernelError::NotFound);
         }
         // Full (Linux htab: E2BIG)
@@ -337,14 +353,15 @@ impl BpfMapOps for BpfArrayMap {
     }
 
     fn update(&self, key: &[u8], value: &[u8], flags: u64) -> Result<(), KernelError> {
+        update_flags_ok(flags)?;
         if value.len() != self.value_size as usize {
             return Err(KernelError::InvalidArgument);
         }
 
-        let index = self.key_to_index(key).ok_or(KernelError::NotFound)?;
-
-        // Array entries always exist (pre-allocated)
-        if flags == BPF_NOEXIST {
+        // Every element is preallocated: no new index (Linux
+        // array_map_update_elem: E2BIG), none missing (EEXIST)
+        let index = self.key_to_index(key).ok_or(KernelError::ArgListTooLong)?;
+        if flags & BPF_NOEXIST != 0 {
             return Err(KernelError::AlreadyExists);
         }
 

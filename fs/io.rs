@@ -12,9 +12,22 @@ use super::iov_iter::{IovDest, IovSource};
 use super::iov::IoVec;
 use super::syscall::{MAX_RW_COUNT, current_fd_table};
 
-/// The current task's file at `fd`, or EBADF (Linux fget/fdget): the
-/// fd table lock is dropped before return
+/// The current task's file at `fd`, or EBADF, a path-only (O_PATH)
+/// one included (Linux fget/fdget): the fd table lock is dropped before
+/// return
 pub fn fget(fd: i32) -> Result<Arc<File>, KernelError> {
+    fget_raw(fd).and_then(|f| {
+        if f.is_path() {
+            Err(KernelError::BadFd)
+        } else {
+            Ok(f)
+        }
+    })
+}
+
+/// As `fget`, a path-only file too (Linux fget_raw/fdget_raw): for the
+/// calls that only need where the file is (fstat, fstatfs, fchdir)
+pub fn fget_raw(fd: i32) -> Result<Arc<File>, KernelError> {
     current_fd_table().lock().get(fd).ok_or(KernelError::BadFd)
 }
 
@@ -83,7 +96,7 @@ pub fn verify_area(file: &File, at: Option<u64>, count: usize) -> Result<(), Ker
 fn rw_err(e: KernelError, at: Option<u64>, flags: RwFlags) -> KernelError {
     match e {
         KernelError::PermissionDenied => KernelError::BadFd,
-        KernelError::OperationNotSupported if !flags.nowait => match at {
+        KernelError::OperationNotSupported if !flags.nowait() => match at {
             Some(_) => KernelError::IllegalSeek,
             None => KernelError::InvalidArgument,
         },
@@ -92,9 +105,25 @@ fn rw_err(e: KernelError, at: Option<u64>, flags: RwFlags) -> KernelError {
 }
 
 /// Read from `fd` into `segs` at `at`, or at the file position (under
-/// f_pos_lock, Linux fdget_pos) when None (Linux vfs_readv)
-pub fn do_readv(fd: i32, segs: &[IoVec], at: Option<u64>, flags: RwFlags) -> KernelResult<usize> {
+/// f_pos_lock, Linux fdget_pos) when None (Linux vfs_read, vfs_readv).
+/// `vectored` (readv, preadv, preadv2: Linux vfs_readv): nothing to
+/// read is 0 once the file is known readable, before the flags or the
+/// file's read are looked at
+pub fn do_readv(
+    fd: i32,
+    segs: &[IoVec],
+    at: Option<u64>,
+    flags: RwFlags,
+    vectored: bool,
+) -> KernelResult<usize> {
     let file = fget(fd)?;
+    if vectored && seg_len(segs) == 0 {
+        return if file.is_readable() {
+            Ok(0)
+        } else {
+            Err(KernelError::BadFd)
+        };
+    }
     if file.is_dir() {
         return Err(KernelError::IsDirectory);
     }
@@ -104,16 +133,24 @@ pub fn do_readv(fd: i32, segs: &[IoVec], at: Option<u64>, flags: RwFlags) -> Ker
 }
 
 /// Write `segs` to `fd` as one write at `at`, or at the file position
-/// (under f_pos_lock) when None (Linux vfs_writev); `append` as for
-/// `File::write_at`
+/// (under f_pos_lock) when None (Linux vfs_write, vfs_writev); `append`
+/// as for `File::write_at`; `vectored` as for `do_readv`
 pub fn do_writev(
     fd: i32,
     segs: &[IoVec],
     at: Option<u64>,
     flags: RwFlags,
     append: Option<bool>,
+    vectored: bool,
 ) -> KernelResult<usize> {
     let file = fget(fd)?;
+    if vectored && seg_len(segs) == 0 {
+        return if file.is_writable() {
+            Ok(0)
+        } else {
+            Err(KernelError::BadFd)
+        };
+    }
     if file.is_dir() {
         return Err(KernelError::IsDirectory);
     }
@@ -142,18 +179,31 @@ pub(super) fn pos_arg(offset: i64) -> KernelResult<u64> {
 
 /// sys_read - read from a file descriptor
 pub fn sys_read(fd: i32, buf: UserPtr<u8>, count: u64) -> KernelResult<usize> {
-    do_readv(fd, &import_ubuf(buf, count)?, None, RwFlags::empty())
+    do_readv(fd, &import_ubuf(buf, count)?, None, RwFlags::empty(), false)
 }
 
 /// sys_write - write to a file descriptor
 pub fn sys_write(fd: i32, buf: UserPtr<u8>, count: u64) -> KernelResult<usize> {
-    do_writev(fd, &import_ubuf(buf, count)?, None, RwFlags::empty(), None)
+    do_writev(
+        fd,
+        &import_ubuf(buf, count)?,
+        None,
+        RwFlags::empty(),
+        None,
+        false,
+    )
 }
 
 /// sys_pread64 - read at an offset without moving the file position
 pub fn sys_pread64(fd: i32, buf: UserPtr<u8>, count: u64, offset: i64) -> KernelResult<usize> {
     let at = pos_arg(offset)?;
-    do_readv(fd, &import_ubuf(buf, count)?, Some(at), RwFlags::empty())
+    do_readv(
+        fd,
+        &import_ubuf(buf, count)?,
+        Some(at),
+        RwFlags::empty(),
+        false,
+    )
 }
 
 /// sys_pwrite64 - write at an offset without moving the file position
@@ -166,6 +216,7 @@ pub fn sys_pwrite64(fd: i32, buf: UserPtr<u8>, count: u64, offset: i64) -> Kerne
         Some(at),
         RwFlags::empty(),
         None,
+        false,
     )
 }
 

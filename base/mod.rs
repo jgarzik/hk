@@ -22,8 +22,8 @@ pub fn driver_init() {
     core::devices_init();
     bus::buses_init();
     class::classes_init();
-    crate::fs::sysfs::top_dir(b"firmware");
-    crate::fs::sysfs::top_dir(b"hypervisor");
+    crate::fs::kernfs::sysfs::top_dir(b"firmware");
+    crate::fs::kernfs::sysfs::top_dir(b"hypervisor");
     platform::platform_bus_init();
     cpu::cpu_dev_init();
     driver::module_init();

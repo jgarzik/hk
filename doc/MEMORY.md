@@ -45,7 +45,8 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
   (`mm/vmstack.rs`, Linux VMAP_STACK) are 16 KB of single pages at the
   start of a 64 KB slot of their own area, the rest of the slot
   unmapped: an overflow faults in that gap (a double fault, on its IST
-  stack) and panics with "kernel stack overflow". They are not in the
+  stack) and panics with "kernel stack overflow". Each CPU's IRQ stack
+  (`irq_stack.rs`) is one of them. They are not in the
   direct map, so no DMA from the stack.
 
 ## arm64 (4KB granule, 48-bit virtual)
@@ -163,7 +164,7 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   included, go on to min; `__GFP_HIGH` ones to half of it, atomic ones
   (the heap in interrupt context) a quarter lower. A fault that finds
   free memory at low reclaims (direct reclaim: swaps the oldest
-  anonymous pages out, `mm/vmscan.rs`), with no spinlock held, then
+  anonymous pages out, `mm/swap/vmscan.rs`), with no spinlock held, then
   drains the per-CPU lists and retries while reclaim frees pages. User
   allocations stop at low until the OOM killer (P6); then Linux's min.
   A page read
@@ -194,6 +195,22 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   holds its own on each of its pages, splitting a 2MB page gives each 4KB frame the head's count.
   Unmapping drops the reference and the last one frees the frame. Frames
   outside the allocator (MMIO) have no count and are never freed.
+- **Pins (Linux FOLL_PIN, `mm/gup.rs`).** Direct I/O pins the caller's
+  pages for the device: 1024 references per pin on the 4KB page (a 2MB
+  mapping is split first), dropped when the I/O is done, the page
+  dirtied first after a read. Block-device direct I/O (`block/dio.rs`)
+  sends bios straight to and from them, a bio's worth (256 pages)
+  pinned at a time; the submitter dirties and unpins them after its
+  wait, in thread context. A page with that many references is
+  "maybe pinned": fork gives the child a copy of such a page the parent
+  owns alone (the parent keeps the page, writable), reclaim never swaps
+  one out, and munmap or exit leave it allocated until its last unpin.
+  A private mapping's own page carries `PG_ANON_EXCL` (Linux
+  PageAnonExclusive): a write fault or mprotect makes it writable in
+  place whatever its count (once out of the swap cache), so the
+  process keeps seeing the page the device uses. A pin of a page still shared copy-on-write first gives
+  the mapping its own (a write pin through a write fault, a read pin of
+  an anonymous page through an unshare).
 - **Reverse map (Linux anon_vma).** Every private anonymous VMA (mmap,
   brk, the image and stack) has an AnonVma, shared by fork's copies and
   the pieces of a split, whose chain lists each VMA with its range and
@@ -203,22 +220,19 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   reverse map finds its address in each VMA of the chain directly; its
   map count counts the PTEs mapping it. Pages exec copies the image
   into are not on the reverse map.
-- **Shared anonymous memory.** A MAP_SHARED|MAP_ANONYMOUS mapping gets a
-  `Shmem` object (Linux shmem_zero_setup) holding its pages by index:
-  every VMA mapping it (fork's copies, split pieces, mremap) faults the
-  same page in, so pages first touched after fork are shared too, and
-  MADV_DONTNEED keeps the data (MADV_REMOVE clears it for every
-  mapping: a page mapped elsewhere is zeroed in place, others freed).
-  Its size is fixed at mmap (a page past it, after mremap grew the
-  mapping, is SIGBUS, as on Linux); its pages and its index (an `mm::xarray`, a 4-level
-  radix tree of 512-entry nodes, like a page table) are user memory
-  from frames, none from the kernel heap (they stop at the kernel's
-  reserve; a fault out of memory kills the process). The object holds
-  a reference on each page; it goes with its last VMA. A SysV shm
-  segment is such an object too: shmat maps it lazily, and each attach
-  VMA holds a `ShmAttach` counted in shm_nattch (Linux shm_open /
-  shm_close), so fork, split, munmap, shmdt, exit and exec keep the
-  count, and the last detach of a removed segment destroys it.
+- **Shared anonymous memory.** A MAP_SHARED|MAP_ANONYMOUS mapping (or a
+  shared one of /dev/zero) maps a file of its size on the kernel's
+  tmpfs (Linux shmem_zero_setup: "/dev/zero (deleted)" in maps): every
+  VMA mapping it (fork's copies, split pieces, mremap) faults the same
+  page-cache page in, so pages first touched after fork are shared too,
+  and MADV_DONTNEED keeps the data (MADV_REMOVE punches the hole for
+  every mapping). Its size is fixed at mmap (a page past it, after
+  mremap grew the mapping, is SIGBUS, as on Linux). A SysV shm segment
+  is such a file too ("SYSV<key>"): shmat maps it lazily, and each
+  attach VMA holds a `ShmAttach` counted in shm_nattch (Linux shm_open
+  / shm_close), so fork, split, munmap, shmdt, exit and exec keep the
+  count, and the last detach of a removed (SHM_DEST) segment destroys
+  it. memfd_create's files live on the same tmpfs.
 - **File mappings.** A MAP_SHARED mapping of a ramfs file maps the
   file's page-cache pages (`InodeOps::map_page`, Linux filemap_fault):
   every mapping, fork's copies and read()/write() see the same data, and
@@ -229,7 +243,9 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   PTEs: a MAP_SHARED mapping keeps sharing its pages (writes stay
   visible both ways); a private one shares them copy-on-write (both
   PTEs read-only and marked COW, also for pages read-only at fork, so a
-  later mprotect(PROT_WRITE) cannot make the shared page writable). A
+  later mprotect(PROT_WRITE) cannot make the shared page writable),
+  except a maybe-pinned page the parent owns alone, which the child
+  gets a copy of (Linux copy_present_page). A
   2MB page is split into 4KB PTEs in the parent first; a swap PTE is
   copied, its slot counting one more reference (Linux swap_duplicate). MADV_DONTFORK VMAs are left out of the
   child, MADV_WIPEONFORK ones start empty there, and memory locks
@@ -313,8 +329,8 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   entry allows, and none may be executable by the kernel (arm64 PXN);
   a violation prints `MMCHECK:FAIL`.
 - **Swap (Linux mm/vmscan.c, swapfile.c, swap_state.c).** Private
-  anonymous pages sit on the LRU (`mm/lru.rs`). Reclaim
-  (`mm/vmscan.rs`; MADV_PAGEOUT, and the allocator's slow path) gives a
+  anonymous pages sit on the LRU (`mm/swap/lru.rs`). Reclaim
+  (`mm/swap/vmscan.rs`; MADV_PAGEOUT, and the allocator's slow path) gives a
   page a swap slot and a place in the device's swap cache, replaces
   every PTE mapping it by the swap entry through the reverse map,
   writes it out and frees it; a page still mapped somewhere, or busy,

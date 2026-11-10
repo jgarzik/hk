@@ -34,8 +34,9 @@ unsafe extern "C" {
     fn __switch_to_asm_first(next_ctx: *const Aarch64TaskContext, new_kstack: u64);
 }
 
-/// Host tests link the scheduler without switch_to.S (build.rs
-/// assembles it for the kernel only); nothing switches there
+/// Host tests link the scheduler without switch_to.S and vectors.S
+/// (build.rs assembles them for the kernel only); nothing switches or
+/// returns to user mode there
 #[cfg(test)]
 mod host_stubs {
     use super::Aarch64TaskContext;
@@ -52,6 +53,13 @@ mod host_stubs {
     #[unsafe(no_mangle)]
     extern "C" fn __switch_to_asm_first(_next_ctx: *const Aarch64TaskContext, _new_kstack: u64) {
         unreachable!("context switch in a host test");
+    }
+
+    /// `clone_child_entry`'s exit (vectors.S), on the clone path the
+    /// tests link
+    #[unsafe(no_mangle)]
+    extern "C" fn ret_to_user() {
+        unreachable!("return to user mode in a host test");
     }
 }
 

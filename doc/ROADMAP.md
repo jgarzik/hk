@@ -11,7 +11,7 @@ phase end. Gaps a phase leaves go to BUGS.md.
 
 | # | Phase | Why here |
 |---|-------|----------|
-| 1 | F — tmpfs/shmem, rootfs on tmpfs | Debian root filesystem |
+| 1 | A — heap allocations out of spin locks | the LOCKDEP ATOMIC_ALLOC list; before more code grows collections under spin locks |
 | 2 | C — group stop, job control, ptrace stops | Debian JOBCTL; VT needs stops |
 | 3 | Y — tty and console core | prerequisite of devpts (4) and VT (7) |
 | 4 | H — Debian kernel interfaces | DEB_SH, DEB_RCS |
@@ -34,13 +34,15 @@ driver packages and loader, native escape modules). Only its
 preparatory items are in the phases above (M4, D's firmware
 loading); HADL itself waits for the owner's go-ahead.
 
-## 1. F — tmpfs/shmem and rootfs on tmpfs
+## 1. A — heap allocations out of spin locks
 
-shmem on the page cache (swap-backed; size=, nr_inodes=, mode, uid,
-gid; statfs); rootfs is tmpfs (50% of RAM), the cpio unpacked into it,
-initrd pages freed; devtmpfs, SysV shm and MAP_SHARED|MAP_ANONYMOUS
-on shmem; memfd_create with seals; O_TMPFILE; fallocate punch/zero.
-Tests TMPFS_LIMITS, MEMFD_SEALS, ROOTFS_TMPFS.
+Every site a LOCKDEP boot lists as `LOCKDEP:ATOMIC_ALLOC` (BUGS.md
+"Heap allocations under spin locks") moves its allocation out of the
+spin lock, per subsystem (net, fs, task, ipc, cgroup, keys, base):
+preallocate before locking and retry if the collection grew, link
+preallocated intrusive nodes, or a sleeping lock where Linux has one.
+Ends when a LOCKDEP boot lists none outside interrupt context; then
+lockdep reports an allocation under a spin lock as a failure.
 
 ## 2. C — group stop, job control, ptrace stops
 
@@ -132,7 +134,7 @@ Linux drivers/tty/vt equivalence:
 ## 8. J — reclaim and OOM
 
 kswapd, priority reclaim, the slab shrinker API, the OOM killer with
-oom_score_adj. Test: 1000 fork+exec of a dynamic binary with slab flat;
+oom_score_adj; shmem/tmpfs pages swap out (Linux shmem_writeout). Test: 1000 fork+exec of a dynamic binary with slab flat;
 OOM kill semantics.
 
 ## 9. N — credentials and login

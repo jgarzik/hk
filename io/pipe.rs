@@ -310,21 +310,34 @@ impl PipeInner {
         Ok(())
     }
 
-    /// Append from `from` (Linux pipe_write's copy_page_from_iter):
-    /// into the head buffer while it may merge, then into new pages
-    /// while slots are free. Returns the bytes taken and the error that
-    /// stopped it early (EFAULT, ENOMEM), if any.
-    fn write_from(&mut self, from: &mut IovSource<'_>) -> (usize, Option<KernelError>) {
-        let written = match self.merge_from(from) {
-            Ok(c) => c,
-            Err(e) => return (0, Some(e)),
-        };
-        self.total_len += written;
-        if !from.is_empty() && self.head_buf_for_merge().is_some_and(|b| b.can_merge()) {
-            // The merge copy stopped short: a fault
-            return (written, Some(KernelError::BadAddress));
+    /// Append from `from` (Linux anon_pipe_write's copies): with
+    /// `merge` (a write's first pass), the part past whole pages goes into
+    /// the head buffer if it may merge and that part fits whole; then new
+    /// pages while slots are free, each a packet buffer for a `packet`
+    /// writer (Linux is_packetized), else one later writes may merge
+    /// into. A page copy cut short by a fault is dropped. Returns the
+    /// bytes taken and the error that stopped it early (EFAULT, ENOMEM),
+    /// if any.
+    fn write_from(
+        &mut self,
+        from: &mut IovSource<'_>,
+        packet: bool,
+        merge: bool,
+    ) -> (usize, Option<KernelError>) {
+        let mut written = 0;
+        if merge {
+            match self.merge_from(from) {
+                Ok(c) => written = c,
+                Err(e) => return (0, Some(e)),
+            }
+            self.total_len += written;
         }
-        let mut written = written;
+        let flags = pipe_buf_flags::OWNED
+            | if packet {
+                pipe_buf_flags::PACKET
+            } else {
+                pipe_buf_flags::CAN_MERGE
+            };
         while !from.is_empty() && !self.is_full() {
             let Some(page) = allocate_pipe_page() else {
                 return (written, Some(KernelError::OutOfMemory));
@@ -332,47 +345,54 @@ impl PipeInner {
             let n = from.len().min(PAGE_SIZE);
             // SAFETY: a page just allocated for this buffer, under Pipe.inner
             let r = from.copy_from(unsafe { &mut page.bytes()[..n] });
-            let c = match r {
-                Ok(c) if c > 0 => c,
-                Ok(_) | Err(_) => return (written, Some(KernelError::BadAddress)),
-            };
-            let flags = pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE;
+            match r {
+                Ok(c) if c == n => {}
+                _ => return (written, Some(KernelError::BadAddress)),
+            }
             if self
-                .push_buffer(PipeBuffer::new(page, 0, c as u32, flags))
+                .push_buffer(PipeBuffer::new(page, 0, n as u32, flags))
                 .is_err()
             {
                 break;
             }
-            written += c;
-            if c < n {
-                return (written, Some(KernelError::BadAddress));
-            }
+            written += n;
         }
         (written, None)
     }
 
-    /// Append to the head buffer while it may merge (it is unshared):
-    /// the bytes copied
+    /// Linux anon_pipe_write's merge: the write's length past whole pages
+    /// is copied into the head buffer if it may merge (it is unshared) and
+    /// has room for all of it; the bytes copied, EFAULT if the copy came
+    /// up short (nothing is kept)
     fn merge_from(&mut self, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
-        let Some(buf) = self.head_buf_for_merge_mut().filter(|b| b.can_merge()) else {
+        let chars = from.len() & (PAGE_SIZE - 1);
+        if chars == 0 {
             return Ok(0);
-        };
-        let Some(page) = buf.page.as_ref() else {
+        }
+        let Some(buf) = self.head_buf_for_merge_mut() else {
             return Ok(0);
         };
         let off = (buf.offset + buf.len) as usize;
-        let n = from.len().min(PAGE_SIZE - off);
+        if buf.flags & pipe_buf_flags::CAN_MERGE == 0 || off + chars > PAGE_SIZE {
+            return Ok(0);
+        }
+        let Some(page) = buf.page.as_ref() else {
+            return Ok(0);
+        };
         // SAFETY: under Pipe.inner, an unshared CAN_MERGE page
-        let c = from.copy_from(unsafe { &mut page.bytes()[off..off + n] })?;
+        let c = from.copy_from(unsafe { &mut page.bytes()[off..off + chars] })?;
+        if c < chars {
+            return Err(KernelError::BadAddress);
+        }
         buf.len += c as u32;
         Ok(c)
     }
 
     /// Consume into `to` from the tail on (Linux pipe_read's
-    /// copy_page_to_iter): the bytes copied, EFAULT if a fault stopped
-    /// it before the first
+    /// copy_page_to_iter), up to the end of the first packet buffer: the
+    /// bytes copied, EFAULT if a fault stopped it before the first
     fn read_to(&mut self, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
-        let mut read = 0;
+        let (mut read, mut dropped) = (0, 0);
         while !to.is_empty() && !self.is_empty() {
             let tail = self.tail;
             let buf = &mut self.bufs[tail];
@@ -398,12 +418,22 @@ impl PipeInner {
             buf.offset += c as u32;
             buf.len -= c as u32;
             read += c;
+            // A packet ends the read; what did not fit is dropped (Linux
+            // PIPE_BUF_FLAG_PACKET)
+            let packet = buf.flags & pipe_buf_flags::PACKET != 0;
+            if packet {
+                dropped += buf.len as usize;
+                buf.len = 0;
+            }
             if buf.len == 0 {
                 buf.release();
                 self.tail = (tail + 1) % PIPE_RING;
             }
+            if packet {
+                break;
+            }
         }
-        self.total_len = self.total_len.saturating_sub(read);
+        self.total_len = self.total_len.saturating_sub(read + dropped);
         Ok(read)
     }
 }
@@ -736,11 +766,16 @@ pub fn sigpipe() {
 /// SIGPIPE and EPIPE. The copy runs under the sleeping `Pipe.inner`.
 /// The O_ASYNC readers are signalled before each sleep and at the end,
 /// whatever the result (Linux pipe_write's kill_fasync).
-fn pipe_write(pipe: &Pipe, from: &mut IovSource<'_>, nonblock: bool) -> Result<usize, KernelError> {
+fn pipe_write(
+    pipe: &Pipe,
+    from: &mut IovSource<'_>,
+    nonblock: bool,
+    packet: bool,
+) -> Result<usize, KernelError> {
     if from.is_empty() {
         return Ok(0);
     }
-    let r = pipe_write_wait(pipe, from, nonblock);
+    let r = pipe_write_wait(pipe, from, nonblock, packet);
     pipe.kill_readers();
     r
 }
@@ -750,28 +785,26 @@ fn pipe_write_wait(
     pipe: &Pipe,
     from: &mut IovSource<'_>,
     nonblock: bool,
+    packet: bool,
 ) -> Result<usize, KernelError> {
     let partial = |done: usize, e| if done > 0 { Ok(done) } else { Err(e) };
     let mut done = 0;
+    let mut first = true;
     loop {
         if !pipe.has_readers() {
             sigpipe();
             return partial(done, KernelError::BrokenPipe);
         }
         let mut inner = pipe.lock();
-        if !inner.is_full() {
-            let (n, err) = inner.write_from(from);
-            drop(inner);
-            done += n;
-            if n > 0 {
-                // Data for readers (Linux pipe_write)
-                pipe.wake_rd();
-            }
-            if let Some(e) = err {
-                return partial(done, e);
-            }
-        } else {
-            drop(inner);
+        let (n, err) = inner.write_from(from, packet, core::mem::take(&mut first));
+        drop(inner);
+        done += n;
+        if n > 0 {
+            // Data for readers (Linux pipe_write)
+            pipe.wake_rd();
+        }
+        if let Some(e) = err {
+            return partial(done, e);
         }
         if from.is_empty() {
             return Ok(done);
@@ -843,7 +876,7 @@ impl FileOps for PipeReadFileOps {
         if at.is_some() {
             return Err(KernelError::OperationNotSupported);
         }
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait;
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait();
         pipe_read(pipe_of(file)?, to, nonblock)
     }
 
@@ -868,10 +901,12 @@ impl FileOps for PipeReadFileOps {
         mask
     }
 
+    /// One reader fewer, and one file of the inode's pipe (Linux
+    /// pipe_release), as a FIFO's release
     fn release(&self, file: &File) -> Result<(), KernelError> {
         let pipe = pipe_of(file)?;
-        // Decrement reader count when file is closed
-        pipe.remove_reader();
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        fifo_put(&inode, pipe, flags::O_RDONLY);
         pipe.release_notify();
         Ok(())
     }
@@ -936,8 +971,11 @@ impl FileOps for PipeWriteFileOps {
         if at.is_some() {
             return Err(KernelError::OperationNotSupported);
         }
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait;
-        pipe_write(pipe_of(file)?, from, nonblock)
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait();
+        // Packet mode: the file's O_DIRECT (Linux is_packetized), in
+        // the I/O flags
+        let packet = rw.contains(RwFlags::DIRECT);
+        pipe_write(pipe_of(file)?, from, nonblock, packet)
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
@@ -963,10 +1001,12 @@ impl FileOps for PipeWriteFileOps {
         mask
     }
 
+    /// One writer fewer, and one file of the inode's pipe (Linux
+    /// pipe_release), as a FIFO's release
     fn release(&self, file: &File) -> Result<(), KernelError> {
         let pipe = pipe_of(file)?;
-        // Decrement writer count when file is closed
-        pipe.remove_writer();
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        fifo_put(&inode, pipe, flags::O_WRONLY);
         pipe.release_notify();
         Ok(())
     }
@@ -979,8 +1019,6 @@ impl FileOps for PipeWriteFileOps {
 // =============================================================================
 // Pipe Creation
 // =============================================================================
-
-use crate::fs::dentry::Dentry;
 
 /// FIONREAD: the bytes buffered, under the pipe's lock (Linux
 /// pipe_ioctl); anything else ENOTTY
@@ -1142,7 +1180,7 @@ impl FileOps for FifoFileOps {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait || at.is_some() {
+        if rw.nowait() || at.is_some() {
             return Err(KernelError::OperationNotSupported);
         }
         if file.get_flags() & flags::O_ACCMODE == flags::O_WRONLY {
@@ -1159,14 +1197,15 @@ impl FileOps for FifoFileOps {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait || at.is_some() {
+        if rw.nowait() || at.is_some() {
             return Err(KernelError::OperationNotSupported);
         }
         if file.get_flags() & flags::O_ACCMODE == flags::O_RDONLY {
             return Err(KernelError::BadFd);
         }
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        pipe_write(&fifo_of(file)?.pipe, from, nonblock)
+        let packet = rw.contains(RwFlags::DIRECT);
+        pipe_write(&fifo_of(file)?.pipe, from, nonblock, packet)
     }
 
     fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
@@ -1241,23 +1280,30 @@ fn fifo_put(inode: &crate::fs::inode::Inode, pipe: &Pipe, mode: u32) {
 /// The returned files should be added to the process's fd table.
 pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelError> {
     let pipe = Pipe::new()?;
-
-    // We need a dummy dentry for pipe files
-    // Pipes don't have a filesystem path, but File requires a dentry
-    let dummy_dentry = create_pipe_dentry()?;
+    let (mnt, dentry) = create_pipe_path()?.into_parts();
+    // The inode holds the pipe while either file is open (Linux
+    // inode->i_pipe, pipe->files = 2), so an open of the pipe's path (a
+    // /proc fd link, O_EMPTYPATH) joins it as a FIFO open would
+    if let Some(i) = dentry.get_inode() {
+        *i.i_pipe.lock() = Some((pipe.clone(), 2));
+    }
 
     // Determine file flags
     let read_flags = flags::O_RDONLY | (pipe_flags & flags::O_NONBLOCK);
-    let write_flags = flags::O_WRONLY | (pipe_flags & flags::O_NONBLOCK);
+    // O_DIRECT (packet mode) on the write end only (Linux
+    // create_pipe_files)
+    let write_flags = flags::O_WRONLY | (pipe_flags & (flags::O_NONBLOCK | flags::O_DIRECT));
 
     let read_file = try_arc(File::new_anon(
-        Arc::clone(&dummy_dentry),
+        Arc::clone(&dentry),
+        Some(mnt.clone()),
         read_flags,
         &PIPE_READ_FOPS,
         pipe.clone(),
     ))?;
     let write_file = try_arc(File::new_anon(
-        dummy_dentry,
+        dentry,
+        Some(mnt),
         write_flags,
         &PIPE_WRITE_FOPS,
         pipe,
@@ -1266,17 +1312,13 @@ pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelErro
     Ok((read_file, write_file))
 }
 
-/// Create a dummy dentry for pipes
-///
-/// Pipes don't have a real filesystem entry, but our File struct
-/// requires a dentry. This creates a minimal anonymous dentry.
-fn create_pipe_dentry() -> Result<Arc<Dentry>, KernelError> {
-    use crate::fs::dentry::Dentry;
+/// A new pipefs inode and its path (Linux get_pipe_inode: its own
+/// number, the creator's fsuid/fsgid, the current time; then
+/// alloc_file_pseudo)
+fn create_pipe_path() -> Result<crate::fs::Path, KernelError> {
     use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS};
-    use alloc::sync::Weak;
+    use crate::fs::pseudo::PIPEFS;
 
-    // A pipefs inode (Linux get_pipe_inode): its own number, the
-    // creator's fsuid/fsgid, the current time
     let cred = crate::task::percpu::current_cred();
     let inode = try_arc(Inode::new(
         crate::fs::anon_inodes::get_next_ino(),
@@ -1285,14 +1327,10 @@ fn create_pipe_dentry() -> Result<Arc<Dentry>, KernelError> {
         cred.fsgid,
         0,
         crate::time::TIMEKEEPER.current_time(),
-        Weak::new(),
+        Arc::downgrade(&PIPEFS.sb()?),
         &NULL_INODE_OPS,
     ))?;
-
-    // Create anonymous dentry
-    let dentry = try_arc(Dentry::new_anonymous("pipe".into(), Some(inode)))?;
-
-    Ok(dentry)
+    PIPEFS.path("", inode)
 }
 
 // =============================================================================

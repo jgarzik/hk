@@ -56,6 +56,10 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
     // Note: percpu uses u8 APIC ID for xAPIC compatibility
     percpu::init_bsp(bsp_apic_id as u8);
     printkln!("SMP_CPU_ONLINE: cpu=0 apic={}", bsp_apic_id);
+    // Its IRQ stack, before it takes interrupts (Linux init_IRQ)
+    if !crate::irq_stack::init(0) {
+        printkln!("SMP: Failed to allocate the IRQ stack for CPU 0");
+    }
 
     // Enable LAPIC on BSP; legacy PIC interrupts are delivered to it
     lapic.enable();
@@ -84,21 +88,23 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
             break;
         }
 
-        // Allocate stack for this AP
+        // Its stack, IST stacks (in its TSS before it loads it) and IRQ
+        // stack (Linux irq_init_percpu_irqstack at bringup): all or none
+        let irq = crate::mm::vmstack::alloc();
         let stack_base = allocate_ap_stack(frame_alloc);
-        if stack_base == 0 {
+        let ist = stack_base != 0 && cpu::alloc_ist(cpu_id, frame_alloc);
+        let Some(irq) = irq.filter(|_| ist) else {
+            if stack_base != 0 {
+                cpu::free_stack(frame_alloc, stack_base, AP_STACK_SIZE);
+            }
             printkln!(
-                "SMP: Failed to allocate stack for APIC {}",
+                "SMP: Failed to allocate stacks for APIC {}",
                 cpu_info.apic_id
             );
             continue;
-        }
+        };
+        crate::irq_stack::set(cpu_id, irq);
         let stack_top = stack_base + AP_STACK_SIZE as u64;
-        // Its IST stacks, in its TSS before it loads it
-        if !cpu::alloc_ist(cpu_id, frame_alloc) {
-            printkln!("SMP: Failed to allocate IST stacks for CPU {}", cpu_id);
-            continue;
-        }
 
         // Set up trampoline data for this AP
         unsafe {

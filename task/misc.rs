@@ -186,7 +186,7 @@ pub fn sys_sysinfo(info_ptr: UserPtr<SysInfo>) -> KernelResult<()> {
     // Get memory statistics from frame allocator
     let mem_stats = FRAME_ALLOCATOR.stats();
 
-    let (swap_total, swap_free) = crate::mm::swap::swap_totals();
+    let (swap_total, swap_free) = crate::mm::swap::swapfile::swap_totals();
     // Get process count from scheduler
     let procs = super::percpu::task_count() as u16;
 

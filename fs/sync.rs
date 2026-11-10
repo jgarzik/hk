@@ -21,11 +21,30 @@ pub fn sys_sync() -> KernelResult<()> {
 /// fsync(2): the file's data and metadata (Linux vfs_fsync -> ->fsync);
 /// EIO for a write error, else EINVAL (no ->fsync)
 pub fn sys_fsync(fd: i32) -> KernelResult<()> {
-    let file = fget(fd)?;
-    file.f_op.fsync(&file).map_err(|e| match e {
+    vfs_fsync(&*fget(fd)?, false)
+}
+
+/// Sync `file`'s data and, unless `datasync`, its metadata (Linux
+/// vfs_fsync; hk's filesystems write no metadata fdatasync could skip):
+/// EIO for a write error, else EINVAL (no ->fsync); a writeback error
+/// of its mapping since this file last looked, once (Linux
+/// file_check_and_advance_wb_err in the filesystems' fsync)
+pub fn vfs_fsync(file: &crate::fs::file::File, datasync: bool) -> KernelResult<()> {
+    let _ = datasync;
+    let r = file.f_op.fsync(file).map_err(|e| match e {
         KernelError::Io => e,
         _ => KernelError::InvalidArgument,
-    })
+    });
+    let seen = file.check_and_advance_wb_err();
+    r.and(seen)
+}
+
+/// Sync bytes [start, end] of `file` (Linux vfs_fsync_range from
+/// generic_write_sync), with its writeback error reported as `vfs_fsync`
+pub fn vfs_fsync_range(file: &crate::fs::file::File, start: u64, end: u64) -> KernelResult<()> {
+    let r = file.f_op.fsync_range(file, start, end);
+    let seen = file.check_and_advance_wb_err();
+    r.and(seen)
 }
 
 /// fdatasync(2): as fsync (hk's filesystems write no metadata that
@@ -35,13 +54,17 @@ pub fn sys_fdatasync(fd: i32) -> KernelResult<()> {
 }
 
 /// syncfs(2) (Linux sync_filesystem of the file's superblock): its
-/// dirty inodes, then its device's cache; a write error is EIO
+/// dirty inodes, then its device's cache; a write error is EIO, as is
+/// a writeback error of the filesystem since this file last looked,
+/// once (Linux s_wb_err against f_sb_err)
 pub fn sys_syncfs(fd: i32) -> KernelResult<()> {
     let file = fget(fd)?;
     let Some(sb) = file.get_inode().and_then(|i| i.superblock()) else {
         return Ok(());
     };
-    super::fs_writeback::writeback_sb(&sb).map_err(|_| KernelError::Io)
+    let r = super::fs_writeback::writeback_sb(&sb).map_err(|_| KernelError::Io);
+    let seen = file.check_and_advance_sb_err();
+    r.and(seen)
 }
 
 /// sync_file_range flags (Linux include/uapi/linux/fs.h)
@@ -62,8 +85,10 @@ fn page_range(offset: u64, nbytes: u64) -> (u64, u64) {
 
 /// sync_file_range(2) (Linux ksys_sync_file_range): with
 /// SYNC_FILE_RANGE_WRITE, write the dirty pages of the range; the waits
-/// have nothing to wait for (hk's writeback is synchronous). No
-/// metadata and no disk flush, as on Linux.
+/// have no I/O to wait for (hk's writeback is synchronous) but report a
+/// writeback error of the file's mapping since it last looked, once
+/// (Linux file_fdatawait_range). No metadata and no disk flush, as on
+/// Linux.
 pub fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> KernelResult<()> {
     let all = SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
     if flags & !all != 0 || offset < 0 || nbytes < 0 || offset.checked_add(nbytes).is_none() {
@@ -75,15 +100,20 @@ pub fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> Ker
     if !m.is_file() && !m.is_blkdev() && !m.is_dir() && !m.is_symlink() {
         return Err(KernelError::IllegalSeek);
     }
-    if flags & SYNC_FILE_RANGE_WRITE == 0 {
-        return Ok(());
+    if flags & SYNC_FILE_RANGE_WAIT_BEFORE != 0 {
+        file.check_and_advance_wb_err()?;
     }
-    let Some(host) = file.mapping_inode() else {
-        return Ok(());
-    };
-    let (first, last) = page_range(offset as u64, nbytes as u64);
-    // A write error is EIO
-    filemap::write_range(&host, first, last).map_err(|_| KernelError::Io)
+    if flags & SYNC_FILE_RANGE_WRITE != 0
+        && let Some(host) = file.mapping_inode()
+    {
+        let (first, last) = page_range(offset as u64, nbytes as u64);
+        // A write error is EIO
+        filemap::write_range(&host, first, last).map_err(|_| KernelError::Io)?;
+    }
+    if flags & SYNC_FILE_RANGE_WAIT_AFTER != 0 {
+        file.check_and_advance_wb_err()?;
+    }
+    Ok(())
 }
 
 /// fadvise advice (Linux include/uapi/linux/fadvise.h; DONTNEED and

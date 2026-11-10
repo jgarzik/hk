@@ -122,7 +122,8 @@ extern "C" fn handle_el1_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
 #[unsafe(no_mangle)]
 extern "C" fn handle_stack_overflow(sp: u64, elr: u64, far: u64) -> ! {
     panic!(
-        "kernel stack overflow: SP={:#x} ELR={:#x} FAR={:#x} (tid {})",
+        "kernel stack overflow ({}): SP={:#x} ELR={:#x} FAR={:#x} (tid {})",
+        crate::irq_stack::overflowed(sp),
         sp,
         elr,
         far,
@@ -144,7 +145,9 @@ fn irq_body() {
     if let Some(d) = depth {
         d.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    irq_dispatch();
+    // On this CPU's IRQ stack, from either level (Linux
+    // do_interrupt_handler)
+    crate::irq_stack::run(irq_dispatch);
     if let Some(d) = depth {
         d.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }

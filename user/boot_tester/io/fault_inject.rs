@@ -140,14 +140,14 @@ fn run(fd: i32, name: &[u8], call: fn() -> i64, undo: fn(i64)) {
     }
 }
 
-fn set(fd: i32, n: u32) {
+pub fn set(fd: i32, n: u32) {
     let mut b = [0u8; 12];
     let len = fmt_u32(n, &mut b);
     sys_lseek(fd, 0, 0);
     sys_write(fd as u64, b.as_ptr(), len as u64);
 }
 
-fn get(fd: i32) -> u32 {
+pub fn get(fd: i32) -> u32 {
     let mut b = [0u8; 16];
     sys_lseek(fd, 0, 0);
     let n = sys_read(fd as u64, b.as_mut_ptr(), b.len() as u64);

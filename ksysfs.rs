@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::fs::kernfs::sysfs;
 use crate::fs::kernfs::{self, Attr, SysBuf};
-use crate::fs::sysfs;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 use crate::util::kalloc::arc_nofail;

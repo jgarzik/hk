@@ -1211,6 +1211,9 @@ where
         exec_fatal();
         return Err(e);
     }
+    // Its io_uring requests end before the new image (Linux
+    // begin_new_exec: io_uring_task_cancel)
+    crate::io::io_uring::task_cancel(true);
     // Handlers, alternate stack and timers of the old image go
     if let Err(e) = crate::signal::exec_signals() {
         exec_fatal();
@@ -1255,11 +1258,7 @@ where
     {
         let mut m = mm.mmap_write();
         m.set_brk(start_brk);
-        let exe = match (file.f_path(), crate::fs::namei::nd_root()) {
-            (Some(p), Ok(root)) => crate::fs::dentry::d_path(&p, &root).0,
-            _ => alloc::vec::Vec::new(),
-        };
-        m.set_exe(exe.into(), deny);
+        m.set_exe(file.f_path(), deny);
         let code = image_layout(&elf, base_addr);
         m.set_args(MmLayout {
             start_code: code.start_code,

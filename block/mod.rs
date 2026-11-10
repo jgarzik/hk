@@ -5,8 +5,10 @@
 
 pub mod blk_mq;
 pub mod blkdev;
+pub mod dio;
 pub mod genhd;
 pub mod part;
+pub mod plug;
 pub mod ramdisk;
 
 // SCSI layer

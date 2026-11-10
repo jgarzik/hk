@@ -303,24 +303,51 @@ fn has_error_code(vector: u64) -> bool {
 /// `paranoid_common`), with the frame at `regs` (Linux idtentry
 /// handlers, sysvec_*, common_interrupt)
 pub extern "C" fn idt_dispatch(regs: &UserFrame, vector: u64) {
+    // SAFETY: a field load
+    let user = unsafe { regs.with(|r| r.cs) } & 3 == 3;
     match vector {
+        // Exceptions stay on the stack they hit
         0..=31 => handle_exception(regs, vector),
+        // From user mode the task stack is empty: interrupts run there
+        // (Linux run_irq_on_irqstack_cond, run_sysvec_on_irqstack_cond)
+        v if user => handle_interrupt(v),
+        v => crate::irq_stack::run(|| handle_interrupt(v)),
+    }
+    // Back to user mode: its pending work first (Linux
+    // irqentry_exit_to_user_mode); not for NMI, #DF, #MC (paranoid)
+    if user && !matches!(vector, 2 | 8 | 18) {
+        // SAFETY: interrupts off for the exit work's checks
+        unsafe { ::core::arch::asm!("cli", options(nostack)) };
+        crate::entry::exit_to_user_mode(regs);
+    }
+}
+
+/// An interrupt's handlers (vectors 32-255; Linux common_interrupt,
+/// sysvec_*)
+fn handle_interrupt(vector: u64) {
+    match vector {
         32..=47 => handle_irq(vector - 32),
         v if v == u64::from(LAPIC_TIMER_VECTOR) => handle_lapic_timer(),
         v if v == u64::from(CALL_FUNCTION_VECTOR) => handle_call_function(),
         v if v == u64::from(RESCHEDULE_VECTOR) => handle_reschedule(),
         v if v == u64::from(lapic::ERROR_APIC_VECTOR) => in_irq(handle_apic_error),
-        v => in_irq(|| handle_spurious(v as u8)),
+        // Vectors are below 256: `as u8` keeps them
+        v => match super::irq::vector_irq(v as u8) {
+            Some(irq) => handle_msi(irq),
+            None => in_irq(|| handle_spurious(v as u8)),
+        },
     }
-    // Back to user mode: its pending work first (Linux
-    // irqentry_exit_to_user_mode); not for NMI, #DF, #MC (paranoid)
-    // SAFETY: a field load
-    let cs = unsafe { regs.with(|r| r.cs) };
-    if cs & 3 == 3 && !matches!(vector, 2 | 8 | 18) {
-        // SAFETY: interrupts off for the exit work's checks
-        unsafe { ::core::arch::asm!("cli", options(nostack)) };
-        crate::entry::exit_to_user_mode(regs);
-    }
+}
+
+/// An MSI line's interrupt (Linux common_interrupt, handle_edge_irq):
+/// edge-triggered, so acknowledged first; one raised while the handlers
+/// run comes again. Its handlers run as an interrupt (`in_irq`: the
+/// interrupt depth, which the heap's atomic choice and lockdep read)
+fn handle_msi(irq: u32) {
+    lapic::eoi();
+    in_irq(|| {
+        crate::irq::handle_irq(irq);
+    });
 }
 
 /// si_code for a user x87 (#MF) or SIMD (#XM) floating-point exception
@@ -490,8 +517,10 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
     // (Linux exc_double_fault, handle_stack_overflow)
     let guard = |a| crate::mm::vmstack::in_guard(a);
     if matches!(vector, 8 | 14) && (guard(cr2) || guard(rsp)) {
+        let bad = if guard(rsp) { rsp } else { cr2 };
         panic!(
-            "kernel stack overflow: RIP={:#x} RSP={:#x} CR2={:#x} (tid {})",
+            "kernel stack overflow ({}): RIP={:#x} RSP={:#x} CR2={:#x} (tid {})",
+            crate::irq_stack::overflowed(bad),
             rip,
             rsp,
             cr2,
@@ -590,26 +619,72 @@ fn oops_backtrace(frame: &PtRegs) {
     // Only follow frame pointers on the faulting kernel stack: RBP may
     // hold a user value (no frame pointers, or a user-mode fault), and
     // dereferencing it here would fault again under SMAP
-    if frame.cs & 3 != 0 {
-        return;
+    if frame.cs & 3 == 0 {
+        backtrace(frame.rsp, frame.rbp);
     }
-    let stack = frame.rsp..frame.rsp.saturating_add(0x10000);
-    let mut fp = frame.rbp;
-    for depth in 0..16 {
-        if fp == 0 || !stack.contains(&fp) {
-            break;
+}
+
+/// Frames a backtrace prints at most
+const BACKTRACE_DEPTH: usize = 16;
+
+/// Print the return addresses of the frame-pointer chain from `fp`, on
+/// the kernel stack `sp` is on, and from this CPU's IRQ stack on over to
+/// the stack it was entered from (Linux show_trace_log_lvl with
+/// get_stack_info: "<IRQ>" .. "</IRQ>"). Best effort: the kernel may
+/// omit frame pointers.
+pub fn backtrace(sp: u64, mut fp: u64) {
+    let mut stack = stack_of(sp);
+    let mut crossed = false;
+    if irq_stack_next(&stack).is_some() {
+        printkln!("  <IRQ>");
+    }
+    for depth in 0..BACKTRACE_DEPTH {
+        if !frame_in(&stack, fp) {
+            match irq_stack_next(&stack) {
+                Some(next) if !crossed && frame_in(&next, fp) => {
+                    printkln!("  </IRQ>");
+                    stack = next;
+                    crossed = true;
+                }
+                _ => break,
+            }
         }
-        // SAFETY: fp lies within the faulting kernel stack
+        // SAFETY: a frame record within a kernel stack (checked above),
+        // mapped memory; the panic path's best effort
         let (prev, ret) = unsafe { (*(fp as *const u64), *((fp + 8) as *const u64)) };
         if ret == 0 {
             break;
         }
         printkln!("  #{}: {:#018x}", depth, ret);
-        if prev <= fp {
+        // Up the stack only, unless the chain leaves it
+        if stack.contains(&prev) && prev <= fp {
             break;
         }
         fp = prev;
     }
+}
+
+/// The 16-byte frame record at `fp` lies on `stack`
+fn frame_in(stack: &core::ops::Range<u64>, fp: u64) -> bool {
+    fp != 0 && stack.start <= fp && fp.saturating_add(16) <= stack.end
+}
+
+/// The kernel stack `sp` is on: a `vmstack` stack's bounds, else (a
+/// boot stack) the 64 KiB above `sp`
+fn stack_of(sp: u64) -> core::ops::Range<u64> {
+    crate::mm::vmstack::bounds(sp).unwrap_or(sp..sp.saturating_add(0x10000))
+}
+
+/// If `stack` is this CPU's IRQ stack: the stack it was entered from,
+/// by the RSP `irq_stack::call_on_stack` left in its top word
+fn irq_stack_next(stack: &core::ops::Range<u64>) -> Option<core::ops::Range<u64>> {
+    let top = crate::irq_stack::top();
+    if top == 0 || stack.end != top {
+        return None;
+    }
+    // SAFETY: the top word of this CPU's IRQ stack, mapped for good
+    let sp = unsafe { *((top - 8) as *const u64) };
+    Some(stack_of(sp))
 }
 
 /// Resolve a page fault at `addr` (Linux do_user_addr_fault). Only
@@ -773,8 +848,12 @@ fn handle_irq(irq: u64) {
             // Timer interrupt (PIT): the LAPIC timer drives the tick
         }
         _ => {
-            // Dispatch to registered handlers
-            crate::irq::handle_irq(u32::from(irq));
+            // Dispatch to registered handlers, in interrupt context
+            // (`in_irq`: the interrupt depth the heap and lockdep read;
+            // arm64's irq_body raises it for every interrupt)
+            in_irq(|| {
+                crate::irq::handle_irq(u32::from(irq));
+            });
         }
     }
 

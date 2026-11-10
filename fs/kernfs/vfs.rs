@@ -140,6 +140,11 @@ impl InodeOps for KernfsIops {
         knode(inode).is_some_and(|kn| !kn.removed())
     }
 
+    /// kernfs_dop_revalidate is -ECHILD in an RCU walk
+    fn revalidate_blocks(&self, _inode: &Inode) -> bool {
+        true
+    }
+
     fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {
         let kn = knode(inode).ok_or(KernelError::Io)?;
         let Kind::Link(t) = &kn.kind else {
@@ -158,16 +163,8 @@ impl InodeOps for KernfsIops {
             _ => 1,
         };
         InodeAttr {
-            ino: inode.ino,
-            mode: inode.mode(),
-            uid: inode.uid(),
-            gid: inode.gid(),
-            size: inode.get_size(),
             nlink,
-            rdev: inode.rdev,
-            atime: inode.atime(),
-            mtime: inode.mtime(),
-            ctime: inode.ctime(),
+            ..crate::fs::inode::generic_fillattr(inode)
         }
     }
 }
@@ -396,7 +393,7 @@ impl FileOps for KernfsFops {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait {
+        if rw.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let off = at.unwrap_or_else(|| file.get_pos());
@@ -414,7 +411,7 @@ impl FileOps for KernfsFops {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait {
+        if rw.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let off = at.unwrap_or_else(|| file.get_pos());

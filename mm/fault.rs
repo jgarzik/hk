@@ -20,7 +20,6 @@ use core::sync::atomic::Ordering;
 use super::anon_vma::AnonVma;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
 use super::pgtable::{PgTables, Pte, PteTable};
-use super::shmem::Shmem;
 use super::tlb::flush_tlb_page;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry};
 use crate::FRAME_ALLOCATOR;
@@ -28,6 +27,7 @@ use crate::arch::{PageFlags, paging, phys_to_virt};
 use crate::fs::File;
 use crate::mm::page_alloc::Gfp;
 use crate::task::percpu::{increment_maj_flt, increment_min_flt};
+use crate::util::error::KernelError;
 
 /// The access that faulted
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,7 +65,8 @@ struct Area {
     pgoff: u64,
     file: Option<Arc<File>>,
     anon_vma: Option<Arc<AnonVma>>,
-    shmem: Option<Arc<Shmem>>,
+    /// The driver's pages were inserted at mmap (VM_MIXEDMAP)
+    mixed: bool,
 }
 
 impl Area {
@@ -121,8 +122,37 @@ fn area_of(vma: &super::Vma) -> Area {
         pgoff: vma.pgoff,
         file: vma.file.clone(),
         anon_vma: vma.anon_vma.clone(),
-        shmem: vma.shmem.clone(),
+        mixed: vma.flags & super::vma::VM_MIXEDMAP != 0,
     }
+}
+
+/// Map the driver's pages of the new mapping `vma` of `mm` (its
+/// `FileOps::map_page`, Linux vm_insert_pages from f_op->mmap), page
+/// `i` of it at `vma.start + i` pages, until the driver has no more;
+/// the mmap_lock held for writing (`map`). Read-only and copy-on-write
+/// in a private mapping. ENOMEM if a page table cannot be allocated.
+pub fn insert_driver_pages(mm: &Mm, map: &MmStruct, vma: &super::Vma) -> Result<(), KernelError> {
+    let area = area_of(vma);
+    let Some(f) = &area.file else { return Ok(()) };
+    let t = PgTables::new(mm, map);
+    let mut addr = area.start;
+    while addr < area.end {
+        let idx = (addr - area.start) / PAGE_SIZE;
+        // SAFETY: the page goes into this mapping's PTE with the
+        // reference map_page took, dropped when the entry goes
+        let Some(Ok(page)) = (unsafe { f.f_op.map_page(f, area.offset, idx) }) else {
+            break;
+        };
+        let Ok(ptep) = leaf(mm, t, addr) else {
+            FRAME_ALLOCATOR.decref(page);
+            return Err(KernelError::OutOfMemory);
+        };
+        if do_fault(mm, ptep, ptep.get(), page, addr, &area, !area.shared).is_err() {
+            return Err(KernelError::OutOfMemory);
+        }
+        addr += PAGE_SIZE;
+    }
+    Ok(())
 }
 
 /// A frame for user data: below the low watermark it reclaims (swaps
@@ -151,7 +181,7 @@ fn add_anon(phys: u64, area: &Area, addr: u64) {
     if let Some(av) = &area.anon_vma {
         super::rmap::page_add_anon_rmap(phys, av, area.index(addr));
     }
-    super::lru::lru_add(phys);
+    super::swap::lru::lru_add(phys);
 }
 
 /// Resolve a fault at `addr` of the address space `mm` (the current
@@ -257,7 +287,7 @@ fn leaf<'a>(mm: &Mm, t: PgTables<'a>, addr: u64) -> Result<Pte<'a>, VmFault> {
         if still_huge(t, addr) {
             return Err(VmFault::Retry);
         }
-        if super::vmscan::try_to_free_pages(super::vmscan::SWAP_CLUSTER_MAX) == 0 {
+        if super::swap::vmscan::try_to_free_pages(super::swap::vmscan::SWAP_CLUSTER_MAX) == 0 {
             return Err(VmFault::Oom);
         }
     }
@@ -347,20 +377,20 @@ fn do_huge_anon(mm: &Mm, t: PgTables<'_>, addr: u64, area: &Area) -> bool {
 }
 
 /// The page to map at `addr` of a VMA with no page there yet, with a
-/// reference for the new PTE: the shared object's page for shared
-/// anonymous memory (Linux shmem_fault), else a new page, zeroed for
-/// anonymous memory or holding a private copy of the file data (Linux
-/// do_anonymous_page, do_read_fault)
+/// reference for the new PTE: the page cache's for a file that maps its
+/// cache (tmpfs files of shared anonymous memory and SysV shm included,
+/// Linux shmem_fault), else a new page, zeroed for anonymous memory or
+/// holding a private copy of the file data (Linux do_anonymous_page,
+/// do_read_fault)
 /// Also whether the page comes locked (a page-cache page: unlocked
 /// once mapped) and whether it must be mapped read-only (a private
 /// mapping's page-cache page: a write copies it, Linux do_read_fault).
 fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool), VmFault> {
     let exec = area.prot & PROT_EXEC != 0;
-    if let Some(sh) = &area.shmem {
-        return sh
-            .get_page(area.pgoff(addr) / PAGE_SIZE)
-            .inspect(|&f| paging::sync_page(f, exec))
-            .map(|f| (f, false, false));
+    // A driver's pages are inserted at mmap (`insert_driver_pages`):
+    // nothing faults back in (Linux: no vm_ops->fault, SIGBUS)
+    if area.mixed {
+        return Err(VmFault::Bus);
     }
     if let (false, Some(f)) = (area.anon, &area.file)
         && let Some(r) = file_page(f, area.pgoff(addr), area, access)
@@ -388,7 +418,8 @@ fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool
 /// of a filesystem that maps its cache (Linux filemap_fault): SIGBUS
 /// past the end of the file. None: the fault copies the data. A shared
 /// mapping maps the page itself, locked, with a reference for the PTE;
-/// a writable one dirties it (Linux do_shared_fault). A private one
+/// a write through a writable one that writes back dirties it (Linux
+/// do_shared_fault), a read maps it read-only. A private one
 /// maps it read-only on a read (do_read_fault: the cache page is shared
 /// until written) and a copy on a write (do_cow_fault).
 fn file_page(
@@ -419,11 +450,16 @@ fn file_page(
         return Some(Ok((page, true, true)));
     }
     if area.shared {
-        if area.prot & PROT_WRITE != 0 {
+        // A mapping whose pages write back tracks dirtying (Linux
+        // vma_wants_writenotify): a write dirties the page and maps it
+        // writable (do_shared_fault), a read maps it read-only and clean
+        // (do_read_fault), so its first write faults and dirties it
+        // (do_wp_page). tmpfs and ramfs map as the VMA allows.
+        let notify = area.prot & PROT_WRITE != 0 && inode.i_data.aops().can_dirty();
+        if notify && access == Access::Write {
             super::filemap::dirty_page(&inode.i_data, page);
-            crate::fs::fs_writeback::mark_inode_dirty(&inode);
         }
-        return Some(Ok((page, true, false)));
+        return Some(Ok((page, true, notify && access != Access::Write)));
     }
     if access != Access::Write {
         return Some(Ok((page, true, true)));
@@ -470,10 +506,22 @@ fn do_fault(
     if area.anon_private() {
         add_anon(page, area, addr);
     }
+    // A private mapping's own page: fresh, not the page cache's
+    if !area.shared && !wp {
+        set_exclusive(page);
+    }
     flush_tlb_page(mm, addr);
     drop(l);
     increment_min_flt();
     Ok(())
+}
+
+/// The private mapping that just mapped `phys` owns it alone (Linux
+/// RMAP_EXCLUSIVE)
+fn set_exclusive(phys: u64) {
+    if let Some(pg) = super::page::phys_to_page(phys) {
+        pg.set_anon_exclusive();
+    }
 }
 
 /// Map the page of the swap PTE `pte` at `ptep` (Linux do_swap_page),
@@ -492,7 +540,7 @@ fn do_swap_page(
     access: Access,
 ) -> Result<(), VmFault> {
     let e = SwapEntry::from_pte(pte);
-    let page = match super::swap_state::read_swap_page(e) {
+    let page = match super::swap::swap_state::read_swap_page(e) {
         Err(VmFault::Retry) => return Ok(()),
         r => r?,
     };
@@ -518,12 +566,13 @@ fn map_swap_page(
         FRAME_ALLOCATOR.decref(page);
         return Ok(());
     }
-    super::swap::swap_free(SwapEntry::from_pte(pte));
+    super::swap::swapfile::swap_free(SwapEntry::from_pte(pte));
     // The cache lets the page go on a write, or when swap runs short
     // (Linux should_try_to_free_swap: vm_swap_full), if no other swap
     // PTE needs the slot; exclusive: then no reference but ours
     let write = access == Access::Write;
-    let freed = (write || super::swap::swap_full()) && super::swap_state::try_free_swap(page);
+    let freed = (write || super::swap::swapfile::swap_full())
+        && super::swap::swap_state::try_free_swap(page);
     let exclusive = write && freed && FRAME_ALLOCATOR.refcount(page) == 1;
     // A PROT_NONE VMA (swapoff's unuse_pte skips the access check) gets
     // a protnone entry from mk_pte, not a readable one
@@ -533,6 +582,9 @@ fn map_swap_page(
     }
     let ok = t.set(addr, pte, entry);
     debug_assert!(ok, "swap PTE changed under its PTE lock");
+    if exclusive {
+        set_exclusive(page);
+    }
     if let Some(av) = &area.anon_vma {
         super::rmap::page_add_anon_rmap(page, av, area.index(addr));
     }
@@ -586,7 +638,6 @@ fn do_wp_page(mm: &Mm, ptep: Pte<'_>, pte: u64, addr: u64, area: &Area) -> Resul
         super::filemap::dirty_page(&inode.i_data, phys);
         super::page::unlock_page(phys);
         FRAME_ALLOCATOR.decref(phys);
-        crate::fs::fs_writeback::mark_inode_dirty(&inode);
         super::writeback::balance_dirty_pages(&inode);
         return r;
     }
@@ -633,8 +684,14 @@ fn wp_locked(
     if !area.shared && FRAME_ALLOCATOR.refcount(old) > 1 {
         reuse_swap_page(old);
     }
-    if area.shared || FRAME_ALLOCATOR.refcount(old) <= 1 {
+    // The mapping's own page, pinned or not, is reused in place (Linux
+    // wp_can_reuse_anon_folio, PageAnonExclusive)
+    let excl = !area.shared && super::page::reusable(old);
+    if area.shared || excl || FRAME_ALLOCATOR.refcount(old) <= 1 {
         if t.set(addr, pte, own(pte)) {
+            if !area.shared {
+                set_exclusive(old);
+            }
             flush_tlb_page(mm, addr);
             increment_min_flt();
         }
@@ -653,6 +710,9 @@ fn wp_locked(
     if area.anon_private() {
         add_anon(new, area, addr);
     }
+    if !area.shared {
+        set_exclusive(new);
+    }
     super::memory::put_page(old);
     increment_min_flt();
     Ok(())
@@ -664,7 +724,7 @@ fn wp_locked(
 fn reuse_swap_page(phys: u64) {
     let cached = super::page::phys_to_page(phys).is_some_and(|p| p.is_swapcache());
     if cached && super::page::trylock_page(phys) {
-        super::swap_state::try_free_swap(phys);
+        super::swap::swap_state::try_free_swap(phys);
         super::page::unlock_page(phys);
     }
 }
@@ -682,13 +742,11 @@ pub fn pagefault_out_of_memory() -> ! {
     let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
     let exe = crate::task::percpu::current()
         .mm()
-        .and_then(|mm| mm.mmap_read().exe());
+        .and_then(|mm| mm.mmap_read().exe())
+        .map(|p| p.dentry.name());
     let comm: &[u8] = match &name[..len] {
         n if !n.is_empty() => n,
-        _ => exe
-            .as_deref()
-            .and_then(|p| p.rsplit(|&c| c == b'/').next())
-            .unwrap_or(b"?"),
+        _ => exe.as_deref().unwrap_or(b"?"),
     };
     let comm = crate::fs::name::Escaped(comm);
     crate::printkln!("Out of memory: Killed process {} ({})", pid, comm);

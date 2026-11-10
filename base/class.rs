@@ -8,7 +8,7 @@ use spin::Once;
 
 use super::core::{DevNode, Device};
 use crate::fs::kernfs::KNode;
-use crate::fs::sysfs;
+use crate::fs::kernfs::sysfs;
 use crate::sync::spin::Mutex;
 
 static CLASS_DIR: Once<Arc<KNode>> = Once::new();

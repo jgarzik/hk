@@ -9,6 +9,7 @@ use crate::sync::spin::RwLock;
 use ::core::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::RwSem;
+use crate::sync::waitqueue::var_waitqueue;
 
 use super::KernelError;
 use super::superblock::SuperBlock;
@@ -158,6 +159,14 @@ impl InodeMode {
     }
 }
 
+/// What following a symlink gives (Linux ->get_link)
+pub enum Link {
+    /// The path to walk on with
+    Text(alloc::vec::Vec<u8>),
+    /// The object a magic link leads to (Linux nd_jump_link)
+    Jump(super::Path),
+}
+
 /// Inode operations trait - filesystem-specific behavior
 pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
@@ -168,6 +177,14 @@ pub trait InodeOps: Send + Sync {
     /// again. Default yes; procfs says no once its task or fd is gone.
     fn revalidate(&self, _inode: &Inode) -> bool {
         true
+    }
+
+    /// `revalidate` needs the ref-walk (Linux d_revalidate's -ECHILD
+    /// under LOOKUP_RCU), so a RESOLVE_CACHED walk stops there (EAGAIN).
+    /// Default no; kernfs, and procfs outside its process directories,
+    /// say yes.
+    fn revalidate_blocks(&self, _inode: &Inode) -> bool {
+        false
     }
 
     /// Access check for `mask` (MAY_* bits) by `cred` (Linux
@@ -195,6 +212,20 @@ pub trait InodeOps: Send + Sync {
     /// Create a new file in a directory
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
+        Err(KernelError::OperationNotSupported)
+    }
+
+    /// chmod to `perm` may change the mode (after the owner check; Linux
+    /// ->setattr refusing ATTR_MODE); default yes
+    fn chmod_ok(&self, inode: &Inode, perm: u16) -> Result<(), KernelError> {
+        let _ = (inode, perm);
+        Ok(())
+    }
+
+    /// A new regular file of `dir`'s file system with no name (nlink 0)
+    /// for O_TMPFILE (Linux ->tmpfile); default EOPNOTSUPP
+    fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+        let _ = (dir, mode);
         Err(KernelError::OperationNotSupported)
     }
 
@@ -234,17 +265,13 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
-    /// Where symlink `inode` (on mount `mnt`) leads if it is a magic
-    /// link, one that goes to an object rather than to the path its
-    /// readlink shows (Linux get_link + nd_jump_link); None for a plain
-    /// symlink
-    fn jump_link(
-        &self,
-        inode: &Inode,
-        mnt: &Arc<super::mount::Mount>,
-    ) -> Option<Result<super::Path, KernelError>> {
-        let _ = (inode, mnt);
-        None
+    /// Follow symlink `inode` (Linux ->get_link): its text, or for a
+    /// magic link the object it jumps to (nd_jump_link), which
+    /// RESOLVE_NO_MAGICLINKS refuses (ELOOP) and a scoped walk never
+    /// takes (EXDEV). Default: the text `readlink` gives; procfs's fd,
+    /// cwd, root, exe and namespace links jump.
+    fn get_link(&self, inode: &Inode) -> Result<Link, KernelError> {
+        Ok(Link::Text(self.readlink(inode)?))
     }
 
     /// Create a symbolic link
@@ -328,22 +355,10 @@ pub trait InodeOps: Send + Sync {
         Ok(())
     }
 
-    /// Get file size (may be dynamically computed for procfs)
-    ///
-    /// Timestamps are read lock-free (Linux generic_fillattr).
+    /// The attributes stat reports (Linux ->getattr); default
+    /// `generic_fillattr`
     fn getattr(&self, inode: &Inode) -> InodeAttr {
-        InodeAttr {
-            ino: inode.ino,
-            mode: inode.mode(),
-            uid: inode.uid(),
-            gid: inode.gid(),
-            size: inode.get_size(),
-            nlink: inode.get_nlink(),
-            rdev: inode.rdev,
-            atime: inode.atime(),
-            mtime: inode.mtime(),
-            ctime: inode.ctime(),
-        }
+        generic_fillattr(inode)
     }
 
     // =========================================================================
@@ -360,7 +375,7 @@ pub trait InodeOps: Send + Sync {
     /// # Returns
     /// The size of the attribute value on success.
     /// If `value` is empty, returns the size that would be needed.
-    fn getxattr(&self, inode: &Inode, name: &str, value: &mut [u8]) -> Result<usize, KernelError> {
+    fn getxattr(&self, inode: &Inode, name: &[u8], value: &mut [u8]) -> Result<usize, KernelError> {
         let _ = (inode, name, value);
         Err(KernelError::OperationNotSupported)
     }
@@ -375,7 +390,7 @@ pub trait InodeOps: Send + Sync {
     fn setxattr(
         &self,
         inode: &Inode,
-        name: &str,
+        name: &[u8],
         value: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
@@ -402,7 +417,7 @@ pub trait InodeOps: Send + Sync {
     /// # Arguments
     /// * `inode` - The inode to remove the attribute from
     /// * `name` - The attribute name to remove
-    fn removexattr(&self, inode: &Inode, name: &str) -> Result<(), KernelError> {
+    fn removexattr(&self, inode: &Inode, name: &[u8]) -> Result<(), KernelError> {
         let _ = (inode, name);
         Err(KernelError::OperationNotSupported)
     }
@@ -425,6 +440,31 @@ pub struct InodeAttr {
     pub mtime: Timespec,
     /// Last status change time
     pub ctime: Timespec,
+    /// Preferred I/O size (Linux kstat.blksize)
+    pub blksize: u32,
+    /// 512-byte blocks allocated (Linux kstat.blocks)
+    pub blocks: u64,
+}
+
+/// The attributes as the inode holds them (Linux generic_fillattr);
+/// timestamps read lock-free. The block size is the page size, every hk
+/// file system's i_blocksize; the blocks are the size's.
+pub fn generic_fillattr(inode: &Inode) -> InodeAttr {
+    InodeAttr {
+        ino: inode.ino,
+        mode: inode.mode(),
+        uid: inode.uid(),
+        gid: inode.gid(),
+        size: inode.get_size(),
+        nlink: inode.get_nlink(),
+        rdev: inode.rdev,
+        atime: inode.atime(),
+        mtime: inode.mtime(),
+        ctime: inode.ctime(),
+        blksize: crate::mm::PAGE_SIZE as u32,
+        // No hk file system keeps i_blocks: the size's 512-byte blocks
+        blocks: inode.get_size().div_ceil(512),
+    }
 }
 
 /// Filesystem-specific data attached to an inode
@@ -518,6 +558,10 @@ pub struct Inode {
     /// instead which handles proper lock ordering.
     i_rwsem: RwSem,
 
+    /// Direct I/Os in flight (Linux i_dio_count): `inode_dio_begin` /
+    /// `inode_dio_end`, waited for by `inode_dio_wait`
+    i_dio_count: AtomicU32,
+
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn InodeData>>>,
 
@@ -541,6 +585,10 @@ pub struct Inode {
     /// An active swap area (Linux S_SWAPFILE): writes and truncates are
     /// ETXTBSY
     pub i_swapfile: core::sync::atomic::AtomicBool,
+
+    /// An O_TMPFILE file not opened O_EXCL: linkat may give it its first
+    /// name though it has no link (Linux I_LINKABLE)
+    pub i_linkable: core::sync::atomic::AtomicBool,
 
     /// Its flock and POSIX locks (Linux i_flctx; `fs::locks`)
     pub i_flctx: super::locks::FileLockCtx,
@@ -593,6 +641,8 @@ impl Inode {
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
+            i_dio_count: AtomicU32::new(0),
+            i_linkable: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
         }
@@ -638,6 +688,8 @@ impl Inode {
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
+            i_dio_count: AtomicU32::new(0),
+            i_linkable: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
         }
@@ -758,13 +810,26 @@ impl Inode {
     /// for a directory), or relatime and the atime is newer than mtime
     /// and ctime and under a day old. Unlocked, as Linux.
     pub fn touch_atime(&self, mnt: &super::mount::Mount) {
+        if let Some(now) = self.atime_update(mnt) {
+            self.atime.set(now);
+        }
+    }
+
+    /// An access through `mnt` would change the atime (Linux
+    /// atime_needs_update)
+    pub fn atime_needs_update(&self, mnt: &super::mount::Mount) -> bool {
+        self.atime_update(mnt).is_some()
+    }
+
+    /// The new atime an access through `mnt` sets, if any
+    fn atime_update(&self, mnt: &super::mount::Mount) -> Option<Timespec> {
         use super::mount::{MNT_NOATIME, MNT_NODIRATIME, MNT_RELATIME};
         let f = mnt.flags();
         if f & MNT_NOATIME != 0
             || (f & MNT_NODIRATIME != 0 && self.mode().is_dir())
             || mnt.is_readonly()
         {
-            return;
+            return None;
         }
         let now = crate::time::TIMEKEEPER.current_time();
         let atime = self.atime();
@@ -774,9 +839,9 @@ impl Inode {
             || now.sec.wrapping_sub(atime.sec) >= 24 * 60 * 60;
         if (f & MNT_RELATIME != 0 && !relatime_ok) || (now.sec, now.nsec) == (atime.sec, atime.nsec)
         {
-            return;
+            return None;
         }
-        self.atime.set(now);
+        Some(now)
     }
 
     /// ctime becomes the current time (Linux inode_set_ctime_current).
@@ -928,6 +993,58 @@ impl Drop for InodeLock<'_> {
     }
 }
 
+impl Inode {
+    /// A direct I/O on the inode starts (Linux inode_dio_begin)
+    pub fn inode_dio_begin(&self) {
+        self.i_dio_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A direct I/O on the inode is done, its last bio completed (Linux
+    /// inode_dio_end); the last one wakes `inode_dio_wait`. Any context:
+    /// the wakeup takes only the wait queue's IrqSpinlock.
+    pub fn inode_dio_end(&self) {
+        if self.i_dio_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            var_waitqueue(self.dio_key()).wake_all();
+        }
+    }
+
+    /// Sleep until no direct I/O is in flight (Linux inode_dio_wait).
+    /// The caller holds i_rwsem exclusive, so no new one can start on a
+    /// filesystem whose direct I/O takes it (vfat) before what it frees.
+    pub fn inode_dio_wait(&self) {
+        if self.dio_count() != 0 {
+            var_waitqueue(self.dio_key()).wait_event(|| self.dio_count() == 0);
+        }
+    }
+
+    /// Direct I/Os in flight (Linux inode_dio_finished's count)
+    pub fn dio_count(&self) -> u32 {
+        self.i_dio_count.load(Ordering::Acquire)
+    }
+
+    /// `inode_dio_begin` now, `inode_dio_end` when the guard drops
+    pub fn dio_guard(&self) -> DioGuard<'_> {
+        self.inode_dio_begin();
+        DioGuard(self)
+    }
+
+    /// The key of the shared wait queue `inode_dio_wait` sleeps on (Linux
+    /// wake_up_var(&inode->i_dio_count))
+    fn dio_key(&self) -> usize {
+        core::ptr::from_ref(&self.i_dio_count) as usize
+    }
+}
+
+/// A direct I/O counted in `Inode.i_dio_count` until dropped
+#[must_use]
+pub struct DioGuard<'a>(&'a Inode);
+
+impl Drop for DioGuard<'_> {
+    fn drop(&mut self) {
+        self.0.inode_dio_end();
+    }
+}
+
 /// [`InodeLock`] owning its inode reference ([`Inode::lock_arc`])
 #[must_use]
 pub struct InodeLockArc(Arc<Inode>);
@@ -1035,5 +1152,50 @@ impl Drop for DenyWrite {
 impl Drop for Inode {
     fn drop(&mut self) {
         super::icache::evict(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestOps;
+
+    impl InodeOps for TestOps {
+        fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+            Err(KernelError::NotFound)
+        }
+    }
+
+    static TEST_OPS: TestOps = TestOps;
+
+    #[test]
+    fn dio_count() {
+        let i = Inode::new(
+            1,
+            InodeMode::regular(0o644),
+            0,
+            0,
+            0,
+            Timespec::ZERO,
+            Weak::new(),
+            &TEST_OPS,
+        );
+        // None in flight: no wait
+        i.inode_dio_wait();
+        i.inode_dio_begin();
+        {
+            let _g = i.dio_guard();
+            assert_eq!(i.dio_count(), 2);
+        }
+        assert_eq!(i.dio_count(), 1);
+        i.inode_dio_end();
+        assert_eq!(i.dio_count(), 0);
+        i.inode_dio_wait();
+        // The wakeup's queue is the variable's, the same every time
+        assert!(core::ptr::eq(
+            var_waitqueue(i.dio_key()),
+            var_waitqueue(i.dio_key())
+        ));
     }
 }

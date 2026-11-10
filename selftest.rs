@@ -8,9 +8,8 @@
 use crate::util::kalloc::arc_nofail;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::sync::spin::Mutex;
-
 use crate::printkln;
+use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::kthread::{
     kthread_park, kthread_parkme, kthread_run, kthread_should_park, kthread_should_stop,
@@ -55,7 +54,7 @@ fn selftest_thread(_arg: usize) {
     check("tick_rate", dk >= want * 3 / 4 && dk <= want * 3 / 2, dk);
 
     // 2. queue_work runs on the system workqueue worker
-    let work = arc_nofail(Mutex::new(Work::new(|| {
+    let work = arc_nofail(IrqSpinlock::new(Work::new(|| {
         WORK_RAN.store(true, Ordering::Release);
         EVENT_WQ.wake_all();
     })));
@@ -65,7 +64,7 @@ fn selftest_thread(_arg: usize) {
 
     // 3. Delayed work runs no earlier than its delay
     let t0 = get_ticks();
-    let dwork = arc_nofail(Mutex::new(DelayedWork::new(|| {
+    let dwork = arc_nofail(IrqSpinlock::new(DelayedWork::new(|| {
         DELAYED_RAN_TICK.store(get_ticks(), Ordering::Release);
         EVENT_WQ.wake_all();
     })));
@@ -78,7 +77,7 @@ fn selftest_thread(_arg: usize) {
     // 3b. mod_delayed_work (Linux semantics): an idle item is queued
     // (false); a timed one is re-timed to now (true) and runs once; a
     // cancelled one does not run
-    let mw = arc_nofail(Mutex::new(DelayedWork::new(|| {
+    let mw = arc_nofail(IrqSpinlock::new(DelayedWork::new(|| {
         MOD_RUNS.fetch_add(1, Ordering::AcqRel);
         EVENT_WQ.wake_all();
     })));
@@ -214,9 +213,40 @@ fn selftest_thread(_arg: usize) {
         check(what, false, n);
     }
 
+    // 9. A timer interrupt taken in kernel mode runs its handlers on
+    //    this CPU's IRQ stack
+    let seen = irq_stack_seen();
+    check("irq_stack", seen == IRQ_ON_STACK, seen);
+
     if ok {
         printkln!("\nKSELFTEST:OK");
     }
+}
+
+/// `irq_stack_fire` ran on the IRQ stack (else 2: off it; 0: not run)
+const IRQ_ON_STACK: u64 = 1;
+static IRQ_STACK_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// A HARD hrtimer callback: in the timer interrupt
+fn irq_stack_fire(_t: &crate::time::hrtimer::HrTimer) {
+    let on = crate::irq_stack::on_irq_stack();
+    IRQ_STACK_SEEN.store(if on { IRQ_ON_STACK } else { 2 }, Ordering::Release);
+}
+
+/// Where a timer interrupt on this CPU runs its handlers: a HARD
+/// hrtimer 1 ms out, and this thread spins in kernel mode (interrupts
+/// on, never off the CPU: no preemption in the kernel) until it fired
+fn irq_stack_seen() -> u64 {
+    use crate::time::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
+    let t = core::pin::pin!(HrTimer::new(irq_stack_fire, HRTIMER_HARD));
+    let now = crate::time::monotonic_ns();
+    t.as_ref().start(now + 1_000_000, HrClock::Monotonic);
+    let deadline = now + 500_000_000;
+    while IRQ_STACK_SEEN.load(Ordering::Acquire) == 0 && crate::time::monotonic_ns() < deadline {
+        core::hint::spin_loop();
+    }
+    t.cancel_sync();
+    IRQ_STACK_SEEN.load(Ordering::Acquire)
 }
 
 /// Calls each stress thread makes to every other CPU

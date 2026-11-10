@@ -34,7 +34,7 @@ pub trait SuperOps: Send + Sync {
     }
 
     /// Get filesystem statistics
-    fn statfs(&self) -> StatFs {
+    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
         StatFs::default()
     }
 
@@ -50,6 +50,24 @@ pub trait SuperOps: Send + Sync {
     fn show_options(&self, sb: &SuperBlock, out: &mut alloc::vec::Vec<u8>) {
         let _ = (sb, out);
     }
+}
+
+/// Linux vfs_parse_sb_flag: generic words every filesystem takes in its
+/// options (their effect comes from mount(2)'s flags)
+pub fn sb_flag_word(w: &[u8]) -> bool {
+    matches!(
+        w,
+        b"ro"
+            | b"rw"
+            | b"sync"
+            | b"async"
+            | b"dirsync"
+            | b"lazytime"
+            | b"nolazytime"
+            | b"mand"
+            | b"nomand"
+            | b"posixacl"
+    )
 }
 
 /// Filesystem statistics (like Linux statfs)
@@ -374,6 +392,9 @@ pub struct SuperBlock {
     /// Remount and other changes of the superblock's state (Linux
     /// s_umount, a sleeping rw_semaphore): inside namespace_sem
     pub s_umount: sync::RwSem<()>,
+    /// Writeback errors of its files, reported once to each open file by
+    /// syncfs (Linux s_wb_err)
+    pub s_wb_err: crate::util::errseq::ErrSeq,
 }
 
 use super::inode::AsAny;
@@ -424,6 +445,7 @@ impl SuperBlock {
             s_fsnotify: crate::io::inotify::SbMarks::default(),
             s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
+            s_wb_err: crate::util::errseq::ErrSeq::new(),
             s_umount: sync::RwSem::new(()),
         })?;
         let mut all = ALL_SBS.lock();
@@ -627,7 +649,8 @@ pub fn find_filesystem(name: &str) -> Option<&'static FileSystemType> {
 /// Should be called during VFS initialization before any mounts.
 pub fn init_fs_registry() {
     register_filesystem(&super::ramfs::RAMFS_TYPE);
+    register_filesystem(&super::ramfs::tmpfs::TMPFS_TYPE);
     register_filesystem(&super::proc::PROCFS_TYPE);
     register_filesystem(&super::vfat::VFAT_TYPE);
-    register_filesystem(&super::cgroupfs::CGROUPFS_TYPE);
+    register_filesystem(&crate::cgroup::cgroupfs::CGROUPFS_TYPE);
 }

@@ -288,7 +288,7 @@ impl VirtioNet {
 }
 
 impl VirtioIrq for VirtioNet {
-    fn vq_interrupt(&self) {
+    fn vq_interrupt(&self, _vq: Option<u16>) {
         self.rx_cb.disable();
         napi_schedule(&self.napi);
     }
@@ -518,7 +518,7 @@ impl VirtioDriver for VirtioNetDriver {
             })?;
         vdev.ready();
         // Buffers were posted before DRIVER_OK; notify only now (spec 3.1.1)
-        if let Some(rx) = device.rx.lock().as_ref() {
+        if let Some(rx) = device.rx.lock().as_mut() {
             rx.vq.kick();
         }
 

@@ -63,8 +63,9 @@ static SYS_BLOCK: Once<Arc<KNode>> = Once::new();
 
 /// Linux genhd_device_init: the class and /sys/block
 pub fn genhd_init() {
+    super::blk_mq::kblockd_init();
     BLOCK_CLASS.register();
-    SYS_BLOCK.call_once(|| crate::fs::sysfs::top_dir(b"block"));
+    SYS_BLOCK.call_once(|| crate::fs::kernfs::sysfs::top_dir(b"block"));
 }
 
 fn bdev_of(dev: &Device) -> Option<&BlockDevice> {
@@ -155,7 +156,7 @@ fn disk_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
             format!("{}\n", b.disk.queue.limits.max_sectors / 2)
         }),
         (b"max_hw_sectors_kb", |b| {
-            format!("{}\n", b.disk.queue.limits.max_sectors / 2)
+            format!("{}\n", b.disk.queue.limits.max_hw_sectors / 2)
         }),
         (b"max_segments", |b| {
             format!("{}\n", b.disk.queue.limits.max_segments)

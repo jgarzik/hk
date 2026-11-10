@@ -19,6 +19,7 @@
 #        QEMU_LOG_DIR      serial log directory (default target/qemu)
 #        QEMU_SMP          guest CPUs (default 4)
 #        QEMU_MEM          guest RAM (default 512M)
+#        HK_CMDLINE        extra kernel parameters (make BENCH=1: hk.bench)
 
 set -euo pipefail
 
@@ -180,7 +181,7 @@ linux_cache_key() {
         tools/fetch-deb.sh tools/qemu-net.sh tools/netpeer tools/cpio-test.sh \
         tools/dyn-root.sh | LC_ALL=C sort -u) || return 1
     {
-        echo "$ARCH $TIMEOUT $SMP $MEM ${KVM[*]} ${QEMU_MACHINE[*]} ${DISK[*]}" &&
+        echo "$ARCH $TIMEOUT $SMP $MEM ${KVM[*]} ${QEMU_MACHINE[*]} ${DISK[*]} ${HK_CMDLINE:-}" &&
             echo "${QEMU_NET[*]//"$TOP"/}" &&
             "$QEMU_BIN" --version &&
             uname -r &&
@@ -207,7 +208,7 @@ echo "Booting boot_tester on Linux ($([ ${#KVM[@]} = 0 ] && echo TCG || echo KVM
 timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
     -m "$MEM" -smp "$SMP" -nographic -no-reboot -monitor none "${QEMU_NET[@]}" "${DISK[@]}" \
     -kernel "$LINUX_KERNEL" -initrd "$WORK/initramfs.cpio" \
-    -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet" \
+    -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet ${HK_CMDLINE:-}" \
     -serial file:"$SERIAL_LOG" </dev/null || true
 
 # Verdicts come from the log without kernel messages: a printk

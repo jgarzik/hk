@@ -13,7 +13,9 @@
 //! to restore the original context.
 
 use crate::signal::siginfo::UserSigInfo;
-use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, sa_flags};
+use crate::signal::{
+    AltStack, SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, UserStack, sa_flags,
+};
 use crate::uaccess::{access_ok, copy_from_user, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::{FromBytes, IntoBytes};
@@ -91,35 +93,6 @@ crate::pod!(SigContext {
 });
 
 // =============================================================================
-// Stack Info (stack_t)
-// =============================================================================
-
-/// Stack info structure (matches Linux stack_t)
-///
-/// Describes an alternate signal stack.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct StackT {
-    /// Stack base address
-    pub ss_sp: u64,
-    /// Flags (SS_DISABLE, SS_ONSTACK, SS_AUTODISARM)
-    pub ss_flags: i32,
-    /// Padding for alignment
-    pub _pad: i32,
-    /// Stack size
-    pub ss_size: u64,
-}
-crate::pod!(StackT {
-    ss_sp,
-    ss_flags,
-    _pad,
-    ss_size
-});
-
-/// Alternate stack is disabled
-pub const SS_DISABLE: i32 = 2;
-
-// =============================================================================
 // User Context (ucontext_t)
 // =============================================================================
 
@@ -134,7 +107,7 @@ pub struct UContext {
     /// Pointer to next context in chain (usually 0)
     pub uc_link: u64,
     /// Alternate signal stack info
-    pub uc_stack: StackT,
+    pub uc_stack: UserStack,
     /// Machine context (saved registers)
     pub uc_mcontext: SigContext,
     /// Signal mask at time of signal
@@ -179,7 +152,6 @@ crate::pod!(RtSigFrame { pretcode, uc, info });
 const _: () = assert!(core::mem::size_of::<SigContext>() == 256);
 const _: () = assert!(core::mem::offset_of!(SigContext, cs) == 144);
 const _: () = assert!(core::mem::offset_of!(SigContext, err) == 152);
-const _: () = assert!(core::mem::size_of::<StackT>() == 24);
 const _: () = assert!(core::mem::size_of::<SigSet>() == 8);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_mcontext) == 40);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_sigmask) == 296);
@@ -224,10 +196,8 @@ const USER_SS: u16 = 0x1b; // RPL=3, index=3
 
 /// Set up signal frame on user stack
 ///
-/// Linux get_sigframe layout, from the interrupted RSP down: the 128-byte
-/// red zone, the FP image (64-byte aligned; `sigcontext.fpstate` points to
-/// it), then the `RtSigFrame` placed so the handler starts as if called
-/// (RSP + 8 is 16-byte aligned; `pretcode` is its "return address").
+/// Placed by [`get_sigframe`] on the interrupted stack or the alternate
+/// one `alt`; `uc_stack` records `alt` (Linux __save_altstack).
 ///
 /// On success the handler runs with the initial FP state, and the task's
 /// pt_regs are redirected to it:
@@ -240,6 +210,7 @@ pub fn setup_rt_frame(
     blocked: SigSet,
     info: &SigInfo,
     trap: &Trap,
+    alt: &AltStack,
     uframe: &crate::arch::UserFrame,
 ) -> KernelResult<()> {
     use super::fpu;
@@ -270,19 +241,9 @@ pub fn setup_rt_frame(
         return Err(KernelError::InvalidArgument);
     };
 
-    // user_rsp is user-controlled: an underflow means no room (EFAULT, and
-    // the caller forces SIGSEGV), never a wrapped address
     let frame_size = signal_frame_size();
     let fp_size = fpu::sigframe_size();
-    let Some(fpstate_addr) = user_rsp.checked_sub(128 + fp_size as u64).map(|a| a & !63) else {
-        return Err(KernelError::BadAddress);
-    };
-    let Some(frame_addr) = fpstate_addr
-        .checked_sub(frame_size as u64)
-        .and_then(|a| (a & !0xF).checked_sub(8))
-    else {
-        return Err(KernelError::BadAddress);
-    };
+    let (fpstate_addr, frame_addr) = get_sigframe(user_rsp, action, alt)?;
     let total = (fpstate_addr + fp_size as u64 - frame_addr) as usize;
 
     // Validate user stack address
@@ -328,12 +289,6 @@ pub fn setup_rt_frame(
         ..FromBytes::zeroed()
     };
 
-    // Build StackT for ucontext (current stack info)
-    let stack_t = StackT {
-        ss_flags: SS_DISABLE,
-        ..FromBytes::zeroed()
-    };
-
     let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
     if fpu::use_xsave() {
         uc_flags |= UC_FP_XSTATE;
@@ -345,7 +300,7 @@ pub fn setup_rt_frame(
         uc: UContext {
             uc_flags,
             uc_link: 0,
-            uc_stack: stack_t,
+            uc_stack: alt.save(),
             uc_mcontext: sigctx,
             uc_sigmask: blocked,
         },
@@ -382,6 +337,33 @@ pub fn setup_rt_frame(
     uframe.set(r);
 
     Ok(())
+}
+
+/// Where a handler frame for `action` goes when `rsp` is interrupted
+/// (Linux get_sigframe): (FP image, `RtSigFrame`). From the 128-byte red
+/// zone below `rsp`, or the top of `alt` when switching to it for
+/// SA_ONSTACK: the FP image (64-byte aligned; `sigcontext.fpstate` points
+/// to it), then the frame placed so the handler starts as if called
+/// (RSP + 8 is 16-byte aligned; `pretcode` is its "return address").
+///
+/// EFAULT (the caller forces SIGSEGV) when it would wrap below 0 or
+/// overflow the alternate stack it is on or enters.
+fn get_sigframe(rsp: u64, action: &SigAction, alt: &AltStack) -> KernelResult<(u64, u64)> {
+    let nested = alt.on(rsp);
+    // Below the red zone, or the alternate stack
+    let (sp, entering) = alt.sigsp(rsp.wrapping_sub(128), action.flags);
+    let fpstate = sp
+        .checked_sub(super::fpu::sigframe_size() as u64)
+        .map(|a| a & !63)
+        .ok_or(KernelError::BadAddress)?;
+    let frame = fpstate
+        .checked_sub(signal_frame_size() as u64)
+        .and_then(|a| (a & !0xF).checked_sub(8))
+        .ok_or(KernelError::BadAddress)?;
+    if (nested || entering) && !alt.contains(frame) {
+        return Err(KernelError::BadAddress);
+    }
+    Ok((fpstate, frame))
 }
 
 /// Load the FP state saved at `fpstate` by [`setup_rt_frame`] (0 = none:
@@ -489,6 +471,7 @@ pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     // No syscall to restart from here on (Linux: regs->orig_ax = -1)
     regs.orig_rax = u64::MAX;
     frame.set(r);
+    crate::signal::syscall::restore_altstack(&uc.uc_stack, sc.rsp);
 
     // Return RAX from saved context
     // This allows signal handler to modify the return value

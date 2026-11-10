@@ -27,6 +27,7 @@ pub mod console;
 pub mod cpu;
 pub mod entry;
 pub mod irq;
+pub mod irq_stack;
 mod ksysfs;
 pub mod printk;
 pub mod selftest;
@@ -296,16 +297,29 @@ pub(crate) fn kmain() -> ! {
     // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
     // (chr_dev_init), then device initcalls (bus probes below)
     mnt_init();
-    fs::devtmpfs::init();
+    // start_kernel's nsfs_init, after proc_root_init
+    pseudo_init(&fs::pseudo::NSFS);
+    fs::ramfs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();
+    // sock_init, a core initcall after kernel/'s (ksysfs)
+    pseudo_init(&fs::pseudo::SOCKFS);
     base::topology_init();
     net::sysfs::net_sysfs_init();
+    // fs initcalls: init_pipe_fs, anon_inode_init, then drivers/'s
+    // chr_dev_init
+    pseudo_init(&fs::pseudo::PIPEFS);
+    if let Err(e) = fs::anon_inodes::anon_inode_init() {
+        printkln!("ERR: anon_inodefs: {:?}", e);
+    }
     chr_dev_init();
 
     // Device initcalls (Linux order: buses scanned, drivers registered,
     // each registration probing what it matches; a probe may register
     // child devices, probed in turn)
+    // Linux subsys_initcall order (mm/ before block/): default_bdi_init,
+    // then genhd_device_init
+    mm::writeback::default_bdi_init();
     block::genhd::genhd_init();
     CurrentArch::platform_init();
     hw::pci::pci_scan();
@@ -333,19 +347,21 @@ pub(crate) fn kmain() -> ! {
     // ========================================================================
     // Phase 6: Initramfs Unpacking
     // ========================================================================
-    let initramfs_data = CurrentArch::get_initramfs();
+    let initrd = CurrentArch::get_initramfs();
     let root_dentry = crate::ns::init_mnt_ns()
         .root_path()
         .expect("VFS root not initialized")
         .dentry
         .clone();
-    match fs::unpack_cpio(initramfs_data, &root_dentry) {
+    match fs::ramfs::cpio::unpack_cpio(initrd.data(), &root_dentry) {
         Ok(n) => printkln!("initramfs: {} files", n),
         Err(e) => {
             printkln!("ERR: initramfs: {:?}", e);
             CurrentArch::halt_loop();
         }
     }
+    // Everything was copied out (Linux do_populate_rootfs)
+    initrd.free();
 
     // ========================================================================
     // Phase 6b: Graphics Console Initialization
@@ -448,7 +464,12 @@ fn mnt_init() {
     use fs::{init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
-    fs::sysfs::init();
+    fs::kernfs::sysfs::init();
+    // The kernel's tmpfs (Linux shmem_init, before init_rootfs and
+    // init_mount_tree)
+    if let Err(e) = fs::ramfs::tmpfs::shmem_init() {
+        printkln!("ERR: tmpfs: {:?}", e);
+    }
     let root_mount = match fs::mount::init_mount_tree() {
         Ok(m) => m,
         Err(e) => {
@@ -458,6 +479,13 @@ fn mnt_init() {
     };
     fs::DCACHE.set_root(root_mount.root.clone());
     let _ = ramfs_create_dir(&root_mount.root, b"dev");
+}
+
+/// Mount a pseudo filesystem for the kernel (Linux kern_mount)
+fn pseudo_init(p: &'static fs::pseudo::Pseudo) {
+    if let Err(e) = p.init() {
+        printkln!("ERR: pseudo fs: {:?}", e);
+    }
 }
 
 /// Memory and tty character devices (Linux chr_dev_init, fs_initcall)

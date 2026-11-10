@@ -34,13 +34,15 @@
 //!   (Linux 6.10+) or socket is EAGAIN (Linux FMODE_NOWAIT), not EOPNOTSUPP
 //! - RW_STRADDLE: read/write with one buffer running off mapped memory
 //!   mid-page move the mapped part and return its length
+//! - FSTAT_EBADF_FIRST: fstat/fstatfs of a bad fd into a bad buffer is
+//!   EBADF (Linux looks the fd up before copying out)
 
 use crate::harness::{fail_num, pass};
-use crate::helpers::{host_mode, print, print_num, println};
+use crate::helpers::{print, print_num, println};
 use hk_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, FIOCLEX, FIONBIO, FIONCLEX, IoVec, LinuxStatFs, MAP_ANONYMOUS,
     MAP_PRIVATE, MAP_SHARED, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC,
-    PROT_READ, RAMFS_MAGIC, STATX_BASIC_STATS, Statx, sys_close, sys_fcntl, sys_fstatfs,
+    PROT_READ, STATX_BASIC_STATS, Stat, Statx, sys_close, sys_fcntl, sys_fstat, sys_fstatfs,
     sys_ftruncate, sys_getrandom, sys_ioctl, sys_lseek, sys_mmap, sys_munmap, sys_open, sys_pipe2,
     sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
     sys_readv, sys_statfs, sys_statx, sys_unlink, sys_write, sys_writev,
@@ -100,6 +102,7 @@ pub fn run_tests() {
     test_statfs_proc();
     test_statfs_enoent();
     test_fstatfs();
+    test_fstat_ebadf_first();
     test_statx_basic();
     test_statx_at_empty_path();
     // Generic ioctl tests
@@ -1237,10 +1240,10 @@ fn test_statfs_root() {
         return;
     }
 
-    // Verify we got valid data (ramfs magic; Linux's initramfs root is tmpfs)
-    if buf.f_type != RAMFS_MAGIC && !(host_mode() && buf.f_type == TMPFS_MAGIC) {
-        print(b"STATFS_ROOT:FAIL: expected ramfs magic ");
-        print_num(RAMFS_MAGIC);
+    // The initramfs root is tmpfs (Linux rootfs with CONFIG_TMPFS)
+    if buf.f_type != TMPFS_MAGIC {
+        print(b"STATFS_ROOT:FAIL: expected tmpfs magic ");
+        print_num(TMPFS_MAGIC);
         print(b", got ");
         print_num(buf.f_type);
         println(b"");
@@ -1319,13 +1322,28 @@ fn test_fstatfs() {
         return;
     }
 
-    // Verify we got ramfs magic (root fs; tmpfs on a Linux host)
-    if buf.f_type != RAMFS_MAGIC && !(host_mode() && buf.f_type == TMPFS_MAGIC) {
-        fail_num(b"FSTATFS:FAIL: expected ramfs magic, got ", buf.f_type);
+    // The root is tmpfs
+    if buf.f_type != TMPFS_MAGIC {
+        fail_num(b"FSTATFS:FAIL: expected tmpfs magic, got ", buf.f_type);
         return;
     }
 
     pass(b"FSTATFS");
+}
+
+/// fstat/fstatfs of a closed fd into a kernel-half buffer: EBADF, not
+/// EFAULT (Linux newfstat/fstatfs: vfs_fstat/fd_statfs, then the copy)
+fn test_fstat_ebadf_first() {
+    let bad = usize::MAX & !0xfff;
+    let r1 = sys_fstat(-1, bad as *mut Stat);
+    let r2 = sys_fstatfs(-1, bad as *mut LinuxStatFs);
+    if r1 != -9 {
+        fail_num(b"FSTAT_EBADF_FIRST:FAIL: fstat got ", r1);
+    } else if r2 != -9 {
+        fail_num(b"FSTAT_EBADF_FIRST:FAIL: fstatfs got ", r2);
+    } else {
+        pass(b"FSTAT_EBADF_FIRST");
+    }
 }
 
 /// statx() basic usage

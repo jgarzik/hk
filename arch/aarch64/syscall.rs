@@ -56,6 +56,7 @@ pub const SYS_FCHOWN: u64 = 55;
 pub const SYS_OPENAT: u64 = 56;
 pub const SYS_CLOSE: u64 = 57;
 pub const SYS_CLOSE_RANGE: u64 = 436;
+pub const SYS_OPENAT2: u64 = 437;
 pub const SYS_GETDENTS64: u64 = 61;
 pub const SYS_LSEEK: u64 = 62;
 pub const SYS_READ: u64 = 63;
@@ -196,6 +197,20 @@ pub const SYS_EPOLL_PWAIT: u64 = 22;
 /// epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)
 pub const SYS_EPOLL_PWAIT2: u64 = 441;
 
+// Linux native AIO (Section 9.3)
+/// io_setup(nr_events, ctxp)
+pub const SYS_IO_SETUP: u64 = 0;
+/// io_destroy(ctx)
+pub const SYS_IO_DESTROY: u64 = 1;
+/// io_getevents(ctx, min_nr, nr, events, timeout)
+pub const SYS_IO_GETEVENTS: u64 = 4;
+/// io_submit(ctx, nr, iocbpp)
+pub const SYS_IO_SUBMIT: u64 = 2;
+/// io_cancel(ctx, iocb, result)
+pub const SYS_IO_CANCEL: u64 = 3;
+/// io_pgetevents(ctx, min_nr, nr, events, timeout, usig)
+pub const SYS_IO_PGETEVENTS: u64 = 292;
+
 // io_uring syscalls (Section 9.3)
 /// io_uring_setup(entries, params)
 pub const SYS_IO_URING_SETUP: u64 = 425;
@@ -319,6 +334,8 @@ pub const SYS_RT_SIGSUSPEND: u64 = 133;
 pub const SYS_RT_TGSIGQUEUEINFO: u64 = 240;
 
 // Memory barrier syscall
+/// memfd_create(name, flags)
+pub const SYS_MEMFD_CREATE: u64 = 279;
 pub const SYS_MEMBARRIER: u64 = 283;
 
 // File readahead syscall
@@ -565,6 +582,7 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_CLONE3 => Sys::Clone3,
         SYS_CLOSE => Sys::Close,
         SYS_CLOSE_RANGE => Sys::CloseRange,
+        SYS_OPENAT2 => Sys::Openat2,
         SYS_CONNECT => Sys::Connect,
         SYS_COPY_FILE_RANGE => Sys::CopyFileRange,
         SYS_DUP => Sys::Dup,
@@ -639,6 +657,12 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_IOPRIO_SET => Sys::IoprioSet,
         SYS_IO_URING_ENTER => Sys::IoUringEnter,
         SYS_IO_URING_REGISTER => Sys::IoUringRegister,
+        SYS_IO_SETUP => Sys::IoSetup,
+        SYS_IO_DESTROY => Sys::IoDestroy,
+        SYS_IO_GETEVENTS => Sys::IoGetevents,
+        SYS_IO_SUBMIT => Sys::IoSubmit,
+        SYS_IO_CANCEL => Sys::IoCancel,
+        SYS_IO_PGETEVENTS => Sys::IoPgetevents,
         SYS_IO_URING_SETUP => Sys::IoUringSetup,
         SYS_KCMP => Sys::Kcmp,
         SYS_KEXEC_LOAD => Sys::KexecLoad,
@@ -655,6 +679,7 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_MADVISE => Sys::Madvise,
         SYS_MBIND => Sys::Mbind,
         SYS_MEMBARRIER => Sys::Membarrier,
+        SYS_MEMFD_CREATE => Sys::MemfdCreate,
         SYS_MIGRATE_PAGES => Sys::MigratePages,
         SYS_MINCORE => Sys::Mincore,
         SYS_MKDIRAT => Sys::Mkdirat,

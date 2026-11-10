@@ -4,9 +4,11 @@
 //! Each disk has a [`BdiWriteback`] (Linux bdi_writeback): the devices
 //! (the disk or its partitions) with dirty data, and a delayed work item
 //! on `BDI_WORKQUEUE` that writes them back about every 5 seconds (Linux
-//! dirty_writeback_centisecs 500): first the dirty inodes of every
-//! filesystem mounted from the device (`fs_writeback::writeback_dev`),
-//! then the device's own cache (metadata, device-node writes).
+//! dirty_writeback_centisecs 500): what became dirty over 30 seconds
+//! before (dirty_expire_centisecs 3000; everything past the background
+//! limit), first the dirty inodes of every filesystem mounted from the
+//! device (`fs_writeback::writeback_dev`), then the device's own cache
+//! (metadata, device-node writes); younger data re-arms the work.
 //!
 //! Locking: `BDI_REGISTRY`, `BdiWriteback.dirty` and the work item are
 //! spin leaves; writeback runs in the worker thread with none held.
@@ -16,7 +18,7 @@ extern crate alloc;
 use crate::util::kalloc::arc_nofail;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::block::blkdev::DevId;
 use crate::sync::spin::{Mutex, RwLock};
@@ -34,6 +36,15 @@ fn interval() -> u64 {
 pub static BDI_WORKQUEUE: Workqueue =
     Workqueue::new("bdi", wq_flags::WQ_MEM_RECLAIM | wq_flags::WQ_UNBOUND);
 
+/// Start the writeback workqueue's worker (Linux default_bdi_init, a
+/// subsys_initcall allocating bdi_wq): before any disk is registered,
+/// after the workqueues can run
+pub fn default_bdi_init() {
+    if let Err(e) = BDI_WORKQUEUE.start(None) {
+        crate::printkln!("writeback: no bdi worker ({:?}): no periodic writeback", e);
+    }
+}
+
 /// Per-disk writeback state, by the disk's device number
 static BDI_REGISTRY: RwLock<BTreeMap<DevId, Arc<BdiWriteback>>> = RwLock::new(BTreeMap::new());
 
@@ -44,19 +55,23 @@ pub struct BdiWriteback {
     /// Devices of the disk with dirty data
     dirty: Mutex<BTreeSet<DevId>>,
     /// The periodic writeback
-    dwork: Arc<Mutex<DelayedWork>>,
+    dwork: Arc<crate::sync::IrqSpinlock<DelayedWork>>,
+    /// The next pass writes everything, however young (background
+    /// writeback past the background limit, Linux WB_REASON_BACKGROUND)
+    background: AtomicBool,
 }
 
 impl BdiWriteback {
     fn new(dev_id: DevId) -> Self {
         // `bdi_register`'s: not plumbed
-        let dwork = arc_nofail(Mutex::new(DelayedWork::new(move || {
+        let dwork = arc_nofail(crate::sync::IrqSpinlock::new(DelayedWork::new(move || {
             do_device_writeback(dev_id);
         })));
         Self {
             dev_id,
             dirty: Mutex::new(BTreeSet::new()),
             dwork,
+            background: AtomicBool::new(false),
         }
     }
 
@@ -78,6 +93,7 @@ impl BdiWriteback {
     /// wb_start_background_writeback)
     pub fn wakeup(&self, dev: DevId) {
         self.dirty.lock().insert(dev);
+        self.background.store(true, Ordering::Release);
         BDI_WORKQUEUE.mod_delayed_work(&self.dwork, 0);
     }
 }
@@ -87,11 +103,18 @@ fn do_device_writeback(disk: DevId) {
     let Some(bdi) = get_bdi(disk) else {
         return;
     };
+    let cutoff = if bdi.background.swap(false, Ordering::AcqRel) {
+        u64::MAX
+    } else {
+        let expire_ns = EXPIRE_CS.load(Ordering::Relaxed).saturating_mul(10_000_000);
+        crate::time::monotonic_ns().saturating_sub(expire_ns)
+    };
     let devs = core::mem::take(&mut *bdi.dirty.lock());
     for dev in devs {
-        crate::fs::fs_writeback::writeback_dev(dev);
-        if let Some(b) = crate::block::get_blkdev(dev) {
-            let _ = crate::block::blkdev::sync_blockdev(&b);
+        // Younger data waits for a later pass (Linux wb_workfn re-arms
+        // while the wb has dirty I/O)
+        if crate::fs::fs_writeback::writeback_dev(dev, cutoff) {
+            bdi.kick(dev);
         }
     }
 }
@@ -106,8 +129,8 @@ static BG_RATIO: AtomicU64 = AtomicU64::new(10);
 static BG_BYTES: AtomicU64 = AtomicU64::new(0);
 static DIRTY_RATIO: AtomicU64 = AtomicU64::new(20);
 static DIRTY_BYTES: AtomicU64 = AtomicU64::new(0);
-/// vm.dirty_expire_centisecs (stored; hk writes every dirty inode of a
-/// device at each pass) and vm.dirty_writeback_centisecs
+/// vm.dirty_expire_centisecs (the periodic writeback takes data older
+/// than it) and vm.dirty_writeback_centisecs (its interval)
 static EXPIRE_CS: AtomicU64 = AtomicU64::new(3000);
 static WRITEBACK_CS: AtomicU64 = AtomicU64::new(500);
 

@@ -660,7 +660,7 @@ pub fn sys_fanotify_mark(
         // AT_FDCWD
         crate::task::percpu::current_cwd()
     } else {
-        fget(dirfd)?.f_path()
+        crate::fs::io::fget_raw(dirfd)?.f_path()
     };
 
     // Set up lookup flags

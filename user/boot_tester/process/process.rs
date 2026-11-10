@@ -6,7 +6,7 @@
 //! - clone, fork, vfork
 //! - waitid, execve
 
-use crate::harness::{fail_num, pass};
+use crate::harness::{R, check, fail_num, pass, report_r};
 use crate::helpers::{print, print_num, println};
 use hk_syscall::Zeroable;
 #[cfg(target_arch = "x86_64")]
@@ -90,6 +90,7 @@ pub fn run_tests() {
     test_brk_shrink();
     // I/O priority syscalls
     test_ioprio_get_set();
+    report_r(b"IOPRIO_NONE_LEVEL", ioprio_none_level());
     // TLS syscalls
     #[cfg(target_arch = "x86_64")]
     test_arch_prctl();
@@ -1721,6 +1722,19 @@ fn test_ioprio_get_set() {
         print_num(got);
         println(b"");
     }
+}
+
+/// IOPRIO_CLASS_NONE: a nonzero level is EINVAL, hint bits (above the
+/// level) are not (Linux ioprio_check_cap checks IOPRIO_PRIO_LEVEL)
+fn ioprio_none_level() -> R {
+    let old = sys_ioprio_get(IOPRIO_WHO_PROCESS, 0);
+    check(b"get", old >= 0, old)?;
+    let r = sys_ioprio_set(IOPRIO_WHO_PROCESS, 0, 1);
+    check(b"NONE level 1", r == -22, r)?;
+    let r = sys_ioprio_set(IOPRIO_WHO_PROCESS, 0, 1 << 3);
+    check(b"NONE with a hint", r == 0, r)?;
+    let r = sys_ioprio_set(IOPRIO_WHO_PROCESS, 0, old as i32);
+    check(b"restore", r == 0, r)
 }
 
 // =============================================================================

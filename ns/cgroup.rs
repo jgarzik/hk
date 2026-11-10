@@ -15,8 +15,8 @@
 
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
-use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use spin::Lazy;
 
 use crate::cgroup::{CGROUP_ROOT, Cgroup};
@@ -62,38 +62,10 @@ impl CgroupNamespace {
         Self::new(new_root)
     }
 
-    /// Translate an absolute cgroup path to a namespace-relative path
-    ///
-    /// Given a cgroup in the real hierarchy, returns the path as seen
-    /// from within this namespace.
-    ///
-    /// Returns "/" if the cgroup is the namespace root.
-    /// Returns "/../.." style path if the cgroup is an ancestor of the root.
-    pub fn translate_path(&self, cgroup: &Arc<Cgroup>) -> String {
-        // If cgroup is the namespace root, return "/"
-        if Arc::ptr_eq(cgroup, &self.root) {
-            return String::from("/");
-        }
-
-        // Check if cgroup is a descendant of the namespace root
-        if cgroup.is_descendant_of(&self.root) {
-            // Build relative path from root
-            let cgroup_path = cgroup.path();
-            let root_path = self.root.path();
-
-            // Strip the root prefix
-            if let Some(relative) = cgroup_path.strip_prefix(&root_path) {
-                if relative.is_empty() || relative == "/" {
-                    return String::from("/");
-                }
-                return String::from(relative);
-            }
-            return cgroup_path;
-        }
-
-        // Cgroup is an ancestor of the root or in a different subtree
-        // Return the absolute path (escape the namespace)
-        cgroup.path()
+    /// The path of `cgroup` seen from this namespace (Linux
+    /// cgroup_path_ns): from its root, "/.." for each level up
+    pub fn translate_path(&self, cgroup: &Cgroup) -> Vec<u8> {
+        cgroup.path_from(&self.root)
     }
 
     /// Check if a cgroup is visible in this namespace
@@ -108,11 +80,7 @@ impl CgroupNamespace {
 fn create_placeholder_root() -> Arc<Cgroup> {
     // This is called before cgroup_init(), so we create a minimal placeholder
     // It will be replaced when the real root is created
-    Cgroup::new_root(
-        0,
-        String::new(),
-        &arc_nofail(crate::cgroup::CgroupRoot::new()),
-    )
+    Cgroup::new_root(0, Vec::new(), &arc_nofail(crate::cgroup::CgroupRoot::new()))
 }
 
 /// Initial (root) cgroup namespace

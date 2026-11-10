@@ -1271,6 +1271,12 @@ pub const O_CLOEXEC: u32 = 0o2000000;
 /// O_EXCL flag for exclusive creation
 pub const O_EXCL: u32 = 0o200;
 
+/// __O_TMPFILE (asm-generic, both arches); O_TMPFILE adds O_DIRECTORY
+pub const __O_TMPFILE: u32 = 0o20000000;
+
+/// O_PATH (asm-generic, both arches): a path-only descriptor
+pub const O_PATH: u32 = 0o10000000;
+
 // ============================================================================
 // Futex waitv types and constants (Linux 5.16+)
 // ============================================================================

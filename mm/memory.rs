@@ -32,7 +32,7 @@ pub fn put_page(phys: u64) {
 /// leaves the cache when no swap PTE needs its slot either
 fn zap_page(phys: u64) {
     super::rmap::page_remove_rmap(phys);
-    super::swap_state::free_swap_cache(phys);
+    super::swap::swap_state::free_swap_cache(phys);
     crate::FRAME_ALLOCATOR.decref(phys);
 }
 
@@ -49,7 +49,7 @@ pub(super) fn zap_leaf(leaf: Leaf) {
         Leaf::Page(p) => zap_page(p),
         Leaf::Huge(p) => put_huge(p),
         Leaf::Swap(pte) if SwapEntry::is_swap_pte(pte) => {
-            super::swap::free_swap_and_cache(SwapEntry::from_pte(pte))
+            super::swap::swapfile::free_swap_and_cache(SwapEntry::from_pte(pte))
         }
         Leaf::Swap(_) => {}
     }
@@ -71,6 +71,8 @@ pub(super) fn exit_mmap(mm: &Mm) {
     // (Linux exit_mmap), so no `PgTables` of this mm lives meanwhile.
     let mut map = mm.mmap_write();
     let vmas: Vec<_> = map.take_vmas();
+    // The executable's path too (Linux mmput: set_mm_exe_file(mm, NULL))
+    let exe = map.take_exe();
     let mut tlb = Gather::new_full(mm);
     tlb.free_tables(super::pgtable::detach_user(mm, &mut map));
     drop(tlb);
@@ -78,6 +80,7 @@ pub(super) fn exit_mmap(mm: &Mm) {
     // VMAs go last, outside any lock: they may hold the last reference
     // to a mapped file
     drop(vmas);
+    drop(exe);
 }
 
 /// Clear the entries of [start, end) of `t`, the tables of the gather's
@@ -127,7 +130,7 @@ impl PteWalk for Zap<'_, '_> {
         if paging::pte_present(pte) {
             self.tlb.remove_page(addr, paging::pte_addr(pte));
         } else if SwapEntry::is_swap_pte(pte) {
-            super::swap::free_swap_and_cache(SwapEntry::from_pte(pte));
+            super::swap::swapfile::free_swap_and_cache(SwapEntry::from_pte(pte));
         }
         Ok(())
     }
@@ -232,10 +235,14 @@ pub fn next_swap_pte(t: PgTables<'_>, addr: u64, end: u64, ty: u8) -> Option<u64
 /// `src_mm`, into the child's tables `dst`, those of `dst_mm` (Linux
 /// copy_page_range), under both mm locks (dup_mm). A shared mapping
 /// keeps sharing its pages; a private one shares them copy-on-write,
-/// read-only in both; a swap PTE is copied with another slot reference
-/// (`swap::swap_duplicate`). A 2MB page is split first so that its 4KB
-/// pages are copied one by one. Returns whether a parent PTE lost write
-/// permission (its TLB needs a flush).
+/// read-only in both, except a page the parent owns alone that may be
+/// pinned for DMA: the child gets a copy and the parent keeps the page,
+/// writable (Linux copy_present_page, page_needs_cow_for_dma), so a
+/// device's write still lands in the page the parent sees. A swap PTE is
+/// copied with another slot reference (`swap::swap_duplicate`). A 2MB
+/// page is split first so that its 4KB pages are copied one by one.
+/// Returns whether a parent PTE lost write permission (its TLB needs a
+/// flush).
 pub fn copy_page_range(
     dst: PgTables<'_>,
     dst_mm: &Mm,
@@ -248,11 +255,39 @@ pub fn copy_page_range(
         dst,
         dst_mm,
         src_mm,
+        vma,
         cow: !vma.is_shared(),
         wp: false,
+        spare: None,
     };
-    walk_pte_range(src, vma.start, vma.end, &mut c)?;
-    Ok(c.wp)
+    let mut from = vma.start;
+    let r = loop {
+        match walk_pte_range(src, from, vma.end, &mut c) {
+            Ok(()) => break Ok(c.wp),
+            // A pinned page needs a copy: allocate it with no lock but
+            // the mm locks held (it may reclaim), and go on from there
+            // (Linux copy_pte_range's -EAGAIN and folio_prealloc)
+            Err(CopyErr::Page(at)) => match super::fault::alloc_user() {
+                Some(p) => {
+                    c.spare = Some(p);
+                    from = at;
+                }
+                None => break Err(KernelError::OutOfMemory),
+            },
+            Err(CopyErr::Oom) => break Err(KernelError::OutOfMemory),
+        }
+    };
+    if let Some(p) = c.spare {
+        FRAME_ALLOCATOR.free(p);
+    }
+    r
+}
+
+/// Why `copy_page_range`'s walk stopped
+enum CopyErr {
+    Oom,
+    /// The entry at this address needs a page for the child's copy
+    Page(u64),
 }
 
 /// `copy_page_range`'s walk
@@ -260,15 +295,18 @@ struct CopyRange<'a> {
     dst: PgTables<'a>,
     dst_mm: &'a Mm,
     src_mm: &'a Mm,
+    vma: &'a Vma,
     cow: bool,
     wp: bool,
+    /// A page for the next pinned page's copy
+    spare: Option<u64>,
 }
 
 impl PteWalk for CopyRange<'_> {
-    type Err = KernelError;
+    type Err = CopyErr;
 
-    fn huge(&mut self, pmd: Pmd<'_>, _: u64, _: u64) -> KernelResult<bool> {
-        split_huge_pmd(self.src_mm, pmd).ok_or(KernelError::OutOfMemory)?;
+    fn huge(&mut self, pmd: Pmd<'_>, _: u64, _: u64) -> Result<bool, CopyErr> {
+        split_huge_pmd(self.src_mm, pmd).ok_or(CopyErr::Oom)?;
         Ok(false)
     }
 
@@ -280,27 +318,68 @@ impl PteWalk for CopyRange<'_> {
     /// The child's table, allocated before the parent's PTE lock is
     /// taken (Linux copy_pte_range: pte_alloc_map_lock of the child
     /// first)
-    fn prepare(&mut self, addr: u64, _end: u64) -> KernelResult<()> {
+    fn prepare(&mut self, addr: u64, _end: u64) -> Result<(), CopyErr> {
         self.dst
             .pte_alloc(self.dst_mm, addr)
             .map(|_| ())
-            .ok_or(KernelError::OutOfMemory)
+            .ok_or(CopyErr::Oom)
     }
 
-    fn ptes(&mut self, r: &PteRange<'_>) -> KernelResult<()> {
+    fn ptes(&mut self, r: &PteRange<'_>) -> Result<(), CopyErr> {
         if r.iter().all(|(_, e)| e.load(Ordering::Acquire) == 0) {
             return Ok(());
         }
-        let d = self
-            .dst
-            .pte(r.start)
-            .ok_or(KernelError::OutOfMemory)?
-            .lock();
+        let d = self.dst.pte(r.start).ok_or(CopyErr::Oom)?.lock();
         for (a, se) in r.iter() {
-            self.wp |= copy_pte(d.entry(a), se, self.cow)?;
+            if self.cow && needs_cow_for_dma(se.load(Ordering::Acquire)) {
+                let new = self.spare.take().ok_or(CopyErr::Page(a))?;
+                copy_pinned(d.entry(a), se, new, a, self.vma);
+                continue;
+            }
+            self.wp |= copy_pte(d.entry(a), se, self.cow).map_err(|_| CopyErr::Oom)?;
         }
         Ok(())
     }
+}
+
+/// The present private entry `pte` maps a page its mapping owns alone
+/// and that may be pinned (Linux folio_needs_cow_for_dma, after
+/// folio_try_dup_anon_rmap failed): fork must not share it. Stable under
+/// the parent's PTE lock, which a pin takes.
+fn needs_cow_for_dma(pte: u64) -> bool {
+    if !paging::pte_present(pte) {
+        return false;
+    }
+    let phys = paging::pte_addr(pte);
+    phys_to_page(phys).is_some_and(|p| p.anon_exclusive()) && super::gup::maybe_dma_pinned(phys)
+}
+
+/// Give the child at `addr` a copy, in the fresh page `new`, of the
+/// pinned page the parent entry `sp` maps (Linux copy_present_page):
+/// the child's own page, with the mapping's protection; the parent's
+/// entry and page stay as they are. Both PTE locks held.
+fn copy_pinned(dp: &AtomicU64, sp: &AtomicU64, new: u64, addr: u64, vma: &Vma) {
+    let pte = sp.load(Ordering::Acquire);
+    let old = paging::pte_addr(pte);
+    // SAFETY: `new` is ours; `old` stays mapped and referenced (parent
+    // PTE lock held). A device writing it meanwhile gives the child a
+    // copy from some moment of the I/O, as Linux's copy does.
+    unsafe { super::page::copy_page(new, old) };
+    paging::sync_page(new, paging::pte_exec(pte));
+    if let Some(av) = vma
+        .anon_vma
+        .as_ref()
+        .filter(|_| phys_to_page(old).is_some_and(|p| p.is_anon()))
+    {
+        super::rmap::page_add_anon_rmap(new, av, vma.index_of(addr));
+        super::swap::lru::lru_add(new);
+    }
+    if let Some(pg) = phys_to_page(new) {
+        pg.set_anon_exclusive();
+    }
+    // The parent's entry with the child's page: its protection (a
+    // protnone entry stays protnone), dirty and accessed bits
+    dp.store((pte & !paging::PTE_ADDR_MASK) | new, Ordering::Release);
 }
 
 /// Copy the parent PTE `sp` into the child's `dp` (Linux
@@ -316,7 +395,7 @@ fn copy_pte(dp: &AtomicU64, sp: &AtomicU64, cow: bool) -> KernelResult<bool> {
             // The child's PTE references the slot too (Linux
             // copy_nonpresent_pte: swap_duplicate); a full count is
             // ENOMEM (Linux would chain a count continuation)
-            if !super::swap::swap_duplicate(SwapEntry::from_pte(pte)) {
+            if !super::swap::swapfile::swap_duplicate(SwapEntry::from_pte(pte)) {
                 return Err(KernelError::OutOfMemory);
             }
             dp.store(pte, Ordering::Release);
@@ -324,6 +403,12 @@ fn copy_pte(dp: &AtomicU64, sp: &AtomicU64, cow: bool) -> KernelResult<bool> {
         return Ok(false);
     }
     let mut child = pte;
+    if cow {
+        // Shared copy-on-write from now on: no longer the parent's alone
+        if let Some(pg) = phys_to_page(paging::pte_addr(pte)) {
+            pg.clear_flag(super::page::PG_ANON_EXCL);
+        }
+    }
     if cow && !paging::pte_cow(pte) {
         // Under the PTE lock only the MMU changes the entry (accessed /
         // dirty bits, each set once): retry with them

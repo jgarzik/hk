@@ -12,9 +12,9 @@
 //! Note: rt_sigreturn (15) is implemented in arch-specific signal.rs files
 
 use crate::signal::{
-    KillSig, SendInfo, SigAction, SigInfo, SigSet, Signal, UserSigInfo, dequeue_signal,
-    get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info, si_code,
-    with_task_signal_state,
+    AltStack, KillSig, SendInfo, SigAction, SigInfo, SigSet, Signal, UserSigInfo, UserStack,
+    dequeue_signal, get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info,
+    si_code, ss_flags, with_task_signal_state,
 };
 use crate::task::percpu::{TaskRef, current, current_pgid, current_tid, get_all_pids};
 use crate::time::time_syscall::LinuxTimespec;
@@ -545,7 +545,7 @@ fn sleep_until_signal(deadline: Option<u64>) {
     use crate::time::hrtimer::{HrClock, schedule_hrtimeout};
     loop {
         set_current_state(SleepState::Interruptible);
-        if crate::sync::waitqueue::signal_pending() {
+        if crate::sync::waitqueue::signal_pending_run_work() {
             break;
         }
         if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
@@ -555,22 +555,6 @@ fn sleep_until_signal(deadline: Option<u64>) {
     }
     set_current_state(SleepState::Running);
 }
-
-/// User `stack_t` (sigaltstack)
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct UserStack {
-    ss_sp: u64,
-    ss_flags: i32,
-    _pad: i32,
-    ss_size: u64,
-}
-crate::pod!(UserStack {
-    ss_sp,
-    ss_flags,
-    _pad,
-    ss_size
-});
 
 /// sigaltstack(ss, oss): set and/or read the alternate signal stack;
 /// either pointer may be NULL
@@ -589,53 +573,65 @@ pub fn sys_sigaltstack(ss: UserPtr<UserStack>, oss: UserPtr<UserStack>) -> Kerne
 }
 
 /// Install `new` (if any) as the alternate stack of a thread at
-/// `user_sp` (Linux do_sigaltstack); the stack it had
+/// `user_sp` (Linux do_sigaltstack); the stack it had. Errors: EPERM
+/// (running on it), EINVAL (mode), ENOMEM (below MINSIGSTKSZ).
 fn do_sigaltstack(
     state: &mut crate::signal::TaskSignalState,
     new: Option<UserStack>,
     user_sp: u64,
 ) -> KernelResult<UserStack> {
-    use crate::signal::{AltStack, MINSIGSTKSZ, ss_flags};
-    let alt = &state.altstack;
-    let on_stack = alt.is_enabled() && {
-        let end = alt.ss_sp.saturating_add(alt.ss_size as u64);
-        (alt.ss_sp..end).contains(&user_sp)
-    };
+    let alt = state.altstack;
     let old = UserStack {
         ss_sp: alt.ss_sp,
-        ss_flags: alt.ss_flags | if on_stack { ss_flags::SS_ONSTACK } else { 0 },
+        ss_flags: alt.flags_at(user_sp) | (alt.ss_flags & ss_flags::SS_FLAG_BITS),
         _pad: 0,
         ss_size: alt.ss_size as u64,
     };
-    let Some(new) = new else {
-        return Ok(old);
-    };
-    // Cannot change while on signal stack
-    if on_stack {
+    if let Some(new) = new {
+        state.altstack = sas_new(&alt, &new, user_sp)?;
+    }
+    Ok(old)
+}
+
+/// rt_sigreturn: the frame's `uc_stack` becomes the alternate stack
+/// again, judged from the restored `sp` (Linux restore_altstack: its
+/// errors are ignored)
+pub fn restore_altstack(uss: &UserStack, sp: u64) {
+    with_task_signal_state(&current(), |state| {
+        let _ = do_sigaltstack(state, Some(*uss), sp);
+    });
+}
+
+/// The alternate stack `new` asks for, replacing `alt` of a thread at
+/// `user_sp` (Linux do_sigaltstack's checks; SS_ONSTACK as the mode
+/// enables it like 0)
+fn sas_new(alt: &AltStack, new: &UserStack, user_sp: u64) -> KernelResult<AltStack> {
+    if alt.on(user_sp) {
         return Err(KernelError::NotPermitted);
     }
-    // Only SS_DISABLE and SS_FLAG_BITS are valid
     let mode = new.ss_flags & !ss_flags::SS_FLAG_BITS;
-    if mode != 0 && mode != ss_flags::SS_DISABLE {
+    if mode != 0 && mode != ss_flags::SS_ONSTACK && mode != ss_flags::SS_DISABLE {
         return Err(KernelError::InvalidArgument);
     }
-    state.altstack = if mode == ss_flags::SS_DISABLE {
-        AltStack {
+    // The same stack again is no change, whatever its size
+    if (alt.ss_sp, alt.ss_size as u64, alt.ss_flags) == (new.ss_sp, new.ss_size, new.ss_flags) {
+        return Ok(*alt);
+    }
+    if mode == ss_flags::SS_DISABLE {
+        return Ok(AltStack {
             ss_sp: 0,
             ss_size: 0,
-            ss_flags: ss_flags::SS_DISABLE,
-        }
-    } else {
-        if (new.ss_size as usize) < MINSIGSTKSZ {
-            return Err(KernelError::OutOfMemory);
-        }
-        AltStack {
-            ss_sp: new.ss_sp,
-            ss_size: new.ss_size as usize,
             ss_flags: new.ss_flags,
-        }
-    };
-    Ok(old)
+        });
+    }
+    if (new.ss_size as usize) < crate::arch::uapi::MINSIGSTKSZ {
+        return Err(KernelError::OutOfMemory);
+    }
+    Ok(AltStack {
+        ss_sp: new.ss_sp,
+        ss_size: new.ss_size as usize,
+        ss_flags: new.ss_flags,
+    })
 }
 
 /// signalfd4(fd, mask, sizemask, flags): a new signalfd (`fd` -1) or a

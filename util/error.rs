@@ -104,6 +104,8 @@ pub enum KernelError {
     NoMessage = 42,
     /// Identifier removed (EIDRM)
     IdentifierRemoved = 43,
+    /// Invalid request descriptor (EBADR)
+    BadRequest = 53,
     /// No data available (ENODATA)
     NoData = 61,
     /// Timer expired (ETIME)
@@ -196,6 +198,8 @@ pub enum KernelError {
     KeyRevoked = 128,
     /// Key was rejected by service (EKEYREJECTED)
     KeyRejected = 129,
+    /// Wrong file type for the intended operation (EFTYPE, asm-generic)
+    WrongFileType = 134,
 
     // =========================================================================
     // Kernel-internal restart codes (include/linux/errno.h); never reach
@@ -256,6 +260,7 @@ impl KernelError {
             40 => Self::TooManySymlinks,
             42 => Self::NoMessage,
             43 => Self::IdentifierRemoved,
+            53 => Self::BadRequest,
             61 => Self::NoData,
             64 => Self::NoNetwork,
             71 => Self::ProtocolError,
@@ -298,6 +303,7 @@ impl KernelError {
             127 => Self::KeyExpired,
             128 => Self::KeyRevoked,
             129 => Self::KeyRejected,
+            134 => Self::WrongFileType,
             512 => Self::RestartSys,
             513 => Self::RestartNoIntr,
             514 => Self::RestartNoHand,

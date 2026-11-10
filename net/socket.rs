@@ -20,7 +20,6 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::Ordering;
 
-use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, RwFlags, flags as fflags, nowait_rw};
 use crate::fs::inode::{AsAny, Inode, InodeData, InodeMode, NULL_INODE_OPS};
 use crate::fs::iov_iter::{IovDest, IovSource};
@@ -202,17 +201,18 @@ fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<Arc<File>, Kerne
         cred.fsgid,
         0,
         now,
-        alloc::sync::Weak::new(),
+        alloc::sync::Arc::downgrade(&crate::fs::pseudo::SOCKFS.sb()?),
         &NULL_INODE_OPS,
     ))?;
     inode.set_private(try_arc(SockInode(sock))?);
-    let name = alloc::format!("socket:[{}]", ino);
-    let dentry = try_arc(Dentry::new_anonymous(name.as_str().into(), Some(inode)))?;
+    // On sockfs (Linux sock_alloc_file: alloc_file_pseudo, dname
+    // "socket:[ino]")
+    let (mnt, dentry) = crate::fs::pseudo::SOCKFS.path("", inode)?.into_parts();
     let mut flags = fflags::O_RDWR;
     if nonblock {
         flags |= fflags::O_NONBLOCK;
     }
-    try_arc(File::new(dentry, None, flags, &SOCK_FOPS))
+    try_arc(File::new(dentry, Some(mnt), flags, &SOCK_FOPS))
 }
 
 /// Create a protocol socket (Linux __sock_create)

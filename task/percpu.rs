@@ -1238,16 +1238,17 @@ impl core::ops::Deref for Cur {
 }
 
 impl Cur {
-    /// Its credentials, copied (Linux current_cred)
+    /// Its credentials, copied (Linux current_cred: an override in
+    /// force, `task::override_creds`, else its own)
     pub fn cred(&self) -> Cred {
         // SAFETY: the task itself
-        unsafe { self.task.cred() }
+        unsafe { self.task.subj_cred() }
     }
 
-    /// A reference to its credentials
+    /// A reference to its credentials (as `cred`)
     pub fn cred_arc(&self) -> Arc<Cred> {
         // SAFETY: the task itself
-        unsafe { self.task.cred_arc() }
+        unsafe { self.task.subj_cred_arc() }
     }
 
     /// Its address space (an mm_count reference)
@@ -1366,9 +1367,6 @@ fn idle_task_entry() -> ! {
         // Nothing to run here: pull from a busier CPU (Linux
         // sched_balance_newidle); a task pulled flags us to switch
         sched_balance_rq(crate::cpu::this_id());
-
-        // Flush console before halting to ensure all output is sent
-        crate::console::console_flush();
 
         // Halt until an interrupt unless a wakeup made a task runnable
         // since the yield (it flags the idle task, interrupts off
@@ -2141,6 +2139,9 @@ pub struct CloneConfig {
     /// `set_tid_size` levels of its pid namespace, its own first
     pub set_tid: [u32; crate::ns::pid::MAX_PID_NS_LEVEL as usize],
     pub set_tid_size: usize,
+    /// An io thread (`create_io_thread`): the child runs this in the
+    /// kernel instead of returning to user mode
+    pub io_thread: Option<crate::task::IoThreadFn>,
 }
 
 impl CloneConfig {
@@ -2197,7 +2198,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Validate: CLONE_VM requires child_stack UNLESS CLONE_VFORK is also set
     // (vfork shares parent's stack with the child)
-    if config.flags & CLONE_VM != 0 && config.child_stack == 0 && config.flags & CLONE_VFORK == 0 {
+    if config.flags & CLONE_VM != 0
+        && config.child_stack == 0
+        && config.flags & CLONE_VFORK == 0
+        && config.io_thread.is_none()
+    {
         return Err(KernelError::InvalidArgument);
     }
 
@@ -2352,6 +2357,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.flags & CLONE_SIGHAND != 0,
         config.flags & CLONE_THREAD != 0,
         config.flags & CLONE_CLEAR_SIGHAND != 0,
+        config.flags & (CLONE_VM | CLONE_VFORK) == CLONE_VM,
     )?;
     let child_io = if config.flags & CLONE_IO != 0 {
         Some(crate::task::fork_io(true)?)
@@ -2423,7 +2429,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // the TrapFrame and the saved FP state
     // SAFETY: the child's TrapFrame, on its new kernel stack (not run)
     let frame_top = unsafe { CurrentArch::clone_child_fpu(trapframe_ptr) };
-    let context = CurrentArch::new_clone_child_context(frame_top);
+    // An io thread starts in the kernel, at its function (Linux
+    // copy_thread with args->fn); a user one returns to user mode
+    let context = if config.io_thread.is_some() {
+        CurrentArch::new_kernel_thread_context(io_thread_entry as *const () as usize, kstack_top)
+    } else {
+        CurrentArch::new_clone_child_context(frame_top)
+    };
 
     // Determine child's parent PID
     // CLONE_PARENT or CLONE_THREAD: child becomes sibling (same parent as caller)
@@ -2712,6 +2724,19 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Only a fully set up child becomes runnable (Linux: wake_up_new_task
     // at the end of kernel_clone); before this it has no mm, files or
     // signal state to run with
+    // An io thread: its function, PF_IO_WORKER, every signal but
+    // SIGKILL and SIGSTOP blocked (Linux copy_process with io_thread)
+    if let Some(f) = config.io_thread {
+        child_task.io_thread.call_once(|| f);
+        child_task.set_flag(crate::task::pf::IO_WORKER);
+        let mut keep = crate::signal::SigSet::new();
+        keep.add(crate::signal::SIGKILL);
+        keep.add(crate::signal::SIGSTOP);
+        child_task.sig.lock().blocked = crate::signal::SigSet::from_bits(!keep.bits());
+        let mut name = [0u8; 16];
+        io_thread_name(&mut name, current_tid);
+        child_task.task_lock().set_comm(name);
+    }
     wake_up_new_task(&child_task);
 
     // CLONE_VFORK: parent sleeps until the child exec()s or _exit()s
@@ -2753,6 +2778,76 @@ fn close_pidfd(fd: i32) {
     if let Some(files) = current().files() {
         // Released after the table lock (FilesGuard)
         files.lock().close(fd);
+    }
+}
+
+/// Start a thread of the current task's process that runs `f(arg)` in
+/// the kernel and never returns to user mode (Linux create_io_thread):
+/// it shares the mm, files, fs context, signal handlers and I/O context
+/// (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+/// CLONE_IO, untraced), is PF_IO_WORKER (no ptrace attach), blocks every
+/// signal but SIGKILL and SIGSTOP, shows as `iou-wrk-<creator tid>` in
+/// /proc, and exits when `f` returns
+pub fn create_io_thread(
+    f: fn(Arc<dyn core::any::Any + Send + Sync>),
+    arg: Arc<dyn core::any::Any + Send + Sync>,
+) -> KernelResult<Tid> {
+    use crate::task::clone_flags::*;
+    let config = CloneConfig {
+        flags: CLONE_VM
+            | CLONE_FS
+            | CLONE_FILES
+            | CLONE_SIGHAND
+            | CLONE_THREAD
+            | CLONE_IO
+            | CLONE_UNTRACED,
+        child_stack: 0,
+        parent_tidptr: 0,
+        child_tidptr: 0,
+        tls: 0,
+        pidfd_ptr: 0,
+        exit_signal: crate::signal::ExitSignal::NONE,
+        cgroup_fd: -1,
+        set_tid: CloneConfig::NO_SET_TID,
+        set_tid_size: 0,
+        io_thread: Some((f, arg)),
+    };
+    let mut fa = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
+    do_clone(config, &mut fa)
+}
+
+/// First code an io thread runs: its function, then a thread exit
+extern "C" fn io_thread_entry() -> ! {
+    // The switch that started it left interrupts disabled
+    CurrentArch::enable_interrupts();
+    let work = current().io_thread.get().cloned();
+    if let Some((f, arg)) = work {
+        f(arg);
+    }
+    crate::task::proc::do_exit(0)
+}
+
+/// "iou-wrk-<tid>" (Linux io_wq_worker: "iou-wrk-%d"), cut to 15 bytes
+fn io_thread_name(out: &mut [u8; 16], tid: Tid) {
+    let mut n = 0;
+    for &c in b"iou-wrk-" {
+        out[n] = c;
+        n += 1;
+    }
+    let mut digits = [0u8; 20];
+    let (mut v, mut k) = (tid, 0);
+    loop {
+        digits[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while k > 0 && n < 15 {
+        k -= 1;
+        out[n] = digits[k];
+        n += 1;
     }
 }
 
@@ -3218,6 +3313,11 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
     // robust futexes), which needs this CPU's rq lock.
     if tid != 0 {
+        // Its io_uring requests end first, so none outlives the task
+        // (Linux do_exit: io_uring_files_cancel); then no callback can
+        // be queued on it any more (Linux exit_task_work)
+        crate::io::io_uring::task_cancel(false);
+        crate::task::task_work::exit_task_work();
         // Linux exit_signals sets PF_EXITING first, then hands the
         // group signals this thread would have taken to another
         set_exiting();
@@ -3544,6 +3644,11 @@ pub fn schedule() {
     crate::sync::might_sleep();
     let Some(sched) = this_sched() else { return };
     let me = current();
+    // Held bios go out before a sleep that may wait for them (Linux
+    // sched_submit_work: blk_flush_plug)
+    if me.se.state() != RUNNING {
+        crate::block::plug::flush_on_sleep();
+    }
     // This is the rescheduling a pending NEED_RESCHED asked for
     me.clear_tif(crate::task::tif::NEED_RESCHED);
     let mut rq = sched.lock.lock();
@@ -3647,14 +3752,18 @@ fn policy_class(policy: i32) -> Class {
 /// A kernel thread's class from its creator's priority hint: the idle
 /// task, the stoppers (Linux sched_set_stop_task, shown as FIFO 99),
 /// SCHED_FIFO 1 for the high ones (`ktimers/N`, as Linux PREEMPT_RT
-/// ktimers), the rest SCHED_NORMAL nice 0
+/// ktimers), SCHED_NORMAL nice -20 for the highpri workqueue workers,
+/// the rest SCHED_NORMAL nice 0
 fn set_kthread_class(se: &sched::SchedEntity, prio: Priority) {
-    use crate::task::{PRIORITY_HIGH, PRIORITY_REALTIME, SCHED_FIFO, SCHED_NORMAL};
+    use crate::task::{
+        PRIORITY_HIGH, PRIORITY_NICE_MIN, PRIORITY_REALTIME, SCHED_FIFO, SCHED_NORMAL,
+    };
     let d = sched::DEFAULT_PRIO;
     match prio {
         PRIORITY_IDLE => se.set_params(Class::Idle, SCHED_NORMAL, d, 0),
         PRIORITY_REALTIME => se.set_params(Class::Stop, SCHED_FIFO, d, 99),
         PRIORITY_HIGH => se.set_params(Class::Rt, SCHED_FIFO, d, 1),
+        PRIORITY_NICE_MIN => se.set_params(Class::Fair, SCHED_NORMAL, d - 20, 0),
         _ => se.set_params(Class::Fair, SCHED_NORMAL, d, 0),
     }
 }
@@ -4262,7 +4371,7 @@ pub fn sleep_until(
             set_current_state(SleepState::Running);
             return Ok(());
         }
-        if interruptible && crate::sync::waitqueue::signal_pending() {
+        if interruptible && crate::sync::waitqueue::signal_pending_run_work() {
             set_current_state(SleepState::Running);
             return Err(deadline - now);
         }
@@ -4947,7 +5056,10 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
     if me.tid() == 0 {
         return; // The boot task keeps its static root credentials
     }
-    let old = me.cred();
+    // Its own credentials, not an override in force (Linux commit_creds
+    // replaces real_cred and cred together)
+    // SAFETY: the task itself
+    let old = unsafe { Task::cred(&me) };
 
     // Changing euid/egid/fsuid/fsgid makes the task non-dumpable
     // (suid_dumpable, default 0), so a less-privileged identity can't ptrace

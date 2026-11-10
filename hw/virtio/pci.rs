@@ -4,9 +4,17 @@
 //!
 //! The device's vendor capabilities locate four structures inside its
 //! memory BARs: common configuration, notification area, ISR status and
-//! device-specific configuration; each is ioremapped. Interrupts are INTx
-//! (shareable, level-triggered): reading the ISR status byte returns the
-//! causes and deasserts the line. MSI-X is not used.
+//! device-specific configuration; each is ioremapped.
+//!
+//! Interrupts (Linux virtio_pci_common.c vp_find_vqs): MSI-X when the
+//! driver asks for vectors (`alloc_vectors`, before its queues) and the
+//! function and interrupt controller have them: vector 0 for
+//! configuration changes, vector i + 1 for queue i, each aimed at the
+//! CPU the driver picks (Linux vp_find_vqs_msix with per-vq vectors
+//! and managed affinity), or failing that one vector for configuration
+//! and one all queues share. Otherwise INTx (shareable, level-triggered):
+//! reading the ISR status byte returns the causes and deasserts the
+//! line, and every queue is reaped.
 //!
 //! ## Locking
 //!
@@ -15,15 +23,17 @@
 //! or the PCI function's (transport probe and remove). Otherwise the
 //! transport touches lock-free state only: config reads
 //! (generation-checked), notify writes (under the caller's queue lock)
-//! and the ISR byte (IRQ context). The INTx registration
-//! (`VirtioDevice.irq`, which owns the driver's interrupt callbacks) is
-//! a spin leaf, thread context only: claimed, then set, by `request_irq`
-//! (driver probe; it registers between the two, unlocked) and taken by
-//! `free_irq` (driver remove, transport remove), which drops it
-//! (`IrqDesc.lock`) after unlocking.
+//! and the ISR byte (IRQ context). The interrupt registration
+//! (`VirtioDevice.irq`: MSI-X vectors, then their handlers or the INTx
+//! handler, which own the driver's interrupt callbacks) is a spin leaf,
+//! thread context only: set by `alloc_vectors`, claimed, then set, by
+//! `request_irq` (driver probe; it registers between the two, unlocked)
+//! and taken by `free_irq` (driver remove, transport remove), which
+//! drops it (`IrqDesc.lock`) after unlocking.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -33,12 +43,14 @@ use super::{VirtioIrq, status};
 use crate::arch::barrier::wmb;
 use crate::hw::dma::{DmaCoherent, DmaConfig, DmaDevice};
 use crate::hw::mmio::IoMem;
+use crate::hw::pci::msix::{MsixHandler, MsixVectors};
 use crate::hw::pci::{PciDevice, cap_id};
 use crate::irq::{IrqHandler, IrqRegistration, IrqReturn};
 use crate::printkln;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
+use crate::util::kmem::KVec;
 
 /// Red Hat / virtio vendor ID
 const VENDOR_VIRTIO: u16 = 0x1AF4;
@@ -60,11 +72,13 @@ mod common {
     pub const DF: usize = 0x04;
     pub const GFSELECT: usize = 0x08;
     pub const GF: usize = 0x0C;
+    pub const MSIX_CONFIG: usize = 0x10;
     pub const NUM_QUEUES: usize = 0x12;
     pub const STATUS: usize = 0x14;
     pub const CFG_GENERATION: usize = 0x15;
     pub const Q_SELECT: usize = 0x16;
     pub const Q_SIZE: usize = 0x18;
+    pub const Q_MSIX_VECTOR: usize = 0x1A;
     pub const Q_ENABLE: usize = 0x1C;
     pub const Q_NOFF: usize = 0x1E;
     pub const Q_DESC: usize = 0x20;
@@ -73,6 +87,10 @@ mod common {
     /// Size of the structure up to queue_device (all we use)
     pub const LEN: u32 = 0x38;
 }
+
+/// No MSI-X vector: the event raises INTx, or nothing while MSI-X is on
+/// (Linux VIRTIO_MSI_NO_VECTOR)
+const NO_VECTOR: u16 = 0xffff;
 
 /// ISR status bits
 mod isr {
@@ -164,31 +182,48 @@ pub struct VirtioDevice {
     /// read by the bound driver and the sysfs `features` file (Linux
     /// vdev->features, a plain field under the same rule)
     features: AtomicU64,
-    /// The INTx handler with the bound driver's interrupt callbacks
-    /// (Linux vq->callback and config_changed): between `request_irq`
-    /// and `free_irq`
+    /// The interrupt handlers with the bound driver's callbacks (Linux
+    /// vq->callback and config_changed): MSI-X vectors from
+    /// `alloc_vectors`, handlers from `request_irq` to `free_irq`
     irq: Mutex<IrqSlot>,
     /// Interrupts that were ours (stats)
     irqs: AtomicU64,
 }
 
-/// `VirtioDevice.irq`: the INTx registration, or who may make it
+/// `VirtioDevice.irq`: the interrupt registration, or who may make it
 enum IrqSlot {
     Free,
+    /// MSI-X on, entries masked: the queues are being set up with them;
+    /// `shared`: one vector serves every queue
+    Vectors {
+        v: Arc<MsixVectors>,
+        shared: bool,
+    },
     /// A `request_irq` is registering, unlocked
     Claimed,
-    Held(IrqRegistration<VpIntx>),
+    Intx(IrqRegistration<VpIntx>),
+    /// One handler per vector (they hold the vectors), kept to be
+    /// dropped
+    Msix {
+        _handlers: Vec<MsixHandler<VpVector>>,
+    },
 }
 
 impl IrqSlot {
     /// The registration, leaving the slot free (a claim stays: its
     /// `request_irq` finishes it)
-    fn take(&mut self) -> Option<IrqRegistration<VpIntx>> {
-        if !matches!(self, Self::Held(_)) {
+    fn take(&mut self) -> Option<Self> {
+        if matches!(self, Self::Free | Self::Claimed) {
             return None;
         }
-        match core::mem::replace(self, Self::Free) {
-            Self::Held(r) => Some(r),
+        Some(core::mem::replace(self, Self::Free))
+    }
+
+    /// The vectors queues are set up with, if MSI-X is on, and whether
+    /// they share one
+    fn vectors(&self) -> Option<(&Arc<MsixVectors>, bool)> {
+        match self {
+            Self::Vectors { v, shared } => Some((v, *shared)),
             _ => None,
         }
     }
@@ -378,6 +413,17 @@ impl VirtioDevice {
 
     /// Set up queue `index` (spec 4.1.5.1.3); before `ready()`
     pub fn setup_vq(&self, index: u16) -> Result<Virtqueue, KernelError> {
+        self.setup_vq_cb(index, true)
+    }
+
+    /// Set up queue `index` with no interrupt: no MSI-X vector and used
+    /// buffers not signalled, its completions found by polling (Linux
+    /// vp_find_vqs with a NULL callback)
+    pub fn setup_poll_vq(&self, index: u16) -> Result<Virtqueue, KernelError> {
+        self.setup_vq_cb(index, false)
+    }
+
+    fn setup_vq_cb(&self, index: u16, cb: bool) -> Result<Virtqueue, KernelError> {
         if index >= self.num_queues() {
             return Err(KernelError::NoDevice);
         }
@@ -386,6 +432,11 @@ impl VirtioDevice {
             return Err(KernelError::Io);
         }
         let num = ring::pick_size(self.r16(common::Q_SIZE)).ok_or(KernelError::NoDevice)?;
+        if cb {
+            self.queue_vector(index);
+        } else {
+            self.w16(common::Q_MSIX_VECTOR, NO_VECTOR);
+        }
         let off = self.r16(common::Q_NOFF) as usize * self.notify_mul as usize;
         let notify = self.notify.sub(off, 2).ok_or(KernelError::NoDevice)?;
         let lay = Layout::new(num);
@@ -398,41 +449,128 @@ impl VirtioDevice {
         self.w64(common::Q_AVAIL, d + lay.avail as u64);
         self.w64(common::Q_USED, d + lay.used as u64);
         self.w16(common::Q_ENABLE, 1);
+        // SAFETY: `mem` is zeroed DMA memory of `lay.size` bytes for
+        // `num` entries, owned by the queue (`mem`) for the ring's life
+        let mut ring = unsafe { Vring::new(mem.cpu_addr(), num) };
+        if self.has_feature(super::feature::RING_EVENT_IDX) {
+            ring.set_event_idx();
+        }
+        if !cb {
+            ring.disable_cb();
+        }
         Ok(Virtqueue {
-            // SAFETY: `mem` is zeroed DMA memory of `lay.size` bytes for
-            // `num` entries, owned by the queue (`mem`) for the ring's life
-            ring: unsafe { Vring::new(mem.cpu_addr(), num) },
+            ring,
             mem,
             owner: core::ptr::from_ref::<Self>(self) as usize,
             index,
             notify,
+            indirect: self.has_feature(super::feature::RING_INDIRECT_DESC),
         })
     }
 
-    /// Register the driver's interrupt callbacks and enable INTx (Linux
-    /// find_vqs: vp_request_intx); Busy if already requested or being
-    /// requested. The slot is claimed first, so of two callers only
-    /// one registers
-    pub fn request_irq(self: &Arc<Self>, cb: Arc<dyn VirtioIrq>) -> Result<u32, KernelError> {
-        {
-            let mut s = self.irq.lock();
-            if !matches!(*s, IrqSlot::Free) {
-                return Err(KernelError::Busy);
-            }
-            *s = IrqSlot::Claimed;
+    /// Turn MSI-X on before the queues are set up (Linux
+    /// vp_find_vqs_msix): best a vector for configuration changes
+    /// (aimed at the boot CPU) and one per queue, queue i's aimed at
+    /// `cpus[i]` (managed affinity); else one for configuration and one
+    /// all queues share. False (INTx then) if the function or the
+    /// interrupt controller has too few, or the device takes no config
+    /// vector. Busy if interrupts are already set up
+    pub fn alloc_vectors(&self, cpus: &[u32]) -> Result<bool, KernelError> {
+        if !matches!(*self.irq.lock(), IrqSlot::Free) {
+            return Err(KernelError::Busy);
         }
-        // Holds the device until `free_irq` (the driver's remove)
-        let reg = try_arc(VpIntx {
-            vdev: self.clone(),
-            cb,
-        })
-        .and_then(|h| self.pci.request_irq(h));
+        let mut want = KVec::try_with_capacity(cpus.len() + 1)?;
+        want.try_push(0)?;
+        want.try_extend_from_slice(cpus)?;
+        // Mapped and allocated unlocked: the slot is a leaf
+        let (v, shared) = match MsixVectors::enable(&self.pci, &want) {
+            Ok(v) => (v, false),
+            Err(_) if cpus.len() > 1 => match MsixVectors::enable(&self.pci, &[0, 0]) {
+                Ok(v) => (v, true),
+                Err(_) => return Ok(false),
+            },
+            Err(_) => return Ok(false),
+        };
+        let v = try_arc(v)?;
+        self.w16(common::MSIX_CONFIG, 0);
+        if self.r16(common::MSIX_CONFIG) != 0 {
+            // Linux: EBUSY, then INTx
+            self.w16(common::MSIX_CONFIG, NO_VECTOR);
+            return Ok(false);
+        }
+        let mut s = self.irq.lock();
+        if !matches!(*s, IrqSlot::Free) {
+            drop(s);
+            self.w16(common::MSIX_CONFIG, NO_VECTOR);
+            return Err(KernelError::Busy);
+        }
+        *s = IrqSlot::Vectors { v, shared };
+        Ok(true)
+    }
+
+    /// MSI-X is on (Linux vp_dev->msix_enabled)
+    pub fn msix(&self) -> bool {
+        matches!(
+            *self.irq.lock(),
+            IrqSlot::Vectors { .. } | IrqSlot::Msix { .. }
+        )
+    }
+
+    /// Give queue `index` (selected) its vector, index + 1 or the shared
+    /// 1, if MSI-X is on (Linux vp_modern_queue_vector). A device
+    /// refusing it (Linux EBUSY) turns MSI-X off for all queues: INTx
+    /// serves them
+    fn queue_vector(&self, index: u16) {
+        let mut s = self.irq.lock();
+        let Some((_, shared)) = s.vectors() else {
+            return;
+        };
+        let v = if shared { 1 } else { index.saturating_add(1) };
+        self.w16(common::Q_MSIX_VECTOR, v);
+        if self.r16(common::Q_MSIX_VECTOR) == v {
+            return;
+        }
+        self.w16(common::MSIX_CONFIG, NO_VECTOR);
+        for q in 0..=index {
+            self.w16(common::Q_SELECT, q);
+            self.w16(common::Q_MSIX_VECTOR, NO_VECTOR);
+        }
+        self.w16(common::Q_SELECT, index);
+        let old = s.take();
+        drop(s);
+        drop(old);
+    }
+
+    /// Register the driver's interrupt callbacks (Linux find_vqs): on
+    /// the MSI-X vectors if `alloc_vectors` turned them on, else on INTx
+    /// (vp_request_intx). Busy if already requested or being requested:
+    /// the slot is claimed first, so of two callers only one registers
+    pub fn request_irq(self: &Arc<Self>, cb: Arc<dyn VirtioIrq>) -> Result<u32, KernelError> {
+        let vecs = {
+            let mut s = self.irq.lock();
+            let v = match &*s {
+                IrqSlot::Free => None,
+                IrqSlot::Vectors { v, shared } => Some((v.clone(), *shared)),
+                _ => return Err(KernelError::Busy),
+            };
+            *s = IrqSlot::Claimed;
+            v
+        };
+        let r = match vecs {
+            Some((v, shared)) => self
+                .request_msix(&v, shared, cb)
+                .map(|h| IrqSlot::Msix { _handlers: h }),
+            None => self.request_intx(cb).map(IrqSlot::Intx),
+        };
         let mut s = self.irq.lock();
         // Replaces `Claimed`: no registration is dropped under the lock
-        match reg {
-            Ok(reg) => {
-                let irq = reg.irq();
-                *s = IrqSlot::Held(reg);
+        match r {
+            Ok(slot) => {
+                let irq = match &slot {
+                    IrqSlot::Intx(reg) => reg.irq(),
+                    _ => 0,
+                };
+                *s = slot;
                 Ok(irq)
             }
             Err(e) => {
@@ -440,6 +578,44 @@ impl VirtioDevice {
                 Err(e)
             }
         }
+    }
+
+    /// The INTx handler (holds the device until `free_irq`)
+    fn request_intx(
+        self: &Arc<Self>,
+        cb: Arc<dyn VirtioIrq>,
+    ) -> Result<IrqRegistration<VpIntx>, KernelError> {
+        try_arc(VpIntx {
+            vdev: self.clone(),
+            cb,
+        })
+        .and_then(|h| self.pci.request_irq(h))
+    }
+
+    /// A handler per vector: configuration on 0, queue i on i + 1, or
+    /// every queue on a shared 1
+    fn request_msix(
+        self: &Arc<Self>,
+        v: &Arc<MsixVectors>,
+        shared: bool,
+        cb: Arc<dyn VirtioIrq>,
+    ) -> Result<Vec<MsixHandler<VpVector>>, KernelError> {
+        let mut hs = KVec::try_with_capacity(v.len())?;
+        for i in 0..v.len() {
+            let h = try_arc(VpVector {
+                vdev: self.clone(),
+                cb: cb.clone(),
+                vq: match i {
+                    0 => Vector::Config,
+                    _ if shared => Vector::Queues,
+                    // Vectors: one per queue (u16) plus one
+                    _ => Vector::Queue((i - 1) as u16),
+                },
+            })?;
+            // Room was reserved
+            hs.try_push(v.request(i, h)?)?;
+        }
+        Ok(hs.into_vec())
     }
 
     /// Reset the device, then free the rings of `vqs` (Linux del_vqs:
@@ -468,8 +644,8 @@ impl VirtioDevice {
     /// shared level-triggered line nobody acks.
     pub fn free_irq(&self) {
         // Dropped outside the lock: the callbacks may own the driver
-        let irq = self.irq.lock().take();
-        drop(irq);
+        let held = self.irq.lock().take();
+        drop(held);
     }
 
     /// Interrupts handled (stats)
@@ -505,6 +681,34 @@ impl IrqHandler for VpIntx {
     }
 }
 
+/// A transport MSI-X handler: configuration changes (no queue) or one
+/// queue (Linux vp_config_changed, vring_interrupt)
+struct VpVector {
+    vdev: Arc<VirtioDevice>,
+    cb: Arc<dyn VirtioIrq>,
+    vq: Vector,
+}
+
+/// What an MSI-X vector signals
+enum Vector {
+    Config,
+    /// Every queue (one shared vector: Linux vp_vring_interrupt)
+    Queues,
+    Queue(u16),
+}
+
+impl IrqHandler for VpVector {
+    fn handle(&self, _irq: u32) -> IrqReturn {
+        self.vdev.irqs.fetch_add(1, Ordering::Relaxed);
+        match self.vq {
+            Vector::Config => self.cb.config_changed(),
+            Vector::Queues => self.cb.vq_interrupt(None),
+            Vector::Queue(q) => self.cb.vq_interrupt(Some(q)),
+        }
+        IrqReturn::Handled
+    }
+}
+
 /// Transport interrupt handler (Linux vp_interrupt; IRQ context)
 fn vp_interrupt(vdev: &VirtioDevice, cb: &dyn VirtioIrq) -> IrqReturn {
     // Read-to-clear; deasserts the level-triggered line
@@ -517,7 +721,7 @@ fn vp_interrupt(vdev: &VirtioDevice, cb: &dyn VirtioIrq) -> IrqReturn {
         cb.config_changed();
     }
     if isr & isr::QUEUE != 0 {
-        cb.vq_interrupt();
+        cb.vq_interrupt(None);
     }
     IrqReturn::Handled
 }
@@ -537,6 +741,8 @@ pub struct Virtqueue {
     index: u16,
     /// This queue's 2-byte doorbell
     notify: IoMem,
+    /// The device takes indirect descriptor tables
+    indirect: bool,
 }
 
 // SAFETY: the ring is DMA memory reached under the driver's queue lock
@@ -546,9 +752,14 @@ unsafe impl Send for Virtqueue {}
 unsafe impl Sync for Virtqueue {}
 
 impl Virtqueue {
+    /// Indirect descriptors were negotiated (Linux vq->indirect)
+    pub fn indirect(&self) -> bool {
+        self.indirect
+    }
+
     /// Notify the device of new buffers if it wants to be (Linux
     /// virtqueue_kick)
-    pub fn kick(&self) {
+    pub fn kick(&mut self) {
         if self.ring.needs_notify() {
             // Ring writes before the doorbell MMIO write
             wmb();

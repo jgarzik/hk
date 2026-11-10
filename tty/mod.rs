@@ -401,15 +401,18 @@ impl ConsoleDriver for Tty {
         self.name
     }
 
+    /// Bytes straight to the hardware (no line discipline), LF as CR LF,
+    /// then a wait until the transmitter is empty (Linux
+    /// serial8250_console_write, pl011_console_write): what a console
+    /// write prints is out before it returns
     fn write(&self, data: &[u8]) {
-        // Console write bypasses line discipline - direct to hardware
-        // But we still do CR-NL translation for readability
         for &byte in data {
             if byte == b'\n' {
                 let _ = self.driver.write(b"\r");
             }
             let _ = self.driver.write(&[byte]);
         }
+        self.driver.flush();
     }
 
     fn flush(&self) {

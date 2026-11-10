@@ -1,7 +1,7 @@
 //! Split virtqueue ring logic (virtio 1.2 section 2.7)
 //!
-//! Linux reference: drivers/virtio/virtio_ring.c (split ring, no indirect
-//! descriptors, no event index).
+//! Linux reference: drivers/virtio/virtio_ring.c (split ring, indirect
+//! descriptors, event index).
 //!
 //! [`Vring`] works on raw ring memory the caller provides (coherent DMA
 //! memory in the kernel, a heap buffer in host unit tests), so the index
@@ -18,6 +18,22 @@
 //! The free list and descriptor chains are tracked in a driver-private
 //! shadow (`next`, Linux `desc_extra`): the driver never trusts link
 //! fields in memory the device can write.
+//!
+//! Indirect descriptors (VIRTIO_RING_F_INDIRECT_DESC, spec 2.7.5.3): a
+//! request's chain is written to a table of its own ([`set_chain`],
+//! Linux alloc_indirect_split), which the caller allocates and DMA-maps;
+//! one ring descriptor points at it ([`Vring::add_indirect`]), so a big
+//! request takes one ring slot instead of one per buffer.
+//!
+//! Event index (VIRTIO_RING_F_EVENT_IDX, spec 2.7.7, 2.7.10): with it
+//! negotiated ([`Vring::set_event_idx`]) the flags are hints the other
+//! side ignores. The device publishes `avail_event` (after the used
+//! ring): the driver notifies only when its new avail index passes it
+//! since the last notification (Linux virtqueue_kick_prepare_split,
+//! [`need_event`]). The driver publishes `used_event` (after the avail
+//! ring): the device interrupts only when its used index passes it, so
+//! the driver moves it to the next entry it will consume whenever it
+//! wants interrupts (`get`, `enable_cb`).
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec;
@@ -31,6 +47,8 @@ use crate::arch::barrier::{dma_rmb, dma_wmb};
 const VRING_DESC_F_NEXT: u16 = 1;
 /// Buffer is device-writable
 const VRING_DESC_F_WRITE: u16 = 2;
+/// Buffer is a table of descriptors
+const VRING_DESC_F_INDIRECT: u16 = 4;
 /// Driver: do not interrupt on used buffers (a hint)
 const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
 /// Device: do not notify on available buffers (a hint)
@@ -55,12 +73,50 @@ pub enum VqError {
     Empty,
 }
 
+/// One descriptor (struct vring_desc), little-endian: in the ring, or
+/// in an indirect table
 #[repr(C)]
-struct Desc {
+#[derive(Clone, Copy, Default)]
+pub struct Desc {
     addr: u64,
     len: u32,
     flags: u16,
     next: u16,
+}
+
+impl Desc {
+    /// The buffer it describes
+    pub fn sg(&self) -> Sg {
+        Sg {
+            addr: u64::from_le(self.addr),
+            len: u32::from_le(self.len),
+        }
+    }
+}
+
+/// Flags of descriptor `k` of a chain of `total`: device-writable if
+/// `write`, linked to the next unless last
+fn chain_flags(write: bool, k: usize, total: usize) -> u16 {
+    let mut flags = if write { VRING_DESC_F_WRITE } else { 0 };
+    if k + 1 < total {
+        flags |= VRING_DESC_F_NEXT;
+    }
+    flags
+}
+
+/// Entry `k` of a chain written to `table`, which holds exactly the
+/// chain (Linux alloc_indirect_split + virtqueue_add_desc_split): buffer
+/// `sg`, device-writable if `write`, linked to entry k + 1 unless last.
+/// The device-readable buffers must come first
+pub fn set_chain(table: &mut [Desc], k: usize, sg: Sg, write: bool) {
+    let flags = chain_flags(write, k, table.len());
+    table[k] = Desc {
+        addr: sg.addr.to_le(),
+        len: sg.len.to_le(),
+        flags: flags.to_le(),
+        // Truncation only on the last entry, whose link is unused
+        next: ((k + 1) as u16).to_le(),
+    };
 }
 
 const _: () = assert!(core::mem::size_of::<Desc>() == 16);
@@ -124,6 +180,10 @@ pub struct Vring {
     tokens: Vec<usize>,
     /// The device returned an invalid used entry
     broken: bool,
+    /// VIRTIO_RING_F_EVENT_IDX was negotiated
+    event: bool,
+    /// `avail_idx` when the device was last asked about a notification
+    kicked: u16,
 }
 
 // The ring memory is owned by the queue; access is serialized by its owner
@@ -156,7 +216,15 @@ impl Vring {
             chain: vec![0; n],
             tokens: vec![0; n],
             broken: false,
+            event: false,
+            kicked: 0,
         }
+    }
+
+    /// Use the event index (VIRTIO_RING_F_EVENT_IDX negotiated), before
+    /// the first buffer
+    pub fn set_event_idx(&mut self) {
+        self.event = true;
     }
 
     pub fn num(&self) -> u16 {
@@ -200,14 +268,7 @@ impl Vring {
         let head = self.free_head;
         let mut i = head;
         for (k, sg) in out.iter().chain(inb).enumerate() {
-            let mut flags = if k >= out.len() {
-                VRING_DESC_F_WRITE
-            } else {
-                0
-            };
-            if k + 1 < total {
-                flags |= VRING_DESC_F_NEXT;
-            }
+            let flags = chain_flags(k >= out.len(), k, total);
             let d = self.desc(i);
             unsafe {
                 write_volatile(&raw mut (*d).addr, sg.addr.to_le());
@@ -218,8 +279,65 @@ impl Vring {
             i = self.next[i as usize];
         }
         self.free_head = i;
-        self.num_free -= total as u16;
-        self.chain[head as usize] = total as u16;
+        self.publish(head, total as u16, token);
+        Ok(())
+    }
+
+    /// Expose a chain written by [`set_chain`] as direct ring
+    /// descriptors, for a device without indirect descriptors
+    pub fn add_chain(&mut self, table: &[Desc], token: usize) -> Result<(), VqError> {
+        let total = table.len();
+        if total == 0 {
+            return Err(VqError::Empty);
+        }
+        if total > self.num_free as usize {
+            return Err(VqError::NoSpace);
+        }
+        let head = self.free_head;
+        let mut i = head;
+        for t in table {
+            let d = self.desc(i);
+            unsafe {
+                write_volatile(&raw mut (*d).addr, t.addr);
+                write_volatile(&raw mut (*d).len, t.len);
+                write_volatile(&raw mut (*d).flags, t.flags);
+                write_volatile(&raw mut (*d).next, self.next[i as usize].to_le());
+            }
+            i = self.next[i as usize];
+        }
+        self.free_head = i;
+        self.publish(head, total as u16, token);
+        Ok(())
+    }
+
+    /// Expose an indirect table of `n` descriptors at DMA address
+    /// `table` (written by [`set_chain`], mapped for the device until
+    /// `token` comes back from [`Vring::get`]): one ring descriptor
+    pub fn add_indirect(&mut self, table: u64, n: u16, token: usize) -> Result<(), VqError> {
+        if n == 0 {
+            return Err(VqError::Empty);
+        }
+        if self.num_free == 0 {
+            return Err(VqError::NoSpace);
+        }
+        let head = self.free_head;
+        let d = self.desc(head);
+        unsafe {
+            write_volatile(&raw mut (*d).addr, table.to_le());
+            write_volatile(&raw mut (*d).len, (u32::from(n) * 16).to_le());
+            write_volatile(&raw mut (*d).flags, VRING_DESC_F_INDIRECT.to_le());
+            write_volatile(&raw mut (*d).next, 0);
+        }
+        self.free_head = self.next[head as usize];
+        self.publish(head, 1, token);
+        Ok(())
+    }
+
+    /// Account the chain of `n` ring descriptors at `head` and make it
+    /// available to the device
+    fn publish(&mut self, head: u16, n: u16, token: usize) {
+        self.num_free -= n;
+        self.chain[head as usize] = n;
         self.tokens[head as usize] = token;
 
         // Publish the head in the avail ring, then the index that covers
@@ -229,16 +347,38 @@ impl Vring {
         self.avail_idx = self.avail_idx.wrapping_add(1);
         dma_wmb();
         unsafe { write_volatile(self.avail16(1), self.avail_idx.to_le()) };
-        Ok(())
     }
 
     /// After [`Vring::add`]s: true if the device wants a notification
-    /// (Linux virtqueue_kick_prepare without event index)
-    pub fn needs_notify(&self) -> bool {
-        // The new avail.idx before the used.flags read
+    /// for the buffers added since the last call (Linux
+    /// virtqueue_kick_prepare_split)
+    pub fn needs_notify(&mut self) -> bool {
+        // The new avail.idx before the used ring's event or flags read
         fence(Ordering::SeqCst);
+        let (old, new) = (self.kicked, self.avail_idx);
+        self.kicked = new;
+        if self.event {
+            let ev = u16::from_le(unsafe { read_volatile(self.avail_event()) });
+            return need_event(ev, new, old);
+        }
         let f = u16::from_le(unsafe { read_volatile(self.used16(0)) });
         f & VRING_USED_F_NO_NOTIFY == 0
+    }
+
+    /// The device's avail_event, after the used ring (spec 2.7.8)
+    fn avail_event(&self) -> *mut u16 {
+        self.used16(2 + 4 * self.num as usize)
+    }
+
+    /// Our used_event, after the avail ring (spec 2.7.6)
+    fn used_event(&self) -> *mut u16 {
+        self.avail16(2 + self.num as usize)
+    }
+
+    /// Callbacks are wanted: the avail flags (our own; with the event
+    /// index the device ignores them) lack NO_INTERRUPT
+    fn cb_wanted(&self) -> bool {
+        u16::from_le(unsafe { read_volatile(self.avail16(0)) }) & VRING_AVAIL_F_NO_INTERRUPT == 0
     }
 
     fn used_idx(&self) -> u16 {
@@ -266,6 +406,12 @@ impl Vring {
             return None;
         }
         self.last_used = self.last_used.wrapping_add(1);
+        // The next interrupt for the entry after this one, if wanted
+        // (Linux virtqueue_get_buf_ctx_split: virtio_store_mb)
+        if self.event && self.cb_wanted() {
+            unsafe { write_volatile(self.used_event(), self.last_used.to_le()) };
+            fence(Ordering::SeqCst);
+        }
         let token = self.tokens[id as usize];
         self.detach(id as u16);
         Some((token, len))
@@ -294,7 +440,12 @@ impl Vring {
     /// pending (the caller must poll again: Linux virtqueue_enable_cb)
     pub fn enable_cb(&self) -> bool {
         unsafe { write_volatile(self.avail16(0), 0) };
-        // flags store before the used.idx load
+        if self.event {
+            // An interrupt for the next entry consumed (Linux
+            // virtqueue_enable_cb_prepare_split)
+            unsafe { write_volatile(self.used_event(), self.last_used.to_le()) };
+        }
+        // flags (and used_event) store before the used.idx load
         fence(Ordering::SeqCst);
         !self.more_used()
     }
@@ -303,8 +454,16 @@ impl Vring {
     pub fn cb(&self) -> VringCb {
         VringCb {
             avail_flags: self.avail16(0),
+            used_event: self.event.then(|| self.used_event()),
         }
     }
+}
+
+/// The other side asked for an event at index `event`: true if moving
+/// an index from `old` to `new` passes it (spec 2.7.10, Linux
+/// vring_need_event)
+pub fn need_event(event: u16, new: u16, old: u16) -> bool {
+    new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
 }
 
 /// Lock-free handle that lets an ISR suppress further used-buffer
@@ -313,14 +472,24 @@ impl Vring {
 #[derive(Clone, Copy)]
 pub struct VringCb {
     avail_flags: *mut u16,
+    /// The ring's used_event, with the event index
+    used_event: Option<*mut u16>,
 }
 
 unsafe impl Send for VringCb {}
 unsafe impl Sync for VringCb {}
 
 impl VringCb {
+    /// Ask for no used-buffer interrupts (Linux
+    /// virtqueue_disable_cb_split): the flag, which also tells `get` not
+    /// to move used_event; with the event index, which makes the device
+    /// ignore the flag, used_event goes to 0, so the device interrupts
+    /// only when its used index wraps past it (Linux writes the same)
     pub fn disable(&self) {
         unsafe { write_volatile(self.avail_flags, VRING_AVAIL_F_NO_INTERRUPT.to_le()) };
+        if let Some(ue) = self.used_event {
+            unsafe { write_volatile(ue, 0) };
+        }
     }
 }
 
@@ -489,6 +658,141 @@ mod tests {
         assert!(want > 0x1_0000);
         assert_eq!(f.ring.avail_idx, f.dev_avail);
         assert_eq!(f.ring.last_used, f.dev_used);
+    }
+
+    /// A request's table: header out, data and status in
+    fn table3() -> [Desc; 3] {
+        let mut t = [Desc::default(); 3];
+        set_chain(&mut t, 0, sg(0x10, 16), false);
+        set_chain(&mut t, 1, sg(0x20, 512), true);
+        set_chain(&mut t, 2, sg(0x30, 1), true);
+        t
+    }
+
+    #[test]
+    fn indirect_takes_one_slot() {
+        let mut f = Fake::new(4);
+        let t = table3();
+        let e: Vec<(u64, u32, u16, u16)> =
+            t.iter().map(|d| (d.addr, d.len, d.flags, d.next)).collect();
+        let (n, w) = (VRING_DESC_F_NEXT, VRING_DESC_F_WRITE);
+        assert_eq!(
+            e,
+            [(0x10, 16, n, 1), (0x20, 512, n | w, 2), (0x30, 1, w, 3)]
+        );
+        assert_eq!(t[2].sg().addr, 0x30);
+        for k in 0..4 {
+            f.ring.add_indirect(0x9000 + k, 3, k as usize).unwrap();
+        }
+        assert_eq!(f.ring.add_indirect(0x9000, 3, 9), Err(VqError::NoSpace));
+        assert_eq!(f.ring.num_free(), 0);
+        let (h, c) = f.pop().unwrap();
+        assert_eq!(c, [(0x9000, 48, VRING_DESC_F_INDIRECT)]);
+        f.push(h, 0);
+        assert_eq!(f.ring.get(), Some((0, 0)));
+        assert_eq!(f.ring.num_free(), 1);
+        // The freed slot takes a direct chain of one
+        f.ring.add(&[sg(5, 5)], &[], 5).unwrap();
+        assert_eq!(f.ring.add_indirect(1, 0, 0), Err(VqError::Empty));
+    }
+
+    #[test]
+    fn table_as_direct_chain() {
+        let mut f = Fake::new(4);
+        let t = table3();
+        assert_eq!(f.ring.add_chain(&t[..0], 0), Err(VqError::Empty));
+        f.ring.add_chain(&t, 7).unwrap();
+        assert_eq!(f.ring.add_chain(&t, 8), Err(VqError::NoSpace));
+        let (h, c) = f.pop().unwrap();
+        let (n, w) = (VRING_DESC_F_NEXT, VRING_DESC_F_WRITE);
+        assert_eq!(c, [(0x10, 16, n), (0x20, 512, n | w), (0x30, 1, w)]);
+        f.push(h, 513);
+        assert_eq!(f.ring.get(), Some((7, 513)));
+        assert_eq!(f.ring.num_free(), 4);
+    }
+
+    #[test]
+    fn need_event_window() {
+        // Passing the event index from old to new (exclusive of old)
+        assert!(need_event(5, 6, 5));
+        assert!(need_event(5, 8, 2));
+        assert!(!need_event(5, 5, 2));
+        assert!(!need_event(5, 9, 6));
+        assert!(!need_event(5, 5, 5));
+        // Across the 16-bit wrap
+        assert!(need_event(0xffff, 0x0001, 0xfffe));
+        assert!(need_event(0, 1, 0xffff));
+        assert!(!need_event(2, 1, 0xffff));
+    }
+
+    #[test]
+    fn event_idx_suppression() {
+        let mut f = Fake::new(8);
+        f.ring.set_event_idx();
+        let lay = f.ring.lay;
+        let avail_event = lay.used + 4 + 8 * 8;
+        let used_event = lay.avail + 4 + 2 * 8;
+        // The device wants a kick once avail passes 0: the first add
+        f.wr16(avail_event, 0);
+        f.ring.add(&[sg(1, 1)], &[], 1).unwrap();
+        assert!(f.ring.needs_notify());
+        // Nothing new: no kick
+        assert!(!f.ring.needs_notify());
+        // The device asks again at 3: adds 2 and 3 cover only index 2
+        f.wr16(avail_event, 3);
+        f.ring.add(&[sg(2, 1)], &[], 2).unwrap();
+        assert!(!f.ring.needs_notify());
+        f.ring.add(&[sg(3, 1)], &[], 3).unwrap();
+        f.ring.add(&[sg(4, 1)], &[], 4).unwrap();
+        assert!(f.ring.needs_notify());
+        // The flags no longer count
+        f.wr16(lay.used, VRING_USED_F_NO_NOTIFY);
+        f.wr16(avail_event, 4);
+        f.ring.add(&[sg(5, 1)], &[], 5).unwrap();
+        assert!(f.ring.needs_notify());
+        // Consuming moves used_event to the next entry while callbacks
+        // are on; disabled, it is out of the way and stays there
+        for _ in 0..5 {
+            let (h, _) = f.pop().unwrap();
+            f.push(h, 0);
+        }
+        assert!(f.ring.get().is_some());
+        assert_eq!(f.rd16(used_event), 1);
+        f.ring.disable_cb();
+        assert!(f.ring.get().is_some());
+        assert_eq!(f.rd16(used_event), 0);
+        // Enabling asks for the next entry and reports what is pending
+        assert!(!f.ring.enable_cb());
+        assert_eq!(f.rd16(used_event), 2);
+        while f.ring.get().is_some() {}
+        assert_eq!(f.rd16(used_event), 5);
+        assert!(f.ring.enable_cb());
+    }
+
+    /// With the event index, turning callbacks off moves used_event out
+    /// of the way (Linux virtqueue_disable_cb_split writes 0), from the
+    /// ring or the ISR's lock-free handle; consuming leaves it there and
+    /// enabling brings it back to the next entry
+    #[test]
+    fn event_idx_disable() {
+        let mut f = Fake::new(8);
+        f.ring.set_event_idx();
+        let used_event = f.ring.lay.avail + 4 + 2 * 8;
+        for t in 0..3 {
+            f.ring.add(&[sg(t, 1)], &[], t as usize).unwrap();
+            let (h, _) = f.pop().unwrap();
+            f.push(h, 0);
+        }
+        assert!(f.ring.get().is_some());
+        assert_eq!(f.rd16(used_event), 1);
+        f.ring.disable_cb();
+        assert_eq!(f.rd16(used_event), 0);
+        assert!(f.ring.get().is_some());
+        assert_eq!(f.rd16(used_event), 0);
+        assert!(!f.ring.enable_cb());
+        assert_eq!(f.rd16(used_event), 2);
+        f.ring.cb().disable();
+        assert_eq!(f.rd16(used_event), 0);
     }
 
     #[test]

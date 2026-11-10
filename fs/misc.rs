@@ -6,12 +6,13 @@
 //! - xattr syscalls (extended attributes)
 //! - readahead (file readahead)
 
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::{Inode, KernelError, LookupFlags, lookup_path_flags};
-use crate::uaccess::{UserPtr, access_ok, copy_to_user, strncpy_from_user, strncpy_from_user_str};
+use crate::uaccess::{
+    UaccessError, UserPtr, access_ok, copy_to_user, strncpy_from_user, strncpy_from_user_str,
+};
 use crate::util::error::KernelResult;
 
 use super::io::fget;
@@ -238,7 +239,6 @@ pub fn sys_mount(
     mut flags: u64,
     data_ptr: UserPtr<u8>,
 ) -> KernelResult<()> {
-    use crate::uaccess::UaccessError;
     // Linux copy_mount_string (strndup_user): EFAULT, EINVAL if too long;
     // type, then source, then the target as a path name. Source and type
     // may be absent for remount / propagation changes; a type is a name
@@ -534,15 +534,16 @@ fn xattr_err(e: KernelError) -> KernelError {
     }
 }
 
-/// An xattr name: any copy failure is EFAULT, an empty or too long
-/// name ERANGE (BUGS.md: Linux import_xattr_name)
-fn xattr_name(ptr: UserPtr<u8>) -> KernelResult<String> {
-    let name = strncpy_from_user_str(ptr.addr(), XATTR_NAME_MAX + 1)
-        .map_err(|_| KernelError::BadAddress)?;
-    if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return Err(KernelError::Range);
+/// An xattr name, any bytes but NUL (Linux import_xattr_name): empty
+/// or without a NUL in XATTR_NAME_MAX + 1 bytes is ERANGE, a fault
+/// EFAULT
+fn xattr_name(ptr: UserPtr<u8>) -> KernelResult<Vec<u8>> {
+    match strncpy_from_user(ptr.addr(), XATTR_NAME_MAX + 1) {
+        Ok(name) if name.is_empty() => Err(KernelError::Range),
+        Ok(name) => Ok(name),
+        Err(UaccessError::TooLong) => Err(KernelError::Range),
+        Err(_) => Err(KernelError::BadAddress),
     }
-    Ok(name)
 }
 
 /// Lookup flags of the path xattr calls (the l* ones do not follow)
@@ -579,7 +580,7 @@ fn copy_xattr_value_from_user(value_ptr: UserPtr<u8>, size: u64) -> KernelResult
 
 /// Linux vfs_setxattr, write access already held: the permission
 /// check, then the file system's op
-fn setxattr_inode(inode: &Arc<Inode>, name: &str, value: &[u8], flags: i32) -> KernelResult<()> {
+fn setxattr_inode(inode: &Arc<Inode>, name: &[u8], value: &[u8], flags: i32) -> KernelResult<()> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
     inode
         .i_op
@@ -671,7 +672,7 @@ pub fn sys_fsetxattr(
 /// file system when the buffer is too small
 fn getxattr_inode(
     inode: &Arc<Inode>,
-    name: &str,
+    name: &[u8],
     value_ptr: UserPtr<u8>,
     size: u64,
 ) -> KernelResult<usize> {
@@ -681,18 +682,32 @@ fn getxattr_inode(
     }
     // A larger buffer is clamped (Linux do_getxattr): no value is longer
     let size = size.min(XATTR_SIZE_MAX as u64) as usize;
-    // EFAULT before ENOMEM
-    if !access_ok(value_ptr.addr(), size) {
-        return Err(KernelError::BadAddress);
-    }
-    // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
+    // Allocate kernel buffer (ENOMEM, Linux kvzalloc); the user buffer
+    // is only touched by the copy
     let mut value = crate::util::kmem::try_vec(size, 0u8)?;
     let n = inode
         .i_op
         .getxattr(inode, name, &mut value)
-        .map_err(xattr_err)?;
-    copy_to_user(value_ptr.addr(), &value[..n])?;
-    Ok(n)
+        .map_err(|e| too_big(xattr_err(e), size, XATTR_SIZE_MAX))?;
+    copy_out(value_ptr, &value[..n])
+}
+
+/// ERANGE for a buffer of the largest size: what the file system has
+/// cannot be returned at all (Linux do_getxattr, listxattr: E2BIG)
+fn too_big(e: KernelError, size: usize, max: usize) -> KernelError {
+    if e == KernelError::Range && size >= max {
+        KernelError::ArgListTooLong
+    } else {
+        e
+    }
+}
+
+/// The `n` bytes of `buf` to user `ptr`, none touched when `n` is 0
+fn copy_out(ptr: UserPtr<u8>, buf: &[u8]) -> KernelResult<usize> {
+    if !buf.is_empty() {
+        copy_to_user(ptr.addr(), buf)?;
+    }
+    Ok(buf.len())
 }
 
 /// sys_getxattr - get an extended attribute value
@@ -758,15 +773,15 @@ fn listxattr_inode(inode: &Arc<Inode>, list_ptr: UserPtr<u8>, size: u64) -> Kern
     if size == 0 {
         return inode.i_op.listxattr(inode, &mut []).map_err(xattr_err);
     }
-    // EFAULT before ENOMEM
-    if !access_ok(list_ptr.addr(), size as usize) {
-        return Err(KernelError::BadAddress);
-    }
-    // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer
-    let mut list = crate::util::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8)?;
-    let n = inode.i_op.listxattr(inode, &mut list).map_err(xattr_err)?;
-    copy_to_user(list_ptr.addr(), &list[..n])?;
-    Ok(n)
+    // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer; the
+    // user buffer is only touched by the copy
+    let size = size.min(XATTR_LIST_MAX as u64) as usize;
+    let mut list = crate::util::kmem::try_vec(size, 0u8)?;
+    let n = inode
+        .i_op
+        .listxattr(inode, &mut list)
+        .map_err(|e| too_big(xattr_err(e), size, XATTR_LIST_MAX))?;
+    copy_out(list_ptr, &list[..n])
 }
 
 /// sys_listxattr - list extended attribute names
@@ -815,7 +830,7 @@ pub fn sys_flistxattr(fd: i32, list_ptr: UserPtr<u8>, size: u64) -> KernelResult
 }
 
 /// Linux vfs_removexattr, write access already held
-fn removexattr_inode(inode: &Arc<Inode>, name: &str) -> KernelResult<()> {
+fn removexattr_inode(inode: &Arc<Inode>, name: &[u8]) -> KernelResult<()> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
     inode.i_op.removexattr(inode, name).map_err(xattr_err)
 }
@@ -908,8 +923,13 @@ pub mod falloc_mode {
 /// Linux ksys_fallocate + vfs_fallocate: the argument and file checks in
 /// Linux's order, then the filesystem's op under i_rwsem
 pub fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> KernelResult<()> {
-    use falloc_mode::*;
     let file = fget(fd)?;
+    vfs_fallocate(&file, mode, offset, len)
+}
+
+/// Linux vfs_fallocate on an open file (fallocate(2), MADV_REMOVE)
+pub fn vfs_fallocate(file: &super::File, mode: i32, offset: i64, len: i64) -> KernelResult<()> {
+    use falloc_mode::*;
     if offset < 0 || len <= 0 {
         return Err(KernelError::InvalidArgument);
     }

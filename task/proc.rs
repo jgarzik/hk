@@ -109,6 +109,7 @@ pub fn sys_clone(
         cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
         set_tid: super::percpu::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
+        io_thread: None,
     })
 }
 
@@ -141,6 +142,7 @@ pub fn sys_fork() -> KernelResult<i64> {
         cgroup_fd: -1,
         set_tid: super::percpu::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
+        io_thread: None,
     })
 }
 
@@ -178,6 +180,7 @@ pub fn sys_vfork() -> KernelResult<i64> {
         cgroup_fd: -1,
         set_tid: super::percpu::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
+        io_thread: None,
     })
 }
 
@@ -657,5 +660,6 @@ pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
         cgroup_fd,
         set_tid,
         set_tid_size: n,
+        io_thread: None,
     })
 }

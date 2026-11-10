@@ -16,24 +16,15 @@ infallible, so each one is investigated, not written off.
   got 9` (SIGKILL where SIGXCPU was expected first); passed on rerun.
   Likely CPU-time accounting under a loaded host.
 
-## Seen on hk only
-
-- **MM_FAULT_STORM once under LOCKDEP**: one x86 `make check LOCKDEP=1`
-  run reported `MM_FAULT_STORM:FAIL got 0` (no wrong value: a thread did
-  not finish within the 60 s join); three later LOCKDEP runs (x86 twice,
-  arm64) passed. Either LOCKDEP slowness against the join timeout or a
-  missed wakeup on the contended mmap_lock; a recurrence should dump
-  the stuck threads' state.
-
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
-There are 50 files with `#![expect(clippy::undocumented_unsafe_blocks)]
-// TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`). Most of their
-blocks belong in a missing wrapper:
+Files marked `#![expect(clippy::undocumented_unsafe_blocks)]
+// TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`) remain.
+Most of their blocks belong in a missing wrapper:
 
 - **Frames:** an owned / page-locked / PTL-held frame borrow type in
-  place of the `frame_bytes` unsafe fn (17 callers: vfat, pipe, splice,
-  exec, fault, filemap, swap).
+  place of the `mm/page.rs` `frame_bytes` unsafe fn (callers: vfat,
+  pipe, fault, filemap, swap, blkdev_ops).
 - **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
   `&T` into device-written memory: xhci rings and contexts, virtio
   rings and blk, e1000 descriptors, virtio-net buffers.
@@ -46,16 +37,9 @@ blocks belong in a missing wrapper:
   without wait, `stop_one_cpu_nowait`, kthread `fn(usize)`) still carry
   integers or casts; the waiting forms have typed `_ref` variants.
 
-## cgroup names must be UTF-8
-
-**Location:** `fs/cgroupfs.rs`.
-
-mkdir of a name that is not valid UTF-8 is EINVAL; Linux kernfs takes
-any bytes.
-
 ## cgroup controller application gaps
 
-**Location**: `cgroup/mod.rs`, `fs/cgroupfs.rs`
+**Location**: `cgroup/mod.rs`, `cgroup/cgroupfs.rs`
 
 Enabling a controller in cgroup.subtree_control creates its state only
 for cgroups made afterwards (Linux cgroup_apply_control creates it for
@@ -78,9 +62,9 @@ back up the hierarchy), the IO token bucket under the queue's lock
 
 ## user/ does not follow doc/UNSAFE.md
 
-The `user/syscall` wrappers are safe `pub fn`s, and about 330 of them take
+The `user/syscall` wrappers are safe `pub fn`s, and many of them take
 raw pointers, so `sys_read(fd, 0x1234 as *mut u8, n)` corrupts memory
-without `unsafe`. The boot tester uses about 80 `static mut`, open-codes
+without `unsafe`. The boot tester uses many `static mut`, open-codes
 volatile access to mmap'd memory, and defines `mem*` without
 `#![no_builtins]`.
 
@@ -154,15 +138,16 @@ Missing:
   and pipe allocations that may sleep reclaim directly; atomic heap
   allocations never do, so with anonymous memory filling RAM they fail
   at the low watermark until kswapd (J) keeps free memory above it.
-- SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
-  IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
-  by id still work there).
 - File mappings: no fault-around (Linux maps up to 16 cached pages
   per read fault); filesystems without a page cache (procfs) still
   map a private copy.
-- MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
-  holes); shmdt needs the address an attachment starts at (Linux also
-  finds a piece moved by mremap); SHM_EXEC is ignored.
+- A MAP_PRIVATE file mapping's copy of a page (its write fault) is not
+  an anonymous page (no rmap, no LRU; Linux makes it one): a read pin
+  (`mm/gup.rs` `follow_pin`) of such a copy still shared copy-on-write
+  after fork pins it shared instead of first giving the mapping its own
+  (Linux gup_must_unshare).
+- shmdt needs the address an attachment starts at (Linux also finds a
+  piece moved by mremap); SHM_EXEC is ignored.
 - shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
   range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
   an address).
@@ -266,6 +251,54 @@ lo (hk has no checksum offload states).
 - fanotify_mark keeps only the mask: FAN_MARK_IGNORED_MASK,
   FAN_MARK_IGNORE, FAN_MARK_IGNORED_SURV_MODIFY and FAN_MARK_EVICTABLE
   are accepted but have no effect (Linux fanotify_add_mark).
+- A NULL pathname is EINVAL; Linux fanotify_find_path marks dfd's own
+  file (a descriptor, not a path-only one).
+
+## O_DIRECT gaps
+
+**Location**: `fs/blkdev_ops.rs`, `block/dio.rs`, `block/blkdev.rs`,
+`fs/vfat/`
+
+- Block-device and vfat O_DIRECT from kernel virtual memory (a kernel
+  `IovDest` or `IovSource`) is not pinned (`get_pages`: EOPNOTSUPP)
+  and takes the cached path; Linux sends bios from it (ITER_KVEC) with
+  the same alignment rules. Pinned pages (Linux ITER_BVEC: io_uring's
+  registered buffers) go to bios through `dio::submit_async`.
+- vfat writes a file page back whole (`VfatAops::writepage`); Linux
+  writes only its dirty blocks (buffer heads), so a block of the page
+  changed on disk behind the cache (a raw device write) is overwritten
+  by hk with the cached copy.
+
+## Linux AIO gaps
+
+**Location**: `io/aio/`
+
+- RWF_NOWAIT on a file without nonblocking I/O (Linux: no
+  FMODE_NOWAIT) fails the request's event with EOPNOTSUPP; Linux fails
+  the io_submit itself (kiocb_set_rw_flags). hk has no FMODE_NOWAIT.
+- IOCB_CMD_FSYNC/FDSYNC on a file without ->fsync (pipes, sockets) is
+  an event of 0: `FileOps::fsync` defaults to success (fsync(2) too);
+  Linux fails the io_submit with EINVAL (aio_fsync).
+- The ring is one physically contiguous `SharedRegion`: a large
+  io_setup (aio-max-nr's default allows 4 MiB) can fail with ENOMEM
+  under fragmentation; Linux's ring is separate pages
+  (`ring::AioRing`; io_uring's rings likewise).
+- FSYNC/FDSYNC and poll completion work run on `SYSTEM_WQ`'s single
+  worker, one at a time; Linux's system_wq runs concurrency-managed
+  pools.
+- An ended O_DIRECT request is released in thread context
+  (`Kiocb::put_any` -> `Kioctx::defer`: the reap list, drained by the
+  next io_submit/io_getevents or a delayed work item), not where its
+  bios end as Linux iocb_destroy (unpinning there unless pages must be
+  dirtied under their page lock: bio_check_pages_dirty; fput's
+  delayed_fput for a last file reference). Releasing there needs a
+  file put that is safe in hardirq, which `Arc<File>` cannot give
+  atomically (no "drop unless last"; the file must not move: its
+  address keys flock locks). AIO 4K QD1 (`make check BENCH=1`,
+  DIO_BENCH) is unexplained and noisy: 12k..81k IOPS across boots of
+  one kernel, Linux 15k..110k on the same host; with the request
+  spinning on the ring rather than sleeping, about 16.5 us per request
+  (submit about 3 us), sleeping adds about 5 us.
 
 ## File lock gaps
 
@@ -281,8 +314,6 @@ No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS as with no tracer), no
 user notification (SECCOMP_RET_USER_NOTIF, SECCOMP_GET_NOTIF_SIZES), no
 FLAG_TSYNC_ESRCH / FLAG_SPEC_ALLOW / FLAG_WAIT_KILLABLE_RECV, and
 nothing is logged for RET_LOG or FLAG_LOG.
-SECCOMP_GET_ACTION_AVAIL takes `args` as the action itself; Linux
-reads a u32 action from the user pointer `args` (EFAULT if bad).
 
 ## Pipe size is fixed
 
@@ -332,7 +363,7 @@ EPERM).
 ## Before user namespaces grant capabilities
 
 **Location**: `task/mod.rs` (`capable`), `fs/dac.rs`, `ns/mod.rs`,
-`fs/mount.rs`, `net/netlink/rtnetlink.rs`
+`fs/mount.rs`, `fs/pnode.rs`, `net/netlink/rtnetlink.rs`
 
 Safe today only because a user namespace grants no capabilities. First:
 - each `capable()` becomes Linux's `ns_capable(<owner>->user_ns)` (or
@@ -344,6 +375,13 @@ Safe today only because a user namespace grants no capabilities. First:
   mounts into slaves (CL_SHARED_TO_SLAVE).
 - netlink newlink/setlink check CAP_NET_ADMIN in the target netns too
   once IFLA_NET_NS_PID/FD are implemented (`7b735ef81286`).
+- creating a namespace together with CLONE_NEWUSER checks capabilities
+  in the new user namespace, where the caller holds every capability
+  (today any namespace but a user namespace needs the caller's own
+  CAP_SYS_ADMIN, even with CLONE_NEWUSER), and /proc/<pid>/uid_map and
+  gid_map become writable.
+- mounts become user-namespace aware (plain `capable()` today): copies
+  of a namespace are always peers and never locked.
 
 ## Credentials have no identity
 
@@ -358,28 +396,27 @@ linked on hk without CAP_DAC_READ_SEARCH; Linux gives ENOENT. The
 capability is checked in the caller's namespace (Linux: the opener's
 `user_ns`); hk has one user namespace.
 
-User namespaces grant no capabilities: creating any namespace but a
-user namespace needs the caller's own CAP_SYS_ADMIN, even together with
-CLONE_NEWUSER (Linux checks in the new user namespace, where the caller
-holds every capability), and /proc/<pid>/uid_map and gid_map cannot be
-written.
+## POSIX mqueue gaps
 
+**Location**: `ipc/mqueue.rs`
 
 POSIX message queues reject creation by an unprivileged user with
-EACCES (`ipc/mqueue.rs`): hk has no 01777 `/dev/mqueue`, so only root
+EACCES: hk has no 01777 `/dev/mqueue`, so only root
 creates queues, where Linux lets any user. mq_attr_ok's soft caps
 (msgsize_max 8192, msg_max 10 without CAP_SYS_RESOURCE) are therefore
 unreachable today.
 There is no mqueue filesystem at all: queues live only in a kernel
 table, so they cannot be listed or read as files under /dev/mqueue
-(Linux mqueue_fs_type).
+(Linux mqueue_fs_type), and an mq_open descriptor does not open again
+through /proc/<pid>/fd or O_EMPTYPATH (ENXIO; Linux opens the queue
+through the mqueue mount).
 mq_notify with SIGEV_THREAD is EINVAL: Linux delivers that notice as
 a message on a netlink socket the caller names (NETLINK_NOTIFY_COOKIE,
 glibc's helper thread), and hk has no such path.
 
 ## sysfs gaps
 
-**Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
+**Location**: `fs/kernfs/`, `fs/kernfs/sysfs.rs`, `base/`, `block/genhd.rs`,
 `net/sysfs.rs`, `hw/pci/driver.rs`
 
 - No power/ directories (Linux dpm_sysfs_add: control, runtime_status,
@@ -469,15 +506,14 @@ Accepted without effect: MS_SILENT, MS_MANDLOCK, MS_POSIXACL,
 MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated
 copy lands on top of what is already mounted at the target (Linux
 tucks it under); a slave's master is its master's peer group, not one
-mount; copies of a namespace are always peers and not locked (Linux
-copy_mnt_ns for a less privileged user namespace makes shared mounts
-slaves, CL_SHARED_TO_SLAVE, and locks them, lock_mnt_tree): harmless
-while CLONE_NEWNS needs root and mounts ignore user namespaces, but
-required before mounts become user-namespace aware. Mount options are
+mount; copies of a namespace are always peers and not locked (see
+"Before user namespaces grant capabilities"). Mount options are
 parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
-cp437 only), ramfs (mode=) and procfs (hidepid=, gid=, subset=pid);
-devtmpfs and cgroupfs ignore theirs, and only procfs applies options
-on a remount or shows them in /proc/mounts; mounts are not user-namespace aware (plain capable()).
+cp437 only), ramfs (mode=), tmpfs and devtmpfs (see "tmpfs gaps") and
+procfs (hidepid=, gid=, subset=pid; devtmpfs drops a new mount's after
+parsing them, as Linux 6.15+); cgroupfs ignores its own, and only
+procfs, tmpfs and devtmpfs apply options on a remount or show them in
+/proc/mounts.
 Crossing into a mount scans the current mount's children (Linux hashes
 (parent, mountpoint): mount_hashtable).
 
@@ -493,10 +529,7 @@ namespaces, the nullfs that stands in for an unmounted mount and the
 empty immutable regular file. Locks are not refused with ENOLCK
 (31a1fb90624d), MS_REMOUNT and umount of the root are not refused on
 the internal superblock (d791606bb915), and nothing marks knullfs's
-root as unmountable (e22e69c2ad88: dont_mount). The rootfs is
-always a ramfs; Linux fills it as tmpfs when it has CONFIG_TMPFS
-(Ubuntu does), so statfs("/") on the initramfs differs until hk has a
-tmpfs (doc/ROADMAP.md phase F). Kernel code that resolves a path from a kernel thread finds nothing
+root as unmountable (e22e69c2ad88: dont_mount). Kernel code that resolves a path from a kernel thread finds nothing
 (knullfs); hk has none today, and has no scoped_with_init_fs for one
 that would need init's root.
 
@@ -535,24 +568,34 @@ always infinite, promote_secondaries is off.
 RTM_NEWLINK/RTM_SETLINK ignore IFLA_NET_NS_PID/IFLA_NET_NS_FD: they
 return 0 without moving the device (Linux: moved, or an error).
 
-## io_uring has no shared rings
+## io_uring gaps
 
-**Location**: `io/io_uring.rs`
+**Location**: `io/io_uring/`
 
-io_uring_setup returns ring offsets, but nothing maps the SQ ring, the
-CQ ring or the SQE array (IORING_OFF_SQ_RING/CQ_RING/SQES), so user
-SQEs never reach the kernel and CQEs never reach user space: submit
-works on a kernel-side copy, and `post_cqe` assumes the CQ head is 0.
-Missing on top of that:
-- `io_uring_enter(IORING_ENTER_GETEVENTS)` never blocks (`wait_completions`
-  is a stub) and ignores IORING_ENTER_EXT_ARG
+- GETEVENTS ignores io_uring_getevents_arg's min_wait_usec (Linux
+  IORING_FEAT_MIN_TIMEOUT) and IORING_ENTER_ABS_TIMER (EINVAL)
+- What would block goes to io-wq workers that block where Linux arms
+  poll (a read of an empty pipe or socket, Linux IORING_FEAT_FAST_POLL):
+  one worker per blocked request; on an O_NONBLOCK pipe or socket the
+  worker's read is EAGAIN (Linux polls until it is ready). Link chains
+  run in a worker, not issued inline one by one; a chain with
+  poll/timeout bookkeeping runs in io_uring_enter
+- A queued request with offset -1 does not move the file position (as
+  Linux), an inline one does
 - IORING_OP_TIMEOUT has no timer (nothing ever completes it), and has
   no count trigger, TIMEOUT_UPDATE or MULTISHOT
 - IORING_OP_LINK_TIMEOUT returns 0 without arming anything
-- poll ops never complete asynchronously; IOSQE_IO_DRAIN and ASYNC are
-  ignored
-
-The boot tests cover setup and enter return values only.
+- poll ops never complete asynchronously
+- IORING_OP_OPENAT2 is not handled (Linux io_openat2: the open_how
+  rules of `fs/open.rs` sys_openat2, without its page limit), nor
+  most opcodes past IORING_OP_SHUTDOWN (EINVAL CQEs)
+- Setup flags: no SQPOLL (Linux allows it unprivileged), SUBMIT_ALL,
+  COOP_TASKRUN, TASKRUN_FLAG, SINGLE_ISSUER, DEFER_TASKRUN,
+  NO_SQARRAY, SQE128/CQE32, NO_MMAP, REGISTERED_FD_ONLY, R_DISABLED,
+  ATTACH_WQ (EINVAL); no registered ring fds
+  (IORING_ENTER_REGISTERED_RING), personalities, provided buffers,
+  eventfd, buffer updates or tags (IORING_REGISTER_BUFFERS2,
+  BUFFERS_UPDATE)
 
 ## Rare QEMU crash in the arm64 boot test (host CPU suspected)
 
@@ -560,7 +603,7 @@ The boot tests cover setup and enter return values only.
 host, `make check-arm`)
 
 qemu-system-aarch64 occasionally dies in the guest stage-1 page table
-walk (arm_ldq_ptw, target/arm/ptw.c:671; once S1_ptw_translate): the
+walk (arm_ldq_ptw in target/arm/ptw.c; once S1_ptw_translate): the
 fault address differs from the pointer the faulting load holds, so the
 host CPU computed a wrong address. The crashes run on CPUs 5 and 2,
 the favored cores, which also lead the host's segfault count for other
@@ -569,40 +612,30 @@ page tables hardest. Nothing in hk can avoid it. To do: check the BIOS
 for Intel default power/turbo settings and current microcode,
 stress-test CPUs 2 and 5, or keep gate QEMUs off them (taskset).
 
-## Interrupts run on the task stack (no IRQ stacks)
-
-**Location**: `arch/aarch64/vectors.S`, `arch/x86_64/`
-(IRQ entry)
-
-An interrupt pushes its trap frame (0x320 bytes on arm64, with the
-FP/SIMD registers) and handler frames onto whatever 16 KB task stack
-it lands on, so the deepest syscall path plus the deepest interrupt
-must fit in one stack. An overflow faults in the guard gap below the
-stack ("kernel stack overflow" panic, `mm::vmstack`). Linux has per-CPU IRQ stacks (x86 hardirq_stack,
-arm64 irq_stack).
-
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 
 **Location**: unknown (CPU 0, right after `FAULT_SEGV_ACCERR`, i.e. while
 `FAULT_SIGILL` runs `udf` in user mode)
 
-One "KERNEL PANIC ... exceptions.rs:95" (kernel instruction abort) in
-about 190 `make check-arm` runs (QEMU neoverse-n1 with PAN, -smp 4);
+One "KERNEL PANIC" from the arm64 `exceptions.rs` kernel instruction
+abort handler, rare across many `make check-arm` runs (QEMU neoverse-n1
+with PAN, -smp 4);
 ELR/FAR were not captured. Next occurrence: capture the Message line.
 
-## ramfs has no size limit
+## tmpfs gaps
 
-**Location**: `fs/ramfs.rs`, `mm/filemap.rs`,
-`mm/frame_alloc.rs`
+**Location**: `fs/ramfs/tmpfs.rs`, `fs/ramfs/mod.rs`, `mm/filemap.rs`
 
-ramfs (the root filesystem and every ramfs mount) is bounded only by
-memory, for every user: writes fail with ENOSPC once free frames reach
-the low watermark (min_free_kbytes formula), and the memory comes back when the last link and the last
-open reference of a file are gone (or on truncate). Linux's rootfs is a
-tmpfs limited to half of RAM by default; tmpfs with `size=`/`nr_inodes=`
-limits (and per-user accounting) comes with phase F (tmpfs).
-Reads of holes need a zeroed page each and can fail with ENOMEM when
-memory is at the low watermark (Linux maps the shared zero page).
+tmpfs/shmem is not swap-backed (phase J): its pages, SysV shm and
+shared anonymous memory included, never go to swap (the mapping is
+unevictable, like ramfs; Linux shmem_writeout swaps them), and noswap
+is only recorded. huge= takes only
+never, mpol= and the quota options are refused (EINVAL), as on a Linux
+without THP, NUMA or CONFIG_TMPFS_QUOTA. inode32 is recorded and shown
+but inode numbers do not wrap at 2^32 (Linux shmem_reserve_inode).
+F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
+pinned by other references (Linux memfd_wait_for_pins: EBUSY after
+waiting).
 
 ## Kernel heap (slab) gaps
 
@@ -631,7 +664,7 @@ last page and bss of each segment (copied).
 
 ## The memory cgroup's memory.max is not enforced
 
-**Location**: `cgroup/memory.rs`, `mm/fault.rs`, `mm/shmem.rs`
+**Location**: `cgroup/memory.rs`, `mm/fault.rs`, `mm/filemap.rs`
 
 memory.max, memory.current and memory.events exist, but no page is
 charged: page faults (anonymous and shmem) and page tables are never
@@ -645,15 +678,6 @@ Once enforced, OOM_FAULT_KILL and OOM_SHARED_KILL can run in a small
 cgroup (say memory.max 64MB) at any RAM size, and on Linux too,
 instead of filling all of RAM and being skipped above 4GB
 (`user/boot_tester/mm/mm_oom.rs`).
-
-## BPF map update flags are not checked
-
-**Location**: `bpf/map.rs`, `bpf/syscall.rs`
-
-BPF_MAP_UPDATE_ELEM treats any flags value but BPF_NOEXIST and
-BPF_EXIST as BPF_ANY; Linux returns EINVAL for flags above BPF_EXIST
-and for BPF_F_LOCK on a map without a bpf_spin_lock
-(bpf_map_update_value, htab_map_update_elem).
 
 ## BPF map memory is not charged
 
@@ -672,21 +696,10 @@ The heap picks GFP_ATOMIC by itself under a spin lock, so an allocation
 there takes the atomic reserve silently (Linux needs it named, and
 might_alloc reports a GFP_KERNEL one in atomic context). A LOCKDEP boot
 lists each lock allocated under once (`LOCKDEP:ATOMIC_ALLOC ... under
-<lock> (taken at ...)`; the shutdown summary counts them): 105 locks,
-mostly collections grown under spin mutexes, in fs, net, task and
+<lock> (taken at ...)`; the shutdown summary counts them): mostly
+collections grown under spin mutexes, in fs, net, task and
 ipc (procfs: only its mount-time tree building). Each wants its allocation moved out of the
-lock (preallocate, or a sleeping lock as in Linux).
-
-## Sleeping mutex has no handoff
-
-**Location**: `sync/mutex.rs`
-
-A woken waiter retries the CAS and sleeps again if it lost, so a task
-that unlocks and relocks at once can starve the sleepers indefinitely;
-Linux hands the lock to a waiter that has failed for over a jiffy
-(MUTEX_FLAG_HANDOFF). Seen with a test-only 300 us delay under
-`Pipe.inner` in pipe_read: a reader spinning in non-blocking reads kept
-the writer off the pipe for over 10 s.
+lock (preallocate, or a sleeping lock as in Linux): ROADMAP phase A.
 
 ## Scheduler gaps (deviations from Linux)
 
@@ -706,6 +719,13 @@ the writer off the pipe for over 10 s.
   SCHED_DEADLINE (EINVAL).
 - Kernel preemption is off: a long kernel path delays a woken task of
   a higher class until its next scheduling point.
+- The idle loop (`idle_task_entry`) halts at once: no polling before
+  the halt (TIF_POLLING_NRFLAG, haltpoll), so every remote wakeup pays
+  an IPI and the exit from HLT/WFI. It also runs `yield_now` and
+  `sched_balance_rq` on every pass.
+- `select_idle_sibling` has no wake_affine and no recent_used_cpu: a
+  woken task moves between CPUs from one wakeup to the next, and with
+  it the blk-mq hardware queue its I/O goes to.
 
 ## xHCI driver gaps on real hardware
 
@@ -788,7 +808,10 @@ line firmware wrote into each function's Interrupt Line register (PIC
 mode, legacy BIOS boot), delivered to the boot CPU only. Real hardware
 in APIC mode (UEFI boot; Linux on the Dell uses IOAPIC 16-23 and MSI)
 needs IOAPIC with ACPI `_PRT` routing, or MSI/MSI-X, which xHCI, AHCI
-and r8169 all support. The MADT parser skips IOAPIC entries (Linux
+and r8169 all support: MSI-X exists (`hw/pci/msix.rs`, x86 vectors in
+`arch/x86_64/irq.rs`) but only virtio-blk uses it, and plain MSI (the
+MSI capability, which RTL8168g and some AHCI parts offer alone) is
+missing. The MADT parser skips IOAPIC entries (Linux
 acpi_parse_ioapic registers them).
 
 ## ACPI power management gaps
@@ -806,21 +829,10 @@ mode, a short power-button press does nothing). Only the 32-bit FADT
 block fields are read (no X_ GAS forms, no hardware-reduced ACPI), and
 a reset register in PCI configuration space is ignored.
 
-## vfat file I/O walks the whole cluster chain per page
-
-**Location**: `fs/vfat.rs` (`page_runs`)
-
-Every read_folio, writepage and swap_rw of a vfat file rebuilds its
-whole cluster chain from the FAT (through the device cache) to find a
-page's clusters, so reading or writing back a file is quadratic in its
-size (a 1GB file of 4KB clusters: about 3e10 FAT lookups). Linux
-fat_get_cluster keeps a per-inode cache of chain positions
-(fat_cache); one is needed before large vfat files or vfat swap files.
-
 ## Block layer gaps
 
 **Location**: `block/`, `hw/virtio/blk.rs`,
-`fs/blkdev_ops.rs`, `fs/vfat.rs`
+`fs/blkdev_ops.rs`, `fs/vfat/`
 
 - Partition tables are parsed in 512-byte sectors: on a disk with
   larger logical blocks, GPT LBAs and MBR sector counts are misread
@@ -835,7 +847,8 @@ fat_get_cluster keeps a per-inode cache of chain positions
   BLKROSET, BLKDISCARD, BLKZEROOUT, BLKIOMIN/OPT, BLKALIGNOFF,
   BLKSECTGET, HDIO_GETGEO and the BLKPG partition ioctls are ENOTTY.
 - virtio-blk: modern devices only (QEMU needs `disable-legacy=on`;
-  Linux also drives transitional devices), INTx only (no MSI-X),
+  Linux also drives transitional devices), INTx on arm64 (no MSI: the
+  GICv3 ITS has no driver; Linux uses it on QEMU virt),
   capacity changes (config interrupts) are ignored, no DISCARD,
   WRITE_ZEROES, GET_ID (serial) or secure erase. The disk's queues are
   fixed at probe.
@@ -863,25 +876,34 @@ Designs that grew one commit at a time. Tag = roadmap phase
 (doc/ROADMAP.md).
 
 - **Syscalls that do not deliver** (H/C): inotify queues only
-  IN_DELETE_SELF, IN_UNMOUNT and IN_IGNORED, fanotify nothing (no
-  fsnotify hooks in the VFS operations); rename has no
+  IN_DELETE_SELF, IN_UNMOUNT, IN_IGNORED and IN_Q_OVERFLOW, fanotify
+  nothing (the other events have no fsnotify hooks in the VFS
+  operations); rename has no
   IN_MOVED_FROM/IN_MOVED_TO cookie pairing (Linux fsnotify_get_cookie); waitid without WEXITED is
   EINVAL (C).
-- **Copied helpers** (J, or as touched): four `current_time`s; about ten user-timespec readers each validating
-  (Linux get_timespec64); three iovec structs and five
-  importers; three Timeval, two Timespec types.
+- **Copied helpers** (J, or as touched): `current_time` in cgroupfs,
+  perm, procfs and ramfs, `current_time_secs` in ipc msg/sem/shm;
+  user-timespec readers each validating (futex `read_user_timeout`,
+  poll `read_ts`, mqueue, posix_timer...; Linux get_timespec64);
+  iovec structs (`fs/iov.rs` `IoVec`, `net/msg.rs` `IoVec`/`Iov`) and
+  importers beside `import_iovec` (`net/msg.rs` `Iov::import`,
+  process_vm `remote_iovecs`); Timespec
+  types `time::Timespec`, `LinuxTimespec` (time_syscall), `SemTimespec`
+  (ipc/sem); Timeval types in task/misc and time_syscall, plus
+  `TimexTimeval`.
 - **Process-wide state per thread** (C): pgid/sid copied into every
   thread; one global CHILD_EXIT_WQ wakes every waiting parent on every
   exit.
-- **`task/percpu.rs` is about 4,600 lines** (before C): scheduler core,
-  do_clone (523 lines), exit, wait, credential setters, five sleep
-  APIs. Split like Linux (sched/core, fork, exit, cred). Other giants:
-  sys_prctl, do_semctl, sys_mmap, exec_file, sys_fcntl.
+- **`task/percpu.rs` is the largest file** (before C): scheduler core,
+  do_clone, exit, wait, credential setters, several sleep APIs. Split
+  like Linux (sched/core, fork, exit, cred). Other giant functions:
+  do_clone, sys_prctl, sys_semctl, sys_mmap, exec_file, sys_fcntl.
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
   softnet/0 only; CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
-  (bpf, mqueue, which wrap with no collision check): one
-  IDR/IDA.
+  (bpf map ids, mqueue ids, which wrap with no collision check) move
+  onto `util/ida.rs` (or an IDR), as sd, virtio-blk, virtio and
+  ns/inum already do.
 - **procfs** (H): a file is generated whole (no seq_file records): an
   open file's reads continuing one another see one generation, where
   Linux generates record by record, so a long file's later chunks are
@@ -893,33 +915,33 @@ Designs that grew one commit at a time. Tag = roadmap phase
   reading or writing, not the one the file was opened in (Linux binds
   the file to the opener's namespace): an fd passed across namespaces
   reads and writes the other one's values.
-- **Stale comments and dead code** (as touched): 56 `#[expect(dead_code)]`
-  and over a hundred "for now"/TODO markers; comments that
-  contradict the code in `ns/mod.rs` (setns) and `task/misc.rs`.
+- **Stale comments** (as touched): "for now"/TODO markers; the
+  `ns/mod.rs` `sys_setns` doc says EBADF for a non-namespace fd, the
+  code returns EINVAL.
 
 ## Review gaps, by phase
 
 Tag = roadmap phase (doc/ROADMAP.md).
 
-1. **pcp_free drains the hot end** (J). `mm/page_alloc.rs:441`: a
+1. **pcp_free drains the hot end** (J). `mm/page_alloc.rs` `pcp_free`: a
    freed page is pushed at the head and a drain pops from the head;
    Linux returns the cold tail.
 2. **arm64 /reserved-memory no-map regions are linear-mapped** (D;
-   real HW). `arch/aarch64/dtb.rs:192`: Linux memblock_mark_nomap
+   real HW). `arch/aarch64/dtb.rs` `for_each_firmware_reserved`: Linux memblock_mark_nomap
    removes them (speculative access to secure carve-outs).
 3. **memblock does not grow its arrays** (J). `mm/memblock.rs`: 512
    ranges per set; RAM ranges past that are dropped with a warning (as
    Linux before memblock_allow_resize), but a reservation past it still
    panics; Linux doubles the arrays then (memblock_double_array).
-4. **LRU batch refs defeat exclusivity checks** (J). `mm/fault.rs:504`
-   / `:596`: refcount==1 tests fail while a page sits in the per-CPU
+4. **LRU batch refs defeat exclusivity checks** (J). `mm/fault.rs`
+   `map_swap_page` / `do_wp_page`: refcount==1 tests fail while a page sits in the per-CPU
    add batch, so swap-in makes needless COW copies. Linux drains and
    rechecks (wp_can_reuse_anon_folio).
 5. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
-   reclaimed page** (J). `mm/swap.rs:206`: cluster/free-hint
+   reclaimed page** (J). `mm/swap/swapfile.rs` `alloc_slot`: cluster/free-hint
    allocator, cached sorted device list.
 6. **One AnonVma per fork family, Vec chain** (J).
-   `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
+   `mm/anon_vma.rs` `AnonVma`: O(N×VMAs) under one family write lock.
 7. **reboot(2) in a pid namespace checks `capable`** (B4). It checks
    CAP_SYS_BOOT with `capable`, not in the namespace's user namespace
    (Linux ns_capable(pid_ns->user_ns)): a pid namespace has no owning
@@ -937,7 +959,7 @@ Tag = roadmap phase (doc/ROADMAP.md).
    connect left SYN_SENT by a SYN-ACK or a SYN: something answered on
    the dead port. Not a self-connect: bind(0) gives the dead port an
    odd offset, connect takes even ones while any is free. Not
-   reproduced in 10000 looped runs (with SOCKCORE_PORT_PARITY before
+   reproduced in long looped runs (with SOCKCORE_PORT_PARITY before
    each; x86 and arm64 LOCKDEP e1000, 8 CPUs, CPU spinners, TIME_WAIT
    churn); LOCKDEP builds assert that a listener receiving a SYN owns
    its port in bhash (`TcpSock::assert_owner`). On failure the test
@@ -957,13 +979,12 @@ dumb buffer from shmem and blits it on page flip
 
 **Location**: `fs/proc/mod.rs` (`ns_file`), `ns/mod.rs` (`sys_setns`)
 
-/proc/<pid>/ns/<type> leads to a procfs inode numbered as the
-namespace, not to an nsfs inode: st_dev is procfs's, and the file names
-the task and the type, so setns joins the namespace that task is in at
+/proc/<pid>/ns/<type> leads to an inode on the nsfs mount numbered as
+the namespace, but its operations are procfs's: the file names the
+task and the type, so setns joins the namespace that task is in at
 setns time (Linux: the open file pins the namespace itself, and a bind
 mount of it keeps the namespace alive). No cgroup, time,
-pid_for_children or time_for_children links, no NS_GET_* ioctls, and
-open(O_CREAT) through a link does not follow it.
+pid_for_children or time_for_children links, and no NS_GET_* ioctls.
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 
@@ -991,24 +1012,9 @@ tick, but neither changes how fast the clock runs (Linux
 ntp_update_frequency), and maxerror does not grow each second (Linux
 second_overflow).
 
-## Signal delivery ignores sigaltstack
-
-sigaltstack() records the stack (signal/syscall.rs), but
-setup_rt_frame on both arches never reads it or SA_ONSTACK: the frame
-always goes on the current stack, and uc_stack reports SS_DISABLE.
-A SIGSEGV handler meant to catch stack overflow (Rust std, Go) faults
-on the overflowed stack and the process dies. Linux get_sigframe /
-sigsp switch to the alt stack, __save_altstack fills uc_stack.
-
 ## Errno differs from Linux
 
 - **User namespaces nest one level short** (ns/user.rs clone_ns): hk
   refuses a child of a level-32 namespace; Linux create_user_ns refuses
   only past `parent_ns->level > 32`, so 33 levels nest. Not testable on
   both until uid_map is writable (Linux needs a mapping per level).
-- **fstat, fstatfs check the buffer before the fd** (fs/stat.rs): a
-  bad fd with a bad buffer is EFAULT; Linux newfstat and fstatfs look
-  the fd up first (EBADF) and copy out after.
-- **xattr names: EFAULT for a name too long or not UTF-8**
-  (fs/misc.rs xattr_name): Linux import_xattr_name returns ERANGE for
-  a name without a NUL in XATTR_NAME_MAX + 1 bytes and takes any bytes.

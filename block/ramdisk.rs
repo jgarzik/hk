@@ -104,9 +104,11 @@ fn create(minor: u16, bytes: u64, data: &[u8]) -> Result<Arc<BlockDevice>, Kerne
         pages: Mutex::new(BTreeMap::new()),
     })?;
     rd.copy(true, 0, data.as_ptr().cast_mut(), data.len())?;
-    // brd: no seek cost (Linux QUEUE_FLAG_NONROT)
+    // brd: no seek cost (Linux QUEUE_FLAG_NONROT), never waits
+    // (BLK_FEAT_NOWAIT)
     let limits = QueueLimits {
         rotational: false,
+        nowait: true,
         ..QueueLimits::default()
     };
     let q = RequestQueue::new_bio(rd, limits, false);

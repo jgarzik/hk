@@ -5,6 +5,7 @@
 //! - TIMES_BASIC: times() - clock ticks and process times
 //! - sethostname() - set hostname
 //! - setdomainname() - set domain name
+//! - PROC_CMDLINE: /proc/cmdline
 //! - sethostname() EINVAL - too long name
 //! - clock_settime() - set realtime clock
 //! - clock_settime() EINVAL - cannot set CLOCK_MONOTONIC
@@ -25,6 +26,16 @@ use hk_syscall::{Timeval, sys_gettimeofday, sys_settimeofday};
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
 
+/// PROC_CMDLINE: /proc/cmdline is the kernel command line, one line
+/// (Linux cmdline_proc_show)
+fn test_cmdline() {
+    let mut b = [0u8; 2048];
+    let n = crate::helpers::read_file(b"/proc/cmdline\0", &mut b);
+    let line = &b[..n.max(0) as usize];
+    let ok = n >= 1 && line.last() == Some(&b'\n') && !line[..line.len() - 1].contains(&b'\n');
+    crate::harness::verdict(b"PROC_CMDLINE", ok, n);
+}
+
 /// Run all sysinfo tests
 pub fn run_tests() {
     test_uname();
@@ -37,6 +48,7 @@ pub fn run_tests() {
     test_clock_settime_invalid_nsec();
     test_clock_settime_storm();
     test_loadavg();
+    test_cmdline();
     test_settimeofday_basic();
     test_settimeofday_invalid_usec();
 }

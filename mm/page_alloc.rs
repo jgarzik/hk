@@ -179,7 +179,7 @@ fn direct_reclaim() -> usize {
         // Allocations made while reclaiming do not reclaim again
         // (Linux __perform_reclaim: memalloc_noreclaim_save)
         crate::mm::memalloc_scope(crate::task::pf::MEMALLOC, || {
-            crate::mm::vmscan::try_to_free_pages(crate::mm::vmscan::SWAP_CLUSTER_MAX)
+            crate::mm::swap::vmscan::try_to_free_pages(crate::mm::swap::vmscan::SWAP_CLUSTER_MAX)
         })
     }
     #[cfg(test)]
@@ -650,7 +650,7 @@ impl Zone {
         // (slab)
         #[cfg(not(test))]
         if order == 0 && self.sections.load(Ordering::Relaxed) {
-            crate::mm::lru::page_freed(pfn);
+            crate::mm::swap::lru::page_freed(pfn);
         }
         for i in 0..1u64 << order {
             let pg = self.page(pfn + i);
@@ -723,6 +723,44 @@ impl Zone {
         true
     }
 
+    /// Take `n` references at once (a pin) unless the page is free or
+    /// the count would come near saturation (Linux try_grab_folio's
+    /// overflow check)
+    pub fn get_n(&self, pfn: u64, n: u32) -> bool {
+        let rc = &self.page(pfn).refcount;
+        let mut c = rc.load(Ordering::Relaxed);
+        loop {
+            if c == 0 || c >= u32::MAX / 2 {
+                return false;
+            }
+            match rc.compare_exchange_weak(c, c + n, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(cur) => c = cur,
+            }
+        }
+    }
+
+    /// Drop `n` references at once, freeing the page with the last (as
+    /// `put`); true if freed
+    pub fn put_n(&self, pfn: u64, n: u32) -> bool {
+        let rc = &self.page(pfn).refcount;
+        let mut c = rc.load(Ordering::Relaxed);
+        loop {
+            if c == 0 || c == u32::MAX {
+                return false;
+            }
+            debug_assert!(c >= n, "put_n: {n} of {c} references");
+            let left = c.saturating_sub(n);
+            match rc.compare_exchange_weak(c, left, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) if left == 0 => break,
+                Ok(_) => return false,
+                Err(cur) => c = cur,
+            }
+        }
+        self.release(pfn, self.order_of(pfn));
+        true
+    }
+
     /// Current reference count
     pub fn count(&self, pfn: u64) -> u32 {
         self.page(pfn).refcount.load(Ordering::Relaxed)
@@ -759,9 +797,11 @@ impl Zone {
     // Boot and statistics
     // ------------------------------------------------------------------
 
-    /// Hand the free pfns [start, end) to the buddy lists (boot; Linux
-    /// memblock_free_all), in the largest aligned blocks that fit
-    pub fn free_range(&self, mut start: u64, end: u64) {
+    /// Hand the free pfns [start, end) to the buddy lists (boot, Linux
+    /// memblock_free_all; or reserved boot memory given up later, Linux
+    /// free_reserved_area), in the largest aligned blocks that fit: the
+    /// pages handed over
+    pub fn free_range(&self, mut start: u64, end: u64) -> usize {
         let (lo, hi) = (
             self.start.load(Ordering::Relaxed),
             self.end.load(Ordering::Relaxed),
@@ -769,6 +809,7 @@ impl Zone {
         start = start.max(lo);
         let end = end.min(hi);
         let mut fa = self.lock.lock();
+        let mut freed = 0;
         while start < end {
             let fit = 63 - (end - start).leading_zeros();
             let order = start.trailing_zeros().min(fit).min(MAX_ORDER);
@@ -783,8 +824,10 @@ impl Zone {
             }
             self.managed.fetch_add(1 << order, Ordering::Relaxed);
             self.free_one(&mut fa, start, order);
+            freed += 1 << order;
             start += 1 << order;
         }
+        freed
     }
 
     /// Size the per-CPU lists from the zone size (Linux zone_batchsize:
@@ -1015,6 +1058,30 @@ mod tests {
         let q = t.z.alloc_pages(0, Gfp::KERNEL).unwrap();
         assert!(t.z.put(q));
         assert!(!t.z.put(q));
+    }
+
+    /// A pin's references come and go at once, the last unpin freeing the
+    /// page (mm::gup); a free page, or one whose count nears saturation,
+    /// refuses a pin
+    #[test]
+    fn pin_refs() {
+        let t = zone(0, 16);
+        t.z.free_range(0, 16);
+        let p = t.z.alloc_pages(0, Gfp::KERNEL).unwrap();
+        assert!(t.z.get_n(p, 1024));
+        assert_eq!(t.z.count(p), 1025);
+        // The mapping goes first (munmap), the unpin frees
+        assert!(!t.z.put(p));
+        assert!(t.z.put_n(p, 1024));
+        assert_eq!(t.z.count(p), 0);
+        assert!(!t.z.get_n(p, 1024));
+        assert!(!t.z.put_n(p, 1024));
+        assert_eq!(t.z.count(p), 0);
+        let q = t.z.alloc_pages(0, Gfp::KERNEL).unwrap();
+        t.z.page(q).refcount.store(u32::MAX / 2, Ordering::Relaxed);
+        assert!(!t.z.get_n(q, 1024));
+        t.z.page(q).refcount.store(1, Ordering::Relaxed);
+        assert!(t.z.put(q));
     }
 
     /// A reference taken while another CPU drops the last one either

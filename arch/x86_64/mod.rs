@@ -20,6 +20,7 @@ pub mod io;
 pub mod ioremap;
 pub mod ipi;
 pub mod irq;
+pub mod irq_stack;
 pub mod irqflags;
 pub mod kmap;
 pub mod lapic;
@@ -257,43 +258,8 @@ impl HaltOps for X86_64Arch {
         crate::printkln!("  RBP: {:#018x}", rbp);
         crate::printkln!("  RFLAGS: {:#018x}", rflags);
 
-        // Simple stack backtrace using frame pointers
         crate::printkln!("\nStack backtrace:");
-        let mut frame_ptr = rbp;
-        let mut frame_count = 0;
-        const MAX_FRAMES: usize = 16;
-
-        while frame_ptr != 0 && frame_count < MAX_FRAMES {
-            // Only follow frames on the current kernel stack: RBP may hold a
-            // user value, and reading it would fault again under SMAP
-            if !(rsp..rsp.saturating_add(0x10000)).contains(&frame_ptr) {
-                break;
-            }
-
-            // Read return address (stored at frame_ptr + 8)
-            // SAFETY: frame_ptr lies within this kernel stack's 64KB
-            // (checked above), mapped memory; the panic path's best effort
-            let return_addr = unsafe { *((frame_ptr + 8) as *const u64) };
-            if return_addr == 0 {
-                break;
-            }
-
-            crate::printkln!("  #{}: {:#018x}", frame_count, return_addr);
-
-            // Move to previous frame
-            // SAFETY: as above
-            let prev_frame = unsafe { *(frame_ptr as *const u64) };
-            if prev_frame <= frame_ptr {
-                // Prevent infinite loops
-                break;
-            }
-            frame_ptr = prev_frame;
-            frame_count += 1;
-        }
-
-        if frame_count == 0 {
-            crate::printkln!("  <no frames available>");
-        }
+        interrupts::backtrace(rsp, rbp);
     }
 
     fn halt_loop() -> ! {
@@ -496,9 +462,12 @@ impl ExceptionOps for X86_64Arch {
 }
 
 impl InitramfsOps for X86_64Arch {
-    fn get_initramfs() -> &'static [u8] {
-        crate::arch::x86_64::multiboot2::find_module("initramfs")
-            .expect("initramfs module not loaded by bootloader")
+    fn get_initramfs() -> crate::fs::ramfs::cpio::Initrd {
+        let (start, end) = crate::arch::x86_64::multiboot2::initrd_range()
+            .expect("initramfs module not loaded by bootloader");
+        // SAFETY: a module the info structure lists, reserved since
+        // boot (`boot_ranges`); `find_module` never returns it
+        unsafe { crate::fs::ramfs::cpio::Initrd::loaded(start, end) }
     }
 }
 

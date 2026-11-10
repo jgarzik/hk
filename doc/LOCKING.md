@@ -139,16 +139,43 @@ fn write(&self) -> RwLockWriteGuard<'_, T>
 ### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (sync/)
 
 Linux `struct mutex` and `struct rw_semaphore`: a contended lock sleeps
-on the lock's `WaitQueue` instead of spinning (only a tid-0 caller, the
-boot context before pid 1 exists or an idle task, spins: neither ever
-meets contention), so the holder may sleep (page locks, block I/O,
-user page faults, blocking pipe/socket I/O).
+instead of spinning (only a tid-0 caller, the boot context before pid 1
+exists or an idle task, spins: neither ever meets contention), so the
+holder may sleep (page locks, block I/O, user page faults, blocking
+pipe/socket I/O). No optimistic spinning (hk cannot tell whether an
+owner is running).
 
-- `Mutex<T>`: owner tid recorded (debug builds catch recursive locking
-  and foreign unlocks); `unlock` wakes one waiter, which retries.
+- Wait lock (both): a `sync::spin::Mutex` (Linux wait_lock; interrupts
+  stay on: these locks are thread context only and nothing under the
+  wait lock wakes a task). Lockdep class: the lock's construction site
+  (`Mutex::new`/`RwSem::new` are `#[track_caller]`): all
+  `Inode.i_rwsem` wait locks share one class. A
+  leaf: held only to queue, dequeue and grant, never across a sleep, and
+  nothing is taken under it. The waker queues the tasks to wake on a
+  `task::wake_q::WakeQ` (Linux wake_q: a task reference each, linked
+  through `Task.wake_q`, no allocation) and wakes them after dropping
+  the wait lock (`pi_lock`, run-queue locks). The reference is taken
+  while the waiter is still queued under the wait lock, before a reader
+  sees its grant (`granted`, Release/Acquire), so the waiter may return
+  (its on-stack node gone) and even exit before the wakeup. A task on
+  another `WakeQ` already is not queued twice: that wakeup comes after
+  the caller's store (full barriers on both sides, Linux
+  __wake_q_add), and every sleeping-lock wait rechecks its condition.
+- `Mutex<T>` (Linux kernel/locking/mutex.c): an owner word (the owner's
+  tid shifted past three flags) and a FIFO wait list under the wait
+  lock. Flags: `WAITERS` (list not empty: unlock takes
+  the slow path and wakes the first waiter), `HANDOFF` (set by the
+  first waiter when a retry after its wakeup fails: the next unlock
+  hands the lock to it instead of releasing it), `PICKUP` (handed to
+  the tid in the word; no one else may take it). So a task that
+  unlocks and relocks at once cannot starve a sleeper. Debug builds
+  catch recursive locking and foreign unlocks by the tid.
   `lock_interruptible`/`lock_killable` (Linux mutex_lock_interruptible/
   _killable) give up with EINTR on a signal (any, or SIGKILL) pending
-  while they wait; `try_lock` (mutex_trylock) never sleeps.
+  while they wait, after one more try under the wait lock (so a waiter
+  woken by an unlock never leaves the lock free with sleepers queued);
+  `try_lock` (mutex_trylock) never sleeps and never takes a lock handed
+  to another task.
 - `RwSem<T>` (typed; `RwSem<()>` guards what its owner says):
   `read`/`write` guards, `read_killable`/`write_killable` (Linux
   down_*_killable: a `Killable` sleep, woken by wakeups and SIGKILL
@@ -156,10 +183,23 @@ user page faults, blocking pipe/socket I/O).
   `read_interruptible`/`write_interruptible` (Linux
   down_*_interruptible: any pending signal gives up with EINTR; no
   caller yet), `try_read`/`try_write`, and the raw `down_read`/`up_read`, `down_write`/
-  `up_write` pairs; writer preference: once a writer waits, new readers
-  wait behind it (a killable writer that gives up wakes them). Its
-  count word is a short `spin::Mutex` leaf never held across a sleep;
-  release wakes all waiters (mixed conditions).
+  `up_write` pairs. Linux kernel/locking/rwsem.c: one atomic count
+  (writer bit, `WAITERS`, `HANDOFF`, reader count above bit 8): an
+  uncontended acquire or release is one atomic op; the wait lock and
+  its FIFO list of readers and writers are taken only when the count
+  says so (`WAITERS` and `HANDOFF` change only under it). A free lock is
+  taken at once only while nobody queues (`try_*` likewise); otherwise
+  the locker queues at the tail, except that a reader may steal a lock
+  no reader or writer holds and no handoff guards (then granting the
+  queued readers too). Release (last reader, writer) wakes the front
+  waiter (`mark_wake`): a front writer, which then competes for the
+  lock, or every queued reader (up to 256, writers skipped:
+  phase-fair), granted the lock by the waker before it runs. A waiter
+  past `RWSEM_WAIT_TIMEOUT` (4 ms, at least a tick; at once for an RT
+  writer) that still finds the lock held sets `HANDOFF`: no stealing,
+  and only the front waiter may take the lock, until it has. A front
+  waiter that gives up (signal) wakes the waiters behind it; the last
+  waiter leaving clears `HANDOFF`.
 - Rules: thread context only; never taken in IRQ context or while any
   spinlock is held (`might_sleep` asserts a zero preempt count in debug
   builds; `IrqSpinlock` raises it). Sleeping locks order ABOVE every
@@ -177,7 +217,11 @@ the mmap_lock (`Mm.map`), `AnonVma.chain`; `Mutex`:
 Linux seqlock_t: `write()` takes a spin lock and keeps the sequence odd
 while held (Release fences around the writer's stores); lockless
 readers use `read_begin`/`read_retry` and repeat a read that raced a
-writer. Thread context only. Used for `MOUNT_LOCK`.
+writer. Thread context only. Used for `MOUNT_LOCK`. `SeqRwLock` is the
+same with a spin RwLock (its write guard bumps the sequence): locking
+readers share it (Linux read_seqlock_excl excludes them), lockless ones
+sample the sequence. Used for `dentry::RENAME_LOCK` (Linux rename_lock).
+Both are built on `SeqCount` (Linux seqcount_t), the sequence alone.
 
 ### 1.5 Lockdep-lite (`sync::lockdep`, feature `lockdep`)
 
@@ -296,12 +340,14 @@ VFS locks (detailed order):
     SuperBlock.s_umount (sync::RwSem; write for remount, read for a
                    bind remount)
         ↓
-    mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write)
+    mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write, and
+                   the tree's links in attach_mnt/detach_mnt)
         → SuperBlock.s_mounts (spin leaf: a new mount, a read-only
                    remount's snapshot)
         ↓
-    dentry::RENAME_LOCK (spin RwLock, Linux rename_lock: write in
-                   d_move/d_exchange, read in is_subdir/d_path)
+    dentry::RENAME_LOCK (SeqRwLock, spin; Linux rename_lock: write in
+                   d_move/d_exchange, read in is_subdir/d_path, its
+                   sequence read lock-free by scoped walks)
         ↓
     MntNamespace.root, Mount.{children, parent, mountpoint} (spin;
                    d_path reads parent/mountpoint under RENAME_LOCK)
@@ -364,6 +410,14 @@ Kernel mappings (3.2 Kernel Page Tables): vmalloc FLUSH (sleeping;
     vmstack SLOTS (spin leaves; no mapping or flush under them); KTABLES
     (spin, thread context) → frame allocator
 
+AIO (3.11, io/aio/): Kioctx.ring_lock (sleeping) → mmap_lock (the
+    copy of events to user space); Mm.ioctx and AIO_NR (spin leaves);
+    Kioctx.comp, Kioctx.reap (IrqSpinlock leaves, any context: a bio's
+    end posts its event); PollIocb.reg (sleeping, across the file's
+    poll) → Kioctx.active → file wait queue head → PollIocb.st →
+    Workqueue.inner (a poll's wakeup queues its work under the queue
+    head)
+
 Pipes (3.11): Pipe.inner (sleeping; two in address order) → frame
     allocator, and the mmap_lock of a faulting user copy (read, write
     and vmsplice copy between pipe pages and the caller's memory under
@@ -387,7 +441,9 @@ Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem → BLKDEV_REGISTRY,
     MAJORS; I/O sleeps under open_mutex only
     blk-mq software queue, hardware queue (IrqSpinlock leaves; the
-    hardware queue also from the driver ISR, under its line's IrqDesc.lock)
+    hardware queue also from the driver ISR, under its line's IrqDesc.lock;
+    a poll queue is a hardware queue no interrupt reaches: taken by the
+    polled bio's submitter and by pollers, `BlkMq::poll_queues`)
     Completion.done (IrqSpinlock) → wait queue head → run-queue lock
 
 Network locks (3.10 Network Subsystem has the full order):
@@ -867,6 +923,7 @@ serializes wakers (3.1), `Task.sig` holds the per-task signal state
 | `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task: an intrusive `ArcList` (Linux init_task.tasks) holding a `TaskRef` (`Arc<Task>`) each, found by tid through the pid hash (`Pid.task`, set and cleared under the write lock) |
 | Per-CPU `curr` | `*const Task` in PerCpu | The running task (no lock) |
 | `Task.cred` | `Arc<Cred>` (raw) | Reference-counted credentials |
+| `Task.cred_override` | `Arc<Cred>` (raw) or null | Override credentials, the task's own (no lock) |
 
 **Pids** (`task/pid.rs`, Linux 4.14 pidmap): a `Pid` holds one
 number per pid-namespace level. Numbers come from a lock-free bitmap
@@ -1058,6 +1115,12 @@ Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
    (`current().cred()`, Linux current_cred); other tasks read them under
    TASKLIST; only the task itself replaces them (`commit_creds`, under
    TASKLIST), so a lock-free owner read never races a writer
+4. **Override** - `Task.cred_override` (Linux task->cred apart from
+   real_cred) is touched by the task alone, no lock: `override_creds`
+   installs an `Arc<Cred>` its own checks use (`current().cred()`)
+   until the guard drops (revert_creds); others keep reading
+   `Task.cred`. io-wq workers run each request under the submitter's
+   credentials of its submission this way
 
 **Credential APIs (like Linux):**
 - `prepare_creds()` - Clone current credentials, return mutable copy
@@ -1299,7 +1362,7 @@ pub struct Zone {
   `exit_mmap`, which, under the mm lock held for writing, takes the
   VMAs (dropping the rmap chains) and tears down the user half
   (`pgtable::detach_user`, a TLB flush, `UserTables::free`), then drops
-  the VMAs (file references) with no lock held. **Never drop an `MmRef`
+  the VMAs (file references) and the executable's path with no lock held. **Never drop an `MmRef`
   under a spinlock** (TASKLIST included): take it out (`Option::take`,
   `replace`) and drop it after unlocking. `mmget_not_zero` refuses an
   address space already being torn down.
@@ -1353,21 +1416,19 @@ pub struct Zone {
   flush of a changed entry, `FRAME_ALLOCATOR`; nothing under it takes
   an mm lock (a walk names address spaces by the `Weak<Mm>` and table
   root in each entry, never through the task table).
-- Shared anonymous memory (`mm::shmem::Shmem`, Linux shmem): its page
-  index `Shmem.root` is a `spin::Mutex` taken by the fault path under
-  the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE after the mm
-  lock is dropped; under it only `FRAME_ALLOCATOR` and the heap (index
-  nodes, atomic under the spin lock) are taken. The object goes with its last VMA
-  (possibly under the mm lock): its drop takes no lock but
-  `FRAME_ALLOCATOR`.
+- Shared anonymous memory and SysV shm segments are files on the
+  kernel's tmpfs (Linux shmem_zero_setup, shmem_kernel_file_setup):
+  their pages are page-cache pages (Per-inode page cache), faulted and
+  locked like any file's; MADV_REMOVE punches the hole through the
+  file system (vfs_fallocate) after the mm lock is dropped.
 - A SysV shm attachment (`ipc::shm::ShmAttach`, in its VMA) is cloned
-  and dropped with the VMA, possibly under the mm lock: it only updates
-  the segment's atomics (shm_nattch, times, pid), and destroying a
-  removed segment at the last detach takes no lock. IPC_RMID (mark
-  deleted, then read shm_nattch) and shmat (count the attachment, then
-  check the mark) order with SeqCst fences, so a racing shmat backs out
-  (EINVAL) or IPC_RMID sees it; destroy is idempotent, so namespace
-  totals are given back exactly once.
+  and dropped with the VMA, possibly under the mm lock: it counts
+  shm_nattch under the segment's `KernIpcPerm.lock` (a spin leaf).
+  shmat counts only a segment not marked deleted; IPC_RMID of an
+  attached segment sets SHM_DEST under that lock, and the detach that
+  takes shm_nattch to 0 on a SHM_DEST segment marks it deleted there;
+  either then takes it out of the table (`IpcIds.inner`, after the
+  perm lock is released) and destroys it, exactly once.
 - The page-fault path (`mm/fault.rs`, `handle_mm_fault`, shared by
   both arches) holds the mm lock for reading from the VMA lookup through
   the PTE update (Linux lock_mm_and_find_vma: a stack that must grow
@@ -1379,8 +1440,7 @@ pub struct Zone {
   under the page-table locks (Page-table locks below). Remote access
   takes it per page (`mm::remote`) and drops it to fault an absent page
   in (`handle_mm_fault` takes it itself), as Linux GUP retries. Under the mm lock:
-  page-table and page allocation (`FRAME_ALLOCATOR`), a shared object's
-  `Shmem.root`, rmap/LRU, and the reads that may sleep (a file page:
+  page-table and page allocation (`FRAME_ALLOCATOR`), rmap/LRU, and the reads that may sleep (a file page:
   `pread` or the page cache for a ramfs page; a swap slot), as in Linux
   (the mm lock is a sleeping lock, so nothing it waits for can need
   it, and the VMA cannot change meanwhile). Only files whose
@@ -1499,7 +1559,48 @@ pub struct Zone {
   switches away, so the flush reaches it (arm64 broadcast; x86 see TLB
   Flushing).
 
-#### Swap (mm/swap.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
+#### Page pins (mm/gup.rs; Linux mm/gup.c FOLL_PIN)
+
+- A pin is `GUP_PIN_COUNTING_BIAS` (1024) references on a 4KB page's
+  atomic count (Linux's scheme for small folios), taken at once by
+  `get_n` (refused for a free page or a count near saturation) and
+  dropped at once by `put_n`, whose last reference frees the page.
+  `maybe_dma_pinned` reads the count lock-free.
+- Pinning (`pin_user_range`) holds the mmap_lock for reading across a
+  run of pages, keeping the VMA while the pages are in it, and drops it
+  only to fault a page in (`handle_mm_fault` takes it; Linux
+  __get_user_pages): mmap_lock (read) -> page_table_lock (a 2MB entry is
+  split first) -> PTE lock, under which the entry is checked and the
+  count raised. A private anonymous page still shared copy-on-write is
+  first given to the mapping (`unshare_for_write`, under the same mmap
+  lock hold).
+- The PTE lock orders a pin against fork and reclaim, which decide
+  under it too: `memory::copy_pte` copies a maybe-pinned page the
+  parent owns alone for the child instead of sharing it (the copy's
+  page is allocated with no PTE lock held: the walk stops at that
+  entry, allocates under the mm locks only, and resumes there, Linux
+  copy_pte_range's -EAGAIN); `rmap::try_to_unmap` leaves a maybe-pinned
+  page mapped, and reclaim skips one before it starts. A pin that comes
+  after either sees the entry they left (a copy-on-write entry: a
+  write pin faults, a read pin unshares; a swap entry: it faults).
+- `PG_ANON_EXCL` (Linux PG_anon_exclusive) is an atomic flag bit set
+  and cleared only under the PTE lock of the entry mapping the page:
+  set by a fault mapping a private mapping's own page, a copy-on-write
+  copy or reuse, an exclusive swap-in and a pin of a writable private
+  entry; cleared by fork sharing the page and by reclaim unmapping it;
+  reset by the free. Read under the PTE lock by the write fault and
+  mprotect (reuse in place, for a page out of the swap cache:
+  `Page::reusable`), remote writes and fork.
+- Unpinning (`PinnedPages` drop) takes no lock for anonymous pages
+  (their dirty flag is an atomic bit; the count drop may free the page,
+  which the allocator allows in any context). A page-cache page written
+  through a shared mapping is dirtied under its page lock (sleeping),
+  so a `PinnedPages` with such pages is dropped in thread context; a
+  completion in an interrupt handler must hand it to a thread (Linux
+  bio_dirty_work). Block-device direct I/O keeps its pins until the
+  submitter's wait returns and drops them there (3.10).
+
+#### Swap (mm/swap/swapfile.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
 
 - `SwapInfo.map` (`spin::Mutex`, Linux si->lock): a device's slot
   counts (swap PTEs + SWAP_HAS_CACHE) and allocation hint; swapoff
@@ -1528,7 +1629,7 @@ pub struct Zone {
   are dropped before any mm lock) with its mmap_lock held for reading, faulting the device's swap
   PTEs in.
 
-#### LRU (mm/lru.rs; Linux mm/swap.c lruvec)
+#### LRU (mm/swap/lru.rs; Linux mm/swap.c lruvec)
 
 - `Lruvec.lock` (`IrqSpinlock`, Linux lruvec->lru_lock): the LRU lists,
   linked through struct page (`next`/`prev`, owned by the list while
@@ -1549,7 +1650,7 @@ pub struct Zone {
   reached 0 is left for `page_freed`, which takes the lock and unlinks
   it. Reclaim never takes an mmap_lock while holding it.
 
-#### Reclaim (mm/vmscan.rs; Linux mm/vmscan.c)
+#### Reclaim (mm/swap/vmscan.rs; Linux mm/vmscan.c)
 
 - `shrink_folio_list` works on pages it isolated (each with a
   reference) and holds no lock between pages. Per page: page lock by
@@ -1797,7 +1898,7 @@ layout in `doc/MEMORY.md`
 #### Per-inode page cache (Linux i_pages)
 
 **Location:** `mm/filemap.rs` (`AddressSpace`, the inode's
-`i_data`); users: ramfs, vfat files, block devices
+`i_data`); users: ramfs, tmpfs, vfat files, block devices
 (`BlockDevice.bd_inode`). vfat writes its FAT and directory blocks
 into the device cache marking only the 512-byte sectors it changes
 (`bdev_write_meta`: bits in `Page.private`, set under the page lock;
@@ -1820,6 +1921,17 @@ dropped before and after it is zeroed on the disk.)
   removed (truncate) under it. Order: i_rwsem -> page lock ->
   i_pages. Removal also needs `i_pages`; a lookup that then locks the
   page rechecks `Page.mapping` (truncated meanwhile: retry).
+- `AddressSpace.writable` (atomic, Linux i_mmap_writable): the
+  shared writable mappings (VM_SHARED, file open for writing, not
+  `VM_NOMAYWRITE`), counted by the VMA link/unlink (mmap_lock held for
+  writing) and held across an mmap's insertion (`map_writable`, EPERM
+  once denied); F_SEAL_WRITE denies it for good under the inode's
+  i_rwsem (`deny_writable`, EBUSY while one exists). memfd seals
+  (`AddressSpace.seals`) are added under i_rwsem and read lock-free.
+- A tmpfs mapping charges each page to its file system's block limit
+  before inserting it (`AddressSpace.acct`, a per-CPU counter: 3.11
+  tmpfs accounting) and returns it on removal; a charge near the limit
+  takes the counter's leaf lock.
 - Page allocation (`alloc_user`, may reclaim) happens with no
   spinlock held: writes under i_rwsem, faults under the mmap_lock read
   side (mmap_lock -> page lock -> i_pages).
@@ -1911,7 +2023,7 @@ pub struct Inode {
 `Inode`. One `IrqSpinlock` per bucket (a RAM-sized table), a leaf:
 under it only the bucket vector, `Weak` counts and the filesystem's
 `test` (which may take `Inode.private`, a spin RwLock, then vfat's
-`VfatInode` data, a spin Mutex leaf held only to copy the data in or
+`VfatInode.d`, a spin Mutex leaf held only to copy the data in or
 out; never taken from an interrupt). IRQ-safe
 because a last reference could go anywhere. The hash holds `Weak`s;
 an inode upgraded under a bucket lock is never dropped there (its last
@@ -1924,6 +2036,27 @@ cluster freeing of an unlinked file on `SYSTEM_WQ`
 (`Workqueue.inner`, IrqSpinlock leaf). Deviation from Linux: no
 unused-inode LRU or I_NEW state (an inode is complete before it is
 hashed; the losing builder's inode is dropped unhashed).
+
+**vfat chain cache** (`fs/vfat/cache.rs`, Linux fs/fat/cache.c):
+`VfatInode.cache` (spin Mutex, Linux cache_lru_lock), a leaf in
+thread context only, never held with `VfatInode.d` and never across
+the FAT reads. It holds the cached runs, their id (Linux
+cache_valid_id) and the chain's first cluster, a copy of
+`VfatInodeData.start_cluster` that `set_inode_data` updates after the
+data. A walk (`read_folio`/`writepage`/`swap_rw` under a page lock,
+direct I/O, the write and truncate paths under `i_rwsem`) takes, in
+one hold, the first cluster, the id and its starting run, so the three
+always belong to one chain; it reads the FAT through the device cache
+with no lock held, then caches its run only if the id is unchanged. A
+new first cluster invalidates the cache (bumping the id); a cut that
+keeps the first cluster (`free_past`, under `i_rwsem`) invalidates it
+before touching the FAT and again once the new end is written, before
+the tail is freed: a walk that began before the second invalidation
+caches nothing, and one that begins after it stops at the new end, so
+no cached run can name a freed cluster. Walks that use what they find
+for I/O and can race a cut: writes, truncate and direct I/O are
+excluded by `i_rwsem`; page-cache reads past a shrinking end are the
+pages truncate drops first (`truncate_setsize` before `free_past`).
 
 **Dentry** (`fs/dentry.rs`):
 
@@ -1948,7 +2081,8 @@ struct DentryInner {
 A rename moves the dentry itself (`d_move`, `d_exchange`) under the
 global `RENAME_LOCK` (write; Linux rename_lock), with both parents'
 `i_rwsem` held by the caller; each step takes one `d_lock` at a time
-(parent, then the moved or replaced child). `is_subdir` and `d_path`
+(parent, then the moved or replaced child). The
+write guard keeps the lock's sequence odd, which scoped walks check. `is_subdir` and `d_path`
 read parents and names under `RENAME_LOCK` (read), so they see one
 consistent tree. `d_path` also climbs mounts (`Mount.parent`, then
 `Mount.mountpoint`, each read and released) inside it: RENAME_LOCK ->
@@ -1998,7 +2132,7 @@ under a d_lock or ALL_SBS cannot re-enter it.
 superblock's tree) takes the same parent-then-child d_locks one leaf
 at a time, with no RENAME_LOCK held (d_move drops it first).
 
-#### kernfs / sysfs (fs/kernfs/, fs/sysfs.rs; Linux fs/kernfs)
+#### kernfs / sysfs (fs/kernfs/, fs/kernfs/sysfs.rs; Linux fs/kernfs)
 
 | Lock | Type | Order / rule |
 |------|------|--------------|
@@ -2068,7 +2202,7 @@ Linux `vfsmount.mnt_count` pattern:
 | `Mount.children` | `RwLock<Vec<Arc<Mount>>>` | Child mounts |
 | `Mount.mnt_count` | `AtomicU64` | Open file reference count |
 | `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC/READONLY/LOCKED; every write under `MOUNT_LOCK` (remount, reconfigure, pivot_root's MNT_LOCKED), read lock-free (open, exec, statfs) |
-| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes; under NAMESPACE_SEM and s_umount; only `SuperBlock.s_mounts` is taken under it (no mount is dropped under it: `make_rdonly` releases its references after the unlock); the sequence is there for lockless readers |
+| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`: Linux attach_mnt and umount_tree under lock_mount_hash); under NAMESPACE_SEM and s_umount; under it only `SuperBlock.s_mounts`, and in attach/detach the moved mount's `parent`/`mountpoint`, its parent's `children` and the mountpoint's `d_lock` (mount count), one at a time; nothing takes it under a Mount field lock (a namespace copy copies each `children` list out before copying the mounts, whose `Mount::new` takes it). No mount or mountpoint is dropped under it (`make_rdonly` releases its references, `detach_mnt` the mountpoint, after the unlock). The sequence is read lock-free by scoped walks (3.3 Path Traversal) |
 | `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
 | `Mount.mnt_ns` | `AtomicU64` | Id of the mount's namespace (`MntNamespace.id`, never reused), 0 for none (Linux mnt_ns): written only under NAMESPACE_SEM write (commit_tree when a tree is grafted or propagated, the namespace root, a namespace copy; umount clears it), read by `check_mnt` under NAMESPACE_SEM; can_umount and remount read it first without, as Linux (umount repeats it under the lock) |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
@@ -2088,11 +2222,12 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 1. the mountpoint's Inode.i_rwsem (attach: a dead directory is refused)
 2. mount::NAMESPACE_SEM (write: attach, umount, namespace copy)
 3. SuperBlock.s_umount (write: remount)
-4. MntNamespace.root (read/write)
-5. parent Mount.children (write for add/remove child)
-6. Mount.parent (write for set/clear)
-7. Mount.mountpoint (write for set/clear)
-8. Dentry.d_lock (DentryInner.flags: write for the mount count)
+4. mount::MOUNT_LOCK (attach_mnt / detach_mnt; Mount::new)
+5. MntNamespace.root (read/write)
+6. parent Mount.children (write for add/remove child)
+7. Mount.parent (write for set/clear)
+8. Mount.mountpoint (write for set/clear)
+9. Dentry.d_lock (DentryInner.flags: write for the mount count)
 ```
 MS_MOVE and pivot_root take the target's (put_old's) i_rwsem, then
 NAMESPACE_SEM; pivot_root's chroot_fs_refs runs after both are
@@ -2115,6 +2250,16 @@ across a call into the mount tree or a d_lock).
 The walk carries a Path{mnt, dentry}: crossing looks only at the
 current mount's children (Linux lookup_mnt); ".." at a mount root
 reads `Mount.parent` and `Mount.mountpoint` (follow_dotdot).
+
+A scoped walk (openat2 RESOLVE_BENEATH / RESOLVE_IN_ROOT, `namei::Nd`;
+Linux nd->m_seq, nd->r_seq) samples `MOUNT_LOCK`'s and `RENAME_LOCK`'s
+sequences at its start, holding no lock (`read_begin` spins out a
+writer, which holds only spin locks), and after each ".." gives up
+with EAGAIN if either moved: a rename or a mount change may have taken
+it above its root. Its result must then still be under the root
+(`mount::is_path_reachable`, Linux complete_walk's path_is_under:
+`Mount.parent`/`Mount.mountpoint` reads one at a time, then
+`is_subdir` under RENAME_LOCK read), else EXDEV.
 
 `is_local_mountpoint` (rmdir, unlink, rename: EBUSY) takes the same
 locks in the same order, one mount's `children` at a time, inside the
@@ -2355,7 +2500,10 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
   open files never overlap, and the data copy, the size update,
   RLIMIT_FSIZE check and set-id stripping are atomic with respect to
   other writers. `truncate`/`ftruncate`/O_TRUNC take it too (Linux
-  do_truncate). Reads do not take it (Linux generic_file_read_iter).
+  do_truncate). Reads do not take it (Linux generic_file_read_iter),
+  except a vfat O_DIRECT read, which holds it exclusive from its
+  end-of-file check until its last bio is submitted (3.10, Linux
+  DIO_LOCKING).
 - Data moves between user memory and the file through an iov_iter
   (`fs/iov_iter.rs`). Page-cache files (ramfs, vfat, block devices:
   `filemap::read_iter`/`write_iter`) copy straight between the
@@ -2710,7 +2858,7 @@ static CONSOLE_REGISTRY: IrqSpinlock<ConsoleRegistry> = IrqSpinlock::new(...);
    ↓
 2. PRINTK (held briefly for ring buffer write) - IrqSpinlock
    ↓
-3. CONSOLE_REGISTRY (held during console_write) - IrqSpinlock
+3. CONSOLE_REGISTRY (console_write's snapshot of the enabled consoles) - IrqSpinlock
 ```
 
 **The record log** (`kmsg.rs`): `LOG` (IrqSpinlock) holds the
@@ -2818,13 +2966,22 @@ if self._guard.is_some() {
 
 **Console Integration:**
 
-`console::console_write()` holds `CONSOLE_REGISTRY` lock during `write_all()`:
+`console::console_write()` takes `CONSOLE_REGISTRY` only for a snapshot
+of the enabled consoles (or, with none registered, the early UART
+write), then writes each with the lock dropped; the tty console's write
+waits until the transmitter is empty before it returns (Linux
+serial8250_console_write, pl011_console_write), so nothing else needs
+to flush a console: the idle loop never touches one.
 
 ```rust
 pub fn console_write(data: &[u8]) {
-    let registry = CONSOLE_REGISTRY.lock();  // IrqSpinlock
-    if registry.has_console() {
-        registry.write_all(data);
+    let snapshot = {
+        let registry = CONSOLE_REGISTRY.lock();  // IrqSpinlock
+        // ...early UART if none registered...
+        registry.enabled_consoles_snapshot()
+    };
+    for console in snapshot.into_iter().flatten() {
+        console.write(data);  // outside the lock
     }
 }
 ```
@@ -3200,7 +3357,8 @@ lock: a private futex is (mm, address), with no lock; a shared one
 takes the mmap_lock for reading to find its VMA (and, under it, the
 file's dentry `d_lock` for its inode) and drops it before locking a
 bucket: mmap_lock and bucket locks are never nested. A shared key in a
-shared mapping is the backing `Shmem` or inode, named by its `KeySeq`
+shared mapping is the backing inode (shared anonymous memory and SysV
+shm included: tmpfs files), named by its `KeySeq`
 (Linux i_sequence: unique for the boot, assigned on first use from a
 global atomic counter, no lock), and its byte offset; in private
 memory it is (mm, address), apart from the private key. The exit path
@@ -3374,6 +3532,7 @@ ISRs only ack the device, set atomics and use IRQ-safe deferral
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
 | `IrqDesc.lock` (`irq.rs`; one per line of the static `IRQ_TABLE`, Linux desc->lock) | `IrqSpinlock` | taken in IRQ (`handle_irq`) and process context (`request_irq`, a registration's drop) | leaf, except that the interrupt controller's line mask/unmask (`arch::IrqChipOps`) and the line's handlers run under it. Lines never nest: no code holds two descriptors' locks |
+| `MATRIX` (`arch/x86_64/irq.rs`, Linux vector_lock over the irq_matrix) | spin `Mutex` | thread only (`msi_alloc`, `msi_free`: a driver's probe and remove) | leaf: hands out MSI lines and per-CPU device vectors and writes each CPU's `VECTOR_IRQ` table (atomics, read lock-free with acquire by the interrupt entry on that CPU, Linux per-CPU vector_irq) |
 | `I8259A_LOCK` (`arch/x86_64/pic.rs`), `IRQ_CONTROLLER_LOCK` (`arch/aarch64/gic.rs`) | `IrqSpinlock<()>` | any context | leaf, under `IrqDesc.lock`: the chip state lines share (the PIC mask registers; GICD_ICFGR, 16 SPIs per register) changes under it (Linux i8259A_lock, irq-gic-common.c irq_controller_lock) |
 
 Generic interface (`crate::irq`): `request_irq(irq, Arc<T: IrqHandler>)
@@ -3403,7 +3562,13 @@ __setup_irq clearing IRQS_SPURIOUS_DISABLED).
   the QEMU virt swizzle INTID 35 + (slot + pin - 1) % 4.
 - x86-64: legacy 8259 PIC with the firmware-assigned config-space Interrupt
   Line (QEMU `pc`). Real hardware in APIC mode (Dell OptiPlex 3020 target)
-  needs IOAPIC + ACPI `_PRT` routing (not implemented).
+  needs IOAPIC + ACPI `_PRT` routing (not implemented). MSI lines (16 and
+  up) are one LAPIC vector of one CPU each (`msi_alloc`, an `MsiIrq` freed
+  on drop); the chip's mask/unmask leave them alone, the device's MSI-X
+  entry is their mask (`hw/pci/msix.rs`: unmasked after `request`,
+  masked before the handler is dropped, under no lock). The entry acks
+  the LAPIC, then runs `handle_irq` (edge).
+- aarch64 has no MSI (no GICv3 ITS driver): `msi_alloc` is None.
 - Handlers run in IRQ context with their line's lock held: they must only ack
   the device, touch atomics/IrqSpinlocks and wake threads; they must not
   request or free IRQs. Once a registration's drop returns its handler is
@@ -3460,8 +3625,8 @@ IRQ-safe.
 
 #### Block Device Subsystem
 
-**Location:** `block/` (`blkdev.rs`, `blk_mq.rs`, `genhd.rs`,
-`part/`), `hw/virtio/blk.rs`, `fs/{blkdev_ops,devtmpfs}.rs`,
+**Location:** `block/` (`blkdev.rs`, `blk_mq.rs`, `dio.rs`, `genhd.rs`,
+`part/`), `hw/virtio/blk.rs`, `fs/blkdev_ops.rs`, `fs/ramfs/devtmpfs.rs`,
 `sync/completion.rs`
 
 Linux model (block/bio.c, blk-mq.c, genhd.c): a bio is submitted from
@@ -3474,9 +3639,13 @@ thread context, the driver completes it from its interrupt handler and
 | `Disk.open_mutex` | `sync::Mutex<OpenState>` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock; holds the count of open partitions (Linux open_partitions, plain), and each `BlockDevice.openers` (an atomic on the device, as Linux bd_openers) and soft block size (BLKBSZSET) change only under it: block device open/release (files, and the kernel opens of a mount (`SuperBlock.s_bdev`) and of active swap: `BdevHandle`), partition scans (and rescans, BLKRRPART), disk removal (`del_gendisk` drops its devices under it); I/O, `BLKDEV_REGISTRY`, `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
 | `BLKDEV_REGISTRY` | spin `RwLock` (dev_t -> block device; global like Linux's bdev map) | thread only | leaf |
 | `MAJORS` | spin `Mutex` (block majors, register_blkdev) | thread only | leaf |
-| blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held; its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
-| blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list, the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock), the in-flight count and the dying flag | thread (dispatch, drain, release) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under its line's `IrqDesc.lock` in the ISR |
-| `BlkMq.drained` | `WaitQueue` (Linux mq_freeze_wq) | woken from hardirq (the completion that empties a dying queue, after its lock is dropped); waited in thread context (`del_gendisk`, no lock held) | its head lock -> run-queue lock; the condition takes each hardware queue lock alone |
+| blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) and hardirq (a FUA write's post-flush, sent from the write's completion after the hardware queue lock is dropped) | leaf: never taken with the hardware queue lock held; in the ISR it nests under the line's `IrqDesc.lock` (IrqDesc.lock -> ctx lock; nothing allocates under it: the flush is preallocated with its post-flush queue, and the completions free bios and the `FlushSeq` to the heap under `IrqDesc.lock` only, outside every queue lock); its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
+| Post-flush queue (`RequestQueue.fqs[h]`, `block/blkdev.rs`, one per hardware queue; Linux blk_flush_queue->mq_flush_lock) | `IrqSpinlock` | thread (a FUA write's submission) and hardirq (its data's and the shared flush's completions) | leaf: writes waiting for a flush, the writes the flush in flight serves, the FUA data in flight and the preallocated flush; the flush is sent and the writes are ended after it is dropped |
+| blk-mq requests taken (`BlkMq.rqs[h]`, Linux tags in use) | `AtomicUsize` per hardware queue, lock-free (as Linux's sbitmap) | thread (`get_rq` at submission or plug time) and hardirq (completion, failed dispatch) | counts requests from `get_rq` to their end, wherever they are (software queue, parked for kblockd, dispatch list, driver); a NOWAIT bio takes one only below the driver's depth (compare-and-swap), else ends with EAGAIN; the dispatch itself stays under the hardware queue lock. With `BlkMq.dying` (set once by `start_drain`) the end that brings a count to 0 wakes `drained` (Linux q_usage_counter) |
+| Block plug (`Task.plug` -> a `BlkPlug` in a `blk_plug` frame, `block/plug.rs`; Linux current->plug) | none: task-private | thread, the owning task only (submission, and `schedule()` on the way to sleep: Linux sched_submit_work) | holds bios and merges into the last held request; going out takes the software then hardware queue locks as a submission does, never under a spin lock (`schedule` checks `might_sleep` first); from `schedule()` (the sleep state set) it takes only the software queue locks, then each reached hardware queue's `HctxRun.hold` and a kblockd queue (intrusive: no allocation), waking that kblockd: nothing is dispatched or ended there; flushes and FUA writes bypass it |
+| `HctxRun.hold` (per hardware queue: a hold on its `BlkMq` while its kblockd run is queued; Linux hctx->run_work) | spin `Mutex` | thread only (`schedule()` on the way to sleep, the kblockd worker) | leaf: set and the run queued (after unlocking) on the kblockd of the hardware queue's first CPU, always the same, by `run_async`; the work takes the hold, runs the queue and drops the hold unlocked, so the `BlkMq` outlives every queued run. `KBLOCKD` is per CPU (Linux kblockd: per-CPU, highpri pool), one worker each at nice -20; the only global is the static array of those per-CPU workqueues |
+| blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list, the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock), the in-flight count and the dying flag | thread (dispatch, drain, release) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep (virtio-blk's descriptor tables are allocated with the queue: a small one per tag and a bounded set of full-size ones; a request that finds no full-size one free stays on the dispatch list until a completion puts one back); taken under its line's `IrqDesc.lock` in the ISR |
+| `BlkMq.drained` | `WaitQueue` (Linux mq_freeze_wq) | woken from any context (the request end that empties a dying queue's count, after the queue locks are dropped); waited in thread context (`del_gendisk`, no lock held) | its head lock -> run-queue lock; the condition reads the counts only |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
 | `RamDisk.pages` | spin `Mutex` | thread only (bio-based driver) | leaf |
 
@@ -3484,18 +3653,80 @@ Rules:
 
 - **Disk removal (`del_gendisk`, Linux):** under `open_mutex` every
   hardware queue is marked dying (nothing reaches `queue_rq` after,
-  pending bios end with EIO) and the block devices are dropped; then,
-  with no lock held, it sleeps on `BlkMq.drained` until the started
-  requests complete. The driver's remove then frees the IRQ, takes its
+  every request not yet started, on a software queue or the dispatch
+  list, ends with EIO) and the block devices are dropped; then, with no
+  lock held, it sleeps on `BlkMq.drained` until every request taken
+  has ended. The driver's remove then frees the IRQ, takes its
   queues back (`BlkMq::release`) and resets the device before freeing
   the rings (`VirtioDevice::del_vqs`).
 - **end_io runs in hardirq context** (virtio-blk) or in the submitter's
   thread (bio-based drivers: ramdisk, USB sd). It may only complete a
   `Completion`, touch atomics and wake; the bios are ended after the
   hardware queue lock is dropped, so `end_io` can resubmit.
+  A FUA write on a queue with a volatile cache but no FUA (every
+  queue now; Linux blk_insert_flush, REQ_FSEQ_POSTFLUSH) carries a
+  `FlushSeq`, allocated at submission with its flush bio: the write's
+  completion sends the flush from its own context (blk-mq: the
+  software and hardware queue locks, IRQ-safe leaves, taken in
+  hardirq), the flush's completion runs the owner's `end_io`. The
+  sequence is owned by the one bio in flight at a time; no lock.
   `submit_bio_wait`'s `end_io` hands the bio back and completes last:
   once `Completion::wait` returns the waker no longer touches the
   waiter's stack.
+- **Direct I/O (`block/dio.rs`, Linux __blkdev_direct_IO):** the bios
+  of one I/O count down a `DioWait` on the submitter's stack: `left`
+  (atomic, bios in flight plus one the submitter holds while it
+  submits), `err` (atomic, the first error's errno, compare-exchange
+  from 0) and a `Completion`. Each bio's `end_io` (hardirq) stores its
+  error, frees the bio, then decrements `left` (AcqRel); the one that
+  reaches 0 completes, last. The submitter drops its own count after
+  the last submit and waits only if a bio is still out, so once it
+  returns no `end_io` touches the frame (`Completion`'s rule). It then
+  dirties a read's pages and unpins them in thread context (page
+  lock; 3.2 Page pins). No lock is held across the I/O, and no
+  i_rwsem: block devices are not regular files (Linux
+  blkdev_read_iter/blkdev_write_iter take none for direct I/O). The
+  cache over the range is written back first (page lock -> i_pages,
+  the writeback's own order) and, for a write, dropped before and
+  after (`filemap::invalidate_pages2`: page lock -> i_mmap read -> PTE
+  lock to unmap, then i_pages; Linux invalidate_inode_pages2_range).
+- **vfat direct I/O (`fs/vfat/direct.rs`, Linux fat_direct_IO over
+  __blockdev_direct_IO with DIO_LOCKING):** the same bios and
+  `DioWait` (`dio::direct_io_map`, through the file's disk extents),
+  under the file's `i_rwsem` held exclusive. A write runs under the
+  one `File::write_iter` holds for the whole call (invalidation, bios,
+  wait, size update, the buffered rest), as Linux
+  generic_file_write_iter. A read takes it itself after writing the
+  cache back unlocked (Linux kiocb_write_and_wait), and holds it over
+  the end-of-file check, a second write-back, the chain walk
+  (`VfatInode.cache`) and the pinning and submission of every bio
+  (plugged), dropping it after the plug is flushed and before the
+  wait (`direct_io_map`'s `unlock`); a buffered rest is read unlocked.
+  Order: `i_rwsem` -> page lock -> i_pages (write-back,
+  invalidation), `i_rwsem` -> mmap_lock (pinning faults the caller's
+  pages in; the fault path takes no `i_rwsem`).
+  An asynchronous write (AIO, io_uring) whose file has pages cached
+  when its last bio ends hands itself and its result to a work item
+  made at submission (`PostWrite.job`, an IrqSpinlock leaf, any
+  context; the queueing on `SYSTEM_WQ` follows the unlock), which
+  drops the written range from the cache in thread context (page lock
+  -> i_pages, no `i_rwsem`) before the count is lowered and the result
+  passed on (Linux dio_bio_end_aio -> dio_aio_complete_work).
+- **Direct I/O in flight (`Inode.i_dio_count`, Linux i_dio_count):**
+  an atomic counter, raised under `i_rwsem` before an I/O's first bio
+  (`inode_dio_begin`, or `dio_guard`) and lowered once its last bio
+  is done (`inode_dio_end`; any context, including a completion: the
+  last one wakes the variable's queue in `VAR_WAIT_TABLE`
+  (`sync/waitqueue.rs`, Linux bit_wait_table / wake_up_var), whose
+  lock is an IrqSpinlock taking only run-queue locks). The decrement
+  is AcqRel and the waiter re-checks the count (Acquire) after
+  queueing (`wait_event`), so no wakeup is lost. `inode_dio_wait`
+  sleeps until it is 0 with `i_rwsem` held exclusive, which keeps new
+  direct I/O out: vfat truncate (Linux fat_setattr) and a failed
+  write's trim wait before any cluster is freed, so a read that
+  dropped `i_rwsem` before its wait never reads a cluster another file
+  got. A shared queue may hold other variables' waiters; each
+  re-checks its own condition.
 - **Boot I/O sleeps:** the scheduler runs and interrupts are on before
   driver probe (main.rs: the boot context is pid 1 by then, Linux
   kernel_init), so the boot partition scan's `submit_bio_wait` sleeps on
@@ -3505,6 +3736,9 @@ Rules:
   the devtmpfs root's `i_rwsem`. No path holding a directory `i_rwsem`
   takes `open_mutex` (a block device is opened after the path walk), so
   `open_mutex -> i_rwsem` cannot invert.
+  The devtmpfs superblock is a tmpfs one (its limits: 3.11 tmpfs
+  accounting); a remount reconfigures it under its `s_umount` held
+  for writing, like any tmpfs.
 - **Block device page cache (`BlockDevice.bd_inode`, Linux
   bd_mapping):** device-file I/O and vfat metadata go through it (3.2
   Per-inode page cache); pages are read and written synchronously
@@ -3600,9 +3834,9 @@ not rely on either.
 | e1000 `pending_icr`, irq counters | atomics | IRQ + thread | ISR ORs ICR causes in; poll swaps them out |
 | virtio-net `rx` queue (`hw/net/virtio_net.rs`) | `spin::Mutex<Option<..>>` | thread only (NAPI poll, open, stop, remove) | leaf: virtqueue + bounce buffers + `napi_off` (as e1000); frames are delivered after it is dropped; taken out by remove, whose `del_vqs` resets the device before the rings and buffers are freed |
 | virtio-net `tx` queue | `spin::Mutex<Option<..>>` | thread only (xmit, poll reclaim, remove) | leaf; one descriptor per frame; ring full -> drop, `tx_dropped`, ENOBUFS; empty once removed |
-| virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx` |
+| virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx`. With the event index the device ignores the flag: suppressing also sets `used_event` to 0 (Linux virtqueue_disable_cb_split), which `get` leaves alone while the flag is set, so a suppressed ring interrupts only when its used index wraps past 0; `enable_cb` (under `rx`) moves it back to the next entry. A suppression racing a `get` that just saw the flag clear may leave one more interrupt (a hint, as in Linux) |
 | virtio-PCI transport (`hw/virtio/pci.rs`) | none | probe and remove (under the virtio device's or the PCI function's `Device.lock`), then IRQ (ISR byte) | common config (status, features, queues, reset) written only under those device locks; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
-| Drivers' IRQ registrations: `VirtioDevice.irq` (the INTx handler owning the virtio driver's callbacks), the e1000 binding's `irq`, `Serial8250.irq`, `Pl011Port.irq` | spin `Mutex<Option<IrqRegistration<..>>>` (virtio: `Mutex<IrqSlot>`) | thread only (probe sets it, remove takes it; virtio: `request_irq` claims the slot, registers unlocked, then stores it or frees the claim; `free_irq` takes it) | leaf: the registration is made and dropped (`IrqDesc.lock`) unlocked; the ISR never takes it (the handler holds its device state) |
+| Drivers' IRQ registrations: `VirtioDevice.irq` (MSI-X vectors, then their per-vector handlers or the INTx handler, owning the virtio driver's callbacks), the e1000 binding's `irq`, `Serial8250.irq`, `Pl011Port.irq` | spin `Mutex<Option<IrqRegistration<..>>>` (virtio: `Mutex<IrqSlot>`) | thread only (probe sets it, remove takes it; virtio: `alloc_vectors` enables MSI-X unlocked and stores the vectors, `setup_vq` writes a queue's vector under it, `request_irq` claims the slot, registers unlocked, then stores it or frees the claim; `free_irq` takes it) | leaf: vectors are enabled, registrations made and dropped (`IrqDesc.lock`, `MATRIX`) unlocked; the ISR never takes it (the handler holds its device state) |
 | PCI and USB `DYNIDS` (hw/pci/driver.rs, hw/usb/usbcore.rs; Linux dynids.lock) | spin Mutex | thread only | leaf: new_id/remove_id and each match take it alone; the probing after new_id runs with it dropped |
 | `ScsiDisk.state` (block/sd.rs, Linux sdev_state + state_mutex) | spin `Mutex<ScsiDeviceState>` | thread only | leaf: transitions (Linux's legal table) and each command's state check take it alone, never across I/O |
 | `util::ida::Ida` allocators: virtio, virtio-blk and sd indexes (Linux virtio_index_ida, vd_index_ida, sd_index_ida), namespace inode numbers (`ns::inum`, Linux proc_inum_ida) | `IrqSpinlock` | alloc thread only; free any context | leaf; nothing allocates under it (alloc grows the bitmap with it dropped, fallibly for `try_alloc`); a disk index is freed when the disk's last reference drops, a namespace's number when the namespace goes |
@@ -3762,6 +3996,7 @@ else is taken under it) unless an order is given. "spin" is the
 | Lock | Location | Class | Protects / order |
 |------|----------|-------|------------------|
 | `Task.vfork_done` | task/mod.rs | atomic pointer | the vforking parent's on-stack `Completion` (Linux vfork_done): set before the child runs, taken once by the child at exec/exit, which completes it; the parent waits uninterruptibly so the completion outlives that use |
+| `Task.wake_q` | task/mod.rs, task/wake_q.rs | atomic pointer | next task on the `WakeQ` it is queued on (Linux task->wake_q): claimed null -> tail by a compare-exchange after a full fence, so a task is on one queue at a time; only that queue's owner links and walks it; the waker clears it before `try_to_wake_up`, which may then queue it again |
 | `SignalStruct.posix_timers` | signal/mod.rs, time/posix_timer.rs | spin Mutex | the thread group's POSIX timers and itimers (Linux signal->posix_timers); thread context, never under TASKLIST; cpu_timer holds it around arming the group's CPU-timer state and its whole expiry pass (`PosixTimer.inner` and `SignalStruct.rlim` inside); deleted at the group's last exit (`exit_itimers`, timers stopped after the lock) or with the SignalStruct |
 | `PosixTimer.inner` | time/posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete). A CPU-time timer's clock value is read before it (that may take TASKLIST) |
 | `PosixTimer.sigq` | time/posix_timer.rs | spin Mutex | a timer_create timer's preallocated signal entry while it is not queued (Linux SIGQUEUE_PREALLOC); leaf, thread context: taken alone, never with `inner` or a signal lock. The entry is taken out to be queued by `signal::send_timer_sigqueue` with no lock held, and put back when its signal is dequeued (`posix_timer::deliver`, which rearms an interval timer under `inner`), flushed or refused (`reclaim`) |
@@ -3773,24 +4008,31 @@ else is taken under it) unless an order is given. "spin" is the
 | `Inotify.fasync` | io/inotify.rs | `FasyncList` (sleeping, see `FasyncList.list`) | the group's O_ASYNC files (Linux fsnotify group fsn_fa); queueing an event sends their SIGIO after `Inotify.inner` is dropped |
 | `Inotify.mark_mutex`; `Inode.fsnotify` (`Marks.list`), `SuperBlock.s_fsnotify` (`SbMarks`) | io/inotify.rs | sleeping `sync::Mutex`; spin leaves | `mark_mutex` (Linux group->mark_mutex) serializes a group's adds and is taken before every other inotify lock. `Marks.list` holds the watches on an inode (Linux i_fsnotify_marks: group and wd), `SbMarks` the inodes of a superblock that have had watches (Linux s_fsnotify_info; each listed once: `Marks.on_sb` is set under `SbMarks`'s lock by the adder that pushed the inode, after the push, and read lock-free (Acquire) to skip the lock, so a watch is placed only on a listed inode; dead ones dropped before the list grows). Both grow with the lock released (`push_if`, `kmem::spare`: nothing allocates under them). An add holds the watched path (mount and dentry) throughout, so neither the superblock's shutdown nor the dentry's release of the inode can run meanwhile: it lists the inode on its superblock, puts the mark on the inode, then under `Inotify.inner` (order `Inotify.inner` -> `Marks.list`, the only nesting) inserts the watch only if the mark is still there; a failure undoes the charge before anything is published. rm_watch and a group's drop remove the watch under `Inotify.inner`, then the mark. Removal of an inode's watches (Linux fsnotify_inoderemove: a dentry letting go of an inode with no name left, in `d_delete` after its locks or in a dentry's drop, which may run under d_lock; fsnotify_sb_delete: the superblock's drop, through `&mut`, no lock) takes the marks out under `Marks.list`, releases it, then per group takes `Inotify.inner` and checks the wd still names that inode before queueing IN_DELETE_SELF/IN_UNMOUNT and IN_IGNORED; only the remover that finds the watch uncharges it. Nothing there sleeps: an event's queue slot is allocated atomically (no memory: IN_Q_OVERFLOW takes its place, a queue position that allocates nothing, Linux's preallocated overflow_event), the wakeup is allowed under any lock and SIGIO (`FasyncList.list` sleeps) is sent from a SYSTEM_WQ worker. A watch never counts toward a mount being busy |
 | `USER_WATCHES` | io/inotify.rs | spin leaf | each user's inotify watches against fs.inotify.max_user_watches (Linux UCOUNT_INOTIFY_WATCHES ucounts): a new watch is charged before `Inotify.inner` is taken and a removed one returned after it is released (never nested in it); the limit itself (`MAX_USER_WATCHES`) is a sysctl atomic read lock-free |
-| `Eventfd.inner`, `Inotify.inner`, `Fanotify.inner`, `IoUring.inner`, `Signalfd.inner`, `Timerfd.inner` | io/eventfd.rs, io/epoll.rs, io/inotify.rs, io/fanotify.rs, io/io_uring.rs, io/signalfd.rs, time/timerfd.rs | IrqSpinlock | per-object state of the anon-inode files; their wait queues are woken after unlocking. An inotify watch holds its inode (`Arc<Inode>`, matched by identity, Linux's mark pinning the inode); a removed watch's inode is released after `Inotify.inner` is dropped. eventfd, inotify and fanotify readers wait with it held (`wait_event_interruptible_locked`: inner -> wait queue head while queueing, released while asleep) |
+| `Eventfd.inner`, `Inotify.inner`, `Fanotify.inner`, `Signalfd.inner`, `Timerfd.inner` | io/eventfd.rs, io/epoll.rs, io/inotify.rs, io/fanotify.rs, io/signalfd.rs, time/timerfd.rs | IrqSpinlock | per-object state of the anon-inode files; their wait queues are woken after unlocking. An inotify watch holds its inode (`Arc<Inode>`, matched by identity, Linux's mark pinning the inode); a removed watch's inode is released after `Inotify.inner` is dropped. eventfd, inotify and fanotify readers wait with it held (`wait_event_interruptible_locked`: inner -> wait queue head while queueing, released while asleep) |
+| `IoRing.submit` → `Files`, `IoRing.cq` | io/io_uring/ | `submit` sleeping `sync::Mutex` (Linux uring_lock); `cq` spin Mutex (Linux completion_lock), thread context | `submit`: the kernel's SQ head (Linux cached_sq_head), the registered files and buffers, the pending poll/timeout list; held across a whole io_uring_enter submission, so the operations run (and may sleep, fault on user memory, take any lock a syscall takes) under it, and across io_uring_register (which reads the fd table under it: -> `Files`; replaced files are released after both). `cq`: the kernel's CQ tail (Linux cached_cq_tail) and the overflow list (Linux cq_overflow_list), a leaf but for growing that list (Linux allocates an overflow CQE under completion_lock, GFP_ATOMIC); posting writes the CQE into the shared ring and publishes the tail (Release) under it, wakeups follow the unlock (`IoRing.cq_wait`, GETEVENTS sleepers, which check the tail after queueing themselves, and the poll queue). `IoRing.poll_files` (spin Mutex, IOPOLL rings: the files with polled requests issued) is held while GETEVENTS polls them (-> the disk's poll queues and the bio ends they run: `Tctx.reqs`, `TaskWorks.q`, wakeups); emptied once nothing is in flight, the files released after it. `IoRing.overflowed` (atomic) is set and cleared under `cq` and read lock-free by poll and GETEVENTS; `IoRing.dropped` (atomic, a CQE was lost) is set under `cq` and cleared by the io_uring_enter that returns EBADR. The overflow list holds at most `cq_entries` CQEs (Linux charges them to the memory cgroup). The ring memory (`mm::shared::SharedRegion`) is written by user space at any time: the kernel only uses atomics and volatile copies on it |
+| `Mm.ioctx` (`IoctxTable.slots`); `AIO_NR` | io/aio/mod.rs | spin Mutex leaves, thread context | `Mm.ioctx`: an address space's AIO contexts by id (Linux mm->ioctx_table under ioctx_lock): io_setup adds (the table grows by a buffer allocated before the lock, `kmem::spare`/`adopt`), io_destroy and exit_aio remove, every AIO syscall looks a context up under it, cloning its `Arc`; mremap of a ring, under the mmap_lock for writing, finds its context in it and moves the context id (atomics); nothing is taken under it. `AIO_NR` (Linux aio_nr_lock): the events every context asked for, against aio-max-nr (an atomic, read lock-free) |
+| `Kioctx.ring_lock` (sleeping) → mmap_lock; `Kioctx.comp`, `Kioctx.reap`; `PollIocb.reg` (sleeping) → `Kioctx.active` → file wait queue head → `PollIocb.st` → `Workqueue.inner` | io/aio/ctx.rs, io/aio/poll.rs | `ring_lock`, `reg` sleeping `sync::Mutex`; `comp`, `reap`, `active`, `st` IrqSpinlock | An AIO context (Linux struct kioctx). `ring_lock` (Linux ring_lock): one io_getevents copies events to user space (it may fault: -> mmap_lock) and moves the ring's head. `comp` (Linux completion_lock): the kernel's tail and the count of posted events whose slots are not free yet; a request's end writes its event into the shared ring and publishes the tail (Release) under it, in any context (a bio's end_io in hardirq), then signals its eventfd (`Eventfd.inner`) and wakes io_getevents sleepers (`Kioctx.wait`, keyed by the events in the ring) after the unlock; a leaf. `Kioctx.avail` (atomic, Linux reqs_available) counts free event slots, refilled under `comp` from the head user space stored. `reap`: requests whose event is posted, waiting for release in thread context (their pins are dirtied under page locks, their file dropped: Linux bio_dirty_work, delayed_fput), pushed in any context with a delayed work item on `SYSTEM_WQ` (queued from the interrupt handler: `Workqueue.inner`), drained by that work, io_submit, io_getevents and the context's end; a leaf. `active` (Linux ctx_lock): the cancellable requests (IOCB_CMD_POLL), taken by io_cancel, the end's cancel, and a poll's submission and work, which take their wait entry off the file's queue under it (-> the queue head). `PollIocb.reg` (a poll request's wait entry and the owners of its queue) is held by the submission across the file's poll (which may sleep) and its decision under `active`, and by the poll work around its own, so the work waits for a submission still registering. A poll's wakeup runs under the file's wait queue head and takes only `PollIocb.st` (its work's queued/again/cancelled flags), then queues its work (`Workqueue.inner`, the worker's wait queue head): head -> head nesting, as epoll's callback. `Kioctx.users` and `reqs` (atomics, Linux percpu_ref users and reqs) count the syscalls using a context and its requests alive; io_destroy and exit_aio set `dead` (SeqCst against a lookup's increment, and against the last put's read of `dead` after its decrement: store buffering, all four accesses SeqCst), wait for `users` to drain, cancel, then wait for `reqs` (`Kioctx.idle`), releasing reaped requests meanwhile |
+| `TaskWorks.q` (per task) | task/task_work.rs | IrqSpinlock leaf | a task's queued callbacks (Linux task->task_works, here a lock and an intrusive list that never allocates): `task_work_add` from any context, hardirq included, links a callback head (once), drops the lock, then sets TIF_NOTIFY_SIGNAL and wakes the task from an interruptible sleep (pi_lock, run-queue lock: after the lock); the task pops one at a time and runs it with nothing held; `exit_task_work` closes the list (later adds fail) |
+| `Tctx.reqs` (per task) → `TaskWorks.q`; `IoWq` `Acct.q`, `IoWq.workers`, `Tctx.io_wq`, `IoRing.defer` | io/io_uring/tctx.rs, io/io_uring/iowq.rs, io/io_uring/mod.rs | `Tctx.reqs` IrqSpinlock; the others spin Mutex leaves, thread context | `Tctx.reqs`: a task's ended io_uring requests (Linux tctx->task_list), pushed by `AsyncIo::complete` in any context (a bio's end_io in hardirq); the push queues the task's callback under it, while the pushed request (which holds the task) is still the pusher's, so no task reference is dropped in an interrupt handler. The task pops them in its context and finishes them (CQE under `IoRing.cq`, pins released: page locks) with nothing held. `Acct.q`: one io-wq pool's queue (an intrusive list of boxed work: nothing allocates under it) and worker counts; `IoWq.workers`: the workers' tasks, for cancel; `Tctx.io_wq`: the task's io-wq and whether its cancel began (Linux tctx->in_cancel): exit and exec leave it in place while they cancel, so work queued meanwhile ends ECANCELED, and take it after; none is made again after exit (after exec, a new one); `IoRing.defer`: the requests a drain holds back, popped under it and queued after. Workers are io threads of the submitter's process, started (only by the owner, else through its task_work callback) and woken after the locks are released. `Tctx.inflight`, `IoRing.inflight` (atomics) count requests from their issue or queueing to their drop (in the submitter's context or a worker's); exit and exec wait for zero after cancelling the io-wq, polling IOPOLL rings and running their own ended requests meanwhile; the drop that takes `IoRing.inflight` to zero lets the held-back requests go |
 | `Pid.wait_pidfd` | task/pid.rs, task/pidfd.rs | WaitQueue | pidfd pollers of the task the `Pid` names (Linux wait_pidfd); woken under TASKLIST's write lock (a wait queue head is a leaf under it) when the task becomes a zombie and is reported (`notify_pidfd` from `notify`, Linux do_notify_pidfd) or, an untraced thread, exits, and when it leaves the task list (`remove_task`, Linux __unhash_process). A poll reads the task's state under TASKLIST's read lock (`pidfd_exited`, Linux pidfd_poll under RCU): readable once it is a zombie and, a leader, no other thread of its group is listed; hung up once it is gone. Poll methods run with no spin lock held, so taking TASKLIST there is in order |
 | `SigHand.signalfd_wq` | signal/mod.rs | WaitQueue (its own IrqSpinlock) | signalfd readers and pollers of the tasks sharing a handler table (Linux sighand->signalfd_wqh); woken by send_signal after the target's signal state is unlocked; readers take `Signalfd.inner` and the caller's signal state only in its condition, after the queue's lock is dropped |
-| `Workqueue.inner` | task/workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's state is plain fields under its own `spin::Mutex` (pending/running bits; a delayed item's `wake_tick`, nonzero exactly while it is on the delayed list, and a `seq` that voids a promoted copy). `queue_work` takes the item lock and drops it before this lock; the delayed-work calls (queue, mod, cancel, promote) take the item lock under it, so list membership and `wake_tick` change together (order: `Workqueue.inner` → item, a leaf). Never from IRQ context |
+| `Workqueue.inner` | task/workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`, `KBLOCKD`), intrusive (Linux work_struct.entry): each item links to the next through its own `next`/`dnext`, a reference the list owns while queued, so queueing never allocates; a work item's state is plain fields under its own `IrqSpinlock` (pending/running bits, the links; a delayed item's `wake_tick`, nonzero exactly while it is on the delayed list, a `seq` that voids its promoted entry, and whether that entry is on the pending list). `queue_work` takes the item lock and drops it before this lock; linking and the delayed-work calls (queue, mod, cancel, promote) take one item lock at a time under it, so list membership and `wake_tick` change together (order: `Workqueue.inner` → item, a leaf; nobody waits for `inner` holding an item lock). An item is non-reentrant across workqueues (Linux find_worker_executing_work): a worker that pops one running elsewhere marks it to run again (WORK_RERUN, under the item lock) and the running worker runs it once more. Queueing and the delayed-work calls are allowed in any context, hardirq included (Linux queue_work: pool->lock with interrupts off): they allocate nothing, drop no last reference and wake the worker through its wait queue; work functions run in the worker only |
 | `BDI_REGISTRY`, `BdiWriteback.dirty`, `BdiWriteback.dwork` | mm/writeback.rs | spin | per-disk writeback state: the devices with dirty data, the periodic work; leaves, writeback runs with none held |
 | `Task.cgroup`, `CSS_SET_CACHE`, `CgroupRoot.{root_cgrp, controllers}`, `Cgroup.{parent, children, ancestors, subsys, tasks}`, `CssSet.subsys`, `CgroupSubsysState.private`, `CpuState.bw`, `IoState.devices` | cgroup/ | spin (RwLock; `CSS_SET_CACHE`, `Task.cgroup`, `CpuState.bw` (weight, quota, period together), `IoState.devices` (each device's limits together) Mutex leaves) | cgroup hierarchy and membership (`Task.cgroup`: the task's cgroup, a leaf reached through the task the caller holds: current, a fork child, or a `TaskRef` cloned out of TASKLIST; Linux task->cgroups); parent before child; never under TASKLIST. `CGROUP_MUTEX` (sleeping, Linux cgroup_mutex; section 2) serializes mkdir, rmdir, cgroup.procs/subtree_control/freeze writes and a CLONE_INTO_CGROUP fork from admission to post_fork, so rmdir's emptiness check and its `dead` mark cannot interleave with an attach; it is taken before the cgroupfs inode's spin lock. `CGROUP_THREADGROUP_RWSEM` (sleeping, under `CGROUP_MUTEX`) keeps forks out while cgroup.procs moves a whole thread group. The pids counters are atomics charged add-then-check (Linux pids_try_charge): at fork, before the child exists, on the target cgroup (`cgroup::can_fork`, undone by `ForkCg` on failure); the root is never charged. memory.max is one atomic word (Linux page_counter max); a cgroup's frozen flag is written under `CGROUP_MUTEX`. |
-| `IpcIds.inner`, `KernIpcPerm.lock`, `MsgQueue.q`, `SemArray.global`, `SemSlot.lock`, `SemUndoList.arrays`, `MQ_ACCT`, `MqQueue.{messages, flags, notify}`; `MQ_REGISTRY` | ipc/ | spin; `MQ_REGISTRY` sleeping (`RwSem`) | SysV and POSIX IPC objects; `MQ_REGISTRY` (the POSIX queues by name, Linux the mqueue root's i_rwsem) is taken by mq_open and mq_unlink in thread context under no other lock, and a create charges and allocates the queue under it; `MQ_ACCT` (the POSIX queue count and each user's queue bytes against RLIMIT_MSGQUEUE, Linux mq_lock) is a leaf, taken under `MQ_REGISTRY` by a create and by a queue's Drop (which may run under it at unlink); nothing allocates under it (a user's first charge grows its list with it released, then checks again); `IpcIds.rwsem` (sleeping, section 2) -> `IpcIds.inner` -> the object's lock; the namespace totals (`used_sems`, `shm_tot`) grow only under `IpcIds.rwsem`, after the insert, and shrink lock-free at destroy. Semaphores use Linux sem_lock's two levels: a single-operation semop takes only that semaphore's `SemSlot.lock` (its value, sempid, otime, single-operation waiters and SEM_UNDO adjustments, reached through the `SemLock` guard); multi-operation semops, semctl, exit and removal take `SemArray.global` (multi-operation waiters, `complex_count`, ctime) in complex mode: `use_global_lock` (written under `global`, read lock-free) is set and every slot lock taken and dropped once, which waits out the single-operation holders; the fast path rechecks the flag with Acquire after its slot lock and falls back to `global` while it is set; it is cleared with Release after `USE_GLOBAL_LOCK_HYSTERESIS` global holds with no multi-operation waiter. Order `SemArray.global` -> `SemSlot.lock`. A waiter's status is set by its waker under the locks (Release) and read by the sleeper without them (Acquire, Linux q->status); wakeups happen after the unlock. SEM_UNDO adjustments live in each semaphore (`PerSem.undo`, by undo-list id); `SemUndoList.arrays` (a leaf, never held with the array's locks) names the arrays a list has adjusted and is filled before the array lock is taken (Linux find_alloc_undo). `MsgQueue.q` holds the queue's messages, counters, qbytes, times and last pids (Linux: the msq lock): msgsnd's limit and removal check, the enqueue and the sender's pid and time are one critical section, likewise msgrcv's dequeue, and IPC_STAT copies a snapshot under it; IPC_SET takes `KernIpcPerm.lock` (a leaf) under it. The namespace's message statistics are atomics changed under it |
+| `IpcIds.inner`, `KernIpcPerm.lock`, `MsgQueue.q`, `SemArray.global`, `SemSlot.lock`, `SemUndoList.arrays`, `MQ_ACCT`, `MqQueue.{messages, flags, notify}`; `MQ_REGISTRY` | ipc/ | spin; `MQ_REGISTRY` sleeping (`RwSem`) | SysV and POSIX IPC objects; `MQ_REGISTRY` (the POSIX queues by name, Linux the mqueue root's i_rwsem) is taken by mq_open and mq_unlink in thread context under no other lock, and a create charges and allocates the queue under it; `MQ_ACCT` (the POSIX queue count and each user's queue bytes against RLIMIT_MSGQUEUE, Linux mq_lock) is a leaf, taken under `MQ_REGISTRY` by a create and by a queue's Drop (which may run under it at unlink); nothing allocates under it (a user's first charge grows its list with it released, then checks again); `IpcIds.rwsem` (sleeping, section 2) -> `IpcIds.inner` -> the object's lock; the namespace totals (`used_sems`, `shm_tot`) grow only under `IpcIds.rwsem`, after the insert, and shrink lock-free at destroy; a removed, still attached shm segment's key (`KernIpcPerm.key`, an atomic) becomes IPC_PRIVATE under `IpcIds.inner` (Linux ipc_set_key_private). Semaphores use Linux sem_lock's two levels: a single-operation semop takes only that semaphore's `SemSlot.lock` (its value, sempid, otime, single-operation waiters and SEM_UNDO adjustments, reached through the `SemLock` guard); multi-operation semops, semctl, exit and removal take `SemArray.global` (multi-operation waiters, `complex_count`, ctime) in complex mode: `use_global_lock` (written under `global`, read lock-free) is set and every slot lock taken and dropped once, which waits out the single-operation holders; the fast path rechecks the flag with Acquire after its slot lock and falls back to `global` while it is set; it is cleared with Release after `USE_GLOBAL_LOCK_HYSTERESIS` global holds with no multi-operation waiter. Order `SemArray.global` -> `SemSlot.lock`. A waiter's status is set by its waker under the locks (Release) and read by the sleeper without them (Acquire, Linux q->status); wakeups happen after the unlock. SEM_UNDO adjustments live in each semaphore (`PerSem.undo`, by undo-list id); `SemUndoList.arrays` (a leaf, never held with the array's locks) names the arrays a list has adjusted and is filled before the array lock is taken (Linux find_alloc_undo). `MsgQueue.q` holds the queue's messages, counters, qbytes, times and last pids (Linux: the msq lock): msgsnd's limit and removal check, the enqueue and the sender's pid and time are one critical section, likewise msgrcv's dequeue, and IPC_STAT copies a snapshot under it; IPC_SET takes `KernIpcPerm.lock` (a leaf) under it. The namespace's message statistics are atomics changed under it |
 | `KEYRING_LINK` (sleeping) → `Key.keyring_keys`; `Task.keyrings`, `USER_KEYRINGS`, `Key.payload` → `KEY_DATABASE` → `KEY_USERS` | keys/ | spin (RwLock; `Task.keyrings` Mutex) | a task's thread/process/session keyrings (`Task.keyrings`, reached through the current task or a fork child; creating a keyring registers it under it), the per-user keyrings, the key registry and keyrings. Links and keyring slots own keys (`Arc<Key>`); `KEY_DATABASE` holds weak entries (lookups upgrade after releasing it). A key's `Drop` (its last reference) takes `KEY_DATABASE`, then `KEY_USERS` (the per-user quota, a leaf), so no `Arc<Key>` is dropped under either; `Key.keyring_keys` is a leaf: unlinked keys are dropped after it is released, and replaced slots after `Task.keyrings`. `KEYRING_LINK` (Linux keyring_serialise_link_lock) is held by a keyring's link from its cycle check to the link, taken with no spin lock held. `Key.payload` also plays key->sem: instantiate (only from uninstantiated), update, revoke and invalidate change `Key.state` under its write lock, so a revoked key is never revived (the state is read lock-free); and KEYCTL_CHOWN / KEYCTL_SETPERM decide (owner, group, CAP_SYS_ADMIN) and store `Key.uid`/`gid`/`perm` in one write hold, as Linux keyctl_chown_key / keyctl_setperm_key under key->sem; those atomics are read lock-free by the permission checks and describe (Linux reads key->uid unlocked) |
 | `FileLockCtx.flc_lock` (per inode), `locks::BLOCKED` | fs/locks.rs | spin Mutex | an inode's flock and POSIX locks (Linux i_flctx flc_lock; a POSIX owner is a descriptor table's id), leaf but for BLOCKED (flc_lock -> BLOCKED, Linux blocked_lock_lock: each waiting POSIX owner and the owner it waits on, for EDEADLK). A blocked locker sleeps on the inode's wait queue with neither held, interruptibly, until the change count moves |
 | `cmdline::SAVED` | cmdline.rs | spin Mutex | the saved kernel command line (Linux saved_command_line): written once while parsing, before SMP; read in thread context (init's arguments); a leaf |
 | `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty group set a task with no SignalStruct (kernel thread, exited task) reads; nothing is queued on it; locked where `SignalStruct.shared` would be, same position (Task.sig -> shared) |
 | `FS_TYPES`, `CHARDEV_REGISTRY` | fs/superblock.rs, fs/chardev.rs | spin | filesystem types, character device registry |
-| `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf, also under `FasyncList.list` (O_ASYNC is set or cleared only with the file's fasync entry) |
+| `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf, also under `FasyncList.list` (O_ASYNC is set or cleared only with the file's fasync entry). `File.f_iocb` (the flags' I/O part, Linux f_iocb_flags: O_APPEND, O_DIRECT, O_DSYNC, __O_SYNC) is an atomic written only under it with the flags (F_SETFL), read lock-free by each read and write: an I/O racing an F_SETFL sees the old or the new word, as Linux's unlocked read of f_iocb_flags. `File.f_wb_err` / `f_sb_err` (Linux f_wb_err, f_sb_err: the writeback errors of the file's mapping and filesystem it has seen) are atomics sampled at open and advanced only under it (`errseq` check-and-advance, Linux file_check_and_advance_wb_err), read lock-free first. `AddressSpace.wb_err`, `SuperBlock.s_wb_err` (`util::errseq::ErrSeq`, Linux errseq_t) are lock-free words set by a failed writeback and a stale page cache after a direct write |
 | `FasyncList.list` → `File.f_lock`, `FOwner.st` | io/fasync.rs | sleeping `sync::Mutex` (per object: a pipe's readers and writers, a socket's, a tty's, an inotify group's); `FOwner.st` spin leaf | SIGIO (Linux fasync_lock and RCU readers, fown->lock): `FasyncList.armed` (atomic, written under the lock, read lock-free: Linux kill_fasync's unlocked list test) lets a wakeup with no armed file skip the lock; a list's entries (a file's `FOwner` reference and the armed fd), changed by `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) and walked by `kill_fasync`, which sends each entry's signal under it: thread context, no spin lock held (3.7 rule 1). `FOwner.st` (a file's owner pid, type, setter uids and F_SETSIG signal; allocated once per file) is copied under it and released before the send. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
-| `RamfsInodeData.xattrs` | fs/ramfs.rs | spin | ramfs xattrs (under VFS locks); nothing allocates under it: the name and value are copied before it is taken (Linux simple_xattr_alloc), the list grows with it released (`kmem::spare`), and a replaced or removed attribute is freed after. Their space (`RamfsSbData.xattr_space`, Linux tmpfs free_ispace) is a lock-free counter: a set takes its space before the lock (ENOSPC) and returns what it did not use after; the inode's share (`RamfsInodeData.xattr_bytes`) goes back when it is freed |
+| `RamfsInodeData.xattrs` | fs/ramfs/mod.rs | spin | tmpfs xattrs (under VFS locks); nothing allocates under it: the name and value are copied before it is taken (Linux simple_xattr_alloc), the list grows with it released (`kmem::spare`), and a replaced or removed attribute is freed after. Only tmpfs has them (ramfs: EOPNOTSUPP, as Linux). Their space is the inode space under `tmpfs::Acct.stat` (Linux free_ispace under stat_lock), never nested with this lock: a set takes its space before the lock (ENOSPC) and returns what it did not use after; the inode's share (`RamfsInodeData.xattr_bytes`) goes back when it is freed |
+| tmpfs accounting (`tmpfs::Acct`: `stat`, `max_blocks`, `used_blocks`) | fs/ramfs/tmpfs.rs | `stat` IrqSpinlock leaf; `used_blocks` a `PercpuCounter` | as Linux shmem_sb_info: `stat` (Linux stat_lock) holds the inode limit, the inode space (Linux free_ispace: each inode, extra hard link and user.* xattr takes from it; returned at unlink of an extra link, at `evict_inode` in any context, and when the xattr goes) and the inode64/noswap options; `max_blocks` (an atomic written under `stat`, read without it as Linux does) is the block limit; file pages are charged to `used_blocks` as they enter the cache (`filemap::add`, under the page lock, before `i_pages`) by a limited add that is exact near the limit, and returned as they leave (`remove`, eviction). A remount (under `s_umount` held for writing) checks every new limit against the use and changes them all under `stat`, or nothing. Uncounted while unlimited; an unlimited mount cannot be limited again (Linux "Cannot retroactively limit size") |
+| `PercpuCounter.lock` | util/percpu_counter.rs | IrqSpinlock leaf | a per-CPU counter's folded count (Linux percpu_counter.lock): parts (atomics, one cache line each) fold into it at the batch size; an exact sum or a limited add near its limit takes it; the folded count is read without it for estimates. A caller's choice of its CPU's part, the read, the check and the add run with interrupts off (Linux local_irq_save), so nothing on that CPU slips an add in between and a part never passes the batch (the bound a limited add's fast path relies on) |
 | membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | task/membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`: `curr_mm` SeqCst, then a full fence, then the registrations read, so a registration either sees the CPU in its mm and refreshes it by IPI or is seen by the switch; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
-| `Inode.i_pipe` | fs/inode.rs, io/pipe.rs (FIFOs) | spin Mutex leaf (Linux inode->i_lock around i_pipe) | a FIFO's pipe and its open-file count: attached by the first open, dropped by the last release; every change of the pipe's reader/writer counts and open counters happens under it (so a blocking open decides, and samples the counter it waits on, before unlocking; the release wakes the other side under it: -> `Pipe.wait_queue`); never held across a wait (a blocking open waits on `Pipe.wait_queue` after unlocking) or under `Pipe.inner` |
+| `Inode.i_pipe` | fs/inode.rs, io/pipe.rs (FIFOs, pipefs) | spin Mutex leaf (Linux inode->i_lock around i_pipe) | a FIFO's or pipefs inode's pipe and its open-file count: attached by the first open (pipe(2): at creation, with both ends counted), dropped by the last release (a pipe end's release as a FIFO's); every change of the pipe's reader/writer counts and open counters happens under it (so a blocking open decides, and samples the counter it waits on, before unlocking; the release wakes the other side under it: -> `Pipe.wait_queue`); never held across a wait (a blocking open waits on `Pipe.wait_queue` after unlocking) or under `Pipe.inner` |
 | `Pipe.inner` | io/pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation and across read/write's copy to or from the caller's memory (may fault: -> mmap_lock, as Linux pipe->mutex), never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator; -> `FasyncList.list` (pipe_fasync changes both lists under it, Linux too); -> the output file's write path (i_rwsem, page cache, socket locks) for a pipe-to-file splice, which consumes only what the write took (Linux iter_file_splice_write under pipe_lock); -> the input file's read path for a file-to-pipe splice, which reads only once the pipe has room (Linux splice_file_to_pipe: wait_for_space, then do_splice_read under pipe_lock). A splice, tee or vmsplice waits for data or room with it dropped (`lock_data`, `lock_room`; Linux pipe_wait_readable/writable) and decides EOF, EPIPE or progress under it. SIGIO is sent after it is dropped (Linux sends under pipe->mutex) and after `Inode.i_pipe`. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock. A read decides EOF (no writers) under it, after seeing the ring empty (Linux pipe_read under pipe->mutex): a writer's last write unlocks before its release drops the count, so its data is never read as EOF |
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
@@ -3801,11 +4043,12 @@ else is taken under it) unless an order is given. "spin" is the
 | PCI fixups (`hw/pci/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |
 | `CMDLINE_CONSOLE` | cmdline.rs | spin Mutex | console= choice |
 | `CPU_CRNG` (per CPU) -> `BASE` | random.rs | IrqSpinlock | ChaCha20 CRNG: this CPU's key, then the base key when the CPU key is refreshed or the base reseeded; both leaves otherwise (callers include softirq net code). `GENERATION`/`BIRTH_NS` are atomics read unlocked, rechecked under `BASE` |
+| `Inode.i_linkable` | fs/inode.rs | atomic flag | an O_TMPFILE file not opened O_EXCL may get its first name (Linux I_LINKABLE in i_state under i_lock): set before the file is reachable, tested and cleared by linkat under the inode's `i_rwsem` (`link_locked`) |
 | `Inode.i_writecount`, `Inode.i_swapfile` | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write_access`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: set and cleared by swapon/swapoff
 under its i_rwsem, `SWAPON` -> i_rwsem, and checked under it by
 writes and truncates). The address space holds the executable's denial (`MmStruct.exe_deny`, cloned at fork) |
 | `SuperBlock.s_wb_lock` | fs/superblock.rs | sleeping `sync::Mutex` | serializes whole-filesystem writeback passes (`writeback_sb`: sync, syncfs, umount, the periodic writeback), held across their I/O: s_wb_lock -> page lock -> i_mmap -> PTE lock. fsync writes its inode without it; a page another pass is writing carries the WRITEBACK mark and its writer holds its page lock, so fsync waits on that lock |
-| `SuperBlock.s_dirty`, `SUPER_BLOCKS` | fs/superblock.rs, fs/fs_writeback.rs | spin Mutex leaves | inodes with dirty pages, each held (an `Arc`) until written back (Linux wb->b_dirty), and the device filesystems for sync(2) (Linux super_blocks). `mark_inode_dirty` takes `s_dirty` under a page lock at most (the fault path), then the BDI's spin locks to arm its periodic writeback; writeback takes the list and writes with no spin lock held |
+| `SuperBlock.s_dirty`, `SUPER_BLOCKS` | fs/superblock.rs, fs/fs_writeback.rs | spin Mutex leaves | inodes with dirty pages, each held (an `Arc`) until written back (Linux wb->b_dirty), and the device filesystems for sync(2) (Linux super_blocks). `mark_inode_dirty` (called by every page dirtying, `filemap::dirty_page`, through the mapping's `host`: Linux __folio_mark_dirty) takes `s_dirty` under a page lock at most, then the BDI's spin locks to arm its periodic writeback (a block device's own inode, which has no superblock, arms its disk's directly); `AddressSpace.dirtied_when` is stored (release, under the `i_pages` lock) when the mapping's first dirty page since it was clean comes, and read (acquire) by the periodic writeback, which takes the list, puts back the inodes younger than vm.dirty_expire_centisecs, and writes the rest with no spin lock held |
 | `LAST_INO` (per CPU) | fs/anon_inodes.rs | IrqSpinlock leaf | this CPU's batch of pseudo-filesystem inode numbers (Linux get_next_ino, preempt-off per-CPU counter); refilled from the atomic `SHARED_LAST_INO` under it |
 | `NUMA_TOPOLOGY` | mm/numa.rs | IrqSpinlock leaf | NUMA node table: written by the boot parsers and by each CPU at bring-up (`numa::cpu_up`, end of arch per-CPU init), read by getcpu and the mempolicy syscalls |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents |
@@ -4069,12 +4312,21 @@ is `SCHED:FAIL scheduling while atomic`).
 - `napi_schedule()` (NIC ISRs): `Softnet.poll_list` IrqSpinlock push
   (pre-reserved, no allocation) and a wake of `softnet/N` (allocation-free
   as above); a no-op while the NAPI is scheduled or disabled
-- Workqueues have no IRQ-side work: the worker thread promotes expired
-  delayed work itself, sleeping with a timeout until the next deadline
-- Block completion (virtio-blk ISR): the blk-mq hardware queue lock
+- `Workqueue::queue_work` and the delayed-work calls (Linux queue_work
+  from an interrupt handler): `Workqueue.inner` and the item's lock
+  (IrqSpinlocks) and a wake of the worker; the worker promotes expired
+  delayed work itself, sleeping with a timeout until the next deadline,
+  and runs every work function in thread context
+- Block completion (virtio-blk ISR: per queue on MSI-X, every queue on
+  INTx): the blk-mq hardware queue lock
   (`IrqSpinlock`, leaf) to reap the virtqueue and restart dispatch, then
   `bio_endio` with no lock held; `end_io` completes a `Completion`
   (`IrqSpinlock` -> wait queue wakeup); the lock-free DMA API unmaps
+- AIO completion (a bio's end of an AIO request): `Kioctx.comp`
+  (IrqSpinlock) to post the event into the shared ring, then the
+  request's eventfd (`Eventfd.inner`), the io_getevents wakeup and the
+  push onto `Kioctx.reap` with its delayed work queued; the request's
+  release (pins dirtied, file dropped) runs later in thread context
 - Set reschedule flags (atomic)
 - Read per-CPU data (via GS segment)
 
@@ -4114,7 +4366,7 @@ this is the interrupt-safety invariant:
 | `SignalStruct.shared` | signal/mod.rs | `Mutex` | Thread-group pending signals and curr_target (under Task.sig) |
 | `Task.alloc_lock` | task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over `Task.sig`) |
 | `FsStruct.inner` | fs/fsstruct.rs | `Mutex` | Root, cwd, umask (leaf) |
-| `UCOUNTS` | task/mod.rs | `Mutex` | Per-real-uid counts: RLIMIT_NPROC tasks, RLIMIT_SIGPENDING queued signals (leaf: may be taken under TASKLIST, takes no lock) |
+| `UCOUNTS` | task/mod.rs | `Mutex` | Per-real-uid counts: RLIMIT_NPROC tasks, RLIMIT_SIGPENDING queued signals, io_uring locked pages (Linux user_struct.locked_vm: checked against RLIMIT_MEMLOCK and charged in one hold) (leaf: may be taken under TASKLIST, takes no lock) |
 | `MEMBLOCK` | mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
 | `PidNamespace.bacct` | task/acct.rs | `Mutex` | A pid namespace's process accounting file (Linux pid_namespace->bacct; leaf, thread context: cloned out, the record written and an old file released with no lock held; an exit walks its namespace and each parent, one lock at a time; taken out at the namespace's zap, after its other tasks are gone) |
 | All VFS locks | fs/*.rs | `RwLock` | Inodes, dentries, mounts |
@@ -4182,8 +4434,11 @@ uninterrupted by other tasks. What this changes, and why it holds:
   exactly as for kernel threads, which always ran with interrupts on.
 - Sleeping with interrupts off is now a bug: `might_sleep` reports it
   under `LOCKDEP=1` (1.5).
-- Interrupt handlers nest on the interrupted task's kernel stack (no
-  separate IRQ stacks, unlike Linux): handlers stay shallow.
+- Interrupt handlers run on their CPU's IRQ stack (`irq_stack`, Linux
+  hardirq_stack/irq_stack: x86 for an interrupt from kernel mode, arm64
+  for any), not the interrupted task's; the return-to-user work after
+  them runs on the task stack. Nothing nests on the IRQ stack but
+  exceptions (handlers keep interrupts off).
 - IRQ toggles (`cli`/`sti`, `msr daifset/daifclr`, `local_irq_*`) are
   compiler barriers (no `nomem`), so no memory access moves across
   them.

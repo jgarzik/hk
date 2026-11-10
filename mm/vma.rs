@@ -6,7 +6,6 @@ use alloc::sync::Arc;
 
 use crate::fs::File;
 use crate::mm::anon_vma::AnonVma;
-use crate::mm::shmem::Shmem;
 
 /// Protection flags - Linux PROT_* values
 pub const PROT_NONE: u32 = 0;
@@ -102,6 +101,15 @@ pub const VM_SEQ_READ: u32 = 0x0020_0000;
 /// VMA should not be copied on fork (madvise MADV_DONTFORK)
 pub const VM_DONTCOPY: u32 = 0x0040_0000;
 
+/// mremap may not grow the mapping, nor keep it with MREMAP_DONTUNMAP
+/// (Linux VM_DONTEXPAND: AIO's ring)
+pub const VM_DONTEXPAND: u32 = 0x0000_0400;
+
+/// Mappings whose pages are not ordinary memory, nor to be grown,
+/// merged or inherited as such (Linux VM_SPECIAL: VM_IO, VM_DONTEXPAND,
+/// VM_PFNMAP, VM_MIXEDMAP; hk has no VM_IO or VM_PFNMAP mappings)
+pub const VM_SPECIAL: u32 = VM_DONTEXPAND | VM_MIXEDMAP;
+
 /// VMA should not be included in core dumps (madvise MADV_DONTDUMP)
 pub const VM_DONTDUMP: u32 = 0x0080_0000;
 
@@ -129,6 +137,15 @@ pub const VM_NOMAYEXEC: u32 = 0x1000_0000;
 /// The signal return trampoline's page (arm64; Linux: the vDSO special
 /// mapping), shown as [sigpage] in /proc/<pid>/maps
 pub const VM_SIGPAGE: u32 = 0x2000_0000;
+
+/// A read-only shared mapping of a write-sealed memfd: never PROT_WRITE
+/// (Linux memfd_check_seals_mmap clears VM_MAYWRITE)
+pub const VM_NOMAYWRITE: u32 = 0x4000_0000;
+
+/// A driver's pages inserted at mmap (Linux VM_MIXEDMAP from
+/// vm_insert_pages): fork copies the entries, nothing faults back in
+/// (SIGBUS), it never merges with a neighbour
+pub const VM_MIXEDMAP: u32 = 0x8000_0000;
 
 // ============================================================================
 // msync flags (MS_*)
@@ -248,9 +265,6 @@ pub struct Vma {
     ///
     /// If None, the task's default mempolicy is used.
     pub mempolicy: Option<crate::mm::mempolicy::TaskMempolicy>,
-    /// The pages of shared anonymous memory (MAP_SHARED|MAP_ANONYMOUS),
-    /// indexed from `offset` like a file
-    pub shmem: Option<Arc<Shmem>>,
     /// The SysV shm attachment this VMA is (counted in shm_nattch)
     pub shm: Option<crate::ipc::shm::ShmAttach>,
 }
@@ -366,6 +380,15 @@ impl Vma {
         self.file.as_ref().and_then(|f| f.mapping_inode())
     }
 
+    /// A shared mapping that may write its file (Linux
+    /// vma_is_shared_maywrite: VM_SHARED and VM_MAYWRITE, the file open
+    /// for writing and not write-sealed at mmap)
+    pub fn shared_maywrite(&self) -> bool {
+        self.flags & VM_SHARED != 0
+            && self.flags & VM_NOMAYWRITE == 0
+            && self.file.as_ref().is_some_and(|f| f.is_writable())
+    }
+
     /// Check if this VMA is memory-locked
     #[inline]
     pub fn is_locked(&self) -> bool {
@@ -427,13 +450,6 @@ impl Vma {
         // close are not merged)
         if self.shm.is_some() || other.shm.is_some() {
             return false;
-        }
-        // Must be the same shared object at contiguous offsets
-        match (&self.shmem, &other.shmem) {
-            (None, None) => {}
-            (Some(a), Some(b))
-                if Arc::ptr_eq(a, b) && self.offset + self.size() == other.offset => {}
-            _ => return false,
         }
         // Must have same file backing with contiguous offsets
         match (&self.file, &other.file) {

@@ -3,13 +3,21 @@
 //! Provides shared memory segments that can be attached to multiple process
 //! address spaces for inter-process communication.
 //!
-//! A segment's pages live in a shared object (`mm::shmem::Shmem`, as on
-//! Linux, where segments are shmem files), faulted in on demand. Each
-//! attachment is a VMA holding a [`ShmAttach`]: shm_nattch counts those
-//! VMAs (Linux shm_open/shm_close), so fork's copies, split pieces and
-//! their removal by munmap, shmdt, exit or exec all keep it right, and the
-//! last detach of a segment removed with IPC_RMID destroys it. The pages
-//! go when the segment and its last VMA are gone.
+//! A segment is a file on the kernel's tmpfs ("SYSV<key>", Linux
+//! shmem_kernel_file_setup), its pages in that file's page cache,
+//! faulted in on demand. Each attachment is a VMA mapping the file and
+//! holding a [`ShmAttach`]: shm_nattch counts those VMAs (Linux
+//! shm_open/shm_close), so fork's copies, split pieces and their removal
+//! by munmap, shmdt, exit or exec all keep it right. IPC_RMID of an
+//! attached segment marks it SHM_DEST and drops its key; it stays found
+//! by id (IPC_STAT, shmat) until the last detach removes and destroys it
+//! (Linux do_shm_rmid, shm_close). The pages go with the file, when the
+//! segment and its last VMA are gone.
+//!
+//! Locking: attach, detach and IPC_RMID decide under the segment's
+//! `KernIpcPerm.lock` (spin leaf: nattch with SHM_DEST, and the deleted
+//! mark), then remove it from the table (`IpcIds.inner`) after releasing
+//! it; a detach may run under the mm lock (both are leaves below it).
 
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
@@ -21,7 +29,6 @@ use crate::ipc::util::{
 };
 use crate::ipc::{IPC_64, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Shmid64Ds, current_ipc_ns};
 use crate::mm::Vma;
-use crate::mm::shmem::Shmem;
 use crate::mm::vma::{
     MAP_SHARED, PROT_READ as VMA_PROT_READ, PROT_WRITE as VMA_PROT_WRITE, VM_SHARED, VM_SHM,
 };
@@ -58,6 +65,12 @@ pub const SHM_UNLOCK: i32 = 12;
 pub const SHM_STAT: i32 = 13;
 /// Get info
 pub const SHM_INFO: i32 = 14;
+/// SHM_STAT without the read permission check
+pub const SHM_STAT_ANY: i32 = 15;
+/// Limits (Linux IPC_INFO)
+pub const IPC_INFO: i32 = 3;
+/// Removed, destroyed at its last detach (mode bit)
+pub const SHM_DEST: u16 = 0o1000;
 
 /// Minimum segment size
 pub const SHMMIN: usize = 1;
@@ -84,8 +97,10 @@ pub struct ShmidKernel {
     pub cpid: i32,
     /// Last operation PID
     pub lpid: AtomicI32,
-    /// The segment's pages
-    pub shmem: Arc<Shmem>,
+    /// The segment's file on the kernel's tmpfs (its pages)
+    pub file: Arc<crate::fs::File>,
+    /// That file's inode (its resident pages, read under the table lock)
+    inode: Arc<crate::fs::Inode>,
     /// Destroyed (namespace totals given back): at most once
     destroyed: AtomicBool,
     /// Namespace this segment belongs to
@@ -98,6 +113,11 @@ impl ShmidKernel {
     pub fn new(key: i32, size: usize, mode: u16, ns: Arc<IpcNamespace>) -> KernelResult<Arc<Self>> {
         let now = current_time_secs();
         let pid = current_pid() as i32;
+        let file = crate::fs::ramfs::tmpfs::shmem_kernel_file_setup(
+            alloc::format!("SYSV{:08x}", key as u32).as_bytes(),
+            size as u64,
+        )?;
+        let inode = file.get_inode().ok_or(KernelError::Io)?;
 
         try_arc(Self {
             perm: KernIpcPerm::new(key, mode),
@@ -108,7 +128,8 @@ impl ShmidKernel {
             ctim: AtomicI64::new(now),
             cpid: pid,
             lpid: AtomicI32::new(pid),
-            shmem: Shmem::new(size.div_ceil(PAGE_SIZE) as u64)?,
+            file,
+            inode,
             destroyed: AtomicBool::new(false),
             ns,
         })
@@ -136,7 +157,7 @@ impl IpcObject for ShmidKernel {
     }
 
     /// Linux shm_destroy: once removed (IPC_RMID) and detached. The
-    /// pages go with the last reference to the segment's object.
+    /// pages go with the last reference to the segment's file.
     fn destroy(&self) {
         if self.destroyed.swap(true, Ordering::AcqRel) {
             return;
@@ -154,7 +175,8 @@ impl IpcObject for ShmidKernel {
 /// shm_close through the VMA's vm_ops): counted in shm_nattch for as long
 /// as the VMA exists. Cloned with the VMA (fork, split) and dropped with
 /// it (munmap, shmdt, exit, exec); the last drop of a removed segment
-/// destroys it. Takes no lock (safe under the mm lock).
+/// destroys it. Takes the segment's perm lock (a leaf; safe under the mm
+/// lock).
 pub struct ShmAttach {
     seg: Arc<ShmidKernel>,
     /// Attached SHM_RDONLY: never writable (Linux: no VM_MAYWRITE)
@@ -162,25 +184,24 @@ pub struct ShmAttach {
 }
 
 impl ShmAttach {
-    fn new(seg: Arc<ShmidKernel>, rdonly: bool) -> Self {
-        let a = Self { seg, rdonly };
-        a.open();
-        a
-    }
-
     fn shm(&self) -> &ShmidKernel {
         &self.seg
     }
 
-    /// A new attachment, unless the segment was removed meanwhile
-    /// (IPC_RMID raced the lookup): then backed out, EINVAL like a
-    /// removed id. Pairs with the fence in IPC_RMID.
+    /// A new attachment, unless the segment was destroyed meanwhile
+    /// (its last detach after IPC_RMID raced the lookup): EINVAL like a
+    /// removed id. A removed segment still attached (SHM_DEST) may be
+    /// attached again, as Linux.
     fn attach_live(seg: Arc<ShmidKernel>, rdonly: bool) -> Option<Self> {
-        let a = Self::new(seg, rdonly);
-        core::sync::atomic::fence(Ordering::SeqCst);
-        if a.seg.perm().is_deleted() {
-            return None; // the drop detaches (and destroys if last)
+        {
+            let _l = seg.perm().lock.lock();
+            if seg.perm().is_deleted() {
+                return None;
+            }
+            seg.nattch.fetch_add(1, Ordering::Relaxed);
         }
+        let a = Self { seg, rdonly };
+        a.touch();
         Some(a)
     }
 
@@ -194,34 +215,50 @@ impl ShmAttach {
         Arc::ptr_eq(&self.seg, &other.seg)
     }
 
-    /// Linux shm_open: attach time, last pid, one more attachment
-    fn open(&self) {
+    /// Linux shm_open: attach time, last pid
+    fn touch(&self) {
         let shp = self.shm();
         shp.atim.store(current_time_secs(), Ordering::Relaxed);
         shp.lpid.store(current_pid() as i32, Ordering::Relaxed);
-        shp.nattch.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 impl Clone for ShmAttach {
+    /// Another VMA of an attachment (fork, split): the segment is
+    /// attached, so it is not destroyed
     fn clone(&self) -> Self {
+        {
+            let _l = self.seg.perm().lock.lock();
+            self.seg.nattch.fetch_add(1, Ordering::Relaxed);
+        }
         let a = Self {
             seg: self.seg.clone(),
             rdonly: self.rdonly,
         };
-        a.open();
+        a.touch();
         a
     }
 }
 
 impl Drop for ShmAttach {
     /// Linux shm_close: detach time, last pid; the last detach of a
-    /// removed segment destroys it
+    /// removed (SHM_DEST) segment marks it deleted, then takes it out of
+    /// its table and destroys it
     fn drop(&mut self) {
         let shp = self.shm();
         shp.dtim.store(current_time_secs(), Ordering::Relaxed);
         shp.lpid.store(current_pid() as i32, Ordering::Relaxed);
-        if shp.nattch.fetch_sub(1, Ordering::SeqCst) == 1 && shp.perm().is_deleted() {
+        let last = {
+            let p = shp.perm().lock.lock();
+            let n = shp.nattch.fetch_sub(1, Ordering::Relaxed) - 1;
+            let last = n == 0 && p.mode & SHM_DEST != 0;
+            if last {
+                shp.perm().mark_deleted();
+            }
+            last.then_some(p.id)
+        };
+        if let Some(id) = last {
+            shp.ns.shm_ids().remove_obj(id, &self.seg);
             self.seg.destroy();
         }
     }
@@ -306,7 +343,7 @@ pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> KernelResult<u64> {
     ipc_checkperm(shm_obj.perm(), access)?;
     let shm_kernel: &ShmidKernel = &shm_obj;
     let size = (shm_kernel.segsz as u64).div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
-    let shmem = shm_kernel.shmem.clone();
+    let file = shm_kernel.file.clone();
 
     // SHM_REMAP needs an address (Linux do_shmat)
     if shmaddr == 0 && shmflg & SHM_REMAP != 0 {
@@ -360,9 +397,9 @@ pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> KernelResult<u64> {
     } else {
         VMA_PROT_READ | VMA_PROT_WRITE
     };
-    // Pages are faulted in from the segment's object (Linux shm_mmap)
-    let mut vma = Vma::new(addr, addr + size, prot, MAP_SHARED | VM_SHARED | VM_SHM);
-    vma.shmem = Some(shmem);
+    // A mapping of the segment's file (Linux shm_mmap)
+    let flags = MAP_SHARED | VM_SHARED | VM_SHM;
+    let mut vma = Vma::new_file(addr, addr + size, prot, flags, file, 0);
     vma.shm =
         Some(ShmAttach::attach_live((*shm_obj).clone(), shmflg & SHM_RDONLY != 0).ok_or(einval)?);
     mm_guard.insert_vma(vma);
@@ -418,25 +455,52 @@ pub fn sys_shmctl(shmid: i32, cmd: i32, buf: UserPtr<Shmid64Ds>) -> KernelResult
     let cmd_only = cmd & !IPC_64;
 
     match cmd_only {
-        IPC_STAT | SHM_STAT => {
-            let shm = ns
-                .shm_ids()
-                .find_by_id(shmid)
-                .ok_or(KernelError::InvalidArgument)?;
-
-            // Check read permission
-            ipc_checkperm(shm.perm(), IPC_PERM_READ)?;
-
-            // Fill and copy structure
-            let mut ds = Shmid64Ds::default();
-
-            shm.fill_shmid64_ds(&mut ds);
-
-            if !buf.is_null() {
-                buf.write(&ds)?;
+        // Linux shmctl_stat: IPC_STAT by id (0), SHM_STAT / SHM_STAT_ANY
+        // by table index (the full id); SHM_STAT_ANY skips the read check
+        IPC_STAT | SHM_STAT | SHM_STAT_ANY => {
+            let einval = KernelError::InvalidArgument;
+            let (shm, ret) = if cmd_only == IPC_STAT {
+                (ns.shm_ids().find_by_id(shmid).ok_or(einval)?, 0)
+            } else {
+                ns.shm_ids().find_by_idx(shmid).ok_or(einval)?
+            };
+            if cmd_only != SHM_STAT_ANY {
+                ipc_checkperm(shm.perm(), IPC_PERM_READ)?;
             }
+            let mut ds = Shmid64Ds::default();
+            shm.fill_shmid64_ds(&mut ds);
+            buf.write(&ds)?;
+            Ok(ret)
+        }
 
-            Ok(0)
+        IPC_INFO => {
+            let info = ShmInfo64 {
+                shmmax: ns.shm_ctlmax as u64,
+                shmmin: SHMMIN as u64,
+                shmmni: u64::from(ns.shm_ctlmni),
+                shmseg: u64::from(ns.shm_ctlmni),
+                shmall: ns.shm_ctlall as u64,
+                unused: [0; 4],
+            };
+            let idx = ns.shm_ids().max_idx().max(0);
+            UserPtr::<ShmInfo64>::new(buf.addr()).write(&info)?;
+            Ok(idx)
+        }
+
+        SHM_INFO => {
+            let ids = ns.shm_ids();
+            let info = ShmInfo {
+                used_ids: ids.in_use() as i32,
+                pad: 0,
+                shm_tot: ns.shm_tot.load(Ordering::Relaxed),
+                shm_rss: shm_rss(&ns),
+                shm_swp: 0,
+                swap_attempts: 0,
+                swap_successes: 0,
+            };
+            let idx = ids.max_idx().max(0);
+            UserPtr::<ShmInfo>::new(buf.addr()).write(&info)?;
+            Ok(idx)
         }
 
         IPC_SET => {
@@ -460,7 +524,8 @@ pub fn sys_shmctl(shmid: i32, cmd: i32, buf: UserPtr<Shmid64Ds>) -> KernelResult
                 }
                 p.uid = ds.shm_perm.uid;
                 p.gid = ds.shm_perm.gid;
-                p.mode = ds.shm_perm.mode & 0o777;
+                // SHM_DEST stays (Linux: only S_IRWXUGO change)
+                p.mode = (p.mode & !0o777) | (ds.shm_perm.mode & 0o777);
             }
             shm.ctim.store(current_time_secs(), Ordering::Relaxed);
 
@@ -481,17 +546,27 @@ pub fn sys_shmctl(shmid: i32, cmd: i32, buf: UserPtr<Shmid64Ds>) -> KernelResult
                 return Err(KernelError::NotPermitted);
             }
 
-            // Remove from ID table (marks it deleted). With no attachment
-            // destroy it now, else the last detach does; a racing shmat
-            // either is seen here or sees the mark and backs out
-            // (`attach_live`), so it is destroyed exactly once
-            if let Some(removed) = ns.shm_ids().remove(shmid) {
-                core::sync::atomic::fence(Ordering::SeqCst);
-                if removed.nattch.load(Ordering::SeqCst) == 0 {
-                    removed.destroy();
+            // Linux do_shm_rmid: attached, it becomes SHM_DEST without a
+            // key and the last detach destroys it; else it goes now.
+            // Decided under the perm lock, where attach and detach count.
+            let now = {
+                let mut p = perm.lock.lock();
+                if p.mode & SHM_DEST != 0 {
+                    false
+                } else if shm.nattch.load(Ordering::Relaxed) > 0 {
+                    p.mode |= SHM_DEST;
+                    false
+                } else {
+                    perm.mark_deleted();
+                    true
                 }
+            };
+            if now {
+                ns.shm_ids().remove_obj(shmid, &shm);
+                shm.destroy();
+            } else {
+                ns.shm_ids().set_key_private(&shm);
             }
-
             Ok(0)
         }
 
@@ -514,4 +589,100 @@ pub fn sys_shmctl(shmid: i32, cmd: i32, buf: UserPtr<Shmid64Ds>) -> KernelResult
 
         _ => Err(KernelError::InvalidArgument),
     }
+}
+
+/// shminfo64 (Linux IPC_INFO): limits, then four unused words
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ShmInfo64 {
+    shmmax: u64,
+    shmmin: u64,
+    shmmni: u64,
+    shmseg: u64,
+    shmall: u64,
+    unused: [u64; 4],
+}
+crate::pod!(ShmInfo64 {
+    shmmax,
+    shmmin,
+    shmmni,
+    shmseg,
+    shmall,
+    unused
+});
+
+/// struct shm_info (Linux SHM_INFO)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ShmInfo {
+    used_ids: i32,
+    pad: u32,
+    shm_tot: u64,
+    shm_rss: u64,
+    shm_swp: u64,
+    swap_attempts: u64,
+    swap_successes: u64,
+}
+crate::pod!(ShmInfo {
+    used_ids,
+    pad,
+    shm_tot,
+    shm_rss,
+    shm_swp,
+    swap_attempts,
+    swap_successes
+});
+
+/// The resident pages of a segment (Linux shm_add_rss_swap: its file's
+/// cached pages; none are swapped)
+fn rss(shm: &ShmidKernel) -> u64 {
+    shm.inode.i_data.nrpages()
+}
+
+/// The resident pages of every segment of `ns` (Linux shm_get_stat)
+fn shm_rss(ns: &IpcNamespace) -> u64 {
+    let mut n = 0;
+    ns.shm_ids().for_each(|s, _| n += rss(s));
+    n
+}
+
+/// /proc/sysvipc/shm of the reader's IPC namespace (Linux
+/// sysvipc_shm_proc_show): a header, then a line per segment
+pub fn proc_sysvipc_shm() -> Vec<u8> {
+    use core::fmt::Write;
+    let ns = current_ipc_ns();
+    let ids = ns.shm_ids();
+    let mut out = alloc::string::String::from(
+        "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
+    );
+    // The segments taken in one walk of the table, printed after it
+    for (s, id) in ids.snapshot().unwrap_or_default() {
+        let p = s.perm();
+        let (uid, gid, mode) = {
+            let l = p.lock.lock();
+            (l.uid, l.gid, l.mode)
+        };
+        let vnr = |pid: i32| crate::task::pid::vnr(pid as u64) as i32;
+        let _ = writeln!(
+            out,
+            "{:>10} {:>10}  {:>4o} {:>21} {:>5} {:>5}  {:>5} {:>5} {:>5} {:>5} {:>5} {:>10} {:>10} {:>10} {:>21} {:>21}",
+            p.key(),
+            id,
+            mode,
+            s.segsz,
+            vnr(s.cpid),
+            vnr(s.lpid.load(Ordering::Relaxed)),
+            s.nattch.load(Ordering::Relaxed),
+            uid,
+            gid,
+            p.cuid,
+            p.cgid,
+            s.atim.load(Ordering::Relaxed),
+            s.dtim.load(Ordering::Relaxed),
+            s.ctim.load(Ordering::Relaxed),
+            rss(&s) * PAGE_SIZE as u64,
+            0
+        );
+    }
+    out.into_bytes()
 }

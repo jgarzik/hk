@@ -7,6 +7,7 @@
 
 pub mod driver;
 pub mod intx;
+pub mod msix;
 pub mod quirks;
 
 use alloc::boxed::Box;

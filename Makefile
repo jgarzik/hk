@@ -116,6 +116,7 @@ ifdef MACHINE
 	@echo "Created target/$(MACHINE).iso"
 else
 	@cp boot/grub.cfg target/iso/boot/grub/grub.cfg
+	@sed -i 's|multiboot2 /boot/kernel .*|& $(HK_CMDLINE)|' target/iso/boot/grub/grub.cfg
 	@grub-mkrescue -o target/hk-x86_64.iso target/iso 2>/dev/null
 endif
 
@@ -195,6 +196,16 @@ export NIC
 # NO_KVM=1: force TCG on x86 (CI's conditions); LINUX_NOCACHE=1: boot
 # check-linux* even if the PASS is cached (tools/linux-boot-tester.sh)
 export NO_KVM LINUX_NOCACHE
+
+# BENCH=1: boot with hk.bench on the kernel command line (hk and the
+# Linux reference), which runs the boot tester's print-only benchmarks
+# (DIO_BENCH); extra words go in HK_CMDLINE. Every boot gives virtio-blk
+# a poll queue (Linux's poll_queues module parameter; default 0), so the
+# io_uring IOPOLL tests poll on both kernels
+HK_CMDLINE ?=
+HK_CMDLINE += virtio_blk.poll_queues=1
+HK_CMDLINE += $(if $(BENCH),hk.bench)
+export HK_CMDLINE
 
 # Serial logs, per tree (so worktrees and parallel boots don't collide)
 QEMU_LOG_DIR ?= $(CURDIR)/target/qemu

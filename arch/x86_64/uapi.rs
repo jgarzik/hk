@@ -14,6 +14,10 @@ pub const AUDIT_ARCH: u32 = crate::seccomp::AUDIT_ARCH_X86_64;
 /// ELF e_machine of native executables (Linux ELF_ARCH)
 pub const ELF_ARCH: u16 = crate::util::elf::EM_X86_64;
 
+/// The smallest alternate signal stack sigaltstack takes (Linux
+/// MINSIGSTKSZ, arch/x86/include/uapi/asm/signal.h)
+pub const MINSIGSTKSZ: usize = 2048;
+
 /// The RELATIVE relocation type (Linux R_X86_64_RELATIVE)
 pub const R_RELATIVE: u32 = crate::util::elf::R_X86_64_RELATIVE;
 
@@ -31,6 +35,11 @@ pub const SECCOMP_STRICT: [i32; 5] = {
         SYS_RT_SIGRETURN as i32,
     ]
 };
+
+/// `st_blksize` from a block size; the field is i64 on this arch
+pub fn st_blksize(n: u32) -> i64 {
+    i64::from(n)
+}
 
 /// `st_nlink` from an inode link count; the field is u64 on this arch
 pub fn st_nlink(n: u32) -> u64 {
@@ -84,6 +93,11 @@ crate::pod!(Stat {
 // O_* flags whose values differ per arch (include/uapi/asm-generic/fcntl.h)
 /// Must be a directory
 pub const O_DIRECTORY: u32 = 0o200000;
+/// Large-file offsets (always on 64-bit; Linux sets it on every open
+/// file, force_o_largefile)
+pub const O_LARGEFILE: u32 = 0o100000;
+/// Direct I/O, bypassing the page cache
+pub const O_DIRECT: u32 = 0o40000;
 /// Don't follow a trailing symlink
 pub const O_NOFOLLOW: u32 = 0o400000;
 

@@ -166,6 +166,11 @@ impl<T> KVec<T> {
         self.0.pop()
     }
 
+    /// Take out element `i`, shifting the rest down (panics past the end)
+    pub fn remove(&mut self, i: usize) -> T {
+        self.0.remove(i)
+    }
+
     pub fn iter(&self) -> core::slice::Iter<'_, T> {
         self.0.iter()
     }

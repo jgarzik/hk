@@ -23,7 +23,9 @@
 //! the task's EL0 trap frame, where they live while it is in the kernel.
 
 use crate::signal::siginfo::UserSigInfo;
-use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, sa_flags};
+use crate::signal::{
+    AltStack, SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, UserStack, sa_flags,
+};
 use crate::uaccess::{access_ok, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::{FromBytes, IntoBytes};
@@ -64,30 +66,6 @@ crate::pod!(SigContext {
 pub const RESERVED_SIZE: usize = 4096;
 
 // =============================================================================
-// Stack Info (stack_t)
-// =============================================================================
-
-/// Stack info structure (matches Linux stack_t)
-#[repr(C)]
-#[derive(Debug, Clone, Default, Copy)]
-pub struct StackT {
-    /// Stack base address
-    pub ss_sp: u64,
-    /// Flags
-    pub ss_flags: i32,
-    /// Padding
-    pub _pad: i32,
-    /// Stack size
-    pub ss_size: u64,
-}
-crate::pod!(StackT {
-    ss_sp,
-    ss_flags,
-    _pad,
-    ss_size
-});
-
-// =============================================================================
 // User Context (ucontext_t)
 // =============================================================================
 
@@ -101,7 +79,7 @@ pub struct UContext {
     /// Link to next context
     pub uc_link: u64,
     /// Alternate signal stack
-    pub uc_stack: StackT,
+    pub uc_stack: UserStack,
     /// Signal mask
     pub uc_sigmask: SigSet,
     /// Padding: Linux's 120-byte `__unused` (1024 bits of sigset_t space)
@@ -145,7 +123,6 @@ pub const RESERVED_OFFSET: usize = core::mem::size_of::<RtSigFrame>();
 // asm-generic siginfo) and every byte is a named field: the frame is
 // copied whole to user memory, so implicit padding would leak kernel stack
 const _: () = assert!(core::mem::size_of::<SigContext>() == 8 + 31 * 8 + 3 * 8 + 8);
-const _: () = assert!(core::mem::size_of::<StackT>() == 24);
 const _: () = assert!(core::mem::size_of::<SigSet>() == 8);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_stack) == 16);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_sigmask) == 40);
@@ -222,9 +199,6 @@ pub const fn signal_frame_size() -> usize {
 /// (`Mm::sigpage`), placed in free space at exec.
 pub const SIGPAGE: Option<[u32; 2]> = Some([0xd280_1168, 0xd400_0001]);
 
-/// SS_DISABLE flag for stack_t
-const SS_DISABLE: i32 = 2;
-
 /// PSTATE bits user code may set through rt_sigreturn (Linux
 /// valid_native_regs): NZCV, SS (single step), SSBS, BTYPE, DIT, TCO.
 /// Mode (EL0t), DAIF and everything else are forced to 0.
@@ -240,7 +214,8 @@ const PSTATE_BTYPE: u64 = 3 << 10;
 /// Set up signal frame on user stack
 ///
 /// This function:
-/// 1. Calculates frame location on user stack (Linux get_sigframe)
+/// 1. Calculates frame location on the user stack or the alternate one
+///    `alt` (Linux get_sigframe)
 /// 2. Builds siginfo and ucontext (with the FP/SIMD record) from saved registers
 /// 3. Writes frame to user memory
 /// 4. Redirects the task's pt_regs (`regs`) to the handler
@@ -260,6 +235,7 @@ pub fn setup_rt_frame(
     blocked: SigSet,
     info: &SigInfo,
     trap: &Trap,
+    alt: &AltStack,
     uframe: &crate::arch::UserFrame,
 ) -> KernelResult<()> {
     // A copy, written back once the handler frame is in place
@@ -291,27 +267,7 @@ pub fn setup_rt_frame(
         page
     };
 
-    // Frame record, then the frame below it, both 16-byte aligned.
-    // user_sp is user-controlled: an underflow means no room (EFAULT, and
-    // the caller forces SIGSEGV), never a wrapped address
-    let frame_size = signal_frame_size() as u64;
-    let Some(record_addr) = user_sp
-        .checked_sub(16)
-        .map(|a| a & !(SIGNAL_FRAME_ALIGN - 1))
-    else {
-        return Err(KernelError::BadAddress);
-    };
-    let Some(frame_addr) = record_addr
-        .checked_sub(frame_size)
-        .map(|a| a & !(SIGNAL_FRAME_ALIGN - 1))
-    else {
-        return Err(KernelError::BadAddress);
-    };
-
-    // Validate user stack address
-    if !access_ok(frame_addr, (record_addr + 16 - frame_addr) as usize) {
-        return Err(KernelError::BadAddress);
-    }
+    let (record_addr, frame_addr) = get_sigframe(user_sp, action, alt)?;
 
     // __reserved: the FP/SIMD record of the interrupted code, an
     // esr_context for faults, then the terminating null record
@@ -357,10 +313,7 @@ pub fn setup_rt_frame(
     let frame = RtSigFrame {
         info: info.to_user(),
         uc: UContext {
-            uc_stack: StackT {
-                ss_flags: SS_DISABLE,
-                ..FromBytes::zeroed()
-            },
+            uc_stack: alt.save(),
             uc_sigmask: blocked,
             uc_mcontext: SigContext {
                 // The last fault's FAR (Linux thread.fault_address)
@@ -399,6 +352,27 @@ pub fn setup_rt_frame(
     uframe.set(r);
 
     Ok(())
+}
+
+/// Where a handler frame for `action` goes when `sp` is interrupted
+/// (Linux get_sigframe): (frame record, `RtSigFrame`), both 16-byte
+/// aligned, below `sp` or the top of `alt` for SA_ONSTACK (Linux sigsp).
+/// `sp` is user-controlled: an underflow or an unwritable range is EFAULT
+/// (the caller forces SIGSEGV), never a wrapped address.
+fn get_sigframe(sp: u64, action: &SigAction, alt: &AltStack) -> KernelResult<(u64, u64)> {
+    let (top, _) = alt.sigsp(sp, action.flags);
+    let record = top
+        .checked_sub(16)
+        .map(|a| a & !(SIGNAL_FRAME_ALIGN - 1))
+        .ok_or(KernelError::BadAddress)?;
+    let frame = record
+        .checked_sub(signal_frame_size() as u64)
+        .map(|a| a & !(SIGNAL_FRAME_ALIGN - 1))
+        .ok_or(KernelError::BadAddress)?;
+    if !access_ok(frame, (top - frame) as usize) {
+        return Err(KernelError::BadAddress);
+    }
+    Ok((record, frame))
 }
 
 /// Read a plain-data `T` from user memory
@@ -474,6 +448,11 @@ pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     let Some(fpsimd) = parse_reserved(frame_addr + RESERVED_OFFSET as u64) else {
         return Err(crate::signal::sigreturn_badframe());
     };
+    let Some(uss) =
+        read_user::<UserStack>(uc_addr + core::mem::offset_of!(UContext, uc_stack) as u64)
+    else {
+        return Err(crate::signal::sigreturn_badframe());
+    };
 
     // Restore blocked signal mask
     crate::signal::with_task_signal_state(&crate::task::percpu::current(), |state| {
@@ -494,6 +473,7 @@ pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     // No syscall to restart from here on (Linux forget_syscall)
     tf.syscallno = super::NO_SYSCALL;
     frame.set(r);
+    crate::signal::syscall::restore_altstack(&uss, sc.sp);
 
     // Return x0 from saved context
     Ok(sc.regs[0] as i64)

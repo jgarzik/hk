@@ -64,6 +64,15 @@ pub const PG_SLAB: u32 = 1 << 12;
 /// A page-cache page's data is valid (Linux PG_uptodate)
 pub const PG_UPTODATE: u32 = 1 << 13;
 
+/// A page of a private mapping that one PTE maps and no one shares
+/// copy-on-write (Linux PG_anon_exclusive): a write fault or mprotect
+/// may make it writable in place whatever its count (pins). Set when the
+/// mapping gets the page as its own (a fresh fault page, a copy-on-write
+/// copy or reuse, an exclusive swap-in, a pin of a writable entry);
+/// cleared when fork shares it and when reclaim unmaps it; the free
+/// resets it.
+pub const PG_ANON_EXCL: u32 = 1 << 14;
+
 /// Page frame size
 pub const PAGE_SHIFT: u32 = 12;
 
@@ -173,6 +182,28 @@ impl Page {
     #[inline]
     pub fn is_reserved(&self) -> bool {
         self.has(PG_RESERVED)
+    }
+
+    /// The private mapping that maps it owns it alone (Linux
+    /// PageAnonExclusive)
+    #[inline]
+    pub fn anon_exclusive(&self) -> bool {
+        self.has(PG_ANON_EXCL)
+    }
+
+    /// Its private mapping owns it alone (Linux SetPageAnonExclusive)
+    #[inline]
+    pub fn set_anon_exclusive(&self) {
+        self.set_flag(PG_ANON_EXCL);
+    }
+
+    /// Its private mapping may write it in place whatever its count:
+    /// owned alone and not in the swap cache (a cached page is a clean
+    /// copy of its slot, written back only if PG_DIRTY: it becomes
+    /// writable only once out of the cache)
+    #[inline]
+    pub fn reusable(&self) -> bool {
+        self.anon_exclusive() && !self.is_swapcache()
     }
 
     // ========================================================================
@@ -308,6 +339,12 @@ pub fn lock_page(phys: u64) {
     }
 }
 
+/// The page at `phys` is a private mapping's own, writable in place
+/// whatever its count ([`Page::reusable`]; Linux PageAnonExclusive)
+pub fn reusable(phys: u64) -> bool {
+    phys_to_page(phys).is_some_and(|p| p.reusable())
+}
+
 /// Unlock the page at `phys` and wake its waiters (Linux folio_unlock)
 pub fn unlock_page(phys: u64) {
     if let Some(pg) = phys_to_page(phys) {
@@ -358,6 +395,60 @@ pub unsafe fn copy_page(dst: u64, src: u64) {
     debug_assert_ne!(dst, src);
     // SAFETY: the caller's contract; two different frames
     unsafe { frame_bytes(dst).copy_from_slice(frame_bytes(src)) };
+}
+
+/// Copy the page frame `src`, which another party (user space, a
+/// device) may write meanwhile, to `dst` (Linux copy_user_highpage of a
+/// shared kernel page): word by word with volatile reads, so a racing
+/// write gives some mix of old and new bytes, never undefined behavior
+///
+/// # Safety
+/// As [`frame_bytes`] for `dst`; `src` is a different RAM frame that
+/// stays allocated meanwhile.
+pub unsafe fn copy_page_racy(dst: u64, src: u64) {
+    debug_assert_ne!(dst, src);
+    let words = (1usize << PAGE_SHIFT) / 8;
+    let s = crate::arch::phys_to_virt(src).cast::<u64>();
+    let d = crate::arch::phys_to_virt(dst).cast::<u64>();
+    for i in 0..words {
+        // SAFETY: word `i` of two allocated RAM frames (the caller's
+        // contract), page-aligned; `dst` is the caller's alone
+        unsafe { d.add(i).write(s.add(i).read_volatile()) };
+    }
+}
+
+/// Copy `src` to byte `off` of the frame `phys`, which user space may
+/// access meanwhile (a pinned user page): volatile byte stores, so a
+/// racing access sees some mix of old and new bytes, never undefined
+/// behavior (Linux copy_to_page over a kmap)
+///
+/// # Safety
+/// `phys` is a RAM frame kept allocated meanwhile (pinned) and meant to
+/// be written (no kernel data); [off, off + src.len()) lies in it.
+pub unsafe fn copy_to_frame_racy(phys: u64, off: usize, src: &[u8]) {
+    debug_assert!(off + src.len() <= 1 << PAGE_SHIFT);
+    let d = crate::arch::phys_to_virt(phys).wrapping_add(off);
+    for (i, &b) in src.iter().enumerate() {
+        // SAFETY: byte `off + i` of the frame, in it (the caller's
+        // contract); volatile: another party may access it
+        unsafe { d.add(i).write_volatile(b) };
+    }
+}
+
+/// Fill `dst` from byte `off` of the frame `phys`, which user space may
+/// write meanwhile: volatile byte loads (as `copy_to_frame_racy`)
+///
+/// # Safety
+/// `phys` is a RAM frame kept allocated meanwhile (pinned);
+/// [off, off + dst.len()) lies in it.
+pub unsafe fn copy_from_frame_racy(dst: &mut [u8], phys: u64, off: usize) {
+    debug_assert!(off + dst.len() <= 1 << PAGE_SHIFT);
+    let s = crate::arch::phys_to_virt(phys).wrapping_add(off);
+    for (i, b) in dst.iter_mut().enumerate() {
+        // SAFETY: byte `off + i` of the frame, in it (the caller's
+        // contract)
+        *b = unsafe { s.add(i).read_volatile() };
+    }
 }
 
 /// Release a mapping word taken off a page: an anon_vma reference
@@ -596,6 +687,19 @@ mod tests {
         assert!(!page.is_anon());
         page.clear_mapping();
         assert_eq!(Arc::strong_count(&av), 1);
+    }
+
+    #[test]
+    fn anon_exclusive_until_freed() {
+        let page = Page::new();
+        assert!(!page.anon_exclusive());
+        page.set_anon_exclusive();
+        assert!(page.anon_exclusive());
+        page.clear_flag(PG_ANON_EXCL);
+        assert!(!page.anon_exclusive());
+        page.set_anon_exclusive();
+        put_mapping(page.free_prepare());
+        assert!(!page.anon_exclusive());
     }
 
     #[test]

@@ -383,6 +383,21 @@ pub trait PerCpuOps {
     fn cpu_online(cpu: u32) -> bool;
 }
 
+/// Per-CPU IRQ stacks (`crate::irq_stack`)
+pub trait IrqStackOps {
+    /// The stack pointer now
+    fn stack_pointer() -> u64;
+
+    /// Call `f(arg)` on the stack whose top is `top`, back on this one
+    /// after, with the frame-pointer chain linked across (Linux x86
+    /// call_on_stack, arm64 call_on_irq_stack)
+    ///
+    /// # Safety
+    /// `top` is the 16-byte aligned top of a mapped kernel stack that
+    /// nothing else uses until this returns.
+    unsafe fn call_on_stack(top: u64, f: extern "C" fn(*mut ()), arg: *mut ());
+}
+
 /// CPU control operations
 ///
 /// This trait abstracts CPU-level operations like interrupt enable/disable
@@ -471,6 +486,13 @@ pub trait IrqChipOps {
     /// The IRQ of a PCI function's INTx `pin` (1 = INTA, 0 = none);
     /// `line` is its config-space Interrupt Line
     fn pci_intx_irq(bus: u8, device: u8, function: u8, pin: u8, line: u8) -> Option<u32>;
+    /// A free MSI line aimed at `cpu`, and the message that raises it
+    /// (Linux irq_domain_alloc_irqs on the MSI parent domain, then
+    /// irq_chip_compose_msi_msg); None when there is no room, or the
+    /// controller takes no MSI. Thread context
+    fn msi_alloc(cpu: u32) -> Option<(u32, crate::irq::MsiMsg)>;
+    /// Free an MSI line of `msi_alloc` (its handlers are gone)
+    fn msi_free(irq: u32);
 }
 
 /// Task context and context switching operations
@@ -864,11 +886,9 @@ pub trait ExceptionOps {
 /// On x86_64 this uses multiboot2 module lookup.
 /// On aarch64 this uses DTB extraction or falls back to embedded initramfs.
 pub trait InitramfsOps {
-    /// Get initramfs data from boot information
-    ///
-    /// Returns a static slice containing the initramfs (cpio archive).
-    /// Panics if initramfs is not found (required for boot).
-    fn get_initramfs() -> &'static [u8];
+    /// The initramfs (cpio archive) from the boot information, freed
+    /// after unpacking. Panics if there is none (required for boot).
+    fn get_initramfs() -> crate::fs::ramfs::cpio::Initrd;
 }
 
 /// Optional VFS initialization extensions

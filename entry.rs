@@ -10,6 +10,8 @@
 //!   IPI arrived; the task yields (the kernel itself is not preemptive:
 //!   this is the one place a task loses the CPU involuntarily);
 //! - TIF_SIGPENDING: `signal::do_signal` delivers (or acts on) it;
+//! - TIF_NOTIFY_SIGNAL: callbacks queued on the task (`task_work`) run
+//!   first in `signal::do_signal`;
 //! - TIF_RESTORE_SIGMASK: a syscall's temporary signal mask is still in
 //!   place; `do_signal` puts the old one back;
 //! - TIF_NOTIFY_RESUME: work queued for the return: CPU-time timers the
@@ -27,8 +29,8 @@ use crate::task::tif;
 /// Work for the return to user mode (Linux EXIT_TO_USER_MODE_WORK)
 const EXIT_WORK: u32 = tif::NEED_RESCHED | SIGNAL_WORK | tif::NOTIFY_RESUME;
 
-/// Work `do_signal` handles
-const SIGNAL_WORK: u32 = tif::SIGPENDING | tif::RESTORE_SIGMASK;
+/// Work `do_signal` handles (queued callbacks first, Linux get_signal)
+const SIGNAL_WORK: u32 = tif::SIGPENDING | tif::RESTORE_SIGMASK | tif::NOTIFY_SIGNAL;
 
 /// Run the pending work of the return to user mode (Linux
 /// exit_to_user_mode_prepare / exit_to_user_mode_loop). Interrupts are

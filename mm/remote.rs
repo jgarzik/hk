@@ -55,7 +55,7 @@ fn fault_in(target: &Mm, addr: u64, write: bool) -> Result<(), KernelError> {
 
 /// `phys` is in a frame of the allocator (a 4KB page, or a 2MB page by
 /// its head), not MMIO or other memory outside it
-fn ordinary(phys: u64) -> bool {
+pub(super) fn ordinary(phys: u64) -> bool {
     let fa = &crate::FRAME_ALLOCATOR;
     fa.refcount(phys & !(PAGE_SIZE - 1)) > 0 || fa.refcount_huge(phys & !((2 << 20) - 1)) > 0
 }
@@ -221,7 +221,41 @@ fn write_page(
         )
         .map_err(|_| KernelError::OutOfMemory)?;
     }
+    if vma.wants_writenotify() {
+        return write_tracked(mm, t, vma, addr, buf);
+    }
     write_frame(mm, t, addr, buf, !vma.is_shared())
+}
+
+/// `write_frame` into a shared mapping that tracks dirtying: the page is
+/// dirtied after, under its page lock (Linux __access_remote_vm:
+/// set_page_dirty_lock), since its entry may be read-only and clean
+fn write_tracked(
+    mm: &Mm,
+    t: PgTables<'_>,
+    vma: &Vma,
+    addr: u64,
+    buf: &[u8],
+) -> Result<Wrote, KernelError> {
+    let mut page = None;
+    let r = with_frame(mm, t, addr, |phys| {
+        let r = copy_to_frame(phys, buf);
+        let p = phys & !(PAGE_SIZE - 1);
+        if r.is_ok() && crate::FRAME_ALLOCATOR.incref(p) {
+            page = Some(p);
+        }
+        r
+    })
+    .unwrap_or(Ok(Wrote::Absent));
+    if let Some(p) = page {
+        if let Some(inode) = vma.inode() {
+            crate::mm::page::lock_page(p);
+            crate::mm::filemap::dirty_page(&inode.i_data, p);
+            crate::mm::page::unlock_page(p);
+        }
+        crate::mm::filemap::put_page(p);
+    }
+    r
 }
 
 /// The byte of page `addr` a 4KB entry maps, also when it is PROT_NONE
@@ -232,12 +266,14 @@ fn frame_of(pte: u64, addr: u64) -> Option<u64> {
 }
 
 /// A private 4KB entry `pte` maps a page this mapping alone owns:
-/// writable, or neither copy-on-write nor referenced elsewhere
+/// writable, marked its own (a pinned page), or neither copy-on-write
+/// nor referenced elsewhere
 fn exclusive(pte: u64) -> bool {
+    let phys = paging::pte_addr(pte);
     (paging::pte_present(pte) || paging::pte_protnone(pte))
         && (paging::pte_write(pte)
-            || (!paging::pte_cow(pte)
-                && crate::FRAME_ALLOCATOR.refcount(paging::pte_addr(pte)) == 1))
+            || crate::mm::page::reusable(phys)
+            || (!paging::pte_cow(pte) && crate::FRAME_ALLOCATOR.refcount(phys) == 1))
 }
 
 /// Copy `buf` to page `addr` under the entry's page-table lock; with

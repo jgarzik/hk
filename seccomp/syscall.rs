@@ -11,15 +11,15 @@ use super::{
     SECCOMP_FILTER_FLAG_LOG, SECCOMP_FILTER_FLAG_TSYNC, SECCOMP_GET_ACTION_AVAIL,
     SECCOMP_GET_NOTIF_SIZES, SECCOMP_MODE_DISABLED, SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT,
     SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD,
-    SECCOMP_RET_LOG, SECCOMP_RET_TRACE, SECCOMP_RET_TRAP, SECCOMP_SET_MODE_FILTER,
-    SECCOMP_SET_MODE_STRICT,
+    SECCOMP_RET_LOG, SECCOMP_RET_TRACE, SECCOMP_RET_TRAP, SECCOMP_RET_USER_NOTIF,
+    SECCOMP_SET_MODE_FILTER, SECCOMP_SET_MODE_STRICT,
 };
 
 /// seccomp(op, flags, args)
 pub fn sys_seccomp(op: u64, flags: u64, args: u64) -> KernelResult<i64> {
     match op as u32 {
         SECCOMP_SET_MODE_STRICT => {
-            if flags != 0 {
+            if flags != 0 || args != 0 {
                 return Err(KernelError::InvalidArgument);
             }
             set_seccomp_strict().map(|()| 0)
@@ -37,7 +37,7 @@ pub fn sys_seccomp(op: u64, flags: u64, args: u64) -> KernelResult<i64> {
             if flags != 0 {
                 return Err(KernelError::InvalidArgument);
             }
-            get_action_avail(args).map(|()| 0)
+            get_action_avail(UserPtr::new(args)).map(|()| 0)
         }
         // No user notification
         SECCOMP_GET_NOTIF_SIZES => Err(KernelError::OperationNotSupported),
@@ -153,19 +153,19 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
     Ok(0)
 }
 
-/// Check if an action is available
-fn get_action_avail(action: u64) -> KernelResult<()> {
-    // Check if we support this action
-    match action as u32 {
+/// Whether the u32 action at `uaction` is one a filter may return
+/// (Linux seccomp_get_action_avail): EFAULT, EOPNOTSUPP if unknown.
+/// USER_NOTIF is known: with no listener it is ENOSYS, as in Linux.
+fn get_action_avail(uaction: UserPtr<u32>) -> KernelResult<()> {
+    match uaction.read()? {
         SECCOMP_RET_KILL_PROCESS
         | SECCOMP_RET_KILL_THREAD
         | SECCOMP_RET_TRAP
         | SECCOMP_RET_ERRNO
+        | SECCOMP_RET_USER_NOTIF
         | SECCOMP_RET_TRACE
         | SECCOMP_RET_LOG
         | SECCOMP_RET_ALLOW => Ok(()),
-
-        // USER_NOTIF not supported yet
         _ => Err(KernelError::OperationNotSupported),
     }
 }

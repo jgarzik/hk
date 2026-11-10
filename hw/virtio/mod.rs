@@ -4,7 +4,8 @@
 //!
 //! Transports (`pci`: modern virtio-PCI only, no legacy) register each
 //! device as virtio<N> on the virtio bus; binding negotiates features
-//! against the matching driver and hands it an `Arc<VirtioDevice>`. Drivers set up their queues
+//! against the matching driver and hands it an `Arc<VirtioDevice>`. Drivers may ask for MSI-X
+//! vectors (`alloc_vectors`), set up their queues
 //! (`setup_vq`), register an interrupt callback (`request_irq`) and call
 //! `ready()` (DRIVER_OK). Their remove resets the device (`reset`), frees
 //! the interrupt (`free_irq`) and drops their queues; the bus then
@@ -46,6 +47,10 @@ pub mod status {
 
 /// Device-independent feature bits (virtio 1.2 section 6)
 pub mod feature {
+    /// Indirect descriptor tables (VIRTIO_RING_F_INDIRECT_DESC)
+    pub const RING_INDIRECT_DESC: u32 = 28;
+    /// used_event / avail_event (VIRTIO_RING_F_EVENT_IDX)
+    pub const RING_EVENT_IDX: u32 = 29;
     pub const VERSION_1: u32 = 32;
     pub const ACCESS_PLATFORM: u32 = 33;
 }
@@ -61,9 +66,14 @@ pub mod id {
 /// VERSION_1 is required (no legacy). ACCESS_PLATFORM (the device's DMA
 /// goes through platform translation) is accepted when offered, as Linux
 /// does: every address hk gives a device comes from the DMA API, which is
-/// correct both with and without it.
+/// correct both with and without it. RING_INDIRECT_DESC and
+/// RING_EVENT_IDX are ring features every driver may use (Linux
+/// vring_transport_features).
 pub fn transport_features() -> u64 {
-    (1 << feature::VERSION_1) | (1 << feature::ACCESS_PLATFORM)
+    (1 << feature::VERSION_1)
+        | (1 << feature::ACCESS_PLATFORM)
+        | (1 << feature::RING_INDIRECT_DESC)
+        | (1 << feature::RING_EVENT_IDX)
 }
 
 /// Features to accept: what both sides support
@@ -77,8 +87,9 @@ pub fn negotiate(device: u64, driver: u64) -> Result<u64, KernelError> {
 
 /// Interrupt callbacks of a virtio driver (IRQ context: lock-free only)
 pub trait VirtioIrq: Send + Sync {
-    /// A used buffer may be available on some queue
-    fn vq_interrupt(&self);
+    /// A used buffer may be available on queue `vq` (MSI-X), or on any
+    /// queue (None: INTx)
+    fn vq_interrupt(&self, vq: Option<u16>);
     /// The device configuration changed
     fn config_changed(&self);
 }

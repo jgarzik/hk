@@ -175,7 +175,11 @@ fn ptrace_may_access(t: &Task) -> bool {
 fn attach_refused(t: &Task) -> bool {
     let table = TASKLIST.read();
     table.view(t).is_none_or(|v| {
-        v.task.has_flag(crate::task::pf::KTHREAD) || v.task.pid == percpu::current_pid()
+        // Not a kernel thread nor an io thread (Linux ptrace_attach:
+        // PF_KTHREAD, PF_IO_WORKER)
+        v.task.has_flag(crate::task::pf::KTHREAD)
+            || v.task.has_flag(crate::task::pf::IO_WORKER)
+            || v.task.pid == percpu::current_pid()
     })
 }
 

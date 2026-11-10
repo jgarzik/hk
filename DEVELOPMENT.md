@@ -61,6 +61,11 @@ make check-arm LOCKDEP=1
 make check OVERFLOW=1
 make check-arm OVERFLOW=1
 
+# Print-only benchmarks (DIO_BENCH: lines; hk.bench on the kernel
+# command line), on hk and the Linux reference; not in the gates
+make check BENCH=1
+LINUX_NOCACHE=1 make check-linux BENCH=1
+
 # Run interactively
 make run            # x86-64 in QEMU
 make run-arm        # aarch64 in QEMU

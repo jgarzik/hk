@@ -11,8 +11,7 @@
 //!   i_size_read are release and acquire).
 //!
 //! fallocate as Linux vfs_fallocate, then the filesystem's op under
-//! i_rwsem (the root is tmpfs on Linux; hk's ramfs follows
-//! shmem_fallocate):
+//! i_rwsem (the root is tmpfs: shmem_fallocate):
 //! - FALLOCATE_MODES: the errnos and their order (EBADF, EINVAL,
 //!   EOPNOTSUPP for a bad mode or a mode the filesystem lacks, ESPIPE
 //!   for a pipe, EFBIG on overflow).

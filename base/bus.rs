@@ -13,8 +13,8 @@ use spin::Once;
 use super::core::Device;
 use super::driver::Driver;
 use crate::fs::KernelError;
+use crate::fs::kernfs::sysfs;
 use crate::fs::kernfs::{Attr, KNode, SysBuf};
-use crate::fs::sysfs;
 use crate::sync::spin::Mutex;
 use crate::util::kalloc::arc_nofail;
 

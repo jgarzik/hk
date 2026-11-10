@@ -10,10 +10,10 @@ use crate::uaccess::{UserPtr, access_ok};
 
 use super::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK,
-    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE,
-    MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ,
-    PROT_WRITE, TASK_SIZE, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_NORESERVE,
-    VM_SHARED, Vma, anon_vma::AnonVma,
+    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_FIXED,
+    MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP,
+    PROT_READ, PROT_WRITE, TASK_SIZE, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT,
+    VM_NORESERVE, VM_SHARED, Vma, anon_vma::AnonVma,
 };
 use crate::util::error::{KernelError, KernelResult};
 
@@ -84,6 +84,29 @@ fn mmap_file_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// A shared writable mapping counted on its file's mapping while it is
+/// made (Linux mapping_map_writable .. mapping_unmap_writable around
+/// vma_link, which counts it for good)
+struct WritableHold(Option<Arc<crate::fs::Inode>>);
+
+impl WritableHold {
+    fn new(v: &Vma) -> Result<Self, KernelError> {
+        let inode = v.inode().filter(|_| v.shared_maywrite());
+        if let Some(i) = &inode {
+            i.i_data.map_writable()?;
+        }
+        Ok(Self(inode))
+    }
+}
+
+impl Drop for WritableHold {
+    fn drop(&mut self) {
+        if let Some(i) = &self.0 {
+            i.i_data.unmap_writable();
+        }
+    }
+}
+
 /// The mapping stays inside the file's offset space (Linux
 /// file_mmap_ok): regular files, block devices and sockets end at
 /// MAX_LFS_FILESIZE, other files at 2^64
@@ -128,29 +151,22 @@ pub fn sys_mmap(
     }
 
     let is_anonymous = flags & MAP_ANONYMOUS != 0;
-    let is_fixed = flags & MAP_FIXED != 0;
-    let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
 
     // Check sharing mode: MAP_SHARED (0x01), MAP_PRIVATE (0x02), or MAP_SHARED_VALIDATE (0x03)
     // MAP_SHARED_VALIDATE is special - it's MAP_SHARED | MAP_PRIVATE bits together,
     // and means "shared mapping with strict flag validation"
     let share_mode = flags & super::MAP_SHARED_VALIDATE; // Mask to just these 2 bits
-    let (is_shared, is_shared_validate) = match share_mode {
-        0x01 => (true, false),  // MAP_SHARED
-        0x02 => (false, false), // MAP_PRIVATE
+    match share_mode {
+        0x01 | 0x02 => {} // MAP_SHARED, MAP_PRIVATE
         0x03 => {
             // MAP_SHARED_VALIDATE - shared with strict validation
             // If MAP_SYNC is requested, we must reject since we don't support DAX
             if flags & super::MAP_SYNC != 0 {
                 return Err(KernelError::OperationNotSupported); // EOPNOTSUPP - no DAX filesystem support
             }
-            (true, true)
         }
         _ => return Err(KernelError::InvalidArgument), // 0x00 = neither specified
-    };
-    let is_private = !is_shared;
-    // Suppress unused warning - is_shared_validate is for future validation
-    let _ = is_shared_validate;
+    }
 
     // Get file if not anonymous
     let file: Option<Arc<File>> = if !is_anonymous {
@@ -158,16 +174,45 @@ pub fn sys_mmap(
     } else {
         None
     };
+    do_mmap(addr, length, prot, flags, file, offset, 0)
+}
+
+/// Map `length` bytes (page-aligned, checked by the caller) of `file`
+/// at `offset`, or anonymous memory without one, near `addr` (Linux
+/// do_mmap): the mmap(2) work after its argument checks, for the kernel
+/// too (AIO's ring), with `vm_flags` added to the VMA's (Linux: a
+/// file's mmap_prepare setting VM_DONTCOPY, VM_DONTEXPAND)
+pub fn do_mmap(
+    addr: u64,
+    length: u64,
+    prot: u32,
+    flags: u32,
+    file: Option<Arc<File>>,
+    offset: u64,
+    vm_flags: u32,
+) -> KernelResult<u64> {
+    let pgoff = offset / PAGE_SIZE;
+    let is_fixed = flags & MAP_FIXED != 0;
+    let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+    let is_shared = flags & super::MAP_SHARED_VALIDATE != MAP_PRIVATE;
     if let Some(f) = &file
         && !file_mmap_ok(f, pgoff, length)
     {
         return Err(KernelError::Overflow);
     }
     if let Some(f) = &file
-        && let Err(e) = mmap_file_ok(f, prot, is_shared).and_then(|()| f.f_op.mmap(f, is_shared))
+        && let Err(e) = mmap_file_ok(f, prot, is_shared)
+            .and_then(|()| f.f_op.mmap(f, is_shared))
+            .and_then(|()| f.f_op.mmap_offset(f, pgoff * PAGE_SIZE))
     {
         return Err(e);
     }
+    // A write-sealed memfd: no shared writable mapping, a read-only
+    // shared one never becomes writable (Linux memfd_check_seals_mmap)
+    let seal_flags = match &file {
+        Some(f) => super::memfd::check_seals_mmap(f, prot, is_shared)?,
+        None => 0,
+    };
     // PROT_EXEC of a file on a noexec mount (its own mount: Linux
     // path_noexec): EPERM; without it the mapping never gets it later
     let noexec = file.as_ref().is_some_and(|f| f.noexec());
@@ -244,21 +289,23 @@ pub fn sys_mmap(
     // A shared mapping of /dev/zero is shared anonymous memory (Linux
     // mmap_zero -> shmem_zero_setup)
     let file = file.filter(|f| !(is_shared && crate::fs::chardev::maps_shared_anon(f)));
+    // The VMA's flags are built, never copied from the caller's (Linux
+    // calc_vm_flag_bits): the sharing type here, the VM_* bits below,
+    // so no mmap flag a caller sets can stand for kernel state
+    let share = if is_shared { MAP_SHARED } else { MAP_PRIVATE };
     // Create VMA
+    let driver = file.as_ref().is_some_and(|f| f.f_op.maps_driver_pages(f));
     let mut vma = if let Some(f) = file {
-        Vma::new_file(map_addr, map_addr + length, prot, flags, f, offset)
+        Vma::new_file(map_addr, map_addr + length, prot, share, f, offset)
+    } else if is_shared {
+        // Shared anonymous memory is a file of its size on the kernel's
+        // tmpfs (Linux shmem_zero_setup: "/dev/zero (deleted)")
+        let f = crate::fs::ramfs::tmpfs::shmem_kernel_file_setup(b"dev/zero", length)?;
+        Vma::new_file(map_addr, map_addr + length, prot, share, f, 0)
     } else {
-        // Anonymous mapping
-        let mut v = Vma::new(map_addr, map_addr + length, prot, flags | MAP_ANONYMOUS);
-        // Set up anon_vma for private anonymous mappings (for swap-out
-        // reverse mapping); shared ones get a shared object for their
-        // pages (Linux shmem_zero_setup)
-        let made = if is_private {
-            AnonVma::new().map(|av| v.set_anon_vma(av))
-        } else {
-            super::shmem::Shmem::new(length / PAGE_SIZE).map(|s| v.shmem = Some(s))
-        };
-        made?;
+        // Private anonymous memory, with an anon_vma for the reverse map
+        let mut v = Vma::new(map_addr, map_addr + length, prot, share | MAP_ANONYMOUS);
+        v.set_anon_vma(AnonVma::new()?);
         v
     };
 
@@ -266,6 +313,11 @@ pub fn sys_mmap(
     if is_shared {
         vma.flags |= VM_SHARED;
     }
+    vma.flags |= seal_flags | vm_flags;
+    // A shared writable mapping is counted on its file's mapping until
+    // the VMA is linked (Linux mmap_region: mapping_map_writable, EPERM
+    // once F_SEAL_WRITE denies it)
+    let _writable = WritableHold::new(&vma)?;
     if noexec {
         vma.flags |= super::vma::VM_NOMAYEXEC;
     }
@@ -332,13 +384,27 @@ pub fn sys_mmap(
         mm_guard.add_locked_vm(pages);
     }
 
+    // A driver's pages are inserted now (Linux vm_insert_pages from
+    // f_op->mmap); the mapping never merges and refaults nothing
+    if driver {
+        vma.flags |= super::vma::VM_MIXEDMAP;
+    }
     let idx = mm_guard.insert_vma(vma);
 
     // Update total_vm for RLIMIT_AS tracking
     mm_guard.add_total_vm(length / PAGE_SIZE);
 
-    // Try to merge with adjacent VMAs (VMA merging optimization)
-    mm_guard.merge_adjacent(idx);
+    if driver {
+        // Out of page tables, the pages not inserted are SIGBUS, as a
+        // failed MAP_POPULATE leaves its pages to fault
+        if let (Some(mm), Some(v)) = (crate::task::percpu::current().mm(), mm_guard.get_vma(idx)) {
+            let v = v.clone();
+            let _ = super::fault::insert_driver_pages(&mm, &mm_guard, &v);
+        }
+    } else {
+        // Try to merge with adjacent VMAs (VMA merging optimization)
+        mm_guard.merge_adjacent(idx);
+    }
 
     // Populate pages if:
     // 1. MAP_LOCKED is set, or
@@ -535,7 +601,7 @@ fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) -> Result<(), KernelEr
 /// A VMA the heap can grow into: private anonymous memory, no file
 /// or shared object behind it
 fn is_heap(v: &Vma) -> bool {
-    v.file.is_none() && v.shmem.is_none() && v.shm.is_none() && v.is_private()
+    v.file.is_none() && v.shm.is_none() && v.is_private()
 }
 
 // ============================================================================
@@ -1074,6 +1140,9 @@ fn prot_allowed(vma: &Vma, prot: u32) -> Result<(), KernelError> {
     if prot & PROT_WRITE != 0 && vma.shm.as_ref().is_some_and(|a| a.rdonly()) {
         return Err(KernelError::PermissionDenied);
     }
+    if prot & PROT_WRITE != 0 && vma.flags & super::vma::VM_NOMAYWRITE != 0 {
+        return Err(KernelError::PermissionDenied);
+    }
     Ok(())
 }
 
@@ -1136,15 +1205,15 @@ fn mprotect_fixup(
     }
     let vma = mm.get_vma_mut(idx).ok_or(KernelError::OutOfMemory)?;
     vma.prot = prot;
-    // A dirty-tracked shared file mapping is written only after a write
-    // fault (which dirties the page): not made writable here
-    let (s, e, shared) = (
-        vma.start,
-        vma.end,
-        vma.is_shared() && !vma.wants_writenotify(),
-    );
+    use super::mprotect::WriteUpgrade;
+    let up = match (vma.is_shared(), vma.wants_writenotify()) {
+        (true, false) => WriteUpgrade::Shared,
+        (true, true) => WriteUpgrade::Dirty,
+        (false, _) => WriteUpgrade::Private,
+    };
+    let (s, e) = (vma.start, vma.end);
     let t = super::pgtable::PgTables::new(owner, mm);
-    super::mprotect::change_protection(owner, t, s, e, prot, shared);
+    super::mprotect::change_protection(owner, t, s, e, prot, up);
     Ok((idx, e))
 }
 
@@ -1210,7 +1279,7 @@ fn msync_vmas(mm: &super::Mm, mut start: u64, end: u64, flags: i32) -> Result<()
         };
         // The whole file is written back (Linux: the range only)
         if let Some(f) = file {
-            f.f_op.fsync(&f)?;
+            crate::fs::sync::vfs_fsync(&f, false)?;
         }
     }
     if unmapped {
@@ -1332,6 +1401,18 @@ pub fn sys_mremap(
         Some(v) if v.end >= kept => v.end,
         _ => return Err(KernelError::BadAddress),
     };
+    // A mapping that may not grow (Linux VM_DONTEXPAND: AIO's ring) is
+    // kept by no MREMAP_DONTUNMAP (EINVAL, check_prep_vma) and grown by
+    // no mremap (EFAULT, vma_to_resize)
+    let dontexpand = mm_guard
+        .get_vma(vma_idx)
+        .is_some_and(|v| v.flags & super::vma::VM_DONTEXPAND != 0);
+    if dontexpand && dontunmap {
+        return Err(KernelError::InvalidArgument);
+    }
+    if dontexpand && new_len_aligned > page_align(old_len) {
+        return Err(KernelError::BadAddress);
+    }
 
     let moves = fixed || dontunmap;
     // Shrinking: the tail is unmapped like munmap (Linux do_vmi_munmap;
@@ -1506,6 +1587,15 @@ fn move_mapping(
     let t = super::pgtable::PgTables::new(owner, mm);
     let mut alloc = |va| t.pte_alloc(owner, va).is_some();
     super::mremap::move_prep(owner, t, old_addr, new_addr, old_len, &mut alloc)?;
+    // The file's own say on the move (Linux vm_ops->mremap: AIO's ring
+    // takes its new address as the context id), before anything moves
+    if let Some(f) = mm
+        .find_vma_index(old_addr)
+        .and_then(|i| mm.get_vma(i))
+        .and_then(|v| v.file.clone())
+    {
+        f.f_op.mremap(&f, owner, new_addr, new_len)?;
+    }
     mm.split_at(old_addr);
     mm.split_at(old_addr + old_len);
     let mut new_vma = mm

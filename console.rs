@@ -276,15 +276,6 @@ impl ConsoleRegistry {
         }
     }
 
-    /// Flush all consoles
-    pub fn flush_all(&self) {
-        for entry in &self.consoles[..self.count] {
-            if let Some(console) = entry.console {
-                console.flush();
-            }
-        }
-    }
-
     /// No console was registered yet: output goes the early way
     pub fn is_early(&self) -> bool {
         !self.registered
@@ -457,11 +448,6 @@ pub fn console_write(data: &[u8]) {
     for console in snapshot.into_iter().flatten() {
         console.write(data);
     }
-}
-
-/// Flush all registered consoles
-pub fn console_flush() {
-    CONSOLE_REGISTRY.lock().flush_all();
 }
 
 /// The ttys of the enabled consoles, in list order (Linux

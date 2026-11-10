@@ -192,13 +192,13 @@ fn check_statx(id: u64) -> R {
 }
 
 /// The value of `key:\t` in fdinfo text
-fn field<'a>(text: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+pub fn field<'a>(text: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     text.split(|&c| c == b'\n')
         .find(|l| l.starts_with(key) && l.get(key.len()) == Some(&b':'))
         .map(|l| &l[key.len() + 2..])
 }
 
-fn octal(s: &[u8]) -> Option<u64> {
+pub fn octal(s: &[u8]) -> Option<u64> {
     let mut v = 0u64;
     for &c in s {
         if !(b'0'..=b'7').contains(&c) {

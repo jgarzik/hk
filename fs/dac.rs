@@ -34,8 +34,7 @@ pub const MAY_OPEN: u32 = 32;
 /// Permission mask: check comes from chdir()
 pub const MAY_CHDIR: u32 = 64;
 
-/// O_NOATIME (same value on every arch)
-pub const O_NOATIME: u32 = 0o1000000;
+pub use super::file::flags::O_NOATIME;
 
 const S_ISUID: u16 = 0o4000;
 const S_ISGID: u16 = 0o2000;
@@ -348,6 +347,7 @@ pub fn chmod(p: &super::Path, perm: u16) -> Result<(), KernelError> {
     if !in_group_or_capable(&c, inode.gid()) {
         perm &= !S_ISGID;
     }
+    inode.i_op.chmod_ok(inode, perm)?;
     inode.set_mode_perm(perm);
     inode.set_ctime(crate::time::TIMEKEEPER.current_time());
     inode.i_op.setattr_done(inode);
@@ -439,24 +439,24 @@ pub fn may_truncate(inode: &Inode) -> Result<(), KernelError> {
 /// files, directories and sockets (sticky directories: owner only for
 /// writes); then plain permission. Denials that hide a name are ENODATA
 /// for reads.
-pub fn xattr_permission(inode: &Inode, name: &str, mask: u32) -> Result<(), KernelError> {
+pub fn xattr_permission(inode: &Inode, name: &[u8], mask: u32) -> Result<(), KernelError> {
     let c = cred();
     let hidden = if mask & MAY_WRITE != 0 {
         KernelError::NotPermitted
     } else {
         KernelError::NoData
     };
-    if name.starts_with("security.") || name.starts_with("system.") {
+    if name.starts_with(b"security.") || name.starts_with(b"system.") {
         return Ok(());
     }
-    if name.starts_with("trusted.") {
+    if name.starts_with(b"trusted.") {
         return if capable(&c, CAP_SYS_ADMIN) {
             Ok(())
         } else {
             Err(hidden)
         };
     }
-    if name.starts_with("user.") {
+    if name.starts_with(b"user.") {
         let mode = inode.mode();
         if mode.is_dir() {
             if mode.perm() & S_ISVTX != 0 && mask & MAY_WRITE != 0 && !owner_or_capable(&c, inode) {

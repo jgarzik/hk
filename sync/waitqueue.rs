@@ -177,9 +177,40 @@ pub struct WaitQueue {
     head: IrqSpinlock<List<EntryAdapter>>,
 }
 
-/// True if the current task has a deliverable signal pending
+/// True if the current task has a deliverable signal pending, or
+/// callbacks to run (TIF_NOTIFY_SIGNAL: the sleep ends, the syscall
+/// restarts after them; Linux signal_pending)
 pub fn signal_pending() -> bool {
-    crate::task::percpu::current().sigpending()
+    use crate::task::tif;
+    crate::task::percpu::current().has_tif(tif::SIGPENDING | tif::NOTIFY_SIGNAL)
+}
+
+/// A deliverable signal is pending; callbacks queued on the task alone
+/// (TIF_NOTIFY_SIGNAL) run here and the sleep goes on (call with the
+/// task's state set for the sleep: it is Running on return, and the
+/// caller's loop sets it again). For sleeps whose interruption Linux
+/// restarts with the same deadline (-ERESTART_RESTARTBLOCK: futex and
+/// nanosleep timeouts) or reports as EINTR only for a signal
+/// (sigtimedwait), which hk has no restart_block for.
+pub fn signal_pending_run_work() -> bool {
+    use crate::task::tif;
+    let me = crate::task::percpu::current();
+    if me.has_tif(tif::NOTIFY_SIGNAL) && !me.sigpending() {
+        crate::task::percpu::set_current_state(crate::task::percpu::SleepState::Running);
+        crate::task::task_work::task_work_run();
+    }
+    me.sigpending()
+}
+
+/// A pending signal ends a sleep in `state`: any signal an
+/// interruptible one, SIGKILL a killable one (Linux
+/// signal_pending_state)
+pub fn signal_pending_state(state: SleepState) -> bool {
+    match state {
+        SleepState::Interruptible => signal_pending(),
+        SleepState::Killable => crate::signal::fatal_signal_pending(),
+        _ => false,
+    }
 }
 
 impl WaitQueue {
@@ -393,7 +424,7 @@ impl WaitQueue {
             if cond() {
                 break Ok(true);
             }
-            if interrupted(state) {
+            if signal_pending_state(state) {
                 break Err(match state {
                     SleepState::Killable => KernelError::Interrupted,
                     _ => KernelError::RestartSys,
@@ -480,7 +511,7 @@ impl WaitQueue {
             if cond(ctx) {
                 break Ok(left.max(1));
             }
-            if interrupted(state) {
+            if signal_pending_state(state) {
                 break Err(match state {
                     SleepState::Killable => KernelError::Interrupted,
                     _ => KernelError::RestartSys,
@@ -574,15 +605,6 @@ impl WaitQueue {
     }
 }
 
-/// A pending signal ends a sleep in `state` (Linux signal_pending_state)
-fn interrupted(state: SleepState) -> bool {
-    match state {
-        SleepState::Interruptible => signal_pending(),
-        SleepState::Killable => crate::signal::fatal_signal_pending(),
-        _ => false,
-    }
-}
-
 // ============================================================================
 // Page Wait Table (Linux folio_wait_table pattern)
 // ============================================================================
@@ -605,6 +627,24 @@ pub fn page_wait_queue(page_addr: u64) -> &'static WaitQueue {
     let hash = (page_addr >> 12) as usize; // Shift by page size bits
     let index = hash % PAGE_WAIT_TABLE_SIZE;
     &PAGE_WAIT_TABLE[index]
+}
+
+/// Shared wait queues for waiting on a variable's value (Linux
+/// bit_wait_table behind wait_var_event / wake_up_var): an object with
+/// rare waiters (an inode's direct I/O count) needs no queue of its own.
+/// A queue may hold waiters for several variables: each re-checks its
+/// own condition.
+static VAR_WAIT_TABLE: [WaitQueue; VAR_WAIT_TABLE_SIZE] =
+    [const { WaitQueue::new() }; VAR_WAIT_TABLE_SIZE];
+
+const VAR_WAIT_TABLE_SIZE: usize = 256;
+
+/// The wait queue of the variable at address `addr` (Linux
+/// __var_waitqueue)
+pub fn var_waitqueue(addr: usize) -> &'static WaitQueue {
+    // Mix the bits above the alignment (Linux hash_ptr)
+    let h = (addr as u64 >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56;
+    &VAR_WAIT_TABLE[h as usize % VAR_WAIT_TABLE_SIZE]
 }
 
 // ============================================================================

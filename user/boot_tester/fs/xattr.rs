@@ -16,6 +16,10 @@
 //! - XATTR_SPACE: user.* attributes draw on a per-file-system space
 //!   (tmpfs: half of RAM's pages times 1 KB) and are ENOSPC past it;
 //!   removing them gives it back (Linux shmem_xattr_handler_set)
+//! - XATTR_NAME_BYTES: a name that is not UTF-8 round-trips
+//! - XATTR_NAME_RANGE: empty and 256-byte names are ERANGE, unterminated
+//!   too; a shorter unterminated one running off the map is EFAULT
+//! - XATTR_BUF_AFTER: getxattr/listxattr check the buffer last
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -49,6 +53,101 @@ pub fn run_tests() {
     test_getxattr_erange();
     test_xattr_size_limits();
     test_xattr_space();
+    test_xattr_name_bytes();
+    test_xattr_name_range();
+    test_xattr_buf_after();
+}
+
+/// getxattr/listxattr copy out after the file system's answer: a
+/// missing name into a bad buffer is ENODATA, an empty list into one
+/// is 0 (Linux do_getxattr, listxattr: no access_ok first)
+fn test_xattr_buf_after() {
+    let mut t = crate::harness::T::new(b"XATTR_BUF_AFTER");
+    let path = b"/tmp/xattr_buf\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
+    t.ok(b"open", fd >= 0, fd);
+    let bad = (usize::MAX & !0xfff) as *mut u8;
+    let r = sys_getxattr(path.as_ptr(), b"user.none\0".as_ptr(), bad, 64);
+    t.eq(b"get", r, ENODATA);
+    t.eq(b"list", sys_listxattr(path.as_ptr(), bad, 64), 0);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    hk_syscall::sys_unlink(path.as_ptr());
+    t.done();
+}
+
+/// A name with bytes that are not UTF-8 is a name like any other: set,
+/// get, listed raw, removed (Linux import_xattr_name takes any bytes)
+fn test_xattr_name_bytes() {
+    let mut t = crate::harness::T::new(b"XATTR_NAME_BYTES");
+    let path = b"/tmp/xattr_bytes\0";
+    let name = b"user.\xff\xfe\x80\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
+    t.ok(b"open", fd >= 0, fd);
+    let r = sys_setxattr(path.as_ptr(), name.as_ptr(), b"v1".as_ptr(), 2, 0);
+    t.eq(b"set", r, 0);
+    let mut buf = [0u8; 64];
+    let r = sys_getxattr(path.as_ptr(), name.as_ptr(), buf.as_mut_ptr(), buf.len());
+    t.ok(b"get", r == 2 && &buf[..2] == b"v1", r);
+    let r = sys_listxattr(path.as_ptr(), buf.as_mut_ptr(), buf.len());
+    let listed = r > 0
+        && buf[..r as usize]
+            .split(|&c| c == 0)
+            .any(|n| n == &name[..8]);
+    t.ok(b"list", listed, r);
+    t.eq(b"remove", sys_removexattr(path.as_ptr(), name.as_ptr()), 0);
+    let r = sys_getxattr(path.as_ptr(), name.as_ptr(), buf.as_mut_ptr(), buf.len());
+    t.eq(b"gone", r, ENODATA);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    hk_syscall::sys_unlink(path.as_ptr());
+    t.done();
+}
+
+/// Names of XATTR_NAME_MAX + 1 bytes (with or without a NUL after) and
+/// empty names are ERANGE, even when unterminated at a page's end; a
+/// shorter unterminated one that runs off mapped memory is EFAULT
+/// (Linux import_xattr_name)
+fn test_xattr_name_range() {
+    const EFAULT: i64 = -14;
+    let mut t = crate::harness::T::new(b"XATTR_NAME_RANGE");
+    let path = b"/tmp/xattr_range\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
+    t.ok(b"open", fd >= 0, fd);
+    // Two pages, the second unmapped: names end at the first's end
+    let m = hk_syscall::sys_mmap(0, 8192, 3, 0x22, -1, 0);
+    t.ok(b"mmap", m > 0, m);
+    if m > 0 {
+        let base = m as usize;
+        hk_syscall::sys_munmap(base as u64 + 4096, 4096);
+        // SAFETY: the first page is mapped read-write and only this
+        // function uses it
+        let page = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, 4096) };
+        page.fill(b'a');
+        page[..5].copy_from_slice(b"user.");
+        let set = |p: *const u8| sys_setxattr(path.as_ptr(), p, b"v".as_ptr(), 1, 0);
+        // 256 bytes and a NUL
+        page[256] = 0;
+        t.eq(b"256+nul", set(page.as_ptr()), ERANGE);
+        // 255 bytes and a NUL: the longest name
+        page[255] = 0;
+        t.eq(b"255", set(page.as_ptr()), 0);
+        t.eq(b"empty", set(b"\0".as_ptr()), ERANGE);
+        // 256 unterminated bytes up to the unmapped page
+        page[4096 - 256..4096 - 251].copy_from_slice(b"user.");
+        t.eq(b"256 at end", set(page[4096 - 256..].as_ptr()), ERANGE);
+        // 100 unterminated bytes up to the unmapped page
+        page[4096 - 100..4096 - 95].copy_from_slice(b"user.");
+        t.eq(b"100 at end", set(page[4096 - 100..].as_ptr()), EFAULT);
+        hk_syscall::sys_munmap(base as u64, 4096);
+    }
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    hk_syscall::sys_unlink(path.as_ptr());
+    t.done();
 }
 
 fn test_xattr_space() {

@@ -35,7 +35,10 @@ use super::fd::{
     create_bpf_map_fd, create_bpf_prog_fd, get_bpf_map_from_fd, get_bpf_prog_info_from_fd,
 };
 use super::insn::BpfInsn;
-use super::map::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BpfMapOps, create_map};
+use super::map::{
+    BPF_F_ALL_CPUS, BPF_F_CPU, BPF_F_LOCK, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BpfMapOps,
+    create_map,
+};
 use super::prog::BpfProg;
 use super::verifier::{Kind, verify};
 use crate::uaccess::{UserPtr, copy_from_user, copy_to_user, put_user};
@@ -404,9 +407,21 @@ fn bpf_map_lookup_elem(attr_buf: &[u8]) -> KernelResult<()> {
 fn bpf_map_update_elem(attr_buf: &[u8]) -> KernelResult<()> {
     let attr = MapElemAttr::read_from(attr_buf).ok_or(KernelError::InvalidArgument)?;
     let map = get_bpf_map_from_fd(attr.map_fd as i32)?;
+    op_flags_ok(attr.flags)?;
     let key = user_bytes(attr.key, map.key_size() as usize)?;
     let value = user_bytes(attr.value, map.value_size() as usize)?;
     map.update(&key, &value, attr.flags)
+}
+
+/// Flags checked before the key is copied (Linux
+/// bpf_map_check_op_flags): no map has a bpf_spin_lock (hk has no BTF)
+/// or is per-CPU, so BPF_F_LOCK, BPF_F_CPU, BPF_F_ALL_CPUS and a CPU
+/// number in the upper half are EINVAL
+fn op_flags_ok(flags: u64) -> KernelResult<()> {
+    if flags & (BPF_F_LOCK | BPF_F_CPU | BPF_F_ALL_CPUS) != 0 || flags >> 32 != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(())
 }
 
 /// Delete an element from a map

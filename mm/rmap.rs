@@ -85,12 +85,21 @@ pub fn rmap_walk(
 /// page is then never freed.
 pub fn try_to_unmap(phys: u64, e: crate::mm::SwapEntry) -> bool {
     rmap_walk(phys, &mut |mm, avc, addr, t, pte| {
-        if avc.locked || !crate::mm::swap::swap_duplicate(e) {
+        // Pinned since reclaim checked (under this PTE lock, which a pin
+        // takes): keep it mapped
+        if avc.locked || crate::mm::gup::maybe_dma_pinned(phys) {
+            return false;
+        }
+        if !crate::mm::swap::swapfile::swap_duplicate(e) {
             return false;
         }
         if !unmap_one(t.entry(addr), pte, phys, e) {
-            crate::mm::swap::swap_free(e);
+            crate::mm::swap::swapfile::swap_free(e);
             return true;
+        }
+        // No longer mapped: a swap-in decides again whose it is
+        if let Some(pg) = phys_to_page(phys) {
+            pg.clear_flag(crate::mm::page::PG_ANON_EXCL);
         }
         crate::mm::tlb::flush_tlb_page(mm, addr);
         page_remove_rmap(phys);

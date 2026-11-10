@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::spin::Mutex;
-use ::core::sync::atomic::{AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync;
 
@@ -52,9 +52,47 @@ pub mod flags {
     /// Asynchronous I/O (generate SIGIO)
     pub const O_ASYNC: u32 = 0o20000;
     /// Must be a directory / don't follow symlinks (values differ per arch)
-    pub use crate::arch::uapi::{O_DIRECTORY, O_NOFOLLOW};
+    pub use crate::arch::uapi::{O_DIRECT, O_DIRECTORY, O_LARGEFILE, O_NOFOLLOW};
+    /// Don't update the access time
+    pub const O_NOATIME: u32 = 0o1000000;
     /// Close on exec
     pub const O_CLOEXEC: u32 = 0o2000000;
+    /// File integrity sync (O_SYNC is it with O_DSYNC)
+    pub const __O_SYNC: u32 = 0o4000000;
+    /// A path-only file: a place in the tree, no I/O (asm-generic,
+    /// both arches)
+    pub const O_PATH: u32 = 0o10000000;
+    /// An empty path names dirfd itself (asm-generic, both arches;
+    /// Linux 7.2 LOOKUP_EMPTY)
+    pub const O_EMPTYPATH: u32 = 1 << 26;
+    /// An unnamed file in the directory named (asm-generic __O_TMPFILE;
+    /// O_TMPFILE is it with O_DIRECTORY)
+    pub const __O_TMPFILE: u32 = 0o20000000;
+
+    /// Every flag open(2) knows (Linux VALID_OPEN_FLAGS; O_NDELAY is
+    /// O_NONBLOCK); the old calls drop the rest
+    pub const VALID_OPEN_FLAGS: u32 = O_ACCMODE
+        | O_CREAT
+        | O_EXCL
+        | O_NOCTTY
+        | O_TRUNC
+        | O_APPEND
+        | O_NONBLOCK
+        | __O_SYNC
+        | O_DSYNC
+        | O_ASYNC
+        | O_DIRECT
+        | O_LARGEFILE
+        | O_DIRECTORY
+        | O_NOFOLLOW
+        | O_NOATIME
+        | O_CLOEXEC
+        | O_PATH
+        | __O_TMPFILE
+        | O_EMPTYPATH;
+
+    /// What O_PATH keeps (Linux O_PATH_FLAGS)
+    pub const O_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC | O_EMPTYPATH;
 
     /// The *at() calls' dirfd for the current directory
     pub const AT_FDCWD: i32 = -100;
@@ -85,22 +123,51 @@ pub mod seek {
     pub const SEEK_HOLE: i32 = 4;
 }
 
-/// Flags for read/write operations (preadv2/pwritev2 RWF_* flags)
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RwFlags {
-    /// RWF_NOWAIT - return EAGAIN if operation would block
-    pub nowait: bool,
+bitflags::bitflags! {
+    /// Flags of one read or write (Linux kiocb ki_flags, IOCB_*): the
+    /// file's own (`File::iocb_flags`, from O_APPEND, O_DIRECT,
+    /// O_DSYNC, __O_SYNC) and the call's RWF_* ones; the values are
+    /// Linux's, where the RWF_* flags share them
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct RwFlags: u32 {
+        /// RWF_HIPRI: poll for completion
+        const HIPRI = 1 << 0;
+        /// O_DSYNC / RWF_DSYNC: the data reaches storage before return
+        const DSYNC = 1 << 1;
+        /// __O_SYNC / RWF_SYNC: the file's metadata too
+        const SYNC = 1 << 2;
+        /// RWF_NOWAIT: EAGAIN rather than block
+        const NOWAIT = 1 << 3;
+        /// O_APPEND
+        const APPEND = 1 << 4;
+        /// O_DIRECT: bypass the page cache
+        const DIRECT = 1 << 17;
+    }
 }
 
 impl RwFlags {
-    /// Create empty flags (no special behavior)
-    pub const fn empty() -> Self {
-        Self { nowait: false }
+    /// RWF_NOWAIT
+    #[inline]
+    pub const fn nowait(self) -> bool {
+        self.contains(Self::NOWAIT)
     }
 
-    /// Create flags with NOWAIT set
-    pub const fn with_nowait() -> Self {
-        Self { nowait: true }
+    /// The file flags' part (Linux iocb_flags)
+    pub const fn from_file(f: u32) -> Self {
+        let mut r = Self::empty();
+        if f & flags::O_APPEND != 0 {
+            r = r.union(Self::APPEND);
+        }
+        if f & flags::O_DIRECT != 0 {
+            r = r.union(Self::DIRECT);
+        }
+        if f & flags::O_DSYNC != 0 {
+            r = r.union(Self::DSYNC);
+        }
+        if f & flags::__O_SYNC != 0 {
+            r = r.union(Self::SYNC);
+        }
+        r
     }
 }
 
@@ -201,7 +268,7 @@ pub fn generic_llseek(
 /// RWF_NOWAIT is EOPNOTSUPP, which the syscalls report as ESPIPE resp.
 /// EOPNOTSUPP
 pub fn stream_rw(at: Option<u64>, flags: RwFlags) -> Result<(), KernelError> {
-    if at.is_some() || flags.nowait {
+    if at.is_some() || flags.nowait() {
         return Err(KernelError::OperationNotSupported);
     }
     Ok(())
@@ -211,7 +278,7 @@ pub fn stream_rw(at: Option<u64>, flags: RwFlags) -> Result<(), KernelError> {
 /// (Linux vfs_read without read_iter), and positioned I/O or RWF_NOWAIT
 /// EOPNOTSUPP (the syscalls report ESPIPE resp. EOPNOTSUPP)
 fn no_rw(at: Option<u64>, flags: RwFlags) -> Result<usize, KernelError> {
-    if at.is_some() || flags.nowait {
+    if at.is_some() || flags.nowait() {
         return Err(KernelError::OperationNotSupported);
     }
     Err(KernelError::InvalidArgument)
@@ -225,7 +292,7 @@ pub fn nowait_rw(file: &File, at: Option<u64>, flags: RwFlags) -> Result<bool, K
     if at.is_some() {
         return Err(KernelError::OperationNotSupported);
     }
-    Ok(flags.nowait || file.get_flags() & self::flags::O_NONBLOCK != 0)
+    Ok(flags.nowait() || file.get_flags() & self::flags::O_NONBLOCK != 0)
 }
 
 /// File operations trait - filesystem-specific behavior for open files
@@ -288,9 +355,64 @@ pub trait FileOps: Send + Sync {
         Err(KernelError::NoDevice)
     }
 
+    /// May a mapping start at byte `off` of the file (Linux f_op->mmap
+    /// looking at vm_pgoff, e.g. io_uring_validate_mmap_request)? Asked
+    /// after `mmap` accepted the mapping. Default: any offset.
+    fn mmap_offset(&self, _file: &File, _off: u64) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    /// A mapping of the file in address space `mm` moved to `start`,
+    /// `len` bytes, by mremap (Linux vm_ops->mremap, which has the vma's
+    /// vm_mm), before its entries move, the mmap_lock held for writing;
+    /// an error refuses the move. Default: any move.
+    fn mremap(
+        &self,
+        _file: &File,
+        _mm: &crate::mm::Mm,
+        _start: u64,
+        _len: u64,
+    ) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    /// The file's mappings are its driver's pages, inserted at mmap
+    /// (`map_page`; Linux vm_insert_pages from f_op->mmap). Default: no.
+    fn maps_driver_pages(&self, _file: &File) -> bool {
+        false
+    }
+
+    /// The kernel page that page `idx` of a mapping made at byte `off`
+    /// of the file maps, with a reference taken for its PTE (Linux
+    /// vm_insert_pages from f_op->mmap: pages of the driver, not of a
+    /// page cache); None past the driver's pages. Asked at mmap, only
+    /// for a file that `maps_driver_pages`.
+    ///
+    /// # Safety
+    /// The caller maps the page into user space with the reference
+    /// taken here and drops that reference when the mapping goes. The
+    /// implementor returns a RAM frame that stays allocated while the
+    /// reference is held and holds nothing but what user space may
+    /// read and write.
+    unsafe fn map_page(
+        &self,
+        _file: &File,
+        _off: u64,
+        _idx: u64,
+    ) -> Option<Result<u64, KernelError>> {
+        None
+    }
+
     /// Sync file data to backing store
     fn fsync(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
+    }
+
+    /// Sync the data of bytes [start, end] (Linux f_op->fsync with a
+    /// range, from generic_write_sync); default: the whole file
+    fn fsync_range(&self, file: &File, start: u64, end: u64) -> Result<(), KernelError> {
+        let _ = (start, end);
+        self.fsync(file)
     }
 
     /// A descriptor of the file is being closed (close, dup2 over it,
@@ -332,6 +454,55 @@ pub trait FileOps: Send + Sync {
         DEFAULT_POLLMASK
     }
 
+    /// O_DIRECT I/O on `file` can be started without waiting
+    /// (`dio_submit`; Linux: ->read_iter/->write_iter return -EIOCBQUEUED
+    /// for an async IOCB_DIRECT kiocb). Default: no.
+    fn can_async_dio(&self, _file: &File) -> bool {
+        false
+    }
+
+    /// Start O_DIRECT I/O of `io`'s pinned memory at `pos`, a read from
+    /// the file or (`write`) a write to it, with the I/O flags `flags`
+    /// (the request's whole: the file's and its RWF_* ones, APPEND as
+    /// RWF_APPEND / RWF_NOAPPEND left it; Linux ki_flags) (Linux
+    /// blkdev_direct_IO on an async kiocb): Ok(None) when queued
+    /// (`io` completes later, from any context), Ok(Some(n)) when done at
+    /// once (n bytes: nothing to do, the end of the file); an error means
+    /// nothing was started (EAGAIN with RWF_NOWAIT where it would wait).
+    /// Only called when `can_async_dio`; `io` holds `file` until it
+    /// completes (an implementation may drop its own references to the
+    /// file's inode in `complete`, any context, knowing they are not the
+    /// last).
+    fn dio_submit(
+        &self,
+        _file: &File,
+        _io: Arc<dyn crate::block::dio::AsyncIo>,
+        _pos: u64,
+        _write: bool,
+        _flags: RwFlags,
+    ) -> Result<Option<usize>, KernelError> {
+        Err(KernelError::OperationNotSupported)
+    }
+
+    /// Polled I/O of the file can be reaped (`iopoll`; Linux
+    /// f_op->iopoll is set). Default: no.
+    fn can_iopoll(&self, _file: &File) -> bool {
+        false
+    }
+
+    /// Reap polled I/O of the file once (Linux f_op->iopoll): whether
+    /// anything ended. Default: nothing to poll.
+    fn iopoll(&self, _file: &File) -> bool {
+        false
+    }
+
+    /// O_DIRECT may be set on `file`, asked once at the end of its open
+    /// (Linux FMODE_CAN_ODIRECT: the mapping has ->direct_IO, or ->open
+    /// sets it). Default: no.
+    fn can_odirect(&self, _file: &File) -> bool {
+        false
+    }
+
     /// The file has a poll of its own (Linux file_can_poll: f_op->poll
     /// set): epoll accepts only these (EPERM otherwise); poll and select
     /// see `poll`'s DEFAULT_POLLMASK either way (Linux vfs_poll)
@@ -364,8 +535,22 @@ pub struct File {
     /// Open flags (protected by f_lock, like Linux)
     f_lock: Mutex<u32>,
 
+    /// The flags' I/O part (Linux f_iocb_flags, `RwFlags::from_file`):
+    /// written under `f_lock` with the flags, read lock-free by each
+    /// read and write (a racing F_SETFL may or may not apply to an I/O
+    /// already started, as in Linux)
+    f_iocb: AtomicU32,
+
+    /// O_DIRECT may be set (Linux FMODE_CAN_ODIRECT): fixed by
+    /// `open::dentry_open` from `FileOps::can_odirect`; false for a file
+    /// made without an open (memfd, pipe, socket)
+    can_odirect: bool,
+
     /// File operations
     pub f_op: &'static dyn FileOps,
+
+    /// Opened O_PATH (Linux FMODE_PATH): fixed at open
+    path_only: bool,
 
     /// SIGIO owner (Linux f_owner), allocated on first use
     /// (`io::fasync`)
@@ -389,6 +574,12 @@ pub struct File {
     /// The epoll items watching this file (Linux f_ep), removed at its
     /// last close (spin leaf)
     pub f_ep: Mutex<alloc::vec::Vec<alloc::sync::Weak<crate::io::epoll::EpItem>>>,
+
+    /// The writeback errors of its mapping and filesystem it has seen
+    /// (Linux f_wb_err, f_sb_err): sampled at open, advanced by fsync
+    /// and syncfs under `f_lock`, read lock-free
+    f_wb_err: AtomicU32,
+    f_sb_err: AtomicU32,
 }
 
 impl File {
@@ -441,25 +632,72 @@ impl File {
             f_pos_lock: sync::Mutex::new(()),
             f_ep: Mutex::new(alloc::vec::Vec::new()),
             f_lock: Mutex::new(flags),
+            f_iocb: AtomicU32::new(RwFlags::from_file(flags).bits()),
+            can_odirect: false,
             f_op,
+            path_only: flags & flags::O_PATH != 0,
             f_owner: spin::Once::new(),
             write_access: None,
             i_write: None,
             f_cred: crate::task::current_cred(),
             private: spin::Once::new(),
+            f_wb_err: AtomicU32::new(0),
+            f_sb_err: AtomicU32::new(0),
+        }
+        .sampled()
+    }
+
+    /// With the writeback errors of its mapping and filesystem sampled
+    /// (Linux do_dentry_open: filemap_sample_wb_err, file_sample_sb_err)
+    fn sampled(self) -> Self {
+        self.sample_wb_err();
+        self
+    }
+
+    /// Sample its mapping's and filesystem's writeback errors: what came
+    /// before (and was seen) is not this file's to report (Linux
+    /// do_dentry_open; again after ->open, which may change the mapping:
+    /// blkdev_open)
+    pub fn sample_wb_err(&self) {
+        if let Some(i) = self.mapping_inode() {
+            self.f_wb_err
+                .store(i.i_data.wb_err.sample(), Ordering::Relaxed);
+        }
+        if let Some(sb) = self.dentry.get_inode().and_then(|i| i.superblock()) {
+            self.f_sb_err.store(sb.s_wb_err.sample(), Ordering::Relaxed);
         }
     }
 
-    /// An anonymous-inode file whose shared state lives in `private`
-    /// (Linux anon_inode_getfile priv): the ops stay static, and the
-    /// state goes with the last reference to the file
+    /// A writeback error of its mapping since it last looked, once
+    /// (Linux file_check_and_advance_wb_err)
+    pub fn check_and_advance_wb_err(&self) -> Result<(), KernelError> {
+        let Some(i) = self.mapping_inode() else {
+            return Ok(());
+        };
+        advance(&i.i_data.wb_err, &self.f_wb_err, &self.f_lock)
+    }
+
+    /// A writeback error of its filesystem since it last looked, once
+    /// (Linux syncfs: errseq_check_and_advance of s_wb_err, f_sb_err)
+    pub fn check_and_advance_sb_err(&self) -> Result<(), KernelError> {
+        let Some(sb) = self.dentry.get_inode().and_then(|i| i.superblock()) else {
+            return Ok(());
+        };
+        advance(&sb.s_wb_err, &self.f_sb_err, &self.f_lock)
+    }
+
+    /// A file whose shared state lives in `private` (Linux
+    /// anon_inode_getfile priv, alloc_file_pseudo): the ops stay static,
+    /// and the state goes with the last reference to the file; `mnt` is
+    /// its pseudo filesystem's mount
     pub fn new_anon(
         dentry: Arc<Dentry>,
+        mnt: Option<Arc<Mount>>,
         flags: u32,
         f_op: &'static dyn FileOps,
         private: Arc<dyn core::any::Any + Send + Sync>,
     ) -> Self {
-        let f = Self::new(dentry, None, flags, f_op);
+        let f = Self::new(dentry, mnt, flags, f_op);
         f.private.call_once(|| private);
         f
     }
@@ -511,29 +749,69 @@ impl File {
         self.pos.fetch_add(n, Ordering::Relaxed)
     }
 
+    /// Drop open-only flags before the file is shared (Linux
+    /// do_dentry_open's f_flags strip)
+    pub fn clear_flags(&mut self, f: u32) {
+        *self.f_lock.get_mut() &= !f;
+    }
+
     /// Get current flags
     pub fn get_flags(&self) -> u32 {
         *self.f_lock.lock()
     }
 
-    /// Set status flags (for F_SETFL)
-    ///
-    /// Only O_APPEND, O_NONBLOCK and O_NOATIME can be modified. Access
-    /// mode is preserved.
+    /// Set the status flags F_SETFL may change (Linux SETFL_MASK:
+    /// O_APPEND, O_NONBLOCK, O_DIRECT, O_NOATIME), the I/O flags with
+    /// them under `f_lock` (Linux setfl)
     pub fn set_status_flags(&self, new_status: u32) {
-        const SETTABLE_FLAGS: u32 = flags::O_APPEND | flags::O_NONBLOCK | super::dac::O_NOATIME;
+        const SETFL_MASK: u32 =
+            flags::O_APPEND | flags::O_NONBLOCK | flags::O_DIRECT | super::dac::O_NOATIME;
         let mut guard = self.f_lock.lock();
-        *guard = (*guard & !SETTABLE_FLAGS) | (new_status & SETTABLE_FLAGS);
+        *guard = (*guard & !SETFL_MASK) | (new_status & SETFL_MASK);
+        self.f_iocb
+            .store(RwFlags::from_file(*guard).bits(), Ordering::Relaxed);
+    }
+
+    /// The file's I/O flags (Linux f_iocb_flags)
+    #[inline]
+    pub fn iocb_flags(&self) -> RwFlags {
+        RwFlags::from_bits_retain(self.f_iocb.load(Ordering::Relaxed))
+    }
+
+    /// O_DIRECT may be set on the file (Linux FMODE_CAN_ODIRECT)
+    #[inline]
+    pub fn can_odirect(&self) -> bool {
+        self.can_odirect
+    }
+
+    /// Fix FMODE_CAN_ODIRECT at the end of the open, before the file is
+    /// shared (`open::dentry_open`)
+    pub fn set_can_odirect(&mut self) {
+        self.can_odirect = self.f_op.can_odirect(self);
+    }
+
+    /// A path-only (O_PATH) file (Linux FMODE_PATH): it names a place
+    /// in the tree, for *at() calls, fstat, fchdir, dup; every other use
+    /// of the descriptor is EBADF
+    #[inline]
+    pub fn is_path(&self) -> bool {
+        self.path_only
     }
 
     /// Check if file is readable
     pub fn is_readable(&self) -> bool {
+        if self.path_only {
+            return false;
+        }
         let mode = self.get_flags() & flags::O_ACCMODE;
         mode == flags::O_RDONLY || mode == flags::O_RDWR
     }
 
     /// Check if file is writable
     pub fn is_writable(&self) -> bool {
+        if self.path_only {
+            return false;
+        }
         let mode = self.get_flags() & flags::O_ACCMODE;
         mode == flags::O_WRONLY || mode == flags::O_RDWR
     }
@@ -583,6 +861,7 @@ impl File {
             return Err(KernelError::PermissionDenied);
         }
         let want = !to.is_empty();
+        let flags = flags | self.iocb_flags();
         let r = self.f_op.read_iter(self, to, at, flags);
         // A regular file read asking for data (Linux filemap_read)
         if want && let Some(i) = self.get_inode().filter(|i| i.mode().is_file()) {
@@ -663,13 +942,14 @@ impl File {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
+        let flags = flags | self.iocb_flags();
         let inode = match self.get_inode() {
             Some(i) if i.mode().is_file() => i,
             _ => return self.f_op.write_iter(self, from, at, flags),
         };
-        let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
+        let append = append.unwrap_or(flags.contains(RwFlags::APPEND));
         let lock = inode.lock();
-        let n = (|| {
+        let (pos, n) = (|| {
             // An active swap file (Linux generic_write_checks:
             // IS_SWAPFILE), checked under i_rwsem: swapon sets it there
             if inode.i_swapfile.load(Ordering::Acquire) {
@@ -687,28 +967,22 @@ impl File {
             // A zero-length write checks nothing (Linux: count 0 returns
             // before generic_write_checks)
             if from.is_empty() {
-                return Ok(0);
+                return Ok((pos, 0));
             }
             from.truncate(inode.write_limit(pos, from.len())?);
             // file_modified: set-id bits go unless CAP_FSETID, then
             // mtime and ctime, before the data
             super::dac::remove_privs(&inode);
             inode.touch_mc();
-            self.f_op.write_iter(self, from, at, flags)
+            self.f_op
+                .write_iter(self, from, at, flags)
+                .map(|n| (pos, n))
         })()?;
         drop(lock);
-        // O_DSYNC/O_SYNC or a synchronous mount: the data reaches the
-        // storage before the write returns (Linux generic_write_sync,
-        // after i_rwsem is released)
-        // Only a write that wrote, and the superblock only without O_DSYNC
-        let sync = || {
-            self.get_flags() & flags::O_DSYNC != 0
-                || inode.superblock().is_some_and(|sb| sb.synchronous())
-        };
-        if n > 0 && sync() {
-            self.f_op.fsync(self)?;
-        }
-        Ok(n)
+        // After i_rwsem is released; a synchronous mount is Linux IS_SYNC
+        let sync =
+            flags.contains(RwFlags::DSYNC) || inode.superblock().is_some_and(|sb| sb.synchronous());
+        generic_write_sync(self, pos, n, sync)
     }
 
     /// Seek
@@ -735,6 +1009,24 @@ impl File {
     pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         self.f_op.poll(self, pt)
     }
+}
+
+/// Check `seq` against the file's `since` and advance it (lock-free when
+/// nothing changed, else under the file's `f_lock`: Linux
+/// file_check_and_advance_wb_err)
+fn advance(
+    seq: &crate::util::errseq::ErrSeq,
+    since: &AtomicU32,
+    lock: &Mutex<u32>,
+) -> Result<(), KernelError> {
+    if seq.check(since.load(Ordering::Relaxed)).is_none() {
+        return Ok(());
+    }
+    let _g = lock.lock();
+    let mut s = since.load(Ordering::Relaxed);
+    let e = seq.check_and_advance(&mut s);
+    since.store(s, Ordering::Relaxed);
+    e.map_or(Ok(()), Err)
 }
 
 impl Drop for File {
@@ -765,6 +1057,22 @@ impl Drop for File {
     }
 }
 
+/// After a write of `n` bytes at `pos` of `file` that must be
+/// synchronous (`dsync`: IOCB_DSYNC, or the inode IS_SYNC), those bytes
+/// reach the storage before the write returns, and an error doing so is
+/// the write's (Linux generic_write_sync: vfs_fsync_range over them)
+pub fn generic_write_sync(
+    file: &File,
+    pos: u64,
+    n: usize,
+    dsync: bool,
+) -> Result<usize, KernelError> {
+    if n > 0 && dsync {
+        crate::fs::sync::vfs_fsync_range(file, pos, pos.saturating_add(n as u64 - 1))?;
+    }
+    Ok(n)
+}
+
 /// FIONREAD (Linux ioctl number): bytes ready to read
 pub const FIONREAD: u32 = 0x541B;
 
@@ -774,6 +1082,18 @@ pub fn put_fionread(arg: u64, n: i64) -> Result<i64, KernelError> {
     crate::uaccess::put_user::<i32>(arg, n as i32).map_err(|_| KernelError::BadAddress)?;
     Ok(0)
 }
+
+/// The operations of a path-only (O_PATH) file (Linux do_dentry_open's
+/// empty_fops): none, as no I/O reaches it
+pub struct EmptyFileOps;
+
+impl FileOps for EmptyFileOps {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub static EMPTY_FOPS: EmptyFileOps = EmptyFileOps;
 
 /// Null file ops - returns errors for all operations
 pub struct NullFileOps;
@@ -864,7 +1184,7 @@ impl FileOps for CharDevFileOps {
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
         let dev = Self::dev(file)?;
-        if (at.is_some() && !dev.positional()) || flags.nowait {
+        if (at.is_some() && !dev.positional()) || flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         dev.read(file, to)
@@ -879,7 +1199,7 @@ impl FileOps for CharDevFileOps {
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
         let dev = Self::dev(file)?;
-        if (at.is_some() && !dev.positional()) || flags.nowait {
+        if (at.is_some() && !dev.positional()) || flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         dev.write(file, from)
@@ -924,6 +1244,10 @@ pub static CHAR_FILE_OPS: CharDevFileOps = CharDevFileOps;
 /// `owner` was closed (Linux filp_flush): that owner's POSIX locks on
 /// the inode go, then the file's own flush
 pub fn filp_flush(file: &File, owner: u64) {
-    crate::fs::posix_lock::release_posix_locks_on_close(file, owner);
+    // A path-only file holds no locks of the closer's (Linux filp_flush
+    // skips locks_remove_posix for FMODE_PATH)
+    if !file.is_path() {
+        crate::fs::posix_lock::release_posix_locks_on_close(file, owner);
+    }
     file.f_op.flush(file);
 }

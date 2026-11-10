@@ -7,7 +7,7 @@ use crate::task::percpu::{current_cwd, current_fs};
 use crate::uaccess::{UserPtr, copy_to_user};
 use crate::util::error::KernelResult;
 
-use super::io::fget;
+use super::io::fget_raw;
 
 /// chdir/fchdir/chroot target: a directory with search permission
 /// (MAY_EXEC | MAY_CHDIR)
@@ -38,7 +38,7 @@ pub fn sys_chdir(path_ptr: UserPtr<u8>) -> KernelResult<()> {
 
 /// sys_fchdir - change working directory via file descriptor
 pub fn sys_fchdir(fd: i32) -> KernelResult<()> {
-    let file = fget(fd)?;
+    let file = fget_raw(fd)?;
     may_chdir(&file.dentry)?;
     if let Some(fs) = current_fs()
         && let Some(new_pwd) = file.f_path()

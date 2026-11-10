@@ -37,13 +37,15 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
+use crate::sync::IrqSpinlock;
 use crate::sync::completion::Completion;
 use crate::sync::spin::{Mutex, RwLock};
 
 pub use crate::fs::chardev::{DevId, DevMajor, DevMinor};
 use crate::mm::writeback::{BdiWriteback, bdi_register, bdi_unregister};
 use crate::util::error::KernelError;
-use crate::util::kalloc::{box_nofail, try_arc};
+use crate::util::kalloc::{arc_nofail, box_nofail, try_arc};
+use crate::util::smallvec::SmallVec;
 
 use super::blk_mq::BlkMq;
 
@@ -65,6 +67,9 @@ pub mod major {
 pub const SECTOR_SIZE: u64 = 512;
 pub const SECTOR_SHIFT: u32 = 9;
 const PAGE: usize = 4096;
+/// Default cap on a request's sectors when the device has none (Linux
+/// BLK_DEF_MAX_SECTORS_CAP: 4 MiB)
+pub const BLK_DEF_MAX_SECTORS_CAP: u32 = (4 << 20) >> SECTOR_SHIFT;
 
 // ============================================================================
 // Major numbers (Linux register_blkdev)
@@ -112,14 +117,41 @@ impl BioOp {
     }
 }
 
+bitflags::bitflags! {
+    /// Modifiers of a bio's operation (Linux blk_opf_t REQ_* flags)
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct BioFlags: u32 {
+        /// The written data is durable when the bio completes (Linux
+        /// REQ_FUA): a queue with a volatile cache but no FUA follows it
+        /// with a flush
+        const FUA = 1 << 0;
+        /// Never wait in the block layer or driver: a bio that would
+        /// (no free tag) ends with EAGAIN (Linux REQ_NOWAIT,
+        /// bio_wouldblock_error); a queue without NOWAIT support ends
+        /// it with EOPNOTSUPP
+        const NOWAIT = 1 << 1;
+        /// Its end is found by polling (Linux REQ_POLLED, from
+        /// IOCB_HIPRI): it goes to a poll queue; a queue without them
+        /// ends it with EOPNOTSUPP (Linux since 6.11: no BLK_FEAT_POLL)
+        const POLLED = 1 << 2;
+    }
+}
+
 /// One segment: part of a physical frame
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BioSeg {
     /// Physical address of the frame
     pub frame: u64,
     pub offset: usize,
     pub len: usize,
 }
+
+/// Segments a bio keeps inline (Linux BIO_INLINE_VECS): more go to
+/// the heap
+pub const BIO_INLINE_VECS: usize = 4;
+
+/// A bio's segments
+pub type BioSegs = SmallVec<BioSeg, BIO_INLINE_VECS>;
 
 /// Completion callback; called once with the finished bio, possibly in
 /// hardirq context (module docs)
@@ -129,15 +161,30 @@ pub type EndIo = fn(Box<Bio>);
 /// memory (Linux struct bio)
 pub struct Bio {
     pub op: BioOp,
+    pub flags: BioFlags,
     /// First sector; relative to the block device on submission, to the
     /// disk after the partition remap
     pub sector: u64,
-    pub segs: Vec<BioSeg>,
+    pub segs: BioSegs,
     /// Result, set by the driver before `bio_endio` (Linux bi_status)
     pub status: Result<(), KernelError>,
     pub end_io: Option<EndIo>,
     /// For the owner of `end_io` (Linux bi_private)
     pub private: usize,
+    /// Bios merged behind this one into one request (Linux rq->bio
+    /// chain): each ends on its own when the request does
+    /// (`bio_endio`); blk-mq only
+    pub merged: BioList,
+    /// Sectors and segments of the `merged` bios (a request's running
+    /// totals beyond its head, Linux __data_len, nr_phys_segments)
+    merged_sectors: u64,
+    merged_segs: usize,
+    /// Address of the queue a bio is held for on a plug (`plug`), or a
+    /// shared flush is out for (`FqState::kick`)
+    pub(super) plug_q: usize,
+    /// Software queue (CPU) of its blk-mq request, set when the request
+    /// is taken (Linux rq->mq_ctx)
+    pub(super) rq_ctx: u16,
     /// Link in a [`BioList`]
     next: Option<Box<Bio>>,
 }
@@ -148,13 +195,26 @@ impl Bio {
     pub fn new(op: BioOp, sector: u64) -> Box<Self> {
         box_nofail(Self {
             op,
+            flags: BioFlags::empty(),
             sector,
-            segs: Vec::new(),
+            segs: BioSegs::new(),
             status: Ok(()),
             end_io: None,
             private: 0,
+            merged: BioList::new(),
+            merged_sectors: 0,
+            merged_segs: 0,
+            plug_q: 0,
+            rq_ctx: 0,
             next: None,
         })
+    }
+
+    /// `new` with room for `n` segments (ENOMEM past the inline ones)
+    pub fn with_segs(op: BioOp, sector: u64, n: usize) -> Result<Box<Self>, KernelError> {
+        let mut b = Self::new(op, sector);
+        b.segs = BioSegs::try_with_capacity(n)?;
+        Ok(b)
     }
 
     pub fn add_seg(&mut self, frame: u64, offset: usize, len: usize) {
@@ -170,11 +230,69 @@ impl Bio {
     pub fn sectors(&self) -> u64 {
         (self.size() as u64) >> SECTOR_SHIFT
     }
+
+    /// The bios of the request this one heads: itself, then the merged
+    fn rq_bios(&self) -> impl Iterator<Item = &Bio> {
+        core::iter::once(self).chain(self.merged.iter())
+    }
+
+    /// The request's segments, in order (Linux rq_for_each_segment)
+    pub fn rq_segs(&self) -> impl Iterator<Item = &BioSeg> {
+        self.rq_bios().flat_map(|b| b.segs.iter())
+    }
+
+    /// The request's segment count (Linux blk_rq_nr_phys_segments)
+    pub fn rq_nr_segs(&self) -> usize {
+        self.segs.len() + self.merged_segs
+    }
+
+    /// The request's sectors (Linux blk_rq_sectors)
+    pub fn rq_sectors(&self) -> u64 {
+        self.sectors() + self.merged_sectors
+    }
+
+    /// Merge `b` (a lone bio) behind the request this bio heads (Linux
+    /// bio_attempt_back_merge)
+    pub(super) fn rq_append(&mut self, b: Box<Bio>) {
+        self.merged_sectors += b.sectors();
+        self.merged_segs += b.segs.len();
+        self.merged.push(b);
+    }
+
+    /// Merge `b` (a lone bio) in front of the request this bio heads
+    /// (Linux bio_attempt_front_merge): `b`'s data takes the head's
+    /// place, the old head and the bios behind it follow. What the head
+    /// holds for the request stays: its software queue (whose hardware
+    /// queue counted its tag), its queue, its flags (Linux keeps mq_ctx
+    /// and cmd_flags), and the running totals grow by the old head
+    pub(super) fn rq_prepend(&mut self, mut b: Box<Bio>) {
+        core::mem::swap(self, &mut *b);
+        // `b` is the old head now, `self` the new bio's data
+        core::mem::swap(&mut self.rq_ctx, &mut b.rq_ctx);
+        core::mem::swap(&mut self.plug_q, &mut b.plug_q);
+        core::mem::swap(&mut self.flags, &mut b.flags);
+        self.merged_sectors = b.merged_sectors + b.sectors();
+        self.merged_segs = b.merged_segs + b.segs.len();
+        b.merged_sectors = 0;
+        b.merged_segs = 0;
+        let mut rest = core::mem::take(&mut b.merged);
+        self.merged.push(b);
+        self.merged.append(&mut rest);
+    }
 }
 
 /// Finish a bio: hand it to its `end_io` or free it (Linux bio_endio).
+/// A request's head ends the bios merged behind it first, with its
+/// status (Linux blk_mq_end_request: blk_update_request, bio by bio).
 /// Callable in hardirq context (the heap is IRQ-safe).
-pub fn bio_endio(bio: Box<Bio>) {
+pub fn bio_endio(mut bio: Box<Bio>) {
+    while let Some(mut b) = bio.merged.pop() {
+        b.status = bio.status;
+        bio_endio(b);
+    }
+    // The head ends as a lone bio
+    bio.merged_sectors = 0;
+    bio.merged_segs = 0;
     match bio.end_io {
         Some(f) => f(bio),
         None => drop(bio),
@@ -196,6 +314,12 @@ pub struct BioList {
 
 // The raw tail points into the list's own boxes
 unsafe impl Send for BioList {}
+
+impl Default for BioList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl BioList {
     pub const fn new() -> Self {
@@ -229,6 +353,23 @@ impl BioList {
         self.head = Some(bio);
     }
 
+    /// The software queue of the first bio's request
+    pub(super) fn first_ctx(&self) -> Option<usize> {
+        self.head.as_ref().map(|b| usize::from(b.rq_ctx))
+    }
+
+    /// The last bio
+    pub fn last_mut(&mut self) -> Option<&mut Bio> {
+        // SAFETY: `tail` is null or points into the last box of the
+        // list, which `&mut self` owns
+        unsafe { self.tail.as_mut() }
+    }
+
+    /// The bios in order
+    pub fn iter(&self) -> impl Iterator<Item = &Bio> {
+        core::iter::successors(self.head.as_deref(), |b| b.next.as_deref())
+    }
+
     pub fn pop(&mut self) -> Option<Box<Bio>> {
         let mut bio = self.head.take()?;
         self.head = bio.next.take();
@@ -238,11 +379,20 @@ impl BioList {
         Some(bio)
     }
 
-    /// Move all of `other` to the end of this list
+    /// Move all of `other` to the end of this list, in O(1)
     pub fn append(&mut self, other: &mut BioList) {
-        while let Some(b) = other.pop() {
-            self.push(b);
+        let Some(head) = other.head.take() else {
+            return;
+        };
+        if self.tail.is_null() {
+            self.head = Some(head);
+        } else {
+            // SAFETY: `tail` points into this list's last box, which
+            // `&mut self` owns
+            unsafe { (*self.tail).next = Some(head) };
         }
+        self.tail = other.tail;
+        other.tail = core::ptr::null_mut();
     }
 }
 
@@ -255,12 +405,32 @@ impl BioList {
 pub struct QueueLimits {
     pub logical_block_size: u32,
     pub physical_block_size: u32,
-    /// Largest request in sectors
+    /// Largest request in sectors the block layer builds (Linux
+    /// max_sectors, from max_hw_sectors in blk_validate_limits)
     pub max_sectors: u32,
+    /// Largest request in sectors the device takes
+    pub max_hw_sectors: u32,
     pub max_segments: u32,
     pub max_segment_size: u32,
     /// Seeks cost (Linux !QUEUE_FLAG_NONROT)
     pub rotational: bool,
+    /// Mask a DMA buffer's address and length must clear (Linux
+    /// dma_alignment; default SECTOR_SIZE - 1)
+    pub dma_alignment: u32,
+    /// Smallest efficient I/O in bytes as the device reports it, 0 if it
+    /// does not (`io_min` raises it to the physical block size)
+    pub io_min: u32,
+    /// A bio-based driver that never waits takes NOWAIT bios (Linux
+    /// BLK_FEAT_NOWAIT, which blk-mq queues always have)
+    pub nowait: bool,
+}
+
+impl QueueLimits {
+    /// Smallest efficient I/O (Linux io_min after blk_validate_limits:
+    /// at least the physical block size)
+    pub fn io_min(&self) -> u32 {
+        self.io_min.max(self.physical_block_size)
+    }
 }
 
 impl Default for QueueLimits {
@@ -269,9 +439,13 @@ impl Default for QueueLimits {
             logical_block_size: 512,
             physical_block_size: 512,
             max_sectors: 128, // 64 KiB
+            max_hw_sectors: 128,
             max_segments: 32,
             max_segment_size: PAGE as u32,
             rotational: true,
+            dma_alignment: SECTOR_SIZE as u32 - 1,
+            io_min: 0,
+            nowait: false,
         }
     }
 }
@@ -285,7 +459,7 @@ pub trait BlockDriver: Send + Sync {
 
 enum QueueKind {
     Bio(Arc<dyn BlockDriver>),
-    Mq(BlkMq),
+    Mq(Arc<BlkMq>),
 }
 
 /// Request queue of a disk (Linux struct request_queue)
@@ -295,6 +469,11 @@ pub struct RequestQueue {
     /// The device has a volatile write cache: flushes reach the driver
     /// (Linux QUEUE_FLAG_WC); without one they complete at once
     write_cache: bool,
+    /// The device takes FUA writes (Linux BLK_FEAT_FUA); no driver does
+    /// yet, so a FUA write to a cache is followed by a flush
+    fua: bool,
+    /// Post-flush state per hardware queue
+    fqs: Vec<FlushQueue>,
 }
 
 impl RequestQueue {
@@ -304,20 +483,43 @@ impl RequestQueue {
             limits,
             kind: QueueKind::Bio(driver),
             write_cache,
+            fua: false,
+            fqs: flush_queues(1),
         }
     }
 
     /// Queue of a blk-mq driver
     pub fn new_mq(mq: BlkMq, limits: QueueLimits, write_cache: bool) -> Self {
+        let fqs = flush_queues(mq.nr_hw_queues());
         Self {
             limits,
-            kind: QueueKind::Mq(mq),
+            kind: QueueKind::Mq(arc_nofail(mq)),
             write_cache,
+            fua: false,
+            fqs,
+        }
+    }
+
+    /// It takes NOWAIT bios (Linux bdev_nowait: BLK_FEAT_NOWAIT, which
+    /// every blk-mq queue has); hk's bio-based drivers without it (sd) do
+    /// their I/O in the submitter
+    pub fn nowait(&self) -> bool {
+        match self.kind {
+            QueueKind::Mq(_) => true,
+            QueueKind::Bio(_) => self.limits.nowait,
         }
     }
 
     /// The blk-mq queues (for the driver's interrupt handler)
     pub fn mq(&self) -> Option<&BlkMq> {
+        match &self.kind {
+            QueueKind::Mq(m) => Some(&**m),
+            QueueKind::Bio(_) => None,
+        }
+    }
+
+    /// The blk-mq queues, shared with kblockd (`plug`)
+    pub(super) fn mq_arc(&self) -> Option<&Arc<BlkMq>> {
         match &self.kind {
             QueueKind::Mq(m) => Some(m),
             QueueKind::Bio(_) => None,
@@ -340,15 +542,243 @@ impl RequestQueue {
         }
     }
 
-    fn submit(&self, bio: Box<Bio>) {
+    /// Pass `bio` to the driver; a flush without a write cache completes
+    /// at once, and FUA is dropped there too or, on a cache without FUA,
+    /// becomes a flush after the write (Linux submit_bio_noacct,
+    /// blk_insert_flush)
+    fn submit(&self, mut bio: Box<Bio>) {
         if bio.op == BioOp::Flush && !self.write_cache {
             return bio_endio(bio);
         }
+        // A queue that cannot honor NOWAIT refuses it (Linux
+        // submit_bio_noacct: not_supported, BLK_STS_NOTSUPP)
+        if bio.flags.contains(BioFlags::NOWAIT) && !self.nowait() {
+            return bio_io_error(bio, KernelError::OperationNotSupported);
+        }
+        if bio.flags.contains(BioFlags::POLLED) {
+            match self.mq().filter(|m| m.can_poll()) {
+                None => return bio_io_error(bio, KernelError::OperationNotSupported),
+                // A write needing a post-flush ends by interrupt
+                Some(_) if bio.flags.contains(BioFlags::FUA) && !self.fua => {
+                    bio.flags.remove(BioFlags::POLLED);
+                }
+                Some(m) => return m.submit_polled(bio),
+            }
+        }
+        if bio.flags.contains(BioFlags::FUA) && !self.fua {
+            bio.flags.remove(BioFlags::FUA);
+            if self.write_cache {
+                return self.postflush(bio);
+            }
+        }
+        self.submit_plugged(bio);
+    }
+
+    /// Reap its poll queues once (Linux bio_poll): whether anything
+    /// ended
+    pub fn poll(&self) -> bool {
+        self.mq().is_some_and(BlkMq::poll_queues)
+    }
+
+    fn dispatch(&self, bio: Box<Bio>) {
         match &self.kind {
             QueueKind::Bio(d) => d.submit_bio(bio),
             QueueKind::Mq(m) => m.submit(bio),
         }
     }
+
+    /// A submitted bio: on the task's plug if it has one, the queue is
+    /// blk-mq and it is no flush (Linux blk_mq_submit_bio), else
+    /// dispatched
+    fn submit_plugged(&self, bio: Box<Bio>) {
+        let bio = match self.kind {
+            QueueKind::Mq(_) if bio.op != BioOp::Flush => match super::plug::hold(self, bio) {
+                Ok(()) => return,
+                Err(b) => b,
+            },
+            _ => bio,
+        };
+        self.dispatch(bio);
+    }
+}
+
+/// How long written data may wait for others' data before its flush
+/// goes out anyway (Linux FLUSH_PENDING_TIMEOUT, 5 s)
+const FLUSH_PENDING_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// One hardware queue's post-flush state (Linux struct blk_flush_queue,
+/// one per hctx): FUA writes whose data is done share flushes
+pub(super) struct FlushQueue(IrqSpinlock<FqState>);
+
+struct FqState {
+    /// Writes whose data is done, waiting for the next flush (Linux
+    /// flush_queue[flush_pending_idx])
+    pending: BioList,
+    /// When the first of `pending` came (Linux flush_pending_since)
+    since: u64,
+    /// Writes the flush in flight serves (Linux
+    /// flush_queue[flush_running_idx])
+    running: BioList,
+    /// FUA writes whose data is in flight (Linux flush_data_in_flight)
+    data_in_flight: usize,
+    /// The flush, allocated with the queue, while not in flight (Linux
+    /// fq->flush_rq)
+    flush: Option<Box<Bio>>,
+}
+
+impl FlushQueue {
+    fn new() -> Self {
+        Self(IrqSpinlock::new(FqState {
+            pending: BioList::new(),
+            since: 0,
+            running: BioList::new(),
+            data_in_flight: 0,
+            flush: Some(Bio::new(BioOp::Flush, 0)),
+        }))
+    }
+}
+
+/// One flush queue per hardware queue (one for a bio-based queue)
+fn flush_queues(n: usize) -> Vec<FlushQueue> {
+    (0..n.max(1)).map(|_| FlushQueue::new()).collect()
+}
+
+impl FqState {
+    /// The flush to send, if one should go now (Linux blk_kick_flush):
+    /// none in flight (C1), writes waiting, and no FUA data in flight
+    /// that it could also serve (C2) unless the oldest waited too long
+    /// (C3). Its writes move to `running`; the flush carries its flush
+    /// queue and `q`, the queue that owns it
+    fn kick(&mut self, fq: &FlushQueue, q: usize) -> Option<Box<Bio>> {
+        if self.flush.is_none() || self.pending.is_empty() {
+            return None;
+        }
+        if self.data_in_flight > 0
+            && crate::time::monotonic_ns().saturating_sub(self.since) < FLUSH_PENDING_TIMEOUT_NS
+        {
+            return None;
+        }
+        self.running = core::mem::take(&mut self.pending);
+        let mut f = self.flush.take()?;
+        f.status = Ok(());
+        f.end_io = Some(fq_flush_done);
+        f.private = core::ptr::from_ref(fq) as usize;
+        f.plug_q = q;
+        Some(f)
+    }
+}
+
+/// Send a flush `kick` picked (no flush queue lock held)
+fn send_flush(f: Option<Box<Bio>>) {
+    if let Some(f) = f {
+        // SAFETY: `kick` took `plug_q` from a write's live queue, whose
+        // disk outlives the bios submitted to it, this flush's writes
+        // among them
+        let q = unsafe { &*(f.plug_q as *const RequestQueue) };
+        // A blk-mq dispatch only takes IRQ-safe queue locks: fine in
+        // hardirq
+        q.dispatch(f);
+    }
+}
+
+impl RequestQueue {
+    /// A FUA write on a cache without FUA: the write, then a flush it
+    /// shares with the writes done meanwhile, then the owner's
+    /// completion with the first error (Linux blk-flush.c: REQ_FSEQ_DATA
+    /// | REQ_FSEQ_POSTFLUSH through the submitting CPU's hctx flush
+    /// queue). The sequence is allocated here, in the submitter's
+    /// context, so completions allocate nothing.
+    fn postflush(&self, mut bio: Box<Bio>) {
+        let h = self
+            .mq()
+            .map_or(0, BlkMq::this_hctx)
+            .min(self.fqs.len() - 1);
+        let seq = box_nofail(FlushSeq {
+            end_io: bio.end_io.take(),
+            private: bio.private,
+            q: core::ptr::from_ref(self) as usize,
+            h,
+        });
+        bio.end_io = Some(flushseq_data_done);
+        bio.private = Box::into_raw(seq) as usize;
+        self.fqs[h].0.lock().data_in_flight += 1;
+        self.dispatch(bio);
+    }
+}
+
+/// A FUA write's sequence, owned by the write until it ends
+struct FlushSeq {
+    /// The write's own completion, restored before it runs
+    end_io: Option<EndIo>,
+    private: usize,
+    /// Address of its queue (which outlives it) and its flush queue
+    /// there
+    q: usize,
+    h: usize,
+}
+
+/// The data of a post-flush write is done (any context): a failed write
+/// ends now, a good one waits for the next flush (Linux
+/// mq_flush_data_end_io, blk_flush_complete_seq)
+fn flushseq_data_done(bio: Box<Bio>) {
+    // SAFETY: `postflush` made `private` a leaked FlushSeq, owned by this
+    // write until it ends
+    let (q, h) = unsafe {
+        let seq = &*(bio.private as *const FlushSeq);
+        (seq.q, seq.h)
+    };
+    // SAFETY: the queue outlives its bios (FlushSeq.q)
+    let rq = unsafe { &*(q as *const RequestQueue) };
+    let fq = &rq.fqs[h];
+    let failed = bio.status.is_err();
+    let (f, bio) = {
+        let mut st = fq.0.lock();
+        st.data_in_flight -= 1;
+        let bio = if failed {
+            Some(bio)
+        } else {
+            if st.pending.is_empty() {
+                st.since = crate::time::monotonic_ns();
+            }
+            st.pending.push(bio);
+            None
+        };
+        (st.kick(fq, q), bio)
+    };
+    send_flush(f);
+    if let Some(bio) = bio {
+        flushseq_end(bio);
+    }
+}
+
+/// A shared flush is done (any context): the writes it served end, with
+/// its error if any, and the next goes out if writes wait (Linux
+/// flush_end_io)
+fn fq_flush_done(f: Box<Bio>) {
+    // SAFETY: `kick` made `private` the flush queue, in its queue
+    let fq = unsafe { &*(f.private as *const FlushQueue) };
+    let (status, q) = (f.status, f.plug_q);
+    let (mut done, next) = {
+        let mut st = fq.0.lock();
+        st.flush = Some(f);
+        let done = core::mem::take(&mut st.running);
+        (done, st.kick(fq, q))
+    };
+    send_flush(next);
+    while let Some(mut bio) = done.pop() {
+        bio.status = status;
+        flushseq_end(bio);
+    }
+}
+
+/// Give the write its own completion back and run it
+fn flushseq_end(mut bio: Box<Bio>) {
+    // SAFETY: `postflush` made `private` the leaked sequence, which ends
+    // with the write here
+    let seq = unsafe { Box::from_raw(bio.private as *mut FlushSeq) };
+    bio.end_io = seq.end_io;
+    bio.private = seq.private;
+    bio_endio(bio);
 }
 
 // ============================================================================
@@ -499,6 +929,16 @@ impl BlockDevice {
 
     pub fn physical_block_size(&self) -> u32 {
         self.disk.queue.limits.physical_block_size
+    }
+
+    /// Linux bdev_dma_alignment
+    pub fn dma_alignment(&self) -> u32 {
+        self.disk.queue.limits.dma_alignment
+    }
+
+    /// Linux bdev_io_min
+    pub fn io_min(&self) -> u32 {
+        self.disk.queue.limits.io_min()
     }
 
     pub fn ro(&self) -> bool {
@@ -667,7 +1107,8 @@ pub(super) fn disk_release(disk: &Disk) {
 // ============================================================================
 
 /// Submit `bio` for `bdev` (Linux submit_bio): checked against the end
-/// of the device, remapped to the disk; completes through `end_io`
+/// of the device, remapped to the disk; completes through `end_io`. The
+/// caller keeps `bdev` (so its disk and queue) until then.
 pub fn submit_bio(bdev: &BlockDevice, mut bio: Box<Bio>) {
     // A removed disk's I/O fails with EIO (Linux bio_queue_enter on a
     // dead disk: bio_io_error)
@@ -973,6 +1414,141 @@ mod tests {
         assert_eq!(l.pop().unwrap().sector, 7);
         assert_eq!(l.pop().unwrap().sector, 8);
         assert!(l.pop().is_none());
+    }
+
+    /// A bio-based driver that logs each bio's operation and flags, and
+    /// fails the ones in `fail`
+    struct LogDrv {
+        log: Mutex<Vec<(BioOp, BioFlags)>>,
+        fail: Vec<BioOp>,
+    }
+
+    impl BlockDriver for LogDrv {
+        fn submit_bio(&self, mut bio: Box<Bio>) {
+            self.log.lock().push((bio.op, bio.flags));
+            if self.fail.contains(&bio.op) {
+                bio.status = Err(KernelError::Io);
+            }
+            bio_endio(bio);
+        }
+    }
+
+    /// The owner's view of a completion: (calls, last status)
+    static DONE: Mutex<(u32, Option<Result<(), KernelError>>)> = Mutex::new((0, None));
+
+    fn owner_done(bio: Box<Bio>) {
+        assert_eq!(bio.private, 77);
+        let mut d = DONE.lock();
+        d.0 += 1;
+        d.1 = Some(bio.status);
+    }
+
+    /// One FUA write through a queue: what the driver saw and what the
+    /// owner got
+    fn fua_write(
+        write_cache: bool,
+        fail: Vec<BioOp>,
+    ) -> (
+        Vec<(BioOp, BioFlags)>,
+        (u32, Option<Result<(), KernelError>>),
+    ) {
+        let drv = Arc::new(LogDrv {
+            log: Mutex::new(Vec::new()),
+            fail,
+        });
+        let q = RequestQueue::new_bio(drv.clone(), QueueLimits::default(), write_cache);
+        *DONE.lock() = (0, None);
+        let mut b = Bio::new(BioOp::Write, 8);
+        b.flags = BioFlags::FUA;
+        b.end_io = Some(owner_done);
+        b.private = 77;
+        q.submit(b);
+        let log = drv.log.lock().clone();
+        (log, *DONE.lock())
+    }
+
+    #[test]
+    fn fua_becomes_postflush() {
+        let w = (BioOp::Write, BioFlags::empty());
+        let f = (BioOp::Flush, BioFlags::empty());
+        // A cache without FUA: the write, then a flush, then the owner
+        let (log, done) = fua_write(true, Vec::new());
+        assert_eq!(log, [w, f]);
+        assert_eq!(done, (1, Some(Ok(()))));
+        // No cache: FUA means nothing
+        let (log, done) = fua_write(false, Vec::new());
+        assert_eq!(log, [w]);
+        assert_eq!(done, (1, Some(Ok(()))));
+        // A failed write is not flushed; a failed flush fails the write
+        let (log, done) = fua_write(true, alloc::vec![BioOp::Write]);
+        assert_eq!(log, [w]);
+        assert_eq!(done, (1, Some(Err(KernelError::Io))));
+        let (log, done) = fua_write(true, alloc::vec![BioOp::Flush]);
+        assert_eq!(log, [w, f]);
+        assert_eq!(done, (1, Some(Err(KernelError::Io))));
+    }
+
+    /// A bio-based driver that logs each bio and holds it for the test
+    /// to end
+    struct HoldDrv {
+        held: Mutex<Vec<Box<Bio>>>,
+        log: Mutex<Vec<BioOp>>,
+    }
+
+    impl BlockDriver for HoldDrv {
+        fn submit_bio(&self, bio: Box<Bio>) {
+            self.log.lock().push(bio.op);
+            self.held.lock().push(bio);
+        }
+    }
+
+    static OWNED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+    fn owner_seen(bio: Box<Bio>) {
+        assert!(bio.status.is_ok());
+        OWNED.lock().push(bio.sector);
+    }
+
+    #[test]
+    fn postflushes_coalesce() {
+        let drv = Arc::new(HoldDrv {
+            held: Mutex::new(Vec::new()),
+            log: Mutex::new(Vec::new()),
+        });
+        let q = RequestQueue::new_bio(drv.clone(), QueueLimits::default(), true);
+        let write = |sector| {
+            let mut b = Bio::new(BioOp::Write, sector);
+            b.flags = BioFlags::FUA;
+            b.end_io = Some(owner_seen);
+            q.submit(b);
+        };
+        // End the held bio for `sector` (a flush is at sector 0)
+        let end = |sector: u64| {
+            let b = {
+                let mut h = drv.held.lock();
+                let i = h.iter().position(|b| b.sector == sector).unwrap();
+                h.remove(i)
+            };
+            bio_endio(b);
+        };
+        let (w, f) = (BioOp::Write, BioOp::Flush);
+        write(8);
+        write(16);
+        end(8);
+        // 16's data is in flight: 8 waits to share its flush
+        assert_eq!(*drv.log.lock(), [w, w]);
+        end(16);
+        assert_eq!(*drv.log.lock(), [w, w, f]);
+        // One flush at a time: 24 waits for the next
+        write(24);
+        end(24);
+        assert_eq!(*drv.log.lock(), [w, w, f, w]);
+        end(0);
+        assert_eq!(*OWNED.lock(), [8, 16]);
+        assert_eq!(*drv.log.lock(), [w, w, f, w, f]);
+        end(0);
+        assert_eq!(*OWNED.lock(), [8, 16, 24]);
+        assert!(drv.held.lock().is_empty());
     }
 
     #[test]

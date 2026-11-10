@@ -99,6 +99,12 @@ pub enum Sys {
     Ioctl,
     IoprioGet,
     IoprioSet,
+    IoCancel,
+    IoDestroy,
+    IoGetevents,
+    IoPgetevents,
+    IoSetup,
+    IoSubmit,
     IoUringEnter,
     IoUringRegister,
     IoUringSetup,
@@ -117,6 +123,7 @@ pub enum Sys {
     Madvise,
     Mbind,
     Membarrier,
+    MemfdCreate,
     MigratePages,
     Mincore,
     Mkdirat,
@@ -146,6 +153,7 @@ pub enum Sys {
     Nanosleep,
     Newfstatat,
     Openat,
+    Openat2,
     PerfEventOpen,
     Personality,
     PidfdGetfd,
@@ -651,6 +659,18 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::io::io_uring::sys_io_uring_register(a[0] as u32, a[1] as u32, a[2], a[3] as u32)
                 .ret() as u64
         }
+        Sys::IoSetup => crate::io::aio::sys_io_setup(a[0] as u32, UserPtr::new(a[1])).ret() as u64,
+        Sys::IoDestroy => crate::io::aio::sys_io_destroy(a[0]).ret() as u64,
+        Sys::IoSubmit => crate::io::aio::sys_io_submit(a[0], a[1] as i64, a[2]).ret() as u64,
+        Sys::IoCancel => crate::io::aio::sys_io_cancel(a[0], a[1], a[2]).ret() as u64,
+        Sys::IoGetevents => {
+            crate::io::aio::sys_io_getevents(a[0], a[1] as i64, a[2] as i64, a[3], a[4]).ret()
+                as u64
+        }
+        Sys::IoPgetevents => {
+            crate::io::aio::sys_io_pgetevents(a[0], a[1] as i64, a[2] as i64, a[3], a[4], a[5])
+                .ret() as u64
+        }
         Sys::IoUringSetup => {
             crate::io::io_uring::sys_io_uring_setup(a[0] as u32, UserPtr::new(a[1])).ret() as u64
         }
@@ -714,6 +734,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Membarrier => {
             crate::task::membarrier::sys_membarrier(a[0] as i32, a[1] as u32, a[2] as i32).ret()
                 as u64
+        }
+        Sys::MemfdCreate => {
+            crate::mm::memfd::sys_memfd_create(UserPtr::new(a[0]), a[1] as u32).ret() as u64
         }
         Sys::MigratePages => crate::mm::mempolicy::sys_migrate_pages(
             i64::from(a[0] as i32),
@@ -828,6 +851,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[3] as u32,
         )
         .ret() as u64,
+        Sys::Openat2 => {
+            crate::fs::syscall::sys_openat2(a[0] as i32, UserPtr::new(a[1]), a[2], a[3] as usize)
+                .ret() as u64
+        }
         Sys::PerfEventOpen => KernelError::OperationNotSupported.sysret() as u64,
         Sys::Personality => crate::task::syscall::sys_personality(a[0] as u32).ret() as u64,
         Sys::PidfdGetfd => {

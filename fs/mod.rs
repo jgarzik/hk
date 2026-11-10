@@ -40,26 +40,21 @@ pub mod perm;
 #[path = "poll.rs"]
 pub mod pollsys;
 pub mod posix_lock;
+pub mod pseudo;
 pub mod stat;
 pub mod sync;
 
 // Filesystem implementations
-pub mod cgroupfs;
-pub mod cpio;
-pub mod devtmpfs;
 pub mod kernfs;
 pub mod nullfs;
 pub mod proc;
 pub mod ramfs;
-pub mod sysfs;
 pub mod vfat;
 
 // Re-exports for convenience
 pub use crate::util::error::KernelError;
 use crate::util::error::KernelResult;
 pub use blkdev_ops::BLOCK_FILE_OPS;
-pub use cgroupfs::{CGROUPFS_FILE_OPS, CGROUPFS_TYPE};
-pub use cpio::unpack_cpio;
 pub use dac::{MAY_EXEC, MAY_READ, MAY_WRITE};
 pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, RwFlags, flags, seek};
@@ -71,8 +66,8 @@ pub use path_ref::Path;
 pub use proc::{NamespaceType, PROCFS_FILE_OPS, PROCFS_TYPE, ProcfsInodeData, ProcfsInodeWrapper};
 pub use ramfs::{
     RAMFS_FILE_OPS, RAMFS_INODE_OPS, RAMFS_TYPE, RamfsInodeData, ramfs_create_blkdev,
-    ramfs_create_chrdev, ramfs_create_dir, ramfs_create_dir_with_owner,
-    ramfs_create_dir_with_timestamp, ramfs_create_file_with_timestamp, ramfs_mkpath_with_timestamp,
+    ramfs_create_chrdev, ramfs_create_dir, ramfs_create_dir_with_timestamp,
+    ramfs_create_file_with_timestamp, ramfs_mkpath_with_timestamp,
 };
 pub use superblock::{
     FileSystemType, LinuxStatFs, MSDOS_SUPER_MAGIC, PROC_SUPER_MAGIC, RAMFS_MAGIC, StatFs,

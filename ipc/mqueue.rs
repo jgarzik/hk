@@ -612,7 +612,7 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> KernelRe
     }
 
     let private = try_arc(MqFile { queue, access_mode })?;
-    try_arc(File::new_anon(dentry, file_flags, &MQ_FOPS, private))
+    try_arc(File::new_anon(dentry, None, file_flags, &MQ_FOPS, private))
 }
 
 // ============================================================================

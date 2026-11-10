@@ -283,7 +283,7 @@ impl Scm {
         for c in data[..n * 4].as_chunks::<4>().0 {
             let fd = i32::from_ne_bytes(*c);
             let f = table.lock().get(fd).ok_or(KernelError::BadFd)?;
-            if f.f_op.as_any().is::<crate::io::io_uring::IoUringFileOps>() {
+            if crate::io::io_uring::is_uring(&f) {
                 return Err(KernelError::InvalidArgument);
             }
             fpl.files.push(f);

@@ -498,25 +498,37 @@ pub mod ss_flags {
     pub const SS_FLAG_BITS: i32 = SS_AUTODISARM;
 }
 
-/// Minimum signal stack size (MINSIGSTKSZ on Linux)
-pub const MINSIGSTKSZ: usize = 2048;
+/// User `stack_t` (sigaltstack, ucontext uc_stack)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UserStack {
+    pub ss_sp: u64,
+    pub ss_flags: i32,
+    pub _pad: i32,
+    pub ss_size: u64,
+}
+crate::pod!(UserStack {
+    ss_sp,
+    ss_flags,
+    _pad,
+    ss_size
+});
+const _: () = assert!(core::mem::size_of::<UserStack>() == 24);
 
-/// Default signal stack size (SIGSTKSZ on Linux)
-pub const SIGSTKSZ: usize = 8192;
-
-/// Alternate signal stack state
-#[derive(Clone, Debug)]
+/// Alternate signal stack state (Linux task sas_ss_sp, sas_ss_size,
+/// sas_ss_flags)
+#[derive(Clone, Copy, Debug)]
 pub struct AltStack {
     /// Stack pointer (base address)
     pub ss_sp: u64,
-    /// Stack size
+    /// Stack size (0: none)
     pub ss_size: usize,
-    /// Flags (SS_DISABLE, SS_AUTODISARM, etc.)
+    /// The flags it was set with (mode word and SS_AUTODISARM)
     pub ss_flags: i32,
 }
 
 impl AltStack {
-    /// Create new disabled alternate stack
+    /// None (Linux sas_ss_reset)
     pub const fn new() -> Self {
         Self {
             ss_sp: 0,
@@ -525,9 +537,54 @@ impl AltStack {
         }
     }
 
-    /// Check if alternate stack is enabled
-    pub fn is_enabled(&self) -> bool {
-        self.ss_flags & ss_flags::SS_DISABLE == 0
+    /// `sp` lies on it (Linux __on_sig_stack; the stack grows down)
+    pub fn contains(&self, sp: u64) -> bool {
+        sp > self.ss_sp && sp - self.ss_sp <= self.ss_size as u64
+    }
+
+    /// A thread at `sp` runs on it (Linux on_sig_stack): never with
+    /// SS_AUTODISARM, which disarmed it on entry
+    pub fn on(&self, sp: u64) -> bool {
+        self.ss_flags & ss_flags::SS_AUTODISARM == 0 && self.contains(sp)
+    }
+
+    /// Its state seen from `sp` (Linux sas_ss_flags): SS_DISABLE,
+    /// SS_ONSTACK or 0
+    pub fn flags_at(&self, sp: u64) -> i32 {
+        if self.ss_size == 0 {
+            ss_flags::SS_DISABLE
+        } else if self.on(sp) {
+            ss_flags::SS_ONSTACK
+        } else {
+            0
+        }
+    }
+
+    /// Its top, where a handler's frame starts
+    pub fn top(&self) -> u64 {
+        self.ss_sp.wrapping_add(self.ss_size as u64)
+    }
+
+    /// The stack a handler with `sa_flags` starts on, interrupting `sp`
+    /// (Linux sigsp), and whether that enters this one: its top for
+    /// SA_ONSTACK unless it is absent or already in use
+    pub fn sigsp(&self, sp: u64, sa_flags: u64) -> (u64, bool) {
+        if sa_flags & sa_flags::SA_ONSTACK != 0 && self.flags_at(sp) == 0 {
+            (self.top(), true)
+        } else {
+            (sp, false)
+        }
+    }
+
+    /// Its `uc_stack` in a handler frame (Linux __save_altstack: the
+    /// stored flags, not whether the handler runs on it)
+    pub fn save(&self) -> UserStack {
+        UserStack {
+            ss_sp: self.ss_sp,
+            ss_flags: self.ss_flags,
+            _pad: 0,
+            ss_size: self.ss_size as u64,
+        }
     }
 }
 
@@ -820,11 +877,16 @@ pub struct ForkSignal {
 ///
 /// If `clear_sighand` is true (CLONE_CLEAR_SIGHAND), reset all handlers to default
 /// after cloning (except SIG_IGN handlers which are preserved).
+///
+/// The child inherits the alternate stack unless `reset_sas` (Linux
+/// copy_process: a CLONE_VM child without CLONE_VFORK runs on the same
+/// memory at once, so it starts without one).
 pub fn fork_signal(
     parent: &Task,
     share_sighand: bool,
     share_pending: bool,
     clear_sighand: bool,
+    reset_sas: bool,
 ) -> Result<(TaskSignalState, ForkSignal), KernelError> {
     // Get parent's sighand and signal_state
     // The parent's blocked mask and shared set (no queued info is
@@ -836,7 +898,7 @@ pub fn fork_signal(
             parent.and_then(|p| p.sighand().cloned()),
             parent.map(|p| {
                 let s = p.task.sig.lock();
-                (s.blocked, s.trap)
+                (s.blocked, s.trap, s.altstack)
             }),
         )
     };
@@ -869,12 +931,12 @@ pub fn fork_signal(
     // Clone per-task signal state
     let shared_pending = SharedPending(Some(signal.clone()));
     let child_state = match parent_state {
-        Some((blocked, trap)) => TaskSignalState {
+        Some((blocked, trap, altstack)) => TaskSignalState {
             blocked, // Inherit blocked mask
             saved_sigmask: SigSet::EMPTY,
             pending: SigPending::new(), // Fresh private pending
             shared_pending,
-            altstack: AltStack::new(), // Child starts with no altstack
+            altstack: if reset_sas { AltStack::new() } else { altstack },
             real_blocked: SigSet::EMPTY,
             // The thread struct is copied (Linux arch_dup_task_struct)
             trap,
@@ -961,7 +1023,8 @@ pub fn exit_task_signal(t: &Task) {
 /// a handler table shared with another process (CLONE_SIGHAND) is
 /// copied first (unshare_sighand: ENOMEM), then caught signals go back
 /// to SIG_DFL (flush_signal_handlers; ignored ones stay ignored), the
-/// alternate stack is forgotten (sas_ss_sp = 0), and the process's
+/// alternate stack is forgotten (sas_ss_sp and sas_ss_size 0, its
+/// flags kept), and the process's
 /// timer_create timers are deleted with their queued signals
 /// (posixtimer_exec). Blocked and pending signals stay. The caller is
 /// its process's only thread (after de_thread).
@@ -995,7 +1058,13 @@ pub fn exec_signals() -> Result<(), KernelError> {
         crate::time::posix_timer::exec_timers(&sig);
     }
     let _gone = with_task_signal_state(&me, |s| {
-        s.altstack = AltStack::new();
+        // No stack, its flags kept (Linux begin_new_exec zeroes
+        // sas_ss_sp and sas_ss_size only)
+        s.altstack = AltStack {
+            ss_sp: 0,
+            ss_size: 0,
+            ..s.altstack
+        };
         let shared = s.shared_pending.lock().flush_timers();
         (s.pending.flush_timers(), shared)
     });
@@ -2608,6 +2677,10 @@ pub fn do_signal(regs: &UserFrame) {
     const EINTR: u64 = KernelError::Interrupted.sysret() as u64;
 
     let me = crate::task::percpu::current();
+    // Queued callbacks run before any signal (Linux get_signal)
+    if me.has_tif(crate::task::tif::NOTIFY_SIGNAL) {
+        crate::task::task_work::task_work_run();
+    }
     let err = regs.ret() as i64;
     let restart = syscall_restarting(regs);
     regs.forget_syscall();
@@ -2752,17 +2825,17 @@ fn deliver_to_handler(
     // pre-syscall mask if a temporary one is in effect, else current
     // (Linux sigmask_to_save)
     let restore = me.has_tif(crate::task::tif::RESTORE_SIGMASK);
-    let (frame_mask, trap) = with_task_signal_state(me, |state| {
+    let (frame_mask, trap, alt) = with_task_signal_state(me, |state| {
         let mask = if restore {
             state.saved_sigmask
         } else {
             state.blocked
         };
-        (mask, state.trap)
+        (mask, state.trap, state.altstack)
     })
-    .unwrap_or_default();
+    .unwrap_or((SigSet::EMPTY, Trap::NONE, AltStack::new()));
 
-    match signal::setup_rt_frame(sig, action, frame_mask, info, &trap, regs) {
+    match signal::setup_rt_frame(sig, action, frame_mask, info, &trap, &alt, regs) {
         Ok(()) => {
             // The saved mask now lives in the frame (Linux
             // signal_delivered -> clear_restore_sigmask)
@@ -2776,6 +2849,12 @@ fn deliver_to_handler(
                 // SIGKILL/SIGSTOP are never blockable, whatever sa_mask
                 // or the signal is
                 state.blocked = state.blocked.blockable();
+                // SS_AUTODISARM gives the stack up while the handler
+                // runs (Linux signal_delivered -> sas_ss_reset);
+                // rt_sigreturn reinstalls it from uc_stack
+                if state.altstack.ss_flags & ss_flags::SS_AUTODISARM != 0 {
+                    state.altstack = AltStack::new();
+                }
             });
             true
         }

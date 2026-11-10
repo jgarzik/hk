@@ -63,30 +63,12 @@ fn hidepid(v: &[u8]) -> Option<u8> {
     }
 }
 
-/// Linux vfs_parse_sb_flag: generic words every filesystem takes (their
-/// effect comes from mount(2)'s flags)
-fn sb_flag_word(w: &[u8]) -> bool {
-    matches!(
-        w,
-        b"ro"
-            | b"rw"
-            | b"sync"
-            | b"async"
-            | b"dirsync"
-            | b"lazytime"
-            | b"nolazytime"
-            | b"mand"
-            | b"nomand"
-            | b"posixacl"
-    )
-}
-
 /// Parse a comma-separated options string: EINVAL for an unknown
 /// option or a bad value (Linux proc_parse_param, "Unknown parameter")
 fn parse(data: &[u8]) -> Result<Parsed, KernelError> {
     let mut p = Parsed::default();
     for opt in data.split(|&c| c == b',').filter(|o| !o.is_empty()) {
-        if sb_flag_word(opt) {
+        if crate::fs::superblock::sb_flag_word(opt) {
             continue;
         }
         let (k, v) = match opt.iter().position(|&c| c == b'=') {

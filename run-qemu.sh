@@ -240,6 +240,11 @@ setup_arm_config() {
         -initrd "$INITRAMFS"
         -nographic
     )
+    # Extra kernel parameters (make BENCH=1 / HK_CMDLINE); x86 takes
+    # them from the ISO's grub.cfg
+    if [ -n "${HK_CMDLINE// /}" ]; then
+        QEMU_ARGS+=(-append "$HK_CMDLINE")
+    fi
 
     # Serial configuration (test vs interactive)
     if [ "$TEST_MODE" = true ]; then

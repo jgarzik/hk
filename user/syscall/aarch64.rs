@@ -353,6 +353,7 @@ pub const SYS_PSELECT6: u64 = 72;
 pub const SYS_BRK: u64 = 214;
 pub const SYS_MUNMAP: u64 = 215;
 pub const SYS_MMAP: u64 = 222;
+pub const SYS_MEMFD_CREATE: u64 = 279;
 pub const SYS_MPROTECT: u64 = 226;
 pub const SYS_MLOCK: u64 = 228;
 pub const SYS_MUNLOCK: u64 = 229;
@@ -494,6 +495,14 @@ pub fn sys_read(fd: u64, buf: *mut u8, len: u64) -> i64 {
 #[inline(always)]
 pub fn sys_openat(dirfd: i32, path: *const u8, flags: u32, mode: u32) -> i64 {
     unsafe { syscall4!(SYS_OPENAT, dirfd, path, flags, mode) }
+}
+
+pub const SYS_OPENAT2: u64 = 437;
+
+/// openat2(dirfd, path, how, size)
+#[inline(always)]
+pub fn sys_openat2(dirfd: i32, path: *const u8, how: *const u8, size: usize) -> i64 {
+    unsafe { syscall4!(SYS_OPENAT2, dirfd, path, how, size) }
 }
 
 /// open(path, flags, mode) - compatibility wrapper using openat with AT_FDCWD
@@ -1568,6 +1577,11 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
 }
 
 /// mprotect(addr, len, prot) - change memory protection
+#[inline(always)]
+pub fn sys_memfd_create(name: *const u8, flags: u32) -> i64 {
+    unsafe { syscall2!(SYS_MEMFD_CREATE, name, flags) }
+}
+
 #[inline(always)]
 pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     unsafe { syscall3!(SYS_MPROTECT, addr, len, prot) }
@@ -3108,4 +3122,49 @@ pub const SYS_SCHED_YIELD: u64 = 124;
 #[inline(always)]
 pub fn sys_sched_yield() -> i64 {
     unsafe { syscall0!(SYS_SCHED_YIELD) }
+}
+
+// Linux native AIO (fs/aio.c)
+pub const SYS_IO_SETUP: u64 = 0;
+pub const SYS_IO_DESTROY: u64 = 1;
+pub const SYS_IO_GETEVENTS: u64 = 4;
+pub const SYS_IO_SUBMIT: u64 = 2;
+pub const SYS_IO_CANCEL: u64 = 3;
+pub const SYS_IO_PGETEVENTS: u64 = 292;
+
+/// io_setup(nr_events, ctxp)
+pub fn sys_io_setup(nr_events: u32, ctxp: *mut u64) -> i64 {
+    unsafe { syscall2!(SYS_IO_SETUP, nr_events, ctxp) }
+}
+
+/// io_destroy(ctx)
+pub fn sys_io_destroy(ctx: u64) -> i64 {
+    unsafe { syscall1!(SYS_IO_DESTROY, ctx) }
+}
+
+/// io_submit(ctx, nr, iocbpp)
+pub fn sys_io_submit(ctx: u64, nr: i64, iocbpp: *const u64) -> i64 {
+    unsafe { syscall3!(SYS_IO_SUBMIT, ctx, nr, iocbpp) }
+}
+
+/// io_cancel(ctx, iocb, result)
+pub fn sys_io_cancel(ctx: u64, iocb: u64, result: u64) -> i64 {
+    unsafe { syscall3!(SYS_IO_CANCEL, ctx, iocb, result) }
+}
+
+/// io_getevents(ctx, min_nr, nr, events, timeout)
+pub fn sys_io_getevents(ctx: u64, min_nr: i64, nr: i64, events: u64, timeout: u64) -> i64 {
+    unsafe { syscall5!(SYS_IO_GETEVENTS, ctx, min_nr, nr, events, timeout) }
+}
+
+/// io_pgetevents(ctx, min_nr, nr, events, timeout, usig)
+pub fn sys_io_pgetevents(
+    ctx: u64,
+    min_nr: i64,
+    nr: i64,
+    events: u64,
+    timeout: u64,
+    usig: u64,
+) -> i64 {
+    unsafe { syscall6!(SYS_IO_PGETEVENTS, ctx, min_nr, nr, events, timeout, usig) }
 }

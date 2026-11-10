@@ -5,7 +5,9 @@
 #![no_std]
 #![no_main]
 
+pub mod aio;
 pub mod arch;
+pub mod blk;
 pub mod exec;
 pub mod fs;
 pub mod harness;
@@ -18,6 +20,7 @@ pub mod proc;
 pub mod process;
 pub mod signal;
 pub mod time;
+pub mod uring;
 
 use core::ffi::c_void;
 use core::panic::PanicInfo;
@@ -252,6 +255,12 @@ pub fn run_all_tests() {
     fs::fs_ops::run_tests();
     fs::rename2::run_tests();
     fs::linkat::run_tests();
+    fs::open_flags::run_tests();
+    fs::o_path::run_tests();
+    fs::openat2::run_tests();
+    fs::resolve::run_tests();
+    fs::emptypath::run_tests();
+    fs::reopen::run_tests();
     fs::permissions::run_tests();
     fs::dac::run_tests();
     fs::sync::run_tests();
@@ -266,6 +275,7 @@ pub fn run_all_tests() {
     proc::kmsg::run_tests();
     process::groups::run_tests();
     fs::fifo::run_tests();
+    io::pipe_packet::run_tests();
     fs::splice::run_tests();
     fs::deep_chain::run_tests();
     fs::anon_inode::run_tests();
@@ -278,8 +288,11 @@ pub fn run_all_tests() {
     arch::fpu::run_tests();
     process::preempt::run_tests();
     signal::fault_signals::run_tests();
+    isolated(b"SIGALTSTACK", signal::sigaltstack::run_tests);
     ipc::ipc::run_tests();
+    ipc::shm_info::run_tests();
     mm::mmap::run_tests();
+    mm::memfd::run_tests();
     isolated(b"MM_LIFE", mm::mm_life::run_tests);
     isolated(b"MM_OOM", mm::mm_oom::run_tests);
     isolated(b"FAULT_INJECT", io::fault_inject::run_tests);
@@ -321,6 +334,7 @@ pub fn run_all_tests() {
     fs::attr_race::run_tests();
     process::caps_checks::run_tests();
     fs::mount_race::run_tests();
+    fs::tmpfs::run_tests();
     time::timerfd::run_tests();
     time::posix_timer::run_tests();
     fs::xattr::run_tests();
@@ -338,7 +352,18 @@ pub fn run_all_tests() {
     process::pidfd::run_tests();
     process::pidfd_thread::run_tests();
     mm::swap::run_tests();
-    isolated(b"BLK", fs::blk::run_tests);
+    isolated(b"BLK", blk::disk::run_tests);
+    blk::odirect::run_tests();
+    blk::dioalign::run_tests();
+    blk::dsync::run_tests();
+    blk::dio_pin::run_tests();
+    blk::dio_alias::run_tests();
+    blk::dio::run_tests();
+    blk::vfat_dio::run_tests();
+    blk::mmap_dirty::run_tests();
+    blk::dio_nowait::run_tests();
+    blk::writeback::run_tests();
+    blk::dio_bench::run_tests();
     isolated(b"SWAPOUT", mm::swapout::run_tests);
     time::adjtimex::run_tests();
     isolated(b"SETTIME", time::settime::run_tests);
@@ -348,7 +373,8 @@ pub fn run_all_tests() {
     io::errno_pass::run_tests();
     isolated(b"CPU_ACCT", proc::cpu_acct::run_tests);
     isolated(b"CPU_TIMERS", time::cpu_timers::run_tests);
-    io::io_uring::run_tests();
+    uring::run_tests();
+    aio::run_tests();
     net::tcp::run_tests();
     isolated(b"MEMCORE", mm::memcore::run_tests);
     isolated(b"MMLOCK", mm::mmlock::run_tests);
@@ -393,6 +419,7 @@ pub fn run_all_tests() {
     signal::ptrace_stop::run_tests();
     signal::ptrace_exit::run_tests();
     process::wake_storm::run_tests();
+    process::lock_fair::run_tests();
     io::enomem::run_tests();
     io::uaccess::run_tests();
     isolated(b"BUSYBOX", exec::busybox::run_tests);

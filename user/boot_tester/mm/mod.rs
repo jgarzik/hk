@@ -6,6 +6,7 @@ pub mod frag;
 pub mod layout;
 pub mod mapcount;
 pub mod memcore;
+pub mod memfd;
 pub mod mempolicy;
 pub mod mm_life;
 pub mod mm_oom;

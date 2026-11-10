@@ -8,6 +8,7 @@ pub mod groups;
 pub mod init_args;
 pub mod init_signals;
 pub mod kcmp;
+pub mod lock_fair;
 pub mod namespace;
 pub mod nproc;
 pub mod pgrp_links;

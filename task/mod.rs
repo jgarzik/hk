@@ -8,6 +8,8 @@ pub mod kcmp;
 pub mod membarrier;
 pub mod pidfd;
 pub(crate) mod rlimit;
+pub mod task_work;
+pub mod wake_q;
 pub mod workqueue;
 
 pub mod exec;
@@ -386,6 +388,9 @@ pub const PRIORITY_IDLE: Priority = 0;
 pub const PRIORITY_LOW: Priority = 64;
 /// Normal priority for regular tasks
 pub const PRIORITY_NORMAL: Priority = 128;
+/// SCHED_NORMAL at nice -20: a kernel thread that must run before
+/// ordinary ones (Linux the workqueue highpri pools, WQ_HIGHPRI)
+pub const PRIORITY_NICE_MIN: Priority = 160;
 /// High priority for important tasks
 pub const PRIORITY_HIGH: Priority = 192;
 /// Realtime priority - preempts everything else
@@ -892,6 +897,9 @@ pub mod pf {
     pub const FORKNOEXEC: u32 = 0x0000_0040;
     /// Kernel thread (Linux PF_KTHREAD)
     pub const KTHREAD: u32 = 0x0020_0000;
+    /// An io thread (`create_io_thread`, Linux PF_IO_WORKER): a thread of
+    /// a user process that never returns to user mode; no ptrace attach
+    pub const IO_WORKER: u32 = 0x0000_0010;
     /// Used a capability (Linux PF_SUPERPRIV, set by ns_capable_common;
     /// not inherited by fork): the process accounting ASU flag
     pub const SUPERPRIV: u32 = 0x0000_0100;
@@ -899,6 +907,12 @@ pub mod pf {
     /// PF_NO_SETAFFINITY): every hk kernel thread is bound to its CPU
     pub const NO_SETAFFINITY: u32 = 0x0400_0000;
 }
+
+/// An io thread's function and its argument (`percpu::create_io_thread`)
+pub type IoThreadFn = (
+    fn(Arc<dyn core::any::Any + Send + Sync>),
+    Arc<dyn core::any::Any + Send + Sync>,
+);
 
 /// Thread flags (Linux TIF_*, `Task.thread_flags`): work to do on the way
 /// back to user mode, set by anyone, consumed by the task
@@ -919,6 +933,10 @@ pub mod tif {
     /// (Linux SYSCALL_WORK_SYSCALL_TRACE; set and cleared by the tracer
     /// while the task is stopped)
     pub const SYSCALL_TRACE: u32 = 1 << 4;
+    /// Callbacks are queued (`task_work`): run them on the way back
+    /// to user mode; an interruptible sleep ends for it (Linux
+    /// TIF_NOTIFY_SIGNAL)
+    pub const NOTIFY_SIGNAL: u32 = 1 << 5;
 }
 
 /// A task (thread or process; Linux task_struct), shared as
@@ -978,6 +996,9 @@ pub struct Task {
     /// that takes it to 0 fails (`mm::fault_inject`); written by the
     /// task itself through /proc/thread-self/fail-nth
     pub fail_nth: AtomicU32,
+    /// The active block plug (`block::plug`, Linux current->plug):
+    /// set, read and cleared by the task itself only
+    pub plug: AtomicPtr<crate::block::plug::BlkPlug>,
     /// CPU whose network backlog this task last queued a packet to
     /// (`netif_rx`; u32::MAX: none), written by the task itself: its
     /// loopback flush covers that backlog even if it moved since
@@ -1024,14 +1045,31 @@ pub struct Task {
     /// Files `defer_fput` still has to drop while an outer frame of this
     /// task drains (Linux task_work fput); only the task itself uses it
     pub fput_defer: crate::sync::spin::Mutex<Option<Vec<Arc<crate::fs::File>>>>,
+    /// Callbacks queued to run in this task's context (Linux
+    /// task_works; `task_work`)
+    pub task_works: task_work::TaskWorks,
+    /// An io thread's function and argument (`create_io_thread`), set
+    /// before it runs
+    pub io_thread: spin::Once<IoThreadFn>,
+    /// Its io_uring context, made by its first submission (Linux
+    /// task->io_uring)
+    pub io_uring: spin::Once<Arc<crate::io::io_uring::Tctx>>,
     /// The vforking parent's completion until this task execs or exits
     /// (Linux vfork_done): set by the parent before the task runs, taken
     /// once by the task
     pub vfork_done: AtomicPtr<crate::sync::completion::Completion>,
+    /// Next task on the `wake_q::WakeQ` it is queued on (Linux
+    /// task->wake_q): null when on none
+    pub wake_q: AtomicPtr<Task>,
     /// Credentials (Linux task->cred): read lock-free by the task, under
     /// TASKLIST by others; replaced only by the task (commit_creds)
     /// under TASKLIST
     cred: TaskCred,
+    /// Subjective credentials in force over `cred` (Linux task->cred
+    /// when it differs from real_cred: override_creds), null for none;
+    /// the task's own checks use them, others see `cred`. Only the task
+    /// itself reads or writes it.
+    cred_override: CredOverride,
     /// Linux task_lock(p) (p->alloc_lock): guards the cells below. Spin
     /// Mutex, thread context only; order TASKLIST -> pidmap ->
     /// alloc_lock -> `sig`; only memory is freed under it (rule 4: the
@@ -1577,6 +1615,79 @@ impl Drop for TaskCred {
     }
 }
 
+/// A task's override credentials: an `Arc<Cred>` turned raw, or null
+/// (Linux task->cred while override_creds is in force). Only the task
+/// itself touches it, so the atomic is for the type only.
+struct CredOverride(AtomicPtr<Cred>);
+
+impl CredOverride {
+    const fn none() -> Self {
+        Self(AtomicPtr::new(core::ptr::null_mut()))
+    }
+
+    /// Install `p` (from `Arc::into_raw`, or null): the one in force
+    /// before, its count passed to the caller
+    fn swap(&self, p: *mut Cred) -> *mut Cred {
+        self.0.swap(p, Ordering::Relaxed)
+    }
+
+    /// # Safety
+    /// The caller is the task itself.
+    unsafe fn arc(&self) -> Option<Arc<Cred>> {
+        let p = self.0.load(Ordering::Relaxed);
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: `p` came from Arc::into_raw and holds the cell's
+        // count; only this task (the caller) could replace it
+        unsafe {
+            Arc::increment_strong_count(p);
+            Some(Arc::from_raw(p))
+        }
+    }
+}
+
+impl Drop for CredOverride {
+    fn drop(&mut self) {
+        let p = *self.0.get_mut();
+        if !p.is_null() {
+            // SAFETY: the cell's count (an override guard was forgotten)
+            drop(unsafe { Arc::from_raw(p) });
+        }
+    }
+}
+
+/// The current task's override credentials in force (Linux
+/// override_creds): reverted to those before when dropped
+/// (revert_creds). A forgotten guard leaves them in force.
+#[must_use]
+pub struct CredGuard {
+    /// The override before, with its count (null: none)
+    old: *mut Cred,
+}
+
+/// Run the current task's own checks with `c` until the guard drops
+/// (Linux override_creds); its objective credentials, which others see,
+/// stay as they are. Guards nest; the boot task keeps its static root
+/// credentials.
+pub fn override_creds(c: Arc<Cred>) -> CredGuard {
+    let me = percpu::current();
+    CredGuard {
+        old: me.cred_override.swap(Arc::into_raw(c).cast_mut()),
+    }
+}
+
+impl Drop for CredGuard {
+    fn drop(&mut self) {
+        let me = percpu::current();
+        let p = me.cred_override.swap(self.old);
+        if !p.is_null() {
+            // SAFETY: the count `override_creds` installed with it
+            drop(unsafe { Arc::from_raw(p) });
+        }
+    }
+}
+
 /// The initial `alloc_lock` fields of a new task (the resources are
 /// attached after it joins the table, before it first runs)
 pub struct TaskAlloc {
@@ -1750,6 +1861,7 @@ impl Task {
             cpus_mask: crate::util::cpumask::CpuMask::from_set(cpus),
             pagefault_disabled: AtomicU32::new(0),
             fail_nth: AtomicU32::new(0),
+            plug: AtomicPtr::new(core::ptr::null_mut()),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(false),
@@ -1764,8 +1876,13 @@ impl Task {
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
+            task_works: task_work::TaskWorks::new(),
+            io_thread: spin::Once::new(),
+            io_uring: spin::Once::new(),
             vfork_done: AtomicPtr::new(core::ptr::null_mut()),
+            wake_q: AtomicPtr::new(core::ptr::null_mut()),
             cred: TaskCred::new(cred),
+            cred_override: CredOverride::none(),
             alloc_lock: Mutex::new(()),
             mm: OwnCell::new(mm),
             files: OwnCell::new(None),
@@ -1815,6 +1932,7 @@ impl Task {
             cpus_mask: crate::util::cpumask::CpuMask::new(),
             pagefault_disabled: AtomicU32::new(0),
             fail_nth: AtomicU32::new(0),
+            plug: AtomicPtr::new(core::ptr::null_mut()),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(true),
@@ -1829,8 +1947,13 @@ impl Task {
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
+            task_works: task_work::TaskWorks::new(),
+            io_thread: spin::Once::new(),
+            io_uring: spin::Once::new(),
             vfork_done: AtomicPtr::new(core::ptr::null_mut()),
+            wake_q: AtomicPtr::new(core::ptr::null_mut()),
             cred: TaskCred::boot(),
+            cred_override: CredOverride::none(),
             alloc_lock: Mutex::new(()),
             mm: OwnCell::new(None),
             files: OwnCell::new(None),
@@ -1927,6 +2050,33 @@ impl Task {
     pub unsafe fn cred_arc(&self) -> Arc<Cred> {
         // SAFETY: see above
         unsafe { self.cred.arc() }
+    }
+
+    /// The credentials its own checks use: an override in force, else
+    /// its credentials (Linux current_cred vs real_cred)
+    ///
+    /// # Safety
+    /// The caller is the task itself.
+    pub unsafe fn subj_cred_arc(&self) -> Arc<Cred> {
+        // SAFETY: the task itself (see above)
+        match unsafe { self.cred_override.arc() } {
+            Some(c) => c,
+            // SAFETY: as above
+            None => unsafe { self.cred.arc() },
+        }
+    }
+
+    /// As [`Task::subj_cred_arc`], copied
+    ///
+    /// # Safety
+    /// As [`Task::subj_cred_arc`].
+    pub unsafe fn subj_cred(&self) -> Cred {
+        // SAFETY: the task itself (see above)
+        match unsafe { self.cred_override.arc() } {
+            Some(c) => (*c).clone(),
+            // SAFETY: as above
+            None => unsafe { self.cred.get() },
+        }
     }
 
     /// Take its `alloc_lock` (Linux task_lock(p))
@@ -2466,7 +2616,7 @@ pub fn capable(cap: u32) -> bool {
 }
 
 // =============================================================================
-// Per-UID counts (RLIMIT_NPROC, RLIMIT_SIGPENDING)
+// Per-UID counts (RLIMIT_NPROC, RLIMIT_SIGPENDING, locked memory)
 // =============================================================================
 
 /// What a user's count counts (Linux enum ucount_type, the rlimit ones)
@@ -2479,20 +2629,58 @@ pub enum Ucount {
     /// Queued signals (UCOUNT_RLIMIT_SIGPENDING): charged to the
     /// receiver's real uid while queued
     Sigpending,
+    /// Pages pinned for io_uring (Linux user_struct.locked_vm: rings and
+    /// registered buffers), against RLIMIT_MEMLOCK (`locked_vm_charge`)
+    LockedVm,
 }
+
+/// Counts per user
+const NR_UCOUNTS: usize = 3;
 
 /// Each real uid's counts (Linux ucounts, one per user in the initial
 /// user namespace), indexed by `Ucount`: an entry lives while any count
 /// is non-zero, so a user's signals find it made by its tasks
-static UCOUNTS: Mutex<BTreeMap<Uid, [u64; 2]>> = Mutex::new(BTreeMap::new());
+static UCOUNTS: Mutex<BTreeMap<Uid, [u64; NR_UCOUNTS]>> = Mutex::new(BTreeMap::new());
 
 /// Charge one to `uid`'s `kind`; the new count (Linux
 /// inc_rlimit_ucounts)
 pub fn ucount_inc(uid: Uid, kind: Ucount) -> u64 {
     let mut counts = UCOUNTS.lock();
-    let c = &mut counts.entry(uid).or_insert([0; 2])[kind as usize];
+    let c = &mut counts.entry(uid).or_insert([0; NR_UCOUNTS])[kind as usize];
     *c += 1;
     *c
+}
+
+/// Charge `pages` locked pages to `uid` unless that passes `limit`
+/// pages (Linux __io_account_mem against RLIMIT_MEMLOCK): false then
+pub fn locked_vm_charge(uid: Uid, pages: u64, limit: u64) -> bool {
+    let mut counts = UCOUNTS.lock();
+    let e = counts.entry(uid).or_insert([0; NR_UCOUNTS]);
+    let c = &mut e[Ucount::LockedVm as usize];
+    match c.checked_add(pages) {
+        Some(n) if n <= limit => {
+            *c = n;
+            true
+        }
+        _ => {
+            if *e == [0; NR_UCOUNTS] {
+                counts.remove(&uid);
+            }
+            false
+        }
+    }
+}
+
+/// Release `pages` locked pages of `uid` (Linux __io_unaccount_mem)
+pub fn locked_vm_uncharge(uid: Uid, pages: u64) {
+    let mut counts = UCOUNTS.lock();
+    if let Some(c) = counts.get_mut(&uid) {
+        let v = &mut c[Ucount::LockedVm as usize];
+        *v = v.saturating_sub(pages);
+        if *c == [0; NR_UCOUNTS] {
+            counts.remove(&uid);
+        }
+    }
 }
 
 /// Release one of `uid`'s `kind` (Linux dec_rlimit_ucounts)
@@ -2500,7 +2688,7 @@ pub fn ucount_dec(uid: Uid, kind: Ucount) {
     let mut counts = UCOUNTS.lock();
     if let Some(c) = counts.get_mut(&uid) {
         c[kind as usize] = c[kind as usize].saturating_sub(1);
-        if *c == [0; 2] {
+        if *c == [0; NR_UCOUNTS] {
             counts.remove(&uid);
         }
     }
@@ -2619,6 +2807,10 @@ pub const IOPRIO_CLASS_SHIFT: u16 = 13;
 /// Mask for I/O priority data
 pub const IOPRIO_PRIO_MASK: u16 = (1 << IOPRIO_CLASS_SHIFT) - 1;
 
+/// The level bits of a priority's data (Linux IOPRIO_LEVEL_MASK); the
+/// bits above them up to the class are hints
+pub const IOPRIO_LEVEL_MASK: u16 = 7;
+
 /// Default I/O priority (best-effort class, level 4)
 pub const IOPRIO_DEFAULT: IoPrio = ioprio_prio_value(IOPRIO_CLASS_BE, 4);
 
@@ -2640,11 +2832,20 @@ pub const fn ioprio_prio_value(class: u16, data: u16) -> IoPrio {
     ((class & 0x7) << IOPRIO_CLASS_SHIFT) | (data & IOPRIO_PRIO_MASK)
 }
 
-/// Check if an ioprio value is valid
-#[inline]
-pub fn ioprio_valid(ioprio: IoPrio) -> bool {
-    let class = ioprio_prio_class(ioprio);
-    class <= IOPRIO_CLASS_IDLE
+/// An I/O priority a request may carry (Linux ioprio_check_cap): the
+/// RT class needs CAP_SYS_ADMIN or CAP_SYS_NICE (EPERM); BE and IDLE
+/// anyone; NONE only with level 0; any other class EINVAL
+pub fn ioprio_check_cap(ioprio: IoPrio) -> KernelResult<()> {
+    match ioprio_prio_class(ioprio) {
+        IOPRIO_CLASS_RT if !capable(CAP_SYS_ADMIN) && !capable(CAP_SYS_NICE) => {
+            Err(KernelError::NotPermitted)
+        }
+        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE | IOPRIO_CLASS_IDLE => Ok(()),
+        // Only the level must be 0: hint bits are accepted (Linux
+        // IOPRIO_PRIO_LEVEL)
+        IOPRIO_CLASS_NONE if ioprio & IOPRIO_LEVEL_MASK == 0 => Ok(()),
+        _ => Err(KernelError::InvalidArgument),
+    }
 }
 
 /// I/O context for a task (shareable via CLONE_IO)
@@ -2829,7 +3030,7 @@ pub fn set_set_child_tid(t: &Task, addr: u64) {
 /// cgroup directory, ENOENT for a removed one
 /// (css_tryget_online_from_dir)
 pub fn cgroup_from_fd(fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
-    use crate::fs::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
+    use crate::cgroup::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
     let file = percpu::current()
         .files()
         .and_then(|t| t.lock().get(fd))

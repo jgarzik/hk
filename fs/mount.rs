@@ -57,7 +57,8 @@ pub type MountMap = Vec<(Arc<Mount>, Arc<Mount>)>;
 /// s_umount, then the spinning Mount fields.
 pub static NAMESPACE_SEM: crate::sync::RwSem<()> = crate::sync::RwSem::new(());
 
-/// Mount ids (Linux mnt_id_ida): the lowest free one, from 1
+/// Mount ids: the lowest free one, from 0 (Linux mnt_id_xa, an
+/// XA_FLAGS_ALLOC xarray: the kernel's tmpfs gets 0, the nullfs root 1)
 struct MntIds {
     next: u32,
     free: alloc::collections::BTreeSet<u32>,
@@ -80,8 +81,9 @@ fn mnt_alloc_id() -> u32 {
     if let Some(id) = ids.free.pop_first() {
         return id;
     }
+    let id = ids.next;
     ids.next += 1;
-    ids.next
+    id
 }
 
 fn mnt_free_id(id: u32) {
@@ -407,9 +409,11 @@ impl Mount {
         let _ns = NAMESPACE_SEM.write();
         let new_root = root.copy(ns);
 
-        // Recursively clone children
+        // Recursively clone children, each list copied out first: a
+        // copy takes MOUNT_LOCK, which nests outside Mount.children
         let mut map = alloc::vec![(root.clone(), new_root.clone())];
-        for child in root.children.read().iter() {
+        let kids = root.children.read().clone();
+        for child in &kids {
             Self::clone_subtree(&new_root, child, ns, &mut map);
         }
 
@@ -428,15 +432,16 @@ impl Mount {
         new_parent.children.write().push(new_mount.clone());
         map.push((old_mount.clone(), new_mount.clone()));
 
-        // Recursively clone this mount's children
-        for child in old_mount.children.read().iter() {
+        // Recursively clone this mount's children (copied out, as above)
+        let kids = old_mount.children.read().clone();
+        for child in &kids {
             Self::clone_subtree(&new_mount, child, ns, map);
         }
     }
 }
 
 /// The initial mount tree (Linux init_mount_tree, 7.0+): a nullfs mount
-/// (id 1) is the namespace root and the mutable rootfs, a ramfs under
+/// (id 1) is the namespace root and the mutable rootfs, a tmpfs under
 /// the type name "rootfs" (id 2), is mounted on it. Root and cwd go to the rootfs, so it can be
 /// pivoted away or unmounted like any other mount. Then the private
 /// nullfs kernel threads start in (id 3, Linux 7.3 knullfs). Returns
@@ -450,7 +455,7 @@ pub fn init_mount_tree() -> Result<Arc<Mount>, KernelError> {
         false,
         b"nullfs".as_slice().into(),
     )?;
-    let rootfs_type = &super::ramfs::ROOTFS_TYPE;
+    let rootfs_type = &super::ramfs::tmpfs::ROOTFS_TYPE;
     let sb = (rootfs_type.mount)(rootfs_type, b"")?;
     let on = Path::new(null.clone(), null.root.clone());
     let rootfs = attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())?;
@@ -778,17 +783,26 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
 /// Take `m` (and what is mounted below it) off its parent; under
 /// NAMESPACE_SEM
 fn detach_mnt(m: &Arc<Mount>) {
+    // A tree change under MOUNT_LOCK (Linux umount_tree under
+    // lock_mount_hash), for the walks that check its sequence; the
+    // mountpoint goes after the unlock
+    let ml = MOUNT_LOCK.write();
     if let Some(parent) = m.get_parent() {
         parent.remove_child(m);
     }
     *m.parent.write() = None;
-    if let Some(mp) = m.mountpoint.write().take() {
-        note_mp(&mp, -1);
+    let mp = m.mountpoint.write().take();
+    if let Some(mp) = &mp {
+        note_mp(mp, -1);
     }
+    drop(ml);
 }
 
-/// Hang `m` on `mp` (Linux attach_mnt); under NAMESPACE_SEM
+/// Hang `m` on `mp` (Linux attach_mnt, under lock_mount_hash: here
+/// MOUNT_LOCK, for the walks that check its sequence); under
+/// NAMESPACE_SEM
 pub(super) fn attach_mnt(m: &Arc<Mount>, mp: &Path) {
+    let _ml = MOUNT_LOCK.write();
     m.set_mountpoint(mp.dentry.clone());
     m.set_parent(&mp.mnt);
     mp.mnt.add_child(m.clone());
@@ -809,8 +823,9 @@ fn graft(m: &Arc<Mount>, mp: &Path) {
     }
 }
 
-/// `p` is at or below `root`, across mounts (Linux is_path_reachable)
-fn is_path_reachable(p: &Path, root: &Path) -> bool {
+/// `p` is at or below `root`, across mounts (Linux is_path_reachable,
+/// path_is_under)
+pub fn is_path_reachable(p: &Path, root: &Path) -> bool {
     let (mut mnt, mut d) = (p.mnt.clone(), p.dentry.clone());
     while !Arc::ptr_eq(&mnt, &root.mnt) {
         match (mnt.get_parent(), mnt.get_mountpoint()) {

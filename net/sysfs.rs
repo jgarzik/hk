@@ -239,7 +239,7 @@ pub fn netns_exit(kdevs: Vec<Arc<Device>>) {
         }
     });
     // Namespace teardown cannot fail
-    let work = arc_nofail(crate::sync::spin::Mutex::new(work));
+    let work = arc_nofail(crate::sync::IrqSpinlock::new(work));
     crate::task::workqueue::SYSTEM_WQ.queue_work(work);
 }
 

@@ -59,6 +59,11 @@ pub struct PidNamespace {
     /// Its process accounting file (Linux pid_namespace->bacct): set by
     /// acct(2) inside, ended with the namespace (`task::acct`)
     pub bacct: crate::task::acct::Acct,
+
+    /// vm.memfd_noexec set in this namespace (Linux memfd_noexec_scope:
+    /// 0 exec allowed, 1 MFD_NOEXEC_SEAL by default, 2 enforced); the
+    /// one in force is the highest up the chain (`memfd_noexec`)
+    pub memfd_noexec: core::sync::atomic::AtomicU8,
 }
 
 impl PidNamespace {
@@ -75,7 +80,20 @@ impl PidNamespace {
             reaper: TableCell::new(None),
             reboot: TableCell::new(0),
             bacct: crate::task::acct::Acct::default(),
+            memfd_noexec: core::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    /// The vm.memfd_noexec scope in force: the highest set here or in
+    /// an ancestor (Linux pidns_memfd_noexec_scope)
+    pub fn memfd_noexec(&self) -> u8 {
+        let mut scope = 0;
+        let mut ns = Some(self);
+        while let Some(n) = ns {
+            scope = scope.max(n.memfd_noexec.load(core::sync::atomic::Ordering::Relaxed));
+            ns = n.parent.as_deref();
+        }
+        scope
     }
 
     /// Create a child namespace (CLONE_NEWPID, unshare)
@@ -95,6 +113,7 @@ impl PidNamespace {
             reaper: TableCell::new(None),
             reboot: TableCell::new(0),
             bacct: crate::task::acct::Acct::default(),
+            memfd_noexec: core::sync::atomic::AtomicU8::new(parent.memfd_noexec()),
         })
     }
 }

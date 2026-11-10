@@ -100,6 +100,18 @@ pub trait Aops: Sync {
     }
 }
 
+/// Block accounting of a mapping's file system (Linux tmpfs
+/// shmem_inode_acct_blocks / shmem_inode_unacct_blocks): a page is
+/// charged before it enters the cache (ENOSPC when the file system is
+/// full) and released when it leaves. Called with the page locked and
+/// no spin lock held; must not sleep.
+pub trait PageAcct: Send + Sync {
+    /// Take `pages` blocks (NoSpace when short)
+    fn charge(&self, pages: u64) -> Result<(), KernelError>;
+    /// Give `pages` blocks back
+    fn uncharge(&self, pages: u64);
+}
+
 /// A mapping with no I/O: pages read as zeros (a new inode before its
 /// filesystem sets its operations)
 struct NoAops;
@@ -124,10 +136,30 @@ pub struct AddressSpace {
     flags: AtomicU32,
     /// The filesystem's I/O
     a_ops: Once<&'static dyn Aops>,
+    /// Where its pages are charged (tmpfs; none: not counted)
+    acct: Once<alloc::sync::Arc<dyn PageAcct>>,
+    /// F_SEAL_* of a tmpfs file (Linux shmem_inode_info.seals, kept
+    /// here so a write reaches them in one load; 0 elsewhere): changed
+    /// under the inode's i_rwsem, read lock-free
+    pub seals: AtomicU32,
+    /// Shared mappings that may write (VM_SHARED with VM_MAYWRITE), or
+    /// below 0 while F_SEAL_WRITE denies them (Linux i_mmap_writable)
+    writable: core::sync::atomic::AtomicI64,
     /// Every VMA mapping the file (Linux i_mmap + i_mmap_rwsem; the
     /// same chain type as an anon_vma's): written under the mmap_lock
     /// held for writing, read by truncate and the reverse map
     pub i_mmap: AnonVma,
+    /// When its first dirty page since it was last clean came,
+    /// monotonic ns (Linux inode->dirtied_when, set as I_DIRTY_PAGES
+    /// is): written under the `i_pages` lock, read by the periodic
+    /// writeback (vm.dirty_expire_centisecs)
+    pub dirtied_when: AtomicU64,
+    /// The inode it belongs to, for page dirtying to mark it dirty
+    /// (Linux mapping->host; set with the aops by `set_aops`)
+    host: Once<alloc::sync::Weak<Inode>>,
+    /// Writeback errors, reported once to each open file by fsync
+    /// (Linux mapping->wb_err)
+    pub wb_err: crate::util::errseq::ErrSeq,
 }
 
 impl AddressSpace {
@@ -138,17 +170,89 @@ impl AddressSpace {
             nrpages: AtomicU64::new(0),
             flags: AtomicU32::new(0),
             a_ops: Once::new(),
+            acct: Once::new(),
+            seals: AtomicU32::new(0),
+            writable: core::sync::atomic::AtomicI64::new(0),
             i_mmap: AnonVma::default(),
+            dirtied_when: AtomicU64::new(0),
+            host: Once::new(),
+            wb_err: crate::util::errseq::ErrSeq::new(),
         }
     }
 
-    /// Set the filesystem's operations (once, before any page is cached)
-    pub fn set_aops(&self, a: &'static dyn Aops) {
+    /// Set the filesystem's operations and, for a mapping whose pages
+    /// get dirty, the inode it belongs to (once, before any page is
+    /// cached; Linux inode->i_mapping->a_ops, mapping->host)
+    pub fn set_aops(&self, a: &'static dyn Aops, host: Option<&alloc::sync::Arc<Inode>>) {
         self.a_ops.call_once(|| a);
+        if let Some(h) = host {
+            self.host.call_once(|| alloc::sync::Arc::downgrade(h));
+        }
     }
 
     pub fn aops(&self) -> &'static dyn Aops {
         self.a_ops.get().copied().unwrap_or(&NO_AOPS)
+    }
+
+    /// Charge its pages to `a` (once, before any page is cached)
+    pub fn set_acct(&self, a: alloc::sync::Arc<dyn PageAcct>) {
+        self.acct.call_once(|| a);
+    }
+
+    /// Its pages are charged to a file system (a tmpfs file)
+    pub fn charged(&self) -> bool {
+        self.acct.get().is_some()
+    }
+
+    fn charge(&self) -> Result<(), KernelError> {
+        self.acct.get().map_or(Ok(()), |a| a.charge(1))
+    }
+
+    fn uncharge(&self, pages: u64) {
+        if let Some(a) = self.acct.get()
+            && pages != 0
+        {
+            a.uncharge(pages);
+        }
+    }
+
+    /// A new shared writable mapping may be made (Linux
+    /// mapping_map_writable): EPERM while denied
+    pub fn map_writable(&self) -> Result<(), KernelError> {
+        self.writable
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n >= 0).then_some(n + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| KernelError::NotPermitted)
+    }
+
+    /// One more shared writable mapping of an existing one (a split,
+    /// fork; Linux mapping_allow_writable)
+    pub fn allow_writable(&self) {
+        self.writable.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// One shared writable mapping fewer (Linux mapping_unmap_writable)
+    pub fn unmap_writable(&self) {
+        self.writable.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Deny new shared writable mappings for good (F_SEAL_WRITE; Linux
+    /// mapping_deny_writable): EBUSY while there is one
+    pub fn deny_writable(&self) -> Result<(), KernelError> {
+        self.writable
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n <= 0).then_some(n - 1)
+            })
+            .map(|_| ())
+            .map_err(|_| KernelError::Busy)
+    }
+
+    /// Undo a `deny_writable` (Linux mapping_allow_writable after a
+    /// failed seal)
+    pub fn undeny_writable(&self) {
+        self.writable.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn set_flags(&self, f: u32) {
@@ -186,6 +290,9 @@ static NR_FILE: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
     crate::percpu![core::sync::atomic::AtomicI64::new(0)];
 static NR_UNEVICT: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
     crate::percpu![core::sync::atomic::AtomicI64::new(0)];
+/// tmpfs pages (Linux NR_SHMEM): those of a mapping charged to a tmpfs
+static NR_SHMEM: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
+    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
 
 fn sum(c: &crate::cpu::PerCpu<core::sync::atomic::AtomicI64>) -> u64 {
     c.for_each_possible()
@@ -200,6 +307,14 @@ fn count_file(m: &AddressSpace, d: i64) {
     if m.has_flag(AS_UNEVICTABLE) {
         NR_UNEVICT.this().fetch_add(d, Ordering::Relaxed);
     }
+    if m.acct.get().is_some() {
+        NR_SHMEM.this().fetch_add(d, Ordering::Relaxed);
+    }
+}
+
+/// tmpfs and shared memory pages (Linux NR_SHMEM): /proc/meminfo Shmem
+pub fn nr_shmem() -> u64 {
+    sum(&NR_SHMEM)
 }
 
 /// Page-cache pages (Linux NR_FILE_PAGES)
@@ -273,9 +388,20 @@ pub fn find_get(m: &AddressSpace, index: u64) -> Option<u64> {
     (phys != 0 && FRAME_ALLOCATOR.incref(phys)).then_some(phys)
 }
 
-/// Insert the locked page `phys` at `index` (Linux filemap_add_folio);
-/// the cache takes a reference. AlreadyExists if a page is there.
+/// Insert the locked page `phys` at `index` (Linux filemap_add_folio),
+/// charged to the mapping's file system first (NoSpace); the cache
+/// takes a reference. AlreadyExists if a page is there.
 fn add(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
+    m.charge()?;
+    let r = insert(m, phys, index);
+    if r.is_err() {
+        m.uncharge(1);
+    }
+    r
+}
+
+/// The insertion of `add`, its block charged
+fn insert(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
     let pg = page(phys);
     pg.index.store(index, Ordering::Relaxed);
     pg.mapping.store(m.key(), Ordering::Release);
@@ -392,6 +518,7 @@ pub fn remove(m: &AddressSpace, phys: u64) {
     pg.private.store(0, Ordering::Relaxed);
     m.nrpages.fetch_sub(1, Ordering::Relaxed);
     count_file(m, -1);
+    m.uncharge(1);
     put_page(phys);
 }
 
@@ -430,6 +557,7 @@ fn truncate_pages(m: &AddressSpace, from: u64, last: u64) {
 /// truncate_inode_pages_final, from eviction): no page lock, no sleep
 fn truncate_final(m: &AddressSpace) {
     count_file(m, -(m.nrpages() as i64));
+    m.uncharge(m.nrpages());
     let mut pages = m.i_pages.lock();
     pages.destroy(&mut |phys| {
         let pg = page(phys);
@@ -442,13 +570,18 @@ fn truncate_final(m: &AddressSpace) {
     m.nrpages.store(0, Ordering::Relaxed);
 }
 
-/// Set the page's dirty bit and the mapping's DIRTY mark (Linux
-/// filemap_dirty_folio)
+/// Set the page's dirty bit and the mapping's DIRTY mark, and mark its
+/// inode dirty (Linux folio_mark_dirty: ->dirty_folio, whose
+/// __folio_mark_dirty calls __mark_inode_dirty(I_DIRTY_PAGES)). Under
+/// the page lock at most
 pub fn dirty_page(m: &AddressSpace, phys: u64) {
     if !m.aops().can_dirty() {
         return;
     }
     m.aops().dirty_folio(m, phys);
+    if let Some(inode) = m.host.get().and_then(alloc::sync::Weak::upgrade) {
+        crate::fs::fs_writeback::mark_inode_dirty(&inode);
+    }
 }
 
 /// The generic dirtying (Linux filemap_dirty_folio): PG_dirty and the
@@ -459,9 +592,12 @@ pub fn dirty_folio(m: &AddressSpace, phys: u64) {
         && pg.flags.fetch_or(PG_DIRTY, Ordering::AcqRel) & PG_DIRTY == 0
     {
         count_dirty(1);
-        m.i_pages
-            .lock()
-            .set_mark(pg.index.load(Ordering::Relaxed), MARK_DIRTY);
+        let mut pages = m.i_pages.lock();
+        if !pages.marked(MARK_DIRTY) {
+            m.dirtied_when
+                .store(crate::time::monotonic_ns(), Ordering::Release);
+        }
+        pages.set_mark(pg.index.load(Ordering::Relaxed), MARK_DIRTY);
     }
 }
 
@@ -509,11 +645,32 @@ fn mkclean(m: &AddressSpace, index: u64, phys: u64) {
     }
 }
 
+/// Record a writeback error of `inode`'s pages on its mapping and its
+/// filesystem, for fsync and syncfs to report (Linux mapping_set_error:
+/// wb_err and s_wb_err)
+pub fn mapping_set_error(inode: &Inode, e: KernelError) {
+    inode.i_data.wb_err.set(e);
+    if let Some(sb) = inode.superblock() {
+        sb.s_wb_err.set(e);
+    }
+}
+
+/// The pages over a direct write could not be dropped after it (Linux
+/// dio_warn_stale_pagecache): the mapping's writeback error is EIO,
+/// which the next fsync of each open file reports, and a warning
+pub fn dio_warn_stale_pagecache(inode: &Inode) {
+    inode.i_data.wb_err.set(KernelError::Io);
+    crate::printkln!(
+        "Page cache invalidation failure on direct I/O.  Possible data corruption due to collision with buffered I/O!"
+    );
+}
+
 /// Write every dirty page of `inode` and wait (Linux
 /// filemap_write_and_wait, synchronous I/O): each is locked, its dirty
 /// bit and mark cleared, then written. The first error is returned
-/// after the others were tried; a page that failed stays clean (Linux
-/// records the error on the mapping; the data is in the page still).
+/// after the others were tried, and each is recorded on the mapping
+/// (`mapping_set_error`); a page that failed stays clean (the data is
+/// in the page still, as Linux).
 pub fn write_and_wait(inode: &Inode) -> Result<(), KernelError> {
     write_range(inode, 0, u64::MAX)
 }
@@ -550,9 +707,11 @@ pub fn write_range(inode: &Inode, first: u64, last: u64) -> Result<(), KernelErr
             mkclean(m, index, phys);
             if test_clear_dirty(pg)
                 && let Err(e) = m.aops().writepage(inode, phys, index)
-                && err.is_ok()
             {
-                err = Err(e);
+                mapping_set_error(inode, e);
+                if err.is_ok() {
+                    err = Err(e);
+                }
             }
             m.i_pages.lock().clear_mark(index, MARK_WRITEBACK);
         }
@@ -565,6 +724,118 @@ pub fn write_range(inode: &Inode, first: u64, last: u64) -> Result<(), KernelErr
     }
     wait_writeback(m, first, last);
     err
+}
+
+/// Write back the dirty pages holding bytes [start, end] of `inode` and
+/// wait (Linux filemap_write_and_wait_range): nothing to do in an empty
+/// mapping
+pub fn write_and_wait_range(inode: &Inode, start: u64, end: u64) -> Result<(), KernelError> {
+    if end < start || inode.i_data.nrpages() == 0 {
+        return Ok(());
+    }
+    let p = PAGE_SIZE as u64;
+    write_range(inode, start / p, end / p)
+}
+
+/// A page is cached for bytes [start, end] (Linux
+/// filemap_range_has_page)
+pub fn range_has_page(m: &AddressSpace, start: u64, end: u64) -> bool {
+    let p = PAGE_SIZE as u64;
+    end >= start && m.i_pages.lock().find(start / p, end / p, None).is_some()
+}
+
+/// A page for bytes [start, end] is dirty, locked or under writeback:
+/// direct I/O there would first wait for it (Linux
+/// filemap_range_needs_writeback). The flags are read without a
+/// reference (a racing change is a stale answer, as Linux under RCU).
+pub fn range_needs_writeback(m: &AddressSpace, start: u64, end: u64) -> bool {
+    if end < start || m.nrpages() == 0 {
+        return false;
+    }
+    let (first, last) = (start / PAGE_SIZE as u64, end / PAGE_SIZE as u64);
+    {
+        let pages = m.i_pages.lock();
+        if !pages.marked(MARK_DIRTY) && !pages.marked(MARK_WRITEBACK) {
+            return false;
+        }
+    }
+    let mut at = first;
+    loop {
+        let next = {
+            let pages = m.i_pages.lock();
+            pages
+                .find(at, last, None)
+                .map(|(i, phys)| (i, phys, pages.get_mark(i, MARK_WRITEBACK)))
+        };
+        let Some((index, phys, wb)) = next else {
+            return false;
+        };
+        if wb || page(phys).flags.load(Ordering::Acquire) & (PG_DIRTY | PG_LOCKED) != 0 {
+            return true;
+        }
+        match index.checked_add(1) {
+            Some(n) => at = n,
+            None => return false,
+        }
+    }
+}
+
+/// Drop the pages of `inode` with index in [first, last], unmapping them
+/// from every mapping first (Linux invalidate_inode_pages2_range): EBUSY
+/// if one could not go, the others still do. Sleeps (page locks).
+pub fn invalidate_pages2(inode: &Inode, first: u64, last: u64) -> Result<(), KernelError> {
+    let m = &inode.i_data;
+    if m.nrpages() == 0 {
+        return Ok(());
+    }
+    let (mut ret, mut unmapped, mut at) = (Ok(()), false, first);
+    while at <= last {
+        let next = {
+            let pages = m.i_pages.lock();
+            pages
+                .find(at, last, None)
+                .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
+        };
+        let Some((index, phys)) = next else {
+            break;
+        };
+        // A mapped file: the rest of the range is unmapped at once first
+        // (Linux: at the first mapped folio)
+        if !unmapped && !m.i_mmap.is_empty() {
+            unmap_pages(m, index, last);
+            unmapped = true;
+        }
+        lock_page(phys);
+        if page(phys).mapping.load(Ordering::Acquire) == m.key()
+            && let Err(e) = unmap_invalidate(m, phys, index)
+        {
+            ret = Err(e);
+        }
+        unlock_page(phys);
+        put_page(phys);
+        match index.checked_add(1) {
+            Some(n) => at = n,
+            None => break,
+        }
+    }
+    ret
+}
+
+/// Drop the locked page `phys`, index `index` of `m`, unmapped first
+/// (Linux folio_unmap_invalidate): EBUSY if it is dirty (no
+/// ->launder_folio; a device page's dirty sectors are Linux's dirty
+/// buffers, which try_to_free_buffers keeps). Unmapped again under the
+/// page lock: a fault maps a file page under it, so none can have
+/// mapped it since.
+fn unmap_invalidate(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
+    if !m.i_mmap.is_empty() {
+        unmap_pages(m, index, index);
+    }
+    if page(phys).flags.load(Ordering::Acquire) & PG_DIRTY != 0 {
+        return Err(KernelError::Busy);
+    }
+    remove(m, phys);
+    Ok(())
 }
 
 /// Wait for the pages with index in [first, last] that another thread
@@ -621,6 +892,9 @@ pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), Kerne
             if test_clear_dirty(pg) {
                 m.i_pages.lock().clear_mark(index, MARK_DIRTY);
                 r = m.aops().writepage(inode, phys, index);
+                if let Err(e) = r {
+                    mapping_set_error(inode, e);
+                }
             }
             if r.is_ok() {
                 remove(m, phys);
@@ -741,13 +1015,60 @@ pub fn read(inode: &Inode, buf: &mut [u8], pos: u64) -> Result<usize, KernelErro
 /// page by page, each uptodate and held by a reference, not locked,
 /// while it is copied out
 pub fn read_iter(inode: &Inode, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
+    read_with(inode, to, pos, &|i| read_page(inode, i).map(Some))
+}
+
+/// `read_iter` that waits for no I/O (Linux filemap_read with
+/// IOCB_NOWAIT): only cached, uptodate pages are copied; EAGAIN at the
+/// first other one if nothing was read
+pub fn read_iter_nowait(
+    inode: &Inode,
+    to: &mut IovDest<'_>,
+    pos: u64,
+) -> Result<usize, KernelError> {
+    read_with(inode, to, pos, &|i| match find_get(&inode.i_data, i) {
+        Some(p) if uptodate(p) => Ok(Some(p)),
+        Some(p) => {
+            put_page(p);
+            Err(KernelError::WouldBlock)
+        }
+        None => Err(KernelError::WouldBlock),
+    })
+}
+
+/// `read_iter` of a file whose cache is its only copy (Linux
+/// shmem_file_read_iter, SGP_READ): a page not cached is a hole, read
+/// as zeros without adding one
+pub fn read_iter_holes(
+    inode: &Inode,
+    to: &mut IovDest<'_>,
+    pos: u64,
+) -> Result<usize, KernelError> {
+    read_with(inode, to, pos, &|i| match find_get(&inode.i_data, i) {
+        None => Ok(None),
+        Some(p) if uptodate(p) => Ok(Some(p)),
+        Some(p) => {
+            put_page(p);
+            read_page(inode, i).map(Some)
+        }
+    })
+}
+
+/// The loop of `read_iter`: `get` gives each page uptodate with a
+/// reference, or None for zeros
+fn read_with(
+    inode: &Inode,
+    to: &mut IovDest<'_>,
+    pos: u64,
+    get: &dyn Fn(u64) -> Result<Option<u64>, KernelError>,
+) -> Result<usize, KernelError> {
     let mut done = 0;
     while !to.is_empty() {
         let at = pos + done as u64;
         if at >= inode.get_size() {
             break;
         }
-        let phys = match read_page(inode, at / PAGE_SIZE as u64) {
+        let page = match get(at / PAGE_SIZE as u64) {
             Ok(p) => p,
             Err(e) => return short(done, e),
         };
@@ -758,12 +1079,17 @@ pub fn read_iter(inode: &Inode, to: &mut IovDest<'_>, pos: u64) -> Result<usize,
         let n = (PAGE_SIZE - off)
             .min(to.len())
             .min(size.saturating_sub(at) as usize);
-        // SAFETY: an uptodate page with our reference; writers hold its
-        // lock, a racing one gives torn data as on Linux, never UB here
-        // beyond the byte copy
-        let bytes: &[u8] = unsafe { frame_bytes(phys) };
-        let r = to.copy_to(&bytes[off..off + n]);
-        put_page(phys);
+        let r = match page {
+            Some(phys) => {
+                // SAFETY: an uptodate page with our reference, no
+                // reference to it held; writers hold its lock, a racing
+                // one gives torn data as on Linux
+                let r = unsafe { to.copy_from_page(phys, off, n) };
+                put_page(phys);
+                r
+            }
+            None => to.zero(n),
+        };
         match r {
             Ok(c) if c == n && n > 0 => done += c,
             Ok(c) => return Ok(done + c),
@@ -787,6 +1113,59 @@ pub fn perform_write(inode: &Inode, buf: &[u8], pos: u64) -> Result<usize, Kerne
 /// cannot be faulted in is EFAULT.
 pub fn write_iter(inode: &Inode, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
     let a = inode.i_data.aops();
+    write_with(inode, from, pos, &|at, n| a.write_begin(inode, at, n))
+}
+
+/// `write_iter` that waits for nothing (Linux generic_perform_write
+/// with IOCB_NOWAIT: FGP_NOWAIT pages): a page another holds locked,
+/// or one a partial write would first have to read, ends it with
+/// EAGAIN (the bytes before it written). For a mapping with the
+/// default write_begin (simple_write_begin): block devices.
+pub fn write_iter_nowait(
+    inode: &Inode,
+    from: &mut IovSource<'_>,
+    pos: u64,
+) -> Result<usize, KernelError> {
+    write_with(inode, from, pos, &|at, n| grab_nowait(inode, at, n))
+}
+
+/// simple_write_begin's page for a write of `n` bytes at `at`, without
+/// waiting: EAGAIN where that would wait for a page lock or a read
+fn grab_nowait(inode: &Inode, at: u64, n: usize) -> Result<u64, KernelError> {
+    let m = &inode.i_data;
+    let index = at / PAGE_SIZE as u64;
+    let whole = n == PAGE_SIZE || index * PAGE_SIZE as u64 >= inode.get_size();
+    let Some(phys) = find_get(m, index) else {
+        if !whole {
+            return Err(KernelError::WouldBlock);
+        }
+        return simple_write_begin(inode, at, n);
+    };
+    if !super::page::trylock_page(phys) {
+        put_page(phys);
+        return Err(KernelError::WouldBlock);
+    }
+    if page(phys).mapping.load(Ordering::Acquire) != m.key() || !(whole || uptodate(phys)) {
+        unlock_page(phys);
+        put_page(phys);
+        return Err(KernelError::WouldBlock);
+    }
+    if !uptodate(phys) && index * PAGE_SIZE as u64 >= inode.get_size() {
+        zero_page(phys, 0);
+        set_uptodate(phys);
+    }
+    Ok(phys)
+}
+
+/// The loop of `write_iter`: `begin` gives each page locked, with a
+/// reference (Linux ->write_begin)
+fn write_with(
+    inode: &Inode,
+    from: &mut IovSource<'_>,
+    pos: u64,
+    begin: &dyn Fn(u64, usize) -> Result<u64, KernelError>,
+) -> Result<usize, KernelError> {
+    let a = inode.i_data.aops();
     let mut done = 0;
     let mut limit = PAGE_SIZE;
     while !from.is_empty() {
@@ -796,7 +1175,7 @@ pub fn write_iter(inode: &Inode, from: &mut IovSource<'_>, pos: u64) -> Result<u
         if from.fault_in(n) == n {
             return short(done, KernelError::BadAddress);
         }
-        let phys = match a.write_begin(inode, at, n) {
+        let phys = match begin(at, n) {
             Ok(p) => p,
             Err(e) => return short(done, e),
         };
@@ -832,9 +1211,9 @@ fn copy_page(
     n: usize,
 ) -> Result<usize, usize> {
     let off = (at % PAGE_SIZE as u64) as usize;
-    // SAFETY: the locked page with our reference
-    let bytes = unsafe { frame_bytes(phys) };
-    let c = from.copy_from_nofault(&mut bytes[off..off + n]);
+    // SAFETY: the locked page with our reference, no reference to it
+    // held
+    let c = unsafe { from.copy_to_page_nofault(phys, off, n) };
     if c == 0 || (c < n && !uptodate(phys)) {
         from.revert(c);
         unlock_page(phys);
@@ -943,6 +1322,68 @@ pub fn punch_range(inode: &Inode, start: u64, end: u64) {
     }
 }
 
+/// Allocate the pages of bytes [start, end) of a file whose cache is
+/// its only copy (Linux shmem_fallocate, SGP_FALLOC): each new page is
+/// charged and cached locked, then left unlocked and not uptodate (it
+/// reads as zeros: `read_folio` fills it), so a failure can remove just
+/// those again; a page left so by an earlier fallocate is zeroed and
+/// made uptodate now, so that undo cannot take it. A fatal signal stops
+/// it (EINTR). The caller holds i_rwsem.
+pub fn falloc_range(inode: &Inode, start: u64, end: u64) -> Result<(), KernelError> {
+    let m = &inode.i_data;
+    let ps = PAGE_SIZE as u64;
+    let (first, past) = (start / ps, end.div_ceil(ps));
+    for index in first..past {
+        let r = if crate::signal::fatal_signal_pending() {
+            Err(KernelError::Interrupted)
+        } else {
+            falloc_page(m, index)
+        };
+        if let Err(e) = r {
+            if index > first {
+                undo_falloc(m, first, index - 1);
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// One page of `falloc_range`
+fn falloc_page(m: &AddressSpace, index: u64) -> Result<(), KernelError> {
+    let old = find_get(m, index);
+    let phys = match old {
+        Some(p) => {
+            lock_page(p);
+            p
+        }
+        None => grab(m, index)?,
+    };
+    if old.is_some() && !uptodate(phys) {
+        zero_page(phys, 0);
+        set_uptodate(phys);
+    }
+    unlock_page(phys);
+    put_page(phys);
+    Ok(())
+}
+
+/// Remove the pages with index in [first, last] that are not uptodate:
+/// those a failed `falloc_range` added (Linux shmem_undo_range,
+/// unfalloc)
+fn undo_falloc(m: &AddressSpace, first: u64, last: u64) {
+    for index in first..=last {
+        if let Some(phys) = find_get(m, index) {
+            lock_page(phys);
+            if !uptodate(phys) {
+                remove(m, phys);
+            }
+            unlock_page(phys);
+            put_page(phys);
+        }
+    }
+}
+
 /// The page at `index` for a mapping's fault (Linux filemap_fault):
 /// uptodate, LOCKED, with a reference for the PTE; past EOF or a read
 /// error is SIGBUS. The size is checked again under the page lock and
@@ -954,8 +1395,10 @@ pub fn fault(inode: &Inode, index: u64) -> Result<u64, VmFault> {
     if past(inode) {
         return Err(VmFault::Bus);
     }
+    // Linux vmf_error: ENOMEM is OOM, anything else (a full tmpfs's
+    // ENOSPC) SIGBUS
     let err = |e| match e {
-        KernelError::OutOfMemory | KernelError::NoSpace => VmFault::Oom,
+        KernelError::OutOfMemory => VmFault::Oom,
         _ => VmFault::Bus,
     };
     loop {

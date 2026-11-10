@@ -635,7 +635,7 @@ impl crate::fs::FileOps for KmsgFileOps {
         at: Option<u64>,
         flags: crate::fs::RwFlags,
     ) -> Result<usize, KernelError> {
-        if at.is_some() || flags.nowait {
+        if at.is_some() || flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let u = user(file)?;
@@ -666,7 +666,7 @@ impl crate::fs::FileOps for KmsgFileOps {
         at: Option<u64>,
         flags: crate::fs::RwFlags,
     ) -> Result<usize, KernelError> {
-        if at.is_some() || flags.nowait {
+        if at.is_some() || flags.nowait() {
             return Err(KernelError::OperationNotSupported);
         }
         let u = user(file)?;

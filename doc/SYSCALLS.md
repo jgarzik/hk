@@ -53,14 +53,15 @@
 2.1 FD lifecycle
 
 - [x] open (x86-64 only, legacy; use openat)
-- [x] openat
+- [x] openat (O_TMPFILE on tmpfs and ramfs: unnamed, linkable unless O_EXCL; O_PATH: path-only descriptors; O_EMPTYPATH: an empty path reopens dirfd's file; O_DIRECT only on tmpfs and vfat regular files and block devices, else EINVAL after ->open; zero-copy on block devices, still buffered on vfat and tmpfs)
+- [x] openat2 (open_how size rules, OPENAT2_REGULAR, O_EMPTYPATH, every RESOLVE_* flag)
 - [x] close
 - [x] close_range (CLOSE_RANGE_UNSHARE, CLOSE_RANGE_CLOEXEC)
 - [ ] creat (x86-64 only, legacy; use openat with O_CREAT)
 - [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)
 - [x] dup3
-- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETOWN_EX, F_SETOWN_EX, F_GETSIG, F_SETSIG; O_ASYNC raises SIGIO, or the F_SETSIG signal with POLL_* info, on pipes, FIFOs, ttys (input; FIOASYNC makes the foreground group or the caller owner), inotify and sockets (POLL_IN on input, POLL_OUT for room only after a send found none, POLL_ERR, POLL_HUP; TCP: POLL_OUT once connected))
+- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL (O_APPEND, O_NONBLOCK, O_NOATIME, O_DIRECT where open would take it), F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETOWN_EX, F_SETOWN_EX, F_GETSIG, F_SETSIG, F_ADD_SEALS, F_GET_SEALS (tmpfs files; all six seals enforced); O_ASYNC raises SIGIO, or the F_SETSIG signal with POLL_* info, on pipes, FIFOs, ttys (input; FIOASYNC makes the foreground group or the caller owner), inotify and sockets (POLL_IN on input, POLL_OUT for room only after a send found none, POLL_ERR, POLL_HUP; TCP: POLL_OUT once connected))
 
 2.2 Read/write + position
 
@@ -71,9 +72,9 @@
 - [x] readv
 - [x] writev
 - [x] preadv
-- [x] preadv2
+- [x] preadv2 (RWF_NOWAIT on block devices: direct I/O and cached data, EAGAIN where it would wait)
 - [x] pwritev
-- [x] pwritev2
+- [x] pwritev2 (RWF_DSYNC, RWF_SYNC: synchronous where O_DSYNC would be: regular files, block devices; RWF_NOWAIT for direct writes to block devices)
 - [x] lseek
 - [x] truncate
 - [x] ftruncate
@@ -130,7 +131,7 @@ New kernels mostly use statx; older ones use stat/lstat/fstat.
 - [x] newfstatat (fstatat on aarch64)
 - [x] statfs
 - [x] fstatfs
-- [x] statx (modern richer interface)
+- [x] statx (modern richer interface; STATX_DIOALIGN and io_min as stx_blksize for block devices)
 
 Permissions and ownership:
 
@@ -190,6 +191,7 @@ Extended attributes (Linux-specific):
 - [x] mlock2
 - [x] madvise
 - [x] mincore
+- [x] memfd_create (MFD_CLOEXEC, MFD_ALLOW_SEALING, MFD_NOEXEC_SEAL/MFD_EXEC with vm.memfd_noexec per pid namespace; MFD_HUGETLB ENOSYS: no hugetlbfs)
 - [ ] remap_file_pages (legacy)
 
 4.2 NUMA / memory policy (optional but Linuxy)
@@ -252,7 +254,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 7.1 Pipes & simple IPC
 
 - [x] pipe (x86-64 only, legacy; use pipe2)
-- [x] pipe2
+- [x] pipe2 (O_CLOEXEC, O_NONBLOCK, O_DIRECT: packet mode, also by F_SETFL on a pipe or FIFO)
 - [x] eventfd (x86-64 only, legacy; use eventfd2)
 - [x] eventfd2
 - [x] pidfd_open (PIDFD_NONBLOCK, PIDFD_THREAD)
@@ -271,7 +273,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] shmget
 - [x] shmat
 - [x] shmdt
-- [x] shmctl
+- [x] shmctl (IPC_STAT, IPC_SET, IPC_RMID (SHM_DEST while attached), IPC_INFO, SHM_INFO, SHM_STAT, SHM_STAT_ANY, SHM_LOCK, SHM_UNLOCK)
 - [x] semget
 - [x] semop
 - [x] semtimedop
@@ -452,11 +454,18 @@ goes down later.
 - [x] fanotify_init
 - [x] fanotify_mark
 
-9.3 io_uring (modern async I/O)
+9.3 Linux native AIO and io_uring
 
-- [x] io_uring_setup
-- [x] io_uring_enter
-- [x] io_uring_register
+- [x] io_setup (the ring mapped shared at the context id, Linux's struct aio_ring layout read by libaio; twice the events asked, at least 4 per CPU, rounded up to whole pages; /proc/sys/fs/aio-nr, aio-max-nr: EAGAIN past it; mremap moves the ring and the id, growing it is EFAULT; not inherited by fork)
+- [x] io_destroy (waits for every request to end)
+- [x] io_submit (PREAD, PWRITE, PREADV, PWRITEV: O_DIRECT on block devices and vfat asynchronous, the rest completed within the call; FSYNC, FDSYNC in a workqueue worker with the submitter's credentials; POLL; IOCB_FLAG_RESFD, IOCB_FLAG_IOPRIO, RWF_* flags; NOOP is EINVAL as Linux)
+- [x] io_cancel (POLL requests only, EINPROGRESS; EINVAL for any other, as Linux)
+- [x] io_getevents
+- [x] io_pgetevents (sigmask; no io_pgetevents_time64 on 64-bit arches)
+
+- [x] io_uring_setup (rings mapped at IORING_OFF_SQ_RING/CQ_RING/SQES, one region: IORING_FEAT_SINGLE_MMAP; IORING_SETUP_CQSIZE, CLAMP, IOPOLL (O_DIRECT reads and writes polled on the disk's poll queues: virtio_blk.poll_queues=, default 0, EOPNOTSUPP without; other operations but NOP EINVAL); no SQPOLL)
+- [x] io_uring_enter (SQEs read from the shared SQ, CQEs posted to the shared CQ, overflow kept: IORING_FEAT_NODROP; GETEVENTS sleeps interruptibly for min_complete, IORING_ENTER_EXT_ARG timeout and sigmask; O_DIRECT READ/WRITE(V)/_FIXED on block devices and vfat asynchronous; what would block, IOSQE_ASYNC, fsync/statx/openat/ftruncate/accept/connect, link chains and drained requests run in io-wq worker threads of the process, iou-wrk-<tid>)
+- [x] io_uring_register (FILES, UNREGISTER_FILES, FILES_UPDATE, BUFFERS, UNREGISTER_BUFFERS: pinned once, charged to RLIMIT_MEMLOCK without CAP_IPC_LOCK)
 
 10. Credentials, security, keyrings
 10.1 UIDs / GIDs
