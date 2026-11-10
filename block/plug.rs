@@ -191,8 +191,15 @@ fn merge(q: &RequestQueue, rq: &mut Bio, mut bio: Box<Bio>) -> Result<(), Box<Bi
     }
     if bio.sector + bio.sectors() == rq.sector {
         // `bio` heads the request: it takes the head's place in the
-        // plug, the old head and its merged bios follow it
+        // plug, the old head and its merged bios follow it. What the
+        // head holds for the request stays the request's (Linux
+        // bio_attempt_front_merge: req->cmd_flags, mq_ctx unchanged): its
+        // software queue, whose hardware queue counted its tag, its
+        // queue and its flags
         core::mem::swap(rq, &mut *bio);
+        core::mem::swap(&mut rq.rq_ctx, &mut bio.rq_ctx);
+        core::mem::swap(&mut rq.plug_q, &mut bio.plug_q);
+        core::mem::swap(&mut rq.flags, &mut bio.flags);
         let mut rest = core::mem::take(&mut bio.merged);
         rq.merged.push(bio);
         rq.merged.append(&mut rest);
@@ -259,6 +266,25 @@ mod tests {
         let mut n = bio(40, 1);
         n.flags = BioFlags::NOWAIT;
         assert!(merge(&q, &mut rq, n).is_ok());
+    }
+
+    /// A front merge keeps the request's own state on its head: the
+    /// software queue whose hardware queue counted its tag, its queue
+    /// and its flags (NOWAIT may differ between the two bios)
+    #[test]
+    fn front_merge_keeps_request_state() {
+        let q = queue(1024, 32);
+        let mut rq = bio(16, 1);
+        rq.rq_ctx = 3;
+        rq.plug_q = 0x1234;
+        let mut b = bio(8, 1);
+        b.flags = BioFlags::NOWAIT;
+        assert!(merge(&q, &mut rq, b).is_ok());
+        assert_eq!(sectors(&rq), [8, 16]);
+        assert_eq!(
+            (rq.rq_ctx, rq.plug_q, rq.flags),
+            (3, 0x1234, BioFlags::empty())
+        );
     }
 
     #[test]

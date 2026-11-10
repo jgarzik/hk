@@ -238,7 +238,11 @@ impl BlkMq {
     /// `n` requests of hardware queue `h` ended
     fn put_rqs(&self, h: usize, n: usize) {
         if n > 0 {
-            self.rqs[h].fetch_sub(n, Ordering::Relaxed);
+            let was = self.rqs[h].fetch_sub(n, Ordering::Relaxed);
+            debug_assert!(
+                was >= n,
+                "hardware queue {h}: {n} requests ended, {was} taken"
+            );
         }
     }
 
