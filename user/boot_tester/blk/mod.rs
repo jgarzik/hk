@@ -2,6 +2,7 @@
 
 pub mod dio;
 pub mod dio_alias;
+pub mod dio_bench;
 pub mod dio_pin;
 pub mod dioalign;
 pub mod disk;

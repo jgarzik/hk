@@ -357,6 +357,7 @@ pub fn run_all_tests() {
     blk::dio_pin::run_tests();
     blk::dio_alias::run_tests();
     blk::dio::run_tests();
+    blk::dio_bench::run_tests();
     isolated(b"SWAPOUT", mm::swapout::run_tests);
     time::adjtimex::run_tests();
     isolated(b"SETTIME", time::settime::run_tests);
