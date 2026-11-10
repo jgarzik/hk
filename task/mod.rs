@@ -979,6 +979,9 @@ pub struct Task {
     /// that takes it to 0 fails (`mm::fault_inject`); written by the
     /// task itself through /proc/thread-self/fail-nth
     pub fail_nth: AtomicU32,
+    /// The active block plug (`block::plug`, Linux current->plug):
+    /// set, read and cleared by the task itself only
+    pub plug: AtomicPtr<crate::block::plug::BlkPlug>,
     /// CPU whose network backlog this task last queued a packet to
     /// (`netif_rx`; u32::MAX: none), written by the task itself: its
     /// loopback flush covers that backlog even if it moved since
@@ -1754,6 +1757,7 @@ impl Task {
             cpus_mask: crate::util::cpumask::CpuMask::from_set(cpus),
             pagefault_disabled: AtomicU32::new(0),
             fail_nth: AtomicU32::new(0),
+            plug: AtomicPtr::new(core::ptr::null_mut()),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(false),
@@ -1820,6 +1824,7 @@ impl Task {
             cpus_mask: crate::util::cpumask::CpuMask::new(),
             pagefault_disabled: AtomicU32::new(0),
             fail_nth: AtomicU32::new(0),
+            plug: AtomicPtr::new(core::ptr::null_mut()),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(true),

@@ -215,7 +215,7 @@ impl VbQueue {
     }
 
     /// Write tag `t`'s chain `[header, data..., status]` to `table`
-    /// (n + 2 entries), DMA-mapping the data; false if a mapping failed
+    /// (n + 2 entries for the request's n segments), DMA-mapping the data; false if a mapping failed
     /// (nothing left mapped)
     fn fill(&self, t: u16, bio: &Bio, table: &mut [Desc]) -> bool {
         let d = dir(bio.op);
@@ -225,7 +225,7 @@ impl VbQueue {
             len: 16,
         };
         set_chain(table, 0, hdr, false);
-        for (k, seg) in bio.segs.iter().enumerate() {
+        for (k, seg) in bio.rq_segs().enumerate() {
             let p = unsafe { phys_to_virt(seg.frame).add(seg.offset) };
             // SAFETY: the bio's pages stay allocated until it completes,
             // and `unmap` runs at completion (or on the failure below)
@@ -244,7 +244,7 @@ impl VbQueue {
             addr: self.hdr_dma(t) + 16,
             len: 1,
         };
-        set_chain(table, bio.segs.len() + 1, st, true);
+        set_chain(table, table.len() - 1, st, true);
         true
     }
 
@@ -295,7 +295,7 @@ impl VbQueue {
 
 impl MqOps for VbQueue {
     fn queue_rq(&mut self, bio: Box<Bio>) -> Queued {
-        let n = bio.segs.len();
+        let n = bio.rq_nr_segs();
         if n > self.max_segs {
             return Queued::Failed(bio, KernelError::Io);
         }

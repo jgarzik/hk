@@ -3545,6 +3545,11 @@ pub fn schedule() {
     crate::sync::might_sleep();
     let Some(sched) = this_sched() else { return };
     let me = current();
+    // Held bios go out before a sleep that may wait for them (Linux
+    // sched_submit_work: blk_flush_plug)
+    if me.se.state() != RUNNING {
+        crate::block::plug::flush_on_sleep();
+    }
     // This is the rescheduling a pending NEED_RESCHED asked for
     me.clear_tif(crate::task::tif::NEED_RESCHED);
     let mut rq = sched.lock.lock();

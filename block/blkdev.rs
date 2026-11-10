@@ -161,6 +161,12 @@ pub struct Bio {
     pub end_io: Option<EndIo>,
     /// For the owner of `end_io` (Linux bi_private)
     pub private: usize,
+    /// Bios merged behind this one into one request (Linux rq->bio
+    /// chain): each ends on its own when the request does
+    /// (`rq_end`); blk-mq only
+    pub merged: BioList,
+    /// Address of the queue a plugged bio is for (`plug`)
+    pub(super) plug_q: usize,
     /// Link in a [`BioList`]
     next: Option<Box<Bio>>,
 }
@@ -177,6 +183,8 @@ impl Bio {
             status: Ok(()),
             end_io: None,
             private: 0,
+            merged: BioList::new(),
+            plug_q: 0,
             next: None,
         })
     }
@@ -201,6 +209,36 @@ impl Bio {
     pub fn sectors(&self) -> u64 {
         (self.size() as u64) >> SECTOR_SHIFT
     }
+
+    /// The bios of the request this one heads: itself, then the merged
+    fn rq_bios(&self) -> impl Iterator<Item = &Bio> {
+        core::iter::once(self).chain(self.merged.iter())
+    }
+
+    /// The request's segments, in order (Linux rq_for_each_segment)
+    pub fn rq_segs(&self) -> impl Iterator<Item = &BioSeg> {
+        self.rq_bios().flat_map(|b| b.segs.iter())
+    }
+
+    /// The request's segment count (Linux blk_rq_nr_phys_segments)
+    pub fn rq_nr_segs(&self) -> usize {
+        self.rq_bios().map(|b| b.segs.len()).sum()
+    }
+
+    /// The request's sectors (Linux blk_rq_sectors)
+    pub fn rq_sectors(&self) -> u64 {
+        self.rq_bios().map(Bio::sectors).sum()
+    }
+}
+
+/// Finish a request: the bios merged behind `bio` with its status, then
+/// `bio` (Linux blk_update_request, bio by bio). Any context.
+pub fn rq_end(mut bio: Box<Bio>) {
+    while let Some(mut b) = bio.merged.pop() {
+        b.status = bio.status;
+        bio_endio(b);
+    }
+    bio_endio(bio);
 }
 
 /// Finish a bio: hand it to its `end_io` or free it (Linux bio_endio).
@@ -227,6 +265,12 @@ pub struct BioList {
 
 // The raw tail points into the list's own boxes
 unsafe impl Send for BioList {}
+
+impl Default for BioList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl BioList {
     pub const fn new() -> Self {
@@ -258,6 +302,18 @@ impl BioList {
             self.tail = &raw mut *bio;
         }
         self.head = Some(bio);
+    }
+
+    /// The last bio
+    pub fn last_mut(&mut self) -> Option<&mut Bio> {
+        // SAFETY: `tail` is null or points into the last box of the
+        // list, which `&mut self` owns
+        unsafe { self.tail.as_mut() }
+    }
+
+    /// The bios in order
+    pub fn iter(&self) -> impl Iterator<Item = &Bio> {
+        core::iter::successors(self.head.as_deref(), |b| b.next.as_deref())
     }
 
     pub fn pop(&mut self) -> Option<Box<Bio>> {
@@ -410,7 +466,7 @@ impl RequestQueue {
                 return self.postflush(bio);
             }
         }
-        self.dispatch(bio);
+        self.submit_plugged(bio);
     }
 
     fn dispatch(&self, bio: Box<Bio>) {
@@ -418,6 +474,20 @@ impl RequestQueue {
             QueueKind::Bio(d) => d.submit_bio(bio),
             QueueKind::Mq(m) => m.submit(bio),
         }
+    }
+
+    /// A submitted bio: on the task's plug if it has one, the queue is
+    /// blk-mq and it is no flush (Linux blk_mq_submit_bio), else
+    /// dispatched
+    fn submit_plugged(&self, bio: Box<Bio>) {
+        let bio = match self.kind {
+            QueueKind::Mq(_) if bio.op != BioOp::Flush => match super::plug::hold(self, bio) {
+                Ok(()) => return,
+                Err(b) => b,
+            },
+            _ => bio,
+        };
+        self.dispatch(bio);
     }
 }
 

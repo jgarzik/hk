@@ -16,6 +16,10 @@
 //! hk bios cut at max_sectors, max_segments and max_segment_size, on
 //! logical-block boundaries ([`Cursor::next_bio`]): the same requests.
 //!
+//! The large path's bios go out plugged (Linux __blkdev_direct_IO's
+//! blk_start_plug): split or not, a batch reaches the device with one
+//! notify, and the pins between them flush the plug if they sleep.
+//!
 //! Completion: each hk bio of the I/O counts down one [`DioWait`] on the
 //! submitter's stack (Linux blkdev_dio.ref); its end_io (hardirq for
 //! virtio-blk) keeps the first error, frees the bio and completes the
@@ -193,6 +197,21 @@ impl<'a> Dio<'a> {
         let nr = it.npages(usize::MAX);
         let mut pins: KVec<PinnedPages> = KVec::try_with_capacity(nr.div_ceil(BIO_MAX_VECS) + 1)?;
         let w = DioWait::new();
+        let (done, ret) = super::plug::blk_plug(|| self.send_all(it, &mut pins, &w));
+        let r = w.finish();
+        drop(pins);
+        ret?;
+        r.map(|()| done)
+    }
+
+    /// The large path's bios, plugged: pinned and sent a bio's worth at
+    /// a time, the pins kept in `pins`; (bytes sent, the first error)
+    fn send_all<I: DioIter>(
+        &self,
+        it: &mut I,
+        pins: &mut KVec<PinnedPages>,
+        w: &DioWait,
+    ) -> (usize, Result<(), KernelError>) {
         let (mut done, mut ret) = (0usize, Ok(()));
         while it.count() > 0 {
             // Room before the pin, so a sent bio's pins are always kept
@@ -212,7 +231,7 @@ impl<'a> Dio<'a> {
                 ret = Err(KernelError::WouldBlock);
                 break;
             }
-            let sent = self.send(&pp, self.sector + (done as u64 >> SECTOR_SHIFT), &w);
+            let sent = self.send(&pp, self.sector + (done as u64 >> SECTOR_SHIFT), w);
             if let Some(pp) = self.sent(pp, &sent) {
                 // Room was reserved: no allocation, cannot fail
                 let _ = pins.try_push(pp);
@@ -225,10 +244,7 @@ impl<'a> Dio<'a> {
                 }
             }
         }
-        let r = w.finish();
-        drop(pins);
-        ret?;
-        r.map(|()| done)
+        (done, ret)
     }
 
     /// What of `pp` must stay pinned until the wait after `send` gave

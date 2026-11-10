@@ -49,7 +49,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 
-use super::blkdev::{Bio, BioList, bio_endio};
+use super::blkdev::{Bio, BioList, rq_end};
 use crate::util::error::KernelError;
 use crate::util::group_cpus::{first_cpu, group_of};
 
@@ -129,7 +129,7 @@ impl HwState {
 /// End every bio of `l` (no queue lock held)
 fn end_all(l: &mut BioList) {
     while let Some(bio) = l.pop() {
-        bio_endio(bio);
+        rq_end(bio);
     }
 }
 
@@ -201,15 +201,29 @@ impl BlkMq {
     /// Queue a bio and run its hardware queue: from thread context, or
     /// from a completion with no queue lock held (a FUA write's flush)
     pub fn submit(&self, bio: Box<Bio>) {
+        let mut l = BioList::new();
+        l.push(bio);
+        self.submit_list(&mut l);
+    }
+
+    /// Queue the bios of `l` (a plug's, Linux blk_mq_flush_plug_list)
+    /// and run their hardware queue once: one dispatch, one notify of
+    /// the device for the lot (Linux queue_rqs / commit_rqs)
+    pub fn submit_list(&self, l: &mut BioList) {
         let cpu = crate::cpu::this_id() as usize % self.ctxs.len();
         let h = self.map(cpu);
         let (w, bit) = self.ctx_bit(cpu);
         {
             let mut ctx = self.ctxs[cpu].lock();
-            ctx.push(bio);
+            ctx.append(l);
             self.ctx_maps[h][w].fetch_or(bit, Ordering::Relaxed);
         }
         self.run(h);
+    }
+
+    /// The hardware queue this CPU submits to
+    pub fn this_hctx(&self) -> usize {
+        self.map(crate::cpu::this_id() as usize % self.ctxs.len())
     }
 
     /// Splice the software queues of hardware queue `h` with bios
