@@ -545,7 +545,7 @@ fn sleep_until_signal(deadline: Option<u64>) {
     use crate::time::hrtimer::{HrClock, schedule_hrtimeout};
     loop {
         set_current_state(SleepState::Interruptible);
-        if crate::sync::waitqueue::signal_pending() {
+        if crate::sync::waitqueue::signal_pending_run_work() {
             break;
         }
         if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {

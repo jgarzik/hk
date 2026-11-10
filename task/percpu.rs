@@ -4274,7 +4274,7 @@ pub fn sleep_until(
             set_current_state(SleepState::Running);
             return Ok(());
         }
-        if interruptible && crate::sync::waitqueue::signal_pending() {
+        if interruptible && crate::sync::waitqueue::signal_pending_run_work() {
             set_current_state(SleepState::Running);
             return Err(deadline - now);
         }

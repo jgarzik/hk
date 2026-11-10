@@ -484,7 +484,14 @@ fn dio_endio(bio: Box<Bio>) {
 /// The memory and completion of an asynchronous direct I/O (Linux an
 /// async kiocb with its bvec iterator): pages pinned at least as long as
 /// the object lives, and the call that ends it
-pub trait AsyncIo: Send + Sync {
+///
+/// # Safety
+/// The pieces `segs` returns are RAM frames that stay allocated (pinned)
+/// and unchanged while the object lives: the block layer sends bios to
+/// them and holds the object until the last one ends. `complete` may be
+/// called in hardirq context: it neither sleeps nor allocates, and does
+/// not drop a reference whose release could.
+pub unsafe trait AsyncIo: Send + Sync {
     /// The I/O's memory: pinned pieces, in order
     fn segs(&self) -> &[PageSeg];
     /// The I/O ended (Linux ki_complete): the bytes done or the first

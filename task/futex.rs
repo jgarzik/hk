@@ -306,7 +306,7 @@ fn futex_sleep<F: Fn() -> bool>(queued: F, deadline_ns: Option<u64>, realtime: b
         if !queued() {
             break FutexSleep::Woken;
         }
-        if crate::sync::waitqueue::signal_pending() {
+        if crate::sync::waitqueue::signal_pending_run_work() {
             break FutexSleep::Signal;
         }
         if deadline_ns.is_some_and(|d| clock.now() >= d) {

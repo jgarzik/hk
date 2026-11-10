@@ -12,12 +12,19 @@
 //! - IO_URING_DIO_HIPRI: RWF_HIPRI on a ring without IORING_SETUP_IOPOLL
 //!   is EINVAL (Linux io_rw_init_file: polled I/O only on an IOPOLL
 //!   ring)
+//! - IO_URING_DIO_FUTEX: a timed futex wait while O_DIRECT reads end
+//!   (their completions are run by the waiting task) times out; it is
+//!   not ended with EINTR (Linux restarts it: -ERESTART_RESTARTBLOCK)
+//! - IO_URING_DIO_NONOWAIT (hk only: no USB disk on the Linux
+//!   references): an O_DIRECT read of a disk that cannot honor
+//!   IOCB_NOWAIT (sda, bio-based) goes to a worker and completes (Linux
+//!   io_file_supports_nowait)
 //!
 //! Reads use vda3's untouched first 7 MiB; writes 13..14 MiB.
 
 use super::{Ring, sqe};
 use crate::harness::{R, check, report_r};
-use crate::helpers::{BlkDev, find_blkdev};
+use crate::helpers::{BlkDev, find_blkdev, host_mode, skip};
 use hk_syscall::{
     IORING_OP_READ, IORING_OP_READV, IORING_OP_WRITE, IoVec, MAP_ANONYMOUS, MAP_PRIVATE, O_RDONLY,
     O_RDWR, PROT_READ, PROT_WRITE, SEEK_CUR, sys_close, sys_lseek, sys_mmap, sys_munmap, sys_open,
@@ -32,14 +39,20 @@ pub fn run_tests() {
         report_r(b"IO_URING_DIO", check(b"no vda3", false, 0));
         return;
     };
-    let cases: [(&[u8], fn(&BlkDev) -> R); 4] = [
+    let cases: [(&[u8], fn(&BlkDev) -> R); 5] = [
         (b"IO_URING_DIO_ASYNC", async_reads),
         (b"IO_URING_DIO_WRITE", writes),
         (b"IO_URING_DIO_CUR_POS", cur_pos),
         (b"IO_URING_DIO_HIPRI", hipri),
+        (b"IO_URING_DIO_FUTEX", futex),
     ];
     for (name, t) in cases {
         report_r(name, t(&p3));
+    }
+    if host_mode() {
+        skip(b"IO_URING_DIO_NONOWAIT", b"no USB disk (/dev/sda) on host");
+    } else {
+        report_r(b"IO_URING_DIO_NONOWAIT", nonowait());
     }
 }
 
@@ -260,4 +273,60 @@ fn hipri(d: &BlkDev) -> R {
         let c = r.pop().ok_or((&b"no cqe"[..], 0))?;
         check(b"res", c.res == -22, i64::from(c.res))
     })
+}
+
+fn futex(d: &BlkDev) -> R {
+    with_fd(d, O_RDONLY | O_DIRECT, |fd| {
+        const N: u32 = 8;
+        const SZ: usize = 1 << 20;
+        let mut r = Ring::simple(N).map_err(|e| (&b"ring"[..], e))?;
+        let b = Buf::new(N as usize * SZ)?;
+        for i in 0..N {
+            let at = i as usize * SZ;
+            r.push(sqe(
+                IORING_OP_READ,
+                fd,
+                b.addr(at),
+                SZ as u32,
+                at as u64 / 2,
+                u64::from(i),
+            ));
+        }
+        let n = r.enter(N, 0, 0);
+        check(b"submit", n == i64::from(N), n)?;
+        let word = 0u32;
+        let ts = hk_syscall::Timespec {
+            tv_sec: 0,
+            tv_nsec: 200_000_000,
+        };
+        let w = hk_syscall::sys_futex(
+            &word as *const u32 as *mut u32,
+            hk_syscall::FUTEX_WAIT,
+            0,
+            &ts,
+            core::ptr::null_mut(),
+            0,
+        );
+        reap(&r, 0, N, &mut |_, res| {
+            check(b"read", res == SZ as i32, i64::from(res))
+        })?;
+        // ETIMEDOUT, not EINTR
+        check(b"futex wait", w == -110, w)
+    })
+}
+
+fn nonowait() -> R {
+    let fd = sys_open(b"/dev/sda\0".as_ptr(), O_RDONLY | O_DIRECT, 0);
+    check(b"open sda", fd >= 0, fd)?;
+    let fd = fd as i32;
+    let r = (|| {
+        let mut r = Ring::simple(4).map_err(|e| (&b"ring"[..], e))?;
+        let b = Buf::new(4096)?;
+        r.push(sqe(IORING_OP_READ, fd, b.addr(0), 4096, 0, 1));
+        reap(&r, 1, 1, &mut |_, res| {
+            check(b"res", res == 4096, i64::from(res))
+        })
+    })();
+    sys_close(fd as u64);
+    r
 }

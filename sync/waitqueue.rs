@@ -185,6 +185,23 @@ pub fn signal_pending() -> bool {
     crate::task::percpu::current().has_tif(tif::SIGPENDING | tif::NOTIFY_SIGNAL)
 }
 
+/// A deliverable signal is pending; callbacks queued on the task alone
+/// (TIF_NOTIFY_SIGNAL) run here and the sleep goes on (call with the
+/// task's state set for the sleep: it is Running on return, and the
+/// caller's loop sets it again). For sleeps whose interruption Linux
+/// restarts with the same deadline (-ERESTART_RESTARTBLOCK: futex and
+/// nanosleep timeouts) or reports as EINTR only for a signal
+/// (sigtimedwait), which hk has no restart_block for.
+pub fn signal_pending_run_work() -> bool {
+    use crate::task::tif;
+    let me = crate::task::percpu::current();
+    if me.has_tif(tif::NOTIFY_SIGNAL) && !me.sigpending() {
+        crate::task::percpu::set_current_state(crate::task::percpu::SleepState::Running);
+        crate::task::task_work::task_work_run();
+    }
+    me.sigpending()
+}
+
 /// A pending signal ends a sleep in `state`: any signal an
 /// interruptible one, SIGKILL a killable one (Linux
 /// signal_pending_state)

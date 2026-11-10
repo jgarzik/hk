@@ -143,6 +143,13 @@ enum Mem {
     },
 }
 
+/// The I/O flags of a request: the file's (O_DIRECT, O_DSYNC, __O_SYNC,
+/// O_APPEND) and the SQE's RWF_* ones (Linux io_rw_init_file: ki_flags =
+/// iocb_flags(file), then kiocb_set_rw_flags)
+fn kiocb_flags(file: RwFlags, rwf: RwFlags) -> RwFlags {
+    file | rwf
+}
+
 /// The file takes asynchronous I/O for this request: O_DIRECT on a file
 /// that starts it without waiting
 fn async_ok(file: &File) -> bool {
@@ -208,6 +215,7 @@ fn rw_async(
     {
         return Some(Err(e));
     }
+    let flags = kiocb_flags(file.iocb_flags(), flags);
     let req = match Req::new(r, file, mem, sqe, write, flags) {
         Ok(req) => req,
         Err(e) => return Some(Err(e)),
@@ -226,7 +234,10 @@ fn rw_async(
             }
             Some(Ok(cqe_count(n)))
         }
-        Err(KernelError::WouldBlock) if !req.rwf_nowait => {
+        // A file without nonblocking issue says EOPNOTSUPP: blocking from
+        // a worker then (Linux io_file_supports_nowait; __io_read retries
+        // EOPNOTSUPP of an IOCB_NOWAIT issue from io-wq)
+        Err(KernelError::WouldBlock | KernelError::OperationNotSupported) if !req.rwf_nowait => {
             super::iowq::queue(req);
             None
         }
@@ -354,7 +365,11 @@ impl Req {
     }
 }
 
-impl AsyncIo for Req {
+// SAFETY: the pieces are the request's own pins or a registered
+// buffer's pages, which it holds (`Mem`), unchanged while it lives;
+// `complete` only stores atomics and pushes the request onto its task's
+// list (an IrqSpinlock, no allocation), dropping no task reference
+unsafe impl AsyncIo for Req {
     fn segs(&self) -> &[PageSeg] {
         match &self.mem {
             Mem::Pinned(p) => p.segs(),
@@ -390,5 +405,18 @@ impl Drop for Req {
     fn drop(&mut self) {
         self.tctx.put();
         self.ring.inflight_put();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_dsync_reaches_the_request() {
+        let f = kiocb_flags(RwFlags::DIRECT | RwFlags::DSYNC, RwFlags::empty());
+        assert!(f.contains(RwFlags::DSYNC) && f.contains(RwFlags::DIRECT));
+        let f = kiocb_flags(RwFlags::DIRECT | RwFlags::SYNC, RwFlags::NOWAIT);
+        assert!(f.contains(RwFlags::SYNC) && f.contains(RwFlags::NOWAIT));
     }
 }
