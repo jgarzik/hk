@@ -380,7 +380,8 @@ fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool
 /// of a filesystem that maps its cache (Linux filemap_fault): SIGBUS
 /// past the end of the file. None: the fault copies the data. A shared
 /// mapping maps the page itself, locked, with a reference for the PTE;
-/// a writable one dirties it (Linux do_shared_fault). A private one
+/// a write through a writable one that writes back dirties it (Linux
+/// do_shared_fault), a read maps it read-only. A private one
 /// maps it read-only on a read (do_read_fault: the cache page is shared
 /// until written) and a copy on a write (do_cow_fault).
 fn file_page(
@@ -411,11 +412,17 @@ fn file_page(
         return Some(Ok((page, true, true)));
     }
     if area.shared {
-        if area.prot & PROT_WRITE != 0 {
+        // A mapping whose pages write back tracks dirtying (Linux
+        // vma_wants_writenotify): a write dirties the page and maps it
+        // writable (do_shared_fault), a read maps it read-only and clean
+        // (do_read_fault), so its first write faults and dirties it
+        // (do_wp_page). tmpfs and ramfs map as the VMA allows.
+        let notify = area.prot & PROT_WRITE != 0 && inode.i_data.aops().can_dirty();
+        if notify && access == Access::Write {
             super::filemap::dirty_page(&inode.i_data, page);
             crate::fs::fs_writeback::mark_inode_dirty(&inode);
         }
-        return Some(Ok((page, true, false)));
+        return Some(Ok((page, true, notify && access != Access::Write)));
     }
     if access != Access::Write {
         return Some(Ok((page, true, true)));

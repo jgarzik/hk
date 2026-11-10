@@ -100,6 +100,7 @@ pub fn run_tests() {
     vfat(&d);
     swap(&d.p2);
     cache(&d.p3);
+    mmap_clean(&d.p3);
 }
 
 /// A block device's page cache (Linux bd_mapping): pwrite, pread and a
@@ -237,6 +238,37 @@ fn ioctls(p3: &BlkDev) {
     let r = sys_ioctl(fd, BLKRRPART, 0);
     verdict(b"BLK_RRPART_PART", r == EINVAL, r);
     sys_close(fd as u64);
+}
+
+/// Reading through a shared writable mapping of the device dirties
+/// nothing (Linux do_read_fault maps the page read-only, clean, when
+/// the mapping tracks dirty pages; the first write faults and dirties
+/// it): /proc/meminfo Dirty stays put over 4 MiB of reads
+fn mmap_clean(p3: &BlkDev) {
+    use crate::helpers::proc_kb;
+    use hk_syscall::{MAP_SHARED, PROT_READ, PROT_WRITE, sys_mmap, sys_munmap};
+    const LEN: u64 = 4 * MIB;
+    let fd = open_dev(p3, O_RDWR);
+    let p = sys_mmap(0, LEN, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    let before = proc_kb(b"/proc/meminfo\0", b"Dirty:");
+    let mut sum = 0u32;
+    if p > 0 {
+        for off in (0..LEN).step_by(4096) {
+            // SAFETY: inside the mapping
+            sum += u32::from(unsafe { core::ptr::read_volatile((p as u64 + off) as *const u8) });
+        }
+    }
+    let after = proc_kb(b"/proc/meminfo\0", b"Dirty:");
+    if p > 0 {
+        sys_munmap(p as u64, LEN);
+    }
+    sys_close(fd as u64);
+    let grew = after - before;
+    verdict(
+        b"BLK_MMAP_READ_CLEAN",
+        p > 0 && before >= 0 && sum > 0 && grew < 1024,
+        if p > 0 { grew } else { p },
+    );
 }
 
 /// Aligned, unaligned and last-sector reads of the pattern
