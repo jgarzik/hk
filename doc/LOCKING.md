@@ -2817,7 +2817,7 @@ static CONSOLE_REGISTRY: IrqSpinlock<ConsoleRegistry> = IrqSpinlock::new(...);
    ↓
 2. PRINTK (held briefly for ring buffer write) - IrqSpinlock
    ↓
-3. CONSOLE_REGISTRY (held during console_write) - IrqSpinlock
+3. CONSOLE_REGISTRY (console_write's snapshot of the enabled consoles) - IrqSpinlock
 ```
 
 **The record log** (`kmsg.rs`): `LOG` (IrqSpinlock) holds the
@@ -2925,13 +2925,22 @@ if self._guard.is_some() {
 
 **Console Integration:**
 
-`console::console_write()` holds `CONSOLE_REGISTRY` lock during `write_all()`:
+`console::console_write()` takes `CONSOLE_REGISTRY` only for a snapshot
+of the enabled consoles (or, with none registered, the early UART
+write), then writes each with the lock dropped; the tty console's write
+waits until the transmitter is empty before it returns (Linux
+serial8250_console_write, pl011_console_write), so nothing else needs
+to flush a console: the idle loop never touches one.
 
 ```rust
 pub fn console_write(data: &[u8]) {
-    let registry = CONSOLE_REGISTRY.lock();  // IrqSpinlock
-    if registry.has_console() {
-        registry.write_all(data);
+    let snapshot = {
+        let registry = CONSOLE_REGISTRY.lock();  // IrqSpinlock
+        // ...early UART if none registered...
+        registry.enabled_consoles_snapshot()
+    };
+    for console in snapshot.into_iter().flatten() {
+        console.write(data);  // outside the lock
     }
 }
 ```
