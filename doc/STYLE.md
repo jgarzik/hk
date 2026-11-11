@@ -35,6 +35,11 @@ The rules for `unsafe` are in `doc/UNSAFE.md` and the locking rules in
   it before taking the lock: one allocation, no allocator work inside.
   Don't pre-size long-lived, slowly growing tables or usually-empty lists,
   and `collect()` from an exact-size iterator already allocates once.
+  First ask whether Linux allocates there at all (an intrusive link, a
+  walk under the lock instead of a copy). Where Linux itself allocates
+  GFP_ATOMIC or GFP_NOWAIT under the lock, name it at the call
+  (`kalloc::try_box_gfp(v, Gfp::ATOMIC)`, `with_gfp` around a `try_*`):
+  an unnamed allocation in atomic context is listed by lockdep.
 - **Types carry meaning.** Use newtypes for addresses and numbers that
   must not be mixed up (`PhysAddr`, `VirtAddr`, `Pfn`, device numbers,
   fds), `bitflags` for flag words, and enums for closed sets.

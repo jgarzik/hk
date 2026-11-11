@@ -18,8 +18,8 @@
 //!   table) and above `IoRing.cq`.
 //! - `IoRing.cq` (Linux completion_lock; spin Mutex, thread context): the
 //!   kernel's CQ tail and the overflow list; a leaf, but for the
-//!   overflow list's (Linux GFP_ATOMIC) allocation. Wakeups come after
-//!   it is released.
+//!   overflow list's growth, GFP_NOWAIT named (Linux
+//!   io_cqe_overflow_locked). Wakeups come after it is released.
 
 pub mod abi;
 mod iowq;
@@ -45,6 +45,7 @@ use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::mm::page_alloc::Gfp;
 use crate::sync::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::current;
@@ -529,14 +530,15 @@ impl IoRing {
         tail.wrapping_sub(self.rings.cq_head()) < self.rings.cq_entries()
     }
 
-    /// Keep `cqe` until there is room (Linux io_cqring_event_overflow):
+    /// Keep `cqe` until there is room (Linux io_cqe_overflow_locked,
+    /// GFP_NOWAIT under the completion lock):
     /// at most as many as the CQ holds (Linux charges each to the memory
     /// cgroup; hk has none, so the list is bounded instead), and one that
     /// does not fit is lost: counted in cq_overflow, and the next
     /// GETEVENTS wait says EBADR (Linux IO_CHECK_CQ_DROPPED_BIT)
     fn overflow(&self, cq: &mut Cq, cqe: IoUringCqe) {
         if cq.overflow.len() >= self.rings.cq_entries() as usize
-            || cq.overflow.try_push_back(cqe).is_err()
+            || cq.overflow.try_push_back_gfp(cqe, Gfp::NOWAIT).is_err()
         {
             self.rings.inc_cq_overflow();
             self.dropped.store(true, Ordering::Release);

@@ -475,9 +475,10 @@ mod imp {
     /// The heap is about to allocate `size` bytes with no GFP named:
     /// implicitly GFP_KERNEL, which atomic context (a spin lock of any
     /// kind, preemption or interrupts off) may not use (Linux
-    /// might_alloc -> might_sleep_if). Not checked in an interrupt
-    /// handler (implicitly GFP_ATOMIC), within reclaim (PF_MEMALLOC),
-    /// or before the scheduler runs tasks (Linux skips SYSTEM_BOOTING).
+    /// might_alloc -> might_sleep_if). Not checked where the call named
+    /// a GFP (`util::kalloc::with_gfp`), in an interrupt handler
+    /// (implicitly GFP_ATOMIC), within reclaim (PF_MEMALLOC), or before
+    /// the scheduler runs tasks (Linux skips SYSTEM_BOOTING).
     /// Listed once per site as `LOCKDEP:ATOMIC_ALLOC` (an audit list,
     /// not a failure): the innermost `IrqSpinlock` taken, else the
     /// innermost tracked spin lock, else where interrupts went off.
@@ -495,7 +496,8 @@ mod imp {
         if c.irq.get() != 0 || CurrentArch::interrupt_depth() != 0 {
             return;
         }
-        if !crate::task::percpu::can_sleep()
+        if crate::util::kalloc::named_gfp().is_some()
+            || !crate::task::percpu::can_sleep()
             || crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC)
         {
             return;

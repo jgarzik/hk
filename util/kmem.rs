@@ -262,6 +262,16 @@ impl<T> KDeque<T> {
         Ok(())
     }
 
+    /// [`try_push_back`](Self::try_push_back) with `gfp` named
+    /// (`util::kalloc::with_gfp`)
+    pub fn try_push_back_gfp(
+        &mut self,
+        v: T,
+        gfp: crate::mm::page_alloc::Gfp,
+    ) -> Result<(), KernelError> {
+        crate::util::kalloc::with_gfp(gfp, || self.try_push_back(v))
+    }
+
     pub fn pop_front(&mut self) -> Option<T> {
         self.0.pop_front()
     }
