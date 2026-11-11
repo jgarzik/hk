@@ -756,6 +756,25 @@ Phase A2 (net) remaining:
   fallback): Linux has one hlist_*_rcu; unify.
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
+- TCP (`net/tcp/mod.rs`): a SYN backlogged while `listen()` owns the
+  socket is answered by `conn_request` before `apply` copies
+  `listen_opts`, so the first children get default options
+  (TCP_NODELAY, keepalive, MAXSEG, SYNCNT, DEFER_ACCEPT, congestion).
+- TCP `release_cb` runs `finish`/`apply` even with no deferred flags
+  (Linux tcp_release_cb returns early), and its wakeups run inside
+  `SockLock::drain` while the socket is still owned.
+- TCP `child_ready`/`child_gone` scan the SYN queue (`remove_first`)
+  under `TcpSock.queue`; the intrusive `accept_link` can unlink in O(1).
+- No debug check that a listener owns its bhash port (the old
+  `assert_owner` raced a close on the lockless SYN path); re-add on
+  the locked path only.
+- `util/hlist_nulls.rs` `NullsGuard::del_rcu` walks the chain to prove
+  membership (Linux hlist_nulls_del_rcu is O(1) via pprev).
+- `net/tcp/table.rs` keeps separate established and TIME_WAIT nulls
+  tables (two walks per miss, two bucket locks in hash_unique); Linux
+  has one ehash for both.
+- `net/core/neigh.rs` `nht` is an `Option` that is never None; its
+  None branch in `insert` would leak a `gc_entries` count.
 
 ## Deferred file release gaps
 
