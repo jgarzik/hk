@@ -92,7 +92,9 @@ pub struct Cgroup {
     subsys: RwSem<BTreeMap<ControllerType, Arc<CgroupSubsysState>>>,
 
     /// Tasks currently in this cgroup (pid list for iteration)
-    tasks: RwLock<Vec<Pid>>,
+    /// Member tasks, linked through `Task.cg_node` (Linux css_set->tasks
+    /// under css_set_lock): nothing allocates to join
+    tasks: RwLock<crate::util::list::List<CgTask>>,
 
     /// Removed (Linux CGRP_DEAD): set under CGROUP_MUTEX by rmdir, read
     /// under it (and lock-free by the file paths, which then fail
@@ -109,6 +111,8 @@ pub struct Cgroup {
     /// Inode number for cgroupfs
     pub ino: u64,
 }
+
+crate::adapter!(CgTask, Task, cg_node);
 
 impl Cgroup {
     /// Create a new cgroup as a child of parent, or ENOMEM
@@ -163,7 +167,7 @@ impl Cgroup {
             level,
             ancestors,
             subsys: RwSem::new(BTreeMap::new()),
-            tasks: RwLock::new(Vec::new()),
+            tasks: RwLock::new(crate::util::list::List::new()),
             dead: AtomicBool::new(false),
             subtree_control: AtomicU64::new(0),
             frozen: AtomicBool::new(false),
@@ -259,19 +263,23 @@ impl Cgroup {
             .collect()
     }
 
-    /// Add a task to this cgroup
-    pub fn add_task(&self, pid: Pid) {
+    /// Add task `t` to this cgroup, which becomes its `Task.cgroup`
+    pub fn add_task(&self, t: &Task) {
         let mut tasks = self.tasks.write();
-        if !tasks.contains(&pid) {
-            tasks.push(pid);
+        if !t.cg_node.is_linked() {
+            // SAFETY: the task stays live while linked: it leaves when it
+            // exits (detach_task) or, at the latest, is freed (its Drop)
+            unsafe { tasks.push_back(t) };
         }
     }
 
-    /// Remove a task from this cgroup
-    pub fn remove_task(&self, pid: Pid) {
+    /// Remove task `t`, whose `Task.cgroup` this is, from this cgroup
+    pub fn remove_task(&self, t: &Task) {
         let mut tasks = self.tasks.write();
-        if let Some(pos) = tasks.iter().position(|&p| p == pid) {
-            tasks.remove(pos);
+        if t.cg_node.is_linked() {
+            // SAFETY: a task's node is only ever on the list of the
+            // cgroup its `Task.cgroup` names, which the callers pass
+            unsafe { tasks.remove(t) };
         }
     }
 
@@ -285,9 +293,20 @@ impl Cgroup {
         self.dead.load(Ordering::Acquire)
     }
 
-    /// Get all tasks in this cgroup
-    pub fn tasks(&self) -> Vec<Pid> {
-        self.tasks.read().clone()
+    /// The member processes' ids (tgids, repeated per thread): sized
+    /// from the count, filled under the lock, again if it grew (Linux
+    /// cgroup.procs walks css_task_iter into a seq_file buffer)
+    pub fn task_tgids(&self) -> Vec<Pid> {
+        loop {
+            let n = self.tasks.read().len();
+            let mut v = Vec::with_capacity(n);
+            let tasks = self.tasks.read();
+            if tasks.len() > n {
+                continue;
+            }
+            v.extend(tasks.iter().map(|t| t.pid));
+            return v;
+        }
     }
 
     /// Check if cgroup is empty (no tasks, no children)
@@ -651,12 +670,12 @@ fn migrate_one(
         for (css, ops) in from {
             ops.detach(css, pid);
         }
-        old.remove_task(pid);
+        old.remove_task(t);
     }
     for (css, ops) in to {
         ops.attach(css, pid);
     }
-    target.add_task(pid);
+    target.add_task(t);
     *slot = Some(target.clone());
 }
 
@@ -674,7 +693,7 @@ pub fn detach_task(t: &Task) {
                 ops.exit(&css, pid);
             }
         }
-        cg.remove_task(pid);
+        cg.remove_task(t);
     }
 }
 
@@ -842,7 +861,7 @@ impl ForkCg {
     /// (Linux cgroup_post_fork)
     pub fn post_fork(mut self, child: &Task) {
         self.charged.clear();
-        self.cg.add_task(child.tid());
+        self.cg.add_task(child);
         set_task_cgroup(child, self.cg.clone());
     }
 }

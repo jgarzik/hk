@@ -1045,6 +1045,9 @@ pub struct Task {
     /// by to_kthread); taken when the thread exits (spin leaf)
     pub kthread: crate::sync::spin::Mutex<Option<Arc<crate::task::kthread::KThread>>>,
     pub cgroup: crate::sync::spin::Mutex<Option<Arc<crate::cgroup::Cgroup>>>,
+    /// On its cgroup's task list (Linux task->cg_list on its css_set),
+    /// under that cgroup's `tasks` lock
+    pub cg_node: crate::util::list::Link,
     /// Files `defer_fput` still has to drop while an outer frame of this
     /// task drains (Linux task_work fput); only the task itself uses it
     pub fput_defer: crate::sync::spin::Mutex<Option<Vec<Arc<crate::fs::File>>>>,
@@ -1879,6 +1882,7 @@ impl Task {
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
+            cg_node: crate::util::list::Link::new(),
             fput_defer: crate::sync::spin::Mutex::new(None),
             task_works: task_work::TaskWorks::new(),
             io_thread: spin::Once::new(),
@@ -1951,6 +1955,7 @@ impl Task {
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
+            cg_node: crate::util::list::Link::new(),
             fput_defer: crate::sync::spin::Mutex::new(None),
             task_works: task_work::TaskWorks::new(),
             io_thread: spin::Once::new(),
@@ -3055,4 +3060,16 @@ pub fn cgroup_from_fd(fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
         .upgrade()
         .filter(|c| !c.is_dead())
         .ok_or(KernelError::NotFound)
+}
+
+/// A task freed while still on a cgroup's task list (it never ran its
+/// exit) leaves it first, so the list never names freed memory
+impl Drop for Task {
+    fn drop(&mut self) {
+        if self.cg_node.is_linked()
+            && let Some(cg) = self.cgroup.get_mut().take()
+        {
+            cg.remove_task(self);
+        }
+    }
 }

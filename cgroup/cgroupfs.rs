@@ -346,14 +346,7 @@ fn generate_control_file_content(
         CgroupControlFileType::Procs => {
             // Each member process once, by its tgid (Linux cgroup.procs;
             // cgroup.threads would list the threads)
-            let mut tgids: Vec<Pid> = {
-                let table = crate::task::percpu::TASKLIST.read();
-                cgroup
-                    .tasks()
-                    .into_iter()
-                    .filter_map(|tid| table.get(tid as crate::task::Tid).map(|t| t.task.pid))
-                    .collect()
-            };
+            let mut tgids = cgroup.task_tgids();
             tgids.sort_unstable();
             tgids.dedup();
             let mut content = String::new();
