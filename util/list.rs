@@ -8,13 +8,14 @@
 //! - [`List`]: raw, for items whose lifetime the owner manages (entries
 //!   pinned on a waiter's stack that unlink themselves before they go,
 //!   Linux wait_queue_entry).
-//! - [`ArcList`]: the list owns one strong reference per entry
-//!   (`Arc::into_raw` on insert, back on removal): run queues, children
-//!   and thread-group lists.
+//! - [`PtrList`]: the list owns each entry through an owning pointer
+//!   ([`ListPtr`]: `into_raw` on insert, back on removal):
+//!   [`ArcList`] one strong reference per entry (run queues, children
+//!   and thread-group lists), [`BoxList`] the entry itself (queued
+//!   signals, the packet backlog).
 //! - [`OwnedList`]: an `ArcList` whose items carry an [`Owner`] mark,
 //!   so removing or stepping from any given item is safe in O(1): a
 //!   dentry's children.
-//! - [`BoxList`]: the list owns each entry as a `Box`: queued signals.
 //! - [`WeakList`]: the list holds a `Weak` per entry, which leaves it in
 //!   its own teardown: superblocks, a superblock's mounts and inodes.
 //!
@@ -22,7 +23,7 @@
 //! that owns the list (the caller's: `&mut List` is that proof); the
 //! link words are atomics only so items stay `Sync`. An item is on at
 //! most one list per link: a link off every list holds [`UNLINKED`] (on
-//! a list, the ends hold null), which [`ArcList`] checks on insert.
+//! a list, the ends hold null), which [`PtrList`] checks on insert.
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
@@ -377,18 +378,69 @@ impl<'a, A: Adapter> Iterator for Iter<'a, A> {
     }
 }
 
-/// A [`List`] that owns a strong reference to each entry
+/// An owning pointer a [`PtrList`] can hold as a raw pointer: `Box`
+/// (the list owns the entry) or `Arc` (the list owns one reference)
 ///
-/// # Invariants
-/// Every item on `list` was inserted with `Arc::into_raw`: the list
-/// holds that reference until the item leaves it through `from_raw`.
-pub struct ArcList<A: Adapter> {
-    list: List<A>,
-    /// It drops `Arc<Item>`s wherever it goes: Send/Sync as Arc's
-    _owns: PhantomData<Arc<A::Item>>,
+/// # Safety
+/// `into_raw` hands over ownership as a pointer to the live value
+/// `Deref` reached, which stays live and unmoved until `from_raw` takes
+/// it back; `from_raw(into_raw(p))` is `p` again.
+pub unsafe trait ListPtr: core::ops::Deref<Target: Sized> {
+    fn into_raw(this: Self) -> *const Self::Target;
+    /// # Safety
+    /// `p` came from `into_raw` of this pointer type and is taken back
+    /// once.
+    unsafe fn from_raw(p: *const Self::Target) -> Self;
 }
 
-impl<A: Adapter> ArcList<A> {
+// SAFETY: Box::into_raw/from_raw; a box's value never moves
+unsafe impl<T> ListPtr for Box<T> {
+    #[inline]
+    fn into_raw(this: Self) -> *const T {
+        Box::into_raw(this)
+    }
+    #[inline]
+    unsafe fn from_raw(p: *const T) -> Self {
+        // SAFETY: from `into_raw` (the caller), taken back once
+        unsafe { Box::from_raw(p.cast_mut()) }
+    }
+}
+
+// SAFETY: Arc::into_raw/from_raw keep the reference; the value never
+// moves
+unsafe impl<T> ListPtr for Arc<T> {
+    #[inline]
+    fn into_raw(this: Self) -> *const T {
+        Arc::into_raw(this)
+    }
+    #[inline]
+    unsafe fn from_raw(p: *const T) -> Self {
+        // SAFETY: from `into_raw` (the caller), taken back once
+        unsafe { Arc::from_raw(p) }
+    }
+}
+
+/// A [`List`] that owns its entries through `P` (Linux list_head of
+/// kmalloc'd or refcounted entries): a [`BoxList`] owns each entry
+/// (struct sigpending's sigqueues, the per-CPU packet backlog), an
+/// [`ArcList`] one strong reference to each (run queues, children and
+/// thread-group lists)
+///
+/// # Invariants
+/// Every item on `list` was inserted with `P::into_raw`: the list owns
+/// that pointer until the item leaves it through `from_raw`.
+pub struct PtrList<A: Adapter, P: ListPtr<Target = A::Item>> {
+    list: List<A>,
+    /// It drops `P`s wherever it goes: Send/Sync as P's
+    _owns: PhantomData<P>,
+}
+
+/// A [`PtrList`] owning each entry as a `Box`
+pub type BoxList<A> = PtrList<A, Box<<A as Adapter>::Item>>;
+/// A [`PtrList`] owning a strong reference to each entry
+pub type ArcList<A> = PtrList<A, Arc<<A as Adapter>::Item>>;
+
+impl<A: Adapter, P: ListPtr<Target = A::Item>> PtrList<A, P> {
     pub const fn new() -> Self {
         Self {
             list: List::new(),
@@ -404,49 +456,50 @@ impl<A: Adapter> ArcList<A> {
         self.list.is_empty()
     }
 
-    /// Append `item`; panics if it is on a list through this link
-    pub fn push_back(&mut self, item: Arc<A::Item>) {
-        assert!(A::link(&item).claim(), "ArcList: item already linked");
+    /// Append `item` (Linux list_add_tail); panics if it is on a list
+    /// through this link
+    pub fn push_back(&mut self, item: P) {
+        assert!(A::link(&item).claim(), "list: item already linked");
         // SAFETY: unlinked and claimed for this insert (the CAS), and live
-        // while the list owns this reference
-        unsafe { self.list.push_back(Arc::into_raw(item)) };
+        // while the list owns it
+        unsafe { self.list.push_back(P::into_raw(item)) };
     }
 
-    /// Prepend `item` (as `push_back`)
-    pub fn push_front(&mut self, item: Arc<A::Item>) {
-        assert!(A::link(&item).claim(), "ArcList: item already linked");
+    /// Prepend `item` (Linux list_add; as `push_back`)
+    pub fn push_front(&mut self, item: P) {
+        assert!(A::link(&item).claim(), "list: item already linked");
         // SAFETY: as above
-        unsafe { self.list.push_front(Arc::into_raw(item)) };
+        unsafe { self.list.push_front(P::into_raw(item)) };
     }
 
-    /// Unlink `item` and hand back the list's reference
+    /// Unlink `item` and hand back the list's pointer
     ///
     /// # Safety
     /// `item` is on this list.
-    pub unsafe fn remove(&mut self, item: &A::Item) -> Arc<A::Item> {
+    pub unsafe fn remove(&mut self, item: &A::Item) -> P {
         let p = core::ptr::from_ref::<A::Item>(item);
-        // SAFETY: on this list, which holds the reference from into_raw
+        // SAFETY: on this list, which owns it from into_raw
         unsafe {
             self.list.remove(p);
-            Arc::from_raw(p)
+            P::from_raw(p)
         }
     }
 
     /// Remove and return the first entry
-    pub fn pop_front(&mut self) -> Option<Arc<A::Item>> {
+    pub fn pop_front(&mut self) -> Option<P> {
         // SAFETY: entries were inserted with into_raw
-        self.list.pop_front().map(|p| unsafe { Arc::from_raw(p) })
+        self.list.pop_front().map(|p| unsafe { P::from_raw(p) })
     }
 
     /// Remove and return the last entry
-    pub fn pop_back(&mut self) -> Option<Arc<A::Item>> {
+    pub fn pop_back(&mut self) -> Option<P> {
         // SAFETY: entries were inserted with into_raw
-        self.list.pop_back().map(|p| unsafe { Arc::from_raw(p) })
+        self.list.pop_back().map(|p| unsafe { P::from_raw(p) })
     }
 
     /// The first entry
     pub fn front(&self) -> Option<&A::Item> {
-        // SAFETY: live while on the list (the list holds a reference)
+        // SAFETY: live while on the list (the list owns it)
         self.list.front().map(|p| unsafe { &*p })
     }
 
@@ -454,8 +507,37 @@ impl<A: Adapter> ArcList<A> {
         self.list.iter()
     }
 
+    /// Unlink and return the first entry `f` picks
+    pub fn remove_first(&mut self, f: impl Fn(&A::Item) -> bool) -> Option<P> {
+        let p = core::ptr::from_ref(self.list.iter().find(|i| f(i))?);
+        // SAFETY: found on this list, which owns it from into_raw
+        unsafe {
+            self.list.remove(p);
+            Some(P::from_raw(p))
+        }
+    }
+
+    /// Unlink every entry `f` picks, in one walk, handing each to `sink`
+    /// in list order (Linux list_for_each_entry_safe + list_del)
+    pub fn drain_if(&mut self, mut f: impl FnMut(&A::Item) -> bool, mut sink: impl FnMut(P)) {
+        let mut cur = self.list.front();
+        while let Some(p) = cur {
+            // SAFETY: `p` is on this list; its successor is read before
+            // `p` may leave it
+            cur = unsafe { self.list.next(p) };
+            // SAFETY: a live entry of this list
+            if f(unsafe { &*p }) {
+                // SAFETY: on this list, which owns it from into_raw
+                unsafe {
+                    self.list.remove(p);
+                    sink(P::from_raw(p));
+                }
+            }
+        }
+    }
+
     /// Move every entry `f` picks to the tail of `to`, in order, with
-    /// its reference (Linux move_expired_inodes' list_move to the
+    /// its pointer (Linux move_expired_inodes' list_move to the
     /// dispatch queue)
     pub fn move_if(&mut self, to: &mut Self, mut f: impl FnMut(&A::Item) -> bool) {
         let mut cur = self.list.front();
@@ -463,11 +545,11 @@ impl<A: Adapter> ArcList<A> {
             // SAFETY: `p` is on this list; its successor is read before
             // `p` may leave it
             cur = unsafe { self.list.next(p) };
-            // SAFETY: a live entry (the list holds a reference)
+            // SAFETY: a live entry (the list owns it)
             if f(unsafe { &*p }) {
-                // SAFETY: on this list, then on no list; both lists hold
-                // one into_raw reference per entry (type invariant), so
-                // the reference moves with it
+                // SAFETY: on this list, then on no list; both lists own
+                // one into_raw pointer per entry (type invariant), so
+                // the pointer moves with it
                 unsafe {
                     self.list.remove(p);
                     to.list.push_back(p);
@@ -477,7 +559,13 @@ impl<A: Adapter> ArcList<A> {
     }
 }
 
-impl<A: Adapter> Drop for ArcList<A> {
+impl<A: Adapter, P: ListPtr<Target = A::Item>> Default for PtrList<A, P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A: Adapter, P: ListPtr<Target = A::Item>> Drop for PtrList<A, P> {
     fn drop(&mut self) {
         while self.pop_front().is_some() {}
     }
@@ -786,110 +874,6 @@ impl<'a, A: Adapter> WeakEntry<'a, A> {
     /// Some strong reference is alive
     pub fn is_live(&self) -> bool {
         self.weak().strong_count() != 0
-    }
-}
-
-/// A [`List`] that owns each entry as a `Box` (Linux list_head of
-/// kmalloc'd entries: struct sigpending's sigqueues)
-///
-/// # Invariants
-/// Every item on `list` was inserted with `Box::into_raw`: the list owns
-/// it until it leaves through `from_raw`.
-pub struct BoxList<A: Adapter> {
-    list: List<A>,
-    /// It drops `Box<Item>`s wherever it goes: Send/Sync as Box's
-    _owns: PhantomData<Box<A::Item>>,
-}
-
-impl<A: Adapter> BoxList<A> {
-    pub const fn new() -> Self {
-        Self {
-            list: List::new(),
-            _owns: PhantomData,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.list.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.list.is_empty()
-    }
-
-    /// Append `item` (Linux list_add_tail); panics if it is on a list
-    /// through this link
-    pub fn push_back(&mut self, item: Box<A::Item>) {
-        assert!(A::link(&item).claim(), "BoxList: item already linked");
-        // SAFETY: unlinked and claimed for this insert (the CAS), and live
-        // while the list owns it
-        unsafe { self.list.push_back(Box::into_raw(item)) };
-    }
-
-    /// Remove and return the first entry
-    pub fn pop_front(&mut self) -> Option<Box<A::Item>> {
-        // SAFETY: entries were inserted with into_raw
-        self.list
-            .pop_front()
-            .map(|p| unsafe { Box::from_raw(p.cast_mut()) })
-    }
-
-    /// Unlink `item` and hand it back
-    ///
-    /// # Safety
-    /// `item` is on this list.
-    pub unsafe fn remove(&mut self, item: &A::Item) -> Box<A::Item> {
-        let p = core::ptr::from_ref::<A::Item>(item);
-        // SAFETY: on this list (the caller), which owns it from into_raw
-        unsafe {
-            self.list.remove(p);
-            Box::from_raw(p.cast_mut())
-        }
-    }
-
-    /// Unlink and return the first entry `f` picks
-    pub fn remove_first(&mut self, f: impl Fn(&A::Item) -> bool) -> Option<Box<A::Item>> {
-        let p = core::ptr::from_ref(self.list.iter().find(|i| f(i))?);
-        // SAFETY: found on this list, which owns it from into_raw
-        unsafe {
-            self.list.remove(p);
-            Some(Box::from_raw(p.cast_mut()))
-        }
-    }
-
-    /// Unlink every entry `f` picks, in one walk, handing each to `sink`
-    /// in list order
-    pub fn drain_if(&mut self, f: impl Fn(&A::Item) -> bool, mut sink: impl FnMut(Box<A::Item>)) {
-        let mut cur = self.list.front();
-        while let Some(p) = cur {
-            // SAFETY: `p` is on this list; its successor is read before
-            // `p` may leave it
-            cur = unsafe { self.list.next(p) };
-            // SAFETY: a live entry of this list
-            if f(unsafe { &*p }) {
-                // SAFETY: on this list, which owns it from into_raw
-                unsafe {
-                    self.list.remove(p);
-                    sink(Box::from_raw(p.cast_mut()));
-                }
-            }
-        }
-    }
-
-    pub fn iter(&self) -> Iter<'_, A> {
-        self.list.iter()
-    }
-}
-
-impl<A: Adapter> Default for BoxList<A> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<A: Adapter> Drop for BoxList<A> {
-    fn drop(&mut self) {
-        while self.pop_front().is_some() {}
     }
 }
 

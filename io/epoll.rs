@@ -579,7 +579,7 @@ impl Drop for Eventpoll {
                 drop(off);
             }
         }
-        let ready = core::mem::replace(self.lock.get_mut(), ArcList::new());
+        let ready = core::mem::take(self.lock.get_mut());
         drop(ready);
         drop(items);
     }

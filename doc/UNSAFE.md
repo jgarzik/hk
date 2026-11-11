@@ -45,7 +45,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | vmalloc-area range `VmArea` (`mm/vmalloc.rs`, Linux vm_struct) | ownership token |
 | kernel stack `VmStack`, a task's `StackSlot` (`mm/vmstack.rs`) | ownership token |
 | red-black tree `RbTree` / `RbTreeNodeReservation` (`util/rbtree.rs`, Linux rb_root) | owning container of preallocated nodes |
-| hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList` (`util/list.rs`) | owning intrusive containers, membership checked |
+| hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box` or `Arc`: `BoxList`, `ArcList`) (`util/list.rs`) | owning intrusive containers, membership checked |
 
 Make each wrapper `#[inline]`: it must compile to the same code as the
 open-coded `unsafe` it replaces.
