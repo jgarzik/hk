@@ -762,6 +762,27 @@ impl<K: Ord, V> RbTree<K, V> {
         Some(RbTreeNode { node })
     }
 
+    /// `key`'s value, mutably, after showing `visit` every other entry
+    /// the search passes on its way down from the root (Linux
+    /// inetpeer.c lookup(), which gathers its gc_stack on that path)
+    pub fn get_mut_visiting(&mut self, key: &K, mut visit: impl FnMut(&K, &V)) -> Option<&mut V> {
+        let mut n = self.root.node;
+        while !n.is_null() {
+            // SAFETY: a link of this tree heads a live node (type
+            // invariant); the borrow ends in this iteration
+            let node = unsafe { &*n.cast::<Node<K, V>>() };
+            n = match key.cmp(&node.key) {
+                Ordering::Less => node.link.left,
+                Ordering::Greater => node.link.right,
+                Ordering::Equal => break,
+            };
+            visit(&node.key, &node.value);
+        }
+        // SAFETY: null or a link of this tree heading a live node, whose
+        // tree is borrowed mutably; no other borrow of it is live
+        (!n.is_null()).then(|| unsafe { &mut (*n.cast::<Node<K, V>>()).value })
+    }
+
     /// The entries with keys from `key` up, in order (BTreeMap
     /// `range(key..)`; Rust-for-Linux `cursor_lower_bound`)
     pub fn range_from(&self, key: &K) -> Iter<'_, K, V> {
@@ -1453,6 +1474,24 @@ mod tests {
 
     fn node<K, V>(k: K, v: V) -> RbTreeNode<K, V> {
         RbTreeNodeReservation::new().unwrap().into_node(k, v)
+    }
+
+    /// A lookup shows the entries on its search path, not the one found
+    #[test]
+    fn get_mut_visiting_path() {
+        let mut t = RbTree::new();
+        for k in 0..15u32 {
+            assert!(t.insert(node(k, k * 10)).is_none());
+        }
+        let mut seen = Vec::new();
+        *t.get_mut_visiting(&5, |k, _| seen.push(*k)).unwrap() += 1;
+        assert_eq!(t.get(&5), Some(&51));
+        assert!(!seen.contains(&5) && !seen.is_empty() && seen.len() < 5);
+        // A miss shows the whole path to the empty slot
+        let mut miss = Vec::new();
+        assert!(t.get_mut_visiting(&99, |k, _| miss.push(*k)).is_none());
+        assert_eq!(miss.last(), Some(&14));
+        assert!(miss.windows(2).all(|w| w[0] < w[1]));
     }
 
     /// xorshift64: deterministic, no crates

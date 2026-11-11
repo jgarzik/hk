@@ -638,6 +638,50 @@ impl<A: Adapter, O: UniqueOwner> RcuHList<A, O> {
         let arc = unsafe { Arc::from_raw(A::item(cur)) };
         Some(RcuUnlinked(Some(arc), PhantomData))
     }
+
+    /// Move every entry, with its reference, to the head of the chain
+    /// `to` picks for it, with no grace period in between (Linux
+    /// neigh_hash_grow: hlist_del_rcu, then hlist_add_head_rcu of the
+    /// same node into the new table). A reader standing on a moved
+    /// entry walks on into its new chain: it may miss entries, but
+    /// every link it reaches is live. Panics if `to` picks this chain.
+    pub fn move_all<'b>(&self, mut to: impl FnMut(&A::Item) -> &'b Self, _o: &mut O)
+    where
+        Self: 'b,
+    {
+        loop {
+            let cur = self.first.load(Relaxed);
+            if cur.is_null() {
+                return;
+            }
+            // SAFETY: the first link of this chain, live (invariant;
+            // `O`'s lock held)
+            let item = unsafe { &*A::item(cur) };
+            let dst = to(item);
+            assert!(!core::ptr::eq(dst, self), "RcuHList: moved to itself");
+            // SAFETY: `cur` and its successor are links of this chain;
+            // `dst` is another chain under the same lock (`_o`), its
+            // first link live. `cur` stays claimed throughout.
+            unsafe {
+                let next = (*cur).next();
+                self.first.store(next, Release);
+                if let Some(n) = next.as_ref() {
+                    n.set_prev(null_mut());
+                }
+                let first = dst.first.load(Relaxed);
+                // A reader standing on `cur` follows this into `dst`,
+                // whose links were published initialized
+                (*cur).publish_next(first);
+                (*cur).set_prev(null_mut());
+                if let Some(f) = first.as_ref() {
+                    f.set_prev(cur);
+                }
+            }
+            // INVARIANT: `cur` heads `dst` with the reference this chain
+            // held
+            dst.first.store(cur, Release);
+        }
+    }
 }
 
 impl<A: Adapter, O: UniqueOwner> Drop for RcuHList<A, O> {
@@ -862,5 +906,40 @@ mod tests {
         drop(h);
         assert_eq!(Arc::strong_count(&a), 1);
         assert!(!a.link.is_linked());
+    }
+
+    /// A rehash moves entries and their references between chains at
+    /// once; a reader standing on one walks on into its new chain
+    #[test]
+    fn hash_chain_move() {
+        let mut o = Owner;
+        let old = RcuHList::<ItemLink, Owner>::new();
+        let new = [RcuHList::new(), RcuHList::new()];
+        let a = item(1);
+        old.push_front(a.clone(), &mut o);
+        for v in 2..=4 {
+            old.push_front(item(v), &mut o);
+        }
+        new[1].push_front(item(9), &mut o);
+        let g = read_lock();
+        let mut it = old.iter(&g);
+        assert_eq!(it.next().map(|i| i.v), Some(4));
+        old.move_all(|i| &new[(i.v % 2) as usize], &mut o);
+        // The reader had read 4 and stood at 3, which moved to the odd
+        // chain: it walks on there
+        assert_eq!(it.map(|i| i.v).collect::<Vec<_>>(), [3, 9]);
+        drop(g);
+        assert_eq!(old.iter_locked(&o).count(), 0);
+        fn vals(h: &RcuHList<ItemLink, Owner>, o: &Owner) -> Vec<u32> {
+            h.iter_locked(o).map(|i| i.v).collect()
+        }
+        assert_eq!(vals(&new[0], &o), [2, 4]);
+        assert_eq!(vals(&new[1], &o), [1, 3, 9]);
+        assert_eq!(Arc::strong_count(&a), 2);
+        // The moved links stay usable: removal from the new chain
+        drop(new[1].remove_first(|i| i.v == 3, &mut o));
+        assert_eq!(vals(&new[1], &o), [1, 9]);
+        drop(new);
+        assert_eq!(Arc::strong_count(&a), 1);
     }
 }

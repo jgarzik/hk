@@ -292,7 +292,12 @@ entries off through `&mut` (`drain`: no reader or writer is left, so
 no grace period). `RcuHList` (Linux hlist_head, _rcu ops) is a hash
 chain with no lock of its own: its writers pass the `UniqueOwner` data
 of the lock they hold (1.4.1's `LockedBy` proof), so a table of chains
-under one lock costs a pointer per bucket. `util::rcuhlist::RcuHList`
+under one lock costs a pointer per bucket. A table grows by moving
+every entry of a chain into a new table's chains under that lock with
+no grace period (`move_all`, Linux neigh_hash_grow): a reader standing
+on a moved entry walks on into its new chain and may miss entries, so
+a lookup that must not miss repeats under the lock. `RcuArc::empty` is
+a static pointer published by its init. `util::rcuhlist::RcuHList`
 is one RCU hash chain (Linux hlist_*_rcu: `next`/`pprev` nodes, a
 strong reference per entry, its own spin leaf for writers, which a
 table nests under its own lock): readers walk it under a guard,

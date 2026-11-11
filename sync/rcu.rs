@@ -291,6 +291,14 @@ unsafe impl<T: Send + Sync> Send for RcuArc<T> {}
 unsafe impl<T: Send + Sync> Sync for RcuArc<T> {}
 
 impl<T> RcuArc<T> {
+    /// Holding nothing yet (Linux a static `__rcu` pointer, NULL until
+    /// its init publishes the first version)
+    pub const fn empty() -> Self {
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
     /// Holding `v`
     pub fn new(v: Arc<T>) -> Self {
         Self {
