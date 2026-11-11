@@ -7,6 +7,7 @@
 //! - capget, capset (capabilities)
 //! - pidfd_open, pidfd_send_signal, pidfd_getfd (pidfd operations)
 
+use crate::fs::FileRef;
 use crate::fs::file::File;
 use crate::signal::Signal;
 use crate::uaccess::{UserPtr, access_ok};
@@ -1091,7 +1092,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> KernelResult<i3
 /// File `targetfd` of the process `pidfd_file` refers to (Linux
 /// __pidfd_fget): looked up under that process's exec_update read lock,
 /// with PTRACE_MODE_ATTACH_REALCREDS access
-fn pidfd_fget(pidfd_file: &File, targetfd: i32) -> KernelResult<alloc::sync::Arc<File>> {
+fn pidfd_fget(pidfd_file: &File, targetfd: i32) -> KernelResult<FileRef> {
     // The pidfd's process itself, while it is still there
     let target = crate::task::pidfd::pidfd_task(pidfd_file)?;
 

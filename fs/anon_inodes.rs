@@ -25,6 +25,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Once;
 
 use crate::cpu::PerCpu;
+use crate::fs::FileRef;
 use crate::fs::file::{File, FileOps};
 use crate::fs::inode::{Inode, InodeMode, InodeOps, Timespec};
 use crate::sync::IrqSpinlock;
@@ -101,9 +102,9 @@ pub fn anon_inode_getfile(
     f_op: &'static dyn FileOps,
     private: Arc<dyn Any + Send + Sync>,
     flags: u32,
-) -> Result<Arc<File>, KernelError> {
+) -> Result<FileRef, KernelError> {
     let inode = ANON_INODE.get().cloned().ok_or(KernelError::NoDevice)?;
     let p = crate::fs::pseudo::ANON_INODEFS.path(name, inode)?;
     let (mnt, dentry) = p.into_parts();
-    try_arc(File::new_anon(dentry, Some(mnt), flags, f_op, private))
+    File::new_anon(dentry, Some(mnt), flags, f_op, private).alloc()
 }

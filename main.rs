@@ -298,6 +298,9 @@ pub(crate) fn kmain() -> ! {
     // Tasks can be scheduled from here (Linux rest_init)
     system_state::set_system_state(system_state::SystemState::Scheduling);
 
+    // The files' delayed release (Linux vfs_caches_init: files_init,
+    // before mnt_init)
+    fs::file::files_init();
     // Linux order: mnt_init (start_kernel), then do_basic_setup:
     // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
     // (chr_dev_init), then device initcalls (bus probes below)
@@ -367,6 +370,7 @@ pub(crate) fn kmain() -> ! {
     }
     // Everything was copied out (Linux do_populate_rootfs)
     initrd.free();
+    init_flush_fput();
 
     // ========================================================================
     // Phase 6b: Graphics Console Initialization
@@ -460,6 +464,14 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> util::error::KernelError {
         Ok(never) => match never {},
         Err(e) => e,
     }
+}
+
+/// The files closed so far are released (Linux init/do_mounts.h
+/// init_flush_fput, at the end of do_populate_rootfs): pid 1's queued
+/// on it, and those on the delayed list
+fn init_flush_fput() {
+    fs::file::flush_delayed_fput();
+    task::task_work::task_work_run();
 }
 
 /// Default RAM disk size in MB

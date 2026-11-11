@@ -1,8 +1,7 @@
 //! read/write family (Linux fs/read_write.c): read, write, lseek,
 //! pread64, pwrite64 and the shared core used by the vectored calls
 
-use alloc::sync::Arc;
-
+use crate::fs::FileRef;
 use crate::fs::{File, KernelError, RwFlags};
 use crate::uaccess::{UserPtr, access_ok};
 use crate::util::error::KernelResult;
@@ -15,7 +14,7 @@ use super::syscall::{MAX_RW_COUNT, current_fd_table};
 /// The current task's file at `fd`, or EBADF, a path-only (O_PATH)
 /// one included (Linux fget/fdget): the fd table lock is dropped before
 /// return
-pub fn fget(fd: i32) -> Result<Arc<File>, KernelError> {
+pub fn fget(fd: i32) -> Result<FileRef, KernelError> {
     fget_raw(fd).and_then(|f| {
         if f.is_path() {
             Err(KernelError::BadFd)
@@ -27,14 +26,14 @@ pub fn fget(fd: i32) -> Result<Arc<File>, KernelError> {
 
 /// As `fget`, a path-only file too (Linux fget_raw/fdget_raw): for the
 /// calls that only need where the file is (fstat, fstatfs, fchdir)
-pub fn fget_raw(fd: i32) -> Result<Arc<File>, KernelError> {
+pub fn fget_raw(fd: i32) -> Result<FileRef, KernelError> {
     current_fd_table().lock().get(fd).ok_or(KernelError::BadFd)
 }
 
 /// Install `file` at the current task's lowest free descriptor with fd
 /// flags `flags` (Linux get_unused_fd_flags + fd_install): EMFILE past
 /// RLIMIT_NOFILE, ENOMEM if the table cannot grow
-pub fn fd_install(file: Arc<File>, flags: u32) -> Result<i32, KernelError> {
+pub fn fd_install(file: FileRef, flags: u32) -> Result<i32, KernelError> {
     let nofile = super::syscall::get_nofile_limit();
     current_fd_table()
         .lock()

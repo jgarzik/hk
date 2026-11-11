@@ -98,7 +98,7 @@ pub struct ShmidKernel {
     /// Last operation PID
     pub lpid: AtomicI32,
     /// The segment's file on the kernel's tmpfs (its pages)
-    pub file: Arc<crate::fs::File>,
+    pub file: crate::fs::FileRef,
     /// That file's inode (its resident pages, read under the table lock)
     inode: Arc<crate::fs::Inode>,
     /// Destroyed (namespace totals given back): at most once

@@ -31,6 +31,7 @@ use super::rsrc::RegBuf;
 use super::tctx::{Tctx, tctx};
 use super::{IoRing, Submit};
 use crate::block::dio::AsyncIo;
+use crate::fs::FileRef;
 use crate::fs::file::{File, RwFlags};
 use crate::fs::iov::IoVec;
 use crate::fs::iov_iter::{IovDest, IovSource};
@@ -46,7 +47,7 @@ use crate::util::smallvec::SmallVec;
 
 /// The SQE's file, opened for reading (`write` false) or writing, like
 /// read(2)/write(2) (EBADF)
-fn rw_file(r: &IoRing, s: &Submit, sqe: &IoUringSqe, write: bool) -> KernelResult<Arc<File>> {
+fn rw_file(r: &IoRing, s: &Submit, sqe: &IoUringSqe, write: bool) -> KernelResult<FileRef> {
     let file = r.sqe_file(s, sqe)?;
     let ok = if write {
         file.is_writable()
@@ -198,7 +199,7 @@ fn kiocb_flags(file: RwFlags, flags: RwFlags, rwf: u32) -> RwFlags {
 /// None when punted
 fn rw_nowait(
     r: &Arc<IoRing>,
-    file: Arc<File>,
+    file: FileRef,
     sqe: &IoUringSqe,
     write: bool,
     flags: RwFlags,
@@ -345,7 +346,7 @@ fn pin(segs: &[IoVec], write: bool) -> KernelResult<PinnedPages> {
 /// nonblocking): None when queued; the result when it ended at once
 fn rw_async(
     r: &Arc<IoRing>,
-    file: Arc<File>,
+    file: FileRef,
     mem: Mem,
     sqe: &IoUringSqe,
     write: bool,
@@ -402,7 +403,7 @@ pub struct Req {
     creds: Arc<Cred>,
     user_data: u64,
     skip_success: bool,
-    file: Arc<File>,
+    file: FileRef,
     pos: u64,
     /// The offset was -1: the file position (Linux REQ_F_CUR_POS)
     cur_pos: bool,
@@ -428,7 +429,7 @@ impl Req {
     /// ring and task
     fn new(
         r: &Arc<IoRing>,
-        file: Arc<File>,
+        file: FileRef,
         mem: Mem,
         sqe: &IoUringSqe,
         write: bool,

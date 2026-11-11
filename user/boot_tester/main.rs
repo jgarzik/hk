@@ -343,6 +343,7 @@ pub fn run_all_tests() {
     io::eventfd::run_tests();
     io::epoll::run_tests();
     io::pollperm::run_tests();
+    io::last_close::run_tests();
     signal::signalfd::run_tests();
     process::prctl::run_tests();
     fs::inotify::run_tests();

@@ -19,7 +19,7 @@ use super::abi::IoEvent;
 use super::ctx::Kioctx;
 use super::poll::PollIocb;
 use crate::block::dio::AsyncIo;
-use crate::fs::file::File;
+use crate::fs::FileRef;
 use crate::io::eventfd::Eventfd;
 use crate::mm::gup::{PageSeg, PinnedPages};
 use crate::util::error::KernelError;
@@ -39,7 +39,7 @@ pub enum Op {
 /// What a request is made with (Linux __io_submit_one's setup)
 pub struct Base {
     pub ctx: Arc<Kioctx>,
-    pub file: Arc<File>,
+    pub file: FileRef,
     pub eventfd: Option<Arc<Eventfd>>,
     /// The iocb's aio_data
     pub data: u64,
@@ -55,7 +55,7 @@ pub struct Kiocb {
     active: Link,
     /// Dropped before `file`: a poll's wait entry is on the file's queue
     op: Op,
-    file: Arc<File>,
+    file: FileRef,
     eventfd: Option<Arc<Eventfd>>,
     data: u64,
     obj: u64,
@@ -117,7 +117,7 @@ impl Kiocb {
         &self.ctx.0
     }
 
-    pub fn file(&self) -> &Arc<File> {
+    pub fn file(&self) -> &FileRef {
         &self.file
     }
 

@@ -159,6 +159,19 @@ pub fn might_sleep() {
     }
 }
 
+/// In an interrupt handler (Linux in_interrupt; hk has no softirq
+/// context: its bottom halves run in threads). Host unit tests run in
+/// none.
+pub fn in_interrupt() -> bool {
+    #[cfg(not(test))]
+    {
+        use crate::arch::{CurrentArch, PerCpuOps};
+        CurrentArch::interrupt_depth() != 0
+    }
+    #[cfg(test)]
+    false
+}
+
 /// Spin lock held, interrupts off or in an interrupt handler: this
 /// context must not sleep (Linux preempt_count() != 0 || irqs_disabled())
 pub fn in_atomic() -> bool {

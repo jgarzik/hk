@@ -3320,10 +3320,10 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // robust futexes), which needs this CPU's rq lock.
     if tid != 0 {
         // Its io_uring requests end first, so none outlives the task
-        // (Linux do_exit: io_uring_files_cancel); then no callback can
-        // be queued on it any more (Linux exit_task_work)
+        // (Linux do_exit: io_uring_files_cancel, which runs the task's
+        // callbacks as it waits)
         crate::io::io_uring::task_cancel(false);
-        crate::task::task_work::exit_task_work();
+        crate::task::task_work::task_work_run();
         // Linux exit_signals sets PF_EXITING first, then hands the
         // group signals this thread would have taken to another
         set_exiting();
@@ -3422,6 +3422,13 @@ pub fn exit_current(status: Option<i32>) -> ! {
         None
     };
     if tid != 0 {
+        // The files its descriptors, address space and the rest held
+        // are released now, before a parent can see it exited; then no
+        // callback can be queued on it any more, and a file it still
+        // drops goes to the delayed list (Linux do_exit: exit_mm,
+        // exit_files, exit_fs, exit_task_namespaces, then
+        // exit_task_work)
+        crate::task::task_work::exit_task_work();
         forget_original_parent();
         // Its signal state goes once its tracees and children are dealt
         // with: whether the process ignores SIGCHLD decides the fate of

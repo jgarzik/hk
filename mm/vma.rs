@@ -4,7 +4,7 @@
 
 use alloc::sync::Arc;
 
-use crate::fs::File;
+use crate::fs::FileRef;
 use crate::mm::anon_vma::AnonVma;
 
 /// Protection flags - Linux PROT_* values
@@ -249,7 +249,7 @@ pub struct Vma {
     /// Map flags (MAP_SHARED, MAP_PRIVATE, MAP_ANONYMOUS, etc.)
     pub flags: u32,
     /// File backing (None for anonymous mappings)
-    pub file: Option<Arc<File>>,
+    pub file: Option<FileRef>,
     /// Offset within file (in bytes, page-aligned)
     pub offset: u64,
     /// Anonymous VMA tracking for reverse mapping
@@ -288,7 +288,7 @@ impl Vma {
         end: u64,
         prot: u32,
         flags: u32,
-        file: Arc<File>,
+        file: FileRef,
         offset: u64,
     ) -> Self {
         Self {
@@ -456,7 +456,7 @@ impl Vma {
             (None, None) => true, // Both anonymous
             (Some(f1), Some(f2)) => {
                 // Same file and contiguous offset
-                Arc::ptr_eq(f1, f2) && self.offset + self.size() == other.offset
+                crate::fs::FileRef::ptr_eq(f1, f2) && self.offset + self.size() == other.offset
             }
             _ => false, // One has file, other doesn't
         }

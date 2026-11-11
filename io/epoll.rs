@@ -10,16 +10,19 @@
 //! (Linux semantics), a level-triggered one while it stays ready.
 //!
 //! An item holds no reference to its file (Linux epitem): the file's
-//! last close removes its items (`eventpoll_release`, from `File`'s
-//! drop), so a closed pipe end or socket is released and its peer sees
-//! EOF. Items are keyed by (file, fd): closing one descriptor of a file
+//! release removes its items (`eventpoll_release`, from `__fput`, which
+//! its last `fput` queues), so a closed pipe end or socket is released
+//! and its peer sees EOF. To poll an item's file, epoll takes a
+//! reference unless the last one is gone (`FileRef::try_get`, Linux
+//! epi_fget). Items are keyed by (file, fd): closing one descriptor of a file
 //! that stays open keeps the item, as on Linux. Watching an epoll file
 //! is allowed EP_MAX_NESTS deep without cycles (`ep_loop_check`, ELOOP).
 //!
 //! Locking (doc/LOCKING.md):
 //! - `Eventpoll.mtx` (sleeping, Linux ep->mtx): the item map. Nothing
-//!   polls a file or drops a last `Arc<File>` under it (a file's last
-//!   close runs `eventpoll_release` at once, which takes it).
+//!   polls a file under it (BUGS.md: Linux holds it across the ready
+//!   scans). A last `FileRef` dropped under it only queues the release
+//!   (`fput`), whose `eventpoll_release` takes it later.
 //! - `Eventpoll.lock` (IrqSpinlock, Linux ep->lock; the callback runs
 //!   under the woken queue's lock, possibly in an interrupt): the ready
 //!   list and the links of a transfer's private list. Nothing sleeps,
@@ -33,6 +36,7 @@
 //! - `EPNESTED` (sleeping): the loop check and insert of an epoll target
 //!   (Linux epnested_mutex), with no spin lock held.
 
+use crate::fs::FileRef;
 use crate::util::kalloc::{try_arc, try_arc_cyclic};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -197,7 +201,7 @@ crate::adapter!(TxAdapter, EpItem, txlink);
 impl EpItem {
     /// The ready events of its file, without registering
     fn poll(&self) -> u32 {
-        let Some(file) = self.file.upgrade() else {
+        let Some(file) = FileRef::try_get(&self.file) else {
             return 0;
         };
         let revents = u32::from(file.f_op.poll(&file, None));
@@ -277,8 +281,8 @@ pub struct Eventpoll {
 /// Serializes the loop check with the insert of an epoll target
 static EPNESTED: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
-fn key(file: &Arc<File>, fd: Fd) -> (usize, Fd) {
-    (Arc::as_ptr(file) as usize, fd)
+fn key(file: &File, fd: Fd) -> (usize, Fd) {
+    (core::ptr::from_ref::<File>(file) as usize, fd)
 }
 
 impl Eventpoll {
@@ -341,7 +345,7 @@ impl Eventpoll {
     fn insert(
         self: &Arc<Self>,
         fd: Fd,
-        file: &Arc<File>,
+        file: &FileRef,
         ev: &EpollEvent,
     ) -> Result<(), KernelError> {
         let k = key(file, fd);
@@ -349,7 +353,7 @@ impl Eventpoll {
             rdlink: Link::new(),
             txlink: Link::new(),
             fd,
-            file: Arc::downgrade(file),
+            file: FileRef::downgrade(file),
             ep_raw: Arc::as_ptr(self),
             ep: Arc::downgrade(self),
             events: AtomicU32::new(ev.events),
@@ -404,7 +408,7 @@ impl Eventpoll {
     }
 
     /// EPOLL_CTL_MOD (Linux ep_modify)
-    fn modify(&self, fd: Fd, file: &Arc<File>, ev: &EpollEvent) -> Result<(), KernelError> {
+    fn modify(&self, fd: Fd, file: &FileRef, ev: &EpollEvent) -> Result<(), KernelError> {
         let item = self.lookup(fd, file)?;
         if item.events.load(Ordering::Acquire) & EPOLLEXCLUSIVE != 0 {
             return Err(KernelError::InvalidArgument);
@@ -416,7 +420,7 @@ impl Eventpoll {
     }
 
     /// The item watching (`file`, `fd`): ENOENT if none
-    fn lookup(&self, fd: Fd, file: &Arc<File>) -> Result<Arc<EpItem>, KernelError> {
+    fn lookup(&self, fd: Fd, file: &FileRef) -> Result<Arc<EpItem>, KernelError> {
         self.mtx
             .lock()
             .get(&key(file, fd))
@@ -445,8 +449,8 @@ impl Eventpoll {
         // ready list): unregistering waits out any one running, under
         // its queue's lock (Linux ep_remove: ep_unregister_pollwait)
         item.unregister();
-        // The file is held across the locks: no last reference to it
-        // may go under `mtx` (its release takes `mtx`)
+        // The file's memory, not a reference: found even while its
+        // release is queued, and dropping it never releases the file
         let file = item.file.upgrade();
         let mapped = file
             .as_ref()
@@ -462,7 +466,7 @@ impl Eventpoll {
     }
 
     /// EPOLL_CTL_DEL
-    fn delete(&self, fd: Fd, file: &Arc<File>) -> Result<(), KernelError> {
+    fn delete(&self, fd: Fd, file: &FileRef) -> Result<(), KernelError> {
         let item = self.lookup(fd, file)?;
         self.remove(&item);
         Ok(())
@@ -624,11 +628,11 @@ impl Eventpoll {
     /// The epoll files among this one's targets (walked under `mtx`,
     /// Linux ep_loop_check_proc; the files are released after it)
     fn epoll_targets(&self) -> Vec<Arc<Eventpoll>> {
-        let files: Vec<Arc<File>> = self
+        let files: Vec<FileRef> = self
             .mtx
             .lock()
             .values()
-            .filter_map(|it| it.file.upgrade())
+            .filter_map(|it| FileRef::try_get(&it.file))
             .collect();
         files.iter().filter_map(|f| get_eventpoll(f)).collect()
     }
@@ -781,7 +785,7 @@ impl FileOps for EpollFileOps {
 }
 
 /// Create an epoll file
-pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
+pub fn create_epoll_file(eflags: i32) -> Result<FileRef, KernelError> {
     let ep = Eventpoll::new()?;
     let mut file_flags = flags::O_RDWR;
     if eflags & EPOLL_CLOEXEC != 0 {
@@ -793,7 +797,7 @@ pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
         ep.clone(),
         file_flags,
     )?;
-    ep.file.call_once(|| Arc::downgrade(&file));
+    ep.file.call_once(|| FileRef::downgrade(&file));
     Ok(file)
 }
 
@@ -848,7 +852,7 @@ pub fn sys_epoll_ctl(
         return Err(KernelError::NotPermitted);
     }
     let ep = get_eventpoll(&ep_file).ok_or(KernelError::InvalidArgument)?;
-    if Arc::ptr_eq(&ep_file, &tf) {
+    if FileRef::ptr_eq(&ep_file, &tf) {
         return Err(KernelError::InvalidArgument);
     }
     let target_ep = get_eventpoll(&tf);

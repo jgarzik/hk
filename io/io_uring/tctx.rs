@@ -22,7 +22,7 @@ use super::rw::{Req, ReqAdapter};
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::current;
-use crate::task::task_work::{CallbackHead, TaskWork, task_work_add, task_work_run};
+use crate::task::task_work::{TaskWork, WorkHead, task_work_run};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
 use crate::util::kmem::KVec;
@@ -33,7 +33,7 @@ pub struct Tctx {
     /// Ended requests to finish in the task's context (Linux task_list)
     reqs: IrqSpinlock<ArcList<ReqAdapter>>,
     /// Queued on the task while `reqs` holds requests
-    cb: Arc<CallbackHead>,
+    cb: Arc<WorkHead>,
     /// Requests of the task in flight (Linux tctx->inflight)
     inflight: AtomicU32,
     /// Woken when `inflight` drops to zero
@@ -135,7 +135,7 @@ impl TaskWork for Tctx {
 
 impl Tctx {
     fn new() -> KernelResult<Arc<Self>> {
-        let cb = try_arc(CallbackHead::new())?;
+        let cb = try_arc(WorkHead::new())?;
         let t = try_arc(Self {
             reqs: IrqSpinlock::new(ArcList::new()),
             cb: cb.clone(),
@@ -179,7 +179,7 @@ impl Tctx {
         // A task that has exited finishes its requests itself first
         // (`cancel`): nothing is lost if this fails
         if l.is_empty() {
-            let _ = task_work_add(req.task(), &self.cb);
+            let _ = self.cb.queue(req.task());
         }
         l.push_back(req);
     }

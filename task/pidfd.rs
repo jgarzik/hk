@@ -25,6 +25,7 @@
 //! - Integration with waitid(P_PIDFD)
 //! - CLONE_PIDFD support for automatic pidfd creation
 
+use crate::fs::FileRef;
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
@@ -106,7 +107,7 @@ impl FileOps for PidfdFileOps {
 /// pidfd_open's pidfd for task `pid` (Linux pidfd_prepare): ESRCH
 /// once its task is released, ENOENT for a thread that does not lead
 /// its group unless PIDFD_THREAD asks for a thread's
-pub fn open_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
+pub fn open_pidfd(pid: Pid, file_flags: u32) -> Result<FileRef, KernelError> {
     // The caller's number (Linux pidfd_open: find_get_pid)
     let nr = u32::try_from(pid).map_err(|_| KernelError::NoProcess)?;
     let p = crate::task::pid::find_vpid(nr).ok_or(KernelError::NoProcess)?;
@@ -126,7 +127,7 @@ pub fn open_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
 pub fn pidfd_file(
     pid: Arc<crate::task::pid::Pid>,
     file_flags: u32,
-) -> Result<Arc<File>, KernelError> {
+) -> Result<FileRef, KernelError> {
     let thread = file_flags & pidfd_flags::PIDFD_THREAD != 0;
     let pidfd = try_arc(Pidfd { pid, thread })?;
     let mut f_flags = flags::O_RDONLY;

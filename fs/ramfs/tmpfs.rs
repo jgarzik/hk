@@ -561,7 +561,7 @@ pub fn shmem_file_setup(
     name: &[u8],
     size: u64,
     flags: u32,
-) -> Result<Arc<crate::fs::File>, KernelError> {
+) -> Result<crate::fs::FileRef, KernelError> {
     let mnt = SHM_MNT.get().ok_or(KernelError::NoDevice)?.clone();
     let inode = super::new_file(&mnt.sb, 0o777)?;
     inode.set_size(size);
@@ -571,15 +571,12 @@ pub fn shmem_file_setup(
     let mut f = crate::fs::File::new(dentry, Some(mnt), flags, &super::TMPFS_FILE_OPS);
     f.write_access = Some(w);
     f.i_write = Some(iw);
-    try_arc(f)
+    f.alloc()
 }
 
 /// The file of a SysV shm segment or of shared anonymous memory (Linux
 /// shmem_kernel_file_setup / shmem_zero_setup's "dev/zero")
-pub fn shmem_kernel_file_setup(
-    name: &[u8],
-    size: u64,
-) -> Result<Arc<crate::fs::File>, KernelError> {
+pub fn shmem_kernel_file_setup(name: &[u8], size: u64) -> Result<crate::fs::FileRef, KernelError> {
     shmem_file_setup(name, size, crate::fs::flags::O_RDWR)
 }
 

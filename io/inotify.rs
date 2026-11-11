@@ -29,6 +29,7 @@
 //! - Multiple watches per inotify instance
 //! - Watch descriptors (wd) are unique per instance
 
+use crate::fs::FileRef;
 use crate::util::kalloc::{try_arc, try_box};
 use crate::util::list::{BoxList, Link};
 use alloc::boxed::Box;
@@ -955,8 +956,8 @@ impl FileOps for InotifyFileOps {
 /// * `in_flags` - IN_CLOEXEC | IN_NONBLOCK
 ///
 /// # Returns
-/// Arc<File> for the new inotify fd
-pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
+/// FileRef for the new inotify fd
+pub fn create_inotify(in_flags: i32) -> Result<FileRef, KernelError> {
     let inotify = Inotify::new()?;
 
     // Create dummy dentry for inotify

@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::fs::File;
+use crate::fs::{File, FileRef};
 use crate::uaccess::{UserPtr, access_ok};
 
 use super::{
@@ -169,7 +169,7 @@ pub fn sys_mmap(
     }
 
     // Get file if not anonymous
-    let file: Option<Arc<File>> = if !is_anonymous {
+    let file: Option<FileRef> = if !is_anonymous {
         Some(crate::fs::io::fget(fd)?)
     } else {
         None
@@ -187,7 +187,7 @@ pub fn do_mmap(
     length: u64,
     prot: u32,
     flags: u32,
-    file: Option<Arc<File>>,
+    file: Option<FileRef>,
     offset: u64,
     vm_flags: u32,
 ) -> KernelResult<u64> {

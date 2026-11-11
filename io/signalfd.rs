@@ -22,6 +22,7 @@
 //! - poll() support for integration with select/poll/epoll
 //! - Mask can be updated by calling signalfd4 with existing fd
 
+use crate::fs::FileRef;
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
@@ -343,8 +344,8 @@ impl FileOps for SignalfdFileOps {
 /// * `sfd_flags` - SFD_CLOEXEC | SFD_NONBLOCK
 ///
 /// # Returns
-/// Arc<File> for the new signalfd
-pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, KernelError> {
+/// FileRef for the new signalfd
+pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<FileRef, KernelError> {
     let signalfd = Signalfd::new(mask)?;
 
     // Create dummy dentry for signalfd

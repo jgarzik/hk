@@ -291,10 +291,9 @@ lo (hk has no checksum offload states).
   next io_submit/io_getevents or a delayed work item), not where its
   bios end as Linux iocb_destroy (unpinning there unless pages must be
   dirtied under their page lock: bio_check_pages_dirty; fput's
-  delayed_fput for a last file reference). Releasing there needs a
-  file put that is safe in hardirq, which `Arc<File>` cannot give
-  atomically (no "drop unless last"; the file must not move: its
-  address keys flock locks). AIO 4K QD1 (`make check BENCH=1`,
+  delayed_fput for a last file reference). The file's put is safe
+  there now (a `FileRef` dropped in hardirq goes to the delayed list);
+  the rest of the request's release is not yet. AIO 4K QD1 (`make check BENCH=1`,
   DIO_BENCH) is unexplained and noisy: 12k..81k IOPS across boots of
   one kernel, Linux 15k..110k on the same host; with the request
   spinning on the ring rather than sleeping, about 16.5 us per request
@@ -704,19 +703,17 @@ locks in net, fs, io, task, ipc, cgroup and keys, and IRQ-safe locks
 in bpf maps and the swap cache. ROADMAP
 phase A (A0-A3).
 
-## The last fput is not deferred
+## epoll does not hold its mutex across the ready scans
 
-**Location**: `fs/file.rs`, `io/epoll.rs` (`Eventpoll.mtx`)
+**Location**: `io/epoll.rs` (`Eventpoll.mtx`)
 
-Linux defers a file's release (`__fput`) to task_work (or a kernel
-thread from interrupt context), so ep->mtx is held across epoll's
-ready-list scans and polls: a file whose last reference drops there is
-released later. hk releases it at once, and its eventpoll removal takes
-`Eventpoll.mtx`, so epoll polls with no epoll lock held instead. Two
-`epoll_wait`s on one epoll may then both report an item that got an
-event mid-scan (Linux serializes them under ep->mtx). Phase A1: defer
-fput (Linux fput -> task_work_add / delayed_fput), then hold
-`Eventpoll.mtx` across the scan.
+Linux holds ep->mtx across epoll's ready-list scans and polls. hk's
+file release is deferred like Linux's (`fput`), so a file's last
+reference dropped there no longer releases it under the lock, but
+epoll still polls with no epoll lock held: two `epoll_wait`s on one
+epoll may both report an item that got an event mid-scan (Linux
+serializes them under ep->mtx). Fix: hold `Eventpoll.mtx` across the
+scan (nested epolls: Linux's mutex_lock_nested by depth).
 
 ## Scheduler gaps (deviations from Linux)
 

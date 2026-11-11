@@ -261,7 +261,7 @@ mod tests {
     fn fdtable_paths() {
         use crate::task::{FD_CLOEXEC, FdTable};
         use alloc::sync::Arc;
-        let mut t: FdTable<u32> = FdTable::new();
+        let mut t: FdTable<Arc<u32>> = FdTable::new();
         let f = Arc::new(7u32);
         for want in 0..200 {
             assert_eq!(t.alloc(f.clone(), u64::MAX), Ok(want));

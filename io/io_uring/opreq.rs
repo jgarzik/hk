@@ -16,7 +16,8 @@ use super::IoRing;
 use super::abi::*;
 use super::rsrc::RegBuf;
 use super::tctx::Tctx;
-use crate::fs::file::{File, RwFlags};
+use crate::fs::FileRef;
+use crate::fs::file::RwFlags;
 use crate::fs::iov::IoVec;
 use crate::task::percpu::current;
 use crate::task::{Cred, override_creds};
@@ -30,7 +31,7 @@ pub enum Body {
     /// A read or write of `file`: user iovecs, or `len` bytes at `addr`
     /// of a registered buffer
     Rw {
-        file: Arc<File>,
+        file: FileRef,
         write: bool,
         flags: RwFlags,
         mem: RwMem,

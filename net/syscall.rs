@@ -4,6 +4,7 @@
 //! arguments in with uaccess, call the protocol, copy results out. The
 //! file's O_NONBLOCK is read at every call.
 
+use crate::fs::FileRef;
 use crate::util::scope::ScopeGuard;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -23,14 +24,14 @@ use crate::uaccess::{UserPtr, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 
 /// The socket behind `fd`: EBADF, or ENOTSOCK for other files
-fn sockfd(fd: i32) -> KernelResult<(Arc<File>, Arc<dyn ProtoOps>)> {
+fn sockfd(fd: i32) -> KernelResult<(FileRef, Arc<dyn ProtoOps>)> {
     let file = fget(fd)?;
     let s = sock_of(&file).ok_or(KernelError::NotSocket)?;
     Ok((file, s))
 }
 
 /// Install `file` in a new descriptor, close-on-exec if `cloexec`
-pub fn fd_install(file: Arc<File>, cloexec: bool) -> KernelResult<i32> {
+pub fn fd_install(file: FileRef, cloexec: bool) -> KernelResult<i32> {
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
     crate::fs::io::fd_install(file, fl)
 }
@@ -76,7 +77,7 @@ pub fn sys_socketpair(
 
 /// Install two files in new descriptors, or neither (the table
 /// releases undone and refused files after its lock is dropped)
-fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> KernelResult<[i32; 2]> {
+fn install_pair(a: FileRef, b: FileRef, cloexec: bool) -> KernelResult<[i32; 2]> {
     let table = crate::task::percpu::current()
         .files()
         .ok_or(KernelError::BadFd)?;

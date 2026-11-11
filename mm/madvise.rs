@@ -9,7 +9,6 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,7 +25,7 @@ use crate::util::error::{KernelError, KernelResult};
 
 /// A hole to punch in a file once the mm lock is dropped (MADV_REMOVE):
 /// the file, the byte offset and the length
-type Punch = (Arc<crate::fs::File>, u64, u64);
+type Punch = (crate::fs::FileRef, u64, u64);
 
 /// madvise(2): give advice about [start, start + len) (Linux do_madvise)
 pub fn sys_madvise(start: u64, len: u64, advice: i32) -> KernelResult<()> {

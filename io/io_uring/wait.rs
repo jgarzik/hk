@@ -149,9 +149,9 @@ impl IoRing {
 
 impl IoRing {
     /// Note `f` as having polled requests in flight
-    pub(super) fn poll_add(&self, f: &alloc::sync::Arc<crate::fs::file::File>) -> KernelResult<()> {
+    pub(super) fn poll_add(&self, f: &crate::fs::FileRef) -> KernelResult<()> {
         let mut l = self.poll_files.lock();
-        if !l.iter().any(|x| alloc::sync::Arc::ptr_eq(x, f)) {
+        if !l.iter().any(|x| crate::fs::FileRef::ptr_eq(x, f)) {
             l.try_push(f.clone())?;
         }
         Ok(())

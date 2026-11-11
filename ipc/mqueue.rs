@@ -23,6 +23,7 @@
 //! - Linux kernel ipc/mqueue.c
 //! - POSIX.1-2017 mq_overview(7)
 
+use crate::fs::FileRef;
 use crate::fs::name::FileName;
 use crate::signal::Signal;
 use crate::time::hrtimer::HrClock;
@@ -34,9 +35,6 @@ use core::any::Any;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use crate::sync::RwSem;
-use crate::sync::spin::Mutex;
-
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -44,6 +42,8 @@ use crate::fs::io::{fd_install, fget};
 use crate::fs::iov_iter::IovDest;
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::sync::RwSem;
+use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::rlimit;
 use crate::uaccess::{UserPtr, copy_from_user, copy_to_user, strncpy_from_user};
@@ -584,7 +584,7 @@ fn mq_uncharge(uid: u32, bytes: u64) {
     }
 }
 
-fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> KernelResult<Arc<File>> {
+fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> KernelResult<FileRef> {
     // Create anonymous inode
     let mode = InodeMode::regular(0o644);
     let inode = try_arc(Inode::new(
@@ -612,7 +612,7 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> KernelRe
     }
 
     let private = try_arc(MqFile { queue, access_mode })?;
-    try_arc(File::new_anon(dentry, None, file_flags, &MQ_FOPS, private))
+    File::new_anon(dentry, None, file_flags, &MQ_FOPS, private).alloc()
 }
 
 // ============================================================================

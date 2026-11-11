@@ -26,6 +26,7 @@
 
 use alloc::sync::Arc;
 
+use crate::fs::FileRef;
 use crate::fs::KernelError;
 use crate::fs::file::File;
 use crate::fs::io::fget;
@@ -451,7 +452,7 @@ fn nb(f: &File) -> bool {
 /// pipe has room, the file is read under its lock, so nothing read can
 /// find the pipe full
 fn do_splice_file_to_pipe(
-    file: &Arc<File>,
+    file: &FileRef,
     off_in: Option<u64>,
     pipe: &Pipe,
     len: usize,
@@ -497,7 +498,7 @@ fn do_splice_file_to_pipe(
 /// Splice from pipe to file (write pipe contents to file)
 fn do_splice_pipe_to_file(
     pipe: &Pipe,
-    file: &Arc<File>,
+    file: &FileRef,
     off_out: Option<u64>,
     len: usize,
     flags: u32,
@@ -790,9 +791,9 @@ fn do_sendfile(out_fd: i32, in_fd: i32, pos: Option<u64>, count: usize) -> Kerne
 
 /// Sendfile to regular file
 fn do_sendfile_to_file(
-    in_file: &Arc<File>,
+    in_file: &FileRef,
     offset: Option<u64>,
-    out_file: &Arc<File>,
+    out_file: &FileRef,
     count: usize,
 ) -> KernelResult<usize> {
     let mut buf = [0u8; PAGE_SIZE];

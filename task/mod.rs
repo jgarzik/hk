@@ -600,21 +600,21 @@ pub const FD_CLOEXEC: u32 = 1;
 /// filp_close/fput after spin_unlock).
 pub struct FdTable<F> {
     /// Mapping from fd number to file object
-    files: BTreeMap<Fd, Arc<F>>,
+    files: BTreeMap<Fd, F>,
     /// Which descriptors are open, for the lowest-free search; agrees
     /// with the keys of `files`
     bits: fdbits::OpenFds,
     /// Per-fd flags (FD_CLOEXEC, etc.)
     fd_flags: BTreeMap<Fd, u32>,
     /// Detached files, released once the lock is dropped
-    dead: Vec<Arc<F>>,
+    dead: Vec<F>,
     /// The ones of them a descriptor was closed for (close, dup2 over
     /// it, close_range), not files refused an install: their closer's
     /// POSIX locks go (`fdtable::FilesGuard`)
-    closed: Vec<Arc<F>>,
+    closed: Vec<F>,
 }
 
-impl<F> FdTable<F> {
+impl<F: Clone> FdTable<F> {
     /// Create a new empty file descriptor table
     pub fn new() -> Self {
         Self::new_const()
@@ -633,7 +633,7 @@ impl<F> FdTable<F> {
 
     /// Install `file` at `fd`, free in both `files` and `bits`; false
     /// (file parked) if the bitmap cannot grow
-    fn install(&mut self, fd: Fd, file: Arc<F>, flags: u32) -> bool {
+    fn install(&mut self, fd: Fd, file: F, flags: u32) -> bool {
         if !self.bits.set(fd as usize) {
             self.defer(file);
             return false;
@@ -646,19 +646,19 @@ impl<F> FdTable<F> {
     }
 
     /// Park `file` for release after the table lock is dropped
-    fn defer(&mut self, file: Arc<F>) {
+    fn defer(&mut self, file: F) {
         self.dead.push(file);
     }
 
     /// The files detached since the lock was taken (`FilesGuard` drops
     /// them after unlocking)
-    pub fn take_dead(&mut self) -> Vec<Arc<F>> {
+    pub fn take_dead(&mut self) -> Vec<F> {
         core::mem::take(&mut self.dead)
     }
 
     /// The files whose descriptors were closed since the lock was taken
     /// (also released after unlocking)
-    pub fn take_closed(&mut self) -> Vec<Arc<F>> {
+    pub fn take_closed(&mut self) -> Vec<F> {
         core::mem::take(&mut self.closed)
     }
 
@@ -668,7 +668,7 @@ impl<F> FdTable<F> {
     /// would be >= nofile, returns Err(EMFILE). Pass `u64::MAX` to disable limit.
     ///
     /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation.
-    pub fn alloc(&mut self, file: Arc<F>, nofile: u64) -> KernelResult<Fd> {
+    pub fn alloc(&mut self, file: F, nofile: u64) -> KernelResult<Fd> {
         self.alloc_at_or_above(file, 0, 0, nofile)
     }
 
@@ -676,7 +676,7 @@ impl<F> FdTable<F> {
     ///
     /// This does NOT enforce RLIMIT_NOFILE as it's used for initial fd setup
     /// (stdin=0, stdout=1, stderr=2) where limits don't apply.
-    pub fn alloc_at(&mut self, fd: Fd, file: Arc<F>) -> bool {
+    pub fn alloc_at(&mut self, fd: Fd, file: F) -> bool {
         if fd < 0 || self.files.contains_key(&fd) {
             self.defer(file);
             return false;
@@ -691,22 +691,30 @@ impl<F> FdTable<F> {
     }
 
     /// Get a file by descriptor
-    pub fn get(&self, fd: Fd) -> Option<Arc<F>> {
+    pub fn get(&self, fd: Fd) -> Option<F> {
         self.files.get(&fd).cloned()
     }
 
     /// Close a file descriptor (false: EBADF); the file is released
     /// after the table lock is dropped
     pub fn close(&mut self, fd: Fd) -> bool {
-        self.fd_flags.remove(&fd);
-        match self.files.remove(&fd) {
+        match self.close_fd(fd) {
             Some(f) => {
-                self.bits.clear(fd as usize);
                 self.closed.push(f);
                 true
             }
             None => false,
         }
+    }
+
+    /// Detach descriptor `fd` and hand its file to the caller, who
+    /// flushes and drops it after the table lock (Linux
+    /// file_close_fd_locked, for close(2)); None: EBADF
+    pub fn close_fd(&mut self, fd: Fd) -> Option<F> {
+        self.fd_flags.remove(&fd);
+        let f = self.files.remove(&fd)?;
+        self.bits.clear(fd as usize);
+        Some(f)
     }
 
     /// Check if a file descriptor is valid
@@ -726,7 +734,7 @@ impl<F> FdTable<F> {
     ///
     /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation,
     /// not as a separate pre-check. This avoids TOCTOU races.
-    pub fn alloc_with_flags(&mut self, file: Arc<F>, flags: u32, nofile: u64) -> KernelResult<Fd> {
+    pub fn alloc_with_flags(&mut self, file: F, flags: u32, nofile: u64) -> KernelResult<Fd> {
         self.alloc_at_or_above(file, 0, flags, nofile)
     }
 
@@ -739,7 +747,7 @@ impl<F> FdTable<F> {
     pub fn alloc_at_with_flags(
         &mut self,
         fd: Fd,
-        file: Arc<F>,
+        file: F,
         flags: u32,
         nofile: u64,
     ) -> KernelResult<()> {
@@ -768,7 +776,7 @@ impl<F> FdTable<F> {
     /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation.
     pub fn alloc_at_or_above(
         &mut self,
-        file: Arc<F>,
+        file: F,
         min_fd: Fd,
         flags: u32,
         nofile: u64,
@@ -1048,9 +1056,6 @@ pub struct Task {
     /// On its cgroup's task list (Linux task->cg_list on its css_set),
     /// under that cgroup's `tasks` lock
     pub cg_node: crate::util::list::Link,
-    /// Files `defer_fput` still has to drop while an outer frame of this
-    /// task drains (Linux task_work fput); only the task itself uses it
-    pub fput_defer: crate::sync::spin::Mutex<Option<Vec<Arc<crate::fs::File>>>>,
     /// Callbacks queued to run in this task's context (Linux
     /// task_works; `task_work`)
     pub task_works: task_work::TaskWorks,
@@ -1883,7 +1888,6 @@ impl Task {
             kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
             cg_node: crate::util::list::Link::new(),
-            fput_defer: crate::sync::spin::Mutex::new(None),
             task_works: task_work::TaskWorks::new(),
             io_thread: spin::Once::new(),
             io_uring: spin::Once::new(),
@@ -1956,7 +1960,6 @@ impl Task {
             kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
             cg_node: crate::util::list::Link::new(),
-            fput_defer: crate::sync::spin::Mutex::new(None),
             task_works: task_work::TaskWorks::new(),
             io_thread: spin::Once::new(),
             io_uring: spin::Once::new(),

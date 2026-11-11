@@ -19,7 +19,6 @@
 //! are closed.
 
 use alloc::collections::BTreeSet;
-use alloc::sync::Arc;
 
 use crate::fs::File;
 use crate::util::error::{KernelError, KernelResult};
@@ -240,7 +239,7 @@ pub fn sys_flock(fd: i32, operation: i32) -> KernelResult<()> {
 
     // flock locks belong to the open file description (Linux fl_file):
     // every descriptor of it, in any process, holds the same lock
-    let owner = Arc::as_ptr(&file) as u64;
+    let owner = crate::fs::FileRef::as_ptr(&file) as u64;
     let ctx = file.get_inode();
 
     // Linux flock_lock_inode: a lock of the other type the owner holds

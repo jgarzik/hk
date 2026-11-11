@@ -24,6 +24,7 @@
 //! - poll() support for integration with select/poll/epoll
 //! - CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME and the alarm clocks
 
+use crate::fs::FileRef;
 use crate::util::kalloc::try_arc;
 use alloc::sync::{Arc, Weak};
 use core::pin::Pin;
@@ -460,8 +461,8 @@ impl FileOps for TimerfdFileOps {
 /// * `flags` - TFD_CLOEXEC | TFD_NONBLOCK
 ///
 /// # Returns
-/// Arc<File> for the new timerfd
-pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelError> {
+/// FileRef for the new timerfd
+pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<FileRef, KernelError> {
     let timerfd = Timerfd::new(clockid)?;
 
     // Create dummy dentry for timerfd

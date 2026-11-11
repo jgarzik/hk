@@ -27,6 +27,7 @@
 //! - Support for permission events (blocking operations pending user decision)
 //! - Multiple marks per fanotify instance
 
+use crate::fs::FileRef;
 use crate::util::kalloc::{try_arc, try_box};
 use crate::util::list::{BoxList, Link};
 use alloc::boxed::Box;
@@ -605,7 +606,7 @@ impl FileOps for FanotifyFileOps {
 // =============================================================================
 
 /// Create a new fanotify instance
-pub fn create_fanotify(init_flags: u32) -> Result<Arc<File>, KernelError> {
+pub fn create_fanotify(init_flags: u32) -> Result<FileRef, KernelError> {
     let fanotify = Fanotify::new(init_flags)?;
 
     // Create dummy dentry for fanotify

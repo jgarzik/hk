@@ -41,6 +41,7 @@ use abi::*;
 use rings::Rings;
 use rw::Kind;
 
+use crate::fs::FileRef;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
 use crate::io::pipe::FD_CLOEXEC;
@@ -90,7 +91,7 @@ pub struct Submit {
     /// SQ entries consumed (Linux cached_sq_head)
     sq_head: u32,
     /// Registered files
-    files: Option<Vec<Option<Arc<File>>>>,
+    files: Option<Vec<Option<FileRef>>>,
     /// Registered buffers (Linux buf_table)
     bufs: Option<Vec<Option<Arc<rsrc::RegBuf>>>>,
     /// user_data of poll and timeout requests noted but never completed;
@@ -114,7 +115,7 @@ pub struct IoRing {
     /// Files with polled requests issued (Linux iopoll_list, by file):
     /// polled by GETEVENTS (`iopoll_check`); emptied once nothing is in
     /// flight
-    poll_files: crate::sync::Mutex<KVec<Arc<File>>>,
+    poll_files: crate::sync::Mutex<KVec<FileRef>>,
     /// The user its locked memory is charged to (Linux ctx->user: none
     /// with CAP_IPC_LOCK), and its rings' pages charged
     acct: Option<crate::task::Uid>,
@@ -488,7 +489,7 @@ impl IoRing {
 
     /// The SQE's file: a registered one with IOSQE_FIXED_FILE, else its
     /// fd's; EBADF
-    fn sqe_file(&self, s: &Submit, sqe: &IoUringSqe) -> KernelResult<Arc<File>> {
+    fn sqe_file(&self, s: &Submit, sqe: &IoUringSqe) -> KernelResult<FileRef> {
         if sqe.flags & IOSQE_FIXED_FILE != 0 {
             let fixed = s.files.as_ref().and_then(|f| f.get(sqe.fd as u32 as usize));
             return fixed.cloned().flatten().ok_or(KernelError::BadFd);
@@ -827,7 +828,7 @@ fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
 /// A file to register: none, a path-only one or an io_uring is EBADF
 /// (Linux io_sqe_files_register: fget, io_is_uring_fops; a ring in a
 /// ring's table would keep both alive forever)
-fn reg_file(f: Option<Arc<File>>) -> KernelResult<Arc<File>> {
+fn reg_file(f: Option<FileRef>) -> KernelResult<FileRef> {
     f.filter(|f| !f.is_path() && !is_uring(f))
         .ok_or(KernelError::BadFd)
 }

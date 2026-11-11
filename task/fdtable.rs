@@ -8,11 +8,14 @@
 //! ## Locking
 //!
 //! `Files` wraps the table's `crate::sync::spin::Mutex` (Linux files->file_lock).
-//! Releasing a file can sleep (TCP SO_LINGER, socket release paths), so
-//! no file is ever dropped under that lock: the table parks the files
-//! it detaches (close, dup2 over an open descriptor, a refused install)
-//! and `FilesGuard` drops them after unlocking (Linux
-//! file_close_fd_locked, then filp_close/fput after spin_unlock).
+//! Flushing a file and its closer's POSIX locks can sleep, so no file
+//! is flushed or dropped under that lock: the table parks the files it
+//! detaches (close_range, dup2 over an open descriptor, exec's
+//! close-on-exec, a refused install) and `FilesGuard` flushes and drops
+//! them after unlocking (Linux file_close_fd_locked, then filp_close
+//! after spin_unlock); a last reference queues the release (`fput`).
+//! close(2) takes its file out (`FdTable::close_fd`) and releases it
+//! before returning (`fput_close_sync`).
 //! Likewise a task's last reference to its table is dropped after its
 //! alloc_lock is released, never under it.
 
@@ -24,12 +27,12 @@ use core::ops::{Deref, DerefMut};
 
 use super::percpu::current;
 use super::{FdTable, Task};
-use crate::fs::File;
+use crate::fs::FileRef;
 use crate::util::error::KernelError;
 
 /// A descriptor table (Linux files_struct)
 pub struct Files {
-    table: Mutex<FdTable<File>>,
+    table: Mutex<FdTable<FileRef>>,
     /// Its identity as a POSIX lock owner (Linux fl_owner): unique, never
     /// reused, kept across an exec that did not have to copy the table
     id: u64,
@@ -39,19 +42,19 @@ pub struct Files {
 }
 
 /// The locked table; files it detached are released after the unlock
-pub struct FilesGuard<'a>(ManuallyDrop<MutexGuard<'a, FdTable<File>>>, u64);
+pub struct FilesGuard<'a>(ManuallyDrop<MutexGuard<'a, FdTable<FileRef>>>, u64);
 
 /// Source of `Files::id`
 static NEXT_FILES_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 impl Files {
-    pub fn new(t: FdTable<File>) -> Self {
+    pub fn new(t: FdTable<FileRef>) -> Self {
         let id = NEXT_FILES_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Self::with_id(t, id)
     }
 
     /// A table keeping lock-owner identity `id`
-    fn with_id(t: FdTable<File>, id: u64) -> Self {
+    fn with_id(t: FdTable<FileRef>, id: u64) -> Self {
         Self {
             table: Mutex::new(t),
             id,
@@ -89,14 +92,14 @@ impl Drop for Files {
 }
 
 impl Deref for FilesGuard<'_> {
-    type Target = FdTable<File>;
-    fn deref(&self) -> &FdTable<File> {
+    type Target = FdTable<FileRef>;
+    fn deref(&self) -> &FdTable<FileRef> {
         &self.0
     }
 }
 
 impl DerefMut for FilesGuard<'_> {
-    fn deref_mut(&mut self) -> &mut FdTable<File> {
+    fn deref_mut(&mut self) -> &mut FdTable<FileRef> {
         &mut self.0
     }
 }

@@ -43,7 +43,7 @@ use super::rw::Req;
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{TaskRef, current, task_ref};
-use crate::task::task_work::{CallbackHead, TaskWork, task_work_add, task_work_run};
+use crate::task::task_work::{TaskWork, WorkHead, task_work_run};
 use crate::util::error::KernelResult;
 use crate::util::kalloc::{try_arc, try_box};
 use crate::util::kmem::KVec;
@@ -148,7 +148,7 @@ pub struct IoWq {
     /// Woken when a worker exits
     gone: WaitQueue,
     /// Queued on the owner to start workers asked for elsewhere
-    spawn: Arc<CallbackHead>,
+    spawn: Arc<WorkHead>,
 }
 
 impl TaskWork for IoWq {
@@ -167,7 +167,7 @@ impl TaskWork for IoWq {
 impl IoWq {
     /// The current task's io-wq
     pub fn new() -> KernelResult<Arc<Self>> {
-        let spawn = try_arc(CallbackHead::new())?;
+        let spawn = try_arc(WorkHead::new())?;
         let wq = try_arc(Self {
             accts: [Acct::new(), Acct::new()],
             owner: Arc::downgrade(&task_ref(&current())),
@@ -225,7 +225,7 @@ impl IoWq {
             return;
         }
         self.accts[i].q.lock().want = true;
-        let _ = task_work_add(&owner, &self.spawn);
+        let _ = self.spawn.queue(&owner);
     }
 
     /// Start a worker of pool `i` in the owner's process (Linux

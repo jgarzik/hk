@@ -341,12 +341,12 @@ mod fcntl_cmd {
 /// early, so that range is unlocked now; the process's other locks
 /// stay (Linux fcntl_setlk rechecks with files_lookup_fd and sets
 /// F_UNLCK over the same, already resolved, region)
-fn setlk_recheck(fd: i32, file: &Arc<crate::fs::File>, flock: &Flock, range: (u64, u64)) {
+fn setlk_recheck(fd: i32, file: &crate::fs::FileRef, flock: &Flock, range: (u64, u64)) {
     use crate::fs::posix_lock::{F_UNLCK, posix_unlock};
     let same = current_fd_table()
         .lock()
         .get(fd)
-        .is_some_and(|f| Arc::ptr_eq(&f, file));
+        .is_some_and(|f| crate::fs::FileRef::ptr_eq(&f, file));
     if !same && flock.l_type != F_UNLCK {
         posix_unlock(file, range);
     }

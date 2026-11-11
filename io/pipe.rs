@@ -50,6 +50,7 @@
 //! - Linux pipe(7) man page
 //! - Linux fs/pipe.c
 
+use crate::fs::FileRef;
 use crate::sync::{Mutex, MutexGuard};
 use crate::util::error::KernelResult;
 use crate::util::kalloc::try_arc;
@@ -1278,7 +1279,7 @@ fn fifo_put(inode: &crate::fs::inode::Inode, pipe: &Pipe, mode: u32) {
 /// Create a pipe and return (read_file, write_file)
 ///
 /// The returned files should be added to the process's fd table.
-pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelError> {
+pub fn create_pipe(pipe_flags: u32) -> Result<(FileRef, FileRef), KernelError> {
     let pipe = Pipe::new()?;
     let (mnt, dentry) = create_pipe_path()?.into_parts();
     // The inode holds the pipe while either file is open (Linux
@@ -1294,20 +1295,16 @@ pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelErro
     // create_pipe_files)
     let write_flags = flags::O_WRONLY | (pipe_flags & (flags::O_NONBLOCK | flags::O_DIRECT));
 
-    let read_file = try_arc(File::new_anon(
+    let read_file = File::new_anon(
         Arc::clone(&dentry),
         Some(mnt.clone()),
         read_flags,
         &PIPE_READ_FOPS,
         pipe.clone(),
-    ))?;
-    let write_file = try_arc(File::new_anon(
-        dentry,
-        Some(mnt),
-        write_flags,
-        &PIPE_WRITE_FOPS,
-        pipe,
-    ))?;
+    )
+    .alloc()?;
+    let write_file =
+        File::new_anon(dentry, Some(mnt), write_flags, &PIPE_WRITE_FOPS, pipe).alloc()?;
 
     Ok((read_file, write_file))
 }
