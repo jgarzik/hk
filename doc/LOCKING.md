@@ -625,10 +625,13 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
     KmsgUser.rate (spin leaf)
 
 TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
-    (spin; never takes TASKLIST under it); Tty.ldata → Tty.termios
-    (spin, thread context; termios is read under ldata by input
-    processing and swapped under it by set_termios, as Linux's
-    termios_rwsem spans both); Tty.read_lock (sleeping Mutex, Linux
+    (spin; never takes TASKLIST under it); Tty.ldata (sleeping Mutex,
+    Linux termios_rwsem's role) → Tty.termios (spin, thread context;
+    termios is read under ldata by input processing and swapped under
+    it by set_termios, as Linux's termios_rwsem spans both), and →
+    Tty.ctrl, TASKLIST and the signal locks (ISIG signals sent under
+    it, Linux __isig) and the echo's driver writes; Tty.avail
+    (atomics) is read lock-free by poll and readers; Tty.read_lock (sleeping Mutex, Linux
     atomic_read_lock) → Tty.ldata, Tty.flip: held by a reader across its
     sleeps on read_wait; Tty.write_lock (sleeping Mutex, Linux
     atomic_write_lock) → Tty.termios, TASKLIST (read) → Tty.ctrl and
@@ -636,11 +639,10 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     whole write(2) and its driver writes; never nested with read_lock or
     buf_lock; Tty.buf_lock (sleeping Mutex, Linux
     tty_bufhead.lock) → Tty.ldata: held by the flip thread across
-    feeding input (including the echo's driver write) and by
-    flush_input; Tty.flip (IrqSpinlock leaf,
+    feeding input and by flush_input; Tty.flip (IrqSpinlock leaf,
     also under IrqDesc.lock in the UART handler). No tty spin lock is held
-    across a signal, a sleep or a driver write; Tty.buf_lock is (ISIG
-    signals, and SIGIO: Tty.buf_lock → `Tty.fasync` FasyncList.list).
+    across a signal, a sleep or a driver write; Tty.buf_lock is (SIGIO
+    after ldata is dropped: Tty.buf_lock → `Tty.fasync` FasyncList.list).
     tty_fasync reads Tty.ctrl (the foreground group) after
     `Tty.fasync` is released.
 ```
@@ -3717,7 +3719,8 @@ Each `Tty` struct contains:
 | Lock | Type | Purpose |
 |------|------|---------|
 | `termios` | `Mutex<Termios>` | Terminal I/O settings (baud, echo, etc.) |
-| `ldata` | `Mutex<NTtyData>` | N_TTY read ring and edited line (Linux `n_tty_data`) |
+| `ldata` | `sync::Mutex<NTtyData>` (sleeping) | N_TTY read ring, edited line and echo ring (Linux `n_tty_data` under `termios_rwsem`): input processing, reads' copies out, flushes and termios changes; held across the echo's driver writes and ISIG signals |
+| `avail` | atomics (`n_tty::Avail`) | `ldata`'s commit, line and read heads and ICANON, stored (Release) under `ldata` as each holder releases it, loaded (Acquire) with no lock by poll and a reader's wait condition (Linux `input_available_p` on `commit_head`/`canon_head`/`read_tail`): a poll may run under a spin lock (an epoll's), a wait condition with the task state set. A hint only: the input itself is copied under `ldata` |
 | `ctrl` | `Mutex<TtyCtrl>` | Session, foreground group, window size (Linux `ctrl.lock` + `winsize_mutex`) |
 | `flip` | `IrqSpinlock<Flip>` | Bytes from the UART interrupt handler (Linux `tty_bufhead`) |
 | `buf_lock` | `sync::Mutex<()>` (sleeping) | Feeding `flip` to N_TTY vs input flushes (Linux `tty_bufhead.lock`); outside `ldata` |
@@ -3726,14 +3729,22 @@ Each `Tty` struct contains:
 | `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
 | `fasync` | `FasyncList` (sleeping, 3.11) | O_ASYNC files (Linux `tty->fasync`): N_TTY input sends their SIGIO after dropping `ldata`, under `buf_lock` |
 
-The `Mutex`es are spin locks taken in thread context only, briefly, one
-at a time except `ldata` → `termios` (input processing reads termios and
-set_termios swaps it under `ldata`, so an ICANON change is applied
-atomically, as Linux's `termios_rwsem`), and never across a signal, a
-sleep or a driver write: N_TTY collects echo and ISIG signals under
-`ldata` and writes/sends them after dropping it; the SIGWINCH of
-TIOCSWINSZ and the SIGHUP/SIGCONT of giving up a controlling tty are sent
-after `ctrl` is dropped. A reader's wait condition takes `ldata`.
+`termios` and `ctrl` are spin locks taken in thread context only,
+briefly, never across a signal, a sleep or a driver write: the SIGWINCH
+of TIOCSWINSZ and the SIGHUP/SIGCONT of giving up a controlling tty are
+sent after `ctrl` is dropped. `ldata` (sleeping, thread context: the
+flip thread, readers, TIOCINQ, input flushes and termios changes from
+ioctl) is taken with no spin lock held and orders above `termios`
+(input processing reads termios and set_termios swaps it under `ldata`,
+so an ICANON change is applied atomically, as Linux's `termios_rwsem`).
+Under `ldata` N_TTY queues echo in its ring and writes it to the driver
+(`driver_write`: the UART's polled MMIO/port writes, no lock) once
+`ECHO_COMMIT_WATERMARK` bytes are pending and at the end of the input
+(Linux commit_echoes, flush_echoes), and sends an ISIG signal to the
+foreground group (Linux __isig: `ctrl` for the group, then TASKLIST and
+the signal locks). No driver write and no signal path takes `ldata`.
+Order: `read_lock` → `ldata`; `buf_lock` → `ldata` → `termios`, `ctrl`,
+TASKLIST and the signal locks.
 
 Input (`tty/flip.rs`, Linux tty_buffer.c): the UART handler (IRQ
 context, under its line's `IrqDesc.lock`) drains its FIFO into `Tty.flip` (leaf), sets
@@ -3772,7 +3783,7 @@ PRINTK (IrqSpinlock, ring buffer, brief hold during write)
     ↓
 CONSOLE_REGISTRY (IrqSpinlock, console dispatch to drivers)
     ↓
-Per-TTY locks (Mutex: termios, ldata, ctrl) - independent between TTYs
+Per-TTY spin locks (termios, ctrl) - independent between TTYs
     ↓
 GfxConsole.state (Mutex, if graphics console receives output)
 ```
@@ -4326,7 +4337,6 @@ else is taken under it) unless an order is given. "spin" is the
 | membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | task/membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`: `curr_mm` SeqCst, then a full fence, then the registrations read, so a registration either sees the CPU in its mm and refreshes it by IPI or is seen by the switch; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
 | `Inode.i_pipe` | fs/inode.rs, io/pipe.rs (FIFOs, pipefs) | spin Mutex leaf (Linux inode->i_lock around i_pipe) | a FIFO's or pipefs inode's pipe and its open-file count: attached by the first open (pipe(2): at creation, with both ends counted; a FIFO's pipe is allocated with the lock dropped and installed if the slot is still empty, Linux fifo_open, the losing one freed after the unlock), dropped by the last release (a pipe end's release as a FIFO's); every change of the pipe's reader/writer counts and open counters happens under it (so a blocking open decides, and samples the counter it waits on, before unlocking; the release wakes the other side under it: -> `Pipe.wait_queue`); never held across a wait (a blocking open waits on `Pipe.wait_queue` after unlocking) or under `Pipe.inner` |
 | `Pipe.inner` | io/pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation and across read/write's copy to or from the caller's memory (may fault: -> mmap_lock, as Linux pipe->mutex), never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator; -> `FasyncList.list` (pipe_fasync changes both lists under it, Linux too); -> the output file's write path (i_rwsem, page cache, socket locks) for a pipe-to-file splice, which consumes only what the write took (Linux iter_file_splice_write under pipe_lock); -> the input file's read path for a file-to-pipe splice, which reads only once the pipe has room (Linux splice_file_to_pipe: wait_for_space, then do_splice_read under pipe_lock). A splice, tee or vmsplice waits for data or room with it dropped (`lock_data`, `lock_room`; Linux pipe_wait_readable/writable) and decides EOF, EPIPE or progress under it. SIGIO is sent after it is dropped (Linux sends under pipe->mutex) and after `Inode.i_pipe`. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock. A read decides EOF (no writers) under it, after seeing the ring empty (Linux pipe_read under pipe->mutex): a writer's last write unlocks before its release drops the count, so its data is never read as EOF |
-| `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state` | hw/gfx/ | sleeping `sync::Mutex` (Linux DRM modeset locks) | framebuffer device state, DRM ioctls only |
 | `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device registry |

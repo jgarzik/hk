@@ -158,8 +158,11 @@ pub struct Tty {
     pub termios: Mutex<Termios>,
     /// Hardware driver
     driver: &'static dyn TtyDriver,
-    /// N_TTY input state
-    ldata: Mutex<n_tty::NTtyData>,
+    /// N_TTY input state (sleeping: Linux termios_rwsem's role for the
+    /// line discipline; input echoes and signals under it)
+    ldata: crate::sync::Mutex<n_tty::NTtyData>,
+    /// `ldata`'s heads, for poll and readers' wait conditions without it
+    avail: n_tty::Avail,
     /// Bytes from the driver's interrupt handler
     flip: IrqSpinlock<flip::Flip>,
     /// Serializes feeding the flip buffer to the line discipline with
@@ -188,7 +191,8 @@ impl Tty {
             dev,
             termios: Mutex::new(Termios::cooked()),
             driver,
-            ldata: Mutex::new(n_tty::NTtyData::new()),
+            ldata: crate::sync::Mutex::new(n_tty::NTtyData::new()),
+            avail: n_tty::Avail::new(),
             flip: IrqSpinlock::new(flip::Flip::new()),
             buf_lock: crate::sync::Mutex::new(()),
             read_lock: crate::sync::Mutex::new(()),
@@ -243,7 +247,7 @@ impl Tty {
     /// ones with the ICANON change applied, never half; readers and
     /// pollers are woken (VMIN, VTIME or ICANON may make input readable)
     pub fn update_termios(&self, f: impl FnOnce(&mut Termios)) {
-        let mut ld = self.ldata.lock();
+        let mut ld = n_tty::ldata(self);
         let canon = {
             let mut t = self.termios.lock();
             f(&mut t);
@@ -277,7 +281,7 @@ impl Tty {
 
     /// Bytes a read can return (TIOCINQ)
     pub fn bytes_available(&self) -> usize {
-        self.ldata.lock().inq()
+        n_tty::ldata(self).inq()
     }
 
     /// The foreground process group
@@ -329,7 +333,7 @@ impl Tty {
     pub fn flush_input(&self) {
         let _b = self.buf_lock.lock();
         self.flip.lock().clear();
-        self.ldata.lock().reset();
+        n_tty::ldata(self).reset();
     }
 
     /// Flush the output buffer (no-op for polled driver)
