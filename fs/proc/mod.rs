@@ -2306,11 +2306,6 @@ fn build_sys(sb: &Arc<SuperBlock>, root: &Arc<Inode>) -> Result<(), KernelError>
     Ok(())
 }
 
-/// Mount function for procfs
-/// Every procfs superblock, for proc_flush_pid
-static PROC_SBS: crate::sync::spin::Mutex<Vec<alloc::sync::Weak<SuperBlock>>> =
-    crate::sync::spin::Mutex::new(Vec::new());
-
 /// A released task's /proc entries leave every procfs dcache (Linux
 /// proc_flush_pid): /proc/<tid>, and the process directory with it
 /// when the task was its leader, /proc/<pid>/task/<tid> otherwise, each
@@ -2336,16 +2331,11 @@ pub fn proc_flush_pid(t: &crate::task::Task) {
     let Some(thread) = thread else {
         return;
     };
-    let sbs: Vec<Arc<SuperBlock>> = {
-        let mut v = PROC_SBS.lock();
-        v.retain(|w| w.strong_count() != 0);
-        v.iter().filter_map(alloc::sync::Weak::upgrade).collect()
-    };
     let name = |n: u32| alloc::format!("{n}").into_bytes();
-    for sb in sbs {
-        let ns = opts::sb_pid_ns(&sb);
+    crate::fs::superblock::iterate_supers_type(&PROCFS_TYPE, |sb| {
+        let ns = opts::sb_pid_ns(sb);
         let (Some(root), Some(tid)) = (sb.get_root(), thread.nr_in(&ns)) else {
-            continue;
+            return;
         };
         root.remove_child(&name(tid));
         if let Some(pid) = leader.as_ref().and_then(|l| l.nr_in(&ns))
@@ -2355,9 +2345,10 @@ pub fn proc_flush_pid(t: &crate::task::Task) {
         {
             task.remove_child(&name(tid));
         }
-    }
+    });
 }
 
+/// Mount function for procfs
 fn procfs_mount(
     fs_type: &'static FileSystemType,
     data: &[u8],
@@ -2366,7 +2357,6 @@ fn procfs_mount(
     // Create superblock
     let sb = SuperBlock::new(fs_type, &PROCFS_SUPER_OPS, 0)?;
     sb.set_private(opts);
-    PROC_SBS.lock().push(Arc::downgrade(&sb));
 
     // Create root inode (directory)
     let root_inode = try_arc(Inode::new(
@@ -2543,4 +2533,6 @@ pub static PROCFS_TYPE: FileSystemType = FileSystemType {
     mount: procfs_mount,
     mount_dev: None, // Procfs doesn't use a backing device
     file_ops: &PROCFS_FILE_OPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };

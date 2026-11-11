@@ -10,40 +10,21 @@
 //! writes each inode's dirty pages (`filemap::write_and_wait`), then the
 //! device's own cache (filesystem metadata). It runs from fsync's
 //! superblock-wide callers: sync(2), syncfs(2), umount and the periodic
-//! device writeback. Device filesystems register in `SUPER_BLOCKS`
-//! (Linux super_blocks) when mounted.
+//! device writeback, over the device filesystems
+//! (`superblock::iterate_supers`).
 //!
-//! Locking: `SuperBlock.s_dirty` and `SUPER_BLOCKS` are spin leaves,
-//! thread context only; `mark_inode_dirty` may run under a page lock
-//! (the fault path), never under a spinlock. Writeback itself sleeps
+//! Locking: `SuperBlock.s_dirty` is a spin leaf, thread context only;
+//! `mark_inode_dirty` may run under a page lock (the fault path), never
+//! under a spinlock. Writeback itself sleeps
 //! (block I/O) with no spinlock held.
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::inode::Inode;
-use super::superblock::SuperBlock;
-use crate::sync::spin::Mutex;
+use super::superblock::{SuperBlock, iterate_supers};
 use crate::util::error::KernelError;
-
-/// Device-backed superblocks (Linux super_blocks)
-static SUPER_BLOCKS: Mutex<Vec<Weak<SuperBlock>>> = Mutex::new(Vec::new());
-
-/// Register a device filesystem's superblock for sync(2)
-pub fn register_sb(sb: &Arc<SuperBlock>) {
-    let mut l = SUPER_BLOCKS.lock();
-    l.retain(|w| w.strong_count() > 0);
-    l.push(Arc::downgrade(sb));
-}
-
-fn live_sbs() -> Vec<Arc<SuperBlock>> {
-    SUPER_BLOCKS
-        .lock()
-        .iter()
-        .filter_map(Weak::upgrade)
-        .collect()
-}
 
 /// `inode` has a new dirty page (Linux __mark_inode_dirty(I_DIRTY_PAGES)):
 /// the first time, put it on its superblock's dirty list and arm its
@@ -106,9 +87,13 @@ pub fn writeback_sb(sb: &SuperBlock) -> Result<(), KernelError> {
 /// Write back every device filesystem (sync(2): Linux ksys_sync, the
 /// inodes; the block devices follow)
 pub fn sync_all_sbs() {
-    for sb in live_sbs() {
-        let _ = writeback_sb(&sb);
-    }
+    // Linux sync_inodes_one_sb: nothing to write without a backing
+    // device (noop_backing_dev_info)
+    iterate_supers(|sb| {
+        if sb.bdev().is_some() {
+            let _ = writeback_sb(sb);
+        }
+    });
 }
 
 /// Its pages became dirty at or before `cutoff` (monotonic ns)
@@ -123,11 +108,11 @@ fn expired(inode: &Inode, cutoff: u64) -> bool {
 /// if it did. True if dirty inodes are left for a later pass
 pub fn writeback_dev(dev: crate::block::DevId, cutoff: u64) -> bool {
     let mut left = false;
-    for sb in live_sbs() {
+    iterate_supers(|sb| {
         if sb.bdev().is_some_and(|b| b.dev_id() == dev) {
-            left |= writeback_sb_expired(&sb, cutoff);
+            left |= writeback_sb_expired(sb, cutoff);
         }
-    }
+    });
     if let Some(b) = crate::block::get_blkdev(dev) {
         let bi = &b.bd_inode;
         if bi.i_dirty.load(Ordering::Acquire) {

@@ -807,4 +807,6 @@ pub static CGROUPFS_TYPE: FileSystemType = FileSystemType {
     mount: cgroupfs_mount,
     mount_dev: None,
     file_ops: &CGROUPFS_FILE_OPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };

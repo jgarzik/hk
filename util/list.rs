@@ -15,6 +15,8 @@
 //!   so removing or stepping from any given item is safe in O(1): a
 //!   dentry's children.
 //! - [`BoxList`]: the list owns each entry as a `Box`: queued signals.
+//! - [`WeakList`]: the list holds a `Weak` per entry, which leaves it in
+//!   its own teardown: superblocks, a superblock's mounts and inodes.
 //!
 //! A list and the links of its entries are only touched under the lock
 //! that owns the list (the caller's: `&mut List` is that proof); the
@@ -23,7 +25,7 @@
 //! a list, the ends hold null), which [`ArcList`] checks on insert.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::marker::PhantomData;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering::Relaxed};
@@ -588,6 +590,172 @@ impl<A: OwnerAdapter> Default for OwnedList<A> {
     }
 }
 
+/// A [`List`] that holds a `Weak` reference to each entry: for objects
+/// that stay listed for their whole life and leave the list in their
+/// teardown (Linux super_blocks and fs_supers, whose entries
+/// __put_super and generic_shutdown_super unlink; an sb's s_mounts and
+/// s_inodes). A walker under the list's lock may meet an entry whose
+/// last strong reference is gone and whose teardown waits for that lock
+/// (Linux SB_DYING, I_FREEING): [`WeakEntry::upgrade`] fails for it
+/// (refcount_inc_not_zero).
+///
+/// The item's owner keeps the contract the walkers rely on: every
+/// entry leaves the list (`remove`) under its lock as the first step of
+/// its `Drop`, before any field is dropped, so a linked entry is never
+/// a dropped value. The list's `Weak` keeps the allocation, which is
+/// what lets an entry be upgraded from its link.
+///
+/// # Invariants
+/// Every item on `list` was inserted with `Weak::into_raw`: the list
+/// holds that weak reference until the item leaves it through
+/// `from_raw`.
+pub struct WeakList<A: Adapter> {
+    list: List<A>,
+    /// It drops `Weak<Item>`s wherever it goes: Send/Sync as Weak's
+    _owns: PhantomData<Weak<A::Item>>,
+}
+
+impl<A: Adapter> WeakList<A> {
+    pub const fn new() -> Self {
+        Self {
+            list: List::new(),
+            _owns: PhantomData,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// Append `item` (Linux list_add_tail); panics if it is on a list
+    /// through this link
+    pub fn push_back(&mut self, item: &Arc<A::Item>) {
+        assert!(A::link(item).claim(), "WeakList: item already linked");
+        // SAFETY: unlinked and claimed for this insert (the CAS); the
+        // weak reference keeps the allocation, and the owner unlinks it
+        // before it is dropped (type contract)
+        unsafe { self.list.push_back(Weak::into_raw(Arc::downgrade(item))) };
+    }
+
+    /// Prepend `item` (Linux list_add / hlist_add_head)
+    pub fn push_front(&mut self, item: &Arc<A::Item>) {
+        assert!(A::link(item).claim(), "WeakList: item already linked");
+        // SAFETY: as in push_back
+        unsafe { self.list.push_front(Weak::into_raw(Arc::downgrade(item))) };
+    }
+
+    /// Unlink `item` and hand back the list's weak reference (dropping
+    /// it never runs the item's `Drop`)
+    ///
+    /// # Safety
+    /// `item` is on this list.
+    pub unsafe fn remove(&mut self, item: &A::Item) -> Weak<A::Item> {
+        let p = core::ptr::from_ref::<A::Item>(item);
+        // SAFETY: on this list, which holds the weak reference from
+        // into_raw
+        unsafe {
+            self.list.remove(p);
+            Weak::from_raw(p)
+        }
+    }
+
+    /// Remove the first entry, handing back the list's weak reference
+    pub fn pop_front(&mut self) -> Option<Weak<A::Item>> {
+        // SAFETY: entries were inserted with into_raw
+        self.list.pop_front().map(|p| unsafe { Weak::from_raw(p) })
+    }
+
+    /// The entries, front to back (the list must not change meanwhile:
+    /// its lock is held for the walk)
+    pub fn iter(&self) -> WeakIter<'_, A> {
+        WeakIter {
+            list: self,
+            cur: self.list.front(),
+        }
+    }
+
+    /// The entries after `item`, which the walker holds (an `Arc`), so
+    /// it is still listed (Linux list_for_each_entry_continue)
+    ///
+    /// # Safety
+    /// `item` is on this list.
+    pub unsafe fn iter_after(&self, item: &A::Item) -> WeakIter<'_, A> {
+        WeakIter {
+            list: self,
+            // SAFETY: on this list (the caller)
+            cur: unsafe { self.list.next(item) },
+        }
+    }
+}
+
+impl<A: Adapter> Drop for WeakList<A> {
+    fn drop(&mut self) {
+        while self.pop_front().is_some() {}
+    }
+}
+
+/// Iterator over a [`WeakList`]'s entries
+pub struct WeakIter<'a, A: Adapter> {
+    list: &'a WeakList<A>,
+    cur: Option<*const A::Item>,
+}
+
+impl<'a, A: Adapter> Iterator for WeakIter<'a, A> {
+    type Item = WeakEntry<'a, A>;
+    fn next(&mut self) -> Option<WeakEntry<'a, A>> {
+        let p = self.cur?;
+        // SAFETY: an entry of the borrowed list
+        self.cur = unsafe { self.list.list.next(p) };
+        Some(WeakEntry { p, _l: PhantomData })
+    }
+}
+
+/// One entry of a [`WeakList`], under the list's lock
+///
+/// # Invariants
+/// `p` is on the list borrowed for 'a, which holds a weak reference to
+/// it from `Weak::into_raw`.
+pub struct WeakEntry<'a, A: Adapter> {
+    p: *const A::Item,
+    _l: PhantomData<&'a WeakList<A>>,
+}
+
+impl<'a, A: Adapter> WeakEntry<'a, A> {
+    /// The item, possibly in its teardown (its last strong reference
+    /// gone, its `Drop` waiting for the list's lock): only what stays
+    /// valid until that `Drop` unlinks it may be used (no field has
+    /// been dropped yet; Linux reads a dying sb under sb_lock likewise)
+    pub fn get(&self) -> &'a A::Item {
+        // SAFETY: listed, so not dropped (type contract: an entry leaves
+        // the list before any of it is dropped, under the lock the
+        // borrowed list stands for)
+        unsafe { &*self.p }
+    }
+
+    /// The list's weak reference, borrowed
+    fn weak(&self) -> core::mem::ManuallyDrop<Weak<A::Item>> {
+        // SAFETY: the list holds this weak reference (type invariant);
+        // ManuallyDrop leaves it the list's
+        core::mem::ManuallyDrop::new(unsafe { Weak::from_raw(self.p) })
+    }
+
+    /// A strong reference, unless the item is in its teardown (Linux
+    /// refcount_inc_not_zero). It must not be dropped under the list's
+    /// lock: the last one's `Drop` takes that lock.
+    pub fn upgrade(&self) -> Option<Arc<A::Item>> {
+        self.weak().upgrade()
+    }
+
+    /// Some strong reference is alive
+    pub fn is_live(&self) -> bool {
+        self.weak().strong_count() != 0
+    }
+}
+
 /// A [`List`] that owns each entry as a `Box` (Linux list_head of
 /// kmalloc'd entries: struct sigpending's sigqueues)
 ///
@@ -852,6 +1020,64 @@ mod tests {
             assert_eq!(Arc::strong_count(&a), 2);
         }
         assert_eq!(Arc::strong_count(&a), 1);
+    }
+
+    struct WNode {
+        v: u32,
+        link: Link,
+        list: *const crate::sync::spin::Mutex<WeakList<WNodeA>>,
+    }
+    crate::adapter!(WNodeA, WNode, link);
+    // SAFETY: the tests use the list pointer only under its lock
+    unsafe impl Send for WNode {}
+    // SAFETY: as above
+    unsafe impl Sync for WNode {}
+
+    impl Drop for WNode {
+        /// The owner's side of the contract: unlink first, under the lock
+        fn drop(&mut self) {
+            // SAFETY: the list outlives its nodes in the test
+            let mut l = unsafe { &*self.list }.lock();
+            if self.link.is_linked() {
+                // SAFETY: linked only on this list
+                drop(unsafe { l.remove(self) });
+            }
+        }
+    }
+
+    #[test]
+    fn weak_list_entries_leave_in_teardown() {
+        let l = crate::sync::spin::Mutex::new(WeakList::<WNodeA>::new());
+        let mk = |v| {
+            Arc::new(WNode {
+                v,
+                link: Link::new(),
+                list: &raw const l,
+            })
+        };
+        let (a, b, c) = (mk(1), mk(2), mk(3));
+        for n in [&a, &b, &c] {
+            l.lock().push_back(n);
+        }
+        // The list holds no strong reference
+        assert_eq!((Arc::strong_count(&a), Arc::weak_count(&a)), (1, 1));
+        let vals = |l: &WeakList<WNodeA>| l.iter().map(|e| e.get().v).collect::<Vec<_>>();
+        assert_eq!(vals(&l.lock()), [1, 2, 3]);
+        // A walk continues after an entry it holds
+        let after: Vec<u32> = {
+            let g = l.lock();
+            unsafe { g.iter_after(&a) }
+                .filter_map(|e| e.upgrade())
+                .map(|n| n.v)
+                .collect()
+        };
+        assert_eq!(after, [2, 3]);
+        drop(b);
+        assert_eq!(vals(&l.lock()), [1, 3]);
+        assert!(l.lock().iter().all(|e| e.is_live()));
+        drop(a);
+        drop(c);
+        assert!(l.lock().is_empty());
     }
 
     #[test]

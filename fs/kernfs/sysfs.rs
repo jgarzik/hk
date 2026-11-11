@@ -5,8 +5,7 @@
 //! untagged ones (Linux sysfs_get_tree: kobj_ns_grab_current(NET)).
 //! Subsystems hang their directories off `root()` as they initialize.
 
-use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
+use alloc::sync::Arc;
 
 use spin::Once;
 
@@ -15,16 +14,12 @@ use crate::fs::dentry::Dentry;
 use crate::fs::inode::{Inode, InodeMode, InodeOps};
 use crate::fs::kernfs::{self, KNode};
 use crate::fs::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
-use crate::sync::spin::Mutex;
 use crate::util::kalloc::try_arc;
 
 /// Linux SYSFS_MAGIC
 pub const SYSFS_MAGIC: u64 = 0x6265_6572;
 
 static ROOT: Once<Arc<KNode>> = Once::new();
-/// Superblock of each network namespace's mounts, by namespace id
-/// (spin leaf)
-static SBS: Mutex<Vec<(u64, Weak<SuperBlock>)>> = Mutex::new(Vec::new());
 
 /// The root of /sys
 pub fn root() -> &'static Arc<KNode> {
@@ -65,23 +60,31 @@ impl SuperOps for SysfsSops {
 
 static SYSFS_SOPS: SysfsSops = SysfsSops;
 
+/// The network namespace a sysfs superblock shows (Linux
+/// kernfs_test_super's info->ns)
+fn sb_ns(sb: &SuperBlock) -> Option<u64> {
+    let p = sb.private.read();
+    p.as_ref()?
+        .as_any()
+        .downcast_ref::<kernfs::vfs::KfSuper>()
+        .map(|k| k.ns)
+}
+
+/// The namespace's superblock, shared by its mounts (Linux
+/// kernfs_get_tree: sget_fc with kernfs_test_super)
 fn mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
     let ns = crate::net::current_net_ns().id;
-    let mut sbs = SBS.lock();
-    sbs.retain(|(_, w)| w.strong_count() > 0);
-    if let Some(sb) = sbs
-        .iter()
-        .find(|(n, _)| *n == ns)
-        .and_then(|(_, w)| w.upgrade())
-    {
-        return Ok(sb);
-    }
-    let sb = SuperBlock::new(t, &SYSFS_SOPS, 0)?;
-    sb.set_private(try_arc(kernfs::vfs::KfSuper { ns })?);
-    let ri = kernfs::vfs::inode(&sb, root())?;
-    sb.set_root(try_arc(Dentry::new_root(ri, Arc::downgrade(&sb)))?);
-    sbs.push((ns, Arc::downgrade(&sb)));
-    Ok(sb)
+    crate::fs::superblock::sget(
+        t,
+        |sb| sb_ns(sb) == Some(ns),
+        || {
+            let sb = SuperBlock::alloc(t, &SYSFS_SOPS, 0)?;
+            sb.set_private(try_arc(kernfs::vfs::KfSuper { ns })?);
+            let ri = kernfs::vfs::inode(&sb, root())?;
+            sb.set_root(try_arc(Dentry::new_root(ri, Arc::downgrade(&sb)))?);
+            Ok(sb)
+        },
+    )
 }
 
 pub static SYSFS_TYPE: FileSystemType = FileSystemType {
@@ -90,6 +93,8 @@ pub static SYSFS_TYPE: FileSystemType = FileSystemType {
     mount,
     mount_dev: None,
     file_ops: &kernfs::vfs::KERNFS_FOPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };
 
 /// Linux sysfs_init + mnt_init's fs_kobj: the root, /sys/fs, the type;
@@ -97,7 +102,7 @@ pub static SYSFS_TYPE: FileSystemType = FileSystemType {
 pub fn init() {
     let fs = top_dir(b"fs");
     mount_point(&fs, b"cgroup");
-    crate::fs::superblock::register_filesystem(&SYSFS_TYPE);
+    crate::fs::superblock::register_filesystem(&SYSFS_TYPE).expect("sysfs type");
 }
 
 /// An empty directory something else mounts on (Linux

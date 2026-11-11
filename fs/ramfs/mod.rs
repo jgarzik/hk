@@ -1234,6 +1234,8 @@ pub static RAMFS_TYPE: FileSystemType = FileSystemType {
     mount: ramfs_mount,
     mount_dev: None, // Ramfs doesn't use a backing device
     file_ops: &RAMFS_FILE_OPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };
 
 use super::inode::{Gid, Uid};

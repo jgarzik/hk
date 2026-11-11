@@ -2680,6 +2680,8 @@ pub static VFAT_TYPE: FileSystemType = FileSystemType {
     mount: vfat_mount_pseudo,
     mount_dev: Some(vfat_mount_dev),
     file_ops: &VFAT_FILE_OPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };
 
 #[cfg(test)]

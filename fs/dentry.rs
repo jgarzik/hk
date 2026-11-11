@@ -701,16 +701,13 @@ fn prune_tree(root: &Arc<Dentry>, budget: usize) -> usize {
 /// number dropped.
 pub fn shrink_dcache(budget: usize) -> usize {
     let mut freed = 0;
-    let mut i = 0;
-    while let Some(sb) = super::superblock::nth_sb(i) {
-        i += 1;
-        if let Some(root) = sb.and_then(|sb| sb.get_root()) {
+    super::superblock::iterate_supers(|sb| {
+        if freed < budget
+            && let Some(root) = sb.get_root()
+        {
             freed += prune_tree(&root, budget - freed);
         }
-        if freed >= budget {
-            break;
-        }
-    }
+    });
     freed
 }
 

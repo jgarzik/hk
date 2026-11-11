@@ -149,6 +149,9 @@ pub struct Mount {
     /// via mntget(). Incremented by mntget(), decremented by mntput().
     /// The mount cannot be unmounted while mnt_count > 0 (unless MNT_FORCE/MNT_DETACH).
     mnt_count: AtomicU64,
+
+    /// On its superblock's `s_mounts` (Linux mnt_instance)
+    pub(super) mnt_instance: crate::util::list::Link,
 }
 
 impl Mount {
@@ -200,6 +203,7 @@ impl Mount {
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
             devname,
             mnt_count: AtomicU64::new(0),
+            mnt_instance: crate::util::list::Link::new(),
         }
     }
 
@@ -675,7 +679,6 @@ pub fn dev_super(
     let h = bdev.open_handle()?;
     let sb = mount_dev_fn(fs_type, bdev, opts)?;
     sb.set_bdev(h);
-    super::fs_writeback::register_sb(&sb);
     Ok(sb)
 }
 
@@ -978,6 +981,15 @@ impl Drop for Mount {
     /// A mount dropped without an umount (a namespace going away) still
     /// had its mountpoint counted
     fn drop(&mut self) {
+        // First off its superblock's s_mounts (the list's contract,
+        // `WeakList`; Linux removes mnt_instance in umount_tree)
+        let me: &Self = self;
+        let weak = {
+            let mut l = me.sb.s_mounts.lock();
+            // SAFETY: a linked mnt_instance is on its superblock's list
+            me.mnt_instance.is_linked().then(|| unsafe { l.remove(me) })
+        };
+        drop(weak);
         if let Some(mp) = self.mountpoint.get_mut().take() {
             note_mp(&mp, -1);
         }

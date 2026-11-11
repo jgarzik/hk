@@ -98,6 +98,8 @@ const fn pseudo(name: &'static str, magic: u64, file_ops: &'static dyn FileOps) 
             mount: pseudo_mount,
             mount_dev: None,
             file_ops,
+            next: crate::fs::superblock::FsNext::new(None),
+            fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
         },
         ops: PseudoSuperOps { magic },
         mnt: spin::Once::new(),

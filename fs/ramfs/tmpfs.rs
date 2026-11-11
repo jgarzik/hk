@@ -538,6 +538,8 @@ pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
     mount: tmpfs_mount,
     mount_dev: None,
     file_ops: &super::TMPFS_FILE_OPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };
 
 /// The kernel's own tmpfs (Linux shm_mnt, kern_mount: no limits, in
@@ -587,6 +589,8 @@ pub static TMPFS_TYPE: FileSystemType = FileSystemType {
     mount: tmpfs_mount,
     mount_dev: None,
     file_ops: &super::TMPFS_FILE_OPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };
 
 #[cfg(test)]

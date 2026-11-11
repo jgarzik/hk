@@ -435,7 +435,7 @@ VFS locks (detailed order):
     mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write, and
                    the tree's links in attach_mnt/detach_mnt)
         → SuperBlock.s_mounts (spin leaf: a new mount, a read-only
-                   remount's snapshot)
+                   remount's walk)
         ↓
     dentry::RENAME_LOCK (SeqRwLock, spin; Linux rename_lock: write in
                    d_move/d_exchange, read in is_subdir/d_path, its
@@ -2313,9 +2313,10 @@ d_revalidate) after its d_lock is released, inside whatever i_rwsem the
 walk holds: procfs's takes TASKLIST (read) and the task's fd table
 lock. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
 clones the task's and its leader's `Pid` under TASKLIST's read lock
-(dropped after it), collects the procfs superblocks under `PROC_SBS`
-(spin Mutex, leaf), releases it, then drops dentries (d_lock), each
-named as that superblock's pid namespace numbers the task.
+(dropped after it), then walks the procfs superblocks
+(`iterate_supers_type`: each taken under `SB_LOCK` and held with it
+released) and drops dentries (d_lock), each named as that superblock's
+pid namespace numbers the task.
 
 A procfs superblock's pid namespace (`ProcOpts.pid_ns`, Linux
 proc_fs_info.pid_ns: the mounter's) is fixed at mount and read with no
@@ -2340,11 +2341,32 @@ TASKLIST, mmap_lock, network and mount locks) and the copy to the
 caller (may fault: -> mmap_lock); under f_pos_lock for read().
 
 The dcache shrinker (`dentry::shrink_dcache`: drop_caches 2, direct
-reclaim) takes `superblock::ALL_SBS` (spin Mutex, leaf) only to pick the
-next superblock, then per dentry the parent's d_lock (write) and the
-child's (read): spin locks only, allocating nothing. Direct reclaim
-never runs in atomic context (`may_direct_reclaim`), so an allocation
-under a d_lock or ALL_SBS cannot re-enter it.
+reclaim) walks the superblocks with `superblock::iterate_supers`
+(`SB_LOCK` only to step), then per dentry the parent's d_lock (write)
+and the child's (read): spin locks only, allocating nothing. Direct
+reclaim never runs in atomic context (`may_direct_reclaim`), so an
+allocation under a d_lock cannot re-enter it.
+
+**Superblock lists** (`fs/superblock.rs`; Linux fs/super.c,
+fs/filesystems.c): `SB_LOCK` (spin Mutex leaf, thread context; Linux
+sb_lock) guards `super_blocks` (`SuperBlock.s_list`) and each type's
+`FileSystemType.fs_supers` (`SuperBlock.s_instances`, a `LockedBy`
+cell of the lock's data). Both are `util::list::WeakList`s: a `Weak`
+per superblock, linked by `SuperBlock::new` (or `sget`) and unlinked
+as the first step of its `Drop` (Linux __put_super and
+generic_shutdown_super), so nothing allocates under the lock. A walker
+(`iterate_supers`, `iterate_supers_type`; Linux __iterate_supers)
+takes the next live superblock's reference under it (a dying one,
+whose last `Arc` went and whose `Drop` waits for the lock, fails the
+upgrade: Linux SB_DYING / refcount_inc_not_zero), releases it, runs
+its callback (which may sleep), and drops the previous reference with
+the lock released (the last one's teardown takes it). `sget` (Linux
+sget_fc) runs its test under it (sysfs: `SuperBlock.private`, a spin
+RwLock read, the only lock taken under `SB_LOCK`), builds a new
+superblock unlocked and lists it unless a matching one was listed
+meanwhile. `FILE_SYSTEMS` (spin RwLock leaf, thread context; Linux
+file_systems_lock) guards the registered types, a singly linked list
+through `FileSystemType.next` in registration order.
 `dentry::d_drop_tree` (a removed directory's cache, inside the
 victim's i_rwsem: Linux vfs_rmdir's shrink_dcache_parent; an unhashed
 dentry's cached subtree, a dying superblock's tree) takes the same
@@ -2367,7 +2389,7 @@ dropped. No dentry's last reference is dropped under a d_lock.
 | `KNode.iattr` | spin Mutex, leaf (Linux kernfs_iattr_rwsem) | written by chmod/chown/utimes under the inode's i_rwsem; read (copied out) when lookup builds an inode, under the parent's i_rwsem |
 | `AttrNode.ops`, `BinNode.ops` | spin RwLock, leaf | read (clone) under an active reference by show()/store(); cleared by `KNode::remove` after the drain, with no lock held, the operations dropped after it is released (a removed node kept by a dentry or open file pins nothing) |
 | `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks, and across a read's copy to the caller (may fault: -> mmap_lock; no active reference held then, Linux seq_read_iter under m->lock); a write copies its data in before taking it; under f_pos_lock for read/write |
-| `sysfs::SBS` | spin Mutex, leaf | per-network-namespace superblocks, taken only in mount |
+| `SB_LOCK` (sget) | spin Mutex, leaf | a network namespace's sysfs superblock is found in `SYSFS_TYPE.fs_supers` by `sget` (Linux kernfs_get_tree), its test reading `SuperBlock.private` under the lock |
 
 Device model (base/): `Device.lock` (sync::Mutex, Linux device_lock)
 guards the device's "dead" flag, set first by `del` (a dead device is
@@ -2446,7 +2468,7 @@ Linux `vfsmount.mnt_count` pattern:
 | `Mount.mnt_ns` | `AtomicU64` | Id of the mount's namespace (`MntNamespace.id`, never reused), 0 for none (Linux mnt_ns): written only under NAMESPACE_SEM write (commit_tree when a tree is grafted or propagated, the namespace root, a namespace copy; umount clears it), read by `check_mnt` under NAMESPACE_SEM; can_umount and remount read it first without, as Linux (umount repeats it under the lock) |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
 | `Mount.writers`, `SuperBlock.s_writers` | `AtomicU64` (count + WRITE_HOLD bit 63) | Write-access holders (Linux mnt_writers + WRITE_HOLD): through a mount on the mount, for mountless internal objects on the superblock. A writer adds itself, spins while WRITE_HOLD is set, then checks read-only state (EROFS, backing out). Making a mount read-only (`set_flags`, Linux mnt_make_readonly) or the file system (`make_rdonly`, Linux sb_prepare_remount_readonly: every writable mount in `s_mounts` and `s_writers`) sets WRITE_HOLD under `MOUNT_LOCK`, is EBUSY with nothing changed if any count is nonzero, else sets the read-only flag before clearing the hold (Release). The writer's spin is invisible to lockdep; holders never wait for writers |
-| `SuperBlock.s_mounts` | spin Mutex leaf | the superblock's mounts (Weak; Linux s_mounts), always under `MOUNT_LOCK`: a new mount is added there (`Mount::new`, Linux clone_mnt under lock_mount_hash), so a read-only remount's snapshot misses no mount a writer could use |
+| `SuperBlock.s_mounts` | spin Mutex leaf | the superblock's mounts (Linux s_mounts: a `WeakList` through `Mount.mnt_instance`): a new mount is added under `MOUNT_LOCK` (`Mount::new`, Linux clone_mnt under lock_mount_hash), so a read-only remount's walk (`make_rdonly`, under `MOUNT_LOCK` and this lock across both passes, taking no reference) misses no mount a writer could use; a mount leaves it first thing in its `Drop`, under this lock alone |
 
 **Reference Counting (mntget/mntput):**
 
@@ -4268,7 +4290,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `FileLockCtx.flc_lock` (per inode), `locks::BLOCKED` | fs/locks.rs | spin Mutex | an inode's flock and POSIX locks (Linux i_flctx flc_lock; a POSIX owner is a descriptor table's id; nothing allocates for a POSIX change under it: room for the two locks one change can add is reserved before it is taken, Linux posix_lock_inode's new_fl/new_fl2, and splits, inserts and merges are done in place; a flock change likewise reserves room for one more shared holder, Linux flock_lock_inode's new_fl),  leaf but for BLOCKED (flc_lock -> BLOCKED, Linux blocked_lock_lock: each waiting POSIX owner and the owner it waits on, for EDEADLK). A blocked locker sleeps on the inode's wait queue with neither held, interruptibly, until the change count moves; `locks::BLOCKED` (Linux blocked_hash) is an rbtree whose node the waiter allocates before taking it and frees after it |
 | `cmdline::SAVED` | cmdline.rs | `spin::Once` | the saved kernel command line (Linux saved_command_line): set once while parsing, before SMP; read lock-free (init's arguments, /proc/cmdline) |
 | `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty group set a task with no SignalStruct (kernel thread, exited task) reads; nothing is queued on it; locked where `SignalStruct.shared` would be, same position (Task.sig -> shared) |
-| `FS_TYPES` | fs/superblock.rs | spin | filesystem types |
+| `FILE_SYSTEMS`, `SB_LOCK` | fs/superblock.rs | spin RwLock, spin Mutex | the registered filesystem types (Linux file_systems_lock) and the superblock lists (Linux sb_lock); 3.3 Superblock lists |
 | `CHARDEV_REGISTRY` | fs/chardev.rs | sleeping `sync::RwSem` (Linux chrdevs_lock, cdev_map->lock: mutexes) | character device registry: registered at probe, looked up at open and mmap (under mmap_lock); never under a spin lock |
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf, also under `FasyncList.list` (O_ASYNC is set or cleared only with the file's fasync entry). `File.f_iocb` (the flags' I/O part, Linux f_iocb_flags: O_APPEND, O_DIRECT, O_DSYNC, __O_SYNC) is an atomic written only under it with the flags (F_SETFL), read lock-free by each read and write: an I/O racing an F_SETFL sees the old or the new word, as Linux's unlocked read of f_iocb_flags. `File.f_wb_err` / `f_sb_err` (Linux f_wb_err, f_sb_err: the writeback errors of the file's mapping and filesystem it has seen) are atomics sampled at open and advanced only under it (`errseq` check-and-advance, Linux file_check_and_advance_wb_err), read lock-free first. `AddressSpace.wb_err`, `SuperBlock.s_wb_err` (`util::errseq::ErrSeq`, Linux errseq_t) are lock-free words set by a failed writeback and a stale page cache after a direct write |
 | `FasyncList.list` → `File.f_lock`, `FOwner.st` | io/fasync.rs | sleeping `sync::Mutex` (per object: a pipe's readers and writers, a socket's, a tty's, an inotify group's); `FOwner.st` spin leaf | SIGIO (Linux fasync_lock and RCU readers, fown->lock): `FasyncList.armed` (atomic, written under the lock, read lock-free: Linux kill_fasync's unlocked list test) lets a wakeup with no armed file skip the lock; a list's entries (a file's `FOwner` reference and the armed fd), changed by `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) and walked by `kill_fasync`, which sends each entry's signal under it: thread context, no spin lock held (3.7 rule 1). `FOwner.st` (a file's owner pid, type, setter uids and F_SETSIG signal; allocated once per file) is copied under it and released before the send. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |
@@ -4294,7 +4316,7 @@ else is taken under it) unless an order is given. "spin" is the
 under its i_rwsem, `SWAPON` -> i_rwsem, and checked under it by
 writes and truncates). The address space holds the executable's denial (`MmStruct.exe_deny`, cloned at fork) |
 | `SuperBlock.s_wb_lock` | fs/superblock.rs | sleeping `sync::Mutex` | serializes whole-filesystem writeback passes (`writeback_sb`: sync, syncfs, umount, the periodic writeback), held across their I/O: s_wb_lock -> page lock -> i_mmap -> PTE lock. fsync writes its inode without it; a page another pass is writing carries the WRITEBACK mark and its writer holds its page lock, so fsync waits on that lock |
-| `SuperBlock.s_dirty`, `SUPER_BLOCKS` | fs/superblock.rs, fs/fs_writeback.rs | spin Mutex leaves | inodes with dirty pages, each held (an `Arc`) until written back (Linux wb->b_dirty), and the device filesystems for sync(2) (Linux super_blocks). `mark_inode_dirty` (called by every page dirtying, `filemap::dirty_page`, through the mapping's `host`: Linux __folio_mark_dirty) takes `s_dirty` under a page lock at most, then the BDI's spin locks to arm its periodic writeback (a block device's own inode, which has no superblock, arms its disk's directly); `AddressSpace.dirtied_when` is stored (release, under the `i_pages` lock) when the mapping's first dirty page since it was clean comes, and read (acquire) by the periodic writeback, which takes the list, puts back the inodes younger than vm.dirty_expire_centisecs, and writes the rest with no spin lock held |
+| `SuperBlock.s_dirty` | fs/superblock.rs, fs/fs_writeback.rs | spin Mutex leaf | inodes with dirty pages, each held (an `Arc`) until written back (Linux wb->b_dirty); sync(2) and the periodic writeback find the device filesystems with `iterate_supers`. `mark_inode_dirty` (called by every page dirtying, `filemap::dirty_page`, through the mapping's `host`: Linux __folio_mark_dirty) takes `s_dirty` under a page lock at most, then the BDI's spin locks to arm its periodic writeback (a block device's own inode, which has no superblock, arms its disk's directly); `AddressSpace.dirtied_when` is stored (release, under the `i_pages` lock) when the mapping's first dirty page since it was clean comes, and read (acquire) by the periodic writeback, which takes the list, puts back the inodes younger than vm.dirty_expire_centisecs, and writes the rest with no spin lock held |
 | `LAST_INO` (per CPU) | fs/anon_inodes.rs | IrqSpinlock leaf | this CPU's batch of pseudo-filesystem inode numbers (Linux get_next_ino, preempt-off per-CPU counter); refilled from the atomic `SHARED_LAST_INO` under it |
 | `NUMA_TOPOLOGY` | mm/numa.rs | IrqSpinlock leaf | NUMA node table: written by the boot parsers and by each CPU at bring-up (`numa::cpu_up`, end of arch per-CPU init), read by getcpu and the mempolicy syscalls |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents; nothing allocates under them: hash elements are preallocated at create on a free list (Linux htab prealloc), lookups and get_next_key copy into a buffer the caller allocated before the lock (Linux bpf_map_copy_value) |
