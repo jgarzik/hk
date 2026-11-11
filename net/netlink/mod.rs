@@ -26,8 +26,11 @@
 //!
 //! - `NlTable.socks` (per netns): `crate::sync::spin::RwLock`, thread context only,
 //!   leaf; lookups return `Arc` clones (no guard escapes).
-//! - `NlSock.dump`: `crate::sync::spin::Mutex`, thread context only; held while the
+//! - `NlSock.dump`: sleeping `crate::sync::Mutex` (Linux nlk->cb_mutex),
+//!   thread context only (sendmsg, recvmsg, release); held while the
 //!   cursor reads table snapshots and while its part is queued.
+//!   `NlSock.running` (Linux cb_running) mirrors whether a dump is set,
+//!   written under it, read lock-free by poll.
 //! - `NlSock.rxq`: `crate::sync::spin::Mutex`, thread context only, leaf. Senders
 //!   (notifications under RTNL, requests, peers, dump steps) push and
 //!   wake `wq` after dropping it.
@@ -197,8 +200,11 @@ pub struct NlSock {
     congested: AtomicBool,
     /// Messages dropped on overrun
     drops: AtomicU32,
-    /// Running dump (Linux cb_running + netlink_callback)
-    dump: Mutex<Option<Dump>>,
+    /// Running dump (Linux netlink_callback, under nlk->cb_mutex)
+    dump: crate::sync::Mutex<Option<Dump>>,
+    /// A dump is set (Linux cb_running): written under `dump`, read
+    /// lock-free by poll, which may run in atomic context
+    running: AtomicBool,
     /// Released (Linux SOCK_DEAD): senders waiting for room give up
     /// with ECONNREFUSED
     dead: AtomicBool,
@@ -246,7 +252,8 @@ impl NlSock {
             flags: AtomicU32::new(0),
             congested: AtomicBool::new(false),
             drops: AtomicU32::new(0),
-            dump: Mutex::new(None),
+            dump: crate::sync::Mutex::new(None),
+            running: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             wait: WaitQueue::new(),
             me: me.clone(),
@@ -469,7 +476,7 @@ impl NlSock {
         // Separate statements: never hold rxq while taking dump (order
         // is dump -> rxq)
         let queued = !self.rxq.lock().is_empty();
-        let dumping = self.dump.lock().is_some();
+        let dumping = self.running.load(Ordering::Acquire);
         queued || dumping || self.sk.has_err()
     }
 
@@ -525,6 +532,7 @@ impl NlSock {
                 return Err(KernelError::Busy);
             }
             *d = Some(Dump { cb, seq });
+            self.running.store(true, Ordering::Release);
         }
         self.dump_step();
         Ok(())
@@ -550,8 +558,8 @@ impl NlSock {
         if self.dump.lock().is_none() {
             return false;
         }
-        // Allocated before NlSock.dump is taken (a spin lock): one part,
-        // NLMSG_DONE included (fill leaves room for it), one slab object
+        // One part, NLMSG_DONE included (fill leaves room for it), one
+        // slab object
         let mut buf = Vec::with_capacity(rtnetlink::DUMP_SIZE);
         let mut d = self.dump.lock();
         let Some(st) = d.as_mut() else {
@@ -571,6 +579,7 @@ impl NlSock {
             m.put(&err.to_ne_bytes());
             buf.extend_from_slice(&m.finish());
             *d = None;
+            self.running.store(false, Ordering::Release);
         }
         // Admission was checked above (a racing notification may push
         // rmem past rcvbuf, which Linux also allows for one skb). Queued
@@ -640,7 +649,11 @@ impl NlSock {
     /// running dump, mark the socket dead, purge the receive queue and
     /// wake senders waiting for room in it (they fail ECONNREFUSED)
     pub fn release(&self) {
-        let dump = self.dump.lock().take();
+        let dump = {
+            let mut d = self.dump.lock();
+            self.running.store(false, Ordering::Release);
+            d.take()
+        };
         drop(dump);
         if self.bound.load(Ordering::Acquire) {
             self.sk.net.nl.remove(self.sk.protocol, self.portid());
