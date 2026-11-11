@@ -36,9 +36,10 @@
 //! queues to the receive backlog and `netif_rx_flush_local` runs only
 //! with no lock held.
 //!
-//! Order: `TcpSock.lock` owner (sleeping) -> its `slock` (a listener's
-//! before its new child's; a child never takes its listener's) ->
-//! tables (`bhash` -> `ehash`, `lhash`) -> `Inet.addr` ->
+//! Order: `TcpSock.lock` owner (sleeping) -> its `slock` (one
+//! socket's at a time: a listener's SYN path takes none, its new child
+//! is set up under the child's own) -> tables (`bhash` -> `ehash`,
+//! `lhash`) -> `Inet.addr` ->
 //! `TcpSock.queue` (listener SYN/accept queues, leaf) -> the
 //! timer bases (the socket's timers); and either -> FIB / neighbour / device TX (transmit).
 
@@ -56,7 +57,6 @@ pub mod timer;
 pub mod timewait;
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
@@ -100,7 +100,8 @@ use crate::net::{NetNamespace, dev};
 use crate::sync::rcu::RcuPuts;
 use crate::time::timer::ArcTimer;
 use crate::util::hlist_nulls::NullsLink;
-use crate::util::list::Link;
+use crate::util::kalloc::with_gfp;
+use crate::util::list::{ArcList, Link};
 
 pub use self::cb::TcpState;
 
@@ -154,15 +155,19 @@ struct Inner {
     connecting: bool,
 }
 
-/// A listener's queues (Linux request_sock_queue + accept queue)
+/// A listener's queues (Linux request_sock_queue + accept queue):
+/// children linked through their own `accept_link` (Linux
+/// rskq_accept_head through req->dl_next), on one list at a time
 struct Accept {
     backlog: u32,
     /// Children in SYN_RECEIVED (hk keeps full child sockets where Linux
     /// has request socks; the count is bounded by the backlog)
-    syn: Vec<Arc<TcpSock>>,
+    syn: ArcList<AcceptLink>,
     /// Established, not yet accepted
-    ready: VecDeque<Arc<TcpSock>>,
+    ready: ArcList<AcceptLink>,
 }
+
+crate::adapter!(AcceptLink, TcpSock, accept_link);
 
 impl Accept {
     /// Linux sk_acceptq_is_full
@@ -266,6 +271,12 @@ pub struct TcpSock {
     by_bind: AtomicBool,
     /// The tables' references, dropped a grace period after unhashing
     rcu_puts: RcuPuts,
+    /// A child's place on its listener's SYN or accept queue
+    accept_link: Link,
+    /// A listener's options as its children inherit them, for the
+    /// lockless SYN path (Linux reads the listener's fields with no
+    /// lock): copied at the end of every locked step in LISTEN; leaf
+    listen_opts: Mutex<cb::Opts>,
     me: Weak<TcpSock>,
 }
 
@@ -407,6 +418,8 @@ impl TcpSock {
             bind_link: Link::new(),
             by_bind: AtomicBool::new(false),
             rcu_puts: RcuPuts::new(),
+            accept_link: Link::new(),
+            listen_opts: Mutex::new(cb::Opts::default()),
             me: me.clone(),
         })
     }
@@ -524,15 +537,19 @@ impl TcpSock {
         bind.addr = self.inet.get().rcv_saddr;
         bind.tw = true;
         bind.listen = false;
-        let Ok(tw) = TimeWait::new(
-            self.sk.net.clone(),
-            t,
-            bind,
-            self.by_bind.load(Ordering::Relaxed),
-            self.inet.params(),
-            self.oif(),
-            g.cb.tw_clone(),
-        ) else {
+        // GFP_ATOMIC under the socket lock (Linux inet_twsk_alloc)
+        let tw = with_gfp(Gfp::ATOMIC, || {
+            TimeWait::new(
+                self.sk.net.clone(),
+                t,
+                bind,
+                self.by_bind.load(Ordering::Relaxed),
+                self.inet.params(),
+                self.oif(),
+                g.cb.tw_clone(),
+            )
+        });
+        let Ok(tw) = tw else {
             // Out of memory: close without TIME_WAIT (Linux tcp_time_wait
             // falls back to tcp_done); `post` leaves the tables
             g.tuple = Some(t);
@@ -593,6 +610,9 @@ impl TcpSock {
         let t = g.tuple.or_else(|| self.cur_tuple());
         let ready = self.post(g, out);
         let w = self.emit(out, t);
+        if g.cb.state == TcpState::Listen {
+            *self.listen_opts.lock() = g.cb.opts;
+        }
         self.snap.store(&g.cb);
         Wake { w, ready }
     }
@@ -715,7 +735,7 @@ impl TcpSock {
     fn do_rcv(&self, g: &mut Inner, skb: Box<SkBuff>, t: Tuple, now: u64, out: &mut Out) {
         let s = &skb.tcp.clone();
         if g.cb.state == TcpState::Listen {
-            return self.listen_rcv(g, s, t, now);
+            return self.conn_request(s, t, now);
         }
         if g.tuple != Some(t) {
             return;
@@ -740,11 +760,24 @@ impl TcpSock {
         self.queue.lock().as_ref().is_none_or(|q| q.full())
     }
 
-    /// A segment for this listener (Linux tcp_rcv_state_process in
-    /// LISTEN, tcp_conn_request): a SYN makes a child in SYN_RECEIVED
-    /// that answers with SYN-ACK. Dropped when the accept queue or the
-    /// SYN queue is full (no syncookies).
-    fn listen_rcv(&self, g: &mut Inner, s: &SegIn, t: Tuple, now: u64) {
+    /// A segment for this listener (Linux tcp_v4_rcv's TCP_LISTEN
+    /// case): handled with no socket lock, as Linux; a socket that left
+    /// LISTEN meanwhile takes the locked path
+    fn listen_rcv(&self, skb: Box<SkBuff>, t: Tuple) {
+        if self.state() != TcpState::Listen {
+            return self.rcv(skb, t);
+        }
+        let s = skb.tcp;
+        drop(skb);
+        self.conn_request(&s, t, now_ms());
+    }
+
+    /// A segment in LISTEN (Linux tcp_rcv_state_process,
+    /// tcp_conn_request): a SYN makes a child in SYN_RECEIVED that
+    /// answers with SYN-ACK. Dropped when the accept queue or the SYN
+    /// queue is full (no syncookies). Takes no lock of the listener but
+    /// its queue's (the options and buffer sizes are read as published)
+    fn conn_request(&self, s: &SegIn, t: Tuple, now: u64) {
         if s.has(flags::RST) {
             return;
         }
@@ -759,7 +792,6 @@ impl TcpSock {
         if !s.has(flags::SYN) || s.has(flags::FIN) {
             return;
         }
-        self.assert_owner();
         {
             let q = self.queue.lock();
             match q.as_ref() {
@@ -767,29 +799,23 @@ impl TcpSock {
                 _ => return,
             }
         }
-        let caps = (g.cb.rcv_cap, g.cb.snd_cap, g.cb.rcv_locked);
-        self.child(s, t, g.cb.opts, caps, now);
-    }
-
-    /// Debug and LOCKDEP builds: a listener (locked, in LISTEN) owns
-    /// its port in bhash, or bind(0) could hand the port out while this
-    /// listener still answers on it
-    fn assert_owner(&self) {
-        if cfg!(any(debug_assertions, feature = "lockdep")) {
-            let port = self.inet.get().sport;
-            assert!(
-                self.sk.net.tcp.owns(port, &self.arc()),
-                "tcp: listener on port {port} is no bhash owner"
-            );
-        }
+        let opts = *self.listen_opts.lock();
+        let caps = (
+            (self.sk.rcvbuf() / 2) as usize,
+            (self.sk.sndbuf() / 2) as usize,
+            self.sk.flag(sf::RCVBUF_LOCK),
+        );
+        self.child(s, t, opts, caps, now);
     }
 
     /// Create, hash and queue a SYN_RECEIVED child and send its SYN-ACK
-    /// (listener locked, then the new child's `slock`: nobody owns it
-    /// yet; `opts` and the buffer `caps` are the listener's)
+    /// (under the new child's `slock`: nobody owns it yet; `opts` and
+    /// the buffer `caps` are the listener's). The child is allocated
+    /// GFP_ATOMIC before any lock is taken (Linux inet_reqsk_alloc,
+    /// sk_clone_lock)
     fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, caps: (usize, usize, bool), now: u64) {
         // Out of memory: drop the SYN (Linux inet_csk_clone_lock)
-        let Ok(c) = TcpSock::new(Sock::clone_from(&self.sk)) else {
+        let Ok(c) = with_gfp(Gfp::ATOMIC, || TcpSock::new(Sock::clone_from(&self.sk))) else {
             return;
         };
         c.inet.clone_opts(&self.inet);
@@ -830,8 +856,24 @@ impl TcpSock {
         }
         g.bound = true;
         g.parent = Some(self.me.clone());
-        if let Some(q) = self.queue.lock().as_mut() {
-            q.syn.push(c.clone());
+        let queued = match self.queue.lock().as_mut() {
+            Some(q) => {
+                q.syn.push_back(c.clone());
+                true
+            }
+            None => false,
+        };
+        if !queued {
+            // The listener closed meanwhile (Linux: the request finds
+            // no listener): the child leaves the tables unanswered
+            g.parent = None;
+            g.cb.set_closed(&mut Out::default());
+            let mut gone = Out {
+                done: true,
+                ..Out::default()
+            };
+            let _ = c.post(g, &mut gone);
+            return;
         }
         // SYN-ACK: nobody waits on a new child, no wakeup
         let _ = c.apply(g, &mut out);
@@ -845,16 +887,23 @@ impl TcpSock {
         let Some(q) = q.as_mut() else {
             return false;
         };
-        q.syn.retain(|x| !Arc::ptr_eq(x, c));
-        q.ready.push_back(c.clone());
+        let Some(r) = q.syn.remove_first(|x| core::ptr::eq(x, Arc::as_ptr(c))) else {
+            return false;
+        };
+        q.ready.push_back(r);
         true
     }
 
     /// A child died before being accepted
     fn child_gone(&self, c: &TcpSock) {
-        if let Some(q) = self.queue.lock().as_mut() {
-            q.syn.retain(|x| !core::ptr::eq(Arc::as_ptr(x), c));
-        }
+        let gone = self
+            .queue
+            .lock()
+            .as_mut()
+            .and_then(|q| q.syn.remove_first(|x| core::ptr::eq(x, c)));
+        // The queue's reference goes after its lock (the caller holds
+        // another)
+        drop(gone);
     }
 
     /// TCP_SYNCNT or the sysctl
@@ -1016,8 +1065,8 @@ impl TcpSock {
     }
 
     /// Abort children of a closed listener (Linux inet_csk_listen_stop)
-    fn listen_stop(&self, q: Accept) {
-        for c in q.syn.into_iter().chain(q.ready) {
+    fn listen_stop(&self, mut q: Accept) {
+        while let Some(c) = q.syn.pop_front().or_else(|| q.ready.pop_front()) {
             c.step(|g, out| {
                 g.parent = None;
                 g.cb.close(true, now_ms(), out);
@@ -1208,7 +1257,7 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
         None => skb,
     };
     if let Some(l) = net.tcp.listener(daddr, t.lport, dif) {
-        return l.rcv(skb, t);
+        return l.listen_rcv(skb, t);
     }
     // No socket: reset (never answer a RST)
     if let Some(r) = output::reset_for(&s) {
@@ -1780,8 +1829,8 @@ impl ProtoOps for TcpSock {
         }
         *self.queue.lock() = Some(Accept {
             backlog,
-            syn: Vec::new(),
-            ready: VecDeque::new(),
+            syn: ArcList::new(),
+            ready: ArcList::new(),
         });
         g.cb.state = TcpState::Listen;
         self.sk.set_flag(sf::ACCEPTCONN, true);
