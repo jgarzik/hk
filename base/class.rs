@@ -2,14 +2,12 @@
 //! holds a link to each device of the class.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use spin::Once;
 
 use super::core::{DevNode, Device};
 use crate::fs::kernfs::KNode;
 use crate::fs::kernfs::sysfs;
-use crate::sync::spin::Mutex;
 
 static CLASS_DIR: Once<Arc<KNode>> = Once::new();
 
@@ -29,8 +27,6 @@ pub struct Class {
     /// and device_type->uevent)
     pub uevent: Option<super::bus::UeventFn>,
     dir: Once<Arc<KNode>>,
-    /// Registered devices (Linux klist_devices)
-    devices: Mutex<Vec<Arc<Device>>>,
 }
 
 impl Class {
@@ -41,7 +37,6 @@ impl Class {
             blk: false,
             uevent: None,
             dir: Once::new(),
-            devices: Mutex::new(Vec::new()),
         }
     }
 
@@ -53,7 +48,6 @@ impl Class {
             blk: false,
             uevent: Some(uevent),
             dir: Once::new(),
-            devices: Mutex::new(Vec::new()),
         }
     }
 
@@ -65,7 +59,6 @@ impl Class {
             blk: true,
             uevent,
             dir: Once::new(),
-            devices: Mutex::new(Vec::new()),
         }
     }
 
@@ -80,20 +73,5 @@ impl Class {
             c.create_dir(self.name.as_bytes(), 0o755)
                 .expect("class directory")
         })
-    }
-
-    pub(super) fn add_device(&self, d: Arc<Device>) {
-        self.devices.lock().push(d);
-    }
-
-    pub(super) fn remove_device(&self, d: &Device) {
-        self.devices
-            .lock()
-            .retain(|x| !core::ptr::eq(Arc::as_ptr(x), d));
-    }
-
-    /// Devices of the class (Linux class_for_each_device)
-    pub fn devices(&self) -> Vec<Arc<Device>> {
-        self.devices.lock().clone()
     }
 }

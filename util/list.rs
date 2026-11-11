@@ -291,6 +291,16 @@ impl<A: Adapter> List<A> {
         (!n.is_null()).then(|| unsafe { A::item(n) })
     }
 
+    /// Remove and return the last item (Linux list_last_entry +
+    /// list_del)
+    pub fn pop_back(&mut self) -> Option<*const A::Item> {
+        // SAFETY: a non-null tail is an entry's link
+        let item = (!self.tail.is_null()).then(|| unsafe { A::item(self.tail) })?;
+        // SAFETY: it is on this list
+        unsafe { self.remove(item) };
+        Some(item)
+    }
+
     /// Remove and return the first item (Linux list_first_entry +
     /// list_del)
     pub fn pop_front(&mut self) -> Option<*const A::Item> {
@@ -398,6 +408,12 @@ impl<A: Adapter> ArcList<A> {
     pub fn pop_front(&mut self) -> Option<Arc<A::Item>> {
         // SAFETY: entries were inserted with into_raw
         self.list.pop_front().map(|p| unsafe { Arc::from_raw(p) })
+    }
+
+    /// Remove and return the last entry
+    pub fn pop_back(&mut self) -> Option<Arc<A::Item>> {
+        // SAFETY: entries were inserted with into_raw
+        self.list.pop_back().map(|p| unsafe { Arc::from_raw(p) })
     }
 
     /// The first entry

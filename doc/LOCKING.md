@@ -2256,14 +2256,21 @@ emptied-glue removal: Device.lock -> GLUE -> KERNFS_RWSEM. `Device.added`
 probe may register child devices (their sysfs entries, uevents and
 probes), so a parent's lock is taken before its children's, never the
 reverse. `Device.driver` (spin RwLock) and `Device.bound` (spin Mutex)
-are leaves read without the device lock. `Class.devices`,
-`BusType.{devices,drivers}` (Linux klist_devices/klist_drivers) and
-`core::DEVICES_LIST` (Linux devices_kset list) are spin leaves taken
-alone; lists are snapshotted before probing walks them.
-`device_shutdown` (reboot(2)) takes the list out under its lock and runs
-each bound driver's shutdown callback after dropping it, so callbacks
-(which may poll hardware or take driver locks such as `USB_CONTROLLER`)
-never run under it. `PciDev.driver_override` is a sleeping
+are leaves read without the device lock. `BusType.devices` is a klist
+(`util::klist`, Linux klist_devices): the device embeds its node
+(`Device.knode_bus`), a walk (`bus.devices()`, Linux bus_for_each_dev)
+takes the klist's spin leaf only to step and holds the device it
+stands on, so a probe sleeps between devices; a device removed while a
+walker stands on it is marked dead, skipped, and unlinked when the walker
+moves on. `BusType.drivers` (Linux klist_drivers) is an intrusive list
+of the 'static drivers, never unregistered, stepped under its spin
+leaf. `core::DEVICES_LIST` (Linux devices_kset list) is an intrusive
+list through `Device.kset_link`, a spin leaf. Nothing allocates under
+these locks. `device_shutdown` (reboot(2)) takes the devices off the
+list's end one at a time, as Linux, and runs each bound driver's
+shutdown callback with the lock dropped, so callbacks (which may poll
+hardware or take driver locks such as `USB_CONTROLLER`) never run under
+it. `PciDev.driver_override` is a sleeping
 `sync::Mutex` leaf (Linux device_lock).
 Net devices: `NetNamespace::register_device` links the device on the
 namespace's `devices` RCU list (its leaf writer lock released) before

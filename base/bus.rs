@@ -10,13 +10,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::Once;
 
-use super::core::Device;
-use super::driver::Driver;
+use super::core::{DevBus, Device};
+use super::driver::{Driver, DrvBus};
 use crate::fs::KernelError;
 use crate::fs::kernfs::sysfs;
 use crate::fs::kernfs::{Attr, KNode, SysBuf};
 use crate::sync::spin::Mutex;
 use crate::util::kalloc::arc_nofail;
+use crate::util::klist::{Klist, KlistIter};
+use crate::util::list::List;
 
 static BUS_DIR: Once<Arc<KNode>> = Once::new();
 static SYSTEM_DIR: Once<Arc<KNode>> = Once::new();
@@ -87,10 +89,12 @@ pub struct BusType {
     p: Once<BusPriv>,
     /// Probe new devices and drivers (drivers_autoprobe)
     autoprobe: AtomicBool,
-    /// Devices in registration order (Linux klist_devices)
-    devices: Mutex<Vec<Arc<Device>>>,
-    /// Registered drivers (Linux klist_drivers)
-    drivers: Mutex<Vec<&'static Driver>>,
+    /// Devices in registration order (Linux klist_devices), walked while
+    /// devices come and go
+    devices: Klist<DevBus>,
+    /// Registered drivers (Linux klist_drivers), never unregistered: a
+    /// walk steps under the lock and may sleep between drivers
+    drivers: Mutex<List<DrvBus>>,
 }
 
 /// drivers_autoprobe (Linux bus_attr_drivers_autoprobe)
@@ -178,8 +182,8 @@ impl BusType {
             drv_attrs,
             p: Once::new(),
             autoprobe: AtomicBool::new(true),
-            devices: Mutex::new(Vec::new()),
-            drivers: Mutex::new(Vec::new()),
+            devices: Klist::new(),
+            drivers: Mutex::new(List::new()),
         }
     }
 
@@ -226,35 +230,64 @@ impl BusType {
         dev.kobj().create_link(b"subsystem", &p.dir)?;
         p.devices_dir
             .create_link(dev.name().as_bytes(), dev.kobj())?;
-        self.devices.lock().push(dev.clone());
+        self.devices.add_tail(dev.clone());
         Ok(())
     }
 
     /// Linux bus_remove_device
     pub(super) fn remove_device(&self, dev: &Device) {
         self.p().devices_dir.remove_child(dev.name().as_bytes());
-        self.devices
-            .lock()
-            .retain(|d| !core::ptr::eq(Arc::as_ptr(d), dev));
+        self.devices.del(dev);
     }
 
+    /// Linux bus_add_driver's klist_add_tail; once per driver
     pub(super) fn add_driver(&self, drv: &'static Driver) {
-        self.drivers.lock().push(drv);
+        let mut l = self.drivers.lock();
+        if !drv.bus_link.is_linked() {
+            // SAFETY: a 'static driver, linked once and never unlinked
+            unsafe { l.push_back(drv) };
+        }
     }
 
-    pub fn devices(&self) -> Vec<Arc<Device>> {
-        self.devices.lock().clone()
+    /// The bus's devices, each held while the walker uses it, the lock
+    /// taken only to step (Linux bus_for_each_dev)
+    pub fn devices(&self) -> KlistIter<'_, DevBus> {
+        self.devices.iter()
     }
 
-    pub fn drivers(&self) -> Vec<&'static Driver> {
-        self.drivers.lock().clone()
+    /// The bus's drivers (Linux bus_for_each_drv)
+    pub fn drivers(&self) -> Drivers<'_> {
+        Drivers {
+            bus: self,
+            cur: None,
+        }
     }
 
+    /// Linux bus_find_device_by_name
     pub fn find_device(&self, name: &[u8]) -> Option<Arc<Device>> {
-        self.devices
-            .lock()
-            .iter()
-            .find(|d| d.name().as_bytes() == name)
-            .cloned()
+        self.devices.find(|d| d.name().as_bytes() == name)
+    }
+}
+
+/// A walk over a bus's drivers, stepping under the list's lock
+pub struct Drivers<'a> {
+    bus: &'a BusType,
+    cur: Option<&'static Driver>,
+}
+
+impl Iterator for Drivers<'_> {
+    type Item = &'static Driver;
+
+    fn next(&mut self) -> Option<&'static Driver> {
+        let l = self.bus.drivers.lock();
+        let p = match self.cur {
+            // SAFETY: a driver on the list stays on it (never removed)
+            Some(c) => unsafe { l.next(c) },
+            None => l.front(),
+        }?;
+        // SAFETY: every driver on the list is 'static
+        let d: &'static Driver = unsafe { &*p };
+        self.cur = Some(d);
+        Some(d)
     }
 }

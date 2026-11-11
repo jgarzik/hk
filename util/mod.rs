@@ -9,6 +9,7 @@ pub mod errseq;
 pub mod group_cpus;
 pub mod ida;
 pub mod kalloc;
+pub mod klist;
 pub mod kmem;
 pub mod list;
 pub mod percpu_counter;
