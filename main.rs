@@ -411,7 +411,7 @@ pub(crate) fn kmain() -> ! {
 fn run_init() -> ! {
     // Linux kernel_init, before run_init_process
     system_state::set_system_state(system_state::SystemState::Running);
-    let args = cmdline::init_args(&cmdline::saved());
+    let args = cmdline::init_args(cmdline::saved());
     let rdinit = args.rdinit.as_deref().unwrap_or("/init");
     if fs::lookup_path(rdinit.as_bytes()).is_ok() {
         let e = try_init(rdinit, &args);

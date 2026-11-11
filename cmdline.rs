@@ -70,14 +70,20 @@ static CMDLINE_CONSOLE: Mutex<CmdlineConsole> = Mutex::new(CmdlineConsole::new()
 /// Longest command line kept (Linux COMMAND_LINE_SIZE on x86)
 const COMMAND_LINE_SIZE: usize = 2048;
 
-/// The command line, saved at parse time (before the heap exists) for
-/// what reads it later: init's arguments (Linux saved_command_line)
-static SAVED: Mutex<([u8; COMMAND_LINE_SIZE], usize)> = Mutex::new(([0; COMMAND_LINE_SIZE], 0));
+/// The command line, saved once at parse time (before the heap exists)
+/// for what reads it later: init's arguments, /proc/cmdline (Linux
+/// saved_command_line: set once, read with no lock)
+static SAVED: spin::Once<([u8; COMMAND_LINE_SIZE], usize)> = spin::Once::new();
 
-/// The saved command line
-pub fn saved() -> alloc::string::String {
-    let s = SAVED.lock();
-    alloc::string::String::from_utf8_lossy(&s.0[..s.1]).into_owned()
+/// The saved command line (empty before it is parsed)
+pub fn saved() -> &'static str {
+    SAVED.get().map_or("", |(b, n)| {
+        // Cut at a character boundary: a long line is truncated in bytes
+        match core::str::from_utf8(&b[..*n]) {
+            Ok(s) => s,
+            Err(e) => core::str::from_utf8(&b[..e.valid_up_to()]).unwrap_or(""),
+        }
+    })
 }
 
 /// Parameters the kernel takes itself (Linux: __setup handlers and
@@ -145,12 +151,12 @@ pub fn init_args(cmdline: &str) -> InitArgs {
 /// - `console=<device>[,<baud>]`: Set kernel console device
 /// - `watchdog_thresh=<seconds>`: soft lockup threshold (`watchdog`)
 pub fn parse_cmdline(cmdline: &str) {
-    {
-        let mut s = SAVED.lock();
+    SAVED.call_once(|| {
+        let mut b = [0; COMMAND_LINE_SIZE];
         let n = cmdline.len().min(COMMAND_LINE_SIZE);
-        s.0[..n].copy_from_slice(&cmdline.as_bytes()[..n]);
-        s.1 = n;
-    }
+        b[..n].copy_from_slice(&cmdline.as_bytes()[..n]);
+        (b, n)
+    });
     for option in cmdline.split_whitespace() {
         if option == "usb_trace" {
             usb::enable_usb_trace();
