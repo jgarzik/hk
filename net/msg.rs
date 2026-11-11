@@ -87,9 +87,20 @@ impl Iov {
     }
 
     /// Copy in up to `max` bytes starting `skip` bytes into the vector
-    pub fn gather_at(&self, mut skip: usize, max: usize) -> Result<Vec<u8>, KernelError> {
+    pub fn gather_at(&self, skip: usize, max: usize) -> Result<Vec<u8>, KernelError> {
         let want = self.total.saturating_sub(skip).min(max);
         let mut out = crate::util::kmem::try_vec(want, 0u8)?;
+        if self.gather_into(skip, &mut out)? < want {
+            return Err(KernelError::BadAddress);
+        }
+        Ok(out)
+    }
+
+    /// Copy in up to `buf.len()` bytes starting `skip` bytes into the
+    /// vector: the bytes copied, short at the end of the vector or after
+    /// a fault; EFAULT if a fault stopped it before the first byte
+    pub fn gather_into(&self, mut skip: usize, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let want = self.total.saturating_sub(skip).min(buf.len());
         let mut off = 0;
         for s in &self.segs {
             if off == want {
@@ -100,12 +111,17 @@ impl Iov {
                 continue;
             }
             let n = (s.len - skip).min(want - off);
-            copy_from_user(&mut out[off..off + n], s.base + skip as u64, n)
-                .map_err(|_| KernelError::BadAddress)?;
+            if copy_from_user(&mut buf[off..off + n], s.base + skip as u64, n).is_err() {
+                return if off > 0 {
+                    Ok(off)
+                } else {
+                    Err(KernelError::BadAddress)
+                };
+            }
             skip = 0;
             off += n;
         }
-        Ok(out)
+        Ok(off)
     }
 
     /// Copy `data` out starting `skip` bytes into the vector; returns the
@@ -354,6 +370,23 @@ impl<'a> Src<'a> {
     /// Copy in the first `n` bytes
     pub fn take(&mut self, n: usize) -> Result<Vec<u8>, KernelError> {
         self.take_at(0, n)
+    }
+
+    /// Copy in up to `buf.len()` bytes starting at `off` into `buf` (for
+    /// an iterator, `off` is the bytes already taken; Linux
+    /// copy_from_iter): the bytes copied, short after a fault; EFAULT if
+    /// none
+    pub fn copy_at(&mut self, off: usize, buf: &mut [u8]) -> Result<usize, KernelError> {
+        match self {
+            Src::User(v) => v.gather_into(off, buf),
+            Src::Iter { from, total } => {
+                debug_assert_eq!(off, *total - from.len());
+                match from.copy_from(buf)? {
+                    0 if !buf.is_empty() => Err(KernelError::BadAddress),
+                    n => Ok(n),
+                }
+            }
+        }
     }
 
     /// Copy in up to `n` bytes starting at `off` (for an iterator, `off`

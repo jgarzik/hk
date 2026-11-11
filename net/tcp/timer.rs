@@ -19,7 +19,9 @@
 //! deadline; it only raises a flag and wakes `softnet/0` (decision 1:
 //! protocol timers run in softnet), which calls [`run`]: due entries are
 //! taken out under `TIMERS`, then each is processed under its own socket
-//! lock with `TIMERS` dropped. Order: socket lock -> `TIMERS` ->
+//! lock with `TIMERS` dropped (a connection's `slock`; one owned by a
+//! socket call leaves the timer to the owner's release, Linux
+//! TCP_WRITE_TIMER_DEFERRED). Order: socket lock -> `TIMERS` ->
 //! `Alarm.st` -> the timer base (IrqSpinlock).
 
 use alloc::collections::BTreeMap;
@@ -379,6 +381,14 @@ pub fn rearm(slot: &mut Slot, want: Option<u64>, me: Weak<dyn Expire>) {
     drop(t);
     if first {
         ALARM.arm(at.saturating_mul(1_000_000));
+    }
+}
+
+/// Forget `slot`'s registration, taken out of `TIMERS` if still there
+/// (a deferred timer's: `run` took it out when it fired)
+pub fn cancel(slot: &mut Slot) {
+    if let Some(k) = slot.0.take() {
+        TIMERS.lock().remove(&k);
     }
 }
 

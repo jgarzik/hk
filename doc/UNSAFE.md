@@ -37,6 +37,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | Wrapper | Kind |
 |---|---|
 | inode and page lock guards | RAII guard |
+| socket lock `SockLock` / `SockGuard` / `BhGuard` (`net/core/sock_lock.rs`, Linux socket_lock_t) | RAII guards over owner bit + spin lock |
 | frame borrows | typed handle |
 | `Pod` byte views | marker trait |
 | `IoMem` registers | checked volatile |

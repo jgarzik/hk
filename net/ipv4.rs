@@ -309,7 +309,7 @@ pub fn pseudo_header_checksum(saddr: Ipv4Addr, daddr: Ipv4Addr, protocol: u8, le
 ///
 /// `skb.data()` starts at the IP header (eth_type_trans pulled the MAC
 /// header). The packet's namespace is its device's.
-pub fn ip_rcv(mut skb: SkBuff) {
+pub fn ip_rcv(mut skb: Box<SkBuff>) {
     let Some(ihl) = ip_check(&mut skb) else {
         return;
     };
@@ -401,18 +401,18 @@ pub fn ip_options_ok(opt: &[u8]) -> bool {
 
 /// A reassembled datagram as a received skb (device and link-layer
 /// classification of its last fragment)
-fn rebuild(last: &SkBuff, pkt: &[u8]) -> Option<SkBuff> {
+fn rebuild(last: &SkBuff, pkt: &[u8]) -> Option<Box<SkBuff>> {
     let mut s = SkBuff::alloc(NET_SKB_PAD, pkt.len(), Gfp::ATOMIC)?;
     s.put_slice(pkt)?;
     s.dev = last.dev.clone();
     s.pkt_type = last.pkt_type;
     s.ip_bcast = last.ip_bcast;
-    Some(*s)
+    Some(s)
 }
 
 /// Deliver a whole datagram for us to its protocol (Linux
 /// ip_local_deliver_finish)
-fn ip_local_deliver(mut skb: SkBuff) {
+fn ip_local_deliver(mut skb: Box<SkBuff>) {
     let mut h = [0u8; IP_HLEN_MIN];
     h.copy_from_slice(&skb.data()[..IP_HLEN_MIN]);
     let ihl = ((h[0] & 0x0f) as usize) * 4;
@@ -432,8 +432,8 @@ fn ip_local_deliver(mut skb: SkBuff) {
     let raw = crate::net::raw::raw_deliver(&net, &skb);
     match proto {
         IPPROTO_TCP => tcp::tcp_rcv(skb),
-        IPPROTO_UDP => udp::udp_rcv(skb),
-        IPPROTO_ICMP => crate::net::icmp::icmp_rcv(skb),
+        IPPROTO_UDP => udp::udp_rcv(*skb),
+        IPPROTO_ICMP => crate::net::icmp::icmp_rcv(*skb),
         _ if !raw => crate::net::icmp::prot_unreach(&net, &skb),
         _ => {}
     }
@@ -513,8 +513,9 @@ impl IpParams {
 /// and send it along `rt`, fragmenting a datagram larger than the MTU
 /// when the socket's PMTU mode allows (else EMSGSIZE). Never delivers
 /// synchronously: `lo` queues to the receive backlog. Callers may hold a
-/// socket lock (TCP always does: it transmits under `TcpSock.cb`; lock
-/// order: socket -> FIB -> neighbour -> device TX -> backlog), so
+/// socket lock (TCP always does: it transmits owning `TcpSock.lock` or
+/// under its slock; lock order: socket -> FIB -> neighbour -> device
+/// TX -> backlog), so
 /// nothing here may take a socket lock or flush the backlog.
 pub fn ip_send_rt(
     net: &NetNamespace,

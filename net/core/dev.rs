@@ -71,7 +71,7 @@ pub const NETDEV_MAX_BACKLOG: usize = 1000;
 
 /// Protocol receive handler: takes ownership of an skb whose MAC header was
 /// pulled (`skb.data()` starts at the network header)
-pub type PacketHandler = fn(SkBuff);
+pub type PacketHandler = fn(Box<SkBuff>);
 
 /// A frame shown to the taps (Linux ptype_all delivery): received
 /// frames after classification, transmitted ones as PACKET_OUTGOING
@@ -544,7 +544,7 @@ pub fn netif_receive_skb(mut skb: Box<SkBuff>) {
     }
 
     match ptype_lookup(ethertype) {
-        Some(handler) => handler(*skb),
+        Some(handler) => handler(skb),
         None => dev.stats.inc_rx_nohandler(),
     }
 }

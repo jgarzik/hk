@@ -242,10 +242,13 @@ owner is running).
 the mmap_lock (`Mm.map`), `AnonVma.chain`, `Cgroup.{children,
 subsys}`; `Mutex`:
 `SuperBlock.s_vfs_rename_mutex`, `File.f_pos_lock`,
-`SignalStruct.cred_guard`, RTNL (Linux rtnl_mutex), `TcpSock.rd`,
+`SignalStruct.cred_guard`, RTNL (Linux rtnl_mutex),
 `UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex`, `SWAPON`,
 `Pipe.inner` (Linux pipe->mutex), `Eventpoll.mtx` (Linux ep->mtx) and
 the inotify and fanotify `mark_mutex` (Linux group->mark_mutex).
+The socket owner lock `net::sock_lock::SockLock` (Linux socket_lock_t:
+`TcpSock.lock`) ranks with these sleeping locks; it is described in
+3.10 Network.
 
 ### 1.4.1 SeqLock (sync/seqlock.rs)
 
@@ -381,13 +384,13 @@ each, as `LOCKDEP:FAIL` (so the boot test fails):
   run with them on, 7.5). Without the feature it is the
   `MIGHT_SLEEP:FAIL` check above.
 - **Lock order:** a lock's class is the source location of its `new()`
-  (`#[track_caller]`, like Linux's static lock_class_key: all `TcpSock.cb`
-  share one class). A `#[derive(Default)]` struct's locks all get the
+  (`#[track_caller]`, like Linux's static lock_class_key: all
+  `TcpSock.lock` slocks share one class). A `#[derive(Default)]` struct's locks all get the
   derive line as their class, so derive `Default` only on a struct with
   at most one lock. Taking B while holding A records A -> B; taking B
   under A after A was taken under B reports both acquisitions. Only
   direct inversions (no transitive cycles); nesting within one class is
-  not checked (listener -> child `cb`, `lock2` of two unix sockets).
+  not checked (listener -> child slock, `lock2` of two unix sockets).
 - **IRQ safety:** a tracked lock taken in an interrupt handler (the timer
   tick and device IRQ dispatch call `lockdep::irq_enter/exit`).
 - **Interrupts on with an `IrqSpinlock` held** (Linux lockdep's
@@ -645,18 +648,19 @@ Block locks (3.10 Block Device Subsystem):
 Network locks (3.10 Network Subsystem has the full order):
     RTNL (sleeping, outermost; never under any spinlock)
         ↓
-    TcpSock.rd / UnixSock.bindlock / UnixSock.iolock / UdpSock.op /
-    PingSock.op (sleeping)
+    TcpSock.lock owner / UnixSock.bindlock / UnixSock.iolock /
+    UdpSock.op / PingSock.op (sleeping; TCP's held across user copies:
+    → mmap_lock)
         ↓
-    socket locks (TcpSock.cb, TimeWait.inner, UnixSock.st) → protocol
-    tables → Inet.addr → queues, timers
+    socket spin locks (TcpSock.lock slock, TimeWait.inner, UnixSock.st)
+    → protocol tables → Inet.addr → queues, timers
         ↓ (transmit under a socket lock)
     FIB / neighbour / device TX → Softnet.backlog
     Socket wakeups (`Sock::data_ready`, `write_space`,
     `error_report`, `wake_async`) send SIGIO (`Sock.fasync` ->
     FasyncList.list), so they run after every network spin lock is
-    dropped (TCP posts an error under `TcpSock.cb` with `post_err` and
-    signals after unlocking). `Sock.wq_flags` (NOSPACE, WAITDATA) are
+    dropped (TCP posts an error under its slock with `post_err` and
+    signals after dropping it, or as the owner). `Sock.wq_flags` (NOSPACE, WAITDATA) are
     atomic bits, Linux socket_wq.flags.
     Network spin locks are taken in thread context only (softnet
     threads, socket calls); ISRs only touch atomics, `Softnet.poll_list`
@@ -4244,12 +4248,13 @@ not rely on either.
 | `Softnet.thread` (per CPU) | `spin::Once<Arc<KThread>>` | thread only | set once by `softnet_init` |
 | `Sock` (`net/sock.rs`, in every protocol socket) | atomics + `Sock.wq` (`WaitQueue`) | any (wakeups) | error, shutdown, buffer sizes, timeouts, SOL_SOCKET flags, SO_LINGER (switch and time in one word); one wait queue per socket for readers, writers, connect/accept and pollers (`sk_data_ready`/`sk_write_space`/`sk_error_report` = `wake_poll` keyed with their events, `sk_state_change` = `wake_all`), woken after the socket's own protocol locks are dropped; another path may wake it under its own locks (an AF_PACKET tap queueing to a packet socket under a transmitting TCP socket's `cb`): `Sock.wq` is an IrqSpinlock taking only run-queue locks, so that never inverts |
 | sockfs inode `private` | `spin::RwLock` (VFS, `Inode.private`) | thread only | read per socket file operation (`sock_of`) to reach the protocol socket; leaf |
-| `TcpSock.cb` (`net/tcp/mod.rs`) | `spin::Mutex<Inner>` | thread only (softnet input, softnet/0 timers, socket calls) | the TCP socket lock: Linux `bh_lock_sock` plus the `tcp_sock` state it guards (the whole I/O-free `TcpCb`: state, sequence space, send/receive/out-of-order queues, RFC 7323 option state, delayed-ACK state, RTO, all timers, the connect-in-progress flag (`Inner.connecting`, Linux SS_CONNECTING: connect decides EALREADY/EISCONN/EINPROGRESS under it), the shutdown bits (set by shutdown and cleared by disconnect under it, as inet_shutdown/tcp_disconnect under lock_sock; `Sock.shutdown` is read locklessly by poll), the IPPROTO_TCP options (`TcpCb.opts`; the separate `TcpSock.opts` leaf is gone); tuple, port ownership, listener link). Held for one bounded step: never across a sleep or a user copy. The step's `Out` is applied before the unlock (Linux transmits under the socket lock): error and shutdown bits are published and segments transmitted under it (cb -> FIB / neighbour / device TX, which never re-enter a socket lock), so one connection's segments are never reordered across CPUs; only wakeups follow the unlock. Segment input re-checks under it that the socket still has the tuple it was found by. A listener's is taken before its new child's (creating it, and sending its SYN-ACK); a child never takes its listener's `cb` (it queues itself under the listener's `queue` leaf and the listener is woken after the child's unlock) |
-| `TcpSock.rd` | `sync::Mutex<()>` (sleeping) | thread only (recvmsg) | serializes readers across peek -> user copy -> consume, so a faulting copy leaves the data queued (reader half of Linux `lock_sock`); a MSG_TRUNC reader that only discards takes it too; held only for that step, never across a wait; above `cb`. Unlike lock_sock it does not hold off input, so recvmsg, after finding the queue empty, takes an end (error, FIN, close) only if the queue is still empty once it saw the end: a segment queues its data before publishing its FIN or error under `cb` |
-| `TcpSock.queue` | `spin::Mutex<Option<Accept>>` | thread only | leaf: a listener's SYN_RECEIVED children and accept queue; taken under the listener's or a child's `cb` |
-| `TimeWait.inner` (`net/tcp/timewait.rs`) | `spin::Mutex` | thread only | a TIME_WAIT entry's queue-less control block + timer slot; same position as `TcpSock.cb` (taken instead of it, never with it): its ACKs/RSTs are transmitted under it, then TCP `TIMERS` / `Alarm.st` as for `cb` |
-| TCP `TIMERS` (`net/tcp/timer.rs`) | `spin::Mutex<BTreeMap>` | thread only | leaf under `cb`/`TimeWait.inner`: (deadline, id) -> weak owner. `rearm` drops it before arming the `timer::Alarm` (so `cb` -> `Alarm.st` -> timer base, never `TIMERS` -> `Alarm.st`); the Alarm only wakes softnet/0 (`dev::raise_timer`), which takes due entries out and runs each under its owner's lock with `TIMERS` dropped |
-| TCP tables `TcpTables.{bhash, ehash, lhash}` (`net/tcp/table.rs`, per netns) | `spin::RwLock` | thread only | `bhash` -> `ehash` (connect picks a port and inserts its four-tuple atomically); `lhash` -> `Inet.addr` (listener lookup scores candidates' bound address and device); candidates' `Inet.addr` and `Sock` flags are read under `bhash`; never a socket `cb` under a table lock (/proc/net/tcp copies the entries out, drops the table locks, then takes each `cb` / `TimeWait.inner` in turn) |
+| `TcpSock.lock` owner (`net/tcp/mod.rs`; `net::sock_lock::SockLock<Inner>`, `net/core/sock_lock.rs`) | sleeping owner (an `owned` bit under `slock`, waiters on `SockLock.wq`, exclusive and uninterruptible) | thread only (socket calls: connect, bind, listen, shutdown, setsockopt/getsockopt incl. TCP_INFO, SIOCINQ, release, disconnect, sendmsg, recvmsg, /proc/net/tcp) | Linux `lock_sock`: guards the `tcp_sock` state (`Inner`: the whole I/O-free `TcpCb` with its queues, options, timers and the connect-in-progress flag `Inner.connecting` (Linux SS_CONNECTING); tuple, port ownership, listener link, timer slot) for socket calls across user copies (recvmsg copies from the receive queue, sendmsg into the send queue: owner -> mmap_lock through the faults) and is released only around sleeps (`Relock::unlocked`, Linux sk_wait_event: waits for data, room, memory, the handshake). Above every network spin lock: everything the old socket spin lock was above (tables, `Inet.addr`, `TcpSock.queue`, `TIMERS`, the transmit path) may be taken under it. A step's `Out` is applied as the owner (segments transmitted, error/shutdown bits and the `Snap` published, so one connection's segments are never reordered across CPUs); wakeups run owned or after the release, with no spin lock held. Release (Linux release_sock) feeds the backlog to `backlog_rcv` and runs `release_cb` (deferred timers, MTU reduction, soft error; it also publishes the `Snap`), both owned with `slock` dropped (Linux runs release_cb under slock; hk's wakeups send SIGIO, which may sleep; input still sees the socket owned and backlogs), until neither has work, then clears `owned` under `slock` and wakes one waiter. Never taken under a spin lock or another TCP socket's owner (a closed listener's children are aborted, `listen_stop`, after the listener's release) |
+| `TcpSock.lock` slock | `spin::Mutex` (lockdep class: `SockLock::new` in `TcpSock::new`, one for every TCP socket) | thread only (softnet input, softnet/0 timers, ICMP errors, owners' lock/release) | Linux `bh_lock_sock`: the `owned` bit, the backlog (`SkbHead<Box<SkBuff>>`: skbs linked through their own `list`, queueing allocates nothing; its truesize count, Linux sk_backlog.len, zeroed only when a release found it empty) and the deferred flags (Linux sk_tsq_flags TCP_*_DEFERRED). Input (`TcpSock::rcv`, Linux tcp_v4_rcv) runs tcp_v4_do_rcv under it when unowned (state changes, transmit, `Snap`, the error and shutdown bits as above), else queues to the backlog (Linux tcp_add_backlog: over rcvbuf*2 + sndbuf/2 + 64 KiB with the receive queue it drops); a timer that finds the socket owned sets TIMER (Linux tcp_write_timer), an ICMP error MTU or ERR (Linux tcp_v4_err: `mtu_info`, `err_soft`). Input re-checks under it (or in `backlog_rcv`) that the socket still has the tuple it was found by. Taken under nothing but a listener's slock (its new child's: created, hashed and its SYN-ACK sent under both; the child is new, never owned; a child never takes its listener's, it queues itself under the listener's `queue` leaf and the listener is woken after); tables, `Inet.addr`, `TcpSock.queue`, `TIMERS` and the transmit path below it. The `SockLock.wq` IrqSpinlock is taken under it only in the lock's wait condition |
+| `TcpSock.snap` (`Snap`: state, receive and send queue bytes, writable, snd_una, snd_max), `TcpSock.mtu_info`, `TcpSock.err_soft` | atomics | written by the one context holding the socket (owner, or slock unowned); read lock-free | Linux's READ_ONCE fields: `Snap` is stored (Release) at the end of every locked step (`apply`, `release_cb`) and read (Acquire) by poll (tcp_poll), `TcpSock::state`, SIOCOUTQ/`inq`, the sleepers' conditions (sk_wait_event: data, room, handshake, close) and tcp_v4_err's sequence check on an owned socket; the owner re-checks under the lock after waking. `mtu_info` / `err_soft` (Linux tp->mtu_info, sk_err_soft) are stored under slock by an ICMP error that found the socket owned before its deferred flag is set, and read by the owner's `release_cb` after the flag (both ordered by slock). Relaxed for those two |
+| `TcpSock.queue` | `spin::Mutex<Option<Accept>>` | thread only | leaf: a listener's SYN_RECEIVED children and accept queue; taken under the listener's or a child's socket lock (owner or slock) |
+| `TimeWait.inner` (`net/tcp/timewait.rs`) | `spin::Mutex` | thread only | a TIME_WAIT entry's queue-less control block + timer slot; same position as the `TcpSock.lock` slock (taken instead of it, never with it): its ACKs/RSTs are transmitted under it, then TCP `TIMERS` / `Alarm.st` as for the slock |
+| TCP `TIMERS` (`net/tcp/timer.rs`) | `spin::Mutex<BTreeMap>` | thread only | leaf under a TCP socket lock (owner or slock) / `TimeWait.inner`: (deadline, id) -> weak owner. `rearm` drops it before arming the `timer::Alarm` (so socket lock -> `Alarm.st` -> timer base, never `TIMERS` -> `Alarm.st`); the Alarm only wakes softnet/0 (`dev::raise_timer`), which takes due entries out and runs each under its socket's slock with `TIMERS` dropped (an owned socket gets the TIMER flag; its `release_cb` forgets the fired registration, runs the timers and registers the next deadline) |
+| TCP tables `TcpTables.{bhash, ehash, lhash}` (`net/tcp/table.rs`, per netns) | `spin::RwLock` | thread only | `bhash` -> `ehash` (connect picks a port and inserts its four-tuple atomically); `lhash` -> `Inet.addr` (listener lookup scores candidates' bound address and device); candidates' `Inet.addr` and `Sock` flags are read under `bhash`; never a socket lock under a table lock (/proc/net/tcp copies the entries out, drops the table locks, then owns each socket / takes each `TimeWait.inner` in turn) |
 | `Sock.errq` (`net/sock.rs`) | `SkbQueue<Box<SkBuff>>` (its spin `Mutex`, Linux sk_error_queue.lock) | thread only (softnet ICMP error delivery, sendmsg's local errors, recvmsg MSG_ERRQUEUE, poll) | leaf: IP_RECVERR queue of skbs (quoted payload, `SkbCb::Exterr`) built GFP_ATOMIC before it (Linux ip_icmp_error's skb_clone, ip_local_error's alloc_skb), bounded by SO_RCVBUF (own charge); a purge splices it out and frees after; the wakeup follows the unlock |
 | `IcmpRate.st` (`net/icmp.rs`, per netns) | `spin::Mutex` | thread only | leaf: global + per-destination (bounded, 256) ICMP error token buckets |
 | `UdpSock.op`, `PingSock.op` | sleeping `sync::Mutex<()>` (Linux lock_sock) | thread only (socket calls) | datagram socket lock (bind/connect/disconnect/autobind; connect autobinds within the same hold, and routes under it); taken before the protocol's port/identifier table, never under a spin lock |
@@ -4309,8 +4314,9 @@ not rely on either.
 **Lock order (outermost first):**
 
 ```
-RTNL (sleeping; configuration)   TcpSock.rd (sleeping) -> TcpSock.cb (listener before its new child;
-  |                                 a child never takes its listener's cb) /
+RTNL (sleeping; configuration)   TcpSock.lock owner (sleeping; -> mmap_lock) -> its slock
+  |                                 (listener before its new child; a child never
+  |                                 takes its listener's) /
   |                                 TimeWait.inner / UdpSock.op, PingSock.op (sleeping)
   |                                 -> TCP bhash -> ehash, lhash / UdpTable.socks /
   |                                    PingTable.lock -> chain -> Inet.addr
@@ -4424,29 +4430,41 @@ work that arrived meanwhile makes it suppress again and reschedule
 clear can race; either order leaves NAPI scheduled or the flag clear.
 
 Sockets block only in `Sock::wait` (`wait_event_interruptible_timeout`
-on `Sock.wq`) with no lock held; receive paths make the condition true
+on `Sock.wq`) with no lock held (TCP releases its owner lock around
+it), or for the TCP owner lock (`SockLock.wq`); receive paths make the condition true
 under their leaf lock, drop it, then wake. A socket leaves every table at
 last close (`ProtoOps::release`); a TCP connection leaves ehash when it
 reaches CLOSED (an orphan when its close handshake or timers end) or is
 replaced by a TIME_WAIT entry, which leaves after 2MSL.
 
-**TCP and Linux lock_sock.** Linux has two levels: `lock_sock` (an
-owner lock process context holds across user copies and sleeps, with
-a backlog where softirq input waits) and the `bh_lock_sock` spinlock.
-hk input already runs in thread context, so `TcpSock.cb` alone plays
-both parts, with a release-before-sleep discipline: socket calls copy
-user data through a bounded (64 KiB) kernel buffer outside the lock and
-re-check the state at every step, and sleep in `Sock::wait` with no lock
-held. Consequences (deviations): input never waits for a sleeping user
-(no backlog), and concurrent senders on one socket interleave at
-64 KiB steps rather than at sndbuf-wait points. Like Linux, segments
-are transmitted and errors/shutdown bits published under the lock
-(`TcpSock::emit`, at the end of `TcpSock::step`); wakeups follow the
-unlock. Transmitting under `cb` is safe because the output path only
+**TCP and Linux lock_sock.** Two levels, as Linux
+(`net::sock_lock::SockLock`, Linux socket_lock_t): the owner
+(`lock_sock`, sleeping) and `slock` (`bh_lock_sock`, spin) over the
+owned bit, the backlog and the deferred flags. Socket calls own the
+socket across user copies (recvmsg copies straight from the receive
+queue to user memory, consuming only what reached it; sendmsg copies
+straight into the send queue) and release it only while asleep
+(`Relock::unlocked` around `Sock::wait`/`wait_data`, Linux
+sk_wait_event), re-checking under the lock after waking. Input, timers
+and ICMP errors take `slock`: unowned, they run at once (Linux
+tcp_v4_do_rcv, the timer handlers, tcp_v4_err); owned, input waits in
+the backlog and timers and errors set deferred flags, which the owner's
+release runs (`backlog_rcv`, `release_cb`, Linux __release_sock and
+tcp_release_cb) before clearing `owned`. The one difference: Linux runs
+release_cb under `slock`; hk runs it, like the backlog, owned with
+`slock` dropped, because its wakeups send SIGIO (a sleeping FasyncList
+lock); input meanwhile still sees the socket owned and backlogs, so the
+exclusion is the same. Lock-free readers (poll, the sleepers'
+conditions, SIOCOUTQ) read the `Snap` atomics every locked step
+publishes, as Linux reads sk_state and the queue edges with READ_ONCE.
+Segments are transmitted and errors/shutdown bits published within the
+locked step (`TcpSock::apply`); wakeups run with no spin lock held.
+Transmitting under either level is safe because the output path only
 takes FIB/neighbour/device-TX leaves and `lo` queues to the receive
 backlog instead of delivering inline; the loopback flush
-(`netif_rx_flush_local`) runs only at the end of socket calls, with no
-lock held. A TIME_WAIT entry transmits under its `inner` the same way.
+(`netif_rx_flush_local`) runs only with no lock held (at the end of
+socket calls, and before a sleep with the socket released). A
+TIME_WAIT entry transmits under its `inner` the same way.
 
 #### Key Device Driver Rules
 
@@ -4705,8 +4723,9 @@ Correct uses of atomics in hk:
 | `Inode` | mode, uid, gid | Written under i_rwsem (chmod, chown, set-id kill on write/truncate); read lock-free |
 | `Inode` | size | Linux i_size_write/read: Release under i_rwsem, Acquire lock-free, so the bytes below it are visible first |
 | `Sock` | flags, error, buffer sizes | Independent values; protocol data under the socket lock |
-| `Sock` | shutdown | Written under the protocol socket lock (TCP `cb`, unix `st`); read lock-free by poll |
-| TCP `mem::FW_ALLOC` (per-CPU) | quanta not yet in `ALLOCATED` | Linux tcp_memory_per_cpu_fw_alloc (rule 9): every charge and uncharge, under the connection's `cb`, is an RMW on this CPU's slot (correct after a migration, as this_cpu ops); past ±`PCPU_RSV` the slot is swapped to 0 and added to `ALLOCATED`. Relaxed: a count |
+| `Sock` | shutdown | Written under the protocol socket lock (TCP `lock`: owner or slock, unix `st`); read lock-free by poll |
+| TCP `TcpSock.snap` | state, queue bytes, writable, snd_una/snd_max | Linux READ_ONCE of sk_state and the queue edges: stored (Release) at the end of every locked step by the one context holding the socket, read (Acquire) by poll, the waits and tcp_v4_err; the owner re-checks under the lock |
+| TCP `mem::FW_ALLOC` (per-CPU) | quanta not yet in `ALLOCATED` | Linux tcp_memory_per_cpu_fw_alloc (rule 9): every charge and uncharge, under the connection's socket lock, is an RMW on this CPU's slot (correct after a migration, as this_cpu ops); past ±`PCPU_RSV` the slot is swapped to 0 and added to `ALLOCATED`. Relaxed: a count |
 | TCP `mem::ALLOCATED` | quanta all connections hold, less the CPUs' reserves | Linux tcp_memory_allocated: read lock-free by every charge to check the limits (add-then-check: the charge is added before the check, subtracted on failure); lags by up to the reserve per CPU, as Linux. Relaxed |
 | TCP `mem::LIMITS[3]`, `mem::PCPU_RSV` | tcp_mem, net.core.mem_pcpu_rsv | sysctl words (initial netns only), each independent, read lock-free per charge (Linux sysctl_tcp_mem, mem_pcpu_rsv with READ_ONCE). Relaxed |
 | TCP `mem::PRESSURE` | memory pressure mode | Linux tcp_memory_pressure: set past tcp_mem[1], cleared under tcp_mem[0], by any charge; a mode, so racing writers store the same value. Relaxed |

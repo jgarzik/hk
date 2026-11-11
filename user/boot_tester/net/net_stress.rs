@@ -44,7 +44,7 @@ fn spawn(f: fn(u64) -> i32, until: u64) -> i64 {
 }
 
 /// Reap `pids` within LIMIT_MS: (all exited, worst status)
-fn reap(pids: &[i64]) -> (bool, i32) {
+pub(crate) fn reap(pids: &[i64]) -> (bool, i32) {
     let t0 = now_ms();
     let mut left = pids.len();
     let mut done = [false; 16];

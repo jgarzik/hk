@@ -215,7 +215,7 @@ fn sock_line(out: &mut String, i: usize, s: &super::TcpSock, now: u64) {
     let a = s.inet.get();
     let ino = s.sk.ino.load(Ordering::Relaxed);
     let uid = s.sk.cred.euid;
-    let g = s.cb.lock();
+    let g = s.lock_sock();
     let cb = &g.cb;
     let listen = cb.state == TcpState::Listen;
     let rxq = if listen {
@@ -286,8 +286,8 @@ fn tw_line(out: &mut String, i: usize, tw: &super::timewait::TimeWait, now: u64)
 }
 
 /// `/proc/net/tcp` of the reader's namespace: listeners, then
-/// connections and TIME_WAIT entries (socket locks are taken one at a
-/// time after the table locks are dropped)
+/// connections and TIME_WAIT entries (each socket is owned in turn,
+/// after the table locks are dropped)
 pub fn proc_net_tcp() -> Vec<u8> {
     let mut out = String::new();
     line(

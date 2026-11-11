@@ -69,6 +69,24 @@ impl TcpState {
         )
     }
 
+    /// The state of Linux TCP_* number `v` (`linux()`'s inverse;
+    /// anything else is CLOSED)
+    pub fn from_linux(v: u8) -> Self {
+        match v {
+            1 => TcpState::Established,
+            2 => TcpState::SynSent,
+            3 => TcpState::SynReceived,
+            4 => TcpState::FinWait1,
+            5 => TcpState::FinWait2,
+            6 => TcpState::TimeWait,
+            8 => TcpState::CloseWait,
+            9 => TcpState::LastAck,
+            10 => TcpState::Listen,
+            11 => TcpState::Closing,
+            _ => TcpState::Closed,
+        }
+    }
+
     /// Linux TCP_* number (include/net/tcp_states.h)
     pub fn linux(self) -> u8 {
         match self {
@@ -309,6 +327,27 @@ pub fn after(a: u32, b: u32) -> bool {
 /// lo <= x <= hi (mod 2^32)
 pub fn between(x: u32, lo: u32, hi: u32) -> bool {
     hi.wrapping_sub(lo) >= x.wrapping_sub(lo)
+}
+
+/// The bytes of `q` from `skip` on, as its two slices
+fn slices_from(q: &VecDeque<u8>, skip: usize) -> (&[u8], &[u8]) {
+    let (a, b) = q.as_slices();
+    if skip < a.len() {
+        (&a[skip..], b)
+    } else {
+        (&[], &b[(skip - a.len()).min(b.len())..])
+    }
+}
+
+/// The bytes of `q` from `from` on, as two mutable slices
+fn tail_mut(q: &mut VecDeque<u8>, from: usize) -> (&mut [u8], &mut [u8]) {
+    let (a, b) = q.as_mut_slices();
+    if from < a.len() {
+        (&mut a[from..], b)
+    } else {
+        let at = (from - a.len()).min(b.len());
+        (&mut [], &mut b[at..])
+    }
 }
 
 /// Copy `buf.len()` bytes of `q` starting at `skip` into `buf`
@@ -918,18 +957,71 @@ impl TcpCb {
 
     // --- user calls --------------------------------------------------------
 
-    /// Queue up to `data.len()` bytes for sending; returns how many fit
-    /// (the caller calls `output`)
-    pub fn send(&mut self, data: &[u8]) -> usize {
-        let want = data.len().min(self.snd_space());
+    /// Queue up to `max` bytes for sending, filled in place by `fill`
+    /// (Linux tcp_sendmsg_locked's copy into the queue; the caller calls
+    /// `output`): `fill` gets the queue's new tail in pieces and returns
+    /// the bytes it stored there, short or Err after a fault. Returns
+    /// the bytes queued (0: no room or no memory), EFAULT-like Err if a
+    /// fault left none; what `fill` did not store is taken back.
+    pub fn send_with(
+        &mut self,
+        max: usize,
+        mut fill: impl FnMut(&mut [u8]) -> Result<usize, KernelError>,
+    ) -> Result<usize, KernelError> {
+        let want = max.min(self.snd_space());
         // Reserve before charging: a failed reservation is "no memory"
         // (the caller waits, sk_stream_wait_memory), never a panic
         if want > 0 && self.sndq.try_reserve(want).is_err() {
-            return 0;
+            return Ok(0);
         }
         let n = self.wmem_schedule(want);
-        self.sndq.extend(&data[..n]);
-        n
+        if n == 0 {
+            return Ok(0);
+        }
+        let old = self.sndq.len();
+        // Within the reserved capacity: no allocation
+        self.sndq.resize(old + n, 0);
+        let (mut done, mut err) = (0, None);
+        let (a, b) = tail_mut(&mut self.sndq, old);
+        for piece in [a, b] {
+            if piece.is_empty() {
+                continue;
+            }
+            match fill(piece) {
+                Ok(k) => {
+                    done += k.min(piece.len());
+                    if k < piece.len() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        if done < n {
+            self.sndq.truncate(old + done);
+            self.mem_settle();
+        }
+        match err {
+            _ if done > 0 => Ok(done),
+            Some(e) => Err(e),
+            None => Err(KernelError::BadAddress),
+        }
+    }
+
+    /// Queue up to `data.len()` bytes for sending; returns how many fit
+    /// (host tests)
+    #[cfg(test)]
+    pub fn send(&mut self, data: &[u8]) -> usize {
+        let mut at = 0;
+        self.send_with(data.len(), |b| {
+            b.copy_from_slice(&data[at..at + b.len()]);
+            at += b.len();
+            Ok(b.len())
+        })
+        .unwrap_or(0)
     }
 
     /// How much of `n` bytes may be queued (Linux tcp_wmem_schedule):
@@ -984,29 +1076,71 @@ impl TcpCb {
         self.rcvq.len()
     }
 
-    /// Copy (`take`: and consume) readable bytes at `skip` into `buf`;
-    /// consuming may open the window: a window update goes out when it
-    /// grew enough (Linux tcp_cleanup_rbuf)
-    pub fn recv(&mut self, buf: &mut [u8], skip: usize, take: bool, out: &mut Out) -> usize {
-        let n = buf.len().min(self.rcvq.len().saturating_sub(skip));
-        copy_out(&self.rcvq, skip, &mut buf[..n]);
-        if take && n > 0 {
-            self.rcvq.drain(..skip + n);
+    /// Hand up to `max` readable bytes past `skip` to `sink` in pieces
+    /// (Linux tcp_recvmsg_locked's copies to user memory); `sink` returns
+    /// the bytes it stored, short or Err after a fault. With `take` only
+    /// those are consumed (a faulting copy leaves the rest queued), and
+    /// the window may open: a window update goes out when it grew enough
+    /// (Linux tcp_cleanup_rbuf). Returns the bytes stored, Err if a fault
+    /// stored none.
+    pub fn recv_with(
+        &mut self,
+        skip: usize,
+        max: usize,
+        take: bool,
+        mut sink: impl FnMut(&[u8]) -> Result<usize, KernelError>,
+        out: &mut Out,
+    ) -> Result<usize, KernelError> {
+        let want = max.min(self.rcvq.len().saturating_sub(skip));
+        let (mut done, mut err) = (0, None);
+        let (a, b) = slices_from(&self.rcvq, skip);
+        for piece in [a, b] {
+            let piece = &piece[..piece.len().min(want - done)];
+            if piece.is_empty() {
+                continue;
+            }
+            match sink(piece) {
+                Ok(k) => {
+                    done += k.min(piece.len());
+                    if k < piece.len() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        if take && done > 0 {
+            self.rcvq.drain(..skip + done);
             self.mem_settle();
             self.cleanup_rbuf(out);
         }
-        n
+        match err {
+            Some(e) if done == 0 => Err(e),
+            _ => Ok(done),
+        }
     }
 
-    /// Drop `n` readable bytes (MSG_TRUNC reads)
-    pub fn discard(&mut self, n: usize, out: &mut Out) -> usize {
-        let n = n.min(self.rcvq.len());
-        self.rcvq.drain(..n);
-        self.mem_settle();
-        if n > 0 {
-            self.cleanup_rbuf(out);
-        }
-        n
+    /// Copy (`take`: and consume) readable bytes at `skip` into `buf`
+    /// (host tests)
+    #[cfg(test)]
+    pub fn recv(&mut self, buf: &mut [u8], skip: usize, take: bool, out: &mut Out) -> usize {
+        let mut at = 0;
+        let max = buf.len();
+        self.recv_with(
+            skip,
+            max,
+            take,
+            |d| {
+                buf[at..at + d.len()].copy_from_slice(d);
+                at += d.len();
+                Ok(d.len())
+            },
+            out,
+        )
+        .unwrap_or(0)
     }
 
     /// After reading (Linux tcp_cleanup_rbuf): send an owed ACK when

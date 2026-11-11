@@ -12,8 +12,9 @@
 //! state), from which each segment or timer event rebuilds a control
 //! block for the call.
 //!
-//! Locking: `inner` is a `crate::sync::spin::Mutex` leaf like `TcpSock.cb` (thread
-//! context only; table and timer locks may be taken under it).
+//! Locking: `inner` is a `crate::sync::spin::Mutex` in the place of a
+//! socket's `TcpSock.lock` slock (thread context only; table and timer
+//! locks may be taken under it).
 
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc_cyclic;

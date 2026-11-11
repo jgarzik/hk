@@ -19,8 +19,8 @@
 //! `ehash` (connect picks a port and inserts its tuple atomically);
 //! `lhash` -> `Inet.addr` (listener lookup scores the candidates' bound
 //! address). Candidate owners' `Inet.addr` and `Sock` flags are read
-//! under `bhash` too; socket locks (`TcpSock.cb`) are never taken
-//! under a table lock (callers may hold their own socket lock).
+//! under `bhash` too; socket locks (`TcpSock.lock`, owner or slock)
+//! are never taken under a table lock (callers may hold their own).
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
