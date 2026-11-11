@@ -19,7 +19,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::spin::RwLock;
 use spin::Lazy;
 
 use crate::net::device::{DevList, LinkInfo, NetDevice, NetDeviceOps};
@@ -160,7 +160,13 @@ impl NetNamespace {
 
     /// List `ns` and give it its loopback device `lo`
     fn attach(ns: Arc<Self>, lo: Arc<NetDevice>) -> Arc<Self> {
-        NET_NAMESPACE_LIST.lock().push(Arc::downgrade(&ns));
+        {
+            // Linux setup_net: list_add_tail_rcu under net_rwsem (write);
+            // namespaces gone since are pruned here
+            let mut l = NET_NAMESPACE_LIST.write();
+            l.retain(|w| w.strong_count() > 0);
+            l.push(Arc::downgrade(&ns));
+        }
 
         // Loopback device: ifindex 1, down and without addresses until
         // brought up (then 127.0.0.1/8, like Linux)
@@ -292,8 +298,11 @@ fn loopback_device(ops: Arc<LoopbackOps>) -> NetDevice {
 /// Physical network devices are registered here. Created lazily on first access.
 pub static INIT_NET_NS: Lazy<Arc<NetNamespace>> = Lazy::new(NetNamespace::new_init);
 
-/// Every network namespace (Linux net_namespace_list; spin leaf)
-static NET_NAMESPACE_LIST: Mutex<Vec<Weak<NetNamespace>>> = Mutex::new(Vec::new());
+/// Every network namespace (Linux net_namespace_list under net_rwsem,
+/// a sleeping lock): written at creation, read by the walkers; thread
+/// context only
+static NET_NAMESPACE_LIST: crate::sync::RwSem<Vec<Weak<NetNamespace>>> =
+    crate::sync::RwSem::new(Vec::new());
 
 /// A namespace's devices leave sysfs with it (Linux
 /// default_device_exit_batch unregistering them)
@@ -310,11 +319,20 @@ impl Drop for NetNamespace {
     }
 }
 
-/// The live network namespaces (Linux for_each_net)
+/// References to the live network namespaces, for work that takes
+/// `NET_NAMESPACE_LIST` again (registering sysfs devices sends uevents)
 pub fn all_net_ns() -> Vec<Arc<NetNamespace>> {
-    let mut l = NET_NAMESPACE_LIST.lock();
-    l.retain(|w| w.strong_count() > 0);
+    let l = NET_NAMESPACE_LIST.read();
     l.iter().filter_map(Weak::upgrade).collect()
+}
+
+/// Run `f` on each live network namespace, under `net_rwsem` read (Linux
+/// for_each_net with down_read(&net_rwsem)); `f` must not take it again
+pub fn for_each_net(mut f: impl FnMut(&Arc<NetNamespace>)) {
+    let l = NET_NAMESPACE_LIST.read();
+    for net in l.iter().filter_map(Weak::upgrade) {
+        f(&net);
+    }
 }
 
 /// Get the init network namespace

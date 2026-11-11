@@ -90,17 +90,16 @@ fn send(
         msg.extend_from_slice(v);
         msg.push(0);
     }
-    for net in crate::ns::net::all_net_ns() {
-        if ns != 0 && net.id != ns {
-            continue;
+    crate::ns::net::for_each_net(|net| {
+        if ns == 0 || net.id == ns {
+            netlink::broadcast(
+                net,
+                NETLINK_KOBJECT_UEVENT,
+                NlSkb::kernel(msg.clone(), 1),
+                0,
+            );
         }
-        netlink::broadcast(
-            &net,
-            NETLINK_KOBJECT_UEVENT,
-            NlSkb::kernel(msg.clone(), 1),
-            0,
-        );
-    }
+    });
 }
 
 /// Linux kobject_uevent

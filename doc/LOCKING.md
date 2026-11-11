@@ -2279,9 +2279,12 @@ sysfs entries, devtmpfs nodes, uevents) under the disk's `open_mutex`:
 `Disk.open_mutex` -> KERNFS_RWSEM -> devtmpfs root i_rwsem. Their
 attributes read the block device without it.
 
-uevents (base/uevent.rs) broadcast with `ns::net::NET_NAMESPACE_LIST`
-(spin Mutex, leaf; Linux net_namespace_list) taken only to snapshot
-the namespaces, then each namespace's `NlTable.socks` -> `NlSock.rxq`;
+uevents (base/uevent.rs) broadcast under `ns::net::NET_NAMESPACE_LIST`
+(sleeping `sync::RwSem`, Linux net_namespace_list under net_rwsem: read
+by `for_each_net` and the sysfs setup's snapshot, which registers
+devices and so sends uevents after releasing it; written at namespace
+creation; thread context, a uevent is sent from a sleepable context as
+Linux's kobject_uevent), then each namespace's `NlTable.socks` -> `NlSock.rxq`;
 `ksysfs::UEVENT_HELPER` is a spin leaf.
 
 show()/store() run under an active reference (`KNode::get_active`),
