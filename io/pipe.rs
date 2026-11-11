@@ -1089,16 +1089,29 @@ impl FileOps for FifoFileOps {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
         let mode = file.get_flags() & flags::O_ACCMODE;
+        // A FIFO with no pipe gets one allocated with the slot unlocked,
+        // installed if still none (Linux fifo_open: alloc_pipe_info with
+        // i_lock dropped, then recheck); a pipe another open installed
+        // first wins, and ours is freed after the unlock
+        let mut fresh: Option<Arc<Pipe>> = None;
         let pipe = {
-            let mut slot = inode.i_pipe.lock();
-            let (p, files) = match slot.take() {
-                Some(s) => slot.insert(s),
-                None => {
-                    let p = Pipe::new()?;
-                    p.readers.store(0, Ordering::Relaxed);
-                    p.writers.store(0, Ordering::Relaxed);
-                    slot.insert((p, 0))
+            let mut slot = loop {
+                let mut slot = inode.i_pipe.lock();
+                if slot.is_none() {
+                    let Some(p) = fresh.take() else {
+                        drop(slot);
+                        let p = Pipe::new()?;
+                        p.readers.store(0, Ordering::Relaxed);
+                        p.writers.store(0, Ordering::Relaxed);
+                        fresh = Some(p);
+                        continue;
+                    };
+                    *slot = Some((p, 0));
                 }
+                break slot;
+            };
+            let Some((p, files)) = slot.as_mut() else {
+                unreachable!("fifo slot filled above");
             };
             if mode == flags::O_WRONLY && nonblock && !p.has_readers() {
                 if *files == 0 {
@@ -1146,6 +1159,8 @@ impl FileOps for FifoFileOps {
             };
             (p.clone(), wait, w_version)
         };
+        // Another open's pipe won: ours goes with the lock released
+        drop(fresh);
         let (pipe, wait, w_version) = pipe;
         pipe.wait_queue.wake_all();
         let waited = match wait {
