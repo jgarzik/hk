@@ -13,6 +13,7 @@ pub mod kmem;
 pub mod list;
 pub mod percpu_counter;
 pub mod pod;
+pub mod rculist;
 pub mod scope;
 pub mod seg;
 pub mod smallvec;

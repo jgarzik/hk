@@ -22,12 +22,13 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::sync::spin::{Mutex, RwLock};
 use spin::Lazy;
 
-use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
+use crate::net::device::{DevList, LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::inet::fib::Fib;
 use crate::net::inet::port::PortRange;
 use crate::net::netlink::NlTable;
 use crate::net::udp::UdpTable;
 use crate::util::error::KernelError;
+use crate::util::rculist::RcuList;
 
 /// Next network namespace id (never reused)
 static NEXT_NET_ID: AtomicU64 = AtomicU64::new(1);
@@ -54,8 +55,9 @@ pub struct NetNamespace {
     /// Its inode number (Linux ns.inum)
     pub inum: super::inum::Inum,
 
-    /// Network devices in this namespace (registration = ifindex order)
-    devices: RwLock<Vec<Arc<NetDevice>>>,
+    /// Network devices in this namespace (registration = ifindex order;
+    /// Linux dev_base_head): read under RCU, changed under RTNL
+    devices: RcuList<DevList>,
 
     /// Next interface index (Linux dev_new_index; lo gets 1)
     next_ifindex: AtomicU32,
@@ -130,7 +132,7 @@ impl NetNamespace {
         Self {
             id: NEXT_NET_ID.fetch_add(1, Ordering::Relaxed),
             inum,
-            devices: RwLock::new(Vec::new()),
+            devices: RcuList::new(),
             next_ifindex: AtomicU32::new(1),
             fib: Fib::new(),
             nl: Default::default(),
@@ -182,11 +184,7 @@ impl NetNamespace {
 
     /// Get a network device by name in this namespace
     pub fn get_device(&self, name: &str) -> Option<Arc<NetDevice>> {
-        self.devices
-            .read()
-            .iter()
-            .find(|d| d.name() == name)
-            .cloned()
+        self.devices.find(|d| d.name() == name)
     }
 
     /// Device with interface index `ifindex`
@@ -194,11 +192,7 @@ impl NetNamespace {
         if ifindex == 0 {
             return None;
         }
-        self.devices
-            .read()
-            .iter()
-            .find(|d| d.ifindex() == ifindex)
-            .cloned()
+        self.devices.find(|d| d.ifindex() == ifindex)
     }
 
     /// First free name for a template like "eth%d" (Linux dev_alloc_name)
@@ -206,21 +200,22 @@ impl NetNamespace {
         let Some((pre, post)) = template.split_once("%d") else {
             return alloc::string::String::from(template);
         };
-        let devs = self.devices.read();
+        let devs = self.devices();
         (0..)
             .map(|i| alloc::format!("{}{}{}", pre, i, post))
             .find(|n| devs.iter().all(|d| d.name() != n))
             .unwrap()
     }
 
-    /// Snapshot of this namespace's devices (registration order)
+    /// References to this namespace's devices (registration order), for
+    /// work done per device outside RCU
     pub fn devices(&self) -> Vec<Arc<NetDevice>> {
-        self.devices.read().clone()
+        self.devices.snapshot()
     }
 
     /// Number of devices in this namespace
     pub fn device_count(&self) -> usize {
-        self.devices.read().len()
+        self.devices.count()
     }
 
     /// The namespace's loopback device
@@ -229,25 +224,23 @@ impl NetNamespace {
     }
 
     /// Register a network device in this namespace: assign the next
-    /// ifindex and set the device's netns (Linux register_netdevice)
+    /// ifindex and set the device's netns (Linux register_netdevice:
+    /// RTNL held, or the namespace not yet listed); readers see it at
+    /// once (list_add_tail_rcu)
     pub fn register_device(self: &Arc<Self>, dev: Arc<NetDevice>) {
-        {
-            let mut devs = self.devices.write();
-            let idx = self.next_ifindex.fetch_add(1, Ordering::Relaxed);
-            dev.set_net(self, idx);
-            devs.push(dev.clone());
-        }
-        // Sleeping sysfs work, after the spin lock
+        let idx = self.next_ifindex.fetch_add(1, Ordering::Relaxed);
+        dev.set_net(self, idx);
+        self.devices.push_back(dev.clone());
+        // Sleeping sysfs work
         crate::net::sysfs::netdev_register_kobject(&dev);
     }
 
     /// Take a device off this namespace's list (Linux
-    /// unlist_netdevice; RTNL held by `net::unregister_netdevice`): no
-    /// lookup finds it again; its ifindex is never reused
+    /// unlist_netdevice, then synchronize_net; RTNL held by
+    /// `net::unregister_netdevice`): no lookup finds it again, and no
+    /// reader still walks over it on return; its ifindex is never reused
     pub fn unlist_device(&self, dev: &NetDevice) {
-        self.devices
-            .write()
-            .retain(|d| !core::ptr::eq(Arc::as_ptr(d), dev));
+        drop(self.devices.remove_first(|d| core::ptr::eq(d, dev)));
     }
 }
 
@@ -307,8 +300,7 @@ static NET_NAMESPACE_LIST: Mutex<Vec<Weak<NetNamespace>>> = Mutex::new(Vec::new(
 impl Drop for NetNamespace {
     fn drop(&mut self) {
         let kdevs = self
-            .devices
-            .get_mut()
+            .devices()
             .iter()
             .filter_map(|d| d.kdev.get().cloned())
             .collect();

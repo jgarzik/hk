@@ -238,7 +238,12 @@ publishes a new one (rcu_assign_pointer, Release) and returns the old
 as `RcuRetired`, released after a grace period when it drops
 (synchronize_rcu; it panics in atomic context, where it would wait for
 its own CPU or, with one CPU, not at all). Updaters serialize under
-their own lock.
+their own lock. `util::rculist::RcuList` (Linux rculist.h) is an
+intrusive list of `Arc` entries: readers walk it under a guard (Acquire
+loads of `next`), writers take its own spin leaf (`ends`), and an entry
+unlinked keeps its `next` for readers standing on it and comes back as
+`RcuUnlinked`, whose drop waits for a grace period, frees the link and
+drops the list's reference (list_del_rcu + synchronize_rcu).
 
 Quiescent states, per CPU: a context switch (recorded under the rq
 lock, reported later), each idle-loop pass, and a clock interrupt that
@@ -2223,9 +2228,10 @@ alone; lists are snapshotted before probing walks them.
 each bound driver's shutdown callback after dropping it, so callbacks
 (which may poll hardware or take driver locks such as `USB_CONTROLLER`)
 never run under it. `PciDev.driver_override` is a spin leaf.
-Net devices: `NetNamespace::register_device` drops the namespace's
-`devices` spin lock before creating the device's sysfs entries (under
-RTNL for driver registrations: RTNL -> KERNFS_RWSEM); a namespace's
+Net devices: `NetNamespace::register_device` links the device on the
+namespace's `devices` RCU list (its leaf writer lock released) before
+creating the device's sysfs entries (under RTNL for driver
+registrations: RTNL -> KERNFS_RWSEM); a namespace's
 devices leave sysfs when it is dropped, in thread context. A NIC
 driver's probe and remove run under its device's lock and take RTNL
 (`register_netdev` / `unregister_netdev`): `Device.lock` -> RTNL ->
@@ -3859,7 +3865,8 @@ not rely on either.
 | `PingTable.socks` (`net/ping.rs`, per netns) | `spin::RwLock` | thread only | ping sockets by echo identifier; receive/error lookups clone the `Arc` and queue after dropping it; reads candidates' `Inet.addr` under it (order table -> Inet.addr) |
 | `Inet.addr` (`net/af_inet.rs`) | `spin::Mutex` | thread only | leaf: addresses/ports of a TCP or UDP socket; read under the UDP/TCP port tables during lookups, so bind sets the addresses before publishing the port in a table (reset on failure; Linux inet_bind) |
 | `RTNL` (`net/rtnl.rs`) | `sync::Mutex<()>` (sleeping, Linux rtnl_mutex) | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes, neighbour entries, device naming + registration via `alloc_netdev`/`register_netdev`) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Never taken while any spinlock is held (a socket's last close, which may take it for AF_PACKET memberships, runs only after the fd table lock is dropped). Holders may sleep (user copies such as SIOCADDRT's `rt_dev` name, like Linux rtentry_to_fib_config; driver open/stop waiting for NAPI) but never take a socket lock (`sk_lock`) and never wait for packets |
-| `NetNamespace` tables (`devices`, `loopback`), `UdpTable.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready); the UDP port table reads each candidate's `Inet.addr` under its lock |
+| `NetNamespace.devices` | `RcuList` (Linux dev_base_head) | readers under RCU, any context; writers thread only | registration and unlisting run under RTNL (or before the namespace is listed) and take the list's leaf writer lock; lookups (`get_device`, `dev_get_by_index`) walk it under RCU and take a reference, no lock, no copy; `devices()` references every device for work done per device; unlisting returns after a grace period (Linux synchronize_net), so no reader still walks over the device |
+| `NetNamespace.loopback`, `UdpTable.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes); the UDP port table reads each candidate's `Inet.addr` under its lock |
 | `Fib.tables` (`net/inet/fib.rs`, per netns) | `spin::RwLock` | thread only | leaf; written only under RTNL; read by input/output routing (softnet, socket syscalls, possibly under `sk_lock`) and dumps; returns `Arc<FibEntry>` clones; notifications are sent after the guard is dropped |
 | `NetDevice.addrs` (IPv4 list; IPv6 later) | `spin::RwLock` | thread only | leaf; written only under RTNL (`inet::ifaddr`), read via snapshots (`inet_addrs()`) |
 | `NeighTable.hash` (`net/core/neigh.rs`; `NetNamespace.arp`, IPv6 ND later) | `spin::RwLock` | thread only (softnet, socket output, ktimers/N) | (ifindex, address) -> `Arc<Neighbour>`; lookups drop the guard; GC/flush take each entry's `inner` under the write lock (order hash -> inner) |
@@ -3881,7 +3888,7 @@ not rely on either.
 | `unix::scm::INFLIGHT`, `Task.fput_defer` | `spin::Mutex` | thread only | leaves: per-user in-flight file counts (charged under the receiver's `st`); the current task's files awaiting `defer_fput` (each task drains its own, like Linux task_work fput; `Some` marks the task draining, so nested releases queue instead of recursing; only the task itself takes it) |
 | `UnixSock` `state`/`dead`/`wmem`/`backlog`/`peer_wake` | atomics | thread only | |
 | `NetDevice.ops` | `spin::RwLock<Option<Arc<dyn NetDeviceOps>>>` | thread only | the driver while registered (Linux reg_state + netdev_ops); written once, under RTNL, by `rtnl::unregister_netdevice` (`detach_ops`: None = unregistered). Read-held across the driver's `xmit` (after the lock-free IFF_UP check, so a closed device's senders do not take it), so the write waits for transmits in flight (Linux synchronize_net after dev_deactivate); RTNL-side callbacks (open, stop, set_promisc) clone the `Arc` out, since they may sleep, and RTNL orders them with the detach. Under it: the driver's TX lock, `Softnet.backlog` (lo). Also read under `NeighTable.hash` (`is_gone`: no neighbour is created for an unregistered device after its flush) |
-| `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet; written at registration under the namespace's `devices` write lock (order `devices` -> `NetDevice.net`) |
+| `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet; written at registration (RTNL held), before the device is linked on the namespace's list |
 | driver `netdev` / `Napi.poller` (`spin::Once<Weak<..>>`) | set once at probe, before the IRQ is registered and the NAPI added | read lock-free by polls (thread) | ISRs never read them (they use the driver struct passed as IRQ data) |
 | `icmp::ICMP_ECHO_REPLY_WQ` | `WaitQueue` | woken by ICMP input (softnet) | kernel self-test waiter only (`selftest.rs`), woken after the reply is recorded |
 | `UnixSock.peer_wait` | `WaitQueue` | thread only | Linux peer_wait: dgram senders blocked on a full peer wait here (no lock held); woken by the peer's reads and release, relays to pollers via `UnixSock.relay` |

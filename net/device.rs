@@ -276,7 +276,11 @@ pub struct NetDevice {
     pub parent: spin::Once<Arc<crate::base::Device>>,
     /// Its sysfs device (net/sysfs.rs)
     pub kdev: spin::Once<Arc<crate::base::Device>>,
+    /// On its namespace's device list (Linux dev_list, an RCU list)
+    dev_list: crate::util::list::Link,
 }
+
+crate::adapter!(pub DevList, NetDevice, dev_list);
 
 impl NetDevice {
     /// Create a device named `name` (see `net::dev_alloc_name`)
@@ -303,6 +307,7 @@ impl NetDevice {
             allmulti: AtomicU32::new(0),
             parent: spin::Once::new(),
             kdev: spin::Once::new(),
+            dev_list: crate::util::list::Link::new(),
         }
     }
 

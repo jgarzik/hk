@@ -55,10 +55,58 @@ impl Link {
 
     /// Claim an unlinked link for an insert: false if it is on a list or
     /// being inserted (two lists under different locks cannot both win)
-    fn claim(&self) -> bool {
+    pub(super) fn claim(&self) -> bool {
         self.next
             .compare_exchange(UNLINKED, null_mut(), Relaxed, Relaxed)
             .is_ok()
+    }
+}
+
+/// Raw link access for the RCU list (`util::rculist`), whose writers
+/// hold its lock and whose readers load `next` with Acquire
+impl Link {
+    pub(super) fn next(&self) -> *mut Link {
+        self.next.load(Relaxed)
+    }
+
+    pub(super) fn prev(&self) -> *mut Link {
+        self.prev.load(Relaxed)
+    }
+
+    /// `next` for a reader under RCU (Linux rcu_dereference)
+    pub(super) fn next_rcu(&self) -> *mut Link {
+        self.next.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// # Safety
+    /// The caller holds the lock of the list this link is claimed for or
+    /// on, and `n` keeps that list's invariant.
+    pub(super) unsafe fn set_next(&self, n: *mut Link) {
+        self.next.store(n, Relaxed);
+    }
+
+    /// # Safety
+    /// As [`Link::set_next`].
+    pub(super) unsafe fn set_prev(&self, p: *mut Link) {
+        self.prev.store(p, Relaxed);
+    }
+
+    /// Point `next` at `n` for readers, after `n` is initialized (Linux
+    /// rcu_assign_pointer)
+    ///
+    /// # Safety
+    /// As [`Link::set_next`].
+    pub(super) unsafe fn publish_next(&self, n: *mut Link) {
+        self.next.store(n, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Mark the link free again
+    ///
+    /// # Safety
+    /// No list holds it and no reader stands on it.
+    pub(super) unsafe fn reset(&self) {
+        self.next.store(UNLINKED, Relaxed);
+        self.prev.store(UNLINKED, Relaxed);
     }
 }
 
