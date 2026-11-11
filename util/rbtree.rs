@@ -594,6 +594,37 @@ impl<K, V> RbTree<K, V> {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// The entries in order (Linux rb_first + rb_next)
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        let mut n = self.root.node;
+        // SAFETY: the tree's links are live (type invariant)
+        while !n.is_null() && unsafe { !(*n).left.is_null() } {
+            // SAFETY: as above
+            n = unsafe { (*n).left };
+        }
+        Iter {
+            cur: n,
+            _t: PhantomData,
+        }
+    }
+
+    /// The entry with the greatest key (Linux rb_last)
+    pub fn last(&self) -> Option<(&K, &V)> {
+        let mut n = self.root.node;
+        if n.is_null() {
+            return None;
+        }
+        // SAFETY: the tree's links are live and each heads a node (type
+        // invariant), borrowed with the tree
+        unsafe {
+            while !(*n).right.is_null() {
+                n = (*n).right;
+            }
+            let node = &*n.cast::<Node<K, V>>();
+            Some((&node.key, &node.value))
+        }
+    }
 }
 
 impl<K: Ord, V> RbTree<K, V> {
@@ -784,6 +815,15 @@ pub struct RbTreeNode<K, V> {
     node: Box<Node<K, V>>,
 }
 
+impl<K, V> RbTreeNode<K, V> {
+    /// The key and value, freeing the node (Rust-for-Linux
+    /// `to_key_value`)
+    pub fn to_key_value(self) -> (K, V) {
+        let n = *self.node;
+        (n.key, n.value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,8 +936,23 @@ mod tests {
             check(&t);
         }
         assert!(t.remove_node(&0).is_none());
+        assert!(t.iter().map(|(k, _)| *k).eq((1..2000).step_by(2)));
+        assert_eq!(t.last().map(|(k, _)| *k), Some(1999));
         assert_eq!(t.range_from(&1999).count(), 1);
         assert_eq!(t.range_from(&2000).count(), 0);
+    }
+
+    #[test]
+    fn empty_iter_last() {
+        let mut t: RbTree<u32, u32> = RbTree::new();
+        assert!(t.iter().next().is_none() && t.last().is_none());
+        t.insert(node(3, 30));
+        assert_eq!(t.last(), Some((&3, &30)));
+        assert_eq!(
+            t.remove_node(&3).map(RbTreeNode::to_key_value),
+            Some((3, 30))
+        );
+        assert!(t.iter().next().is_none());
     }
 
     #[test]

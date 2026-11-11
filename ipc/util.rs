@@ -6,7 +6,7 @@
 //! - Common traits and structures for IPC objects
 
 use crate::sync::spin::{Mutex, RwLock};
-use alloc::collections::BTreeMap;
+use crate::util::rbtree::{RbTree, RbTreeNode, RbTreeNodeReservation};
 use alloc::sync::Arc;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -204,10 +204,10 @@ pub struct IpcIdsInner<T> {
     pub seq: u32,
     /// Last allocated index (for cyclic allocation)
     pub last_idx: u32,
-    /// ID -> Object mapping
-    pub entries: BTreeMap<u32, Arc<T>>,
-    /// Key -> Index mapping (for non-private keys)
-    pub key_map: BTreeMap<i32, u32>,
+    /// Index -> object (Linux ipcs_idr): nodes reserved before the lock
+    pub entries: RbTree<u32, Arc<T>>,
+    /// Key -> index, for non-private keys (Linux key_ht)
+    pub key_map: RbTree<i32, u32>,
 }
 
 impl<T> IpcIdsInner<T> {
@@ -216,11 +216,36 @@ impl<T> IpcIdsInner<T> {
             in_use: 0,
             seq: 0,
             last_idx: 0,
-            entries: BTreeMap::new(),
-            key_map: BTreeMap::new(),
+            entries: RbTree::new(),
+            key_map: RbTree::new(),
         }
     }
+
+    /// The first index in `from..to` with no entry: a walk up the keys
+    /// from `from` to the first gap
+    fn free_idx(&self, from: u32, to: u32) -> Option<u32> {
+        let mut want = from;
+        for (&k, _) in self.entries.range_from(&from) {
+            if k != want {
+                break;
+            }
+            want += 1;
+        }
+        (want < to).then_some(want)
+    }
 }
+
+/// The nodes an insert into the table uses, allocated under
+/// `IpcIds.rwsem` before `IpcIds.inner` is taken (Linux ipc_addid:
+/// idr_preload(GFP_KERNEL), then idr_alloc_cyclic(GFP_NOWAIT) under the
+/// lock)
+struct IdsPreload<T> {
+    entry: RbTreeNodeReservation<u32, Arc<T>>,
+    key: Option<RbTreeNodeReservation<i32, u32>>,
+}
+
+/// What a removal took off the table, freed after the lock
+type IdsRemoved<T> = (RbTreeNode<u32, Arc<T>>, Option<RbTreeNode<i32, u32>>);
 
 /// IPC IDs table - manages IPC object IDs for a namespace (one per
 /// object type, Linux ipc_ids)
@@ -243,10 +268,19 @@ impl<T: IpcObject> IpcIds<T> {
         }
     }
 
-    /// Allocate a new ID for an object
-    ///
-    /// Returns the allocated ID on success
-    pub fn alloc_id(&self, obj: Arc<T>, max_ids: u32) -> KernelResult<i32> {
+    /// Insert `obj` under a new id, the next free index after the last
+    /// one given, cyclically (Linux ipc_addid, ipc_idr_alloc); called
+    /// with `rwsem` held for write. The id on success.
+    fn alloc_id(&self, obj: Arc<T>, max_ids: u32) -> KernelResult<i32> {
+        let key = obj.perm().key();
+        let pre = IdsPreload {
+            entry: RbTreeNodeReservation::new()?,
+            key: if key != IPC_PRIVATE {
+                Some(RbTreeNodeReservation::new()?)
+            } else {
+                None
+            },
+        };
         let mut inner = self.inner.write();
 
         if inner.in_use >= max_ids || inner.in_use >= IPCMNI {
@@ -255,17 +289,10 @@ impl<T: IpcObject> IpcIds<T> {
 
         // Find free index (cyclic allocation)
         let start_idx = inner.last_idx;
-        let mut idx = start_idx;
-
-        loop {
-            idx = (idx + 1) % IPCMNI;
-            if !inner.entries.contains_key(&idx) {
-                break;
-            }
-            if idx == start_idx {
-                return Err(KernelError::NoSpace);
-            }
-        }
+        let idx = inner
+            .free_idx(start_idx + 1, IPCMNI)
+            .or_else(|| inner.free_idx(0, start_idx + 1))
+            .ok_or(KernelError::NoSpace)?;
 
         // Update sequence number on wrap
         if idx <= inner.last_idx && inner.in_use > 0 {
@@ -287,11 +314,10 @@ impl<T: IpcObject> IpcIds<T> {
             perm.seq = inner.seq;
         }
 
-        // Insert into maps
-        let key = obj.perm().key();
-        inner.entries.insert(idx, obj);
-        if key != IPC_PRIVATE {
-            inner.key_map.insert(key, idx);
+        // Insert into maps: the nodes are the preloaded ones
+        inner.entries.insert(pre.entry.into_node(idx, obj));
+        if let Some(r) = pre.key {
+            inner.key_map.insert(r.into_node(key, idx));
         }
         inner.in_use += 1;
 
@@ -331,22 +357,27 @@ impl<T: IpcObject> IpcIds<T> {
         None
     }
 
-    /// Remove object by ID
+    /// Remove object by ID (Linux ipc_rmid); its nodes are freed after
+    /// the lock
     pub fn remove(&self, id: i32) -> Option<Arc<T>> {
+        let (entry, key) = self.unlink(id)?;
+        drop(key);
+        Some(entry.to_key_value().1)
+    }
+
+    /// Take index `id`'s entry and key off the table
+    fn unlink(&self, id: i32) -> Option<IdsRemoved<T>> {
         let mut inner = self.inner.write();
         let idx = (id as u32) & (IPCMNI - 1);
-
-        if let Some(obj) = inner.entries.remove(&idx) {
-            let key = obj.perm().key();
-            if key != IPC_PRIVATE {
-                inner.key_map.remove(&key);
-            }
-            inner.in_use -= 1;
-            obj.perm().mark_deleted();
-            Some(obj)
-        } else {
-            None
-        }
+        let obj = inner.entries.get(&idx)?;
+        let key = obj.perm().key();
+        obj.perm().mark_deleted();
+        let key = (key != IPC_PRIVATE)
+            .then(|| inner.key_map.remove_node(&key))
+            .flatten();
+        let entry = inner.entries.remove_node(&idx)?;
+        inner.in_use -= 1;
+        Some((entry, key))
     }
 
     /// Remove `obj` (id `id`) if it is still the one in the table (a
@@ -369,10 +400,12 @@ impl<T: IpcObject> IpcIds<T> {
     pub fn set_key_private(&self, obj: &T) {
         let mut inner = self.inner.write();
         let key = obj.perm().key();
-        if key != IPC_PRIVATE {
-            inner.key_map.remove(&key);
-        }
+        // Freed after the lock
+        let _node = (key != IPC_PRIVATE)
+            .then(|| inner.key_map.remove_node(&key))
+            .flatten();
         obj.perm().key.store(IPC_PRIVATE, Ordering::Relaxed);
+        drop(inner);
     }
 
     /// The object at table index `idx` and its id (SHM_STAT; Linux
@@ -391,16 +424,20 @@ impl<T: IpcObject> IpcIds<T> {
         self.inner
             .read()
             .entries
-            .keys()
-            .next_back()
-            .map_or(-1, |&i| i as i32)
+            .last()
+            .map_or(-1, |(&i, _)| i as i32)
     }
 
     /// `f` on every live object and its id, in index order, in one walk
     /// under the table's read lock: `f` must not allocate or sleep
     pub fn for_each(&self, mut f: impl FnMut(&T, i32)) {
         let inner = self.inner.read();
-        for obj in inner.entries.values().filter(|o| !o.perm().is_deleted()) {
+        for obj in inner
+            .entries
+            .iter()
+            .map(|(_, o)| o)
+            .filter(|o| !o.perm().is_deleted())
+        {
             let id = obj.perm().lock.lock().id;
             f(obj, id);
         }
@@ -420,7 +457,12 @@ impl<T: IpcObject> IpcIds<T> {
             if inner.entries.len() > v.capacity() {
                 continue;
             }
-            for obj in inner.entries.values().filter(|o| !o.perm().is_deleted()) {
+            for obj in inner
+                .entries
+                .iter()
+                .map(|(_, o)| o)
+                .filter(|o| !o.perm().is_deleted())
+            {
                 let id = obj.perm().lock.lock().id;
                 v.push((obj.clone(), id));
             }
