@@ -1949,10 +1949,15 @@ impl XhciController {
             return Ok(());
         };
 
-        // Get list of configured endpoint DCIs
-        let dcis: Vec<u8> = state.transfer_rings.keys().copied().collect();
+        // The configured endpoints, as a mask of DCIs 1..=31 (Linux walks
+        // the fixed virt_dev->eps array; nothing allocated)
+        let dcis = state
+            .transfer_rings
+            .keys()
+            .filter(|&&d| (1..32).contains(&d))
+            .fold(0u32, |m, &d| m | 1 << d);
 
-        for dci in dcis {
+        for dci in (1..32u8).filter(|d| dcis & (1 << d) != 0) {
             printkln!("xHCI: Stopping endpoint DCI {} for slot {}", dci, slot_id);
 
             // Issue STOP_ENDPOINT command
