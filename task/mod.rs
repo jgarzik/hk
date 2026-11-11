@@ -1041,6 +1041,9 @@ pub struct Task {
     /// thread context; the key database is taken under it
     pub keyrings: crate::sync::spin::Mutex<crate::keys::keyring::TaskKeyrings>,
     /// Its cgroup (Linux task->cgroups): spin leaf, thread context
+    /// A kernel thread's control block (Linux task->worker_private, read
+    /// by to_kthread); taken when the thread exits (spin leaf)
+    pub kthread: crate::sync::spin::Mutex<Option<Arc<crate::task::kthread::KThread>>>,
     pub cgroup: crate::sync::spin::Mutex<Option<Arc<crate::cgroup::Cgroup>>>,
     /// Files `defer_fput` still has to drop while an outer frame of this
     /// task drains (Linux task_work fput); only the task itself uses it
@@ -1874,6 +1877,7 @@ impl Task {
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
             sig: crate::sync::spin::Mutex::new(sig),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
+            kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
             task_works: task_work::TaskWorks::new(),
@@ -1945,6 +1949,7 @@ impl Task {
             seccomp_mode: AtomicU8::new(0),
             sig: crate::sync::spin::Mutex::new(TaskSignalState::boot()),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
+            kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
             task_works: task_work::TaskWorks::new(),

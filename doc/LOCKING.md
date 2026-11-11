@@ -947,11 +947,11 @@ CPU being idle) is a quiescent state for a future QSBR RCU.
 #### Kernel Threads (task/kthread.rs)
 
 `kthread_run(name, fn, arg, cpu)` creates a pid-0 task bound to one CPU
-(created asleep in that CPU's rq, then woken). `KTHREADS`
-(`spin::Mutex<Vec<Arc<KThread>>>`, process context only, never held across
-a wakeup/sleep; order: may be taken while holding nothing else, or only
-sleeping locks such as a directory's `i_rwsem`) maps tid -> control
-block. A kernel thread (`TaskKind::KernelThread`) with no fs of its
+(created asleep in that CPU's rq, then woken). The thread finds its
+control block through its task: `Task.kthread`
+(`spin::Mutex<Option<Arc<KThread>>>`, a leaf; Linux task->worker_private
+read by to_kthread), set before the first wakeup, taken when the thread
+exits, never held across a wakeup or sleep. A kernel thread (`TaskKind::KernelThread`) with no fs of its
 own gets the shared knullfs fs_struct from `get_task_fs` and
 `current_fs` (fs/fsstruct.rs `KTHREAD_FS`; no lock).
 `kthread_should_stop/should_park/parkme` and
