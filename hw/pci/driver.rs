@@ -21,14 +21,26 @@ use crate::base::{Device, DeviceInfo, Driver, device_create};
 use crate::fs::kernfs::{self, Attr, BinAttr, SysBuf};
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
-use crate::util::kalloc::{arc_nofail, try_arc};
+use crate::util::kalloc::{arc_nofail, try_arc, try_box};
 
 pub static PCI_BUS: BusType =
     BusType::with_drv_attrs("pci", pci_match, Some(pci_uevent), Some(pci_drv_attrs));
 
+/// An id added through a driver's new_id file (Linux struct pci_dynid),
+/// allocated before `DYNIDS` is taken
+struct DynId {
+    link: crate::util::list::Link,
+    drv: &'static str,
+    id: PciDeviceId,
+}
+
+crate::adapter!(DynIdLink, DynId, link);
+
 /// Ids added through drivers' new_id files, by driver name (Linux
-/// pci_driver.dynids; spin leaf)
-static DYNIDS: Mutex<Vec<(&'static str, PciDeviceId)>> = Mutex::new(Vec::new());
+/// pci_driver.dynids, list_add_tail under dynids.lock; spin leaf,
+/// nothing allocated under it)
+static DYNIDS: Mutex<crate::util::list::BoxList<DynIdLink>> =
+    Mutex::new(crate::util::list::BoxList::new());
 
 /// Matches any vendor/device/subsystem id (Linux PCI_ANY_ID)
 pub const PCI_ANY_ID: u32 = !0;
@@ -131,7 +143,7 @@ fn pci_match(dev: &Device, drv: &'static Driver) -> bool {
     let dynamic = DYNIDS
         .lock()
         .iter()
-        .any(|(n, id)| *n == drv.name && id.matches(&d.pci));
+        .any(|e| e.drv == drv.name && e.id.matches(&d.pci));
     dynamic || static_ids(drv).iter().any(|id| id.matches(&d.pci))
 }
 
@@ -175,14 +187,19 @@ impl Attr for NewId {
             let dynamic = DYNIDS
                 .lock()
                 .iter()
-                .any(|(n, d)| *n == drv.name && d.matches_ids(dev, id.class));
+                .any(|e| e.drv == drv.name && e.id.matches_ids(dev, id.class));
             if dynamic || static_ids(drv).iter().any(|s| s.matches_ids(dev, id.class)) {
                 return Err(KernelError::AlreadyExists);
             }
         } else if f[6] != 0 {
             return Err(KernelError::InvalidArgument);
         }
-        DYNIDS.lock().push((drv.name, id));
+        let e = try_box(DynId {
+            link: crate::util::list::Link::new(),
+            drv: drv.name,
+            id,
+        })?;
+        DYNIDS.lock().push_back(e);
         crate::base::dd::driver_attach(drv);
         Ok(data.len())
     }
@@ -202,29 +219,21 @@ impl Attr for RemoveId {
             return Err(KernelError::InvalidArgument);
         }
         let id = field_id(&f);
-        let mut ids = DYNIDS.lock();
-        let i = ids
-            .iter()
-            .position(|(n, d)| {
-                *n == self.0.name
-                    && (
-                        d.vendor,
-                        d.device,
-                        d.subvendor,
-                        d.subdevice,
-                        d.class,
-                        d.class_mask,
-                    ) == (
-                        id.vendor,
-                        id.device,
-                        id.subvendor,
-                        id.subdevice,
-                        id.class,
-                        id.class_mask,
-                    )
-            })
-            .ok_or(KernelError::NoDevice)?;
-        ids.remove(i);
+        let key = |d: &PciDeviceId| {
+            (
+                d.vendor,
+                d.device,
+                d.subvendor,
+                d.subdevice,
+                d.class,
+                d.class_mask,
+            )
+        };
+        // Freed after the unlock
+        let gone = DYNIDS
+            .lock()
+            .remove_first(|e| e.drv == self.0.name && key(&e.id) == key(&id));
+        gone.ok_or(KernelError::NoDevice)?;
         Ok(data.len())
     }
 }

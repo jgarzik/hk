@@ -24,9 +24,20 @@ pub static USB_BUS: BusType =
     BusType::with_drv_attrs("usb", usb_match, Some(usb_uevent), Some(usb_drv_attrs));
 
 /// Ids added through interface drivers' new_id files, by driver name
-/// (Linux usb_driver.dynids; spin leaf)
-static DYNIDS: crate::sync::spin::Mutex<Vec<(&'static str, UsbDeviceId)>> =
-    crate::sync::spin::Mutex::new(Vec::new());
+/// (Linux usb_driver.dynids under dynids.lock; spin leaf, nothing
+/// allocated under it)
+static DYNIDS: crate::sync::spin::Mutex<crate::util::list::BoxList<DynIdLink>> =
+    crate::sync::spin::Mutex::new(crate::util::list::BoxList::new());
+
+/// An id added through a driver's new_id file (Linux struct
+/// usb_dynid), allocated before `DYNIDS` is taken
+struct DynId {
+    link: crate::util::list::Link,
+    drv: &'static str,
+    id: UsbDeviceId,
+}
+
+crate::adapter!(DynIdLink, DynId, link);
 
 /// new_id (Linux usb_store_new_id): "idVendor idProduct
 /// [bInterfaceClass [refVendor refProduct]]"; the id is added and
@@ -51,7 +62,12 @@ impl crate::fs::kernfs::Attr for NewId {
             id.b_interface_class = f[2] as u8;
             id.match_flags |= super::driver::id_match::INT_CLASS;
         }
-        DYNIDS.lock().push((self.0.name, id));
+        let e = try_box(DynId {
+            link: crate::util::list::Link::new(),
+            drv: self.0.name,
+            id,
+        })?;
+        DYNIDS.lock().push_back(e);
         crate::base::dd::driver_attach(self.0);
         Ok(data.len())
     }
@@ -73,13 +89,11 @@ impl crate::fs::kernfs::Attr for RemoveId {
         }
         // The first such id (Linux usb_remove_newid_store)
         let (v, p) = (f[0] as u16, f[1] as u16);
-        let mut ids = DYNIDS.lock();
-        if let Some(i) = ids
-            .iter()
-            .position(|(n, id)| *n == self.0.name && id.id_vendor == v && id.id_product == p)
-        {
-            ids.remove(i);
-        }
+        // Freed after the unlock
+        let gone = DYNIDS
+            .lock()
+            .remove_first(|e| e.drv == self.0.name && e.id.id_vendor == v && e.id.id_product == p);
+        drop(gone);
         Ok(data.len())
     }
 }
@@ -138,7 +152,7 @@ fn usb_match(dev: &Device, drv: &'static Driver) -> bool {
             let dynamic = DYNIDS
                 .lock()
                 .iter()
-                .any(|(n, id)| *n == drv.name && id.matches(d, f));
+                .any(|e| e.drv == drv.name && e.id.matches(d, f));
             dynamic || usb_match_id(ids, d, f).is_some()
         }),
         None => false,
