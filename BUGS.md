@@ -471,6 +471,11 @@ glibc's helper thread), and hk has no such path.
 
 **Location:** `tty/`, `hw/serial.rs`, `arch/aarch64/serial.rs`.
 
+- **Line discipline input untested:** no boot test types into a tty,
+  so the N_TTY receive path (`tty/n_tty.rs`: the echo ring, inline
+  ISIG signals, canonical lines, the lock-free input check poll uses)
+  runs only on the console's real input. A pty (phase H) makes it
+  testable from the boot tester.
 - **No hangup:** nothing hangs a tty up (Linux __tty_hangup: vhangup,
   a session leader's exit, carrier loss), so open files stay usable.
   A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
