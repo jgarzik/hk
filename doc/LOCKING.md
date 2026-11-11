@@ -2193,17 +2193,23 @@ pub struct Inode {
 
 **Inode cache** (`fs/icache.rs`, Linux inode_hashtable): vfat inodes
 (by directory-entry position) are hashed so each on-disk object has one
-`Inode`. One `IrqSpinlock` per bucket (a RAM-sized table), a leaf:
-under it only the bucket vector, `Weak` counts and the filesystem's
-`test` (which may take `Inode.private`, a spin RwLock, then vfat's
-`VfatInode.d`, a spin Mutex leaf held only to copy the data in or
-out; never taken from an interrupt). IRQ-safe
-because a last reference could go anywhere. The hash holds `Weak`s;
-an inode upgraded under a bucket lock is never dropped there (its last
-reference's eviction takes the same lock): lookups keep them in a
-vector dropped after unlocking. Eviction (`Drop for Inode` ->
+`Inode`. A RAM-sized table of buckets, each a `WeakList` through the
+inode's embedded `i_hash_node` (one `Weak` per entry, nothing
+allocated), all under one `INODE_HASH_LOCK` (spin Mutex, Linux
+inode_hash_lock, thread context): under it only the bucket links and
+the filesystem's `test` (which may take `Inode.private`, a spin
+RwLock, then vfat's `VfatInode.d`, a spin Mutex leaf held only to copy
+the data in or out). Not IRQ-safe: an inode's last reference never goes
+in an interrupt handler (pinned pages and files are released in thread
+context: `PinnedPages`, `fput`), which lockdep checks (a tracked lock
+taken in an interrupt handler is reported). A lookup (Linux
+find_inode) runs `test` on each candidate before taking a reference,
+then upgrades the match, so no reference is dropped under the lock (a
+last reference's eviction takes it); an entry in its teardown (Linux
+I_FREEING: its last `Arc` gone, its eviction waiting for the lock)
+fails the upgrade and counts as absent. Eviction (`Drop for Inode` ->
 `icache::evict`, Linux iput_final -> evict) runs where the last `Arc`
-goes, possibly under spin locks: it takes the bucket lock (if hashed)
+goes, possibly under spin locks: it takes `INODE_HASH_LOCK` (if hashed)
 and calls `->evict_inode`, which must not sleep; vfat queues the
 cluster freeing of an unlinked file on `SYSTEM_WQ`
 (`Workqueue.inner`, IrqSpinlock leaf). Deviation from Linux: no
@@ -4309,6 +4315,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty group set a task with no SignalStruct (kernel thread, exited task) reads; nothing is queued on it; locked where `SignalStruct.shared` would be, same position (Task.sig -> shared) |
 | `FILE_SYSTEMS`, `SB_LOCK` | fs/superblock.rs | spin RwLock, spin Mutex | the registered filesystem types (Linux file_systems_lock) and the superblock lists (Linux sb_lock); 3.3 Superblock lists |
 | `INODE_SB_LIST_LOCK` | fs/inode.rs | spin Mutex | every superblock's `s_inodes` (Linux inode_sb_list_lock); 3.3 Superblock inode lists |
+| `INODE_HASH_LOCK` | fs/icache.rs | spin Mutex | the inode cache's buckets (Linux inode_hash_lock); 3.3 Inode cache: under it `Inode.private` -> `VfatInode.d` (vfat's `test`) |
 | `CHARDEV_REGISTRY` | fs/chardev.rs | sleeping `sync::RwSem` (Linux chrdevs_lock, cdev_map->lock: mutexes) | character device registry: registered at probe, looked up at open and mmap (under mmap_lock); never under a spin lock |
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf, also under `FasyncList.list` (O_ASYNC is set or cleared only with the file's fasync entry). `File.f_iocb` (the flags' I/O part, Linux f_iocb_flags: O_APPEND, O_DIRECT, O_DSYNC, __O_SYNC) is an atomic written only under it with the flags (F_SETFL), read lock-free by each read and write: an I/O racing an F_SETFL sees the old or the new word, as Linux's unlocked read of f_iocb_flags. `File.f_wb_err` / `f_sb_err` (Linux f_wb_err, f_sb_err: the writeback errors of the file's mapping and filesystem it has seen) are atomics sampled at open and advanced only under it (`errseq` check-and-advance, Linux file_check_and_advance_wb_err), read lock-free first. `AddressSpace.wb_err`, `SuperBlock.s_wb_err` (`util::errseq::ErrSeq`, Linux errseq_t) are lock-free words set by a failed writeback and a stale page cache after a direct write |
 | `FasyncList.list` → `File.f_lock`, `FOwner.st` | io/fasync.rs | sleeping `sync::Mutex` (per object: a pipe's readers and writers, a socket's, a tty's, an inotify group's); `FOwner.st` spin leaf | SIGIO (Linux fasync_lock and RCU readers, fown->lock): `FasyncList.armed` (atomic, written under the lock, read lock-free: Linux kill_fasync's unlocked list test) lets a wakeup with no armed file skip the lock; a list's entries (a file's `FOwner` reference and the armed fd), changed by `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) and walked by `kill_fasync`, which sends each entry's signal under it: thread context, no spin lock held (3.7 rule 1). `FOwner.st` (a file's owner pid, type, setter uids and F_SETSIG signal; allocated once per file) is copied under it and released before the send. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |

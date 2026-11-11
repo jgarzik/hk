@@ -603,8 +603,9 @@ pub struct Inode {
 
     /// The inode cache key it is hashed under (`fs::icache`)
     pub(super) i_hash: AtomicU64,
-    /// Hashed in the inode cache (Linux !inode_unhashed)
-    pub(super) i_hashed: core::sync::atomic::AtomicBool,
+    /// On its inode-cache bucket (Linux i_hash, under inode_hash_lock;
+    /// linked: !inode_unhashed)
+    pub(super) i_hash_node: list::Link,
     /// Identity for shared futex keys (Linux i_sequence)
     pub(crate) i_sequence: crate::task::futex::KeySeq,
     /// On its superblock's `s_inodes` (Linux i_sb_list), from
@@ -738,7 +739,7 @@ impl Inode {
             private: RwLock::new(None),
             i_pipe: crate::sync::spin::Mutex::new(None),
             i_hash: AtomicU64::new(0),
-            i_hashed: core::sync::atomic::AtomicBool::new(false),
+            i_hash_node: list::Link::new(),
             i_data: crate::mm::filemap::AddressSpace::new(),
             fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
@@ -799,7 +800,7 @@ impl Inode {
             private: RwLock::new(None),
             i_pipe: crate::sync::spin::Mutex::new(None),
             i_hash: AtomicU64::new(0),
-            i_hashed: core::sync::atomic::AtomicBool::new(false),
+            i_hash_node: list::Link::new(),
             i_data: crate::mm::filemap::AddressSpace::new(),
             fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
