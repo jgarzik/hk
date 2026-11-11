@@ -2967,8 +2967,17 @@ where `run` reads them.
   for HARD, whose callback runs with interrupts off on another CPU;
   sleeping on the base's wait queue for SOFT, whose callback may
   sleep), so the owner may go once it returns; dropping a `TimerList`
-  does that. Never call it from the timer's own callback, nor (SOFT)
-  where sleeping is not allowed.
+  does that. From the timer's own callback it only detaches (the base
+  records the running task, `TimerBase.runner`, and never touches the
+  timer after the callback returns), so a callback may drop the
+  timer's owner; elsewhere (SOFT) never where sleeping is not allowed.
+- `ArcTimer<T>` (Linux sk_reset_timer/sk_stop_timer): a SOFT timer in
+  an `Arc`-owned object; a pending arm holds one reference to the
+  owner (taken when `reset` finds it idle, `mod_timer` returning the
+  old pending state), which the callback receives and drops, or
+  `stop` drops when it disarms. The owner's last reference may thus
+  go in its own callback, and while the timer can fire the owner is
+  alive.
 - Order: `Alarm.st` -> `TimerBase.wheel` (leaf).
 
 #### High-resolution timers (time/hrtimer.rs; Linux kernel/time/hrtimer.c)
