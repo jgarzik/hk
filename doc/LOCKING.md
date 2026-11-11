@@ -4271,7 +4271,8 @@ not rely on either.
 | `UnixSock.bindlock` (`net/unix`) | `sync::Mutex<()>` (sleeping) | thread only | Linux u->bindlock: bind/autobind; taken with no spinlock held, before `UnixTable.st`/`BSD`. A path bind runs the VFS mknod (parent `i_rwsem`) first and takes `bindlock` after it returns (Linux nests i_rwsem -> bindlock; hk does not need to); if the socket got bound meanwhile it drops `bindlock` before unlinking the node, so `i_rwsem` is never taken under `bindlock` |
 | `UnixSock.iolock` | `sync::Mutex<()>` (sleeping) | thread only (recvmsg) | Linux u->iolock: one reader across dequeue -> user copy -> consume; dropped before waiting for data; above `st`/`rq` |
 | `UnixSock.st` | `spin::Mutex<Option<Arc<UnixSock>>>` | thread only | Linux unix_state_lock: the peer; `state`, shutdown bits and `dead` change under it. At most two published sockets at once: listener -> connecting socket (stream connect; a socket that is not CLOSE fails before taking its own, so listeners never nest), then the new server-side socket (not yet reachable by anyone; Linux unix_state_lock_nested(newsk)) as a third; or two in ascending address order (`lock2`, Linux unix_state_double_lock: dgram connect, socketpair). Senders queue under the receiver's `st`, so nothing is queued to a released socket |
-| `UnixSock.rq` | `spin::Mutex<RxQueue>` | thread only | receive queue (Linux sk_receive_queue.lock), under `st`; a listener's queue holds embryo connections |
+| `UnixSock.rq` | `SkbOwnedQueue` (spin `Mutex`, skbs carry its owner mark) | thread only | receive queue (Linux sk_receive_queue.lock), under `st`; a listener's queue holds embryo connections. Messages are skbs (`SkbCb::Unix`: the sender's charge, credentials, files, consumed count) whose `Arc` is made before any lock; readers (holding `iolock`) take a reference under it and copy after (Linux unix_stream_read_generic), step to the next one (skb_peek_next) and unlink a fully read one (skb_unlink) by its mark, a no-op if a purge took it; taken skbs are freed after it. `UnixSock.inq_len` (atomic) changes under it |
+| `UnixCb.fp` (a queued message's files) | `spin::Mutex` | thread only | leaf except for the in-flight charge (`queue` charges under the receiver's `st` -> `fp` -> `INFLIGHT`); changed only by the `iolock` holder: the reader takes the files, a peek takes them out, copies them unlocked (Linux unix_peek_fds) and puts them back |
 | `UnixTable.st` (per netns), `unix::BSD` (global, by inode) | `spin::RwLock` | thread only | all sockets + abstract names (per type) / filesystem bindings; after `bindlock`, before `UnixSock.addr` (published under them); lookups return `Arc`s, no socket lock under them |
 | `UnixSock.addr`, `UnixSock.peercred`, `UnixSock.relay` | `spin::RwLock` / `spin::Mutex` | thread only | leaves (Linux u->addr, sk_peer_lock, peer_wait.lock for peer_wake relays); `relay` also guards the registered sockets' `peer_wake` atomics |
 | `unix::scm::INFLIGHT` | `spin::Mutex` | thread only | leaf: per-user in-flight file counts (charged under the receiver's `st`) |
@@ -4318,7 +4319,7 @@ NetNamespace tables (RwLocks; lookups drop the guard before returning);
   (AF_UNIX: UnixSock.bindlock (sleeping) -> UnixTable.st / BSD
    -> UnixSock.addr; UnixSock.iolock (sleeping) -> UnixSock.st (listener
    before connector, else by address) -> UnixSock.rq / peercred / addr /
-   INFLIGHT; UnixSock.relay leaf)
+     UnixCb.fp -> INFLIGHT; UnixSock.relay leaf)
   (NlSock.dump -> RCU walks of devices, addresses, FIB; ARP snapshot
    -> NlSock.rxq: dump parts)
   (AF_PACKET taps, from any receive or transmit path: PacketTable.socks,

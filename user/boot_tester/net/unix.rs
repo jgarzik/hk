@@ -51,6 +51,8 @@ pub fn run_tests() {
     test_stream_data();
     test_stream_coalesce();
     test_peek_waitall();
+    test_stream_peek();
+    test_stream_peek_fds();
     test_shutdown();
     test_backlog();
     test_sndbuf();
@@ -705,6 +707,59 @@ fn test_peek_waitall() {
     wait_status(pid);
     close(a);
     close(b);
+    t.done();
+}
+
+/// A stream peek joins messages and copies a partly read one from where
+/// the reads stopped, consuming nothing
+fn test_stream_peek() {
+    let mut t = T::new(b"UNIX_STREAM_PEEK");
+    let (a, b) = pair(SOCK_STREAM);
+    send(a, b"ab", 0);
+    send(a, b"cd", 0);
+    send(a, b"efg", 0);
+    let mut buf = [0u8; 16];
+    t.eq(b"peek all", recv(b, &mut buf, MSG_PEEK), 7);
+    t.ok(b"peek data", &buf[..7] == b"abcdefg", buf[0] as i64);
+    t.eq(b"peek part", recv(b, &mut buf[..3], MSG_PEEK), 3);
+    t.ok(b"peek part data", &buf[..3] == b"abc", buf[0] as i64);
+    t.eq(b"read one", recv(b, &mut buf[..1], 0), 1);
+    buf.fill(0);
+    t.eq(b"peek rest", recv(b, &mut buf, MSG_PEEK), 6);
+    t.ok(b"peek rest data", &buf[..6] == b"bcdefg", buf[0] as i64);
+    t.eq(b"FIONREAD", ioctl_int(b, FIONREAD as u64).1 as i64, 6);
+    buf.fill(0);
+    t.eq(b"read rest", recv(b, &mut buf, 0), 6);
+    t.ok(b"read data", &buf[..6] == b"bcdefg", buf[0] as i64);
+    t.eq(b"empty", recv(b, &mut buf, MSG_DONTWAIT), EAGAIN);
+    close(a);
+    close(b);
+    t.done();
+}
+
+/// A stream peek of a message with files stops after it and gets
+/// copies of the files; the read then gets them again, and the next
+/// message comes without
+fn test_stream_peek_fds() {
+    let mut t = T::new(b"UNIX_STREAM_PEEK_FDS");
+    let (a, b) = pair(SOCK_STREAM);
+    let mut p = [0i32; 2];
+    sys_pipe(p.as_mut_ptr());
+    t.eq(b"send fds", send_fds(a, b"aa", &[p[0]]), 2);
+    send(a, b"bb", 0);
+    let mut buf = [0u8; 16];
+    let mut ctl = [0u8; 64];
+    let (r, _, clen) = recv_msg(b, &mut buf, &mut ctl, MSG_PEEK);
+    let (pk, n) = got_fds(&ctl, clen);
+    t.ok(b"peek", r == 2 && pk >= 0 && n == 1, r);
+    let (r, _, clen) = recv_msg(b, &mut buf, &mut ctl, 0);
+    let (rd, n) = got_fds(&ctl, clen);
+    t.ok(b"read", r == 2 && rd >= 0 && n == 1 && rd != pk, r);
+    let (r, _, clen) = recv_msg(b, &mut buf, &mut ctl, 0);
+    t.ok(b"rest", r == 2 && &buf[..2] == b"bb" && clen == 0, r);
+    for f in [a, b, p[0], p[1], pk, rd] {
+        close(f);
+    }
     t.done();
 }
 

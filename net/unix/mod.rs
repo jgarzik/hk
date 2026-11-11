@@ -12,8 +12,8 @@
 //! namespace, separately per socket type (`UnixTable.names`). Autobind
 //! picks "\0" + 5 hex digits. Unlinking the file does not unbind.
 //!
-//! Data moves between sockets directly: a sender queues `Skb`s on the
-//! receiver's queue (`rq`). Each is charged to the sender's `wmem` until
+//! Data moves between sockets directly: a sender queues skbs (`UnixCb`
+//! in their cb) on the receiver's queue (`rq`). Each is charged to the sender's `wmem` until
 //! it is consumed or dropped, so a sender is bounded by its SO_SNDBUF
 //! (Linux sock_alloc_send_pskb / sock_wfree). Datagram receivers are
 //! also bounded by queue length (`backlog`: net.unix.max_dgram_qlen,
@@ -35,9 +35,11 @@
 //!   a listener's before the connecting socket's (stream connect),
 //!   otherwise in ascending address order (`lock2`, Linux
 //!   unix_state_double_lock).
-//! - `rq` (`crate::sync::spin::Mutex`): receive queue, under `st` (senders queue
-//!   while holding the receiver's `st`, so they never queue to a dead
-//!   socket); leaf except for `relay` wakeups done after unlock.
+//! - `rq` (an `SkbOwnedQueue`, spin): receive queue, under `st`
+//!   (senders queue while holding the receiver's `st`, so they never
+//!   queue to a dead socket); a leaf (`UnixCb.fp` aside): a message's
+//!   `Arc` is made before it, a reader takes a reference under it and
+//!   copies after, and taken messages are freed after it.
 //! - `UnixTable.st` (per netns) and `BSD` (`crate::sync::spin::RwLock`): after
 //!   `bindlock`; `addr` (`crate::sync::spin::RwLock` leaf) is set under them, so a
 //!   name found in a table always has its address. Lookups return
@@ -52,7 +54,7 @@ pub mod scm;
 pub mod stream;
 
 use crate::util::kalloc::{try_arc, try_arc_cyclic};
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -66,6 +68,7 @@ use crate::fs::Dentry;
 use crate::io::fasync::{POLL_HUP, POLL_IN};
 use crate::net::NetNamespace;
 use crate::net::msg::{RecvMsg, SendMsg};
+use crate::net::skb::{SkBuff, SkbCb, SkbOwned, SkbOwnedQueue};
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, WakeHow, sf};
 use crate::net::socket::{
     AF_UNIX, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_PEERCRED, SOCK_DGRAM, SOCK_RAW,
@@ -74,6 +77,7 @@ use crate::net::socket::{
 use crate::sync::Mutex as SMutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::error::KernelError;
+use crate::util::list::OwnedList;
 
 use scm::{Creds, FpList};
 
@@ -131,80 +135,97 @@ impl PeerCred {
     }
 }
 
-/// A queued message (Linux sk_buff + UNIXCB)
-pub struct Skb {
-    pub data: Vec<u8>,
-    /// Bytes already read (stream)
-    pub consumed: usize,
-    /// Sender: holds the buffer charge, source address (Linux skb->sk)
-    from: Arc<UnixSock>,
+/// A sender's buffer charge for one message, returned when the skb is
+/// freed (Linux skb->sk + sock_wfree, the skb destructor)
+pub struct Wmem {
+    /// The sender (its address is the message's source)
+    pub from: Arc<UnixSock>,
     truesize: usize,
-    pub creds: Option<Creds>,
-    pub fds: Option<FpList>,
-    /// A listener's pending connection (Linux: the embryo is skb->sk)
-    pub embryo: Option<Arc<UnixSock>>,
 }
 
-impl Skb {
-    /// A message from `from` charged to it (call `wmem_wait` first)
-    fn new(from: &Arc<UnixSock>, data: Vec<u8>) -> Self {
-        let truesize = data.len() + SKB_OVERHEAD;
-        from.wmem.fetch_add(truesize, Ordering::AcqRel);
-        Self {
-            data,
-            consumed: 0,
-            from: from.clone(),
-            truesize,
-            creds: None,
-            fds: None,
-            embryo: None,
-        }
-    }
-
-    /// Unread bytes
-    pub fn len(&self) -> usize {
-        self.data.len() - self.consumed
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Linux unix_maybe_add_creds: attach the sender's credentials when
-    /// either end passes them or the receiver is an embryo (no socket
-    /// file yet), unless the sender gave SCM_CREDENTIALS
-    fn add_creds(&mut self, me: &UnixSock, other: &UnixSock) {
-        if self.creds.is_none() && (me.passcred() || other.passcred() || !other.has_file()) {
-            self.creds = Some(Creds::current());
-        }
-    }
-}
-
-impl Drop for Skb {
+impl Drop for Wmem {
     /// Linux sock_wfree: return the charge, wake a blocked writer
     fn drop(&mut self) {
         self.from.wfree(self.truesize);
     }
 }
 
-/// A receive queue (Linux sk_receive_queue)
-#[derive(Default)]
-pub struct RxQueue {
-    pub q: VecDeque<Skb>,
-    /// Unread bytes (Linux unix_sock.inq_len)
-    pub bytes: usize,
+/// What a queued AF_UNIX message keeps beside its bytes (Linux UNIXCB
+/// and the skb's owner). Queued messages and the files they carry are
+/// freed only with no spin lock held: their drop returns the charge
+/// (waking writers) and may release sockets.
+pub struct UnixCb {
+    pub wmem: Wmem,
+    pub creds: Option<Creds>,
+    /// The files (Linux UNIXCB.fp): changed only by the `iolock`
+    /// holder (the reader that takes them, a peek that copies them);
+    /// a leaf lock, nothing allocated under it
+    pub fp: Mutex<Option<FpList>>,
+    /// Bytes already read (stream; Linux UNIXCB.consumed): written
+    /// under `iolock`
+    consumed: AtomicUsize,
+    /// A listener's pending connection (Linux: the embryo is skb->sk)
+    pub embryo: Option<Arc<UnixSock>>,
 }
 
-impl RxQueue {
-    fn push(&mut self, skb: Skb) {
-        self.bytes += skb.len();
-        self.q.push_back(skb);
-    }
+/// A message from `from` of `data`, charged to it (call `wmem_wait`
+/// first); its `Arc` is made by the caller before any lock
+fn unix_skb(from: &Arc<UnixSock>, data: Vec<u8>) -> SkBuff {
+    let truesize = data.len() + SKB_OVERHEAD;
+    from.wmem.fetch_add(truesize, Ordering::AcqRel);
+    let mut skb = SkBuff::from_vec(data);
+    skb.cb = SkbCb::Unix(UnixCb {
+        wmem: Wmem {
+            from: from.clone(),
+            truesize,
+        },
+        creds: None,
+        fp: Mutex::new(None),
+        consumed: AtomicUsize::new(0),
+        embryo: None,
+    });
+    skb
+}
 
-    fn take_all(&mut self) -> VecDeque<Skb> {
-        self.bytes = 0;
-        core::mem::take(&mut self.q)
+/// The `UnixCb` of a message (every skb on a unix queue has one)
+pub fn ucb(skb: &SkBuff) -> &UnixCb {
+    match &skb.cb {
+        SkbCb::Unix(c) => c,
+        _ => unreachable!("AF_UNIX skb without its cb"),
     }
+}
+
+fn ucb_mut(skb: &mut SkBuff) -> &mut UnixCb {
+    match &mut skb.cb {
+        SkbCb::Unix(c) => c,
+        _ => unreachable!("AF_UNIX skb without its cb"),
+    }
+}
+
+/// Unread bytes (Linux unix_skb_len)
+pub fn unix_len(skb: &SkBuff) -> usize {
+    skb.len() - ucb(skb).consumed.load(Ordering::Acquire)
+}
+
+/// Linux unix_maybe_add_creds: attach the sender's credentials when
+/// either end passes them or the receiver is an embryo (no socket file
+/// yet), unless the sender gave SCM_CREDENTIALS
+fn add_creds(skb: &mut SkBuff, me: &UnixSock, other: &UnixSock) {
+    let cb = ucb_mut(skb);
+    if cb.creds.is_none() && (me.passcred() || other.passcred() || !other.has_file()) {
+        cb.creds = Some(Creds::current());
+    }
+}
+
+/// The message's files, copied for MSG_PEEK (Linux unix_peek_fds:
+/// scm_fp_dup, not in flight itself). The `iolock` holder takes them
+/// out, copies them with no lock held and puts them back.
+fn peek_fds(skb: &SkBuff) -> Option<FpList> {
+    let cb = ucb(skb);
+    let fp = cb.fp.lock().take()?;
+    let dup = fp.dup();
+    *cb.fp.lock() = Some(fp);
+    Some(dup)
 }
 
 /// An AF_UNIX socket (Linux struct unix_sock)
@@ -215,7 +236,12 @@ pub struct UnixSock {
     st: Mutex<Option<Arc<UnixSock>>>,
     /// ESTABLISHED / CLOSE / LISTEN, written under `st`
     state: AtomicU8,
-    rq: Mutex<RxQueue>,
+    /// Receive queue (Linux sk_receive_queue): messages in their
+    /// `Arc`s, made before the lock
+    rq: SkbOwnedQueue,
+    /// Unread bytes queued (Linux unix_sock.inq_len), changed under
+    /// `rq`'s lock
+    inq_len: AtomicUsize,
     addr: RwLock<Option<Arc<UnixAddr>>>,
     iolock: SMutex<()>,
     bindlock: SMutex<()>,
@@ -319,7 +345,8 @@ impl UnixSock {
             me: me.clone(),
             st: Mutex::new(None),
             state: AtomicU8::new(CLOSE),
-            rq: Mutex::new(RxQueue::default()),
+            rq: SkbOwnedQueue::new(),
+            inq_len: AtomicUsize::new(0),
             addr: RwLock::new(None),
             iolock: SMutex::new(()),
             bindlock: SMutex::new(()),
@@ -381,7 +408,7 @@ impl UnixSock {
 
     /// Linux unix_recvq_full_lockless: more queued than the limit
     fn recvq_full(&self) -> bool {
-        self.rq.lock().q.len() as u64 > u64::from(self.backlog.load(Ordering::Acquire))
+        self.rq.len() as u64 > u64::from(self.backlog.load(Ordering::Acquire))
     }
 
     /// Linux unix_writable: under a quarter of sndbuf in flight
@@ -551,7 +578,7 @@ impl UnixSock {
         self.peer_wait.wake_all();
         if let Some(p) = peer {
             if self.connected_type() {
-                let unread = !self.rq.lock().q.is_empty();
+                let unread = !self.rq.is_empty();
                 {
                     let _g = p.st.lock();
                     p.sk.or_shutdown(SHUTDOWN_MASK);
@@ -564,15 +591,23 @@ impl UnixSock {
             }
             dgram::peer_wake_disconnect(self, &p);
         }
-        let q = self.rq.lock().take_all();
-        for mut skb in q {
-            if state == LISTEN
-                && let Some(e) = skb.embryo.take()
-            {
-                e.release_sock(true);
+        let q = self.purge();
+        if state == LISTEN {
+            for skb in q.iter() {
+                if let Some(e) = &ucb(skb).embryo {
+                    e.release_sock(true);
+                }
             }
         }
+        drop(q);
         self.relay_wake();
+    }
+
+    /// Take the whole receive queue off; the caller frees it unlocked
+    pub(super) fn purge(&self) -> OwnedList<SkbOwned> {
+        let mut g = self.rq.lock();
+        self.inq_len.store(0, Ordering::Release);
+        core::mem::take(&mut *g)
     }
 
     fn unhash_bsd(&self) {
@@ -627,10 +662,9 @@ impl UnixSock {
         if self.state() == LISTEN {
             return Err(KernelError::InvalidArgument);
         }
-        let q = self.rq.lock();
         Ok(match self.sk.stype {
-            SOCK_STREAM | SOCK_SEQPACKET => q.bytes,
-            _ => q.q.front().map_or(0, |s| s.len()),
+            SOCK_STREAM | SOCK_SEQPACKET => self.inq_len.load(Ordering::Acquire),
+            _ => self.rq.lock().first().map_or(0, SkBuff::len),
         })
     }
 }
@@ -924,11 +958,14 @@ pub fn proc_net_unix() -> Vec<u8> {
 
 /// Queue `skb` on `to` (caller holds `to.st`, so `to` is alive) and
 /// charge its files as in flight
-fn queue(to: &UnixSock, mut skb: Skb) {
-    if let Some(f) = skb.fds.as_mut() {
+fn queue(to: &UnixSock, skb: Arc<SkBuff>) {
+    if let Some(f) = ucb(&skb).fp.lock().as_mut() {
         f.queued();
     }
-    to.rq.lock().push(skb);
+    let len = unix_len(&skb);
+    let mut q = to.rq.lock();
+    q.push_back(skb);
+    to.inq_len.fetch_add(len, Ordering::AcqRel);
 }
 
 /// Shutdown bits test helper

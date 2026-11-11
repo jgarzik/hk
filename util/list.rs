@@ -709,6 +709,19 @@ impl<A: OwnerAdapter> OwnedList<A> {
         Some(unsafe { self.list.remove(item) })
     }
 
+    /// Take the first entry off and hand back the list's reference
+    pub fn pop_front(&mut self) -> Option<Arc<A::Item>> {
+        let item = self.list.pop_front()?;
+        // INVARIANT: off the list
+        A::owner(&item).0.store(0, Relaxed);
+        Some(item)
+    }
+
+    /// The first entry, borrowed for as long as the list is
+    pub fn first(&self) -> Option<&A::Item> {
+        self.list.front()
+    }
+
     /// A new reference to the first entry
     pub fn front(&self) -> Option<Arc<A::Item>> {
         self.list.list.front().map(|p| {

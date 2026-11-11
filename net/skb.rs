@@ -40,7 +40,7 @@ use alloc::vec::Vec;
 
 use crate::mm::page_alloc::Gfp;
 use crate::sync::spin::{Mutex, MutexGuard};
-use crate::util::list::{Link, ListPtr, PtrList};
+use crate::util::list::{Link, ListPtr, OwnedList, Owner, PtrList};
 
 use crate::net::af_inet::RxInfo;
 use crate::net::device::NetDevice;
@@ -63,6 +63,8 @@ pub const MAX_SKB_SIZE: usize = 65536 + 512;
 pub struct SkBuff {
     /// Its link on a queue (Linux skb->next/prev)
     list: Link,
+    /// Which [`SkbOwnedQueue`] holds it through `list` (none: 0)
+    qowner: Owner,
     /// The buffer: headroom, packet data, tailroom (a Vec so a message
     /// built in one is adopted whole, `from_vec`)
     buf: Vec<u8>,
@@ -113,7 +115,7 @@ pub struct SkBuff {
 
 /// What a protocol keeps with a queued skb (Linux skb->cb, typed: each
 /// layer reads only its own variant)
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub enum SkbCb {
     #[default]
     None,
@@ -127,6 +129,24 @@ pub enum SkbCb {
     Pkt(crate::net::packet::PktCb),
     /// A netlink message (Linux NETLINK_CB)
     Nl(crate::net::netlink::NlCb),
+    /// An AF_UNIX message (Linux UNIXCB and the skb's sock_wfree
+    /// destructor)
+    Unix(crate::net::unix::UnixCb),
+}
+
+impl SkbCb {
+    /// The cb of a clone (Linux skb_clone copies cb). AF_UNIX messages,
+    /// which own their files and their sender's charge, are never
+    /// cloned: theirs comes back empty.
+    fn dup(&self) -> Self {
+        match self {
+            Self::None | Self::Unix(_) => Self::None,
+            Self::Inet(c) => Self::Inet(*c),
+            Self::Exterr(e) => Self::Exterr(*e),
+            Self::Pkt(p) => Self::Pkt(*p),
+            Self::Nl(n) => Self::Nl(n.clone()),
+        }
+    }
 }
 
 /// [`SkbCb::Inet`]
@@ -368,6 +388,7 @@ impl SkBuff {
         let buf = with_gfp(gfp, || crate::util::kmem::try_to_vec(&self.buf)).ok()?;
         Some(Self {
             list: Link::new(),
+            qowner: Owner::new(),
             buf,
             data: self.data,
             tail: self.tail,
@@ -385,7 +406,7 @@ impl SkBuff {
             nh: self.nh,
             tstamp: self.tstamp,
             dropcount: self.dropcount,
-            cb: self.cb.clone(),
+            cb: self.cb.dup(),
         })
     }
 
@@ -397,6 +418,7 @@ impl SkBuff {
 }
 
 crate::adapter!(pub SkbLink, SkBuff, list);
+crate::owned_adapter!(pub SkbOwned, SkBuff, list, qowner);
 
 /// A queue of skbs, each owned through `P` (Linux sk_buff_head with the
 /// unlocked `__skb_queue_tail`/`__skb_dequeue`/`skb_queue_walk_safe`
@@ -455,6 +477,80 @@ impl SkbQueue<Arc<SkBuff>> {
     /// skb_get under the queue lock): the caller reads it unlocked
     pub fn peek(&self) -> Option<Arc<SkBuff>> {
         self.q.lock().front_arc()
+    }
+}
+
+/// An skb queue with its own lock whose skbs carry its owner mark
+/// (Linux sk_buff_head with skb_peek_next and skb_unlink of a given
+/// skb): for a reader that copies an skb with the lock dropped and
+/// then steps past it or unlinks it, which is safe even if the queue
+/// was purged meanwhile (the skb is then on no queue: nothing happens).
+/// Thread context only, a leaf; nothing is dropped under it.
+pub struct SkbOwnedQueue {
+    q: Mutex<OwnedList<SkbOwned>>,
+}
+
+impl SkbOwnedQueue {
+    #[track_caller]
+    pub fn new() -> Self {
+        Self {
+            q: Mutex::new(OwnedList::new()),
+        }
+    }
+
+    /// Take the lock for several steps (`push_back`, `len`, a walk)
+    #[track_caller]
+    pub fn lock(&self) -> MutexGuard<'_, OwnedList<SkbOwned>> {
+        self.q.lock()
+    }
+
+    /// Linux skb_queue_tail
+    pub fn push(&self, skb: Arc<SkBuff>) {
+        self.q.lock().push_back(skb);
+    }
+
+    /// The first skb, taken off (Linux skb_dequeue)
+    pub fn dequeue(&self) -> Option<Arc<SkBuff>> {
+        self.q.lock().pop_front()
+    }
+
+    /// A reference to the first skb, left queued (Linux skb_peek)
+    pub fn peek(&self) -> Option<Arc<SkBuff>> {
+        self.q.lock().front()
+    }
+
+    /// A reference to the skb after `skb` (Linux skb_peek_next); None
+    /// at the end, or if `skb` is no longer queued here
+    pub fn peek_next(&self, skb: &SkBuff) -> Option<Arc<SkBuff>> {
+        self.q.lock().next(skb)
+    }
+
+    /// Take `skb` off (Linux skb_unlink): the queue's reference, which
+    /// the caller drops after the lock; None if it is not queued here
+    #[must_use]
+    pub fn unlink(&self, skb: &SkBuff) -> Option<Arc<SkBuff>> {
+        self.q.lock().remove(skb)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.q.lock().is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.q.lock().len()
+    }
+
+    /// Take every skb off at once; the caller drops them after the lock
+    /// (Linux skb_queue_splice_init + __skb_queue_purge)
+    #[must_use]
+    pub fn purge(&self) -> OwnedList<SkbOwned> {
+        core::mem::take(&mut *self.q.lock())
+    }
+}
+
+impl Default for SkbOwnedQueue {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -557,6 +653,27 @@ mod tests {
         assert_eq!(lens(&all), [1, 2]);
         drop(all);
         assert_eq!(Arc::strong_count(&p), 1);
+    }
+
+    /// An owned queue steps from and unlinks a given skb, and ignores
+    /// one it no longer holds
+    #[test]
+    fn owned_queue_next_unlink() {
+        let q = SkbOwnedQueue::new();
+        let a: Arc<SkBuff> = Arc::from(skb(1));
+        let b: Arc<SkBuff> = Arc::from(skb(2));
+        q.push(a.clone());
+        q.push(b.clone());
+        assert_eq!(q.peek_next(&a).map(|s| s.len()), Some(2));
+        assert!(q.peek_next(&b).is_none());
+        let gone = q.purge();
+        assert!(q.peek_next(&a).is_none());
+        assert!(q.unlink(&a).is_none());
+        drop(gone);
+        q.push(a.clone());
+        assert!(q.unlink(&b).is_none());
+        assert!(q.unlink(&a).is_some());
+        assert!(q.is_empty());
     }
 
     /// A clone has its own buffer and keeps the marks and cb
