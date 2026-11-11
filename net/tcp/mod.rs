@@ -60,7 +60,9 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::net::sock_lock::{BhGuard, SockGuard, SockHooks, SockLock};
 use crate::sync::spin::Mutex;
@@ -95,7 +97,10 @@ use crate::net::socket::{
     SOCK_STREAM, SOL_SOCKET, shut_bits,
 };
 use crate::net::{NetNamespace, dev};
+use crate::sync::rcu::RcuPuts;
 use crate::time::timer::ArcTimer;
+use crate::util::hlist_nulls::NullsLink;
+use crate::util::list::Link;
 
 pub use self::cb::TcpState;
 
@@ -183,6 +188,16 @@ struct Snap {
     /// Linux snd_una / snd_nxt (the ICMP error sequence check)
     snd_una: AtomicU32,
     snd_max: AtomicU32,
+    /// /proc/net/tcp's values (`info::ProcView`)
+    tr: AtomicU8,
+    when: AtomicU64,
+    backoff: AtomicU32,
+    probes: AtomicU32,
+    rto: AtomicU64,
+    ato: AtomicU64,
+    qp: AtomicU32,
+    cwnd: AtomicU32,
+    last: AtomicI64,
 }
 
 impl Snap {
@@ -194,7 +209,33 @@ impl Snap {
         self.writable.store(c.writable(), Ordering::Release);
         self.snd_una.store(c.snd_una, Ordering::Release);
         self.snd_max.store(c.snd_max, Ordering::Release);
+        let v = info::ProcView::of(c);
+        self.tr.store(v.tr, Ordering::Relaxed);
+        self.when.store(v.when, Ordering::Relaxed);
+        self.backoff.store(v.backoff, Ordering::Relaxed);
+        self.probes.store(v.probes, Ordering::Relaxed);
+        self.rto.store(v.rto, Ordering::Relaxed);
+        self.ato.store(v.ato, Ordering::Relaxed);
+        self.qp.store(v.qp, Ordering::Relaxed);
+        self.cwnd.store(v.cwnd, Ordering::Relaxed);
+        self.last.store(v.last, Ordering::Relaxed);
         self.state.store(c.state.linux(), Ordering::Release);
+    }
+
+    /// /proc/net/tcp's values (each read on its own, as Linux's
+    /// READ_ONCE fields: a line may mix two steps' values)
+    fn proc_view(&self) -> info::ProcView {
+        info::ProcView {
+            tr: self.tr.load(Ordering::Relaxed),
+            when: self.when.load(Ordering::Relaxed),
+            backoff: self.backoff.load(Ordering::Relaxed),
+            probes: self.probes.load(Ordering::Relaxed),
+            rto: self.rto.load(Ordering::Relaxed),
+            ato: self.ato.load(Ordering::Relaxed),
+            qp: self.qp.load(Ordering::Relaxed),
+            cwnd: self.cwnd.load(Ordering::Relaxed),
+            last: self.last.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -214,8 +255,21 @@ pub struct TcpSock {
     /// icsk_delack_timer, sk_timer), armed by `sync_timers` under the
     /// socket lock
     timers: [ArcTimer<TcpSock>; 3],
+    /// Its ehash and lhash chain links and key (Linux sk_nulls_node,
+    /// sk_portpair / sk_addrpair), its bhash owner link (sk_bind_node)
+    /// and whether it took the port with bind()/listen() (written under
+    /// the bhash chain lock)
+    eh_link: NullsLink,
+    lh_link: NullsLink,
+    ehkey: table::EhKey,
+    bind_link: Link,
+    by_bind: AtomicBool,
+    /// The tables' references, dropped a grace period after unhashing
+    rcu_puts: RcuPuts,
     me: Weak<TcpSock>,
 }
+
+crate::rcu_puts!(TcpSock, rcu_puts);
 
 /// The owner of a TCP socket
 type Guard<'a> = SockGuard<'a, Inner, TcpSock>;
@@ -347,6 +401,12 @@ impl TcpSock {
                 ArcTimer::new(TcpSock::delack_timer),
                 ArcTimer::new(TcpSock::keepalive_timer),
             ],
+            eh_link: NullsLink::new(),
+            lh_link: NullsLink::new(),
+            ehkey: table::EhKey::new(),
+            bind_link: Link::new(),
+            by_bind: AtomicBool::new(false),
+            rcu_puts: RcuPuts::new(),
             me: me.clone(),
         })
     }
@@ -468,6 +528,7 @@ impl TcpSock {
             self.sk.net.clone(),
             t,
             bind,
+            self.by_bind.load(Ordering::Relaxed),
             self.inet.params(),
             self.oif(),
             g.cb.tw_clone(),
@@ -761,7 +822,12 @@ impl TcpSock {
             return;
         }
         g.tuple = Some(t);
-        self.sk.net.tcp.inherit(&c, t.lport);
+        if !self.sk.net.tcp.inherit(&c, t.lport) {
+            // No bind bucket: drop the SYN (Linux inet_csk_clone_lock
+            // failing in tcp_v4_syn_recv_sock)
+            self.sk.net.tcp.unhash(&t, &c);
+            return;
+        }
         g.bound = true;
         g.parent = Some(self.me.clone());
         if let Some(q) = self.queue.lock().as_mut() {

@@ -112,13 +112,15 @@ fn secret() -> [u64; 2] {
 }
 
 /// SipHash of `words` under the boot secret, separated by `domain`
-/// (RFC 6528 initial sequence numbers and similar keyed hashes)
+/// (RFC 6528 initial sequence numbers and similar keyed hashes; at most
+/// 7 words, hashed from the stack: callers hold spin locks)
 pub fn secure_hash(domain: u64, words: &[u64]) -> u64 {
     let k = secret();
-    let mut w = alloc::vec::Vec::with_capacity(words.len() + 1);
-    w.push(domain);
-    w.extend_from_slice(words);
-    siphash([k[0] ^ domain, k[1]], &w)
+    let mut w = [0u64; 8];
+    assert!(words.len() < w.len(), "secure_hash: too many words");
+    w[0] = domain;
+    w[1..=words.len()].copy_from_slice(words);
+    siphash([k[0] ^ domain, k[1]], &w[..=words.len()])
 }
 
 /// RFC 6056 algorithm 4 perturbation table

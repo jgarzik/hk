@@ -8,14 +8,13 @@
 //! reports without pacing. Counts Linux keeps in packets (cwnd,
 //! ssthresh, unacked) are bytes / MSS.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 
 use super::cb::{RTO_INIT, RTO_MAX, TcpCb, TcpState, Tmr};
-use super::table::Ent;
 use super::timer::now_ms;
+use crate::fs::proc::seq::{self, SeqBuf};
 
 /// tcpi_options bits
 const OPT_TIMESTAMPS: u8 = 1;
@@ -192,78 +191,140 @@ fn raw(a: crate::net::ipv4::Ipv4Addr) -> u32 {
 
 use crate::time::ms_to_clock_t as ticks;
 
-/// One line padded like Linux seq_pad (TMPSZ - 1 = 149 columns)
-fn line(out: &mut String, l: &str) {
-    let _ = writeln!(out, "{:<149}", l);
+/// One line, built on the stack (no allocation under the RCU guard)
+/// and padded like Linux seq_pad (TMPSZ - 1 = 149 columns)
+struct Line {
+    b: [u8; 192],
+    n: usize,
 }
 
-/// (timer kind, ms left) of a connection (Linux tcp4_seq_show
-/// timer_active: 1 retransmit, 4 zero-window probe, 2 keepalive /
-/// FIN_WAIT2 timer)
-fn timer(cb: &TcpCb, now: u64) -> (u8, u64) {
-    let left = |t: u64| t.saturating_sub(now);
-    match (cb.tmr, cb.keep_at.or(cb.wait_at)) {
-        (Some((Tmr::Rtx, t)), _) => (1, left(t)),
-        (Some((Tmr::Probe, t)), _) => (4, left(t)),
-        (None, Some(t)) => (2, left(t)),
-        _ => (0, 0),
+impl Line {
+    fn new() -> Self {
+        Self { b: [0; 192], n: 0 }
+    }
+
+    /// Write it to `m`, padded
+    fn put(&self, m: &mut SeqBuf) {
+        let t = core::str::from_utf8(&self.b[..self.n]).unwrap_or("");
+        let _ = writeln!(m, "{:<149}", t);
     }
 }
 
-/// A listener or connection line
-fn sock_line(out: &mut String, i: usize, s: &super::TcpSock, now: u64) {
+impl Write for Line {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.n + s.len();
+        if end > self.b.len() {
+            return Err(core::fmt::Error);
+        }
+        self.b[self.n..end].copy_from_slice(s.as_bytes());
+        self.n = end;
+        Ok(())
+    }
+}
+
+/// What /proc/net/tcp shows of a connection beyond its addresses (Linux
+/// get_tcp4_sock's READ_ONCE reads), published in the socket's `Snap`
+#[derive(Clone, Copy, Default)]
+pub(super) struct ProcView {
+    /// Linux timer_active: 1 retransmit, 4 zero-window probe, 2
+    /// keepalive / FIN_WAIT2 timer; and its deadline (ms)
+    pub tr: u8,
+    pub when: u64,
+    pub backoff: u32,
+    pub probes: u32,
+    pub rto: u64,
+    pub ato: u64,
+    /// quick << 1 | pingpong
+    pub qp: u32,
+    pub cwnd: u32,
+    /// ssthresh in packets (-1: infinite), or a listener's fastopen
+    pub last: i64,
+}
+
+impl ProcView {
+    /// `cb`'s values (under its socket lock)
+    pub fn of(cb: &TcpCb) -> Self {
+        let (tr, when) = match (cb.tmr, cb.keep_at.or(cb.wait_at)) {
+            (Some((Tmr::Rtx, t)), _) => (1, t),
+            (Some((Tmr::Probe, t)), _) => (4, t),
+            (None, Some(t)) => (2, t),
+            _ => (0, 0),
+        };
+        let ss = cb.cong.ssthresh;
+        let last = if cb.state == TcpState::Listen {
+            i64::from(cb.opts.fastopen)
+        } else if ss >= INFINITE_SSTHRESH {
+            -1
+        } else {
+            i64::from(pkts(ss, cb.mss))
+        };
+        Self {
+            tr,
+            when,
+            backoff: cb.backoff,
+            probes: cb.probes,
+            rto: cb.rto_cur(),
+            ato: cb.dack.ato,
+            qp: (cb.dack.quick << 1) | u32::from(cb.dack.pingpong),
+            cwnd: pkts(cb.cong.cwnd, cb.mss),
+            last,
+        }
+    }
+}
+
+/// A listener or connection line, from the socket's published values
+/// (no socket lock: Linux reads them with READ_ONCE)
+fn sock_line(m: &mut SeqBuf, i: usize, s: &super::TcpSock, now: u64) {
     let a = s.inet.get();
     let ino = s.sk.ino.load(Ordering::Relaxed);
     let uid = s.sk.cred.euid;
-    let g = s.lock_sock();
-    let cb = &g.cb;
-    let listen = cb.state == TcpState::Listen;
-    let rxq = if listen {
+    let state = s.state();
+    let v = s.snap.proc_view();
+    let rxq = if state == TcpState::Listen {
         s.queue.lock().as_ref().map_or(0, |q| q.ready.len())
     } else {
-        cb.rcvq_len()
+        s.snap.rcvq.load(Ordering::Acquire)
     };
-    let (tr, when) = timer(cb, now);
-    let ss = cb.cong.ssthresh;
-    let last: i64 = if listen {
-        i64::from(cb.opts.fastopen)
-    } else if ss >= INFINITE_SSTHRESH {
-        -1
+    let when = if v.tr == 0 {
+        0
     } else {
-        i64::from(pkts(ss, cb.mss))
+        v.when.saturating_sub(now)
     };
-    let l = alloc::format!(
+    let mut l = Line::new();
+    let _ = write!(
+        l,
         "{:4}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x} {} {} {} {} {}",
         i,
         raw(a.rcv_saddr),
         a.sport,
         raw(a.daddr),
         a.dport,
-        cb.state.linux(),
-        cb.sndq_len(),
+        state.linux(),
+        s.snap.sndq.load(Ordering::Acquire),
         rxq,
-        tr,
+        v.tr,
         ticks(when),
-        cb.backoff,
+        v.backoff,
         uid,
-        cb.probes,
+        v.probes,
         ino,
         1,
         0,
-        ticks(cb.rto_cur()),
-        ticks(cb.dack.ato),
-        (cb.dack.quick << 1) | u32::from(cb.dack.pingpong),
-        pkts(cb.cong.cwnd, cb.mss),
-        last
+        ticks(v.rto),
+        ticks(v.ato),
+        v.qp,
+        v.cwnd,
+        v.last
     );
-    drop(g);
-    line(out, &l);
+    l.put(m);
 }
 
 /// A TIME_WAIT line (Linux get_timewait4_sock)
-fn tw_line(out: &mut String, i: usize, tw: &super::timewait::TimeWait, now: u64) {
+fn tw_line(m: &mut SeqBuf, i: usize, tw: &super::timewait::TimeWait, now: u64) {
     let t = &tw.tuple;
-    let l = alloc::format!(
+    let mut l = Line::new();
+    let _ = write!(
+        l,
         "{:4}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x}",
         i,
         raw(t.laddr),
@@ -282,33 +343,36 @@ fn tw_line(out: &mut String, i: usize, tw: &super::timewait::TimeWait, now: u64)
         3,
         0
     );
-    line(out, &l);
+    l.put(m);
 }
 
 /// `/proc/net/tcp` of the reader's namespace: listeners, then
-/// connections and TIME_WAIT entries (each socket is owned in turn,
-/// after the table locks are dropped)
+/// connections and TIME_WAIT entries, generated under RCU into a
+/// `SeqBuf` (Linux tcp4_seq_show over the hash walk)
 pub fn proc_net_tcp() -> Vec<u8> {
-    let mut out = String::new();
-    line(
-        &mut out,
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
-    );
-    let (ls, es) = crate::net::current_net_ns().tcp.snapshot();
-    let now = now_ms();
-    let mut i = 0;
-    for s in &ls {
-        sock_line(&mut out, i, s, now);
-        i += 1;
-    }
-    for e in &es {
-        match e {
-            Ent::Sk(s) => sock_line(&mut out, i, s, now),
-            Ent::Tw(t) => tw_line(&mut out, i, t, now),
-        }
-        i += 1;
-    }
-    out.into_bytes()
+    let net = crate::net::current_net_ns();
+    seq::generate(|m| {
+        let mut l = Line::new();
+        let _ = l.write_str(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+        );
+        l.put(m);
+        let now = now_ms();
+        let i = core::cell::Cell::new(0);
+        let next = || {
+            let n = i.get();
+            i.set(n + 1);
+            n
+        };
+        let g = crate::sync::rcu::read_lock();
+        let m = core::cell::RefCell::new(m);
+        net.tcp.walk_rcu(
+            &g,
+            |s| sock_line(&mut m.borrow_mut(), next(), s, now),
+            |s| sock_line(&mut m.borrow_mut(), next(), s, now),
+            |t| tw_line(&mut m.borrow_mut(), next(), t, now),
+        );
+    })
 }
 
 #[cfg(test)]

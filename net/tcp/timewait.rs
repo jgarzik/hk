@@ -32,7 +32,10 @@ use crate::net::NetNamespace;
 use crate::net::inet::port::BindInfo;
 use crate::net::ipv4::IpParams;
 use crate::net::skb::SkBuff;
+use crate::sync::rcu::RcuPuts;
 use crate::time::timer::ArcTimer;
+use crate::util::hlist_nulls::NullsLink;
+use crate::util::list::Link;
 use alloc::boxed::Box;
 
 pub struct TimeWait {
@@ -46,8 +49,17 @@ pub struct TimeWait {
     inner: Mutex<(TwCb, Option<u64>)>,
     /// 2MSL (Linux tw_timer)
     timer: ArcTimer<TimeWait>,
+    /// Its ehash chain link and bhash owner link (Linux tw_node,
+    /// tw_bind_node), and whether its socket took the port with bind()
+    pub(super) eh_link: NullsLink,
+    pub(super) bind_link: Link,
+    pub(super) by_bind: bool,
+    /// The tables' references, dropped a grace period after unhashing
+    rcu_puts: RcuPuts,
     me: Weak<TimeWait>,
 }
+
+crate::rcu_puts!(TimeWait, rcu_puts);
 
 impl TimeWait {
     /// Entry for `cb` (already in TIME_WAIT); register with [`start`]
@@ -55,6 +67,7 @@ impl TimeWait {
         net: Arc<NetNamespace>,
         tuple: Tuple,
         bind: BindInfo,
+        by_bind: bool,
         params: IpParams,
         oif: u32,
         cb: TwCb,
@@ -67,8 +80,17 @@ impl TimeWait {
             oif,
             inner: Mutex::new((cb, None)),
             timer: ArcTimer::new(TimeWait::tw_timer),
+            eh_link: NullsLink::new(),
+            bind_link: Link::new(),
+            by_bind,
+            rcu_puts: RcuPuts::new(),
             me: me.clone(),
         })
+    }
+
+    /// Its namespace
+    pub fn net(&self) -> &Arc<NetNamespace> {
+        &self.net
     }
 
     /// Milliseconds of 2MSL left at `now` (/proc/net/tcp)
