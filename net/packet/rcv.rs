@@ -2,14 +2,16 @@
 //! tap (Linux packet_rcv via ptype_all/ptype_base), the bounded receive
 //! queue and recvmsg delivery (Linux packet_recvmsg)
 
-use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::sync::spin::{Mutex, RwLock};
+use crate::mm::page_alloc::Gfp;
+use crate::net::skb::{SkBuff, SkbCb, SkbQueue};
+use crate::sync::spin::RwLock;
+use crate::util::kalloc::try_arc_gfp;
 
 use super::{ETH_P_802_2, ETH_P_802_3, ETH_P_ALL, PacketSock, SLL_LEN, Sll, pf};
 use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
@@ -32,68 +34,71 @@ const TP_STATUS_CSUM_VALID: u32 = 0x80;
 /// Packet sockets in all namespaces (fast path: no socket, no work)
 static NSOCKS: AtomicUsize = AtomicUsize::new(0);
 
-/// A queued frame
-#[derive(Clone)]
-pub struct Frame {
-    /// What the socket receives (snapped by the filter)
-    data: Vec<u8>,
+/// What a frame queued to a packet socket keeps beside its data (Linux
+/// PACKET_SKB_CB: the sockaddr_ll and the original length)
+#[derive(Clone, Copy, Default)]
+pub struct PktCb {
     /// Length before the filter's snap (tpacket_auxdata.tp_len)
     origlen: usize,
     sll: Sll,
-    /// Offset of the network header in `data`
+    /// Offset of the network header in the data
     net_off: u16,
     loopback: bool,
-    stamp: i128,
-    drops: u32,
 }
 
-/// Bytes charged to rcvbuf per frame (data + skb overhead)
-fn truesize(len: usize) -> usize {
-    len + 512
-}
-
-/// A socket's receive queue, bounded by SO_RCVBUF
-#[derive(Default)]
+/// A socket's receive queue, bounded by SO_RCVBUF: the copied frames
+/// as skbs, each wrapped in an `Arc` (Linux skb->users) before the
+/// lock, so queueing allocates nothing and MSG_PEEK takes a reference
+/// under the lock and copies after it
 pub struct PktQueue {
-    q: Mutex<VecDeque<Frame>>,
+    q: SkbQueue,
     rmem: AtomicUsize,
 }
 
+impl Default for PktQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PktQueue {
-    /// Queue unless the receive buffer is full (Linux packet_rcv:
-    /// admit while rmem < rcvbuf); false if dropped
-    fn enqueue(&self, sk: &Sock, mut f: Frame) -> bool {
-        if self.rmem.load(Ordering::Acquire) >= sk.rcvbuf() as usize {
-            sk.drops.fetch_add(1, Ordering::Relaxed);
-            return false;
+    #[track_caller]
+    pub const fn new() -> Self {
+        Self {
+            q: SkbQueue::new(),
+            rmem: AtomicUsize::new(0),
         }
-        self.rmem
-            .fetch_add(truesize(f.data.len()), Ordering::AcqRel);
-        f.drops = sk.drops.load(Ordering::Relaxed);
-        self.q.lock().push_back(f);
+    }
+
+    /// Room for another frame (Linux packet_rcv: admit while rmem <
+    /// rcvbuf, checked before the copy is made)
+    fn has_room(&self, sk: &Sock) -> bool {
+        self.rmem.load(Ordering::Acquire) < sk.rcvbuf() as usize
+    }
+
+    /// Queue a frame
+    fn enqueue(&self, sk: &Sock, skb: Arc<SkBuff>) {
+        self.rmem.fetch_add(skb.truesize(), Ordering::AcqRel);
+        self.q.lock().push_back(skb);
         sk.data_ready();
-        true
     }
 
     fn readable(&self) -> bool {
-        !self.q.lock().is_empty()
+        !self.q.is_empty()
     }
 
-    fn dequeue(&self, peek: bool) -> Option<Frame> {
-        let mut q = self.q.lock();
+    fn dequeue(&self, peek: bool) -> Option<Arc<SkBuff>> {
         if peek {
-            return q.front().cloned();
+            return self.q.peek();
         }
-        let f = q.pop_front()?;
-        drop(q);
-        self.rmem
-            .fetch_sub(truesize(f.data.len()), Ordering::AcqRel);
-        Some(f)
+        let skb = self.q.dequeue()?;
+        self.rmem.fetch_sub(skb.truesize(), Ordering::AcqRel);
+        Some(skb)
     }
 
     /// Length of the next frame (SIOCINQ)
     pub fn inq(&self) -> usize {
-        self.q.lock().front().map_or(0, |f| f.data.len())
+        self.q.lock().front().map_or(0, SkBuff::len)
     }
 
     pub fn rmem(&self) -> usize {
@@ -102,16 +107,17 @@ impl PktQueue {
 
     /// Purge the queue, uncharging exactly what it held (a concurrent
     /// enqueue charges before it pushes, a dequeue uncharges after it
-    /// pops: zeroing the counter would let them skew it)
+    /// pops: zeroing the counter would let them skew it); the frames are
+    /// freed after the lock
     pub fn clear(&self) {
-        let q = core::mem::take(&mut *self.q.lock());
-        let n: usize = q.iter().map(|x| truesize(x.data.len())).sum();
+        let q = self.q.purge();
+        let n: usize = q.iter().map(SkBuff::truesize).sum();
         self.rmem.fetch_sub(n, Ordering::AcqRel);
     }
 
     /// Wait for a frame (Linux __skb_recv_datagram: a pending error
     /// first, EAGAIN when non-blocking or on timeout)
-    pub fn recv(&self, sk: &Sock, flags: i32) -> Result<Frame, KernelError> {
+    pub fn recv(&self, sk: &Sock, flags: i32) -> Result<Arc<SkBuff>, KernelError> {
         let mut timeo = sk.rcv_timeo(flags & MSG_DONTWAIT != 0);
         loop {
             if let Some(e) = sk.take_err() {
@@ -146,29 +152,34 @@ impl PktQueue {
 pub fn deliver(
     s: &PacketSock,
     m: &mut RecvMsg<'_>,
-    f: &Frame,
+    skb: &SkBuff,
     flags: i32,
 ) -> Result<usize, KernelError> {
-    let n = m.data.put(0, &f.data)?;
-    if n < f.data.len() {
+    let SkbCb::Pkt(cb) = skb.cb else {
+        return Err(KernelError::InvalidArgument);
+    };
+    let data = skb.data();
+    let n = m.data.put(0, data)?;
+    if n < data.len() {
         m.flags |= MSG_TRUNC;
     }
     if m.want_name {
-        m.name = Some(f.sll.bytes()[..SLL_LEN].to_vec());
+        m.name = Some(cb.sll.bytes()[..SLL_LEN].to_vec());
     }
-    crate::net::dgram::sock_cmsgs(&s.sk, m, f.stamp, f.drops);
+    crate::net::dgram::sock_cmsgs(&s.sk, m, skb.tstamp, skb.dropcount);
     if s.flag(pf::AUXDATA) {
-        m.cmsg.put(SOL_PACKET, PACKET_AUXDATA, &auxdata(f));
+        m.cmsg
+            .put(SOL_PACKET, PACKET_AUXDATA, &auxdata(&cb, data.len()));
     }
     Ok(if flags & MSG_TRUNC != 0 {
-        f.data.len()
+        data.len()
     } else {
         n
     })
 }
 
-/// struct tpacket_auxdata (20 bytes)
-fn auxdata(f: &Frame) -> [u8; 20] {
+/// struct tpacket_auxdata (20 bytes) of a frame of `snaplen` bytes
+fn auxdata(f: &PktCb, snaplen: usize) -> [u8; 20] {
     let mut status = TP_STATUS_USER;
     if f.loopback && f.sll.pkttype != PktType::Outgoing.num() {
         // Linux loopback marks received packets CHECKSUM_UNNECESSARY
@@ -177,7 +188,7 @@ fn auxdata(f: &Frame) -> [u8; 20] {
     let mut b = [0u8; 20];
     b[0..4].copy_from_slice(&status.to_ne_bytes());
     b[4..8].copy_from_slice(&(f.origlen as u32).to_ne_bytes());
-    b[8..12].copy_from_slice(&(f.data.len() as u32).to_ne_bytes());
+    b[8..12].copy_from_slice(&(snaplen as u32).to_ne_bytes());
     // tp_mac 0, tp_net, no VLAN tag
     b[14..16].copy_from_slice(&f.net_off.to_ne_bytes());
     b
@@ -282,28 +293,39 @@ impl PacketSock {
             addr: [0; 8],
         };
         sll.addr[..ETH_ALEN].copy_from_slice(&t.frame[6..12]);
-        // No memory for the copy: dropped and counted (Linux packet_rcv's
-        // failed skb_clone goes to drop_n_acct)
-        let Ok(copy) = crate::util::kmem::try_to_vec(&data[..snap]) else {
+        if !self.rxq.has_room(&self.sk) {
             self.sk.drops.fetch_add(1, Ordering::Relaxed);
             self.drops.fetch_add(1, Ordering::Relaxed);
             return;
-        };
-        let f = Frame {
-            data: copy,
+        }
+        let cb = PktCb {
             origlen: data.len(),
             sll,
             net_off: if raw { ETH_HLEN as u16 } else { 0 },
             loopback: t.dev.is_loopback(),
-            stamp: crate::time::TIMEKEEPER.current_time().to_nanos(),
-            drops: 0,
         };
-        if self.rxq.enqueue(&self.sk, f) {
-            self.packets.fetch_add(1, Ordering::Relaxed);
-        } else {
+        // No memory for the copy: dropped and counted (Linux packet_rcv's
+        // failed skb_clone(GFP_ATOMIC) goes to drop_n_acct)
+        let Some(skb) = frame_skb(&data[..snap], cb, self.sk.drops.load(Ordering::Relaxed)) else {
+            self.sk.drops.fetch_add(1, Ordering::Relaxed);
             self.drops.fetch_add(1, Ordering::Relaxed);
-        }
+            return;
+        };
+        self.rxq.enqueue(&self.sk, skb);
+        self.packets.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// A queued copy of a tapped frame's `data`, allocated GFP_ATOMIC (a
+/// receive or transmit path, possibly under a socket's lock) and
+/// wrapped in its `Arc` before any queue lock
+fn frame_skb(data: &[u8], cb: PktCb, drops: u32) -> Option<Arc<SkBuff>> {
+    let mut skb = SkBuff::alloc(0, data.len(), Gfp::ATOMIC)?;
+    skb.put_slice(data)?;
+    skb.cb = SkbCb::Pkt(cb);
+    skb.tstamp = crate::net::dgram::now();
+    skb.dropcount = drops;
+    try_arc_gfp(*skb, Gfp::ATOMIC).ok()
 }
 
 /// The ptype_all tap: give every matching packet socket of the device's

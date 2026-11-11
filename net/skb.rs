@@ -121,6 +121,8 @@ pub enum SkbCb {
     /// An extended error on a socket's error queue (Linux
     /// SKB_EXT_ERR / sock_exterr_skb)
     Exterr(crate::net::sock::ExtErr),
+    /// A frame queued to a packet socket (Linux PACKET_SKB_CB)
+    Pkt(crate::net::packet::PktCb),
 }
 
 /// [`SkbCb::Inet`]

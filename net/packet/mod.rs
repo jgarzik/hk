@@ -23,7 +23,8 @@
 //! `PacketTable.socks` (`crate::sync::spin::RwLock`, per namespace, leaf): delivery
 //! clones the matching `Arc`s and queues after dropping it. Per socket:
 //! `bind` is one atomic word, changed only by compare-exchange (bind,
-//! device unregister); `rxq` (`crate::sync::spin::Mutex` leaf) and `filter`
+//! device unregister); `rxq` (an `SkbQueue`, spin leaf: frames are
+//! copied into skbs GFP_ATOMIC before it, freed after it) and `filter`
 //! (`crate::sync::spin::RwLock` leaf, the `Arc` is cloned out before running it).
 //! `mclist` (sleeping `crate::sync::Mutex` leaf; Linux keeps po->mclist
 //! under RTNL) is changed under RTNL, which device promiscuity changes
@@ -53,7 +54,7 @@ use crate::net::socket::{
 };
 use crate::util::error::KernelError;
 
-pub use rcv::{PacketTable, proc_net_packet, tap};
+pub use rcv::{PacketTable, PktCb, proc_net_packet, tap};
 
 /// All protocols (ETH_P_ALL, host order)
 pub const ETH_P_ALL: u16 = 0x0003;
