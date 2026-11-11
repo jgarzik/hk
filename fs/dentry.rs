@@ -648,9 +648,10 @@ pub fn d_drop_tree(d: &Arc<Dentry>) {
         ci.flags.unhashed = true;
         drop(ci);
         drop(p);
-        if ours.is_none() {
-            return;
-        }
+        // A leaf another remover took out first (the shrinker, a move)
+        // is not ours to drop: look again from the top, so no child is
+        // left holding the subtree
+        drop(ours);
     }
 }
 
