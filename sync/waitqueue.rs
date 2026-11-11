@@ -267,6 +267,14 @@ impl WaitQueue {
         self.link(&mut list, w, 0);
     }
 
+    /// Register `w` until a wakeup its function accepts: the waker then
+    /// unlinks it (Linux: a wake function that removes its own entry,
+    /// unix_dgram_peer_wake_relay)
+    pub fn add_wait_queue_once(&self, w: Pin<&WaitEntry>) {
+        let mut list = self.head.lock();
+        self.link(&mut list, w, WQ_AUTOREMOVE);
+    }
+
     /// Unlink `w` if it is on this queue (Linux remove_wait_queue)
     pub fn remove_wait_queue(&self, w: Pin<&WaitEntry>) {
         let mut list = self.head.lock();

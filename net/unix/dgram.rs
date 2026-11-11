@@ -24,6 +24,8 @@ use crate::io::poll::{
 use crate::net::msg::{MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, RecvMsg, SendMsg};
 use crate::net::sock::SHUTDOWN_MASK;
 use crate::net::socket::{AF_UNSPEC, SOCK_SEQPACKET};
+use crate::sync::waitqueue::WaitEntry;
+use crate::task::percpu::WakeMode;
 use crate::util::error::KernelError;
 
 use super::scm::{Creds, FpList, Scm, too_many_fds};
@@ -177,7 +179,10 @@ pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, K
                 }
             }
             Tx::Full => {
-                if !is(&s.peer(), &other) || peer_wake_me(s, &other) {
+                // Under our state lock, so the peer stays our peer
+                // (Linux: under unix_state_double_lock)
+                let st = s.st.lock();
+                if !is(&st, &other) || peer_wake_me(s, &other) {
                     return Err(KernelError::WouldBlock);
                 }
             }
@@ -374,30 +379,47 @@ fn deliver(
     Ok(if flags & MSG_TRUNC != 0 { n } else { size })
 }
 
-/// Linux unix_dgram_peer_wake_connect: register `s` once on `other`'s
-/// relay list; true if this call registered it
-fn peer_wake_connect(s: &UnixSock, other: &UnixSock) -> bool {
-    let mut r = other.relay.lock();
-    if s.peer_wake.load(Ordering::Acquire) != 0 {
-        return false;
-    }
-    s.peer_wake.store(other.id(), Ordering::Release);
-    r.push(s.me.clone());
+/// A wakeup on the peer's `peer_wait` reached our `peer_wake` entry
+/// (Linux unix_dgram_peer_wake_relay): under that queue's lock, which
+/// unlinks the entry (it returns true); wake our pollers
+pub fn peer_wake_relay(e: &WaitEntry, _mode: WakeMode, key: usize) -> bool {
+    // SAFETY: `private` is the socket embedding `e` (UnixSock::new),
+    // alive while its entry is linked: its drop unlinks it first under
+    // this queue's lock, which the waker holds
+    let u = unsafe { &*(e.private as *const UnixSock) };
+    u.peer_wake_to.store(0, Ordering::Release);
+    u.sk.wq.wake_poll(key as u32);
     true
 }
 
-/// Linux unix_dgram_peer_wake_disconnect
+/// Linux unix_dgram_peer_wake_connect: link our `peer_wake` once on
+/// `other`'s `peer_wait`; true if this call linked it. The caller holds
+/// our `st` with `other` as our peer.
+fn peer_wake_connect(s: &UnixSock, other: &UnixSock) -> bool {
+    let _r = other.relay.lock();
+    if s.peer_wake_to.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    s.peer_wake_to.store(other.id(), Ordering::Release);
+    // INVARIANT: linked on our peer's queue
+    other.peer_wait.add_wait_queue_once(s.peer_wake());
+    true
+}
+
+/// Linux unix_dgram_peer_wake_disconnect: off `other`'s `peer_wait`
+/// (called before our reference to the old peer goes)
 pub fn peer_wake_disconnect(s: &UnixSock, other: &UnixSock) {
-    let mut r = other.relay.lock();
-    if s.peer_wake.load(Ordering::Acquire) == other.id() {
-        r.retain(|w| !core::ptr::eq(w.as_ptr(), s));
-        s.peer_wake.store(0, Ordering::Release);
+    let _r = other.relay.lock();
+    if s.peer_wake_to.load(Ordering::Acquire) == other.id() {
+        other.peer_wait.remove_wait_queue(s.peer_wake());
+        s.peer_wake_to.store(0, Ordering::Release);
     }
 }
 
 /// Linux unix_dgram_peer_wake_me: true (stay unwritable, registered)
 /// while `other`'s queue is full and it is alive; a dead receiver must
-/// look writable so the next write reports ECONNREFUSED
+/// look writable so the next write reports ECONNREFUSED. The caller
+/// holds our `st` with `other` as our peer.
 fn peer_wake_me(s: &UnixSock, other: &UnixSock) -> bool {
     let connected = peer_wake_connect(s, other);
     if other.recvq_full() && !other.is_dead() {
@@ -434,9 +456,13 @@ pub fn poll(s: &UnixSock) -> u16 {
         && let Some(other) = s.peer()
         && !is(&other.peer(), s)
         && other.recvq_full()
-        && peer_wake_me(s, &other)
     {
-        writable = false;
+        // Under our state lock, so `other` stays our peer while our
+        // entry is linked on it (Linux unix_dgram_poll)
+        let st = s.st.lock();
+        if is(&st, &other) && peer_wake_me(s, &other) {
+            writable = false;
+        }
     }
     if writable {
         mask |= POLLOUT | POLLWRNORM | POLLWRBAND;

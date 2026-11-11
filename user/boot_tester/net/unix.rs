@@ -5,12 +5,13 @@
 //! EPIPE/SIGPIPE, poll states, /proc/net/unix.
 
 use hk_syscall::{
-    AF_UNIX, FIONREAD, IoVec, MsgHdr, O_RDONLY, SHUT_RD, SHUT_WR, SIG_DFL, SIG_IGN, SIGPIPE,
-    SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, Stat, sys_accept, sys_bind, sys_chmod,
-    sys_connect, sys_exit, sys_fcntl, sys_fork, sys_getpeername, sys_getpid, sys_getsockname,
-    sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe, sys_read, sys_recvfrom, sys_rt_sigaction,
-    sys_sendmsg, sys_sendto, sys_setresgid, sys_setresuid, sys_shutdown, sys_socket,
-    sys_socketpair, sys_stat, sys_umask, sys_unlink, sys_wait4, sys_write,
+    AF_UNIX, EPOLL_CTL_ADD, EPOLLET, EPOLLOUT, EpollEvent, FIONREAD, IoVec, MsgHdr, O_RDONLY,
+    SHUT_RD, SHUT_WR, SIG_DFL, SIG_IGN, SIGPIPE, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK,
+    SOCK_STREAM, Stat, sys_accept, sys_bind, sys_chmod, sys_connect, sys_epoll_create1,
+    sys_epoll_ctl, sys_epoll_wait, sys_exit, sys_fcntl, sys_fork, sys_getpeername, sys_getpid,
+    sys_getsockname, sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe, sys_read, sys_recvfrom,
+    sys_rt_sigaction, sys_sendmsg, sys_sendto, sys_setresgid, sys_setresuid, sys_shutdown,
+    sys_socket, sys_socketpair, sys_stat, sys_umask, sys_unlink, sys_wait4, sys_write,
 };
 
 use crate::harness::T;
@@ -58,6 +59,7 @@ pub fn run_tests() {
     test_sndbuf();
     test_dgram();
     test_dgram_queue();
+    test_dgram_peer_wake();
     test_seqpacket();
     test_epipe();
     test_reset();
@@ -1010,6 +1012,50 @@ fn test_dgram_queue() {
 
 /// SOCK_SEQPACKET: boundaries, truncation, EOF and EPIPE after close,
 /// ENOTCONN unconnected
+/// A datagram sender's epoll waiter is woken (EPOLLOUT) when its
+/// peer's reader makes room; after it reconnects elsewhere, the old
+/// peer's reads and close do not touch it, and it is writable
+fn test_dgram_peer_wake() {
+    let mut t = T::new(b"UNIX_DGRAM_PEER_WAKE");
+    let srv = ux(SOCK_DGRAM);
+    ubind(srv, &sun_abs(b"hk-ux-pw1"));
+    let srv2 = ux(SOCK_DGRAM);
+    ubind(srv2, &sun_abs(b"hk-ux-pw2"));
+    let c = ux(SOCK_DGRAM);
+    uconnect(c, &sun_abs(b"hk-ux-pw1"));
+    while send(c, b"m", MSG_DONTWAIT) == 1 {}
+    let ep = sys_epoll_create1(0) as i32;
+    let e = EpollEvent::new(EPOLLOUT | EPOLLET, 7);
+    t.eq(b"epoll add", sys_epoll_ctl(ep, EPOLL_CTL_ADD, c, &e), 0);
+    let mut out = [EpollEvent::empty(); 1];
+    t.eq(
+        b"not writable",
+        sys_epoll_wait(ep, out.as_mut_ptr(), 1, 0),
+        0,
+    );
+    let pid = sys_fork();
+    if pid == 0 {
+        msleep(100);
+        let mut buf = [0u8; 4];
+        recv(srv, &mut buf, 0);
+        sys_exit(0);
+    }
+    t.eq(b"woken", sys_epoll_wait(ep, out.as_mut_ptr(), 1, 5000), 1);
+    wait_status(pid);
+    while send(c, b"m", MSG_DONTWAIT) == 1 {}
+    t.eq(b"full", poll1(c, POLLOUT, 0).0, 0);
+    t.eq(b"reconnect", uconnect(c, &sun_abs(b"hk-ux-pw2")), 0);
+    let mut buf = [0u8; 4];
+    recv(srv, &mut buf, MSG_DONTWAIT);
+    close(srv);
+    t.eq(b"writable", poll1(c, POLLOUT, 0).0, 1);
+    t.eq(b"send", send(c, b"n", MSG_DONTWAIT), 1);
+    for f in [ep, srv2, c] {
+        close(f);
+    }
+    t.done();
+}
+
 fn test_seqpacket() {
     let mut t = T::new(b"UNIX_SEQPACKET");
     let a = sun_abs(b"hk-ux-seq");

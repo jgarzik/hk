@@ -44,7 +44,13 @@
 //!   `bindlock`; `addr` (`crate::sync::spin::RwLock` leaf) is set under them, so a
 //!   name found in a table always has its address. Lookups return
 //!   `Arc`s; no socket lock is taken under a table lock.
-//! - `relay` (`crate::sync::spin::Mutex` leaf; Linux peer_wait.lock for peer_wake),
+//! - `relay` (`crate::sync::spin::Mutex`; Linux peer_wait.lock for
+//!   peer_wake registrations) -> `peer_wait`'s head: a datagram poller
+//!   (or sender) that finds its peer's queue full links its own
+//!   `peer_wake` entry there, under its own `st` (the peer stays its
+//!   peer); the peer's reader wakes `peer_wait`, whose relay callback
+//!   unlinks the entry and wakes the poller's `Sock.wq` (head -> head,
+//!   never the reverse). Nothing is allocated.
 //!   `peercred` (leaf, Linux sk_peer_lock).
 //! - Wakeups (`Sock.wq`, `peer_wait`) happen after unlocking; queued
 //!   messages and their files are always dropped with no lock held.
@@ -66,6 +72,7 @@ use crate::sync::spin::{Mutex, MutexGuard, RwLock};
 
 use crate::fs::Dentry;
 use crate::io::fasync::{POLL_HUP, POLL_IN};
+use crate::io::poll::{POLLOUT, POLLWRBAND, POLLWRNORM};
 use crate::net::NetNamespace;
 use crate::net::msg::{RecvMsg, SendMsg};
 use crate::net::skb::{SkBuff, SkbCb, SkbOwned, SkbOwnedQueue};
@@ -75,9 +82,10 @@ use crate::net::socket::{
     SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
 };
 use crate::sync::Mutex as SMutex;
-use crate::sync::waitqueue::WaitQueue;
+use crate::sync::waitqueue::{WaitEntry, WaitQueue};
 use crate::util::error::KernelError;
 use crate::util::list::OwnedList;
+use core::pin::Pin;
 
 use scm::{Creds, FpList};
 
@@ -229,7 +237,17 @@ fn peek_fds(skb: &SkBuff) -> Option<FpList> {
 }
 
 /// An AF_UNIX socket (Linux struct unix_sock)
+///
+/// # Invariants
+/// Lives only in the `Arc` `new` makes (never moved), so `peer_wake`
+/// is pinned. `peer_wake` is linked only on the `peer_wait` of the
+/// socket `peer_wake_to` names, which is our peer while it is linked
+/// (we hold it through `st`), and it is the first field: its drop
+/// unlinks it before anything else of ours (or our peer) goes.
 pub struct UnixSock {
+    /// Our entry on the peer's `peer_wait` while a poller waits for
+    /// room in its queue (Linux unix_sock.peer_wake)
+    peer_wake: WaitEntry,
     pub sk: Sock,
     me: Weak<UnixSock>,
     /// unix_state_lock: the peer (Linux unix_peer)
@@ -248,12 +266,13 @@ pub struct UnixSock {
     /// Writers waiting for room in our queue, connectors waiting for
     /// the backlog (Linux peer_wait)
     peer_wait: WaitQueue,
-    /// Sockets whose pollers wait for room in our queue (Linux
-    /// peer_wake entries on peer_wait): woken once, then dropped
-    relay: Mutex<Vec<Weak<UnixSock>>>,
-    /// Address of the socket whose `relay` holds us (0 = none),
-    /// changed under that socket's `relay`
-    peer_wake: AtomicUsize,
+    /// Serializes peer_wake registrations on our `peer_wait` (Linux
+    /// takes peer_wait.lock for them)
+    relay: Mutex<()>,
+    /// Address of the socket whose `peer_wait` has our `peer_wake`
+    /// (0 = none; Linux peer_wake.private): set under that socket's
+    /// `relay`, cleared under it or by the relay wakeup
+    peer_wake_to: AtomicUsize,
     /// Bytes charged for our messages not yet consumed (sk_wmem_alloc)
     wmem: AtomicUsize,
     /// Released (Linux SOCK_DEAD), set under `st`
@@ -341,6 +360,7 @@ impl UnixSock {
     fn new(net: Arc<NetNamespace>, stype: i32) -> Result<Arc<Self>, KernelError> {
         let qlen = net.sysctl.unix_max_dgram_qlen.load(Ordering::Relaxed) as u32;
         let s = try_arc_cyclic(|me| Self {
+            peer_wake: WaitEntry::with_func(Some(dgram::peer_wake_relay), me.as_ptr() as usize),
             sk: Sock::new(net, AF_UNIX, stype, 0),
             me: me.clone(),
             st: Mutex::new(None),
@@ -351,8 +371,8 @@ impl UnixSock {
             iolock: SMutex::new(()),
             bindlock: SMutex::new(()),
             peer_wait: WaitQueue::new(),
-            relay: Mutex::new(Vec::new()),
-            peer_wake: AtomicUsize::new(0),
+            relay: Mutex::new(()),
+            peer_wake_to: AtomicUsize::new(0),
             wmem: AtomicUsize::new(0),
             dead: AtomicBool::new(false),
             backlog: AtomicU32::new(qlen),
@@ -625,20 +645,19 @@ impl UnixSock {
 
     // --- wakeups -----------------------------------------------------------
 
-    /// Room was made in our queue: wake blocked writers and relay to
-    /// pollers (Linux wake_up on peer_wait + unix_dgram_peer_wake_relay)
+    /// Room was made in our queue: wake blocked writers and, through
+    /// their `peer_wake` entries, pollers of senders waiting for room
+    /// (Linux wake_up_interruptible_sync_poll on peer_wait, relayed by
+    /// unix_dgram_peer_wake_relay)
     fn relay_wake(&self) {
-        self.peer_wait.wake_all();
-        let waiters = {
-            let mut r = self.relay.lock();
-            for w in r.iter().filter_map(|w| w.upgrade()) {
-                w.peer_wake.store(0, Ordering::Release);
-            }
-            core::mem::take(&mut *r)
-        };
-        for w in waiters.iter().filter_map(|w| w.upgrade()) {
-            w.sk.write_space();
-        }
+        self.peer_wait
+            .wake_poll(u32::from(POLLOUT | POLLWRNORM | POLLWRBAND));
+    }
+
+    /// Our `peer_wake`, pinned
+    fn peer_wake(&self) -> Pin<&WaitEntry> {
+        // SAFETY: never moved out of its Arc (type invariant)
+        unsafe { Pin::new_unchecked(&self.peer_wake) }
     }
 
     // --- options -----------------------------------------------------------
