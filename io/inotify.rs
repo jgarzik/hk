@@ -426,30 +426,11 @@ struct Mark {
     wd: i32,
 }
 
-/// Push `x` onto the vector under `m`, growing it with the lock released
-/// (nothing allocates under a spin lock): ENOMEM if it cannot grow
-fn push_grow<T>(m: &Mutex<Vec<T>>, x: T) -> Result<(), KernelError> {
-    push_if(m, |v| v.push(x))
-}
-
-/// Under `m`, with room for one more item: `f` pushes it, or not;
-/// the vector grows with the lock released first if it is full
-/// (`kmem::spare`): ENOMEM if it cannot
+/// Under `m`, with room for one more item: `f` pushes it, or not; the
+/// vector grows with the lock released first if it is full
+/// (`kmem::grow_locked`): ENOMEM if it cannot
 fn push_if<T>(m: &Mutex<Vec<T>>, f: impl FnOnce(&mut Vec<T>)) -> Result<(), KernelError> {
-    loop {
-        let cap = {
-            let mut v = m.lock();
-            if v.len() < v.capacity() {
-                f(&mut v);
-                return Ok(());
-            }
-            v.capacity()
-        };
-        let bigger = crate::util::kmem::spare(cap)?;
-        let old = crate::util::kmem::adopt(&mut m.lock(), bigger);
-        // The old (or unused) buffer is freed with the lock released
-        drop(old);
-    }
+    crate::util::kmem::grow_locked(|| m.lock(), |v| &mut **v, |mut v| f(&mut v))
 }
 
 /// The watches on an inode (Linux inode->i_fsnotify_marks): `list` a
@@ -714,7 +695,7 @@ impl Inotify {
             group: Arc::downgrade(self),
             wd,
         };
-        if let Err(e) = push_grow(&inode.fsnotify.list, mark) {
+        if let Err(e) = push_if(&inode.fsnotify.list, |v| v.push(mark)) {
             return undo(e);
         }
         let watch = InotifyWatch {
@@ -740,18 +721,7 @@ impl Inotify {
     /// Room for one more watch, made with the group's lock released
     /// (Linux idr_preload); under `mark_mutex`, so it stays for this add
     fn watch_preload(&self) -> Result<(), KernelError> {
-        let cap = {
-            let inner = self.inner.lock();
-            if inner.watches.len() < inner.watches.capacity() {
-                return Ok(());
-            }
-            inner.watches.capacity()
-        };
-        let bigger = crate::util::kmem::spare(cap)?;
-        let old = crate::util::kmem::adopt(&mut self.inner.lock().watches, bigger);
-        // The old buffer is freed with the lock released
-        drop(old);
-        Ok(())
+        crate::util::kmem::grow_locked(|| self.inner.lock(), |i| &mut i.watches, drop)
     }
 
     /// Watch `wd` on `inode` gets `mask` (if it asks for it, or it is

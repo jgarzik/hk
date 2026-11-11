@@ -995,14 +995,10 @@ Tag = roadmap phase (doc/ROADMAP.md).
    its port in bhash (`TcpSock::assert_owner`). On failure the test
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
-10. **Grow-outside-the-lock helper copied three times** (A1).
-   `io/inotify.rs` `push_if`/`push_grow`, `io/epoll.rs` `f_ep_add`,
-   `Inotify::watch_preload`: one `kmem` helper over `kmem::spare` and
-   `adopt`.
-11. **fanotify event queue duplicates inotify's** (A1). `io/fanotify.rs`
+10. **fanotify event queue duplicates inotify's** (A1). `io/fanotify.rs`
    `FanotifyInner` (EvNode, overflow position, push/pop): one generic
    queue; `queue_event` has no caller yet (fanotify delivers nothing).
-12. **Drop paths lock what `&mut self` owns** (A1). `ns/net.rs`
+11. **Drop paths lock what `&mut self` owns** (A1). `ns/net.rs`
    `NetNamespace::drop` snapshots its devices (RCU, `ends`, a Vec),
    `io/epoll.rs` `Eventpoll::drop` takes `mtx` and `lock`: walk the
    list directly, `get_mut`.

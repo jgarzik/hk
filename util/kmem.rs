@@ -95,6 +95,33 @@ pub fn adopt<T>(v: &mut Vec<T>, mut bigger: Vec<T>) -> Vec<T> {
     bigger
 }
 
+/// Run `f` on what `lock` guards with room for one more item in the
+/// vector `vec` picks out of it: a full vector grows first with the
+/// lock released, a buffer twice its size made by [`spare`] and taken
+/// over under the lock by [`adopt`], the old one freed after it.
+/// Nothing allocates under the lock (Linux allocates before taking it:
+/// idr_preload, alloc_ucounts). `f` gets the guard, and may return it
+/// to go on under the lock; ENOMEM
+pub fn grow_locked<G, T, R>(
+    lock: impl Fn() -> G,
+    vec: impl Fn(&mut G) -> &mut Vec<T>,
+    f: impl FnOnce(G) -> R,
+) -> Result<R, KernelError> {
+    loop {
+        let cap = {
+            let mut g = lock();
+            let v = vec(&mut g);
+            if v.len() < v.capacity() {
+                return Ok(f(g));
+            }
+            v.capacity()
+        };
+        let bigger = spare(cap)?;
+        let old = adopt(vec(&mut lock()), bigger);
+        drop(old);
+    }
+}
+
 /// A `Vec` whose every growth is fallible (ENOMEM, capped at
 /// [`MAX_KMALLOC`]): hand an untrusted length to one of these and the
 /// worst case is an error, not a kernel panic.

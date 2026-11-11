@@ -576,9 +576,10 @@ pub struct File {
     /// at most once, by `FileOps::open`
     pub private: spin::Once<Arc<dyn core::any::Any + Send + Sync>>,
 
-    /// The epoll items watching this file (Linux f_ep), removed at its
-    /// last close (spin leaf)
-    pub f_ep: Mutex<alloc::vec::Vec<alloc::sync::Weak<crate::io::epoll::EpItem>>>,
+    /// The epoll items watching this file (Linux f_ep), linked through
+    /// their `fllink` (no allocation), removed at its last close (spin
+    /// leaf)
+    pub f_ep: Mutex<crate::util::list::ArcList<crate::io::epoll::FlAdapter>>,
 
     /// The writeback errors of its mapping and filesystem it has seen
     /// (Linux f_wb_err, f_sb_err): sampled at open, advanced by fsync
@@ -645,7 +646,7 @@ impl File {
             mnt,
             pos: AtomicU64::new(0),
             f_pos_lock: sync::Mutex::new(()),
-            f_ep: Mutex::new(alloc::vec::Vec::new()),
+            f_ep: Mutex::new(crate::util::list::ArcList::new()),
             f_lock: Mutex::new(flags),
             f_iocb: AtomicU32::new(RwFlags::from_file(flags).bits()),
             can_odirect: false,

@@ -34,7 +34,9 @@
 //!   and the owners of their queues; registering and unregistering take
 //!   the file's queue locks under it (queue lock -> `Eventpoll.lock` in
 //!   the callback; never the reverse).
-//! - `File.f_ep` (spin leaf): the items watching the file.
+//! - `File.f_ep` (spin leaf): the items watching the file, linked
+//!   through `EpItem.fllink` (Linux file->f_ep through epi->fllink
+//!   under file->f_lock): no allocation.
 //! - `EPNESTED` (sleeping): the loop check and insert of an epoll target
 //!   (Linux epnested_mutex), with no spin lock held.
 
@@ -160,6 +162,9 @@ impl EpRegs {
 pub struct EpItem {
     /// On the ready list (under `Eventpoll.lock`)
     rdlink: Link,
+    /// On its file's `f_ep` (under `File.f_ep`; Linux epi->fllink), which
+    /// holds a reference until the item is removed
+    fllink: Link,
     fd: Fd,
     /// The file: no reference (its last close removes the item)
     file: Weak<File>,
@@ -182,6 +187,7 @@ unsafe impl Send for EpItem {}
 unsafe impl Sync for EpItem {}
 
 crate::adapter!(RdAdapter, EpItem, rdlink);
+crate::adapter!(pub FlAdapter, EpItem, fllink);
 
 impl EpItem {
     /// The ready events of its file, without registering
@@ -329,6 +335,7 @@ impl Eventpoll {
         }
         let item = try_arc_cyclic(|w: &Weak<EpItem>| EpItem {
             rdlink: Link::new(),
+            fllink: Link::new(),
             fd,
             file: FileRef::downgrade(file),
             ep_raw: Arc::as_ptr(self),
@@ -343,10 +350,7 @@ impl Eventpoll {
             }),
         })?;
         items.insert(k, item.clone());
-        if let Err(e) = f_ep_add(file, &item) {
-            items.remove(&k);
-            return Err(e);
-        }
+        file.f_ep.lock().push_back(item.clone());
         // Register the callbacks (Linux ep_item_poll with the queue
         // proc), under `mtx` as Linux: the file's poll may sleep, so its
         // entries are made in a local list and swapped into the item
@@ -419,11 +423,9 @@ impl Eventpoll {
     fn delete(&self, items: &mut EpItems, fd: Fd, file: &FileRef) -> Result<(), KernelError> {
         let k = key(file, fd);
         let item = items.get(&k).cloned().ok_or(KernelError::NotFound)?;
-        file.f_ep
-            .lock()
-            .retain(|w| !core::ptr::eq(w.as_ptr(), Arc::as_ptr(&item)));
+        let off = f_ep_del(file, &item);
         let gone = self.remove(items, k, &item);
-        drop(gone);
+        drop((off, gone));
         Ok(())
     }
 
@@ -553,23 +555,13 @@ impl Eventpoll {
     }
 }
 
-/// Put `item` on `file`'s watchers (Linux f_ep), the vector growing
-/// with its lock released (nothing allocates under it): ENOMEM
-fn f_ep_add(file: &File, item: &Arc<EpItem>) -> Result<(), KernelError> {
-    let w = Arc::downgrade(item);
-    loop {
-        let cap = {
-            let mut v = file.f_ep.lock();
-            if v.len() < v.capacity() {
-                v.push(w);
-                return Ok(());
-            }
-            v.capacity()
-        };
-        let bigger = crate::util::kmem::spare(cap)?;
-        let old = crate::util::kmem::adopt(&mut file.f_ep.lock(), bigger);
-        drop(old);
-    }
+/// Take `item` off `file`'s watchers if it is still there (Linux
+/// hlist_del_rcu of epi->fllink under file->f_lock); the list's
+/// reference comes back to drop after the lock
+fn f_ep_del(file: &File, item: &EpItem) -> Option<Arc<EpItem>> {
+    let mut l = file.f_ep.lock();
+    // SAFETY: an item's `fllink` is only ever on its own file's `f_ep`
+    item.fllink.is_linked().then(|| unsafe { l.remove(item) })
 }
 
 impl Drop for Eventpoll {
@@ -581,9 +573,8 @@ impl Drop for Eventpoll {
         for item in items.values() {
             item.unregister();
             if let Some(f) = item.file.upgrade() {
-                f.f_ep
-                    .lock()
-                    .retain(|w| !core::ptr::eq(w.as_ptr(), Arc::as_ptr(item)));
+                let off = f_ep_del(&f, item);
+                drop(off);
             }
         }
         let ready = core::mem::replace(&mut *self.lock.lock(), ArcList::new());
@@ -599,10 +590,11 @@ impl Drop for Eventpoll {
 /// `FileRef::try_get` never holds the file's last `Arc` (this release
 /// keeps one until it is done)
 pub fn eventpoll_release(file: &File) {
-    let items = core::mem::take(&mut *file.f_ep.lock());
-    for w in items {
-        let Some(item) = w.upgrade() else {
-            continue;
+    // One at a time under `f_ep`: an epoll's drop takes its items off
+    // concurrently
+    loop {
+        let Some(item) = file.f_ep.lock().pop_front() else {
+            break;
         };
         let Some(ep) = item.ep.upgrade() else {
             // The epoll is being freed: its drop unregisters the item
@@ -649,38 +641,48 @@ fn down_depth(
     d
 }
 
+/// The epolls watching `file`: sized with `f_ep` released, then filled
+/// under it without allocating. Under `EPNESTED`, so none is added in
+/// between (only an epoll target's insert adds one); ENOMEM
+fn watchers(file: &File) -> Result<Vec<Arc<Eventpoll>>, KernelError> {
+    let n = file.f_ep.lock().len();
+    let mut v = crate::util::kmem::KVec::try_with_capacity(n)?.into_vec();
+    let l = file.f_ep.lock();
+    for ep in l.iter().filter_map(|it| it.ep.upgrade()) {
+        if v.len() == v.capacity() {
+            break;
+        }
+        v.push(ep);
+    }
+    drop(l);
+    Ok(v)
+}
+
 /// How many epoll levels watch `ep` from above (Linux
 /// ep_get_upwards_depth_proc); bounded, as every insert checked it
-fn up_depth(ep: &Eventpoll, seen: &mut Seen) -> u32 {
+fn up_depth(ep: &Eventpoll, seen: &mut Seen) -> Result<u32, KernelError> {
     let k = core::ptr::from_ref::<Eventpoll>(ep) as usize;
     if let Some(&Some(d)) = seen.get(&k) {
-        return d;
+        return Ok(d);
     }
     let Some(file) = ep.file.get().and_then(Weak::upgrade) else {
-        return 0;
+        return Ok(0);
     };
-    let watchers: Vec<Arc<Eventpoll>> = file
-        .f_ep
-        .lock()
-        .iter()
-        .filter_map(|w| w.upgrade().and_then(|it| it.ep.upgrade()))
-        .collect();
-    let d = watchers
-        .iter()
-        .map(|w| up_depth(w, seen) + 1)
-        .max()
-        .unwrap_or(0);
+    let mut d = 0;
+    for w in watchers(&file)? {
+        d = d.max(up_depth(&w, seen)? + 1);
+    }
     seen.insert(k, Some(d));
-    d
+    Ok(d)
 }
 
 /// Whether watching `target` from `ep` would make a cycle or a chain
-/// deeper than EP_MAX_NESTS (Linux ep_loop_check)
-fn ep_loop_check(ep: &Arc<Eventpoll>, target: &Arc<Eventpoll>) -> bool {
-    match down_depth(target, ep, 0, &mut Seen::new()) {
+/// deeper than EP_MAX_NESTS (Linux ep_loop_check); ENOMEM
+fn ep_loop_check(ep: &Arc<Eventpoll>, target: &Arc<Eventpoll>) -> Result<bool, KernelError> {
+    Ok(match down_depth(target, ep, 0, &mut Seen::new()) {
         None => true,
-        Some(d) => d > EP_MAX_NESTS || d + 1 + up_depth(ep, &mut Seen::new()) > EP_MAX_NESTS,
-    }
+        Some(d) => d > EP_MAX_NESTS || d + 1 + up_depth(ep, &mut Seen::new())? > EP_MAX_NESTS,
+    })
 }
 
 // ============================================================================
@@ -800,7 +802,7 @@ pub fn sys_epoll_ctl(
     let _nest = match &target_ep {
         Some(t) if op == EPOLL_CTL_ADD => {
             let g = EPNESTED.lock();
-            if ep_loop_check(&ep, t) {
+            if ep_loop_check(&ep, t)? {
                 return Err(KernelError::TooManySymlinks);
             }
             Some(g)
