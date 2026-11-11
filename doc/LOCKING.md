@@ -1712,8 +1712,10 @@ pub struct Zone {
   zap's free_swap_and_cache, swap-in's swap_free), never with a swap
   cache lock held.
 - `SwapInfo.cache` (`IrqSpinlock<XArray>`, Linux i_pages xa_lock_irq):
-  the swap cache of a device, page by slot. A leaf: under it only the
-  allocators (a page, a heap index node; atomic, never sleeping). A lookup takes its page
+  the swap cache of a device, page by slot. A leaf: nothing allocates
+  under it (an insert missing an index node drops it, preloads and
+  retries: `xarray::store_nomem`, Linux xas_nomem, as the page cache
+  does; swapoff's drop walks it one slot per hold). A lookup takes its page
   reference under it (get_page_unless_zero); reclaim deletes a page
   from it by freezing its count (expected -> 0) under it, so no lookup
   revives a page being freed. Slot counts change after it is dropped.
