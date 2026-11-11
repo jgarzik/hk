@@ -489,8 +489,8 @@ Global subsystem locks (TASKLIST, fd table `Files`)  ← NOT IRQ-safe;
     (IrqSpinlock); SignalStruct.rlim (IrqSpinlock leaf;
     setrlimit/prlimit64 read the old limit, decide (with the
     lock-free capable()) and store in one hold, as Linux do_prlimit
-    under task_lock); UCOUNTS;
-    wait queue heads
+    under task_lock); UCOUNTS (IrqSpinlock leaf, 3.1.1 Per-user
+    counts); wait queue heads
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
     copy may fault) → page lock (PG_locked, sleeping; Linux folio_lock)
@@ -1227,7 +1227,7 @@ for the task, TASKLIST for others.
    release may sleep in SO_LINGER: sleeping under a spin lock) or tear
    down a network namespace (RTNL, a sleeping lock). `Arc<Cred>` is the
    exception: replacing it under the lock (commit_creds) frees only
-   memory.
+   memory and at most takes the `UCOUNTS` leaf.
 5. **PF_EXITING** - `exit_current` sets `pf::EXITING` in `Task.flags`
    before releasing anything; release paths read
    it lock-free via `current_exiting()` (TCP close skips its SO_LINGER
@@ -1250,11 +1250,32 @@ Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
    until the guard drops (revert_creds); others keep reading
    `Task.cred`. io-wq workers run each request under the submitter's
    credentials of its submission this way
+5. **Per-user counts** - `Cred.ucounts` (Linux cred->ucounts) is a
+   counted reference to its real uid's `Ucounts` (task/ucount.rs, Linux
+   kernel/ucount.c): the RLIMIT_NPROC, RLIMIT_SIGPENDING and io_uring
+   locked-memory counters, atomics charged and returned with no lock.
+   A uid change points the new credentials at the new uid's before
+   they are committed (`set_cred_ucounts`, EAGAIN without memory), and
+   commit_creds moves the task's RLIMIT_NPROC charge (Linux: increment
+   the new before the switch, decrement the old after). A queued
+   signal (`SigQueue`, Linux sigqueue->ucounts) and an io_uring ring
+   and its registered buffers (Linux ctx->user) hold their own
+   reference, taken from the receiver's or creator's credentials (a
+   task's under TASKLIST or by itself, `task_ucounts`). Root's is the
+   static `INIT_UCOUNTS` (Linux init_ucounts). `UCOUNTS` (IrqSpinlock
+   leaf, Linux ucounts_lock: a last reference may go in any context)
+   is the table by uid of weak references: `alloc_ucounts` looks up,
+   and on a miss allocates the entry and its rbtree node with the lock
+   released, then looks again before inserting (a racer's entry wins);
+   the last reference's drop unlinks its node (unless a lookup that
+   found it dying already replaced it) and frees it after the unlock.
+   Nothing allocates under it.
 
 **Credential APIs (like Linux):**
 - `prepare_creds()` - Clone current credentials, return mutable copy
 - `commit_creds(new)` - swap `Task.cred` under TASKLIST; the old
-  `Arc<Cred>` is dropped after the lock (it only frees memory)
+  `Arc<Cred>` is dropped after the lock (frees memory and may drop a
+  last `Ucounts` reference: `UCOUNTS`, a leaf)
 - `copy_creds(flags, parent)` - For fork/clone: share Arc (CLONE_THREAD) or deep copy
 
 #### Exec vs. Credential Checks (Linux cred_guard_mutex, exec_update_lock)
@@ -3386,7 +3407,8 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 5. **Queue entries are made and freed outside the locks** (Linux
    allocates its sigqueue GFP_ATOMIC under siglock; hk allocates under
    no spin lock): a sender allocates its `SigQueue` and charges the
-   receiver's user (`UCOUNTS`) before taking `Task.sig`, the locked
+   receiver's user (an atomic on its `Ucounts`, whose reference the
+   entry keeps, 3.1.1) before taking `Task.sig`, the locked
    section only links it in, and an unused one is dropped after the
    lock is released. A dequeue unlinks its entry under the lock and the
    caller frees it (`Dequeued::info`) after; an exiting task's sets are
@@ -3401,10 +3423,9 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    again. The charge comes before the lock, not under it as in Linux,
    so while an entry that turns out unused (the state changed between
    the two decisions) is alive its user's count is one high: a racing
-   send for the same user at its RLIMIT_SIGPENDING can see EAGAIN.
-   Charging under `Task.sig` would put `UCOUNTS`, whose map allocates
-   a node for a new user, under it; the window is one locked section
-   and matters only at the limit.
+   send for the same user at its RLIMIT_SIGPENDING can see EAGAIN. The
+   entry carries its charge from its allocation, which needs no lock;
+   the window is one locked section and matters only at the limit.
 
 6. **A group signal's thread is chosen under TASKLIST, not siglock**
    (Linux complete_signal under siglock): after the signal is queued
@@ -4712,7 +4733,6 @@ this is the interrupt-safety invariant:
 | `SignalStruct.shared` | signal/mod.rs | `Mutex` | Thread-group pending signals and curr_target (under Task.sig) |
 | `Task.alloc_lock` | task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over `Task.sig`) |
 | `FsStruct.inner` | fs/fsstruct.rs | `Mutex` | Root, cwd, umask (leaf) |
-| `UCOUNTS` | task/mod.rs | `Mutex` | Per-real-uid counts: RLIMIT_NPROC tasks, RLIMIT_SIGPENDING queued signals, io_uring locked pages (Linux user_struct.locked_vm: checked against RLIMIT_MEMLOCK and charged in one hold) (leaf: may be taken under TASKLIST, takes no lock) |
 | `MEMBLOCK` | mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
 | `PidNamespace.bacct` | task/acct.rs | `Mutex` | A pid namespace's process accounting file (Linux pid_namespace->bacct; leaf, thread context: cloned out, the record written and an old file released with no lock held; an exit walks its namespace and each parent, one lock at a time; taken out at the namespace's zap, after its other tasks are gone) |
 | All VFS locks | fs/*.rs | `RwLock` | Inodes, dentries, mounts |

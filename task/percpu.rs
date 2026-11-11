@@ -672,6 +672,13 @@ macro_rules! owner_reads {
                 // SAFETY: as above
                 unsafe { self.task.cred_arc() }
             }
+
+            /// A reference to its real uid's counters (Linux
+            /// task_ucounts)
+            pub fn ucounts(&self) -> crate::task::UcountsRef {
+                // SAFETY: as above
+                unsafe { self.task.ucounts() }
+            }
         }
     };
 }
@@ -1940,7 +1947,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
         drop(table);
         return gone;
     }
-    let (ppid, start, uid) = (l.task.ppid(), l.task.start_time(), l.cred().uid);
+    let (ppid, start, ucounts) = (l.task.ppid(), l.task.start_time(), l.ucounts());
     for t in table.threads(tgid) {
         if t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)) {
             gone_tids.push(t.task.tid());
@@ -1999,7 +2006,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
         l.set_tid(tid);
         // The old leader's RLIMIT_NPROC charge goes with it; the caller
         // keeps its own as the process's
-        crate::task::nproc_uncharge(uid);
+        ucounts.dec(crate::task::Ucount::Nproc, 1);
     }
     me.set_tid(ltid);
     // The new leader takes the old one's place among its parent's
@@ -2227,14 +2234,14 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // real uid until it is released; over the limit is EAGAIN unless
     // root or CAP_SYS_RESOURCE/CAP_SYS_ADMIN (Linux copy_process). The
     // guard uncharges on every error return.
-    let nproc = crate::task::NprocCharge::new(current_cred().uid);
+    let nproc = crate::task::NprocCharge::new(current_cred().ucounts);
     let parent_nproc_exceeded = {
         let table = TASKLIST.read();
         table
             .view(&current())
             .is_some_and(|t| t.task.has_flag(crate::task::pf::NPROC_EXCEEDED))
     };
-    if crate::task::nproc_over(nproc.uid, nproc.count) {
+    if crate::task::nproc_over(&nproc.ucounts) {
         return Err(KernelError::WouldBlock);
     }
 
@@ -3268,16 +3275,16 @@ fn leader_waits(table: &GlobalTaskTable, pid: Pid) -> bool {
 /// under TASKLIST (Linux EXIT_DEAD, then release_task after the lock)
 struct Reaped {
     t: TaskRef,
-    uid: crate::task::Uid,
+    ucounts: crate::task::UcountsRef,
 }
 
 /// Take zombie `tid` out of the task list for [`release`]
 fn reap_locked(table: &mut GlobalTaskTable, tid: Tid) -> Option<Reaped> {
-    let uid = match table.get(tid) {
-        Some(t) if matches!(t.state, TaskState::Zombie(_)) => t.cred().uid,
+    let ucounts = match table.get(tid) {
+        Some(t) if matches!(t.state, TaskState::Zombie(_)) => t.ucounts(),
         _ => return None,
     };
-    table.remove(tid).map(|t| Reaped { t, uid })
+    table.remove(tid).map(|t| Reaped { t, ucounts })
 }
 
 /// Release a zombie leader [`reap_locked`] took (Linux release_task of
@@ -3285,11 +3292,11 @@ fn reap_locked(table: &mut GlobalTaskTable, tid: Tid) -> Option<Reaped> {
 /// parent rechecks; its run queue keeps it if it still runs. TASKLIST
 /// not held.
 fn release(gone: Option<Reaped>) {
-    let Some(Reaped { t, uid }) = gone else {
+    let Some(Reaped { t, ucounts }) = gone else {
         return;
     };
     crate::fs::proc::proc_flush_pid(&t);
-    crate::task::nproc_uncharge(uid);
+    ucounts.dec(crate::task::Ucount::Nproc, 1);
     drop(t);
     crate::task::proc::CHILD_EXIT_WQ.wake_all();
 }
@@ -3354,7 +3361,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
             if let Some(task) = table.view(&me)
                 && task.task.tid() != task.task.pid
             {
-                crate::task::nproc_uncharge(task.cred().uid);
+                task.ucounts().dec(crate::task::Ucount::Nproc, 1);
             }
         }
 
@@ -5122,6 +5129,9 @@ pub fn set_current_uid_all(uid: crate::task::Uid) -> Result<(), KernelError> {
 fn commit_uid_change(mut new_cred: crate::task::Cred) -> Result<(), KernelError> {
     let old = current_cred();
     crate::task::cap_fix_setuid(&old, &mut new_cred, current_keep_caps());
+    // The new real uid's counters (Linux __sys_setuid et al.:
+    // set_cred_ucounts before commit_creds): EAGAIN without them
+    crate::task::set_cred_ucounts(&mut new_cred)?;
     crate::task::commit_creds(try_arc(new_cred)?);
     Ok(())
 }

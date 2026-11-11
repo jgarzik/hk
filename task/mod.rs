@@ -33,6 +33,8 @@ pub mod sched;
 pub mod schedsys;
 pub mod stop_machine;
 pub mod syscall;
+pub mod ucount;
+pub use ucount::{Ucount, Ucounts, UcountsRef, alloc_ucounts, set_cred_ucounts};
 
 /// Clone flags for clone() syscall (subset of Linux flags)
 ///
@@ -120,7 +122,6 @@ pub mod wait_options {
 
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::{arc_nofail, try_arc};
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -184,6 +185,10 @@ pub struct Cred {
     pub cap_ambient: KernelCap,
     /// Supplementary groups, sorted (Linux group_info)
     pub groups: GroupInfo,
+    /// The real uid's counters (Linux cred->ucounts): a counted
+    /// reference, pointed at a new uid's by `set_cred_ucounts` before a
+    /// uid change is committed
+    pub ucounts: UcountsRef,
 }
 
 /// Supplementary group list (Linux struct group_info): sorted and
@@ -234,6 +239,7 @@ impl Cred {
         cap_bset: CAP_FULL_SET,
         cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
         groups: GroupInfo::EMPTY,
+        ucounts: UcountsRef::INIT,
     };
 
     /// No privileges at all (overflow uid/gid 65534, no capabilities,
@@ -254,13 +260,15 @@ impl Cred {
         cap_bset: CAP_EMPTY_SET,
         cap_ambient: CAP_EMPTY_SET,
         groups: GroupInfo::EMPTY,
+        ucounts: UcountsRef::INIT,
     };
 
     /// Create credentials for a specific user/group
     ///
     /// Sets all credential fields (uid, suid, euid, fsuid) to the same value.
     /// For root (uid=0), grants full capabilities.
-    /// For non-root, grants empty capabilities.
+    /// For non-root, grants empty capabilities. The counters are root's
+    /// until `set_cred_ucounts` points them at `uid`'s.
     pub const fn new(uid: Uid, gid: Gid) -> Self {
         // Root gets full caps, non-root gets empty caps
         let (caps, bset) = if uid == 0 {
@@ -284,6 +292,7 @@ impl Cred {
             cap_bset: bset,
             cap_ambient: CAP_EMPTY_SET,
             groups: GroupInfo::EMPTY,
+            ucounts: UcountsRef::INIT,
         }
     }
 
@@ -333,12 +342,20 @@ pub fn prepare_creds() -> Cred {
 /// replaced under TASKLIST (others read it under the lock; the task
 /// itself without). The new credentials take effect immediately.
 pub fn commit_creds(new: Arc<Cred>) {
-    let old = current_cred().uid;
-    if old != new.uid {
-        flag_nproc_exceeded(new.uid);
+    let old = current_cred().ucounts;
+    if old.uid() != new.uid {
+        flag_nproc_exceeded(&new);
     }
-    nproc_move(old, new.uid);
+    // The task's RLIMIT_NPROC charge moves to its new user (Linux
+    // commit_creds: inc_rlimit_ucounts before, dec after the switch)
+    let moved = old != new.ucounts;
+    if moved {
+        new.ucounts.inc(Ucount::Nproc, 1);
+    }
     percpu::commit_creds_impl(new);
+    if moved {
+        old.dec(Ucount::Nproc, 1);
+    }
 }
 
 /// execve's RLIMIT_NPROC check (Linux do_execveat_common): EAGAIN if a
@@ -346,9 +363,8 @@ pub fn commit_creds(new: Arc<Cred>) {
 /// is cleared
 pub fn nproc_exec_check() -> KernelResult<()> {
     let me = percpu::current();
-    let uid = current_cred().uid;
     // rlimit() takes TASKLIST: decide before locking it
-    let over = nproc_overlimit(nproc_count(uid));
+    let over = nproc_overlimit(&current_cred().ucounts);
     let table = percpu::TASKLIST.read();
     let Some(t) = table.view(&me) else {
         return Ok(());
@@ -1299,6 +1315,13 @@ impl TaskCred {
 
     /// # Safety
     /// As [`TaskCred::get`].
+    unsafe fn ucounts(&self) -> UcountsRef {
+        // SAFETY: the pointer is live (see above)
+        unsafe { (*self.0.load(Ordering::Acquire)).ucounts.clone() }
+    }
+
+    /// # Safety
+    /// As [`TaskCred::get`].
     unsafe fn arc(&self) -> Arc<Cred> {
         let p = self.0.load(Ordering::Acquire);
         if Self::is_static(p) {
@@ -1760,6 +1783,15 @@ impl Task {
     pub unsafe fn cred(&self) -> Cred {
         // SAFETY: see above
         unsafe { self.cred.get() }
+    }
+
+    /// A reference to its real uid's counters (Linux task_ucounts)
+    ///
+    /// # Safety
+    /// As [`Task::cred`].
+    pub unsafe fn ucounts(&self) -> UcountsRef {
+        // SAFETY: see above
+        unsafe { self.cred.ucounts() }
     }
 
     /// A reference to the task's credentials
@@ -2335,131 +2367,37 @@ pub fn capable(cap: u32) -> bool {
 }
 
 // =============================================================================
-// Per-UID counts (RLIMIT_NPROC, RLIMIT_SIGPENDING, locked memory)
+// RLIMIT_NPROC (Linux UCOUNT_RLIMIT_NPROC on the real cred's ucounts)
 // =============================================================================
 
-/// What a user's count counts (Linux enum ucount_type, the rlimit ones)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ucount {
-    /// Tasks, threads included (UCOUNT_RLIMIT_NPROC): charged to a
-    /// task's real uid from clone until it is released (reaped, or at
-    /// exit for a non-leader thread); a real-uid change moves the charge
-    Nproc,
-    /// Queued signals (UCOUNT_RLIMIT_SIGPENDING): charged to the
-    /// receiver's real uid while queued
-    Sigpending,
-    /// Pages pinned for io_uring (Linux user_struct.locked_vm: rings and
-    /// registered buffers), against RLIMIT_MEMLOCK (`locked_vm_charge`)
-    LockedVm,
-}
-
-/// Counts per user
-const NR_UCOUNTS: usize = 3;
-
-/// Each real uid's counts (Linux ucounts, one per user in the initial
-/// user namespace), indexed by `Ucount`: an entry lives while any count
-/// is non-zero, so a user's signals find it made by its tasks
-static UCOUNTS: Mutex<BTreeMap<Uid, [u64; NR_UCOUNTS]>> = Mutex::new(BTreeMap::new());
-
-/// Charge one to `uid`'s `kind`; the new count (Linux
-/// inc_rlimit_ucounts)
-pub fn ucount_inc(uid: Uid, kind: Ucount) -> u64 {
-    let mut counts = UCOUNTS.lock();
-    let c = &mut counts.entry(uid).or_insert([0; NR_UCOUNTS])[kind as usize];
-    *c += 1;
-    *c
-}
-
-/// Charge `pages` locked pages to `uid` unless that passes `limit`
-/// pages (Linux __io_account_mem against RLIMIT_MEMLOCK): false then
-pub fn locked_vm_charge(uid: Uid, pages: u64, limit: u64) -> bool {
-    let mut counts = UCOUNTS.lock();
-    let e = counts.entry(uid).or_insert([0; NR_UCOUNTS]);
-    let c = &mut e[Ucount::LockedVm as usize];
-    match c.checked_add(pages) {
-        Some(n) if n <= limit => {
-            *c = n;
-            true
-        }
-        _ => {
-            if *e == [0; NR_UCOUNTS] {
-                counts.remove(&uid);
-            }
-            false
-        }
-    }
-}
-
-/// Release `pages` locked pages of `uid` (Linux __io_unaccount_mem)
-pub fn locked_vm_uncharge(uid: Uid, pages: u64) {
-    let mut counts = UCOUNTS.lock();
-    if let Some(c) = counts.get_mut(&uid) {
-        let v = &mut c[Ucount::LockedVm as usize];
-        *v = v.saturating_sub(pages);
-        if *c == [0; NR_UCOUNTS] {
-            counts.remove(&uid);
-        }
-    }
-}
-
-/// Release one of `uid`'s `kind` (Linux dec_rlimit_ucounts)
-pub fn ucount_dec(uid: Uid, kind: Ucount) {
-    let mut counts = UCOUNTS.lock();
-    if let Some(c) = counts.get_mut(&uid) {
-        c[kind as usize] = c[kind as usize].saturating_sub(1);
-        if *c == [0; NR_UCOUNTS] {
-            counts.remove(&uid);
-        }
-    }
-}
-
-/// `uid`'s `kind` count (Linux get_rlimit_value)
-pub fn ucount(uid: Uid, kind: Ucount) -> u64 {
-    UCOUNTS.lock().get(&uid).map_or(0, |c| c[kind as usize])
-}
-
-/// Charge one task to `uid`; the new count
-pub fn nproc_charge(uid: Uid) -> u64 {
-    ucount_inc(uid, Ucount::Nproc)
-}
-
-/// Release one task's charge to `uid`
-pub fn nproc_uncharge(uid: Uid) {
-    ucount_dec(uid, Ucount::Nproc)
-}
-
-/// Tasks charged to `uid`
-pub fn nproc_count(uid: Uid) -> u64 {
-    ucount(uid, Ucount::Nproc)
-}
-
-/// `count` tasks exceed the caller's RLIMIT_NPROC (Linux
+/// `u`'s tasks exceed the caller's RLIMIT_NPROC (Linux
 /// is_rlimit_overlimit)
-pub fn nproc_overlimit(count: u64) -> bool {
-    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NPROC);
-    limit != crate::task::rlimit::RLIM_INFINITY && count > limit
+pub fn nproc_overlimit(u: &Ucounts) -> bool {
+    u.overlimit(
+        Ucount::Nproc,
+        crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NPROC),
+    )
 }
 
 /// clone's check (Linux copy_process): over the limit fails unless the
 /// task's user is root or it has CAP_SYS_RESOURCE/CAP_SYS_ADMIN
-pub fn nproc_over(uid: Uid, count: u64) -> bool {
-    nproc_overlimit(count) && uid != 0 && !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN)
+pub fn nproc_over(u: &Ucounts) -> bool {
+    nproc_overlimit(u) && u.uid() != 0 && !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN)
 }
 
-/// A pending RLIMIT_NPROC charge for a task being created: uncharged on
-/// drop unless `keep` hands it to the created task
+/// A pending RLIMIT_NPROC charge for a task being created (Linux
+/// copy_creds' inc_rlimit_ucounts): uncharged on drop unless `keep`
+/// hands it to the created task
 pub struct NprocCharge {
-    pub uid: Uid,
-    /// Tasks charged to `uid`, this one included
-    pub count: u64,
+    pub ucounts: UcountsRef,
     armed: bool,
 }
 
 impl NprocCharge {
-    pub fn new(uid: Uid) -> Self {
+    pub fn new(ucounts: UcountsRef) -> Self {
+        ucounts.inc(Ucount::Nproc, 1);
         Self {
-            uid,
-            count: nproc_charge(uid),
+            ucounts,
             armed: true,
         }
     }
@@ -2473,25 +2411,16 @@ impl NprocCharge {
 impl Drop for NprocCharge {
     fn drop(&mut self) {
         if self.armed {
-            nproc_uncharge(self.uid);
+            self.ucounts.dec(Ucount::Nproc, 1);
         }
     }
 }
 
-/// The current task's real uid changes from `old` to `new` (Linux
-/// commit_creds): move its charge
-pub fn nproc_move(old: Uid, new: Uid) {
-    if old != new {
-        nproc_charge(new);
-        nproc_uncharge(old);
-    }
-}
-
 /// Linux set_user / flag_nproc_exceeded: a task whose real uid becomes
-/// `new` is flagged if that user is already over RLIMIT_NPROC (root's
+/// `new`'s is flagged if that user is already over RLIMIT_NPROC (root's
 /// user never is); the flag is cleared otherwise
-fn flag_nproc_exceeded(new: Uid) {
-    let over = new != 0 && nproc_overlimit(nproc_count(new));
+fn flag_nproc_exceeded(new: &Cred) {
+    let over = new.uid != 0 && nproc_overlimit(&new.ucounts);
     let me = percpu::current();
     let table = percpu::TASKLIST.read();
     if let Some(t) = table.view(&me) {

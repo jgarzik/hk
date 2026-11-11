@@ -189,8 +189,9 @@ pub fn ignoring_children(table: &GlobalTaskTable, pid: crate::task::Pid) -> bool
 /// drops the lock and makes another
 #[derive(Default)]
 pub struct Entry {
-    /// The receiver's real uid and the signal it was made for
-    key: Option<(crate::task::Uid, Signal)>,
+    /// The receiver's user (its counters) and the signal it was made
+    /// for
+    key: Option<(crate::task::UcountsRef, Signal)>,
     q: Option<Box<SigQueue>>,
 }
 
@@ -238,12 +239,12 @@ impl Entry {
             sig,
             // An Info: no namespace to number in (filled when queued)
             info.resolve(sig, &crate::ns::INIT_PID_NS),
-            tg.uid,
+            &tg.ucounts,
             tg.limit,
             info.override_rlimit(sig),
         );
         Self {
-            key: Some((tg.uid, sig)),
+            key: Some((tg.ucounts, sig)),
             q,
         }
     }
@@ -267,7 +268,11 @@ impl Entry {
 
     /// Made for `to`'s user and `sig`, or `to` takes no signal
     fn matches(&self, table: &GlobalTaskTable, to: &TaskRef, sig: Signal) -> bool {
-        super::target_in(table, to).is_none_or(|tg| self.key == Some((tg.uid, sig)))
+        super::target_in(table, to).is_none_or(|tg| {
+            self.key
+                .as_ref()
+                .is_some_and(|(u, s)| *u == tg.ucounts && *s == sig)
+        })
     }
 }
 

@@ -1260,7 +1260,8 @@ struct Target {
     global: bool,
     group_exit: bool,
     stopped: bool,
-    uid: crate::task::Uid,
+    /// The receiver's real uid's counters (Linux task_ucounts)
+    ucounts: crate::task::UcountsRef,
     limit: u64,
     sighand: Option<Arc<SigHand>>,
     signal: Option<Arc<SignalStruct>>,
@@ -1293,7 +1294,7 @@ fn target_in(table: &crate::task::percpu::GlobalTaskTable, t: &Task) -> Option<T
         global: v.task.pid == 1,
         group_exit: sig.is_some_and(|s| matches!(s.group_exit(), GroupExit::Exit(_))),
         stopped: matches!(v.state(), crate::task::TaskState::Traced(_)),
-        uid: v.cred_arc().uid,
+        ucounts: v.ucounts(),
         limit: limit.map_or(0, |r| r.rlim_cur),
         sighand: v.sighand().cloned(),
         signal: sig.cloned(),
@@ -1369,7 +1370,7 @@ fn send_task(t: &Task, sig: Signal, info: SendInfo, ty: PidType, force: bool) ->
         SigQueue::alloc(
             sig,
             info.resolve_checked(sig, t.pid_ns()),
-            tg.uid,
+            &tg.ucounts,
             tg.limit,
             info.override_rlimit(sig),
         )

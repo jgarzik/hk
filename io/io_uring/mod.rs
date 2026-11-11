@@ -118,7 +118,7 @@ pub struct IoRing {
     poll_files: crate::sync::Mutex<KVec<FileRef>>,
     /// The user its locked memory is charged to (Linux ctx->user: none
     /// with CAP_IPC_LOCK), and its rings' pages charged
-    acct: Option<crate::task::Uid>,
+    acct: Option<crate::task::UcountsRef>,
     ring_pages: u64,
     submit: Mutex<Submit>,
     cq: crate::sync::spin::Mutex<Cq>,
@@ -192,7 +192,7 @@ impl IoRing {
         let rings = Rings::new(sq, cq)?;
         let acct = rsrc::acct_user();
         let ring_pages = rings.pages();
-        rsrc::account(acct, ring_pages)?;
+        rsrc::account(acct.as_ref(), ring_pages)?;
         try_arc(Self {
             rings,
             iopoll: flags & IORING_SETUP_IOPOLL != 0,
@@ -633,7 +633,7 @@ impl IoRing {
         if s.bufs.is_some() {
             return Err(KernelError::Busy);
         }
-        s.bufs = Some(rsrc::register(&iovs, self.acct)?);
+        s.bufs = Some(rsrc::register(&iovs, self.acct.as_ref())?);
         Ok(())
     }
 
@@ -750,7 +750,7 @@ fn init_check(sqe: &IoUringSqe, iopoll: bool) -> KernelResult<()> {
 
 impl Drop for IoRing {
     fn drop(&mut self) {
-        rsrc::unaccount(self.acct, self.ring_pages);
+        rsrc::unaccount(self.acct.as_ref(), self.ring_pages);
     }
 }
 

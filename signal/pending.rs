@@ -15,7 +15,7 @@
 //! signal still counts and rearms an interval timer.
 
 use super::{SYNCHRONOUS_MASK, SigInfo, SigSet, Signal, si_code};
-use crate::task::{Ucount, Uid, ucount_dec, ucount_inc};
+use crate::task::{Ucount, UcountsRef};
 use crate::time::posix_timer::PosixTimer;
 use crate::util::kalloc::try_box;
 use crate::util::list::{BoxList, Link};
@@ -28,8 +28,8 @@ pub struct SigQueue {
     sig: Signal,
     /// Its si_signo is `sig`
     info: SigInfo,
-    /// The user charged (Linux sigqueue.ucounts)
-    uid: Uid,
+    /// The user charged, a counted reference (Linux sigqueue.ucounts)
+    ucounts: UcountsRef,
     /// The POSIX timer whose entry this is (Linux SIGQUEUE_PREALLOC)
     timer: Option<Weak<PosixTimer>>,
     /// On its SigPending's list (Linux sigqueue.list)
@@ -39,23 +39,24 @@ pub struct SigQueue {
 crate::adapter!(SigQueueLink, SigQueue, link);
 
 impl SigQueue {
-    /// An entry for `sig` with `info` charged to `uid`, the receiver's
-    /// real uid (Linux sigqueue_alloc): none if that takes the user past
-    /// `limit` (its RLIMIT_SIGPENDING) unless `override_rlimit`, or
-    /// without memory. Thread context, no spin lock held.
+    /// An entry for `sig` with `info` charged to `ucounts`, the
+    /// receiver's real uid's (Linux sigqueue_alloc, sig_get_ucounts):
+    /// none if that takes the user past `limit` (its RLIMIT_SIGPENDING)
+    /// unless `override_rlimit`, or without memory. Thread context, no
+    /// spin lock held.
     pub fn alloc(
         sig: Signal,
         info: SigInfo,
-        uid: Uid,
+        ucounts: &UcountsRef,
         limit: u64,
         override_rlimit: bool,
     ) -> Option<Box<Self>> {
-        let n = ucount_inc(uid, Ucount::Sigpending);
+        let n = ucounts.inc(Ucount::Sigpending, 1);
         // Holds the charge from here: dropped, it gives it back
         let q = Self {
             sig,
             info: info.with_sig(sig),
-            uid,
+            ucounts: ucounts.clone(),
             timer: None,
             link: Link::new(),
         };
@@ -69,9 +70,9 @@ impl SigQueue {
     /// task's user within its RLIMIT_SIGPENDING (Linux
     /// posixtimer_init_sigqueue)
     pub fn alloc_timer(sig: Signal, info: SigInfo, timer: Weak<PosixTimer>) -> Option<Box<Self>> {
-        let uid = crate::task::current_cred().uid;
+        let ucounts = crate::task::current_cred().ucounts;
         let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_SIGPENDING);
-        let mut q = Self::alloc(sig, info, uid, limit, false)?;
+        let mut q = Self::alloc(sig, info, &ucounts, limit, false)?;
         q.timer = Some(timer);
         Some(q)
     }
@@ -107,8 +108,10 @@ fn release(q: Box<SigQueue>) {
 }
 
 impl Drop for SigQueue {
+    /// Its charge goes back, then its reference (Linux __sigqueue_free:
+    /// dec_rlimit_put_ucounts)
     fn drop(&mut self) {
-        ucount_dec(self.uid, Ucount::Sigpending);
+        self.ucounts.dec(Ucount::Sigpending, 1);
     }
 }
 
@@ -291,6 +294,7 @@ impl Drop for SigPending {
 mod tests {
     use super::*;
     use crate::signal::{SIGBUS, SIGFPE, SIGHUP, SIGRTMIN, SIGSEGV, SIGUSR1, SigFields};
+    use crate::task::{Uid, alloc_ucounts};
 
     const NONE: SigSet = SigSet::EMPTY;
 
@@ -312,7 +316,7 @@ mod tests {
             value,
         };
         let info = SigInfo::new(sig, si_code::SI_QUEUE, f);
-        SigQueue::alloc(sig, info, uid, u64::MAX, false).unwrap()
+        SigQueue::alloc(sig, info, &alloc_ucounts(uid).unwrap(), u64::MAX, false).unwrap()
     }
 
     fn value(d: Dequeued) -> u64 {
@@ -347,18 +351,19 @@ mod tests {
     #[test]
     fn rt_queue_order() {
         let sig = rtsig(3);
+        let u = alloc_ucounts(4242).unwrap();
         let mut p = SigPending::new();
         for v in 1..=3 {
             p.queue(rt(sig, v));
         }
-        assert_eq!(crate::task::ucount(4242, Ucount::Sigpending), 3);
+        assert_eq!(u.get(Ucount::Sigpending), 3);
         for v in 1..=3 {
             assert!(p.is_pending(sig));
             assert_eq!(p.dequeue(&NONE).map(value), Some(v));
         }
         assert!(!p.is_pending(sig));
         assert!(p.dequeue(&NONE).is_none());
-        assert_eq!(crate::task::ucount(4242, Ucount::Sigpending), 0);
+        assert_eq!(u.get(Ucount::Sigpending), 0);
     }
 
     /// flush_mask takes the signal and every queued instance, nothing else
@@ -383,12 +388,13 @@ mod tests {
     fn sync_and_limit() {
         let mut p = SigPending::new();
         p.add(SIGHUP);
+        let u = alloc_ucounts(4243).unwrap();
         let segv = SigInfo::fault(SIGSEGV, si_code::SEGV_MAPERR, 0x1000);
-        p.queue(SigQueue::alloc(SIGSEGV, segv, 4243, 1, false).unwrap());
-        assert!(SigQueue::alloc(SIGSEGV, segv, 4243, 1, false).is_none());
+        p.queue(SigQueue::alloc(SIGSEGV, segv, &u, 1, false).unwrap());
+        assert!(SigQueue::alloc(SIGSEGV, segv, &u, 1, false).is_none());
         let d = p.dequeue_sync(&NONE).unwrap();
         assert_eq!(d.info(), Some(segv));
         assert!(p.dequeue_sync(&NONE).is_none());
-        assert_eq!(crate::task::ucount(4243, Ucount::Sigpending), 0);
+        assert_eq!(u.get(Ucount::Sigpending), 0);
     }
 }

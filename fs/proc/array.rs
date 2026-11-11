@@ -393,7 +393,7 @@ fn status_sig(o: &mut Out, s: &Snap) {
         .and_then(|sig| sig.get_rlimit(crate::task::rlimit::RLIMIT_SIGPENDING))
         .map_or(0, |r| r.rlim_cur);
     // Signals queued for the task's user (Linux task_sig: its ucounts)
-    let queued = crate::task::ucount(s.cred.uid, crate::task::Ucount::Sigpending);
+    let queued = s.cred.ucounts.get(crate::task::Ucount::Sigpending);
     let (ign, cgt) = ign_cgt(s);
     let _ = writeln!(o, "Threads:\t{}\nSigQ:\t{}/{}", s.threads, queued, qlim);
     let sets = [
