@@ -714,7 +714,7 @@ named and might_alloc reports an unnamed (GFP_KERNEL) one. A LOCKDEP
 boot lists each site once (`LOCKDEP:ATOMIC_ALLOC`, with the IRQ-safe
 lock, spin lock or `local_irq_save` it was made under; the shutdown
 summary counts them): mostly collections grown, or copied, under spin
-locks in net, fs, io, task, ipc, cgroup and keys, and IRQ-safe locks
+locks in net, fs, io, task, cgroup and keys, and IRQ-safe locks
 in bpf maps and the swap cache. ROADMAP
 phase A (A0-A3).
 
