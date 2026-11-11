@@ -14,7 +14,7 @@
 //! RTNL for driver registrations); `NET_SYSFS` is set once at init.
 //! Attributes read the device without RTNL, as its receive path does.
 
-use crate::util::kalloc::{arc_nofail, try_arc};
+use crate::util::kalloc::try_arc;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -224,23 +224,6 @@ pub fn netdev_unregister_kobject(n: &NetDevice) {
     if let Some(d) = n.kdev.get() {
         d.del();
     }
-}
-
-/// Remove a dropped namespace's devices from sysfs, from the system
-/// workqueue (Linux cleanup_net -> default_device_exit_batch)
-pub fn netns_exit(kdevs: Vec<Arc<Device>>) {
-    if kdevs.is_empty() {
-        return;
-    }
-    let mut pending = Some(kdevs);
-    let work = crate::task::workqueue::Work::new(move || {
-        for d in pending.take().unwrap_or_default() {
-            d.del();
-        }
-    });
-    // Namespace teardown cannot fail
-    let work = arc_nofail(crate::sync::IrqSpinlock::new(work));
-    crate::task::workqueue::SYSTEM_WQ.queue_work(work);
 }
 
 /// Linux netdev_kobject_init: the class, then the devices already

@@ -567,13 +567,13 @@ fn ifa_routes(dev: &NetDevice, ifa: &InIfaddr, prim_local: Ipv4Addr) -> Vec<FibC
     let mask = ifa.mask();
     let prefix = ifa.prefix();
     if (prefix.0 >> 24) != 0 && !ifa.is_secondary() && (prefix != ifa.local || ifa.prefixlen < 32) {
-        if ifa.flags & crate::net::inet::ifaddr::IFA_F_NOPREFIXROUTE == 0 {
+        if ifa.flags() & crate::net::inet::ifaddr::IFA_F_NOPREFIXROUTE == 0 {
             let t = if dev.is_loopback() {
                 RouteType::Local
             } else {
                 RouteType::Unicast
             };
-            out.push(magic(t, prefix, ifa.prefixlen, ifa.rt_priority));
+            out.push(magic(t, prefix, ifa.prefixlen, ifa.rt_priority()));
         }
         if ifa.prefixlen < 31 {
             out.push(magic(
@@ -592,9 +592,10 @@ fn primary_local(dev: &NetDevice, ifa: &InIfaddr) -> Ipv4Addr {
     if !ifa.is_secondary() {
         return ifa.local;
     }
-    dev.inet_addrs()
-        .into_iter()
-        .find(|p| !p.is_secondary() && p.prefixlen == ifa.prefixlen && p.matches(ifa.address))
+    let g = crate::sync::rcu::read_lock();
+    dev.in_dev()
+        .addrs(&g)
+        .find(|p| !p.is_secondary() && p.same_subnet(ifa))
         .map_or(ifa.local, |p| p.local)
 }
 
@@ -613,7 +614,7 @@ pub fn fib_add_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa
 pub fn fib_del_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa: &InIfaddr) {
     let mut still: Vec<FibConfig> = Vec::new();
     for d in net.devices() {
-        for other in d.inet_addrs() {
+        for other in d.in_dev().ifa_list.snapshot() {
             still.extend(ifa_routes(&d, &other, primary_local(&d, &other)));
         }
     }
@@ -645,7 +646,7 @@ pub fn fib_del_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa
             rtnetlink::notify_route(net, &e, rtnetlink::RTM_DELROUTE, NlInfo::default());
         }
     }
-    if dev.inet_addrs().is_empty() {
+    if !dev.in_dev().has_addrs() {
         fib_disable_dev(rtnl, net, dev, true);
     }
 }

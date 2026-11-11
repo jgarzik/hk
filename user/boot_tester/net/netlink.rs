@@ -10,6 +10,11 @@
 //! - NL_AUTOBIND_PIDNS: in a new pid and network namespace, the
 //!   autobound port id is the caller's pid there (Linux netlink_autobind:
 //!   task_tgid_vnr), 1 for the namespace's init
+//! - NL_ADDR_ORDER: addresses dump in Linux's list order (a primary
+//!   after the last primary, a secondary last), and NLM_F_REPLACE
+//!   changes an address in place
+//! - NL_NETNS_ADDR_EXIT: namespaces with addresses, created and left
+//!   many times, leave none of them local in the initial namespace
 
 use hk_syscall::{
     _LINUX_CAPABILITY_VERSION_3, CapUserData, CapUserHeader, IoVec, MsgHdr, SOCK_DGRAM, SOCK_RAW,
@@ -61,6 +66,8 @@ pub fn run_tests() {
     test_ack();
     test_updown();
     test_addr_route();
+    test_addr_order();
+    test_netns_addr_exit();
     test_notify();
     test_peek_trunc();
     test_sockopt();
@@ -228,6 +235,144 @@ fn test_link_dump() {
         print_num(eth_ok as i64);
         println(b"");
         return;
+    }
+    pass(N);
+}
+
+const IFA_RT_PRIORITY: u16 = 9;
+const NLM_F_REPLACE: u16 = 0x100;
+const IFA_F_SECONDARY: u8 = 0x01;
+
+/// Our addresses on lo in dump order: (last octet, secondary, metric)
+fn order_on_lo(nl: &mut Nl, out: &mut [(u8, bool, u32); 4]) -> (i32, usize) {
+    let mut n = 0;
+    let mut r = Req::new(RTM_GETADDR, 0, &ifaddr(AF_INET, 0, 0));
+    let res = nl.dump(&mut r, &mut |m| {
+        if m.ty != RTM_NEWADDR || m.body[0] != AF_INET || m.u32_at(4) != 1 {
+            return;
+        }
+        let Some(ip) = m.attr_ip(8, IFA_LOCAL) else {
+            return;
+        };
+        if (ip[..3] == ORDER_NET || ip[..3] == ORDER_NET2) && n < out.len() {
+            let prio = m.attr_u32(8, IFA_RT_PRIORITY).unwrap_or(0);
+            out[n] = (ip[3], m.body[2] & IFA_F_SECONDARY != 0, prio);
+            n += 1;
+        }
+    });
+    (res, n)
+}
+
+const ORDER_NET: [u8; 3] = [203, 0, 113];
+const ORDER_NET2: [u8; 3] = [198, 18, 0];
+
+/// Linux __inet_insert_ifa order: a new primary goes after the last
+/// primary of its scope, a secondary (same subnet) last; NLM_F_REPLACE
+/// changes an address in place, keeping its position
+fn test_addr_order() {
+    const N: &[u8] = b"NL_ADDR_ORDER";
+    let Some(mut nl) = Nl::open() else {
+        return fail_why(N, b"open", 0);
+    };
+    let ce = NLM_F_CREATE | NLM_F_EXCL;
+    let a = [203, 0, 113, 10];
+    let b = [203, 0, 113, 11];
+    let c = [198, 18, 0, 1];
+    let result = (|| -> Result<(), (&'static [u8], i64)> {
+        let chk = |what: &'static [u8], got: i32| {
+            if got == 0 {
+                Ok(())
+            } else {
+                Err((what, got as i64))
+            }
+        };
+        chk(b"add primary", addr(&mut nl, true, 1, a, 24, ce))?;
+        chk(b"add secondary", addr(&mut nl, true, 1, b, 24, ce))?;
+        chk(b"add second primary", addr(&mut nl, true, 1, c, 24, ce))?;
+        let mut o = [(0, false, 0); 4];
+        let (res, n) = order_on_lo(&mut nl, &mut o);
+        chk(b"dump", res.min(0))?;
+        let want = [(10, false, 0), (1, false, 0), (11, true, 0)];
+        if n != 3 || o[..3] != want {
+            return Err((b"order", (n as i64) * 1000 + i64::from(o[1].0)));
+        }
+        let mut r = Req::new(RTM_NEWADDR, NLM_F_REPLACE, &ifaddr(AF_INET, 24, 1));
+        r.attr(IFA_LOCAL, &a)
+            .attr(IFA_ADDRESS, &a)
+            .attr(IFA_BROADCAST, &[203, 0, 113, 255])
+            .u32(IFA_RT_PRIORITY, 77);
+        chk(b"replace", nl.ack(&mut r))?;
+        let (res, n) = order_on_lo(&mut nl, &mut o);
+        chk(b"dump after replace", res.min(0))?;
+        let want = [(10, false, 77), (1, false, 0), (11, true, 0)];
+        if n != 3 || o[..3] != want {
+            return Err((
+                b"order after replace",
+                (n as i64) * 1000 + i64::from(o[0].2),
+            ));
+        }
+        Ok(())
+    })();
+    addr(&mut nl, false, 1, b, 24, 0);
+    addr(&mut nl, false, 1, a, 24, 0);
+    addr(&mut nl, false, 1, c, 24, 0);
+    match result {
+        Ok(()) => pass(N),
+        Err((why, v)) => fail_why(N, why, v),
+    }
+}
+
+const EXIT_IP: [u8; 4] = [192, 0, 2, 77];
+
+/// In a new network namespace: lo up (127.0.0.1) with EXIT_IP added,
+/// both bindable there; returns the failed step (0: none)
+fn netns_with_addr() -> u64 {
+    if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
+        return 1;
+    }
+    let Some(mut nl) = Nl::open() else { return 2 };
+    if set_link_up(&mut nl, 1, true) != 0 {
+        return 3;
+    }
+    if addr(&mut nl, true, 1, EXIT_IP, 24, NLM_F_CREATE | NLM_F_EXCL) != 0 {
+        return 4;
+    }
+    for (step, ip) in [(5, EXIT_IP), (6, [127, 0, 0, 1])] {
+        let fd = crate::net::sk::udp();
+        let r = crate::net::sk::bind(fd, ip, 0);
+        crate::net::sk::close(fd);
+        if r != 0 {
+            return step;
+        }
+    }
+    0
+}
+
+/// Namespaces created with addressed devices and left, many times
+/// (Linux cleanup_net unregisters their devices, taking the addresses
+/// out of the address hash): each works while it lives, and none of
+/// their addresses is local in the initial namespace afterwards
+fn test_netns_addr_exit() {
+    const N: &[u8] = b"NL_NETNS_ADDR_EXIT";
+    const ROUNDS: u64 = 32;
+    for i in 0..ROUNDS {
+        let pid = sys_fork();
+        if pid == 0 {
+            sys_exit(netns_with_addr());
+        }
+        let mut st = 0;
+        if pid < 0 || sys_wait4(pid, &mut st, 0, 0) != pid {
+            return fail_why(N, b"fork/wait", pid);
+        }
+        if st != 0 {
+            return fail_why(N, b"child step", (i as i64) * 1000 + i64::from(st >> 8));
+        }
+    }
+    let fd = crate::net::sk::udp();
+    let r = crate::net::sk::bind(fd, EXIT_IP, 0);
+    crate::net::sk::close(fd);
+    if r != crate::net::sk::EADDRNOTAVAIL {
+        return fail_why(N, b"bind in init ns", r);
     }
     pass(N);
 }

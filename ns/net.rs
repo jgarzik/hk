@@ -313,19 +313,15 @@ pub static INIT_NET_NS: Lazy<Arc<NetNamespace>> = Lazy::new(NetNamespace::new_in
 static NET_NAMESPACE_LIST: crate::sync::RwSem<Vec<Weak<NetNamespace>>> =
     crate::sync::RwSem::new(Vec::new());
 
-/// A namespace's devices leave sysfs with it (Linux
-/// default_device_exit_batch unregistering them)
+/// A namespace's devices are unregistered with it (Linux cleanup_net ->
+/// default_device_exit_batch, loopback last)
 impl Drop for NetNamespace {
     fn drop(&mut self) {
         // Walked through `&mut`: no reader or writer is left
-        let kdevs = self
-            .devices
-            .drain()
-            .filter_map(|d| d.kdev.get().cloned())
-            .collect();
-        // Sleeping sysfs work: deferred (Linux cleanup_net runs from a
-        // workqueue); the last reference may drop in any context
-        crate::net::sysfs::netns_exit(kdevs);
+        let devs = self.devices.drain().collect();
+        // Sleeping RTNL and sysfs work: deferred (Linux cleanup_net runs
+        // from a workqueue); the last reference may drop in any context
+        crate::net::rtnl::netns_exit(devs);
     }
 }
 

@@ -24,7 +24,9 @@ use crate::net::inet::fib::{
     self, FibConfig, FibEntry, FlowKey, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, RT_TABLE_MAIN,
     RTNH_F_LINKDOWN, RouteType,
 };
-use crate::net::inet::ifaddr::{self, IFA_F_PERMANENT, IFNAMSIZ, INFINITY_LIFE_TIME, InIfaddr};
+use crate::net::inet::ifaddr::{
+    self, IFA_F_PERMANENT, IFNAMSIZ, INFINITY_LIFE_TIME, IfaLabel, InIfaddr,
+};
 use crate::net::inet::route;
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::neigh::{self, NeighInfo, nud};
@@ -333,17 +335,18 @@ impl RtDump {
         }
     }
 
-    /// Fill messages for `items[pos..]` into the part while they fit
-    /// (Linux: a dump's fill meets EMSGSIZE, the part ends there and the
-    /// next resumes at that object); one too large for an empty part
-    /// ends the dump with EMSGSIZE
+    /// Fill messages for the objects of `items` past `pos` into the
+    /// part while they fit (Linux: a dump's fill meets EMSGSIZE, the
+    /// part ends there and the next resumes at that object); one too
+    /// large for an empty part ends the dump with EMSGSIZE. `items` may
+    /// be an RCU walk: nothing here allocates.
     fn take_nl<T>(
         &mut self,
         nb: &mut NlBuf<'_>,
-        items: &[T],
-        f: impl Fn(&mut NlBuf<'_>, &T) -> Result<(), KernelError>,
+        items: impl IntoIterator<Item = T>,
+        f: impl Fn(&mut NlBuf<'_>, T) -> Result<(), KernelError>,
     ) -> Result<bool, KernelError> {
-        for it in items.iter().skip(self.pos) {
+        for it in items.into_iter().skip(self.pos) {
             if let Err(e) = f(nb, it) {
                 return if nb.is_empty() { Err(e) } else { Ok(false) };
             }
@@ -380,15 +383,17 @@ impl DumpCb for RtDump {
                 Ok(self.take(buf, &devs, |d| fill_link(d, RTM_NEWLINK, f, seq, pid, 0)))
             }
             DumpKind::Addr(only) => {
-                let addrs: Vec<(Arc<NetDevice>, InIfaddr)> = net
-                    .devices()
-                    .into_iter()
+                // Linux inet_dump_ifaddr: devices and addresses walked
+                // under RCU, filled into the part as they are reached
+                let g = crate::sync::rcu::read_lock();
+                let addrs = net
+                    .devices_rcu(&g)
                     .filter(|d| only == 0 || d.ifindex() == only)
-                    .flat_map(|d| d.inet_addrs().into_iter().map(move |a| (d.clone(), a)))
-                    .collect();
-                Ok(self.take(buf, &addrs, |(d, a)| {
-                    fill_addr(d, a, RTM_NEWADDR, f, seq, pid)
-                }))
+                    .flat_map(|d| d.in_dev().addrs(&g).map(move |a| (d, a)));
+                let mut nb = NlBuf::new(buf, DUMP_SIZE);
+                self.take_nl(&mut nb, addrs, |nb, (d, a)| {
+                    fill_addr(nb, d, a, RTM_NEWADDR, f, seq, pid)
+                })
             }
             DumpKind::Route(table) => {
                 let rts: Vec<Arc<FibEntry>> = net
@@ -652,51 +657,84 @@ fn addr_dump_kind(net: &NetNamespace, p: &[u8], strict: bool, flags: &mut u16) -
     DumpKind::Addr(ifm.index)
 }
 
-/// RTM_NEWADDR/DELADDR message (Linux inet_fill_ifaddr)
+/// Largest address message (Linux inet_nlmsg_size)
+const ADDR_NLMSG_SIZE: usize = msg_size(IFADDRMSG_LEN)
+    + attr_size(4) * 3 // IFA_ADDRESS, IFA_LOCAL, IFA_BROADCAST
+    + attr_size(IFNAMSIZ) // IFA_LABEL
+    + attr_size(1) // IFA_PROTO
+    + attr_size(4) // IFA_FLAGS
+    + attr_size(4) // IFA_RT_PRIORITY
+    + attr_size(16); // IFA_CACHEINFO
+
+/// An RTM_NEWADDR/DELADDR message in `nb` (Linux inet_fill_ifaddr):
+/// EMSGSIZE, nothing left behind, if it does not fit
 pub fn fill_addr(
+    nb: &mut NlBuf<'_>,
     dev: &NetDevice,
     ifa: &InIfaddr,
     ty: u16,
     flags: u16,
     seq: u32,
     pid: u32,
-) -> Vec<u8> {
-    let mut m = Msg::new(ty, flags, seq, pid);
+) -> Result<(), KernelError> {
+    let ifa_flags = ifa.flags();
     let mut h = [0u8; IFADDRMSG_LEN];
     h[0] = AF_INET;
     h[1] = ifa.prefixlen;
-    h[2] = ifa.flags as u8;
+    h[2] = ifa_flags as u8; // ifa_flags holds the low byte
     h[3] = ifa.scope;
     h[4..8].copy_from_slice(&dev.ifindex().to_ne_bytes());
-    m.put(&h)
-        .attr(IFA_ADDRESS, &ifa.address.to_be_bytes())
-        .attr(IFA_LOCAL, &ifa.local.to_be_bytes());
-    if !ifa.broadcast.is_unspecified() {
-        m.attr(IFA_BROADCAST, &ifa.broadcast.to_be_bytes());
+    let m = nb.msg_put(ty, flags, seq, pid, &h)?;
+    match addr_attrs(nb, ifa, ifa_flags) {
+        Ok(()) => {
+            nb.msg_end(m);
+            Ok(())
+        }
+        Err(e) => {
+            nb.msg_cancel(m);
+            Err(e)
+        }
     }
-    m.str(IFA_LABEL, &ifa.label);
-    if ifa.proto != 0 {
-        m.u8(IFA_PROTO, ifa.proto);
-    }
-    m.u32(IFA_FLAGS, ifa.flags);
-    if ifa.rt_priority != 0 {
-        m.u32(IFA_RT_PRIORITY, ifa.rt_priority);
-    }
-    let ci: Vec<u8> = [INFINITY_LIFE_TIME, INFINITY_LIFE_TIME, 0, 0]
-        .iter()
-        .flat_map(|v| v.to_ne_bytes())
-        .collect();
-    m.attr(IFA_CACHEINFO, &ci);
-    m.finish()
 }
 
-/// Announce an address change to RTNLGRP_IPV4_IFADDR
+/// An address's attributes (inet_fill_ifaddr's nla_puts)
+fn addr_attrs(nb: &mut NlBuf<'_>, ifa: &InIfaddr, flags: u32) -> Result<(), KernelError> {
+    nb.put(IFA_ADDRESS, &ifa.address.to_be_bytes())?;
+    nb.put(IFA_LOCAL, &ifa.local.to_be_bytes())?;
+    if !ifa.broadcast.is_unspecified() {
+        nb.put(IFA_BROADCAST, &ifa.broadcast.to_be_bytes())?;
+    }
+    // NUL-terminated (nla_put_string)
+    let label = ifa.label.as_str().as_bytes();
+    let mut l = [0u8; IFNAMSIZ];
+    l[..label.len()].copy_from_slice(label);
+    nb.put(IFA_LABEL, &l[..=label.len()])?;
+    let proto = ifa.proto();
+    if proto != 0 {
+        nb.put(IFA_PROTO, &[proto])?;
+    }
+    nb.put_u32(IFA_FLAGS, flags)?;
+    let prio = ifa.rt_priority();
+    if prio != 0 {
+        nb.put_u32(IFA_RT_PRIORITY, prio)?;
+    }
+    // struct ifa_cacheinfo: preferred, valid, cstamp, tstamp
+    let mut ci = [0u8; 16];
+    ci[0..4].copy_from_slice(&INFINITY_LIFE_TIME.to_ne_bytes());
+    ci[4..8].copy_from_slice(&INFINITY_LIFE_TIME.to_ne_bytes());
+    nb.put(IFA_CACHEINFO, &ci)
+}
+
+/// Announce an address change to RTNLGRP_IPV4_IFADDR (Linux rtmsg_ifa:
+/// a message sized first, then filled; dropped if no memory)
 pub fn notify_addr(net: &NetNamespace, dev: &NetDevice, ifa: &InIfaddr, ty: u16, nl: NlInfo) {
-    notify(
-        net,
-        fill_addr(dev, ifa, ty, 0, nl.seq, nl.portid),
-        RTNLGRP_IPV4_IFADDR,
-    );
+    let Ok(mut v) = nlmsg_new(ADDR_NLMSG_SIZE) else {
+        return;
+    };
+    let mut nb = NlBuf::new(&mut v, ADDR_NLMSG_SIZE);
+    if fill_addr(&mut nb, dev, ifa, ty, 0, nl.seq, nl.portid).is_ok() {
+        notify(net, v, RTNLGRP_IPV4_IFADDR);
+    }
 }
 
 /// RTM_NEWADDR (Linux inet_rtm_newaddr)
@@ -727,21 +765,17 @@ fn newaddr(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelErr
         .ok_or(KernelError::NoDevice)?;
     let mut ifa = InIfaddr::new(local, ifm.prefixlen, dev.name());
     ifa.address = a.in_addr(IFA_ADDRESS)?.unwrap_or(local);
-    ifa.flags = a.u32(IFA_FLAGS)?.unwrap_or(u32::from(ifm.flags)) | IFA_F_PERMANENT;
+    ifa.set_flags(a.u32(IFA_FLAGS)?.unwrap_or(u32::from(ifm.flags)) | IFA_F_PERMANENT);
     ifa.scope = ifm.scope;
     if let Some(b) = a.in_addr(IFA_BROADCAST)? {
         ifa.broadcast = b;
     }
     if let Some(l) = a.str(IFA_LABEL, IFNAMSIZ)? {
-        ifa.label = l.into();
+        ifa.label = IfaLabel::new(l);
     }
-    ifa.rt_priority = a.u32(IFA_RT_PRIORITY)?.unwrap_or(0);
-    ifa.proto = a.u8(IFA_PROTO)?.unwrap_or(0);
-    let exists = dev
-        .inet_addrs()
-        .iter()
-        .any(|x| x.prefixlen == ifa.prefixlen && ifa.matches(x.address) && x.local == ifa.local);
-    if !exists {
+    ifa.set_rt_priority(a.u32(IFA_RT_PRIORITY)?.unwrap_or(0));
+    ifa.set_proto(a.u8(IFA_PROTO)?.unwrap_or(0));
+    if ifaddr::find_matching_ifa(&dev, &ifa).is_none() {
         ifaddr::inet_insert_ifa(&r, net, &dev, ifa, nl)?;
     } else if h.flags & NLM_F_EXCL != 0 || h.flags & NLM_F_REPLACE == 0 {
         return Err(KernelError::AlreadyExists);
@@ -763,9 +797,9 @@ fn deladdr(sk: &NlSock, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
     let dev = net
         .dev_get_by_index(ifm.index)
         .ok_or(KernelError::NoDevice)?;
-    let victim = dev.inet_addrs().into_iter().find(|x| {
+    let victim = dev.in_dev().ifa_list.find(|x| {
         local.is_none_or(|l| l == x.local)
-            && label.is_none_or(|l| l == x.label)
+            && label.is_none_or(|l| l == x.label.as_str())
             && address.is_none_or(|ad| ifm.prefixlen == x.prefixlen && x.matches(ad))
     });
     let ifa = victim.ok_or(KernelError::AddressNotAvailable)?;

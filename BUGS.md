@@ -105,6 +105,11 @@ NIC removal: e1000 leaves the function's bus mastering and memory
 space on (no pci_disable_device) and its BAR mapped (no iounmap); an
 unregistered `NetDevice` lives on while queued skbs reference it
 (no netdev_wait_allrefs; it is down and driverless).
+netns: no active/passive refcount split (Linux net->ns.count vs
+net->passive), so the cleanup_net / default_device_exit_batch work
+(`rtnl::netns_exit`, from `NetNamespace`'s drop in `ns/net.rs`) runs
+after the struct is freed and cannot call `rtnl::unregister_netdevice`
+or `NetDevice::net`.
 
 
 The TCP send and receive queues are one contiguous `VecDeque<u8>`

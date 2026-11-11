@@ -4256,7 +4256,7 @@ not rely on either.
 | `NetNamespace.devices` | `RcuList` (Linux dev_base_head) | readers under RCU, any context; writers thread only | registration and unlisting run under RTNL (or before the namespace is listed) and take the list's leaf writer lock; lookups (`get_device`, `dev_get_by_index`) walk it under RCU and take a reference, no lock, no copy; `/proc/net/dev` formats under the guard into a `SeqBuf` (fs/proc/seq.rs, Linux seq_file: a fixed buffer, the walk rerun into a doubled one on overflow), allocating nothing inside; `devices()` references every device for work done per device; unlisting returns after a grace period (Linux synchronize_net), so no reader still walks over the device |
 | `NetNamespace.loopback`, `UdpTable.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes); the UDP port table reads each candidate's `Inet.addr` under its lock |
 | `Fib.tables` (`net/inet/fib.rs`, per netns) | `spin::RwLock` | thread only | leaf; written only under RTNL; read by input/output routing (softnet, socket syscalls, possibly under `sk_lock`) and dumps; returns `Arc<FibEntry>` clones; notifications are sent after the guard is dropped |
-| `NetDevice.addrs` (IPv4 list; IPv6 later) | `spin::RwLock` | thread only | leaf; written only under RTNL (`inet::ifaddr`), read via snapshots (`inet_addrs()`) |
+| `InDevice.ifa_list` (`NetDevice.ip_ptr`, Linux in_device ifa_list; IPv6 later), `ifaddr::INET_ADDR_LST` (Linux inet_addr_lst: 256 chains by namespace and local address) | `RcuList`s (their `ends` spin leaves) | readers under RCU, any context; writers thread only | changed only under RTNL (`inet::ifaddr`): an address is inserted at its place (a primary after the last primary of its scope, a secondary last: `insert_after`) and on its hash chain, and unlinked from both and freed after a grace period with one callback (`RcuUnlinked::defer_with`, Linux inet_free_ifa); NLM_F_REPLACE changes its `flags`/`rt_priority`/`proto` atomics in place. Readers (source selection on transmit, possibly under a socket lock; `ip_dev_find`; address dumps filling an `NlBuf`) walk under `rcu::read_lock`, no lock, no copy |
 | `NeighTable.hash` (`net/core/neigh.rs`; `NetNamespace.arp`, IPv6 ND later) | `spin::RwLock` | thread only (softnet, socket output, ktimers/N) | (ifindex, address) -> `Arc<Neighbour>`; lookups drop the guard; GC/flush take each entry's `inner` under the write lock (order hash -> inner) |
 | `Neighbour.inner` | `spin::Mutex` | thread only | leaf: NUD state + bounded unresolved queue (unres_qlen_bytes). Never held while transmitting, soliciting, reporting errors or arming the neighbour `Alarm` (the next deadline is read under it, armed after): state changes return actions run after the unlock |
 | neighbour `TABLES` | `spin::Mutex` | thread only | leaf (snapshot of registered tables). One `timer::Alarm` runs all tables' due entries and GC on `ktimers/N`, armed with no table lock held |
@@ -4307,8 +4307,9 @@ RTNL (sleeping; configuration)   TcpSock.rd (sleeping) -> TcpSock.cb (listener b
   |                                 -> TcpSock.queue / RxQueue.q
   |                                 -> TCP TIMERS (leaf); Alarm.st -> timer base
   v                                 |
-NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
-  the guard before returning)
+NetNamespace tables, Fib.tables (RwLocks; lookups drop the guard before
+  returning); address lists (RCU readers; writers under RTNL take the
+  lists' leaf `ends`)
   -> NeighTable.hash -> Neighbour.inner (dropped before any transmit)
   (RawTable.socks -> Inet.addr; FragTable.st, PmtuCache.m, IcmpRate.st,
    Sock.errq, RxQueue.q: leaves, never held while transmitting)
@@ -4378,6 +4379,13 @@ line's `IrqDesc.lock` every dispatch of the line holds), `netif_napi_del`s and f
 memory. A `NetDevice` still referenced (queued skbs) stays down and
 driverless; hk cannot wait for those references (Linux
 netdev_wait_allrefs) because skbs in socket queues hold them.
+A namespace that is gone (its last reference dropped, in any context)
+hands its devices to the system workqueue (`rtnl::netns_exit`, Linux
+cleanup_net -> default_device_exit_batch), which under RTNL closes and
+detaches each, loopback last, unlinks its addresses from their lists
+and `INET_ADDR_LST` (freed after a grace period) and removes its sysfs
+device; its FIB, ARP table and sockets went with the namespace, so
+nothing is announced.
 
 **Driver ISR rules (e1000 pattern):** read ICR (read-to-clear; 0 => not
 ours on a shared line, return false), write IMC (mask all), record causes
@@ -4428,9 +4436,8 @@ backlog instead of delivering inline; the loopback flush
 (`netif_rx_flush_local`) runs only at the end of socket calls, with no
 lock held. A TIME_WAIT entry transmits under its `inner` the same way.
 
-**Known gaps (later phases):** RCU for the read-mostly tables (FIB,
-device list, address lists: COW snapshots are the intended next step;
-see plan 3a).
+**Known gaps (later phases):** RCU for the FIB (its tables are still a
+spin `RwLock` read through `Arc` copies).
 
 #### Key Device Driver Rules
 

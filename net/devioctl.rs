@@ -197,11 +197,11 @@ fn ifconf(net: &NetNamespace, arg: u64) -> Result<i64, KernelError> {
     let buf = u64::from_ne_bytes(hdr[8..16].try_into().unwrap());
     let mut out: Vec<u8> = Vec::new();
     for dev in net.devices() {
-        for ifa in dev.inet_addrs() {
+        for ifa in dev.in_dev().ifa_list.snapshot() {
             let mut r = Ifreq {
                 raw: [0; IFREQ_LEN],
             };
-            r.set_name(&ifa.label);
+            r.set_name(ifa.label.as_str());
             r.set_sin(ifa.local);
             out.extend_from_slice(&r.raw);
         }
@@ -249,12 +249,10 @@ fn devinet(net: &NetNamespace, cmd: u32, ifr: &mut Ifreq) -> Result<(), KernelEr
     let label = alloc::string::String::from(ifr.name());
     let r = rtnl::lock();
     let dev = dev_by_name(net, label.split(':').next().unwrap_or(""))?;
-    let addrs = dev.inet_addrs();
+    let addrs = &dev.in_dev().ifa_list;
     let found = addrs
-        .iter()
-        .find(|a| family == AF_INET && a.label == label && a.local == sin)
-        .or_else(|| addrs.iter().find(|a| a.label == label))
-        .cloned();
+        .find(|a| family == AF_INET && a.label.as_str() == label && a.local == sin)
+        .or_else(|| addrs.find(|a| a.label.as_str() == label));
     let ctx = Ctx {
         r: &r,
         net,
@@ -298,7 +296,7 @@ impl Ctx<'_> {
     /// SIOCSIFADDR: classful prefix and broadcast; 0.0.0.0 removes
     fn set_addr(
         &self,
-        old: Option<InIfaddr>,
+        old: Option<Arc<InIfaddr>>,
         sin: Ipv4Addr,
         label: &str,
     ) -> Result<(), KernelError> {
@@ -307,11 +305,10 @@ impl Ctx<'_> {
             Some(o) if o.local == sin => return Ok(()),
             Some(o) => {
                 self.del(&o);
-                InIfaddr {
-                    broadcast: Ipv4Addr(0),
-                    scope: RT_SCOPE_UNIVERSE,
-                    ..o
-                }
+                let mut n = o.dup();
+                n.broadcast = Ipv4Addr(0);
+                n.scope = RT_SCOPE_UNIVERSE;
+                n
             }
             None => InIfaddr::new(sin, plen, label),
         };
@@ -331,29 +328,26 @@ impl Ctx<'_> {
     }
 
     /// SIOCSIFBRDADDR
-    fn set_brd(&self, ifa: InIfaddr, sin: Ipv4Addr) -> Result<(), KernelError> {
+    fn set_brd(&self, ifa: Arc<InIfaddr>, sin: Ipv4Addr) -> Result<(), KernelError> {
         if ifa.broadcast == sin {
             return Ok(());
         }
         self.del(&ifa);
-        self.add(InIfaddr {
-            broadcast: sin,
-            ..ifa
-        })
+        let mut n = ifa.dup();
+        n.broadcast = sin;
+        self.add(n)
     }
 
     /// SIOCSIFNETMASK: a broadcast derived from the old mask follows
-    fn set_mask(&self, ifa: InIfaddr, sin: Ipv4Addr) -> Result<(), KernelError> {
+    fn set_mask(&self, ifa: Arc<InIfaddr>, sin: Ipv4Addr) -> Result<(), KernelError> {
         let plen = bad_mask(sin, Ipv4Addr(0)).ok_or(KernelError::InvalidArgument)?;
         if ifa.mask() == sin {
             return Ok(());
         }
         let old_mask = ifa.mask();
         self.del(&ifa);
-        let mut n = InIfaddr {
-            prefixlen: plen,
-            ..ifa
-        };
+        let mut n = ifa.dup();
+        n.prefixlen = plen;
         if self.bcast_ok(plen) && n.broadcast.0 == n.local.0 | !old_mask.0 {
             n.broadcast = Ipv4Addr(n.local.0 | !sin.0);
         }
@@ -440,9 +434,9 @@ fn rtentry_cfg(net: &NetNamespace, cmd: u32, rt: &[u8]) -> Result<FibConfig, Ker
         cfg.oif = dev.ifindex();
         if label.contains(':') {
             let ifa = dev
-                .inet_addrs()
-                .into_iter()
-                .find(|a| a.label == label)
+                .in_dev()
+                .ifa_list
+                .find(|a| a.label.as_str() == label)
                 .ok_or(KernelError::NoDevice)?;
             cfg.prefsrc = Some(ifa.local);
         }
