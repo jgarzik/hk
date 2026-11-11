@@ -262,10 +262,21 @@ each, as `LOCKDEP:FAIL` (so the boot test fails):
   context switch counts on the CPU) catches a release that re-enables
   interrupts while the count is nonzero.
 
+Also listed, once per site, as `LOCKDEP:ATOMIC_ALLOC` (an audit list,
+not yet a failure; ROADMAP phase A): a heap allocation with no GFP named
+(implicitly GFP_KERNEL) in atomic context, i.e. a spin lock of any kind
+held, preemption or interrupts off (Linux might_alloc ->
+might_sleep_if). Not checked in an interrupt handler, under PF_MEMALLOC
+or before the scheduler runs tasks. The site is the innermost
+`IrqSpinlock` taken (`lock`/`try_lock` are `#[track_caller]` in lockdep
+builds; each CPU keeps the sites of the ones it holds, report only,
+like Linux's preempt_disable_ip), else the innermost tracked spin lock,
+else the `local_irq_save` that turned interrupts off.
+
 The held-lock stacks are per CPU (the kernel is not preemptive and a task
 never sleeps holding a spin lock, which is itself checked), the edge
 table is a fixed array: nothing allocates. Power-off prints a
-`lockdep: N reports, M order edges` summary. `IrqSpinlock` acquisitions
+`lockdep: N reports, M order edges, K atomic allocation sites` summary. `IrqSpinlock` acquisitions
 are not tracked for order (they are leaves or near-leaves); they count
 through the preempt count and the held count above.
 

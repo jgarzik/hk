@@ -688,18 +688,21 @@ creation, but nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
 bpf_map_charge_memlock / memcg accounting), so many maps can still use
 up memory.
 
-## Heap allocations under spin locks
+## Heap allocations in atomic context
 
-**Location**: `mm/slab.rs` (`heap_gfp`); sites listed by LOCKDEP
+**Location**: `mm/slab.rs` (`heap_gfp`), `sync/lockdep.rs`
+(`might_alloc`); sites listed by LOCKDEP
 
-The heap picks GFP_ATOMIC by itself under a spin lock, so an allocation
-there takes the atomic reserve silently (Linux needs it named, and
-might_alloc reports a GFP_KERNEL one in atomic context). A LOCKDEP boot
-lists each lock allocated under once (`LOCKDEP:ATOMIC_ALLOC ... under
-<lock> (taken at ...)`; the shutdown summary counts them): mostly
-collections grown under spin mutexes, in fs, net, task and
-ipc (procfs: only its mount-time tree building). Each wants its allocation moved out of the
-lock (preallocate, or a sleeping lock as in Linux): ROADMAP phase A.
+The heap takes no GFP: in atomic context (a spin lock of any kind,
+preemption or interrupts off) it allocates without reclaim down to the
+min watermark (in effect GFP_NOWAIT), where Linux requires the GFP
+named and might_alloc reports an unnamed (GFP_KERNEL) one. A LOCKDEP
+boot lists each site once (`LOCKDEP:ATOMIC_ALLOC`, with the IRQ-safe
+lock, spin lock or `local_irq_save` it was made under; the shutdown
+summary counts them): mostly collections grown, or copied, under spin
+locks in net, fs, io, task, ipc, cgroup and keys, and IRQ-safe locks
+in epoll, inotify, fanotify, bpf maps and the swap cache. ROADMAP
+phase A (A0-A3).
 
 ## Scheduler gaps (deviations from Linux)
 
