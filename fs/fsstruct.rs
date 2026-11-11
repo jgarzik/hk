@@ -155,14 +155,23 @@ impl FsStruct {
     /// Creates a new FsStruct with the same pwd/root/umask,
     /// but independent (changes don't affect original).
     /// The underlying mount/dentry objects are still shared via Arc.
+    ///
+    /// The paths (references) and umask are read under the lock, the
+    /// new struct allocated after it (Linux copy_fs_struct allocates,
+    /// then copies under fs->lock)
     pub fn copy(&self) -> Result<Arc<Self>, KernelError> {
-        let inner = self.inner.lock();
+        // Pinned under the lock (Linux path_get under fs->lock): the
+        // mount count, an atomic, no allocation
+        let (pwd, root, umask) = {
+            let inner = self.inner.lock();
+            (
+                Pinned::new(inner.pwd.0.clone()),
+                Pinned::new(inner.root.0.clone()),
+                inner.umask,
+            )
+        };
         try_arc(Self {
-            inner: Mutex::new(FsStructInner {
-                pwd: Pinned::new(inner.pwd.0.clone()),
-                root: Pinned::new(inner.root.0.clone()),
-                umask: inner.umask,
-            }),
+            inner: Mutex::new(FsStructInner { pwd, root, umask }),
             users: core::sync::atomic::AtomicUsize::new(1),
         })
     }
