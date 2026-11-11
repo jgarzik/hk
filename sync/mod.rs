@@ -17,6 +17,7 @@ pub mod lockdep;
 mod locked_by;
 mod mutex;
 mod racy;
+pub mod rcu;
 mod rwsem;
 mod seqlock;
 pub mod spin;

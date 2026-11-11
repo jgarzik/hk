@@ -283,9 +283,11 @@ pub(crate) fn kmain() -> ! {
     })
     .expect("Failed to create user task");
 
-    // Schedulers for the APs, then the kernel threads: timer callbacks
+    // RCU grace periods (rcu_gp) before a second CPU runs anything;
+    // schedulers for the APs, then the kernel threads: timer callbacks
     // (ktimers/N), the system workqueue worker, the per-CPU network
     // softnet threads. Then interrupts on: pid 1 may sleep from here.
+    crate::sync::rcu::start();
     task::percpu::init_ap_schedulers();
     crate::time::timer::start_ktimers();
     crate::task::stop_machine::start();

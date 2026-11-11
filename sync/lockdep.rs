@@ -30,7 +30,7 @@
 #[cfg(feature = "lockdep")]
 pub use imp::{
     acquire, irq_enter, irq_exit, irqs_off, irqs_on, irqsafe_acquire, irqsafe_release, might_alloc,
-    might_sleep, release,
+    might_sleep, rcu_lock, rcu_unlock, release,
 };
 
 /// Where a lock or interrupt state was taken
@@ -69,6 +69,16 @@ pub fn irqs_off(_at: Loc) {}
 #[cfg(not(feature = "lockdep"))]
 #[inline(always)]
 pub fn irqs_on() {}
+
+/// An RCU read-side section was entered at `at` / left (no-ops without
+/// `lockdep`)
+#[cfg(not(feature = "lockdep"))]
+#[inline(always)]
+pub fn rcu_lock(_at: Loc) {}
+
+#[cfg(not(feature = "lockdep"))]
+#[inline(always)]
+pub fn rcu_unlock() {}
 
 /// The heap is about to allocate `size` bytes (no-op without `lockdep`)
 #[cfg(not(feature = "lockdep"))]
@@ -119,6 +129,10 @@ mod imp {
         irqsafe_at: [Cell<Option<Loc>>; IRQSAFE_AT],
         /// The `local_irq_save` that turned interrupts off (report only)
         irqoff_at: Cell<Option<Loc>>,
+        /// RCU read-side nesting and where the outermost began (report
+        /// only; Linux rcu_lock_map)
+        rcu: Cell<u32>,
+        rcu_at: Cell<Option<Loc>>,
     }
 
     /// `IrqSpinlock` nesting depths whose sites are kept
@@ -137,6 +151,8 @@ mod imp {
         irqsafe: Cell::new(0),
         irqsafe_at: [const { Cell::new(None) }; IRQSAFE_AT],
         irqoff_at: Cell::new(None),
+        rcu: Cell::new(0),
+        rcu_at: Cell::new(None),
     })];
 
     #[derive(Clone, Copy)]
@@ -399,6 +415,28 @@ mod imp {
         }
     }
 
+    /// An RCU read-side section was entered at `at`
+    pub fn rcu_lock(at: Loc) {
+        if let Some(c) = this_cpu() {
+            let n = c.rcu.get();
+            if n == 0 {
+                c.rcu_at.set(Some(at));
+            }
+            c.rcu.set(n + 1);
+        }
+    }
+
+    /// An RCU read-side section was left
+    pub fn rcu_unlock() {
+        if let Some(c) = this_cpu() {
+            let n = c.rcu.get().saturating_sub(1);
+            c.rcu.set(n);
+            if n == 0 {
+                c.rcu_at.set(None);
+            }
+        }
+    }
+
     /// A `local_irq_restore` turned interrupts back on
     pub fn irqs_on() {
         if let Some(c) = this_cpu() {
@@ -481,7 +519,8 @@ mod imp {
     /// the scheduler runs tasks (Linux skips SYSTEM_BOOTING).
     /// Listed once per site as `LOCKDEP:ATOMIC_ALLOC` (an audit list,
     /// not a failure): the innermost `IrqSpinlock` taken, else the
-    /// innermost tracked spin lock, else where interrupts went off.
+    /// innermost tracked spin lock, else the RCU read-side section, else
+    /// where interrupts went off.
     pub fn might_alloc(size: usize, align: usize) {
         use crate::arch::{CurrentArch, PerCpuOps};
         let Some(c) = this_cpu() else {
@@ -508,9 +547,11 @@ mod imp {
             .and_then(|i| c.irqsafe_at[i.min(IRQSAFE_AT - 1)].get());
         let spin = depth.checked_sub(1).and_then(|i| c.held[i].get());
         let irqoff = if off { c.irqoff_at.get() } else { None };
+        let rcu = c.rcu_at.get();
         let k = irqsafe
             .map(|l| key(l) ^ 0x10)
             .or(spin.map(|h| key(h.class) ^ 0x11))
+            .or(rcu.map(|l| key(l) ^ 0x14))
             .or(irqoff.map(|l| key(l) ^ 0x12))
             .unwrap_or(0x13 ^ (u64::from(pc) << 8));
         if !atomic_first(k | 1) {
@@ -520,13 +561,14 @@ mod imp {
         NATOMIC.fetch_add(1, Ordering::Relaxed);
         crate::printkln!(
             "LOCKDEP:ATOMIC_ALLOC heap allocation of {} (align {}) in atomic context: \
-             IRQ-safe lock taken at {}; spin lock {} taken at {}; irqs off at {}; \
-             preempt count {}, tid {}",
+             IRQ-safe lock taken at {}; spin lock {} taken at {}; rcu at {}; \
+             irqs off at {}; preempt count {}, tid {}",
             size,
             align,
             Site(irqsafe),
             Site(spin.map(|h| h.class)),
             Site(spin.map(|h| h.at)),
+            Site(rcu),
             Site(irqoff),
             pc,
             crate::task::percpu::current_tid()

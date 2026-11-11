@@ -223,6 +223,46 @@ readers share it (Linux read_seqlock_excl excludes them), lockless ones
 sample the sequence. Used for `dentry::RENAME_LOCK` (Linux rename_lock).
 Both are built on `SeqCount` (Linux seqcount_t), the sequence alone.
 
+### 1.4.2 RCU (sync/rcu.rs)
+
+Linux RCU, the non-preemptible flavor (kernel/rcu/tree.c with one flat
+level instead of the rcu_node tree). A reader holds an `RcuReadGuard`
+(`rcu::read_lock`, Linux rcu_read_lock): it raises the preempt count,
+so a reader never sleeps (`might_sleep` reports it), an unnamed
+allocation in it is listed by might_alloc (1.5; lockdep builds show
+where it began), and its CPU passes no quiescent state while it holds
+one. `RcuArc<T>` is an RCU-protected pointer (Linux `__rcu`): `read`
+borrows the current version for the guard's lifetime
+(rcu_dereference, Acquire), `get` takes a reference to it, `replace`
+publishes a new one (rcu_assign_pointer, Release) and returns the old
+as `RcuRetired`, released after a grace period when it drops
+(synchronize_rcu; it panics in atomic context, where it would wait for
+its own CPU or, with one CPU, not at all). Updaters serialize under
+their own lock.
+
+Quiescent states, per CPU: a context switch (recorded under the rq
+lock, reported later), each idle-loop pass, and a clock interrupt that
+arrived with the preempt count zero outside any other interrupt (Linux
+rcu_flavor_sched_clock_irq: user mode, or kernel code outside every
+spin lock and reader). A grace period (`rcu_gp` kthread): under `NODE`
+(IrqSpinlock leaf, Linux rcu_node.lock), copy the online CPUs into its
+mask and make `GP_SEQ` odd; each CPU, at a quiescent state after seeing
+it odd, takes `NODE` and clears its bit only if `GP_SEQ` is still the
+value it saw (Linux rcu_report_qs_rdp: a context switch recorded in an
+earlier grace period clears nothing); the last one wakes `rcu_gp`
+after releasing `NODE`, which makes `GP_SEQ` even under it and wakes
+`synchronize` callers (`GP_DONE`). Fences: SeqCst before a report and
+around both ends of a grace period (Linux's smp_mb in
+rcu_gp_init/cleanup and smp_mb__after_unlock_lock). Taken in the clock
+interrupt, the idle loop and `rcu_gp`, never with another lock held.
+
+Assumptions: a CPU joins grace periods (`rcu::cpu_online`) when its
+scheduler starts, before it runs anything, and never leaves (no CPU
+hotplug); every CPU takes the clock interrupt every tick (no NOHZ), so
+idle CPUs report. `rcu_gp` starts while the boot CPU is the only one
+online (before the APs get schedulers); with one CPU online
+`synchronize` returns at once (Linux rcu_blocking_is_gp).
+
 ### 1.5 Lockdep-lite (`sync::lockdep`, feature `lockdep`)
 
 Kernel code takes `crate::sync::spin::{Mutex, RwLock}` (never the `spin`
@@ -271,7 +311,8 @@ or before the scheduler runs tasks. The site is the innermost
 `IrqSpinlock` taken (`lock`/`try_lock` are `#[track_caller]` in lockdep
 builds; each CPU keeps the sites of the ones it holds, report only,
 like Linux's preempt_disable_ip), else the innermost tracked spin lock,
-else the `local_irq_save` that turned interrupts off.
+else the outermost RCU read-side section, else the `local_irq_save`
+that turned interrupts off.
 
 The held-lock stacks are per CPU (the kernel is not preemptive and a task
 never sleeps holding a spin lock, which is itself checked), the edge
@@ -878,8 +919,9 @@ own gets the shared knullfs fs_struct from `get_task_fs` and
 `ack` WaitQueue. A thread created without a CPU gets one round-robin;
 every kernel thread stays on its CPU (`cpus_mask` holds only it, Linux
 kthread_bind). Standing threads: `ktimers/N` (one per CPU, runs its SOFT
-timer callbacks), the system workqueue worker, `softnet/N` (one per CPU,
-network receive; see 3.10), `kselftest` (boot only).
+timer callbacks), `rcu_gp` (RCU grace periods, 1.4.2), the system
+workqueue worker, `softnet/N` (one per CPU, network receive; see 3.10),
+`kselftest` (boot only).
 
 **Stoppers (task/stop_machine.rs, Linux stop_machine.c):**
 `migration/N`, one per CPU at the highest priority, runs calls queued

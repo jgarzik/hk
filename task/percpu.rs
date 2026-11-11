@@ -1364,6 +1364,9 @@ fn idle_task_entry() -> ! {
     loop {
         // Yield immediately to give other tasks priority
         yield_now();
+        // Idle holds nothing: a quiescent state (Linux rcu_idle_enter's
+        // extended one, here reported each pass)
+        crate::sync::rcu::idle();
         // Nothing to run here: pull from a busier CPU (Linux
         // sched_balance_newidle); a task pulled flags us to switch
         sched_balance_rq(crate::cpu::this_id());
@@ -1500,6 +1503,9 @@ fn create_idle_task(cpu_id: u32) -> Result<(), KernelError> {
         PRIORITY_IDLE,
         true,
     )?;
+    // Its ticks report quiescent states from here (Linux
+    // rcutree_online_cpu), before anything runs on it
+    crate::sync::rcu::cpu_online(cpu_id);
     get_percpu_sched(cpu_id)
         .initialized
         .store(true, Ordering::Release);
@@ -3552,6 +3558,7 @@ fn context_switch_locked(
     next: *const Task,
 ) {
     check_switch_atomic();
+    crate::sync::rcu::note_context_switch();
     // Save the outgoing task's user TLS register and GS base (user code
     // may have changed them without a syscall, e.g. msr tpidr_el0, mov
     // gs); the arch switch loads `next`'s
