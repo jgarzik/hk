@@ -122,7 +122,7 @@ fn try_connect(
 ) -> Result<(), KernelError> {
     // The embryo's skb, made before any lock (Linux
     // unix_stream_connect allocates it first)
-    let mut skb = unix_skb(newsk, alloc::vec::Vec::new());
+    let mut skb = unix_skb(newsk, alloc::vec::Vec::new())?;
     ucb_mut(&mut skb).embryo = Some(newsk.clone());
     let skb = try_arc_gfp(skb, Gfp::KERNEL)?;
     let ost = other.st.lock();
@@ -250,7 +250,7 @@ fn send_chunk(
     let size = (m.data.len() - off).min(chunk_max(s));
     s.wmem_wait(timeo)?;
     let data = m.data.take_at(off, size)?;
-    let mut skb = unix_skb(&s.arc(), data);
+    let mut skb = unix_skb(&s.arc(), data)?;
     ucb_mut(&mut skb).creds = scm.creds.take();
     if let Some(f) = scm.fds.take() {
         if too_many_fds() {

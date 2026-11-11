@@ -38,8 +38,9 @@ pub fn prepare(skb: &mut SkBuff, info: RxInfo, sport: u16) {
 }
 
 /// The CLOCK_REALTIME time now (ns), for a skb not stamped on arrival
-pub fn now() -> i128 {
-    crate::time::TIMEKEEPER.current_time().to_nanos()
+pub fn now() -> i64 {
+    // Truncation intended: ktime_t (signed 64-bit ns, past 2262)
+    crate::time::TIMEKEEPER.current_time().to_nanos() as i64
 }
 
 /// A socket's receive queue, bounded by SO_RCVBUF
@@ -182,16 +183,16 @@ pub fn deliver(
 /// SOL_SOCKET control messages (Linux __sock_recv_cmsgs) of a packet
 /// that arrived at `stamp` (CLOCK_REALTIME ns) with the socket's drop
 /// count at `drops`
-pub fn sock_cmsgs(sk: &Sock, m: &mut RecvMsg<'_>, stamp: i128, drops: u32) {
+pub fn sock_cmsgs(sk: &Sock, m: &mut RecvMsg<'_>, stamp: i64, drops: u32) {
     if sk.flag(sf::TIMESTAMPNS) {
         let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&((stamp / 1_000_000_000) as i64).to_ne_bytes());
-        b[8..].copy_from_slice(&((stamp % 1_000_000_000) as i64).to_ne_bytes());
+        b[..8].copy_from_slice(&(stamp / 1_000_000_000).to_ne_bytes());
+        b[8..].copy_from_slice(&(stamp % 1_000_000_000).to_ne_bytes());
         m.cmsg.put(SOL_SOCKET, SCM_TIMESTAMPNS, &b);
     } else if sk.flag(sf::TIMESTAMP) {
         let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&((stamp / 1_000_000_000) as i64).to_ne_bytes());
-        b[8..].copy_from_slice(&((stamp % 1_000_000_000 / 1000) as i64).to_ne_bytes());
+        b[..8].copy_from_slice(&(stamp / 1_000_000_000).to_ne_bytes());
+        b[8..].copy_from_slice(&(stamp % 1_000_000_000 / 1000).to_ne_bytes());
         m.cmsg.put(SOL_SOCKET, SCM_TIMESTAMP, &b);
     }
     if sk.flag(sf::RXQ_OVFL) && drops != 0 {

@@ -150,7 +150,7 @@ pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, K
     let nonblock = flags & MSG_DONTWAIT != 0;
     let mut timeo = s.sk.snd_timeo(nonblock);
     s.wmem_wait(&mut timeo)?;
-    let mut skb = unix_skb(&s.arc(), m.data.take(len)?);
+    let mut skb = unix_skb(&s.arc(), m.data.take(len)?)?;
     ucb_mut(&mut skb).creds = scm.creds;
     if let Some(f) = scm.fds.take() {
         if too_many_fds() {

@@ -103,9 +103,9 @@ pub struct SkBuff {
     mac: Option<usize>,
     /// Start of the IP header of a received packet (None until marked)
     nh: Option<usize>,
-    /// Arrival time, CLOCK_REALTIME ns (Linux skb->tstamp; 0: not
-    /// stamped yet, the receiving socket stamps it as it queues)
-    pub tstamp: i128,
+    /// Arrival time, CLOCK_REALTIME ns (Linux skb->tstamp, a ktime_t;
+    /// 0: not stamped yet, the receiving socket stamps it as it queues)
+    pub tstamp: i64,
     /// The receiving socket's drop count when it was queued (Linux
     /// SOCK_SKB_CB(skb)->dropcount, for SO_RXQ_OVFL)
     pub dropcount: u32,
@@ -130,8 +130,9 @@ pub enum SkbCb {
     /// A netlink message (Linux NETLINK_CB)
     Nl(crate::net::netlink::NlCb),
     /// An AF_UNIX message (Linux UNIXCB and the skb's sock_wfree
-    /// destructor)
-    Unix(crate::net::unix::UnixCb),
+    /// destructor); boxed, so every skb stays small (skbs are passed by
+    /// value down the receive path)
+    Unix(Box<crate::net::unix::UnixCb>),
 }
 
 impl SkbCb {

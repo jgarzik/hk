@@ -64,7 +64,7 @@ pub mod dgram;
 pub mod scm;
 pub mod stream;
 
-use crate::util::kalloc::{try_arc, try_arc_cyclic};
+use crate::util::kalloc::{try_arc, try_arc_cyclic, try_box};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -183,21 +183,23 @@ pub struct UnixCb {
 
 /// A message from `from` of `data`, charged to it (call `wmem_wait`
 /// first); its `Arc` is made by the caller before any lock
-fn unix_skb(from: &Arc<UnixSock>, data: Vec<u8>) -> SkBuff {
+fn unix_skb(from: &Arc<UnixSock>, data: Vec<u8>) -> Result<SkBuff, KernelError> {
     let truesize = data.len() + SKB_OVERHEAD;
     from.wmem.fetch_add(truesize, Ordering::AcqRel);
-    let mut skb = SkBuff::from_vec(data);
-    skb.cb = SkbCb::Unix(UnixCb {
-        wmem: Wmem {
-            from: from.clone(),
-            truesize,
-        },
+    let wmem = Wmem {
+        from: from.clone(),
+        truesize,
+    };
+    let cb = try_box(UnixCb {
+        wmem,
         creds: None,
         fp: Mutex::new(None),
         consumed: AtomicUsize::new(0),
         embryo: None,
-    });
-    skb
+    })?;
+    let mut skb = SkBuff::from_vec(data);
+    skb.cb = SkbCb::Unix(cb);
+    Ok(skb)
 }
 
 /// The `UnixCb` of a message (every skb on a unix queue has one)
