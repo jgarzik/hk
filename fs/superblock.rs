@@ -365,6 +365,7 @@ impl Drop for SuperBlock {
             (a, b)
         };
         drop(weaks);
+        super::inode::sb_list_drain(&self.s_inodes);
         if let Some(root) = self.root.get_mut().take() {
             super::dentry::d_drop_tree(&root);
         }
@@ -512,6 +513,9 @@ pub struct SuperBlock {
     /// wb->b_dirty; `fs_writeback`)
     pub(crate) s_dirty: crate::sync::spin::Mutex<alloc::vec::Vec<Arc<Inode>>>,
 
+    /// Its inodes (Linux s_inodes, under inode_sb_list_lock)
+    pub(super) s_inodes: super::inode::SbInodes,
+
     /// Its inodes that have had inotify watches (Linux s_fsnotify_info)
     pub s_fsnotify: crate::io::inotify::SbMarks,
 
@@ -593,6 +597,7 @@ impl SuperBlock {
             private: RwLock::new(None),
             s_bdev: spin::Once::new(),
             s_dirty: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
+            s_inodes: super::inode::SbInodes::new(WeakList::new()),
             s_fsnotify: crate::io::inotify::SbMarks::default(),
             s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),

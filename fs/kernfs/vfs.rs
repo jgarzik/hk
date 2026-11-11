@@ -85,7 +85,7 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<Arc<Inode>, Kernel
         Kind::Link(_) => (InodeMode::symlink(), 0),
     };
     let now = crate::time::TIMEKEEPER.current_time();
-    let i = try_arc(Inode::new(
+    let i = Inode::alloc(Inode::new(
         kn.ino,
         mode,
         0,

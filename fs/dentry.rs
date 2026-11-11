@@ -835,7 +835,7 @@ mod tests {
     use crate::fs::inode::{InodeMode, NULL_INODE_OPS, Timespec};
 
     fn inode() -> Arc<Inode> {
-        try_arc(Inode::new(
+        Inode::alloc(Inode::new(
             1,
             InodeMode::directory(0o755),
             0,

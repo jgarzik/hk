@@ -1332,7 +1332,7 @@ fn create_pipe_path() -> Result<crate::fs::Path, KernelError> {
     use crate::fs::pseudo::PIPEFS;
 
     let cred = crate::task::percpu::current_cred();
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         crate::fs::anon_inodes::get_next_ino(),
         InodeMode::fifo(0o600),
         cred.fsuid,

@@ -123,7 +123,7 @@ fn of_type(ty: &FileSystemType) -> Option<&'static Pseudo> {
 fn pseudo_mount(ty: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
     let p = of_type(ty).ok_or(KernelError::InvalidArgument)?;
     let sb = SuperBlock::new(ty, &p.ops, 0)?;
-    let root = try_arc(Inode::new(
+    let root = Inode::alloc(Inode::new(
         1,
         InodeMode::directory(0o600),
         0,

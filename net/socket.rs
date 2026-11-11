@@ -195,7 +195,7 @@ fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<FileRef, KernelE
     sock.sk().ino.store(ino, Ordering::Release);
     let cred = &sock.sk().cred;
     let now = crate::time::TIMEKEEPER.current_time();
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         ino,
         InodeMode::socket(0o777),
         cred.fsuid,

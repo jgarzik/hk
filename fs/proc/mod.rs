@@ -723,7 +723,7 @@ fn create_dir_inode(
     data: ProcfsInodeData,
 ) -> Result<Arc<Inode>, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         ino,
         InodeMode::directory(0o555),
         0,
@@ -739,7 +739,7 @@ fn create_dir_inode(
 
 fn create_pid_dir_inode(parent: &Inode, pid: ProcPid) -> Result<Arc<Inode>, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         pid_ino(pid.ino(), 0),
         InodeMode::directory(0o555), // r-xr-xr-x
         0,                           // uid: root
@@ -765,7 +765,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
         "ns" => {
             // Create /proc/<pid>/ns directory
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let inode = try_arc(Inode::new(
+            let inode = Inode::alloc(Inode::new(
                 pid_ino(pid, 1),
                 InodeMode::directory(0o555), // r-xr-xr-x
                 0,
@@ -783,7 +783,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
         "fd" => {
             // Create /proc/<pid>/fd directory
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let inode = try_arc(Inode::new(
+            let inode = Inode::alloc(Inode::new(
                 pid_ino(pid, 100),           // offset 100 for fd dir
                 InodeMode::directory(0o500), // dr-x------ (only owner can read)
                 0,
@@ -806,7 +806,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
         "fdinfo" => {
             // Create /proc/<pid>/fdinfo directory
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let inode = try_arc(Inode::new(
+            let inode = Inode::alloc(Inode::new(
                 pid_ino(pid, 101),           // offset 101 for fdinfo dir
                 InodeMode::directory(0o500), // dr-x------ (only owner can read)
                 0,
@@ -827,7 +827,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
                 .find(|(n, _, _)| *n == name)
                 .ok_or(KernelError::NotFound)?;
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let inode = try_arc(Inode::new(
+            let inode = Inode::alloc(Inode::new(
                 pid_ino(pid, off),
                 InodeMode::symlink(),
                 0,
@@ -848,7 +848,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
         "fail-nth" => {
             let sb = dir.superblock().ok_or(KernelError::Io)?;
             let (uid, gid) = dump_owner(&t);
-            let inode = try_arc(Inode::new(
+            let inode = Inode::alloc(Inode::new(
                 pid_ino(pid, FAIL_NTH_INO),
                 InodeMode::regular(0o644),
                 uid,
@@ -867,7 +867,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
             let (off, mode, generator) = pid_file(name).ok_or(KernelError::NotFound)?;
             let sb = dir.superblock().ok_or(KernelError::Io)?;
             let (uid, gid) = dump_owner(&t);
-            let inode = try_arc(Inode::new(
+            let inode = Inode::alloc(Inode::new(
                 pid_ino(pid, off),
                 InodeMode::regular(mode),
                 uid,
@@ -908,7 +908,7 @@ fn lookup_pid_ns_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode
 
     // A magic link to the namespace (Linux proc_ns_dir_operations:
     // S_IFLNK | 0777)
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         pid_ino(pid, offset),
         InodeMode::symlink(),
         0,
@@ -938,7 +938,7 @@ fn self_link(inode: &Inode) -> Result<Vec<u8>, KernelError> {
 /// /proc/self (resolved at readlink time to the reader's pid)
 fn create_self_link(parent: &Inode) -> Result<Arc<Inode>, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         pid_ino(0, 999),
         InodeMode::symlink(),
         0,
@@ -1011,7 +1011,7 @@ fn lookup_pid_fd_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode
 
     // Create symlink inode for /proc/<pid>/fd/<n>
     let sb = dir.superblock().ok_or(KernelError::Io)?;
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         pid_ino(pid, FD_INO + fd as u64), // fd symlinks
         InodeMode::symlink(),
         0,
@@ -1069,7 +1069,7 @@ fn lookup_pid_fdinfo_entry(
 
     // Create regular file inode for /proc/<pid>/fdinfo/<n>
     let sb = dir.superblock().ok_or(KernelError::Io)?;
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         pid_ino(pid, FDINFO_INO + fd as u64), // fdinfo files
         InodeMode::regular(0o444),            // r--r--r--
         0,
@@ -1146,7 +1146,7 @@ fn ns_inum(pid: &ProcPid, ns_type: NamespaceType) -> Result<u32, KernelError> {
 fn ns_file(pid: ProcPid, ns_type: NamespaceType) -> Result<crate::fs::Path, KernelError> {
     let inum = ns_inum(&pid, ns_type)?;
     let sb = crate::fs::pseudo::NSFS.sb()?;
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         u64::from(inum),
         InodeMode::regular(0o444),
         0,
@@ -2095,7 +2095,7 @@ impl SuperOps for ProcfsSuperOps {
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
     ) -> Result<Arc<Inode>, KernelError> {
-        let inode = try_arc(Inode::new(
+        let inode = Inode::alloc(Inode::new(
             sb.alloc_ino(),
             mode,
             0, // uid: root owns all procfs entries
@@ -2238,7 +2238,7 @@ fn mk_inode(
     mode: InodeMode,
     data: ProcfsInodeData,
 ) -> Result<Arc<Inode>, KernelError> {
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         sb.alloc_ino(),
         mode,
         0,
@@ -2359,7 +2359,7 @@ fn procfs_mount(
     sb.set_private(opts);
 
     // Create root inode (directory)
-    let root_inode = try_arc(Inode::new(
+    let root_inode = Inode::alloc(Inode::new(
         sb.alloc_ino(),
         InodeMode::directory(0o555),
         0, // uid: root
@@ -2374,7 +2374,7 @@ fn procfs_mount(
     )))?);
 
     // Create /proc/version
-    let version_inode = try_arc(Inode::new(
+    let version_inode = Inode::alloc(Inode::new(
         sb.alloc_ino(),
         InodeMode::regular(0o444),
         0, // uid: root
@@ -2408,7 +2408,7 @@ fn procfs_mount(
 
     // Create /proc/net (directory) with /proc/net/{dev,route}; contents follow
     // the reader's network namespace
-    let net_dir_inode = try_arc(Inode::new(
+    let net_dir_inode = Inode::alloc(Inode::new(
         sb.alloc_ino(),
         InodeMode::directory(0o555),
         0,
@@ -2419,7 +2419,7 @@ fn procfs_mount(
         &PROCFS_INODE_OPS,
     ))?;
     let mut net_dir = ProcfsInodeData::new_dir()?;
-    let net_dev_inode = try_arc(Inode::new(
+    let net_dev_inode = Inode::alloc(Inode::new(
         sb.alloc_ino(),
         InodeMode::regular(0o444),
         0,
@@ -2432,7 +2432,7 @@ fn procfs_mount(
     net_dev_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_file(crate::net::proc::proc_net_dev),
     )))?);
-    let net_route_inode = try_arc(Inode::new(
+    let net_route_inode = Inode::alloc(Inode::new(
         sb.alloc_ino(),
         InodeMode::regular(0o444),
         0,

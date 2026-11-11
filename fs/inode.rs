@@ -5,7 +5,10 @@
 
 use alloc::sync::{Arc, Weak};
 
-use crate::sync::spin::RwLock;
+use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::{LockedBy, UniqueOwner};
+use crate::util::kalloc::try_arc;
+use crate::util::list::{self, WeakList};
 use ::core::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::RwSem;
@@ -599,6 +602,101 @@ pub struct Inode {
     pub(super) i_hashed: core::sync::atomic::AtomicBool,
     /// Identity for shared futex keys (Linux i_sequence)
     pub(crate) i_sequence: crate::task::futex::KeySeq,
+    /// On its superblock's `s_inodes` (Linux i_sb_list), from
+    /// [`Inode::alloc`] to its eviction
+    i_sb_list: list::Link,
+}
+
+crate::adapter!(pub SbInodeA, Inode, i_sb_list);
+
+/// What `INODE_SB_LIST_LOCK` guards: every superblock's `s_inodes`
+pub struct InodeSbLists(());
+
+// SAFETY: one instance, `INODE_SB_LIST_LOCK`'s, made here (the field is
+// private)
+unsafe impl UniqueOwner for InodeSbLists {}
+
+/// A superblock's inodes (Linux s_inodes): a `WeakList` through
+/// `Inode.i_sb_list`
+pub type SbInodes = LockedBy<WeakList<SbInodeA>, InodeSbLists>;
+
+/// Linux inode_sb_list_lock (one lock for every superblock's s_inodes,
+/// as Linux had before s_inode_list_lock went per superblock): an
+/// inode holds only a `Weak` to its superblock and may be evicted
+/// while the superblock is torn down, which drains its list under this
+/// lock first; an inode still linked under it therefore has a
+/// superblock whose fields are intact. A spin leaf, thread context
+/// only: an inode's last reference never goes in an interrupt handler
+/// (pinned pages and files are released in thread context:
+/// `PinnedPages`, `fput`), and lockdep reports a tracked spin lock taken
+/// in one.
+static INODE_SB_LIST_LOCK: Mutex<InodeSbLists> = Mutex::new(InodeSbLists(()));
+
+/// List a new inode on its superblock (Linux inode_sb_list_add)
+fn sb_list_add(sb: &SuperBlock, inode: &Arc<Inode>) {
+    let mut l = INODE_SB_LIST_LOCK.lock();
+    sb.s_inodes.access_mut(&mut l).push_front(inode);
+}
+
+/// Take an evicted inode off its superblock's list (Linux
+/// inode_sb_list_del), unless the superblock's teardown drained it
+fn sb_list_del(inode: &Inode) {
+    let weak = {
+        let mut l = INODE_SB_LIST_LOCK.lock();
+        if !inode.i_sb_list.is_linked() {
+            return;
+        }
+        // SAFETY: linked, so `sb` is the superblock `alloc` listed it on
+        // (alive then), whose teardown drains s_inodes under this lock
+        // before any of its fields go: they are intact, and the inode's
+        // Weak keeps the allocation
+        let sb = unsafe { &*inode.sb.as_ptr() };
+        // SAFETY: linked on its superblock's list
+        unsafe { sb.s_inodes.access_mut(&mut l).remove(inode) }
+    };
+    drop(weak);
+}
+
+/// Unlink every inode of a superblock in its teardown (Linux
+/// evict_inodes' list walk; here an inode may outlive its superblock,
+/// so its later eviction finds itself unlinked)
+pub(super) fn sb_list_drain(list: &SbInodes) {
+    let mut l = INODE_SB_LIST_LOCK.lock();
+    let list = list.access_mut(&mut l);
+    // Only weak references go: no inode's Drop runs here
+    while list.pop_front().is_some() {}
+}
+
+/// `f` on each live inode of `sb` until it returns false (Linux
+/// drop_pagecache_sb's walk): each taken under `INODE_SB_LIST_LOCK`
+/// and held while `f` runs with no lock, released after the next one is
+/// taken; allocates nothing. False if `f` stopped the walk.
+pub fn for_each_sb_inode(sb: &Arc<SuperBlock>, f: &mut dyn FnMut(&Arc<Inode>) -> bool) -> bool {
+    let mut cur: Option<Arc<Inode>> = None;
+    loop {
+        let next = {
+            let l = INODE_SB_LIST_LOCK.lock();
+            let list = sb.s_inodes.access(&l);
+            let mut it = match &cur {
+                // SAFETY: `c` is alive (held) and `sb` too (the caller's
+                // reference): neither its eviction nor the superblock's
+                // drain has unlinked it, and nothing else does
+                Some(c) => unsafe { list.iter_after(c) },
+                None => list.iter(),
+            };
+            it.find_map(|e| e.upgrade())
+        };
+        // The previous one goes with the lock released: its last
+        // reference's eviction takes it
+        drop(cur.take());
+        let Some(i) = next else {
+            return true;
+        };
+        if !f(&i) {
+            return false;
+        }
+        cur = Some(i);
+    }
 }
 
 impl Inode {
@@ -645,7 +743,20 @@ impl Inode {
             i_linkable: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
+            i_sb_list: list::Link::new(),
         }
+    }
+
+    /// Put a new inode in its `Arc` and list it on its superblock's
+    /// `s_inodes` (Linux new_inode: alloc_inode + inode_sb_list_add);
+    /// one with no superblock stays unlisted
+    pub fn alloc(inode: Self) -> Result<Arc<Self>, KernelError> {
+        let sb = inode.sb.upgrade();
+        let i = try_arc(inode)?;
+        if let Some(sb) = &sb {
+            sb_list_add(sb, &i);
+        }
+        Ok(i)
     }
 
     /// Create a new device inode
@@ -692,6 +803,7 @@ impl Inode {
             i_linkable: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
+            i_sb_list: list::Link::new(),
         }
     }
 
@@ -1150,7 +1262,10 @@ impl Drop for DenyWrite {
 }
 
 impl Drop for Inode {
+    /// Linux iput_final -> evict: off its superblock's list first (the
+    /// list's contract, `WeakList`), then the filesystem's eviction
     fn drop(&mut self) {
+        sb_list_del(self);
         super::icache::evict(self);
     }
 }

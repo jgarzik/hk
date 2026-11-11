@@ -250,7 +250,7 @@ fn create_cgroup_dir_inode(
     cgroup: &Arc<Cgroup>,
 ) -> Result<Arc<Inode>, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         cgroup.ino,
         InodeMode::directory(0o755),
         0,
@@ -278,7 +278,7 @@ fn create_control_file_inode(
     } else {
         0o444
     };
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         sb.alloc_ino(),
         InodeMode::regular(mode),
         0,
@@ -315,7 +315,7 @@ fn create_subsys_file_inode(
         0o444
     };
 
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         sb.alloc_ino(),
         InodeMode::regular(mode),
         0,
@@ -736,7 +736,7 @@ impl SuperOps for CgroupfsSuperOps {
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
     ) -> Result<Arc<Inode>, KernelError> {
-        let inode = try_arc(Inode::new(
+        let inode = Inode::alloc(Inode::new(
             sb.alloc_ino(),
             mode,
             0,
@@ -777,7 +777,7 @@ fn cgroupfs_mount(
         .ok_or(KernelError::InvalidArgument)?;
 
     // Create root inode
-    let root_inode = try_arc(Inode::new(
+    let root_inode = Inode::alloc(Inode::new(
         root_cg.ino,
         InodeMode::directory(0o755),
         0,

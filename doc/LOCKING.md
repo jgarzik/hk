@@ -2210,6 +2210,23 @@ cluster freeing of an unlinked file on `SYSTEM_WQ`
 unused-inode LRU or I_NEW state (an inode is complete before it is
 hashed; the losing builder's inode is dropped unhashed).
 
+**Superblock inode lists** (`fs/inode.rs`; Linux s_inodes,
+inode_sb_list_add/del): every inode made with `Inode::alloc` is on its
+superblock's `s_inodes` (a `WeakList` through `Inode.i_sb_list`) until
+its eviction (`Drop for Inode`, first step) unlinks it. One global
+`INODE_SB_LIST_LOCK` (spin Mutex leaf, thread context; Linux
+inode_sb_list_lock as it was before s_inode_list_lock went per
+superblock) guards every list: an inode holds only a `Weak` to its
+superblock and may be evicted while that superblock is torn down, whose
+`Drop` drains the list under this lock before any field goes, so an
+inode still linked under the lock has a superblock with intact fields
+(a per-superblock lock would live in memory the teardown may already
+have finished with). Taken wherever an inode's last reference goes
+(under d_locks and other spin locks; nothing is taken under it). The
+reclaim and drop_caches walks (`for_each_sb_inode`, Linux
+drop_pagecache_sb) take each inode's reference under it and work with
+it released, dropping the previous reference unlocked.
+
 **vfat chain cache** (`fs/vfat/cache.rs`, Linux fs/fat/cache.c):
 `VfatInode.cache` (spin Mutex, Linux cache_lru_lock), a leaf in
 thread context only, never held with `VfatInode.d` and never across
@@ -4291,6 +4308,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `cmdline::SAVED` | cmdline.rs | `spin::Once` | the saved kernel command line (Linux saved_command_line): set once while parsing, before SMP; read lock-free (init's arguments, /proc/cmdline) |
 | `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty group set a task with no SignalStruct (kernel thread, exited task) reads; nothing is queued on it; locked where `SignalStruct.shared` would be, same position (Task.sig -> shared) |
 | `FILE_SYSTEMS`, `SB_LOCK` | fs/superblock.rs | spin RwLock, spin Mutex | the registered filesystem types (Linux file_systems_lock) and the superblock lists (Linux sb_lock); 3.3 Superblock lists |
+| `INODE_SB_LIST_LOCK` | fs/inode.rs | spin Mutex | every superblock's `s_inodes` (Linux inode_sb_list_lock); 3.3 Superblock inode lists |
 | `CHARDEV_REGISTRY` | fs/chardev.rs | sleeping `sync::RwSem` (Linux chrdevs_lock, cdev_map->lock: mutexes) | character device registry: registered at probe, looked up at open and mmap (under mmap_lock); never under a spin lock |
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf, also under `FasyncList.list` (O_ASYNC is set or cleared only with the file's fasync entry). `File.f_iocb` (the flags' I/O part, Linux f_iocb_flags: O_APPEND, O_DIRECT, O_DSYNC, __O_SYNC) is an atomic written only under it with the flags (F_SETFL), read lock-free by each read and write: an I/O racing an F_SETFL sees the old or the new word, as Linux's unlocked read of f_iocb_flags. `File.f_wb_err` / `f_sb_err` (Linux f_wb_err, f_sb_err: the writeback errors of the file's mapping and filesystem it has seen) are atomics sampled at open and advanced only under it (`errseq` check-and-advance, Linux file_check_and_advance_wb_err), read lock-free first. `AddressSpace.wb_err`, `SuperBlock.s_wb_err` (`util::errseq::ErrSeq`, Linux errseq_t) are lock-free words set by a failed writeback and a stale page cache after a direct write |
 | `FasyncList.list` → `File.f_lock`, `FOwner.st` | io/fasync.rs | sleeping `sync::Mutex` (per object: a pipe's readers and writers, a socket's, a tty's, an inotify group's); `FOwner.st` spin leaf | SIGIO (Linux fasync_lock and RCU readers, fown->lock): `FasyncList.armed` (atomic, written under the lock, read lock-free: Linux kill_fasync's unlocked list test) lets a wakeup with no armed file skip the lock; a list's entries (a file's `FOwner` reference and the armed fd), changed by `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) and walked by `kill_fasync`, which sends each entry's signal under it: thread context, no spin lock held (3.7 rule 1). `FOwner.st` (a file's owner pid, type, setter uids and F_SETSIG signal; allocated once per file) is copied under it and released before the send. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |

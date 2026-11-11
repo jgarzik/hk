@@ -1280,8 +1280,10 @@ fn new_inode(
     let (ino, w) = (sb.alloc_ino(), Arc::downgrade(sb));
     let ops = &RAMFS_INODE_OPS;
     let inode = match &kind {
-        Kind::Dev(rdev) => try_arc(Inode::new_device(ino, mode, uid, gid, *rdev, time, w, ops)),
-        Kind::Symlink(t) => try_arc(Inode::new(
+        Kind::Dev(rdev) => {
+            Inode::alloc(Inode::new_device(ino, mode, uid, gid, *rdev, time, w, ops))
+        }
+        Kind::Symlink(t) => Inode::alloc(Inode::new(
             ino,
             mode,
             uid,
@@ -1291,7 +1293,7 @@ fn new_inode(
             w,
             ops,
         )),
-        _ => try_arc(Inode::new(ino, mode, uid, gid, 0, time, w, ops)),
+        _ => Inode::alloc(Inode::new(ino, mode, uid, gid, 0, time, w, ops)),
     }
     .inspect_err(|_| free_inode(sb))?;
     // From here the inode's drop gives the reservation back

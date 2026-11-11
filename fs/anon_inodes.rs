@@ -30,7 +30,6 @@ use crate::fs::file::{File, FileOps};
 use crate::fs::inode::{Inode, InodeMode, InodeOps, Timespec};
 use crate::sync::IrqSpinlock;
 use crate::util::error::KernelError;
-use crate::util::kalloc::try_arc;
 
 /// Numbers one CPU takes from the shared counter at a time
 const LAST_INO_BATCH: u64 = 1024;
@@ -81,7 +80,7 @@ pub fn anon_inode_init() -> Result<(), KernelError> {
     use crate::fs::pseudo::ANON_INODEFS;
     ANON_INODEFS.init()?;
     let sb = ANON_INODEFS.sb()?;
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         get_next_ino(),
         InodeMode(0o600),
         0,

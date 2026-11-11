@@ -662,7 +662,7 @@ fn mq_uncharge(uid: u32, bytes: u64) {
 fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> KernelResult<FileRef> {
     // Create anonymous inode
     let mode = InodeMode::regular(0o644);
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         MQ_NEXT_ID.fetch_add(1, AtomicOrdering::SeqCst),
         mode,
         0,                           // uid

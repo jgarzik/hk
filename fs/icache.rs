@@ -190,27 +190,3 @@ pub fn evict(inode: &Inode) {
     remove_inode_hash(inode);
     inode.i_op.evict_inode(inode);
 }
-
-/// `f` on every hashed inode still alive until it returns false
-/// (drop_caches, reclaim), allocating nothing: each inode's reference
-/// is taken under its bucket's lock, `f` runs (and the reference goes)
-/// with no lock held; a bucket is walked by position, so an inode
-/// hashed or unhashed meanwhile may be seen twice or missed
-pub fn for_each_inode(f: &mut dyn FnMut(&Arc<Inode>) -> bool) {
-    for b in table() {
-        let mut i = 0;
-        loop {
-            let inode = {
-                let list = b.lock();
-                list.iter().skip(i).find_map(|(_, _, w)| w.upgrade())
-            };
-            let Some(inode) = inode else {
-                break;
-            };
-            if !f(&inode) {
-                return;
-            }
-            i += 1;
-        }
-    }
-}

@@ -1415,13 +1415,14 @@ pub fn fault(inode: &Inode, index: u64) -> Result<u64, VmFault> {
     }
 }
 
-/// `f` on each inode that may hold reclaimable cache (every hashed
-/// inode, every block device's) until it returns false; no allocation
+/// `f` on each inode that may hold reclaimable cache (every
+/// superblock's, every block device's) until it returns false; no
+/// allocation
 fn for_each_cache_inode(f: &mut dyn FnMut(&Inode) -> bool) {
     let mut more = true;
-    crate::fs::icache::for_each_inode(&mut |i| {
-        more = i.i_data.nrpages() == 0 || f(i);
-        more
+    crate::fs::superblock::iterate_supers(|sb| {
+        more = more
+            && crate::fs::inode::for_each_sb_inode(sb, &mut |i| i.i_data.nrpages() == 0 || f(i));
     });
     if more {
         crate::block::blkdev::for_each_bdev_inode(&mut |i| i.i_data.nrpages() == 0 || f(i));
