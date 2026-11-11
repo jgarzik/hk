@@ -18,7 +18,7 @@
 //! Locks are released when all fds referring to the open file description
 //! are closed.
 
-use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 
 use crate::fs::File;
 use crate::util::error::{KernelError, KernelResult};
@@ -57,8 +57,10 @@ pub enum LockType {
 pub struct FileLock {
     /// Type of lock currently held
     lock_type: LockType,
-    /// Set of PIDs holding shared locks (for LOCK_SH)
-    shared_holders: BTreeSet<u64>,
+    /// Owners holding shared locks (for LOCK_SH), each once; room for
+    /// the one a change can add is reserved before `flc_lock` (Linux
+    /// flock_lock_inode's preallocated new_fl)
+    shared_holders: Vec<u64>,
     /// PID holding exclusive lock (for LOCK_EX)
     exclusive_holder: Option<u64>,
 }
@@ -68,7 +70,7 @@ impl FileLock {
     pub const fn new() -> Self {
         Self {
             lock_type: LockType::None,
-            shared_holders: BTreeSet::new(),
+            shared_holders: Vec::new(),
             exclusive_holder: None,
         }
     }
@@ -86,12 +88,12 @@ impl FileLock {
             LockType::None => {
                 // No lock held, acquire shared
                 self.lock_type = LockType::Shared;
-                self.shared_holders.insert(pid);
+                self.add_shared(pid);
                 Ok(())
             }
             LockType::Shared => {
                 // Already shared, add ourselves
-                self.shared_holders.insert(pid);
+                self.add_shared(pid);
                 Ok(())
             }
             LockType::Exclusive => {
@@ -100,7 +102,7 @@ impl FileLock {
                     // Downgrade: release exclusive, acquire shared
                     self.lock_type = LockType::Shared;
                     self.exclusive_holder = None;
-                    self.shared_holders.insert(pid);
+                    self.add_shared(pid);
                     Ok(())
                 } else {
                     // Someone else holds exclusive
@@ -150,7 +152,13 @@ impl FileLock {
         match self.lock_type {
             LockType::None => false,
             LockType::Shared => {
-                let held = self.shared_holders.remove(&pid);
+                let held = match self.shared_holders.iter().position(|&p| p == pid) {
+                    Some(i) => {
+                        self.shared_holders.swap_remove(i);
+                        true
+                    }
+                    None => false,
+                };
                 if self.shared_holders.is_empty() {
                     self.lock_type = LockType::None;
                 }
@@ -169,6 +177,23 @@ impl FileLock {
     }
 
     /// The lock this owner holds
+    /// Add shared holder `pid` once, in the room reserved for it
+    fn add_shared(&mut self, pid: u64) {
+        if !self.shared_holders.contains(&pid) {
+            debug_assert!(self.shared_holders.len() < self.shared_holders.capacity());
+            self.shared_holders.push(pid);
+        }
+    }
+
+    /// Room for one more shared holder, or the length to grow to
+    fn room(&self) -> Result<(), usize> {
+        if self.shared_holders.len() < self.shared_holders.capacity() {
+            Ok(())
+        } else {
+            Err(self.shared_holders.len() + 1)
+        }
+    }
+
     pub fn held(&self, pid: u64) -> LockType {
         match self.lock_type {
             LockType::Shared if self.shared_holders.contains(&pid) => LockType::Shared,
@@ -253,9 +278,21 @@ pub fn sys_flock(fd: i32, operation: i32) -> KernelResult<()> {
         LOCK_EX => LockType::Exclusive,
         _ => LockType::None,
     };
+    let mut spare: Vec<u64> = Vec::new();
     loop {
         let g = ctx.as_ref().map_or(0, |i| i.i_flctx.generation());
+        // Room for this owner is made before the lock, then adopted
+        // under it (nothing allocates under flc_lock)
+        let mut need = None;
+        let mut left = Vec::new();
         let result = with_lock(&file, |l| {
+            left = crate::util::kmem::adopt(&mut l.shared_holders, core::mem::take(&mut spare));
+            if want == LockType::Shared
+                && let Err(n) = l.room()
+            {
+                need = Some(n);
+                return (Ok(()), false);
+            }
             let held = l.held(owner);
             if held == want && want != LockType::None {
                 return (Ok(()), false);
@@ -268,6 +305,11 @@ pub fn sys_flock(fd: i32, operation: i32) -> KernelResult<()> {
             };
             (r, dropped)
         });
+        drop(left);
+        if let Some(n) = need {
+            spare = crate::util::kmem::spare(n)?;
+            continue;
+        }
         match (result, &ctx) {
             (Err(KernelError::WouldBlock), Some(i)) if !nonblock => i.i_flctx.wait_change(g)?,
             (r, _) => return r,
