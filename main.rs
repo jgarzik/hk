@@ -35,6 +35,7 @@ pub mod smp;
 pub mod sync;
 pub mod syscall;
 pub mod sysctl;
+pub mod system_state;
 pub mod time;
 pub mod uaccess;
 
@@ -294,6 +295,8 @@ pub(crate) fn kmain() -> ! {
     crate::task::workqueue::init();
     crate::net::start_threads();
     CurrentArch::enable_interrupts();
+    // Tasks can be scheduled from here (Linux rest_init)
+    system_state::set_system_state(system_state::SystemState::Scheduling);
 
     // Linux order: mnt_init (start_kernel), then do_basic_setup:
     // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
@@ -406,6 +409,8 @@ pub(crate) fn kmain() -> ! {
 /// through execve with argv {path, the command line's extra words} and
 /// envp {HOME=/, TERM=linux, its extra name=value words}.
 fn run_init() -> ! {
+    // Linux kernel_init, before run_init_process
+    system_state::set_system_state(system_state::SystemState::Running);
     let args = cmdline::init_args(&cmdline::saved());
     let rdinit = args.rdinit.as_deref().unwrap_or("/init");
     if fs::lookup_path(rdinit.as_bytes()).is_ok() {

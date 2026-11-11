@@ -471,7 +471,7 @@ mod imp {
     /// any `IrqSpinlock` / preemption disable via the preempt count)
     #[track_caller]
     pub fn might_sleep() {
-        if !crate::task::percpu::can_sleep() {
+        if !crate::task::percpu::can_sleep() || !crate::system_state::checks_apply() {
             return;
         }
         let Some(c) = cpu() else {
@@ -515,8 +515,9 @@ mod imp {
     /// kind, preemption or interrupts off) may not use (Linux
     /// might_alloc -> might_sleep_if). Not checked where the call named
     /// a GFP (`util::kalloc::with_gfp`), in an interrupt handler
-    /// (implicitly GFP_ATOMIC), within reclaim (PF_MEMALLOC), or before
-    /// the scheduler runs tasks (Linux skips SYSTEM_BOOTING).
+    /// (implicitly GFP_ATOMIC), within reclaim (PF_MEMALLOC), or while
+    /// booting or shutting down (`system_state`, as Linux's
+    /// __might_resched).
     /// Listed once per site as `LOCKDEP:ATOMIC_ALLOC` (an audit list,
     /// not a failure): the innermost `IrqSpinlock` taken, else the
     /// innermost tracked spin lock, else the RCU read-side section, else
@@ -536,6 +537,7 @@ mod imp {
             return;
         }
         if crate::util::kalloc::named_gfp().is_some()
+            || !crate::system_state::checks_apply()
             || !crate::task::percpu::can_sleep()
             || crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC)
         {

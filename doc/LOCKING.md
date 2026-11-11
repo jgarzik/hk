@@ -277,7 +277,9 @@ crate's types directly; `printk` and lockdep itself are the exceptions).
 These wrap `spin`'s types and raise the preempt count while held (1.2).
 Every build checks `might_sleep` against the preempt count, interrupt
 state and interrupt depth, and reports the first violation as
-`MIGHT_SLEEP:FAIL`; a context switch with any lock held besides the
+`MIGHT_SLEEP:FAIL` (quiet while booting, until the scheduler runs tasks,
+and once reboot(2) is shutting down: `system_state`, as Linux's
+__might_resched); a context switch with any lock held besides the
 run-queue lock is reported as `SCHED:FAIL scheduling while atomic`
 (Linux schedule_debug). Built with `make check LOCKDEP=1` (cargo feature
 `lockdep`) the wrappers are also tracked, and the kernel reports, once
@@ -313,8 +315,9 @@ Also listed, once per site, as `LOCKDEP:ATOMIC_ALLOC` (an audit list,
 not yet a failure; ROADMAP phase A): a heap allocation with no GFP named
 (implicitly GFP_KERNEL) in atomic context, i.e. a spin lock of any kind
 held, preemption or interrupts off (Linux might_alloc ->
-might_sleep_if). Not checked in an interrupt handler, under PF_MEMALLOC
-or before the scheduler runs tasks. The site is the innermost
+might_sleep_if). Not checked where the call named a GFP, in an
+interrupt handler, under PF_MEMALLOC, or while booting or shutting down
+(`system_state`). The site is the innermost
 `IrqSpinlock` taken (`lock`/`try_lock` are `#[track_caller]` in lockdep
 builds; each CPU keeps the sites of the ones it holds, report only,
 like Linux's preempt_disable_ip), else the innermost tracked spin lock,

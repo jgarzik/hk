@@ -154,7 +154,7 @@ pub fn might_sleep() {
     lockdep::might_sleep();
     // Host unit tests have no CPU state to check
     #[cfg(not(any(feature = "lockdep", test)))]
-    if sched::can_sleep() && in_atomic() {
+    if sched::can_sleep() && crate::system_state::checks_apply() && in_atomic() {
         atomic_sleep(core::panic::Location::caller());
     }
 }
