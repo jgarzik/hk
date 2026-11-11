@@ -531,8 +531,9 @@ impl SbMarks {
 
 /// A dentry lets go of `inode` (Linux dentry_unlink_inode): if no name
 /// is left (nlink 0), its watches get IN_DELETE_SELF and IN_IGNORED and
-/// go (fsnotify_inoderemove). Any lock may be held but an inotify one;
-/// nothing here sleeps or allocates.
+/// go (fsnotify_inoderemove). Called with no spin lock held (Linux
+/// dentry_unlink_inode drops d_lock and i_lock first): the queued
+/// events are allocated. Nothing here sleeps.
 pub fn d_iput(inode: &Inode) {
     if inode.nlink.load(Ordering::Acquire) == 0 && !inode.fsnotify.is_empty() {
         destroy_marks(inode, IN_DELETE_SELF);

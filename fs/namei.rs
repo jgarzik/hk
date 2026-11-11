@@ -684,7 +684,12 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
         let r = if super::mount::is_local_mountpoint(&victim) {
             Err(KernelError::Busy)
         } else if isdir {
-            dir.i_op.rmdir(&dir, name).inspect(|()| inode.set_dead())
+            // What is cached below goes first (Linux vfs_rmdir:
+            // shrink_dcache_parent, then S_DEAD)
+            dir.i_op.rmdir(&dir, name).inspect(|()| {
+                super::dentry::d_drop_tree(&victim);
+                inode.set_dead();
+            })
         } else {
             dir.i_op.unlink(&dir, name)
         };

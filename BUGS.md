@@ -1012,21 +1012,14 @@ Tag = roadmap phase (doc/ROADMAP.md).
    its port in bhash (`TcpSock::assert_owner`). On failure the test
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
-10. **inotify events allocated under d_lock** (A1, dentry). `io/inotify.rs`
-   `destroy_watch`, reached from `d_iput` in a dentry's drop, which
-   `d_delete` can run under the parent's and child's d_locks: its two
-   event nodes are allocated unnamed in atomic context (IN_Q_OVERFLOW
-   replaces them under pressure). Linux runs fsnotify_inoderemove after
-   dropping d_lock and i_lock; the `d_iput` comment ("nothing here
-   allocates") is wrong meanwhile.
-11. **Grow-outside-the-lock helper copied three times** (A1).
+10. **Grow-outside-the-lock helper copied three times** (A1).
    `io/inotify.rs` `push_if`/`push_grow`, `io/epoll.rs` `f_ep_add`,
    `Inotify::watch_preload`: one `kmem` helper over `kmem::spare` and
    `adopt`.
-12. **fanotify event queue duplicates inotify's** (A1). `io/fanotify.rs`
+11. **fanotify event queue duplicates inotify's** (A1). `io/fanotify.rs`
    `FanotifyInner` (EvNode, overflow position, push/pop): one generic
    queue; `queue_event` has no caller yet (fanotify delivers nothing).
-13. **Drop paths lock what `&mut self` owns** (A1). `ns/net.rs`
+12. **Drop paths lock what `&mut self` owns** (A1). `ns/net.rs`
    `NetNamespace::drop` snapshots its devices (RCU, `ends`, a Vec),
    `io/epoll.rs` `Eventpoll::drop` takes `mtx` and `lock`: walk the
    list directly, `get_mut`.

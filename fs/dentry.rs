@@ -216,21 +216,21 @@ impl Dentry {
     }
 
     /// The child `name` was unlinked (Linux d_delete): one no one but
-    /// the caller (`held` references) holds becomes negative in place,
-    /// with what was cached under it dropped, and lets go of its inode
-    /// after the locks (dentry_unlink_inode); a held one leaves the
-    /// tree, and lets go when its last holder does. Decided under this
-    /// parent's d_lock, where lookups take their references.
+    /// the caller (`held` references) holds becomes negative in place
+    /// and lets go of its inode after the locks (Linux
+    /// dentry_unlink_inode: fsnotify_inoderemove and iput after d_lock
+    /// and i_lock are dropped); a held one leaves the tree (__d_drop),
+    /// and lets go when its last holder does. Decided under this
+    /// parent's d_lock, where lookups take their references. A removed
+    /// directory has nothing cached below it any more (`delete_entry`,
+    /// Linux vfs_rmdir's shrink_dcache_parent).
     pub fn d_delete(&self, name: &[u8], held: usize) {
         let mut p = self.d_lock.write();
         let Some(c) = p.children.get(name) else {
             return;
         };
         if Arc::strong_count(c) <= held + 1 {
-            let mut ci = c.d_lock.write();
-            let inode = ci.inode.take();
-            ci.children.clear();
-            drop(ci);
+            let inode = c.d_lock.write().inode.take();
             drop(p);
             if let Some(i) = inode {
                 crate::io::inotify::d_iput(&i);
@@ -238,7 +238,7 @@ impl Dentry {
         } else if let Some(c) = p.children.remove(name) {
             c.d_lock.write().flags.unhashed = true;
             drop(p);
-            d_drop_tree(&c);
+            drop(c);
         }
     }
 
@@ -703,6 +703,35 @@ mod tests {
         d_exchange(&a, &other);
         assert!(r.lookup_child(b"a").is_some_and(|c| Arc::ptr_eq(&c, &a)));
         assert!(a.get_parent().is_some_and(|p| Arc::ptr_eq(&p, &r)));
+    }
+
+    /// rmdir's shape (Linux vfs_rmdir): the cache below goes first, then
+    /// d_delete turns an unused dentry negative in place, keeping it
+    /// in the tree
+    #[test]
+    fn rmdir_shrinks_then_deletes() {
+        let r = try_arc(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        let x = Dentry::alloc(&a, b"x", None).unwrap();
+        d_drop_tree(&a);
+        assert_eq!(a.num_children(), 0);
+        assert!(x.is_unhashed());
+        drop(x);
+        r.d_delete(b"a", 1);
+        assert!(a.is_negative() && !a.is_unhashed());
+        assert!(r.lookup_child(b"a").is_some_and(|c| Arc::ptr_eq(&c, &a)));
+    }
+
+    /// d_delete of a dentry someone else holds unhashes it and keeps
+    /// its inode for the holder
+    #[test]
+    fn delete_held_unhashes() {
+        let r = try_arc(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        let other = a.clone();
+        r.d_delete(b"a", 1);
+        assert!(other.is_unhashed() && !other.is_negative());
+        assert!(r.lookup_child(b"a").is_none());
     }
 
     /// A real exchange swaps names and parents
