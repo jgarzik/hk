@@ -36,6 +36,7 @@
 use crate::util::kalloc::{try_box, with_gfp};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::mm::page_alloc::Gfp;
 use crate::sync::spin::{Mutex, MutexGuard};
@@ -62,8 +63,9 @@ pub const MAX_SKB_SIZE: usize = 65536 + 512;
 pub struct SkBuff {
     /// Its link on a queue (Linux skb->next/prev)
     list: Link,
-    /// The buffer: headroom, packet data, tailroom
-    buf: Box<[u8]>,
+    /// The buffer: headroom, packet data, tailroom (a Vec so a message
+    /// built in one is adopted whole, `from_vec`)
+    buf: Vec<u8>,
     /// Start of the packet data (moves with push/pull)
     data: usize,
     /// End of the packet data (moves with put/trim)
@@ -111,7 +113,7 @@ pub struct SkBuff {
 
 /// What a protocol keeps with a queued skb (Linux skb->cb, typed: each
 /// layer reads only its own variant)
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub enum SkbCb {
     #[default]
     None,
@@ -123,6 +125,8 @@ pub enum SkbCb {
     Exterr(crate::net::sock::ExtErr),
     /// A frame queued to a packet socket (Linux PACKET_SKB_CB)
     Pkt(crate::net::packet::PktCb),
+    /// A netlink message (Linux NETLINK_CB)
+    Nl(crate::net::netlink::NlCb),
 }
 
 /// [`SkbCb::Inet`]
@@ -147,7 +151,7 @@ impl SkBuff {
         with_gfp(gfp, || {
             let buf = crate::util::kmem::try_vec(total_size, 0u8).ok()?;
             try_box(Self {
-                buf: buf.into_boxed_slice(),
+                buf,
                 data: headroom,
                 tail: headroom,
                 ..Default::default()
@@ -337,7 +341,18 @@ impl SkBuff {
     /// Bytes charged to a socket buffer for it (Linux skb->truesize:
     /// the buffer and the skb itself)
     pub fn truesize(&self) -> usize {
-        self.buf.len() + core::mem::size_of::<Self>()
+        self.buf.capacity() + core::mem::size_of::<Self>()
+    }
+
+    /// An skb whose data is `v`, taken over without a copy (a netlink
+    /// or AF_UNIX message built before any lock); its truesize counts
+    /// the Vec's capacity
+    pub fn from_vec(v: Vec<u8>) -> Self {
+        Self {
+            tail: v.len(),
+            buf: v,
+            ..Default::default()
+        }
     }
 
     /// The received packet's data offset past its IP header (None if
@@ -353,7 +368,7 @@ impl SkBuff {
         let buf = with_gfp(gfp, || crate::util::kmem::try_to_vec(&self.buf)).ok()?;
         Some(Self {
             list: Link::new(),
-            buf: buf.into_boxed_slice(),
+            buf,
             data: self.data,
             tail: self.tail,
             protocol: self.protocol,
@@ -370,7 +385,7 @@ impl SkBuff {
             nh: self.nh,
             tstamp: self.tstamp,
             dropcount: self.dropcount,
-            cb: self.cb,
+            cb: self.cb.clone(),
         })
     }
 

@@ -232,7 +232,7 @@ fn echo_msg(seq: u32, pid: u32, msg: &[u8], err: i32) -> Option<Vec<u8>> {
 }
 
 fn reply(sk: &NlSock, data: Vec<u8>) {
-    sk.queue(NlSkb::kernel(data, 0));
+    sk.queue(kernel_skb(data, 0));
 }
 
 /// One request: permission, then dump or do
@@ -613,7 +613,8 @@ pub fn notify_dellink(net: &NetNamespace, dev: &NetDevice) {
 }
 
 fn notify(net: &NetNamespace, data: Vec<u8>, group: u32) {
-    broadcast(net, NETLINK_ROUTE, NlSkb::kernel(data, group), 0);
+    // Linux rtnl_notify(GFP_KERNEL): no lock held here
+    broadcast(net, NETLINK_ROUTE, kernel_skb(data, group), 0, Gfp::KERNEL);
 }
 
 // ============================================================================

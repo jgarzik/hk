@@ -205,20 +205,22 @@ impl ProtoOps for NlSock {
     /// with SO_PASSCRED (Linux netlink_recvmsg -> scm_recv)
     fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         let skb = self.recv(flags & MSG_PEEK != 0, flags & MSG_DONTWAIT != 0)?;
-        let n = m.data.put(0, &skb.data)?;
-        if n < skb.data.len() {
+        let cb = super::nl_cb(&skb);
+        let data = skb.data();
+        let n = m.data.put(0, data)?;
+        if n < data.len() {
             m.flags |= MSG_TRUNC;
         }
         if m.want_name {
-            m.name = Some(nladdr_bytes(skb.portid, group_mask(skb.group)));
+            m.name = Some(nladdr_bytes(cb.portid, group_mask(cb.group)));
         }
         if self.has_flag(sflags::PKTINFO) {
             m.cmsg
-                .put(SOL_NETLINK, NETLINK_PKTINFO, &skb.group.to_ne_bytes());
+                .put(SOL_NETLINK, NETLINK_PKTINFO, &cb.group.to_ne_bytes());
         }
-        scm::put(m, self.sk.flag(sf::PASSCRED), Some(skb.creds), None);
+        scm::put(m, self.sk.flag(sf::PASSCRED), Some(cb.creds), None);
         Ok(if flags & MSG_TRUNC != 0 {
-            skb.data.len()
+            data.len()
         } else {
             n
         })

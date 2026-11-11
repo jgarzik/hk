@@ -70,6 +70,7 @@ pub fn run_tests() {
     test_netns_addr_exit();
     test_notify();
     test_peek_trunc();
+    test_peek_dump();
     test_sockopt();
     test_strict_dump();
     test_other_dumps();
@@ -858,6 +859,41 @@ fn test_peek_trunc() {
     let (cut, f3) = recvmsg(nl.fd, &mut small, 0);
     if cut != 16 || f3 & MSG_TRUNC == 0 {
         return fail_why(N, b"truncated read", cut);
+    }
+    pass(N);
+}
+
+/// MSG_PEEK of a dump part returns its bytes and leaves it queued: a
+/// second peek and the read that follows see the same part
+fn test_peek_dump() {
+    const N: &[u8] = b"NL_PEEK_DUMP";
+    let Some(mut nl) = Nl::open() else {
+        return fail_why(N, b"open", 0);
+    };
+    let mut r = Req::new(RTM_GETLINK, NLM_F_DUMP, &ifinfo(0, 0, 0));
+    nl.send(&mut r);
+    if !wait_readable(nl.fd, 5000) {
+        return fail_why(N, b"no reply", 0);
+    }
+    let (peek, read) = rxbuf().split_at_mut(16384);
+    let (n1, _) = recvmsg(nl.fd, peek, MSG_PEEK);
+    let mut first = (0u16, 0u16);
+    each_msg(&peek[..n1.max(0) as usize], &mut |m| {
+        if first.0 == 0 {
+            first = (m.ty, m.flags);
+        }
+    });
+    if n1 <= 16 || first.0 != RTM_NEWLINK || first.1 & NLM_F_MULTI == 0 {
+        return fail_why(N, b"peeked part", n1);
+    }
+    let (n2, _) = recvmsg(nl.fd, read, MSG_PEEK);
+    if n2 != n1 || read[..n2 as usize] != peek[..n1 as usize] {
+        return fail_why(N, b"second peek", n2);
+    }
+    read.fill(0);
+    let (n3, _) = recvmsg(nl.fd, read, 0);
+    if n3 != n1 || read[..n3 as usize] != peek[..n1 as usize] {
+        return fail_why(N, b"read after peek", n3);
     }
     pass(N);
 }
