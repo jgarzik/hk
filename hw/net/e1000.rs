@@ -56,7 +56,7 @@ use crate::net::dev::{
     netif_napi_del,
 };
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
-use crate::net::skb::{NET_SKB_PAD, SkBuff};
+use crate::net::skb::{NET_SKB_PAD, SkBuff, SkbHead};
 use crate::printkln;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
@@ -414,14 +414,21 @@ impl E1000 {
         Ok(())
     }
 
-    /// Receive up to `budget` frames; returns them (delivered by the caller
-    /// after the ring lock is dropped)
-    #[expect(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
-    fn receive(&self, dev: &Arc<NetDevice>, budget: usize, out: &mut Vec<Box<SkBuff>>) {
+    /// Receive up to `budget` frames onto `out`, linked through their
+    /// own `list` (Linux napi_alloc_skb, GFP_ATOMIC under the ring lock);
+    /// the caller delivers them after the lock is dropped. Returns how
+    /// many it received.
+    fn receive(
+        &self,
+        dev: &Arc<NetDevice>,
+        budget: usize,
+        out: &mut SkbHead<Box<SkBuff>>,
+    ) -> usize {
         let mut rx = self.rx.lock();
-        let Some(rx) = rx.as_mut() else { return };
+        let Some(rx) = rx.as_mut() else { return 0 };
         let mut last = None;
-        while out.len() < budget {
+        let mut n = 0;
+        while n < budget {
             let i = rx.next;
             let d = rx.desc(i);
             let st = unsafe { read_volatile(&raw const (*d).status) };
@@ -447,7 +454,8 @@ impl E1000 {
                         if src[0] & 1 != 0 {
                             dev.stats.multicast.fetch_add(1, Ordering::Relaxed);
                         }
-                        out.push(skb);
+                        out.push_back(skb);
+                        n += 1;
                     }
                     None => dev.stats.inc_rx_dropped(),
                 }
@@ -467,6 +475,7 @@ impl E1000 {
             wmb();
             self.write_reg(reg::RDT, i as u32);
         }
+        n
     }
 
     fn handle_link_change(&self) {
@@ -520,13 +529,14 @@ impl NapiPoll for E1000 {
             tx.reclaim();
         }
 
-        // RX
-        let mut frames = Vec::new();
-        if let Some(dev) = self.netdev() {
-            self.receive(&dev, budget, &mut frames);
-        }
-        let work = frames.len();
-        for skb in frames {
+        // RX: delivered with the ring lock dropped (Linux
+        // napi_gro_receive runs outside the driver's locks)
+        let mut frames = SkbHead::new();
+        let work = match self.netdev() {
+            Some(dev) => self.receive(&dev, budget, &mut frames),
+            None => 0,
+        };
+        while let Some(skb) = frames.pop_front() {
             net::dev::netif_receive_skb(skb);
         }
 
