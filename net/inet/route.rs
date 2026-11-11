@@ -434,9 +434,13 @@ pub fn classify(
         return IpInput::Drop("martian source");
     }
     if loopback {
-        // lo only carries our own traffic
+        // lo only carries our own traffic, already routed on output: a
+        // broadcast keeps that route's type (Linux keeps the output
+        // dst, RTCF_BROADCAST, on a looped skb)
         return if daddr.is_unspecified() {
             IpInput::Drop("zero destination")
+        } else if daddr.is_broadcast() || addr_type(daddr) == RouteType::Broadcast {
+            IpInput::Broadcast
         } else {
             IpInput::Local
         };
@@ -543,8 +547,9 @@ mod tests {
 
     #[test]
     fn loopback_device() {
-        let lo = |s, t| classify(s, t, true, |_| RouteType::Local);
+        let lo = |s, t| classify(s, t, true, types);
         assert_eq!(lo(ip(127, 0, 0, 1), ip(127, 0, 0, 1)), IpInput::Local);
+        assert_eq!(lo(ip(127, 0, 0, 1), ip(10, 0, 2, 255)), IpInput::Broadcast);
         assert_eq!(lo(ip(10, 0, 2, 15), ip(10, 0, 2, 15)), IpInput::Local);
         assert!(matches!(
             lo(ip(127, 0, 0, 1), ip(224, 0, 0, 1)),
