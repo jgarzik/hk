@@ -394,6 +394,9 @@ VFS locks (detailed order):
                    attach, umount, namespace copy; read for /proc mount
                    lists)
         ↓
+    pnode::GROUPS (sync::Mutex; peer groups, never held across a call
+                   into the mount tree)
+        ↓
     SuperBlock.s_umount (sync::RwSem; write for remount, read for a
                    bind remount)
         ↓
@@ -2304,8 +2307,10 @@ namespace_unlock). Mount ids come from `MNT_IDS` (spin Mutex leaf,
 Linux mnt_id_ida) and `MNT_ID_UNIQUE` (atomic). Deviation: no global
 (parent, mountpoint) hash; crossing scans the current mount's children.
 Propagation (`fs/pnode.rs`) runs entirely under NAMESPACE_SEM (write):
-peer groups live in `pnode::GROUPS` (spin Mutex, leaf: never held
-across a call into the mount tree or a d_lock).
+peer groups live in `pnode::GROUPS` (sleeping `sync::Mutex`, inside
+NAMESPACE_SEM, as Linux keeps the mnt_share rings under namespace_sem;
+never held across a call into the mount tree or with a spin lock held;
+mountinfo reads it under NAMESPACE_SEM read).
 
 **Lock Order for Path Traversal (follow_mount, lookup_mnt):**
 ```

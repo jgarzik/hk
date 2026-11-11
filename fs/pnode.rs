@@ -6,9 +6,10 @@
 //! covers the master's whole peer group, so the group is the master
 //! here. A mount attached under a shared mount is copied to every peer
 //! and, as slaves, down the slave groups; an umount takes the copies
-//! that hold nothing with it. Everything here runs under
-//! `mount::NAMESPACE_SEM` (write); `GROUPS` is a leaf, never held across
-//! a call into the mount tree.
+//! that hold nothing with it. Changes run under `mount::NAMESPACE_SEM`
+//! (write); `GROUPS` (a sleeping `Mutex`, inside NAMESPACE_SEM; Linux
+//! keeps the mnt_share rings under namespace_sem itself) is never held
+//! across a call into the mount tree.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
@@ -30,8 +31,7 @@ struct Group {
 }
 
 /// Peer groups by id (Linux mnt_group_ida plus the mnt_share rings)
-static GROUPS: crate::sync::spin::Mutex<BTreeMap<u32, Group>> =
-    crate::sync::spin::Mutex::new(BTreeMap::new());
+static GROUPS: crate::sync::Mutex<BTreeMap<u32, Group>> = crate::sync::Mutex::new(BTreeMap::new());
 
 /// The propagation type of a mount (Linux MS_SHARED and friends)
 #[derive(Clone, Copy, PartialEq, Eq)]
