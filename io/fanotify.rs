@@ -27,10 +27,11 @@
 //! - Support for permission events (blocking operations pending user decision)
 //! - Multiple marks per fanotify instance
 
-use crate::util::kalloc::try_arc;
+use crate::util::kalloc::{try_arc, try_box};
+use crate::util::list::{BoxList, Link};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
@@ -271,6 +272,7 @@ impl FanotifyMark {
 // =============================================================================
 
 /// A queued fanotify event
+#[derive(Clone, Copy)]
 struct FanotifyEvent {
     /// Event mask
     mask: u64,
@@ -285,26 +287,126 @@ impl FanotifyEvent {
     }
 }
 
+/// FAN_Q_OVERFLOW as read (Linux's preallocated group->overflow_event)
+const OVERFLOW_EVENT: FanotifyEvent = FanotifyEvent {
+    mask: FAN_Q_OVERFLOW,
+    pid: 0,
+};
+
+/// A queued event, allocated before the queue lock is taken (Linux
+/// fanotify_alloc_event, then fsnotify_insert_event)
+struct EvNode {
+    link: Link,
+    ev: FanotifyEvent,
+}
+
+crate::adapter!(EvAdapter, EvNode, link);
+
 // =============================================================================
 // Fanotify Instance
 // =============================================================================
 
-/// Internal fanotify state
+/// A group's marks (Linux: the marks a group holds, under
+/// group->mark_mutex)
 #[derive(Default)]
-struct FanotifyInner {
+struct FanMarks {
     /// Inode marks: inode_number -> mark
     inode_marks: BTreeMap<u64, FanotifyMark>,
     /// Mount marks: mount_id -> mark
     mount_marks: BTreeMap<u64, FanotifyMark>,
     /// Filesystem marks: superblock_id -> mark
     fs_marks: BTreeMap<u64, FanotifyMark>,
-    /// Queued events
-    events: Vec<FanotifyEvent>,
+}
+
+impl FanMarks {
+    /// The marks of the type `mark_flags` names
+    fn of(&mut self, mark_flags: u32) -> &mut BTreeMap<u64, FanotifyMark> {
+        if (mark_flags & FAN_MARK_FILESYSTEM) != 0 {
+            &mut self.fs_marks
+        } else if (mark_flags & FAN_MARK_MOUNT) != 0 {
+            &mut self.mount_marks
+        } else {
+            &mut self.inode_marks
+        }
+    }
+}
+
+/// A group's event queue (Linux group->notification_list under
+/// notification_lock)
+struct FanotifyInner {
+    /// Queued events, oldest first
+    events: BoxList<EvAdapter>,
+    /// The one FAN_Q_OVERFLOW, while queued: how many of `events` are
+    /// ahead of it (a position, so queueing it allocates nothing)
+    overflow: Option<usize>,
+}
+
+impl FanotifyInner {
+    const fn new() -> Self {
+        Self {
+            events: BoxList::new(),
+            overflow: None,
+        }
+    }
+
+    /// Queued events, the overflow counted (Linux q_len)
+    fn len(&self) -> usize {
+        self.events.len() + usize::from(self.overflow.is_some())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Queue `ev` (Linux fsnotify_insert_event): past
+    /// FANOTIFY_MAX_QUEUED_EVENTS, or without memory for it (None),
+    /// FAN_Q_OVERFLOW is queued in its place, once. Whether anything
+    /// was queued, and the event if it was not, to free after the
+    /// unlock.
+    fn push(&mut self, ev: Option<Box<EvNode>>) -> (bool, Option<Box<EvNode>>) {
+        match ev {
+            Some(e) if self.len() < FANOTIFY_MAX_QUEUED_EVENTS => {
+                self.events.push_back(e);
+                (true, None)
+            }
+            e if self.overflow.is_none() => {
+                self.overflow = Some(self.events.len());
+                (true, e)
+            }
+            e => (false, e),
+        }
+    }
+
+    /// The oldest event (Linux fsnotify_peek_first_event)
+    fn front(&self) -> Option<FanotifyEvent> {
+        match self.overflow {
+            Some(0) => Some(OVERFLOW_EVENT),
+            _ => self.events.iter().next().map(|n| n.ev),
+        }
+    }
+
+    /// Take the oldest event (Linux fsnotify_remove_first_event): its
+    /// node, if any, is freed by the caller after the unlock
+    fn pop(&mut self) -> Option<(FanotifyEvent, Option<Box<EvNode>>)> {
+        match self.overflow {
+            Some(0) => {
+                self.overflow = None;
+                Some((OVERFLOW_EVENT, None))
+            }
+            Some(n) => {
+                self.overflow = Some(n - 1);
+                self.events.pop_front().map(|b| (b.ev, Some(b)))
+            }
+            None => self.events.pop_front().map(|b| (b.ev, Some(b))),
+        }
+    }
 }
 
 /// Fanotify instance
 pub struct Fanotify {
-    /// Inner state protected by spinlock
+    /// The marks (sleeping, Linux group->mark_mutex)
+    mark_mutex: crate::sync::Mutex<FanMarks>,
+    /// The event queue (Linux group->notification_lock)
     inner: IrqSpinlock<FanotifyInner>,
     /// Wait queue for blocking readers
     wait_queue: WaitQueue,
@@ -316,23 +418,17 @@ impl Fanotify {
     /// Create a new fanotify instance
     pub fn new(init_flags: u32) -> Result<Arc<Self>, KernelError> {
         try_arc(Self {
-            inner: IrqSpinlock::new(FanotifyInner::default()),
+            mark_mutex: crate::sync::Mutex::new(FanMarks::default()),
+            inner: IrqSpinlock::new(FanotifyInner::new()),
             wait_queue: WaitQueue::new(),
             init_flags,
         })
     }
 
-    /// Add or update a mark
+    /// Add or update a mark (Linux fanotify_add_mark, under mark_mutex)
     pub fn add_mark(&self, mark_flags: u32, mask: u64, target_id: u64) {
-        let mut inner = self.inner.lock();
-
-        let marks = if (mark_flags & FAN_MARK_FILESYSTEM) != 0 {
-            &mut inner.fs_marks
-        } else if (mark_flags & FAN_MARK_MOUNT) != 0 {
-            &mut inner.mount_marks
-        } else {
-            &mut inner.inode_marks
-        };
+        let mut all = self.mark_mutex.lock();
+        let marks = all.of(mark_flags);
 
         if let Some(existing) = marks.get_mut(&target_id) {
             // Add to existing mark
@@ -345,15 +441,8 @@ impl Fanotify {
 
     /// Remove mask bits from a mark
     pub fn remove_mark(&self, mark_flags: u32, mask: u64, target_id: u64) {
-        let mut inner = self.inner.lock();
-
-        let marks = if (mark_flags & FAN_MARK_FILESYSTEM) != 0 {
-            &mut inner.fs_marks
-        } else if (mark_flags & FAN_MARK_MOUNT) != 0 {
-            &mut inner.mount_marks
-        } else {
-            &mut inner.inode_marks
-        };
+        let mut all = self.mark_mutex.lock();
+        let marks = all.of(mark_flags);
 
         if let Some(existing) = marks.get_mut(&target_id) {
             existing.mask &= !mask;
@@ -365,58 +454,51 @@ impl Fanotify {
 
     /// Flush all marks of a given type
     pub fn flush_marks(&self, mark_flags: u32) {
-        let mut inner = self.inner.lock();
-
-        if (mark_flags & FAN_MARK_FILESYSTEM) != 0 {
-            inner.fs_marks.clear();
-        } else if (mark_flags & FAN_MARK_MOUNT) != 0 {
-            inner.mount_marks.clear();
-        } else {
-            inner.inode_marks.clear();
-        }
+        // The marks are freed after the lock
+        let gone = core::mem::take(self.mark_mutex.lock().of(mark_flags));
+        drop(gone);
     }
 
-    /// Queue an event
+    /// Queue an event: allocated before the queue lock (Linux
+    /// fanotify_handle_event: fanotify_alloc_event, then
+    /// fsnotify_insert_event; no memory queues FAN_Q_OVERFLOW)
     pub fn queue_event(&self, mask: u64, pid: i32) {
-        let mut inner = self.inner.lock();
-
-        if inner.events.len() < FANOTIFY_MAX_QUEUED_EVENTS {
-            inner.events.push(FanotifyEvent { mask, pid });
-        } else if inner.events.is_empty()
-            || inner.events.last().map(|e| e.mask) != Some(FAN_Q_OVERFLOW)
-        {
-            // Queue overflow event
-            inner.events.push(FanotifyEvent {
-                mask: FAN_Q_OVERFLOW,
-                pid: 0,
-            });
+        let ev = try_box(EvNode {
+            link: Link::new(),
+            ev: FanotifyEvent { mask, pid },
+        })
+        .ok();
+        let (queued, left) = self.inner.lock().push(ev);
+        drop(left);
+        if queued {
+            self.wait_queue.wake_all();
         }
-
-        drop(inner);
-        self.wait_queue.wake_all();
     }
 
     /// Check if any events are pending
     fn has_events(&self) -> bool {
-        !self.inner.lock().events.is_empty()
+        !self.inner.lock().is_empty()
     }
 
     /// The oldest event if it fits in `room` bytes (EINVAL if not),
     /// waiting for one unless `nonblock` (Linux get_one_event)
     fn get_event(&self, room: usize, nonblock: bool) -> Result<FanotifyEvent, KernelError> {
         let mut inner = self.inner.lock();
-        if inner.events.is_empty() {
+        if inner.is_empty() {
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
             // Wait for events (a signal ends the wait)
             self.wait_queue
-                .wait_event_interruptible_locked(&mut inner, |i| !i.events.is_empty())?;
+                .wait_event_interruptible_locked(&mut inner, |i| !i.is_empty())?;
         }
-        if inner.events[0].serialized_size() > room {
+        if inner.front().map_or(0, |e| e.serialized_size()) > room {
             return Err(KernelError::InvalidArgument);
         }
-        Ok(inner.events.remove(0))
+        let (ev, node) = inner.pop().ok_or(KernelError::WouldBlock)?;
+        drop(inner);
+        drop(node);
+        Ok(ev)
     }
 
     /// Read events into `to` (Linux fanotify_read): each is taken off
@@ -465,8 +547,7 @@ impl Fanotify {
 
     /// Get the total size of queued events
     pub fn queued_size(&self) -> usize {
-        let inner = self.inner.lock();
-        inner.events.iter().map(|e| e.serialized_size()).sum()
+        self.inner.lock().len() * FANOTIFY_METADATA_SIZE
     }
 
     /// Get init flags

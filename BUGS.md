@@ -701,8 +701,22 @@ boot lists each site once (`LOCKDEP:ATOMIC_ALLOC`, with the IRQ-safe
 lock, spin lock or `local_irq_save` it was made under; the shutdown
 summary counts them): mostly collections grown, or copied, under spin
 locks in net, fs, io, task, ipc, cgroup and keys, and IRQ-safe locks
-in epoll, inotify, fanotify, bpf maps and the swap cache. ROADMAP
+in bpf maps and the swap cache. ROADMAP
 phase A (A0-A3).
+
+## The last fput is not deferred
+
+**Location**: `fs/file.rs`, `io/epoll.rs` (`Eventpoll.mtx`)
+
+Linux defers a file's release (`__fput`) to task_work (or a kernel
+thread from interrupt context), so ep->mtx is held across epoll's
+ready-list scans and polls: a file whose last reference drops there is
+released later. hk releases it at once, and its eventpoll removal takes
+`Eventpoll.mtx`, so epoll polls with no epoll lock held instead. Two
+`epoll_wait`s on one epoll may then both report an item that got an
+event mid-scan (Linux serializes them under ep->mtx). Phase A1: defer
+fput (Linux fput -> task_work_add / delayed_fput), then hold
+`Eventpoll.mtx` across the scan.
 
 ## Scheduler gaps (deviations from Linux)
 

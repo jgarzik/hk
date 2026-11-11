@@ -17,10 +17,14 @@
 //! is allowed EP_MAX_NESTS deep without cycles (`ep_loop_check`, ELOOP).
 //!
 //! Locking (doc/LOCKING.md):
-//! - `Eventpoll.lock` (IrqSpinlock; the callback runs under the woken
-//!   queue's lock, possibly in an interrupt): the item map and the
-//!   ready list. Nothing sleeps, polls or copies to user under it, and
-//!   no `EpItem` is dropped under it.
+//! - `Eventpoll.mtx` (sleeping, Linux ep->mtx): the item map. Nothing
+//!   polls a file or drops a last `Arc<File>` under it (a file's last
+//!   close runs `eventpoll_release` at once, which takes it).
+//! - `Eventpoll.lock` (IrqSpinlock, Linux ep->lock; the callback runs
+//!   under the woken queue's lock, possibly in an interrupt): the ready
+//!   list and the links of a transfer's private list. Nothing sleeps,
+//!   allocates, polls or copies to user under it, and no last
+//!   `Arc<EpItem>` is dropped under it.
 //! - `EpItem.regs` (spin, thread context): the item's callback entries
 //!   and the owners of their queues; registering and unregistering take
 //!   the file's queue locks under it (queue lock -> `Eventpoll.lock` in
@@ -146,10 +150,26 @@ impl EpRegs {
     }
 }
 
+/// Return `item`, whose report a transfer could not copy out, to the
+/// transfer's list `tx` (`Eventpoll.lock` held), so `done_scan` puts it
+/// back on the ready list. Off `tx` while it was polled, an event may
+/// have queued it again and another transfer taken it: then that one
+/// reports it, and the reference comes back to drop after the unlock.
+fn give_back(tx: &mut ArcList<TxAdapter>, item: Arc<EpItem>) -> Option<Arc<EpItem>> {
+    if item.txlink.is_linked() {
+        return Some(item);
+    }
+    tx.push_front(item);
+    None
+}
+
 /// One watched (file, fd) pair (Linux struct epitem)
 pub struct EpItem {
     /// On the ready list (under `Eventpoll.lock`)
     rdlink: Link,
+    /// On an epoll_wait transfer's private list (under `Eventpoll.lock`;
+    /// Linux reuses rdllink and parks new events on ovflist meanwhile)
+    txlink: Link,
     fd: Fd,
     /// The file: no reference (its last close removes the item)
     file: Weak<File>,
@@ -172,6 +192,7 @@ unsafe impl Send for EpItem {}
 unsafe impl Sync for EpItem {}
 
 crate::adapter!(RdAdapter, EpItem, rdlink);
+crate::adapter!(TxAdapter, EpItem, txlink);
 
 impl EpItem {
     /// The ready events of its file, without registering
@@ -209,16 +230,17 @@ fn ep_poll_callback(e: &WaitEntry, _mode: WakeMode, key: usize) -> bool {
         return false;
     }
     let queued = {
-        let mut inner = ep.lock.lock();
+        let mut rdl = ep.lock.lock();
         if item.rdlink.is_linked() {
             false
         } else {
-            // SAFETY: the item is in `inner.items`, which holds an Arc
+            // SAFETY: the item is alive while its entries are registered
+            // (the map's Arc goes only after they are removed)
             let arc = unsafe {
                 Arc::increment_strong_count(item);
                 Arc::from_raw(item)
             };
-            inner.rdl.push_back(arc);
+            rdl.push_back(arc);
             true
         }
     };
@@ -233,16 +255,16 @@ fn ep_poll_callback(e: &WaitEntry, _mode: WakeMode, key: usize) -> bool {
 // The epoll instance
 // ============================================================================
 
-struct EpInner {
-    /// Every item by (file address, fd)
-    items: BTreeMap<(usize, Fd), Arc<EpItem>>,
-    /// Items that had an event since last reported
-    rdl: ArcList<RdAdapter>,
-}
+/// Every item by (file address, fd) (Linux ep->rbr)
+type EpItems = BTreeMap<(usize, Fd), Arc<EpItem>>;
 
 /// An epoll instance (Linux struct eventpoll)
 pub struct Eventpoll {
-    lock: IrqSpinlock<EpInner>,
+    /// The items (Linux ep->mtx over ep->rbr)
+    mtx: crate::sync::Mutex<EpItems>,
+    /// Items that had an event since last reported (Linux ep->lock over
+    /// ep->rdllist)
+    lock: IrqSpinlock<ArcList<RdAdapter>>,
     /// epoll_wait sleepers
     wq: WaitQueue,
     /// Pollers of the epoll file itself (an epoll watching it)
@@ -263,10 +285,8 @@ impl Eventpoll {
     /// Create a new epoll instance
     pub fn new() -> Result<Arc<Self>, KernelError> {
         try_arc(Self {
-            lock: IrqSpinlock::new(EpInner {
-                items: BTreeMap::new(),
-                rdl: ArcList::new(),
-            }),
+            mtx: crate::sync::Mutex::new(BTreeMap::new()),
+            lock: IrqSpinlock::new(ArcList::new()),
             wq: WaitQueue::new(),
             poll_wq: WaitQueue::new(),
             file: spin::Once::new(),
@@ -279,10 +299,10 @@ impl Eventpoll {
             return;
         }
         let queued = {
-            let mut inner = self.lock.lock();
+            let mut rdl = self.lock.lock();
             let mine = !item.dead.load(Ordering::Acquire) && !item.rdlink.is_linked();
             if mine {
-                inner.rdl.push_back(item.clone());
+                rdl.push_back(item.clone());
             }
             mine
         };
@@ -290,6 +310,31 @@ impl Eventpoll {
             self.wq.wake_all();
             self.poll_wq.wake_poll(u32::from(POLLIN));
         }
+    }
+
+    /// Put `item` back at the end of the ready list unless it is
+    /// removed or already there; the reference is dropped after the
+    /// unlock otherwise
+    fn requeue(&self, item: Arc<EpItem>) {
+        self.requeue_at(item, ArcList::push_back);
+    }
+
+    /// As `requeue`, at the front
+    fn requeue_front(&self, item: Arc<EpItem>) {
+        self.requeue_at(item, ArcList::push_front);
+    }
+
+    fn requeue_at(&self, item: Arc<EpItem>, put: fn(&mut ArcList<RdAdapter>, Arc<EpItem>)) {
+        let left = {
+            let mut rdl = self.lock.lock();
+            if item.dead.load(Ordering::Acquire) || item.rdlink.is_linked() {
+                Some(item)
+            } else {
+                put(&mut rdl, item);
+                None
+            }
+        };
+        drop(left);
     }
 
     /// EPOLL_CTL_ADD (Linux ep_insert)
@@ -302,6 +347,7 @@ impl Eventpoll {
         let k = key(file, fd);
         let item = try_arc_cyclic(|w: &Weak<EpItem>| EpItem {
             rdlink: Link::new(),
+            txlink: Link::new(),
             fd,
             file: Arc::downgrade(file),
             ep_raw: Arc::as_ptr(self),
@@ -316,20 +362,15 @@ impl Eventpoll {
             }),
         })?;
         {
-            let mut inner = self.lock.lock();
-            if inner.items.contains_key(&k) {
+            let mut items = self.mtx.lock();
+            if items.contains_key(&k) {
                 return Err(KernelError::AlreadyExists);
             }
-            inner.items.insert(k, item.clone());
+            items.insert(k, item.clone());
         }
-        {
-            let mut f_ep = file.f_ep.lock();
-            if f_ep.try_reserve(1).is_err() {
-                drop(f_ep);
-                self.remove(&item);
-                return Err(KernelError::OutOfMemory);
-            }
-            f_ep.push(Arc::downgrade(&item));
+        if let Err(e) = f_ep_add(file, &item) {
+            self.remove(&item);
+            return Err(e);
         }
         // Register the callbacks (Linux ep_item_poll with the queue
         // proc). The file is polled with no lock held (a poll method may
@@ -351,8 +392,10 @@ impl Eventpoll {
                 local.clear();
                 return Ok(());
             }
-            regs.entries.append(&mut local.entries);
-            regs.owners.append(&mut local.owners);
+            // The item's lists are empty (only this add registers):
+            // swapped in, nothing allocates under `regs`
+            core::mem::swap(&mut regs.entries, &mut local.entries);
+            core::mem::swap(&mut regs.owners, &mut local.owners);
         }
         if revents & (ev.events | EPOLLERR | EPOLLHUP) != 0 {
             self.queue_if_ready(&item);
@@ -362,13 +405,7 @@ impl Eventpoll {
 
     /// EPOLL_CTL_MOD (Linux ep_modify)
     fn modify(&self, fd: Fd, file: &Arc<File>, ev: &EpollEvent) -> Result<(), KernelError> {
-        let item = self
-            .lock
-            .lock()
-            .items
-            .get(&key(file, fd))
-            .cloned()
-            .ok_or(KernelError::NotFound)?;
+        let item = self.lookup(fd, file)?;
         if item.events.load(Ordering::Acquire) & EPOLLEXCLUSIVE != 0 {
             return Err(KernelError::InvalidArgument);
         }
@@ -378,28 +415,43 @@ impl Eventpoll {
         Ok(())
     }
 
+    /// The item watching (`file`, `fd`): ENOENT if none
+    fn lookup(&self, fd: Fd, file: &Arc<File>) -> Result<Arc<EpItem>, KernelError> {
+        self.mtx
+            .lock()
+            .get(&key(file, fd))
+            .cloned()
+            .ok_or(KernelError::NotFound)
+    }
+
+    /// Take `item` out of the map, if it is still there under `k`
+    fn unmap(&self, k: (usize, Fd), item: &Arc<EpItem>) -> Option<Arc<EpItem>> {
+        let mut items = self.mtx.lock();
+        let mine = items.get(&k).is_some_and(|it| Arc::ptr_eq(it, item));
+        mine.then(|| items.remove(&k)).flatten()
+    }
+
+    /// Take `item` off the ready list, if it is on it
+    fn unready(&self, item: &EpItem) -> Option<Arc<EpItem>> {
+        let mut rdl = self.lock.lock();
+        // SAFETY: `rdlink` is only ever on this epoll's ready list
+        item.rdlink.is_linked().then(|| unsafe { rdl.remove(item) })
+    }
+
     /// Take `item` out of the map and the ready list, and unregister it
-    /// (Linux ep_remove); its Arcs are dropped after the lock
+    /// (Linux ep_remove); its Arcs are dropped after the locks
     fn remove(&self, item: &Arc<EpItem>) {
         // No callback first (it could queue the item again once off the
         // ready list): unregistering waits out any one running, under
         // its queue's lock (Linux ep_remove: ep_unregister_pollwait)
         item.unregister();
-        // The file is held across the lock: no last reference to it may
-        // go under `lock` (its release takes `lock`)
+        // The file is held across the locks: no last reference to it
+        // may go under `mtx` (its release takes `mtx`)
         let file = item.file.upgrade();
-        let (mapped, ready) = {
-            let mut inner = self.lock.lock();
-            let mapped = file
-                .as_ref()
-                .and_then(|f| inner.items.remove(&key(f, item.fd)));
-            // SAFETY: linked only on this epoll's ready list
-            let ready = item
-                .rdlink
-                .is_linked()
-                .then(|| unsafe { inner.rdl.remove(item) });
-            (mapped, ready)
-        };
+        let mapped = file
+            .as_ref()
+            .and_then(|f| self.unmap(key(f, item.fd), item));
+        let ready = self.unready(item);
         if let Some(f) = &file {
             f.f_ep
                 .lock()
@@ -411,13 +463,7 @@ impl Eventpoll {
 
     /// EPOLL_CTL_DEL
     fn delete(&self, fd: Fd, file: &Arc<File>) -> Result<(), KernelError> {
-        let item = self
-            .lock
-            .lock()
-            .items
-            .get(&key(file, fd))
-            .cloned()
-            .ok_or(KernelError::NotFound)?;
+        let item = self.lookup(fd, file)?;
         self.remove(&item);
         Ok(())
     }
@@ -431,27 +477,10 @@ impl Eventpoll {
         max: usize,
         mut put: impl FnMut(usize, EpollEvent) -> bool,
     ) -> Result<usize, KernelError> {
-        // Take the ready list (items queued during the transfer are new
-        // events and land on it again)
-        let mut tx = Vec::new();
-        {
-            let mut inner = self.lock.lock();
-            while tx.len() < max
-                && let Some(it) = inner.rdl.pop_front()
-            {
-                if tx.try_reserve(1).is_err() {
-                    inner.rdl.push_front(it);
-                    break;
-                }
-                tx.push(it);
-            }
-        }
+        let mut tx = self.start_scan(max);
         let mut n = 0;
-        let mut requeue = Vec::new();
-        let _ = requeue.try_reserve(tx.len());
         let mut fault = false;
-        let mut rest = tx.into_iter();
-        for item in rest.by_ref() {
+        while let Some(item) = self.next_tx(&mut tx) {
             if item.dead.load(Ordering::Acquire) {
                 continue;
             }
@@ -462,7 +491,11 @@ impl Eventpoll {
             let ev = EpollEvent::new(revents, item.data.load(Ordering::Acquire));
             if !put(n, ev) {
                 fault = true;
-                requeue.push(item);
+                let left = {
+                    let _g = self.lock.lock();
+                    give_back(&mut tx, item)
+                };
+                drop(left);
                 break;
             }
             n += 1;
@@ -470,27 +503,66 @@ impl Eventpoll {
             if events & EPOLLONESHOT != 0 {
                 item.events.fetch_and(EP_PRIVATE_BITS, Ordering::AcqRel);
             } else if events & EPOLLET == 0 {
-                requeue.push(item);
+                self.requeue(item);
             }
         }
-        requeue.extend(rest);
-        {
-            let mut inner = self.lock.lock();
-            for item in requeue.drain(..) {
-                if !item.dead.load(Ordering::Acquire) && !item.rdlink.is_linked() {
-                    inner.rdl.push_back(item);
-                }
-            }
-        }
+        self.done_scan(tx);
         if fault && n == 0 {
             return Err(KernelError::BadAddress);
         }
         Ok(n)
     }
 
+    /// Move up to `max` ready items to a private list (Linux
+    /// ep_start_scan). Through their own link: off the ready list, an
+    /// item is queued again by an event during the transfer (Linux
+    /// ovflist). One already on another transfer's list is left to it
+    /// (that list holds a reference: not the last one dropped here).
+    fn start_scan(&self, max: usize) -> ArcList<TxAdapter> {
+        let mut tx = ArcList::new();
+        let mut rdl = self.lock.lock();
+        while tx.len() < max
+            && let Some(it) = rdl.pop_front()
+        {
+            if !it.txlink.is_linked() {
+                tx.push_back(it);
+            }
+        }
+        tx
+    }
+
+    /// The next item of a transfer's list (its links change only under
+    /// `lock`: another transfer reads them there)
+    fn next_tx(&self, tx: &mut ArcList<TxAdapter>) -> Option<Arc<EpItem>> {
+        let _g = self.lock.lock();
+        tx.pop_front()
+    }
+
+    /// The items a transfer did not reach go back on the ready list
+    /// (Linux ep_done_scan); another waiter is woken if any is ready.
+    /// Removed ones are released after the unlock.
+    fn done_scan(&self, mut tx: ArcList<TxAdapter>) {
+        let mut gone = ArcList::<TxAdapter>::new();
+        let ready = {
+            let mut rdl = self.lock.lock();
+            while let Some(it) = tx.pop_front() {
+                if it.dead.load(Ordering::Acquire) || it.rdlink.is_linked() {
+                    gone.push_back(it);
+                } else {
+                    rdl.push_back(it);
+                }
+            }
+            !rdl.is_empty()
+        };
+        drop(gone);
+        if ready {
+            self.wq.wake_all();
+        }
+    }
+
     /// Any queued item with an event
     fn has_ready(&self) -> bool {
-        !self.lock.lock().rdl.is_empty()
+        !self.lock.lock().is_empty()
     }
 
     /// epoll_wait's core (Linux ep_poll): report ready events, else
@@ -521,63 +593,73 @@ impl Eventpoll {
 
     /// Readiness of the epoll file itself (Linux ep_eventpoll_poll): an
     /// item on the ready list with an event; the queue it waits on is
-    /// `poll_wq`
+    /// `poll_wq`. The ready items are taken off the list front first
+    /// and polled (an event meanwhile queues one again), at most as many
+    /// as were queued, until one has an event: that one goes back in
+    /// front; those with none stay off (Linux __ep_eventpoll_poll's scan).
+    /// The epoll's waiters are woken if any item is left ready (Linux
+    /// ep_done_scan: one may have looked while it was off).
     pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(pt) = pt {
             pt.poll_wait(&self.poll_wq);
         }
-        let ready: Vec<Arc<EpItem>> = {
-            let inner = self.lock.lock();
-            let mut v = Vec::new();
-            for it in inner.rdl.iter() {
-                if v.try_reserve(1).is_err() {
-                    break;
-                }
-                // SAFETY: on the list, which holds an Arc to it
-                v.push(unsafe {
-                    Arc::increment_strong_count(it);
-                    Arc::from_raw(core::ptr::from_ref::<EpItem>(it))
-                });
+        let n = self.lock.lock().len();
+        let mut res = 0;
+        for _ in 0..n {
+            let Some(item) = self.lock.lock().pop_front() else {
+                break;
+            };
+            if !item.dead.load(Ordering::Acquire) && item.poll() != 0 {
+                self.requeue_front(item);
+                res = POLLIN | POLLRDNORM;
+                break;
             }
-            v
-        };
-        let any = ready
-            .iter()
-            .any(|it| !it.dead.load(Ordering::Acquire) && it.poll() != 0);
-        drop(ready);
-        if any { POLLIN | POLLRDNORM } else { 0 }
+        }
+        if self.has_ready() {
+            self.wq.wake_all();
+        }
+        res
     }
 
-    /// The epoll files among this one's targets
+    /// The epoll files among this one's targets (walked under `mtx`,
+    /// Linux ep_loop_check_proc; the files are released after it)
     fn epoll_targets(&self) -> Vec<Arc<Eventpoll>> {
-        let files: Vec<Arc<File>> = {
-            let inner = self.lock.lock();
-            inner
-                .items
-                .values()
-                .filter_map(|it| it.file.upgrade())
-                .collect()
-        };
+        let files: Vec<Arc<File>> = self
+            .mtx
+            .lock()
+            .values()
+            .filter_map(|it| it.file.upgrade())
+            .collect();
         files.iter().filter_map(|f| get_eventpoll(f)).collect()
     }
 }
 
-impl Drop for Eventpoll {
-    /// The epoll file's last close (Linux ep_free): every item goes
-    fn drop(&mut self) {
-        let mut ready = Vec::new();
-        let items: Vec<Arc<EpItem>> = {
-            let mut inner = self.lock.lock();
-            while let Some(it) = inner.rdl.pop_front() {
-                // The map holds each too: no item is freed here
-                if ready.try_reserve(1).is_ok() {
-                    ready.push(it);
-                }
+/// Put `item` on `file`'s watchers (Linux f_ep), the vector growing
+/// with its lock released (nothing allocates under it): ENOMEM
+fn f_ep_add(file: &File, item: &Arc<EpItem>) -> Result<(), KernelError> {
+    let w = Arc::downgrade(item);
+    loop {
+        let cap = {
+            let mut v = file.f_ep.lock();
+            if v.len() < v.capacity() {
+                v.push(w);
+                return Ok(());
             }
-            core::mem::take(&mut inner.items).into_values().collect()
+            v.capacity()
         };
-        drop(ready);
-        for item in &items {
+        let bigger = crate::util::kmem::spare(cap)?;
+        let old = crate::util::kmem::adopt(&mut file.f_ep.lock(), bigger);
+        drop(old);
+    }
+}
+
+impl Drop for Eventpoll {
+    /// The epoll file's last close (Linux ep_free): every item goes,
+    /// unregistered before the ready list is emptied (no callback can
+    /// queue one after); all are released with no lock held
+    fn drop(&mut self) {
+        let items = core::mem::take(&mut *self.mtx.lock());
+        for item in items.values() {
             item.unregister();
             if let Some(f) = item.file.upgrade() {
                 f.f_ep
@@ -585,6 +667,9 @@ impl Drop for Eventpoll {
                     .retain(|w| !core::ptr::eq(w.as_ptr(), Arc::as_ptr(item)));
             }
         }
+        let ready = core::mem::replace(&mut *self.lock.lock(), ArcList::new());
+        drop(ready);
+        drop(items);
     }
 }
 
@@ -598,14 +683,8 @@ pub fn eventpoll_release(file: &File) {
         };
         item.unregister();
         if let Some(ep) = item.ep.upgrade() {
-            let gone = {
-                let mut inner = ep.lock.lock();
-                inner.items.retain(|_, it| !Arc::ptr_eq(it, &item));
-                // SAFETY: linked only on this epoll's ready list
-                item.rdlink
-                    .is_linked()
-                    .then(|| unsafe { inner.rdl.remove(&item) })
-            };
+            let k = (core::ptr::from_ref::<File>(file) as usize, item.fd);
+            let gone = (ep.unmap(k, &item), ep.unready(&item));
             drop(gone);
         }
     }
@@ -887,4 +966,46 @@ pub fn sys_epoll_pwait2(
         crate::time::deadline_ts(ts.tv_sec, ts.tv_nsec)?
     };
     do_epoll_pwait(epfd, events_ptr, maxevents, deadline, sigmask, sigsetsize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item() -> Arc<EpItem> {
+        crate::util::kalloc::arc_nofail(EpItem {
+            rdlink: Link::new(),
+            txlink: Link::new(),
+            fd: 3,
+            file: Weak::new(),
+            ep_raw: core::ptr::null(),
+            ep: Weak::new(),
+            events: AtomicU32::new(0),
+            data: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
+            regs: crate::sync::spin::Mutex::new(EpRegs {
+                entries: Vec::new(),
+                owners: Vec::new(),
+                item: core::ptr::null(),
+            }),
+        })
+    }
+
+    /// A transfer whose copy-out failed gives its item back only if no
+    /// other transfer took it meanwhile (an event requeued it and a
+    /// second epoll_wait's scan moved it to its own list)
+    #[test]
+    fn give_back_leaves_item_to_other_transfer() {
+        let x = item();
+        let mut other = ArcList::<TxAdapter>::new();
+        other.push_back(x.clone());
+        let mut mine = ArcList::<TxAdapter>::new();
+        let left = give_back(&mut mine, x.clone());
+        assert!(left.is_some() && mine.is_empty());
+        drop(left);
+        let y = item();
+        assert!(give_back(&mut mine, y).is_none());
+        assert_eq!(mine.len(), 1);
+        drop(other.pop_front());
+    }
 }

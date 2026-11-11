@@ -29,9 +29,9 @@
 //! - Multiple watches per inotify instance
 //! - Watch descriptors (wd) are unique per instance
 
-use crate::util::kalloc::try_arc;
-use crate::util::kmem::KDeque;
-use alloc::collections::BTreeMap;
+use crate::util::kalloc::{try_arc, try_box};
+use crate::util::list::{BoxList, Link};
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -199,6 +199,47 @@ const OVERFLOW_EVENT: QueuedEvent = QueuedEvent {
     name: None,
 };
 
+/// A queued event, allocated before the queue lock is taken (Linux
+/// struct inotify_event_info on group->notification_list)
+struct EvNode {
+    link: Link,
+    ev: QueuedEvent,
+}
+
+crate::adapter!(EvAdapter, EvNode, link);
+
+/// An event for watch `wd` with no name: None without memory (Linux
+/// inotify_handle_inode_event's allocation; IN_Q_OVERFLOW stands in)
+fn ev_alloc(wd: i32, mask: u32) -> Option<Box<EvNode>> {
+    let ev = QueuedEvent {
+        wd,
+        mask,
+        cookie: 0,
+        name: None,
+    };
+    try_box(EvNode {
+        link: Link::new(),
+        ev,
+    })
+    .ok()
+}
+
+/// An event taken off the queue: the preallocated overflow, or one
+/// that is freed after the queue lock is dropped
+enum Taken {
+    Overflow,
+    Ev(Box<EvNode>),
+}
+
+impl Taken {
+    fn ev(&self) -> &QueuedEvent {
+        match self {
+            Taken::Overflow => &OVERFLOW_EVENT,
+            Taken::Ev(n) => &n.ev,
+        }
+    }
+}
+
 impl QueuedEvent {
     /// Bytes of the name field: the name, its NUL and padding to a
     /// multiple of the header size (16 bytes); 0 without a name
@@ -241,10 +282,12 @@ impl QueuedEvent {
 struct InotifyInner {
     /// Next watch descriptor to allocate
     next_wd: i32,
-    /// Active watches: wd -> watch
-    watches: BTreeMap<i32, InotifyWatch>,
+    /// Active watches by wd, sorted (Linux the group's idr under
+    /// idr_lock); room for an insert is made before the lock is taken
+    /// (`Inotify::watch_preload`, Linux idr_preload)
+    watches: Vec<(i32, InotifyWatch)>,
     /// Queued events, oldest first (Linux group->notification_list)
-    events: KDeque<QueuedEvent>,
+    events: BoxList<EvAdapter>,
     /// The one IN_Q_OVERFLOW, while queued: how many of `events` are
     /// ahead of it (Linux's preallocated group->overflow_event, on the
     /// list or not; a position, so queueing it allocates nothing)
@@ -255,8 +298,8 @@ impl InotifyInner {
     const fn new() -> Self {
         Self {
             next_wd: 1,
-            watches: BTreeMap::new(),
-            events: KDeque::new(),
+            watches: Vec::new(),
+            events: BoxList::new(),
             overflow: None,
         }
     }
@@ -271,14 +314,18 @@ impl InotifyInner {
     }
 
     /// Queue `ev` (Linux fsnotify_insert_event): past
-    /// INOTIFY_MAX_QUEUED_EVENTS, or without memory for it
-    /// (inotify_handle_inode_event), IN_Q_OVERFLOW is queued in its
-    /// place. Whether anything was queued: no wakeup or SIGIO if not.
-    fn push(&mut self, ev: QueuedEvent) -> bool {
-        if self.len() < INOTIFY_MAX_QUEUED_EVENTS && self.events.try_push_back(ev).is_ok() {
-            return true;
+    /// INOTIFY_MAX_QUEUED_EVENTS, or without memory for it (None,
+    /// inotify_handle_inode_event), IN_Q_OVERFLOW is queued in its
+    /// place. Whether anything was queued (no wakeup or SIGIO if not),
+    /// and the event if it was not, to free after the unlock.
+    fn push(&mut self, ev: Option<Box<EvNode>>) -> (bool, Option<Box<EvNode>>) {
+        match ev {
+            Some(e) if self.len() < INOTIFY_MAX_QUEUED_EVENTS => {
+                self.events.push_back(e);
+                (true, None)
+            }
+            e => (self.queue_overflow(), e),
         }
-        self.queue_overflow()
     }
 
     /// Queue IN_Q_OVERFLOW unless it is already queued (Linux
@@ -295,23 +342,28 @@ impl InotifyInner {
     fn front(&self) -> Option<&QueuedEvent> {
         match self.overflow {
             Some(0) => Some(&OVERFLOW_EVENT),
-            _ => self.events.front(),
+            _ => self.events.iter().next().map(|n| &n.ev),
         }
     }
 
     /// Take the oldest event (Linux fsnotify_remove_first_event)
-    fn pop(&mut self) -> Option<QueuedEvent> {
+    fn pop(&mut self) -> Option<Taken> {
         match self.overflow {
             Some(0) => {
                 self.overflow = None;
-                Some(OVERFLOW_EVENT)
+                Some(Taken::Overflow)
             }
             Some(n) => {
                 self.overflow = Some(n - 1);
-                self.events.pop_front()
+                self.events.pop_front().map(Taken::Ev)
             }
-            None => self.events.pop_front(),
+            None => self.events.pop_front().map(Taken::Ev),
         }
+    }
+
+    /// Where watch `wd` is in `watches` (Err: where it would go)
+    fn find(&self, wd: i32) -> Result<usize, usize> {
+        self.watches.binary_search_by_key(&wd, |(w, _)| *w)
     }
 
     /// Change the existing watch on `inode`, if any: its result (EEXIST
@@ -338,7 +390,7 @@ impl InotifyInner {
         let next = |wd: i32| if wd == i32::MAX { 1 } else { wd + 1 };
         let mut wd = self.next_wd;
         for _ in 0..=self.watches.len() {
-            if !self.watches.contains_key(&wd) {
+            if self.find(wd).is_err() {
                 self.next_wd = next(wd);
                 return Some(wd);
             }
@@ -524,24 +576,26 @@ fn max_user_watches() -> i64 {
     }
 }
 
-/// Each user's watches (Linux UCOUNT_INOTIFY_WATCHES ucounts); a leaf,
-/// never taken under a group's `inner` lock
-static USER_WATCHES: Mutex<BTreeMap<u32, i64>> = Mutex::new(BTreeMap::new());
+/// Each user's watches, (uid, count) for the users with any (Linux
+/// UCOUNT_INOTIFY_WATCHES ucounts); a leaf, never taken under a group's
+/// `inner` lock. It grows with the lock released (`push_if`, Linux
+/// alloc_ucounts allocating before ucounts_lock)
+static USER_WATCHES: Mutex<Vec<(u32, i64)>> = Mutex::new(Vec::new());
 
 /// Charge one watch to `uid`: ENOSPC at max_user_watches (Linux
 /// inc_inotify_watches -> inc_ucount)
 fn watch_charge(uid: u32) -> Result<(), KernelError> {
     let max = max_user_watches();
-    let mut users = USER_WATCHES.lock();
-    let n = users.entry(uid).or_insert(0);
-    if *n >= max {
-        if *n == 0 {
-            users.remove(&uid);
+    let mut r = Ok(());
+    push_if(&USER_WATCHES, |users| {
+        match users.iter_mut().find(|(u, _)| *u == uid) {
+            Some((_, n)) if *n >= max => r = Err(KernelError::NoSpace),
+            Some((_, n)) => *n += 1,
+            None if max <= 0 => r = Err(KernelError::NoSpace),
+            None => users.push((uid, 1)),
         }
-        return Err(KernelError::NoSpace);
-    }
-    *n += 1;
-    Ok(())
+    })?;
+    r
 }
 
 /// Return `n` watches' charge to `uid`
@@ -550,10 +604,11 @@ fn watch_uncharge(uid: u32, n: usize) {
         return;
     }
     let mut users = USER_WATCHES.lock();
-    if let Some(c) = users.get_mut(&uid) {
+    if let Some(i) = users.iter().position(|(u, _)| *u == uid) {
+        let c = &mut users[i].1;
         *c = c.saturating_sub(n as i64);
         if *c == 0 {
-            users.remove(&uid);
+            users.swap_remove(i);
         }
     }
 }
@@ -641,6 +696,9 @@ impl Inotify {
             watch_uncharge(self.uid, 1);
             Err(e)
         };
+        if let Err(e) = self.watch_preload() {
+            return undo(e);
+        }
         let Some(wd) = self.inner.lock().alloc_wd() else {
             return undo(KernelError::NoSpace);
         };
@@ -670,8 +728,28 @@ impl Inotify {
             drop(watch);
             return undo(KernelError::NotFound);
         }
-        inner.watches.insert(wd, watch);
+        // Room was made above and only an add takes it (`mark_mutex`):
+        // nothing allocates here; `wd` is still free (only adds insert)
+        let (Ok(i) | Err(i)) = inner.find(wd);
+        inner.watches.insert(i, (wd, watch));
         Ok(wd)
+    }
+
+    /// Room for one more watch, made with the group's lock released
+    /// (Linux idr_preload); under `mark_mutex`, so it stays for this add
+    fn watch_preload(&self) -> Result<(), KernelError> {
+        let cap = {
+            let inner = self.inner.lock();
+            if inner.watches.len() < inner.watches.capacity() {
+                return Ok(());
+            }
+            inner.watches.capacity()
+        };
+        let bigger = crate::util::kmem::spare(cap)?;
+        let old = crate::util::kmem::adopt(&mut self.inner.lock().watches, bigger);
+        // The old buffer is freed with the lock released
+        drop(old);
+        Ok(())
     }
 
     /// Watch `wd` on `inode` gets `mask` (if it asks for it, or it is
@@ -679,31 +757,28 @@ impl Inotify {
     /// released with the group's lock dropped. SIGIO waits for a worker:
     /// the caller may hold spin locks.
     fn destroy_watch(self: &Arc<Self>, wd: i32, inode: &Inode, mask: u32, isdir: u32) {
+        // Both events are allocated before the queue lock (Linux
+        // inotify_handle_inode_event, then fsnotify_insert_event)
+        let ev = ev_alloc(wd, mask | isdir);
+        let ignored = ev_alloc(wd, IN_IGNORED);
         let mut inner = self.inner.lock();
-        let ours = inner
-            .watches
-            .get(&wd)
-            .is_some_and(|w| core::ptr::eq(Arc::as_ptr(&w.inode), inode));
-        let Some(gone) = ours.then(|| inner.watches.remove(&wd)).flatten() else {
+        let Ok(i) = inner.find(wd) else {
             return;
         };
-        if gone.mask & mask != 0 || mask == IN_UNMOUNT {
-            inner.push(QueuedEvent {
-                wd,
-                mask: mask | isdir,
-                cookie: 0,
-                name: None,
-            });
+        if !core::ptr::eq(Arc::as_ptr(&inner.watches[i].1.inode), inode) {
+            return;
         }
-        let queued = inner.push(QueuedEvent {
-            wd,
-            mask: IN_IGNORED,
-            cookie: 0,
-            name: None,
-        });
+        let (_, gone) = inner.watches.remove(i);
+        let (q1, left1) = if gone.mask & mask != 0 || mask == IN_UNMOUNT {
+            inner.push(ev)
+        } else {
+            (false, ev)
+        };
+        let (q2, left2) = inner.push(ignored);
         drop(inner);
+        drop((left1, left2));
         watch_uncharge(self.uid, 1);
-        if queued {
+        if q1 || q2 {
             self.wait_queue.wake_all();
             self.sigio_later();
         }
@@ -721,18 +796,14 @@ impl Inotify {
     ///
     /// EINVAL if there is no such watch.
     pub fn rm_watch(&self, wd: i32) -> KernelResult<()> {
+        // IN_IGNORED is allocated before the queue lock
+        let ignored = ev_alloc(wd, IN_IGNORED);
         let mut inner = self.inner.lock();
-        let gone = inner
-            .watches
-            .remove(&wd)
-            .ok_or(KernelError::InvalidArgument)?;
-        let queued = inner.push(QueuedEvent {
-            wd,
-            mask: IN_IGNORED,
-            cookie: 0,
-            name: None,
-        });
+        let i = inner.find(wd).map_err(|_| KernelError::InvalidArgument)?;
+        let (_, gone) = inner.watches.remove(i);
+        let (queued, left) = inner.push(ignored);
         drop(inner);
+        drop(left);
         // Its mark leaves the inode, which goes with no lock held
         gone.inode.fsnotify.remove(self, wd);
         drop(gone);
@@ -751,8 +822,9 @@ impl Inotify {
     }
 
     /// The oldest event if it fits in `room` bytes (EINVAL if not),
-    /// waiting for one unless `nonblock` (Linux get_one_event)
-    fn get_event(&self, room: usize, nonblock: bool) -> Result<QueuedEvent, KernelError> {
+    /// waiting for one unless `nonblock` (Linux get_one_event); it is
+    /// freed by the caller, after the lock
+    fn get_event(&self, room: usize, nonblock: bool) -> Result<Taken, KernelError> {
         let mut inner = self.inner.lock();
         if inner.is_empty() {
             if nonblock {
@@ -785,7 +857,7 @@ impl Inotify {
                 Err(_) if done > 0 => return Ok(done),
                 Err(e) => return Err(e),
             };
-            done += event.copy_out(to)?;
+            done += event.ev().copy_out(to)?;
         }
     }
 
@@ -811,7 +883,7 @@ impl Inotify {
         inner
             .events
             .iter()
-            .map(QueuedEvent::serialized_size)
+            .map(|n| n.ev.serialized_size())
             .sum::<usize>()
             + overflow
     }
@@ -1003,18 +1075,17 @@ fn resolve_path(pathname: &[u8], mask: u32) -> KernelResult<Path> {
 mod tests {
     use super::*;
 
-    fn ev(wd: i32) -> QueuedEvent {
-        QueuedEvent {
-            wd,
-            mask: IN_IGNORED,
-            cookie: 0,
-            name: None,
-        }
+    fn push(q: &mut InotifyInner, wd: i32) -> bool {
+        q.push(ev_alloc(wd, IN_IGNORED)).0
+    }
+
+    fn pop(q: &mut InotifyInner) -> Option<(i32, u32)> {
+        q.pop().map(|t| (t.ev().wd, t.ev().mask))
     }
 
     fn fill(q: &mut InotifyInner, n: usize) {
         for i in 0..n {
-            assert!(q.push(ev(i as i32)));
+            assert!(push(q, i as i32));
         }
     }
 
@@ -1022,20 +1093,29 @@ mod tests {
     fn overflow_queued_once_and_keeps_its_place() {
         let mut q = InotifyInner::new();
         fill(&mut q, INOTIFY_MAX_QUEUED_EVENTS);
-        assert!(q.push(ev(-1)), "full: the overflow is queued");
-        assert!(!q.push(ev(-1)), "only one overflow");
+        assert!(push(&mut q, -1), "full: the overflow is queued");
+        assert!(!push(&mut q, -1), "only one overflow");
         // The overflow counts (Linux q_len): room after two reads
-        assert_eq!(q.pop().map(|e| e.wd), Some(0));
-        assert!(!q.push(ev(9998)));
-        assert_eq!(q.pop().map(|e| e.wd), Some(1));
-        assert!(q.push(ev(9999)), "queued behind the overflow");
-        assert!(!q.push(ev(10000)));
+        assert_eq!(pop(&mut q).map(|e| e.0), Some(0));
+        assert!(!push(&mut q, 9998));
+        assert_eq!(pop(&mut q).map(|e| e.0), Some(1));
+        assert!(push(&mut q, 9999), "queued behind the overflow");
+        assert!(!push(&mut q, 10000));
         for i in 2..INOTIFY_MAX_QUEUED_EVENTS {
-            assert_eq!(q.pop().map(|e| e.wd), Some(i as i32));
+            assert_eq!(pop(&mut q).map(|e| e.0), Some(i as i32));
         }
         assert_eq!(q.front().map(|e| e.mask), Some(IN_Q_OVERFLOW));
-        assert_eq!(q.pop().map(|e| (e.wd, e.mask)), Some((-1, IN_Q_OVERFLOW)));
-        assert_eq!(q.pop().map(|e| e.wd), Some(9999));
+        assert_eq!(pop(&mut q), Some((-1, IN_Q_OVERFLOW)));
+        assert_eq!(pop(&mut q).map(|e| e.0), Some(9999));
         assert!(q.is_empty() && q.pop().is_none());
+    }
+
+    #[test]
+    fn no_memory_queues_the_overflow() {
+        let mut q = InotifyInner::new();
+        assert!(q.push(None).0, "no event: the overflow instead");
+        assert!(!q.push(None).0, "only one overflow");
+        assert_eq!(pop(&mut q), Some((-1, IN_Q_OVERFLOW)));
+        assert!(q.is_empty());
     }
 }
