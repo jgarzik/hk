@@ -132,6 +132,11 @@ impl<T> Mutex<T> {
         }
     }
 
+    /// The data, through exclusive access (no lock needed)
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
     /// Take the lock if free or handed to `me`; else, with `handoff`,
     /// ask the owner to hand it over (Linux __mutex_trylock_common).
     /// True if `me` now holds it.

@@ -52,6 +52,7 @@ pub fn run_tests() {
     test_lo_dgram(lo);
     test_send(lo);
     test_trunc(lo);
+    test_peek(lo);
     test_rcvbuf(lo);
     test_filter(lo);
     test_opts(lo);
@@ -461,6 +462,35 @@ fn test_trunc(lo: i32) {
         recv(rx, &mut small, MSG_TRUNC | MSG_DONTWAIT),
         60,
     );
+    close(tx);
+    close(rx);
+    t.done();
+}
+
+/// MSG_PEEK leaves the frame queued, also when it truncates; the read
+/// that follows gets the same frame
+fn test_peek(lo: i32) {
+    let mut t = T::new(b"PACKET_PEEK");
+    let rx = bound(SOCK_RAW, ETH_P_TEST, lo);
+    let tx = bound(SOCK_RAW, ETH_P_ALL, lo);
+    let mut f = [0u8; 64];
+    send(tx, test_frame(&mut f, 0x55, 60), 0);
+    t.eq(b"readable", poll1(rx, 1, 3000).0, 1);
+    let mut small = [0u8; 16];
+    let mut ctl = [0u8; 8];
+    let (n, flags, _) = recv_msg(rx, &mut small, &mut ctl, MSG_PEEK);
+    t.ok(
+        b"peek short",
+        n == 16 && flags & MSG_TRUNC != 0,
+        flags as i64,
+    );
+    let mut buf = [0u8; 128];
+    let n = recv(rx, &mut buf, MSG_PEEK | MSG_DONTWAIT);
+    t.ok(b"peek whole", n == 60 && buf[14] == 0x55, n);
+    buf.fill(0);
+    let n = recv(rx, &mut buf, MSG_DONTWAIT);
+    t.ok(b"read", n == 60 && buf[14] == 0x55, n);
+    t.eq(b"consumed", recv(rx, &mut buf, MSG_DONTWAIT), EAGAIN);
     close(tx);
     close(rx);
     t.done();

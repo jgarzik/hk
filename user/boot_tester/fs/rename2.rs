@@ -4,13 +4,16 @@
 //! EEXIST on an existing target; EXCHANGE swaps two names and is ENOENT
 //! without a target; ramfs makes no whiteouts (EINVAL); no rename or
 //! exchange may move a directory under itself (EINVAL, or ENOTEMPTY for
-//! a plain rename onto an ancestor). On arm64,
+//! a plain rename onto an ancestor). A held directory renamed to long
+//! names, exchanged and moved over another is where its holder's cwd
+//! says (the dcache's names: Linux copy_name, swap_names). On arm64,
 //! renameat (38) stays wired, as in Linux (arm64 keeps it).
 
 use crate::harness::verdict;
 use hk_syscall::{
-    AT_FDCWD, O_CREAT, O_WRONLY, Stat, sys_close, sys_mkdir, sys_mount, sys_open, sys_renameat2,
-    sys_rmdir, sys_stat, sys_umount2, sys_unlink,
+    AT_FDCWD, O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close, sys_fchdir,
+    sys_getcwd, sys_mkdir, sys_mount, sys_open, sys_renameat2, sys_rmdir, sys_stat, sys_umount2,
+    sys_unlink,
 };
 
 const NOREPLACE: u32 = 1 << 0;
@@ -44,6 +47,7 @@ pub fn run_tests() {
     }
     trap();
     exchange_dirs();
+    long_names();
     sys_umount2(DIR.as_ptr(), 0);
     sys_rmdir(DIR.as_ptr());
 }
@@ -170,5 +174,64 @@ fn exchange_dirs() {
     verdict(b"RENAME2_EXCHANGE_DIRS", ok, r);
     for d in dirs.iter().rev() {
         sys_rmdir(d.as_ptr());
+    }
+}
+
+/// `prefix`, `n` bytes `c`, a NUL, in `buf`
+fn named<'a>(buf: &'a mut [u8; 96], prefix: &[u8], c: u8, n: usize) -> &'a [u8] {
+    buf[..prefix.len()].copy_from_slice(prefix);
+    buf[prefix.len()..prefix.len() + n].fill(c);
+    buf[prefix.len() + n] = 0;
+    &buf[..prefix.len() + n + 1]
+}
+
+/// The cwd is `want` (NUL-terminated)
+fn cwd_is(want: &[u8]) -> bool {
+    let mut b = [0u8; 128];
+    let r = sys_getcwd(b.as_mut_ptr(), b.len());
+    r > 0 && b[..want.len()] == *want
+}
+
+/// A held directory follows a rename to a long name, an exchange with
+/// a short one and a move over an empty directory with another long
+/// name
+fn long_names() {
+    let (mut lb, mut mb) = ([0u8; 96], [0u8; 96]);
+    let s: &[u8] = b"/tmp/rn2/s\0";
+    let f: &[u8] = b"/tmp/rn2/f\0";
+    let l = named(&mut lb, b"/tmp/rn2/", b'x', 60);
+    let m = named(&mut mb, b"/tmp/rn2/", b'y', 45);
+    let mut home = [0u8; 256];
+    let saved = sys_getcwd(home.as_mut_ptr(), home.len()) > 0;
+    sys_mkdir(s.as_ptr(), 0o755);
+    sys_mkdir(m.as_ptr(), 0o755);
+    touch(f);
+    let fd = sys_open(s.as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    let mut bad = if !saved || fd < 0 || sys_fchdir(fd as i32) != 0 {
+        1
+    } else {
+        0
+    };
+    if bad == 0 && (rn(s, l, 0) != 0 || !cwd_is(l)) {
+        bad = 2;
+    }
+    if bad == 0 && (rn(l, f, EXCHANGE) != 0 || !cwd_is(f) || ino(l) <= 0) {
+        bad = 3;
+    }
+    if bad == 0 && (rn(f, m, 0) != 0 || !cwd_is(m) || ino(f) != ENOENT) {
+        bad = 4;
+    }
+    sys_chdir(if saved {
+        home.as_ptr()
+    } else {
+        b"/\0".as_ptr()
+    });
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    verdict(b"RENAME2_LONG_NAMES", bad == 0, bad);
+    sys_unlink(l.as_ptr());
+    for p in [s, f, m] {
+        sys_rmdir(p.as_ptr());
     }
 }

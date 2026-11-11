@@ -426,20 +426,29 @@ unsafe impl Sync for KmemCache {}
 /// Slab pages from `FRAME_ALLOCATOR`, used through the direct map
 pub struct KernelPages;
 
-/// Heap pages, GFP from the context (the heap API has no flags):
-/// GFP_KERNEL, down to the min watermark; the page allocator reclaims
-/// for it only where the caller may sleep, else it drains the per-CPU
-/// lists and fails (a spin lock held: Linux GFP_NOWAIT's limits).
-/// GFP_ATOMIC (Linux's partial allowance below min) only in an
-/// interrupt handler or within reclaim (PF_MEMALLOC). User data, kernel
-/// buffers of it included (pipe pages), stops at low, so heap objects
-/// get low - min to themselves.
+/// Heap pages, GFP from the context (the heap API has no flags): the
+/// one the call named (`util::kalloc::with_gfp`), else GFP_KERNEL, down
+/// to the min watermark; the page allocator reclaims for it only where
+/// the caller may sleep, else it drains the per-CPU lists and fails (an
+/// unnamed allocation in atomic context, which lockdep's might_alloc
+/// lists). GFP_ATOMIC (Linux's partial allowance below min) in an
+/// interrupt handler unless it named one, and within reclaim
+/// (PF_MEMALLOC, which overrides a named one as in Linux
+/// __gfp_pfmemalloc_flags). User data, kernel buffers of it included
+/// (pipe pages), stops at low, so heap objects get low - min to
+/// themselves.
 fn heap_gfp() -> Gfp {
     #[cfg(not(test))]
     {
         use crate::arch::{CurrentArch, PerCpuOps};
-        let reclaiming = crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC);
-        if CurrentArch::interrupt_depth() > 0 || reclaiming {
+        let irq = CurrentArch::interrupt_depth() > 0;
+        if !irq && crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC) {
+            return Gfp::ATOMIC;
+        }
+        if let Some(g) = crate::util::kalloc::named_gfp() {
+            return g;
+        }
+        if irq {
             return Gfp::ATOMIC;
         }
     }

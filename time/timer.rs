@@ -16,7 +16,12 @@
 //! waits until the callback is done (spinning for HARD, sleeping on the
 //! base's wait queue for SOFT), and dropping a timer does that too, so
 //! its owner may go once it returns. A callback may re-arm its own
-//! timer but must not `del_timer_sync` it.
+//! timer, and may drop the timer's owner (the timer with it): from its
+//! own callback `del_timer_sync` does not wait (the base records the
+//! task running it, and touches the timer no more once it returns),
+//! as Linux frees a socket from its timer's final sock_put.
+//! [`ArcTimer`] is a timer embedded in an `Arc`-owned object whose
+//! pending arm holds a reference to it (Linux sk_reset_timer).
 //!
 //! Locking: `TimerBase.wheel` is an IrqSpinlock leaf (only the wheel's
 //! lists and the timers' `expires`/`pending` under it); callbacks run
@@ -24,6 +29,7 @@
 
 use crate::util::kalloc::box_nofail;
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -133,13 +139,19 @@ impl TimerList {
     }
 
     /// (Re)arm to fire once CLOCK_MONOTONIC reaches `deadline_ns`, at
-    /// tick granularity, never early
-    pub fn mod_timer_ns(self: Pin<&Self>, deadline_ns: u64) {
+    /// tick granularity, never early; true if it was pending
+    pub fn mod_timer_ns(self: Pin<&Self>, deadline_ns: u64) -> bool {
         let now = crate::time::monotonic_ns();
         let ticks = deadline_ns.saturating_sub(now).div_ceil(TICK_NS);
         // The current jiffy is partly over: one more never fires early
         let expires = get_ticks().saturating_add(ticks).saturating_add(1);
-        self.arm(expires, deadline_ns.max(1));
+        self.arm(expires, deadline_ns.max(1))
+    }
+
+    /// The CLOCK_MONOTONIC bound it was armed with (0: armed in
+    /// jiffies or never armed); /proc/net/tcp shows the time left
+    pub fn deadline_ns(&self) -> u64 {
+        self.not_before.load(Ordering::Relaxed)
     }
 
     /// Expiry and lower bound change together under the base lock, so
@@ -164,8 +176,10 @@ impl TimerList {
     }
 
     /// Disarm and wait for a running callback to finish (Linux
-    /// del_timer_sync / timer_delete_sync); thread context unless HARD,
-    /// never from its own callback
+    /// del_timer_sync / timer_delete_sync); thread context unless HARD.
+    /// From its own callback (the owner dropped there) it only disarms:
+    /// the callback is this task, and the base does not touch the timer
+    /// after it returns.
     pub fn del_timer_sync(&self) -> bool {
         let Some(base) = base_ref(self.base.load(Ordering::Acquire)) else {
             return false;
@@ -174,7 +188,7 @@ impl TimerList {
         let mut was = false;
         loop {
             was |= base.wheel.lock().detach(self);
-            if base.running.load(Ordering::Acquire) != me {
+            if base.running.load(Ordering::Acquire) != me || base.runs_here() {
                 return was;
             }
             if self.flags & TIMER_HARD != 0 {
@@ -276,6 +290,9 @@ pub struct TimerBase {
     wheel: IrqSpinlock<Wheel>,
     /// The timer whose callback runs now (Linux running_timer)
     running: AtomicPtr<TimerList>,
+    /// The task running it (valid while `running` is set): a
+    /// `del_timer_sync` by that task is inside the callback
+    runner: AtomicU64,
     /// SOFT: `ktimers/N` waits here for due timers, `del_timer_sync`
     /// for a callback to end
     wq: WaitQueue,
@@ -289,8 +306,14 @@ impl TimerBase {
                 clk: 0,
             }),
             running: AtomicPtr::new(core::ptr::null_mut()),
+            runner: AtomicU64::new(0),
             wq: WaitQueue::new(),
         }
+    }
+
+    /// The running callback is the caller's (its owner dropped in it)
+    fn runs_here(&self) -> bool {
+        self.runner.load(Ordering::Relaxed) == crate::task::percpu::current_tid()
     }
 
     fn ready(&self) -> bool {
@@ -311,8 +334,11 @@ impl TimerBase {
                 w.insert(t, now + 1);
                 continue;
             }
+            self.runner
+                .store(crate::task::percpu::current_tid(), Ordering::Relaxed);
             self.running.store(p.cast_mut(), Ordering::Release);
             drop(w);
+            // `t` may be freed by its callback: not touched after it
             (t.func)(t);
             self.running.store(core::ptr::null_mut(), Ordering::Release);
             w = self.wheel.lock();
@@ -419,6 +445,112 @@ pub fn start_ktimers() {
     }
 }
 
+/// A SOFT timer embedded in an `Arc`-owned object, its callback given
+/// a strong reference to that object (Linux sk_reset_timer /
+/// sk_stop_timer around a timer_list in struct sock): a pending arm
+/// holds one reference, which the callback receives and drops at its
+/// end, so the owner lives while the timer can fire, and the owner's
+/// last reference may go in its own timer's callback.
+///
+/// # Invariants
+/// `timer` is the first field (`repr(C)`), so a `&TimerList` the base
+/// passes to [`arc_timer_fire`] is this `ArcTimer`'s. While `timer` is
+/// pending its data is `Arc::into_raw` of the owning `Arc<T>`, whose
+/// reference the pending arm holds; at most one such reference per
+/// pending period (taken when an arm finds it idle, given back by the
+/// callback or by `stop` when it disarms it).
+#[repr(C)]
+pub struct ArcTimer<T> {
+    timer: TimerList,
+    func: fn(Arc<T>),
+    _owner: core::marker::PhantomData<fn(Arc<T>)>,
+}
+
+impl<T: Send + Sync> ArcTimer<T> {
+    /// An idle timer calling `func` in `ktimers/N`
+    pub const fn new(func: fn(Arc<T>)) -> Self {
+        Self {
+            timer: TimerList::new(arc_timer_fire::<T>, 0),
+            func,
+            _owner: core::marker::PhantomData,
+        }
+    }
+
+    /// (Re)arm for CLOCK_MONOTONIC `at_ns` (Linux sk_reset_timer: an
+    /// idle timer takes a reference to `owner`); true if it was pending.
+    /// Panics unless this timer is a field of `*owner`.
+    pub fn reset(&self, owner: &Arc<T>, at_ns: u64) -> bool {
+        let base = Arc::as_ptr(owner).addr();
+        let me = core::ptr::from_ref(self).addr();
+        assert!(
+            me >= base && me + size_of::<Self>() <= base + size_of::<T>(),
+            "ArcTimer: not a field of its owner"
+        );
+        self.timer.set_data(Arc::as_ptr(owner).addr());
+        // SAFETY: a field of `*owner`, which an `Arc` never moves; it is
+        // moved or reused only through `&mut T` (`Arc::get_mut`), which
+        // the reference a pending arm or a running callback holds rules
+        // out until it is idle again
+        let t = unsafe { Pin::new_unchecked(&self.timer) };
+        // INVARIANT: the reference an idle timer's arm hands over is
+        // taken before arming: the timer may fire on another CPU at once
+        // and its callback consumes it
+        let raw = Arc::into_raw(owner.clone());
+        let was = t.mod_timer_ns(at_ns);
+        if was {
+            // SAFETY: `raw` is the reference just taken; it was pending
+            // already and keeps its own, so this one goes back unused
+            drop(unsafe { Arc::from_raw(raw) });
+        }
+        was
+    }
+
+    /// Disarm (Linux sk_stop_timer); true if it was pending (its
+    /// reference dropped). A running callback may still run.
+    pub fn stop(&self) -> bool {
+        if !self.timer.del_timer() {
+            return false;
+        }
+        // SAFETY: it was pending, so its data is the reference the arm
+        // took (type invariant), given back once here
+        drop(unsafe { Arc::from_raw(self.timer.data() as *const T) });
+        true
+    }
+
+    /// Disarm and wait for a running callback (Linux
+    /// sk_stop_timer_sync); thread context, may sleep
+    pub fn stop_sync(&self) -> bool {
+        let was = self.timer.del_timer_sync();
+        if was {
+            // SAFETY: as in `stop`
+            drop(unsafe { Arc::from_raw(self.timer.data() as *const T) });
+        }
+        was
+    }
+
+    /// Armed and not yet fired (Linux timer_pending)
+    pub fn pending(&self) -> bool {
+        self.timer.pending()
+    }
+
+    /// The CLOCK_MONOTONIC ns it was last armed for (Linux
+    /// icsk_timeout / timer->expires)
+    pub fn deadline_ns(&self) -> u64 {
+        self.timer.deadline_ns()
+    }
+}
+
+/// An [`ArcTimer`] expired: its callback, with the arm's reference
+fn arc_timer_fire<T: Send + Sync>(t: &TimerList) {
+    // SAFETY: the base calls this only for an `ArcTimer<T>`'s timer
+    // (its `new`), the first field of a `repr(C)` struct
+    let at = unsafe { &*core::ptr::from_ref(t).cast::<ArcTimer<T>>() };
+    // SAFETY: it was pending until the base detached it, so its data is
+    // the reference its arm took (type invariant), handed over here
+    let owner = unsafe { Arc::from_raw(t.data() as *const T) };
+    (at.func)(owner);
+}
+
 /// A one-shot timer that tracks its earliest wanted deadline (for
 /// subsystems that keep their own per-object deadlines and need one
 /// kernel timer: neighbour tables, IP reassembly, TCP).
@@ -453,7 +585,7 @@ impl Alarm {
         *s = at_ns;
         self.timer
             .set_data(core::ptr::from_ref::<Alarm>(self) as usize);
-        Pin::static_ref(&self.timer).mod_timer_ns(at_ns);
+        let _ = Pin::static_ref(&self.timer).mod_timer_ns(at_ns);
     }
 
     /// The timer ran (call first thing in the callback)

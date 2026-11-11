@@ -14,25 +14,32 @@
 //!
 //! ## Locking
 //!
-//! `Fib.tables`: `crate::sync::spin::RwLock`, thread context only. Writers hold RTNL
-//! (every mutating function takes the `RtnlGuard`); readers (input/output
-//! routing, dumps) take the read lock briefly and get `Arc<FibEntry>`
-//! clones, so no guard escapes (RCU-ready, plan 3a). Order: RTNL ->
-//! device address lists -> `Fib.tables` (leaf; never held while calling
-//! out, notifications are sent after it is dropped).
+//! Linux fib_table_insert/delete under RTNL, lookups under RCU: the
+//! tables and each table's entries are RCU lists. Writers hold RTNL
+//! (every mutating function takes the `RtnlGuard`) and the lists' leaf
+//! writer locks; readers (input/output routing in softnet and socket
+//! calls, possibly under a socket lock; dumps filling an `NlBuf`;
+//! /proc/net/route into a `SeqBuf`) walk under `rcu::read_lock` with no
+//! lock and no copy, and a lookup takes a reference to the entry it
+//! returns. An entry removed or replaced is freed after a grace period
+//! (`RcuUnlinked::defer`, Linux alias_free_mem_rcu); notifications are
+//! sent outside the RCU guard. Order: RTNL -> device address lists ->
+//! FIB lists' writer locks (leaves).
 
 use crate::util::kalloc::try_arc;
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::sync::spin::RwLock;
+use crate::sync::rcu::{RcuHead, RcuReadGuard};
+use crate::util::list::Link;
+use crate::util::rculist::{RcuIter, RcuList, RcuRef, RcuUnlinked};
 
 use crate::net::NetNamespace;
 use crate::net::device::NetDevice;
 use crate::net::inet::ifaddr::{
     InIfaddr, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, inet_make_mask,
 };
+use crate::net::inet::route::NhExceptions;
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::netlink::NlInfo;
 use crate::net::netlink::rtnetlink;
@@ -118,8 +125,8 @@ impl RouteType {
     }
 }
 
-/// One route (Linux fib_alias + fib_info + single fib_nh)
-#[derive(Clone)]
+/// One route (Linux fib_alias + fib_info + single fib_nh): fixed once
+/// it is in a table
 pub struct FibEntry {
     pub table: u32,
     pub dst: Ipv4Addr,
@@ -135,7 +142,16 @@ pub struct FibEntry {
     pub dev: Option<Arc<NetDevice>>,
     /// RTNH_F_* flags (ONLINK)
     pub flags: u32,
+    /// Learned exceptions of its nexthop (Linux nhc_exceptions): PMTU
+    pub exceptions: NhExceptions,
+    /// On its table's entries (Linux fa_list)
+    link: Link,
+    /// Freed through it a grace period after it leaves its table
+    rcu: RcuHead,
 }
+
+crate::adapter!(pub FibLink, FibEntry, link);
+crate::rcu_head!(FibEntry, rcu);
 
 impl FibEntry {
     /// Output interface index (0 = none)
@@ -179,33 +195,41 @@ pub struct FlowKey {
     pub tos: u8,
 }
 
-/// Per-namespace IPv4 FIB
-pub struct Fib {
-    /// table id -> entries sorted by prefix length (longest first)
-    tables: RwLock<BTreeMap<u32, Vec<Arc<FibEntry>>>>,
+/// One routing table (Linux struct fib_table)
+pub struct FibTable {
+    pub id: u32,
+    /// Routes, longest prefix first; within a prefix by priority, then
+    /// in insertion order (Linux a trie leaf's fa_list); read under
+    /// RCU, changed under RTNL
+    entries: RcuList<FibLink>,
+    /// On `Fib.tables`
+    link: Link,
 }
 
-impl Fib {
-    pub fn new() -> Self {
-        let mut t = BTreeMap::new();
-        t.insert(RT_TABLE_LOCAL, Vec::new());
-        t.insert(RT_TABLE_MAIN, Vec::new());
-        Self {
-            tables: RwLock::new(t),
-        }
+crate::adapter!(pub TableLink, FibTable, link);
+
+impl FibTable {
+    fn new(id: u32) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
+            id,
+            entries: RcuList::new(),
+            link: Link::new(),
+        })
     }
 
-    /// Look up in one table: Ok(None) = no match
-    fn lookup_table(
-        &self,
-        table: u32,
+    /// The routes, while `g` is held
+    pub fn entries<'a>(&'a self, g: &'a RcuReadGuard) -> RcuIter<'a, FibLink> {
+        self.entries.iter(g)
+    }
+
+    /// Look up `key` (Ok(None) = no match): the first route, longest
+    /// prefix first, whose TOS, scope and device fit
+    fn lookup<'a>(
+        &'a self,
+        g: &'a RcuReadGuard,
         key: &FlowKey,
-    ) -> Result<Option<Arc<FibEntry>>, KernelError> {
-        let tables = self.tables.read();
-        let Some(entries) = tables.get(&table) else {
-            return Ok(None);
-        };
-        for e in entries.iter() {
+    ) -> Result<Option<RcuRef<'a, FibEntry>>, KernelError> {
+        for e in self.entries.iter_ref(g) {
             if !e.matches(key.daddr) {
                 continue;
             }
@@ -224,17 +248,125 @@ impl Fib {
             if key.oif != 0 && e.oif() != key.oif {
                 continue;
             }
-            return Ok(Some(Arc::clone(e)));
+            return Ok(Some(e));
         }
         Ok(None)
     }
 
+    /// Insert with Linux fib_table_insert's duplicate rules (RTNL held)
+    fn insert(&self, new: &Arc<FibEntry>, nlflags: u16) -> Result<(), KernelError> {
+        /// Where the route goes
+        enum At {
+            Replace(*const FibEntry),
+            Before(*const FibEntry),
+            After(*const FibEntry),
+            Sorted,
+        }
+        let at = {
+            let g = crate::sync::rcu::read_lock();
+            // The entries with the same key and priority (Linux
+            // fib_find_alias), and whether one is the same route
+            let (mut first, mut last, mut dup) = (None, None, false);
+            for x in self.entries.iter(&g) {
+                if x.same_key(new) && x.priority == new.priority {
+                    first = first.or(Some(core::ptr::from_ref(x)));
+                    last = Some(core::ptr::from_ref(x));
+                    dup |= x.same_route(new);
+                }
+            }
+            match (first, last) {
+                (Some(_), _) if nlflags & NLM_F_EXCL != 0 => {
+                    return Err(KernelError::AlreadyExists);
+                }
+                (Some(f), _) if nlflags & NLM_F_REPLACE != 0 => At::Replace(f),
+                (Some(_), _) if dup => return Err(KernelError::AlreadyExists),
+                _ if nlflags & NLM_F_CREATE == 0 => return Err(KernelError::NotFound),
+                (Some(_), Some(l)) if nlflags & NLM_F_APPEND != 0 => At::After(l),
+                (Some(f), _) => At::Before(f),
+                (None, _) => At::Sorted,
+            }
+        };
+        // RTNL keeps the entries as walked: the positions are still there
+        let new = Arc::clone(new);
+        match at {
+            At::Replace(f) => {
+                if let Ok(old) = self.entries.replace(new, |x| core::ptr::eq(x, f)) {
+                    old.defer();
+                }
+            }
+            At::Before(f) => self.entries.insert_before(new, |x| core::ptr::eq(x, f)),
+            At::After(l) => self.entries.insert_after(new, |x| core::ptr::eq(x, l)),
+            At::Sorted => {
+                let (len, dst, prio) = (new.dst_len, new.dst, new.priority);
+                self.entries.insert_before(new, |x| {
+                    x.dst_len < len || (x.dst_len == len && x.dst == dst && x.priority > prio)
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-namespace IPv4 FIB (Linux netns_ipv4's fib_table_hash)
+pub struct Fib {
+    /// Tables by descending id: local, main, then those created on
+    /// demand; never removed while the namespace lives
+    tables: RcuList<TableLink>,
+}
+
+impl Fib {
+    pub fn new() -> Result<Self, KernelError> {
+        let tables = RcuList::new();
+        tables.push_back(FibTable::new(RT_TABLE_LOCAL)?);
+        tables.push_back(FibTable::new(RT_TABLE_MAIN)?);
+        Ok(Self { tables })
+    }
+
+    /// Table `id`, while `g` is held (Linux fib_get_table)
+    pub fn get_table<'a>(&'a self, g: &'a RcuReadGuard, id: u32) -> Option<&'a FibTable> {
+        self.tables.iter(g).find(|t| t.id == id)
+    }
+
+    /// The tables (by descending id), while `g` is held
+    pub fn tables<'a>(&'a self, g: &'a RcuReadGuard) -> RcuIter<'a, TableLink> {
+        self.tables.iter(g)
+    }
+
+    /// Every route, table by table, while `g` is held
+    pub fn entries<'a>(&'a self, g: &'a RcuReadGuard) -> impl Iterator<Item = &'a FibEntry> + 'a {
+        self.tables(g).flat_map(move |t| t.entries(g))
+    }
+
+    /// Table `id`, created if missing (Linux fib_new_table; RTNL held)
+    fn new_table(&self, id: u32) -> Result<Arc<FibTable>, KernelError> {
+        if let Some(t) = self.tables.find(|t| t.id == id) {
+            return Ok(t);
+        }
+        let t = FibTable::new(id)?;
+        self.tables.insert_before(Arc::clone(&t), |x| x.id < id);
+        Ok(t)
+    }
+
+    /// Look up in one table: Ok(None) = no match
+    fn lookup_table<'a>(
+        &'a self,
+        g: &'a RcuReadGuard,
+        table: u32,
+        key: &FlowKey,
+    ) -> Result<Option<RcuRef<'a, FibEntry>>, KernelError> {
+        match self.get_table(g, table) {
+            Some(t) => t.lookup(g, key),
+            None => Ok(None),
+        }
+    }
+
     /// Full lookup: local, then main (Linux default rules); ENETUNREACH
-    /// when nothing matches
+    /// when nothing matches. The route is referenced, nothing copied.
     pub fn lookup(&self, key: &FlowKey) -> Result<Arc<FibEntry>, KernelError> {
+        let g = crate::sync::rcu::read_lock();
         for table in [RT_TABLE_LOCAL, RT_TABLE_MAIN] {
-            if let Some(e) = self.lookup_table(table, key)? {
-                return Ok(e);
+            if let Some(e) = self.lookup_table(&g, table, key)? {
+                return Ok(e.get());
             }
         }
         Err(KernelError::NetworkUnreachable)
@@ -252,88 +384,44 @@ impl Fib {
             daddr: addr,
             ..Default::default()
         };
-        match self.lookup_table(RT_TABLE_LOCAL, &key) {
+        let g = crate::sync::rcu::read_lock();
+        match self.lookup_table(&g, RT_TABLE_LOCAL, &key) {
             Ok(Some(e)) => e.rtype,
             _ => RouteType::Unicast,
         }
     }
 
-    /// Snapshot of every route (all tables)
-    pub fn dump(&self) -> Vec<Arc<FibEntry>> {
-        self.tables
-            .read()
-            .iter()
-            .rev()
-            .flat_map(|(_, v)| v.iter().cloned())
-            .collect()
-    }
-
-    /// Snapshot of one table
-    pub fn table(&self, id: u32) -> Vec<Arc<FibEntry>> {
-        self.tables.read().get(&id).cloned().unwrap_or_default()
-    }
-
-    /// Insert with Linux fib_table_insert duplicate rules
+    /// Insert `e` into its table (created if missing), RTNL held
     fn insert(&self, e: FibEntry, nlflags: u16) -> Result<Arc<FibEntry>, KernelError> {
-        let mut tables = self.tables.write();
-        let entries = tables.entry(e.table).or_default();
-        let same_key: Vec<usize> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, x)| x.same_key(&e) && x.priority == e.priority)
-            .map(|(i, _)| i)
-            .collect();
+        let t = self.new_table(e.table)?;
         let new = try_arc(e)?;
-        if let Some(&first) = same_key.first() {
-            if nlflags & NLM_F_EXCL != 0 {
-                return Err(KernelError::AlreadyExists);
-            }
-            if nlflags & NLM_F_REPLACE != 0 {
-                entries[first] = Arc::clone(&new);
-                return Ok(new);
-            }
-            if same_key.iter().any(|&i| entries[i].same_route(&new)) {
-                return Err(KernelError::AlreadyExists);
-            }
-            if nlflags & NLM_F_CREATE == 0 {
-                return Err(KernelError::NotFound);
-            }
-            let at = if nlflags & NLM_F_APPEND != 0 {
-                *same_key.last().unwrap() + 1
-            } else {
-                first
-            };
-            entries.insert(at, Arc::clone(&new));
-            return Ok(new);
-        }
-        if nlflags & NLM_F_CREATE == 0 {
-            return Err(KernelError::NotFound);
-        }
-        // Longest prefix first; within a prefix, by priority
-        let at = entries
-            .iter()
-            .position(|x| {
-                x.dst_len < new.dst_len
-                    || (x.dst_len == new.dst_len && x.dst == new.dst && x.priority > new.priority)
-            })
-            .unwrap_or(entries.len());
-        entries.insert(at, Arc::clone(&new));
+        t.insert(&new, nlflags)?;
         Ok(new)
     }
 
-    /// Remove and return the entries `pred` selects
-    fn remove_where(&self, mut pred: impl FnMut(&FibEntry) -> bool) -> Vec<Arc<FibEntry>> {
-        let mut out = Vec::new();
-        for entries in self.tables.write().values_mut() {
-            entries.retain(|e| {
-                let dead = pred(e);
-                if dead {
-                    out.push(Arc::clone(e));
-                }
-                !dead
-            });
+    /// Unlink every route `pred` picks, handing each to `gone` (RTNL
+    /// held; `gone` runs outside RCU, so it may notify)
+    fn remove_each(
+        &self,
+        mut pred: impl FnMut(&FibEntry) -> bool,
+        mut gone: impl FnMut(RcuUnlinked<FibLink>),
+    ) {
+        // Tables are never removed; a reference each keeps the walk
+        // outside RCU
+        for t in self.tables.snapshot() {
+            while let Some(u) = t.entries.remove_first(&mut pred) {
+                gone(u);
+            }
         }
-        out
+    }
+
+    /// Unlink the first route of table `id` that `pred` picks
+    fn remove_first(
+        &self,
+        id: u32,
+        pred: impl FnMut(&FibEntry) -> bool,
+    ) -> Option<RcuUnlinked<FibLink>> {
+        self.tables.find(|t| t.id == id)?.entries.remove_first(pred)
     }
 }
 
@@ -393,6 +481,9 @@ fn fib_create_info(net: &NetNamespace, cfg: &FibConfig) -> Result<FibEntry, Kern
         gateway: cfg.gateway,
         dev: None,
         flags: cfg.flags,
+        exceptions: NhExceptions::default(),
+        link: Link::new(),
+        rcu: RcuHead::new(),
     };
     if rtype.error().is_some() {
         if cfg.gateway.is_some() || cfg.oif != 0 {
@@ -507,12 +598,8 @@ pub fn fib_table_delete(
     if cfg.dst_len > 32 {
         return Err(KernelError::InvalidArgument);
     }
-    let table = cfg.table_id();
-    let mut done = false;
-    let removed = net.fib.remove_where(|e| {
-        let hit = !done
-            && e.table == table
-            && e.dst == cfg.dst
+    let removed = net.fib.remove_first(cfg.table_id(), |e| {
+        e.dst == cfg.dst
             && e.dst_len == cfg.dst_len
             && e.tos == cfg.tos
             && (cfg.rtype == 0 || e.rtype as u8 == cfg.rtype)
@@ -521,16 +608,13 @@ pub fn fib_table_delete(
             && (cfg.protocol == 0 || e.protocol == cfg.protocol)
             && (cfg.priority == 0 || e.priority == cfg.priority)
             && (cfg.oif == 0 || e.oif() == cfg.oif)
-            && (cfg.gateway.is_none() || e.gateway == cfg.gateway);
-        if hit {
-            done = true;
-        }
-        hit
+            && (cfg.gateway.is_none() || e.gateway == cfg.gateway)
     });
-    let Some(e) = removed.first() else {
+    let Some(e) = removed else {
         return Err(KernelError::NoProcess);
     };
-    rtnetlink::notify_route(net, e, rtnetlink::RTM_DELROUTE, cfg.nl);
+    rtnetlink::notify_route(net, e.item(), rtnetlink::RTM_DELROUTE, cfg.nl);
+    e.defer();
     Ok(())
 }
 
@@ -567,13 +651,13 @@ fn ifa_routes(dev: &NetDevice, ifa: &InIfaddr, prim_local: Ipv4Addr) -> Vec<FibC
     let mask = ifa.mask();
     let prefix = ifa.prefix();
     if (prefix.0 >> 24) != 0 && !ifa.is_secondary() && (prefix != ifa.local || ifa.prefixlen < 32) {
-        if ifa.flags & crate::net::inet::ifaddr::IFA_F_NOPREFIXROUTE == 0 {
+        if ifa.flags() & crate::net::inet::ifaddr::IFA_F_NOPREFIXROUTE == 0 {
             let t = if dev.is_loopback() {
                 RouteType::Local
             } else {
                 RouteType::Unicast
             };
-            out.push(magic(t, prefix, ifa.prefixlen, ifa.rt_priority));
+            out.push(magic(t, prefix, ifa.prefixlen, ifa.rt_priority()));
         }
         if ifa.prefixlen < 31 {
             out.push(magic(
@@ -592,9 +676,10 @@ fn primary_local(dev: &NetDevice, ifa: &InIfaddr) -> Ipv4Addr {
     if !ifa.is_secondary() {
         return ifa.local;
     }
-    dev.inet_addrs()
-        .into_iter()
-        .find(|p| !p.is_secondary() && p.prefixlen == ifa.prefixlen && p.matches(ifa.address))
+    let g = crate::sync::rcu::read_lock();
+    dev.in_dev()
+        .addrs(&g)
+        .find(|p| !p.is_secondary() && p.same_subnet(ifa))
         .map_or(ifa.local, |p| p.local)
 }
 
@@ -613,7 +698,7 @@ pub fn fib_add_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa
 pub fn fib_del_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa: &InIfaddr) {
     let mut still: Vec<FibConfig> = Vec::new();
     for d in net.devices() {
-        for other in d.inet_addrs() {
+        for other in d.in_dev().ifa_list.snapshot() {
             still.extend(ifa_routes(&d, &other, primary_local(&d, &other)));
         }
     }
@@ -641,11 +726,15 @@ pub fn fib_del_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa
     }
     if crate::net::inet::ifaddr::ip_dev_find(net, ifa.local).is_none() {
         let local = ifa.local;
-        for e in net.fib.remove_where(|e| e.prefsrc == Some(local)) {
-            rtnetlink::notify_route(net, &e, rtnetlink::RTM_DELROUTE, NlInfo::default());
-        }
+        net.fib.remove_each(
+            |e| e.prefsrc == Some(local),
+            |e| {
+                rtnetlink::notify_route(net, e.item(), rtnetlink::RTM_DELROUTE, NlInfo::default());
+                e.defer();
+            },
+        );
     }
-    if dev.inet_addrs().is_empty() {
+    if !dev.in_dev().has_addrs() {
         fib_disable_dev(rtnl, net, dev, true);
     }
 }
@@ -694,8 +783,10 @@ fn ifa_routes_all(dev: &NetDevice, ifa: &InIfaddr, prim: Ipv4Addr) -> Vec<FibCon
 /// on a down device). Like Linux, no RTM_DELROUTE is sent for these.
 pub fn fib_disable_dev(_rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, force: bool) {
     let idx = dev.ifindex();
-    net.fib
-        .remove_where(|e| e.oif() == idx && (force || e.scope != RT_SCOPE_HOST));
+    net.fib.remove_each(
+        |e| e.oif() == idx && (force || e.scope != RT_SCOPE_HOST),
+        RcuUnlinked::defer,
+    );
 }
 
 #[cfg(test)]
@@ -724,7 +815,31 @@ mod tests {
             gateway: None,
             dev: None,
             flags: 0,
+            exceptions: NhExceptions::default(),
+            link: Link::new(),
+            rcu: RcuHead::new(),
         }
+    }
+
+    impl FibEntry {
+        /// An unlinked copy
+        fn dup(&self) -> Self {
+            let mut e = entry(
+                self.table,
+                self.dst,
+                self.dst_len,
+                self.rtype,
+                self.priority,
+            );
+            e.scope = self.scope;
+            e.protocol = self.protocol;
+            e
+        }
+    }
+
+    fn table_len(f: &Fib, id: u32) -> usize {
+        let g = crate::sync::rcu::read_lock();
+        f.get_table(&g, id).map_or(0, |t| t.entries(&g).count())
     }
 
     fn key(d: Ipv4Addr) -> FlowKey {
@@ -736,7 +851,7 @@ mod tests {
 
     #[test]
     fn longest_prefix_and_local_first() {
-        let f = Fib::new();
+        let f = Fib::new().unwrap();
         let c = NLM_F_CREATE;
         f.insert(
             entry(RT_TABLE_MAIN, ip(0, 0, 0, 0), 0, RouteType::Unicast, 0),
@@ -765,7 +880,7 @@ mod tests {
 
     #[test]
     fn no_route_and_error_types() {
-        let f = Fib::new();
+        let f = Fib::new().unwrap();
         assert!(matches!(
             f.lookup(&key(ip(1, 2, 3, 4))),
             Err(KernelError::NetworkUnreachable)
@@ -792,35 +907,61 @@ mod tests {
 
     #[test]
     fn duplicate_rules() {
-        let f = Fib::new();
+        let f = Fib::new().unwrap();
         let e = entry(RT_TABLE_MAIN, ip(10, 1, 0, 0), 16, RouteType::Unicast, 5);
-        assert!(matches!(f.insert(e.clone(), 0), Err(KernelError::NotFound)));
-        f.insert(e.clone(), NLM_F_CREATE | NLM_F_EXCL).unwrap();
+        assert!(matches!(f.insert(e.dup(), 0), Err(KernelError::NotFound)));
+        f.insert(e.dup(), NLM_F_CREATE | NLM_F_EXCL).unwrap();
         assert!(matches!(
-            f.insert(e.clone(), NLM_F_CREATE | NLM_F_EXCL),
+            f.insert(e.dup(), NLM_F_CREATE | NLM_F_EXCL),
             Err(KernelError::AlreadyExists)
         ));
         assert!(matches!(
-            f.insert(e.clone(), NLM_F_CREATE),
+            f.insert(e.dup(), NLM_F_CREATE),
             Err(KernelError::AlreadyExists)
         ));
         // Same prefix, other metric: a separate route
-        let mut e2 = e.clone();
+        let mut e2 = e.dup();
         e2.priority = 10;
         f.insert(e2, NLM_F_CREATE | NLM_F_EXCL).unwrap();
-        assert_eq!(f.table(RT_TABLE_MAIN).len(), 2);
+        assert_eq!(table_len(&f, RT_TABLE_MAIN), 2);
         // Lower metric wins
         assert_eq!(f.lookup(&key(ip(10, 1, 2, 3))).unwrap().priority, 5);
-        // Replace keeps the count
-        let mut e3 = e.clone();
-        e3.protocol = RTPROT_KERNEL;
+        // Same key, other route: before the first (append: after the
+        // last) of its key and priority
+        let mut e4 = e.dup();
+        e4.scope = RT_SCOPE_LINK;
+        f.insert(e4, NLM_F_CREATE).unwrap();
+        let mut e5 = e.dup();
+        e5.protocol = RTPROT_KERNEL;
+        f.insert(e5, NLM_F_CREATE | NLM_F_APPEND).unwrap();
+        let order = |f: &Fib| {
+            let g = crate::sync::rcu::read_lock();
+            let t = f.get_table(&g, RT_TABLE_MAIN).unwrap();
+            t.entries(&g)
+                .map(|x| (x.priority, x.scope, x.protocol))
+                .collect::<Vec<_>>()
+        };
+        let (u, l) = (RT_SCOPE_UNIVERSE, RT_SCOPE_LINK);
+        assert_eq!(
+            order(&f),
+            [
+                (5, l, RTPROT_BOOT),
+                (5, u, RTPROT_BOOT),
+                (5, u, RTPROT_KERNEL),
+                (10, u, RTPROT_BOOT)
+            ]
+        );
+        // Replace takes the first's place and keeps the count
+        let mut e3 = e.dup();
+        e3.protocol = 9;
         f.insert(e3, NLM_F_CREATE | NLM_F_REPLACE).unwrap();
-        assert_eq!(f.table(RT_TABLE_MAIN).len(), 2);
+        assert_eq!(table_len(&f, RT_TABLE_MAIN), 4);
+        assert_eq!(order(&f)[0], (5, u, 9));
     }
 
     #[test]
     fn scope_filter() {
-        let f = Fib::new();
+        let f = Fib::new().unwrap();
         f.insert(
             entry(RT_TABLE_MAIN, ip(0, 0, 0, 0), 0, RouteType::Unicast, 0),
             NLM_F_CREATE,

@@ -421,6 +421,7 @@ pub fn interrupt() {
         return;
     };
     crate::sync::lockdep::irq_enter();
+    crate::sync::rcu::clock_irq();
     if !crate::time::TIMEKEEPER.is_initialized() {
         crate::task::percpu::scheduler_tick();
         crate::arch::clockevent_next(TICK_NS);

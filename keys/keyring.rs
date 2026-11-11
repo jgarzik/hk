@@ -9,8 +9,6 @@
 //! This module manages the per-task keyring references and provides
 //! functions to resolve special keyring IDs to actual key serials.
 
-use crate::sync::spin::RwLock;
-use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -18,13 +16,13 @@ use alloc::sync::Arc;
 use crate::task::Task;
 use crate::util::error::KernelError;
 
-use super::key::{KEYRING_DEFAULT_PERM, Key};
+use super::key::{KEYRING_DEFAULT_PERM, Key, KeySerial};
 use super::types::keyring_key_type;
 use super::{
     KEY_SPEC_PROCESS_KEYRING, KEY_SPEC_SESSION_KEYRING, KEY_SPEC_THREAD_KEYRING,
     KEY_SPEC_USER_KEYRING, KEY_SPEC_USER_SESSION_KEYRING,
 };
-use super::{alloc_serial, lookup_key, register_key};
+use super::{alloc_key, alloc_key_nofail, lookup_key, register_key};
 
 /// Per-task keyrings (Linux cred->thread/process/session_keyring): the
 /// task holds a reference to each
@@ -48,8 +46,10 @@ impl TaskKeyrings {
     }
 }
 
-/// Per-user keyring tracking
-static USER_KEYRINGS: RwLock<BTreeMap<u32, UserKeyrings>> = RwLock::new(BTreeMap::new());
+/// Per-user keyring tracking (Linux key_user_keyring_mutex, a sleeping
+/// lock: a keyring is created under it)
+static USER_KEYRINGS: crate::sync::Mutex<BTreeMap<u32, UserKeyrings>> =
+    crate::sync::Mutex::new(BTreeMap::new());
 
 /// Per-user keyrings, which live as long as the system (Linux keeps them
 /// with the user namespace's key_user)
@@ -82,7 +82,7 @@ pub fn fork_keyrings(parent: &TaskKeyrings, thread: bool, uid: u32, gid: u32) ->
         process_keyring: parent.process_keyring.clone().filter(|_| thread),
         // Linux copy_creds can fail here; do_clone cannot yet
         thread_keyring: (thread && parent.thread_keyring.is_some()).then(|| {
-            let k = arc_nofail(keyring_key("_tid", uid, gid));
+            let k = alloc_key_nofail(|s| keyring_key(s, "_tid", uid, gid));
             publish_keyring(&k);
             k
         }),
@@ -100,15 +100,15 @@ pub fn exec_keyrings(t: &Task) {
 
 /// Create a new keyring with the given description
 pub fn create_keyring(description: &str, uid: u32, gid: u32) -> Result<Arc<Key>, KernelError> {
-    let key = try_arc(keyring_key(description, uid, gid))?;
+    let key = alloc_key(|s| keyring_key(s, description, uid, gid))?;
     publish_keyring(&key);
     Ok(key)
 }
 
-/// A new keyring, not yet registered
-fn keyring_key(description: &str, uid: u32, gid: u32) -> Key {
+/// A new keyring with `serial`, not yet registered
+fn keyring_key(serial: KeySerial, description: &str, uid: u32, gid: u32) -> Key {
     Key::new(
-        alloc_serial(),
+        serial,
         keyring_key_type(),
         String::from(description),
         uid,
@@ -124,7 +124,15 @@ fn publish_keyring(key: &Arc<Key>) {
     register_key(key);
 }
 
+/// The live keyring in `slot`, if any
+fn live(slot: &Option<Arc<Key>>) -> Option<Arc<Key>> {
+    slot.as_ref()
+        .filter(|k| k.state() != super::KeyState::Dead)
+        .cloned()
+}
+
 /// The keyring in `slot`, made (as `name`) if `create` and none is there
+/// (under the sleeping `USER_KEYRINGS`)
 fn slot_keyring(
     slot: &mut Option<Arc<Key>>,
     create: bool,
@@ -132,16 +140,15 @@ fn slot_keyring(
     uid: u32,
     gid: u32,
 ) -> Result<Arc<Key>, KernelError> {
-    if let Some(k) = slot.as_ref().filter(|k| k.state() != super::KeyState::Dead) {
-        return Ok(k.clone());
+    if let Some(k) = live(slot) {
+        return Ok(k);
     }
     if !create {
         return Err(KernelError::NoKey);
     }
     let k = create_keyring(name, uid, gid)?;
-    // An invalidated keyring the slot held is dropped after the caller's
-    // lock (returned to it below by replace)
-    let _old = slot.replace(k.clone());
+    // An invalidated keyring the slot held goes (a sleeping lock held)
+    drop(slot.replace(k.clone()));
     Ok(k)
 }
 
@@ -154,12 +161,31 @@ pub fn resolve_special_keyring(
     uid: u32,
     gid: u32,
 ) -> Result<Arc<Key>, KernelError> {
+    // A task's keyring is made with its keyrings unlocked, then
+    // installed if the slot is still empty (Linux install_*_keyring:
+    // keyring_alloc, then commit_creds); the replaced or spare key is
+    // dropped after the lock
     let task_slot = |pick: fn(&mut TaskKeyrings) -> &mut Option<Arc<Key>>, name| {
-        let mut k = t.keyrings.lock();
-        slot_keyring(pick(&mut k), create, name, uid, gid)
+        if let Some(k) = live(pick(&mut t.keyrings.lock())) {
+            return Ok(k);
+        }
+        if !create {
+            return Err(KernelError::NoKey);
+        }
+        let new = create_keyring(name, uid, gid)?;
+        let (k, spare) = {
+            let mut keys = t.keyrings.lock();
+            let slot = pick(&mut keys);
+            match live(slot) {
+                Some(k) => (k, Some(new)),
+                None => (new.clone(), slot.replace(new)),
+            }
+        };
+        drop(spare);
+        Ok(k)
     };
     let user_slot = |pick: fn(&mut UserKeyrings) -> &mut Option<Arc<Key>>, name| {
-        let mut users = USER_KEYRINGS.write();
+        let mut users = USER_KEYRINGS.lock();
         slot_keyring(pick(users.entry(uid).or_default()), create, name, uid, gid)
     };
     match special_id {
@@ -195,7 +221,7 @@ pub fn possessed(key: &Key, t: &Task) -> bool {
     let session = k.session_keyring.clone().or_else(|| {
         let uid = crate::task::percpu::current_cred().uid;
         USER_KEYRINGS
-            .read()
+            .lock()
             .get(&uid)
             .and_then(|u| u.user_session_keyring.clone())
     });

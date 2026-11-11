@@ -3,7 +3,7 @@
 //! This module defines the Key struct which represents a security key
 //! in the Linux keyring subsystem.
 
-use crate::sync::spin::RwLock;
+use crate::sync::RwSem;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -154,8 +154,9 @@ pub struct Key {
     /// Key description (user-visible identifier)
     pub description: String,
 
-    /// Key payload (type-specific data) - None for keyrings
-    payload: RwLock<Option<Vec<u8>>>,
+    /// Key payload (type-specific data) - None for keyrings; a sleeping
+    /// lock (Linux key->sem, an rw_semaphore)
+    payload: RwSem<Option<Vec<u8>>>,
 
     /// Owner UID and GID (Linux key->uid/gid: changed under key->sem,
     /// here the payload lock, by KEYCTL_CHOWN; read lock-free by the
@@ -172,8 +173,9 @@ pub struct Key {
     /// For keyrings: the linked keys (Linux keyring links hold a
     /// reference: a key lives while linked or otherwise referenced, and
     /// is freed with the last; cycle checks keep links acyclic). An
-    /// unlinked key is dropped after the lock is released.
-    keyring_keys: RwLock<Vec<Arc<Key>>>,
+    /// unlinked key is dropped after the lock is released. A sleeping
+    /// lock (Linux keyring edits under key->sem)
+    keyring_keys: RwSem<Vec<Arc<Key>>>,
 
     /// Key type reference for polymorphic operations
     key_type: Arc<dyn KeyType>,
@@ -199,12 +201,12 @@ impl Key {
             serial,
             type_name: String::from(key_type.name()),
             description,
-            payload: RwLock::new(None),
+            payload: RwSem::new(None),
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
             perm: AtomicU32::new(perm),
             state: AtomicU32::new(KeyState::Uninstantiated as u32),
-            keyring_keys: RwLock::new(Vec::new()),
+            keyring_keys: RwSem::new(Vec::new()),
             key_type,
             quota_uid: AtomicU32::new(0),
             quota_bytes: core::sync::atomic::AtomicUsize::new(0),
@@ -597,11 +599,15 @@ impl Drop for Key {
         // the key quota allows: Linux's key GC is iterative too)
         let mut stack = core::mem::take(self.keyring_keys.get_mut());
         while let Some(k) = stack.pop() {
+            // Its entry names its Arc's address, not the one it is moved
+            // to: removed here (its own Drop then finds no entry)
+            let at = Arc::as_ptr(&k);
             if let Some(mut key) = Arc::into_inner(k) {
+                super::remove_entry(key.serial, at);
                 stack.append(key.keyring_keys.get_mut());
             }
         }
-        super::unregister_key(self.serial, core::ptr::from_ref::<Key>(self));
+        super::remove_key(self);
         let bytes = self.quota_bytes.load(Ordering::Relaxed);
         if bytes > 0 {
             super::key_user_uncharge(self.quota_uid.load(Ordering::Relaxed), bytes);
@@ -636,5 +642,39 @@ mod tests {
         }
         drop(cur);
         drop(top);
+    }
+
+    /// A keyring's children freed with it leave the serial tree too:
+    /// they are torn down after being moved out of their Arc, at another
+    /// address than the one their entry names
+    #[test]
+    fn freed_children_leave_serial_tree() {
+        let ty = super::super::types::keyring_key_type();
+        let make = || {
+            super::super::alloc_key(|serial| {
+                Key::new(
+                    serial,
+                    ty.clone(),
+                    alloc::string::String::from("k"),
+                    0,
+                    0,
+                    0,
+                )
+            })
+            .unwrap()
+        };
+        let parent = make();
+        let child = make();
+        let grandchild = make();
+        super::super::register_key(&parent);
+        super::super::register_key(&child);
+        super::super::register_key(&grandchild);
+        let serials = [child.serial, grandchild.serial];
+        child.keyring_keys.write().push(grandchild);
+        parent.keyring_keys.write().push(child);
+        drop(parent);
+        for s in serials {
+            assert!(!super::super::has_entry(s), "serial {} left in the tree", s);
+        }
     }
 }

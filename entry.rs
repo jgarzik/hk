@@ -14,8 +14,9 @@
 //!   first in `signal::do_signal`;
 //! - TIF_RESTORE_SIGMASK: a syscall's temporary signal mask is still in
 //!   place; `do_signal` puts the old one back;
-//! - TIF_NOTIFY_RESUME: work queued for the return: CPU-time timers the
-//!   tick found due (`cpu_timer::run`).
+//! - TIF_NOTIFY_RESUME: work queued for the return: callbacks queued
+//!   with `Twa::Resume` (`task_work_run`: a file's deferred release),
+//!   CPU-time timers the tick found due (`cpu_timer::run`).
 //!
 //! So a task spinning in user mode still takes SIGKILL or a handler
 //! (the next tick or a kick IPI interrupts it, and the interrupt returns
@@ -51,6 +52,9 @@ pub fn exit_to_user_mode(regs: &UserFrame) {
         }
         if work & tif::NOTIFY_RESUME != 0 {
             crate::task::percpu::current().clear_tif(tif::NOTIFY_RESUME);
+            // Callbacks queued for the return (Linux
+            // resume_user_mode_work: task_work_run), e.g. a file's release
+            crate::task::task_work::task_work_run();
             // CPU-time timers the tick found due (cpu_timer)
             crate::time::cpu_timer::run();
         }

@@ -5,7 +5,9 @@
 
 use alloc::sync::Arc;
 
-use crate::sync::spin::RwLock;
+use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::{LockedBy, UniqueOwner};
+use crate::util::list::{Adapter, Link, WeakList};
 use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync;
@@ -209,7 +211,20 @@ pub struct FileSystemType {
 
     /// Default file operations for files on this filesystem
     pub file_ops: &'static dyn FileOps,
+
+    /// The next registered type (Linux file_system_type.next, under
+    /// file_systems_lock): `FsNext::new(None)`
+    pub next: FsNext,
+
+    /// Its superblocks (Linux fs_supers, the sbs' s_instances, under
+    /// sb_lock): `FsSupers::new(WeakList::new())`
+    pub fs_supers: FsSupers,
 }
+
+/// [`FileSystemType::next`]
+pub type FsNext = LockedBy<Option<&'static FileSystemType>, FsList>;
+/// [`FileSystemType::fs_supers`]
+pub type FsSupers = LockedBy<WeakList<SInstanceA>, SbLists>;
 
 /// Filesystem type flags
 pub mod fs_flags {
@@ -305,16 +320,52 @@ impl Drop for WriteAccess {
     }
 }
 
-/// Every superblock (the dcache shrinker walks their trees); dead ones
-/// are dropped when one is added
-static ALL_SBS: crate::sync::spin::Mutex<alloc::vec::Vec<alloc::sync::Weak<SuperBlock>>> =
-    crate::sync::spin::Mutex::new(alloc::vec::Vec::new());
+crate::adapter!(pub SListA, SuperBlock, s_list);
+crate::adapter!(pub SInstanceA, SuperBlock, s_instances);
+crate::adapter!(pub MntInstanceA, super::mount::Mount, mnt_instance);
+
+/// What sb_lock guards (Linux sb_lock): the list of every superblock
+/// (Linux super_blocks) and, through [`FsSupers`], each type's
+/// instances. Entries hold a `Weak` and leave in the superblock's
+/// teardown (Linux __put_super, generic_shutdown_super).
+pub struct SbLists {
+    supers: WeakList<SListA>,
+}
+
+// SAFETY: one instance, `SB_LOCK`'s, made here (the field is private)
+unsafe impl UniqueOwner for SbLists {}
+
+/// Linux sb_lock: a spin leaf, thread context only; under it only
+/// list changes and `sget`'s test. Walkers drop it per superblock.
+static SB_LOCK: Mutex<SbLists> = Mutex::new(SbLists {
+    supers: WeakList::new(),
+});
 
 impl Drop for SuperBlock {
     /// What the filesystem had cached goes with it (Linux
     /// generic_shutdown_super: shrink_dcache_for_umount, then
-    /// fsnotify_sb_delete: its watches get IN_UNMOUNT and go)
+    /// fsnotify_sb_delete: its watches get IN_UNMOUNT and go). First it
+    /// leaves super_blocks and its type's fs_supers (the lists' contract,
+    /// `WeakList`): no walker reaches it once its fields start to go.
     fn drop(&mut self) {
+        let weaks = {
+            let mut l = SB_LOCK.lock();
+            let me: &Self = self;
+            let inst = me.fs_type.fs_supers.access_mut(&mut l);
+            // SAFETY: a linked s_instances link is on its type's list
+            let a = me
+                .s_instances
+                .is_linked()
+                .then(|| unsafe { inst.remove(me) });
+            // SAFETY: a linked s_list link is on super_blocks
+            let b = me
+                .s_list
+                .is_linked()
+                .then(|| unsafe { l.supers.remove(me) });
+            (a, b)
+        };
+        drop(weaks);
+        super::inode::sb_list_drain(&self.s_inodes);
         if let Some(root) = self.root.get_mut().take() {
             super::dentry::d_drop_tree(&root);
         }
@@ -322,15 +373,100 @@ impl Drop for SuperBlock {
     }
 }
 
-/// The `i`th live superblock, or None past the end (no allocation: the
-/// shrinker runs when memory is short)
-pub fn nth_sb(i: usize) -> Option<Option<Arc<SuperBlock>>> {
-    ALL_SBS.lock().get(i).map(alloc::sync::Weak::upgrade)
+/// List a new superblock (Linux sget_fc's insert: super_blocks tail,
+/// fs_supers head)
+fn sb_add(l: &mut SbLists, sb: &Arc<SuperBlock>) {
+    sb.fs_type.fs_supers.access_mut(l).push_front(sb);
+    l.supers.push_back(sb);
+}
+
+/// The live superblock after `cur` (the first if None) on the list `on`
+/// picks, taken under sb_lock (Linux __iterate_supers' step: skip the
+/// dying, refcount_inc_not_zero); `cur` is held, so still listed
+fn next_live<A: Adapter<Item = SuperBlock>>(
+    cur: Option<&Arc<SuperBlock>>,
+    on: impl Fn(&SbLists) -> &WeakList<A>,
+) -> Option<Arc<SuperBlock>> {
+    let l = SB_LOCK.lock();
+    let list = on(&l);
+    let mut it = match cur {
+        // SAFETY: `c` is alive (held), so its teardown has not unlinked
+        // it, and only that teardown does
+        Some(c) => unsafe { list.iter_after(c) },
+        None => list.iter(),
+    };
+    it.find_map(|e| e.upgrade())
+}
+
+/// `f` on every superblock (Linux iterate_supers): each taken under
+/// sb_lock and held while `f` runs with no lock, released after the
+/// next one is taken; `f` may sleep. Superblocks listed meanwhile may
+/// be missed.
+pub fn iterate_supers(f: impl FnMut(&Arc<SuperBlock>)) {
+    walk(f, |l| &l.supers);
+}
+
+/// `f` on every superblock of `fs_type` (Linux iterate_supers_type)
+pub fn iterate_supers_type(fs_type: &'static FileSystemType, f: impl FnMut(&Arc<SuperBlock>)) {
+    walk(f, |l| fs_type.fs_supers.access(l));
+}
+
+fn walk<A: Adapter<Item = SuperBlock>>(
+    mut f: impl FnMut(&Arc<SuperBlock>),
+    on: impl Fn(&SbLists) -> &WeakList<A>,
+) {
+    let mut cur: Option<Arc<SuperBlock>> = None;
+    while let Some(sb) = next_live(cur.as_ref(), &on) {
+        f(&sb);
+        // The previous one goes with sb_lock released (Linux put_super
+        // outside it): its last reference's teardown takes the lock
+        cur = Some(sb);
+    }
+}
+
+/// The superblock of `fs_type` that `test` accepts, else a new one
+/// (Linux sget_fc). `test` runs under sb_lock (a spin lock: it must not
+/// sleep) and may see a superblock in its teardown, which is then
+/// skipped (Linux grab_super of a dying sb). `make` builds a complete
+/// superblock with [`SuperBlock::alloc`] and no lock held; if another
+/// mounter listed one `test` accepts meanwhile, that one is returned and
+/// the new one dropped unlisted.
+pub fn sget(
+    fs_type: &'static FileSystemType,
+    test: impl Fn(&SuperBlock) -> bool,
+    make: impl FnOnce() -> Result<Arc<SuperBlock>, KernelError>,
+) -> Result<Arc<SuperBlock>, KernelError> {
+    let find = |l: &SbLists| {
+        fs_type
+            .fs_supers
+            .access(l)
+            .iter()
+            .filter(|e| test(e.get()))
+            .find_map(|e| e.upgrade())
+    };
+    let found = find(&SB_LOCK.lock());
+    if let Some(sb) = found {
+        return Ok(sb);
+    }
+    let new = make()?;
+    let mut l = SB_LOCK.lock();
+    if let Some(old) = find(&l) {
+        drop(l);
+        return Ok(old);
+    }
+    sb_add(&mut l, &new);
+    drop(l);
+    Ok(new)
 }
 
 pub struct SuperBlock {
     /// Filesystem type
     pub fs_type: &'static FileSystemType,
+
+    /// On super_blocks (Linux s_list, under sb_lock)
+    s_list: Link,
+    /// On its type's fs_supers (Linux s_instances, under sb_lock)
+    s_instances: Link,
 
     /// Root dentry of this filesystem
     pub root: RwLock<Option<Arc<Dentry>>>,
@@ -345,9 +481,10 @@ pub struct SuperBlock {
     /// files), and the WRITE_HOLD bit (see get_write); writes through a
     /// mount count on the mount
     s_writers: AtomicU64,
-    /// Its mounts (Linux s_mounts), for a read-only remount to hold their
-    /// writers; dead ones pruned on insert. A leaf under MOUNT_LOCK.
-    s_mounts: crate::sync::spin::Mutex<alloc::vec::Vec<alloc::sync::Weak<super::mount::Mount>>>,
+    /// Its mounts (Linux s_mounts, through `Mount.mnt_instance`), for a
+    /// read-only remount to hold their writers: a spin leaf, added to
+    /// under MOUNT_LOCK; a mount leaves it in its teardown
+    pub(super) s_mounts: Mutex<WeakList<MntInstanceA>>,
 
     /// Next inode number to allocate
     next_ino: AtomicU64,
@@ -372,16 +509,11 @@ pub struct SuperBlock {
     /// while the superblock lives (Linux s_bdev_file)
     s_bdev: spin::Once<crate::block::blkdev::BdevHandle>,
 
-    /// Inodes with dirty pages, each held until written back (Linux
-    /// wb->b_dirty; `fs_writeback`)
-    pub(crate) s_dirty: crate::sync::spin::Mutex<alloc::vec::Vec<Arc<Inode>>>,
+    /// Its inodes (Linux s_inodes, under inode_sb_list_lock)
+    pub(super) s_inodes: super::inode::SbInodes,
 
     /// Its inodes that have had inotify watches (Linux s_fsnotify_info)
     pub s_fsnotify: crate::io::inotify::SbMarks,
-
-    /// Serializes whole-filesystem writeback passes (sleeping: held
-    /// across the I/O; `fs_writeback::writeback_sb`)
-    pub(crate) s_wb_lock: crate::sync::Mutex<()>,
 
     /// Mutex for cross-directory renames (like Linux s_vfs_rename_mutex)
     ///
@@ -422,37 +554,46 @@ impl SuperBlock {
         self.mounted_on.load(Ordering::Acquire) != 0
     }
 
-    /// Create a new superblock
+    /// Create a new superblock, listed on super_blocks and its type's
+    /// fs_supers (Linux sget_fc with no test)
     pub fn new(
         fs_type: &'static FileSystemType,
         s_op: &'static dyn SuperOps,
         flags: u32,
     ) -> Result<Arc<Self>, KernelError> {
-        let sb = try_arc(Self {
+        let sb = Self::alloc(fs_type, s_op, flags)?;
+        sb_add(&mut SB_LOCK.lock(), &sb);
+        Ok(sb)
+    }
+
+    /// Create a superblock not listed yet (Linux alloc_super), for
+    /// [`sget`]'s `make`
+    pub fn alloc(
+        fs_type: &'static FileSystemType,
+        s_op: &'static dyn SuperOps,
+        flags: u32,
+    ) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             fs_type,
+            s_list: Link::new(),
+            s_instances: Link::new(),
             root: RwLock::new(None),
             s_op,
             s_flags: AtomicU32::new(flags),
             mounted_on: AtomicU32::new(0),
             s_writers: AtomicU64::new(0),
-            s_mounts: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
+            s_mounts: Mutex::new(WeakList::new()),
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
             s_maxbytes: AtomicU64::new(MAX_LFS_FILESIZE),
             private: RwLock::new(None),
             s_bdev: spin::Once::new(),
-            s_dirty: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
+            s_inodes: super::inode::SbInodes::new(WeakList::new()),
             s_fsnotify: crate::io::inotify::SbMarks::default(),
-            s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
             s_wb_err: crate::util::errseq::ErrSeq::new(),
             s_umount: sync::RwSem::new(()),
-        })?;
-        let mut all = ALL_SBS.lock();
-        all.retain(|w| w.strong_count() != 0);
-        all.push(Arc::downgrade(&sb));
-        drop(all);
-        Ok(sb)
+        })
     }
 
     /// Largest file size on this filesystem (Linux s_maxbytes)
@@ -514,14 +655,12 @@ impl SuperBlock {
     /// before it existed (its writers then see SB_RDONLY)
     pub(super) fn add_mount(&self, m: &Arc<super::mount::Mount>) {
         let _ml = super::mount::MOUNT_LOCK.write();
-        let mut mounts = self.s_mounts.lock();
-        mounts.retain(|w| w.strong_count() != 0);
-        mounts.push(Arc::downgrade(m));
+        self.s_mounts.lock().push_back(m);
     }
 
     /// Some mount of it is alive
     pub fn is_mounted(&self) -> bool {
-        self.s_mounts.lock().iter().any(|w| w.strong_count() != 0)
+        self.s_mounts.lock().iter().any(|e| e.is_live())
     }
 
     /// Make the file system read-only (Linux sb_prepare_remount_readonly,
@@ -534,30 +673,29 @@ impl SuperBlock {
         if self.rdonly() {
             return Ok(());
         }
-        let ml = super::mount::MOUNT_LOCK.write();
-        let mounts: alloc::vec::Vec<Arc<super::mount::Mount>> = self
-            .s_mounts
-            .lock()
-            .iter()
-            .filter_map(|w| w.upgrade())
-            .filter(|m| m.flags() & super::mount::MNT_READONLY == 0)
-            .collect();
+        // Linux walks sb->s_mounts under lock_mount_hash: no reference
+        // is taken (a mount in its teardown has no writers and waits for
+        // s_mounts to unlink it), and the writable set cannot change
+        // between the two passes (mnt_flags is written under MOUNT_LOCK)
+        let _ml = super::mount::MOUNT_LOCK.write();
+        let mounts = self.s_mounts.lock();
+        let rw = || {
+            mounts
+                .iter()
+                .map(|e| e.get())
+                .filter(|m| m.flags() & super::mount::MNT_READONLY == 0)
+        };
         let mut free = hold_writers(&self.s_writers);
-        for m in &mounts {
+        for m in rw() {
             free &= m.hold_writers();
         }
         if free {
             self.s_flags.fetch_or(SB_RDONLY, Ordering::SeqCst);
         }
-        for m in &mounts {
+        for m in rw() {
             m.unhold_writers();
         }
         unhold_writers(&self.s_writers);
-        // The references go after the unlock: a mount whose last other
-        // reference went meanwhile is torn down outside MOUNT_LOCK
-        // (Mount::drop takes dentry and id locks)
-        drop(ml);
-        drop(mounts);
         if free { Ok(()) } else { Err(KernelError::Busy) }
     }
 
@@ -623,34 +761,55 @@ pub static NULL_SUPER_OPS: NullSuperOps = NullSuperOps;
 // Filesystem Type Registry
 // ============================================================================
 
-use crate::sync::spin::Mutex;
-use alloc::collections::BTreeMap;
-
-/// Global filesystem type registry
-static FS_TYPES: Mutex<BTreeMap<&'static str, &'static FileSystemType>> =
-    Mutex::new(BTreeMap::new());
-
-/// Register a filesystem type
-///
-/// Makes the filesystem type available for mounting by name.
-pub fn register_filesystem(fs_type: &'static FileSystemType) {
-    FS_TYPES.lock().insert(fs_type.name, fs_type);
+/// What file_systems_lock guards (Linux file_systems): the head of the
+/// registered types, linked through [`FileSystemType::next`] in
+/// registration order
+pub struct FsList {
+    head: Option<&'static FileSystemType>,
 }
 
-/// Find a filesystem type by name
-///
-/// Returns the filesystem type if registered, None otherwise.
+// SAFETY: one instance, `FILE_SYSTEMS`'s, made here (the field is private)
+unsafe impl UniqueOwner for FsList {}
+
+/// Linux file_systems_lock: a spin rwlock leaf, thread context only
+static FILE_SYSTEMS: RwLock<FsList> = RwLock::new(FsList { head: None });
+
+/// The registered types, in registration order
+fn types(l: &FsList) -> impl Iterator<Item = &'static FileSystemType> + '_ {
+    core::iter::successors(l.head, |t| *t.next.access(l))
+}
+
+/// Register a filesystem type (Linux register_filesystem): appended to
+/// the list; EBUSY if one of that name is registered
+pub fn register_filesystem(fs_type: &'static FileSystemType) -> Result<(), KernelError> {
+    let mut l = FILE_SYSTEMS.write();
+    assert!(fs_type.next.access(&l).is_none(), "fs type relinked");
+    if types(&l).any(|t| t.name == fs_type.name) {
+        return Err(KernelError::Busy);
+    }
+    match types(&l).last() {
+        Some(t) => *t.next.access_mut(&mut l) = Some(fs_type),
+        None => l.head = Some(fs_type),
+    }
+    Ok(())
+}
+
+/// Find a filesystem type by name (Linux get_fs_type)
 pub fn find_filesystem(name: &str) -> Option<&'static FileSystemType> {
-    FS_TYPES.lock().get(name).copied()
+    types(&FILE_SYSTEMS.read()).find(|t| t.name == name)
 }
 
 /// Initialize the filesystem type registry with built-in types
 ///
 /// Should be called during VFS initialization before any mounts.
 pub fn init_fs_registry() {
-    register_filesystem(&super::ramfs::RAMFS_TYPE);
-    register_filesystem(&super::ramfs::tmpfs::TMPFS_TYPE);
-    register_filesystem(&super::proc::PROCFS_TYPE);
-    register_filesystem(&super::vfat::VFAT_TYPE);
-    register_filesystem(&crate::cgroup::cgroupfs::CGROUPFS_TYPE);
+    for t in [
+        &super::ramfs::RAMFS_TYPE,
+        &super::ramfs::tmpfs::TMPFS_TYPE,
+        &super::proc::PROCFS_TYPE,
+        &super::vfat::VFAT_TYPE,
+        &crate::cgroup::cgroupfs::CGROUPFS_TYPE,
+    ] {
+        register_filesystem(t).expect("built-in fs type");
+    }
 }

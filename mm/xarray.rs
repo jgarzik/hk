@@ -103,6 +103,43 @@ impl Drop for Preload {
     }
 }
 
+/// Store `val` at `idx` in the tree that `lock` locks, allocating no
+/// node under the lock (Linux xa_store's __xas_nomem): the first try
+/// uses only the nodes the tree has; when one is missing, the lock is
+/// dropped, a preload allocated (may reclaim) and the store retried
+/// once. `check` runs under the lock before each try and may refuse.
+/// Returns the old entry, or `nomem` when the preload fails or the retry
+/// still falls short.
+pub fn store_nomem<G, E>(
+    mut lock: impl FnMut() -> G,
+    idx: u64,
+    val: u64,
+    mut check: impl FnMut(&XArray) -> Result<(), E>,
+    nomem: E,
+) -> Result<u64, E>
+where
+    G: core::ops::DerefMut<Target = XArray>,
+    E: Copy,
+{
+    let mut pre: Option<Preload> = None;
+    loop {
+        let mut t = lock();
+        check(&t)?;
+        let stored = match pre.as_mut() {
+            Some(p) => t.store(idx, val, &mut || p.take()),
+            None => t.store(idx, val, &mut || None),
+        };
+        if let Some(old) = stored {
+            return Ok(old);
+        }
+        drop(t);
+        if pre.is_some() {
+            return Err(nomem);
+        }
+        pre = Some(Preload::new().ok_or(nomem)?);
+    }
+}
+
 /// A tree of entries by index (Linux struct xarray)
 pub struct XArray {
     /// The root: the entry at index 0 when `height` is 0, else the top

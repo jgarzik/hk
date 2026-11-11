@@ -9,7 +9,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::spin::Mutex;
-use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use ::core::mem::ManuallyDrop;
+use ::core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::sync;
 
@@ -19,6 +20,10 @@ use super::inode::{FileType, Inode, InodeId};
 use super::iov_iter::{IovDest, IovSource};
 use super::mount::Mount;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLHUP, PollTable};
+use crate::sync::IrqSpinlock;
+use crate::task::task_work::{CallbackHead, CbAdapter, Twa, task_work_add};
+use crate::task::workqueue::{DelayedWork, SYSTEM_WQ};
+use crate::util::list::List;
 
 /// Largest kernel buffer a pseudo-file write (sysctl, cgroup attribute)
 /// copies in for one store
@@ -571,15 +576,26 @@ pub struct File {
     /// at most once, by `FileOps::open`
     pub private: spin::Once<Arc<dyn core::any::Any + Send + Sync>>,
 
-    /// The epoll items watching this file (Linux f_ep), removed at its
-    /// last close (spin leaf)
-    pub f_ep: Mutex<alloc::vec::Vec<alloc::sync::Weak<crate::io::epoll::EpItem>>>,
+    /// The epoll items watching this file (Linux f_ep), linked through
+    /// their `fllink` (no allocation), removed at its last close (spin
+    /// leaf)
+    pub f_ep: Mutex<crate::util::list::ArcList<crate::io::epoll::FlAdapter>>,
 
     /// The writeback errors of its mapping and filesystem it has seen
     /// (Linux f_wb_err, f_sb_err): sampled at open, advanced by fsync
     /// and syncfs under `f_lock`, read lock-free
     f_wb_err: AtomicU32,
     f_sb_err: AtomicU32,
+
+    /// References (Linux f_ref): one per [`FileRef`]; the last one's
+    /// drop releases the file (`fput`), and [`FILE_REF_DEAD`] marks it
+    /// released. Atomic like Arc's count: taken and dropped lock-free
+    /// from any context.
+    f_count: AtomicUsize,
+
+    /// Queues the release on a task or the delayed list (Linux
+    /// f_task_work / f_llist): on one list at a time, once
+    f_task_work: CallbackHead,
 }
 
 impl File {
@@ -630,7 +646,7 @@ impl File {
             mnt,
             pos: AtomicU64::new(0),
             f_pos_lock: sync::Mutex::new(()),
-            f_ep: Mutex::new(alloc::vec::Vec::new()),
+            f_ep: Mutex::new(crate::util::list::ArcList::new()),
             f_lock: Mutex::new(flags),
             f_iocb: AtomicU32::new(RwFlags::from_file(flags).bits()),
             can_odirect: false,
@@ -643,6 +659,8 @@ impl File {
             private: spin::Once::new(),
             f_wb_err: AtomicU32::new(0),
             f_sb_err: AtomicU32::new(0),
+            f_count: AtomicUsize::new(0),
+            f_task_work: CallbackHead::new(____fput),
         }
         .sampled()
     }
@@ -1029,8 +1047,10 @@ fn advance(
     e.map_or(Ok(()), Err)
 }
 
-impl Drop for File {
-    fn drop(&mut self) {
+impl File {
+    /// Release the open file description (Linux __fput): its last
+    /// reference went, in a context that may sleep with nothing held
+    fn __fput(&self) {
         // Leave every epoll first, while the wait queues the items are
         // registered on still exist (Linux __fput -> eventpoll_release)
         if !self.f_ep.lock().is_empty() {
@@ -1045,7 +1065,7 @@ impl Drop for File {
 
         // The open file description is gone: its flock locks go (Linux
         // __fput -> locks_remove_file). POSIX locks are the closer's,
-        // released at each close (fdtable::FilesGuard), not here (this
+        // released at each close (fdtable `filp_close`), not here (this
         // may run in another process's context)
         super::flock::release_file_locks(self);
 
@@ -1054,6 +1074,236 @@ impl Drop for File {
         if let Some(ref mnt) = self.mnt {
             mnt.mntput();
         }
+    }
+
+    /// Give the new file its first reference (Linux alloc_empty_file's
+    /// f_ref of one): the one way to a [`FileRef`]; ENOMEM
+    pub fn alloc(mut self) -> Result<FileRef, KernelError> {
+        *self.f_count.get_mut() = 1;
+        crate::util::kalloc::try_arc(self).map(|f| FileRef(ManuallyDrop::new(f)))
+    }
+}
+
+/// A file never given a reference (dropped before `alloc`: an open that
+/// failed) is released here; one that had them was by its last `fput`
+/// (`FILE_REF_DEAD`), whoever drops the memory
+impl Drop for File {
+    fn drop(&mut self) {
+        if *self.f_count.get_mut() != FILE_REF_DEAD {
+            self.__fput();
+        }
+    }
+}
+
+/// `File.f_count` once the file is released (Linux FILE_REF_DEAD): no
+/// reference can be taken again
+const FILE_REF_DEAD: usize = usize::MAX;
+
+/// A counted reference to an open file (Linux a `struct file *` holding
+/// f_ref): descriptors, mappings, in-flight messages and requests. A
+/// clone takes one (get_file); the last one's drop releases the file
+/// (`fput`). A holder that must not keep the file open (an epoll item)
+/// keeps a `Weak` (`FileRef::downgrade`) and takes a reference with
+/// `FileRef::try_get` (Linux epi_fget).
+///
+/// # Invariants
+/// Holds one strong count of its `Arc` and one of the file's `f_count`.
+pub struct FileRef(ManuallyDrop<Arc<File>>);
+
+impl FileRef {
+    /// A reference to the file `w` names, unless its last one is gone
+    /// (Linux file_ref_get). A failure briefly holds an `Arc` that would
+    /// drop the file's memory (dentry, private data) if the release had
+    /// finished and dropped its own meanwhile (Linux frees a file
+    /// through RCU instead): the caller keeps the release from finishing
+    /// (epoll calls it under `Eventpoll.mtx`, which the file's
+    /// `eventpoll_release` takes for the item)
+    pub fn try_get(w: &alloc::sync::Weak<File>) -> Option<FileRef> {
+        let f = w.upgrade()?;
+        let mut n = f.f_count.load(Ordering::Relaxed);
+        loop {
+            // Released or being released: dropping this `Arc` never
+            // releases it (the releaser holds one until it is DEAD)
+            if n == 0 || n == FILE_REF_DEAD {
+                return None;
+            }
+            match f
+                .f_count
+                .compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(FileRef(ManuallyDrop::new(f))),
+                Err(v) => n = v,
+            }
+        }
+    }
+
+    /// A non-owning handle to the file (no reference)
+    pub fn downgrade(this: &Self) -> alloc::sync::Weak<File> {
+        Arc::downgrade(&this.0)
+    }
+
+    /// The file's address (its identity)
+    pub fn as_ptr(this: &Self) -> *const File {
+        Arc::as_ptr(&this.0)
+    }
+
+    /// Both are the same open file
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.0, &b.0)
+    }
+
+    /// Drop the reference (Linux file_ref_put): its `Arc` back for the
+    /// release if it was the last
+    fn put(self) -> Option<Arc<File>> {
+        let mut me = ManuallyDrop::new(self);
+        // SAFETY: taken once; `me` is never dropped
+        let f = unsafe { ManuallyDrop::take(&mut me.0) };
+        if f.f_count.fetch_sub(1, Ordering::Release) != 1 {
+            // Another reference holds an `Arc`: this is not the last
+            return None;
+        }
+        // Every other holder's use comes before the release
+        fence(Ordering::Acquire);
+        Some(f)
+    }
+}
+
+impl Clone for FileRef {
+    /// Another reference (Linux get_file)
+    fn clone(&self) -> Self {
+        self.0.f_count.fetch_add(1, Ordering::Relaxed);
+        FileRef(self.0.clone())
+    }
+}
+
+impl core::ops::Deref for FileRef {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for FileRef {
+    /// fput: the last reference queues the release
+    fn drop(&mut self) {
+        // SAFETY: taken once, here; `put` owns it from now on
+        let f = FileRef(ManuallyDrop::new(unsafe {
+            ManuallyDrop::take(&mut self.0)
+        }));
+        if let Some(f) = f.put() {
+            fput_deferred(f);
+        }
+    }
+}
+
+/// Drop a reference (Linux fput): the last one's release runs later,
+/// with nothing held, in the dropping task on its way back to user mode
+/// (task_work), or from interrupt context, a kernel thread or a task
+/// past `exit_task_work` in the system workqueue (`delayed_fput`)
+pub fn fput(f: FileRef) {
+    drop(f);
+}
+
+/// close(2)'s drop (Linux fput_close_sync): the last reference releases
+/// the file before returning, so the close is complete when the call
+/// returns (a pipe's reader sees EOF, a socket is gone). The caller
+/// holds no lock.
+pub fn fput_close_sync(f: FileRef) {
+    if let Some(f) = f.put() {
+        release(f);
+    }
+}
+
+/// Release a file whose last reference went, then mark it so its
+/// memory's drop does not again (Linux __fput, then file_free)
+fn release(f: Arc<File>) {
+    crate::sync::might_sleep();
+    f.__fput();
+    f.f_count.store(FILE_REF_DEAD, Ordering::Release);
+}
+
+/// Queue the release of `f` (Linux __fput_deferred)
+fn fput_deferred(f: Arc<File>) {
+    let me = crate::task::percpu::current();
+    let p = Arc::into_raw(f);
+    if !crate::sync::in_interrupt() && !me.is_kthread() {
+        // SAFETY: `p` is live; its head is on no list (it is queued once,
+        // by the last reference's drop); the task's list keeps the
+        // reference until `____fput`
+        if unsafe { task_work_add(&me, &raw const (*p).f_task_work, Twa::Resume) }.is_ok() {
+            return;
+        }
+        // Past exit_task_work: the delayed list takes it
+    }
+    let first = {
+        let mut l = DELAYED_FPUT.lock();
+        let first = l.is_empty();
+        // SAFETY: as above; the delayed list keeps the reference until
+        // `delayed_fput`
+        unsafe { l.push_back(&raw const (*p).f_task_work) };
+        first
+    };
+    if first && let Some(w) = DELAYED_FPUT_WORK.get() {
+        // One tick later (Linux schedule_delayed_work(.., 1)): files
+        // dropped together are released together
+        SYSTEM_WQ.queue_delayed_work(w.clone(), 1);
+    }
+}
+
+/// The release callback of a file queued by `fput_deferred` (Linux
+/// ____fput)
+///
+/// # Safety
+/// `cb` is the `f_task_work` of a file whose `Arc` was handed to the
+/// list it came off (`Arc::into_raw`).
+unsafe fn ____fput(cb: *const CallbackHead) {
+    let off = core::mem::offset_of!(File, f_task_work);
+    // SAFETY: the caller's contract: `cb` is inside a File, and its
+    // reference is ours
+    let f = unsafe { Arc::from_raw(cb.cast::<u8>().sub(off).cast::<File>()) };
+    release(f);
+}
+
+/// Files whose release waits for the system workqueue (Linux
+/// delayed_fput_list): their `f_task_work` heads, each holding its
+/// file's `Arc`. IrqSpinlock leaf: added to from any context.
+static DELAYED_FPUT: IrqSpinlock<List<CbAdapter>> = IrqSpinlock::new(List::new());
+
+/// The work item that drains `DELAYED_FPUT` (Linux delayed_fput_work),
+/// made by `files_init`
+static DELAYED_FPUT_WORK: spin::Once<Arc<IrqSpinlock<DelayedWork>>> = spin::Once::new();
+
+/// Held across a drain of `DELAYED_FPUT`, so a flush waits for one in
+/// progress (Linux flush_delayed_work in flush_delayed_fput); sleeping,
+/// taken with nothing held
+static DELAYED_FPUT_RUN: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
+/// Release the files on the delayed list (Linux delayed_fput): those
+/// there now; ones their releases drop are queued again
+fn delayed_fput() {
+    let _run = DELAYED_FPUT_RUN.lock();
+    let mut l = core::mem::replace(&mut *DELAYED_FPUT.lock(), List::new());
+    while let Some(cb) = l.pop_front() {
+        // SAFETY: taken off the delayed list, which held its reference
+        unsafe { CallbackHead::run(cb) };
+    }
+}
+
+/// Release every file waiting on the delayed list, and wait for a drain
+/// under way (Linux flush_delayed_fput)
+pub fn flush_delayed_fput() {
+    delayed_fput();
+}
+
+/// Make the delayed list's work item (Linux files_init, from
+/// vfs_caches_init): before any file is opened
+pub fn files_init() {
+    let w = DELAYED_FPUT_WORK.call_once(|| {
+        crate::util::kalloc::arc_nofail(IrqSpinlock::new(DelayedWork::new(delayed_fput)))
+    });
+    // Releases queued before the work existed found none to schedule
+    if !DELAYED_FPUT.lock().is_empty() {
+        SYSTEM_WQ.queue_delayed_work(w.clone(), 1);
     }
 }
 

@@ -19,17 +19,15 @@
 //!
 //! ## Locking
 //!
-//! `KTHREADS` (crate::sync::spin::Mutex, process context only) maps tid -> control
-//! block; it is never held across a wakeup or sleep. Stop/park requests are
+//! A thread finds its control block through its task (`Task.kthread`, a
+//! spin leaf; Linux task->worker_private and to_kthread), set before its
+//! first wakeup and taken when it exits. Stop/park requests are
 //! atomics plus a direct `try_to_wake_up`; requesters wait on the control
 //! block's `WaitQueue` for the thread to acknowledge.
 
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-
-use crate::sync::spin::Mutex;
 
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{
@@ -68,16 +66,12 @@ impl KThread {
     }
 }
 
-/// Registry of live kernel threads (process context only)
-static KTHREADS: Mutex<Vec<Arc<KThread>>> = Mutex::new(Vec::new());
-
 /// Round-robin cursor for unbound threads
 static NEXT_CPU: AtomicU32 = AtomicU32::new(0);
 
 /// Control block of the current task, if it is a kthread
 pub fn current_kthread() -> Option<Arc<KThread>> {
-    let tid = current_tid();
-    KTHREADS.lock().iter().find(|k| k.tid() == tid).cloned()
+    crate::task::percpu::current().kthread.lock().clone()
 }
 
 /// Create and start a kernel thread running `func(arg)`
@@ -119,8 +113,9 @@ pub fn kthread_run_prio(
     })?;
     // The task is created asleep: register it before it can look itself up
     let task = create_kthread_task(cpu, name, kthread_entry as *const () as usize, priority)?;
+    // Found by the thread itself through its task (Linux to_kthread)
+    *task.kthread.lock() = Some(k.clone());
     k.task.call_once(|| task);
-    KTHREADS.lock().push(k.clone());
     k.wake();
     Ok(k)
 }
@@ -150,8 +145,6 @@ extern "C" fn kthread_entry() -> ! {
         (k.func)(k.arg);
         k.exited.store(true, Ordering::Release);
         k.ack.wake_all();
-        let tid = k.tid();
-        KTHREADS.lock().retain(|t| t.tid() != tid);
     }
     kthread_exit()
 }
@@ -161,6 +154,9 @@ extern "C" fn kthread_entry() -> ! {
 /// has switched away)
 fn kthread_exit() -> ! {
     let tid = current_tid();
+    // Its control block goes (others hold their own references)
+    let k = crate::task::percpu::current().kthread.lock().take();
+    drop(k);
     // Dropped after TASKLIST (nothing is released under it)
     let me = crate::task::percpu::TASKLIST.write().remove(tid);
     drop(me);

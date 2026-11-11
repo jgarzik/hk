@@ -22,8 +22,8 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
 use super::blkdev::{
-    BLKDEV_REGISTRY, BioOp, BlockDevice, Disk, bdev_rw_bytes, disk_bdevs, disk_release,
-    register_bdev, unregister_bdev,
+    BioOp, BlockDevice, Disk, OpenState, bdev_add, bdev_del, bdev_rw_bytes, disk_release,
+    for_each_bdev,
 };
 use super::part;
 
@@ -234,19 +234,19 @@ pub fn add_disk(
         0,
         disk.capacity(),
         disk.name.clone(),
-    ))?;
-    register_bdev(whole.clone())?;
+    )?)?;
+    bdev_add(&mut disk.open_mutex.lock(), &whole)?;
     bdev_device_add(&whole, parent);
     if disk.minors > 1 {
-        let _g = disk.open_mutex.lock();
-        scan_partitions(&whole);
+        let mut st = disk.open_mutex.lock();
+        scan_partitions(&mut st, &whole);
     }
     Ok(whole)
 }
 
 /// Read the partition table and add a block device per partition
-/// (Linux blk_add_partitions); called with `open_mutex` held
-fn scan_partitions(whole: &BlockDevice) {
+/// (Linux blk_add_partitions), under `open_mutex` (`st`)
+fn scan_partitions(st: &mut OpenState, whole: &BlockDevice) {
     let parent = whole.kdev.get().and_then(|d| d.upgrade());
     let disk = &whole.disk;
     let mut rd = |s: u64, b: &mut [u8; 512]| bdev_rw_bytes(whole, BioOp::Read, s << 9, b);
@@ -254,32 +254,25 @@ fn scan_partitions(whole: &BlockDevice) {
     for (no, p) in parts {
         // A partition that cannot be had is skipped (Linux
         // blk_add_partition)
-        let Ok(b) = try_arc(BlockDevice::new(
-            disk.clone(),
-            no,
-            p.start,
-            p.size,
-            part_name(&disk.name, no),
-        )) else {
+        let Ok(b) = BlockDevice::new(disk.clone(), no, p.start, p.size, part_name(&disk.name, no))
+            .and_then(try_arc)
+        else {
             continue;
         };
-        if register_bdev(b.clone()).is_ok() {
+        if bdev_add(st, &b).is_ok() {
             bdev_device_add(&b, parent.as_ref());
         }
     }
 }
 
-/// Remove block devices of `disk` with `partno >= from`
-fn drop_bdevs(disk: &Arc<Disk>, from: u16) {
-    let mut gone: Vec<_> = disk_bdevs(disk)
-        .into_iter()
-        .filter(|b| b.partno >= from)
-        .collect();
-    // Partitions before their disk
-    gone.sort_by_key(|b| core::cmp::Reverse(b.partno));
-    for b in gone {
-        unregister_bdev(b.dev);
-        bdev_device_del(&b);
+/// Remove the block devices with `partno >= from`, partitions before
+/// their disk, under `open_mutex` (`st`)
+fn drop_bdevs(st: &mut OpenState, from: u16) {
+    let n = u16::try_from(st.part_tbl.len()).unwrap_or(u16::MAX);
+    for no in (from..n).rev() {
+        if let Some(b) = bdev_del(st, no) {
+            bdev_device_del(&b);
+        }
     }
 }
 
@@ -291,14 +284,14 @@ pub fn rescan(bdev: &BlockDevice) -> Result<(), KernelError> {
     if bdev.partno != 0 || disk.minors <= 1 {
         return Err(KernelError::InvalidArgument);
     }
-    let st = disk.open_mutex.lock();
+    let mut st = disk.open_mutex.lock();
     // A partition is open: a file, a mounted filesystem or active swap
     // (each opens the device, as in Linux)
     if st.open_partitions != 0 {
         return Err(KernelError::Busy);
     }
-    drop_bdevs(disk, 1);
-    scan_partitions(bdev);
+    drop_bdevs(&mut st, 1);
+    scan_partitions(&mut st, bdev);
     Ok(())
 }
 
@@ -309,9 +302,9 @@ pub fn del_gendisk(disk: &Arc<Disk>) {
     {
         // Under open_mutex, like a rescan: an open in progress either
         // finished before or sees the device dead
-        let _g = disk.open_mutex.lock();
+        let mut st = disk.open_mutex.lock();
         disk.queue.start_drain();
-        drop_bdevs(disk, 0);
+        drop_bdevs(&mut st, 0);
     }
     // Started requests complete before the bdi goes (Linux freezes the
     // queue before tearing the disk down)
@@ -320,13 +313,18 @@ pub fn del_gendisk(disk: &Arc<Disk>) {
 }
 
 /// /proc/partitions (Linux show_partition): every block device with a
-/// non-zero size, in device number order
+/// non-zero size, in device number order; gathered one device at a
+/// time from the bdev superblock, formatted with no lock held
 pub fn proc_partitions() -> Vec<u8> {
-    let mut s = String::from("major minor  #blocks  name\n\n");
-    for b in BLKDEV_REGISTRY.read().values() {
-        if b.nr_sects() == 0 {
-            continue;
+    let mut all: Vec<Arc<BlockDevice>> = Vec::new();
+    for_each_bdev(|b| {
+        if b.nr_sects() != 0 {
+            all.push(b.clone());
         }
+    });
+    all.sort_by_key(|b| b.dev);
+    let mut s = String::from("major minor  #blocks  name\n\n");
+    for b in all {
         let _ = writeln!(
             s,
             "{:4}  {:7} {:10} {}",

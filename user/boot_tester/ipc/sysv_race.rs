@@ -28,6 +28,13 @@
 //!   so the exit undoes nothing.
 //! - SEM_UNDO_ERANGE: an adjustment past -32768 is ERANGE and changes
 //!   nothing.
+//! - SEM_UNDO_RMID: arrays with adjustments removed before the exit
+//!   take their undo structures along (freeary): the removed id is
+//!   EINVAL, a new array gets its own, and the exit undoes only the
+//!   array still there.
+//! - SEM_UNDO_WAKE: a SEM_UNDO decrement that slept and was completed
+//!   by another process's increment records its adjustment: the exit
+//!   gives the unit back.
 //! - SEM_NCNT: GETNCNT and GETZCNT count the waiters blocked on that
 //!   semaphore (Linux count_semcnt); IPC_RMID wakes them with EIDRM.
 //! - SEM_MIXED_STRESS: single-operation semops on one semaphore (the
@@ -74,6 +81,8 @@ pub fn run_tests() {
     report_r(b"SEM_UNDO_EXIT", sem_undo(undo_exit_child, 0));
     report_r(b"SEM_UNDO_SETVAL", sem_undo(undo_setval_child, 5));
     report_r(b"SEM_UNDO_ERANGE", sem_undo(undo_erange_child, 0));
+    report_r(b"SEM_UNDO_RMID", sem_undo(undo_rmid_child, 1));
+    report_r(b"SEM_UNDO_WAKE", sem_undo_wake());
     report_r(b"SEM_NCNT", sem_ncnt());
     report_r(b"SEM_MIXED_STRESS", sem_mixed_stress());
     report_r(b"MSGCTL_QBYTES", msgctl_qbytes());
@@ -410,6 +419,58 @@ fn undo_erange_child(id: i32) -> u64 {
     // The failed semop changed nothing: value 1; the exit adds -32768
     // and clamps at 0
     (sys_semctl(id, 0, GETVAL, 0) != 1) as u64 * 4
+}
+
+fn undo_rmid_child(id: i32) -> u64 {
+    let one = |n| [Sembuf::new(n, 1, UNDO)];
+    let a = Set::new(2);
+    if a.0 < 0 || a.op(&one(1)) != 0 {
+        return 1;
+    }
+    // +2 with SEM_UNDO and +1 without on the parent's array
+    let two = [Sembuf::new(0, 2, UNDO)];
+    let plain = [Sembuf::new(0, 1, 0)];
+    if sys_semop(id, two.as_ptr(), 1) != 0 || sys_semop(id, plain.as_ptr(), 1) != 0 {
+        return 2;
+    }
+    if sys_semctl(a.0, 0, IPC_RMID, 0) != 0 {
+        return 3;
+    }
+    if a.op(&one(1)) != EINVAL {
+        return 4;
+    }
+    // A new array gets its own undo structure; removed (its drop)
+    // before the exit too
+    let b = Set::new(1);
+    if b.0 < 0 || b.op(&one(0)) != 0 || b.get(0) != 1 {
+        return 5;
+    }
+    0
+}
+
+fn sem_undo_wake() -> R {
+    let set = Set::new(1);
+    check(b"semget", set.0 >= 0, set.0 as i64)?;
+    let pid = sys_fork();
+    if pid == 0 {
+        let down = [Sembuf::new(0, -1, UNDO)];
+        sys_exit((timed(set.0, &down) != 0) as u64);
+    }
+    let t0 = mono_ms();
+    while sys_semctl(set.0, 0, GETNCNT, 0) != 1 && mono_ms() - t0 < 2000 {
+        let ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 5_000_000,
+        };
+        hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    }
+    let r = set.op(&[Sembuf::new(0, 1, 0)]);
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+    check(b"up", r == 0, r)?;
+    check(b"child", ws == 0, (ws >> 8) as i64)?;
+    // Taken by the child, given back by its exit
+    check(b"value", set.get(0) == 1, set.get(0))
 }
 
 /// Block in semop(`sem_op` on `num`); exit 0 on EIDRM

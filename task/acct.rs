@@ -20,9 +20,9 @@
 //! its record to the file of its namespace and of each one above it,
 //! numbered as that namespace sees it.
 
-use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
+use crate::fs::FileRef;
 use crate::fs::KernelError;
 use crate::fs::file::File;
 use crate::ns::PidNamespace;
@@ -186,7 +186,7 @@ fn encode_float(mut value: u64) -> u32 {
 /// acct->file). A leaf spin lock, thread context only: users clone the
 /// file out and write with no lock held (the write sleeps), and a
 /// replaced file is released after unlocking.
-pub struct Acct(Mutex<Option<Arc<File>>>);
+pub struct Acct(Mutex<Option<FileRef>>);
 
 impl Default for Acct {
     fn default() -> Self {
@@ -196,12 +196,12 @@ impl Default for Acct {
 
 impl Acct {
     /// The file, if accounting is on
-    fn get(&self) -> Option<Arc<File>> {
+    fn get(&self) -> Option<FileRef> {
         self.0.lock().clone()
     }
 
     /// Install `file`, returning the old one
-    fn replace(&self, file: Option<Arc<File>>) -> Option<Arc<File>> {
+    fn replace(&self, file: Option<FileRef>) -> Option<FileRef> {
         core::mem::replace(&mut *self.0.lock(), file)
     }
 }
@@ -210,7 +210,7 @@ impl Acct {
 /// The old file gets a record for the calling process before it is
 /// released, with no lock held (Linux acct_pin_kill ->
 /// do_acct_process(current))
-fn set_acct_file(file: Option<Arc<File>>) {
+fn set_acct_file(file: Option<FileRef>) {
     let ns = crate::task::pid::current_pid_ns();
     if let Some(old) = ns.bacct.replace(file) {
         close(&old, ns);
@@ -261,7 +261,7 @@ pub fn sys_acct(filename: UserPtr<u8>) -> KernelResult<()> {
 }
 
 /// Open the accounting file
-fn open_acct_file(path: &[u8]) -> KernelResult<Arc<File>> {
+fn open_acct_file(path: &[u8]) -> KernelResult<FileRef> {
     use crate::fs::file::flags;
     use crate::fs::{LookupFlags, dac};
 
@@ -295,7 +295,7 @@ fn open_acct_file(path: &[u8]) -> KernelResult<Arc<File>> {
         .unwrap_or(&crate::fs::ramfs::RAMFS_FILE_OPS);
     let mut file = File::new(dentry, Some(mnt), flags::O_WRONLY | flags::O_APPEND, f_op);
     file.write_access = w;
-    try_arc(file)
+    file.alloc()
 }
 
 // =============================================================================

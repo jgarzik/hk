@@ -23,21 +23,24 @@
 //! `PacketTable.socks` (`crate::sync::spin::RwLock`, per namespace, leaf): delivery
 //! clones the matching `Arc`s and queues after dropping it. Per socket:
 //! `bind` is one atomic word, changed only by compare-exchange (bind,
-//! device unregister); `rxq` (`crate::sync::spin::Mutex` leaf) and `filter`
+//! device unregister); `rxq` (an `SkbQueue`, spin leaf: frames are
+//! copied into skbs GFP_ATOMIC before it, freed after it) and `filter`
 //! (`crate::sync::spin::RwLock` leaf, the `Arc` is cloned out before running it).
-//! `mclist` (`crate::sync::spin::Mutex` leaf) is changed under RTNL, which device
-//! promiscuity changes need: RTNL -> `mclist`.
+//! `mclist` (sleeping `crate::sync::Mutex` leaf; Linux keeps po->mclist
+//! under RTNL) is changed under RTNL, which device promiscuity changes
+//! need: RTNL -> `mclist`.
 
 mod opts;
 mod rcv;
 
+use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::spin::RwLock;
 
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{ETH_ALEN, ETH_HLEN};
@@ -51,7 +54,7 @@ use crate::net::socket::{
 };
 use crate::util::error::KernelError;
 
-pub use rcv::{PacketTable, proc_net_packet, tap};
+pub use rcv::{PacketTable, PktCb, proc_net_packet, tap};
 
 /// All protocols (ETH_P_ALL, host order)
 pub const ETH_P_ALL: u16 = 0x0003;
@@ -139,7 +142,7 @@ pub struct PacketSock {
     packets: AtomicU32,
     drops: AtomicU32,
     /// PACKET_ADD_MEMBERSHIP entries (changed under RTNL)
-    mclist: Mutex<Vec<opts::Mreq>>,
+    mclist: crate::sync::Mutex<Vec<opts::Mreq>>,
 }
 
 /// socket(AF_PACKET, type, protocol) (Linux packet_create: EPERM
@@ -163,7 +166,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         filter: RwLock::new(None),
         packets: AtomicU32::new(0),
         drops: AtomicU32::new(0),
-        mclist: Mutex::new(Vec::new()),
+        mclist: crate::sync::Mutex::new(Vec::new()),
     })?;
     net.packet.insert(&s);
     Ok(s)
@@ -294,8 +297,8 @@ impl PacketSock {
         addr: Option<[u8; 8]>,
         data: &[u8],
     ) -> Result<alloc::boxed::Box<SkBuff>, KernelError> {
-        let mut skb =
-            SkBuff::alloc(NET_SKB_PAD, data.len() + ETH_HLEN).ok_or(KernelError::NoBufferSpace)?;
+        let mut skb = SkBuff::alloc(NET_SKB_PAD, data.len() + ETH_HLEN, Gfp::KERNEL)
+            .ok_or(KernelError::NoBufferSpace)?;
         if self.sk.stype == SOCK_DGRAM {
             skb.reserve(ETH_HLEN);
             skb.put_slice(data).ok_or(KernelError::NoBufferSpace)?;

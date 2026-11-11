@@ -3,6 +3,7 @@
 //! This module handles IPv4 packet parsing, building, routing,
 //! and checksum computation.
 
+use crate::mm::page_alloc::Gfp;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -308,7 +309,7 @@ pub fn pseudo_header_checksum(saddr: Ipv4Addr, daddr: Ipv4Addr, protocol: u8, le
 ///
 /// `skb.data()` starts at the IP header (eth_type_trans pulled the MAC
 /// header). The packet's namespace is its device's.
-pub fn ip_rcv(mut skb: SkBuff) {
+pub fn ip_rcv(mut skb: Box<SkBuff>) {
     let Some(ihl) = ip_check(&mut skb) else {
         return;
     };
@@ -400,18 +401,18 @@ pub fn ip_options_ok(opt: &[u8]) -> bool {
 
 /// A reassembled datagram as a received skb (device and link-layer
 /// classification of its last fragment)
-fn rebuild(last: &SkBuff, pkt: &[u8]) -> Option<SkBuff> {
-    let mut s = SkBuff::alloc(NET_SKB_PAD, pkt.len())?;
+fn rebuild(last: &SkBuff, pkt: &[u8]) -> Option<Box<SkBuff>> {
+    let mut s = SkBuff::alloc(NET_SKB_PAD, pkt.len(), Gfp::ATOMIC)?;
     s.put_slice(pkt)?;
     s.dev = last.dev.clone();
     s.pkt_type = last.pkt_type;
     s.ip_bcast = last.ip_bcast;
-    Some(*s)
+    Some(s)
 }
 
 /// Deliver a whole datagram for us to its protocol (Linux
 /// ip_local_deliver_finish)
-fn ip_local_deliver(mut skb: SkBuff) {
+fn ip_local_deliver(mut skb: Box<SkBuff>) {
     let mut h = [0u8; IP_HLEN_MIN];
     h.copy_from_slice(&skb.data()[..IP_HLEN_MIN]);
     let ihl = ((h[0] & 0x0f) as usize) * 4;
@@ -431,8 +432,8 @@ fn ip_local_deliver(mut skb: SkBuff) {
     let raw = crate::net::raw::raw_deliver(&net, &skb);
     match proto {
         IPPROTO_TCP => tcp::tcp_rcv(skb),
-        IPPROTO_UDP => udp::udp_rcv(skb),
-        IPPROTO_ICMP => crate::net::icmp::icmp_rcv(skb),
+        IPPROTO_UDP => udp::udp_rcv(*skb),
+        IPPROTO_ICMP => crate::net::icmp::icmp_rcv(*skb),
         _ if !raw => crate::net::icmp::prot_unreach(&net, &skb),
         _ => {}
     }
@@ -512,8 +513,9 @@ impl IpParams {
 /// and send it along `rt`, fragmenting a datagram larger than the MTU
 /// when the socket's PMTU mode allows (else EMSGSIZE). Never delivers
 /// synchronously: `lo` queues to the receive backlog. Callers may hold a
-/// socket lock (TCP always does: it transmits under `TcpSock.cb`; lock
-/// order: socket -> FIB -> neighbour -> device TX -> backlog), so
+/// socket lock (TCP always does: it transmits owning `TcpSock.lock` or
+/// under its slock; lock order: socket -> FIB -> neighbour -> device
+/// TX -> backlog), so
 /// nothing here may take a socket lock or flush the backlog.
 pub fn ip_send_rt(
     net: &NetNamespace,
@@ -555,9 +557,10 @@ pub fn ip_send_rt(
 }
 
 /// Send a packet with a complete IP header along `rt`, fragmenting it
-/// to `mtu` if needed (Linux ip_finish_output -> ip_fragment)
+/// to `mtu` if needed (Linux ip_finish_output -> ip_fragment); `_net`
+/// is the sender's namespace (Linux counts IP MIB statistics in it)
 pub fn ip_output(
-    net: &NetNamespace,
+    _net: &NetNamespace,
     rt: &route::Rtable,
     mut skb: Box<SkBuff>,
     saddr: Ipv4Addr,
@@ -567,10 +570,10 @@ pub fn ip_output(
     skb.saddr = Some(saddr);
     skb.daddr = Some(rt.daddr);
     if skb.len() <= mtu {
-        return neigh_output(net, &rt.dev, rt, rt.nexthop(), skb);
+        return neigh_output(&rt.dev, rt, rt.nexthop(), skb);
     }
     for f in fragment(&skb, mtu)? {
-        neigh_output(net, &rt.dev, rt, rt.nexthop(), f)?;
+        neigh_output(&rt.dev, rt, rt.nexthop(), f)?;
     }
     Ok(())
 }
@@ -591,7 +594,7 @@ pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelErro
     while off < payload.len() {
         let len = room.min(payload.len() - off);
         let more = off + len < payload.len();
-        let mut f = SkBuff::alloc_tx(ihl + len).ok_or(KernelError::NoBufferSpace)?;
+        let mut f = SkBuff::alloc_tx(ihl + len, Gfp::ATOMIC).ok_or(KernelError::NoBufferSpace)?;
         f.put_slice(&pkt[..ihl]).ok_or(KernelError::NoBufferSpace)?;
         f.put_slice(&payload[off..off + len])
             .ok_or(KernelError::NoBufferSpace)?;
@@ -616,7 +619,6 @@ pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelErro
 /// NOARP devices and broadcast/multicast map directly, unicast next hops
 /// go through the ARP table)
 fn neigh_output(
-    net: &NetNamespace,
     dev: &Arc<crate::net::NetDevice>,
     rt: &route::Rtable,
     next_hop: Ipv4Addr,
@@ -630,7 +632,7 @@ fn neigh_output(
     match rt.rtype {
         RouteType::Broadcast => ip_finish_output(skb, ethernet::ETH_BROADCAST),
         RouteType::Multicast => ip_finish_output(skb, mc_map(rt.daddr)),
-        _ => arp::output(net, dev, next_hop, skb),
+        _ => arp::output(dev, next_hop, skb),
     }
 }
 

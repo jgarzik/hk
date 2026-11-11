@@ -7,11 +7,15 @@
 //! a time in canonical mode, VMIN/VTIME otherwise) and sleeps on
 //! `Tty.read_wait`. Output (`write`) does OPOST/ONLCR.
 //!
-//! Locking: `Tty.ldata` is a spin Mutex taken briefly in thread context;
-//! echo is written to the driver and signals are sent after it is
-//! dropped.
+//! Locking: `Tty.ldata` is a sleeping mutex (Linux termios_rwsem's
+//! role for the line discipline), thread context only: input echoes
+//! through a fixed ring written to the driver under it and sends ISIG
+//! signals under it (Linux __isig under termios_rwsem). Its read, line
+//! and commit heads are published in `Tty.avail` (atomics), so poll and
+//! a reader's wait condition test for input without it (Linux
+//! input_available_p): a poll may run under a spin lock.
 
-use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::Tty;
 use super::termios::*;
@@ -32,6 +36,13 @@ const LINE_MAX: usize = READ_BUF_SIZE - 1;
 /// out (Linux __DISABLED_CHAR); a real line end is never NUL
 const EOF_MARK: u8 = 0;
 
+/// Echo ring size (Linux echo_buf, N_TTY_BUF_SIZE)
+const ECHO_BUF_SIZE: usize = 4096;
+
+/// Queued echo is written to the driver once this much is pending
+/// (Linux ECHO_COMMIT_WATERMARK); the rest at the end of the input
+const ECHO_COMMIT_WATERMARK: usize = 256;
+
 /// Per-tty N_TTY state (Linux struct n_tty_data)
 pub struct NTtyData {
     /// Input ready for readers; `head`/`tail` run free, index mod size
@@ -40,8 +51,14 @@ pub struct NTtyData {
     eol: [u64; READ_BUF_SIZE / 64],
     head: usize,
     tail: usize,
-    /// Line ends in the ring
-    lines: usize,
+    /// Past the last line end in canonical mode (Linux canon_head): a
+    /// line is readable while it differs from `tail`
+    canon_head: usize,
+    /// Echo not yet written to the driver (Linux echo_buf); `echo_head`
+    /// and `echo_tail` run free, index mod size
+    echo: [u8; ECHO_BUF_SIZE],
+    echo_head: usize,
+    echo_tail: usize,
     /// The line being edited in canonical mode
     line: [u8; LINE_MAX],
     line_len: usize,
@@ -57,7 +74,10 @@ impl NTtyData {
             eol: [0; READ_BUF_SIZE / 64],
             head: 0,
             tail: 0,
-            lines: 0,
+            canon_head: 0,
+            echo: [0; ECHO_BUF_SIZE],
+            echo_head: 0,
+            echo_tail: 0,
             line: [0; LINE_MAX],
             line_len: 0,
             icanon: true,
@@ -67,8 +87,37 @@ impl NTtyData {
     /// Drop all input (Linux n_tty_flush_buffer)
     pub fn reset(&mut self) {
         self.tail = self.head;
-        self.lines = 0;
+        self.canon_head = self.head;
         self.line_len = 0;
+    }
+
+    /// A complete line is queued (canonical mode)
+    fn has_line(&self) -> bool {
+        self.canon_head != self.tail
+    }
+
+    /// Publish the heads for lock-free readers (Linux's smp_store_release
+    /// of commit_head, canon_head and read_tail)
+    fn publish(&self, av: &Avail) {
+        av.icanon.store(self.icanon, Ordering::Release);
+        av.canon_head.store(self.canon_head, Ordering::Release);
+        av.head.store(self.head, Ordering::Release);
+        av.tail.store(self.tail, Ordering::Release);
+    }
+
+    /// Queue an echo byte (Linux add_echo_byte); a full ring drops its
+    /// oldest byte (Linux's echo discard)
+    fn add_echo(&mut self, c: u8) {
+        if self.echo_head.wrapping_sub(self.echo_tail) == ECHO_BUF_SIZE {
+            self.echo_tail = self.echo_tail.wrapping_add(1);
+        }
+        self.echo[self.echo_head % ECHO_BUF_SIZE] = c;
+        self.echo_head = self.echo_head.wrapping_add(1);
+    }
+
+    /// Drop queued echo (an ISIG flush; Linux isig clears echo_buf)
+    fn clear_echo(&mut self) {
+        self.echo_tail = self.echo_head;
     }
 
     fn cnt(&self) -> usize {
@@ -90,7 +139,7 @@ impl NTtyData {
         let bit = 1u64 << (i % 64);
         if eol {
             self.eol[i / 64] |= bit;
-            self.lines += 1;
+            self.canon_head = self.head.wrapping_add(1);
         } else {
             self.eol[i / 64] &= !bit;
         }
@@ -122,11 +171,11 @@ impl NTtyData {
             self.push(self.line[i], false);
         }
         self.eol = [0; READ_BUF_SIZE / 64];
-        self.lines = 0;
+        self.canon_head = self.tail;
         if now && self.cnt() > 0 {
             let i = self.head.wrapping_sub(1) % READ_BUF_SIZE;
             self.eol[i / 64] |= 1 << (i % 64);
-            self.lines = 1;
+            self.canon_head = self.head;
         }
     }
 
@@ -139,13 +188,13 @@ impl NTtyData {
         if !self.icanon {
             return self.cnt() < READ_BUF_SIZE;
         }
-        self.cnt() + self.line_len + 1 < READ_BUF_SIZE || self.lines == 0
+        self.cnt() + self.line_len + 1 < READ_BUF_SIZE || !self.has_line()
     }
 
     /// Readable input: a line in canonical mode, else `min` bytes
     fn available(&self, min: usize) -> bool {
         if self.icanon {
-            self.lines > 0
+            self.has_line()
         } else {
             self.cnt() >= min.max(1)
         }
@@ -185,7 +234,6 @@ impl NTtyData {
             // An EOF mark is consumed but not copied, even with `out` full
             if eol && c == EOF_MARK {
                 self.tail = self.tail.wrapping_add(1);
-                self.lines -= 1;
                 if canon {
                     return Some((n, canon, true));
                 }
@@ -197,59 +245,134 @@ impl NTtyData {
             out[n] = c;
             n += 1;
             self.tail = self.tail.wrapping_add(1);
-            if eol {
-                self.lines -= 1;
-                if canon {
-                    return Some((n, canon, true));
-                }
+            if eol && canon {
+                return Some((n, canon, true));
             }
         }
         Some((n, canon, false))
     }
 }
 
-/// What input processing produced, acted on once `ldata` is dropped
-#[derive(Default)]
-struct Effects {
-    echo: Vec<u8>,
-    sigs: Vec<crate::signal::Signal>,
-    /// Input became readable: SIGIO POLL_IN (Linux kill_fasync at a
-    /// canonical line end, or after non-canonical input)
-    kill: bool,
+/// Input availability for readers without `ldata` (Linux's commit_head,
+/// canon_head, read_tail and icanon, which input_available_p reads with
+/// no lock): stored under `ldata` by every holder as it lets go (`Ld`),
+/// loaded by poll (possibly under an epoll IrqSpinlock) and by a
+/// reader's wait condition (with its task state set). A hint only: what
+/// is read is copied out under `ldata`.
+pub struct Avail {
+    head: AtomicUsize,
+    canon_head: AtomicUsize,
+    tail: AtomicUsize,
+    icanon: AtomicBool,
+}
+
+impl Avail {
+    pub const fn new() -> Self {
+        Self {
+            head: AtomicUsize::new(0),
+            canon_head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            icanon: AtomicBool::new(true),
+        }
+    }
+
+    /// Readable input (Linux input_available_p): a line in canonical
+    /// mode, else `amt` bytes
+    fn ready(&self, amt: usize) -> bool {
+        let tail = self.tail.load(Ordering::Acquire);
+        if self.icanon.load(Ordering::Acquire) {
+            self.canon_head.load(Ordering::Acquire) != tail
+        } else {
+            self.head.load(Ordering::Acquire).wrapping_sub(tail) >= amt.max(1)
+        }
+    }
+}
+
+/// `Tty.ldata` held; its heads are published in `Tty.avail` as it is
+/// released, so a lock-free reader sees each change
+pub(super) struct Ld<'a> {
+    g: crate::sync::MutexGuard<'a, NTtyData>,
+    av: &'a Avail,
+}
+
+impl core::ops::Deref for Ld<'_> {
+    type Target = NTtyData;
+    fn deref(&self) -> &NTtyData {
+        &self.g
+    }
+}
+
+impl core::ops::DerefMut for Ld<'_> {
+    fn deref_mut(&mut self) -> &mut NTtyData {
+        &mut self.g
+    }
+}
+
+impl Drop for Ld<'_> {
+    fn drop(&mut self) {
+        self.g.publish(self.av);
+    }
+}
+
+/// Take `tty`'s line discipline lock (thread context; it sleeps)
+pub(super) fn ldata(tty: &Tty) -> Ld<'_> {
+    Ld {
+        g: tty.ldata.lock(),
+        av: &tty.avail,
+    }
+}
+
+/// Write the queued echo to the driver (Linux __process_echoes: the
+/// driver takes it all, its writes are synchronous)
+fn process_echoes(tty: &Tty, ld: &mut NTtyData) {
+    while ld.echo_tail != ld.echo_head {
+        let i = ld.echo_tail % ECHO_BUF_SIZE;
+        let n = ld
+            .echo_head
+            .wrapping_sub(ld.echo_tail)
+            .min(ECHO_BUF_SIZE - i);
+        let _ = tty.driver_write(&ld.echo[i..i + n]);
+        ld.echo_tail = ld.echo_tail.wrapping_add(n);
+    }
+}
+
+/// Write the queued echo once a watermark's worth is pending (Linux
+/// commit_echoes)
+fn commit_echoes(tty: &Tty, ld: &mut NTtyData) {
+    if ld.echo_head.wrapping_sub(ld.echo_tail) >= ECHO_COMMIT_WATERMARK {
+        process_echoes(tty, ld);
+    }
 }
 
 /// Input bytes from the driver, in thread context (Linux
-/// n_tty_receive_buf); wakes readers. The bytes taken: the rest wait in
-/// the flip buffer until a read makes room
+/// n_tty_receive_buf_common, under termios_rwsem); wakes readers. The
+/// bytes taken: the rest wait in the flip buffer until a read makes
+/// room
 pub fn receive_buf(tty: &Tty, bytes: &[u8]) -> usize {
-    let mut fx = Effects::default();
+    // Input became readable: SIGIO POLL_IN (Linux kill_fasync at a
+    // canonical line end, or after non-canonical input)
+    let mut kill = false;
     let mut taken = 0;
     {
         // termios under ldata: set_termios changes both under it (Linux
         // termios_rwsem), so input never sees half a change
-        let mut ld = tty.ldata.lock();
+        let mut ld = ldata(tty);
         let t = tty.get_termios();
         for &c in bytes {
             if !ld.room() {
                 break;
             }
-            receive_char(&mut ld, &t, c, &mut fx);
+            receive_char(tty, &mut ld, &t, c, &mut kill);
             taken += 1;
         }
+        // Linux flush_echoes at the end of the input
+        process_echoes(tty, &mut ld);
         // Linux n_tty_receive_buf_common: non-canonical input queued
         if t.c_lflag & ICANON == 0 && ld.cnt() > 0 {
-            fx.kill = true;
+            kill = true;
         }
     }
-    if !fx.echo.is_empty() {
-        let _ = tty.driver_write(&fx.echo);
-    }
-    if let Some(pg) = tty.pgrp() {
-        for &sig in &fx.sigs {
-            crate::signal::kill_pgrp_pid(&pg, sig);
-        }
-    }
-    if fx.kill {
+    if kill {
         tty.kill_input();
     }
     tty.read_wait.wake_poll(u32::from(
@@ -278,34 +401,45 @@ fn signal_char(c: u8, t: &Termios) -> Option<crate::signal::Signal> {
         .map(|(_, s)| s)
 }
 
-fn receive_char(ld: &mut NTtyData, t: &Termios, c: u8, fx: &mut Effects) {
+/// Signal the foreground group, then flush input and queued echo unless
+/// NOFLSH (Linux isig, __isig)
+fn isig(tty: &Tty, ld: &mut NTtyData, t: &Termios, sig: crate::signal::Signal) {
+    if let Some(pg) = tty.pgrp() {
+        crate::signal::kill_pgrp_pid(&pg, sig);
+    }
+    if t.c_lflag & NOFLSH == 0 {
+        ld.clear_echo();
+        ld.reset();
+    }
+}
+
+fn receive_char(tty: &Tty, ld: &mut NTtyData, t: &Termios, c: u8, kill: &mut bool) {
     let Some(c) = map_input(c, t) else {
         return;
     };
     if t.c_lflag & ISIG != 0
         && let Some(sig) = signal_char(c, t)
     {
-        // Linux isig: flush unless NOFLSH, echo, signal the group
-        if t.c_lflag & NOFLSH == 0 {
-            ld.reset();
-        }
+        // Linux n_tty_receive_signal_char: the signal, then its echo
+        isig(tty, ld, t, sig);
         if t.c_lflag & ECHO != 0 {
-            echo_char(c, t, &mut fx.echo);
+            echo_char(ld, c, t);
         }
-        fx.sigs.push(sig);
+        commit_echoes(tty, ld);
         return;
     }
     if t.c_lflag & ICANON != 0 {
-        let lines = ld.lines;
-        canon_char(ld, t, c, &mut fx.echo);
+        let canon_head = ld.canon_head;
+        canon_char(ld, t, c);
         // Linux n_tty_receive_handle_newline
-        fx.kill |= ld.lines != lines;
+        *kill |= ld.canon_head != canon_head;
     } else {
         ld.push(c, false);
         if t.c_lflag & ECHO != 0 {
-            echo_char(c, t, &mut fx.echo);
+            echo_char(ld, c, t);
         }
     }
+    commit_echoes(tty, ld);
 }
 
 /// A control character shows as ^X under ECHOCTL (not TAB or NL)
@@ -314,20 +448,22 @@ fn shows_caret(c: u8, t: &Termios) -> bool {
 }
 
 /// Echo `c`: a control character as ^X with ECHOCTL, a newline through
-/// OPOST/ONLCR
-fn echo_char(c: u8, t: &Termios, echo: &mut Vec<u8>) {
+/// OPOST/ONLCR (Linux echo_char)
+fn echo_char(ld: &mut NTtyData, c: u8, t: &Termios) {
     if c == b'\n' && t.c_oflag & OPOST != 0 && t.c_oflag & ONLCR != 0 {
-        echo.extend_from_slice(b"\r\n");
+        ld.add_echo(b'\r');
+        ld.add_echo(b'\n');
     } else if shows_caret(c, t) {
-        echo.extend_from_slice(&[b'^', c ^ 0x40]);
+        ld.add_echo(b'^');
+        ld.add_echo(c ^ 0x40);
     } else {
-        echo.push(c);
+        ld.add_echo(c);
     }
 }
 
 /// Erase the last character of the edited line, echoing it away (ECHOE:
 /// one column, two for a ^X)
-fn erase(ld: &mut NTtyData, t: &Termios, echo: &mut Vec<u8>) -> bool {
+fn erase(ld: &mut NTtyData, t: &Termios) -> bool {
     let Some(&c) = ld.line[..ld.line_len].last() else {
         return false;
     };
@@ -335,7 +471,9 @@ fn erase(ld: &mut NTtyData, t: &Termios, echo: &mut Vec<u8>) -> bool {
     if t.c_lflag & ECHO != 0 && t.c_lflag & ECHOE != 0 {
         let cols = if shows_caret(c, t) { 2 } else { 1 };
         for _ in 0..cols {
-            echo.extend_from_slice(b"\x08 \x08");
+            for &b in b"\x08 \x08" {
+                ld.add_echo(b);
+            }
         }
     }
     true
@@ -346,38 +484,38 @@ fn is_blank(c: u8) -> bool {
 }
 
 /// A character in canonical mode (Linux n_tty_receive_char_canon)
-fn canon_char(ld: &mut NTtyData, t: &Termios, c: u8, echo: &mut Vec<u8>) {
+fn canon_char(ld: &mut NTtyData, t: &Termios, c: u8) {
     let is = |i: usize| t.c_cc[i] != 0 && t.c_cc[i] == c;
     if is(VERASE) {
-        erase(ld, t, echo);
+        erase(ld, t);
     } else if is(VWERASE) && t.c_lflag & IEXTEN != 0 {
         // Trailing blanks, then the word
         while ld.line_len > 0 && is_blank(ld.line[ld.line_len - 1]) {
-            erase(ld, t, echo);
+            erase(ld, t);
         }
         while ld.line_len > 0 && !is_blank(ld.line[ld.line_len - 1]) {
-            erase(ld, t, echo);
+            erase(ld, t);
         }
     } else if is(VKILL) {
         if t.c_lflag & ECHO != 0 && t.c_lflag & ECHOK != 0 && t.c_lflag & ECHOKE == 0 {
-            echo_char(c, t, echo);
-            echo_char(b'\n', t, echo);
+            echo_char(ld, c, t);
+            echo_char(ld, b'\n', t);
             ld.line_len = 0;
         } else {
-            while erase(ld, t, echo) {}
+            while erase(ld, t) {}
         }
     } else if is(VEOF) {
         ld.commit_line(EOF_MARK);
     } else if c == b'\n' || is(VEOL) || is(VEOL2) {
         if t.c_lflag & (ECHO | ECHONL) != 0 {
-            echo_char(c, t, echo);
+            echo_char(ld, c, t);
         }
         ld.commit_line(c);
     } else if ld.line_len < LINE_MAX {
         ld.line[ld.line_len] = c;
         ld.line_len += 1;
         if t.c_lflag & ECHO != 0 {
-            echo_char(c, t, echo);
+            echo_char(ld, c, t);
         }
     }
 }
@@ -405,7 +543,7 @@ const KBUF: usize = 64;
 fn copy_out(tty: &Tty, to: &mut IovDest<'_>) -> Option<Got> {
     let mut kbuf = [0u8; KBUF];
     let want = to.len().min(KBUF);
-    let (k, canon, end) = tty.ldata.lock().copy(&mut kbuf[..want])?;
+    let (k, canon, end) = ldata(tty).copy(&mut kbuf[..want])?;
     let n = to.copy_to(&kbuf[..k]).unwrap_or(0);
     Some(Got {
         n,
@@ -446,7 +584,9 @@ pub fn read(tty: &Tty, file: &File, to: &mut IovDest<'_>) -> Result<usize, Kerne
     } else {
         tty.read_lock.lock_interruptible()?
     };
-    let ready = || tty.ldata.lock().available(1);
+    // Lock-free: the condition runs with the task state set (Linux
+    // n_tty_read's input_available_p)
+    let ready = || tty.avail.ready(1);
     let mut n = 0;
     loop {
         if let Some(g) = copy_out(tty, to) {
@@ -498,16 +638,16 @@ pub fn read(tty: &Tty, file: &File, to: &mut IovDest<'_>) -> Result<usize, Kerne
 }
 
 /// Input a poll reports (Linux input_available_p for poll): a line, or
-/// VMIN bytes when VTIME is 0
+/// VMIN bytes when VTIME is 0; takes no sleeping lock (a poll may run
+/// under a spin lock)
 pub fn poll_in(tty: &Tty) -> bool {
-    let ld = tty.ldata.lock();
     let t = tty.get_termios();
     let min = if t.c_cc[VTIME] == 0 {
         usize::from(t.c_cc[VMIN])
     } else {
         1
     };
-    ld.available(min)
+    tty.avail.ready(min)
 }
 
 /// Write (Linux iterate_tty_write + n_tty_write), under the tty's

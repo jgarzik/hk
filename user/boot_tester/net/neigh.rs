@@ -1,7 +1,8 @@
 //! Neighbour (ARP) table over eth0 and QEMU slirp (hk and Linux):
 //! resolution of the gateway (/proc/net/arp, RTM_GETNEIGH), failure of
 //! an unused address after three probes, administrative entries
-//! (RTM_NEWNEIGH / RTM_DELNEIGH errors and PERMANENT state).
+//! (RTM_NEWNEIGH / RTM_DELNEIGH errors and PERMANENT state), and a
+//! table of hundreds: a multipart dump and /proc/net/arp past a page.
 
 use crate::harness::T;
 use crate::helpers::skip;
@@ -42,6 +43,7 @@ pub fn run_tests() {
     test_gateway(idx);
     test_failed(idx);
     test_admin(idx);
+    test_many(idx);
 }
 
 /// struct ndmsg
@@ -223,5 +225,92 @@ fn test_admin(idx: u32) {
     t.eq(b"del", del(&mut nl), 0);
     t.eq(b"del again", del(&mut nl), ENOENT);
     t.ok(b"gone", neigh_state(&mut nl, idx, ip).is_none(), 0);
+    t.done();
+}
+
+/// Entries of `test_many`: more than the first hash's buckets (the
+/// table grows) and than one dump part or /proc page holds
+const MANY: u32 = 300;
+
+/// The `i`th address of `test_many`: 10.123.x.y, off every subnet used
+fn many_ip(i: u32) -> [u8; 4] {
+    [10, 123, (i / 250) as u8, (i % 250 + 1) as u8]
+}
+
+const ARP_LEN: usize = 65536;
+static mut ARP: [u8; ARP_LEN] = [0; ARP_LEN];
+
+/// /proc/net/arp's length and how many PERMANENT 10.123. lines it has
+fn proc_many() -> (i64, u32) {
+    // SAFETY: single-threaded test program; no other user of the buffer
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(ARP) };
+    let n = read_file(b"/proc/net/arp\0", buf);
+    if n <= 0 {
+        return (n, 0);
+    }
+    let lines = buf[..n as usize]
+        .split(|&c| c == b'\n')
+        .filter(|l| l.starts_with(b"10.123.") && contains(l, b"0x6 "))
+        .count();
+    (n, lines as u32)
+}
+
+/// How many PERMANENT 10.123. entries on `ifindex` a dump reports, and
+/// the dump's result (message count or -errno)
+fn dump_many(nl: &mut Nl, ifindex: u32) -> (u32, i32) {
+    let mut seen = 0;
+    let mut r = Req::new(RTM_GETNEIGH, 0, &ndmsg(AF_INET, 0, 0));
+    let rc = nl.dump(&mut r, &mut |m: &Msg| {
+        if m.ty != RTM_NEWNEIGH || m.body.len() < 12 || m.u32_at(4) != ifindex {
+            return;
+        }
+        let st = u16::from_ne_bytes([m.body[8], m.body[9]]);
+        if st == NUD_PERMANENT && m.attr_ip(12, NDA_DST).is_some_and(|a| a[..2] == [10, 123]) {
+            seen += 1;
+        }
+    });
+    (seen, rc)
+}
+
+/// Hundreds of PERMANENT entries: all in a multipart dump and in
+/// /proc/net/arp (more than a page), then all deleted
+fn test_many(idx: u32) {
+    let mut t = T::new(b"NEIGH_MANY");
+    let Some(mut nl) = Nl::open() else {
+        t.ok(b"netlink", false, 0);
+        return t.done();
+    };
+    let mut bad = 0;
+    for i in 0..MANY {
+        let mac = [0x02, 0, 0, 0x7b, (i >> 8) as u8, i as u8];
+        let mut r = Req::new(
+            RTM_NEWNEIGH,
+            NLM_F_CREATE | NLM_F_EXCL,
+            &ndmsg(AF_INET, idx, NUD_PERMANENT),
+        );
+        r.attr(NDA_DST, &many_ip(i));
+        r.attr(NDA_LLADDR, &mac);
+        if nl.ack(&mut r) != 0 {
+            bad += 1;
+        }
+    }
+    t.eq(b"added", bad, 0);
+    let (seen, rc) = dump_many(&mut nl, idx);
+    t.eq(b"dumped", seen as i64, MANY as i64);
+    t.ok(b"dump done", rc >= MANY as i32, rc as i64);
+    let (len, lines) = proc_many();
+    t.ok(b"proc > page", len > 4096, len);
+    t.eq(b"proc lines", lines as i64, MANY as i64);
+    let mut bad = 0;
+    for i in 0..MANY {
+        let mut r = Req::new(RTM_DELNEIGH, 0, &ndmsg(AF_INET, idx, 0));
+        r.attr(NDA_DST, &many_ip(i));
+        if nl.ack(&mut r) != 0 {
+            bad += 1;
+        }
+    }
+    t.eq(b"deleted", bad, 0);
+    t.eq(b"gone", dump_many(&mut nl, idx).0 as i64, 0);
+    t.eq(b"proc gone", proc_many().1 as i64, 0);
     t.done();
 }

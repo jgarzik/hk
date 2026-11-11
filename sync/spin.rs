@@ -64,6 +64,31 @@ fn leave(id: usize) {
     preempt_enable();
 }
 
+/// The lockdep class of a spin lock built outside this module (a bit
+/// lock: `util::hlist_bl`, Linux bit_spin_lock)
+pub struct RawClass(Class);
+
+impl RawClass {
+    #[track_caller]
+    pub const fn new() -> Self {
+        Self(class())
+    }
+}
+
+/// Before taking such a lock, `id` its address: preemption off, then
+/// lockdep, as for [`Mutex::lock`]
+#[inline]
+#[track_caller]
+pub fn raw_enter(id: usize, c: &RawClass) {
+    enter(id, c.0, true);
+}
+
+/// After releasing it
+#[inline]
+pub fn raw_leave(id: usize) {
+    leave(id);
+}
+
 fn addr<T: ?Sized>(p: &T) -> usize {
     core::ptr::from_ref::<T>(p).cast::<u8>() as usize
 }

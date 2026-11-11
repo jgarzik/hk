@@ -398,7 +398,11 @@ fn bpf_map_lookup_elem(attr_buf: &[u8]) -> KernelResult<()> {
     let attr = MapElemAttr::read_from(attr_buf).ok_or(KernelError::InvalidArgument)?;
     let map = get_bpf_map_from_fd(attr.map_fd as i32)?;
     let key = user_bytes(attr.key, map.key_size() as usize)?;
-    let value = map.lookup(&key).ok_or(KernelError::NotFound)?;
+    // Allocated before the map is locked (Linux bpf_map_copy_value)
+    let mut value = crate::util::kmem::try_vec(map.value_size() as usize, 0u8)?;
+    if !map.lookup(&key, &mut value) {
+        return Err(KernelError::NotFound);
+    }
     copy_to_user(attr.value, &value)?;
     Ok(())
 }
@@ -442,9 +446,10 @@ fn bpf_map_get_next_key(attr_buf: &[u8]) -> KernelResult<()> {
     } else {
         Some(user_bytes(attr.key, map.key_size() as usize)?)
     };
-    let next_key = map
-        .get_next_key(current_key.as_deref())
-        .ok_or(KernelError::NotFound)?;
+    let mut next_key = crate::util::kmem::try_vec(map.key_size() as usize, 0u8)?;
+    if !map.get_next_key(current_key.as_deref(), &mut next_key) {
+        return Err(KernelError::NotFound);
+    }
     copy_to_user(attr.value, &next_key)?;
     Ok(())
 }

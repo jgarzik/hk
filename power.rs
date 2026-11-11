@@ -80,6 +80,13 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> KernelResult
     // (Linux machine_shutdown -> stop_other_cpus), so nothing goes on
     // running against quiesced hardware
     if matches!(cmd, cmd::POWER_OFF | cmd::RESTART | cmd::HALT) {
+        // Linux kernel_shutdown_prepare / kernel_restart_prepare
+        use crate::system_state::{SystemState, set_system_state};
+        set_system_state(match cmd {
+            cmd::POWER_OFF => SystemState::PowerOff,
+            cmd::RESTART => SystemState::Restart,
+            _ => SystemState::Halt,
+        });
         crate::base::device_shutdown();
         crate::smp::stop_other_cpus();
     }

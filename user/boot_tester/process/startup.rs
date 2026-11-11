@@ -23,6 +23,7 @@ pub fn run_tests() {
     test_tls_switch();
     test_newfstatat();
     test_itimer_real();
+    test_itimer_fork();
     #[cfg(target_arch = "x86_64")]
     test_alarm();
 }
@@ -235,6 +236,45 @@ fn test_itimer_real() {
     block_alrm(SIG_UNBLOCK);
     let ok = r == 0 && left > 0 && left <= 200_000 && fired && idle && bad == -22;
     verdict(b"ITIMER_REAL", ok, left);
+}
+
+/// A fork child starts with all three itimers disarmed while its
+/// parent's run (Linux copy_signal: signal->real_timer and it[] are
+/// not inherited)
+fn test_itimer_fork() {
+    let tv = |s| Timeval {
+        tv_sec: s,
+        tv_usec: 0,
+    };
+    let it = ITimerVal {
+        it_interval: tv(0),
+        it_value: tv(100),
+    };
+    let mut armed = 0;
+    for which in [ITIMER_REAL, 1, 2] {
+        armed |= sys_setitimer(which, &it, core::ptr::null_mut());
+    }
+    let st = in_child(|| {
+        let mut bad = 0;
+        for which in [ITIMER_REAL, 1, 2] {
+            let mut cur = ITimerVal::default();
+            let r = sys_getitimer(which, &mut cur);
+            let v = cur.it_value;
+            if r != 0 || v.tv_sec != 0 || v.tv_usec != 0 || cur.it_interval.tv_sec != 0 {
+                bad |= 1 << which;
+            }
+        }
+        sys_exit(bad);
+    });
+    // The parent's are still armed, then disarmed
+    let mut left = ITimerVal::default();
+    sys_getitimer(ITIMER_REAL, &mut left);
+    let off = ITimerVal::default();
+    for which in [ITIMER_REAL, 1, 2] {
+        sys_setitimer(which, &off, core::ptr::null_mut());
+    }
+    let ok = armed == 0 && st == 0 && left.it_value.tv_sec > 0;
+    verdict(b"ITIMER_FORK", ok, (st >> 8) as i64);
 }
 
 /// alarm returns the seconds left on the previous alarm and fires

@@ -7,56 +7,72 @@
 //!
 //! ## Locking
 //!
-//! `Files` wraps the table's `crate::sync::spin::Mutex` (Linux files->file_lock).
-//! Releasing a file can sleep (TCP SO_LINGER, socket release paths), so
-//! no file is ever dropped under that lock: the table parks the files
-//! it detaches (close, dup2 over an open descriptor, a refused install)
-//! and `FilesGuard` drops them after unlocking (Linux
-//! file_close_fd_locked, then filp_close/fput after spin_unlock).
-//! Likewise a task's last reference to its table is dropped after its
-//! alloc_lock is released, never under it.
+//! `Files` wraps the table's `crate::sync::spin::Mutex` (Linux
+//! files->file_lock), a leaf: nothing is allocated, flushed or closed
+//! under it. A table too small for a new descriptor is replaced by a
+//! bigger one allocated with the lock dropped (Linux expand_files,
+//! alloc_fdtable); fork's copy is allocated first and made again if
+//! the table grew meanwhile (dup_fd). A new descriptor is reserved
+//! under the lock and its file installed later (get_unused_fd_flags,
+//! fd_install). Closing detaches the file under the lock and flushes
+//! it (the closer's POSIX locks go) after the unlock (Linux
+//! file_close_fd_locked, then filp_close after spin_unlock);
+//! close_range, exec's close-on-exec and the last reference's close
+//! take one descriptor per lock hold. A task's last reference to its
+//! table is dropped after its alloc_lock is released, never under it.
 
 use crate::sync::spin::{Mutex, MutexGuard};
+use crate::sync::waitqueue::WaitQueue;
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
-use core::mem::ManuallyDrop;
-use core::ops::{Deref, DerefMut};
 
+use super::fdbits::{Fdt, NR_OPEN_DEFAULT, Slot};
 use super::percpu::current;
-use super::{FdTable, Task};
-use crate::fs::File;
-use crate::util::error::KernelError;
+use super::{Fd, FdTable, Task};
+use crate::fs::FileRef;
+use crate::util::error::{KernelError, KernelResult};
 
 /// A descriptor table (Linux files_struct)
 pub struct Files {
-    table: Mutex<FdTable<File>>,
+    table: Mutex<FdTable<FileRef>>,
     /// Its identity as a POSIX lock owner (Linux fl_owner): unique, never
     /// reused, kept across an exec that did not have to copy the table
     id: u64,
     /// Tasks using it (Linux files_struct.count): other `Arc` holders
     /// (a /proc reader, kcmp) do not make it shared
     users: core::sync::atomic::AtomicUsize,
+    /// Tasks waiting for another's table growth (Linux
+    /// files_struct.resize_wait)
+    resize_wait: WaitQueue,
 }
 
-/// The locked table; files it detached are released after the unlock
-pub struct FilesGuard<'a>(ManuallyDrop<MutexGuard<'a, FdTable<File>>>, u64);
+/// The locked table (Linux spin_lock(&files->file_lock))
+pub type FilesGuard<'a> = MutexGuard<'a, FdTable<FileRef>>;
 
 /// Source of `Files::id`
 static NEXT_FILES_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
-impl Files {
-    pub fn new(t: FdTable<File>) -> Self {
-        let id = NEXT_FILES_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        Self::with_id(t, id)
-    }
+/// Close a detached descriptor's file (Linux filp_close): it is flushed
+/// and `owner`'s POSIX locks on it go; then the reference is put
+fn filp_close(f: FileRef, owner: u64) {
+    crate::fs::file::filp_flush(&f, owner);
+    drop(f);
+}
 
-    /// A table keeping lock-owner identity `id`
-    fn with_id(t: FdTable<File>, id: u64) -> Self {
+impl Files {
+    fn new(t: FdTable<FileRef>) -> Self {
         Self {
             table: Mutex::new(t),
-            id,
+            id: NEXT_FILES_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             users: core::sync::atomic::AtomicUsize::new(0),
+            resize_wait: WaitQueue::new(),
         }
+    }
+
+    /// An empty table (Linux files_struct's embedded NR_OPEN_DEFAULT
+    /// slots); ENOMEM
+    fn empty() -> KernelResult<Self> {
+        Ok(Self::new(FdTable::new(Fdt::alloc(NR_OPEN_DEFAULT)?)))
     }
 
     /// More than one task uses it
@@ -69,9 +85,157 @@ impl Files {
         self.id
     }
 
-    /// Lock the table (Linux spin_lock(&files->file_lock))
+    /// Lock the table (Linux spin_lock(&files->file_lock)): for lookups
+    /// and descriptor flags; descriptors come and go through the
+    /// methods below
     pub fn lock(&self) -> FilesGuard<'_> {
-        FilesGuard(ManuallyDrop::new(self.table.lock()), self.id)
+        self.table.lock()
+    }
+
+    /// Make room for descriptor `nr` (Linux expand_files): one task at
+    /// a time grows the table (resize_in_progress; the others sleep on
+    /// `resize_wait` until it is done, then look again), allocating the
+    /// bigger one with the lock dropped (expand_fdtable). EMFILE at or
+    /// past fs.nr_open, ENOMEM.
+    fn expand_files<'a>(
+        &'a self,
+        mut t: FilesGuard<'a>,
+        nr: usize,
+    ) -> (FilesGuard<'a>, KernelResult<()>) {
+        loop {
+            if nr < t.max_fds() {
+                return (t, Ok(()));
+            }
+            if t.resize_in_progress {
+                drop(t);
+                self.resize_wait
+                    .wait_event(|| !self.lock().resize_in_progress);
+                t = self.lock();
+                continue;
+            }
+            if let Err(e) = t.need_expand(nr) {
+                return (t, Err(e));
+            }
+            t.resize_in_progress = true;
+            drop(t);
+            let r = self.expand_fdtable(nr);
+            self.resize_wait.wake_all();
+            t = self.lock();
+            if let Err(e) = r {
+                return (t, Err(e));
+            }
+        }
+    }
+
+    /// Replace the table, under resize_in_progress, by one that holds
+    /// `nr` (Linux expand_fdtable): allocated and the old one freed with
+    /// the lock dropped; ENOMEM, EMFILE (fs.nr_open lowered meanwhile)
+    fn expand_fdtable(&self, nr: usize) -> KernelResult<()> {
+        let new = Fdt::alloc(nr + 1);
+        let mut t = self.lock();
+        t.resize_in_progress = false;
+        let old = t.expand(new?);
+        drop(t);
+        drop(old);
+        Ok(())
+    }
+
+    /// Reserve the lowest free descriptor at or above `start` and below
+    /// `end` (RLIMIT_NOFILE), FD_CLOEXEC from `flags` (Linux alloc_fd):
+    /// EMFILE, ENOMEM
+    fn alloc_fd(&self, start: usize, flags: u32, end: u64) -> KernelResult<Fd> {
+        let mut t = self.lock();
+        loop {
+            match t.alloc_fd(start, flags, end)? {
+                Slot::Fd(fd) => return Ok(fd),
+                Slot::Expand(nr) => {
+                    let (g, r) = self.expand_files(t, nr);
+                    t = g;
+                    r?;
+                }
+            }
+        }
+    }
+
+    /// Detach descriptor `fd` for the caller to close after the unlock
+    /// (Linux file_close_fd); None (EBADF) if no file is installed there
+    pub fn close_fd(&self, fd: Fd) -> Option<FileRef> {
+        self.lock().close_fd(fd)
+    }
+
+    /// Make `newfd` a copy of `oldfd` with FD_CLOEXEC from `flags`
+    /// (Linux ksys_dup3 under file_lock, do_dup2): room for `newfd`
+    /// first, then EBADF for no `oldfd` (and for `newfd` past fs.nr_open),
+    /// EBUSY for a `newfd` reserved but not installed yet; the file
+    /// `newfd` had is closed after the unlock
+    pub fn dup3(&self, oldfd: Fd, newfd: usize, flags: u32) -> KernelResult<()> {
+        let (mut t, room) = self.expand_files(self.lock(), newfd);
+        let file = t.get(oldfd).ok_or(KernelError::BadFd)?;
+        room.map_err(|e| match e {
+            KernelError::ProcessFileLimit => KernelError::BadFd,
+            e => e,
+        })?;
+        let tofree = t.dup2(newfd, file, flags)?;
+        drop(t);
+        if let Some(f) = tofree {
+            filp_close(f, self.id);
+        }
+        Ok(())
+    }
+
+    /// Close the descriptors in `lo..=hi` (Linux __range_close): one per
+    /// lock hold, each closed after the unlock
+    pub fn range_close(&self, lo: usize, hi: usize) {
+        let mut fd = lo;
+        loop {
+            let next = self.lock().close_next(fd, hi);
+            let Some((n, f)) = next else {
+                return;
+            };
+            filp_close(f, self.id);
+            fd = n + 1;
+        }
+    }
+
+    /// Mark `lo..=hi` close-on-exec (Linux __range_cloexec)
+    pub fn range_cloexec(&self, lo: usize, hi: usize) {
+        self.lock().range_cloexec(lo, hi);
+    }
+
+    /// Close the close-on-exec descriptors (Linux do_close_on_exec): one
+    /// per lock hold, each closed after the unlock
+    fn close_on_exec(&self) {
+        let mut fd = 0;
+        loop {
+            let next = self.lock().take_cloexec(fd);
+            let Some((n, f)) = next else {
+                return;
+            };
+            if let Some(f) = f {
+                filp_close(f, self.id);
+            }
+            fd = n + 1;
+        }
+    }
+
+    /// A copy, with a new lock-owner identity (Linux dup_fd): its table
+    /// is allocated before the lock is taken, and again with the lock
+    /// dropped while the open descriptors outgrow it; ENOMEM, EMFILE
+    fn dup_fd(&self) -> KernelResult<Files> {
+        let mut fdt = Fdt::alloc(NR_OPEN_DEFAULT)?;
+        let mut t = self.lock();
+        loop {
+            let n = t.sane_size();
+            if n <= fdt.max_fds() {
+                break;
+            }
+            drop(t);
+            fdt = Fdt::alloc(n)?;
+            t = self.lock();
+        }
+        let new = t.dup_into(fdt);
+        drop(t);
+        Ok(Files::new(new))
     }
 }
 
@@ -80,42 +244,56 @@ impl Files {
 /// locks owned by this table go
 impl Drop for Files {
     fn drop(&mut self) {
+        let id = self.id;
         let t = self.table.get_mut();
-        let open: alloc::vec::Vec<_> = t.fds().filter_map(|&fd| t.get(fd)).collect();
-        for f in &open {
-            crate::fs::file::filp_flush(f, self.id);
+        let mut fd = 0;
+        while let Some((n, f)) = t.close_next(fd, usize::MAX) {
+            filp_close(f, id);
+            fd = n + 1;
         }
     }
 }
 
-impl Deref for FilesGuard<'_> {
-    type Target = FdTable<File>;
-    fn deref(&self) -> &FdTable<File> {
-        &self.0
+/// A descriptor reserved in a table (Linux get_unused_fd_flags):
+/// `install` puts its file there (fd_install); dropped unused, it is
+/// released (put_unused_fd)
+#[must_use]
+pub struct UnusedFd {
+    files: Option<Arc<Files>>,
+    fd: Fd,
+}
+
+impl UnusedFd {
+    /// Reserve the lowest free descriptor of `files` at or above
+    /// `start`, below `end` (RLIMIT_NOFILE), FD_CLOEXEC from `flags`:
+    /// EMFILE, ENOMEM
+    pub fn alloc(files: Arc<Files>, start: usize, flags: u32, end: u64) -> KernelResult<Self> {
+        let fd = files.alloc_fd(start, flags, end)?;
+        Ok(Self {
+            files: Some(files),
+            fd,
+        })
+    }
+
+    /// Its number
+    pub fn fd(&self) -> Fd {
+        self.fd
+    }
+
+    /// Put `file` in it (Linux fd_install); its number
+    pub fn install(mut self, file: FileRef) -> Fd {
+        if let Some(files) = self.files.take() {
+            files.lock().install(self.fd, file);
+        }
+        self.fd
     }
 }
 
-impl DerefMut for FilesGuard<'_> {
-    fn deref_mut(&mut self) -> &mut FdTable<File> {
-        &mut self.0
-    }
-}
-
-impl Drop for FilesGuard<'_> {
+impl Drop for UnusedFd {
     fn drop(&mut self) {
-        let dead = self.0.take_dead();
-        let closed = self.0.take_closed();
-        // SAFETY: dropped exactly once, here
-        unsafe { ManuallyDrop::drop(&mut self.0) };
-        // A descriptor closed (close, dup2 over it, close_range): the
-        // caller's POSIX locks on its inode go and the file's flush runs
-        // (Linux filp_flush), however many other descriptors it has.
-        // Files refused an install (`dead`) were never the caller's.
-        for f in &closed {
-            crate::fs::file::filp_flush(f, self.1);
+        if let Some(files) = self.files.take() {
+            files.lock().put_unused(self.fd);
         }
-        drop(closed);
-        drop(dead);
     }
 }
 
@@ -149,50 +327,28 @@ pub fn exit_task_fd(t: &Task) {
     drop(files);
 }
 
-/// At exec's point of no return: give the calling task a private table
-/// without its close-on-exec descriptors (Linux unshare_files, then
-/// do_close_on_exec). A table shared through CLONE_FILES stays intact
-/// for the other tasks; the closed files are released after every lock
-/// is dropped.
-pub fn exec_task_fd() {
+/// At exec, past its point of no return: give the calling task a
+/// private table (Linux unshare_files: a copy if shared through
+/// CLONE_FILES, which stays intact for the other tasks) and close its
+/// close-on-exec descriptors (do_close_on_exec), the files closed for
+/// the private table's lock owner. ENOMEM, EMFILE (the copy).
+pub fn exec_task_fd() -> KernelResult<()> {
     let me = current();
     let Some(old) = me.files() else {
-        return;
+        return Ok(());
     };
     // Not shared: the table itself loses its close-on-exec descriptors,
-    // staying the same lock owner (Linux keeps an unshared files_struct);
-    // the guard's drop flushes them (do_close_on_exec -> filp_close)
-    if !old.shared() {
-        let mut t = old.lock();
-        let cloexec: alloc::vec::Vec<_> = t
-            .fds()
-            .filter(|&&fd| t.get_fd_flags(fd) & super::FD_CLOEXEC != 0)
-            .copied()
-            .collect();
-        for fd in cloexec {
-            t.close(fd);
-        }
-        return;
-    }
-    let (new, cloexec) = {
-        let t = old.lock();
-        let cloexec: alloc::vec::Vec<_> = t
-            .fds()
-            .filter(|&&fd| t.get_fd_flags(fd) & super::FD_CLOEXEC != 0)
-            .filter_map(|&fd| t.get(fd))
-            .collect();
-        // Past exec's point of no return: failure cannot be reported
-        (arc_nofail(Files::new(t.exec_copy())), cloexec)
+    // staying the same lock owner (Linux keeps an unshared files_struct)
+    let files = if old.shared() {
+        let new = try_arc(old.dup_fd()?)?;
+        init_task_fd(&me, new.clone());
+        drop(old);
+        new
+    } else {
+        old
     };
-    init_task_fd(&me, new);
-    // Linux do_close_on_exec closes them (filp_close): their POSIX locks
-    // go and they are flushed; every other lock stays across the exec
-    let owner = me.files().map_or(0, |f| f.id());
-    for f in &cloexec {
-        crate::fs::file::filp_flush(f, owner);
-    }
-    drop(cloexec);
-    drop(old);
+    files.close_on_exec();
+    Ok(())
 }
 
 /// Give the calling task a private copy of its table (Linux
@@ -207,7 +363,7 @@ pub fn unshare_task_fd() -> Result<Arc<Files>, KernelError> {
     if !old.shared() {
         return Ok(old);
     }
-    let new = try_arc(Files::new(old.lock().deep_clone()))?;
+    let new = try_arc(old.dup_fd()?)?;
     init_task_fd(&me, new.clone());
     drop(old);
     Ok(new)
@@ -215,17 +371,17 @@ pub fn unshare_task_fd() -> Result<Arc<Files>, KernelError> {
 
 /// The table for a new task, built before it exists (Linux copy_files,
 /// reading current->files lock-free; installed with `init_task_fd`):
-/// the caller's with CLONE_FILES (`share`), else a copy; ENOMEM
+/// the caller's with CLONE_FILES (`share`), else a copy; ENOMEM, EMFILE
 pub fn fork_task_fd(share: bool) -> Result<Arc<Files>, KernelError> {
     match crate::task::percpu::current().files() {
         Some(p) if share => Ok(p),
-        Some(p) => try_arc(Files::new(p.lock().deep_clone())),
-        None => try_arc(Files::new(FdTable::new())),
+        Some(p) => try_arc(p.dup_fd()?),
+        None => try_arc(Files::empty()?),
     }
 }
 
 /// A new empty table for the boot-time init task (init opens its
 /// console descriptors itself; failure cannot be reported)
 pub fn create_empty_fd_table() -> Arc<Files> {
-    arc_nofail(Files::new(FdTable::new()))
+    arc_nofail(Files::empty().expect("no memory for init's descriptor table"))
 }

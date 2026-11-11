@@ -118,27 +118,25 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
     };
     let me = table.view(&cur).ok_or(KernelError::NoProcess)?;
     let (pid, mine, nnp) = (me.task.pid, me.seccomp_filter().cloned(), me.no_new_privs());
-    let mut targets = alloc::vec![tid];
+    // The other threads TSYNC covers: exiting and zombie ones are
+    // skipped (Linux: PF_EXITING)
+    let other =
+        |t: &crate::task::percpu::TaskView<'_>| t.task.tid() != tid && crate::signal::task_live(t);
     if tsync {
         // Linux seccomp_can_sync_threads: every other thread's filter is
         // ours or one ours stacks on; else that thread's tid
-        // Exiting and zombie threads are skipped (Linux: PF_EXITING)
-        for t in table
-            .threads(pid)
-            .filter(|t| t.task.tid() != tid && crate::signal::task_live(t))
-        {
+        for t in table.threads(pid).filter(other) {
             let mode = t.task.seccomp_mode();
             let ok = (mode == SECCOMP_MODE_DISABLED || mode == SECCOMP_MODE_FILTER)
                 && SeccompFilter::is_ancestor_of(t.seccomp_filter(), mine.as_ref());
             if !ok {
                 return Ok(t.task.tid() as i64);
             }
-            targets.push(t.task.tid());
         }
     }
-    for t in targets {
+    let install = |table: &mut crate::task::percpu::GlobalTaskTable, t: crate::task::Tid| {
         let Some(mut task) = table.get_mut(t) else {
-            continue;
+            return;
         };
         // Filter first: syscall entry reads the mode lock-free, then
         // the filter under TASKLIST
@@ -149,6 +147,19 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
         task.task
             .seccomp_mode
             .store(SECCOMP_MODE_FILTER, core::sync::atomic::Ordering::Release);
+    };
+    install(&mut table, tid);
+    if tsync {
+        // The threads checked above, walked on the group's list in place
+        // (Linux seccomp_sync_threads' for_each_thread under siglock:
+        // nothing is allocated)
+        let mut cur = table.first_thread(pid);
+        while let Some(t) = cur {
+            if table.get(t.tid()).is_some_and(|v| other(&v)) {
+                install(&mut table, t.tid());
+            }
+            cur = table.next_thread(pid, &t);
+        }
     }
     Ok(0)
 }

@@ -17,7 +17,6 @@
 //! updated after the cache lock is dropped, never under it.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::swap_entry::SwapEntry;
@@ -56,12 +55,12 @@ pub fn add(e: SwapEntry, phys: u64) -> bool {
     }
     pg.private.store(e.raw(), Ordering::Relaxed);
     pg.set_flag(PG_SWAPCACHE);
-    let stored = si
-        .cache
-        .lock()
-        .store(e.offset(), phys, &mut crate::mm::xarray::node_alloc);
-    debug_assert!(stored.is_none_or(|old| old == 0));
-    if stored.is_none() {
+    // No index node allocated under the IRQ-safe lock (Linux
+    // add_to_swap_cache: xas_nomem with the lock dropped)
+    let stored =
+        crate::mm::xarray::store_nomem(|| si.cache.lock(), e.offset(), phys, |_| Ok(()), ());
+    debug_assert!(stored.is_err() || stored == Ok(0));
+    if stored.is_err() {
         unhash(pg);
         FRAME_ALLOCATOR.decref(phys);
         return false;
@@ -234,11 +233,7 @@ fn read_new(e: SwapEntry) -> Result<u64, VmFault> {
 /// page cannot be read, EINTR on SIGKILL.
 pub fn try_to_unuse(si: &Arc<SwapInfo>) -> Result<(), KernelError> {
     for _ in 0..16 {
-        for mm in all_mms() {
-            if let Some(mm) = crate::mm::mmget_not_zero(&mm) {
-                unuse_mm(&mm, si.swap_type)?;
-            }
-        }
+        unuse_mms(si.swap_type)?;
         drop_cache(si);
         if si.inuse.load(Ordering::Acquire) == 0 {
             return Ok(());
@@ -250,21 +245,31 @@ pub fn try_to_unuse(si: &Arc<SwapInfo>) -> Result<(), KernelError> {
     Err(KernelError::OutOfMemory)
 }
 
-/// Every live address space (mm_count references)
-fn all_mms() -> Vec<Arc<crate::mm::Mm>> {
-    let mut v: Vec<Arc<crate::mm::Mm>> = Vec::new();
-    {
-        let table = crate::task::percpu::TASKLIST.read();
-        for t in table.iter() {
-            let a = t.task.task_lock();
-            if let Some(mm) = a.mm()
-                && !v.iter().any(|m| Arc::ptr_eq(m, mm.arc()))
-            {
-                v.push(mm.arc().clone());
-            }
-        }
+/// Fault in the swap PTEs of type `ty` in every address space that may
+/// have some (Linux try_to_unuse's walk of init_mm.mmlist): each one
+/// still in use is taken as a user under the list's lock, which is
+/// dropped for the faults; a user keeps it listed, so the walk goes on
+/// from it. The previous one's user goes with the lock released (its
+/// last drop takes the lock to unlink it).
+fn unuse_mms(ty: u8) -> Result<(), KernelError> {
+    let mut l = crate::mm::mmlist().lock();
+    let mut cur = l.front();
+    let mut prev = None;
+    while let Some(mm) = cur {
+        let Some(user) = crate::mm::mmget_not_zero(&mm) else {
+            cur = l.next(&mm);
+            continue;
+        };
+        drop(l);
+        drop(prev.take());
+        unuse_mm(&user, ty)?;
+        prev = Some(user);
+        l = crate::mm::mmlist().lock();
+        cur = l.next(&mm);
     }
-    v
+    drop(l);
+    drop(prev);
+    Ok(())
 }
 
 /// Fault in the swap PTEs of type `ty` in `mm`
@@ -289,11 +294,17 @@ fn unuse_mm(mm: &crate::mm::Mm, ty: u8) -> Result<(), KernelError> {
 
 /// Drop the cache pages of `si` no swap PTE needs (swapoff)
 fn drop_cache(si: &SwapInfo) {
-    let mut pages = Vec::new();
-    si.cache
-        .lock()
-        .for_each(0, si.max.saturating_sub(1), &mut |off, _| pages.push(off));
-    for off in pages {
+    // One slot per lock hold, from the last one found (Linux
+    // try_to_unuse walks the slots; nothing collected under the lock)
+    let last = si.max.saturating_sub(1);
+    let mut from = 0;
+    loop {
+        // The guard ends with this statement: the body takes the lock
+        let found = si.cache.lock().find(from, last, None);
+        let Some((off, _)) = found else {
+            break;
+        };
+        from = off + 1;
         let e = SwapEntry::new(si.swap_type, off);
         if let Some(phys) = lookup(e) {
             lock_page(phys);

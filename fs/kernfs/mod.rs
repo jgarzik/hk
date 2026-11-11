@@ -25,9 +25,12 @@
 //! - `KERNFS_RWSEM` (sleeping `RwSem`, Linux kernfs_rwsem): held for
 //!   write while adding, removing or renaming nodes, for read while
 //!   building a symlink target path. Never held across show/store.
-//! - `KNode.children`, `KNode.name`, `KNode.parent` (spin `RwLock`,
-//!   leaves): taken alone, for lookups and listings, or under the rwsem
-//!   for changes.
+//! - `KNode.children` (sleeping `RwSem`; Linux keeps the children's
+//!   rbtree under kernfs_rwsem): taken alone for lookups and listings,
+//!   or under `KERNFS_RWSEM` for changes; thread context only.
+//! - `KNode.parent` (spin `RwLock`, leaf): set when linked, cleared when
+//!   unlinked. `KNode.name` never changes (no rename), so it has no
+//!   lock.
 //! - `AttrNode.ops` (spin `RwLock`, leaf): read to clone the operations
 //!   under an active reference; cleared once, after the drain.
 //! - `KNode.active`: incremented lock-free by `get_active` (CAS, refused
@@ -157,7 +160,7 @@ impl BinNode {
 type Key = (u32, u64, Vec<u8>);
 
 /// A directory's entries by key
-pub type Children = RwLock<BTreeMap<Key, Arc<KNode>>>;
+pub type Children = RwSem<BTreeMap<Key, Arc<KNode>>>;
 
 pub enum Kind {
     Dir(Children),
@@ -182,7 +185,8 @@ pub struct Iattr {
 
 /// A kernfs node (Linux struct kernfs_node)
 pub struct KNode {
-    name: RwLock<Vec<u8>>,
+    /// Fixed at creation (Linux changes kn->name only on rename)
+    name: Vec<u8>,
     parent: RwLock<Weak<KNode>>,
     /// Permission bits
     pub mode: u16,
@@ -237,7 +241,7 @@ impl KNode {
 
     fn new_ns(name: &[u8], mode: u16, kind: Kind, ns: u64) -> Self {
         Self {
-            name: RwLock::new(name.to_vec()),
+            name: name.to_vec(),
             parent: RwLock::new(Weak::new()),
             mode,
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
@@ -254,12 +258,17 @@ impl KNode {
         arc_nofail(Self::new(
             b"",
             0o755,
-            Kind::Dir(RwLock::new(BTreeMap::new())),
+            Kind::Dir(RwSem::new(BTreeMap::new())),
         ))
     }
 
     pub fn name(&self) -> Vec<u8> {
-        self.name.read().clone()
+        self.name.clone()
+    }
+
+    /// The name, borrowed (fixed at creation)
+    pub fn name_bytes(&self) -> &[u8] {
+        &self.name
     }
 
     pub fn parent(&self) -> Option<Arc<KNode>> {
@@ -350,7 +359,7 @@ impl KNode {
             return Err(KernelError::NotFound);
         }
         let c = self.children().ok_or(KernelError::NotDirectory)?;
-        let k = key(&child.name.read(), child.ns);
+        let k = key(&child.name, child.ns);
         let mut map = c.write();
         if map.contains_key(&k) {
             return Err(KernelError::AlreadyExists);
@@ -372,7 +381,7 @@ impl KNode {
         mode: u16,
         ns: u64,
     ) -> Result<Arc<KNode>, KernelError> {
-        let kind = Kind::Dir(RwLock::new(BTreeMap::new()));
+        let kind = Kind::Dir(RwSem::new(BTreeMap::new()));
         self.add(try_arc(Self::new_ns(name, mode, kind, ns))?)
     }
 
@@ -468,7 +477,7 @@ impl KNode {
         let _w = KERNFS_RWSEM.write();
         let Some(p) = self.parent() else { return };
         if let Some(c) = p.children() {
-            let k = key(&self.name.read(), self.ns);
+            let k = key(&self.name, self.ns);
             let mut map = c.write();
             if map.get(&k).is_some_and(|n| Arc::ptr_eq(n, self)) {
                 map.remove(&k);
@@ -511,7 +520,7 @@ impl KNode {
         let mut p = Vec::new();
         for n in self.chain() {
             p.push(b'/');
-            p.extend_from_slice(&n.name.read());
+            p.extend_from_slice(&n.name);
         }
         p
     }
@@ -539,7 +548,7 @@ impl KNode {
             if i > 0 {
                 p.push(b'/');
             }
-            p.extend_from_slice(&n.name.read());
+            p.extend_from_slice(&n.name);
         }
         p
     }

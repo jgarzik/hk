@@ -22,7 +22,6 @@
 //! BLOCKED, Linux flc_lock -> blocked_lock_lock). Waits sleep with none
 //! held.
 
-use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::flock::FileLock;
@@ -30,6 +29,7 @@ use super::posix_lock::InodeLocks;
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::error::KernelError;
+use crate::util::rbtree::{RbTree, RbTreeNodeReservation};
 
 /// The locks of one inode
 #[derive(Default)]
@@ -90,28 +90,36 @@ impl FileLockCtx {
 const MAX_DEADLK_ITERATIONS: usize = 10;
 
 /// Waiting POSIX lock owners and the owner each waits on (Linux
-/// blocked_hash)
-static BLOCKED: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+/// blocked_hash, linking the waiter's preallocated request): an rbtree
+/// whose node the waiter allocates before taking the lock
+static BLOCKED: Mutex<RbTree<u64, u64>> = Mutex::new(RbTree::new());
 
 /// Record that `owner` waits on `blocker`, unless that closes a cycle
 /// (Linux posix_locks_deadlock): EDEADLK then
 pub fn block_on(owner: u64, blocker: u64) -> Result<(), KernelError> {
-    let mut b = BLOCKED.lock();
-    let mut at = blocker;
-    for _ in 0..MAX_DEADLK_ITERATIONS {
-        if at == owner {
-            return Err(KernelError::Deadlock);
+    let node = RbTreeNodeReservation::new()?;
+    let replaced = {
+        let mut b = BLOCKED.lock();
+        let mut at = blocker;
+        for _ in 0..MAX_DEADLK_ITERATIONS {
+            if at == owner {
+                return Err(KernelError::Deadlock);
+            }
+            match b.get(&at) {
+                Some(&next) => at = next,
+                None => break,
+            }
         }
-        match b.get(&at) {
-            Some(&next) => at = next,
-            None => break,
-        }
-    }
-    b.insert(owner, blocker);
+        b.insert(node.into_node(owner, blocker))
+    };
+    // Freed after the lock
+    drop(replaced);
     Ok(())
 }
 
 /// `owner` no longer waits
 pub fn unblock(owner: u64) {
-    BLOCKED.lock().remove(&owner);
+    // Its node is freed after the lock
+    let node = BLOCKED.lock().remove_node(&owner);
+    drop(node);
 }

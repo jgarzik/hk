@@ -1,28 +1,29 @@
 //! Per-device writeback (Linux mm/backing-dev.c, the flusher of
 //! fs/fs-writeback.c)
 //!
-//! Each disk has a [`BdiWriteback`] (Linux bdi_writeback): the devices
-//! (the disk or its partitions) with dirty data, and a delayed work item
-//! on `BDI_WORKQUEUE` that writes them back about every 5 seconds (Linux
+//! Each disk has a [`BdiWriteback`] (Linux bdi_writeback): the dirty
+//! inodes of the filesystems on it and of its block devices' caches
+//! (`b_dirty`, `b_io`: `fs_writeback`), and a delayed work item on
+//! `BDI_WORKQUEUE` that writes them back about every 5 seconds (Linux
 //! dirty_writeback_centisecs 500): what became dirty over 30 seconds
 //! before (dirty_expire_centisecs 3000; everything past the background
-//! limit), first the dirty inodes of every filesystem mounted from the
-//! device (`fs_writeback::writeback_dev`), then the device's own cache
-//! (metadata, device-node writes); younger data re-arms the work.
+//! limit), oldest first; younger data re-arms the work.
 //!
-//! Locking: `BDI_REGISTRY`, `BdiWriteback.dirty` and the work item are
-//! spin leaves; writeback runs in the worker thread with none held.
+//! Locking: `BdiWriteback.list_lock` and the work item are spin leaves;
+//! writeback runs in the worker thread with only `BdiWriteback.pass`
+//! (sleeping) held.
 
 extern crate alloc;
 
-use crate::util::kalloc::arc_nofail;
-use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::sync::Arc;
+use crate::util::kalloc::{arc_cyclic_nofail, arc_nofail};
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::block::blkdev::DevId;
-use crate::sync::spin::{Mutex, RwLock};
+use crate::fs::fs_writeback::IoListA;
+use crate::sync::spin::Mutex;
 use crate::task::workqueue::{DelayedWork, Workqueue, wq_flags};
+use crate::util::list::ArcList;
 
 /// The periodic writeback's interval in scheduler ticks
 /// (vm.dirty_writeback_centisecs)
@@ -45,15 +46,17 @@ pub fn default_bdi_init() {
     }
 }
 
-/// Per-disk writeback state, by the disk's device number
-static BDI_REGISTRY: RwLock<BTreeMap<DevId, Arc<BdiWriteback>>> = RwLock::new(BTreeMap::new());
-
 /// One disk's writeback state (Linux bdi_writeback)
 pub struct BdiWriteback {
     /// The disk's device number
     pub dev_id: DevId,
-    /// Devices of the disk with dirty data
-    dirty: Mutex<BTreeSet<DevId>>,
+    /// Linux wb->list_lock and the inode lists it guards
+    /// (`fs_writeback`): a spin leaf, thread context
+    pub(crate) list_lock: Mutex<WbLists>,
+    /// One writeback pass over the lists at a time (sleeping, held
+    /// across the pass's I/O; Linux runs them one at a time from the
+    /// wb's work list)
+    pub(crate) pass: crate::sync::Mutex<()>,
     /// The periodic writeback
     dwork: Arc<crate::sync::IrqSpinlock<DelayedWork>>,
     /// The next pass writes everything, however young (background
@@ -61,61 +64,64 @@ pub struct BdiWriteback {
     background: AtomicBool,
 }
 
+/// A disk's dirty inodes, each list holding a reference per inode
+/// (linked through `Inode.i_io_list`)
+pub(crate) struct WbLists {
+    /// Dirtied and not yet taken by a pass, oldest first (Linux b_dirty,
+    /// which keeps them newest first)
+    pub b_dirty: ArcList<IoListA>,
+    /// Taken by the running pass, to write in order (Linux b_io)
+    pub b_io: ArcList<IoListA>,
+}
+
 impl BdiWriteback {
-    fn new(dev_id: DevId) -> Self {
+    fn new(dev_id: DevId, me: &Weak<Self>) -> Self {
+        let me = me.clone();
         // `bdi_register`'s: not plumbed
         let dwork = arc_nofail(crate::sync::IrqSpinlock::new(DelayedWork::new(move || {
-            do_device_writeback(dev_id);
+            if let Some(wb) = me.upgrade() {
+                wb_workfn(&wb);
+            }
         })));
         Self {
             dev_id,
-            dirty: Mutex::new(BTreeSet::new()),
+            list_lock: Mutex::new(WbLists {
+                b_dirty: ArcList::new(),
+                b_io: ArcList::new(),
+            }),
+            pass: crate::sync::Mutex::new(()),
             dwork,
             background: AtomicBool::new(false),
         }
     }
 
-    /// Device `dev` (the disk or a partition) has dirty data: arm the
-    /// periodic writeback (Linux wb_wakeup_delayed)
-    pub fn kick(&self, dev: DevId) {
-        let first = {
-            let mut d = self.dirty.lock();
-            let first = d.is_empty();
-            d.insert(dev);
-            first
-        };
-        if first {
-            BDI_WORKQUEUE.queue_delayed_work(self.dwork.clone(), interval());
-        }
+    /// The lists got their first dirty inode: arm the periodic writeback
+    /// (Linux wb_wakeup_delayed)
+    pub fn wakeup_delayed(&self) {
+        BDI_WORKQUEUE.queue_delayed_work(self.dwork.clone(), interval());
     }
 
-    /// Start writing `dev` back now (past the background limit; Linux
-    /// wb_start_background_writeback)
-    pub fn wakeup(&self, dev: DevId) {
-        self.dirty.lock().insert(dev);
+    /// Start writing back now, everything dirty (past the background
+    /// limit; Linux wb_start_background_writeback)
+    pub fn wakeup(&self) {
         self.background.store(true, Ordering::Release);
         BDI_WORKQUEUE.mod_delayed_work(&self.dwork, 0);
     }
 }
 
-/// The periodic writeback of one disk, in the worker thread
-fn do_device_writeback(disk: DevId) {
-    let Some(bdi) = get_bdi(disk) else {
-        return;
-    };
-    let cutoff = if bdi.background.swap(false, Ordering::AcqRel) {
+/// The periodic writeback of one disk, in the worker thread (Linux
+/// wb_workfn)
+fn wb_workfn(wb: &BdiWriteback) {
+    let cutoff = if wb.background.swap(false, Ordering::AcqRel) {
         u64::MAX
     } else {
         let expire_ns = EXPIRE_CS.load(Ordering::Relaxed).saturating_mul(10_000_000);
         crate::time::monotonic_ns().saturating_sub(expire_ns)
     };
-    let devs = core::mem::take(&mut *bdi.dirty.lock());
-    for dev in devs {
-        // Younger data waits for a later pass (Linux wb_workfn re-arms
-        // while the wb has dirty I/O)
-        if crate::fs::fs_writeback::writeback_dev(dev, cutoff) {
-            bdi.kick(dev);
-        }
+    // Younger data waits for a later pass (Linux wb_workfn re-arms
+    // while the wb has dirty I/O)
+    if crate::fs::fs_writeback::wb_do_writeback(wb, cutoff) {
+        wb.wakeup_delayed();
     }
 }
 
@@ -157,7 +163,7 @@ pub fn balance_dirty_pages(inode: &crate::fs::Inode) {
     } else if dirty > limit(&BG_RATIO, &BG_BYTES)
         && let Some(b) = inode.superblock().and_then(|sb| sb.bdev().cloned())
     {
-        b.disk.bdi.wakeup(b.dev_id());
+        b.disk.bdi.wakeup();
     }
 }
 
@@ -258,25 +264,15 @@ pub fn sync_all() {
     crate::block::blkdev::sync_bdevs();
 }
 
-/// Register a disk's writeback state (Linux bdi_register)
+/// Make a disk's writeback state (Linux bdi_alloc + bdi_register): its
+/// periodic work reaches it through a `Weak`
 pub fn bdi_register(dev_id: DevId) -> Arc<BdiWriteback> {
     // Not plumbed: its caller, Disk::new, has no error path
-    let bdi = arc_nofail(BdiWriteback::new(dev_id));
-    BDI_REGISTRY.write().insert(dev_id, bdi.clone());
-    bdi
+    arc_cyclic_nofail(|me| BdiWriteback::new(dev_id, me))
 }
 
-/// Unregister it when the disk goes (Linux bdi_unregister)
-pub fn bdi_unregister(dev_id: DevId) {
-    // The registry guard is gone before the workqueue's locks are taken
-    // (BDI_REGISTRY stays a leaf)
-    let bdi = BDI_REGISTRY.write().remove(&dev_id);
-    if let Some(bdi) = bdi {
-        BDI_WORKQUEUE.cancel_delayed_work(&bdi.dwork);
-    }
-}
-
-/// A disk's writeback state
-pub fn get_bdi(dev_id: DevId) -> Option<Arc<BdiWriteback>> {
-    BDI_REGISTRY.read().get(&dev_id).cloned()
+/// Stop its periodic writeback when the disk goes (Linux
+/// bdi_unregister)
+pub fn bdi_unregister(bdi: &BdiWriteback) {
+    BDI_WORKQUEUE.cancel_delayed_work(&bdi.dwork);
 }

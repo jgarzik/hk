@@ -6,10 +6,102 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use super::cb::{
-    Cfg, MSS_DEFAULT, Open, Out, RCV_SHUTDOWN, RTO_MAX, Seg, SegIn, TIMEWAIT_LEN, TcpCb, TcpState,
-    flags,
+    Cfg, MSS_DEFAULT, Open, Out, RCV_SHUTDOWN, RTO_MAX, TIMEWAIT_LEN, TcpCb, TcpState, flags,
 };
+use crate::mm::page_alloc::Gfp;
+use crate::net::skb::SkBuff;
 use crate::util::error::KernelError;
+
+/// A segment as the wire sees it: header fields and payload
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Seg {
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    wnd: u16,
+    mss: Option<u16>,
+    ws: Option<u8>,
+    ts: Option<(u32, u32)>,
+    data: Vec<u8>,
+}
+
+impl Seg {
+    fn has(&self, f: u8) -> bool {
+        self.flags & f != 0
+    }
+}
+
+/// A segment to feed a control block
+#[derive(Clone, Copy, Debug, Default)]
+struct SegIn<'a> {
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    wnd: u16,
+    mss: Option<u16>,
+    ws: Option<u8>,
+    ts: Option<(u32, u32)>,
+    data: &'a [u8],
+}
+
+impl SegIn<'_> {
+    /// Its header (Linux TCP_SKB_CB) and an skb holding its payload
+    fn skb(&self) -> Box<SkBuff> {
+        let mut skb = SkBuff::alloc_tx(self.data.len(), Gfp::KERNEL).unwrap();
+        skb.put_slice(self.data).unwrap();
+        skb.tcp = super::cb::Seg {
+            seq: self.seq,
+            ack: self.ack,
+            flags: self.flags,
+            wnd: self.wnd,
+            mss: self.mss,
+            ws: self.ws,
+            ts: self.ts,
+            ..Default::default()
+        };
+        skb.tcp.set_len(self.data.len() as u32);
+        skb
+    }
+
+    fn hdr(&self) -> super::cb::Seg {
+        self.skb().tcp
+    }
+}
+
+/// Feeding segments given as header + payload slice
+trait Feed {
+    fn feed(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out);
+    fn passive_in(&mut self, s: &SegIn<'_>, o: Open, now: u64, out: &mut Out);
+}
+
+impl Feed for TcpCb {
+    fn feed(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
+        let skb = s.skb();
+        let h = skb.tcp;
+        self.input(&h, skb, now, out);
+    }
+
+    fn passive_in(&mut self, s: &SegIn<'_>, o: Open, now: u64, out: &mut Out) {
+        self.passive(&s.hdr(), o, now, out);
+    }
+}
+
+/// The segments `out` holds, as the wire sees them
+fn wire(out: &Out) -> Vec<Seg> {
+    out.segs
+        .iter()
+        .map(|skb| Seg {
+            seq: skb.tcp.seq,
+            ack: skb.tcp.ack,
+            flags: skb.tcp.flags,
+            wnd: skb.tcp.wnd,
+            mss: skb.tcp.mss,
+            ws: skb.tcp.ws,
+            ts: skb.tcp.ts,
+            data: skb.data().to_vec(),
+        })
+        .collect()
+}
 
 fn seg_in(s: &Seg) -> SegIn<'_> {
     SegIn {
@@ -37,7 +129,7 @@ fn open(iss: u32, mss: u32) -> Open {
 fn passive(syn: &Seg, iss: u32, mss: u32, cap: usize, now: u64, out: &mut Out) -> TcpCb {
     let mut b = TcpCb::new(cfg());
     b.rcv_cap = cap;
-    b.passive(&seg_in(syn), open(iss, mss), now, out);
+    b.passive_in(&seg_in(syn), open(iss, mss), now, out);
     b
 }
 
@@ -106,7 +198,7 @@ impl Pair {
         let mut out = Out::default();
         p.b = TcpCb::new(cb);
         p.b.rcv_cap = cap;
-        p.b.passive(&seg_in(&syn), open(5000, mss), p.now, &mut out);
+        p.b.passive_in(&seg_in(&syn), open(5000, mss), p.now, &mut out);
         p.take(false, out);
         p.run();
         assert_eq!(p.a.state, TcpState::Established);
@@ -131,7 +223,7 @@ impl Pair {
 
     /// Put `out`'s segments on the wire (from a if `from_a`)
     fn take(&mut self, from_a: bool, out: Out) {
-        for s in out.segs {
+        for s in wire(&out) {
             let to_b = from_a;
             let i = self.count[!to_b as usize];
             self.count[!to_b as usize] += 1;
@@ -151,10 +243,7 @@ impl Pair {
                 }
             }
         }
-        let rest = Out {
-            segs: Vec::new(),
-            ..out
-        };
+        let rest = out;
         let acc = if from_a {
             &mut self.a_out
         } else {
@@ -177,9 +266,9 @@ impl Pair {
         };
         let mut out = Out::default();
         if to_b {
-            self.b.input(&seg_in(&s), self.now, &mut out);
+            self.b.feed(&seg_in(&s), self.now, &mut out);
         } else {
-            self.a.input(&seg_in(&s), self.now, &mut out);
+            self.a.feed(&seg_in(&s), self.now, &mut out);
         }
         self.take(!to_b, out);
         true
@@ -307,7 +396,7 @@ fn mss_default_without_option() {
         ..Default::default()
     };
     let mut out = Out::default();
-    a.input(&synack, 5, &mut out);
+    a.feed(&synack, 5, &mut out);
     assert_eq!(a.state, TcpState::Established);
     assert_eq!(a.mss, MSS_DEFAULT);
     assert!(out.established);
@@ -559,10 +648,10 @@ fn time_wait_reacks_fin_and_restarts() {
     p.now += 30_000;
     p.log.clear();
     let mut out = Out::default();
-    p.a.input(&seg_in(&fin), p.now, &mut out);
-    assert_eq!(out.segs.len(), 1);
-    assert!(out.segs[0].has(flags::ACK));
-    assert_eq!(out.segs[0].ack, fin.seq.wrapping_add(1));
+    p.a.feed(&seg_in(&fin), p.now, &mut out);
+    assert_eq!(wire(&out).len(), 1);
+    assert!(wire(&out)[0].has(flags::ACK));
+    assert_eq!(wire(&out)[0].ack, fin.seq.wrapping_add(1));
     assert_eq!(p.a.next_timer(), Some(p.now + TIMEWAIT_LEN));
 }
 
@@ -656,23 +745,23 @@ fn rst_rules_rfc5961() {
     // In window, not exact: challenge ACK (spaced past the 500 ms
     // per-connection rate limit)
     let mut out = Out::default();
-    p.a.input(&rst(nxt + 10), 1000, &mut out);
+    p.a.feed(&rst(nxt + 10), 1000, &mut out);
     assert_eq!(p.a.state, TcpState::Established);
-    assert_eq!(out.segs.len(), 1);
-    assert!(out.segs[0].has(flags::ACK) && out.segs[0].ack == nxt);
+    assert_eq!(wire(&out).len(), 1);
+    assert!(wire(&out)[0].has(flags::ACK) && wire(&out)[0].ack == nxt);
     // Out of window: silently dropped
     let mut out = Out::default();
-    p.a.input(&rst(nxt.wrapping_sub(100_000)), 2000, &mut out);
-    assert!(out.segs.is_empty() && p.a.state == TcpState::Established);
+    p.a.feed(&rst(nxt.wrapping_sub(100_000)), 2000, &mut out);
+    assert!(wire(&out).is_empty() && p.a.state == TcpState::Established);
     // SYN on an established connection: challenge ACK
     let syn = SegIn {
         flags: flags::SYN,
         ..rst(nxt)
     };
     let mut out = Out::default();
-    p.a.input(&syn, 3000, &mut out);
+    p.a.feed(&syn, 3000, &mut out);
     assert_eq!(p.a.state, TcpState::Established);
-    assert!(out.segs[0].has(flags::ACK));
+    assert!(wire(&out)[0].has(flags::ACK));
     // ACK of data never sent: ACK back, segment dropped
     let bad = SegIn {
         flags: flags::ACK,
@@ -681,12 +770,12 @@ fn rst_rules_rfc5961() {
         ..rst(nxt)
     };
     let mut out = Out::default();
-    p.a.input(&bad, 4000, &mut out);
+    p.a.feed(&bad, 4000, &mut out);
     assert_eq!(p.a.rcvq_len(), 0);
-    assert!(out.segs[0].has(flags::ACK));
+    assert!(wire(&out)[0].has(flags::ACK));
     // Exact: reset
     let mut out = Out::default();
-    p.a.input(&rst(nxt), 5000, &mut out);
+    p.a.feed(&rst(nxt), 5000, &mut out);
     assert_eq!(p.a.state, TcpState::Closed);
     assert_eq!(out.err, Some(KernelError::ConnectionReset));
     assert!(out.done);
@@ -705,12 +794,12 @@ fn syn_sent_refused_and_bad_ack() {
         ..Default::default()
     };
     let mut out = Out::default();
-    a.input(&bad, 0, &mut out);
+    a.feed(&bad, 0, &mut out);
     assert_eq!(a.state, TcpState::SynSent);
-    assert_eq!((out.segs[0].flags, out.segs[0].seq), (flags::RST, 77));
+    assert_eq!((wire(&out)[0].flags, wire(&out)[0].seq), (flags::RST, 77));
     // RST without ACK: ignored
     let mut out = Out::default();
-    a.input(
+    a.feed(
         &SegIn {
             flags: flags::RST,
             ..bad
@@ -721,7 +810,7 @@ fn syn_sent_refused_and_bad_ack() {
     assert_eq!(a.state, TcpState::SynSent);
     // RST+ACK of our SYN: refused
     let mut out = Out::default();
-    a.input(
+    a.feed(
         &SegIn {
             flags: flags::RST | flags::ACK,
             ack: 501,
@@ -748,7 +837,7 @@ fn reset_errors_by_state() {
         ..Default::default()
     };
     let mut out = Out::default();
-    p.a.input(&rst, 0, &mut out);
+    p.a.feed(&rst, 0, &mut out);
     assert_eq!(out.err, Some(KernelError::BrokenPipe));
 }
 
@@ -761,7 +850,7 @@ fn close_with_unread_data_resets() {
     let mut out = Out::default();
     p.b.close(false, p.now, &mut out);
     assert_eq!(p.b.state, TcpState::Closed);
-    assert!(out.segs[0].has(flags::RST));
+    assert!(wire(&out)[0].has(flags::RST));
     p.take(false, out);
     p.run();
     assert_eq!(p.a.state, TcpState::Closed);
@@ -773,7 +862,7 @@ fn linger_zero_resets() {
     let mut p = Pair::new(1460);
     let mut out = Out::default();
     p.a.close(true, p.now, &mut out);
-    assert!(out.segs[0].has(flags::RST));
+    assert!(wire(&out)[0].has(flags::RST));
     p.take(true, out);
     p.run();
     assert_eq!(p.b.state, TcpState::Closed);
@@ -806,29 +895,29 @@ fn duplicate_syn_resends_synack() {
     let mut a = TcpCb::new(cfg());
     let mut out = Out::default();
     a.connect(open(10, 1460), 0, &mut out);
-    let syn = out.segs[0].clone();
+    let syn = wire(&out)[0].clone();
     let mut out = Out::default();
     let mut b = passive(&syn, 99, 1460, BUFS.0, 0, &mut out);
-    let synack = out.segs[0].clone();
+    let synack = wire(&out)[0].clone();
     let mut out = Out::default();
-    b.input(&seg_in(&syn), 1, &mut out);
+    b.feed(&seg_in(&syn), 1, &mut out);
     // The same SYN-ACK, but a fresh TSval
     let again = Seg {
         ts: synack.ts,
-        ..out.segs[0].clone()
+        ..wire(&out)[0].clone()
     };
-    assert_eq!(out.segs.len(), 1);
+    assert_eq!(wire(&out).len(), 1);
     assert_eq!(again, synack);
     assert_eq!(b.state, TcpState::SynReceived);
     assert_eq!(b.stats.total_retrans, 1);
     // Rate limited (Linux tcp_oow_rate_limited), resent after that
     let mut out = Out::default();
-    b.input(&seg_in(&syn), 100, &mut out);
-    assert!(out.segs.is_empty());
+    b.feed(&seg_in(&syn), 100, &mut out);
+    assert!(wire(&out).is_empty());
     let mut out = Out::default();
-    b.input(&seg_in(&syn), 600, &mut out);
-    assert_eq!(out.segs.len(), 1);
-    assert!(out.segs[0].flags & flags::SYN != 0);
+    b.feed(&seg_in(&syn), 600, &mut out);
+    assert_eq!(wire(&out).len(), 1);
+    assert!(wire(&out)[0].flags & flags::SYN != 0);
 }
 
 #[test]
@@ -836,18 +925,18 @@ fn new_syn_resets_request() {
     let mut a = TcpCb::new(cfg());
     let mut out = Out::default();
     a.connect(open(10, 1460), 0, &mut out);
-    let syn = out.segs[0].clone();
+    let syn = wire(&out)[0].clone();
     let mut out = Out::default();
     let mut b = passive(&syn, 99, 1460, BUFS.0, 0, &mut out);
     // A SYN at RCV.NXT (in window, another ISN): Linux tcp_check_req
     // resets and drops the request
     let syn2 = Seg { seq: 11, ..syn };
     let mut out = Out::default();
-    b.input(&seg_in(&syn2), 1, &mut out);
+    b.feed(&seg_in(&syn2), 1, &mut out);
     assert_eq!(b.state, TcpState::Closed);
-    assert_eq!(out.segs.len(), 1);
-    assert_eq!(out.segs[0].flags, flags::RST | flags::ACK);
-    assert_eq!(out.segs[0].ack, 12);
+    assert_eq!(wire(&out).len(), 1);
+    assert_eq!(wire(&out)[0].flags, flags::RST | flags::ACK);
+    assert_eq!(wire(&out)[0].ack, 12);
 }
 
 #[test]
@@ -855,7 +944,7 @@ fn synack_retries_then_give_up() {
     let mut p = Pair::bare();
     let mut out = Out::default();
     p.a.connect(open(1, 1460), 0, &mut out);
-    let syn = out.segs[0].clone();
+    let syn = wire(&out)[0].clone();
     let mut out = Out::default();
     p.b = passive(&syn, 2, 1460, BUFS.0, 0, &mut out);
     p.filter = drop_all;
@@ -871,7 +960,7 @@ fn ack_with_data_completes_handshake() {
     let mut a = TcpCb::new(cfg());
     let mut out = Out::default();
     a.connect(open(10, 1460), 0, &mut out);
-    let syn = out.segs[0].clone();
+    let syn = wire(&out)[0].clone();
     let mut out = Out::default();
     let mut b = passive(&syn, 99, 1460, BUFS.0, 0, &mut out);
     let ack = SegIn {
@@ -883,7 +972,7 @@ fn ack_with_data_completes_handshake() {
         ..Default::default()
     };
     let mut out = Out::default();
-    b.input(&ack, 1, &mut out);
+    b.feed(&ack, 1, &mut out);
     assert_eq!(b.state, TcpState::Established);
     assert!(out.established);
     assert_eq!(b.rcvq_len(), 7);
@@ -918,35 +1007,58 @@ fn pmtu_shrinks_segments() {
     let mut out = Out::default();
     p.a.pmtu(576, p.now, &mut out);
     assert_eq!(p.a.mss, 524);
-    assert!(!out.segs.is_empty());
-    assert!(out.segs.iter().all(|s| s.data.len() <= 524));
+    assert!(!wire(&out).is_empty());
+    assert!(wire(&out).iter().all(|s| s.data.len() <= 524));
 }
 
+/// An skb of `len` bytes of `v` at `seq`
+fn piece(seq: u32, len: usize, v: u8) -> Box<SkBuff> {
+    SegIn {
+        seq,
+        data: &alloc::vec![v; len],
+        ..Default::default()
+    }
+    .skb()
+}
+
+/// tcp_data_queue_ofo: a covered skb is dropped, one starting where
+/// another starts and reaching past it replaces it and the ones it
+/// covers; partial overlaps are trimmed as they reach RCV.NXT
 #[test]
-fn ooo_intervals_merge() {
+fn ooo_insert_and_take() {
     use super::cb::Ooo;
     let mut o = Ooo::default();
-    o.insert(100, 110, &[1; 10]);
-    o.insert(100, 130, &[3; 10]);
-    o.insert(100, 118, &[2; 14]);
-    assert_eq!(o.bytes(), 30);
-    assert_eq!(o.take(100), None);
-    // Disjoint pieces, each byte stored once, delivered in order
-    assert_eq!(o.take(110).unwrap(), [1u8; 10]);
-    assert_eq!(o.take(120).unwrap(), [2u8; 10]);
-    assert_eq!(o.take(130).unwrap(), [3u8; 10]);
+    assert!(o.insert(piece(110, 10, 1)));
+    assert!(o.insert(piece(130, 10, 3)));
+    assert!(!o.insert(piece(112, 4, 9)), "covered");
+    assert!(o.insert(piece(118, 14, 2)));
+    assert_eq!((o.pieces(), o.bytes()), (3, 34));
+    assert!(o.take(100).is_none());
+    let a = o.take(110).unwrap();
+    assert_eq!((a.tcp.seq, a.data()), (110, &[1u8; 10][..]));
+    let b = o.take(120).unwrap();
+    assert_eq!((b.tcp.seq, b.data()), (120, &[2u8; 12][..]));
+    let c = o.take(132).unwrap();
+    assert_eq!((c.tcp.seq, c.data()), (132, &[3u8; 8][..]));
+    assert!(o.is_empty() && o.bytes() == 0);
+    // Same start, longer: replaces and swallows what it covers
+    o.insert(piece(200, 5, 1));
+    o.insert(piece(210, 5, 2));
+    o.insert(piece(220, 5, 3));
+    assert!(o.insert(piece(200, 22, 7)));
+    assert_eq!((o.pieces(), o.bytes()), (2, 27));
+    // An skb RCV.NXT already passed is dropped on the way
+    assert_eq!(o.take(230).map(|s| s.tcp.seq), None);
     assert!(o.is_empty());
-    o.insert(100, 105, &[9; 10]);
-    assert_eq!(o.take(108).unwrap().len(), 7);
 }
 
 #[test]
 fn ooo_prune_from_the_top() {
     use super::cb::Ooo;
     let mut o = Ooo::default();
-    o.insert(100, 110, &[1; 10]);
-    o.insert(100, 130, &[3; 10]);
-    // Only pieces beyond the incoming segment go, highest first
+    o.insert(piece(110, 10, 1));
+    o.insert(piece(130, 10, 3));
+    // Only skbs beyond the incoming segment go, highest first
     assert!(o.prune_after(120));
     assert_eq!(o.bytes(), 10);
     assert!(!o.prune_after(120));
@@ -970,11 +1082,11 @@ fn rcv_nxt_only_over_accepted_bytes() {
     let (start, edge) = (p.b.rcv_nxt, p.b.rcv_nxt.wrapping_add(p.b.rcv_wnd()));
     assert_eq!(p.b.rcv_wnd(), 10_000);
     let mut out = Out::default();
-    p.b.input(&big, p.now, &mut out);
+    p.b.feed(&big, p.now, &mut out);
     assert_eq!(p.b.rcv_nxt, edge);
     assert_eq!(p.b.rcvq_len(), edge.wrapping_sub(start) as usize);
     // Its ACK offers a zero window
-    assert_eq!(out.segs.last().unwrap().wnd, 0);
+    assert_eq!(wire(&out).last().unwrap().wnd, 0);
 }
 
 #[test]
@@ -993,7 +1105,7 @@ fn covered_ooo_intervals_do_not_block_fin() {
             ..Default::default()
         };
         let mut out = Out::default();
-        b.input(&s, 0, &mut out);
+        b.feed(&s, 0, &mut out);
         out
     };
     feed(&mut p.b, seg(100, 100, 0));
@@ -1003,7 +1115,7 @@ fn covered_ooo_intervals_do_not_block_fin() {
     assert_eq!(p.b.rcvq_len(), 400);
     let out = feed(&mut p.b, seg(400, 0, flags::FIN));
     assert_eq!(p.b.state, TcpState::CloseWait);
-    assert_eq!(out.segs.last().unwrap().ack, base.wrapping_add(401));
+    assert_eq!(wire(&out).last().unwrap().ack, base.wrapping_add(401));
 }
 
 #[test]
@@ -1031,26 +1143,17 @@ fn ooo_pieces_bounded() {
     use super::cb::{OOO_MAX, Ooo};
     let mut o = Ooo::default();
     // Many tiny scattered segments: bounded pieces, charged overhead
-    for i in 0..20_000u32 {
-        o.insert(0, 10 + i * 3, &[1]);
+    for i in 0..2000u32 {
+        o.insert(piece(10 + i * 3, 1, 1));
     }
     assert_eq!(o.pieces(), OOO_MAX);
     assert_eq!(o.truesize(), OOO_MAX * (1 + super::cb::OOO_OVERHEAD));
-    // Adjacent tiny segments growing one range never re-copy held bytes
+    // Sequence numbers wrap
     let mut o = Ooo::default();
-    for i in 0..200u32 {
-        o.insert(0, 10 + i, &[i as u8]);
-    }
-    o.insert(0, 5, &[9; 300]);
-    assert_eq!(o.bytes(), 300);
-    let d = o.take(5).unwrap();
-    assert_eq!(d.len(), 5);
-    assert_eq!(o.take(10).unwrap(), [0u8]);
-    // Rebasing keeps data
-    let mut o = Ooo::default();
-    o.insert(0, 100, &[3; 10]);
-    o.insert(0x7000_0000, 0x7000_0010, &[4; 4]);
-    assert_eq!(o.take(0x7000_0010).unwrap(), [4u8; 4]);
+    o.insert(piece(0xffff_fffc, 8, 4));
+    o.insert(piece(10, 4, 5));
+    assert_eq!(o.take(0xffff_fffe).unwrap().data(), &[4u8; 6][..]);
+    assert_eq!(o.take(10).unwrap().data(), &[5u8; 4][..]);
 }
 
 // ============================================================================
@@ -1117,9 +1220,9 @@ fn wscale_opens_large_window() {
     let mut out = Out::default();
     a.connect(open(1, 1460), 0, &mut out);
     let mut o2 = Out::default();
-    b.passive(&seg_in(&out.segs[0]), open(2, 1460), 0, &mut o2);
+    b.passive_in(&seg_in(&wire(&out)[0]), open(2, 1460), 0, &mut o2);
     assert_eq!(b.rcv_wscale, 0);
-    assert_eq!(o2.segs[0].ws, Some(0));
+    assert_eq!(wire(&o2)[0].ws, Some(0));
 }
 
 #[test]
@@ -1175,14 +1278,14 @@ fn paws_rejects_old_timestamps() {
     replay.seq = p.b.rcv_nxt;
     replay.data = b"evil".to_vec();
     let mut out = Out::default();
-    p.b.input(&seg_in(&replay), p.now, &mut out);
+    p.b.feed(&seg_in(&replay), p.now, &mut out);
     assert_eq!(p.b.rcvq_len(), 6);
-    assert_eq!(out.segs.len(), 1);
-    assert_eq!(out.segs[0].ack, p.b.rcv_nxt);
+    assert_eq!(wire(&out).len(), 1);
+    assert_eq!(wire(&out)[0].ack, p.b.rcv_nxt);
     // The same with a fresh TSval is accepted
     replay.ts = Some((old.ts.unwrap().0.wrapping_add(5000), 0));
     let mut out = Out::default();
-    p.b.input(&seg_in(&replay), p.now, &mut out);
+    p.b.feed(&seg_in(&replay), p.now, &mut out);
     assert_eq!(p.b.rcvq_len(), 10);
     // An old RST is still honoured (RFC 7323 5.3 / Linux)
     let rst = Seg {
@@ -1192,7 +1295,7 @@ fn paws_rejects_old_timestamps() {
         ..Default::default()
     };
     let mut out = Out::default();
-    p.b.input(&seg_in(&rst), p.now, &mut out);
+    p.b.feed(&seg_in(&rst), p.now, &mut out);
     assert_eq!(p.b.state, TcpState::Closed);
 }
 
@@ -1261,8 +1364,8 @@ fn delayed_ack_timing() {
     let mut out = Out::default();
     p.b.send(b"reply");
     p.b.output(p.now, &mut out);
-    assert_eq!(out.segs.len(), 1);
-    assert_eq!(out.segs[0].ack, p.b.rcv_nxt);
+    assert_eq!(wire(&out).len(), 1);
+    assert_eq!(wire(&out)[0].ack, p.b.rcv_nxt);
     assert_eq!(p.b.dack.at, None);
 }
 
@@ -1280,7 +1383,7 @@ fn quickack_option() {
     let mut out = Out::default();
     p.b.set_quickack(1, &mut out);
     assert!(p.b.quickack());
-    assert_eq!(out.segs.len(), 1);
+    assert_eq!(wire(&out).len(), 1);
     assert!(!p.b.dack.pending);
 }
 
@@ -1352,8 +1455,8 @@ fn cork_holds_partial_segments() {
     p.a.opts.cork = false;
     let mut out = Out::default();
     p.a.output(p.now, &mut out);
-    assert_eq!(out.segs.len(), 1);
-    assert_eq!(out.segs[0].data.len(), 300);
+    assert_eq!(wire(&out).len(), 1);
+    assert_eq!(wire(&out)[0].data.len(), 300);
     // MSG_MORE holds the tail of that send only
     p.take(true, out);
     p.run();
@@ -1361,7 +1464,7 @@ fn cork_holds_partial_segments() {
     p.a.send(&pattern(m + 200));
     let mut out = Out::default();
     p.a.output_more(p.now, &mut out);
-    let sent: Vec<usize> = out.segs.iter().map(|s| s.data.len()).collect();
+    let sent: Vec<usize> = wire(&out).iter().map(|s| s.data.len()).collect();
     assert_eq!(sent, [m]);
 }
 
@@ -1492,11 +1595,14 @@ fn tw_reopens_with_newer_timestamp() {
     p.run();
     assert_eq!(p.a.state, TcpState::TimeWait);
     let tw = p.a.tw_clone();
-    let syn = |seq: u32, tsv: u32| SegIn {
-        seq,
-        flags: flags::SYN,
-        ts: Some((tsv, 0)),
-        ..Default::default()
+    let syn = |seq: u32, tsv: u32| {
+        SegIn {
+            seq,
+            flags: flags::SYN,
+            ts: Some((tsv, 0)),
+            ..Default::default()
+        }
+        .hdr()
     };
     let old = tw.rcv_nxt.wrapping_sub(10);
     assert!(!tw.tw_syn_ok(&syn(old, tw.ts_recent.wrapping_sub(1))));
@@ -1523,7 +1629,7 @@ fn ts_recent_needs_valid_ack() {
         ts: Some((before_ts.wrapping_add(0x7fff_0000), 0)),
         ..Default::default()
     };
-    p.b.input(&bogus, p.now, &mut Out::default());
+    p.b.feed(&bogus, p.now, &mut Out::default());
     assert_eq!(p.b.ts_recent, before_ts);
     // The real peer still gets through
     let data = pattern(1000);
@@ -1546,7 +1652,7 @@ fn old_ack_does_not_update_window() {
         ts: Some((p.a.ts_recent.wrapping_add(1), 0)),
         ..Default::default()
     };
-    p.a.input(&old, p.now, &mut Out::default());
+    p.a.feed(&old, p.now, &mut Out::default());
     assert_eq!(p.a.snd_wnd, wnd);
     // The acceptable ACK range is bounded by the bytes acknowledged so
     // far (Linux: min(max_window, bytes_acked))
@@ -1562,10 +1668,10 @@ fn old_ack_does_not_update_window() {
         ..Default::default()
     };
     let mut out = Out::default();
-    q.a.input(&far, q.now, &mut out);
+    q.a.feed(&far, q.now, &mut out);
     assert!(q.a.snd_wnd > 0);
     assert_eq!(
-        out.segs.len(),
+        wire(&out).len(),
         1,
         "challenge ACK for an ACK below the range"
     );
@@ -1610,13 +1716,13 @@ fn oow_acks_rate_limited() {
     let mut n = 0;
     for _ in 0..10 {
         let mut out = Out::default();
-        p.a.input(&stale, p.now, &mut out);
-        n += out.segs.len();
+        p.a.feed(&stale, p.now, &mut out);
+        n += wire(&out).len();
     }
     assert_eq!(n, 1);
     let mut out = Out::default();
-    p.a.input(&stale, p.now + 500, &mut out);
-    assert_eq!(out.segs.len(), 1);
+    p.a.feed(&stale, p.now + 500, &mut out);
+    assert_eq!(wire(&out).len(), 1);
     // Challenge ACKs (in-window RST) share the limit
     let rst = SegIn {
         seq: p.a.rcv_nxt.wrapping_add(10),
@@ -1624,8 +1730,8 @@ fn oow_acks_rate_limited() {
         ..Default::default()
     };
     let mut out = Out::default();
-    p.a.input(&rst, p.now + 600, &mut out);
-    assert!(out.segs.is_empty());
+    p.a.feed(&rst, p.now + 600, &mut out);
+    assert!(wire(&out).is_empty());
     assert_eq!(p.a.state, TcpState::Established);
 }
 
@@ -1633,6 +1739,7 @@ fn oow_acks_rate_limited() {
 fn time_wait_entry_is_compact() {
     let cb = core::mem::size_of::<super::cb::TcpCb>();
     let tw = core::mem::size_of::<super::timewait::TimeWait>();
-    // kmalloc-256 with Arc's counts
-    assert!(tw + 16 <= 256, "TimeWait {tw} B vs TcpCb {cb} B");
+    // kmalloc-512 with Arc's counts and the embedded 2MSL timer (Linux
+    // tcp_timewait_sock has its tw_timer too); under the control block
+    assert!(tw + 16 <= 512 && tw < cb, "TimeWait {tw} B vs TcpCb {cb} B");
 }

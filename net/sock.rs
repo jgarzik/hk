@@ -9,24 +9,23 @@
 //! ## Locking
 //!
 //! `Sock` holds atomics, its `WaitQueue` (IrqSpinlock leaf) and the
-//! error queue `errq` (`crate::sync::spin::Mutex` leaf, thread only). Wakeups
+//! error queue `errq` (an `SkbQueue`, spin leaf, thread only: the skbs
+//! are built before it and freed after it). Wakeups
 //! (`data_ready`, `write_space`, `state_change`, `error_report`) are
 //! issued after the caller dropped its protocol locks, in thread context:
 //! they also send the O_ASYNC owners' SIGIO (`wake_async`, Linux
 //! sk_wake_async; `fasync`, a sleeping lock taken when a file is armed).
 
-use alloc::collections::VecDeque;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-
-use crate::sync::spin::Mutex;
 
 use crate::io::fasync::{FasyncList, POLL_ERR, POLL_IN, POLL_OUT, kill_fasync};
 use crate::io::poll::{
     POLLERR, POLLIN, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
 use crate::net::NetNamespace;
+use crate::net::skb::{SkBuff, SkbCb, SkbQueue};
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::Cred;
 use crate::util::error::KernelError;
@@ -70,30 +69,30 @@ pub mod sf {
 pub const EE_ORIGIN_LOCAL: u8 = 1;
 pub const EE_ORIGIN_ICMP: u8 = 2;
 
-/// An error-queue entry (Linux sock_exterr_skb): `struct
-/// sock_extended_err` plus what recvmsg(MSG_ERRQUEUE) returns with it.
-/// Addresses are kept as socket addresses, so IPv6 can reuse it.
-#[derive(Clone, Debug, Default)]
-pub struct ErrSkb {
+/// An error-queue entry's `struct sock_extended_err` and what
+/// recvmsg(MSG_ERRQUEUE) returns with it (Linux sock_exterr_skb, the
+/// cb of an skb on `Sock.errq` whose data is the quoted payload)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExtErr {
     pub errno: u32,
     pub origin: u8,
     pub ty: u8,
     pub code: u8,
     pub info: u32,
-    /// msg_name: the offending packet's destination (sockaddr)
-    pub name: Vec<u8>,
-    /// SO_EE_OFFENDER: who reported it (sockaddr; empty = none)
-    pub offender: Vec<u8>,
-    /// Data returned: the offending packet's payload as quoted
-    pub payload: Vec<u8>,
+    /// msg_name: the offending packet's destination and port
+    pub addr: crate::net::ipv4::Ipv4Addr,
+    pub port: u16,
+    /// SO_EE_OFFENDER: who reported it (an ICMP error's sender)
+    pub offender: crate::net::ipv4::Ipv4Addr,
     /// Receive metadata of the ICMP message (for IP_PKTINFO etc.)
     pub rx: Option<crate::net::af_inet::RxInfo>,
 }
 
-impl ErrSkb {
-    /// Bytes charged to the receive buffer
-    fn truesize(&self) -> usize {
-        self.payload.len() + 256
+/// The `ExtErr` of an error-queue skb
+pub fn exterr(skb: &SkBuff) -> ExtErr {
+    match skb.cb {
+        SkbCb::Exterr(e) => e,
+        _ => ExtErr::default(),
     }
 }
 
@@ -157,8 +156,9 @@ pub struct Sock {
     pub drops: AtomicU32,
     /// sockfs inode number (0 until the file exists)
     pub ino: AtomicU64,
-    /// Error queue (IP_RECVERR, MSG_ERRQUEUE) and its memory charge
-    errq: Mutex<VecDeque<ErrSkb>>,
+    /// Error queue (IP_RECVERR, MSG_ERRQUEUE; Linux sk_error_queue)
+    /// and its memory charge
+    errq: SkbQueue<Box<SkBuff>>,
     errmem: AtomicUsize,
     /// O_ASYNC files of the socket (Linux socket_wq.fasync_list)
     pub fasync: FasyncList,
@@ -190,7 +190,7 @@ impl Sock {
             mark: AtomicU32::new(0),
             drops: AtomicU32::new(0),
             ino: AtomicU64::new(0),
-            errq: Mutex::new(VecDeque::new()),
+            errq: SkbQueue::new(),
             errmem: AtomicUsize::new(0),
             fasync: FasyncList::new(),
             wq_flags: AtomicU32::new(0),
@@ -260,18 +260,19 @@ impl Sock {
     /// POLLERR condition (Linux datagram_poll): a pending error or a
     /// queued extended error
     pub fn err_pending(&self) -> bool {
-        self.has_err() || !self.errq.lock().is_empty()
+        self.has_err() || !self.errq.is_empty()
     }
 
-    /// Queue an extended error (Linux sock_queue_err_skb): dropped when
-    /// it would exceed the receive buffer
-    pub fn queue_err(&self, e: ErrSkb) -> bool {
-        let ts = e.truesize();
+    /// Queue an extended error, an skb built by the caller with
+    /// `SkbCb::Exterr` (Linux sock_queue_err_skb): dropped when it would
+    /// exceed the receive buffer
+    pub fn queue_err(&self, skb: Box<SkBuff>) -> bool {
+        let ts = skb.truesize();
         if self.errmem.load(Ordering::Acquire) + ts >= self.rcvbuf() as usize {
             return false;
         }
         self.errmem.fetch_add(ts, Ordering::AcqRel);
-        self.errq.lock().push_back(e);
+        self.errq.lock().push_back(skb);
         self.error_report();
         true
     }
@@ -279,29 +280,34 @@ impl Sock {
     /// Take the oldest extended error (Linux sock_dequeue_err_skb): the
     /// pending error follows the next queued ICMP error, or is cleared
     /// when the taken one was an ICMP error and no other follows
-    pub fn dequeue_err(&self) -> Option<ErrSkb> {
-        let (e, next) = {
+    pub fn dequeue_err(&self) -> Option<Box<SkBuff>> {
+        let (skb, next) = {
             let mut q = self.errq.lock();
-            let e = q.pop_front()?;
-            let next = q.front().map(|n| (n.origin, n.errno));
-            (e, next)
+            let skb = q.pop_front()?;
+            let next = q.front().map(|n| {
+                let e = exterr(n);
+                (e.origin, e.errno)
+            });
+            (skb, next)
         };
-        self.errmem.fetch_sub(e.truesize(), Ordering::AcqRel);
+        self.errmem.fetch_sub(skb.truesize(), Ordering::AcqRel);
         match next {
             Some((EE_ORIGIN_ICMP, errno)) => self.store_err(errno),
-            _ if e.origin == EE_ORIGIN_ICMP => self.store_err(0),
+            _ if exterr(&skb).origin == EE_ORIGIN_ICMP => self.store_err(0),
             _ => {}
         }
         if next.is_some() {
             self.error_report();
         }
-        Some(e)
+        Some(skb)
     }
 
-    /// Drop all queued extended errors (close)
+    /// Drop all queued extended errors (close), uncharging exactly what
+    /// was taken; they are freed after the queue lock
     pub fn purge_err(&self) {
-        self.errq.lock().clear();
-        self.errmem.store(0, Ordering::Release);
+        let q = self.errq.purge();
+        let n: usize = q.iter().map(SkBuff::truesize).sum();
+        self.errmem.fetch_sub(n, Ordering::AcqRel);
     }
 
     /// Take the pending error (Linux sock_error)

@@ -672,6 +672,13 @@ macro_rules! owner_reads {
                 // SAFETY: as above
                 unsafe { self.task.cred_arc() }
             }
+
+            /// A reference to its real uid's counters (Linux
+            /// task_ucounts)
+            pub fn ucounts(&self) -> crate::task::UcountsRef {
+                // SAFETY: as above
+                unsafe { self.task.ucounts() }
+            }
         }
     };
 }
@@ -1007,13 +1014,21 @@ impl GlobalTaskTable {
             .flatten()
     }
 
+    /// The first thread of process `pid` (its leader's thread list)
+    pub fn first_thread(&self, pid: Pid) -> Option<TaskRef> {
+        self.get(pid)?.fields().threads.front()
+    }
+
+    /// The thread after `t` in process `pid`'s list (Linux next_thread);
+    /// None at the end or if `t` is not on it
+    pub fn next_thread(&self, pid: Pid, t: &Task) -> Option<TaskRef> {
+        self.get(pid)?.fields().threads.next(t)
+    }
+
     /// Take `t` off its leader's thread group
     fn unlink_thread(&mut self, t: &Task) {
         let Some(l) = self.task(t.pid) else { return };
-        let li = self.inner_mut_of(&l);
-        if li.threads.iter().any(|x| core::ptr::eq(x, t)) {
-            drop(unsafe { li.threads.remove(t) });
-        }
+        drop(self.inner_mut_of(&l).threads.remove(t));
     }
 
     /// Remove task `tid`; the caller drops it after unlocking (nothing
@@ -1140,33 +1155,57 @@ impl GlobalTaskTable {
 
     /// Move process `pid` (every thread; its leader on the lists) to
     /// group `pg` and, if given, session `s` (Linux change_pid); the
-    /// references it held go to `old`, dropped after TASKLIST
+    /// group and session it left come back, for the caller to drop
+    /// after TASKLIST (Linux ksys_setsid's pids[] and free_pids).
+    /// Nothing is allocated: the threads are walked on the leader's
+    /// list, and each thread's old reference is one of the two returned
+    /// (a process's threads share them), so dropping it here frees
+    /// nothing.
+    #[must_use]
     fn change_pids(
         &mut self,
         pid: Pid,
         pg: &Arc<crate::task::pid::Pid>,
         s: Option<&Arc<crate::task::pid::Pid>>,
-        old: &mut Vec<Arc<crate::task::pid::Pid>>,
-    ) {
-        let Some(l) = self.task(pid) else { return };
+    ) -> [Option<Arc<crate::task::pid::Pid>>; 2] {
+        let Some(l) = self.task(pid) else {
+            return [None, None];
+        };
         let before = self.inner_mut_of(&l).pgrp.clone();
         let before_s = self.inner_mut_of(&l).session.clone();
         self.detach_pids(&l);
-        let threads: Vec<TaskRef> = self.threads(pid).map(|t| task_ref(t.task)).collect();
-        for t in &threads {
-            let ti = self.inner_mut_of(t);
-            old.extend(ti.pgrp.replace(pg.clone()));
+        let mut cur = self.inner_mut_of(&l).threads.front();
+        while let Some(t) = cur {
+            let ti = self.inner_mut_of(&t);
+            let old = ti.pgrp.replace(pg.clone());
+            debug_assert!(
+                Self::pid_ptr(&old) == Self::pid_ptr(&before),
+                "threads share a group"
+            );
+            drop(old);
             t.pgid.store(Pid::from(pg.nr()), Ordering::Relaxed);
             if let Some(s) = s {
-                old.extend(ti.session.replace(s.clone()));
+                let old = ti.session.replace(s.clone());
+                debug_assert!(
+                    Self::pid_ptr(&old) == Self::pid_ptr(&before_s),
+                    "threads share a session"
+                );
+                drop(old);
                 t.sid.store(Pid::from(s.nr()), Ordering::Relaxed);
             }
+            cur = self.inner_mut_of(&l).threads.next(&t);
         }
         self.attach_pids(&l);
         // The group or session it left may be gone (setpgid, setsid)
-        for p in [before, before_s].iter().flatten() {
+        for p in [&before, &before_s].into_iter().flatten() {
             self.release_unused(p);
         }
+        [before, before_s]
+    }
+
+    /// The `Pid` a reference names, for identity checks
+    fn pid_ptr(p: &Option<Arc<crate::task::pid::Pid>>) -> *const crate::task::pid::Pid {
+        p.as_ref().map_or(core::ptr::null(), Arc::as_ptr)
     }
 
     /// Number of tasks, zombies included
@@ -1364,6 +1403,9 @@ fn idle_task_entry() -> ! {
     loop {
         // Yield immediately to give other tasks priority
         yield_now();
+        // Idle holds nothing: a quiescent state (Linux rcu_idle_enter's
+        // extended one, here reported each pass)
+        crate::sync::rcu::idle();
         // Nothing to run here: pull from a busier CPU (Linux
         // sched_balance_newidle); a task pulled flags us to switch
         sched_balance_rq(crate::cpu::this_id());
@@ -1500,6 +1542,9 @@ fn create_idle_task(cpu_id: u32) -> Result<(), KernelError> {
         PRIORITY_IDLE,
         true,
     )?;
+    // Its ticks report quiescent states from here (Linux
+    // rcutree_online_cpu), before anything runs on it
+    crate::sync::rcu::cpu_online(cpu_id);
     get_percpu_sched(cpu_id)
         .initialized
         .store(true, Ordering::Release);
@@ -1934,7 +1979,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
         drop(table);
         return gone;
     }
-    let (ppid, start, uid) = (l.task.ppid(), l.task.start_time(), l.cred().uid);
+    let (ppid, start, ucounts) = (l.task.ppid(), l.task.start_time(), l.ucounts());
     for t in table.threads(tgid) {
         if t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)) {
             gone_tids.push(t.task.tid());
@@ -1943,13 +1988,13 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     // The thread group moves to the caller: it is the only live thread
     // (Linux de_thread leaves only the exec'ing thread); the old list's
     // references go after TASKLIST
-    let mut old_threads = crate::util::list::ArcList::new();
+    let mut old_threads = crate::util::list::OwnedList::new();
     if let Some(l) = table.task(ltid) {
         let li = table.inner_mut_of(&l);
         core::mem::swap(&mut li.threads, &mut old_threads);
     }
-    while let Some(t) = old_threads.pop_front() {
-        gone.push(t);
+    while let Some(t) = old_threads.front() {
+        gone.extend(old_threads.remove(&t));
     }
     // Their numbers go back only once the caller holds the leader's
     // pid and heads its group and session (Linux de_thread:
@@ -1993,7 +2038,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
         l.set_tid(tid);
         // The old leader's RLIMIT_NPROC charge goes with it; the caller
         // keeps its own as the process's
-        crate::task::nproc_uncharge(uid);
+        ucounts.dec(crate::task::Ucount::Nproc, 1);
     }
     me.set_tid(ltid);
     // The new leader takes the old one's place among its parent's
@@ -2221,14 +2266,14 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // real uid until it is released; over the limit is EAGAIN unless
     // root or CAP_SYS_RESOURCE/CAP_SYS_ADMIN (Linux copy_process). The
     // guard uncharges on every error return.
-    let nproc = crate::task::NprocCharge::new(current_cred().uid);
+    let nproc = crate::task::NprocCharge::new(current_cred().ucounts);
     let parent_nproc_exceeded = {
         let table = TASKLIST.read();
         table
             .view(&current())
             .is_some_and(|t| t.task.has_flag(crate::task::pf::NPROC_EXCEEDED))
     };
-    if crate::task::nproc_over(nproc.uid, nproc.count) {
+    if crate::task::nproc_over(&nproc.ucounts) {
         return Err(KernelError::WouldBlock);
     }
 
@@ -2557,10 +2602,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // SAFETY: not on a run queue yet
     unsafe { *child_task.se.ctx() = context };
 
-    // CLONE_PIDFD: the child's pidfd is in the caller's table and its
-    // number stored before the child exists, so a failure leaves
-    // neither (Linux copy_process: pidfd_prepare and put_user, EFAULT
-    // through bad_fork_put_pidfd)
+    // CLONE_PIDFD: the child's pidfd descriptor is reserved in the
+    // caller's table and its number stored before the child exists; the
+    // file is installed past the point of no return, so a failure
+    // releases the reservation and leaves no descriptor (Linux
+    // copy_process: pidfd_prepare and put_user, bad_fork_put_pidfd,
+    // fd_install at the end)
     let pidfd = if config.flags & CLONE_PIDFD != 0 {
         Some(clone_pidfd(
             child_thread_pid,
@@ -2580,9 +2627,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // this child or this sees the namespace dying
         if !crate::task::pid::ns_adding(child_task.pid_ns()) {
             drop(table);
-            if let Some(fd) = pidfd {
-                close_pidfd(fd);
-            }
+            // The reservation goes with `pidfd` (put_unused_fd)
             return Err(KernelError::OutOfMemory);
         }
         if child_init {
@@ -2702,6 +2747,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // tid), as the caller numbers it
     let return_value = Tid::from(child_vnr);
 
+    // Nothing fails from here: the pidfd goes in its descriptor (Linux
+    // copy_process: fd_install(pidfd, pidfile))
+    if let Some((fd, file)) = pidfd {
+        fd.install(file);
+    }
+
     // CLONE_VFORK: the completion must be in place before the child can
     // run (it may exec or exit at once on another CPU; Linux
     // p->vfork_done)
@@ -2749,36 +2800,22 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     Ok(return_value)
 }
 
-/// CLONE_PIDFD: a close-on-exec pidfd of the child `pid` (a thread
-/// pidfd for a new thread: Linux PIDFD_THREAD) in the caller's table,
-/// its number stored at `ptr`: EMFILE, ENOMEM, or EFAULT (the
-/// descriptor closed again). The child does not exist yet: nothing
-/// but the caller's threads can see the descriptor before clone
-/// returns (Linux reserves it and installs it at the end).
-fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> KernelResult<i32> {
+/// CLONE_PIDFD: a close-on-exec descriptor reserved in the caller's
+/// table and a pidfd of the child `pid` for it (a thread pidfd for a
+/// new thread: Linux PIDFD_THREAD), the number stored at `ptr` (Linux
+/// pidfd_prepare, put_user): EMFILE, ENOMEM, EFAULT. Installed once the
+/// clone cannot fail; dropped before, the reservation is released.
+fn clone_pidfd(
+    pid: Arc<crate::task::pid::Pid>,
+    thread: bool,
+    ptr: u64,
+) -> KernelResult<(crate::task::fdtable::UnusedFd, crate::fs::FileRef)> {
     use crate::task::pidfd::pidfd_flags::PIDFD_THREAD;
     let flags = if thread { PIDFD_THREAD } else { 0 };
+    let fd = crate::fs::io::get_unused_fd_flags(crate::task::FD_CLOEXEC)?;
     let file = crate::task::pidfd::pidfd_file(pid, flags)?;
-    let files = current().files().ok_or(KernelError::BadFd)?;
-    let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-    let fd = files
-        .lock()
-        .alloc_with_flags(file, crate::task::FD_CLOEXEC, nofile)?;
-    if crate::uaccess::put_user::<i32>(ptr, fd).is_err() {
-        // Released after the table lock (FilesGuard)
-        files.lock().close(fd);
-        return Err(KernelError::BadAddress);
-    }
-    Ok(fd)
-}
-
-/// A clone whose child was not made after all closes the pidfd
-/// [`clone_pidfd`] gave the caller (Linux bad_fork_put_pidfd)
-fn close_pidfd(fd: i32) {
-    if let Some(files) = current().files() {
-        // Released after the table lock (FilesGuard)
-        files.lock().close(fd);
-    }
+    crate::uaccess::put_user::<i32>(ptr, fd.fd()).map_err(|_| KernelError::BadAddress)?;
+    Ok((fd, file))
 }
 
 /// Start a thread of the current task's process that runs `f(arg)` in
@@ -3270,16 +3307,16 @@ fn leader_waits(table: &GlobalTaskTable, pid: Pid) -> bool {
 /// under TASKLIST (Linux EXIT_DEAD, then release_task after the lock)
 struct Reaped {
     t: TaskRef,
-    uid: crate::task::Uid,
+    ucounts: crate::task::UcountsRef,
 }
 
 /// Take zombie `tid` out of the task list for [`release`]
 fn reap_locked(table: &mut GlobalTaskTable, tid: Tid) -> Option<Reaped> {
-    let uid = match table.get(tid) {
-        Some(t) if matches!(t.state, TaskState::Zombie(_)) => t.cred().uid,
+    let ucounts = match table.get(tid) {
+        Some(t) if matches!(t.state, TaskState::Zombie(_)) => t.ucounts(),
         _ => return None,
     };
-    table.remove(tid).map(|t| Reaped { t, uid })
+    table.remove(tid).map(|t| Reaped { t, ucounts })
 }
 
 /// Release a zombie leader [`reap_locked`] took (Linux release_task of
@@ -3287,11 +3324,11 @@ fn reap_locked(table: &mut GlobalTaskTable, tid: Tid) -> Option<Reaped> {
 /// parent rechecks; its run queue keeps it if it still runs. TASKLIST
 /// not held.
 fn release(gone: Option<Reaped>) {
-    let Some(Reaped { t, uid }) = gone else {
+    let Some(Reaped { t, ucounts }) = gone else {
         return;
     };
     crate::fs::proc::proc_flush_pid(&t);
-    crate::task::nproc_uncharge(uid);
+    ucounts.dec(crate::task::Ucount::Nproc, 1);
     drop(t);
     crate::task::proc::CHILD_EXIT_WQ.wake_all();
 }
@@ -3314,10 +3351,10 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // robust futexes), which needs this CPU's rq lock.
     if tid != 0 {
         // Its io_uring requests end first, so none outlives the task
-        // (Linux do_exit: io_uring_files_cancel); then no callback can
-        // be queued on it any more (Linux exit_task_work)
+        // (Linux do_exit: io_uring_files_cancel, which runs the task's
+        // callbacks as it waits)
         crate::io::io_uring::task_cancel(false);
-        crate::task::task_work::exit_task_work();
+        crate::task::task_work::task_work_run();
         // Linux exit_signals sets PF_EXITING first, then hands the
         // group signals this thread would have taken to another
         set_exiting();
@@ -3356,7 +3393,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
             if let Some(task) = table.view(&me)
                 && task.task.tid() != task.task.pid
             {
-                crate::task::nproc_uncharge(task.cred().uid);
+                task.ucounts().dec(crate::task::Ucount::Nproc, 1);
             }
         }
 
@@ -3416,6 +3453,13 @@ pub fn exit_current(status: Option<i32>) -> ! {
         None
     };
     if tid != 0 {
+        // The files its descriptors, address space and the rest held
+        // are released now, before a parent can see it exited; then no
+        // callback can be queued on it any more, and a file it still
+        // drops goes to the delayed list (Linux do_exit: exit_mm,
+        // exit_files, exit_fs, exit_task_namespaces, then
+        // exit_task_work)
+        crate::task::task_work::exit_task_work();
         forget_original_parent();
         // Its signal state goes once its tracees and children are dealt
         // with: whether the process ignores SIGCHLD decides the fate of
@@ -3552,6 +3596,7 @@ fn context_switch_locked(
     next: *const Task,
 ) {
     check_switch_atomic();
+    crate::sync::rcu::note_context_switch();
     // Save the outgoing task's user TLS register and GS base (user code
     // may have changed them without a syscall, e.g. msr tpidr_el0, mov
     // gs); the arch switch loads `next`'s
@@ -4958,11 +5003,10 @@ pub fn set_task_pgid(
 ) -> KernelResult<()> {
     // Found before TASKLIST (the pid hash's lock is not nested in it)
     let target = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, new_pgid);
-    let mut old = Vec::new();
     let mut table = TASKLIST.write();
     setpgid_who(&table, caller_pid, target_pid, caller_sid)?;
     let pg = setpgid_target(&table, target_pid, new_pgid, target.as_ref(), caller_sid)?;
-    table.change_pids(target_pid, &pg, None, &mut old);
+    let old = table.change_pids(target_pid, &pg, None);
     drop(table);
     drop(old);
     Ok(())
@@ -5028,7 +5072,6 @@ fn setpgid_target(
 /// Returns the new session ID; EPERM if a session leader already, or a process group with the
 ///   caller's pid as id exists
 pub fn create_session(caller_pid: Pid) -> KernelResult<Pid> {
-    let mut old = Vec::new();
     let mut table = TASKLIST.write();
     let pid = {
         let l = table.get(caller_pid).ok_or(KernelError::NoProcess)?;
@@ -5041,7 +5084,7 @@ pub fn create_session(caller_pid: Pid) -> KernelResult<Pid> {
         pid
     };
     // The whole process: pid becomes sid and pgid
-    table.change_pids(caller_pid, &pid, Some(&pid), &mut old);
+    let old = table.change_pids(caller_pid, &pid, Some(&pid));
     drop(table);
     drop(old);
     Ok(caller_pid)
@@ -5116,6 +5159,9 @@ pub fn set_current_uid_all(uid: crate::task::Uid) -> Result<(), KernelError> {
 fn commit_uid_change(mut new_cred: crate::task::Cred) -> Result<(), KernelError> {
     let old = current_cred();
     crate::task::cap_fix_setuid(&old, &mut new_cred, current_keep_caps());
+    // The new real uid's counters (Linux __sys_setuid et al.:
+    // set_cred_ucounts before commit_creds): EAGAIN without them
+    crate::task::set_cred_ucounts(&mut new_cred)?;
     crate::task::commit_creds(try_arc(new_cred)?);
     Ok(())
 }

@@ -135,7 +135,7 @@ static NULLFS_FILE_OPS: NullfsFileOps = NullfsFileOps;
 /// mode 0555, owned by root
 fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
     let sb = SuperBlock::new(fs_type, &NULLFS_SUPER_OPS, 0)?;
-    let root = try_arc(Inode::new(
+    let root = Inode::alloc(Inode::new(
         1,
         InodeMode::directory(0o555),
         0,
@@ -156,4 +156,6 @@ pub static NULLFS_TYPE: FileSystemType = FileSystemType {
     mount,
     mount_dev: None,
     file_ops: &NULLFS_FILE_OPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };

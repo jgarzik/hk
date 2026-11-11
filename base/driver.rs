@@ -45,7 +45,12 @@ pub struct Driver {
     pub ids: Ids,
     pub probe: ProbeFn,
     dir: Once<Arc<KNode>>,
+    /// On its bus's driver list (Linux knode_bus; drivers are never
+    /// unregistered, so it stays linked)
+    pub(super) bus_link: crate::util::list::Link,
 }
+
+crate::adapter!(pub(super) DrvBus, Driver, bus_link);
 
 static MODULE_DIR: Once<Arc<KNode>> = Once::new();
 
@@ -129,6 +134,7 @@ impl Driver {
             ids,
             probe,
             dir: Once::new(),
+            bus_link: crate::util::list::Link::new(),
         }
     }
 

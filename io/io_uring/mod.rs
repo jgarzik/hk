@@ -18,8 +18,8 @@
 //!   table) and above `IoRing.cq`.
 //! - `IoRing.cq` (Linux completion_lock; spin Mutex, thread context): the
 //!   kernel's CQ tail and the overflow list; a leaf, but for the
-//!   overflow list's (Linux GFP_ATOMIC) allocation. Wakeups come after
-//!   it is released.
+//!   overflow list's growth, GFP_NOWAIT named (Linux
+//!   io_cqe_overflow_locked). Wakeups come after it is released.
 
 pub mod abi;
 mod iowq;
@@ -41,10 +41,12 @@ use abi::*;
 use rings::Rings;
 use rw::Kind;
 
+use crate::fs::FileRef;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::mm::page_alloc::Gfp;
 use crate::sync::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::current;
@@ -89,7 +91,7 @@ pub struct Submit {
     /// SQ entries consumed (Linux cached_sq_head)
     sq_head: u32,
     /// Registered files
-    files: Option<Vec<Option<Arc<File>>>>,
+    files: Option<Vec<Option<FileRef>>>,
     /// Registered buffers (Linux buf_table)
     bufs: Option<Vec<Option<Arc<rsrc::RegBuf>>>>,
     /// user_data of poll and timeout requests noted but never completed;
@@ -113,10 +115,10 @@ pub struct IoRing {
     /// Files with polled requests issued (Linux iopoll_list, by file):
     /// polled by GETEVENTS (`iopoll_check`); emptied once nothing is in
     /// flight
-    poll_files: crate::sync::spin::Mutex<KVec<Arc<File>>>,
+    poll_files: crate::sync::Mutex<KVec<FileRef>>,
     /// The user its locked memory is charged to (Linux ctx->user: none
     /// with CAP_IPC_LOCK), and its rings' pages charged
-    acct: Option<crate::task::Uid>,
+    acct: Option<crate::task::UcountsRef>,
     ring_pages: u64,
     submit: Mutex<Submit>,
     cq: crate::sync::spin::Mutex<Cq>,
@@ -136,8 +138,9 @@ pub struct IoRing {
     inflight: AtomicU32,
     /// Woken when `inflight` drops to zero
     idle: WaitQueue,
-    /// Requests held back by a drain (Linux defer_list), in order
-    defer: crate::sync::spin::Mutex<KDeque<Deferred>>,
+    /// Requests held back by a drain (Linux defer_list), in order: each
+    /// boxed before the lock and linked through its own node
+    defer: crate::sync::spin::Mutex<crate::util::list::BoxList<DeferredLink>>,
 }
 
 /// The SQEs' link state across one submission: a chain's members are
@@ -151,13 +154,17 @@ struct Link {
     sqes: KVec<IoUringSqe>,
 }
 
-/// A request a drain held back (Linux io_defer_entry)
+/// A request a drain held back (Linux io_defer_entry, allocated before
+/// list_add_tail on the defer list)
 struct Deferred {
+    link: crate::util::list::Link,
     op: opreq::OpReq,
     /// It is itself an IOSQE_IO_DRAIN request: it runs alone, after
     /// everything before it, and before everything after it
     drain: bool,
 }
+
+crate::adapter!(DeferredLink, Deferred, link);
 
 impl Submit {
     /// Registered buffer `i` (EFAULT for none: Linux io_import_reg_buf)
@@ -185,11 +192,11 @@ impl IoRing {
         let rings = Rings::new(sq, cq)?;
         let acct = rsrc::acct_user();
         let ring_pages = rings.pages();
-        rsrc::account(acct, ring_pages)?;
+        rsrc::account(acct.as_ref(), ring_pages)?;
         try_arc(Self {
             rings,
             iopoll: flags & IORING_SETUP_IOPOLL != 0,
-            poll_files: crate::sync::spin::Mutex::new(KVec::new()),
+            poll_files: crate::sync::Mutex::new(KVec::new()),
             acct,
             ring_pages,
             submit: Mutex::new(Submit {
@@ -208,7 +215,7 @@ impl IoRing {
             cq_wait: WaitQueue::new(),
             inflight: AtomicU32::new(0),
             idle: WaitQueue::new(),
-            defer: crate::sync::spin::Mutex::new(KDeque::new()),
+            defer: crate::sync::spin::Mutex::new(crate::util::list::BoxList::new()),
         })
         // A failed allocation drops the ring it was given, whose Drop
         // gives the charge back: nothing to undo here
@@ -415,10 +422,17 @@ impl IoRing {
             self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
             return true;
         }
-        let pushed = self.defer.lock().try_push_back(Deferred { op: o, drain });
-        if let Err(e) = pushed {
-            self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
-            return true;
+        let user_data = sqe.user_data;
+        match crate::util::kalloc::try_box(Deferred {
+            link: crate::util::list::Link::new(),
+            op: o,
+            drain,
+        }) {
+            Ok(d) => self.defer.lock().push_back(d),
+            Err(e) => {
+                self.post_cqe(user_data, e.to_errno_neg(), 0);
+                return true;
+            }
         }
         // Its predecessors may have ended meanwhile
         self.flush_defer();
@@ -448,7 +462,7 @@ impl IoRing {
         loop {
             let next = {
                 let mut d = self.defer.lock();
-                if d.front().is_none_or(|f| f.drain) {
+                if d.iter().next().is_none_or(|f| f.drain) {
                     return;
                 }
                 d.pop_front()
@@ -487,7 +501,7 @@ impl IoRing {
 
     /// The SQE's file: a registered one with IOSQE_FIXED_FILE, else its
     /// fd's; EBADF
-    fn sqe_file(&self, s: &Submit, sqe: &IoUringSqe) -> KernelResult<Arc<File>> {
+    fn sqe_file(&self, s: &Submit, sqe: &IoUringSqe) -> KernelResult<FileRef> {
         if sqe.flags & IOSQE_FIXED_FILE != 0 {
             let fixed = s.files.as_ref().and_then(|f| f.get(sqe.fd as u32 as usize));
             return fixed.cloned().flatten().ok_or(KernelError::BadFd);
@@ -529,14 +543,15 @@ impl IoRing {
         tail.wrapping_sub(self.rings.cq_head()) < self.rings.cq_entries()
     }
 
-    /// Keep `cqe` until there is room (Linux io_cqring_event_overflow):
+    /// Keep `cqe` until there is room (Linux io_cqe_overflow_locked,
+    /// GFP_NOWAIT under the completion lock):
     /// at most as many as the CQ holds (Linux charges each to the memory
     /// cgroup; hk has none, so the list is bounded instead), and one that
     /// does not fit is lost: counted in cq_overflow, and the next
     /// GETEVENTS wait says EBADR (Linux IO_CHECK_CQ_DROPPED_BIT)
     fn overflow(&self, cq: &mut Cq, cqe: IoUringCqe) {
         if cq.overflow.len() >= self.rings.cq_entries() as usize
-            || cq.overflow.try_push_back(cqe).is_err()
+            || cq.overflow.try_push_back_gfp(cqe, Gfp::NOWAIT).is_err()
         {
             self.rings.inc_cq_overflow();
             self.dropped.store(true, Ordering::Release);
@@ -618,7 +633,7 @@ impl IoRing {
         if s.bufs.is_some() {
             return Err(KernelError::Busy);
         }
-        s.bufs = Some(rsrc::register(&iovs, self.acct)?);
+        s.bufs = Some(rsrc::register(&iovs, self.acct.as_ref())?);
         Ok(())
     }
 
@@ -735,7 +750,7 @@ fn init_check(sqe: &IoUringSqe, iopoll: bool) -> KernelResult<()> {
 
 impl Drop for IoRing {
     fn drop(&mut self) {
-        rsrc::unaccount(self.acct, self.ring_pages);
+        rsrc::unaccount(self.acct.as_ref(), self.ring_pages);
     }
 }
 
@@ -825,7 +840,7 @@ fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
 /// A file to register: none, a path-only one or an io_uring is EBADF
 /// (Linux io_sqe_files_register: fget, io_is_uring_fops; a ring in a
 /// ring's table would keep both alive forever)
-fn reg_file(f: Option<Arc<File>>) -> KernelResult<Arc<File>> {
+fn reg_file(f: Option<FileRef>) -> KernelResult<FileRef> {
     f.filter(|f| !f.is_path() && !is_uring(f))
         .ok_or(KernelError::BadFd)
 }

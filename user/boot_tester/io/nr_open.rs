@@ -13,6 +13,10 @@
 //!   descriptor past it is EMFILE (F_DUPFD) and dup3 to one is EBADF
 //! - DUP3_RLIMIT: dup3 to a descriptor at or past RLIMIT_NOFILE is
 //!   EBADF and leaves that descriptor open
+//! - FDTABLE_GROW: with RLIMIT_NOFILE raised, dup3 to descriptor 500000
+//!   grows the table to the next power of two (FDSize 524288), a fork
+//!   child gets a copy holding it, the table does not shrink when it
+//!   closes, and a later child's copy is sized by its open descriptors
 //!
 //! fs.nr_open is global: every test puts 1048576 back.
 
@@ -20,8 +24,8 @@ use crate::harness::report_step;
 use crate::proc::sysctl::{read_file, write_file};
 use core::ptr;
 use hk_syscall::{
-    O_RDONLY, RLIM_INFINITY, RLIMIT_NOFILE, RLimit, sys_close, sys_dup3, sys_fcntl, sys_getrlimit,
-    sys_open, sys_prlimit64, sys_setrlimit,
+    O_RDONLY, RLIM_INFINITY, RLIMIT_NOFILE, RLimit, sys_close, sys_dup3, sys_exit, sys_fcntl,
+    sys_fork, sys_getrlimit, sys_open, sys_prlimit64, sys_setrlimit, sys_wait4,
 };
 
 const PATH: &[u8] = b"/proc/sys/fs/nr_open\0";
@@ -39,6 +43,7 @@ pub fn run_tests() {
     report_step(b"NR_OPEN_RLIMIT", rlimit());
     report_step(b"NR_OPEN_ALLOC", alloc());
     report_step(b"DUP3_RLIMIT", dup3_rlimit());
+    report_step(b"FDTABLE_GROW", grow());
 }
 
 /// fs.nr_open, or -1
@@ -190,5 +195,75 @@ fn dup3_rlimit() -> i64 {
     sys_setrlimit(RLIMIT_NOFILE, &old);
     sys_close(100);
     sys_close(fd as u64);
+    step
+}
+
+/// FDSize of /proc/self/status (the table's max_fds), or -1
+fn fd_size() -> i64 {
+    const KEY: &[u8] = b"FDSize:";
+    let mut b = [0u8; 4096];
+    let n = read_file(b"/proc/self/status\0", &mut b).max(0) as usize;
+    let Some(at) = b[..n].windows(KEY.len()).position(|w| w == KEY) else {
+        return -1;
+    };
+    let mut v = -1i64;
+    for &c in b[at + KEY.len()..n]
+        .iter()
+        .skip_while(|c| c.is_ascii_whitespace())
+    {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        v = v.max(0) * 10 + (c - b'0') as i64;
+    }
+    v
+}
+
+/// A fork child's exit code: `check` run in the child
+fn in_child(check: fn() -> i32) -> i32 {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(check() as u64);
+    }
+    let mut st = 0;
+    if pid < 0 || sys_wait4(pid, &mut st, 0, 0) != pid || st & 0x7f != 0 {
+        return -1;
+    }
+    (st >> 8) & 0xff
+}
+
+const HIGH: i32 = 500000;
+/// The table that holds HIGH (Linux alloc_fdtable: a power of two)
+const HIGH_SIZE: i64 = 524288;
+
+fn grow() -> i64 {
+    let mut old = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    sys_getrlimit(RLIMIT_NOFILE, &mut old);
+    let fd = sys_open(b"/\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 || set_nofile(HIGH as u64 + 1, HIGH as u64 + 1) != 0 {
+        sys_close(fd as u64);
+        return 1;
+    }
+    let step = if sys_dup3(fd as i32, HIGH, 0) != i64::from(HIGH) {
+        2
+    } else if fd_size() != HIGH_SIZE {
+        3
+    } else if in_child(|| i32::from(sys_fcntl(HIGH, F_GETFD, 0) != 0 || fd_size() != HIGH_SIZE))
+        != 0
+    {
+        4
+    } else if sys_close(HIGH as u64) != 0 || fd_size() != HIGH_SIZE {
+        5
+    } else if in_child(|| i32::from(fd_size() >= HIGH_SIZE)) != 0 {
+        6
+    } else {
+        0
+    };
+    sys_close(HIGH as u64);
+    sys_close(fd as u64);
+    sys_setrlimit(RLIMIT_NOFILE, &old);
     step
 }

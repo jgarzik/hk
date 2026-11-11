@@ -1,6 +1,5 @@
 //! /sys/kernel (Linux kernel/ksysfs.c, mm/mm_init.c mm_sysfs_init)
 
-use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -13,18 +12,22 @@ use crate::util::kalloc::arc_nofail;
 /// Sequence number of the last uevent (Linux uevent_seqnum)
 pub static UEVENT_SEQNUM: AtomicU64 = AtomicU64::new(0);
 
-/// Program run for each uevent; empty: none (Linux uevent_helper,
-/// CONFIG_UEVENT_HELPER_PATH ""; spin leaf)
-static UEVENT_HELPER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-
 /// Linux UEVENT_HELPER_PATH_LEN
 const UEVENT_HELPER_PATH_LEN: usize = 256;
+
+/// Program run for each uevent and its length; empty: none (Linux
+/// uevent_helper, a fixed char array, CONFIG_UEVENT_HELPER_PATH ""; spin
+/// leaf, nothing allocated under it)
+static UEVENT_HELPER: Mutex<([u8; UEVENT_HELPER_PATH_LEN], usize)> =
+    Mutex::new(([0; UEVENT_HELPER_PATH_LEN], 0));
 
 struct UeventHelper;
 
 impl Attr for UeventHelper {
     fn show(&self, out: &mut SysBuf) -> Result<(), KernelError> {
-        out.bytes(&UEVENT_HELPER.lock());
+        // Copied out, then emitted with the lock released
+        let (b, n) = *UEVENT_HELPER.lock();
+        out.bytes(&b[..n]);
         out.bytes(b"\n");
         Ok(())
     }
@@ -36,7 +39,9 @@ impl Attr for UeventHelper {
             return Err(KernelError::NotFound);
         }
         let v = data.strip_suffix(b"\n").unwrap_or(data);
-        *UEVENT_HELPER.lock() = v.to_vec();
+        let mut h = UEVENT_HELPER.lock();
+        h.0[..v.len()].copy_from_slice(v);
+        h.1 = v.len();
         Ok(data.len())
     }
 }

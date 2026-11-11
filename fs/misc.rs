@@ -183,7 +183,7 @@ fn reconfigure_mnt(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), Kerne
 /// do_change_type): exactly one type (else EINVAL), for the subtree
 /// with MS_REC
 fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
-    use super::pnode::{Prop, change_propagation, subtree};
+    use super::pnode::{Prop, change_propagation};
     let p = match flags & !(ms::REC | ms::SILENT) {
         ms::SHARED => Prop::Shared,
         ms::SLAVE => Prop::Slave,
@@ -191,19 +191,18 @@ fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelErr
         ms::UNBINDABLE => Prop::Unbindable,
         _ => return Err(KernelError::InvalidArgument),
     };
-    let _ns = super::mount::NAMESPACE_SEM.write();
+    let ns = super::mount::namespace_lock();
     // Mounted in some namespace (Linux may_change_propagation: not
     // necessarily the caller's)
     if m.ns() == 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let targets = if flags & ms::REC != 0 {
-        subtree(m)
+    if flags & ms::REC != 0 {
+        for t in super::mount::walk(m, &*ns) {
+            change_propagation(&t, p);
+        }
     } else {
-        alloc::vec![m.clone()]
-    };
-    for t in targets {
-        change_propagation(&t, p);
+        change_propagation(m, p);
     }
     Ok(())
 }

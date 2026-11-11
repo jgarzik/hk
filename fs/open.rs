@@ -3,6 +3,7 @@
 use alloc::sync::Arc;
 
 use super::file::EMPTY_FOPS;
+use crate::fs::FileRef;
 use crate::fs::namei::{CreateAt, Last, Nd, filename_lookup, getname, path_start};
 use crate::fs::{
     Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac, lookup_one,
@@ -15,11 +16,10 @@ use super::flags::{
     O_TRUNC, VALID_OPEN_FLAGS,
 };
 use super::mount::MNT_NODEV;
-use super::syscall::{current_fd_table, get_nofile_limit};
+use super::syscall::current_fd_table;
 use crate::task::FD_CLOEXEC;
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
-use crate::util::kalloc::try_arc;
 
 /// Create regular file `name` in `parent` for O_CREAT (Linux
 /// lookup_open + may_o_create) under the parent's lock: an entry that
@@ -340,23 +340,24 @@ fn do_sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: &OpenHow) -> KernelRes
     let op = build_open_flags(how)?;
     // O_EMPTYPATH: an empty name is dirfd itself (Linux LOOKUP_EMPTY)
     let path = getname(path_ptr, op.flags & O_EMPTYPATH != 0)?;
-    let file = filp_open(dirfd, &path, &op)?;
-    // RLIMIT_NOFILE enforced inside alloc
+    // The descriptor is reserved before the open (Linux FD_ADD:
+    // get_unused_fd_flags, then do_file_open; EMFILE first) and
+    // released if it fails
     let fd_flags = if how.flags & u64::from(O_CLOEXEC) != 0 {
         FD_CLOEXEC
     } else {
         0
     };
-    current_fd_table()
-        .lock()
-        .alloc_with_flags(file, fd_flags, get_nofile_limit())
+    let fd = super::io::get_unused_fd_flags(fd_flags)?;
+    let file = filp_open(dirfd, &path, &op)?;
+    Ok(fd.install(file))
 }
 
 /// O_TMPFILE (Linux do_tmpfile, vfs_tmpfile): an unnamed regular file in
 /// the directory `path`; ENOTDIR or ENOENT from the walk, EROFS, then
 /// write and search on the directory (EACCES), EOPNOTSUPP from a file
 /// system without tmpfile. Linkable unless O_EXCL.
-fn tmpfile_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, KernelError> {
+fn tmpfile_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
     let lf = LookupFlags {
         directory: true,
         ..op.lookup
@@ -391,16 +392,16 @@ fn tmpfile_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, Ke
 /// walk alone (a final symlink with O_NOFOLLOW is the link itself,
 /// O_DIRECTORY is ENOTDIR on anything else), with no permission check,
 /// device or FIFO open, write access or ->open; the file does no I/O
-fn do_o_path(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, KernelError> {
+fn do_o_path(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
     let p = filename_lookup(dirfd, path, op.lookup)?;
     let file = File::new(p.dentry.clone(), Some(p.mnt.clone()), op.flags, &EMPTY_FOPS);
-    try_arc(file)
+    file.alloc()
 }
 
 /// The end of an open (Linux do_dentry_open): `->open`, then the flags
 /// that only steered the open leave f_flags; O_DIRECT on a file that
 /// cannot take it is EINVAL, after `->open` (the file is released)
-fn dentry_open(mut file: File) -> Result<Arc<File>, KernelError> {
+fn dentry_open(mut file: File) -> Result<FileRef, KernelError> {
     file.f_op.open(&file)?;
     file.sample_wb_err();
     file.set_can_odirect();
@@ -408,12 +409,12 @@ fn dentry_open(mut file: File) -> Result<Arc<File>, KernelError> {
     if file.get_flags() & O_DIRECT != 0 && !file.can_odirect() {
         return Err(KernelError::InvalidArgument);
     }
-    try_arc(file)
+    file.alloc()
 }
 
 /// Open `path` (relative to `start`) as a new file (Linux do_filp_open):
 /// resolve or create the target, may_open, O_TRUNC, then the file object
-fn filp_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<Arc<File>, KernelError> {
+fn filp_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
     let flags = op.flags;
     if flags & O_PATH != 0 {
         return do_o_path(dirfd, path, op);
@@ -513,20 +514,22 @@ pub fn console_on_rootfs() {
         crate::printkln!("Warning: unable to open an initial console.");
         return;
     };
-    let table = current_fd_table();
-    let mut t = table.lock();
-    for fd in 0..3 {
-        t.alloc_at(fd, file.clone());
+    // Linux init_dup: descriptors 0, 1 and 2, the lowest free
+    for _ in 0..3 {
+        let _ = super::io::fd_install(file.clone(), 0);
     }
 }
 
-/// sys_close - close a file descriptor
+/// close(2) (Linux fs/open.c): the descriptor goes under the table
+/// lock; after it the file is flushed, the caller's POSIX locks on it
+/// go, and the last reference releases it before the call returns
+/// (`fput_close_sync`)
 pub fn sys_close(fd: i32) -> KernelResult<()> {
-    if current_fd_table().lock().close(fd) {
-        Ok(())
-    } else {
-        Err(KernelError::BadFd)
-    }
+    let files = current_fd_table();
+    let file = files.close_fd(fd).ok_or(KernelError::BadFd)?;
+    crate::fs::file::filp_flush(&file, files.id());
+    crate::fs::file::fput_close_sync(file);
+    Ok(())
 }
 
 /// close_range(2) flags
@@ -546,16 +549,12 @@ pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> KernelResult<()> {
     } else {
         current_fd_table()
     };
-    // Descriptors are i32: nothing is open above i32::MAX
-    let Ok(lo) = i32::try_from(fd) else {
-        return Ok(());
-    };
-    let hi = i32::try_from(max_fd).unwrap_or(i32::MAX);
-    let mut t = files.lock();
+    // Only descriptors below the table's size are visited
+    let (lo, hi) = (fd as usize, max_fd as usize);
     if flags & CLOSE_RANGE_CLOEXEC != 0 {
-        t.cloexec_range(lo, hi);
+        files.range_cloexec(lo, hi);
     } else {
-        t.close_range(lo, hi);
+        files.range_close(lo, hi);
     }
     Ok(())
 }

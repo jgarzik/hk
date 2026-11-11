@@ -11,7 +11,7 @@ phase end. Gaps a phase leaves go to BUGS.md.
 
 | # | Phase | Why here |
 |---|-------|----------|
-| 1 | A — heap allocations out of spin locks | the LOCKDEP ATOMIC_ALLOC list; before more code grows collections under spin locks |
+| 1 | A — heap allocations out of atomic context | the LOCKDEP ATOMIC_ALLOC list; before more code grows collections under spin locks |
 | 2 | C — group stop, job control, ptrace stops | Debian JOBCTL; VT needs stops |
 | 3 | Y — tty and console core | prerequisite of devpts (4) and VT (7) |
 | 4 | H — Debian kernel interfaces | DEB_SH, DEB_RCS |
@@ -34,15 +34,27 @@ driver packages and loader, native escape modules). Only its
 preparatory items are in the phases above (M4, D's firmware
 loading); HADL itself waits for the owner's go-ahead.
 
-## 1. A — heap allocations out of spin locks
+## 1. A — heap allocations out of atomic context
 
 Every site a LOCKDEP boot lists as `LOCKDEP:ATOMIC_ALLOC` (BUGS.md
-"Heap allocations under spin locks") moves its allocation out of the
-spin lock, per subsystem (net, fs, task, ipc, cgroup, keys, base):
-preallocate before locking and retry if the collection grew, link
-preallocated intrusive nodes, or a sleeping lock where Linux has one.
-Ends when a LOCKDEP boot lists none outside interrupt context; then
-lockdep reports an allocation under a spin lock as a failure.
+"Heap allocations in atomic context": any spin lock, preemption or
+interrupts off) moves its allocation out, in Linux's shape: first ask
+whether Linux allocates there at all (intrusive links, iteration under
+the lock or RCU instead of a copied snapshot), then a sleeping lock
+where Linux has one, allocation before the lock (preload, retry if it
+grew), and a GFP named at the call where Linux itself allocates
+GFP_ATOMIC/GFP_NOWAIT under that lock. Each sub-phase starts with a
+design pass and ends with /code-review and the heavy gate.
+
+- A0 infrastructure: the full might_alloc audit; GFP named per call;
+  RCU; an intrusive rbtree and RCU hash lists, each with a first user;
+  the locks Linux makes sleeping (cgroup_mutex, key->sem, kernfs_rwsem,
+  ep->mtx, mark_mutex, net_rwsem, lock_sock, cb_mutex...).
+- A1 task, ipc, time, signal, keys, cgroup, fs, io, mm, block, hw, bpf,
+  base.
+- A2 net.
+- A3 an unnamed allocation in atomic context fails in every build
+  (`MIGHT_ALLOC:FAIL`, Linux CONFIG_DEBUG_ATOMIC_SLEEP).
 
 ## 2. C — group stop, job control, ptrace stops
 

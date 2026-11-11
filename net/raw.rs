@@ -16,6 +16,7 @@
 //! delivery clones the matching `Arc`s and queues (`RxQueue`, leaf)
 //! after dropping the table lock. `RawSock.filter` is an atomic.
 
+use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -26,7 +27,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::sync::spin::RwLock;
 
 use crate::net::af_inet::{self, Inet, RxInfo, SOL_IP, ipf};
-use crate::net::dgram::{self, Dgram, RxQueue};
+use crate::net::dgram::{self, RxQueue};
 use crate::net::icmp::{self, IcmpErr, icmp_type};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::route;
@@ -163,7 +164,8 @@ impl RawSock {
         if ihl > data.len() || ihl < IP_HLEN_MIN {
             return Err(KernelError::InvalidArgument);
         }
-        let mut skb = SkBuff::alloc_tx(data.len()).ok_or(KernelError::NoBufferSpace)?;
+        let mut skb =
+            SkBuff::alloc_tx(data.len(), Gfp::KERNEL).ok_or(KernelError::NoBufferSpace)?;
         skb.put_slice(data).ok_or(KernelError::NoBufferSpace)?;
         let h = skb.data_mut();
         if h[12..16] == [0; 4] {
@@ -360,7 +362,7 @@ impl ProtoOps for RawSock {
         if self.inet.flag(ipf::HDRINCL) {
             return self.send_hdrinc(&rt, &data).map(|()| len);
         }
-        let mut skb = SkBuff::alloc_tx(len).ok_or(KernelError::NoBufferSpace)?;
+        let mut skb = SkBuff::alloc_tx(len, Gfp::KERNEL).ok_or(KernelError::NoBufferSpace)?;
         skb.put_slice(&data).ok_or(KernelError::NoBufferSpace)?;
         skb.saddr = Some(rt.saddr);
         skb.daddr = Some(rt.daddr);
@@ -438,7 +440,7 @@ impl RawTable {
 /// marked). Returns whether any socket matched (even if it filtered the
 /// packet or its buffer was full): then no protocol unreachable is sent.
 pub fn raw_deliver(net: &NetNamespace, skb: &SkBuff) -> bool {
-    let Some(pkt) = skb.network_packet() else {
+    let Some(nhoff) = skb.network_offset() else {
         return false;
     };
     let (saddr, daddr) = (skb.saddr.unwrap_or_default(), skb.daddr.unwrap_or_default());
@@ -453,11 +455,17 @@ pub fn raw_deliver(net: &NetNamespace, skb: &SkBuff) -> bool {
         if icmp && skb.data().first().is_none_or(|&t| s.filtered(t)) {
             continue;
         }
-        // No copy, no delivery (Linux raw_v4_input: a failed skb_clone
-        // skips the socket)
-        if let Some(d) = Dgram::copy(saddr, 0, pkt, info) {
-            s.rxq.enqueue(&s.sk, d);
+        // No clone, no delivery (Linux raw_v4_input: a failed
+        // skb_clone(GFP_ATOMIC) skips the socket); the clone reads from
+        // its IP header (Linux raw_rcv's skb_push)
+        let Some(mut c) = skb.clone_gfp(Gfp::ATOMIC) else {
+            continue;
+        };
+        if c.push(nhoff).is_none() {
+            continue;
         }
+        dgram::prepare(&mut c, info, 0);
+        s.rxq.enqueue(&s.sk, c);
     }
     true
 }

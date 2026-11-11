@@ -17,7 +17,7 @@
 
 extern crate alloc;
 
-use crate::sync::spin::Mutex;
+use crate::sync::Mutex;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -56,7 +56,8 @@ struct SimpleGfxState {
 
 /// SimpleDRM driver for firmware framebuffers
 pub struct SimpleGfxDevice {
-    /// Driver state protected by mutex
+    /// Driver state: a sleeping lock (Linux DRM's modeset locks are
+    /// mutexes), taken only by the DRM ioctls
     state: Mutex<SimpleGfxState>,
 }
 

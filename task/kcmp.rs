@@ -118,7 +118,7 @@ fn lock_key(t: &Task, kcmp_type: i32) -> Option<u64> {
 fn fd_key(t: &Task, idx: u64) -> Option<u64> {
     let files = t.task_lock().files().cloned()?;
     let f = files.lock().get(idx as i32)?;
-    Some(Arc::as_ptr(&f) as u64)
+    Some(crate::fs::FileRef::as_ptr(&f) as u64)
 }
 
 /// kcmp syscall implementation

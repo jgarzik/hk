@@ -141,7 +141,10 @@ impl MntNamespace {
 
     /// Set the root mount
     pub fn set_root(&self, mount: Arc<Mount>) {
-        *self.root.write() = Some(mount);
+        // The old root goes after the unlock (`Mount`: never the last
+        // reference under a spin lock)
+        let old = self.root.write().replace(mount);
+        drop(old);
     }
 
     /// Get the root mount

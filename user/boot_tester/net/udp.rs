@@ -28,6 +28,7 @@ pub fn run_tests() {
     test_ttl_tos();
     test_timestamp();
     test_broadcast();
+    test_broadcast_many();
     test_poll_epoll();
     test_shut_rd();
     test_errqueue();
@@ -372,6 +373,44 @@ fn test_broadcast() {
     let (n, ev) = poll1(r, 1, 2000);
     t.ok(b"received", n == 1 && ev & 1 != 0, ev as i64);
     close(r);
+    close(s);
+    t.done();
+}
+
+/// A broadcast reaches every wildcard-bound SO_REUSEADDR socket on the
+/// port, each with its own copy: one peeked and read, the others read
+fn test_broadcast_many() {
+    let mut t = T::new(b"UDP_BROADCAST_MANY");
+    let r = [udp(), udp(), udp()];
+    for &fd in &r {
+        setint(fd, SOL_SOCKET, SO_REUSEADDR, 1);
+    }
+    t.eq(b"bind first", bind(r[0], ANY, 0), 0);
+    let pr = port(r[0]);
+    t.eq(b"bind second", bind(r[1], ANY, pr), 0);
+    t.eq(b"bind third", bind(r[2], ANY, pr), 0);
+    let s = udp();
+    setint(s, SOL_SOCKET, SO_BROADCAST, 1);
+    t.eq(
+        b"sendto",
+        send_to(s, b"bcast", [127, 255, 255, 255], pr, 0),
+        5,
+    );
+    let mut buf = [0u8; 16];
+    let names: [&[u8]; 3] = [b"readable 1", b"readable 2", b"readable 3"];
+    for (&fd, name) in r.iter().zip(names) {
+        t.eq(name, poll1(fd, 1, 2000).0, 1);
+    }
+    t.eq(b"peek", recv(r[1], &mut buf, MSG_PEEK | MSG_DONTWAIT), 5);
+    for &fd in &r {
+        buf.fill(0);
+        let n = recv(fd, &mut buf, MSG_DONTWAIT);
+        t.ok(b"copy", n == 5 && &buf[..5] == b"bcast", n);
+        t.eq(b"one each", recv(fd, &mut buf, MSG_DONTWAIT), EAGAIN);
+    }
+    for fd in r {
+        close(fd);
+    }
     close(s);
     t.done();
 }

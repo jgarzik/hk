@@ -3,11 +3,12 @@
 //!
 //! Send side: `Scm::parse` turns SOL_SOCKET control messages into a
 //! cookie: SCM_RIGHTS files (at most `SCM_MAX_FD` per message, held as
-//! `Arc<File>`) and SCM_CREDENTIALS (only values the sender could set
+//! `FileRef`) and SCM_CREDENTIALS (only values the sender could set
 //! with setuid/setgid, its own pid unless CAP_SYS_ADMIN).
 //!
-//! Files in flight are charged to the sending user (`INFLIGHT`, Linux
-//! user->unix_inflight) from the moment they are queued until they are
+//! Files in flight are charged to the sending user (its ucounts'
+//! `UnixInflight`, Linux user->unix_inflight) from the moment they are
+//! queued until they are
 //! received or their message is dropped. Attaching more while the
 //! user's count exceeds RLIMIT_NOFILE is ETOOMANYREFS (Linux
 //! too_many_unix_fds). There is no garbage collector for unreachable
@@ -19,24 +20,22 @@
 //! do not fit the control buffer are closed and MSG_CTRUNC is set.
 //!
 //! Dropping files can release sockets whose queues hold more files
-//! (recursively, without bound); `defer_fput` drops them iteratively
-//! from one place, never from inside a socket lock.
+//! (recursively, without bound): `fput` defers each release (task_work
+//! or the delayed list), so chains are released one file at a time,
+//! never from inside a socket lock.
 //!
 //! ## Locking
 //!
-//! `INFLIGHT` and `DEFERRED` are `crate::sync::spin::Mutex` leaves (thread context
-//! only); no file is ever dropped while either is held.
+//! The in-flight count is an atomic of the sender's ucounts: charging
+//! (under the receiver's `st`) takes no lock and allocates nothing.
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::sync::spin::Mutex;
-
-use crate::fs::file::File;
+use crate::fs::FileRef;
 use crate::net::msg::{MSG_CMSG_CLOEXEC, RecvMsg, cmsgs};
 use crate::net::socket::SOL_SOCKET;
-use crate::task::Uid;
+use crate::task::ucount::{Ucount, UcountsRef};
 use crate::util::error::KernelError;
 
 pub const SCM_RIGHTS: i32 = 1;
@@ -99,27 +98,10 @@ impl Creds {
 
 /// Files of one message (Linux struct scm_fp_list)
 pub struct FpList {
-    files: Vec<Arc<File>>,
-    /// Sending user, charged while queued
-    uid: Uid,
+    files: Vec<FileRef>,
+    /// Sending user, charged while queued (Linux fpl->user)
+    user: UcountsRef,
     inflight: bool,
-}
-
-/// In-flight files per user (Linux user_struct.unix_inflight)
-static INFLIGHT: Mutex<BTreeMap<Uid, usize>> = Mutex::new(BTreeMap::new());
-
-fn inflight_add(uid: Uid, n: usize) {
-    *INFLIGHT.lock().entry(uid).or_insert(0) += n;
-}
-
-fn inflight_sub(uid: Uid, n: usize) {
-    let mut t = INFLIGHT.lock();
-    if let Some(v) = t.get_mut(&uid) {
-        *v = v.saturating_sub(n);
-        if *v == 0 {
-            t.remove(&uid);
-        }
-    }
 }
 
 /// Ceiling on a user's in-flight files whatever its RLIMIT_NOFILE
@@ -133,8 +115,9 @@ const INFLIGHT_MAX: u64 = (SCM_MAX_FD * 8) as u64;
 /// RLIMIT_NOFILE (and over `INFLIGHT_MAX` here) and it lacks
 /// CAP_SYS_RESOURCE and CAP_SYS_ADMIN
 pub fn too_many_fds() -> bool {
-    let uid = crate::task::current_cred().uid;
-    let n = INFLIGHT.lock().get(&uid).copied().unwrap_or(0) as u64;
+    let n = crate::task::current_cred()
+        .ucounts
+        .get(Ucount::UnixInflight);
     let lim = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE).min(INFLIGHT_MAX);
     n > lim
         && !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
@@ -154,7 +137,7 @@ impl FpList {
     /// unix_add_edges)
     pub fn queued(&mut self) {
         if !self.inflight {
-            inflight_add(self.uid, self.files.len());
+            self.user.inc(Ucount::UnixInflight, self.files.len() as u64);
             self.inflight = true;
         }
     }
@@ -162,7 +145,7 @@ impl FpList {
     /// Received or dropped (Linux unix_del_edges)
     fn uncharge(&mut self) {
         if self.inflight {
-            inflight_sub(self.uid, self.files.len());
+            self.user.dec(Ucount::UnixInflight, self.files.len() as u64);
             self.inflight = false;
         }
     }
@@ -171,64 +154,24 @@ impl FpList {
     pub fn dup(&self) -> Self {
         Self {
             files: self.files.clone(),
-            uid: self.uid,
+            user: self.user.clone(),
             inflight: false,
         }
     }
 
     /// Take the files out (received): no longer in flight
-    fn take(mut self) -> Vec<Arc<File>> {
+    fn take(mut self) -> Vec<FileRef> {
         self.uncharge();
         core::mem::take(&mut self.files)
     }
 }
 
+/// Dropped unreceived: uncharged; its files' references go with it
+/// (`fput`: a socket among them is released later, not under the lock
+/// of the queue that held the message)
 impl Drop for FpList {
     fn drop(&mut self) {
         self.uncharge();
-        defer_fput(core::mem::take(&mut self.files));
-    }
-}
-
-/// Drop `files` with no lock held (Linux defers fput to task work, run
-/// by the same task before it returns to user space). A drop that
-/// releases a socket whose queue holds files lands here again in the
-/// same task: those are queued on the task's `fput_defer` list and
-/// dropped by the outer frame's loop, so chains of sockets in flight
-/// never recurse. Each task drains its own files (a sleeping release,
-/// e.g. SO_LINGER, delays only the task that dropped it). Callers hold
-/// no locks.
-pub fn defer_fput(files: Vec<Arc<File>>) {
-    if files.is_empty() {
-        return;
-    }
-    let me = crate::task::percpu::current();
-    {
-        let mut d = me.fput_defer.lock();
-        if let Some(q) = d.as_mut() {
-            // An outer frame of this task is draining: it takes them
-            q.extend(files);
-            return;
-        }
-        *d = Some(Vec::new());
-    }
-    let mut pending = files;
-    loop {
-        for f in pending.drain(..) {
-            drop(f);
-        }
-        let more = {
-            let mut d = me.fput_defer.lock();
-            let q = d.as_mut().map(core::mem::take).unwrap_or_default();
-            if q.is_empty() {
-                *d = None;
-            }
-            q
-        };
-        if more.is_empty() {
-            return;
-        }
-        pending = more;
     }
 }
 
@@ -271,7 +214,7 @@ impl Scm {
         }
         let fpl = self.fds.get_or_insert_with(|| FpList {
             files: Vec::new(),
-            uid: crate::task::current_cred().uid,
+            user: crate::task::current_cred().ucounts,
             inflight: false,
         });
         if n > SCM_MAX_FD || fpl.files.len() + n > SCM_MAX_FD {
@@ -361,8 +304,6 @@ fn put_fds(m: &mut RecvMsg<'_>, fpl: FpList) {
     let files = fpl.take();
     let count = files.len();
     let mut fds = Vec::new();
-    // Clones go to the table, so a failed install never drops the last
-    // reference under the table lock
     for f in files.iter().take(max) {
         match crate::net::syscall::fd_install(f.clone(), cloexec) {
             Ok(fd) => fds.extend_from_slice(&fd.to_ne_bytes()),
@@ -376,5 +317,5 @@ fn put_fds(m: &mut RecvMsg<'_>, fpl: FpList) {
     if n < count {
         m.cmsg.trunc = true;
     }
-    defer_fput(files);
+    drop(files);
 }

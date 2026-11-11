@@ -22,7 +22,7 @@ use super::rw::{Req, ReqAdapter};
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::current;
-use crate::task::task_work::{CallbackHead, TaskWork, task_work_add, task_work_run};
+use crate::task::task_work::{TaskWork, WorkHead, task_work_run};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
 use crate::util::kmem::KVec;
@@ -33,15 +33,17 @@ pub struct Tctx {
     /// Ended requests to finish in the task's context (Linux task_list)
     reqs: IrqSpinlock<ArcList<ReqAdapter>>,
     /// Queued on the task while `reqs` holds requests
-    cb: Arc<CallbackHead>,
+    cb: Arc<WorkHead>,
     /// Requests of the task in flight (Linux tctx->inflight)
     inflight: AtomicU32,
     /// Woken when `inflight` drops to zero
     idle: WaitQueue,
     /// IOPOLL rings it issued polled requests on: nothing but polling
     /// ends those, so `cancel` polls them (Linux io_uring_cancel_generic
-    /// -> io_iopoll_try_reap_events)
-    polled: crate::sync::spin::Mutex<KVec<Weak<IoRing>>>,
+    /// -> io_iopoll_try_reap_events). A sleeping lock: noted at submit
+    /// and walked by the cancel's polls, thread context (Linux keeps
+    /// tctx->xa changed only by its task); -> `IoRing.poll_files`
+    polled: crate::sync::Mutex<KVec<Weak<IoRing>>>,
     /// Its io-wq, made by its first request that needs one and gone at
     /// exit or exec (Linux tctx->io_wq, tctx->in_cancel)
     io_wq: WqSlot<IoWq>,
@@ -135,13 +137,13 @@ impl TaskWork for Tctx {
 
 impl Tctx {
     fn new() -> KernelResult<Arc<Self>> {
-        let cb = try_arc(CallbackHead::new())?;
+        let cb = try_arc(WorkHead::new())?;
         let t = try_arc(Self {
             reqs: IrqSpinlock::new(ArcList::new()),
             cb: cb.clone(),
             inflight: AtomicU32::new(0),
             idle: WaitQueue::new(),
-            polled: crate::sync::spin::Mutex::new(KVec::new()),
+            polled: crate::sync::Mutex::new(KVec::new()),
             io_wq: WqSlot::new(),
         })?;
         // Named weakly: a queued callback never keeps the context alive
@@ -179,7 +181,7 @@ impl Tctx {
         // A task that has exited finishes its requests itself first
         // (`cancel`): nothing is lost if this fails
         if l.is_empty() {
-            let _ = task_work_add(req.task(), &self.cb);
+            let _ = self.cb.queue(req.task());
         }
         l.push_back(req);
     }
@@ -205,17 +207,11 @@ impl Tctx {
     /// Poll the IOPOLL rings the task issued on, once; rings gone are
     /// dropped from the list
     fn poll_rings(&self) {
-        let rings: KVec<Arc<IoRing>> = {
-            let mut l = self.polled.lock();
-            prune(&mut l);
-            let mut v = KVec::new();
-            for r in l.iter().filter_map(Weak::upgrade) {
-                // Room is not reserved: a ring left out is polled next time
-                let _ = v.try_push(r);
-            }
-            v
-        };
-        for r in rings.iter() {
+        // Walked in place (Linux xa_for_each over tctx->xa): the list is
+        // a sleeping lock and a ring's drop never touches it
+        let mut l = self.polled.lock();
+        prune(&mut l);
+        for r in l.iter().filter_map(Weak::upgrade) {
             r.poll_once();
         }
     }

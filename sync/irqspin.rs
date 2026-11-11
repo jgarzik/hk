@@ -55,6 +55,11 @@ impl<T> IrqSpinlock<T> {
         }
     }
 
+    /// The data, through exclusive access (no lock needed)
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
     /// Acquire the lock, disabling interrupts and preemption
     ///
     /// This is equivalent to Linux's spin_lock_irqsave():
@@ -64,6 +69,7 @@ impl<T> IrqSpinlock<T> {
     ///
     /// Returns a guard that releases the lock and restores state on drop.
     #[inline]
+    #[cfg_attr(feature = "lockdep", track_caller)]
     pub fn lock(&self) -> IrqSpinlockGuard<'_, T> {
         let irq_state = irqflags::save();
         percpu::preempt_disable();
@@ -74,7 +80,7 @@ impl<T> IrqSpinlock<T> {
         {
             core::hint::spin_loop();
         }
-        crate::sync::lockdep::irqsafe_acquire();
+        crate::sync::lockdep::irqsafe_acquire(::core::panic::Location::caller());
         IrqSpinlockGuard {
             lock: self,
             irq_state,
@@ -87,6 +93,7 @@ impl<T> IrqSpinlock<T> {
     /// Returns Some(guard) if the lock was acquired, None if it was already held.
     /// This is useful in interrupt context where blocking is not allowed.
     #[inline]
+    #[cfg_attr(feature = "lockdep", track_caller)]
     pub fn try_lock(&self) -> Option<IrqSpinlockGuard<'_, T>> {
         let irq_state = irqflags::save();
         percpu::preempt_disable();
@@ -95,7 +102,7 @@ impl<T> IrqSpinlock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            crate::sync::lockdep::irqsafe_acquire();
+            crate::sync::lockdep::irqsafe_acquire(::core::panic::Location::caller());
             Some(IrqSpinlockGuard {
                 lock: self,
                 irq_state,

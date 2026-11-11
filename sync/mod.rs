@@ -17,13 +17,14 @@ pub mod lockdep;
 mod locked_by;
 mod mutex;
 mod racy;
+pub mod rcu;
 mod rwsem;
 mod seqlock;
 pub mod spin;
 
 pub use irqflags::{IrqFlags, irqs_disabled, local_irq_restore, local_irq_save};
 pub use irqspin::{IrqSpinlock, IrqSpinlockGuard};
-pub use locked_by::{LockedBy, UniqueOwner};
+pub use locked_by::{LockedBy, LockedByEither, UniqueOwner};
 pub use mutex::{Mutex, MutexGuard};
 pub use racy::RacyCell;
 pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
@@ -153,9 +154,22 @@ pub fn might_sleep() {
     lockdep::might_sleep();
     // Host unit tests have no CPU state to check
     #[cfg(not(any(feature = "lockdep", test)))]
-    if sched::can_sleep() && in_atomic() {
+    if sched::can_sleep() && crate::system_state::checks_apply() && in_atomic() {
         atomic_sleep(core::panic::Location::caller());
     }
+}
+
+/// In an interrupt handler (Linux in_interrupt; hk has no softirq
+/// context: its bottom halves run in threads). Host unit tests run in
+/// none.
+pub fn in_interrupt() -> bool {
+    #[cfg(not(test))]
+    {
+        use crate::arch::{CurrentArch, PerCpuOps};
+        CurrentArch::interrupt_depth() != 0
+    }
+    #[cfg(test)]
+    false
 }
 
 /// Spin lock held, interrupts off or in an interrupt handler: this

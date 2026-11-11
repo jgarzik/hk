@@ -11,23 +11,20 @@
 //! data may stay unacknowledged while retransmitting or probing a zero
 //! window, in place of the retry counts.
 //!
-//! ## Timer service (thread context only)
+//! ## Timers (thread context only)
 //!
-//! Connections and timewait entries register their earliest deadline in
-//! `TIMERS` (a `crate::sync::spin::Mutex` leaf: deadline-ordered map of weak
-//! handles). One `timer::Alarm` (ktimers/N) is armed for the earliest
-//! deadline; it only raises a flag and wakes `softnet/0` (decision 1:
-//! protocol timers run in softnet), which calls [`run`]: due entries are
-//! taken out under `TIMERS`, then each is processed under its own socket
-//! lock with `TIMERS` dropped. Order: socket lock -> `TIMERS` ->
-//! `Alarm.st` -> the timer base (IrqSpinlock).
-
-use alloc::collections::BTreeMap;
-use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
-
-use crate::sync::spin::Mutex;
+//! A connection has Linux's three timers, embedded in its socket
+//! (`time::timer::ArcTimer`: a pending one holds a reference to the
+//! socket, Linux sk_reset_timer): the retransmit timer (RTO and the
+//! zero-window probe, icsk_retransmit_timer), the delayed ACK timer
+//! (icsk_delack_timer) and the keepalive timer (keepalive and an
+//! orphan's FIN_WAIT_2, sk_timer); a TIME_WAIT entry has one. They run
+//! in `ktimers/N` and take the socket's `slock`: unowned, the control
+//! block's due work runs at once; owned by a socket call, it is left to
+//! the owner's release (Linux TCP_WRITE_TIMER_DEFERRED). After each step
+//! the socket re-arms them for the control block's deadlines
+//! ([`TcpCb::deadlines`]). Order: socket lock -> timer base
+//! (IrqSpinlock).
 
 use super::cb::{
     ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TIMEWAIT_LEN, TcpCb, TcpState, Tmr,
@@ -176,8 +173,7 @@ impl TcpCb {
         if handshake {
             self.syn_rtx = true;
             self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
-            let s = self.syn_seg();
-            out.segs.push(s);
+            self.syn_seg(out);
         } else {
             self.snd_nxt = self.snd_una;
             self.output(now, out);
@@ -191,8 +187,7 @@ impl TcpCb {
     pub(super) fn rtx_synack(&mut self, now: u64, out: &mut Out) {
         self.syn_rtx = true;
         self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
-        let s = self.syn_seg();
-        out.segs.push(s);
+        self.syn_seg(out);
         self.arm_rtx(now);
     }
 
@@ -201,7 +196,7 @@ impl TcpCb {
     /// with a reset when `reset`, when it sent within TIME_WAIT's length,
     /// or when the peer's window is shut with nothing in flight
     fn out_of_resources(&mut self, now: u64, reset: bool, out: &mut Out) -> bool {
-        if !self.orphan || !super::mem::out_of_memory(self.sndq.len()) {
+        if !self.orphan || !super::mem::out_of_memory(self.sndq_len()) {
             return false;
         }
         let reset = reset
@@ -304,7 +299,7 @@ impl TcpCb {
         if !self.opts.keepalive || !self.keep_state() {
             return;
         }
-        let busy = self.snd_una != self.snd_max || !self.sndq.is_empty();
+        let busy = self.snd_una != self.snd_max || self.sndq_len() != 0;
         let idle = self.idle(now);
         let next = if busy {
             self.keep_idle()
@@ -327,98 +322,22 @@ impl TcpCb {
     }
 }
 
-// ============================================================================
-// Timer service
-// ============================================================================
+/// Which of a connection's timers a deadline is for
+pub const RTX: usize = 0;
+pub const DELACK: usize = 1;
+pub const KEEPALIVE: usize = 2;
 
-/// Something with TCP deadlines (a connection or a timewait entry)
-pub trait Expire: Send + Sync {
-    /// Registration `id` is due: run due work at `now` (ms) and
-    /// re-register (call [`fired`] first, under the owner's lock)
-    fn expire(self: Arc<Self>, id: u64, now: u64);
-}
-
-/// Registered deadlines: (deadline ms, registration id) -> owner
-static TIMERS: Mutex<BTreeMap<(u64, u64), Weak<dyn Expire>>> = Mutex::new(BTreeMap::new());
-
-/// Registration ids
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Wakes softnet/0 to run [`run`]
-static ALARM: crate::time::timer::Alarm = crate::time::timer::Alarm::new(alarm_fired);
-
-fn alarm_fired(_: u64) {
-    crate::net::dev::raise_timer();
+impl TcpCb {
+    /// The deadlines of the retransmit, delayed ACK and keepalive
+    /// timers (`RTX`, `DELACK`, `KEEPALIVE`; Linux icsk_timeout,
+    /// icsk_ack.timeout, sk_timer's expiry), ms
+    pub fn deadlines(&self) -> [Option<u64>; 3] {
+        let keep = [self.keep_at, self.wait_at].into_iter().flatten().min();
+        [self.tmr.map(|t| t.1), self.dack.at, keep]
+    }
 }
 
 /// Milliseconds on the monotonic clock
 pub fn now_ms() -> u64 {
     crate::time::monotonic_ns() / 1_000_000
-}
-
-/// A registration slot owned by a connection (kept under its lock)
-#[derive(Debug, Default)]
-pub struct Slot(Option<(u64, u64)>);
-
-/// Make `slot` match `want` (None = cancel) for owner `me`
-pub fn rearm(slot: &mut Slot, want: Option<u64>, me: Weak<dyn Expire>) {
-    if slot.0.map(|k| k.0) == want {
-        return;
-    }
-    let mut t = TIMERS.lock();
-    if let Some(k) = slot.0.take() {
-        t.remove(&k);
-    }
-    let Some(at) = want else {
-        return;
-    };
-    let k = (at, NEXT_ID.fetch_add(1, Ordering::Relaxed));
-    t.insert(k, me);
-    slot.0 = Some(k);
-    let first = t.keys().next().map(|k| k.0) == Some(at);
-    drop(t);
-    if first {
-        ALARM.arm(at.saturating_mul(1_000_000));
-    }
-}
-
-/// Registration `id` fired (called under the owner's lock before it
-/// runs its timers): true if it is the slot's current one, which is
-/// then forgotten; false if it was re-armed or cancelled meanwhile, so
-/// the owner runs nothing (Linux: a handler finding its event no longer
-/// pending in icsk_pending returns)
-#[must_use]
-pub fn fired(slot: &mut Slot, id: u64) -> bool {
-    if slot.0.is_some_and(|k| k.1 == id) {
-        slot.0 = None;
-        return true;
-    }
-    false
-}
-
-/// Run due TCP timers (softnet/0, thread context, no locks held)
-pub fn run() {
-    ALARM.fired();
-    let now = now_ms();
-    let due: Vec<((u64, u64), Weak<dyn Expire>)> = {
-        let mut t = TIMERS.lock();
-        let mut v = Vec::new();
-        while let Some((&k, _)) = t.iter().next() {
-            if k.0 > now || v.len() >= 256 {
-                break;
-            }
-            let w = t.remove(&k).unwrap();
-            v.push((k, w));
-        }
-        v
-    };
-    for (k, w) in due {
-        if let Some(o) = w.upgrade() {
-            o.expire(k.1, now);
-        }
-    }
-    let next = TIMERS.lock().keys().next().map(|k| k.0);
-    if let Some(at) = next {
-        ALARM.arm(at.saturating_mul(1_000_000));
-    }
 }

@@ -24,8 +24,12 @@
 //! - poll() support for integration with select/poll/epoll
 //! - CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME and the alarm clocks
 
+use crate::fs::FileRef;
+use crate::sync::rcu::RcuHead;
 use crate::util::kalloc::try_arc;
-use alloc::sync::{Arc, Weak};
+use crate::util::list::Link;
+use crate::util::rculist::RcuList;
+use alloc::sync::Arc;
 use core::pin::Pin;
 
 use crate::fs::KernelError;
@@ -124,8 +128,12 @@ struct TimerfdInner {
     expired: bool,
     /// settime flags (TFD_TIMER_ABSTIME, etc.)
     settime_flags: i32,
-    /// TFD_TIMER_CANCEL_ON_SET armed (on the cancel list)
+    /// TFD_TIMER_CANCEL_ON_SET armed (Linux ctx->might_cancel): the
+    /// clock being set cancels it
     might_cancel: bool,
+    /// On `CANCEL_LIST`: from its first cancel-on-set settime until its
+    /// release (a reader skips it while `might_cancel` is off)
+    listed: bool,
     /// The realtime offset when armed; None once the clock was set
     /// (Linux moffs == KTIME_MAX)
     moffs: Option<i64>,
@@ -142,6 +150,7 @@ impl TimerfdInner {
             expired: false,
             settime_flags: 0,
             might_cancel: false,
+            listed: false,
             moffs: Some(0),
         }
     }
@@ -158,7 +167,15 @@ pub struct Timerfd {
     /// timerfd, which outlives it: dropping the timer waits out its
     /// callback)
     timer: HrTimer,
+    /// Its link on `CANCEL_LIST` (Linux ctx->clist)
+    clist: Link,
+    /// Its release from `CANCEL_LIST` after a grace period (Linux
+    /// ctx->rcu)
+    rcu: RcuHead,
 }
+
+crate::adapter!(ClistAdapter, Timerfd, clist);
+crate::rcu_head!(Timerfd, rcu);
 
 impl Timerfd {
     /// Create a new timerfd, or ENOMEM
@@ -167,6 +184,8 @@ impl Timerfd {
             inner: IrqSpinlock::new(TimerfdInner::new(clockid)),
             wait_queue: WaitQueue::new(),
             timer: HrTimer::new(timerfd_fire, HRTIMER_HARD),
+            clist: Link::new(),
+            rcu: RcuHead::new(),
         })?;
         timerfd.timer.set_data(Arc::as_ptr(&timerfd) as usize);
         Ok(timerfd)
@@ -338,30 +357,47 @@ impl Timerfd {
         missed - 1
     }
 
-    /// Release the timerfd (cancel the timer, waiting out its callback)
+    /// Release the timerfd (Linux timerfd_release): cancel the timer,
+    /// waiting out its callback, and leave the cancel list; the list's
+    /// reference goes after a grace period without waiting for one
+    /// (Linux kfree_rcu): its drop, maybe the last, runs in `rcuc/N`,
+    /// where the timer is already cancelled and nothing sleeps
     fn release(self: &Arc<Self>) {
         self.timer.cancel_sync();
-        self.setup_cancel(0);
+        let listed = {
+            let mut inner = self.inner.lock();
+            inner.might_cancel = false;
+            core::mem::take(&mut inner.listed)
+        };
+        if listed
+            && let Some(gone) = CANCEL_LIST.remove_first(|t| core::ptr::eq(t, Arc::as_ptr(self)))
+        {
+            gone.defer();
+        }
     }
 
-    /// Join or leave the cancel list for `flags` (Linux
-    /// timerfd_setup_cancel): realtime, absolute, CANCEL_ON_SET
+    /// Arm or disarm cancel-on-set for `flags` (Linux
+    /// timerfd_setup_cancel): realtime, absolute, CANCEL_ON_SET. Decided
+    /// under `inner`; the first one to arm it puts it on the cancel list
+    /// after (a settime under way when the clock is set may miss it, as
+    /// in Linux), where it stays until its release: a timerfd whose
+    /// cancel-on-set is turned off again is skipped by
+    /// `clock_was_set` (`might_cancel`), so a second settime never
+    /// re-links an entry still in its grace period.
     fn setup_cancel(self: &Arc<Self>, flags: i32) {
         use tfd_timer_flags::{TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET};
-        let want = flags & TFD_TIMER_ABSTIME != 0
-            && flags & TFD_TIMER_CANCEL_ON_SET != 0
-            && clock_of(self.inner.lock().clockid) == HrClock::Realtime;
-        let mut list = CANCEL_LIST.lock();
-        let mut inner = self.inner.lock();
-        if want == inner.might_cancel {
-            return;
-        }
-        inner.might_cancel = want;
-        drop(inner);
-        let me = Arc::as_ptr(self);
-        list.retain(|w| w.as_ptr() != me);
-        if want {
-            list.push(Arc::downgrade(self));
+        let link = {
+            let mut inner = self.inner.lock();
+            let want = flags & TFD_TIMER_ABSTIME != 0
+                && flags & TFD_TIMER_CANCEL_ON_SET != 0
+                && clock_of(inner.clockid) == HrClock::Realtime;
+            inner.might_cancel = want;
+            let link = want && !inner.listed;
+            inner.listed |= want;
+            link
+        };
+        if link {
+            CANCEL_LIST.push_back(self.clone());
         }
     }
 
@@ -386,20 +422,17 @@ fn clock_of(clockid: i32) -> HrClock {
         .unwrap_or(HrClock::Monotonic)
 }
 
-/// Timerfds with TFD_TIMER_CANCEL_ON_SET armed (Linux cancel_list)
-static CANCEL_LIST: crate::sync::spin::Mutex<alloc::vec::Vec<Weak<Timerfd>>> =
-    crate::sync::spin::Mutex::new(alloc::vec::Vec::new());
+/// Timerfds that armed TFD_TIMER_CANCEL_ON_SET (Linux cancel_list): an
+/// RCU list, walked by `clock_was_set` with no lock and no allocation
+static CANCEL_LIST: RcuList<ClistAdapter> = RcuList::new();
 
 /// CLOCK_REALTIME was set: fail the reads of cancel-on-set timerfds
-/// whose offset changed (Linux timerfd_clock_was_set; thread context)
+/// whose offset changed (Linux timerfd_clock_was_set: the list walked
+/// under rcu_read_lock, each one's lock taken in turn)
 pub fn clock_was_set() {
     let moffs = crate::time::real_offset();
-    let list: alloc::vec::Vec<Arc<Timerfd>> = CANCEL_LIST
-        .lock()
-        .iter()
-        .filter_map(Weak::upgrade)
-        .collect();
-    for t in list {
+    let g = crate::sync::rcu::read_lock();
+    for t in CANCEL_LIST.iter(&g) {
         t.clock_was_set(moffs);
     }
 }
@@ -460,8 +493,8 @@ impl FileOps for TimerfdFileOps {
 /// * `flags` - TFD_CLOEXEC | TFD_NONBLOCK
 ///
 /// # Returns
-/// Arc<File> for the new timerfd
-pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelError> {
+/// FileRef for the new timerfd
+pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<FileRef, KernelError> {
     let timerfd = Timerfd::new(clockid)?;
 
     // Create dummy dentry for timerfd

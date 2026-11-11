@@ -73,7 +73,7 @@ pub const IOV_MAX: usize = 1024;
 /// This value is passed to fd allocation functions which enforce the limit.
 ///
 /// Following Linux pattern: RLIMIT_NOFILE is enforced inside fd allocation
-/// functions (alloc, alloc_with_flags, etc.), not as separate pre-checks.
+/// functions (`UnusedFd::alloc`, Linux alloc_fd), not as separate pre-checks.
 #[inline]
 pub fn get_nofile_limit() -> u64 {
     let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);

@@ -11,7 +11,7 @@
 
 use crate::sync::spin::Mutex;
 use crate::util::kalloc::try_arc;
-use alloc::collections::BTreeMap;
+use crate::util::rbtree::{RbTree, RbTreeNodeReservation};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -51,44 +51,96 @@ impl IoMax {
     }
 }
 
-/// Per-cgroup IO state: io.max per device, values under one lock, so a
-/// write's limits land together (thread context only). No IO is
-/// throttled or accounted yet (BUGS "cgroup controller application");
-/// when it is, the token bucket lives under the queue's lock, as Linux
-/// blk-throttle under queue_lock.
-#[derive(Default)]
+/// Per-cgroup IO state: io.max per device (Linux the blkg's
+/// throtl_grp), values under one lock, so a write's limits land
+/// together (a spin leaf, thread context only; nothing allocates under
+/// it). No IO is throttled or accounted yet (BUGS "cgroup controller
+/// application"); when it is, the token bucket lives under the queue's
+/// lock, as Linux blk-throttle under queue_lock.
 pub struct IoState {
-    devices: Mutex<BTreeMap<DevId, IoMax>>,
+    /// The devices with limits, by device (an entry without limits is
+    /// removed)
+    devices: Mutex<RbTree<DevId, IoMax>>,
+}
+
+impl Default for IoState {
+    fn default() -> Self {
+        Self {
+            devices: Mutex::new(RbTree::new()),
+        }
+    }
+}
+
+/// One io.max line's values (None keeps a value)
+#[derive(Clone, Copy, Default)]
+pub struct IoMaxSet {
+    pub rbps: Option<u64>,
+    pub wbps: Option<u64>,
+    pub riops: Option<u64>,
+    pub wiops: Option<u64>,
+}
+
+impl IoMax {
+    fn apply(&mut self, s: IoMaxSet) {
+        self.rbps = s.rbps.unwrap_or(self.rbps);
+        self.wbps = s.wbps.unwrap_or(self.wbps);
+        self.riops = s.riops.unwrap_or(self.riops);
+        self.wiops = s.wiops.unwrap_or(self.wiops);
+    }
 }
 
 impl IoState {
-    /// The devices with limits, in device order
-    pub fn limits(&self) -> Vec<(DevId, IoMax)> {
-        self.devices
-            .lock()
-            .iter()
-            .filter(|(_, m)| m.has_limits())
-            .map(|(&d, &m)| (d, m))
-            .collect()
+    /// The devices with limits, in device order: the copy is sized
+    /// before the lock is taken, and made again if the map grew
+    /// meanwhile; ENOMEM
+    pub fn limits(&self) -> Result<Vec<(DevId, IoMax)>, KernelError> {
+        let mut n = self.devices.lock().len();
+        loop {
+            let mut v = Vec::new();
+            v.try_reserve_exact(n)
+                .map_err(|_| KernelError::OutOfMemory)?;
+            let devices = self.devices.lock();
+            if devices.len() <= n {
+                v.extend(devices.iter().map(|(&d, &m)| (d, m)));
+                return Ok(v);
+            }
+            n = devices.len();
+        }
     }
 
-    /// Set limits for a device (None keeps a value), all in one hold
-    pub fn set_limits(
-        &self,
-        dev: DevId,
-        rbps: Option<u64>,
-        wbps: Option<u64>,
-        riops: Option<u64>,
-        wiops: Option<u64>,
-    ) {
-        let mut devices = self.devices.lock();
-        let m = devices.entry(dev).or_default();
-        m.rbps = rbps.unwrap_or(m.rbps);
-        m.wbps = wbps.unwrap_or(m.wbps);
-        m.riops = riops.unwrap_or(m.riops);
-        m.wiops = wiops.unwrap_or(m.wiops);
-        if !m.has_limits() {
-            devices.remove(&dev);
+    /// Set limits for a device, all in one hold (Linux blkg_conf_prep,
+    /// then tg_set_limit): a device with none yet needs a node, made
+    /// with the lock dropped and the lookup repeated; the node of a
+    /// device left without limits is freed after the unlock. ENOMEM.
+    pub fn set_limits(&self, dev: DevId, set: IoMaxSet) -> Result<(), KernelError> {
+        let mut spare = None;
+        loop {
+            let mut devices = self.devices.lock();
+            if let Some(m) = devices.get_mut(&dev) {
+                m.apply(set);
+                let gone = if m.has_limits() {
+                    None
+                } else {
+                    devices.remove_node(&dev)
+                };
+                drop(devices);
+                drop(gone);
+                return Ok(());
+            }
+            let mut m = IoMax::default();
+            m.apply(set);
+            if !m.has_limits() {
+                return Ok(());
+            }
+            if let Some(node) = spare.take() {
+                // Absent (looked up above): nothing is replaced
+                let old = devices.insert(RbTreeNodeReservation::into_node(node, dev, m));
+                drop(devices);
+                drop(old);
+                return Ok(());
+            }
+            drop(devices);
+            spare = Some(RbTreeNodeReservation::new()?);
         }
     }
 }
@@ -152,7 +204,7 @@ fn io_max_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
     if let Some(state) = css.private_as::<IoState>() {
         let mut content = String::new();
 
-        for (dev, m) in state.limits() {
+        for (dev, m) in state.limits()? {
             let (major, minor) = dev_major_minor(dev);
             content.push_str(&format!("{}:{}", major, minor));
             if m.rbps > 0 {
@@ -206,24 +258,20 @@ fn io_max_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelError>
 
             let dev = make_dev(major, minor);
 
-            let mut rbps = None;
-            let mut wbps = None;
-            let mut riops = None;
-            let mut wiops = None;
-
+            let mut set = IoMaxSet::default();
             for param in parts {
                 if let Some(val) = param.strip_prefix("rbps=") {
-                    rbps = Some(parse_io_value(val)?);
+                    set.rbps = Some(parse_io_value(val)?);
                 } else if let Some(val) = param.strip_prefix("wbps=") {
-                    wbps = Some(parse_io_value(val)?);
+                    set.wbps = Some(parse_io_value(val)?);
                 } else if let Some(val) = param.strip_prefix("riops=") {
-                    riops = Some(parse_io_value(val)?);
+                    set.riops = Some(parse_io_value(val)?);
                 } else if let Some(val) = param.strip_prefix("wiops=") {
-                    wiops = Some(parse_io_value(val)?);
+                    set.wiops = Some(parse_io_value(val)?);
                 }
             }
 
-            state.set_limits(dev, rbps, wbps, riops, wiops);
+            state.set_limits(dev, set)?;
         }
 
         Ok(())
@@ -246,4 +294,38 @@ fn parse_io_value(s: &str) -> Result<u64, KernelError> {
 fn io_stat_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
     css.private_as::<IoState>().ok_or(KernelError::Io)?;
     Ok(Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(rbps: Option<u64>, wiops: Option<u64>) -> IoMaxSet {
+        IoMaxSet {
+            rbps,
+            wiops,
+            ..IoMaxSet::default()
+        }
+    }
+
+    /// A device appears with its first limit, keeps values a later line
+    /// leaves out, and goes when all are "max"; listed in device order
+    #[test]
+    fn limits_merge_and_clear() {
+        let st = IoState::default();
+        st.set_limits(make_dev(8, 16), set(Some(100), None))
+            .unwrap();
+        st.set_limits(make_dev(8, 0), set(None, Some(5))).unwrap();
+        st.set_limits(make_dev(8, 0), set(Some(7), None)).unwrap();
+        let l = st.limits().unwrap();
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0].0, make_dev(8, 0));
+        assert_eq!((l[0].1.rbps, l[0].1.wiops), (7, 5));
+        st.set_limits(make_dev(8, 0), set(Some(0), Some(0)))
+            .unwrap();
+        st.set_limits(make_dev(9, 0), set(Some(0), None)).unwrap();
+        let l = st.limits().unwrap();
+        assert_eq!(l.len(), 1);
+        assert_eq!((l[0].0, l[0].1.rbps), (make_dev(8, 16), 100));
+    }
 }

@@ -16,6 +16,7 @@ use super::file::File;
 use super::io::fget;
 use super::posix_lock::{Flock, posix_getlk, posix_setlk, posix_setlkw};
 use super::syscall::{current_fd_table, get_nofile_limit};
+use crate::task::fdtable::UnusedFd;
 
 // =============================================================================
 // truncate, ftruncate syscalls
@@ -144,12 +145,9 @@ pub fn sys_truncate(path_ptr: UserPtr<u8>, length: i64) -> KernelResult<()> {
 /// # Returns
 /// The new file descriptor
 pub fn sys_dup(oldfd: i32) -> KernelResult<i32> {
-    let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
-    let file = table.get(oldfd).ok_or(KernelError::BadFd)?;
-
-    // Allocate fd (RLIMIT_NOFILE enforced inside alloc)
-    table.alloc(file, get_nofile_limit())
+    // Linux ksys_dup: fget_raw, then get_unused_fd_flags + fd_install
+    let file = super::io::fget_raw(oldfd)?;
+    super::io::fd_install(file, 0)
 }
 
 /// sys_dup2 - duplicate a file descriptor to a specific number
@@ -210,17 +208,7 @@ fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> KernelResult<i32> {
     if u64::from(newfd as u32) >= nofile {
         return Err(KernelError::BadFd);
     }
-    let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
-    let room = table.expand(newfd);
-    let file = table.get(oldfd).ok_or(KernelError::BadFd)?;
-    // Past fs.nr_open: EBADF, not EMFILE (Linux ksys_dup3)
-    room.map_err(|e| match e {
-        KernelError::ProcessFileLimit => KernelError::BadFd,
-        e => e,
-    })?;
-    table.close(newfd);
-    table.alloc_at_with_flags(newfd, file, fd_flags, nofile)?;
+    current_fd_table().dup3(oldfd, newfd as u32 as usize, fd_flags)?;
     Ok(newfd)
 }
 
@@ -275,40 +263,20 @@ pub fn sys_pipe2(pipefd: UserPtr<[i32; 2]>, flags: u32) -> KernelResult<()> {
 
     let (read_file, write_file) = create_pipe(flags & (O_NONBLOCK | O_DIRECT))?;
 
-    // Allocate file descriptors (RLIMIT_NOFILE enforced inside alloc)
-    // Following Linux pattern: each get_unused_fd_flags() call checks limit
-    let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
-    let nofile = get_nofile_limit();
-
-    // Determine fd flags
+    // Two descriptors reserved, their numbers stored, then the files
+    // installed; a failure releases what was reserved (Linux
+    // __do_pipe_flags, do_pipe2: put_unused_fd on EFAULT)
     let fd_flags = if flags & O_CLOEXEC != 0 {
         FD_CLOEXEC
     } else {
         0
     };
-
-    let read_fd = table.alloc_with_flags(read_file, fd_flags, nofile)?;
-
-    let write_fd = match table.alloc_with_flags(write_file, fd_flags, nofile) {
-        Ok(fd) => fd,
-        Err(e) => {
-            // Clean up read fd on failure
-            table.close(read_fd);
-            return Err(e);
-        }
-    };
-
-    drop(table);
-
-    // Write file descriptors to user space
-    pipefd.write(&[read_fd, write_fd]).map_err(|e| {
-        // Clean up on error
-        let mut table = fd_table.lock();
-        table.close(read_fd);
-        table.close(write_fd);
-        e.into()
-    })
+    let fdr = super::io::get_unused_fd_flags(fd_flags)?;
+    let fdw = super::io::get_unused_fd_flags(fd_flags)?;
+    pipefd.write(&[fdr.fd(), fdw.fd()])?;
+    fdr.install(read_file);
+    fdw.install(write_file);
+    Ok(())
 }
 
 // =============================================================================
@@ -341,12 +309,12 @@ mod fcntl_cmd {
 /// early, so that range is unlocked now; the process's other locks
 /// stay (Linux fcntl_setlk rechecks with files_lookup_fd and sets
 /// F_UNLCK over the same, already resolved, region)
-fn setlk_recheck(fd: i32, file: &Arc<crate::fs::File>, flock: &Flock, range: (u64, u64)) {
+fn setlk_recheck(fd: i32, file: &crate::fs::FileRef, flock: &Flock, range: (u64, u64)) {
     use crate::fs::posix_lock::{F_UNLCK, posix_unlock};
     let same = current_fd_table()
         .lock()
         .get(fd)
-        .is_some_and(|f| Arc::ptr_eq(&f, file));
+        .is_some_and(|f| crate::fs::FileRef::ptr_eq(&f, file));
     if !same && flock.l_type != F_UNLCK {
         posix_unlock(file, range);
     }
@@ -371,10 +339,9 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
     use fcntl_cmd::*;
 
     let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
     // Any open file (Linux fdget_raw); a path-only one only for the
     // descriptor commands (check_fcntl_cmd)
-    let file = table.get(fd).ok_or(KernelError::BadFd)?;
+    let file = fd_table.lock().get(fd).ok_or(KernelError::BadFd)?;
     if file.is_path() && !path_cmd(cmd) {
         return Err(KernelError::BadFd);
     }
@@ -393,17 +360,17 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
             } else {
                 0
             };
-            // RLIMIT_NOFILE enforced inside alloc_at_or_above
-            let new_fd = table.alloc_at_or_above(file, min_fd, fl, nofile)?;
-            Ok(i64::from(new_fd))
+            // Linux f_dupfd: alloc_fd(from, nofile), then fd_install
+            let new = UnusedFd::alloc(fd_table, min_fd as usize, fl, nofile)?;
+            Ok(i64::from(new.install(file)))
         }
 
         // Get fd flags (FD_CLOEXEC)
-        F_GETFD => Ok(i64::from(table.get_fd_flags(fd))),
+        F_GETFD => Ok(i64::from(fd_table.lock().get_fd_flags(fd))),
 
         F_SETFD => {
             // Set fd flags (only FD_CLOEXEC is valid)
-            if !table.set_fd_flags(fd, arg as u32) {
+            if !fd_table.lock().set_fd_flags(fd, arg as u32) {
                 return Err(KernelError::BadFd);
             }
             Ok(0)
@@ -412,15 +379,12 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
         F_GETFL => Ok(i64::from(file.get_flags())),
 
         F_SETFL => {
-            // ->fasync takes sleeping locks
-            drop(table);
             setfl(fd, &file, arg as u32)?;
             Ok(0)
         }
 
         F_GETLK => {
             // Get lock info - test if a lock would block
-            drop(table); // Release FD table lock before copying
             let uflock = UserPtr::<Flock>::new(arg);
             let mut flock = uflock.read()?;
             posix_getlk(&file, &mut flock)?;
@@ -430,7 +394,6 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
 
         F_SETLK | F_SETLKW => {
             // F_SETLKW: blocking - but we don't actually block, like flock
-            drop(table);
             let flock = UserPtr::<Flock>::new(arg).read()?;
             let range = if cmd == F_SETLK {
                 posix_setlk(&file, &flock)?
@@ -442,14 +405,10 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
         }
 
         crate::mm::memfd::F_ADD_SEALS | crate::mm::memfd::F_GET_SEALS => {
-            // Adding takes the inode's sleeping lock
-            drop(table);
             crate::mm::memfd::fcntl(&file, cmd, arg)
         }
 
         F_SETOWN | F_GETOWN | F_SETOWN_EX | F_GETOWN_EX | F_SETSIG | F_GETSIG => {
-            // They allocate and copy to and from the user
-            drop(table);
             fcntl_owner(&file, cmd, arg)
         }
 

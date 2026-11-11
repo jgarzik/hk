@@ -5,8 +5,9 @@
 //! - Blocking send/receive with optional timeout
 //! - Per-queue byte limits
 
-use crate::util::kalloc::try_arc;
-use alloc::collections::VecDeque;
+use crate::util::kalloc::{try_arc, try_box};
+use crate::util::list::{BoxList, Link};
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -49,13 +50,16 @@ pub const MSG_INFO: i32 = 12;
 // Message Structures
 // ============================================================================
 
-/// A single message
+/// A single message (Linux struct msg_msg), on its queue's list
 pub struct MsgMsg {
+    link: Link,
     /// Message type (must be > 0)
     pub mtype: i64,
     /// Message data
     pub mtext: Vec<u8>,
 }
+
+crate::adapter!(MsgA, MsgMsg, link);
 
 /// Which messages msgrcv takes (Linux convert_mode / testmsg)
 #[derive(Clone, Copy)]
@@ -91,8 +95,9 @@ impl Search {
 /// (Linux: the msq lock, ipc_lock_object(&msq->q_perm))
 #[derive(Default)]
 pub struct MsgState {
-    /// Message list
-    list: VecDeque<MsgMsg>,
+    /// Message list (Linux q_messages); each message is allocated
+    /// before the lock is taken
+    list: BoxList<MsgA>,
     /// Current bytes in queue
     cbytes: u64,
     /// Current number of messages
@@ -153,39 +158,36 @@ impl MsgQueue {
         msgsz: usize,
         noerror: bool,
         pid: i32,
-    ) -> KernelResult<Option<MsgMsg>> {
+    ) -> KernelResult<Option<Box<MsgMsg>>> {
         let mut q = self.q.lock();
-        let mut found = q
-            .list
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| search.test(m.mtype));
-        let idx = match search {
-            Search::LessEqual(_) => found.min_by_key(|(i, m)| (m.mtype, *i)),
+        let mut found = q.list.iter().filter(|m| search.test(m.mtype));
+        // min_by_key keeps the first of equal keys
+        let m = match search {
+            Search::LessEqual(_) => found.min_by_key(|m| m.mtype),
             _ => found.next(),
-        }
-        .map(|(i, _)| i);
-        let Some(i) = idx else {
+        };
+        let Some(m) = m else {
             return Ok(None);
         };
-        if q.list[i].mtext.len() > msgsz && !noerror {
+        if m.mtext.len() > msgsz && !noerror {
             return Err(KernelError::ArgListTooLong);
         }
-        let msg = q.list.remove(i);
-        if let Some(m) = &msg {
-            self.account(&mut q, -(m.mtext.len() as i64));
-            q.rtime = current_time_secs();
-            q.lrpid = pid;
-        }
-        Ok(msg)
+        let m: *const MsgMsg = m;
+        // SAFETY: found on the queue's list
+        let msg = unsafe { q.list.remove(&*m) };
+        self.account(&mut q, -(msg.mtext.len() as i64));
+        q.rtime = current_time_secs();
+        q.lrpid = pid;
+        Ok(Some(msg))
     }
 
     /// Queue `msg` if it fits (Linux do_msgsnd under the queue lock): the
     /// limit and removal are checked, the counters kept and the sender's
     /// pid and time recorded with the queue locked, so concurrent senders
     /// never pass qbytes and a removed queue takes nothing. A message that
-    /// does not fit comes back
-    fn try_send(&self, msg: MsgMsg, pid: i32) -> KernelResult<Option<MsgMsg>> {
+    /// does not fit comes back. It was allocated before the lock (Linux
+    /// load_msg before ipc_lock_object): queueing allocates nothing.
+    fn try_send(&self, msg: Box<MsgMsg>, pid: i32) -> KernelResult<Option<Box<MsgMsg>>> {
         let mut q = self.q.lock();
         if self.perm.is_deleted() {
             return Err(KernelError::IdentifierRemoved);
@@ -248,14 +250,19 @@ impl IpcObject for MsgQueue {
         &self.perm
     }
 
+    /// Linux freeque: the messages are taken off under the lock and
+    /// freed after it
     fn destroy(&self) {
         // Marked deleted before this: after the lock no sender adds more
-        {
+        let msgs = {
             let mut q = self.q.lock();
-            while let Some(m) = q.list.pop_front() {
+            let msgs = core::mem::take(&mut q.list);
+            for m in msgs.iter() {
                 self.account(&mut q, -(m.mtext.len() as i64));
             }
-        }
+            msgs
+        };
+        drop(msgs);
         self.waitq.wake_all();
     }
 }
@@ -311,7 +318,11 @@ pub fn sys_msgsnd(msqid: i32, msgp: UserPtr<i64>, msgsz: usize, msgflg: i32) -> 
         copy_from_user(&mut mtext, data_ptr, msgsz)?;
     }
 
-    let msg = MsgMsg { mtype, mtext };
+    let msg = try_box(MsgMsg {
+        link: Link::new(),
+        mtype,
+        mtext,
+    })?;
 
     // Find queue
     let queue = ns

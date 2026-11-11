@@ -32,6 +32,10 @@ pub fn page_remove_rmap(phys: u64) {
     }
 }
 
+/// `rmap_walk`'s visitor: (mm, chain entry, address, PTE table, PTE
+/// value) -> go on
+type RmapOne<'f> = dyn FnMut(&Arc<crate::mm::Mm>, &Avc, u64, &PteTable<'_>, u64) -> bool + 'f;
+
 /// Each PTE mapping the anonymous page `phys` (Linux rmap_walk_anon):
 /// `f(mm, chain entry, address, PTE table, PTE value)` with that
 /// table's PTE lock held (the `PteTable`), the AnonVma chain held for
@@ -39,10 +43,7 @@ pub fn page_remove_rmap(phys: u64) {
 /// returns false to stop the walk, and so does `rmap_walk`. The caller
 /// holds a reference on the page (its mapping stays until it is
 /// freed). Sleeps (the chain lock): thread context, no spinlock held.
-pub fn rmap_walk(
-    phys: u64,
-    f: &mut dyn FnMut(&crate::mm::Mm, &Avc, u64, &PteTable<'_>, u64) -> bool,
-) -> bool {
+pub fn rmap_walk(phys: u64, f: &mut RmapOne<'_>) -> bool {
     use crate::arch::paging;
     let Some(pg) = phys_to_page(phys).filter(|p| p.is_anon()) else {
         return true;
@@ -93,6 +94,9 @@ pub fn try_to_unmap(phys: u64, e: crate::mm::SwapEntry) -> bool {
         if !crate::mm::swap::swapfile::swap_duplicate(e) {
             return false;
         }
+        // On the list swapoff walks before its PTE names the slot (Linux
+        // try_to_unmap_one)
+        crate::mm::prepare_for_swap_entries(mm);
         if !unmap_one(t.entry(addr), pte, phys, e) {
             crate::mm::swap::swapfile::swap_free(e);
             return true;

@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::sync::spin::RwLock;
 
 use crate::net::KernelError;
-use crate::net::inet::ifaddr::IfAddrs;
+use crate::net::inet::ifaddr::InDevice;
 use crate::net::skb::SkBuff;
 
 /// Interface flags (matches Linux IFF_* flags)
@@ -246,10 +246,9 @@ pub struct NetDevice {
     /// Device statistics
     pub stats: NetDeviceStats,
 
-    /// Protocol addresses by family (Linux in_device / inet6_dev). Leaf
-    /// `RwLock`, thread context only; written only under RTNL, read via
-    /// snapshots (`inet_addrs()`).
-    addrs: RwLock<IfAddrs>,
+    /// IPv4 state and addresses (Linux ip_ptr, an in_device; IPv6
+    /// adds an inet6_dev): read under RCU, changed under RTNL
+    ip_ptr: InDevice,
 
     /// Network namespace the device lives in (weak: the namespace owns
     /// its devices). Thread context only; read on every received packet.
@@ -276,7 +275,14 @@ pub struct NetDevice {
     pub parent: spin::Once<Arc<crate::base::Device>>,
     /// Its sysfs device (net/sysfs.rs)
     pub kdev: spin::Once<Arc<crate::base::Device>>,
+    /// On its namespace's device list (Linux dev_list, an RCU list)
+    dev_list: crate::util::list::Link,
+    /// Its ARP entries (Linux dev->neighbours[NEIGH_ARP_TABLE]), under
+    /// the ARP table's lock
+    pub neighbours: crate::net::neigh::DevNeighbours,
 }
+
+crate::adapter!(pub DevList, NetDevice, dev_list);
 
 impl NetDevice {
     /// Create a device named `name` (see `net::dev_alloc_name`)
@@ -294,7 +300,7 @@ impl NetDevice {
             ops: RwLock::new(Some(ops)),
             max_mtu,
             stats: NetDeviceStats::default(),
-            addrs: RwLock::new(IfAddrs::default()),
+            ip_ptr: InDevice::default(),
             net: RwLock::new(Weak::new()),
             carrier: AtomicBool::new(true),
             running: AtomicBool::new(false),
@@ -303,12 +309,20 @@ impl NetDevice {
             allmulti: AtomicU32::new(0),
             parent: spin::Once::new(),
             kdev: spin::Once::new(),
+            dev_list: crate::util::list::Link::new(),
+            neighbours: crate::net::neigh::dev_neighbours(),
         }
     }
 
     /// Network namespace of this device
     pub fn net(&self) -> Option<Arc<crate::net::NetNamespace>> {
         self.net.read().upgrade()
+    }
+
+    /// The device lives in `net` (Linux net_eq(dev_net(dev), net)),
+    /// without taking a reference
+    pub fn net_is(&self, net: &crate::net::NetNamespace) -> bool {
+        core::ptr::eq(self.net.read().as_ptr(), net)
     }
 
     /// Move the device into `net` with index `ifindex` (registration)
@@ -519,14 +533,9 @@ impl NetDevice {
         self.promiscuity.load(Ordering::Acquire)
     }
 
-    /// Snapshot of the IPv4 addresses (primaries before secondaries)
-    pub fn inet_addrs(&self) -> alloc::vec::Vec<crate::net::inet::ifaddr::InIfaddr> {
-        self.addrs.read().inet.clone()
-    }
-
-    /// Replace the IPv4 address list (RTNL held; inet::ifaddr only)
-    pub(crate) fn addrs_mut<R>(&self, f: impl FnOnce(&mut IfAddrs) -> R) -> R {
-        f(&mut self.addrs.write())
+    /// IPv4 state: the addresses (Linux __in_dev_get_rcu)
+    pub fn in_dev(&self) -> &InDevice {
+        &self.ip_ptr
     }
 
     /// Transmit a packet

@@ -10,7 +10,6 @@
 //! - `BPF_MAP_TYPE_ARRAY`: Fixed-size array indexed by u32
 
 use crate::util::kalloc::try_arc;
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -72,10 +71,10 @@ pub const BPF_MAX_ENTRIES: u32 = 1 << 20; // 1M entries
 ///
 /// Each map type implements this trait to provide its specific behavior.
 pub trait BpfMapOps: Send + Sync {
-    /// Look up an element by key
-    ///
-    /// Returns the value if found, None otherwise.
-    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>>;
+    /// Look up an element by key, copying its value into `out` (the
+    /// value size, allocated by the caller before the map is locked:
+    /// Linux bpf_map_copy_value); false if absent
+    fn lookup(&self, key: &[u8], out: &mut [u8]) -> bool;
 
     /// Update or insert an element
     ///
@@ -88,11 +87,9 @@ pub trait BpfMapOps: Send + Sync {
     /// Delete an element by key
     fn delete(&self, key: &[u8]) -> Result<(), KernelError>;
 
-    /// Get the next key after the given key
-    ///
-    /// If key is None, returns the first key.
-    /// Returns None when iteration is complete.
-    fn get_next_key(&self, key: Option<&[u8]>) -> Option<Vec<u8>>;
+    /// Copy the key after `key` (the first for None) into `out` (the key
+    /// size, allocated by the caller); false when iteration is complete
+    fn get_next_key(&self, key: Option<&[u8]>, out: &mut [u8]) -> bool;
 
     /// Get the map type
     fn map_type(&self) -> u32;
@@ -124,14 +121,82 @@ pub trait BpfMapOps: Send + Sync {
 /// Keys and values are stored as byte vectors. BTreeMap is used instead
 /// of HashMap because HashMap isn't available in alloc.
 pub struct BpfHashMap {
-    /// The actual key-value store
-    data: IrqSpinlock<BTreeMap<Vec<u8>, Vec<u8>>>,
+    /// The table, every element preallocated at create (Linux htab
+    /// prealloc_init): an update takes one from the free list and copies
+    /// in, so nothing allocates under the lock
+    data: IrqSpinlock<Htab>,
     /// Key size in bytes
     key_size: u32,
     /// Value size in bytes
     value_size: u32,
     /// Maximum number of entries
     max_entries: u32,
+}
+
+/// No element (an index's end of chain)
+const NIL: u32 = u32::MAX;
+
+/// A preallocated hash table (Linux struct bpf_htab with its freelist):
+/// elements by index, each `key_size + value_size` bytes of `kv`, chained
+/// per bucket through `next` (newest first, as hlist_nulls_add_head)
+struct Htab {
+    /// Each bucket's first element
+    buckets: Vec<u32>,
+    /// Each element's successor in its bucket, or on the free list
+    next: Vec<u32>,
+    /// Each element's key hash
+    hash: Vec<u32>,
+    /// Keys and values, element by element
+    kv: Vec<u8>,
+    /// Head of the free elements
+    free: u32,
+    len: usize,
+    /// Random per-map hash seed (Linux htab->hashrnd): user space cannot
+    /// pick keys that crowd one bucket
+    seed: u32,
+}
+
+impl Htab {
+    /// A key's hash: FNV-1a from the map's seed, then a full avalanche
+    /// (murmur3 fmix32), so the seed reaches every bit of the bucket
+    /// index (Linux jhash(key, key_size, hashrnd))
+    fn key_hash(&self, key: &[u8]) -> u32 {
+        let mut h = key.iter().fold(0x811c_9dc5u32 ^ self.seed, |h, &b| {
+            (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+        });
+        h ^= self.seed;
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x85eb_ca6b);
+        h ^= h >> 13;
+        h = h.wrapping_mul(0xc2b2_ae35);
+        h ^ (h >> 16)
+    }
+}
+
+impl Htab {
+    /// Every element on the free list
+    fn new(kv_size: usize, max_entries: u32) -> Result<Self, KernelError> {
+        use crate::util::kmem::try_vec;
+        let n = max_entries as usize;
+        let nbuckets = n.next_power_of_two();
+        let mut next = try_vec(n, NIL)?;
+        for (i, x) in next.iter_mut().enumerate().take(n - 1) {
+            *x = i as u32 + 1;
+        }
+        Ok(Self {
+            buckets: try_vec(nbuckets, NIL)?,
+            next,
+            hash: try_vec(n, 0)?,
+            kv: try_vec(n * kv_size, 0)?,
+            free: 0,
+            len: 0,
+            seed: crate::random::get_random_u32(),
+        })
+    }
+
+    fn bucket(&self, h: u32) -> usize {
+        h as usize & (self.buckets.len() - 1)
+    }
 }
 
 impl BpfHashMap {
@@ -146,36 +211,63 @@ impl BpfHashMap {
         if max_entries == 0 || max_entries > BPF_MAX_ENTRIES {
             return Err(KernelError::InvalidArgument);
         }
-        // A full map must fit the budget the array map preallocates
-        // against: ENOMEM at create (Linux preallocates every hash
-        // element, bpf_map_area_alloc failing) rather than later. Each
-        // entry: key and value in their kmalloc classes, their Vec
-        // headers, and a share of the tree's node
-        let class = |n: u32| u64::from(n).next_power_of_two().max(16);
-        let entry = class(key_size)
-            + class(value_size)
-            + 2 * core::mem::size_of::<Vec<u8>>() as u64
-            + HASH_NODE_SHARE;
+        // Every element is allocated now (Linux htab_map_alloc with
+        // prealloc): ENOMEM at create, within the budget the array map
+        // preallocates against. Each element: its key and value, its
+        // chain, hash and bucket words
+        let entry = u64::from(key_size) + u64::from(value_size) + 4 * 4;
         if u64::from(max_entries) * entry > prealloc_budget() {
             return Err(KernelError::OutOfMemory);
         }
-
+        let kv = (key_size + value_size) as usize;
         try_arc(Self {
-            data: IrqSpinlock::new(BTreeMap::new()),
+            data: IrqSpinlock::new(Htab::new(kv, max_entries)?),
             key_size,
             value_size,
             max_entries,
         })
     }
+
+    fn kv_size(&self) -> usize {
+        (self.key_size + self.value_size) as usize
+    }
+
+    /// Element `e`'s key and value
+    fn key_of<'a>(&self, t: &'a Htab, e: u32) -> &'a [u8] {
+        let at = e as usize * self.kv_size();
+        &t.kv[at..at + self.key_size as usize]
+    }
+
+    fn value_of<'a>(&self, t: &'a mut Htab, e: u32) -> &'a mut [u8] {
+        let at = e as usize * self.kv_size() + self.key_size as usize;
+        &mut t.kv[at..at + self.value_size as usize]
+    }
+
+    /// The element holding `key` (Linux lookup_elem_raw)
+    fn find(&self, t: &Htab, key: &[u8], h: u32) -> Option<u32> {
+        let mut e = t.buckets[t.bucket(h)];
+        while e != NIL {
+            if t.hash[e as usize] == h && self.key_of(t, e) == key {
+                return Some(e);
+            }
+            e = t.next[e as usize];
+        }
+        None
+    }
 }
 
 impl BpfMapOps for BpfHashMap {
-    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if key.len() != self.key_size as usize {
-            return None;
+    fn lookup(&self, key: &[u8], out: &mut [u8]) -> bool {
+        if key.len() != self.key_size as usize || out.len() != self.value_size as usize {
+            return false;
         }
-        let data = self.data.lock();
-        data.get(key).cloned()
+        let mut t = self.data.lock();
+        let h = t.key_hash(key);
+        let Some(e) = self.find(&t, key, h) else {
+            return false;
+        };
+        out.copy_from_slice(self.value_of(&mut t, e));
+        true
     }
 
     fn update(&self, key: &[u8], value: &[u8], flags: u64) -> Result<(), KernelError> {
@@ -186,29 +278,33 @@ impl BpfMapOps for BpfHashMap {
         if value.len() != self.value_size as usize {
             return Err(KernelError::InvalidArgument);
         }
-
-        // A new element's key and value are allocated before the lock
-        // (IRQs are off under it), fallibly (ENOMEM); dropped after it
-        // when unused
-        let k = crate::util::kmem::try_to_vec(key)?;
-        let v = crate::util::kmem::try_to_vec(value)?;
-        let mut data = self.data.lock();
+        let mut t = self.data.lock();
+        let h = t.key_hash(key);
         // Linux htab check_flags
-        if let Some(old) = data.get_mut(key) {
+        if let Some(e) = self.find(&t, key, h) {
             if flags & !BPF_F_LOCK == BPF_NOEXIST {
                 return Err(KernelError::AlreadyExists);
             }
-            old.copy_from_slice(value);
+            self.value_of(&mut t, e).copy_from_slice(value);
             return Ok(());
         }
         if flags & !BPF_F_LOCK == BPF_EXIST {
             return Err(KernelError::NotFound);
         }
-        // Full (Linux htab: E2BIG)
-        if data.len() >= self.max_entries as usize {
+        // Full (Linux htab: E2BIG): the free list is empty
+        let e = t.free;
+        if e == NIL {
             return Err(KernelError::ArgListTooLong);
         }
-        data.insert(k, v);
+        t.free = t.next[e as usize];
+        let at = e as usize * self.kv_size();
+        t.kv[at..at + key.len()].copy_from_slice(key);
+        self.value_of(&mut t, e).copy_from_slice(value);
+        t.hash[e as usize] = h;
+        let b = t.bucket(h);
+        t.next[e as usize] = t.buckets[b];
+        t.buckets[b] = e;
+        t.len += 1;
         Ok(())
     }
 
@@ -216,30 +312,54 @@ impl BpfMapOps for BpfHashMap {
         if key.len() != self.key_size as usize {
             return Err(KernelError::InvalidArgument);
         }
-        let mut data = self.data.lock();
-        if data.remove(key).is_some() {
-            Ok(())
-        } else {
-            Err(KernelError::NotFound)
+        let mut t = self.data.lock();
+        let h = t.key_hash(key);
+        let b = t.bucket(h);
+        // Unlink from the bucket's chain, onto the free list
+        let mut prev = NIL;
+        let mut e = t.buckets[b];
+        while e != NIL {
+            if t.hash[e as usize] == h && self.key_of(&t, e) == key {
+                let n = t.next[e as usize];
+                match prev {
+                    NIL => t.buckets[b] = n,
+                    p => t.next[p as usize] = n,
+                }
+                t.next[e as usize] = t.free;
+                t.free = e;
+                t.len -= 1;
+                return Ok(());
+            }
+            prev = e;
+            e = t.next[e as usize];
         }
+        Err(KernelError::NotFound)
     }
 
-    fn get_next_key(&self, key: Option<&[u8]>) -> Option<Vec<u8>> {
-        let data = self.data.lock();
-
-        match key {
-            None => {
-                // Return first key
-                data.keys().next().cloned()
-            }
-            Some(k) => {
-                // Return key after this one
-                // Use range to find keys greater than k
-                data.range::<[u8], _>((core::ops::Bound::Excluded(k), core::ops::Bound::Unbounded))
-                    .next()
-                    .map(|(key, _)| key.clone())
-            }
+    /// Linux htab_map_get_next_key: the element after `key` in its
+    /// bucket, else the first of the next non-empty bucket; a key not in
+    /// the map (or none) starts from the first bucket
+    fn get_next_key(&self, key: Option<&[u8]>, out: &mut [u8]) -> bool {
+        if out.len() != self.key_size as usize {
+            return false;
         }
+        let t = self.data.lock();
+        let found = key
+            .filter(|k| k.len() == self.key_size as usize)
+            .and_then(|k| {
+                let h = t.key_hash(k);
+                Some((self.find(&t, k, h)?, t.bucket(h)))
+            });
+        let next = match found {
+            Some((e, _)) if t.next[e as usize] != NIL => Some(t.next[e as usize]),
+            Some((_, b)) => t.buckets[b + 1..].iter().copied().find(|&e| e != NIL),
+            None => t.buckets.iter().copied().find(|&e| e != NIL),
+        };
+        let Some(e) = next else {
+            return false;
+        };
+        out.copy_from_slice(self.key_of(&t, e));
+        true
     }
 
     fn map_type(&self) -> u32 {
@@ -259,18 +379,13 @@ impl BpfMapOps for BpfHashMap {
     }
 
     fn len(&self) -> usize {
-        self.data.lock().len()
+        self.data.lock().len
     }
 }
 
 // =============================================================================
 // BPF Array Map
 // =============================================================================
-
-/// Per-entry share of a BTreeMap node in the hash map's budget (a node
-/// holds up to 11 entries in about 300 bytes of keys and values plus
-/// edges)
-const HASH_NODE_SHARE: u64 = 32;
 
 /// Most bytes a map may preallocate: half of free memory (host tests:
 /// no limit)
@@ -347,9 +462,16 @@ impl BpfArrayMap {
 }
 
 impl BpfMapOps for BpfArrayMap {
-    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let index = self.key_to_index(key)?;
-        Some(self.data[index as usize].lock().clone())
+    fn lookup(&self, key: &[u8], out: &mut [u8]) -> bool {
+        let Some(index) = self.key_to_index(key) else {
+            return false;
+        };
+        let v = self.data[index as usize].lock();
+        if out.len() != v.len() {
+            return false;
+        }
+        out.copy_from_slice(&v);
+        true
     }
 
     fn update(&self, key: &[u8], value: &[u8], flags: u64) -> Result<(), KernelError> {
@@ -378,16 +500,18 @@ impl BpfMapOps for BpfArrayMap {
         Ok(())
     }
 
-    fn get_next_key(&self, key: Option<&[u8]>) -> Option<Vec<u8>> {
-        let next_index = match key {
+    fn get_next_key(&self, key: Option<&[u8]>, out: &mut [u8]) -> bool {
+        // Linux array_map_get_next_key: a missing or out-of-range key
+        // starts from 0
+        let next_index = match key.and_then(|k| self.key_to_index(k)) {
             None => 0u32,
-            Some(k) => {
-                let current = self.key_to_index(k)?;
-                current.checked_add(1)?
-            }
+            Some(i) => i + 1,
         };
-
-        (next_index < self.max_entries).then(|| next_index.to_ne_bytes().to_vec())
+        if next_index >= self.max_entries || out.len() != 4 {
+            return false;
+        }
+        out.copy_from_slice(&next_index.to_ne_bytes());
+        true
     }
 
     fn map_type(&self) -> u32 {
@@ -443,8 +567,8 @@ impl BpfMap {
 
 // Implement BpfMapOps by delegation
 impl BpfMapOps for BpfMap {
-    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.ops.lookup(key)
+    fn lookup(&self, key: &[u8], out: &mut [u8]) -> bool {
+        self.ops.lookup(key, out)
     }
 
     fn update(&self, key: &[u8], value: &[u8], flags: u64) -> Result<(), KernelError> {
@@ -455,8 +579,8 @@ impl BpfMapOps for BpfMap {
         self.ops.delete(key)
     }
 
-    fn get_next_key(&self, key: Option<&[u8]>) -> Option<Vec<u8>> {
-        self.ops.get_next_key(key)
+    fn get_next_key(&self, key: Option<&[u8]>, out: &mut [u8]) -> bool {
+        self.ops.get_next_key(key, out)
     }
 
     fn map_type(&self) -> u32 {
@@ -518,12 +642,43 @@ mod tests {
         assert!(map.update(&key, &value, BPF_ANY).is_ok());
 
         // Lookup
-        let result = map.lookup(&key).unwrap();
-        assert_eq!(result, value);
+        let mut out = [0u8; 8];
+        assert!(map.lookup(&key, &mut out));
+        assert_eq!(out, value);
 
         // Delete
         assert!(map.delete(&key).is_ok());
-        assert!(map.lookup(&key).is_none());
+        assert!(!map.lookup(&key, &mut out));
+    }
+
+    /// Full at max_entries (E2BIG), a deleted element is reused, and
+    /// get_next_key visits every key once
+    #[test]
+    fn test_hash_map_prealloc_and_iteration() {
+        let map = BpfHashMap::new(4, 4, 8).unwrap();
+        for i in 0u32..8 {
+            assert!(
+                map.update(&i.to_ne_bytes(), &i.to_ne_bytes(), BPF_NOEXIST)
+                    .is_ok()
+            );
+        }
+        assert!(matches!(
+            map.update(&9u32.to_ne_bytes(), &[0; 4], BPF_ANY),
+            Err(KernelError::ArgListTooLong)
+        ));
+        assert!(map.delete(&3u32.to_ne_bytes()).is_ok());
+        assert!(map.update(&9u32.to_ne_bytes(), &[9; 4], BPF_ANY).is_ok());
+        let mut seen = alloc::vec::Vec::new();
+        let mut k = [0u8; 4];
+        let mut cur: Option<[u8; 4]> = None;
+        while map.get_next_key(cur.as_ref().map(|c| &c[..]), &mut k) {
+            seen.push(u32::from_ne_bytes(k));
+            cur = Some(k);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, [0, 1, 2, 4, 5, 6, 7, 9]);
+        // A key not in the map starts from the first
+        assert!(map.get_next_key(Some(&77u32.to_ne_bytes()), &mut k));
     }
 
     #[test]
@@ -537,7 +692,8 @@ mod tests {
         assert!(map.update(&key, &value, BPF_ANY).is_ok());
 
         // Lookup
-        let result = map.lookup(&key).unwrap();
-        assert_eq!(result, value);
+        let mut out = [0u8; 8];
+        assert!(map.lookup(&key, &mut out));
+        assert_eq!(out, value);
     }
 }

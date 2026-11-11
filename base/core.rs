@@ -13,7 +13,9 @@
 //!
 //! `Device.lock` (sleeping Mutex, Linux device_lock) is held across
 //! probe and release; the driver and its state are spin leaves read
-//! without it. Bus, class and `DEVICES_LIST` are spin leaves; sysfs
+//! without it. A bus's device list is a klist (`util::klist`, a spin
+//! leaf, walked while devices come and go) and `DEVICES_LIST` an
+//! intrusive spin-leaf list: nothing allocates under either. sysfs
 //! changes take kernfs's locks (doc/LOCKING.md 3.3).
 
 use alloc::string::String;
@@ -85,7 +87,6 @@ static GLUE: Mutex<()> = Mutex::new(());
 struct Added {
     dir: bool,
     class_link: bool,
-    class_list: bool,
     sys_dev: bool,
     devnode: bool,
     bus: bool,
@@ -133,8 +134,9 @@ impl DeviceInfo<'_> {
 }
 
 /// Every registered device, parents before children (Linux
-/// devices_kset list)
-static DEVICES_LIST: SpinMutex<Vec<Arc<Device>>> = SpinMutex::new(Vec::new());
+/// devices_kset list, linked through `Device.kset_link`)
+static DEVICES_LIST: SpinMutex<crate::util::list::ArcList<DevKset>> =
+    SpinMutex::new(crate::util::list::ArcList::new());
 
 /// A device (Linux struct device)
 pub struct Device {
@@ -159,8 +161,15 @@ pub struct Device {
     driver: RwLock<Option<&'static Driver>>,
     /// The bound driver's state (Linux drvdata)
     bound: SpinMutex<Option<Arc<dyn Bound>>>,
+    /// On its bus's device klist (Linux p->knode_bus)
+    pub(super) knode_bus: crate::util::klist::KlistNode,
+    /// On `DEVICES_LIST` (Linux kobj.entry in devices_kset)
+    kset_link: crate::util::list::Link,
     me: Weak<Device>,
 }
+
+crate::klist_adapter!(pub DevBus, Device, knode_bus);
+crate::adapter!(DevKset, Device, kset_link);
 
 /// The `uevent` attribute: the device's environment (Linux
 /// uevent_show); a write sends a synthetic event (uevent_store)
@@ -339,8 +348,6 @@ impl Device {
             if let Some(p) = &self.parent {
                 dir.create_link(b"device", p.kobj())?;
             }
-            c.add_device(me.clone());
-            self.added.lock().class_list = true;
         }
         if let Some(dt) = self.devt {
             dir.create_file(
@@ -365,7 +372,7 @@ impl Device {
             b.add_device(&me)?;
             self.added.lock().bus = true;
         }
-        DEVICES_LIST.lock().push(me.clone());
+        DEVICES_LIST.lock().push_back(me.clone());
         self.added.lock().listed = true;
         super::uevent::uevent(self, super::uevent::Action::Add);
         self.added.lock().announced = true;
@@ -397,7 +404,16 @@ impl Device {
     fn undo(self: &Arc<Self>) {
         let a = core::mem::take(&mut *self.added.lock());
         if a.listed {
-            DEVICES_LIST.lock().retain(|d| !Arc::ptr_eq(d, self));
+            let gone = {
+                let mut l = DEVICES_LIST.lock();
+                // `kset_link` is used only by DEVICES_LIST, so a linked
+                // device is on it (device_shutdown may have taken it)
+                // SAFETY: as just said
+                self.kset_link
+                    .is_linked()
+                    .then(|| unsafe { l.remove(self) })
+            };
+            drop(gone);
         }
         if a.bus
             && let Some(b) = self.bus
@@ -413,13 +429,10 @@ impl Device {
                 self.sys_dev_dir().remove_child(mm.as_bytes());
             }
         }
-        if let Some(c) = self.class {
-            if a.class_link {
-                c.dir().remove_child_ns(self.name.as_bytes(), self.ns);
-            }
-            if a.class_list {
-                c.remove_device(self);
-            }
+        if let Some(c) = self.class
+            && a.class_link
+        {
+            c.dir().remove_child_ns(self.name.as_bytes(), self.ns);
         }
         if !a.dir {
             return;
@@ -456,6 +469,8 @@ pub fn device_create(info: DeviceInfo<'_>) -> Result<Arc<Device>, KernelError> {
         added: SpinMutex::new(Added::default()),
         driver: RwLock::new(None),
         bound: SpinMutex::new(None),
+        knode_bus: crate::util::klist::KlistNode::new(),
+        kset_link: crate::util::list::Link::new(),
         me: me.clone(),
     })?;
     if let Err(e) = d.add() {
@@ -468,13 +483,17 @@ pub fn device_create(info: DeviceInfo<'_>) -> Result<Arc<Device>, KernelError> {
 /// Quiesce every bound device before power-off, restart or halt, the
 /// last registered first (Linux device_shutdown); runs once
 pub fn device_shutdown() {
-    let devs = core::mem::take(&mut *DEVICES_LIST.lock());
-    for d in devs.iter().rev() {
+    // One at a time off the list's end, with it unlocked (Linux takes
+    // devices_kset->list.prev, list_del_init, then shuts it down)
+    loop {
+        let Some(d) = DEVICES_LIST.lock().pop_back() else {
+            break;
+        };
         let b = d.bound.lock().clone();
         if let Some(b) = b {
             b.shutdown();
         }
+        // The device stays registered: the machine goes down next
+        core::mem::forget(d);
     }
-    // The devices stay registered: the machine goes down next
-    core::mem::forget(devs);
 }

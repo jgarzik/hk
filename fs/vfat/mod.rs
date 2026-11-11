@@ -1837,7 +1837,7 @@ impl InodeOps for VfatInodeOps {
 
         // Create and return the new inode
         let ino = sb.alloc_ino();
-        let inode = try_arc(Inode::new(
+        let inode = Inode::alloc(Inode::new(
             ino,
             sb_data.opts.file_mode(),
             sb_data.opts.uid,
@@ -1924,7 +1924,7 @@ impl InodeOps for VfatInodeOps {
 
         // Create and return the new inode
         let ino = sb.alloc_ino();
-        let inode = try_arc(Inode::new(
+        let inode = Inode::alloc(Inode::new(
             ino,
             sb_data.opts.dir_mode(),
             sb_data.opts.uid,
@@ -2290,7 +2290,7 @@ fn create_inode_for_entry(
     };
 
     let ino = sb.alloc_ino();
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         ino,
         mode,
         o.uid,
@@ -2505,7 +2505,7 @@ impl SuperOps for VfatSuperOps {
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
     ) -> Result<Arc<Inode>, KernelError> {
-        try_arc(Inode::new(
+        Inode::alloc(Inode::new(
             sb.alloc_ino(),
             mode,
             0,
@@ -2642,7 +2642,7 @@ fn vfat_mount_dev(
 
     // Create root inode
     let root_ino = sb.alloc_ino();
-    let root_inode = try_arc(Inode::new(
+    let root_inode = Inode::alloc(Inode::new(
         root_ino,
         sb_data.opts.dir_mode(),
         sb_data.opts.uid,
@@ -2680,6 +2680,8 @@ pub static VFAT_TYPE: FileSystemType = FileSystemType {
     mount: vfat_mount_pseudo,
     mount_dev: Some(vfat_mount_dev),
     file_ops: &VFAT_FILE_OPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };
 
 #[cfg(test)]

@@ -35,6 +35,7 @@ pub mod smp;
 pub mod sync;
 pub mod syscall;
 pub mod sysctl;
+pub mod system_state;
 pub mod time;
 pub mod uaccess;
 
@@ -283,20 +284,32 @@ pub(crate) fn kmain() -> ! {
     })
     .expect("Failed to create user task");
 
-    // Schedulers for the APs, then the kernel threads: timer callbacks
+    // RCU grace periods (rcu_gp) before a second CPU runs anything;
+    // schedulers for the APs, then the kernel threads: RCU callbacks
+    // (rcuc/N), timer callbacks
     // (ktimers/N), the system workqueue worker, the per-CPU network
     // softnet threads. Then interrupts on: pid 1 may sleep from here.
+    crate::sync::rcu::start();
     task::percpu::init_ap_schedulers();
+    crate::sync::rcu::spawn_core_kthreads();
     crate::time::timer::start_ktimers();
     crate::task::stop_machine::start();
     crate::task::workqueue::init();
     crate::net::start_threads();
     CurrentArch::enable_interrupts();
+    // Tasks can be scheduled from here (Linux rest_init)
+    system_state::set_system_state(system_state::SystemState::Scheduling);
 
+    // Linux vfs_caches_init: dcache_init (the dentry hash table, sized
+    // to RAM), files_init (the files' delayed release), then mnt_init
+    fs::dentry::dcache_init(FRAME_ALLOCATOR.stats().total_bytes / 4096);
+    fs::file::files_init();
     // Linux order: mnt_init (start_kernel), then do_basic_setup:
     // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
     // (chr_dev_init), then device initcalls (bus probes below)
     mnt_init();
+    // vfs_caches_init's bdev_cache_init, after mnt_init
+    pseudo_init(&fs::pseudo::BDEV);
     // start_kernel's nsfs_init, after proc_root_init
     pseudo_init(&fs::pseudo::NSFS);
     fs::ramfs::devtmpfs::init();
@@ -362,6 +375,7 @@ pub(crate) fn kmain() -> ! {
     }
     // Everything was copied out (Linux do_populate_rootfs)
     initrd.free();
+    init_flush_fput();
 
     // ========================================================================
     // Phase 6b: Graphics Console Initialization
@@ -404,7 +418,9 @@ pub(crate) fn kmain() -> ! {
 /// through execve with argv {path, the command line's extra words} and
 /// envp {HOME=/, TERM=linux, its extra name=value words}.
 fn run_init() -> ! {
-    let args = cmdline::init_args(&cmdline::saved());
+    // Linux kernel_init, before run_init_process
+    system_state::set_system_state(system_state::SystemState::Running);
+    let args = cmdline::init_args(cmdline::saved());
     let rdinit = args.rdinit.as_deref().unwrap_or("/init");
     if fs::lookup_path(rdinit.as_bytes()).is_ok() {
         let e = try_init(rdinit, &args);
@@ -453,6 +469,14 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> util::error::KernelError {
         Ok(never) => match never {},
         Err(e) => e,
     }
+}
+
+/// The files closed so far are released (Linux init/do_mounts.h
+/// init_flush_fput, at the end of do_populate_rootfs): pid 1's queued
+/// on it, and those on the delayed list
+fn init_flush_fput() {
+    fs::file::flush_delayed_fput();
+    task::task_work::task_work_run();
 }
 
 /// Default RAM disk size in MB

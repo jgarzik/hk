@@ -4,8 +4,8 @@
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::arch::ArchPageTable;
+use crate::fs::FileRef;
 use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch::{FrameAlloc, PageFlags, PageTable, phys_to_virt};
@@ -548,7 +548,7 @@ pub fn image_vmas(
     elf: &ElfExecutable,
     base: u64,
     stack_bottom: u64,
-    file: Option<&Arc<File>>,
+    file: Option<&FileRef>,
 ) -> Vec<crate::mm::Vma> {
     use crate::mm::{PROT_READ, PROT_WRITE, VM_GROWSDOWN};
     let mut vmas = segment_vmas(elf, base, file);
@@ -645,7 +645,7 @@ fn seg_prot(f: &crate::util::elf::SegmentFlags) -> u32 {
 /// image mapped from the page cache) a span's whole file pages are a
 /// private file VMA, the rest (a partial page, the bss) anonymous ones
 /// around it. They cover exactly the pages `load_elf_segments` maps.
-fn segment_vmas(elf: &ElfExecutable, base: u64, file: Option<&Arc<File>>) -> Vec<crate::mm::Vma> {
+fn segment_vmas(elf: &ElfExecutable, base: u64, file: Option<&FileRef>) -> Vec<crate::mm::Vma> {
     use crate::mm::{MAP_PRIVATE, Vma};
     let mut vmas: Vec<Vma> = Vec::new();
     for sp in image_spans(elf, base) {
@@ -836,11 +836,11 @@ fn apply_relocations(
 /// MAX_DEPTH levels is ELOOP. A script named through a close-on-exec fd
 /// (execveat) cannot be reopened by its interpreter: ENOENT.
 fn resolve_scripts(
-    mut file: Arc<File>,
+    mut file: FileRef,
     mut argv: ArgStrings,
     path: &[u8],
     path_inaccessible: bool,
-) -> KernelResult<(Arc<File>, ArgStrings)> {
+) -> KernelResult<(FileRef, ArgStrings)> {
     use crate::task::binfmt_script::{BINPRM_BUF_SIZE, MAX_DEPTH, parse, rewrite_argv};
     let mut name = path.to_vec();
     for depth in 0.. {
@@ -1047,7 +1047,7 @@ fn exec_file<FA, F>(
 ) -> KernelResult<Infallible>
 where
     FA: FrameAlloc<PhysAddr = u64>,
-    F: FnOnce(&[u8]) -> KernelResult<Arc<File>>,
+    F: FnOnce(&[u8]) -> KernelResult<FileRef>,
 {
     // Linux prepare_bprm_creds: the thread group's cred_guard_mutex from
     // the first credential check until the new image is in place, so
@@ -1240,8 +1240,12 @@ where
     // a pipe) sees the exec, and its setpgid is EACCES
     percpu::current().clear_flag(crate::task::pf::FORKNOEXEC);
 
-    // Private fd table without the close-on-exec descriptors
-    crate::task::fdtable::exec_task_fd();
+    // Private fd table without the close-on-exec descriptors (Linux
+    // begin_new_exec: unshare_files, then do_close_on_exec)
+    if let Err(e) = crate::task::fdtable::exec_task_fd() {
+        exec_fatal();
+        return Err(e);
+    }
 
     // Signal vfork completion if parent is waiting
     // Must be done before we switch address spaces since parent may be blocked

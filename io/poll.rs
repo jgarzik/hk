@@ -34,7 +34,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::pin::Pin;
 
-use crate::fs::File;
+use crate::fs::FileRef;
 use crate::sync::waitqueue::{WaitEntry, WaitQueue};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_box;
@@ -182,7 +182,7 @@ pub struct PollContext {
     /// Registered (wait queue, entry) pairs
     entries: Vec<(*const WaitQueue, Pin<Box<WaitEntry>>)>,
     /// Files whose wait queues we registered on (keeps them alive)
-    files: Vec<Arc<File>>,
+    files: Vec<FileRef>,
     /// Other owners of wait queues registered on (a signalfd's poll
     /// registers on the caller's SigHand), kept alive likewise
     owners: Vec<Arc<dyn core::any::Any + Send + Sync>>,
@@ -224,7 +224,7 @@ impl PollContext {
 
     /// Keep `file` alive for the lifetime of this context (call before
     /// polling it with a registering table)
-    pub fn hold_file(&mut self, file: Arc<File>) {
+    pub fn hold_file(&mut self, file: FileRef) {
         if Self::room(&mut self.files, &mut self.error) {
             self.files.push(file);
         }
@@ -352,7 +352,7 @@ impl<'a> PollTable<'a> {
     /// registration is disabled)
     /// (An epoll item holds no reference to its file: the file's last
     /// close unregisters it.)
-    pub fn hold_file(&mut self, file: &Arc<File>) {
+    pub fn hold_file(&mut self, file: &FileRef) {
         if self.qproc_enabled
             && let Target::Ctx(c) = &mut self.target
         {

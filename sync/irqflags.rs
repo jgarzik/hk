@@ -60,12 +60,20 @@ pub struct IrqFlags(Raw);
 /// Disable interrupts on this CPU, returning the previous state (Linux
 /// local_irq_save)
 #[inline]
+#[cfg_attr(feature = "lockdep", track_caller)]
 pub fn local_irq_save() -> IrqFlags {
-    IrqFlags(save())
+    let f = save();
+    if enabled(f) {
+        crate::sync::lockdep::irqs_off(core::panic::Location::caller());
+    }
+    IrqFlags(f)
 }
 
 /// Restore the state saved by [`local_irq_save`]
 #[inline]
 pub fn local_irq_restore(f: IrqFlags) {
+    if enabled(f.0) {
+        crate::sync::lockdep::irqs_on();
+    }
     restore(f.0)
 }

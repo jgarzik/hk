@@ -9,12 +9,13 @@
 //! - Test timer_delete
 //! - Test timer_getoverrun (initial value is 0)
 //! - Test multiple timers
+//! - timer_create whose id cannot be stored leaves no timer
 
-use crate::harness::pass;
+use crate::harness::{pass, verdict};
 use crate::helpers::{print, print_num};
 use hk_syscall::{
-    CLOCK_MONOTONIC, CLOCK_REALTIME, ITimerSpec, Timespec, sys_timer_create, sys_timer_delete,
-    sys_timer_getoverrun, sys_timer_gettime, sys_timer_settime,
+    CLOCK_MONOTONIC, CLOCK_REALTIME, ITimerSpec, Timespec, sys_exit, sys_fork, sys_timer_create,
+    sys_timer_delete, sys_timer_getoverrun, sys_timer_gettime, sys_timer_settime, sys_wait4,
 };
 
 /// Run all POSIX timer tests
@@ -28,6 +29,43 @@ pub fn run_tests() {
     test_timer_getoverrun_initial();
     test_timer_create_multiple();
     test_timer_settime_old_value();
+    test_timer_create_efault();
+}
+
+/// timer_create with a timerid it cannot write is EFAULT and leaves no
+/// timer: the id it took is not one (Linux do_timer_create unhashes it
+/// after the failed copy_to_user), and the next timer takes the id
+/// after it. In a fork child, whose ids start at 0.
+fn test_timer_create_efault() {
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut bad = 0u64;
+        // NULL, then an unmapped address
+        if sys_timer_create(CLOCK_MONOTONIC, core::ptr::null(), core::ptr::null_mut()) != -14 {
+            bad |= 1;
+        }
+        if sys_timer_create(CLOCK_MONOTONIC, core::ptr::null(), 8 as *mut i32) != -14 {
+            bad |= 2;
+        }
+        let mut id: i32 = -1;
+        if sys_timer_create(CLOCK_MONOTONIC, core::ptr::null(), &mut id) != 0 || id != 2 {
+            bad |= 4;
+        }
+        if sys_timer_delete(0) != -22 || sys_timer_delete(1) != -22 {
+            bad |= 8;
+        }
+        let mut cur = ITimerSpec::default();
+        if sys_timer_gettime(1, &mut cur) != -22 {
+            bad |= 16;
+        }
+        if sys_timer_delete(id) != 0 {
+            bad |= 32;
+        }
+        sys_exit(bad);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    verdict(b"TIMER_CREATE_EFAULT", st == 0, (st >> 8) as i64);
 }
 
 /// Test timer_create with CLOCK_MONOTONIC

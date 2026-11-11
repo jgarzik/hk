@@ -11,7 +11,8 @@ use core::sync::atomic::Ordering;
 use super::core::Device;
 use crate::fs::KernelError;
 use crate::ksysfs::UEVENT_SEQNUM;
-use crate::net::netlink::{self, NETLINK_KOBJECT_UEVENT, NlSkb};
+use crate::mm::page_alloc::Gfp;
+use crate::net::netlink::{self, NETLINK_KOBJECT_UEVENT};
 
 /// Linux enum kobject_action
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,17 +91,17 @@ fn send(
         msg.extend_from_slice(v);
         msg.push(0);
     }
-    for net in crate::ns::net::all_net_ns() {
-        if ns != 0 && net.id != ns {
-            continue;
+    crate::ns::net::for_each_net(|net| {
+        if ns == 0 || net.id == ns {
+            netlink::broadcast(
+                net,
+                NETLINK_KOBJECT_UEVENT,
+                netlink::kernel_skb(msg.clone(), 1),
+                0,
+                Gfp::KERNEL,
+            );
         }
-        netlink::broadcast(
-            &net,
-            NETLINK_KOBJECT_UEVENT,
-            NlSkb::kernel(msg.clone(), 1),
-            0,
-        );
-    }
+    });
 }
 
 /// Linux kobject_uevent

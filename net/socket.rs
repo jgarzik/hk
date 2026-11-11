@@ -14,6 +14,7 @@
 //! take effect immediately) plus MSG_DONTWAIT; timeouts and signal
 //! rules are in `Sock::wait`.
 
+use crate::fs::FileRef;
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -181,7 +182,7 @@ pub fn sock_of(file: &File) -> Option<Arc<dyn ProtoOps>> {
 
 /// Wrap a protocol socket in a new sockfs file (Linux sock_alloc_file:
 /// on failure the socket is released)
-pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<Arc<File>, KernelError> {
+pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<FileRef, KernelError> {
     let r = sock_file(sock.clone(), nonblock);
     if r.is_err() {
         sock.release();
@@ -189,12 +190,12 @@ pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<Arc<Fi
     r
 }
 
-fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<Arc<File>, KernelError> {
+fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<FileRef, KernelError> {
     let ino = crate::fs::anon_inodes::get_next_ino();
     sock.sk().ino.store(ino, Ordering::Release);
     let cred = &sock.sk().cred;
     let now = crate::time::TIMEKEEPER.current_time();
-    let inode = try_arc(Inode::new(
+    let inode = Inode::alloc(Inode::new(
         ino,
         InodeMode::socket(0o777),
         cred.fsuid,
@@ -212,7 +213,7 @@ fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<Arc<File>, Kerne
     if nonblock {
         flags |= fflags::O_NONBLOCK;
     }
-    try_arc(File::new(dentry, Some(mnt), flags, &SOCK_FOPS))
+    File::new(dentry, Some(mnt), flags, &SOCK_FOPS).alloc()
 }
 
 /// Create a protocol socket (Linux __sock_create)

@@ -11,15 +11,18 @@
 //! `Inet.addr` is a `crate::sync::spin::Mutex` leaf (thread context only); the
 //! IP-level options are atomics.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 use crate::sync::spin::Mutex;
 
+use crate::mm::page_alloc::Gfp;
 use crate::net::inet::fib::RouteType;
 use crate::net::ipv4::{IP_DEFAULT_TTL, IpParams, Ipv4Addr};
 use crate::net::msg::Cmsg;
+use crate::net::skb::{SkBuff, SkbCb};
 use crate::net::sock::Sock;
 use crate::net::socket::{
     AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM,
@@ -408,21 +411,32 @@ pub fn ip_icmp_error(
     port: u16,
     payload: &[u8],
 ) {
-    // Linux ip_icmp_error: no clone, no queued error
-    let Ok(payload) = crate::util::kmem::try_to_vec(payload) else {
-        return;
-    };
-    sk.queue_err(crate::net::sock::ErrSkb {
+    let ee = crate::net::sock::ExtErr {
         errno: errno as u32,
         origin: crate::net::sock::EE_ORIGIN_ICMP,
         ty: e.ty,
         code: e.code,
         info: e.info,
-        name: sin_bytes(e.inner_daddr(), port),
-        offender: sin_bytes(e.from, 0),
-        payload,
+        addr: e.inner_daddr(),
+        port,
+        offender: e.from,
         rx: Some(e.rx),
-    });
+    };
+    // Linux ip_icmp_error: skb_clone(GFP_ATOMIC); no clone, no queued
+    // error
+    if let Some(skb) = err_skb(payload, ee) {
+        sk.queue_err(skb);
+    }
+}
+
+/// An error-queue skb of `payload` with `ee` in its cb, allocated
+/// GFP_ATOMIC before the queue lock (the receive path, or Linux
+/// ip_local_error's alloc_skb(GFP_ATOMIC))
+fn err_skb(payload: &[u8], ee: crate::net::sock::ExtErr) -> Option<Box<SkBuff>> {
+    let mut skb = SkBuff::alloc(0, payload.len(), Gfp::ATOMIC)?;
+    skb.put_slice(payload)?;
+    skb.cb = SkbCb::Exterr(ee);
+    Some(skb)
 }
 
 /// Queue a locally detected error (EMSGSIZE) if IP_RECVERR is on (Linux
@@ -438,13 +452,17 @@ pub fn ip_local_error(
     if !inet.flag(ipf::RECVERR) {
         return;
     }
-    sk.queue_err(crate::net::sock::ErrSkb {
+    let ee = crate::net::sock::ExtErr {
         errno: errno as u32,
         origin: crate::net::sock::EE_ORIGIN_LOCAL,
         info,
-        name: sin_bytes(daddr, port),
+        addr: daddr,
+        port,
         ..Default::default()
-    });
+    };
+    if let Some(skb) = err_skb(&[], ee) {
+        sk.queue_err(skb);
+    }
 }
 
 /// recvmsg(MSG_ERRQUEUE) (Linux ip_recv_error): EAGAIN when empty; the
@@ -456,13 +474,14 @@ pub fn ip_recv_error(
     m: &mut crate::net::msg::RecvMsg<'_>,
 ) -> Result<usize, KernelError> {
     use crate::net::msg::{MSG_ERRQUEUE, MSG_TRUNC};
-    let e = sk.dequeue_err().ok_or(KernelError::WouldBlock)?;
-    let n = m.data.put(0, &e.payload)?;
-    if n < e.payload.len() {
+    let skb = sk.dequeue_err().ok_or(KernelError::WouldBlock)?;
+    let e = crate::net::sock::exterr(&skb);
+    let n = m.data.put(0, skb.data())?;
+    if n < skb.len() {
         m.flags |= MSG_TRUNC;
     }
-    if m.want_name && !e.name.is_empty() {
-        m.name = Some(e.name.clone());
+    if m.want_name {
+        m.name = Some(sin_bytes(e.addr, e.port));
     }
     let mut ee = [0u8; 32];
     ee[0..4].copy_from_slice(&e.errno.to_ne_bytes());
@@ -471,8 +490,7 @@ pub fn ip_recv_error(
     ee[6] = e.code;
     ee[8..12].copy_from_slice(&e.info.to_ne_bytes());
     if e.origin == crate::net::sock::EE_ORIGIN_ICMP {
-        ee[16..16 + e.offender.len().min(16)]
-            .copy_from_slice(&e.offender[..e.offender.len().min(16)]);
+        ee[16..32].copy_from_slice(&sin_bytes(e.offender, 0)[..16]);
         if let Some(rx) = &e.rx {
             inet.recv_cmsgs(&mut m.cmsg, rx);
         }

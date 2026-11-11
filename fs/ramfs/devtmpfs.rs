@@ -51,6 +51,8 @@ pub static DEVTMPFS_TYPE: FileSystemType = FileSystemType {
     mount,
     mount_dev: None,
     file_ops: &super::TMPFS_FILE_OPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };
 
 /// Create the node `name` for a device (Linux device_add ->
@@ -91,5 +93,5 @@ pub fn init() {
             return;
         }
     }
-    crate::fs::superblock::register_filesystem(&DEVTMPFS_TYPE);
+    crate::fs::superblock::register_filesystem(&DEVTMPFS_TYPE).expect("devtmpfs type");
 }

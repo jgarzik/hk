@@ -5,12 +5,13 @@
 //! EPIPE/SIGPIPE, poll states, /proc/net/unix.
 
 use hk_syscall::{
-    AF_UNIX, FIONREAD, IoVec, MsgHdr, O_RDONLY, SHUT_RD, SHUT_WR, SIG_DFL, SIG_IGN, SIGPIPE,
-    SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, Stat, sys_accept, sys_bind, sys_chmod,
-    sys_connect, sys_exit, sys_fcntl, sys_fork, sys_getpeername, sys_getpid, sys_getsockname,
-    sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe, sys_read, sys_recvfrom, sys_rt_sigaction,
-    sys_sendmsg, sys_sendto, sys_setresgid, sys_setresuid, sys_shutdown, sys_socket,
-    sys_socketpair, sys_stat, sys_umask, sys_unlink, sys_wait4, sys_write,
+    AF_UNIX, EPOLL_CTL_ADD, EPOLLET, EPOLLOUT, EpollEvent, FIONREAD, IoVec, MsgHdr, O_RDONLY,
+    SHUT_RD, SHUT_WR, SIG_DFL, SIG_IGN, SIGPIPE, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK,
+    SOCK_STREAM, Stat, sys_accept, sys_bind, sys_chmod, sys_connect, sys_epoll_create1,
+    sys_epoll_ctl, sys_epoll_wait, sys_exit, sys_fcntl, sys_fork, sys_getpeername, sys_getpid,
+    sys_getsockname, sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe, sys_read, sys_recvfrom,
+    sys_rt_sigaction, sys_sendmsg, sys_sendto, sys_setresgid, sys_setresuid, sys_shutdown,
+    sys_socket, sys_socketpair, sys_stat, sys_umask, sys_unlink, sys_wait4, sys_write,
 };
 
 use crate::harness::T;
@@ -51,11 +52,14 @@ pub fn run_tests() {
     test_stream_data();
     test_stream_coalesce();
     test_peek_waitall();
+    test_stream_peek();
+    test_stream_peek_fds();
     test_shutdown();
     test_backlog();
     test_sndbuf();
     test_dgram();
     test_dgram_queue();
+    test_dgram_peer_wake();
     test_seqpacket();
     test_epipe();
     test_reset();
@@ -66,6 +70,7 @@ pub fn run_tests() {
     test_scm_creds();
     test_poll();
     test_proc();
+    test_proc_big();
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +713,59 @@ fn test_peek_waitall() {
     t.done();
 }
 
+/// A stream peek joins messages and copies a partly read one from where
+/// the reads stopped, consuming nothing
+fn test_stream_peek() {
+    let mut t = T::new(b"UNIX_STREAM_PEEK");
+    let (a, b) = pair(SOCK_STREAM);
+    send(a, b"ab", 0);
+    send(a, b"cd", 0);
+    send(a, b"efg", 0);
+    let mut buf = [0u8; 16];
+    t.eq(b"peek all", recv(b, &mut buf, MSG_PEEK), 7);
+    t.ok(b"peek data", &buf[..7] == b"abcdefg", buf[0] as i64);
+    t.eq(b"peek part", recv(b, &mut buf[..3], MSG_PEEK), 3);
+    t.ok(b"peek part data", &buf[..3] == b"abc", buf[0] as i64);
+    t.eq(b"read one", recv(b, &mut buf[..1], 0), 1);
+    buf.fill(0);
+    t.eq(b"peek rest", recv(b, &mut buf, MSG_PEEK), 6);
+    t.ok(b"peek rest data", &buf[..6] == b"bcdefg", buf[0] as i64);
+    t.eq(b"FIONREAD", ioctl_int(b, FIONREAD as u64).1 as i64, 6);
+    buf.fill(0);
+    t.eq(b"read rest", recv(b, &mut buf, 0), 6);
+    t.ok(b"read data", &buf[..6] == b"bcdefg", buf[0] as i64);
+    t.eq(b"empty", recv(b, &mut buf, MSG_DONTWAIT), EAGAIN);
+    close(a);
+    close(b);
+    t.done();
+}
+
+/// A stream peek of a message with files stops after it and gets
+/// copies of the files; the read then gets them again, and the next
+/// message comes without
+fn test_stream_peek_fds() {
+    let mut t = T::new(b"UNIX_STREAM_PEEK_FDS");
+    let (a, b) = pair(SOCK_STREAM);
+    let mut p = [0i32; 2];
+    sys_pipe(p.as_mut_ptr());
+    t.eq(b"send fds", send_fds(a, b"aa", &[p[0]]), 2);
+    send(a, b"bb", 0);
+    let mut buf = [0u8; 16];
+    let mut ctl = [0u8; 64];
+    let (r, _, clen) = recv_msg(b, &mut buf, &mut ctl, MSG_PEEK);
+    let (pk, n) = got_fds(&ctl, clen);
+    t.ok(b"peek", r == 2 && pk >= 0 && n == 1, r);
+    let (r, _, clen) = recv_msg(b, &mut buf, &mut ctl, 0);
+    let (rd, n) = got_fds(&ctl, clen);
+    t.ok(b"read", r == 2 && rd >= 0 && n == 1 && rd != pk, r);
+    let (r, _, clen) = recv_msg(b, &mut buf, &mut ctl, 0);
+    t.ok(b"rest", r == 2 && &buf[..2] == b"bb" && clen == 0, r);
+    for f in [a, b, p[0], p[1], pk, rd] {
+        close(f);
+    }
+    t.done();
+}
+
 /// shutdown: SHUT_WR is EOF for the peer and EPIPE for us; the other
 /// direction still works; bad how is EINVAL
 fn test_shutdown() {
@@ -955,6 +1013,50 @@ fn test_dgram_queue() {
 
 /// SOCK_SEQPACKET: boundaries, truncation, EOF and EPIPE after close,
 /// ENOTCONN unconnected
+/// A datagram sender's epoll waiter is woken (EPOLLOUT) when its
+/// peer's reader makes room; after it reconnects elsewhere, the old
+/// peer's reads and close do not touch it, and it is writable
+fn test_dgram_peer_wake() {
+    let mut t = T::new(b"UNIX_DGRAM_PEER_WAKE");
+    let srv = ux(SOCK_DGRAM);
+    ubind(srv, &sun_abs(b"hk-ux-pw1"));
+    let srv2 = ux(SOCK_DGRAM);
+    ubind(srv2, &sun_abs(b"hk-ux-pw2"));
+    let c = ux(SOCK_DGRAM);
+    uconnect(c, &sun_abs(b"hk-ux-pw1"));
+    while send(c, b"m", MSG_DONTWAIT) == 1 {}
+    let ep = sys_epoll_create1(0) as i32;
+    let e = EpollEvent::new(EPOLLOUT | EPOLLET, 7);
+    t.eq(b"epoll add", sys_epoll_ctl(ep, EPOLL_CTL_ADD, c, &e), 0);
+    let mut out = [EpollEvent::empty(); 1];
+    t.eq(
+        b"not writable",
+        sys_epoll_wait(ep, out.as_mut_ptr(), 1, 0),
+        0,
+    );
+    let pid = sys_fork();
+    if pid == 0 {
+        msleep(100);
+        let mut buf = [0u8; 4];
+        recv(srv, &mut buf, 0);
+        sys_exit(0);
+    }
+    t.eq(b"woken", sys_epoll_wait(ep, out.as_mut_ptr(), 1, 5000), 1);
+    wait_status(pid);
+    while send(c, b"m", MSG_DONTWAIT) == 1 {}
+    t.eq(b"full", poll1(c, POLLOUT, 0).0, 0);
+    t.eq(b"reconnect", uconnect(c, &sun_abs(b"hk-ux-pw2")), 0);
+    let mut buf = [0u8; 4];
+    recv(srv, &mut buf, MSG_DONTWAIT);
+    close(srv);
+    t.eq(b"writable", poll1(c, POLLOUT, 0).0, 1);
+    t.eq(b"send", send(c, b"n", MSG_DONTWAIT), 1);
+    for f in [ep, srv2, c] {
+        close(f);
+    }
+    t.done();
+}
+
 fn test_seqpacket() {
     let mut t = T::new(b"UNIX_SEQPACKET");
     let a = sun_abs(b"hk-ux-seq");
@@ -1151,7 +1253,8 @@ fn test_ctrunc() {
 
 /// Files in flight per user are capped near RLIMIT_NOFILE: an
 /// unprivileged sender gets ETOOMANYREFS once its count exceeds the
-/// limit, and may send again after the receiver takes them
+/// limit, on any socket, and may send again after the receiver takes
+/// them
 fn test_inflight() {
     let mut t = T::new(b"UNIX_INFLIGHT");
     let pid = sys_fork();
@@ -1180,6 +1283,13 @@ fn test_inflight() {
         if sent != 17 {
             sys_exit(2);
         }
+        // The count is the user's, not the socket's
+        let (c, d) = pair(SOCK_DGRAM);
+        if send_fds(c, b"y", &[c]) != -109 {
+            sys_exit(4);
+        }
+        close(c);
+        close(d);
         // Receiving (and closing) them all uncharges the user
         let mut buf = [0u8; 64];
         let mut ctl = [0u8; 0];
@@ -1449,6 +1559,57 @@ fn test_proc() {
     unlink(p);
     close(l);
     close(d);
+    t.done();
+}
+
+/// /proc/net/unix longer than a page is read whole: every one of many
+/// bound sockets has its line
+fn test_proc_big() {
+    let mut t = T::new(b"UNIX_PROC_BIG");
+    const N: usize = 80;
+    let mut fds = [0i32; N];
+    let mut name = *b"hk-ux-proc-big-socket-number-00";
+    let tag = name.len() - 2;
+    for (i, fd) in fds.iter_mut().enumerate() {
+        name[tag] = b'0' + (i / 10) as u8;
+        name[tag + 1] = b'0' + (i % 10) as u8;
+        *fd = ux(SOCK_DGRAM);
+        if ubind(*fd, &sun_abs(&name)) != 0 {
+            t.ok(b"bind", false, i as i64);
+        }
+    }
+    let f = sys_open(b"/proc/net/unix\0".as_ptr(), O_RDONLY, 0) as i32;
+    let buf = &mut [0u8; 32768];
+    let mut n = 0;
+    loop {
+        let r = sys_read(f as u64, buf[n..].as_mut_ptr(), (buf.len() - n) as u64);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+        if n == buf.len() {
+            break;
+        }
+    }
+    close(f);
+    let text = &buf[..n];
+    t.ok(b"over a page", n > 4096, n as i64);
+    let mut seen = 0;
+    for i in 0..N {
+        name[tag] = b'0' + (i / 10) as u8;
+        name[tag + 1] = b'0' + (i % 10) as u8;
+        let mut want = [0u8; 40];
+        want[0] = b'@';
+        want[1..1 + name.len()].copy_from_slice(&name);
+        let want = &want[..1 + name.len()];
+        if text.split(|&c| c == b'\n').any(|l| l.ends_with(want)) {
+            seen += 1;
+        }
+    }
+    t.eq(b"every socket", seen, N as i64);
+    for fd in fds {
+        close(fd);
+    }
     t.done();
 }
 

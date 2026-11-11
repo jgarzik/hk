@@ -24,7 +24,7 @@ use crate::sync::spin::Mutex;
 
 use super::blkdev::{
     Bio, BioOp, BlockDevice, BlockDriver, Disk, QueueLimits, RequestQueue, SECTOR_SHIFT, bio_endio,
-    disk_bdevs, major, register_blkdev,
+    major, register_blkdev,
 };
 use super::genhd::{add_disk, del_gendisk, disk_name};
 
@@ -392,7 +392,7 @@ impl SdDisk {
         if !self.sdev.cancel() {
             return;
         }
-        let all = disk_bdevs(&self.bdev.disk);
+        let all = self.bdev.disk.bdevs();
         let pages: u64 = all.iter().map(|b| b.bd_inode.i_data.nrpages()).sum();
         del_gendisk(&self.bdev.disk);
         self.sdev.mark_deleted();

@@ -19,7 +19,7 @@ directory.
 - `arch/*`;
 - the mm frame and page-table core;
 - MMIO, DMA, per-CPU and the uaccess core;
-- `sync`, `list`, `heap`;
+- `sync`, `list`, `rbtree`, `heap`;
 - entry and context switch.
 
 Subsystem code (fs, net, ipc, drivers above the register level) should need
@@ -37,6 +37,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | Wrapper | Kind |
 |---|---|
 | inode and page lock guards | RAII guard |
+| socket lock `SockLock` / `SockGuard` / `BhGuard` (`net/core/sock_lock.rs`, Linux socket_lock_t) | RAII guards over owner bit + spin lock |
 | frame borrows | typed handle |
 | `Pod` byte views | marker trait |
 | `IoMem` registers | checked volatile |
@@ -44,6 +45,13 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | page-table `PgTables` / `Pte` / `PteTable` / `Pmd` / `Dir`, `PgPrune` (`mm/pgtable.rs`) | typed handle borrowing the lock |
 | vmalloc-area range `VmArea` (`mm/vmalloc.rs`, Linux vm_struct) | ownership token |
 | kernel stack `VmStack`, a task's `StackSlot` (`mm/vmstack.rs`) | ownership token |
+| red-black tree `RbTree` / `RbTreeNodeReservation` (`util/rbtree.rs`, Linux rb_root) | owning container of preallocated nodes |
+| intrusive red-black tree `RbRoot` / `RbNode` / `RbCursorMut` over a `ListPtr` (`util/rbtree.rs`, Linux rb_node embedded, `skb->rbnode`) | owning intrusive container, membership checked |
+| RCU callback head `RcuHead` / `HasRcuHead`, `call_rcu` (`sync/rcu.rs`, Linux rcu_head) | embedded queue node, claimed once |
+| repeated deferred put `RcuPuts` / `HasRcuPuts`, `put_rcu` (`sync/rcu.rs`) | embedded counted queue node |
+| RCU nulls hash bucket `NullsHead` / `NullsGuard` / `NullsRef` / `NullsUnlinked` (`util/hlist_nulls.rs`, Linux hlist_nulls) | owning intrusive container, lockless readers, grace-period-held references |
+| hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box`, `Arc` or `&'static`: `BoxList`, `ArcList`) (`util/list.rs`), RCU list `RcuList` and hash chain `RcuHList` with `RcuRef` and `RcuUnlinked` (`util/rculist.rs`, Linux rculist.h) | owning intrusive containers, membership checked |
+| RCU hash chain `RcuHList` / `HNode` / `RcuHRef` (`util/rcuhlist.rs`, Linux hlist_*_rcu) | owning intrusive chain, membership checked, release after a grace period |
 
 Make each wrapper `#[inline]`: it must compile to the same code as the
 open-coded `unsafe` it replaces.
@@ -149,6 +157,19 @@ this policy carry `#![expect(clippy::undocumented_unsafe_blocks)] //
 TODO(unsafe)` until their blocks are documented or wrapped. Remove the
 line when the file is clean, and never add it to a new file
 (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'` lists what is left).
+
+### 12. Deferred release (RCU)
+
+An object that RCU readers reach without a reference (an `RcuList` or
+`RcuHList` entry, an `RcuArc` version) is released only after a grace
+period: the container's reference goes through `RcuUnlinked`,
+`RcuHRef` or `RcuRetired` (`defer`: `call_rcu`/`kfree_rcu`). That
+reference may be the last, so the object's `Drop`, and every drop it
+causes, can run in `rcuc/N` with preemption off: it must not sleep
+(no sleeping lock, no `synchronize`) and allocates only with a GFP
+named. A type kept in such a container says so where it is defined
+(Linux SOCK_RCU_FREE sockets: `__sk_destruct` runs from the RCU
+callback).
 
 ## Review checklist (for each new `unsafe`)
 

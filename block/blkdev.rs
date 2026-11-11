@@ -19,11 +19,16 @@
 //!
 //! ## Locking (doc/LOCKING.md 3.10, Block Device Subsystem)
 //!
-//! - `BLKDEV_REGISTRY` (spin `RwLock`, thread context, leaf): dev_t ->
-//!   block device. `MAJORS` (spin `Mutex`, leaf): block major numbers.
+//! - Block devices are found by number through their inodes on the
+//!   bdev pseudo superblock (`fs::pseudo::BDEV`, Linux
+//!   blockdev_superblock), hashed in the inode cache by dev_t (Linux
+//!   bdev_add, blkdev_get_no_open's ilookup), and walked through its
+//!   `s_inodes`. `MAJORS` (sleeping `sync::Mutex`, Linux
+//!   major_names_lock): block major numbers.
 //! - `Disk.open_mutex` (sleeping `sync::Mutex`, Linux disk->open_mutex):
-//!   serializes opens, releases and partition rescans; I/O and devtmpfs
-//!   node updates happen under it.
+//!   serializes opens, releases and partition rescans and owns the
+//!   disk's `part_tbl`; I/O, the inode cache and devtmpfs node updates
+//!   happen under it.
 //! - blk-mq queue locks are `IrqSpinlock` leaves (`blk_mq`).
 //! - `end_io` runs in the completion context, possibly hardirq: it may
 //!   only use IRQ-safe operations (atomics, `Completion::complete`, wait
@@ -39,7 +44,6 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::IrqSpinlock;
 use crate::sync::completion::Completion;
-use crate::sync::spin::{Mutex, RwLock};
 
 pub use crate::fs::chardev::{DevId, DevMajor, DevMinor};
 use crate::mm::writeback::{BdiWriteback, bdi_register, bdi_unregister};
@@ -78,7 +82,10 @@ pub const BLK_DEF_MAX_SECTORS_CAP: u32 = (4 << 20) >> SECTOR_SHIFT;
 /// Highest major handed out dynamically (Linux searches 254 down to 1)
 const DYN_MAJOR_MAX: DevMajor = 254;
 
-static MAJORS: Mutex<BTreeMap<DevMajor, &'static str>> = Mutex::new(BTreeMap::new());
+/// Block majors in use (Linux major_names, under the major_names_lock
+/// mutex)
+static MAJORS: crate::sync::Mutex<BTreeMap<DevMajor, &'static str>> =
+    crate::sync::Mutex::new(BTreeMap::new());
 
 /// Register block major `major` for `name`; 0 picks the highest free
 /// one (Linux register_blkdev). Returns the major.
@@ -787,10 +794,12 @@ fn flushseq_end(mut bio: Box<Bio>) {
 
 /// What a disk's `open_mutex` guards beyond serializing opens,
 /// releases and rescans
-#[derive(Default)]
 pub(super) struct OpenState {
     /// Partitions currently open (Linux open_partitions)
     pub(super) open_partitions: u32,
+    /// Its block devices by partition number, the whole disk at 0, one
+    /// slot per minor (Linux disk->part_tbl); each holds a reference
+    pub(super) part_tbl: Box<[Option<Arc<BlockDevice>>]>,
 }
 
 /// A disk (Linux struct gendisk)
@@ -832,7 +841,9 @@ impl Disk {
         ro: bool,
     ) -> Result<Arc<Self>, KernelError> {
         let dev = DevId::new(major, first_minor);
+        let part_tbl = crate::util::kmem::try_vec(usize::from(minors.max(1)), None)?;
         let bdi = bdi_register(dev);
+        let wb = bdi.clone();
         try_arc(Self {
             major,
             first_minor,
@@ -842,11 +853,14 @@ impl Disk {
             ro,
             queue,
             bdi,
-            open_mutex: crate::sync::Mutex::new(OpenState::default()),
+            open_mutex: crate::sync::Mutex::new(OpenState {
+                open_partitions: 0,
+                part_tbl: part_tbl.into_boxed_slice(),
+            }),
             seq: DISKSEQ.fetch_add(1, Ordering::Relaxed),
             private: spin::Once::new(),
         })
-        .inspect_err(|_| bdi_unregister(dev))
+        .inspect_err(|_| bdi_unregister(&wb))
     }
 
     /// Capacity in sectors
@@ -856,6 +870,13 @@ impl Disk {
 
     pub fn ro(&self) -> bool {
         self.ro
+    }
+
+    /// Its block devices, whole disk first (its `part_tbl`, under
+    /// `open_mutex`)
+    pub fn bdevs(&self) -> Vec<Arc<BlockDevice>> {
+        let st = self.open_mutex.lock();
+        st.part_tbl.iter().flatten().cloned().collect()
     }
 
     pub fn devt(&self) -> DevId {
@@ -892,9 +913,18 @@ pub struct BlockDevice {
 }
 
 impl BlockDevice {
-    pub fn new(disk: Arc<Disk>, partno: u16, start: u64, nr_sects: u64, name: String) -> Self {
+    /// A block device of `disk`, its inode new on the bdev superblock
+    /// and not yet hashed (Linux bdev_alloc); ENOMEM
+    pub fn new(
+        disk: Arc<Disk>,
+        partno: u16,
+        start: u64,
+        nr_sects: u64,
+        name: String,
+    ) -> Result<Self, KernelError> {
         let dev = DevId::new(disk.major, disk.first_minor + partno);
-        Self {
+        let bd_inode = crate::fs::blkdev_ops::bdev_inode(dev, nr_sects << SECTOR_SHIFT)?;
+        Ok(Self {
             disk,
             partno,
             start,
@@ -904,9 +934,9 @@ impl BlockDevice {
             openers: AtomicU32::new(0),
             bsize: AtomicU32::new(512),
             dead: AtomicBool::new(false),
-            bd_inode: crate::fs::blkdev_ops::bdev_inode(dev, nr_sects << SECTOR_SHIFT),
+            bd_inode,
             kdev: spin::Once::new(),
-        }
+        })
     }
 
     /// Size in sectors
@@ -1049,57 +1079,94 @@ impl Drop for BdevHandle {
 }
 
 // ============================================================================
-// Registry (dev_t -> block device)
+// Lookup (Linux block/bdev.c: blockdev_superblock, bdev_add)
 // ============================================================================
 
-/// Every block device by dev_t. Global like Linux's bdev lookup (one
-/// map of device numbers; reads are rare: open, mount, swapon)
-pub static BLKDEV_REGISTRY: RwLock<BTreeMap<DevId, Arc<BlockDevice>>> =
-    RwLock::new(BTreeMap::new());
+/// The inode-cache key of a block device's inode: its device number
+/// (Linux bdev_add: i_ino = dev)
+fn bdev_hash(dev: DevId) -> u64 {
+    u64::from(dev.encode())
+}
 
-pub fn register_bdev(bdev: Arc<BlockDevice>) -> Result<(), KernelError> {
+/// Make `bdev` reachable, under its disk's `open_mutex` (`st`): its
+/// slot in the disk's `part_tbl`, then its inode hashed on the bdev
+/// superblock by number (Linux the part_tbl insert, then bdev_add);
+/// EEXIST for a taken slot
+pub(super) fn bdev_add(st: &mut OpenState, bdev: &Arc<BlockDevice>) -> Result<(), KernelError> {
+    let slot = st
+        .part_tbl
+        .get_mut(usize::from(bdev.partno))
+        .ok_or(KernelError::InvalidArgument)?;
+    if slot.is_some() {
+        return Err(KernelError::AlreadyExists);
+    }
     // The device's inode does I/O on this device only (never a later
     // one with the same number)
     bdev.bd_inode
         .set_private(try_arc(crate::fs::blkdev_ops::BdevOwner(Arc::downgrade(
-            &bdev,
+            bdev,
         )))?);
-    let mut r = BLKDEV_REGISTRY.write();
-    if r.contains_key(&bdev.dev) {
-        return Err(KernelError::AlreadyExists);
-    }
-    r.insert(bdev.dev, bdev);
+    *slot = Some(bdev.clone());
+    crate::fs::icache::insert_inode_hash(&bdev.bd_inode, bdev_hash(bdev.dev));
     Ok(())
 }
 
-/// Remove one block device; I/O on it fails from now on, and its page
-/// cache goes without writeback, unmapped from every mapping (Linux
-/// del_gendisk / blk_drop_partitions: kill_bdev). Sleeps.
-pub fn unregister_bdev(dev: DevId) -> Option<Arc<BlockDevice>> {
-    let b = BLKDEV_REGISTRY.write().remove(&dev)?;
+/// Remove partition `partno` (0: the whole disk) under its disk's
+/// `open_mutex` (`st`): lookups miss it, I/O on it fails from now on,
+/// and its page cache goes without writeback, unmapped from every
+/// mapping (Linux delete_partition / del_gendisk: the part_tbl erase,
+/// remove_inode_hash, bdev_mark_dead and kill_bdev). Sleeps.
+pub(super) fn bdev_del(st: &mut OpenState, partno: u16) -> Option<Arc<BlockDevice>> {
+    let b = st.part_tbl.get_mut(usize::from(partno))?.take()?;
+    crate::fs::icache::remove_inode_hash(&b.bd_inode);
     b.mark_dead();
     crate::mm::filemap::unmap_mapping_range(&b.bd_inode.i_data, 0);
     crate::mm::filemap::invalidate(&b.bd_inode);
     Some(b)
 }
 
-pub fn get_blkdev(id: DevId) -> Option<Arc<BlockDevice>> {
-    BLKDEV_REGISTRY.read().get(&id).cloned()
+/// The block device `dev` (Linux blkdev_get_no_open: ilookup of its
+/// inode on blockdev_superblock); None if no disk has it
+pub fn get_blkdev(dev: DevId) -> Option<Arc<BlockDevice>> {
+    let sb = crate::fs::pseudo::BDEV.sb().ok()?;
+    let inode = crate::fs::icache::ilookup5(&sb, bdev_hash(dev), &|i| i.rdev == dev)?;
+    crate::fs::blkdev_ops::inode_owner(&inode)
 }
 
-/// The block devices of `disk`, whole disk first
-pub fn disk_bdevs(disk: &Arc<Disk>) -> Vec<Arc<BlockDevice>> {
-    BLKDEV_REGISTRY
-        .read()
-        .values()
-        .filter(|b| Arc::ptr_eq(&b.disk, disk))
-        .cloned()
-        .collect()
+/// `f` on each block device's inode (Linux: blockdev_superblock's
+/// s_inodes), with no lock held
+fn for_each_bdev_inode(mut f: impl FnMut(&Arc<crate::fs::Inode>)) {
+    let Ok(sb) = crate::fs::pseudo::BDEV.sb() else {
+        return;
+    };
+    crate::fs::inode::for_each_sb_inode(&sb, &mut |i| {
+        f(i);
+        true
+    });
+}
+
+/// `f` on each block device a disk has, with no lock held, in no order
+pub(super) fn for_each_bdev(mut f: impl FnMut(&Arc<BlockDevice>)) {
+    for_each_bdev_inode(|i| {
+        if let Some(b) = crate::fs::blkdev_ops::inode_owner(i)
+            && !b.is_dead()
+        {
+            f(&b);
+        }
+    });
+}
+
+/// Pages in every block device's cache (Linux nr_blockdev_pages:
+/// meminfo's Buffers)
+pub fn nr_blockdev_pages() -> u64 {
+    let mut n = 0;
+    for_each_bdev_inode(|i| n += i.i_data.nrpages());
+    n
 }
 
 /// Forget a disk's writeback state (Linux del_gendisk, with genhd)
 pub(super) fn disk_release(disk: &Disk) {
-    bdi_unregister(disk.devt());
+    bdi_unregister(&disk.bdi);
 }
 
 // ============================================================================
@@ -1343,42 +1410,14 @@ pub fn sync_blockdev(bdev: &BlockDevice) -> Result<(), KernelError> {
     crate::mm::filemap::write_and_wait(&bdev.bd_inode)
 }
 
-/// The page-cache inode of every block device (drop_caches, reclaim)
-pub fn all_bdev_inodes() -> Vec<Arc<crate::fs::Inode>> {
-    BLKDEV_REGISTRY
-        .read()
-        .values()
-        .map(|b| b.bd_inode.clone())
-        .collect()
-}
-
-/// `f` on each block device's page-cache inode until it returns false,
-/// allocating nothing (reclaim): the reference is taken under the
-/// registry lock, `f` runs with no lock held
-pub fn for_each_bdev_inode(f: &mut dyn FnMut(&Arc<crate::fs::Inode>) -> bool) {
-    let mut i = 0;
-    loop {
-        let inode = BLKDEV_REGISTRY
-            .read()
-            .values()
-            .nth(i)
-            .map(|b| b.bd_inode.clone());
-        let Some(inode) = inode else {
-            return;
-        };
-        if !f(&inode) {
-            return;
-        }
-        i += 1;
-    }
-}
-
-/// Write back every block device's cache (sync(2): Linux sync_bdevs)
+/// Write back every block device's cache (sync(2): Linux sync_bdevs),
+/// one at a time with no lock held
 pub fn sync_bdevs() {
-    let all: Vec<Arc<BlockDevice>> = BLKDEV_REGISTRY.read().values().cloned().collect();
-    for b in all {
-        let _ = sync_blockdev(&b);
-    }
+    for_each_bdev_inode(|i| {
+        if i.i_data.nrpages() != 0 {
+            let _ = crate::mm::filemap::write_and_wait(i);
+        }
+    });
 }
 
 /// Flush the disk's volatile write cache (Linux blkdev_issue_flush)
@@ -1389,6 +1428,7 @@ pub fn blkdev_issue_flush(bdev: &BlockDevice) -> Result<(), KernelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::spin::Mutex;
 
     fn bio(sector: u64) -> Box<Bio> {
         Bio::new(BioOp::Read, sector)

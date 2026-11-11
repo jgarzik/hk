@@ -39,6 +39,7 @@
 //!   Empty once removed.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::mm::page_alloc::Gfp;
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -58,7 +59,7 @@ use crate::net::dev::{
     netif_napi_del,
 };
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
-use crate::net::skb::{NET_SKB_PAD, SkBuff};
+use crate::net::skb::{NET_SKB_PAD, SkBuff, SkbHead};
 use crate::printkln;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
@@ -232,7 +233,7 @@ impl VirtioNet {
         }
         let len = len - HDR_LEN;
         // 2 extra bytes of headroom align the IP header (NET_IP_ALIGN)
-        let Some(mut skb) = SkBuff::alloc(NET_SKB_PAD + 2, len) else {
+        let Some(mut skb) = SkBuff::alloc(NET_SKB_PAD + 2, len, Gfp::ATOMIC) else {
             dev.stats.inc_rx_dropped();
             return None;
         };
@@ -248,11 +249,17 @@ impl VirtioNet {
         Some(skb)
     }
 
-    /// Receive up to `budget` frames, reposting each buffer; frames are
-    /// delivered by the caller after the lock is dropped
-    #[expect(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
-    /// Returns the buffers consumed (bad frames count against the budget)
-    fn receive(&self, dev: &Arc<NetDevice>, budget: usize, out: &mut Vec<Box<SkBuff>>) -> usize {
+    /// Receive up to `budget` frames onto `out`, linked through their
+    /// own `list` (Linux napi_alloc_skb, GFP_ATOMIC under the queue
+    /// lock), reposting each buffer; the caller delivers them after the
+    /// lock is dropped. Returns the buffers consumed (bad frames count
+    /// against the budget).
+    fn receive(
+        &self,
+        dev: &Arc<NetDevice>,
+        budget: usize,
+        out: &mut SkbHead<Box<SkBuff>>,
+    ) -> usize {
         let mut rx = self.rx.lock();
         let Some(rx) = rx.as_mut() else { return 0 };
         let mut n = 0;
@@ -261,7 +268,7 @@ impl VirtioNet {
             // SAFETY: buffer `i` came back from the device (vq.get) and
             // is reposted only below
             if let Some(skb) = unsafe { Self::rx_skb(dev, rx.pool.cpu(i), len as usize) } {
-                out.push(skb);
+                out.push_back(skb);
             }
             rx.post(i);
             n += 1;
@@ -312,12 +319,14 @@ impl NapiPoll for VirtioNet {
             tx.reclaim();
         }
 
-        let mut frames = Vec::new();
+        // Delivered with the queue lock dropped (Linux napi_gro_receive
+        // runs outside the driver's locks)
+        let mut frames = SkbHead::new();
         let work = match &dev {
             Some(d) => self.receive(d, budget, &mut frames),
             None => 0,
         };
-        for skb in frames {
+        while let Some(skb) = frames.pop_front() {
             net::dev::netif_receive_skb(skb);
         }
 

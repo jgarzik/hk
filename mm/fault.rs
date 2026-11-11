@@ -24,7 +24,7 @@ use super::tlb::flush_tlb_page;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{PageFlags, paging, phys_to_virt};
-use crate::fs::File;
+use crate::fs::{File, FileRef};
 use crate::mm::page_alloc::Gfp;
 use crate::task::percpu::{increment_maj_flt, increment_min_flt};
 use crate::util::error::KernelError;
@@ -63,7 +63,7 @@ struct Area {
     offset: u64,
     /// Anonymous page index of `start` (Linux vm_pgoff)
     pgoff: u64,
-    file: Option<Arc<File>>,
+    file: Option<FileRef>,
     anon_vma: Option<Arc<AnonVma>>,
     /// The driver's pages were inserted at mmap (VM_MIXEDMAP)
     mixed: bool,

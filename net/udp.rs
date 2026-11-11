@@ -13,12 +13,14 @@
 //!
 //! ## Locking (thread context only)
 //!
-//! Order: `UdpSock.op` (Linux lock_sock: bind/connect/autobind) ->
-//! `UdpTable.socks` (RwLock) -> `Inet.addr` (Mutex leaf);
+//! Order: `UdpSock.op` (sleeping `sync::Mutex`, Linux lock_sock:
+//! bind/connect/autobind, socket calls only) -> `UdpTable.socks`
+//! (RwLock) -> `Inet.addr` (Mutex leaf);
 //! `UdpSock.rxq` is a separate leaf. Receive takes the table read lock
 //! and then each candidate's `Inet.addr`; it never holds the table lock
 //! while queueing. No lock is held across a sleep or a transmit.
 
+use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc_cyclic;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -26,12 +28,12 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::spin::RwLock;
 
 use crate::net::af_inet::{
     self, IP_PKTINFO, IP_TOS, IP_TTL, IPPROTO_UDP, Inet, InetAddr, RxInfo, SOL_IP,
 };
-use crate::net::dgram::{self, Dgram, RxQueue};
+use crate::net::dgram::{self, RxQueue};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::port::{self, BindInfo, Flow, Parity};
 use crate::net::inet::route;
@@ -55,8 +57,9 @@ pub const SOL_UDP: i32 = 17;
 pub struct UdpSock {
     sk: Sock,
     pub inet: Inet,
-    /// Socket lock: bind/connect/disconnect/autobind (Linux lock_sock)
-    op: Mutex<()>,
+    /// Socket lock: bind/connect/disconnect/autobind (Linux lock_sock,
+    /// which sleeps)
+    op: crate::sync::Mutex<()>,
     /// Connected (Linux TCP_ESTABLISHED state for datagram sockets)
     connected: AtomicBool,
     /// In the namespace table
@@ -71,7 +74,7 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
     Ok(try_arc_cyclic(|me| UdpSock {
         sk: Sock::new(net, AF_INET, SOCK_DGRAM, IPPROTO_UDP),
         inet: Inet::default(),
-        op: Mutex::new(()),
+        op: crate::sync::Mutex::new(()),
         connected: AtomicBool::new(false),
         hashed: AtomicBool::new(false),
         rxq: RxQueue::default(),
@@ -211,7 +214,8 @@ impl UdpSock {
         data: &[u8],
         p: IpParams,
     ) -> Result<(), KernelError> {
-        let mut skb = SkBuff::alloc_tx(UDP_HLEN + data.len()).ok_or(KernelError::NoBufferSpace)?;
+        let mut skb = SkBuff::alloc_tx(UDP_HLEN + data.len(), Gfp::KERNEL)
+            .ok_or(KernelError::NoBufferSpace)?;
         skb.put_slice(data).ok_or(KernelError::NoBufferSpace)?;
         let h = skb.push(UDP_HLEN).ok_or(KernelError::NoBufferSpace)?;
         h[0..2].copy_from_slice(&sport.to_be_bytes());
@@ -650,8 +654,10 @@ fn bcast_match(s: &UdpSock, k: &Key) -> bool {
 }
 
 /// Receive a UDP packet (from ip_rcv; thread context; the device's
-/// namespace)
-pub fn udp_rcv(skb: SkBuff) {
+/// namespace). The skb itself is queued to the socket, trimmed to the
+/// datagram and pulled to its payload (Linux __udp4_lib_rcv ->
+/// udp_queue_rcv_skb).
+pub fn udp_rcv(mut skb: SkBuff) {
     let (Some(net), Some(saddr), Some(daddr)) = (skb.net(), skb.saddr, skb.daddr) else {
         return;
     };
@@ -675,29 +681,42 @@ pub fn udp_rcv(skb: SkBuff) {
         dport: u16::from_be_bytes([b[2], b[3]]),
         dif,
     };
+    let pad = b.len() - ulen;
     let info = RxInfo::of(&net, &skb);
-    // Each socket's copy may fail to allocate: that socket counts a drop
-    // (Linux __udp4_lib_mcast_deliver when skb_clone fails)
-    let deliver = |s: &UdpSock| match Dgram::copy(saddr, k.sport, &pkt[UDP_HLEN..], info) {
-        Some(d) => s.rxq.enqueue(&s.sk, d),
-        None => {
-            s.sk.drops.fetch_add(1, Ordering::Relaxed);
-        }
-    };
-    if skb.ip_bcast || daddr.is_multicast() {
-        for s in net
-            .udp
-            .on_port(k.dport)
-            .iter()
-            .filter(|s| bcast_match(s, &k))
-        {
-            deliver(s);
-        }
+    if skb.trim(pad).is_none() || skb.pull(UDP_HLEN).is_none() {
         return;
     }
+    dgram::prepare(&mut skb, info, k.sport);
+    if skb.ip_bcast || daddr.is_multicast() {
+        return mcast_deliver(&net, skb, &k);
+    }
     match lookup(&net.udp, &k) {
-        Some(s) => deliver(&s),
+        Some(s) => s.rxq.enqueue(&s.sk, skb),
         None => crate::net::icmp::port_unreach(&net, &skb),
+    }
+}
+
+/// A broadcast or multicast datagram to every matching socket (Linux
+/// __udp4_lib_mcast_deliver): each but the first gets a clone made
+/// GFP_ATOMIC (a failed clone counts a drop on that socket), the first
+/// the skb itself
+fn mcast_deliver(net: &crate::net::NetNamespace, skb: SkBuff, k: &Key) {
+    let socks = net.udp.on_port(k.dport);
+    let mut first = None;
+    for s in socks.iter().filter(|s| bcast_match(s, k)) {
+        if first.is_none() {
+            first = Some(s);
+            continue;
+        }
+        match skb.clone_gfp(Gfp::ATOMIC) {
+            Some(c) => s.rxq.enqueue(&s.sk, c),
+            None => {
+                s.sk.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if let Some(s) = first {
+        s.rxq.enqueue(&s.sk, skb);
     }
 }
 

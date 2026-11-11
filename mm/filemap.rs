@@ -31,7 +31,7 @@ use super::fault::VmFault;
 use super::page::{
     PG_DIRTY, PG_LOCKED, PG_UPTODATE, Page, frame_bytes, lock_page, phys_to_page, unlock_page,
 };
-use super::xarray::{MARK_DIRTY, MARK_WRITEBACK, Preload, XArray};
+use super::xarray::{MARK_DIRTY, MARK_WRITEBACK, XArray};
 use crate::FRAME_ALLOCATOR;
 use crate::fs::inode::Inode;
 use crate::fs::iov_iter::{IovDest, IovSource};
@@ -406,38 +406,31 @@ fn insert(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
     pg.index.store(index, Ordering::Relaxed);
     pg.mapping.store(m.key(), Ordering::Release);
     FRAME_ALLOCATOR.incref(phys);
-    let mut pre: Option<Preload> = None;
-    loop {
-        let mut pages = m.i_pages.lock();
-        if pages.load(index) != 0 {
-            drop(pages);
-            pg.mapping.store(0, Ordering::Release);
-            put_page(phys);
-            return Err(KernelError::AlreadyExists);
-        }
-        // Nothing allocated under the spin lock: the first try takes
-        // only nodes already there, a retry the preload's
-        let stored = match pre.as_mut() {
-            Some(p) => pages.store(index, phys, &mut || p.take()),
-            None => pages.store(index, phys, &mut || None),
-        };
-        if stored.is_some() {
+    // Nothing allocated under the spin lock (Linux xas_nomem)
+    let stored = super::xarray::store_nomem(
+        || m.i_pages.lock(),
+        index,
+        phys,
+        |pages| {
+            if pages.load(index) != 0 {
+                Err(KernelError::AlreadyExists)
+            } else {
+                Ok(())
+            }
+        },
+        KernelError::OutOfMemory,
+    );
+    match stored {
+        Ok(_) => {
             m.nrpages.fetch_add(1, Ordering::Relaxed);
             count_file(m, 1);
-            return Ok(());
+            Ok(())
         }
-        drop(pages);
-        if pre.is_some() {
+        Err(e) => {
             pg.mapping.store(0, Ordering::Release);
             put_page(phys);
-            return Err(KernelError::OutOfMemory);
+            Err(e)
         }
-        // Linux xas_nomem: allocate with no lock held (may reclaim)
-        pre = Some(Preload::new().ok_or_else(|| {
-            pg.mapping.store(0, Ordering::Release);
-            put_page(phys);
-            KernelError::OutOfMemory
-        })?);
     }
 }
 
@@ -1422,17 +1415,15 @@ pub fn fault(inode: &Inode, index: u64) -> Result<u64, VmFault> {
     }
 }
 
-/// `f` on each inode that may hold reclaimable cache (every hashed
-/// inode, every block device's) until it returns false; no allocation
+/// `f` on each inode that may hold reclaimable cache (every
+/// superblock's, the block devices' on the bdev superblock) until it
+/// returns false; no allocation
 fn for_each_cache_inode(f: &mut dyn FnMut(&Inode) -> bool) {
     let mut more = true;
-    crate::fs::icache::for_each_inode(&mut |i| {
-        more = i.i_data.nrpages() == 0 || f(i);
-        more
+    crate::fs::superblock::iterate_supers(|sb| {
+        more = more
+            && crate::fs::inode::for_each_sb_inode(sb, &mut |i| i.i_data.nrpages() == 0 || f(i));
     });
-    if more {
-        crate::block::blkdev::for_each_bdev_inode(&mut |i| i.i_data.nrpages() == 0 || f(i));
-    }
 }
 
 /// Drop up to `nr` clean, unmapped page-cache pages for direct reclaim

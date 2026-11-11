@@ -58,7 +58,9 @@ io.stat report zeros. When they are applied, use Linux's shapes: CPU
 bandwidth under the bandwidth lock (cfs_b->lock, an IrqSpinlock: the
 period timer), memory by page_counter_try_charge (add, check, roll
 back up the hierarchy), the IO token bucket under the queue's lock
-(blk-throttle), freezing under cgroup_mutex.
+(blk-throttle), freezing under cgroup_mutex. io.max takes any MAJ:MIN
+(`cgroup/io.rs` `io_max_write`); Linux resolves it to a live whole
+disk first (blkg_conf_open_bdev: ENODEV otherwise).
 
 ## user/ does not follow doc/UNSAFE.md
 
@@ -103,12 +105,16 @@ NIC removal: e1000 leaves the function's bus mastering and memory
 space on (no pci_disable_device) and its BAR mapped (no iounmap); an
 unregistered `NetDevice` lives on while queued skbs reference it
 (no netdev_wait_allrefs; it is down and driverless).
-
-
-The TCP send and receive queues are one contiguous `VecDeque<u8>`
-each (`net/tcp/cb.rs`), grown fallibly but still a single allocation up
-to SO_SNDBUF/SO_RCVBUF: a large buffer fragments the heap. Linux keeps a
-queue of bounded skbs; hk should hold a queue of bounded chunks.
+netns: no active/passive refcount split (Linux net->ns.count vs
+net->passive), so the cleanup_net / default_device_exit_batch work
+(`rtnl::netns_exit`, from `NetNamespace`'s drop in `ns/net.rs`) runs
+after the struct is freed and cannot call `rtnl::unregister_netdevice`
+or `NetDevice::net`.
+FIB: removing every route through a device (`net/inet/fib.rs`,
+`remove_first` per route) restarts from the list head each time, under
+the table's leaf lock; Linux fib_table_flush is one walk. Path MTU
+exceptions (`route::NhExceptions`) have no generation id (Linux
+fnhe_genid), so they are not flushed when a device goes down.
 
 ## Memory management gaps
 
@@ -291,10 +297,9 @@ lo (hk has no checksum offload states).
   next io_submit/io_getevents or a delayed work item), not where its
   bios end as Linux iocb_destroy (unpinning there unless pages must be
   dirtied under their page lock: bio_check_pages_dirty; fput's
-  delayed_fput for a last file reference). Releasing there needs a
-  file put that is safe in hardirq, which `Arc<File>` cannot give
-  atomically (no "drop unless last"; the file must not move: its
-  address keys flock locks). AIO 4K QD1 (`make check BENCH=1`,
+  delayed_fput for a last file reference). The file's put is safe
+  there now (a `FileRef` dropped in hardirq goes to the delayed list);
+  the rest of the request's release is not yet. AIO 4K QD1 (`make check BENCH=1`,
   DIO_BENCH) is unexplained and noisy: 12k..81k IOPS across boots of
   one kernel, Linux 15k..110k on the same host; with the request
   spinning on the ring rather than sleeping, about 16.5 us per request
@@ -396,6 +401,21 @@ linked on hk without CAP_DAC_READ_SEARCH; Linux gives ENOENT. The
 capability is checked in the caller's namespace (Linux: the opener's
 `user_ns`); hk has one user namespace.
 
+## SysV semaphore undo gaps
+
+**Location**: `ipc/sem.rs` (`clone_task_semundo`), `ns/mod.rs`
+
+- CLONE_SYSVSEM from a parent with no undo list leaves parent and
+  child with separate lists made later (Linux copy_semundo allocates
+  the list first, so both share it): a thread's SEM_UNDO adjustments
+  are then undone at that thread's exit, not the process's.
+- clone(CLONE_NEWIPC | CLONE_SYSVSEM) is not EINVAL, unshare
+  (CLONE_NEWIPC) does not imply CLONE_SYSVSEM and setns into an ipc
+  namespace does not run exit_sem (Linux copy_namespaces,
+  ksys_unshare, ipcns_install): an undo list can outlive its
+  namespace's arrays. Each undo structure names its array, so exit
+  undoes nothing there instead of touching another array.
+
 ## POSIX mqueue gaps
 
 **Location**: `ipc/mqueue.rs`
@@ -457,6 +477,11 @@ glibc's helper thread), and hk has no such path.
 
 **Location:** `tty/`, `hw/serial.rs`, `arch/aarch64/serial.rs`.
 
+- **Line discipline input untested:** no boot test types into a tty,
+  so the N_TTY receive path (`tty/n_tty.rs`: the echo ring, inline
+  ISIG signals, canonical lines, the lock-free input check poll uses)
+  runs only on the console's real input. A pty (phase H) makes it
+  testable from the boot tester.
 - **No hangup:** nothing hangs a tty up (Linux __tty_hangup: vhangup,
   a session leader's exit, carrier loss), so open files stay usable.
   A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
@@ -514,8 +539,10 @@ procfs (hidepid=, gid=, subset=pid; devtmpfs drops a new mount's after
 parsing them, as Linux 6.15+); cgroupfs ignores its own, and only
 procfs, tmpfs and devtmpfs apply options on a remount or show them in
 /proc/mounts.
-Crossing into a mount scans the current mount's children (Linux hashes
-(parent, mountpoint): mount_hashtable).
+Crossing into a mount scans the current mount's children under
+`MOUNT_LOCK`'s locking read, one global spin lock for every walk at a
+mountpoint (Linux hashes (parent, mountpoint): mount_hashtable, looked
+up under RCU and the mount_lock sequence).
 
 ## nullfs gaps
 
@@ -688,18 +715,79 @@ creation, but nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
 bpf_map_charge_memlock / memcg accounting), so many maps can still use
 up memory.
 
-## Heap allocations under spin locks
+## Heap allocations in atomic context
 
-**Location**: `mm/slab.rs` (`heap_gfp`); sites listed by LOCKDEP
+**Location**: `mm/slab.rs` (`heap_gfp`), `sync/lockdep.rs`
+(`might_alloc`); sites listed by LOCKDEP
 
-The heap picks GFP_ATOMIC by itself under a spin lock, so an allocation
-there takes the atomic reserve silently (Linux needs it named, and
-might_alloc reports a GFP_KERNEL one in atomic context). A LOCKDEP boot
-lists each lock allocated under once (`LOCKDEP:ATOMIC_ALLOC ... under
-<lock> (taken at ...)`; the shutdown summary counts them): mostly
-collections grown under spin mutexes, in fs, net, task and
-ipc (procfs: only its mount-time tree building). Each wants its allocation moved out of the
-lock (preallocate, or a sleeping lock as in Linux): ROADMAP phase A.
+The heap takes no GFP: in atomic context (a spin lock of any kind,
+preemption or interrupts off) it allocates without reclaim down to the
+min watermark (in effect GFP_NOWAIT), where Linux requires the GFP
+named and might_alloc reports an unnamed (GFP_KERNEL) one. A LOCKDEP
+boot lists each site once (`LOCKDEP:ATOMIC_ALLOC`, with the IRQ-safe
+lock, spin lock or `local_irq_save` it was made under; the shutdown
+summary counts them): mostly collections grown, or copied, under spin
+locks in net, fs, io, task, cgroup and keys, and IRQ-safe locks
+in bpf maps and the swap cache. ROADMAP
+phase A (A0-A3). A ping socket's table reference is released a grace
+period after it leaves the table (`net/ping.rs`, Linux SOCK_RCU_FREE),
+in `rcuc/N` with preemption off: if that drops its network namespace's
+last reference, `NetNamespace`'s drop allocates unnamed (the device
+list it collects, the sysfs work it queues); Linux's put_net only
+queues cleanup_net.
+
+Phase A2 (net) remaining:
+- IPv4 reassembly (`net/inet/frag.rs` `FragTable.st`): Linux per-queue
+  locks and timers, fragments in the skb rbtree, inet_frag_alloc
+  GFP_ATOMIC, ip_expire's ICMP_EXC_FRAGTIME.
+- ICMP global limiter (icmp_global_allow) and inet_peer on the RbTree
+  with `new_gfp(ATOMIC)` nodes and Linux's GC thresholds.
+- Raw, UDP, packet and netlink socket tables still allocate under their
+  spin locks: fan-out delivery under RCU needs `kill_fasync` RCU-safe
+  as Linux (fasync_lock spin + RCU fasync list) instead of the
+  sleeping `FasyncList.list`; then hslot/RCU tables, sock_reuseport
+  groups (GFP_ATOMIC under reuseport_lock), packet RCU sklist, netlink
+  RCU portid table.
+- netns active/passive refcount split (above, Network stack gaps)
+  also removes the drop-time allocation.
+- Two RCU hash chain types (`util::rculist::RcuHList`, table-locked;
+  `util::rcuhlist::RcuHList`, own spin leaf) and two repeat-release
+  schemes (`rcu::put_rcu`, `rcu::try_kfree_rcu` with a synchronize
+  fallback): Linux has one hlist_*_rcu; unify.
+- `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
+  enum side by side (Linux: one skb->cb); size matters for stacks.
+- TCP (`net/tcp/mod.rs`): a SYN backlogged while `listen()` owns the
+  socket is answered by `conn_request` before `apply` copies
+  `listen_opts`, so the first children get default options
+  (TCP_NODELAY, keepalive, MAXSEG, SYNCNT, DEFER_ACCEPT, congestion).
+- TCP `release_cb` runs `finish`/`apply` even with no deferred flags
+  (Linux tcp_release_cb returns early), and its wakeups run inside
+  `SockLock::drain` while the socket is still owned.
+- TCP `child_ready`/`child_gone` scan the SYN queue (`remove_first`)
+  under `TcpSock.queue`; the intrusive `accept_link` can unlink in O(1).
+- No debug check that a listener owns its bhash port (the old
+  `assert_owner` raced a close on the lockless SYN path); re-add on
+  the locked path only.
+- `util/hlist_nulls.rs` `NullsGuard::del_rcu` walks the chain to prove
+  membership (Linux hlist_nulls_del_rcu is O(1) via pprev).
+- `net/tcp/table.rs` keeps separate established and TIME_WAIT nulls
+  tables (two walks per miss, two bucket locks in hash_unique); Linux
+  has one ehash for both.
+- `net/core/neigh.rs` `nht` is an `Option` that is never None; its
+  None branch in `insert` would leak a `gc_entries` count.
+
+## Deferred file release gaps
+
+**Location**: `fs/file.rs` (`FileRef`, `fput`), `task/task_work.rs`,
+`sync/waitqueue.rs` (`signal_pending_run_work`)
+
+- Queued releases run inside futex and nanosleep sleeps when
+  TIF_NOTIFY_SIGNAL is set (`signal_pending_run_work` runs task_work
+  there); Linux runs TWA_RESUME work only on the return to user mode
+  (and io_uring's own waits).
+- Between the io_uring cancel and `exit_task_work` the task_work list
+  is still open: a late io_uring callback's TIF_NOTIFY_SIGNAL can
+  interrupt sleeps in that part of exit.
 
 ## Scheduler gaps (deviations from Linux)
 
@@ -829,6 +917,18 @@ mode, a short power-button press does nothing). Only the 32-bit FADT
 block fields are read (no X_ GAS forms, no hardware-reduced ACPI), and
 a reset register in PCI configuration space is ignored.
 
+## Writeback of a superblock with no block device
+
+**Location**: `fs/fs_writeback.rs` (`mark_inode_dirty`, `writeback_sb`)
+
+An inode dirtied on a superblock without a backing device (Linux
+noop_backing_dev_info) is marked dirty but queued nowhere, and
+syncfs/umount write nothing for it; its dirty mark then stays, so it
+is never queued again. No such file system dirties pages for writeback
+today (ramfs/tmpfs pages are unevictable or swap-backed); one that
+does needs a backing device of its own, or Linux's noop wb lists with
+its no-writeback skip, before it relies on sync.
+
 ## Block layer gaps
 
 **Location**: `block/`, `hw/virtio/blk.rs`,
@@ -898,8 +998,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   do_clone, exit, wait, credential setters, several sleep APIs. Split
   like Linux (sched/core, fork, exit, cred). Other giant functions:
   do_clone, sys_prctl, sys_semctl, sys_mmap, exec_file, sys_fcntl.
-- **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
-  softnet/0 only; CHILD_EXIT_WQ.
+- **Globals where per-CPU fits** (I/C/E): CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move
   onto `util/ida.rs` (or an IDR), as sd, virtio-blk, virtio and

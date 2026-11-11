@@ -1,10 +1,12 @@
 //! TCP data transfer (hk and Linux): 2 MB each way over lo, 2 MB through
 //! the slirp echo peer on eth0, a slow reader closing and reopening the
 //! window, MSG_WAITALL across sends, MSG_PEEK, EFAULT keeping data
-//! queued, and 50 concurrent connections.
+//! queued, 50 concurrent connections, and both ends of one connection
+//! sending, receiving and asking for TCP_INFO / SIOCINQ all at once.
 
 use hk_syscall::{
-    SHUT_WR, sys_accept, sys_exit, sys_fork, sys_listen, sys_setsockopt, sys_shutdown, sys_wait4,
+    FIONREAD, POLLIN, SHUT_WR, sys_accept, sys_exit, sys_fork, sys_getsockopt, sys_ioctl,
+    sys_listen, sys_pipe, sys_setsockopt, sys_shutdown, sys_wait4,
 };
 
 use crate::harness::T;
@@ -21,6 +23,7 @@ pub fn run_tests() {
     test_slow_reader();
     test_waitall();
     test_many();
+    test_lock_sock_concurrent();
     test_echo_2mb();
 }
 
@@ -315,5 +318,90 @@ fn test_echo_2mb() {
     t.eq(b"eof", last, 0);
     t.eq(b"sender", wait_child(pid) as i64, 0);
     close(fd);
+    t.done();
+}
+
+/// One worker of `test_lock_sock_concurrent` on socket `fd` (`peer`:
+/// the other end's): 0 sends 1 MiB seeded with `fd`, 1 receives and
+/// checks the 1 MiB `peer` sends, 2 polls until `done`; exits 0 on
+/// success
+fn lock_worker(fd: i32, peer: i32, role: usize, done: i32) -> ! {
+    let ok = match role {
+        0 => send_pat(fd, fd as usize, MB) == MB as i64,
+        1 => {
+            let (n, bad, _) = recv_pat(fd, peer as usize, MB, 16384);
+            n == MB && bad < 0
+        }
+        _ => poll_info(fd, done),
+    };
+    sys_exit(if ok { 0 } else { 1 });
+}
+
+/// getsockopt(TCP_INFO) and SIOCINQ in a loop until `done` is readable
+/// (its writers closed); false if a call failed
+fn poll_info(fd: i32, done: i32) -> bool {
+    loop {
+        let mut b = [0u8; 256];
+        let mut len = b.len() as u32;
+        if sys_getsockopt(
+            fd,
+            IPPROTO_TCP,
+            11, /* TCP_INFO */
+            b.as_mut_ptr(),
+            &mut len,
+        ) != 0
+            || len == 0
+        {
+            return false;
+        }
+        let mut q = 0i32;
+        if sys_ioctl(fd, FIONREAD as u64, &mut q as *mut i32 as u64) != 0 || q < 0 {
+            return false;
+        }
+        if poll1(done, POLLIN, 0).1 != 0 {
+            return true;
+        }
+    }
+}
+
+/// The socket lock under load (Linux lock_sock with a backlog): on each
+/// end of one lo connection a sender of 1 MiB, a receiver and a
+/// TCP_INFO / SIOCINQ poller run at once, each in its own process;
+/// every byte arrives intact in both directions and every worker ends
+/// in time.
+fn test_lock_sock_concurrent() {
+    let mut t = T::new(b"TCP_LOCK_SOCK_CONCURRENT");
+    let (l, p) = listener(4);
+    let c = tcp();
+    set_timeo(c, 20_000);
+    if !t.eq(b"connect", connect(c, LO, p), 0) {
+        close(c);
+        close(l);
+        return t.done();
+    }
+    let s = accept(l);
+    set_timeo(s, 20_000);
+    let mut pipe = [-1i32; 2];
+    sys_pipe(pipe.as_mut_ptr());
+    // Data workers first (reaped first), then the pollers
+    let mut pids = [0i64; 6];
+    for (i, pid) in pids.iter_mut().enumerate() {
+        let (fd, peer) = if i % 2 == 0 { (c, s) } else { (s, c) };
+        *pid = sys_fork();
+        if *pid == 0 {
+            close(pipe[1]);
+            lock_worker(fd, peer, i / 2, pipe[0]);
+        }
+    }
+    let (data_done, data_st) = crate::net::net_stress::reap(&pids[..4]);
+    close(pipe[1]);
+    let (poll_done, poll_st) = crate::net::net_stress::reap(&pids[4..]);
+    t.ok(b"data workers finished", data_done, 0);
+    t.eq(b"data worker status", data_st as i64, 0);
+    t.ok(b"pollers finished", poll_done, 0);
+    t.eq(b"poller status", poll_st as i64, 0);
+    for fd in [c, s, l, pipe[0]] {
+        close(fd);
+    }
     t.done();
 }

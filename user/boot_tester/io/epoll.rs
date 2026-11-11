@@ -12,6 +12,8 @@
 //! - EPOLL_LOOP_ELOOP / EPOLL_NEST_DEPTH: ep_loop_check
 //! - EPOLL_ET_REARM: edge-triggered reports each new event
 //! - EPOLL_MAXEVENTS: Linux's maxevents range
+//! - EPOLL_ET_TWO_WAITERS: one edge-triggered event reaches one of two
+//!   epoll_waits on one epoll
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{host_mode, print, print_num, println, skip};
@@ -43,6 +45,7 @@ pub fn run_tests() {
     test_epoll_maxevents();
     test_epoll_hup_events0();
     test_epoll_et_partial_read();
+    test_epoll_et_two_waiters();
 }
 
 const ELOOP: i64 = -40;
@@ -822,4 +825,58 @@ fn test_epoll_et_partial_read() {
         }
     })();
     ok_or_fail(b"EPOLL_ET_PARTIAL_READ", step);
+}
+
+/// A child that waits up to 500 ms on `epfd` for one event and exits
+/// with the count (2 on an error)
+fn et_waiter(epfd: i32) -> i64 {
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        let mut out = [EpollEvent::empty(); 1];
+        let n = sys_epoll_wait(epfd, out.as_mut_ptr(), 1, 500);
+        hk_syscall::sys_exit(if (0..=1).contains(&n) { n as u64 } else { 2 });
+    }
+    pid
+}
+
+/// The exit code of child `pid`, -1 if it did not exit
+fn exit_code(pid: i64) -> i32 {
+    let mut st = 0i32;
+    if pid <= 0 || hk_syscall::sys_wait4(pid, &mut st, 0, 0) != pid || st & 0x7f != 0 {
+        return -1;
+    }
+    (st >> 8) & 0xff
+}
+
+/// Two epoll_waits (two processes sharing one epoll) sleep on one
+/// edge-triggered item; one write is one event, reported to exactly
+/// one of them (Linux scans the ready list under ep->mtx)
+fn test_epoll_et_two_waiters() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), 0) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLIN | EPOLLET, 9);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != 0 {
+            return 2;
+        }
+        let a = et_waiter(epfd);
+        let b = et_waiter(epfd);
+        crate::helpers::msleep(50);
+        sys_write(p[1] as u64, b"x".as_ptr(), 1);
+        let (ca, cb) = (exit_code(a), exit_code(b));
+        sys_close(p[0] as u64);
+        sys_close(p[1] as u64);
+        sys_close(epfd as u64);
+        if ca < 0 || cb < 0 || ca == 2 || cb == 2 {
+            3
+        } else if ca + cb != 1 {
+            4
+        } else {
+            0
+        }
+    })();
+    ok_or_fail(b"EPOLL_ET_TWO_WAITERS", step);
 }

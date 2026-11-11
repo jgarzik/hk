@@ -13,6 +13,7 @@
 //! SO_PASSCRED never joins messages of different senders.
 
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use crate::io::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
@@ -23,7 +24,13 @@ use crate::net::socket::{SOCK_SEQPACKET, SOCK_STREAM};
 use crate::util::error::KernelError;
 
 use super::scm::{Creds, FpList, Scm, too_many_fds};
-use super::{CLOSE, ESTABLISHED, LISTEN, PeerCred, Skb, UnixSock, find_other, queue, validate};
+use super::{
+    CLOSE, ESTABLISHED, LISTEN, PeerCred, UnixSock, add_creds, find_other, peek_fds, queue, ucb,
+    ucb_mut, unix_len, unix_skb, validate,
+};
+use crate::mm::page_alloc::Gfp;
+use crate::net::skb::SkBuff;
+use crate::util::kalloc::try_arc_gfp;
 
 /// Largest message one stream write queues (Linux: half of sndbuf less
 /// 64, at most SKB_MAX_HEAD(0) + 32 KiB of pages)
@@ -113,6 +120,11 @@ fn try_connect(
     newsk: &Arc<UnixSock>,
     cred: PeerCred,
 ) -> Result<(), KernelError> {
+    // The embryo's skb, made before any lock (Linux
+    // unix_stream_connect allocates it first)
+    let mut skb = unix_skb(newsk, alloc::vec::Vec::new())?;
+    ucb_mut(&mut skb).embryo = Some(newsk.clone());
+    let skb = try_arc_gfp(skb, Gfp::KERNEL)?;
     let ost = other.st.lock();
     if other.is_dead() {
         return Err(KernelError::NoDevice);
@@ -146,8 +158,6 @@ fn try_connect(
     s.set_state(ESTABLISHED);
     *st = Some(newsk.clone());
     drop(st);
-    let mut skb = Skb::new(newsk, alloc::vec::Vec::new());
-    skb.embryo = Some(newsk.clone());
     queue(other, skb);
     drop(ost);
     other.sk.data_ready();
@@ -177,10 +187,10 @@ pub fn accept(s: &UnixSock, nonblock: bool) -> Result<Arc<UnixSock>, KernelError
         if let Some(e) = s.sk.take_err() {
             return Err(e);
         }
-        let skb = s.rq.lock().q.pop_front();
-        if let Some(mut skb) = skb {
-            let e = skb.embryo.take().ok_or(KernelError::InvalidArgument)?;
+        if let Some(skb) = s.rq.dequeue() {
+            let e = ucb(&skb).embryo.clone();
             drop(skb);
+            let e = e.ok_or(KernelError::InvalidArgument)?;
             // A connector may wait for backlog room
             s.peer_wait.wake_all();
             return Ok(e);
@@ -190,7 +200,7 @@ pub fn accept(s: &UnixSock, nonblock: bool) -> Result<Arc<UnixSock>, KernelError
             return Err(KernelError::InvalidArgument);
         }
         timeo = s.sk.wait(timeo, || {
-            !s.rq.lock().q.is_empty() || s.sk.has_err() || super::rcv_shut(s)
+            !s.rq.is_empty() || s.sk.has_err() || super::rcv_shut(s)
         })?;
     }
 }
@@ -240,15 +250,16 @@ fn send_chunk(
     let size = (m.data.len() - off).min(chunk_max(s));
     s.wmem_wait(timeo)?;
     let data = m.data.take_at(off, size)?;
-    let mut skb = Skb::new(&s.arc(), data);
-    skb.creds = scm.creds.take();
+    let mut skb = unix_skb(&s.arc(), data)?;
+    ucb_mut(&mut skb).creds = scm.creds.take();
     if let Some(f) = scm.fds.take() {
         if too_many_fds() {
             return Err(KernelError::TooManyRefs);
         }
-        skb.fds = Some(f);
+        *ucb_mut(&mut skb).fp.get_mut() = Some(f);
     }
-    skb.add_creds(s, other);
+    add_creds(&mut skb, s, other);
+    let skb = try_arc_gfp(skb, Gfp::KERNEL)?;
     {
         let _ost = other.st.lock();
         if other.is_dead() || super::rcv_shut(other) {
@@ -288,24 +299,20 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
     };
     let mut timeo = s.sk.rcv_timeo(flags & MSG_DONTWAIT != 0);
     let mut g = Got::default();
-    let mut peek_at = 0;
+    let mut last: Option<Arc<SkBuff>> = None;
     let err = loop {
-        match read_some(s, m, flags, size, target, timeo, &mut g, &mut peek_at) {
+        match read_some(s, m, flags, size, target, timeo, &mut g, &mut last) {
             Ok(Some(())) => {}
             Ok(None) => break None,
             Err(e) => break Some(e),
         }
-        // Linux unix_stream_data_wait, with no lock held
-        let seen = peek_at;
-        let peek = flags & MSG_PEEK != 0;
+        // Linux unix_stream_data_wait, with no lock held: a peek waits
+        // for a message after the last one it copied
         match s.sk.wait_data(timeo, || {
-            let q = s.rq.lock();
-            let more = if peek {
-                q.q.len() > seen
-            } else {
-                !q.q.is_empty()
-            };
-            more || s.sk.has_err() || super::rcv_shut(s) || s.is_dead()
+            next_skb(s, last.as_deref()).is_some()
+                || s.sk.has_err()
+                || super::rcv_shut(s)
+                || s.is_dead()
         }) {
             Ok(t) => timeo = t,
             Err(KernelError::WouldBlock) => timeo = 0,
@@ -320,6 +327,16 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
     }
 }
 
+/// The message a read continues with: the head, or for a peek the one
+/// after `last` (the last it copied; Linux skb_peek_next). A `last`
+/// that left the queue (a purge) ends the peek.
+fn next_skb(s: &UnixSock, last: Option<&SkBuff>) -> Option<Arc<SkBuff>> {
+    match last {
+        None => s.rq.peek(),
+        Some(l) => s.rq.peek_next(l),
+    }
+}
+
 /// One pass under `iolock`: `Ok(Some(()))` = wait for more data,
 /// `Ok(None)` = done, `Err` = error (returned unless data was copied)
 #[expect(clippy::too_many_arguments)]
@@ -331,7 +348,7 @@ fn read_some(
     target: usize,
     timeo: u64,
     g: &mut Got,
-    peek_at: &mut usize,
+    last: &mut Option<Arc<SkBuff>>,
 ) -> Result<Option<()>, KernelError> {
     let _io = s.iolock.lock();
     let peek = flags & MSG_PEEK != 0;
@@ -340,7 +357,7 @@ fn read_some(
             return Err(KernelError::ConnectionReset);
         }
         let step = if peek {
-            peek_one(s, m, size, g, peek_at)?
+            peek_one(s, m, size, g, last)?
         } else {
             read_one(s, m, size, g)?
         };
@@ -355,10 +372,10 @@ fn read_some(
                 // end counts only if nothing was queued ahead of it. The
                 // ends are sampled once: one that lands after the queue
                 // check is left for the next pass.
-                let seen = if peek { *peek_at } else { 0 };
                 let err = s.sk.has_err();
                 let shut = super::rcv_shut(s);
-                if (err || shut) && s.rq.lock().q.len() > seen {
+                let cur = if peek { last.as_deref() } else { None };
+                if (err || shut) && next_skb(s, cur).is_some() {
                     continue;
                 }
                 if err && let Some(e) = s.sk.take_err() {
@@ -415,28 +432,26 @@ fn may_join(
     true
 }
 
-/// Consume from the head message (iolock held: only we remove)
+/// Consume from the head message (Linux unix_stream_read_generic
+/// without MSG_PEEK): the head is referenced under the queue lock and
+/// copied after it; `iolock` is held, so only we consume or unlink, and
+/// a fully read message is unlinked and freed after the lock
 fn read_one(
     s: &UnixSock,
     m: &mut RecvMsg<'_>,
     size: usize,
     g: &mut Got,
 ) -> Result<Step, KernelError> {
-    let mut skb = {
-        let mut q = s.rq.lock();
-        let Some(front) = q.q.pop_front() else {
-            return Ok(Step::Empty);
-        };
-        front
+    let Some(skb) = s.rq.peek() else {
+        return Ok(Step::Empty);
     };
-    if !may_join(s, skb.creds.as_ref(), &skb.from, m, g) {
-        s.rq.lock().q.push_front(skb);
+    let cb = ucb(&skb);
+    if !may_join(s, cb.creds.as_ref(), &cb.wmem.from, m, g) {
         return Ok(Step::Stop);
     }
-    let chunk = skb.len().min(size - g.copied);
-    let from = skb.consumed;
-    if let Err(e) = m.data.put(g.copied, &skb.data[from..from + chunk]) {
-        s.rq.lock().q.push_front(skb);
+    let from = cb.consumed.load(Ordering::Acquire);
+    let chunk = unix_len(&skb).min(size - g.copied);
+    if let Err(e) = m.data.put(g.copied, &skb.data()[from..from + chunk]) {
         return if g.copied == 0 {
             Err(e)
         } else {
@@ -444,66 +459,53 @@ fn read_one(
         };
     }
     g.copied += chunk;
-    skb.consumed += chunk;
-    let fds = skb.fds.take();
+    cb.consumed.fetch_add(chunk, Ordering::AcqRel);
+    let fds = cb.fp.lock().take();
     let had_fds = fds.is_some();
     if fds.is_some() {
         g.fds = fds;
     }
-    let rest = {
+    let done = unix_len(&skb) == 0;
+    let gone = {
         let mut q = s.rq.lock();
-        q.bytes -= chunk;
-        if skb.is_empty() {
-            Some(skb)
-        } else {
-            q.q.push_front(skb);
-            None
-        }
+        s.inq_len.fetch_sub(chunk, Ordering::AcqRel);
+        if done { q.remove(&skb) } else { None }
     };
-    let Some(done) = rest else {
+    drop(gone);
+    if !done {
         return Ok(Step::Stop);
-    };
-    drop(done);
+    }
     Ok(if had_fds { Step::Stop } else { Step::More })
 }
 
-/// MSG_PEEK: copy from message `peek_at` without consuming; files are
-/// duplicated (Linux unix_peek_fds) and end the read
+/// MSG_PEEK: copy from the message after `last` without consuming;
+/// files are duplicated (Linux unix_peek_fds) and end the read
 fn peek_one(
     s: &UnixSock,
     m: &mut RecvMsg<'_>,
     size: usize,
     g: &mut Got,
-    peek_at: &mut usize,
+    last: &mut Option<Arc<SkBuff>>,
 ) -> Result<Step, KernelError> {
-    let (data, creds, fds, name) = {
-        let q = s.rq.lock();
-        let Some(skb) = q.q.get(*peek_at) else {
-            return Ok(Step::Empty);
-        };
-        let chunk = skb.len().min(size - g.copied);
-        let d = skb.data[skb.consumed..skb.consumed + chunk].to_vec();
-        (
-            d,
-            skb.creds.clone(),
-            skb.fds.as_ref().map(|f| f.dup()),
-            skb.from.clone(),
-        )
+    let Some(skb) = next_skb(s, last.as_deref()) else {
+        return Ok(Step::Empty);
     };
-    if !may_join(s, creds.as_ref(), &name, m, g) {
-        drop(fds);
+    let cb = ucb(&skb);
+    if !may_join(s, cb.creds.as_ref(), &cb.wmem.from, m, g) {
         return Ok(Step::Stop);
     }
-    if let Err(e) = m.data.put(g.copied, &data) {
-        drop(fds);
+    let from = cb.consumed.load(Ordering::Acquire);
+    let chunk = unix_len(&skb).min(size - g.copied);
+    if let Err(e) = m.data.put(g.copied, &skb.data()[from..from + chunk]) {
         return if g.copied == 0 {
             Err(e)
         } else {
             Ok(Step::Stop)
         };
     }
-    g.copied += data.len();
-    *peek_at += 1;
+    g.copied += chunk;
+    let fds = peek_fds(&skb);
+    *last = Some(skb);
     if fds.is_some() {
         g.fds = fds;
         return Ok(Step::Stop);
@@ -525,7 +527,7 @@ pub fn poll(s: &UnixSock) -> u16 {
     if shut & RCV_SHUTDOWN != 0 {
         mask |= POLLRDHUP | POLLIN | POLLRDNORM;
     }
-    if !s.rq.lock().q.is_empty() {
+    if !s.rq.is_empty() {
         mask |= POLLIN | POLLRDNORM;
     }
     if s.state() == CLOSE {

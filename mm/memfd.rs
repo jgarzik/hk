@@ -13,12 +13,11 @@
 //! Locking: seals are added under the inode's i_rwsem and read lock-free
 //! (Acquire). The deny is an atomic count (doc/LOCKING.md, page cache).
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use crate::fs::File;
 use crate::fs::flags::{O_LARGEFILE, O_RDWR};
+use crate::fs::{File, FileRef};
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
 
@@ -123,13 +122,11 @@ pub fn sys_memfd_create(uname: UserPtr<u8>, flags: u32) -> KernelResult<i32> {
     } else {
         0
     };
-    crate::fs::syscall::current_fd_table()
-        .lock()
-        .alloc_with_flags(file, fd_flags, crate::fs::syscall::get_nofile_limit())
+    crate::fs::io::fd_install(file, fd_flags)
 }
 
 /// F_ADD_SEALS and F_GET_SEALS (Linux memfd_fcntl)
-pub fn fcntl(file: &Arc<File>, cmd: i32, arg: u64) -> KernelResult<i64> {
+pub fn fcntl(file: &FileRef, cmd: i32, arg: u64) -> KernelResult<i64> {
     let inode = file.get_inode().ok_or(KernelError::InvalidArgument)?;
     if cmd == F_GET_SEALS {
         let s = crate::fs::ramfs::with_seals(&inode, |s| s.load(Ordering::Acquire));

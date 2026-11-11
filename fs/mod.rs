@@ -57,7 +57,7 @@ use crate::util::error::KernelResult;
 pub use blkdev_ops::BLOCK_FILE_OPS;
 pub use dac::{MAY_EXEC, MAY_READ, MAY_WRITE};
 pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
-pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, RwFlags, flags, seek};
+pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, FileRef, RwFlags, flags, seek};
 pub use fsstruct::{FsStruct, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
 pub use mount::{Mount, do_umount, follow_mount, umount_flags};
@@ -77,15 +77,13 @@ pub use vfat::{VFAT_FILE_OPS, VFAT_TYPE};
 
 use alloc::sync::Arc;
 
-use crate::util::kalloc::try_arc;
-
 /// Open a file for execve (Linux do_open_execat): the walk's search
 /// checks, then may_open for MAY_EXEC (x permission; CAP_DAC_OVERRIDE
 /// only if some x bit is set; directories and devices EACCES) and a
 /// regular file. Kernel-internal callers (init) have root credentials.
 ///
 /// Returns a read-only file, or ENOENT, EACCES, ...
-pub fn kernel_open_exec(path: &[u8]) -> KernelResult<Arc<File>> {
+pub fn kernel_open_exec(path: &[u8]) -> KernelResult<FileRef> {
     let p = namei::path_lookupat(
         crate::task::percpu::current_cwd(),
         path,
@@ -97,7 +95,7 @@ pub fn kernel_open_exec(path: &[u8]) -> KernelResult<Arc<File>> {
 /// The checks and open of kernel_open_exec on a dentry already looked up
 /// (execveat: relative to a dirfd, the dirfd's own file, or a final
 /// symlink not followed, which is ELOOP like Linux's may_open)
-pub fn open_exec(path: Path) -> KernelResult<Arc<File>> {
+pub fn open_exec(path: Path) -> KernelResult<FileRef> {
     let dentry = path.dentry.clone();
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
     if inode.mode().is_symlink() {
@@ -115,12 +113,7 @@ pub fn open_exec(path: Path) -> KernelResult<Arc<File>> {
         .superblock()
         .map(|sb| sb.fs_type.file_ops)
         .unwrap_or(&ramfs::RAMFS_FILE_OPS);
-    try_arc(File::new(
-        dentry,
-        Some(path.mnt.clone()),
-        flags::O_RDONLY,
-        f_op,
-    ))
+    File::new(dentry, Some(path.mnt.clone()), flags::O_RDONLY, f_op).alloc()
 }
 
 // ============================================================================

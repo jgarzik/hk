@@ -5,6 +5,8 @@
 //! - TIMERFD_CANCEL_ON_SET: with TFD_TIMER_CANCEL_ON_SET, setting the
 //!   clock makes the timerfd readable and its read fail with ECANCELED
 //!   once
+//! - TIMERFD_CANCEL_TOGGLE: cancel-on-set turned off by a settime is not
+//!   canceled by a clock set; turned on again, it is
 //! - TIMERFD_PERIODIC_COUNT: a periodic timerfd counts elapsed/period
 //!   expirations (within one)
 //! - POSIX_TIMER_ABSTIME_RT: an absolute CLOCK_REALTIME POSIX timer
@@ -30,6 +32,7 @@ const ECANCELED: i64 = -125;
 pub fn run_tests() {
     test_timerfd_abstime_rt();
     test_timerfd_cancel_on_set();
+    test_timerfd_cancel_toggle();
     test_timerfd_periodic_count();
     test_posix_timer_abstime_rt();
     test_timer_tiny_period();
@@ -105,6 +108,31 @@ fn test_timerfd_cancel_on_set() {
     t.eq(b"readable", sys_ppoll(pfd.as_mut_ptr(), 1, &zero, 0, 0), 1);
     t.eq(b"read canceled", tfd_read(fd), ECANCELED);
     t.eq(b"read again", tfd_read(fd), EAGAIN);
+    sys_close(fd as u64);
+    t.done();
+}
+
+/// Set CLOCK_REALTIME to (about) its own value: the offset changes
+fn bump_clock() -> i64 {
+    let now = ts(clock_ns(CLOCK_REALTIME) + 1_000_000);
+    sys_clock_settime(CLOCK_REALTIME, &now)
+}
+
+fn test_timerfd_cancel_toggle() {
+    let mut t = T::new(b"TIMERFD_CANCEL_TOGGLE");
+    let fd = sys_timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
+    let set = |flags| {
+        let s = spec(clock_ns(CLOCK_REALTIME) + 60_000_000_000, 0);
+        sys_timerfd_settime(fd as i32, flags, &s, core::ptr::null_mut())
+    };
+    let cancel = TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET;
+    t.eq(b"settime cancel", set(cancel), 0);
+    t.eq(b"settime plain", set(TFD_TIMER_ABSTIME), 0);
+    t.eq(b"clock_settime", bump_clock(), 0);
+    t.eq(b"read not canceled", tfd_read(fd), EAGAIN);
+    t.eq(b"settime cancel again", set(cancel), 0);
+    t.eq(b"clock_settime again", bump_clock(), 0);
+    t.eq(b"read canceled", tfd_read(fd), ECANCELED);
     sys_close(fd as u64);
     t.done();
 }

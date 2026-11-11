@@ -18,6 +18,7 @@
 //! users (dumps, route lookups, /proc) do not take it.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::sync::{Mutex, MutexGuard};
 
@@ -99,10 +100,39 @@ pub fn unregister_netdevice(rtnl: &RtnlGuard, dev: &Arc<NetDevice>) {
     net.unlist_device(dev);
     dev.detach_ops(rtnl);
     ifaddr::inetdev_destroy(rtnl, &net, dev);
-    net.arp.flush_dev(dev.ifindex());
+    crate::net::arp::arp_tbl().flush_dev(dev);
     crate::net::packet::netdev_unregister(rtnl, &net, dev);
     rtnetlink::notify_dellink(&net, dev);
     crate::net::sysfs::netdev_unregister_kobject(dev);
+}
+
+/// Unregister the devices of a namespace that is gone (Linux
+/// cleanup_net -> default_device_exit_batch, then loopback_net_exit):
+/// from the system workqueue under RTNL, the others first, loopback
+/// last. Each is closed and detached from its driver, its addresses
+/// leave their lists and the address hash (NETDEV_UNREGISTER ->
+/// inetdev_destroy) and its sysfs device goes. The namespace's FIB,
+/// ARP table and sockets went with it, so nothing is announced: no
+/// netlink socket of the namespace is left to hear it.
+pub fn netns_exit(mut devs: Vec<Arc<NetDevice>>) {
+    if devs.is_empty() {
+        return;
+    }
+    // Registration order puts lo first; it goes last
+    devs.sort_by_key(|d| d.is_loopback());
+    let mut pending = Some(devs);
+    let work = crate::task::workqueue::Work::new(move || {
+        let r = lock();
+        for dev in pending.take().unwrap_or_default() {
+            dev.close();
+            dev.detach_ops(&r);
+            ifaddr::inetdev_exit(&r, &dev);
+            crate::net::sysfs::netdev_unregister_kobject(&dev);
+        }
+    });
+    // Namespace teardown cannot fail
+    let work = crate::util::kalloc::arc_nofail(crate::sync::IrqSpinlock::new(work));
+    crate::task::workqueue::SYSTEM_WQ.queue_work(work);
 }
 
 /// Change a device's MTU (Linux dev_set_mtu): EINVAL if negative or

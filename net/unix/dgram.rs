@@ -24,13 +24,18 @@ use crate::io::poll::{
 use crate::net::msg::{MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, RecvMsg, SendMsg};
 use crate::net::sock::SHUTDOWN_MASK;
 use crate::net::socket::{AF_UNSPEC, SOCK_SEQPACKET};
+use crate::sync::waitqueue::WaitEntry;
+use crate::task::percpu::WakeMode;
 use crate::util::error::KernelError;
 
 use super::scm::{Creds, FpList, Scm, too_many_fds};
 use super::{
-    CLOSE, ESTABLISHED, LISTEN, SUN_PATH, Skb, UnixSock, family, find_other, queue, rcv_shut,
-    validate,
+    CLOSE, ESTABLISHED, LISTEN, SUN_PATH, UnixSock, add_creds, family, find_other, peek_fds, queue,
+    rcv_shut, ucb, ucb_mut, unix_len, unix_skb, validate,
 };
+use crate::mm::page_alloc::Gfp;
+use crate::net::skb::SkBuff;
+use crate::util::kalloc::try_arc_gfp;
 
 /// Linux unix_may_send: `other` (whose peer is `other_peer`) takes
 /// messages from `s` unless connected to someone else
@@ -108,7 +113,7 @@ fn reconnected(s: &UnixSock, old: Option<Arc<UnixSock>>, new: Option<&Arc<UnixSo
 /// Linux unix_dgram_disconnected: purge our queue; if `other` was
 /// connected back to us, it loses messages: ECONNRESET for it
 fn disconnected(s: &UnixSock, other: &UnixSock) {
-    let q = s.rq.lock().take_all();
+    let q = s.purge();
     if q.is_empty() {
         return;
     }
@@ -145,20 +150,21 @@ pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, K
     let nonblock = flags & MSG_DONTWAIT != 0;
     let mut timeo = s.sk.snd_timeo(nonblock);
     s.wmem_wait(&mut timeo)?;
-    let mut skb = Skb::new(&s.arc(), m.data.take(len)?);
-    skb.creds = scm.creds;
+    let mut skb = unix_skb(&s.arc(), m.data.take(len)?)?;
+    ucb_mut(&mut skb).creds = scm.creds;
     if let Some(f) = scm.fds.take() {
         if too_many_fds() {
             return Err(KernelError::TooManyRefs);
         }
-        skb.fds = Some(f);
+        *ucb_mut(&mut skb).fp.get_mut() = Some(f);
     }
     let mut other = match &m.addr {
         Some(a) => find_other(&s.sk.net, a, s.sk.stype)?,
         None => s.peer().ok_or(KernelError::NotConnected)?,
     };
-    skb.add_creds(s, &other);
-    let mut skb = Some(skb);
+    add_creds(&mut skb, s, &other);
+    // Its Arc before any lock (Linux: the skb is allocated first)
+    let mut skb = Some(try_arc_gfp(skb, Gfp::KERNEL)?);
     loop {
         match try_send(s, &other, &mut skb)? {
             Tx::Sent => return Ok(len),
@@ -173,7 +179,10 @@ pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, K
                 }
             }
             Tx::Full => {
-                if !is(&s.peer(), &other) || peer_wake_me(s, &other) {
+                // Under our state lock, so the peer stays our peer
+                // (Linux: under unix_state_double_lock)
+                let st = s.st.lock();
+                if !is(&st, &other) || peer_wake_me(s, &other) {
                     return Err(KernelError::WouldBlock);
                 }
             }
@@ -183,7 +192,11 @@ pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, K
 
 /// Queue under the receiver's lock (Linux unix_dgram_sendmsg
 /// restart_locked)
-fn try_send(s: &UnixSock, other: &Arc<UnixSock>, skb: &mut Option<Skb>) -> Result<Tx, KernelError> {
+fn try_send(
+    s: &UnixSock,
+    other: &Arc<UnixSock>,
+    skb: &mut Option<Arc<SkBuff>>,
+) -> Result<Tx, KernelError> {
     {
         let g = other.st.lock();
         if !may_send(s, &g) {
@@ -265,51 +278,38 @@ pub fn seqpacket_recvmsg(
     recvmsg(s, m, flags)
 }
 
-/// A received message: owned, or copied for MSG_PEEK
+/// A received message: taken off, or a reference left queued for
+/// MSG_PEEK; its files taken (or copied for MSG_PEEK)
 struct Rx {
-    skb: Option<Skb>,
-    peeked: alloc::vec::Vec<u8>,
+    skb: Arc<SkBuff>,
     creds: Option<Creds>,
     fds: Option<FpList>,
-    from: Arc<UnixSock>,
 }
 
-impl Rx {
-    fn data(&self) -> &[u8] {
-        self.skb.as_ref().map_or(&self.peeked, |s| &s.data)
-    }
-}
-
-/// Take (or copy, with MSG_PEEK) the head message; a dequeue makes
-/// room for blocked or polling senders
+/// Take (or reference, with MSG_PEEK) the head message; a dequeue
+/// makes room for blocked or polling senders. The caller holds
+/// `iolock`, so only it takes the files.
 fn take(s: &UnixSock, peek: bool) -> Option<Rx> {
-    let rx = {
+    let skb = if peek {
+        s.rq.peek()?
+    } else {
         let mut q = s.rq.lock();
-        if peek {
-            let skb = q.q.front()?;
-            Rx {
-                skb: None,
-                peeked: skb.data.clone(),
-                creds: skb.creds.clone(),
-                fds: skb.fds.as_ref().map(|f| f.dup()),
-                from: skb.from.clone(),
-            }
-        } else {
-            let mut skb = q.q.pop_front()?;
-            q.bytes -= skb.len();
-            Rx {
-                creds: skb.creds.take(),
-                fds: skb.fds.take(),
-                from: skb.from.clone(),
-                skb: Some(skb),
-                peeked: alloc::vec::Vec::new(),
-            }
-        }
-    };
-    if !peek {
+        let skb = q.pop_front()?;
+        s.inq_len.fetch_sub(unix_len(&skb), Ordering::AcqRel);
+        drop(q);
         s.relay_wake();
-    }
-    Some(rx)
+        skb
+    };
+    let fds = if peek {
+        peek_fds(&skb)
+    } else {
+        ucb(&skb).fp.lock().take()
+    };
+    Some(Rx {
+        creds: ucb(&skb).creds.clone(),
+        fds,
+        skb,
+    })
 }
 
 /// Linux __unix_dgram_recvmsg: whole messages; MSG_TRUNC flags a short
@@ -346,7 +346,7 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
             return Err(KernelError::NotConnected);
         }
         match s.sk.wait(timeo, || {
-            !s.rq.lock().q.is_empty()
+            !s.rq.is_empty()
                 || s.sk.has_err()
                 || rcv_shut(s)
                 || (seqpacket && s.state() != ESTABLISHED)
@@ -366,43 +366,60 @@ fn deliver(
     mut rx: Rx,
 ) -> Result<usize, KernelError> {
     if m.want_name {
-        m.name = rx.from.addr().map(|a| a.name.clone());
+        m.name = ucb(&rx.skb).wmem.from.addr().map(|a| a.name.clone());
     }
-    let n = rx.data().len();
+    let n = rx.skb.len();
     let size = n.min(m.data.len());
     if size < n {
         m.flags |= MSG_TRUNC;
     }
-    m.data.put(0, &rx.data()[..size])?;
+    m.data.put(0, &rx.skb.data()[..size])?;
     super::scm_recv(s, m, rx.creds.take(), rx.fds.take());
     drop(rx);
     Ok(if flags & MSG_TRUNC != 0 { n } else { size })
 }
 
-/// Linux unix_dgram_peer_wake_connect: register `s` once on `other`'s
-/// relay list; true if this call registered it
-fn peer_wake_connect(s: &UnixSock, other: &UnixSock) -> bool {
-    let mut r = other.relay.lock();
-    if s.peer_wake.load(Ordering::Acquire) != 0 {
-        return false;
-    }
-    s.peer_wake.store(other.id(), Ordering::Release);
-    r.push(s.me.clone());
+/// A wakeup on the peer's `peer_wait` reached our `peer_wake` entry
+/// (Linux unix_dgram_peer_wake_relay): under that queue's lock, which
+/// unlinks the entry (it returns true); wake our pollers
+pub fn peer_wake_relay(e: &WaitEntry, _mode: WakeMode, key: usize) -> bool {
+    // SAFETY: `private` is the socket embedding `e` (UnixSock::new),
+    // alive while its entry is linked: its drop unlinks it first under
+    // this queue's lock, which the waker holds
+    let u = unsafe { &*(e.private as *const UnixSock) };
+    u.peer_wake_to.store(0, Ordering::Release);
+    u.sk.wq.wake_poll(key as u32);
     true
 }
 
-/// Linux unix_dgram_peer_wake_disconnect
+/// Linux unix_dgram_peer_wake_connect: link our `peer_wake` once on
+/// `other`'s `peer_wait`; true if this call linked it. The caller holds
+/// our `st` with `other` as our peer.
+fn peer_wake_connect(s: &UnixSock, other: &UnixSock) -> bool {
+    let _r = other.relay.lock();
+    if s.peer_wake_to.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    s.peer_wake_to.store(other.id(), Ordering::Release);
+    // INVARIANT: linked on our peer's queue
+    other.peer_wait.add_wait_queue_once(s.peer_wake());
+    true
+}
+
+/// Linux unix_dgram_peer_wake_disconnect: off `other`'s `peer_wait`
+/// (called before our reference to the old peer goes)
 pub fn peer_wake_disconnect(s: &UnixSock, other: &UnixSock) {
-    let mut r = other.relay.lock();
-    if s.peer_wake.load(Ordering::Acquire) == other.id() {
-        r.retain(|w| !core::ptr::eq(w.as_ptr(), s));
-        s.peer_wake.store(0, Ordering::Release);
+    let _r = other.relay.lock();
+    if s.peer_wake_to.load(Ordering::Acquire) == other.id() {
+        other.peer_wait.remove_wait_queue(s.peer_wake());
+        s.peer_wake_to.store(0, Ordering::Release);
     }
 }
 
 /// Linux unix_dgram_peer_wake_me: true (stay unwritable, registered)
 /// while `other`'s queue is full and it is alive; a dead receiver must
-/// look writable so the next write reports ECONNREFUSED
+/// look writable so the next write reports ECONNREFUSED. The caller
+/// holds our `st` with `other` as our peer.
 fn peer_wake_me(s: &UnixSock, other: &UnixSock) -> bool {
     let connected = peer_wake_connect(s, other);
     if other.recvq_full() && !other.is_dead() {
@@ -428,7 +445,7 @@ pub fn poll(s: &UnixSock) -> u16 {
     if shut == SHUTDOWN_MASK {
         mask |= POLLHUP;
     }
-    if !s.rq.lock().q.is_empty() {
+    if !s.rq.is_empty() {
         mask |= POLLIN | POLLRDNORM;
     }
     if s.sk.stype == SOCK_SEQPACKET && s.state() == CLOSE {
@@ -439,9 +456,13 @@ pub fn poll(s: &UnixSock) -> u16 {
         && let Some(other) = s.peer()
         && !is(&other.peer(), s)
         && other.recvq_full()
-        && peer_wake_me(s, &other)
     {
-        writable = false;
+        // Under our state lock, so `other` stays our peer while our
+        // entry is linked on it (Linux unix_dgram_poll)
+        let st = s.st.lock();
+        if is(&st, &other) && peer_wake_me(s, &other) {
+            writable = false;
+        }
     }
     if writable {
         mask |= POLLOUT | POLLWRNORM | POLLWRBAND;

@@ -8,10 +8,14 @@
 //! [`mangle`]d for /proc text files).
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::borrow::Borrow;
 use core::fmt;
 use core::ops::Deref;
+
+use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc_slice;
 
 /// An owned file name (a path component, or a whole path where a path is
 /// stored: a symlink target, an executable's name)
@@ -81,6 +85,158 @@ impl fmt::Debug for FileName {
     }
 }
 
+/// Room for a name inside a dentry (Linux DNAME_INLINE_LEN on 64-bit,
+/// its last byte the NUL: names shorter than this stay inline)
+pub const DNAME_INLINE_LEN: usize = 40;
+
+/// A dentry's name (Linux struct qstr over d_shortname or an
+/// external_name) and its hash: a short name inline, a longer one in a
+/// refcounted block allocated, fallibly, before any lock is taken. A
+/// copy is a byte copy or a reference: never an allocation, so names
+/// are snapshotted (take_dentry_name_snapshot) and moved by a rename
+/// (copy_name, swap_names) under spin locks.
+#[derive(Clone)]
+pub struct DName {
+    hash: u64,
+    repr: DNameRepr,
+}
+
+#[derive(Clone)]
+enum DNameRepr {
+    /// Linux d_shortname
+    Inline {
+        len: u8,
+        buf: [u8; DNAME_INLINE_LEN],
+    },
+    /// Linux external_name (its count is the Arc's)
+    External(Arc<[u8]>),
+}
+
+impl DName {
+    /// `b` as a dentry name: ENOMEM if a long one cannot be had (Linux
+    /// __d_alloc)
+    pub fn new(b: &[u8]) -> Result<Self, KernelError> {
+        let repr = match u8::try_from(b.len()) {
+            Ok(len) if b.len() < DNAME_INLINE_LEN => {
+                let mut buf = [0; DNAME_INLINE_LEN];
+                buf[..b.len()].copy_from_slice(b);
+                DNameRepr::Inline { len, buf }
+            }
+            _ => DNameRepr::External(try_arc_slice(b)?),
+        };
+        Ok(Self {
+            hash: name_hash(b),
+            repr,
+        })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match &self.repr {
+            DNameRepr::Inline { len, buf } => &buf[..usize::from(*len)],
+            DNameRepr::External(a) => a,
+        }
+    }
+
+    /// The name's hash (Linux qstr.hash): keyed per boot, unsalted (the
+    /// dcache mixes in the parent, so a name moves between parents)
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+}
+
+impl Default for DName {
+    /// The empty name of a root
+    fn default() -> Self {
+        Self {
+            hash: name_hash(b""),
+            repr: DNameRepr::Inline {
+                len: 0,
+                buf: [0; DNAME_INLINE_LEN],
+            },
+        }
+    }
+}
+
+/// The dcache's hash key, drawn once per boot from the RNG
+#[cfg(not(test))]
+static NAME_KEY: spin::Once<[u64; 2]> = spin::Once::new();
+
+#[cfg(not(test))]
+fn name_key() -> [u64; 2] {
+    *NAME_KEY.call_once(|| {
+        let r = || {
+            (u64::from(crate::random::get_random_u32()) << 32)
+                | u64::from(crate::random::get_random_u32())
+        };
+        [r(), r()]
+    })
+}
+
+#[cfg(test)]
+fn name_key() -> [u64; 2] {
+    [3, 4]
+}
+
+/// A name's hash (Linux full_name_hash): SipHash under a per-boot
+/// random key, so colliding names cannot be built offline to pile one
+/// hash chain up
+pub fn name_hash(b: &[u8]) -> u64 {
+    crate::util::siphash::siphash_bytes(name_key(), b)
+}
+
+impl Deref for DName {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl Borrow<[u8]> for DName {
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl AsRef<[u8]> for DName {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+/// Equality and order are the bytes' (the hash follows from them), as
+/// `Borrow<[u8]>` requires
+impl PartialEq for DName {
+    fn eq(&self, o: &Self) -> bool {
+        self.hash == o.hash && self.as_bytes() == o.as_bytes()
+    }
+}
+
+impl Eq for DName {}
+
+impl PartialOrd for DName {
+    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for DName {
+    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
+        self.as_bytes().cmp(o.as_bytes())
+    }
+}
+
+impl fmt::Display for DName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&Escaped(self.as_bytes()), f)
+    }
+}
+
+impl fmt::Debug for DName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\"{}\"", self)
+    }
+}
+
 /// A byte string shown as text, invalid UTF-8 as `\xNN` (kernel messages)
 pub struct Escaped<'a>(pub &'a [u8]);
 
@@ -144,6 +300,23 @@ mod tests {
     fn display_escapes_invalid_utf8() {
         let n = FileName::new(b"a\xffb\xc3\xa9");
         assert_eq!(format!("{}", n), "a\\xffbé");
+    }
+
+    /// Short names stay inline, long ones are shared: a copy of either
+    /// allocates nothing and compares equal
+    #[test]
+    fn dname_inline_and_external() {
+        let s = DName::new(&[b'a'; DNAME_INLINE_LEN - 1]).unwrap();
+        assert!(matches!(s.repr, DNameRepr::Inline { .. }));
+        let l = DName::new(&[b'b'; DNAME_INLINE_LEN]).unwrap();
+        let DNameRepr::External(a) = &l.repr else {
+            panic!("long name inline");
+        };
+        let c = l.clone();
+        assert_eq!(Arc::strong_count(a), 2);
+        assert!(c == l && c.as_bytes().len() == DNAME_INLINE_LEN);
+        assert!(s.as_bytes() == [b'a'; DNAME_INLINE_LEN - 1] && s.hash() != l.hash());
+        assert!(DName::default().is_empty());
     }
 
     #[test]

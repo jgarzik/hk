@@ -15,6 +15,7 @@ pub mod workqueue;
 pub mod exec;
 pub mod fair;
 pub mod fdbits;
+pub use fdbits::FdTable;
 pub mod fdtable;
 pub mod id;
 pub mod kthread;
@@ -32,6 +33,8 @@ pub mod sched;
 pub mod schedsys;
 pub mod stop_machine;
 pub mod syscall;
+pub mod ucount;
+pub use ucount::{Ucount, Ucounts, UcountsRef, alloc_ucounts, set_cred_ucounts};
 
 /// Clone flags for clone() syscall (subset of Linux flags)
 ///
@@ -119,9 +122,7 @@ pub mod wait_options {
 
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::{arc_nofail, try_arc};
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
@@ -184,6 +185,10 @@ pub struct Cred {
     pub cap_ambient: KernelCap,
     /// Supplementary groups, sorted (Linux group_info)
     pub groups: GroupInfo,
+    /// The real uid's counters (Linux cred->ucounts): a counted
+    /// reference, pointed at a new uid's by `set_cred_ucounts` before a
+    /// uid change is committed
+    pub ucounts: UcountsRef,
 }
 
 /// Supplementary group list (Linux struct group_info): sorted and
@@ -234,6 +239,7 @@ impl Cred {
         cap_bset: CAP_FULL_SET,
         cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
         groups: GroupInfo::EMPTY,
+        ucounts: UcountsRef::INIT,
     };
 
     /// No privileges at all (overflow uid/gid 65534, no capabilities,
@@ -254,13 +260,15 @@ impl Cred {
         cap_bset: CAP_EMPTY_SET,
         cap_ambient: CAP_EMPTY_SET,
         groups: GroupInfo::EMPTY,
+        ucounts: UcountsRef::INIT,
     };
 
     /// Create credentials for a specific user/group
     ///
     /// Sets all credential fields (uid, suid, euid, fsuid) to the same value.
     /// For root (uid=0), grants full capabilities.
-    /// For non-root, grants empty capabilities.
+    /// For non-root, grants empty capabilities. The counters are root's
+    /// until `set_cred_ucounts` points them at `uid`'s.
     pub const fn new(uid: Uid, gid: Gid) -> Self {
         // Root gets full caps, non-root gets empty caps
         let (caps, bset) = if uid == 0 {
@@ -284,6 +292,7 @@ impl Cred {
             cap_bset: bset,
             cap_ambient: CAP_EMPTY_SET,
             groups: GroupInfo::EMPTY,
+            ucounts: UcountsRef::INIT,
         }
     }
 
@@ -333,12 +342,20 @@ pub fn prepare_creds() -> Cred {
 /// replaced under TASKLIST (others read it under the lock; the task
 /// itself without). The new credentials take effect immediately.
 pub fn commit_creds(new: Arc<Cred>) {
-    let old = current_cred().uid;
-    if old != new.uid {
-        flag_nproc_exceeded(new.uid);
+    let old = current_cred().ucounts;
+    if old.uid() != new.uid {
+        flag_nproc_exceeded(&new);
     }
-    nproc_move(old, new.uid);
+    // The task's RLIMIT_NPROC charge moves to its new user (Linux
+    // commit_creds: inc_rlimit_ucounts before, dec after the switch)
+    let moved = old != new.ucounts;
+    if moved {
+        new.ucounts.inc(Ucount::Nproc, 1);
+    }
     percpu::commit_creds_impl(new);
+    if moved {
+        old.dec(Ucount::Nproc, 1);
+    }
 }
 
 /// execve's RLIMIT_NPROC check (Linux do_execveat_common): EAGAIN if a
@@ -346,9 +363,8 @@ pub fn commit_creds(new: Arc<Cred>) {
 /// is cleared
 pub fn nproc_exec_check() -> KernelResult<()> {
     let me = percpu::current();
-    let uid = current_cred().uid;
     // rlimit() takes TASKLIST: decide before locking it
-    let over = nproc_overlimit(nproc_count(uid));
+    let over = nproc_overlimit(&current_cred().ucounts);
     let table = percpu::TASKLIST.read();
     let Some(t) = table.view(&me) else {
         return Ok(());
@@ -590,292 +606,6 @@ pub type Fd = i32;
 /// closed when the process calls execve().
 pub const FD_CLOEXEC: u32 = 1;
 
-/// File descriptor table for a process
-///
-/// Files the table lets go of (close, dup2/dup3 over an open descriptor,
-/// an install it refused) are parked in `dead` instead of being dropped
-/// under the table lock: releasing a file can sleep (TCP SO_LINGER, a
-/// socket's release path), so `fdtable::FilesGuard` drops them after
-/// unlocking (Linux file_close_fd_locked under files->file_lock, then
-/// filp_close/fput after spin_unlock).
-pub struct FdTable<F> {
-    /// Mapping from fd number to file object
-    files: BTreeMap<Fd, Arc<F>>,
-    /// Which descriptors are open, for the lowest-free search; agrees
-    /// with the keys of `files`
-    bits: fdbits::OpenFds,
-    /// Per-fd flags (FD_CLOEXEC, etc.)
-    fd_flags: BTreeMap<Fd, u32>,
-    /// Detached files, released once the lock is dropped
-    dead: Vec<Arc<F>>,
-    /// The ones of them a descriptor was closed for (close, dup2 over
-    /// it, close_range), not files refused an install: their closer's
-    /// POSIX locks go (`fdtable::FilesGuard`)
-    closed: Vec<Arc<F>>,
-}
-
-impl<F> FdTable<F> {
-    /// Create a new empty file descriptor table
-    pub fn new() -> Self {
-        Self::new_const()
-    }
-
-    /// Create a new empty file descriptor table (const)
-    pub const fn new_const() -> Self {
-        Self {
-            files: BTreeMap::new(),
-            bits: fdbits::OpenFds::new(),
-            fd_flags: BTreeMap::new(),
-            dead: Vec::new(),
-            closed: Vec::new(),
-        }
-    }
-
-    /// Install `file` at `fd`, free in both `files` and `bits`; false
-    /// (file parked) if the bitmap cannot grow
-    fn install(&mut self, fd: Fd, file: Arc<F>, flags: u32) -> bool {
-        if !self.bits.set(fd as usize) {
-            self.defer(file);
-            return false;
-        }
-        self.files.insert(fd, file);
-        if flags != 0 {
-            self.fd_flags.insert(fd, flags);
-        }
-        true
-    }
-
-    /// Park `file` for release after the table lock is dropped
-    fn defer(&mut self, file: Arc<F>) {
-        self.dead.push(file);
-    }
-
-    /// The files detached since the lock was taken (`FilesGuard` drops
-    /// them after unlocking)
-    pub fn take_dead(&mut self) -> Vec<Arc<F>> {
-        core::mem::take(&mut self.dead)
-    }
-
-    /// The files whose descriptors were closed since the lock was taken
-    /// (also released after unlocking)
-    pub fn take_closed(&mut self) -> Vec<Arc<F>> {
-        core::mem::take(&mut self.closed)
-    }
-
-    /// Allocate the lowest free file descriptor for a file (POSIX).
-    ///
-    /// The `nofile` parameter is the RLIMIT_NOFILE limit. If the allocated fd
-    /// would be >= nofile, returns Err(EMFILE). Pass `u64::MAX` to disable limit.
-    ///
-    /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation.
-    pub fn alloc(&mut self, file: Arc<F>, nofile: u64) -> KernelResult<Fd> {
-        self.alloc_at_or_above(file, 0, 0, nofile)
-    }
-
-    /// Allocate a specific file descriptor (for stdin/stdout/stderr).
-    ///
-    /// This does NOT enforce RLIMIT_NOFILE as it's used for initial fd setup
-    /// (stdin=0, stdout=1, stderr=2) where limits don't apply.
-    pub fn alloc_at(&mut self, fd: Fd, file: Arc<F>) -> bool {
-        if fd < 0 || self.files.contains_key(&fd) {
-            self.defer(file);
-            return false;
-        }
-        self.install(fd, file, 0)
-    }
-
-    /// Make room for `fd` before installing it there (Linux
-    /// expand_files): Err(EMFILE) at or past fs.nr_open, Err(ENOMEM)
-    pub fn expand(&mut self, fd: Fd) -> KernelResult<()> {
-        self.bits.reserve(fd as usize)
-    }
-
-    /// Get a file by descriptor
-    pub fn get(&self, fd: Fd) -> Option<Arc<F>> {
-        self.files.get(&fd).cloned()
-    }
-
-    /// Close a file descriptor (false: EBADF); the file is released
-    /// after the table lock is dropped
-    pub fn close(&mut self, fd: Fd) -> bool {
-        self.fd_flags.remove(&fd);
-        match self.files.remove(&fd) {
-            Some(f) => {
-                self.bits.clear(fd as usize);
-                self.closed.push(f);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Check if a file descriptor is valid
-    pub fn is_valid(&self, fd: Fd) -> bool {
-        self.files.contains_key(&fd)
-    }
-
-    /// Get all open file descriptors
-    pub fn fds(&self) -> impl Iterator<Item = &Fd> {
-        self.files.keys()
-    }
-
-    /// Allocate a file descriptor with specific fd flags.
-    ///
-    /// The `nofile` parameter is the RLIMIT_NOFILE limit. If the allocated fd
-    /// would be >= nofile, returns Err(EMFILE). Pass `u64::MAX` to disable limit.
-    ///
-    /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation,
-    /// not as a separate pre-check. This avoids TOCTOU races.
-    pub fn alloc_with_flags(&mut self, file: Arc<F>, flags: u32, nofile: u64) -> KernelResult<Fd> {
-        self.alloc_at_or_above(file, 0, flags, nofile)
-    }
-
-    /// Allocate a specific file descriptor with flags.
-    ///
-    /// The `nofile` parameter is the RLIMIT_NOFILE limit. If fd >= nofile,
-    /// returns Err(EMFILE). Pass `u64::MAX` to disable limit.
-    ///
-    /// Returns Err(EBADF) if the fd is already in use.
-    pub fn alloc_at_with_flags(
-        &mut self,
-        fd: Fd,
-        file: Arc<F>,
-        flags: u32,
-        nofile: u64,
-    ) -> KernelResult<()> {
-        // RLIMIT_NOFILE enforcement
-        if (fd as u64) >= nofile {
-            self.defer(file);
-            return Err(KernelError::ProcessFileLimit);
-        }
-        if fd < 0 || self.files.contains_key(&fd) {
-            self.defer(file);
-            return Err(KernelError::BadFd); // fd already in use
-        }
-        if !self.install(fd, file, flags) {
-            return Err(KernelError::OutOfMemory);
-        }
-        Ok(())
-    }
-
-    /// Allocate a file descriptor at or above min_fd (for F_DUPFD).
-    ///
-    /// Finds the lowest available fd >= min_fd and allocates the file
-    /// there; the search reads the open-fd bitmap (`fdbits`), not each fd.
-    /// The `nofile` parameter is the RLIMIT_NOFILE limit. If the found fd
-    /// would be >= nofile, returns Err(EMFILE).
-    ///
-    /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation.
-    pub fn alloc_at_or_above(
-        &mut self,
-        file: Arc<F>,
-        min_fd: Fd,
-        flags: u32,
-        nofile: u64,
-    ) -> KernelResult<Fd> {
-        // RLIMIT_NOFILE enforced inside (EMFILE)
-        let fd = match self.bits.alloc(min_fd.max(0) as usize, nofile) {
-            Ok(fd) => fd as Fd,
-            Err(e) => {
-                self.defer(file);
-                return Err(e);
-            }
-        };
-        self.files.insert(fd, file);
-        if flags != 0 {
-            self.fd_flags.insert(fd, flags);
-        }
-        Ok(fd)
-    }
-
-    /// Descriptors the table has room for (Linux fdtable->max_fds)
-    pub fn max_fds(&self) -> usize {
-        self.bits.max_fds()
-    }
-
-    /// Get fd flags for a file descriptor
-    pub fn get_fd_flags(&self, fd: Fd) -> u32 {
-        self.fd_flags.get(&fd).copied().unwrap_or(0)
-    }
-
-    /// Set fd flags for a file descriptor
-    ///
-    /// Returns false if the fd is not valid
-    pub fn set_fd_flags(&mut self, fd: Fd, flags: u32) -> bool {
-        if !self.files.contains_key(&fd) {
-            return false;
-        }
-        if flags != 0 {
-            self.fd_flags.insert(fd, flags);
-        } else {
-            self.fd_flags.remove(&fd);
-        }
-        true
-    }
-
-    /// Deep clone the FD table (for fork without CLONE_FILES)
-    ///
-    /// Creates an independent copy of the FD table where each file
-    /// descriptor points to the same underlying file (Arc clone),
-    /// but the table itself is independent.
-    pub fn deep_clone(&self) -> Self {
-        Self {
-            files: self.files.clone(),
-            bits: self.bits.clone(),
-            fd_flags: self.fd_flags.clone(),
-            dead: Vec::new(),
-            closed: Vec::new(),
-        }
-    }
-
-    /// Copy for exec (Linux unshare_files + do_close_on_exec): the
-    /// descriptors without FD_CLOEXEC, with their flags
-    pub fn exec_copy(&self) -> Self {
-        let mut t = Self::new();
-        t.bits = self.bits.clone();
-        for (&fd, file) in &self.files {
-            let fl = self.get_fd_flags(fd);
-            if fl & FD_CLOEXEC != 0 {
-                t.bits.clear(fd as usize);
-                continue;
-            }
-            t.files.insert(fd, file.clone());
-            if fl != 0 {
-                t.fd_flags.insert(fd, fl);
-            }
-        }
-        t
-    }
-
-    /// Detach the open descriptors in `lo..=hi` (Linux __range_close):
-    /// only the open ones are visited, however wide the range
-    pub fn close_range(&mut self, lo: Fd, hi: Fd) {
-        let mut mid = self.files.split_off(&lo);
-        let mut flags = self.fd_flags.split_off(&lo);
-        if let Some(next) = hi.checked_add(1) {
-            self.files.append(&mut mid.split_off(&next));
-            self.fd_flags.append(&mut flags.split_off(&next));
-        }
-        for &fd in mid.keys() {
-            self.bits.clear(fd as usize);
-        }
-        self.closed.extend(mid.into_values());
-    }
-
-    /// Set FD_CLOEXEC on the open descriptors in `lo..=hi` (Linux
-    /// __range_cloexec)
-    pub fn cloexec_range(&mut self, lo: Fd, hi: Fd) {
-        for &fd in self.files.range(lo..=hi).map(|(fd, _)| fd) {
-            *self.fd_flags.entry(fd).or_insert(0) |= FD_CLOEXEC;
-        }
-    }
-
-    /// Get the number of open file descriptors
-    pub fn count(&self) -> usize {
-        self.files.len()
-    }
-}
-
 /// Task flags (Linux PF_*, `Task.flags`): set by the task itself (or
 /// its creator before it runs), read lock-free by anyone
 pub mod pf {
@@ -1041,10 +771,13 @@ pub struct Task {
     /// thread context; the key database is taken under it
     pub keyrings: crate::sync::spin::Mutex<crate::keys::keyring::TaskKeyrings>,
     /// Its cgroup (Linux task->cgroups): spin leaf, thread context
+    /// A kernel thread's control block (Linux task->worker_private, read
+    /// by to_kthread); taken when the thread exits (spin leaf)
+    pub kthread: crate::sync::spin::Mutex<Option<Arc<crate::task::kthread::KThread>>>,
     pub cgroup: crate::sync::spin::Mutex<Option<Arc<crate::cgroup::Cgroup>>>,
-    /// Files `defer_fput` still has to drop while an outer frame of this
-    /// task drains (Linux task_work fput); only the task itself uses it
-    pub fput_defer: crate::sync::spin::Mutex<Option<Vec<Arc<crate::fs::File>>>>,
+    /// On its cgroup's task list (Linux task->cg_list on its css_set),
+    /// under that cgroup's `tasks` lock
+    pub cg_node: crate::util::list::Link,
     /// Callbacks queued to run in this task's context (Linux
     /// task_works; `task_work`)
     pub task_works: task_work::TaskWorks,
@@ -1132,8 +865,9 @@ pub struct Task {
     /// TASKLIST)
     pub sibling: crate::util::list::Link,
     /// Its place in its group leader's `threads` (Linux thread_node;
-    /// under TASKLIST)
+    /// under TASKLIST), and that list's mark
     pub thread_node: crate::util::list::Link,
+    thread_owner: crate::util::list::Owner,
     /// A group leader's place on its process group's `Pid.pgrp` (Linux
     /// pid_links[PIDTYPE_PGID]; under TASKLIST)
     pub pgrp_link: crate::util::list::Link,
@@ -1274,7 +1008,7 @@ pub struct TaskInner {
     /// A leader's thread group, itself included (Linux
     /// signal->thread_head; links `thread_node`), one strong reference
     /// each, until a thread leaves the task list (under TASKLIST)
-    threads: crate::util::list::ArcList<ThreadNode>,
+    threads: crate::util::list::OwnedList<ThreadNode>,
 
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
     ptrace_message: u64,
@@ -1327,7 +1061,7 @@ impl TaskInner {
             real_parent: None,
             children: crate::util::list::ArcList::new(),
             in_children: false,
-            threads: crate::util::list::ArcList::new(),
+            threads: crate::util::list::OwnedList::new(),
             ptrace_message: 0,
             ptrace_options: 0,
             ptrace_code: 0,
@@ -1493,24 +1227,9 @@ unsafe impl crate::util::list::Adapter for Sibling {
     }
 }
 
-/// The adapter of `Task.thread_node` (thread groups)
-pub struct ThreadNode;
-
-// SAFETY: offset_of! gives `thread_node`'s place in the task
-unsafe impl crate::util::list::Adapter for ThreadNode {
-    type Item = Task;
-    fn link(t: &Task) -> &crate::util::list::Link {
-        &t.thread_node
-    }
-    unsafe fn item(l: *const crate::util::list::Link) -> *const Task {
-        // SAFETY: `l` is the `thread_node` of a live task
-        unsafe {
-            l.cast::<u8>()
-                .sub(core::mem::offset_of!(Task, thread_node))
-                .cast::<Task>()
-        }
-    }
-}
+// The adapter of `Task.thread_node` (thread groups), marked in
+// `thread_owner`
+crate::owned_adapter!(pub ThreadNode, Task, thread_node, thread_owner);
 
 /// The ids a new task starts with
 pub struct TaskIds {
@@ -1578,6 +1297,13 @@ impl TaskCred {
     unsafe fn get(&self) -> Cred {
         // SAFETY: the pointer is live (see above)
         unsafe { (*self.0.load(Ordering::Acquire)).clone() }
+    }
+
+    /// # Safety
+    /// As [`TaskCred::get`].
+    unsafe fn ucounts(&self) -> UcountsRef {
+        // SAFETY: the pointer is live (see above)
+        unsafe { (*self.0.load(Ordering::Acquire)).ucounts.clone() }
     }
 
     /// # Safety
@@ -1874,8 +1600,9 @@ impl Task {
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
             sig: crate::sync::spin::Mutex::new(sig),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
+            kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
-            fput_defer: crate::sync::spin::Mutex::new(None),
+            cg_node: crate::util::list::Link::new(),
             task_works: task_work::TaskWorks::new(),
             io_thread: spin::Once::new(),
             io_uring: spin::Once::new(),
@@ -1909,6 +1636,7 @@ impl Task {
             tasks_link: crate::util::list::Link::new(),
             sibling: crate::util::list::Link::new(),
             thread_node: crate::util::list::Link::new(),
+            thread_owner: crate::util::list::Owner::new(),
             pgrp_link: crate::util::list::Link::new(),
             session_link: crate::util::list::Link::new(),
             inner: TableCell::new(Some(inner)),
@@ -1945,8 +1673,9 @@ impl Task {
             seccomp_mode: AtomicU8::new(0),
             sig: crate::sync::spin::Mutex::new(TaskSignalState::boot()),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
+            kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
-            fput_defer: crate::sync::spin::Mutex::new(None),
+            cg_node: crate::util::list::Link::new(),
             task_works: task_work::TaskWorks::new(),
             io_thread: spin::Once::new(),
             io_uring: spin::Once::new(),
@@ -1980,6 +1709,7 @@ impl Task {
             tasks_link: crate::util::list::Link::new(),
             sibling: crate::util::list::Link::new(),
             thread_node: crate::util::list::Link::new(),
+            thread_owner: crate::util::list::Owner::new(),
             pgrp_link: crate::util::list::Link::new(),
             session_link: crate::util::list::Link::new(),
             inner: TableCell::new(None),
@@ -2041,6 +1771,15 @@ impl Task {
     pub unsafe fn cred(&self) -> Cred {
         // SAFETY: see above
         unsafe { self.cred.get() }
+    }
+
+    /// A reference to its real uid's counters (Linux task_ucounts)
+    ///
+    /// # Safety
+    /// As [`Task::cred`].
+    pub unsafe fn ucounts(&self) -> UcountsRef {
+        // SAFETY: see above
+        unsafe { self.cred.ucounts() }
     }
 
     /// A reference to the task's credentials
@@ -2616,131 +2355,37 @@ pub fn capable(cap: u32) -> bool {
 }
 
 // =============================================================================
-// Per-UID counts (RLIMIT_NPROC, RLIMIT_SIGPENDING, locked memory)
+// RLIMIT_NPROC (Linux UCOUNT_RLIMIT_NPROC on the real cred's ucounts)
 // =============================================================================
 
-/// What a user's count counts (Linux enum ucount_type, the rlimit ones)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ucount {
-    /// Tasks, threads included (UCOUNT_RLIMIT_NPROC): charged to a
-    /// task's real uid from clone until it is released (reaped, or at
-    /// exit for a non-leader thread); a real-uid change moves the charge
-    Nproc,
-    /// Queued signals (UCOUNT_RLIMIT_SIGPENDING): charged to the
-    /// receiver's real uid while queued
-    Sigpending,
-    /// Pages pinned for io_uring (Linux user_struct.locked_vm: rings and
-    /// registered buffers), against RLIMIT_MEMLOCK (`locked_vm_charge`)
-    LockedVm,
-}
-
-/// Counts per user
-const NR_UCOUNTS: usize = 3;
-
-/// Each real uid's counts (Linux ucounts, one per user in the initial
-/// user namespace), indexed by `Ucount`: an entry lives while any count
-/// is non-zero, so a user's signals find it made by its tasks
-static UCOUNTS: Mutex<BTreeMap<Uid, [u64; NR_UCOUNTS]>> = Mutex::new(BTreeMap::new());
-
-/// Charge one to `uid`'s `kind`; the new count (Linux
-/// inc_rlimit_ucounts)
-pub fn ucount_inc(uid: Uid, kind: Ucount) -> u64 {
-    let mut counts = UCOUNTS.lock();
-    let c = &mut counts.entry(uid).or_insert([0; NR_UCOUNTS])[kind as usize];
-    *c += 1;
-    *c
-}
-
-/// Charge `pages` locked pages to `uid` unless that passes `limit`
-/// pages (Linux __io_account_mem against RLIMIT_MEMLOCK): false then
-pub fn locked_vm_charge(uid: Uid, pages: u64, limit: u64) -> bool {
-    let mut counts = UCOUNTS.lock();
-    let e = counts.entry(uid).or_insert([0; NR_UCOUNTS]);
-    let c = &mut e[Ucount::LockedVm as usize];
-    match c.checked_add(pages) {
-        Some(n) if n <= limit => {
-            *c = n;
-            true
-        }
-        _ => {
-            if *e == [0; NR_UCOUNTS] {
-                counts.remove(&uid);
-            }
-            false
-        }
-    }
-}
-
-/// Release `pages` locked pages of `uid` (Linux __io_unaccount_mem)
-pub fn locked_vm_uncharge(uid: Uid, pages: u64) {
-    let mut counts = UCOUNTS.lock();
-    if let Some(c) = counts.get_mut(&uid) {
-        let v = &mut c[Ucount::LockedVm as usize];
-        *v = v.saturating_sub(pages);
-        if *c == [0; NR_UCOUNTS] {
-            counts.remove(&uid);
-        }
-    }
-}
-
-/// Release one of `uid`'s `kind` (Linux dec_rlimit_ucounts)
-pub fn ucount_dec(uid: Uid, kind: Ucount) {
-    let mut counts = UCOUNTS.lock();
-    if let Some(c) = counts.get_mut(&uid) {
-        c[kind as usize] = c[kind as usize].saturating_sub(1);
-        if *c == [0; NR_UCOUNTS] {
-            counts.remove(&uid);
-        }
-    }
-}
-
-/// `uid`'s `kind` count (Linux get_rlimit_value)
-pub fn ucount(uid: Uid, kind: Ucount) -> u64 {
-    UCOUNTS.lock().get(&uid).map_or(0, |c| c[kind as usize])
-}
-
-/// Charge one task to `uid`; the new count
-pub fn nproc_charge(uid: Uid) -> u64 {
-    ucount_inc(uid, Ucount::Nproc)
-}
-
-/// Release one task's charge to `uid`
-pub fn nproc_uncharge(uid: Uid) {
-    ucount_dec(uid, Ucount::Nproc)
-}
-
-/// Tasks charged to `uid`
-pub fn nproc_count(uid: Uid) -> u64 {
-    ucount(uid, Ucount::Nproc)
-}
-
-/// `count` tasks exceed the caller's RLIMIT_NPROC (Linux
+/// `u`'s tasks exceed the caller's RLIMIT_NPROC (Linux
 /// is_rlimit_overlimit)
-pub fn nproc_overlimit(count: u64) -> bool {
-    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NPROC);
-    limit != crate::task::rlimit::RLIM_INFINITY && count > limit
+pub fn nproc_overlimit(u: &Ucounts) -> bool {
+    u.overlimit(
+        Ucount::Nproc,
+        crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NPROC),
+    )
 }
 
 /// clone's check (Linux copy_process): over the limit fails unless the
 /// task's user is root or it has CAP_SYS_RESOURCE/CAP_SYS_ADMIN
-pub fn nproc_over(uid: Uid, count: u64) -> bool {
-    nproc_overlimit(count) && uid != 0 && !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN)
+pub fn nproc_over(u: &Ucounts) -> bool {
+    nproc_overlimit(u) && u.uid() != 0 && !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN)
 }
 
-/// A pending RLIMIT_NPROC charge for a task being created: uncharged on
-/// drop unless `keep` hands it to the created task
+/// A pending RLIMIT_NPROC charge for a task being created (Linux
+/// copy_creds' inc_rlimit_ucounts): uncharged on drop unless `keep`
+/// hands it to the created task
 pub struct NprocCharge {
-    pub uid: Uid,
-    /// Tasks charged to `uid`, this one included
-    pub count: u64,
+    pub ucounts: UcountsRef,
     armed: bool,
 }
 
 impl NprocCharge {
-    pub fn new(uid: Uid) -> Self {
+    pub fn new(ucounts: UcountsRef) -> Self {
+        ucounts.inc(Ucount::Nproc, 1);
         Self {
-            uid,
-            count: nproc_charge(uid),
+            ucounts,
             armed: true,
         }
     }
@@ -2754,25 +2399,16 @@ impl NprocCharge {
 impl Drop for NprocCharge {
     fn drop(&mut self) {
         if self.armed {
-            nproc_uncharge(self.uid);
+            self.ucounts.dec(Ucount::Nproc, 1);
         }
     }
 }
 
-/// The current task's real uid changes from `old` to `new` (Linux
-/// commit_creds): move its charge
-pub fn nproc_move(old: Uid, new: Uid) {
-    if old != new {
-        nproc_charge(new);
-        nproc_uncharge(old);
-    }
-}
-
 /// Linux set_user / flag_nproc_exceeded: a task whose real uid becomes
-/// `new` is flagged if that user is already over RLIMIT_NPROC (root's
+/// `new`'s is flagged if that user is already over RLIMIT_NPROC (root's
 /// user never is); the flag is cleared otherwise
-fn flag_nproc_exceeded(new: Uid) {
-    let over = new != 0 && nproc_overlimit(nproc_count(new));
+fn flag_nproc_exceeded(new: &Cred) {
+    let over = new.uid != 0 && nproc_overlimit(&new.ucounts);
     let me = percpu::current();
     let table = percpu::TASKLIST.read();
     if let Some(t) = table.view(&me) {
@@ -3030,7 +2666,7 @@ pub fn set_set_child_tid(t: &Task, addr: u64) {
 /// cgroup directory, ENOENT for a removed one
 /// (css_tryget_online_from_dir)
 pub fn cgroup_from_fd(fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
-    use crate::cgroup::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
+    use crate::cgroup::cgroupfs::CgroupfsInodeData;
     let file = percpu::current()
         .files()
         .and_then(|t| t.lock().get(fd))
@@ -3039,16 +2675,27 @@ pub fn cgroup_from_fd(fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
         .get_inode()
         .and_then(|i| i.get_private())
         .ok_or(KernelError::BadFd)?;
-    let wrapper = private
+    let data = private
         .as_any()
-        .downcast_ref::<CgroupfsInodeWrapper>()
+        .downcast_ref::<CgroupfsInodeData>()
         .ok_or(KernelError::BadFd)?;
-    let data = wrapper.0.read();
-    let CgroupfsInodeData::Directory { cgroup } = &*data else {
+    let CgroupfsInodeData::Directory { cgroup } = data else {
         return Err(KernelError::BadFd);
     };
     cgroup
         .upgrade()
         .filter(|c| !c.is_dead())
         .ok_or(KernelError::NotFound)
+}
+
+/// A task freed while still on a cgroup's task list (it never ran its
+/// exit) leaves it first, so the list never names freed memory
+impl Drop for Task {
+    fn drop(&mut self) {
+        if self.cg_node.is_linked()
+            && let Some(cg) = self.cgroup.get_mut().take()
+        {
+            cg.remove_task(self);
+        }
+    }
 }

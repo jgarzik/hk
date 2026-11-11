@@ -23,12 +23,19 @@
 //! while it is set, so the next allocation of that layout on this CPU
 //! is `Arc::new`'s. Taking it turns preemption back on: `new_cyclic`
 //! allocates before calling its closure, which may then sleep.
+//!
+//! The heap takes no flags: an allocation is GFP_KERNEL unless the call
+//! names another GFP ([`with_gfp`], [`try_box_gfp`], [`try_arc_gfp`];
+//! Rust-for-Linux `KBox::new(x, GFP_ATOMIC)`). Only a site where Linux
+//! itself allocates GFP_ATOMIC or GFP_NOWAIT in atomic context names
+//! one; an unnamed allocation there is listed by lockdep's might_alloc.
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::Relaxed};
 
+use crate::mm::page_alloc::Gfp;
 use crate::util::error::KernelError;
 
 /// One CPU's reserved block: its address, size and alignment
@@ -43,6 +50,58 @@ static RESERVE: crate::cpu::PerCpu<Reserve> = crate::percpu!(Reserve {
     size: AtomicUsize::new(0),
     align: AtomicUsize::new(0),
 });
+
+/// This CPU's named heap GFP ([`with_gfp`]): 0 for none, else
+/// `NAMED | interrupt depth << 32 | gfp`
+static GFP_CX: crate::cpu::PerCpu<core::sync::atomic::AtomicU64> =
+    crate::percpu!(core::sync::atomic::AtomicU64::new(0));
+
+/// A [`GFP_CX`] value is set
+const NAMED: u64 = 1 << 63;
+
+/// Run `f` with `gfp` named for its heap allocations (Linux passes the
+/// GFP to each call: GFP_ATOMIC, GFP_NOWAIT). A GFP that may sleep
+/// (RECLAIM) names nothing: that is the default. Otherwise preemption
+/// is off for `f` (the section is atomic, as a Linux GFP_ATOMIC caller
+/// is), the name is this CPU's, and an interrupt arriving meanwhile does
+/// not see it. Scopes nest, the inner one winning. `f` allocates only
+/// through fallible calls (`try_*`): an infallible one would panic
+/// where the GFP fails.
+pub fn with_gfp<R>(gfp: Gfp, f: impl FnOnce() -> R) -> R {
+    use crate::arch::{CurrentArch, PerCpuOps};
+    if gfp.has(Gfp::RECLAIM) || cfg!(test) || crate::cpu::try_this_id().is_none() {
+        return f();
+    }
+    crate::arch::preempt_disable();
+    let cx = GFP_CX.this();
+    let depth = u64::from(CurrentArch::interrupt_depth());
+    let old = cx.swap(NAMED | depth << 32 | u64::from(gfp.0), Relaxed);
+    let r = f();
+    cx.store(old, Relaxed);
+    crate::arch::preempt_enable();
+    r
+}
+
+/// The GFP named by a [`with_gfp`] around this allocation, if any
+pub fn named_gfp() -> Option<Gfp> {
+    use crate::arch::{CurrentArch, PerCpuOps};
+    let cx = GFP_CX.get(crate::cpu::try_this_id()?).load(Relaxed);
+    let depth = u64::from(CurrentArch::interrupt_depth());
+    if cx & NAMED == 0 || (cx >> 32) & 0x7fff_ffff != depth {
+        return None;
+    }
+    Some(Gfp(cx as u32))
+}
+
+/// [`try_box`] with `gfp` named (Rust-for-Linux `KBox::new(v, gfp)`)
+pub fn try_box_gfp<T>(v: T, gfp: Gfp) -> Result<Box<T>, KernelError> {
+    with_gfp(gfp, || try_box(v))
+}
+
+/// [`try_arc`] with `gfp` named (Rust-for-Linux `Arc::new(v, gfp)`)
+pub fn try_arc_gfp<T>(v: T, gfp: Gfp) -> Result<Arc<T>, KernelError> {
+    with_gfp(gfp, || try_arc(v))
+}
 
 /// The block std's `Arc::new` allocates for a `T` (`ArcInner<T>`)
 pub fn arc_layout<T>() -> Layout {
@@ -80,6 +139,15 @@ pub fn try_box<T>(v: T) -> Result<Box<T>, KernelError> {
 pub fn try_arc<T>(v: T) -> Result<Arc<T>, KernelError> {
     #[expect(clippy::disallowed_methods)]
     reserved(arc_layout::<T>(), || Arc::new(v))
+}
+
+/// `Arc::<[T]>::from(s)`, or ENOMEM (a refcounted copy of a slice:
+/// Linux's external_name)
+pub fn try_arc_slice<T: Copy>(s: &[T]) -> Result<Arc<[T]>, KernelError> {
+    let counts = Layout::new::<[AtomicUsize; 2]>();
+    let data = Layout::array::<T>(s.len()).map_err(|_| KernelError::OutOfMemory)?;
+    let (l, _) = counts.extend(data).map_err(|_| KernelError::OutOfMemory)?;
+    reserved(l.pad_to_align(), || Arc::from(s))
 }
 
 /// `Arc::new_cyclic(f)`, or ENOMEM (before `f` runs)
@@ -176,6 +244,7 @@ pub fn selftest() -> bool {
         && try_arc(7u64).is_ok()
         && try_arc([0u8; 3000]).is_ok()
         && try_arc(Big([0; 200])).is_ok()
+        && try_arc_slice(&[7u8; 61]).is_ok_and(|a| a.len() == 61 && a[60] == 7)
         && try_arc_cyclic(|w: &Weak<u32>| w.strong_count() as u32).is_ok()
         // The closure runs preemptible: it may sleep
         && try_arc_cyclic(|_: &Weak<u32>| {
@@ -184,7 +253,22 @@ pub fn selftest() -> bool {
         })
         .is_ok();
     // Nothing left over (a leftover panics in debug builds already)
-    ok && Big([1; 200]).0[0] == 1 && RESERVE.this().ptr.load(Relaxed).is_null()
+    ok && Big([1; 200]).0[0] == 1 && RESERVE.this().ptr.load(Relaxed).is_null() && gfp_selftest()
+}
+
+/// Boot check of named GFPs: nesting, the default, and a named
+/// `try_arc` (the reserve taken inside the scope)
+fn gfp_selftest() -> bool {
+    let outside = named_gfp().is_none();
+    let nested = with_gfp(Gfp::NOWAIT, || {
+        let a = named_gfp() == Some(Gfp::NOWAIT);
+        let b = with_gfp(Gfp::ATOMIC, || named_gfp() == Some(Gfp::ATOMIC));
+        let c = with_gfp(Gfp::KERNEL, || named_gfp() == Some(Gfp::NOWAIT));
+        a && b && c && named_gfp() == Some(Gfp::NOWAIT)
+    });
+    let arc = try_arc_gfp(3u32, Gfp::ATOMIC).is_ok_and(|a| *a == 3)
+        && try_box_gfp(4u16, Gfp::NOWAIT).is_ok_and(|b| *b == 4);
+    outside && nested && arc && named_gfp().is_none() && crate::arch::preempt_count() == 0
 }
 
 #[cfg(test)]
