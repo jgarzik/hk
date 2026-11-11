@@ -453,6 +453,28 @@ impl<A: Adapter> ArcList<A> {
     pub fn iter(&self) -> Iter<'_, A> {
         self.list.iter()
     }
+
+    /// Move every entry `f` picks to the tail of `to`, in order, with
+    /// its reference (Linux move_expired_inodes' list_move to the
+    /// dispatch queue)
+    pub fn move_if(&mut self, to: &mut Self, mut f: impl FnMut(&A::Item) -> bool) {
+        let mut cur = self.list.front();
+        while let Some(p) = cur {
+            // SAFETY: `p` is on this list; its successor is read before
+            // `p` may leave it
+            cur = unsafe { self.list.next(p) };
+            // SAFETY: a live entry (the list holds a reference)
+            if f(unsafe { &*p }) {
+                // SAFETY: on this list, then on no list; both lists hold
+                // one into_raw reference per entry (type invariant), so
+                // the reference moves with it
+                unsafe {
+                    self.list.remove(p);
+                    to.list.push_back(p);
+                }
+            }
+        }
+    }
 }
 
 impl<A: Adapter> Drop for ArcList<A> {
@@ -999,6 +1021,28 @@ mod tests {
         // Reinsert after removal
         l.push_back(a.clone());
         assert_eq!(vals(&l), [1]);
+    }
+
+    #[test]
+    fn move_if_keeps_order_and_references() {
+        let (mut l, mut m): (ArcList<NodeA>, ArcList<NodeA>) = (ArcList::new(), ArcList::new());
+        let nodes: Vec<_> = (1..=5).map(node).collect();
+        for n in &nodes {
+            l.push_back(n.clone());
+        }
+        m.push_back(node(9));
+        l.move_if(&mut m, |n| n.v % 2 == 1);
+        assert_eq!(
+            (vals(&l), vals(&m)),
+            (alloc::vec![2, 4], alloc::vec![9, 1, 3, 5])
+        );
+        assert!(nodes.iter().all(|n| Arc::strong_count(n) == 2));
+        l.move_if(&mut m, |_| true);
+        assert!(l.is_empty() && l.front().is_none());
+        assert_eq!(vals(&m), [9, 1, 3, 5, 2, 4]);
+        // The emptied list takes entries again
+        l.push_back(m.pop_back().unwrap());
+        assert_eq!(vals(&l), [4]);
     }
 
     #[test]

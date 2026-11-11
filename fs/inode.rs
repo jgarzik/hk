@@ -578,8 +578,13 @@ pub struct Inode {
     /// The inotify watches on it (Linux i_fsnotify_marks)
     pub fsnotify: crate::io::inotify::Marks,
 
-    /// On its superblock's dirty list (Linux I_DIRTY_PAGES; fs_writeback)
+    /// Queued on its device's writeback lists (Linux I_DIRTY_PAGES;
+    /// fs_writeback): set by `mark_inode_dirty`, cleared under the
+    /// list lock by the pass that takes it off `b_io`
     pub(crate) i_dirty: core::sync::atomic::AtomicBool,
+    /// On its device's `b_dirty` or `b_io` (Linux i_io_list, under the
+    /// wb's list_lock)
+    pub(crate) i_io_list: list::Link,
 
     /// Writers (> 0) or executions denying them (< 0) (Linux
     /// i_writecount; `get_write_access`, `deny_write_access`)
@@ -737,6 +742,7 @@ impl Inode {
             i_data: crate::mm::filemap::AddressSpace::new(),
             fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
+            i_io_list: list::Link::new(),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
             i_dio_count: AtomicU32::new(0),
@@ -797,6 +803,7 @@ impl Inode {
             i_data: crate::mm::filemap::AddressSpace::new(),
             fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
+            i_io_list: list::Link::new(),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
             i_dio_count: AtomicU32::new(0),

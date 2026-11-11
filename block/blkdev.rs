@@ -837,6 +837,7 @@ impl Disk {
     ) -> Result<Arc<Self>, KernelError> {
         let dev = DevId::new(major, first_minor);
         let bdi = bdi_register(dev);
+        let wb = bdi.clone();
         try_arc(Self {
             major,
             first_minor,
@@ -850,7 +851,7 @@ impl Disk {
             seq: DISKSEQ.fetch_add(1, Ordering::Relaxed),
             private: spin::Once::new(),
         })
-        .inspect_err(|_| bdi_unregister(dev))
+        .inspect_err(|_| bdi_unregister(&wb))
     }
 
     /// Capacity in sectors
@@ -1103,7 +1104,7 @@ pub fn disk_bdevs(disk: &Arc<Disk>) -> Vec<Arc<BlockDevice>> {
 
 /// Forget a disk's writeback state (Linux del_gendisk, with genhd)
 pub(super) fn disk_release(disk: &Disk) {
-    bdi_unregister(disk.devt());
+    bdi_unregister(&disk.bdi);
 }
 
 // ============================================================================
