@@ -1136,8 +1136,10 @@ its pid namespace that is a child subreaper
 leaves the task list at once (Linux release_task), unless traced:
 then when its tracer reaps it or exits (Linux wait_task_zombie,
 exit_ptrace).
-A group leader's `threads` (intrusive `ArcList`, link
-`Task.thread_node`, the leader included; Linux signal->thread_head)
+A group leader's `threads` (intrusive `OwnedList`, link
+`Task.thread_node` marked in `Task.thread_owner`, so a thread is
+removed or stepped from safely; the leader included; Linux
+signal->thread_head)
 lists its group: joined at insert, left at removal, handed to the
 exec'ing thread when it takes the leader's place. A process is found
 by its pid as its leader's tid (`get(pid)`); its threads through
@@ -1156,9 +1158,12 @@ session's `Pid` (`TaskInner.pgrp`/`session`, Linux signal->pids), so
 a `Pid` outlives its group even after its own task is gone; the
 `pgid`/`sid` atomics carry the numbers for lock-free getpgid/getsid.
 setpgid and setsid change every thread of the process in one write
-section (`change_pids`); fork copies the creator's under the same
-write lock that inserts the child. The old `Pid` references are
-dropped after TASKLIST; a group's `Pid` is looked up by number
+section (`change_pids`, walking the leader's `threads` list: nothing
+is allocated); fork copies the creator's under the same
+write lock that inserts the child. The old group and session `Pid`
+references are handed back and dropped after TASKLIST (Linux
+ksys_setsid's pids[] and free_pids; each thread's own old reference,
+one of those two, is dropped in the section and frees nothing); a group's `Pid` is looked up by number
 (`find_pgrp`, PIDMAP_LOCK) before TASKLIST is taken. Group 0, where
 init starts, is `INIT_STRUCT_PID` (Linux init_struct_pid, never
 hashed). kill(-pgrp), kill(0), tty ISIG, F_SETOWN and PRIO_PGRP /

@@ -865,8 +865,9 @@ pub struct Task {
     /// TASKLIST)
     pub sibling: crate::util::list::Link,
     /// Its place in its group leader's `threads` (Linux thread_node;
-    /// under TASKLIST)
+    /// under TASKLIST), and that list's mark
     pub thread_node: crate::util::list::Link,
+    thread_owner: crate::util::list::Owner,
     /// A group leader's place on its process group's `Pid.pgrp` (Linux
     /// pid_links[PIDTYPE_PGID]; under TASKLIST)
     pub pgrp_link: crate::util::list::Link,
@@ -1007,7 +1008,7 @@ pub struct TaskInner {
     /// A leader's thread group, itself included (Linux
     /// signal->thread_head; links `thread_node`), one strong reference
     /// each, until a thread leaves the task list (under TASKLIST)
-    threads: crate::util::list::ArcList<ThreadNode>,
+    threads: crate::util::list::OwnedList<ThreadNode>,
 
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
     ptrace_message: u64,
@@ -1060,7 +1061,7 @@ impl TaskInner {
             real_parent: None,
             children: crate::util::list::ArcList::new(),
             in_children: false,
-            threads: crate::util::list::ArcList::new(),
+            threads: crate::util::list::OwnedList::new(),
             ptrace_message: 0,
             ptrace_options: 0,
             ptrace_code: 0,
@@ -1226,24 +1227,9 @@ unsafe impl crate::util::list::Adapter for Sibling {
     }
 }
 
-/// The adapter of `Task.thread_node` (thread groups)
-pub struct ThreadNode;
-
-// SAFETY: offset_of! gives `thread_node`'s place in the task
-unsafe impl crate::util::list::Adapter for ThreadNode {
-    type Item = Task;
-    fn link(t: &Task) -> &crate::util::list::Link {
-        &t.thread_node
-    }
-    unsafe fn item(l: *const crate::util::list::Link) -> *const Task {
-        // SAFETY: `l` is the `thread_node` of a live task
-        unsafe {
-            l.cast::<u8>()
-                .sub(core::mem::offset_of!(Task, thread_node))
-                .cast::<Task>()
-        }
-    }
-}
+// The adapter of `Task.thread_node` (thread groups), marked in
+// `thread_owner`
+crate::owned_adapter!(pub ThreadNode, Task, thread_node, thread_owner);
 
 /// The ids a new task starts with
 pub struct TaskIds {
@@ -1650,6 +1636,7 @@ impl Task {
             tasks_link: crate::util::list::Link::new(),
             sibling: crate::util::list::Link::new(),
             thread_node: crate::util::list::Link::new(),
+            thread_owner: crate::util::list::Owner::new(),
             pgrp_link: crate::util::list::Link::new(),
             session_link: crate::util::list::Link::new(),
             inner: TableCell::new(Some(inner)),
@@ -1722,6 +1709,7 @@ impl Task {
             tasks_link: crate::util::list::Link::new(),
             sibling: crate::util::list::Link::new(),
             thread_node: crate::util::list::Link::new(),
+            thread_owner: crate::util::list::Owner::new(),
             pgrp_link: crate::util::list::Link::new(),
             session_link: crate::util::list::Link::new(),
             inner: TableCell::new(None),

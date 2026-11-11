@@ -1014,13 +1014,21 @@ impl GlobalTaskTable {
             .flatten()
     }
 
+    /// The first thread of process `pid` (its leader's thread list)
+    pub fn first_thread(&self, pid: Pid) -> Option<TaskRef> {
+        self.get(pid)?.fields().threads.front()
+    }
+
+    /// The thread after `t` in process `pid`'s list (Linux next_thread);
+    /// None at the end or if `t` is not on it
+    pub fn next_thread(&self, pid: Pid, t: &Task) -> Option<TaskRef> {
+        self.get(pid)?.fields().threads.next(t)
+    }
+
     /// Take `t` off its leader's thread group
     fn unlink_thread(&mut self, t: &Task) {
         let Some(l) = self.task(t.pid) else { return };
-        let li = self.inner_mut_of(&l);
-        if li.threads.iter().any(|x| core::ptr::eq(x, t)) {
-            drop(unsafe { li.threads.remove(t) });
-        }
+        drop(self.inner_mut_of(&l).threads.remove(t));
     }
 
     /// Remove task `tid`; the caller drops it after unlocking (nothing
@@ -1147,33 +1155,57 @@ impl GlobalTaskTable {
 
     /// Move process `pid` (every thread; its leader on the lists) to
     /// group `pg` and, if given, session `s` (Linux change_pid); the
-    /// references it held go to `old`, dropped after TASKLIST
+    /// group and session it left come back, for the caller to drop
+    /// after TASKLIST (Linux ksys_setsid's pids[] and free_pids).
+    /// Nothing is allocated: the threads are walked on the leader's
+    /// list, and each thread's old reference is one of the two returned
+    /// (a process's threads share them), so dropping it here frees
+    /// nothing.
+    #[must_use]
     fn change_pids(
         &mut self,
         pid: Pid,
         pg: &Arc<crate::task::pid::Pid>,
         s: Option<&Arc<crate::task::pid::Pid>>,
-        old: &mut Vec<Arc<crate::task::pid::Pid>>,
-    ) {
-        let Some(l) = self.task(pid) else { return };
+    ) -> [Option<Arc<crate::task::pid::Pid>>; 2] {
+        let Some(l) = self.task(pid) else {
+            return [None, None];
+        };
         let before = self.inner_mut_of(&l).pgrp.clone();
         let before_s = self.inner_mut_of(&l).session.clone();
         self.detach_pids(&l);
-        let threads: Vec<TaskRef> = self.threads(pid).map(|t| task_ref(t.task)).collect();
-        for t in &threads {
-            let ti = self.inner_mut_of(t);
-            old.extend(ti.pgrp.replace(pg.clone()));
+        let mut cur = self.inner_mut_of(&l).threads.front();
+        while let Some(t) = cur {
+            let ti = self.inner_mut_of(&t);
+            let old = ti.pgrp.replace(pg.clone());
+            debug_assert!(
+                Self::pid_ptr(&old) == Self::pid_ptr(&before),
+                "threads share a group"
+            );
+            drop(old);
             t.pgid.store(Pid::from(pg.nr()), Ordering::Relaxed);
             if let Some(s) = s {
-                old.extend(ti.session.replace(s.clone()));
+                let old = ti.session.replace(s.clone());
+                debug_assert!(
+                    Self::pid_ptr(&old) == Self::pid_ptr(&before_s),
+                    "threads share a session"
+                );
+                drop(old);
                 t.sid.store(Pid::from(s.nr()), Ordering::Relaxed);
             }
+            cur = self.inner_mut_of(&l).threads.next(&t);
         }
         self.attach_pids(&l);
         // The group or session it left may be gone (setpgid, setsid)
-        for p in [before, before_s].iter().flatten() {
+        for p in [&before, &before_s].into_iter().flatten() {
             self.release_unused(p);
         }
+        [before, before_s]
+    }
+
+    /// The `Pid` a reference names, for identity checks
+    fn pid_ptr(p: &Option<Arc<crate::task::pid::Pid>>) -> *const crate::task::pid::Pid {
+        p.as_ref().map_or(core::ptr::null(), Arc::as_ptr)
     }
 
     /// Number of tasks, zombies included
@@ -1956,13 +1988,13 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     // The thread group moves to the caller: it is the only live thread
     // (Linux de_thread leaves only the exec'ing thread); the old list's
     // references go after TASKLIST
-    let mut old_threads = crate::util::list::ArcList::new();
+    let mut old_threads = crate::util::list::OwnedList::new();
     if let Some(l) = table.task(ltid) {
         let li = table.inner_mut_of(&l);
         core::mem::swap(&mut li.threads, &mut old_threads);
     }
-    while let Some(t) = old_threads.pop_front() {
-        gone.push(t);
+    while let Some(t) = old_threads.front() {
+        gone.extend(old_threads.remove(&t));
     }
     // Their numbers go back only once the caller holds the leader's
     // pid and heads its group and session (Linux de_thread:
@@ -4971,11 +5003,10 @@ pub fn set_task_pgid(
 ) -> KernelResult<()> {
     // Found before TASKLIST (the pid hash's lock is not nested in it)
     let target = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, new_pgid);
-    let mut old = Vec::new();
     let mut table = TASKLIST.write();
     setpgid_who(&table, caller_pid, target_pid, caller_sid)?;
     let pg = setpgid_target(&table, target_pid, new_pgid, target.as_ref(), caller_sid)?;
-    table.change_pids(target_pid, &pg, None, &mut old);
+    let old = table.change_pids(target_pid, &pg, None);
     drop(table);
     drop(old);
     Ok(())
@@ -5041,7 +5072,6 @@ fn setpgid_target(
 /// Returns the new session ID; EPERM if a session leader already, or a process group with the
 ///   caller's pid as id exists
 pub fn create_session(caller_pid: Pid) -> KernelResult<Pid> {
-    let mut old = Vec::new();
     let mut table = TASKLIST.write();
     let pid = {
         let l = table.get(caller_pid).ok_or(KernelError::NoProcess)?;
@@ -5054,7 +5084,7 @@ pub fn create_session(caller_pid: Pid) -> KernelResult<Pid> {
         pid
     };
     // The whole process: pid becomes sid and pgid
-    table.change_pids(caller_pid, &pid, Some(&pid), &mut old);
+    let old = table.change_pids(caller_pid, &pid, Some(&pid));
     drop(table);
     drop(old);
     Ok(caller_pid)
