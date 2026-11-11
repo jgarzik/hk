@@ -31,9 +31,10 @@ pub use types::{KeyType, KeyringKeyType, UserKeyType};
 
 use crate::sync::spin::RwLock;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_cyclic_nofail, try_arc_cyclic};
+use crate::util::rbtree::{RbTree, RbTreeNodeReservation};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 
 // =============================================================================
 // Special keyring IDs (negative values, Linux ABI compatible)
@@ -111,17 +112,44 @@ pub const KEYCTL_GET_PERSISTENT: i32 = 22;
 // Global key database
 // =============================================================================
 
-/// Every live key by serial number (Linux key_serial_tree). Entries are
-/// weak: links and task/user keyring slots own keys, and a key removes
-/// its entry when it is freed. Nothing drops an `Arc<Key>` under this
-/// lock (lookups upgrade after releasing it), so a key's Drop may take it.
-static KEY_DATABASE: RwLock<BTreeMap<KeySerial, Weak<Key>>> = RwLock::new(BTreeMap::new());
+/// A key's entry in the serial tree (Linux key->serial_node): it holds
+/// the key's serial from the key's creation, and makes the key findable
+/// once registered (instantiated)
+struct KeyEntry {
+    key: Weak<Key>,
+    registered: bool,
+}
 
-/// Reserve a new key serial number (Linux key_alloc_serial): a random
-/// start, never below 3, moved up past serials in use (wrapping back to
-/// 3). It is taken under the database lock by a placeholder entry, which
-/// `register_key` replaces or the key's Drop removes.
-pub fn alloc_serial() -> KeySerial {
+/// Every key by serial number (Linux key_serial_tree, under
+/// key_serial_lock). A key's node is allocated with the key, before the
+/// lock (`alloc_key`), so nothing allocates under it. Entries are weak:
+/// links and task/user keyring slots own keys, and only a key removes its
+/// own entry (invalidated, or freed). Nothing drops an `Arc<Key>` under
+/// this lock (lookups upgrade after releasing it), so a key's Drop may
+/// take it.
+static KEY_DATABASE: RwLock<RbTree<KeySerial, KeyEntry>> = RwLock::new(RbTree::new());
+
+type SerialNode = RbTreeNodeReservation<KeySerial, KeyEntry>;
+
+/// A new key, `make` given its serial (Linux key_alloc): the key and its
+/// tree node are allocated first, then the serial is taken under the
+/// lock; ENOMEM
+pub fn alloc_key(make: impl FnOnce(KeySerial) -> Key) -> Result<Arc<Key>, KernelError> {
+    let node = SerialNode::new()?;
+    try_arc_cyclic(|key| make(alloc_serial(key, node)))
+}
+
+/// `alloc_key` where a failure cannot be reported (`kalloc::*_nofail`)
+pub fn alloc_key_nofail(make: impl FnOnce(KeySerial) -> Key) -> Arc<Key> {
+    let node = SerialNode::new_nofail();
+    arc_cyclic_nofail(|key| make(alloc_serial(key, node)))
+}
+
+/// Reserve a serial number for `key`, being built (Linux
+/// key_alloc_serial): a random start, never below 3, moved up past
+/// serials in use (wrapping back to 3). `node` takes it in the tree,
+/// unfindable until `register_key`; the key's Drop removes it.
+fn alloc_serial(key: &Weak<Key>, node: SerialNode) -> KeySerial {
     let mut serial = loop {
         // Negative serials are not permitted (Linux: random >> 1)
         let r = (crate::random::get_random_u32() >> 1) as KeySerial;
@@ -129,59 +157,81 @@ pub fn alloc_serial() -> KeySerial {
             break r;
         }
     };
+    let entry = KeyEntry {
+        key: key.clone(),
+        registered: false,
+    };
     let mut db = KEY_DATABASE.write();
-    while db.contains_key(&serial) {
+    while db.get(&serial).is_some() {
         serial = serial.checked_add(1).unwrap_or(3);
     }
-    db.insert(serial, Weak::new());
+    let old = db.insert(node.into_node(serial, entry));
+    drop(db);
+    debug_assert!(old.is_none());
     serial
 }
 
-/// Register a key in the global database
+/// Make a new key findable by its serial
 pub fn register_key(key: &Arc<Key>) {
-    KEY_DATABASE.write().insert(key.serial, Arc::downgrade(key));
+    let mut db = KEY_DATABASE.write();
+    let e = db
+        .get_mut(&key.serial)
+        .filter(|e| core::ptr::eq(e.key.as_ptr(), Arc::as_ptr(key)));
+    debug_assert!(e.is_some(), "register_key: not made by alloc_key");
+    if let Some(e) = e {
+        e.registered = true;
+    }
 }
 
 /// Look up a live key by serial number
 pub fn lookup_key(serial: KeySerial) -> Option<Arc<Key>> {
-    let w = KEY_DATABASE.read().get(&serial).cloned()?;
+    let w = KEY_DATABASE
+        .read()
+        .get(&serial)
+        .filter(|e| e.registered)
+        .map(|e| e.key.clone())?;
     w.upgrade()
 }
 
-/// Take a key out of the database (invalidate): lookups no longer find
-/// it; it is freed when its links and references go
-pub fn remove_key(serial: KeySerial) {
-    let w = KEY_DATABASE.write().remove(&serial);
-    drop(w);
-}
-
-/// A freed key (`key`, its `Drop`) leaves the database, unless the
-/// serial names another entry by then
-fn unregister_key(serial: KeySerial, key: *const Key) {
+/// Take `key` out of the database (invalidate, or its Drop): lookups no
+/// longer find it and its serial may be reused; it is freed when its
+/// links and references go. Only its own entry: once it is out, the
+/// serial may be another key's.
+pub fn remove_key(key: &Key) {
     let mut db = KEY_DATABASE.write();
-    // Its own entry, or the placeholder of a key never registered
-    if db
-        .get(&serial)
-        .is_some_and(|w| core::ptr::eq(w.as_ptr(), key) || w.ptr_eq(&Weak::new()))
-    {
-        db.remove(&serial);
-    }
+    let own = db
+        .get(&key.serial)
+        .is_some_and(|e| core::ptr::eq(e.key.as_ptr(), key));
+    let node = if own {
+        db.remove_node(&key.serial)
+    } else {
+        None
+    };
+    drop(db);
+    drop(node);
 }
 
-/// Every live keyring (for invalidation's unlinking)
-fn all_keyrings() -> Vec<Arc<Key>> {
-    let all: Vec<Weak<Key>> = KEY_DATABASE.read().values().cloned().collect();
-    all.iter()
-        .filter_map(Weak::upgrade)
-        .filter(|k| k.is_keyring())
-        .collect()
+/// The first registered live key with a serial of `from` or above
+fn next_key(from: KeySerial) -> Option<Arc<Key>> {
+    let db = KEY_DATABASE.read();
+    db.range_from(&from)
+        .find_map(|(_, e)| e.registered.then(|| e.key.upgrade()).flatten())
 }
 
 /// Unlink `serial` from every keyring (Linux key_gc_keyring for an
-/// invalidated key)
+/// invalidated key): the tree is walked one key per lock hold, nothing
+/// collected (Linux key_garbage_collector drops key_serial_lock around
+/// keyring_gc)
 pub fn unlink_everywhere(serial: KeySerial) {
-    for r in all_keyrings() {
-        let _ = r.keyring_remove(serial);
+    let mut from = 0;
+    while let Some(k) = next_key(from) {
+        if k.is_keyring() {
+            let _ = k.keyring_remove(serial);
+        }
+        match k.serial.checked_add(1) {
+            Some(s) => from = s,
+            None => break,
+        }
     }
 }
 

@@ -8,12 +8,11 @@
 use crate::task::percpu;
 use crate::uaccess::{UserPtr, UserSlice, strncpy_from_user_str};
 use crate::util::error::{KernelError, KernelResult};
-use crate::util::kalloc::try_arc;
 
 use super::key::{KEY_DEFAULT_PERM, Key};
 use super::keyring::{keyring_link, resolve_special_keyring, search_process_keyrings};
 use super::types::get_key_type;
-use super::{alloc_serial, register_key};
+use super::{alloc_key, register_key};
 
 /// Maximum type name length
 pub(super) const MAX_TYPE_LEN: usize = 256;
@@ -72,20 +71,23 @@ pub fn sys_add_key(
     let charge = description.len() + 1 + payload.len();
     super::key_user_charge(cred.fsuid, charge)?;
 
-    let serial = alloc_serial();
     // Owned by the fsuid and fsgid (Linux key_create_or_update ->
-    // key_alloc)
-    let key = Key::new(
-        serial,
-        key_type.clone(),
-        description,
-        cred.fsuid,
-        cred.fsgid,
-        KEY_DEFAULT_PERM,
-    );
-    // Record the charge so a later failure (or invalidate) returns it
-    key.set_quota(cred.fsuid, charge);
-    let key = try_arc(key)?;
+    // key_alloc); ENOMEM returns the charge
+    let key = alloc_key(|serial| {
+        let key = Key::new(
+            serial,
+            key_type.clone(),
+            description,
+            cred.fsuid,
+            cred.fsgid,
+            KEY_DEFAULT_PERM,
+        );
+        // Record the charge so a later failure (or invalidate) returns it
+        key.set_quota(cred.fsuid, charge);
+        key
+    })
+    .inspect_err(|_| super::key_user_uncharge(cred.fsuid, charge))?;
+    let serial = key.serial;
     key_type.instantiate(&key, &payload)?;
     register_key(&key);
     // Link to destination keyring; on failure the key is freed here

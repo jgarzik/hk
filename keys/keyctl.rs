@@ -251,7 +251,7 @@ pub fn keyctl_invalidate(key_serial: i32) -> KernelResult<()> {
     key.invalidate();
     // Lookups no longer find it, and no keyring links it: it is freed
     // with its last reference (Linux: the key GC unlinks invalidated keys)
-    remove_key(key_serial);
+    remove_key(&key);
     crate::keys::unlink_everywhere(key_serial);
     Ok(())
 }

@@ -10,7 +10,6 @@
 //! functions to resolve special keyring IDs to actual key serials.
 
 use crate::sync::spin::RwLock;
-use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -18,13 +17,13 @@ use alloc::sync::Arc;
 use crate::task::Task;
 use crate::util::error::KernelError;
 
-use super::key::{KEYRING_DEFAULT_PERM, Key};
+use super::key::{KEYRING_DEFAULT_PERM, Key, KeySerial};
 use super::types::keyring_key_type;
 use super::{
     KEY_SPEC_PROCESS_KEYRING, KEY_SPEC_SESSION_KEYRING, KEY_SPEC_THREAD_KEYRING,
     KEY_SPEC_USER_KEYRING, KEY_SPEC_USER_SESSION_KEYRING,
 };
-use super::{alloc_serial, lookup_key, register_key};
+use super::{alloc_key, alloc_key_nofail, lookup_key, register_key};
 
 /// Per-task keyrings (Linux cred->thread/process/session_keyring): the
 /// task holds a reference to each
@@ -82,7 +81,7 @@ pub fn fork_keyrings(parent: &TaskKeyrings, thread: bool, uid: u32, gid: u32) ->
         process_keyring: parent.process_keyring.clone().filter(|_| thread),
         // Linux copy_creds can fail here; do_clone cannot yet
         thread_keyring: (thread && parent.thread_keyring.is_some()).then(|| {
-            let k = arc_nofail(keyring_key("_tid", uid, gid));
+            let k = alloc_key_nofail(|s| keyring_key(s, "_tid", uid, gid));
             publish_keyring(&k);
             k
         }),
@@ -100,15 +99,15 @@ pub fn exec_keyrings(t: &Task) {
 
 /// Create a new keyring with the given description
 pub fn create_keyring(description: &str, uid: u32, gid: u32) -> Result<Arc<Key>, KernelError> {
-    let key = try_arc(keyring_key(description, uid, gid))?;
+    let key = alloc_key(|s| keyring_key(s, description, uid, gid))?;
     publish_keyring(&key);
     Ok(key)
 }
 
-/// A new keyring, not yet registered
-fn keyring_key(description: &str, uid: u32, gid: u32) -> Key {
+/// A new keyring with `serial`, not yet registered
+fn keyring_key(serial: KeySerial, description: &str, uid: u32, gid: u32) -> Key {
     Key::new(
-        alloc_serial(),
+        serial,
         keyring_key_type(),
         String::from(description),
         uid,

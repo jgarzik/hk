@@ -601,7 +601,7 @@ impl Drop for Key {
                 stack.append(key.keyring_keys.get_mut());
             }
         }
-        super::unregister_key(self.serial, core::ptr::from_ref::<Key>(self));
+        super::remove_key(self);
         let bytes = self.quota_bytes.load(Ordering::Relaxed);
         if bytes > 0 {
             super::key_user_uncharge(self.quota_uid.load(Ordering::Relaxed), bytes);
