@@ -29,7 +29,6 @@ use core::sync::atomic::Ordering;
 use super::file::{File, FileOps, RwFlags, generic_write_sync, seek};
 use super::iov_iter::{IovDest, IovSource};
 use crate::block::dio;
-use crate::util::kalloc::arc_nofail;
 
 /// Block device ioctls (Linux include/uapi/linux/fs.h)
 pub mod ioc {
@@ -335,16 +334,20 @@ struct BdevAops;
 /// The bdev inode's device: its own, never another one registered
 /// under the same number later; EIO once it is removed
 pub(crate) fn inode_bdev(inode: &Inode) -> Result<Arc<BlockDevice>, KernelError> {
-    let p = inode.get_private().ok_or(KernelError::Io)?;
-    let b = p
-        .as_any()
-        .downcast_ref::<BdevOwner>()
-        .and_then(|o| o.0.upgrade())
-        .ok_or(KernelError::Io)?;
+    let b = inode_owner(inode).ok_or(KernelError::Io)?;
     if b.is_dead() {
         return Err(KernelError::Io);
     }
     Ok(b)
+}
+
+/// The block device whose inode `inode` is (Linux I_BDEV), removed or
+/// not; None for another inode or one whose device is gone
+pub(crate) fn inode_owner(inode: &Inode) -> Option<Arc<BlockDevice>> {
+    let p = inode.get_private()?;
+    p.as_any()
+        .downcast_ref::<BdevOwner>()
+        .and_then(|o| o.0.upgrade())
 }
 
 /// A bdev inode's back reference to its device (set at registration)
@@ -473,21 +476,24 @@ impl Aops for BdevAops {
 static BDEV_AOPS: BdevAops = BdevAops;
 
 /// The bdev pseudo filesystem's inode of device `dev` with `size`
-/// bytes (Linux bdev_alloc): unhashed, no superblock
-pub fn bdev_inode(dev: DevId, size: u64) -> Arc<Inode> {
-    let inode = arc_nofail(Inode::new_device(
-        0,
+/// bytes (Linux bdev_alloc: new_inode on blockdev_superblock, numbered
+/// by the device), on the superblock's `s_inodes`, unhashed until the
+/// device is added; ENOMEM
+pub fn bdev_inode(dev: DevId, size: u64) -> Result<Arc<Inode>, KernelError> {
+    let sb = crate::fs::pseudo::BDEV.sb()?;
+    let inode = Inode::alloc(Inode::new_device(
+        u64::from(dev.encode()),
         InodeMode::blockdev(0o600),
         0,
         0,
         dev,
         Timespec::ZERO,
-        alloc::sync::Weak::new(),
+        Arc::downgrade(&sb),
         &BDEV_INODE_OPS,
-    ));
+    ))?;
     inode.set_size(size);
     inode.i_data.set_aops(&BDEV_AOPS, Some(&inode));
-    inode
+    Ok(inode)
 }
 
 /// The bdev inode's operations: its page cache maps (mmap of the node)

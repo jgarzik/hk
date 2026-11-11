@@ -1,10 +1,11 @@
-//! Pseudo filesystems (Linux init_pseudo + kern_mount): pipefs, sockfs,
-//! anon_inodefs and nsfs
+//! Pseudo filesystems (Linux init_pseudo + kern_mount): bdev, pipefs,
+//! sockfs, anon_inodefs and nsfs
 //!
 //! Each is one internal superblock and mount, in no mount namespace
 //! (mount(2) cannot name them, Linux SB_NOUSER), made at boot in Linux's
-//! order (nsfs in start_kernel, sockfs a core initcall, pipefs and
-//! anon_inodefs fs initcalls). A pipe, socket, anonymous-inode or
+//! order (bdev and nsfs in start_kernel, sockfs a core initcall, pipefs
+//! and anon_inodefs fs initcalls). The bdev filesystem holds the block
+//! devices' inodes (Linux blockdev_superblock: `block::blkdev`). A pipe, socket, anonymous-inode or
 //! namespace file's path is that mount and a dentry outside any tree
 //! (Linux d_alloc_pseudo), so a /proc/<pid>/fd link jumps to it and an
 //! open of it goes by its inode's rules: a pipe joins the pipe (Linux
@@ -29,6 +30,7 @@ const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const SOCKFS_MAGIC: u64 = 0x534F_434B;
 const ANON_INODE_FS_MAGIC: u64 = 0x0904_1934;
 const NSFS_MAGIC: u64 = 0x6e73_6673;
+const BDEVFS_MAGIC: u64 = 0x6264_6576;
 
 /// One pseudo filesystem: its type, statfs magic and kernel mount
 pub struct Pseudo {
@@ -110,8 +112,9 @@ pub static PIPEFS: Pseudo = pseudo("pipefs", PIPEFS_MAGIC, &NO_OPEN);
 pub static SOCKFS: Pseudo = pseudo("sockfs", SOCKFS_MAGIC, &NO_OPEN);
 pub static ANON_INODEFS: Pseudo = pseudo("anon_inodefs", ANON_INODE_FS_MAGIC, &NO_OPEN);
 pub static NSFS: Pseudo = pseudo("nsfs", NSFS_MAGIC, &NS_FILE_OPS);
+pub static BDEV: Pseudo = pseudo("bdev", BDEVFS_MAGIC, &NO_OPEN);
 
-const ALL: [&Pseudo; 4] = [&PIPEFS, &SOCKFS, &ANON_INODEFS, &NSFS];
+const ALL: [&Pseudo; 5] = [&PIPEFS, &SOCKFS, &ANON_INODEFS, &NSFS, &BDEV];
 
 /// The pseudo filesystem of type `ty`
 fn of_type(ty: &FileSystemType) -> Option<&'static Pseudo> {
@@ -152,6 +155,11 @@ impl Pseudo {
     /// Its mount (ENODEV before boot made it)
     pub fn mnt(&self) -> Result<Arc<Mount>, KernelError> {
         self.mnt.get().cloned().ok_or(KernelError::NoDevice)
+    }
+
+    /// Its type
+    pub fn fs_type(&self) -> &FileSystemType {
+        &self.ty
     }
 
     /// Its superblock, for the inodes made on it

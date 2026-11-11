@@ -561,8 +561,8 @@ SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fown->lock):
     its callers hold no spin lock (no Inode.i_pipe, no Pipe.inner)
 
 Block locks (3.10 Block Device Subsystem):
-    Disk.open_mutex (sleeping) → devtmpfs root i_rwsem → BLKDEV_REGISTRY,
-    MAJORS; I/O sleeps under open_mutex only
+    Disk.open_mutex (sleeping) → devtmpfs root i_rwsem, INODE_HASH_LOCK
+    (bdev_add/bdev_del), MAJORS; I/O sleeps under open_mutex only
     blk-mq software queue, hardware queue (IrqSpinlock leaves; the
     hardware queue also from the driver ISR, under its line's IrqDesc.lock;
     a poll queue is a hardware queue no interrupt reaches: taken by the
@@ -2209,7 +2209,8 @@ pub struct Inode {
 
 **Inode cache** (`fs/icache.rs`, Linux inode_hashtable): vfat inodes
 (by directory-entry position) are hashed so each on-disk object has one
-`Inode`. A RAM-sized table of buckets, each a `WeakList` through the
+`Inode`, and block devices' inodes on the bdev superblock by device
+number, so a device is found by its number (3.10). A RAM-sized table of buckets, each a `WeakList` through the
 inode's embedded `i_hash_node` (one `Weak` per entry, nothing
 allocated), all under one `INODE_HASH_LOCK` (spin Mutex, Linux
 inode_hash_lock, thread context): under it only the bucket links and
@@ -3957,8 +3958,7 @@ thread context, the driver completes it from its interrupt handler and
 
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
-| `Disk.open_mutex` | `sync::Mutex<OpenState>` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock; holds the count of open partitions (Linux open_partitions, plain), and each `BlockDevice.openers` (an atomic on the device, as Linux bd_openers) and soft block size (BLKBSZSET) change only under it: block device open/release (files, and the kernel opens of a mount (`SuperBlock.s_bdev`) and of active swap: `BdevHandle`), partition scans (and rescans, BLKRRPART), disk removal (`del_gendisk` drops its devices under it); I/O, `BLKDEV_REGISTRY`, `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
-| `BLKDEV_REGISTRY` | spin `RwLock` (dev_t -> block device; global like Linux's bdev map) | thread only | leaf |
+| `Disk.open_mutex` | `sync::Mutex<OpenState>` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock; holds the count of open partitions (Linux open_partitions, plain) and the disk's `part_tbl` (its block devices by partition number, one slot per minor, each a reference; Linux disk->part_tbl), and each `BlockDevice.openers` (an atomic on the device, as Linux bd_openers) and soft block size (BLKBSZSET) change only under it: block device open/release (files, and the kernel opens of a mount (`SuperBlock.s_bdev`) and of active swap: `BdevHandle`), partition scans (and rescans, BLKRRPART), disk removal (`del_gendisk` drops its devices under it); I/O, `INODE_HASH_LOCK` (`bdev_add` hashes a device's inode, `bdev_del` unhashes it), `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
 | `MAJORS` | sleeping `sync::Mutex` (block majors, register_blkdev; Linux major_names_lock) | thread only | leaf |
 | blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) and hardirq (a FUA write's post-flush, sent from the write's completion after the hardware queue lock is dropped) | leaf: never taken with the hardware queue lock held; in the ISR it nests under the line's `IrqDesc.lock` (IrqDesc.lock -> ctx lock; nothing allocates under it: the flush is preallocated with its post-flush queue, and the completions free bios and the `FlushSeq` to the heap under `IrqDesc.lock` only, outside every queue lock); its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
 | Post-flush queue (`RequestQueue.fqs[h]`, `block/blkdev.rs`, one per hardware queue; Linux blk_flush_queue->mq_flush_lock) | `IrqSpinlock` | thread (a FUA write's submission) and hardirq (its data's and the shared flush's completions) | leaf: writes waiting for a flush, the writes the flush in flight serves, the FUA data in flight and the preallocated flush; the flush is sent and the writes are ended after it is dropped |
@@ -3972,6 +3972,22 @@ thread context, the driver completes it from its interrupt handler and
 
 Rules:
 
+- **Finding block devices (Linux block/bdev.c):** each block device's
+  inode (`bd_inode`) lives on the bdev pseudo superblock
+  (`fs::pseudo::BDEV`, Linux blockdev_superblock, made after the mount
+  tree as Linux's bdev_cache_init), on its `s_inodes` from creation
+  (`BlockDevice::new`, Linux bdev_alloc). `bdev_add` puts the device
+  in its disk's `part_tbl` and hashes the inode by device number;
+  `get_blkdev` (Linux blkdev_get_no_open) is an `ilookup5` of that
+  number (`INODE_HASH_LOCK`, the inode's `rdev` compared under it), the
+  device then reached from the inode's `BdevOwner`; `bdev_del` takes it
+  out of `part_tbl` and the hash, so lookups miss a removed device that
+  open files still hold. sync(2) (`sync_bdevs`), meminfo's Buffers
+  (`nr_blockdev_pages`), reclaim and /proc/partitions walk the bdev
+  superblock's `s_inodes` (`for_each_sb_inode`: one inode per
+  `INODE_SB_LIST_LOCK` hold, the work done with no lock);
+  /proc/partitions gathers references that way and sorts and formats
+  them with no lock held. No global map of devices.
 - **Disk removal (`del_gendisk`, Linux):** under `open_mutex` every
   hardware queue is marked dying (nothing reaches `queue_rq` after,
   every request not yet started, on a software queue or the dispatch
@@ -4704,7 +4720,7 @@ this is the interrupt-safety invariant:
 | `RTNL` and every network `spin::Mutex`/`RwLock` | net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |
 | Driver queue locks (e1000 / virtio-net `rx`, `tx`) | hw/net/ | `Mutex` | Rings: NAPI poll, xmit, open/stop |
 | `Softnet.backlog` | net/core/dev.rs | `Mutex` | `netif_rx` (lo), softnet |
-| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages` | block/ | spin `RwLock` / sleeping `Mutex` / spin `Mutex` | Block device lookup, majors, RAM disk pages (3.10) |
+| `MAJORS`, `RamDisk.pages` | block/ | sleeping `Mutex` / spin `Mutex` | Block majors, RAM disk pages (3.10) |
 | `Disk.open_mutex` | block/blkdev.rs | sleeping `sync::Mutex` | Block device open/release, partition scans |
 | Sleeping locks (`sync::Mutex`, `RwSem`) | sync/ | sleeping | Never in IRQ or atomic context (`might_sleep`) |
 

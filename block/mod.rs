@@ -16,8 +16,8 @@ pub mod scsi;
 pub mod sd;
 
 pub use blkdev::{
-    BLKDEV_REGISTRY, Bio, BioOp, BioSeg, BlockDevice, BlockDriver, DevId, DevMajor, DevMinor, Disk,
-    QueueLimits, RequestQueue, SECTOR_SIZE, get_blkdev, major, register_blkdev,
+    Bio, BioOp, BioSeg, BlockDevice, BlockDriver, DevId, DevMajor, DevMinor, Disk, QueueLimits,
+    RequestQueue, SECTOR_SIZE, get_blkdev, major, register_blkdev,
 };
 pub use ramdisk::{create_ramdisk, create_ramdisk_from_data};
 pub use scsi::{Cdb, DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult};

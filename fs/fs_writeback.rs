@@ -38,15 +38,17 @@ use crate::util::error::KernelError;
 
 crate::adapter!(pub IoListA, Inode, i_io_list);
 
-/// The writeback state of `inode`'s device (Linux inode_to_wb): its
-/// filesystem's, or the block device's own for its cache inode
+/// The writeback state of `inode`'s device (Linux inode_to_wb,
+/// inode_to_bdi): its filesystem's, or the block device's own for its
+/// cache inode (sb_is_blkdev_sb)
 fn inode_to_wb(inode: &Inode) -> Option<Arc<BdiWriteback>> {
-    match inode.superblock() {
-        Some(sb) => sb.bdev().map(|b| b.disk.bdi.clone()),
-        None => crate::fs::blkdev_ops::inode_bdev(inode)
+    let sb = inode.superblock()?;
+    if core::ptr::eq(sb.fs_type, crate::fs::pseudo::BDEV.fs_type()) {
+        return crate::fs::blkdev_ops::inode_bdev(inode)
             .ok()
-            .map(|b| b.disk.bdi.clone()),
+            .map(|b| b.disk.bdi.clone());
     }
+    sb.bdev().map(|b| b.disk.bdi.clone())
 }
 
 /// `inode` has a new dirty page (Linux __mark_inode_dirty(I_DIRTY_PAGES)):

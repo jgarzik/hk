@@ -306,6 +306,8 @@ pub(crate) fn kmain() -> ! {
     // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
     // (chr_dev_init), then device initcalls (bus probes below)
     mnt_init();
+    // vfs_caches_init's bdev_cache_init, after mnt_init
+    pseudo_init(&fs::pseudo::BDEV);
     // start_kernel's nsfs_init, after proc_root_init
     pseudo_init(&fs::pseudo::NSFS);
     fs::ramfs::devtmpfs::init();

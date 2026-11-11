@@ -2177,10 +2177,7 @@ fn gen_meminfo() -> Vec<u8> {
     let mut out = String::new();
     use crate::mm::filemap;
     let file = filemap::nr_file_pages() * 4;
-    let buffers: u64 = crate::block::blkdev::all_bdev_inodes()
-        .iter()
-        .map(|i| i.i_data.nrpages() * 4)
-        .sum();
+    let buffers = crate::block::blkdev::nr_blockdev_pages() * 4;
     let dirty = filemap::nr_dirty() * 4;
     let unevict = filemap::nr_unevictable() * 4;
     // What reclaim could free without I/O (Linux si_mem_available,

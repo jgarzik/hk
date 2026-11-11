@@ -1416,17 +1416,14 @@ pub fn fault(inode: &Inode, index: u64) -> Result<u64, VmFault> {
 }
 
 /// `f` on each inode that may hold reclaimable cache (every
-/// superblock's, every block device's) until it returns false; no
-/// allocation
+/// superblock's, the block devices' on the bdev superblock) until it
+/// returns false; no allocation
 fn for_each_cache_inode(f: &mut dyn FnMut(&Inode) -> bool) {
     let mut more = true;
     crate::fs::superblock::iterate_supers(|sb| {
         more = more
             && crate::fs::inode::for_each_sb_inode(sb, &mut |i| i.i_data.nrpages() == 0 || f(i));
     });
-    if more {
-        crate::block::blkdev::for_each_bdev_inode(&mut |i| i.i_data.nrpages() == 0 || f(i));
-    }
 }
 
 /// Drop up to `nr` clean, unmapped page-cache pages for direct reclaim
