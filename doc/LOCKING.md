@@ -2285,7 +2285,8 @@ by `for_each_net` and the sysfs setup's snapshot, which registers
 devices and so sends uevents after releasing it; written at namespace
 creation; thread context, a uevent is sent from a sleepable context as
 Linux's kobject_uevent), then each namespace's `NlTable.socks` -> `NlSock.rxq`;
-`ksysfs::UEVENT_HELPER` is a spin leaf.
+`ksysfs::UEVENT_HELPER` (a fixed array, Linux uevent_helper) is a spin
+leaf: show copies it out and emits after releasing it.
 
 show()/store() run under an active reference (`KNode::get_active`),
 not a lock. `KNode::remove` deactivates the subtree and sleeps until
