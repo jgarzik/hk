@@ -17,6 +17,7 @@ pub mod list;
 pub mod percpu_counter;
 pub mod pod;
 pub mod rbtree;
+pub mod rcuhlist;
 pub mod rculist;
 pub mod scope;
 pub mod seg;

@@ -289,7 +289,15 @@ entries off through `&mut` (`drain`: no reader or writer is left, so
 no grace period). `RcuHList` (Linux hlist_head, _rcu ops) is a hash
 chain with no lock of its own: its writers pass the `UniqueOwner` data
 of the lock they hold (1.4.1's `LockedBy` proof), so a table of chains
-under one lock costs a pointer per bucket.
+under one lock costs a pointer per bucket. `util::rcuhlist::RcuHList`
+is one RCU hash chain (Linux hlist_*_rcu: `next`/`pprev` nodes, a
+strong reference per entry, its own spin leaf for writers, which a
+table nests under its own lock): readers walk it under a guard,
+removal is hlist_del_init_rcu (the node free for a new insert at once,
+`next` kept for a reader on it) and hands back the chain's reference as
+`RcuHRef`, released after a grace period (`defer`: call_rcu, or a
+synchronize when the entry's head is still queued for an earlier
+removal; Linux SOCK_RCU_FREE).
 
 Quiescent states, per CPU: a context switch (recorded under the rq
 lock, reported later), each idle-loop pass, and a clock interrupt that
