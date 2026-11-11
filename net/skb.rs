@@ -41,6 +41,7 @@ use crate::mm::page_alloc::Gfp;
 use crate::sync::spin::{Mutex, MutexGuard};
 use crate::util::list::{Link, ListPtr, PtrList};
 
+use crate::net::af_inet::RxInfo;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{EtherType, PktType};
 use crate::net::ipv4::Ipv4Addr;
@@ -98,6 +99,33 @@ pub struct SkBuff {
     mac: Option<usize>,
     /// Start of the IP header of a received packet (None until marked)
     nh: Option<usize>,
+    /// Arrival time, CLOCK_REALTIME ns (Linux skb->tstamp; 0: not
+    /// stamped yet, the receiving socket stamps it as it queues)
+    pub tstamp: i128,
+    /// The receiving socket's drop count when it was queued (Linux
+    /// SOCK_SKB_CB(skb)->dropcount, for SO_RXQ_OVFL)
+    pub dropcount: u32,
+    /// Per-layer data of a queued skb (Linux skb->cb)
+    pub cb: SkbCb,
+}
+
+/// What a protocol keeps with a queued skb (Linux skb->cb, typed: each
+/// layer reads only its own variant)
+#[derive(Clone, Copy, Default)]
+pub enum SkbCb {
+    #[default]
+    None,
+    /// A datagram queued to a UDP, ping or raw socket: its control
+    /// message data (Linux IPCB + PKTINFO_SKB_CB) and source port
+    Inet(InetCb),
+}
+
+/// [`SkbCb::Inet`]
+#[derive(Clone, Copy, Default)]
+pub struct InetCb {
+    pub info: RxInfo,
+    /// Source port (0 for ping and raw)
+    pub sport: u16,
 }
 
 impl SkBuff {
@@ -274,6 +302,9 @@ impl SkBuff {
         self.owner = 0;
         self.mac = None;
         self.nh = None;
+        self.tstamp = 0;
+        self.dropcount = 0;
+        self.cb = SkbCb::None;
     }
 
     /// Record the current data pointer as the start of the MAC header
@@ -296,6 +327,46 @@ impl SkBuff {
     /// header was pulled), if one was recorded
     pub fn network_packet(&self) -> Option<&[u8]> {
         self.buf.get(self.nh?..self.tail)
+    }
+
+    /// Bytes charged to a socket buffer for it (Linux skb->truesize:
+    /// the buffer and the skb itself)
+    pub fn truesize(&self) -> usize {
+        self.buf.len() + core::mem::size_of::<Self>()
+    }
+
+    /// The received packet's data offset past its IP header (None if
+    /// none was marked): `push` that much to get back to it
+    pub fn network_offset(&self) -> Option<usize> {
+        Some(self.data - self.nh?)
+    }
+
+    /// A copy under `gfp` with its own buffer and no queue link (Linux
+    /// skb_clone: hk skbs do not share data, so a clone copies it; the
+    /// receive paths clone GFP_ATOMIC). None on failure.
+    pub fn clone_gfp(&self, gfp: Gfp) -> Option<Self> {
+        let buf = with_gfp(gfp, || crate::util::kmem::try_to_vec(&self.buf)).ok()?;
+        Some(Self {
+            list: Link::new(),
+            buf: buf.into_boxed_slice(),
+            data: self.data,
+            tail: self.tail,
+            protocol: self.protocol,
+            ip_protocol: self.ip_protocol,
+            dev: self.dev.clone(),
+            saddr: self.saddr,
+            daddr: self.daddr,
+            pkt_type: self.pkt_type,
+            ip_bcast: self.ip_bcast,
+            ip_ttl: self.ip_ttl,
+            ip_tos: self.ip_tos,
+            owner: self.owner,
+            mac: self.mac,
+            nh: self.nh,
+            tstamp: self.tstamp,
+            dropcount: self.dropcount,
+            cb: self.cb,
+        })
     }
 
     /// Network namespace of the skb's device (receive path: the namespace
@@ -342,6 +413,28 @@ impl<P: ListPtr<Target = SkBuff>> SkbQueue<P> {
     /// The first skb, taken off (Linux skb_dequeue)
     pub fn dequeue(&self) -> Option<P> {
         self.q.lock().pop_front()
+    }
+
+    /// Whether the queue is empty (Linux skb_queue_empty_lockless: a
+    /// hint unless the caller orders it with the queueing)
+    pub fn is_empty(&self) -> bool {
+        self.q.lock().is_empty()
+    }
+
+    /// Take every skb off at once (Linux skb_queue_splice_init under the
+    /// lock, then __skb_queue_purge): the caller drops what comes back
+    /// after the lock is released
+    #[must_use]
+    pub fn purge(&self) -> SkbHead<P> {
+        core::mem::take(&mut *self.q.lock())
+    }
+}
+
+impl SkbQueue<Arc<SkBuff>> {
+    /// A reference to the first skb, left queued (Linux skb_peek +
+    /// skb_get under the queue lock): the caller reads it unlocked
+    pub fn peek(&self) -> Option<Arc<SkBuff>> {
+        self.q.lock().front_arc()
     }
 }
 
@@ -426,6 +519,41 @@ mod tests {
         let s = gone.pop_front().unwrap();
         q.lock().push_back(s);
         assert_eq!(lens(&q.lock()), [3, 5, 2]);
+    }
+
+    /// peek takes a reference and leaves the skb queued; purge takes
+    /// them all off at once
+    #[test]
+    fn peek_and_purge() {
+        let q: SkbQueue = SkbQueue::new();
+        assert!(q.peek().is_none());
+        q.lock().push_back(Arc::from(skb(1)));
+        q.lock().push_back(Arc::from(skb(2)));
+        let p = q.peek().unwrap();
+        assert_eq!((p.len(), Arc::strong_count(&p)), (1, 2));
+        assert_eq!(q.lock().len(), 2);
+        let all = q.purge();
+        assert!(q.is_empty());
+        assert_eq!(lens(&all), [1, 2]);
+        drop(all);
+        assert_eq!(Arc::strong_count(&p), 1);
+    }
+
+    /// A clone has its own buffer and keeps the marks and cb
+    #[test]
+    fn clone_copies() {
+        let mut a = skb(4);
+        a.data_mut().copy_from_slice(b"abcd");
+        a.mark_network_header();
+        a.pull(2);
+        a.cb = SkbCb::Inet(InetCb::default());
+        let mut c = a.clone_gfp(Gfp::ATOMIC).unwrap();
+        c.data_mut()[0] = b'X';
+        assert_eq!(a.data(), b"cd");
+        assert_eq!(c.data(), b"Xd");
+        assert_eq!(c.network_offset(), Some(2));
+        assert!(matches!(c.cb, SkbCb::Inet(_)));
+        assert_eq!(c.truesize(), a.truesize());
     }
 
     /// A shared skb stays alive in the queue while its other reference

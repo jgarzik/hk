@@ -33,7 +33,7 @@ use crate::sync::spin::RwLock;
 use crate::net::af_inet::{
     self, IP_PKTINFO, IP_TOS, IP_TTL, IPPROTO_UDP, Inet, InetAddr, RxInfo, SOL_IP,
 };
-use crate::net::dgram::{self, Dgram, RxQueue};
+use crate::net::dgram::{self, RxQueue};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::port::{self, BindInfo, Flow, Parity};
 use crate::net::inet::route;
@@ -654,8 +654,10 @@ fn bcast_match(s: &UdpSock, k: &Key) -> bool {
 }
 
 /// Receive a UDP packet (from ip_rcv; thread context; the device's
-/// namespace)
-pub fn udp_rcv(skb: SkBuff) {
+/// namespace). The skb itself is queued to the socket, trimmed to the
+/// datagram and pulled to its payload (Linux __udp4_lib_rcv ->
+/// udp_queue_rcv_skb).
+pub fn udp_rcv(mut skb: SkBuff) {
     let (Some(net), Some(saddr), Some(daddr)) = (skb.net(), skb.saddr, skb.daddr) else {
         return;
     };
@@ -679,29 +681,42 @@ pub fn udp_rcv(skb: SkBuff) {
         dport: u16::from_be_bytes([b[2], b[3]]),
         dif,
     };
+    let pad = b.len() - ulen;
     let info = RxInfo::of(&net, &skb);
-    // Each socket's copy may fail to allocate: that socket counts a drop
-    // (Linux __udp4_lib_mcast_deliver when skb_clone fails)
-    let deliver = |s: &UdpSock| match Dgram::copy(saddr, k.sport, &pkt[UDP_HLEN..], info) {
-        Some(d) => s.rxq.enqueue(&s.sk, d),
-        None => {
-            s.sk.drops.fetch_add(1, Ordering::Relaxed);
-        }
-    };
-    if skb.ip_bcast || daddr.is_multicast() {
-        for s in net
-            .udp
-            .on_port(k.dport)
-            .iter()
-            .filter(|s| bcast_match(s, &k))
-        {
-            deliver(s);
-        }
+    if skb.trim(pad).is_none() || skb.pull(UDP_HLEN).is_none() {
         return;
     }
+    dgram::prepare(&mut skb, info, k.sport);
+    if skb.ip_bcast || daddr.is_multicast() {
+        return mcast_deliver(&net, skb, &k);
+    }
     match lookup(&net.udp, &k) {
-        Some(s) => deliver(&s),
+        Some(s) => s.rxq.enqueue(&s.sk, skb),
         None => crate::net::icmp::port_unreach(&net, &skb),
+    }
+}
+
+/// A broadcast or multicast datagram to every matching socket (Linux
+/// __udp4_lib_mcast_deliver): each but the first gets a clone made
+/// GFP_ATOMIC (a failed clone counts a drop on that socket), the first
+/// the skb itself
+fn mcast_deliver(net: &crate::net::NetNamespace, skb: SkBuff, k: &Key) {
+    let socks = net.udp.on_port(k.dport);
+    let mut first = None;
+    for s in socks.iter().filter(|s| bcast_match(s, k)) {
+        if first.is_none() {
+            first = Some(s);
+            continue;
+        }
+        match skb.clone_gfp(Gfp::ATOMIC) {
+            Some(c) => s.rxq.enqueue(&s.sk, c),
+            None => {
+                s.sk.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if let Some(s) = first {
+        s.rxq.enqueue(&s.sk, skb);
     }
 }
 

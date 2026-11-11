@@ -580,6 +580,19 @@ impl<A: Adapter, P: ListPtr<Target = A::Item>> PtrList<A, P> {
     }
 }
 
+impl<A: Adapter> PtrList<A, Arc<A::Item>> {
+    /// A new reference to the first entry, left on the list (Linux
+    /// list_first_entry + a get under the list's lock)
+    pub fn front_arc(&self) -> Option<Arc<A::Item>> {
+        let p = self.list.front()?;
+        // SAFETY: the list owns a strong reference to `p` from
+        // Arc::into_raw (type invariant), so it is a live Arc allocation
+        unsafe { Arc::increment_strong_count(p) };
+        // SAFETY: the reference just taken, of an Arc allocation
+        Some(unsafe { Arc::from_raw(p) })
+    }
+}
+
 impl<A: Adapter, P: ListPtr<Target = A::Item>> Default for PtrList<A, P> {
     fn default() -> Self {
         Self::new()

@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use crate::sync::spin::RwLock;
 
 use crate::net::af_inet::{self, Inet, RxInfo, SOL_IP};
-use crate::net::dgram::{self, Dgram, RxQueue};
+use crate::net::dgram::{self, RxQueue};
 use crate::net::icmp::{IcmpErr, icmp_type};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::route;
@@ -458,10 +458,11 @@ pub fn ping_rcv(net: &NetNamespace, skb: &SkBuff) {
         return;
     };
     let info = RxInfo::of(net, skb);
-    // A copy that cannot be allocated drops the reply (Linux ping_rcv:
-    // skb_clone failure)
-    if let Some(dg) = Dgram::copy(skb.saddr.unwrap_or_default(), 0, d, info) {
-        s.rxq.enqueue(&s.sk, dg);
+    // A clone that cannot be allocated drops the reply (Linux ping_rcv:
+    // skb_clone(GFP_ATOMIC) failure)
+    if let Some(mut c) = skb.clone_gfp(Gfp::ATOMIC) {
+        dgram::prepare(&mut c, info, 0);
+        s.rxq.enqueue(&s.sk, c);
     }
 }
 
