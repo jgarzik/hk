@@ -100,7 +100,7 @@ impl PosixLockType {
 }
 
 /// A single byte-range lock
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PosixLock {
     /// Owner: the holder's descriptor table (Linux fl_owner, the
     /// files_struct; see `current_owner`)
@@ -144,11 +144,18 @@ impl PosixLock {
 // Per-Inode Lock Table
 // =============================================================================
 
-/// Locks held on a single inode
+/// Locks held on a single inode. Nothing allocates under `flc_lock`:
+/// one change adds at most two locks (the new one, and the far part of
+/// an old one it splits: Linux posix_lock_inode's preallocated new_fl
+/// and new_fl2), so the room is reserved before the lock (`reserve`)
+/// and every edit is done in place
 #[derive(Default)]
 pub struct InodeLocks {
     locks: Vec<PosixLock>,
 }
+
+/// Locks one change may add
+const GROWTH: usize = 2;
 
 impl InodeLocks {
     /// Find a conflicting lock for F_GETLK
@@ -185,6 +192,7 @@ impl InodeLocks {
         }
 
         // Remove overlapping locks from same owner (they'll be replaced/merged)
+        debug_assert!(self.locks.capacity() >= self.locks.len() + GROWTH);
         self.unlock_range(owner, start, end);
 
         // Add new lock
@@ -202,76 +210,31 @@ impl InodeLocks {
         Ok(())
     }
 
-    /// Unlock a range - may split existing locks
+    /// Unlock a range - may split existing locks, in place (an owner's
+    /// locks never overlap, so at most one is split, adding one lock)
     fn unlock_range(&mut self, owner: u64, start: u64, end: u64) {
-        let mut new_locks = Vec::new();
-
-        for lock in self.locks.drain(..) {
-            if lock.owner != owner {
-                // Not our lock, keep it
-                new_locks.push(lock);
+        let n = self.locks.len();
+        for i in 0..n {
+            let lock = self.locks[i];
+            if lock.owner != owner || !lock.overlaps(start, end) {
                 continue;
             }
-
-            if !lock.overlaps(start, end) {
-                // No overlap, keep it
-                new_locks.push(lock);
-                continue;
-            }
-
-            // Lock overlaps with unlock range - may need to split
-
-            // Case 1: Lock completely within unlock range - remove entirely
             if lock.start >= start && lock.end <= end {
-                continue;
-            }
-
-            // Case 2: Unlock range splits the lock into two parts
-            if lock.start < start && lock.end > end {
-                // Left part
-                new_locks.push(PosixLock {
-                    owner: lock.owner,
-                    pid: lock.pid,
-                    start: lock.start,
-                    end: start,
-                    lock_type: lock.lock_type,
-                });
-                // Right part
-                new_locks.push(PosixLock {
-                    owner: lock.owner,
-                    pid: lock.pid,
-                    start: end,
-                    end: lock.end,
-                    lock_type: lock.lock_type,
-                });
-                continue;
-            }
-
-            // Case 3: Partial overlap at start of lock
-            if lock.start >= start && lock.start < end && lock.end > end {
-                new_locks.push(PosixLock {
-                    owner: lock.owner,
-                    pid: lock.pid,
-                    start: end,
-                    end: lock.end,
-                    lock_type: lock.lock_type,
-                });
-                continue;
-            }
-
-            // Case 4: Partial overlap at end of lock
-            if lock.start < start && lock.end > start && lock.end <= end {
-                new_locks.push(PosixLock {
-                    owner: lock.owner,
-                    pid: lock.pid,
-                    start: lock.start,
-                    end: start,
-                    lock_type: lock.lock_type,
-                });
+                // Within the range: emptied, removed below
+                self.locks[i].end = lock.start;
+            } else if lock.start < start && lock.end > end {
+                // Split: the left part stays, the right one is added
+                self.locks[i].end = start;
+                self.locks.push(PosixLock { start: end, ..lock });
+            } else if lock.start >= start {
+                // Its start is unlocked
+                self.locks[i].start = end;
+            } else {
+                // Its end is unlocked
+                self.locks[i].end = start;
             }
         }
-
-        self.locks = new_locks;
+        self.locks.retain(|l| l.start < l.end);
     }
 
     /// Drop every lock of `owner`: whether it had any
@@ -281,31 +244,35 @@ impl InodeLocks {
         self.locks.len() != n
     }
 
-    /// Coalesce adjacent locks of same type from same owner
+    /// Coalesce adjacent locks of same type from same owner, in place
+    /// (an unstable sort allocates nothing)
     fn coalesce_locks(&mut self, _pid: u64) {
         // Sort by (owner, type, start)
-        self.locks.sort_by(|a, b| {
+        self.locks.sort_unstable_by(|a, b| {
             a.owner
                 .cmp(&b.owner)
                 .then_with(|| (a.lock_type as u8).cmp(&(b.lock_type as u8)))
                 .then_with(|| a.start.cmp(&b.start))
         });
-
-        // Merge adjacent/overlapping locks
-        let mut merged: Vec<PosixLock> = Vec::new();
-        for lock in self.locks.drain(..) {
-            if let Some(last) = merged.last_mut()
-                && last.owner == lock.owner
+        // Merge adjacent/overlapping locks into the earlier one
+        self.locks.dedup_by(|lock, last| {
+            let merge = last.owner == lock.owner
                 && last.lock_type == lock.lock_type
-                && last.end >= lock.start
-            {
-                // Merge: extend last to cover this lock
+                && last.end >= lock.start;
+            if merge {
                 last.end = last.end.max(lock.end);
-                continue;
             }
-            merged.push(lock);
+            merge
+        });
+    }
+
+    /// Room for one change, or the length to grow past
+    fn room(&self) -> Result<(), usize> {
+        if self.locks.capacity() >= self.locks.len() + GROWTH {
+            Ok(())
+        } else {
+            Err(self.locks.len() + GROWTH)
         }
-        self.locks = merged;
     }
 }
 
@@ -418,33 +385,52 @@ fn set(
     l_type: i16,
 ) -> Result<(), (KernelError, Option<u64>)> {
     let owner = current_owner();
-    if l_type == F_UNLCK {
-        inode.i_flctx.with(|l| {
-            l.posix.unlock_range(owner, start, end);
-            ((), true)
-        });
-        return Ok(());
-    }
-    let lock_type =
-        PosixLockType::from_flock(l_type).ok_or((KernelError::InvalidArgument, None))?;
+    let lock_type = if l_type == F_UNLCK {
+        None
+    } else {
+        Some(PosixLockType::from_flock(l_type).ok_or((KernelError::InvalidArgument, None))?)
+    };
     let pid = current_pid();
-    inode.i_flctx.with(|l| {
-        let r = l
-            .posix
-            .try_lock((owner, pid), start, end, lock_type)
-            .map_err(|e| {
-                let blocker = l
-                    .posix
-                    .find_conflict(start, end, lock_type, owner)
-                    .map(|c| c.owner);
-                (e, blocker)
-            });
-        // A lock set may replace or split one of ours, releasing a
-        // range; a refused one changed nothing (counting it would wake
-        // the other waiters into a retry loop)
-        let changed = r.is_ok();
-        (r, changed)
-    })
+    let mut spare: Vec<PosixLock> = Vec::new();
+    loop {
+        let r = inode.i_flctx.with(|l| {
+            // Room for the change, else grow outside the lock and retry
+            // (Linux allocates new_fl/new_fl2 before taking flc_lock)
+            let bigger = core::mem::take(&mut spare);
+            let left = crate::util::kmem::adopt(&mut l.posix.locks, bigger);
+            if let Err(need) = l.posix.room() {
+                return (Err(Some((need, left))), false);
+            }
+            let Some(lock_type) = lock_type else {
+                l.posix.unlock_range(owner, start, end);
+                return (Ok(Ok(left)), true);
+            };
+            let r = l
+                .posix
+                .try_lock((owner, pid), start, end, lock_type)
+                .map_err(|e| {
+                    let blocker = l
+                        .posix
+                        .find_conflict(start, end, lock_type, owner)
+                        .map(|c| c.owner);
+                    (e, blocker)
+                });
+            // A lock set may replace or split one of ours, releasing a
+            // range; a refused one changed nothing (counting it would
+            // wake the other waiters into a retry loop)
+            let changed = r.is_ok();
+            (Ok(r.map(|()| left)), changed)
+        });
+        match r {
+            // The buffers left over are freed here, after the lock
+            Ok(done) => return done.map(drop),
+            Err(Some((need, left))) => {
+                drop(left);
+                spare = crate::util::kmem::spare(need).map_err(|e| (e, None))?;
+            }
+            Err(None) => unreachable!(),
+        }
+    }
 }
 
 /// F_SETLK - set/clear lock (non-blocking): the absolute range it
@@ -516,6 +502,18 @@ pub fn release_posix_locks_on_close(file: &File, owner: u64) {
 mod tests {
     use super::*;
 
+    /// `try_lock` with its room reserved first, as `set` does
+    fn tl(
+        l: &mut InodeLocks,
+        who: (u64, u64),
+        start: u64,
+        end: u64,
+        t: PosixLockType,
+    ) -> Result<(), KernelError> {
+        l.locks.reserve(GROWTH);
+        l.try_lock(who, start, end, t)
+    }
+
     #[test]
     fn lock_ranges() {
         let r = lock_range;
@@ -554,16 +552,16 @@ mod tests {
     #[test]
     fn conflicts() {
         let mut l = InodeLocks::default();
-        l.try_lock((1, 1), 0, 10, Read).unwrap();
-        assert!(l.try_lock((2, 2), 5, 15, Read).is_ok());
+        tl(&mut l, (1, 1), 0, 10, Read).unwrap();
+        assert!(tl(&mut l, (2, 2), 5, 15, Read).is_ok());
         assert_eq!(
-            l.try_lock((3, 3), 9, 20, Write),
+            tl(&mut l, (3, 3), 9, 20, Write),
             Err(KernelError::WouldBlock)
         );
-        assert!(l.try_lock((3, 3), 15, 20, Write).is_ok());
+        assert!(tl(&mut l, (3, 3), 15, 20, Write).is_ok());
         assert!(l.find_conflict(0, 1, Write, 9).is_some());
         assert!(l.find_conflict(10, 15, Write, 2).is_none());
-        assert!(l.try_lock((1, 1), 0, 10, Write).is_err());
+        assert!(tl(&mut l, (1, 1), 0, 10, Write).is_err());
         // End is exclusive: [0, 10) and [10, ..) do not touch
         assert!(l.find_conflict(20, u64::MAX, Write, 9).is_none());
     }
@@ -572,7 +570,7 @@ mod tests {
     #[test]
     fn unlock_splits() {
         let mut l = InodeLocks::default();
-        l.try_lock((1, 1), 0, 100, Write).unwrap();
+        tl(&mut l, (1, 1), 0, 100, Write).unwrap();
         l.unlock_range(1, 40, 60);
         assert_eq!(ranges(&l, 1), [(0, 40, Write), (60, 100, Write)]);
         l.unlock_range(1, 0, 10);
@@ -588,19 +586,19 @@ mod tests {
     #[test]
     fn replace_and_merge() {
         let mut l = InodeLocks::default();
-        l.try_lock((1, 1), 0, 10, Read).unwrap();
-        l.try_lock((1, 1), 10, 20, Read).unwrap();
+        tl(&mut l, (1, 1), 0, 10, Read).unwrap();
+        tl(&mut l, (1, 1), 10, 20, Read).unwrap();
         assert_eq!(ranges(&l, 1), [(0, 20, Read)]);
-        l.try_lock((1, 1), 5, 15, Write).unwrap();
+        tl(&mut l, (1, 1), 5, 15, Write).unwrap();
         assert_eq!(
             ranges(&l, 1),
             [(0, 5, Read), (5, 15, Write), (15, 20, Read)]
         );
-        l.try_lock((1, 1), 0, 20, Read).unwrap();
+        tl(&mut l, (1, 1), 0, 20, Read).unwrap();
         assert_eq!(ranges(&l, 1), [(0, 20, Read)]);
         // Another owner's locks are untouched
-        l.try_lock((2, 2), 30, 40, Write).unwrap();
-        l.try_lock((1, 1), 20, 30, Read).unwrap();
+        tl(&mut l, (2, 2), 30, 40, Write).unwrap();
+        tl(&mut l, (1, 1), 20, 30, Read).unwrap();
         assert_eq!(ranges(&l, 1), [(0, 30, Read)]);
         assert_eq!(ranges(&l, 2), [(30, 40, Write)]);
         assert!(l.remove_all_for_owner(1));
@@ -612,8 +610,8 @@ mod tests {
     #[test]
     fn same_lock_keeps_pid() {
         let mut l = InodeLocks::default();
-        l.try_lock((1, 100), 0, 10, Write).unwrap();
-        l.try_lock((1, 200), 2, 8, Write).unwrap();
+        tl(&mut l, (1, 100), 0, 10, Write).unwrap();
+        tl(&mut l, (1, 200), 2, 8, Write).unwrap();
         assert_eq!(l.find_conflict(0, 10, Read, 2).map(|k| k.pid), Some(100));
     }
 }
