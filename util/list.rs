@@ -11,6 +11,9 @@
 //! - [`ArcList`]: the list owns one strong reference per entry
 //!   (`Arc::into_raw` on insert, back on removal): run queues, children
 //!   and thread-group lists.
+//! - [`OwnedList`]: an `ArcList` whose items carry an [`Owner`] mark,
+//!   so removing or stepping from any given item is safe in O(1): a
+//!   dentry's children.
 //! - [`BoxList`]: the list owns each entry as a `Box`: queued signals.
 //!
 //! A list and the links of its entries are only touched under the lock
@@ -23,7 +26,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicPtr, Ordering::Relaxed};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering::Relaxed};
 
 /// The pointers of a link that is on no list (Linux LIST_POISON):
 /// never a link's address (no link is at address 8)
@@ -456,6 +459,135 @@ impl<A: Adapter> Drop for ArcList<A> {
     }
 }
 
+/// Which [`OwnedList`] an item is on (0: none), kept beside its link
+pub struct Owner(AtomicU64);
+
+impl Owner {
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
+impl Default for Owner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// An [`Adapter`] whose items also carry an [`Owner`] for that link
+///
+/// # Safety
+/// `owner` returns a field of the item used by no other adapter.
+pub unsafe trait OwnerAdapter: Adapter {
+    fn owner(item: &Self::Item) -> &Owner;
+}
+
+/// `owned_adapter!(vis Name, Type, link, owner)`: an [`OwnerAdapter`]
+/// for `Type.link`, marked in `Type.owner`
+#[macro_export]
+macro_rules! owned_adapter {
+    ($vis:vis $name:ident, $t:ty, $link:ident, $owner:ident) => {
+        $crate::adapter!($vis $name, $t, $link);
+        // SAFETY: a field of the item, named for this adapter only
+        unsafe impl $crate::util::list::OwnerAdapter for $name {
+            fn owner(item: &$t) -> &$crate::util::list::Owner {
+                &item.$owner
+            }
+        }
+    };
+}
+
+/// Ids of [`OwnedList`]s: each list its own, never reused (64 bits)
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+
+/// An [`ArcList`] that knows its items by their [`Owner`] mark, so
+/// removing or stepping from a given item is safe and O(1) (Linux
+/// hlist_del / the next sibling on a dentry's d_children)
+///
+/// # Invariants
+/// An item's owner mark is `id` exactly while it is on `list`; no
+/// other list ever writes `id`.
+pub struct OwnedList<A: OwnerAdapter> {
+    list: ArcList<A>,
+    id: u64,
+}
+
+impl<A: OwnerAdapter> OwnedList<A> {
+    pub fn new() -> Self {
+        Self {
+            list: ArcList::new(),
+            id: NEXT_OWNER.fetch_add(1, Relaxed),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    fn mine(&self, item: &A::Item) -> bool {
+        A::owner(item).0.load(Relaxed) == self.id
+    }
+
+    /// Append `item`; panics if it is on a list through this link
+    pub fn push_back(&mut self, item: Arc<A::Item>) {
+        let mark = item.clone();
+        self.list.push_back(item);
+        // INVARIANT: on this list from here (the push claimed its link)
+        A::owner(&mark).0.store(self.id, Relaxed);
+    }
+
+    /// Take `item` off and hand back the list's reference; None if it
+    /// is not on this list
+    pub fn remove(&mut self, item: &A::Item) -> Option<Arc<A::Item>> {
+        if !self.mine(item) {
+            return None;
+        }
+        // INVARIANT: leaving the list
+        A::owner(item).0.store(0, Relaxed);
+        // SAFETY: marked with this list's id, so on it (type invariant)
+        Some(unsafe { self.list.remove(item) })
+    }
+
+    /// A new reference to the first entry
+    pub fn front(&self) -> Option<Arc<A::Item>> {
+        self.list.list.front().map(|p| {
+            // SAFETY: inserted with `into_raw`; the list holds that
+            // reference while the entry is on it
+            unsafe { Arc::increment_strong_count(p) };
+            // SAFETY: the reference just taken
+            unsafe { Arc::from_raw(p) }
+        })
+    }
+
+    /// A new reference to the entry after `item`; None if `item` is the
+    /// last or not on this list
+    pub fn next(&self, item: &A::Item) -> Option<Arc<A::Item>> {
+        if !self.mine(item) {
+            return None;
+        }
+        // SAFETY: marked with this list's id, so on it (type invariant)
+        let p = unsafe { self.list.list.next(core::ptr::from_ref(item)) }?;
+        // SAFETY: as in `front`
+        unsafe { Arc::increment_strong_count(p) };
+        // SAFETY: the reference just taken
+        Some(unsafe { Arc::from_raw(p) })
+    }
+
+    pub fn iter(&self) -> Iter<'_, A> {
+        self.list.iter()
+    }
+}
+
+impl<A: OwnerAdapter> Default for OwnedList<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A [`List`] that owns each entry as a `Box` (Linux list_head of
 /// kmalloc'd entries: struct sigpending's sigqueues)
 ///
@@ -607,6 +739,39 @@ mod tests {
 
     fn bvals(l: &BoxList<BNodeA>) -> Vec<u32> {
         l.iter().map(|n| n.v).collect()
+    }
+
+    struct ONode {
+        v: u32,
+        link: Link,
+        owner: Owner,
+    }
+    crate::owned_adapter!(ONodeA, ONode, link, owner);
+
+    fn onode(v: u32) -> Arc<ONode> {
+        Arc::new(ONode {
+            v,
+            link: Link::new(),
+            owner: Owner::new(),
+        })
+    }
+
+    /// An owned list removes and steps only from its own items
+    #[test]
+    fn owned_list_knows_its_items() {
+        let (mut a, mut b) = (OwnedList::<ONodeA>::new(), OwnedList::<ONodeA>::new());
+        let (x, y, z) = (onode(1), onode(2), onode(3));
+        a.push_back(x.clone());
+        a.push_back(y.clone());
+        b.push_back(z.clone());
+        assert!(b.remove(&x).is_none() && b.next(&x).is_none());
+        assert_eq!(a.next(&x).map(|n| n.v), Some(2));
+        assert_eq!(a.front().map(|n| n.v), Some(1));
+        assert!(a.remove(&x).is_some() && a.remove(&x).is_none());
+        assert_eq!(Arc::strong_count(&x), 1);
+        assert!(a.next(&y).is_none() && a.len() == 1);
+        b.push_back(x.clone());
+        assert_eq!(b.next(&z).map(|n| n.v), Some(1));
     }
 
     #[test]

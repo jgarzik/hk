@@ -136,6 +136,15 @@ fn read(&self) -> RwLockReadGuard<'_, T>
 fn write(&self) -> RwLockWriteGuard<'_, T>
 ```
 
+### 1.3.1 Bit spin lock (util/hlist_bl.rs)
+
+Linux bit_spin_lock as hlist_bl_lock: bit 0 of a hash bucket's head
+word, so a table of buckets costs one pointer each. Thread context only,
+interrupts stay on; to the preempt count and lockdep it is a spin lock
+(`sync::spin::raw_enter`/`raw_leave`, one class for every bucket, never
+two held at once). Used for the dentry hash table (3.3 Dentry), under
+`Dentry.d_lock`, with only `Dentry.d_name` (a leaf) taken inside it.
+
 ### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (sync/)
 
 Linux `struct mutex` and `struct rw_semaphore`: a contended lock sleeps
@@ -437,6 +446,10 @@ VFS locks (detailed order):
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across
                    i_rwsem; parent before child)
+        → dentry hash bucket (util::hlist_bl bit lock: Linux
+                   hlist_bl_lock on dentry_hashtable)
+        → Dentry.d_name (spin RwLock, leaf: the name, read in a
+                   bucket walk; written by d_move under d_lock)
         ↓
     Inode.private
         ↓
@@ -2221,22 +2234,55 @@ pages truncate drops first (`truncate_setsize` before `free_past`).
 **Dentry** (`fs/dentry.rs`):
 
 Following Linux's `d_lock` pattern, each dentry has a single RwLock protecting
-all mutable state, its name and parent included:
+all mutable state, its parent included; the name has its own leaf lock:
 
 ```rust
 pub struct Dentry {
     pub sb: Weak<SuperBlock>,   // Immutable after creation
+    d_sib: Link, d_sib_owner: Owner, // Parent's children (its d_lock)
+    d_hash: Link,               // Hash bucket (its bit lock)
+    d_hkey: AtomicU64, d_hparent: AtomicUsize, // Hash key, parent (parent's d_lock)
+    d_name: RwLock<DName>,      // Leaf; changed by d_move/d_exchange
     d_lock: RwLock<DentryInner>, // Single lock (like Linux d_lock)
 }
 
 struct DentryInner {
-    name: DName,                // Changed by d_move/d_exchange
     inode: Option<Arc<Inode>>,
     parent: Option<Arc<Dentry>>, // Pinned by the child (Linux d_parent)
-    children: BTreeMap<DName, Arc<Dentry>>,
+    children: OwnedList<SibAdapter>, // Linux d_children
     flags: DentryFlags,
 }
 ```
+
+The tree is Linux's shape: a parent's children are an intrusive list
+(`util::list::OwnedList`, Linux d_children/d_sib) under the parent's
+d_lock, owning a reference to each child, and a child is found through
+the global `DENTRY_HASHTABLE` (Linux dentry_hashtable): a power of two
+of `util::hlist_bl` buckets, one word each with a bit lock in bit 0
+(Linux hlist_bl_lock), sized by `dcache_init` from RAM like
+alloc_large_system_hash (one per 8 KiB) before mnt_init, each bucket
+holding a reference to its entries. The key is the name's hash, a
+SipHash under a per-boot random key (`name::name_hash`, so colliding
+names cannot be built offline), salted with the parent (Linux
+full_name_hash's salt). A dentry is in the tree
+exactly when it is on its parent's list and in its bucket: both are
+added (`hash_in`) and removed (`hash_out`) together, under the parent's
+d_lock held for writing, the bucket lock taken inside it (and inside
+the child's d_lock where that is held: d_drop_tree). Nothing allocates
+to add or remove a child. Order: RENAME_LOCK -> d_lock (parent, then
+child) -> bucket lock (one bucket at a time, a spin lock to the
+preempt count and lockdep, one class) -> `d_name` (leaf).
+`d_lookup` (Linux __d_lookup) holds the parent's d_lock (read: lookups
+take their references under it) and walks the bucket once under its
+lock, comparing key, parent address and name, as Linux compares d_name
+there. That is sound: the key and parent address are stored when the
+dentry is hashed in and change only while it is out of its bucket;
+the name is read under `d_name`, which only d_move/d_exchange write,
+with the dentry out of the tree. Linux walks
+buckets under RCU instead (hk has no call_rcu yet); entries are
+published with Release stores so an RCU walk can come later. A walk
+that misses during a rename (`lookup_cached`/`cached` without the
+directory lock) is fine: lookup_slow rechecks under i_rwsem.
 
 A name (`fs::name::DName`, Linux qstr over d_shortname or an
 external_name) is inline below `DNAME_INLINE_LEN` (40) bytes, else a

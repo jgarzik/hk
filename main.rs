@@ -298,8 +298,9 @@ pub(crate) fn kmain() -> ! {
     // Tasks can be scheduled from here (Linux rest_init)
     system_state::set_system_state(system_state::SystemState::Scheduling);
 
-    // The files' delayed release (Linux vfs_caches_init: files_init,
-    // before mnt_init)
+    // Linux vfs_caches_init: dcache_init (the dentry hash table, sized
+    // to RAM), files_init (the files' delayed release), then mnt_init
+    fs::dentry::dcache_init(FRAME_ALLOCATOR.stats().total_bytes / 4096);
     fs::file::files_init();
     // Linux order: mnt_init (start_kernel), then do_basic_setup:
     // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls

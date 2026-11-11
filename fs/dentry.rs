@@ -8,12 +8,21 @@
 //! Following Linux's `d_lock` pattern, each dentry has a single RwLock (`d_lock`)
 //! that protects all mutable state. This simplifies lock ordering and matches
 //! the proven Linux design.
+//!
+//! The tree is Linux's shape: a parent's children are an intrusive list
+//! (Linux d_children / d_sib) under its d_lock, and a child is found by
+//! (parent, name) in the global hash table of bit-locked buckets
+//! (dentry_hashtable, d_hash). Neither allocates to add or remove a
+//! child.
 
-use alloc::collections::BTreeMap;
+use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use crate::sync::spin::RwLock;
+use crate::util::hlist_bl::BlHead;
+use crate::util::list::{Link, OwnedList, Owner};
 
 use super::inode::Inode;
 use super::name::DName;
@@ -53,21 +62,129 @@ pub fn rename_seq_retry(start: u32) -> bool {
     RENAME_LOCK.read_retry(start)
 }
 
+crate::owned_adapter!(SibAdapter, Dentry, d_sib, d_sib_owner);
+crate::adapter!(HashAdapter, Dentry, d_hash);
+
+/// The references a dentry in the tree has from it: its parent's
+/// children list and its hash bucket
+const TREE_REFS: usize = 2;
+
+/// The dentry hash table (Linux dentry_hashtable): a power of two of
+/// buckets, sized at boot by `dcache_init`
+static DENTRY_HASHTABLE: spin::Once<Box<[BlHead<HashAdapter>]>> = spin::Once::new();
+
+/// Buckets for `pages` pages of RAM (Linux alloc_large_system_hash
+/// with scale 13: one per 8 KiB, rounded up to a power of two)
+fn dhash_entries(pages: u64) -> usize {
+    usize::try_from(pages >> 1)
+        .unwrap_or(usize::MAX)
+        .clamp(1 << 10, 1 << 32)
+        .next_power_of_two()
+}
+
+/// Allocate the hash table (Linux dcache_init, from vfs_caches_init):
+/// before any dentry is hashed. Like Linux, no memory for it is fatal.
+pub fn dcache_init(pages: u64) {
+    DENTRY_HASHTABLE.call_once(|| {
+        let n = dhash_entries(pages);
+        let mut v = Vec::new();
+        v.try_reserve_exact(n)
+            .expect("dcache: no memory for the dentry hash table");
+        v.extend((0..n).map(|_| BlHead::new()));
+        // Host tests have no console
+        #[cfg(not(test))]
+        crate::printkln!(
+            "Dentry cache hash table entries: {} ({} bytes)",
+            n,
+            n * core::mem::size_of::<BlHead<HashAdapter>>()
+        );
+        v.into_boxed_slice()
+    });
+}
+
+fn table() -> &'static [BlHead<HashAdapter>] {
+    #[cfg(test)]
+    dcache_init(0);
+    DENTRY_HASHTABLE
+        .get()
+        .expect("dcache: hash table used before dcache_init")
+}
+
+/// The hash key of the child `hash` (a name's, keyed per boot:
+/// `name::name_hash`) of `parent`: the name's hash salted with the
+/// parent (Linux full_name_hash's salt), so neither a name nor a
+/// parent alone picks the bucket
+fn d_key(parent: &Dentry, hash: u64) -> u64 {
+    let p = core::ptr::from_ref(parent).addr() as u64;
+    (hash ^ p.rotate_left(29)).wrapping_mul(0x61c8_8646_80b5_83eb)
+}
+
+/// The bucket of `key` (Linux d_hash: its top bits)
+fn d_hash(key: u64) -> &'static BlHead<HashAdapter> {
+    let t = table();
+    let bits = t.len().trailing_zeros();
+    // The top `bits` bits: less than the table's length
+    let i = if bits == 0 {
+        0
+    } else {
+        (key >> (64 - bits)) as usize
+    };
+    &t[i]
+}
+
+/// Put `d` (parent `parent`, named `name`) in the tree: on the
+/// parent's children (`p`, its d_lock held for writing), then in its
+/// bucket (Linux d_add's __d_rehash, d_sib)
+fn hash_in(parent: &Dentry, p: &mut DentryInner, d: &Arc<Dentry>, name: &DName) {
+    let key = d_key(parent, name.hash());
+    d.d_hkey.store(key, Relaxed);
+    d.d_hparent
+        .store(core::ptr::from_ref(parent).addr(), Relaxed);
+    p.children.push_back(d.clone());
+    d_hash(key).lock().add_head(d.clone());
+}
+
+/// Take `d` out of the tree if it is a child of the parent whose
+/// d_lock (`p`) is held for writing (Linux __d_drop and the d_sib
+/// unlink): the children list's reference, None if it was not there.
+/// The caller still holds `d`, so it drops nothing last.
+fn hash_out(p: &mut DentryInner, d: &Dentry) -> Option<Arc<Dentry>> {
+    let c = p.children.remove(d)?;
+    let _bucket_ref = d_hash(d.d_hkey.load(Relaxed)).lock().del(d);
+    Some(c)
+}
+
+/// The child `name` of `parent` (Linux __d_lookup), whose d_lock `_p`
+/// is held (lookups take their references under it): one walk of the
+/// bucket under its lock, comparing key, parent and name as Linux
+/// compares d_name there. A hashed dentry's key and parent change only
+/// while it is out of its bucket, and its name only under `d_name`, a
+/// leaf taken here inside the bucket lock (written only while the
+/// dentry is out of the tree, by d_move). A new reference.
+fn d_lookup(parent: &Dentry, _p: &DentryInner, name: &[u8]) -> Option<Arc<Dentry>> {
+    let key = d_key(parent, super::name::name_hash(name));
+    let pa = core::ptr::from_ref(parent).addr();
+    d_hash(key).lock().find(|c| {
+        c.d_hkey.load(Relaxed) == key
+            && c.d_hparent.load(Relaxed) == pa
+            && c.d_name.read().as_bytes() == name
+    })
+}
+
 /// Dentries alive (/proc/sys/fs/dentry-state nr_dentry)
 static NR_DENTRY: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 
 /// Inner mutable state protected by d_lock
 struct DentryInner {
-    /// Name in the parent (empty for a root); changed by d_move
-    name: DName,
     /// The inode this dentry points to (None for negative dentry)
     inode: Option<Arc<Inode>>,
     /// Parent dentry (None for a root), pinned by the child (Linux
     /// d_parent holds a reference): a cwd or open directory keeps its
     /// whole chain valid
     parent: Option<Arc<Dentry>>,
-    /// Children dentries (for directories)
-    children: BTreeMap<DName, Arc<Dentry>>,
+    /// Children in the tree (Linux d_children), each with the list's
+    /// reference; each is also in its hash bucket
+    children: OwnedList<SibAdapter>,
     /// Dentry flags
     flags: DentryFlags,
 }
@@ -76,12 +193,32 @@ struct DentryInner {
 ///
 /// ## Locking
 ///
-/// `d_lock` protects all mutable state, the name and parent included
-/// (Linux d_lock); a parent's d_lock is taken before a child's. `sb` is
-/// immutable.
+/// `d_lock` protects all mutable state, the parent included (Linux
+/// d_lock); a parent's d_lock is taken before a child's. The name has
+/// its own leaf lock, `d_name`, so a bucket walk can compare it (Linux
+/// reads d_name there under d_seq): written by d_move with the dentry's
+/// d_lock held and the dentry out of the tree. `sb` is immutable. `d_sib`/`d_sib_owner` belong to the parent's children
+/// list (its d_lock), `d_hash` to the bucket's bit lock; `d_hkey` and
+/// `d_hparent` are written under the parent's d_lock before the dentry
+/// goes in its bucket and read under the bucket's lock; they change
+/// only while it is out (Linux d_name.hash, d_parent).
 pub struct Dentry {
     /// Back pointer to superblock - immutable after creation
     pub sb: Weak<SuperBlock>,
+
+    /// On the parent's children (Linux d_sib)
+    d_sib: Link,
+    d_sib_owner: Owner,
+    /// In a hash bucket (Linux d_hash)
+    d_hash: Link,
+    /// The key it was hashed under (`d_key`)
+    d_hkey: AtomicU64,
+    /// The parent's address when hashed (compared, never followed)
+    d_hparent: AtomicUsize,
+
+    /// Name in the parent (empty for a root): a leaf, taken inside
+    /// d_lock or a bucket lock
+    d_name: RwLock<DName>,
 
     /// Single lock protecting all mutable state (like Linux d_lock)
     d_lock: RwLock<DentryInner>,
@@ -92,11 +229,16 @@ impl Dentry {
         NR_DENTRY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Self {
             sb,
+            d_sib: Link::new(),
+            d_sib_owner: Owner::new(),
+            d_hash: Link::new(),
+            d_hkey: AtomicU64::new(0),
+            d_hparent: AtomicUsize::new(0),
+            d_name: RwLock::new(name),
             d_lock: RwLock::new(DentryInner {
-                name,
                 inode,
                 parent: None,
-                children: BTreeMap::new(),
+                children: OwnedList::new(),
                 flags: DentryFlags::default(),
             }),
         }
@@ -188,29 +330,31 @@ impl Dentry {
     pub fn add(parent: &Arc<Dentry>, d: Arc<Dentry>, inode: Option<Arc<Inode>>) -> Arc<Dentry> {
         let name = d.name();
         let mut p = parent.d_lock.write();
-        if let Some(c) = p.children.get(name.as_bytes()) {
+        if let Some(c) = d_lookup(parent, &p, &name) {
             let mut ci = c.d_lock.write();
             if ci.inode.is_some() {
                 drop(ci);
-                return c.clone();
+                return c;
             }
             // A negative one is filled only if no one else holds it
             // (lookups take their reference under the parent's d_lock);
             // a held one is replaced, so a holder never sees an inode
             // it did not look up
-            if Arc::strong_count(c) == 1 {
+            if Arc::strong_count(&c) == TREE_REFS + 1 {
                 ci.inode = inode;
                 drop(ci);
-                return c.clone();
+                return c;
             }
             ci.flags.unhashed = true;
+            drop(ci);
+            hash_out(&mut p, &c);
         }
         {
             let mut dl = d.d_lock.write();
             dl.inode = inode;
             dl.parent = Some(parent.clone());
         }
-        p.children.insert(name, d.clone());
+        hash_in(parent, &mut p, &d, &name);
         d
     }
 
@@ -218,7 +362,7 @@ impl Dentry {
     /// d_move may change it): a byte copy or a shared reference, never an
     /// allocation
     pub fn name(&self) -> DName {
-        self.d_lock.read().name.clone()
+        self.d_name.read().clone()
     }
 
     /// Get the inode this dentry points to
@@ -242,19 +386,20 @@ impl Dentry {
     /// Linux vfs_rmdir's shrink_dcache_parent).
     pub fn d_delete(&self, name: &[u8], held: usize) {
         let mut p = self.d_lock.write();
-        let Some(c) = p.children.get(name) else {
+        let Some(c) = d_lookup(self, &p, name) else {
             return;
         };
-        if Arc::strong_count(c) <= held + 1 {
+        if Arc::strong_count(&c) <= held + TREE_REFS + 1 {
             let inode = c.d_lock.write().inode.take();
             drop(p);
             if let Some(i) = inode {
                 crate::io::inotify::d_iput(&i);
             }
-        } else if let Some(c) = p.children.remove(name) {
+        } else {
             c.d_lock.write().flags.unhashed = true;
+            let ours = hash_out(&mut p, &c);
             drop(p);
-            drop(c);
+            drop(ours);
         }
     }
 
@@ -275,15 +420,20 @@ impl Dentry {
 
     /// Look up a child dentry by name
     pub fn lookup_child(&self, name: &[u8]) -> Option<Arc<Dentry>> {
-        self.d_lock.read().children.get(name).cloned()
+        let p = self.d_lock.read();
+        d_lookup(self, &p, name)
     }
 
     /// Drop the child `name` from the tree (Linux d_delete / d_drop):
     /// later lookups ask the file system; a holder keeps an unhashed
     /// dentry
     pub fn remove_child(&self, name: &[u8]) -> Option<Arc<Dentry>> {
-        let c = self.d_lock.write().children.remove(name)?;
+        let mut p = self.d_lock.write();
+        let c = d_lookup(self, &p, name)?;
         c.d_lock.write().flags.unhashed = true;
+        let ours = hash_out(&mut p, &c);
+        drop(p);
+        drop(ours);
         d_drop_tree(&c);
         Some(c)
     }
@@ -331,8 +481,8 @@ impl Prepend {
 
     /// "/name" of `d` in front (ENAMETOOLONG when it does not fit)
     fn name(&mut self, d: &Dentry) -> Result<(), KernelError> {
-        let di = d.d_lock.read();
-        let n: &[u8] = &di.name;
+        let dn = d.d_name.read();
+        let n: &[u8] = &dn;
         let start = self
             .pos
             .checked_sub(n.len() + 1)
@@ -459,15 +609,18 @@ pub fn dentry_state() -> Vec<i64> {
 fn prune_one(parent: &Arc<Dentry>, d: &Arc<Dentry>) -> bool {
     let mut p = parent.d_lock.write();
     let di = d.d_lock.read();
-    let unused = Arc::strong_count(d) == 2 && di.children.is_empty() && di.flags.mounted == 0;
-    let ours = p.children.get(&di.name).is_some_and(|c| Arc::ptr_eq(c, d));
-    if !unused || !ours {
+    let unused =
+        Arc::strong_count(d) == TREE_REFS + 1 && di.children.is_empty() && di.flags.mounted == 0;
+    drop(di);
+    if !unused {
         return false;
     }
-    let name = di.name.clone();
-    drop(di);
-    p.children.remove(&name);
+    let Some(ours) = hash_out(&mut p, d) else {
+        return false;
+    };
     d.d_lock.write().flags.unhashed = true;
+    drop(p);
+    drop(ours);
     true
 }
 
@@ -491,30 +644,23 @@ pub fn d_drop_tree(d: &Arc<Dentry>) {
         };
         let mut p = parent.d_lock.write();
         let mut ci = cur.d_lock.write();
-        let gone = p.children.remove(&ci.name).is_some();
+        let ours = hash_out(&mut p, &cur);
         ci.flags.unhashed = true;
         drop(ci);
         drop(p);
-        if !gone {
+        if ours.is_none() {
             return;
         }
     }
 }
 
-/// The child after `d` in `parent`, by name
+/// The child after `d` in `parent` (none if `d` left it)
 fn next_sibling(parent: &Dentry, d: &Dentry) -> Option<Arc<Dentry>> {
-    use core::ops::Bound::{Excluded, Unbounded};
-    let p = parent.d_lock.read();
-    let di = d.d_lock.read();
-    let key: &[u8] = &di.name;
-    p.children
-        .range::<[u8], _>((Excluded(key), Unbounded))
-        .next()
-        .map(|(_, c)| c.clone())
+    parent.d_lock.read().children.next(d)
 }
 
 fn first_child(d: &Dentry) -> Option<Arc<Dentry>> {
-    d.d_lock.read().children.values().next().cloned()
+    d.d_lock.read().children.front()
 }
 
 /// Prune up to `budget` unused leaves of the tree under `root`, post
@@ -568,23 +714,23 @@ pub fn shrink_dcache(budget: usize) -> usize {
     freed
 }
 
-/// Take `d` off `parent`'s children, if it is the one cached as `name`
-fn unhook_from(d: &Arc<Dentry>, parent: &Dentry, name: &DName) {
+/// Take `d` out of the tree under `parent`, if it is there
+fn unhook_from(d: &Arc<Dentry>, parent: &Dentry) {
     let mut p = parent.d_lock.write();
-    if p.children.get(name).is_some_and(|c| Arc::ptr_eq(c, d)) {
-        p.children.remove(name);
-    }
+    let ours = hash_out(&mut p, d);
+    drop(p);
+    drop(ours);
 }
 
 /// Re-hang `d` as `name` under `parent` (the name a snapshot of the
 /// target's: Linux copy_name, a copy or a shared reference)
 fn rehook(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: DName) {
     let mut di = d.d_lock.write();
-    di.name = name.clone();
+    *d.d_name.write() = name.clone();
     di.parent = Some(parent.clone());
     di.flags.unhashed = false;
     drop(di);
-    parent.d_lock.write().children.insert(name, d.clone());
+    hash_in(parent, &mut parent.d_lock.write(), d, &name);
 }
 
 /// A rename moved `d` to where `target` is (Linux d_move): the target
@@ -599,9 +745,9 @@ pub fn d_move(d: &Arc<Dentry>, target: &Arc<Dentry>) {
     };
     let name = target.name();
     if let Some(old) = d.get_parent() {
-        unhook_from(d, &old, &d.name());
+        unhook_from(d, &old);
     }
-    unhook_from(target, &parent, &name);
+    unhook_from(target, &parent);
     target.d_lock.write().flags.unhashed = true;
     rehook(d, &parent, name);
     drop(w);
@@ -617,8 +763,8 @@ pub fn d_exchange(a: &Arc<Dentry>, b: &Arc<Dentry>) {
         return;
     };
     let (na, nb) = (a.name(), b.name());
-    unhook_from(a, &pa, &na);
-    unhook_from(b, &pb, &nb);
+    unhook_from(a, &pa);
+    unhook_from(b, &pb);
     rehook(a, &pb, nb);
     rehook(b, &pa, na);
 }
@@ -773,6 +919,43 @@ mod tests {
         assert!(r.lookup_child(b"b").is_some_and(|c| Arc::ptr_eq(&c, &a)));
         assert!(b.is_unhashed() && !b.is_negative());
         assert_eq!(r.num_children(), 1);
+    }
+
+    /// The hash finds a child by parent and name: one name under two
+    /// parents is two dentries, and a removed one is gone from both the
+    /// bucket and the children list
+    #[test]
+    fn hash_keys_parent_and_name() {
+        let r = try_arc(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        let b = Dentry::alloc(&r, b"b", Some(inode())).unwrap();
+        let long = [b'z'; 50];
+        let xa = Dentry::alloc(&a, &long, Some(inode())).unwrap();
+        let xb = Dentry::alloc(&b, &long, Some(inode())).unwrap();
+        assert!(!Arc::ptr_eq(&xa, &xb));
+        assert!(a.lookup_child(&long).is_some_and(|c| Arc::ptr_eq(&c, &xa)));
+        assert!(b.lookup_child(&long).is_some_and(|c| Arc::ptr_eq(&c, &xb)));
+        assert!(Dentry::alloc(&a, &long, None).is_ok_and(|c| Arc::ptr_eq(&c, &xa)));
+        assert!(a.remove_child(&long).is_some());
+        assert!(a.lookup_child(&long).is_none() && a.num_children() == 0);
+        assert!(b.lookup_child(&long).is_some() && xa.is_unhashed());
+        assert_eq!(Arc::strong_count(&xa), 1);
+    }
+
+    /// The shrinker drops unused leaves, then the directories they
+    /// leave empty, and keeps what someone holds
+    #[test]
+    fn prune_keeps_held() {
+        let r = try_arc(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        for n in [b"x", b"y"] {
+            Dentry::alloc(&a, n, None).unwrap();
+        }
+        let k = Dentry::alloc(&r, b"k", Some(inode())).unwrap();
+        drop(a);
+        assert_eq!(prune_tree(&r, 100), 3);
+        assert!(r.lookup_child(b"a").is_none());
+        assert!(r.lookup_child(b"k").is_some_and(|c| Arc::ptr_eq(&c, &k)));
     }
 
     /// A real exchange swaps names and parents

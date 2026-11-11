@@ -97,7 +97,7 @@ pub const DNAME_INLINE_LEN: usize = 40;
 /// (copy_name, swap_names) under spin locks.
 #[derive(Clone)]
 pub struct DName {
-    hash: u32,
+    hash: u64,
     repr: DNameRepr,
 }
 
@@ -137,9 +137,9 @@ impl DName {
         }
     }
 
-    /// The name's hash (Linux qstr.hash, here unsalted: the dcache mixes
-    /// in the parent)
-    pub fn hash(&self) -> u32 {
+    /// The name's hash (Linux qstr.hash): keyed per boot, unsalted (the
+    /// dcache mixes in the parent, so a name moves between parents)
+    pub fn hash(&self) -> u64 {
         self.hash
     }
 }
@@ -157,11 +157,31 @@ impl Default for DName {
     }
 }
 
-/// A name's hash (Linux full_name_hash; FNV-1a)
-pub fn name_hash(b: &[u8]) -> u32 {
-    b.iter().fold(0x811c_9dc5u32, |h, &c| {
-        (h ^ u32::from(c)).wrapping_mul(0x0100_0193)
+/// The dcache's hash key, drawn once per boot from the RNG
+#[cfg(not(test))]
+static NAME_KEY: spin::Once<[u64; 2]> = spin::Once::new();
+
+#[cfg(not(test))]
+fn name_key() -> [u64; 2] {
+    *NAME_KEY.call_once(|| {
+        let r = || {
+            (u64::from(crate::random::get_random_u32()) << 32)
+                | u64::from(crate::random::get_random_u32())
+        };
+        [r(), r()]
     })
+}
+
+#[cfg(test)]
+fn name_key() -> [u64; 2] {
+    [3, 4]
+}
+
+/// A name's hash (Linux full_name_hash): SipHash under a per-boot
+/// random key, so colliding names cannot be built offline to pile one
+/// hash chain up
+pub fn name_hash(b: &[u8]) -> u64 {
+    crate::util::siphash::siphash_bytes(name_key(), b)
 }
 
 impl Deref for DName {
