@@ -16,7 +16,7 @@ use super::flags::{
     O_TRUNC, VALID_OPEN_FLAGS,
 };
 use super::mount::MNT_NODEV;
-use super::syscall::{current_fd_table, get_nofile_limit};
+use super::syscall::current_fd_table;
 use crate::task::FD_CLOEXEC;
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
@@ -340,16 +340,17 @@ fn do_sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: &OpenHow) -> KernelRes
     let op = build_open_flags(how)?;
     // O_EMPTYPATH: an empty name is dirfd itself (Linux LOOKUP_EMPTY)
     let path = getname(path_ptr, op.flags & O_EMPTYPATH != 0)?;
-    let file = filp_open(dirfd, &path, &op)?;
-    // RLIMIT_NOFILE enforced inside alloc
+    // The descriptor is reserved before the open (Linux FD_ADD:
+    // get_unused_fd_flags, then do_file_open; EMFILE first) and
+    // released if it fails
     let fd_flags = if how.flags & u64::from(O_CLOEXEC) != 0 {
         FD_CLOEXEC
     } else {
         0
     };
-    current_fd_table()
-        .lock()
-        .alloc_with_flags(file, fd_flags, get_nofile_limit())
+    let fd = super::io::get_unused_fd_flags(fd_flags)?;
+    let file = filp_open(dirfd, &path, &op)?;
+    Ok(fd.install(file))
 }
 
 /// O_TMPFILE (Linux do_tmpfile, vfs_tmpfile): an unnamed regular file in
@@ -513,10 +514,9 @@ pub fn console_on_rootfs() {
         crate::printkln!("Warning: unable to open an initial console.");
         return;
     };
-    let table = current_fd_table();
-    let mut t = table.lock();
-    for fd in 0..3 {
-        t.alloc_at(fd, file.clone());
+    // Linux init_dup: descriptors 0, 1 and 2, the lowest free
+    for _ in 0..3 {
+        let _ = super::io::fd_install(file.clone(), 0);
     }
 }
 
@@ -526,7 +526,7 @@ pub fn console_on_rootfs() {
 /// (`fput_close_sync`)
 pub fn sys_close(fd: i32) -> KernelResult<()> {
     let files = current_fd_table();
-    let file = files.lock().close_fd(fd).ok_or(KernelError::BadFd)?;
+    let file = files.close_fd(fd).ok_or(KernelError::BadFd)?;
     crate::fs::file::filp_flush(&file, files.id());
     crate::fs::file::fput_close_sync(file);
     Ok(())
@@ -549,16 +549,12 @@ pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> KernelResult<()> {
     } else {
         current_fd_table()
     };
-    // Descriptors are i32: nothing is open above i32::MAX
-    let Ok(lo) = i32::try_from(fd) else {
-        return Ok(());
-    };
-    let hi = i32::try_from(max_fd).unwrap_or(i32::MAX);
-    let mut t = files.lock();
+    // Only descriptors below the table's size are visited
+    let (lo, hi) = (fd as usize, max_fd as usize);
     if flags & CLOSE_RANGE_CLOEXEC != 0 {
-        t.cloexec_range(lo, hi);
+        files.range_cloexec(lo, hi);
     } else {
-        t.close_range(lo, hi);
+        files.range_close(lo, hi);
     }
     Ok(())
 }

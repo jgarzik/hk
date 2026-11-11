@@ -1240,8 +1240,12 @@ where
     // a pipe) sees the exec, and its setpgid is EACCES
     percpu::current().clear_flag(crate::task::pf::FORKNOEXEC);
 
-    // Private fd table without the close-on-exec descriptors
-    crate::task::fdtable::exec_task_fd();
+    // Private fd table without the close-on-exec descriptors (Linux
+    // begin_new_exec: unshare_files, then do_close_on_exec)
+    if let Err(e) = crate::task::fdtable::exec_task_fd() {
+        exec_fatal();
+        return Err(e);
+    }
 
     // Signal vfork completion if parent is waiting
     // Must be done before we switch address spaces since parent may be blocked

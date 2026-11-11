@@ -453,18 +453,18 @@ FutexHashBucket.waiters (spin Mutex; wakeups through a WakeQ after
 unlocking)
     ↓
 Global subsystem locks (TASKLIST, fd table `Files`)  ← NOT IRQ-safe;
-    no file is released under `Files` (3.3, Descriptor Tables); order
-    `Files` -> TASKLIST -> Task.alloc_lock (descriptor allocation
-    reads RLIMIT_NOFILE under the table lock; kcmp takes a table out
-    under the task's alloc_lock and locks it after dropping that); no
-    user memory is accessed under any of them. A task's signal
+    `Files` is a leaf: nothing is allocated, flushed or closed and no
+    other lock taken under it (3.3, Descriptor Tables; RLIMIT_NOFILE is
+    read before it, as Linux get_unused_fd_flags; kcmp takes a table
+    out under the task's alloc_lock and locks it after dropping that);
+    no user memory is accessed under any of them. A task's signal
     handlers and signal state, robust-list head and TLS base are
     fields of its `Task` read or changed under TASKLIST; its mm, fd
     table, fs context, namespaces, name, memory policy and I/O context
     under its alloc_lock (3.1.1); under them only leaves:
     SignalStruct.shared (Mutex) → SigHand.action
-    (IrqSpinlock); SignalStruct.rlim (IrqSpinlock leaf, also under
-    `Files`; setrlimit/prlimit64 read the old limit, decide (with the
+    (IrqSpinlock); SignalStruct.rlim (IrqSpinlock leaf;
+    setrlimit/prlimit64 read the old limit, decide (with the
     lock-free capable()) and store in one hold, as Linux do_prlimit
     under task_lock); UCOUNTS;
     wait queue heads
@@ -2096,7 +2096,7 @@ The VFS uses fine-grained locking with `RwLock` for concurrent read access.
 
 #### Descriptor Tables (Linux files_struct)
 
-**Location:** `task/fdtable.rs`, `task/mod.rs` (`FdTable`)
+**Location:** `task/fdtable.rs`, `task/fdbits.rs` (`FdTable`, `Fdt`)
 
 The last `Arc<Files>` closes every descriptor, whoever drops it (a
 /proc reader too; Linux put_files_struct): its drop flushes and may
@@ -2106,15 +2106,41 @@ sleep, so a `Files` reference is never dropped under a spin lock
 files_struct.count) and decides sharing for exec and unshare.
 
 `Files` (one per task, shared by CLONE_FILES) wraps the table's
-`spin::Mutex` (Linux `files->file_lock`), thread context only, a leaf
-apart from the heap. Flushing a file and dropping its closer's POSIX
-locks can sleep, so **no file is flushed or dropped under it**:
-close_range, dup2/dup3 over an open descriptor, exec's close-on-exec
-and installs the table refuses (EMFILE) park the detached `FileRef`s
-in the table, and `FilesGuard::drop` flushes and drops them after
-unlocking (Linux `file_close_fd_locked` under the lock, `filp_close`
-after `spin_unlock`); close(2) takes its file out (`close_fd`),
-flushes it after the unlock and releases it with `fput_close_sync`.
+`spin::Mutex` (Linux `files->file_lock`), thread context only, a
+leaf: **nothing is allocated, flushed or closed under it**. The table
+(`task/fdbits.rs`: `Fdt`, Linux struct fdtable) is a fixed array of
+`max_fds` slots with its open, close-on-exec and full bitmaps, all
+allocated with the lock dropped:
+- A new descriptor (`UnusedFd::alloc`, Linux alloc_fd) is reserved
+  under the lock (open bit set, slot empty: invisible to lookups,
+  close and fork's copy; dup2 onto it is EBUSY) and its file installed
+  in a later hold (`UnusedFd::install`, fd_install); an `UnusedFd`
+  dropped unused releases it (put_unused_fd). When the table is too
+  small (`expand_files`, Linux expand_files/expand_fdtable) one task
+  sets `FdTable.resize_in_progress` under the lock, drops it,
+  allocates the bigger `Fdt` (ENOMEM; EMFILE past fs.nr_open), retakes
+  it, moves the descriptors over, clears the flag and frees the old
+  table after the unlock, then wakes `Files.resize_wait` (a wait queue,
+  woken with no lock held); a task that finds the flag set sleeps
+  there (uninterruptible, Linux wait_event), its condition read under
+  the lock, and looks again. The allocation is then retried.
+  dup2/dup3 (`Files::dup3`, Linux ksys_dup3, do_dup2) grow the same
+  way, then swap the file in under one hold.
+- Fork and unshare (`dup_fd`) allocate the copy's table first, sized
+  by the last open descriptor (Linux sane_fdtable_size); while the
+  source outgrows it they drop the lock and allocate again. The copy
+  takes a reference per installed file (an atomic count) under the
+  lock; reserved descriptors are free in it.
+- Closing detaches a file under the lock (`close_next`, `close_fd`,
+  `take_cloexec`: Linux file_close_fd_locked) and flushes it after the
+  unlock (`filp_close`: the closer's POSIX locks go, then the
+  reference is put); close_range, exec's close-on-exec and the last
+  reference's close of every descriptor (Drop for `Files`, Linux
+  close_files) take one descriptor per lock hold, walking the bitmaps.
+  close(2) releases its file with `fput_close_sync`, the replaced file
+  of a dup2 is closed after the unlock.
+- /proc/<pid>/fd and fdinfo listings look up one descriptor per hold
+  (`next_installed`, Linux fget_task_next) and emit with no lock held.
 Files looked up with `get` are clones taken while the table holds its
 own reference, so dropping them under the lock is never the last
 reference.

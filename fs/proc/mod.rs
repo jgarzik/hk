@@ -1993,15 +1993,14 @@ fn readdir_emit_fd_entries(
     // Its tid only numbers the inodes
     let pid = t.tid();
 
-    // Get FDs from the task's FD table
-    let fds: Vec<i32> = {
-        if let Some(table_arc) = task_files(t) {
-            let table = table_arc.lock();
-            table.fds().copied().collect()
-        } else {
-            return Ok(());
-        }
+    let Some(files) = task_files(t) else {
+        return Ok(());
     };
+    // One descriptor per table lock hold, emitted after it (Linux
+    // proc_readfd_common: fget_task_next)
+    let fds = core::iter::successors(files.lock().next_installed(0), |&fd| {
+        files.lock().next_installed(fd as usize + 1)
+    });
 
     // Emit all FD symlinks
     for fd in fds {
@@ -2035,15 +2034,14 @@ fn readdir_emit_fdinfo_entries(
     // Its tid only numbers the inodes
     let pid = t.tid();
 
-    // Get FDs from the task's FD table
-    let fds: Vec<i32> = {
-        if let Some(table_arc) = task_files(t) {
-            let table = table_arc.lock();
-            table.fds().copied().collect()
-        } else {
-            return Ok(());
-        }
+    let Some(files) = task_files(t) else {
+        return Ok(());
     };
+    // One descriptor per table lock hold, emitted after it (Linux
+    // proc_readfd_common: fget_task_next)
+    let fds = core::iter::successors(files.lock().next_installed(0), |&fd| {
+        files.lock().next_installed(fd as usize + 1)
+    });
 
     // Emit all fdinfo files
     for fd in fds {

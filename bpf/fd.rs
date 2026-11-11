@@ -11,7 +11,7 @@ use super::map::BpfMap;
 use super::prog::BpfProg;
 use crate::fs::anon_inodes::anon_inode_getfile;
 use crate::fs::file::{File, FileOps, flags};
-use crate::fs::syscall::{current_fd_table, get_nofile_limit};
+use crate::fs::syscall::current_fd_table;
 use crate::io::poll::{POLLERR, PollTable};
 use crate::util::error::KernelError;
 
@@ -82,11 +82,7 @@ impl FileOps for BpfProgFileOps {
 pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
     let file = anon_inode_getfile("bpf-map", &BPF_MAP_FOPS, map, flags::O_RDWR)?;
 
-    // Allocate file descriptor using the fd table
-    let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
-
-    table.alloc_with_flags(file, 0, get_nofile_limit())
+    crate::fs::io::fd_install(file, 0)
 }
 
 /// Create a file descriptor for a BPF program
@@ -95,11 +91,7 @@ pub fn create_bpf_prog_fd(prog: Arc<BpfProg>, prog_type: u32) -> Result<i32, Ker
 
     let file = anon_inode_getfile("bpf-prog", &BPF_PROG_FOPS, private, flags::O_RDWR)?;
 
-    // Allocate file descriptor using the fd table
-    let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
-
-    table.alloc_with_flags(file, 0, get_nofile_limit())
+    crate::fs::io::fd_install(file, 0)
 }
 
 // =============================================================================

@@ -122,9 +122,7 @@ pub fn sys_memfd_create(uname: UserPtr<u8>, flags: u32) -> KernelResult<i32> {
     } else {
         0
     };
-    crate::fs::syscall::current_fd_table()
-        .lock()
-        .alloc_with_flags(file, fd_flags, crate::fs::syscall::get_nofile_limit())
+    crate::fs::io::fd_install(file, fd_flags)
 }
 
 /// F_ADD_SEALS and F_GET_SEALS (Linux memfd_fcntl)

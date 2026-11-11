@@ -10,6 +10,7 @@ use super::iov_iter::{IovDest, IovSource};
 
 use super::iov::IoVec;
 use super::syscall::{MAX_RW_COUNT, current_fd_table};
+use crate::task::fdtable::UnusedFd;
 
 /// The current task's file at `fd`, or EBADF, a path-only (O_PATH)
 /// one included (Linux fget/fdget): the fd table lock is dropped before
@@ -30,14 +31,19 @@ pub fn fget_raw(fd: i32) -> Result<FileRef, KernelError> {
     current_fd_table().lock().get(fd).ok_or(KernelError::BadFd)
 }
 
+/// Reserve the current task's lowest free descriptor, FD_CLOEXEC from
+/// `flags` (Linux get_unused_fd_flags): EMFILE at RLIMIT_NOFILE, ENOMEM
+/// if the table cannot grow
+pub fn get_unused_fd_flags(flags: u32) -> Result<UnusedFd, KernelError> {
+    let nofile = super::syscall::get_nofile_limit();
+    UnusedFd::alloc(current_fd_table(), 0, flags, nofile)
+}
+
 /// Install `file` at the current task's lowest free descriptor with fd
 /// flags `flags` (Linux get_unused_fd_flags + fd_install): EMFILE past
 /// RLIMIT_NOFILE, ENOMEM if the table cannot grow
 pub fn fd_install(file: FileRef, flags: u32) -> Result<i32, KernelError> {
-    let nofile = super::syscall::get_nofile_limit();
-    current_fd_table()
-        .lock()
-        .alloc_with_flags(file, flags, nofile)
+    Ok(get_unused_fd_flags(flags)?.install(file))
 }
 
 /// Bytes the segments cover, capped at MAX_RW_COUNT

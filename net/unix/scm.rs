@@ -321,8 +321,6 @@ fn put_fds(m: &mut RecvMsg<'_>, fpl: FpList) {
     let files = fpl.take();
     let count = files.len();
     let mut fds = Vec::new();
-    // Clones go to the table, so a failed install never drops the last
-    // reference under the table lock
     for f in files.iter().take(max) {
         match crate::net::syscall::fd_install(f.clone(), cloexec) {
             Ok(fd) => fds.extend_from_slice(&fd.to_ne_bytes()),

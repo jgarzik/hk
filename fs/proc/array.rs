@@ -223,17 +223,9 @@ fn shd_pnd(s: &Snap) -> u64 {
     s.shared.as_ref().map_or(0, |p| p.lock().signal.0)
 }
 
-/// The fd table's size (Linux max_fds: 64, then doubling in 128s)
+/// The fd table's size (Linux max_fds)
 fn fd_size(s: &Snap) -> u64 {
-    let Some(f) = &s.files else {
-        return 0;
-    };
-    let need = f.lock().fds().last().map_or(0, |&fd| fd as u64 + 1);
-    if need <= 64 {
-        64
-    } else {
-        128 * need.div_ceil(128).next_power_of_two()
-    }
+    s.files.as_ref().map_or(0, |f| f.lock().max_fds() as u64)
 }
 
 /// RLIMIT_RSS soft limit

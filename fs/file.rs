@@ -1064,7 +1064,7 @@ impl File {
 
         // The open file description is gone: its flock locks go (Linux
         // __fput -> locks_remove_file). POSIX locks are the closer's,
-        // released at each close (fdtable::FilesGuard), not here (this
+        // released at each close (fdtable `filp_close`), not here (this
         // may run in another process's context)
         super::flock::release_file_locks(self);
 

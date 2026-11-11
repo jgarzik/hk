@@ -71,27 +71,16 @@ pub fn sys_socketpair(
     // file for `a` must still release `b`
     let fa = sock_alloc_file(a.dismiss(), nb)?;
     let fb = sock_alloc_file(b.dismiss(), nb)?;
-    sv.write(&install_pair(fa, fb, cloexec)?)?;
-    Ok(())
-}
-
-/// Install two files in new descriptors, or neither (the table
-/// releases undone and refused files after its lock is dropped)
-fn install_pair(a: FileRef, b: FileRef, cloexec: bool) -> KernelResult<[i32; 2]> {
-    let table = crate::task::percpu::current()
-        .files()
-        .ok_or(KernelError::BadFd)?;
+    // Both descriptors reserved and stored before either file is
+    // installed; a failure releases the reservations (Linux
+    // __sys_socketpair: get_unused_fd_flags, put_user, fd_install)
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
-    let max = crate::fs::syscall::get_nofile_limit();
-    let mut t = table.lock();
-    let fd1 = t.alloc_with_flags(a, fl, max)?;
-    match t.alloc_with_flags(b, fl, max) {
-        Ok(fd2) => Ok([fd1, fd2]),
-        Err(e) => {
-            t.close(fd1);
-            Err(e)
-        }
-    }
+    let fd1 = crate::fs::io::get_unused_fd_flags(fl)?;
+    let fd2 = crate::fs::io::get_unused_fd_flags(fl)?;
+    sv.write(&[fd1.fd(), fd2.fd()])?;
+    fd1.install(fa);
+    fd2.install(fb);
+    Ok(())
 }
 
 /// The address argument as bytes (empty when none)

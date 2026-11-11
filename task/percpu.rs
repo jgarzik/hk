@@ -2563,10 +2563,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // SAFETY: not on a run queue yet
     unsafe { *child_task.se.ctx() = context };
 
-    // CLONE_PIDFD: the child's pidfd is in the caller's table and its
-    // number stored before the child exists, so a failure leaves
-    // neither (Linux copy_process: pidfd_prepare and put_user, EFAULT
-    // through bad_fork_put_pidfd)
+    // CLONE_PIDFD: the child's pidfd descriptor is reserved in the
+    // caller's table and its number stored before the child exists; the
+    // file is installed past the point of no return, so a failure
+    // releases the reservation and leaves no descriptor (Linux
+    // copy_process: pidfd_prepare and put_user, bad_fork_put_pidfd,
+    // fd_install at the end)
     let pidfd = if config.flags & CLONE_PIDFD != 0 {
         Some(clone_pidfd(
             child_thread_pid,
@@ -2586,9 +2588,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // this child or this sees the namespace dying
         if !crate::task::pid::ns_adding(child_task.pid_ns()) {
             drop(table);
-            if let Some(fd) = pidfd {
-                close_pidfd(fd);
-            }
+            // The reservation goes with `pidfd` (put_unused_fd)
             return Err(KernelError::OutOfMemory);
         }
         if child_init {
@@ -2708,6 +2708,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // tid), as the caller numbers it
     let return_value = Tid::from(child_vnr);
 
+    // Nothing fails from here: the pidfd goes in its descriptor (Linux
+    // copy_process: fd_install(pidfd, pidfile))
+    if let Some((fd, file)) = pidfd {
+        fd.install(file);
+    }
+
     // CLONE_VFORK: the completion must be in place before the child can
     // run (it may exec or exit at once on another CPU; Linux
     // p->vfork_done)
@@ -2755,36 +2761,22 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     Ok(return_value)
 }
 
-/// CLONE_PIDFD: a close-on-exec pidfd of the child `pid` (a thread
-/// pidfd for a new thread: Linux PIDFD_THREAD) in the caller's table,
-/// its number stored at `ptr`: EMFILE, ENOMEM, or EFAULT (the
-/// descriptor closed again). The child does not exist yet: nothing
-/// but the caller's threads can see the descriptor before clone
-/// returns (Linux reserves it and installs it at the end).
-fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> KernelResult<i32> {
+/// CLONE_PIDFD: a close-on-exec descriptor reserved in the caller's
+/// table and a pidfd of the child `pid` for it (a thread pidfd for a
+/// new thread: Linux PIDFD_THREAD), the number stored at `ptr` (Linux
+/// pidfd_prepare, put_user): EMFILE, ENOMEM, EFAULT. Installed once the
+/// clone cannot fail; dropped before, the reservation is released.
+fn clone_pidfd(
+    pid: Arc<crate::task::pid::Pid>,
+    thread: bool,
+    ptr: u64,
+) -> KernelResult<(crate::task::fdtable::UnusedFd, crate::fs::FileRef)> {
     use crate::task::pidfd::pidfd_flags::PIDFD_THREAD;
     let flags = if thread { PIDFD_THREAD } else { 0 };
+    let fd = crate::fs::io::get_unused_fd_flags(crate::task::FD_CLOEXEC)?;
     let file = crate::task::pidfd::pidfd_file(pid, flags)?;
-    let files = current().files().ok_or(KernelError::BadFd)?;
-    let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-    let fd = files
-        .lock()
-        .alloc_with_flags(file, crate::task::FD_CLOEXEC, nofile)?;
-    if crate::uaccess::put_user::<i32>(ptr, fd).is_err() {
-        // Released after the table lock (FilesGuard)
-        files.lock().close(fd);
-        return Err(KernelError::BadAddress);
-    }
-    Ok(fd)
-}
-
-/// A clone whose child was not made after all closes the pidfd
-/// [`clone_pidfd`] gave the caller (Linux bad_fork_put_pidfd)
-fn close_pidfd(fd: i32) {
-    if let Some(files) = current().files() {
-        // Released after the table lock (FilesGuard)
-        files.lock().close(fd);
-    }
+    crate::uaccess::put_user::<i32>(ptr, fd.fd()).map_err(|_| KernelError::BadAddress)?;
+    Ok((fd, file))
 }
 
 /// Start a thread of the current task's process that runs `f(arg)` in
