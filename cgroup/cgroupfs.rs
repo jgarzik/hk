@@ -22,8 +22,6 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use crate::sync::spin::RwLock;
-
 use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{DirContext, DirEntry, File, FileOps, RwFlags, WRITE_CHUNK};
@@ -110,7 +108,8 @@ impl CgroupControlFileType {
     }
 }
 
-/// Cgroupfs inode private data
+/// Cgroupfs inode private data: fixed when the inode is made, so read
+/// without a lock (Linux kernfs_node->priv)
 #[derive(Clone)]
 pub enum CgroupfsInodeData {
     /// Cgroup directory
@@ -152,31 +151,19 @@ impl AsAny for CgroupfsInodeData {
 
 impl InodeData for CgroupfsInodeData {}
 
-/// Wrapper for interior mutability
-pub struct CgroupfsInodeWrapper(pub RwLock<CgroupfsInodeData>);
-
-impl AsAny for CgroupfsInodeWrapper {
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
-}
-
-impl InodeData for CgroupfsInodeWrapper {}
-
 /// Cgroupfs inode operations
 pub struct CgroupfsInodeOps;
 
 impl InodeOps for CgroupfsInodeOps {
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
+        let data = private
             .as_ref()
             .as_any()
-            .downcast_ref::<CgroupfsInodeWrapper>()
+            .downcast_ref::<CgroupfsInodeData>()
             .ok_or(KernelError::Io)?;
 
-        let data = wrapper.0.read();
-        match &*data {
+        match data {
             CgroupfsInodeData::Directory { cgroup } => {
                 let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
 
@@ -214,15 +201,13 @@ impl InodeOps for CgroupfsInodeOps {
 
     fn mkdir(&self, dir: &Inode, name: &[u8], _mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
+        let data = private
             .as_ref()
             .as_any()
-            .downcast_ref::<CgroupfsInodeWrapper>()
+            .downcast_ref::<CgroupfsInodeData>()
             .ok_or(KernelError::Io)?;
 
-        // Out of the inode's spin lock before cgroup_mkdir takes
-        // CGROUP_MUTEX
-        let parent = match &*wrapper.0.read() {
+        let parent = match data {
             CgroupfsInodeData::Directory { cgroup } => cgroup.clone(),
             _ => return Err(KernelError::NotDirectory),
         };
@@ -237,15 +222,13 @@ impl InodeOps for CgroupfsInodeOps {
 
     fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
+        let data = private
             .as_ref()
             .as_any()
-            .downcast_ref::<CgroupfsInodeWrapper>()
+            .downcast_ref::<CgroupfsInodeData>()
             .ok_or(KernelError::Io)?;
 
-        // Out of the inode's spin lock before cgroup_rmdir takes
-        // CGROUP_MUTEX
-        let parent = match &*wrapper.0.read() {
+        let parent = match data {
             CgroupfsInodeData::Directory { cgroup } => cgroup.clone(),
             _ => return Err(KernelError::NotDirectory),
         };
@@ -277,11 +260,9 @@ fn create_cgroup_dir_inode(
         Arc::downgrade(&sb),
         &CGROUPFS_INODE_OPS,
     ))?;
-    inode.set_private(try_arc(CgroupfsInodeWrapper(RwLock::new(
-        CgroupfsInodeData::Directory {
-            cgroup: Arc::downgrade(cgroup),
-        },
-    )))?);
+    inode.set_private(try_arc(CgroupfsInodeData::Directory {
+        cgroup: Arc::downgrade(cgroup),
+    })?);
     Ok(inode)
 }
 
@@ -307,12 +288,10 @@ fn create_control_file_inode(
         Arc::downgrade(&sb),
         &CGROUPFS_INODE_OPS,
     ))?;
-    inode.set_private(try_arc(CgroupfsInodeWrapper(RwLock::new(
-        CgroupfsInodeData::ControlFile {
-            cgroup: Arc::downgrade(cgroup),
-            file_type,
-        },
-    )))?);
+    inode.set_private(try_arc(CgroupfsInodeData::ControlFile {
+        cgroup: Arc::downgrade(cgroup),
+        file_type,
+    })?);
     Ok(inode)
 }
 
@@ -346,13 +325,11 @@ fn create_subsys_file_inode(
         Arc::downgrade(&sb),
         &CGROUPFS_INODE_OPS,
     ))?;
-    inode.set_private(try_arc(CgroupfsInodeWrapper(RwLock::new(
-        CgroupfsInodeData::SubsysFile {
-            cgroup: Arc::downgrade(cgroup),
-            controller,
-            file_name,
-        },
-    )))?);
+    inode.set_private(try_arc(CgroupfsInodeData::SubsysFile {
+        cgroup: Arc::downgrade(cgroup),
+        controller,
+        file_name,
+    })?);
     Ok(inode)
 }
 
@@ -544,13 +521,12 @@ fn handle_subsys_file_write(
 fn cgroupfs_content(file: &File) -> Result<Vec<u8>, KernelError> {
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
     let private = inode.get_private().ok_or(KernelError::Io)?;
-    let wrapper = private
+    let data = private
         .as_ref()
         .as_any()
-        .downcast_ref::<CgroupfsInodeWrapper>()
+        .downcast_ref::<CgroupfsInodeData>()
         .ok_or(KernelError::Io)?;
-    let data = wrapper.0.read();
-    match &*data {
+    match data {
         CgroupfsInodeData::ControlFile { cgroup, file_type } => {
             let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
             generate_control_file_content(&cg, *file_type)
@@ -571,26 +547,23 @@ fn cgroupfs_content(file: &File) -> Result<Vec<u8>, KernelError> {
 fn cgroupfs_write(file: &File, buf: &[u8]) -> Result<usize, KernelError> {
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
     let private = inode.get_private().ok_or(KernelError::Io)?;
-    let wrapper = private
+    let data = private
         .as_ref()
         .as_any()
-        .downcast_ref::<CgroupfsInodeWrapper>()
+        .downcast_ref::<CgroupfsInodeData>()
         .ok_or(KernelError::Io)?;
 
     // Writes run under CGROUP_MUTEX (Linux cgroup_kn_lock_live for
-    // cgroup.procs, subtree_control and freeze), taken before the
-    // inode's spin lock; a removed cgroup's files are ENODEV (Linux
-    // kernfs_fop_write: no active reference to a removed node)
+    // cgroup.procs, subtree_control and freeze); a removed cgroup's
+    // files are ENODEV (Linux kernfs_fop_write: no active reference to
+    // a removed node)
     let _g = crate::cgroup::CGROUP_MUTEX.lock();
-    // A copy, so no spin lock is held while the write sleeps
-    // (cgroup.procs takes the threadgroup rwsem)
-    let data = wrapper.0.read().clone();
     let live = |c: &alloc::sync::Weak<Cgroup>| {
         c.upgrade()
             .filter(|c| !c.is_dead())
             .ok_or(KernelError::NoDevice)
     };
-    match &data {
+    match data {
         CgroupfsInodeData::ControlFile { cgroup, file_type } => {
             let cg = live(cgroup)?;
             handle_control_file_write(&cg, *file_type, buf)?;
@@ -671,14 +644,13 @@ impl FileOps for CgroupfsFileOps {
     fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let private = inode.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
+        let data = private
             .as_ref()
             .as_any()
-            .downcast_ref::<CgroupfsInodeWrapper>()
+            .downcast_ref::<CgroupfsInodeData>()
             .ok_or(KernelError::Io)?;
 
-        let data = wrapper.0.read();
-        match &*data {
+        match data {
             CgroupfsInodeData::Directory { cgroup } => {
                 let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
 
@@ -781,11 +753,9 @@ impl SuperOps for CgroupfsSuperOps {
             Arc::downgrade(sb),
             i_op,
         ))?;
-        inode.set_private(try_arc(CgroupfsInodeWrapper(RwLock::new(
-            CgroupfsInodeData::Directory {
-                cgroup: Weak::new(),
-            },
-        )))?);
+        inode.set_private(try_arc(CgroupfsInodeData::Directory {
+            cgroup: Weak::new(),
+        })?);
         Ok(inode)
     }
 }
@@ -824,11 +794,9 @@ fn cgroupfs_mount(
         Arc::downgrade(&sb),
         &CGROUPFS_INODE_OPS,
     ))?;
-    root_inode.set_private(try_arc(CgroupfsInodeWrapper(RwLock::new(
-        CgroupfsInodeData::Directory {
-            cgroup: Arc::downgrade(&root_cg),
-        },
-    )))?);
+    root_inode.set_private(try_arc(CgroupfsInodeData::Directory {
+        cgroup: Arc::downgrade(&root_cg),
+    })?);
 
     // Create root dentry
     let root_dentry = try_arc(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;

@@ -23,6 +23,7 @@
 //! - `memory`: Memory usage limits and accounting
 //! - `io`: Block I/O bandwidth limits
 
+use crate::sync::RwSem;
 use crate::sync::spin::{Mutex, RwLock};
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
@@ -57,12 +58,10 @@ pub type CgroupId = u64;
 ///
 /// ## Thread Safety
 ///
-/// The Cgroup struct uses fine-grained locking:
-/// - `children`: RwLock for directory operations (mkdir/rmdir)
-/// - `tasks`: RwLock for task list iteration and modification
-/// - `subsys`: RwLock for per-controller state access
-///
-/// Lock ordering: children -> tasks -> subsys
+/// - `children`, `subsys`: sleeping RwSems, written under CGROUP_MUTEX
+///   (Linux cgroup_mutex; lookups read `children` as kernfs_rwsem's
+///   readers do); thread context, never under a spin lock
+/// - `tasks`: spin RwLock (Linux css_set_lock), a leaf
 pub struct Cgroup {
     /// Unique identifier for this cgroup
     pub id: CgroupId,
@@ -75,7 +74,7 @@ pub struct Cgroup {
     parent: RwLock<Option<Weak<Cgroup>>>,
 
     /// Child cgroups (name -> Cgroup)
-    children: RwLock<BTreeMap<Vec<u8>, Arc<Cgroup>>>,
+    children: RwSem<BTreeMap<Vec<u8>, Arc<Cgroup>>>,
 
     /// Reference to the root of this hierarchy
     root: Weak<CgroupRoot>,
@@ -89,7 +88,7 @@ pub struct Cgroup {
 
     /// Per-controller subsystem state (controller_type -> css)
     /// Only populated for controllers enabled on this cgroup
-    subsys: RwLock<BTreeMap<ControllerType, Arc<CgroupSubsysState>>>,
+    subsys: RwSem<BTreeMap<ControllerType, Arc<CgroupSubsysState>>>,
 
     /// Tasks currently in this cgroup (pid list for iteration)
     tasks: RwLock<Vec<Pid>>,
@@ -149,11 +148,11 @@ impl Cgroup {
             id,
             name,
             parent: RwLock::new(parent.map(Arc::downgrade)),
-            children: RwLock::new(BTreeMap::new()),
+            children: RwSem::new(BTreeMap::new()),
             root: Arc::downgrade(root),
             level,
             ancestors: RwLock::new(Vec::new()),
-            subsys: RwLock::new(BTreeMap::new()),
+            subsys: RwSem::new(BTreeMap::new()),
             tasks: RwLock::new(Vec::new()),
             dead: AtomicBool::new(false),
             subtree_control: AtomicU64::new(0),
@@ -241,6 +240,17 @@ impl Cgroup {
         self.subsys.read().keys().cloned().collect()
     }
 
+    /// Each enabled controller's state with its ops, read before any
+    /// spin lock is taken (Linux: the css_set a migration moves to is
+    /// found under cgroup_mutex, before css_set_lock)
+    fn css_ops(&self) -> Vec<(Arc<CgroupSubsysState>, &'static dyn CgroupSubsysOps)> {
+        self.subsys
+            .read()
+            .iter()
+            .filter_map(|(&c, css)| Some((css.clone(), CGROUP_ROOT.get_controller(c)?)))
+            .collect()
+    }
+
     /// Add a task to this cgroup
     pub fn add_task(&self, pid: Pid) {
         let mut tasks = self.tasks.write();
@@ -274,7 +284,9 @@ impl Cgroup {
 
     /// Check if cgroup is empty (no tasks, no children)
     pub fn is_empty(&self) -> bool {
-        self.tasks.read().is_empty() && self.children.read().is_empty()
+        // The sleeping lock first, never under the spin one
+        let no_children = self.children.read().is_empty();
+        no_children && self.tasks.read().is_empty()
     }
 
     /// Check if this cgroup or any ancestor is frozen
@@ -663,26 +675,37 @@ pub fn cgroup_init() {
 /// which exit also takes to detach it, so a thread that exits meanwhile
 /// is skipped, never re-attached
 pub fn migrate_thread_group(target: &Arc<Cgroup>, pid: Pid) -> Result<(), KernelError> {
-    let root = CGROUP_ROOT.clone();
     let threads = thread_group(pid)?;
-    let ctrls: Vec<_> = target
-        .enabled_controllers()
-        .into_iter()
-        .filter_map(|c| Some((target.css(c)?, root.get_controller(c)?)))
-        .collect();
+    let to = target.css_ops();
     for t in &threads {
-        for (css, ops) in &ctrls {
+        for (css, ops) in &to {
             ops.can_attach(css, t.tid() as Pid)?;
         }
     }
     for t in &threads {
-        migrate_one(&root, target, t);
+        migrate_one(target, &to, t);
     }
     Ok(())
 }
 
-/// Thread `t`'s move (Linux cgroup_migrate_execute for one task)
-fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, t: &Task) {
+/// Thread `t`'s move (Linux cgroup_migrate_execute for one task) to
+/// `target`, whose controllers are `to`. Its current cgroup's
+/// controllers are read first, outside the task's cgroup lock (Linux
+/// cgroup_migrate_add_src / prepare_dst under cgroup_mutex, before
+/// css_set_lock). That cgroup stays current until the lock is taken:
+/// other migrations (CGROUP_MUTEX) and post_fork
+/// (CGROUP_THREADGROUP_RWSEM) are held off, and exit marks the thread
+/// exiting before it clears the pointer
+fn migrate_one(
+    target: &Arc<Cgroup>,
+    to: &[(Arc<CgroupSubsysState>, &dyn CgroupSubsysOps)],
+    t: &Task,
+) {
+    let old = get_task_cgroup(t);
+    if old.as_ref().is_some_and(|o| Arc::ptr_eq(o, target)) {
+        return;
+    }
+    let from = old.as_ref().map(|o| o.css_ops()).unwrap_or_default();
     let mut slot = t.cgroup.lock();
     // Exiting: exit owns it (Linux skips PF_EXITING). Exit sets the flag
     // before it detaches under this lock, so a thread seen live here is
@@ -692,20 +715,13 @@ fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, t: &Task) {
     }
     let pid = t.tid() as Pid;
     if let Some(old) = slot.clone() {
-        if Arc::ptr_eq(&old, target) {
-            return;
-        }
-        for c in old.enabled_controllers() {
-            if let (Some(css), Some(ops)) = (old.css(c), root.get_controller(c)) {
-                ops.detach(&css, pid);
-            }
+        for (css, ops) in &from {
+            ops.detach(css, pid);
         }
         old.remove_task(pid);
     }
-    for c in target.enabled_controllers() {
-        if let (Some(css), Some(ops)) = (target.css(c), root.get_controller(c)) {
-            ops.attach(&css, pid);
-        }
+    for (css, ops) in to {
+        ops.attach(css, pid);
     }
     target.add_task(pid);
     *slot = Some(target.clone());
@@ -733,15 +749,16 @@ pub fn detach_task(t: &Task) {
 /// rmdir, cgroup.procs, subtree_control and freeze writes, and a
 /// CLONE_INTO_CGROUP fork from admission to post_fork; whoever holds it
 /// sees a cgroup's death and membership settle together. Under a
-/// cgroupfs directory's i_rwsem; above every cgroup spin lock and
-/// TASKLIST.
+/// cgroupfs directory's i_rwsem; above `Cgroup.{children, subsys}`,
+/// every cgroup spin lock and TASKLIST.
 pub static CGROUP_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 /// Fork against migration (Linux cgroup_threadgroup_rwsem, its default
 /// global form): a fork holds it shared from admission to post_fork, a
 /// cgroup.procs write exclusively while it moves a thread group, so no
 /// thread is created in the old cgroup behind a migration. Under
-/// CGROUP_MUTEX; above TASKLIST and the cgroup spin locks.
+/// CGROUP_MUTEX; above `Cgroup.subsys`, TASKLIST and the cgroup spin
+/// locks.
 pub static CGROUP_THREADGROUP_RWSEM: crate::sync::RwSem<()> = crate::sync::RwSem::new(());
 
 /// The threads of the process `pid` names in the caller's pid
