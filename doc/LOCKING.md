@@ -2538,8 +2538,10 @@ NAMESPACE_SEM; pivot_root's chroot_fs_refs runs after both are
 released (TASKLIST read to collect the tasks, then each FsStruct.inner).
 umount writes the filesystem back after releasing NAMESPACE_SEM
 (writeback takes inode locks; Linux syncs in deactivate_super after
-namespace_unlock). Mount ids come from `MNT_IDS` (spin Mutex leaf,
-Linux mnt_id_ida) and `MNT_ID_UNIQUE` (atomic). Deviation: no global
+namespace_unlock). Mount ids come from `MNT_IDS` (`util::ida::Ida`,
+Linux mnt_id_ida: its IrqSpinlock leaf, the bitmap grown outside it;
+a mount's drop frees its id in whatever context it runs) and
+`MNT_ID_UNIQUE` (atomic). Deviation: no global
 (parent, mountpoint) hash; crossing scans the current mount's children.
 Propagation (`fs/pnode.rs`) runs entirely under NAMESPACE_SEM (write):
 peer groups live in `pnode::GROUPS` (sleeping `sync::Mutex`, inside
@@ -4156,7 +4158,7 @@ not rely on either.
 | Drivers' IRQ registrations: `VirtioDevice.irq` (MSI-X vectors, then their per-vector handlers or the INTx handler, owning the virtio driver's callbacks), the e1000 binding's `irq`, `Serial8250.irq`, `Pl011Port.irq` | spin `Mutex<Option<IrqRegistration<..>>>` (virtio: `Mutex<IrqSlot>`) | thread only (probe sets it, remove takes it; virtio: `alloc_vectors` enables MSI-X unlocked and stores the vectors, `setup_vq` writes a queue's vector under it, `request_irq` claims the slot, registers unlocked, then stores it or frees the claim; `free_irq` takes it) | leaf: vectors are enabled, registrations made and dropped (`IrqDesc.lock`, `MATRIX`) unlocked; the ISR never takes it (the handler holds its device state) |
 | PCI and USB `DYNIDS` (hw/pci/driver.rs, hw/usb/usbcore.rs; Linux dynids.lock) | spin Mutex | thread only | leaf over an intrusive list of boxed ids (Linux pci_dynid/usb_dynid): new_id allocates its entry before taking it, remove_id frees after releasing it; each match takes it alone; the probing after new_id runs with it dropped |
 | `ScsiDisk.state` (block/sd.rs, Linux sdev_state + state_mutex) | spin `Mutex<ScsiDeviceState>` | thread only | leaf: transitions (Linux's legal table) and each command's state check take it alone, never across I/O |
-| `util::ida::Ida` allocators: virtio, virtio-blk and sd indexes (Linux virtio_index_ida, vd_index_ida, sd_index_ida), namespace inode numbers (`ns::inum`, Linux proc_inum_ida) | `IrqSpinlock` | alloc thread only; free any context | leaf; nothing allocates under it (alloc grows the bitmap with it dropped, fallibly for `try_alloc`); a disk index is freed when the disk's last reference drops, a namespace's number when the namespace goes |
+| `util::ida::Ida` allocators: virtio, virtio-blk and sd indexes (Linux virtio_index_ida, vd_index_ida, sd_index_ida), namespace inode numbers (`ns::inum`, Linux proc_inum_ida), mount ids (`fs::mount` MNT_IDS, Linux mnt_id_ida) | `IrqSpinlock` | alloc thread only; free any context | leaf; nothing allocates under it (alloc grows the bitmap with it dropped, fallibly for `try_alloc`); a disk index is freed when the disk's last reference drops, a namespace's number when the namespace goes, a mount id when the mount drops |
 | `SYSTEM_TRANSITION` (`power.rs`) | sleeping `sync::Mutex<()>` | thread only (reboot(2)) | Linux system_transition_mutex: held from after the permission and magic checks through `device_shutdown` and the arch power-off/restart/halt, which do not return; outermost: taken before `core::DEVICES_LIST` and every driver lock the shutdown callbacks take |
 | x86 `power::POWER` (`arch/x86_64/power.rs`) | `spin::Once` | thread only (boot set; power-off/reboot read) | set once from the FADT before `reboot(2)` can run, read lock-free after; the ACPI register sequences (`hw/acpi/hw.rs`) take no locks |
 

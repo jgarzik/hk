@@ -15,6 +15,7 @@ use super::dentry::Dentry;
 use super::inode::FileType;
 use super::path_ref::Path;
 use super::superblock::{FileSystemType, SuperBlock};
+use crate::util::ida::Ida;
 use crate::util::kalloc::{arc_nofail, try_arc};
 
 use crate::block::get_blkdev;
@@ -117,17 +118,11 @@ impl Stable for MntHash {
 
 crate::owned_adapter!(pub MntChild, Mount, mnt_child, mnt_child_owner);
 
-/// Mount ids: the lowest free one, from 0 (Linux mnt_id_xa, an
-/// XA_FLAGS_ALLOC xarray: the kernel's tmpfs gets 0, the nullfs root 1)
-struct MntIds {
-    next: u32,
-    free: alloc::collections::BTreeSet<u32>,
-}
-
-static MNT_IDS: crate::sync::spin::Mutex<MntIds> = crate::sync::spin::Mutex::new(MntIds {
-    next: 0,
-    free: alloc::collections::BTreeSet::new(),
-});
+/// Mount ids: the lowest free one, from 0 (Linux mnt_id_ida, now an
+/// XA_FLAGS_ALLOC xarray: the kernel's tmpfs gets 0, the nullfs root
+/// 1); allocated outside every lock, freed in any context (a mount's
+/// drop)
+static MNT_IDS: Ida = Ida::new();
 
 /// Never-reused mount ids start above this (Linux MNT_UNIQUE_ID_OFFSET,
 /// 2^31 since 6.11), clear of the reused 32-bit ones
@@ -135,20 +130,6 @@ const MNT_UNIQUE_ID_OFFSET: u64 = 1 << 31;
 
 /// The next never-reused mount id (Linux mnt_id_ctr + 1)
 static MNT_ID_UNIQUE: AtomicU64 = AtomicU64::new(MNT_UNIQUE_ID_OFFSET + 1);
-
-fn mnt_alloc_id() -> u32 {
-    let mut ids = MNT_IDS.lock();
-    if let Some(id) = ids.free.pop_first() {
-        return id;
-    }
-    let id = ids.next;
-    ids.next += 1;
-    id
-}
-
-fn mnt_free_id(id: u32) {
-    MNT_IDS.lock().free.insert(id);
-}
 
 /// A mount point in the namespace
 ///
@@ -232,7 +213,7 @@ impl Mount {
         flags: u32,
         devname: super::name::FileName,
     ) -> Result<Arc<Self>, KernelError> {
-        let m = try_arc(Self::init(sb, root, flags, devname))?;
+        let m = try_arc(Self::init(sb, root, flags, devname, MNT_IDS.try_alloc()?))?;
         m.sb.add_mount(&m);
         Ok(m)
     }
@@ -245,16 +226,18 @@ impl Mount {
         flags: u32,
         devname: super::name::FileName,
     ) -> Arc<Self> {
-        let m = arc_nofail(Self::init(sb, root, flags, devname));
+        let m = arc_nofail(Self::init(sb, root, flags, devname, MNT_IDS.alloc()));
         m.sb.add_mount(&m);
         m
     }
 
+    /// A mount with id `mnt_id`, which its drop gives back
     fn init(
         sb: Arc<SuperBlock>,
         root: Arc<Dentry>,
         flags: u32,
         devname: super::name::FileName,
+        mnt_id: u32,
     ) -> Self {
         Self {
             sb,
@@ -271,7 +254,7 @@ impl Mount {
             t_flags: AtomicU32::new(0),
             master: AtomicU32::new(0),
             mnt_ns: AtomicU64::new(0),
-            mnt_id: mnt_alloc_id(),
+            mnt_id,
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
             devname,
             mnt_count: AtomicU64::new(0),
@@ -1132,7 +1115,7 @@ impl Drop for Mount {
         if let Some(mp) = self.mountpoint.get_mut().take() {
             note_mp(&mp, -1);
         }
-        mnt_free_id(self.mnt_id);
+        MNT_IDS.free(self.mnt_id);
     }
 }
 
