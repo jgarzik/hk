@@ -31,7 +31,8 @@
 //! Locking: `Acct.q` and `IoWq.workers` are spin Mutex leaves, thread
 //! context (no work is queued from an interrupt handler: completions go
 //! through the task context first); workers are started and woken after
-//! they are released. Work comes boxed (`Work::new`), so nothing
+//! they are released. Work comes boxed (`Work::new`) and a worker's node
+//! is allocated when it is started (Linux create_io_worker), so nothing
 //! allocates under them.
 
 use alloc::boxed::Box;
@@ -47,7 +48,7 @@ use crate::task::task_work::{TaskWork, WorkHead, task_work_run};
 use crate::util::error::KernelResult;
 use crate::util::kalloc::{try_arc, try_box};
 use crate::util::kmem::KVec;
-use crate::util::list::{BoxList, Link};
+use crate::util::list::{ArcList, BoxList, Link};
 
 /// A worker idle this long exits, unless it is its pool's last (Linux
 /// WORKER_IDLE_TIMEOUT: 5 s)
@@ -143,8 +144,10 @@ pub struct IoWq {
     me: spin::Once<Weak<IoWq>>,
     /// The owner exits or execs: nothing more runs
     exiting: AtomicBool,
-    /// The workers' tasks, to interrupt them at `cancel`
-    workers: Mutex<KVec<TaskRef>>,
+    /// The running workers, to interrupt them at `cancel` (Linux
+    /// wq->all_list through io_worker.all_list): each links itself, its
+    /// node allocated when it was started
+    workers: Mutex<ArcList<WorkerLink>>,
     /// Woken when a worker exits
     gone: WaitQueue,
     /// Queued on the owner to start workers asked for elsewhere
@@ -173,7 +176,7 @@ impl IoWq {
             owner: Arc::downgrade(&task_ref(&current())),
             me: spin::Once::new(),
             exiting: AtomicBool::new(false),
-            workers: Mutex::new(KVec::new()),
+            workers: Mutex::new(ArcList::new()),
             gone: WaitQueue::new(),
             spawn: spawn.clone(),
         })?;
@@ -241,7 +244,12 @@ impl IoWq {
             }
             q.workers += 1;
         }
-        let started = try_arc(WorkerArg { wq, i }).and_then(|a| {
+        let started = try_arc(IoWorker {
+            link: Link::new(),
+            task: spin::Once::new(),
+        })
+        .and_then(|worker| try_arc(WorkerArg { wq, i, worker }))
+        .and_then(|a| {
             let a: Arc<dyn core::any::Any + Send + Sync> = a;
             crate::task::percpu::create_io_thread(worker, a)
         });
@@ -271,9 +279,14 @@ impl IoWq {
             cancel_all(l);
             a.wait.wake_all();
         }
-        for t in self.workers.lock().iter() {
-            t.set_tif(crate::task::tif::NOTIFY_SIGNAL);
-            crate::task::percpu::try_to_wake_up(t, crate::task::percpu::WakeMode::Interruptible);
+        for w in self.workers.lock().iter() {
+            if let Some(t) = w.task.get() {
+                t.set_tif(crate::task::tif::NOTIFY_SIGNAL);
+                crate::task::percpu::try_to_wake_up(
+                    t,
+                    crate::task::percpu::WakeMode::Interruptible,
+                );
+            }
         }
         while !self.none_left() {
             // The workers' ends may need this task's callbacks
@@ -294,10 +307,19 @@ fn cancel_all(mut l: BoxList<WorkAdapter>) {
     }
 }
 
+/// A worker (Linux struct io_worker), allocated before it starts
+struct IoWorker {
+    link: Link,
+    task: spin::Once<TaskRef>,
+}
+
+crate::adapter!(WorkerLink, IoWorker, link);
+
 /// What a worker is started with
 struct WorkerArg {
     wq: Arc<IoWq>,
     i: usize,
+    worker: Arc<IoWorker>,
 }
 
 /// A worker: its pool's work until it is idle too long (and not the
@@ -307,15 +329,16 @@ fn worker(arg: Arc<dyn core::any::Any + Send + Sync>) {
         return;
     };
     let (wq, i) = (&arg.wq, arg.i);
-    let me = task_ref(&current());
-    let listed = wq.workers.lock().try_push(me.clone()).is_ok();
+    let me = &arg.worker;
+    me.task.call_once(|| task_ref(&current()));
+    wq.workers.lock().push_back(me.clone());
     work_loop(wq, i);
-    if listed {
+    let gone = {
         let mut l = wq.workers.lock();
-        if let Some(k) = l.iter().position(|t| Arc::ptr_eq(t, &me)) {
-            l.remove(k);
-        }
-    }
+        // SAFETY: only this worker links its node, on this list, above
+        unsafe { l.remove(me) }
+    };
+    drop(gone);
     // The last one out with work left (a kill raced a queue): it ends
     let orphans = {
         let mut q = wq.accts[i].q.lock();

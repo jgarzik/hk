@@ -138,8 +138,9 @@ pub struct IoRing {
     inflight: AtomicU32,
     /// Woken when `inflight` drops to zero
     idle: WaitQueue,
-    /// Requests held back by a drain (Linux defer_list), in order
-    defer: crate::sync::spin::Mutex<KDeque<Deferred>>,
+    /// Requests held back by a drain (Linux defer_list), in order: each
+    /// boxed before the lock and linked through its own node
+    defer: crate::sync::spin::Mutex<crate::util::list::BoxList<DeferredLink>>,
 }
 
 /// The SQEs' link state across one submission: a chain's members are
@@ -153,13 +154,17 @@ struct Link {
     sqes: KVec<IoUringSqe>,
 }
 
-/// A request a drain held back (Linux io_defer_entry)
+/// A request a drain held back (Linux io_defer_entry, allocated before
+/// list_add_tail on the defer list)
 struct Deferred {
+    link: crate::util::list::Link,
     op: opreq::OpReq,
     /// It is itself an IOSQE_IO_DRAIN request: it runs alone, after
     /// everything before it, and before everything after it
     drain: bool,
 }
+
+crate::adapter!(DeferredLink, Deferred, link);
 
 impl Submit {
     /// Registered buffer `i` (EFAULT for none: Linux io_import_reg_buf)
@@ -210,7 +215,7 @@ impl IoRing {
             cq_wait: WaitQueue::new(),
             inflight: AtomicU32::new(0),
             idle: WaitQueue::new(),
-            defer: crate::sync::spin::Mutex::new(KDeque::new()),
+            defer: crate::sync::spin::Mutex::new(crate::util::list::BoxList::new()),
         })
         // A failed allocation drops the ring it was given, whose Drop
         // gives the charge back: nothing to undo here
@@ -417,10 +422,17 @@ impl IoRing {
             self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
             return true;
         }
-        let pushed = self.defer.lock().try_push_back(Deferred { op: o, drain });
-        if let Err(e) = pushed {
-            self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
-            return true;
+        let user_data = sqe.user_data;
+        match crate::util::kalloc::try_box(Deferred {
+            link: crate::util::list::Link::new(),
+            op: o,
+            drain,
+        }) {
+            Ok(d) => self.defer.lock().push_back(d),
+            Err(e) => {
+                self.post_cqe(user_data, e.to_errno_neg(), 0);
+                return true;
+            }
         }
         // Its predecessors may have ended meanwhile
         self.flush_defer();
@@ -450,7 +462,7 @@ impl IoRing {
         loop {
             let next = {
                 let mut d = self.defer.lock();
-                if d.front().is_none_or(|f| f.drain) {
+                if d.iter().next().is_none_or(|f| f.drain) {
                     return;
                 }
                 d.pop_front()
