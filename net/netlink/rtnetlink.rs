@@ -14,7 +14,9 @@ use crate::util::kalloc::try_box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::attr::{Attrs, Hdr, Msg, NLMSG_HDRLEN, align, header};
+use super::attr::{
+    Attrs, Hdr, Msg, NLMSG_HDRLEN, NlBuf, align, attr_size, header, msg_size, nlmsg_new,
+};
 use super::*;
 use crate::net::NetNamespace;
 use crate::net::device::{NetDevice, flags as dflags};
@@ -120,6 +122,18 @@ const IFINFOMSG_LEN: usize = 16;
 const IFADDRMSG_LEN: usize = 8;
 const RTMSG_LEN: usize = 12;
 const NDMSG_LEN: usize = 12;
+/// Longest hardware address (Linux MAX_ADDR_LEN)
+const MAX_ADDR_LEN: usize = 32;
+/// An RTM_NEWNEIGH message (Linux nlmsg_new(neigh_nlmsg_size()): DST,
+/// LLADDR, CACHEINFO, PROBES, FLAGS_EXT, PROTOCOL)
+const NEIGH_NLMSG_SIZE: usize = msg_size(
+    align(NDMSG_LEN)
+        + 2 * attr_size(MAX_ADDR_LEN)
+        + attr_size(16)
+        + attr_size(4)
+        + attr_size(4)
+        + attr_size(1),
+);
 
 /// Largest dump datagram
 pub const DUMP_SIZE: usize = 8192;
@@ -319,6 +333,26 @@ impl RtDump {
         }
     }
 
+    /// Fill messages for `items[pos..]` into the part while they fit
+    /// (Linux: a dump's fill meets EMSGSIZE, the part ends there and the
+    /// next resumes at that object); one too large for an empty part
+    /// ends the dump with EMSGSIZE
+    fn take_nl<T>(
+        &mut self,
+        nb: &mut NlBuf<'_>,
+        items: &[T],
+        f: impl Fn(&mut NlBuf<'_>, &T) -> Result<(), KernelError>,
+    ) -> Result<bool, KernelError> {
+        for it in items.iter().skip(self.pos) {
+            if let Err(e) = f(nb, it) {
+                return if nb.is_empty() { Err(e) } else { Ok(false) };
+            }
+            self.pos += 1;
+        }
+        // Leave room for NLMSG_DONE in the same part, like Linux
+        Ok(nb.len() + NLMSG_HDRLEN + 4 <= DUMP_SIZE || nb.is_empty())
+    }
+
     /// Append messages for `items[pos..]` while they fit in a part
     fn take<T>(&mut self, buf: &mut Vec<u8>, items: &[T], f: impl Fn(&T) -> Vec<u8>) -> bool {
         for it in items.iter().skip(self.pos) {
@@ -367,7 +401,10 @@ impl DumpCb for RtDump {
             }
             DumpKind::Neigh => {
                 let n = net.arp.dump();
-                Ok(self.take(buf, &n, |e| fill_neigh(e, RTM_NEWNEIGH, f, seq, pid)))
+                let mut nb = NlBuf::new(buf, DUMP_SIZE);
+                self.take_nl(&mut nb, &n, |nb, e| {
+                    fill_neigh(nb, e, RTM_NEWNEIGH, f, seq, pid)
+                })
             }
         }
     }
@@ -950,24 +987,47 @@ fn fill_rt(rt: &route::Rtable, src: Ipv4Addr, seq: u32, pid: u32) -> Vec<u8> {
 // ============================================================================
 
 /// RTM_NEWNEIGH message for a neighbour (Linux neigh_fill_info)
-fn fill_neigh(e: &NeighInfo, ty: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
-    let mut m = Msg::new(ty, flags, seq, pid);
+/// One neighbour as a message in `nb` (Linux neigh_fill_info):
+/// EMSGSIZE, nothing left behind, if it does not fit
+fn fill_neigh(
+    nb: &mut NlBuf<'_>,
+    e: &NeighInfo,
+    ty: u16,
+    flags: u16,
+    seq: u32,
+    pid: u32,
+) -> Result<(), KernelError> {
     let mut h = [0u8; NDMSG_LEN];
     h[0] = AF_INET;
     h[4..8].copy_from_slice(&e.ifindex.to_ne_bytes());
     h[8..10].copy_from_slice(&u16::from(e.state).to_ne_bytes());
     h[11] = RouteType::Unicast as u8;
-    m.put(&h).attr(NDA_DST, &e.key[..4]);
+    let m = nb.msg_put(ty, flags, seq, pid, &h)?;
+    match neigh_attrs(nb, e) {
+        Ok(()) => {
+            nb.msg_end(m);
+            Ok(())
+        }
+        Err(err) => {
+            nb.msg_cancel(m);
+            Err(err)
+        }
+    }
+}
+
+/// A neighbour's attributes (neigh_fill_info's nla_puts)
+fn neigh_attrs(nb: &mut NlBuf<'_>, e: &NeighInfo) -> Result<(), KernelError> {
+    nb.put(NDA_DST, &e.key[..4])?;
     if e.state & nud::VALID != 0 {
-        m.attr(NDA_LLADDR, &e.ha);
+        nb.put(NDA_LLADDR, &e.ha)?;
     }
     // struct nda_cacheinfo: ages in clock_t
     let mut ci = [0u8; 16];
     ci[0..4].copy_from_slice(&(crate::time::ms_to_clock_t(e.confirmed) as u32).to_ne_bytes());
     ci[4..8].copy_from_slice(&(crate::time::ms_to_clock_t(e.used) as u32).to_ne_bytes());
     ci[8..12].copy_from_slice(&(crate::time::ms_to_clock_t(e.updated) as u32).to_ne_bytes());
-    m.u32(NDA_PROBES, e.probes).attr(NDA_CACHEINFO, &ci);
-    m.finish()
+    nb.put_u32(NDA_PROBES, e.probes)?;
+    nb.put(NDA_CACHEINFO, &ci)
 }
 
 /// struct ndmsg fields and the request's attributes
@@ -1049,7 +1109,16 @@ fn getneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
         .into_iter()
         .find(|e| e.ifindex == dev.ifindex() && e.key == key)
         .ok_or(KernelError::NotFound)?;
-    reply(sk, fill_neigh(&e, RTM_NEWNEIGH, 0, h.seq, sk.portid()));
+    let mut v = nlmsg_new(NEIGH_NLMSG_SIZE)?;
+    fill_neigh(
+        &mut NlBuf::new(&mut v, NEIGH_NLMSG_SIZE),
+        &e,
+        RTM_NEWNEIGH,
+        0,
+        h.seq,
+        sk.portid(),
+    )?;
+    reply(sk, v);
     Ok(Done::Ok)
 }
 

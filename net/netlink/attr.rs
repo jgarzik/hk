@@ -2,7 +2,8 @@
 //! lib/nlattr.c)
 //!
 //! `Msg` builds one message (header, fixed family header, attributes,
-//! nests); `parse` splits a request's attributes into a table indexed by
+//! nests); `NlBuf` appends messages to a buffer allocated beforehand,
+//! EMSGSIZE when full (nlmsg_put/nla_put into an skb); `parse` splits a request's attributes into a table indexed by
 //! type, rejecting malformed ones like Linux's deprecated (liberal)
 //! validation.
 
@@ -145,6 +146,129 @@ impl Msg {
     }
 }
 
+/// `nlmsg_total_size`: a message with a `payload`-byte body, aligned
+pub const fn msg_size(payload: usize) -> usize {
+    align(NLMSG_HDRLEN + payload)
+}
+
+/// `nla_total_size`: an attribute with a `payload`-byte body, aligned
+pub const fn attr_size(payload: usize) -> usize {
+    align(NLA_HDRLEN + payload)
+}
+
+/// An empty buffer with room for `size` bytes of messages, allocated
+/// now (Linux nlmsg_new): fill it with an [`NlBuf`], which never grows
+/// it
+pub fn nlmsg_new(size: usize) -> Result<Vec<u8>, KernelError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(size)
+        .map_err(|_| KernelError::OutOfMemory)?;
+    Ok(v)
+}
+
+/// A message begun in an [`NlBuf`] (its offset), to end or cancel
+#[must_use]
+pub struct NlMsg(usize);
+
+/// Netlink messages appended to a buffer allocated beforehand (Linux
+/// an skb's tailroom, filled with nlmsg_put/nla_put): nothing
+/// allocates, so a dump may fill it under a lock or an RCU guard. A
+/// message or attribute that does not fit is EMSGSIZE, and the caller
+/// cancels the message it began (nlmsg_cancel); a dump then ends its
+/// part there and resumes from that object in the next.
+///
+/// # Invariants
+/// `buf.len() <= limit <= buf.capacity()`, so an append never
+/// reallocates.
+pub struct NlBuf<'a> {
+    buf: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl<'a> NlBuf<'a> {
+    /// Append to `buf`, up to `limit` bytes in all (at most its
+    /// capacity)
+    pub fn new(buf: &'a mut Vec<u8>, limit: usize) -> Self {
+        // INVARIANT: clamped to the capacity, which holds the length
+        let limit = limit.min(buf.capacity()).max(buf.len());
+        Self { buf, limit }
+    }
+
+    /// Bytes written (the part's length)
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Room for `n` more bytes, or EMSGSIZE
+    fn room(&self, n: usize) -> Result<(), KernelError> {
+        match self.buf.len().checked_add(n) {
+            Some(end) if end <= self.limit => Ok(()),
+            _ => Err(KernelError::MessageTooLong),
+        }
+    }
+
+    /// `data`, zero-padded to 4 bytes (room checked by the caller)
+    fn append(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+        let pad = align(data.len()) - data.len();
+        self.buf.extend_from_slice(&[0; 3][..pad]);
+    }
+
+    /// Begin a message: its header and the family header `hdr`, padded
+    /// (Linux nlmsg_put); EMSGSIZE if they do not fit
+    pub fn msg_put(
+        &mut self,
+        ty: u16,
+        flags: u16,
+        seq: u32,
+        pid: u32,
+        hdr: &[u8],
+    ) -> Result<NlMsg, KernelError> {
+        self.room(msg_size(hdr.len()))?;
+        let at = self.buf.len();
+        let mut h = [0u8; NLMSG_HDRLEN];
+        h[4..6].copy_from_slice(&ty.to_ne_bytes());
+        h[6..8].copy_from_slice(&flags.to_ne_bytes());
+        h[8..12].copy_from_slice(&seq.to_ne_bytes());
+        h[12..16].copy_from_slice(&pid.to_ne_bytes());
+        self.buf.extend_from_slice(&h);
+        self.append(hdr);
+        Ok(NlMsg(at))
+    }
+
+    /// An attribute (Linux nla_put); EMSGSIZE if it does not fit, or
+    /// if nla_len cannot hold it
+    pub fn put(&mut self, ty: u16, data: &[u8]) -> Result<(), KernelError> {
+        let len =
+            u16::try_from(NLA_HDRLEN + data.len()).map_err(|_| KernelError::MessageTooLong)?;
+        self.room(attr_size(data.len()))?;
+        self.buf.extend_from_slice(&len.to_ne_bytes());
+        self.buf.extend_from_slice(&ty.to_ne_bytes());
+        self.append(data);
+        Ok(())
+    }
+
+    /// A u32 attribute (Linux nla_put_u32)
+    pub fn put_u32(&mut self, ty: u16, v: u32) -> Result<(), KernelError> {
+        self.put(ty, &v.to_ne_bytes())
+    }
+
+    /// Finish message `m`: its nlmsg_len (Linux nlmsg_end)
+    pub fn msg_end(&mut self, m: NlMsg) {
+        let len = u32::try_from(self.buf.len() - m.0).unwrap_or(u32::MAX);
+        self.buf[m.0..m.0 + 4].copy_from_slice(&len.to_ne_bytes());
+    }
+
+    /// Drop message `m` and everything after it (Linux nlmsg_cancel)
+    pub fn msg_cancel(&mut self, m: NlMsg) {
+        self.buf.truncate(m.0);
+    }
+}
+
 /// Attribute table: `tb[type]` = payload of the last attribute of that type
 pub struct Attrs<'a> {
     tb: Vec<Option<&'a [u8]>>,
@@ -269,6 +393,31 @@ mod tests {
         let a = Attrs::parse(&b[NLMSG_HDRLEN..], 30).unwrap();
         assert_eq!(a.u32(4).unwrap(), Some(1));
         assert!(a.get(26).is_none());
+    }
+
+    /// Messages fill the buffer up to its limit; what does not fit is
+    /// EMSGSIZE, and a cancelled message leaves no trace
+    #[test]
+    fn nlbuf_fills_and_cancels() {
+        let mut v = nlmsg_new(64).unwrap();
+        let mut nb = NlBuf::new(&mut v, 64);
+        let m = nb.msg_put(28, 2, 7, 9, &[1, 2, 3]).unwrap();
+        nb.put_u32(4, 1500).unwrap();
+        nb.put(1, b"ab").unwrap();
+        nb.msg_end(m);
+        let one = nb.len();
+        assert_eq!(one, msg_size(3) + attr_size(4) + attr_size(2));
+        let m = nb.msg_put(28, 2, 8, 9, &[0; 4]).unwrap();
+        assert_eq!(nb.put(1, &[0; 40]), Err(KernelError::MessageTooLong));
+        nb.msg_cancel(m);
+        assert_eq!(nb.len(), one);
+        assert!(nb.msg_put(28, 0, 0, 0, &[0; 64]).is_err());
+        assert_eq!(v.capacity(), 64);
+        let h = Hdr::parse(&v).unwrap();
+        assert_eq!((h.len as usize, h.ty, h.seq), (one, 28, 7));
+        let a = Attrs::parse(&v[NLMSG_HDRLEN + 4..one], 4).unwrap();
+        assert_eq!(a.u32(4).unwrap(), Some(1500));
+        assert_eq!(a.get(1), Some(&b"ab"[..]));
     }
 
     #[test]
