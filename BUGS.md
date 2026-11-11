@@ -715,6 +715,24 @@ epoll may both report an item that got an event mid-scan (Linux
 serializes them under ep->mtx). Fix: hold `Eventpoll.mtx` across the
 scan (nested epolls: Linux's mutex_lock_nested by depth).
 
+## Deferred file release gaps
+
+**Location**: `fs/file.rs` (`FileRef`, `fput`), `task/task_work.rs`,
+`sync/waitqueue.rs` (`signal_pending_run_work`)
+
+- A failed `FileRef::try_get` (epoll's weak references) can hold the
+  last `Arc<File>` after the release ran and drop the file's dentry and
+  private data itself (never `__fput`); Linux frees a file through RCU
+  there. Harmless while epoll polls unlocked; it matters once
+  `Eventpoll.mtx` is held across scans.
+- Queued releases run inside futex and nanosleep sleeps when
+  TIF_NOTIFY_SIGNAL is set (`signal_pending_run_work` runs task_work
+  there); Linux runs TWA_RESUME work only on the return to user mode
+  (and io_uring's own waits).
+- Between the io_uring cancel and `exit_task_work` the task_work list
+  is still open: a late io_uring callback's TIF_NOTIFY_SIGNAL can
+  interrupt sleeps in that part of exit.
+
 ## Scheduler gaps (deviations from Linux)
 
 **Location**: `task/fair.rs`, `task/percpu.rs`
