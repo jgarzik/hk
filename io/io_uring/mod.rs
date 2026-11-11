@@ -114,7 +114,7 @@ pub struct IoRing {
     /// Files with polled requests issued (Linux iopoll_list, by file):
     /// polled by GETEVENTS (`iopoll_check`); emptied once nothing is in
     /// flight
-    poll_files: crate::sync::spin::Mutex<KVec<Arc<File>>>,
+    poll_files: crate::sync::Mutex<KVec<Arc<File>>>,
     /// The user its locked memory is charged to (Linux ctx->user: none
     /// with CAP_IPC_LOCK), and its rings' pages charged
     acct: Option<crate::task::Uid>,
@@ -190,7 +190,7 @@ impl IoRing {
         try_arc(Self {
             rings,
             iopoll: flags & IORING_SETUP_IOPOLL != 0,
-            poll_files: crate::sync::spin::Mutex::new(KVec::new()),
+            poll_files: crate::sync::Mutex::new(KVec::new()),
             acct,
             ring_pages,
             submit: Mutex::new(Submit {
