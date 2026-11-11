@@ -395,6 +395,21 @@ linked on hk without CAP_DAC_READ_SEARCH; Linux gives ENOENT. The
 capability is checked in the caller's namespace (Linux: the opener's
 `user_ns`); hk has one user namespace.
 
+## SysV semaphore undo gaps
+
+**Location**: `ipc/sem.rs` (`clone_task_semundo`), `ns/mod.rs`
+
+- CLONE_SYSVSEM from a parent with no undo list leaves parent and
+  child with separate lists made later (Linux copy_semundo allocates
+  the list first, so both share it): a thread's SEM_UNDO adjustments
+  are then undone at that thread's exit, not the process's.
+- clone(CLONE_NEWIPC | CLONE_SYSVSEM) is not EINVAL, unshare
+  (CLONE_NEWIPC) does not imply CLONE_SYSVSEM and setns into an ipc
+  namespace does not run exit_sem (Linux copy_namespaces,
+  ksys_unshare, ipcns_install): an undo list can outlive its
+  namespace's arrays. Each undo structure names its array, so exit
+  undoes nothing there instead of touching another array.
+
 ## POSIX mqueue gaps
 
 **Location**: `ipc/mqueue.rs`

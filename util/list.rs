@@ -273,6 +273,29 @@ impl<A: Adapter> List<A> {
         self.len -= 1;
     }
 
+    /// Move every item of `other` to the end of this list, in order,
+    /// leaving `other` empty (Linux list_splice_tail_init)
+    pub fn append(&mut self, other: &mut Self) {
+        if other.head.is_null() {
+            return;
+        }
+        let first = other.head;
+        // SAFETY: `first` and this list's tail are live links of the two
+        // lists (type invariant)
+        unsafe {
+            (*first).prev.store(self.tail, Relaxed);
+            match self.tail.as_ref() {
+                Some(t) => t.next.store(first, Relaxed),
+                None => self.head = first,
+            }
+        }
+        // INVARIANT: `other`'s chain now follows the old tail; `other`
+        // is the empty list
+        self.tail = other.tail;
+        self.len += other.len;
+        *other = Self::new();
+    }
+
     /// The first item
     pub fn front(&self) -> Option<*const A::Item> {
         // SAFETY: a non-null head is an entry's link
@@ -672,6 +695,32 @@ mod tests {
         unsafe { l.remove(&y) };
         assert_eq!(l.len(), 1);
         assert_eq!(l.pop_front().map(|p| unsafe { (*p).v }), Some(5));
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn append_moves_all() {
+        let n = |v| Node {
+            v,
+            link: Link::new(),
+        };
+        let (a, b, c) = (n(1), n(2), n(3));
+        let (mut l, mut m): (List<NodeA>, List<NodeA>) = (List::new(), List::new());
+        l.append(&mut m);
+        assert!(l.is_empty());
+        unsafe {
+            m.push_back(&a);
+            m.push_back(&b);
+        }
+        l.append(&mut m);
+        assert!(m.is_empty() && m.front().is_none());
+        unsafe { m.push_back(&c) };
+        l.append(&mut m);
+        assert_eq!(l.iter().map(|n| n.v).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(l.len(), 3);
+        unsafe { l.remove(&c) };
+        assert_eq!(l.pop_front().map(|p| unsafe { (*p).v }), Some(1));
+        assert_eq!(l.pop_front().map(|p| unsafe { (*p).v }), Some(2));
         assert!(l.is_empty());
     }
 
