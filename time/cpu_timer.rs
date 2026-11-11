@@ -30,8 +30,10 @@
 //! Signals go out after it is dropped.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use crate::time::posix_timer::ElistAdapter;
+use crate::util::list::ArcList;
 
 use crate::task::Tid;
 
@@ -246,17 +248,6 @@ pub fn tick(t: &crate::task::Task) {
     }
 }
 
-/// What expired timers do once the registry lock is dropped
-enum Fire {
-    /// Queue a timer_create timer's signal
-    Timer(Arc<crate::time::posix_timer::PosixTimer>),
-    /// Signal `sig` to the process from the kernel (an itimer,
-    /// RLIMIT_CPU: Linux SEND_SIG_PRIV)
-    Process(crate::signal::Signal),
-    /// Wake a clock_nanosleep
-    Wake(Arc<crate::time::posix_timer::PosixTimer>),
-}
-
 /// Run the calling task's due CPU timers and its group's (task context,
 /// on the way back to user mode; Linux handle_posix_cpu_timers)
 pub fn run() {
@@ -267,7 +258,12 @@ pub fn run() {
         return;
     };
     let mine = me.cputime(crate::time::monotonic_ns());
-    let mut fire: Vec<Fire> = Vec::new();
+    // Expired timers, linked under the lock and fired after it (Linux
+    // collect_timerqueue's firing list); the process signals of the
+    // itimers (VIRT, PROF) and RLIMIT_CPU, at most one each
+    let mut firing: ArcList<ElistAdapter> = ArcList::new();
+    let mut itimer_sig = [None; 2];
+    let mut rlimit_sig = None;
     let mut thread_next = [NONE; 2];
     let mut proc_next = [NONE; 2];
     let mut any_process = false;
@@ -291,8 +287,8 @@ pub fn run() {
                 }
             }
         };
-        if let Some(f) = t.cpu_expire(now) {
-            fire.push(f.into_fire(t));
+        if let Some(Expired::Collect) = t.cpu_expire(now) {
+            firing.push_back(t.clone());
         }
         if let Some(at) = t.cpu_expiry() {
             let n = match clock.thread {
@@ -304,13 +300,13 @@ pub fn run() {
     }
     // The process's ITIMER_VIRTUAL and ITIMER_PROF, in its SignalStruct
     // (Linux check_process_timers: check_cpu_itimer after the timers)
-    for t in &sig.itimers.cpu {
+    for (t, out) in sig.itimers.cpu.iter().zip(&mut itimer_sig) {
         any_process |= t.armed();
         let (Some(g), Some(clock)) = (group, t.cpu_clock()) else {
             continue;
         };
         if let Some(Expired::Signal(s)) = t.cpu_expire(clock.sample.pick(g)) {
-            fire.push(Fire::Process(s));
+            *out = Some(s);
         }
         if let Some(at) = t.cpu_expiry() {
             let n = &mut proc_next[clock.sample as usize];
@@ -326,7 +322,12 @@ pub fn run() {
     // limit and each second after it (the soft limit moves up a second
     // each time), SIGKILL at the hard limit
     let limited = match group {
-        Some(g) => rlimit_cpu(&sig, Sample::Prof.pick(g), &mut fire, &mut proc_next[0]),
+        Some(g) => rlimit_cpu(
+            &sig,
+            Sample::Prof.pick(g),
+            &mut rlimit_sig,
+            &mut proc_next[0],
+        ),
         None => rlimit_finite(&sig),
     };
     if any_process || limited {
@@ -337,14 +338,12 @@ pub fn run() {
         sig.cputimer.stop();
     }
     drop(reg);
-    for f in fire {
-        match f {
-            Fire::Timer(t) => t.queue_signal(),
-            Fire::Process(s) => {
-                let _ = crate::signal::group_send_sig_info(&me, s, crate::signal::SendInfo::Kernel);
-            }
-            Fire::Wake(t) => t.wake_sleeper(),
-        }
+    while let Some(t) = firing.pop_front() {
+        t.cpu_fire();
+    }
+    // From the kernel to the process (Linux SEND_SIG_PRIV)
+    for s in itimer_sig.into_iter().chain([rlimit_sig]).flatten() {
+        let _ = crate::signal::group_send_sig_info(&me, s, crate::signal::SendInfo::Kernel);
     }
 }
 
@@ -359,7 +358,7 @@ fn rlimit_finite(sig: &crate::signal::SignalStruct) -> bool {
 fn rlimit_cpu(
     sig: &crate::signal::SignalStruct,
     prof: u64,
-    fire: &mut Vec<Fire>,
+    send: &mut Option<crate::signal::Signal>,
     next: &mut u64,
 ) -> bool {
     use crate::task::rlimit::{RLIM_INFINITY, RLIMIT_CPU};
@@ -372,12 +371,12 @@ fn rlimit_cpu(
     }
     let secs = prof / SEC;
     if r.rlim_max != RLIM_INFINITY && secs >= r.rlim_max {
-        fire.push(Fire::Process(crate::signal::SIGKILL));
+        *send = Some(crate::signal::SIGKILL);
         return true;
     }
     let mut soft = r.rlim_cur;
     if secs >= soft {
-        fire.push(Fire::Process(crate::signal::SIGXCPU));
+        *send = Some(crate::signal::SIGXCPU);
         if soft < r.rlim_max {
             soft += 1;
             sig.set_rlimit_cur(RLIMIT_CPU, soft);
@@ -405,17 +404,7 @@ pub fn rlimit_cpu_changed(sig: &crate::signal::SignalStruct, pid: crate::task::P
 pub enum Expired {
     /// An itimer's signal for the process
     Signal(crate::signal::Signal),
-    /// A timer_create timer's queued signal
-    Queue,
-    Wake,
-}
-
-impl Expired {
-    fn into_fire(self, t: &Arc<crate::time::posix_timer::PosixTimer>) -> Fire {
-        match self {
-            Expired::Signal(sig) => Fire::Process(sig),
-            Expired::Queue => Fire::Timer(t.clone()),
-            Expired::Wake => Fire::Wake(t.clone()),
-        }
-    }
+    /// To go on the firing list (a timer_create timer's queued signal,
+    /// a clock_nanosleep's wakeup), marked collected
+    Collect,
 }

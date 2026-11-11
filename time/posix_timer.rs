@@ -136,6 +136,14 @@ struct PosixTimerInner {
     /// Its signal was ignored on expiry: queued once the action stops
     /// ignoring it (Linux ignored_posix_timers)
     ignored: bool,
+    /// A CPU timer on a firing list (`elist`) waiting to fire (Linux
+    /// it.cpu.firing): settime and delete clear it, and the firer then
+    /// drops the event
+    firing: bool,
+    /// Its `elist` is on a firing list: it is collected again only once
+    /// the firer has unlinked it (Linux never re-links a timer still on
+    /// a firing list: settime waits out the firing)
+    collected: bool,
 }
 
 impl PosixTimerInner {
@@ -152,6 +160,8 @@ impl PosixTimerInner {
             sigqueue_seq: 0,
             sig_periodic: false,
             ignored: false,
+            firing: false,
+            collected: false,
         }
     }
 }
@@ -189,7 +199,13 @@ pub struct PosixTimer {
     /// instead of signalling; never seen by timer_* syscalls
     sleeper: bool,
     wq: crate::sync::waitqueue::WaitQueue,
+    /// A CPU timer's link on `cpu_timer::run`'s firing list (Linux
+    /// it.cpu.elist): linked under the group's `posix_timers`, unlinked
+    /// by that run alone after it drops the lock (`inner.collected`)
+    elist: crate::util::list::Link,
 }
+
+crate::adapter!(pub ElistAdapter, PosixTimer, elist);
 
 impl PosixTimer {
     /// An itimer, embedded in its SignalStruct (Linux signal->real_timer,
@@ -214,6 +230,7 @@ impl PosixTimer {
             cpu,
             sleeper: false,
             wq: crate::sync::waitqueue::WaitQueue::new(),
+            elist: crate::util::list::Link::new(),
         }
     }
 
@@ -263,6 +280,7 @@ impl PosixTimer {
             cpu,
             sleeper,
             wq: crate::sync::waitqueue::WaitQueue::new(),
+            elist: crate::util::list::Link::new(),
         }
     }
 
@@ -373,6 +391,9 @@ impl PosixTimer {
         let mut inner = self.inner.lock();
         let old_value = cpu_value(&mut inner, now);
         reset_signal(&mut inner);
+        // A firing under way generates no event (Linux
+        // posix_cpu_timer_set clears it.cpu.firing)
+        inner.firing = false;
         if new_value.is_disarmed() {
             inner.expires_ns = 0;
             inner.interval_ns = 0;
@@ -414,10 +435,14 @@ impl PosixTimer {
     /// interval one rearmed when it is dequeued; an itimer
     /// (ITIMER_VIRTUAL/PROF) rearms a whole number of periods on at once
     /// and signals its process (Linux check_cpu_itimer).
+    /// A timer still on a firing list is left as it is (checked again
+    /// at a later pass); one put on the caller's firing list is marked
+    /// `collected` and `firing` (Linux collect_timerqueue), under the
+    /// group's `posix_timers`.
     pub fn cpu_expire(&self, now: u64) -> Option<crate::time::cpu_timer::Expired> {
         use crate::time::cpu_timer::Expired;
         let mut i = self.inner.lock();
-        if !i.armed || now < i.expires_ns {
+        if !i.armed || now < i.expires_ns || i.collected {
             return None;
         }
         let itimer = self.itimer;
@@ -432,18 +457,39 @@ impl PosixTimer {
                 i.requeue = interval.is_some();
             }
         }
-        drop(i);
-        if self.sleeper {
-            return Some(Expired::Wake);
+        if itimer {
+            drop(i);
+            return self
+                .signals()
+                .then(|| self.sigevent.signal())
+                .flatten()
+                .map(Expired::Signal);
         }
-        if !self.signals() {
+        if !self.sleeper && !self.signals() {
             return None;
         }
-        Some(if itimer {
-            Expired::Signal(self.sigevent.signal()?)
+        i.firing = true;
+        i.collected = true;
+        Some(Expired::Collect)
+    }
+
+    /// Off its firing list (the caller unlinked it): fire unless a
+    /// settime or delete came meanwhile (Linux handle_posix_cpu_timers:
+    /// cpu_timer_fire if it.cpu.firing). No lock held.
+    pub fn cpu_fire(&self) {
+        let fire = {
+            let mut i = self.inner.lock();
+            i.collected = false;
+            core::mem::take(&mut i.firing)
+        };
+        if !fire {
+            return;
+        }
+        if self.sleeper {
+            self.wake_sleeper();
         } else {
-            Expired::Queue
-        })
+            self.queue_signal();
+        }
     }
 
     /// Its target is a thread of the caller's process (Linux
@@ -466,7 +512,7 @@ impl PosixTimer {
     /// Queue its signal entry (Linux posix_timer_queue_signal ->
     /// posixtimer_send_sigqueue): nothing while it is still queued; an
     /// ignored interval timer's waits to be unignored. No lock held.
-    pub fn queue_signal(&self) {
+    fn queue_signal(&self) {
         let Some(q) = self.sigq.lock().take() else {
             return;
         };
@@ -547,7 +593,7 @@ impl PosixTimer {
     }
 
     /// clock_nanosleep's timer expired: wake its sleeper
-    pub fn wake_sleeper(&self) {
+    fn wake_sleeper(&self) {
         self.wq.wake_all();
     }
 
@@ -598,6 +644,7 @@ impl PosixTimer {
             let mut i = self.inner.lock();
             i.armed = false;
             i.requeue = false;
+            i.firing = false;
             i.signal_seq += 1;
         }
         self.timer.cancel_sync();
