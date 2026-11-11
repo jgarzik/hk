@@ -1000,9 +1000,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
    `NetNamespace::drop` snapshots its devices (RCU, `ends`, a Vec),
    `io/epoll.rs` `Eventpoll::drop` takes `mtx` and `lock`: walk the
    list directly, `get_mut`.
-14. **Migration rereads the source cgroup per thread** (A1).
-   `cgroup/mod.rs` `migrate_one` builds `css_ops` for every thread of a
-   group under CGROUP_MUTEX; once per distinct source cgroup.
 
 ## DRM dumb buffers are the boot framebuffer only
 

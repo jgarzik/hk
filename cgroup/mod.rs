@@ -12,7 +12,6 @@
 //!
 //! - `Cgroup`: A node in the hierarchy, contains tasks and child cgroups
 //! - `CgroupSubsysState` (CSS): Per-controller per-cgroup state
-//! - `CssSet`: Optimized task-to-cgroup mapping (shared among tasks in same cgroups)
 //! - `CgroupRoot`: The root of the unified hierarchy
 //!
 //! # Controllers
@@ -24,7 +23,7 @@
 //! - `io`: Block I/O bandwidth limits
 
 use crate::sync::RwSem;
-use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::spin::RwLock;
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -71,7 +70,8 @@ pub struct Cgroup {
     pub name: Vec<u8>,
 
     /// Parent cgroup (None for root)
-    parent: RwLock<Option<Weak<Cgroup>>>,
+    /// Fixed at creation
+    parent: Option<Weak<Cgroup>>,
 
     /// Child cgroups (name -> Cgroup)
     children: RwSem<BTreeMap<Vec<u8>, Arc<Cgroup>>>,
@@ -83,8 +83,9 @@ pub struct Cgroup {
     pub level: u32,
 
     /// Ancestor chain (indexed by level, for O(1) ancestor lookup)
-    /// ancestors[0] = root, ancestors[level-1] = parent
-    ancestors: RwLock<Vec<Weak<Cgroup>>>,
+    /// ancestors[0] = root, ancestors[level-1] = parent; fixed at
+    /// creation (Linux cgrp->ancestors[], allocated with the cgroup)
+    ancestors: alloc::boxed::Box<[Weak<Cgroup>]>,
 
     /// Per-controller subsystem state (controller_type -> css)
     /// Only populated for controllers enabled on this cgroup
@@ -117,29 +118,38 @@ impl Cgroup {
         parent: Option<&Arc<Cgroup>>,
         root: &Arc<CgroupRoot>,
     ) -> Result<Arc<Self>, KernelError> {
-        let cg = try_arc(Self::fresh(id, name, parent, root))?;
-
-        // Build ancestor chain
+        // The ancestor chain, built before the cgroup (Linux
+        // cgroup_create fills cgrp->ancestors[] once)
+        let mut ancestors = crate::util::kmem::KVec::new();
         if let Some(p) = parent {
-            let mut ancestors = p.ancestors.read().clone();
-            ancestors.push(Arc::downgrade(p));
-            *cg.ancestors.write() = ancestors;
+            ancestors.try_reserve(p.ancestors.len() + 1)?;
+            for a in p.ancestors.iter() {
+                ancestors.try_push(a.clone())?;
+            }
+            ancestors.try_push(Arc::downgrade(p))?;
         }
-
-        Ok(cg)
+        let ancestors = ancestors.into_vec().into_boxed_slice();
+        try_arc(Self::fresh(id, name, parent, root, ancestors))
     }
 
     /// A root cgroup made at boot (failure cannot be reported)
     pub fn new_root(id: CgroupId, name: Vec<u8>, root: &Arc<CgroupRoot>) -> Arc<Self> {
-        arc_nofail(Self::fresh(id, name, None, root))
+        arc_nofail(Self::fresh(
+            id,
+            name,
+            None,
+            root,
+            Vec::new().into_boxed_slice(),
+        ))
     }
 
-    /// A cgroup's state, before its ancestor chain is built
+    /// A cgroup's state
     fn fresh(
         id: CgroupId,
         name: Vec<u8>,
         parent: Option<&Arc<Cgroup>>,
         root: &Arc<CgroupRoot>,
+        ancestors: alloc::boxed::Box<[Weak<Cgroup>]>,
     ) -> Self {
         let level = parent.map(|p| p.level + 1).unwrap_or(0);
         let ino = root.alloc_ino();
@@ -147,11 +157,11 @@ impl Cgroup {
         Self {
             id,
             name,
-            parent: RwLock::new(parent.map(Arc::downgrade)),
+            parent: parent.map(Arc::downgrade),
             children: RwSem::new(BTreeMap::new()),
             root: Arc::downgrade(root),
             level,
-            ancestors: RwLock::new(Vec::new()),
+            ancestors,
             subsys: RwSem::new(BTreeMap::new()),
             tasks: RwLock::new(Vec::new()),
             dead: AtomicBool::new(false),
@@ -163,7 +173,7 @@ impl Cgroup {
 
     /// Get parent cgroup
     pub fn parent(&self) -> Option<Arc<Cgroup>> {
-        self.parent.read().as_ref().and_then(Weak::upgrade)
+        self.parent.as_ref().and_then(Weak::upgrade)
     }
 
     /// Get the root of this hierarchy
@@ -176,8 +186,7 @@ impl Cgroup {
         if self.level <= other.level {
             return false;
         }
-        let ancestors = self.ancestors.read();
-        if let Some(ancestor) = ancestors.get(other.level as usize)
+        if let Some(ancestor) = self.ancestors.get(other.level as usize)
             && let Some(a) = ancestor.upgrade()
         {
             return Arc::ptr_eq(&a, other);
@@ -190,8 +199,7 @@ impl Cgroup {
         if level >= self.level {
             return None;
         }
-        let ancestors = self.ancestors.read();
-        ancestors.get(level as usize).and_then(Weak::upgrade)
+        self.ancestors.get(level as usize).and_then(Weak::upgrade)
     }
 
     /// Lookup child by name
@@ -243,7 +251,7 @@ impl Cgroup {
     /// Each enabled controller's state with its ops, read before any
     /// spin lock is taken (Linux: the css_set a migration moves to is
     /// found under cgroup_mutex, before css_set_lock)
-    fn css_ops(&self) -> Vec<(Arc<CgroupSubsysState>, &'static dyn CgroupSubsysOps)> {
+    fn css_ops(&self) -> CssOps {
         self.subsys
             .read()
             .iter()
@@ -316,7 +324,7 @@ impl Cgroup {
             return Vec::from(b"/".as_slice());
         }
         let mut path = Vec::new();
-        for cg in self.ancestors.read().iter().filter_map(|a| a.upgrade()) {
+        for cg in self.ancestors.iter().filter_map(|a| a.upgrade()) {
             if cg.level > 0 {
                 path.push(b'/');
                 path.extend_from_slice(&cg.name);
@@ -345,13 +353,9 @@ impl Cgroup {
         if core::ptr::eq(self, from) {
             return Vec::from(b"/".as_slice());
         }
-        let common = {
-            let mine = self.ancestors.read();
-            let theirs = from.ancestors.read();
-            (0..=self.level.min(from.level))
-                .take_while(|&l| self.at_level(&mine, l) == from.at_level(&theirs, l))
-                .last()
-        };
+        let common = (0..=self.level.min(from.level))
+            .take_while(|&l| self.at_level(&self.ancestors, l) == from.at_level(&from.ancestors, l))
+            .last();
         // Different hierarchies: the full path
         let Some(common) = common else {
             return self.path();
@@ -463,90 +467,6 @@ impl CgroupSubsysState {
     }
 }
 
-/// CSS Set - Optimized task-to-cgroup mapping
-///
-/// Multiple tasks in the same set of cgroups share a CssSet.
-/// This reduces memory overhead when many tasks are in identical cgroup
-/// configurations (common case: all tasks in root cgroups).
-pub struct CssSet {
-    /// Hash of CSS pointers (for fast CssSet lookup)
-    hash: u64,
-
-    /// CSS pointers indexed by controller type
-    subsys: RwLock<BTreeMap<ControllerType, Arc<CgroupSubsysState>>>,
-
-    /// Link to default cgroup (for controllers not enabled)
-    default_cgroup: Weak<Cgroup>,
-}
-
-impl CssSet {
-    /// Create a new CssSet
-    pub fn new(
-        css_map: BTreeMap<ControllerType, Arc<CgroupSubsysState>>,
-        default: &Arc<Cgroup>,
-    ) -> Result<Arc<Self>, KernelError> {
-        let hash = Self::compute_hash(&css_map);
-        try_arc(Self {
-            hash,
-            subsys: RwLock::new(css_map),
-            default_cgroup: Arc::downgrade(default),
-        })
-    }
-
-    /// Compute hash of CSS set for deduplication
-    fn compute_hash(css_map: &BTreeMap<ControllerType, Arc<CgroupSubsysState>>) -> u64 {
-        let mut hash = 0u64;
-        for (ctrl, css) in css_map.iter() {
-            hash ^= css.id.wrapping_mul(31u64.wrapping_pow(*ctrl as u32));
-        }
-        hash
-    }
-
-    /// Get CSS for a controller
-    pub fn css(&self, controller: ControllerType) -> Option<Arc<CgroupSubsysState>> {
-        self.subsys.read().get(&controller).cloned()
-    }
-
-    /// Get the cgroup for a controller (or default if not enabled)
-    pub fn cgroup_for_controller(&self, controller: ControllerType) -> Option<Arc<Cgroup>> {
-        if let Some(css) = self.css(controller) {
-            css.cgroup()
-        } else {
-            self.default_cgroup.upgrade()
-        }
-    }
-
-    /// Get hash
-    pub fn hash(&self) -> u64 {
-        self.hash
-    }
-}
-
-/// Global CssSet cache for deduplication
-pub static CSS_SET_CACHE: Mutex<BTreeMap<u64, Weak<CssSet>>> = Mutex::new(BTreeMap::new());
-
-/// Find or create a CssSet for the given CSS configuration
-pub fn find_css_set(
-    css_map: BTreeMap<ControllerType, Arc<CgroupSubsysState>>,
-    default: &Arc<Cgroup>,
-) -> Result<Arc<CssSet>, KernelError> {
-    let hash = CssSet::compute_hash(&css_map);
-
-    let mut cache = CSS_SET_CACHE.lock();
-
-    // Try to find existing CssSet with same hash
-    if let Some(weak) = cache.get(&hash)
-        && let Some(css_set) = weak.upgrade()
-    {
-        return Ok(css_set);
-    }
-
-    // Create new CssSet
-    let css_set = CssSet::new(css_map, default)?;
-    cache.insert(hash, Arc::downgrade(&css_set));
-    Ok(css_set)
-}
-
 /// Cgroup Root - The unified hierarchy root
 ///
 /// In cgroup v2, there is a single unified hierarchy with one root.
@@ -554,9 +474,6 @@ pub fn find_css_set(
 pub struct CgroupRoot {
     /// Root cgroup of the hierarchy
     pub root_cgrp: RwLock<Option<Arc<Cgroup>>>,
-
-    /// Registered controllers
-    pub controllers: RwLock<BTreeMap<ControllerType, &'static dyn CgroupSubsysOps>>,
 
     /// Next cgroup ID to allocate
     next_cg_id: AtomicU64,
@@ -570,7 +487,6 @@ impl CgroupRoot {
     pub const fn new() -> Self {
         Self {
             root_cgrp: RwLock::new(None),
-            controllers: RwLock::new(BTreeMap::new()),
             next_cg_id: AtomicU64::new(1),
             next_ino: AtomicU64::new(1),
         }
@@ -596,26 +512,34 @@ impl CgroupRoot {
         *self.root_cgrp.write() = Some(cg);
     }
 
-    /// Register a controller
-    pub fn register_controller(
-        &self,
-        controller: ControllerType,
-        ops: &'static dyn CgroupSubsysOps,
-    ) {
-        self.controllers.write().insert(controller, ops);
-    }
-
-    /// Get a controller's operations
+    /// A controller's operations (Linux cgroup_subsys[]: a static table)
     pub fn get_controller(
         &self,
         controller: ControllerType,
     ) -> Option<&'static dyn CgroupSubsysOps> {
-        self.controllers.read().get(&controller).copied()
+        Some(controller_ops(controller))
     }
 
-    /// Get all registered controllers
-    pub fn registered_controllers(&self) -> Vec<ControllerType> {
-        self.controllers.read().keys().cloned().collect()
+    /// Every controller (Linux for_each_subsys)
+    pub fn registered_controllers(&self) -> [ControllerType; 5] {
+        [
+            ControllerType::Pids,
+            ControllerType::Freezer,
+            ControllerType::Cpu,
+            ControllerType::Memory,
+            ControllerType::Io,
+        ]
+    }
+}
+
+/// A controller's operations (Linux cgroup_subsys[])
+fn controller_ops(c: ControllerType) -> &'static dyn CgroupSubsysOps {
+    match c {
+        ControllerType::Pids => &pids::PIDS_CONTROLLER,
+        ControllerType::Freezer => &freezer::FREEZER_CONTROLLER,
+        ControllerType::Cpu => &cpu::CPU_CONTROLLER,
+        ControllerType::Memory => &memory::MEMORY_CONTROLLER,
+        ControllerType::Io => &io::IO_CONTROLLER,
     }
 }
 
@@ -649,13 +573,6 @@ pub fn cgroup_init() {
 
     root.set_root_cgroup(root_cg.clone());
 
-    // Register controllers
-    root.register_controller(ControllerType::Pids, &pids::PIDS_CONTROLLER);
-    root.register_controller(ControllerType::Freezer, &freezer::FREEZER_CONTROLLER);
-    root.register_controller(ControllerType::Cpu, &cpu::CPU_CONTROLLER);
-    root.register_controller(ControllerType::Memory, &memory::MEMORY_CONTROLLER);
-    root.register_controller(ControllerType::Io, &io::IO_CONTROLLER);
-
     // Initialize CSS for root cgroup for each controller
     for controller in root.registered_controllers() {
         if let Some(ops) = root.get_controller(controller)
@@ -682,11 +599,17 @@ pub fn migrate_thread_group(target: &Arc<Cgroup>, pid: Pid) -> Result<(), Kernel
             ops.can_attach(css, t.tid() as Pid)?;
         }
     }
+    // The source cgroup's controllers, read once per distinct source
+    // (the threads of a group almost always share one)
+    let mut from: Option<(Arc<Cgroup>, CssOps)> = None;
     for t in &threads {
-        migrate_one(target, &to, t);
+        migrate_one(target, &to, t, &mut from);
     }
     Ok(())
 }
+
+/// A cgroup's enabled controllers with their operations
+type CssOps = Vec<(Arc<CgroupSubsysState>, &'static dyn CgroupSubsysOps)>;
 
 /// Thread `t`'s move (Linux cgroup_migrate_execute for one task) to
 /// `target`, whose controllers are `to`. Its current cgroup's
@@ -700,12 +623,22 @@ fn migrate_one(
     target: &Arc<Cgroup>,
     to: &[(Arc<CgroupSubsysState>, &dyn CgroupSubsysOps)],
     t: &Task,
+    cache: &mut Option<(Arc<Cgroup>, CssOps)>,
 ) {
     let old = get_task_cgroup(t);
     if old.as_ref().is_some_and(|o| Arc::ptr_eq(o, target)) {
         return;
     }
-    let from = old.as_ref().map(|o| o.css_ops()).unwrap_or_default();
+    if let Some(o) = &old
+        && !cache.as_ref().is_some_and(|(c, _)| Arc::ptr_eq(c, o))
+    {
+        *cache = Some((o.clone(), o.css_ops()));
+    }
+    let empty = CssOps::new();
+    let from = match (&old, cache.as_ref()) {
+        (Some(_), Some((_, ops))) => ops,
+        _ => &empty,
+    };
     let mut slot = t.cgroup.lock();
     // Exiting: exit owns it (Linux skips PF_EXITING). Exit sets the flag
     // before it detaches under this lock, so a thread seen live here is
@@ -715,7 +648,7 @@ fn migrate_one(
     }
     let pid = t.tid() as Pid;
     if let Some(old) = slot.clone() {
-        for (css, ops) in &from {
+        for (css, ops) in from {
             ops.detach(css, pid);
         }
         old.remove_task(pid);
