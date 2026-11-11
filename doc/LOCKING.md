@@ -2230,7 +2230,8 @@ alone; lists are snapshotted before probing walks them.
 `device_shutdown` (reboot(2)) takes the list out under its lock and runs
 each bound driver's shutdown callback after dropping it, so callbacks
 (which may poll hardware or take driver locks such as `USB_CONTROLLER`)
-never run under it. `PciDev.driver_override` is a spin leaf.
+never run under it. `PciDev.driver_override` is a sleeping
+`sync::Mutex` leaf (Linux device_lock).
 Net devices: `NetNamespace::register_device` links the device on the
 namespace's `devices` RCU list (its leaf writer lock released) before
 creating the device's sysfs entries (under RTNL for driver
@@ -4107,7 +4108,8 @@ else is taken under it) unless an order is given. "spin" is the
 | `Pipe.inner` | io/pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation and across read/write's copy to or from the caller's memory (may fault: -> mmap_lock, as Linux pipe->mutex), never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator; -> `FasyncList.list` (pipe_fasync changes both lists under it, Linux too); -> the output file's write path (i_rwsem, page cache, socket locks) for a pipe-to-file splice, which consumes only what the write took (Linux iter_file_splice_write under pipe_lock); -> the input file's read path for a file-to-pipe splice, which reads only once the pipe has room (Linux splice_file_to_pipe: wait_for_space, then do_splice_read under pipe_lock). A splice, tee or vmsplice waits for data or room with it dropped (`lock_data`, `lock_room`; Linux pipe_wait_readable/writable) and decides EOF, EPIPE or progress under it. SIGIO is sent after it is dropped (Linux sends under pipe->mutex) and after `Inode.i_pipe`. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock. A read decides EOF (no writers) under it, after seeing the ring empty (Linux pipe_read under pipe->mutex): a writer's last write unlocks before its release drops the count, so its data is never read as EOF |
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
-| `SimpleGfxDevice.state`, `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device state and registry |
+| `SimpleGfxDevice.state` | hw/gfx/ | sleeping `sync::Mutex` (Linux DRM modeset locks) | framebuffer device state, DRM ioctls only |
+| `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device registry |
 | `UsbMscDevice.state` | hw/usb/msc.rs | sleeping `sync::Mutex` (Linux us->dev_mutex), thread only | a mass-storage interface's CBW tag and disconnected flag, held across each BOT transaction (CBW, data, CSW: the transfers take `USB_CONTROLLER` under it); its unbind sets the flag under it, after the disk is gone and the command in progress is done |
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
 | `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |

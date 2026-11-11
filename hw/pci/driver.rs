@@ -109,7 +109,9 @@ pub struct PciIds(pub &'static [PciDeviceId]);
 /// A function's device data: the function and its driver_override
 pub struct PciDev {
     pub pci: PciDevice,
-    driver_override: Mutex<Option<String>>,
+    /// Linux driver_override, under device_lock (a mutex): matched,
+    /// shown and stored in thread context
+    driver_override: crate::sync::Mutex<Option<String>>,
 }
 
 /// The PCI function behind `dev`
@@ -409,7 +411,7 @@ pub fn pci_device_add(pci: PciDevice) -> Result<Arc<Device>, KernelError> {
     let root = ROOT.get().ok_or(KernelError::NoDevice)?;
     let data = try_arc(PciDev {
         pci,
-        driver_override: Mutex::new(None),
+        driver_override: crate::sync::Mutex::new(None),
     })?;
     device_create(DeviceInfo {
         parent: Some(root),
