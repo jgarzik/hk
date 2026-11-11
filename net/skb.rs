@@ -118,6 +118,9 @@ pub enum SkbCb {
     /// A datagram queued to a UDP, ping or raw socket: its control
     /// message data (Linux IPCB + PKTINFO_SKB_CB) and source port
     Inet(InetCb),
+    /// An extended error on a socket's error queue (Linux
+    /// SKB_EXT_ERR / sock_exterr_skb)
+    Exterr(crate::net::sock::ExtErr),
 }
 
 /// [`SkbCb::Inet`]
