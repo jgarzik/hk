@@ -1252,7 +1252,8 @@ fn test_ctrunc() {
 
 /// Files in flight per user are capped near RLIMIT_NOFILE: an
 /// unprivileged sender gets ETOOMANYREFS once its count exceeds the
-/// limit, and may send again after the receiver takes them
+/// limit, on any socket, and may send again after the receiver takes
+/// them
 fn test_inflight() {
     let mut t = T::new(b"UNIX_INFLIGHT");
     let pid = sys_fork();
@@ -1281,6 +1282,13 @@ fn test_inflight() {
         if sent != 17 {
             sys_exit(2);
         }
+        // The count is the user's, not the socket's
+        let (c, d) = pair(SOCK_DGRAM);
+        if send_fds(c, b"y", &[c]) != -109 {
+            sys_exit(4);
+        }
+        close(c);
+        close(d);
         // Receiving (and closing) them all uncharges the user
         let mut buf = [0u8; 64];
         let mut ctl = [0u8; 0];

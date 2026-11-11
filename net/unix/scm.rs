@@ -6,8 +6,9 @@
 //! `FileRef`) and SCM_CREDENTIALS (only values the sender could set
 //! with setuid/setgid, its own pid unless CAP_SYS_ADMIN).
 //!
-//! Files in flight are charged to the sending user (`INFLIGHT`, Linux
-//! user->unix_inflight) from the moment they are queued until they are
+//! Files in flight are charged to the sending user (its ucounts'
+//! `UnixInflight`, Linux user->unix_inflight) from the moment they are
+//! queued until they are
 //! received or their message is dropped. Attaching more while the
 //! user's count exceeds RLIMIT_NOFILE is ETOOMANYREFS (Linux
 //! too_many_unix_fds). There is no garbage collector for unreachable
@@ -25,18 +26,16 @@
 //!
 //! ## Locking
 //!
-//! `INFLIGHT` is a `crate::sync::spin::Mutex` leaf (thread context only);
-//! no file is ever dropped while it is held.
+//! The in-flight count is an atomic of the sender's ucounts: charging
+//! (under the receiver's `st`) takes no lock and allocates nothing.
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::FileRef;
 use crate::net::msg::{MSG_CMSG_CLOEXEC, RecvMsg, cmsgs};
 use crate::net::socket::SOL_SOCKET;
-use crate::sync::spin::Mutex;
-use crate::task::Uid;
+use crate::task::ucount::{Ucount, UcountsRef};
 use crate::util::error::KernelError;
 
 pub const SCM_RIGHTS: i32 = 1;
@@ -100,26 +99,9 @@ impl Creds {
 /// Files of one message (Linux struct scm_fp_list)
 pub struct FpList {
     files: Vec<FileRef>,
-    /// Sending user, charged while queued
-    uid: Uid,
+    /// Sending user, charged while queued (Linux fpl->user)
+    user: UcountsRef,
     inflight: bool,
-}
-
-/// In-flight files per user (Linux user_struct.unix_inflight)
-static INFLIGHT: Mutex<BTreeMap<Uid, usize>> = Mutex::new(BTreeMap::new());
-
-fn inflight_add(uid: Uid, n: usize) {
-    *INFLIGHT.lock().entry(uid).or_insert(0) += n;
-}
-
-fn inflight_sub(uid: Uid, n: usize) {
-    let mut t = INFLIGHT.lock();
-    if let Some(v) = t.get_mut(&uid) {
-        *v = v.saturating_sub(n);
-        if *v == 0 {
-            t.remove(&uid);
-        }
-    }
 }
 
 /// Ceiling on a user's in-flight files whatever its RLIMIT_NOFILE
@@ -133,8 +115,9 @@ const INFLIGHT_MAX: u64 = (SCM_MAX_FD * 8) as u64;
 /// RLIMIT_NOFILE (and over `INFLIGHT_MAX` here) and it lacks
 /// CAP_SYS_RESOURCE and CAP_SYS_ADMIN
 pub fn too_many_fds() -> bool {
-    let uid = crate::task::current_cred().uid;
-    let n = INFLIGHT.lock().get(&uid).copied().unwrap_or(0) as u64;
+    let n = crate::task::current_cred()
+        .ucounts
+        .get(Ucount::UnixInflight);
     let lim = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE).min(INFLIGHT_MAX);
     n > lim
         && !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
@@ -154,7 +137,7 @@ impl FpList {
     /// unix_add_edges)
     pub fn queued(&mut self) {
         if !self.inflight {
-            inflight_add(self.uid, self.files.len());
+            self.user.inc(Ucount::UnixInflight, self.files.len() as u64);
             self.inflight = true;
         }
     }
@@ -162,7 +145,7 @@ impl FpList {
     /// Received or dropped (Linux unix_del_edges)
     fn uncharge(&mut self) {
         if self.inflight {
-            inflight_sub(self.uid, self.files.len());
+            self.user.dec(Ucount::UnixInflight, self.files.len() as u64);
             self.inflight = false;
         }
     }
@@ -171,7 +154,7 @@ impl FpList {
     pub fn dup(&self) -> Self {
         Self {
             files: self.files.clone(),
-            uid: self.uid,
+            user: self.user.clone(),
             inflight: false,
         }
     }
@@ -231,7 +214,7 @@ impl Scm {
         }
         let fpl = self.fds.get_or_insert_with(|| FpList {
             files: Vec::new(),
-            uid: crate::task::current_cred().uid,
+            user: crate::task::current_cred().ucounts,
             inflight: false,
         });
         if n > SCM_MAX_FD || fpl.files.len() + n > SCM_MAX_FD {

@@ -7,7 +7,8 @@
 //! to its real uid's ([`set_cred_ucounts`] before the credentials are
 //! committed), and so does whatever a charge outlives the credentials
 //! for: a queued signal (Linux sigqueue->ucounts), a message queue
-//! (info->ucounts), an io_uring ring (ctx->user). Root's is the static
+//! (info->ucounts), an io_uring ring (ctx->user), the files of an
+//! AF_UNIX message (scm_fp_list->user). Root's is the static
 //! [`INIT_UCOUNTS`] (Linux init_ucounts), never freed.
 //!
 //! The lookup table is `UCOUNTS` (Linux ucounts_hashtable under
@@ -42,9 +43,13 @@ pub enum Ucount {
     /// RLIMIT_MEMLOCK: Linux user_struct.locked_vm, the uid's other
     /// per-user structure, kept here with the rest
     LockedVm,
+    /// Files in flight in AF_UNIX messages: Linux
+    /// user_struct.unix_inflight, charged to the sending user from
+    /// queueing until received or dropped
+    UnixInflight,
 }
 
-const NR_UCOUNTS: usize = 4;
+const NR_UCOUNTS: usize = 5;
 
 /// One user's counters (Linux struct ucounts)
 pub struct Ucounts {
