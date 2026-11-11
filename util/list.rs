@@ -314,6 +314,12 @@ impl<A: Adapter> List<A> {
         (!self.head.is_null()).then(|| unsafe { A::item(self.head) })
     }
 
+    /// The last item (Linux list_last_entry)
+    pub fn back(&self) -> Option<*const A::Item> {
+        // SAFETY: a non-null tail is an entry's link
+        (!self.tail.is_null()).then(|| unsafe { A::item(self.tail) })
+    }
+
     /// The item after `item` (Linux list_next_entry), read before
     /// `item` is removed when walking and unlinking
     ///
@@ -522,6 +528,12 @@ impl<A: Adapter, P: ListPtr<Target = A::Item>> PtrList<A, P> {
     pub fn front(&self) -> Option<&A::Item> {
         // SAFETY: live while on the list (the list owns it)
         self.list.front().map(|p| unsafe { &*p })
+    }
+
+    /// The last entry (Linux skb_peek_tail)
+    pub fn back(&self) -> Option<&A::Item> {
+        // SAFETY: live while on the list (the list owns it)
+        self.list.back().map(|p| unsafe { &*p })
     }
 
     pub fn iter(&self) -> Iter<'_, A> {

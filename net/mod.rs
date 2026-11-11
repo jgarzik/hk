@@ -103,6 +103,7 @@ pub fn start_threads() {
 pub fn init() {
     tcp::mem::init();
     tcp::table::init();
+    arp::arp_init();
     // Protocol handlers by EtherType (IPv6 will add 0x86DD here)
     // Linux's order: dev_add_pack puts each first
     static IP_PACKET_TYPE: dev::PacketType =

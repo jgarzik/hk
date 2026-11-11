@@ -557,9 +557,10 @@ pub fn ip_send_rt(
 }
 
 /// Send a packet with a complete IP header along `rt`, fragmenting it
-/// to `mtu` if needed (Linux ip_finish_output -> ip_fragment)
+/// to `mtu` if needed (Linux ip_finish_output -> ip_fragment); `_net`
+/// is the sender's namespace (Linux counts IP MIB statistics in it)
 pub fn ip_output(
-    net: &NetNamespace,
+    _net: &NetNamespace,
     rt: &route::Rtable,
     mut skb: Box<SkBuff>,
     saddr: Ipv4Addr,
@@ -569,10 +570,10 @@ pub fn ip_output(
     skb.saddr = Some(saddr);
     skb.daddr = Some(rt.daddr);
     if skb.len() <= mtu {
-        return neigh_output(net, &rt.dev, rt, rt.nexthop(), skb);
+        return neigh_output(&rt.dev, rt, rt.nexthop(), skb);
     }
     for f in fragment(&skb, mtu)? {
-        neigh_output(net, &rt.dev, rt, rt.nexthop(), f)?;
+        neigh_output(&rt.dev, rt, rt.nexthop(), f)?;
     }
     Ok(())
 }
@@ -618,7 +619,6 @@ pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelErro
 /// NOARP devices and broadcast/multicast map directly, unicast next hops
 /// go through the ARP table)
 fn neigh_output(
-    net: &NetNamespace,
     dev: &Arc<crate::net::NetDevice>,
     rt: &route::Rtable,
     next_hop: Ipv4Addr,
@@ -632,7 +632,7 @@ fn neigh_output(
     match rt.rtype {
         RouteType::Broadcast => ip_finish_output(skb, ethernet::ETH_BROADCAST),
         RouteType::Multicast => ip_finish_output(skb, mc_map(rt.daddr)),
-        _ => arp::output(net, dev, next_hop, skb),
+        _ => arp::output(dev, next_hop, skb),
     }
 }
 

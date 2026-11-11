@@ -101,9 +101,6 @@ pub struct NetNamespace {
     /// Key of the IP identification hash (Linux ip_id_key)
     pub ip_id_key: [u64; 2],
 
-    /// ARP neighbour table (IPv6 neighbour discovery gets its own)
-    pub arp: Arc<crate::net::neigh::NeighTable>,
-
     /// Loopback device for this namespace
     loopback: RwLock<Option<Arc<NetDevice>>>,
 }
@@ -150,7 +147,6 @@ impl NetNamespace {
                 (u64::from(crate::random::get_random_u32()) << 32)
                     | u64::from(crate::random::get_random_u32()),
             ],
-            arp: crate::net::neigh::NeighTable::new(&crate::net::arp::ARP_OPS),
             loopback: RwLock::new(None),
         })
     }

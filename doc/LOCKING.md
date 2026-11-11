@@ -4276,10 +4276,9 @@ not rely on either.
 | `NetNamespace.loopback`, `UdpTable.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes); the UDP port table reads each candidate's `Inet.addr` under its lock |
 | `Fib.tables`, `FibTable.entries` (`net/inet/fib.rs`, per netns; Linux fib_table_hash, a table's aliases) | `RcuList`s (their `ends` spin leaves) | readers under RCU, any context; writers thread only | changed only under RTNL (Linux fib_table_insert/delete): a route goes in at its sorted place (`insert_before`/`insert_after`) or takes an old one's (`replace`, NLM_F_REPLACE); one removed or replaced is freed after a grace period (`RcuUnlinked::defer`, Linux alias_free_mem_rcu). Input/output routing (softnet, socket syscalls, possibly under `sk_lock`) walks them under `rcu::read_lock` and takes a reference to the route it returns; route dumps fill an `NlBuf` and /proc/net/route a `SeqBuf` under the guard; notifications are built outside it. Tables are never removed while the namespace lives |
 | `InDevice.ifa_list` (`NetDevice.ip_ptr`, Linux in_device ifa_list; IPv6 later), `ifaddr::INET_ADDR_LST` (Linux inet_addr_lst: 256 chains by namespace and local address) | `RcuList`s (their `ends` spin leaves) | readers under RCU, any context; writers thread only | changed only under RTNL (`inet::ifaddr`): an address is inserted at its place (a primary after the last primary of its scope, a secondary last: `insert_after`) and on its hash chain, and unlinked from both and freed after a grace period with one callback (`RcuUnlinked::defer_with`, Linux inet_free_ifa); NLM_F_REPLACE changes its `flags`/`rt_priority`/`proto` atomics in place. Readers (source selection on transmit, possibly under a socket lock; `ip_dev_find`; address dumps filling an `NlBuf`) walk under `rcu::read_lock`, no lock, no copy |
-| `NeighTable.hash` (`net/core/neigh.rs`; `NetNamespace.arp`, IPv6 ND later) | `spin::RwLock` | thread only (softnet, socket output, ktimers/N) | (ifindex, address) -> `Arc<Neighbour>`; lookups drop the guard; GC/flush take each entry's `inner` under the write lock (order hash -> inner) |
-| `Neighbour.inner` | `spin::Mutex` | thread only | leaf: NUD state + bounded unresolved queue (unres_qlen_bytes). Never held while transmitting, soliciting, reporting errors or arming the neighbour `Alarm` (the next deadline is read under it, armed after): state changes return actions run after the unlock |
-| neighbour `TABLES` | `spin::Mutex` | thread only | leaf (snapshot of registered tables). One `timer::Alarm` runs all tables' due entries and GC on `ktimers/N`, armed with no table lock held |
-| `timer::Alarm.st` (neighbour, IP reassembly) | `spin::Mutex` | thread only | held across arming its SOFT `TimerList` (-> the timer base's IrqSpinlock); otherwise leaf |
+| `NeighTable.lock` (`net/core/neigh.rs`; `arp::arp_tbl`, one table for every namespace, IPv6 ND later; Linux tbl->lock) | `spin::Mutex<TblLocked>` | thread only (softnet, socket output, `ktimers/N` neighbour timers, the system workqueue's periodic GC, RTNL-held configuration) | writers of the RCU hash (`NeighHash`: `RcuHList` chains published through an `RcuArc`; lookups, dumps and /proc/net/arp walk them under `rcu::read_lock`, no lock, no copy), the gc list and every device's list (`NetDevice.neighbours`, a `LockedBy` it owns). An entry is allocated with `Gfp::ATOMIC` before it is taken (Linux neigh_alloc); the hash doubles under it with `Gfp::ATOMIC` (neigh_hash_grow: entries move between chains with no grace period, the old table is freed after one; on failure it stays); unhashed entries are released after a grace period (`RcuUnlinked::defer`). Order: -> `Neighbour.inner` (GC, flush, delete, gc-list moves); the forced GC runs from `create` before it is taken; periodic GC drops it between chains and re-queues itself under it (-> the workqueue's IrqSpinlock, Linux queue_delayed_work under tbl->lock) |
+| `Neighbour.inner` (Linux neigh->lock) | `spin::Mutex` | thread only | NUD state, the entry's timer and its unresolved queue (`arp_queue`: an intrusive `SkbHead`, bounded by truesize at unres_qlen_bytes). The timer (`ArcTimer`, a pending arm holds a reference, Linux neigh_add_timer's neigh_hold) is armed and deleted under it (-> the timer base's IrqSpinlock). Never held while transmitting, soliciting or reporting errors: state changes return actions run after the unlock |
+| `timer::Alarm.st` (IP reassembly) | `spin::Mutex` | thread only | held across arming its SOFT `TimerList` (-> the timer base's IrqSpinlock); otherwise leaf |
 | `FragTable.st` (`net/inet/frag.rs`, per netns) | `spin::Mutex` | thread only (softnet, reassembly timer on ktimers/N) | leaf: reassembly queues + memory charge; completed datagrams are delivered and expiry ICMP errors sent after it is dropped. Reassembly `TABLES` (registered namespaces) is a leaf `spin::Mutex` |
 | `route::FNHE_LOCK` (`net/inet/route.rs`, global; Linux fnhe_lock) | `spin::Mutex<FnheLock>` (its `UniqueOwner` proves writers of every nexthop's `RcuHList` exception chains) | thread only (softnet ICMP frag-needed input, `route::output` deleting an expired exception, possibly under a socket lock) | leaf: a route's chains are allocated at its first exception and each exception is created under it with `Gfp::ATOMIC` (Linux kzalloc GFP_ATOMIC under fnhe_lock), dropped without memory; past a chain depth of 5 to 9 (randomized, Linux FNHE_RECLAIM_DEPTH) the oldest is removed first; removed ones are freed after a grace period. Readers (`route::output`) walk the chain under RCU; pmtu and expiry are atomics updated in place. The chains go with their route (a replaced route's with it) |
 | `NlTable.socks` (`net/netlink`, per netns) | `spin::RwLock` | thread only | leaf; bound netlink sockets by (protocol, portid); lookups return `Arc` clones. A bind/autobind checks the socket's `bound` and publishes its portid under the write lock (Linux netlink_insert), so concurrent binds of one socket cannot both insert |
@@ -4295,7 +4294,7 @@ not rely on either.
 | `UnixSock.addr`, `UnixSock.peercred` | `spin::RwLock` / `spin::Mutex` | thread only | leaves (Linux u->addr, sk_peer_lock) |
 | `UnixSock.relay` | `spin::Mutex<()>` | thread only | Linux peer_wait.lock's part in peer_wake: a datagram sender (poll, or a non-blocking send) whose peer's queue is full links its own embedded `peer_wake` entry on the peer's `peer_wait` under it, holding its own `st` so the peer stays its peer while linked (Linux unix_dgram_poll under unix_state_lock); order `st` -> `relay` -> `peer_wait` head; the sender's `peer_wake_to` atomic is set under it. Nothing is allocated |
 | `UnixSock` `state`/`dead`/`wmem`/`backlog`/`peer_wake` | atomics | thread only | |
-| `NetDevice.ops` | `spin::RwLock<Option<Arc<dyn NetDeviceOps>>>` | thread only | the driver while registered (Linux reg_state + netdev_ops); written once, under RTNL, by `rtnl::unregister_netdevice` (`detach_ops`: None = unregistered). Read-held across the driver's `xmit` (after the lock-free IFF_UP check, so a closed device's senders do not take it), so the write waits for transmits in flight (Linux synchronize_net after dev_deactivate); RTNL-side callbacks (open, stop, set_promisc) clone the `Arc` out, since they may sleep, and RTNL orders them with the detach. Under it: the driver's TX lock, `Softnet.backlog` (lo). Also read under `NeighTable.hash` (`is_gone`: no neighbour is created for an unregistered device after its flush) |
+| `NetDevice.ops` | `spin::RwLock<Option<Arc<dyn NetDeviceOps>>>` | thread only | the driver while registered (Linux reg_state + netdev_ops); written once, under RTNL, by `rtnl::unregister_netdevice` (`detach_ops`: None = unregistered). Read-held across the driver's `xmit` (after the lock-free IFF_UP check, so a closed device's senders do not take it), so the write waits for transmits in flight (Linux synchronize_net after dev_deactivate); RTNL-side callbacks (open, stop, set_promisc) clone the `Arc` out, since they may sleep, and RTNL orders them with the detach. Under it: the driver's TX lock, `Softnet.backlog` (lo). Also read under `NeighTable.lock` (`is_gone`: no neighbour is created for an unregistered device after its flush) |
 | `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet; written at registration (RTNL held), before the device is linked on the namespace's list |
 | driver `netdev` / `Napi.poller` (`spin::Once<Weak<..>>`) | set once at probe, before the IRQ is registered and the NAPI added | read lock-free by polls (thread) | ISRs never read them (they use the driver struct passed as IRQ data) |
 | `icmp::ICMP_ECHO_REPLY_WQ` | `WaitQueue` | woken by ICMP input (softnet) | kernel self-test waiter only (`selftest.rs`), woken after the reply is recorded |
@@ -4331,7 +4330,8 @@ RTNL (sleeping; configuration)   TcpSock.lock owner (sleeping; -> mmap_lock) -> 
 NetNamespace tables (RwLocks; lookups drop the guard before returning);
   address lists, FIB tables (RCU readers; writers under RTNL take the
   lists' leaf `ends`)
-  -> NeighTable.hash -> Neighbour.inner (dropped before any transmit)
+  -> NeighTable.lock -> Neighbour.inner -> timer base (dropped before any
+     transmit)
   (RawTable.socks -> Inet.addr; FragTable.st, FNHE_LOCK, IcmpRate.st,
    Sock.errq, RxQueue.q: leaves, never held while transmitting)
   -> NlTable.socks -> NlSock.rxq (netlink replies/notifications)
@@ -4340,12 +4340,12 @@ NetNamespace tables (RwLocks; lookups drop the guard before returning);
    before connector, else by address) -> UnixSock.rq / peercred / addr /
    UnixCb.fp; UnixSock.st -> peer's UnixSock.relay ->
    peer_wait head -> Sock.wq head)
-  (NlSock.dump -> RCU walks of devices, addresses, FIB; ARP snapshot
+  (NlSock.dump -> RCU walks of devices, addresses, FIB, neighbours
    -> NlSock.rxq: dump parts)
   (AF_PACKET taps, from any receive or transmit path: PacketTable.socks,
    then PacketSock.filter / PacketSock.rxq, each a leaf;
    RTNL -> PacketSock.mclist)
-  -> NetDevice.ops (read across a transmit; NeighTable.hash -> it)
+  -> NetDevice.ops (read across a transmit; NeighTable.lock -> it)
   -> device TX lock (e1000 tx, virtio-net tx)
   -> Softnet.backlog (lo xmit)           Softnet.poll_list; WaitQueue -> pi_lock
                                           -> rq (IrqSpinlocks, innermost)
@@ -4407,8 +4407,8 @@ hands its devices to the system workqueue (`rtnl::netns_exit`, Linux
 cleanup_net -> default_device_exit_batch), which under RTNL closes and
 detaches each, loopback last, unlinks its addresses from their lists
 and `INET_ADDR_LST` (freed after a grace period) and removes its sysfs
-device; its FIB, ARP table and sockets went with the namespace, so
-nothing is announced.
+device; its FIB and sockets went with the namespace, and its
+neighbours with its devices, so nothing is announced.
 
 **Driver ISR rules (e1000 pattern):** read ICR (read-to-clear; 0 => not
 ours on a shared line, return false), write IMC (mask all), record causes

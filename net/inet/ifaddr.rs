@@ -496,7 +496,7 @@ pub fn inetdev_up(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
 /// it go, except host-scope (local) ones
 pub fn inetdev_down(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
     fib::fib_disable_dev(rtnl, net, dev, false);
-    net.arp.flush_dev(dev.ifindex());
+    crate::net::arp::arp_tbl().flush_dev(dev);
 }
 
 /// Device unregistered (Linux inetdev_event NETDEV_UNREGISTER ->

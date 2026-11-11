@@ -100,7 +100,7 @@ pub fn unregister_netdevice(rtnl: &RtnlGuard, dev: &Arc<NetDevice>) {
     net.unlist_device(dev);
     dev.detach_ops(rtnl);
     ifaddr::inetdev_destroy(rtnl, &net, dev);
-    net.arp.flush_dev(dev.ifindex());
+    crate::net::arp::arp_tbl().flush_dev(dev);
     crate::net::packet::netdev_unregister(rtnl, &net, dev);
     rtnetlink::notify_dellink(&net, dev);
     crate::net::sysfs::netdev_unregister_kobject(dev);

@@ -5,10 +5,12 @@
 //! (solicit = ARP request, output = Ethernet transmit of an IPv4
 //! packet, error report = ICMP host unreachable to the sender). This
 //! module parses and answers ARP packets and feeds the table.
+//!
+//! One table serves every namespace (Linux arp_tbl): entries are keyed
+//! by device, and dumps and /proc/net/arp show the reader's namespace.
 
 use crate::mm::page_alloc::Gfp;
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -18,7 +20,7 @@ use crate::net::ethernet::{self, ETH_ALEN, ETH_BROADCAST, ETH_HLEN, EtherType, P
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::ifaddr::{RT_SCOPE_LINK, inet_select_addr};
 use crate::net::ipv4::{self, Ipv4Addr};
-use crate::net::neigh::{self, Key, Lladdr, NeighOps, Neighbour, nud, upd};
+use crate::net::neigh::{self, HASH_RND, Key, Lladdr, NeighOps, NeighTable, Neighbour, nud, upd};
 use crate::net::skb::SkBuff;
 
 /// ARP hardware type: Ethernet
@@ -157,10 +159,35 @@ pub fn classify(
 pub static ARP_OPS: NeighOps = NeighOps {
     family: 2,
     key_len: 4,
+    hash: arp_hash,
     solicit: arp_solicit,
     output: ipv4::ip_finish_output,
     error_report: ipv4::ip_link_failure,
 };
+
+/// The ARP table (Linux arp_tbl), made by `arp_init`
+static ARP_TBL: spin::Once<NeighTable> = spin::Once::new();
+
+/// The ARP table (after `arp_init`)
+pub fn arp_tbl() -> &'static NeighTable {
+    ARP_TBL.get().expect("arp: used before arp_init")
+}
+
+/// Make the ARP table and start its GC (Linux arp_init ->
+/// neigh_table_init); boot, before any device
+pub fn arp_init() {
+    ARP_TBL.call_once(|| NeighTable::new(&ARP_OPS)).start();
+}
+
+/// Linux arp_hashfn: the address mixed with the device's address
+/// (hash32_ptr) times the table's first random word
+fn arp_hash(key: &Key, dev: &NetDevice, rnd: &[u32; HASH_RND]) -> u32 {
+    let k = u32::from_ne_bytes([key[0], key[1], key[2], key[3]]);
+    let p = core::ptr::from_ref(dev).addr() as u64;
+    // Folded to 32 bits on purpose (Linux hash32_ptr)
+    let hp = (p ^ (p >> 32)) as u32;
+    (k ^ hp).wrapping_mul(rnd[0])
+}
 
 /// Receive an ARP packet (EtherType 0x0806 handler; thread context)
 ///
@@ -190,13 +217,15 @@ pub fn arp_rcv(skb: alloc::boxed::Box<SkBuff>) {
         ArpAction::ProbeReply => send_arp_reply(dev, tip, sip, &sha),
         ArpAction::Reply => {
             // Linux neigh_event_ns: the requester's entry, STALE
-            if let Ok(n) = ns.arp.create(dev, &neigh::key4(sip)) {
-                ns.arp.update(&n, Some(sha), nud::STALE, upd::OVERRIDE);
+            let tbl = arp_tbl();
+            if let Ok(n) = tbl.create(dev, &neigh::key4(sip), false) {
+                tbl.update(&n, Some(sha), nud::STALE, upd::OVERRIDE);
             }
             send_arp_reply(dev, tip, sip, &sha);
         }
         ArpAction::Update => {
-            let Some(n) = ns.arp.lookup(dev.ifindex(), &neigh::key4(sip)) else {
+            let tbl = arp_tbl();
+            let Some(n) = tbl.lookup(dev, &neigh::key4(sip)) else {
                 return;
             };
             // Only a unicast reply to us confirms reachability
@@ -206,12 +235,12 @@ pub fn arp_rcv(skb: alloc::boxed::Box<SkBuff>) {
                 nud::STALE
             };
             let garp = op == ARPOP_REQUEST && tip == sip;
-            let flags = if garp || ns.arp.may_override(&n) {
+            let flags = if garp || tbl.may_override(&n) {
                 upd::OVERRIDE
             } else {
                 0
             };
-            ns.arp.update(&n, Some(sha), state, flags);
+            tbl.update(&n, Some(sha), state, flags);
         }
     }
 }
@@ -305,57 +334,65 @@ fn send_arp_reply(
 const ATF_COM: u32 = 0x02;
 const ATF_PERM: u32 = 0x04;
 
-/// `/proc/net/arp` (Linux arp_seq_show; NOARP entries are hidden)
+/// `/proc/net/arp` (Linux arp_seq_show; NOARP entries are hidden):
+/// the reader's namespace's entries, walked under RCU into a fixed
+/// buffer (Linux neigh_seq_start's rcu_read_lock)
 pub fn proc_net_arp() -> Vec<u8> {
-    let mut out = String::from(
-        "IP address       HW type     Flags       HW address            Mask     Device\n",
-    );
-    for e in crate::net::current_net_ns().arp.dump() {
-        if e.state & nud::NOARP != 0 {
-            continue;
+    let net = crate::net::current_net_ns();
+    crate::fs::proc::seq::generate(|m| {
+        let _ = m.write_str(
+            "IP address       HW type     Flags       HW address            Mask     Device\n",
+        );
+        let g = crate::sync::rcu::read_lock();
+        for n in arp_tbl().iter_rcu(&g).filter(|n| n.dev.net_is(&net)) {
+            arp_format_neigh_entry(m, n);
         }
-        let flags = if e.state & nud::PERMANENT != 0 {
-            ATF_PERM | ATF_COM
-        } else if e.state & nud::VALID != 0 {
-            ATF_COM
-        } else {
-            0
-        };
-        let ip = Ipv4Addr::from_be_bytes([e.key[0], e.key[1], e.key[2], e.key[3]]);
-        let m = e.ha;
-        let hw = alloc::format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            m[0],
-            m[1],
-            m[2],
-            m[3],
-            m[4],
-            m[5]
-        );
-        let _ = writeln!(
-            out,
-            "{:<16} 0x{:<10x}0x{:<10x}{:<17}     {:<8} {}",
-            alloc::format!("{}", ip),
-            ARPHRD_ETHER,
-            flags,
-            hw,
-            "*",
-            e.dev.name()
-        );
+    })
+}
+
+/// One entry's line (Linux arp_format_neigh_entry)
+fn arp_format_neigh_entry(m: &mut crate::fs::proc::seq::SeqBuf, n: &Neighbour) {
+    let e = n.info(0);
+    if e.state & nud::NOARP != 0 {
+        return;
     }
-    out.into_bytes()
+    let flags = if e.state & nud::PERMANENT != 0 {
+        ATF_PERM | ATF_COM
+    } else if e.state & nud::VALID != 0 {
+        ATF_COM
+    } else {
+        0
+    };
+    let h = e.ha;
+    // "%-16s " for the address
+    m.setwidth(16);
+    let _ = write!(m, "{}", n.key4());
+    m.pad(' ');
+    let _ = writeln!(
+        m,
+        "0x{:<10x}0x{:<10x}{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}     *        {}",
+        ARPHRD_ETHER,
+        flags,
+        h[0],
+        h[1],
+        h[2],
+        h[3],
+        h[4],
+        h[5],
+        n.dev.name()
+    );
 }
 
 /// Send an IPv4 packet to its next hop on `dev` through the ARP table
-/// (Linux ip_finish_output2 + neigh_output)
+/// (Linux ip_finish_output2: ip_neigh_gw4, then neigh_output)
 pub fn output(
-    net: &crate::net::NetNamespace,
-    dev: &alloc::sync::Arc<NetDevice>,
+    dev: &Arc<NetDevice>,
     nexthop: Ipv4Addr,
     skb: Box<SkBuff>,
 ) -> Result<(), crate::util::error::KernelError> {
-    let n = net.arp.create(dev, &neigh::key4(nexthop))?;
-    net.arp.output(&n, skb)
+    let tbl = arp_tbl();
+    let n = tbl.create(dev, &neigh::key4(nexthop), dev.is_loopback())?;
+    tbl.output(&n, skb)
 }
 
 #[cfg(test)]

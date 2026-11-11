@@ -409,10 +409,16 @@ impl DumpCb for RtDump {
                 })
             }
             DumpKind::Neigh => {
-                let n = net.arp.dump();
+                // Linux neigh_dump_table: the buckets walked under RCU,
+                // each entry of the namespace filled as it is reached
+                let g = crate::sync::rcu::read_lock();
+                let now = neigh::now_ms();
+                let ns = crate::net::arp::arp_tbl()
+                    .iter_rcu(&g)
+                    .filter(|n| n.dev.net_is(net));
                 let mut nb = NlBuf::new(buf, DUMP_SIZE);
-                self.take_nl(&mut nb, &n, |nb, e| {
-                    fill_neigh(nb, e, RTM_NEWNEIGH, f, seq, pid)
+                self.take_nl(&mut nb, ns, |nb, n| {
+                    fill_neigh(nb, &n.info(now), RTM_NEWNEIGH, f, seq, pid)
                 })
             }
         }
@@ -1159,7 +1165,7 @@ fn newneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
         Some(a) => Some([a[0], a[1], a[2], a[3], a[4], a[5]]),
         None => None,
     };
-    sk.net().arp.admin_add(&dev, &key, ll, r.state, h.flags)?;
+    crate::net::arp::arp_tbl().admin_add(&dev, &key, ll, r.state, h.flags)?;
     Ok(Done::Ok)
 }
 
@@ -1168,7 +1174,7 @@ fn delneigh(sk: &NlSock, p: &[u8]) -> Result<Done, KernelError> {
     let r = ndmsg(p)?;
     let (dev, key) = nd_target(sk.net(), &r)?;
     let _r = rtnl::lock();
-    sk.net().arp.admin_del(dev.ifindex(), &key)?;
+    crate::net::arp::arp_tbl().admin_del(&dev, &key)?;
     Ok(Done::Ok)
 }
 
@@ -1176,12 +1182,8 @@ fn delneigh(sk: &NlSock, p: &[u8]) -> Result<Done, KernelError> {
 fn getneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
     let r = ndmsg(p)?;
     let (dev, key) = nd_target(sk.net(), &r)?;
-    let e = sk
-        .net()
-        .arp
-        .dump()
-        .into_iter()
-        .find(|e| e.ifindex == dev.ifindex() && e.key == key)
+    let e = crate::net::arp::arp_tbl()
+        .info(&dev, &key)
         .ok_or(KernelError::NotFound)?;
     let mut v = nlmsg_new(NEIGH_NLMSG_SIZE)?;
     fill_neigh(
