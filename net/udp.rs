@@ -13,8 +13,9 @@
 //!
 //! ## Locking (thread context only)
 //!
-//! Order: `UdpSock.op` (Linux lock_sock: bind/connect/autobind) ->
-//! `UdpTable.socks` (RwLock) -> `Inet.addr` (Mutex leaf);
+//! Order: `UdpSock.op` (sleeping `sync::Mutex`, Linux lock_sock:
+//! bind/connect/autobind, socket calls only) -> `UdpTable.socks`
+//! (RwLock) -> `Inet.addr` (Mutex leaf);
 //! `UdpSock.rxq` is a separate leaf. Receive takes the table read lock
 //! and then each candidate's `Inet.addr`; it never holds the table lock
 //! while queueing. No lock is held across a sleep or a transmit.
@@ -26,7 +27,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::spin::RwLock;
 
 use crate::net::af_inet::{
     self, IP_PKTINFO, IP_TOS, IP_TTL, IPPROTO_UDP, Inet, InetAddr, RxInfo, SOL_IP,
@@ -55,8 +56,9 @@ pub const SOL_UDP: i32 = 17;
 pub struct UdpSock {
     sk: Sock,
     pub inet: Inet,
-    /// Socket lock: bind/connect/disconnect/autobind (Linux lock_sock)
-    op: Mutex<()>,
+    /// Socket lock: bind/connect/disconnect/autobind (Linux lock_sock,
+    /// which sleeps)
+    op: crate::sync::Mutex<()>,
     /// Connected (Linux TCP_ESTABLISHED state for datagram sockets)
     connected: AtomicBool,
     /// In the namespace table
@@ -71,7 +73,7 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
     Ok(try_arc_cyclic(|me| UdpSock {
         sk: Sock::new(net, AF_INET, SOCK_DGRAM, IPPROTO_UDP),
         inet: Inet::default(),
-        op: Mutex::new(()),
+        op: crate::sync::Mutex::new(()),
         connected: AtomicBool::new(false),
         hashed: AtomicBool::new(false),
         rxq: RxQueue::default(),

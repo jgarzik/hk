@@ -510,10 +510,11 @@ Block locks (3.10 Block Device Subsystem):
 Network locks (3.10 Network Subsystem has the full order):
     RTNL (sleeping, outermost; never under any spinlock)
         ↓
-    TcpSock.rd / UnixSock.bindlock / UnixSock.iolock (sleeping)
+    TcpSock.rd / UnixSock.bindlock / UnixSock.iolock / UdpSock.op /
+    PingSock.op (sleeping)
         ↓
-    socket locks (TcpSock.cb, TimeWait.inner, UdpSock.op, PingSock.op,
-    UnixSock.st) → protocol tables → Inet.addr → queues, timers
+    socket locks (TcpSock.cb, TimeWait.inner, UnixSock.st) → protocol
+    tables → Inet.addr → queues, timers
         ↓ (transmit under a socket lock)
     FIB / neighbour / device TX → Softnet.backlog
     Socket wakeups (`Sock::data_ready`, `write_space`,
@@ -3864,7 +3865,7 @@ not rely on either.
 | TCP tables `TcpTables.{bhash, ehash, lhash}` (`net/tcp/table.rs`, per netns) | `spin::RwLock` | thread only | `bhash` -> `ehash` (connect picks a port and inserts its four-tuple atomically); `lhash` -> `Inet.addr` (listener lookup scores candidates' bound address and device); candidates' `Inet.addr` and `Sock` flags are read under `bhash`; never a socket `cb` under a table lock (/proc/net/tcp copies the entries out, drops the table locks, then takes each `cb` / `TimeWait.inner` in turn) |
 | `Sock.errq` (`net/sock.rs`) | `spin::Mutex` | thread only (softnet ICMP error delivery, recvmsg MSG_ERRQUEUE, poll) | leaf: IP_RECVERR queue, bounded by SO_RCVBUF (own charge); the wakeup follows the unlock |
 | `IcmpRate.st` (`net/icmp.rs`, per netns) | `spin::Mutex` | thread only | leaf: global + per-destination (bounded, 256) ICMP error token buckets |
-| `UdpSock.op`, `PingSock.op` | `spin::Mutex<()>` | thread only | datagram socket lock (bind/connect/disconnect/autobind; connect autobinds within the same hold); never across a sleep or a transmit; taken before the protocol's port/identifier table |
+| `UdpSock.op`, `PingSock.op` | sleeping `sync::Mutex<()>` (Linux lock_sock) | thread only (socket calls) | datagram socket lock (bind/connect/disconnect/autobind; connect autobinds within the same hold, and routes under it); taken before the protocol's port/identifier table, never under a spin lock |
 | `RxQueue.q` (`net/dgram.rs`: UDP, ping, raw receive queues) | `spin::Mutex` | thread only (softnet enqueue, recvmsg) | leaf; bounded by SO_RCVBUF (`rmem` atomic: charged before the push, uncharged after the pop; a purge uncharges exactly what it took) |
 | `RawTable.socks` (`net/raw.rs`, per netns) | `spin::RwLock` | thread only | raw sockets by protocol; delivery and ICMP-error fan-out clone the matching `Arc`s (reading their `Inet.addr`) and queue after dropping it; `RawSock.filter` is an atomic |
 | `PacketTable.socks` (`net/packet/`, per netns) | `spin::RwLock<Vec<Arc<PacketSock>>>` | thread only (taps in softnet or a transmitting task, socket create/close) | leaf; the tap clones the matching `Arc`s and queues after dropping it (a global atomic count skips all work when no packet socket exists) |
@@ -3922,7 +3923,7 @@ not rely on either.
 ```
 RTNL (sleeping; configuration)   TcpSock.rd (sleeping) -> TcpSock.cb (listener before its new child;
   |                                 a child never takes its listener's cb) /
-  |                                 TimeWait.inner / UdpSock.op / PingSock.op
+  |                                 TimeWait.inner / UdpSock.op, PingSock.op (sleeping)
   |                                 -> TCP bhash -> ehash, lhash / UdpTable.socks /
   |                                    PingTable.socks -> Inet.addr
   |                                 -> TcpSock.queue / RxQueue.q

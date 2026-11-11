@@ -11,7 +11,8 @@
 //!
 //! ## Locking (thread context only)
 //!
-//! `PingSock.op` (socket lock: bind/connect/autobind) -> `PingTable.socks`
+//! `PingSock.op` (socket lock, sleeping `sync::Mutex` as Linux lock_sock:
+//! bind/connect/autobind, socket calls only) -> `PingTable.socks`
 //! (`crate::sync::spin::RwLock`) -> `Inet.addr`; `RxQueue` and `Sock.errq` are
 //! separate leaves. Receive takes the table read lock, clones the `Arc`
 //! and queues after dropping it.
@@ -23,7 +24,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
-use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::spin::RwLock;
 
 use crate::net::af_inet::{self, Inet, RxInfo, SOL_IP};
 use crate::net::dgram::{self, Dgram, RxQueue};
@@ -47,8 +48,8 @@ const HDR: usize = 8;
 pub struct PingSock {
     sk: Sock,
     pub inet: Inet,
-    /// Socket lock (Linux lock_sock)
-    op: Mutex<()>,
+    /// Socket lock (Linux lock_sock, which sleeps)
+    op: crate::sync::Mutex<()>,
     connected: AtomicBool,
     hashed: AtomicBool,
     rxq: RxQueue,
@@ -77,7 +78,7 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
     Ok(try_arc_cyclic(|me| PingSock {
         sk,
         inet: Inet::default(),
-        op: Mutex::new(()),
+        op: crate::sync::Mutex::new(()),
         connected: AtomicBool::new(false),
         hashed: AtomicBool::new(false),
         rxq: RxQueue::default(),
