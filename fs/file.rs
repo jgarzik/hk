@@ -1111,7 +1111,12 @@ pub struct FileRef(ManuallyDrop<Arc<File>>);
 
 impl FileRef {
     /// A reference to the file `w` names, unless its last one is gone
-    /// (Linux file_ref_get)
+    /// (Linux file_ref_get). A failure briefly holds an `Arc` that would
+    /// drop the file's memory (dentry, private data) if the release had
+    /// finished and dropped its own meanwhile (Linux frees a file
+    /// through RCU instead): the caller keeps the release from finishing
+    /// (epoll calls it under `Eventpoll.mtx`, which the file's
+    /// `eventpoll_release` takes for the item)
     pub fn try_get(w: &alloc::sync::Weak<File>) -> Option<FileRef> {
         let f = w.upgrade()?;
         let mut n = f.f_count.load(Ordering::Relaxed);
