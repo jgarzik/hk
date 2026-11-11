@@ -868,6 +868,18 @@ mode, a short power-button press does nothing). Only the 32-bit FADT
 block fields are read (no X_ GAS forms, no hardware-reduced ACPI), and
 a reset register in PCI configuration space is ignored.
 
+## Writeback of a superblock with no block device
+
+**Location**: `fs/fs_writeback.rs` (`mark_inode_dirty`, `writeback_sb`)
+
+An inode dirtied on a superblock without a backing device (Linux
+noop_backing_dev_info) is marked dirty but queued nowhere, and
+syncfs/umount write nothing for it; its dirty mark then stays, so it
+is never queued again. No such file system dirties pages for writeback
+today (ramfs/tmpfs pages are unevictable or swap-backed); one that
+does needs a backing device of its own, or Linux's noop wb lists with
+its no-writeback skip, before it relies on sync.
+
 ## Block layer gaps
 
 **Location**: `block/`, `hw/virtio/blk.rs`,
