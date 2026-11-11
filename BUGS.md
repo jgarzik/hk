@@ -110,6 +110,11 @@ net->passive), so the cleanup_net / default_device_exit_batch work
 (`rtnl::netns_exit`, from `NetNamespace`'s drop in `ns/net.rs`) runs
 after the struct is freed and cannot call `rtnl::unregister_netdevice`
 or `NetDevice::net`.
+FIB: removing every route through a device (`net/inet/fib.rs`,
+`remove_first` per route) restarts from the list head each time, under
+the table's leaf lock; Linux fib_table_flush is one walk. Path MTU
+exceptions (`route::NhExceptions`) have no generation id (Linux
+fnhe_genid), so they are not flushed when a device goes down.
 
 
 The TCP send and receive queues are one contiguous `VecDeque<u8>`
