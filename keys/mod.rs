@@ -33,7 +33,7 @@ use crate::sync::spin::RwLock;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_cyclic_nofail, try_arc_cyclic};
 use crate::util::rbtree::{RbTree, RbTreeNodeReservation};
-use alloc::collections::BTreeMap;
+
 use alloc::sync::{Arc, Weak};
 
 // =============================================================================
@@ -246,7 +246,30 @@ struct KeyUser {
     nbytes: usize,
 }
 
-static KEY_USERS: RwLock<BTreeMap<u32, KeyUser>> = RwLock::new(BTreeMap::new());
+/// Users' key quotas (Linux key_user_tree under key_user_lock, a
+/// spinlock: key_user_lookup allocates a candidate before taking it and
+/// looks again); entries live as long as the system
+static KEY_USERS: RwLock<RbTree<u32, KeyUser>> = RwLock::new(RbTree::new());
+
+/// `uid`'s quota entry, made if absent: the node is allocated before the
+/// lock and dropped after it if another made the entry first
+fn with_key_user<R>(uid: u32, f: impl FnOnce(&mut KeyUser) -> R) -> Result<R, KernelError> {
+    let spare = {
+        let mut users = KEY_USERS.write();
+        if let Some(u) = users.get_mut(&uid) {
+            return Ok(f(u));
+        }
+        drop(users);
+        RbTreeNodeReservation::new()?
+    };
+    let mut users = KEY_USERS.write();
+    if users.get(&uid).is_none() {
+        let old = users.insert(spare.into_node(uid, KeyUser::default()));
+        debug_assert!(old.is_none());
+    }
+    let r = f(users.get_mut(&uid).expect("key user present"));
+    Ok(r)
+}
 
 /// Linux root/non-root key quota (key.c): maxkeys / maxbytes
 const KEY_MAXKEYS: usize = 200;
@@ -262,14 +285,14 @@ pub fn key_user_charge(uid: u32, bytes: usize) -> Result<(), KernelError> {
     } else {
         (KEY_MAXKEYS, KEY_MAXBYTES)
     };
-    let mut users = KEY_USERS.write();
-    let u = users.entry(uid).or_default();
-    if u.nkeys + 1 > maxk || u.nbytes.saturating_add(bytes) > maxb {
-        return Err(KernelError::QuotaExceeded);
-    }
-    u.nkeys += 1;
-    u.nbytes += bytes;
-    Ok(())
+    with_key_user(uid, |u| {
+        if u.nkeys + 1 > maxk || u.nbytes.saturating_add(bytes) > maxb {
+            return Err(KernelError::QuotaExceeded);
+        }
+        u.nkeys += 1;
+        u.nbytes += bytes;
+        Ok(())
+    })?
 }
 
 /// Change a key's byte charge from `old` to `new` (Linux
@@ -280,14 +303,14 @@ pub fn key_user_resize(uid: u32, old: usize, new: usize) -> Result<(), KernelErr
     } else {
         KEY_MAXBYTES
     };
-    let mut users = KEY_USERS.write();
-    let u = users.entry(uid).or_default();
-    let n = u.nbytes.saturating_sub(old).saturating_add(new);
-    if new > old && n > maxb {
-        return Err(KernelError::QuotaExceeded);
-    }
-    u.nbytes = n;
-    Ok(())
+    with_key_user(uid, |u| {
+        let n = u.nbytes.saturating_sub(old).saturating_add(new);
+        if new > old && n > maxb {
+            return Err(KernelError::QuotaExceeded);
+        }
+        u.nbytes = n;
+        Ok(())
+    })?
 }
 
 /// Return a key's charge when it is freed (Key's drop)
