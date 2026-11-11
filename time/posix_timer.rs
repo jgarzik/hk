@@ -25,7 +25,7 @@
 //! - One-shot and periodic timers
 
 use crate::util::error::KernelError;
-use crate::util::kalloc::{arc_nofail, try_arc};
+use crate::util::kalloc::try_arc;
 use crate::util::pod::FromBytes;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -191,18 +191,30 @@ pub struct PosixTimer {
 }
 
 impl PosixTimer {
-    /// An itimer, made on first use (Linux keeps them in signal_struct:
-    /// getitimer, setitimer and alarm cannot fail)
+    /// An itimer, embedded in its SignalStruct (Linux signal->real_timer,
+    /// signal->it[]): no target of its own (ITIMER_REAL signals the
+    /// group's leader pid, `it_real_fn`; the CPU ones the process whose
+    /// thread runs them); `fire`: its hrtimer's callback
     fn itimer(
         timer_id: TimerT,
         clockid: i32,
-        owner_tid: Tid,
         sigevent: SigEvent,
         cpu: Option<crate::time::cpu_timer::CpuClock>,
-    ) -> Arc<Self> {
-        Self::own_data(arc_nofail(Self::fresh(
-            timer_id, clockid, owner_tid, sigevent, cpu, false,
-        )))
+        fire: fn(&HrTimer),
+    ) -> Self {
+        Self {
+            timer_id,
+            clockid,
+            target: None,
+            pid_type: PidType::Tgid,
+            sigq: Mutex::new(None),
+            sigevent,
+            inner: IrqSpinlock::new(PosixTimerInner::new()),
+            timer: HrTimer::new(fire, 0),
+            cpu,
+            sleeper: false,
+            wq: crate::sync::waitqueue::WaitQueue::new(),
+        }
     }
 
     /// A timer on CPU clock `cpu` (if any); `sleeper`: clock_nanosleep's.
@@ -262,9 +274,11 @@ impl PosixTimer {
         timer
     }
 
-    /// Its timer (pinned: the timer lives in an Arc)
+    /// Its timer (pinned: the timer lives in an Arc, its own or, an
+    /// itimer, its SignalStruct's)
     fn timer(&self) -> Pin<&HrTimer> {
-        // SAFETY: an Arc's contents never move
+        // SAFETY: an Arc's contents never move, and every PosixTimer is
+        // in one (`with_cpu`, `ITimers` in `SignalStruct::alloc`)
         unsafe { Pin::new_unchecked(&self.timer) }
     }
 
@@ -276,7 +290,7 @@ impl PosixTimer {
     ///
     /// # Returns
     /// Previous timer value
-    pub fn settime(self: &Arc<Self>, new_value: &ITimerSpec, flags: i32) -> ITimerSpec {
+    pub fn settime(&self, new_value: &ITimerSpec, flags: i32) -> ITimerSpec {
         if let Some(c) = self.cpu {
             return self.cpu_settime(c, new_value, flags);
         }
@@ -558,25 +572,23 @@ impl PosixTimer {
         overrun_int(self.inner.lock().overrun_last)
     }
 
+    /// The hrtimer expired: false if it was disarmed meanwhile; an
+    /// interval timer rearms when its signal is dequeued
+    fn expire(&self) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner.armed {
+            return false;
+        }
+        inner.armed = false;
+        inner.requeue = inner.interval_ns != 0;
+        true
+    }
+
     /// Called when timer expires (from timer callback): its signal is
     /// queued; an interval timer is rearmed when that is dequeued
-    /// (Linux posix_timer_fn), ITIMER_REAL's when its SIGALRM is
+    /// (Linux posix_timer_fn)
     fn on_expire(&self) {
-        {
-            let mut inner = self.inner.lock();
-            if !inner.armed {
-                return;
-            }
-            inner.armed = false;
-            inner.requeue = inner.interval_ns != 0;
-        }
-        if self.timer_id == ITIMER_REAL_ID {
-            // Linux it_real_fn: SEND_SIG_PRIV to the process
-            let info = crate::signal::SendInfo::Kernel;
-            if let Some(pid) = &self.target {
-                let _ = crate::signal::kill_pid_info(pid, SIGALRM, info, |_, _| Ok(()));
-            }
-        } else if self.signals() {
+        if self.expire() && self.signals() {
             self.queue_signal();
         }
     }
@@ -690,9 +702,10 @@ pub fn sig_unignore(sig: Signal) {
 /// ITIMER_REAL that is not running rearms a whole number of periods
 /// on (Linux posixtimer_rearm_itimer)
 pub fn rearm_itimer_real() {
-    let Some(t) = with_timers(&current(), |reg| reg.get(ITIMER_REAL_ID)).flatten() else {
+    let Some(sig) = crate::signal::get_task_signal_struct(&current()) else {
         return;
     };
+    let t = &sig.itimers.real;
     let mut i = t.inner.lock();
     if i.interval_ns == 0 || i.armed {
         return;
@@ -988,36 +1001,23 @@ pub fn delete_posix_timer(t: &Task, timer_id: TimerT) -> Result<(), KernelError>
     Ok(())
 }
 
-/// Delete every timer of the thread group (Linux exit_itimers: its last
-/// thread is exiting)
+/// The thread group's last thread is exiting: its timer_create timers
+/// are deleted and ITIMER_REAL stopped (Linux do_exit with group_dead:
+/// hrtimer_cancel(&sig->real_timer), exit_itimers). The CPU itimers run
+/// only in the group's own threads: none is left to run them.
 pub fn exit_itimers(sig: &crate::signal::SignalStruct) {
-    let timers = core::mem::take(&mut sig.posix_timers.lock().timers);
-    // Deleted after the lock (cancel_sync waits out a running callback)
-    for (_, t) in timers {
-        t.delete();
-    }
+    exec_timers(sig);
+    sig.itimers.real.delete();
 }
 
 /// An exec deletes the process's timer_create timers; its itimers stay
-/// (Linux posixtimer_exec: exit_itimers keeps signal->it, whose
-/// ITIMER_REAL survives exec as POSIX wants). The registry is taken out
-/// and the itimers' rebuilt outside its lock (nothing allocates or is
-/// released under it); the caller is the process's only thread.
+/// (Linux posixtimer_exec -> exit_itimers, which leaves signal->it and
+/// real_timer: ITIMER_REAL survives exec as POSIX wants). The registry
+/// is taken out under its lock, the timers deleted after it
+/// (cancel_sync waits out a running callback).
 pub fn exec_timers(sig: &crate::signal::SignalStruct) {
-    let all = core::mem::take(&mut sig.posix_timers.lock().timers);
-    let mut keep = BTreeMap::new();
-    let mut gone = alloc::vec::Vec::new();
-    for (id, t) in all {
-        if id < 0 {
-            keep.insert(id, t);
-        } else {
-            gone.push(t);
-        }
-    }
-    core::mem::swap(&mut sig.posix_timers.lock().timers, &mut keep);
-    // Anything made meanwhile goes too (none: the caller is alone)
-    gone.extend(core::mem::take(&mut keep).into_values());
-    for t in gone {
+    let timers = core::mem::take(&mut sig.posix_timers.lock().timers);
+    for (_, t) in timers {
         t.delete();
     }
 }
@@ -1110,15 +1110,16 @@ pub fn sys_timer_delete(timerid: TimerT) -> KernelResult<()> {
 // Interval timers: setitimer/getitimer/alarm (Linux kernel/time/itimer.c)
 // =============================================================================
 //
-// ITIMER_REAL is a CLOCK_MONOTONIC timer sending SIGALRM, kept in the
-// owner's timer registry under an id user timer ids never take; alarm()
-// is ITIMER_REAL in whole seconds. ITIMER_VIRTUAL and ITIMER_PROF are
-// process CPU timers (user time, user + system) sending SIGVTALRM and
-// SIGPROF to the process (`cpu_timer`).
+// The itimers live in the SignalStruct, made with it (Linux
+// signal->real_timer and signal->it[2]): getitimer, setitimer and alarm
+// cannot fail. ITIMER_REAL is a CLOCK_MONOTONIC timer sending SIGALRM to
+// the group's leader pid; alarm() is ITIMER_REAL in whole seconds.
+// ITIMER_VIRTUAL and ITIMER_PROF are process CPU timers (user time,
+// user + system) sending SIGVTALRM and SIGPROF to the process
+// (`cpu_timer::run`, after the registry's timers).
 
-/// ITIMER_REAL's slot in the owner's registry (user timer ids are >= 0)
+/// The itimers' ids (user timer ids are >= 0): they mark a timer as one
 const ITIMER_REAL_ID: TimerT = -1;
-/// ITIMER_VIRTUAL's and ITIMER_PROF's
 const ITIMER_VIRTUAL_ID: TimerT = -2;
 const ITIMER_PROF_ID: TimerT = -3;
 
@@ -1126,6 +1127,84 @@ const ITIMER_PROF_ID: TimerT = -3;
 pub const ITIMER_REAL: i32 = 0;
 const ITIMER_VIRTUAL: i32 = 1;
 const ITIMER_PROF: i32 = 2;
+
+/// A thread group's interval timers (Linux signal->real_timer,
+/// it_real_incr and it[CPUCLOCK_PROF], it[CPUCLOCK_VIRT]), embedded in
+/// its SignalStruct
+pub struct ITimers {
+    /// ITIMER_REAL: its hrtimer's data is the SignalStruct (`own`)
+    pub real: PosixTimer,
+    /// ITIMER_VIRTUAL, ITIMER_PROF (process CPU clocks: no hrtimer)
+    pub cpu: [PosixTimer; 2],
+}
+
+impl ITimers {
+    /// # Safety
+    /// The value is placed where it never moves (its SignalStruct's Arc)
+    /// and [`own`](Self::own) is called with that SignalStruct before
+    /// any timer is armed: an armed hrtimer is queued by address, and
+    /// ITIMER_REAL's callback reaches the SignalStruct through it.
+    pub unsafe fn new() -> Self {
+        use crate::time::cpu_timer::{CpuClock, Sample};
+        let cpu = |id, sample, sig: Signal| {
+            let sev = SigEvent {
+                sigev_signo: sig.into(),
+                sigev_notify: sigev_notify::SIGEV_SIGNAL,
+                ..SigEvent::default()
+            };
+            let clock = CpuClock {
+                thread: None,
+                sample,
+            };
+            // CLOCK_PROCESS_CPUTIME_ID
+            PosixTimer::itimer(id, 2, sev, Some(clock), posix_timer_fire)
+        };
+        Self {
+            // CLOCK_MONOTONIC
+            real: PosixTimer::itimer(ITIMER_REAL_ID, 1, SigEvent::default(), None, it_real_fn),
+            cpu: [
+                cpu(ITIMER_VIRTUAL_ID, Sample::Virt, crate::signal::SIGVTALRM),
+                cpu(ITIMER_PROF_ID, Sample::Prof, crate::signal::SIGPROF),
+            ],
+        }
+    }
+
+    /// Point ITIMER_REAL's hrtimer at `sig`, the SignalStruct holding
+    /// these, in its Arc (before it can be armed)
+    pub fn own(&self, sig: *const crate::signal::SignalStruct) {
+        self.real.timer.set_data(sig as usize);
+    }
+
+    /// Wait out and stop ITIMER_REAL (its SignalStruct is going: Drop)
+    pub fn cancel(&self) {
+        self.real.timer.cancel_sync();
+    }
+
+    /// Itimer `which` (a valid one)
+    fn get(&self, which: i32) -> &PosixTimer {
+        match which {
+            ITIMER_VIRTUAL => &self.cpu[0],
+            ITIMER_PROF => &self.cpu[1],
+            _ => &self.real,
+        }
+    }
+}
+
+/// ITIMER_REAL expired (`ktimers/N`; Linux it_real_fn): SIGALRM from
+/// the kernel to the group's leader pid; an interval one rearms when
+/// it is dequeued (`rearm_itimer_real`)
+fn it_real_fn(t: &HrTimer) {
+    // SAFETY: `data` is the SignalStruct embedding `t` (`ITimers::own`),
+    // whose Drop waits out this callback before anything in it goes
+    let sig = unsafe { &*(t.data() as *const crate::signal::SignalStruct) };
+    if !sig.itimers.real.expire() {
+        return;
+    }
+    if let Some(pid) = sig.leader_pid() {
+        let info = crate::signal::SendInfo::Kernel;
+        let _ = crate::signal::kill_pid_info(&pid, SIGALRM, info, |_, _| Ok(()));
+    }
+}
 
 /// struct itimerval
 #[repr(C)]
@@ -1139,53 +1218,11 @@ crate::pod!(ITimerVal {
     it_value
 });
 
-/// The current task's ITIMER_REAL timer, created on first use
-fn itimer_real() -> Arc<PosixTimer> {
-    let me = current();
-    let tid = me.tid();
-    with_timers(&me, |reg| {
-        if let Some(t) = reg.get(ITIMER_REAL_ID) {
-            return t;
-        }
-        let t = PosixTimer::itimer(ITIMER_REAL_ID, 1, tid, SigEvent::default(), None);
-        reg.add(Arc::clone(&t));
-        t
-    })
-    .unwrap_or_else(|| PosixTimer::itimer(ITIMER_REAL_ID, 1, tid, SigEvent::default(), None))
-}
-
-/// The current process's itimer `which`, created on first use
-fn itimer(which: i32) -> Arc<PosixTimer> {
-    use crate::time::cpu_timer::{CpuClock, Sample};
-    let (id, sample, sig) = match which {
-        ITIMER_VIRTUAL => (ITIMER_VIRTUAL_ID, Sample::Virt, crate::signal::SIGVTALRM),
-        ITIMER_PROF => (ITIMER_PROF_ID, Sample::Prof, crate::signal::SIGPROF),
-        _ => return itimer_real(),
-    };
-    let me = current();
-    let tid = me.tid();
-    let make = || {
-        let sev = SigEvent {
-            sigev_signo: sig.into(),
-            sigev_notify: sigev_notify::SIGEV_SIGNAL,
-            ..SigEvent::default()
-        };
-        let clock = CpuClock {
-            thread: None,
-            sample,
-        };
-        // CLOCK_PROCESS_CPUTIME_ID
-        PosixTimer::itimer(id, 2, tid, sev, Some(clock))
-    };
-    with_timers(&me, |reg| {
-        if let Some(t) = reg.get(id) {
-            return t;
-        }
-        let t = make();
-        reg.add(Arc::clone(&t));
-        t
-    })
-    .unwrap_or_else(make)
+/// `f` on the current process's itimer `which` (a valid one); None for
+/// a task with no SignalStruct (never a syscall's caller)
+fn with_itimer<R>(which: i32, f: impl FnOnce(&PosixTimer) -> R) -> Option<R> {
+    let sig = crate::signal::get_task_signal_struct(&current())?;
+    Some(f(sig.itimers.get(which)))
 }
 
 /// timeval -> timespec; None if invalid (negative, usec >= 1e6)
@@ -1232,7 +1269,8 @@ fn which_ok(which: i32) -> KernelResult<()> {
 /// getitimer(which, curr_value)
 pub fn sys_getitimer(which: i32, curr: UserPtr<ITimerVal>) -> KernelResult<()> {
     which_ok(which)?;
-    Ok(curr.write(&to_itimerval(itimer(which).gettime()))?)
+    let cur = with_itimer(which, PosixTimer::gettime).unwrap_or_default();
+    Ok(curr.write(&to_itimerval(cur))?)
 }
 
 /// setitimer(which, new_value, old_value); a NULL new value disarms
@@ -1267,7 +1305,7 @@ pub fn sys_setitimer(
 /// Arm the current process's itimer `which` (a valid one) with `spec`,
 /// returning its previous setting (Linux do_setitimer)
 pub fn do_setitimer(which: i32, spec: &ITimerSpec) -> ITimerVal {
-    to_itimerval(itimer(which).settime(spec, 0))
+    to_itimerval(with_itimer(which, |t| t.settime(spec, 0)).unwrap_or_default())
 }
 
 #[cfg(test)]

@@ -723,7 +723,7 @@ use crate::task::percpu::{TASKLIST, TaskRef};
 /// reported). Also initializes the SignalStruct (which contains rlimits).
 pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
     // Built before TASKLIST is taken, with init's limits (init_rlimits)
-    let s = arc_nofail(SignalStruct::new());
+    let s = SignalStruct::alloc_nofail();
     // The global init (Linux init_signals: SIGNAL_UNKILLABLE)
     s.set_unkillable();
     let state = TaskSignalState::with_shared(SharedPending(Some(s.clone())));
@@ -736,8 +736,10 @@ pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
         *task.task.sig.lock() = state;
         task.task.set_sigpending(false);
         task.task.set_cpu_group(&s);
-        task.set_signal(s);
+        task.set_signal(s.clone());
     }
+    let pid = table.view(t).and_then(|v| v.thread_pid().cloned());
+    s.set_leader_pid(&mut table, pid);
 }
 
 /// Task `t`'s signal handlers
@@ -976,6 +978,11 @@ pub fn install_fork_signal(child: &Task, f: ForkSignal) {
     let mut table = TASKLIST.write();
     if table.view(child).is_some() {
         f.sighand.get(&mut table);
+    }
+    // A new process: the child leads it
+    if !f.share_signal {
+        let pid = table.view(child).and_then(|c| c.thread_pid().cloned());
+        f.signal.set_leader_pid(&mut table, pid);
     }
     if let Some(mut c) = table.view_mut(child) {
         c.set_sighand(f.sighand);
@@ -2220,9 +2227,18 @@ pub struct SignalStruct {
     /// group_exec_task): 0, GROUP_EXIT | wait status, or GROUP_EXEC |
     /// the exec'ing tid. Changed by compare-and-swap only, no lock.
     group_exit: AtomicU64,
-    /// POSIX timers and ITIMER_REAL (Linux signal->posix_timers,
-    /// real_timer): spin leaf, thread context only
+    /// The timer_create timers (Linux signal->posix_timers): spin,
+    /// thread context only
     pub posix_timers: Mutex<crate::time::posix_timer::PosixTimerRegistry>,
+    /// The interval timers (Linux signal->real_timer, signal->it[]),
+    /// made with the SignalStruct, so setitimer cannot fail
+    pub itimers: crate::time::posix_timer::ITimers,
+    /// The group leader's struct pid (Linux signal->pids[PIDTYPE_TGID]),
+    /// whom ITIMER_REAL signals: set under TASKLIST's write lock when
+    /// the group's first task is attached (fork, the global init), read
+    /// under its read lock. An exec by another thread keeps it (that
+    /// thread takes the leader's pid, exchange_tids).
+    leader_pid: crate::task::TableCell<Option<Arc<crate::task::pid::Pid>>>,
     /// Threads not yet exiting (Linux signal->live): +1 at each
     /// CLONE_THREAD, -1 when a thread starts its exit; the thread that
     /// takes it to 0 is the group's last (group_dead)
@@ -2336,14 +2352,53 @@ impl Drop for CredGuard {
 
 impl SignalStruct {
     /// A new SignalStruct with the global init's rlimits (Linux
-    /// INIT_RLIMITS as fork_init leaves them)
-    pub fn new() -> Self {
+    /// INIT_RLIMITS as fork_init leaves them), its itimers included;
+    /// ENOMEM
+    pub fn alloc() -> Result<Arc<Self>, KernelError> {
+        // SAFETY: put in its Arc at once and owned before it is shared
+        Ok(Self::owned(try_arc(unsafe { Self::new() })?))
+    }
+
+    /// [`alloc`](Self::alloc) at boot, where failure cannot be reported
+    fn alloc_nofail() -> Arc<Self> {
+        // SAFETY: as in `alloc`
+        Self::owned(arc_nofail(unsafe { Self::new() }))
+    }
+
+    /// Its itimers pointed at it, in its Arc
+    fn owned(s: Arc<Self>) -> Arc<Self> {
+        s.itimers.own(Arc::as_ptr(&s));
+        s
+    }
+
+    /// The group leader's pid, ITIMER_REAL's target (takes TASKLIST)
+    pub fn leader_pid(&self) -> Option<Arc<crate::task::pid::Pid>> {
+        self.leader_pid.access(&TASKLIST.read()).clone()
+    }
+
+    /// Its group's first task, with pid `pid`, is being attached
+    /// (TASKLIST held for writing)
+    fn set_leader_pid(
+        &self,
+        table: &mut crate::task::percpu::GlobalTaskTable,
+        pid: Option<Arc<crate::task::pid::Pid>>,
+    ) {
+        *self.leader_pid.access_mut(table) = pid;
+    }
+
+    /// # Safety
+    /// As `ITimers::new`: the value goes into an Arc, never moved after,
+    /// and `owned` runs on it before it is shared.
+    unsafe fn new() -> Self {
         Self {
             rlim: IrqSpinlock::new(crate::task::rlimit::init_rlimits()),
             cred_guard: crate::sync::Mutex::new(()),
             exec_update: crate::sync::RwSem::new(()),
             group_exit: AtomicU64::new(0),
             posix_timers: Mutex::new(crate::time::posix_timer::PosixTimerRegistry::new()),
+            // SAFETY: the caller's promise
+            itimers: unsafe { crate::time::posix_timer::ITimers::new() },
+            leader_pid: crate::task::TableCell::new(None),
             live: AtomicU32::new(1),
             dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -2547,10 +2602,19 @@ impl SignalStruct {
     /// so the leaf lock is held across no allocation. Timers and the
     /// subreaper flag are not inherited.
     pub fn deep_clone(self: &Arc<Self>) -> Result<Arc<Self>, KernelError> {
-        let new = try_arc(Self::new())?;
+        let new = Self::alloc()?;
         let lim = *self.rlim.lock();
         *new.rlim.lock() = lim;
         Ok(new)
+    }
+}
+
+/// ITIMER_REAL's callback reaches the SignalStruct by its address: it
+/// is waited out before any field goes (Linux cancels real_timer at the
+/// group's exit, `exit_itimers`, before the struct is freed)
+impl Drop for SignalStruct {
+    fn drop(&mut self) {
+        self.itimers.cancel();
     }
 }
 
@@ -2580,7 +2644,7 @@ fn fork_signal_struct(
         Some(s) if share_signal => Ok((s, true)),
         // Fork: deep clone
         Some(s) => Ok((s.deep_clone()?, false)),
-        None => Ok((try_arc(SignalStruct::new())?, false)),
+        None => Ok((SignalStruct::alloc()?, false)),
     }
 }
 

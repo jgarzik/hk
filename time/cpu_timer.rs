@@ -302,6 +302,21 @@ pub fn run() {
             *n = (*n).min(at);
         }
     }
+    // The process's ITIMER_VIRTUAL and ITIMER_PROF, in its SignalStruct
+    // (Linux check_process_timers: check_cpu_itimer after the timers)
+    for t in &sig.itimers.cpu {
+        any_process |= t.armed();
+        let (Some(g), Some(clock)) = (group, t.cpu_clock()) else {
+            continue;
+        };
+        if let Some(Expired::Signal(s)) = t.cpu_expire(clock.sample.pick(g)) {
+            fire.push(Fire::Process(s));
+        }
+        if let Some(at) = t.cpu_expiry() {
+            let n = &mut proc_next[clock.sample as usize];
+            *n = (*n).min(at);
+        }
+    }
     // Still under posix_timers: `arm` of a thread timer lowers this
     // under it too
     for (i, n) in thread_next.iter().enumerate() {
