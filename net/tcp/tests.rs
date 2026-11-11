@@ -1739,6 +1739,7 @@ fn oow_acks_rate_limited() {
 fn time_wait_entry_is_compact() {
     let cb = core::mem::size_of::<super::cb::TcpCb>();
     let tw = core::mem::size_of::<super::timewait::TimeWait>();
-    // kmalloc-256 with Arc's counts
-    assert!(tw + 16 <= 256, "TimeWait {tw} B vs TcpCb {cb} B");
+    // kmalloc-512 with Arc's counts and the embedded 2MSL timer (Linux
+    // tcp_timewait_sock has its tw_timer too); under the control block
+    assert!(tw + 16 <= 512 && tw < cb, "TimeWait {tw} B vs TcpCb {cb} B");
 }

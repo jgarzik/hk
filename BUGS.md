@@ -958,8 +958,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   do_clone, exit, wait, credential setters, several sleep APIs. Split
   like Linux (sched/core, fork, exit, cred). Other giant functions:
   do_clone, sys_prctl, sys_semctl, sys_mmap, exec_file, sys_fcntl.
-- **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
-  softnet/0 only; CHILD_EXIT_WQ.
+- **Globals where per-CPU fits** (I/C/E): CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move
   onto `util/ida.rs` (or an IDR), as sd, virtio-blk, virtio and

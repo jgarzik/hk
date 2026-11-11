@@ -18,7 +18,7 @@
 //! recvmsg copies straight from the receive queue to user memory and
 //! sendmsg straight into the send queue, releasing it only while
 //! asleep (Linux sk_wait_event). Segment input (softnet), timers
-//! (softnet/0) and ICMP errors take its `slock` (Linux bh_lock_sock):
+//! (`ktimers/N`, embedded: `timer.rs`) and ICMP errors take its `slock` (Linux bh_lock_sock):
 //! if nobody owns the socket they run at once under it (Linux
 //! tcp_v4_do_rcv), else input waits in the backlog (Linux
 //! tcp_add_backlog) and timers and errors leave deferred flags; the
@@ -39,8 +39,8 @@
 //! Order: `TcpSock.lock` owner (sleeping) -> its `slock` (a listener's
 //! before its new child's; a child never takes its listener's) ->
 //! tables (`bhash` -> `ehash`, `lhash`) -> `Inet.addr` ->
-//! `TcpSock.queue` (listener SYN/accept queues, leaf) -> timer
-//! `TIMERS`; and either -> FIB / neighbour / device TX (transmit).
+//! `TcpSock.queue` (listener SYN/accept queues, leaf) -> the
+//! timer bases (the socket's timers); and either -> FIB / neighbour / device TX (transmit).
 
 pub mod ack;
 pub mod cb;
@@ -70,7 +70,7 @@ use crate::util::kalloc::try_arc_cyclic;
 use self::cb::{Cfg, Open, Out, Seg, SegIn, TcpCb, flags};
 use self::output::Tuple;
 use self::table::Ent;
-use self::timer::{Expire, Slot, now_ms};
+use self::timer::now_ms;
 use self::timewait::TimeWait;
 use crate::io::fasync::{POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT};
 use crate::io::poll::{
@@ -95,6 +95,7 @@ use crate::net::socket::{
     SOCK_STREAM, SOL_SOCKET, shut_bits,
 };
 use crate::net::{NetNamespace, dev};
+use crate::time::timer::ArcTimer;
 
 pub use self::cb::TcpState;
 
@@ -141,7 +142,8 @@ struct Inner {
     bound: bool,
     /// The listener of a child still in SYN_RECEIVED
     parent: Option<Weak<TcpSock>>,
-    slot: Slot,
+    /// The deadline (ms) each of `TcpSock.timers` was last armed for
+    armed: [Option<u64>; 3],
     /// A non-blocking connect is in progress (Linux sock->state
     /// SS_CONNECTING, under lock_sock)
     connecting: bool,
@@ -207,6 +209,11 @@ pub struct TcpSock {
     mtu_info: AtomicU32,
     /// errno of another ICMP error met while owned (Linux sk_err_soft)
     err_soft: AtomicI32,
+    /// The retransmit, delayed ACK and keepalive timers (`timer::RTX`,
+    /// `DELACK`, `KEEPALIVE`; Linux icsk_retransmit_timer,
+    /// icsk_delack_timer, sk_timer), armed by `sync_timers` under the
+    /// socket lock
+    timers: [ArcTimer<TcpSock>; 3],
     me: Weak<TcpSock>,
 }
 
@@ -328,13 +335,18 @@ impl TcpSock {
                 tuple: None,
                 bound: false,
                 parent: None,
-                slot: Slot::default(),
+                armed: [None; 3],
                 connecting: false,
             }),
             queue: Mutex::new(None),
             snap,
             mtu_info: AtomicU32::new(0),
             err_soft: AtomicI32::new(0),
+            timers: [
+                ArcTimer::new(TcpSock::rtx_timer),
+                ArcTimer::new(TcpSock::delack_timer),
+                ArcTimer::new(TcpSock::keepalive_timer),
+            ],
             me: me.clone(),
         })
     }
@@ -416,9 +428,31 @@ impl TcpSock {
                 self.unbind(g);
             }
         }
-        let want = g.cb.next_timer();
-        timer::rearm(&mut g.slot, want, self.me.clone() as Weak<dyn Expire>);
+        self.sync_timers(g);
         ready
+    }
+
+    /// Arm or stop the three timers for the control block's deadlines
+    /// (Linux inet_csk_reset_xmit_timer / sk_reset_timer /
+    /// inet_csk_clear_xmit_timer): a pending timer holds a reference to
+    /// the socket, so a closed connection's timers are stopped here and
+    /// release it
+    fn sync_timers(&self, g: &mut Inner) {
+        let want = g.cb.deadlines();
+        for (k, t) in self.timers.iter().enumerate() {
+            if want[k] == g.armed[k] && (want[k].is_none() || t.pending()) {
+                continue;
+            }
+            match want[k] {
+                Some(at) => {
+                    t.reset(&self.arc(), at.saturating_mul(1_000_000));
+                }
+                None => {
+                    t.stop();
+                }
+            }
+            g.armed[k] = want[k];
+        }
     }
 
     /// Hand TIME_WAIT to a timewait entry (Linux tcp_time_wait)
@@ -987,19 +1021,33 @@ impl TcpSock {
     }
 }
 
-impl Expire for TcpSock {
-    /// Linux tcp_write_timer / tcp_delack_timer: run now unless owned,
-    /// else leave it to the owner's release
-    fn expire(self: Arc<Self>, id: u64, now: u64) {
+impl TcpSock {
+    /// Linux tcp_write_timer: the retransmit timer
+    fn rtx_timer(s: Arc<TcpSock>) {
+        s.timer_fired();
+    }
+
+    /// Linux tcp_delack_timer
+    fn delack_timer(s: Arc<TcpSock>) {
+        s.timer_fired();
+    }
+
+    /// Linux tcp_keepalive_timer (keepalive, orphan FIN_WAIT_2)
+    fn keepalive_timer(s: Arc<TcpSock>) {
+        s.timer_fired();
+    }
+
+    /// A timer fired (`ktimers/N`): the control block's due work runs
+    /// now unless the socket is owned, else at the owner's release
+    /// (Linux TCP_*_TIMER_DEFERRED); the timer's reference to the socket
+    /// goes with the caller's `Arc`
+    fn timer_fired(&self) {
         let w = {
             let mut b = self.lock.bh_lock();
             match self.bh_get(&mut b) {
                 Some(g) => {
-                    if !timer::fired(&mut g.slot, id) {
-                        return;
-                    }
                     let mut out = Out::default();
-                    g.cb.on_timer(now, &mut out);
+                    g.cb.on_timer(now_ms(), &mut out);
                     self.apply(g, &mut out)
                 }
                 None => return b.defer(deferred::TIMER),
@@ -1028,9 +1076,6 @@ impl SockHooks<Inner> for TcpSock {
         let mut out = Out::default();
         let now = now_ms();
         if flags & deferred::TIMER != 0 {
-            // The registration that fired is out of TIMERS: forget the
-            // slot so `post` registers the next deadline again
-            timer::cancel(&mut g.slot);
             g.cb.on_timer(now, &mut out);
         }
         if flags & deferred::MTU != 0 && !matches!(g.cb.state, TcpState::Listen | TcpState::Closed)

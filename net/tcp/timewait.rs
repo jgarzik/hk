@@ -12,6 +12,9 @@
 //! state), from which each segment or timer event rebuilds a control
 //! block for the call.
 //!
+//! Its 2MSL timer is embedded (Linux tw_timer, armed with a reference
+//! to the entry: `time::timer::ArcTimer`) and runs in `ktimers/N`.
+//!
 //! Locking: `inner` is a `crate::sync::spin::Mutex` in the place of a
 //! socket's `TcpSock.lock` slock (thread context only; table and timer
 //! locks may be taken under it).
@@ -24,11 +27,12 @@ use crate::sync::spin::Mutex;
 
 use super::cb::{Out, TwCb};
 use super::output::Tuple;
-use super::timer::{self, Expire, Slot};
+use super::timer::now_ms;
 use crate::net::NetNamespace;
 use crate::net::inet::port::BindInfo;
 use crate::net::ipv4::IpParams;
 use crate::net::skb::SkBuff;
+use crate::time::timer::ArcTimer;
 use alloc::boxed::Box;
 
 pub struct TimeWait {
@@ -38,7 +42,10 @@ pub struct TimeWait {
     net: Arc<NetNamespace>,
     params: IpParams,
     oif: u32,
-    inner: Mutex<(TwCb, Slot)>,
+    /// The control block and the deadline (ms) `timer` is armed for
+    inner: Mutex<(TwCb, Option<u64>)>,
+    /// 2MSL (Linux tw_timer)
+    timer: ArcTimer<TimeWait>,
     me: Weak<TimeWait>,
 }
 
@@ -58,7 +65,8 @@ impl TimeWait {
             net,
             params,
             oif,
-            inner: Mutex::new((cb, Slot::default())),
+            inner: Mutex::new((cb, None)),
+            timer: ArcTimer::new(TimeWait::tw_timer),
             me: me.clone(),
         })
     }
@@ -72,8 +80,26 @@ impl TimeWait {
     /// Arm the 2MSL timer
     pub fn start(&self) {
         let mut g = self.inner.lock();
-        let want = g.0.next_timer();
-        timer::rearm(&mut g.1, want, self.me.clone() as Weak<dyn Expire>);
+        self.sync(&mut g, false);
+    }
+
+    /// Arm the timer for the control block's deadline, or stop it once
+    /// the entry is `done` (the timer's reference goes)
+    fn sync(&self, g: &mut (TwCb, Option<u64>), done: bool) {
+        let want = if done { None } else { g.0.next_timer() };
+        if want == g.1 && (want.is_none() || self.timer.pending()) {
+            return;
+        }
+        match want {
+            Some(at) => {
+                let me = self.me.upgrade().expect("timewait entry alive");
+                self.timer.reset(&me, at.saturating_mul(1_000_000));
+            }
+            None => {
+                self.timer.stop();
+            }
+        }
+        g.1 = want;
     }
 
     /// A segment for this tuple (header in `skb.tcp`). Handed back: it
@@ -84,7 +110,7 @@ impl TimeWait {
         let s = skb.tcp;
         let mut g = self.inner.lock();
         if g.0.tw_syn_ok(&s) {
-            timer::rearm(&mut g.1, None, self.me.clone() as Weak<dyn Expire>);
+            self.sync(&mut g, true);
             drop(g);
             self.net.tcp.tw_unhash(self);
             return Some(skb);
@@ -101,9 +127,8 @@ impl TimeWait {
         None
     }
 
-    fn post(self: &Arc<Self>, g: &mut (TwCb, Slot), out: &Out) {
-        let want = if out.done { None } else { g.0.next_timer() };
-        timer::rearm(&mut g.1, want, self.me.clone() as Weak<dyn Expire>);
+    fn post(self: &Arc<Self>, g: &mut (TwCb, Option<u64>), out: &Out) {
+        self.sync(g, out.done);
         if out.done {
             self.net.tcp.tw_unhash(self);
         }
@@ -114,19 +139,18 @@ impl TimeWait {
     }
 }
 
-impl Expire for TimeWait {
-    fn expire(self: Arc<Self>, id: u64, now: u64) {
+impl TimeWait {
+    /// 2MSL passed (`ktimers/N`; Linux tw_timer_handler): the entry
+    /// leaves the tables; the timer's reference goes with `tw`
+    fn tw_timer(tw: Arc<TimeWait>) {
         let mut out = Out::default();
-        {
-            let mut g = self.inner.lock();
-            if !timer::fired(&mut g.1, id) {
-                return;
-            }
-            let mut cb = g.0.cb(super::cfg(&self.net));
-            cb.on_timer(now, &mut out);
-            g.0 = TwCb::from_cb(&cb);
-            self.post(&mut g, &out);
-            self.send(&mut out);
-        }
+        let mut g = tw.inner.lock();
+        let mut cb = g.0.cb(super::cfg(&tw.net));
+        cb.on_timer(now_ms(), &mut out);
+        g.0 = TwCb::from_cb(&cb);
+        tw.post(&mut g, &out);
+        tw.send(&mut out);
+        drop(g);
+        drop(cb);
     }
 }
