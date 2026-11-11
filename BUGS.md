@@ -533,8 +533,10 @@ procfs (hidepid=, gid=, subset=pid; devtmpfs drops a new mount's after
 parsing them, as Linux 6.15+); cgroupfs ignores its own, and only
 procfs, tmpfs and devtmpfs apply options on a remount or show them in
 /proc/mounts.
-Crossing into a mount scans the current mount's children (Linux hashes
-(parent, mountpoint): mount_hashtable).
+Crossing into a mount scans the current mount's children under
+`MOUNT_LOCK`'s locking read, one global spin lock for every walk at a
+mountpoint (Linux hashes (parent, mountpoint): mount_hashtable, looked
+up under RCU and the mount_lock sequence).
 
 ## nullfs gaps
 

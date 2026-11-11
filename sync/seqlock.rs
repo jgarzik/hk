@@ -65,33 +65,56 @@ impl Drop for SeqCountGuard<'_> {
     }
 }
 
-pub struct SeqLock {
-    lock: Mutex<()>,
+/// A spin lock with a sequence (Linux seqlock_t) over `T`: its writers
+/// and locking readers own `T` (a [`super::UniqueOwner`] for data kept
+/// elsewhere, as the mount tree's links under mount_lock)
+pub struct SeqLock<T = ()> {
+    lock: Mutex<T>,
     seq: SeqCount,
 }
 
 /// A held write side (Linux write_seqlock .. write_sequnlock): fields
 /// drop in order, so the count goes even before the lock is released
-pub struct SeqWriteGuard<'a> {
+pub struct SeqWriteGuard<'a, T = ()> {
     _c: SeqCountGuard<'a>,
-    _g: MutexGuard<'a, ()>,
+    g: MutexGuard<'a, T>,
 }
 
-impl SeqLock {
-    pub const fn new() -> Self {
+impl<T> core::ops::Deref for SeqWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.g
+    }
+}
+
+impl<T> core::ops::DerefMut for SeqWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.g
+    }
+}
+
+impl<T> SeqLock<T> {
+    #[track_caller]
+    pub const fn new(v: T) -> Self {
         Self {
-            lock: Mutex::new(()),
+            lock: Mutex::new(v),
             seq: SeqCount::new(),
         }
     }
 
     /// Take the write side (Linux write_seqlock)
-    pub fn write(&self) -> SeqWriteGuard<'_> {
+    pub fn write(&self) -> SeqWriteGuard<'_, T> {
         let g = self.lock.lock();
         SeqWriteGuard {
             _c: self.seq.write(),
-            _g: g,
+            g,
         }
+    }
+
+    /// A locking read: no writer, nor another locking reader, while
+    /// held; the sequence does not move (Linux read_seqlock_excl)
+    pub fn read_excl(&self) -> MutexGuard<'_, T> {
+        self.lock.lock()
     }
 
     /// Begin a lockless read (Linux read_seqbegin): waits out a writer

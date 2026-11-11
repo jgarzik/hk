@@ -10,7 +10,7 @@ use super::super::Path;
 use super::super::dentry::{d_path, dentry_path};
 use super::super::mount::{
     MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW, MNT_READONLY,
-    MNT_RELATIME, Mount, NAMESPACE_SEM,
+    MNT_RELATIME, Mount, namespace_read, walk,
 };
 use super::super::name::mangle;
 use crate::task::percpu::TaskRef;
@@ -32,13 +32,11 @@ fn visible(t: &TaskRef) -> Vec<(Arc<Mount>, Vec<u8>)> {
         return Vec::new();
     };
     let root = fs.get_root();
-    let _ns = NAMESPACE_SEM.read();
-    let mut all = Vec::new();
-    let mut todo: Vec<Arc<Mount>> = ns.mnt_ns.get_root().into_iter().collect();
-    while let Some(m) = todo.pop() {
-        todo.extend(m.children.read().iter().cloned());
-        all.push(m);
-    }
+    let g = namespace_read();
+    let Some(top) = ns.mnt_ns.get_root() else {
+        return Vec::new();
+    };
+    let mut all: Vec<Arc<Mount>> = walk(&top, &*g).collect();
     all.sort_by_key(|m| m.mnt_id_unique);
     all.into_iter()
         .filter_map(|m| {

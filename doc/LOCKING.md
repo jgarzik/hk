@@ -230,7 +230,9 @@ the inotify and fanotify `mark_mutex` (Linux group->mark_mutex).
 Linux seqlock_t: `write()` takes a spin lock and keeps the sequence odd
 while held (Release fences around the writer's stores); lockless
 readers use `read_begin`/`read_retry` and repeat a read that raced a
-writer. Thread context only. Used for `MOUNT_LOCK`. `SeqRwLock` is the
+writer. `read_excl` takes the spin lock without moving the sequence
+(Linux read_seqlock_excl). A `SeqLock<T>` owns `T`, which can be a
+`sync::UniqueOwner` (the owner of `LockedBy`/`LockedByEither` cells kept elsewhere). Thread context only. Used for `MOUNT_LOCK`. `SeqRwLock` is the
 same with a spin RwLock (its write guard bumps the sequence): locking
 readers share it (Linux read_seqlock_excl excludes them), lockless ones
 sample the sequence. Used for `dentry::RENAME_LOCK` (Linux rename_lock).
@@ -428,7 +430,7 @@ VFS locks (detailed order):
         ↓
     mount::NAMESPACE_SEM (sync::RwSem; Linux namespace_sem: write for
                    attach, umount, namespace copy; read for /proc mount
-                   lists)
+                   lists and is_local_mountpoint)
         ↓
     pnode::GROUPS (sync::Mutex; peer groups, never held across a call
                    into the mount tree)
@@ -437,7 +439,8 @@ VFS locks (detailed order):
                    bind remount)
         ↓
     mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write, and
-                   the tree's links in attach_mnt/detach_mnt)
+                   the tree's links in attach_mnt/detach_mnt; locking
+                   read in lookup_mnt and umount's MNT_EXPIRE check)
         → SuperBlock.s_mounts (spin leaf: a new mount, a read-only
                    remount's walk)
         ↓
@@ -445,7 +448,7 @@ VFS locks (detailed order):
                    d_move/d_exchange, read in is_subdir/d_path, its
                    sequence read lock-free by scoped walks)
         ↓
-    MntNamespace.root, Mount.{children, parent, mountpoint} (spin;
+    MntNamespace.root, Mount.{parent, mountpoint} (spin;
                    d_path reads parent/mountpoint under RENAME_LOCK)
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across
@@ -2493,15 +2496,23 @@ Linux `vfsmount.mnt_count` pattern:
 | `MntNamespace.root` (`ns/mod.rs`) | `RwLock<Option<Arc<Mount>>>` | Root of the namespace's mount tree (one per mount namespace) |
 | `Mount.mountpoint` | `RwLock<Option<Arc<Dentry>>>` | Where this fs is mounted |
 | `Mount.parent` | `RwLock<Option<Weak<Mount>>>` | Parent mount reference |
-| `Mount.children` | `RwLock<Vec<Arc<Mount>>>` | Child mounts |
+| `Mount.mnt_mounts` | `LockedByEither<OwnedList>` (no lock of its own) | Submounts, each holding a reference (Linux mnt_mounts, linked through `Mount.mnt_child`): changed only under NAMESPACE_SEM write and `MOUNT_LOCK` both (`attach_mnt`, `detach_mnt`: `&mut NsTree` and `&mut MntHash`), read under either (`Stable`: `&NsTree` from a NAMESPACE_SEM guard, `&MntHash` from `MOUNT_LOCK.read_excl`). Walks step with `next_mnt` (Linux next_mnt: first submount, else the next sibling of the nearest mount up to the walk's root that has one), so no list is copied and no stack is kept |
 | `Mount.mnt_count` | `AtomicU64` | Open file reference count |
 | `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC/READONLY/LOCKED; every write under `MOUNT_LOCK` (remount, reconfigure, pivot_root's MNT_LOCKED), read lock-free (open, exec, statfs) |
-| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`: Linux attach_mnt and umount_tree under lock_mount_hash); under NAMESPACE_SEM and s_umount; under it only `SuperBlock.s_mounts`, and in attach/detach the moved mount's `parent`/`mountpoint`, its parent's `children` and the mountpoint's `d_lock` (mount count), one at a time; nothing takes it under a Mount field lock (a namespace copy copies each `children` list out before copying the mounts, whose `Mount::new` takes it). No mount or mountpoint is dropped under it (`make_rdonly` releases its references, `detach_mnt` the mountpoint, after the unlock). The sequence is read lock-free by scoped walks (3.3 Path Traversal) |
+| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`: Linux attach_mnt and umount_tree under lock_mount_hash; with NAMESPACE_SEM write it owns `mnt_mounts`); under NAMESPACE_SEM and s_umount; under it only `SuperBlock.s_mounts`, and in attach/detach the moved mount's `parent`/`mountpoint` and the mountpoint's `d_lock` (mount count), one at a time; in `lookup_mnt`'s locking read a child's `mountpoint` and then `d_lock`; nothing takes it under a Mount field lock. No mount or mountpoint is dropped under it (`make_rdonly` releases its references, `detach_mnt` the parent's reference to the mount and the mountpoint, after the unlock). The sequence is read lock-free by scoped walks (3.3 Path Traversal) |
 | `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
 | `Mount.mnt_ns` | `AtomicU64` | Id of the mount's namespace (`MntNamespace.id`, never reused), 0 for none (Linux mnt_ns): written only under NAMESPACE_SEM write (commit_tree when a tree is grafted or propagated, the namespace root, a namespace copy; umount clears it), read by `check_mnt` under NAMESPACE_SEM; can_umount and remount read it first without, as Linux (umount repeats it under the lock) |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
 | `Mount.writers`, `SuperBlock.s_writers` | `AtomicU64` (count + WRITE_HOLD bit 63) | Write-access holders (Linux mnt_writers + WRITE_HOLD): through a mount on the mount, for mountless internal objects on the superblock. A writer adds itself, spins while WRITE_HOLD is set, then checks read-only state (EROFS, backing out). Making a mount read-only (`set_flags`, Linux mnt_make_readonly) or the file system (`make_rdonly`, Linux sb_prepare_remount_readonly: every writable mount in `s_mounts` and `s_writers`) sets WRITE_HOLD under `MOUNT_LOCK`, is EBUSY with nothing changed if any count is nonzero, else sets the read-only flag before clearing the hold (Release). The writer's spin is invisible to lockdep; holders never wait for writers |
 | `SuperBlock.s_mounts` | spin Mutex leaf | the superblock's mounts (Linux s_mounts: a `WeakList` through `Mount.mnt_instance`): a new mount is added under `MOUNT_LOCK` (`Mount::new`, Linux clone_mnt under lock_mount_hash), so a read-only remount's walk (`make_rdonly`, under `MOUNT_LOCK` and this lock across both passes, taking no reference) misses no mount a writer could use; a mount leaves it first thing in its `Drop`, under this lock alone |
+
+**Last reference:** a `Mount`'s last `Arc` is never dropped under a
+spin lock: its drop takes `SuperBlock.s_mounts`, frees its id and
+releases its submounts, superblock and dentries (a superblock's
+teardown sleeps). Code under a spin lock hands references out and
+drops what it unlinked after the unlock (`detach_mnt`,
+`MntNamespace::set_root`); references taken under one (`lookup_mnt`)
+are never the last, the tree holding its mounts.
 
 **Reference Counting (mntget/mntput):**
 
@@ -2518,10 +2529,9 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 3. SuperBlock.s_umount (write: remount)
 4. mount::MOUNT_LOCK (attach_mnt / detach_mnt; Mount::new)
 5. MntNamespace.root (read/write)
-6. parent Mount.children (write for add/remove child)
-7. Mount.parent (write for set/clear)
-8. Mount.mountpoint (write for set/clear)
-9. Dentry.d_lock (DentryInner.flags: write for the mount count)
+6. Mount.parent (write for set/clear)
+7. Mount.mountpoint (write for set/clear)
+8. Dentry.d_lock (DentryInner.flags: write for the mount count)
 ```
 MS_MOVE and pivot_root take the target's (put_old's) i_rwsem, then
 NAMESPACE_SEM; pivot_root's chroot_fs_refs runs after both are
@@ -2539,7 +2549,9 @@ mountinfo reads it under NAMESPACE_SEM read).
 
 **Lock Order for Path Traversal (follow_mount, lookup_mnt):**
 ```
-1. Mount.children (read) of the walk's current mount
+1. mount::MOUNT_LOCK (locking read, `read_excl`: the walk's current
+   mount's `mnt_mounts`; Linux walks the mount hash under RCU and the
+   sequence instead)
 2. child.mountpoint (read)
 3. Dentry.d_lock (DentryInner.inode: read)
 ```
@@ -2557,16 +2569,18 @@ it above its root. Its result must then still be under the root
 `Mount.parent`/`Mount.mountpoint` reads one at a time, then
 `is_subdir` under RENAME_LOCK read), else EXDEV.
 
-`is_local_mountpoint` (rmdir, unlink, rename: EBUSY) takes the same
-locks in the same order, one mount's `children` at a time, inside the
-inode locks those syscalls hold (sleeping, outer): the parents' and the
+`is_local_mountpoint` (rmdir, unlink, rename: EBUSY) walks the
+caller's namespace with `next_mnt` under NAMESPACE_SEM read (Linux
+__is_local_mountpoint under namespace_sem), each mount's `mountpoint`
+then `d_lock` one at a time, inside the inode locks those syscalls
+hold (sleeping, outer): the parents' and the
 victim's (rmdir/unlink) or the renamed and replaced inodes' (a
 directory being replaced included, like Linux vfs_rename). `attach`
 takes the mountpoint directory's i_rwsem (Linux lock_mount) around
 linking the new mount in and refuses a directory marked dead
 (`Inode::set_dead`, set by rmdir or a rename replacing it under that
 same lock), so a mount and a removal of its mountpoint serialize:
-i_rwsem -> MntNamespace.root -> Mount.children -> Mount.mountpoint.
+i_rwsem -> NAMESPACE_SEM -> MntNamespace.root, Mount.mountpoint.
 
 #### VFS Locking Notes
 

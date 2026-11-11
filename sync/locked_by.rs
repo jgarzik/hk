@@ -92,6 +92,59 @@ impl<T, O: UniqueOwner> LockedBy<T, O> {
     }
 }
 
+/// A `T` that belongs to two locks (Linux data changed under both and
+/// read under either: a mount's mnt_mounts, under namespace_sem and
+/// mount_lock): `&A` or `&B` gives `&T`, `&mut A` and `&mut B` together
+/// give `&mut T`
+///
+/// # Invariants
+/// `data` is read only under a shared borrow of the one `A` or the one
+/// `B`, and written only under mutable borrows of both (or through
+/// `&mut self`).
+pub struct LockedByEither<T, A: UniqueOwner, B: UniqueOwner> {
+    data: UnsafeCell<T>,
+    _owners: PhantomData<fn(&A, &B)>,
+}
+
+// SAFETY: as `LockedBy`: shared access hands `&T` to the threads
+// borrowing `A` or `B` (T: Sync), `&mut T` to the one thread borrowing
+// both mutably (T: Send)
+unsafe impl<T: Send + Sync, A: UniqueOwner, B: UniqueOwner> Sync for LockedByEither<T, A, B> {}
+
+impl<T, A: UniqueOwner, B: UniqueOwner> LockedByEither<T, A, B> {
+    pub const fn new(v: T) -> Self {
+        Self {
+            data: UnsafeCell::new(v),
+            _owners: PhantomData,
+        }
+    }
+
+    /// The data, under a shared borrow of the first owner
+    pub fn access_a<'a>(&'a self, _a: &'a A) -> &'a T {
+        // SAFETY: the one `A` is borrowed shared for 'a, so no `&mut T`
+        // (which needs it borrowed mutably) is live meanwhile
+        unsafe { &*self.data.get() }
+    }
+
+    /// The data, under a shared borrow of the second owner
+    pub fn access_b<'a>(&'a self, _b: &'a B) -> &'a T {
+        // SAFETY: as in `access_a`, for the one `B`
+        unsafe { &*self.data.get() }
+    }
+
+    /// The data, under mutable borrows of both owners
+    pub fn access_mut<'a>(&'a self, _a: &'a mut A, _b: &'a mut B) -> &'a mut T {
+        // SAFETY: both owners are borrowed mutably for 'a, so no shared
+        // access (which borrows one of them) is live or can start
+        unsafe { &mut *self.data.get() }
+    }
+
+    /// The data, writable, through exclusive access to the cell
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +176,18 @@ mod tests {
         let mut o = Owner;
         let a = LockedBy::<u32, Owner>::new(1);
         let _ = a.access_pair_mut(&a, &mut o);
+    }
+
+    struct OwnerB;
+    // SAFETY: as `Owner`
+    unsafe impl UniqueOwner for OwnerB {}
+
+    #[test]
+    fn either_owner_reads_both_write() {
+        let (mut a, mut b) = (Owner, OwnerB);
+        let c = LockedByEither::<u32, Owner, OwnerB>::new(1);
+        *c.access_mut(&mut a, &mut b) += 1;
+        assert_eq!(*c.access_a(&a), 2);
+        assert_eq!(*c.access_b(&b), 2);
     }
 }
