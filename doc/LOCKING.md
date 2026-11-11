@@ -3794,7 +3794,7 @@ thread context, the driver completes it from its interrupt handler and
 | blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list, the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock), the in-flight count and the dying flag | thread (dispatch, drain, release) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep (virtio-blk's descriptor tables are allocated with the queue: a small one per tag and a bounded set of full-size ones; a request that finds no full-size one free stays on the dispatch list until a completion puts one back); taken under its line's `IrqDesc.lock` in the ISR |
 | `BlkMq.drained` | `WaitQueue` (Linux mq_freeze_wq) | woken from any context (the request end that empties a dying queue's count, after the queue locks are dropped); waited in thread context (`del_gendisk`, no lock held) | its head lock -> run-queue lock; the condition reads the counts only |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
-| `RamDisk.pages` | spin `Mutex` | thread only (bio-based driver) | leaf |
+| `RamDisk.pages` | spin `Mutex<XArray>` (Linux brd_pages xa_lock) | thread only (bio-based driver) | leaf; a page's frame is allocated before it, index nodes with it dropped (`xarray::store_nomem`), a frame that lost a race freed |
 
 Rules:
 

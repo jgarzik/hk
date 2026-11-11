@@ -6,13 +6,16 @@
 //!
 //! ## Locking
 //!
-//! `pages` (spin `Mutex`, thread context, leaf; Linux brd_pages
-//! xarray lock): held only to find or insert a frame, never across a
-//! copy into user memory (copies use kernel bounce buffers).
+//! `pages` (spin `Mutex` over an `XArray`, thread context, leaf; Linux
+//! brd_pages xarray lock): held only to find or insert a frame, never
+//! across a copy into user memory (copies use kernel bounce buffers).
+//! Nothing allocates under it: a new page's frame is allocated and
+//! zeroed before it is taken (Linux brd_insert_page), its index nodes
+//! with it dropped (`xarray::store_nomem`); a frame that lost a race is
+//! freed.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::sync::Arc;
 
@@ -22,6 +25,7 @@ use super::blkdev::{
 };
 use super::genhd::add_disk;
 use crate::arch::phys_to_virt;
+use crate::mm::xarray::XArray;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
@@ -30,25 +34,44 @@ const PAGE: u64 = 4096;
 
 /// RAM disk storage
 pub struct RamDisk {
-    pages: Mutex<BTreeMap<u64, u64>>,
+    pages: Mutex<XArray>,
 }
 
 impl RamDisk {
     /// Frame of page `idx`; allocated (zeroed) if `alloc`
     fn page(&self, idx: u64, alloc: bool) -> Result<Option<u64>, KernelError> {
-        let mut p = self.pages.lock();
-        if let Some(&f) = p.get(&idx) {
+        let f = self.pages.lock().load(idx);
+        if f != 0 {
             return Ok(Some(f));
         }
         if !alloc {
             return Ok(None);
         }
+        // The frame first, with no lock held (Linux brd_insert_page)
         let f = crate::FRAME_ALLOCATOR
             .alloc()
             .ok_or(KernelError::OutOfMemory)?;
+        // SAFETY: a fresh frame of PAGE bytes, mapped in the direct map,
+        // not yet visible to anyone
         unsafe { core::ptr::write_bytes(phys_to_virt(f), 0, PAGE as usize) };
-        p.insert(idx, f);
-        Ok(Some(f))
+        let stored = crate::mm::xarray::store_nomem(
+            || self.pages.lock(),
+            idx,
+            f,
+            |t| match t.load(idx) {
+                0 => Ok(()),
+                other => Err(Some(other)),
+            },
+            None,
+        );
+        match stored {
+            Ok(_) => Ok(Some(f)),
+            // Another writer's page won (Linux __xa_cmpxchg): ours goes
+            Err(won) => {
+                crate::FRAME_ALLOCATOR.free(f);
+                won.map(Some).ok_or(KernelError::OutOfMemory)
+            }
+        }
     }
 
     /// Copy `len` bytes between disk byte `pos` and kernel memory `mem`
@@ -101,7 +124,7 @@ impl BlockDriver for RamDisk {
 fn create(minor: u16, bytes: u64, data: &[u8]) -> Result<Arc<BlockDevice>, KernelError> {
     register_blkdev(major::RAMDISK, "ramdisk")?;
     let rd = try_arc(RamDisk {
-        pages: Mutex::new(BTreeMap::new()),
+        pages: Mutex::new(XArray::new()),
     })?;
     rd.copy(true, 0, data.as_ptr().cast_mut(), data.len())?;
     // brd: no seek cost (Linux QUEUE_FLAG_NONROT), never waits
