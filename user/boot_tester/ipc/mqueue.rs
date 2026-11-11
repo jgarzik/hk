@@ -8,6 +8,10 @@
 //! - Test mq_unlink removes queue
 //! - Test mq_send and mq_receive
 //! - Test mq_priority ordering
+//! - MQ_FIFO: within one priority messages come out in the order sent,
+//!   interleaved priorities each keep theirs, and a drained queue
+//!   orders new messages the same way (Linux msg_tree: a FIFO per
+//!   priority, an emptied priority's node cached)
 //! - Test mq_nonblock returns EAGAIN
 //! - Test mq_getsetattr
 //! - Test mq_close fd
@@ -25,7 +29,7 @@
 //!   0 since Linux 7.3), checked before the descriptor (EBADF) (Linux
 //!   do_mq_notify)
 
-use crate::harness::{fail_num, pass};
+use crate::harness::{R, check, fail_num, pass, report_r};
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
     MqAttr, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR, sys_close, sys_mq_getsetattr, sys_mq_open,
@@ -56,6 +60,7 @@ pub fn run_tests() {
     test_mq_unlink();
     test_mq_send_receive();
     test_mq_priority_ordering();
+    report_r(b"MQ_FIFO", mq_fifo());
     test_mq_nonblock_eagain();
     test_mq_getsetattr();
     test_mq_close_fd();
@@ -526,6 +531,62 @@ fn test_mq_priority_ordering() {
 
     sys_close(fd as u64);
     sys_mq_unlink(name.as_ptr());
+}
+
+/// Send `(prio, tag)` pairs, then receive them all: the tags in the
+/// order received, or the failing call's result
+fn mq_round(fd: i32, sends: &[(u32, u8)], out: &mut [u8]) -> Result<(), i64> {
+    for &(prio, tag) in sends {
+        let r = sys_mq_timedsend(fd, &tag, 1, prio, core::ptr::null());
+        if r != 0 {
+            return Err(r);
+        }
+    }
+    for slot in out.iter_mut() {
+        let mut prio = 0u32;
+        let mut buf = [0u8; 16];
+        let r = sys_mq_timedreceive(
+            fd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut prio,
+            core::ptr::null(),
+        );
+        if r != 1 {
+            return Err(r);
+        }
+        *slot = buf[0];
+    }
+    Ok(())
+}
+
+fn mq_fifo() -> R {
+    let name = b"hk_mq_fifo\0";
+    let attr = MqAttr::new(10, 16);
+    let fd = sys_mq_open(name.as_ptr(), (O_CREAT | O_RDWR) as i32, 0o600, &attr) as i32;
+    check(b"open", fd >= 0, fd as i64)?;
+    let sends = [
+        (3, b'a'),
+        (1, b'b'),
+        (3, b'c'),
+        (1, b'd'),
+        (3, b'e'),
+        (2, b'f'),
+    ];
+    let mut first = [0u8; 6];
+    let mut again = [0u8; 4];
+    let r1 = mq_round(fd, &sends, &mut first);
+    let r2 = mq_round(
+        fd,
+        &[(5, b'w'), (5, b'x'), (0, b'y'), (5, b'z')],
+        &mut again,
+    );
+    sys_close(fd as u64);
+    sys_mq_unlink(name.as_ptr());
+    check(b"round 1", r1.is_ok(), r1.err().unwrap_or(0))?;
+    check(b"order 1", &first == b"acefbd", first[0] as i64)?;
+    check(b"round 2", r2.is_ok(), r2.err().unwrap_or(0))?;
+    check(b"order 2", &again == b"wxzy", again[0] as i64)
 }
 
 /// Test mq_nonblock returns EAGAIN on empty queue

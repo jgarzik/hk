@@ -780,6 +780,12 @@ pub struct RbTreeNodeReservation<K, V> {
     node: Box<MaybeUninit<Node<K, V>>>,
 }
 
+// SAFETY: it owns its memory alone and holds no initialized link, key
+// or value: Send and Sync as a `Box` of the node would be
+unsafe impl<K: Send, V: Send> Send for RbTreeNodeReservation<K, V> {}
+// SAFETY: as above; `&self` gives nothing out
+unsafe impl<K: Sync, V: Sync> Sync for RbTreeNodeReservation<K, V> {}
+
 impl<K, V> RbTreeNodeReservation<K, V> {
     /// ENOMEM if it cannot be had
     pub fn new() -> Result<Self, KernelError> {
@@ -821,6 +827,21 @@ impl<K, V> RbTreeNode<K, V> {
     pub fn to_key_value(self) -> (K, V) {
         let n = *self.node;
         (n.key, n.value)
+    }
+
+    /// Drop the key and value and keep the memory for another node
+    /// (Rust-for-Linux `into_reservation`)
+    pub fn into_reservation(self) -> RbTreeNodeReservation<K, V> {
+        let p = Box::into_raw(self.node);
+        // SAFETY: `p` is a live, initialized node from the box; its key
+        // is dropped once and not read again
+        unsafe { core::ptr::drop_in_place(&raw mut (*p).key) };
+        // SAFETY: as above, for the value
+        unsafe { core::ptr::drop_in_place(&raw mut (*p).value) };
+        // SAFETY: the box's allocation, whose contents are now treated
+        // as uninitialized (`MaybeUninit<Node>` has `Node`'s layout)
+        let node = unsafe { Box::from_raw(p.cast::<MaybeUninit<Node<K, V>>>()) };
+        RbTreeNodeReservation { node }
     }
 }
 
@@ -953,6 +974,20 @@ mod tests {
             Some((3, 30))
         );
         assert!(t.iter().next().is_none());
+    }
+
+    #[test]
+    fn node_back_to_reservation() {
+        let live = Rc::new(());
+        let mut t = RbTree::new();
+        t.insert(node(1, live.clone()));
+        let r = t.remove_node(&1).expect("present").into_reservation();
+        // The value was dropped; the memory takes another node
+        assert_eq!(Rc::strong_count(&live), 1);
+        t.insert(r.into_node(2, live.clone()));
+        assert_eq!(check(&t), [2]);
+        drop(t);
+        assert_eq!(Rc::strong_count(&live), 1);
     }
 
     #[test]

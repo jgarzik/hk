@@ -27,12 +27,14 @@ use crate::fs::FileRef;
 use crate::fs::name::FileName;
 use crate::signal::Signal;
 use crate::time::hrtimer::HrClock;
-use crate::util::kalloc::try_arc;
+use crate::util::kalloc::{try_arc, try_box};
+use crate::util::list::{BoxList, Link};
+use crate::util::rbtree::{RbTree, RbTreeNode, RbTreeNodeReservation};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::fs::dentry::Dentry;
@@ -127,30 +129,90 @@ crate::pod!(SigEvent {
     _pad
 });
 
-/// Internal message structure
+/// A queued message (Linux struct msg_msg, m_type the priority),
+/// allocated before the queue's lock is taken
 struct MqMessage {
+    link: Link,
     priority: u32,
     data: Vec<u8>,
 }
 
-impl PartialEq for MqMessage {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority
-    }
+crate::adapter!(MqMsgA, MqMessage, link);
+
+/// One priority's messages, oldest first (Linux posix_msg_tree_node)
+type MsgList = BoxList<MqMsgA>;
+type MsgNode = RbTreeNodeReservation<u32, MsgList>;
+
+/// A queue's messages (Linux info->msg_tree, node_cache, mq_curmsgs and
+/// qsize, under info->lock)
+struct MsgTree {
+    /// A FIFO per priority present, by priority; never an empty one
+    tree: RbTree<u32, MsgList>,
+    /// A spare tree node (Linux node_cache): filled by a sender that saw
+    /// it empty, with a node allocated before the lock, and by a
+    /// receiver emptying a priority
+    node_cache: Option<MsgNode>,
+    /// Messages queued (mq_curmsgs)
+    curmsgs: usize,
+    /// Their bytes (QSIZE)
+    qsize: usize,
 }
 
-impl Eq for MqMessage {}
-
-impl PartialOrd for MqMessage {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+impl MsgTree {
+    const fn new() -> Self {
+        Self {
+            tree: RbTree::new(),
+            node_cache: None,
+            curmsgs: 0,
+            qsize: 0,
+        }
     }
-}
 
-impl Ord for MqMessage {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Higher priority = greater (for max-heap behavior)
-        self.priority.cmp(&other.priority)
+    /// Queue `msg` behind those of its priority (Linux msg_insert): a
+    /// new priority takes the cached node, else one allocated here,
+    /// GFP_ATOMIC under the lock as Linux; ENOMEM gives `msg` back
+    fn insert(&mut self, msg: Box<MqMessage>) -> Result<(), Box<MqMessage>> {
+        let (prio, len) = (msg.priority, msg.data.len());
+        if let Some(list) = self.tree.get_mut(&prio) {
+            list.push_back(msg);
+        } else {
+            let node = match self.node_cache.take() {
+                Some(n) => n,
+                None => match crate::util::kalloc::with_gfp(
+                    crate::mm::page_alloc::Gfp::ATOMIC,
+                    MsgNode::new,
+                ) {
+                    Ok(n) => n,
+                    Err(_) => return Err(msg),
+                },
+            };
+            let mut list = MsgList::new();
+            list.push_back(msg);
+            self.tree.insert(node.into_node(prio, list));
+        }
+        self.curmsgs += 1;
+        self.qsize += len;
+        Ok(())
+    }
+
+    /// Take the oldest message of the highest priority (Linux msg_get):
+    /// an emptied priority's node goes back to the cache, or to `freed`
+    /// (to free after the lock) when the cache is full (msg_tree_erase)
+    fn get(&mut self, freed: &mut Option<RbTreeNode<u32, MsgList>>) -> Option<Box<MqMessage>> {
+        let prio = *self.tree.last()?.0;
+        let list = self.tree.get_mut(&prio).expect("present");
+        let msg = list.pop_front().expect("mqueue priority empty");
+        if list.is_empty() {
+            let node = self.tree.remove_node(&prio).expect("present");
+            if self.node_cache.is_none() {
+                self.node_cache = Some(node.into_reservation());
+            } else {
+                *freed = Some(node);
+            }
+        }
+        self.curmsgs -= 1;
+        self.qsize -= msg.data.len();
+        Some(msg)
     }
 }
 
@@ -170,7 +232,11 @@ struct MqNotify {
 pub struct MqQueue {
     maxmsg: i64,
     msgsize: i64,
-    messages: Mutex<Vec<MqMessage>>,
+    messages: Mutex<MsgTree>,
+    /// `messages.node_cache` is empty, read without the lock to decide
+    /// whether to allocate a spare first (Linux reads info->node_cache
+    /// unlocked); written under it
+    cache_empty: core::sync::atomic::AtomicBool,
     flags: Mutex<i64>,
     mode: u32,
     uid: u32,
@@ -195,7 +261,7 @@ impl MqQueue {
     /// "QSIZE:... NOTIFY:... SIGNO:... NOTIFY_PID:...\n" (Linux
     /// mqueue_read_file's format)
     fn status(&self) -> alloc::string::String {
-        let qsize: usize = self.messages.lock().iter().map(|m| m.data.len()).sum();
+        let qsize = self.messages.lock().qsize;
         let (notify, signo, pid) = match self.notify.lock().as_ref() {
             Some(n) => (
                 if n.sig.is_some() {
@@ -222,7 +288,8 @@ impl MqQueue {
         Self {
             maxmsg,
             msgsize,
-            messages: Mutex::new(Vec::new()),
+            messages: Mutex::new(MsgTree::new()),
+            cache_empty: core::sync::atomic::AtomicBool::new(true),
             flags: Mutex::new(0),
             mode,
             // Linux mqueue_get_inode: the creator's fsuid and fsgid
@@ -271,7 +338,7 @@ impl MqQueue {
             mq_flags: *self.flags.lock(),
             mq_maxmsg: self.maxmsg,
             mq_msgsize: self.msgsize,
-            mq_curmsgs: msgs.len() as i64,
+            mq_curmsgs: msgs.curmsgs as i64,
             __reserved: [0; 4],
         }
     }
@@ -286,29 +353,32 @@ impl MqQueue {
         (*self.flags.lock() & i64::from(O_NONBLOCK)) != 0
     }
 
-    fn send(
-        &self,
-        data: Vec<u8>,
-        priority: u32,
-        nonblock: bool,
-        deadline: Option<u64>,
-    ) -> KernelResult<()> {
+    /// Queue `msg` (Linux do_mq_timedsend): allocated before the lock,
+    /// as is a spare tree node when the cache looks empty (stashed in
+    /// the cache under the lock, else freed after it)
+    fn send(&self, msg: Box<MqMessage>, nonblock: bool, deadline: Option<u64>) -> KernelResult<()> {
+        use core::sync::atomic::Ordering::Relaxed;
+        let mut msg = Some(msg);
+        let mut spare = if self.cache_empty.load(Relaxed) {
+            MsgNode::new().ok()
+        } else {
+            None
+        };
         loop {
             {
                 let mut msgs = self.messages.lock();
-                if (msgs.len() as i64) < self.maxmsg {
-                    // Insert maintaining priority order (higher priority first)
-                    let msg = MqMessage { priority, data };
-
-                    // Find insertion point (sorted by priority, descending)
-                    let pos = msgs
-                        .iter()
-                        .position(|m| m.priority < priority)
-                        .unwrap_or(msgs.len());
-                    msgs.insert(pos, msg);
+                if (msgs.curmsgs as i64) < self.maxmsg {
+                    if msgs.node_cache.is_none() {
+                        msgs.node_cache = spare.take();
+                    }
+                    let r = msgs.insert(msg.take().expect("sent once"));
+                    self.cache_empty.store(msgs.node_cache.is_none(), Relaxed);
+                    if r.is_err() {
+                        return Err(KernelError::OutOfMemory);
+                    }
 
                     // Check for notification
-                    let should_notify = msgs.len() == 1; // Queue was empty
+                    let should_notify = msgs.curmsgs == 1; // Queue was empty
                     drop(msgs);
 
                     if should_notify {
@@ -326,7 +396,7 @@ impl MqQueue {
             }
 
             // Wait for space (Linux wq_sleep: ERESTARTSYS, ETIMEDOUT)
-            let room = || (self.messages.lock().len() as i64) < self.maxmsg;
+            let room = || (self.messages.lock().curmsgs as i64) < self.maxmsg;
             match self.waitq_send.wait_event_interruptible_deadline(
                 room,
                 deadline,
@@ -342,12 +412,17 @@ impl MqQueue {
     fn receive(&self, nonblock: bool, deadline: Option<u64>) -> KernelResult<(Vec<u8>, u32)> {
         loop {
             {
+                // A node freed by the receive goes after the lock
+                let mut freed = None;
                 let mut msgs = self.messages.lock();
-                if !msgs.is_empty() {
-                    // Remove highest priority message (at front); the
-                    // caller copies it out, so no kernel buffer is sized
-                    // by the user's request
-                    let msg = msgs.remove(0);
+                // The oldest of the highest priority; the caller copies
+                // it out, so no kernel buffer is sized by the user's
+                // request
+                if let Some(msg) = msgs.get(&mut freed) {
+                    self.cache_empty.store(
+                        msgs.node_cache.is_none(),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
                     drop(msgs);
 
                     // Wake up senders
@@ -361,7 +436,7 @@ impl MqQueue {
             }
 
             // Wait for messages
-            let ready = || !self.messages.lock().is_empty();
+            let ready = || self.messages.lock().curmsgs != 0;
             match self.waitq_recv.wait_event_interruptible_deadline(
                 ready,
                 deadline,
@@ -461,10 +536,10 @@ impl FileOps for MqFileOps {
         let msgs = mq.queue.messages.lock();
         let mut events = 0u16;
 
-        if !msgs.is_empty() {
+        if msgs.curmsgs != 0 {
             events |= POLLIN | POLLRDNORM;
         }
-        if (msgs.len() as i64) < mq.queue.maxmsg {
+        if (msgs.curmsgs as i64) < mq.queue.maxmsg {
             events |= POLLOUT | POLLWRNORM;
         }
 
@@ -801,9 +876,15 @@ pub fn sys_mq_timedsend(
         copy_from_user(&mut msg_buf, msg_ptr.addr(), msg_len)?;
     }
 
+    // Allocated before the queue's lock (Linux load_msg)
+    let msg = try_box(MqMessage {
+        link: Link::new(),
+        priority: msg_prio,
+        data: msg_buf,
+    })?;
     let deadline = mq_deadline(abs_timeout)?;
     let nonblock = mq_ops.queue.is_nonblocking();
-    mq_ops.queue.send(msg_buf, msg_prio, nonblock, deadline)
+    mq_ops.queue.send(msg, nonblock, deadline)
 }
 
 /// mq_timedreceive - receive a message from a queue
