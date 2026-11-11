@@ -172,6 +172,42 @@ impl<A: Adapter> RcuList<A> {
     pub fn count(&self) -> usize {
         self.ends.lock().len
     }
+
+    /// Take the entries off, front to back, with their references: no
+    /// reader can stand on them (`&mut`), so no grace period
+    pub fn drain(&mut self) -> Drain<'_, A> {
+        Drain { list: self }
+    }
+}
+
+/// The entries of an [`RcuList`] taken off one at a time (`drain`);
+/// those not taken stay on it
+pub struct Drain<'a, A: Adapter> {
+    list: &'a mut RcuList<A>,
+}
+
+impl<A: Adapter> Iterator for Drain<'_, A> {
+    type Item = Arc<A::Item>;
+    fn next(&mut self) -> Option<Arc<A::Item>> {
+        let cur = *self.list.head.get_mut();
+        if cur.is_null() {
+            return None;
+        }
+        // SAFETY: the first link of the list, borrowed `&mut` (no reader
+        // or writer): a live entry holding the list's reference
+        unsafe {
+            let next = (*cur).next();
+            *self.list.head.get_mut() = next;
+            let e = self.list.ends.get_mut();
+            e.len -= 1;
+            match next.as_ref() {
+                Some(n) => n.set_prev(null_mut()),
+                None => e.tail = null_mut(),
+            }
+            (*cur).reset();
+            Some(Arc::from_raw(A::item(cur)))
+        }
+    }
 }
 
 /// A new reference to an entry of an [`RcuList`]

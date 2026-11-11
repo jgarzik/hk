@@ -6,6 +6,7 @@ pub mod epoll;
 pub mod eventfd;
 pub mod fanotify;
 pub mod fasync;
+pub mod fsnotify;
 pub mod inotify;
 pub mod io_uring;
 pub mod pipe;

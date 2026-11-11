@@ -55,6 +55,11 @@ impl<T> IrqSpinlock<T> {
         }
     }
 
+    /// The data, through exclusive access (no lock needed)
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
     /// Acquire the lock, disabling interrupts and preemption
     ///
     /// This is equivalent to Linux's spin_lock_irqsave():

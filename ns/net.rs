@@ -308,9 +308,10 @@ static NET_NAMESPACE_LIST: crate::sync::RwSem<Vec<Weak<NetNamespace>>> =
 /// default_device_exit_batch unregistering them)
 impl Drop for NetNamespace {
     fn drop(&mut self) {
+        // Walked through `&mut`: no reader or writer is left
         let kdevs = self
-            .devices()
-            .iter()
+            .devices
+            .drain()
             .filter_map(|d| d.kdev.get().cloned())
             .collect();
         // Sleeping sysfs work: deferred (Linux cleanup_net runs from a

@@ -28,9 +28,8 @@
 //! - Multiple marks per fanotify instance
 
 use crate::fs::FileRef;
-use crate::util::kalloc::{try_arc, try_box};
-use crate::util::list::{BoxList, Link};
-use alloc::boxed::Box;
+use crate::io::fsnotify::NotifQueue;
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
@@ -289,19 +288,10 @@ impl FanotifyEvent {
 }
 
 /// FAN_Q_OVERFLOW as read (Linux's preallocated group->overflow_event)
-const OVERFLOW_EVENT: FanotifyEvent = FanotifyEvent {
+static OVERFLOW_EVENT: FanotifyEvent = FanotifyEvent {
     mask: FAN_Q_OVERFLOW,
     pid: 0,
 };
-
-/// A queued event, allocated before the queue lock is taken (Linux
-/// fanotify_alloc_event, then fsnotify_insert_event)
-struct EvNode {
-    link: Link,
-    ev: FanotifyEvent,
-}
-
-crate::adapter!(EvAdapter, EvNode, link);
 
 // =============================================================================
 // Fanotify Instance
@@ -332,83 +322,14 @@ impl FanMarks {
     }
 }
 
-/// A group's event queue (Linux group->notification_list under
-/// notification_lock)
-struct FanotifyInner {
-    /// Queued events, oldest first
-    events: BoxList<EvAdapter>,
-    /// The one FAN_Q_OVERFLOW, while queued: how many of `events` are
-    /// ahead of it (a position, so queueing it allocates nothing)
-    overflow: Option<usize>,
-}
-
-impl FanotifyInner {
-    const fn new() -> Self {
-        Self {
-            events: BoxList::new(),
-            overflow: None,
-        }
-    }
-
-    /// Queued events, the overflow counted (Linux q_len)
-    fn len(&self) -> usize {
-        self.events.len() + usize::from(self.overflow.is_some())
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Queue `ev` (Linux fsnotify_insert_event): past
-    /// FANOTIFY_MAX_QUEUED_EVENTS, or without memory for it (None),
-    /// FAN_Q_OVERFLOW is queued in its place, once. Whether anything
-    /// was queued, and the event if it was not, to free after the
-    /// unlock.
-    fn push(&mut self, ev: Option<Box<EvNode>>) -> (bool, Option<Box<EvNode>>) {
-        match ev {
-            Some(e) if self.len() < FANOTIFY_MAX_QUEUED_EVENTS => {
-                self.events.push_back(e);
-                (true, None)
-            }
-            e if self.overflow.is_none() => {
-                self.overflow = Some(self.events.len());
-                (true, e)
-            }
-            e => (false, e),
-        }
-    }
-
-    /// The oldest event (Linux fsnotify_peek_first_event)
-    fn front(&self) -> Option<FanotifyEvent> {
-        match self.overflow {
-            Some(0) => Some(OVERFLOW_EVENT),
-            _ => self.events.iter().next().map(|n| n.ev),
-        }
-    }
-
-    /// Take the oldest event (Linux fsnotify_remove_first_event): its
-    /// node, if any, is freed by the caller after the unlock
-    fn pop(&mut self) -> Option<(FanotifyEvent, Option<Box<EvNode>>)> {
-        match self.overflow {
-            Some(0) => {
-                self.overflow = None;
-                Some((OVERFLOW_EVENT, None))
-            }
-            Some(n) => {
-                self.overflow = Some(n - 1);
-                self.events.pop_front().map(|b| (b.ev, Some(b)))
-            }
-            None => self.events.pop_front().map(|b| (b.ev, Some(b))),
-        }
-    }
-}
-
 /// Fanotify instance
 pub struct Fanotify {
     /// The marks (sleeping, Linux group->mark_mutex)
     mark_mutex: crate::sync::Mutex<FanMarks>,
-    /// The event queue (Linux group->notification_lock)
-    inner: IrqSpinlock<FanotifyInner>,
+    /// The event queue (Linux group->notification_list under
+    /// notification_lock): at most FANOTIFY_MAX_QUEUED_EVENTS, then
+    /// FAN_Q_OVERFLOW
+    inner: IrqSpinlock<NotifQueue<FanotifyEvent>>,
     /// Wait queue for blocking readers
     wait_queue: WaitQueue,
     /// Init flags
@@ -420,7 +341,7 @@ impl Fanotify {
     pub fn new(init_flags: u32) -> Result<Arc<Self>, KernelError> {
         try_arc(Self {
             mark_mutex: crate::sync::Mutex::new(FanMarks::default()),
-            inner: IrqSpinlock::new(FanotifyInner::new()),
+            inner: IrqSpinlock::new(NotifQueue::new(FANOTIFY_MAX_QUEUED_EVENTS, &OVERFLOW_EVENT)),
             wait_queue: WaitQueue::new(),
             init_flags,
         })
@@ -464,12 +385,8 @@ impl Fanotify {
     /// fanotify_handle_event: fanotify_alloc_event, then
     /// fsnotify_insert_event; no memory queues FAN_Q_OVERFLOW)
     pub fn queue_event(&self, mask: u64, pid: i32) {
-        let ev = try_box(EvNode {
-            link: Link::new(),
-            ev: FanotifyEvent { mask, pid },
-        })
-        .ok();
-        let (queued, left) = self.inner.lock().push(ev);
+        let ev = crate::io::fsnotify::ev_alloc(FanotifyEvent { mask, pid });
+        let (queued, left) = self.inner.lock().insert(ev);
         drop(left);
         if queued {
             self.wait_queue.wake_all();
@@ -493,13 +410,12 @@ impl Fanotify {
             self.wait_queue
                 .wait_event_interruptible_locked(&mut inner, |i| !i.is_empty())?;
         }
-        if inner.front().map_or(0, |e| e.serialized_size()) > room {
+        if inner.peek_first().map_or(0, |e| e.serialized_size()) > room {
             return Err(KernelError::InvalidArgument);
         }
-        let (ev, node) = inner.pop().ok_or(KernelError::WouldBlock)?;
+        let taken = inner.remove_first().ok_or(KernelError::WouldBlock)?;
         drop(inner);
-        drop(node);
-        Ok(ev)
+        Ok(*taken.ev())
     }
 
     /// Read events into `to` (Linux fanotify_read): each is taken off

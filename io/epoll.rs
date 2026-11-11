@@ -567,9 +567,11 @@ fn f_ep_del(file: &File, item: &EpItem) -> Option<Arc<EpItem>> {
 impl Drop for Eventpoll {
     /// The epoll file's last close (Linux ep_free): every item goes,
     /// unregistered before the ready list is emptied (no callback can
-    /// queue one after); all are released with no lock held
+    /// queue one after); all are released with no lock held. Nothing
+    /// else reaches the map or the ready list (`&mut`), but a callback
+    /// may run on an item until it is unregistered
     fn drop(&mut self) {
-        let items = core::mem::take(&mut *self.mtx.lock());
+        let items = core::mem::take(self.mtx.get_mut());
         for item in items.values() {
             item.unregister();
             if let Some(f) = item.file.upgrade() {
@@ -577,7 +579,7 @@ impl Drop for Eventpoll {
                 drop(off);
             }
         }
-        let ready = core::mem::replace(&mut *self.lock.lock(), ArcList::new());
+        let ready = core::mem::replace(self.lock.get_mut(), ArcList::new());
         drop(ready);
         drop(items);
     }
