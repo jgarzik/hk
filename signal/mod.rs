@@ -2541,27 +2541,16 @@ impl SignalStruct {
         Ok(old)
     }
 
-    /// Deep clone for fork (without CLONE_THREAD)
+    /// Deep clone for fork (without CLONE_THREAD): allocated first,
+    /// then the limits copied under `rlim` (Linux copy_signal: the
+    /// zeroed signal_struct, then the memcpy of rlim under task_lock),
+    /// so the leaf lock is held across no allocation. Timers and the
+    /// subreaper flag are not inherited.
     pub fn deep_clone(self: &Arc<Self>) -> Result<Arc<Self>, KernelError> {
-        let rlim = self.rlim.lock();
-        let mut new_rlim = [RLimit::default(); RLIM_NLIMITS];
-        new_rlim.copy_from_slice(&*rlim);
-        try_arc(Self {
-            rlim: IrqSpinlock::new(new_rlim),
-            cred_guard: crate::sync::Mutex::new(()),
-            exec_update: crate::sync::RwSem::new(()),
-            group_exit: AtomicU64::new(0),
-            // Timers are not inherited (Linux copy_signal)
-            posix_timers: Mutex::new(crate::time::posix_timer::PosixTimerRegistry::new()),
-            live: AtomicU32::new(1),
-            dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
-            child_times: [AtomicU64::new(0), AtomicU64::new(0)],
-            cputimer: crate::time::cpu_timer::GroupCputimer::new(),
-            shared: Mutex::new(GroupPending::new()),
-            // Linux copy_signal: is_child_subreaper is not inherited
-            subreaper: crate::task::TableCell::new(false),
-            unkillable: AtomicBool::new(false),
-        })
+        let new = try_arc(Self::new())?;
+        let lim = *self.rlim.lock();
+        *new.rlim.lock() = lim;
+        Ok(new)
     }
 }
 
