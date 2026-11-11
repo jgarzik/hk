@@ -161,7 +161,7 @@ impl Pseudo {
     /// d_alloc_pseudo) and its path
     pub fn path(&self, name: &str, inode: Arc<Inode>) -> Result<Path, KernelError> {
         let mnt = self.mnt()?;
-        let d = Dentry::new_pseudo(name.into(), inode, &mnt.sb);
+        let d = Dentry::new_pseudo(name.as_bytes(), inode, &mnt.sb)?;
         Ok(Path::new(mnt, try_arc(d)?))
     }
 }

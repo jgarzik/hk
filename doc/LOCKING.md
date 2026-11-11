@@ -2230,13 +2230,24 @@ pub struct Dentry {
 }
 
 struct DentryInner {
-    name: FileName,             // Changed by d_move/d_exchange
+    name: DName,                // Changed by d_move/d_exchange
     inode: Option<Arc<Inode>>,
     parent: Option<Arc<Dentry>>, // Pinned by the child (Linux d_parent)
-    children: BTreeMap<FileName, Arc<Dentry>>,
+    children: BTreeMap<DName, Arc<Dentry>>,
     flags: DentryFlags,
 }
 ```
+
+A name (`fs::name::DName`, Linux qstr over d_shortname or an
+external_name) is inline below `DNAME_INLINE_LEN` (40) bytes, else a
+refcounted `Arc<[u8]>` allocated, fallibly, when the dentry is made,
+before any lock. `Dentry::name` returns a snapshot (Linux
+take_dentry_name_snapshot: a byte copy or a reference) and a rename
+moves names by copy or reference (copy_name, swap_names), so no name
+is allocated under RENAME_LOCK or a d_lock. `d_move` takes the target
+dentry: the replaced one, a cached negative one, or one the rename
+preallocates (`Dentry::prealloc`) before calling the file system, so
+an ENOMEM comes before any change.
 
 A rename moves the dentry itself (`d_move`, `d_exchange`) under the
 global `RENAME_LOCK` (write; Linux rename_lock), with both parents'

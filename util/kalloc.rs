@@ -141,6 +141,15 @@ pub fn try_arc<T>(v: T) -> Result<Arc<T>, KernelError> {
     reserved(arc_layout::<T>(), || Arc::new(v))
 }
 
+/// `Arc::<[T]>::from(s)`, or ENOMEM (a refcounted copy of a slice:
+/// Linux's external_name)
+pub fn try_arc_slice<T: Copy>(s: &[T]) -> Result<Arc<[T]>, KernelError> {
+    let counts = Layout::new::<[AtomicUsize; 2]>();
+    let data = Layout::array::<T>(s.len()).map_err(|_| KernelError::OutOfMemory)?;
+    let (l, _) = counts.extend(data).map_err(|_| KernelError::OutOfMemory)?;
+    reserved(l.pad_to_align(), || Arc::from(s))
+}
+
 /// `Arc::new_cyclic(f)`, or ENOMEM (before `f` runs)
 pub fn try_arc_cyclic<T>(f: impl FnOnce(&Weak<T>) -> T) -> Result<Arc<T>, KernelError> {
     #[expect(clippy::disallowed_methods)]
@@ -235,6 +244,7 @@ pub fn selftest() -> bool {
         && try_arc(7u64).is_ok()
         && try_arc([0u8; 3000]).is_ok()
         && try_arc(Big([0; 200])).is_ok()
+        && try_arc_slice(&[7u8; 61]).is_ok_and(|a| a.len() == 61 && a[60] == 7)
         && try_arc_cyclic(|w: &Weak<u32>| w.strong_count() as u32).is_ok()
         // The closure runs preemptible: it may sleep
         && try_arc_cyclic(|_: &Weak<u32>| {

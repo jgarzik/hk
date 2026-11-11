@@ -5,7 +5,7 @@
 
 use alloc::sync::Arc;
 
-use crate::fs::dentry::{d_exchange, d_move};
+use crate::fs::dentry::{Dentry, d_exchange, d_move};
 use crate::fs::namei::{
     Last, Parent, create_entry, delete_entry, filename_create, filename_lookup, filename_parentat,
     getname,
@@ -455,6 +455,18 @@ fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelE
         }
     }
 
+    // Where the source goes in the dcache (Linux's new_dentry): the
+    // replaced dentry, a cached negative one, else one made now, so an
+    // ENOMEM comes before the file system changes anything and d_move
+    // allocates nothing
+    let target = match &dst {
+        Some(d) => d.clone(),
+        None => match np.lookup_child(nname).filter(|d| d.is_negative()) {
+            Some(d) => d,
+            None => Dentry::prealloc(np, nname)?,
+        },
+    };
+
     // The link counts that change, under their inodes' locks (Linux
     // lock_two_nondirectories); a directory being replaced is locked
     // too (Linux vfs_rename), so a mount on it is either seen here or
@@ -490,9 +502,10 @@ fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelE
     r?;
     // The dentries follow the rename: whoever holds one (a cwd, an fd,
     // a mountpoint) sees the new place
-    match &dst {
-        Some(d) if exchange => d_exchange(&src, d),
-        _ => d_move(&src, np, nname),
+    if exchange {
+        d_exchange(&src, &target);
+    } else {
+        d_move(&src, &target);
     }
     Ok(())
 }

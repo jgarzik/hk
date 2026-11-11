@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use crate::sync::spin::RwLock;
 
 use super::inode::Inode;
-use super::name::FileName;
+use super::name::DName;
 use super::path_ref::Path;
 use super::superblock::SuperBlock;
 use crate::util::error::KernelError;
@@ -59,7 +59,7 @@ static NR_DENTRY: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64:
 /// Inner mutable state protected by d_lock
 struct DentryInner {
     /// Name in the parent (empty for a root); changed by d_move
-    name: FileName,
+    name: DName,
     /// The inode this dentry points to (None for negative dentry)
     inode: Option<Arc<Inode>>,
     /// Parent dentry (None for a root), pinned by the child (Linux
@@ -67,7 +67,7 @@ struct DentryInner {
     /// whole chain valid
     parent: Option<Arc<Dentry>>,
     /// Children dentries (for directories)
-    children: BTreeMap<FileName, Arc<Dentry>>,
+    children: BTreeMap<DName, Arc<Dentry>>,
     /// Dentry flags
     flags: DentryFlags,
 }
@@ -88,7 +88,7 @@ pub struct Dentry {
 }
 
 impl Dentry {
-    fn with(name: FileName, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
+    fn with(name: DName, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
         NR_DENTRY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Self {
             sb,
@@ -104,22 +104,30 @@ impl Dentry {
 
     /// Create root dentry for a filesystem
     pub fn new_root(inode: Arc<Inode>, sb: Weak<SuperBlock>) -> Self {
-        Self::with(FileName::default(), Some(inode), sb)
+        Self::with(DName::default(), Some(inode), sb)
     }
 
     /// Create an anonymous dentry (for pipes, sockets, etc.)
     ///
     /// Anonymous dentries have no superblock and are not part of any filesystem.
     /// They exist solely to provide a File's required dentry reference.
-    pub fn new_anonymous(name: FileName, inode: Option<Arc<Inode>>) -> Self {
-        Self::with(name, inode, Weak::new())
+    pub fn new_anonymous(name: &[u8], inode: Option<Arc<Inode>>) -> Result<Self, KernelError> {
+        Ok(Self::with(DName::new(name)?, inode, Weak::new()))
     }
 
     /// A dentry of `inode` on the pseudo filesystem `sb`, outside any
     /// tree (Linux d_alloc_pseudo): a pipe's, socket's, anonymous
     /// inode's or namespace file's
-    pub fn new_pseudo(name: FileName, inode: Arc<Inode>, sb: &Arc<SuperBlock>) -> Self {
-        Self::with(name, Some(inode), Arc::downgrade(sb))
+    pub fn new_pseudo(
+        name: &[u8],
+        inode: Arc<Inode>,
+        sb: &Arc<SuperBlock>,
+    ) -> Result<Self, KernelError> {
+        Ok(Self::with(
+            DName::new(name)?,
+            Some(inode),
+            Arc::downgrade(sb),
+        ))
     }
 
     /// The child `name` of `parent` with `inode` (Linux d_alloc +
@@ -149,7 +157,11 @@ impl Dentry {
         name: &[u8],
         inode: Arc<Inode>,
     ) -> Result<Arc<Dentry>, KernelError> {
-        let d = try_arc(Self::with(name.into(), Some(inode), parent.sb.clone()))?;
+        let d = try_arc(Self::with(
+            DName::new(name)?,
+            Some(inode),
+            parent.sb.clone(),
+        ))?;
         {
             let mut dl = d.d_lock.write();
             dl.parent = Some(parent.clone());
@@ -159,11 +171,14 @@ impl Dentry {
     }
 
     /// A new child dentry of `parent`, not yet in the tree: the
-    /// allocation a create does before the filesystem makes the entry
-    /// (Linux d_alloc in lookup_create), so an ENOMEM leaves nothing
-    /// half made
+    /// allocation a create or rename does before the filesystem makes
+    /// the entry (Linux d_alloc in lookup_create), so an ENOMEM leaves
+    /// nothing half made. It holds its parent already (Linux d_alloc's
+    /// dget of the parent).
     pub fn prealloc(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
-        try_arc(Self::with(name.into(), None, parent.sb.clone()))
+        let d = try_arc(Self::with(DName::new(name)?, None, parent.sb.clone()))?;
+        d.d_lock.write().parent = Some(parent.clone());
+        Ok(d)
     }
 
     /// Put `d` (from `prealloc` on `parent`) in the tree with `inode`
@@ -172,9 +187,8 @@ impl Dentry {
     /// two dentries
     pub fn add(parent: &Arc<Dentry>, d: Arc<Dentry>, inode: Option<Arc<Inode>>) -> Arc<Dentry> {
         let name = d.name();
-        let name = name.as_bytes();
         let mut p = parent.d_lock.write();
-        if let Some(c) = p.children.get(name) {
+        if let Some(c) = p.children.get(name.as_bytes()) {
             let mut ci = c.d_lock.write();
             if ci.inode.is_some() {
                 drop(ci);
@@ -196,12 +210,14 @@ impl Dentry {
             dl.inode = inode;
             dl.parent = Some(parent.clone());
         }
-        p.children.insert(name.into(), d.clone());
+        p.children.insert(name, d.clone());
         d
     }
 
-    /// Name in the parent (a copy: d_move may change it)
-    pub fn name(&self) -> FileName {
+    /// Name in the parent, a snapshot (Linux take_dentry_name_snapshot:
+    /// d_move may change it): a byte copy or a shared reference, never an
+    /// allocation
+    pub fn name(&self) -> DName {
         self.d_lock.read().name.clone()
     }
 
@@ -552,24 +568,17 @@ pub fn shrink_dcache(budget: usize) -> usize {
     freed
 }
 
-/// Unhook `d` from its parent's children if it is still there
-fn unhook(d: &Arc<Dentry>) -> Option<(Arc<Dentry>, FileName)> {
-    let parent = d.get_parent()?;
-    let name = d.name();
-    unhook_from(d, &parent, &name);
-    Some((parent, name))
-}
-
 /// Take `d` off `parent`'s children, if it is the one cached as `name`
-fn unhook_from(d: &Arc<Dentry>, parent: &Dentry, name: &FileName) {
+fn unhook_from(d: &Arc<Dentry>, parent: &Dentry, name: &DName) {
     let mut p = parent.d_lock.write();
     if p.children.get(name).is_some_and(|c| Arc::ptr_eq(c, d)) {
         p.children.remove(name);
     }
 }
 
-/// Re-hang `d` as `name` under `parent`
-fn rehook(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: FileName) {
+/// Re-hang `d` as `name` under `parent` (the name a snapshot of the
+/// target's: Linux copy_name, a copy or a shared reference)
+fn rehook(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: DName) {
     let mut di = d.d_lock.write();
     di.name = name.clone();
     di.parent = Some(parent.clone());
@@ -578,22 +587,25 @@ fn rehook(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: FileName) {
     parent.d_lock.write().children.insert(name, d.clone());
 }
 
-/// A rename moved `d` to `name` in `parent` (Linux d_move): a dentry
-/// cached there (the replaced target) is unhashed; `d` keeps its
-/// identity, so whoever holds it (a cwd, an fd, a mountpoint) follows
-/// it. Callers hold both parents' i_rwsem.
-pub fn d_move(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: &[u8]) {
+/// A rename moved `d` to where `target` is (Linux d_move): the target
+/// (the replaced dentry, or a negative one the rename made up front,
+/// so nothing allocates here) leaves the tree, and `d` takes its parent
+/// and name; `d` keeps its identity, so whoever holds it (a cwd, an fd,
+/// a mountpoint) follows it. Callers hold both parents' i_rwsem.
+pub fn d_move(d: &Arc<Dentry>, target: &Arc<Dentry>) {
     let w = RENAME_LOCK.write();
-    unhook(d);
-    let t = parent.d_lock.write().children.remove(name);
-    if let Some(t) = &t {
-        t.d_lock.write().flags.unhashed = true;
+    let Some(parent) = target.get_parent() else {
+        return;
+    };
+    let name = target.name();
+    if let Some(old) = d.get_parent() {
+        unhook_from(d, &old, &d.name());
     }
-    rehook(d, parent, name.into());
+    unhook_from(target, &parent, &name);
+    target.d_lock.write().flags.unhashed = true;
+    rehook(d, &parent, name);
     drop(w);
-    if let Some(t) = t {
-        d_drop_tree(&t);
-    }
+    d_drop_tree(target);
 }
 
 /// RENAME_EXCHANGE swapped `a` and `b` (Linux d_exchange): each takes
@@ -732,6 +744,35 @@ mod tests {
         r.d_delete(b"a", 1);
         assert!(other.is_unhashed() && !other.is_negative());
         assert!(r.lookup_child(b"a").is_none());
+    }
+
+    /// A move onto a preallocated target takes its parent and name
+    /// (a long name shared, Linux copy_name), and the target is dead
+    #[test]
+    fn move_takes_target_name() {
+        let r = try_arc(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        let d = Dentry::alloc(&r, b"d", Some(inode())).unwrap();
+        let long = [b'n'; 60];
+        let t = Dentry::prealloc(&d, &long).unwrap();
+        d_move(&a, &t);
+        assert!(r.lookup_child(b"a").is_none());
+        assert!(d.lookup_child(&long).is_some_and(|c| Arc::ptr_eq(&c, &a)));
+        assert!(a.get_parent().is_some_and(|p| Arc::ptr_eq(&p, &d)));
+        assert!(a.name().as_bytes() == long && t.is_unhashed());
+    }
+
+    /// A move over a cached dentry unhashes it, keeping its inode for
+    /// whoever holds it
+    #[test]
+    fn move_over_replaces() {
+        let r = try_arc(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        let b = Dentry::alloc(&r, b"b", Some(inode())).unwrap();
+        d_move(&a, &b);
+        assert!(r.lookup_child(b"b").is_some_and(|c| Arc::ptr_eq(&c, &a)));
+        assert!(b.is_unhashed() && !b.is_negative());
+        assert_eq!(r.num_children(), 1);
     }
 
     /// A real exchange swaps names and parents
