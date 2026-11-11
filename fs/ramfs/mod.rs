@@ -11,9 +11,12 @@
 //! parent directory's inode. For rename operations involving two directories,
 //! VFS uses `lock_rename()`/`unlock_rename()` with proper ancestor-first ordering.
 //!
-//! The `RamfsInodeData.children` RwLock is still used for interior mutability
-//! (required for `Sync`), but complex lock ordering is unnecessary since VFS
-//! guarantees no concurrent directory modifications.
+//! `RamfsInodeData.children` is a sleeping `RwSem` (Linux ramfs keeps a
+//! directory's entries in the dcache under the directory's i_rwsem,
+//! which every change here also holds): taken inside i_rwsem, in thread
+//! context, so entries and their names are added under no spin lock.
+//! Complex lock ordering is unnecessary since VFS guarantees no
+//! concurrent directory modifications.
 //!
 //! File data (`RamfsInodeData.data`) uses RwLock independently for concurrent
 //! read access and exclusive write access during file I/O.
@@ -28,6 +31,7 @@ use super::name::FileName;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::sync::RwSem;
 use crate::sync::spin::RwLock;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -146,7 +150,7 @@ fn current_time() -> Timespec {
 /// Ramfs inode private data
 pub struct RamfsInodeData {
     /// Children (for directories) - maps name to inode
-    pub children: RwLock<Children>,
+    pub children: RwSem<Children>,
 
     /// Symlink target (symlinks only - stored inline, not in page cache)
     /// Symlinks are typically small, so inline storage is more efficient.
@@ -331,7 +335,7 @@ impl RamfsInodeData {
     /// Create empty file data (the data lives in the inode's mapping)
     pub fn new_file() -> Self {
         Self {
-            children: RwLock::new(Children::new()),
+            children: RwSem::new(Children::new()),
             symlink_target: None,
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
@@ -342,7 +346,7 @@ impl RamfsInodeData {
     /// Create directory data
     pub fn new_dir() -> Self {
         Self {
-            children: RwLock::new(Children::new()),
+            children: RwSem::new(Children::new()),
             symlink_target: None,
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
@@ -353,7 +357,7 @@ impl RamfsInodeData {
     /// Create symlink data (target stored inline)
     pub fn new_symlink(target: FileName) -> Self {
         Self {
-            children: RwLock::new(Children::new()),
+            children: RwSem::new(Children::new()),
             symlink_target: Some(target),
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
