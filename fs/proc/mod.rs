@@ -29,6 +29,7 @@
 mod array;
 mod mounts;
 mod opts;
+pub mod seq;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

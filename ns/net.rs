@@ -213,6 +213,15 @@ impl NetNamespace {
             .unwrap()
     }
 
+    /// This namespace's devices in registration order, while `g` is
+    /// held (Linux for_each_netdev_rcu)
+    pub fn devices_rcu<'a>(
+        &'a self,
+        g: &'a crate::sync::rcu::RcuReadGuard,
+    ) -> impl Iterator<Item = &'a NetDevice> + 'a {
+        self.devices.iter(g)
+    }
+
     /// References to this namespace's devices (registration order), for
     /// work done per device outside RCU
     pub fn devices(&self) -> Vec<Arc<NetDevice>> {
