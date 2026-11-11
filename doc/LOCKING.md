@@ -463,7 +463,10 @@ VFS locks (detailed order):
 Filesystem-internal locks (ramfs children: sleeping RwSem inside the
     directory's i_rwsem; ramfs data; procfs data, a leaf: held only to
     copy out what a lookup, readdir, readlink or read acts on, which
-    then runs unlocked; kernfs `KNode.children` sleeping RwSem,
+    then runs unlocked; never written after mount: the static tree is
+    built bottom-up before it is reachable, each directory's entries
+    given to its inode with no lock (`DirBuild`, Linux allocating each
+    proc_dir_entry before proc_register links it); kernfs `KNode.children` sleeping RwSem,
     `KNode.{parent,iattr}` spin leaves, 3.3 kernfs)
     ↓
 Leaves taken with no task lock held (their Arc is cloned out of the

@@ -320,16 +320,6 @@ impl ProcfsInodeData {
         }
     }
 
-    /// Get mutable children map
-    /// The children to add to, at mount (copied first if a readdir
-    /// holds them)
-    pub fn children_mut(&mut self) -> Option<&mut BTreeMap<String, Arc<Inode>>> {
-        match self {
-            Self::Directory { children } => Some(Arc::make_mut(children)),
-            _ => None,
-        }
-    }
-
     /// Generate content (for generator files)
     pub fn generate(&self) -> Option<Vec<u8>> {
         match self {
@@ -575,14 +565,6 @@ pub(crate) fn with_data<T>(inode: &Inode, f: impl FnOnce(&ProcfsInodeData) -> T)
     let w = p.as_ref().as_any().downcast_ref::<ProcfsInodeWrapper>()?;
     let d = w.0.read();
     Some(f(&d))
-}
-
-/// `with_data`, writable (the static tree while procfs is built)
-fn with_data_mut<T>(inode: &Inode, f: impl FnOnce(&mut ProcfsInodeData) -> T) -> Option<T> {
-    let p = inode.get_private()?;
-    let w = p.as_ref().as_any().downcast_ref::<ProcfsInodeWrapper>()?;
-    let mut d = w.0.write();
-    Some(f(&mut d))
 }
 
 /// The owner of a per-process inode follows the task's identity and
@@ -2252,56 +2234,100 @@ fn mk_inode(
     Ok(inode)
 }
 
-/// Child directory `name` of `dir`, created if missing
-fn subdir(sb: &Arc<SuperBlock>, dir: &Arc<Inode>, name: &str) -> Result<Arc<Inode>, KernelError> {
-    with_data_mut(dir, |data| {
-        let children = data.children_mut().expect("procfs dir");
-        if let Some(c) = children.get(name) {
-            return Ok(c.clone());
+/// A static directory while procfs is built: its inode, linked
+/// nowhere yet, and its entries, which become the inode's data in
+/// `finish`, before anything can reach it (Linux allocates each
+/// proc_dir_entry before proc_register links it under
+/// proc_subdir_lock), so nothing is added under the data's lock
+struct DirBuild {
+    inode: Arc<Inode>,
+    files: BTreeMap<String, Arc<Inode>>,
+    dirs: BTreeMap<String, DirBuild>,
+}
+
+impl DirBuild {
+    /// A new empty directory, its inode numbered now
+    fn new(sb: &Arc<SuperBlock>) -> Result<Self, KernelError> {
+        let inode = Inode::alloc(Inode::new(
+            sb.alloc_ino(),
+            InodeMode::directory(0o555),
+            0,
+            0,
+            0,
+            current_time(),
+            Arc::downgrade(sb),
+            &PROCFS_INODE_OPS,
+        ))?;
+        Ok(Self {
+            inode,
+            files: BTreeMap::new(),
+            dirs: BTreeMap::new(),
+        })
+    }
+
+    /// A new file `name` with `data`
+    fn file(
+        &mut self,
+        sb: &Arc<SuperBlock>,
+        name: &str,
+        mode: InodeMode,
+        data: ProcfsInodeData,
+    ) -> Result<(), KernelError> {
+        let i = mk_inode(sb, mode, data)?;
+        self.files.insert(String::from(name), i);
+        Ok(())
+    }
+
+    /// Subdirectory `name`, made if missing
+    fn dir(&mut self, sb: &Arc<SuperBlock>, name: &str) -> Result<&mut DirBuild, KernelError> {
+        use alloc::collections::btree_map::Entry;
+        Ok(match self.dirs.entry(String::from(name)) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(DirBuild::new(sb)?),
+        })
+    }
+
+    /// The directory's inode, its entries (subdirectories finished
+    /// first) now its data
+    fn finish(self) -> Result<Arc<Inode>, KernelError> {
+        let mut map = self.files;
+        for (name, d) in self.dirs {
+            map.insert(name, d.finish()?);
         }
-        let d = mk_inode(sb, InodeMode::directory(0o555), ProcfsInodeData::new_dir()?)?;
-        children.insert(String::from(name), d.clone());
-        Ok(d)
-    })
-    .expect("procfs dir")
+        let data = ProcfsInodeData::Directory {
+            children: try_arc(map)?,
+        };
+        self.inode
+            .set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
+        Ok(self.inode)
+    }
 }
 
 /// /proc/sysvipc (Linux ipc/util.c ipc_init_proc_interface): shm
-fn build_sysvipc(sb: &Arc<SuperBlock>, root: &Arc<Inode>) -> Result<(), KernelError> {
-    let dir = subdir(sb, root, "sysvipc")?;
-    let shm = mk_inode(
+fn build_sysvipc(sb: &Arc<SuperBlock>, root: &mut DirBuild) -> Result<(), KernelError> {
+    root.dir(sb, "sysvipc")?.file(
         sb,
+        "shm",
         InodeMode::regular(0o444),
         ProcfsInodeData::new_file(crate::ipc::shm::proc_sysvipc_shm),
-    )?;
-    with_data_mut(&dir, |d| {
-        if let Some(c) = d.children_mut() {
-            c.insert(String::from("shm"), shm);
-        }
-    })
-    .ok_or(KernelError::Io)
+    )
 }
 
 /// /proc/sys from the sysctl tables
-fn build_sys(sb: &Arc<SuperBlock>, root: &Arc<Inode>) -> Result<(), KernelError> {
-    let sys = subdir(sb, root, "sys")?;
+fn build_sys(sb: &Arc<SuperBlock>, root: &mut DirBuild) -> Result<(), KernelError> {
+    let sys = root.dir(sb, "sys")?;
     for ctl in crate::sysctl::tables().iter().flat_map(|t| t.iter()) {
         let (dirs, name) = ctl.path.rsplit_once('/').unwrap_or(("", ctl.path));
-        let mut d = sys.clone();
+        let mut d = &mut *sys;
         for part in dirs.split('/').filter(|p| !p.is_empty()) {
-            d = subdir(sb, &d, part)?;
+            d = d.dir(sb, part)?;
         }
-        let f = mk_inode(
+        d.file(
             sb,
+            name,
             InodeMode::regular(ctl.mode),
             ProcfsInodeData::Sysctl { ctl },
         )?;
-        with_data_mut(&d, |d| {
-            if let Some(c) = d.children_mut() {
-                c.insert(String::from(name), f);
-            }
-        })
-        .expect("procfs dir");
     }
     Ok(())
 }
@@ -2358,164 +2384,54 @@ fn procfs_mount(
     let sb = SuperBlock::new(fs_type, &PROCFS_SUPER_OPS, 0)?;
     sb.set_private(opts);
 
-    // Create root inode (directory)
-    let root_inode = Inode::alloc(Inode::new(
-        sb.alloc_ino(),
-        InodeMode::directory(0o555),
-        0, // uid: root
-        0, // gid: root
-        0,
-        current_time(),
-        Arc::downgrade(&sb),
-        &PROCFS_INODE_OPS,
-    ))?;
-    root_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::new_dir()?,
-    )))?);
-
-    // Create /proc/version
-    let version_inode = Inode::alloc(Inode::new(
-        sb.alloc_ino(),
-        InodeMode::regular(0o444),
-        0, // uid: root
-        0, // gid: root
-        0, // Size will be determined on read
-        current_time(),
-        Arc::downgrade(&sb),
-        &PROCFS_INODE_OPS,
-    ))?;
-    version_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::new_file(gen_version),
-    )))?);
-
+    // The static tree, built before it is reachable, in the order its
+    // inodes are numbered (the root is 1)
+    let mut root = DirBuild::new(&sb)?;
+    let file = ProcfsInodeData::new_file;
+    let ro = InodeMode::regular(0o444);
+    root.file(&sb, "version", ro, file(gen_version))?;
     // /proc/mounts -> self/mounts (Linux proc_symlink)
-    let mounts_inode = mk_inode(
+    root.file(
         &sb,
+        "mounts",
         InodeMode::symlink(),
         ProcfsInodeData::FixedLink(b"self/mounts"),
     )?;
+    root.file(&sb, "meminfo", ro, file(gen_meminfo))?;
+    root.file(&sb, "loadavg", ro, file(crate::task::loadavg::proc_loadavg))?;
 
-    let meminfo_inode = mk_inode(
-        &sb,
-        InodeMode::regular(0o444),
-        ProcfsInodeData::new_file(gen_meminfo),
-    )?;
-    let loadavg_inode = mk_inode(
-        &sb,
-        InodeMode::regular(0o444),
-        ProcfsInodeData::new_file(crate::task::loadavg::proc_loadavg),
-    )?;
-
-    // Create /proc/net (directory) with /proc/net/{dev,route}; contents follow
-    // the reader's network namespace
-    let net_dir_inode = Inode::alloc(Inode::new(
-        sb.alloc_ino(),
-        InodeMode::directory(0o555),
-        0,
-        0,
-        0,
-        current_time(),
-        Arc::downgrade(&sb),
-        &PROCFS_INODE_OPS,
-    ))?;
-    let mut net_dir = ProcfsInodeData::new_dir()?;
-    let net_dev_inode = Inode::alloc(Inode::new(
-        sb.alloc_ino(),
-        InodeMode::regular(0o444),
-        0,
-        0,
-        0,
-        current_time(),
-        Arc::downgrade(&sb),
-        &PROCFS_INODE_OPS,
-    ))?;
-    net_dev_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::new_file(crate::net::proc::proc_net_dev),
-    )))?);
-    let net_route_inode = Inode::alloc(Inode::new(
-        sb.alloc_ino(),
-        InodeMode::regular(0o444),
-        0,
-        0,
-        0,
-        current_time(),
-        Arc::downgrade(&sb),
-        &PROCFS_INODE_OPS,
-    ))?;
-    net_route_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::new_file(crate::net::proc::proc_net_route),
-    )))?);
-    let net_arp_inode = mk_inode(
-        &sb,
-        InodeMode::regular(0o444),
-        ProcfsInodeData::new_file(crate::net::arp::proc_net_arp),
-    )?;
-    if let Some(children) = net_dir.children_mut() {
-        children.insert(String::from("dev"), net_dev_inode);
-        children.insert(String::from("route"), net_route_inode);
-        children.insert(String::from("arp"), net_arp_inode);
-        let udp = mk_inode(
-            &sb,
-            InodeMode::regular(0o444),
-            ProcfsInodeData::new_file(crate::net::udp::proc_net_udp),
-        )?;
-        children.insert(String::from("udp"), udp);
-        let tcp = mk_inode(
-            &sb,
-            InodeMode::regular(0o444),
-            ProcfsInodeData::new_file(crate::net::tcp::info::proc_net_tcp),
-        )?;
-        children.insert(String::from("tcp"), tcp);
-        let unix = mk_inode(
-            &sb,
-            InodeMode::regular(0o444),
-            ProcfsInodeData::new_file(crate::net::unix::proc_net_unix),
-        )?;
-        children.insert(String::from("unix"), unix);
-        let packet = mk_inode(
-            &sb,
-            InodeMode::regular(0o444),
-            ProcfsInodeData::new_file(crate::net::packet::proc_net_packet),
-        )?;
-        children.insert(String::from("packet"), packet);
-    }
-    net_dir_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(net_dir)))?);
-
-    // Add files to root directory
-    {
-        with_data_mut(&root_inode, |data| -> Result<(), KernelError> {
-            if let Some(children) = data.children_mut() {
-                children.insert(String::from("version"), version_inode);
-                children.insert(String::from("mounts"), mounts_inode);
-                children.insert(String::from("meminfo"), meminfo_inode);
-                children.insert(String::from("loadavg"), loadavg_inode);
-                let slabinfo = mk_inode(
-                    &sb,
-                    InodeMode::regular(0o400),
-                    ProcfsInodeData::new_file(crate::mm::slab::slabinfo),
-                )?;
-                children.insert(String::from("slabinfo"), slabinfo);
-                children.insert(String::from("net"), net_dir_inode);
-                let parts = mk_inode(
-                    &sb,
-                    InodeMode::regular(0o444),
-                    ProcfsInodeData::new_file(crate::block::genhd::proc_partitions),
-                )?;
-                children.insert(String::from("partitions"), parts);
-                let cmdline = mk_inode(
-                    &sb,
-                    InodeMode::regular(0o444),
-                    ProcfsInodeData::new_file(gen_cmdline),
-                )?;
-                children.insert(String::from("cmdline"), cmdline);
-            }
-            Ok(())
-        })
-        .ok_or(KernelError::Io)??;
+    // /proc/net: contents follow the reader's network namespace
+    let net = root.dir(&sb, "net")?;
+    let net_files: [(&str, ContentGenerator); 7] = [
+        ("dev", crate::net::proc::proc_net_dev),
+        ("route", crate::net::proc::proc_net_route),
+        ("arp", crate::net::arp::proc_net_arp),
+        ("udp", crate::net::udp::proc_net_udp),
+        ("tcp", crate::net::tcp::info::proc_net_tcp),
+        ("unix", crate::net::unix::proc_net_unix),
+        ("packet", crate::net::packet::proc_net_packet),
+    ];
+    for (name, g) in net_files {
+        net.file(&sb, name, ro, file(g))?;
     }
 
-    build_sys(&sb, &root_inode)?;
-    build_sysvipc(&sb, &root_inode)?;
+    root.file(
+        &sb,
+        "slabinfo",
+        InodeMode::regular(0o400),
+        file(crate::mm::slab::slabinfo),
+    )?;
+    root.file(
+        &sb,
+        "partitions",
+        ro,
+        file(crate::block::genhd::proc_partitions),
+    )?;
+    root.file(&sb, "cmdline", ro, file(gen_cmdline))?;
+
+    build_sys(&sb, &mut root)?;
+    build_sysvipc(&sb, &mut root)?;
+    let root_inode = root.finish()?;
 
     // Create root dentry
     let root_dentry = try_arc(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
