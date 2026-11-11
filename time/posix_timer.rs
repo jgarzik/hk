@@ -27,7 +27,7 @@
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 use crate::util::pod::FromBytes;
-use alloc::collections::BTreeMap;
+use crate::util::rbtree::{RbTree, RbTreeNode, RbTreeNodeReservation};
 use alloc::sync::Arc;
 use core::pin::Pin;
 
@@ -158,8 +158,9 @@ impl PosixTimerInner {
 
 /// POSIX timer structure
 pub struct PosixTimer {
-    /// Unique timer ID within the process
-    timer_id: TimerT,
+    /// An itimer (ITIMER_VIRTUAL/PROF rearm themselves and signal the
+    /// process; ITIMER_REAL has its own callback)
+    itimer: bool,
     /// Clock ID (CLOCK_REALTIME or CLOCK_MONOTONIC)
     clockid: i32,
     /// Whom it signals (Linux it_pid, a counted struct pid): the
@@ -196,14 +197,13 @@ impl PosixTimer {
     /// group's leader pid, `it_real_fn`; the CPU ones the process whose
     /// thread runs them); `fire`: its hrtimer's callback
     fn itimer(
-        timer_id: TimerT,
         clockid: i32,
         sigevent: SigEvent,
         cpu: Option<crate::time::cpu_timer::CpuClock>,
         fire: fn(&HrTimer),
     ) -> Self {
         Self {
-            timer_id,
+            itimer: true,
             clockid,
             target: None,
             pid_type: PidType::Tgid,
@@ -220,7 +220,6 @@ impl PosixTimer {
     /// A timer on CPU clock `cpu` (if any); `sleeper`: clock_nanosleep's.
     /// ENOMEM
     fn with_cpu(
-        timer_id: TimerT,
         clockid: i32,
         owner_tid: Tid,
         sigevent: SigEvent,
@@ -228,13 +227,12 @@ impl PosixTimer {
         sleeper: bool,
     ) -> Result<Arc<Self>, KernelError> {
         Ok(Self::own_data(try_arc(Self::fresh(
-            timer_id, clockid, owner_tid, sigevent, cpu, sleeper,
+            clockid, owner_tid, sigevent, cpu, sleeper,
         ))?))
     }
 
     /// Its state, before it is in its Arc
     fn fresh(
-        timer_id: TimerT,
         clockid: i32,
         owner_tid: Tid,
         sigevent: SigEvent,
@@ -254,7 +252,7 @@ impl PosixTimer {
             .ok()
             .and_then(|n| crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, n));
         Self {
-            timer_id,
+            itimer: false,
             clockid,
             target,
             pid_type,
@@ -422,7 +420,7 @@ impl PosixTimer {
         if !i.armed || now < i.expires_ns {
             return None;
         }
-        let itimer = self.timer_id < 0 && !self.sleeper;
+        let itimer = self.itimer;
         match (now - i.expires_ns).checked_div(i.interval_ns) {
             Some(late) if itimer => {
                 i.expires_ns = i
@@ -739,10 +737,20 @@ fn posix_timer_fire(t: &HrTimer) {
     unsafe { &*(t.data() as *const PosixTimer) }.on_expire();
 }
 
-/// Per-process POSIX timer registry
+/// A registry node, allocated before the registry lock is taken
+type TimerNode = RbTreeNodeReservation<TimerT, Option<Arc<PosixTimer>>>;
+/// A node taken out under the lock, freed after it
+type TimerOut = RbTreeNode<TimerT, Option<Arc<PosixTimer>>>;
+
+/// Per-process POSIX timer registry (Linux signal->posix_timers and the
+/// posix_timers_hashtable entries of the process). A timer_create's
+/// id is held by a placeholder (None) until the timer is complete
+/// (Linux posix_timer_add hashes the timer with it_signal marked
+/// invalid): lookups skip it.
 pub struct PosixTimerRegistry {
-    /// Mapping from timer_id -> timer
-    timers: BTreeMap<TimerT, Arc<PosixTimer>>,
+    /// timer id -> timer; nodes come in reserved and go out to be freed
+    /// after the lock, so nothing allocates or frees under it
+    timers: RbTree<TimerT, Option<Arc<PosixTimer>>>,
     /// Next timer ID to allocate
     next_id: TimerT,
 }
@@ -751,7 +759,7 @@ impl PosixTimerRegistry {
     /// Create a new empty registry
     pub const fn new() -> Self {
         Self {
-            timers: BTreeMap::new(),
+            timers: RbTree::new(),
             next_id: 0,
         }
     }
@@ -759,33 +767,92 @@ impl PosixTimerRegistry {
     /// A free timer id, or None (EAGAIN) (Linux posix_timer_add)
     fn alloc_id(&mut self) -> Option<TimerT> {
         let timers = &self.timers;
-        next_free(&mut self.next_id, |id| timers.contains_key(&id))
+        next_free(&mut self.next_id, |id| timers.get(&id).is_some())
     }
 
-    /// Add a timer to the registry
-    fn add(&mut self, timer: Arc<PosixTimer>) {
-        self.timers.insert(timer.timer_id, timer);
+    /// Take an id for a timer being made, held by a placeholder in
+    /// `node` (Linux posix_timer_add); the node back if every id is
+    /// taken (EAGAIN)
+    fn reserve(&mut self, node: TimerNode) -> Result<TimerT, TimerNode> {
+        let Some(id) = self.alloc_id() else {
+            return Err(node);
+        };
+        self.timers.insert(node.into_node(id, None));
+        Ok(id)
     }
 
-    /// Get a timer by ID
+    /// The timer reserved as `id` is complete: visible from now on
+    /// (Linux do_timer_create's it_signal store); the timer back if its
+    /// placeholder is gone (an exec or the group's exit took it)
+    fn publish(&mut self, id: TimerT, t: Arc<PosixTimer>) -> Result<(), Arc<PosixTimer>> {
+        match self.timers.get_mut(&id) {
+            Some(slot @ None) => {
+                *slot = Some(t);
+                Ok(())
+            }
+            _ => Err(t),
+        }
+    }
+
+    /// The timer reserved as `id` failed: its placeholder out
+    fn unreserve(&mut self, id: TimerT) -> Option<TimerOut> {
+        if !matches!(self.timers.get(&id), Some(None)) {
+            return None;
+        }
+        self.timers.remove_node(&id)
+    }
+
+    /// Add complete timer `t` in `node` under a new id (one hold);
+    /// `node` back if every id is taken
+    fn insert(&mut self, node: TimerNode, t: Arc<PosixTimer>) -> Result<TimerT, TimerNode> {
+        let Some(id) = self.alloc_id() else {
+            return Err(node);
+        };
+        self.timers.insert(node.into_node(id, Some(t)));
+        Ok(id)
+    }
+
+    /// Get a timer by ID (none while it is being made)
     fn get(&self, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
-        self.timers.get(&timer_id).cloned()
+        self.timers.get(&timer_id)?.clone()
     }
 
-    /// Remove a timer by ID
-    fn remove(&mut self, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
-        self.timers.remove(&timer_id)
+    /// Take out timer `timer_id` if `f` accepts it (not one being made);
+    /// its node is freed after the lock
+    fn remove(&mut self, timer_id: TimerT, f: impl Fn(&PosixTimer) -> bool) -> Option<TimerOut> {
+        let t = self.timers.get(&timer_id).and_then(Option::as_deref);
+        if !t.is_some_and(f) {
+            return None;
+        }
+        self.timers.remove_node(&timer_id)
     }
 
-    /// Every timer, borrowed under the registry lock (cpu_timer's
+    /// Every complete timer, borrowed under the registry lock (cpu_timer's
     /// expiry pass)
     pub fn iter(&self) -> impl Iterator<Item = &Arc<PosixTimer>> {
-        self.timers.values()
+        self.timers.iter().filter_map(|(_, t)| t.as_ref())
+    }
+
+    /// All its timers taken out (the tree freed after the lock)
+    fn take(&mut self) -> RbTree<TimerT, Option<Arc<PosixTimer>>> {
+        core::mem::replace(&mut self.timers, RbTree::new())
+    }
+}
+
+/// The timer a removed node held (freeing the node: no lock held)
+fn node_timer(n: TimerOut) -> Option<Arc<PosixTimer>> {
+    n.to_key_value().1
+}
+
+/// Delete every timer of `tree` (no lock held), then free it
+fn delete_all(tree: RbTree<TimerT, Option<Arc<PosixTimer>>>) {
+    for t in tree.iter().filter_map(|(_, t)| t.as_ref()) {
+        t.delete();
     }
 }
 
 /// The next id from counter `next` that is not `taken`, clamped to
-/// 0..=INT_MAX (negative ids are the itimers'); None once every id was
+/// 0..=INT_MAX; None once every id was
 /// tried (Linux posix_timer_add: next_posix_timer_id & INT_MAX, skipping
 /// hashed ids)
 fn next_free(next: &mut TimerT, taken: impl Fn(TimerT) -> bool) -> Option<TimerT> {
@@ -803,9 +870,7 @@ fn next_free(next: &mut TimerT, taken: impl Fn(TimerT) -> bool) -> Option<TimerT
 /// threads raced) stop with its SignalStruct
 impl Drop for PosixTimerRegistry {
     fn drop(&mut self) {
-        for (_, t) in core::mem::take(&mut self.timers) {
-            t.delete();
-        }
+        delete_all(self.take());
     }
 }
 
@@ -820,18 +885,18 @@ fn with_timers<R>(t: &Task, f: impl FnOnce(&mut PosixTimerRegistry) -> R) -> Opt
     Some(r)
 }
 
-/// Create a new POSIX timer for a task
-///
-/// # Arguments
-/// * `me` - Owning task
-/// * `clockid` - CLOCK_REALTIME or CLOCK_MONOTONIC
-/// * `sigevent` - Notification settings (or None for default)
-///
+/// Create a new POSIX timer for task `me` on `clockid` with `sigevent`
+/// (None: the default) and store its id at `timerid` (Linux
+/// do_timer_create): its id is taken with a placeholder under the
+/// registry lock, the timer made and the id copied out with no lock
+/// held, then the timer made visible, or the placeholder removed on an
+/// error (the id is never visible as a timer that does not exist)
 pub fn create_posix_timer(
     me: &Task,
     clockid: i32,
     sigevent: Option<SigEvent>,
-) -> Result<TimerT, KernelError> {
+    timerid: UserPtr<TimerT>,
+) -> Result<(), KernelError> {
     // Realtime, monotonic, boottime and TAI; the alarm clocks need
     // CAP_WAKE_ALARM (EPERM); CPU clocks of the caller's own process or
     // its threads (Linux also takes other processes': BUGS.md)
@@ -878,18 +943,52 @@ pub fn create_posix_timer(
         _ => me.tid(),
     };
 
-    // The id, then the timer and its signal entry outside the registry
-    // lock (Linux posixtimer_init_sigqueue: EAGAIN past
-    // RLIMIT_SIGPENDING), then the timer in the registry
-    let id = with_timers(me, |reg| reg.alloc_id())
-        .flatten()
-        .ok_or(KernelError::WouldBlock)?;
+    // The id with its placeholder (the node allocated first: Linux
+    // alloc_posix_timer's EAGAIN), then the timer and its signal entry
+    // outside the registry lock (Linux posixtimer_init_sigqueue: EAGAIN
+    // past RLIMIT_SIGPENDING) and the id copied out, then the timer in
+    // its place
+    let node = TimerNode::new().map_err(|_| KernelError::WouldBlock)?;
+    // A node back (no id free) is freed here, after the lock
+    let Some(Ok(id)) = with_timers(me, |reg| reg.reserve(node)) else {
+        return Err(KernelError::WouldBlock);
+    };
     if default_value {
         // Linux: sival_int = the timer id
         sev.sigev_value = u64::from(id as u32);
     }
-    let t = PosixTimer::with_cpu(id, clockid, owner, sev, cpu, false)?;
-    if sev.sigev_notify == SIGEV_THREAD_ID && !t.target_in_group() {
+    let made = make_timer(id, clockid, owner, sev, cpu, sig).and_then(|t| {
+        timerid.write(&id)?;
+        Ok(t)
+    });
+    match made {
+        Ok(t) => {
+            // An exec or the group's exit took the placeholder: as if
+            // deleted at once
+            if let Some(Err(t)) = with_timers(me, |reg| reg.publish(id, t)) {
+                t.delete();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _gone = with_timers(me, |reg| reg.unreserve(id));
+            Err(e)
+        }
+    }
+}
+
+/// The timer for id `id` and its signal entry if it signals `sig`
+fn make_timer(
+    id: TimerT,
+    clockid: i32,
+    owner: Tid,
+    sev: SigEvent,
+    cpu: Option<crate::time::cpu_timer::CpuClock>,
+    sig: Option<Signal>,
+) -> Result<Arc<PosixTimer>, KernelError> {
+    let t = PosixTimer::with_cpu(clockid, owner, sev, cpu, false)
+        .map_err(|_| KernelError::WouldBlock)?;
+    if sev.sigev_notify == sigev_notify::SIGEV_THREAD_ID && !t.target_in_group() {
         return Err(KernelError::InvalidArgument);
     }
     if let Some(sig) = sig {
@@ -903,8 +1002,7 @@ pub fn create_posix_timer(
         let q = q.ok_or(KernelError::WouldBlock)?;
         *t.sigq.lock() = Some(q);
     }
-    with_timers(me, |reg| reg.add(t)).ok_or(KernelError::WouldBlock)?;
-    Ok(id)
+    Ok(t)
 }
 
 /// CPU clock `clockid` if it is the caller's own process or one of its
@@ -953,15 +1051,14 @@ pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (Kern
         sigev_notify: sigev_notify::SIGEV_NONE,
         ..SigEvent::default()
     };
-    let t = match with_timers(&me, |reg| {
-        let id = reg.alloc_id().ok_or(KernelError::WouldBlock)?;
-        let t = PosixTimer::with_cpu(id, clockid, tid, sev, Some(c), true)?;
-        reg.add(t.clone());
-        Ok(t)
-    }) {
-        Some(Ok(t)) => t,
-        Some(Err(e)) => return Err((e, 0)),
-        None => return Err((crate::util::error::KernelError::InvalidArgument, 0)),
+    // The timer and its node before the registry lock, inserted in one
+    // hold
+    let node = TimerNode::new().map_err(|e| (e, 0))?;
+    let t = PosixTimer::with_cpu(clockid, tid, sev, Some(c), true).map_err(|e| (e, 0))?;
+    let id = match with_timers(&me, |reg| reg.insert(node, t.clone())) {
+        Some(Ok(id)) => id,
+        Some(Err(_node)) => return Err((KernelError::WouldBlock, 0)),
+        None => return Err((KernelError::InvalidArgument, 0)),
     };
     let spec = ITimerSpec::from_ns(value_ns, 0);
     let r = if value_ns == 0 && !abs {
@@ -974,7 +1071,7 @@ pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (Kern
         Some(now) => t.cpu_expiry().map_or(0, |at| at.saturating_sub(now)),
         None => 0,
     };
-    let _ = with_timers(&me, |reg| reg.remove(t.timer_id));
+    let _gone = with_timers(&me, |reg| reg.remove(id, |_| true));
     t.delete();
     r.map_err(|e| (e, left))
 }
@@ -996,7 +1093,8 @@ fn user_timer(t: &Task, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
 
 /// Delete task `t`'s POSIX timer: EINVAL if there is none
 pub fn delete_posix_timer(t: &Task, timer_id: TimerT) -> Result<(), KernelError> {
-    let timer = with_timers(t, |reg| reg.remove(timer_id)).flatten();
+    let node = with_timers(t, |reg| reg.remove(timer_id, |t| !t.sleeper)).flatten();
+    let timer = node.and_then(node_timer);
     timer.ok_or(KernelError::InvalidArgument)?.delete();
     Ok(())
 }
@@ -1016,10 +1114,8 @@ pub fn exit_itimers(sig: &crate::signal::SignalStruct) {
 /// is taken out under its lock, the timers deleted after it
 /// (cancel_sync waits out a running callback).
 pub fn exec_timers(sig: &crate::signal::SignalStruct) {
-    let timers = core::mem::take(&mut sig.posix_timers.lock().timers);
-    for (_, t) in timers {
-        t.delete();
-    }
+    let timers = sig.posix_timers.lock().take();
+    delete_all(timers);
 }
 
 // =============================================================================
@@ -1043,13 +1139,7 @@ pub fn sys_timer_create(
     } else {
         Some(sevp.read()?)
     };
-    let timer_id = create_posix_timer(&me, clockid, sigevent)?;
-    if !timerid.is_null() && timerid.write(&timer_id).is_err() {
-        // Linux releases the new timer if the ID cannot be stored
-        let _ = delete_posix_timer(&me, timer_id);
-        return Err(KernelError::BadAddress);
-    }
-    Ok(())
+    create_posix_timer(&me, clockid, sigevent, timerid)
 }
 
 /// timer_settime(timerid, flags, new_value, old_value)
@@ -1118,11 +1208,6 @@ pub fn sys_timer_delete(timerid: TimerT) -> KernelResult<()> {
 // user + system) sending SIGVTALRM and SIGPROF to the process
 // (`cpu_timer::run`, after the registry's timers).
 
-/// The itimers' ids (user timer ids are >= 0): they mark a timer as one
-const ITIMER_REAL_ID: TimerT = -1;
-const ITIMER_VIRTUAL_ID: TimerT = -2;
-const ITIMER_PROF_ID: TimerT = -3;
-
 /// setitimer(2) `which`: real time (SIGALRM)
 pub const ITIMER_REAL: i32 = 0;
 const ITIMER_VIRTUAL: i32 = 1;
@@ -1146,7 +1231,7 @@ impl ITimers {
     /// ITIMER_REAL's callback reaches the SignalStruct through it.
     pub unsafe fn new() -> Self {
         use crate::time::cpu_timer::{CpuClock, Sample};
-        let cpu = |id, sample, sig: Signal| {
+        let cpu = |sample, sig: Signal| {
             let sev = SigEvent {
                 sigev_signo: sig.into(),
                 sigev_notify: sigev_notify::SIGEV_SIGNAL,
@@ -1157,14 +1242,14 @@ impl ITimers {
                 sample,
             };
             // CLOCK_PROCESS_CPUTIME_ID
-            PosixTimer::itimer(id, 2, sev, Some(clock), posix_timer_fire)
+            PosixTimer::itimer(2, sev, Some(clock), posix_timer_fire)
         };
         Self {
             // CLOCK_MONOTONIC
-            real: PosixTimer::itimer(ITIMER_REAL_ID, 1, SigEvent::default(), None, it_real_fn),
+            real: PosixTimer::itimer(1, SigEvent::default(), None, it_real_fn),
             cpu: [
-                cpu(ITIMER_VIRTUAL_ID, Sample::Virt, crate::signal::SIGVTALRM),
-                cpu(ITIMER_PROF_ID, Sample::Prof, crate::signal::SIGPROF),
+                cpu(Sample::Virt, crate::signal::SIGVTALRM),
+                cpu(Sample::Prof, crate::signal::SIGPROF),
             ],
         }
     }
@@ -1313,7 +1398,7 @@ mod tests {
     use super::*;
 
     /// Ids count up from the counter, skip ones in use, and wrap from
-    /// INT_MAX to 0, never negative (the itimers' ids)
+    /// INT_MAX to 0, never negative
     #[test]
     fn ids_clamp_and_skip() {
         let mut next = 0;
