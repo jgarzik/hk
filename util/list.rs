@@ -501,6 +501,19 @@ impl<A: Adapter> BoxList<A> {
             .map(|p| unsafe { Box::from_raw(p.cast_mut()) })
     }
 
+    /// Unlink `item` and hand it back
+    ///
+    /// # Safety
+    /// `item` is on this list.
+    pub unsafe fn remove(&mut self, item: &A::Item) -> Box<A::Item> {
+        let p = core::ptr::from_ref::<A::Item>(item);
+        // SAFETY: on this list (the caller), which owns it from into_raw
+        unsafe {
+            self.list.remove(p);
+            Box::from_raw(p.cast_mut())
+        }
+    }
+
     /// Unlink and return the first entry `f` picks
     pub fn remove_first(&mut self, f: impl Fn(&A::Item) -> bool) -> Option<Box<A::Item>> {
         let p = core::ptr::from_ref(self.list.iter().find(|i| f(i))?);
