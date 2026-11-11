@@ -20,7 +20,8 @@
 //! ## Locking (doc/LOCKING.md 3.10, Block Device Subsystem)
 //!
 //! - `BLKDEV_REGISTRY` (spin `RwLock`, thread context, leaf): dev_t ->
-//!   block device. `MAJORS` (spin `Mutex`, leaf): block major numbers.
+//!   block device. `MAJORS` (sleeping `sync::Mutex`, Linux
+//!   major_names_lock): block major numbers.
 //! - `Disk.open_mutex` (sleeping `sync::Mutex`, Linux disk->open_mutex):
 //!   serializes opens, releases and partition rescans; I/O and devtmpfs
 //!   node updates happen under it.
@@ -39,7 +40,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::IrqSpinlock;
 use crate::sync::completion::Completion;
-use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::spin::RwLock;
 
 pub use crate::fs::chardev::{DevId, DevMajor, DevMinor};
 use crate::mm::writeback::{BdiWriteback, bdi_register, bdi_unregister};
@@ -78,7 +79,10 @@ pub const BLK_DEF_MAX_SECTORS_CAP: u32 = (4 << 20) >> SECTOR_SHIFT;
 /// Highest major handed out dynamically (Linux searches 254 down to 1)
 const DYN_MAJOR_MAX: DevMajor = 254;
 
-static MAJORS: Mutex<BTreeMap<DevMajor, &'static str>> = Mutex::new(BTreeMap::new());
+/// Block majors in use (Linux major_names, under the major_names_lock
+/// mutex)
+static MAJORS: crate::sync::Mutex<BTreeMap<DevMajor, &'static str>> =
+    crate::sync::Mutex::new(BTreeMap::new());
 
 /// Register block major `major` for `name`; 0 picks the highest free
 /// one (Linux register_blkdev). Returns the major.
@@ -1389,6 +1393,7 @@ pub fn blkdev_issue_flush(bdev: &BlockDevice) -> Result<(), KernelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::spin::Mutex;
 
     fn bio(sector: u64) -> Box<Bio> {
         Bio::new(BioOp::Read, sector)

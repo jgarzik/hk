@@ -15,7 +15,7 @@ use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
 use crate::fs::File;
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
-use crate::sync::spin::RwLock;
+use crate::sync::RwSem;
 use crate::util::error::KernelError;
 use crate::util::kalloc::arc_nofail;
 use alloc::collections::BTreeMap;
@@ -252,8 +252,10 @@ impl CharDeviceRegistry {
     }
 }
 
-/// Global character device registry instance
-pub static CHARDEV_REGISTRY: RwLock<CharDeviceRegistry> = RwLock::new(CharDeviceRegistry::new());
+/// Global character device registry instance (Linux chrdevs and
+/// cdev_map, each under a mutex: chrdevs_lock, cdev_map->lock):
+/// registration at probe, lookup at open and mmap, all thread context
+pub static CHARDEV_REGISTRY: RwSem<CharDeviceRegistry> = RwSem::new(CharDeviceRegistry::new());
 
 /// Register a character device globally
 pub fn register_chardev(id: DevId, device: Arc<dyn CharDevice>) -> Result<(), KernelError> {
