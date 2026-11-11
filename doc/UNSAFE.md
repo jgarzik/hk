@@ -49,7 +49,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | RCU callback head `RcuHead` / `HasRcuHead`, `call_rcu` (`sync/rcu.rs`, Linux rcu_head) | embedded queue node, claimed once |
 | repeated deferred put `RcuPuts` / `HasRcuPuts`, `put_rcu` (`sync/rcu.rs`) | embedded counted queue node |
 | RCU nulls hash bucket `NullsHead` / `NullsGuard` / `NullsRef` / `NullsUnlinked` (`util/hlist_nulls.rs`, Linux hlist_nulls) | owning intrusive container, lockless readers, grace-period-held references |
-| hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box` or `Arc`: `BoxList`, `ArcList`) (`util/list.rs`) | owning intrusive containers, membership checked |
+| hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box`, `Arc` or `&'static`: `BoxList`, `ArcList`) (`util/list.rs`), RCU list `RcuList` and hash chain `RcuHList` with `RcuRef` and `RcuUnlinked` (`util/rculist.rs`, Linux rculist.h) | owning intrusive containers, membership checked |
 
 Make each wrapper `#[inline]`: it must compile to the same code as the
 open-coded `unsafe` it replaces.

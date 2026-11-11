@@ -385,7 +385,8 @@ impl<'a, A: Adapter> Iterator for Iter<'a, A> {
 }
 
 /// An owning pointer a [`PtrList`] can hold as a raw pointer: `Box`
-/// (the list owns the entry) or `Arc` (the list owns one reference)
+/// (the list owns the entry), `Arc` (the list owns one reference) or a
+/// `&'static` (an item that is never freed)
 ///
 /// # Safety
 /// `into_raw` hands over ownership as a pointer to the live value
@@ -423,6 +424,20 @@ unsafe impl<T> ListPtr for Arc<T> {
     unsafe fn from_raw(p: *const T) -> Self {
         // SAFETY: from `into_raw` (the caller), taken back once
         unsafe { Arc::from_raw(p) }
+    }
+}
+
+// SAFETY: a static item lives and stays put forever; the "pointer" is
+// the reference itself
+unsafe impl<T> ListPtr for &'static T {
+    #[inline]
+    fn into_raw(this: Self) -> *const T {
+        this
+    }
+    #[inline]
+    unsafe fn from_raw(p: *const T) -> Self {
+        // SAFETY: from `into_raw` of a `&'static T` (the caller)
+        unsafe { &*p }
     }
 }
 

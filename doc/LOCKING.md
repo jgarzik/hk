@@ -276,13 +276,20 @@ as `RcuRetired`, released after a grace period when it drops
 (synchronize_rcu; it panics in atomic context, where it would wait for
 its own CPU or, with one CPU, not at all). Updaters serialize under
 their own lock. `util::rculist::RcuList` (Linux rculist.h) is an
-intrusive list of `Arc` entries: readers walk it under a guard (Acquire
-loads of `next`), writers take its own spin leaf (`ends`), and an entry
-unlinked keeps its `next` for readers standing on it and comes back as
-`RcuUnlinked`, whose drop waits for a grace period, frees the link and
-drops the list's reference (list_del_rcu + synchronize_rcu). The
-owner's teardown takes the entries off through `&mut` (`drain`: no
-reader or writer is left, so no grace period).
+intrusive list of `Arc` (or `&'static`) entries: readers walk it under
+a guard (Acquire loads of `next`; `RcuRef::get` takes a reference to an
+entry found), writers take its own spin leaf (`ends`) and insert at the
+tail, before or after an entry chosen under it, or replace one in
+place (list_add_tail_rcu, list_add_rcu at a position,
+list_replace_rcu); an entry unlinked keeps its `next` for readers
+standing on it and comes back as `RcuUnlinked`, whose drop waits for a
+grace period, frees the link and drops the list's reference
+(list_del_rcu + synchronize_rcu). The owner's teardown takes the
+entries off through `&mut` (`drain`: no reader or writer is left, so
+no grace period). `RcuHList` (Linux hlist_head, _rcu ops) is a hash
+chain with no lock of its own: its writers pass the `UniqueOwner` data
+of the lock they hold (1.4.1's `LockedBy` proof), so a table of chains
+under one lock costs a pointer per bucket.
 
 Quiescent states, per CPU: a context switch (recorded under the rq
 lock, reported later), each idle-loop pass, and a clock interrupt that
