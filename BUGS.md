@@ -58,7 +58,9 @@ io.stat report zeros. When they are applied, use Linux's shapes: CPU
 bandwidth under the bandwidth lock (cfs_b->lock, an IrqSpinlock: the
 period timer), memory by page_counter_try_charge (add, check, roll
 back up the hierarchy), the IO token bucket under the queue's lock
-(blk-throttle), freezing under cgroup_mutex.
+(blk-throttle), freezing under cgroup_mutex. io.max takes any MAJ:MIN
+(`cgroup/io.rs` `io_max_write`); Linux resolves it to a live whole
+disk first (blkg_conf_open_bdev: ENODEV otherwise).
 
 ## user/ does not follow doc/UNSAFE.md
 
