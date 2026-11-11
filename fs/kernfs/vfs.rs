@@ -178,10 +178,11 @@ struct SeqBuf {
     read_pos: u64,
 }
 
-/// An open directory: the key of the last entry readdir returned
-/// (spin leaf)
+/// An open directory: the last entry readdir returned and its hash
+/// (spin leaf; Linux keeps the node itself, kernfs_get, in
+/// private_data: nothing copied under the lock)
 struct OpenDir {
-    last: SpinMutex<Option<(u32, u64, Vec<u8>)>>,
+    last: SpinMutex<Option<(u32, Arc<KNode>)>>,
 }
 
 /// An open attribute (Linux kernfs_open_file)
@@ -464,10 +465,10 @@ impl FileOps for KernfsFops {
                 continue;
             }
             let name = n.name();
-            if let Some(l) = &last
-                && h == l.0
+            if let Some((lh, ln)) = &last
+                && h == *lh
             {
-                if (n.ns, &name) <= (l.1, &l.2) {
+                if (n.ns, n.name_bytes()) <= (ln.ns, ln.name_bytes()) {
                     continue;
                 }
                 ctx.pos = u64::from(h);
@@ -486,7 +487,9 @@ impl FileOps for KernfsFops {
                 return Ok(());
             }
             if let Some(o) = &od {
-                *o.last.lock() = Some((h, n.ns, name));
+                // The node it replaces is dropped after the lock
+                let old = o.last.lock().replace((h, n.clone()));
+                drop(old);
             }
         }
         // Past the last entry (Linux INT_MAX)

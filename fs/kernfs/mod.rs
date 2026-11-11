@@ -266,6 +266,11 @@ impl KNode {
         self.name.clone()
     }
 
+    /// The name, borrowed (fixed at creation)
+    pub fn name_bytes(&self) -> &[u8] {
+        &self.name
+    }
+
     pub fn parent(&self) -> Option<Arc<KNode>> {
         self.parent.read().upgrade()
     }
