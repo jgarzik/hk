@@ -20,6 +20,8 @@ const FIRST: usize = 4096;
 pub struct SeqBuf {
     buf: Vec<u8>,
     overflow: bool,
+    /// End of the record being padded (Linux pad_until)
+    pad_until: usize,
 }
 
 impl SeqBuf {
@@ -28,12 +30,31 @@ impl SeqBuf {
         Self {
             buf: Vec::with_capacity(size),
             overflow: false,
+            pad_until: 0,
         }
     }
 
     /// The text did not fit (Linux seq_has_overflowed)
     pub fn has_overflowed(&self) -> bool {
         self.overflow
+    }
+
+    /// The record that starts now is padded to `width` columns by
+    /// [`pad`](Self::pad) (Linux seq_setwidth)
+    pub fn setwidth(&mut self, width: usize) {
+        self.pad_until = self.buf.len() + width;
+    }
+
+    /// Spaces up to the width set, then `c` (Linux seq_pad)
+    pub fn pad(&mut self, c: char) {
+        const SPACES: &str = "                                ";
+        let mut n = self.pad_until.saturating_sub(self.buf.len());
+        while n > 0 && !self.overflow {
+            let k = n.min(SPACES.len());
+            let _ = fmt::Write::write_str(self, &SPACES[..k]);
+            n -= k;
+        }
+        let _ = fmt::Write::write_char(self, c);
     }
 }
 
@@ -88,6 +109,19 @@ mod tests {
             let _ = write!(m, "short");
         });
         assert_eq!(out, b"short");
+    }
+
+    /// A padded record fills its width, then ends with the character
+    #[test]
+    fn pad_to_width() {
+        let mut m = SeqBuf::with_size(64);
+        m.setwidth(8);
+        let _ = m.write_str("ab");
+        m.pad('\n');
+        m.setwidth(2);
+        let _ = m.write_str("long");
+        m.pad('\n');
+        assert_eq!(m.buf, b"ab      \nlong\n");
     }
 
     /// A write that does not fit is dropped whole and marks overflow

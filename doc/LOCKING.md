@@ -4255,7 +4255,7 @@ not rely on either.
 | `RTNL` (`net/rtnl.rs`) | `sync::Mutex<()>` (sleeping, Linux rtnl_mutex) | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes, neighbour entries, device naming + registration via `alloc_netdev`/`register_netdev`) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Never taken while any spinlock is held (a socket's last close, which may take it for AF_PACKET memberships, runs only after the fd table lock is dropped). Holders may sleep (user copies such as SIOCADDRT's `rt_dev` name, like Linux rtentry_to_fib_config; driver open/stop waiting for NAPI) but never take a socket lock (`sk_lock`) and never wait for packets |
 | `NetNamespace.devices` | `RcuList` (Linux dev_base_head) | readers under RCU, any context; writers thread only | registration and unlisting run under RTNL (or before the namespace is listed) and take the list's leaf writer lock; lookups (`get_device`, `dev_get_by_index`) walk it under RCU and take a reference, no lock, no copy; `/proc/net/dev` formats under the guard into a `SeqBuf` (fs/proc/seq.rs, Linux seq_file: a fixed buffer, the walk rerun into a doubled one on overflow), allocating nothing inside; `devices()` references every device for work done per device; unlisting returns after a grace period (Linux synchronize_net), so no reader still walks over the device |
 | `NetNamespace.loopback`, `UdpTable.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes); the UDP port table reads each candidate's `Inet.addr` under its lock |
-| `Fib.tables` (`net/inet/fib.rs`, per netns) | `spin::RwLock` | thread only | leaf; written only under RTNL; read by input/output routing (softnet, socket syscalls, possibly under `sk_lock`) and dumps; returns `Arc<FibEntry>` clones; notifications are sent after the guard is dropped |
+| `Fib.tables`, `FibTable.entries` (`net/inet/fib.rs`, per netns; Linux fib_table_hash, a table's aliases) | `RcuList`s (their `ends` spin leaves) | readers under RCU, any context; writers thread only | changed only under RTNL (Linux fib_table_insert/delete): a route goes in at its sorted place (`insert_before`/`insert_after`) or takes an old one's (`replace`, NLM_F_REPLACE); one removed or replaced is freed after a grace period (`RcuUnlinked::defer`, Linux alias_free_mem_rcu). Input/output routing (softnet, socket syscalls, possibly under `sk_lock`) walks them under `rcu::read_lock` and takes a reference to the route it returns; route dumps fill an `NlBuf` and /proc/net/route a `SeqBuf` under the guard; notifications are built outside it. Tables are never removed while the namespace lives |
 | `InDevice.ifa_list` (`NetDevice.ip_ptr`, Linux in_device ifa_list; IPv6 later), `ifaddr::INET_ADDR_LST` (Linux inet_addr_lst: 256 chains by namespace and local address) | `RcuList`s (their `ends` spin leaves) | readers under RCU, any context; writers thread only | changed only under RTNL (`inet::ifaddr`): an address is inserted at its place (a primary after the last primary of its scope, a secondary last: `insert_after`) and on its hash chain, and unlinked from both and freed after a grace period with one callback (`RcuUnlinked::defer_with`, Linux inet_free_ifa); NLM_F_REPLACE changes its `flags`/`rt_priority`/`proto` atomics in place. Readers (source selection on transmit, possibly under a socket lock; `ip_dev_find`; address dumps filling an `NlBuf`) walk under `rcu::read_lock`, no lock, no copy |
 | `NeighTable.hash` (`net/core/neigh.rs`; `NetNamespace.arp`, IPv6 ND later) | `spin::RwLock` | thread only (softnet, socket output, ktimers/N) | (ifindex, address) -> `Arc<Neighbour>`; lookups drop the guard; GC/flush take each entry's `inner` under the write lock (order hash -> inner) |
 | `Neighbour.inner` | `spin::Mutex` | thread only | leaf: NUD state + bounded unresolved queue (unres_qlen_bytes). Never held while transmitting, soliciting, reporting errors or arming the neighbour `Alarm` (the next deadline is read under it, armed after): state changes return actions run after the unlock |
@@ -4307,8 +4307,8 @@ RTNL (sleeping; configuration)   TcpSock.rd (sleeping) -> TcpSock.cb (listener b
   |                                 -> TcpSock.queue / RxQueue.q
   |                                 -> TCP TIMERS (leaf); Alarm.st -> timer base
   v                                 |
-NetNamespace tables, Fib.tables (RwLocks; lookups drop the guard before
-  returning); address lists (RCU readers; writers under RTNL take the
+NetNamespace tables (RwLocks; lookups drop the guard before returning);
+  address lists, FIB tables (RCU readers; writers under RTNL take the
   lists' leaf `ends`)
   -> NeighTable.hash -> Neighbour.inner (dropped before any transmit)
   (RawTable.socks -> Inet.addr; FragTable.st, PmtuCache.m, IcmpRate.st,
@@ -4318,7 +4318,8 @@ NetNamespace tables, Fib.tables (RwLocks; lookups drop the guard before
    -> UnixSock.addr; UnixSock.iolock (sleeping) -> UnixSock.st (listener
    before connector, else by address) -> UnixSock.rq / peercred / addr /
    INFLIGHT; UnixSock.relay leaf)
-  (NlSock.dump -> devices/FIB/ARP snapshots -> NlSock.rxq: dump parts)
+  (NlSock.dump -> RCU walks of devices, addresses, FIB; ARP snapshot
+   -> NlSock.rxq: dump parts)
   (AF_PACKET taps, from any receive or transmit path: PacketTable.socks,
    then PacketSock.filter / PacketSock.rxq, each a leaf;
    RTNL -> PacketSock.mclist)
@@ -4435,9 +4436,6 @@ takes FIB/neighbour/device-TX leaves and `lo` queues to the receive
 backlog instead of delivering inline; the loopback flush
 (`netif_rx_flush_local`) runs only at the end of socket calls, with no
 lock held. A TIME_WAIT entry transmits under its `inner` the same way.
-
-**Known gaps (later phases):** RCU for the FIB (its tables are still a
-spin `RwLock` read through `Arc` copies).
 
 #### Key Device Driver Rules
 

@@ -116,25 +116,26 @@ impl NetNamespace {
     pub fn new() -> Result<Arc<Self>, KernelError> {
         // The device first: nothing to undo but itself
         let lo = try_arc(loopback_device(try_arc(LoopbackOps)?))?;
-        let ns = try_arc(Self::fresh(super::inum::Inum::alloc()?))?;
+        let ns = try_arc(Self::fresh(super::inum::Inum::alloc()?)?)?;
         Ok(Self::attach(ns, lo))
     }
 
     /// The initial namespace (boot: failure cannot be reported)
     fn new_init() -> Arc<Self> {
-        let ns = arc_nofail(Self::fresh(super::inum::Inum::fixed(super::inum::NET_INIT)));
+        let ns = Self::fresh(super::inum::Inum::fixed(super::inum::NET_INIT));
+        let ns = arc_nofail(ns.expect("init_net: no memory at boot"));
         let lo = arc_nofail(loopback_device(arc_nofail(LoopbackOps)));
         Self::attach(ns, lo)
     }
 
     /// A namespace's state, before it is listed and has its loopback
-    fn fresh(inum: super::inum::Inum) -> Self {
-        Self {
+    fn fresh(inum: super::inum::Inum) -> Result<Self, KernelError> {
+        Ok(Self {
             id: NEXT_NET_ID.fetch_add(1, Ordering::Relaxed),
             inum,
             devices: RcuList::new(),
             next_ifindex: AtomicU32::new(1),
-            fib: Fib::new(),
+            fib: Fib::new()?,
             nl: Default::default(),
             tcp: Default::default(),
             udp: UdpTable::default(),
@@ -155,7 +156,7 @@ impl NetNamespace {
             ],
             arp: crate::net::neigh::NeighTable::new(&crate::net::arp::ARP_OPS),
             loopback: RwLock::new(None),
-        }
+        })
     }
 
     /// List `ns` and give it its loopback device `lo`

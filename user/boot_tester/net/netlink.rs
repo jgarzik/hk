@@ -1145,7 +1145,8 @@ fn route_dump(nl: &mut Nl, second: bool) -> (u32, bool, i32, i64) {
 }
 
 /// A dump larger than the receive buffer continues as it is read (all
-/// entries arrive, DONE last); a second dump while one runs is EBUSY
+/// entries arrive, DONE last); a second dump while one runs is EBUSY;
+/// /proc/net/route, larger than a page, lists every route
 fn test_dump_resume() {
     const N: &[u8] = b"NL_DUMP_RESUME";
     let (Some(mut cfg), Some(mut small), Some(mut nl)) = (Nl::open(), Nl::open(), Nl::open())
@@ -1174,6 +1175,7 @@ fn test_dump_resume() {
     }
     let (seen, done, err, parts) = route_dump(&mut small, false);
     let (seen2, done2, busy, _) = route_dump(&mut nl, true);
+    let (proc_len, proc_seen) = proc_routes();
     for i in 0..N_ROUTES {
         route(&mut cfg, false, many_route(i), 32, [0; 4], 1, 0);
     }
@@ -1189,7 +1191,37 @@ fn test_dump_resume() {
     if !expect(N, b"second dump", busy, EBUSY) {
         return;
     }
+    if proc_len <= 4096 || proc_seen != N_ROUTES {
+        print_num(proc_len);
+        return fail_why(N, b"/proc/net/route", proc_seen as i64);
+    }
     pass(N);
+}
+
+const PROC_ROUTE_LEN: usize = 65536;
+static mut PROC_ROUTE: [u8; PROC_ROUTE_LEN] = [0; PROC_ROUTE_LEN];
+
+/// /proc/net/route (more than a page with our routes): its length and
+/// how many of our 10.99/16 routes it lists (Destination is the raw
+/// network-order word in hex: little-endian "....630A")
+fn proc_routes() -> (i64, u32) {
+    // SAFETY: single-threaded test program; no other user of the buffer
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(PROC_ROUTE) };
+    let n = crate::helpers::read_file(b"/proc/net/route\0", buf);
+    if n <= 0 {
+        return (n, 0);
+    }
+    let mut seen = 0;
+    for line in buf[..n as usize].split(|&c| c == b'\n') {
+        let mut f = line.split(|&c| c == b'\t');
+        let (Some(_), Some(dst)) = (f.next(), f.next()) else {
+            continue;
+        };
+        if dst.len() == 8 && &dst[4..] == b"630A" {
+            seen += 1;
+        }
+    }
+    (n, seen)
 }
 
 /// Change lo's MTU (one RTM_NEWLINK notification each)

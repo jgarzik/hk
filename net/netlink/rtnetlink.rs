@@ -396,13 +396,17 @@ impl DumpCb for RtDump {
                 })
             }
             DumpKind::Route(table) => {
-                let rts: Vec<Arc<FibEntry>> = net
+                // Linux inet_dump_fib: the tables walked under RCU, each
+                // route filled into the part as it is reached
+                let g = crate::sync::rcu::read_lock();
+                let rts = net
                     .fib
-                    .dump()
-                    .into_iter()
-                    .filter(|e| table == 0 || e.table == table)
-                    .collect();
-                Ok(self.take(buf, &rts, |e| fill_route(e, RTM_NEWROUTE, f, seq, pid)))
+                    .entries(&g)
+                    .filter(|e| table == 0 || e.table == table);
+                let mut nb = NlBuf::new(buf, DUMP_SIZE);
+                self.take_nl(&mut nb, rts, |nb, e| {
+                    fill_route(nb, e, RTM_NEWROUTE, f, seq, pid)
+                })
             }
             DumpKind::Neigh => {
                 let n = net.arp.dump();
@@ -906,9 +910,20 @@ fn route_dump_kind(p: &[u8], strict: bool, flags: &mut u16) -> DumpKind {
     }
 }
 
-/// RTM_NEWROUTE/DELROUTE message for a FIB entry (Linux fib_dump_info)
-pub fn fill_route(e: &FibEntry, ty: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
-    let mut m = Msg::new(ty, flags, seq, pid);
+/// Largest route message (Linux fib_nlmsg_size, one nexthop, no
+/// metrics)
+const ROUTE_NLMSG_SIZE: usize = msg_size(RTMSG_LEN) + attr_size(4) * 6; // RTA_TABLE, _DST, _PRIORITY, _PREFSRC, _GATEWAY, _OIF
+
+/// An RTM_NEWROUTE/DELROUTE message for a FIB entry in `nb` (Linux
+/// fib_dump_info): EMSGSIZE, nothing left behind, if it does not fit
+pub fn fill_route(
+    nb: &mut NlBuf<'_>,
+    e: &FibEntry,
+    ty: u16,
+    flags: u16,
+    seq: u32,
+    pid: u32,
+) -> Result<(), KernelError> {
     let mut rflags = e.flags;
     if e.dev.as_ref().is_some_and(|d| !d.carrier_ok()) && e.rtype == RouteType::Unicast {
         rflags |= RTNH_F_LINKDOWN;
@@ -927,32 +942,55 @@ pub fn fill_route(e: &FibEntry, ty: u16, flags: u16, seq: u32, pid: u32) -> Vec<
     h[6] = e.scope;
     h[7] = e.rtype as u8;
     h[8..12].copy_from_slice(&rflags.to_ne_bytes());
-    m.put(&h).u32(RTA_TABLE, e.table);
-    if e.dst_len != 0 {
-        m.attr(RTA_DST, &e.dst.to_be_bytes());
+    let m = nb.msg_put(ty, flags, seq, pid, &h)?;
+    match route_attrs(nb, e) {
+        Ok(()) => {
+            nb.msg_end(m);
+            Ok(())
+        }
+        Err(err) => {
+            nb.msg_cancel(m);
+            Err(err)
+        }
     }
-    if e.priority != 0 {
-        m.u32(RTA_PRIORITY, e.priority);
-    }
-    if let Some(s) = e.prefsrc {
-        m.attr(RTA_PREFSRC, &s.to_be_bytes());
-    }
-    if let Some(g) = e.gateway {
-        m.attr(RTA_GATEWAY, &g.to_be_bytes());
-    }
-    if e.dev.is_some() {
-        m.u32(RTA_OIF, e.oif());
-    }
-    m.finish()
 }
 
-/// Announce a route change to RTNLGRP_IPV4_ROUTE
+/// A route's attributes (fib_dump_info's nla_puts)
+fn route_attrs(nb: &mut NlBuf<'_>, e: &FibEntry) -> Result<(), KernelError> {
+    nb.put_u32(RTA_TABLE, e.table)?;
+    if e.dst_len != 0 {
+        nb.put(RTA_DST, &e.dst.to_be_bytes())?;
+    }
+    if e.priority != 0 {
+        nb.put_u32(RTA_PRIORITY, e.priority)?;
+    }
+    if let Some(s) = e.prefsrc {
+        nb.put(RTA_PREFSRC, &s.to_be_bytes())?;
+    }
+    if let Some(g) = e.gateway {
+        nb.put(RTA_GATEWAY, &g.to_be_bytes())?;
+    }
+    if e.dev.is_some() {
+        nb.put_u32(RTA_OIF, e.oif())?;
+    }
+    Ok(())
+}
+
+/// A route as one message in a buffer of its own (sized first, Linux
+/// nlmsg_new(fib_nlmsg_size)); None if no memory
+fn route_msg(e: &FibEntry, ty: u16, seq: u32, pid: u32) -> Option<Vec<u8>> {
+    let mut v = nlmsg_new(ROUTE_NLMSG_SIZE).ok()?;
+    let mut nb = NlBuf::new(&mut v, ROUTE_NLMSG_SIZE);
+    fill_route(&mut nb, e, ty, 0, seq, pid).ok()?;
+    Some(v)
+}
+
+/// Announce a route change to RTNLGRP_IPV4_ROUTE (Linux rtmsg_fib;
+/// dropped if no memory)
 pub fn notify_route(net: &NetNamespace, e: &FibEntry, ty: u16, nl: NlInfo) {
-    notify(
-        net,
-        fill_route(e, ty, 0, nl.seq, nl.portid),
-        RTNLGRP_IPV4_ROUTE,
-    );
+    if let Some(v) = route_msg(e, ty, nl.seq, nl.portid) {
+        notify(net, v, RTNLGRP_IPV4_ROUTE);
+    }
 }
 
 /// RTM_GETROUTE for one destination ("ip route get"; Linux
@@ -975,7 +1013,8 @@ fn getroute(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
             ..Default::default()
         };
         let e = net.fib.lookup(&key)?;
-        reply(sk, fill_route(&e, RTM_NEWROUTE, 0, h.seq, sk.portid()));
+        let m = route_msg(&e, RTM_NEWROUTE, h.seq, sk.portid()).ok_or(KernelError::OutOfMemory)?;
+        reply(sk, m);
         return Ok(Done::Ok);
     }
     let rt = route::output(net, dst, src, oif)?;
