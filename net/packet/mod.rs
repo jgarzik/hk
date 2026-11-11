@@ -25,8 +25,9 @@
 //! `bind` is one atomic word, changed only by compare-exchange (bind,
 //! device unregister); `rxq` (`crate::sync::spin::Mutex` leaf) and `filter`
 //! (`crate::sync::spin::RwLock` leaf, the `Arc` is cloned out before running it).
-//! `mclist` (`crate::sync::spin::Mutex` leaf) is changed under RTNL, which device
-//! promiscuity changes need: RTNL -> `mclist`.
+//! `mclist` (sleeping `crate::sync::Mutex` leaf; Linux keeps po->mclist
+//! under RTNL) is changed under RTNL, which device promiscuity changes
+//! need: RTNL -> `mclist`.
 
 mod opts;
 mod rcv;
@@ -37,7 +38,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::spin::RwLock;
 
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{ETH_ALEN, ETH_HLEN};
@@ -139,7 +140,7 @@ pub struct PacketSock {
     packets: AtomicU32,
     drops: AtomicU32,
     /// PACKET_ADD_MEMBERSHIP entries (changed under RTNL)
-    mclist: Mutex<Vec<opts::Mreq>>,
+    mclist: crate::sync::Mutex<Vec<opts::Mreq>>,
 }
 
 /// socket(AF_PACKET, type, protocol) (Linux packet_create: EPERM
@@ -163,7 +164,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         filter: RwLock::new(None),
         packets: AtomicU32::new(0),
         drops: AtomicU32::new(0),
-        mclist: Mutex::new(Vec::new()),
+        mclist: crate::sync::Mutex::new(Vec::new()),
     })?;
     net.packet.insert(&s);
     Ok(s)
