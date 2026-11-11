@@ -41,6 +41,7 @@ use alloc::vec::Vec;
 use crate::mm::page_alloc::Gfp;
 use crate::sync::spin::{Mutex, MutexGuard};
 use crate::util::list::{Link, ListPtr, OwnedList, Owner, PtrList};
+use crate::util::rbtree::{RbNode, RbRoot};
 
 use crate::net::af_inet::RxInfo;
 use crate::net::device::NetDevice;
@@ -65,6 +66,11 @@ pub struct SkBuff {
     list: Link,
     /// Which [`SkbOwnedQueue`] holds it through `list` (none: 0)
     qowner: Owner,
+    /// Its node in a TCP socket's out-of-order or retransmit tree
+    /// (Linux skb->rbnode); an skb is on one list or tree at a time
+    rb: RbNode,
+    /// TCP's control block (Linux TCP_SKB_CB in skb->cb)
+    pub tcp: TcpSkbCb,
     /// The buffer: headroom, packet data, tailroom (a Vec so a message
     /// built in one is adopted whole, `from_vec`)
     buf: Vec<u8>,
@@ -390,6 +396,8 @@ impl SkBuff {
         Some(Self {
             list: Link::new(),
             qowner: Owner::new(),
+            rb: RbNode::new(),
+            tcp: self.tcp,
             buf,
             data: self.data,
             tail: self.tail,
@@ -420,6 +428,32 @@ impl SkBuff {
 
 crate::adapter!(pub SkbLink, SkBuff, list);
 crate::owned_adapter!(pub SkbOwned, SkBuff, list, qowner);
+crate::rb_adapter!(pub SkbRb, SkBuff, rb);
+
+/// A tree of skbs ordered by the caller (Linux rb_root of skb->rbnode:
+/// TCP's out-of-order queue and retransmit queue)
+pub type SkbTree = RbRoot<SkbRb, Box<SkBuff>>;
+
+/// TCP's per-skb state (Linux struct tcp_skb_cb): the sequence space
+/// the skb covers and the header fields it was received with or is to
+/// be sent with
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpSkbCb {
+    pub seq: u32,
+    /// `seq` + data length + SYN + FIN
+    pub end_seq: u32,
+    pub ack: u32,
+    pub flags: u8,
+    pub wnd: u16,
+    /// MSS and window scale options (SYN and SYN-ACK)
+    pub mss: Option<u16>,
+    pub ws: Option<u8>,
+    /// Timestamps option (TSval, TSecr)
+    pub ts: Option<(u32, u32)>,
+    /// The ports of a received segment (its header is pulled)
+    pub sport: u16,
+    pub dport: u16,
+}
 
 /// A queue of skbs, each owned through `P` (Linux sk_buff_head with the
 /// unlocked `__skb_queue_tail`/`__skb_dequeue`/`skb_queue_walk_safe`

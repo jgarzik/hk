@@ -76,6 +76,7 @@ use crate::io::fasync::{POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT};
 use crate::io::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
+use crate::mm::page_alloc::Gfp;
 use crate::net::KernelError;
 use crate::net::af_inet::{self, IPPROTO_TCP as PROTO_TCP, Inet, SOL_IP, ipf};
 use crate::net::icmp::IcmpErr;
@@ -281,13 +282,29 @@ fn open(net: &NetNamespace, t: &Tuple, oif: u32) -> Open {
     }
 }
 
-/// Transmit `seg` on `t` (route each time; no cached dst)
+/// Transmit the header-only segment `seg` on `t`, allocated GFP_ATOMIC
+/// (Linux tcp_v4_send_reset's ip_send_unicast_reply)
 pub(super) fn xmit(net: &NetNamespace, t: &Tuple, seg: &Seg, p: IpParams, oif: u32) {
-    let Some(skb) = output::build(seg, t) else {
-        return;
-    };
+    if let Some(skb) = output::build(seg, t, Gfp::ATOMIC) {
+        send(net, t, skb, p, oif);
+    }
+}
+
+/// Route and send `skb` (its TCP header on) to `t` (route each time;
+/// no cached dst)
+fn send(net: &NetNamespace, t: &Tuple, skb: Box<SkBuff>, p: IpParams, oif: u32) {
     if let Ok(rt) = route::output(net, t.raddr, t.laddr, oif) {
         let _ = ipv4::ip_send_rt(net, &rt, skb, IPPROTO_TCP, p);
+    }
+}
+
+/// Transmit `out`'s segments to `t` in order (Linux tcp_transmit_skb
+/// with ip_queue_xmit), each header put on its payload skb
+pub(super) fn send_segs(net: &NetNamespace, t: &Tuple, out: &mut Out, p: IpParams, oif: u32) {
+    while let Some(mut skb) = out.segs.pop_front() {
+        if output::push_hdr(&mut skb, t).is_some() {
+            send(net, t, skb, p, oif);
+        }
     }
 }
 
@@ -456,7 +473,7 @@ impl TcpSock {
     /// sk_shutdown under the socket lock): publish the shutdown bits and
     /// the error (reported at once), then transmit to `t`. Returns the
     /// wakeups to make after unlocking.
-    fn emit(&self, out: &Out, t: Option<Tuple>) -> u8 {
+    fn emit(&self, out: &mut Out, t: Option<Tuple>) -> u8 {
         if out.shut != 0 {
             self.sk.set_shutdown(out.shut);
         }
@@ -464,10 +481,7 @@ impl TcpSock {
             self.sk.post_err(e);
         }
         if let Some(t) = t {
-            let p = self.inet.params();
-            for seg in &out.segs {
-                xmit(&self.sk.net, &t, seg, p, self.oif());
-            }
+            send_segs(&self.sk.net, &t, out, self.inet.params(), self.oif());
         }
         if out.err.is_some() {
             out.wake | cb::wake::ERR
@@ -576,11 +590,8 @@ impl TcpSock {
             let mut b = self.lock.bh_lock();
             match self.bh_get(&mut b) {
                 Some(g) => {
-                    let Some((_, s)) = seg_of(&skb) else {
-                        return;
-                    };
                     let mut out = Out::default();
-                    self.do_rcv(g, &s, t, now_ms(), &mut out);
+                    self.do_rcv(g, skb, t, now_ms(), &mut out);
                     self.apply(g, &mut out)
                 }
                 None => return self.add_backlog(b, skb),
@@ -606,7 +617,8 @@ impl TcpSock {
     /// (Linux tcp_v4_do_rcv): a listener's goes to `listen_rcv`; a
     /// connection's is dropped if the socket left the tuple `t` it was
     /// found by between the lookup and taking its lock
-    fn do_rcv(&self, g: &mut Inner, s: &SegIn<'_>, t: Tuple, now: u64, out: &mut Out) {
+    fn do_rcv(&self, g: &mut Inner, skb: Box<SkBuff>, t: Tuple, now: u64, out: &mut Out) {
+        let s = &skb.tcp.clone();
         if g.cb.state == TcpState::Listen {
             return self.listen_rcv(g, s, t, now);
         }
@@ -624,7 +636,7 @@ impl TcpSock {
             // SYN-ACK is retransmitted later
             return;
         }
-        g.cb.input(s, now, out);
+        g.cb.input(s, skb, now, out);
     }
 
     // --- listener ---------------------------------------------------------------
@@ -637,7 +649,7 @@ impl TcpSock {
     /// LISTEN, tcp_conn_request): a SYN makes a child in SYN_RECEIVED
     /// that answers with SYN-ACK. Dropped when the accept queue or the
     /// SYN queue is full (no syncookies).
-    fn listen_rcv(&self, g: &mut Inner, s: &SegIn<'_>, t: Tuple, now: u64) {
+    fn listen_rcv(&self, g: &mut Inner, s: &SegIn, t: Tuple, now: u64) {
         if s.has(flags::RST) {
             return;
         }
@@ -680,7 +692,7 @@ impl TcpSock {
     /// Create, hash and queue a SYN_RECEIVED child and send its SYN-ACK
     /// (listener locked, then the new child's `slock`: nobody owns it
     /// yet; `opts` and the buffer `caps` are the listener's)
-    fn child(&self, s: &SegIn<'_>, t: Tuple, opts: cb::Opts, caps: (usize, usize, bool), now: u64) {
+    fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, caps: (usize, usize, bool), now: u64) {
         // Out of memory: drop the SYN (Linux inet_csk_clone_lock)
         let Ok(c) = TcpSock::new(Sock::clone_from(&self.sk)) else {
             return;
@@ -817,7 +829,10 @@ impl TcpSock {
                 ts_off: ts_off(&t),
                 mss: rt.mtu.saturating_sub(cb::HDRS),
             };
+            // The SYN is allocated with sk_allocation (Linux tcp_connect)
+            out.gfp = Gfp::KERNEL;
             g.cb.connect(o, now_ms(), out);
+            out.gfp = Gfp::ATOMIC;
             Ok(())
         }
     }
@@ -998,11 +1013,11 @@ impl SockHooks<Inner> for TcpSock {
     /// A segment that waited for the owner (Linux sk_backlog_rcv ->
     /// tcp_v4_do_rcv; its checksum was checked on arrival)
     fn backlog_rcv(&self, g: &mut Inner, skb: Box<SkBuff>) {
-        let Some((t, s)) = seg_of(&skb) else {
+        let Some(t) = tuple_of(&skb) else {
             return;
         };
         let mut out = Out::default();
-        self.do_rcv(g, &s, t, now_ms(), &mut out);
+        self.do_rcv(g, skb, t, now_ms(), &mut out);
         self.finish(g, &mut out);
     }
 
@@ -1033,21 +1048,20 @@ impl SockHooks<Inner> for TcpSock {
 // Segment demux (Linux tcp_v4_rcv)
 // ============================================================================
 
-/// The tuple (local first) and header of the TCP segment in `skb`
-fn seg_of(skb: &SkBuff) -> Option<(Tuple, SegIn<'_>)> {
-    let (sport, dport, s) = output::parse(skb.data())?;
-    let t = Tuple {
+/// The tuple (local first) of a received segment, its header parsed
+/// into `skb.tcp`
+fn tuple_of(skb: &SkBuff) -> Option<Tuple> {
+    Some(Tuple {
         laddr: skb.daddr?,
-        lport: dport,
+        lport: skb.tcp.dport,
         raddr: skb.saddr?,
-        rport: sport,
-    };
-    Some((t, s))
+        rport: skb.tcp.sport,
+    })
 }
 
 /// Receive a TCP segment (softnet or an inline loopback flush; thread
 /// context). Lookups use the receiving device's namespace.
-pub fn tcp_rcv(skb: Box<SkBuff>) {
+pub fn tcp_rcv(mut skb: Box<SkBuff>) {
     let (Some(net), Some(saddr), Some(daddr)) = (skb.net(), skb.saddr, skb.daddr) else {
         return;
     };
@@ -1058,17 +1072,30 @@ pub fn tcp_rcv(skb: Box<SkBuff>) {
     if output::checksum(saddr, daddr, skb.data()) != 0 {
         return;
     }
-    let Some((t, s)) = seg_of(&skb) else {
+    // The header into the control block, the payload left (Linux
+    // tcp_v4_fill_cb + __skb_pull)
+    let Some((s, doff)) = output::parse(skb.data()) else {
         return;
     };
+    let _ = skb.pull(doff);
+    skb.tcp = s;
+    let Some(t) = tuple_of(&skb) else {
+        return;
+    };
+    // The device reference is not needed past here: it goes after the
+    // socket locks (an skb may be queued or dropped under them)
+    let dev = skb.dev.take();
+    let dif = dev.as_ref().map_or(0, |d| d.ifindex());
     let now = now_ms();
-    match net.tcp.lookup(&t) {
+    let skb = match net.tcp.lookup(&t) {
         Some(Ent::Sk(sk)) => return sk.rcv(skb, t),
         // A TIME_WAIT entry consumes it unless it is a new SYN
-        Some(Ent::Tw(tw)) if tw.rcv(&s, now) => return,
-        _ => {}
-    }
-    let dif = skb.dev.as_ref().map_or(0, |d| d.ifindex());
+        Some(Ent::Tw(tw)) => match tw.rcv(skb, now) {
+            Some(skb) => skb,
+            None => return,
+        },
+        None => skb,
+    };
     if let Some(l) = net.tcp.listener(daddr, t.lport, dif) {
         return l.rcv(skb, t);
     }

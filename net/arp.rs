@@ -165,7 +165,7 @@ pub static ARP_OPS: NeighOps = NeighOps {
 /// Receive an ARP packet (EtherType 0x0806 handler; thread context)
 ///
 /// Uses the receiving device's namespace.
-pub fn arp_rcv(skb: SkBuff) {
+pub fn arp_rcv(skb: alloc::boxed::Box<SkBuff>) {
     if skb.len() < ARP_HLEN {
         return;
     }

@@ -1,21 +1,35 @@
 //! Segment output: what the control block sends (Linux tcp_output.c,
 //! I/O-free) and the wire format (header, options, checksum).
 //!
+//! Data goes out skb by skb (Linux tcp_write_xmit): the write queue's
+//! head, cut at the MSS or the window (tcp_fragment), is cloned for
+//! transmission and moves to the retransmit queue; a retransmission
+//! (after a timeout rewound SND.NXT, or a fast retransmit of the head,
+//! which first merges small skbs behind it, tcp_retrans_try_collapse)
+//! sends the queued skb at SND.NXT again. Transmitted clones and
+//! header-only segments are allocated GFP_ATOMIC (Linux
+//! __tcp_push_pending_frames, tcp_send_ack, tcp_retransmit_skb); a
+//! failed allocation sends nothing now and the retransmit or probe
+//! timer tries again.
+//!
 //! Partial segments follow Linux: Nagle with Minshall's variant (hold a
 //! partial segment only while an earlier partial one is unacknowledged)
 //! unless TCP_NODELAY; TCP_CORK and MSG_MORE hold every partial segment
 //! until uncorked, a full segment forms, or the 200 ms (RTO-based) probe
 //! timer pushes it out (Linux tcp_write_wakeup). A FIN is never held.
 
-use crate::mm::page_alloc::Gfp;
-use alloc::vec::Vec;
+use alloc::boxed::Box;
 
-use super::cb::{Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, copy_out, flags};
+use super::ack::DELACK_MAX;
+use super::cb::{Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, flags};
+use crate::mm::page_alloc::Gfp;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
 use crate::net::skb::SkBuff;
 
 /// TCP header without options
 pub const HLEN: usize = 20;
+/// TCP header with every option it may carry
+const HLEN_MAX: usize = 60;
 /// TCP option kinds
 const OPT_EOL: u8 = 0;
 const OPT_NOP: u8 = 1;
@@ -34,9 +48,32 @@ pub(super) enum Push {
     Force,
 }
 
+/// A copy of `skb`'s payload with headroom for the headers (Linux
+/// skb_clone in tcp_transmit_skb: hk's skbs do not share data)
+fn clone_data(skb: &SkBuff, gfp: Gfp) -> Option<Box<SkBuff>> {
+    let mut c = SkBuff::alloc_tx(skb.len(), gfp)?;
+    c.put_slice(skb.data())?;
+    Some(c)
+}
+
+/// Cut `skb` after `at` payload bytes (Linux tcp_fragment): the rest
+/// moves to a new skb, which takes the FIN and PSH flags; None without
+/// memory (`skb` unchanged)
+fn fragment(skb: &mut SkBuff, at: usize, gfp: Gfp) -> Option<Box<SkBuff>> {
+    let rest = skb.len().checked_sub(at)?;
+    let mut n = SkBuff::alloc_tx(rest, gfp)?;
+    n.put_slice(&skb.data()[at..])?;
+    skb.trim(rest)?;
+    n.tcp = skb.tcp;
+    n.tcp.seq = skb.tcp.seq.wrapping_add(at as u32);
+    skb.tcp.end_seq = n.tcp.seq;
+    skb.tcp.flags &= !(flags::FIN | flags::PSH);
+    Some(n)
+}
+
 impl TcpCb {
-    /// SYN (SYN_SENT) or SYN-ACK (SYN_RECEIVED) with our options
-    pub(super) fn syn_seg(&mut self) -> Seg {
+    /// Queue a SYN (SYN_SENT) or SYN-ACK (SYN_RECEIVED) with our options
+    pub(super) fn syn_seg(&mut self, out: &mut Out) {
         let synack = self.state == TcpState::SynReceived;
         let ts = if !self.ts_ok {
             None
@@ -45,7 +82,7 @@ impl TcpCb {
         } else {
             Some((self.tsval(), 0))
         };
-        Seg {
+        let h = Seg {
             seq: self.iss,
             ack: if synack { self.rcv_nxt } else { 0 },
             flags: flags::SYN | if synack { flags::ACK } else { 0 },
@@ -53,13 +90,15 @@ impl TcpCb {
             mss: Some(self.adv_mss.min(u32::from(u16::MAX)) as u16),
             ws: self.wscale_ok.then_some(self.rcv_wscale),
             ts,
-            data: Vec::new(),
-        }
+            ..Default::default()
+        };
+        out.ctl(h);
     }
 
-    /// A segment of this connection: ACK field, window, timestamp; an
+    /// The header of a segment of this connection at `seq` with flags
+    /// `fl` and `len` payload bytes: ACK field, window, timestamp; an
     /// ACK going out settles what was owed
-    pub(super) fn mk_seg(&mut self, seq: u32, fl: u8, data: Vec<u8>) -> Seg {
+    fn hdr(&mut self, seq: u32, fl: u8, len: u32) -> Seg {
         let wnd = if fl & flags::ACK != 0 {
             self.select_window()
         } else {
@@ -70,10 +109,10 @@ impl TcpCb {
             self.ack_sent();
         }
         self.stats.segs_out = self.stats.segs_out.wrapping_add(1);
-        if !data.is_empty() {
+        if len != 0 {
             self.stats.data_segs_out = self.stats.data_segs_out.wrapping_add(1);
         }
-        Seg {
+        let mut h = Seg {
             seq,
             ack: if fl & flags::ACK != 0 {
                 self.rcv_nxt
@@ -82,21 +121,41 @@ impl TcpCb {
             },
             flags: fl,
             wnd,
-            mss: None,
-            ws: None,
             ts,
-            data,
-        }
+            ..Default::default()
+        };
+        h.set_len(len);
+        h
     }
 
-    /// Sequence number just past the queued data
-    pub(super) fn data_end(&self) -> u32 {
-        self.sndq_seq.wrapping_add(self.sndq.len() as u32)
+    /// Send `skb`'s payload (a queued skb) at `seq` with flags `fl`
+    /// (Linux tcp_transmit_skb on a clone); false without memory
+    fn transmit(&mut self, skb: &SkBuff, seq: u32, fl: u8, out: &mut Out) -> bool {
+        let Some(mut c) = clone_data(skb, out.gfp) else {
+            return false;
+        };
+        c.tcp = self.hdr(seq, fl, skb.len() as u32);
+        out.segs.push_back(c);
+        true
+    }
+
+    /// A header-only segment at `seq` with flags `fl` (Linux
+    /// tcp_send_ack, tcp_xmit_probe_skb). Without memory an owed ACK
+    /// waits for the delayed ACK timer (Linux __tcp_send_ack:
+    /// inet_csk_schedule_ack + TCP_DELACK_MAX)
+    fn send_ctl(&mut self, seq: u32, fl: u8, out: &mut Out) {
+        let Some(mut skb) = SkBuff::alloc_tx(0, out.gfp) else {
+            self.dack.pending = true;
+            self.dack.at = Some(self.clock + DELACK_MAX);
+            return;
+        };
+        skb.tcp = self.hdr(seq, fl, 0);
+        out.segs.push_back(skb);
     }
 
     /// Our FIN was sent and acknowledged
     pub(super) fn fin_acked(&self) -> bool {
-        self.fin_queued && self.snd_una == self.data_end().wrapping_add(1)
+        self.fin_queued && self.snd_una == self.write_seq.wrapping_add(1)
     }
 
     /// States that may send data or FIN
@@ -112,9 +171,10 @@ impl TcpCb {
     }
 
     /// Send what the peer's window and the congestion window allow,
-    /// from `snd_nxt` on (new data, or a rewound range after a timeout),
-    /// ending with the FIN once all data went out; else an owed ACK
-    /// (Linux tcp_write_xmit + tcp_send_ack / delayed ACK)
+    /// from `snd_nxt` on (new data, or queued segments again after a
+    /// timeout rewound it), ending with the FIN once all data went out;
+    /// else an owed ACK (Linux tcp_write_xmit + tcp_send_ack / delayed
+    /// ACK)
     pub fn output(&mut self, now: u64, out: &mut Out) {
         self.xmit(now, Push::Normal, out);
     }
@@ -129,11 +189,9 @@ impl TcpCb {
         let mut sent = false;
         let mut limited = false;
         while self.may_send() {
-            let Some(seg) = self.next_seg(now, push, &mut limited) else {
+            let Some(fin) = self.next_seg(now, push, &mut limited, out) else {
                 break;
             };
-            let fin = seg.has(flags::FIN);
-            out.segs.push(seg);
             sent = true;
             if fin || push == Push::Force {
                 break;
@@ -152,10 +210,9 @@ impl TcpCb {
         self.check_persist(now);
     }
 
-    /// What `next_seg` may send from queue offset `off`: (bytes queued
-    /// there, room in the window, cwnd is the smaller window)
-    fn room(&self, off: u32) -> (u32, u32, bool) {
-        let len = self.sndq.len() as u32;
+    /// Room in the window from `snd_nxt`, and whether cwnd is the
+    /// smaller window
+    fn room(&self) -> (u32, bool) {
         let wnd = self.snd_wnd.min(self.cong.cwnd);
         let end = self.snd_una.wrapping_add(wnd);
         let room = if after(end, self.snd_nxt) {
@@ -163,11 +220,11 @@ impl TcpCb {
         } else {
             0
         };
-        (len - off, room, self.cong.cwnd < self.snd_wnd)
+        (room, self.cong.cwnd < self.snd_wnd)
     }
 
-    /// Hold a partial segment of `n` bytes (Linux tcp_nagle_check with
-    /// Minshall's rule; cork and MSG_MORE hold all partial segments)
+    /// Hold a partial segment (Linux tcp_nagle_check with Minshall's
+    /// rule; cork and MSG_MORE hold all partial segments)
     fn nagle_hold(&self, push: Push) -> bool {
         if push == Push::Force {
             return false;
@@ -181,24 +238,43 @@ impl TcpCb {
             && !after(self.snd_sml, self.snd_nxt)
     }
 
-    /// The next segment `output` may send, if any
-    fn next_seg(&mut self, now: u64, push: Push, limited: &mut bool) -> Option<Seg> {
-        let len = self.sndq.len() as u32;
-        let off = self.snd_nxt.wrapping_sub(self.sndq_seq);
-        if off > len {
+    /// The payload length of the queued skb at `snd_nxt`: one of the
+    /// retransmit queue after a rewind, else the write queue's head
+    fn len_at_nxt(&self) -> u32 {
+        if before(self.snd_nxt, self.snd_max) {
+            self.rtx
+                .iter()
+                .find(|s| s.tcp.seq == self.snd_nxt)
+                .map_or(0, |s| s.len() as u32)
+        } else {
+            self.wq.front().map_or(0, |s| s.len() as u32)
+        }
+    }
+
+    /// Send the next segment `output` may send, if any: Some(it carried
+    /// the FIN)
+    fn next_seg(
+        &mut self,
+        now: u64,
+        push: Push,
+        limited: &mut bool,
+        out: &mut Out,
+    ) -> Option<bool> {
+        if after(self.snd_nxt, self.write_seq) {
             return None; // FIN already sent
         }
-        let (avail, room, cwnd_bound) = self.room(off);
-        let n = avail.min(self.mss).min(room);
-        let fin = self.fin_queued && off + n == len && room > n;
+        let avail = self.write_seq.wrapping_sub(self.snd_nxt);
+        let (room, cwnd_bound) = self.room();
+        let n = self.len_at_nxt().min(self.mss).min(room);
+        let rexmit = before(self.snd_nxt, self.snd_max);
+        let fin = self.fin_queued && self.snd_nxt.wrapping_add(n) == self.write_seq && room > n;
         if n == 0 && !fin {
             *limited |= avail > 0 && cwnd_bound;
             return None;
         }
         let in_flight = self.snd_nxt != self.snd_una;
-        // Retransmissions (after a timeout rewound SND.NXT) are never
-        // held (Linux tcp_retransmit_skb ignores Nagle and cork)
-        let rexmit = before(self.snd_nxt, self.snd_max);
+        // Retransmissions are never held (Linux tcp_retransmit_skb
+        // ignores Nagle and cork)
         if n < self.mss && !fin && push != Push::Force && !rexmit {
             // Sender SWS avoidance (RFC 9293 3.8.6.2.1): with data in
             // flight, wait for a full segment unless this ends the queue
@@ -210,25 +286,28 @@ impl TcpCb {
                 return None;
             }
         }
-        // No memory: nothing sent now; the retransmit or probe timer
-        // (check_persist) tries again (Linux tcp_write_xmit stops on a
-        // failed tcp_transmit_skb and tcp_check_probe_timer arms)
-        let mut data = crate::util::kmem::try_vec(n as usize, 0u8).ok()?;
+        let seq = self.snd_nxt;
+        let mut fl = flags::ACK;
+        if n > 0 && seq.wrapping_add(n) == self.write_seq {
+            fl |= flags::PSH;
+        }
+        if fin {
+            fl |= flags::FIN;
+        }
+        let sent = if rexmit {
+            self.send_rtx_at(seq, n, fl, out)
+        } else {
+            self.send_new(n, fl, out)
+        };
+        if !sent {
+            return None;
+        }
         if self.snd_nxt == self.snd_max
             && !in_flight
             && now.saturating_sub(self.lsndtime) > self.rto
         {
             // Idle longer than an RTO: restart from the initial window
             self.cong.restart(now - self.lsndtime, self.rto);
-        }
-        copy_out(&self.sndq, off as usize, &mut data);
-        let seq = self.snd_nxt;
-        let mut fl = flags::ACK;
-        if n > 0 && off + n == len {
-            fl |= flags::PSH;
-        }
-        if fin {
-            fl |= flags::FIN;
         }
         let next = seq.wrapping_add(n + u32::from(fin));
         let new = after(next, self.snd_max);
@@ -251,65 +330,181 @@ impl TcpCb {
         if new {
             self.snd_max = next;
         }
-        Some(self.mk_seg(seq, fl, data))
+        Some(fin)
+    }
+
+    /// Send `n` bytes from the write queue's head (cut there if longer,
+    /// Linux tcp_fragment) and move them to the retransmit queue; a FIN
+    /// in `fl` rides on them, or on an skb of its own once the data is
+    /// gone (Linux tcp_send_fin). False without memory.
+    fn send_new(&mut self, n: u32, fl: u8, out: &mut Out) -> bool {
+        let mut skb = match self.wq.pop_front() {
+            Some(s) => s,
+            None => {
+                let Some(mut s) = SkBuff::alloc_tx(0, out.gfp) else {
+                    return false;
+                };
+                s.tcp.seq = self.write_seq;
+                s.tcp.end_seq = self.write_seq;
+                s
+            }
+        };
+        if skb.len() > n as usize {
+            let Some(rest) = fragment(&mut skb, n as usize, out.gfp) else {
+                self.wq.push_front(skb);
+                return false;
+            };
+            self.wq.push_front(rest);
+        }
+        if !self.transmit(&skb, skb.tcp.seq, fl, out) {
+            self.requeue(skb);
+            return false;
+        }
+        skb.tcp.flags |= fl;
+        if fl & flags::FIN != 0 {
+            skb.tcp.end_seq = skb.tcp.end_seq.wrapping_add(1);
+        }
+        self.rtx.insert_by(skb, |a, b| before(a.tcp.seq, b.tcp.seq));
+        true
+    }
+
+    /// Put an skb back at the head of the write queue (an empty FIN skb
+    /// is just dropped)
+    fn requeue(&mut self, skb: Box<SkBuff>) {
+        if !skb.is_empty() {
+            self.wq.push_front(skb);
+        }
+    }
+
+    /// Send the queued skb at `seq` again, cut to `n` bytes first if
+    /// longer (Linux __tcp_retransmit_skb with tcp_fragment); false
+    /// without memory
+    fn send_rtx_at(&mut self, seq: u32, n: u32, fl: u8, out: &mut Out) -> bool {
+        let gfp = out.gfp;
+        let mut c = self.rtx.cursor_floor_mut(|s| !after(s.tcp.seq, seq));
+        let cut = c.with_current_mut(|s| {
+            if s.len() > n as usize {
+                fragment(s, n as usize, gfp).map(Some)
+            } else {
+                Some(None)
+            }
+        });
+        match cut {
+            Some(Some(rest)) => {
+                if let Some(r) = rest {
+                    self.rtx.insert_by(r, |a, b| before(a.tcp.seq, b.tcp.seq));
+                }
+            }
+            _ => return false,
+        }
+        let Some(clone) = self
+            .rtx
+            .iter()
+            .find(|s| s.tcp.seq == seq)
+            .and_then(|s| clone_data(s, gfp))
+        else {
+            return false;
+        };
+        self.send_clone(clone, seq, fl, out);
+        true
+    }
+
+    /// Send `c`, a copy of a queued skb's payload, at `seq` with `fl`
+    fn send_clone(&mut self, mut c: Box<SkBuff>, seq: u32, fl: u8, out: &mut Out) {
+        c.tcp = self.hdr(seq, fl, c.len() as u32);
+        out.segs.push_back(c);
     }
 
     /// A pure ACK of everything received (also the RFC 5961 challenge ACK)
     pub(super) fn send_ack(&mut self, out: &mut Out) {
-        let s = self.mk_seg(self.snd_nxt, flags::ACK, Vec::new());
-        out.segs.push(s);
+        self.send_ctl(self.snd_nxt, flags::ACK, out);
     }
 
     /// Resend the oldest unacknowledged segment (fast retransmit, NewReno
-    /// partial ACK); never an RTT sample (Karn)
+    /// partial ACK; Linux tcp_retransmit_skb): the retransmit queue's
+    /// head, cut to the MSS, or merged with the small skbs behind it up
+    /// to the MSS (tcp_retrans_try_collapse); never an RTT sample (Karn)
     pub(super) fn retransmit_head(&mut self, out: &mut Out) {
         self.rtt_seq = None;
-        match self.state {
-            TcpState::SynSent | TcpState::SynReceived => {
-                let s = self.syn_seg();
-                out.segs.push(s);
-                return;
-            }
-            _ => {}
-        }
-        let off = self.snd_una.wrapping_sub(self.sndq_seq) as usize;
-        let len = self.sndq.len();
-        if off > len {
+        if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
+            self.syn_seg(out);
             return;
         }
-        let n = (len - off).min(self.mss as usize);
-        // No memory: the retransmit timer tries again
-        let Ok(mut data) = crate::util::kmem::try_vec(n, 0u8) else {
+        let Some(head) = self.rtx.first() else {
             return;
         };
-        copy_out(&self.sndq, off, &mut data);
-        let fin_sent = self.fin_queued && after(self.snd_max, self.data_end());
-        let mut fl = flags::ACK;
-        if fin_sent && off + n == len {
-            fl |= flags::FIN;
+        let (seq, len) = (head.tcp.seq, head.len());
+        let mss = self.mss as usize;
+        if len > mss {
+            if !self.send_rtx_at(seq, self.mss, flags::ACK, out) {
+                return;
+            }
+        } else {
+            self.collapse_head();
+            let Some(head) = self.rtx.first() else {
+                return;
+            };
+            let mut fl = flags::ACK;
+            if head.tcp.has(flags::FIN) {
+                fl |= flags::FIN;
+            }
+            if head.is_empty() && fl & flags::FIN == 0 {
+                return;
+            }
+            let Some(clone) = clone_data(head, out.gfp) else {
+                return;
+            };
+            self.send_clone(clone, seq, fl, out);
         }
-        if n == 0 && fl & flags::FIN == 0 {
-            return;
-        }
+        let n = len.min(mss);
         self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
         self.stats.bytes_retrans += n as u64;
-        let s = self.mk_seg(self.snd_una, fl, data);
-        out.segs.push(s);
+    }
+
+    /// Merge the skbs after the retransmit queue's head into it while
+    /// they fit its room and the MSS and were sent up to SND.NXT (Linux
+    /// tcp_retrans_try_collapse / tcp_collapse_retrans: the next skb's
+    /// data and FIN move into it)
+    fn collapse_head(&mut self) {
+        let mss = self.mss as usize;
+        loop {
+            let mut c = self.rtx.cursor_front_mut();
+            let (Some(h), Some(n)) = (c.current(), c.peek_next()) else {
+                return;
+            };
+            if h.tcp.has(flags::FIN)
+                || h.len() + n.len() > mss
+                || n.len() > h.tailroom()
+                || h.tcp.end_seq != n.tcp.seq
+                || after(n.tcp.end_seq, self.snd_nxt)
+            {
+                return;
+            }
+            c.move_next();
+            let Some(next) = c.remove_current() else {
+                return;
+            };
+            let mut c = self.rtx.cursor_front_mut();
+            let _ = c.with_current_mut(|h| {
+                let _ = h.put_slice(next.data());
+                h.tcp.end_seq = next.tcp.end_seq;
+                h.tcp.flags |= next.tcp.flags & (flags::FIN | flags::PSH);
+            });
+        }
     }
 
     /// Zero-window or keepalive probe: an old sequence number that the
     /// peer answers with an ACK carrying its window (Linux
     /// tcp_xmit_probe_skb)
     pub(super) fn send_probe(&mut self, out: &mut Out) {
-        let s = self.mk_seg(self.snd_una.wrapping_sub(1), flags::ACK, Vec::new());
-        out.segs.push(s);
+        self.send_ctl(self.snd_una.wrapping_sub(1), flags::ACK, out);
     }
 
     /// Something to send and nothing in flight, yet nothing went out
-    /// (zero window, or a partial segment held by cork/Nagle): arm the
-    /// probe timer (Linux tcp_check_probe_timer)
+    /// (zero window, a partial segment held by cork/Nagle, or no
+    /// memory): arm the probe timer (Linux tcp_check_probe_timer)
     pub(super) fn check_persist(&mut self, now: u64) {
-        let pending = self.snd_nxt != self.data_end().wrapping_add(u32::from(self.fin_queued));
+        let pending = self.snd_nxt != self.write_seq.wrapping_add(u32::from(self.fin_queued));
         if self.may_send() && pending && self.snd_una == self.snd_max && self.tmr.is_none() {
             let t = self.rto_cur().max(RTO_MIN);
             self.tmr = Some((Tmr::Probe, now + t));
@@ -319,11 +514,11 @@ impl TcpCb {
 
 /// RST answering segment `s` that has no connection (RFC 9293 3.10.7.1,
 /// Linux tcp_v4_send_reset): seq = its ACK if any, else ACK its end
-pub fn reset_for(s: &SegIn<'_>) -> Option<Seg> {
+pub fn reset_for(s: &SegIn) -> Option<Seg> {
     if s.has(flags::RST) {
         return None;
     }
-    Some(if s.has(flags::ACK) {
+    let mut r = if s.has(flags::ACK) {
         Seg {
             seq: s.ack,
             flags: flags::RST,
@@ -336,7 +531,9 @@ pub fn reset_for(s: &SegIn<'_>) -> Option<Seg> {
             flags: flags::RST | flags::ACK,
             ..Default::default()
         }
-    })
+    };
+    r.set_len(0);
+    Some(r)
 }
 
 // ============================================================================
@@ -373,48 +570,64 @@ pub struct Tuple {
     pub rport: u16,
 }
 
-/// Option bytes of `seg` in Linux's order and padding (tcp_options_write
-/// without SACK): MSS, NOP NOP TS, NOP WS
-fn put_opts(seg: &Seg, o: &mut Vec<u8>) {
-    if let Some(m) = seg.mss {
-        o.extend_from_slice(&[OPT_MSS, 4]);
-        o.extend_from_slice(&m.to_be_bytes());
+/// The header of `h` from `t.lport` to `t.rport` into `b` (options in
+/// Linux's order and padding, tcp_options_write without SACK: MSS, NOP
+/// NOP TS, NOP WS); its length
+fn put_hdr(h: &Seg, t: &Tuple, b: &mut [u8; HLEN_MAX]) -> usize {
+    b[0..2].copy_from_slice(&t.lport.to_be_bytes());
+    b[2..4].copy_from_slice(&t.rport.to_be_bytes());
+    b[4..8].copy_from_slice(&h.seq.to_be_bytes());
+    b[8..12].copy_from_slice(&h.ack.to_be_bytes());
+    b[12..14].copy_from_slice(&[0, h.flags]);
+    b[14..16].copy_from_slice(&h.wnd.to_be_bytes());
+    b[16..20].fill(0);
+    let mut n = HLEN;
+    if let Some(m) = h.mss {
+        b[n..n + 2].copy_from_slice(&[OPT_MSS, 4]);
+        b[n + 2..n + 4].copy_from_slice(&m.to_be_bytes());
+        n += 4;
     }
-    if let Some((v, e)) = seg.ts {
-        o.extend_from_slice(&[OPT_NOP, OPT_NOP, OPT_TS, 10]);
-        o.extend_from_slice(&v.to_be_bytes());
-        o.extend_from_slice(&e.to_be_bytes());
+    if let Some((v, e)) = h.ts {
+        b[n..n + 4].copy_from_slice(&[OPT_NOP, OPT_NOP, OPT_TS, 10]);
+        b[n + 4..n + 8].copy_from_slice(&v.to_be_bytes());
+        b[n + 8..n + 12].copy_from_slice(&e.to_be_bytes());
+        n += 12;
     }
-    if let Some(w) = seg.ws {
-        o.extend_from_slice(&[OPT_NOP, OPT_WS, 3, w]);
+    if let Some(w) = h.ws {
+        b[n..n + 4].copy_from_slice(&[OPT_NOP, OPT_WS, 3, w]);
+        n += 4;
     }
+    b[12] = ((n / 4) as u8) << 4;
+    n
 }
 
-/// Build the IP payload of `seg` from `t.laddr:lport` to `t.raddr:rport`
-pub fn build(seg: &Seg, t: &Tuple) -> Option<alloc::boxed::Box<SkBuff>> {
-    let mut h = Vec::with_capacity(HLEN + 20);
-    h.extend_from_slice(&t.lport.to_be_bytes());
-    h.extend_from_slice(&t.rport.to_be_bytes());
-    h.extend_from_slice(&seg.seq.to_be_bytes());
-    h.extend_from_slice(&seg.ack.to_be_bytes());
-    h.extend_from_slice(&[0, seg.flags]);
-    h.extend_from_slice(&seg.wnd.to_be_bytes());
-    h.extend_from_slice(&[0; 4]);
-    put_opts(seg, &mut h);
-    h[12] = ((h.len() / 4) as u8) << 4;
-    let mut skb = SkBuff::alloc_tx(h.len() + seg.data.len(), Gfp::ATOMIC)?;
-    skb.put_slice(&h)?;
-    skb.put_slice(&seg.data)?;
+/// Put the TCP header of `skb.tcp` before its payload, from
+/// `t.laddr:lport` to `t.raddr:rport`, checksummed (Linux
+/// tcp_transmit_skb's header part); None if the headroom is short
+pub fn push_hdr(skb: &mut SkBuff, t: &Tuple) -> Option<()> {
+    let mut b = [0u8; HLEN_MAX];
+    let n = put_hdr(&skb.tcp, t, &mut b);
+    skb.push(n)?.copy_from_slice(&b[..n]);
     let c = checksum(t.laddr, t.raddr, skb.data());
     skb.data_mut()[16..18].copy_from_slice(&c.to_be_bytes());
     skb.saddr = Some(t.laddr);
     skb.daddr = Some(t.raddr);
+    Some(())
+}
+
+/// A header-only segment `h` from `t`, ready for IP (no socket: RSTs
+/// for unknown tuples, a listener's stray-ACK reset)
+pub fn build(h: &Seg, t: &Tuple, gfp: Gfp) -> Option<Box<SkBuff>> {
+    let mut skb = SkBuff::alloc_tx(0, gfp)?;
+    skb.tcp = *h;
+    push_hdr(&mut skb, t)?;
     Some(skb)
 }
 
 /// Parse a received segment (`b` = TCP header onwards, checksum already
-/// verified): (source port, destination port, segment)
-pub fn parse(b: &[u8]) -> Option<(u16, u16, SegIn<'_>)> {
+/// verified): its header with ports and sequence space, and the header
+/// length
+pub fn parse(b: &[u8]) -> Option<(Seg, usize)> {
     if b.len() < HLEN {
         return None;
     }
@@ -424,22 +637,24 @@ pub fn parse(b: &[u8]) -> Option<(u16, u16, SegIn<'_>)> {
     }
     let be16 = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
     let be32 = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
-    let mut s = SegIn {
+    let mut s = Seg {
         seq: be32(4),
         ack: be32(8),
         flags: b[13] & 0x3f,
         wnd: be16(14),
-        data: &b[doff..],
+        sport: be16(0),
+        dport: be16(2),
         ..Default::default()
     };
+    s.set_len((b.len() - doff) as u32);
     parse_opts(&b[HLEN..doff], &mut s);
-    Some((be16(0), be16(2), s))
+    Some((s, doff))
 }
 
 /// The options of a segment (Linux tcp_parse_options: parsing stops at
 /// EOL, a length below 2 or past the header; an MSS of 0 is ignored;
 /// MSS and window scale count only on a SYN; a scale above 14 is 14)
-fn parse_opts(mut o: &[u8], s: &mut SegIn<'_>) {
+fn parse_opts(mut o: &[u8], s: &mut Seg) {
     let syn = s.has(flags::SYN);
     while let Some(&k) = o.first() {
         match k {
@@ -476,8 +691,8 @@ fn parse_opts(mut o: &[u8], s: &mut SegIn<'_>) {
 mod tests {
     use super::*;
 
-    fn opts(o: &[u8], syn: bool) -> SegIn<'static> {
-        let mut s = SegIn {
+    fn opts(o: &[u8], syn: bool) -> Seg {
+        let mut s = Seg {
             flags: if syn { flags::SYN } else { flags::ACK },
             ..Default::default()
         };
@@ -495,13 +710,13 @@ mod tests {
         assert!(parse(&h).is_none());
         h[12] = 0x60;
         h[20..24].copy_from_slice(&[2, 4, 0, 0]);
-        let (_, _, s) = parse(&h).unwrap();
-        assert_eq!((s.mss, s.data.len()), (None, 0));
+        let (s, doff) = parse(&h).unwrap();
+        assert_eq!((s.mss, s.data_len(), doff), (None, 0, 24));
         h[22..24].copy_from_slice(&[0x05, 0xb4]);
-        assert_eq!(parse(&h).unwrap().2.mss, Some(1460));
+        assert_eq!(parse(&h).unwrap().0.mss, Some(1460));
         // An option running past the header is not read
         h[20..24].copy_from_slice(&[1, 2, 4, 5]);
-        assert_eq!(parse(&h[..24]).unwrap().2.mss, None);
+        assert_eq!(parse(&h[..24]).unwrap().0.mss, None);
         assert!(parse(&h[..19]).is_none());
     }
 
@@ -538,7 +753,7 @@ mod tests {
             ..Default::default()
         };
         let t = Tuple::default();
-        let skb = build(&seg, &t).unwrap();
+        let skb = build(&seg, &t, Gfp::KERNEL).unwrap();
         let b = skb.data();
         assert_eq!(b.len(), 40);
         assert_eq!(b[12] >> 4, 10);
@@ -548,7 +763,7 @@ mod tests {
                 2, 4, 5, 0xb4, 1, 1, 8, 10, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0, 1, 3, 3, 7
             ]
         );
-        let (_, _, s) = parse(b).unwrap();
+        let (s, _) = parse(b).unwrap();
         assert_eq!(
             (s.mss, s.ws, s.ts),
             (Some(1460), Some(7), Some((0x11223344, 0)))
@@ -557,25 +772,46 @@ mod tests {
 
     #[test]
     fn reset_rules() {
-        let s = SegIn {
+        let mut s = Seg {
             seq: 100,
             ack: 7,
             flags: flags::SYN,
-            data: &[1, 2, 3],
             ..Default::default()
         };
+        s.set_len(3);
         let r = reset_for(&s).unwrap();
         assert_eq!((r.seq, r.ack, r.flags), (0, 104, flags::RST | flags::ACK));
-        let a = SegIn {
+        let a = Seg {
             flags: flags::ACK,
             ..s
         };
         let r = reset_for(&a).unwrap();
         assert_eq!((r.seq, r.flags), (7, flags::RST));
-        let rst = SegIn {
+        let rst = Seg {
             flags: flags::RST,
             ..s
         };
         assert!(reset_for(&rst).is_none());
+    }
+
+    /// tcp_fragment: the rest takes the end, the FIN and PSH
+    #[test]
+    fn fragment_moves_the_tail() {
+        let mut skb = SkBuff::alloc_tx(10, Gfp::KERNEL).unwrap();
+        skb.put_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).unwrap();
+        skb.tcp.seq = 100;
+        skb.tcp.flags = flags::ACK | flags::PSH | flags::FIN;
+        skb.tcp.set_len(10);
+        let rest = fragment(&mut skb, 4, Gfp::KERNEL).unwrap();
+        assert_eq!(
+            (skb.data(), skb.tcp.seq, skb.tcp.end_seq),
+            (&[1, 2, 3, 4][..], 100, 104)
+        );
+        assert_eq!(skb.tcp.flags, flags::ACK);
+        assert_eq!(
+            (rest.data().len(), rest.tcp.seq, rest.tcp.end_seq),
+            (6, 104, 111)
+        );
+        assert!(rest.tcp.has(flags::FIN | flags::PSH));
     }
 }

@@ -178,8 +178,7 @@ impl TcpCb {
         if handshake {
             self.syn_rtx = true;
             self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
-            let s = self.syn_seg();
-            out.segs.push(s);
+            self.syn_seg(out);
         } else {
             self.snd_nxt = self.snd_una;
             self.output(now, out);
@@ -193,8 +192,7 @@ impl TcpCb {
     pub(super) fn rtx_synack(&mut self, now: u64, out: &mut Out) {
         self.syn_rtx = true;
         self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
-        let s = self.syn_seg();
-        out.segs.push(s);
+        self.syn_seg(out);
         self.arm_rtx(now);
     }
 
@@ -203,7 +201,7 @@ impl TcpCb {
     /// with a reset when `reset`, when it sent within TIME_WAIT's length,
     /// or when the peer's window is shut with nothing in flight
     fn out_of_resources(&mut self, now: u64, reset: bool, out: &mut Out) -> bool {
-        if !self.orphan || !super::mem::out_of_memory(self.sndq.len()) {
+        if !self.orphan || !super::mem::out_of_memory(self.sndq_len()) {
             return false;
         }
         let reset = reset
@@ -306,7 +304,7 @@ impl TcpCb {
         if !self.opts.keepalive || !self.keep_state() {
             return;
         }
-        let busy = self.snd_una != self.snd_max || !self.sndq.is_empty();
+        let busy = self.snd_una != self.snd_max || self.sndq_len() != 0;
         let idle = self.idle(now);
         let next = if busy {
             self.keep_idle()

@@ -22,12 +22,14 @@ use alloc::sync::{Arc, Weak};
 
 use crate::sync::spin::Mutex;
 
-use super::cb::{Out, SegIn, TwCb};
+use super::cb::{Out, TwCb};
 use super::output::Tuple;
 use super::timer::{self, Expire, Slot};
 use crate::net::NetNamespace;
 use crate::net::inet::port::BindInfo;
 use crate::net::ipv4::IpParams;
+use crate::net::skb::SkBuff;
+use alloc::boxed::Box;
 
 pub struct TimeWait {
     pub tuple: Tuple,
@@ -74,26 +76,29 @@ impl TimeWait {
         timer::rearm(&mut g.1, want, self.me.clone() as Weak<dyn Expire>);
     }
 
-    /// A segment for this tuple. False: it is a new connection's SYN,
-    /// this entry is gone and the caller hands it to a listener.
-    pub fn rcv(self: &Arc<Self>, s: &SegIn<'_>, now: u64) -> bool {
+    /// A segment for this tuple (header in `skb.tcp`). Handed back: it
+    /// is a new connection's SYN, this entry is gone and the caller
+    /// gives it to a listener.
+    pub fn rcv(self: &Arc<Self>, skb: Box<SkBuff>, now: u64) -> Option<Box<SkBuff>> {
         let mut out = Out::default();
-        {
-            let mut g = self.inner.lock();
-            if g.0.tw_syn_ok(s) {
-                timer::rearm(&mut g.1, None, self.me.clone() as Weak<dyn Expire>);
-                drop(g);
-                self.net.tcp.tw_unhash(self);
-                return false;
-            }
-            let mut cb = g.0.cb(super::cfg(&self.net));
-            cb.input(s, now, &mut out);
-            g.0 = TwCb::from_cb(&cb);
-            self.post(&mut g, &out);
-            // Transmitted under the entry lock, in order
-            self.send(&out);
+        let s = skb.tcp;
+        let mut g = self.inner.lock();
+        if g.0.tw_syn_ok(&s) {
+            timer::rearm(&mut g.1, None, self.me.clone() as Weak<dyn Expire>);
+            drop(g);
+            self.net.tcp.tw_unhash(self);
+            return Some(skb);
         }
-        true
+        let mut cb = g.0.cb(super::cfg(&self.net));
+        cb.input(&s, skb, now, &mut out);
+        g.0 = TwCb::from_cb(&cb);
+        self.post(&mut g, &out);
+        // Transmitted under the entry lock, in order
+        self.send(&mut out);
+        drop(g);
+        // The control block's queues go after the lock
+        drop(cb);
+        None
     }
 
     fn post(self: &Arc<Self>, g: &mut (TwCb, Slot), out: &Out) {
@@ -104,10 +109,8 @@ impl TimeWait {
         }
     }
 
-    fn send(&self, out: &Out) {
-        for seg in &out.segs {
-            super::xmit(&self.net, &self.tuple, seg, self.params, self.oif);
-        }
+    fn send(&self, out: &mut Out) {
+        super::send_segs(&self.net, &self.tuple, out, self.params, self.oif);
     }
 }
 
@@ -123,7 +126,7 @@ impl Expire for TimeWait {
             cb.on_timer(now, &mut out);
             g.0 = TwCb::from_cb(&cb);
             self.post(&mut g, &out);
-            self.send(&out);
+            self.send(&mut out);
         }
     }
 }

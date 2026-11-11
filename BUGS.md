@@ -116,12 +116,6 @@ the table's leaf lock; Linux fib_table_flush is one walk. Path MTU
 exceptions (`route::NhExceptions`) have no generation id (Linux
 fnhe_genid), so they are not flushed when a device goes down.
 
-
-The TCP send and receive queues are one contiguous `VecDeque<u8>`
-each (`net/tcp/cb.rs`), grown fallibly but still a single allocation up
-to SO_SNDBUF/SO_RCVBUF: a large buffer fragments the heap. Linux keeps a
-queue of bounded skbs; hk should hold a queue of bounded chunks.
-
 ## Memory management gaps
 
 **Location**: `mm/`, `arch/*/paging.rs`, `ipc/shm.rs`

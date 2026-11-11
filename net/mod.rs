@@ -104,14 +104,10 @@ pub fn init() {
     tcp::mem::init();
     // Protocol handlers by EtherType (IPv6 will add 0x86DD here)
     // Linux's order: dev_add_pack puts each first
-    #[expect(clippy::boxed_local, reason = "PacketHandler takes a Box")]
-    fn arp_rcv_box(skb: alloc::boxed::Box<skb::SkBuff>) {
-        arp::arp_rcv(*skb);
-    }
     static IP_PACKET_TYPE: dev::PacketType =
         dev::PacketType::new(EtherType::Ipv4.to_be(), ipv4::ip_rcv);
     static ARP_PACKET_TYPE: dev::PacketType =
-        dev::PacketType::new(EtherType::Arp.to_be(), arp_rcv_box);
+        dev::PacketType::new(EtherType::Arp.to_be(), arp::arp_rcv);
     dev::dev_add_pack(&IP_PACKET_TYPE);
     dev::dev_add_pack(&ARP_PACKET_TYPE);
     // AF_PACKET sees frames in both directions
