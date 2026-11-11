@@ -9,7 +9,7 @@
 //! found again through the inode (`BSD` table, global like Linux's
 //! bsd_socket_buckets); connecting needs write permission on it. An
 //! abstract name (sun_path[0] == 0) lives in the socket's network
-//! namespace, separately per socket type (`UnixTable.names`). Autobind
+//! namespace, hashed with the socket type (`UnixTable`). Autobind
 //! picks "\0" + 5 hex digits. Unlinking the file does not unbind.
 //!
 //! Data moves between sockets directly: a sender queues skbs (`UnixCb`
@@ -40,10 +40,15 @@
 //!   queue to a dead socket); a leaf (`UnixCb.fp` aside): a message's
 //!   `Arc` is made before it, a reader takes a reference under it and
 //!   copies after, and taken messages are freed after it.
-//! - `UnixTable.st` (per netns) and `BSD` (`crate::sync::spin::RwLock`): after
-//!   `bindlock`; `addr` (`crate::sync::spin::RwLock` leaf) is set under them, so a
-//!   name found in a table always has its address. Lookups return
-//!   `Arc`s; no socket lock is taken under a table lock.
+//! - `UnixTable` buckets (per netns) and `BSD` buckets (global):
+//!   `crate::sync::spin::Mutex` per bucket (Linux unx.table.locks,
+//!   bsd_socket_locks), sockets linked intrusively and held weakly;
+//!   after `bindlock`. A bind makes its address first, then moves the
+//!   socket between two buckets locked in index order and publishes
+//!   `addr` (`crate::sync::spin::RwLock` leaf) under them, so a name
+//!   found in a bucket always has its address. Lookups return `Arc`s,
+//!   dropped after the bucket lock; no socket lock is taken under one;
+//!   /proc/net/unix formats each bucket under its lock into a `SeqBuf`.
 //! - `relay` (`crate::sync::spin::Mutex`; Linux peer_wait.lock for
 //!   peer_wake registrations) -> `peer_wait`'s head: a datagram poller
 //!   (or sender) that finds its peer's queue full links its own
@@ -60,8 +65,7 @@ pub mod scm;
 pub mod stream;
 
 use crate::util::kalloc::{try_arc, try_arc_cyclic};
-use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
@@ -71,6 +75,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering}
 use crate::sync::spin::{Mutex, MutexGuard, RwLock};
 
 use crate::fs::Dentry;
+use crate::fs::proc::seq::SeqBuf;
 use crate::io::fasync::{POLL_HUP, POLL_IN};
 use crate::io::poll::{POLLOUT, POLLWRBAND, POLLWRNORM};
 use crate::net::NetNamespace;
@@ -84,7 +89,7 @@ use crate::net::socket::{
 use crate::sync::Mutex as SMutex;
 use crate::sync::waitqueue::{WaitEntry, WaitQueue};
 use crate::util::error::KernelError;
-use crate::util::list::OwnedList;
+use crate::util::list::{Link, OwnedList, WeakList};
 use core::pin::Pin;
 
 use scm::{Creds, FpList};
@@ -280,79 +285,224 @@ pub struct UnixSock {
     /// Queue length limit (Linux sk_max_ack_backlog)
     backlog: AtomicU32,
     peercred: Mutex<Option<PeerCred>>,
+    /// Link on our namespace table's bucket (Linux sk_node)
+    node: Link,
+    /// Link on a `BSD` bucket while bound to a path (Linux sk_bind_node)
+    bind_node: Link,
+    /// Our table bucket (Linux sk_hash): changes under the old and new
+    /// buckets' locks; a filesystem binding's `BSD` bucket is its inode
+    /// number's
+    hash: AtomicU32,
+}
+
+impl Drop for UnixSock {
+    /// A socket never released (its creation failed before it had a
+    /// file) leaves the tables first: they hold it weakly and walkers
+    /// read linked sockets (WeakList's contract)
+    fn drop(&mut self) {
+        self.sk.net.unix.remove(self);
+        self.unhash_bsd();
+    }
 }
 
 /// A held unix_state_lock
 type StGuard<'a> = MutexGuard<'a, Option<Arc<UnixSock>>>;
 
-/// All sockets and abstract names of a network namespace (Linux
-/// net->unx.table)
-#[derive(Default)]
+/// Buckets per half of a namespace's table (Linux UNIX_HASH_SIZE)
+const UNIX_HASH_SIZE: usize = 256;
+const UNIX_HASH_MOD: u32 = UNIX_HASH_SIZE as u32 - 1;
+
+crate::adapter!(UnixNode, UnixSock, node);
+crate::adapter!(UnixBindNode, UnixSock, bind_node);
+
+/// A hash bucket: sockets linked through `node` (or `bind_node`), held
+/// weakly (Linux __sk_add_node takes no reference); a socket leaves it
+/// at release or, if never released, first thing in its drop
+type Bucket<A> = Mutex<WeakList<A>>;
+
+/// All sockets of a network namespace (Linux net->unx.table): unbound
+/// and filesystem-bound ones in the lower half, by address or inode
+/// number; abstract names in the upper half, by name and type. Each
+/// bucket has its own spin lock (Linux unx.table.locks), taken two at a
+/// time in index order when a bind moves a socket.
 pub struct UnixTable {
-    st: RwLock<Tables>,
+    buckets: Box<[Bucket<UnixNode>]>,
 }
 
-#[derive(Default)]
-struct Tables {
-    socks: BTreeMap<usize, Weak<UnixSock>>,
-    /// (type, sockaddr bytes) -> socket
-    names: BTreeMap<(i32, Vec<u8>), Weak<UnixSock>>,
+impl Default for UnixTable {
+    fn default() -> Self {
+        Self {
+            buckets: (0..2 * UNIX_HASH_SIZE)
+                .map(|_| Mutex::new(WeakList::new()))
+                .collect(),
+        }
+    }
+}
+
+/// Sockets bound to filesystem names, by socket inode number (Linux
+/// bsd_socket_buckets and bsd_socket_locks; global: a path reaches
+/// across namespaces), linked through `bind_node`
+static BSD: [Bucket<UnixBindNode>; UNIX_HASH_SIZE] =
+    [const { Mutex::new(WeakList::new()) }; UNIX_HASH_SIZE];
+
+/// Linux unix_unbound_hash
+fn unbound_hash(s: &UnixSock) -> u32 {
+    let mut h = s.id();
+    h ^= h >> 16;
+    h ^= h >> 8;
+    // Truncation intended: a bucket index
+    (h as u32 ^ s.sk.stype as u32) & UNIX_HASH_MOD
+}
+
+/// Linux unix_bsd_hash
+fn bsd_hash(ino: u64) -> u32 {
+    // Truncation intended: a bucket index
+    ino as u32 & UNIX_HASH_MOD
+}
+
+/// Linux unix_abstract_hash: a ones'-complement sum of the sockaddr
+/// (csum_partial + csum_fold), with the type, in the upper half
+fn abstract_hash(name: &[u8], stype: i32) -> u32 {
+    let mut sum: u32 = 0;
+    for c in name.chunks(2) {
+        sum += u32::from(u16::from_ne_bytes([c[0], *c.get(1).unwrap_or(&0)]));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let mut h = !sum & 0xffff;
+    h ^= h >> 8;
+    h ^= stype as u32;
+    UNIX_HASH_MOD + 1 + (h & UNIX_HASH_MOD)
 }
 
 impl UnixTable {
-    fn insert(&self, s: &Arc<UnixSock>) {
-        self.st.write().socks.insert(s.id(), Arc::downgrade(s));
+    fn bucket(&self, hash: u32) -> &Bucket<UnixNode> {
+        &self.buckets[hash as usize]
     }
 
-    /// Unhash at release: the socket, and its abstract name if it owns
-    /// it (an accepted socket shares its listener's name)
+    /// Linux unix_insert_unbound_socket (from unix_create1)
+    fn insert_unbound(&self, s: &Arc<UnixSock>) {
+        let h = unbound_hash(s);
+        s.hash.store(h, Ordering::Relaxed);
+        self.bucket(h).lock().push_front(s);
+    }
+
+    /// Linux unix_remove_socket (release, or the drop of a socket never
+    /// released): off its bucket if still on it
     fn remove(&self, s: &UnixSock) {
-        let mut t = self.st.write();
-        t.socks.remove(&s.id());
-        if let Some(a) = s.addr().filter(|a| a.is_abstract()) {
-            let key = (s.sk.stype, a.name.clone());
-            if t.names
-                .get(&key)
-                .is_some_and(|w| core::ptr::eq(w.as_ptr(), s))
-            {
-                t.names.remove(&key);
-            }
+        let mut b = self.bucket(s.hash.load(Ordering::Relaxed)).lock();
+        if s.node.is_linked() {
+            // SAFETY: a linked `node` is on the bucket `hash` names,
+            // which changes only under that bucket's lock (and the new
+            // one's), held here
+            drop(unsafe { b.remove(s) });
         }
     }
 
-    /// Bind an abstract name (EADDRINUSE if taken); the address is
-    /// published under the table lock
-    fn bind(&self, s: &Arc<UnixSock>, name: Vec<u8>) -> Result<(), KernelError> {
-        let mut t = self.st.write();
-        let key = (s.sk.stype, name);
-        if t.names.get(&key).is_some_and(|w| w.strong_count() > 0) {
-            return Err(KernelError::AddressInUse);
+    /// Linux unix_table_double_lock: both buckets in index order
+    fn lock2(
+        &self,
+        h1: u32,
+        h2: u32,
+    ) -> (
+        MutexGuard<'_, WeakList<UnixNode>>,
+        Option<MutexGuard<'_, WeakList<UnixNode>>>,
+    ) {
+        if h1 == h2 {
+            return (self.bucket(h1).lock(), None);
         }
-        *s.addr.write() = Some(try_arc(UnixAddr {
-            name: key.1.clone(),
-            path: None,
-        })?);
-        t.names.insert(key, Arc::downgrade(s));
+        let (lo, hi) = (h1.min(h2), h1.max(h2));
+        let a = self.bucket(lo).lock();
+        let b = self.bucket(hi).lock();
+        (a, Some(b))
+    }
+
+    /// Linux __unix_find_socket_byname: a live socket in bucket `b`
+    /// whose address is `name`
+    fn find_in(b: &WeakList<UnixNode>, name: &[u8]) -> Option<Arc<UnixSock>> {
+        b.iter()
+            .find(|e| e.get().addr.read().as_ref().is_some_and(|a| a.name == name) && e.is_live())
+            .and_then(|e| e.upgrade())
+    }
+
+    /// Linux __unix_set_addr_hash under unix_table_double_lock: publish
+    /// `addr` and move `s` to bucket `new`, unless `check` and a live
+    /// socket there has the name (EADDRINUSE). The address was made
+    /// before (Linux unix_create_addr); the caller holds `bindlock`.
+    fn set_addr(
+        &self,
+        s: &Arc<UnixSock>,
+        addr: Arc<UnixAddr>,
+        new: u32,
+        check: bool,
+    ) -> Result<(), (KernelError, Arc<UnixAddr>)> {
+        let old = s.hash.load(Ordering::Relaxed);
+        let (mut a, mut b) = self.lock2(old, new);
+        let (go, gn) = match &mut b {
+            None => (None, &mut a),
+            Some(b) if old < new => (Some(&mut a), b),
+            Some(b) => (Some(b), &mut a),
+        };
+        if check && let Some(found) = Self::find_in(gn, &addr.name) {
+            drop((a, b));
+            drop(found);
+            return Err((KernelError::AddressInUse, addr));
+        }
+        let gold = go.unwrap_or(&mut *gn);
+        if s.node.is_linked() {
+            // SAFETY: linked on bucket `old` (see `remove`), locked here
+            drop(unsafe { gold.remove(s) });
+        }
+        *s.addr.write() = Some(addr);
+        s.hash.store(new, Ordering::Relaxed);
+        gn.push_front(s);
         Ok(())
     }
 
+    /// Linux unix_find_socket_byname for an abstract name
     fn find(&self, stype: i32, name: &[u8]) -> Option<Arc<UnixSock>> {
-        let t = self.st.read();
-        t.names.get(&(stype, name.to_vec()))?.upgrade()
+        let b = self.bucket(abstract_hash(name, stype)).lock();
+        let s = Self::find_in(&b, name);
+        drop(b);
+        s
     }
 
-    fn all(&self) -> Vec<Arc<UnixSock>> {
-        let t = self.st.read();
-        t.socks.values().filter_map(|w| w.upgrade()).collect()
+    /// /proc/net/unix lines of every socket, bucket by bucket under
+    /// each bucket's lock (Linux unix_seq_start/next/show), into `m`
+    /// (allocating nothing)
+    fn show(&self, m: &mut SeqBuf) {
+        for b in self.buckets.iter() {
+            let b = b.lock();
+            for e in b.iter().filter(|e| e.is_live()) {
+                proc_line(m, e.get(), e.strong_count());
+            }
+        }
     }
 }
 
-/// Sockets bound to filesystem names, by socket inode (Linux
-/// bsd_socket_buckets; global: a path reaches across namespaces)
-static BSD: RwLock<BTreeMap<usize, Weak<UnixSock>>> = RwLock::new(BTreeMap::new());
+/// Linux unix_insert_bsd_socket
+fn insert_bsd(s: &Arc<UnixSock>, ino: u64) {
+    BSD[bsd_hash(ino) as usize].lock().push_front(s);
+}
 
-fn inode_key(d: &Dentry) -> Option<usize> {
-    d.get_inode().map(|i| Arc::as_ptr(&i) as usize)
+/// Linux unix_find_socket_byinode: the live socket bound to `inode`
+fn find_bsd(inode: &crate::fs::Inode) -> Option<Arc<UnixSock>> {
+    let b = BSD[bsd_hash(inode.ino) as usize].lock();
+    let s = b
+        .iter()
+        .find(|e| {
+            e.is_live()
+                && e.get().addr.read().as_ref().is_some_and(|a| {
+                    a.path
+                        .as_ref()
+                        .and_then(|d| d.get_inode())
+                        .is_some_and(|i| core::ptr::eq(Arc::as_ptr(&i), inode))
+                })
+        })
+        .and_then(|e| e.upgrade());
+    drop(b);
+    s
 }
 
 impl UnixSock {
@@ -377,8 +527,11 @@ impl UnixSock {
             dead: AtomicBool::new(false),
             backlog: AtomicU32::new(qlen),
             peercred: Mutex::new(None),
+            node: Link::new(),
+            bind_node: Link::new(),
+            hash: AtomicU32::new(0),
         })?;
-        s.sk.net.unix.insert(&s);
+        s.sk.net.unix.insert_unbound(&s);
         Ok(s)
     }
 
@@ -508,7 +661,7 @@ impl UnixSock {
             KernelError::AlreadyExists => KernelError::AddressInUse,
             e => e,
         })?;
-        let key = inode_key(&d);
+        let ino = d.get_inode().map(|i| i.ino);
         let addr = match try_arc(UnixAddr {
             name,
             path: Some(d),
@@ -520,50 +673,59 @@ impl UnixSock {
             }
         };
         let b = self.bindlock.lock();
-        if self.addr().is_some() {
+        let Some(ino) = ino.filter(|_| self.addr().is_none()) else {
             // Unlinked after bindlock is dropped (Linux out_unlink: the
             // parent's i_rwsem is never taken under bindlock)
             drop(b);
             crate::fs::dir::unlink_sock(&path);
             return Err(KernelError::InvalidArgument);
-        }
-        let key = key.ok_or(KernelError::NotFound)?;
-        let mut t = BSD.write();
-        *self.addr.write() = Some(addr);
-        t.insert(key, self.me.clone());
+        };
+        let me = self.arc();
+        let _ = self.sk.net.unix.set_addr(&me, addr, bsd_hash(ino), false);
+        insert_bsd(&me, ino);
         Ok(())
     }
 
+    /// Linux unix_bind_abstract: the address made first, EINVAL if
+    /// bound, EADDRINUSE if the name is taken
     fn bind_abstract(&self, name: Vec<u8>) -> Result<(), KernelError> {
+        let hash = abstract_hash(&name, self.sk.stype);
+        let addr = try_arc(UnixAddr { name, path: None })?;
         let _b = self.bindlock.lock();
         if self.addr().is_some() {
             return Err(KernelError::InvalidArgument);
         }
-        self.sk.net.unix.bind(&self.arc(), name)
+        self.sk
+            .net
+            .unix
+            .set_addr(&self.arc(), addr, hash, true)
+            .map_err(|(e, _)| e)
     }
 
     /// Linux unix_autobind: "\0" + 5 hex digits from a random start;
-    /// ENOSPC when all 2^20 are taken
+    /// ENOSPC when all 2^20 are taken. The address is made once, before
+    /// any lock, and its name rewritten for each try.
     pub fn autobind(&self) -> Result<(), KernelError> {
         let _b = self.bindlock.lock();
         if self.addr().is_some() {
             return Ok(());
         }
         let me = self.arc();
+        let mut name = crate::util::kmem::try_vec(SUN_PATH + 6, 0u8)?;
+        name[..SUN_PATH].copy_from_slice(&AF_UNIX.to_ne_bytes());
+        let mut addr = try_arc(UnixAddr { name, path: None })?;
         let mut n = crate::random::get_random_u32() & 0xFFFFF;
         let last = n;
         loop {
             n = (n + 1) & 0xFFFFF;
-            let mut name = Vec::with_capacity(SUN_PATH + 6);
-            name.extend_from_slice(&AF_UNIX.to_ne_bytes());
-            name.push(0);
-            let mut hex = String::new();
-            let _ = write!(hex, "{:05x}", n);
-            name.extend_from_slice(hex.as_bytes());
-            match self.sk.net.unix.bind(&me, name) {
-                Err(KernelError::AddressInUse) if n != last => continue,
-                Err(KernelError::AddressInUse) => return Err(KernelError::NoSpace),
-                r => return r,
+            // Ours alone until published
+            let a = Arc::get_mut(&mut addr).ok_or(KernelError::Busy)?;
+            hex5(&mut a.name[SUN_PATH + 1..], n);
+            let hash = abstract_hash(&a.name, self.sk.stype);
+            match self.sk.net.unix.set_addr(&me, addr, hash, true) {
+                Ok(()) => return Ok(()),
+                Err((_, a)) if n != last => addr = a,
+                Err(_) => return Err(KernelError::NoSpace),
             }
         }
     }
@@ -630,16 +792,17 @@ impl UnixSock {
         core::mem::take(&mut *g)
     }
 
+    /// Linux unix_remove_bsd_socket
     fn unhash_bsd(&self) {
-        let Some(key) = self
-            .addr()
-            .and_then(|a| a.path.as_ref().and_then(|d| inode_key(d)))
-        else {
+        if !self.bind_node.is_linked() {
             return;
-        };
-        let mut t = BSD.write();
-        if t.get(&key).is_some_and(|w| core::ptr::eq(w.as_ptr(), self)) {
-            t.remove(&key);
+        }
+        let mut b = BSD[self.hash.load(Ordering::Relaxed) as usize].lock();
+        if self.bind_node.is_linked() {
+            // SAFETY: a linked `bind_node` is on the `BSD` bucket of its
+            // inode number, which is our `hash` (set before the insert,
+            // never changed after: a bound socket does not rebind)
+            drop(unsafe { b.remove(self) });
         }
     }
 
@@ -729,12 +892,7 @@ fn find_other(net: &NetNamespace, a: &[u8], stype: i32) -> Result<Arc<UnixSock>,
     if !inode.mode().is_socket() {
         return Err(KernelError::ConnectionRefused);
     }
-    let key = Arc::as_ptr(&inode) as usize;
-    let s = BSD
-        .read()
-        .get(&key)
-        .and_then(|w| w.upgrade())
-        .ok_or(KernelError::ConnectionRefused)?;
+    let s = find_bsd(&inode).ok_or(KernelError::ConnectionRefused)?;
     if s.sk.stype != stype {
         return Err(KernelError::ProtocolType);
     }
@@ -929,8 +1087,10 @@ const SS_CONNECTED: u8 = 3;
 const SS_DISCONNECTING: u8 = 4;
 
 /// One line: kernel addresses print as 0 (Linux %pK for readers without
-/// CAP_SYSLOG under kptr_restrict)
-fn proc_line(out: &mut String, s: &Arc<UnixSock>) {
+/// CAP_SYSLOG under kptr_restrict); `refs` is its reference count.
+/// Written under its bucket's lock: a whole line or, on overflow,
+/// nothing (the file is generated again into a larger buffer).
+fn proc_line(m: &mut SeqBuf, s: &UnixSock, refs: usize) {
     let est = s.state() == ESTABLISHED;
     let st = match (s.has_file(), est) {
         (true, true) => SS_CONNECTED,
@@ -940,39 +1100,47 @@ fn proc_line(out: &mut String, s: &Arc<UnixSock>) {
     };
     let flags = if s.state() == LISTEN { SO_ACCEPTCON } else { 0 };
     let _ = write!(
-        out,
+        m,
         "{:016x}: {:08X} {:08X} {:08X} {:04X} {:02X} {:5}",
         0,
-        Arc::strong_count(s),
+        refs,
         0,
         flags,
         s.sk.stype,
         st,
         s.sk.ino.load(Ordering::Acquire)
     );
-    if let Some(a) = s.addr() {
-        out.push(' ');
+    if let Some(a) = s.addr.read().as_ref() {
+        let _ = m.write_char(' ');
         let p = &a.name[SUN_PATH..];
         let p = if a.is_abstract() {
-            out.push('@');
+            let _ = m.write_char('@');
             &p[1..]
         } else {
             &p[..p.len() - 1]
         };
         for &c in p {
-            out.push(if c == 0 { '@' } else { c as char });
+            let _ = m.write_char(if c == 0 { '@' } else { c as char });
         }
     }
-    out.push('\n');
+    let _ = m.write_char('\n');
 }
 
 /// `/proc/net/unix` of the reader's namespace
 pub fn proc_net_unix() -> Vec<u8> {
-    let mut out = String::from("Num       RefCount Protocol Flags    Type St Inode Path\n");
-    for s in crate::net::current_net_ns().unix.all() {
-        proc_line(&mut out, &s);
+    let net = crate::net::current_net_ns();
+    crate::fs::proc::seq::generate(|m| {
+        let _ = m.write_str("Num       RefCount Protocol Flags    Type St Inode Path\n");
+        net.unix.show(m);
+    })
+}
+
+/// `n` as five lower-case hex digits (Linux "%05x"), into `out`
+fn hex5(out: &mut [u8], n: u32) {
+    for (i, b) in out.iter_mut().take(5).enumerate() {
+        let d = (n >> (4 * (4 - i))) & 0xf;
+        *b = b"0123456789abcdef"[d as usize];
     }
-    out.into_bytes()
 }
 
 /// Queue `skb` on `to` (caller holds `to.st`, so `to` is alive) and

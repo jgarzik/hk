@@ -922,6 +922,11 @@ impl<'a, A: Adapter> WeakEntry<'a, A> {
     pub fn is_live(&self) -> bool {
         self.weak().strong_count() != 0
     }
+
+    /// Its strong references (a /proc refcount column)
+    pub fn strong_count(&self) -> usize {
+        self.weak().strong_count()
+    }
 }
 
 #[cfg(test)]

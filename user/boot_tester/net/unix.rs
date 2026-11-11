@@ -70,6 +70,7 @@ pub fn run_tests() {
     test_scm_creds();
     test_poll();
     test_proc();
+    test_proc_big();
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,6 +1559,57 @@ fn test_proc() {
     unlink(p);
     close(l);
     close(d);
+    t.done();
+}
+
+/// /proc/net/unix longer than a page is read whole: every one of many
+/// bound sockets has its line
+fn test_proc_big() {
+    let mut t = T::new(b"UNIX_PROC_BIG");
+    const N: usize = 80;
+    let mut fds = [0i32; N];
+    let mut name = *b"hk-ux-proc-big-socket-number-00";
+    let tag = name.len() - 2;
+    for (i, fd) in fds.iter_mut().enumerate() {
+        name[tag] = b'0' + (i / 10) as u8;
+        name[tag + 1] = b'0' + (i % 10) as u8;
+        *fd = ux(SOCK_DGRAM);
+        if ubind(*fd, &sun_abs(&name)) != 0 {
+            t.ok(b"bind", false, i as i64);
+        }
+    }
+    let f = sys_open(b"/proc/net/unix\0".as_ptr(), O_RDONLY, 0) as i32;
+    let buf = &mut [0u8; 32768];
+    let mut n = 0;
+    loop {
+        let r = sys_read(f as u64, buf[n..].as_mut_ptr(), (buf.len() - n) as u64);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+        if n == buf.len() {
+            break;
+        }
+    }
+    close(f);
+    let text = &buf[..n];
+    t.ok(b"over a page", n > 4096, n as i64);
+    let mut seen = 0;
+    for i in 0..N {
+        name[tag] = b'0' + (i / 10) as u8;
+        name[tag + 1] = b'0' + (i % 10) as u8;
+        let mut want = [0u8; 40];
+        want[0] = b'@';
+        want[1..1 + name.len()].copy_from_slice(&name);
+        let want = &want[..1 + name.len()];
+        if text.split(|&c| c == b'\n').any(|l| l.ends_with(want)) {
+            seen += 1;
+        }
+    }
+    t.eq(b"every socket", seen, N as i64);
+    for fd in fds {
+        close(fd);
+    }
     t.done();
 }
 
