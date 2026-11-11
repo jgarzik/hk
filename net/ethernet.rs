@@ -52,7 +52,7 @@ impl EtherType {
     }
 
     /// Convert to network byte order u16
-    pub fn to_be(self) -> u16 {
+    pub const fn to_be(self) -> u16 {
         match self {
             EtherType::Ipv4 => 0x0800,
             EtherType::Arp => 0x0806,

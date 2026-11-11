@@ -25,25 +25,28 @@
 //! ## Locking (see doc/LOCKING.md, Network)
 //!
 //! - `Softnet.poll_list`: `IrqSpinlock`, leaf. Taken by `napi_schedule`
-//!   (ISR) and the softnet thread. Capacity is reserved when a NAPI is
-//!   added, so the ISR never allocates.
+//!   (ISR) and the softnet thread. The NAPI contexts are linked through
+//!   their own `poll_list` link (Linux napi_struct.poll_list), so the ISR
+//!   never allocates.
 //! - `Softnet.backlog`: an `SkbQueue` (its spin lock, Linux
 //!   input_pkt_queue.lock), thread context only, leaf; skbs taken off
 //!   under it are dropped after.
-//! - `PTYPE_BASE` / `PTYPE_ALL`: `crate::sync::spin::RwLock`, thread context only, leaf;
-//!   handlers are copied out and called after the guard is dropped. Taps
+//! - `PTYPE_BASE`: an RCU list of static `PacketType`s (Linux ptype_base),
+//!   added to at boot, read under RCU; the handler is copied out and
+//!   called after the guard is dropped.
+//! - `PTYPE_ALL`: `crate::sync::spin::RwLock`, thread context only, leaf;
+//!   taps are copied out and called after the guard is dropped. They
 //!   run in the receive path (softnet or an inline backlog flush) and in
 //!   `dev_queue_xmit` callers, with no lock held by this module.
-//! - `NAPI_LIST`: `crate::sync::spin::Mutex`, thread context only, leaf.
 
 use crate::util::kalloc::arc_nofail;
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::sync::spin::{Mutex, RwLock};
+use crate::sync::spin::RwLock;
+use crate::util::list::{ArcList, Link};
+use crate::util::rculist::RcuList;
 use spin::Once;
 
 use crate::cpu::PerCpu;
@@ -88,16 +91,37 @@ pub type PacketTap = fn(&Tap<'_>);
 /// Most taps (each address family registers one)
 const MAX_TAPS: usize = 4;
 
-/// EtherType -> handler table (IPv4, ARP; IPv6 later)
-static PTYPE_BASE: RwLock<Vec<(u16, PacketHandler)>> = RwLock::new(Vec::new());
+/// A protocol's receive handler for an EtherType (Linux struct
+/// packet_type): a static, linked on `PTYPE_BASE` by `dev_add_pack`
+pub struct PacketType {
+    /// EtherType, host byte order
+    pub ty: u16,
+    pub func: PacketHandler,
+    /// On `PTYPE_BASE` (Linux packet_type.list)
+    list: Link,
+}
+
+crate::adapter!(pub PtypeLink, PacketType, list);
+
+impl PacketType {
+    pub const fn new(ty: u16, func: PacketHandler) -> Self {
+        Self {
+            ty,
+            func,
+            list: Link::new(),
+        }
+    }
+}
+
+/// The protocol handlers (IPv4, ARP; IPv6 later; Linux ptype_base):
+/// read under RCU, added to at boot
+static PTYPE_BASE: RcuList<PtypeLink, &'static PacketType> = RcuList::new();
 /// Taps that see all frames, both directions (AF_PACKET)
 static PTYPE_ALL: RwLock<[Option<PacketTap>; MAX_TAPS]> = RwLock::new([None; MAX_TAPS]);
 
-/// Register a protocol handler for an EtherType (host byte order)
-pub fn dev_add_pack(ethertype: u16, handler: PacketHandler) {
-    let mut t = PTYPE_BASE.write();
-    t.retain(|&(e, _)| e != ethertype);
-    t.push((ethertype, handler));
+/// Register a protocol handler (Linux dev_add_pack: first on the list)
+pub fn dev_add_pack(pt: &'static PacketType) {
+    PTYPE_BASE.insert_after(pt, |_| false);
 }
 
 /// Register a tap that sees every received and transmitted frame
@@ -115,12 +139,14 @@ fn deliver_taps(t: &Tap<'_>) {
     }
 }
 
+/// The handler for `ethertype`, copied out of the RCU walk: the
+/// handlers take socket locks and allocate, so they run after it
 fn ptype_lookup(ethertype: u16) -> Option<PacketHandler> {
+    let g = crate::sync::rcu::read_lock();
     PTYPE_BASE
-        .read()
-        .iter()
-        .find(|&&(e, _)| e == ethertype)
-        .map(|&(_, h)| h)
+        .iter(&g)
+        .find(|pt| pt.ty == ethertype)
+        .map(|pt| pt.func)
 }
 
 // ============================================================================
@@ -150,7 +176,11 @@ pub struct Napi {
     poller: Once<Weak<dyn NapiPoll>>,
     /// Polls run (stats)
     polls: AtomicU64,
+    /// On a softnet poll list while scheduled (Linux poll_list)
+    poll_list: Link,
 }
+
+crate::adapter!(NapiLink, Napi, poll_list);
 
 impl Napi {
     /// Create a NAPI context; attach the driver with [`netif_napi_add`]
@@ -162,6 +192,7 @@ impl Napi {
             weight: weight.clamp(1, NAPI_POLL_WEIGHT),
             poller: Once::new(),
             polls: AtomicU64::new(0),
+            poll_list: Link::new(),
         })
     }
 
@@ -188,30 +219,19 @@ impl Napi {
     }
 }
 
-/// All NAPI contexts (to reserve poll-list capacity)
-static NAPI_LIST: Mutex<Vec<Arc<Napi>>> = Mutex::new(Vec::new());
-
-/// Attach `poller` to `napi` and make it schedulable (process context)
+/// Attach `poller` to `napi` and make it schedulable (Linux
+/// netif_napi_add; process context)
 pub fn netif_napi_add(napi: &Arc<Napi>, poller: Weak<dyn NapiPoll>) {
     napi.poller.call_once(|| poller);
-    let n = {
-        let mut list = NAPI_LIST.lock();
-        list.push(Arc::clone(napi));
-        list.len()
-    };
-    // Each Napi is on at most one poll list at a time: with this capacity
-    // the ISR's push never allocates
-    for (_, sd) in SOFTNET.for_each_possible() {
-        let mut q = sd.poll_list.lock();
-        let extra = n.saturating_sub(q.len());
-        q.reserve(extra);
-    }
 }
 
 /// Forget `napi` (Linux netif_napi_del; process context): it must be
 /// disabled (`napi_disable`), so it is on no poll list and no poll runs
 pub fn netif_napi_del(napi: &Arc<Napi>) {
-    NAPI_LIST.lock().retain(|n| !Arc::ptr_eq(n, napi));
+    debug_assert!(
+        !napi.poll_list.is_linked(),
+        "netif_napi_del: NAPI still scheduled"
+    );
 }
 
 /// Schedule `napi` for polling on this CPU's softnet thread
@@ -267,8 +287,9 @@ fn napi_wait() {
 
 /// Per-CPU receive state (Linux struct softnet_data)
 struct Softnet {
-    /// NAPI contexts to poll (IRQ-safe: napi_schedule runs in ISRs)
-    poll_list: IrqSpinlock<VecDeque<Arc<Napi>>>,
+    /// NAPI contexts to poll, each holding a reference (IRQ-safe:
+    /// napi_schedule runs in ISRs; Linux sd->poll_list)
+    poll_list: IrqSpinlock<ArcList<NapiLink>>,
     /// Packets queued by netif_rx (Linux input_pkt_queue; thread
     /// context only)
     backlog: SkbQueue<Box<SkBuff>>,
@@ -277,6 +298,8 @@ struct Softnet {
     /// Set while a task processes this CPU's backlog (softnet thread or an
     /// inline flush): keeps the per-CPU processing single-threaded
     busy: AtomicBool,
+    /// Its `softnet/N` thread (Linux the CPU's ksoftirqd)
+    thread: Once<Arc<KThread>>,
     /// Packets processed (Linux softnet_stat "processed")
     processed: AtomicU64,
     /// Packets dropped on backlog overflow (softnet_stat "dropped")
@@ -288,10 +311,11 @@ struct Softnet {
 impl Softnet {
     const fn new() -> Self {
         Self {
-            poll_list: IrqSpinlock::new(VecDeque::new()),
+            poll_list: IrqSpinlock::new(ArcList::new()),
             backlog: SkbQueue::new(),
             wq: WaitQueue::new(),
             busy: AtomicBool::new(false),
+            thread: Once::new(),
             processed: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             time_squeeze: AtomicU64::new(0),
@@ -324,8 +348,6 @@ pub fn raise_timer() {
     SOFTNET.get(0).wq.wake_all();
 }
 
-/// Softnet threads, by CPU
-static SOFTNET_THREADS: Mutex<Vec<Arc<KThread>>> = Mutex::new(Vec::new());
 static SOFTNET_STARTED: AtomicU32 = AtomicU32::new(0);
 
 fn this_softnet() -> &'static Softnet {
@@ -344,7 +366,7 @@ pub fn softnet_init() {
         let name = alloc::format!("softnet/{cpu}");
         match crate::task::kthread::kthread_run(&name, softnet_thread, cpu, Some(cpu as u32)) {
             Ok(k) => {
-                SOFTNET_THREADS.lock().push(k);
+                SOFTNET.get(cpu as u32).thread.call_once(|| k);
                 started += 1;
             }
             Err(e) => crate::printkln!("net: cannot start softnet/{}: {:?}", cpu, e),

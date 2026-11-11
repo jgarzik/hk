@@ -101,8 +101,13 @@ pub fn start_threads() {
 pub fn init() {
     tcp::mem::init();
     // Protocol handlers by EtherType (IPv6 will add 0x86DD here)
-    dev::dev_add_pack(EtherType::Ipv4.to_be(), ipv4::ip_rcv);
-    dev::dev_add_pack(EtherType::Arp.to_be(), arp::arp_rcv);
+    // Linux's order: dev_add_pack puts each first
+    static IP_PACKET_TYPE: dev::PacketType =
+        dev::PacketType::new(EtherType::Ipv4.to_be(), ipv4::ip_rcv);
+    static ARP_PACKET_TYPE: dev::PacketType =
+        dev::PacketType::new(EtherType::Arp.to_be(), arp::arp_rcv);
+    dev::dev_add_pack(&IP_PACKET_TYPE);
+    dev::dev_add_pack(&ARP_PACKET_TYPE);
     // AF_PACKET sees frames in both directions
     dev::dev_add_tap(packet::tap);
 }
