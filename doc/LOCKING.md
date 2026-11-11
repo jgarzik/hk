@@ -146,6 +146,28 @@ interrupts stay on; to the preempt count and lockdep it is a spin lock
 two held at once). Used for the dentry hash table (3.3 Dentry), under
 `Dentry.d_lock`, with only `Dentry.d_name` (a leaf) taken inside it.
 
+### 1.3.2 Nulls hash bucket lock (util/hlist_nulls.rs)
+
+Linux hlist_nulls with inet_ehash_lockp: a `NullsHead` bucket's chain
+ends in a nulls marker carrying the bucket's value (its index), and
+each bucket has its own `sync::spin::Mutex<()>` (`NullsHead.lock`, one
+lockdep class for every bucket: built in `NullsHead::new`). Thread
+context only, interrupts stay on; never two buckets at once (a move
+between buckets is a del under one, then an add under the other); a
+leaf except what its users nest under it. Writers (`NullsGuard`:
+`add_head_rcu`, `del_rcu`, `find`) hold it; readers hold only
+`rcu::read_lock` (`iter_rcu`, `find_rcu`: Acquire loads, every link
+pointer stored with Release). An entry taken off keeps its `next` and
+may be hashed again at once, here or in another bucket, with no grace
+period: a reader that followed it ends at another nulls value, and
+`find_rcu` then walks again (Linux __inet_lookup_established). The
+bucket's reference of an entry taken off comes back as
+`NullsUnlinked`, dropped no earlier than a grace period later
+(`defer`: `rcu::put_rcu`; plain drop: synchronize_rcu, sleeping;
+`rehash` gives it to a bucket again), so a reader may take a
+reference (`NullsRef::arc`). A bucket dropped with entries waits for a
+grace period first (readers of other buckets may stand on them).
+
 ### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (sync/)
 
 Linux `struct mutex` and `struct rw_semaphore`: a contended lock sleeps
@@ -299,7 +321,18 @@ qhimark 10000) and runs them after releasing it, with preemption off
 not sleep and allocates only with a GFP named. It runs in the `rcuc/N`
 of the CPU whose list it joined, never in `rcu_gp` or a clock
 interrupt. The objects it drops must be safe to drop there: their last
-reference may be the one deferred. `rcu_barrier` (Linux; one caller at a time under
+reference may be the one deferred. `put_rcu(arc)` is the deferred
+drop that may be queued again on the same object before an earlier one
+ran (a `util::hlist_nulls` entry unhashed, rehashed and unhashed within
+one grace period): the object embeds an `RcuPuts` (`rcu_puts!`: a head
+and a count of references handed over, each leaked); the put that
+takes the count from 0 queues the head, and each callback (the head
+already idle again) drops one reference and, if its decrement left the
+count above 0, queues the head again, so the k-th reference goes in
+the k-th callback, queued after it was handed over: at least one full
+grace period. No lock; the count's RMWs (AcqRel) order a put against a
+callback's decrement. Same rules as `kfree_rcu` for the drop (runs in
+`rcuc/N`, preemption off). `rcu_barrier` (Linux; one caller at a time under
 `BARRIER_MUTEX`, sleeping) queues a callback behind each CPU's last one
 and waits for them all.
 

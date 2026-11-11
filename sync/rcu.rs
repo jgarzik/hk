@@ -25,8 +25,10 @@
 //!
 //! Callbacks (Linux call_rcu, kfree_rcu): an object with an embedded
 //! [`RcuHead`] is released after a grace period without the updater
-//! waiting ([`kfree_rcu`], [`RcuRetired::defer`], `RcuUnlinked::defer`).
-//! Each CPU queues its callbacks, stamped with the grace period they
+//! waiting ([`kfree_rcu`], [`RcuRetired::defer`], `RcuUnlinked::defer`);
+//! [`put_rcu`] drops references to an object with an embedded
+//! [`RcuPuts`], queueable again before an earlier one ran
+//! (`NullsUnlinked::defer`). Each CPU queues its callbacks, stamped with the grace period they
 //! wait for, on its own list; its clock interrupt wakes its `rcuc/N`
 //! once the first is ready, which runs them with preemption off.
 //! [`rcu_barrier`] waits for every callback queued before it.
@@ -609,6 +611,117 @@ pub fn kfree_rcu<T: HasRcuHead + Send + Sync>(a: Arc<T>) {
     unsafe { call_rcu(&*h, put::<T>, p) };
 }
 
+/// Deferred reference drops that may be queued again before earlier
+/// ones ran ([`put_rcu`]), embedded in the object ([`HasRcuPuts`]):
+/// an entry of a `util::hlist_nulls` table can be unhashed, hashed again
+/// and unhashed again within one grace period, so one [`RcuHead`] queued
+/// per drop ([`kfree_rcu`]) would be queued twice.
+///
+/// # Invariants
+/// `n` counts the references handed to `put_rcu` and not yet dropped,
+/// each leaked (`Arc::into_raw`); `head` is queued, or its callback is
+/// running, exactly while `n` > 0 (its callback re-queues it when the
+/// count it leaves is not zero).
+pub struct RcuPuts {
+    head: RcuHead,
+    n: AtomicUsize,
+}
+
+impl RcuPuts {
+    pub const fn new() -> Self {
+        Self {
+            head: RcuHead::new(),
+            n: AtomicUsize::new(0),
+        }
+    }
+
+    /// One more reference handed over: true if none was pending, so
+    /// the caller queues `head` (otherwise it is queued or its callback
+    /// runs and will re-queue it: the RMWs on `n` are totally ordered)
+    fn get(&self) -> bool {
+        self.n.fetch_add(1, Ordering::AcqRel) == 0
+    }
+
+    /// One reference dropped by the callback: true if more remain, put
+    /// after the callback was queued (its grace period may have begun
+    /// before them), so the callback queues `head` again
+    fn put(&self) -> bool {
+        self.n.fetch_sub(1, Ordering::AcqRel) > 1
+    }
+}
+
+impl Default for RcuPuts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A type that embeds an [`RcuPuts`]; implemented with
+/// [`rcu_puts!`](crate::rcu_puts)
+///
+/// # Safety
+/// `rcu_puts` returns a field of `self`, used for nothing else.
+pub unsafe trait HasRcuPuts {
+    fn rcu_puts(&self) -> &RcuPuts;
+}
+
+/// `rcu_puts!(Type, field)`: `Type.field` is its [`HasRcuPuts`]
+#[macro_export]
+macro_rules! rcu_puts {
+    ($t:ty, $field:ident) => {
+        // SAFETY: a field of the item, named for this use only
+        unsafe impl $crate::sync::rcu::HasRcuPuts for $t {
+            fn rcu_puts(&self) -> &$crate::sync::rcu::RcuPuts {
+                &self.$field
+            }
+        }
+    };
+}
+
+/// Drop one reference to `a` at least a grace period from now, without
+/// waiting (Linux kfree_rcu, but queueable again on the same object
+/// before an earlier one ran). Any context; never sleeps or allocates.
+/// The reference is counted in the object's [`RcuPuts`]; the first one
+/// queues its head, and each callback drops one reference and queues
+/// the head again while more are counted, so the k-th reference goes
+/// in the k-th callback, queued after the k-th was handed over. The
+/// drop runs in `rcuc/N`, preemption off: the object's last drop must
+/// not sleep, and allocates only with a GFP named.
+pub fn put_rcu<T: HasRcuPuts + Send + Sync>(a: Arc<T>) {
+    let h = core::ptr::from_ref(a.rcu_puts());
+    // INVARIANT: leaked here, counted below
+    let p = Arc::into_raw(a).cast::<()>();
+    // SAFETY: a field of the object (HasRcuPuts), kept by `p`
+    let puts = unsafe { &*h };
+    if puts.get() {
+        // SAFETY: the head is idle (`n` was 0: type invariant), a field
+        // of the object kept by the counted references until the last
+        // callback drops them; T is Send + Sync
+        unsafe { call_rcu(&puts.head, puts_cb::<T>, p) };
+    }
+}
+
+/// [`put_rcu`]'s callback: one counted reference dropped, the head
+/// queued again if more remain (it is idle: `do_batch` reset it)
+///
+/// # Safety
+/// `p` is an `Arc::into_raw` of a `T` counted in its `RcuPuts`, a grace
+/// period after the head was queued.
+unsafe fn puts_cb<T: HasRcuPuts + Send + Sync>(p: *const ()) {
+    let t = p.cast::<T>();
+    // SAFETY: a counted reference (the caller's) keeps it until the
+    // drop below
+    let puts = unsafe { &*t }.rcu_puts();
+    if puts.put() {
+        // SAFETY: references remain counted (leaked), so the object and
+        // its head live until a later callback; the head is idle again
+        unsafe { call_rcu(&puts.head, puts_cb::<T>, p) };
+    }
+    // SAFETY: one of the counted references (all clones of one Arc,
+    // so which is fungible), taken back once
+    drop(unsafe { Arc::from_raw(t) });
+}
+
 /// The clock interrupt of `cpu`: wake its `rcuc/N` if its first
 /// callback's grace period is over (Linux rcu_pending ->
 /// invoke_rcu_core)
@@ -841,6 +954,23 @@ mod tests {
             cur = h.next.load(Ordering::Relaxed);
         }
         v
+    }
+
+    /// put_rcu's count: only the first of a run of puts queues the head;
+    /// each callback drops one and queues again while puts remain, the
+    /// last one (count back to 0) not, and a later put starts over
+    #[test]
+    fn puts_count() {
+        let p = RcuPuts::new();
+        assert!(p.get());
+        assert!(!p.get() && !p.get());
+        // Callback 1 and 2 re-queue; a put lands while 3 is pending
+        assert!(p.put() && p.put());
+        assert!(!p.get());
+        assert!(p.put());
+        assert!(!p.put());
+        assert_eq!(p.n.load(Ordering::Relaxed), 0);
+        assert!(p.get());
     }
 
     /// Ready callbacks leave from the front, in order, up to the batch
