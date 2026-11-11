@@ -490,6 +490,12 @@ impl Owner {
     pub const fn new() -> Self {
         Self(AtomicU64::new(0))
     }
+
+    /// On some list now: a hint read without that list's lock (Linux's
+    /// unlocked list_empty() before taking it); exact under it
+    pub fn is_set(&self) -> bool {
+        self.0.load(Relaxed) != 0
+    }
 }
 
 impl Default for Owner {
@@ -554,6 +560,11 @@ impl<A: OwnerAdapter> OwnedList<A> {
 
     fn mine(&self, item: &A::Item) -> bool {
         A::owner(item).0.load(Relaxed) == self.id
+    }
+
+    /// `item` is on this list
+    pub fn contains(&self, item: &A::Item) -> bool {
+        self.mine(item)
     }
 
     /// Append `item`; panics if it is on a list through this link
@@ -962,6 +973,10 @@ mod tests {
         assert!(a.next(&y).is_none() && a.len() == 1);
         b.push_back(x.clone());
         assert_eq!(b.next(&z).map(|n| n.v), Some(1));
+        assert!(b.contains(&x) && !a.contains(&x) && a.contains(&y));
+        assert!(x.owner.is_set());
+        drop(b.remove(&x));
+        assert!(!x.owner.is_set());
     }
 
     #[test]

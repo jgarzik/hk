@@ -6,6 +6,7 @@
 //! the last one. Frames outside the allocator (MMIO) have no count and
 //! are never freed.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -245,7 +246,7 @@ pub fn next_swap_pte(t: PgTables<'_>, addr: u64, end: u64, ty: u8) -> Option<u64
 /// flush).
 pub fn copy_page_range(
     dst: PgTables<'_>,
-    dst_mm: &Mm,
+    dst_mm: &Arc<Mm>,
     src: PgTables<'_>,
     src_mm: &Mm,
     vma: &Vma,
@@ -293,7 +294,7 @@ enum CopyErr {
 /// `copy_page_range`'s walk
 struct CopyRange<'a> {
     dst: PgTables<'a>,
-    dst_mm: &'a Mm,
+    dst_mm: &'a Arc<Mm>,
     src_mm: &'a Mm,
     vma: &'a Vma,
     cow: bool,
@@ -335,6 +336,11 @@ impl PteWalk for CopyRange<'_> {
                 let new = self.spare.take().ok_or(CopyErr::Page(a))?;
                 copy_pinned(d.entry(a), se, new, a, self.vma);
                 continue;
+            }
+            // A swap entry makes the child one swapoff must visit
+            // (Linux copy_nonpresent_pte, under both PTE locks)
+            if SwapEntry::is_swap_pte(se.load(Ordering::Acquire)) {
+                super::prepare_for_swap_entries(self.dst_mm);
             }
             self.wp |= copy_pte(d.entry(a), se, self.cow).map_err(|_| CopyErr::Oom)?;
         }

@@ -892,6 +892,38 @@ pub struct Mm {
     /// Its AIO contexts (Linux mm->ioctx_table): torn down with the
     /// last user (`MmRef`'s drop: exit_aio before exit_mmap)
     ioctx: crate::io::aio::IoctxTable,
+    /// Its place on `MMLIST` (Linux mm->mmlist) and that list's mark
+    mmlist: crate::util::list::Link,
+    mmlist_owner: crate::util::list::Owner,
+}
+
+crate::owned_adapter!(pub MmlistLink, Mm, mmlist, mmlist_owner);
+
+/// Every address space that may hold swap entries, a reference each
+/// (Linux init_mm.mmlist under mmlist_lock): linked when it first gets
+/// one (reclaim's unmap, fork's copy of a swap PTE, under the PTE
+/// lock), unlinked by its last user after exit_mmap; swapoff walks it.
+/// A spin leaf, thread context; nothing allocates under it, and no
+/// user reference is dropped under it.
+static MMLIST: spin::Once<Mutex<crate::util::list::OwnedList<MmlistLink>>> = spin::Once::new();
+
+/// The list of address spaces with swap entries (`MMLIST`)
+pub fn mmlist() -> &'static Mutex<crate::util::list::OwnedList<MmlistLink>> {
+    MMLIST.call_once(|| Mutex::new(crate::util::list::OwnedList::new()))
+}
+
+/// `mm` may hold swap entries from now on: put it on `MMLIST` unless
+/// it is there (Linux mm_prepare_for_swap_entries, from
+/// try_to_unmap_one and copy_nonpresent_pte: an unlocked check, then
+/// again under mmlist_lock)
+pub fn prepare_for_swap_entries(mm: &Arc<Mm>) {
+    if mm.mmlist_owner.is_set() {
+        return;
+    }
+    let mut l = mmlist().lock();
+    if !l.contains(mm) {
+        l.push_back(mm.clone());
+    }
 }
 
 impl Mm {
@@ -1011,6 +1043,8 @@ impl MmRef {
                 membarrier: AtomicU32::new(0),
                 sigpage: AtomicU64::new(0),
                 ioctx: crate::io::aio::IoctxTable::new(),
+                mmlist: crate::util::list::Link::new(),
+                mmlist_owner: crate::util::list::Owner::new(),
             }
         }))
     }
@@ -1045,6 +1079,12 @@ impl Drop for MmRef {
             // goes (Linux __mmput: exit_aio, then exit_mmap)
             crate::io::aio::exit_aio(&self.0.ioctx);
             memory::exit_mmap(&self.0);
+            // Off the swapoff list (Linux __mmput); unlocked check as
+            // Linux: an add happens under a PTE lock exit_mmap took after
+            if self.0.mmlist_owner.is_set() {
+                let gone = mmlist().lock().remove(&self.0);
+                drop(gone);
+            }
         }
     }
 }
@@ -1162,7 +1202,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> KernelResult<MmRef> {
         if vma_needs_copy(&v) {
             let dst = pgtable::PgTables::new(&child, &map);
             let src = pgtable::PgTables::new(parent, &guard);
-            res = memory::copy_page_range(dst, &child, src, parent, &v).map(|wp| {
+            res = memory::copy_page_range(dst, child.arc(), src, parent, &v).map(|wp| {
                 if wp {
                     tlb::flush_tlb_mm_range(parent, v.start, v.end, tlb::PAGE_SHIFT, false);
                 }

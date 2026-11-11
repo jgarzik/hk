@@ -497,7 +497,7 @@ Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
     [→ AddressSpace.i_pages (spin leaf, Linux xa_lock; 3.2)]
     → AddressSpace.i_mmap (sleeping RwSem, Linux i_mmap_rwsem)
     → AnonVma.chain (sleeping RwSem, Linux anon_vma->rwsem)
-    → page_table_lock → PTE lock (spin)
+    → page_table_lock → PTE lock (spin) [→ MMLIST (spin leaf)]
     → SwapInfo.map (spin, Linux si->lock) | swap cache (IrqSpinlock,
       Linux i_pages; never nested with SwapInfo.map) | LRU add batch
       (IrqSpinlock, per CPU) | Lruvec.lock (IrqSpinlock, Linux lru_lock;
@@ -1777,10 +1777,22 @@ pub struct Zone {
   I/O happens under the page lock, never under a spinlock.
 - `SWAP_INFO` (spin `RwLock`, read mostly): the devices; `SWAPON`
   (sleeping `Mutex`, Linux swapon_mutex) serializes swapon/swapoff.
-  swapoff (`try_to_unuse`) clears SWP_WRITEOK, then walks every address
-  space (collected under `TASKLIST` and each task's alloc_lock, which
-  are dropped before any mm lock) with its mmap_lock held for reading, faulting the device's swap
-  PTEs in.
+  swapoff (`try_to_unuse`) clears SWP_WRITEOK, then walks `MMLIST`
+  and faults the device's swap PTEs of each address space in, its
+  mmap_lock held for reading.
+- `MMLIST` (`spin::Mutex` leaf, mm/mod.rs; Linux init_mm.mmlist under
+  mmlist_lock): an `OwnedList` of the address spaces that may hold
+  swap entries, one `Arc<Mm>` each. An mm is linked the first time it
+  gets one, under the PTE lock (reclaim's `try_to_unmap`, fork's copy
+  of a swap PTE into the child: Linux try_to_unmap_one,
+  copy_nonpresent_pte; an unlocked owner-mark check first, as Linux's
+  list_empty), and unlinked by its last user after exit_mmap (Linux
+  __mmput). swapoff takes each listed mm as a user
+  (`mmget_not_zero`) under it, drops it for the faults and retakes it
+  to step on from that mm, which its user keeps listed; the previous
+  user is dropped with it released (a last drop takes it to unlink).
+  Nothing allocates under it and no user reference is dropped under
+  it.
 
 #### LRU (mm/swap/lru.rs; Linux mm/swap.c lruvec)
 
