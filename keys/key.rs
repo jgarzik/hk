@@ -597,7 +597,11 @@ impl Drop for Key {
         // the key quota allows: Linux's key GC is iterative too)
         let mut stack = core::mem::take(self.keyring_keys.get_mut());
         while let Some(k) = stack.pop() {
+            // Its entry names its Arc's address, not the one it is moved
+            // to: removed here (its own Drop then finds no entry)
+            let at = Arc::as_ptr(&k);
             if let Some(mut key) = Arc::into_inner(k) {
+                super::remove_entry(key.serial, at);
                 stack.append(key.keyring_keys.get_mut());
             }
         }
@@ -636,5 +640,39 @@ mod tests {
         }
         drop(cur);
         drop(top);
+    }
+
+    /// A keyring's children freed with it leave the serial tree too:
+    /// they are torn down after being moved out of their Arc, at another
+    /// address than the one their entry names
+    #[test]
+    fn freed_children_leave_serial_tree() {
+        let ty = super::super::types::keyring_key_type();
+        let make = || {
+            super::super::alloc_key(|serial| {
+                Key::new(
+                    serial,
+                    ty.clone(),
+                    alloc::string::String::from("k"),
+                    0,
+                    0,
+                    0,
+                )
+            })
+            .unwrap()
+        };
+        let parent = make();
+        let child = make();
+        let grandchild = make();
+        super::super::register_key(&parent);
+        super::super::register_key(&child);
+        super::super::register_key(&grandchild);
+        let serials = [child.serial, grandchild.serial];
+        child.keyring_keys.write().push(grandchild);
+        parent.keyring_keys.write().push(child);
+        drop(parent);
+        for s in serials {
+            assert!(!super::super::has_entry(s), "serial {} left in the tree", s);
+        }
     }
 }

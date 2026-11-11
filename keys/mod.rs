@@ -198,15 +198,18 @@ pub fn lookup_key(serial: KeySerial) -> Option<Arc<Key>> {
 /// links and references go. Only its own entry: once it is out, the
 /// serial may be another key's.
 pub fn remove_key(key: &Key) {
+    remove_entry(key.serial, key);
+}
+
+/// Remove the entry at `serial` if it names the key at `at` (its Arc's
+/// address: a key moved out of its Arc to be freed passes the address
+/// it had)
+pub(crate) fn remove_entry(serial: KeySerial, at: *const Key) {
     let mut db = KEY_DATABASE.write();
     let own = db
-        .get(&key.serial)
-        .is_some_and(|e| core::ptr::eq(e.key.as_ptr(), key));
-    let node = if own {
-        db.remove_node(&key.serial)
-    } else {
-        None
-    };
+        .get(&serial)
+        .is_some_and(|e| core::ptr::eq(e.key.as_ptr(), at));
+    let node = if own { db.remove_node(&serial) } else { None };
     drop(db);
     drop(node);
 }
@@ -294,6 +297,12 @@ pub fn key_user_uncharge(uid: u32, bytes: usize) {
         u.nkeys = u.nkeys.saturating_sub(1);
         u.nbytes = u.nbytes.saturating_sub(bytes);
     }
+}
+
+/// The serial tree has an entry at `serial` (host tests)
+#[cfg(test)]
+pub fn has_entry(serial: KeySerial) -> bool {
+    KEY_DATABASE.read().get(&serial).is_some()
 }
 
 /// Get the number of keys in the database (for testing/debugging)
