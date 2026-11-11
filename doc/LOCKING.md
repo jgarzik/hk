@@ -278,6 +278,31 @@ around both ends of a grace period (Linux's smp_mb in
 rcu_gp_init/cleanup and smp_mb__after_unlock_lock). Taken in the clock
 interrupt, the idle loop and `rcu_gp`, never with another lock held.
 
+Callbacks (Linux call_rcu, kfree_rcu, rcu_do_batch): an object that
+readers may still see is released after a grace period without its
+updater waiting, through an `RcuHead` embedded in it (`rcu_head!`):
+`kfree_rcu(arc)`, `RcuRetired::defer`, `RcuUnlinked::defer` (the
+link freed and the list's reference dropped). `call_rcu` claims the
+head (queued twice is an assert, not a corrupt list), stamps it with
+the grace period that must end (`snap(GP_SEQ)`, sampled after a SeqCst
+fence under the list lock), links it on this CPU's list (`RcuData.cbs`:
+an IrqSpinlock leaf, Linux rcu_segcblist under the rdp lock; call_rcu
+may run in any context, an interrupt handler included) and asks
+`rcu_gp` for that grace period (`GP_REQ`, its wait queue woken after
+the list lock is released). Nothing else is taken under `cbs`. Each
+CPU's clock interrupt wakes its `rcuc/N` once the first callback's
+grace period is over (`RcuData.next_gp`, written under `cbs`; Linux
+rcu_pending -> invoke_rcu_core); `rcuc/N` takes a batch of ready
+callbacks off under `cbs` (Linux blimit 10, or pending >> 7, all past
+qhimark 10000) and runs them after releasing it, with preemption off
+(Linux runs them with bottom halves off): a callback is atomic, must
+not sleep and allocates only with a GFP named. It runs in the `rcuc/N`
+of the CPU whose list it joined, never in `rcu_gp` or a clock
+interrupt. The objects it drops must be safe to drop there: their last
+reference may be the one deferred. `rcu_barrier` (Linux; one caller at a time under
+`BARRIER_MUTEX`, sleeping) queues a callback behind each CPU's last one
+and waits for them all.
+
 Assumptions: a CPU joins grace periods (`rcu::cpu_online`) when its
 scheduler starts, before it runs anything, and never leaves (no CPU
 hotplug); every CPU takes the clock interrupt every tick (no NOHZ), so
@@ -995,7 +1020,8 @@ own gets the shared knullfs fs_struct from `get_task_fs` and
 `ack` WaitQueue. A thread created without a CPU gets one round-robin;
 every kernel thread stays on its CPU (`cpus_mask` holds only it, Linux
 kthread_bind). Standing threads: `ktimers/N` (one per CPU, runs its SOFT
-timer callbacks), `rcu_gp` (RCU grace periods, 1.4.2), the system
+timer callbacks), `rcu_gp` (RCU grace periods, 1.4.2), `rcuc/N` (one
+per CPU, its RCU callbacks, 1.4.2), the system
 workqueue worker, `softnet/N` (one per CPU, network receive; see 3.10),
 `kselftest` (boot only).
 
@@ -2358,7 +2384,8 @@ there. That is sound: the key and parent address are stored when the
 dentry is hashed in and change only while it is out of its bucket;
 the name is read under `d_name`, which only d_move/d_exchange write,
 with the dentry out of the tree. Linux walks
-buckets under RCU instead (hk has no call_rcu yet); entries are
+buckets under RCU instead (dentries are not yet freed after a grace
+period, Linux d_free's call_rcu); entries are
 published with Release stores so an RCU walk can come later. A walk
 that misses during a rename (`lookup_cached`/`cached` without the
 directory lock) is fine: lookup_slow rechecks under i_rwsem.
@@ -4381,7 +4408,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `PosixTimer.inner` | time/posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete). A CPU-time timer's clock value is read before it (that may take TASKLIST) |
 | `PosixTimer.sigq` | time/posix_timer.rs | spin Mutex | a timer_create timer's preallocated signal entry while it is not queued (Linux SIGQUEUE_PREALLOC); leaf, thread context: taken alone, never with `inner` or a signal lock. The entry is taken out to be queued by `signal::send_timer_sigqueue` with no lock held, and put back when its signal is dequeued (`posix_timer::deliver`, which rearms an interval timer under `inner`), flushed or refused (`reclaim`) |
 | CPU-timer state (`time/cpu_timer.rs`): `SignalStruct.cputimer`, `Task.cpu_next` | time/cpu_timer.rs | atomics | the group's running CPU totals and expiry hints, a thread's hints; written by the tick and accounting (interrupts off) and by `run` in task context. The group totals start (arming a process timer, `arm_group`) and stop (`run` finding nothing armed) only under `posix_timers`; sampling never starts them (Linux cpu_clock_sample_group with start=false for gettime). `run` (TIF_NOTIFY_RESUME on the way to user mode) takes `posix_timers` -> `PosixTimer.inner`, then `SignalStruct.rlim`, and sends signals after dropping them: expired timers go on a local firing list through their embedded `PosixTimer.elist` (Linux collect_timerqueue, no allocation), marked `collected` and `firing` under `inner`; after the lock each is unlinked, `collected` cleared under `inner`, and fired if `firing` is still set (settime and delete clear it). A timer still `collected` is skipped by another thread's pass, so it is never linked twice. The itimers' and RLIMIT_CPU's process signals are kept in locals (one each) |
-| timerfd `CANCEL_LIST` | time/timerfd.rs | `RcuList` (its `ends` spin leaf), thread only | the timerfds that armed TFD_TIMER_CANCEL_ON_SET (Linux cancel_list), linked through `Timerfd.clist`: `clock_was_set` walks it under `rcu::read_lock` and takes each one's `inner` (IrqSpinlock) in turn, skipping one whose `might_cancel` is off; `setup_cancel` decides under `inner` (`might_cancel`, `listed`), drops it, and the first arming links the timerfd; it stays linked until its release, which clears `listed` under `inner` and unlinks it with no lock held, the `RcuUnlinked` dropped (a grace period) in close's thread context. Never nested with `inner` |
+| timerfd `CANCEL_LIST` | time/timerfd.rs | `RcuList` (its `ends` spin leaf), thread only | the timerfds that armed TFD_TIMER_CANCEL_ON_SET (Linux cancel_list), linked through `Timerfd.clist`: `clock_was_set` walks it under `rcu::read_lock` and takes each one's `inner` (IrqSpinlock) in turn, skipping one whose `might_cancel` is off; `setup_cancel` decides under `inner` (`might_cancel`, `listed`), drops it, and the first arming links the timerfd; it stays linked until its release, which clears `listed` under `inner` and unlinks it with no lock held; the list's reference goes with `RcuUnlinked::defer` (Linux kfree_rcu: `Timerfd.rcu`), dropped by `rcuc/N` after a grace period, its timer already cancelled (a HARD hrtimer's drop only spins on a running callback, and none runs). Never nested with `inner` |
 | `TimerBase.wheel` (per CPU, HARD and SOFT) | time/timer.rs | IrqSpinlock leaf | a 64-slot wheel of `TimerList`s (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the tick, by `ktimers/N` and by arming/deleting code in any context |
 | `HrBase.q` (per CPU, HARD and SOFT) | time/hrtimer.rs | IrqSpinlock leaf | sorted lists of `HrTimer`s per clock (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the clock event interrupt, by `ktimers/N` and by start/cancel in any context. `SOFT_ACTIVATED` (per-CPU atomic, Linux softirq_activated): set by the clock interrupt when it hands due SOFT timers to `ktimers/N`, cleared by it after its pass (interrupts off, then reprogram); while set the clock event counts only HARD timers |
 | `EPNESTED` (sleeping) → `Eventpoll.mtx` (sleeping) → `EpItem.regs` (spin) → file wait queue heads → `Eventpoll.lock` (IrqSpinlock); `File.f_ep` (spin leaf) | io/epoll.rs | see column 1 | epoll (Linux epnested_mutex, ep->mtx, ep->lock, file->f_lock): `EPNESTED` serializes an epoll target's loop check and insert. `Eventpoll.mtx` (Linux ep->mtx) holds the item map (Linux ep->rbr) and, as Linux, is held across each epoll_ctl operation (an add polls the target with it held, registering), each scan of the ready list (epoll_wait's `send_events`, Linux ep_send_events, with its items' polls and copies to user; the epoll file's own poll, Linux __ep_eventpoll_poll) and each item's removal (EPOLL_CTL_DEL, and a watched file's release: `eventpoll_release` takes each watching epoll's `mtx` in turn), so one scan at a time looks at the ready list. An epoll watched by another is polled with the outer one's `mtx` held and takes its own inside (Linux mutex_lock_nested by depth; hk lockdep does not check nesting within a class): the loop check under `EPNESTED` keeps the nesting acyclic and at most EP_MAX_NESTS deep. A file's last `FileRef` dropped under it only queues the release (`fput`), whose `eventpoll_release` takes it later. To poll an item's file, epoll takes a reference with `FileRef::try_get` (Linux epi_fget), always under `mtx`: an item a holder sees is still in the map, so its file's release has not passed this epoll's `eventpoll_release` and keeps its `Arc` until then: a failed `try_get` never drops the file's last one. `EpItem.regs` holds an item's callback entries: an add polls the file (a poll method may sleep) into a local list and swaps it into `regs` after; unregistering takes the watched file's queue locks under it, before the item leaves the map and ready list, so no callback can queue it again. `Eventpoll.lock` (Linux ep->lock) holds the ready list (`EpItem.rdlink`): `ep_poll_callback` runs under a woken queue's lock (possibly in an interrupt), queues the item under it, then wakes the epoll's own queues after releasing it (a nested epoll's callback in turn: bounded by EP_MAX_NESTS, no cycles). A scan takes the items queued when it starts off the front one at a time (Linux ep_start_scan) and polls each with the lock released; an event meanwhile queues one again at the end (Linux's ovflist), a level-triggered one reported goes back at the end, one whose copy-out failed back in front, and waiters are woken after if any is ready (ep_done_scan). Nothing sleeps, allocates, polls, copies to user or drops a last `Arc<EpItem>` under `Eventpoll.lock`. `File.f_ep` (Linux file->f_ep under file->f_lock) lists the items watching the file through `EpItem.fllink`, holding a reference each (no allocation): an add links the item, EPOLL_CTL_DEL and an epoll's drop unlink it if still linked (an item's link is only ever on its own file's list), the file's release takes them off one at a time under it; the loop check counts an epoll file's watchers under it, sizes its vector with it released and fills it under it (no add meanwhile: `EPNESTED`). |

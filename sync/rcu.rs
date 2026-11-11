@@ -23,6 +23,14 @@
 //! wakes `rcu_gp`, which makes `GP_SEQ` even and wakes the waiters.
 //! One flat mask, where Linux has a tree of rcu_node masks.
 //!
+//! Callbacks (Linux call_rcu, kfree_rcu): an object with an embedded
+//! [`RcuHead`] is released after a grace period without the updater
+//! waiting ([`kfree_rcu`], [`RcuRetired::defer`], `RcuUnlinked::defer`).
+//! Each CPU queues its callbacks, stamped with the grace period they
+//! wait for, on its own list; its clock interrupt wakes its `rcuc/N`
+//! once the first is ready, which runs them with preemption off.
+//! [`rcu_barrier`] waits for every callback queued before it.
+//!
 //! ## Locking (doc/LOCKING.md 1.4.2)
 //! `NODE` (IrqSpinlock leaf, Linux rcu_node.lock) holds the mask of CPUs
 //! still owing a quiescent state; `GP_SEQ` changes only under it, so a
@@ -36,10 +44,14 @@
 //! released. A CPU joins `ONLINE` when its scheduler
 //! starts and never leaves (no CPU hotplug); every CPU takes the clock
 //! interrupt every tick (no NOHZ), so idle CPUs report too.
+//! `RcuData.cbs` (IrqSpinlock leaf, Linux the rdp's callback list) holds
+//! a CPU's callbacks; nothing is taken under it and callbacks run after
+//! it is released.
 
 use alloc::sync::Arc;
+use core::cell::UnsafeCell;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
@@ -160,6 +172,9 @@ pub fn clock_irq() {
     use crate::arch::{CurrentArch, PerCpuOps};
     let quiet = crate::arch::preempt_count() == 0 && CurrentArch::interrupt_depth() == 1;
     report(quiet);
+    if let Some(cpu) = crate::cpu::try_this_id() {
+        cbs_ready_irq(cpu);
+    }
 }
 
 /// A context switch passed a quiescent state (Linux
@@ -334,6 +349,17 @@ impl<T> Drop for RcuArc<T> {
 #[must_use]
 pub struct RcuRetired<T>(Option<Arc<T>>);
 
+impl<T: HasRcuHead + Send + Sync> RcuRetired<T> {
+    /// Release it after a grace period without waiting for one (Linux
+    /// kfree_rcu instead of synchronize_rcu + kfree): the drop runs in
+    /// `rcuc/N` ([`kfree_rcu`]'s rules)
+    pub fn defer(mut self) {
+        if let Some(a) = self.0.take() {
+            kfree_rcu(a);
+        }
+    }
+}
+
 impl<T> Drop for RcuRetired<T> {
     fn drop(&mut self) {
         if let Some(a) = self.0.take() {
@@ -343,8 +369,401 @@ impl<T> Drop for RcuRetired<T> {
     }
 }
 
+// ============================================================================
+// Callbacks (Linux call_rcu, kfree_rcu, rcu_do_batch, rcu_barrier)
+// ============================================================================
+
+/// A callback's place on a CPU's callback list (Linux struct rcu_head),
+/// embedded in the object it releases ([`HasRcuHead`]). Queued at most
+/// once at a time: a second queueing while the first waits is a bug
+/// (Linux debug_rcu_head_queue), stopped by an assert.
+///
+/// # Invariants
+/// `next` is `IDLE` while the head is on no list; `func` is written only
+/// by the one queueing that claimed the head (`next` from `IDLE` to
+/// null), before it is linked under its list's lock, and read only by
+/// the `rcuc/N` that took it off under that lock, before it sets `next`
+/// back to `IDLE` (Release; a claim is an Acquire).
+pub struct RcuHead {
+    next: AtomicPtr<RcuHead>,
+    /// The `GP_SEQ` value it waits for (rcu_seq_snap when queued)
+    gp: AtomicU64,
+    /// What to run, on what (an object reference taken by the queueing)
+    func: UnsafeCell<Option<(RcuFn, *const ())>>,
+}
+
+// SAFETY: `func` is touched only by the claimant, then by the runner,
+// ordered by the list lock (type invariant); the rest are atomics
+unsafe impl Sync for RcuHead {}
+// SAFETY: as above
+unsafe impl Send for RcuHead {}
+
+/// A callback: run once, after a grace period, on its argument
+///
+/// # Safety
+/// (Of each such fn) its argument is the one queued with it.
+pub type RcuFn = unsafe fn(*const ());
+
+/// The `next` of a head on no list (never a head's address)
+const IDLE: *mut RcuHead = core::ptr::dangling_mut();
+
+impl RcuHead {
+    pub const fn new() -> Self {
+        Self {
+            next: AtomicPtr::new(IDLE),
+            gp: AtomicU64::new(0),
+            func: UnsafeCell::new(None),
+        }
+    }
+}
+
+impl Default for RcuHead {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A type that embeds an [`RcuHead`] for its deferred release (Linux
+/// kfree_rcu(ptr, rhf)); implemented with [`rcu_head!`](crate::rcu_head)
+///
+/// # Safety
+/// `rcu_head` returns a field of `self`, used for nothing else.
+pub unsafe trait HasRcuHead {
+    fn rcu_head(&self) -> &RcuHead;
+}
+
+/// `rcu_head!(Type, field)`: `Type.field` is its [`HasRcuHead`]
+#[macro_export]
+macro_rules! rcu_head {
+    ($t:ty, $field:ident) => {
+        // SAFETY: a field of the item, named for this use only
+        unsafe impl $crate::sync::rcu::HasRcuHead for $t {
+            fn rcu_head(&self) -> &$crate::sync::rcu::RcuHead {
+                &self.$field
+            }
+        }
+    };
+}
+
+/// A CPU's callbacks in queueing order (Linux rcu_segcblist, one
+/// segment: each head carries its own grace period)
+///
+/// # Invariants
+/// `head` through `next` to `tail` are the claimed heads queued here,
+/// each holding the object reference its `func` releases; `pending`
+/// counts them plus those taken off and not yet run (Linux
+/// rcu_segcblist_n_cbs).
+struct CbList {
+    head: *mut RcuHead,
+    tail: *mut RcuHead,
+    pending: usize,
+}
+
+// SAFETY: the heads are reached only under the list's lock
+unsafe impl Send for CbList {}
+
+/// A CPU's callback state (Linux struct rcu_data)
+struct RcuData {
+    /// Its callbacks (IrqSpinlock leaf: call_rcu may run in an
+    /// interrupt handler)
+    cbs: IrqSpinlock<CbList>,
+    /// The grace period the first callback waits for (u64::MAX: none),
+    /// written under `cbs`, read by the clock interrupt
+    next_gp: AtomicU64,
+    /// `rcuc/N` waits here
+    wq: WaitQueue,
+}
+
+static RDP: crate::cpu::PerCpu<RcuData> = crate::percpu![RcuData {
+    cbs: IrqSpinlock::new(CbList {
+        head: core::ptr::null_mut(),
+        tail: core::ptr::null_mut(),
+        pending: 0,
+    }),
+    next_gp: AtomicU64::new(u64::MAX),
+    wq: WaitQueue::new(),
+}];
+
+/// Callbacks run per batch at least (Linux DEFAULT_RCU_BLIMIT)
+const BLIMIT: usize = 10;
+/// Past this many pending, a batch runs them all (Linux qhimark)
+const QHIMARK: usize = 10_000;
+/// A batch runs at least pending >> this (Linux rcu_divisor)
+const DIVISOR: u32 = 7;
+
+impl CbList {
+    /// Link a claimed head at the tail
+    ///
+    /// # Safety
+    /// `h` is claimed (`next` null) by the caller, live until its
+    /// callback runs.
+    unsafe fn push(&mut self, h: *mut RcuHead) {
+        // SAFETY: the tail is a queued head (type invariant), `h` the
+        // caller's
+        match unsafe { self.tail.as_ref() } {
+            Some(t) => t.next.store(h, Ordering::Relaxed),
+            None => self.head = h,
+        }
+        // INVARIANT: `h` is queued, with its reference
+        self.tail = h;
+        self.pending += 1;
+    }
+
+    /// The grace period of the first head (u64::MAX: none)
+    fn first_gp(&self) -> u64 {
+        // SAFETY: a queued head (type invariant)
+        unsafe { self.head.as_ref() }.map_or(u64::MAX, |h| h.gp.load(Ordering::Relaxed))
+    }
+
+    /// Take off up to `max` heads from the front whose grace period is
+    /// over by `seq`, as a chain ending in null; how many
+    fn take_ready(&mut self, seq: u64, max: usize) -> (*mut RcuHead, usize) {
+        let first = self.head;
+        let mut last: *mut RcuHead = core::ptr::null_mut();
+        let mut n = 0;
+        let mut cur = self.head;
+        // SAFETY: queued heads (type invariant)
+        while let Some(h) = unsafe { cur.as_ref() } {
+            if n == max || !done(seq, h.gp.load(Ordering::Relaxed)) {
+                break;
+            }
+            last = cur;
+            cur = h.next.load(Ordering::Relaxed);
+            n += 1;
+        }
+        if n == 0 {
+            return (core::ptr::null_mut(), 0);
+        }
+        // SAFETY: `last` is a queued head; the chain from `first` to it
+        // leaves the list (still counted in `pending` until run)
+        unsafe { (*last).next.store(core::ptr::null_mut(), Ordering::Relaxed) };
+        // INVARIANT: the rest of the list starts at `cur`
+        self.head = cur;
+        if cur.is_null() {
+            self.tail = core::ptr::null_mut();
+        }
+        (first, n)
+    }
+}
+
+/// Queue `func(arg)` to run after a grace period (Linux call_rcu):
+/// `arg` is a reference to the object `h` is embedded in, which `func`
+/// releases. Any context; never sleeps, never allocates. Panics if `h`
+/// is queued already.
+///
+/// # Safety
+/// `h` lives until `func(arg)` runs (it is in the object `arg` keeps),
+/// and `func(arg)` may run on any CPU with preemption off.
+pub unsafe fn call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) {
+    let claimed = h
+        .next
+        .compare_exchange(
+            IDLE,
+            core::ptr::null_mut(),
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
+        .is_ok();
+    assert!(claimed, "call_rcu: head already queued");
+    // SAFETY: claimed: only this queueing writes it (type invariant)
+    unsafe { *h.func.get() = Some((func, arg)) };
+    let d = RDP.this();
+    let want = {
+        let mut l = d.cbs.lock();
+        // The caller's unlink is seen before the grace period sampled
+        // (Linux's full barrier in __call_rcu_common)
+        fence(Ordering::SeqCst);
+        let want = snap(GP_SEQ.load(Ordering::Acquire));
+        h.gp.store(want, Ordering::Relaxed);
+        let first = l.head.is_null();
+        // SAFETY: claimed above, live until its callback (the caller)
+        unsafe { l.push(core::ptr::from_ref(h).cast_mut()) };
+        if first {
+            d.next_gp.store(want, Ordering::Release);
+        }
+        want
+    };
+    // Ask rcu_gp for the grace period (Linux rcu_start_this_gp)
+    if GP_REQ.fetch_max(want, Ordering::SeqCst) < want {
+        GP_KICK.wake_all();
+    }
+}
+
+/// Release one reference to `a` after a grace period (Linux
+/// kfree_rcu): its readers may still hold `&T` under a guard. The drop
+/// runs in `rcuc/N`, preemption off: it must not sleep, and allocates
+/// only with a GFP named.
+pub fn kfree_rcu<T: HasRcuHead + Send + Sync>(a: Arc<T>) {
+    /// The reference queued, dropped
+    ///
+    /// # Safety
+    /// `p` is the `Arc::into_raw` queued with it.
+    unsafe fn put<T>(p: *const ()) {
+        // SAFETY: `Arc::into_raw` of `kfree_rcu`, taken back once
+        drop(unsafe { Arc::from_raw(p.cast::<T>()) });
+    }
+    let h = core::ptr::from_ref(a.rcu_head());
+    let p = Arc::into_raw(a).cast::<()>();
+    // SAFETY: the head is a field of the object (HasRcuHead), kept by
+    // the reference `p` until `put` drops it; T is Send + Sync
+    unsafe { call_rcu(&*h, put::<T>, p) };
+}
+
+/// The clock interrupt of `cpu`: wake its `rcuc/N` if its first
+/// callback's grace period is over (Linux rcu_pending ->
+/// invoke_rcu_core)
+fn cbs_ready_irq(cpu: u32) {
+    let d = RDP.get(cpu);
+    if done(
+        GP_SEQ.load(Ordering::Acquire),
+        d.next_gp.load(Ordering::Acquire),
+    ) {
+        d.wq.wake_all();
+    }
+}
+
+/// Run a batch of `d`'s ready callbacks (Linux rcu_do_batch):
+/// preemption off, as Linux runs them with bottom halves off
+fn do_batch(d: &RcuData) {
+    let seq = GP_SEQ.load(Ordering::Acquire);
+    // Readers that saw the objects are over before they are released
+    fence(Ordering::SeqCst);
+    let (mut cur, n) = {
+        let mut l = d.cbs.lock();
+        let bl = if l.pending > QHIMARK {
+            usize::MAX
+        } else {
+            BLIMIT.max(l.pending >> DIVISOR)
+        };
+        let r = l.take_ready(seq, bl);
+        d.next_gp.store(l.first_gp(), Ordering::Release);
+        r
+    };
+    percpu::preempt_disable();
+    // SAFETY: the chain just taken off: claimed heads, each live until
+    // its callback runs (call_rcu's contract)
+    while let Some(h) = unsafe { cur.as_ref() } {
+        cur = h.next.load(Ordering::Relaxed);
+        // SAFETY: the claimant wrote it before queueing; this runner
+        // took the head off under the lock (type invariant)
+        let f = unsafe { (*h.func.get()).take() };
+        // INVARIANT: on no list again; `h` is not touched after this
+        // (the callback may free it)
+        h.next.store(IDLE, Ordering::Release);
+        if let Some((func, arg)) = f {
+            // SAFETY: call_rcu's contract: a grace period has passed
+            // since it was queued, preemption is off
+            unsafe { func(arg) };
+        }
+    }
+    percpu::preempt_enable();
+    d.cbs.lock().pending -= n;
+}
+
+/// `rcuc/N` (Linux rcu_cpu_kthread): CPU N's ready callbacks
+fn rcuc(cpu: usize) {
+    let d = RDP.get(cpu as u32);
+    loop {
+        d.wq.wait_event(|| {
+            done(
+                GP_SEQ.load(Ordering::Acquire),
+                d.next_gp.load(Ordering::Acquire),
+            )
+        });
+        do_batch(d);
+        crate::task::percpu::cond_resched();
+    }
+}
+
+/// Start `rcuc/N` on every CPU with a scheduler (Linux
+/// rcu_spawn_core_kthreads); callbacks queued before wait for it
+pub fn spawn_core_kthreads() {
+    for cpu in 0..crate::cpu::nr_cpu_ids() {
+        if !crate::task::percpu::cpu_has_scheduler(cpu) {
+            continue;
+        }
+        let name = alloc::format!("rcuc/{}", cpu);
+        if let Err(e) = crate::task::kthread::kthread_run(&name, rcuc, cpu as usize, Some(cpu)) {
+            panic!("rcu: cannot start {}: {:?}", name, e);
+        }
+    }
+}
+
+/// `rcu_barrier` callers, one at a time (Linux rcu_state.barrier_mutex)
+static BARRIER_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+/// Barrier callbacks not yet run, plus one held by `rcu_barrier` while
+/// it queues them (Linux barrier_cpu_count)
+static BARRIER_LEFT: AtomicUsize = AtomicUsize::new(0);
+static BARRIER_DONE: crate::sync::completion::Completion =
+    crate::sync::completion::Completion::new();
+/// Each CPU's barrier callback (Linux rcu_data.barrier_head)
+static BARRIER_HEAD: crate::cpu::PerCpu<RcuHead> = crate::percpu![RcuHead::new()];
+
+/// A barrier callback ran
+///
+/// # Safety
+/// None beyond [`RcuFn`]'s: the argument is unused.
+unsafe fn barrier_cb(_: *const ()) {
+    if BARRIER_LEFT.fetch_sub(1, Ordering::AcqRel) == 1 {
+        BARRIER_DONE.complete();
+    }
+}
+
+/// Queue `cpu`'s barrier callback behind its last callback, if it has
+/// any (Linux rcu_barrier_entrain): it runs after all of them
+fn barrier_entrain(cpu: u32) {
+    let d = RDP.get(cpu);
+    let h = BARRIER_HEAD.get(cpu);
+    {
+        let mut l = d.cbs.lock();
+        if l.pending == 0 {
+            return;
+        }
+        BARRIER_LEFT.fetch_add(1, Ordering::AcqRel);
+        let claimed = h
+            .next
+            .compare_exchange(
+                IDLE,
+                core::ptr::null_mut(),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok();
+        assert!(claimed, "rcu_barrier: barrier head queued");
+        // SAFETY: claimed just now (type invariant)
+        unsafe { *h.func.get() = Some((barrier_cb, core::ptr::null())) };
+        // The last one's grace period, or none if all were taken off
+        // to run: then it is ready at once
+        // SAFETY: the tail is a queued head (CbList invariant)
+        let gp = unsafe { l.tail.as_ref() }.map_or(0, |t| t.gp.load(Ordering::Relaxed));
+        h.gp.store(gp, Ordering::Relaxed);
+        let first = l.head.is_null();
+        // SAFETY: claimed, and a static
+        unsafe { l.push(core::ptr::from_ref(h).cast_mut()) };
+        if first {
+            d.next_gp.store(gp, Ordering::Release);
+        }
+    }
+    d.wq.wake_all();
+}
+
+/// Wait until every callback queued before this call has run (Linux
+/// rcu_barrier); thread context, may sleep
+pub fn rcu_barrier() {
+    crate::sync::might_sleep();
+    let _m = BARRIER_MUTEX.lock();
+    BARRIER_LEFT.store(1, Ordering::Release);
+    for (cpu, _) in RDP.for_each_possible() {
+        barrier_entrain(cpu);
+    }
+    if BARRIER_LEFT.fetch_sub(1, Ordering::AcqRel) == 1 {
+        BARRIER_DONE.complete();
+    }
+    BARRIER_DONE.wait();
+}
+
 /// Boot check: a grace period ends, and a version replaced is released
-/// only after it
+/// only after it, waiting for it or by a callback
 pub fn selftest() -> bool {
     let a = crate::util::kalloc::try_arc(1u32).ok();
     let Some(a) = a else {
@@ -360,5 +779,95 @@ pub fn selftest() -> bool {
     let after = GP_SEQ.load(Ordering::Acquire);
     // Only our reference is left; with several CPUs a grace period ran
     let gp_ok = ONLINE.snapshot().count() <= 1 || done(after, snap(before));
-    read_ok && Arc::strong_count(&a) == 1 && cell.get().is_none() && gp_ok
+    read_ok && Arc::strong_count(&a) == 1 && cell.get().is_none() && gp_ok && callback_selftest()
+}
+
+/// The callback half of [`selftest`]: a version retired with `defer`
+/// is dropped by `rcuc/N`, preemption off, after a grace period, by the
+/// time `rcu_barrier` returns
+fn callback_selftest() -> bool {
+    /// GP_SEQ when the probe was retired
+    static RETIRED: AtomicU64 = AtomicU64::new(0);
+    /// 0: not dropped, 1: dropped wrongly, 2: dropped after a grace
+    /// period in atomic context
+    static FREED: AtomicU64 = AtomicU64::new(0);
+    struct Probe {
+        rcu: RcuHead,
+    }
+    crate::rcu_head!(Probe, rcu);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let gp = done(
+                GP_SEQ.load(Ordering::Acquire),
+                snap(RETIRED.load(Ordering::Acquire)),
+            );
+            let atomic = percpu::preempt_count() > 0;
+            FREED.store(1 + u64::from(gp && atomic), Ordering::Release);
+        }
+    }
+    FREED.store(0, Ordering::Release);
+    let Ok(p) = crate::util::kalloc::try_arc(Probe {
+        rcu: RcuHead::new(),
+    }) else {
+        return false;
+    };
+    let cell = RcuArc::new(p);
+    let seen = cell.read(&read_lock()).is_some();
+    // Retired with the cell's reference, the last
+    let old = cell.replace(None);
+    RETIRED.store(GP_SEQ.load(Ordering::Acquire), Ordering::Release);
+    old.defer();
+    rcu_barrier();
+    seen && FREED.load(Ordering::Acquire) == 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A claimed head waiting for `gp`
+    fn head(gp: u64) -> RcuHead {
+        let h = RcuHead::new();
+        h.next.store(core::ptr::null_mut(), Ordering::Relaxed);
+        h.gp.store(gp, Ordering::Relaxed);
+        h
+    }
+
+    fn chain(mut cur: *mut RcuHead) -> alloc::vec::Vec<u64> {
+        let mut v = alloc::vec::Vec::new();
+        // SAFETY: heads of the test, alive on its stack
+        while let Some(h) = unsafe { cur.as_ref() } {
+            v.push(h.gp.load(Ordering::Relaxed));
+            cur = h.next.load(Ordering::Relaxed);
+        }
+        v
+    }
+
+    /// Ready callbacks leave from the front, in order, up to the batch
+    /// limit, stopping at the first whose grace period is not over; the
+    /// taken ones stay counted until they run
+    #[test]
+    fn take_ready_front_in_order() {
+        let hs = [head(2), head(4), head(4), head(6)];
+        let mut l = CbList {
+            head: core::ptr::null_mut(),
+            tail: core::ptr::null_mut(),
+            pending: 0,
+        };
+        for h in &hs {
+            // SAFETY: claimed, alive for the test
+            unsafe { l.push(core::ptr::from_ref(h).cast_mut()) };
+        }
+        assert_eq!(l.first_gp(), 2);
+        let (c, n) = l.take_ready(4, 2);
+        assert_eq!((chain(c), n), (alloc::vec![2, 4], 2));
+        assert_eq!(l.first_gp(), 4);
+        assert_eq!(l.take_ready(3, 10).1, 0);
+        let (c, n) = l.take_ready(5, 10);
+        assert_eq!((chain(c), n), (alloc::vec![4], 1));
+        let (c, _) = l.take_ready(6, 10);
+        assert_eq!(chain(c), [6]);
+        assert!(l.head.is_null() && l.tail.is_null());
+        assert_eq!((l.first_gp(), l.pending), (u64::MAX, 4));
+    }
 }

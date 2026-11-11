@@ -25,6 +25,7 @@
 //! - CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME and the alarm clocks
 
 use crate::fs::FileRef;
+use crate::sync::rcu::RcuHead;
 use crate::util::kalloc::try_arc;
 use crate::util::list::Link;
 use crate::util::rculist::RcuList;
@@ -168,9 +169,13 @@ pub struct Timerfd {
     timer: HrTimer,
     /// Its link on `CANCEL_LIST` (Linux ctx->clist)
     clist: Link,
+    /// Its release from `CANCEL_LIST` after a grace period (Linux
+    /// ctx->rcu)
+    rcu: RcuHead,
 }
 
 crate::adapter!(ClistAdapter, Timerfd, clist);
+crate::rcu_head!(Timerfd, rcu);
 
 impl Timerfd {
     /// Create a new timerfd, or ENOMEM
@@ -180,6 +185,7 @@ impl Timerfd {
             wait_queue: WaitQueue::new(),
             timer: HrTimer::new(timerfd_fire, HRTIMER_HARD),
             clist: Link::new(),
+            rcu: RcuHead::new(),
         })?;
         timerfd.timer.set_data(Arc::as_ptr(&timerfd) as usize);
         Ok(timerfd)
@@ -352,9 +358,10 @@ impl Timerfd {
     }
 
     /// Release the timerfd (Linux timerfd_release): cancel the timer,
-    /// waiting out its callback, and leave the cancel list; the entry
-    /// goes after a grace period (`RcuUnlinked`, close: thread context,
-    /// no lock held)
+    /// waiting out its callback, and leave the cancel list; the list's
+    /// reference goes after a grace period without waiting for one
+    /// (Linux kfree_rcu): its drop, maybe the last, runs in `rcuc/N`,
+    /// where the timer is already cancelled and nothing sleeps
     fn release(self: &Arc<Self>) {
         self.timer.cancel_sync();
         let listed = {
@@ -362,8 +369,10 @@ impl Timerfd {
             inner.might_cancel = false;
             core::mem::take(&mut inner.listed)
         };
-        if listed {
-            let _gone = CANCEL_LIST.remove_first(|t| core::ptr::eq(t, Arc::as_ptr(self)));
+        if listed
+            && let Some(gone) = CANCEL_LIST.remove_first(|t| core::ptr::eq(t, Arc::as_ptr(self)))
+        {
+            gone.defer();
         }
     }
 

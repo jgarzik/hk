@@ -21,7 +21,7 @@ use core::marker::PhantomData;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
 
-use crate::sync::rcu::RcuReadGuard;
+use crate::sync::rcu::{HasRcuHead, RcuReadGuard, call_rcu};
 use crate::sync::spin::Mutex;
 use crate::util::list::{Adapter, Link};
 
@@ -271,6 +271,38 @@ impl<A: Adapter> RcuUnlinked<A> {
     /// The entry
     pub fn item(&self) -> &A::Item {
         self.0.as_deref().expect("RcuUnlinked: taken")
+    }
+}
+
+impl<A: Adapter> RcuUnlinked<A>
+where
+    A::Item: HasRcuHead + Send + Sync,
+{
+    /// Free the link and drop the list's reference after a grace period
+    /// without waiting for one (Linux list_del_rcu + kfree_rcu): any
+    /// context. The drop runs in `rcuc/N`, preemption off, so the
+    /// item's last drop must not sleep (`sync::rcu::kfree_rcu`).
+    pub fn defer(mut self) {
+        /// After the grace period: the link is free, the reference goes
+        ///
+        /// # Safety
+        /// `p` is the `Arc::into_raw` queued with it, a grace period
+        /// after the item left its list.
+        unsafe fn release<A: Adapter>(p: *const ()) {
+            // SAFETY: `Arc::into_raw` of `defer`, taken back once
+            let a = unsafe { Arc::from_raw(p.cast::<A::Item>()) };
+            // SAFETY: no reader stands on the link any more (the grace
+            // period) and no list has it
+            unsafe { (*RcuList::<A>::lk(&a)).reset() };
+            drop(a);
+        }
+        let Some(a) = self.0.take() else { return };
+        let h = core::ptr::from_ref(a.rcu_head());
+        let p = Arc::into_raw(a).cast::<()>();
+        // SAFETY: the head is a field of the item (HasRcuHead), kept by
+        // the reference `p` until `release` drops it; the item is Send
+        // + Sync
+        unsafe { call_rcu(&*h, release::<A>, p) };
     }
 }
 
