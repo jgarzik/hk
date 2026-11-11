@@ -6,8 +6,8 @@
 //! allocates nothing. A [`Cred`](super::Cred) holds a counted reference
 //! to its real uid's ([`set_cred_ucounts`] before the credentials are
 //! committed), and so does whatever a charge outlives the credentials
-//! for: a queued signal (Linux sigqueue->ucounts), an io_uring ring
-//! (ctx->user). Root's is the static
+//! for: a queued signal (Linux sigqueue->ucounts), a message queue
+//! (info->ucounts), an io_uring ring (ctx->user). Root's is the static
 //! [`INIT_UCOUNTS`] (Linux init_ucounts), never freed.
 //!
 //! The lookup table is `UCOUNTS` (Linux ucounts_hashtable under
@@ -32,6 +32,9 @@ pub enum Ucount {
     /// until the task is released (reaped, or at exit for a non-leader
     /// thread); a real-uid change moves the charge (commit_creds)
     Nproc,
+    /// POSIX message queue bytes (UCOUNT_RLIMIT_MSGQUEUE), charged to
+    /// the creator while the queue lives
+    Msgqueue,
     /// Queued signals (UCOUNT_RLIMIT_SIGPENDING), charged to the
     /// receiver while queued
     Sigpending,
@@ -41,7 +44,7 @@ pub enum Ucount {
     LockedVm,
 }
 
-const NR_UCOUNTS: usize = 3;
+const NR_UCOUNTS: usize = 4;
 
 /// One user's counters (Linux struct ucounts)
 pub struct Ucounts {

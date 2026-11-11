@@ -48,6 +48,7 @@ use crate::sync::RwSem;
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::rlimit;
+use crate::task::{Ucount, UcountsRef};
 use crate::uaccess::{UserPtr, copy_from_user, copy_to_user, strncpy_from_user};
 use crate::util::error::{KernelError, KernelResult};
 
@@ -244,16 +245,17 @@ pub struct MqQueue {
     notify: Mutex<Option<MqNotify>>,
     waitq_send: WaitQueue,
     waitq_recv: WaitQueue,
-    /// The creator's real uid and the bytes charged to it (Linux
-    /// info->ucounts, mq_bytes), returned when the queue is freed
-    charge: (u32, u64),
+    /// The creator's counters (a reference) and the bytes charged to
+    /// them (Linux info->ucounts, mq_bytes), returned when the queue is
+    /// freed
+    charge: (UcountsRef, u64),
 }
 
 impl Drop for MqQueue {
     /// The queue is gone (unlinked, last file closed): its charges go
     /// (Linux mqueue_evict_inode)
     fn drop(&mut self) {
-        mq_uncharge(self.charge.0, self.charge.1);
+        mq_uncharge(&self.charge.0, self.charge.1);
     }
 }
 
@@ -282,7 +284,7 @@ impl MqQueue {
     }
 
     /// A queue charged as `charge` (see [`mq_charge`])
-    fn new(mode: u32, maxmsg: i64, msgsize: i64, charge: (u32, u64)) -> Self {
+    fn new(mode: u32, maxmsg: i64, msgsize: i64, charge: (UcountsRef, u64)) -> Self {
         // Get current task's effective uid/gid as owner
         let cred = crate::task::percpu::current_cred();
         Self {
@@ -581,20 +583,12 @@ const QUEUES_MAX: u32 = 256;
 const MSG_MSG_SIZE: u64 = 48;
 const MSG_TREE_NODE_SIZE: u64 = 48;
 
-/// The queue count and each user's queue bytes (Linux mq_lock over
-/// ipc_ns->mq_queues_count and the UCOUNT_RLIMIT_MSGQUEUE ucounts); a
-/// leaf, taken under `MQ_REGISTRY` by a create and by a queue's Drop
-struct MqAcct {
-    queues: u32,
-    /// (uid, bytes) of each user with a charge; grown with the lock
-    /// released (`kmem::spare`): nothing allocates under it
-    bytes: Vec<(u32, u64)>,
-}
-
-static MQ_ACCT: Mutex<MqAcct> = Mutex::new(MqAcct {
-    queues: 0,
-    bytes: Vec::new(),
-});
+/// The queue count (Linux mq_lock over ipc_ns->mq_queues_count); a
+/// queue's bytes are charged to its creator's ucounts
+/// (UCOUNT_RLIMIT_MSGQUEUE) and returned under it too, as Linux
+/// mqueue_get_inode and mqueue_evict_inode do. A leaf, taken under
+/// `MQ_REGISTRY` by a create and by a queue's Drop
+static MQ_ACCT: Mutex<u32> = Mutex::new(0);
 
 /// What a queue of `maxmsg` messages of `msgsize` bytes charges its
 /// creator against RLIMIT_MSGQUEUE (Linux mqueue_get_inode's mq_bytes);
@@ -604,59 +598,33 @@ fn mq_bytes(maxmsg: i64, msgsize: i64) -> u64 {
     m * MSG_MSG_SIZE + m.min(u64::from(MQ_PRIO_MAX)) * MSG_TREE_NODE_SIZE + m * s
 }
 
-/// Charge a new queue of `bytes` to the caller's real uid (Linux
-/// mqueue_create_attr, mqueue_get_inode): ENOSPC past QUEUES_MAX
+/// Charge a new queue of `bytes` to the caller's real uid's counters
+/// (Linux mqueue_create_attr, mqueue_get_inode): ENOSPC past QUEUES_MAX
 /// without CAP_SYS_RESOURCE, EMFILE past `limit` (the caller's
-/// RLIMIT_MSGQUEUE), ENOMEM; the charge. A user's first charge needs
-/// room in the list: it is made with `MQ_ACCT` released and the check
-/// repeated (Linux charges the cred's ucounts, made before)
-fn mq_charge(bytes: u64, limit: u64) -> Result<(u32, u64), KernelError> {
-    let uid = crate::task::percpu::current_cred().uid;
+/// RLIMIT_MSGQUEUE); the charge, holding a reference to the counters
+fn mq_charge(bytes: u64, limit: u64) -> Result<(UcountsRef, u64), KernelError> {
+    let ucounts = crate::task::percpu::current_cred().ucounts;
     let cap = crate::task::capable(crate::task::CAP_SYS_RESOURCE);
-    loop {
-        let full = 'locked: {
-            let mut a = MQ_ACCT.lock();
-            if a.queues >= QUEUES_MAX && !cap {
-                return Err(KernelError::NoSpace);
-            }
-            let i = a.bytes.iter().position(|e| e.0 == uid);
-            let cur = i.map_or(0, |i| a.bytes[i].1);
-            let new = cur
-                .checked_add(bytes)
-                .filter(|&n| limit == rlimit::RLIM_INFINITY || n <= limit)
-                .ok_or(KernelError::ProcessFileLimit)?;
-            match i {
-                Some(i) => a.bytes[i].1 = new,
-                None if a.bytes.len() < a.bytes.capacity() => a.bytes.push((uid, new)),
-                None => break 'locked a.bytes.capacity(),
-            }
-            a.queues += 1;
-            return Ok((uid, bytes));
-        };
-        mq_grow(full)?;
+    let mut queues = MQ_ACCT.lock();
+    if *queues >= QUEUES_MAX && !cap {
+        return Err(KernelError::NoSpace);
     }
+    let n = ucounts.inc(Ucount::Msgqueue, bytes);
+    if n == u64::MAX || (limit != rlimit::RLIM_INFINITY && n > limit) {
+        ucounts.dec(Ucount::Msgqueue, bytes);
+        return Err(KernelError::ProcessFileLimit);
+    }
+    *queues += 1;
+    drop(queues);
+    Ok((ucounts, bytes))
 }
 
-/// Room for one more user in `MQ_ACCT` if its list is still full at
-/// `cap`: allocated, and the old list freed, with the lock released
-fn mq_grow(cap: usize) -> Result<(), KernelError> {
-    let bigger = crate::util::kmem::spare(cap)?;
-    let old = crate::util::kmem::adopt(&mut MQ_ACCT.lock().bytes, bigger);
-    drop(old);
-    Ok(())
-}
-
-/// Return a queue's charge
-fn mq_uncharge(uid: u32, bytes: u64) {
-    let mut a = MQ_ACCT.lock();
-    a.queues = a.queues.saturating_sub(1);
-    if let Some(i) = a.bytes.iter().position(|e| e.0 == uid) {
-        let b = &mut a.bytes[i].1;
-        *b = b.saturating_sub(bytes);
-        if *b == 0 {
-            a.bytes.swap_remove(i);
-        }
-    }
+/// Return a queue's charge (Linux mqueue_evict_inode); the reference
+/// goes with the queue, after the lock
+fn mq_uncharge(ucounts: &UcountsRef, bytes: u64) {
+    let mut queues = MQ_ACCT.lock();
+    *queues = queues.saturating_sub(1);
+    ucounts.dec(Ucount::Msgqueue, bytes);
 }
 
 fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> KernelResult<FileRef> {
