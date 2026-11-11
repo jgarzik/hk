@@ -27,7 +27,9 @@
 //! - `Softnet.poll_list`: `IrqSpinlock`, leaf. Taken by `napi_schedule`
 //!   (ISR) and the softnet thread. Capacity is reserved when a NAPI is
 //!   added, so the ISR never allocates.
-//! - `Softnet.backlog`: `crate::sync::spin::Mutex`, thread context only, leaf.
+//! - `Softnet.backlog`: an `SkbQueue` (its spin lock, Linux
+//!   input_pkt_queue.lock), thread context only, leaf; skbs taken off
+//!   under it are dropped after.
 //! - `PTYPE_BASE` / `PTYPE_ALL`: `crate::sync::spin::RwLock`, thread context only, leaf;
 //!   handlers are copied out and called after the guard is dropped. Taps
 //!   run in the receive path (softnet or an inline backlog flush) and in
@@ -47,7 +49,7 @@ use spin::Once;
 use crate::cpu::PerCpu;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{self, PktType};
-use crate::net::skb::SkBuff;
+use crate::net::skb::{SkBuff, SkbQueue};
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::kthread::KThread;
@@ -267,8 +269,9 @@ fn napi_wait() {
 struct Softnet {
     /// NAPI contexts to poll (IRQ-safe: napi_schedule runs in ISRs)
     poll_list: IrqSpinlock<VecDeque<Arc<Napi>>>,
-    /// Packets queued by netif_rx (thread context only)
-    backlog: Mutex<VecDeque<Box<SkBuff>>>,
+    /// Packets queued by netif_rx (Linux input_pkt_queue; thread
+    /// context only)
+    backlog: SkbQueue<Box<SkBuff>>,
     /// The softnet thread sleeps here
     wq: WaitQueue,
     /// Set while a task processes this CPU's backlog (softnet thread or an
@@ -286,7 +289,7 @@ impl Softnet {
     const fn new() -> Self {
         Self {
             poll_list: IrqSpinlock::new(VecDeque::new()),
-            backlog: Mutex::new(VecDeque::new()),
+            backlog: SkbQueue::new(),
             wq: WaitQueue::new(),
             busy: AtomicBool::new(false),
             processed: AtomicU64::new(0),
@@ -404,7 +407,7 @@ fn process_backlog(sd: &Softnet, quota: usize) -> usize {
     }
     let mut done = 0;
     while done < quota {
-        let Some(skb) = sd.backlog.lock().pop_front() else {
+        let Some(skb) = sd.backlog.dequeue() else {
             break;
         };
         netif_receive_skb(skb);
@@ -416,10 +419,12 @@ fn process_backlog(sd: &Softnet, quota: usize) -> usize {
 
 /// Queue a received packet on this CPU's backlog (Linux `netif_rx`)
 ///
-/// Thread context only (may allocate). Used by devices without NAPI,
-/// notably `lo`; never processes the packet synchronously, so a transmit
-/// path calling it never re-enters the receive path. Returns false if the
-/// packet was dropped (backlog full).
+/// Thread context only; never allocates (the skb is linked through its
+/// own `list`: a transmit under socket locks queues no memory). Used by
+/// devices without NAPI, notably `lo`; never processes the packet
+/// synchronously, so a transmit path calling it never re-enters the
+/// receive path. Returns false if the packet was dropped (backlog
+/// full).
 pub fn netif_rx(skb: Box<SkBuff>) -> bool {
     let cpu = crate::cpu::this_id();
     let sd = SOFTNET.get(cpu);

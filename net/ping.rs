@@ -17,6 +17,7 @@
 //! separate leaves. Receive takes the table read lock, clones the `Arc`
 //! and queues after dropping it.
 
+use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc_cyclic;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -166,7 +167,8 @@ impl PingSock {
     /// The echo request: the user's type/code/sequence, our identifier,
     /// a fresh checksum
     fn build(&self, user: &[u8], ident: u16) -> Result<alloc::boxed::Box<SkBuff>, KernelError> {
-        let mut skb = SkBuff::alloc_tx(user.len()).ok_or(KernelError::NoBufferSpace)?;
+        let mut skb =
+            SkBuff::alloc_tx(user.len(), Gfp::KERNEL).ok_or(KernelError::NoBufferSpace)?;
         skb.put_slice(user).ok_or(KernelError::NoBufferSpace)?;
         let h = skb.data_mut();
         h[2] = 0;

@@ -34,6 +34,7 @@
 //!   registration is dropped (`IrqDesc.lock`) after unlocking.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::mm::page_alloc::Gfp;
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -436,7 +437,7 @@ impl E1000 {
                 dev.stats.inc_rx_errors();
             } else {
                 // 2 extra bytes of headroom align the IP header (NET_IP_ALIGN)
-                match SkBuff::alloc(NET_SKB_PAD + 2, len) {
+                match SkBuff::alloc(NET_SKB_PAD + 2, len, Gfp::ATOMIC) {
                     Some(mut skb) => {
                         let src =
                             unsafe { core::slice::from_raw_parts(rx.bufs[i].cpu_addr(), len) };

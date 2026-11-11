@@ -6,6 +6,7 @@
 //! packet, error report = ICMP host unreachable to the sender). This
 //! module parses and answers ARP packets and feeds the table.
 
+use crate::mm::page_alloc::Gfp;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -262,7 +263,7 @@ fn send_arp(
     eth_dst: Option<&Lladdr>,
     tha: Option<&Lladdr>,
 ) {
-    let Some(mut skb) = SkBuff::alloc(64, ARP_HLEN + ETH_HLEN) else {
+    let Some(mut skb) = SkBuff::alloc(64, ARP_HLEN + ETH_HLEN, Gfp::ATOMIC) else {
         return;
     };
     let Some(d) = skb.put(ARP_HLEN) else {

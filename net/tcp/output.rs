@@ -7,6 +7,7 @@
 //! until uncorked, a full segment forms, or the 200 ms (RTO-based) probe
 //! timer pushes it out (Linux tcp_write_wakeup). A FIN is never held.
 
+use crate::mm::page_alloc::Gfp;
 use alloc::vec::Vec;
 
 use super::cb::{Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, copy_out, flags};
@@ -401,7 +402,7 @@ pub fn build(seg: &Seg, t: &Tuple) -> Option<alloc::boxed::Box<SkBuff>> {
     h.extend_from_slice(&[0; 4]);
     put_opts(seg, &mut h);
     h[12] = ((h.len() / 4) as u8) << 4;
-    let mut skb = SkBuff::alloc_tx(h.len() + seg.data.len())?;
+    let mut skb = SkBuff::alloc_tx(h.len() + seg.data.len(), Gfp::ATOMIC)?;
     skb.put_slice(&h)?;
     skb.put_slice(&seg.data)?;
     let c = checksum(t.laddr, t.raddr, skb.data());

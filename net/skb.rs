@@ -21,10 +21,25 @@
 //! Data:     data..tail (actual packet data)
 //! Tailroom: tail..end  (for appending data)
 //! ```
+//!
+//! ## Queues
+//!
+//! An skb is linked into a queue through its own `list` link (Linux
+//! skb->next/prev): an [`SkbHead`] (Linux sk_buff_head used with the
+//! unlocked `__skb_*` calls under its owner's lock) or an [`SkbQueue`]
+//! (an `SkbHead` with its own lock: skb_queue_tail, skb_dequeue). A
+//! queue owns each skb through `P`: a `Box` where the skb has one owner
+//! (the per-CPU backlog), an `Arc` where it is shared (Linux
+//! skb->users). Queueing never allocates. An skb taken off under the
+//! lock is dropped after it (its device reference may be the last).
 
-use crate::util::kalloc::try_box;
+use crate::util::kalloc::{try_box, with_gfp};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+
+use crate::mm::page_alloc::Gfp;
+use crate::sync::spin::{Mutex, MutexGuard};
+use crate::util::list::{Link, ListPtr, PtrList};
 
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{EtherType, PktType};
@@ -32,9 +47,6 @@ use crate::net::ipv4::Ipv4Addr;
 
 /// Standard headroom to reserve for headers
 pub const NET_SKB_PAD: usize = 64;
-
-/// Maximum Ethernet frame size (without VLAN)
-pub const ETH_FRAME_LEN: usize = 1514;
 
 /// Maximum packet size we'll allocate
 /// Largest buffer: a 64 KB IP datagram plus headroom (loopback MTU)
@@ -47,6 +59,8 @@ pub const MAX_SKB_SIZE: usize = 65536 + 512;
 /// `tail` (moving `tail` below one clears it).
 #[derive(Default)]
 pub struct SkBuff {
+    /// Its link on a queue (Linux skb->next/prev)
+    list: Link,
     /// The buffer: headroom, packet data, tailroom
     buf: Box<[u8]>,
     /// Start of the packet data (moves with push/pull)
@@ -87,42 +101,34 @@ pub struct SkBuff {
 }
 
 impl SkBuff {
-    /// Allocate a new SkBuff with given size
-    ///
-    /// The buffer will have `headroom` bytes reserved before data
-    /// and space for `data_len` bytes of data.
-    pub fn alloc(headroom: usize, data_len: usize) -> Option<Box<Self>> {
+    /// Allocate an skb with `headroom` bytes reserved before the data
+    /// and room for `data_len` bytes of it (Linux alloc_skb +
+    /// skb_reserve), both allocations under `gfp`: GFP_ATOMIC where
+    /// Linux allocates in atomic context (receive and protocol paths,
+    /// drivers), GFP_KERNEL for a socket's sendmsg. None on failure.
+    pub fn alloc(headroom: usize, data_len: usize, gfp: Gfp) -> Option<Box<Self>> {
         let total_size = headroom.checked_add(data_len)?;
         if total_size > MAX_SKB_SIZE {
             return None;
         }
-        let mut v = alloc::vec::Vec::new();
-        v.try_reserve_exact(total_size).ok()?;
-        v.resize(total_size, 0u8);
-
-        try_box(Self {
-            buf: v.into_boxed_slice(),
-            data: headroom,
-            tail: headroom,
-            ..Default::default()
+        with_gfp(gfp, || {
+            let buf = crate::util::kmem::try_vec(total_size, 0u8).ok()?;
+            try_box(Self {
+                buf: buf.into_boxed_slice(),
+                data: headroom,
+                tail: headroom,
+                ..Default::default()
+            })
+            .ok()
         })
-        .ok()
     }
 
-    /// Allocate a new SkBuff for receiving packets
-    ///
-    /// This allocates with standard headroom and space for max Ethernet frame.
-    pub fn alloc_rx() -> Option<Box<Self>> {
-        Self::alloc(NET_SKB_PAD, ETH_FRAME_LEN)
-    }
-
-    /// Allocate a new SkBuff for transmitting packets
-    ///
-    /// This allocates with space for all headers (Ethernet + IP + TCP).
-    pub fn alloc_tx(data_len: usize) -> Option<Box<Self>> {
+    /// Allocate an skb for transmitting `data_len` bytes, with headroom
+    /// for every header below them (Ethernet + IP + TCP)
+    pub fn alloc_tx(data_len: usize, gfp: Gfp) -> Option<Box<Self>> {
         // Reserve space for: Ethernet (14) + IP (20-60) + TCP (20-60)
         let headroom = 14 + 60 + 60;
-        Self::alloc(headroom, data_len)
+        Self::alloc(headroom, data_len, gfp)
     }
 
     /// Get current data length
@@ -299,13 +305,53 @@ impl SkBuff {
     }
 }
 
+crate::adapter!(pub SkbLink, SkBuff, list);
+
+/// A queue of skbs, each owned through `P` (Linux sk_buff_head with the
+/// unlocked `__skb_queue_tail`/`__skb_dequeue`/`skb_queue_walk_safe`
+/// calls): used under its owner's lock, or as an [`SkbQueue`]'s
+/// contents under the queue's own. Dropping it frees what is left
+/// (Linux __skb_queue_purge).
+pub type SkbHead<P = Arc<SkBuff>> = PtrList<SkbLink, P>;
+
+/// An skb queue with its own lock (Linux sk_buff_head and its lock):
+/// thread context only (no protocol code runs in an interrupt
+/// handler), a leaf: nothing is taken under it and nothing is dropped
+/// under it that could take a lock or sleep
+pub struct SkbQueue<P: ListPtr<Target = SkBuff> = Arc<SkBuff>> {
+    q: Mutex<SkbHead<P>>,
+}
+
+impl<P: ListPtr<Target = SkBuff>> SkbQueue<P> {
+    /// An empty queue; its lockdep class is the caller's location (Linux
+    /// skb_queue_head_init's static key)
+    #[track_caller]
+    pub const fn new() -> Self {
+        Self {
+            q: Mutex::new(SkbHead::new()),
+        }
+    }
+
+    /// Take the queue's lock for several steps at once (Linux
+    /// spin_lock(&list->lock) around `__skb_*` calls)
+    #[track_caller]
+    pub fn lock(&self) -> MutexGuard<'_, SkbHead<P>> {
+        self.q.lock()
+    }
+
+    /// The first skb, taken off (Linux skb_dequeue)
+    pub fn dequeue(&self) -> Option<P> {
+        self.q.lock().pop_front()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_alloc_and_put() {
-        let mut skb = SkBuff::alloc(64, 1500).unwrap();
+        let mut skb = SkBuff::alloc(64, 1500, Gfp::KERNEL).unwrap();
         assert_eq!(skb.len(), 0);
         assert!(skb.headroom() >= 64);
 
@@ -318,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_push_and_pull() {
-        let mut skb = SkBuff::alloc(64, 1500).unwrap();
+        let mut skb = SkBuff::alloc(64, 1500, Gfp::KERNEL).unwrap();
 
         // Add payload
         skb.put(100);
@@ -336,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_bounds_from_safe_calls() {
-        let mut skb = SkBuff::alloc(16, 32).unwrap();
+        let mut skb = SkBuff::alloc(16, 32, Gfp::KERNEL).unwrap();
         // A headroom past the buffer is clamped: no tailroom overflow
         skb.reset(1000);
         assert_eq!(skb.tailroom(), 0);
@@ -349,5 +395,49 @@ mod tests {
         skb.push(14);
         skb.trim(skb.len());
         assert!(skb.frame_from_mac().is_none());
+    }
+
+    fn skb(n: usize) -> Box<SkBuff> {
+        let mut s = SkBuff::alloc(0, 8, Gfp::ATOMIC).unwrap();
+        s.put(n).unwrap();
+        s
+    }
+
+    fn lens<P: ListPtr<Target = SkBuff>>(h: &SkbHead<P>) -> alloc::vec::Vec<usize> {
+        h.iter().map(SkBuff::len).collect()
+    }
+
+    /// FIFO order; a walk unlinks the ones it picks into another head
+    /// in order (Linux skb_queue_walk_safe + __skb_unlink)
+    #[test]
+    fn queue_fifo_and_walk_unlink() {
+        let q: SkbQueue<Box<SkBuff>> = SkbQueue::new();
+        for n in 1..=5 {
+            q.lock().push_back(skb(n));
+        }
+        assert_eq!(q.lock().len(), 5);
+        assert_eq!(q.dequeue().map(|s| s.len()), Some(1));
+        let mut gone: SkbHead<Box<SkBuff>> = SkbHead::new();
+        q.lock()
+            .drain_if(|s| s.len() % 2 == 0, |s| gone.push_back(s));
+        assert_eq!(lens(&gone), [2, 4]);
+        assert_eq!(lens(&q.lock()), [3, 5]);
+        // The link is free again once off every queue
+        let s = gone.pop_front().unwrap();
+        q.lock().push_back(s);
+        assert_eq!(lens(&q.lock()), [3, 5, 2]);
+    }
+
+    /// A shared skb stays alive in the queue while its other reference
+    /// goes, and the queue's drop frees the rest
+    #[test]
+    fn shared_queue_holds_references() {
+        let a: Arc<SkBuff> = Arc::from(skb(3));
+        let q: SkbQueue = SkbQueue::new();
+        q.lock().push_back(a.clone());
+        q.lock().push_back(Arc::from(skb(4)));
+        assert_eq!(Arc::strong_count(&a), 2);
+        drop(q);
+        assert_eq!(Arc::strong_count(&a), 1);
     }
 }

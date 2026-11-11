@@ -16,6 +16,7 @@
 //! delivery clones the matching `Arc`s and queues (`RxQueue`, leaf)
 //! after dropping the table lock. `RawSock.filter` is an atomic.
 
+use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -163,7 +164,8 @@ impl RawSock {
         if ihl > data.len() || ihl < IP_HLEN_MIN {
             return Err(KernelError::InvalidArgument);
         }
-        let mut skb = SkBuff::alloc_tx(data.len()).ok_or(KernelError::NoBufferSpace)?;
+        let mut skb =
+            SkBuff::alloc_tx(data.len(), Gfp::KERNEL).ok_or(KernelError::NoBufferSpace)?;
         skb.put_slice(data).ok_or(KernelError::NoBufferSpace)?;
         let h = skb.data_mut();
         if h[12..16] == [0; 4] {
@@ -360,7 +362,7 @@ impl ProtoOps for RawSock {
         if self.inet.flag(ipf::HDRINCL) {
             return self.send_hdrinc(&rt, &data).map(|()| len);
         }
-        let mut skb = SkBuff::alloc_tx(len).ok_or(KernelError::NoBufferSpace)?;
+        let mut skb = SkBuff::alloc_tx(len, Gfp::KERNEL).ok_or(KernelError::NoBufferSpace)?;
         skb.put_slice(&data).ok_or(KernelError::NoBufferSpace)?;
         skb.saddr = Some(rt.saddr);
         skb.daddr = Some(rt.daddr);

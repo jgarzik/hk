@@ -32,6 +32,7 @@
 mod opts;
 mod rcv;
 
+use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -295,8 +296,8 @@ impl PacketSock {
         addr: Option<[u8; 8]>,
         data: &[u8],
     ) -> Result<alloc::boxed::Box<SkBuff>, KernelError> {
-        let mut skb =
-            SkBuff::alloc(NET_SKB_PAD, data.len() + ETH_HLEN).ok_or(KernelError::NoBufferSpace)?;
+        let mut skb = SkBuff::alloc(NET_SKB_PAD, data.len() + ETH_HLEN, Gfp::KERNEL)
+            .ok_or(KernelError::NoBufferSpace)?;
         if self.sk.stype == SOCK_DGRAM {
             skb.reserve(ETH_HLEN);
             skb.put_slice(data).ok_or(KernelError::NoBufferSpace)?;

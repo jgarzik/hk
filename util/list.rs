@@ -46,6 +46,12 @@ pub struct Link {
     prev: AtomicPtr<Link>,
 }
 
+impl Default for Link {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Link {
     pub const fn new() -> Self {
         Self {

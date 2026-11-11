@@ -20,6 +20,7 @@
 //! and then each candidate's `Inet.addr`; it never holds the table lock
 //! while queueing. No lock is held across a sleep or a transmit.
 
+use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc_cyclic;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -213,7 +214,8 @@ impl UdpSock {
         data: &[u8],
         p: IpParams,
     ) -> Result<(), KernelError> {
-        let mut skb = SkBuff::alloc_tx(UDP_HLEN + data.len()).ok_or(KernelError::NoBufferSpace)?;
+        let mut skb = SkBuff::alloc_tx(UDP_HLEN + data.len(), Gfp::KERNEL)
+            .ok_or(KernelError::NoBufferSpace)?;
         skb.put_slice(data).ok_or(KernelError::NoBufferSpace)?;
         let h = skb.push(UDP_HLEN).ok_or(KernelError::NoBufferSpace)?;
         h[0..2].copy_from_slice(&sport.to_be_bytes());

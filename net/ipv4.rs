@@ -3,6 +3,7 @@
 //! This module handles IPv4 packet parsing, building, routing,
 //! and checksum computation.
 
+use crate::mm::page_alloc::Gfp;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -401,7 +402,7 @@ pub fn ip_options_ok(opt: &[u8]) -> bool {
 /// A reassembled datagram as a received skb (device and link-layer
 /// classification of its last fragment)
 fn rebuild(last: &SkBuff, pkt: &[u8]) -> Option<SkBuff> {
-    let mut s = SkBuff::alloc(NET_SKB_PAD, pkt.len())?;
+    let mut s = SkBuff::alloc(NET_SKB_PAD, pkt.len(), Gfp::ATOMIC)?;
     s.put_slice(pkt)?;
     s.dev = last.dev.clone();
     s.pkt_type = last.pkt_type;
@@ -591,7 +592,7 @@ pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelErro
     while off < payload.len() {
         let len = room.min(payload.len() - off);
         let more = off + len < payload.len();
-        let mut f = SkBuff::alloc_tx(ihl + len).ok_or(KernelError::NoBufferSpace)?;
+        let mut f = SkBuff::alloc_tx(ihl + len, Gfp::ATOMIC).ok_or(KernelError::NoBufferSpace)?;
         f.put_slice(&pkt[..ihl]).ok_or(KernelError::NoBufferSpace)?;
         f.put_slice(&payload[off..off + len])
             .ok_or(KernelError::NoBufferSpace)?;

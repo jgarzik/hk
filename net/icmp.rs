@@ -19,6 +19,7 @@
 //! `IcmpRate.st` (`crate::sync::spin::Mutex`, per namespace, thread only) is a leaf
 //! taken around the token-bucket arithmetic only.
 
+use crate::mm::page_alloc::Gfp;
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -305,7 +306,7 @@ fn icmp_echo(net: &NetNamespace, skb: &SkBuff) {
         return;
     }
     let req = skb.data();
-    let Some(mut out) = SkBuff::alloc_tx(req.len()) else {
+    let Some(mut out) = SkBuff::alloc_tx(req.len(), Gfp::ATOMIC) else {
         return;
     };
     if out.put_slice(req).is_none() {
@@ -561,7 +562,7 @@ fn xmit(
     data: &[u8],
     tos: u8,
 ) {
-    let Some(mut skb) = SkBuff::alloc_tx(ICMP_HLEN + data.len()) else {
+    let Some(mut skb) = SkBuff::alloc_tx(ICMP_HLEN + data.len(), Gfp::ATOMIC) else {
         return;
     };
     if skb.put_slice(&[ty, code, 0, 0]).is_none()
@@ -644,7 +645,8 @@ pub fn icmp_send_echo(
     payload: &[u8],
 ) -> Result<(), crate::util::error::KernelError> {
     use crate::util::error::KernelError;
-    let mut skb = SkBuff::alloc_tx(ICMP_HLEN + payload.len()).ok_or(KernelError::NoBufferSpace)?;
+    let mut skb = SkBuff::alloc_tx(ICMP_HLEN + payload.len(), Gfp::KERNEL)
+        .ok_or(KernelError::NoBufferSpace)?;
     skb.put_slice(&[icmp_type::ECHO, 0, 0, 0])
         .ok_or(KernelError::NoBufferSpace)?;
     skb.put_slice(&id.to_be_bytes())

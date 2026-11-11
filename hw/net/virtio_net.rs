@@ -39,6 +39,7 @@
 //!   Empty once removed.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::mm::page_alloc::Gfp;
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -232,7 +233,7 @@ impl VirtioNet {
         }
         let len = len - HDR_LEN;
         // 2 extra bytes of headroom align the IP header (NET_IP_ALIGN)
-        let Some(mut skb) = SkBuff::alloc(NET_SKB_PAD + 2, len) else {
+        let Some(mut skb) = SkBuff::alloc(NET_SKB_PAD + 2, len, Gfp::ATOMIC) else {
             dev.stats.inc_rx_dropped();
             return None;
         };
