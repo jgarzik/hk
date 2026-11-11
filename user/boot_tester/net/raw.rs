@@ -26,7 +26,43 @@ pub fn run_tests() {
     test_icmp_filter();
     test_hdrincl();
     test_proto_unreach();
+    test_peek();
     test_frag_overlap();
+}
+
+/// MSG_PEEK leaves the packet (IP header included) queued; a short
+/// buffer truncates (MSG_TRUNC in msg_flags) and MSG_TRUNC returns the
+/// real length
+fn test_peek() {
+    let mut t = T::new(b"RAW_PEEK");
+    let a = raw(253);
+    let b = raw(253);
+    t.eq(b"sendto", send_to(a, b"rawpeek!", LO, 0, 0), 8);
+    t.eq(b"readable", poll1(b, 1, 2000).0, 1);
+    let mut small = [0u8; 4];
+    let mut ctl = [0u8; 0];
+    let (n, fl, _) = recv_msg(b, &mut small, &mut ctl, MSG_PEEK);
+    t.ok(
+        b"peek short",
+        n == 4 && fl & MSG_TRUNC != 0 && small[0] == 0x45,
+        n,
+    );
+    t.eq(
+        b"peek trunc len",
+        recv(b, &mut small, MSG_PEEK | MSG_TRUNC),
+        28,
+    );
+    let mut buf = [0u8; 64];
+    let n = recv(b, &mut buf, MSG_DONTWAIT);
+    t.ok(
+        b"read",
+        n == 28 && buf[9] == 253 && &buf[20..28] == b"rawpeek!",
+        n,
+    );
+    t.eq(b"consumed", recv(b, &mut buf, MSG_DONTWAIT), EAGAIN);
+    close(a);
+    close(b);
+    t.done();
 }
 
 fn raw(proto: i32) -> i32 {

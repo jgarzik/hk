@@ -33,7 +33,7 @@ use crate::net::icmp::{IcmpErr, icmp_type};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IPPROTO_ICMP, Ipv4Addr, ip_checksum};
-use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, RecvMsg, SendMsg};
+use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, MSG_TRUNC, RecvMsg, SendMsg};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
@@ -377,7 +377,8 @@ impl ProtoOps for PingSock {
         let Some(d) = self.rxq.recv(&self.sk, flags)? else {
             return Ok(0);
         };
-        dgram::deliver(&self.sk, &self.inet, m, &d, flags)
+        // Linux ping_recvmsg returns what it copied, MSG_TRUNC or not
+        dgram::deliver(&self.sk, &self.inet, m, &d, flags & !MSG_TRUNC)
     }
 }
 
