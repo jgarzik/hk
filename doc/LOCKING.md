@@ -4262,7 +4262,7 @@ not rely on either.
 | neighbour `TABLES` | `spin::Mutex` | thread only | leaf (snapshot of registered tables). One `timer::Alarm` runs all tables' due entries and GC on `ktimers/N`, armed with no table lock held |
 | `timer::Alarm.st` (neighbour, IP reassembly, TCP) | `spin::Mutex` | thread only | held across arming its SOFT `TimerList` (-> the timer base's IrqSpinlock); otherwise leaf |
 | `FragTable.st` (`net/inet/frag.rs`, per netns) | `spin::Mutex` | thread only (softnet, reassembly timer on ktimers/N) | leaf: reassembly queues + memory charge; completed datagrams are delivered and expiry ICMP errors sent after it is dropped. Reassembly `TABLES` (registered namespaces) is a leaf `spin::Mutex` |
-| `PmtuCache.m` (`net/inet/route.rs`, per netns) | `spin::Mutex` | thread only | leaf: learned path MTUs, read by `route::output` (possibly under a socket lock), written by ICMP frag-needed handling |
+| `route::FNHE_LOCK` (`net/inet/route.rs`, global; Linux fnhe_lock) | `spin::Mutex<FnheLock>` (its `UniqueOwner` proves writers of every nexthop's `RcuHList` exception chains) | thread only (softnet ICMP frag-needed input, `route::output` deleting an expired exception, possibly under a socket lock) | leaf: a route's chains are allocated at its first exception and each exception is created under it with `Gfp::ATOMIC` (Linux kzalloc GFP_ATOMIC under fnhe_lock), dropped without memory; past a chain depth of 5 to 9 (randomized, Linux FNHE_RECLAIM_DEPTH) the oldest is removed first; removed ones are freed after a grace period. Readers (`route::output`) walk the chain under RCU; pmtu and expiry are atomics updated in place. The chains go with their route (a replaced route's with it) |
 | `NlTable.socks` (`net/netlink`, per netns) | `spin::RwLock` | thread only | leaf; bound netlink sockets by (protocol, portid); lookups return `Arc` clones. A bind/autobind checks the socket's `bound` and publishes its portid under the write lock (Linux netlink_insert), so concurrent binds of one socket cannot both insert |
 | `NlSock.dump` | sleeping `sync::Mutex<Option<Dump>>` (Linux nlk->cb_mutex) | thread only (sender's `sendmsg`, reader's `recvmsg`, release) | running dump cursor; held while it snapshots devices/FIB/ARP and while its part is queued to `rxq` (keeps parts ordered); readers are woken after it is dropped; never with RTNL. `NlSock.running` (atomic, Linux cb_running) says a dump is set: written under it, read lock-free by poll (`readable`, possibly under an epoll IrqSpinlock) |
 | `NlSock.rxq`, `NlSock.dst` | `spin::Mutex` | thread only | leaf; replies, dump parts and notifications are pushed under it (each charged to rcvbuf first), `Sock.wq` is woken (`data_ready`) after it is dropped; a dequeue wakes `NlSock.wait` (Linux nlk->wait: user senders waiting for room) after it is dropped |
@@ -4311,7 +4311,7 @@ NetNamespace tables (RwLocks; lookups drop the guard before returning);
   address lists, FIB tables (RCU readers; writers under RTNL take the
   lists' leaf `ends`)
   -> NeighTable.hash -> Neighbour.inner (dropped before any transmit)
-  (RawTable.socks -> Inet.addr; FragTable.st, PmtuCache.m, IcmpRate.st,
+  (RawTable.socks -> Inet.addr; FragTable.st, FNHE_LOCK, IcmpRate.st,
    Sock.errq, RxQueue.q: leaves, never held while transmitting)
   -> NlTable.socks -> NlSock.rxq (netlink replies/notifications)
   (AF_UNIX: UnixSock.bindlock (sleeping) -> UnixTable.st / BSD

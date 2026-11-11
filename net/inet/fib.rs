@@ -39,6 +39,7 @@ use crate::net::device::NetDevice;
 use crate::net::inet::ifaddr::{
     InIfaddr, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, inet_make_mask,
 };
+use crate::net::inet::route::NhExceptions;
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::netlink::NlInfo;
 use crate::net::netlink::rtnetlink;
@@ -141,6 +142,8 @@ pub struct FibEntry {
     pub dev: Option<Arc<NetDevice>>,
     /// RTNH_F_* flags (ONLINK)
     pub flags: u32,
+    /// Learned exceptions of its nexthop (Linux nhc_exceptions): PMTU
+    pub exceptions: NhExceptions,
     /// On its table's entries (Linux fa_list)
     link: Link,
     /// Freed through it a grace period after it leaves its table
@@ -478,6 +481,7 @@ fn fib_create_info(net: &NetNamespace, cfg: &FibConfig) -> Result<FibEntry, Kern
         gateway: cfg.gateway,
         dev: None,
         flags: cfg.flags,
+        exceptions: NhExceptions::default(),
         link: Link::new(),
         rcu: RcuHead::new(),
     };
@@ -811,6 +815,7 @@ mod tests {
             gateway: None,
             dev: None,
             flags: 0,
+            exceptions: NhExceptions::default(),
             link: Link::new(),
             rcu: RcuHead::new(),
         }

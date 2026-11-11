@@ -83,9 +83,6 @@ pub struct NetNamespace {
     /// IPv4 reassembly queues
     pub frags: crate::net::inet::frag::FragTable,
 
-    /// Learned path MTUs
-    pub pmtu: crate::net::inet::route::PmtuCache,
-
     /// ICMP rate-limit state
     pub icmp: crate::net::icmp::IcmpRate,
 
@@ -142,7 +139,6 @@ impl NetNamespace {
             port_range: PortRange::default(),
             sysctl: Default::default(),
             frags: Default::default(),
-            pmtu: Default::default(),
             icmp: Default::default(),
             ping: Default::default(),
             raw: Default::default(),
