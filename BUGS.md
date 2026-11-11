@@ -735,7 +735,12 @@ lock, spin lock or `local_irq_save` it was made under; the shutdown
 summary counts them): mostly collections grown, or copied, under spin
 locks in net, fs, io, task, cgroup and keys, and IRQ-safe locks
 in bpf maps and the swap cache. ROADMAP
-phase A (A0-A3).
+phase A (A0-A3). A ping socket's table reference is released a grace
+period after it leaves the table (`net/ping.rs`, Linux SOCK_RCU_FREE),
+in `rcuc/N` with preemption off: if that drops its network namespace's
+last reference, `NetNamespace`'s drop allocates unnamed (the device
+list it collects, the sysfs work it queues); Linux's put_net only
+queues cleanup_net.
 
 ## Deferred file release gaps
 

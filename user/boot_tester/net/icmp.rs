@@ -283,6 +283,7 @@ pub fn run_ping_tests() {
     }
     test_ping_lo();
     test_ping_peek();
+    test_ping_rebind();
     test_ping_errors();
     match net_setup_eth0() {
         Ok(_) => {
@@ -382,6 +383,39 @@ fn test_ping_peek() {
     let r = recv(fd, &mut buf, MSG_DONTWAIT);
     t.ok(b"read", r == n as i64 && &buf[8..16] == b"peekping", r);
     t.eq(b"consumed", recv(fd, &mut buf, MSG_DONTWAIT), EAGAIN);
+    close(fd);
+    t.done();
+}
+
+/// A disconnect unhashes an autobound socket (identifier 0); the next
+/// send binds it again and its reply comes back
+fn test_ping_rebind() {
+    let mut t = T::new(b"PING_REBIND");
+    let fd = ping_socket();
+    let mut req = [0u8; 64];
+    let n = echo(0, 1, b"again", &mut req);
+    let mut buf = [0u8; 64];
+    t.eq(b"send", send_to(fd, &req[..n], LO, 0, 0), n as i64);
+    t.eq(b"reply", recv_wait(fd, &mut buf, 2000).0, n as i64);
+    t.eq(b"connect", connect(fd, LO, 0), 0);
+    let unspec = hk_syscall::SockAddrIn::new(0, 0, 0);
+    t.eq(
+        b"disconnect",
+        hk_syscall::sys_connect(fd, sa(&unspec), 16),
+        0,
+    );
+    t.eq(b"unhashed", port(fd) as i64, 0);
+    for round in 0..3 {
+        t.eq(b"send again", send_to(fd, &req[..n], LO, 0, 0), n as i64);
+        let (r, _) = recv_wait(fd, &mut buf, 2000);
+        t.ok(
+            b"reply again",
+            r == n as i64 && &buf[8..13] == b"again",
+            round,
+        );
+        t.ok(b"rebound", port(fd) != 0, 0);
+        hk_syscall::sys_connect(fd, sa(&unspec), 16);
+    }
     close(fd);
     t.done();
 }
