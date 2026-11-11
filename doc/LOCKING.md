@@ -2897,38 +2897,36 @@ This separation allows:
 
 **PrintkWriter Pattern:**
 
-The `PrintkWriter` struct holds `OUTPUT_LOCK` for the duration of formatting:
-
-```rust
-pub struct PrintkWriter {
-    _guard: Option<IrqSpinlockGuard<'static, ()>>,
-}
-
-impl PrintkWriter {
-    pub fn new() -> Self {
-        if OOPS_IN_PROGRESS.load(Ordering::Acquire) {
-            Self { _guard: OUTPUT_LOCK.try_lock() }
-        } else {
-            Self { _guard: Some(OUTPUT_LOCK.lock()) }
-        }
-    }
-}
-```
+The `PrintkWriter` struct holds `OUTPUT_LOCK` for the duration of
+formatting (`output_lock`, which records the owning CPU in
+`OUTPUT_OWNER`). A printk nested on the CPU that holds it (console code,
+or a lockdep report from an allocation made under it), or one during an
+oops while another CPU holds it, gets no guard and writes the serial
+port directly (Linux printk_safe's recursion context) instead of
+spinning on its own lock.
 
 This ensures that `write!` macro invocations (which may call `write_str` multiple
 times during formatting) produce atomic output.
 
 **printkln! Atomicity:**
 
-The `printkln!` macro uses a single `PrintkWriter` for both the message and newline:
+The `printkln!` macro uses a single `PrintkWriter` for both the message
+and newline. Its arguments are evaluated (a `match` on `format_args!`,
+whose temporaries live to the end of the match) before `OUTPUT_LOCK` is
+taken, as a Linux printk caller's are, so an argument that allocates
+does not allocate under it:
 
 ```rust
 macro_rules! printkln {
     ($($arg:tt)*) => {{
-        let mut writer = PrintkWriter::new();
-        let _ = write!(writer, $($arg)*);
-        let _ = writer.write_str("\n");
-        // OUTPUT_LOCK released when writer drops
+        match format_args!($($arg)*) {
+            args => {
+                let mut writer = PrintkWriter::new();
+                let _ = writer.write_fmt(args);
+                let _ = writer.write_str("\n");
+                // OUTPUT_LOCK released when writer drops
+            }
+        }
     }};
 }
 ```

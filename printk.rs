@@ -25,10 +25,13 @@
 //!
 //! During panic, the normal locking path can deadlock if the panicking CPU
 //! already holds OUTPUT_LOCK. The OOPS_IN_PROGRESS flag switches to
-//! try_lock() with direct serial fallback.
+//! try_lock() with direct serial fallback. A printk nested in one on the
+//! same CPU (console code, or a lockdep report from an allocation made
+//! under OUTPUT_LOCK) takes the same fallback instead of spinning on its
+//! own lock (Linux printk_safe's recursion context).
 
 use ::core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::console;
 use crate::arch::{CurrentArch, EarlyConOps};
@@ -44,6 +47,42 @@ use crate::sync::{IrqSpinlock, IrqSpinlockGuard};
 /// deadlock when printk is called from interrupt context while another
 /// CPU holds the lock. Linux uses raw_spin_lock_irqsave().
 static OUTPUT_LOCK: IrqSpinlock<()> = IrqSpinlock::new(());
+
+/// The CPU holding OUTPUT_LOCK, plus one (0: none or not known)
+static OUTPUT_OWNER: AtomicU32 = AtomicU32::new(0);
+
+/// OUTPUT_LOCK held, its owner recorded
+struct OutputGuard {
+    _lock: IrqSpinlockGuard<'static, ()>,
+}
+
+impl Drop for OutputGuard {
+    fn drop(&mut self) {
+        // Before the lock goes (the field drops after this)
+        OUTPUT_OWNER.store(0, Ordering::Relaxed);
+    }
+}
+
+/// This CPU, plus one (0 before its per-CPU data exists)
+fn me() -> u32 {
+    crate::cpu::try_this_id().map_or(0, |c| c + 1)
+}
+
+/// Take OUTPUT_LOCK: None when this CPU already holds it (a nested
+/// printk) or, during an oops, when another CPU does
+fn output_lock() -> Option<OutputGuard> {
+    let me = me();
+    if me != 0 && OUTPUT_OWNER.load(Ordering::Relaxed) == me {
+        return None;
+    }
+    let g = if OOPS_IN_PROGRESS.load(Ordering::Acquire) {
+        OUTPUT_LOCK.try_lock()?
+    } else {
+        OUTPUT_LOCK.lock()
+    };
+    OUTPUT_OWNER.store(me, Ordering::Relaxed);
+    Some(OutputGuard { _lock: g })
+}
 
 /// Panic/oops in progress - use non-blocking output
 ///
@@ -174,7 +213,9 @@ pub fn flush() {
     }
 
     // Take output lock first to serialize with other writers
-    let _output = OUTPUT_LOCK.lock();
+    let Some(_output) = output_lock() else {
+        return;
+    };
     let mut state = PRINTK.lock();
 
     if state.flushed {
@@ -211,7 +252,11 @@ fn printk_write_locked(bytes: &[u8]) {
 /// A line written by user space (/dev/kmsg), already a log record: to
 /// the console the way printk output goes
 pub fn console_line(text: &[u8]) {
-    let _output = OUTPUT_LOCK.lock();
+    let Some(_output) = output_lock() else {
+        direct_serial_write(text);
+        direct_serial_write(b"\n");
+        return;
+    };
     console_write_locked(text);
     console_write_locked(b"\n");
 }
@@ -252,27 +297,19 @@ fn direct_serial_write(bytes: &[u8]) {
 /// In panic mode (OOPS_IN_PROGRESS), uses try_lock() with direct
 /// serial fallback to avoid deadlock.
 pub struct PrintkWriter {
-    /// Lock guard (None if in panic mode and lock unavailable)
-    /// Uses IrqSpinlockGuard for IRQ safety
-    _guard: Option<IrqSpinlockGuard<'static, ()>>,
+    /// Lock guard (None if nested on this CPU, or in panic mode with the
+    /// lock unavailable)
+    _guard: Option<OutputGuard>,
 }
 
 impl PrintkWriter {
     /// Create a new PrintkWriter, acquiring the output lock
     ///
-    /// In panic mode, uses try_lock() to avoid deadlock. If the lock
-    /// cannot be acquired, writes go directly to serial.
+    /// Nested on this CPU, or in panic mode with the lock held elsewhere,
+    /// writes go directly to serial.
     pub fn new() -> Self {
-        if OOPS_IN_PROGRESS.load(Ordering::Acquire) {
-            // Panic mode: try non-blocking lock
-            Self {
-                _guard: OUTPUT_LOCK.try_lock(),
-            }
-        } else {
-            // Normal mode: blocking lock
-            Self {
-                _guard: Some(OUTPUT_LOCK.lock()),
-            }
+        Self {
+            _guard: output_lock(),
         }
     }
 }
@@ -301,9 +338,16 @@ impl Write for PrintkWriter {
 macro_rules! printk {
     ($($arg:tt)*) => {{
         use ::core::fmt::Write;
-        let mut writer = $crate::printk::PrintkWriter::new();
-        let _ = write!(writer, $($arg)*);
-        // writer dropped here, releasing OUTPUT_LOCK
+        // The arguments are evaluated (the scrutinee's temporaries live
+        // to the end of the match) before OUTPUT_LOCK is taken, as a
+        // Linux printk caller's are
+        match ::core::format_args!($($arg)*) {
+            args => {
+                let mut writer = $crate::printk::PrintkWriter::new();
+                let _ = writer.write_fmt(args);
+                // writer dropped here, releasing OUTPUT_LOCK
+            }
+        }
     }};
 }
 
@@ -317,10 +361,15 @@ macro_rules! printkln {
     };
     ($($arg:tt)*) => {{
         use ::core::fmt::Write;
-        let mut writer = $crate::printk::PrintkWriter::new();
-        let _ = write!(writer, $($arg)*);
-        let _ = writer.write_str("\n");
-        // writer dropped here, releasing OUTPUT_LOCK
+        // Arguments evaluated before OUTPUT_LOCK is taken (`printk!`)
+        match ::core::format_args!($($arg)*) {
+            args => {
+                let mut writer = $crate::printk::PrintkWriter::new();
+                let _ = writer.write_fmt(args);
+                let _ = writer.write_str("\n");
+                // writer dropped here, releasing OUTPUT_LOCK
+            }
+        }
     }};
 }
 
