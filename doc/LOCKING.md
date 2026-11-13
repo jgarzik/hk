@@ -2620,46 +2620,56 @@ takes (Linux lockdep's kernfs active "lock").
 
 **Location:** `fs/mount.rs`
 
-The mount namespace uses reference counting for busy detection, following the
-Linux `vfsmount.mnt_count` pattern:
+A `MountRef` (`fs/mntput.rs`) counts one reference in
+`Mount.mnt_count` (Linux mnt_count): paths, namespace roots, open
+files, the entries of a parent's `mnt_mounts`. Links that must not
+keep a mount are `Weak` (`Mount.parent`, peer groups, `s_mounts`) and
+take a reference with `MountRef::try_get` (refused once the count is
+zero). Busy is a separate count, `Mount.users` (open files, task roots
+and cwds):
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `MntNamespace.root` (`ns/mod.rs`) | `RwLock<Option<Arc<Mount>>>` | Root of the namespace's mount tree (one per mount namespace) |
+| `MntNamespace.root` (`ns/mod.rs`) | `RwLock<Option<MountRef>>` | Root of the namespace's mount tree (one per mount namespace) |
 | `Mount.mountpoint` | `RwLock<Option<Arc<Dentry>>>` | Where this fs is mounted |
-| `Mount.parent` | `RwLock<Option<Weak<Mount>>>` | Parent mount reference |
-| `Mount.mnt_mounts` | `LockedByEither<OwnedList>` (no lock of its own) | Submounts, each holding a reference (Linux mnt_mounts, linked through `Mount.mnt_child`): changed only under NAMESPACE_SEM write and `MOUNT_LOCK` both (`attach_mnt`, `detach_mnt`: `&mut NsTree` and `&mut MntHash`), read under either (`Stable`: `&NsTree` from a NAMESPACE_SEM guard, `&MntHash` from `MOUNT_LOCK.read_excl`). Walks step with `next_mnt` (Linux next_mnt: first submount, else the next sibling of the nearest mount up to the walk's root that has one), so no list is copied and no stack is kept |
-| `Mount.mnt_count` | `AtomicU64` | Open file reference count |
+| `Mount.parent` | `RwLock<Option<Weak<Mount>>>` | Parent mount (no reference; `get_parent` takes one with `try_get`) |
+| `Mount.mnt_mounts` | `LockedByEither<OwnedList>` (no lock of its own) | Submounts, each entry holding a counted reference (`MountRef::into_counted`; Linux mnt_mounts, linked through `Mount.mnt_child`): changed only under NAMESPACE_SEM write and `MOUNT_LOCK` both (`attach_mnt`, `detach_mnt`: `&mut NsTree` and `&mut MntHash`), read under either (`Stable`: `&NsTree` from a NAMESPACE_SEM guard, `&MntHash` from `MOUNT_LOCK.read_excl`). Walks step with `next_mnt` (Linux next_mnt: first submount, else the next sibling of the nearest mount up to the walk's root that has one), so no list is copied and no stack is kept |
+| `Mount.mnt_count` | `AtomicUsize` | `MountRef` count (Linux mnt_count); `MNT_REF_DEAD` once the teardown is queued |
+| `Mount.users` | `AtomicU64` | Open files, task roots and cwds (`user_get`/`user_put`): nonzero is EBUSY for umount |
 | `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC/READONLY/LOCKED; every write under `MOUNT_LOCK` (remount, reconfigure, pivot_root's MNT_LOCKED), read lock-free (open, exec, statfs) |
 | `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`: Linux attach_mnt and umount_tree under lock_mount_hash; with NAMESPACE_SEM write it owns `mnt_mounts`); under NAMESPACE_SEM and s_umount; under it only `SuperBlock.s_mounts`, and in attach/detach the moved mount's `parent`/`mountpoint` and the mountpoint's `d_lock` (mount count), one at a time; in `lookup_mnt`'s locking read a child's `mountpoint` and then `d_lock`; nothing takes it under a Mount field lock. No mount or mountpoint is dropped under it (`make_rdonly` releases its references, `detach_mnt` the parent's reference to the mount and the mountpoint, after the unlock). The sequence is read lock-free by scoped walks (3.3 Path Traversal) |
 | `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
 | `Mount.mnt_ns` | `AtomicU64` | Id of the mount's namespace (`MntNamespace.id`, never reused), 0 for none (Linux mnt_ns): written only under NAMESPACE_SEM write (commit_tree when a tree is grafted or propagated, the namespace root, a namespace copy; umount clears it), read by `check_mnt` under NAMESPACE_SEM; can_umount and remount read it first without, as Linux (umount repeats it under the lock) |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
 | `Mount.writers`, `SuperBlock.s_writers` | `AtomicU64` (count + WRITE_HOLD bit 63) | Write-access holders (Linux mnt_writers + WRITE_HOLD): through a mount on the mount, for mountless internal objects on the superblock. A writer adds itself, spins while WRITE_HOLD is set, then checks read-only state (EROFS, backing out). Making a mount read-only (`set_flags`, Linux mnt_make_readonly) or the file system (`make_rdonly`, Linux sb_prepare_remount_readonly: every writable mount in `s_mounts` and `s_writers`) sets WRITE_HOLD under `MOUNT_LOCK`, is EBUSY with nothing changed if any count is nonzero, else sets the read-only flag before clearing the hold (Release). The writer's spin is invisible to lockdep; holders never wait for writers |
-| `SuperBlock.s_mounts` | spin Mutex leaf | the superblock's mounts (Linux s_mounts: a `WeakList` through `Mount.mnt_instance`): a new mount is added under `MOUNT_LOCK` (`Mount::new`, Linux clone_mnt under lock_mount_hash), so a read-only remount's walk (`make_rdonly`, under `MOUNT_LOCK` and this lock across both passes, taking no reference) misses no mount a writer could use; a mount leaves it first thing in its `Drop`, under this lock alone |
+| `SuperBlock.s_mounts` | spin Mutex leaf | the superblock's mounts (Linux s_mounts: a `WeakList` through `Mount.mnt_instance`): a new mount is added under `MOUNT_LOCK` (`Mount::alloc`, Linux clone_mnt under lock_mount_hash), so a read-only remount's walk (`make_rdonly`, under `MOUNT_LOCK` and this lock across both passes, taking no reference) misses no mount a writer could use; a mount leaves it first thing in its teardown, under this lock alone, before its superblock is released |
 
-**Last reference:** a `Mount`'s last `Arc` is never dropped under a
-spin lock: its drop takes `SuperBlock.s_mounts`, frees its id and
-releases its submounts, superblock and dentries (a superblock's
-teardown sleeps). Code under a spin lock hands references out and
-drops what it unlinked after the unlock (`detach_mnt`,
-`MntNamespace::set_root`); references taken under one (`lookup_mnt`)
-are never the last, the tree holding its mounts.
+**Last reference:** as for files (`fput`), the last `MountRef`'s drop
+never tears the mount down itself (Linux mntput_no_expire): it marks
+the count `MNT_REF_DEAD` and queues the teardown (`Mount::cleanup`,
+Linux cleanup_mnt: off `s_mounts`, its submounts unhung under
+NAMESPACE_SEM write and MOUNT_LOCK and their references dropped, its
+mountpoint and id released, then its root dentry and superblock,
+whose teardown sleeps) on the current task's task_work
+(`Twa::Resume`: an umount(2) is complete when it returns), or, from
+interrupt context, a kernel thread or a task past `exit_task_work`,
+on `DELAYED_MNTPUT` (IrqSpinlock leaf, the mounts' embedded callback
+heads) drained by delayed work on `SYSTEM_WQ`. So a `MountRef` may be
+dropped under any lock. The `sb` and `root` fields (`MntOwned`) are
+released by the teardown while the mount's memory may live on in a
+failed `try_get`'s brief `Arc`, which never reads them.
 
-**Reference Counting (mntget/mntput):**
-
-Each open `File` holds a reference to its mount via the `mnt` field:
-- `File::new()` → `mntget()` increments `mnt_count`
-- `File::drop()` → `mntput()` decrements `mnt_count`
-- `is_mount_busy()` returns true if `mnt_get_count() > 0`
-- Unmount fails with `EBUSY` if mount is busy (unless `MNT_FORCE`/`MNT_DETACH`)
+**Users (busy):** an open `File` (`File::new` → `user_get`, its
+release → `user_put`) and an `FsStruct`'s root and cwd are users;
+`is_mount_busy()` is true with submounts or `users() > 0`, and
+unmount fails with `EBUSY` then (unless `MNT_DETACH`).
 
 **Lock Order for Mount Operations:**
 ```
 1. the mountpoint's Inode.i_rwsem (attach: a dead directory is refused)
 2. mount::NAMESPACE_SEM (write: attach, umount, namespace copy)
 3. SuperBlock.s_umount (write: remount)
-4. mount::MOUNT_LOCK (attach_mnt / detach_mnt; Mount::new)
+4. mount::MOUNT_LOCK (attach_mnt / detach_mnt; Mount::alloc)
 5. MntNamespace.root (read/write)
 6. Mount.parent (write for set/clear)
 7. Mount.mountpoint (write for set/clear)
@@ -2672,7 +2682,7 @@ umount writes the filesystem back after releasing NAMESPACE_SEM
 (writeback takes inode locks; Linux syncs in deactivate_super after
 namespace_unlock). Mount ids come from `MNT_IDS` (`util::ida::Ida`,
 Linux mnt_id_ida: its IrqSpinlock leaf, the bitmap grown outside it;
-a mount's drop frees its id in whatever context it runs) and
+a mount's teardown frees its id) and
 `MNT_ID_UNIQUE` (atomic). Deviation: no global
 (parent, mountpoint) hash; crossing scans the current mount's children.
 Propagation (`fs/pnode.rs`) runs entirely under NAMESPACE_SEM (write):
@@ -4526,6 +4536,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `Mm.ioctx` (`IoctxTable.slots`); `AIO_NR` | io/aio/mod.rs | spin Mutex leaves, thread context | `Mm.ioctx`: an address space's AIO contexts by id (Linux mm->ioctx_table under ioctx_lock): io_setup adds (the table grows by a buffer allocated before the lock, `kmem::spare`/`adopt`), io_destroy and exit_aio remove, every AIO syscall looks a context up under it, cloning its `Arc`; mremap of a ring, under the mmap_lock for writing, finds its context in it and moves the context id (atomics); nothing is taken under it. `AIO_NR` (Linux aio_nr_lock): the events every context asked for, against aio-max-nr (an atomic, read lock-free) |
 | `Kioctx.ring_lock` (sleeping) → mmap_lock; `Kioctx.comp`, `Kioctx.reap`; `PollIocb.reg` (sleeping) → `Kioctx.active` → file wait queue head → `PollIocb.st` → `Workqueue.inner` | io/aio/ctx.rs, io/aio/poll.rs | `ring_lock`, `reg` sleeping `sync::Mutex`; `comp`, `reap`, `active`, `st` IrqSpinlock | An AIO context (Linux struct kioctx). `ring_lock` (Linux ring_lock): one io_getevents copies events to user space (it may fault: -> mmap_lock) and moves the ring's head. `comp` (Linux completion_lock): the kernel's tail and the count of posted events whose slots are not free yet; a request's end writes its event into the shared ring and publishes the tail (Release) under it, in any context (a bio's end_io in hardirq), then signals its eventfd (`Eventfd.inner`) and wakes io_getevents sleepers (`Kioctx.wait`, keyed by the events in the ring) after the unlock; a leaf. `Kioctx.avail` (atomic, Linux reqs_available) counts free event slots, refilled under `comp` from the head user space stored. `reap`: requests whose event is posted, waiting for release in thread context (their pins are dirtied under page locks, their file dropped: Linux bio_dirty_work, delayed_fput), pushed in any context with a delayed work item on `SYSTEM_WQ` (queued from the interrupt handler: `Workqueue.inner`), drained by that work, io_submit, io_getevents and the context's end; a leaf. `active` (Linux ctx_lock): the cancellable requests (IOCB_CMD_POLL), taken by io_cancel, the end's cancel, and a poll's submission and work, which take their wait entry off the file's queue under it (-> the queue head). `PollIocb.reg` (a poll request's wait entry and the owners of its queue) is held by the submission across the file's poll (which may sleep) and its decision under `active`, and by the poll work around its own, so the work waits for a submission still registering. A poll's wakeup runs under the file's wait queue head and takes only `PollIocb.st` (its work's queued/again/cancelled flags), then queues its work (`Workqueue.inner`, the worker's wait queue head): head -> head nesting, as epoll's callback. `Kioctx.users` and `reqs` (atomics, Linux percpu_ref users and reqs) count the syscalls using a context and its requests alive; io_destroy and exit_aio set `dead` (SeqCst against a lookup's increment, and against the last put's read of `dead` after its decrement: store buffering, all four accesses SeqCst), wait for `users` to drain, cancel, then wait for `reqs` (`Kioctx.idle`), releasing reaped requests meanwhile |
 | `TaskWorks.q` (per task) | task/task_work.rs | IrqSpinlock leaf | a task's queued callbacks (Linux task->task_works, here a lock and an intrusive list of embedded callback heads that never allocates): `task_work_add` from any context, hardirq included, links a head, drops the lock, then flags the task: `Twa::Resume` sets TIF_NOTIFY_RESUME (a file's release, run on the return to user mode), `Twa::Signal` sets TIF_NOTIFY_SIGNAL and wakes the task from an interruptible sleep (pi_lock, run-queue lock: after the lock; io_uring's `WorkHead`s, linked once). The task pops one at a time and runs it with nothing held, at the return to user mode, in io_uring and io-wq waits and in sleeps that run work and go on (`signal_pending_run_work`); `exit_task_work` (after exit dropped its files, fs context, namespaces and mm) closes the list: later adds fail, and a file goes to `fs::file`'s delayed list instead |
+| `DELAYED_MNTPUT` → (after) `Workqueue.inner` | fs/mntput.rs | IrqSpinlock leaf | Linux delayed_mntput_list / delayed_mntput_work: mounts whose last reference went in interrupt context, a kernel thread or an exited task, linked through their embedded callback head (no allocation), each holding its `Arc`; the first add queues the delayed work (one tick) after the lock is released. The work takes the whole list under the lock and tears each mount down with it dropped (taking NAMESPACE_SEM, MOUNT_LOCK, `s_mounts` and whatever a superblock's teardown takes, with nothing else held); mounts those teardowns drop queue again |
 | `DELAYED_FPUT` → (after) `Workqueue.inner`; `DELAYED_FPUT_RUN` (sleeping) | fs/file.rs | IrqSpinlock leaf; sleeping `sync::Mutex`, outermost | Linux delayed_fput_list / delayed_fput_work: files whose last reference went in interrupt context, a kernel thread or an exited task, linked through their embedded callback head (no allocation), each holding its `Arc`; the first add queues the delayed work (one tick) after the lock is released. The work (and `flush_delayed_fput`) takes the whole list under the lock and releases each file with it dropped, under `DELAYED_FPUT_RUN`, which a flush takes to wait out a drain under way (Linux flush_delayed_work); files those releases drop queue again |
 | `Tctx.reqs` (per task) → `TaskWorks.q`; `IoWq` `Acct.q`, `IoWq.workers`, `Tctx.io_wq`, `IoRing.defer` | io/io_uring/tctx.rs, io/io_uring/iowq.rs, io/io_uring/mod.rs | `Tctx.reqs` IrqSpinlock; the others spin Mutex leaves, thread context | `Tctx.reqs`: a task's ended io_uring requests (Linux tctx->task_list), pushed by `AsyncIo::complete` in any context (a bio's end_io in hardirq); the push queues the task's callback under it, while the pushed request (which holds the task) is still the pusher's, so no task reference is dropped in an interrupt handler. The task pops them in its context and finishes them (CQE under `IoRing.cq`, pins released: page locks) with nothing held. `Acct.q`: one io-wq pool's queue (an intrusive list of boxed work: nothing allocates under it) and worker counts; `IoWq.workers`: the running workers, for cancel, an intrusive list (Linux wq->all_list) each worker links itself on, its node allocated when it was started (Linux create_io_worker); `Tctx.io_wq`: the task's io-wq and whether its cancel began (Linux tctx->in_cancel): exit and exec leave it in place while they cancel, so work queued meanwhile ends ECANCELED, and take it after; none is made again after exit (after exec, a new one); `IoRing.defer`: the requests a drain holds back, each boxed before the lock and linked through its own node (Linux io_defer_entry), popped under it and queued after. `Tctx.polled` (sleeping `sync::Mutex`, thread context: submit notes a ring, exit and exec's cancel walk it in place, polling each ring: -> `IoRing.poll_files`): the task's IOPOLL rings. Workers are io threads of the submitter's process, started (only by the owner, else through its task_work callback) and woken after the locks are released. `Tctx.inflight`, `IoRing.inflight` (atomics) count requests from their issue or queueing to their drop (in the submitter's context or a worker's); exit and exec wait for zero after cancelling the io-wq, polling IOPOLL rings and running their own ended requests meanwhile; the drop that takes `IoRing.inflight` to zero lets the held-back requests go |
 | `Pid.wait_pidfd` | task/pid.rs, task/pidfd.rs | WaitQueue | pidfd pollers of the task the `Pid` names (Linux wait_pidfd); woken under TASKLIST's write lock (a wait queue head is a leaf under it) when the task becomes a zombie and is reported (`notify_pidfd` from `notify`, Linux do_notify_pidfd) or, an untraced thread, exits, and when it leaves the task list (`remove_task`, Linux __unhash_process). A poll reads the task's state under TASKLIST's read lock (`pidfd_exited`, Linux pidfd_poll under RCU): readable once it is a zombie and, a leader, no other thread of its group is listed; hung up once it is gone. Poll methods run with no spin lock held, so taking TASKLIST there is in order |

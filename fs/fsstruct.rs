@@ -23,6 +23,7 @@ use alloc::sync::Arc;
 
 use crate::sync::spin::Mutex;
 
+use super::mount::MountRef;
 use super::path_ref::Path;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
@@ -45,14 +46,14 @@ struct Pinned(Path);
 
 impl Pinned {
     fn new(p: Path) -> Self {
-        p.mnt.mntget();
+        p.mnt.user_get();
         Self(p)
     }
 }
 
 impl Drop for Pinned {
     fn drop(&mut self) {
-        self.0.mnt.mntput();
+        self.0.mnt.user_put();
     }
 }
 
@@ -128,7 +129,7 @@ impl FsStruct {
     pub fn repoint(&self, map: &crate::fs::mount::MountMap) {
         let swap = |p: &Path| {
             map.iter()
-                .find(|(old, _)| Arc::ptr_eq(old, &p.mnt))
+                .find(|(old, _)| MountRef::ptr_eq(old, &p.mnt))
                 .map(|(_, new)| Path::new(new.clone(), p.dentry.clone()))
         };
         let old = {
@@ -198,8 +199,8 @@ use crate::task::Task;
 static KTHREAD_FS: spin::Once<Arc<FsStruct>> = spin::Once::new();
 
 /// Set up [`KTHREAD_FS`] on `knullfs` (Linux init_mount_tree)
-pub fn kthread_fs_init(knullfs: Arc<super::Mount>) {
-    let root = Path::new(knullfs.clone(), knullfs.root.clone());
+pub fn kthread_fs_init(knullfs: MountRef) {
+    let root = Path::new(knullfs.clone(), (*knullfs.root).clone());
     KTHREAD_FS.call_once(|| FsStruct::new(root.clone(), root));
 }
 

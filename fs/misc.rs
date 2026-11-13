@@ -148,7 +148,7 @@ fn sb_sync_flags(flags: u64) -> u32 {
 /// requested set. The read-only switch goes first and is all-or-nothing
 /// (EBUSY while files are open for writing or changes are in progress,
 /// with nothing changed); only then the per-mount flags are replaced.
-fn remount(m: &Arc<super::mount::Mount>, flags: u64, data: &[u8]) -> Result<(), KernelError> {
+fn remount(m: &super::mount::MountRef, flags: u64, data: &[u8]) -> Result<(), KernelError> {
     let _s = m.sb.s_umount.write();
     // Read-only first (EBUSY changes nothing), then the filesystem's
     // options; their error undoes the switch (Linux reconfigure_super:
@@ -172,7 +172,7 @@ fn remount(m: &Arc<super::mount::Mount>, flags: u64, data: &[u8]) -> Result<(), 
 
 /// MS_REMOUNT|MS_BIND (Linux do_reconfigure_mnt): this mount's flags
 /// only, read-only included; the superblock is untouched
-fn reconfigure_mnt(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+fn reconfigure_mnt(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError> {
     // s_umount shared, as Linux do_reconfigure_mnt: the superblock does
     // not change, MOUNT_LOCK serializes the flag writers
     let _s = m.sb.s_umount.read();
@@ -182,7 +182,7 @@ fn reconfigure_mnt(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), Kerne
 /// MS_SHARED / MS_SLAVE / MS_PRIVATE / MS_UNBINDABLE (Linux
 /// do_change_type): exactly one type (else EINVAL), for the subtree
 /// with MS_REC
-fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+fn change_type(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError> {
     use super::pnode::{Prop, change_propagation};
     let p = match flags & !(ms::REC | ms::SILENT) {
         ms::SHARED => Prop::Shared,
@@ -209,7 +209,7 @@ fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelErr
 
 /// The caller's mount (Linux check_mnt) whose root `target` is (Linux
 /// path_mounted), else EINVAL: what remount works on
-fn own_mount_at(target: &super::Path) -> Result<Arc<super::mount::Mount>, KernelError> {
+fn own_mount_at(target: &super::Path) -> Result<super::mount::MountRef, KernelError> {
     if !super::mount::check_mnt(&target.mnt) {
         return Err(KernelError::InvalidArgument);
     }
@@ -217,7 +217,7 @@ fn own_mount_at(target: &super::Path) -> Result<Arc<super::mount::Mount>, Kernel
 }
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
-fn mount_at(target: &super::Path) -> Result<Arc<super::mount::Mount>, KernelError> {
+fn mount_at(target: &super::Path) -> Result<super::mount::MountRef, KernelError> {
     if Arc::ptr_eq(&target.dentry, &target.mnt.root) {
         Ok(target.mnt.clone())
     } else {

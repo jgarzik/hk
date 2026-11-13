@@ -3,14 +3,13 @@
 //! root reaches, by mount order (mnt_id_unique), with every name field
 //! escaped so a name cannot split or forge a line
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::super::Path;
 use super::super::dentry::{d_path, dentry_path};
 use super::super::mount::{
     MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW, MNT_READONLY,
-    MNT_RELATIME, Mount, namespace_read, walk,
+    MNT_RELATIME, Mount, MountRef, namespace_read, walk,
 };
 use super::super::name::mangle;
 use crate::task::percpu::TaskRef;
@@ -27,7 +26,7 @@ const MOUNTINFO_LINE: usize = 128;
 
 /// The mounts task `t` sees: (mount, mountpoint as seen from its root),
 /// by mount order; a mount its root does not reach is left out
-fn visible(t: &TaskRef) -> Vec<(Arc<Mount>, Vec<u8>)> {
+fn visible(t: &TaskRef) -> Vec<(MountRef, Vec<u8>)> {
     let (Some(ns), Some(fs)) = (super::task_nsproxy(t), crate::fs::get_task_fs(t)) else {
         return Vec::new();
     };
@@ -36,7 +35,7 @@ fn visible(t: &TaskRef) -> Vec<(Arc<Mount>, Vec<u8>)> {
     let Some(top) = ns.mnt_ns.get_root() else {
         return Vec::new();
     };
-    let mut all: Vec<Arc<Mount>> = walk(&top, &*g).collect();
+    let mut all: Vec<MountRef> = walk(&top, &*g).collect();
     all.sort_by_key(|m| m.mnt_id_unique);
     all.into_iter()
         .filter_map(|m| {
@@ -133,7 +132,7 @@ pub fn show_mountinfo(t: &TaskRef) -> Vec<u8> {
         let sees = |g: u32| {
             super::super::pnode::peers(g)
                 .iter()
-                .any(|p| vis.iter().any(|(v, _)| Arc::ptr_eq(v, p)))
+                .any(|p| vis.iter().any(|(v, _)| MountRef::ptr_eq(v, p)))
         };
         out.extend_from_slice(&super::super::pnode::optional_fields(&m, &sees));
         out.extend_from_slice(b" - ");

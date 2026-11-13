@@ -25,6 +25,7 @@ use crate::util::hlist_bl::BlHead;
 use crate::util::list::{Link, OwnedList, Owner};
 
 use super::inode::Inode;
+use super::mount::MountRef;
 use super::name::DName;
 use super::path_ref::Path;
 use super::superblock::SuperBlock;
@@ -519,7 +520,7 @@ pub fn try_d_path(p: &Path, root: &Path) -> Result<(Vec<u8>, bool), KernelError>
         let _r = RENAME_LOCK.read();
         let (mut mnt, mut d) = (p.mnt.clone(), p.dentry.clone());
         loop {
-            if Arc::ptr_eq(&mnt, &root.mnt) && Arc::ptr_eq(&d, &root.dentry) {
+            if MountRef::ptr_eq(&mnt, &root.mnt) && Arc::ptr_eq(&d, &root.dentry) {
                 break true;
             }
             if Arc::ptr_eq(&d, &mnt.root) {

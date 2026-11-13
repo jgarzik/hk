@@ -8,13 +8,16 @@ use alloc::vec::Vec;
 use crate::sync::spin::RwLock;
 use crate::sync::{LockedByEither, RwSem, RwSemReadGuard, RwSemWriteGuard, SeqLock, UniqueOwner};
 use crate::util::list::{Link, OwnedList, Owner};
-use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::FileType;
+pub use super::mntput::MountRef;
+use super::mntput::{__cleanup_mnt, MNT_REF_DEAD, MntOwned};
 use super::path_ref::Path;
 use super::superblock::{FileSystemType, SuperBlock};
+use crate::task::task_work::CallbackHead;
 use crate::util::ida::Ida;
 use crate::util::kalloc::{arc_nofail, try_arc};
 
@@ -63,7 +66,7 @@ unsafe impl UniqueOwner for MntHash {}
 pub static MOUNT_LOCK: SeqLock<MntHash> = SeqLock::new(MntHash(()));
 
 /// Old mount -> its copy, from [`Mount::clone_tree`]
-pub type MountMap = Vec<(Arc<Mount>, Arc<Mount>)>;
+pub type MountMap = Vec<(MountRef, MountRef)>;
 
 /// What NAMESPACE_SEM owns: the mount tree's links (each mount's
 /// `mnt_mounts`), changed with MOUNT_LOCK also held; `&NsTree`
@@ -131,23 +134,18 @@ const MNT_UNIQUE_ID_OFFSET: u64 = 1 << 31;
 /// The next never-reused mount id (Linux mnt_id_ctr + 1)
 static MNT_ID_UNIQUE: AtomicU64 = AtomicU64::new(MNT_UNIQUE_ID_OFFSET + 1);
 
-/// A mount point in the namespace
+/// A mount point in the namespace (Linux struct mount / vfsmount)
 ///
-/// This struct mirrors Linux's `struct vfsmount`. The reference count
-/// (`mnt_count`) tracks users of this mount - each open file that references
-/// this mount holds a reference via `mntget()`.
-///
-/// The last `Arc` of a mount is never dropped under a spin lock: its
-/// drop takes its superblock's `s_mounts`, frees its id and releases
-/// its submounts, superblock and dentries (a superblock's teardown
-/// sleeps). Lists and walks under one hand references out and drop
-/// what they take off after the unlock.
+/// Held through [`MountRef`] (`mnt_count`, Linux mnt_count); the last
+/// reference's teardown (`cleanup`) is deferred (`fs::mntput`), so a
+/// reference may be dropped under any lock. Its users (`users`: open
+/// files, a task's root and cwd) make it busy for umount.
 pub struct Mount {
-    /// The mounted filesystem's superblock
-    pub sb: Arc<SuperBlock>,
+    /// The mounted filesystem's superblock (Linux mnt_sb)
+    pub sb: MntOwned<Arc<SuperBlock>>,
 
-    /// Root dentry of the mounted filesystem
-    pub root: Arc<Dentry>,
+    /// Root dentry of the mounted filesystem (Linux mnt_root)
+    pub root: MntOwned<Arc<Dentry>>,
 
     /// The dentry where this filesystem is mounted (mount point)
     /// None for the root mount
@@ -194,41 +192,47 @@ pub struct Mount {
     /// mounts made by the kernel (Linux mnt_devname)
     pub devname: super::name::FileName,
 
-    /// Reference count for this mount (like Linux mnt_count)
-    ///
-    /// Tracks active users of this mount. Each open file holds a reference
-    /// via mntget(). Incremented by mntget(), decremented by mntput().
-    /// The mount cannot be unmounted while mnt_count > 0 (unless MNT_FORCE/MNT_DETACH).
-    mnt_count: AtomicU64,
+    /// Counted references ([`MountRef`], Linux mnt_count);
+    /// `MNT_REF_DEAD` once the teardown is queued
+    pub(super) mnt_count: AtomicUsize,
+
+    /// Users: open files, task roots and cwds (`user_get`); one makes
+    /// it busy for umount, unless MNT_DETACH (Linux compares mnt_count
+    /// against the references the tree holds)
+    users: AtomicU64,
+
+    /// The deferred teardown's head (Linux mnt_rcu as task_work, or
+    /// mnt_llist on delayed_mntput_list)
+    pub(super) mnt_task_work: CallbackHead,
 
     /// On its superblock's `s_mounts` (Linux mnt_instance)
     pub(super) mnt_instance: crate::util::list::Link,
 }
 
 impl Mount {
-    /// Create a new mount, or ENOMEM
-    pub fn new(
+    /// A new mount, its first reference, or ENOMEM (Linux alloc_vfsmnt)
+    pub fn alloc(
         sb: Arc<SuperBlock>,
         root: Arc<Dentry>,
         flags: u32,
         devname: super::name::FileName,
-    ) -> Result<Arc<Self>, KernelError> {
+    ) -> Result<MountRef, KernelError> {
         let m = try_arc(Self::init(sb, root, flags, devname, MNT_IDS.try_alloc()?))?;
         m.sb.add_mount(&m);
-        Ok(m)
+        Ok(MountRef::first(m))
     }
 
-    /// [`Mount::new`] for a tree copy, which cannot unwind a partial
+    /// [`Mount::alloc`] for a tree copy, which cannot unwind a partial
     /// copy (its peer groups and attachments) on failure
-    fn new_nofail(
+    fn alloc_nofail(
         sb: Arc<SuperBlock>,
         root: Arc<Dentry>,
         flags: u32,
         devname: super::name::FileName,
-    ) -> Arc<Self> {
+    ) -> MountRef {
         let m = arc_nofail(Self::init(sb, root, flags, devname, MNT_IDS.alloc()));
         m.sb.add_mount(&m);
-        m
+        MountRef::first(m)
     }
 
     /// A mount with id `mnt_id`, which its drop gives back
@@ -240,8 +244,8 @@ impl Mount {
         mnt_id: u32,
     ) -> Self {
         Self {
-            sb,
-            root,
+            sb: MntOwned::new(sb),
+            root: MntOwned::new(root),
             mountpoint: RwLock::new(None),
             parent: RwLock::new(None),
             mnt_mounts: LockedByEither::new(OwnedList::new()),
@@ -257,15 +261,17 @@ impl Mount {
             mnt_id,
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
             devname,
-            mnt_count: AtomicU64::new(0),
+            mnt_count: AtomicUsize::new(1),
+            users: AtomicU64::new(0),
+            mnt_task_work: CallbackHead::new(__cleanup_mnt),
             mnt_instance: crate::util::list::Link::new(),
         }
     }
 
     /// A copy of `self` for a namespace copy into namespace `ns`: same
     /// filesystem, root, flags and source, new ids, not attached
-    fn copy(&self, ns: u64) -> Arc<Self> {
-        let c = Self::new_nofail(
+    fn copy(&self, ns: u64) -> MountRef {
+        let c = Self::alloc_nofail(
             self.sb.clone(),
             self.root.clone(),
             self.flags(),
@@ -364,26 +370,15 @@ impl Mount {
         self.flags() & MNT_READONLY != 0 || self.sb.rdonly()
     }
 
-    /// Write access through this mount (Linux mnt_want_write): EROFS
-    /// for a read-only mount or superblock; hold the guard across the
-    /// modification
-    pub fn want_write(self: &Arc<Self>) -> Result<super::superblock::WriteAccess, KernelError> {
-        super::superblock::get_write(&self.writers, || self.is_readonly())?;
-        Ok(super::superblock::WriteAccess::mnt(self.clone()))
-    }
-
     /// Release what want_write took
     pub(super) fn put_write(&self) {
         self.writers.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// Increment mount reference count (like Linux mntget)
-    ///
-    /// Called when a file is opened on this filesystem.
-    /// The caller should hold an Arc<Mount> reference and call this
-    /// to indicate active use of the mount.
-    pub fn mntget(&self) {
-        self.mnt_count.fetch_add(1, Ordering::Relaxed);
+    /// A user of the mount begins: an open file, a task's root or cwd;
+    /// it is busy for umount until `user_put`
+    pub fn user_get(&self) {
+        self.users.fetch_add(1, Ordering::Relaxed);
         // Use clears an MNT_EXPIRE mark (Linux mntput)
         self.expiry.store(false, Ordering::Relaxed);
     }
@@ -396,18 +391,14 @@ impl Mount {
         }
     }
 
-    /// Decrement mount reference count (like Linux mntput)
-    ///
-    /// Called when a file is closed.
-    pub fn mntput(&self) {
-        self.mnt_count.fetch_sub(1, Ordering::Relaxed);
+    /// A user of the mount ended
+    pub fn user_put(&self) {
+        self.users.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Get current mount reference count (like Linux mnt_get_count)
-    ///
-    /// Returns the number of active users of this mount.
-    pub fn mnt_get_count(&self) -> u64 {
-        self.mnt_count.load(Ordering::Relaxed)
+    /// Its users (umount's busy test)
+    pub fn users(&self) -> u64 {
+        self.users.load(Ordering::Relaxed)
     }
 
     /// Get the mount point dentry
@@ -421,17 +412,15 @@ impl Mount {
         *self.mountpoint.write() = Some(dentry);
     }
 
-    /// Get parent mount
-    pub fn get_parent(&self) -> Option<Arc<Mount>> {
-        self.parent
-            .read()
-            .as_ref()
-            .and_then(|w: &Weak<Mount>| w.upgrade())
+    /// The parent mount, unless it is gone (Linux mnt_parent: a
+    /// lazily unmounted parent's teardown may be queued)
+    pub fn get_parent(&self) -> Option<MountRef> {
+        self.parent.read().as_ref().and_then(MountRef::try_get)
     }
 
     /// Set parent mount
-    pub fn set_parent(&self, parent: &Arc<Mount>) {
-        *self.parent.write() = Some(Arc::downgrade(parent));
+    pub fn set_parent(&self, parent: &MountRef) {
+        *self.parent.write() = Some(MountRef::downgrade(parent));
     }
 
     /// `self`'s submounts, under a lock that holds them still
@@ -439,7 +428,7 @@ impl Mount {
         let list = s.mounts(self);
         Kids {
             list,
-            next: list.front(),
+            next: entry(list.front()),
         }
     }
 
@@ -458,7 +447,7 @@ impl Mount {
     ///
     /// This is used by CLONE_NEWNS to give a new mount namespace its
     /// own view of the mount hierarchy.
-    pub fn clone_tree(root: &Arc<Mount>, ns: u64) -> (Arc<Mount>, MountMap) {
+    pub fn clone_tree(root: &MountRef, ns: u64) -> (MountRef, MountMap) {
         let mut g = namespace_lock();
         let new_root = root.copy(ns);
         let mut map = alloc::vec![(root.clone(), new_root.clone())];
@@ -476,29 +465,36 @@ impl Mount {
 /// the list still
 pub struct Kids<'a> {
     list: &'a OwnedList<MntChild>,
-    next: Option<Arc<Mount>>,
+    next: Option<MountRef>,
 }
 
 impl Iterator for Kids<'_> {
-    type Item = Arc<Mount>;
-    fn next(&mut self) -> Option<Arc<Mount>> {
+    type Item = MountRef;
+    fn next(&mut self) -> Option<MountRef> {
         let c = self.next.take()?;
-        self.next = self.list.next(&c);
+        self.next = entry(self.list.next(&c));
         Some(c)
     }
+}
+
+/// A reference to a submount taken from its parent's `mnt_mounts`,
+/// whose lock the caller holds: each entry there is counted
+/// (`attach_mnt`)
+fn entry(c: Option<Arc<Mount>>) -> Option<MountRef> {
+    c.and_then(MountRef::from_entry)
 }
 
 /// The mount after `p` in a walk of the tree at `root`, parents first
 /// (Linux next_mnt: the first submount, else the next sibling of the
 /// nearest mount up to `root` that has one; no stack)
-pub fn next_mnt(p: &Arc<Mount>, root: &Mount, s: &impl Stable) -> Option<Arc<Mount>> {
-    if let Some(c) = s.mounts(p).front() {
+pub fn next_mnt(p: &MountRef, root: &Mount, s: &impl Stable) -> Option<MountRef> {
+    if let Some(c) = entry(s.mounts(p).front()) {
         return Some(c);
     }
     let mut p = p.clone();
-    while !core::ptr::eq(Arc::as_ptr(&p), root) {
+    while !core::ptr::eq(MountRef::as_ptr(&p), root) {
         let parent = p.get_parent()?;
-        if let Some(n) = s.mounts(&parent).next(&p) {
+        if let Some(n) = entry(s.mounts(&parent).next(&p)) {
             return Some(n);
         }
         p = parent;
@@ -507,7 +503,7 @@ pub fn next_mnt(p: &Arc<Mount>, root: &Mount, s: &impl Stable) -> Option<Arc<Mou
 }
 
 /// `root` and every mount below it, parents first, by [`next_mnt`]
-pub fn walk<'a, S: Stable>(root: &'a Arc<Mount>, s: &'a S) -> Walk<'a, S> {
+pub fn walk<'a, S: Stable>(root: &'a MountRef, s: &'a S) -> Walk<'a, S> {
     Walk {
         root,
         s,
@@ -517,14 +513,14 @@ pub fn walk<'a, S: Stable>(root: &'a Arc<Mount>, s: &'a S) -> Walk<'a, S> {
 
 /// Iterator of [`walk`]
 pub struct Walk<'a, S: Stable> {
-    root: &'a Arc<Mount>,
+    root: &'a MountRef,
     s: &'a S,
-    next: Option<Arc<Mount>>,
+    next: Option<MountRef>,
 }
 
 impl<S: Stable> Iterator for Walk<'_, S> {
-    type Item = Arc<Mount>;
-    fn next(&mut self) -> Option<Arc<Mount>> {
+    type Item = MountRef;
+    fn next(&mut self) -> Option<MountRef> {
         let c = self.next.take()?;
         self.next = next_mnt(&c, self.root, self.s);
         Some(c)
@@ -537,9 +533,9 @@ impl<S: Stable> Iterator for Walk<'_, S> {
 /// each one. Under NAMESPACE_SEM write.
 pub(super) fn copy_below(
     ns: &mut NsTree,
-    src: &Arc<Mount>,
-    top: &Arc<Mount>,
-    mut copy: impl FnMut(&Arc<Mount>) -> Arc<Mount>,
+    src: &MountRef,
+    top: &MountRef,
+    mut copy: impl FnMut(&MountRef) -> MountRef,
 ) {
     let (mut p, mut q) = (src.clone(), top.clone());
     let mut next = next_mnt(src, src, &*ns);
@@ -549,7 +545,7 @@ pub(super) fn copy_below(
         let mp = s
             .get_mountpoint()
             .expect("mount: submount without a mountpoint");
-        while !Arc::ptr_eq(&p, &sp) {
+        while !MountRef::ptr_eq(&p, &sp) {
             let (Some(pp), Some(qp)) = (p.get_parent(), q.get_parent()) else {
                 unreachable!("mount: copy cursor climbed past the top");
             };
@@ -568,7 +564,7 @@ pub(super) fn copy_below(
 /// pivoted away or unmounted like any other mount. Then the private
 /// nullfs kernel threads start in (id 3, Linux 7.3 knullfs). Returns
 /// the rootfs.
-pub fn init_mount_tree() -> Result<Arc<Mount>, KernelError> {
+pub fn init_mount_tree() -> Result<MountRef, KernelError> {
     let nullfs = &super::nullfs::NULLFS_TYPE;
     let null = attach(
         (nullfs.mount)(nullfs, b"")?,
@@ -583,7 +579,7 @@ pub fn init_mount_tree() -> Result<Arc<Mount>, KernelError> {
     let rootfs = attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())?;
     let ksb = (nullfs.mount)(nullfs, b"")?;
     let root = ksb.get_root().ok_or(KernelError::InvalidArgument)?;
-    super::fsstruct::kthread_fs_init(Mount::new(
+    super::fsstruct::kthread_fs_init(Mount::alloc(
         ksb,
         root,
         MNT_READONLY,
@@ -602,12 +598,12 @@ pub fn attach(
     mnt_flags: u32,
     ro: bool,
     devname: super::name::FileName,
-) -> Result<Arc<Mount>, KernelError> {
+) -> Result<MountRef, KernelError> {
     let root = sb.get_root().ok_or(KernelError::InvalidArgument)?;
     if ro {
         sb.make_rdonly()?;
     }
-    let mount = Mount::new(sb, root, mnt_flags, devname)?;
+    let mount = Mount::alloc(sb, root, mnt_flags, devname)?;
     let mnt_ns = crate::ns::current_mnt_ns();
     if let Some(mp) = mountpoint {
         // Under the mountpoint's i_rwsem (Linux lock_mount), which rmdir
@@ -642,7 +638,7 @@ pub fn check_mnt(m: &Mount) -> bool {
 
 /// The tree at `m`, just hung on its parent, joins the parent's
 /// namespace (Linux commit_tree); under NAMESPACE_SEM write
-pub(super) fn commit_tree(ns: &NsTree, m: &Arc<Mount>) {
+pub(super) fn commit_tree(ns: &NsTree, m: &MountRef) {
     let id = m.get_parent().map_or(0, |p| p.ns());
     for t in walk(m, ns) {
         t.set_ns(id);
@@ -651,8 +647,8 @@ pub(super) fn commit_tree(ns: &NsTree, m: &Arc<Mount>) {
 
 /// A new mount of `m`'s filesystem rooted at `root`, with its flags
 /// and source (Linux clone_mnt); not attached
-pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> Arc<Mount> {
-    let c = Mount::new_nofail(
+pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> MountRef {
+    let c = Mount::alloc_nofail(
         m.sb.clone(),
         root,
         m.flags() & !MNT_LOCKED,
@@ -665,7 +661,7 @@ pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> Arc<Mount> {
 /// One mount [`copy_tree`] copies: its source, the entry of the copy
 /// it hangs on, and where (the copy's root for the top)
 struct CopyEnt {
-    src: Arc<Mount>,
+    src: MountRef,
     parent: usize,
     at: Arc<Dentry>,
 }
@@ -673,7 +669,7 @@ struct CopyEnt {
 /// What copy_tree copies of `m` at `root`, parents first: the mounts
 /// below `root`; an unbindable submount is left out with whatever is
 /// under it, EPERM if it is also locked (it hides what is under it)
-fn copy_plan(ns: &NsTree, m: &Arc<Mount>, root: &Arc<Dentry>) -> Result<Vec<CopyEnt>, KernelError> {
+fn copy_plan(ns: &NsTree, m: &MountRef, root: &Arc<Dentry>) -> Result<Vec<CopyEnt>, KernelError> {
     let mut plan = alloc::vec![CopyEnt {
         src: m.clone(),
         parent: 0,
@@ -709,8 +705,8 @@ fn copy_plan(ns: &NsTree, m: &Arc<Mount>, root: &Arc<Dentry>) -> Result<Vec<Copy
 /// The copies of `plan` (Linux copy_tree): the top loses MNT_LOCKED
 /// (clone_mnt), a submount keeps it (it still hides what is under
 /// it); under NAMESPACE_SEM write
-fn copy_tree(ns: &mut NsTree, plan: &[CopyEnt]) -> Arc<Mount> {
-    let mut out: Vec<Arc<Mount>> = Vec::new();
+fn copy_tree(ns: &mut NsTree, plan: &[CopyEnt]) -> MountRef {
+    let mut out: Vec<MountRef> = Vec::new();
     for (k, e) in plan.iter().enumerate() {
         let root = if k == 0 { &e.at } else { &e.src.root };
         let n = clone_mnt(&e.src, root.clone());
@@ -817,20 +813,16 @@ pub mod umount_flags {
     pub const UMOUNT_NOFOLLOW: i32 = 8;
 }
 
-/// Check if a mount is busy (has open files or child mounts)
-///
-/// This mirrors Linux's may_umount() / vfs_is_busy() logic:
-/// - Check for child mounts
-/// - Check mnt_count for active file references
-fn is_mount_busy(mount: &Arc<Mount>, s: &impl Stable) -> bool {
+/// A mount is busy for umount: it has submounts or users (open
+/// files, task roots and cwds; Linux do_umount's mnt_get_count against
+/// the tree's own references)
+fn is_mount_busy(mount: &MountRef, s: &impl Stable) -> bool {
     // Check for child mounts - can't unmount if there are filesystems mounted under us
     if mount.has_children(s) {
         return true;
     }
 
-    // Check for open files on this mount
-    // Each open File holds a reference via mntget()
-    if mount.mnt_get_count() > 0 {
+    if mount.users() > 0 {
         return true;
     }
 
@@ -846,15 +838,15 @@ fn is_mount_busy(mount: &Arc<Mount>, s: &impl Stable) -> bool {
 /// submounts or users is EBUSY, MNT_FORCE too. MNT_EXPIRE (not with
 /// MNT_FORCE or MNT_DETACH, not the root) only marks an unmarked mount
 /// (EAGAIN).
-pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
+pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
     use umount_flags::{MNT_DETACH, MNT_EXPIRE, MNT_FORCE};
     // Linux can_umount, optimistic; repeated under NAMESPACE_SEM
     if !check_mnt(&mount) || mount.flags() & MNT_LOCKED != 0 {
         return Err(KernelError::InvalidArgument);
     }
     let detach = flags & MNT_DETACH != 0;
-    let is_root =
-        crate::task::percpu::current_fs().is_some_and(|fs| Arc::ptr_eq(&fs.get_root().mnt, &mount));
+    let is_root = crate::task::percpu::current_fs()
+        .is_some_and(|fs| MountRef::ptr_eq(&fs.get_root().mnt, &mount));
     if flags & MNT_EXPIRE != 0 {
         if is_root || flags & (MNT_FORCE | MNT_DETACH) != 0 {
             return Err(KernelError::InvalidArgument);
@@ -883,7 +875,7 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     // The propagated copies go too (Linux propagate_mount_busy,
     // propagate_umount); a busy one makes it all EBUSY
     let copies = super::pnode::propagate_umount(&ns, &mount);
-    if !detach && (is_mount_busy(&mount, &*ns) || copies.iter().any(|c| c.mnt_get_count() > 0)) {
+    if !detach && (is_mount_busy(&mount, &*ns) || copies.iter().any(|c| c.users() > 0)) {
         return Err(KernelError::Busy);
     }
     for m in core::iter::once(&mount).chain(copies.iter()) {
@@ -906,7 +898,7 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
 
 /// Take `m` (and what is mounted below it) off its parent; under
 /// NAMESPACE_SEM write
-fn detach_mnt(ns: &mut NsTree, m: &Arc<Mount>) {
+fn detach_mnt(ns: &mut NsTree, m: &MountRef) {
     let parent = m.get_parent();
     // A tree change under MOUNT_LOCK (Linux umount_tree under
     // lock_mount_hash), for the walks that check its sequence; the
@@ -914,7 +906,9 @@ fn detach_mnt(ns: &mut NsTree, m: &Arc<Mount>) {
     let mut ml = MOUNT_LOCK.write();
     let link = parent
         .as_ref()
-        .and_then(|p| p.mnt_mounts.access_mut(ns, &mut ml).remove(m));
+        .and_then(|p| p.mnt_mounts.access_mut(ns, &mut ml).remove(m))
+        // SAFETY: entries of mnt_mounts are counted (`attach_mnt`)
+        .map(|c| unsafe { MountRef::from_counted(c) });
     *m.parent.write() = None;
     let mp = m.mountpoint.write().take();
     if let Some(mp) = &mp {
@@ -927,20 +921,20 @@ fn detach_mnt(ns: &mut NsTree, m: &Arc<Mount>) {
 /// Hang `m` on `mp` (Linux attach_mnt, under lock_mount_hash: here
 /// MOUNT_LOCK, for the walks that check its sequence); under
 /// NAMESPACE_SEM write
-pub(super) fn attach_mnt(ns: &mut NsTree, m: &Arc<Mount>, mp: &Path) {
+pub(super) fn attach_mnt(ns: &mut NsTree, m: &MountRef, mp: &Path) {
     let mut ml = MOUNT_LOCK.write();
     m.set_mountpoint(mp.dentry.clone());
     m.set_parent(&mp.mnt);
     mp.mnt
         .mnt_mounts
         .access_mut(ns, &mut ml)
-        .push_back(m.clone());
+        .push_back(m.clone().into_counted());
 }
 
 /// Hang the tree at `m` on `mp` and, under a shared mount, propagate
 /// it (Linux attach_recursive_mnt: the tree is made shared first);
 /// under NAMESPACE_SEM write
-fn graft(ns: &mut NsTree, m: &Arc<Mount>, mp: &Path) {
+fn graft(ns: &mut NsTree, m: &MountRef, mp: &Path) {
     let shared = mp.mnt.group.load(Ordering::SeqCst) != 0;
     if shared {
         super::pnode::invent_groups(ns, m);
@@ -956,7 +950,7 @@ fn graft(ns: &mut NsTree, m: &Arc<Mount>, mp: &Path) {
 /// path_is_under)
 pub fn is_path_reachable(p: &Path, root: &Path) -> bool {
     let (mut mnt, mut d) = (p.mnt.clone(), p.dentry.clone());
-    while !Arc::ptr_eq(&mnt, &root.mnt) {
+    while !MountRef::ptr_eq(&mnt, &root.mnt) {
         match (mnt.get_parent(), mnt.get_mountpoint()) {
             (Some(m), Some(mp)) => (mnt, d) = (m, mp),
             _ => return false,
@@ -1031,7 +1025,7 @@ pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
     }
     // Nothing moves under a shared mount here without propagating
     // (Linux: put_old's mount, new's parent, root's parent not shared)
-    let shared = |m: Option<Arc<Mount>>| m.is_some_and(|m| m.group.load(Ordering::SeqCst) != 0);
+    let shared = |m: Option<MountRef>| m.is_some_and(|m| m.group.load(Ordering::SeqCst) != 0);
     if shared(Some(put_old.mnt.clone()))
         || shared(new.mnt.get_parent())
         || shared(root.mnt.get_parent())
@@ -1044,7 +1038,7 @@ pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
     if new.dentry.is_unhashed() {
         return Err(KernelError::NotFound);
     }
-    if Arc::ptr_eq(&new.mnt, &root.mnt) || Arc::ptr_eq(&put_old.mnt, &root.mnt) {
+    if MountRef::ptr_eq(&new.mnt, &root.mnt) || MountRef::ptr_eq(&put_old.mnt, &root.mnt) {
         return Err(KernelError::Busy);
     }
     let mounted = |p: &Path| Arc::ptr_eq(&p.dentry, &p.mnt.root) && p.mnt.get_parent().is_some();
@@ -1099,23 +1093,84 @@ fn note_mp(mp: &Dentry, delta: i32) {
     }
 }
 
-impl Drop for Mount {
-    /// A mount dropped without an umount (a namespace going away) still
-    /// had its mountpoint counted
-    fn drop(&mut self) {
-        // First off its superblock's s_mounts (the list's contract,
-        // `WeakList`; Linux removes mnt_instance in umount_tree)
-        let me: &Self = self;
+impl Mount {
+    /// Tear the mount down (Linux cleanup_mnt, with mntput_no_expire's
+    /// release of the submounts still hung on it): off its
+    /// superblock's s_mounts, its submounts and mountpoint let go, its
+    /// id freed, then its root dentry and superblock released. Sleeps.
+    ///
+    /// # Safety
+    /// Once per mount, with no counted reference left or to come:
+    /// its `MountRef` count went `MNT_REF_DEAD`, or it never had one.
+    pub(super) unsafe fn cleanup(&self) {
+        // Off s_mounts first, so no walk of it borrows the mount after
+        // this (the list's contract, `WeakList`)
         let weak = {
-            let mut l = me.sb.s_mounts.lock();
+            let mut l = self.sb.s_mounts.lock();
             // SAFETY: a linked mnt_instance is on its superblock's list
-            me.mnt_instance.is_linked().then(|| unsafe { l.remove(me) })
+            self.mnt_instance
+                .is_linked()
+                .then(|| unsafe { l.remove(self) })
         };
         drop(weak);
-        if let Some(mp) = self.mountpoint.get_mut().take() {
+        // A tree torn down whole (a namespace's last reference) still
+        // has its submounts hung on it: each loses its parent and
+        // mountpoint, and the reference this one held
+        while let Some(c) = self.pop_child() {
+            drop(c);
+        }
+        if let Some(mp) = self.mountpoint.write().take() {
             note_mp(&mp, -1);
         }
         MNT_IDS.free(self.mnt_id);
+        // SAFETY: the caller's contract: no reference can reach these
+        // any more, and this is their one release
+        let (root, sb) = unsafe { (self.root.take(), self.sb.take()) };
+        drop(root);
+        drop(sb);
+    }
+
+    /// Unhang one submount (Linux umount_mnt), its reference returned
+    /// for a drop after the locks
+    fn pop_child(&self) -> Option<MountRef> {
+        if !self.has_children(&*MOUNT_LOCK.read_excl()) {
+            return None;
+        }
+        let mut ns = namespace_lock();
+        let mut ml = MOUNT_LOCK.write();
+        let c = self.mnt_mounts.access_mut(&mut ns, &mut ml).pop_front()?;
+        // SAFETY: entries of mnt_mounts are counted (`attach_mnt`)
+        let c = unsafe { MountRef::from_counted(c) };
+        *c.parent.write() = None;
+        let mp = c.mountpoint.write().take();
+        if let Some(mp) = &mp {
+            note_mp(mp, -1);
+        }
+        drop(ml);
+        drop(ns);
+        Some(c)
+    }
+}
+
+impl MountRef {
+    /// Write access through this mount (Linux mnt_want_write): EROFS
+    /// for a read-only mount or superblock; hold the guard across the
+    /// modification
+    pub fn want_write(&self) -> Result<super::superblock::WriteAccess, KernelError> {
+        super::superblock::get_write(&self.writers, || self.is_readonly())?;
+        Ok(super::superblock::WriteAccess::mnt(self.clone()))
+    }
+}
+
+/// The memory of a mount: torn down already, unless it never had a
+/// reference (`Mount::alloc` failed to allocate its `Arc`)
+impl Drop for Mount {
+    fn drop(&mut self) {
+        if *self.mnt_count.get_mut() != MNT_REF_DEAD {
+            // SAFETY: never referenced (`&mut self`), so this is its one
+            // teardown
+            unsafe { self.cleanup() };
+        }
     }
 }
 
@@ -1151,8 +1206,8 @@ pub fn follow_mount(p: Path) -> Path {
 /// The mount on `p` (Linux lookup_mnt): a child of `p.mnt` whose
 /// mountpoint is the place `p.dentry` names, under mount_lock's
 /// locking read (Linux walks the mount hash under RCU and the
-/// sequence; the references it takes here are never the last)
-fn lookup_mnt(p: &Path) -> Option<Arc<Mount>> {
+/// sequence)
+fn lookup_mnt(p: &Path) -> Option<MountRef> {
     let ml = MOUNT_LOCK.read_excl();
     let mut kids = p.mnt.kids(&*ml);
     let m = kids.find(|c| {
@@ -1201,15 +1256,15 @@ mod tests {
     use super::*;
 
     /// An unattached nullfs mount
-    fn mnt() -> Arc<Mount> {
+    fn mnt() -> MountRef {
         let t = &super::super::nullfs::NULLFS_TYPE;
         let sb = (t.mount)(t, b"").unwrap();
         let root = sb.get_root().unwrap();
-        Mount::new(sb, root, 0, b"t".as_slice().into()).unwrap()
+        Mount::alloc(sb, root, 0, b"t".as_slice().into()).unwrap()
     }
 
     /// A new mount on `parent`'s root
-    fn hang(ns: &mut NsTree, parent: &Arc<Mount>) -> Arc<Mount> {
+    fn hang(ns: &mut NsTree, parent: &MountRef) -> MountRef {
         let c = mnt();
         attach_mnt(ns, &c, &Path::new(parent.clone(), parent.root.clone()));
         c

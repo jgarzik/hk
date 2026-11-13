@@ -288,7 +288,7 @@ pub(super) fn unhold_writers(w: &AtomicU64) {
 pub struct WriteAccess {
     sb: Option<Arc<SuperBlock>>,
     /// The mount's write access too (Linux mnt_want_write on a path)
-    mnt: Option<Arc<super::mount::Mount>>,
+    mnt: Option<super::mount::MountRef>,
 }
 
 impl WriteAccess {
@@ -301,7 +301,7 @@ impl WriteAccess {
     }
 
     /// `mnt`'s write count (taken by the caller)
-    pub(super) fn mnt(mnt: Arc<super::mount::Mount>) -> Self {
+    pub(super) fn mnt(mnt: super::mount::MountRef) -> Self {
         Self {
             sb: None,
             mnt: Some(mnt),

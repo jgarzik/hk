@@ -81,7 +81,7 @@ pub const CLONE_NS_FLAGS: u64 = CLONE_NEWNS
 // Mount Namespace
 // ============================================================================
 
-use crate::fs::mount::Mount;
+use crate::fs::mount::{Mount, MountRef};
 
 /// Next mount namespace id (Linux ns_common.ns_id): never reused, so
 /// a mount that outlived its namespace matches no other
@@ -95,7 +95,7 @@ pub struct MntNamespace {
     /// Never-reused id, what `Mount::mnt_ns` names (Linux mnt_ns)
     pub id: u64,
     /// Root mount of this namespace
-    pub root: RwLock<Option<Arc<Mount>>>,
+    pub root: RwLock<Option<MountRef>>,
     /// Its inode number (Linux ns.inum)
     pub inum: inum::Inum,
 }
@@ -140,15 +140,12 @@ impl MntNamespace {
     }
 
     /// Set the root mount
-    pub fn set_root(&self, mount: Arc<Mount>) {
-        // The old root goes after the unlock (`Mount`: never the last
-        // reference under a spin lock)
-        let old = self.root.write().replace(mount);
-        drop(old);
+    pub fn set_root(&self, mount: MountRef) {
+        *self.root.write() = Some(mount);
     }
 
     /// Get the root mount
-    pub fn get_root(&self) -> Option<Arc<Mount>> {
+    pub fn get_root(&self) -> Option<MountRef> {
         self.root.read().clone()
     }
 

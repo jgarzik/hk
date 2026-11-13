@@ -19,7 +19,7 @@ use super::dac::{MAY_EXEC, cred, permission_as};
 use super::dentry::Dentry;
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use super::inode::{Inode, Link};
-use super::mount::{MOUNT_LOCK, Mount, follow_mount, is_path_reachable};
+use super::mount::{MOUNT_LOCK, MountRef, follow_mount, is_path_reachable};
 use super::path_ref::Path;
 use crate::fs::syscall::PATH_MAX;
 use crate::ns::current_mnt_ns;
@@ -305,7 +305,7 @@ impl Nd {
     /// nd_jump_root): EXDEV beneath, and for a no-xdev walk off the
     /// root's mount
     fn jump_root(&self, at: &Path, f: LookupFlags) -> Result<(), KernelError> {
-        if f.beneath || (f.no_xdev && !Arc::ptr_eq(&at.mnt, &self.root.mnt)) {
+        if f.beneath || (f.no_xdev && !MountRef::ptr_eq(&at.mnt, &self.root.mnt)) {
             return Err(KernelError::CrossDevice);
         }
         Ok(())
@@ -318,7 +318,7 @@ impl Nd {
         if f.no_magiclinks {
             return Err(KernelError::TooManySymlinks);
         }
-        let other = !Arc::ptr_eq(&to.mnt, &dir.mnt);
+        let other = !MountRef::ptr_eq(&to.mnt, &dir.mnt);
         if (f.no_xdev && other) || f.scoped() {
             return Err(KernelError::CrossDevice);
         }
@@ -822,7 +822,7 @@ pub enum Last {
 pub struct Parent {
     pub dir: Arc<Dentry>,
     /// The mount `dir` is in
-    pub mnt: Arc<Mount>,
+    pub mnt: MountRef,
     pub name: Vec<u8>,
     pub last: Last,
     /// The path ended in '/' after the last component

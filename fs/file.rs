@@ -18,7 +18,7 @@ use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
 use super::iov_iter::{IovDest, IovSource};
-use super::mount::Mount;
+use super::mount::MountRef;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLHUP, PollTable};
 use crate::sync::IrqSpinlock;
 use crate::task::task_work::{CallbackHead, CbAdapter, Twa, task_work_add};
@@ -520,15 +520,15 @@ pub trait FileOps: Send + Sync {
 ///
 /// This struct mirrors Linux's `struct file`. It holds references to:
 /// - The dentry (f_path.dentry in Linux)
-/// - The mount (f_path.mnt in Linux) - increments mnt_count
+/// - The mount (f_path.mnt in Linux), a user of it while open
 /// - File position and operations
 pub struct File {
     /// Dentry this file was opened from
     pub dentry: Arc<Dentry>,
 
-    /// Mount this file belongs to (like Linux f_path.mnt)
-    /// Holds a reference via mntget() - decremented on drop via mntput()
-    mnt: Option<Arc<Mount>>,
+    /// Mount this file belongs to (Linux f_path.mnt): a reference, and
+    /// a user of the mount (`Mount::user_get`) until the release
+    mnt: Option<MountRef>,
 
     /// Current file position
     pos: AtomicU64,
@@ -629,16 +629,16 @@ impl File {
     }
 
     /// Create a new file on `dentry` in mount `mnt` (None: an internal
-    /// object), counted in the mount's mnt_count (mntget) so it cannot
+    /// object), a user of the mount (`Mount::user_get`) so it cannot
     /// be unmounted while this file is open
     pub fn new(
         dentry: Arc<Dentry>,
-        mnt: Option<Arc<Mount>>,
+        mnt: Option<MountRef>,
         flags: u32,
         f_op: &'static dyn FileOps,
     ) -> Self {
         if let Some(ref m) = mnt {
-            m.mntget();
+            m.user_get();
         }
 
         Self {
@@ -710,7 +710,7 @@ impl File {
     /// its pseudo filesystem's mount
     pub fn new_anon(
         dentry: Arc<Dentry>,
-        mnt: Option<Arc<Mount>>,
+        mnt: Option<MountRef>,
         flags: u32,
         f_op: &'static dyn FileOps,
         private: Arc<dyn core::any::Any + Send + Sync>,
@@ -1069,10 +1069,9 @@ impl File {
         // may run in another process's context)
         super::flock::release_file_locks(self);
 
-        // Decrement mount reference count via mntput
-        // This mirrors Linux's fput() -> mntput()
+        // No longer a user of the mount (Linux __fput's mntput)
         if let Some(ref mnt) = self.mnt {
-            mnt.mntput();
+            mnt.user_put();
         }
     }
 
