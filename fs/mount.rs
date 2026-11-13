@@ -426,7 +426,9 @@ impl Mount {
         let parent = self.parent.read().as_ref().map(Weak::as_ptr)?;
         let mp = self.mountpoint.read().as_ref().map(Arc::as_ptr)?;
         // SAFETY: both links change only under MOUNT_LOCK write
-        // (attach_mnt, detach_mnt, a teardown's pop_child), so they stay
+        // (attach_mnt, detach_mnt, a teardown's unhang_children; the
+        // last takes the mountpoint after the unlock, but only once the
+        // parent link, read first, is gone for good), so they stay
         // while `_ml` is held and `self` lives. The mountpoint is kept by
         // `self.mountpoint`. The parent's memory is kept by a counted
         // reference, or once those are gone by its queued teardown's
@@ -1133,8 +1135,15 @@ impl Mount {
         // A tree torn down whole (a namespace's last reference) still
         // has its submounts hung on it: each loses its parent and
         // mountpoint, and the reference this one held
-        while let Some(c) = self.pop_child() {
-            drop(c);
+        let mut kids = self.unhang_children();
+        while let Some(c) = kids.pop_front() {
+            // SAFETY: entries of mnt_mounts are counted (`attach_mnt`),
+            // and moved here with their counts
+            let c = unsafe { MountRef::from_counted(c) };
+            // Its parent link is gone: `up` no longer reads this
+            if let Some(mp) = c.mountpoint.write().take() {
+                note_mp(&mp, -1);
+            }
         }
         if let Some(mp) = self.mountpoint.write().take() {
             note_mp(&mp, -1);
@@ -1147,25 +1156,24 @@ impl Mount {
         drop(sb);
     }
 
-    /// Unhang one submount (Linux umount_mnt), its reference returned
-    /// for a drop after the locks
-    fn pop_child(&self) -> Option<MountRef> {
+    /// Unhang every submount (Linux umount_mnt for each) in one
+    /// section under NAMESPACE_SEM write and MOUNT_LOCK: each loses its
+    /// parent link there, and moves, with the reference it held, to the
+    /// list returned (intrusive: nothing allocated), released after the
+    /// locks
+    fn unhang_children(&self) -> OwnedList<MntChild> {
+        let mut out = OwnedList::new();
         if !self.has_children(&*MOUNT_LOCK.read()) {
-            return None;
+            return out;
         }
         let mut ns = namespace_lock();
         let mut ml = MOUNT_LOCK.write();
-        let c = self.mnt_mounts.access_mut(&mut ns, &mut ml).pop_front()?;
-        // SAFETY: entries of mnt_mounts are counted (`attach_mnt`)
-        let c = unsafe { MountRef::from_counted(c) };
-        *c.parent.write() = None;
-        let mp = c.mountpoint.write().take();
-        if let Some(mp) = &mp {
-            note_mp(mp, -1);
+        let list = self.mnt_mounts.access_mut(&mut ns, &mut ml);
+        while let Some(c) = list.pop_front() {
+            *c.parent.write() = None;
+            out.push_back(c);
         }
-        drop(ml);
-        drop(ns);
-        Some(c)
+        out
     }
 }
 
