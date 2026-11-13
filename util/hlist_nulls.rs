@@ -78,6 +78,9 @@ const CLAIMED: *mut AtomicPtr<NullsLink> = core::ptr::dangling_mut();
 pub struct NullsLink {
     next: AtomicPtr<NullsLink>,
     pprev: AtomicPtr<AtomicPtr<NullsLink>>,
+    /// The `first` of the bucket it is in (null: none), so removal
+    /// checks membership with no walk; written under that bucket's lock
+    bucket: AtomicPtr<AtomicPtr<NullsLink>>,
 }
 
 impl Default for NullsLink {
@@ -91,6 +94,7 @@ impl NullsLink {
         Self {
             next: AtomicPtr::new(nulls(0)),
             pprev: AtomicPtr::new(null_mut()),
+            bucket: AtomicPtr::new(null_mut()),
         }
     }
 
@@ -253,6 +257,7 @@ impl<A: NullsAdapter> Drop for NullsHead<A> {
             // the bucket's reference (type invariant)
             unsafe {
                 let next = (*cur).next.load(Relaxed);
+                (*cur).bucket.store(null_mut(), Relaxed);
                 (*cur).pprev.store(null_mut(), Release);
                 drop(Arc::from_raw(A::item(cur)));
                 cur = next;
@@ -280,7 +285,8 @@ impl<A: NullsAdapter> NullsGuard<'_, A> {
         unsafe { (*l).next.load(Relaxed) }
     }
 
-    /// `item`'s link if it is in this bucket (chains are short)
+    /// `item`'s link if it is in this bucket, by a walk (a debug check
+    /// of `bucket`)
     fn find_link(&self, item: &A::Item) -> Option<*mut NullsLink> {
         let want = Self::link(item);
         let mut l = self.head.first.load(Relaxed);
@@ -307,6 +313,7 @@ impl<A: NullsAdapter> NullsGuard<'_, A> {
         n.next.store(first, Release);
         // INVARIANT: claimed above; it heads the chain once published
         n.pprev.store(core::ptr::from_ref(h).cast_mut(), Relaxed);
+        n.bucket.store(core::ptr::from_ref(h).cast_mut(), Relaxed);
         let next = core::ptr::from_ref(&n.next).cast_mut();
         let n = core::ptr::from_ref(n).cast_mut();
         // INVARIANT: the bucket keeps the item's reference
@@ -321,10 +328,19 @@ impl<A: NullsAdapter> NullsGuard<'_, A> {
 
     /// Unhash `item` (Linux hlist_nulls_del_init_rcu), keeping its
     /// `next` for readers standing on it, and hand back the bucket's
-    /// reference; None if it is not in this bucket
+    /// reference; None if it is not in this bucket. O(1): the link
+    /// names its bucket (Linux trusts the caller instead).
     pub fn del_rcu(&mut self, item: &A::Item) -> Option<NullsUnlinked<A>> {
-        let n = self.find_link(item)?;
-        // SAFETY: `n` is a link of this bucket (just found) and `pprev`
+        let l = A::link(item);
+        // Set under this bucket's lock when hashed here, cleared under
+        // it when unhashed: held now, so it cannot change meanwhile
+        if l.bucket.load(Relaxed) != core::ptr::from_ref(&self.head.first).cast_mut() {
+            debug_assert!(self.find_link(item).is_none());
+            return None;
+        }
+        debug_assert!(self.find_link(item).is_some());
+        let n = Self::link(item);
+        // SAFETY: `n` is a link of this bucket (its `bucket` says so) and `pprev`
         // the pointer to it, in this bucket's head or a link of it, all
         // live, the lock held (type invariant)
         unsafe {
@@ -336,6 +352,7 @@ impl<A: NullsAdapter> NullsGuard<'_, A> {
             }
             // INVARIANT: unhashed, `next` kept; Release pairs with the
             // next insert's claim
+            (*n).bucket.store(null_mut(), Relaxed);
             (*n).pprev.store(null_mut(), Release);
         }
         // SAFETY: hashed by `add_head_rcu`'s `into_raw`, whose reference

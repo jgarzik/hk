@@ -768,8 +768,6 @@ Phase A2 (net) remaining:
 - No debug check that a listener owns its bhash port (the old
   `assert_owner` raced a close on the lockless SYN path); re-add on
   the locked path only.
-- `util/hlist_nulls.rs` `NullsGuard::del_rcu` walks the chain to prove
-  membership (Linux hlist_nulls_del_rcu is O(1) via pprev).
 - `net/tcp/table.rs` keeps separate established and TIME_WAIT nulls
   tables (two walks per miss, two bucket locks in hash_unique); Linux
   has one ehash for both.

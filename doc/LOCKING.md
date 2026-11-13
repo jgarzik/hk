@@ -155,7 +155,8 @@ lockdep class for every bucket: built in `NullsHead::new`). Thread
 context only, interrupts stay on; never two buckets at once (a move
 between buckets is a del under one, then an add under the other); a
 leaf except what its users nest under it. Writers (`NullsGuard`:
-`add_head_rcu`, `del_rcu`, `find`) hold it; readers hold only
+`add_head_rcu`, `del_rcu` (O(1): a link names the bucket it is in),
+`find`) hold it; readers hold only
 `rcu::read_lock` (`iter_rcu`, `find_rcu`: Acquire loads, every link
 pointer stored with Release). An entry taken off keeps its `next` and
 may be hashed again at once, here or in another bucket, with no grace
