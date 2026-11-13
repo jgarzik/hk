@@ -50,8 +50,8 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | RCU callback head `RcuHead` / `HasRcuHead`, `call_rcu` (`sync/rcu.rs`, Linux rcu_head) | embedded queue node, claimed once |
 | repeated deferred put `RcuPuts` / `HasRcuPuts`, `put_rcu` (`sync/rcu.rs`) | embedded counted queue node |
 | RCU nulls hash bucket `NullsHead` / `NullsGuard` / `NullsRef` / `NullsUnlinked` (`util/hlist_nulls.rs`, Linux hlist_nulls) | owning intrusive container, lockless readers, grace-period-held references |
-| hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box`, `Arc` or `&'static`: `BoxList`, `ArcList`) (`util/list.rs`), RCU list `RcuList` and hash chain `RcuHList` with `RcuRef` and `RcuUnlinked` (`util/rculist.rs`, Linux rculist.h) | owning intrusive containers, membership checked |
-| RCU hash chain `RcuHList` / `HNode` / `RcuHRef` (`util/rcuhlist.rs`, Linux hlist_*_rcu) | owning intrusive chain, membership checked, release after a grace period |
+| hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box`, `Arc` or `&'static`: `BoxList`, `ArcList`) (`util/list.rs`), RCU list `RcuList` with `RcuRef` and `RcuUnlinked` (`util/rculist.rs`, Linux rculist.h) | owning intrusive containers, membership checked |
+| RCU hash chain `RcuHList` / `HNode` / `RcuHRef` (`util/rcuhlist.rs`, Linux hlist_*_rcu), writers proven by a `UniqueOwner` | owning intrusive chain, membership checked, release after a grace period |
 
 Make each wrapper `#[inline]`: it must compile to the same code as the
 open-coded `unsafe` it replaces.
@@ -163,7 +163,7 @@ line when the file is clean, and never add it to a new file
 An object that RCU readers reach without a reference (an `RcuList` or
 `RcuHList` entry, an `RcuArc` version) is released only after a grace
 period: the container's reference goes through `RcuUnlinked`,
-`RcuHRef` or `RcuRetired` (`defer`: `call_rcu`/`kfree_rcu`). That
+`RcuHRef` or `RcuRetired` (`defer`: `call_rcu`/`kfree_rcu`/`put_rcu`). That
 reference may be the last, so the object's `Drop`, and every drop it
 causes, can run in `rcuc/N` with preemption off: it must not sleep
 (no sleeping lock, no `synchronize`) and allocates only with a GFP

@@ -276,12 +276,13 @@ pub fn start() {
     }
 }
 
-/// An RCU-protected `Arc` (Linux `struct foo __rcu *`): readers see the
-/// current version under an [`RcuReadGuard`]; [`replace`](Self::replace)
-/// publishes a new one and hands back the old, freed after a grace
-/// period. Updaters serialize under their own lock.
+/// An RCU-protected `Arc` (Linux `struct foo __rcu *` that is never
+/// NULL once initialized, as tbl->nht): readers see the current version
+/// under an [`RcuReadGuard`]; [`replace`](Self::replace) publishes a new
+/// one and hands back the old, freed after a grace period. Updaters
+/// serialize under their own lock.
 pub struct RcuArc<T> {
-    /// `Arc::into_raw` of the current version, or null
+    /// `Arc::into_raw` of the current version, never null
     ptr: AtomicPtr<T>,
 }
 
@@ -291,14 +292,6 @@ unsafe impl<T: Send + Sync> Send for RcuArc<T> {}
 unsafe impl<T: Send + Sync> Sync for RcuArc<T> {}
 
 impl<T> RcuArc<T> {
-    /// Holding nothing yet (Linux a static `__rcu` pointer, NULL until
-    /// its init publishes the first version)
-    pub const fn empty() -> Self {
-        Self {
-            ptr: AtomicPtr::new(core::ptr::null_mut()),
-        }
-    }
-
     /// Holding `v`
     pub fn new(v: Arc<T>) -> Self {
         Self {
@@ -308,49 +301,45 @@ impl<T> RcuArc<T> {
 
     /// The current version, valid while `g` is held (Linux
     /// rcu_dereference)
-    pub fn read<'a>(&'a self, _g: &'a RcuReadGuard) -> Option<&'a T> {
+    pub fn read<'a>(&'a self, _g: &'a RcuReadGuard) -> &'a T {
         let p = self.ptr.load(Ordering::Acquire);
-        // SAFETY: a published `Arc` stays allocated until a grace period
-        // after it is replaced (`RcuRetired`), and `_g` keeps that grace
-        // period from ending while the borrow lives
-        unsafe { p.as_ref() }
+        // SAFETY: a published `Arc`, never null, stays allocated until a
+        // grace period after it is replaced (`RcuRetired`), and `_g`
+        // keeps that grace period from ending while the borrow lives
+        unsafe { &*p }
     }
 
     /// A reference to the current version (no allocation)
-    pub fn get(&self) -> Option<Arc<T>> {
+    pub fn get(&self) -> Arc<T> {
         let g = read_lock();
         let p = self.ptr.load(Ordering::Acquire);
-        if p.is_null() {
-            return None;
-        }
         // SAFETY: `p` is a live `Arc::into_raw` (see `read`; `g` held)
         let a = unsafe {
             Arc::increment_strong_count(p);
             Arc::from_raw(p)
         };
         drop(g);
-        Some(a)
+        a
     }
 
     /// Publish `new` (Linux rcu_assign_pointer); the old version is
     /// released after a grace period, when the result drops
-    pub fn replace(&self, new: Option<Arc<T>>) -> RcuRetired<T> {
-        let n = new.map_or(core::ptr::null_mut(), |a| Arc::into_raw(a).cast_mut());
-        let old = self.ptr.swap(n, Ordering::AcqRel);
+    pub fn replace(&self, new: Arc<T>) -> RcuRetired<T> {
+        let old = self
+            .ptr
+            .swap(Arc::into_raw(new).cast_mut(), Ordering::AcqRel);
         // SAFETY: `old` was published by `new`/`replace` and the swap
         // took it out: this is its one owner
-        RcuRetired(core::ptr::NonNull::new(old).map(|p| unsafe { Arc::from_raw(p.as_ptr()) }))
+        RcuRetired(Some(unsafe { Arc::from_raw(old) }))
     }
 }
 
 impl<T> Drop for RcuArc<T> {
     fn drop(&mut self) {
         let p = *self.ptr.get_mut();
-        if !p.is_null() {
-            // SAFETY: no reader borrows `self` any more (`&mut`), so the
-            // current version has its one owner here
-            drop(unsafe { Arc::from_raw(p) });
-        }
+        // SAFETY: no reader borrows `self` any more (`&mut`), so the
+        // current version, never null, has its one owner here
+        drop(unsafe { Arc::from_raw(p) });
     }
 }
 
@@ -565,29 +554,16 @@ impl CbList {
 /// `h` lives until `func(arg)` runs (it is in the object `arg` keeps),
 /// and `func(arg)` may run on any CPU with preemption off.
 pub unsafe fn call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) {
-    // SAFETY: the caller's contract
-    let claimed = unsafe { try_call_rcu(h, func, arg) };
-    assert!(claimed, "call_rcu: head already queued");
-}
-
-/// [`call_rcu`], or false (nothing queued) if `h` is queued already:
-/// for an object that may be released again before its last callback
-/// ran, whose caller then waits instead
-///
-/// # Safety
-/// As [`call_rcu`].
-pub unsafe fn try_call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) -> bool {
-    if h.next
+    let claimed = h
+        .next
         .compare_exchange(
             IDLE,
             core::ptr::null_mut(),
             Ordering::Acquire,
             Ordering::Relaxed,
         )
-        .is_err()
-    {
-        return false;
-    }
+        .is_ok();
+    assert!(claimed, "call_rcu: head already queued");
     // SAFETY: claimed: only this queueing writes it (type invariant)
     unsafe { *h.func.get() = Some((func, arg)) };
     let d = RDP.this();
@@ -610,7 +586,6 @@ pub unsafe fn try_call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) -> bool {
     if GP_REQ.fetch_max(want, Ordering::SeqCst) < want {
         GP_KICK.wake_all();
     }
-    true
 }
 
 /// Release one reference to `a` after a grace period (Linux
@@ -742,29 +717,6 @@ unsafe fn puts_cb<T: HasRcuPuts + Send + Sync>(p: *const ()) {
     // SAFETY: one of the counted references (all clones of one Arc,
     // so which is fungible), taken back once
     drop(unsafe { Arc::from_raw(t) });
-}
-
-/// [`kfree_rcu`], or the reference back if `a`'s head is still queued
-/// for an earlier release (the caller then waits for a grace period
-/// itself)
-pub fn try_kfree_rcu<T: HasRcuHead + Send + Sync>(a: Arc<T>) -> Result<(), Arc<T>> {
-    /// The reference queued, dropped
-    ///
-    /// # Safety
-    /// `p` is the `Arc::into_raw` queued with it.
-    unsafe fn put<T>(p: *const ()) {
-        // SAFETY: `Arc::into_raw` of `try_kfree_rcu`, taken back once
-        drop(unsafe { Arc::from_raw(p.cast::<T>()) });
-    }
-    let h = core::ptr::from_ref(a.rcu_head());
-    let p = Arc::into_raw(a).cast::<()>();
-    // SAFETY: the head is a field of the object (HasRcuHead), kept by
-    // the reference `p` until `put` drops it; T is Send + Sync
-    if unsafe { try_call_rcu(&*h, put::<T>, p) } {
-        return Ok(());
-    }
-    // SAFETY: not queued: `p` is still ours, from into_raw above
-    Err(unsafe { Arc::from_raw(p.cast::<T>()) })
 }
 
 /// The clock interrupt of `cpu`: wake its `rcuc/N` if its first
@@ -927,17 +879,20 @@ pub fn selftest() -> bool {
     let Some(a) = a else {
         return false;
     };
+    let Ok(b) = crate::util::kalloc::try_arc(2u32) else {
+        return false;
+    };
     let cell = RcuArc::new(a.clone());
     let before = GP_SEQ.load(Ordering::Acquire);
     let read_ok = {
         let g = read_lock();
-        cell.read(&g) == Some(&1)
+        *cell.read(&g) == 1
     };
-    drop(cell.replace(None));
+    drop(cell.replace(b));
     let after = GP_SEQ.load(Ordering::Acquire);
     // Only our reference is left; with several CPUs a grace period ran
     let gp_ok = ONLINE.snapshot().count() <= 1 || done(after, snap(before));
-    read_ok && Arc::strong_count(&a) == 1 && cell.get().is_none() && gp_ok && callback_selftest()
+    read_ok && Arc::strong_count(&a) == 1 && *cell.get() == 2 && gp_ok && callback_selftest()
 }
 
 /// The callback half of [`selftest`]: a version retired with `defer`
@@ -964,19 +919,24 @@ fn callback_selftest() -> bool {
         }
     }
     FREED.store(0, Ordering::Release);
-    let Ok(p) = crate::util::kalloc::try_arc(Probe {
-        rcu: RcuHead::new(),
-    }) else {
+    let probe = || {
+        crate::util::kalloc::try_arc(Probe {
+            rcu: RcuHead::new(),
+        })
+    };
+    let (Ok(p), Ok(q)) = (probe(), probe()) else {
         return false;
     };
     let cell = RcuArc::new(p);
-    let seen = cell.read(&read_lock()).is_some();
     // Retired with the cell's reference, the last
-    let old = cell.replace(None);
+    let old = cell.replace(q);
     RETIRED.store(GP_SEQ.load(Ordering::Acquire), Ordering::Release);
     old.defer();
     rcu_barrier();
-    seen && FREED.load(Ordering::Acquire) == 2
+    let freed = FREED.load(Ordering::Acquire) == 2;
+    // The current probe goes with the cell, after the check
+    drop(cell);
+    freed
 }
 
 #[cfg(test)]

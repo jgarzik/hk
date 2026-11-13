@@ -229,8 +229,8 @@ impl XArray {
             t.slots[0] = self.head;
             t.count = 1;
             if self.height == 0 {
-                for m in 0..MARKS {
-                    t.marks[m] = u64::from((self.head_marks >> m) & 1);
+                for (m, mark) in t.marks.iter_mut().enumerate() {
+                    *mark = u64::from((self.head_marks >> m) & 1);
                 }
             } else {
                 // SAFETY: a live node of this tree, borrowed as the method's self
@@ -351,8 +351,8 @@ impl XArray {
         if old == 0 {
             return 0;
         }
-        for m in 0..MARKS {
-            n.marks[m] &= !(1 << s);
+        for mark in &mut n.marks {
+            *mark &= !(1 << s);
         }
         n.count -= 1;
         let mut n: *mut Node = n;

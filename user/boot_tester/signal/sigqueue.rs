@@ -868,9 +868,20 @@ fn test_timer_info() {
     }
 }
 
+fn mono_ms() -> i64 {
+    let mut ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    hk_syscall::sys_clock_gettime(hk_syscall::CLOCK_MONOTONIC, &mut ts);
+    ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+}
+
 /// A 10 ms interval timer left 105 ms with its signal blocked: one
 /// signal, si_overrun the periods after the first (about 9),
-/// timer_getoverrun the same; then nothing more is pending
+/// timer_getoverrun the same. The timer still runs, so a slow guest
+/// may see a new expiry queued after the dequeue; what is pending
+/// beyond that, one per elapsed period, is a coalescing failure.
 fn test_timer_overrun() {
     let old = block(bit(SIGRT));
     let id = timer(SIGRT, 1, 0, 0);
@@ -878,15 +889,20 @@ fn test_timer_overrun() {
     sleep_ms(105);
     let mut i = SigInfo::zeroed();
     let r = wait_sig(bit(SIGRT), 1, &mut i);
+    let t0 = mono_ms();
     let over = tid_overrun(&i).1;
     let get = hk_syscall::sys_timer_getoverrun(id);
+    let mut again = 0i64;
     let mut j = SigInfo::zeroed();
-    let again = wait_sig(bit(SIGRT), 0, &mut j);
+    while again < 50 && wait_sig(bit(SIGRT), 0, &mut j) == SIGRT as i64 {
+        again += 1;
+    }
+    let periods = (mono_ms() - t0) / 10 + 1;
     hk_syscall::sys_timer_delete(id);
     let mut k = SigInfo::zeroed();
     wait_sig(bit(SIGRT), 0, &mut k);
     setmask(old);
-    if r == SIGRT as i64 && (5..=20).contains(&over) && get == over as i64 && again == EAGAIN {
+    if r == SIGRT as i64 && (5..=20).contains(&over) && get == over as i64 && again <= periods {
         pass(b"SIGQUEUE_TIMER_OVERRUN");
     } else {
         print(b"SIGQUEUE_TIMER_OVERRUN:FAIL r=");
@@ -897,6 +913,8 @@ fn test_timer_overrun() {
         print_num(get);
         print(b" again=");
         print_num(again);
+        print(b" periods=");
+        print_num(periods);
         println(b"");
     }
 }

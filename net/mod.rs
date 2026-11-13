@@ -48,7 +48,7 @@ use crate::util::kalloc::arc_nofail;
 use alloc::sync::Arc;
 
 // Re-export namespace access
-pub use crate::ns::{INIT_NET_NS, NetNamespace, current_net_ns, init_net_ns};
+pub use crate::ns::{INIT_NET_NS, NetNamespace, NetRef, current_net_ns, init_net_ns};
 
 // Submodules
 pub mod af_inet;
@@ -97,10 +97,12 @@ use crate::util::error::KernelError;
 /// Start the per-CPU softnet threads (after scheduling is enabled)
 pub fn start_threads() {
     dev::softnet_init();
+    crate::ns::net::net_ns_start();
 }
 
 /// Initialize the network subsystem
 pub fn init() {
+    crate::ns::net::net_ns_init();
     tcp::mem::init();
     tcp::table::init();
     arp::arp_init();
@@ -147,7 +149,7 @@ pub fn register_netdev(rtnl: rtnl::RtnlGuard, dev: Arc<NetDevice>) {
         m[5]
     );
     let net = init_net_ns();
-    net.register_device(dev.clone());
+    net.passive().register_device(dev.clone());
     // Linux register_netdevice's rtmsg_ifinfo(RTM_NEWLINK)
     netlink::rtnetlink::notify_link(&net, &dev, Default::default());
     drop(rtnl);

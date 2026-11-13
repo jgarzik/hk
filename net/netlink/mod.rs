@@ -55,10 +55,10 @@ use crate::net::skb::{SkBuff, SkbCb, SkbQueue};
 use crate::sync::spin::{Mutex, RwLock};
 use crate::util::kalloc::try_arc_gfp;
 
-use crate::net::NetNamespace;
 use crate::net::sock::{Sock, wait_on};
 use crate::net::socket::{ProtoOps, SOCK_DGRAM, SOCK_RAW};
 use crate::net::unix::scm::Creds;
+use crate::net::{NetNamespace, NetRef};
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::error::KernelError;
 
@@ -308,7 +308,7 @@ impl NlSock {
         (self.sk.sndbuf() as usize).saturating_sub(32)
     }
 
-    pub fn net(&self) -> &Arc<NetNamespace> {
+    pub fn net(&self) -> &NetRef {
         &self.sk.net
     }
 

@@ -155,7 +155,10 @@ lockdep class for every bucket: built in `NullsHead::new`). Thread
 context only, interrupts stay on; never two buckets at once (a move
 between buckets is a del under one, then an add under the other); a
 leaf except what its users nest under it. Writers (`NullsGuard`:
-`add_head_rcu`, `del_rcu`, `find`) hold it; readers hold only
+`add_head_rcu`, `del_rcu` (O(1): a link names the id of the bucket it
+is in, and a bucket's first link names it symbolically, so a bucket may
+move),
+`find`) hold it; readers hold only
 `rcu::read_lock` (`iter_rcu`, `find_rcu`: Acquire loads, every link
 pointer stored with Release). An entry taken off keeps its `next` and
 may be hashed again at once, here or in another bucket, with no grace
@@ -271,7 +274,8 @@ level instead of the rcu_node tree). A reader holds an `RcuReadGuard`
 so a reader never sleeps (`might_sleep` reports it), an unnamed
 allocation in it is listed by might_alloc (1.5; lockdep builds show
 where it began), and its CPU passes no quiescent state while it holds
-one. `RcuArc<T>` is an RCU-protected pointer (Linux `__rcu`): `read`
+one. `RcuArc<T>` is an RCU-protected pointer (Linux `__rcu`, never
+NULL once initialized): `read`
 borrows the current version for the guard's lifetime
 (rcu_dereference, Acquire), `get` takes a reference to it, `replace`
 publishes a new one (rcu_assign_pointer, Release) and returns the old
@@ -289,23 +293,23 @@ standing on it and comes back as `RcuUnlinked`, whose drop waits for a
 grace period, frees the link and drops the list's reference
 (list_del_rcu + synchronize_rcu). The owner's teardown takes the
 entries off through `&mut` (`drain`: no reader or writer is left, so
-no grace period). `RcuHList` (Linux hlist_head, _rcu ops) is a hash
-chain with no lock of its own: its writers pass the `UniqueOwner` data
-of the lock they hold (1.4.1's `LockedBy` proof), so a table of chains
-under one lock costs a pointer per bucket. A table grows by moving
-every entry of a chain into a new table's chains under that lock with
-no grace period (`move_all`, Linux neigh_hash_grow): a reader standing
-on a moved entry walks on into its new chain and may miss entries, so
-a lookup that must not miss repeats under the lock. `RcuArc::empty` is
-a static pointer published by its init. `util::rcuhlist::RcuHList`
-is one RCU hash chain (Linux hlist_*_rcu: `next`/`pprev` nodes, a
-strong reference per entry, its own spin leaf for writers, which a
-table nests under its own lock): readers walk it under a guard,
-removal is hlist_del_init_rcu (the node free for a new insert at once,
-`next` kept for a reader on it) and hands back the chain's reference as
-`RcuHRef`, released after a grace period (`defer`: call_rcu, or a
-synchronize when the entry's head is still queued for an earlier
-removal; Linux SOCK_RCU_FREE).
+no grace period). `util::rcuhlist::RcuHList` (Linux hlist_head with
+the _rcu ops: `next`/`pprev` nodes, a strong reference per entry) is a
+hash chain with no lock of its own: its writers pass the `UniqueOwner`
+data of the lock they hold (1.4.1's `LockedBy` proof), so a table of
+chains under one lock costs a pointer and an id per bucket. An insert
+claims the node atomically, so chains under different locks cannot
+both link it. Readers walk it under a guard; removal is
+hlist_del_init_rcu, O(1) (the node names its chain's id, so membership
+is checked with no walk and the chain may move; the node is free for a
+new insert at once, `next` kept for a reader on it) and hands back the
+chain's reference as `RcuHRef`, released after a grace period (`defer`:
+kfree_rcu; `defer_put`: `put_rcu`, for an entry that may leave chains
+again before the first release ran, Linux SOCK_RCU_FREE). A table grows by moving every
+entry of a chain into a new table's chains under that lock with no
+grace period (`move_all`, Linux neigh_hash_grow): a reader standing on
+a moved entry walks on into its new chain and may miss entries, so a
+lookup that must not miss repeats under the lock.
 
 Quiescent states, per CPU: a context switch (recorded under the rq
 lock, reported later), each idle-loop pass, and a clock interrupt that
@@ -346,8 +350,8 @@ of the CPU whose list it joined, never in `rcu_gp` or a clock
 interrupt. The objects it drops must be safe to drop there: their last
 reference may be the one deferred. `put_rcu(arc)` is the deferred
 drop that may be queued again on the same object before an earlier one
-ran (a `util::hlist_nulls` entry unhashed, rehashed and unhashed within
-one grace period): the object embeds an `RcuPuts` (`rcu_puts!`: a head
+ran (a `util::hlist_nulls` or `util::rcuhlist` entry unhashed,
+rehashed and unhashed within one grace period): the object embeds an `RcuPuts` (`rcu_puts!`: a head
 and a count of references handed over, each leaked); the put that
 takes the count from 0 queues the head, and each callback (the head
 already idle again) drops one reference and, if its decrement left the
@@ -2600,7 +2604,8 @@ uevents (base/uevent.rs) broadcast under `ns::net::NET_NAMESPACE_LIST`
 (sleeping `sync::RwSem`, Linux net_namespace_list under net_rwsem: read
 by `for_each_net` and the sysfs setup's snapshot, which registers
 devices and so sends uevents after releasing it; written at namespace
-creation; thread context, a uevent is sent from a sleepable context as
+creation and by `cleanup_net` (from the `netns` workqueue, before it
+takes RTNL); thread context, a uevent is sent from a sleepable context as
 Linux's kobject_uevent), then each namespace's `NlTable.socks` -> `NlSock.rxq`;
 `ksysfs::UEVENT_HELPER` (a fixed array, Linux uevent_helper) is a spin
 leaf: show copies it out and emits after releasing it.
@@ -4269,14 +4274,14 @@ not rely on either.
 | `PacketSock.rxq` (`PktQueue.q`), `PacketSock.filter` | `SkbQueue` (spin `Mutex`) / `spin::RwLock` | thread only | leaves; the queue holds each frame's copy as an skb (`SkbCb::Pkt`) made GFP_ATOMIC and wrapped in its `Arc` before the lock (Linux packet_rcv's skb_clone; MSG_PEEK takes a reference under it), bounded by SO_RCVBUF (`rmem` atomic, checked before the copy, drops counted); a purge frees after the lock; the filter `Arc` is cloned out and the read guard dropped before it runs (a separate statement: an `if let` scrutinee's guard would live across the run); the binding (protocol, ifindex) and flags are atomics |
 | `PacketSock.mclist` | sleeping `sync::Mutex<Vec<Mreq>>` (Linux: under RTNL) | thread only | PACKET_ADD/DROP_MEMBERSHIP list, changed only under RTNL (Linux packet_mc_add takes rtnl_lock); RTNL -> `mclist`, dropped before the device's promiscuity changes (`NetDevice.set_promiscuity`, RTNL held, may call the driver) |
 | `PacketSock.bind` | `AtomicU64` (protocol << 32 \| ifindex) | thread only (bind, device unregister; read by receive, send, getname) | the binding (Linux po->num/ifindex under po->bind_lock): changed only by compare-exchange from the value the change was decided on, so bind and unregister never undo each other. bind looks the device up again after storing: unregister unlists a device before visiting its sockets, so either that visit sees the new binding or the lookup misses the device and bind moves the socket to ifindex -1 (Linux "unlisted") |
-| `PingTable.lock`, its chains (`net/ping.rs`, per netns) | `spin::Mutex` (Linux ping_table.lock) -> each `RcuHList` chain's writer leaf | thread only | ping sockets by echo identifier in 64 RCU hash chains (`util::rcuhlist`, Linux hlist_*_rcu): an identifier search and its insert are one hold of `lock` (the new socket's identifier is set under it), removals take it too; candidates' `Inet.addr` is read under the chain lock (order table -> chain -> Inet.addr). Receive/error lookups walk a chain under `rcu::read_lock`, take a reference to the match under the guard (sock_hold) and queue after dropping it. A removed socket's table reference is released a grace period later (`RcuHRef::defer`, Linux SOCK_RCU_FREE), possibly in `rcuc/N` |
+| `PING_TABLE.lock` (`net/ping.rs`, one for every namespace, entries matched in their own, net_eq) | `spin::Mutex<PingLocked>` (Linux ping_table.lock; its `UniqueOwner` proves writers of the 64 `RcuHList` chains) | thread only | ping sockets by echo identifier and namespace in 64 RCU hash chains (`util::rcuhlist`, Linux hlist_*_rcu): an identifier search and its insert are one hold of `lock` (the new socket's identifier is set under it; the rover is per namespace), removals take it too; candidates' `Inet.addr` is read under it (order table -> Inet.addr). Receive/error lookups walk a chain under `rcu::read_lock`, take a reference to the match under the guard (sock_hold) and queue after dropping it. A removed socket's table reference is released a grace period later (`RcuHRef::defer_put`, Linux SOCK_RCU_FREE), possibly in `rcuc/N` |
 | `Inet.addr` (`net/af_inet.rs`) | `spin::Mutex` | thread only | leaf: addresses/ports of a TCP or UDP socket; read under the UDP/TCP port tables during lookups, so bind sets the addresses before publishing the port in a table (reset on failure; Linux inet_bind) |
 | `RTNL` (`net/rtnl.rs`) | `sync::Mutex<()>` (sleeping, Linux rtnl_mutex) | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes, neighbour entries, device naming + registration via `alloc_netdev`/`register_netdev`) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Never taken while any spinlock is held (a socket's last close, which may take it for AF_PACKET memberships, runs only after the fd table lock is dropped). Holders may sleep (user copies such as SIOCADDRT's `rt_dev` name, like Linux rtentry_to_fib_config; driver open/stop waiting for NAPI) but never take a socket lock (`sk_lock`) and never wait for packets |
 | `NetNamespace.devices` | `RcuList` (Linux dev_base_head) | readers under RCU, any context; writers thread only | registration and unlisting run under RTNL (or before the namespace is listed) and take the list's leaf writer lock; lookups (`get_device`, `dev_get_by_index`) walk it under RCU and take a reference, no lock, no copy; `/proc/net/dev` formats under the guard into a `SeqBuf` (fs/proc/seq.rs, Linux seq_file: a fixed buffer, the walk rerun into a doubled one on overflow), allocating nothing inside; `devices()` references every device for work done per device; unlisting returns after a grace period (Linux synchronize_net), so no reader still walks over the device |
 | `NetNamespace.loopback`, `UdpTable.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes); the UDP port table reads each candidate's `Inet.addr` under its lock |
 | `Fib.tables`, `FibTable.entries` (`net/inet/fib.rs`, per netns; Linux fib_table_hash, a table's aliases) | `RcuList`s (their `ends` spin leaves) | readers under RCU, any context; writers thread only | changed only under RTNL (Linux fib_table_insert/delete): a route goes in at its sorted place (`insert_before`/`insert_after`) or takes an old one's (`replace`, NLM_F_REPLACE); one removed or replaced is freed after a grace period (`RcuUnlinked::defer`, Linux alias_free_mem_rcu). Input/output routing (softnet, socket syscalls, possibly under `sk_lock`) walks them under `rcu::read_lock` and takes a reference to the route it returns; route dumps fill an `NlBuf` and /proc/net/route a `SeqBuf` under the guard; notifications are built outside it. Tables are never removed while the namespace lives |
 | `InDevice.ifa_list` (`NetDevice.ip_ptr`, Linux in_device ifa_list; IPv6 later), `ifaddr::INET_ADDR_LST` (Linux inet_addr_lst: 256 chains by namespace and local address) | `RcuList`s (their `ends` spin leaves) | readers under RCU, any context; writers thread only | changed only under RTNL (`inet::ifaddr`): an address is inserted at its place (a primary after the last primary of its scope, a secondary last: `insert_after`) and on its hash chain, and unlinked from both and freed after a grace period with one callback (`RcuUnlinked::defer_with`, Linux inet_free_ifa); NLM_F_REPLACE changes its `flags`/`rt_priority`/`proto` atomics in place. Readers (source selection on transmit, possibly under a socket lock; `ip_dev_find`; address dumps filling an `NlBuf`) walk under `rcu::read_lock`, no lock, no copy |
-| `NeighTable.lock` (`net/core/neigh.rs`; `arp::arp_tbl`, one table for every namespace, IPv6 ND later; Linux tbl->lock) | `spin::Mutex<TblLocked>` | thread only (softnet, socket output, `ktimers/N` neighbour timers, the system workqueue's periodic GC, RTNL-held configuration) | writers of the RCU hash (`NeighHash`: `RcuHList` chains published through an `RcuArc`; lookups, dumps and /proc/net/arp walk them under `rcu::read_lock`, no lock, no copy), the gc list and every device's list (`NetDevice.neighbours`, a `LockedBy` it owns). An entry is allocated with `Gfp::ATOMIC` before it is taken (Linux neigh_alloc); the hash doubles under it with `Gfp::ATOMIC` (neigh_hash_grow: entries move between chains with no grace period, the old table is freed after one; on failure it stays); unhashed entries are released after a grace period (`RcuUnlinked::defer`). Order: -> `Neighbour.inner` (GC, flush, delete, gc-list moves); the forced GC runs from `create` before it is taken; periodic GC drops it between chains and re-queues itself under it (-> the workqueue's IrqSpinlock, Linux queue_delayed_work under tbl->lock) |
+| `NeighTable.lock` (`net/core/neigh.rs`; `arp::arp_tbl`, one table for every namespace, IPv6 ND later; Linux tbl->lock) | `spin::Mutex<TblLocked>` | thread only (softnet, socket output, `ktimers/N` neighbour timers, the system workqueue's periodic GC, RTNL-held configuration) | writers of the RCU hash (`NeighHash`: `RcuHList` chains published through an `RcuArc`; lookups, dumps and /proc/net/arp walk them under `rcu::read_lock`, no lock, no copy), the gc list and every device's list (`NetDevice.neighbours`, a `LockedBy` it owns). An entry is allocated with `Gfp::ATOMIC` before it is taken (Linux neigh_alloc); the hash doubles under it with `Gfp::ATOMIC` (neigh_hash_grow: entries move between chains with no grace period, the old table is freed after one; on failure it stays); unhashed entries are released after a grace period (`RcuHRef::defer`). Order: -> `Neighbour.inner` (GC, flush, delete, gc-list moves); the forced GC runs from `create` before it is taken; periodic GC drops it between chains and re-queues itself under it (-> the workqueue's IrqSpinlock, Linux queue_delayed_work under tbl->lock) |
 | `Neighbour.inner` (Linux neigh->lock) | `spin::Mutex` | thread only | NUD state, the entry's timer and its unresolved queue (`arp_queue`: an intrusive `SkbHead`, bounded by truesize at unres_qlen_bytes). The timer (`ArcTimer`, a pending arm holds a reference, Linux neigh_add_timer's neigh_hold) is armed and deleted under it (-> the timer base's IrqSpinlock). Never held while transmitting, soliciting or reporting errors: state changes return actions run after the unlock |
 | `timer::Alarm.st` (IP reassembly) | `spin::Mutex` | thread only | held across arming its SOFT `TimerList` (-> the timer base's IrqSpinlock); otherwise leaf |
 | `FragTable.st` (`net/inet/frag.rs`, per netns) | `spin::Mutex` | thread only (softnet, reassembly timer on ktimers/N) | leaf: reassembly queues + memory charge; completed datagrams are delivered and expiry ICMP errors sent after it is dropped. Reassembly `TABLES` (registered namespaces) is a leaf `spin::Mutex` |
@@ -4323,7 +4328,7 @@ RTNL (sleeping; configuration)   TcpSock.lock owner (sleeping; -> mmap_lock) -> 
   |                                 listener lock) /
   |                                 TimeWait.inner / UdpSock.op, PingSock.op (sleeping)
   |                                 -> TCP bhash -> owners -> ehash sk -> tw, lhash / UdpTable.socks /
-  |                                    PingTable.lock -> chain -> Inet.addr
+  |                                    PING_TABLE.lock -> Inet.addr
   |                                 -> TcpSock.queue / RxQueue.q
   |                                 -> TCP socket timers (timer base); Alarm.st -> timer base
   v                                 |
@@ -4402,13 +4407,25 @@ line's `IrqDesc.lock` every dispatch of the line holds), `netif_napi_del`s and f
 memory. A `NetDevice` still referenced (queued skbs) stays down and
 driverless; hk cannot wait for those references (Linux
 netdev_wait_allrefs) because skbs in socket queues hold them.
-A namespace that is gone (its last reference dropped, in any context)
-hands its devices to the system workqueue (`rtnl::netns_exit`, Linux
-cleanup_net -> default_device_exit_batch), which under RTNL closes and
-detaches each, loopback last, unlinks its addresses from their lists
-and `INET_ADDR_LST` (freed after a grace period) and removes its sysfs
-device; its FIB and sockets went with the namespace, and its
-neighbours with its devices, so nothing is announced.
+A namespace has active references (`NetRef`, Linux net->ns.count:
+tasks' nsproxies and user sockets) and passive ones (its `Arc`, Linux
+net->passive: the memory; TIME_WAIT entries, devices' back pointers,
+walkers). Dropping the last active reference, in any context (a
+socket's table reference released in `rcuc/N`), pushes the namespace
+on a lock-free list (`CLEANUP_LIST`, Linux cleanup_list) and queues one
+static work item on the `netns` workqueue, allocating nothing (Linux
+__put_net). `cleanup_net` there unlists the namespaces from
+`NET_NAMESPACE_LIST` (write), unregisters each device under RTNL
+through `rtnl::unregister_netdevice`, loopback last (Linux
+default_device_exit_batch: its addresses, routes, neighbours and
+sysfs device go) and clears its loopback (loopback_net_exit), ends
+the batch's TIME_WAIT entries in one walk (`TimeWait::kill`, Linux
+tcp_twsk_purge: timer stopped for good under the entry's lock,
+unhashed), waits for queued RCU
+callbacks (`rcu_barrier`) and drops the passive references the list
+held. Walkers that reach a namespace through a passive reference take
+an active one only if it has one (`maybe_get`, Linux
+maybe_get_net).
 
 **Driver ISR rules (e1000 pattern):** read ICR (read-to-clear; 0 => not
 ours on a shared line, return false), write IMC (mask all), record causes

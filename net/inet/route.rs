@@ -20,8 +20,7 @@ use crate::net::inet::ifaddr::{RT_SCOPE_LINK, inet_select_addr, ip_dev_find};
 use crate::net::ipv4::Ipv4Addr;
 use crate::sync::rcu::RcuHead;
 use crate::util::error::KernelError;
-use crate::util::list::Link;
-use crate::util::rculist::RcuHList;
+use crate::util::rcuhlist::{HNode, RcuHList};
 
 /// An output route (Linux struct rtable)
 #[derive(Clone)]
@@ -250,11 +249,11 @@ pub struct FibNhException {
     /// Last update, ms, to pick the oldest (fnhe_stamp)
     stamp: AtomicU64,
     /// On its chain (fnhe_next)
-    link: Link,
+    link: HNode,
     rcu: RcuHead,
 }
 
-crate::adapter!(pub FnheLink, FibNhException, link);
+crate::hadapter!(pub FnheLink, FibNhException, link);
 crate::rcu_head!(FibNhException, rcu);
 
 type FnheChain = RcuHList<FnheLink, FnheLock>;
@@ -360,11 +359,11 @@ impl NhExceptions {
             pmtu: AtomicU32::new(pmtu),
             expires: AtomicU64::new(expires.max(1)),
             stamp: AtomicU64::new(now),
-            link: Link::new(),
+            link: HNode::new(),
             rcu: RcuHead::new(),
         };
         if let Ok(e) = crate::util::kalloc::try_arc_gfp(e, Gfp::ATOMIC) {
-            chain.push_front(e, &mut o);
+            chain.add_head(e, &mut o);
         }
     }
 }

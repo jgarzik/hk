@@ -12,9 +12,9 @@
 //! ## Locking (thread context only)
 //!
 //! `PingSock.op` (socket lock, sleeping `sync::Mutex` as Linux lock_sock:
-//! bind/connect/autobind, socket calls only) -> `PingTable.lock` (spin,
-//! Linux ping_table.lock: identifier search and insert, removal) -> a
-//! chain's writer lock -> `Inet.addr`; `RxQueue` and `Sock.errq` are
+//! bind/connect/autobind, socket calls only) -> `PING_TABLE.lock` (spin,
+//! Linux ping_table.lock, one for every namespace: identifier search and
+//! insert, removal, chain writes) -> `Inet.addr`; `RxQueue` and `Sock.errq` are
 //! separate leaves. Receive and error lookups walk a chain under RCU,
 //! take a reference to the match under the guard and queue after
 //! dropping it. A socket's table reference is released a grace period
@@ -28,9 +28,10 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
-use crate::sync::rcu::RcuHead;
+use crate::sync::UniqueOwner;
+use crate::sync::rcu::RcuPuts;
 use crate::sync::spin::Mutex;
-use crate::util::rcuhlist::{self, HNode, RcuHList};
+use crate::util::rcuhlist::{HNode, RcuHList};
 
 use crate::net::af_inet::{self, Inet, RxInfo, SOL_IP};
 use crate::net::dgram::{self, RxQueue};
@@ -64,7 +65,7 @@ pub struct PingSock {
     node: HNode,
     /// Its table reference's release after a grace period (Linux
     /// SOCK_RCU_FREE's rcu head)
-    rcu: RcuHead,
+    rcu: RcuPuts,
 }
 
 /// Linux ping_init_sock: the effective group or a supplementary group
@@ -95,7 +96,7 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
         rxq: RxQueue::default(),
         me: me.clone(),
         node: HNode::new(),
-        rcu: RcuHead::new(),
+        rcu: RcuPuts::new(),
     })?)
 }
 
@@ -106,7 +107,7 @@ impl PingSock {
 
     /// Claim echo identifier `ident` (0 = pick); caller holds `op`
     fn get_port(&self, ident: u16) -> Result<u16, KernelError> {
-        let id = self.sk.net.ping.insert(&self.arc(), ident)?;
+        let id = ping_get_port(&self.arc(), ident)?;
         self.hashed.store(true, Ordering::Release);
         Ok(id)
     }
@@ -129,7 +130,7 @@ impl PingSock {
 
     fn unhash(&self) {
         if self.hashed.swap(false, Ordering::AcqRel) {
-            self.sk.net.ping.remove(self, self.inet.get().sport);
+            ping_unhash(self, self.inet.get().sport);
         }
     }
 
@@ -402,100 +403,107 @@ impl ProtoOps for PingSock {
 const PING_HTABLE_SIZE: usize = 64;
 
 crate::hadapter!(PingNode, PingSock, node);
-crate::rcu_head!(PingSock, rcu);
+crate::rcu_puts!(PingSock, rcu);
 
-/// Bound ping sockets of a namespace, hashed by echo identifier (Linux
-/// struct ping_table: hlist chains read under RCU, changed under the
-/// table lock)
-pub struct PingTable {
-    hash: [RcuHList<PingNode>; PING_HTABLE_SIZE],
+/// The data of the ping table's lock (Linux ping_table.lock): the proof
+/// its holder writes the chains
+///
+/// # Invariants
+/// One value exists, in [`PING_TABLE`].
+pub struct PingLocked(());
+
+// SAFETY: one value exists (type invariant), reachable only through the
+// table's lock
+unsafe impl UniqueOwner for PingLocked {}
+
+/// Bound ping sockets of every namespace, hashed by echo identifier
+/// and namespace (Linux struct ping_table: hlist chains read under RCU,
+/// changed under the table lock)
+struct PingTable {
+    hash: [RcuHList<PingNode, PingLocked>; PING_HTABLE_SIZE],
     /// Linux ping_table.lock: an identifier search and the insert it
     /// decides are one step; removals too
-    lock: Mutex<()>,
-    /// Last identifier handed out (Linux ping_port_rover)
+    lock: Mutex<PingLocked>,
+}
+
+static PING_TABLE: PingTable = PingTable {
+    hash: [const { RcuHList::new() }; PING_HTABLE_SIZE],
+    lock: Mutex::new(PingLocked(())),
+};
+
+/// A namespace's part of the ping table (Linux net->ipv4.ping_port_rover)
+#[derive(Default)]
+pub struct PingNet {
+    /// Last identifier handed out
     rover: AtomicU16,
 }
 
-impl Default for PingTable {
-    fn default() -> Self {
-        Self {
-            hash: [const { RcuHList::new() }; PING_HTABLE_SIZE],
-            lock: Mutex::new(()),
-            rover: AtomicU16::new(0),
+/// Linux ping_hashslot: the identifier mixed with the namespace
+fn slot(net: &NetNamespace, ident: u16) -> &'static RcuHList<PingNode, PingLocked> {
+    let mix = net.id as usize;
+    &PING_TABLE.hash[usize::from(ident).wrapping_add(mix) % PING_HTABLE_SIZE]
+}
+
+/// Some socket of `net` other than `s` on its chain holds `ident` and
+/// they may not share it (shared only when both set SO_REUSEADDR)
+fn busy(o: &PingLocked, net: &NetNamespace, ident: u16, s: Option<&PingSock>) -> bool {
+    slot(net, ident).iter_locked(o).any(|x| {
+        let mine = s.is_some_and(|s| core::ptr::eq(x.item(), s));
+        let shared = s.is_some_and(|s| s.sk.flag(sf::REUSEADDR) && x.sk.flag(sf::REUSEADDR));
+        x.sk.net.id == net.id && !mine && x.inet.get().sport == ident && !shared
+    })
+}
+
+/// Hash `s` under `ident` (0 = the next unused one after its
+/// namespace's rover) and set it as its identifier, all under the table
+/// lock (Linux ping_get_port); EADDRINUSE if taken or none is free
+fn ping_get_port(s: &Arc<PingSock>, ident: u16) -> Result<u16, KernelError> {
+    let net = &*s.sk.net;
+    let mut o = PING_TABLE.lock.lock();
+    let id = if ident == 0 {
+        let start = net.ping.rover.load(Ordering::Relaxed);
+        let id = (1..=u16::MAX)
+            .map(|i| start.wrapping_add(i))
+            .find(|&p| p != 0 && !busy(&o, net, p, None))
+            .ok_or(KernelError::AddressInUse)?;
+        net.ping.rover.store(id, Ordering::Relaxed);
+        id
+    } else {
+        if busy(&o, net, ident, Some(s)) {
+            return Err(KernelError::AddressInUse);
         }
+        ident
+    };
+    s.inet.addr.lock().sport = id;
+    if !s.node.is_hashed() {
+        slot(net, id).add_head(s.clone(), &mut o);
+    }
+    Ok(id)
+}
+
+/// Linux ping_unhash: off its chain; the table's reference goes after
+/// a grace period (Linux SOCK_RCU_FREE)
+fn ping_unhash(s: &PingSock, ident: u16) {
+    let gone = slot(&s.sk.net, ident).del_init(s, &mut PING_TABLE.lock.lock());
+    if let Some(g) = gone {
+        g.defer_put();
     }
 }
 
-impl PingTable {
-    /// Linux ping_hashslot (the table is per namespace already)
-    fn slot(&self, ident: u16) -> &RcuHList<PingNode> {
-        &self.hash[usize::from(ident) % PING_HTABLE_SIZE]
-    }
-
-    /// Some socket other than `s` on its chain holds `ident` and they
-    /// may not share it (shared only when both set SO_REUSEADDR)
-    fn busy(&self, ident: u16, s: Option<&PingSock>) -> bool {
-        let mut busy = false;
-        self.slot(ident).for_each(|o| {
-            let mine = s.is_some_and(|s| core::ptr::eq(o, s));
-            let shared = s.is_some_and(|s| s.sk.flag(sf::REUSEADDR) && o.sk.flag(sf::REUSEADDR));
-            busy |= !mine && o.inet.get().sport == ident && !shared;
-        });
-        busy
-    }
-
-    /// Hash `s` under `ident` (0 = the next unused one after the rover)
-    /// and set it as its identifier, all under the table lock (Linux
-    /// ping_get_port); EADDRINUSE if taken or none is free
-    fn insert(&self, s: &Arc<PingSock>, ident: u16) -> Result<u16, KernelError> {
-        let _t = self.lock.lock();
-        let id = if ident == 0 {
-            let start = self.rover.load(Ordering::Relaxed);
-            let id = (1..=u16::MAX)
-                .map(|i| start.wrapping_add(i))
-                .find(|&p| p != 0 && !self.busy(p, None))
-                .ok_or(KernelError::AddressInUse)?;
-            self.rover.store(id, Ordering::Relaxed);
-            id
-        } else {
-            if self.busy(ident, Some(s)) {
-                return Err(KernelError::AddressInUse);
-            }
-            ident
-        };
-        s.inet.addr.lock().sport = id;
-        if !s.node.is_hashed() {
-            self.slot(id).add_head(s.clone());
-        }
-        Ok(id)
-    }
-
-    /// Linux ping_unhash: off its chain; the table's reference goes
-    /// after a grace period (Linux SOCK_RCU_FREE)
-    fn remove(&self, s: &PingSock, ident: u16) {
-        let gone = {
-            let _t = self.lock.lock();
-            self.slot(ident).del_init(s)
-        };
-        if let Some(g) = gone {
-            g.defer();
-        }
-    }
-
-    /// Socket for identifier `ident` of a packet to `daddr` received on
-    /// `dif` (Linux ping_lookup: the first match, under RCU), with a
-    /// reference taken under the guard (sock_hold)
-    fn lookup(&self, ident: u16, daddr: Ipv4Addr, dif: u32) -> Option<Arc<PingSock>> {
-        let g = crate::sync::rcu::read_lock();
-        let s = self.slot(ident).iter(&g).find(|s| {
-            let a = s.inet.get();
-            let dev = s.sk.bound_dev_if();
-            a.sport == ident
-                && (a.rcv_saddr.is_unspecified() || a.rcv_saddr == daddr)
-                && (dev == 0 || dev == dif)
-        })?;
-        Some(rcuhlist::get::<PingNode>(s, &g))
-    }
+/// Socket of `net` for identifier `ident` of a packet to `daddr`
+/// received on `dif` (Linux ping_lookup: the first match, under RCU),
+/// with a reference taken under the guard (sock_hold)
+fn ping_lookup(net: &NetNamespace, ident: u16, daddr: Ipv4Addr, dif: u32) -> Option<Arc<PingSock>> {
+    let g = crate::sync::rcu::read_lock();
+    let s = slot(net, ident).iter_ref(&g).find(|s| {
+        let a = s.inet.get();
+        let dev = s.sk.bound_dev_if();
+        s.sk.net.id == net.id
+            && a.sport == ident
+            && (a.rcv_saddr.is_unspecified() || a.rcv_saddr == daddr)
+            && (dev == 0 || dev == dif)
+    })?;
+    Some(s.get())
 }
 
 /// An echo reply arrived (Linux ping_rcv; `skb.data()` is the ICMP
@@ -504,7 +512,7 @@ pub fn ping_rcv(net: &NetNamespace, skb: &SkBuff) {
     let d = skb.data();
     let ident = u16::from_be_bytes([d[4], d[5]]);
     let dif = skb.dev.as_ref().map_or(0, |d| d.ifindex());
-    let Some(s) = net.ping.lookup(ident, skb.daddr.unwrap_or_default(), dif) else {
+    let Some(s) = ping_lookup(net, ident, skb.daddr.unwrap_or_default(), dif) else {
         return;
     };
     let info = RxInfo::of(net, skb);
@@ -523,7 +531,7 @@ pub fn ping_err(net: &NetNamespace, e: &IcmpErr<'_>) {
         return;
     }
     let ident = u16::from_be_bytes([l4[4], l4[5]]);
-    let Some(s) = net.ping.lookup(ident, e.rx.daddr, e.rx.ifindex) else {
+    let Some(s) = ping_lookup(net, ident, e.rx.daddr, e.rx.ifindex) else {
         return;
     };
     // Source quench is no error, but ping wants to see it

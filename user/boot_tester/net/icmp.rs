@@ -284,6 +284,7 @@ pub fn run_ping_tests() {
     test_ping_lo();
     test_ping_peek();
     test_ping_rebind();
+    test_ping_netns_exit();
     test_ping_errors();
     match net_setup_eth0() {
         Ok(_) => {
@@ -383,6 +384,39 @@ fn test_ping_peek() {
     let r = recv(fd, &mut buf, MSG_DONTWAIT);
     t.ok(b"read", r == n as i64 && &buf[8..16] == b"peekping", r);
     t.eq(b"consumed", recv(fd, &mut buf, MSG_DONTWAIT), EAGAIN);
+    close(fd);
+    t.done();
+}
+
+/// A network namespace whose last user is a bound ping socket: the
+/// child leaves with it open, so the namespace goes when the socket's
+/// table reference is released a grace period after its close (Linux
+/// SOCK_RCU_FREE, then put_net queueing cleanup_net)
+fn test_ping_netns_exit() {
+    let mut t = T::new(b"PING_NETNS_EXIT");
+    for round in 0..8 {
+        let pid = sys_fork();
+        if pid == 0 {
+            if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
+                sys_exit(2);
+            }
+            if write_file(PING_RANGE, b"0 2147483647") < 0 {
+                sys_exit(3);
+            }
+            let fd = ping_socket();
+            if fd < 0 || bind(fd, [0; 4], 0) != 0 {
+                sys_exit(4);
+            }
+            sys_exit(0);
+        }
+        let mut status = 0;
+        sys_wait4(pid, &mut status, 0, 0);
+        if !t.ok(b"child", status == 0, i64::from(status) << 8 | round) {
+            break;
+        }
+    }
+    let fd = ping_socket();
+    t.ok(b"socket after", fd >= 0, fd as i64);
     close(fd);
     t.done();
 }

@@ -39,7 +39,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicPtr, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
+use core::sync::atomic::{
+    AtomicPtr, AtomicUsize, Ordering::Acquire, Ordering::Relaxed, Ordering::Release,
+};
 
 use crate::sync::rcu::{HasRcuPuts, RcuReadGuard, put_rcu, synchronize};
 use crate::sync::spin::{Mutex, MutexGuard};
@@ -66,18 +68,29 @@ fn get_nulls_value(p: *const NullsLink) -> usize {
 /// (never a pointer's address)
 const CLAIMED: *mut AtomicPtr<NullsLink> = core::ptr::dangling_mut();
 
+/// The `pprev` of a bucket's first link: the bucket's `first`, named
+/// symbolically so the bucket may move (never a pointer's address)
+const HEAD: *mut AtomicPtr<NullsLink> = core::ptr::without_provenance_mut(1);
+
+/// Bucket ids handed out (0: none yet)
+static NEXT_BUCKET: AtomicUsize = AtomicUsize::new(1);
+
 /// The chain hook embedded in an item (Linux struct hlist_nulls_node)
 ///
 /// # Invariants
 /// `pprev` is null while the link is in no chain (Linux
-/// hlist_nulls_unhashed), `CLAIMED` while one insert owns it, and
-/// otherwise the address of the pointer to it (its bucket's `first` or
-/// the previous link's `next`). While hashed, `next` is the following
+/// hlist_nulls_unhashed), `CLAIMED` while one insert owns it, `HEAD`
+/// while it is first in its bucket, and otherwise the address of the
+/// previous link's `next`. `bucket` is the id of the bucket it is in
+/// (0: none). While hashed, `next` is the following
 /// link or the chain's nulls marker; unhashed, it keeps its last value
 /// for readers standing on the link.
 pub struct NullsLink {
     next: AtomicPtr<NullsLink>,
     pprev: AtomicPtr<AtomicPtr<NullsLink>>,
+    /// The bucket it is in, so removal checks membership with no walk;
+    /// written under that bucket's lock
+    bucket: AtomicUsize,
 }
 
 impl Default for NullsLink {
@@ -91,6 +104,7 @@ impl NullsLink {
         Self {
             next: AtomicPtr::new(nulls(0)),
             pprev: AtomicPtr::new(null_mut()),
+            bucket: AtomicUsize::new(0),
         }
     }
 
@@ -149,14 +163,18 @@ macro_rules! nulls_adapter {
 /// # Invariants
 /// From `first` through `next` run the links of live items, ending in
 /// `nulls(nulls)`; each was hashed with `Arc::into_raw` (the bucket
-/// holds that reference) and its `pprev` is the address of the pointer
-/// to it. The chain changes only under `lock`. The reference of an
+/// holds that reference), its `pprev` `HEAD` for the first and the
+/// previous link's `next` otherwise, its `bucket` this bucket's `id`
+/// (nonzero once any link was hashed, unique). The chain changes only
+/// under `lock`. The reference of an
 /// entry taken off is dropped no earlier than a grace period after
 /// (`NullsUnlinked`), so every link a reader reaches is live while its
 /// guard is held.
 pub struct NullsHead<A: NullsAdapter> {
     first: AtomicPtr<NullsLink>,
     nulls: usize,
+    /// Given at the first insert (0: none yet)
+    id: AtomicUsize,
     /// Writers' lock; one lockdep class for every bucket (built here),
     /// and two are never held at once
     lock: Mutex<()>,
@@ -172,6 +190,7 @@ impl<A: NullsAdapter> NullsHead<A> {
         Self {
             first: AtomicPtr::new(self::nulls(nulls)),
             nulls,
+            id: AtomicUsize::new(0),
             lock: Mutex::new(()),
             _owns: PhantomData,
         }
@@ -253,6 +272,7 @@ impl<A: NullsAdapter> Drop for NullsHead<A> {
             // the bucket's reference (type invariant)
             unsafe {
                 let next = (*cur).next.load(Relaxed);
+                (*cur).bucket.store(0, Relaxed);
                 (*cur).pprev.store(null_mut(), Release);
                 drop(Arc::from_raw(A::item(cur)));
                 cur = next;
@@ -280,17 +300,15 @@ impl<A: NullsAdapter> NullsGuard<'_, A> {
         unsafe { (*l).next.load(Relaxed) }
     }
 
-    /// `item`'s link if it is in this bucket (chains are short)
-    fn find_link(&self, item: &A::Item) -> Option<*mut NullsLink> {
-        let want = Self::link(item);
-        let mut l = self.head.first.load(Relaxed);
-        while !is_a_nulls(l) {
-            if l == want {
-                return Some(l);
-            }
-            l = Self::next(l);
+    /// This bucket's id, given now if it has none (the lock held)
+    fn id(&self) -> usize {
+        let id = self.head.id.load(Relaxed);
+        if id != 0 {
+            return id;
         }
-        None
+        let id = NEXT_BUCKET.fetch_add(1, Relaxed);
+        self.head.id.store(id, Relaxed);
+        id
     }
 
     /// Hash `item` at the head (Linux hlist_nulls_add_head_rcu); panics
@@ -306,7 +324,8 @@ impl<A: NullsAdapter> NullsGuard<'_, A> {
         // initialized
         n.next.store(first, Release);
         // INVARIANT: claimed above; it heads the chain once published
-        n.pprev.store(core::ptr::from_ref(h).cast_mut(), Relaxed);
+        n.pprev.store(HEAD, Relaxed);
+        n.bucket.store(self.id(), Relaxed);
         let next = core::ptr::from_ref(&n.next).cast_mut();
         let n = core::ptr::from_ref(n).cast_mut();
         // INVARIANT: the bucket keeps the item's reference
@@ -321,21 +340,34 @@ impl<A: NullsAdapter> NullsGuard<'_, A> {
 
     /// Unhash `item` (Linux hlist_nulls_del_init_rcu), keeping its
     /// `next` for readers standing on it, and hand back the bucket's
-    /// reference; None if it is not in this bucket
+    /// reference; None if it is not in this bucket. O(1): the link
+    /// names its bucket (Linux trusts the caller instead).
     pub fn del_rcu(&mut self, item: &A::Item) -> Option<NullsUnlinked<A>> {
-        let n = self.find_link(item)?;
-        // SAFETY: `n` is a link of this bucket (just found) and `pprev`
-        // the pointer to it, in this bucket's head or a link of it, all
-        // live, the lock held (type invariant)
+        let l = A::link(item);
+        let id = self.head.id.load(Relaxed);
+        // Set under this bucket's lock when hashed here, cleared under
+        // it when unhashed: held now, so it cannot become `id` meanwhile
+        if id == 0 || l.bucket.load(Relaxed) != id {
+            return None;
+        }
+        let n = Self::link(item);
+        // SAFETY: `n` is a link of this bucket (its `bucket` says so):
+        // `pprev` is `HEAD` or a live link's `next`, `next` a live link
+        // or the nulls marker, the lock held (type invariant)
         unsafe {
             let next = (*n).next.load(Relaxed);
             let pprev = (*n).pprev.load(Relaxed);
-            (*pprev).store(next, Release);
+            if pprev == HEAD {
+                self.head.first.store(next, Release);
+            } else {
+                (*pprev).store(next, Release);
+            }
             if !is_a_nulls(next) {
                 (*next).pprev.store(pprev, Relaxed);
             }
             // INVARIANT: unhashed, `next` kept; Release pairs with the
             // next insert's claim
+            (*n).bucket.store(0, Relaxed);
             (*n).pprev.store(null_mut(), Release);
         }
         // SAFETY: hashed by `add_head_rcu`'s `into_raw`, whose reference
@@ -564,6 +596,23 @@ mod tests {
         assert_eq!(walk(&t[3]), (alloc::vec![1], Some(3)));
         drop(t[3].lock().del_rcu(&a));
         assert_eq!(walk(&t[3]), (Vec::new(), Some(3)));
+    }
+
+    /// A bucket holding entries may move (its first link names it
+    /// symbolically): removal still finds them, from the front and the
+    /// back
+    #[test]
+    fn bucket_moves() {
+        let (x, y) = (item(1), item(2));
+        let a = Head::new(5);
+        a.lock().add_head_rcu(x.clone());
+        a.lock().add_head_rcu(y.clone());
+        let b = a;
+        assert_eq!(walk(&b), (alloc::vec![2, 1], Some(5)));
+        drop(b.lock().del_rcu(&y).expect("y in the moved bucket"));
+        drop(b.lock().del_rcu(&x).expect("x in the moved bucket"));
+        assert_eq!(walk(&b), (Vec::new(), Some(5)));
+        assert_eq!(Arc::strong_count(&x), 1);
     }
 
     /// A reader standing on an entry that moves to another bucket walks

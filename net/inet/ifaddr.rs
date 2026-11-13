@@ -509,16 +509,6 @@ pub fn inetdev_destroy(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice
     fib::fib_disable_dev(rtnl, net, dev, true);
 }
 
-/// A device of a namespace that is gone loses its addresses (Linux
-/// NETDEV_UNREGISTER -> inetdev_destroy from cleanup_net): they leave
-/// its list and the address hash. Its FIB went with the namespace and
-/// no socket is left to hear an announcement.
-pub fn inetdev_exit(_rtnl: &RtnlGuard, dev: &NetDevice) {
-    while let Some(gone) = ifa_unlink(dev, |_| true) {
-        gone.free();
-    }
-}
-
 /// Type of `addr` in the namespace (Linux inet_addr_type)
 pub fn inet_addr_type(net: &NetNamespace, addr: Ipv4Addr) -> RouteType {
     net.fib.addr_type(addr)

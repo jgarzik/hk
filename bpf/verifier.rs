@@ -466,8 +466,8 @@ impl Checker<'_> {
             .iter()
             .find(|h| h.0 == insn.imm)
             .map_or(0, |h| h.1);
-        for r in 1..=n as usize {
-            if !matches!(read(st.regs[r])?, Val::Scalar(_)) {
+        for &r in &st.regs[1..=n as usize] {
+            if !matches!(read(r)?, Val::Scalar(_)) {
                 return acces();
             }
         }

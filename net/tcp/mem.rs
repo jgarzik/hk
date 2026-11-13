@@ -181,7 +181,7 @@ pub fn sysctl_show() -> Vec<i64> {
 /// over a container's own namespace is no right over the host's TCP)
 fn init_net_only() -> Result<(), KernelError> {
     let net = crate::net::current_net_ns();
-    if alloc::sync::Arc::ptr_eq(&net, &crate::net::init_net_ns()) {
+    if net.id == crate::net::init_net_ns().id {
         Ok(())
     } else {
         Err(KernelError::NotPermitted)

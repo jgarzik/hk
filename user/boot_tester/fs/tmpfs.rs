@@ -37,7 +37,7 @@
 
 use crate::exec::busybox::contains;
 use crate::harness::T;
-use crate::helpers::read_file;
+use crate::helpers::{host_mode, read_file};
 use crate::mm::mm_life::{SI_TOTALRAM, sysinfo_ram};
 use hk_syscall::{
     LinuxStatFs, O_CREAT, O_RDWR, O_WRONLY, Stat, sys_close, sys_fallocate, sys_ftruncate,
@@ -265,9 +265,14 @@ fn rootfs() {
     t.eq(b"f_type", st.f_type, TMPFS_MAGIC);
     let ram = sysinfo_ram(SI_TOTALRAM) as i64;
     let size = st.f_blocks * 4096;
+    // Linux sizes rootfs at its mount in start_kernel, half of the RAM
+    // totalram_pages() counts then (shmem_default_max_blocks), which can
+    // be well below what sysinfo reports later; hk at its mount, with
+    // all RAM counted
+    let low = if host_mode() { 0 } else { ram * 2 / 5 };
     t.ok(
         b"half of RAM",
-        size > ram * 2 / 5 && size <= ram * 11 / 20,
+        size > low && size <= ram * 11 / 20,
         st.f_blocks,
     );
     t.ok(b"files", st.f_files > 0 && st.f_ffree > 0, st.f_files);
