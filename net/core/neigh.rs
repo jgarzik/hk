@@ -660,7 +660,7 @@ impl NeighTable {
         dev: &NetDevice,
         key: &Key,
     ) -> Option<RcuRef<'a, Neighbour>> {
-        let nht = self.nht.read(g)?;
+        let nht = self.nht.read(g);
         nht.bucket(self.ops, key, dev)
             .iter_ref(g)
             .find(|n| core::ptr::eq(Arc::as_ptr(&n.dev), dev) && n.key == *key)
@@ -759,14 +759,11 @@ impl NeighTable {
     ) -> (Result<Arc<Neighbour>, KernelError>, Option<Arc<Neighbour>>) {
         let mut o = self.lock.lock();
         let g = rcu::read_lock();
-        if let Some(nht) = self.nht.read(&g)
-            && self.entries.load(Relaxed) > nht.heads.len()
-        {
+        let nht = self.nht.read(&g);
+        if self.entries.load(Relaxed) > nht.heads.len() {
             self.grow(&mut o, nht);
         }
-        let Some(nht) = self.nht.read(&g) else {
-            return (Err(KernelError::NoBufferSpace), Some(n));
-        };
+        let nht = self.nht.read(&g);
         let unwind = |r| {
             if !exempt {
                 self.gc_entries.fetch_sub(1, Relaxed);
@@ -806,7 +803,7 @@ impl NeighTable {
         }
         // Freed after readers of the old chains are done (Linux
         // call_rcu(neigh_hash_free_rcu))
-        self.nht.replace(Some(new)).defer();
+        self.nht.replace(new).defer();
     }
 
     /// Only the table references `n` besides `extra` references the
@@ -846,9 +843,7 @@ impl NeighTable {
         let (mut shrunk, mut loops) = (0usize, 0);
         let mut o = self.lock.lock();
         let g = rcu::read_lock();
-        let Some(nht) = self.nht.read(&g) else {
-            return 0;
-        };
+        let nht = self.nht.read(&g);
         let mut cur = o.gc_list.front();
         while let Some(n) = cur {
             cur = o.gc_list.next(&n);
@@ -888,9 +883,7 @@ impl NeighTable {
             loop {
                 {
                     let g = rcu::read_lock();
-                    let Some(nht) = self.nht.read(&g) else {
-                        break;
-                    };
+                    let nht = self.nht.read(&g);
                     let Some(head) = nht.heads.get(b) else {
                         break;
                     };
@@ -1057,9 +1050,7 @@ impl NeighTable {
     pub fn flush_dev(&self, dev: &NetDevice) {
         let mut o = self.lock.lock();
         let g = rcu::read_lock();
-        let Some(nht) = self.nht.read(&g) else {
-            return;
-        };
+        let nht = self.nht.read(&g);
         while let Some(n) = dev.neighbours.access(&o).front() {
             self.flush_one(&mut o, nht, &n);
         }
@@ -1109,9 +1100,7 @@ impl NeighTable {
         // Linux neigh_release + neigh_remove_one under tbl->lock
         let mut o = self.lock.lock();
         let g = rcu::read_lock();
-        let Some(nht) = self.nht.read(&g) else {
-            return Ok(());
-        };
+        let nht = self.nht.read(&g);
         let mut i = n.inner.lock();
         if !i.dead && Self::unused(&o, &n, 1) {
             self.unlink(&mut o, nht, &n, &mut i);
@@ -1123,10 +1112,7 @@ impl NeighTable {
     /// neigh_seq walk the buckets under RCU); callers filter by
     /// namespace
     pub fn iter_rcu<'a>(&'a self, g: &'a RcuReadGuard) -> impl Iterator<Item = &'a Neighbour> + 'a {
-        self.nht
-            .read(g)
-            .into_iter()
-            .flat_map(move |h| h.heads.iter().flat_map(move |b| b.iter(g)))
+        self.nht.read(g).heads.iter().flat_map(move |b| b.iter(g))
     }
 
     /// The entry for `key` on `dev`, as dumps report it

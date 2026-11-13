@@ -272,7 +272,8 @@ level instead of the rcu_node tree). A reader holds an `RcuReadGuard`
 so a reader never sleeps (`might_sleep` reports it), an unnamed
 allocation in it is listed by might_alloc (1.5; lockdep builds show
 where it began), and its CPU passes no quiescent state while it holds
-one. `RcuArc<T>` is an RCU-protected pointer (Linux `__rcu`): `read`
+one. `RcuArc<T>` is an RCU-protected pointer (Linux `__rcu`, never
+NULL once initialized): `read`
 borrows the current version for the guard's lifetime
 (rcu_dereference, Acquire), `get` takes a reference to it, `replace`
 publishes a new one (rcu_assign_pointer, Release) and returns the old
@@ -297,8 +298,7 @@ under one lock costs a pointer per bucket. A table grows by moving
 every entry of a chain into a new table's chains under that lock with
 no grace period (`move_all`, Linux neigh_hash_grow): a reader standing
 on a moved entry walks on into its new chain and may miss entries, so
-a lookup that must not miss repeats under the lock. `RcuArc::empty` is
-a static pointer published by its init. `util::rcuhlist::RcuHList`
+a lookup that must not miss repeats under the lock. `util::rcuhlist::RcuHList`
 is one RCU hash chain (Linux hlist_*_rcu: `next`/`pprev` nodes, a
 strong reference per entry, its own spin leaf for writers, which a
 table nests under its own lock): readers walk it under a guard,

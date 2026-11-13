@@ -771,8 +771,6 @@ Phase A2 (net) remaining:
 - `net/tcp/table.rs` keeps separate established and TIME_WAIT nulls
   tables (two walks per miss, two bucket locks in hash_unique); Linux
   has one ehash for both.
-- `net/core/neigh.rs` `nht` is an `Option` that is never None; its
-  None branch in `insert` would leak a `gc_entries` count.
 
 ## Deferred file release gaps
 
