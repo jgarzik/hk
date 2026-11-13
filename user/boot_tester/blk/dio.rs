@@ -444,7 +444,8 @@ fn fault(f: &Fds) -> R {
 /// write with nothing cached go ahead; a dirty page in a read's range,
 /// any cached page in a write's, or an I/O needing more than one bio is
 /// EAGAIN. Buffered: a write is EOPNOTSUPP, a read of cached data goes
-/// ahead and of uncached data is EAGAIN.
+/// ahead and of uncached data is EAGAIN unless the readahead it starts
+/// is done first.
 fn nowait(f: &Fds) -> R {
     let a = Buf::new(PAGE)?;
     let r = rw2(f.d, a.ptr(0), PAGE, RD + MIB, RWF_NOWAIT, false);
@@ -484,7 +485,14 @@ fn nowait(f: &Fds) -> R {
     let r = rw2(f.b, c.ptr(0), PAGE, 3 * MIB, RWF_NOWAIT, false);
     check(b"buffered cached read", r == PAGE as i64, r)?;
     is_pat(b"buffered cached data", c.bytes(0, PAGE), 3 * MIB)?;
-    let r = rw2(f.b, c.ptr(0), PAGE, 6 * MIB + MIB / 2, RWF_NOWAIT, false);
+    // Uncached: Linux starts readahead (filemap_get_pages calls
+    // page_cache_sync_ra before its NOWAIT check) and goes ahead if the
+    // page came in meanwhile, so either outcome is Linux's
+    let off3 = 6 * MIB + MIB / 2;
+    let r = rw2(f.b, c.ptr(0), PAGE, off3, RWF_NOWAIT, false);
+    if r == PAGE as i64 {
+        return is_pat(b"buffered uncached data", c.bytes(0, PAGE), off3);
+    }
     check(b"buffered uncached read", r == EAGAIN, r)
 }
 
