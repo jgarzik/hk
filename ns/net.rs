@@ -87,7 +87,7 @@ pub struct NetNamespace {
     pub icmp: crate::net::icmp::IcmpRate,
 
     /// Ping sockets by echo identifier
-    pub ping: crate::net::ping::PingTable,
+    pub ping: crate::net::ping::PingNet,
 
     /// Raw sockets by protocol
     pub raw: crate::net::raw::RawTable,

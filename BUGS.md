@@ -750,10 +750,6 @@ Phase A2 (net) remaining:
   RCU portid table.
 - netns active/passive refcount split (above, Network stack gaps)
   also removes the drop-time allocation.
-- Two RCU hash chain types (`util::rculist::RcuHList`, table-locked;
-  `util::rcuhlist::RcuHList`, own spin leaf) and two repeat-release
-  schemes (`rcu::put_rcu`, `rcu::try_kfree_rcu` with a synchronize
-  fallback): Linux has one hlist_*_rcu; unify.
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
 - TCP (`net/tcp/mod.rs`): a SYN backlogged while `listen()` owns the

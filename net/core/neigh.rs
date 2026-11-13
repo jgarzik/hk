@@ -50,13 +50,14 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use crate::mm::page_alloc::Gfp;
-use crate::sync::rcu::{self, RcuArc, RcuHead, RcuReadGuard};
+use crate::sync::rcu::{self, RcuArc, RcuHead, RcuPuts, RcuReadGuard};
 use crate::sync::spin::Mutex;
 use crate::sync::{IrqSpinlock, UniqueOwner};
 use crate::task::workqueue::{DelayedWork, SYSTEM_WQ};
 use crate::time::timer::ArcTimer;
 use crate::util::list::{Link, OwnedList, Owner};
-use crate::util::rculist::{RcuHList, RcuRef};
+use crate::util::rcuhlist::{HNode, RcuHList};
+use crate::util::rculist::RcuRef;
 
 use crate::net::device::NetDevice;
 use crate::net::skb::{SkBuff, SkbHead};
@@ -445,7 +446,7 @@ impl Inner {
 /// A neighbour entry (Linux struct neighbour)
 pub struct Neighbour {
     /// On its bucket's chain (Linux neigh->hash)
-    hash: Link,
+    hash: HNode,
     /// On its device's list (Linux neigh->dev_list)
     dev_list: Link,
     dev_owner: Owner,
@@ -453,7 +454,7 @@ pub struct Neighbour {
     gc_list: Link,
     gc_owner: Owner,
     /// Freed a grace period after it leaves the hash (Linux neigh->rcu)
-    rcu: RcuHead,
+    rcu: RcuPuts,
     /// Its state machine's timer (Linux neigh->timer): a pending arm
     /// holds a reference
     timer: ArcTimer<Neighbour>,
@@ -463,10 +464,10 @@ pub struct Neighbour {
     inner: Mutex<Inner>,
 }
 
-crate::adapter!(NeighHashLink, Neighbour, hash);
+crate::hadapter!(NeighHashLink, Neighbour, hash);
 crate::owned_adapter!(pub NeighDevLink, Neighbour, dev_list, dev_owner);
 crate::owned_adapter!(NeighGcLink, Neighbour, gc_list, gc_owner);
-crate::rcu_head!(Neighbour, rcu);
+crate::rcu_puts!(Neighbour, rcu);
 
 impl Drop for Neighbour {
     /// Linux neigh_destroy: the queue goes with it
@@ -721,12 +722,12 @@ impl NeighTable {
         self.entries.fetch_add(1, Relaxed);
         let n = try_arc_gfp(
             Neighbour {
-                hash: Link::new(),
+                hash: HNode::new(),
                 dev_list: Link::new(),
                 dev_owner: Owner::new(),
                 gc_list: Link::new(),
                 gc_owner: Owner::new(),
-                rcu: RcuHead::new(),
+                rcu: RcuPuts::new(),
                 timer: ArcTimer::new(neigh_timer_handler),
                 tbl: self,
                 key: *key,
@@ -787,7 +788,7 @@ impl NeighTable {
         if !exempt {
             o.gc_list.push_back(n.clone());
         }
-        b.push_front(n.clone(), &mut o);
+        b.add_head(n.clone(), &mut o);
         n.dev.neighbours.access_mut(&mut o).push_back(n.clone());
         (Ok(n), None)
     }
@@ -826,7 +827,7 @@ impl NeighTable {
     /// reference goes a grace period later (neigh_cleanup_and_release)
     fn unlink(&self, o: &mut TblLocked, nht: &NeighHash, n: &Neighbour, i: &mut Inner) {
         let b = nht.bucket(self.ops, &n.key, &n.dev);
-        if let Some(u) = b.remove_first(|x| core::ptr::eq(x, n), o) {
+        if let Some(u) = b.del_init(n, o) {
             u.defer();
         }
         drop(n.dev.neighbours.access_mut(o).remove(n));

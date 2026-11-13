@@ -554,29 +554,16 @@ impl CbList {
 /// `h` lives until `func(arg)` runs (it is in the object `arg` keeps),
 /// and `func(arg)` may run on any CPU with preemption off.
 pub unsafe fn call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) {
-    // SAFETY: the caller's contract
-    let claimed = unsafe { try_call_rcu(h, func, arg) };
-    assert!(claimed, "call_rcu: head already queued");
-}
-
-/// [`call_rcu`], or false (nothing queued) if `h` is queued already:
-/// for an object that may be released again before its last callback
-/// ran, whose caller then waits instead
-///
-/// # Safety
-/// As [`call_rcu`].
-pub unsafe fn try_call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) -> bool {
-    if h.next
+    let claimed = h
+        .next
         .compare_exchange(
             IDLE,
             core::ptr::null_mut(),
             Ordering::Acquire,
             Ordering::Relaxed,
         )
-        .is_err()
-    {
-        return false;
-    }
+        .is_ok();
+    assert!(claimed, "call_rcu: head already queued");
     // SAFETY: claimed: only this queueing writes it (type invariant)
     unsafe { *h.func.get() = Some((func, arg)) };
     let d = RDP.this();
@@ -599,7 +586,6 @@ pub unsafe fn try_call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) -> bool {
     if GP_REQ.fetch_max(want, Ordering::SeqCst) < want {
         GP_KICK.wake_all();
     }
-    true
 }
 
 /// Release one reference to `a` after a grace period (Linux
@@ -731,29 +717,6 @@ unsafe fn puts_cb<T: HasRcuPuts + Send + Sync>(p: *const ()) {
     // SAFETY: one of the counted references (all clones of one Arc,
     // so which is fungible), taken back once
     drop(unsafe { Arc::from_raw(t) });
-}
-
-/// [`kfree_rcu`], or the reference back if `a`'s head is still queued
-/// for an earlier release (the caller then waits for a grace period
-/// itself)
-pub fn try_kfree_rcu<T: HasRcuHead + Send + Sync>(a: Arc<T>) -> Result<(), Arc<T>> {
-    /// The reference queued, dropped
-    ///
-    /// # Safety
-    /// `p` is the `Arc::into_raw` queued with it.
-    unsafe fn put<T>(p: *const ()) {
-        // SAFETY: `Arc::into_raw` of `try_kfree_rcu`, taken back once
-        drop(unsafe { Arc::from_raw(p.cast::<T>()) });
-    }
-    let h = core::ptr::from_ref(a.rcu_head());
-    let p = Arc::into_raw(a).cast::<()>();
-    // SAFETY: the head is a field of the object (HasRcuHead), kept by
-    // the reference `p` until `put` drops it; T is Send + Sync
-    if unsafe { try_call_rcu(&*h, put::<T>, p) } {
-        return Ok(());
-    }
-    // SAFETY: not queued: `p` is still ours, from into_raw above
-    Err(unsafe { Arc::from_raw(p.cast::<T>()) })
 }
 
 /// The clock interrupt of `cpu`: wake its `rcuc/N` if its first
