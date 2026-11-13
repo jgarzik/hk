@@ -394,7 +394,9 @@ fn test_ping_peek() {
 /// SOCK_RCU_FREE, then put_net queueing cleanup_net)
 fn test_ping_netns_exit() {
     let mut t = T::new(b"PING_NETNS_EXIT");
-    for round in 0..8 {
+    // Few rounds: Linux frees a namespace from a workqueue later, and
+    // a loaded host lets several pile up before BPF_PROG_LOAD_BIG
+    for round in 0..3 {
         let pid = sys_fork();
         if pid == 0 {
             if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
