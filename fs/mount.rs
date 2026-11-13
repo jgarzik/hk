@@ -6,7 +6,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use crate::sync::spin::RwLock;
-use crate::sync::{LockedByEither, RwSem, RwSemReadGuard, RwSemWriteGuard, SeqLock, UniqueOwner};
+use crate::sync::{LockedByEither, RwSem, RwSemReadGuard, RwSemWriteGuard, SeqRwLock, UniqueOwner};
 use crate::util::list::{Link, OwnedList, Owner};
 use ::core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -60,10 +60,10 @@ unsafe impl UniqueOwner for MntHash {}
 
 /// Every write of a mount's `mnt_flags` and every change of the mount
 /// tree's links (Linux mount_lock, lock_mount_hash: a seqlock whose
-/// sequence lockless readers may check; read_seqlock_excl is
-/// `read_excl`); under NAMESPACE_SEM and s_umount, above nothing but
-/// leaves
-pub static MOUNT_LOCK: SeqLock<MntHash> = SeqLock::new(MntHash(()));
+/// sequence lockless readers may check; read_seqlock_excl is `read`,
+/// whose locking readers share it); under NAMESPACE_SEM and s_umount,
+/// above nothing but leaves
+pub static MOUNT_LOCK: SeqRwLock<MntHash> = SeqRwLock::new(MntHash(()));
 
 /// Old mount -> its copy, from [`Mount::clone_tree`]
 pub type MountMap = Vec<(MountRef, MountRef)>;
@@ -870,7 +870,7 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         }
         // Busy first (Linux: mnt_get_count != 2 under lock_mount_hash),
         // then the mark
-        let busy = is_mount_busy(&mount, &*MOUNT_LOCK.read_excl());
+        let busy = is_mount_busy(&mount, &*MOUNT_LOCK.read());
         if busy {
             return Err(KernelError::Busy);
         }
@@ -1150,7 +1150,7 @@ impl Mount {
     /// Unhang one submount (Linux umount_mnt), its reference returned
     /// for a drop after the locks
     fn pop_child(&self) -> Option<MountRef> {
-        if !self.has_children(&*MOUNT_LOCK.read_excl()) {
+        if !self.has_children(&*MOUNT_LOCK.read()) {
             return None;
         }
         let mut ns = namespace_lock();
@@ -1225,7 +1225,7 @@ pub fn follow_mount(p: Path) -> Path {
 /// locking read (Linux walks the mount hash under RCU and the
 /// sequence)
 fn lookup_mnt(p: &Path) -> Option<MountRef> {
-    let ml = MOUNT_LOCK.read_excl();
+    let ml = MOUNT_LOCK.read();
     let mut kids = p.mnt.kids(&*ml);
     let m = kids.find(|c| {
         c.get_mountpoint()
