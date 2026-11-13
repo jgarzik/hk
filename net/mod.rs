@@ -149,7 +149,7 @@ pub fn register_netdev(rtnl: rtnl::RtnlGuard, dev: Arc<NetDevice>) {
         m[5]
     );
     let net = init_net_ns();
-    net.register_device(dev.clone());
+    net.passive().register_device(dev.clone());
     // Linux register_netdevice's rtmsg_ifinfo(RTM_NEWLINK)
     netlink::rtnetlink::notify_link(&net, &dev, Default::default());
     drop(rtnl);

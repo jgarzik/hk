@@ -540,7 +540,7 @@ impl TcpSock {
         // GFP_ATOMIC under the socket lock (Linux inet_twsk_alloc)
         let tw = with_gfp(Gfp::ATOMIC, || {
             TimeWait::new(
-                Arc::clone(&self.sk.net),
+                Arc::clone(self.sk.net.passive()),
                 t,
                 bind,
                 self.by_bind.load(Ordering::Relaxed),

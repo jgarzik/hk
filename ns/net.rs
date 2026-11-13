@@ -118,9 +118,10 @@ pub struct NetNamespace {
 
 /// An active reference to a network namespace (Linux get_net/put_net):
 /// while one exists the namespace is listed and keeps its devices. It
-/// derefs to the namespace's `Arc` (a passive reference, Linux
-/// net->passive: the memory only), so the namespace's methods and
-/// fields are reached through it. Dropping the last one queues the
+/// derefs to the namespace; [`passive`](Self::passive) is the `Arc`
+/// under it (a passive reference, Linux net->passive: the memory only),
+/// cloned only by holders that must not keep the namespace alive
+/// (TIME_WAIT entries, devices' back pointers). Dropping the last one queues the
 /// namespace's teardown (Linux __put_net -> cleanup_net) and allocates
 /// nothing: any context.
 pub struct NetRef(Option<Arc<NetNamespace>>);
@@ -132,15 +133,16 @@ impl NetRef {
         Self(Some(ns))
     }
 
-    fn arc(&self) -> &Arc<NetNamespace> {
+    /// The passive reference under it (Linux net->passive)
+    pub fn passive(&self) -> &Arc<NetNamespace> {
         self.0.as_ref().expect("NetRef: taken")
     }
 }
 
 impl core::ops::Deref for NetRef {
-    type Target = Arc<NetNamespace>;
-    fn deref(&self) -> &Arc<NetNamespace> {
-        self.arc()
+    type Target = NetNamespace;
+    fn deref(&self) -> &NetNamespace {
+        self.passive()
     }
 }
 
@@ -148,7 +150,7 @@ impl Clone for NetRef {
     /// Linux get_net: the holder keeps one already
     fn clone(&self) -> Self {
         self.active.fetch_add(1, Ordering::Relaxed);
-        Self(Some(self.arc().clone()))
+        Self(Some(self.passive().clone()))
     }
 }
 
@@ -161,7 +163,6 @@ impl Drop for NetRef {
         }
     }
 }
-
 
 impl NetNamespace {
     /// Create a new network namespace with loopback device, or ENOMEM
@@ -217,11 +218,13 @@ impl NetNamespace {
         let ns = NetRef::first(ns);
         // Linux setup_net: list_add_tail_rcu under net_rwsem (write);
         // `cleanup_net` unlists it
-        NET_NAMESPACE_LIST.write().push(Arc::downgrade(&ns));
+        NET_NAMESPACE_LIST
+            .write()
+            .push(Arc::downgrade(ns.passive()));
 
         // Loopback device: ifindex 1, down and without addresses until
         // brought up (then 127.0.0.1/8, like Linux)
-        ns.register_device(Arc::clone(&lo));
+        ns.passive().register_device(Arc::clone(&lo));
         *ns.loopback.write() = Some(lo);
 
         ns
@@ -403,8 +406,9 @@ pub fn net_ns_init() {
 
 /// Start the teardown queue's worker (once the scheduler runs)
 pub fn net_ns_start() {
+    // Linux net_ns_init: panic("Could not create netns workq")
     if let Err(e) = NETNS_WQ.start(None) {
-        crate::printkln!("netns: no cleanup worker: {:?}", e);
+        panic!("netns: no cleanup worker: {:?}", e);
     }
 }
 
@@ -451,8 +455,10 @@ fn cleanup_net() {
     });
     for net in &nets {
         crate::net::rtnl::netns_exit(net);
-        net.tcp.twsk_purge();
+        // Linux loopback_net_exit
+        *net.loopback.write() = None;
     }
+    crate::net::tcp::table::twsk_purge(&nets);
     crate::sync::rcu::rcu_barrier();
 }
 

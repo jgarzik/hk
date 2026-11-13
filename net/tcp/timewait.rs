@@ -37,6 +37,7 @@ use crate::time::timer::ArcTimer;
 use crate::util::hlist_nulls::NullsLink;
 use crate::util::list::Link;
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub struct TimeWait {
     pub tuple: Tuple,
@@ -54,6 +55,10 @@ pub struct TimeWait {
     pub(super) eh_link: NullsLink,
     pub(super) bind_link: Link,
     pub(super) by_bind: bool,
+    /// Ended by its namespace's teardown: the timer is never armed
+    /// again (Linux timer_shutdown in inet_twsk_deschedule_put); set
+    /// under `inner`
+    killed: AtomicBool,
     /// The tables' references, dropped a grace period after unhashing
     rcu_puts: RcuPuts,
     me: Weak<TimeWait>,
@@ -83,6 +88,7 @@ impl TimeWait {
             eh_link: NullsLink::new(),
             bind_link: Link::new(),
             by_bind,
+            killed: AtomicBool::new(false),
             rcu_puts: RcuPuts::new(),
             me: me.clone(),
         })
@@ -108,7 +114,11 @@ impl TimeWait {
     /// Arm the timer for the control block's deadline, or stop it once
     /// the entry is `done` (the timer's reference goes)
     fn sync(&self, g: &mut (TwCb, Option<u64>), done: bool) {
-        let want = if done { None } else { g.0.next_timer() };
+        let want = if done || self.killed.load(Ordering::Relaxed) {
+            None
+        } else {
+            g.0.next_timer()
+        };
         if want == g.1 && (want.is_none() || self.timer.pending()) {
             return;
         }
@@ -167,6 +177,7 @@ impl TimeWait {
     /// and the entry leaves the tables
     pub fn kill(self: &Arc<Self>) {
         let mut g = self.inner.lock();
+        self.killed.store(true, Ordering::Relaxed);
         self.sync(&mut g, true);
         drop(g);
         self.net.tcp.tw_unhash(self);

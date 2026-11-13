@@ -201,6 +201,25 @@ pub struct TcpTables {
     _id: u8,
 }
 
+/// End every TIME_WAIT entry of the namespaces `nets` going (Linux
+/// tcp_twsk_purge from cleanup_net, one walk for the batch): they hold
+/// no active reference, so a namespace goes without waiting out their
+/// 2MSL. A lookup that followed a moved entry walks its bucket again
+/// (`find_rcu`).
+pub fn twsk_purge(nets: &[Arc<NetNamespace>]) {
+    for t in hi().etw.iter() {
+        loop {
+            let tw = {
+                let g = crate::sync::rcu::read_lock();
+                t.find_rcu(&g, |e| nets.iter().any(|n| n.tcp.mine_tw(e)))
+                    .map(|e| e.arc())
+            };
+            let Some(tw) = tw else { break };
+            tw.kill();
+        }
+    }
+}
+
 /// The namespace an entry is in, as the tables name it
 fn net_id(net: &NetNamespace) -> usize {
     core::ptr::from_ref(&net.tcp).addr()
@@ -571,24 +590,6 @@ impl TcpTables {
             }
             if it.ended_at() == Some(head.nulls()) {
                 return best.map(|b| b.1);
-            }
-        }
-    }
-
-    /// End every TIME_WAIT entry of this namespace (Linux
-    /// tcp_twsk_purge from cleanup_net: they hold no active reference,
-    /// so the namespace goes without waiting out their 2MSL)
-    pub fn twsk_purge(&self) {
-        for t in hi().etw.iter() {
-            loop {
-                let tw = {
-                    let g = crate::sync::rcu::read_lock();
-                    t.iter_rcu(&g)
-                        .find(|e| self.mine_tw(e.get()))
-                        .map(|e| e.arc())
-                };
-                let Some(tw) = tw else { break };
-                tw.kill();
             }
         }
     }

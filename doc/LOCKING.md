@@ -4418,8 +4418,10 @@ __put_net). `cleanup_net` there unlists the namespaces from
 `NET_NAMESPACE_LIST` (write), unregisters each device under RTNL
 through `rtnl::unregister_netdevice`, loopback last (Linux
 default_device_exit_batch: its addresses, routes, neighbours and
-sysfs device go), ends its TIME_WAIT entries (`TimeWait::kill`, Linux
-tcp_twsk_purge: timer stopped, unhashed), waits for queued RCU
+sysfs device go) and clears its loopback (loopback_net_exit), ends
+the batch's TIME_WAIT entries in one walk (`TimeWait::kill`, Linux
+tcp_twsk_purge: timer stopped for good under the entry's lock,
+unhashed), waits for queued RCU
 callbacks (`rcu_barrier`) and drops the passive references the list
 held. Walkers that reach a namespace through a passive reference take
 an active one only if it has one (`maybe_get`, Linux
