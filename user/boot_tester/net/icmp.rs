@@ -388,8 +388,6 @@ fn test_ping_peek() {
     t.done();
 }
 
-/// A disconnect unhashes an autobound socket (identifier 0); the next
-/// send binds it again and its reply comes back
 /// A network namespace whose last user is a bound ping socket: the
 /// child leaves with it open, so the namespace goes when the socket's
 /// table reference is released a grace period after its close (Linux
@@ -423,6 +421,8 @@ fn test_ping_netns_exit() {
     t.done();
 }
 
+/// A disconnect unhashes an autobound socket (identifier 0); the next
+/// send binds it again and its reply comes back
 fn test_ping_rebind() {
     let mut t = T::new(b"PING_REBIND");
     let fd = ping_socket();
