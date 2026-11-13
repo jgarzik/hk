@@ -8,8 +8,9 @@
 //!   meanwhile detaches the vfat mount (MNT_DETACH), so the last
 //!   reference to it can go while a walk is inside it. Its teardown
 //!   (releasing the block device) must not run inside the walk, which
-//!   holds spin locks: a LOCKDEP boot reports it there. Each round
-//!   remounts both; at the end the chain is removed.
+//!   holds spin locks: a LOCKDEP boot reports it there. Every getcwd
+//!   names the chain's directory, or (once detached) an unreachable
+//!   path. Each round remounts both; at the end the chain is removed.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -40,6 +41,9 @@ struct Sh {
     done: AtomicU32,
     /// getcwd calls made (walker)
     calls: AtomicU32,
+    /// getcwd results that were neither the chain's path nor an
+    /// unreachable one (walker)
+    bad: AtomicU32,
 }
 
 /// vda1's vfat, mounted at /tmp/dpm
@@ -181,7 +185,13 @@ fn race(t: &mut T, dev: &BlkDev) {
         }
         // Inside a batch of walks, detach the mount they climb through
         let base = sh.calls.load(Ordering::Acquire);
-        wait(|| sh.calls.load(Ordering::Acquire) >= base + 2);
+        if !t.ok(
+            b"walks under way",
+            wait(|| sh.calls.load(Ordering::Acquire) >= base + 2),
+            0,
+        ) {
+            break;
+        }
         if !t.eq(b"umount2", sys_umount2(DIR.as_ptr(), MNT_DETACH), 0) {
             break;
         }
@@ -198,6 +208,11 @@ fn race(t: &mut T, dev: &BlkDev) {
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
     t.eq(b"walker status", i64::from(st), 0);
+    t.eq(
+        b"getcwd names",
+        i64::from(sh.bad.load(Ordering::Acquire)),
+        0,
+    );
     sys_munmap(p as u64, 4096);
 }
 
@@ -216,7 +231,14 @@ fn walker(sh: &Sh, c: &[u8]) -> ! {
         sys_chdir(c.as_ptr());
         sh.ready.store(last, Ordering::Release);
         for _ in 0..CALLS {
-            sys_getcwd(buf.as_mut_ptr(), buf.len());
+            let r = sys_getcwd(buf.as_mut_ptr(), buf.len());
+            // The full name until the detach, an unreachable one after
+            let ok =
+                r > 0 && (buf.starts_with(b"/tmp/dpm/d/d/") || buf.starts_with(b"(unreachable)"));
+            if !ok {
+                let b = sh.bad.load(Ordering::Relaxed);
+                sh.bad.store(b + 1, Ordering::Release);
+            }
             // The only writer: no read-modify-write needed
             let n = sh.calls.load(Ordering::Relaxed);
             sh.calls.store(n + 1, Ordering::Release);
