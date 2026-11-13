@@ -179,9 +179,15 @@ impl Mount {
 /// Queue the teardown of `m` (Linux mntput_no_expire's task_work_add,
 /// else delayed_mntput_list)
 fn mntput_deferred(m: Arc<Mount>) {
-    let me = crate::task::percpu::current();
     let p = Arc::into_raw(m);
-    if !crate::sync::in_interrupt() && !me.is_kthread() {
+    // No task before per-CPU data (or in host unit tests): the delayed
+    // list, drained once `mnt_init` made its work
+    let me =
+        (!cfg!(test) && crate::cpu::try_this_id().is_some()).then(crate::task::percpu::current);
+    if let Some(me) = me
+        && !crate::sync::in_interrupt()
+        && !me.is_kthread()
+    {
         // SAFETY: `p` is live; its head is on no list (queued once, by
         // the last reference's drop); the task's list keeps the `Arc`
         // until `__cleanup_mnt`
