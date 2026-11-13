@@ -20,8 +20,11 @@
 //! (disconnect, then bind again; a hash table growing). A reader
 //! standing on it may then follow it into its new chain: lookups
 //! recheck their key on every entry, as Linux's do. Each node records
-//! the chain it is on, so a removal proves membership in O(1). The
-//! chain's reference comes back as an [`RcuHRef`], released a grace
+//! the chain it is on (the chain's id, not its address: a chain may be
+//! moved, so the first node's `pprev` names the head symbolically), so a
+//! removal proves membership in O(1). An insert claims the node first,
+//! atomically, so two chains under different locks cannot both link it.
+//! The chain's reference comes back as an [`RcuHRef`], released a grace
 //! period later (Linux SOCK_RCU_FREE, kfree_rcu: the entry's memory
 //! outlives every reader that may stand on it), never at once.
 //!
@@ -34,23 +37,38 @@
 use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicPtr, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
+use core::sync::atomic::{
+    AtomicPtr, AtomicUsize, Ordering::Acquire, Ordering::Relaxed, Ordering::Release,
+};
 
 use crate::sync::UniqueOwner;
-use crate::sync::rcu::{HasRcuPuts, RcuReadGuard, put_rcu};
+use crate::sync::rcu::{HasRcuHead, HasRcuPuts, RcuReadGuard, kfree_rcu, put_rcu};
 use crate::util::rculist::RcuRef;
+
+/// The `pprev` of a chain's first node: its head's `first`, named
+/// symbolically so the chain may move (never a pointer's address)
+const HEAD: *mut AtomicPtr<HNode> = core::ptr::without_provenance_mut(1);
+
+/// The `pprev` of a node one insert has claimed, before it is linked
+/// (never a pointer's address)
+const CLAIMED: *mut AtomicPtr<HNode> = core::ptr::without_provenance_mut(2);
+
+/// Chain ids handed out (0: none yet)
+static NEXT_CHAIN: AtomicUsize = AtomicUsize::new(1);
 
 /// A chain link embedded in an entry (Linux struct hlist_node)
 ///
 /// # Invariants
-/// `pprev` is null exactly when the node is on no chain (Linux
-/// hlist_unhashed); `head` is the `first` of the chain it is on (null:
-/// none). Both change only under the lock owning that chain.
+/// `pprev` is null exactly when the node is on no chain and no insert
+/// claimed it (Linux hlist_unhashed); `CLAIMED` while one insert owns
+/// it; `HEAD` when it is first on its chain; otherwise the address of
+/// the previous node's `next`. `chain` is the id of the chain it is on
+/// (0: none). Linked or unlinked only under the lock owning that chain.
 pub struct HNode {
     next: AtomicPtr<HNode>,
     pprev: AtomicPtr<AtomicPtr<HNode>>,
     /// The chain it is on, so removal checks membership
-    head: AtomicPtr<AtomicPtr<HNode>>,
+    chain: AtomicUsize,
 }
 
 impl HNode {
@@ -58,8 +76,17 @@ impl HNode {
         Self {
             next: AtomicPtr::new(null_mut()),
             pprev: AtomicPtr::new(null_mut()),
-            head: AtomicPtr::new(null_mut()),
+            chain: AtomicUsize::new(0),
         }
+    }
+
+    /// Claim an unhashed node for an insert: false if it is hashed or
+    /// being hashed (two chains under different locks cannot both win;
+    /// Acquire pairs with the Release that unhashed it)
+    fn claim(&self) -> bool {
+        self.pprev
+            .compare_exchange(null_mut(), CLAIMED, Acquire, Relaxed)
+            .is_ok()
     }
 
     /// On a chain now (Linux !hlist_unhashed): a hint unless the
@@ -116,12 +143,15 @@ type Owned<O> = fn(&O);
 /// # Invariants
 /// From `first` through `next` are the nodes of the live items on the
 /// chain, each inserted with `Arc::into_raw` (the chain's reference),
-/// with `pprev` pointing at the pointer that points at it and `head` at
-/// `first`. Nodes change only under a mutable borrow of the one `O`. A
-/// node taken off keeps its item allocated until a grace period after
-/// that (`RcuHRef`).
+/// with `pprev` `HEAD` for the first and the previous node's `next`
+/// otherwise, and `chain` this chain's `id` (nonzero once any node was
+/// linked, unique). Nodes change only under a mutable borrow of the one
+/// `O`. A node taken off keeps its item allocated until a grace period
+/// after that (`RcuHRef`).
 pub struct RcuHList<A: HAdapter, O: UniqueOwner> {
     first: AtomicPtr<HNode>,
+    /// Given at the first insert (0: none yet)
+    id: AtomicUsize,
     _owns: PhantomData<(Arc<A::Item>, Owned<O>)>,
 }
 
@@ -140,12 +170,20 @@ impl<A: HAdapter, O: UniqueOwner> RcuHList<A, O> {
     pub const fn new() -> Self {
         Self {
             first: AtomicPtr::new(null_mut()),
+            id: AtomicUsize::new(0),
             _owns: PhantomData,
         }
     }
 
-    fn first_ptr(&self) -> *mut AtomicPtr<HNode> {
-        core::ptr::from_ref(&self.first).cast_mut()
+    /// This chain's id, given now if it has none (`O`'s lock held)
+    fn id(&self, _o: &O) -> usize {
+        let id = self.id.load(Relaxed);
+        if id != 0 {
+            return id;
+        }
+        let id = NEXT_CHAIN.fetch_add(1, Relaxed);
+        self.id.store(id, Relaxed);
+        id
     }
 
     fn np(item: &A::Item) -> *mut HNode {
@@ -178,17 +216,19 @@ impl<A: HAdapter, O: UniqueOwner> RcuHList<A, O> {
     }
 
     /// Link `item` first (Linux hlist_add_head_rcu); panics if it is on
-    /// a chain
-    pub fn add_head(&self, item: Arc<A::Item>, _o: &mut O) {
+    /// a chain, or being linked into one
+    pub fn add_head(&self, item: Arc<A::Item>, o: &mut O) {
         let n = A::node(&item);
-        assert!(!n.is_hashed(), "RcuHList: item already hashed");
+        assert!(n.claim(), "RcuHList: item already hashed");
+        let id = self.id(o);
         let first = self.first.load(Relaxed);
         let np = Self::np(&item);
         // A reader standing on `n` (it was on a chain) sees `first`
         // initialized
         n.next.store(first, Release);
-        n.pprev.store(self.first_ptr(), Relaxed);
-        n.head.store(self.first_ptr(), Relaxed);
+        // INVARIANT: claimed above; first once published
+        n.pprev.store(HEAD, Relaxed);
+        n.chain.store(id, Relaxed);
         // Published after its fields (rcu_assign_pointer)
         self.first.store(np, Release);
         // SAFETY: `first` is a node of this chain (type invariant), its
@@ -208,23 +248,29 @@ impl<A: HAdapter, O: UniqueOwner> RcuHList<A, O> {
     #[must_use]
     pub fn del_init(&self, item: &A::Item, _o: &mut O) -> Option<RcuHRef<A>> {
         let n = A::node(item);
-        if n.head.load(Relaxed) != self.first_ptr() || !n.is_hashed() {
+        let id = self.id.load(Relaxed);
+        // `chain` is set and cleared under the lock of the chain it
+        // names: held for this one, so it cannot become `id` meanwhile
+        if id == 0 || n.chain.load(Relaxed) != id {
             return None;
         }
         let next = n.next.load(Relaxed);
         let pprev = n.pprev.load(Relaxed);
-        // SAFETY: on this chain (its head says so, under `O`'s lock):
-        // `pprev` points at the pointer to it, in `first` or a live
-        // node, and `next` is a live node of the chain or null
-        unsafe {
-            (*pprev).store(next, Release);
-            if let Some(nx) = next.as_ref() {
-                nx.pprev.store(pprev, Relaxed);
-            }
+        if pprev == HEAD {
+            self.first.store(next, Release);
+        } else {
+            // SAFETY: on this chain (its id says so, under `O`'s lock)
+            // and not first: `pprev` is a live node's `next`
+            unsafe { (*pprev).store(next, Release) };
         }
-        // INVARIANT: off the chain, `next` kept for readers on it
-        n.pprev.store(null_mut(), Relaxed);
-        n.head.store(null_mut(), Relaxed);
+        // SAFETY: `next` is a live node of this chain or null
+        if let Some(nx) = unsafe { next.as_ref() } {
+            nx.pprev.store(pprev, Relaxed);
+        }
+        // INVARIANT: off the chain, `next` kept for readers on it;
+        // Release pairs with the next insert's claim
+        n.chain.store(0, Relaxed);
+        n.pprev.store(null_mut(), Release);
         // SAFETY: the reference the chain took with into_raw
         let arc = unsafe { Arc::from_raw(core::ptr::from_ref(item)) };
         Some(RcuHRef(Some(arc), PhantomData))
@@ -287,8 +333,8 @@ impl<A: HAdapter, O: UniqueOwner> Drop for RcuHList<A, O> {
         // nodes are live entries holding the chain's references
         while let Some(n) = unsafe { cur.as_ref() } {
             let next = n.next.load(Relaxed);
-            n.pprev.store(null_mut(), Relaxed);
-            n.head.store(null_mut(), Relaxed);
+            n.chain.store(0, Relaxed);
+            n.pprev.store(null_mut(), Release);
             // SAFETY: the chain's into_raw reference, taken back once
             drop(unsafe { Arc::from_raw(A::item(cur)) });
             cur = next;
@@ -332,7 +378,8 @@ impl<'a, A: HAdapter> Iterator for RcuHRefIter<'a, A> {
 /// A chain's reference to an entry it no longer holds: released after
 /// a grace period, as readers may still stand on the entry (Linux
 /// SOCK_RCU_FREE). Dropping it waits for the grace period
-/// (synchronize_rcu: thread context only); `defer` does not wait.
+/// (synchronize_rcu: thread context only); `defer` and `defer_put` do
+/// not wait.
 #[must_use]
 pub struct RcuHRef<A: HAdapter>(Option<Arc<A::Item>>, PhantomData<A>);
 
@@ -351,14 +398,29 @@ impl<A: HAdapter> RcuHRef<A> {
 
 impl<A: HAdapter> RcuHRef<A>
 where
-    A::Item: HasRcuPuts + Send + Sync,
+    A::Item: HasRcuHead + Send + Sync,
 {
     /// Release the reference after a grace period without waiting
-    /// (Linux call_rcu of SOCK_RCU_FREE's __sk_destruct, kfree_rcu):
-    /// any context. Its drop runs in `rcuc/N` (the module's contract).
-    /// The entry may have left another chain within the same grace
-    /// period: `put_rcu` counts both.
+    /// (Linux kfree_rcu): any context. Its drop runs in `rcuc/N` (the
+    /// module's contract). For an entry that leaves a chain once; one
+    /// that may leave again before its first release ran uses
+    /// [`defer_put`](Self::defer_put).
     pub fn defer(mut self) {
+        if let Some(a) = self.0.take() {
+            kfree_rcu(a);
+        }
+    }
+}
+
+impl<A: HAdapter> RcuHRef<A>
+where
+    A::Item: HasRcuPuts + Send + Sync,
+{
+    /// As [`defer`](Self::defer), for an entry that may leave chains
+    /// again within one grace period (a socket unhashed, rehashed and
+    /// unhashed: Linux SOCK_RCU_FREE's __sk_destruct): `put_rcu` counts
+    /// each release.
+    pub fn defer_put(mut self) {
         if let Some(a) = self.0.take() {
             put_rcu(a);
         }
@@ -513,6 +575,34 @@ mod tests {
         drop(g);
         assert_eq!(values(&new[0]), [2, 4]);
         assert_eq!(values(&new[1]), [1, 3, 9]);
+    }
+
+    /// A chain holding entries may move (its first node names the head
+    /// symbolically): removal and insertion still work on it
+    #[test]
+    fn chain_moves() {
+        let mut o = Own;
+        let (x, y) = (item(1), item(2));
+        let a = Chain::new();
+        a.add_head(x.clone(), &mut o);
+        let b = a;
+        b.add_head(y.clone(), &mut o);
+        assert_eq!(values(&b), [2, 1]);
+        drop(b.del_init(&x, &mut o).expect("x on the moved chain"));
+        drop(b.del_init(&y, &mut o).expect("y on the moved chain"));
+        assert!(b.is_empty());
+        assert_eq!(Arc::strong_count(&x), 1);
+    }
+
+    /// An entry on one chain cannot be linked into another
+    #[test]
+    #[should_panic(expected = "already hashed")]
+    fn second_chain_panics() {
+        let mut o = Own;
+        let (a, b) = (Chain::new(), Chain::new());
+        let x = item(1);
+        a.add_head(x.clone(), &mut o);
+        b.add_head(x, &mut o);
     }
 
     /// The writer walk sees every entry

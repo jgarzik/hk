@@ -18,7 +18,7 @@ use crate::net::device::NetDevice;
 use crate::net::inet::fib::{FibEntry, FlowKey, RouteType};
 use crate::net::inet::ifaddr::{RT_SCOPE_LINK, inet_select_addr, ip_dev_find};
 use crate::net::ipv4::Ipv4Addr;
-use crate::sync::rcu::RcuPuts;
+use crate::sync::rcu::RcuHead;
 use crate::util::error::KernelError;
 use crate::util::rcuhlist::{HNode, RcuHList};
 
@@ -250,11 +250,11 @@ pub struct FibNhException {
     stamp: AtomicU64,
     /// On its chain (fnhe_next)
     link: HNode,
-    rcu: RcuPuts,
+    rcu: RcuHead,
 }
 
 crate::hadapter!(pub FnheLink, FibNhException, link);
-crate::rcu_puts!(FibNhException, rcu);
+crate::rcu_head!(FibNhException, rcu);
 
 type FnheChain = RcuHList<FnheLink, FnheLock>;
 
@@ -360,7 +360,7 @@ impl NhExceptions {
             expires: AtomicU64::new(expires.max(1)),
             stamp: AtomicU64::new(now),
             link: HNode::new(),
-            rcu: RcuPuts::new(),
+            rcu: RcuHead::new(),
         };
         if let Ok(e) = crate::util::kalloc::try_arc_gfp(e, Gfp::ATOMIC) {
             chain.add_head(e, &mut o);

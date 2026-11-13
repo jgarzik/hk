@@ -486,7 +486,7 @@ fn ping_get_port(s: &Arc<PingSock>, ident: u16) -> Result<u16, KernelError> {
 fn ping_unhash(s: &PingSock, ident: u16) {
     let gone = slot(&s.sk.net, ident).del_init(s, &mut PING_TABLE.lock.lock());
     if let Some(g) = gone {
-        g.defer();
+        g.defer_put();
     }
 }
 

@@ -50,7 +50,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use crate::mm::page_alloc::Gfp;
-use crate::sync::rcu::{self, RcuArc, RcuHead, RcuPuts, RcuReadGuard};
+use crate::sync::rcu::{self, RcuArc, RcuHead, RcuReadGuard};
 use crate::sync::spin::Mutex;
 use crate::sync::{IrqSpinlock, UniqueOwner};
 use crate::task::workqueue::{DelayedWork, SYSTEM_WQ};
@@ -454,7 +454,7 @@ pub struct Neighbour {
     gc_list: Link,
     gc_owner: Owner,
     /// Freed a grace period after it leaves the hash (Linux neigh->rcu)
-    rcu: RcuPuts,
+    rcu: RcuHead,
     /// Its state machine's timer (Linux neigh->timer): a pending arm
     /// holds a reference
     timer: ArcTimer<Neighbour>,
@@ -467,7 +467,7 @@ pub struct Neighbour {
 crate::hadapter!(NeighHashLink, Neighbour, hash);
 crate::owned_adapter!(pub NeighDevLink, Neighbour, dev_list, dev_owner);
 crate::owned_adapter!(NeighGcLink, Neighbour, gc_list, gc_owner);
-crate::rcu_puts!(Neighbour, rcu);
+crate::rcu_head!(Neighbour, rcu);
 
 impl Drop for Neighbour {
     /// Linux neigh_destroy: the queue goes with it
@@ -727,7 +727,7 @@ impl NeighTable {
                 dev_owner: Owner::new(),
                 gc_list: Link::new(),
                 gc_owner: Owner::new(),
-                rcu: RcuPuts::new(),
+                rcu: RcuHead::new(),
                 timer: ArcTimer::new(neigh_timer_handler),
                 tbl: self,
                 key: *key,
