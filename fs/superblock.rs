@@ -660,7 +660,9 @@ impl SuperBlock {
 
     /// Some mount of it is alive
     pub fn is_mounted(&self) -> bool {
-        self.s_mounts.lock().iter().any(|e| e.is_live())
+        // A mount whose last reference went may wait for its teardown,
+        // still on the list: not mounted
+        self.s_mounts.lock().iter().any(|e| e.get().is_live())
     }
 
     /// Make the file system read-only (Linux sb_prepare_remount_readonly,

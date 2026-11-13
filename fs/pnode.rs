@@ -43,7 +43,7 @@ pub enum Prop {
 }
 
 fn live(v: &mut Vec<Weak<Mount>>) -> Vec<MountRef> {
-    v.retain(|w| w.strong_count() != 0);
+    v.retain(MountRef::is_live);
     v.iter().filter_map(MountRef::try_get).collect()
 }
 

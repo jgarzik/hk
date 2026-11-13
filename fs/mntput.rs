@@ -78,9 +78,12 @@ impl MountRef {
 
     /// A reference to a list entry handed out by
     /// [`MountRef::into_counted`] while it is on the list (the caller
-    /// holds the lock that keeps it there): None only if it was not one
+    /// holds the lock that keeps it there), so it is live: None (and a
+    /// debug assertion) only if that was broken
     pub(super) fn from_entry(m: Arc<Mount>) -> Option<Self> {
-        Self::try_from_arc(m)
+        let r = Self::try_from_arc(m);
+        debug_assert!(r.is_some(), "mount: dead entry on a counted list");
+        r
     }
 
     /// The reference as a plain `Arc` that keeps its count, for a list
@@ -98,6 +101,12 @@ impl MountRef {
     /// `m` came from `into_counted` and its count was not taken back.
     pub(super) unsafe fn from_counted(m: Arc<Mount>) -> Self {
         Self(ManuallyDrop::new(m))
+    }
+
+    /// The mount `w` names still has a reference (none can be taken
+    /// once the last is gone, though its teardown may not have run)
+    pub fn is_live(w: &Weak<Mount>) -> bool {
+        w.upgrade().is_some_and(|m| m.is_live())
     }
 
     /// A non-owning link to the mount (no reference)
@@ -156,6 +165,14 @@ impl Drop for MountRef {
         if let Some(m) = r.put() {
             mntput_deferred(m);
         }
+    }
+}
+
+impl Mount {
+    /// It still has a counted reference (Linux: not MNT_DOOMED)
+    pub(super) fn is_live(&self) -> bool {
+        let n = self.mnt_count.load(Ordering::Acquire);
+        n != 0 && n != MNT_REF_DEAD
     }
 }
 
