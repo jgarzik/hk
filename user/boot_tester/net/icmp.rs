@@ -393,9 +393,15 @@ fn test_ping_peek() {
 /// table reference is released a grace period after its close (Linux
 /// SOCK_RCU_FREE, then put_net queueing cleanup_net)
 fn test_ping_netns_exit() {
+    // Linux frees a namespace from its workqueue well after the last
+    // reference; on a loaded host those left here are still held when
+    // BPF_PROG_LOAD_BIG runs, and the 512 MB guest runs out of memory.
+    // The test is for hk's teardown path.
+    if crate::helpers::host_mode() {
+        skip(b"PING_NETNS_EXIT", b"Linux frees namespaces late");
+        return;
+    }
     let mut t = T::new(b"PING_NETNS_EXIT");
-    // Few rounds: Linux frees a namespace from a workqueue later, and
-    // a loaded host lets several pile up before BPF_PROG_LOAD_BIG
     for round in 0..3 {
         let pid = sys_fork();
         if pid == 0 {
