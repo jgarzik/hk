@@ -418,6 +418,23 @@ impl Mount {
         self.parent.read().as_ref().and_then(MountRef::try_get)
     }
 
+    /// The parent mount and the mountpoint in it, borrowed from a
+    /// locking read of MOUNT_LOCK (Linux mnt_parent, mnt_mountpoint
+    /// under mount_lock): no reference taken. None for a mount on no
+    /// parent.
+    pub fn up<'a>(&'a self, _ml: &'a MntHash) -> Option<(&'a Mount, &'a Dentry)> {
+        let parent = self.parent.read().as_ref().map(Weak::as_ptr)?;
+        let mp = self.mountpoint.read().as_ref().map(Arc::as_ptr)?;
+        // SAFETY: both links change only under MOUNT_LOCK write
+        // (attach_mnt, detach_mnt, a teardown's pop_child), so they stay
+        // while `_ml` is held and `self` lives. The mountpoint is kept by
+        // `self.mountpoint`. The parent's memory is kept by a counted
+        // reference, or once those are gone by its queued teardown's
+        // `Arc`, which cannot finish (nor release its root) before
+        // unhanging `self`, under MOUNT_LOCK write.
+        Some(unsafe { (&*parent, &*mp) })
+    }
+
     /// Set parent mount
     pub fn set_parent(&self, parent: &MountRef) {
         *self.parent.write() = Some(MountRef::downgrade(parent));

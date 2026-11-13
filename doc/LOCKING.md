@@ -525,7 +525,8 @@ VFS locks (detailed order):
         ↓
     mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write, and
                    the tree's links in attach_mnt/detach_mnt; locking
-                   read in lookup_mnt and umount's MNT_EXPIRE check)
+                   read in lookup_mnt, d_path and umount's MNT_EXPIRE
+                   check)
         → SuperBlock.s_mounts (spin leaf: a new mount, a read-only
                    remount's walk)
         ↓
@@ -534,7 +535,8 @@ VFS locks (detailed order):
                    sequence read lock-free by scoped walks)
         ↓
     MntNamespace.root, Mount.{parent, mountpoint} (spin;
-                   d_path reads parent/mountpoint under RENAME_LOCK)
+                   d_path borrows parent/mountpoint under MOUNT_LOCK's
+                   locking read and RENAME_LOCK)
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across
                    i_rwsem; parent before child)
@@ -2468,9 +2470,14 @@ global `RENAME_LOCK` (write; Linux rename_lock), with both parents'
 (parent, then the moved or replaced child). The
 write guard keeps the lock's sequence odd, which scoped walks check. `is_subdir` and `d_path`
 read parents and names under `RENAME_LOCK` (read), so they see one
-consistent tree. `d_path` also climbs mounts (`Mount.parent`, then
-`Mount.mountpoint`, each read and released) inside it: RENAME_LOCK ->
-Mount fields -> d_lock; nothing takes RENAME_LOCK under a Mount lock. `d_path` and `dentry_path` copy names into a PATH_MAX buffer allocated before RENAME_LOCK (Linux prepend_buffer): nothing allocates under it. `Dentry::alloc` inserts a child under the parent's
+consistent tree. `d_path` also climbs mounts (`Mount::up`: `Mount.parent`,
+then `Mount.mountpoint`, each read and released), under MOUNT_LOCK's
+locking read taken first: MOUNT_LOCK -> RENAME_LOCK -> Mount fields ->
+d_lock; nothing takes RENAME_LOCK under a Mount lock. Like Linux
+prepend_path it takes no reference: parents (`Dentry::parent_under`),
+mountpoints and parent mounts are borrowed, pinned by those two
+locks (a teardown unhangs a submount under MOUNT_LOCK write before it
+releases anything), so nothing is dropped inside the walk. `d_path` and `dentry_path` copy names into a PATH_MAX buffer allocated before RENAME_LOCK (Linux prepend_buffer): nothing allocates under it. `Dentry::alloc` inserts a child under the parent's
 `d_lock` unless one with that name is cached (Linux d_alloc + d_add):
 one dentry per name. Deviation: Linux readers retry a seqlock instead of
 taking a lock.
