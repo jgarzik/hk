@@ -581,10 +581,12 @@ pub fn d_path(p: &Path, root: &Path) -> (Vec<u8>, bool) {
 pub fn dentry_path(d: &Arc<Dentry>) -> Result<Vec<u8>, KernelError> {
     let mut b = Prepend::new()?;
     {
-        let _r = RENAME_LOCK.read();
-        let mut cur = d.clone();
-        while let Some(p) = cur.get_parent() {
-            b.name(&cur)?;
+        let r = RenameRead {
+            _g: RENAME_LOCK.read(),
+        };
+        let mut cur: &Dentry = d;
+        while let Some(p) = cur.parent_under(&r) {
+            b.name(cur)?;
             cur = p;
         }
     }
