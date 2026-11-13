@@ -162,6 +162,16 @@ impl TimeWait {
 }
 
 impl TimeWait {
+    /// End the entry now: its namespace goes (Linux
+    /// inet_twsk_deschedule_put from tcp_twsk_purge): the timer stops,
+    /// and the entry leaves the tables
+    pub fn kill(self: &Arc<Self>) {
+        let mut g = self.inner.lock();
+        self.sync(&mut g, true);
+        drop(g);
+        self.net.tcp.tw_unhash(self);
+    }
+
     /// 2MSL passed (`ktimers/N`; Linux tw_timer_handler): the entry
     /// leaves the tables; the timer's reference goes with `tw`
     fn tw_timer(tw: Arc<TimeWait>) {

@@ -575,6 +575,24 @@ impl TcpTables {
         }
     }
 
+    /// End every TIME_WAIT entry of this namespace (Linux
+    /// tcp_twsk_purge from cleanup_net: they hold no active reference,
+    /// so the namespace goes without waiting out their 2MSL)
+    pub fn twsk_purge(&self) {
+        for t in hi().etw.iter() {
+            loop {
+                let tw = {
+                    let g = crate::sync::rcu::read_lock();
+                    t.iter_rcu(&g)
+                        .find(|e| self.mine_tw(e.get()))
+                        .map(|e| e.arc())
+                };
+                let Some(tw) = tw else { break };
+                tw.kill();
+            }
+        }
+    }
+
     /// Walk this namespace's listeners, then its connections and
     /// TIME_WAIT entries, under `g` (Linux /proc/net/tcp order:
     /// listening hash, then established hash); entries moving meanwhile

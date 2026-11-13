@@ -78,7 +78,6 @@ use crate::fs::Dentry;
 use crate::fs::proc::seq::SeqBuf;
 use crate::io::fasync::{POLL_HUP, POLL_IN};
 use crate::io::poll::{POLLOUT, POLLWRBAND, POLLWRNORM};
-use crate::net::NetNamespace;
 use crate::net::msg::{RecvMsg, SendMsg};
 use crate::net::skb::{SkBuff, SkbCb, SkbOwned, SkbOwnedQueue};
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, WakeHow, sf};
@@ -86,6 +85,7 @@ use crate::net::socket::{
     AF_UNIX, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_PEERCRED, SOCK_DGRAM, SOCK_RAW,
     SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
 };
+use crate::net::{NetNamespace, NetRef};
 use crate::sync::Mutex as SMutex;
 use crate::sync::waitqueue::{WaitEntry, WaitQueue};
 use crate::util::error::KernelError;
@@ -509,7 +509,7 @@ fn find_bsd(inode: &crate::fs::Inode) -> Option<Arc<UnixSock>> {
 
 impl UnixSock {
     /// A new socket in `net` (Linux unix_create1)
-    fn new(net: Arc<NetNamespace>, stype: i32) -> Result<Arc<Self>, KernelError> {
+    fn new(net: NetRef, stype: i32) -> Result<Arc<Self>, KernelError> {
         let qlen = net.sysctl.unix_max_dgram_qlen.load(Ordering::Relaxed) as u32;
         let s = try_arc_cyclic(|me| Self {
             peer_wake: WaitEntry::with_func(Some(dgram::peer_wake_relay), me.as_ptr() as usize),

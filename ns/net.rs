@@ -17,9 +17,12 @@
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use crate::sync::IrqSpinlock;
 use crate::sync::spin::RwLock;
+use crate::task::workqueue::{Work, Workqueue};
 use spin::Lazy;
 
 use crate::net::device::{DevList, LinkInfo, NetDevice, NetDeviceOps};
@@ -103,11 +106,67 @@ pub struct NetNamespace {
 
     /// Loopback device for this namespace
     loopback: RwLock<Option<Arc<NetDevice>>>,
+
+    /// Active references (Linux net->ns.count: [`NetRef`]s, held by
+    /// tasks' nsproxies and user sockets); the `Arc` count is the
+    /// passive one (Linux net->passive: the memory)
+    active: AtomicUsize,
+
+    /// Next on `CLEANUP_LIST` once inactive (Linux net->cleanup_list)
+    cleanup_next: AtomicPtr<NetNamespace>,
 }
+
+/// An active reference to a network namespace (Linux get_net/put_net):
+/// while one exists the namespace is listed and keeps its devices. It
+/// derefs to the namespace's `Arc` (a passive reference, Linux
+/// net->passive: the memory only), so the namespace's methods and
+/// fields are reached through it. Dropping the last one queues the
+/// namespace's teardown (Linux __put_net -> cleanup_net) and allocates
+/// nothing: any context.
+pub struct NetRef(Option<Arc<NetNamespace>>);
+
+impl NetRef {
+    /// The first active reference of a new namespace
+    fn first(ns: Arc<NetNamespace>) -> Self {
+        ns.active.store(1, Ordering::Release);
+        Self(Some(ns))
+    }
+
+    fn arc(&self) -> &Arc<NetNamespace> {
+        self.0.as_ref().expect("NetRef: taken")
+    }
+}
+
+impl core::ops::Deref for NetRef {
+    type Target = Arc<NetNamespace>;
+    fn deref(&self) -> &Arc<NetNamespace> {
+        self.arc()
+    }
+}
+
+impl Clone for NetRef {
+    /// Linux get_net: the holder keeps one already
+    fn clone(&self) -> Self {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        Self(Some(self.arc().clone()))
+    }
+}
+
+impl Drop for NetRef {
+    /// Linux put_net: the last one queues the teardown
+    fn drop(&mut self) {
+        let Some(a) = self.0.take() else { return };
+        if a.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            put_net_last(a);
+        }
+    }
+}
+
 
 impl NetNamespace {
     /// Create a new network namespace with loopback device, or ENOMEM
-    pub fn new() -> Result<Arc<Self>, KernelError> {
+    /// (Linux copy_net_ns -> setup_net)
+    pub fn create() -> Result<NetRef, KernelError> {
         // The device first: nothing to undo but itself
         let lo = try_arc(loopback_device(try_arc(LoopbackOps)?))?;
         let ns = try_arc(Self::fresh(super::inum::Inum::alloc()?)?)?;
@@ -115,7 +174,7 @@ impl NetNamespace {
     }
 
     /// The initial namespace (boot: failure cannot be reported)
-    fn new_init() -> Arc<Self> {
+    fn new_init() -> NetRef {
         let ns = Self::fresh(super::inum::Inum::fixed(super::inum::NET_INIT));
         let ns = arc_nofail(ns.expect("init_net: no memory at boot"));
         let lo = arc_nofail(loopback_device(arc_nofail(LoopbackOps)));
@@ -148,18 +207,17 @@ impl NetNamespace {
                     | u64::from(crate::random::get_random_u32()),
             ],
             loopback: RwLock::new(None),
+            active: AtomicUsize::new(0),
+            cleanup_next: AtomicPtr::new(null_mut()),
         })
     }
 
     /// List `ns` and give it its loopback device `lo`
-    fn attach(ns: Arc<Self>, lo: Arc<NetDevice>) -> Arc<Self> {
-        {
-            // Linux setup_net: list_add_tail_rcu under net_rwsem (write);
-            // namespaces gone since are pruned here
-            let mut l = NET_NAMESPACE_LIST.write();
-            l.retain(|w| w.strong_count() > 0);
-            l.push(Arc::downgrade(&ns));
-        }
+    fn attach(ns: Arc<Self>, lo: Arc<NetDevice>) -> NetRef {
+        let ns = NetRef::first(ns);
+        // Linux setup_net: list_add_tail_rcu under net_rwsem (write);
+        // `cleanup_net` unlists it
+        NET_NAMESPACE_LIST.write().push(Arc::downgrade(&ns));
 
         // Loopback device: ifindex 1, down and without addresses until
         // brought up (then 127.0.0.1/8, like Linux)
@@ -173,8 +231,27 @@ impl NetNamespace {
     ///
     /// Network namespaces don't copy state - new namespace starts fresh
     /// with only loopback device (unlike mount namespace which clones tree).
-    pub fn clone_ns(&self) -> Result<Arc<Self>, KernelError> {
-        Self::new()
+    pub fn clone_ns(&self) -> Result<NetRef, KernelError> {
+        Self::create()
+    }
+
+    /// An active reference if the namespace still has one (Linux
+    /// maybe_get_net: refcount_inc_not_zero), for a walker that reached
+    /// it through a passive one
+    pub fn maybe_get(self: &Arc<Self>) -> Option<NetRef> {
+        let mut n = self.active.load(Ordering::Relaxed);
+        loop {
+            if n == 0 {
+                return None;
+            }
+            match self
+                .active
+                .compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(NetRef(Some(self.clone()))),
+                Err(cur) => n = cur,
+            }
+        }
     }
 
     // ========================================================================
@@ -298,7 +375,7 @@ fn loopback_device(ops: Arc<LoopbackOps>) -> NetDevice {
 /// Initial (root) network namespace
 ///
 /// Physical network devices are registered here. Created lazily on first access.
-pub static INIT_NET_NS: Lazy<Arc<NetNamespace>> = Lazy::new(NetNamespace::new_init);
+pub static INIT_NET_NS: Lazy<NetRef> = Lazy::new(NetNamespace::new_init);
 
 /// Every network namespace (Linux net_namespace_list under net_rwsem,
 /// a sleeping lock): written at creation, read by the walkers; thread
@@ -306,23 +383,88 @@ pub static INIT_NET_NS: Lazy<Arc<NetNamespace>> = Lazy::new(NetNamespace::new_in
 static NET_NAMESPACE_LIST: crate::sync::RwSem<Vec<Weak<NetNamespace>>> =
     crate::sync::RwSem::new(Vec::new());
 
-/// A namespace's devices are unregistered with it (Linux cleanup_net ->
-/// default_device_exit_batch, loopback last)
-impl Drop for NetNamespace {
-    fn drop(&mut self) {
-        // Walked through `&mut`: no reader or writer is left
-        let devs = self.devices.drain().collect();
-        // Sleeping RTNL and sysfs work: deferred (Linux cleanup_net runs
-        // from a workqueue); the last reference may drop in any context
-        crate::net::rtnl::netns_exit(devs);
+/// The namespace teardown's queue (Linux netns_wq: cleanup_net waits
+/// for grace periods and takes RTNL, so it runs apart from other work)
+static NETNS_WQ: Workqueue = Workqueue::new("netns", 0);
+
+/// Namespaces whose last active reference went, each holding one
+/// passive reference (`Arc::into_raw`), linked through `cleanup_next`
+/// (Linux cleanup_list, an llist: pushed in any context)
+static CLEANUP_LIST: AtomicPtr<NetNamespace> = AtomicPtr::new(null_mut());
+
+/// The teardown work (Linux net_cleanup_work: static, so queueing it
+/// allocates nothing)
+static CLEANUP_WORK: spin::Once<Arc<IrqSpinlock<Work>>> = spin::Once::new();
+
+/// Make the teardown work (boot, before any namespace can go)
+pub fn net_ns_init() {
+    CLEANUP_WORK.call_once(|| arc_nofail(IrqSpinlock::new(Work::new(cleanup_net))));
+}
+
+/// Start the teardown queue's worker (once the scheduler runs)
+pub fn net_ns_start() {
+    if let Err(e) = NETNS_WQ.start(None) {
+        crate::printkln!("netns: no cleanup worker: {:?}", e);
     }
 }
 
-/// References to the live network namespaces, for work that takes
-/// `NET_NAMESPACE_LIST` again (registering sysfs devices sends uevents)
-pub fn all_net_ns() -> Vec<Arc<NetNamespace>> {
+/// The last active reference to `ns` went (Linux __put_net): queue its
+/// teardown with the passive reference `ns`; no allocation, any context
+fn put_net_last(ns: Arc<NetNamespace>) {
+    let p = Arc::into_raw(ns).cast_mut();
+    let mut head = CLEANUP_LIST.load(Ordering::Relaxed);
+    loop {
+        // SAFETY: `p` is the passive reference just leaked, live until
+        // `cleanup_net` takes it back
+        unsafe { (*p).cleanup_next.store(head, Ordering::Relaxed) };
+        match CLEANUP_LIST.compare_exchange_weak(head, p, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(h) => head = h,
+        }
+    }
+    let w = CLEANUP_WORK.get().expect("netns: cleanup before init");
+    NETNS_WQ.queue_work(w.clone());
+}
+
+/// Tear down the namespaces queued (Linux cleanup_net): unlist them so
+/// no walker finds them, unregister their devices (Linux
+/// default_device_exit_batch, loopback last) and end their TIME_WAIT
+/// entries (tcp_twsk_purge), wait for the callbacks queued meanwhile
+/// (rcu_barrier), then drop the passive references the list held
+fn cleanup_net() {
+    let mut nets = Vec::new();
+    let mut cur = CLEANUP_LIST.swap(null_mut(), Ordering::Acquire);
+    while !cur.is_null() {
+        // SAFETY: the passive reference `put_net_last` leaked, taken
+        // back once (the swap took the whole list)
+        let a = unsafe { Arc::from_raw(cur) };
+        cur = a.cleanup_next.load(Ordering::Relaxed);
+        nets.push(a);
+    }
+    if nets.is_empty() {
+        return;
+    }
+    NET_NAMESPACE_LIST.write().retain(|w| {
+        !nets
+            .iter()
+            .any(|n| core::ptr::eq(w.as_ptr(), Arc::as_ptr(n)))
+    });
+    for net in &nets {
+        crate::net::rtnl::netns_exit(net);
+        net.tcp.twsk_purge();
+    }
+    crate::sync::rcu::rcu_barrier();
+}
+
+/// Active references to the live network namespaces, for work that
+/// takes `NET_NAMESPACE_LIST` again (registering sysfs devices sends
+/// uevents)
+pub fn all_net_ns() -> Vec<NetRef> {
     let l = NET_NAMESPACE_LIST.read();
-    l.iter().filter_map(Weak::upgrade).collect()
+    l.iter()
+        .filter_map(Weak::upgrade)
+        .filter_map(|n| n.maybe_get())
+        .collect()
 }
 
 /// Run `f` on each live network namespace, under `net_rwsem` read (Linux
@@ -335,6 +477,6 @@ pub fn for_each_net(mut f: impl FnMut(&Arc<NetNamespace>)) {
 }
 
 /// Get the init network namespace
-pub fn init_net_ns() -> Arc<NetNamespace> {
+pub fn init_net_ns() -> NetRef {
     INIT_NET_NS.clone()
 }

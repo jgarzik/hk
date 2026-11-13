@@ -2604,7 +2604,8 @@ uevents (base/uevent.rs) broadcast under `ns::net::NET_NAMESPACE_LIST`
 (sleeping `sync::RwSem`, Linux net_namespace_list under net_rwsem: read
 by `for_each_net` and the sysfs setup's snapshot, which registers
 devices and so sends uevents after releasing it; written at namespace
-creation; thread context, a uevent is sent from a sleepable context as
+creation and by `cleanup_net` (from the `netns` workqueue, before it
+takes RTNL); thread context, a uevent is sent from a sleepable context as
 Linux's kobject_uevent), then each namespace's `NlTable.socks` -> `NlSock.rxq`;
 `ksysfs::UEVENT_HELPER` (a fixed array, Linux uevent_helper) is a spin
 leaf: show copies it out and emits after releasing it.
@@ -4406,13 +4407,23 @@ line's `IrqDesc.lock` every dispatch of the line holds), `netif_napi_del`s and f
 memory. A `NetDevice` still referenced (queued skbs) stays down and
 driverless; hk cannot wait for those references (Linux
 netdev_wait_allrefs) because skbs in socket queues hold them.
-A namespace that is gone (its last reference dropped, in any context)
-hands its devices to the system workqueue (`rtnl::netns_exit`, Linux
-cleanup_net -> default_device_exit_batch), which under RTNL closes and
-detaches each, loopback last, unlinks its addresses from their lists
-and `INET_ADDR_LST` (freed after a grace period) and removes its sysfs
-device; its FIB and sockets went with the namespace, and its
-neighbours with its devices, so nothing is announced.
+A namespace has active references (`NetRef`, Linux net->ns.count:
+tasks' nsproxies and user sockets) and passive ones (its `Arc`, Linux
+net->passive: the memory; TIME_WAIT entries, devices' back pointers,
+walkers). Dropping the last active reference, in any context (a
+socket's table reference released in `rcuc/N`), pushes the namespace
+on a lock-free list (`CLEANUP_LIST`, Linux cleanup_list) and queues one
+static work item on the `netns` workqueue, allocating nothing (Linux
+__put_net). `cleanup_net` there unlists the namespaces from
+`NET_NAMESPACE_LIST` (write), unregisters each device under RTNL
+through `rtnl::unregister_netdevice`, loopback last (Linux
+default_device_exit_batch: its addresses, routes, neighbours and
+sysfs device go), ends its TIME_WAIT entries (`TimeWait::kill`, Linux
+tcp_twsk_purge: timer stopped, unhashed), waits for queued RCU
+callbacks (`rcu_barrier`) and drops the passive references the list
+held. Walkers that reach a namespace through a passive reference take
+an active one only if it has one (`maybe_get`, Linux
+maybe_get_net).
 
 **Driver ISR rules (e1000 pattern):** read ICR (read-to-clear; 0 => not
 ours on a shared line, return false), write IMC (mask all), record causes

@@ -17,14 +17,13 @@
 //! sk_wake_async; `fasync`, a sleeping lock taken when a file is armed).
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::io::fasync::{FasyncList, POLL_ERR, POLL_IN, POLL_OUT, kill_fasync};
 use crate::io::poll::{
     POLLERR, POLLIN, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
-use crate::net::NetNamespace;
+use crate::net::NetRef;
 use crate::net::skb::{SkBuff, SkbCb, SkbQueue};
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::Cred;
@@ -130,7 +129,7 @@ pub struct Sock {
     pub stype: i32,
     pub protocol: i32,
     /// Namespace (Linux sock_net)
-    pub net: Arc<NetNamespace>,
+    pub net: NetRef,
     /// Credentials of the creator (the socket file's f_cred)
     pub cred: Cred,
     /// Readers, writers, connect/accept waiters and pollers
@@ -168,7 +167,7 @@ pub struct Sock {
 
 impl Sock {
     /// New socket state in `net`, created by the current task
-    pub fn new(net: Arc<NetNamespace>, family: u16, stype: i32, protocol: i32) -> Self {
+    pub fn new(net: NetRef, family: u16, stype: i32, protocol: i32) -> Self {
         Self {
             family,
             stype,

@@ -152,7 +152,7 @@ fn selftest_thread(_arg: usize) {
     use crate::net::inet::ifaddr::{InIfaddr, inet_insert_ifa};
     use crate::net::netlink::NlInfo;
     use crate::net::{Ipv4Addr, device::flags::IFF_UP, rtnl};
-    match crate::net::NetNamespace::new() {
+    match crate::net::NetNamespace::create() {
         Ok(net) => {
             let extra = Ipv4Addr::new(192, 0, 2, 1);
             if let Some(lo) = net.loopback() {
@@ -182,6 +182,25 @@ fn selftest_thread(_arg: usize) {
                     200,
                 );
                 check("icmp_lo_reply", left > 0, u64::from(dst.to_u32()));
+            }
+            // The last active reference goes: the namespace's teardown
+            // unregisters its devices (Linux cleanup_net)
+            if let Some(lo) = net.loopback() {
+                drop(net);
+                // Unregistered, and nothing else holds it: its neighbour
+                // entries, addresses and routes went with it
+                let done = || lo.is_gone() && alloc::sync::Arc::strong_count(&lo) == 1;
+                for _ in 0..100 {
+                    if done() {
+                        break;
+                    }
+                    sleep_ms(20);
+                }
+                check(
+                    "netns_cleanup",
+                    done(),
+                    alloc::sync::Arc::strong_count(&lo) as u64,
+                );
             }
         }
         Err(e) => check("netns_new", false, e.errno() as u64),

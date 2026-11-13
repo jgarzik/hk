@@ -41,7 +41,7 @@ pub use user::{INIT_USER_NS, UidGidExtent, UidGidMap, UserNamespace};
 pub use uts::{__NEW_UTS_LEN, INIT_UTS_NS, NewUtsname, UTS_FIELD_SIZE, UtsNamespace};
 
 use crate::ipc::{INIT_IPC_NS, IpcNamespace};
-pub use net::{INIT_NET_NS, NetNamespace, init_net_ns};
+pub use net::{INIT_NET_NS, NetNamespace, NetRef, init_net_ns};
 
 // ============================================================================
 // Namespace Clone Flags (Linux compatible)
@@ -208,7 +208,7 @@ pub struct NsProxy {
     pub ipc_ns: Arc<IpcNamespace>,
 
     /// Network namespace (network stack isolation)
-    pub net_ns: Arc<NetNamespace>,
+    pub net_ns: NetRef,
 
     /// Cgroup namespace (cgroup hierarchy virtualization)
     pub cgroup_ns: Arc<CgroupNamespace>,
@@ -422,7 +422,7 @@ pub fn current_user_ns() -> Arc<UserNamespace> {
 ///
 /// Returns the network namespace for the calling task, or the init
 /// namespace if no namespace context is set.
-pub fn current_net_ns() -> Arc<NetNamespace> {
+pub fn current_net_ns() -> NetRef {
     current()
         .nsproxy()
         .map(|ns| ns.net_ns.clone())

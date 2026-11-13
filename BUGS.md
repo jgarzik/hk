@@ -105,11 +105,6 @@ NIC removal: e1000 leaves the function's bus mastering and memory
 space on (no pci_disable_device) and its BAR mapped (no iounmap); an
 unregistered `NetDevice` lives on while queued skbs reference it
 (no netdev_wait_allrefs; it is down and driverless).
-netns: no active/passive refcount split (Linux net->ns.count vs
-net->passive), so the cleanup_net / default_device_exit_batch work
-(`rtnl::netns_exit`, from `NetNamespace`'s drop in `ns/net.rs`) runs
-after the struct is freed and cannot call `rtnl::unregister_netdevice`
-or `NetDevice::net`.
 FIB: removing every route through a device (`net/inet/fib.rs`,
 `remove_first` per route) restarts from the list head each time, under
 the table's leaf lock; Linux fib_table_flush is one walk. Path MTU
@@ -729,12 +724,7 @@ lock, spin lock or `local_irq_save` it was made under; the shutdown
 summary counts them): mostly collections grown, or copied, under spin
 locks in net, fs, io, task, cgroup and keys, and IRQ-safe locks
 in bpf maps and the swap cache. ROADMAP
-phase A (A0-A3). A ping socket's table reference is released a grace
-period after it leaves the table (`net/ping.rs`, Linux SOCK_RCU_FREE),
-in `rcuc/N` with preemption off: if that drops its network namespace's
-last reference, `NetNamespace`'s drop allocates unnamed (the device
-list it collects, the sysfs work it queues); Linux's put_net only
-queues cleanup_net.
+phase A (A0-A3).
 
 Phase A2 (net) remaining:
 - IPv4 reassembly (`net/inet/frag.rs` `FragTable.st`): Linux per-queue
@@ -748,8 +738,6 @@ Phase A2 (net) remaining:
   sleeping `FasyncList.list`; then hslot/RCU tables, sock_reuseport
   groups (GFP_ATOMIC under reuseport_lock), packet RCU sklist, netlink
   RCU portid table.
-- netns active/passive refcount split (above, Network stack gaps)
-  also removes the drop-time allocation.
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
 - TCP (`net/tcp/mod.rs`): a SYN backlogged while `listen()` owns the
