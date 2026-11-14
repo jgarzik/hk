@@ -24,6 +24,10 @@
 //! - SIGIO_NO_FASYNC: a file without fasync: FIOASYNC is ENOTTY, F_SETFL
 //!   keeps no O_ASYNC
 //! - SIGIO_OWNER_EX: F_SETOWN_EX / F_GETOWN_EX round trip a thread owner
+//! - SIGIO_PGRP_KILL: a fatal F_SETSIG signal to a process group kills
+//!   its leader and a two-thread member; a member in a ptrace stop
+//!   keeps the stop until kill(-pgrp, SIGKILL), which its tracer's wait
+//!   reports
 
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -34,6 +38,7 @@ use hk_syscall::{
     sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid, sys_setresuid, sys_setsid, sys_socket,
     sys_socketpair, sys_unlink, sys_wait4, sys_write,
 };
+use hk_syscall::{sys_kill, sys_ptrace};
 
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
@@ -72,6 +77,7 @@ pub fn run_tests() {
     test_notify();
     test_no_fasync();
     test_owner_ex();
+    test_pgrp_kill();
 }
 
 fn bit(sig: u32) -> u64 {
@@ -692,4 +698,143 @@ fn test_owner_ex() {
             (b"pid", get.pid as i64),
         ],
     );
+}
+
+const SIGKILL: u32 = 9;
+const SIGTERM: u32 = 15;
+const SIGSTOP: u32 = 19;
+const PTRACE_TRACEME: i64 = 0;
+const WNOHANG: i32 = 1;
+
+#[repr(C, align(16))]
+struct Stack([u8; 16384]);
+static mut KILL_STACK: Stack = Stack([0; 16384]);
+static mut KILL_CTID: u32 = 0;
+
+/// A thread that sleeps on a pipe no one writes (`fd`)
+extern "C" fn pgrp_kill_sleeper(fd: u64) -> ! {
+    let mut b = [0u8; 1];
+    sys_read(fd, b.as_mut_ptr(), 1);
+    sys_exit(71)
+}
+
+/// The group's leader: owner -pgrp with F_SETSIG SIGTERM; on the go
+/// byte, input makes the group's SIGIO, which kills it (exit 50 if it
+/// lives)
+fn pgrp_kill_leader(go: [i32; 2]) -> i32 {
+    setmask(0);
+    let me = sys_getpid();
+    let p = pipe();
+    if arm_to(p[0], -me) != 0 || sys_fcntl(p[0], F_SETSIG, SIGTERM as u64) != 0 {
+        return 51;
+    }
+    let mut b = [0u8; 1];
+    sys_read(go[0] as u64, b.as_mut_ptr(), 1);
+    sys_write(p[1] as u64, b"x".as_ptr(), 1);
+    50
+}
+
+/// A member with two threads, both asleep; `ready` written once the
+/// second is made (exit 70 if it lives)
+fn pgrp_kill_threads(pg: i64, ready: [i32; 2]) -> i32 {
+    setmask(0);
+    sys_setpgid(0, pg as u64);
+    let q = pipe();
+    let top = (&raw mut KILL_STACK) as u64 + 16384;
+    // SAFETY: the stack and tid word are this process's alone
+    let tid = unsafe {
+        crate::mm::fork_mm::spawn_thread(top, pgrp_kill_sleeper, q[0] as u64, &raw mut KILL_CTID)
+    };
+    if tid < 0 {
+        return 72;
+    }
+    sys_write(ready[1] as u64, b"r".as_ptr(), 1);
+    let mut b = [0u8; 1];
+    sys_read(q[0] as u64, b.as_mut_ptr(), 1);
+    70
+}
+
+/// A member in a ptrace stop for its parent (exit 60 if resumed)
+fn pgrp_kill_traced(pg: i64) -> ! {
+    sys_setpgid(0, pg as u64);
+    sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+    sys_kill(sys_getpid(), SIGSTOP);
+    sys_exit(60)
+}
+
+/// Reap `pid` within 5 s: the signal that killed it, -(status) for an
+/// exit, -1000 if it did not end
+fn killed_by(pid: i64) -> i64 {
+    let mut st = 0i32;
+    for _ in 0..500 {
+        let r = sys_wait4(pid, &mut st, WNOHANG, 0);
+        if r == pid {
+            return if st & 0x7f != 0 {
+                (st & 0x7f) as i64
+            } else {
+                -(st as i64)
+            };
+        }
+        if r < 0 {
+            return r;
+        }
+        crate::helpers::sleep_ms(10);
+    }
+    -1000
+}
+
+/// SIGIO_PGRP_KILL: a fatal F_SETSIG signal sent to a process group by
+/// SIGIO kills the leader and a two-thread member, while a member in a
+/// ptrace stop keeps its stop ('t'); kill(-pgrp, SIGKILL) then ends
+/// the stop, its tracer's wait reporting the kill (Linux send_sigio,
+/// __kill_pgrp_info under tasklist_lock, complete_signal's group kill)
+fn test_pgrp_kill() {
+    let mut t = crate::harness::T::new(b"SIGIO_PGRP_KILL");
+    let go = pipe();
+    let ready = pipe();
+    let l = sys_fork();
+    if l == 0 {
+        sys_setpgid(0, 0);
+        sys_exit(pgrp_kill_leader(go) as u64)
+    }
+    sys_setpgid(l as u64, l as u64);
+    let m = sys_fork();
+    if m == 0 {
+        sys_exit(pgrp_kill_threads(l, ready) as u64)
+    }
+    sys_setpgid(m as u64, l as u64);
+    let tr = sys_fork();
+    if tr == 0 {
+        pgrp_kill_traced(l)
+    }
+    sys_setpgid(tr as u64, l as u64);
+    let mut st = 0i32;
+    let w = sys_wait4(tr, &mut st, 0, 0);
+    let stop = if w == tr {
+        ((st >> 8) & 0xff) as i64
+    } else {
+        w
+    };
+    t.eq(b"stop", stop, SIGSTOP as i64);
+    let mut b = [0u8; 1];
+    t.eq(b"ready", sys_read(ready[0] as u64, b.as_mut_ptr(), 1), 1);
+    sys_write(go[1] as u64, b"g".as_ptr(), 1);
+    let mk = killed_by(m);
+    t.eq(b"threads", mk, SIGTERM as i64);
+    let state = crate::signal::ptrace_exit::stat_state(tr);
+    t.eq(b"traced", state as i64, b't' as i64);
+    t.eq(b"kill", sys_kill(-l, SIGKILL), 0);
+    let tk = killed_by(tr);
+    t.eq(b"traced killed", tk, SIGKILL as i64);
+    let lk = killed_by(l);
+    t.eq(b"leader", lk, SIGTERM as i64);
+    // What a failed run left
+    for (p, k) in [(l, lk), (m, mk), (tr, tk)] {
+        if k < 0 {
+            crate::helpers::reap(p);
+        }
+    }
+    close2(go);
+    close2(ready);
+    t.done();
 }
