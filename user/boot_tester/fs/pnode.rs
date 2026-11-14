@@ -6,9 +6,9 @@
 
 use crate::harness::{R, check, report_r};
 use hk_syscall::{
-    CLONE_NEWNS, O_RDONLY, Stat, sys_chdir, sys_chroot, sys_close, sys_exit, sys_fork, sys_mkdir,
-    sys_mount, sys_open, sys_pipe, sys_pivot_root, sys_read, sys_rmdir, sys_stat, sys_umount2,
-    sys_unshare, sys_wait4, sys_write,
+    CLONE_NEWNS, O_CREAT, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_chroot, sys_close, sys_exit,
+    sys_fork, sys_fstatat, sys_mkdir, sys_mount, sys_open, sys_pipe, sys_pivot_root, sys_read,
+    sys_rmdir, sys_stat, sys_umount2, sys_unshare, sys_wait4, sys_write,
 };
 
 const ENOENT: i64 = -2;
@@ -39,6 +39,123 @@ pub fn run_tests() {
     report_r(b"PIVOT_ROOT_SHARED", pivot_shared());
     report_r(b"PROPAG_PROPAGATE_FROM", propagate_from());
     report_r(b"PROPAG_NEW_SKIPPED", new_skipped());
+    report_r(b"PROPAG_TUCK", tuck());
+    report_r(b"PROPAG_UMOUNT_REPARENT", umount_reparent());
+    report_r(b"UMOUNT_LAZY_DISCONNECT", lazy_disconnect());
+}
+
+/// An umount takes a propagated copy whose only submount sits on its
+/// root, and that submount slides down to where the copy was (Linux
+/// propagate_umount's reparent)
+fn umount_reparent() -> R {
+    let dirs: [&[u8]; 2] = [b"/tmp/tr_a\0", b"/tmp/tr_b\0"];
+    mkdirs(&dirs);
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/tr_a\0") == 0, -1)?;
+        check(b"shared", set(b"/tmp/tr_a\0", MS_SHARED) == 0, -1)?;
+        sys_mkdir(b"/tmp/tr_a/x\0".as_ptr(), 0o755);
+        check(b"bind", bind(b"/tmp/tr_a\0", b"/tmp/tr_b\0") == 0, -1)?;
+        check(b"slave", set(b"/tmp/tr_b\0", MS_SLAVE) == 0, -1)?;
+        check(b"mount on slave", ramfs(b"/tmp/tr_b/x\0") == 0, -1)?;
+        check(b"marker", touch(b"/tmp/tr_b/x/m\0"), -1)?;
+        check(b"mount on master", ramfs(b"/tmp/tr_a/x\0") == 0, -1)?;
+        let u = sys_umount2(b"/tmp/tr_a/x\0".as_ptr(), 0);
+        check(b"umount", u == 0, u)?;
+        let n = lines(b"/tmp/tr_b/x");
+        check(b"copy gone", n == 1, n as i64)?;
+        check(b"slave's stays", dev(b"/tmp/tr_b/x/m\0").is_ok(), -1)
+    })();
+    sys_umount2(b"/tmp/tr_b\0".as_ptr(), MNT_DETACH);
+    sys_umount2(b"/tmp/tr_a\0".as_ptr(), MNT_DETACH);
+    rmdirs(&dirs);
+    r
+}
+
+/// A lazy umount takes every mount of the tree off its parent (Linux
+/// umount_tree): a directory open in the top one shows what was under
+/// its submount
+fn lazy_disconnect() -> R {
+    let dirs: [&[u8]; 1] = [b"/tmp/ld_a\0"];
+    mkdirs(&dirs);
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/ld_a\0") == 0, -1)?;
+        sys_mkdir(b"/tmp/ld_a/b\0".as_ptr(), 0o755);
+        check(b"submount", ramfs(b"/tmp/ld_a/b\0") == 0, -1)?;
+        check(b"marker", touch(b"/tmp/ld_a/b/m\0"), -1)?;
+        let fd = sys_open(b"/tmp/ld_a\0".as_ptr(), O_RDONLY, 0);
+        check(b"open", fd >= 0, fd)?;
+        let u = sys_umount2(b"/tmp/ld_a\0".as_ptr(), MNT_DETACH);
+        let mut st = Stat::default();
+        let seen = sys_fstatat(fd as i32, b"b/m\0".as_ptr(), &mut st, 0);
+        sys_close(fd as u64);
+        check(b"umount", u == 0, u)?;
+        check(b"submount gone", seen == ENOENT, seen)
+    })();
+    sys_umount2(b"/tmp/ld_a/b\0".as_ptr(), MNT_DETACH);
+    sys_umount2(b"/tmp/ld_a\0".as_ptr(), MNT_DETACH);
+    rmdirs(&dirs);
+    r
+}
+
+/// A propagated copy that lands where a mount already is goes under it
+/// (Linux attach_recursive_mnt's tucking): the mount there moves onto
+/// the copy's root and still shows at that place
+fn tuck() -> R {
+    let dirs: [&[u8]; 2] = [b"/tmp/tk_a\0", b"/tmp/tk_b\0"];
+    mkdirs(&dirs);
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/tk_a\0") == 0, -1)?;
+        check(b"shared", set(b"/tmp/tk_a\0", MS_SHARED) == 0, -1)?;
+        sys_mkdir(b"/tmp/tk_a/x\0".as_ptr(), 0o755);
+        check(b"bind", bind(b"/tmp/tk_a\0", b"/tmp/tk_b\0") == 0, -1)?;
+        check(b"slave", set(b"/tmp/tk_b\0", MS_SLAVE) == 0, -1)?;
+        // Not propagated: a slave sends nothing
+        check(b"mount on slave", ramfs(b"/tmp/tk_b/x\0") == 0, -1)?;
+        check(b"marker", touch(b"/tmp/tk_b/x/m\0"), -1)?;
+        check(b"mount on master", ramfs(b"/tmp/tk_a/x\0") == 0, -1)?;
+        let n = lines(b"/tmp/tk_b/x");
+        check(b"copy at slave", n == 2, n as i64)?;
+        check(b"slave's on top", dev(b"/tmp/tk_b/x/m\0").is_ok(), -1)
+    })();
+    sys_umount2(b"/tmp/tk_b\0".as_ptr(), MNT_DETACH);
+    sys_umount2(b"/tmp/tk_a\0".as_ptr(), MNT_DETACH);
+    rmdirs(&dirs);
+    r
+}
+
+/// Create the empty file `p`
+fn touch(p: &[u8]) -> bool {
+    let fd = sys_open(p.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if fd < 0 {
+        return false;
+    }
+    sys_close(fd as u64);
+    true
+}
+
+/// The lines of /proc/self/mountinfo whose mount point is `mp`
+fn lines(mp: &[u8]) -> usize {
+    let mut buf = [0u8; 8192];
+    let n = read_info(b"/proc/self/mountinfo\0", &mut buf);
+    buf[..n]
+        .split(|&c| c == b'\n')
+        .filter(|l| l.split(|&c| c == b' ').nth(4) == Some(mp))
+        .count()
+}
+
+/// Read the mountinfo file `file` into `buf`: the bytes read
+fn read_info(file: &[u8], buf: &mut [u8]) -> usize {
+    let fd = sys_open(file.as_ptr(), O_RDONLY, 0);
+    let mut n = 0usize;
+    while fd >= 0 && n < buf.len() {
+        let r = sys_read(fd as u64, buf[n..].as_mut_ptr(), (buf.len() - n) as u64);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    sys_close(fd as u64);
+    n
 }
 
 /// `mp` has a line in /proc/self/mountinfo
@@ -120,16 +237,7 @@ fn opt(mp: &[u8], key: &[u8]) -> u64 {
 /// [`opt`] in the mountinfo file `file`
 fn opt_in(file: &[u8], mp: &[u8], key: &[u8]) -> u64 {
     let mut buf = [0u8; 8192];
-    let fd = sys_open(file.as_ptr(), O_RDONLY, 0);
-    let mut n = 0usize;
-    while fd >= 0 && n < buf.len() {
-        let r = sys_read(fd as u64, buf[n..].as_mut_ptr(), (buf.len() - n) as u64);
-        if r <= 0 {
-            break;
-        }
-        n += r as usize;
-    }
-    sys_close(fd as u64);
+    let n = read_info(file, &mut buf);
     let Some(line) = buf[..n]
         .split(|&c| c == b'\n')
         .find(|l| l.split(|&c| c == b' ').nth(4) == Some(mp))

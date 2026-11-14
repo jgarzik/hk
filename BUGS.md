@@ -510,12 +510,8 @@ glibc's helper thread), and hk has no such path.
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
 Accepted without effect: MS_SILENT, MS_MANDLOCK, MS_POSIXACL,
-MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated
-copy lands on top of what is already mounted at the target (Linux
-tucks it under); an umount keeps a propagated copy with anything
-mounted on it (Linux takes it and slides a mount on its root down:
-propagate_umount's reparent); copies of a namespace are always peers
-and not locked (see "Before user namespaces grant capabilities").
+MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): copies of a
+namespace are always peers and not locked (see "Before user namespaces grant capabilities").
 Mount options are
 parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
 cp437 only), ramfs (mode=), tmpfs and devtmpfs (see "tmpfs gaps") and
@@ -523,10 +519,6 @@ procfs (hidepid=, gid=, subset=pid; devtmpfs drops a new mount's after
 parsing them, as Linux 6.15+); cgroupfs ignores its own, and only
 procfs, tmpfs and devtmpfs apply options on a remount or show them in
 /proc/mounts.
-Crossing into a mount scans the current mount's children under
-`MOUNT_LOCK`'s locking read, one global spin lock for every walk at a
-mountpoint (Linux hashes (parent, mountpoint): mount_hashtable, looked
-up under RCU and the mount_lock sequence).
 
 ## nullfs gaps
 

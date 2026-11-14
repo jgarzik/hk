@@ -767,6 +767,17 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
         A::owner(item).0.store(self.id, Relaxed);
     }
 
+    /// Prepend `item` (Linux list_add); panics if it is on a list
+    /// through this link
+    pub fn push_front(&mut self, item: P) {
+        let p = core::ptr::from_ref::<A::Item>(&item);
+        self.list.push_front(item);
+        // SAFETY: on this list now, which keeps it live
+        let item = unsafe { &*p };
+        // INVARIANT: on this list from here (the push claimed its link)
+        A::owner(item).0.store(self.id, Relaxed);
+    }
+
     /// Take `item` off and hand back the list's reference; None if it
     /// is not on this list
     pub fn remove(&mut self, item: &A::Item) -> Option<P> {
