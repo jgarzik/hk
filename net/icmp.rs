@@ -31,6 +31,7 @@ use crate::net::ethernet::PktType;
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IP_HLEN_MIN, IPPROTO_ICMP, IpParams, Ipv4Addr, ip_checksum, pmtu};
+use crate::net::mib::*;
 use crate::net::skb::SkBuff;
 use crate::sync::waitqueue::WaitQueue;
 
@@ -51,6 +52,9 @@ pub mod icmp_type {
     pub const ADDRESSREPLY: u8 = 18;
     /// Highest known type (NR_ICMP_TYPES)
     pub const MAX: u8 = 18;
+    /// RFC 8335 PROBE request and reply
+    pub const EXT_ECHO: u8 = 42;
+    pub const EXT_ECHOREPLY: u8 = 43;
 }
 
 /// Codes
@@ -258,16 +262,30 @@ fn limited(net: &NetNamespace, ty: u8, code: u8) -> bool {
 // ============================================================================
 
 /// Receive an ICMP packet (from ip_local_deliver; thread context; the
-/// receiving device's namespace)
+/// receiving device's namespace), counted as Linux icmp_rcv does
 pub fn icmp_rcv(skb: SkBuff) {
     let Some(net) = skb.net() else {
         return;
     };
+    let icmp = &net.mib.icmp;
+    icmp.inc(ICMP_MIB_INMSGS);
     let d = skb.data();
-    if d.len() < ICMP_HLEN || ip_checksum(d) != 0 {
+    if ip_checksum(d) != 0 {
+        icmp.inc(ICMP_MIB_CSUMERRORS);
+        icmp.inc(ICMP_MIB_INERRORS);
+        return;
+    }
+    if d.len() < ICMP_HLEN {
+        icmp.inc(ICMP_MIB_INERRORS);
         return;
     }
     let ty = d[0];
+    net.mib.icmpmsg_in(ty);
+    if ty == icmp_type::EXT_ECHO {
+        // PROBE (RFC 8335): answered only with icmp_echo_enable_probe,
+        // which hk does not have (Linux's default is off)
+        return;
+    }
     if skb.ip_bcast {
         // Linux icmp_rcv: errors to broadcasts are bogus; echo per sysctl
         use icmp_type::*;
@@ -275,8 +293,15 @@ pub fn icmp_rcv(skb: SkBuff) {
         if (echo && net.sysctl.icmp_echo_ignore_bcast())
             || !(echo || ty == ADDRESS || ty == ADDRESSREPLY)
         {
+            icmp.inc(ICMP_MIB_INERRORS);
             return;
         }
+    }
+    // Linux: echo replies go to ping first (no PROBE replies here: hk
+    // never sends PROBEs); past that, an unknown type is an error
+    if ty > icmp_type::MAX && ty != icmp_type::EXT_ECHOREPLY {
+        icmp.inc(ICMP_MIB_INERRORS);
+        return;
     }
     match ty {
         icmp_type::ECHO => icmp_echo(&net, &skb),
@@ -307,9 +332,12 @@ fn icmp_echo(net: &NetNamespace, skb: &SkBuff) {
     }
     let req = skb.data();
     let Some(mut out) = SkBuff::alloc_tx(req.len(), Gfp::ATOMIC) else {
+        // Linux icmp_push_reply: ip_append_data failed
+        net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
         return;
     };
     if out.put_slice(req).is_none() {
+        net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
         return;
     }
     let h = out.data_mut();
@@ -390,11 +418,12 @@ impl IcmpErr<'_> {
 fn icmp_unreach(net: &NetNamespace, skb: &SkBuff) {
     let d = skb.data();
     let inner = &d[ICMP_HLEN..];
-    if inner.len() < IP_HLEN_MIN || inner[0] >> 4 != 4 {
-        return;
-    }
-    let ihl = ((inner[0] & 0x0f) as usize) * 4;
-    if ihl < IP_HLEN_MIN || inner.len() < ihl + 8 {
+    let ihl = inner.first().map_or(0, |b| usize::from(b & 0x0f) * 4);
+    // Linux icmp_unreach / icmp_socket_deliver: a quote too short or
+    // mangled is an input error
+    if inner.len() < IP_HLEN_MIN || inner[0] >> 4 != 4 || ihl < IP_HLEN_MIN || inner.len() < ihl + 8
+    {
+        net.mib.icmp.inc(ICMP_MIB_INERRORS);
         return;
     }
     let (ty, code) = (d[0], d[1]);
@@ -511,6 +540,7 @@ pub fn icmp_send(net: &NetNamespace, o: &Offender<'_>, ty: u8, code: u8, rest: [
     // Rate limits apply to the ratemask types, not to loopback input
     let apply = limited(net, ty, code) && !o.in_lo;
     if apply && !net.icmp.global_allow(net, now) {
+        net.mib.icmp.inc(ICMP_MIB_RATELIMITGLOBAL);
         return;
     }
     let p = o.pkt;
@@ -531,6 +561,7 @@ pub fn icmp_send(net: &NetNamespace, o: &Offender<'_>, ty: u8, code: u8, rest: [
     if apply {
         let timeout = net.sysctl.icmp_ratelimit.load(Ordering::Relaxed).max(0) as u64;
         if timeout != 0 && !rt.dev.is_loopback() && !net.icmp.peer_allow(src, now, timeout) {
+            net.mib.icmp.inc(ICMP_MIB_RATELIMITHOST);
             return;
         }
         net.icmp.consume();
@@ -563,12 +594,15 @@ fn xmit(
     tos: u8,
 ) {
     let Some(mut skb) = SkBuff::alloc_tx(ICMP_HLEN + data.len(), Gfp::ATOMIC) else {
+        // Linux icmp_push_reply: ip_append_data failed
+        net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
         return;
     };
     if skb.put_slice(&[ty, code, 0, 0]).is_none()
         || skb.put_slice(&rest).is_none()
         || skb.put_slice(data).is_none()
     {
+        net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
         return;
     }
     let c = ip_checksum(skb.data());

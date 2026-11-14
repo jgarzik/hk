@@ -148,6 +148,7 @@ impl TimeWait {
             return Some(skb);
         }
         let mut cb = g.0.cb(super::cfg(&self.net));
+        cb.mib = Some(Arc::clone(&self.net.mib));
         cb.input(&s, skb, now, &mut out);
         g.0 = TwCb::from_cb(&cb);
         self.post(&mut g, &out);

@@ -64,6 +64,7 @@ pub mod filter;
 pub mod icmp;
 pub mod inet;
 pub mod ipv4;
+pub mod mib;
 pub mod msg;
 #[path = "core/neigh.rs"]
 pub mod neigh;

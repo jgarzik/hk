@@ -2376,8 +2376,10 @@ fn procfs_mount(
 
     // /proc/net: contents follow the reader's network namespace
     let net = root.dir(&sb, "net")?;
-    let net_files: [(&str, ContentGenerator); 7] = [
+    let net_files: [(&str, ContentGenerator); 9] = [
         ("dev", crate::net::proc::proc_net_dev),
+        ("netstat", crate::net::proc::proc_net_netstat),
+        ("snmp", crate::net::proc::proc_net_snmp),
         ("route", crate::net::proc::proc_net_route),
         ("arp", crate::net::arp::proc_net_arp),
         ("udp", crate::net::udp::proc_net_udp),

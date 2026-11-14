@@ -32,6 +32,7 @@ use crate::net::icmp::{self, IcmpErr, icmp_type};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IP_HLEN_MIN, IPPROTO_ICMP, Ipv4Addr, ip_checksum, pmtu};
+use crate::net::mib::IPSTATS_MIB_OUTDISCARDS;
 use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, RecvMsg, SendMsg};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
@@ -160,6 +161,14 @@ impl RawSock {
         if data.len() < IP_HLEN_MIN {
             return Err(KernelError::InvalidArgument);
         }
+        // Linux raw_send_hdrinc's error path past the size checks
+        self.xmit_hdrinc(rt, data, mtu)
+            .inspect_err(|_| self.sk.net.mib.ip.inc(IPSTATS_MIB_OUTDISCARDS))
+    }
+
+    /// The header of an IP_HDRINCL packet completed, then out along
+    /// `rt` (without __ip_local_out, so not in OutRequests, as Linux)
+    fn xmit_hdrinc(&self, rt: &route::Rtable, data: &[u8], mtu: usize) -> Result<(), KernelError> {
         let ihl = ((data[0] & 0x0f) as usize) * 4;
         if ihl > data.len() || ihl < IP_HLEN_MIN {
             return Err(KernelError::InvalidArgument);
@@ -185,6 +194,9 @@ impl RawSock {
         let c = ip_checksum(&h[..ihl]);
         h[10..12].copy_from_slice(&c.to_be_bytes());
         let saddr = Ipv4Addr::from_be_bytes([h[12], h[13], h[14], h[15]]);
+        if h[9] == IPPROTO_ICMP && data.len() >= ihl + icmp::ICMP_HLEN {
+            self.sk.net.mib.icmp_out_count(h[ihl]);
+        }
         ipv4::ip_output(&self.sk.net, rt, skb, saddr, mtu)
     }
 }
@@ -465,7 +477,7 @@ pub fn raw_deliver(net: &NetNamespace, skb: &SkBuff) -> bool {
             continue;
         }
         dgram::prepare(&mut c, info, 0);
-        s.rxq.enqueue(&s.sk, c);
+        let _ = s.rxq.enqueue(&s.sk, c);
     }
     true
 }
