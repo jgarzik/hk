@@ -38,6 +38,12 @@ pub const TCSBRK: u32 = 0x5409;
 pub const TCXONC: u32 = 0x540A;
 /// Flush queues
 pub const TCFLSH: u32 = 0x540B;
+
+/// TCXONC arguments (asm-generic/termbits.h)
+const TCOOFF: u64 = 0;
+const TCOON: u64 = 1;
+const TCIOFF: u64 = 2;
+const TCION: u64 = 3;
 /// Set exclusive mode
 pub const TIOCEXCL: u32 = 0x540C;
 /// Clear exclusive mode
@@ -78,6 +84,10 @@ pub const TIOCSSOFTCAR: u32 = 0x541A;
 pub const FIONREAD: u32 = 0x541B;
 /// Alias for FIONREAD
 pub const TIOCINQ: u32 = FIONREAD;
+/// Get serial port settings (struct serial_struct)
+pub const TIOCGSERIAL: u32 = 0x541E;
+/// Set serial port settings
+pub const TIOCSSERIAL: u32 = 0x541F;
 /// Give up controlling terminal
 pub const TIOCNOTTY: u32 = 0x5422;
 /// Set line discipline
@@ -109,7 +119,7 @@ fn get<T: FromBytes>(arg: u64) -> Result<T, KernelError> {
 /// Wait until the output is sent (Linux tty_wait_until_sent); a
 /// pending signal ends the call with EINTR
 fn drain(tty: &Tty) -> Result<(), KernelError> {
-    tty.wait_until_sent();
+    tty.wait_until_sent(0);
     if crate::sync::waitqueue::signal_pending() {
         return Err(KernelError::Interrupted);
     }
@@ -149,7 +159,7 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
             arg,
             i32::try_from(tty.bytes_available()).unwrap_or(i32::MAX),
         ),
-        TIOCOUTQ => put(arg, 0i32), // output is written synchronously
+        TIOCOUTQ => put(arg, tty.chars_in_buffer().min(i32::MAX as usize) as i32),
         TIOCGPGRP => put(arg, pid_i32(jobctrl::tiocgpgrp(tty)?)),
         TIOCSPGRP => {
             jobctrl::tiocspgrp(tty, get::<i32>(arg)?)?;
@@ -188,7 +198,13 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
             drain(tty)?;
             Ok(0)
         }
-        TIOCSBRK | TIOCCBRK | TCXONC | TIOCEXCL | TIOCNXCL => Ok(0),
+        TCXONC => tcxonc(tty, arg),
+        TIOCGSERIAL => put(arg, tty.get_serial()?),
+        TIOCSSERIAL => {
+            tty.set_serial(&get::<super::SerialStruct>(arg)?)?;
+            Ok(0)
+        }
+        TIOCSBRK | TIOCCBRK | TIOCEXCL | TIOCNXCL => Ok(0),
         // No modem control: the lines read as asserted, sets are ignored
         TIOCMGET => put(
             arg,
@@ -204,6 +220,26 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
         }
         _ => Err(KernelError::NotTty),
     }
+}
+
+/// TCXONC (Linux n_tty_ioctl_helper): stop or restart output, or send
+/// the STOP or START character unless disabled (_POSIX_VDISABLE, 0)
+fn tcxonc(tty: &Tty, arg: u64) -> Result<i64, KernelError> {
+    use crate::tty::termios::{VSTART, VSTOP};
+    let xchar = |i: usize| {
+        let ch = tty.get_termios().c_cc[i];
+        if ch != 0 {
+            tty.send_xchar(ch);
+        }
+    };
+    match arg {
+        TCOOFF => tty.tcooff(),
+        TCOON => tty.tcoon(),
+        TCIOFF => xchar(VSTOP),
+        TCION => xchar(VSTART),
+        _ => return Err(KernelError::InvalidArgument),
+    }
+    Ok(0)
 }
 
 /// A pid as the user's pid_t

@@ -37,6 +37,7 @@ pub mod syscall;
 pub mod sysctl;
 pub mod system_state;
 pub mod time;
+pub mod trace;
 pub mod uaccess;
 
 // Device subsystems
@@ -302,9 +303,12 @@ pub(crate) fn kmain() -> ! {
 
     // Linux vfs_caches_init: dcache_init (the dentry hash table, sized
     // to RAM), files_init (the files' delayed release), then mnt_init
-    // (the mounts' delayed teardown here; the tree below)
-    fs::dentry::dcache_init(FRAME_ALLOCATOR.stats().total_bytes / 4096);
+    // (the mount and mountpoint hash tables, sized to RAM, and the
+    // mounts' delayed teardown here; the tree below)
+    let pages = FRAME_ALLOCATOR.stats().total_bytes / 4096;
+    fs::dentry::dcache_init(pages);
     fs::file::files_init();
+    fs::mount::mnt_hash_init(pages);
     fs::mntput::mnt_init();
     // Linux order: mnt_init (start_kernel), then do_basic_setup:
     // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
@@ -317,6 +321,8 @@ pub(crate) fn kmain() -> ! {
     fs::ramfs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();
+    // tracefs (Linux tracefs_init, a core initcall; trace files, fs_initcall)
+    trace::init();
     // sock_init, a core initcall after kernel/'s (ksysfs)
     pseudo_init(&fs::pseudo::SOCKFS);
     base::topology_init();
@@ -341,6 +347,8 @@ pub(crate) fn kmain() -> ! {
     hw::usb::usb_init();
     hw::usb::USB_SERIAL_DRIVER.register();
     hw::usb::msc::USB_STORAGE_DRIVER.register();
+    // xhci-hcd's trace events (Linux: its module's trace system)
+    trace::register_system(&hw::usb::xhci::TRACE_SYSTEM);
     hw::usb::xhci::XHCI_PCI_DRIVER.register();
     hw::net::E1000_DRIVER.register();
     hw::virtio::virtio_init();

@@ -20,6 +20,7 @@ const EC_PC_ALIGN: u64 = 0x22; // PC alignment fault
 const EC_DABORT_LOWER: u64 = 0x24; // Data abort from lower EL
 const EC_DABORT_SAME: u64 = 0x25; // Data abort from same EL
 const EC_SP_ALIGN: u64 = 0x26; // SP alignment fault
+const EC_SOFTSTP_LOWER: u64 = 0x32; // Software step from lower EL
 const EC_BRK: u64 = 0x3C; // BRK instruction
 
 // Exception vector table symbol (defined in vectors.S)
@@ -193,6 +194,7 @@ fn irq_dispatch() {
 /// Handle synchronous exception from EL0 (user mode)
 #[unsafe(no_mangle)]
 extern "C" fn handle_el0_sync(frame: &UserFrame, esr: u64) {
+    super::ptrace::enter_from_user();
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x1FFFFFF;
     // Not a syscall frame unless it is one (Linux el0t_64_sync)
@@ -264,6 +266,10 @@ extern "C" fn handle_el0_sync(frame: &UserFrame, esr: u64) {
             if res.is_err() {
                 user_abort(frame, esr, far, iss & 0x3F, res);
             }
+        }
+        EC_SOFTSTP_LOWER => {
+            super::cpu::enable_interrupts();
+            super::ptrace::el0_softstep(frame);
         }
         EC_BRK => {
             // brk #imm: PC still points at it
@@ -400,6 +406,7 @@ fn user_fault(frame: &UserFrame, sig: Signal, code: i32, addr: u64, trap: TrapSe
 /// Handle IRQ from EL0 (user mode)
 #[unsafe(no_mangle)]
 extern "C" fn handle_el0_irq(frame: &UserFrame) {
+    super::ptrace::enter_from_user();
     // SAFETY: a field store
     unsafe { frame.with(|f| f.syscallno = super::NO_SYSCALL) };
     irq_body();

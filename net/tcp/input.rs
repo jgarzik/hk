@@ -19,6 +19,7 @@ use super::cb::{
     MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TIMEWAIT_LEN,
     TcpCb, TcpState, Tmr, after, before, between, flags, wake,
 };
+use crate::net::mib::*;
 use crate::net::skb::SkBuff;
 use crate::util::error::KernelError;
 use alloc::boxed::Box;
@@ -45,12 +46,19 @@ impl TcpCb {
         if ack_ok
             && (!after(s.ack, self.iss) || after(s.ack, self.snd_max) || !self.synack_ts_ok(s))
         {
+            if after(s.ack, self.iss) && !after(s.ack, self.snd_max) {
+                // In range, so the echoed timestamp failed
+                self.net_stat(LINUX_MIB_PAWSACTIVEREJECTED);
+            }
             if !s.has(flags::RST) {
-                out.ctl(Seg {
-                    seq: s.ack,
-                    flags: flags::RST,
-                    ..Default::default()
-                });
+                self.reset_seg(
+                    Seg {
+                        seq: s.ack,
+                        flags: flags::RST,
+                        ..Default::default()
+                    },
+                    out,
+                );
             }
             return;
         }
@@ -66,7 +74,8 @@ impl TcpCb {
         self.syn_rcvd(s, now);
         if !ack_ok {
             // Simultaneous open: SYN-ACK from our ISS, wait for its ACK
-            self.state = TcpState::SynReceived;
+            // (not in OutSegs: its end is not beyond SND.NXT, as Linux)
+            self.set_state(TcpState::SynReceived);
             self.syn_seg(out);
             return;
         }
@@ -92,11 +101,13 @@ impl TcpCb {
     /// The handshake completed with `s`
     fn established(&mut self, s: &SegIn, now: u64, out: &mut Out) {
         // shutdown(SHUT_WR) in SYN_RECEIVED queued a FIN
-        self.state = if self.fin_queued {
+        self.set_state(if self.fin_queued {
             TcpState::FinWait1
         } else {
             TcpState::Established
-        };
+        });
+        // Linux tcp_create_openreq_child: the request became a socket
+        self.tcp_stat_if(self.passive, TCP_MIB_PASSIVEOPENS);
         self.snd_wnd = self.seg_wnd(s);
         self.max_wnd = self.max_wnd.max(self.snd_wnd);
         self.snd_wl1 = s.seq;
@@ -198,30 +209,46 @@ impl TcpCb {
             // tcp_check_req, rate limited)
             if !self.oow_recent() {
                 self.rtx_synack(now, out);
+            } else {
+                self.net_stat(LINUX_MIB_TCPACKSKIPPEDSYNRECV);
             }
             return;
         }
         if self.paws_reject(s) {
             if s.has(flags::SYN) {
-                self.challenge_ack(out);
-            } else if !(s.seq_len() == 0 && before(s.seq, self.rcv_nxt)) && !self.oow_limited(s) {
+                self.syn_challenge(out);
+                return;
+            }
+            self.net_stat(if self.state == TcpState::TimeWait {
+                LINUX_MIB_PAWS_TW_REJECTED
+            } else {
+                LINUX_MIB_PAWSESTABREJECTED
+            });
+            if !(s.seq_len() == 0 && before(s.seq, self.rcv_nxt))
+                && !self.oow_limited(s, LINUX_MIB_TCPACKSKIPPEDPAWS)
+            {
                 self.send_ack(out); // dupack (an old pure ACK is just dropped)
             }
             return;
         }
         if !self.acceptable(s) {
             if s.has(flags::SYN) {
-                self.challenge_ack(out);
-            } else if !s.has(flags::RST) && !self.oow_limited(s) {
+                self.syn_challenge(out);
+            } else if !s.has(flags::RST) && !self.oow_limited(s, LINUX_MIB_TCPACKSKIPPEDSEQ) {
                 self.dupack(s, out);
             }
             return;
         }
         if s.has(flags::RST) {
-            if s.seq == self.rcv_nxt {
+            if s.seq != self.rcv_nxt {
+                self.challenge_ack(out); // RFC 5961 3.2
+            } else if req {
+                // Linux tcp_check_req: the request dies (embryonic_reset)
+                self.tcp_stat(TCP_MIB_ATTEMPTFAILS);
+                self.net_stat(LINUX_MIB_EMBRYONICRSTS);
                 self.on_reset(out);
             } else {
-                self.challenge_ack(out); // RFC 5961 3.2
+                self.on_reset(out);
             }
             return;
         }
@@ -229,12 +256,14 @@ impl TcpCb {
             if req {
                 // A new SYN in window: reset, drop the request (Linux
                 // tcp_check_req embryonic_reset)
+                self.tcp_stat(TCP_MIB_ATTEMPTFAILS);
                 if let Some(r) = super::output::reset_for(s) {
-                    out.ctl(r);
+                    self.reset_seg(r, out);
                 }
+                self.net_stat(LINUX_MIB_EMBRYONICRSTS);
                 self.set_closed(out);
             } else {
-                self.challenge_ack(out); // RFC 5961 4.2
+                self.syn_challenge(out); // RFC 5961 4.2
             }
             return;
         }
@@ -243,11 +272,14 @@ impl TcpCb {
         }
         if self.state == TcpState::SynReceived {
             if !after(s.ack, self.snd_una) || after(s.ack, self.snd_max) {
-                out.ctl(Seg {
-                    seq: s.ack,
-                    flags: flags::RST,
-                    ..Default::default()
-                });
+                self.reset_seg(
+                    Seg {
+                        seq: s.ack,
+                        flags: flags::RST,
+                        ..Default::default()
+                    },
+                    out,
+                );
                 return;
             }
             self.update_ts_recent(s);
@@ -278,20 +310,42 @@ impl TcpCb {
     }
 
     /// Linux tcp_oow_rate_limited: data segments are never limited
-    /// (they are not part of an ACK loop), pure ones and SYNs are
-    fn oow_limited(&mut self, s: &SegIn) -> bool {
+    /// (they are not part of an ACK loop), pure ones and SYNs are; a
+    /// skipped ACK counts in `mib` (TIME_WAIT's own entry in that
+    /// state)
+    fn oow_limited(&mut self, s: &SegIn, mib: usize) -> bool {
         if s.data_len() != 0 && !s.has(flags::SYN) {
             return false;
         }
-        self.oow_recent()
+        if !self.oow_recent() {
+            return false;
+        }
+        self.net_stat(if self.state == TcpState::TimeWait {
+            LINUX_MIB_TCPACKSKIPPEDTIMEWAIT
+        } else {
+            mib
+        });
+        true
     }
 
     /// RFC 5961 challenge ACK, rate limited per connection (Linux
     /// tcp_send_challenge_ack)
     fn challenge_ack(&mut self, out: &mut Out) {
-        if !self.oow_recent() {
-            self.send_ack(out);
+        if self.oow_recent() {
+            self.net_stat(LINUX_MIB_TCPACKSKIPPEDCHALLENGE);
+            return;
         }
+        self.net_stat(LINUX_MIB_TCPCHALLENGEACK);
+        self.send_ack(out);
+    }
+
+    /// A SYN on a synchronized connection (Linux tcp_validate_incoming
+    /// syn_challenge: an input error in ESTABLISHED, where
+    /// tcp_rcv_established passes syn_inerr)
+    fn syn_challenge(&mut self, out: &mut Out) {
+        self.tcp_stat_if(self.state == TcpState::Established, TCP_MIB_INERRS);
+        self.net_stat(LINUX_MIB_TCPSYNCHALLENGE);
+        self.challenge_ack(out);
     }
 
     /// An unacceptable or old segment: ACK at once (Linux
@@ -299,6 +353,7 @@ impl TcpCb {
     /// delaying ACKs for a while)
     fn dupack(&mut self, s: &SegIn, out: &mut Out) {
         if s.data_len() != 0 && before(s.seq, self.rcv_nxt) {
+            self.net_stat(LINUX_MIB_DELAYEDACKLOST);
             self.enter_quickack();
         }
         self.send_ack(out);
@@ -312,7 +367,7 @@ impl TcpCb {
         }
         match self.state {
             TcpState::FinWait1 => {
-                self.state = TcpState::FinWait2;
+                self.set_state(TcpState::FinWait2);
                 self.tmr = None;
                 self.arm_fw2(now);
                 out.wake |= wake::STATE;
@@ -371,7 +426,10 @@ impl TcpCb {
         {
             let flight = self.snd_max.wrapping_sub(self.snd_una);
             if self.cong.on_dupack(flight, self.snd_max) {
-                self.retransmit_head(out);
+                // Linux tcp_enter_recovery (Reno: no SACK) and the fast
+                // retransmit of tcp_xmit_retransmit_queue
+                self.net_stat(LINUX_MIB_TCPRENORECOVERY);
+                self.fast_retransmit(out);
             }
         }
         // Window update (SND.WL1/WL2 rule)
@@ -413,7 +471,8 @@ impl TcpCb {
         }
         self.rtx_stamp = None;
         if self.cong.on_ack(acked, ack) {
-            self.retransmit_head(out);
+            // NewReno partial ACK: the next hole, still in recovery
+            self.fast_retransmit(out);
         }
         if self.snd_una == self.snd_max {
             self.tmr = None;
@@ -451,6 +510,8 @@ impl TcpCb {
             let skip = self.rcv_nxt.wrapping_sub(seq) as usize;
             if skip > len || (skip == len && !fin) {
                 if len != 0 {
+                    // Linux tcp_data_queue: a retransmit of what we have
+                    self.net_stat(LINUX_MIB_DELAYEDACKLOST);
                     self.enter_quickack();
                 }
                 self.ack_now = true;
@@ -494,9 +555,14 @@ impl TcpCb {
         }
         if len != 0 && self.rcv_shut && self.state != TcpState::Established {
             // Data for a closed reader (Linux: abort on data in FIN_WAIT)
+            self.net_stat(LINUX_MIB_TCPABORTONDATA);
             self.abort(out);
             out.err = Some(KernelError::ConnectionReset);
             return;
+        }
+        if len != 0 && seq != self.rcv_nxt {
+            // Linux tcp_data_queue_ofo, before its memory check
+            self.net_stat(LINUX_MIB_TCPOFOQUEUE);
         }
         if len != 0 && !self.rmem_ok(seq, len, out) {
             // Dropped whole, FIN too; it comes again
@@ -553,10 +619,14 @@ impl TcpCb {
         self.mem_settle();
         out.wake |= wake::DATA;
         if !in_order {
+            self.net_stat(LINUX_MIB_TCPOFODROP);
             return false;
         }
         self.ack_nomem = true;
         self.ack_now = true;
+        if self.rcv_bytes != 0 {
+            self.net_stat(LINUX_MIB_TCPRCVQDROP);
+        }
         self.rcv_bytes == 0
     }
 
@@ -604,9 +674,9 @@ impl TcpCb {
         out.shut |= RCV_SHUTDOWN;
         out.wake |= wake::STATE | wake::FIN;
         match self.state {
-            TcpState::Established => self.state = TcpState::CloseWait,
+            TcpState::Established => self.set_state(TcpState::CloseWait),
             TcpState::FinWait1 if self.fin_acked() => self.time_wait(now, out),
-            TcpState::FinWait1 => self.state = TcpState::Closing,
+            TcpState::FinWait1 => self.set_state(TcpState::Closing),
             TcpState::FinWait2 => self.time_wait(now, out),
             _ => {}
         }

@@ -262,6 +262,13 @@ fn user_group_send(pid: u64, sig: KillSig, info: SendInfo) -> KernelResult<()> {
     sig?.map_or(Ok(()), |s| send_group_signal(&t, s, info))
 }
 
+/// [`user_group_send`] as one process of kill(-1)'s (Linux
+/// kill_something_info: PIDTYPE_MAX, delayed by a fork in progress)
+fn user_all_send(pid: u64, sig: KillSig, info: SendInfo) -> KernelResult<()> {
+    let t = group_target(pid, sig)?;
+    sig?.map_or(Ok(()), |s| crate::signal::send_all_signal(&t, s, info))
+}
+
 /// A user signal to one thread `tid`, which must be in group `tgid`
 /// if one is given (Linux do_send_specific; tkill gives none): ESRCH
 /// if it is not, then the same
@@ -349,7 +356,7 @@ fn kill_all(sig: KillSig) -> KernelResult<()> {
         if crate::task::pid::nr_ns(target_pid, ns) <= 1 || target_pid == self_tgid {
             continue;
         }
-        match user_group_send(target_pid, sig, SendInfo::User) {
+        match user_all_send(target_pid, sig, SendInfo::User) {
             // Gone between listing and now
             Err(KernelError::NoProcess) => continue,
             // Permission denied, but it exists

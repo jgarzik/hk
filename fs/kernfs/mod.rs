@@ -12,7 +12,8 @@
 //! links) is seen only through mounts of that namespace; one name may
 //! exist once per namespace (Linux KERNFS_NS).
 //!
-//! Attribute show/store run under an active reference (Linux
+//! Attribute show/store and a binary attribute's open hook run under an
+//! active reference (Linux
 //! kernfs_get_active), never under a tree lock. Removal deactivates the
 //! whole subtree first, waits for in-flight operations to drain (Linux
 //! kernfs_drain), then drops the attributes' operations (a node kept by
@@ -95,9 +96,9 @@ pub trait Attr: Send + Sync {
 }
 
 /// A binary attribute (Linux bin_attribute): raw reads and writes at an
-/// offset below `size`, no show() buffering
+/// offset below `size` (any offset if 0), no show() buffering
 pub trait BinAttr: Send + Sync {
-    /// st_size
+    /// st_size; 0: no limit (Linux sysfs_kf_bin_read)
     fn size(&self) -> u64;
 
     fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, KernelError>;
@@ -105,6 +106,14 @@ pub trait BinAttr: Send + Sync {
     fn write(&self, off: u64, data: &[u8]) -> Result<usize, KernelError> {
         let _ = (off, data);
         Err(KernelError::Io)
+    }
+
+    /// An open of the file (Linux kernfs_ops->open), under an active
+    /// reference: `writable` for an open for writing, `flags` its
+    /// open(2) flags (O_TRUNC still set)
+    fn open(&self, writable: bool, flags: u32) -> Result<(), KernelError> {
+        let _ = (writable, flags);
+        Ok(())
     }
 }
 
@@ -194,6 +203,9 @@ pub struct KNode {
     /// Namespace tag (0: untagged, visible in every mount)
     pub ns: u64,
     pub kind: Kind,
+    /// A permanently empty directory, something mounts on (Linux
+    /// KERNFS_EMPTY_DIR): nothing is added under it
+    pub empty: bool,
     /// In-flight operations, plus `DEACTIVATED` once removal starts
     active: AtomicI32,
     /// Removal waits here for `active` to drain
@@ -247,6 +259,7 @@ impl KNode {
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
             ns,
             kind,
+            empty: false,
             active: AtomicI32::new(0),
             drain: WaitQueue::new(),
             iattr: crate::sync::spin::Mutex::new(None),
@@ -358,6 +371,9 @@ impl KNode {
         if self.removed() {
             return Err(KernelError::NotFound);
         }
+        if self.empty {
+            return Err(KernelError::InvalidArgument);
+        }
         let c = self.children().ok_or(KernelError::NotDirectory)?;
         let k = key(&child.name, child.ns);
         let mut map = c.write();
@@ -372,6 +388,15 @@ impl KNode {
     /// New directory `name` (EEXIST if taken)
     pub fn create_dir(self: &Arc<Self>, name: &[u8], mode: u16) -> Result<Arc<KNode>, KernelError> {
         self.create_dir_ns(name, mode, 0)
+    }
+
+    /// New permanently empty directory `name`, r-x for all (Linux
+    /// kernfs_create_empty_dir)
+    pub fn create_empty_dir(self: &Arc<Self>, name: &[u8]) -> Result<Arc<KNode>, KernelError> {
+        let kind = Kind::Dir(RwSem::new(BTreeMap::new()));
+        let mut kn = Self::new(name, 0o555, kind);
+        kn.empty = true;
+        self.add(try_arc(kn)?)
     }
 
     /// New directory `name` tagged with namespace `ns`

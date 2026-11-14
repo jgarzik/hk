@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 use crate::sync::spin::Mutex;
 
 use crate::net::ipv4::Ipv4Addr;
+use crate::net::mib::*;
 use crate::util::kmem::{KVec, try_to_vec};
 
 /// Largest IPv4 datagram
@@ -54,8 +55,11 @@ pub enum Ins {
     More,
     /// Exact duplicate: this fragment is dropped, the queue kept
     Dup,
-    /// Corrupt or overlapping: drop the whole queue
+    /// Corrupt: drop the whole queue
     Kill,
+    /// Overlapping a stored piece: drop the whole queue (Linux
+    /// IPFRAG_OVERLAP, counted in ReasmOverlaps)
+    Overlap,
     /// All pieces present
     Done,
 }
@@ -119,7 +123,7 @@ impl FragQueue {
         match self.place(off, end) {
             Some(true) => {}
             Some(false) => return Ins::Dup,
-            None => return Ins::Kill,
+            None => return Ins::Overlap,
         }
         if self.frags.len() >= MAX_FRAGS {
             return Ins::Kill;
@@ -247,8 +251,12 @@ static ALARM: crate::time::timer::Alarm = crate::time::timer::Alarm::new(frag_ti
 impl FragTable {
     /// Add a fragment (`pkt` = whole IP packet, header validated) of a
     /// datagram for us in `net`. `high`: ipfrag_high_thresh;
-    /// `timeout`: ipfrag_time in ms.
+    /// `timeout`: ipfrag_time in ms. Counted as Linux ip_defrag does:
+    /// ReasmReqds for each, then ReasmOKs or ReasmFails (and
+    /// ReasmOverlaps) when the queue completes or dies.
     pub fn add(&self, net: &Arc<crate::net::NetNamespace>, pkt: &[u8]) -> Defrag {
+        let ip = &net.mib.ip;
+        ip.inc(IPSTATS_MIB_REASMREQDS);
         let s = &net.sysctl;
         let high = s.frag_high.load(core::sync::atomic::Ordering::Relaxed);
         let secs = s
@@ -268,6 +276,8 @@ impl FragTable {
         let now = crate::net::neigh::now_ms();
         let mut st = self.st.lock();
         if st.mem > high {
+            // Linux ip_find fails: no queue
+            ip.inc(IPSTATS_MIB_REASMFAILS);
             return Defrag::Pending;
         }
         let fresh = !st.q.contains_key(&key);
@@ -280,13 +290,23 @@ impl FragTable {
         st.mem = st.mem + after - before;
         let out = match r {
             Ins::More | Ins::Dup => Defrag::Pending,
-            Ins::Kill => {
+            Ins::Kill | Ins::Overlap => {
+                if r == Ins::Overlap {
+                    ip.inc(IPSTATS_MIB_REASM_OVERLAPS);
+                }
+                ip.inc(IPSTATS_MIB_REASMFAILS);
                 self.remove(&mut st, &key);
                 Defrag::Pending
             }
             Ins::Done => {
                 let whole = st.q.get(&key).and_then(|q| q.assemble());
                 self.remove(&mut st, &key);
+                // Linux ip_frag_reasm
+                ip.inc(if whole.is_some() {
+                    IPSTATS_MIB_REASMOKS
+                } else {
+                    IPSTATS_MIB_REASMFAILS
+                });
                 whole.map_or(Defrag::Pending, Defrag::Whole)
             }
         };
@@ -314,7 +334,7 @@ impl FragTable {
 
     /// Drop expired queues; returns the first-fragment headers of those
     /// that had one (for ICMP time exceeded) and the next expiry
-    fn expire(&self, now: u64) -> (Vec<Vec<u8>>, Option<u64>) {
+    fn expire(&self, net: &crate::net::NetNamespace, now: u64) -> (Vec<Vec<u8>>, Option<u64>) {
         let mut st = self.st.lock();
         let dead: Vec<FragKey> =
             st.q.iter()
@@ -325,6 +345,9 @@ impl FragTable {
         for k in dead {
             if let Some(q) = st.q.remove(&k) {
                 st.mem -= q.mem;
+                // Linux ip_expire
+                net.mib.ip.inc(IPSTATS_MIB_REASMFAILS);
+                net.mib.ip.inc(IPSTATS_MIB_REASMTIMEOUT);
                 if let Some(f) = q.first {
                     firsts.push(f);
                 }
@@ -353,7 +376,7 @@ fn frag_timer(_: u64) {
     let now = crate::net::neigh::now_ms();
     let mut next: Option<u64> = None;
     for net in nets {
-        let (firsts, n) = net.frags.expire(now);
+        let (firsts, n) = net.frags.expire(&net, now);
         for f in firsts {
             crate::net::icmp::frag_expired(&net, &f);
         }
@@ -403,10 +426,10 @@ mod tests {
         assert_eq!(q.insert(0, &data(16, 1), true, &HDR), Ins::More);
         assert_eq!(q.insert(0, &data(16, 1), true, &HDR), Ins::Dup);
         assert_eq!(q.insert(8, &data(8, 1), true, &HDR), Ins::Dup);
-        assert_eq!(q.insert(8, &data(16, 9), true, &HDR), Ins::Kill);
+        assert_eq!(q.insert(8, &data(16, 9), true, &HDR), Ins::Overlap);
         let mut q = FragQueue::new(0);
         assert_eq!(q.insert(16, &data(16, 1), true, &HDR), Ins::More);
-        assert_eq!(q.insert(8, &data(16, 1), true, &HDR), Ins::Kill);
+        assert_eq!(q.insert(8, &data(16, 1), true, &HDR), Ins::Overlap);
     }
 
     #[test]

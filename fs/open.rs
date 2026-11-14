@@ -1,8 +1,7 @@
 //! File open/close syscalls
 
-use alloc::sync::Arc;
-
 use super::file::EMPTY_FOPS;
+use crate::fs::DentryRef;
 use crate::fs::FileRef;
 use crate::fs::namei::{CreateAt, Last, Nd, filename_lookup, getname, path_start};
 use crate::fs::{
@@ -28,10 +27,10 @@ use crate::util::error::KernelResult;
 /// stripping, the owner comes from init_owner
 fn create_in(
     mnt: &super::mount::MountRef,
-    parent: &Arc<Dentry>,
+    parent: &DentryRef,
     name: &[u8],
     mode: u32,
-) -> Result<(Arc<Dentry>, bool), KernelError> {
+) -> Result<(DentryRef, bool), KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     if !dir.mode().is_dir() {
         return Err(KernelError::NotDirectory);

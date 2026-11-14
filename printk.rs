@@ -98,6 +98,12 @@ pub fn set_oops_in_progress() {
     OOPS_IN_PROGRESS.store(true, Ordering::Release);
 }
 
+/// A panic is printing (Linux oops_in_progress): console drivers only
+/// try their locks
+pub fn oops_in_progress() -> bool {
+    OOPS_IN_PROGRESS.load(Ordering::Acquire)
+}
+
 /// Ring buffer size (must be power of 2)
 const PRINTK_BUFFER_SIZE: usize = 16384; // 16KB
 

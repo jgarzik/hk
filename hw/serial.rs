@@ -12,6 +12,13 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 
 use crate::fs::chardev::{DevId, major};
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use crate::time::timer::{TIMER_HARD, TimerList};
+use crate::tty::serial_core::{
+    PORT_16550A, PORT_CIRRUS, PORT_STARTECH, PORT_UNKNOWN, UPF_BOOT_AUTOCONF, UPF_SKIP_TEST,
+    UPIO_PORT, UartCfg, UartDesc, UartOps, UartPort,
+};
 use crate::tty::{Tty, TtyDriver};
 
 /// NS16550A register offsets
@@ -51,7 +58,13 @@ mod lsr {
 mod ier {
     /// Received Data available Interrupt
     pub const RDI: u8 = 0x01;
+    /// Transmitter Holding Register Empty Interrupt (Linux UART_IER_THRI)
+    pub const THRI: u8 = 0x02;
 }
+
+/// Bytes the transmitter takes once THR is empty: the 16550A's FIFO
+/// (Linux tx_loadsz)
+const TX_LOADSZ: usize = 16;
 
 /// Interrupt Identification Register bits
 mod iir {
@@ -91,19 +104,57 @@ mod fcr {
 
 /// Serial port (NS16550A UART) driver
 ///
-/// Output is polled (console-safe); COM1 input comes by interrupt
-/// (`rx_irq_init`).
+/// tty output goes through the port's transmit buffer, drained by the
+/// THRE interrupt (a timer without one); console output is polled.
+/// COM1 input comes by interrupt (`rx_irq_init`).
 pub struct SerialTty {
     /// I/O port base address
     port: u16,
+    /// Its port lock and transmit buffer (Linux uart_port)
+    uart: UartPort,
+    /// IER as last written (Linux up->ier), under the port lock
+    ier: AtomicU8,
+    /// Polls the transmitter while it has no interrupt (Linux up->timer)
+    poll: &'static TimerList,
 }
 
 impl SerialTty {
     /// Create a new serial TTY
     ///
-    /// `port`: I/O port base address (e.g., 0x3F8 for COM1)
-    pub const fn new(port: u16) -> Self {
-        Self { port }
+    /// ttyS`line` at I/O port `port` (e.g., 0x3F8 for COM1) on
+    /// interrupt `irq` (Linux SERIAL_PORT_DFNS); `poll`: its
+    /// transmitter poll timer
+    pub const fn new(line: i32, port: u16, irq: i32, poll: &'static TimerList) -> Self {
+        Self {
+            port,
+            uart: UartPort::new(
+                UartDesc {
+                    type_: PORT_16550A,
+                    line,
+                    iobase: port as u32,
+                    mapbase: 0,
+                    iotype: UPIO_PORT,
+                    regshift: 0,
+                },
+                // Linux STD_COMX_FLAGS, BASE_BAUD * 16, the 16550A's FIFO
+                UartCfg {
+                    irq,
+                    flags: UPF_BOOT_AUTOCONF | UPF_SKIP_TEST,
+                    uartclk: 1_843_200,
+                    custom_divisor: 0,
+                    fifosize: TX_LOADSZ as i32,
+                },
+            ),
+            ier: AtomicU8::new(0),
+            poll,
+        }
+    }
+
+    /// Write IER (under the port lock)
+    fn set_ier(&self, v: u8) {
+        self.ier.store(v, Ordering::Relaxed);
+        // SAFETY: IER is a register of this UART
+        unsafe { self.outb(regs::IER, v) };
     }
 
     /// Initialize the UART hardware
@@ -182,8 +233,8 @@ impl SerialTty {
 
     /// Enable the receive interrupt (IER.RDI; MCR.OUT2 is set already)
     fn enable_rx_irq(&self) {
-        // SAFETY: IER is a register of this UART
-        unsafe { self.outb(regs::IER, ier::RDI) };
+        self.uart
+            .locked(|| self.set_ier(self.ier.load(Ordering::Relaxed) | ier::RDI));
     }
 
     /// Wait for transmitter to be completely empty (all bytes sent)
@@ -231,16 +282,165 @@ impl SerialTty {
     }
 }
 
-impl TtyDriver for SerialTty {
-    fn write(&self, data: &[u8]) -> Result<usize, KernelError> {
-        for &byte in data {
-            self.write_byte(byte);
+/// The 8250's transmitter (Linux serial8250_pops), under the port lock
+impl UartOps for SerialTty {
+    fn tx_burst(&self, _from_irq: bool) -> usize {
+        // SAFETY: LSR is a register of this UART
+        if unsafe { self.inb(regs::LSR) } & lsr::THRE != 0 {
+            TX_LOADSZ
+        } else {
+            0
         }
-        Ok(data.len())
+    }
+
+    fn tx_put(&self, b: u8) {
+        // SAFETY: THR is a register of this UART, empty (tx_burst)
+        unsafe { self.outb(regs::THR, b) };
+    }
+
+    /// Linux serial8250_tx_chars: the x_char alone in its round
+    fn xchar_ends_round(&self) -> bool {
+        true
+    }
+
+    /// Linux serial8250_start_tx / __stop_tx: IER.THRI
+    fn tx_irq(&self, on: bool) {
+        let v = self.ier.load(Ordering::Relaxed);
+        self.set_ier(if on { v | ier::THRI } else { v & !ier::THRI });
+    }
+
+    fn console_putc(&self, b: u8) {
+        self.write_byte(b);
+    }
+
+    fn tx_drain(&self) {
+        SerialTty::flush(self);
+    }
+
+    /// Linux serial8250_console_write: IER saved and cleared
+    fn console_begin(&self) -> u32 {
+        let v = self.ier.load(Ordering::Relaxed);
+        // SAFETY: IER is a register of this UART
+        unsafe { self.outb(regs::IER, 0) };
+        u32::from(v)
+    }
+
+    /// ... and restored once the transmitter is empty
+    fn console_end(&self, saved: u32) {
+        // SAFETY: IER is a register of this UART
+        unsafe { self.outb(regs::IER, saved as u8) };
+    }
+
+    fn arm_poll(&self) {
+        core::pin::Pin::static_ref(self.poll).mod_timer(crate::task::percpu::get_ticks() + 1);
+    }
+
+    /// Linux serial8250_verify_port: a type of uart_config (PORT_BCM7271
+    /// the last), not Cirrus or Startech
+    fn verify_port(&self, ss: &crate::tty::SerialStruct) -> Result<(), KernelError> {
+        const NR_TYPES: i32 = 77;
+        if ss.irq < 0
+            || ss.baud_base < 9600
+            || ss.type_ < PORT_UNKNOWN
+            || ss.type_ >= NR_TYPES
+            || ss.type_ == PORT_CIRRUS
+            || ss.type_ == PORT_STARTECH
+        {
+            return Err(KernelError::InvalidArgument);
+        }
+        Ok(())
+    }
+}
+
+impl TtyDriver for SerialTty {
+    /// Linux uart_write: into the transmit buffer, the transmitter
+    /// started
+    fn write(&self, tty: &Tty, data: &[u8]) -> Result<usize, KernelError> {
+        let (n, wake) = self.uart.write(self, data);
+        if wake {
+            tty.write_wakeup();
+        }
+        Ok(n)
+    }
+
+    /// Linux uart_stop
+    fn stop(&self) {
+        self.uart.stop(self);
+    }
+
+    /// Linux uart_start (the tty layer wakes writers after)
+    fn start(&self) {
+        self.uart.start(self);
+    }
+
+    /// Linux uart_send_xchar
+    fn send_xchar(&self, tty: &Tty, ch: u8) {
+        if self.uart.send_xchar(self, ch) {
+            tty.write_wakeup();
+        }
+    }
+
+    /// Linux uart_throttle
+    fn throttle(&self, tty: &Tty) {
+        if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, true) {
+            self.send_xchar(tty, ch);
+        }
+    }
+
+    /// Linux uart_unthrottle
+    fn unthrottle(&self, tty: &Tty) {
+        if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, false) {
+            self.send_xchar(tty, ch);
+        }
     }
 
     fn flush(&self) {
         SerialTty::flush(self);
+    }
+
+    fn write_room(&self) -> usize {
+        self.uart.write_room()
+    }
+
+    fn chars_in_buffer(&self) -> usize {
+        self.uart.chars_in_buffer()
+    }
+
+    fn flush_buffer(&self) {
+        self.uart.flush_buffer();
+    }
+
+    /// Linux uart_hangup
+    fn hangup(&self) {
+        self.uart.hangup(self);
+    }
+    /// Linux uart_tty_port_shutdown
+    fn shutdown(&self, console: bool) {
+        self.uart.shutdown(self, console);
+    }
+
+    /// Linux serial8250_console_write: under the port lock
+    fn console_write(&self, data: &[u8]) {
+        self.uart.console_write(self, data);
+    }
+
+    /// Linux uart_get_info
+    fn get_serial(
+        &self,
+        port: &crate::tty::TtyPort,
+    ) -> Result<crate::tty::SerialStruct, KernelError> {
+        Ok(self.uart.get_info(port))
+    }
+
+    /// Linux uart_set_info
+    fn set_serial(
+        &self,
+        port: &mut crate::tty::TtyPort,
+        ss: &crate::tty::SerialStruct,
+        users: usize,
+    ) -> Result<(), KernelError> {
+        let admin = crate::task::capable(crate::task::CAP_SYS_ADMIN);
+        self.uart.set_info(self, port, ss, users > 0, users, admin)
     }
 }
 
@@ -257,8 +457,30 @@ pub mod ports {
 }
 
 /// Static serial hardware driver instances for standard COM ports
-static SERIAL_DRIVER_S0: SerialTty = SerialTty::new(ports::COM1);
-static SERIAL_DRIVER_S1: SerialTty = SerialTty::new(ports::COM2);
+static SERIAL_DRIVER_S0: SerialTty = SerialTty::new(0, ports::COM1, 4, &POLL_S0);
+static SERIAL_DRIVER_S1: SerialTty = SerialTty::new(1, ports::COM2, 3, &POLL_S1);
+
+/// The ports' transmitter poll timers (Linux up->timer), for a port
+/// without an interrupt
+static POLL_S0: TimerList = TimerList::new(serial8250_timeout, TIMER_HARD);
+static POLL_S1: TimerList = TimerList::new(serial8250_timeout, TIMER_HARD);
+
+/// The 8250 ports, each driver with its tty (Linux serial8250_ports)
+static PORTS: [(&SerialTty, &Tty); 2] = [
+    (&SERIAL_DRIVER_S0, &SERIAL_TTY_S0),
+    (&SERIAL_DRIVER_S1, &SERIAL_TTY_S1),
+];
+
+/// A port's poll timer (Linux serial8250_timeout): the port is the one
+/// whose timer fired (Linux from_timer(up, t, timer))
+fn serial8250_timeout(t: &TimerList) {
+    let Some(&(drv, tty)) = PORTS.iter().find(|(d, _)| core::ptr::eq(d.poll, t)) else {
+        return;
+    };
+    if drv.uart.poll_tx(drv) {
+        tty.write_wakeup();
+    }
+}
 
 /// Static TTY instances wrapping the serial drivers
 ///
@@ -303,9 +525,17 @@ pub fn write_byte_com1(byte: u8) {
     SERIAL_DRIVER_S0.write_byte(byte);
 }
 
-/// COM1's interrupt handler (IRQ context): input to ttyS0
+/// COM1's interrupt handler (IRQ context; Linux serial8250_handle_irq):
+/// input to ttyS0, then the transmitter refilled under the port lock,
+/// its writers woken after
 fn com1_irq(_irq: u32) -> IrqReturn {
-    SERIAL_DRIVER_S0.rx_chars(&SERIAL_TTY_S0).into()
+    if !SERIAL_DRIVER_S0.rx_chars(&SERIAL_TTY_S0) {
+        return IrqReturn::None;
+    }
+    if SERIAL_DRIVER_S0.uart.interrupt_tx(&SERIAL_DRIVER_S0) {
+        SERIAL_TTY_S0.write_wakeup();
+    }
+    IrqReturn::Handled
 }
 
 /// Take COM1's input by interrupt (Linux serial8250_startup); `irq` is
@@ -316,6 +546,8 @@ fn rx_irq_init(irq: u32) -> Option<IrqRegistration<IrqFn>> {
         .inspect_err(|e| crate::printkln!("ttyS0: no IRQ {}: {:?}", irq, e))
         .ok()?;
     SERIAL_DRIVER_S0.enable_rx_irq();
+    // The transmitter drains by interrupt from here
+    SERIAL_DRIVER_S0.uart.set_irq(&SERIAL_DRIVER_S0, true);
     Some(reg)
 }
 
@@ -338,8 +570,8 @@ pub static SERIAL8250_DRIVER: crate::base::Driver = crate::base::Driver::new(
 /// Stop taking COM1's input by interrupt (Linux serial8250_shutdown:
 /// IER cleared, then free_irq, which waits out a running handler)
 fn rx_irq_exit(irq: IrqRegistration<IrqFn>) {
-    // SAFETY: IER is a register of COM1
-    unsafe { SERIAL_DRIVER_S0.outb(regs::IER, 0) };
+    SERIAL_DRIVER_S0.uart.set_irq(&SERIAL_DRIVER_S0, false);
+    SERIAL_DRIVER_S0.uart.locked(|| SERIAL_DRIVER_S0.set_ier(0));
     drop(irq);
 }
 
@@ -356,11 +588,14 @@ impl crate::base::Bound for Serial8250 {
     }
 
     /// Linux serial8250_remove, uart_remove_one_port per port: its tty
-    /// device and console go, its interrupt is off (no hangup of an
-    /// open tty: BUGS.md)
+    /// device goes, its tty is hung up (tty_port_tty_vhangup), its
+    /// console goes, its interrupt is off
     fn remove(&self) {
         for t in self.ttys.iter().rev() {
             t.del();
+        }
+        for tty in serial_ttys().iter().rev() {
+            tty.hangup(false);
         }
         crate::console::unregister_console(SERIAL_TTY_S0.name());
         let irq = self.irq.lock().take();
@@ -385,6 +620,9 @@ fn serial8250_probe(
         ConsolePriority::Fallback,
         crate::console::ConsoleFlags::BOOT,
     );
+    // COM2 is set up as COM1 was at boot (Linux serial8250_config_port);
+    // it has no interrupt: a timer drains its transmitter
+    SERIAL_DRIVER_S1.init_hardware(115200);
     let irq = crate::base::platform::pdev(dev).and_then(|p| p.irq);
     *port.irq.get_mut() = irq.and_then(rx_irq_init);
     port.ttys = serial_ttys()

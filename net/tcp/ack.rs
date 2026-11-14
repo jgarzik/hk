@@ -183,6 +183,7 @@ impl TcpCb {
             self.dack.ato = (self.dack.ato << 1).min(self.rto);
         }
         self.send_ack(out);
+        self.net_stat(crate::net::mib::LINUX_MIB_DELAYEDACKS);
     }
 
     /// TCP_QUICKACK (Linux __tcp_sock_set_quickack): nonzero leaves

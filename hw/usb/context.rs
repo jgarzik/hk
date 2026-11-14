@@ -441,6 +441,39 @@ impl OutputDeviceContext {
             core::ptr::write_bytes(self.dma.cpu_addr(), 0, Self::SIZE);
         }
     }
+
+    /// Dword `i` of endpoint context `dci` (1-31) as the controller
+    /// last wrote it, `ctx_size`-byte contexts (0 for a bad DCI)
+    fn ep_dword(&self, ctx_size: usize, dci: u8, i: usize) -> u32 {
+        if !(1..=31).contains(&dci) {
+            return 0;
+        }
+        let off = ctx_size * usize::from(dci) + i * 4;
+        // SAFETY: inside the 4 KiB context (31 * 64 + 16 < 4096); the
+        // controller's writes are read volatile
+        unsafe { core::ptr::read_volatile(self.dma.cpu_addr().add(off).cast::<u32>()) }
+    }
+
+    /// Endpoint `dci`'s state (Linux GET_EP_CTX_STATE)
+    pub fn ep_state(&self, ctx_size: usize, dci: u8) -> u8 {
+        (self.ep_dword(ctx_size, dci, 0) & 0x7) as u8
+    }
+
+    /// Endpoint `dci`'s TR dequeue pointer with its cycle state in bit 0
+    /// (Linux xhci_get_hw_deq)
+    pub fn ep_deq(&self, ctx_size: usize, dci: u8) -> u64 {
+        let lo = u64::from(self.ep_dword(ctx_size, dci, 2));
+        let hi = u64::from(self.ep_dword(ctx_size, dci, 3));
+        (hi << 32) | (lo & !0xe)
+    }
+}
+
+/// Endpoint context states (xHCI 6.2.3, Linux EP_STATE_*)
+pub mod ep_ctx_state {
+    pub const DISABLED: u8 = 0;
+    pub const RUNNING: u8 = 1;
+    pub const HALTED: u8 = 2;
+    pub const STOPPED: u8 = 3;
 }
 
 #[cfg(test)]

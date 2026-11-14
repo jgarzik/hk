@@ -106,8 +106,11 @@ pub struct IpcNamespace {
     pub shm_tot: AtomicU64,
     pub shm_ctlmni: u32, // Max segments (SHMMNI)
 
-    /// Its inode number (Linux ns.inum)
-    pub inum: crate::ns::inum::Inum,
+    /// Its inode number and nsfs dentry (Linux ns)
+    pub ns: crate::ns::NsCommon,
+
+    /// The user namespace that owns it (Linux ipc_namespace.user_ns)
+    pub user_ns: Arc<crate::ns::UserNamespace>,
 }
 
 impl IpcNamespace {
@@ -139,7 +142,8 @@ impl IpcNamespace {
             shm_ctlall: usize::MAX - (1 << 24), // SHMALL (pages)
             shm_tot: AtomicU64::new(0),
             shm_ctlmni: 4096, // SHMMNI
-            inum: crate::ns::inum::Inum::fixed(crate::ns::inum::IPC_INIT),
+            ns: crate::ns::NsCommon::new(crate::ns::inum::Inum::fixed(crate::ns::inum::IPC_INIT)),
+            user_ns: crate::ns::INIT_USER_NS.clone(),
         }
     }
 
@@ -147,7 +151,7 @@ impl IpcNamespace {
     ///
     /// Creates a new empty namespace with same limits.
     /// IPC objects are NOT copied - new namespace starts empty.
-    pub fn clone_ns(&self) -> KernelResult<Arc<Self>> {
+    pub fn clone_ns(&self, user_ns: &Arc<crate::ns::UserNamespace>) -> KernelResult<Arc<Self>> {
         let inum = crate::ns::inum::Inum::alloc()?;
         try_arc(Self {
             sem_ids: IpcIds::new(),
@@ -164,7 +168,8 @@ impl IpcNamespace {
             shm_ctlall: self.shm_ctlall,
             shm_tot: AtomicU64::new(0),
             shm_ctlmni: self.shm_ctlmni,
-            inum,
+            ns: crate::ns::NsCommon::new(inum),
+            user_ns: user_ns.clone(),
         })
     }
 

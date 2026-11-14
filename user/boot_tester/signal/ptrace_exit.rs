@@ -16,6 +16,10 @@
 //! - PTRACE_EXIT_IGNORED_ZOMBIE: a tracer ignoring SIGCHLD that exits
 //!   with its own traced child a zombie releases it (exit_ptrace runs
 //!   before the children are handed on); the subreaper never sees it
+//! - PTRACE_EXIT_KEEPS_SIGNAL: a tracee in a signal-delivery stop its
+//!   tracer never waited for gets that signal once the tracer exits
+//!   (Linux __ptrace_unlink leaves exit_code alone); one its tracer
+//!   waited for (exit_code taken: 0) gets none
 
 use crate::harness::verdict;
 use crate::helpers::{read_file, sleep_ms};
@@ -38,6 +42,100 @@ pub fn run_tests() {
     test_real_parent_notify();
     in_child(b"PTRACE_EXITKILL", exitkill);
     in_child(b"PTRACE_EXIT_IGNORED_ZOMBIE", exit_ignored_zombie);
+    in_child(b"PTRACE_EXIT_KEEPS_SIGNAL", || match exit_keeps(false) {
+        0 => exit_keeps(true),
+        r => r,
+    });
+}
+
+/// The write end the SIGUSR1 handler reports on (this process's copy)
+static HFD: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn note_usr1(_: i32) {
+    let fd = HFD.load(core::sync::atomic::Ordering::Relaxed);
+    sys_write(fd as u64, b"h".as_ptr(), 1);
+}
+
+/// A child with a SIGUSR1 handler is seized by a sibling tracer, which
+/// sends it SIGUSR1, sees it stop for it, waits for the stop if
+/// `waited`, and exits: the handler runs once the tracer is gone unless
+/// the stop was waited for (then nothing is delivered)
+fn exit_keeps(waited: bool) -> i32 {
+    const SIGUSR1: u32 = 10;
+    let base = if waited { 20 } else { 0 };
+    let (h, ready) = (pipe(), pipe());
+    let c = sys_fork();
+    if c == 0 {
+        HFD.store(h[1], core::sync::atomic::Ordering::Relaxed);
+        crate::io::nonblock::sigaction(SIGUSR1, note_usr1 as *const () as u64, 0);
+        // Unblocked whatever the mask this test was started with
+        let m: u64 = 1 << (SIGUSR1 - 1);
+        sys_rt_sigprocmask(1, &m as *const u64 as u64, 0, 8);
+        go(ready[1]);
+        loop {
+            sleep_ms(1000);
+        }
+    }
+    wait_go(ready[0]);
+    let r = quiet_fork();
+    if r == 0 {
+        sys_exit_group(stop_and_leave(c, waited) as u64);
+    }
+    let mut st = 0i32;
+    sys_wait4(r, &mut st, WALL, 0);
+    let res = if st != 0 {
+        10 + (st >> 8)
+    } else {
+        match (
+            handled_within(h[0], if waited { 200 } else { 5000 }),
+            waited,
+        ) {
+            (true, false) | (false, true) => 0,
+            _ => 2,
+        }
+    };
+    kill_reap(c);
+    close(&[h, ready]);
+    if res == 0 { 0 } else { base + res }
+}
+
+/// The tracer: seize `c`, send it SIGUSR1, see its signal-delivery stop
+/// (wait for it if `waited`, else watch /proc), then exit
+fn stop_and_leave(c: i64, waited: bool) -> i32 {
+    const SIGUSR1: u32 = 10;
+    if sys_ptrace(PTRACE_SEIZE, c, 0, 0) != 0 {
+        return 1;
+    }
+    if sys_kill(c, SIGUSR1) != 0 {
+        return 4;
+    }
+    if waited {
+        let mut st = 0i32;
+        let ok = sys_wait4(c, &mut st, WALL, 0) == c && st == ((SIGUSR1 as i32) << 8) | 0x7f;
+        return if ok { 0 } else { 2 };
+    }
+    for _ in 0..500 {
+        if stat_state(c) == b't' {
+            return 0;
+        }
+        sleep_ms(10);
+    }
+    3
+}
+
+/// The handler wrote on pipe `fd` within `ms`
+fn handled_within(fd: i32, ms: i64) -> bool {
+    use hk_syscall::{PollFd, Timespec, sys_ppoll};
+    let mut p = PollFd {
+        fd,
+        events: 1, // POLLIN
+        revents: 0,
+    };
+    let ts = Timespec {
+        tv_sec: ms / 1000,
+        tv_nsec: (ms % 1000) * 1_000_000,
+    };
+    sys_ppoll(&mut p, 1, &ts, 0, 8) == 1
 }
 
 /// PTRACE_EXITKILL: a middle process seizes its sleeping child with
@@ -171,7 +269,7 @@ fn chld_pending(pid: i64) -> bool {
 }
 
 /// The state letter in /proc/<pid>/stat, or 0
-fn stat_state(pid: i64) -> u8 {
+pub(crate) fn stat_state(pid: i64) -> u8 {
     let path = crate::exec::exec_identity::proc_path(pid, b"stat\0");
     let mut b = [0u8; 128];
     let n = read_file(&path, &mut b);

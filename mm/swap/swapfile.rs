@@ -13,6 +13,15 @@
 //! swap-in), never with the swap cache's lock held. `SWAP_INFO` (a
 //! spin `RwLock`, read mostly) holds the devices; `SWAPON` (a sleeping
 //! `Mutex`) serializes swapon and swapoff.
+//!
+//! Lifetime (Linux si->users, get_swap_device / put_swap_device): every
+//! use of a device by swap entry or type holds a [`SwapDev`], one count
+//! of the device's per-CPU `users` reference. swapoff, once its device
+//! is empty, kills `users`, waits out a grace period and the last
+//! [`SwapDev`], and only then drops the table's and its own `Arc`: the
+//! device is released (block device closed, swap file's inode put,
+//! which sleep) in swapoff's process context, never in a user's drop
+//! under a PTE lock.
 
 extern crate alloc;
 
@@ -26,7 +35,8 @@ use crate::sync::spin::{Mutex, RwLock};
 
 use super::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
-use crate::fs::{Inode, lookup_path};
+use crate::fs::namei::path_lookupat;
+use crate::fs::{Inode, LookupFlags, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::mm::page::frame_bytes;
 use crate::mm::xarray::XArray;
@@ -34,6 +44,8 @@ use crate::sync::IrqSpinlock;
 use crate::task::{CAP_SYS_ADMIN, capable};
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
+use crate::util::percpu_ref::PercpuRef;
+use core::ptr::NonNull;
 
 /// 512-byte sectors per page
 const SECTORS_PER_PAGE: u64 = (PAGE_SIZE / 512) as u64;
@@ -144,6 +156,47 @@ pub struct SwapInfo {
     pub(super) cache: IrqSpinlock<XArray>,
     /// Pages in the swap cache (meminfo SwapCached)
     pub(super) cached: AtomicU64,
+    /// Its users, each a [`SwapDev`] (Linux si->users)
+    users: PercpuRef,
+    /// What swapon opened (Linux si->swap_file's path): its mount stays
+    /// busy, so the swap file or device node outlives no mount of its
+    /// filesystem (umount is EBUSY meanwhile). Last, so the inode and
+    /// device go before it.
+    swap_file: Option<crate::fs::Path>,
+}
+
+impl Drop for SwapInfo {
+    /// Its backing goes (block device release, iput), which may sleep:
+    /// only swapoff (or a failed swapon) drops the last `Arc`, after
+    /// every user is gone (Linux swapoff: filp_close after the wait)
+    fn drop(&mut self) {
+        crate::sync::might_sleep();
+    }
+}
+
+/// A use of a live swap device (Linux a `swap_info_struct *` from
+/// get_swap_device): one count of its `users`, put on drop (Linux
+/// put_swap_device)
+///
+/// # Invariants
+/// Holds one count of the device's `users`, taken while `SWAP_INFO`
+/// held the device; swapoff drops its `Arc`s only after `users` is
+/// killed and drained, so the device outlives this.
+pub struct SwapDev(NonNull<SwapInfo>);
+
+impl core::ops::Deref for SwapDev {
+    type Target = SwapInfo;
+
+    fn deref(&self) -> &SwapInfo {
+        // SAFETY: the type invariant keeps the device alive
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl Drop for SwapDev {
+    fn drop(&mut self) {
+        self.users.put();
+    }
 }
 
 impl SwapInfo {
@@ -184,6 +237,8 @@ impl SwapInfo {
             inuse: AtomicU64::new(0),
             cache: IrqSpinlock::new(XArray::new()),
             cached: AtomicU64::new(0),
+            users: PercpuRef::new()?,
+            swap_file: None,
         })
     }
 
@@ -264,14 +319,27 @@ impl SwapInfo {
 // Swap device lookup
 // ============================================================================
 
-/// The device of swap type `t`
-pub fn get_swap_info(t: u8) -> Option<Arc<SwapInfo>> {
-    SWAP_INFO.read().get(t as usize)?.clone()
+/// A use of the device of swap type `t`, unless there is none or
+/// swapoff is tearing it down (Linux get_swap_device_info)
+fn get_device(t: u8) -> Option<SwapDev> {
+    let tbl = SWAP_INFO.read();
+    let si = tbl.get(t as usize)?.as_ref()?;
+    // Counted while the table holds it: swapoff kills `users` before
+    // it lets go
+    si.users
+        .tryget_live()
+        .then(|| SwapDev(NonNull::from(&**si)))
 }
 
-/// The device of `e`
-fn info_of(e: SwapEntry) -> Option<Arc<SwapInfo>> {
-    e.is_valid().then(|| get_swap_info(e.swap_type()))?
+/// A use of the device of `e`, keeping it from swapoff's teardown
+/// until dropped (Linux get_swap_device): None for an invalid entry,
+/// no device, a device going away, or an offset past its end
+pub fn get_swap_device(e: SwapEntry) -> Option<SwapDev> {
+    if !e.is_valid() {
+        return None;
+    }
+    let si = get_device(e.swap_type())?;
+    (e.offset() < si.max).then_some(si)
 }
 
 /// The type of the device at `path`
@@ -297,25 +365,28 @@ fn find_swap_by_path(path: &[u8]) -> Option<u8> {
 /// blocks at swapon and bypasses the filesystem)
 pub fn get_swap_page() -> Option<SwapEntry> {
     let reclaiming = crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC);
-    // A copy of the table (no allocation under its lock), then the
-    // usable devices in priority order
-    let mut devs = SWAP_INFO.read().clone();
-    for d in devs.iter_mut() {
-        if d.as_ref()
-            .is_some_and(|s| !s.writeok() || (reclaiming && s.inode.is_some()))
-        {
-            *d = None;
-        }
+    // Each device's priority (no reference kept past the table's lock),
+    // then the usable ones in priority order, each in use while a slot
+    // is taken from it (Linux swap_alloc_slow: get_swap_device_info)
+    let mut prio: [Option<i16>; MAX_SWAPFILES] = [None; MAX_SWAPFILES];
+    for (p, d) in prio.iter_mut().zip(SWAP_INFO.read().iter()) {
+        *p = d.as_ref().map(|s| s.priority);
     }
     loop {
-        let best = devs
+        let best = prio
             .iter()
             .enumerate()
-            .filter_map(|(i, d)| d.as_ref().map(|s| (i, s.priority)))
+            .filter_map(|(i, p)| p.map(|p| (i, p)))
             // Equal priorities: the lower type first, as before
             .max_by_key(|&(i, p)| (p, core::cmp::Reverse(i)))?
             .0;
-        let si = devs[best].take()?;
+        prio[best] = None;
+        let Some(si) = get_device(best as u8) else {
+            continue;
+        };
+        if !si.writeok() || (reclaiming && si.inode.is_some()) {
+            continue;
+        }
         if let Some(off) = si.alloc_slot() {
             return Some(SwapEntry::new(si.swap_type, off));
         }
@@ -326,7 +397,7 @@ pub fn get_swap_page() -> Option<SwapEntry> {
 /// reclaim replacing a PTE); false if the slot is free or its count is
 /// full (the caller fails with ENOMEM)
 pub fn swap_duplicate(e: SwapEntry) -> bool {
-    let Some(si) = info_of(e) else {
+    let Some(si) = get_swap_device(e) else {
         return false;
     };
     si.update(e.offset(), |c| {
@@ -339,7 +410,7 @@ pub fn swap_duplicate(e: SwapEntry) -> bool {
 /// A swap PTE referencing `e` went (Linux swap_free): the slot is freed
 /// with its last reference; the new count (cache bit included)
 pub fn swap_free(e: SwapEntry) -> u16 {
-    let Some(si) = info_of(e) else {
+    let Some(si) = get_swap_device(e) else {
         return 0;
     };
     si.update(e.offset(), |c| (c & !SWAP_HAS_CACHE != 0).then(|| c - 1))
@@ -350,7 +421,7 @@ pub fn swap_free(e: SwapEntry) -> u16 {
 /// (Linux swapcache_prepare): Err(true) if a cache page already stands
 /// for it (another reader), Err(false) if no PTE references it any more
 pub fn swapcache_prepare(e: SwapEntry) -> Result<(), bool> {
-    let si = info_of(e).ok_or(false)?;
+    let si = get_swap_device(e).ok_or(false)?;
     let mut busy = false;
     si.update(e.offset(), |c| {
         busy = c & SWAP_HAS_CACHE != 0;
@@ -363,7 +434,7 @@ pub fn swapcache_prepare(e: SwapEntry) -> Result<(), bool> {
 /// The swap-cache page of `e` is gone (Linux put_swap_folio /
 /// swapcache_clear): the slot is freed if no PTE references it
 pub fn swapcache_clear(e: SwapEntry) {
-    if let Some(si) = info_of(e) {
+    if let Some(si) = get_swap_device(e) {
         si.update(e.offset(), |c| Some(c & !SWAP_HAS_CACHE));
     }
     // A reader waiting for the claim to settle looks again
@@ -379,12 +450,12 @@ pub fn swap_wait(e: SwapEntry) -> &'static crate::sync::waitqueue::WaitQueue {
 
 /// SWAP_HAS_CACHE is set on `e`
 pub fn swapcache_busy(e: SwapEntry) -> bool {
-    info_of(e).is_some_and(|si| si.has_cache(e.offset()))
+    get_swap_device(e).is_some_and(|si| si.has_cache(e.offset()))
 }
 
 /// Swap PTEs referencing `e` (Linux swp_swapcount)
 pub fn swap_count(e: SwapEntry) -> u16 {
-    info_of(e).map_or(0, |si| si.count(e.offset()))
+    get_swap_device(e).map_or(0, |si| si.count(e.offset()))
 }
 
 /// A swap PTE was zapped (munmap, exit; Linux free_swap_and_cache): its
@@ -402,7 +473,7 @@ pub fn free_swap_and_cache(e: SwapEntry) {
 
 /// Read slot `entry` into the frame at `frame_phys` (may sleep)
 pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
-    let si = info_of(entry).ok_or(KernelError::InvalidArgument)?;
+    let si = get_swap_device(entry).ok_or(KernelError::InvalidArgument)?;
     let off = entry.offset();
     if let Some(ref inode) = si.inode {
         inode
@@ -430,7 +501,7 @@ pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
 
 /// `swap_write_page` with PF_MEMALLOC_NOIO set
 fn write_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
-    let si = info_of(entry).ok_or(KernelError::InvalidArgument)?;
+    let si = get_swap_device(entry).ok_or(KernelError::InvalidArgument)?;
     let off = entry.offset();
     if let Some(ref inode) = si.inode {
         // Not from direct reclaim (PF_MEMALLOC): the file's writepage may
@@ -490,10 +561,10 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         return Err(KernelError::NotPermitted);
     }
     let path = user_path(path)?;
-    let inode = lookup_path(&path)
-        .map_err(|_| KernelError::NotFound)?
-        .get_inode()
-        .ok_or(KernelError::NotFound)?;
+    let cwd = crate::task::percpu::current_cwd();
+    let swap_file =
+        path_lookupat(cwd, &path, LookupFlags::open()).map_err(|_| KernelError::NotFound)?;
+    let inode = swap_file.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let _g = SWAPON.lock();
     if find_swap_by_path(&path).is_some() {
         return Err(KernelError::Busy);
@@ -547,7 +618,9 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         Some(b) => (None, Some(b)),
         None => (Some(inode), None),
     };
-    let si = try_arc(SwapInfo::new(backing, path, swap_type, max, priority)?)?;
+    let mut si = SwapInfo::new(backing, path, swap_type, max, priority)?;
+    si.swap_file = Some(swap_file);
+    let si = try_arc(si)?;
     // S_SWAPFILE under i_rwsem (Linux claim_swapfile under inode_lock):
     // a write or truncate in flight finishes first, later ones see it
     let si_inode = si.swapfile_inode();
@@ -571,7 +644,10 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     lookup_path(&path)?;
     let _g = SWAPON.lock();
     let t = find_swap_by_path(&path).ok_or(KernelError::InvalidArgument)?;
-    let si = get_swap_info(t).ok_or(KernelError::InvalidArgument)?;
+    // Only swapoff takes a device out of the table, under SWAPON
+    let si = SWAP_INFO.read()[t as usize]
+        .clone()
+        .ok_or(KernelError::InvalidArgument)?;
     // No new slots from it (Linux del_from_avail_list, under si->lock:
     // an allocator past get_swap_page's filter rechecks under `map`)
     si.set_writeok(false);
@@ -579,13 +655,26 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
         si.set_writeok(true);
         return Err(e);
     }
-    SWAP_INFO.write()[t as usize] = None;
+    // Wait for every use of the device to end (Linux percpu_ref_kill,
+    // synchronize_rcu, wait_for_completion(&p->comp)): from here the
+    // last `Arc`s are the table's and this one, dropped below, so the
+    // device is released here, in process context
+    si.users.kill();
+    si.users.wait();
+    let table = SWAP_INFO.write()[t as usize].take();
     let si_inode = si.swapfile_inode();
     let lock = si_inode.lock();
     si_inode.i_swapfile.store(false, Ordering::Release);
     drop(lock);
     TOTAL_SWAP_PAGES.fetch_sub(si.max - 1, Ordering::Relaxed);
     super::swap_state::destroy_cache(&si);
+    drop(table);
+    debug_assert_eq!(
+        Arc::strong_count(&si),
+        1,
+        "swapoff: device still referenced"
+    );
+    drop(si);
     Ok(())
 }
 

@@ -11,7 +11,10 @@
 //!   (within 8MB on hk, 32MB on Linux)
 //! - MEM_SLAB_TIME_WAIT: 2000 connections closed into TIME_WAIT are all
 //!   listed in /proc/net/tcp (those not yet expired, if closing them
-//!   outlasted TIME_WAIT); on hk each entry costs at most 1KB of
+//!   outlasted TIME_WAIT), but for those reset (Linux under load: a
+//!   peer's segment arriving after its FIN fails PAWS, the TIME_WAIT's
+//!   dup ACK finds the peer gone and draws an RST, which kills it with
+//!   tcp_rfc1337 off); on hk each entry costs at most 1KB of
 //!   Slab with its table and timer entries (about 600 bytes, 860 with
 //!   LOCKDEP's lock tracking: a compact timewait entry, not a whole
 //!   control block, which was over 1.3KB;
@@ -217,6 +220,32 @@ fn cycle(l: i32, p: u16, cp: u16) -> bool {
 /// TIME_WAIT duration (Linux TCP_TIMEWAIT_LEN, hk TIMEWAIT_LEN)
 const TW_MS: u64 = 60_000;
 
+/// Tcp OutRsts of /proc/net/snmp (resets sent), 0 without the file
+fn out_rsts() -> i64 {
+    let mut buf = [0u8; 4096];
+    let n = read_file(b"/proc/net/snmp\0", &mut buf);
+    if n <= 0 {
+        return 0;
+    }
+    // A "Tcp:" line of names, then one of values
+    let mut tcp = buf[..n as usize]
+        .split(|&b| b == b'\n')
+        .filter(|l| l.starts_with(b"Tcp: "));
+    let (Some(names), Some(vals)) = (tcp.next(), tcp.next()) else {
+        return 0;
+    };
+    let mut vs = vals.split(|&b| b == b' ');
+    for name in names.split(|&b| b == b' ') {
+        let v = vs.next().unwrap_or(b"");
+        if name == b"OutRsts" {
+            return v
+                .iter()
+                .fold(0i64, |a, &c| a * 10 + i64::from(c.wrapping_sub(b'0')));
+        }
+    }
+    0
+}
+
 fn slab_time_wait() {
     const N: i64 = 2000;
     const BASE: u16 = 20000;
@@ -233,6 +262,7 @@ fn slab_time_wait() {
     }
     sleep_ms(100);
     let before = meminfo(b"Slab:");
+    let rsts = out_rsts();
     // When each batch of 100 began closing: on a loaded TCG host the
     // loop can outlast TIME_WAIT (60 s), and the oldest entries expire
     let mut batch = [0u64; (N / 100) as usize];
@@ -249,6 +279,7 @@ fn slab_time_wait() {
     sleep_ms(200);
     let tw = time_wait_count(BASE..BASE + N as u16);
     let grew = meminfo(b"Slab:") - before;
+    let reset = out_rsts() - rsts;
     // Batches begun less than TIME_WAIT (minus slack) ago are all listed
     let t = now_ms();
     let live = 100 * batch.iter().filter(|&&b| t - b < TW_MS - 5000).count() as i64;
@@ -257,8 +288,10 @@ fn slab_time_wait() {
     print_num(tw);
     print(b" entries, Slab +");
     print_num(grew);
-    println(b" kB");
-    if tw < live {
+    print(b" kB, ");
+    print_num(reset);
+    println(b" resets");
+    if tw + reset < live {
         verdict_detail(b"MEM_SLAB_TIME_WAIT", false, tw);
         return;
     }

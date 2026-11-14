@@ -147,15 +147,18 @@ setup_x86_config() {
         # USB serial console mode: USB serial is primary, standard serial disabled
         QEMU_ARGS+=(
             -serial null
+            -serial null
             -device qemu-xhci,id=xhci
             -chardev file,id=usbserial0,path="$USB_SERIAL_LOG"
             -device usb-serial,chardev=usbserial0
         )
         SERIAL_LOG="$USB_SERIAL_LOG"
     else
-        # Standard mode: regular serial console, USB devices present
+        # Standard mode: regular serial console, USB devices present;
+        # COM2 (ttyS1) goes nowhere, for tests of a non-console tty
         QEMU_ARGS+=(
             -serial file:"$SERIAL_LOG"
+            -serial null
             -device qemu-xhci,id=xhci
             -chardev file,id=usbserial0,path="$USB_SERIAL_LOG"
             -device usb-serial,chardev=usbserial0

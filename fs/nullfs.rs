@@ -12,7 +12,12 @@
 //!
 //! One inode, a directory with no entries that nothing can change
 //! (Linux make_empty_dir_inode plus S_IMMUTABLE): lookups find nothing,
-//! creating or changing anything is EPERM.
+//! creating or changing anything is EPERM. The kernel's private
+//! instance also has an empty regular file outside its tree
+//! ([`new_file`], Linux nullfs_new_file): reads find nothing, writes
+//! are taken and dropped, its mode and owner never change. It stands
+//! in for a locked file mount an umount left covered (Linux
+//! knullfs_file).
 
 use alloc::sync::Arc;
 
@@ -24,7 +29,6 @@ use super::inode::{FileType, Inode, InodeMode, InodeOps};
 use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 use crate::task::Cred;
-use crate::util::kalloc::try_arc;
 
 /// statfs f_type (Linux NULL_FS_MAGIC, "NULL")
 pub const NULL_FS_MAGIC: u64 = 0x4E55_4C4C;
@@ -62,6 +66,10 @@ impl InodeOps for NullfsInodeOps {
         Err(KernelError::NotFound)
     }
 
+    fn is_empty_dir(&self, _inode: &Inode) -> bool {
+        true
+    }
+
     /// S_IMMUTABLE: no write access (Linux inode_permission: EPERM)
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
         if mask & MAY_WRITE != 0 {
@@ -90,25 +98,33 @@ impl FileOps for NullfsFileOps {
         false
     }
 
-    /// A directory (Linux generic_read_dir)
+    /// A directory (Linux generic_read_dir); the file is empty (Linux
+    /// nullfs_file_read_iter)
     fn read_iter(
         &self,
-        _file: &File,
+        file: &File,
         _to: &mut IovDest<'_>,
         _at: Option<u64>,
         _flags: RwFlags,
     ) -> Result<usize, KernelError> {
+        if is_file(file) {
+            return Ok(0);
+        }
         Err(KernelError::IsDirectory)
     }
 
-    /// No write op
+    /// No write op for the directory; the file takes everything and
+    /// keeps nothing (Linux nullfs_file_write_iter)
     fn write_iter(
         &self,
-        _file: &File,
-        _from: &mut IovSource<'_>,
+        file: &File,
+        from: &mut IovSource<'_>,
         _at: Option<u64>,
         _flags: RwFlags,
     ) -> Result<usize, KernelError> {
+        if is_file(file) {
+            return Ok(from.len());
+        }
         Err(KernelError::OperationNotSupported)
     }
 
@@ -131,6 +147,49 @@ impl FileOps for NullfsFileOps {
 
 static NULLFS_FILE_OPS: NullfsFileOps = NullfsFileOps;
 
+/// `file` is the regular file of [`new_file`], not the directory
+fn is_file(file: &File) -> bool {
+    file.get_inode().is_some_and(|i| !i.mode().is_dir())
+}
+
+/// The file's inode operations (Linux nullfs_file_inode_operations):
+/// its mode and owner never change, its times may
+struct NullfsFileInodeOps;
+
+impl InodeOps for NullfsFileInodeOps {
+    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+        Err(KernelError::NotDirectory)
+    }
+
+    /// Linux nullfs_file_setattr: ATTR_MODE is EPERM
+    fn chmod_ok(&self, _inode: &Inode, _perm: u16) -> Result<(), KernelError> {
+        Err(KernelError::NotPermitted)
+    }
+
+    /// Linux nullfs_file_setattr: ATTR_UID / ATTR_GID are EPERM
+    fn chown_ok(&self, _inode: &Inode) -> Result<(), KernelError> {
+        Err(KernelError::NotPermitted)
+    }
+}
+
+static NULLFS_FILE_INODE_OPS: NullfsFileInodeOps = NullfsFileInodeOps;
+
+/// An empty regular file on the nullfs `sb` (inode 2, mode 0666), a
+/// dentry of its own that no lookup finds (Linux nullfs_new_file)
+pub fn new_file(sb: &Arc<SuperBlock>) -> Result<crate::fs::DentryRef, KernelError> {
+    let inode = Inode::alloc(Inode::new(
+        2,
+        InodeMode::regular(0o666),
+        0,
+        0,
+        0,
+        crate::time::TIMEKEEPER.current_time(),
+        Arc::downgrade(sb),
+        &NULLFS_FILE_INODE_OPS,
+    ))?;
+    crate::fs::DentryRef::new(Dentry::new_root(inode, Arc::downgrade(sb)))
+}
+
 /// A new instance (Linux nullfs_fs_fill_super): the root is inode 1,
 /// mode 0555, owned by root
 fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
@@ -145,7 +204,10 @@ fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBloc
         Arc::downgrade(&sb),
         &NULLFS_INODE_OPS,
     ))?;
-    sb.set_root(try_arc(Dentry::new_root(root, Arc::downgrade(&sb)))?);
+    sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
+        root,
+        Arc::downgrade(&sb),
+    ))?);
     Ok(sb)
 }
 

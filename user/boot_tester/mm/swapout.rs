@@ -16,6 +16,8 @@ use hk_syscall::{
     sys_wait4,
 };
 
+use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
 const MIB: u64 = 1024 * 1024;
 /// Pages out per test (16 MiB)
 const LEN: u64 = 16 * MIB;
@@ -125,6 +127,7 @@ pub fn run_tests() {
     pageout_cycle(base);
     direct_reclaim();
     swapoff_swapped(path);
+    swapoff_race(path);
 }
 
 /// Page out 16 MiB, read it back through fork and mremap, then unmap
@@ -309,4 +312,71 @@ fn swapoff_swapped(path: &[u8]) {
         && vmswap() == 0;
     verdict(b"SWAPOUT_SWAPOFF", ok, off * 1000 + out);
     sys_munmap(p, len);
+}
+
+/// Pages written while swapoff runs, per round
+const RACE_PAGES: u64 = 32;
+
+#[repr(C, align(16))]
+struct ThreadStack([u8; 16384]);
+static mut RACE_STACK: ThreadStack = ThreadStack([0; 16384]);
+static mut RACE_CTID: u32 = 0;
+/// The swap path, and what swapoff returned (i64::MIN: not yet)
+static RACE_PATH: AtomicU64 = AtomicU64::new(0);
+static RACE_RC: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// Thread: swapoff the area at the path in RACE_PATH
+extern "C" fn swapoff_thread(_: u64) -> ! {
+    let path = RACE_PATH.load(Ordering::Acquire) as *const u8;
+    RACE_RC.store(hk_syscall::sys_swapoff(path), Ordering::Release);
+    sys_exit(0)
+}
+
+/// swapoff in one thread while another writes pages read back from
+/// swap: each write fault frees its slot (reuse of the swap-cache
+/// page) as swapoff drains the device. Every swapoff succeeds and the
+/// data stays; the device is torn down only after its last user (hk:
+/// SwapInfo's release asserts a sleepable context)
+fn swapoff_race(path: &[u8]) {
+    use crate::mm::fork_mm::{join, spawn_thread};
+    let len = RACE_PAGES * 4096;
+    RACE_PATH.store(path.as_ptr() as u64, Ordering::Release);
+    let mut code = 0i64;
+    for round in 0..16u64 {
+        if swap_on(path) != 0 {
+            code = 1;
+            break;
+        }
+        let p = map(len);
+        if p == 0 {
+            swap_off(path);
+            code = 2;
+            break;
+        }
+        fill(p, len, 10 + round);
+        sys_madvise(p, len, MADV_PAGEOUT);
+        // Read back: swap-cache pages, mapped read-only
+        let read = check(p, len, 10 + round).is_none();
+        RACE_RC.store(i64::MIN, Ordering::Relaxed);
+        let ctid = &raw mut RACE_CTID;
+        let top = unsafe { (&raw mut RACE_STACK as *mut u8).add(16384) } as u64;
+        unsafe { core::ptr::write_volatile(ctid, 1) };
+        if unsafe { spawn_thread(top, swapoff_thread, 0, ctid) } <= 0 {
+            swap_off(path);
+            sys_munmap(p, len);
+            code = 3;
+            break;
+        }
+        fill(p, len, 100 + round);
+        let joined = join(ctid);
+        let rc = RACE_RC.load(Ordering::Acquire);
+        let total = proc_kb(b"/proc/meminfo\0", b"SwapTotal:");
+        let data = check(p, len, 100 + round).is_none();
+        sys_munmap(p, len);
+        if !(read && joined && rc == 0 && total == 0 && data) {
+            code = 100 + round as i64 * 10 + if rc != 0 { 1 } else { 0 };
+            break;
+        }
+    }
+    verdict(b"SWAPOUT_SWAPOFF_RACE", code == 0, code);
 }

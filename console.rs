@@ -44,6 +44,7 @@
 
 use crate::arch::{CurrentArch, EarlyConOps};
 use crate::sync::IrqSpinlock;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Maximum number of console drivers that can be registered
 const MAX_CONSOLES: usize = 8;
@@ -66,6 +67,11 @@ pub trait ConsoleDriver: Send + Sync {
 
     /// Flush any buffered output
     fn flush(&self) {}
+
+    /// Start sending what `write` queued for a thread to send: the
+    /// scheduler tick after `console_defer_kick` (interrupt context, no
+    /// lock held), so it may queue work
+    fn kick(&self) {}
 
     /// The tty behind the console, if it is one (Linux console->device)
     fn tty(&'static self) -> Option<&'static crate::tty::Tty> {
@@ -447,6 +453,33 @@ pub fn console_write(data: &[u8]) {
     // Write outside the registry lock
     for console in snapshot.into_iter().flatten() {
         console.write(data);
+    }
+}
+
+/// A console's write queued output for a thread to send
+static KICK_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// From a console's write (any context, any lock held, run-queue locks
+/// included): the next scheduler tick kicks the enabled consoles
+/// (`ConsoleDriver::kick`). A write cannot wake a thread itself; Linux
+/// defers printk's wakeups the same way, through irq_work
+/// (defer_console_output)
+pub fn console_defer_kick() {
+    if !KICK_PENDING.load(Ordering::Relaxed) {
+        KICK_PENDING.store(true, Ordering::Release);
+    }
+}
+
+/// Kick the consoles if a write asked for it (the scheduler tick:
+/// interrupt context, no lock held)
+pub fn tick() {
+    // A plain load first: every CPU's tick would otherwise write the line
+    if !(KICK_PENDING.load(Ordering::Relaxed) && KICK_PENDING.swap(false, Ordering::AcqRel)) {
+        return;
+    }
+    let snapshot = CONSOLE_REGISTRY.lock().enabled_consoles_snapshot();
+    for console in snapshot.into_iter().flatten() {
+        console.kick();
     }
 }
 

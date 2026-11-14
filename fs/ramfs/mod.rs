@@ -38,7 +38,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::mm::filemap::{self, Aops};
 
 use super::KernelError;
-use super::dentry::Dentry;
+use super::dentry::{Dentry, DentryRef};
 use super::file::{DirContext, DirEntry, File, FileOps, RwFlags};
 use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::iov_iter::{IovDest, IovSource};
@@ -1223,7 +1223,10 @@ pub(crate) fn fill_root(
         gid,
         current_time(),
     )?;
-    sb.set_root(try_arc(Dentry::new_root(inode, Arc::downgrade(sb)))?);
+    sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
+        inode,
+        Arc::downgrade(sb),
+    ))?);
     Ok(())
 }
 
@@ -1351,14 +1354,14 @@ fn add_new(
 
 /// `add_new` under the dentry `parent`, with the new child's dentry
 fn add_dentry(
-    parent: &Arc<Dentry>,
+    parent: &DentryRef,
     name: &[u8],
     kind: Kind,
     mode: InodeMode,
     uid: Uid,
     gid: Gid,
     time: Timespec,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<DentryRef, KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     let inode = add_new(&dir, name, kind, mode, uid, gid, time)?;
     Dentry::alloc(parent, name, Some(inode))
@@ -1389,21 +1392,21 @@ pub(crate) fn parse_octal(v: &[u8]) -> Option<u16> {
 }
 
 /// Create a directory in ramfs with default ownership (root:root, mode 0755)
-pub fn ramfs_create_dir(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
+pub fn ramfs_create_dir(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
     let mode = InodeMode::directory(0o755);
     add_dentry(parent, name, Kind::Dir, mode, 0, 0, current_time())
 }
 
 /// Create a file in ramfs with initial content, ownership, and explicit timestamp
 pub fn ramfs_create_file_with_timestamp(
-    parent: &Arc<Dentry>,
+    parent: &DentryRef,
     name: &[u8],
     content: &[u8],
     mode: InodeMode,
     uid: Uid,
     gid: Gid,
     mtime: Timespec,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<DentryRef, KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     let private = dir.get_private().ok_or(KernelError::Io)?;
     let dir_data = private
@@ -1454,24 +1457,24 @@ pub fn ramfs_fill_file(inode: &Inode, content: &[u8]) -> Result<(), KernelError>
 
 /// Create a directory in ramfs with ownership and explicit timestamp
 pub fn ramfs_create_dir_with_timestamp(
-    parent: &Arc<Dentry>,
+    parent: &DentryRef,
     name: &[u8],
     mode: InodeMode,
     uid: Uid,
     gid: Gid,
     mtime: Timespec,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<DentryRef, KernelError> {
     add_dentry(parent, name, Kind::Dir, mode, uid, gid, mtime)
 }
 
 /// Create nested directory path in ramfs with specified ownership and timestamp.
 pub fn ramfs_mkpath_with_timestamp(
-    root: &Arc<Dentry>,
+    root: &DentryRef,
     path: &[u8],
     uid: Uid,
     gid: Gid,
     mtime: Timespec,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<DentryRef, KernelError> {
     let mut current = root.clone();
 
     for component in path.split(|&c| c == b'/').filter(|s| !s.is_empty()) {
@@ -1500,13 +1503,13 @@ pub fn ramfs_mkpath_with_timestamp(
 
 /// Create a symlink in ramfs with ownership and explicit timestamp
 pub fn ramfs_create_symlink_with_timestamp(
-    parent: &Arc<Dentry>,
+    parent: &DentryRef,
     name: &[u8],
     target: &[u8],
     uid: Uid,
     gid: Gid,
     mtime: Timespec,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<DentryRef, KernelError> {
     let kind = Kind::Symlink(FileName::from(target));
     add_dentry(parent, name, kind, InodeMode::symlink(), uid, gid, mtime)
 }
@@ -1514,11 +1517,11 @@ pub fn ramfs_create_symlink_with_timestamp(
 /// Create the block device node `name` (device `rdev`, permissions
 /// `mode`, owned by root) in `parent`
 pub fn ramfs_create_blkdev(
-    parent: &Arc<Dentry>,
+    parent: &DentryRef,
     name: &[u8],
     rdev: DevId,
     mode: u16,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<DentryRef, KernelError> {
     let mode = InodeMode::blockdev(mode);
     add_dentry(parent, name, Kind::Dev(rdev), mode, 0, 0, current_time())
 }
@@ -1526,11 +1529,11 @@ pub fn ramfs_create_blkdev(
 /// Create the character device node `name` (device `rdev`, permissions
 /// `mode`, owned by root) in `parent`
 pub fn ramfs_create_chrdev(
-    parent: &Arc<Dentry>,
+    parent: &DentryRef,
     name: &[u8],
     rdev: DevId,
     mode: u16,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<DentryRef, KernelError> {
     let mode = InodeMode::chardev(mode);
     add_dentry(parent, name, Kind::Dev(rdev), mode, 0, 0, current_time())
 }

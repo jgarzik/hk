@@ -16,6 +16,7 @@ pub mod io;
 pub mod ipc;
 pub mod mm;
 pub mod net;
+pub mod ns;
 pub mod proc;
 pub mod process;
 pub mod signal;
@@ -247,6 +248,7 @@ pub fn run_all_tests() {
     fs::mntns_check::run_tests();
     fs::mountinfo::run_tests();
     proc::sysfs::run_tests();
+    proc::tracefs::run_tests();
     fs::pnode::run_tests();
     proc::proc_dcache::run_tests();
     process::process::run_tests();
@@ -284,6 +286,7 @@ pub fn run_all_tests() {
     signal::signals::run_tests();
     signal::signo::run_tests();
     signal::sigqueue::run_tests();
+    signal::fork_delay::run_tests();
     signal::sigmask::run_tests();
     arch::fpu::run_tests();
     process::preempt::run_tests();
@@ -318,6 +321,7 @@ pub fn run_all_tests() {
     process::rlimit::run_tests();
     isolated(b"NR_OPEN", io::nr_open::run_tests);
     process::namespace::run_tests();
+    ns::run_tests();
     process::pidns::run_tests();
     net::sockets::run_tests();
     net::sockcore::run_tests();
@@ -335,6 +339,8 @@ pub fn run_all_tests() {
     process::caps_checks::run_tests();
     fs::mount_race::run_tests();
     isolated(b"DPATH_UMOUNT", fs::dpath_umount::run_tests);
+    isolated(b"DPATH_RENAME", fs::dpath_rename::run_tests);
+    isolated(b"VFAT_CI_DENTRY", fs::vfat_names::run_tests);
     fs::tmpfs::run_tests();
     time::timerfd::run_tests();
     time::posix_timer::run_tests();
@@ -362,6 +368,7 @@ pub fn run_all_tests() {
     blk::dio_alias::run_tests();
     blk::dio::run_tests();
     blk::vfat_dio::run_tests();
+    blk::dio_stack::run_tests();
     blk::mmap_dirty::run_tests();
     blk::dio_nowait::run_tests();
     blk::writeback::run_tests();
@@ -400,6 +407,7 @@ pub fn run_all_tests() {
     net::tcp_mem::run_tests();
     net::tcp_opt::run_tests();
     net::tcp_close::run_tests();
+    net::snmp::run_tests();
     net::net_stress::run_tests();
     ipc::keys::run_tests();
     process::kcmp::run_tests();
@@ -421,6 +429,8 @@ pub fn run_all_tests() {
     time::timer_rt::run_tests();
     signal::ptrace_stop::run_tests();
     signal::ptrace_exit::run_tests();
+    signal::jobctl::run_tests();
+    signal::ptrace_listen::run_tests();
     process::wake_storm::run_tests();
     process::lock_fair::run_tests();
     io::enomem::run_tests();

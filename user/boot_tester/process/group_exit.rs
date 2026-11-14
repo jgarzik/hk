@@ -5,12 +5,13 @@
 //! others, and keeps the process's pid when it leads its own process
 //! group and a traced sibling is left a zombie (the exec waits for its
 //! tracer to reap it). A process whose
-//! threads all exit at once tells its parent once. Each child's threads hold the write end of a pipe (in their
+//! threads all exit at once tells its parent once; when its leader
+//! exits first, the notice its last thread sends names the leader. Each child's threads hold the write end of a pipe (in their
 //! shared descriptor table): EOF on it after the reap shows that none
 //! is left.
 
 use crate::harness::verdict;
-use crate::helpers::sleep_ms;
+use crate::helpers::{linux_at_least, sleep_ms};
 use crate::mm::fork_mm::spawn_thread;
 use hk_syscall::{
     P_PID, SigInfo, WEXITED, Zeroable, sys_close, sys_execve, sys_exit, sys_exit_group, sys_fork,
@@ -29,6 +30,7 @@ pub fn run_tests() {
     test_leader_delay();
     test_kill_zombie_leader();
     test_kill_dead_group();
+    test_notice_unseen_sender();
     test_exec_leader();
     test_exec_thread();
     test_exec_traced_sibling();
@@ -254,6 +256,88 @@ fn test_kill_dead_group() {
     }
     verdict(b"GROUP_LAST_THREAD_STATUS", got[0] == 5 << 8, got[0]);
     verdict(b"GROUP_KILL_DEAD_STATUS", got[1] == 5 << 8, got[1]);
+}
+
+/// The leader exits first, then its last thread: that thread's release
+/// sends the leader's notice, its own pid already detached, and the
+/// SIGCHLD still names the leader, as the parent's pid namespace
+/// numbers it, the root one or a nested one (Linux release_task:
+/// detach_pid, then do_notify_parent, which queues with
+/// __send_signal_locked: no sender check hides si_pid)
+fn test_notice_unseen_sender() {
+    for (nested, name) in [
+        (false, &b"GROUP_LEADER_NOTICE_PID"[..]),
+        (true, &b"GROUP_LEADER_NOTICE_PIDNS"[..]),
+    ] {
+        let s = sys_fork();
+        if s == 0 {
+            sys_exit_group(if nested {
+                in_pidns(notice_steps)
+            } else {
+                notice_steps()
+            });
+        }
+        let mut st = 0i32;
+        sys_wait4(s, &mut st, 0, 0);
+        verdict(name, st == 0, (st >> 8) as i64);
+    }
+}
+
+/// `f`'s result, run as the init of a new pid namespace
+fn in_pidns(f: fn() -> u64) -> u64 {
+    const CLONE_NEWPID: u64 = 0x2000_0000;
+    if hk_syscall::sys_unshare(CLONE_NEWPID) != 0 {
+        return 9;
+    }
+    let p = sys_fork();
+    if p == 0 {
+        sys_exit_group(f());
+    }
+    let mut st = 0i32;
+    if sys_wait4(p, &mut st, 0, 0) != p {
+        return 10;
+    }
+    (st >> 8) as u64
+}
+
+/// SIGCHLD blocked, a child whose leader exits before its thread: the
+/// notice's si_pid, code and status; 0, else the failed step. The last
+/// thread's exit sets the group's exit code (Linux 5.17+
+/// synchronize_group_exit), which the notice carries from Linux 6.15
+/// (9133607de37a: release_task copies it to the leader's exit_code);
+/// before, the leader's own code
+fn notice_steps() -> u64 {
+    use hk_syscall::{sys_rt_sigprocmask, sys_rt_sigtimedwait};
+    const SIGCHLD: u32 = 17;
+    const CLD_EXITED: i32 = 1;
+    let m: u64 = 1 << (SIGCHLD - 1);
+    sys_rt_sigprocmask(0, &m as *const u64 as u64, 0, 8);
+    let pid = sys_fork();
+    if pid == 0 {
+        start(0, thread_exit5, 0);
+        sys_exit(3);
+    }
+    let ts = [5i64, 0];
+    let mut i = SigInfo::zeroed();
+    let r = sys_rt_sigtimedwait(
+        &m as *const u64 as u64,
+        &mut i as *mut SigInfo as u64,
+        ts.as_ptr() as u64,
+        8,
+    );
+    let mut st = 0i32;
+    let w = sys_wait4(pid, &mut st, 0, 0);
+    if r != SIGCHLD as i64 {
+        1
+    } else if i.si_code != CLD_EXITED || i.si_status != if linux_at_least(6, 15) { 5 } else { 3 } {
+        2
+    } else if i.si_pid as i64 != pid {
+        3
+    } else if w != pid || st != 5 << 8 {
+        4
+    } else {
+        0
+    }
 }
 
 /// exec `busybox sh -c "exit <code>"`

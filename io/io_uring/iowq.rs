@@ -37,7 +37,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::opreq::{OpReq, run_chain};
 use super::rw::Req;
@@ -45,7 +45,7 @@ use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{TaskRef, current, task_ref};
 use crate::task::task_work::{TaskWork, WorkHead, task_work_run};
-use crate::util::error::KernelResult;
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::{try_arc, try_box};
 use crate::util::kmem::KVec;
 use crate::util::list::{ArcList, BoxList, Link};
@@ -152,7 +152,17 @@ pub struct IoWq {
     gone: WaitQueue,
     /// Queued on the owner to start workers asked for elsewhere
     spawn: Arc<WorkHead>,
+    /// Queues `spawn` again after a creation a signal interrupted
+    /// (Linux queue_create_worker_retry's delayed work)
+    retry: Arc<crate::sync::IrqSpinlock<crate::task::workqueue::DelayedWork>>,
+    /// Creations retried since the last that worked (Linux
+    /// io_worker.init_retries)
+    retries: AtomicU32,
 }
+
+/// Most retries of an interrupted worker creation (Linux
+/// WORKER_INIT_LIMIT)
+const WORKER_INIT_LIMIT: u32 = 3;
 
 impl TaskWork for IoWq {
     /// Start the workers asked for from other contexts (Linux
@@ -171,14 +181,25 @@ impl IoWq {
     /// The current task's io-wq
     pub fn new() -> KernelResult<Arc<Self>> {
         let spawn = try_arc(WorkHead::new())?;
+        let owner = Arc::downgrade(&task_ref(&current()));
+        let (o, s) = (owner.clone(), spawn.clone());
+        let retry = try_arc(crate::sync::IrqSpinlock::new(
+            crate::task::workqueue::DelayedWork::new(move || {
+                if let Some(t) = o.upgrade() {
+                    let _ = s.queue(&t);
+                }
+            }),
+        ))?;
         let wq = try_arc(Self {
             accts: [Acct::new(), Acct::new()],
-            owner: Arc::downgrade(&task_ref(&current())),
+            owner,
             me: spin::Once::new(),
             exiting: AtomicBool::new(false),
             workers: Mutex::new(ArcList::new()),
             gone: WaitQueue::new(),
             spawn: spawn.clone(),
+            retry,
+            retries: AtomicU32::new(0),
         })?;
         wq.me.call_once(|| Arc::downgrade(&wq));
         let weak: Weak<dyn TaskWork> = Arc::downgrade(&wq) as Weak<Self>;
@@ -253,7 +274,23 @@ impl IoWq {
             let a: Arc<dyn core::any::Any + Send + Sync> = a;
             crate::task::percpu::create_io_thread(worker, a)
         });
-        if started.is_err() {
+        if started.is_ok() {
+            self.retries.store(0, Ordering::Relaxed);
+        }
+        if let Err(e) = started {
+            if self.should_retry(e) {
+                // Asked again a little later, the signal handled by
+                // then (Linux queue_create_worker_retry: 5 ms per try)
+                {
+                    let mut q = self.accts[i].q.lock();
+                    q.workers -= 1;
+                    q.want = true;
+                }
+                let n = self.retries.fetch_add(1, Ordering::Relaxed) + 1;
+                let ticks = crate::task::percpu::ms_to_ticks(u64::from(n) * 5).max(1);
+                crate::task::workqueue::SYSTEM_WQ.queue_delayed_work(self.retry.clone(), ticks);
+                return;
+            }
             let orphans = {
                 let mut q = self.accts[i].q.lock();
                 q.workers -= 1;
@@ -266,6 +303,24 @@ impl IoWq {
             };
             cancel_all(orphans);
         }
+    }
+
+    /// A worker creation that failed with `e` is tried again (Linux
+    /// io_should_retry_thread): a signal the owner had to handle first
+    /// (copy_process's ERESTARTNOINTR), or no memory or pid for now
+    /// (EAGAIN), a few times, unless the owner is dying
+    fn should_retry(&self, e: KernelError) -> bool {
+        let retryable = matches!(
+            e,
+            KernelError::WouldBlock
+                | KernelError::RestartSys
+                | KernelError::RestartNoIntr
+                | KernelError::RestartNoHand
+        );
+        retryable
+            && !crate::signal::fatal_signal_pending()
+            && !self.exiting.load(Ordering::Acquire)
+            && self.retries.load(Ordering::Relaxed) < WORKER_INIT_LIMIT
     }
 
     /// The owner exits or execs (Linux io_wq_exit_start, the cancel of

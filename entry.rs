@@ -61,6 +61,8 @@ pub fn exit_to_user_mode(regs: &UserFrame) {
         CurrentArch::disable_interrupts();
     }
     check_user_return();
+    // Single-step state for the way out (arm64 MDSCR_EL1.SS)
+    crate::arch::ptrace::exit_to_user();
 }
 
 /// The return from a syscall (Linux syscall_exit_to_user_mode), with

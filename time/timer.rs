@@ -21,7 +21,10 @@
 //! task running it, and touches the timer no more once it returns),
 //! as Linux frees a socket from its timer's final sock_put.
 //! [`ArcTimer`] is a timer embedded in an `Arc`-owned object whose
-//! pending arm holds a reference to it (Linux sk_reset_timer).
+//! pending arm holds a reference to it (Linux sk_reset_timer, neigh_hold
+//! in neigh_add_timer); its callback releases that reference at its
+//! end, so the owner's last drop never finds it pending or running and
+//! only disarms, in any context (Linux neigh_destroy, sk_free).
 //!
 //! Locking: `TimerBase.wheel` is an IrqSpinlock leaf (only the wheel's
 //! lists and the timers' `expires`/`pending` under it); callbacks run
@@ -31,6 +34,7 @@ use crate::util::kalloc::box_nofail;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::marker::PhantomPinned;
+use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
@@ -452,16 +456,27 @@ pub fn start_ktimers() {
 /// end, so the owner lives while the timer can fire, and the owner's
 /// last reference may go in its own timer's callback.
 ///
+/// Its drop does not wait for a callback (Linux neigh_destroy and
+/// sk_free only disarm): it runs at the owner's last drop, and a pending
+/// arm or a running callback still holds a reference until the base no
+/// longer touches the timer (`arc_timer_fire` reads nothing of it after
+/// the callback, the base only clears `running`, a pointer it never
+/// dereferences). So the owner may go anywhere, e.g. in `rcuc/N` after
+/// `kfree_rcu`.
+///
 /// # Invariants
-/// `timer` is the first field (`repr(C)`), so a `&TimerList` the base
-/// passes to [`arc_timer_fire`] is this `ArcTimer`'s. While `timer` is
+/// `timer` is the first field (`repr(C)`; `ManuallyDrop` is
+/// transparent), so a `&TimerList` the base passes to
+/// [`arc_timer_fire`] is this `ArcTimer`'s. While `timer` is
 /// pending its data is `Arc::into_raw` of the owning `Arc<T>`, whose
 /// reference the pending arm holds; at most one such reference per
 /// pending period (taken when an arm finds it idle, given back by the
 /// callback or by `stop` when it disarms it).
 #[repr(C)]
 pub struct ArcTimer<T> {
-    timer: TimerList,
+    /// Never dropped: [`ArcTimer`]'s drop disarms it, without
+    /// `del_timer_sync`'s wait
+    timer: ManuallyDrop<TimerList>,
     func: fn(Arc<T>),
     _owner: core::marker::PhantomData<fn(Arc<T>)>,
 }
@@ -470,7 +485,7 @@ impl<T: Send + Sync> ArcTimer<T> {
     /// An idle timer calling `func` in `ktimers/N`
     pub const fn new(func: fn(Arc<T>)) -> Self {
         Self {
-            timer: TimerList::new(arc_timer_fire::<T>, 0),
+            timer: ManuallyDrop::new(TimerList::new(arc_timer_fire::<T>, 0)),
             func,
             _owner: core::marker::PhantomData,
         }
@@ -491,7 +506,7 @@ impl<T: Send + Sync> ArcTimer<T> {
         // moved or reused only through `&mut T` (`Arc::get_mut`), which
         // the reference a pending arm or a running callback holds rules
         // out until it is idle again
-        let t = unsafe { Pin::new_unchecked(&self.timer) };
+        let t = unsafe { Pin::new_unchecked(&*self.timer) };
         // INVARIANT: the reference an idle timer's arm hands over is
         // taken before arming: the timer may fire on another CPU at once
         // and its callback consumes it
@@ -540,6 +555,19 @@ impl<T: Send + Sync> ArcTimer<T> {
     }
 }
 
+impl<T> Drop for ArcTimer<T> {
+    /// The owner's last reference went (Linux neigh_destroy's
+    /// neigh_del_timer): none is pending, since an arm holds one, and no
+    /// callback runs that the base still touches, since it holds one
+    /// until the base is done with the timer. Disarm only, as Linux
+    /// warns of the impossible pending case; never wait.
+    fn drop(&mut self) {
+        if self.timer.del_timer() {
+            crate::printkln!("timer: ArcTimer dropped while pending");
+        }
+    }
+}
+
 /// An [`ArcTimer`] expired: its callback, with the arm's reference
 fn arc_timer_fire<T: Send + Sync>(t: &TimerList) {
     // SAFETY: the base calls this only for an `ArcTimer<T>`'s timer
@@ -548,7 +576,60 @@ fn arc_timer_fire<T: Send + Sync>(t: &TimerList) {
     // SAFETY: it was pending until the base detached it, so its data is
     // the reference its arm took (type invariant), handed over here
     let owner = unsafe { Arc::from_raw(t.data() as *const T) };
-    (at.func)(owner);
+    // INVARIANT: `at` and `t` are not touched once `owner` is handed
+    // over: the callback may drop the last reference
+    let func = at.func;
+    func(owner);
+}
+
+/// Boot self-test of [`ArcTimer`]'s drop: a callback hands its owner's
+/// last reference to `kfree_rcu` and runs on until the owner is gone,
+/// which happens in `rcuc/N`, preemption off, while the base still runs
+/// that callback (Linux: a neighbour unlinked and released while its
+/// timer runs). The drop must not wait for the callback (a sleep there,
+/// and here it would never end before the callback gives up). True if
+/// the owner went in atomic context while its callback still ran.
+pub fn selftest() -> bool {
+    use crate::sync::rcu::{RcuHead, kfree_rcu, rcu_barrier};
+    static WQ: WaitQueue = WaitQueue::new();
+    /// The owner went: 1, in atomic context: 2
+    static GONE: AtomicU64 = AtomicU64::new(0);
+    /// The callback saw the owner go: 1; gave up waiting: 2
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    /// Dropped after `timer` (fields drop in order)
+    struct Gone;
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let atomic = crate::arch::preempt_count() > 0;
+            GONE.store(1 + u64::from(atomic), Ordering::Release);
+            WQ.wake_all();
+        }
+    }
+    struct Probe {
+        timer: ArcTimer<Probe>,
+        rcu: RcuHead,
+        _gone: Gone,
+    }
+    crate::rcu_head!(Probe, rcu);
+    fn fire(p: Arc<Probe>) {
+        kfree_rcu(p);
+        let left = WQ.wait_event_timeout(|| GONE.load(Ordering::Acquire) != 0, 500);
+        SEEN.store(if left > 0 { 1 } else { 2 }, Ordering::Release);
+        WQ.wake_all();
+    }
+    let probe = crate::util::kalloc::try_arc(Probe {
+        timer: ArcTimer::new(fire),
+        rcu: RcuHead::new(),
+        _gone: Gone,
+    });
+    let Ok(p) = probe else {
+        return false;
+    };
+    p.timer.reset(&p, crate::time::monotonic_ns());
+    drop(p);
+    WQ.wait_event_timeout(|| SEEN.load(Ordering::Acquire) != 0, 1000);
+    rcu_barrier();
+    SEEN.load(Ordering::Acquire) == 1 && GONE.load(Ordering::Acquire) == 2
 }
 
 /// A one-shot timer that tracks its earliest wanted deadline (for

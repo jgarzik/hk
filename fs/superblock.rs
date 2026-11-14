@@ -13,7 +13,7 @@ use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::sync;
 
 use super::KernelError;
-use super::dentry::Dentry;
+use super::dentry::DentryRef;
 use super::inode::{Inode, InodeId, InodeMode, InodeOps};
 use crate::util::kalloc::try_arc;
 
@@ -234,6 +234,11 @@ pub mod fs_flags {
     pub const FS_PSEUDO: u32 = 1;
     /// Filesystem requires a backing block device
     pub const FS_REQUIRES_DEV: u32 = 2;
+    /// A bit with the kind above: a new mount in a mount namespace of
+    /// another user namespace needs one already fully visible there
+    /// (Linux FS_USERNS_MOUNT_RESTRICTED, SB_I_USERNS_VISIBLE): procfs
+    /// and sysfs
+    pub const FS_USERNS_MOUNT_RESTRICTED: u32 = 0x100;
 }
 
 /// Global counter for unique device IDs per superblock
@@ -347,7 +352,14 @@ impl Drop for SuperBlock {
     /// fsnotify_sb_delete: its watches get IN_UNMOUNT and go). First it
     /// leaves super_blocks and its type's fs_supers (the lists' contract,
     /// `WeakList`): no walker reaches it once its fields start to go.
+    ///
+    /// Thread context only, nothing atomic held (Linux deactivate_super
+    /// takes s_umount for writing): the teardown sleeps (the device's
+    /// release takes its open_mutex and writes it back). A last reference
+    /// dropped in atomic context (interrupts off, a spin lock held) is
+    /// reported here, wherever the teardown would have slept.
     fn drop(&mut self) {
+        crate::sync::might_sleep();
         let weaks = {
             let mut l = SB_LOCK.lock();
             let me: &Self = self;
@@ -469,7 +481,7 @@ pub struct SuperBlock {
     s_instances: Link,
 
     /// Root dentry of this filesystem
-    pub root: RwLock<Option<Arc<Dentry>>>,
+    pub root: RwLock<Option<DentryRef>>,
 
     /// Superblock operations
     pub s_op: &'static dyn SuperOps,
@@ -489,11 +501,10 @@ pub struct SuperBlock {
     /// Next inode number to allocate
     next_ino: AtomicU64,
 
-    /// Mounts whose mountpoint is a dentry of this filesystem, in any
-    /// namespace: 0 lets unlink/rmdir/rename skip the mountpoint walk
-    /// (Linux checks DCACHE_MOUNTED first). Never low; a stale high
-    /// count only costs the walk.
-    mounted_on: AtomicU32,
+    /// Name hashing and comparison for its dentries, if names match
+    /// more than their bytes (Linux s_d_op): set before its root
+    /// dentry is made
+    s_d_op: spin::Once<&'static super::dentry::DentryOps>,
 
     /// Unique device ID for this filesystem instance (for stat st_dev)
     pub dev_id: u64,
@@ -539,19 +550,15 @@ pub const MAX_LFS_FILESIZE: u64 = i64::MAX as u64;
 pub trait SuperBlockData: Send + Sync + AsAny {}
 
 impl SuperBlock {
-    /// A mount was put on (`+1`) or taken off (`-1`) one of this
-    /// filesystem's dentries
-    pub fn note_mounted_on(&self, delta: i32) {
-        if delta > 0 {
-            self.mounted_on.fetch_add(1, Ordering::AcqRel);
-        } else {
-            self.mounted_on.fetch_sub(1, Ordering::AcqRel);
-        }
+    /// Its dentries hash and compare names with `op` (Linux
+    /// set_default_d_op): before the root dentry is made
+    pub fn set_d_op(&self, op: &'static super::dentry::DentryOps) {
+        self.s_d_op.call_once(|| op);
     }
 
-    /// Something may be mounted on a dentry of this filesystem
-    pub fn has_mounts_on(&self) -> bool {
-        self.mounted_on.load(Ordering::Acquire) != 0
+    /// Its dentries' name operations (Linux s_d_op)
+    pub fn d_op(&self) -> Option<&'static super::dentry::DentryOps> {
+        self.s_d_op.get().copied()
     }
 
     /// Create a new superblock, listed on super_blocks and its type's
@@ -580,7 +587,7 @@ impl SuperBlock {
             root: RwLock::new(None),
             s_op,
             s_flags: AtomicU32::new(flags),
-            mounted_on: AtomicU32::new(0),
+            s_d_op: spin::Once::new(),
             s_writers: AtomicU64::new(0),
             s_mounts: Mutex::new(WeakList::new()),
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
@@ -707,12 +714,12 @@ impl SuperBlock {
     }
 
     /// Set the root dentry
-    pub fn set_root(&self, root: Arc<Dentry>) {
+    pub fn set_root(&self, root: DentryRef) {
         *self.root.write() = Some(root);
     }
 
     /// Get the root dentry
-    pub fn get_root(&self) -> Option<Arc<Dentry>> {
+    pub fn get_root(&self) -> Option<DentryRef> {
         self.root.read().clone()
     }
 

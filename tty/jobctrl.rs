@@ -123,17 +123,52 @@ pub fn tiocnotty(tty: &Tty) -> Result<(), KernelError> {
     if !is_current(tty) {
         return Err(KernelError::NotTty);
     }
-    disassociate_ctty();
+    disassociate_ctty(false);
     Ok(())
 }
 
-/// A session leader gives up its controlling tty, by TIOCNOTTY or at
-/// exit (Linux disassociate_ctty): its foreground group gets SIGHUP and
-/// SIGCONT, and the session has no tty any more. No-op for others. At
-/// exit Linux hangs the tty up instead (tty_vhangup_session); hk has no
-/// hangup.
-pub fn disassociate_ctty() {
+/// A hangup takes the tty's session and foreground group (Linux
+/// __tty_hangup under ctrl.lock); the window size stays
+pub(super) fn hangup_take(tty: &Tty) -> (Option<Arc<Pid>>, Option<Arc<Pid>>) {
+    let _g = CTTY_LOCK.lock();
+    let mut c = tty.ctrl.lock();
+    (c.session.take(), c.pgrp.take())
+}
+
+/// A hung up tty's session leader gets SIGHUP and SIGCONT; with
+/// `exit_session` (the leader is exiting) the foreground group gets
+/// SIGHUP too (Linux tty_signal_session_leader: only if the leader is
+/// still there)
+pub(super) fn signal_session_leader(
+    session: Option<Arc<Pid>>,
+    pgrp: Option<Arc<Pid>>,
+    exit_session: bool,
+) {
+    use crate::signal::{SendInfo, kill_pid_info};
+    let Some(s) = session else {
+        return;
+    };
+    if kill_pid_info(&s, SIGHUP, SendInfo::Kernel, |_, _| Ok(())).is_err() {
+        return;
+    }
+    let _ = kill_pid_info(&s, SIGCONT, SendInfo::Kernel, |_, _| Ok(()));
+    if exit_session && let Some(pg) = pgrp {
+        kill_pgrp_pid(&pg, SIGHUP);
+    }
+}
+
+/// A session leader gives up its controlling tty (Linux
+/// disassociate_ctty). At exit (`on_exit`) the tty is hung up (Linux
+/// tty_vhangup_session); by TIOCNOTTY its foreground group gets SIGHUP
+/// and SIGCONT and the session has no tty any more. No-op for others
+pub fn disassociate_ctty(on_exit: bool) {
     if !is_leader() {
+        return;
+    }
+    if on_exit {
+        if let Some(tty) = current_tty() {
+            tty.hangup(true);
+        }
         return;
     }
     let pgrp = {
@@ -151,13 +186,24 @@ pub fn disassociate_ctty() {
     }
 }
 
+/// The tty's last close (Linux tty_release's session_clear_tty, then
+/// the tty_struct freed): no session has it and no group is in the
+/// foreground; the window size starts afresh
+pub fn session_clear_tty(tty: &Tty) {
+    let (s, pg) = {
+        let _g = CTTY_LOCK.lock();
+        let mut c = tty.ctrl.lock();
+        let old = core::mem::replace(&mut *c, super::TtyCtrl::new());
+        (old.session, old.pgrp)
+    };
+    drop((s, pg));
+}
+
 /// A background process of the session changing `tty` (`sig` SIGTTOU)
 /// or reading it (SIGTTIN) (Linux __tty_check_change): its group gets
-/// `sig` and the call restarts once it is handled; ignored or blocked,
-/// a change goes ahead and a read is EIO; an orphaned group gets EIO.
-/// hk has no group stop, so where Linux would stop the group (SIG_DFL)
-/// the signal is sent and the call fails with EIO instead of
-/// restarting forever
+/// `sig` and the call restarts once it is handled (or the group, by
+/// default, is stopped and continued); ignored or blocked, a change
+/// goes ahead and a read is EIO; an orphaned group gets EIO
 pub fn check_change(tty: &Tty, sig: crate::signal::Signal) -> Result<(), KernelError> {
     use crate::signal::{Disposition, SIGTTIN, disposition};
     let Some((pg, s)) = pids(&TASKLIST.read()) else {
@@ -190,10 +236,7 @@ pub fn check_change(tty: &Tty, sig: crate::signal::Signal) -> Result<(), KernelE
         return Err(KernelError::Io);
     }
     kill_pgrp_pid(&pg, sig);
-    match d {
-        Disposition::Caught => Err(KernelError::RestartSys),
-        _ => Err(KernelError::Io),
-    }
+    Err(KernelError::RestartSys)
 }
 
 /// TIOCGPGRP (Linux tiocgpgrp): the foreground group of the caller's

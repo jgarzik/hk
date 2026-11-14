@@ -13,17 +13,18 @@
 //! sock_no_open, no_open_fops). /proc shows each by its fs's name for it
 //! ([`dname`], Linux d_dname).
 
+pub mod nsfs;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::KernelError;
-use super::dentry::Dentry;
+use super::dentry::{Dentry, DentryOps};
 use super::file::{File, FileOps};
 use super::inode::{Inode, InodeMode, NULL_INODE_OPS};
 use super::mount::{MNT_NODEV, MNT_NOEXEC, Mount, MountRef};
 use super::path_ref::Path;
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
-use crate::util::kalloc::try_arc;
 
 /// statfs f_type of each (Linux include/uapi/linux/magic.h)
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
@@ -36,6 +37,7 @@ const BDEVFS_MAGIC: u64 = 0x6264_6576;
 pub struct Pseudo {
     ty: FileSystemType,
     ops: PseudoSuperOps,
+    d_op: Option<&'static DentryOps>,
     mnt: spin::Once<MountRef>,
 }
 
@@ -80,19 +82,17 @@ impl FileOps for NoOpen {
 
 static NO_OPEN: NoOpen = NoOpen;
 
-/// A namespace file's operations (Linux ns_file_operations): it opens,
-/// and has no read or write (EINVAL)
-struct NsFileOps;
-
-impl FileOps for NsFileOps {
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
+const fn pseudo(name: &'static str, magic: u64, file_ops: &'static dyn FileOps) -> Pseudo {
+    with_d_op(name, magic, file_ops, None)
 }
 
-static NS_FILE_OPS: NsFileOps = NsFileOps;
-
-const fn pseudo(name: &'static str, magic: u64, file_ops: &'static dyn FileOps) -> Pseudo {
+/// One with dentry operations of its own (Linux init_pseudo's dops)
+const fn with_d_op(
+    name: &'static str,
+    magic: u64,
+    file_ops: &'static dyn FileOps,
+    d_op: Option<&'static DentryOps>,
+) -> Pseudo {
     Pseudo {
         ty: FileSystemType {
             name,
@@ -104,6 +104,7 @@ const fn pseudo(name: &'static str, magic: u64, file_ops: &'static dyn FileOps) 
             fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
         },
         ops: PseudoSuperOps { magic },
+        d_op,
         mnt: spin::Once::new(),
     }
 }
@@ -111,7 +112,12 @@ const fn pseudo(name: &'static str, magic: u64, file_ops: &'static dyn FileOps) 
 pub static PIPEFS: Pseudo = pseudo("pipefs", PIPEFS_MAGIC, &NO_OPEN);
 pub static SOCKFS: Pseudo = pseudo("sockfs", SOCKFS_MAGIC, &NO_OPEN);
 pub static ANON_INODEFS: Pseudo = pseudo("anon_inodefs", ANON_INODE_FS_MAGIC, &NO_OPEN);
-pub static NSFS: Pseudo = pseudo("nsfs", NSFS_MAGIC, &NS_FILE_OPS);
+pub static NSFS: Pseudo = with_d_op(
+    "nsfs",
+    NSFS_MAGIC,
+    &nsfs::NS_FILE_OPS,
+    Some(&nsfs::NS_DENTRY_OPS),
+);
 pub static BDEV: Pseudo = pseudo("bdev", BDEVFS_MAGIC, &NO_OPEN);
 
 const ALL: [&Pseudo; 5] = [&PIPEFS, &SOCKFS, &ANON_INODEFS, &NSFS, &BDEV];
@@ -126,6 +132,9 @@ fn of_type(ty: &FileSystemType) -> Option<&'static Pseudo> {
 fn pseudo_mount(ty: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
     let p = of_type(ty).ok_or(KernelError::InvalidArgument)?;
     let sb = SuperBlock::new(ty, &p.ops, 0)?;
+    if let Some(op) = p.d_op {
+        sb.set_d_op(op);
+    }
     let root = Inode::alloc(Inode::new(
         1,
         InodeMode::directory(0o600),
@@ -136,7 +145,10 @@ fn pseudo_mount(ty: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBl
         Arc::downgrade(&sb),
         &NULL_INODE_OPS,
     ))?;
-    sb.set_root(try_arc(Dentry::new_root(root, Arc::downgrade(&sb)))?);
+    sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
+        root,
+        Arc::downgrade(&sb),
+    ))?);
     Ok(sb)
 }
 
@@ -174,7 +186,7 @@ impl Pseudo {
     pub fn path(&self, name: &str, inode: Arc<Inode>) -> Result<Path, KernelError> {
         let mnt = self.mnt()?;
         let d = Dentry::new_pseudo(name.as_bytes(), inode, &mnt.sb)?;
-        Ok(Path::new(mnt, try_arc(d)?))
+        Ok(Path::new(mnt, crate::fs::DentryRef::new(d)?))
     }
 }
 

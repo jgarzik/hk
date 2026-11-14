@@ -792,7 +792,7 @@ fn cgroupfs_mount(
     })?);
 
     // Create root dentry
-    let root_dentry = try_arc(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
+    let root_dentry = crate::fs::DentryRef::new(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
 
     // Set root in superblock
     sb.set_root(root_dentry);

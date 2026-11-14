@@ -36,12 +36,14 @@
 //! fault: -> mmap_lock, as in Linux). Wait conditions and poll never take
 //! it (poll runs under epoll's spin lock): like Linux pipe_readable /
 //! pipe_writable they read the ring indices `Pipe.head`/`Pipe.tail`,
-//! which the guard publishes as it unlocks. Wakeups follow the unlock.
-//! O_ASYNC files are on `fasync_readers`/`fasync_writers` (by access
-//! mode; changed under `Pipe.inner`, Linux pipe_fasync); their SIGIO is
-//! sent after the unlock too, never under `Pipe.inner` or `Inode.i_pipe`
-//! (Linux sends under pipe->mutex; hk's senders hold no spin lock and
-//! nothing but the frame allocator and user faults nests in the mutex).
+//! which the guard publishes as it unlocks (or before a wakeup made
+//! under it). Wakeups follow the unlock where Linux's do (read, write,
+//! most of splice). O_ASYNC files are on `fasync_readers` /
+//! `fasync_writers` (by access mode; changed under `Pipe.inner`, Linux
+//! pipe_fasync); their SIGIO goes with the wakeups (Linux pipe_read,
+//! pipe_write: after the unlock), and a release's under `Inode.i_pipe`,
+//! the lock of the count change (Linux pipe_release: under pipe->mutex,
+//! the counts' lock there).
 //! splice/tee lock two pipes in address order (Linux pipe_double_lock).
 //!
 //! ## Reference
@@ -614,7 +616,7 @@ impl Pipe {
     }
 
     /// SIGIO to the O_ASYNC readers (Linux kill_fasync(fasync_readers,
-    /// SIGIO, POLL_IN)); `Pipe.inner` not held
+    /// SIGIO, POLL_IN))
     fn kill_readers(&self) {
         kill_fasync(&self.fasync_readers, crate::signal::SIGIO, POLL_IN);
     }
@@ -634,16 +636,6 @@ impl Pipe {
     pub fn wake_writers(&self) {
         self.wake_wr();
         self.kill_writers();
-    }
-
-    /// A file of the pipe was released: if that was the last reader or
-    /// writer but not both, the O_ASYNC files of both sides learn it
-    /// (Linux pipe_release); `Pipe.inner` and `Inode.i_pipe` not held
-    fn release_notify(&self) {
-        if self.has_readers() != self.has_writers() {
-            self.kill_readers();
-            self.kill_writers();
-        }
     }
 }
 
@@ -703,12 +695,21 @@ impl DerefMut for PipeGuard<'_> {
     }
 }
 
-impl Drop for PipeGuard<'_> {
-    /// Publish the ring indices for lockless readers, then unlock (the
-    /// mutex guard field drops after this)
-    fn drop(&mut self) {
+impl PipeGuard<'_> {
+    /// Publish the ring indices for lockless readers (Linux's stores to
+    /// pipe->head / pipe->tail); a wakeup made under the lock follows
+    /// it, so the woken see the change
+    pub fn publish(&self) {
         self.pipe.head.store(self.g.head, Ordering::Release);
         self.pipe.tail.store(self.g.tail, Ordering::Release);
+    }
+}
+
+impl Drop for PipeGuard<'_> {
+    /// Publish the ring indices, then unlock (the mutex guard field
+    /// drops after this)
+    fn drop(&mut self) {
+        self.publish();
     }
 }
 
@@ -716,42 +717,38 @@ impl Drop for PipeGuard<'_> {
 /// is there (at most `to`'s room) and returns, 0 at EOF (no writers).
 /// The copy runs under the sleeping `Pipe.inner` (it may fault). Every
 /// read that gets that far, whatever its result, then signals the
-/// O_ASYNC writers (Linux pipe_read's kill_fasync).
+/// O_ASYNC writers (Linux pipe_read's kill_fasync); one a signal
+/// interrupts in its wait returns before (Linux: -ERESTARTSYS).
 fn pipe_read(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
     if to.is_empty() {
         return Ok(0);
     }
-    let r = pipe_read_wait(pipe, to, nonblock);
-    pipe.kill_writers();
-    r
-}
-
-/// pipe_read's wait and copy
-fn pipe_read_wait(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
-    loop {
+    let r = loop {
         let mut inner = pipe.lock();
         if !inner.is_empty() {
             let r = inner.read_to(to);
             drop(inner);
             // Room for writers (Linux pipe_read)
             pipe.wake_wr();
-            return r;
+            break r;
         }
         // EOF is decided under the lock that saw the ring empty (Linux
         // pipe_read checks pipe->writers under pipe->mutex): a writer's
         // last write unlocks before its close drops the count, so data
         // written before the close is never mistaken for EOF
         if !pipe.has_writers() {
-            return Ok(0);
+            break Ok(0);
         }
         drop(inner);
         if nonblock {
-            return Err(KernelError::WouldBlock);
+            break Err(KernelError::WouldBlock);
         }
         // Block until data or EOF; a signal ends the wait (-ERESTARTSYS)
         pipe.wait_queue
             .wait_event_interruptible(|| pipe.readable())?;
-    }
+    };
+    pipe.kill_writers();
+    r
 }
 
 /// EPIPE's SIGPIPE to the writing thread
@@ -908,7 +905,6 @@ impl FileOps for PipeReadFileOps {
         let pipe = pipe_of(file)?;
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         fifo_put(&inode, pipe, flags::O_RDONLY);
-        pipe.release_notify();
         Ok(())
     }
 
@@ -1008,7 +1004,6 @@ impl FileOps for PipeWriteFileOps {
         let pipe = pipe_of(file)?;
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         fifo_put(&inode, pipe, flags::O_WRONLY);
-        pipe.release_notify();
         Ok(())
     }
 
@@ -1263,7 +1258,6 @@ impl FileOps for FifoFileOps {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let f = fifo_of(file)?;
         fifo_put(&inode, &f.pipe, file.get_flags() & flags::O_ACCMODE);
-        f.pipe.release_notify();
         Ok(())
     }
 
@@ -1272,9 +1266,11 @@ impl FileOps for FifoFileOps {
     }
 }
 
-/// Drop one open of a FIFO in `mode`: its reader/writer counts (waking
-/// the other side), and the inode's pipe with the last file; all under
-/// the slot lock, like the open side
+/// Drop one open of a FIFO in `mode` (Linux pipe_release): its
+/// reader/writer counts (waking the other side; if that was the last
+/// reader or writer but not both, the O_ASYNC files of both sides
+/// learn it), and the inode's pipe with the last file; all under the
+/// slot lock, like the open side
 fn fifo_put(inode: &crate::fs::inode::Inode, pipe: &Pipe, mode: u32) {
     let mut slot = inode.i_pipe.lock();
     if mode != flags::O_WRONLY {
@@ -1282,6 +1278,10 @@ fn fifo_put(inode: &crate::fs::inode::Inode, pipe: &Pipe, mode: u32) {
     }
     if mode != flags::O_RDONLY {
         pipe.remove_writer();
+    }
+    if pipe.has_readers() != pipe.has_writers() {
+        pipe.kill_readers();
+        pipe.kill_writers();
     }
     if let Some((_, files)) = slot.as_mut() {
         *files -= 1;
@@ -1311,7 +1311,7 @@ pub fn create_pipe(pipe_flags: u32) -> Result<(FileRef, FileRef), KernelError> {
     let write_flags = flags::O_WRONLY | (pipe_flags & (flags::O_NONBLOCK | flags::O_DIRECT));
 
     let read_file = File::new_anon(
-        Arc::clone(&dentry),
+        dentry.clone(),
         Some(mnt.clone()),
         read_flags,
         &PIPE_READ_FOPS,

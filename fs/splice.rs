@@ -396,13 +396,15 @@ fn move_bufs(
         let to_move = (len - moved).min(available);
 
         if let Some(ref page) = src_buf.page {
-            // Create new buffer in destination
-            let new_buf = PipeBuffer::new(
-                Arc::clone(page),
-                src_buf.offset,
-                to_move as u32,
-                src_buf.flags & !pipe_buf_flags::CAN_MERGE,
-            );
+            // A whole buffer moves with its flags; part of one shares
+            // the page, so the copy may not be stolen or merged into
+            // (Linux splice_pipe_to_pipe)
+            let flags = if to_move == available {
+                src_buf.flags
+            } else {
+                src_buf.flags & !(pipe_buf_flags::GIFT | pipe_buf_flags::CAN_MERGE)
+            };
+            let new_buf = PipeBuffer::new(Arc::clone(page), src_buf.offset, to_move as u32, flags);
 
             if dst_guard.push_buffer(new_buf).is_err() {
                 break;
@@ -480,12 +482,9 @@ fn do_splice_file_to_pipe(
     unsafe {
         core::ptr::copy_nonoverlapping(buf.as_ptr(), crate::arch::phys_to_virt(page.frame), n);
     }
-    let pb = PipeBuffer::new(
-        page,
-        0,
-        n as u32,
-        pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
-    );
+    // Not mergeable: only pipe_write makes such buffers (Linux
+    // copy_splice_read's default_pipe_buf_ops, no CAN_MERGE)
+    let pb = PipeBuffer::new(page, 0, n as u32, pipe_buf_flags::OWNED);
     // Room was seen under this lock: the push cannot fail
     if g.push_buffer(pb).is_err() {
         return Err(KernelError::WouldBlock);
@@ -514,6 +513,8 @@ fn do_splice_pipe_to_file(
     };
     let mut written = 0;
     let mut err = None;
+    // A buffer was freed: room for writers (Linux sd->need_wakeup)
+    let mut wake = false;
     while written < len && !g.is_empty() {
         let tail = g.tail;
         let pb = &g.bufs[tail];
@@ -552,6 +553,7 @@ fn do_splice_pipe_to_file(
         if n == avail {
             pb.release();
             g.tail = (tail + 1) % PIPE_RING;
+            wake = true;
         } else {
             pb.offset += n as u32;
             pb.len -= n as u32;
@@ -562,10 +564,12 @@ fn do_splice_pipe_to_file(
             break;
         }
     }
-    drop(g);
-    if written > 0 {
+    // Linux splice_from_pipe_end, under pipe_lock
+    if wake {
+        g.publish();
         pipe.wake_writers();
     }
+    drop(g);
     if written == 0
         && let Some(e) = err
     {
@@ -679,9 +683,9 @@ pub fn sys_vmsplice(
     r
 }
 
-/// Copy the segments into pipe pages, a page at a time, until they or
-/// the room run out (Linux iter_to_pipe); a fault or no memory ends it,
-/// an error only if nothing was copied
+/// Copy the segments into pipe pages, a buffer per user page touched,
+/// until they or the room run out (Linux iter_to_pipe); a fault or no
+/// memory ends it, an error only if nothing was copied
 fn iter_to_pipe(g: &mut PipeGuard<'_>, segs: &[IoVec]) -> KernelResult<usize> {
     let mut total = 0usize;
     for seg in segs {
@@ -707,21 +711,18 @@ fn iter_to_pipe(g: &mut PipeGuard<'_>, segs: &[IoVec]) -> KernelResult<usize> {
     Ok(total)
 }
 
-/// A pipe buffer holding up to a page of user memory at `addr` (`len`
-/// bytes left there): EFAULT, ENOMEM
+/// A pipe buffer holding the user memory at `addr` (`len` bytes left
+/// there) up to its page's end, as Linux's buffer holds that user
+/// page; not mergeable (Linux: a later write takes a new buffer):
+/// EFAULT, ENOMEM
 fn page_from_user(addr: u64, len: u64) -> KernelResult<PipeBuffer> {
     let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
-    let n = len.min(PAGE_SIZE as u64) as usize;
+    let n = len.min(PAGE_SIZE as u64 - addr % PAGE_SIZE as u64) as usize;
     // SAFETY: page.frame is a freshly allocated, kernel-mapped page of
     // PAGE_SIZE bytes owned by this buffer, and `n <= PAGE_SIZE`
     let dst = unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), n) };
     copy_from_user(dst, addr, n).map_err(|_| KernelError::BadAddress)?;
-    Ok(PipeBuffer::new(
-        page,
-        0,
-        n as u32,
-        pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
-    ))
+    Ok(PipeBuffer::new(page, 0, n as u32, pipe_buf_flags::OWNED))
 }
 
 /// sys_sendfile64 - send file data to socket/file

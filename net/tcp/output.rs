@@ -24,6 +24,7 @@ use super::ack::DELACK_MAX;
 use super::cb::{Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, flags};
 use crate::mm::page_alloc::Gfp;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
+use crate::net::mib::*;
 use crate::net::skb::SkBuff;
 
 /// TCP header without options
@@ -72,8 +73,9 @@ fn fragment(skb: &mut SkBuff, at: usize, gfp: Gfp) -> Option<Box<SkBuff>> {
 }
 
 impl TcpCb {
-    /// Queue a SYN (SYN_SENT) or SYN-ACK (SYN_RECEIVED) with our options
-    pub(super) fn syn_seg(&mut self, out: &mut Out) {
+    /// Queue a SYN (SYN_SENT) or SYN-ACK (SYN_RECEIVED) with our
+    /// options; false without memory
+    pub(super) fn syn_seg(&mut self, out: &mut Out) -> bool {
         let synack = self.state == TcpState::SynReceived;
         let ts = if !self.ts_ok {
             None
@@ -92,7 +94,15 @@ impl TcpCb {
             ts,
             ..Default::default()
         };
-        out.ctl(h);
+        out.ctl(h)
+    }
+
+    /// A SYN or SYN-ACK again (Linux __tcp_retransmit_skb /
+    /// tcp_rtx_synack)
+    pub(super) fn syn_rtx(&mut self, out: &mut Out) {
+        self.syn_seg(out);
+        self.tcp_stat(TCP_MIB_RETRANSSEGS);
+        self.net_stat(LINUX_MIB_TCPSYNRETRANS);
     }
 
     /// The header of a segment of this connection at `seq` with flags
@@ -108,6 +118,10 @@ impl TcpCb {
         if fl & flags::ACK != 0 {
             self.ack_sent();
         }
+        // Linux __tcp_transmit_skb: OutSegs leaves out retransmissions
+        // (hk's SND.MAX is Linux's snd_nxt)
+        let end = seq.wrapping_add(len + u32::from(fl & flags::FIN != 0));
+        self.tcp_stat_if(after(end, self.snd_max) || end == seq, TCP_MIB_OUTSEGS);
         self.stats.segs_out = self.stats.segs_out.wrapping_add(1);
         if len != 0 {
             self.stats.data_segs_out = self.stats.data_segs_out.wrapping_add(1);
@@ -321,9 +335,16 @@ impl TcpCb {
             self.data_sent(now);
             self.lsndtime = now;
         }
+        // Linux tcp_event_new_data_sent
+        self.net_stat_if(new, LINUX_MIB_TCPORIGDATASENT);
         if before(seq, self.snd_max) {
             self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
             self.stats.bytes_retrans += u64::from(n);
+            self.tcp_stat(TCP_MIB_RETRANSSEGS);
+            // After a timeout (Linux TCP_CA_Loss) every segment but
+            // the head, which the timer itself resent, is a slow start
+            // retransmission (tcp_xmit_retransmit_queue)
+            self.net_stat_if(seq != self.snd_una, LINUX_MIB_TCPSLOWSTARTRETRANS);
         }
         self.stats.bytes_sent += u64::from(n);
         self.snd_nxt = next;
@@ -427,7 +448,7 @@ impl TcpCb {
     pub(super) fn retransmit_head(&mut self, out: &mut Out) {
         self.rtt_seq = None;
         if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
-            self.syn_seg(out);
+            self.syn_rtx(out);
             return;
         }
         let Some(head) = self.rtx.first() else {
@@ -459,6 +480,16 @@ impl TcpCb {
         let n = len.min(mss);
         self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
         self.stats.bytes_retrans += n as u64;
+        self.tcp_stat(TCP_MIB_RETRANSSEGS);
+    }
+
+    /// `retransmit_head` in fast recovery (Linux
+    /// tcp_xmit_retransmit_queue outside TCP_CA_Loss)
+    pub(super) fn fast_retransmit(&mut self, out: &mut Out) {
+        if self.state.synced() {
+            self.net_stat(LINUX_MIB_TCPFASTRETRANS);
+        }
+        self.retransmit_head(out);
     }
 
     /// Merge the skbs after the retransmit queue's head into it while
@@ -495,8 +526,10 @@ impl TcpCb {
 
     /// Zero-window or keepalive probe: an old sequence number that the
     /// peer answers with an ACK carrying its window (Linux
-    /// tcp_xmit_probe_skb)
-    pub(super) fn send_probe(&mut self, out: &mut Out) {
+    /// tcp_xmit_probe_skb), counted in `mib` (TCPWinProbe or
+    /// TCPKeepAlive)
+    pub(super) fn send_probe(&mut self, mib: usize, out: &mut Out) {
+        self.net_stat(mib);
         self.send_ctl(self.snd_una.wrapping_sub(1), flags::ACK, out);
     }
 

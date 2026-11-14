@@ -57,7 +57,7 @@ pub use crate::util::error::KernelError;
 use crate::util::error::KernelResult;
 pub use blkdev_ops::BLOCK_FILE_OPS;
 pub use dac::{MAY_EXEC, MAY_READ, MAY_WRITE};
-pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
+pub use dentry::{DCACHE, Dentry, DentryCache, DentryRef, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, FileRef, RwFlags, flags, seek};
 pub use fsstruct::{FsStruct, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
@@ -144,8 +144,8 @@ pub fn open_exec(path: Path) -> KernelResult<FileRef> {
 /// # Arguments
 /// * `p1` - First directory dentry (typically old_parent)
 /// * `p2` - Second directory dentry (typically new_parent)
-pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> RenameLock {
-    let lock = |d: &Arc<Dentry>| d.get_inode().map(|i| i.lock_arc());
+pub fn lock_rename(p1: &DentryRef, p2: &DentryRef) -> RenameLock {
+    let lock = |d: &DentryRef| d.get_inode().map(|i| i.lock_arc());
     let mut g = RenameLock {
         trap: None,
         locks: [None, None],
@@ -172,7 +172,7 @@ pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> RenameLock {
         g.trap = Some(p2.clone());
         false
     } else {
-        Arc::as_ptr(p1) < Arc::as_ptr(p2)
+        DentryRef::as_ptr(p1) < DentryRef::as_ptr(p2)
     };
     let (a, b) = if first_p1 { (p1, p2) } else { (p2, p1) };
     g.locks[0] = lock(a);
@@ -184,7 +184,7 @@ pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> RenameLock {
 /// superblock's rename mutex (Linux unlock_rename)
 #[must_use]
 pub struct RenameLock {
-    trap: Option<Arc<Dentry>>,
+    trap: Option<DentryRef>,
     /// The parents' i_rwsem, in the order taken
     locks: [Option<inode::InodeLockArc>; 2],
     /// Its s_vfs_rename_mutex is held (cross-directory)
@@ -193,7 +193,7 @@ pub struct RenameLock {
 
 impl RenameLock {
     /// The parent that is an ancestor of the other, if one is
-    pub fn trap(&self) -> Option<&Arc<Dentry>> {
+    pub fn trap(&self) -> Option<&DentryRef> {
         self.trap.as_ref()
     }
 }
@@ -211,8 +211,8 @@ impl Drop for RenameLock {
 
 /// Same directory for lock_rename: the same dentry, or two dentries of
 /// one inode (bind mounts) - its i_rwsem must be taken once
-fn same_dir(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> bool {
-    Arc::ptr_eq(p1, p2)
+fn same_dir(p1: &DentryRef, p2: &DentryRef) -> bool {
+    DentryRef::ptr_eq(p1, p2)
         || matches!((p1.get_inode(), p2.get_inode()), (Some(a), Some(b)) if Arc::ptr_eq(&a, &b))
 }
 

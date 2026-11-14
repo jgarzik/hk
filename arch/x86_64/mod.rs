@@ -495,10 +495,7 @@ impl VfsInitOps for X86_64Arch {
 ///
 /// Note: The actual mount is performed by userspace init (boot_tester2)
 /// via the mount syscall, simulating how real init/systemd works.
-fn init_vfat_ramdisk(
-    root_dentry: &alloc::sync::Arc<crate::fs::Dentry>,
-    _dev_dentry: &alloc::sync::Arc<crate::fs::Dentry>,
-) {
+fn init_vfat_ramdisk(root_dentry: &crate::fs::DentryRef, _dev_dentry: &crate::fs::DentryRef) {
     use crate::block::create_ramdisk_from_data;
     use crate::fs::ramfs_create_dir;
 

@@ -175,6 +175,13 @@ pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError>;
 
+    /// A directory that is permanently empty (Linux is_empty_dir_inode:
+    /// make_empty_dir_inode's operations), so a mount on it hides
+    /// nothing. Default no.
+    fn is_empty_dir(&self, _inode: &Inode) -> bool {
+        false
+    }
+
     /// A cached dentry of this inode is still good for the walk (Linux
     /// d_revalidate): false drops it and the walk looks the name up
     /// again. Default yes; procfs says no once its task or fd is gone.
@@ -222,6 +229,13 @@ pub trait InodeOps: Send + Sync {
     /// ->setattr refusing ATTR_MODE); default yes
     fn chmod_ok(&self, inode: &Inode, perm: u16) -> Result<(), KernelError> {
         let _ = (inode, perm);
+        Ok(())
+    }
+
+    /// chown may change the owner or group (after the owner checks;
+    /// Linux ->setattr refusing ATTR_UID / ATTR_GID); default yes
+    fn chown_ok(&self, inode: &Inode) -> Result<(), KernelError> {
+        let _ = inode;
         Ok(())
     }
 
@@ -587,7 +601,7 @@ pub struct Inode {
     pub(crate) i_io_list: list::Link,
 
     /// Writers (> 0) or executions denying them (< 0) (Linux
-    /// i_writecount; `get_write_access`, `deny_write_access`)
+    /// i_writecount; `get_write_access`, `deny_write`)
     i_writecount: core::sync::atomic::AtomicI32,
 
     /// An active swap area (Linux S_SWAPFILE): writes and truncates are
@@ -1204,10 +1218,6 @@ pub static NULL_INODE_OPS: NullInodeOps = NullInodeOps;
 /// truncate (Linux get_write_access / put_write_access)
 pub struct InodeWrite(Arc<Inode>);
 
-/// Writes denied while a program runs from the inode (Linux
-/// deny_write_access / allow_write_access, held by the address space)
-pub struct DenyWrite(Arc<Inode>);
-
 impl Inode {
     /// Take write access (Linux get_write_access): ETXTBSY while the
     /// file is being executed
@@ -1225,9 +1235,10 @@ impl Inode {
         }
     }
 
-    /// Deny writes while executing it (Linux exe_file_deny_write_access):
-    /// ETXTBSY while it is open for writing
-    pub fn deny_write_access(self: &Arc<Self>) -> Result<DenyWrite, KernelError> {
+    /// Deny writes while executing it (Linux exe_file_deny_write_access
+    /// on its inode): ETXTBSY while it is open for writing. Taken and
+    /// released through a file ([`super::file::DenyWrite`]).
+    pub(super) fn deny_write(&self) -> Result<(), KernelError> {
         let c = &self.i_writecount;
         let mut v = c.load(Ordering::Relaxed);
         loop {
@@ -1235,37 +1246,26 @@ impl Inode {
                 return Err(KernelError::TextBusy);
             }
             match c.compare_exchange_weak(v, v - 1, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => return Ok(DenyWrite(self.clone())),
+                Ok(_) => return Ok(()),
                 Err(now) => v = now,
             }
         }
+    }
+
+    /// Another denial while one is held (fork's copy of it)
+    pub(super) fn deny_write_again(&self) {
+        self.i_writecount.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Release a denial (Linux exe_file_allow_write_access)
+    pub(super) fn allow_write(&self) {
+        self.i_writecount.fetch_add(1, Ordering::AcqRel);
     }
 }
 
 impl Drop for InodeWrite {
     fn drop(&mut self) {
         self.0.i_writecount.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-impl DenyWrite {
-    /// The inode executed
-    pub fn inode(&self) -> &Arc<Inode> {
-        &self.0
-    }
-}
-
-/// fork's copy of the address space denies writes again
-impl Clone for DenyWrite {
-    fn clone(&self) -> Self {
-        self.0.i_writecount.fetch_sub(1, Ordering::AcqRel);
-        DenyWrite(self.0.clone())
-    }
-}
-
-impl Drop for DenyWrite {
-    fn drop(&mut self) {
-        self.0.i_writecount.fetch_add(1, Ordering::AcqRel);
     }
 }
 

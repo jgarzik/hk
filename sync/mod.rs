@@ -152,9 +152,12 @@ mod sched {
 pub fn might_sleep() {
     #[cfg(feature = "lockdep")]
     lockdep::might_sleep();
-    // Host unit tests have no CPU state to check
+    // Host unit tests have no CPU state to check. An interrupt handler
+    // is checked whatever task it interrupted, the idle task included
+    // (Linux __might_resched: preempt_count() is the hardirq's there)
     #[cfg(not(any(feature = "lockdep", test)))]
-    if sched::can_sleep() && crate::system_state::checks_apply() && in_atomic() {
+    if (sched::can_sleep() || in_interrupt()) && crate::system_state::checks_apply() && in_atomic()
+    {
         atomic_sleep(core::panic::Location::caller());
     }
 }

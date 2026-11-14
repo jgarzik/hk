@@ -54,13 +54,21 @@ pub fn siphash(key: [u64; 2], words: &[u64]) -> u64 {
 
 /// SipHash-2-4 of the bytes `b` under `key` (Linux siphash(data, len))
 pub fn siphash_bytes(key: [u64; 2], b: &[u8]) -> u64 {
+    siphash_bytes_map(key, b, |c| c)
+}
+
+/// [`siphash_bytes`] of `b` with `f` applied to each byte, nothing
+/// copied (Linux partial_name_hash over nls_tolower)
+pub fn siphash_bytes_map(key: [u64; 2], b: &[u8], f: impl Fn(u8) -> u8) -> u64 {
     let mut v = init(key);
     let (words, rest) = b.as_chunks::<8>();
     for w in words {
-        compress(&mut v, u64::from_le_bytes(*w));
+        compress(&mut v, u64::from_le_bytes(w.map(&f)));
     }
     let mut last = [0u8; 8];
-    last[..rest.len()].copy_from_slice(rest);
+    for (d, &c) in last.iter_mut().zip(rest) {
+        *d = f(c);
+    }
     // Only the length's low byte goes in (the reference's `b`)
     last[7] = b.len() as u8;
     finish(v, u64::from_le_bytes(last))
@@ -88,5 +96,10 @@ mod tests {
             siphash(key(), &[u64::from_le_bytes(m)])
         );
         assert_eq!(siphash_bytes(key(), &m), 0x93f5_f579_9a93_2462);
+        let up: [u8; 9] = *b"ABCDEFGHI";
+        assert_eq!(
+            siphash_bytes_map(key(), &up, |c| c.to_ascii_lowercase()),
+            siphash_bytes(key(), b"abcdefghi")
+        );
     }
 }

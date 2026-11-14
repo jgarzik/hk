@@ -22,7 +22,9 @@
 //! zero marks the mount doomed (Linux MNT_DOOMED) and queues its
 //! teardown. [`MountRef::try_get`] from a `Weak` is a fast add while the
 //! mount is in a namespace, else refused once doomed, under MOUNT_LOCK
-//! (Linux legitimize_mnt).
+//! (Linux legitimize_mnt). A lockless walk's add that raced a
+//! synchronous umount is given back (MNT_SYNC_UMOUNT), so the umount's
+//! puts are the last and umount(2) returns with the mount torn down.
 //!
 //! The teardown (Linux cleanup_mnt: submounts, mountpoint, root dentry,
 //! superblock, any of which may sleep) runs later with nothing held, in
@@ -33,12 +35,15 @@
 //! but MOUNT_LOCK.
 //!
 //! The mount's memory is an `Arc`: one strong count stands for all its
-//! references, taken back by the teardown; list entries and `Weak`s keep
+//! references, taken back by the teardown, which drops it a grace
+//! period later (Linux delayed_free_vfsmnt), so an RCU walk may read a
+//! mount it reached with no reference; list entries and `Weak`s keep
 //! the rest.
 //!
 //! Locking: a put's exact path and a `try_get` outside a namespace take
 //! MOUNT_LOCK (write, locking read): no put of a mount outside a
-//! namespace under it.
+//! namespace under it, but [`MountRef::put_held`] (never the last:
+//! umount_tree drops the extra references it holds under MOUNT_LOCK).
 //! `DELAYED_MNTPUT` is an IrqSpinlock leaf. The teardown takes
 //! NAMESPACE_SEM and MOUNT_LOCK (submounts) and `s_mounts`, with nothing
 //! else held.
@@ -49,7 +54,7 @@ use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 use core::sync::atomic::{Ordering, fence};
 
-use super::mount::{MOUNT_LOCK, Mount};
+use super::mount::{MNT_SYNC_UMOUNT, MOUNT_LOCK, Mount};
 
 /// `Mount.mnt_ns` of a kernel mount, in no namespace of its own (Linux
 /// MNT_NS_INTERNAL): its puts take the fast path, and it is never
@@ -124,7 +129,15 @@ impl MountRef {
     /// decided under MOUNT_LOCK, where a mount is doomed
     pub fn try_get(w: &Weak<Mount>) -> Option<Self> {
         let a = w.upgrade()?;
-        let p = NonNull::from(a.as_ref());
+        Self::try_get_mnt(&a)
+        // `a` dropped: never the last strong count while a reference is
+        // held; after the teardown, only memory goes
+    }
+
+    /// [`MountRef::try_get`] for a mount whose memory the caller's lock
+    /// keeps (Linux legitimize_mnt on mnt_parent under namespace_sem)
+    pub fn try_get_mnt(a: &Mount) -> Option<Self> {
+        let p = NonNull::from(a);
         if have_cpu() {
             let _g = crate::sync::rcu::read_lock();
             // In a namespace: taking it out clears `mnt_ns` and puts the
@@ -143,8 +156,42 @@ impl MountRef {
         }
         a.pcp_add(1);
         Some(Self(p))
-        // `a` dropped: never the last strong count while a reference is
-        // held; after the teardown, only memory goes
+    }
+
+    /// A reference to `m`, reached under an RCU read guard with
+    /// MOUNT_LOCK's sequence `seq` sampled before (Linux
+    /// __legitimize_mnt): the add first, then the sequence. Unmoved, no
+    /// link to `m` changed since the sample, so the tree still holds its
+    /// reference and the add is counted. Moved: see
+    /// [`MountRef::legitimize_moved`].
+    pub(super) fn legitimize(m: &Mount, seq: u32) -> Result<Self, Option<Self>> {
+        if MOUNT_LOCK.read_retry(seq) {
+            return Err(None);
+        }
+        m.pcp_add(1);
+        // Pairs with `put_slow`'s: its sum sees this add, or this sees
+        // the write section that took the tree's reference away
+        fence(Ordering::SeqCst);
+        if !MOUNT_LOCK.read_retry(seq) {
+            return Ok(Self(NonNull::from(m)));
+        }
+        Self::legitimize_moved(m)
+    }
+
+    /// [`MountRef::legitimize`]'s add to `m` raced a mount change: under
+    /// MOUNT_LOCK, it is taken back (`Err(None)`) from a doomed mount,
+    /// whose count reached zero without it, and from one a synchronous
+    /// umount took out (MNT_SYNC_UMOUNT), whose references that umount
+    /// puts after a grace period this walk is inside, so it is not the
+    /// last; else the caller gets the reference to put, with the guard
+    /// released, before it retries (`Err(Some)`)
+    fn legitimize_moved(m: &Mount) -> Result<Self, Option<Self>> {
+        let _ml = MOUNT_LOCK.read_excl();
+        if m.flags() & MNT_SYNC_UMOUNT != 0 || m.doomed.load(Ordering::Acquire) {
+            m.pcp_add(-1);
+            return Err(None);
+        }
+        Err(Some(Self(NonNull::from(m))))
     }
 
     /// Another reference to a list entry (by [`MountRef::into_entry`])
@@ -154,6 +201,17 @@ impl MountRef {
         debug_assert!(m.is_live(), "mount: doomed entry on a list");
         m.pcp_add(1);
         Self(NonNull::from(m))
+    }
+
+    /// Put a reference that is not the last (Linux mnt_add_count(mnt,
+    /// -1)): another one the caller holds, or the tree's while the
+    /// caller holds NAMESPACE_SEM write and MOUNT_LOCK, outlives it. A
+    /// take from this CPU's part, lock-free, so safe under MOUNT_LOCK
+    /// (an umount drops a list's reference to a mount its set holds).
+    /// A put that is the last instead leaks the mount, never frees it.
+    pub(super) fn put_held(self) {
+        let me = ManuallyDrop::new(self);
+        me.mount().pcp_add(-1);
     }
 
     /// The reference, as the `Arc` an intrusive list keeps (an entry of
@@ -182,6 +240,12 @@ impl MountRef {
     /// A non-owning link to the mount (no reference)
     pub fn downgrade(this: &Self) -> Weak<Mount> {
         Arc::downgrade(&this.arc())
+    }
+
+    /// The shared `Arc`, another strong count (an entry of the mount
+    /// hash, which holds one)
+    pub(super) fn arc_of(this: &Self) -> Arc<Mount> {
+        Arc::clone(&this.arc())
     }
 
     /// The mount's address (its identity)
@@ -301,6 +365,12 @@ pub(super) unsafe fn __cleanup_mnt(cb: *const CallbackHead) {
     // SAFETY: the mount is doomed (`put_slow`): no reference exists or
     // can be made, and this runs once per mount
     unsafe { m.cleanup() };
+    // An RCU walk that reached it before its links were cleared may
+    // still read it (Linux cleanup_mnt's call_rcu of
+    // delayed_free_vfsmnt)
+    if have_cpu() {
+        crate::sync::rcu::kfree_rcu(m);
+    }
 }
 
 /// Mounts whose teardown waits for the system workqueue (Linux
@@ -358,8 +428,17 @@ impl<T> MntOwned<T> {
     /// the mount is doomed (or never had a reference) and is off every
     /// list that hands out a borrowed one.
     pub(super) unsafe fn take(&self) -> T {
-        // SAFETY: the caller's contract gives exclusive use
-        unsafe { ManuallyDrop::take(&mut *self.0.get()) }
+        // SAFETY: the caller's contract: this is the one release. A raw
+        // read, no `&mut`: the bits stay, for `stale`
+        unsafe { ManuallyDrop::into_inner(core::ptr::read(self.0.get())) }
+    }
+
+    /// The value's bits, which `take` leaves in place (Linux: the
+    /// pointer fields of a mount torn down but not yet freed): for an
+    /// RCU walk that may reach the mount after its teardown, to compare
+    /// addresses, never to use the value
+    pub(super) fn stale(&self) -> *const T {
+        self.0.get().cast::<T>()
     }
 }
 
@@ -369,5 +448,29 @@ impl<T> core::ops::Deref for MntOwned<T> {
         // SAFETY: `take` runs only once no reference is left that could
         // reach this (its contract)
         unsafe { &*self.0.get() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lockless walk's add that raced a synchronous umount is given
+    /// back (Linux __legitimize_mnt: MNT_SYNC_UMOUNT), so the umount's
+    /// puts end the mount; after any other umount the walk keeps it to
+    /// put
+    #[test]
+    fn sync_umount_refuses_legitimize() {
+        let m = super::super::mount::test_mnt();
+        let before = m.mnt_get_count();
+        m.pcp_add(1);
+        let r = MountRef::legitimize_moved(&m);
+        assert!(matches!(&r, Err(Some(_))));
+        drop(r);
+        assert_eq!(m.mnt_get_count(), before);
+        m.mark(MNT_SYNC_UMOUNT, true);
+        m.pcp_add(1);
+        assert!(matches!(MountRef::legitimize_moved(&m), Err(None)));
+        assert_eq!(m.mnt_get_count(), before);
     }
 }

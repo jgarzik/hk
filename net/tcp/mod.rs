@@ -30,9 +30,9 @@
 //! two CPUs never reorder one connection's segments), the error and
 //! shutdown bits and the lockless view (`Snap`: state, queue sizes,
 //! writability, send window edges, Linux's READ_ONCE fields that
-//! tcp_poll, the waits and tcp_v4_err read) are published. Wakeups run
-//! with no spin lock held (they send SIGIO): from the owner, or after
-//! `slock` is dropped. Transmitting never re-enters a socket lock: `lo`
+//! tcp_poll, the waits and tcp_v4_err read) are published. Wakeups,
+//! SIGIO included, run in the step: from the owner, or under `slock`
+//! (unowned input, timers and errors; `release_cb`), as Linux. Transmitting never re-enters a socket lock: `lo`
 //! queues to the receive backlog and `netif_rx_flush_local` runs only
 //! with no lock held.
 //!
@@ -74,7 +74,7 @@ use self::output::Tuple;
 use self::table::Ent;
 use self::timer::now_ms;
 use self::timewait::TimeWait;
-use crate::io::fasync::{POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT};
+use crate::io::fasync::{POLL_HUP, POLL_IN, POLL_OUT};
 use crate::io::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
@@ -86,6 +86,7 @@ use crate::net::inet::fib::RouteType;
 use crate::net::inet::port::BindInfo;
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IPPROTO_TCP, IpParams, Ipv4Addr};
+use crate::net::mib::*;
 use crate::net::msg::{
     MSG_DONTWAIT, MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, RecvMsg,
     SendMsg,
@@ -285,7 +286,7 @@ crate::rcu_puts!(TcpSock, rcu_puts);
 /// The owner of a TCP socket
 type Guard<'a> = SockGuard<'a, Inner, TcpSock>;
 
-/// The wakeups of a locked step, made with no spin lock held
+/// The wakeups of a locked step, made before it ends
 #[must_use]
 struct Wake {
     /// `cb::wake` bits
@@ -358,24 +359,27 @@ fn open(net: &NetNamespace, t: &Tuple, oif: u32) -> Open {
 /// (Linux tcp_v4_send_reset's ip_send_unicast_reply)
 pub(super) fn xmit(net: &NetNamespace, t: &Tuple, seg: &Seg, p: IpParams, oif: u32) {
     if let Some(skb) = output::build(seg, t, Gfp::ATOMIC) {
-        send(net, t, skb, p, oif);
+        let _ = send(net, t, skb, p, oif);
     }
 }
 
 /// Route and send `skb` (its TCP header on) to `t` (route each time;
-/// no cached dst)
-fn send(net: &NetNamespace, t: &Tuple, skb: Box<SkBuff>, p: IpParams, oif: u32) {
-    if let Ok(rt) = route::output(net, t.raddr, t.laddr, oif) {
-        let _ = ipv4::ip_send_rt(net, &rt, skb, IPPROTO_TCP, p);
-    }
+/// no cached dst); false without a route
+fn send(net: &NetNamespace, t: &Tuple, skb: Box<SkBuff>, p: IpParams, oif: u32) -> bool {
+    let Ok(rt) = route::output(net, t.raddr, t.laddr, oif) else {
+        return false;
+    };
+    let _ = ipv4::ip_send_rt(net, &rt, skb, IPPROTO_TCP, p);
+    true
 }
 
 /// Transmit `out`'s segments to `t` in order (Linux tcp_transmit_skb
 /// with ip_queue_xmit), each header put on its payload skb
 pub(super) fn send_segs(net: &NetNamespace, t: &Tuple, out: &mut Out, p: IpParams, oif: u32) {
     while let Some(mut skb) = out.segs.pop_front() {
-        if output::push_hdr(&mut skb, t).is_some() {
-            send(net, t, skb, p, oif);
+        if output::push_hdr(&mut skb, t).is_some() && !send(net, t, skb, p, oif) {
+            // Linux __ip_queue_xmit's no_route
+            net.mib.ip.inc(crate::net::mib::IPSTATS_MIB_OUTNOROUTES);
         }
     }
 }
@@ -389,6 +393,7 @@ fn route_mss(net: &NetNamespace, daddr: Ipv4Addr, saddr: Ipv4Addr, oif: u32) -> 
 impl TcpSock {
     pub fn new(sk: Sock) -> Result<Arc<Self>, KernelError> {
         let mut cb = TcpCb::new(cfg(&sk.net));
+        cb.mib = Some(Arc::clone(&sk.net.mib));
         cb.opts.ca = sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
         let snap = Snap::default();
         snap.store(&cb);
@@ -552,6 +557,7 @@ impl TcpSock {
         let Ok(tw) = tw else {
             // Out of memory: close without TIME_WAIT (Linux tcp_time_wait
             // falls back to tcp_done); `post` leaves the tables
+            self.sk.net.mib.net.inc(LINUX_MIB_TCPTIMEWAITOVERFLOW);
             g.tuple = Some(t);
             g.cb.tw_done(out);
             out.done = true;
@@ -559,6 +565,8 @@ impl TcpSock {
         };
         self.sk.net.tcp.tw_hashdance(&self.arc(), &tw);
         g.bound = false;
+        // Linux inet_twsk_schedule: 2MSL is past the "killed" bound
+        self.sk.net.mib.net.inc(LINUX_MIB_TIMEWAITED);
         tw.start();
         g.cb.tw_done(out);
     }
@@ -583,14 +591,14 @@ impl TcpSock {
 
     /// Apply `out` under the lock (Linux transmits and sets sk_err /
     /// sk_shutdown under the socket lock): publish the shutdown bits and
-    /// the error (reported at once), then transmit to `t`. Returns the
-    /// wakeups to make after unlocking.
+    /// the error (reported with the wakeups), then transmit to `t`.
+    /// Returns the wakeups still to make.
     fn emit(&self, out: &mut Out, t: Option<Tuple>) -> u8 {
         if out.shut != 0 {
             self.sk.set_shutdown(out.shut);
         }
         if let Some(e) = out.err {
-            self.sk.post_err(e);
+            self.sk.store_err(e as u32);
         }
         if let Some(t) = t {
             send_segs(&self.sk.net, &t, out, self.inet.params(), self.oif());
@@ -604,8 +612,7 @@ impl TcpSock {
 
     /// End of a locked step (owner, or `slock` unowned): post-process
     /// and apply `out` (segments go to the connection's tuple) and
-    /// publish the lockless view; the wakeups follow with no spin lock
-    /// held (`wake_up`)
+    /// publish the lockless view; the wakeups follow (`wake_up`)
     fn apply(&self, g: &mut Inner, out: &mut Out) -> Wake {
         let t = g.tuple.or_else(|| self.cur_tuple());
         let ready = self.post(g, out);
@@ -617,21 +624,20 @@ impl TcpSock {
         Wake { w, ready }
     }
 
-    /// `apply`, then the wakeups (the owner holds no spin lock)
+    /// `apply`, then the wakeups, still locked (Linux wakes under the
+    /// socket lock, either level)
     fn finish(&self, g: &mut Inner, out: &mut Out) {
         let w = self.apply(g, out);
         self.wake_up(w);
     }
 
-    /// Own the socket, run `f` on it, apply the result, release (which
-    /// runs the backlog), wake
+    /// Own the socket, run `f` on it, apply the result and wake,
+    /// release (which runs the backlog)
     fn step<R>(&self, f: impl FnOnce(&mut Inner, &mut Out) -> R) -> R {
         let mut out = Out::default();
         let mut g = self.lock_sock();
         let r = f(&mut g, &mut out);
-        let w = self.apply(&mut g, &mut out);
-        drop(g);
-        self.wake_up(w);
+        self.finish(&mut g, &mut out);
         r
     }
 
@@ -646,15 +652,17 @@ impl TcpSock {
     /// The wakeups `w` (`cb::wake`) asked for, each of them, in Linux's
     /// order within one segment: an establishing state change before the
     /// data it carried (tcp_finish_connect, then tcp_data_queue), the
-    /// data before the FIN behind it (tcp_data_queue, then tcp_fin)
+    /// data before the FIN behind it (tcp_data_queue, then tcp_fin); an
+    /// error is reported after the close's state change (Linux
+    /// tcp_done_with_error: tcp_done, then sk_error_report)
     fn wake(&self, w: u8) {
-        if w & cb::wake::ERR != 0 {
-            self.sk.wake_async(WakeHow::Io, POLL_ERR);
-        }
         let fin = w & cb::wake::FIN != 0;
         if w & cb::wake::STATE != 0 && !fin {
             self.sk.state_change();
             self.state_async(w);
+        }
+        if w & cb::wake::ERR != 0 {
+            self.sk.error_report();
         }
         if w & cb::wake::DATA != 0 {
             self.sk.data_ready();
@@ -701,18 +709,15 @@ impl TcpSock {
     /// (Linux tcp_v4_rcv's socket part): processed at once unless the
     /// socket is owned, else queued to the backlog for the owner
     fn rcv(&self, skb: Box<SkBuff>, t: Tuple) {
-        let w = {
-            let mut b = self.lock.bh_lock();
-            match self.bh_get(&mut b) {
-                Some(g) => {
-                    let mut out = Out::default();
-                    self.do_rcv(g, skb, t, now_ms(), &mut out);
-                    self.apply(g, &mut out)
-                }
-                None => return self.add_backlog(b, skb),
+        let mut b = self.lock.bh_lock();
+        match self.bh_get(&mut b) {
+            Some(g) => {
+                let mut out = Out::default();
+                self.do_rcv(g, skb, t, now_ms(), &mut out);
+                self.finish(g, &mut out);
             }
-        };
-        self.wake_up(w);
+            None => self.add_backlog(b, skb),
+        }
     }
 
     /// Linux tcp_add_backlog: over rcvbuf * 2 + sndbuf / 2 + 64 KiB of
@@ -725,6 +730,9 @@ impl TcpSock {
         let rmem = self.snap.rcvq.load(Ordering::Relaxed);
         let r = b.add_backlog(skb, rmem, limit);
         drop(b);
+        if r.is_err() {
+            self.sk.net.mib.net.inc(LINUX_MIB_TCPBACKLOGDROP);
+        }
         drop(r);
     }
 
@@ -747,8 +755,9 @@ impl TcpSock {
                 .and_then(|w| w.upgrade())
                 .is_some_and(|p| p.acceptq_full())
         {
-            // Linux listen overflow: drop the completing ACK, the
-            // SYN-ACK is retransmitted later
+            // Linux listen overflow (tcp_v4_syn_recv_sock): drop the
+            // completing ACK, the SYN-ACK is retransmitted later
+            self.listen_overflow();
             return;
         }
         g.cb.input(s, skb, now, out);
@@ -758,6 +767,18 @@ impl TcpSock {
 
     fn acceptq_full(&self) -> bool {
         self.queue.lock().as_ref().is_none_or(|q| q.full())
+    }
+
+    /// Linux tcp_listendrop: a connection request was dropped
+    fn listen_drop(&self) {
+        self.sk.net.mib.net.inc(LINUX_MIB_LISTENDROPS);
+    }
+
+    /// The accept queue was full (Linux LISTENOVERFLOWS, then
+    /// tcp_listendrop)
+    fn listen_overflow(&self) {
+        self.sk.net.mib.net.inc(LINUX_MIB_LISTENOVERFLOWS);
+        self.listen_drop();
     }
 
     /// A segment for this listener (Linux tcp_v4_rcv's TCP_LISTEN
@@ -784,7 +805,7 @@ impl TcpSock {
         if s.has(flags::ACK) {
             // A stray ACK (no request): RST (Linux tcp_rcv_state_process)
             if let Some(r) = output::reset_for(s) {
-                xmit(&self.sk.net, &t, &r, IpParams::default(), 0);
+                send_reset(&self.sk.net, &t, &r);
             }
             return;
         }
@@ -794,9 +815,18 @@ impl TcpSock {
         }
         {
             let q = self.queue.lock();
-            match q.as_ref() {
-                Some(q) if !q.full() && (q.syn.len() as u32) < q.backlog.max(1) => {}
-                _ => return,
+            let Some(q) = q.as_ref() else {
+                return;
+            };
+            if q.syn.len() as u32 >= q.backlog.max(1) {
+                // Linux tcp_syn_flood_action without syncookies
+                self.sk.net.mib.net.inc(LINUX_MIB_TCPREQQFULLDROP);
+                self.listen_drop();
+                return;
+            }
+            if q.full() {
+                self.listen_overflow();
+                return;
             }
         }
         let opts = *self.listen_opts.lock();
@@ -814,8 +844,10 @@ impl TcpSock {
     /// GFP_ATOMIC before any lock is taken (Linux inet_reqsk_alloc,
     /// sk_clone_lock)
     fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, caps: (usize, usize, bool), now: u64) {
-        // Out of memory: drop the SYN (Linux inet_csk_clone_lock)
+        // Out of memory: drop the SYN (Linux inet_reqsk_alloc failing in
+        // tcp_conn_request: tcp_listendrop)
         let Ok(c) = with_gfp(Gfp::ATOMIC, || TcpSock::new(Sock::clone_from(&self.sk))) else {
+            self.listen_drop();
             return;
         };
         c.inet.clone_opts(&self.inet);
@@ -840,11 +872,13 @@ impl TcpSock {
             kc.synack_retries = opts.syncnt;
         }
         let mut cb = TcpCb::new(kc);
+        cb.mib = Some(Arc::clone(&self.sk.net.mib));
         cb.opts = opts;
         (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = caps;
         cb.passive(s, o, now, &mut out);
         g.cb = cb;
         if !self.sk.net.tcp.hash(t, &c) {
+            self.listen_drop();
             return;
         }
         g.tuple = Some(t);
@@ -852,6 +886,7 @@ impl TcpSock {
             // No bind bucket: drop the SYN (Linux inet_csk_clone_lock
             // failing in tcp_v4_syn_recv_sock)
             self.sk.net.tcp.unhash(&t, &c);
+            self.listen_drop();
             return;
         }
         g.bound = true;
@@ -880,8 +915,8 @@ impl TcpSock {
     }
 
     /// A child completed its handshake (Linux inet_csk_complete_hashdance;
-    /// under the child's lock). True: it was queued, the caller wakes
-    /// the listener after unlocking.
+    /// under the child's lock). True: it was queued, the step wakes the
+    /// listener under the child's lock (Linux tcp_child_process).
     fn child_ready(&self, c: &Arc<TcpSock>) -> bool {
         let mut q = self.queue.lock();
         let Some(q) = q.as_mut() else {
@@ -932,7 +967,8 @@ impl TcpSock {
                 return Err(KernelError::AlreadyConnected);
             }
             let a = self.inet.get();
-            let rt = route::output(&self.sk.net, daddr, a.saddr, self.oif())?;
+            let rt = route::output(&self.sk.net, daddr, a.saddr, self.oif())
+                .inspect_err(|e| self.sk.net.mib.route_err(e))?;
             if matches!(rt.rtype, RouteType::Broadcast | RouteType::Multicast) {
                 return Err(KernelError::NetworkUnreachable);
             }
@@ -970,6 +1006,7 @@ impl TcpSock {
             let mut c = cfg(&self.sk.net);
             c.syn_retries = self.syncnt(&g.cb.opts);
             let mut cb = TcpCb::new(c);
+            cb.mib = Some(Arc::clone(&self.sk.net.mib));
             cb.opts = g.cb.opts;
             (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = (g.cb.rcv_cap, g.cb.snd_cap, g.cb.rcv_locked);
             g.cb = cb;
@@ -1082,8 +1119,9 @@ impl TcpSock {
     }
 
     /// tcp_disconnect's part under the socket lock: stop listening,
-    /// abort, clear the shutdown bits and the connecting state; the
-    /// listener's queue, if any, to stop after the unlock
+    /// abort, clear the shutdown bits and the connecting state, report
+    /// the error (ECONNRESET for a connection; the report comes anyway);
+    /// the listener's queue, if any, to stop after the unlock
     fn disconnect_locked(&self, g: &mut Inner, out: &mut Out) -> Option<Accept> {
         let q = if g.cb.state == TcpState::Listen {
             self.sk.set_flag(sf::ACCEPTCONN, false);
@@ -1095,7 +1133,7 @@ impl TcpSock {
         } else {
             None
         };
-        g.cb.abort(out);
+        g.cb.disconnect(out);
         out.shut = 0;
         self.sk.clear_shutdown();
         g.connecting = false;
@@ -1139,36 +1177,40 @@ impl TcpSock {
 impl TcpSock {
     /// Linux tcp_write_timer: the retransmit timer
     fn rtx_timer(s: Arc<TcpSock>) {
-        s.timer_fired();
+        let _ = s.timer_fired();
     }
 
-    /// Linux tcp_delack_timer
+    /// Linux tcp_delack_timer: one that finds the socket owned is
+    /// DelayedACKLocked
     fn delack_timer(s: Arc<TcpSock>) {
-        s.timer_fired();
+        if !s.timer_fired() {
+            s.sk.net.mib.net.inc(LINUX_MIB_DELAYEDACKLOCKED);
+        }
     }
 
     /// Linux tcp_keepalive_timer (keepalive, orphan FIN_WAIT_2)
     fn keepalive_timer(s: Arc<TcpSock>) {
-        s.timer_fired();
+        let _ = s.timer_fired();
     }
 
     /// A timer fired (`ktimers/N`): the control block's due work runs
     /// now unless the socket is owned, else at the owner's release
     /// (Linux TCP_*_TIMER_DEFERRED); the timer's reference to the socket
-    /// goes with the caller's `Arc`
-    fn timer_fired(&self) {
-        let w = {
-            let mut b = self.lock.bh_lock();
-            match self.bh_get(&mut b) {
-                Some(g) => {
-                    let mut out = Out::default();
-                    g.cb.on_timer(now_ms(), &mut out);
-                    self.apply(g, &mut out)
-                }
-                None => return b.defer(deferred::TIMER),
+    /// goes with the caller's `Arc`. False if it was deferred.
+    fn timer_fired(&self) -> bool {
+        let mut b = self.lock.bh_lock();
+        match self.bh_get(&mut b) {
+            Some(g) => {
+                let mut out = Out::default();
+                g.cb.on_timer(now_ms(), &mut out);
+                self.finish(g, &mut out);
+                true
             }
-        };
-        self.wake_up(w);
+            None => {
+                b.defer(deferred::TIMER);
+                false
+            }
+        }
     }
 }
 
@@ -1184,9 +1226,10 @@ impl SockHooks<Inner> for TcpSock {
         self.finish(g, &mut out);
     }
 
-    /// Linux tcp_release_cb: the timers that fired, an MTU reduction
-    /// (tcp_v4_mtu_reduced) and the soft error left while owned; then
-    /// the lockless view of the owner's work is published
+    /// Linux tcp_release_cb, under `slock`: the timers that fired, an
+    /// MTU reduction (tcp_v4_mtu_reduced) and the soft error left while
+    /// owned; then the lockless view of the owner's work is published
+    /// and the wakeups made
     fn release_cb(&self, g: &mut Inner, flags: u32) {
         let mut out = Out::default();
         let now = now_ms();
@@ -1229,7 +1272,20 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
     if skb.ip_bcast {
         return;
     }
-    if output::checksum(saddr, daddr, skb.data()) != 0 {
+    let tcp = &net.mib.tcp;
+    tcp.inc(TCP_MIB_INSEGS);
+    let b = skb.data();
+    if b.len() < output::HLEN {
+        return;
+    }
+    if b[12] >> 4 < 5 {
+        // Linux bad_packet: doff below the header
+        tcp.inc(TCP_MIB_INERRS);
+        return;
+    }
+    if output::checksum(saddr, daddr, b) != 0 {
+        tcp.inc(TCP_MIB_CSUMERRORS);
+        tcp.inc(TCP_MIB_INERRS);
         return;
     }
     // The header into the control block, the payload left (Linux
@@ -1261,8 +1317,16 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
     }
     // No socket: reset (never answer a RST)
     if let Some(r) = output::reset_for(&s) {
-        xmit(&net, &t, &r, IpParams::default(), 0);
+        send_reset(&net, &t, &r);
     }
+}
+
+/// RST `r` answering a segment on `t` with no socket to send it
+/// (Linux tcp_v4_send_reset)
+fn send_reset(net: &NetNamespace, t: &Tuple, r: &Seg) {
+    xmit(net, t, r, IpParams::default(), 0);
+    net.mib.tcp.inc(TCP_MIB_OUTSEGS);
+    net.mib.tcp.inc(TCP_MIB_OUTRSTS);
 }
 
 /// An ICMP error quoting one of our segments (Linux tcp_v4_err)
@@ -1278,30 +1342,36 @@ pub fn tcp_err(net: &NetNamespace, e: &IcmpErr<'_>) {
         rport: u16::from_be_bytes([l4[2], l4[3]]),
     };
     let seq = u32::from_be_bytes([l4[4], l4[5], l4[6], l4[7]]);
-    let Some(Ent::Sk(s)) = net.tcp.lookup(&t) else {
-        return;
+    let s = match net.tcp.lookup(&t) {
+        Some(Ent::Sk(s)) => s,
+        Some(Ent::Tw(_)) => return,
+        None => {
+            // Linux tcp_v4_err: no socket for it
+            net.mib.icmp.inc(ICMP_MIB_INERRORS);
+            return;
+        }
     };
     let pmtudisc = s.inet.pmtudisc();
     let Some((err, _)) = e.errno(pmtudisc) else {
         return;
     };
     let recverr = s.inet.flag(ipf::RECVERR);
-    let (w, syn_err) = {
-        let mut b = s.lock.bh_lock();
-        match s.bh_get(&mut b) {
-            Some(g) => {
-                let mut out = Out::default();
-                let syn_err = s.err_rcv(g, seq, e.info, err, recverr, &mut out);
-                (Some(s.apply(g, &mut out)), syn_err)
-            }
-            None => (None, s.err_owned(&mut b, seq, e.info, err)),
+    // A handshake's error goes to the IP_RECVERR queue before the
+    // socket fails with it (Linux tcp_v4_err: ip_icmp_error, then
+    // tcp_done_with_error, under bh_lock_sock)
+    let queue = |syn_err: bool| {
+        if syn_err && recverr {
+            af_inet::ip_icmp_error(&s.sk, e, err, t.rport, &l4[..8]);
         }
     };
-    if let Some(w) = w {
-        s.wake_up(w);
-    }
-    if syn_err && recverr {
-        af_inet::ip_icmp_error(&s.sk, e, err, t.rport, &l4[..8]);
+    let mut b = s.lock.bh_lock();
+    match s.bh_get(&mut b) {
+        Some(g) => {
+            let mut out = Out::default();
+            queue(s.err_rcv(g, seq, e.info, err, recverr, &mut out));
+            s.finish(g, &mut out);
+        }
+        None => queue(s.err_owned(&mut b, seq, e.info, err)),
     }
 }
 
@@ -1317,7 +1387,11 @@ impl TcpSock {
         recverr: bool,
         out: &mut Out,
     ) -> bool {
-        if !cb::between(seq, g.cb.snd_una, g.cb.snd_max) {
+        if g.cb.state == TcpState::Closed {
+            return false;
+        }
+        if g.cb.state != TcpState::Listen && !cb::between(seq, g.cb.snd_una, g.cb.snd_max) {
+            self.sk.net.mib.net.inc(LINUX_MIB_OUTOFWINDOWICMPS);
             return false;
         }
         if err == KernelError::MessageTooLong {
@@ -1346,12 +1420,20 @@ impl TcpSock {
     /// (Linux TCP_MTU_REDUCED_DEFERRED, sk_err_soft); true in the
     /// handshake (the IP_RECVERR queue still gets it)
     fn err_owned(&self, b: &mut BhGuard<'_, Inner>, seq: u32, info: u32, err: KernelError) -> bool {
-        let una = self.snap.snd_una.load(Ordering::Acquire);
-        let nxt = self.snap.snd_max.load(Ordering::Acquire);
-        if !cb::between(seq, una, nxt) {
-            return false;
+        let mib = &self.sk.net.mib.net;
+        if err != KernelError::MessageTooLong {
+            mib.inc(LINUX_MIB_LOCKDROPPEDICMPS);
         }
         let state = self.state();
+        if state == TcpState::Closed {
+            return false;
+        }
+        let una = self.snap.snd_una.load(Ordering::Acquire);
+        let nxt = self.snap.snd_max.load(Ordering::Acquire);
+        if state != TcpState::Listen && !cb::between(seq, una, nxt) {
+            mib.inc(LINUX_MIB_OUTOFWINDOWICMPS);
+            return false;
+        }
         if err == KernelError::MessageTooLong {
             if state != TcpState::Listen {
                 self.mtu_info.store(info, Ordering::Relaxed);

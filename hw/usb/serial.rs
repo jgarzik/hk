@@ -5,19 +5,27 @@
 //! ## Console Integration
 //!
 //! The port is registered as a console with Normal priority, ahead of
-//! the legacy serial port (Fallback priority). Output goes out its
-//! bulk OUT endpoint raw (the FT232 frames only its IN data).
+//! the legacy serial port (Fallback priority). As Linux's usb-serial
+//! console, a write only queues the output in the port's FIFO (any
+//! context, dropping what does not fit); the port's write URB sends it
+//! out the bulk OUT endpoint raw (the FT232 frames only its IN data),
+//! one chunk at a time, its completion handler submitting the next
+//! (Linux usb_serial_generic_write_start and write_bulk_callback).
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::any::Any;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::console::{ConsoleDriver, ConsolePriority, register_console};
 use crate::printkln;
-use crate::sync::spin::Mutex;
+use crate::sync::{IrqSpinlock, Mutex};
+use crate::task::workqueue::{SYSTEM_WQ, Work};
 use crate::util::error::KernelError;
-use crate::util::kalloc::try_box;
+use crate::util::kalloc::{arc_nofail, try_box};
+use crate::util::kfifo::Kfifo;
 
-use super::{UsbDeviceId, UsbIds};
+use super::{Pipe, Urb, UsbDevice, UsbDeviceId, UsbIds, usb_poison_urb, usb_submit_urb};
 
 /// FTDI's vendor id and the FT232's product id (Linux FTDI_VID,
 /// FTDI_8U232AM_PID)
@@ -49,13 +57,24 @@ fn ftdi_probe(
         bulk_in_ep,
         bulk_out_ep,
     })?;
+    // The write URB and its buffer (Linux usb_serial_probe's
+    // write_urbs[0], bulk_out_size bytes)
+    let complete = try_box(write_bulk_callback)?;
+    let urb = Urb::new(
+        usb_dev,
+        Pipe::bulk_out(bulk_out_ep),
+        None,
+        BULK_OUT_SIZE,
+        complete,
+    )
+    .ok_or(KernelError::OutOfMemory)?;
     printkln!(
         "ftdi_sio {}: FTDI USB Serial Device converter, bulk in {:#04x}, out {:#04x}",
         dev.name(),
         bulk_in_ep,
         bulk_out_ep
     );
-    register_usb_serial_console(&serial);
+    register_usb_serial_console(&serial, usb_dev, urb);
     Ok(serial)
 }
 
@@ -75,34 +94,149 @@ impl crate::base::Bound for UsbSerial {
     }
 
     /// Off the console list if it is the console (Linux
-    /// usb_serial_console_disconnect); then, under the port lock, which
-    /// a write in progress holds, the console loses its device: a
-    /// printk still holding a snapshot of the list writes nothing
+    /// usb_serial_console_disconnect); then the port loses its device
+    /// and its queued output, and its write URB is killed (Linux
+    /// usb_serial_disconnect: usb_serial_port_poison_urbs)
     fn remove(&self) {
         if PORT.lock().out != Some((self.slot_id, self.bulk_out_ep)) {
             return;
         }
         crate::console::unregister_console(USB_SERIAL_CONSOLE.name());
-        PORT.lock().out = None;
+        let urb = {
+            let mut p = PORT.lock();
+            p.out = None;
+            p.fifo.reset();
+            p.urb.take()
+        };
+        if let Some(urb) = urb {
+            usb_poison_urb(&urb);
+        }
+        *PORT_DEV.lock() = None;
     }
 }
 
-/// The console's device and DMA buffer
+/// The port's write FIFO (Linux usb-serial's write_fifo, PAGE_SIZE)
+const WRITE_FIFO_SIZE: usize = 4096;
+/// Bytes per bulk OUT transfer (Linux ftdi_sio's bulk_out_size)
+const BULK_OUT_SIZE: usize = 256;
+
+/// The console's port (Linux usb_serial_port: `lock`, `write_fifo`,
+/// `write_urbs[0]`, USB_SERIAL_WRITE_BUSY)
 struct Port {
     /// The bound port's slot and bulk OUT endpoint (None: no console)
     out: Option<(u8, u8)>,
-    /// Output goes through it: the controller DMAs the data, and a
-    /// printk's may be on a kernel stack
-    buf: [u8; 256],
+    /// Output queued for the write URB
+    fifo: Kfifo<WRITE_FIFO_SIZE>,
+    /// The write URB (None: no console)
+    urb: Option<Arc<Urb>>,
+    /// The write URB is submitted (Linux USB_SERIAL_WRITE_BUSY)
+    busy: bool,
 }
 
-/// The USB serial console's port (spin leaf but for the transfer: a
-/// write holds it across the bulk transfer, so it orders before
-/// `USB_CONTROLLER`; `try_lock` there, a busy port drops the output)
-static PORT: Mutex<Port> = Mutex::new(Port {
+/// The USB serial console's port (Linux port->lock, IRQ-safe leaf: the
+/// console write runs in any context, under printk's `OUTPUT_LOCK`)
+static PORT: IrqSpinlock<Port> = IrqSpinlock::new(Port {
     out: None,
-    buf: [0; 256],
+    fifo: Kfifo::new(),
+    urb: None,
+    busy: false,
 });
+
+/// The console port's device and bulk IN endpoint (Linux
+/// port->serial->dev, port->bulk_in_endpointAddress), for the boot
+/// self-test
+static PORT_DEV: Mutex<Option<(UsbDevice, u8)>> = Mutex::new(None);
+
+/// The write work: the tick's kick starts the write URB from a thread
+/// (Linux submits it from the console write itself, GFP_ATOMIC; an hk
+/// submission builds its TRBs on the heap, which an interrupt handler
+/// does not)
+static WRITE_WORK: spin::Once<Arc<IrqSpinlock<Work>>> = spin::Once::new();
+
+/// A failed write transfer was reported: a console port's errors are
+/// printed once, or each report would queue the next (Linux
+/// dev_err_console)
+static ERR_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// Report a failed write once
+fn write_error(e: super::UsbError) {
+    if !ERR_ONCE.swap(true, Ordering::Relaxed) {
+        printkln!(
+            "ftdi_sio: write_bulk_callback - nonzero urb status: {:?}",
+            e
+        );
+    }
+}
+
+/// Submit the write URB with the FIFO's next chunk, unless it is
+/// submitted already or there is nothing to send (Linux
+/// usb_serial_generic_write_start); thread context (the write work,
+/// the giveback bottom half)
+fn write_start() {
+    let mut chunk = [0u8; BULK_OUT_SIZE];
+    let (urb, n) = {
+        let mut p = PORT.lock();
+        if p.busy || p.out.is_none() {
+            return;
+        }
+        let Some(urb) = p.urb.clone() else {
+            return;
+        };
+        let n = p.fifo.pop(&mut chunk);
+        if n == 0 {
+            return;
+        }
+        p.busy = true;
+        (urb, n)
+    };
+    // A failed submission's data is lost, as a failed URB's
+    let r = urb
+        .fill(Some(&chunk[..n]), n)
+        .and_then(|_| usb_submit_urb(&urb));
+    if let Err(e) = r {
+        PORT.lock().busy = false;
+        // Rejected: poisoned by remove
+        if e != super::UsbError::Rejected {
+            write_error(e);
+        }
+    }
+}
+
+/// The write URB was given back (Linux
+/// usb_serial_generic_write_bulk_callback): the port is free again and
+/// the next chunk goes out; a killed URB (remove) sends nothing more.
+/// Giveback bottom half: does not sleep
+fn write_bulk_callback(urb: &Arc<Urb>) {
+    PORT.lock().busy = false;
+    match urb.status() {
+        Err(super::UsbError::Killed | super::UsbError::Shutdown) => {
+            return;
+        }
+        Err(e) => write_error(e),
+        Ok(()) => {}
+    }
+    // The bottom half does not sleep: GFP_ATOMIC, as Linux's callback
+    crate::util::kalloc::with_gfp(crate::mm::page_alloc::Gfp::ATOMIC, write_start);
+}
+
+/// The console port's device and bulk IN pipe, for the boot self-test
+/// (`urb::urb_selftest`); thread context
+pub fn console_in_pipe() -> Option<(UsbDevice, Pipe)> {
+    let p = PORT_DEV.lock();
+    let (dev, ep) = p.as_ref()?;
+    Some((dev.clone(), Pipe::bulk_in(*ep)))
+}
+
+/// Queue console output with a CR after each LF (Linux
+/// usb_console_write)
+fn console_push<const N: usize>(fifo: &mut Kfifo<N>, data: &[u8]) {
+    for line in data.split_inclusive(|&b| b == b'\n') {
+        fifo.push(line);
+        if line.ends_with(b"\n") {
+            fifo.push(b"\r");
+        }
+    }
+}
 
 /// The FTDI port as a console (`ttyUSB0`); one at a time
 struct UsbSerialConsole;
@@ -114,38 +248,67 @@ impl ConsoleDriver for UsbSerialConsole {
         "ttyUSB0"
     }
 
+    /// Queue `data` in the port's FIFO, dropping what does not fit
+    /// (Linux usb_console_write -> usb_serial_generic_write), in any
+    /// context; the next tick starts the write work
     fn write(&self, data: &[u8]) {
-        use crate::hw::usb::xhci::usb_console_out;
+        let mut p = PORT.lock();
+        if p.out.is_none() {
+            return;
+        }
+        console_push(&mut p.fifo, data);
+        drop(p);
+        crate::console::console_defer_kick();
+    }
 
-        // Busy (another CPU, or a printk nested in this one): dropped,
-        // the console is best-effort like the transfer itself
-        let Some(mut p) = PORT.try_lock() else {
-            return;
+    /// Start the write work if output is queued and the write URB idle
+    fn kick(&self) {
+        let start = {
+            let p = PORT.lock();
+            !p.fifo.is_empty() && !p.busy
         };
-        let Some((slot, ep)) = p.out else {
-            return;
-        };
-        for chunk in data.chunks(p.buf.len()) {
-            p.buf[..chunk.len()].copy_from_slice(chunk);
-            let _ = usb_console_out(slot, ep, &p.buf[..chunk.len()]);
+        if start && let Some(w) = WRITE_WORK.get() {
+            SYSTEM_WQ.queue_work(w.clone());
         }
     }
 }
 
 /// Make the port the console (`ttyUSB0`) if there is none: Normal
 /// priority, above legacy serial's Fallback, no special flags
-fn register_usb_serial_console(serial: &UsbSerial) {
+fn register_usb_serial_console(serial: &UsbSerial, dev: &UsbDevice, urb: Arc<Urb>) {
     use crate::console::ConsoleFlags;
 
+    WRITE_WORK.call_once(|| arc_nofail(IrqSpinlock::new(Work::new(write_start))));
     let mut p = PORT.lock();
     if p.out.is_some() {
+        // Not the console: its URB is freed here, with the lock dropped
+        drop(p);
+        drop(urb);
         return;
     }
     p.out = Some((serial.slot_id, serial.bulk_out_ep));
+    p.fifo.reset();
+    p.urb = Some(urb);
+    p.busy = false;
     drop(p);
+    *PORT_DEV.lock() = Some((dev.clone(), serial.bulk_in_ep));
     register_console(
         &USB_SERIAL_CONSOLE,
         ConsolePriority::Normal,
         ConsoleFlags::empty(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Kfifo, console_push};
+
+    #[test]
+    fn console_cr_after_lf() {
+        let mut f = Kfifo::<64>::new();
+        console_push(&mut f, b"a\nb\n\nc");
+        let mut b = [0u8; 64];
+        let n = f.pop(&mut b);
+        assert_eq!(&b[..n], b"a\n\rb\n\r\n\rc");
+    }
 }

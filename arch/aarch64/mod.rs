@@ -631,6 +631,8 @@ impl ExceptionOps for Aarch64Arch {
         exceptions::init();
         // ASID width and TLB tagging of the boot CPU
         tlb::init_cpu();
+        // Debug state: no step, OS lock open
+        ptrace::debug_init_cpu();
         // Initialize GIC (distributor + redistributor + CPU interface)
         gic::init();
     }

@@ -21,6 +21,12 @@ pub fn child_reaper(table: &GlobalTaskTable, ns: &PidNamespace) -> Option<TaskRe
     table.view(&t).is_some().then_some(t)
 }
 
+/// `ns` has had its init (Linux pid_ns->child_reaper set): kept once
+/// set, so a namespace whose init died still has one
+pub fn has_reaper(ns: &PidNamespace) -> bool {
+    ns.reaper.access(&TASKLIST.read()).is_some()
+}
+
 /// `t` is `ns`'s child reaper (TASKLIST held)
 fn is_reaper(table: &GlobalTaskTable, ns: &PidNamespace, t: &TaskRef) -> bool {
     ns.reaper

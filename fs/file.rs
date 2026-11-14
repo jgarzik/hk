@@ -15,7 +15,7 @@ use ::core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use crate::sync;
 
 use super::KernelError;
-use super::dentry::Dentry;
+use super::dentry::DentryRef;
 use super::inode::{FileType, Inode, InodeId};
 use super::iov_iter::{IovDest, IovSource};
 use super::mount::MountRef;
@@ -524,7 +524,7 @@ pub trait FileOps: Send + Sync {
 /// - File position and operations
 pub struct File {
     /// Dentry this file was opened from
-    pub dentry: Arc<Dentry>,
+    pub dentry: DentryRef,
 
     /// Mount this file belongs to (Linux f_path.mnt): a reference, which
     /// makes the mount busy for umount
@@ -632,7 +632,7 @@ impl File {
     /// object), whose reference keeps the mount busy for umount while
     /// this file is open
     pub fn new(
-        dentry: Arc<Dentry>,
+        dentry: DentryRef,
         mnt: Option<MountRef>,
         flags: u32,
         f_op: &'static dyn FileOps,
@@ -705,7 +705,7 @@ impl File {
     /// and the state goes with the last reference to the file; `mnt` is
     /// its pseudo filesystem's mount
     pub fn new_anon(
-        dentry: Arc<Dentry>,
+        dentry: DentryRef,
         mnt: Option<MountRef>,
         flags: u32,
         f_op: &'static dyn FileOps,
@@ -1184,6 +1184,61 @@ impl Drop for FileRef {
         }));
         if let Some(f) = f.put() {
             fput_deferred(f);
+        }
+    }
+}
+
+/// Writes denied to a file's inode while a program runs from it or
+/// loads it (Linux exe_file_deny_write_access on a `struct file`,
+/// exe_file_allow_write_access before its fput). It holds the file,
+/// so the file's mount, and with it the superblock, outlives the
+/// inode it keeps: as in Linux, no inode in use outlives every mount
+/// of its filesystem. The address space's executable (Linux
+/// mm->exe_file) is one.
+pub struct DenyWrite {
+    /// Let go first, as Linux allows writes before the fput
+    inode: Option<Arc<Inode>>,
+    file: FileRef,
+}
+
+impl DenyWrite {
+    /// Deny writes to `file`'s inode: ETXTBSY while it is open for
+    /// writing
+    pub fn new(file: &FileRef) -> Result<Self, KernelError> {
+        let inode = file.get_inode();
+        if let Some(i) = &inode {
+            i.deny_write()?;
+        }
+        Ok(Self {
+            inode,
+            file: file.clone(),
+        })
+    }
+
+    /// The file
+    pub fn file(&self) -> &FileRef {
+        &self.file
+    }
+}
+
+/// fork's copy of the address space denies writes again (Linux
+/// dup_mm_exe_file)
+impl Clone for DenyWrite {
+    fn clone(&self) -> Self {
+        if let Some(i) = &self.inode {
+            i.deny_write_again();
+        }
+        Self {
+            inode: self.inode.clone(),
+            file: self.file.clone(),
+        }
+    }
+}
+
+impl Drop for DenyWrite {
+    fn drop(&mut self) {
+        if let Some(i) = &self.inode {
+            i.allow_write();
         }
     }
 }

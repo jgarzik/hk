@@ -496,8 +496,6 @@ pub enum TaskState {
     Running,
     /// Sleeping/waiting
     Sleeping,
-    /// Stopped for ptrace (signal number that caused stop)
-    Traced(i32),
     /// Exited with status
     Zombie(i32),
 }
@@ -667,6 +665,10 @@ pub mod tif {
     /// to user mode; an interruptible sleep ends for it (Linux
     /// TIF_NOTIFY_SIGNAL)
     pub const NOTIFY_SIGNAL: u32 = 1 << 5;
+    /// PTRACE_SINGLESTEP on aarch64: MDSCR_EL1.SS on each return to user
+    /// mode (Linux TIF_SINGLESTEP; set and cleared by the tracer while
+    /// the task is stopped)
+    pub const SINGLESTEP: u32 = 1 << 6;
 }
 
 /// A task (thread or process; Linux task_struct), shared as
@@ -1015,18 +1017,6 @@ pub struct TaskInner {
 
     /// Ptrace options (PTRACE_O_TRACESYSGOOD, etc.)
     ptrace_options: u32,
-    /// A ptrace stop's code (Linux exit_code): the stop's signal until
-    /// the tracer's wait reports it (then 0), then the signal the
-    /// tracer's resume leaves to deliver (0: none)
-    ptrace_code: u32,
-    /// The siginfo of the stop it is in, which PTRACE_GETSIGINFO reads
-    /// and PTRACE_SETSIGINFO replaces (Linux task->last_siginfo); none
-    /// outside a ptrace stop
-    last_siginfo: Option<crate::signal::SigInfo>,
-    /// Its tracer is inside a ptrace request on it (Linux
-    /// JOBCTL_PTRACE_FROZEN): a SIGKILL leaves its ptrace stop alone
-    /// until the request ends
-    ptrace_frozen: bool,
 }
 
 impl TaskInner {
@@ -1064,9 +1054,6 @@ impl TaskInner {
             threads: crate::util::list::OwnedList::new(),
             ptrace_message: 0,
             ptrace_options: 0,
-            ptrace_code: 0,
-            last_siginfo: None,
-            ptrace_frozen: false,
         }
     }
 
@@ -1133,19 +1120,6 @@ impl TaskInner {
     /// Its ptrace flags (0: not traced)
     pub fn ptrace(&self) -> u32 {
         self.ptrace
-    }
-
-    /// Its tracer is inside a ptrace request on it
-    pub fn ptrace_frozen(&self) -> bool {
-        self.ptrace_frozen
-    }
-
-    /// End a ptrace stop it is in: ready, nothing for its tracer's wait
-    pub fn end_trace_stop(&mut self) {
-        if matches!(self.state, TaskState::Traced(_)) {
-            self.state = TaskState::Ready;
-            self.ptrace_code = 0;
-        }
     }
 
     /// Its exit status, once a zombie

@@ -6,7 +6,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use super::cb::{
-    Cfg, MSS_DEFAULT, Open, Out, RCV_SHUTDOWN, RTO_MAX, TIMEWAIT_LEN, TcpCb, TcpState, flags,
+    Cfg, MSS_DEFAULT, Open, Out, RCV_SHUTDOWN, RTO_MAX, TIMEWAIT_LEN, TcpCb, TcpState, flags, wake,
 };
 use crate::mm::page_alloc::Gfp;
 use crate::net::skb::SkBuff;
@@ -841,6 +841,24 @@ fn reset_errors_by_state() {
     assert_eq!(out.err, Some(KernelError::BrokenPipe));
 }
 
+/// Linux tcp_disconnect: RST and ECONNRESET for a connection, a bare
+/// error report (no state change wakeup) for a closed socket
+#[test]
+fn disconnect_reports() {
+    let mut p = Pair::new(1460);
+    let mut out = Out::default();
+    p.a.disconnect(&mut out);
+    assert_eq!(p.a.state, TcpState::Closed);
+    assert!(wire(&out)[0].has(flags::RST));
+    assert_eq!(out.err, Some(KernelError::ConnectionReset));
+    assert_eq!(out.wake & (wake::STATE | wake::ERR), wake::ERR);
+    let mut out = Out::default();
+    p.a.disconnect(&mut out);
+    assert!(wire(&out).is_empty());
+    assert_eq!(out.err, None);
+    assert_eq!(out.wake, wake::ERR);
+}
+
 #[test]
 fn close_with_unread_data_resets() {
     let mut p = Pair::new(1460);
@@ -855,6 +873,26 @@ fn close_with_unread_data_resets() {
     p.run();
     assert_eq!(p.a.state, TcpState::Closed);
     assert_eq!(p.a_out.err, Some(KernelError::ConnectionReset));
+}
+
+/// Linux __tcp_close: unread data resets in LAST_ACK too (not a
+/// need-reset state), the FIN still unacknowledged
+#[test]
+fn close_with_unread_data_resets_in_last_ack() {
+    let mut p = Pair::new(1460);
+    p.send_a(b"unread");
+    let mut out = Out::default();
+    assert!(p.a.shutdown_wr(p.now, &mut out));
+    p.take(true, out);
+    p.run();
+    assert_eq!(p.b.state, TcpState::CloseWait);
+    let mut out = Out::default();
+    assert!(p.b.shutdown_wr(p.now, &mut out));
+    assert_eq!(p.b.state, TcpState::LastAck);
+    let mut out = Out::default();
+    p.b.close(false, p.now, &mut out);
+    assert_eq!(p.b.state, TcpState::Closed);
+    assert!(wire(&out).iter().any(|s| s.has(flags::RST)));
 }
 
 #[test]
@@ -1742,4 +1780,118 @@ fn time_wait_entry_is_compact() {
     // kmalloc-512 with Arc's counts and the embedded 2MSL timer (Linux
     // tcp_timewait_sock has its tw_timer too); under the control block
     assert!(tw + 16 <= 512 && tw < cb, "TimeWait {tw} B vs TcpCb {cb} B");
+}
+
+/// A pair counting in one namespace's MIBs (as over loopback)
+fn mib_pair() -> (Pair, alloc::sync::Arc<crate::net::mib::NetMib>) {
+    let m = crate::net::mib::NetMib::new().unwrap();
+    let mut p = Pair::bare();
+    p.a.mib = Some(m.clone());
+    let mut out = Out::default();
+    p.a.connect(open(1000, 1460), p.now, &mut out);
+    p.take(true, out);
+    let (_, syn) = p.wire.pop_front().unwrap();
+    let mut out = Out::default();
+    p.b.mib = Some(m.clone());
+    p.b.passive_in(&seg_in(&syn), open(5000, 1460), p.now, &mut out);
+    p.take(false, out);
+    p.run();
+    assert_eq!(p.b.state, TcpState::Established);
+    (p, m)
+}
+
+/// Linux tcp_set_state / tcp_connect / tcp_create_openreq_child and
+/// tcp_transmit_skb counting: a handshake, then an orderly close
+#[test]
+fn mib_open_close() {
+    use crate::net::mib::*;
+    let (mut p, m) = mib_pair();
+    assert_eq!(m.tcp.fold(TCP_MIB_ACTIVEOPENS), 1);
+    assert_eq!(m.tcp.fold(TCP_MIB_PASSIVEOPENS), 1);
+    assert_eq!(m.tcp.fold(TCP_MIB_CURRESTAB), 2);
+    // SYN, SYN-ACK, ACK
+    assert_eq!(m.tcp.fold(TCP_MIB_OUTSEGS), 3);
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    p.take(true, out);
+    p.run();
+    // FIN_WAIT_2 left ESTABLISHED, CLOSE_WAIT is still counted
+    assert_eq!(m.tcp.fold(TCP_MIB_CURRESTAB), 1);
+    let mut out = Out::default();
+    p.b.close(false, p.now, &mut out);
+    p.take(false, out);
+    p.run();
+    assert_eq!(p.a.state, TcpState::TimeWait);
+    assert_eq!(m.tcp.fold(TCP_MIB_CURRESTAB), 0);
+    assert_eq!(m.tcp.fold(TCP_MIB_ESTABRESETS), 0);
+    // FIN, ACK, FIN, ACK
+    assert_eq!(m.tcp.fold(TCP_MIB_OUTSEGS), 7);
+    assert_eq!(m.tcp.fold(TCP_MIB_RETRANSSEGS), 0);
+    // Both FINs were new sequence space
+    assert_eq!(m.net.fold(LINUX_MIB_TCPORIGDATASENT), 2);
+}
+
+/// An abort resets both ends: EstabResets on each, one OutRst
+#[test]
+fn mib_reset() {
+    use crate::net::mib::*;
+    let (mut p, m) = mib_pair();
+    let mut out = Out::default();
+    p.a.close(true, p.now, &mut out);
+    p.take(true, out);
+    p.run();
+    assert_eq!(p.b.state, TcpState::Closed);
+    assert_eq!(m.tcp.fold(TCP_MIB_CURRESTAB), 0);
+    assert_eq!(m.tcp.fold(TCP_MIB_ESTABRESETS), 2);
+    assert_eq!(m.tcp.fold(TCP_MIB_OUTRSTS), 1);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPABORTONDATA), 1);
+    assert_eq!(m.tcp.fold(TCP_MIB_ATTEMPTFAILS), 0);
+}
+
+/// A lost data segment: one timeout, one retransmission, which is not
+/// in OutSegs
+#[test]
+fn mib_retransmit() {
+    use crate::net::mib::*;
+    let (mut p, m) = mib_pair();
+    let segs = m.tcp.fold(TCP_MIB_OUTSEGS);
+    p.filter = |_, to_b, s, _| {
+        if to_b && !s.data.is_empty() {
+            Fate::Drop
+        } else {
+            Fate::Pass
+        }
+    };
+    p.send_a(b"lost");
+    p.run();
+    p.filter = pass;
+    p.until(|p| p.b.rcvq_len() == 4, 10);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPTIMEOUTS), 1);
+    assert_eq!(m.tcp.fold(TCP_MIB_RETRANSSEGS), 1);
+    // The data once, b's ACK of the retransmission
+    assert_eq!(m.tcp.fold(TCP_MIB_OUTSEGS), segs + 2);
+}
+
+/// A refused connect is a failed attempt
+#[test]
+fn mib_refused() {
+    use crate::net::mib::*;
+    let m = crate::net::mib::NetMib::new().unwrap();
+    let mut a = TcpCb::new(cfg());
+    a.mib = Some(m.clone());
+    let mut out = Out::default();
+    a.connect(open(1000, 1460), 0, &mut out);
+    let syn = wire(&out)[0].clone();
+    let rst = SegIn {
+        seq: 0,
+        ack: syn.seq.wrapping_add(1),
+        flags: flags::RST | flags::ACK,
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    a.feed(&rst, 1, &mut out);
+    assert_eq!(a.state, TcpState::Closed);
+    assert_eq!(m.tcp.fold(TCP_MIB_ACTIVEOPENS), 1);
+    assert_eq!(m.tcp.fold(TCP_MIB_ATTEMPTFAILS), 1);
+    assert_eq!(m.tcp.fold(TCP_MIB_CURRESTAB), 0);
 }

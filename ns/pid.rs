@@ -32,8 +32,11 @@ pub struct PidNamespace {
     /// Nesting level (0 = init_pid_ns, increases with each child)
     pub level: u32,
 
-    /// Its inode number (Linux ns.inum)
-    pub inum: super::inum::Inum,
+    /// Its inode number and nsfs dentry (Linux ns)
+    pub ns: super::NsCommon,
+
+    /// The user namespace that owns it (Linux pid_namespace.user_ns)
+    pub user_ns: Arc<super::UserNamespace>,
 
     /// Parent namespace (None for init_pid_ns)
     pub parent: Option<Arc<PidNamespace>>,
@@ -73,7 +76,8 @@ impl PidNamespace {
         // child_reaper is set from the start
         arc_nofail(Self {
             level: 0,
-            inum: super::inum::Inum::fixed(super::inum::PID_INIT),
+            ns: super::NsCommon::new(super::inum::Inum::fixed(super::inum::PID_INIT)),
+            user_ns: super::INIT_USER_NS.clone(),
             parent: None,
             map: crate::task::pid::PidMap::new(),
             alloc: AtomicU32::new(NS_ADDING | NS_INIT),
@@ -99,14 +103,18 @@ impl PidNamespace {
     /// Create a child namespace (CLONE_NEWPID, unshare)
     ///
     /// ENOSPC past MAX_PID_NS_LEVEL levels, like Linux create_pid_namespace.
-    pub fn clone_ns(parent: &Arc<PidNamespace>) -> Result<Arc<Self>, KernelError> {
+    pub fn clone_ns(
+        parent: &Arc<PidNamespace>,
+        user_ns: &Arc<super::UserNamespace>,
+    ) -> Result<Arc<Self>, KernelError> {
         if parent.level >= MAX_PID_NS_LEVEL {
             return Err(KernelError::NoSpace);
         }
         let inum = super::inum::Inum::alloc()?;
         try_arc(Self {
             level: parent.level + 1,
-            inum,
+            ns: super::NsCommon::new(inum),
+            user_ns: user_ns.clone(),
             parent: Some(parent.clone()),
             map: crate::task::pid::PidMap::new(),
             alloc: AtomicU32::new(NS_ADDING),

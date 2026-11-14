@@ -7,7 +7,7 @@
 
 use core::ptr;
 
-use crate::sync::spin::Mutex;
+use crate::sync::IrqSpinlock;
 
 use crate::console::{ConsoleDriver, ConsolePriority};
 use crate::gfx::font::{DEFAULT_FONT, Font};
@@ -35,7 +35,7 @@ pub struct ScanoutSurface {
 }
 
 // SAFETY: device memory reached only by volatile access through `&self`
-// methods of the console, which serializes them (its state Mutex)
+// methods of the console, which serializes them (its state lock)
 unsafe impl Send for ScanoutSurface {}
 // SAFETY: as above
 unsafe impl Sync for ScanoutSurface {}
@@ -233,8 +233,9 @@ struct GfxConsoleState {
 pub struct GfxConsole {
     /// Console name
     name: &'static str,
-    /// Console state (surface + cursor) protected by single mutex
-    state: Mutex<GfxConsoleState>,
+    /// Console state (surface + cursor); IRQ-safe: console writes run in
+    /// any context
+    state: IrqSpinlock<GfxConsoleState>,
     /// Font to use for rendering
     font: &'static Font,
     /// Console width in characters
@@ -255,7 +256,7 @@ impl GfxConsole {
 
         Self {
             name,
-            state: Mutex::new(GfxConsoleState {
+            state: IrqSpinlock::new(GfxConsoleState {
                 surface,
                 cursor_x: 0,
                 cursor_y: 0,
@@ -282,9 +283,7 @@ impl GfxConsole {
     }
 
     /// Put a single character at the current cursor position
-    fn put_char(&self, ch: u8) {
-        let mut state = self.state.lock();
-
+    fn put_char(&self, state: &mut GfxConsoleState, ch: u8) {
         // Copy cursor position (avoid borrow conflict with surface)
         let cx = state.cursor_x;
         let cy = state.cursor_y;
@@ -312,9 +311,7 @@ impl GfxConsole {
     }
 
     /// Handle newline
-    fn newline(&self) {
-        let mut state = self.state.lock();
-
+    fn newline(&self, state: &mut GfxConsoleState) {
         state.cursor_x = 0;
         state.cursor_y += 1;
 
@@ -326,39 +323,23 @@ impl GfxConsole {
         }
     }
 
-    /// Handle carriage return
-    fn carriage_return(&self) {
-        self.state.lock().cursor_x = 0;
-    }
-
     /// Handle tab
-    fn tab(&self) {
-        let mut state = self.state.lock();
+    fn tab(&self, state: &mut GfxConsoleState) {
         let tab_width = 8;
         let new_x = ((state.cursor_x / tab_width) + 1) * tab_width;
         state.cursor_x = new_x.min(self.cols - 1);
     }
 
-    /// Handle backspace
-    fn backspace(&self) {
-        let mut state = self.state.lock();
-        if state.cursor_x > 0 {
-            state.cursor_x -= 1;
-        }
-    }
-
     /// Write a byte to the console
-    fn write_byte(&self, byte: u8) {
+    fn write_byte(&self, state: &mut GfxConsoleState, byte: u8) {
         match byte {
-            b'\n' => self.newline(),
-            b'\r' => self.carriage_return(),
-            b'\t' => self.tab(),
-            0x08 => self.backspace(), // Backspace
-            0x7F => self.backspace(), // Delete (treat as backspace)
-            // Printable ASCII characters
-            0x20..=0x7E => self.put_char(byte),
-            // Extended ASCII (render if font has it)
-            0x80..=0xFF => self.put_char(byte),
+            b'\n' => self.newline(state),
+            b'\r' => state.cursor_x = 0,
+            b'\t' => self.tab(state),
+            // Backspace, and Delete treated as one
+            0x08 | 0x7F => state.cursor_x = state.cursor_x.saturating_sub(1),
+            // Printable ASCII, and extended ASCII if the font has it
+            0x20..=0x7E | 0x80..=0xFF => self.put_char(state, byte),
             // Ignore other control characters
             _ => {}
         }
@@ -370,9 +351,16 @@ impl ConsoleDriver for GfxConsole {
         self.name
     }
 
+    /// Render `data`, in any context (under printk's `OUTPUT_LOCK`).
+    /// The state is only tried: held (a printk nested in this write, or
+    /// a concurrent oops), the output is dropped (Linux
+    /// vt_console_print's printing_lock trylock)
     fn write(&self, data: &[u8]) {
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
         for &byte in data {
-            self.write_byte(byte);
+            self.write_byte(&mut state, byte);
         }
     }
 
@@ -453,4 +441,40 @@ pub fn register_graphics_console() {
 /// Check if graphics console is available
 pub fn has_graphics_console() -> bool {
     GRAPHICS_CONSOLE.get().is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn console(mem: &mut [u8]) -> GfxConsole {
+        let fb = FramebufferInfo {
+            phys_addr: 0,
+            size: mem.len() as u64,
+            width: 64,
+            height: 32,
+            pitch: 64 * 4,
+            format: PixelFormat::Xrgb8888,
+        };
+        // SAFETY: `mem` is `fb.size` bytes, outliving the console
+        let s = unsafe { ScanoutSurface::new(&fb, mem.as_mut_ptr()) };
+        GfxConsole::new("t", s, &DEFAULT_FONT)
+    }
+
+    /// A write that finds the state held (a printk nested in a console
+    /// write) drops its output instead of spinning on its own lock
+    #[test]
+    fn nested_write_drops() {
+        let mut mem = vec![0u8; 64 * 4 * 32];
+        let c = console(&mut mem);
+        c.write(b"a");
+        let held = c.state.lock();
+        let x = held.cursor_x;
+        c.write(b"bc");
+        assert_eq!(held.cursor_x, x);
+        drop(held);
+        c.write(b"d\r");
+        assert_eq!(c.state.lock().cursor_x, 0);
+    }
 }

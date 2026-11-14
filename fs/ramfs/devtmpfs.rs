@@ -27,13 +27,13 @@ use spin::Once;
 use crate::fs::chardev::DevId;
 
 use crate::fs::KernelError;
-use crate::fs::dentry::Dentry;
+use crate::fs::dentry::DentryRef;
 use crate::fs::superblock::{FileSystemType, SuperBlock};
 
 /// The internal superblock
 static DEVTMPFS: Once<Arc<SuperBlock>> = Once::new();
 
-fn root() -> Option<Arc<Dentry>> {
+fn root() -> Option<DentryRef> {
     DEVTMPFS.get()?.get_root()
 }
 

@@ -9,13 +9,21 @@ use core::fmt;
 use crate::fs::chardev::{DevId, major};
 use crate::irq::{IrqFn, IrqRegistration, IrqReturn};
 use crate::sync::spin::Mutex;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::time::timer::{TIMER_HARD, TimerList};
+use crate::tty::serial_core::{
+    PORT_AMBA, PORT_UNKNOWN, UPF_BOOT_AUTOCONF, UPIO_MEM, UartCfg, UartDesc, UartOps, UartPort,
+};
 use crate::tty::{Tty, TtyDriver};
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 use core::ptr::{read_volatile, write_volatile};
 
-/// PL011 UART base address on QEMU virt machine
-const PL011_BASE: usize = super::paging::io_va(0x0900_0000) as usize;
+/// PL011 UART physical address on QEMU virt machine (Linux mapbase)
+const PL011_PHYS: u64 = 0x0900_0000;
+/// ... and where the kernel maps it
+const PL011_BASE: usize = super::paging::io_va(PL011_PHYS) as usize;
 
 /// PL011 register offsets
 mod regs {
@@ -51,9 +59,15 @@ mod fr {
 mod int {
     /// Receive (FIFO level reached)
     pub const RX: u32 = 1 << 4;
+    /// Transmit (FIFO at or below its level; Linux UART011_TXIS)
+    pub const TX: u32 = 1 << 5;
     /// Receive timeout (FIFO not empty, idle line)
     pub const RT: u32 = 1 << 6;
 }
+
+/// Bytes sent per TX interrupt: half the FIFO (Linux pl011_tx_chars'
+/// fifosize >> 1)
+const TX_BURST: usize = 8;
 
 /// Line Control Register bits
 mod lcr {
@@ -79,6 +93,10 @@ mod cr {
 /// `base` is the PL011's register block, mapped for the kernel's life.
 struct Pl011 {
     base: usize,
+    /// Its port lock and transmit buffer (Linux uart_port)
+    uart: UartPort,
+    /// IMSC as last written (Linux uap->im), under the port lock
+    im: AtomicU32,
 }
 
 impl Pl011 {
@@ -86,7 +104,36 @@ impl Pl011 {
     const fn new(base: usize) -> Self {
         // INVARIANT: PL011_BASE is mapped by the early page tables and
         // stays mapped
-        Self { base }
+        Self {
+            base,
+            uart: UartPort::new(
+                UartDesc {
+                    type_: PORT_AMBA,
+                    line: 0,
+                    iobase: 0,
+                    mapbase: PL011_PHYS,
+                    iotype: UPIO_MEM,
+                    regshift: 0,
+                },
+                // Linux pl011_probe: the APB clock (24 MHz on QEMU
+                // virt), an r1 PL011's 16-byte FIFO (get_fifosize_arm);
+                // the interrupt is known at probe
+                UartCfg {
+                    irq: 0,
+                    flags: UPF_BOOT_AUTOCONF,
+                    uartclk: 24_000_000,
+                    custom_divisor: 0,
+                    fifosize: 16,
+                },
+            ),
+            im: AtomicU32::new(0),
+        }
+    }
+
+    /// Write IMSC (under the port lock)
+    fn set_im(&self, v: u32) {
+        self.im.store(v, Ordering::Relaxed);
+        self.write_reg(regs::IMSC, v);
     }
 
     /// Read a register
@@ -180,18 +227,152 @@ impl Pl011 {
 /// Global UART instance (its methods take `&self`: MMIO only)
 static UART: Pl011 = Pl011::new(PL011_BASE);
 
-impl TtyDriver for Pl011 {
-    fn write(&self, data: &[u8]) -> Result<usize, KernelError> {
-        for &b in data {
-            self.write_byte(b);
+/// The PL011's transmitter (Linux amba_pl011_pops), under the port lock
+impl UartOps for Pl011 {
+    /// Half the FIFO from the interrupt; else until the FIFO is full
+    fn tx_burst(&self, from_irq: bool) -> usize {
+        if from_irq { TX_BURST } else { usize::MAX }
+    }
+
+    fn tx_full(&self) -> bool {
+        self.read_reg(regs::FR) & fr::TXFF != 0
+    }
+
+    fn tx_put(&self, b: u8) {
+        self.write_reg(regs::DR, u32::from(b));
+    }
+
+    /// Linux pl011_start_tx_pio / pl011_stop_tx: IMSC.TXIM
+    fn tx_irq(&self, on: bool) {
+        let v = self.im.load(Ordering::Relaxed);
+        self.set_im(if on { v | int::TX } else { v & !int::TX });
+    }
+
+    fn console_putc(&self, b: u8) {
+        self.write_byte(b);
+    }
+
+    fn tx_drain(&self) {
+        TtyDriver::flush(self);
+    }
+
+    fn arm_poll(&self) {
+        core::pin::Pin::static_ref(&POLL).mod_timer(crate::task::percpu::get_ticks() + 1);
+    }
+
+    /// Linux pl011_verify_port: an AMBA port at its own address
+    fn verify_port(&self, ss: &crate::tty::SerialStruct) -> Result<(), KernelError> {
+        if (ss.type_ != PORT_UNKNOWN && ss.type_ != PORT_AMBA)
+            || ss.irq < 0
+            || ss.baud_base < 9600
+            || ss.iomem_base != PL011_PHYS
+        {
+            return Err(KernelError::InvalidArgument);
         }
-        Ok(data.len())
+        Ok(())
+    }
+}
+
+impl TtyDriver for Pl011 {
+    /// Linux uart_write: into the transmit buffer, the transmitter
+    /// started
+    fn write(&self, tty: &Tty, data: &[u8]) -> Result<usize, KernelError> {
+        let (n, wake) = self.uart.write(self, data);
+        if wake {
+            tty.write_wakeup();
+        }
+        Ok(n)
+    }
+
+    /// Linux uart_stop
+    fn stop(&self) {
+        self.uart.stop(self);
+    }
+
+    /// Linux uart_start (the tty layer wakes writers after)
+    fn start(&self) {
+        self.uart.start(self);
+    }
+
+    /// Linux uart_send_xchar
+    fn send_xchar(&self, tty: &Tty, ch: u8) {
+        if self.uart.send_xchar(self, ch) {
+            tty.write_wakeup();
+        }
+    }
+
+    /// Linux uart_throttle
+    fn throttle(&self, tty: &Tty) {
+        if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, true) {
+            self.send_xchar(tty, ch);
+        }
+    }
+
+    /// Linux uart_unthrottle
+    fn unthrottle(&self, tty: &Tty) {
+        if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, false) {
+            self.send_xchar(tty, ch);
+        }
     }
 
     fn flush(&self) {
         while self.read_reg(regs::FR) & fr::BUSY != 0 {
             core::hint::spin_loop();
         }
+    }
+
+    fn write_room(&self) -> usize {
+        self.uart.write_room()
+    }
+
+    fn chars_in_buffer(&self) -> usize {
+        self.uart.chars_in_buffer()
+    }
+
+    fn flush_buffer(&self) {
+        self.uart.flush_buffer();
+    }
+
+    /// Linux uart_hangup
+    fn hangup(&self) {
+        self.uart.hangup(self);
+    }
+    /// Linux uart_tty_port_shutdown
+    fn shutdown(&self, console: bool) {
+        self.uart.shutdown(self, console);
+    }
+
+    /// Linux pl011_console_write: under the port lock
+    fn console_write(&self, data: &[u8]) {
+        self.uart.console_write(self, data);
+    }
+
+    /// Linux uart_get_info
+    fn get_serial(
+        &self,
+        port: &crate::tty::TtyPort,
+    ) -> Result<crate::tty::SerialStruct, KernelError> {
+        Ok(self.uart.get_info(port))
+    }
+
+    /// Linux uart_set_info
+    fn set_serial(
+        &self,
+        port: &mut crate::tty::TtyPort,
+        ss: &crate::tty::SerialStruct,
+        users: usize,
+    ) -> Result<(), KernelError> {
+        let admin = crate::task::capable(crate::task::CAP_SYS_ADMIN);
+        self.uart.set_info(self, port, ss, users > 0, users, admin)
+    }
+}
+
+/// Polls the transmitter while the PL011 has no interrupt
+static POLL: TimerList = TimerList::new(poll, TIMER_HARD);
+
+fn poll(_t: &TimerList) {
+    if UART.uart.poll_tx(&UART) {
+        TTY_AMA0.write_wakeup();
     }
 }
 
@@ -204,26 +385,38 @@ pub fn serial_ttys() -> &'static [&'static Tty] {
     &TTYS
 }
 
-/// The PL011's interrupt handler (IRQ context): input to ttyAMA0
+/// The PL011's interrupt handler (IRQ context; Linux pl011_int): input
+/// to ttyAMA0, then the transmitter refilled under the port lock, its
+/// writers woken after
 fn pl011_irq(_irq: u32) -> IrqReturn {
-    UART.rx_chars(&TTY_AMA0).into()
+    let rx = UART.rx_chars(&TTY_AMA0);
+    let tx = UART.read_reg(regs::MIS) & int::TX != 0;
+    if tx && UART.uart.interrupt_tx(&UART) {
+        TTY_AMA0.write_wakeup();
+    }
+    (rx || tx).into()
 }
 
 /// Take input by interrupt (Linux pl011_startup); `irq` is the GIC
 /// INTID. None without it
 fn rx_irq_init(irq: u32) -> Option<IrqRegistration<IrqFn>> {
+    UART.uart.set_irq_nr(irq as i32);
     let h = try_arc(IrqFn(pl011_irq)).ok()?;
     let reg = crate::irq::request_irq(irq, h)
         .inspect_err(|e| crate::printkln!("ttyAMA0: no IRQ {}: {:?}", irq, e))
         .ok()?;
-    UART.write_reg(regs::IMSC, int::RX | int::RT);
+    UART.uart
+        .locked(|| UART.set_im(UART.im.load(Ordering::Relaxed) | int::RX | int::RT));
+    // The transmitter drains by interrupt from here
+    UART.uart.set_irq(&UART, true);
     Some(reg)
 }
 
 /// Stop taking input by interrupt (Linux pl011_shutdown: IMSC cleared,
 /// then free_irq, which waits out a running handler)
 fn rx_irq_exit(irq: IrqRegistration<IrqFn>) {
-    UART.write_reg(regs::IMSC, 0);
+    UART.uart.set_irq(&UART, false);
+    UART.uart.locked(|| UART.set_im(0));
     drop(irq);
 }
 
@@ -318,13 +511,14 @@ impl crate::base::Bound for Pl011Port {
         self
     }
 
-    /// Linux pl011_remove, uart_remove_one_port: the tty device and
-    /// console go, the interrupt is off (no hangup of an open tty:
-    /// BUGS.md). Printk then has no console, as on Linux
+    /// Linux pl011_remove, uart_remove_one_port: the tty device goes,
+    /// the tty is hung up (tty_port_tty_vhangup), the console goes, the
+    /// interrupt is off. Printk then has no console, as on Linux
     fn remove(&self) {
         if let Some(t) = &self.tty {
             t.del();
         }
+        TTY_AMA0.hangup(false);
         crate::console::unregister_console(TTY_AMA0.name());
         let irq = self.irq.lock().take();
         if let Some(irq) = irq {

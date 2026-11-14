@@ -145,10 +145,15 @@ fn sb_sync_flags(flags: u64) -> u32 {
 }
 
 /// MS_REMOUNT (Linux do_remount): the mount's flags become exactly the
-/// requested set. The read-only switch goes first and is all-or-nothing
-/// (EBUSY while files are open for writing or changes are in progress,
-/// with nothing changed); only then the per-mount flags are replaced.
+/// requested set, EPERM if that drops one a lock keeps
+/// (can_change_locked_flags). The read-only switch goes first and is
+/// all-or-nothing (EBUSY while files are open for writing or changes
+/// are in progress, with nothing changed); only then the per-mount
+/// flags are replaced.
 fn remount(m: &super::mount::MountRef, flags: u64, data: &[u8]) -> Result<(), KernelError> {
+    if !m.can_change_locked_flags(remount_flags(flags, m.flags())) {
+        return Err(KernelError::NotPermitted);
+    }
     let _s = m.sb.s_umount.write();
     // Read-only first (EBUSY changes nothing), then the filesystem's
     // options; their error undoes the switch (Linux reconfigure_super:
@@ -171,8 +176,12 @@ fn remount(m: &super::mount::MountRef, flags: u64, data: &[u8]) -> Result<(), Ke
 }
 
 /// MS_REMOUNT|MS_BIND (Linux do_reconfigure_mnt): this mount's flags
-/// only, read-only included; the superblock is untouched
+/// only, read-only included, EPERM if that drops one a lock keeps; the
+/// superblock is untouched
 fn reconfigure_mnt(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError> {
+    if !m.can_change_locked_flags(remount_flags(flags, m.flags())) {
+        return Err(KernelError::NotPermitted);
+    }
     // s_umount shared, as Linux do_reconfigure_mnt: the superblock does
     // not change, MOUNT_LOCK serializes the flag writers
     let _s = m.sb.s_umount.read();
@@ -183,7 +192,7 @@ fn reconfigure_mnt(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelE
 /// do_change_type): exactly one type (else EINVAL), for the subtree
 /// with MS_REC
 fn change_type(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError> {
-    use super::pnode::{Prop, change_propagation};
+    use super::pnode::{Prop, change_mnt_propagation, invent_group_ids};
     let p = match flags & !(ms::REC | ms::SILENT) {
         ms::SHARED => Prop::Shared,
         ms::SLAVE => Prop::Slave,
@@ -191,19 +200,21 @@ fn change_type(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError
         ms::UNBINDABLE => Prop::Unbindable,
         _ => return Err(KernelError::InvalidArgument),
     };
-    let ns = super::mount::namespace_lock();
+    let mut ns = super::mount::namespace_lock();
     // Mounted in some namespace, not a kernel mount (Linux
     // may_change_propagation's IS_ERR_OR_NULL(mnt_ns): not necessarily
     // the caller's)
     if !m.is_mounted() {
         return Err(KernelError::InvalidArgument);
     }
-    if flags & ms::REC != 0 {
-        for t in super::mount::walk(m, &*ns) {
-            change_propagation(&t, p);
-        }
+    let rec = flags & ms::REC != 0;
+    if p == Prop::Shared {
+        invent_group_ids(&mut ns, m, rec)?;
+    }
+    if rec {
+        super::mount::for_each_mut(&mut ns, m, |ns, t| change_mnt_propagation(ns, t, p));
     } else {
-        change_propagation(m, p);
+        change_mnt_propagation(&mut ns, m, p);
     }
     Ok(())
 }
@@ -219,7 +230,7 @@ fn own_mount_at(target: &super::Path) -> Result<super::mount::MountRef, KernelEr
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
 fn mount_at(target: &super::Path) -> Result<super::mount::MountRef, KernelError> {
-    if Arc::ptr_eq(&target.dentry, &target.mnt.root) {
+    if super::DentryRef::ptr_eq(&target.dentry, &target.mnt.root) {
         Ok(target.mnt.clone())
     } else {
         Err(KernelError::InvalidArgument)
@@ -346,11 +357,18 @@ fn new_mount(
     } else {
         (fs_type.mount)(fs_type, data)
     };
+    // Linux do_new_mount_fc: "Mount too revealing"
+    let mut revealing = false;
     let r = sb.and_then(|sb| {
         // A superblock already mounted elsewhere (sysfs of a namespace)
         // keeps its flags (Linux: only a new one gets the mount's)
         if !sb.is_mounted() {
             sb.set_sync_flags(sb_sync_flags(flags));
+        }
+        let mut mnt_flags = mnt_flags(flags);
+        if super::mount::mount_too_revealing(&sb, &mut mnt_flags) {
+            revealing = true;
+            return Err(KernelError::NotPermitted);
         }
         // Linux: no source is "none"
         let devname = if source.is_empty() {
@@ -361,13 +379,14 @@ fn new_mount(
         super::mount::attach(
             sb,
             Some(mp),
-            mnt_flags(flags),
+            mnt_flags,
             flags & ms::RDONLY != 0,
             devname.into(),
         )
     });
     match r {
         Ok(_) => Ok(()),
+        Err(e) if revealing => Err(e),
         Err(
             e @ (KernelError::NotBlockDevice
             | KernelError::NoDevice

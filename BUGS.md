@@ -7,15 +7,6 @@ Failures that also occur when the boot tester runs on real Linux
 real bug in Linux as well as hk: Linux is the reference, not
 infallible, so each one is investigated, not written off.
 
-- **NICE_ADJACENT flaky on the arm64 Linux reference**: one emulated
-  `check-linux-arm` run had two adjacent-nice spinners' CPU share off
-  (`share a:b tenths got 26`); passed on the uncached rerun. Likely
-  TCG timing noise in a ratio test; widen the tolerance if it recurs.
-- **RLIMIT_CPU_XCPU flaky on the x86 Linux reference**: one uncached
-  `check-linux` run, run alongside `check-arm`, got `RLIMIT_CPU_XCPU:FAIL
-  got 9` (SIGKILL where SIGXCPU was expected first); passed on rerun.
-  Likely CPU-time accounting under a loaded host.
-
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
 Files marked `#![expect(clippy::undocumented_unsafe_blocks)]
@@ -97,8 +88,18 @@ Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. /proc/net/raw and
-/proc/net/icmp do not exist.
+IP_TRANSPARENT. /proc/net/raw, /proc/net/icmp, /proc/net/sockstat
+and /proc/<pid>/net do not exist (/proc/net follows the reader's
+namespace; Linux makes it a link to self/net).
+MIB counters (`net/mib.rs`): TcpExt counts the connection lifecycle,
+timeouts, aborts, listen drops, TIME_WAIT, delayed ACKs, Reno
+recovery, retransmissions, PAWS, challenge ACKs, out-of-order and
+memory drops and probes; header prediction (TCPHPHits, TCPPureAcks,
+TCPHPAcks), coalescing, zero-window advertisement, undo and
+delivered counters stay 0. Ip InDiscards/OutDiscards count
+only some of Linux's sites. Counters of features hk lacks (SACK,
+DSACK, TLP, Fast Open, syncookies, MD5/AO, forwarding, multicast
+receive) stay 0 by nature.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
 NIC removal: e1000 leaves the function's bus mastering and memory
@@ -370,9 +371,6 @@ Safe today only because a user namespace grants no capabilities. First:
   `capable`, where Linux keeps it); sockopt_ns_capable sites take the
   socket netns's user_ns, but SO_DEBUG and SO_SNDBUFFORCE/RCVBUFFORCE
   stay init-namespace (Linux sockopt_capable).
-- an unprivileged CLONE_NEWNS (new user_ns) locks the copied tree
-  (lock_mnt_tree: MNT_LOCKED plus MNT_LOCK_* flags) and turns shared
-  mounts into slaves (CL_SHARED_TO_SLAVE).
 - netlink newlink/setlink check CAP_NET_ADMIN in the target netns too
   once IFLA_NET_NS_PID/FD are implemented (`7b735ef81286`).
 - creating a namespace together with CLONE_NEWUSER checks capabilities
@@ -380,8 +378,8 @@ Safe today only because a user namespace grants no capabilities. First:
   (today any namespace but a user namespace needs the caller's own
   CAP_SYS_ADMIN, even with CLONE_NEWUSER), and /proc/<pid>/uid_map and
   gid_map become writable.
-- mounts become user-namespace aware (plain `capable()` today): copies
-  of a namespace are always peers and never locked.
+- mounts become user-namespace aware (plain `capable()` today, Linux
+  ns_capable of the mount namespace's `user_ns`).
 
 ## Credentials have no identity
 
@@ -477,26 +475,21 @@ glibc's helper thread), and hk has no such path.
   ISIG signals, canonical lines, the lock-free input check poll uses)
   runs only on the console's real input. A pty (phase H) makes it
   testable from the boot tester.
-- **No hangup:** nothing hangs a tty up (Linux __tty_hangup: vhangup,
-  a session leader's exit, carrier loss), so open files stay usable.
-  A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
-  foreground group and clear the session; vhangup(2) only checks
-  CAP_SYS_TTY_CONFIG. Unbinding a serial port (serial8250, PL011)
-  removes its tty devices, console and interrupt but hangs up no open
-  file (Linux uart_remove_one_port: tty_port_tty_vhangup): writes to
-  an open ttyS0/ttyAMA0 or /dev/console still reach the UART. No boot
-  test unbinds the console UART (the test output goes there).
+- **Hangup gaps:** no carrier (DCD) loss hangs a tty up (no modem
+  control); a session leader exiting with no controlling tty signals
+  no former foreground group (Linux tty_old_pgrp). An unbound serial
+  port's tty is hung up, but its /dev/console files (left alone, as
+  Linux) still write to the UART, where Linux's port is detached
+  (uart_port_check). No boot test unbinds the console UART (the test
+  output goes there).
 - **Per-process controlling tty:** it is the session's tty, so TIOCNOTTY
   by a non-leader changes nothing (Linux clears that process's
   signal->tty only).
-- **No group stop:** a background process that gets SIGTTOU/SIGTTIN
-  with SIG_DFL (tty_check_change) fails with EIO instead of stopping
-  (see the ptrace stop gaps: stop/continue are not implemented).
 - **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
-  TIOCEXCL exclusivity, sending a break (TCSBRK 0), IXON/IXOFF flow
-  control, packet mode, ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT,
-  IUCLC/OLCUC, IMAXBEL, PARMRK and parity/break input handling. Output
-  is written synchronously by polling (TIOCOUTQ 0, no write_wait).
+  TIOCEXCL exclusivity, sending a break (TCSBRK 0), packet mode,
+  ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT, IUCLC/OLCUC, IMAXBEL,
+  PARMRK and parity/break input handling, CRTSCTS (no modem
+  control: IXOFF throttles by STOP/START only).
 - **Serial ports:** ttyS1 is registered without probing COM2; only
   COM1 (and the PL011) take input.
 - **No virtual terminals:** the framebuffer and VGA consoles are not
@@ -523,33 +516,24 @@ glibc's helper thread), and hk has no such path.
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
 Accepted without effect: MS_SILENT, MS_MANDLOCK, MS_POSIXACL,
-MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated
-copy lands on top of what is already mounted at the target (Linux
-tucks it under); a slave's master is its master's peer group, not one
-mount; copies of a namespace are always peers and not locked (see
-"Before user namespaces grant capabilities"). Mount options are
+MS_I_VERSION, MS_LAZYTIME. Mount options are
 parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
 cp437 only), ramfs (mode=), tmpfs and devtmpfs (see "tmpfs gaps") and
 procfs (hidepid=, gid=, subset=pid; devtmpfs drops a new mount's after
 parsing them, as Linux 6.15+); cgroupfs ignores its own, and only
 procfs, tmpfs and devtmpfs apply options on a remount or show them in
 /proc/mounts.
-Crossing into a mount scans the current mount's children under
-`MOUNT_LOCK`'s locking read, one global spin lock for every walk at a
-mountpoint (Linux hashes (parent, mountpoint): mount_hashtable, looked
-up under RCU and the mount_lock sequence).
 
 ## nullfs gaps
 
 **Location**: `fs/nullfs.rs`, `fs/mount.rs` init_mount_tree,
 `fs/fsstruct.rs` KTHREAD_FS
 
-The nullfs root (Linux 7.0) and the kernel threads' private nullfs
-(7.3) are in place, but no user path reaches either, so what Linux 7.3
-added for when they become reachable is not done: empty mount
-namespaces, the nullfs that stands in for an unmounted mount and the
-empty immutable regular file. Locks are not refused with ENOLCK
-(31a1fb90624d), MS_REMOUNT and umount of the root are not refused on
+The nullfs root (Linux 7.0), the kernel threads' private nullfs (7.3)
+and its file (7.4) are in place; a user path reaches the last two only
+as a cover's stand-in (Linux 7.4 __lookup_mnt). Not done: empty mount
+namespaces and the nullfs that stands in for an unmounted mount. Locks
+are not refused with ENOLCK (31a1fb90624d), MS_REMOUNT and umount of the root are not refused on
 the internal superblock (d791606bb915), and nothing marks knullfs's
 root as unmountable (e22e69c2ad88: dont_mount). Kernel code that resolves a path from a kernel thread finds nothing
 (knullfs); hk has none today, and has no scoped_with_init_fs for one
@@ -571,8 +555,7 @@ return trampoline stands in for the vDSO's sigtramp, shown as
 
 Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
 clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
-PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
-to an untraced task is ignored: stop/continue are not implemented).
+PTRACE_EVENT_FORK..PTRACE_EVENT_EXIT).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 
@@ -794,29 +777,26 @@ Phase A2 (net) remaining:
 
 ## xHCI driver gaps on real hardware
 
-**Location**: `hw/usb/xhci.rs`, `hw/usb/msc.rs`
+**Location**: `hw/usb/xhci.rs`, `hw/usb/xhci_ring.rs`, `hw/usb/msc.rs`
 
 QEMU's xHCI hides all of them.
-- Command completions are not matched to their TRB (`wait_for_command`
-  ignores `_trb_addr`): a late completion for a timed-out command is
-  credited to the next one. A timed-out transfer leaves its TRB queued
-  and leaks its bounce buffer; a timeout should stop the endpoint and
-  move its dequeue pointer past the TRB (Linux
-  xhci_handle_cmd_stop_ep).
-- One controller only: the driver keeps a single global
-  `USB_CONTROLLER`; a second xHCI's probe replaces the first, which is
-  left running, and both device handles act on the survivor at
-  shutdown (unbinding the first stops neither).
+- A second controller's root hub is `usb1` too (no bus numbers, Linux
+  usb_register_bus): its devices fail to register.
 - No hub support (route string 0): devices behind a hub are not
   enumerated.
 - Only bulk and interrupt endpoints are added to the controller
   (`configure_endpoints`): isochronous and non-default control
-  endpoints are skipped. A control data stage is one TRB of at most a
-  page: a configuration descriptor longer than 4 KiB is cut short.
+  endpoints are skipped.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
-- The USB serial console drops output while `USB_CONTROLLER` is held
-  (by any CPU): it only try-locks it; Linux queues console output in a
-  write FIFO sent asynchronously.
+- Transfer rings are one segment and never grow (Linux
+  xhci_ring_expansion): a submission that does not fit fails
+  (NoResources).
+- A transaction error halts the endpoint at once (Linux retries a
+  few: EP_SOFT_RESET); no quirk for controllers that send a spurious
+  success event after a short transfer (XHCI_SPURIOUS_SUCCESS).
+- INTx only (Linux tries MSI-X, then MSI): see "x86 has no IOAPIC or
+  MSI"; a controller without an INTx line is not started, as Linux
+  without any interrupt.
 
 ## USB core gaps
 
@@ -843,7 +823,9 @@ QEMU's xHCI hides all of them.
   0).
 - usb-storage: SCSI transparent command set over Bulk-Only Transport
   only (no CB/CBI, RBC/UFI/8070 subclasses, UAS, or unusual_devs
-  quirks).
+  quirks). A stalled bulk transfer fails the command: no CLEAR_FEATURE
+  ENDPOINT_HALT to the device, CSW read or reset recovery (Linux
+  usb_stor_clear_halt, usb_stor_Bulk_reset).
 - ftdi_sio: a console only, for the FT232 (0403:6001): no usb-serial
   bus or ttyUSB0 tty device, no baud rate or modem control requests,
   the bulk IN endpoint is never read.
@@ -956,8 +938,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   IN_DELETE_SELF, IN_UNMOUNT, IN_IGNORED and IN_Q_OVERFLOW, fanotify
   nothing (the other events have no fsnotify hooks in the VFS
   operations); rename has no
-  IN_MOVED_FROM/IN_MOVED_TO cookie pairing (Linux fsnotify_get_cookie); waitid without WEXITED is
-  EINVAL (C).
+  IN_MOVED_FROM/IN_MOVED_TO cookie pairing (Linux fsnotify_get_cookie).
 - **Copied helpers** (J, or as touched): `current_time` in cgroupfs,
   perm, procfs and ramfs, `current_time_secs` in ipc msg/sem/shm;
   user-timespec readers each validating (futex `read_user_timeout`,
@@ -1051,16 +1032,14 @@ size and depth match it, else ENOMEM; Linux simpledrm allocates any
 dumb buffer from shmem and blits it on page flip
 (drm_gem_shmem_dumb_create).
 
-## Namespace files are not nsfs
+## Namespace file gaps
 
-**Location**: `fs/proc/mod.rs` (`ns_file`), `ns/mod.rs` (`sys_setns`)
+**Location**: `fs/pseudo/nsfs.rs`, `ns/setns.rs`
 
-/proc/<pid>/ns/<type> leads to an inode on the nsfs mount numbered as
-the namespace, but its operations are procfs's: the file names the
-task and the type, so setns joins the namespace that task is in at
-setns time (Linux: the open file pins the namespace itself, and a bind
-mount of it keeps the namespace alive). No cgroup, time,
-pid_for_children or time_for_children links, and no NS_GET_* ioctls.
+No time or time_for_children links (no time namespaces). Of the
+NS_GET_* ioctls only Linux 6.8's: no NS_GET_MNTNS_ID, NS_GET_ID,
+NS_GET_{PID,TGID}_{FROM,IN}_PIDNS, NS_MNT_GET_{INFO,NEXT,PREV}
+(ENOTTY).
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 

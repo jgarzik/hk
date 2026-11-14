@@ -33,6 +33,9 @@ use spin::Lazy;
 
 use crate::task::percpu;
 
+/// The uid an id with no mapping shows as (Linux overflowuid)
+pub const OVERFLOWUID: u32 = 65534;
+
 /// Maximum user namespace nesting level (same as Linux)
 pub const MAX_USER_NS_LEVEL: u32 = 32;
 
@@ -145,8 +148,8 @@ pub struct UserNamespace {
     /// Creator's GID in the parent namespace
     pub group: u32,
 
-    /// Its inode number (Linux ns.inum)
-    pub inum: super::inum::Inum,
+    /// Its inode number and nsfs dentry (Linux ns)
+    pub ns: super::NsCommon,
 }
 
 impl UserNamespace {
@@ -160,7 +163,7 @@ impl UserNamespace {
             parent: None,
             owner: 0,
             group: 0,
-            inum: super::inum::Inum::fixed(super::inum::USER_INIT),
+            ns: super::NsCommon::new(super::inum::Inum::fixed(super::inum::USER_INIT)),
         })
     }
 
@@ -192,7 +195,7 @@ impl UserNamespace {
             parent: Some(parent.clone()),
             owner: cred.uid,
             group: cred.gid,
-            inum,
+            ns: super::NsCommon::new(inum),
         })
     }
 
@@ -224,6 +227,12 @@ impl UserNamespace {
     /// Maps a UID from this namespace through to the init namespace.
     pub fn to_kuid(&self, uid: u32) -> Option<u32> {
         self.uid_map.map_id_down(uid)
+    }
+
+    /// The id `kuid` has in this namespace, or the overflow uid 65534
+    /// if it has none (Linux from_kuid_munged)
+    pub fn from_kuid_munged(&self, kuid: u32) -> u32 {
+        self.from_kuid(kuid).unwrap_or(OVERFLOWUID)
     }
 
     /// Get the effective GID in the init namespace

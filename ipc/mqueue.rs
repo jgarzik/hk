@@ -641,7 +641,7 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> KernelRe
         &NULL_INODE_OPS,
     ))?;
 
-    let dentry = try_arc(Dentry::new_anonymous(b"mqueue", Some(inode))?)?;
+    let dentry = crate::fs::DentryRef::new(Dentry::new_anonymous(b"mqueue", Some(inode))?)?;
 
     let mut file_flags = match access_mode {
         O_RDONLY => flags::O_RDONLY,

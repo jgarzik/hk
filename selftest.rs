@@ -46,6 +46,13 @@ fn selftest_thread(_arg: usize) {
         }
     };
 
+    // 0. URB cancellation (unlink, kill, a synchronous timeout) on the
+    //    USB serial console's bulk IN endpoint, which QEMU NAKs; first,
+    //    before user space unbinds the xHCI
+    if let Some((dev, pipe)) = crate::hw::usb::serial::console_in_pipe() {
+        crate::hw::usb::urb::urb_selftest(&dev, pipe, &mut check);
+    }
+
     // 1. Scheduler tick rate: 200 ms of CLOCK_MONOTONIC is ~20 ticks
     let k0 = get_ticks();
     sleep_ms(200);
@@ -152,7 +159,7 @@ fn selftest_thread(_arg: usize) {
     use crate::net::inet::ifaddr::{InIfaddr, inet_insert_ifa};
     use crate::net::netlink::NlInfo;
     use crate::net::{Ipv4Addr, device::flags::IFF_UP, rtnl};
-    match crate::net::NetNamespace::create() {
+    match crate::net::NetNamespace::create(&crate::ns::INIT_USER_NS) {
         Ok(net) => {
             let extra = Ipv4Addr::new(192, 0, 2, 1);
             if let Some(lo) = net.loopback() {
@@ -221,6 +228,9 @@ fn selftest_thread(_arg: usize) {
     check("kalloc_arc_reserve", crate::util::kalloc::selftest(), 0);
     // 6c. RCU: a replaced version is released after a grace period
     check("rcu_grace_period", crate::sync::rcu::selftest(), 0);
+    // 6d. An ArcTimer owner released in rcuc/N while its callback runs
+    //     goes without waiting for it
+    check("arc_timer_rcu_put", crate::time::timer::selftest(), 0);
 
     // 7. Cross-CPU calls from every CPU at once: none lost, no deadlock
     if let Err((what, n)) = ipi_stress() {
@@ -238,6 +248,11 @@ fn selftest_thread(_arg: usize) {
     //    this CPU's IRQ stack
     let seen = irq_stack_seen();
     check("irq_stack", seen == IRQ_ON_STACK, seen);
+
+    // 10. A printk in an interrupt handler (the soft-lockup watchdog's)
+    //     reaches every console, the USB serial console too: LOCKDEP
+    //     builds report any non-IRQ-safe lock taken on the way
+    check("printk_hardirq", printk_hardirq(), 0);
 
     if ok {
         printkln!("\nKSELFTEST:OK");
@@ -268,6 +283,29 @@ fn irq_stack_seen() -> u64 {
     }
     t.cancel_sync();
     IRQ_STACK_SEEN.load(Ordering::Acquire)
+}
+
+static PRINTK_HARDIRQ_DONE: AtomicBool = AtomicBool::new(false);
+
+/// A HARD hrtimer callback that prints
+fn printk_hardirq_fire(_t: &crate::time::hrtimer::HrTimer) {
+    printkln!("kselftest: printk in hardirq");
+    PRINTK_HARDIRQ_DONE.store(true, Ordering::Release);
+}
+
+/// Print from a timer interrupt on this CPU: a HARD hrtimer 1 ms out,
+/// and this thread spins until it fired (as `irq_stack_seen`)
+fn printk_hardirq() -> bool {
+    use crate::time::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
+    let t = core::pin::pin!(HrTimer::new(printk_hardirq_fire, HRTIMER_HARD));
+    let now = crate::time::monotonic_ns();
+    t.as_ref().start(now + 1_000_000, HrClock::Monotonic);
+    let deadline = now + 500_000_000;
+    while !PRINTK_HARDIRQ_DONE.load(Ordering::Acquire) && crate::time::monotonic_ns() < deadline {
+        core::hint::spin_loop();
+    }
+    t.cancel_sync();
+    PRINTK_HARDIRQ_DONE.load(Ordering::Acquire)
 }
 
 /// Calls each stress thread makes to every other CPU

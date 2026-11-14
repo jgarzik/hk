@@ -36,6 +36,7 @@ pub fn run_tests() {
     report_r(b"RENAME_PINNED_TRAP", pinned_trap());
     report_r(b"RENAME_ANCESTOR_MOUNT", ancestor_mount());
     report_r(b"DOTDOT_MOUNT", dotdot_mount());
+    report_r(b"DOTDOT_ROOT_OVERMOUNT", dotdot_root_overmount());
     report_r(b"GETCWD_IN_MOUNT", getcwd_in_mount());
     report_r(b"MOUNT_NESTED_BUSY", nested_busy());
     report_r(b"EXDEV_SAME_SB", exdev_same_sb());
@@ -49,6 +50,7 @@ pub fn run_tests() {
     report_r(b"RAMFS_MOUNT_MODE", ramfs_mode());
     report_r(b"UMOUNT_BUSY_CWD", busy_cwd());
     report_r(b"UMOUNT_EXPIRE_BUSY", expire_busy());
+    report_r(b"UMOUNT_EXPIRE_SUBMOUNT", expire_submount());
     report_r(b"MOUNT_HARDLINK", hardlink());
 }
 
@@ -261,6 +263,53 @@ fn dotdot_mount() -> R {
     sys_umount2(dm.as_ptr(), 0);
     sys_rmdir(dm.as_ptr());
     r
+}
+
+/// ".." at a root that something was mounted on afterwards steps onto
+/// that mount (Linux follow_dotdot's in_root, then step_into's
+/// handle_mounts), and ".." at the root of that mount stays there
+/// (choose_mountpoint stops at the root): in a chroot to /tmp/om with
+/// a ramfs then mounted on "/", "/under" is the covered directory's
+/// file, "/../under" and "/../../under" are looked up in the ramfs
+fn dotdot_root_overmount() -> R {
+    sys_mkdir(b"/tmp/om\0".as_ptr(), 0o755);
+    touch(b"/tmp/om/under\0");
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(overmount_child() as u64);
+    }
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    sys_unlink(b"/tmp/om/under\0".as_ptr());
+    sys_rmdir(b"/tmp/om\0".as_ptr());
+    check(b"child", ws == 0, (ws >> 8) as i64)
+}
+
+/// 0, or the step that failed
+fn overmount_child() -> i32 {
+    if sys_unshare(CLONE_NEWNS) != 0 {
+        return 1;
+    }
+    if sys_chroot(b"/tmp/om\0".as_ptr()) != 0 || sys_chdir(b"/\0".as_ptr()) != 0 {
+        return 2;
+    }
+    if ramfs(b"/\0") != 0 {
+        return 3;
+    }
+    let mut st = Stat::default();
+    if sys_stat(b"/under\0".as_ptr(), &mut st) != 0 {
+        return 4;
+    }
+    if sys_stat(b"/../under\0".as_ptr(), &mut st) != ENOENT {
+        return 5;
+    }
+    if sys_chdir(b"/..\0".as_ptr()) != 0 || sys_stat(b"../under\0".as_ptr(), &mut st) != ENOENT {
+        return 6;
+    }
+    if sys_stat(b"under\0".as_ptr(), &mut st) != ENOENT {
+        return 7;
+    }
+    0
 }
 
 /// getcwd and /proc/self/fd links name files inside a mount by their
@@ -770,6 +819,39 @@ fn expire_busy() -> R {
         check(b"expire", r == 0, r)
     })();
     sys_umount2(d.as_ptr(), 0);
+    sys_rmdir(d.as_ptr());
+    r
+}
+
+/// MNT_EXPIRE on a mount with a submount is EBUSY, never a mark
+/// (Linux do_umount: !list_empty(mnt_mounts)); with the submount gone
+/// it marks (EAGAIN), then unmounts; with MNT_DETACH it is EINVAL
+fn expire_submount() -> R {
+    let d = b"/tmp/exs\0";
+    let sub = b"/tmp/exs/sub\0";
+    sys_mkdir(d.as_ptr(), 0o755);
+    if ramfs(d) != 0 {
+        sys_rmdir(d.as_ptr());
+        return Err((b"mount", -1));
+    }
+    let r = (|| {
+        sys_mkdir(sub.as_ptr(), 0o755);
+        check(b"mount sub", ramfs(sub) == 0, -1)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE | MNT_DETACH);
+        check(b"expire+detach", r == EINVAL, r)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"submount busy", r == EBUSY, r)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"still busy", r == EBUSY, r)?;
+        let r = sys_umount2(sub.as_ptr(), 0);
+        check(b"umount sub", r == 0, r)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"mark", r == EAGAIN, r)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"expire", r == 0, r)
+    })();
+    sys_umount2(sub.as_ptr(), MNT_DETACH);
+    sys_umount2(d.as_ptr(), MNT_DETACH);
     sys_rmdir(d.as_ptr());
     r
 }

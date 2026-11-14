@@ -5,7 +5,8 @@
 #      warnings), test and test-arm (host unit tests, x86-64 and
 #      arm64): fail fast
 #   2. build everything the boots need, serially (shared target dirs)
-#   3. check, check-arm, check-linux, check-linux-arm concurrently
+#   3. check, check-arm, check-linux, check-linux-arm and the -ci pair
+#      (CI's reference Linux) concurrently
 #      (NOBUILD=1; each boot has its own serial log in $QEMU_LOG_DIR)
 # Prints one line per boot, then GATE-OK or GATE-FAILED. Output of each
 # step: $QEMU_LOG_DIR/gate/<step>.out. Make variables pass through the
@@ -51,9 +52,10 @@ serial build iso build-arm disk-image
 serial build-host-x86_64 -C user host ARCH=x86_64
 serial build-host-aarch64 -C user host ARCH=aarch64
 
-# On an arm64 host check-linux is aarch64 already
-BOOTS="check check-arm check-linux check-linux-arm"
-[ "$(uname -m)" = x86_64 ] || BOOTS="check check-arm check-linux"
+# On an arm64 host check-linux is aarch64 already. The -ci boots run
+# CI's reference Linux beside the host's
+BOOTS="check check-arm check-linux check-linux-arm check-linux-ci check-linux-arm-ci"
+[ "$(uname -m)" = x86_64 ] || BOOTS="check check-arm check-linux check-linux-ci"
 
 echo "gate: $BOOTS (parallel, ${SECONDS}s so far)"
 for b in $BOOTS; do
@@ -71,7 +73,7 @@ for b in $BOOTS; do
     res=PASS
     [ "$rc" = 0 ] || { res=FAIL; ok=false; }
     line=$(grep -aE 'PASSED|FAILED|cached PASS' "$OUT/$b.out" | tail -1)
-    printf '%-16s %s %4ss  %s\n' "$b" "$res" "$secs" "$line"
+    printf '%-18s %s %4ss  %s\n' "$b" "$res" "$secs" "$line"
     if [ "$res" = FAIL ]; then
         # Where it stopped: the last serial lines and any failure lines
         log=$QEMU_LOG_DIR/serial.log

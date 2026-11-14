@@ -49,6 +49,11 @@ impl Completion {
         self.wait.wake_all();
     }
 
+    /// Not done again, for reuse (Linux reinit_completion)
+    pub fn reinit(&self) {
+        *self.done.lock() = 0;
+    }
+
     /// Consume one completion if there is one (Linux try_wait_for_completion)
     pub fn try_wait(&self) -> bool {
         let mut d = self.done.lock();
@@ -70,5 +75,11 @@ impl Completion {
     /// context, no spinlock held)
     pub fn wait(&self) {
         self.wait.wait_event_exclusive(|| self.try_wait());
+    }
+
+    /// As `wait`, giving up after `ticks` (Linux
+    /// wait_for_completion_timeout): true if completed (and consumed)
+    pub fn wait_timeout(&self, ticks: u64) -> bool {
+        self.wait.wait_event_timeout(|| self.try_wait(), ticks) != 0
     }
 }

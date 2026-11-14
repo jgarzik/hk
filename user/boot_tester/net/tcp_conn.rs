@@ -3,8 +3,8 @@
 //! refused and unanswered connects on eth0.
 
 use hk_syscall::{
-    AF_INET, SHUT_WR, SOCK_NONBLOCK, SOCK_STREAM, sys_exit, sys_fork, sys_listen, sys_setsockopt,
-    sys_shutdown, sys_socket,
+    AF_INET, SHUT_WR, SOCK_NONBLOCK, SOCK_STREAM, sys_exit, sys_fork, sys_getsockopt, sys_listen,
+    sys_setsockopt, sys_shutdown, sys_socket,
 };
 
 use crate::harness::T;
@@ -28,6 +28,7 @@ pub fn run_tests() {
     test_half_close();
     test_connect_race();
     test_rst_unread();
+    test_rst_unread_last_ack();
     test_linger0();
     test_time_wait_bind();
     test_ephemeral_owners();
@@ -123,6 +124,62 @@ fn test_rst_unread() {
     t.eq(b"reset", recv(c, &mut b, 0), ECONNRESET);
     t.eq(b"then eof", recv(c, &mut b, 0), 0);
     t.eq(b"send", send(c, b"x", MSG_NOSIGNAL), EPIPE);
+    close(c);
+    close(l);
+    t.done();
+}
+
+/// TCP_INFO's tcpi_state
+fn tcp_state(fd: i32) -> u8 {
+    let mut b = [0u8; 8];
+    let mut len = b.len() as u32;
+    sys_getsockopt(
+        fd,
+        IPPROTO_TCP,
+        11, /* TCP_INFO */
+        b.as_mut_ptr(),
+        &mut len,
+    );
+    b[0]
+}
+
+/// Unread data resets in any state (Linux __tcp_close), here LAST_ACK
+/// with the FIN still queued behind data the peer has no room for: the
+/// peer sees the RST (ECONNRESET), not a silent close
+fn test_rst_unread_last_ack() {
+    const TCP_LAST_ACK: u8 = 9;
+    let mut t = T::new(b"TCP_RST_UNREAD_LAST_ACK");
+    let (l, p) = listener(4);
+    let c = tcp();
+    setint(c, SOL_SOCKET, SO_RCVBUF, 4096);
+    set_timeo(c, 10_000);
+    connect(c, LO, p);
+    let s = accept(l);
+    // Fill c's window and s's send buffer: data stays unsent
+    let page = [b'd'; 4096];
+    let mut n = 0;
+    while n < 4096 && send(s, &page, MSG_DONTWAIT) > 0 {
+        n += 1;
+    }
+    send(c, b"never read", 0);
+    sys_shutdown(c, SHUT_WR);
+    let (n, ev) = poll1(s, POLLIN | POLLRDHUP, 2000);
+    t.ok(b"peer fin", n == 1 && ev & POLLRDHUP != 0, ev as i64);
+    sys_shutdown(s, SHUT_WR);
+    t.eq(
+        b"last ack",
+        i64::from(tcp_state(s)),
+        i64::from(TCP_LAST_ACK),
+    );
+    close(s);
+    // POLLERR | POLLHUP come with the RST, whatever is asked for
+    let (n, _) = poll1(c, 0, 2000);
+    t.eq(b"reset seen", n, 1);
+    t.eq(
+        b"ECONNRESET",
+        i64::from(getint(c, SOL_SOCKET, SO_ERROR).1),
+        -ECONNRESET,
+    );
     close(c);
     close(l);
     t.done();

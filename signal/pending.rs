@@ -12,7 +12,11 @@
 //! SIGQUEUE_PREALLOC) and is never freed while it lives: dequeued,
 //! flushed or refused, it goes back to its timer
 //! (`posix_timer::reclaim`), which also decides at dequeue whether the
-//! signal still counts and rearms an interval timer.
+//! signal still counts and rearms an interval timer. A flushed set may
+//! be dropped in atomic context (kill_fasync, under its caller's spin
+//! locks): freeing an entry and handing a timer's back are atomic-safe,
+//! the timer reference that takes put through RCU (Linux
+//! posixtimer_putref).
 
 use super::{SYNCHRONOUS_MASK, SigInfo, SigSet, Signal, si_code};
 use crate::task::{Ucount, UcountsRef};
@@ -94,8 +98,8 @@ impl SigQueue {
     }
 }
 
-/// Free an unlinked entry, or give a timer's back to it (no spin lock
-/// held)
+/// Free an unlinked entry, or give a timer's back to it (any context
+/// but hardirq)
 fn release(q: Box<SigQueue>) {
     if q.timer.is_some() {
         crate::time::posix_timer::reclaim(q);
@@ -260,6 +264,15 @@ impl SigPending {
     /// The info of its `n`th queued entry (PTRACE_PEEKSIGINFO)
     pub fn nth(&self, n: u64) -> Option<SigInfo> {
         self.iter().nth(usize::try_from(n).ok()?).map(|q| q.info)
+    }
+
+    /// [`flush_mask`](Self::flush_mask) into `gone`, which takes the
+    /// signals and their entries (to be dropped with no lock held)
+    pub fn flush_mask_into(&mut self, mask: &SigSet, gone: &mut SigPending) {
+        gone.signal = gone.signal.union(&self.signal.intersect(mask));
+        self.signal = self.signal.subtract(mask);
+        self.list
+            .drain_if(|q| mask.contains(q.sig), |q| gone.list.push_back(q));
     }
 
     /// Take the signals of `mask` out, their queued info with them
