@@ -284,7 +284,7 @@ fn xhci_probe(
         slot,
         XhciDeviceHandle {
             usb,
-            bus_id: pci_dev.bus_id(),
+            bdf: (pci_dev.bus, pci_dev.device, pci_dev.function),
         },
     ))
 }
@@ -292,8 +292,8 @@ fn xhci_probe(
 /// A bound xHCI: its USB devices (the root hub last)
 struct XhciDeviceHandle {
     usb: Vec<alloc::sync::Arc<crate::base::Device>>,
-    /// Its PCI function
-    bus_id: alloc::string::String,
+    /// Its PCI function: bus, device, function
+    bdf: (u8, u8, u8),
 }
 
 impl crate::base::Bound for XhciDeviceHandle {
@@ -310,9 +310,12 @@ impl crate::base::Bound for XhciDeviceHandle {
         super::usbcore::usb_unregister_devices(&self.usb);
         let hc = {
             let mut g = acquire_usb_controller();
-            // Not a second xHCI's, which replaced this one (BUGS.md)
+            // Not a second xHCI's, which replaced this one (BUGS.md);
+            // matched by address, nothing allocated under the lock
             match g.as_ref() {
-                Some(c) if c.pci_dev.bus_id() == self.bus_id => g.take(),
+                Some(c) if (c.pci_dev.bus, c.pci_dev.device, c.pci_dev.function) == self.bdf => {
+                    g.take()
+                }
                 _ => None,
             }
         };

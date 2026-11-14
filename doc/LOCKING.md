@@ -4168,7 +4168,8 @@ lock, deletes the interfaces, whose drivers' removes run under the
 interface's lock (usb-storage: the disk's `open_mutex` for
 del_gendisk, then `UsbMscDevice.state`; ftdi_sio: `CONSOLE_REGISTRY`,
 then `PORT`, then `WRITE_BUF`). The controller is then taken out of `USB_CONTROLLER`
-(drivers' transfers fail with no device from there on) and stopped
+(matched by PCI bus/device/function: nothing allocates under it;
+drivers' transfers fail with no device from there on) and stopped
 with no lock held: slots disabled, halted, reset, the IRQ handler
 unregistered (`IrqDesc.lock`, which waits out a running handler), memory
 freed.
