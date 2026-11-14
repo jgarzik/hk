@@ -160,6 +160,17 @@ fn write_start() {
     }
 }
 
+/// Queue console output with a CR after each LF (Linux
+/// usb_console_write)
+fn console_push<const N: usize>(fifo: &mut Kfifo<N>, data: &[u8]) {
+    for line in data.split_inclusive(|&b| b == b'\n') {
+        fifo.push(line);
+        if line.ends_with(b"\n") {
+            fifo.push(b"\r");
+        }
+    }
+}
+
 /// The FTDI port as a console (`ttyUSB0`); one at a time
 struct UsbSerialConsole;
 
@@ -181,7 +192,7 @@ impl ConsoleDriver for UsbSerialConsole {
         if p.out.is_none() {
             return;
         }
-        p.fifo.push(data);
+        console_push(&mut p.fifo, data);
         drop(p);
         crate::console::console_defer_kick();
     }
@@ -213,4 +224,18 @@ fn register_usb_serial_console(serial: &UsbSerial) {
         ConsolePriority::Normal,
         ConsoleFlags::empty(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Kfifo, console_push};
+
+    #[test]
+    fn console_cr_after_lf() {
+        let mut f = Kfifo::<64>::new();
+        console_push(&mut f, b"a\nb\n\nc");
+        let mut b = [0u8; 64];
+        let n = f.pop(&mut b);
+        assert_eq!(&b[..n], b"a\n\rb\n\r\n\rc");
+    }
 }
