@@ -882,10 +882,7 @@ pub fn exit_ptrace() {
     if !traces {
         return;
     }
-    while let Some((t, kill)) = detach_live(&me) {
-        if let Some(k) = kill {
-            k.finish();
-        }
+    while let Some(t) = detach_live(&me) {
         percpu::try_to_wake_up(&t, percpu::WakeMode::Any);
     }
     percpu::detach_zombies(&me);
@@ -894,23 +891,21 @@ pub fn exit_ptrace() {
 /// [`exit_ptrace`]'s write section for one live tracee of `me`: an
 /// EXITKILL one gets SIGKILL before it is detached and resumed (Linux
 /// exit_ptrace: send_sig_info under tasklist_lock, then
-/// __ptrace_detach), so it never runs untraced code first; the tracee
-/// and the kill's wakeups, for after the lock
-fn detach_live(me: &crate::task::Task) -> Option<(percpu::TaskRef, Option<signal::Posted>)> {
+/// __ptrace_detach), so it never runs untraced code first, the whole
+/// send done there; the tracee, for its wakeup after the lock
+fn detach_live(me: &crate::task::Task) -> Option<percpu::TaskRef> {
     let mut table = TASKLIST.write();
     let v = table
         .find(|t| t.ptrace != 0 && t.traced_by(me) && !matches!(t.state, TaskState::Zombie(_)))?;
     let exitkill = v.ptrace_options & PTRACE_O_EXITKILL != 0;
     let t = percpu::task_ref(v.task);
-    let kill = if exitkill {
-        signal::sigkill_held(&table, &t)
-    } else {
-        None
-    };
+    if exitkill {
+        signal::sigkill_held(&table, &t);
+    }
     let mut v = table.view_mut(&t)?;
     ptrace_unlink(&mut v);
     t.sig.lock().end_trace_stop();
-    Some((t, kill))
+    Some(t)
 }
 
 // =============================================================================

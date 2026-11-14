@@ -182,23 +182,17 @@ pub fn ignoring_children(table: &GlobalTaskTable, pid: crate::task::Pid) -> bool
 }
 
 /// What [`notify`] did: the parent is to release the zombie now
-/// (`autoreap`); the signal's wakeups wait for TASKLIST to be dropped
-/// ([`Told::finish`])
+/// (`autoreap`); what the send read is freed by [`Told::finish`]
 #[must_use]
 #[derive(Default)]
 pub struct Told {
     pub autoreap: bool,
-    posted: Option<super::Posted>,
     rcv: Option<Rcv>,
 }
 
 impl Told {
-    /// Wake whoever takes the signal and free what the send left
-    /// (TASKLIST not held)
+    /// Free what the send left (TASKLIST not held)
     pub fn finish(self) {
-        if let Some(p) = self.posted {
-            p.finish();
-        }
         drop(self.rcv);
     }
 }
@@ -212,8 +206,9 @@ impl Told {
 ///
 /// Under TASKLIST's write lock, in the section that made it reportable
 /// (Linux exit_notify, release_task, reparent_leader call
-/// do_notify_parent under tasklist_lock), its queue entry made there
-/// GFP_ATOMIC (Linux __send_signal_locked): no wait reaps it before its
+/// do_notify_parent under tasklist_lock), the whole send done there,
+/// its queue entry GFP_ATOMIC, its wakeup and any group kill (Linux
+/// __group_send_sig_info, complete_signal): no wait reaps it before its
 /// signal is pending, and a parent its signal wakes finds it.
 pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
     let tid = z.tid();
@@ -223,16 +218,12 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
         return Told::default();
     };
     let (sig, autoreap) = (r.sig, r.autoreap);
-    let posted = match (sig, chld_notice(table, tid, r.to.pid_ns())) {
-        (Some(sig), Some(info)) => {
-            let info = SendInfo::Info(info.with_sig(sig));
-            super::send_held(table, &r.to, sig, info, super::PidType::Tgid)
-        }
-        _ => None,
-    };
+    if let (Some(sig), Some(info)) = (sig, chld_notice(table, tid, r.to.pid_ns())) {
+        let info = SendInfo::Info(info.with_sig(sig));
+        let _ = super::send_task_in(table, &r.to, sig, info, super::PidType::Tgid, false);
+    }
     Told {
         autoreap,
-        posted,
         rcv: Some(r),
     }
 }

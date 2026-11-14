@@ -1380,11 +1380,12 @@ fn send_task(t: &Task, sig: Signal, info: SendInfo, ty: PidType, force: bool) ->
     send_task_in(&TASKLIST.read(), t, sig, info, ty, force)
 }
 
-/// [`send_task`] under TASKLIST's read lock held by the caller (Linux
-/// group_send_sig_info under tasklist_lock: __kill_pgrp_info,
-/// send_sigio): the whole send, its thread choice, wakeup and any group
-/// kill done in place; nothing allocated but its queue entry, under the
-/// receiver's Task.sig with GFP_ATOMIC
+/// [`send_task`] under TASKLIST held by the caller, read or write
+/// (Linux send_signal_locked under tasklist_lock: __kill_pgrp_info and
+/// send_sigio read-locked, do_notify_parent and exit_ptrace
+/// write-locked): the whole send, its thread choice, wakeup and any
+/// group kill done in place; nothing allocated but its queue entry,
+/// under the receiver's Task.sig with GFP_ATOMIC
 fn send_task_in(
     table: &crate::task::percpu::GlobalTaskTable,
     t: &Task,
@@ -1456,89 +1457,12 @@ fn send_task_in(
     Ok(())
 }
 
-/// Signal `sig` with `info` to task `t` or its group (`ty`), queued
-/// under TASKLIST held by the caller (Linux do_notify_parent's
-/// __group_send_sig_info, exit_ptrace's send_sig_info, under
-/// tasklist_lock): `q` is its entry, made before TASKLIST was taken
-/// (SIGKILL needs none), which it takes if queued; an unused one is the
-/// caller's to free after unlocking. Signalfd readers and the thread
-/// that takes it are woken by [`Posted::finish`], after TASKLIST is
-/// dropped.
-fn send_held(
-    table: &crate::task::percpu::GlobalTaskTable,
-    t: &TaskRef,
-    sig: Signal,
-    info: SendInfo,
-    ty: PidType,
-) -> Option<Posted> {
-    check_send_context();
-    let tg = target_in(table, t)?;
-    if tg.kthread || tg.group_exit {
-        return None;
-    }
-    // Numbered in the receiver's namespace by the sender already (Linux
-    // do_notify_parent: __send_signal_locked, no check); its entry made
-    // under the receiver's lock, GFP_ATOMIC, as TASKLIST is held
-    let entry = (sig != SIGKILL).then(|| EntryOf {
-        info: info.resolve(sig, t.pid_ns()),
-        ucounts: &tg.ucounts,
-        limit: tg.limit,
-        override_rlimit: info.override_rlimit(sig),
-    });
-    let to = Send {
-        sig,
-        init: tg.protects(sig, info.forces(t.pid_ns())),
-        info: &info,
-        ty,
-        entry,
-    };
-    let sighand = tg.sighand.as_ref();
-    let sent = with_sig_send(t, |t, state| send_locked(t, state, sighand, &to));
-    let Sent::Queued(wants) = sent else {
-        return None;
-    };
-    // The thread that takes it, and whether it ends the group, are
-    // decided now, as it is queued (Linux complete_signal under
-    // siglock): a mask changed after this, or the signal taken, by the
-    // time the wakeup runs changes nothing
-    let chosen = choose(table, t, sig, ty, wants, sighand, to.init);
-    Some(Posted {
-        t: t.clone(),
-        sig,
-        chosen,
-        sighand: tg.sighand,
-    })
-}
-
 /// SIGKILL from the kernel to thread `t`, under TASKLIST held by the
-/// caller (Linux exit_ptrace: send_sig_info(SIGKILL, SEND_SIG_PRIV)
-/// under tasklist_lock); SIGKILL needs no queue entry, so nothing
-/// allocates. Its wakeups wait for [`Posted::finish`].
-pub fn sigkill_held(table: &crate::task::percpu::GlobalTaskTable, t: &TaskRef) -> Option<Posted> {
-    send_held(table, t, SIGKILL, SendInfo::Kernel, PidType::Pid)
-}
-
-/// A signal [`send_held`] queued, whose wakeups wait for TASKLIST to be
-/// dropped
-#[must_use]
-pub struct Posted {
-    t: TaskRef,
-    sig: Signal,
-    chosen: Option<Chosen>,
-    sighand: Option<Arc<SigHand>>,
-}
-
-impl Posted {
-    /// Wake its signalfd readers and the thread chosen to take it,
-    /// ending the group if that was decided (Linux signalfd_notify,
-    /// complete_signal), under TASKLIST's read lock (taken here: the
-    /// caller dropped its write lock)
-    pub fn finish(self) {
-        if let Some(h) = self.sighand.as_ref() {
-            h.signalfd_wq.wake_all();
-        }
-        deliver(&TASKLIST.read(), &self.t, self.sig, self.chosen);
-    }
+/// caller, read or write (Linux exit_ptrace: send_sig_info(SIGKILL,
+/// SEND_SIG_PRIV) under tasklist_lock): done in place, as any
+/// [`send_task_in`]
+pub fn sigkill_held(table: &crate::task::percpu::GlobalTaskTable, t: &Task) {
+    let _ = send_task_in(table, t, SIGKILL, SendInfo::Kernel, PidType::Pid, false);
 }
 
 /// What a send is, for its locked part
@@ -1655,7 +1579,7 @@ fn drops(
 }
 
 /// Find a thread to take `sig` just queued for `p` and wake it (Linux
-/// complete_signal), under TASKLIST's read lock held by the caller
+/// complete_signal), under TASKLIST held by the caller, read or write
 /// ([`choose`], [`deliver`]); `init`: an init's protection applied to
 /// the send
 fn complete_signal(
