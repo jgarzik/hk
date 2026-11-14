@@ -4,7 +4,7 @@
 
 use alloc::sync::Arc;
 
-use super::urb::{Pipe, Urb, UrbComplete, usb_submit_urb};
+use super::urb::{Pipe, Urb, UrbComplete, usb_kill_urb, usb_submit_urb};
 use super::{SetupPacket, UsbDevice, UsbError};
 use crate::sync::completion::Completion;
 use crate::task::percpu::ms_to_ticks;
@@ -44,9 +44,13 @@ fn usb_start_wait_urb(urb: &Arc<Urb>, done: &Completion, timeout_ms: u64) -> Res
         t => t.min(USB_MAX_SYNCHRONOUS_TIMEOUT),
     };
     if !done.wait_timeout(ms_to_ticks(ms)) {
-        // Still queued: left to the controller, which owns the URB
-        // and its buffer until it gives it back
-        return Err(UsbError::Timeout);
+        // Killed: given back by the time this returns, so the caller
+        // owns its buffer again; Timeout unless it completed meanwhile
+        usb_kill_urb(urb);
+        return match urb.status() {
+            Err(UsbError::Killed) => Err(UsbError::Timeout),
+            s => s,
+        };
     }
     urb.status()
 }

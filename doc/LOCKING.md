@@ -4378,6 +4378,21 @@ command ring when the controller sits on a command for 5 s, so no
 waiter sleeps forever. There is one `Arc<Xhci>` per bound controller;
 the USB devices below it reach it as their `Hcd` (`UsbDevice.bus`).
 
+Cancellation (Linux usb_unlink_urb, usb_kill_urb, xhci_urb_dequeue):
+`usb_unlink_urb` (any context) marks the URB unlinked under `Urb.st`
+and its TD cancelled under `Xhci.lock`, and queues a Stop Endpoint
+nobody waits for (allocated GFP_ATOMIC, as Linux); its completion, in
+the interrupt handler, turns the cancelled TDs into No-ops, queues a
+Set TR Dequeue Pointer past one the endpoint sat on and gives back
+the others; that command's completion gives back the rest and
+restarts the endpoint. `usb_kill_urb` (thread, may sleep) also raises
+the URB's `reject` and sleeps on `USB_KILL_URB_QUEUE` until its
+`use_count` drops, which the giveback does after the completion
+handler; the atomics' fences pair as Linux's (`reject` before
+`use_count` in the kill, the reverse in submit and giveback). A
+synchronous request that times out kills its URB before returning, so
+the caller's buffer and the URB's are never the device's after it.
+
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
 | `Xhci.lock` (`xhci.rs`; Linux xhci->lock) | `IrqSpinlock<XhciState>` | any context: the interrupt handler (under its line's `IrqDesc.lock`), URB submission, command queueing and the command timeout work (thread) | `IrqDesc.lock` -> `Xhci.lock` -> {`Urb.st`, `GivebackBh.list`, the `usb_bh` and system workqueues' locks (`queue_work`, `mod_delayed_work`, `cancel_delayed_work`), a command's `Completion` (`done` -> wait queue -> run queue), the slab (the commands the interrupt handler queues for a halted endpoint are allocated GFP_ATOMIC, as Linux), the trace ring, printk on error paths}. Holds the command and event rings, the command list, each device's contexts, endpoint rings, TD lists and endpoint state. Never sleeps or waits: the command abort releases it for its handshake (Linux xhci_abort_cmd_ring); halt and reset poll the controller under it, as Linux xhci_stop. Queueing never allocates: TD and command lists have their room reserved with the ring. No URB is freed under it (a finished TD's URB reference moves to the bottom half's list) |

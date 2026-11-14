@@ -23,7 +23,7 @@ mod xhci_ring;
 
 pub use hcd::{Hcd, HcdRef};
 pub use message::{usb_bulk_msg, usb_control_msg};
-pub use urb::{Pipe, Urb, usb_submit_urb};
+pub use urb::{Pipe, Urb, usb_kill_urb, usb_submit_urb, usb_unlink_urb};
 
 // Re-export USB serial driver for registration
 pub use serial::{USB_SERIAL_DRIVER, UsbSerial};

@@ -5,7 +5,8 @@
 //! (`usb_submit_urb`): the host controller queues it on the endpoint
 //! and gives it back once it completed, failed or was unlinked, calling
 //! its completion handler from the giveback bottom half (`hcd.rs`).
-//! The handler may resubmit it.
+//! The handler may resubmit it. `usb_unlink_urb` asks for an early
+//! giveback; `usb_kill_urb` also waits for it.
 //!
 //! Its transfer buffer is coherent DMA memory allocated with the URB
 //! (Linux usb_alloc_coherent with URB_NO_TRANSFER_DMA_MAP): submitting
@@ -240,6 +241,17 @@ impl Urb {
         self.st.lock().actual_length = n;
     }
 
+    /// Linux usb_hcd_check_unlink_urb's URB half: mark it unlinked
+    /// with `status` unless it was already (Busy)
+    pub(super) fn mark_unlinked(&self, status: UsbError) -> Result<(), UsbError> {
+        let mut st = self.st.lock();
+        if st.unlinked.is_some() {
+            return Err(UsbError::Busy);
+        }
+        st.unlinked = Some(status);
+        Ok(())
+    }
+
     /// Linux usb_hcd_giveback_urb: pass `status` on unless it was
     /// unlinked
     pub(super) fn set_giveback_status(&self, status: Result<(), UsbError>) {
@@ -319,6 +331,37 @@ pub fn usb_submit_urb(urb: &Arc<Urb>) -> Result<(), UsbError> {
     r
 }
 
+/// Ask for `urb` to be given back early with `status` (Linux
+/// usb_hcd_unlink_urb); any context. Idle if it is not queued
+fn usb_hcd_unlink_urb(urb: &Arc<Urb>, status: UsbError) -> Result<(), UsbError> {
+    if urb.use_count.load(Ordering::Acquire) == 0 {
+        return Err(UsbError::Idle);
+    }
+    urb.hcd.urb_dequeue(urb, status)
+}
+
+/// Cancel `urb` without waiting (Linux usb_unlink_urb): it is given
+/// back with Unlinked once the controller let go of it. Ok when the
+/// unlink is under way (Linux -EINPROGRESS); Idle if not queued, Busy
+/// if being given back or unlinked already
+pub fn usb_unlink_urb(urb: &Arc<Urb>) -> Result<(), UsbError> {
+    usb_hcd_unlink_urb(urb, UsbError::Unlinked)
+}
+
+/// Cancel `urb` and wait until it is given back, its completion
+/// handler done (status Killed unless it completed first); submissions
+/// fail meanwhile (Linux usb_kill_urb). Thread context, no spinlock
+pub fn usb_kill_urb(urb: &Arc<Urb>) {
+    crate::sync::might_sleep();
+    urb.reject.fetch_add(1, Ordering::AcqRel);
+    // The reject before the count check (pairs with giveback and
+    // submit)
+    fence(Ordering::SeqCst);
+    let _ = usb_hcd_unlink_urb(urb, UsbError::Killed);
+    USB_KILL_URB_QUEUE.wait_event(|| urb.use_count.load(Ordering::Acquire) == 0);
+    urb.reject.fetch_sub(1, Ordering::AcqRel);
+}
+
 /// Give `urb` back to its owner with `status` (Linux
 /// usb_hcd_giveback_urb): queued for the giveback bottom half; any
 /// context
@@ -326,4 +369,106 @@ pub(super) fn usb_hcd_giveback_urb(urb: Arc<Urb>, status: Result<(), UsbError>) 
     urb.set_giveback_status(status);
     let h = urb.hcd.clone();
     hcd::giveback_queue(h.bh(), urb);
+}
+
+/// Boot self-test of URB cancellation (`selftest.rs`) on IN `pipe` of
+/// `dev`, an endpoint that NAKs while it has nothing to send (QEMU's
+/// FT232 without input; a real one answers with its status bytes,
+/// which ends the test unchecked): an unlinked URB is given back
+/// Unlinked, a timed-out synchronous request is killed (Timeout) and
+/// the endpoint keeps working after each, a killed URB is given back
+/// Killed, and killing an idle one returns at once. The device going
+/// away meanwhile (an unbind) ends it unchecked. Thread context
+pub fn urb_selftest(dev: &UsbDevice, pipe: Pipe, check: &mut dyn FnMut(&str, bool, u64)) {
+    use crate::sync::completion::Completion;
+    use crate::task::percpu::ms_to_ticks;
+    let code = |r: Result<(), UsbError>| r.err().map_or(0, err_code);
+    let gone = |r: &Result<(), UsbError>| matches!(r, Err(UsbError::NoDevice | UsbError::Shutdown));
+    let Ok(done) = crate::util::kalloc::try_arc(Completion::new()) else {
+        return;
+    };
+    let d = done.clone();
+    let Ok(complete) = crate::util::kalloc::try_box(move |_: &Arc<Urb>| d.complete()) else {
+        return;
+    };
+    let Some(urb) = Urb::new(dev, pipe, None, 64, complete) else {
+        return;
+    };
+    let _ = urb.fill(None, 64);
+    // 1. Unlink: given back Unlinked once the endpoint stopped and the
+    // TD is off the ring
+    let r = usb_submit_urb(&urb);
+    if gone(&r) {
+        return;
+    }
+    check("urb_submit", r.is_ok(), code(r));
+    if r.is_err() || done.wait_timeout(ms_to_ticks(50)) {
+        // The device answered: nothing to cancel
+        return;
+    }
+    let r = usb_unlink_urb(&urb);
+    check("urb_unlink", r.is_ok() || gone(&r), code(r));
+    let back = done.wait_timeout(ms_to_ticks(1000));
+    check("urb_unlink_giveback", back, 0);
+    if !back {
+        // Still queued: a kill would never return
+        return;
+    }
+    let s = urb.status();
+    check(
+        "urb_unlink_status",
+        s == Err(UsbError::Unlinked) || gone(&s),
+        code(s),
+    );
+    // 2. A timed-out request is killed; the endpoint restarts after
+    // the Set TR Dequeue Pointer, so the next one runs (and times out)
+    for i in 0..2 {
+        let mut b = [0u8; 64];
+        let r = super::usb_bulk_msg(dev, pipe, &mut b, 50).map(|_| ());
+        if gone(&r) {
+            return;
+        }
+        check("urb_timeout_killed", r == Err(UsbError::Timeout), i);
+    }
+    // 3. Kill: given back Killed, no longer in flight
+    let r = usb_submit_urb(&urb);
+    if gone(&r) {
+        return;
+    }
+    check("urb_resubmit", r.is_ok(), code(r));
+    if r.is_ok() {
+        usb_kill_urb(&urb);
+        let s = urb.status();
+        check(
+            "urb_kill_status",
+            (s == Err(UsbError::Killed) || gone(&s)) && !urb.in_flight(),
+            code(s),
+        );
+        done.reinit();
+    }
+    // 4. Killing an idle URB returns at once
+    usb_kill_urb(&urb);
+    check("urb_kill_idle", !urb.in_flight(), 0);
+}
+
+/// A self-test failure line's number for `e`: Linux's errno
+fn err_code(e: UsbError) -> u64 {
+    match e {
+        UsbError::InProgress => 115,
+        UsbError::Timeout => 110,
+        UsbError::Killed => 2,
+        UsbError::Unlinked => 104,
+        UsbError::Shutdown => 108,
+        UsbError::Stall => 32,
+        UsbError::Overflow => 75,
+        UsbError::BufferError => 63,
+        UsbError::BusError => 71,
+        UsbError::NoDevice => 19,
+        UsbError::NoResources => 12,
+        UsbError::InvalidParam => 22,
+        UsbError::Busy => 16,
+        UsbError::Idle => 43,
+        UsbError::Rejected => 1,
+        UsbError::TransferError(cc) => 0x100 | u64::from(cc),
+    }
 }

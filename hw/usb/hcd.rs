@@ -31,6 +31,11 @@ pub trait Hcd: Send + Sync {
     /// controller gives it back with `usb_hcd_giveback_urb`
     fn urb_enqueue(&self, urb: &Arc<Urb>) -> Result<(), UsbError>;
 
+    /// Cancel `urb` with `status` (Linux hc_driver.urb_dequeue): given
+    /// back once the controller let go of it; any context. Idle if not
+    /// queued, Busy if being unlinked already
+    fn urb_dequeue(&self, urb: &Arc<Urb>, status: UsbError) -> Result<(), UsbError>;
+
     /// The bottom half its URBs are given back through
     fn bh(&self) -> &GivebackBh;
 

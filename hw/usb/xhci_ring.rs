@@ -293,6 +293,9 @@ impl Xhci {
                 }
                 trb_type::RESET_ENDPOINT => self.handle_cmd_reset_ep(st, &cmd_trb),
                 trb_type::SET_TR_DEQUEUE => self.handle_cmd_set_deq(st, &cmd_trb, cc),
+                trb_type::STOP_ENDPOINT if cmd.completion.is_none() => {
+                    self.handle_cmd_stop_ep(st, &cmd_trb, cc)
+                }
                 // An aborted command turned No-op
                 trb_type::CMD_NOOP if cmd.status.load(Acquire) == Cc::COMMAND_RING_STOPPED => {
                     cc = Cc::COMMAND_RING_STOPPED;
@@ -530,6 +533,158 @@ impl Xhci {
         }
     }
 
+    /// Cancel `urb` (Linux xhci_urb_dequeue): its TD is marked
+    /// cancelled and the endpoint stopped with a Stop Endpoint command,
+    /// whose completion takes the TD off the ring and gives the URB
+    /// back. Idle if the URB is not queued here, Busy if being unlinked
+    /// already
+    pub(super) fn xhci_urb_dequeue(
+        &self,
+        urb: &Arc<Urb>,
+        status: UsbError,
+    ) -> Result<(), UsbError> {
+        let (slot, dci) = (urb.slot_id(), urb_dci(urb));
+        let mut st = self.lock.lock();
+        let dying = st.xhc_state & (xhc_state::DYING | xhc_state::HALTED) != 0;
+        let ep = st.ep(slot, dci).ok_or(UsbError::Idle)?;
+        // Linux usb_hcd_check_unlink_urb: queued, not unlinked yet
+        let ti = ep
+            .tds
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.urb, urb))
+            .ok_or(UsbError::Idle)?;
+        urb.mark_unlinked(status)?;
+        if let Some(r) = ep.ring.as_ref() {
+            xhci_trace!(
+                DBG_CANCEL_URB,
+                "Cancel URB slot {} ep {:#04x} at {:#x}",
+                slot,
+                urb.pipe().ep,
+                r.dma_of(ep.tds[ti].span.start)
+            );
+        }
+        if dying {
+            // Linux: "HC halted, freeing TD manually"
+            if let Some(td) = ep.tds.remove(ti) {
+                td_cleanup(td);
+            }
+            return Ok(());
+        }
+        // A TD the endpoint halted on is being cancelled already
+        if ep.tds[ti].cancel == TdCancel::None {
+            ep.tds[ti].cancel = TdCancel::Dirty;
+        }
+        // Their completions sort the cancelled TDs out
+        let busy = ep_state::EP_STOP_CMD_PENDING | ep_state::EP_HALTED | ep_state::SET_DEQ_PENDING;
+        if ep.ep_state & busy != 0 {
+            return Ok(());
+        }
+        self.queue_stop_endpoint(&mut st, slot, dci)
+    }
+
+    /// Queue a Stop Endpoint nobody waits for (Linux
+    /// xhci_queue_stop_endpoint from xhci_urb_dequeue)
+    fn queue_stop_endpoint(&self, st: &mut XhciState, slot: u8, dci: u8) -> Result<(), UsbError> {
+        let trb = slot_trb(trb_type::STOP_ENDPOINT, slot, dci, 0);
+        let cmd = try_arc_gfp(
+            XhciCommand::new_nowait(trb),
+            crate::mm::page_alloc::Gfp::ATOMIC,
+        )
+        .map_err(|_| UsbError::NoResources)?;
+        self.queue_command(st, cmd)?;
+        if let Some(ep) = st.ep(slot, dci) {
+            ep.ep_state |= ep_state::EP_STOP_CMD_PENDING;
+            ep.stop_time = crate::time::monotonic_ns();
+        }
+        Ok(())
+    }
+
+    /// Stop Endpoint completed (Linux xhci_handle_cmd_stop_ep): the
+    /// cancelled TDs are taken off the stopped ring (No-ops, and a Set
+    /// TR Dequeue Pointer past one the endpoint sat on), those clear of
+    /// it given back, the endpoint restarted for what remains. A stop
+    /// that raced with a halt resets the endpoint; one that raced with
+    /// a restart is queued again
+    fn handle_cmd_stop_ep(&self, st: &mut XhciState, trb: &Trb, cc: u8) {
+        let (slot, dci) = (
+            (trb.control >> 24) as u8,
+            ((trb.control >> 16) & 0x1f) as u8,
+        );
+        let ctx_size = self.ctx_size;
+        let Some(dev) = st.dev(slot) else {
+            return;
+        };
+        let ctx_state = dev.out_ctx.ep_state(ctx_size, dci);
+        let hw = dev.out_ctx.ep_deq(ctx_size, dci) & !0xf;
+        let Some(ep) = usize::from(dci)
+            .checked_sub(1)
+            .and_then(|i| dev.eps.get_mut(i))
+        else {
+            return;
+        };
+        if cc == Cc::CONTEXT_STATE_ERROR {
+            match ctx_state {
+                ep_ctx_state::HALTED => {
+                    // The halt's transfer event queued the reset, or
+                    // this does: the TD it halted on fails (Linux -EPROTO)
+                    if ep.ep_state & ep_state::EP_HALTED == 0 {
+                        let ti = ep.ring.as_ref().and_then(|r| {
+                            let h = r.index_of(hw)?;
+                            let first = ep.tds.iter().position(Td::on_ring)?;
+                            r.td_contains(ep.tds[first].span, h).then_some(first)
+                        });
+                        if let Some(i) = ti {
+                            ep.tds[i].status = Err(UsbError::BusError);
+                        }
+                        self.handle_halted_endpoint(st, slot, dci, ti);
+                    }
+                    if let Some(ep) = st.ep(slot, dci) {
+                        ep.ep_state &= !ep_state::EP_STOP_CMD_PENDING;
+                    }
+                    return;
+                }
+                // Stopped by now: unless a halt's reset is behind it,
+                // some controllers report Stopped a while after a
+                // doorbell; retry for up to 100 ms
+                ep_ctx_state::STOPPED
+                    if ep.ep_state & ep_state::EP_HALTED == 0
+                        && crate::time::monotonic_ns() < ep.stop_time + 100_000_000 =>
+                {
+                    self.requeue_stop_endpoint(st, slot, dci);
+                    return;
+                }
+                // Not stopped yet: the doorbell restarted it after the stop
+                ep_ctx_state::RUNNING => {
+                    self.requeue_stop_endpoint(st, slot, dci);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.invalidate_cancelled_tds(st, slot, dci);
+        if let Some(ep) = st.ep(slot, dci) {
+            ep.ep_state &= !ep_state::EP_STOP_CMD_PENDING;
+        }
+        self.giveback_invalidated_tds(st, slot, dci);
+        self.ring_doorbell_for_active_rings(st, slot, dci);
+    }
+
+    /// Queue the Stop Endpoint again; without memory, give up on it
+    fn requeue_stop_endpoint(&self, st: &mut XhciState, slot: u8, dci: u8) {
+        let trb = slot_trb(trb_type::STOP_ENDPOINT, slot, dci, 0);
+        let queued = try_arc_gfp(
+            XhciCommand::new_nowait(trb),
+            crate::mm::page_alloc::Gfp::ATOMIC,
+        )
+        .map_err(|_| UsbError::NoResources)
+        .and_then(|cmd| self.queue_command(st, cmd));
+        if queued.is_err()
+            && let Some(ep) = st.ep(slot, dci)
+        {
+            ep.ep_state &= !ep_state::EP_STOP_CMD_PENDING;
+        }
+    }
+
     /// A transfer event (Linux handle_tx_event): the TD whose TRB it
     /// names is finished, unless the endpoint stopped on it
     fn handle_tx_event(&self, st: &mut XhciState, ev: &Trb) {
@@ -726,7 +881,7 @@ impl Xhci {
         let mut cached: Option<usize> = None;
         for i in 0..ep.tds.len() {
             let (span, cancel) = (ep.tds[i].span, ep.tds[i].cancel);
-            if !matches!(cancel, TdCancel::Halted) {
+            if !matches!(cancel, TdCancel::Dirty | TdCancel::Halted) {
                 continue;
             }
             xhci_trace!(
@@ -859,7 +1014,10 @@ impl Xhci {
         }
         ep.ep_state &= !ep_state::SET_DEQ_PENDING;
         ep.queued_deq = None;
-        let more = ep.tds.iter().any(|t| matches!(t.cancel, TdCancel::Halted));
+        let more = ep
+            .tds
+            .iter()
+            .any(|t| matches!(t.cancel, TdCancel::Dirty | TdCancel::Halted));
         self.giveback_invalidated_tds(st, slot, dci);
         if more {
             self.invalidate_cancelled_tds(st, slot, dci);

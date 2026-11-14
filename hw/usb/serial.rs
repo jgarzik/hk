@@ -124,6 +124,7 @@ static PORT: IrqSpinlock<Port> = IrqSpinlock::new(Port {
 static WRITE_BUF: Mutex<WriteBuf> = Mutex::new(WriteBuf {
     buf: [0; BULK_OUT_SIZE],
     dev: None,
+    inp: 0,
 });
 
 /// The write transfer's buffer and device
@@ -131,6 +132,8 @@ struct WriteBuf {
     buf: [u8; BULK_OUT_SIZE],
     /// The console port's device (None: no console)
     dev: Option<UsbDevice>,
+    /// Its bulk IN endpoint (never read by the driver: BUGS.md)
+    inp: u8,
 }
 
 /// A console write transfer's time limit: a stalled console device
@@ -151,7 +154,7 @@ static ERR_ONCE: AtomicBool = AtomicBool::new(false);
 /// completion refilling: usb_serial_generic_write_bulk_callback)
 fn write_start() {
     let mut w = WRITE_BUF.lock();
-    let WriteBuf { buf, dev } = &mut *w;
+    let WriteBuf { buf, dev, .. } = &mut *w;
 
     loop {
         let (out, n) = {
@@ -184,6 +187,13 @@ fn write_start() {
         // Busy consoles keep refilling the FIFO: not the CPU's only task
         crate::task::percpu::cond_resched();
     }
+}
+
+/// The console port's device and bulk IN pipe, for the boot self-test
+/// (`urb::urb_selftest`); thread context
+pub fn console_in_pipe() -> Option<(UsbDevice, Pipe)> {
+    let w = WRITE_BUF.lock();
+    Some((w.dev.clone()?, Pipe::bulk_in(w.inp)))
 }
 
 /// Queue console output with a CR after each LF (Linux
@@ -242,7 +252,11 @@ fn register_usb_serial_console(serial: &UsbSerial, dev: &UsbDevice) {
     p.out = Some((serial.slot_id, serial.bulk_out_ep));
     p.fifo.reset();
     drop(p);
-    WRITE_BUF.lock().dev = Some(dev.clone());
+    {
+        let mut w = WRITE_BUF.lock();
+        w.dev = Some(dev.clone());
+        w.inp = serial.bulk_in_ep;
+    }
     register_console(
         &USB_SERIAL_CONSOLE,
         ConsolePriority::Normal,

@@ -678,6 +678,8 @@ impl XhciCommand {
 pub(super) enum TdCancel {
     /// Not cancelled
     None,
+    /// Cancelled, still on the ring as queued
+    Dirty,
     /// The endpoint halted on it
     Halted,
     /// Turned into No-ops; a Set TR Dequeue Pointer moves past it
@@ -702,7 +704,10 @@ impl Td {
     /// Still on the TD list proper: not yet invalidated (Linux: on
     /// ring->td_list)
     pub(super) fn on_ring(&self) -> bool {
-        matches!(self.cancel, TdCancel::None | TdCancel::Halted)
+        matches!(
+            self.cancel,
+            TdCancel::None | TdCancel::Dirty | TdCancel::Halted
+        )
     }
 }
 
@@ -732,6 +737,9 @@ pub(super) struct VirtEp {
     pub(super) queued_deq: Option<usize>,
     /// wMaxPacketSize (TD Size)
     pub(super) maxp: u16,
+    /// When its last Stop Endpoint was queued (monotonic ns; Linux
+    /// ep->stop_time)
+    pub(super) stop_time: u64,
 }
 
 impl VirtEp {
@@ -742,6 +750,7 @@ impl VirtEp {
             ep_state: 0,
             queued_deq: None,
             maxp: 0,
+            stop_time: 0,
         }
     }
 
@@ -756,6 +765,7 @@ impl VirtEp {
             ep_state: 0,
             queued_deq: None,
             maxp,
+            stop_time: 0,
         })
     }
 }
@@ -1469,6 +1479,10 @@ impl Xhci {
 impl Hcd for Xhci {
     fn urb_enqueue(&self, urb: &Arc<Urb>) -> Result<(), UsbError> {
         self.xhci_urb_enqueue(urb)
+    }
+
+    fn urb_dequeue(&self, urb: &Arc<Urb>, status: UsbError) -> Result<(), UsbError> {
+        self.xhci_urb_dequeue(urb, status)
     }
 
     fn bh(&self) -> &GivebackBh {

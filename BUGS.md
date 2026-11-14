@@ -773,10 +773,6 @@ Phase A2 (net) remaining:
 **Location**: `hw/usb/xhci.rs`, `hw/usb/xhci_ring.rs`, `hw/usb/msc.rs`
 
 QEMU's xHCI hides all of them.
-- A synchronous request that times out (`usb_start_wait_urb`) leaves
-  its URB queued with its buffer; Linux kills it (usb_kill_urb: Stop
-  Endpoint, then Set TR Dequeue Pointer past its TD,
-  xhci_handle_cmd_stop_ep). No URB can be unlinked or killed.
 - A second controller's root hub is `usb1` too (no bus numbers, Linux
   usb_register_bus): its devices fail to register.
 - No hub support (route string 0): devices behind a hub are not
