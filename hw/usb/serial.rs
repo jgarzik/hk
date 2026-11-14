@@ -13,7 +13,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::console::{ConsoleDriver, ConsolePriority, register_console};
 use crate::printkln;
@@ -127,12 +127,10 @@ static WRITE_BUF: Mutex<[u8; BULK_OUT_SIZE]> = Mutex::new([0; BULK_OUT_SIZE]);
 /// itself; hk's transfers are synchronous, so a thread sends them)
 static WRITE_WORK: spin::Once<Arc<IrqSpinlock<Work>>> = spin::Once::new();
 
-/// The CPU running a write transfer, else `NO_CPU`: what it prints in
-/// thread context meanwhile (USB trace, transfer errors) is not queued,
-/// or each transfer would feed the next forever (Linux prints a console
-/// port's errors once for this: dev_err_console)
-static TX_CPU: AtomicU32 = AtomicU32::new(NO_CPU);
-const NO_CPU: u32 = u32::MAX;
+/// A failed write transfer was reported: a console port's errors are
+/// printed once, or each report would queue the next (Linux
+/// dev_err_console)
+static ERR_ONCE: AtomicBool = AtomicBool::new(false);
 
 /// Send the FIFO's contents, a bulk OUT transfer at a time, in thread
 /// context (Linux usb_serial_generic_write_start, and the write URB's
@@ -152,11 +150,16 @@ fn write_start() {
         if n == 0 {
             return;
         }
-        // Kernel threads are not preempted: the transfer stays on this CPU
-        TX_CPU.store(crate::cpu::this_id(), Ordering::Relaxed);
-        // A failed transfer's data is lost, as a failed URB's
-        let _ = usb_console_out(out.0, out.1, &buf[..n]);
-        TX_CPU.store(NO_CPU, Ordering::Relaxed);
+        // A failed transfer's data is lost, as a failed URB's (Linux
+        // usb_serial_generic_write_bulk_callback)
+        if let Err(e) = usb_console_out(out.0, out.1, &buf[..n])
+            && !ERR_ONCE.swap(true, Ordering::Relaxed)
+        {
+            printkln!(
+                "ftdi_sio: write_bulk_callback - nonzero urb status: {:?}",
+                e
+            );
+        }
         // Busy consoles keep refilling the FIFO: not the CPU's only task
         crate::task::percpu::cond_resched();
     }
@@ -187,9 +190,6 @@ impl ConsoleDriver for UsbSerialConsole {
     /// (Linux usb_console_write -> usb_serial_generic_write), in any
     /// context; the next tick starts the write work
     fn write(&self, data: &[u8]) {
-        if TX_CPU.load(Ordering::Relaxed) == crate::cpu::this_id() && !crate::sync::in_interrupt() {
-            return;
-        }
         let mut p = PORT.lock();
         if p.out.is_none() {
             return;
