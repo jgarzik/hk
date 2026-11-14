@@ -143,11 +143,36 @@ fn d_hash(key: u64) -> &'static Bucket {
     &t[i]
 }
 
+/// Name hashing and comparison for a filesystem whose names match
+/// more than their bytes (Linux dentry_operations' d_hash and
+/// d_compare): vfat ignores case and trailing dots, so each object has
+/// one dentry whatever the spelling it was reached by
+pub struct DentryOps {
+    /// The name's hash (Linux d_hash): names `d_compare` matches hash
+    /// alike
+    pub d_hash: fn(&[u8]) -> u64,
+    /// The cached name `stored` is `name` (Linux d_compare)
+    pub d_compare: fn(stored: &[u8], name: &[u8]) -> bool,
+}
+
+/// The hash of the child name `name` under `parent` (Linux
+/// full_name_hash, or d_hash where the filesystem has one)
+fn name_hash_in(parent: &Dentry, name: &[u8]) -> u64 {
+    match parent.d_op {
+        Some(op) => (op.d_hash)(name),
+        None => super::name::name_hash(name),
+    }
+}
+
 /// Put `d` (parent `parent`, named `name`) in the tree: on the
 /// parent's children (`p`, its d_lock held for writing), then in its
 /// bucket (Linux d_add's __d_rehash, d_sib)
 fn hash_in(parent: &Dentry, p: &mut DentryInner, d: &DentryRef, name: &DName) {
-    let key = d_key(parent, name.hash());
+    let h = match parent.d_op {
+        Some(op) => (op.d_hash)(name),
+        None => name.hash(),
+    };
+    let key = d_key(parent, h);
     d.d_hkey.store(key, Relaxed);
     d.d_hparent
         .store(core::ptr::from_ref(parent).addr(), Relaxed);
@@ -173,12 +198,16 @@ fn hash_out(p: &mut DentryInner, d: &Dentry) -> Option<DentryRef> {
 /// leaf taken here inside the bucket lock (written only while the
 /// dentry is out of the tree, by d_move). A new reference.
 fn d_lookup(parent: &Dentry, _p: &DentryInner, name: &[u8]) -> Option<DentryRef> {
-    let key = d_key(parent, super::name::name_hash(name));
+    let key = d_key(parent, name_hash_in(parent, name));
     let pa = core::ptr::from_ref(parent).addr();
+    let same = |stored: &[u8]| match parent.d_op {
+        Some(op) => (op.d_compare)(stored, name),
+        None => stored == name,
+    };
     d_hash(key).lock().find(|c| {
         c.d_hkey.load(Relaxed) == key
             && c.d_hparent.load(Relaxed) == pa
-            && c.d_name.read().as_bytes() == name
+            && same(c.d_name.read().as_bytes())
     })
 }
 
@@ -219,6 +248,9 @@ struct DentryInner {
 pub struct Dentry {
     /// Back pointer to superblock - immutable after creation
     pub sb: Weak<SuperBlock>,
+    /// Its superblock's name operations, for its children (Linux d_op,
+    /// from s_d_op at d_alloc): immutable
+    d_op: Option<&'static DentryOps>,
 
     /// References ([`DentryRef`], Linux d_lockref.count): the tree's
     /// (its parent's children list and its bucket), children's
@@ -254,6 +286,7 @@ pub struct Dentry {
 impl Dentry {
     fn with(name: DName, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
         Self {
+            d_op: sb.upgrade().and_then(|s| s.d_op()),
             sb,
             d_count: AtomicUsize::new(1),
             d_parent: AtomicPtr::new(core::ptr::null_mut()),

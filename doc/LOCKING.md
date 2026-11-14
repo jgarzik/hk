@@ -2474,7 +2474,9 @@ preempt count and lockdep, one class) -> `d_name` (leaf).
 `d_lookup` (Linux __d_lookup) holds the parent's d_lock (read: lookups
 take their references under it) and walks the bucket once under its
 lock, comparing key, parent address and name, as Linux compares d_name
-there. That is sound: the key and parent address are stored when the
+there (a filesystem's `DentryOps`, Linux d_hash/d_compare, hash and
+compare where names match more than their bytes: vfat, without case
+or trailing dots; no lock of their own). That is sound: the key and parent address are stored when the
 dentry is hashed in and change only while it is out of its bucket;
 the name is read under `d_name`, which only d_move/d_exchange write,
 with the dentry out of the tree. Linux walks

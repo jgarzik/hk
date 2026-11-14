@@ -729,6 +729,29 @@ fn user_name(dir: &Inode, name: &[u8], err: KernelError) -> Result<String, Kerne
     Ok(String::from(s.trim_end_matches('.')))
 }
 
+/// `name` without its trailing dots (Linux vfat_striptail_len)
+fn striptail(name: &[u8]) -> &[u8] {
+    let n = name.iter().rposition(|&c| c != b'.').map_or(0, |i| i + 1);
+    &name[..n]
+}
+
+/// Hash of a name, case folded, trailing dots dropped (Linux
+/// vfat_hashi; hk folds ASCII, as its lookups match)
+fn vfat_hashi(name: &[u8]) -> u64 {
+    crate::fs::name::name_hash_nocase(striptail(name))
+}
+
+/// Two names match without case or trailing dots (Linux vfat_cmpi)
+fn vfat_cmpi(stored: &[u8], name: &[u8]) -> bool {
+    striptail(stored).eq_ignore_ascii_case(striptail(name))
+}
+
+/// vfat's dentry name operations (Linux vfat_ci_dentry_ops)
+static VFAT_CI_DENTRY_OPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
+    d_hash: vfat_hashi,
+    d_compare: vfat_cmpi,
+};
+
 /// A name for a new entry (Linux vfat_create_shortname /
 /// vfat_valid_longname): EINVAL for nothing left or a character FAT
 /// forbids, ENAMETOOLONG past 255 UTF-16 units
@@ -2666,7 +2689,9 @@ fn vfat_mount_dev(
         clusters: 0,
     })?);
 
-    // Create root dentry
+    // Names match without case or trailing dots (Linux setup's
+    // vfat_ci_dentry_ops), before the root dentry takes them
+    sb.set_d_op(&VFAT_CI_DENTRY_OPS);
     let root_dentry = crate::fs::DentryRef::new(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
     sb.set_root(root_dentry);
 

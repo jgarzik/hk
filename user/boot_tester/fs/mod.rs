@@ -40,5 +40,6 @@ pub mod resolve;
 pub mod splice;
 pub mod sync;
 pub mod tmpfs;
+pub mod vfat_names;
 pub mod vfs;
 pub mod xattr;

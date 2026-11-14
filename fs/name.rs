@@ -184,6 +184,13 @@ pub fn name_hash(b: &[u8]) -> u64 {
     crate::util::siphash::siphash_bytes(name_key(), b)
 }
 
+/// [`name_hash`] of `b` with ASCII case folded (Linux partial_name_hash
+/// over nls_tolower): one hash for names a filesystem matches without
+/// case
+pub fn name_hash_nocase(b: &[u8]) -> u64 {
+    crate::util::siphash::siphash_bytes_map(name_key(), b, |c| c.to_ascii_lowercase())
+}
+
 impl Deref for DName {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
