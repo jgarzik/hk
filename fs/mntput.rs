@@ -33,7 +33,9 @@
 //! but MOUNT_LOCK.
 //!
 //! The mount's memory is an `Arc`: one strong count stands for all its
-//! references, taken back by the teardown; list entries and `Weak`s keep
+//! references, taken back by the teardown, which drops it a grace
+//! period later (Linux delayed_free_vfsmnt), so an RCU walk may read a
+//! mount it reached with no reference; list entries and `Weak`s keep
 //! the rest.
 //!
 //! Locking: a put's exact path and a `try_get` outside a namespace take
@@ -301,6 +303,12 @@ pub(super) unsafe fn __cleanup_mnt(cb: *const CallbackHead) {
     // SAFETY: the mount is doomed (`put_slow`): no reference exists or
     // can be made, and this runs once per mount
     unsafe { m.cleanup() };
+    // An RCU walk that reached it before its links were cleared may
+    // still read it (Linux cleanup_mnt's call_rcu of
+    // delayed_free_vfsmnt)
+    if have_cpu() {
+        crate::sync::rcu::kfree_rcu(m);
+    }
 }
 
 /// Mounts whose teardown waits for the system workqueue (Linux
@@ -358,8 +366,9 @@ impl<T> MntOwned<T> {
     /// the mount is doomed (or never had a reference) and is off every
     /// list that hands out a borrowed one.
     pub(super) unsafe fn take(&self) -> T {
-        // SAFETY: the caller's contract gives exclusive use
-        unsafe { ManuallyDrop::take(&mut *self.0.get()) }
+        // SAFETY: the caller's contract: this is the one release. A raw
+        // read, no `&mut`: the bits stay
+        unsafe { ManuallyDrop::into_inner(core::ptr::read(self.0.get())) }
     }
 }
 

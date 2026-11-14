@@ -2712,7 +2712,12 @@ on `DELAYED_MNTPUT` (IrqSpinlock leaf, the mounts' embedded callback
 heads) drained by delayed work on `SYSTEM_WQ`. So a `MountRef` may be
 dropped under any lock. The `sb` and `root` fields (`MntOwned`) are
 released by the teardown while the mount's memory may live on in a
-`try_get`'s brief `Arc` (a refused one never reads them).
+`try_get`'s brief `Arc` (a refused one never reads them). The
+teardown hands its `Arc` to `kfree_rcu` (Linux cleanup_mnt's call_rcu
+of delayed_free_vfsmnt, through `Mount.mnt_rcu`), so a mount an RCU
+walk reached stays readable for the walk's guard; the drop then runs
+in `rcuc/N` (1.4.2) and only releases memory and the mount's
+`PcpSlot` number (an IrqSpinlock leaf).
 
 **Busy:** as Linux do_umount (propagate_mount_busy, do_refcount_check),
 umount sums the count under MOUNT_LOCK's locking read and NAMESPACE_SEM

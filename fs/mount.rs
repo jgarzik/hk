@@ -205,6 +205,8 @@ pub struct Mount {
     /// The deferred teardown's head (Linux mnt_rcu as task_work, or
     /// mnt_llist on delayed_mntput_list)
     pub(super) mnt_task_work: CallbackHead,
+    /// The free a grace period after the teardown (Linux mnt_rcu)
+    mnt_rcu: crate::sync::rcu::RcuHead,
 
     /// On its superblock's `s_mounts` (Linux mnt_instance)
     pub(super) mnt_instance: crate::util::list::Link,
@@ -275,6 +277,7 @@ impl Mount {
             mnt_pcp,
             doomed: AtomicBool::new(false),
             mnt_task_work: CallbackHead::new(__cleanup_mnt),
+            mnt_rcu: crate::sync::rcu::RcuHead::new(),
             mnt_instance: crate::util::list::Link::new(),
         }
     }
@@ -1328,6 +1331,8 @@ impl MountRef {
         Ok(super::superblock::WriteAccess::mnt(self.clone()))
     }
 }
+
+crate::rcu_head!(Mount, mnt_rcu);
 
 /// The memory of a mount: torn down already, unless it never had a
 /// reference (`Mount::alloc` failed to allocate its `Arc`)
