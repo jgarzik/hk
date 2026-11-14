@@ -73,10 +73,11 @@ fn fragment(skb: &mut SkBuff, at: usize, gfp: Gfp) -> Option<Box<SkBuff>> {
 }
 
 impl TcpCb {
-    /// Queue a SYN (SYN_SENT) or SYN-ACK (SYN_RECEIVED) with our
+    /// Queue a SYN (SYN_SENT) or SYN-ACK (the peer's SYN received:
+    /// SYN_RECEIVED, or FIN_WAIT_1 after a close there) with our
     /// options; false without memory
     pub(super) fn syn_seg(&mut self, out: &mut Out) -> bool {
-        let synack = self.state == TcpState::SynReceived;
+        let synack = self.state != TcpState::SynSent;
         let ts = if !self.ts_ok {
             None
         } else if synack {
@@ -449,7 +450,7 @@ impl TcpCb {
     /// to the MSS (tcp_retrans_try_collapse); never an RTT sample (Karn)
     pub(super) fn retransmit_head(&mut self, out: &mut Out) {
         self.rtt_seq = None;
-        if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
+        if self.syn_unacked {
             self.syn_rtx(out);
             return;
         }

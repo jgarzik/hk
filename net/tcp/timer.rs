@@ -193,6 +193,13 @@ impl TcpCb {
             self.syn_rtx = true;
             self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
             self.syn_rtx(out);
+        } else if self.syn_unacked {
+            // Closed in SYN_RECEIVED: the SYN-ACK heads the queue and
+            // goes alone (Linux tcp_retransmit_skb of the head; a SYN is
+            // never collapsed), the FIN behind it once that is acked
+            self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
+            self.syn_rtx(out);
+            self.snd_nxt = self.snd_una.wrapping_add(1);
         } else {
             self.snd_nxt = self.snd_una;
             self.output(now, out);

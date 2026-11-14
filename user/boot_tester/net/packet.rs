@@ -143,7 +143,7 @@ fn sockname(fd: i32) -> (i64, u32, Sll) {
 }
 
 /// Interface index by name (SIOCGIFINDEX)
-fn ifindex(name: &[u8]) -> i32 {
+pub fn ifindex(name: &[u8]) -> i32 {
     const SIOCGIFINDEX: u64 = 0x8933;
     let mut ifr = [0u8; 40];
     ifr[..name.len()].copy_from_slice(name);

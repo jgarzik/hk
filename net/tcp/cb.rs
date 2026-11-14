@@ -721,6 +721,10 @@ pub struct TcpCb {
     /// Karn: (sequence that must be acknowledged, send time)
     pub(super) rtt_seq: Option<(u32, u64)>,
     pub(super) syn_rtx: bool,
+    /// Our SYN is not yet acknowledged (Linux: the SYN skb heads the
+    /// retransmit queue): a retransmission resends the SYN or SYN-ACK,
+    /// in FIN_WAIT_1 too after a close in SYN_RECEIVED
+    pub(super) syn_unacked: bool,
     /// A listener's child: in SYN_RECEIVED it is Linux's request sock
     /// (tcp_check_req rules), not a simultaneous open
     pub(super) passive: bool,
@@ -813,6 +817,7 @@ impl TcpCb {
         self.snd_nxt = o.iss.wrapping_add(1);
         self.snd_max = self.snd_nxt;
         self.write_seq = self.snd_nxt;
+        self.syn_unacked = true;
         self.ts_off = if self.cfg.ts == 1 { o.ts_off } else { 0 };
         self.cong.set_algo(self.opts.ca);
         self.set_adv_mss(o.mss);
@@ -1223,14 +1228,11 @@ impl TcpCb {
     /// Close the sending side (shutdown(SHUT_WR) / close): FIN after the
     /// queued data (Linux tcp_close_state + tcp_send_fin). Returns false
     /// if there is nothing to close (Linux: no FIN in SYN_SENT/CLOSED).
+    /// SYN_RECEIVED goes to FIN_WAIT_1 at once, its FIN sent behind the
+    /// unacknowledged SYN-ACK (Linux's new_state table)
     pub fn shutdown_wr(&mut self, now: u64, out: &mut Out) -> bool {
         let next = match self.state {
-            TcpState::Established => TcpState::FinWait1,
-            TcpState::SynReceived => {
-                // The FIN follows once the SYN is acknowledged
-                self.fin_queued = true;
-                return true;
-            }
+            TcpState::Established | TcpState::SynReceived => TcpState::FinWait1,
             TcpState::CloseWait => TcpState::LastAck,
             _ => return false,
         };
@@ -1242,10 +1244,9 @@ impl TcpCb {
 
     /// The user closed the socket (Linux tcp_close): unread data resets
     /// in any state, then `linger0` (SO_LINGER {1, 0}) aborts as
-    /// tcp_disconnect, else the sending side closes. The connection
-    /// lives on as an orphan. A connection still in SYN_RECEIVED
-    /// (simultaneous open) is reset instead of sending a FIN before its
-    /// SYN is acknowledged.
+    /// tcp_disconnect, else the sending side closes (SYN_RECEIVED of a
+    /// simultaneous open included: FIN_WAIT_1 and a FIN). The
+    /// connection lives on as an orphan.
     pub fn close(&mut self, linger0: bool, now: u64, out: &mut Out) {
         self.orphan = true;
         self.rcv_shut = true;
@@ -1262,7 +1263,6 @@ impl TcpCb {
                 self.disconnect(out);
                 self.net_stat(LINUX_MIB_TCPABORTONDATA);
             }
-            TcpState::SynReceived => self.abort(out),
             _ => {
                 self.shutdown_wr(now, out);
                 if self.state == TcpState::FinWait2 {

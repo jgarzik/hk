@@ -82,6 +82,7 @@ impl TcpCb {
         self.snd_una = s.ack;
         // Linux tcp_clean_rtx_queue acknowledges the SYN
         self.net_stat(LINUX_MIB_TCPDELIVERED);
+        self.syn_unacked = false;
         self.established(s, now, out);
         self.ack_now = true;
         self.rcv_text(s, skb, now, out);
@@ -102,12 +103,7 @@ impl TcpCb {
 
     /// The handshake completed with `s`
     fn established(&mut self, s: &SegIn, now: u64, out: &mut Out) {
-        // shutdown(SHUT_WR) in SYN_RECEIVED queued a FIN
-        self.set_state(if self.fin_queued {
-            TcpState::FinWait1
-        } else {
-            TcpState::Established
-        });
+        self.set_state(TcpState::Established);
         // Linux tcp_create_openreq_child: the request became a socket
         self.tcp_stat_if(self.passive, TCP_MIB_PASSIVEOPENS);
         self.snd_wnd = self.seg_wnd(s);
@@ -306,6 +302,7 @@ impl TcpCb {
             // Linux tcp_rcv_state_process: tcp_ack(FLAG_SLOWPATH)
             self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
             self.snd_una = s.ack;
+            self.syn_unacked = false;
             self.established(s, now, out);
         } else if !self.rcv_ack(s, now, out) {
             return;
@@ -481,6 +478,7 @@ impl TcpCb {
         self.clean_rtx(ack);
         self.stats.bytes_acked += u64::from(acked);
         self.snd_una = ack;
+        self.syn_unacked = false;
         self.mem_settle();
         if before(self.snd_nxt, ack) {
             self.snd_nxt = ack;

@@ -34,6 +34,47 @@ pub fn run_tests() {
     test_ephemeral_owners();
     test_eth0_refused();
     test_connect_timeout();
+    test_lo_route();
+}
+
+/// A SYN over a unicast route out lo to an address not ours arrives
+/// locally, finds no socket and is not answered (Linux
+/// tcp_v4_send_reset: no RST unless the route was RTN_LOCAL): the
+/// connect stays in SYN_SENT
+fn test_lo_route() {
+    use crate::net::nl::{NLM_F_CREATE, NLM_F_EXCL, Nl, route};
+    const SYN_SENT: u8 = 2;
+    const VOID: [u8; 4] = [192, 0, 2, 79];
+    let mut t = T::new(b"TCP_LO_ROUTE");
+    let Some(mut nl) = Nl::open() else {
+        t.ok(b"netlink", false, 0);
+        return t.done();
+    };
+    let lo = crate::net::packet::ifindex(b"lo") as u32;
+    let r = route(
+        &mut nl,
+        true,
+        VOID,
+        32,
+        [0; 4],
+        lo,
+        NLM_F_CREATE | NLM_F_EXCL,
+    );
+    if !t.eq(b"route add", r as i64, 0) {
+        return t.done();
+    }
+    let c = nb_tcp();
+    bind(c, LO, 0);
+    t.eq(b"connect", connect(c, VOID, 7782), EINPROGRESS);
+    t.eq(b"unanswered", poll1(c, POLLOUT, 300).0, 0);
+    t.eq(b"syn_sent", i64::from(tcp_state(c)), i64::from(SYN_SENT));
+    close(c);
+    t.eq(
+        b"route del",
+        route(&mut nl, false, VOID, 32, [0; 4], lo, 0) as i64,
+        0,
+    );
+    t.done();
 }
 
 fn nb_tcp() -> i32 {

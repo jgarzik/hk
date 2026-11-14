@@ -1156,8 +1156,9 @@ fn covered_ooo_intervals_do_not_block_fin() {
     assert_eq!(wire(&out).last().unwrap().ack, base.wrapping_add(401));
 }
 
-#[test]
-fn shutdown_in_syn_received_sends_fin_later() {
+/// A simultaneous open with both ends in SYN_RECEIVED, each one's
+/// SYN-ACK on the wire
+fn crossed_syns() -> Pair {
     let mut p = Pair::bare();
     let mut o1 = Out::default();
     p.a.connect(open(100, 1460), 0, &mut o1);
@@ -1168,12 +1169,89 @@ fn shutdown_in_syn_received_sends_fin_later() {
     p.step();
     p.step();
     assert_eq!(p.a.state, TcpState::SynReceived);
+    assert_eq!(p.b.state, TcpState::SynReceived);
+    p
+}
+
+#[test]
+fn shutdown_in_syn_received_sends_fin() {
+    let mut p = crossed_syns();
     let mut out = Out::default();
     assert!(p.a.shutdown_wr(p.now, &mut out));
+    // Linux tcp_close_state: FIN_WAIT_1 and the FIN at once, behind the
+    // unacknowledged SYN-ACK
+    assert_eq!(p.a.state, TcpState::FinWait1);
+    let w = wire(&out);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0].flags, flags::FIN | flags::ACK);
+    assert_eq!(w[0].seq, 101);
     p.take(true, out);
     p.run();
     assert_eq!(p.a.state, TcpState::FinWait2);
     assert_eq!(p.b.state, TcpState::CloseWait);
+}
+
+#[test]
+fn close_in_syn_received_sends_fin() {
+    let mut p = crossed_syns();
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    // A FIN, not a RST (Linux __tcp_close: no unread data, no linger 0)
+    assert_eq!(p.a.state, TcpState::FinWait1);
+    let w = wire(&out);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0].flags, flags::FIN | flags::ACK);
+    assert_eq!((w[0].seq, w[0].ack), (101, 901));
+    assert!(!out.done && out.err.is_none());
+    p.take(true, out);
+    p.run();
+    assert_eq!(p.a.state, TcpState::FinWait2);
+    assert_eq!(p.b.state, TcpState::CloseWait);
+    assert!(!p.log.iter().any(|(_, _, s)| s.has(flags::RST)));
+}
+
+#[test]
+fn fin_wait1_resends_unacked_synack() {
+    let mut p = crossed_syns();
+    p.wire.clear();
+    p.filter = |_, to_b, _, _| if to_b { Fate::Drop } else { Fate::Pass };
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    p.take(true, out);
+    // The timeout resends the SYN-ACK alone (Linux: the head of the
+    // retransmit queue, still in FIN_WAIT_1), then the FIN once it is
+    // acknowledged
+    let n = p.log.len();
+    assert!(p.tick());
+    let w: Vec<Seg> = p.log[n..]
+        .iter()
+        .filter(|(_, to_b, _)| *to_b)
+        .map(|(_, _, s)| s.clone())
+        .collect();
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0].flags, flags::SYN | flags::ACK);
+    assert_eq!((w[0].seq, w[0].ack), (100, 901));
+    assert!(w[0].mss.is_some());
+    assert_eq!(p.a.state, TcpState::FinWait1);
+    assert_eq!(p.a.stats.total_retrans, 1);
+    p.filter = pass;
+    let mut out = Out::default();
+    let ack = SegIn {
+        seq: 901,
+        ack: 101,
+        flags: flags::ACK,
+        wnd: 1000,
+        ..Default::default()
+    };
+    p.a.feed(&ack, p.now, &mut out);
+    let w = wire(&out);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0].flags, flags::FIN | flags::ACK);
+    assert_eq!(w[0].seq, 101);
+    assert_eq!(p.a.state, TcpState::FinWait1);
+    let mut out = Out::default();
+    p.a.feed(&SegIn { ack: 102, ..ack }, p.now, &mut out);
+    assert_eq!(p.a.state, TcpState::FinWait2);
 }
 
 #[test]
