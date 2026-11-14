@@ -5079,8 +5079,12 @@ pub fn create_session(caller_pid: Pid) -> KernelResult<Pid> {
         }
         pid
     };
-    // The whole process: pid becomes sid and pgid
+    // The whole process: pid becomes sid and pgid, with no controlling
+    // tty (Linux ksys_setsid: proc_clear_tty)
     let old = table.change_pids(caller_pid, &pid, Some(&pid));
+    if let Some(sig) = table.get(caller_pid).and_then(|l| l.signal().cloned()) {
+        crate::tty::jobctrl::proc_clear_tty(&sig);
+    }
     drop(table);
     drop(old);
     Ok(caller_pid)

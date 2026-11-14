@@ -37,6 +37,14 @@
 //!   tty: a member's open file writes EIO, its foreground group got
 //!   SIGHUP and no SIGCONT (Linux disassociate_ctty(1) ->
 //!   tty_vhangup_session)
+//! - TTY_CTTY_PROC: the controlling tty is per process (Linux
+//!   signal->tty): a session member forked before its leader acquired
+//!   one has none (/dev/tty ENXIO), one forked after has it; TIOCNOTTY
+//!   by a member drops only its own
+//! - TTY_OLD_PGRP: a session leader whose tty was hung up (vhangup)
+//!   signals its old foreground group SIGHUP and SIGCONT when it exits
+//!   (Linux tty_old_pgrp, disassociate_ctty(1)); the hangup itself
+//!   signalled only the leader
 //! - TTY_SERIAL: TIOCGSERIAL shows the UART (ttyS1 on x86, ttyAMA0 on
 //!   arm64) and its tty_port's close timing defaults (0.5 s, 30 s);
 //!   TIOCSSERIAL with CAP_SYS_ADMIN sets close_delay and closing_wait
@@ -106,6 +114,8 @@ pub fn run_tests() {
     test_serial_info();
     test_hangup();
     test_hangup_exit();
+    test_ctty_proc();
+    test_old_pgrp();
 }
 
 /// Bytes queued for the console's UART
@@ -694,6 +704,157 @@ fn test_hangup_exit() {
         sys_wait4(member as i64, &mut st, 0, 0);
     }
     let r = check(b"leader", st & 0x7f == 0, i64::from(st))
+        .and_then(|()| check(b"report", n == 5, n))
+        .and_then(|()| check(b"member", out[4] == 0, i64::from(out[4])));
+    report_r(NAME, r);
+}
+
+/// /dev/tty opens (the caller has a controlling tty): 0, or -errno
+fn dev_tty() -> i64 {
+    let fd = sys_open(b"/dev/tty\0".as_ptr(), O_RDWR | O_NONBLOCK, 0);
+    if fd >= 0 {
+        sys_close(fd as u64);
+        return 0;
+    }
+    fd
+}
+
+/// A child of the calling session leader running `f`: its exit code
+fn member(f: fn() -> i32) -> i64 {
+    in_child(f)
+}
+
+fn ctty_proc_child() -> i32 {
+    sys_ioctl(1, TCSBRK, 1);
+    block_hup_cont();
+    sys_setsid();
+    let mut go = [0i32; 2];
+    if sys_pipe(go.as_mut_ptr()) != 0 {
+        return 2;
+    }
+    let early = sys_fork();
+    if early == 0 {
+        let mut b = [0u8; 1];
+        sys_read(go[0] as u64, b.as_mut_ptr(), 1);
+        sys_exit(if dev_tty() == ENXIO { 0 } else { 1 });
+    }
+    let fd = open_ctty();
+    if fd < 0 || early < 0 {
+        return 3;
+    }
+    sys_write(go[1] as u64, b"g".as_ptr(), 1);
+    let mut st = 0i32;
+    sys_wait4(early, &mut st, 0, 0);
+    if st != 0 {
+        return 4;
+    }
+    let late = member(|| {
+        if dev_tty() != 0 {
+            return 1;
+        }
+        let fd = sys_open(b"/dev/tty\0".as_ptr(), O_RDWR | O_NONBLOCK, 0);
+        if sys_ioctl(fd as i32, TIOCNOTTY, 0) != 0 {
+            return 2;
+        }
+        if dev_tty() != ENXIO { 3 } else { 0 }
+    });
+    if late != 0 {
+        return 10 + late as i32;
+    }
+    if dev_tty() != 0 {
+        return 5;
+    }
+    sys_ioctl(fd as i32, TIOCNOTTY, 0);
+    0
+}
+
+fn test_ctty_proc() {
+    let code = in_child(ctty_proc_child);
+    report(b"TTY_CTTY_PROC", code == 0, code);
+}
+
+/// The leader of a new session with a controlling tty forks a member
+/// of its foreground group, hangs the tty up (vhangup) and exits; the
+/// member reports through `res`: its pid and the step that failed
+fn old_pgrp_leader(res: i32) -> i32 {
+    sys_ioctl(1, TCSBRK, 1);
+    block_hup_cont();
+    sys_setsid();
+    let fd = open_ctty();
+    let (mut ready, mut hung) = ([0i32; 2], [0i32; 2]);
+    if fd < 0 || sys_pipe(ready.as_mut_ptr()) != 0 || sys_pipe(hung.as_mut_ptr()) != 0 {
+        return 2;
+    }
+    let leader = sys_getpid();
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut b = [0u8; 1];
+        sys_write(ready[1] as u64, b"r".as_ptr(), 1);
+        sys_read(hung[0] as u64, b.as_mut_ptr(), 1);
+        let want = 1 << (SIGHUP - 1) | 1 << (SIGCONT - 1);
+        let mut step: u8 = if pending_sigs() & want != 0 { 1 } else { 0 };
+        sys_write(ready[1] as u64, b"c".as_ptr(), 1);
+        for _ in 0..500 {
+            if sys_getppid() != leader {
+                break;
+            }
+            crate::helpers::msleep(10);
+        }
+        if step == 0 && pending_sigs() & want != want {
+            step = 2;
+        }
+        let me = sys_getpid() as i32;
+        let mut out = [0u8; 5];
+        out[..4].copy_from_slice(&me.to_ne_bytes());
+        out[4] = step;
+        sys_write(res as u64, out.as_ptr(), 5);
+        sys_exit(0);
+    }
+    if pid < 0 {
+        return 3;
+    }
+    let mut b = [0u8; 1];
+    sys_read(ready[0] as u64, b.as_mut_ptr(), 1);
+    let v = sys_vhangup();
+    let gone = dev_tty();
+    sys_write(hung[1] as u64, b"h".as_ptr(), 1);
+    // Exit only once the member has looked
+    sys_read(ready[0] as u64, b.as_mut_ptr(), 1);
+    let want = 1 << (SIGHUP - 1) | 1 << (SIGCONT - 1);
+    if v != 0 {
+        4
+    } else if gone != ENXIO {
+        5
+    } else if pending_sigs() & want != want {
+        6
+    } else {
+        0
+    }
+}
+
+fn test_old_pgrp() {
+    const NAME: &[u8] = b"TTY_OLD_PGRP";
+    let mut res = [0i32; 2];
+    if sys_pipe(res.as_mut_ptr()) != 0 {
+        return report(NAME, false, -1);
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_close(res[0] as u64);
+        sys_exit(old_pgrp_leader(res[1]) as u64);
+    }
+    sys_close(res[1] as u64);
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    let mut out = [0u8; 5];
+    let n = sys_read(res[0] as u64, out.as_mut_ptr(), 5);
+    sys_close(res[0] as u64);
+    if n == 5 {
+        let m = i32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
+        let mut st2 = 0i32;
+        sys_wait4(m as i64, &mut st2, 0, 0);
+    }
+    let r = check(b"leader", st == 0, i64::from(st))
         .and_then(|()| check(b"report", n == 5, n))
         .and_then(|()| check(b"member", out[4] == 0, i64::from(out[4])));
     report_r(NAME, r);

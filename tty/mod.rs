@@ -799,7 +799,7 @@ impl Tty {
             r.fasync_off(self);
         }
         let (session, pgrp) = jobctrl::hangup_take(self);
-        jobctrl::signal_session_leader(session, pgrp, exit_session);
+        jobctrl::signal_session_leader(self, session, pgrp, exit_session);
         // Linux tty_ldisc_hangup: the line discipline's and the
         // driver's buffers flushed, a pending write wakeup run, readers
         // and writers woken, the line discipline reset (reinit or kill)

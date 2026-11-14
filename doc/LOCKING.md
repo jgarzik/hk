@@ -4287,6 +4287,12 @@ and feeds them to N_TTY, which wakes `read_wait` under `ldata`. It is the only
 consumer, so input stays in order. Order: `IrqDesc.lock` → `Tty.flip`;
 `IrqDesc.lock` → wait queue head (the wakeup).
 
+A process's controlling tty and old foreground group
+(`SignalStruct.ctty`, spin leaf, thread context; Linux signal->tty and
+signal->tty_old_pgrp under siglock) are set and cleared under it alone,
+under TASKLIST (read) when sessions are walked (session_clear_tty, a
+hangup's tty_signal_session_leader), never nested with `Tty.ctrl`; pid
+references taken out of it are dropped after the locks.
 `tty::jobctrl::CTTY_LOCK` (spin `Mutex`, thread context; Linux tty_lock
 + siglock in `__proc_set_tty`/`session_clear_tty`) serializes giving and
 taking controlling ttys (open without O_NOCTTY, TIOCSCTTY, TIOCNOTTY, a

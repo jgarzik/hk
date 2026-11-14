@@ -476,15 +476,10 @@ glibc's helper thread), and hk has no such path.
   runs only on the console's real input. A pty (phase H) makes it
   testable from the boot tester.
 - **Hangup gaps:** no carrier (DCD) loss hangs a tty up (no modem
-  control); a session leader exiting with no controlling tty signals
-  no former foreground group (Linux tty_old_pgrp). An unbound serial
-  port's tty is hung up, but its /dev/console files (left alone, as
+  control). An unbound serial port's tty is hung up, but its /dev/console files (left alone, as
   Linux) still write to the UART, where Linux's port is detached
   (uart_port_check). No boot test unbinds the console UART (the test
   output goes there).
-- **Per-process controlling tty:** it is the session's tty, so TIOCNOTTY
-  by a non-leader changes nothing (Linux clears that process's
-  signal->tty only).
 - **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
   TIOCEXCL exclusivity, sending a break (TCSBRK 0), packet mode,
   ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT, IUCLC/OLCUC, IMAXBEL,
