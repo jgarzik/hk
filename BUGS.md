@@ -11,10 +11,6 @@ infallible, so each one is investigated, not written off.
   `check-linux-arm` run had two adjacent-nice spinners' CPU share off
   (`share a:b tenths got 26`); passed on the uncached rerun. Likely
   TCG timing noise in a ratio test; widen the tolerance if it recurs.
-- **RLIMIT_CPU_XCPU flaky on the x86 Linux reference**: one uncached
-  `check-linux` run, run alongside `check-arm`, got `RLIMIT_CPU_XCPU:FAIL
-  got 9` (SIGKILL where SIGXCPU was expected first); passed on rerun.
-  Likely CPU-time accounting under a loaded host.
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
