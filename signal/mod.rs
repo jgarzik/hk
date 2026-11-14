@@ -891,11 +891,15 @@ fn retarget(t: &Task, which: SigSet) {
         if left.subtract(&blocked).is_empty() {
             continue;
         }
-        // It takes those it does not block
+        // It takes those it does not block, marked and woken under its
+        // Task.sig (Linux retarget_shared_pending: signal_wake_up under
+        // siglock)
         left = left.intersect(&blocked);
         if !u.sigpending() {
-            with_sig(&u, |_, _| ());
+            let s = u.sig.lock();
+            u.set_sigpending(s.has_deliverable_signals());
             signal_wake_task(&u, crate::task::percpu::WakeMode::Interruptible);
+            drop(s);
         }
         if left.is_empty() {
             break;
@@ -1636,16 +1640,18 @@ fn deliver(
     if kill {
         group_kill(table, p, sig);
     }
-    if !core::ptr::eq(Arc::as_ptr(&c), p) {
-        with_sig_send(&c, |_, _| ());
-    }
     use crate::task::percpu::WakeMode;
     let mode = if sig == SIGKILL {
         WakeMode::Fatal
     } else {
         WakeMode::Interruptible
     };
+    // Marked and woken under its Task.sig (Linux complete_signal:
+    // signal_wake_up under siglock)
+    let s = c.sig.lock();
+    c.set_sigpending(s.has_deliverable_signals());
     signal_wake_task(&c, mode);
+    drop(s);
 }
 
 /// Under TASKLIST: the thread of `p`'s group, from its curr_target on,
@@ -1970,17 +1976,18 @@ fn group_signal(
 /// to user mode (a tick or a kick IPI interrupts it:
 /// `entry::exit_to_user_mode`).
 fn zap_threads(table: &crate::task::percpu::GlobalTaskTable, tgid: Pid, except: Option<&Task>) {
-    // The thread list walked under TASKLIST, each thread killed under
-    // its Task.sig, a ptrace stop ended there too (Linux
+    // The thread list walked under TASKLIST, each thread killed and
+    // woken under its Task.sig, a ptrace stop ended there too (Linux
     // zap_other_threads under siglock: no allocation, so it may run
     // where a send does, under a caller's spin lock); a wakeup under
-    // TASKLIST is allowed (it takes only pi_lock and run-queue locks)
+    // them is allowed (it takes only pi_lock and run-queue locks)
     for v in table.threads(tgid) {
         if except.is_some_and(|e| core::ptr::eq(v.task, e)) || !task_live(&v) {
             continue;
         }
-        sigkill_task(v.task);
+        let s = sigkill_task(v.task);
         signal_wake_task(v.task, crate::task::percpu::WakeMode::Fatal);
+        drop(s);
     }
 }
 
@@ -1994,14 +2001,16 @@ pub fn zap_group_others(t: &Task) {
 /// longer reported to its tracer's wait (signal_wake_up_state clears
 /// JOBCTL_TRACED with the signal queued), so a wait after the kill
 /// finds its exit, never the stop; unless its tracer is inside a
-/// request on it (JOBCTL_PTRACE_FROZEN), whose end does that
-fn sigkill_task(t: &Task) {
+/// request on it (JOBCTL_PTRACE_FROZEN), whose end does that. Its
+/// Task.sig comes back held, for the caller's wakeup.
+fn sigkill_task(t: &Task) -> crate::sync::spin::MutexGuard<'_, TaskSignalState> {
     let mut s = t.sig.lock();
     s.pending.add(SIGKILL);
     t.set_sigpending(true);
     if !s.frozen() {
         s.end_trace_stop();
     }
+    s
 }
 
 /// A thread just cloned into `parent`'s group dies with it if the group
@@ -2011,7 +2020,7 @@ fn sigkill_task(t: &Task) {
 pub fn zap_new_thread(parent: &Task, child: &Task) {
     let dying = get_task_signal_struct(parent).is_some_and(|s| s.group_exit() != GroupExit::None);
     if dying && TASKLIST.read().view(child).is_some() {
-        sigkill_task(child);
+        drop(sigkill_task(child));
     }
 }
 

@@ -723,12 +723,7 @@ fn page_from_user(addr: u64, len: u64) -> KernelResult<PipeBuffer> {
     // PAGE_SIZE bytes owned by this buffer, and `n <= PAGE_SIZE`
     let dst = unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), n) };
     copy_from_user(dst, addr, n).map_err(|_| KernelError::BadAddress)?;
-    Ok(PipeBuffer::new(
-        page,
-        0,
-        n as u32,
-        pipe_buf_flags::OWNED,
-    ))
+    Ok(PipeBuffer::new(page, 0, n as u32, pipe_buf_flags::OWNED))
 }
 
 /// sys_sendfile64 - send file data to socket/file

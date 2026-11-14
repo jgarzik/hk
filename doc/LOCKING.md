@@ -3728,13 +3728,15 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    never for an init its protection covers (`Target::protects`). Then,
    still under TASKLIST, a decided group kill is done (`group_kill`,
    `zap_threads`: each thread's `Task.sig` alone, nothing allocated)
-   and the chosen thread's TIF_SIGPENDING is recomputed under its
-   `Task.sig` and it is woken, all in the caller's TASKLIST section
-   (a wakeup takes only pi_lock and run-queue locks). A send changes
+   and the chosen thread's TIF_SIGPENDING is recomputed and it is
+   woken under its `Task.sig` (Linux signal_wake_up under siglock),
+   all in the caller's TASKLIST section (a wakeup takes only pi_lock
+   and run-queue locks, allowed under `Task.sig`). A send changes
    no blocked mask, so it never
    retargets (`with_sig_send`), which would take TASKLIST again. A
    thread that blocks a group signal or starts exiting hands it on
-   the same way after dropping its own lock (retarget_shared_pending).
+   the same way after dropping its own lock, each receiver marked and
+   woken under its own `Task.sig` (retarget_shared_pending).
    A thread that changes its mask between the test and the wakeup
    sees the signal when it recomputes TIF_SIGPENDING.
 
@@ -3854,8 +3856,9 @@ de_thread, exit_group does not.
   zap_other_threads under siglock), queuing SIGKILL in each live
   thread's private pending set under its `Task.sig`, setting its
   TIF_SIGPENDING and ending a ptrace stop there (`sigkill_task`), and
-  waking it (`WakeMode::Fatal`: interruptible and killable sleeps; a
-  wakeup takes only pi_lock and run-queue locks under TASKLIST).
+  waking it in that hold (`WakeMode::Fatal`: interruptible and
+  killable sleeps; Linux signal_wake_up(t, 1) under siglock; a wakeup
+  takes only pi_lock and run-queue locks).
 - A thread cloned into a group whose state is set gets SIGKILL after
   `install_fork_signal` set up its signal state (`zap_new_thread`): the
   state is set before a zap takes TASKLIST, so either the zap saw the
