@@ -6,20 +6,24 @@
 //!   the common fields, Tcp's RFC 2012 constants
 //! - NETSTAT_FORMAT: TcpExt and IpExt row pairs, the common fields
 //! - SNMP_NETNS (in a new network namespace, so no other traffic):
-//!   fresh counters start at zero; a datagram to a closed UDP port
-//!   counts Udp NoPorts and the ICMP port unreachable both ways; a
-//!   received datagram InDatagrams. Deltas are checked with >=, as
-//!   Linux counts some events twice.
+//!   fresh counters start at zero; a loopback TCP connect and close
+//!   moves ActiveOpens, PassiveOpens, CurrEstab (back to 0), InSegs,
+//!   OutSegs, the IP counters and TcpExt TW; an SO_LINGER 0 close
+//!   counts EstabResets, OutRsts and TCPAbortOnData; a refused connect
+//!   AttemptFails; a datagram to a closed UDP port Udp NoPorts and the
+//!   ICMP port unreachable both ways; a received datagram InDatagrams.
+//!   Deltas are checked with >=, as Linux counts some events twice.
 
-use hk_syscall::{CLONE_NEWNET, sys_exit, sys_fork, sys_unshare};
+use hk_syscall::{CLONE_NEWNET, sys_exit, sys_fork, sys_setsockopt, sys_unshare};
 
 use crate::harness::{T, fail_num, pass};
 use crate::helpers::{host_mode, loopback_up, msleep, println, read_file, skip};
 use crate::net::sk::*;
-use crate::net::tcp_xfer::{set_timeo, wait_child};
+use crate::net::tcp_xfer::{accept, listener, set_timeo, wait_child};
 
 const SNMP: &[u8] = b"/proc/net/snmp\0";
 const NETSTAT: &[u8] = b"/proc/net/netstat\0";
+const ECONNREFUSED: i64 = -111;
 
 pub fn run_tests() {
     println(b"=== SNMP Tests ===");
@@ -291,6 +295,9 @@ fn test_snmp_netns() {
         }
         loopback_up();
         netns_fresh();
+        netns_tcp();
+        netns_tcp_reset();
+        netns_tcp_refused();
         netns_udp();
         sys_exit(0);
     }
@@ -326,6 +333,116 @@ fn netns_fresh() {
     }
     t.eq(b"TW", n.val(b"TcpExt", b"TW"), 0);
     t.eq(b"RtoMin", s.val(b"Tcp", b"RtoMin"), 200);
+    t.done();
+}
+
+/// Connect and close over loopback
+fn netns_tcp() {
+    let mut t = T::new(b"SNMP_TCP_LOOPBACK");
+    let Some((a, an)) = snap() else {
+        println(b"SNMP_TCP_LOOPBACK:FAIL read");
+        return;
+    };
+    let (l, p) = listener(4);
+    let c = tcp();
+    set_timeo(c, 10_000);
+    t.eq(b"connect", connect(c, LO, p), 0);
+    set_timeo(l, 10_000);
+    let s = accept(l);
+    t.ok(b"accept", s >= 0, s as i64);
+    set_timeo(s, 10_000);
+    // Both ends established (the passive one once its ACK is in)
+    let Some((b, _)) = settle(|m, _| m.val(b"Tcp", b"CurrEstab") >= 2) else {
+        println(b"SNMP_TCP_LOOPBACK:FAIL read");
+        return;
+    };
+    t.ok(
+        b"CurrEstab open",
+        b.val(b"Tcp", b"CurrEstab") >= 2,
+        b.val(b"Tcp", b"CurrEstab"),
+    );
+    grew(&mut t, &a, &b, b"Tcp", b"ActiveOpens", 1);
+    grew(&mut t, &a, &b, b"Tcp", b"PassiveOpens", 1);
+    grew(&mut t, &a, &b, b"Tcp", b"InSegs", 3);
+    grew(&mut t, &a, &b, b"Tcp", b"OutSegs", 3);
+    grew(&mut t, &a, &b, b"Ip", b"InReceives", 3);
+    grew(&mut t, &a, &b, b"Ip", b"InDelivers", 3);
+    grew(&mut t, &a, &b, b"Ip", b"OutRequests", 3);
+    // The active closer ends in TIME_WAIT once the peer's FIN is in
+    close(c);
+    let mut buf = [0u8; 4];
+    t.eq(b"eof", recv(s, &mut buf, 0), 0);
+    close(s);
+    close(l);
+    let Some((e, en)) = settle(|m, n| {
+        m.val(b"Tcp", b"CurrEstab") == 0 && n.val(b"TcpExt", b"TW") > an.val(b"TcpExt", b"TW")
+    }) else {
+        println(b"SNMP_TCP_LOOPBACK:FAIL read");
+        return;
+    };
+    t.eq(b"CurrEstab closed", e.val(b"Tcp", b"CurrEstab"), 0);
+    grew(&mut t, &an, &en, b"TcpExt", b"TW", 1);
+    grew(&mut t, &a, &e, b"Tcp", b"OutSegs", 6);
+    t.done();
+}
+
+/// An SO_LINGER {1, 0} close resets an established connection
+fn netns_tcp_reset() {
+    let mut t = T::new(b"SNMP_TCP_RESET");
+    let Some((a, an)) = snap() else {
+        println(b"SNMP_TCP_RESET:FAIL read");
+        return;
+    };
+    let (l, p) = listener(4);
+    let c = tcp();
+    set_timeo(c, 10_000);
+    t.eq(b"connect", connect(c, LO, p), 0);
+    set_timeo(l, 10_000);
+    let s = accept(l);
+    let lg = [1i32, 0];
+    t.eq(
+        b"linger",
+        sys_setsockopt(s, SOL_SOCKET, SO_LINGER, lg.as_ptr() as *const u8, 8),
+        0,
+    );
+    close(s);
+    let mut buf = [0u8; 4];
+    t.ok(b"reset", recv(c, &mut buf, 0) < 0, 0);
+    close(c);
+    close(l);
+    let Some((b, bn)) = settle(|m, _| m.val(b"Tcp", b"CurrEstab") == 0) else {
+        println(b"SNMP_TCP_RESET:FAIL read");
+        return;
+    };
+    t.eq(b"CurrEstab", b.val(b"Tcp", b"CurrEstab"), 0);
+    grew(&mut t, &a, &b, b"Tcp", b"EstabResets", 1);
+    grew(&mut t, &a, &b, b"Tcp", b"OutRsts", 1);
+    grew(&mut t, &an, &bn, b"TcpExt", b"TCPAbortOnData", 1);
+    t.done();
+}
+
+/// A connect to a port nobody listens on is refused by a RST
+fn netns_tcp_refused() {
+    let mut t = T::new(b"SNMP_TCP_REFUSED");
+    let Some((a, _)) = snap() else {
+        println(b"SNMP_TCP_REFUSED:FAIL read");
+        return;
+    };
+    let x = tcp();
+    bind(x, LO, 0);
+    let p = port(x);
+    close(x);
+    let c = tcp();
+    set_timeo(c, 10_000);
+    t.eq(b"connect", connect(c, LO, p), ECONNREFUSED);
+    close(c);
+    let Some((b, _)) = snap() else {
+        println(b"SNMP_TCP_REFUSED:FAIL read");
+        return;
+    };
+    grew(&mut t, &a, &b, b"Tcp", b"ActiveOpens", 1);
+    grew(&mut t, &a, &b, b"Tcp", b"AttemptFails", 1);
+    grew(&mut t, &a, &b, b"Tcp", b"OutRsts", 1);
     t.done();
 }
 

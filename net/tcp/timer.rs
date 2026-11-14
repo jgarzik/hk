@@ -30,6 +30,7 @@ use super::cb::{
     ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TIMEWAIT_LEN, TcpCb, TcpState, Tmr,
 };
 use super::output::Push;
+use crate::net::mib::*;
 use crate::util::error::KernelError;
 
 impl TcpCb {
@@ -105,10 +106,18 @@ impl TcpCb {
         count >= self.retries()
     }
 
-    /// Give up: the last soft (ICMP) error, else ETIMEDOUT
+    /// Give up: the last soft (ICMP) error, else ETIMEDOUT (Linux
+    /// tcp_write_err; a listener's child is a request sock, dropped
+    /// uncounted by its timer, reqsk_timer_handler)
     fn timed_out(&mut self, out: &mut Out) {
         let e = self.soft_err.take().unwrap_or(KernelError::TimedOut);
+        if self.passive && self.state == TcpState::SynReceived {
+            out.err = Some(e);
+            self.set_closed(out);
+            return;
+        }
         self.fail(e, out);
+        self.net_stat(LINUX_MIB_TCPABORTONTIMEOUT);
     }
 
     /// A deadline passed (call at or after `next_timer()`)
@@ -151,6 +160,8 @@ impl TcpCb {
         if !handshake && self.snd_una == self.snd_max {
             return;
         }
+        // Linux tcp_retransmit_timer / tcp_syn_ack_timeout
+        self.net_stat(LINUX_MIB_TCPTIMEOUTS);
         if self.rtx_stamp.is_none() {
             // The head went out about one (backed-off) RTO ago
             self.rtx_stamp = Some(now.saturating_sub(self.rto_cur()));
@@ -173,7 +184,7 @@ impl TcpCb {
         if handshake {
             self.syn_rtx = true;
             self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
-            self.syn_seg(out);
+            self.syn_rtx(out);
         } else {
             self.snd_nxt = self.snd_una;
             self.output(now, out);
@@ -187,7 +198,7 @@ impl TcpCb {
     pub(super) fn rtx_synack(&mut self, now: u64, out: &mut Out) {
         self.syn_rtx = true;
         self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
-        self.syn_seg(out);
+        self.syn_rtx(out);
         self.arm_rtx(now);
     }
 
@@ -207,6 +218,7 @@ impl TcpCb {
         } else {
             self.set_closed(out);
         }
+        self.net_stat(LINUX_MIB_TCPABORTONMEMORY);
         true
     }
 
@@ -233,7 +245,7 @@ impl TcpCb {
         if self.out_of_resources(now, true, out) {
             return;
         }
-        self.send_probe(out);
+        self.send_probe(LINUX_MIB_TCPWINPROBE, out);
         self.backoff += 1;
         let mut t = self.rto_cur().max(RTO_MIN);
         if let Some(left) = self.user_left(now) {
@@ -308,11 +320,13 @@ impl TcpCb {
             if (ut != 0 && idle >= ut && self.probes > 0)
                 || (ut == 0 && self.probes >= self.keep_cnt())
             {
+                // Linux tcp_keepalive_timer -> tcp_write_err
                 self.abort(out);
                 out.err = Some(self.soft_err.take().unwrap_or(KernelError::TimedOut));
+                self.net_stat(LINUX_MIB_TCPABORTONTIMEOUT);
                 return;
             }
-            self.send_probe(out);
+            self.send_probe(LINUX_MIB_TCPKEEPALIVE, out);
             self.probes += 1;
             self.keep_intvl()
         } else {

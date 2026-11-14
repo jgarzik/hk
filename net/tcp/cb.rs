@@ -28,11 +28,13 @@
 //! and the user timeout in `time/timer.rs`.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 use super::ack::Dack;
 use super::cong::Cong;
 use super::mem;
 use crate::mm::page_alloc::Gfp;
+use crate::net::mib::*;
 use crate::net::skb::{SkBuff, SkbHead, SkbTree};
 use crate::util::error::KernelError;
 
@@ -748,6 +750,9 @@ pub struct TcpCb {
     pub(super) stats: Stats,
     /// Quanta held in the global TCP memory; counts the socket too
     held: mem::Held,
+    /// The namespace's MIBs, counted in as Linux counts in
+    /// sock_net(sk)->mib (None: not counted, unit tests)
+    pub mib: Option<Arc<NetMib>>,
 }
 
 /// Counters for TCP_INFO; the u32 ones wrap, as Linux tcp_info's
@@ -821,8 +826,11 @@ impl TcpCb {
             0
         };
         self.ts_ok = self.cfg.ts != 0;
-        self.state = TcpState::SynSent;
-        self.syn_seg(out);
+        self.set_state(TcpState::SynSent);
+        if self.syn_seg(out) {
+            self.tcp_stat(TCP_MIB_OUTSEGS);
+        }
+        self.tcp_stat(TCP_MIB_ACTIVEOPENS);
         self.arm_rtx(now);
     }
 
@@ -835,9 +843,11 @@ impl TcpCb {
         self.wscale_ok = self.cfg.wscale && syn.ws.is_some();
         self.ts_ok = self.cfg.ts != 0 && syn.ts.is_some();
         self.syn_rcvd(syn, now);
-        self.state = TcpState::SynReceived;
+        self.set_state(TcpState::SynReceived);
         self.passive = true;
-        self.syn_seg(out);
+        if self.syn_seg(out) {
+            self.tcp_stat(TCP_MIB_OUTSEGS);
+        }
         self.arm_rtx(now);
     }
 
@@ -1218,7 +1228,7 @@ impl TcpCb {
             TcpState::CloseWait => TcpState::LastAck,
             _ => return false,
         };
-        self.state = next;
+        self.set_state(next);
         self.fin_queued = true;
         self.output(now, out);
         true
@@ -1238,10 +1248,14 @@ impl TcpCb {
             TcpState::Listen | TcpState::SynSent | TcpState::Closed => self.set_closed(out),
             TcpState::TimeWait => {}
             _ if unread => {
+                self.net_stat(LINUX_MIB_TCPABORTONCLOSE);
                 self.send_reset(out);
                 self.set_closed(out);
             }
-            _ if linger0 => self.disconnect(out),
+            _ if linger0 => {
+                self.disconnect(out);
+                self.net_stat(LINUX_MIB_TCPABORTONDATA);
+            }
             TcpState::SynReceived => self.abort(out),
             _ => {
                 self.shutdown_wr(now, out);
@@ -1261,14 +1275,28 @@ impl TcpCb {
         self.set_closed(out);
     }
 
-    /// RST to the peer (Linux tcp_send_active_reset)
+    /// RST to the peer (Linux tcp_send_active_reset: counted before
+    /// the buffer is allocated)
     fn send_reset(&self, out: &mut Out) {
-        out.ctl(Seg {
+        self.tcp_stat(TCP_MIB_OUTRSTS);
+        let sent = out.ctl(Seg {
             seq: self.snd_max,
             ack: self.rcv_nxt,
             flags: flags::RST | flags::ACK,
             ..Default::default()
         });
+        self.tcp_stat_if(sent, TCP_MIB_OUTSEGS);
+        if !sent {
+            self.net_stat(LINUX_MIB_TCPABORTFAILED);
+        }
+    }
+
+    /// The RST `r` answering a received segment (Linux tcp_v4_send_reset from
+    /// tcp_v4_do_rcv or a request's send_reset)
+    pub(super) fn reset_seg(&self, r: Seg, out: &mut Out) {
+        out.ctl(r);
+        self.tcp_stat(TCP_MIB_OUTSEGS);
+        self.tcp_stat(TCP_MIB_OUTRSTS);
     }
 
     /// Linux tcp_disconnect's abort: CLOSED, RST to a synchronized peer
@@ -1311,15 +1339,30 @@ impl TcpCb {
         }
     }
 
-    /// Fail the connection with `err` (timeout, ICMP hard error)
+    /// Fail the connection with `err` (timeout, ICMP hard error, RST;
+    /// Linux tcp_done_with_error)
     pub fn fail(&mut self, err: KernelError, out: &mut Out) {
         out.err = Some(err);
+        self.done(out);
+    }
+
+    /// Linux tcp_done: a connection still opening is a failed attempt
+    /// (a listener's child is Linux's request sock, counted where its
+    /// RST or SYN arrives, tcp_check_req), then CLOSED
+    fn done(&mut self, out: &mut Out) {
+        let opening = match self.state {
+            TcpState::SynSent => true,
+            TcpState::SynReceived => !self.passive,
+            _ => false,
+        };
+        self.tcp_stat_if(opening, TCP_MIB_ATTEMPTFAILS);
         self.set_closed(out);
     }
 
-    /// Enter CLOSED (Linux tcp_done): queues and timers go, everyone wakes
+    /// Enter CLOSED (Linux tcp_set_state(TCP_CLOSE) and the cleanup of
+    /// tcp_done): queues and timers go, everyone wakes
     pub fn set_closed(&mut self, out: &mut Out) {
-        self.state = TcpState::Closed;
+        self.set_state(TcpState::Closed);
         self.purge_wq();
         self.ooo = Ooo::default();
         self.stop_timers();
@@ -1331,7 +1374,7 @@ impl TcpCb {
 
     /// Entering TIME_WAIT (2MSL); the glue hands it to a timewait entry
     pub(super) fn time_wait(&mut self, now: u64, out: &mut Out) {
-        self.state = TcpState::TimeWait;
+        self.set_state(TcpState::TimeWait);
         self.stop_timers();
         self.purge_wq();
         self.mem_settle();
@@ -1349,10 +1392,58 @@ impl TcpCb {
     /// The socket's side after handing TIME_WAIT over: CLOSED, readable
     /// data kept
     pub fn tw_done(&mut self, out: &mut Out) {
-        self.state = TcpState::Closed;
+        self.set_state(TcpState::Closed);
         self.stop_timers();
         out.shut |= SHUTDOWN_MASK;
         out.wake |= wake::STATE;
+    }
+
+    /// Change state (Linux tcp_set_state): CurrEstab counts
+    /// connections in ESTABLISHED or CLOSE_WAIT; a reset of one of them
+    /// is an EstabReset
+    pub(super) fn set_state(&mut self, state: TcpState) {
+        use TcpState::{CloseWait, Closed, Established, SynReceived};
+        let old = self.state;
+        let was = matches!(old, Established | CloseWait);
+        match state {
+            Established => self.tcp_stat_if(old != Established, TCP_MIB_CURRESTAB),
+            CloseWait => self.tcp_stat_if(old == SynReceived, TCP_MIB_CURRESTAB),
+            _ => {
+                self.tcp_stat_if(state == Closed && was, TCP_MIB_ESTABRESETS);
+                if was && let Some(m) = &self.mib {
+                    m.tcp.dec(TCP_MIB_CURRESTAB);
+                }
+            }
+        }
+        self.state = state;
+    }
+
+    /// Linux TCP_INC_STATS
+    pub(super) fn tcp_stat(&self, f: usize) {
+        if let Some(m) = &self.mib {
+            m.tcp.inc(f);
+        }
+    }
+
+    /// TCP_INC_STATS when `cond`
+    pub(super) fn tcp_stat_if(&self, cond: bool, f: usize) {
+        if cond {
+            self.tcp_stat(f);
+        }
+    }
+
+    /// Linux NET_INC_STATS (TcpExt)
+    pub(super) fn net_stat(&self, f: usize) {
+        if let Some(m) = &self.mib {
+            m.net.inc(f);
+        }
+    }
+
+    /// NET_INC_STATS when `cond`
+    pub(super) fn net_stat_if(&self, cond: bool, f: usize) {
+        if cond {
+            self.net_stat(f);
+        }
     }
 
     /// Orphan in FIN_WAIT_2: give up after tcp_fin_timeout
