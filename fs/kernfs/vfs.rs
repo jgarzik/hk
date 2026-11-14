@@ -111,6 +111,11 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<Arc<Inode>, Kernel
 pub struct KernfsIops;
 
 impl InodeOps for KernfsIops {
+    /// A mount point directory (Linux KERNFS_EMPTY_DIR)
+    fn is_empty_dir(&self, inode: &Inode) -> bool {
+        knode(inode).is_some_and(|k| k.empty)
+    }
+
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         let d = knode(dir).ok_or(KernelError::Io)?;
         let kn = d.find_ns(name, sb_ns(dir)).ok_or(KernelError::NotFound)?;

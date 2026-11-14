@@ -2419,7 +2419,8 @@ fn procfs_mount(
 /// Procfs filesystem type
 pub static PROCFS_TYPE: FileSystemType = FileSystemType {
     name: "proc",
-    fs_flags: super::superblock::fs_flags::FS_PSEUDO,
+    fs_flags: super::superblock::fs_flags::FS_PSEUDO
+        | super::superblock::fs_flags::FS_USERNS_MOUNT_RESTRICTED,
     mount: procfs_mount,
     mount_dev: None, // Procfs doesn't use a backing device
     file_ops: &PROCFS_FILE_OPS,

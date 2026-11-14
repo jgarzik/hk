@@ -1285,6 +1285,73 @@ pub fn attach(
     Ok(mount)
 }
 
+/// A new mount of `sb` with flags `mnt_flags` would show more than the
+/// caller's mount namespace, owned by another user namespace than the
+/// initial one, already shows (Linux mount_too_revealing): for procfs
+/// and sysfs, unless a mount of the same type there is fully visible
+/// (`mnt_already_visible`), whose locked flags the new mount then takes
+pub fn mount_too_revealing(sb: &SuperBlock, mnt_flags: &mut u32) -> bool {
+    let ns = crate::ns::current_mnt_ns();
+    if Arc::ptr_eq(&ns.user_ns, &crate::ns::INIT_USER_NS) {
+        return false;
+    }
+    if sb.fs_type.fs_flags & super::superblock::fs_flags::FS_USERNS_MOUNT_RESTRICTED == 0 {
+        return false;
+    }
+    !mnt_already_visible(&ns, sb, mnt_flags)
+}
+
+/// A mount of `sb`'s type in `ns` shows its whole filesystem (Linux
+/// mnt_already_visible): rooted at the filesystem's root, no more
+/// restrictive than `new` in its locked read-only and atime flags, and
+/// no locked submount covering anything but a permanently empty
+/// directory; `new` takes its locked flags. Under NAMESPACE_SEM read.
+fn mnt_already_visible(ns: &crate::ns::MntNamespace, sb: &SuperBlock, new: &mut u32) -> bool {
+    let Some(root) = ns.get_root() else {
+        return false;
+    };
+    let g = namespace_read();
+    let flags = *new;
+    let found = walk(&root, &*g).find_map(|m| {
+        if !core::ptr::eq(m.sb.fs_type, sb.fs_type) {
+            return None;
+        }
+        if !m
+            .sb
+            .get_root()
+            .is_some_and(|r| DentryRef::ptr_eq(&r, &m.root))
+        {
+            return None;
+        }
+        let mut mf = m.flags();
+        // Read-only hidden in the superblock flags
+        if m.sb.rdonly() {
+            mf |= MNT_LOCK_READONLY;
+        }
+        if mf & MNT_LOCK_READONLY != 0 && flags & MNT_READONLY == 0 {
+            return None;
+        }
+        if mf & MNT_LOCK_ATIME != 0 && mf & MNT_ATIME_MASK != flags & MNT_ATIME_MASK {
+            return None;
+        }
+        let hides = m.kids(&*g).any(|c| {
+            c.flags() & MNT_LOCKED != 0
+                && !c
+                    .get_mountpoint(&*g)
+                    .and_then(|d| d.get_inode())
+                    .is_some_and(|i| i.i_op.is_empty_dir(&i))
+        });
+        (!hides).then_some(mf & (MNT_LOCK_READONLY | MNT_LOCK_ATIME))
+    });
+    match found {
+        Some(locks) => {
+            *new |= locks;
+            true
+        }
+        None => false,
+    }
+}
+
 /// `m` is in the caller's mount namespace (Linux check_mnt); under
 /// NAMESPACE_SEM, or an optimistic early check as Linux's
 pub fn check_mnt(m: &Mount) -> bool {

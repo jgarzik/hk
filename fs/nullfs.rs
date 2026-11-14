@@ -66,6 +66,10 @@ impl InodeOps for NullfsInodeOps {
         Err(KernelError::NotFound)
     }
 
+    fn is_empty_dir(&self, _inode: &Inode) -> bool {
+        true
+    }
+
     /// S_IMMUTABLE: no write access (Linux inode_permission: EPERM)
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
         if mask & MAY_WRITE != 0 {

@@ -361,8 +361,6 @@ Safe today only because a user namespace grants no capabilities. First:
   `capable`, where Linux keeps it); sockopt_ns_capable sites take the
   socket netns's user_ns, but SO_DEBUG and SO_SNDBUFFORCE/RCVBUFFORCE
   stay init-namespace (Linux sockopt_capable).
-- a new proc or sysfs mount in a namespace of another user namespace
-  needs a fully visible one there (mount_too_revealing).
 - netlink newlink/setlink check CAP_NET_ADMIN in the target netns too
   once IFLA_NET_NS_PID/FD are implemented (`7b735ef81286`).
 - creating a namespace together with CLONE_NEWUSER checks capabilities

@@ -234,6 +234,11 @@ pub mod fs_flags {
     pub const FS_PSEUDO: u32 = 1;
     /// Filesystem requires a backing block device
     pub const FS_REQUIRES_DEV: u32 = 2;
+    /// A bit with the kind above: a new mount in a mount namespace of
+    /// another user namespace needs one already fully visible there
+    /// (Linux FS_USERNS_MOUNT_RESTRICTED, SB_I_USERNS_VISIBLE): procfs
+    /// and sysfs
+    pub const FS_USERNS_MOUNT_RESTRICTED: u32 = 0x100;
 }
 
 /// Global counter for unique device IDs per superblock

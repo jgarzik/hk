@@ -92,7 +92,7 @@ fn mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, Ke
 
 pub static SYSFS_TYPE: FileSystemType = FileSystemType {
     name: "sysfs",
-    fs_flags: fs_flags::FS_PSEUDO,
+    fs_flags: fs_flags::FS_PSEUDO | fs_flags::FS_USERNS_MOUNT_RESTRICTED,
     mount,
     mount_dev: None,
     file_ops: &kernfs::vfs::KERNFS_FOPS,
@@ -108,8 +108,8 @@ pub fn init() {
     crate::fs::superblock::register_filesystem(&SYSFS_TYPE).expect("sysfs type");
 }
 
-/// An empty directory something else mounts on (Linux
+/// A permanently empty directory something else mounts on (Linux
 /// sysfs_create_mount_point)
 pub fn mount_point(parent: &Arc<KNode>, name: &[u8]) {
-    let _ = parent.create_dir(name, 0o755);
+    let _ = parent.create_empty_dir(name);
 }

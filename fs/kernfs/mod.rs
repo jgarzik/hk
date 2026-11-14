@@ -203,6 +203,9 @@ pub struct KNode {
     /// Namespace tag (0: untagged, visible in every mount)
     pub ns: u64,
     pub kind: Kind,
+    /// A permanently empty directory, something mounts on (Linux
+    /// KERNFS_EMPTY_DIR): nothing is added under it
+    pub empty: bool,
     /// In-flight operations, plus `DEACTIVATED` once removal starts
     active: AtomicI32,
     /// Removal waits here for `active` to drain
@@ -256,6 +259,7 @@ impl KNode {
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
             ns,
             kind,
+            empty: false,
             active: AtomicI32::new(0),
             drain: WaitQueue::new(),
             iattr: crate::sync::spin::Mutex::new(None),
@@ -367,6 +371,9 @@ impl KNode {
         if self.removed() {
             return Err(KernelError::NotFound);
         }
+        if self.empty {
+            return Err(KernelError::InvalidArgument);
+        }
         let c = self.children().ok_or(KernelError::NotDirectory)?;
         let k = key(&child.name, child.ns);
         let mut map = c.write();
@@ -381,6 +388,15 @@ impl KNode {
     /// New directory `name` (EEXIST if taken)
     pub fn create_dir(self: &Arc<Self>, name: &[u8], mode: u16) -> Result<Arc<KNode>, KernelError> {
         self.create_dir_ns(name, mode, 0)
+    }
+
+    /// New permanently empty directory `name`, r-x for all (Linux
+    /// kernfs_create_empty_dir)
+    pub fn create_empty_dir(self: &Arc<Self>, name: &[u8]) -> Result<Arc<KNode>, KernelError> {
+        let kind = Kind::Dir(RwSem::new(BTreeMap::new()));
+        let mut kn = Self::new(name, 0o555, kind);
+        kn.empty = true;
+        self.add(try_arc(kn)?)
     }
 
     /// New directory `name` tagged with namespace `ns`

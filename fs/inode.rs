@@ -175,6 +175,13 @@ pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError>;
 
+    /// A directory that is permanently empty (Linux is_empty_dir_inode:
+    /// make_empty_dir_inode's operations), so a mount on it hides
+    /// nothing. Default no.
+    fn is_empty_dir(&self, _inode: &Inode) -> bool {
+        false
+    }
+
     /// A cached dentry of this inode is still good for the walk (Linux
     /// d_revalidate): false drops it and the walk looks the name up
     /// again. Default yes; procfs says no once its task or fd is gone.

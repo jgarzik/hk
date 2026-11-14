@@ -541,7 +541,8 @@ VFS locks (detailed order):
         ↓
     mount::NAMESPACE_SEM (sync::RwSem; Linux namespace_sem: write for
                    attach, umount, namespace copy; read for /proc mount
-                   lists and is_local_mountpoint)
+                   lists, is_local_mountpoint and a new mount's
+                   mnt_already_visible, taken there with nothing held)
         → ns::MNT_NS_TREE (spin leaf; Linux mnt_ns_tree_lock: a mount
                    namespace added once made, removed at its end;
                    graft's owner check under NAMESPACE_SEM)
