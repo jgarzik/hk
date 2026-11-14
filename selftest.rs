@@ -221,6 +221,9 @@ fn selftest_thread(_arg: usize) {
     check("kalloc_arc_reserve", crate::util::kalloc::selftest(), 0);
     // 6c. RCU: a replaced version is released after a grace period
     check("rcu_grace_period", crate::sync::rcu::selftest(), 0);
+    // 6d. An ArcTimer owner released in rcuc/N while its callback runs
+    //     goes without waiting for it
+    check("arc_timer_rcu_put", crate::time::timer::selftest(), 0);
 
     // 7. Cross-CPU calls from every CPU at once: none lost, no deadlock
     if let Err((what, n)) = ipi_stress() {
