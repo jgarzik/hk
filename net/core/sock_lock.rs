@@ -38,7 +38,7 @@ use crate::util::scope::ScopeGuard;
 /// What a protocol does when its socket is released
 pub trait SockHooks<T> {
     /// An skb that waited in the backlog (Linux sk_backlog_rcv); the
-    /// socket is owned, no spin lock held
+    /// socket is owned, `slock` dropped
     fn backlog_rcv(&self, t: &mut T, skb: Box<SkBuff>);
     /// Work deferred while owned, `flags` (Linux sk_prot->release_cb;
     /// called on every release, also with no flags); owned, under
