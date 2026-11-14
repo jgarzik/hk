@@ -267,7 +267,7 @@ fn enable_char<'a>(events: impl Iterator<Item = &'a TraceEvent>) -> u8 {
     for ev in events {
         set |= if ev.enabled() { 2 } else { 1 };
     }
-    [b'0', b'0', b'1', b'X'][usize::from(set)]
+    b"001X"[usize::from(set)]
 }
 
 /// events/<system>/<event>/enable (Linux event_enable_fops)
