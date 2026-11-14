@@ -612,7 +612,7 @@ fn copy_prop(ns: &mut NsTree, copy: &MountRef, ty: u32) -> MountRef {
 /// (such a copy stays)
 pub fn propagate_umount(ns: &NsTree, m: &MountRef) -> Vec<MountRef> {
     let mut out = Vec::new();
-    let (Some(parent), Some(mp)) = (m.parent_in(ns), m.get_mountpoint()) else {
+    let (Some(parent), Some(mp)) = (m.parent_in(ns), m.get_mountpoint(ns)) else {
         return out;
     };
     let p = core::ptr::from_ref(parent);

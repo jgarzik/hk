@@ -126,7 +126,15 @@ impl MountRef {
     /// decided under MOUNT_LOCK, where a mount is doomed
     pub fn try_get(w: &Weak<Mount>) -> Option<Self> {
         let a = w.upgrade()?;
-        let p = NonNull::from(a.as_ref());
+        Self::try_get_mnt(&a)
+        // `a` dropped: never the last strong count while a reference is
+        // held; after the teardown, only memory goes
+    }
+
+    /// [`MountRef::try_get`] for a mount whose memory the caller's lock
+    /// keeps (Linux legitimize_mnt on mnt_parent under namespace_sem)
+    pub fn try_get_mnt(a: &Mount) -> Option<Self> {
+        let p = NonNull::from(a);
         if have_cpu() {
             let _g = crate::sync::rcu::read_lock();
             // In a namespace: taking it out clears `mnt_ns` and puts the
@@ -145,8 +153,6 @@ impl MountRef {
         }
         a.pcp_add(1);
         Some(Self(p))
-        // `a` dropped: never the last strong count while a reference is
-        // held; after the teardown, only memory goes
     }
 
     /// A reference to `m`, reached under an RCU read guard with

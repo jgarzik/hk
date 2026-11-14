@@ -132,7 +132,7 @@ fn show_mountinfo_of(vis: &Vis<'_>) -> Vec<u8> {
     let mut out = Vec::with_capacity(vis.mnts.len() * MOUNTINFO_LINE);
     for (m, mp) in vis.mnts.iter().cloned() {
         // The namespace root's parent is itself (Linux: its mnt_parent)
-        let parent = m.get_parent().map_or(m.mnt_id, |p| p.mnt_id);
+        let parent = m.parent_in(vis.ns).map_or(m.mnt_id, |p| p.mnt_id);
         let dev = m.sb.dev_id;
         let mut head = alloc::string::String::new();
         let _ = write!(
