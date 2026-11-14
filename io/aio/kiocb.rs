@@ -4,13 +4,16 @@
 //! submitter's, given up when io_submit is done with it, and its
 //! completion's, given up when the operation ends (a bio's end_io,
 //! possibly in hardirq; the fsync or poll work item; at once for one
-//! that completed within io_submit). The last of the two posts the
-//! event (`Kioctx::complete`, Linux aio_complete). The request itself
+//! that completed within io_submit). Each is an `Arc` that its `put`
+//! consumes, and the two counts decide the request's life as Linux's
+//! one does: an earlier put leaves its `Arc` to the last one, which
+//! posts the event (`Kioctx::complete`, Linux aio_complete) and
+//! releases the request (Linux iocb_destroy) holding both. No other
+//! holder of an `Arc` drops it outside thread context, so the request
 //! (its pins, dirtied as they are unpinned under page locks; its file;
-//! its eventfd) is then released in thread context: by the dropper
-//! itself in thread context, else through the context's `reap` list
-//! (Linux iocb_destroy, with bio_dirty_work and delayed_fput doing the
-//! thread work of an interrupt-time end).
+//! its eventfd) is released in thread context: by a last put there,
+//! else through the context's `reap` list (Linux bio_dirty_work and
+//! delayed_fput doing the thread work of an interrupt-time end).
 
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -162,29 +165,36 @@ impl Kiocb {
         }
     }
 
-    /// Give up one of its two references (Linux iocb_put): the last
-    /// posts the event; true then
-    fn put(&self) -> bool {
+    /// Give up one of its two references (Linux iocb_put), `self`
+    /// being its `Arc`: the last posts the event and returns the
+    /// request, holding both references' counts, for the caller to
+    /// release; an earlier one gives its count over to the last and
+    /// touches the request no more, as it may be gone at once
+    fn put(self: Arc<Self>) -> Option<Arc<Self>> {
         if self.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
-            return false;
+            // Released by the last put, with its own
+            core::mem::forget(self);
+            return None;
         }
+        // SAFETY: the other reference's put forgot its `Arc` (above),
+        // leaving its count to this one, which this `Arc` outlives
+        unsafe { Arc::decrement_strong_count(Arc::as_ptr(&self)) };
         self.ctx().complete(self.event(), self.eventfd.as_deref());
-        true
+        Some(self)
     }
 
-    /// `put` in thread context: a release here is harmless
+    /// `put` in thread context: the request, if released, goes here
     pub fn put_thread(self: Arc<Self>) {
-        self.put();
+        drop(self.put());
     }
 
-    /// `put` in any context, hardirq included: once the event is posted
-    /// the request goes to its context's reap list for release in
-    /// thread context; otherwise the other reference's holder still has
-    /// an `Arc` (it puts after this), so this one is not the last
+    /// `put` in any context, hardirq included: the request, if
+    /// released, goes to its context's reap list for release in thread
+    /// context (an earlier put leaves nothing behind to release)
     pub fn put_any(self: Arc<Self>) {
-        if self.put() {
-            let ctx = self.ctx().clone();
-            ctx.defer(self);
+        if let Some(k) = self.put() {
+            let ctx = k.ctx().clone();
+            ctx.defer(k);
         }
     }
 
@@ -207,8 +217,8 @@ impl Kiocb {
 // SAFETY: the pieces are the request's own pins (`Op::Rw`), unchanged
 // while it lives; `complete` stores an atomic, writes the ring and
 // wakes under IrqSpinlocks (`Kioctx::complete`), and either queues the
-// request for release in thread context or drops an `Arc` that is not
-// the last (`put_any`): nothing it does sleeps or allocates
+// request for release in thread context or gives its `Arc` over to the
+// submitter's put (`put_any`): nothing it does sleeps or allocates
 unsafe impl AsyncIo for Kiocb {
     fn segs(&self) -> &[PageSeg] {
         match &self.op {
