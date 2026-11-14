@@ -302,8 +302,10 @@ pub(crate) fn kmain() -> ! {
 
     // Linux vfs_caches_init: dcache_init (the dentry hash table, sized
     // to RAM), files_init (the files' delayed release), then mnt_init
+    // (the mounts' delayed teardown here; the tree below)
     fs::dentry::dcache_init(FRAME_ALLOCATOR.stats().total_bytes / 4096);
     fs::file::files_init();
+    fs::mntput::mnt_init();
     // Linux order: mnt_init (start_kernel), then do_basic_setup:
     // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
     // (chr_dev_init), then device initcalls (bus probes below)

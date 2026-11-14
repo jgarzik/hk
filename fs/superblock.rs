@@ -288,7 +288,7 @@ pub(super) fn unhold_writers(w: &AtomicU64) {
 pub struct WriteAccess {
     sb: Option<Arc<SuperBlock>>,
     /// The mount's write access too (Linux mnt_want_write on a path)
-    mnt: Option<Arc<super::mount::Mount>>,
+    mnt: Option<super::mount::MountRef>,
 }
 
 impl WriteAccess {
@@ -301,7 +301,7 @@ impl WriteAccess {
     }
 
     /// `mnt`'s write count (taken by the caller)
-    pub(super) fn mnt(mnt: Arc<super::mount::Mount>) -> Self {
+    pub(super) fn mnt(mnt: super::mount::MountRef) -> Self {
         Self {
             sb: None,
             mnt: Some(mnt),
@@ -660,7 +660,9 @@ impl SuperBlock {
 
     /// Some mount of it is alive
     pub fn is_mounted(&self) -> bool {
-        self.s_mounts.lock().iter().any(|e| e.is_live())
+        // A mount whose last reference went may wait for its teardown,
+        // still on the list: not mounted
+        self.s_mounts.lock().iter().any(|e| e.get().is_live())
     }
 
     /// Make the file system read-only (Linux sb_prepare_remount_readonly,

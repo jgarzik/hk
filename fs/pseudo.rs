@@ -20,7 +20,7 @@ use super::KernelError;
 use super::dentry::Dentry;
 use super::file::{File, FileOps};
 use super::inode::{Inode, InodeMode, NULL_INODE_OPS};
-use super::mount::{MNT_NODEV, MNT_NOEXEC, Mount};
+use super::mount::{MNT_NODEV, MNT_NOEXEC, Mount, MountRef};
 use super::path_ref::Path;
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
 use crate::util::kalloc::try_arc;
@@ -36,7 +36,7 @@ const BDEVFS_MAGIC: u64 = 0x6264_6576;
 pub struct Pseudo {
     ty: FileSystemType,
     ops: PseudoSuperOps,
-    mnt: spin::Once<Arc<Mount>>,
+    mnt: spin::Once<MountRef>,
 }
 
 struct PseudoSuperOps {
@@ -147,13 +147,15 @@ impl Pseudo {
         let sb = (self.ty.mount)(&self.ty, b"")?;
         let root = sb.get_root().ok_or(KernelError::Io)?;
         let name = self.ty.name.as_bytes().into();
-        let m = Mount::new(sb, root, MNT_NOEXEC | MNT_NODEV, name)?;
+        let m = Mount::alloc(sb, root, MNT_NOEXEC | MNT_NODEV, name)?;
+        // A kernel mount (Linux kern_mount)
+        m.set_internal();
         self.mnt.call_once(|| m);
         Ok(())
     }
 
     /// Its mount (ENODEV before boot made it)
-    pub fn mnt(&self) -> Result<Arc<Mount>, KernelError> {
+    pub fn mnt(&self) -> Result<MountRef, KernelError> {
         self.mnt.get().cloned().ok_or(KernelError::NoDevice)
     }
 

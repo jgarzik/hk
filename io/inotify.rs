@@ -533,8 +533,6 @@ pub struct Inotify {
     /// Serializes adding watches (Linux group->mark_mutex; sleeping,
     /// taken before every other inotify lock)
     mark_mutex: crate::sync::Mutex<()>,
-    /// Its SIGIO work for events queued where kill_fasync cannot sleep
-    sigio: Arc<crate::sync::IrqSpinlock<crate::task::workqueue::Work>>,
 }
 
 /// Global cookie counter for rename event pairing
@@ -543,26 +541,13 @@ static NEXT_RENAME_COOKIE: AtomicI32 = AtomicI32::new(1);
 impl Inotify {
     /// Create a new inotify instance
     pub fn new() -> Result<Arc<Self>, KernelError> {
-        use crate::task::workqueue::Work;
-        // The SIGIO work item, made now so a removal under a spin lock
-        // allocates nothing; it finds the group through `me`
-        let me: Arc<spin::Once<Weak<Inotify>>> = try_arc(spin::Once::new())?;
-        let found = me.clone();
-        let sigio = try_arc(crate::sync::IrqSpinlock::new(Work::new(move || {
-            if let Some(g) = found.get().and_then(Weak::upgrade) {
-                kill_fasync(&g.fasync, crate::signal::SIGIO, POLL_IN);
-            }
-        })))?;
-        let g = try_arc(Self {
+        try_arc(Self {
             inner: IrqSpinlock::new(InotifyInner::new()),
             uid: crate::task::percpu::current_cred().euid,
             wait_queue: WaitQueue::new(),
             fasync: FasyncList::new(),
             mark_mutex: crate::sync::Mutex::new(()),
-            sigio,
-        })?;
-        me.call_once(|| Arc::downgrade(&g));
-        Ok(g)
+        })
     }
 
     /// Add a watch on `path`'s inode, which it holds; its mark goes on
@@ -635,8 +620,8 @@ impl Inotify {
 
     /// Watch `wd` on `inode` gets `mask` (if it asks for it, or it is
     /// IN_UNMOUNT) with `isdir`, then IN_IGNORED, and goes; its inode is
-    /// released with the group's lock dropped. SIGIO waits for a worker:
-    /// the caller may hold spin locks.
+    /// released with the group's lock dropped. SIGIO is sent there too
+    /// (`kill_fasync`, safe under the caller's spin locks).
     fn destroy_watch(self: &Arc<Self>, wd: i32, inode: &Inode, mask: u32, isdir: u32) {
         // Both events are allocated before the queue lock (Linux
         // inotify_handle_inode_event, then fsnotify_insert_event)
@@ -661,16 +646,11 @@ impl Inotify {
         watch_uncharge(self.uid, 1);
         if q1 || q2 {
             self.wait_queue.wake_all();
-            self.sigio_later();
+            // Linux fsnotify_insert_event's kill_fasync: safe in any
+            // context but hardirq, locks held or not
+            kill_fasync(&self.fasync, crate::signal::SIGIO, POLL_IN);
         }
         drop(gone);
-    }
-
-    /// SIGIO to the O_ASYNC files from a worker (kill_fasync sleeps)
-    fn sigio_later(&self) {
-        if self.fasync.armed() {
-            crate::task::workqueue::SYSTEM_WQ.queue_work(self.sigio.clone());
-        }
     }
 
     /// Remove a watch by descriptor

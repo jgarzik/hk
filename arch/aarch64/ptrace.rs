@@ -51,12 +51,15 @@ pub fn get_user_regs(t: &Task) -> KernelResult<UserPtRegs> {
     let task = table.view(t).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
-    if !matches!(task.state(), crate::task::TaskState::Traced(_)) {
+    let stop = task.task.sig.lock();
+    if !stop.traced() {
         return Err(KernelError::NoProcess); // not stopped
     }
 
     // Its pt_regs: the frame at the top of its kernel stack
-    // SAFETY: the tracee is stopped (TASKLIST held): its frame is stable
+    // SAFETY: the tracee is in a ptrace stop, which ends only under
+    // its Task.sig (held), and switched out (ptrace_check_attach):
+    // its frame is stable
     let tf = unsafe { &*crate::task::percpu::task_pt_regs(task.task) };
 
     let regs = UserPtRegs {
@@ -78,7 +81,8 @@ pub fn set_user_regs(t: &Task, regs: &UserPtRegs) -> KernelResult<()> {
     let task = table.view(t).ok_or(KernelError::NoProcess)?;
 
     // Check task is in traced state
-    if !matches!(task.state(), crate::task::TaskState::Traced(_)) {
+    let stop = task.task.sig.lock();
+    if !stop.traced() {
         return Err(KernelError::NoProcess); // not stopped
     }
 

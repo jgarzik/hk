@@ -216,3 +216,119 @@ impl<T> Drop for IrqSpinlockGuard<'_, T> {
         irqflags::restore(self.irq_state);
     }
 }
+
+/// An IRQ-safe reader-writer spinlock (Linux rwlock_t taken with
+/// read_lock_irqsave / write_lock_irqsave): readers share it, a writer
+/// excludes everyone; either side masks interrupts and raises the
+/// preempt count while held, so it may be taken from interrupt and
+/// thread context alike. Ordered like [`IrqSpinlock`].
+pub struct IrqRwLock<T> {
+    inner: spin::RwLock<T>,
+}
+
+impl<T> IrqRwLock<T> {
+    pub const fn new(data: T) -> Self {
+        Self {
+            inner: spin::RwLock::new(data),
+        }
+    }
+
+    /// The data, through exclusive access (no lock needed)
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
+
+    /// Take the read side (Linux read_lock_irqsave)
+    #[inline]
+    #[cfg_attr(feature = "lockdep", track_caller)]
+    pub fn read(&self) -> IrqRwReadGuard<'_, T> {
+        let irq_state = irqflags::save();
+        percpu::preempt_disable();
+        let g = self.inner.read();
+        crate::sync::lockdep::irqsafe_acquire(::core::panic::Location::caller());
+        IrqRwReadGuard {
+            g: core::mem::ManuallyDrop::new(g),
+            addr: core::ptr::from_ref(self).cast::<u8>() as usize,
+            irq_state,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Take the write side (Linux write_lock_irqsave)
+    #[inline]
+    #[cfg_attr(feature = "lockdep", track_caller)]
+    pub fn write(&self) -> IrqRwWriteGuard<'_, T> {
+        let irq_state = irqflags::save();
+        percpu::preempt_disable();
+        let g = self.inner.write();
+        crate::sync::lockdep::irqsafe_acquire(::core::panic::Location::caller());
+        IrqRwWriteGuard {
+            g: core::mem::ManuallyDrop::new(g),
+            addr: core::ptr::from_ref(self).cast::<u8>() as usize,
+            irq_state,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl<T: Default> Default for IrqRwLock<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+/// [`IrqRwLock`]'s read side held
+pub struct IrqRwReadGuard<'a, T> {
+    g: core::mem::ManuallyDrop<spin::RwLockReadGuard<'a, T>>,
+    addr: usize,
+    irq_state: Raw,
+    _not_send: PhantomData<*const ()>,
+}
+
+/// [`IrqRwLock`]'s write side held
+pub struct IrqRwWriteGuard<'a, T> {
+    g: core::mem::ManuallyDrop<spin::RwLockWriteGuard<'a, T>>,
+    addr: usize,
+    irq_state: Raw,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Deref for IrqRwReadGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.g
+    }
+}
+
+impl<T> Deref for IrqRwWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.g
+    }
+}
+
+impl<T> DerefMut for IrqRwWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.g
+    }
+}
+
+impl<T> Drop for IrqRwReadGuard<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: dropped once, here
+        unsafe { core::mem::ManuallyDrop::drop(&mut self.g) };
+        percpu::preempt_enable();
+        crate::sync::lockdep::irqsafe_release(self.addr, irqflags::enabled(self.irq_state));
+        irqflags::restore(self.irq_state);
+    }
+}
+
+impl<T> Drop for IrqRwWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: dropped once, here
+        unsafe { core::mem::ManuallyDrop::drop(&mut self.g) };
+        percpu::preempt_enable();
+        crate::sync::lockdep::irqsafe_release(self.addr, irqflags::enabled(self.irq_state));
+        irqflags::restore(self.irq_state);
+    }
+}

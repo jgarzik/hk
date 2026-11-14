@@ -1,10 +1,9 @@
 //! Telling a parent or tracer about a child (Linux do_notify_parent,
 //! do_notify_parent_cldstop in kernel/signal.c)
 
-use super::{SIGCHLD, SendInfo, SigFields, SigHandler, SigInfo, SigQueue, Signal, sa_flags};
+use super::{SIGCHLD, SendInfo, SigFields, SigHandler, SigInfo, Signal, sa_flags};
 use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef};
 use crate::task::{Task, Tid};
-use alloc::boxed::Box;
 
 /// SIGCHLD info for child `t` with `code` (CLD_*) and `status`: its
 /// pid, real uid and CPU time in clock ticks (Linux
@@ -182,117 +181,15 @@ pub fn ignoring_children(table: &GlobalTaskTable, pid: crate::task::Pid) -> bool
         .is_some_and(|to| disposition(table, &to, Some(SIGCHLD)).1)
 }
 
-/// The entry a zombie's notice is queued with, made before TASKLIST is
-/// taken (nothing allocates under it) and charged to the user it would
-/// go to then, none if no signal would be sent; under the lock,
-/// [`Entry::fits`] tells whether that is still so, else the caller
-/// drops the lock and makes another
-#[derive(Default)]
-pub struct Entry {
-    /// The receiver's user (its counters) and the signal it was made
-    /// for
-    key: Option<(crate::task::UcountsRef, Signal)>,
-    q: Option<Box<SigQueue>>,
-}
-
-impl Entry {
-    /// For zombie (or soon zombie) `z`'s notice
-    pub fn child(z: Zombie) -> Self {
-        let table = TASKLIST.read();
-        let r = receiver(&table, z);
-        let pre = r
-            .as_ref()
-            .and_then(|r| Some((super::target_in(&table, &r.to)?, r.sig?)));
-        drop(table);
-        drop(r);
-        Self::make(pre)
-    }
-
-    /// For SIGCHLD to `parent`'s process (an untraced zombie reparented
-    /// to it)
-    pub fn parent(parent: &TaskRef) -> Self {
-        let table = TASKLIST.read();
-        let to = adopter(&table, parent);
-        let pre = to
-            .as_ref()
-            .and_then(|to| Some((super::target_in(&table, to)?, SIGCHLD)));
-        drop(table);
-        drop(to);
-        Self::make(pre)
-    }
-
-    /// An entry for `pre`'s receiver and signal (TASKLIST not held); its
-    /// info is filled in when it is queued
-    fn make(pre: Option<(super::Target, Signal)>) -> Self {
-        let Some((tg, sig)) = pre else {
-            return Self::default();
-        };
-        let fields = SigFields::Chld {
-            pid: 0,
-            uid: 0,
-            status: 0,
-            utime: 0,
-            stime: 0,
-        };
-        let info = SendInfo::Info(SigInfo::new(sig, super::si_code::CLD_EXITED, fields));
-        let q = SigQueue::alloc(
-            sig,
-            // An Info: no namespace to number in (filled when queued)
-            info.resolve(sig, &crate::ns::INIT_PID_NS),
-            &tg.ucounts,
-            tg.limit,
-            info.override_rlimit(sig),
-        );
-        Self {
-            key: Some((tg.ucounts, sig)),
-            q,
-        }
-    }
-
-    /// Under TASKLIST: zombie `z`'s notice would go where this entry
-    /// was made for (or needs none)
-    pub fn fits(&self, table: &GlobalTaskTable, z: Zombie) -> bool {
-        match receiver(table, z) {
-            Some(Rcv {
-                to, sig: Some(sig), ..
-            }) => self.matches(table, &to, sig),
-            _ => true,
-        }
-    }
-
-    /// Under TASKLIST: SIGCHLD to `parent`'s process would go where this
-    /// entry was made for (or needs none)
-    pub fn fits_parent(&self, table: &GlobalTaskTable, parent: &TaskRef) -> bool {
-        adopter(table, parent).is_none_or(|to| self.matches(table, &to, SIGCHLD))
-    }
-
-    /// Made for `to`'s user and `sig`, or `to` takes no signal
-    fn matches(&self, table: &GlobalTaskTable, to: &TaskRef, sig: Signal) -> bool {
-        super::target_in(table, to).is_none_or(|tg| {
-            self.key
-                .as_ref()
-                .is_some_and(|(u, s)| *u == tg.ucounts && *s == sig)
-        })
-    }
-}
-
-/// The thread of `parent`'s process an untraced zombie reparented to it
-/// signals, if the signal is sent (SIGCHLD, as [`disposition`] decides)
-fn adopter(table: &GlobalTaskTable, parent: &TaskRef) -> Option<TaskRef> {
-    super::group_task(table, table.get(parent.pid))
-        .filter(|to| disposition(table, to, Some(SIGCHLD)).0.is_some())
-}
-
 /// What [`notify`] did: the parent is to release the zombie now
-/// (`autoreap`); the signal's wakeups and the entry it left wait for
-/// TASKLIST to be dropped ([`Told::finish`])
+/// (`autoreap`); the signal's wakeups wait for TASKLIST to be dropped
+/// ([`Told::finish`])
 #[must_use]
 #[derive(Default)]
 pub struct Told {
     pub autoreap: bool,
     posted: Option<super::Posted>,
     rcv: Option<Rcv>,
-    entry: Entry,
 }
 
 impl Told {
@@ -303,7 +200,6 @@ impl Told {
             p.finish();
         }
         drop(self.rcv);
-        drop(self.entry);
     }
 }
 
@@ -316,24 +212,21 @@ impl Told {
 ///
 /// Under TASKLIST's write lock, in the section that made it reportable
 /// (Linux exit_notify, release_task, reparent_leader call
-/// do_notify_parent under tasklist_lock), with `entry` checked by
-/// [`Entry::fits`] in that section: no wait reaps it before its signal
-/// is pending, and a parent its signal wakes finds it.
-pub fn notify(table: &GlobalTaskTable, z: Zombie, mut entry: Entry) -> Told {
+/// do_notify_parent under tasklist_lock), its queue entry made there
+/// GFP_ATOMIC (Linux __send_signal_locked): no wait reaps it before its
+/// signal is pending, and a parent its signal wakes finds it.
+pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
     let tid = z.tid();
     // Its pidfd pollers first (Linux do_notify_parent: do_notify_pidfd)
     crate::task::percpu::notify_pidfd(table, tid);
     let Some(r) = receiver(table, z) else {
-        return Told {
-            entry,
-            ..Told::default()
-        };
+        return Told::default();
     };
     let (sig, autoreap) = (r.sig, r.autoreap);
     let posted = match (sig, chld_notice(table, tid, r.to.pid_ns())) {
         (Some(sig), Some(info)) => {
             let info = SendInfo::Info(info.with_sig(sig));
-            super::send_held(table, &r.to, sig, info, super::PidType::Tgid, &mut entry.q)
+            super::send_held(table, &r.to, sig, info, super::PidType::Tgid)
         }
         _ => None,
     };
@@ -341,7 +234,6 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie, mut entry: Entry) -> Told {
         autoreap,
         posted,
         rcv: Some(r),
-        entry,
     }
 }
 

@@ -310,7 +310,7 @@ impl Tty {
     }
 
     /// SIGIO for input to the O_ASYNC files (Linux n_tty's kill_fasync
-    /// POLL_IN); no tty spin lock held
+    /// POLL_IN), under `ldata` (Linux: under termios_rwsem)
     pub(crate) fn kill_input(&self) {
         kill_fasync(&self.fasync, crate::signal::SIGIO, POLL_IN);
     }

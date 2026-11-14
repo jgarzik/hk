@@ -12,6 +12,7 @@ pub mod dentry;
 pub mod file;
 pub mod fsstruct;
 pub mod inode;
+pub mod mntput;
 pub mod mount;
 pub mod name;
 pub mod namei;

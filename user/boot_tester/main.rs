@@ -334,6 +334,7 @@ pub fn run_all_tests() {
     fs::attr_race::run_tests();
     process::caps_checks::run_tests();
     fs::mount_race::run_tests();
+    isolated(b"DPATH_UMOUNT", fs::dpath_umount::run_tests);
     fs::tmpfs::run_tests();
     time::timerfd::run_tests();
     time::posix_timer::run_tests();
@@ -393,6 +394,7 @@ pub fn run_all_tests() {
     net::icmp::run_ping_tests();
     net::raw::run_tests();
     net::packet::run_tests();
+    net::fasync_tap::run_tests();
     net::tcp_xfer::run_tests();
     net::tcp_conn::run_tests();
     net::tcp_mem::run_tests();

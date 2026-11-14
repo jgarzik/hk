@@ -11,7 +11,7 @@
 use alloc::sync::Arc;
 
 use super::dentry::Dentry;
-use super::mount::Mount;
+use super::mount::MountRef;
 
 /// A filesystem path - pair of (mount, dentry)
 ///
@@ -29,14 +29,14 @@ use super::mount::Mount;
 #[derive(Clone)]
 pub struct Path {
     /// The mount point this path is on
-    pub mnt: Arc<Mount>,
+    pub mnt: MountRef,
     /// The dentry within that mount
     pub dentry: Arc<Dentry>,
 }
 
 impl Path {
     /// Create a new Path, taking ownership of the provided Arc references
-    pub fn new(mnt: Arc<Mount>, dentry: Arc<Dentry>) -> Self {
+    pub fn new(mnt: MountRef, dentry: Arc<Dentry>) -> Self {
         Self { mnt, dentry }
     }
 
@@ -49,7 +49,7 @@ impl Path {
 
     /// The same mount and dentry (Linux path_equal)
     pub fn same(&self, o: &Path) -> bool {
-        Arc::ptr_eq(&self.mnt, &o.mnt) && Arc::ptr_eq(&self.dentry, &o.dentry)
+        MountRef::ptr_eq(&self.mnt, &o.mnt) && Arc::ptr_eq(&self.dentry, &o.dentry)
     }
 
     /// Check if this path points to a directory
@@ -66,19 +66,19 @@ impl Path {
     }
 
     /// Get the mount
-    pub fn mnt(&self) -> &Arc<Mount> {
+    pub fn mnt(&self) -> &MountRef {
         &self.mnt
     }
 
     /// The mount and dentry (path_get of both, then path_put of this)
-    pub fn into_parts(self) -> (Arc<Mount>, Arc<Dentry>) {
+    pub fn into_parts(self) -> (MountRef, Arc<Dentry>) {
         (self.mnt.clone(), self.dentry.clone())
     }
 
     /// The mount, dropping the rest without counting as a use of it: an
     /// MNT_EXPIRE mark stays (Linux mntput_no_expire, for umount's own
     /// lookup)
-    pub fn into_mnt_noexpire(self) -> Arc<Mount> {
+    pub fn into_mnt_noexpire(self) -> MountRef {
         let p = core::mem::ManuallyDrop::new(self);
         // SAFETY: `p` is never dropped or used again, so each field is
         // read out exactly once and its reference moves to the copy

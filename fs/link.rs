@@ -18,6 +18,7 @@ use crate::uaccess::{UserPtr, UserSlice};
 use crate::util::error::KernelResult;
 
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW};
+use super::mount::MountRef;
 
 // =============================================================================
 // symlink, symlinkat syscalls
@@ -213,7 +214,7 @@ pub fn sys_linkat(
     let old_inode = old.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let p = filename_create(newdirfd, &getname(newpath_ptr, false)?, false)?;
     // EXDEV across mounts, even of one superblock
-    if !Arc::ptr_eq(&old.mnt, &p.mnt) {
+    if !MountRef::ptr_eq(&old.mnt, &p.mnt) {
         return Err(KernelError::CrossDevice);
     }
 
@@ -359,7 +360,7 @@ fn do_renameat2(
     let newpath = getname(newpath_ptr, false);
     let old = filename_parentat(olddirfd, &getname(oldpath_ptr, false)?)?;
     let new = filename_parentat(newdirfd, &newpath?)?;
-    if !Arc::ptr_eq(&old.mnt, &new.mnt) {
+    if !MountRef::ptr_eq(&old.mnt, &new.mnt) {
         return Err(KernelError::CrossDevice);
     }
     if old.last != Last::Norm {

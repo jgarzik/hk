@@ -10,8 +10,9 @@
 //! gap lies below it, arm64's entry overflow check holds on it, and an
 //! overflow into the gap says it was the IRQ stack ([`overflowed`]).
 //!
-//! The arch entry code calls [`run`] around the handlers only, not the
-//! return-to-user work (which may schedule): x86 for an interrupt from
+//! [`run_softirq`] runs a task's inline network receive work there too
+//! (Linux do_softirq_own_stack). The arch entry code calls [`run`] around
+//! the handlers only, not the return-to-user work (which may schedule): x86 for an interrupt from
 //! kernel mode (Linux run_irq_on_irqstack_cond: from user mode the task
 //! stack is empty), arm64 for any (Linux do_interrupt_handler).
 //! Exceptions stay on the task stack, as in Linux. Handlers run with
@@ -74,6 +75,29 @@ pub fn run<F: FnOnce()>(f: F) {
     // interrupts off nothing else on this CPU switches to it before the
     // call returns. `f` outlives the call.
     unsafe { CurrentArch::call_on_stack(top, call_once::<F>, (&raw mut f).cast()) };
+}
+
+/// Run `f`, deferred network work a task does inline (Linux pending
+/// softirqs run at local_bh_enable), on this CPU's IRQ stack as Linux
+/// do_softirq_own_stack: interrupts are masked for the switch and
+/// restored on the IRQ stack (Linux __do_softirq's local_irq_enable),
+/// so an interrupt meanwhile nests there; preemption stays off, so
+/// nothing else on this CPU uses the stack, and `f` must not sleep.
+/// Directly if SP is on it already.
+pub fn run_softirq<F: FnOnce()>(f: F) {
+    let mut saved = Some(crate::sync::local_irq_save());
+    crate::arch::preempt_disable();
+    run(|| {
+        if let Some(s) = saved.take() {
+            crate::sync::local_irq_restore(s);
+        }
+        f();
+        saved = Some(crate::sync::local_irq_save());
+    });
+    crate::arch::preempt_enable();
+    if let Some(s) = saved.take() {
+        crate::sync::local_irq_restore(s);
+    }
 }
 
 /// `run`'s `f`, on the IRQ stack

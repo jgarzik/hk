@@ -544,13 +544,15 @@ pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
 
 /// The kernel's own tmpfs (Linux shm_mnt, kern_mount: no limits, in
 /// no mount namespace): memfd_create's files
-static SHM_MNT: spin::Once<Arc<crate::fs::mount::Mount>> = spin::Once::new();
+static SHM_MNT: spin::Once<crate::fs::mount::MountRef> = spin::Once::new();
 
 /// Make the kernel's tmpfs (Linux shmem_init's kern_mount; mnt_init)
 pub fn shmem_init() -> Result<(), KernelError> {
     let sb = tmpfs_mount(&TMPFS_TYPE, b"size=0,nr_inodes=0")?;
     let root = sb.get_root().ok_or(KernelError::Io)?;
-    let m = crate::fs::mount::Mount::new(sb, root, 0, b"tmpfs".as_slice().into())?;
+    let m = crate::fs::mount::Mount::alloc(sb, root, 0, b"tmpfs".as_slice().into())?;
+    // A kernel mount (Linux kern_mount)
+    m.set_internal();
     SHM_MNT.call_once(|| m);
     Ok(())
 }

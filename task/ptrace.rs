@@ -10,6 +10,7 @@
 //! Not all ptrace operations are implemented; this focuses on the core subset
 //! needed for basic debugging and tracing.
 
+use crate::signal::jobctl::{PTRACE_FROZEN, TRACED};
 use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP, Signal};
 use crate::task::percpu::TaskRef;
 use crate::task::percpu::{self, TASKLIST};
@@ -196,20 +197,24 @@ fn tracee(pid: Pid) -> KernelResult<TaskRef> {
 /// its TLS and GS base not yet saved (Linux wait_task_inactive)
 fn ptrace_check_attach(task: &TaskRef) -> KernelResult<Frozen> {
     {
-        let mut table = TASKLIST.write();
-        let mut target = table.view_mut(task).ok_or(KernelError::NoProcess)?;
+        // The tracer link under TASKLIST, the stop under the tracee's
+        // Task.sig (Linux ptrace_check_attach: tasklist_lock read, then
+        // ptrace_freeze_traced under siglock)
+        let table = TASKLIST.read();
+        let target = table.view(task).ok_or(KernelError::NoProcess)?;
 
         // Check if we are the tracer
         if !target.traced_by(&percpu::current()) {
             return Err(KernelError::NoProcess);
         }
 
-        // In a ptrace stop, and not killed (Linux ptrace_freeze_traced):
-        // the stop then stays until the request ends
-        if !matches!(target.state, TaskState::Traced(_)) || signal::task_fatal_pending(task) {
+        // In a ptrace stop, and not killed: the stop then stays until
+        // the request ends
+        let mut s = task.sig.lock();
+        if !s.traced() || s.fatal_pending() {
             return Err(KernelError::NoProcess);
         }
-        target.ptrace_frozen = true;
+        s.jobctl |= PTRACE_FROZEN;
     }
     let frozen = Frozen(task.clone());
     if !percpu::wait_task_inactive(&frozen.0) {
@@ -227,14 +232,11 @@ struct Frozen(TaskRef);
 impl Drop for Frozen {
     fn drop(&mut self) {
         let killed = {
-            let mut table = TASKLIST.write();
-            let Some(mut t) = table.view_mut(&self.0) else {
-                return;
-            };
-            t.ptrace_frozen = false;
-            let killed = signal::task_fatal_pending(&self.0);
+            let mut s = self.0.sig.lock();
+            s.jobctl &= !PTRACE_FROZEN;
+            let killed = s.fatal_pending();
             if killed {
-                t.end_trace_stop();
+                s.end_trace_stop();
             }
             killed
         };
@@ -403,19 +405,16 @@ fn resume_sig(data: u64) -> KernelResult<Option<Signal>> {
 }
 
 /// Let a stopped tracee go on with `sig` to deliver (Linux
-/// ptrace_resume: exit_code, wake_up_state(__TASK_TRACED))
+/// ptrace_resume: exit_code and JOBCTL_TRACED under siglock,
+/// wake_up_state(__TASK_TRACED))
 fn ptrace_wake(task: &TaskRef, sig: Option<Signal>) {
     {
-        let mut table = TASKLIST.write();
-        let Some(mut t) = table.view_mut(task) else {
-            return;
-        };
-        if !matches!(t.state, TaskState::Traced(_)) {
+        let mut s = task.sig.lock();
+        if !s.traced() {
             return;
         }
-        t.state = TaskState::Ready;
-        t.ptrace_frozen = false;
-        t.ptrace_code = sig.map_or(0, Signal::nr);
+        s.jobctl &= !(TRACED | PTRACE_FROZEN);
+        s.ptrace_code = sig.map_or(0, Signal::nr);
     }
     percpu::try_to_wake_up(task, percpu::WakeMode::Any);
 }
@@ -601,7 +600,8 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> KernelResult<i64> {
 fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> KernelResult<i64> {
     let task = tracee(target_pid)?;
     let _frozen = ptrace_check_attach(&task)?;
-    let info = TASKLIST.read().view(&task).and_then(|t| t.last_siginfo);
+    // Under its Task.sig (Linux ptrace_getsiginfo: lock_task_sighand)
+    let info = task.sig.lock().last_siginfo;
     info.ok_or(KernelError::InvalidArgument)?
         .copy_to_user(data)?;
     Ok(0)
@@ -614,13 +614,13 @@ fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> KernelResult<i64> {
     let task = tracee(target_pid)?;
     let _frozen = ptrace_check_attach(&task)?;
     let info = crate::signal::SigInfo::copy_from_user(data)?;
-    let mut table = TASKLIST.write();
-    match table.view_mut(&task) {
-        Some(mut t) if t.last_siginfo.is_some() => {
-            t.last_siginfo = Some(info);
+    let mut s = task.sig.lock();
+    match s.last_siginfo.as_mut() {
+        Some(i) => {
+            *i = info;
             Ok(0)
         }
-        _ => Err(KernelError::InvalidArgument),
+        None => Err(KernelError::InvalidArgument),
     }
 }
 
@@ -735,22 +735,27 @@ pub fn ptrace_stop(
     use percpu::{SleepState, schedule, set_current_state};
     let me = percpu::current();
     let tracer = {
-        let mut table = TASKLIST.write();
-        let Some(mut t) = table.view_mut(&me) else {
+        // Traced, under TASKLIST (which a detach writes); the stop set
+        // under Task.sig inside it, so a tracer's exit detaching us
+        // either came first or sees the stop (Linux ptrace_stop: the
+        // stop under siglock, ->ptrace written under both)
+        let table = TASKLIST.read();
+        let Some(t) = table.view(&me) else {
             return (None, info);
         };
         if t.ptrace == 0 {
             return (Signal::new(code), info);
         }
-        t.state = TaskState::Traced(code as i32);
-        t.ptrace_frozen = false;
-        t.ptrace_code = code;
-        t.last_siginfo = info;
+        let mut s = me.sig.lock();
+        s.jobctl = (s.jobctl | TRACED) & !PTRACE_FROZEN;
+        s.ptrace_code = code;
+        s.last_siginfo = info;
         // Asleep before the tracer can see the stop (Linux
         // set_special_state(TASK_TRACED) before notifying it): a tracer
         // on another CPU waits for us to switch out
         // (wait_task_inactive), and gives up on a Running tracee
         set_current_state(SleepState::Killable);
+        drop(s);
         t.tracer()
     };
     // The tracer's wait finds the stop; SIGCHLD tells it (Linux
@@ -781,33 +786,27 @@ pub fn ptrace_stop(
         schedule();
     }
     set_current_state(SleepState::Running);
-    let mut table = TASKLIST.write();
-    let Some(mut t) = table.view_mut(&me) else {
-        return (None, None);
-    };
+    let mut s = me.sig.lock();
     // The stop's siginfo, as the tracer left it (Linux: last_siginfo
     // cleared after the stop)
-    let info = t.last_siginfo.take();
+    let info = s.last_siginfo.take();
     // Out of the stop: nothing holds it (Linux clears
     // JOBCTL_PTRACE_FROZEN with the stop)
-    t.ptrace_frozen = false;
+    s.jobctl &= !PTRACE_FROZEN;
     // Killed while stopped: no longer reported, nothing delivered
-    if matches!(t.state, TaskState::Traced(_)) {
-        t.state = TaskState::Ready;
-        t.ptrace_code = 0;
+    if s.traced() {
+        s.end_trace_stop();
         return (None, info);
     }
     // A resume's signal (ptrace_wake)
-    (Signal::new(core::mem::take(&mut t.ptrace_code)), info)
+    (Signal::new(core::mem::take(&mut s.ptrace_code)), info)
 }
 
 /// The current task is in a ptrace stop, and its tracer inside a
-/// request on it (frozen)
+/// request on it (frozen), read under its Task.sig
 fn stop_state(me: &Task) -> (bool, bool) {
-    let table = TASKLIST.read();
-    table.view(me).map_or((false, false), |t| {
-        (matches!(t.state, TaskState::Traced(_)), t.ptrace_frozen)
-    })
+    let s = me.sig.lock();
+    (s.traced(), s.frozen())
 }
 
 /// A PTRACE_SYSCALL stop at syscall entry or exit (Linux
@@ -860,10 +859,11 @@ pub fn ptrace_signal(info: &mut crate::signal::SigInfo, sig: Signal) -> Option<S
 }
 
 /// Task `t` is no longer traced (Linux __ptrace_unlink), under
-/// TASKLIST's write lock (the view borrows it)
+/// TASKLIST's write lock (the view borrows it), its frozen bit under
+/// its Task.sig
 pub(crate) fn ptrace_unlink(t: &mut percpu::TaskViewMut<'_>) {
     t.ptrace = 0;
-    t.ptrace_frozen = false;
+    t.task.sig.lock().jobctl &= !PTRACE_FROZEN;
     t.ptracer = None;
     t.ptrace_options = 0;
     t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
@@ -909,7 +909,7 @@ fn detach_live(me: &crate::task::Task) -> Option<(percpu::TaskRef, Option<signal
     };
     let mut v = table.view_mut(&t)?;
     ptrace_unlink(&mut v);
-    v.end_trace_stop();
+    t.sig.lock().end_trace_stop();
     Some((t, kill))
 }
 

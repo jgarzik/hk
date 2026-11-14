@@ -171,7 +171,7 @@ fn chld_pending(pid: i64) -> bool {
 }
 
 /// The state letter in /proc/<pid>/stat, or 0
-fn stat_state(pid: i64) -> u8 {
+pub(crate) fn stat_state(pid: i64) -> u8 {
     let path = crate::exec::exec_identity::proc_path(pid, b"stat\0");
     let mut b = [0u8; 128];
     let n = read_file(&path, &mut b);
