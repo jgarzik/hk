@@ -3964,6 +3964,7 @@ context. Per-TTY locks use Mutex and are accessed from process context only.
 | `OUTPUT_LOCK` | `printk.rs` | `IrqSpinlock<()>` | Serializes all console writes across CPUs |
 | `PRINTK` | `printk.rs` | `IrqSpinlock<PrintkState>` | Protects ring buffer state |
 | `CONSOLE_REGISTRY` | `console.rs` | `IrqSpinlock<ConsoleRegistry>` | Protects console driver list |
+| `UartPort.lock` (8250 `SerialTty`, PL011) | `tty/serial_core.rs` | `IrqSpinlock<()>` | A UART's port lock (Linux uart_port.lock): its console write holds it for the whole message (under `OUTPUT_LOCK`, any context; only tried during an oops, as Linux), its tty write per 16-byte chunk (under the tty's `write_lock`, or from N_TTY echo), so console output never interleaves with a tty write's bytes. A leaf |
 
 All three use `IrqSpinlock` for IRQ safety - see Section 3.6 for details.
 
