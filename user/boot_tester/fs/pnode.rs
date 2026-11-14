@@ -7,8 +7,8 @@
 use crate::harness::{R, check, report_r};
 use hk_syscall::{
     CLONE_NEWNS, O_RDONLY, Stat, sys_chdir, sys_chroot, sys_close, sys_exit, sys_fork, sys_mkdir,
-    sys_mount, sys_open, sys_pivot_root, sys_read, sys_rmdir, sys_stat, sys_umount2, sys_unshare,
-    sys_wait4,
+    sys_mount, sys_open, sys_pipe, sys_pivot_root, sys_read, sys_rmdir, sys_stat, sys_umount2,
+    sys_unshare, sys_wait4, sys_write,
 };
 
 const ENOENT: i64 = -2;
@@ -37,6 +37,41 @@ pub fn run_tests() {
     report_r(b"PROPAG_SLAVE_GROUPS", slave_groups());
     report_r(b"PROPAG_UNBIND_THEN_SHARED", unbind_then_shared());
     report_r(b"PIVOT_ROOT_SHARED", pivot_shared());
+    report_r(b"PROPAG_PROPAGATE_FROM", propagate_from());
+    report_r(b"PROPAG_NEW_SKIPPED", new_skipped());
+}
+
+/// `mp` has a line in /proc/self/mountinfo
+fn listed(mp: &[u8]) -> bool {
+    opt(mp, b"") != 0
+}
+
+/// A bind of a slave under its own master: the new mount is a slave of
+/// the master too, but a copy made by the attach it is part of gets
+/// none of that attach's propagation (Linux IS_MNT_NEW): the master's
+/// other slave gets a copy, the new mount none on itself
+fn new_skipped() -> R {
+    let dirs: [&[u8]; 2] = [b"/tmp/nw_a\0", b"/tmp/nw_b\0"];
+    mkdirs(&dirs);
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/nw_a\0") == 0, -1)?;
+        check(b"shared", set(b"/tmp/nw_a\0", MS_SHARED) == 0, -1)?;
+        check(b"bind b", bind(b"/tmp/nw_a\0", b"/tmp/nw_b\0") == 0, -1)?;
+        check(b"b slave", set(b"/tmp/nw_b\0", MS_SLAVE) == 0, -1)?;
+        sys_mkdir(b"/tmp/nw_a/x\0".as_ptr(), 0o755);
+        let r = bind(b"/tmp/nw_b\0", b"/tmp/nw_a/x\0");
+        check(b"bind slave under master", r == 0, r)?;
+        check(b"copy at b", listed(b"/tmp/nw_b/x"), -1)?;
+        check(b"none on the new mount", !listed(b"/tmp/nw_a/x/x"), -1)
+    })();
+    for p in [&b"/tmp/nw_a/x/x\0"[..], b"/tmp/nw_b/x\0", b"/tmp/nw_a/x\0"] {
+        sys_umount2(p.as_ptr(), MNT_DETACH);
+    }
+    sys_rmdir(b"/tmp/nw_a/x\0".as_ptr());
+    sys_umount2(b"/tmp/nw_b\0".as_ptr(), MNT_DETACH);
+    sys_umount2(b"/tmp/nw_a\0".as_ptr(), MNT_DETACH);
+    rmdirs(&dirs);
+    r
 }
 
 fn ramfs(t: &[u8]) -> i64 {
@@ -79,8 +114,13 @@ fn rmdirs(ps: &[&[u8]]) {
 /// The value of optional field `key` ("shared" or "master") on the
 /// mountinfo line of mountpoint `mp`, 0 if absent
 fn opt(mp: &[u8], key: &[u8]) -> u64 {
+    opt_in(b"/proc/self/mountinfo\0", mp, key)
+}
+
+/// [`opt`] in the mountinfo file `file`
+fn opt_in(file: &[u8], mp: &[u8], key: &[u8]) -> u64 {
     let mut buf = [0u8; 8192];
-    let fd = sys_open(b"/proc/self/mountinfo\0".as_ptr(), O_RDONLY, 0);
+    let fd = sys_open(file.as_ptr(), O_RDONLY, 0);
     let mut n = 0usize;
     while fd >= 0 && n < buf.len() {
         let r = sys_read(fd as u64, buf[n..].as_mut_ptr(), (buf.len() - n) as u64);
@@ -96,6 +136,9 @@ fn opt(mp: &[u8], key: &[u8]) -> u64 {
     else {
         return 0;
     };
+    if key.is_empty() {
+        return 1;
+    }
     for f in line.split(|&c| c == b' ').skip(6) {
         if f == b"-" {
             break;
@@ -376,6 +419,126 @@ fn unbind_then_shared() -> R {
     sys_umount2(b"/tmp/ub_t\0".as_ptr(), 0);
     sys_umount2(b"/tmp/ub_s\0".as_ptr(), 0);
     rmdirs(&dirs);
+    r
+}
+
+/// "/proc/<pid>/mountinfo" with its NUL, in `out`
+fn mountinfo_of(out: &mut [u8; 40], pid: i64) -> &[u8] {
+    let mut digits = [0u8; 20];
+    let (mut n, mut v) = (0, pid as u64);
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let mut k = 0;
+    for &c in b"/proc/" {
+        out[k] = c;
+        k += 1;
+    }
+    for i in (0..n).rev() {
+        out[k] = digits[i];
+        k += 1;
+    }
+    for &c in b"/mountinfo\0" {
+        out[k] = c;
+        k += 1;
+    }
+    &out[..k]
+}
+
+/// A slave whose master group has no member under the reader's root
+/// shows propagate_from:N, the nearest group up the master chain that
+/// has one (Linux get_dominating_id); a reader that sees the master
+/// gets none
+fn propagate_from() -> R {
+    let dirs: [&[u8]; 5] = [
+        b"/tmp/pf\0",
+        b"/tmp/pf/vis\0",
+        b"/tmp/pf/hid\0",
+        b"/tmp/pf/vis/x\0",
+        b"/tmp/pf/vis/z\0",
+    ];
+    sys_mkdir(dirs[0].as_ptr(), 0o755);
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/pf\0") == 0, -1)?;
+        check(b"private", set(b"/tmp/pf\0", MS_PRIVATE) == 0, -1)?;
+        mkdirs(&dirs[1..]);
+        // x shared; hid a slave of x, then shared; z a slave of hid
+        check(b"mount x", ramfs(b"/tmp/pf/vis/x\0") == 0, -1)?;
+        check(b"x shared", set(b"/tmp/pf/vis/x\0", MS_SHARED) == 0, -1)?;
+        check(
+            b"bind hid",
+            bind(b"/tmp/pf/vis/x\0", b"/tmp/pf/hid\0") == 0,
+            -1,
+        )?;
+        check(b"hid slave", set(b"/tmp/pf/hid\0", MS_SLAVE) == 0, -1)?;
+        check(b"hid shared", set(b"/tmp/pf/hid\0", MS_SHARED) == 0, -1)?;
+        check(
+            b"bind z",
+            bind(b"/tmp/pf/hid\0", b"/tmp/pf/vis/z\0") == 0,
+            -1,
+        )?;
+        check(b"z slave", set(b"/tmp/pf/vis/z\0", MS_SLAVE) == 0, -1)?;
+        let (gx, gh) = (
+            opt(b"/tmp/pf/vis/x", b"shared"),
+            opt(b"/tmp/pf/hid", b"shared"),
+        );
+        check(
+            b"groups",
+            gx != 0 && gh != 0 && gx != gh,
+            (gx * 1000 + gh) as i64,
+        )?;
+        check(b"z master", opt(b"/tmp/pf/vis/z", b"master") == gh, -1)?;
+        check(
+            b"no propagate_from when master seen",
+            opt(b"/tmp/pf/vis/z", b"propagate_from") == 0,
+            -1,
+        )?;
+        let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+        check(b"pipes", sys_pipe(ready.as_mut_ptr()) == 0, -1)?;
+        check(b"pipes", sys_pipe(go.as_mut_ptr()) == 0, -1)?;
+        let pid = sys_fork();
+        if pid == 0 {
+            let ok = sys_chroot(b"/tmp/pf/vis\0".as_ptr()) == 0;
+            sys_write(ready[1] as u64, [ok as u8].as_ptr(), 1);
+            let mut b = [0u8; 1];
+            sys_read(go[0] as u64, b.as_mut_ptr(), 1);
+            sys_exit(0);
+        }
+        let mut b = [0u8; 1];
+        sys_read(ready[0] as u64, b.as_mut_ptr(), 1);
+        let mut path = [0u8; 40];
+        let file = mountinfo_of(&mut path, pid);
+        let (zm, zp, zs) = (
+            opt_in(file, b"/z", b"master"),
+            opt_in(file, b"/z", b"propagate_from"),
+            opt_in(file, b"/x", b"shared"),
+        );
+        sys_write(go[1] as u64, b"g".as_ptr(), 1);
+        let mut ws = 0i32;
+        sys_wait4(pid, &mut ws, 0, 0);
+        for fd in [ready[0], ready[1], go[0], go[1]] {
+            sys_close(fd as u64);
+        }
+        check(b"chroot", b[0] == 1, -1)?;
+        check(b"x seen", zs == gx, zs as i64)?;
+        check(b"z master in chroot", zm == gh, zm as i64)?;
+        check(b"propagate_from", zp == gx, zp as i64)
+    })();
+    for p in [
+        &b"/tmp/pf/vis/z\0"[..],
+        b"/tmp/pf/hid\0",
+        b"/tmp/pf/vis/x\0",
+    ] {
+        sys_umount2(p.as_ptr(), MNT_DETACH);
+    }
+    rmdirs(&dirs[1..]);
+    sys_umount2(b"/tmp/pf\0".as_ptr(), MNT_DETACH);
+    sys_rmdir(dirs[0].as_ptr());
     r
 }
 
