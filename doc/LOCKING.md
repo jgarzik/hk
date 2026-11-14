@@ -1494,20 +1494,28 @@ stop is `TaskSignalState.jobctl` (`jobctl::TRACED`, `PTRACE_FROZEN`),
 `ptrace_code` and `last_siginfo`, all under the tracee's `Task.sig`.
 The tracee checks it is traced under TASKLIST's read lock (`ptrace`
 is written under the write lock, so a detach cannot slip between) and
-sets the stop under its `Task.sig` inside it, drops both, wakes
-`CHILD_EXIT_WQ` and signals its tracer, then sleeps `Killable` until
+sets the stop under its `Task.sig` inside it, drops `Task.sig`, wakes
+`CHILD_EXIT_WQ` and signals its tracer still inside that read hold
+(Linux ptrace_stop: do_notify_parent_cldstop under tasklist_lock, so
+a tracer that detached first gets no CLD_TRAPPED), drops TASKLIST,
+then sleeps `Killable` until
 the stop has ended (`Task.sig`, rechecked after each wakeup) or
-SIGKILL. The tracer's wait walks its tracees under the read lock and
+SIGKILL. PTRACE_ATTACH sends its SIGSTOP in the TASKLIST write
+section that links the tracer (Linux ptrace_attach under
+tasklist_lock). The tracer's wait walks its tracees under the read lock and
 takes a stop's code under that tracee's `Task.sig` (Linux
 wait_task_stopped); resume, detach and the tracer's exit
-(`exit_ptrace`) end the stop and set the code to deliver under it, then
-`try_to_wake_up` the tracee. The tracer's exit detaches
-one tracee per write section; a PTRACE_O_EXITKILL tracee's SIGKILL is
-queued in that section before the detach (`sigkill_held`, Linux
-exit_ptrace under tasklist_lock: SIGKILL takes no queue entry, so
-nothing allocates), so a tracee woken by anything between the section
-and its wakeup still dies before user code; the kill's group effects
-and wakeups follow the lock (`Posted::finish`). SIGKILL ends the stop
+(`exit_ptrace`) end the stop, set the code to deliver and
+`try_to_wake_up` the tracee under it (`ptrace_wake`, Linux
+ptrace_resume and __ptrace_unlink's ptrace_signal_wake_up under
+siglock); detach and the tracer's exit do so in the TASKLIST write
+section that untraces it (Linux __ptrace_detach under tasklist_lock).
+The tracer's exit detaches one tracee per write section; a
+PTRACE_O_EXITKILL tracee's SIGKILL is sent in that section before
+the detach (`send_sig_info_in`, Linux exit_ptrace under tasklist_lock:
+SIGKILL takes no queue entry, so nothing allocates), its group
+effects and wakeups done there too, so the tracee never runs untraced
+user code. SIGKILL ends the stop
 under the `Task.sig` hold that queues it (`sigkill_task`, Linux
 signal_wake_up(fatal) clearing JOBCTL_TRACED under siglock), so a wait
 after the kill never reports the stop, and a kill needs no TASKLIST
@@ -1521,10 +1529,16 @@ leaving `ptrace_stop`), so no stale flag outlives a stop; while it is
 set, SIGKILL leaves the stop alone (`sigkill_task`, and the tracee,
 woken, sleeps `Uninterruptible` once it reads frozen with SIGKILL
 pending), and the guard's drop ends a stop with SIGKILL pending and
-wakes the tracee (Linux ptrace_unfreeze_traced). The arch register
-helpers take the TASKLIST read lock, then the tracee's `Task.sig`,
-held across the frame access (a stop ends only under it); they and
-the single-step helpers lock for themselves, so callers hold neither.
+wakes the tracee under its `Task.sig` (Linux ptrace_unfreeze_traced).
+The tracee's user
+register frame is touched only through `ptrace::with_stopped_regs`
+(the arch register and single-step helpers): TASKLIST's read lock,
+then the tracee's `Task.sig`, held across the frame access (a stop
+ends only under it), ESRCH unless the tracee is stopped and frozen
+(Linux: regs of a task ptrace_check_attach froze); callers hold
+neither. A detach clears the single-step flag while the tracee is
+still frozen, before it is untraced (Linux ptrace_detach:
+ptrace_disable first).
 
 **Source of Truth for Scheduling** (owner CPU's rq, IrqSpinlock):
 1. **Runnable**: entry `queued` (in `CpuRunQueue.queue`)
@@ -3689,19 +3703,19 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 6. **A group signal's thread is chosen under TASKLIST, not siglock**
    (Linux complete_signal under siglock): a send holds TASKLIST's read
    lock from finding its receiver to its last wakeup (`send_task_in`;
-   a caller already holding it, a process-group walk, sends in place,
-   as Linux group_send_sig_info under tasklist_lock). After the signal
+   a caller already holding it, read or write, sends in place: a
+   process-group walk, a child's notice, exit_ptrace's EXITKILL, as
+   Linux send_signal_locked under tasklist_lock). After the signal
    is queued under the receiver's `Task.sig`, the threads are walked
-   (`signal::choose`; a send under the write lock, a child's notice,
-   chooses in that section), each candidate's `Task.sig` taken alone
+   (`signal::choose`), each candidate's `Task.sig` taken alone
    to test wants_signal, and whether it ends the group decided there,
    never for an init its protection covers (`Target::protects`). Then,
    still under TASKLIST, a decided group kill is done (`group_kill`,
    `zap_threads`: each thread's `Task.sig` alone, nothing allocated)
    and the chosen thread's TIF_SIGPENDING is recomputed under its
-   `Task.sig` and it is woken; a send under the write lock leaves
-   these to `Posted::finish`, which takes the read lock after the
-   write lock is dropped. A send changes no blocked mask, so it never
+   `Task.sig` and it is woken, all in the caller's TASKLIST section
+   (a wakeup takes only pi_lock and run-queue locks). A send changes
+   no blocked mask, so it never
    retargets (`with_sig_send`), which would take TASKLIST again. A
    thread that blocks a group signal or starts exiting hands it on
    the same way after dropping its own lock (retarget_shared_pending).
@@ -3867,21 +3881,15 @@ de_thread, exit_group does not.
   __unhash_process). Under the write
   lock: the receiver and signal, the autoreap decision (the parent
   process's SIGCHLD action, in the `SigHand` of the thread the signal
-  goes to) and the queueing (`signal::send_held`: TASKLIST →
-  Task.sig → SignalStruct.shared → SigHand.action, the order above);
-  an autoreaped zombie leaves the task list there too (Linux
-  EXIT_DEAD). Its `SigQueue` entry is made and charged before the lock
-  (`notify::Entry`, for the receiver's user found under the read lock;
-  none when no signal is sent: a parent that ignores SIGCHLD);
-  if the receiver's user or the signal changed by the time the write
-  lock is held (`Entry::fits`), the lock is dropped and a new entry made
-  before anything changes. The thread that takes the signal, and
-  whether it ends the parent's group, are chosen there too, as it is
-  queued (`signal::choose`, Linux complete_signal under siglock: a mask
-  changed or the signal dequeued by the time the wakeup runs changes
-  nothing). After the lock: the unused entry is freed, signalfd readers
-  and the chosen thread are woken and a decided group kill is done
-  (`Posted::finish`), the autoreaped Task released.
+  goes to) and the whole send (`signal::send_task_in`: TASKLIST →
+  Task.sig → SignalStruct.shared → SigHand.action, the order above;
+  its `SigQueue` entry made under the receiver's `Task.sig`,
+  GFP_ATOMIC, rule 5); an autoreaped zombie leaves the task list there
+  too (Linux EXIT_DEAD). The thread that takes the signal is chosen,
+  a decided group kill done, and signalfd readers and that thread
+  woken in the same section (Linux __group_send_sig_info,
+  complete_signal under siglock inside tasklist_lock). After the
+  lock: the autoreaped Task released.
 - de_thread (exec) holds cred_guard (sleeping, outermost) while it waits
   on CHILD_EXIT_WQ (killable) until every other thread is released and
   the leader is a zombie (`exec_waits`, Linux notify_count: a traced

@@ -4,7 +4,7 @@
 //! for ptrace operations.
 
 use crate::task::Task;
-use crate::task::percpu::TASKLIST;
+use crate::task::ptrace::with_stopped_regs;
 use crate::util::error::{KernelError, KernelResult};
 
 // =============================================================================
@@ -84,27 +84,10 @@ pub type UserRegs = UserRegsStruct;
 // Register access functions
 // =============================================================================
 
-/// Get all general-purpose registers from a stopped tracee.
-///
-/// The tracee must be in Traced state. This reads its user registers
-/// from its pt_regs (the entry frame at the top of its kernel stack).
+/// All general-purpose registers of tracee `t`, from its pt_regs, held
+/// in its ptrace stop ([`with_stopped_regs`]; ESRCH otherwise)
 pub fn get_user_regs(t: &Task) -> KernelResult<UserRegsStruct> {
-    let table = TASKLIST.read();
-    let task = table.view(t).ok_or(KernelError::NoProcess)?;
-
-    // Check task is in traced state
-    let stop = task.task.sig.lock();
-    if !stop.traced() {
-        return Err(KernelError::NoProcess); // not stopped
-    }
-
-    // Its pt_regs: the frame at the top of its kernel stack
-    // SAFETY: the tracee is in a ptrace stop, which ends only under
-    // its Task.sig (held), and switched out (ptrace_check_attach):
-    // its frame is stable
-    let tf = unsafe { &*crate::task::percpu::task_pt_regs(task.task) };
-
-    let regs = UserRegsStruct {
+    with_stopped_regs(t, |tf| UserRegsStruct {
         r15: tf.r15,
         r14: tf.r14,
         r13: tf.r13,
@@ -126,31 +109,19 @@ pub fn get_user_regs(t: &Task) -> KernelResult<UserRegsStruct> {
         eflags: tf.rflags,
         rsp: tf.rsp,
         ss: tf.ss,
-        fs_base: task.task.tls.load(core::sync::atomic::Ordering::Relaxed),
-        gs_base: task.task.gsbase.load(core::sync::atomic::Ordering::Relaxed),
+        fs_base: t.tls.load(core::sync::atomic::Ordering::Relaxed),
+        gs_base: t.gsbase.load(core::sync::atomic::Ordering::Relaxed),
         ds: 0x2b,
         es: 0x2b,
         fs: 0,
         gs: 0,
-    };
-
-    Ok(regs)
+    })
 }
 
-/// Set all general-purpose registers for a stopped tracee.
-///
-/// The tracee must be in Traced state. This updates its pt_regs so the
-/// registers take effect when it resumes.
+/// Set all general-purpose registers of tracee `t`, in its pt_regs,
+/// held in its ptrace stop ([`with_stopped_regs`]; ESRCH otherwise), to
+/// take effect when it resumes
 pub fn set_user_regs(t: &Task, regs: &UserRegsStruct) -> KernelResult<()> {
-    let table = TASKLIST.read();
-    let task = table.view(t).ok_or(KernelError::NoProcess)?;
-
-    // Check task is in traced state
-    let stop = task.task.sig.lock();
-    if !stop.traced() {
-        return Err(KernelError::NoProcess); // not stopped
-    }
-
     // A non-canonical RIP would fault on the return to user mode in ring
     // 0 (SYSRET with the user stack loaded): refused (EIO). Linux takes
     // it and returns through IRET, which delivers SIGSEGV.
@@ -162,9 +133,11 @@ pub fn set_user_regs(t: &Task, regs: &UserRegsStruct) -> KernelResult<()> {
         return Err(KernelError::Io);
     }
 
-    // Update its pt_regs with the new register values
-    // SAFETY: as in get_user_regs
-    let tf = unsafe { &mut *crate::task::percpu::task_pt_regs(task.task) };
+    with_stopped_regs(t, |tf| put_regs(t, tf, regs))
+}
+
+/// Write `regs` into tracee `t`'s frame `tf`
+fn put_regs(t: &Task, tf: &mut crate::task::ptrace::PtRegs, regs: &UserRegsStruct) {
     tf.r15 = regs.r15;
     tf.r14 = regs.r14;
     tf.r13 = regs.r13;
@@ -187,14 +160,10 @@ pub fn set_user_regs(t: &Task, regs: &UserRegsStruct) -> KernelResult<()> {
     tf.rflags = sanitize_rflags(regs.eflags);
     tf.rsp = regs.rsp;
 
-    task.task
-        .tls
+    t.tls
         .store(regs.fs_base, core::sync::atomic::Ordering::Relaxed);
-    task.task
-        .gsbase
+    t.gsbase
         .store(regs.gs_base, core::sync::atomic::Ordering::Relaxed);
-
-    Ok(())
 }
 
 /// Sanitize RFLAGS to prevent setting dangerous flags.
@@ -216,25 +185,15 @@ fn sanitize_rflags(rflags: u64) -> u64 {
 /// RFLAGS Trap Flag bit
 const RFLAGS_TF: u64 = 0x100;
 
-/// Enable single-step mode for a task.
-///
-/// Sets the TF (Trap Flag) in RFLAGS so the CPU generates a debug exception
-/// after executing one instruction.
-pub fn enable_single_step(t: &Task) {
-    let table = TASKLIST.read();
-    if let Some(task) = table.view(t) {
-        // SAFETY: as in get_user_regs
-        unsafe { (*crate::task::percpu::task_pt_regs(task.task)).rflags |= RFLAGS_TF };
-    }
+/// Single-step tracee `t` (Linux user_enable_single_step): TF in its
+/// RFLAGS, so the CPU raises a debug exception after one instruction;
+/// the tracee held in its ptrace stop ([`with_stopped_regs`])
+pub fn enable_single_step(t: &Task) -> KernelResult<()> {
+    with_stopped_regs(t, |tf| tf.rflags |= RFLAGS_TF)
 }
 
-/// Disable single-step mode for a task.
-///
-/// Clears the TF (Trap Flag) in RFLAGS.
-pub fn disable_single_step(t: &Task) {
-    let table = TASKLIST.read();
-    if let Some(task) = table.view(t) {
-        // SAFETY: as in get_user_regs
-        unsafe { (*crate::task::percpu::task_pt_regs(task.task)).rflags &= !RFLAGS_TF };
-    }
+/// Stop single-stepping tracee `t` (Linux user_disable_single_step):
+/// TF cleared, the tracee held in its ptrace stop
+pub fn disable_single_step(t: &Task) -> KernelResult<()> {
+    with_stopped_regs(t, |tf| tf.rflags &= !RFLAGS_TF)
 }
