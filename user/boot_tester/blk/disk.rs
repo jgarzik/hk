@@ -429,6 +429,7 @@ fn vfat(d: &Disk) {
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     verdict(b"BLK_VFAT_UMOUNT", u == 0, u);
     vfat_remount(p1);
+    vfat_lazy_umount(p1);
     vfat_names(p1);
     vfat_opts(p1);
     vfat_neg_case(p1);
@@ -522,6 +523,32 @@ fn vfat_remount(p1: &BlkDev) {
         println(b"");
     }
     verdict(b"VFAT_REMOUNT_DATA", ok && u == 0, n);
+}
+
+/// What a file left open by a lazy umount writes reaches the disk when
+/// its last user goes (Linux: the last deactivate_super's
+/// generic_shutdown_super runs sync_filesystem, before the close
+/// returns): a new mount reads it
+fn vfat_lazy_umount(p1: &BlkDev) {
+    const MNT_DETACH: u64 = 2;
+    let opts = b"iocharset=cp437\0";
+    let path = b"/mnt/vd1/LAZY.TXT\0";
+    let r = mount_vd1(p1, opts);
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), MNT_DETACH);
+    let w = sys_pwrite64(fd, b"after detach".as_ptr(), 12, 0);
+    sys_close(fd as u64);
+    let m = mount_vd1(p1, opts);
+    let mut b = [0u8; 32];
+    let n = read_file(path, &mut b);
+    sys_unlink(path.as_ptr());
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    let ok = r == 0 && fd >= 0 && u == 0 && w == 12 && m == 0;
+    verdict(
+        b"VFAT_LAZY_UMOUNT_SYNC",
+        ok && n == 12 && &b[..12] == b"after detach",
+        if ok { n } else { r * 1000 + u * 100 + m },
+    );
 }
 
 /// Mount vda1 on /mnt/vd1 with mount data `opts` (NUL-terminated)

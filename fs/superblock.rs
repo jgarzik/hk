@@ -480,14 +480,18 @@ fn kill_sb(sb: &SuperBlock, g: sync::RwSemWriteGuard<'_, ()>) {
 /// What every filesystem's shutdown does (Linux generic_shutdown_super),
 /// under s_umount held for writing, which it releases: inotify watches
 /// get IN_UNMOUNT and go (fsnotify_sb_delete), the dentry tree is
-/// dropped (shrink_dcache_for_umount) and the inodes leave s_inodes
-/// (evict_inodes); then SB_DYING tells walkers and mounters
+/// dropped (shrink_dcache_for_umount), what is dirty is written back
+/// while the device is still open (sync_filesystem) and the inodes
+/// leave s_inodes (evict_inodes); then SB_DYING tells walkers and
+/// mounters
 fn generic_shutdown_super(sb: &SuperBlock, g: sync::RwSemWriteGuard<'_, ()>) {
     let root = sb.root.write().take();
     if let Some(root) = root {
         sb.s_fsnotify.sb_delete();
         super::dentry::d_drop_tree(&root);
         drop(root);
+        // Linux ignores sync_filesystem's error here too
+        let _ = super::fs_writeback::writeback_sb(sb);
         super::inode::sb_list_drain(&sb.s_inodes);
     }
     sb.super_wake(SB_DYING);

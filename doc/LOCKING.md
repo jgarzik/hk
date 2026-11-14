@@ -553,9 +553,11 @@ VFS locks (detailed order):
     SuperBlock.s_umount (sync::RwSem; write for remount and for the
                    last active reference's shutdown (taken with
                    nothing held: generic_shutdown_super takes d_locks,
-                   INODE_SB_LIST_LOCK, inotify locks and what eviction
-                   takes under it), read for a bind remount and the
-                   superblock walks; trylock-read for reclaim's)
+                   INODE_SB_LIST_LOCK, inotify locks, the writeback
+                   pass (BdiWriteback.pass and what writeback takes)
+                   and what eviction takes under it), read for a bind
+                   remount and the superblock walks; trylock-read for
+                   reclaim's)
         ↓
     mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write, and
                    the tree's links in attach_mnt/detach_mnt; across
@@ -2760,7 +2762,7 @@ dropped. No dentry's last reference is dropped under a d_lock.
 | `KNode.iattr` | spin Mutex, leaf (Linux kernfs_iattr_rwsem) | written by chmod/chown/utimes under the inode's i_rwsem; read (copied out) when lookup builds an inode, under the parent's i_rwsem |
 | `AttrNode.ops`, `BinNode.ops` | spin RwLock, leaf | read (clone) under an active reference by show()/store(); cleared by `KNode::remove` after the drain, with no lock held, the operations dropped after it is released (a removed node kept by a dentry or open file pins nothing) |
 | `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks, and across a read's copy to the caller (may fault: -> mmap_lock; no active reference held then, Linux seq_read_iter under m->lock); a write copies its data in before taking it; under f_pos_lock for read/write |
-| `SB_LOCK` (sget) | spin Mutex, leaf | a network namespace's sysfs superblock is found in `SYSFS_TYPE.fs_supers` by `sget` (Linux kernfs_get_tree), its test reading `SuperBlock.private` under the lock |
+| `SB_LOCK` (sget) | spin Mutex (under it only `SuperBlock.private` read by a test, and the SB_DEAD wakeup) | a network namespace's sysfs superblock is found in `SYSFS_TYPE.fs_supers` by `sget` (Linux kernfs_get_tree), its test reading `SuperBlock.private` under the lock; the match is then taken by `grab_super` with the lock released |
 
 Device model (base/): `Device.lock` (sync::Mutex, Linux device_lock)
 guards the device's "dead" flag, set first by `del` (a dead device is
@@ -5015,7 +5017,7 @@ list taken whole under its lock) takes the marks out under `Marks.list`, release
 | `Inode.i_writecount`, `Inode.i_swapfile` | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write` through a file's `DenyWrite`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: set and cleared by swapon/swapoff
 under its i_rwsem, `SWAPON` -> i_rwsem, and checked under it by
 writes and truncates). The address space holds the executable's denial (`MmStruct.exe_deny`, cloned at fork) |
-| `BdiWriteback.pass` | mm/writeback.rs, fs/fs_writeback.rs | sleeping `sync::Mutex` | serializes writeback passes over one disk's lists (`wb_writeback`: sync, syncfs, umount, the periodic writeback; Linux runs them one at a time from the wb's work list), held across their I/O: pass -> page lock -> i_mmap -> PTE lock, and `list_lock` taken and released under it per step. fsync writes its inode without it; a page another pass is writing carries the WRITEBACK mark and its writer holds its page lock, so fsync waits on that lock |
+| `BdiWriteback.pass` | mm/writeback.rs, fs/fs_writeback.rs | sleeping `sync::Mutex` | serializes writeback passes over one disk's lists (`wb_writeback`: sync, syncfs, a superblock's shutdown (under its s_umount write), the periodic writeback; Linux runs them one at a time from the wb's work list), held across their I/O: pass -> page lock -> i_mmap -> PTE lock, and `list_lock` taken and released under it per step. fsync writes its inode without it; a page another pass is writing carries the WRITEBACK mark and its writer holds its page lock, so fsync waits on that lock |
 | `BdiWriteback.list_lock` | mm/writeback.rs, fs/fs_writeback.rs | spin Mutex leaf | Linux wb->list_lock: the disk's dirty inodes, `b_dirty` (oldest first) and `b_io` (the running pass's), `ArcList`s through `Inode.i_io_list` holding a reference each (a dirty inode stays in memory until written back), and `Inode.i_dirty`'s clearing. `mark_inode_dirty` (called by every page dirtying, `filemap::dirty_page`, through the mapping's `host`: Linux __folio_mark_dirty) sets `i_dirty` first and, the first time, queues the inode at the tail under a page lock at most, then arms the periodic work after unlocking if the lists were empty (a block device's own inode is on its disk's lists too). A pass moves the expired inodes (of one superblock for a sync) to `b_io` in one hold (`ArcList::move_if`, Linux queue_io), then per inode: under the lock take it off `b_io` and clear `i_dirty`, unlock, write it, drop it with no lock held (its last reference may evict it). `AddressSpace.dirtied_when` is stored (release, under the `i_pages` lock) when the mapping's first dirty page since it was clean comes, and read (acquire) under `list_lock` by the expiry test |
 | `LAST_INO` (per CPU) | fs/anon_inodes.rs | IrqSpinlock leaf | this CPU's batch of pseudo-filesystem inode numbers (Linux get_next_ino, preempt-off per-CPU counter); refilled from the atomic `SHARED_LAST_INO` under it |
 | `NUMA_TOPOLOGY` | mm/numa.rs | IrqSpinlock leaf | NUMA node table: written by the boot parsers and by each CPU at bring-up (`numa::cpu_up`, end of arch per-CPU init), read by getcpu and the mempolicy syscalls |

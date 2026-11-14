@@ -1775,10 +1775,11 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         // one's teardown runs before the syscall returns)
     }
 
-    // Write the filesystem back, outside namespace_sem: writeback takes
-    // inode locks, which nest outside it (Linux: deactivate_super ->
-    // sync_filesystem after namespace_unlock)
-    let _ = super::fs_writeback::writeback_sb(&mount.sb);
+    // The filesystem is written back by its shutdown, when the last
+    // active reference goes (Linux deactivate_super ->
+    // generic_shutdown_super's sync_filesystem): here, once the
+    // caller's reference is put, or later, with its last user, after a
+    // lazy umount or with another mount left
     Ok(())
 }
 
