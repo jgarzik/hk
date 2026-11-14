@@ -91,6 +91,15 @@ let mut rq = sched.lock.lock();  // IRQs disabled, preemption disabled
 // IRQs and preemption restored automatically on drop
 ```
 
+### 1.1.1 IrqRwLock<T>
+
+Linux rwlock_t taken with read_lock_irqsave / write_lock_irqsave
+(`sync/irqspin.rs`): readers share it, a writer excludes all; either
+side masks interrupts and raises the preempt count while held, so it
+is ordered like an `IrqSpinlock` (non-IRQ-safe locks such as TASKLIST
+may be taken inside it, never the reverse in interrupt context). Used
+for SIGIO's `Fasync.fa` and `FOwner.st` (Linux fa_lock, fown->lock).
+
 ### 1.2 Mutex<T> (spin crate, via `sync::spin`)
 
 A standard spinning mutex from the `spin` crate (taken through
