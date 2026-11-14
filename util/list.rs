@@ -747,6 +747,19 @@ impl<A: OwnerAdapter> OwnedList<A> {
 
     /// A new reference to the entry after `item`; None if `item` is the
     /// last or not on this list
+    /// The entry after `item`, borrowed for as long as the list is (None
+    /// for the last one, or an item not on this list)
+    pub fn next_ref(&self, item: &A::Item) -> Option<&A::Item> {
+        if !self.mine(item) {
+            return None;
+        }
+        // SAFETY: marked with this list's id, so on it (type invariant)
+        let p = unsafe { self.list.list.next(core::ptr::from_ref(item)) }?;
+        // SAFETY: an entry of the borrowed list, which holds a reference
+        // to it while it is on it
+        Some(unsafe { &*p })
+    }
+
     pub fn next(&self, item: &A::Item) -> Option<Arc<A::Item>> {
         if !self.mine(item) {
             return None;

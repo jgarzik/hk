@@ -442,6 +442,17 @@ impl Mount {
         Some(unsafe { (&*parent, &*mp) })
     }
 
+    /// The parent mount, borrowed from the lock `_s` holds the tree
+    /// still with: its link changes only under NAMESPACE_SEM write and
+    /// MOUNT_LOCK both, and a parent's teardown unhangs its submounts
+    /// under both before it goes
+    fn parent_in<'a>(&'a self, _s: &'a impl Stable) -> Option<&'a Mount> {
+        let p = self.parent.read().as_ref().map(Weak::as_ptr)?;
+        // SAFETY: as above: while `_s` is held the link stays and the
+        // parent, which still has `self` hung on it, lives
+        Some(unsafe { &*p })
+    }
+
     /// Set parent mount
     pub fn set_parent(&self, parent: &MountRef) {
         *self.parent.write() = Some(MountRef::downgrade(parent));
@@ -524,6 +535,35 @@ pub fn next_mnt(p: &MountRef, root: &Mount, s: &impl Stable) -> Option<MountRef>
         p = parent;
     }
     None
+}
+
+/// `f` on `root` and every mount below it, parents first, borrowed
+/// from the lock `s` holds the tree still with (Linux umount_tree's
+/// next_mnt walk): no reference is taken or put, as a walk must not
+/// that clears `mnt_ns` before the grace period
+fn for_each_mnt<'a, S: Stable>(root: &'a Mount, s: &'a S, mut f: impl FnMut(&'a Mount)) {
+    let mut p = root;
+    loop {
+        f(p);
+        if let Some(c) = s.mounts(p).first() {
+            p = c;
+            continue;
+        }
+        // The next sibling of the nearest mount up to `root` that has one
+        loop {
+            if core::ptr::eq(p, root) {
+                return;
+            }
+            let Some(parent) = p.parent_in(s) else {
+                return;
+            };
+            if let Some(n) = s.mounts(parent).next_ref(p) {
+                p = n;
+                break;
+            }
+            p = parent;
+        }
+    }
 }
 
 /// `root` and every mount below it, parents first, by [`next_mnt`]
@@ -923,12 +963,17 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         if let Some(t) = detach_mnt(&mut ns, m) {
             gone.push(t);
         }
-        // Unmounted mounts leave propagation and the namespace
-        // (Linux umount_tree)
+        // Unmounted mounts leave propagation (Linux umount_tree), while
+        // still in the namespace: the references taken here go by the
+        // fast path
         for t in walk(m, &*ns) {
             super::pnode::change_propagation(&t, super::pnode::Prop::Private);
-            t.set_ns(0);
         }
+    }
+    // Then the namespace, in a walk that takes no reference: none may be
+    // put by the exact path before the grace period
+    for m in core::iter::once(&mount).chain(copies.iter()) {
+        for_each_mnt(m, &*ns, |t| t.set_ns(0));
     }
     drop(ns);
     crate::sync::rcu::synchronize();
@@ -952,10 +997,13 @@ pub fn put_mnt_ns(root: MountRef) {
     let mut gone = OwnedList::<MntChild>::new();
     {
         let mut ns = namespace_lock();
+        // Propagation first, while every mount is in the namespace (the
+        // references taken go by the fast path), then the namespace, in
+        // a walk that takes none
         for t in walk(&root, &*ns) {
             super::pnode::change_propagation(&t, super::pnode::Prop::Private);
-            t.set_ns(0);
         }
+        for_each_mnt(&root, &*ns, |t| t.set_ns(0));
         // Every submount off its parent, breadth first, onto `gone`
         // (intrusive: nothing allocated under the locks)
         let mut ml = MOUNT_LOCK.write();
