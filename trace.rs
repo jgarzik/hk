@@ -268,6 +268,34 @@ impl BinAttr for TraceFile {
         buf[..n].copy_from_slice(&t[start..start + n]);
         Ok(n)
     }
+
+    /// Writes are accepted and dropped (Linux tracing_write_stub), so
+    /// `echo > trace` clears through its O_TRUNC open
+    fn write(&self, _off: u64, data: &[u8]) -> Result<usize, KernelError> {
+        Ok(data.len())
+    }
+
+    /// Linux tracing_open: an open for writing with O_TRUNC empties
+    /// every CPU's ring (tracing_reset_online_cpus)
+    fn open(&self, writable: bool, flags: u32) -> Result<(), KernelError> {
+        if writable && flags & crate::fs::file::flags::O_TRUNC != 0 {
+            reset();
+        }
+        Ok(())
+    }
+}
+
+/// Empty every CPU's ring, its counts too (Linux tracing_reset_online_cpus)
+fn reset() {
+    for (_, slot) in RINGS.for_each_possible() {
+        if let Some(ring) = slot.get() {
+            let mut r = ring.lock();
+            r.head = 0;
+            r.used = 0;
+            r.written = 0;
+            r.overrun = 0;
+        }
+    }
 }
 
 static ROOT: Once<Arc<KNode>> = Once::new();
@@ -345,7 +373,7 @@ pub fn init() {
             }
         }
     }
-    let _ = root().create_bin(b"trace", 0o440, arc_nofail(TraceFile));
+    let _ = root().create_bin(b"trace", 0o640, arc_nofail(TraceFile));
     sysfs::mount_point(&sysfs::top_dir(b"kernel"), b"tracing");
     crate::fs::superblock::register_filesystem(&TRACEFS_TYPE).expect("tracefs type");
 }

@@ -3538,7 +3538,10 @@ under it; the oldest records are overwritten). The rings are allocated
 once at boot (`trace::init`, before any reader) only when the command
 line asked for tracing. tracefs's `trace` file (kernfs, /sys/kernel/
 tracing) copies each ring out under its lock into a buffer allocated
-before taking it, one CPU at a time, and formats with no lock held.
+before taking it, one CPU at a time, and formats with no lock held; an
+O_TRUNC open for writing (Linux tracing_open) empties each ring under
+its lock, one CPU at a time, from the kernfs open hook (under the
+node's active reference, no other lock).
 
 ### 3.7 Signal Infrastructure
 
