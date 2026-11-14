@@ -19,8 +19,9 @@
 //! All protocol processing runs in thread context: in the `softnet/N`
 //! threads, or inline in a sending task at a lock-free point
 //! ([`netif_rx_flush_local`], the equivalent of Linux running pending
-//! softirqs at `local_bh_enable()` after `dev_queue_xmit`). Nothing below a
-//! driver ISR ever runs in interrupt context.
+//! softirqs at `local_bh_enable()` after `dev_queue_xmit`, and like it on
+//! the CPU's IRQ stack, atomic, GFP_ATOMIC). Nothing below a driver ISR
+//! ever runs in interrupt context.
 //!
 //! ## Locking (see doc/LOCKING.md, Network)
 //!
@@ -475,14 +476,22 @@ pub fn netif_rx_flush_local() {
         cpu => cpu,
     };
     let sd = SOFTNET.get(cpu);
-    let mut budget = NETDEV_BUDGET;
-    while budget > 0 && !sd.backlog.lock().is_empty() {
-        let n = process_backlog(sd, budget.min(NAPI_POLL_WEIGHT));
-        if n == 0 {
-            break;
-        }
-        budget -= n;
-    }
+    // On the IRQ stack, atomic, allocating GFP_ATOMIC (Linux runs these
+    // pending softirqs at local_bh_enable through do_softirq_own_stack):
+    // a receive path nested in a deep task path (an exit closing TCP
+    // sockets over lo) does not add to the task's stack
+    crate::irq_stack::run_softirq(|| {
+        crate::util::kalloc::with_gfp(crate::mm::page_alloc::Gfp::ATOMIC, || {
+            let mut budget = NETDEV_BUDGET;
+            while budget > 0 && !sd.backlog.lock().is_empty() {
+                let n = process_backlog(sd, budget.min(NAPI_POLL_WEIGHT));
+                if n == 0 {
+                    break;
+                }
+                budget -= n;
+            }
+        });
+    });
     if !sd.backlog.lock().is_empty() {
         sd.wq.wake_all();
     }

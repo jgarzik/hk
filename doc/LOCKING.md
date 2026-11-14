@@ -4283,7 +4283,11 @@ transmit path therefore never re-enters the receive path. A sending socket
 syscall then runs `netif_rx_flush_local()` at a point where it holds no
 locks (Linux runs pending softirqs at `local_bh_enable()` after
 `dev_queue_xmit`), so loopback data is normally queued at the peer before
-`sendto()` returns. A received packet's namespace is its device's
+`sendto()` returns. As Linux's do_softirq_own_stack it runs the backlog
+on the CPU's IRQ stack (`irq_stack::run_softirq`: interrupts on, nesting
+there; preemption off), allocating GFP_ATOMIC: atomic, it never sleeps,
+and a deep task path (an exit closing TCP sockets over lo) does not
+carry the receive path's depth on its own stack. A received packet's namespace is its device's
 (`skb.net()`), never `current_net_ns()`; a socket's is `Sock.net`.
 
 Today all device IRQs are routed to CPU 0 (PIC / GIC IROUTER), so
