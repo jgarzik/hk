@@ -33,7 +33,9 @@
 //! but MOUNT_LOCK.
 //!
 //! The mount's memory is an `Arc`: one strong count stands for all its
-//! references, taken back by the teardown; list entries and `Weak`s keep
+//! references, taken back by the teardown, which drops it a grace
+//! period later (Linux delayed_free_vfsmnt), so an RCU walk may read a
+//! mount it reached with no reference; list entries and `Weak`s keep
 //! the rest.
 //!
 //! Locking: a put's exact path and a `try_get` outside a namespace take
@@ -147,6 +149,36 @@ impl MountRef {
         // held; after the teardown, only memory goes
     }
 
+    /// A reference to `m`, reached under an RCU read guard with
+    /// MOUNT_LOCK's sequence `seq` sampled before (Linux
+    /// __legitimize_mnt): the add first, then the sequence. Unmoved, no
+    /// link to `m` changed since the sample, so the tree still holds its
+    /// reference and the add is counted. Moved: under MOUNT_LOCK, an add
+    /// to a doomed mount is taken back (`Err(None)`), else the caller
+    /// gets the reference to put, with the guard released, before it
+    /// retries (`Err(Some)`).
+    pub(super) fn legitimize(m: &Mount, seq: u32) -> Result<Self, Option<Self>> {
+        if MOUNT_LOCK.read_retry(seq) {
+            return Err(None);
+        }
+        m.pcp_add(1);
+        // Pairs with `put_slow`'s: its sum sees this add, or this sees
+        // the write section that took the tree's reference away
+        fence(Ordering::SeqCst);
+        let r = Self(NonNull::from(m));
+        if !MOUNT_LOCK.read_retry(seq) {
+            return Ok(r);
+        }
+        let _ml = MOUNT_LOCK.read_excl();
+        if m.doomed.load(Ordering::Acquire) {
+            // Its count reached zero without this add: never a reference
+            core::mem::forget(r);
+            m.pcp_add(-1);
+            return Err(None);
+        }
+        Err(Some(r))
+    }
+
     /// Another reference to a list entry (by [`MountRef::into_entry`])
     /// while it is on the list (the caller holds the lock that keeps it
     /// there), which holds one
@@ -182,6 +214,12 @@ impl MountRef {
     /// A non-owning link to the mount (no reference)
     pub fn downgrade(this: &Self) -> Weak<Mount> {
         Arc::downgrade(&this.arc())
+    }
+
+    /// The shared `Arc`, another strong count (an entry of the mount
+    /// hash, which holds one)
+    pub(super) fn arc_of(this: &Self) -> Arc<Mount> {
+        Arc::clone(&this.arc())
     }
 
     /// The mount's address (its identity)
@@ -301,6 +339,12 @@ pub(super) unsafe fn __cleanup_mnt(cb: *const CallbackHead) {
     // SAFETY: the mount is doomed (`put_slow`): no reference exists or
     // can be made, and this runs once per mount
     unsafe { m.cleanup() };
+    // An RCU walk that reached it before its links were cleared may
+    // still read it (Linux cleanup_mnt's call_rcu of
+    // delayed_free_vfsmnt)
+    if have_cpu() {
+        crate::sync::rcu::kfree_rcu(m);
+    }
 }
 
 /// Mounts whose teardown waits for the system workqueue (Linux
@@ -358,8 +402,17 @@ impl<T> MntOwned<T> {
     /// the mount is doomed (or never had a reference) and is off every
     /// list that hands out a borrowed one.
     pub(super) unsafe fn take(&self) -> T {
-        // SAFETY: the caller's contract gives exclusive use
-        unsafe { ManuallyDrop::take(&mut *self.0.get()) }
+        // SAFETY: the caller's contract: this is the one release. A raw
+        // read, no `&mut`: the bits stay, for `stale`
+        unsafe { ManuallyDrop::into_inner(core::ptr::read(self.0.get())) }
+    }
+
+    /// The value's bits, which `take` leaves in place (Linux: the
+    /// pointer fields of a mount torn down but not yet freed): for an
+    /// RCU walk that may reach the mount after its teardown, to compare
+    /// addresses, never to use the value
+    pub(super) fn stale(&self) -> *const T {
+        self.0.get().cast::<T>()
     }
 }
 

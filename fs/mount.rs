@@ -5,13 +5,17 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use crate::sync::LockedBy;
+use crate::sync::rcu::{RcuPuts, RcuReadGuard};
 use crate::sync::spin::RwLock;
 use crate::sync::{LockedByEither, RwSem, RwSemReadGuard, RwSemWriteGuard, SeqLock, UniqueOwner};
-use crate::util::list::{Link, OwnedList, Owner};
-use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::util::list::{BoxList, Link, OwnedList, Owner};
+use crate::util::rcuhlist::{HNode, RcuHList};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use alloc::boxed::Box;
 
 use super::KernelError;
-use super::dentry::Dentry;
+use super::dentry::{Dentry, DentryRef};
 use super::inode::FileType;
 pub use super::mntput::MountRef;
 use super::mntput::{__cleanup_mnt, MNT_NS_INTERNAL, MntOwned};
@@ -44,6 +48,10 @@ pub const MNT_ATIME_MASK: u32 = MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME;
 pub const MNT_READONLY: u32 = 0x40;
 /// Symlinks on this mount are not followed (Linux MNT_NOSYMFOLLOW)
 pub const MNT_NOSYMFOLLOW: u32 = 0x80;
+/// New write access through the mount waits (Linux MNT_WRITE_HOLD):
+/// set only under MOUNT_LOCK while writers are counted, never seen by
+/// [`Mount::flags`]
+const MNT_WRITE_HOLD: u32 = 0x200;
 /// Cannot be bind-mounted (Linux T_UNBINDABLE, in `t_flags`)
 pub const T_UNBINDABLE: u32 = 0x1;
 /// Cannot be unmounted, moved or pivoted away (Linux MNT_LOCKED: a mount
@@ -63,8 +71,8 @@ unsafe impl UniqueOwner for MntHash {}
 /// Every write of a mount's `mnt_flags` and every change of the mount
 /// tree's links (Linux mount_lock, lock_mount_hash: a seqlock whose
 /// sequence lockless readers may check; read_seqlock_excl is
-/// `read_excl`); under NAMESPACE_SEM, s_umount and (d_path's locking
-/// read) RENAME_LOCK, above nothing but leaves
+/// `read_excl`); under NAMESPACE_SEM and s_umount, above RENAME_LOCK
+/// (d_path, path_is_under) and leaves
 pub static MOUNT_LOCK: SeqLock<MntHash> = SeqLock::new(MntHash(()));
 
 /// Old mount -> its copy, from [`Mount::clone_tree`]
@@ -148,11 +156,11 @@ pub struct Mount {
     pub sb: MntOwned<Arc<SuperBlock>>,
 
     /// Root dentry of the mounted filesystem (Linux mnt_root)
-    pub root: MntOwned<Arc<Dentry>>,
+    pub root: MntOwned<DentryRef>,
 
     /// The dentry where this filesystem is mounted (mount point)
     /// None for the root mount
-    pub mountpoint: RwLock<Option<Arc<Dentry>>>,
+    pub mountpoint: RwLock<Option<DentryRef>>,
 
     /// Parent mount (None for root)
     pub parent: RwLock<Option<Weak<Mount>>>,
@@ -183,9 +191,11 @@ pub struct Mount {
     /// Marked by a first umount2(MNT_EXPIRE) (Linux mnt_expiry_mark)
     expiry: core::sync::atomic::AtomicBool,
 
-    /// Holders of write access through this mount and the WRITE_HOLD bit
-    /// (Linux mnt_writers and WRITE_HOLD): see superblock::get_write
-    writers: AtomicU64,
+    /// Holders of write access through this mount, per CPU (Linux
+    /// mnt_pcp's mnt_writers): a writer adds to any CPU's part, a
+    /// holder sums them with MNT_WRITE_HOLD set (`want_write`,
+    /// `hold_writers`)
+    mnt_writers: PcpSlot,
 
     /// Id in /proc/<pid>/mountinfo and statx (Linux mnt_id): reused
     pub mnt_id: u32,
@@ -202,9 +212,17 @@ pub struct Mount {
     /// write by that put
     pub(super) doomed: AtomicBool,
 
+    /// In the mount hash while attached (Linux mnt_hash), its chain's
+    /// reference released a grace period after it leaves (`mnt_puts`)
+    mnt_hash: HNode,
+    /// The mount hash's deferred releases (`RcuHRef::defer_put`)
+    mnt_puts: RcuPuts,
+
     /// The deferred teardown's head (Linux mnt_rcu as task_work, or
     /// mnt_llist on delayed_mntput_list)
     pub(super) mnt_task_work: CallbackHead,
+    /// The free a grace period after the teardown (Linux mnt_rcu)
+    mnt_rcu: crate::sync::rcu::RcuHead,
 
     /// On its superblock's `s_mounts` (Linux mnt_instance)
     pub(super) mnt_instance: crate::util::list::Link,
@@ -214,7 +232,7 @@ impl Mount {
     /// A new mount, its first reference, or ENOMEM (Linux alloc_vfsmnt)
     pub fn alloc(
         sb: Arc<SuperBlock>,
-        root: Arc<Dentry>,
+        root: DentryRef,
         flags: u32,
         devname: super::name::FileName,
     ) -> Result<MountRef, KernelError> {
@@ -225,6 +243,7 @@ impl Mount {
             flags,
             devname,
             pcp,
+            PcpSlot::new()?,
             MNT_IDS.try_alloc()?,
         ))?;
         m.sb.add_mount(&m);
@@ -235,12 +254,21 @@ impl Mount {
     /// copy (its peer groups and attachments) on failure
     fn alloc_nofail(
         sb: Arc<SuperBlock>,
-        root: Arc<Dentry>,
+        root: DentryRef,
         flags: u32,
         devname: super::name::FileName,
     ) -> MountRef {
         let pcp = PcpSlot::new_nofail();
-        let m = arc_nofail(Self::init(sb, root, flags, devname, pcp, MNT_IDS.alloc()));
+        let w = PcpSlot::new_nofail();
+        let m = arc_nofail(Self::init(
+            sb,
+            root,
+            flags,
+            devname,
+            pcp,
+            w,
+            MNT_IDS.alloc(),
+        ));
         m.sb.add_mount(&m);
         MountRef::first(m)
     }
@@ -248,10 +276,11 @@ impl Mount {
     /// A mount with id `mnt_id`, which its drop gives back
     fn init(
         sb: Arc<SuperBlock>,
-        root: Arc<Dentry>,
+        root: DentryRef,
         flags: u32,
         devname: super::name::FileName,
         mnt_pcp: PcpSlot,
+        mnt_writers: PcpSlot,
         mnt_id: u32,
     ) -> Self {
         Self {
@@ -263,7 +292,7 @@ impl Mount {
             mnt_child: Link::new(),
             mnt_child_owner: Owner::new(),
             mnt_flags: AtomicU32::new(flags),
-            writers: AtomicU64::new(0),
+            mnt_writers,
             expiry: core::sync::atomic::AtomicBool::new(false),
             group: AtomicU32::new(0),
             t_flags: AtomicU32::new(0),
@@ -274,7 +303,10 @@ impl Mount {
             devname,
             mnt_pcp,
             doomed: AtomicBool::new(false),
+            mnt_hash: HNode::new(),
+            mnt_puts: RcuPuts::new(),
             mnt_task_work: CallbackHead::new(__cleanup_mnt),
+            mnt_rcu: crate::sync::rcu::RcuHead::new(),
             mnt_instance: crate::util::list::Link::new(),
         }
     }
@@ -320,9 +352,10 @@ impl Mount {
         self.mnt_ns.store(ns, Ordering::Relaxed);
     }
 
-    /// MNT_* flags
+    /// MNT_* flags (MNT_WRITE_HOLD, a MOUNT_LOCK holder's, left out:
+    /// Linux clone_mnt and remount clear it from what they copy)
     pub fn flags(&self) -> u32 {
-        self.mnt_flags.load(Ordering::Relaxed)
+        self.mnt_flags.load(Ordering::Relaxed) & !MNT_WRITE_HOLD
     }
 
     /// Replace the MNT_* flags (mount, remount): turning MNT_READONLY on
@@ -330,8 +363,8 @@ impl Mount {
     /// through the mount (Linux mnt_make_readonly)
     pub fn set_flags(&self, f: u32) -> Result<(), KernelError> {
         let _ml = MOUNT_LOCK.write();
-        // Lock state is not the caller's to set here
-        let f = (f & !MNT_LOCKED) | (self.flags() & MNT_LOCKED);
+        // Lock state is not the caller's to set here, nor the hold
+        let f = (f & !(MNT_LOCKED | MNT_WRITE_HOLD)) | (self.flags() & MNT_LOCKED);
         // Linux mnt_make_readonly: writers held off; read-only only if
         // none holds access, set before the hold is released
         if f & MNT_READONLY != 0 && self.flags() & MNT_READONLY == 0 {
@@ -346,14 +379,22 @@ impl Mount {
         Ok(())
     }
 
-    /// Linux mnt_hold_writers, under MOUNT_LOCK
+    /// Hold new writers off (Linux mnt_hold_writers), under MOUNT_LOCK:
+    /// true if none holds write access now. The flag is stored before
+    /// the parts are summed (smp_mb), and a writer adds before it looks
+    /// at the flag, so a writer the sum misses waits, then sees the
+    /// read-only state set before `unhold_writers`.
     pub(super) fn hold_writers(&self) -> bool {
-        super::superblock::hold_writers(&self.writers)
+        self.mnt_flags.fetch_or(MNT_WRITE_HOLD, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        self.mnt_writers.sum() <= 0
     }
 
-    /// Linux mnt_unhold_writers, under MOUNT_LOCK
+    /// Let writers in again (Linux mnt_unhold_writers), under
+    /// MOUNT_LOCK: after the read-only state they must see (smp_wmb)
     pub(super) fn unhold_writers(&self) {
-        super::superblock::unhold_writers(&self.writers)
+        fence(Ordering::Release);
+        self.mnt_flags.fetch_and(!MNT_WRITE_HOLD, Ordering::Release);
     }
 
     /// Set (`on`) or clear MNT_* bits that need no other checks, under
@@ -395,9 +436,27 @@ impl Mount {
         self.flags() & MNT_READONLY != 0 || self.sb.rdonly()
     }
 
-    /// Release what want_write took
+    /// Release what want_write took (Linux mnt_put_write_access): from
+    /// any CPU's part, the sum adds up
     pub(super) fn put_write(&self) {
-        self.writers.fetch_sub(1, Ordering::SeqCst);
+        self.mnt_writers.add(-1);
+    }
+
+    /// Take write access (Linux mnt_get_write_access): count first,
+    /// then (smp_mb) wait out a hold, spinning (a holder holds MOUNT_LOCK
+    /// and never waits for writers), then (smp_rmb) EROFS if read-only
+    fn get_write(&self) -> Result<(), KernelError> {
+        self.mnt_writers.add(1);
+        fence(Ordering::SeqCst);
+        while self.mnt_flags.load(Ordering::Relaxed) & MNT_WRITE_HOLD != 0 {
+            core::hint::spin_loop();
+        }
+        fence(Ordering::Acquire);
+        if self.is_readonly() {
+            self.mnt_writers.add(-1);
+            return Err(KernelError::ReadOnlyFs);
+        }
+        Ok(())
     }
 
     /// A use of the mount ended (Linux mntput): an MNT_EXPIRE mark
@@ -409,14 +468,8 @@ impl Mount {
     }
 
     /// Get the mount point dentry
-    pub fn get_mountpoint(&self) -> Option<Arc<Dentry>> {
+    pub fn get_mountpoint(&self) -> Option<DentryRef> {
         self.mountpoint.read().clone()
-    }
-
-    /// Set the mount point
-    pub fn set_mountpoint(&self, dentry: Arc<Dentry>) {
-        note_mp(&dentry, 1);
-        *self.mountpoint.write() = Some(dentry);
     }
 
     /// The parent mount, unless it is gone (Linux mnt_parent: a
@@ -434,7 +487,7 @@ impl Mount {
     /// parent.
     pub fn up<'a>(&'a self, _ml: &'a MntHash) -> Option<(&'a Mount, &'a Dentry)> {
         let parent = self.parent.read().as_ref().map(Weak::as_ptr)?;
-        let mp = self.mountpoint.read().as_ref().map(Arc::as_ptr)?;
+        let mp = self.mountpoint.read().as_ref().map(DentryRef::as_ptr)?;
         // SAFETY: both links change only under MOUNT_LOCK write
         // (attach_mnt, detach_mnt, a teardown's unhang_children; the
         // last takes the mountpoint after the unlock, but only once the
@@ -445,6 +498,35 @@ impl Mount {
         // `Arc`, which cannot finish (nor release its root) before
         // unhanging `self`, under MOUNT_LOCK write.
         Some(unsafe { (&*parent, &*mp) })
+    }
+
+    /// The parent mount and the mountpoint in it, borrowed for an RCU
+    /// read guard's life with no reference (Linux READ_ONCE of
+    /// mnt_parent and mnt_mountpoint in an RCU walk): a walk on them
+    /// checks MOUNT_LOCK's sequence after. None for a mount on no
+    /// parent.
+    pub fn up_rcu<'g>(
+        &self,
+        _g: &'g crate::sync::rcu::RcuReadGuard,
+    ) -> Option<(&'g Mount, &'g Dentry)> {
+        let parent = self.parent.read().as_ref().map(Weak::as_ptr)?;
+        let mp = self.mountpoint.read().as_ref().map(DentryRef::as_ptr)?;
+        // SAFETY: each link was set when read under the guard: the parent
+        // then still had `self` hung on it, and is freed only a grace
+        // period after its teardown, which unhangs `self` first
+        // (`kfree_rcu` in `__cleanup_mnt`); the mountpoint was then a
+        // reference `self` held, and a dentry is freed only a grace
+        // period after its last one goes. Both frees wait for `_g`.
+        Some(unsafe { (&*parent, &*mp) })
+    }
+
+    /// The root dentry's address, read even after the teardown released
+    /// it (Linux compares mnt_root of a mount an RCU walk reached): for
+    /// comparison only
+    pub(super) fn root_addr(&self) -> *const Dentry {
+        // SAFETY: the cell holds a `DentryRef`'s bits, which `take`
+        // leaves in place; only its address is read
+        DentryRef::as_ptr(unsafe { &*self.root.stale() })
     }
 
     /// The parent mount, borrowed from the lock `_s` holds the tree
@@ -627,6 +709,180 @@ pub(super) fn copy_below(
     }
 }
 
+/// A dentry something is mounted on (Linux struct mountpoint): in
+/// `MountTables.mp` while `m_count` attached mounts sit on it, holding
+/// the dentry, which is marked mounted (DCACHE_MOUNTED) meanwhile.
+/// Changed under MOUNT_LOCK (its locking read or write).
+pub struct Mountpoint {
+    /// In its hash bucket (Linux m_hash)
+    m_hash: Link,
+    /// The dentry (Linux m_dentry, a reference)
+    m_dentry: DentryRef,
+    /// Mounts attached on it (Linux m_count)
+    m_count: AtomicU32,
+}
+
+crate::adapter!(MpHashA, Mountpoint, m_hash);
+crate::hadapter!(MntHashA, Mount, mnt_hash);
+
+/// A mountpoint hash bucket (Linux mountpoint_hashtable's hlist_head)
+type MpBucket = LockedBy<BoxList<MpHashA>, MntHash>;
+/// A mount hash chain (Linux mount_hashtable's hlist_head), read under
+/// RCU
+type MBucket = RcuHList<MntHashA, MntHash>;
+
+/// The mount and mountpoint hash tables (Linux mount_hashtable and
+/// mountpoint_hashtable), sized at boot by [`mnt_hash_init`]; changed
+/// under MOUNT_LOCK
+struct MountTables {
+    m: Box<[MBucket]>,
+    mp: Box<[MpBucket]>,
+}
+
+static MOUNT_TABLES: spin::Once<MountTables> = spin::Once::new();
+
+/// Buckets for `pages` pages of RAM (Linux alloc_large_system_hash
+/// with scale 19: one per 512 KiB, rounded up to a power of two)
+fn mhash_entries(pages: u64) -> usize {
+    usize::try_from(pages >> 7)
+        .unwrap_or(usize::MAX)
+        .clamp(1 << 8, 1 << 20)
+        .next_power_of_two()
+}
+
+/// Allocate the mount and mountpoint hash tables (Linux mnt_init):
+/// before the first mount. Like Linux, no memory for them is fatal.
+pub fn mnt_hash_init(pages: u64) {
+    MOUNT_TABLES.call_once(|| {
+        let n = mhash_entries(pages);
+        let mut m = Vec::new();
+        let mut mp = Vec::new();
+        m.try_reserve_exact(n)
+            .and_then(|()| mp.try_reserve_exact(n))
+            .expect("mount: no memory for the mount hash tables");
+        m.extend((0..n).map(|_| MBucket::new()));
+        mp.extend((0..n).map(|_| LockedBy::new(BoxList::new())));
+        MountTables {
+            m: m.into_boxed_slice(),
+            mp: mp.into_boxed_slice(),
+        }
+    });
+}
+
+fn tables() -> &'static MountTables {
+    #[cfg(test)]
+    mnt_hash_init(0);
+    MOUNT_TABLES
+        .get()
+        .expect("mount: hash tables used before mnt_init")
+}
+
+/// An address's hash part (Linux: the pointer over L1_CACHE_BYTES)
+fn addr_key<T>(p: *const T) -> usize {
+    p.addr() / 64
+}
+
+/// The bucket of `n` buckets for `tmp` (Linux: tmp + (tmp >> shift),
+/// masked)
+fn bucket_of(tmp: usize, n: usize) -> usize {
+    tmp.wrapping_add(tmp >> n.trailing_zeros()) & (n - 1)
+}
+
+/// The mount hash chain of children of `parent` on `d` (Linux m_hash)
+fn m_hash(parent: *const Mount, d: *const Dentry) -> &'static MBucket {
+    let t = &tables().m;
+    &t[bucket_of(addr_key(parent).wrapping_add(addr_key(d)), t.len())]
+}
+
+/// The mountpoint bucket of `d` (Linux mp_hash)
+fn mp_hash(d: *const Dentry) -> &'static MpBucket {
+    let t = &tables().mp;
+    &t[bucket_of(addr_key(d), t.len())]
+}
+
+/// The mountpoint of `d`, if one exists (Linux lookup_mountpoint)
+fn lookup_mountpoint<'a>(ml: &'a MntHash, d: &Dentry) -> Option<&'a Mountpoint> {
+    mp_hash(d)
+        .access(ml)
+        .iter()
+        .find(|mp| core::ptr::eq(DentryRef::as_ptr(&mp.m_dentry), d))
+}
+
+/// A new mountpoint for `d`, made before MOUNT_LOCK is taken (Linux
+/// get_mountpoint's kmalloc) if none exists yet. Under NAMESPACE_SEM
+/// write, so no other one is made meanwhile.
+fn prealloc_mountpoint(d: &DentryRef) -> Option<Box<Mountpoint>> {
+    if lookup_mountpoint(&MOUNT_LOCK.read_excl(), d).is_some() {
+        return None;
+    }
+    Some(crate::util::kalloc::box_nofail(Mountpoint {
+        m_hash: Link::new(),
+        m_dentry: d.clone(),
+        m_count: AtomicU32::new(0),
+    }))
+}
+
+/// Count a mount on `d`'s mountpoint, made from `new` if it has none
+/// (Linux get_mountpoint, d_set_mounted); under MOUNT_LOCK. What is
+/// left of `new` goes after the unlock.
+fn get_mountpoint(ml: &mut MntHash, d: &DentryRef, new: &mut Option<Box<Mountpoint>>) {
+    if let Some(mp) = lookup_mountpoint(ml, d) {
+        mp.m_count.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let mp = new
+        .take()
+        .expect("mount: a new mountpoint with none made for it");
+    mp.m_count.store(1, Ordering::Relaxed);
+    d.set_mounted(true);
+    mp_hash(DentryRef::as_ptr(d)).access_mut(ml).push_back(mp);
+}
+
+/// A mount left `d` (Linux put_mountpoint, maybe_free_mountpoint);
+/// under MOUNT_LOCK: the last one takes the mountpoint out and unmarks
+/// the dentry, and hands it back to be dropped (its dentry put) after
+/// the unlock
+fn put_mountpoint(ml: &mut MntHash, d: &Dentry) -> Option<Box<Mountpoint>> {
+    let mp = lookup_mountpoint(ml, d)?;
+    if mp.m_count.fetch_sub(1, Ordering::Relaxed) != 1 {
+        return None;
+    }
+    d.set_mounted(false);
+    mp_hash(d)
+        .access_mut(ml)
+        .remove_first(|m| core::ptr::eq(DentryRef::as_ptr(&m.m_dentry), d))
+}
+
+/// The child of `parent` mounted on `d` (Linux __lookup_mnt): one walk
+/// of its hash chain under an RCU read guard, comparing each entry's
+/// `parent` and `mountpoint`, which a lockless caller checks with
+/// MOUNT_LOCK's sequence after
+fn __lookup_mnt<'g>(parent: &Mount, d: &Dentry, g: &'g RcuReadGuard) -> Option<&'g Mount> {
+    m_hash(parent, d).iter(g).find(|c| {
+        c.parent
+            .read()
+            .as_ref()
+            .is_some_and(|p| core::ptr::eq(p.as_ptr(), parent))
+            && c.mountpoint
+                .read()
+                .as_ref()
+                .is_some_and(|mp| core::ptr::eq(DentryRef::as_ptr(mp), d))
+    })
+}
+
+/// Take `m` out of the mount hash (Linux hlist_del_init_rcu of
+/// mnt_hash), before its `parent` or `mountpoint` changes; under
+/// MOUNT_LOCK write. The chain's reference goes a grace period later.
+fn unhash_mnt(ml: &mut MntHash, m: &Mount) {
+    let parent = m.parent.read().as_ref().map(Weak::as_ptr);
+    let mp = m.mountpoint.read().as_ref().map(DentryRef::as_ptr);
+    if let (Some(p), Some(d)) = (parent, mp)
+        && let Some(r) = m_hash(p, d).del_init(m, ml)
+    {
+        r.defer_put();
+    }
+}
+
 /// The kernel threads' nullfs mount (Linux knullfs, an internal mount)
 static KNULLFS: spin::Once<MountRef> = spin::Once::new();
 
@@ -718,7 +974,7 @@ pub(super) fn commit_tree(ns: &NsTree, m: &MountRef) {
 
 /// A new mount of `m`'s filesystem rooted at `root`, with its flags
 /// and source (Linux clone_mnt); not attached
-pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> MountRef {
+pub fn clone_mnt(m: &Mount, root: DentryRef) -> MountRef {
     let c = Mount::alloc_nofail(
         m.sb.clone(),
         root,
@@ -734,13 +990,13 @@ pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> MountRef {
 struct CopyEnt {
     src: MountRef,
     parent: usize,
-    at: Arc<Dentry>,
+    at: DentryRef,
 }
 
 /// What copy_tree copies of `m` at `root`, parents first: the mounts
 /// below `root`; an unbindable submount is left out with whatever is
 /// under it, EPERM if it is also locked (it hides what is under it)
-fn copy_plan(ns: &NsTree, m: &MountRef, root: &Arc<Dentry>) -> Result<Vec<CopyEnt>, KernelError> {
+fn copy_plan(ns: &NsTree, m: &MountRef, root: &DentryRef) -> Result<Vec<CopyEnt>, KernelError> {
     let mut plan = alloc::vec![CopyEnt {
         src: m.clone(),
         parent: 0,
@@ -799,7 +1055,7 @@ fn copy_tree(ns: &mut NsTree, plan: &[CopyEnt]) -> MountRef {
 
 /// A mount under `d` in `m` is locked (Linux has_locked_children): a
 /// bind of `d` alone would uncover what it hides
-fn has_locked_children(ns: &NsTree, m: &Mount, d: &Arc<Dentry>) -> bool {
+fn has_locked_children(ns: &NsTree, m: &Mount, d: &DentryRef) -> bool {
     m.kids(ns).any(|c| {
         c.get_mountpoint()
             .is_some_and(|mp| super::is_subdir(&mp, d))
@@ -1019,6 +1275,7 @@ pub fn put_mnt_ns(root: MountRef) {
             todo.push_back(c);
         }
         while let Some(c) = todo.pop_front() {
+            unhash_mnt(&mut ml, &c);
             *c.parent.write() = None;
             let kids = c.mnt_mounts.access_mut(&mut ns, &mut ml);
             while let Some(k) = kids.pop_front() {
@@ -1042,9 +1299,7 @@ fn put_unhung(mut l: OwnedList<MntChild>) {
         // moved onto `l` as they were
         let c = unsafe { MountRef::from_entry(c) };
         // Its parent link is gone: `up` no longer reads this
-        if let Some(mp) = c.mountpoint.write().take() {
-            note_mp(&mp, -1);
-        }
+        c.put_mountpoint();
     }
 }
 
@@ -1058,6 +1313,7 @@ fn detach_mnt(ns: &mut NsTree, m: &MountRef) -> Option<MountRef> {
     // `m` to the caller (a move hangs it elsewhere, an umount releases
     // it)
     let mut ml = MOUNT_LOCK.write();
+    unhash_mnt(&mut ml, m);
     let link = parent
         .as_ref()
         .and_then(|p| p.mnt_mounts.access_mut(ns, &mut ml).remove(m))
@@ -1065,10 +1321,10 @@ fn detach_mnt(ns: &mut NsTree, m: &MountRef) -> Option<MountRef> {
         .map(|c| unsafe { MountRef::from_entry(c) });
     *m.parent.write() = None;
     let mp = m.mountpoint.write().take();
-    if let Some(mp) = &mp {
-        note_mp(mp, -1);
-    }
+    let gone = mp.as_deref().and_then(|d| put_mountpoint(&mut ml, d));
     drop(ml);
+    drop(gone);
+    drop(mp);
     link
 }
 
@@ -1076,13 +1332,20 @@ fn detach_mnt(ns: &mut NsTree, m: &MountRef) -> Option<MountRef> {
 /// MOUNT_LOCK, for the walks that check its sequence); under
 /// NAMESPACE_SEM write
 pub(super) fn attach_mnt(ns: &mut NsTree, m: MountRef, mp: &Path) {
+    let mut new = prealloc_mountpoint(&mp.dentry);
     let mut ml = MOUNT_LOCK.write();
-    m.set_mountpoint(mp.dentry.clone());
+    get_mountpoint(&mut ml, &mp.dentry, &mut new);
+    *m.mountpoint.write() = Some(mp.dentry.clone());
     m.set_parent(&mp.mnt);
+    // Linux make_visible: in the mount hash and on the parent's list
+    m_hash(MountRef::as_ptr(&mp.mnt), DentryRef::as_ptr(&mp.dentry))
+        .add_head(MountRef::arc_of(&m), &mut ml);
     mp.mnt
         .mnt_mounts
         .access_mut(ns, &mut ml)
         .push_back(m.into_entry());
+    drop(ml);
+    drop(new);
 }
 
 /// Hang the tree at `m` on `mp` and, under a shared mount, propagate
@@ -1101,17 +1364,71 @@ fn graft(ns: &mut NsTree, t: MountRef, mp: &Path) {
     }
 }
 
-/// `p` is at or below `root`, across mounts (Linux is_path_reachable,
-/// path_is_under)
+/// Where `m` is mounted, past mounts stacked on their parent's root,
+/// as a path holding references (Linux choose_mountpoint): None for a
+/// mount on no parent, or when the climb meets `root`. The climb runs
+/// under an RCU read guard and MOUNT_LOCK's sequence, and is repeated
+/// if a mount change raced it (legitimize_mnt).
+pub fn choose_mountpoint(m: &Mount, root: &Path) -> Option<Path> {
+    loop {
+        let g = crate::sync::rcu::read_lock();
+        let seq = MOUNT_LOCK.read_begin();
+        let Some((pm, pd)) = choose_mountpoint_rcu(m, root, &g) else {
+            if !MOUNT_LOCK.read_retry(seq) {
+                return None;
+            }
+            continue;
+        };
+        // The mountpoint is held while the child is hung there, which
+        // the unmoved sequence vouches for (Linux __legitimize_path)
+        let put = match MountRef::legitimize(pm, seq) {
+            Ok(mnt) => match DentryRef::try_get(pd) {
+                Some(d) => return Some(Path::new(mnt, d)),
+                None => Some(mnt),
+            },
+            Err(put) => put,
+        };
+        // Puts after the guard (Linux rcu_read_unlock; path_put)
+        drop(g);
+        drop(put);
+    }
+}
+
+/// One climb of [`choose_mountpoint`] (Linux choose_mountpoint_rcu)
+fn choose_mountpoint_rcu<'g>(
+    m: &'g Mount,
+    root: &Path,
+    g: &'g crate::sync::rcu::RcuReadGuard,
+) -> Option<(&'g Mount, &'g Dentry)> {
+    let mut m = m;
+    while let Some((p, mp)) = m.up_rcu(g) {
+        if core::ptr::eq(mp, DentryRef::as_ptr(&root.dentry))
+            && core::ptr::eq(p, MountRef::as_ptr(&root.mnt))
+        {
+            return None;
+        }
+        if !core::ptr::eq(mp, p.root_addr()) {
+            return Some((p, mp));
+        }
+        m = p;
+    }
+    None
+}
+
+/// `p` is at or below `root`, across mounts (Linux path_is_under:
+/// is_path_reachable under mount_lock's locking read, the mounts
+/// borrowed from it, then is_subdir, which reads RENAME_LOCK's
+/// sequence inside it)
 pub fn is_path_reachable(p: &Path, root: &Path) -> bool {
-    let (mut mnt, mut d) = (p.mnt.clone(), p.dentry.clone());
-    while !MountRef::ptr_eq(&mnt, &root.mnt) {
-        match (mnt.get_parent(), mnt.get_mountpoint()) {
-            (Some(m), Some(mp)) => (mnt, d) = (m, mp),
-            _ => return false,
+    let ml = MOUNT_LOCK.read_excl();
+    let (mut mnt, mut d): (&Mount, &Dentry) = (&p.mnt, &p.dentry);
+    while !core::ptr::eq(mnt, MountRef::as_ptr(&root.mnt)) {
+        match mnt.up(&ml) {
+            Some(up) => (mnt, d) = up,
+            None => return false,
         }
     }
-    super::is_subdir(&d, &root.dentry)
+    super::dentry::is_subdir_borrowed(d, &root.dentry)
 }
 
 /// The mountpoint's i_rwsem (Linux lock_mount): a directory removed
@@ -1131,7 +1448,7 @@ fn lock_mountpoint(mp: &Path) -> Result<super::inode::InodeLockArc, KernelError>
 /// not under a shared mount, and the target in the namespace too
 /// (EINVAL), and not into its own subtree (ELOOP)
 pub fn do_move(old: &Path, mp: &Path) -> Result<(), KernelError> {
-    if !Arc::ptr_eq(&old.dentry, &old.mnt.root) {
+    if !DentryRef::ptr_eq(&old.dentry, &old.mnt.root) {
         return Err(KernelError::InvalidArgument);
     }
     let is_dir = |d: &Dentry| d.get_inode().is_some_and(|i| i.mode().is_dir());
@@ -1199,7 +1516,8 @@ pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
     if MountRef::ptr_eq(&new.mnt, &root.mnt) || MountRef::ptr_eq(&put_old.mnt, &root.mnt) {
         return Err(KernelError::Busy);
     }
-    let mounted = |p: &Path| Arc::ptr_eq(&p.dentry, &p.mnt.root) && p.mnt.get_parent().is_some();
+    let mounted =
+        |p: &Path| DentryRef::ptr_eq(&p.dentry, &p.mnt.root) && p.mnt.get_parent().is_some();
     if !mounted(&root) || !mounted(new) {
         return Err(KernelError::InvalidArgument);
     }
@@ -1248,16 +1566,17 @@ fn chroot_fs_refs(old: &Path, new: &Path) {
     }
 }
 
-/// Count a mount on (`+1`) or off (`-1`) the dentry `mp` and the
-/// filesystem it is in
-fn note_mp(mp: &Dentry, delta: i32) {
-    mp.note_mounted(delta);
-    if let Some(sb) = mp.superblock() {
-        sb.note_mounted_on(delta);
-    }
-}
-
 impl Mount {
+    /// Let go of the mountpoint of a mount already off its parent and
+    /// out of the mount hash (Linux umount_mnt's put_mountpoint)
+    fn put_mountpoint(&self) {
+        let Some(mp) = self.mountpoint.write().take() else {
+            return;
+        };
+        let gone = put_mountpoint(&mut MOUNT_LOCK.read_excl(), &mp);
+        drop(gone);
+    }
+
     /// Tear the mount down (Linux cleanup_mnt, with mntput_no_expire's
     /// release of the submounts still hung on it): off its
     /// superblock's s_mounts, its submounts and mountpoint let go, its
@@ -1283,9 +1602,7 @@ impl Mount {
         // (Linux mntput_no_expire's stuck children: out of any namespace,
         // as their doomed parent is, so put by the exact path)
         put_unhung(self.unhang_children());
-        if let Some(mp) = self.mountpoint.write().take() {
-            note_mp(&mp, -1);
-        }
+        self.put_mountpoint();
         MNT_IDS.free(self.mnt_id);
         // SAFETY: the caller's contract: no reference can reach these
         // any more, and this is their one release
@@ -1306,11 +1623,11 @@ impl Mount {
         }
         let mut ns = namespace_lock();
         let mut ml = MOUNT_LOCK.write();
-        let list = self.mnt_mounts.access_mut(&mut ns, &mut ml);
-        while let Some(c) = list.pop_front() {
+        while let Some(c) = self.mnt_mounts.access_mut(&mut ns, &mut ml).pop_front() {
             // A doomed mount is in no namespace, nor what hangs on it
             // (umount and put_mnt_ns clear the whole tree)
             debug_assert_eq!(c.ns(), 0, "mount: a doomed mount's submount in a namespace");
+            unhash_mnt(&mut ml, &c);
             *c.parent.write() = None;
             out.push_back(c);
         }
@@ -1323,10 +1640,13 @@ impl MountRef {
     /// for a read-only mount or superblock; hold the guard across the
     /// modification
     pub fn want_write(&self) -> Result<super::superblock::WriteAccess, KernelError> {
-        super::superblock::get_write(&self.writers, || self.is_readonly())?;
+        self.get_write()?;
         Ok(super::superblock::WriteAccess::mnt(self.clone()))
     }
 }
+
+crate::rcu_head!(Mount, mnt_rcu);
+crate::rcu_puts!(Mount, mnt_puts);
 
 /// The memory of a mount: torn down already, unless it never had a
 /// reference (`Mount::alloc` failed to allocate its `Arc`)
@@ -1344,23 +1664,27 @@ impl Drop for Mount {
 /// is_local_mountpoint, __is_local_mountpoint under namespace_sem
 /// read): a walk of the namespace's mounts for one whose mountpoint is
 /// the dentry `d`
-pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
-    // Nothing is mounted on this dentry (or an alias) anywhere: no walk
-    if !may_be_mountpoint(d) {
+pub fn is_local_mountpoint(d: &DentryRef) -> bool {
+    // Nothing is mounted on this dentry anywhere: no walk (Linux
+    // d_mountpoint)
+    if !d.is_mountpoint() {
         return false;
     }
     let ns = namespace_read();
     let Some(root) = crate::ns::current_mnt_ns().get_root() else {
         return false;
     };
-    walk(&root, &*ns).any(|m| m.get_mountpoint().is_some_and(|mp| same_place(&mp, d)))
+    walk(&root, &*ns).any(|m| {
+        m.get_mountpoint()
+            .is_some_and(|mp| DentryRef::ptr_eq(&mp, d))
+    })
 }
 
 /// Where a walk lands on `p` (Linux traverse_mounts): the root of the
 /// topmost mount stacked on it, else `p` itself
 pub fn follow_mount(p: Path) -> Path {
     let mut p = p;
-    while may_be_mountpoint(&p.dentry) {
+    while p.dentry.is_mountpoint() {
         match lookup_mnt(&p) {
             Some(m) => p = Path::new(m.clone(), m.root.clone()),
             None => break,
@@ -1369,56 +1693,26 @@ pub fn follow_mount(p: Path) -> Path {
     p
 }
 
-/// The mount on `p` (Linux lookup_mnt): a child of `p.mnt` whose
-/// mountpoint is the place `p.dentry` names, under mount_lock's
-/// locking read (Linux walks the mount hash under RCU and the
-/// sequence)
+/// The mount on `p` (Linux lookup_mnt): a child of `p.mnt` on
+/// `p.dentry`, found in the mount hash under an RCU read guard with
+/// MOUNT_LOCK's sequence sampled, and a reference taken to it
+/// (legitimize_mnt); repeated if a mount change raced
 fn lookup_mnt(p: &Path) -> Option<MountRef> {
-    let ml = MOUNT_LOCK.read_excl();
-    // Borrowed while scanning (Linux __lookup_mnt takes no reference):
-    // a put under MOUNT_LOCK of a mount out of its namespace would take
-    // it again; only the match gets one
-    ml.mounts(&p.mnt)
-        .iter()
-        .find(|c| {
-            c.mountpoint
-                .read()
-                .as_ref()
-                .is_some_and(|mp| same_place(mp, &p.dentry))
-        })
-        .map(MountRef::entry_ref)
-}
-
-/// Names on this inode's filesystem are their exact bytes (in-memory
-/// ones): otherwise another spelling (vfat: case, trailing dots) is
-/// another dentry for the same object
-fn exact_names(i: &super::inode::Inode) -> bool {
-    i.superblock()
-        .is_some_and(|sb| sb.fs_type.fs_flags == super::superblock::fs_flags::FS_IN_MEMORY)
-}
-
-/// The mountpoint `mp` and the dentry `d` are one place: the same
-/// dentry (renames move dentries), or the same inode where that cannot
-/// be another object: a directory (no hard links), or a filesystem
-/// without exact names (FAT has no hard links either; Linux gets one
-/// dentry there through vfat's d_hash/d_compare)
-fn same_place(mp: &Arc<Dentry>, d: &Arc<Dentry>) -> bool {
-    if Arc::ptr_eq(mp, d) {
-        return true;
+    loop {
+        let g = crate::sync::rcu::read_lock();
+        let seq = MOUNT_LOCK.read_begin();
+        let put = match __lookup_mnt(&p.mnt, &p.dentry, &g) {
+            None if !MOUNT_LOCK.read_retry(seq) => return None,
+            None => None,
+            Some(c) => match MountRef::legitimize(c, seq) {
+                Ok(m) => return Some(m),
+                Err(put) => put,
+            },
+        };
+        // A put after the guard (Linux legitimize_mnt's mntput)
+        drop(g);
+        drop(put);
     }
-    let (Some(a), Some(b)) = (mp.get_inode(), d.get_inode()) else {
-        return false;
-    };
-    a.ino == b.ino && a.sb.ptr_eq(&b.sb) && (a.mode().is_dir() || !exact_names(&b))
-}
-
-/// The walk must look for a mount on `d`: it is marked, or (no exact
-/// names, something mounted on its filesystem) an alias of it may be
-fn may_be_mountpoint(d: &Dentry) -> bool {
-    d.is_mountpoint()
-        || d.get_inode().is_some_and(|i| {
-            !exact_names(&i) && i.sb.upgrade().is_some_and(|sb| sb.has_mounts_on())
-        })
 }
 
 #[cfg(test)]
@@ -1480,6 +1774,43 @@ mod tests {
         c.mark(MNT_LOCKED, true);
         let r = copy_plan(&ns, &top, &top.root);
         assert!(matches!(r, Err(KernelError::NotPermitted)));
+    }
+
+    /// The mount hash finds a child by (parent, mountpoint), the latest
+    /// stacked one first; the mountpoint stays, the dentry marked,
+    /// while any mount sits on it (Linux m_count)
+    #[test]
+    fn mount_hash_and_mountpoint() {
+        let mut ns = namespace_lock();
+        let top = mnt();
+        let at = Path::new(top.clone(), top.root.clone());
+        let a = hang(&mut ns, &top);
+        let b = hang(&mut ns, &top);
+        assert!(top.root.is_mountpoint());
+        let found = lookup_mnt(&at).unwrap();
+        assert!(MountRef::ptr_eq(&found, &b));
+        drop(found);
+        assert!(detach_mnt(&mut ns, &b).is_some());
+        assert!(lookup_mnt(&at).is_some_and(|m| MountRef::ptr_eq(&m, &a)));
+        assert!(top.root.is_mountpoint());
+        assert!(detach_mnt(&mut ns, &a).is_some());
+        assert!(lookup_mnt(&at).is_none() && !top.root.is_mountpoint());
+    }
+
+    /// A held write access makes a read-only flip EBUSY (Linux
+    /// mnt_make_readonly over mnt_get_writers' per-CPU sum); once it
+    /// goes the flip succeeds, the hold never shows in the flags, and
+    /// new writers get EROFS
+    #[test]
+    fn writers_block_readonly() {
+        let m = mnt();
+        let w = m.want_write().unwrap();
+        assert!(matches!(m.set_flags(MNT_READONLY), Err(KernelError::Busy)));
+        assert_eq!(m.flags() & (MNT_READONLY | MNT_WRITE_HOLD), 0);
+        drop(w);
+        assert!(m.set_flags(MNT_READONLY).is_ok());
+        assert_eq!(m.flags(), MNT_READONLY);
+        assert!(matches!(m.want_write(), Err(KernelError::ReadOnlyFs)));
     }
 
     #[test]

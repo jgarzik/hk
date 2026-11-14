@@ -23,7 +23,6 @@ use super::inode::{Inode, InodeMode, NULL_INODE_OPS};
 use super::mount::{MNT_NODEV, MNT_NOEXEC, Mount, MountRef};
 use super::path_ref::Path;
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
-use crate::util::kalloc::try_arc;
 
 /// statfs f_type of each (Linux include/uapi/linux/magic.h)
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
@@ -136,7 +135,10 @@ fn pseudo_mount(ty: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBl
         Arc::downgrade(&sb),
         &NULL_INODE_OPS,
     ))?;
-    sb.set_root(try_arc(Dentry::new_root(root, Arc::downgrade(&sb)))?);
+    sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
+        root,
+        Arc::downgrade(&sb),
+    ))?);
     Ok(sb)
 }
 
@@ -174,7 +176,7 @@ impl Pseudo {
     pub fn path(&self, name: &str, inode: Arc<Inode>) -> Result<Path, KernelError> {
         let mnt = self.mnt()?;
         let d = Dentry::new_pseudo(name.as_bytes(), inode, &mnt.sb)?;
-        Ok(Path::new(mnt, try_arc(d)?))
+        Ok(Path::new(mnt, crate::fs::DentryRef::new(d)?))
     }
 }
 

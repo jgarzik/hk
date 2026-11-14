@@ -74,7 +74,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering}
 
 use crate::sync::spin::{Mutex, MutexGuard, RwLock};
 
-use crate::fs::Dentry;
+use crate::fs::DentryRef;
 use crate::fs::proc::seq::SeqBuf;
 use crate::io::fasync::{POLL_HUP, POLL_IN};
 use crate::io::poll::{POLLOUT, POLLWRBAND, POLLWRNORM};
@@ -116,7 +116,7 @@ pub struct UnixAddr {
     /// addr->len bytes)
     pub name: Vec<u8>,
     /// The socket inode of a filesystem name
-    pub path: Option<Arc<Dentry>>,
+    pub path: Option<DentryRef>,
 }
 
 impl UnixAddr {

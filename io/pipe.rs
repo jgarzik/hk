@@ -1311,7 +1311,7 @@ pub fn create_pipe(pipe_flags: u32) -> Result<(FileRef, FileRef), KernelError> {
     let write_flags = flags::O_WRONLY | (pipe_flags & (flags::O_NONBLOCK | flags::O_DIRECT));
 
     let read_file = File::new_anon(
-        Arc::clone(&dentry),
+        dentry.clone(),
         Some(mnt.clone()),
         read_flags,
         &PIPE_READ_FOPS,

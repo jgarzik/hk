@@ -4,7 +4,7 @@
 //! meminfo Slab)
 
 use crate::harness::verdict_detail;
-use crate::helpers::{host_mode, print, print_num, println};
+use crate::helpers::{host_mode, msleep, print, print_num, println};
 use crate::mm::mm_life::meminfo;
 use hk_syscall::{
     IoUringParams, MqAttr, O_CREAT, O_RDWR, sys_close, sys_epoll_create1, sys_eventfd2, sys_getpid,
@@ -71,7 +71,8 @@ fn pipe_cycle() -> i64 {
 
 /// Run `f` `n` times: every step must succeed, and on hk the heap
 /// (Slab) must come back to within 64 kB of where it was (it grew by
-/// ~600 B per pipe when pipe state leaked). Linux slab caches keep
+/// ~600 B per pipe when pipe state leaked), once what waits for a grace
+/// period is freed. Linux slab caches keep
 /// freed objects, so there only the steps are checked.
 fn leak(name: &[u8], n: u32, f: fn() -> i64) {
     for _ in 0..16 {
@@ -94,6 +95,21 @@ fn leak(name: &[u8], n: u32, f: fn() -> i64) {
         verdict_detail(name, true, 0);
         return;
     }
-    let grew = meminfo(b"Slab:") - before;
+    let grew = settled(before);
     verdict_detail(name, before >= 0 && grew <= 64, grew);
+}
+
+/// How far Slab is above `before` once objects freed after an RCU
+/// grace period (Linux dentry_free, delayed_free_vfsmnt) are gone:
+/// polled for up to 2 s while it is above 64 kB
+fn settled(before: i64) -> i64 {
+    let mut grew = meminfo(b"Slab:") - before;
+    for _ in 0..200 {
+        if grew <= 64 {
+            break;
+        }
+        msleep(10);
+        grew = meminfo(b"Slab:") - before;
+    }
+    grew
 }

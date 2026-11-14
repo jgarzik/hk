@@ -16,7 +16,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use super::dentry::Dentry;
+use super::dentry::DentryRef;
 use super::mount::{Mount, MountRef, NsTree, attach_mnt, clone_mnt, commit_tree, copy_below, walk};
 use super::path_ref::Path;
 
@@ -188,7 +188,7 @@ fn copy_prop(ns: &mut NsTree, src: &MountRef, prop: &dyn Fn(&Mount, &MountRef)) 
 }
 
 /// `d` is inside what `m` shows
-fn visible(m: &Mount, d: &Arc<Dentry>) -> bool {
+fn visible(m: &Mount, d: &DentryRef) -> bool {
     super::is_subdir(d, &m.root)
 }
 
@@ -196,7 +196,7 @@ fn visible(m: &Mount, d: &Arc<Dentry>) -> bool {
 /// `dest`: copy it to every peer of `dest` (as peers) and down the
 /// slave groups (as slaves; among shared slaves, as a new peer group)
 /// (Linux propagate_mnt)
-pub fn propagate_mnt(ns: &mut NsTree, dest: &MountRef, d: &Arc<Dentry>, src: &MountRef) {
+pub fn propagate_mnt(ns: &mut NsTree, dest: &MountRef, d: &DentryRef, src: &MountRef) {
     let g = dest.group.load(Ordering::SeqCst);
     if g == 0 {
         return;
@@ -221,7 +221,7 @@ pub fn propagate_mnt(ns: &mut NsTree, dest: &MountRef, d: &Arc<Dentry>, src: &Mo
 
 /// Copies for the slaves of group `g`; `up` maps each mount of the
 /// source tree to the group its copies here are slaves of
-fn to_slaves(ns: &mut NsTree, g: u32, d: &Arc<Dentry>, src: &MountRef, up: &BTreeMap<usize, u32>) {
+fn to_slaves(ns: &mut NsTree, g: u32, d: &DentryRef, src: &MountRef, up: &BTreeMap<usize, u32>) {
     let mut seen = BTreeSet::new();
     for s in slaves(g) {
         let sg = s.group.load(Ordering::SeqCst);
@@ -291,7 +291,8 @@ pub fn propagate_umount(ns: &NsTree, m: &MountRef) -> Vec<MountRef> {
         out.extend(t.kids(ns).filter(|c| {
             !MountRef::ptr_eq(c, m)
                 && Arc::ptr_eq(&*c.sb, &*m.sb)
-                && c.get_mountpoint().is_some_and(|x| Arc::ptr_eq(&x, &mp))
+                && c.get_mountpoint()
+                    .is_some_and(|x| DentryRef::ptr_eq(&x, &mp))
                 && !c.has_children(ns)
         }));
     }

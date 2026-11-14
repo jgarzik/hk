@@ -219,7 +219,7 @@ fn own_mount_at(target: &super::Path) -> Result<super::mount::MountRef, KernelEr
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
 fn mount_at(target: &super::Path) -> Result<super::mount::MountRef, KernelError> {
-    if Arc::ptr_eq(&target.dentry, &target.mnt.root) {
+    if super::DentryRef::ptr_eq(&target.dentry, &target.mnt.root) {
         Ok(target.mnt.clone())
     } else {
         Err(KernelError::InvalidArgument)

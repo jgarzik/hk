@@ -20,7 +20,7 @@ use super::{
     ramfs_mkpath_with_timestamp,
 };
 use crate::fs::chardev::DevId;
-use crate::fs::dentry::Dentry;
+use crate::fs::dentry::DentryRef;
 use crate::fs::inode::{Gid, Inode, InodeMode, Timespec, Uid};
 
 /// The initramfs image (Linux __initramfs_start or initrd_start)
@@ -157,7 +157,7 @@ type Links = Vec<((u32, u32, u32), Arc<Inode>)>;
 /// Unpack an initramfs (one or more concatenated cpio newc archives)
 /// into a ramfs directory. Returns the number of non-directory entries
 /// made.
-pub fn unpack_cpio(data: &[u8], root: &Arc<Dentry>) -> Result<usize, CpioError> {
+pub fn unpack_cpio(data: &[u8], root: &DentryRef) -> Result<usize, CpioError> {
     let mut off = 0;
     let mut count = 0;
     let mut links: Links = Vec::new();
@@ -191,7 +191,7 @@ pub fn unpack_cpio(data: &[u8], root: &Arc<Dentry>) -> Result<usize, CpioError> 
 }
 
 /// Make one entry; true unless it is a directory
-fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool, CpioError> {
+fn do_entry(root: &DentryRef, e: &Entry<'_>, links: &mut Links) -> Result<bool, CpioError> {
     let fs_err = |_| CpioError::KernelError;
     let ty = e.mode & S_IFMT;
     if ty == S_IFDIR {
@@ -280,7 +280,7 @@ fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool
 
 /// Linux clean_path: an existing entry of another type is removed
 /// (rmdir for a directory); one of the same type is returned
-fn clean_path(parent: &Arc<Dentry>, dir: &Inode, name: &[u8], ty: u32) -> Option<Arc<Inode>> {
+fn clean_path(parent: &DentryRef, dir: &Inode, name: &[u8], ty: u32) -> Option<Arc<Inode>> {
     let old = dir.i_op.lookup(dir, name).ok()?;
     if u32::from(old.mode().0) & S_IFMT == ty {
         return Some(old);
