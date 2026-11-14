@@ -263,7 +263,7 @@ impl SerialTty {
 
 /// The 8250's transmitter (Linux serial8250_pops), under the port lock
 impl UartOps for SerialTty {
-    fn tx_burst(&self) -> usize {
+    fn tx_burst(&self, _from_irq: bool) -> usize {
         // SAFETY: LSR is a register of this UART
         if unsafe { self.inb(regs::LSR) } & lsr::THRE != 0 {
             TX_LOADSZ

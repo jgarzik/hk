@@ -11,11 +11,12 @@
 //! - TTY_READ_EINTR: a blocking read sleeps until a signal (EINTR)
 //! - TTY_WRITE_ATOMIC: a write holds the tty's write lock to its end
 //!   (an O_NONBLOCK writer meanwhile gets EAGAIN)
-//! - TTY_OUTQ: a console write returns with its bytes queued for the
-//!   UART (TIOCOUTQ > 0; Linux uart_write into the transmit buffer,
-//!   drained by the TX interrupt); tcdrain waits until none are left
+//! - TTY_OUTQ: TIOCOUTQ shows a console write's bytes still queued for
+//!   the UART (Linux uart_write into the transmit buffer, drained by the
+//!   TX interrupt), at most what was written; tcdrain waits until none
+//!   are left
 
-use crate::harness::{fail_num, pass};
+use crate::harness::{check, fail_num, pass, report_r};
 use crate::helpers::{host_mode, print, println, skip};
 use crate::io::nonblock::{on_sig, sigaction};
 use hk_syscall::{
@@ -77,8 +78,15 @@ fn test_outq() {
     let drained = sys_ioctl(fd, TCSBRK, 1);
     let left = outq(fd);
     sys_close(fd as u64);
-    let ok = w == line.len() as i64 && queued > 0 && drained == 0 && left == 0;
-    report(NAME, ok, if queued <= 0 { queued } else { left });
+    // How much is still queued as the write returns depends on where
+    // the TX interrupt runs: QEMU's UARTs send at once, so on the CPU
+    // taking it the interrupt re-fires until the queue is empty
+    let n = line.len() as i64;
+    let r = check(b"write", w == n, w)
+        .and_then(|()| check(b"queued", (0..=n).contains(&queued), queued))
+        .and_then(|()| check(b"tcdrain", drained == 0, drained))
+        .and_then(|()| check(b"left", left == 0, left));
+    report_r(NAME, r);
 }
 
 fn report(name: &[u8], ok: bool, got: i64) {

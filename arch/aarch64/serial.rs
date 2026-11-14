@@ -206,8 +206,9 @@ static UART: Pl011 = Pl011::new(PL011_BASE);
 
 /// The PL011's transmitter (Linux amba_pl011_pops), under the port lock
 impl UartOps for Pl011 {
-    fn tx_burst(&self) -> usize {
-        TX_BURST
+    /// Half the FIFO from the interrupt; else until the FIFO is full
+    fn tx_burst(&self, from_irq: bool) -> usize {
+        if from_irq { TX_BURST } else { usize::MAX }
     }
 
     fn tx_full(&self) -> bool {

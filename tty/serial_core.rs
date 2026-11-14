@@ -34,9 +34,11 @@ pub const WAKEUP_CHARS: usize = 256;
 /// A UART's transmitter (Linux uart_ops, the transmit side), called
 /// under the port lock
 pub trait UartOps: Sync {
-    /// Bytes the transmitter takes in one round now (8250: its FIFO
-    /// once THR is empty, else 0; PL011: half its FIFO)
-    fn tx_burst(&self) -> usize;
+    /// Bytes the transmitter takes in one round now, from its interrupt
+    /// or not (8250: its FIFO once THR is empty, else 0; PL011: half
+    /// its FIFO from the interrupt, else until full, as pl011_tx_chars'
+    /// from_irq)
+    fn tx_burst(&self, from_irq: bool) -> usize;
 
     /// The transmit FIFO is full (PL011 FR.TXFF; 8250: never within a
     /// burst)
@@ -122,8 +124,8 @@ impl UartPort {
     /// Send what the transmitter takes now; once empty its interrupt
     /// goes off. True if writers should be woken (Linux
     /// serial8250_tx_chars, pl011_tx_chars)
-    fn tx_chars(&self, ops: &dyn UartOps, x: &mut Xmit) -> bool {
-        for _ in 0..ops.tx_burst() {
+    fn tx_chars(&self, ops: &dyn UartOps, x: &mut Xmit, from_irq: bool) -> bool {
+        for _ in 0..ops.tx_burst(from_irq) {
             if ops.tx_full() {
                 break;
             }
@@ -146,7 +148,7 @@ impl UartPort {
     /// what it takes now, then its interrupt or the poll timer for the
     /// rest
     fn start_tx(&self, ops: &dyn UartOps, x: &mut Xmit) -> bool {
-        let wake = self.tx_chars(ops, x);
+        let wake = self.tx_chars(ops, x, false);
         if !x.fifo.is_empty() && !x.tx_on {
             x.tx_on = true;
             if self.irq.load(Ordering::Relaxed) {
@@ -174,7 +176,7 @@ impl UartPort {
         if !x.tx_on {
             return false;
         }
-        self.tx_chars(ops, &mut x)
+        self.tx_chars(ops, &mut x, true)
     }
 
     /// The poll timer of a port without an interrupt (Linux
@@ -184,7 +186,7 @@ impl UartPort {
         if !x.tx_on || self.irq.load(Ordering::Relaxed) {
             return false;
         }
-        let wake = self.tx_chars(ops, &mut x);
+        let wake = self.tx_chars(ops, &mut x, true);
         if x.tx_on {
             ops.arm_poll();
         }
@@ -243,7 +245,7 @@ mod tests {
     }
 
     impl UartOps for Fake {
-        fn tx_burst(&self) -> usize {
+        fn tx_burst(&self, _from_irq: bool) -> usize {
             self.rounds.fetch_add(1, Ordering::Relaxed);
             4
         }
