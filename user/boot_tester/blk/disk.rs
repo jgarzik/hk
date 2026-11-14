@@ -699,6 +699,7 @@ fn vfat_swapfile() {
     let mut got = [0i64; 3];
     let mut busy = [0i64; 4];
     let mut map = [0i64; 5];
+    let mut umount = -1000;
     for (i, last) in [0u32, 0x7fff_ffff, 255].into_iter().enumerate() {
         let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o600) as i32;
         let mut hdr = [0u8; 4096];
@@ -751,6 +752,8 @@ fn vfat_swapfile() {
             let ot = sys_open(path.as_ptr(), O_WRONLY | O_TRUNC, 0);
             let un = hk_syscall::sys_unlink(path.as_ptr());
             busy = [w, t, ot, un];
+            // Its mount is busy (Linux: si->swap_file holds it)
+            umount = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
             got[i] = sys_swapoff(path.as_ptr()) * 100;
         }
     }
@@ -765,6 +768,7 @@ fn vfat_swapfile() {
         busy == [-26, -26, -26, -1],
         busy[0] * 1000 + busy[1] * 100 + busy[2] * 10 + busy[3],
     );
+    verdict(b"VFAT_SWAPFILE_UMOUNT", umount == -16, umount);
     // mmap shared writable and copy_file_range into it are ETXTBSY; a
     // write through a mapping made before swapon is SIGBUS (Linux
     // do_mmap, generic_copy_file_checks, do_page_mkwrite), and mprotect
