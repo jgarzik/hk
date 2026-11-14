@@ -89,7 +89,7 @@ fn test_singlestep() {
     let mut addrs = [0u64; 8];
     for a in addrs.iter_mut() {
         if !t.eq(b"step", sys_ptrace(PTRACE_SINGLESTEP, pid, 0, 0), 0)
-            || !t.eq(b"trap stop", stop_sig(pid) as i64, SIGTRAP)
+            || !t.eq(b"trap stop", stop_sig_within(pid) as i64, SIGTRAP)
         {
             break;
         }
@@ -233,6 +233,22 @@ fn test_poke_text() {
     }
     t.eq(b"step", step, 0);
     t.done();
+}
+
+/// [`stop_sig`] within 2 s (-2000: still running), so a step that
+/// never traps fails instead of hanging
+fn stop_sig_within(pid: i64) -> i32 {
+    const WNOHANG: i32 = 1;
+    let mut st = 0i32;
+    for _ in 0..200 {
+        match sys_wait4(pid, &mut st, WNOHANG, 0) {
+            0 => crate::helpers::sleep_ms(10),
+            r if r == pid && st & 0xff == 0x7f => return (st >> 8) & 0xff,
+            r if r == pid => return -st,
+            _ => return -1000,
+        }
+    }
+    -2000
 }
 
 /// A child that stops for its tracer, then makes one getppid: exit 7 if
