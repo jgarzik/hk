@@ -361,9 +361,13 @@ Safe today only because a user namespace grants no capabilities. First:
   `capable`, where Linux keeps it); sockopt_ns_capable sites take the
   socket netns's user_ns, but SO_DEBUG and SO_SNDBUFFORCE/RCVBUFFORCE
   stay init-namespace (Linux sockopt_capable).
-- an unprivileged CLONE_NEWNS (new user_ns) locks the copied tree
-  (lock_mnt_tree: MNT_LOCKED plus MNT_LOCK_* flags) and turns shared
-  mounts into slaves (CL_SHARED_TO_SLAVE).
+- a CLONE_NEWNS for another user namespace locks the copied tree
+  (lock_mnt_tree: MNT_LOCKED plus MNT_LOCK_* flags; its copies are
+  slaves already), as does a propagation into a namespace of another
+  user namespace (attach_recursive_mnt); a lazy umount of a locked
+  mount whose parent goes too then leaves Linux 7.4's cover
+  (needs_cover, leave_cover), and a namespace copy's root drops
+  MNT_LOCKED (clone_mnt).
 - netlink newlink/setlink check CAP_NET_ADMIN in the target netns too
   once IFLA_NET_NS_PID/FD are implemented (`7b735ef81286`).
 - creating a namespace together with CLONE_NEWUSER checks capabilities
@@ -371,8 +375,8 @@ Safe today only because a user namespace grants no capabilities. First:
   (today any namespace but a user namespace needs the caller's own
   CAP_SYS_ADMIN, even with CLONE_NEWUSER), and /proc/<pid>/uid_map and
   gid_map become writable.
-- mounts become user-namespace aware (plain `capable()` today): copies
-  of a namespace are always peers and never locked.
+- mounts become user-namespace aware (plain `capable()` today, Linux
+  ns_capable of the mount namespace's `user_ns`).
 
 ## Credentials have no identity
 
@@ -510,9 +514,7 @@ glibc's helper thread), and hk has no such path.
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
 Accepted without effect: MS_SILENT, MS_MANDLOCK, MS_POSIXACL,
-MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): copies of a
-namespace are always peers and not locked (see "Before user namespaces grant capabilities").
-Mount options are
+MS_I_VERSION, MS_LAZYTIME. Mount options are
 parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
 cp437 only), ramfs (mode=), tmpfs and devtmpfs (see "tmpfs gaps") and
 procfs (hidepid=, gid=, subset=pid; devtmpfs drops a new mount's after

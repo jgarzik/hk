@@ -337,8 +337,9 @@ impl Mount {
     }
 
     /// A copy of `self` for a namespace copy into namespace `ns`: same
-    /// filesystem, root, flags and source, new ids, not attached
-    fn copy(&self, g: &mut NsTree, ns: u64) -> MountRef {
+    /// filesystem, root, flags and source, new ids, not attached; a peer
+    /// of `self`, or with CL_SLAVE in `flag` its slave
+    fn copy(&self, g: &mut NsTree, ns: u64, flag: u32) -> MountRef {
         let c = Self::alloc_nofail(
             self.sb.clone(),
             self.root.clone(),
@@ -347,8 +348,7 @@ impl Mount {
         );
         c.inherit_t_flags(self);
         c.set_ns(ns);
-        // A namespace copy keeps peerage (Linux copy_mnt_ns: CL_COPY_ALL)
-        super::pnode::clone_links(g, self, &c, 0);
+        super::pnode::clone_links(g, self, &c, flag);
         c
     }
 
@@ -684,16 +684,19 @@ impl Mount {
     /// Each mount in the new tree references the same superblock/dentry
     /// as the original (the filesystem data is shared), but the mount
     /// structures themselves are independent (Linux copy_mnt_ns'
-    /// copy_tree with CL_COPY_ALL).
+    /// copy_tree with CL_COPY_UNBINDABLE): peers of the originals, or
+    /// with `slave` (a copy for another user namespace) their slaves
+    /// (CL_SLAVE).
     ///
     /// This is used by CLONE_NEWNS to give a new mount namespace its
     /// own view of the mount hierarchy.
-    pub fn clone_tree(root: &MountRef, ns: u64) -> (MountRef, MountMap) {
+    pub fn clone_tree(root: &MountRef, ns: u64, slave: bool) -> (MountRef, MountMap) {
+        let flag = if slave { super::pnode::CL_SLAVE } else { 0 };
         let mut g = namespace_lock();
-        let new_root = root.copy(&mut g, ns);
+        let new_root = root.copy(&mut g, ns, flag);
         let mut map = alloc::vec![(root.clone(), new_root.clone())];
         copy_below(&mut g, root, &new_root, |g, o| {
-            let c = o.copy(g, ns);
+            let c = o.copy(g, ns, flag);
             map.push((o.clone(), c.clone()));
             c
         });
