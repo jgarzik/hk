@@ -471,7 +471,10 @@ mod imp {
     /// any `IrqSpinlock` / preemption disable via the preempt count)
     #[track_caller]
     pub fn might_sleep() {
-        if !crate::task::percpu::can_sleep() || !crate::system_state::checks_apply() {
+        // An interrupt handler whatever task it interrupted, the idle
+        // task included (as in `sync::might_sleep`)
+        let task = crate::task::percpu::can_sleep() || crate::sync::in_interrupt();
+        if !task || !crate::system_state::checks_apply() {
             return;
         }
         let Some(c) = cpu() else {
