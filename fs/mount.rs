@@ -48,12 +48,29 @@ pub const MNT_ATIME_MASK: u32 = MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME;
 pub const MNT_READONLY: u32 = 0x40;
 /// Symlinks on this mount are not followed (Linux MNT_NOSYMFOLLOW)
 pub const MNT_NOSYMFOLLOW: u32 = 0x80;
+/// The flags mount(2) sets (Linux MNT_USER_SETTABLE_MASK): a remount
+/// replaces these and keeps the rest
+pub const MNT_USER_SETTABLE_MASK: u32 =
+    MNT_NOSUID | MNT_NODEV | MNT_NOEXEC | MNT_ATIME_MASK | MNT_READONLY | MNT_NOSYMFOLLOW;
 /// New write access through the mount waits (Linux MNT_WRITE_HOLD):
 /// set only under MOUNT_LOCK while writers are counted, never seen by
 /// [`Mount::flags`]
 const MNT_WRITE_HOLD: u32 = 0x200;
 /// Cannot be bind-mounted (Linux T_UNBINDABLE, in `t_flags`)
 pub const T_UNBINDABLE: u32 = 0x1;
+/// A copy for a less privileged user namespace keeps its atime flags
+/// (Linux MNT_LOCK_ATIME), and each lock below the flag it names, set
+/// then: a remount may not drop it (lock_mnt_tree). Set under
+/// MOUNT_LOCK, never cleared, copied by a clone.
+pub const MNT_LOCK_ATIME: u32 = 0x4_0000;
+/// Keeps MNT_NOEXEC (Linux MNT_LOCK_NOEXEC)
+pub const MNT_LOCK_NOEXEC: u32 = 0x8_0000;
+/// Keeps MNT_NOSUID (Linux MNT_LOCK_NOSUID)
+pub const MNT_LOCK_NOSUID: u32 = 0x10_0000;
+/// Keeps MNT_NODEV (Linux MNT_LOCK_NODEV)
+pub const MNT_LOCK_NODEV: u32 = 0x20_0000;
+/// Keeps MNT_READONLY (Linux MNT_LOCK_READONLY)
+pub const MNT_LOCK_READONLY: u32 = 0x40_0000;
 /// Cannot be unmounted, moved or pivoted away (Linux MNT_LOCKED: a mount
 /// a less privileged namespace copied, which would uncover what is
 /// under it; the initial root is protected by having no parent)
@@ -345,13 +362,14 @@ impl Mount {
     }
 
     /// A copy of `self` for a namespace copy into namespace `ns`: same
-    /// filesystem, root, flags and source, new ids, not attached; a peer
-    /// of `self`, or with CL_SLAVE in `flag` its slave
+    /// filesystem, root, flags (not the kernel's: Linux clone_mnt) and
+    /// source, new ids, not attached; a peer of `self`, or with CL_SLAVE
+    /// in `flag` its slave
     fn copy(&self, g: &mut NsTree, ns: u64, flag: u32) -> MountRef {
         let c = Self::alloc_nofail(
             self.sb.clone(),
             self.root.clone(),
-            self.flags(),
+            self.flags() & !MNT_INTERNAL_FLAGS,
             self.devname.clone(),
         );
         c.inherit_t_flags(self);
@@ -396,9 +414,9 @@ impl Mount {
     /// through the mount (Linux mnt_make_readonly)
     pub fn set_flags(&self, f: u32) -> Result<(), KernelError> {
         let _ml = MOUNT_LOCK.write();
-        // Lock state is not the caller's to set here, nor the hold
-        let kept = MNT_INTERNAL_FLAGS;
-        let f = (f & !(kept | MNT_WRITE_HOLD)) | (self.flags() & kept);
+        // Only what mount(2) sets changes (Linux set_mount_attributes):
+        // the locks and the kernel's state stay, the hold is not seen
+        let f = (f & MNT_USER_SETTABLE_MASK) | (self.flags() & !MNT_USER_SETTABLE_MASK);
         // Linux mnt_make_readonly: writers held off; read-only only if
         // none holds access, set before the hold is released
         if f & MNT_READONLY != 0 && self.flags() & MNT_READONLY == 0 {
@@ -429,6 +447,19 @@ impl Mount {
     pub(super) fn unhold_writers(&self) {
         fence(Ordering::Release);
         self.mnt_flags.fetch_and(!MNT_WRITE_HOLD, Ordering::Release);
+    }
+
+    /// A remount to MNT_* flags `f` keeps every flag a lock holds
+    /// (Linux can_change_locked_flags): no lock is ever cleared, so no
+    /// lock is needed to read them
+    pub fn can_change_locked_flags(&self, f: u32) -> bool {
+        let fl = self.flags();
+        let keeps = |lock: u32, flag: u32| fl & lock == 0 || f & flag != 0;
+        keeps(MNT_LOCK_READONLY, MNT_READONLY)
+            && keeps(MNT_LOCK_NODEV, MNT_NODEV)
+            && keeps(MNT_LOCK_NOSUID, MNT_NOSUID)
+            && keeps(MNT_LOCK_NOEXEC, MNT_NOEXEC)
+            && (fl & MNT_LOCK_ATIME == 0 || fl & MNT_ATIME_MASK == f & MNT_ATIME_MASK)
     }
 
     /// Set (`on`) or clear MNT_* bits that need no other checks, under
@@ -697,7 +728,9 @@ impl Mount {
     /// (CL_SLAVE).
     ///
     /// This is used by CLONE_NEWNS to give a new mount namespace its
-    /// own view of the mount hierarchy.
+    /// own view of the mount hierarchy. A submount's copy keeps
+    /// MNT_LOCKED, the root's does not (Linux copy_tree); a copy for
+    /// another user namespace is locked whole (lock_mnt_tree).
     pub fn clone_tree(root: &MountRef, ns: u64, slave: bool) -> (MountRef, MountMap) {
         let flag = if slave { super::pnode::CL_SLAVE } else { 0 };
         let mut g = namespace_lock();
@@ -705,9 +738,15 @@ impl Mount {
         let mut map = alloc::vec![(root.clone(), new_root.clone())];
         copy_below(&mut g, root, &new_root, |g, o| {
             let c = o.copy(g, ns, flag);
+            if o.flags() & MNT_LOCKED != 0 {
+                c.mark(MNT_LOCKED, true);
+            }
             map.push((o.clone(), c.clone()));
             c
         });
+        if slave {
+            lock_mnt_tree(&g, &new_root);
+        }
         (new_root, map)
     }
 }
@@ -1265,6 +1304,33 @@ pub(super) fn copy_tree(ns: &mut NsTree, plan: &[CopyEnt], flag: u32) -> MountRe
     out.swap_remove(0)
 }
 
+/// The tree at `m` goes to a less privileged user namespace (Linux
+/// lock_mnt_tree): each mount's atime flags and each of its read-only,
+/// nodev, nosuid and noexec flags are locked on, and every mount below
+/// `m` is MNT_LOCKED, so what it hides stays hidden; under
+/// NAMESPACE_SEM
+fn lock_mnt_tree(ns: &NsTree, m: &Mount) {
+    let _ml = MOUNT_LOCK.write();
+    for_each_mnt(m, ns, |p| {
+        let fl = p.flags();
+        let mut add = MNT_LOCK_ATIME;
+        for (flag, lock) in [
+            (MNT_READONLY, MNT_LOCK_READONLY),
+            (MNT_NODEV, MNT_LOCK_NODEV),
+            (MNT_NOSUID, MNT_LOCK_NOSUID),
+            (MNT_NOEXEC, MNT_LOCK_NOEXEC),
+        ] {
+            if fl & flag != 0 {
+                add |= lock;
+            }
+        }
+        if !core::ptr::eq(p, m) {
+            add |= MNT_LOCKED;
+        }
+        p.mnt_flags.fetch_or(add, Ordering::SeqCst);
+    });
+}
+
 /// A mount under `d` in `m` is locked (Linux has_locked_children): a
 /// bind of `d` alone would uncover what it hides
 fn has_locked_children(ns: &NsTree, m: &Mount, d: &DentryRef) -> bool {
@@ -1686,7 +1752,8 @@ pub(super) fn attach_at(ns: &mut NsTree, m: MountRef, at: &Path) {
 /// the original and each copy join it in turn. One that lands where a
 /// mount already is goes under it: that mount moves onto the root of
 /// the topmost mount of the new tree's root (Linux's tucking), taking
-/// its lock along. Under NAMESPACE_SEM write.
+/// its lock along. A copy in a namespace of another user namespace is
+/// locked (lock_mnt_tree). Under NAMESPACE_SEM write.
 fn graft(ns: &mut NsTree, t: MountRef, at: &Path) -> Result<(), KernelError> {
     let source = MountRef::clone(&t);
     // A mountpoint for where a mount tucked under goes (Linux: get
@@ -1719,9 +1786,10 @@ fn graft(ns: &mut NsTree, t: MountRef, at: &Path) -> Result<(), KernelError> {
     // visible (Linux mnt_set_mountpoint)
     source.set_mountpoint(&mut MOUNT_LOCK.write(), &at.mnt, dest.mp());
     // The original first, then the copies newest first (Linux tree_list)
+    let dest_ns = at.mnt.ns();
     for child in core::iter::once(t).chain(copies.into_iter().rev()) {
         let is_source = MountRef::ptr_eq(&child, &source);
-        commit_one(ns, child, is_source, root.mp());
+        commit_one(ns, child, is_source, root.mp(), dest_ns);
     }
     unpin_both(root, dest);
     Ok(())
@@ -1740,7 +1808,13 @@ fn unpin_both(a: MpPin, b: MpPin) {
 /// attach_recursive_mnt's loop over tree_list: __lookup_mnt, then
 /// commit_tree, then a mount found there tucked over `child`'s topmost
 /// overmount at `root_mp`); under NAMESPACE_SEM write
-fn commit_one(ns: &mut NsTree, child: MountRef, is_source: bool, root_mp: MpPtr) {
+fn commit_one(ns: &mut NsTree, child: MountRef, is_source: bool, root_mp: MpPtr, dest_ns: u64) {
+    // Propagated into a namespace of another user namespace (Linux:
+    // its parent's mnt_ns->user_ns not the destination's)
+    let pns = child.parent_in(&*ns).map_or(0, Mount::ns);
+    if pns != dest_ns && !crate::ns::mnt_ns_same_owner(pns, dest_ns) {
+        lock_mnt_tree(ns, &child);
+    }
     let q = {
         let _ml = MOUNT_LOCK.read_excl();
         let p = child.mnt_parent.load(Ordering::Relaxed).cast_const();

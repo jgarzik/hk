@@ -32,7 +32,8 @@ pub mod uts;
 use crate::sync::spin::RwLock;
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::{arc_nofail, try_arc};
-use alloc::sync::Arc;
+use crate::util::rbtree::{RbTree, RbTreeNodeReservation};
+use alloc::sync::{Arc, Weak};
 use spin::Lazy;
 
 pub use cgroup::{CgroupNamespace, INIT_CGROUP_NS};
@@ -86,11 +87,39 @@ use crate::fs::mount::{Mount, MountRef};
 impl Drop for MntNamespace {
     /// Linux put_mnt_ns: the tree is unmounted whole (sleeps: the last
     /// reference goes in thread context with nothing held, an exit or
-    /// unshare/setns, or a namespace file's deferred release)
+    /// unshare/setns, or a namespace file's deferred release); first
+    /// it leaves the namespace tree (Linux mnt_ns_tree_remove)
     fn drop(&mut self) {
+        let node = MNT_NS_TREE.lock().remove_node(&self.id);
+        drop(node);
         if let Some(root) = self.root.get_mut().take() {
             crate::fs::mount::put_mnt_ns(root);
         }
+    }
+}
+
+/// Live mount namespaces by id, each with its owning user namespace
+/// (Linux mnt_ns_tree, which finds a namespace from a mount's mnt_ns id
+/// here): a namespace is added once made, removed at its end. A spin
+/// leaf (Linux mnt_ns_tree_lock), taken under NAMESPACE_SEM by graft.
+static MNT_NS_TREE: crate::sync::spin::Mutex<RbTree<u64, Weak<UserNamespace>>> =
+    crate::sync::spin::Mutex::new(RbTree::new());
+
+/// Add `ns` to the namespace tree (Linux mnt_ns_tree_add)
+fn mnt_ns_tree_add(ns: &MntNamespace, node: RbTreeNodeReservation<u64, Weak<UserNamespace>>) {
+    let node = node.into_node(ns.id, Arc::downgrade(&ns.user_ns));
+    let old = MNT_NS_TREE.lock().insert(node);
+    debug_assert!(old.is_none(), "ns: a mount namespace id reused");
+}
+
+/// The mount namespaces numbered `a` and `b` are owned by the same user
+/// namespace (Linux a->user_ns == b->user_ns, each found from a mount's
+/// mnt_ns); false if either is gone
+pub fn mnt_ns_same_owner(a: u64, b: u64) -> bool {
+    let t = MNT_NS_TREE.lock();
+    match (t.get(&a), t.get(&b)) {
+        (Some(x), Some(y)) => Weak::ptr_eq(x, y),
+        _ => false,
     }
 }
 
@@ -118,15 +147,20 @@ impl MntNamespace {
     /// Create a new empty mount namespace owned by `user_ns`, or ENOMEM
     /// (Linux alloc_mnt_ns)
     pub fn new(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
-        try_arc(Self::with(inum::Inum::alloc()?, user_ns))
+        let node = RbTreeNodeReservation::new()?;
+        let ns = try_arc(Self::with(inum::Inum::alloc()?, user_ns))?;
+        mnt_ns_tree_add(&ns, node);
+        Ok(ns)
     }
 
     /// Create initial mount namespace (boot: failure cannot be reported)
     fn new_init() -> Arc<Self> {
-        arc_nofail(Self::with(
+        let ns = arc_nofail(Self::with(
             inum::Inum::fixed(inum::MNT_INIT),
             INIT_USER_NS.clone(),
-        ))
+        ));
+        mnt_ns_tree_add(&ns, RbTreeNodeReservation::new_nofail());
+        ns
     }
 
     /// An empty namespace numbered `inum`, owned by `user_ns`

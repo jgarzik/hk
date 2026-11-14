@@ -1,22 +1,33 @@
-//! Mount operations on another namespace's mounts (Linux check_mnt), and
-//! SO_PRIORITY above 6 with CAP_NET_RAW alone (Linux sk_set_prio_allowed)
+//! Mount operations on another namespace's mounts (Linux check_mnt),
+//! locked mounts of a namespace copied for another user namespace
+//! (Linux lock_mnt_tree), and SO_PRIORITY above 6 with CAP_NET_RAW
+//! alone (Linux sk_set_prio_allowed)
 //!
 //! A child that unshares its mount namespace and reaches a mount of the
 //! parent's namespace through a directory fd opened before the unshare
 //! gets EINVAL from MS_MOVE, MS_BIND, umount, remount and a new mount
 //! on it; the parent's mount is untouched. A propagation change needs
 //! only a mount in some namespace (Linux may_change_propagation).
+//!
+//! In a namespace copied with a new user namespace, a submount cannot
+//! be unmounted or moved, nor its parent bound without it (EINVAL), and
+//! a remount may not drop its read-only, nosuid or atime flags (EPERM);
+//! a mount propagated into such a namespace is locked the same way.
 
-use crate::harness::{fail_num, pass};
+use crate::harness::{R, check, fail_num, pass, report_r};
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
-    _LINUX_CAPABILITY_VERSION_3, AF_INET, CLONE_NEWNS, CapUserData, CapUserHeader, O_CREAT,
-    O_DIRECTORY, O_RDONLY, O_RDWR, SOCK_DGRAM, sys_capset, sys_close, sys_exit, sys_fchdir,
-    sys_fork, sys_mkdir, sys_mount, sys_open, sys_rmdir, sys_setsockopt, sys_socket, sys_umount2,
-    sys_unshare, sys_wait4,
+    _LINUX_CAPABILITY_VERSION_3, AF_INET, CLONE_NEWNS, CLONE_NEWUSER, CapUserData, CapUserHeader,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, SOCK_DGRAM, sys_capset, sys_close, sys_exit,
+    sys_fchdir, sys_fork, sys_mkdir, sys_mount, sys_open, sys_pipe, sys_read, sys_rmdir,
+    sys_setsockopt, sys_socket, sys_umount2, sys_unshare, sys_wait4, sys_write,
 };
 
 const MS_RDONLY: u64 = 1;
+const MS_NOSUID: u64 = 2;
+const MS_NOATIME: u64 = 1024;
+const MS_SHARED: u64 = 1 << 20;
+const EPERM: i64 = -1;
 const MS_REMOUNT: u64 = 32;
 const MS_BIND: u64 = 4096;
 const MS_MOVE: u64 = 8192;
@@ -27,7 +38,175 @@ const EINVAL: i64 = -22;
 
 pub fn run_tests() {
     test_foreign_mount();
+    report_r(b"MNT_LOCKED_USERNS", locked_userns());
+    report_r(b"MNT_LOCKED_PROPAGATED", locked_propagated());
     test_prio_net_raw();
+}
+
+/// A new mount (ramfs on both kernels) on `t`
+fn ramfs(t: &[u8]) -> i64 {
+    sys_mount(b"none\0".as_ptr(), t.as_ptr(), b"ramfs\0".as_ptr(), 0, 0)
+}
+
+/// mount(2) with no source or type: remounts and propagation changes
+fn remount(t: &[u8], flags: u64) -> i64 {
+    let none = core::ptr::null();
+    sys_mount(none, t.as_ptr(), none, flags, 0)
+}
+
+/// The exit status of a child running `f`: the number of its first
+/// failed check, 0 if all passed
+fn in_child(f: fn() -> u8) -> R {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(u64::from(f()));
+    }
+    check(b"fork", pid > 0, pid)?;
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    check(b"child step", ws == 0, i64::from(ws >> 8))
+}
+
+/// The first of `steps` that is false, numbered from 1; 0 if none
+fn first_bad(steps: &[bool]) -> u8 {
+    steps.iter().position(|ok| !ok).map_or(0, |i| i as u8 + 1)
+}
+
+/// A private namespace with /tmp/ml (ramfs) holding /tmp/ml/sub, a
+/// read-only nosuid ramfs over a file `secret`, and an empty /tmp/ml/b
+fn locked_setup() -> bool {
+    if sys_unshare(CLONE_NEWNS) != 0 || remount(b"/\0", MS_REC | MS_PRIVATE) != 0 {
+        return false;
+    }
+    sys_mkdir(b"/tmp/ml\0".as_ptr(), 0o755);
+    if ramfs(b"/tmp/ml\0") != 0 {
+        return false;
+    }
+    sys_mkdir(b"/tmp/ml/sub\0".as_ptr(), 0o755);
+    sys_mkdir(b"/tmp/ml/b\0".as_ptr(), 0o755);
+    let fd = sys_open(b"/tmp/ml/sub/secret\0".as_ptr(), O_RDWR | O_CREAT, 0o644);
+    sys_close(fd as u64);
+    fd >= 0
+        && ramfs(b"/tmp/ml/sub\0") == 0
+        && remount(
+            b"/tmp/ml/sub\0",
+            MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID,
+        ) == 0
+}
+
+/// Child of MNT_LOCKED_USERNS (Linux copy_mnt_ns' lock_mnt_tree for a
+/// copy owned by another user namespace)
+fn locked_child() -> u8 {
+    if !locked_setup() {
+        return 100;
+    }
+    if sys_unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0 {
+        return 101;
+    }
+    let sub = b"/tmp/ml/sub\0";
+    let bind = MS_REMOUNT | MS_BIND;
+    first_bad(&[
+        // MNT_LOCKED: can_umount, lazy or not
+        sys_umount2(sub.as_ptr(), 0) == EINVAL,
+        sys_umount2(sub.as_ptr(), MNT_DETACH) == EINVAL,
+        // MNT_LOCK_*: keeping every locked flag is fine
+        remount(sub, bind | MS_RDONLY | MS_NOSUID) == 0,
+        remount(sub, bind | MS_NOSUID) == EPERM,
+        remount(sub, bind | MS_RDONLY) == EPERM,
+        remount(sub, bind | MS_RDONLY | MS_NOSUID | MS_NOATIME) == EPERM,
+        remount(sub, MS_REMOUNT | MS_NOSUID) == EPERM,
+        // A lone bind would uncover the secret; a locked mount stays put
+        sys_mount(
+            b"/tmp/ml\0".as_ptr(),
+            b"/tmp/ml/b\0".as_ptr(),
+            core::ptr::null(),
+            MS_BIND,
+            0,
+        ) == EINVAL,
+        sys_mount(
+            sub.as_ptr(),
+            b"/tmp/ml/b\0".as_ptr(),
+            core::ptr::null(),
+            MS_MOVE,
+            0,
+        ) == EINVAL,
+        // What is mounted over a locked mount comes and goes freely
+        ramfs(sub) == 0,
+        sys_umount2(sub.as_ptr(), 0) == 0,
+        sys_umount2(sub.as_ptr(), 0) == EINVAL,
+    ])
+}
+
+/// A namespace copied with a new user namespace is locked: its
+/// submounts stay, with the flags they had
+fn locked_userns() -> R {
+    in_child(locked_child)
+}
+
+/// Child of MNT_LOCKED_PROPAGATED: /tmp/mp is shared, a grandchild in a
+/// new user namespace holds a slave copy; a tree bound under /tmp/mp
+/// reaches the grandchild with its submount locked (Linux
+/// attach_recursive_mnt: lock_mnt_tree across user namespaces)
+fn propagated_child() -> u8 {
+    if sys_unshare(CLONE_NEWNS) != 0 || remount(b"/\0", MS_REC | MS_PRIVATE) != 0 {
+        return 100;
+    }
+    for d in [&b"/tmp/mp\0"[..], b"/tmp/mt\0"] {
+        sys_mkdir(d.as_ptr(), 0o755);
+    }
+    if ramfs(b"/tmp/mp\0") != 0 || remount(b"/tmp/mp\0", MS_SHARED) != 0 {
+        return 101;
+    }
+    if ramfs(b"/tmp/mt\0") != 0 {
+        return 102;
+    }
+    sys_mkdir(b"/tmp/mt/x\0".as_ptr(), 0o755);
+    sys_mkdir(b"/tmp/mp/t\0".as_ptr(), 0o755);
+    if ramfs(b"/tmp/mt/x\0") != 0 {
+        return 103;
+    }
+    let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+    if sys_pipe(ready.as_mut_ptr()) != 0 || sys_pipe(go.as_mut_ptr()) != 0 {
+        return 104;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        let ok = sys_unshare(CLONE_NEWUSER | CLONE_NEWNS) == 0;
+        sys_write(ready[1] as u64, [u8::from(ok)].as_ptr(), 1);
+        let mut b = [0u8; 1];
+        sys_read(go[0] as u64, b.as_mut_ptr(), 1);
+        let code = first_bad(&[
+            ok,
+            sys_umount2(b"/tmp/mp/t/x\0".as_ptr(), 0) == EINVAL,
+            sys_umount2(b"/tmp/mp/t/x\0".as_ptr(), MNT_DETACH) == EINVAL,
+        ]);
+        sys_exit(u64::from(code));
+    }
+    let mut b = [0u8; 1];
+    sys_read(ready[0] as u64, b.as_mut_ptr(), 1);
+    let bound = sys_mount(
+        b"/tmp/mt\0".as_ptr(),
+        b"/tmp/mp/t\0".as_ptr(),
+        core::ptr::null(),
+        MS_BIND | MS_REC,
+        0,
+    );
+    sys_write(go[1] as u64, b"g".as_ptr(), 1);
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    if bound != 0 {
+        return 105;
+    }
+    if ws != 0 {
+        return 10 + (ws >> 8) as u8;
+    }
+    0
+}
+
+/// A tree propagated into a namespace of another user namespace has
+/// its submounts locked there
+fn locked_propagated() -> R {
+    in_child(propagated_child)
 }
 
 /// Child: each foreign-mount operation must be EINVAL; exit status is a
