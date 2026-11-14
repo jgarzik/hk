@@ -684,9 +684,9 @@ pub fn sys_vmsplice(
     r
 }
 
-/// Copy the segments into pipe pages, a page at a time, until they or
-/// the room run out (Linux iter_to_pipe); a fault or no memory ends it,
-/// an error only if nothing was copied
+/// Copy the segments into pipe pages, a buffer per user page touched,
+/// until they or the room run out (Linux iter_to_pipe); a fault or no
+/// memory ends it, an error only if nothing was copied
 fn iter_to_pipe(g: &mut PipeGuard<'_>, segs: &[IoVec]) -> KernelResult<usize> {
     let mut total = 0usize;
     for seg in segs {
@@ -712,11 +712,13 @@ fn iter_to_pipe(g: &mut PipeGuard<'_>, segs: &[IoVec]) -> KernelResult<usize> {
     Ok(total)
 }
 
-/// A pipe buffer holding up to a page of user memory at `addr` (`len`
-/// bytes left there): EFAULT, ENOMEM
+/// A pipe buffer holding the user memory at `addr` (`len` bytes left
+/// there) up to its page's end, as Linux's buffer holds that user
+/// page; not mergeable (Linux: a later write takes a new buffer):
+/// EFAULT, ENOMEM
 fn page_from_user(addr: u64, len: u64) -> KernelResult<PipeBuffer> {
     let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
-    let n = len.min(PAGE_SIZE as u64) as usize;
+    let n = len.min(PAGE_SIZE as u64 - addr % PAGE_SIZE as u64) as usize;
     // SAFETY: page.frame is a freshly allocated, kernel-mapped page of
     // PAGE_SIZE bytes owned by this buffer, and `n <= PAGE_SIZE`
     let dst = unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), n) };
@@ -725,7 +727,7 @@ fn page_from_user(addr: u64, len: u64) -> KernelResult<PipeBuffer> {
         page,
         0,
         n as u32,
-        pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
+        pipe_buf_flags::OWNED,
     ))
 }
 
