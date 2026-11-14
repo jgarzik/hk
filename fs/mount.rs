@@ -143,8 +143,8 @@ static MNT_ID_UNIQUE: AtomicU64 = AtomicU64::new(MNT_UNIQUE_ID_OFFSET + 1);
 /// Held through [`MountRef`] (a per-CPU count, Linux mnt_pcp, exact
 /// once out of its namespace); the last reference's teardown
 /// (`cleanup`) is deferred (`fs::mntput`), so a reference may be dropped
-/// under any lock but MOUNT_LOCK. Its users (`users`: open
-/// files, a task's root and cwd) make it busy for umount.
+/// under any lock but MOUNT_LOCK. References beyond its caller's and
+/// the tree's make it busy for umount.
 pub struct Mount {
     /// The mounted filesystem's superblock (Linux mnt_sb)
     pub sb: MntOwned<Arc<SuperBlock>>,
@@ -1030,16 +1030,24 @@ pub fn put_mnt_ns(root: MountRef) {
         }
     }
     crate::sync::rcu::synchronize();
-    while let Some(c) = gone.pop_front() {
+    put_unhung(gone);
+    drop(root);
+}
+
+/// Release submounts unhung onto `l` (their parent links cleared under
+/// MOUNT_LOCK write, their namespace left a grace period ago or never
+/// held): each one's mountpoint, then the reference its list entry held
+/// (Linux umount_mnt's put_mountpoint, then mntput)
+fn put_unhung(mut l: OwnedList<MntChild>) {
+    while let Some(c) = l.pop_front() {
         // SAFETY: entries of mnt_mounts are references (`attach_mnt`),
-        // moved here as they were
+        // moved onto `l` as they were
         let c = unsafe { MountRef::from_entry(c) };
         // Its parent link is gone: `up` no longer reads this
         if let Some(mp) = c.mountpoint.write().take() {
             note_mp(&mp, -1);
         }
     }
-    drop(root);
 }
 
 /// Take `m` (and what is mounted below it) off its parent; under
@@ -1274,22 +1282,9 @@ impl Mount {
         // A tree torn down whole (a namespace's last reference) still
         // has its submounts hung on it: each loses its parent and
         // mountpoint, and the reference this one held
-        let (mut kids, in_ns) = self.unhang_children();
-        // One that was still in a namespace (Linux never has such: the
-        // parent of a doomed mount is in none) had fast puts: wait them
-        // out before its reference goes (Linux namespace_unlock)
-        if in_ns {
-            crate::sync::rcu::synchronize();
-        }
-        while let Some(c) = kids.pop_front() {
-            // SAFETY: entries of mnt_mounts are references
-            // (`attach_mnt`), moved here as they were
-            let c = unsafe { MountRef::from_entry(c) };
-            // Its parent link is gone: `up` no longer reads this
-            if let Some(mp) = c.mountpoint.write().take() {
-                note_mp(&mp, -1);
-            }
-        }
+        // (Linux mntput_no_expire's stuck children: out of any namespace,
+        // as their doomed parent is, so put by the exact path)
+        put_unhung(self.unhang_children());
         if let Some(mp) = self.mountpoint.write().take() {
             note_mp(&mp, -1);
         }
@@ -1306,23 +1301,22 @@ impl Mount {
     /// parent link there, and moves, with the reference it held, to the
     /// list returned (intrusive: nothing allocated), released after the
     /// locks
-    fn unhang_children(&self) -> (OwnedList<MntChild>, bool) {
+    fn unhang_children(&self) -> OwnedList<MntChild> {
         let mut out = OwnedList::new();
         if !self.has_children(&*MOUNT_LOCK.read_excl()) {
-            return (out, false);
+            return out;
         }
         let mut ns = namespace_lock();
         let mut ml = MOUNT_LOCK.write();
         let list = self.mnt_mounts.access_mut(&mut ns, &mut ml);
-        let mut in_ns = false;
         while let Some(c) = list.pop_front() {
+            // A doomed mount is in no namespace, nor what hangs on it
+            // (umount and put_mnt_ns clear the whole tree)
             debug_assert_eq!(c.ns(), 0, "mount: a doomed mount's submount in a namespace");
-            in_ns |= c.ns() != 0;
-            c.set_ns(0);
             *c.parent.write() = None;
             out.push_back(c);
         }
-        (out, in_ns)
+        out
     }
 }
 

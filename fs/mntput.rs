@@ -101,18 +101,13 @@ impl Mount {
         p.0.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// The count, exact once no fast put runs (Linux mnt_get_count)
-    fn pcp_sum(&self) -> isize {
+    /// Its references, summed (Linux mnt_get_count): exact once out of
+    /// its namespace, approximate while fast puts may run
+    pub(super) fn mnt_get_count(&self) -> isize {
         self.mnt_pcp
             .iter()
             .map(|p| p.0.load(Ordering::Relaxed))
             .sum()
-    }
-
-    /// Its references, summed (Linux mnt_get_count): exact once out of
-    /// its namespace, approximate while fast puts may run
-    pub(super) fn mnt_get_count(&self) -> isize {
-        self.pcp_sum()
     }
 
     /// It still has a reference (Linux: not MNT_DOOMED)
@@ -241,7 +236,7 @@ impl MountRef {
             // fast put that saw it is in the parts (Linux smp_mb)
             fence(Ordering::SeqCst);
             m.pcp_add(-1);
-            let count = m.pcp_sum();
+            let count = m.mnt_get_count();
             debug_assert!(count >= 0, "mount: count below zero");
             let last = count == 0 && !m.doomed.load(Ordering::Relaxed);
             if last {

@@ -260,8 +260,9 @@ while held (Release fences around the writer's stores); lockless
 readers use `read_begin`/`read_retry` and repeat a read that raced a
 writer. `read_excl` takes the spin lock without moving the sequence
 (Linux read_seqlock_excl). A `SeqLock<T>` owns `T`, which can be a
-`sync::UniqueOwner` (the owner of `LockedBy`/`LockedByEither` cells kept elsewhere). Thread context only. Used for `MOUNT_LOCK`. `SeqRwLock` is the
-same with a spin RwLock (its write guard bumps the sequence): locking
+`sync::UniqueOwner` (the owner of `LockedBy`/`LockedByEither` cells
+kept elsewhere). Thread context only. Used for `MOUNT_LOCK`.
+`SeqRwLock` is the same with a spin RwLock (its write guard bumps the sequence): locking
 readers share it (Linux read_seqlock_excl excludes them), lockless ones
 sample the sequence. Used for `dentry::RENAME_LOCK` (Linux rename_lock).
 Both are built on `SeqCount` (Linux seqcount_t), the sequence alone.
