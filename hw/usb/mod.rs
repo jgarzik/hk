@@ -5,10 +5,6 @@
 //! matching and uevents; `config`: descriptor parsing) and the device
 //! drivers (usb-storage, ftdi_sio).
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
-use crate::printkln;
-
 pub mod config;
 pub mod context;
 pub mod driver;
@@ -19,29 +15,6 @@ pub mod serial;
 pub mod transfer;
 pub mod usbcore;
 pub mod xhci;
-
-// ============================================================================
-// USB Protocol Tracing
-// ============================================================================
-
-/// USB protocol tracing flag (enable via kernel cmdline "usb_trace")
-static USB_TRACE: AtomicBool = AtomicBool::new(false);
-
-/// Enable USB protocol tracing
-///
-/// This enables detailed tracing of USB protocol operations across
-/// all USB host controllers and drivers.
-pub fn enable_usb_trace() {
-    USB_TRACE.store(true, Ordering::Release);
-    crate::trace::want_buffers();
-    printkln!("USB: Protocol tracing enabled");
-}
-
-/// Check if USB tracing is enabled
-#[inline]
-pub fn usb_trace_enabled() -> bool {
-    USB_TRACE.load(Ordering::Relaxed)
-}
 
 // Re-export USB host functions for use by USB drivers
 pub use xhci::{usb_bulk_in, usb_bulk_out};

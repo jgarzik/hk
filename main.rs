@@ -344,6 +344,8 @@ pub(crate) fn kmain() -> ! {
     hw::usb::usb_init();
     hw::usb::USB_SERIAL_DRIVER.register();
     hw::usb::msc::USB_STORAGE_DRIVER.register();
+    // xhci-hcd's trace events (Linux: its module's trace system)
+    trace::register_system(&hw::usb::xhci::TRACE_SYSTEM);
     hw::usb::xhci::XHCI_PCI_DRIVER.register();
     hw::net::E1000_DRIVER.register();
     hw::virtio::virtio_init();

@@ -4,14 +4,13 @@
 //!
 //! ## Supported Options
 //!
-//! - `usb_trace` - Enable USB protocol tracing (xHCI trace events in
-//!   /sys/kernel/tracing/trace)
+//! - `trace_event=<system>[:<event>][,...]` - Enable trace events at
+//!   boot (`trace`; Linux kernel/trace/trace_events.c)
 //! - `console=<device>[,<options>]` - Set kernel console device
 //!   - Examples: `console=ttyS0`, `console=ttyS0,115200`
 //!   - Multiple console= options can be specified; all receive output
 //!   - The last one specified is the primary console
 
-use crate::hw::usb;
 use crate::sync::spin::Mutex;
 
 /// Maximum number of console specifications from command line
@@ -92,7 +91,7 @@ pub fn saved() -> &'static str {
 const KERNEL_PARAMS: &[&str] = &[
     "console",
     "earlycon",
-    "usb_trace",
+    "trace_event",
     "watchdog_thresh",
     "root",
     "rootfstype",
@@ -148,7 +147,6 @@ pub fn init_args(cmdline: &str) -> InitArgs {
 /// Parse kernel command line and apply options
 ///
 /// Supported options:
-/// - `usb_trace`: Enable USB protocol tracing for debugging
 /// - `console=<device>[,<baud>]`: Set kernel console device
 /// - `watchdog_thresh=<seconds>`: soft lockup threshold (`watchdog`)
 pub fn parse_cmdline(cmdline: &str) {
@@ -159,9 +157,7 @@ pub fn parse_cmdline(cmdline: &str) {
         (b, n)
     });
     for option in cmdline.split_whitespace() {
-        if option == "usb_trace" {
-            usb::enable_usb_trace();
-        } else if let Some(console_arg) = option.strip_prefix("console=") {
+        if let Some(console_arg) = option.strip_prefix("console=") {
             parse_console_option(console_arg);
         } else if let Some(n) = option.strip_prefix("virtio_blk.poll_queues=")
             && let Ok(n) = n.parse()

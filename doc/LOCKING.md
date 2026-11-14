@@ -3531,12 +3531,19 @@ bitflags! {
 - `ENABLED` is automatically set on registration; only enabled consoles receive output
 
 **Trace ring (`trace.rs`; Linux kernel/trace ring_buffer):** trace
-events (`trace::emit`, e.g. xHCI's under `usb_trace`) never reach
-printk: each is formatted on the stack and appended to this CPU's ring,
-an `IrqSpinlock` leaf (any context, hardirq included; nothing allocated
-under it; the oldest records are overwritten). The rings are allocated
-once at boot (`trace::init`, before any reader) only when the command
-line asked for tracing. tracefs's `trace` file (kernfs, /sys/kernel/
+events (`trace::emit`, e.g. xHCI's, system `xhci-hcd`) never reach
+printk: an enabled event (its flag an atomic, read lock-free) is
+formatted on the stack and appended to this CPU's ring, an
+`IrqSpinlock` leaf (any context, hardirq included; nothing allocated
+under it; the oldest records are overwritten). `EVENT_MUTEX` (sleeping
+`sync::Mutex`, Linux event_mutex, thread only) holds the registered
+systems and serializes enabling: the `events/.../enable` stores and
+`trace_event=` (applied as each system registers) set the flags under
+it, allocating the rings first (once, a `Once` per CPU; Linux
+tracing_update_buffers); registration makes the system's tracefs
+directories under it (order: `EVENT_MUTEX` -> `KERNFS_RWSEM`; an enable
+store runs under its node's active reference, then takes
+`EVENT_MUTEX`; no tracefs node is ever removed). tracefs's `trace` file (kernfs, /sys/kernel/
 tracing) copies each ring out under its lock into a buffer allocated
 before taking it, one CPU at a time, and formats with no lock held; an
 O_TRUNC open for writing (Linux tracing_open) empties each ring under
