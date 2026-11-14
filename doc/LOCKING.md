@@ -3597,19 +3597,26 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    Linux): its held locks order above TASKLIST and the signal locks.
 
 6. **A group signal's thread is chosen under TASKLIST, not siglock**
-   (Linux complete_signal under siglock): after the signal is queued
-   on the group set under the receiver's `Task.sig`, the threads are
-   walked under TASKLIST (`signal::choose`: read lock; a send under the
-   write lock, a child's notice, chooses in that section), each
-   candidate's `Task.sig` taken alone to test wants_signal, and whether
-   it ends the group decided there, never for an init its protection
-   covers (`Target::protects`). The lock is dropped before the chosen
-   thread's TIF_SIGPENDING is recomputed under its `Task.sig` and it is
-   woken (a decided group kill done then too). A thread that blocks a group signal or starts
-   exiting hands it on the same way after dropping its own lock
-   (retarget_shared_pending). A thread that changes its mask between
-   the test and the wakeup sees the signal when it recomputes
-   TIF_SIGPENDING.
+   (Linux complete_signal under siglock): a send holds TASKLIST's read
+   lock from finding its receiver to its last wakeup (`send_task_in`;
+   a caller already holding it, a process-group walk, sends in place,
+   as Linux group_send_sig_info under tasklist_lock). After the signal
+   is queued under the receiver's `Task.sig`, the threads are walked
+   (`signal::choose`; a send under the write lock, a child's notice,
+   chooses in that section), each candidate's `Task.sig` taken alone
+   to test wants_signal, and whether it ends the group decided there,
+   never for an init its protection covers (`Target::protects`). Then,
+   still under TASKLIST, a decided group kill is done (`group_kill`,
+   `zap_threads`: each thread's `Task.sig` alone, nothing allocated)
+   and the chosen thread's TIF_SIGPENDING is recomputed under its
+   `Task.sig` and it is woken; a send under the write lock leaves
+   these to `Posted::finish`, which takes the read lock after the
+   write lock is dropped. A send changes no blocked mask, so it never
+   retargets (`with_sig_send`), which would take TASKLIST again. A
+   thread that blocks a group signal or starts exiting hands it on
+   the same way after dropping its own lock (retarget_shared_pending).
+   A thread that changes its mask between the test and the wakeup
+   sees the signal when it recomputes TIF_SIGPENDING.
 
 #### Lock Order for Signal Operations
 
@@ -3680,17 +3687,19 @@ process context only). The syscall finds the target once, under one
 TASKLIST read hold (the number, the permission check, a `TaskRef`);
 the send works on that task:
 ```rust
-let tg = target(t)?;                      // TASKLIST read: still listed,
-                                          // its handlers, group, limits
-let sent = with_sig(t, |t, state| {       // Task.sig
+let table = TASKLIST.read();
+let tg = target_in(&table, t)?;           // still listed, its handlers,
+                                          // group, limits
+let sent = with_sig_send(t, |t, state| {  // Task.sig
     if sig_ignored(..) { return Dropped } // SIG_IGN / default-ignore
     state.pending.add(sig);
     Queued(wants)
 });                                       // TIF_SIGPENDING recomputed
-// both released, then (complete_signal):
+// Task.sig released, TASKLIST still read-held (complete_signal):
 signal_wake_task(&c, WakeMode::Interruptible) // try_to_wake_up(&Task) or
                                               // kick_process
 ```
+
 `with_task_signal_state` recomputes the task's TIF_SIGPENDING after every
 access (the one record of it: no copy in `TaskSignalState`), so it means
 "a signal is deliverable under the current mask"; interruptible sleeps
