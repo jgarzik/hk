@@ -61,7 +61,7 @@
 - [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)
 - [x] dup3
-- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL (O_APPEND, O_NONBLOCK, O_NOATIME, O_DIRECT where open would take it), F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETOWN_EX, F_SETOWN_EX, F_GETSIG, F_SETSIG, F_ADD_SEALS, F_GET_SEALS (tmpfs files; all six seals enforced); O_ASYNC raises SIGIO, or the F_SETSIG signal with POLL_* info, on pipes, FIFOs, ttys (input; FIOASYNC makes the foreground group or the caller owner), inotify and sockets (POLL_IN on input, POLL_OUT for room only after a send found none, POLL_ERR, POLL_HUP; TCP: POLL_OUT once connected))
+- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL (O_APPEND, O_NONBLOCK, O_NOATIME, O_DIRECT where open would take it), F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETOWN_EX, F_SETOWN_EX, F_GETSIG, F_SETSIG, F_ADD_SEALS, F_GET_SEALS (tmpfs files; all six seals enforced); O_ASYNC raises SIGIO, or the F_SETSIG signal with POLL_* info, on pipes, FIFOs, ttys (POLL_IN on input, POLL_OUT for room after a short write; FIOASYNC makes the foreground group or the caller owner), inotify and sockets (POLL_IN on input, POLL_OUT for room only after a send found none, POLL_ERR, POLL_HUP; TCP: POLL_OUT once connected))
 
 2.2 Read/write + position
 
@@ -86,7 +86,7 @@
 - [x] tee
 - [x] vmsplice
 - [x] copy_file_range
-- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD (regular files, pipes/FIFOs, inotify, fanotify), xHCI USB; ttys (also via /dev/tty and /dev/console): TCGETS, TCSETS[WF], TIOC[GS]WINSZ (SIGWINCH), TIOC[GS]PGRP, TIOCGSID, TIOCSCTTY, TIOCNOTTY, TIOC[GS]ETD, TCFLSH, TCSBRK[P] (drain), TIOCINQ, TIOCOUTQ; block devices: BLKGETSIZE, BLKGETSIZE64, BLKSSZGET, BLKPBSZGET, BLKBSZGET, BLKBSZSET, BLKROGET, BLKRRPART, BLKFLSBUF; sockets: FIONREAD/SIOCINQ, SIOCOUTQ, FIOSETOWN/SIOCSPGRP, FIOGETOWN/SIOCGPGRP, SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFNAME, SIOC[GS]IFFLAGS, SIOC[GS]IFADDR, SIOC[GS]IFNETMASK, SIOC[GS]IFBRDADDR, SIOCGIFHWADDR, SIOC[GS]IFMTU, SIOCADDRT, SIOCDELRT)
+- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD (regular files, pipes/FIFOs, inotify, fanotify), xHCI USB; ttys (also via /dev/tty and /dev/console): TCGETS, TCSETS[WF], TIOC[GS]WINSZ (SIGWINCH), TIOC[GS]PGRP, TIOCGSID, TIOCSCTTY, TIOCNOTTY, TIOC[GS]ETD, TCFLSH, TCXONC, TCSBRK[P] (drain), TIOCINQ, TIOCOUTQ; block devices: BLKGETSIZE, BLKGETSIZE64, BLKSSZGET, BLKPBSZGET, BLKBSZGET, BLKBSZSET, BLKROGET, BLKRRPART, BLKFLSBUF; sockets: FIONREAD/SIOCINQ, SIOCOUTQ, FIOSETOWN/SIOCSPGRP, FIOGETOWN/SIOCGPGRP, SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFNAME, SIOC[GS]IFFLAGS, SIOC[GS]IFADDR, SIOC[GS]IFNETMASK, SIOC[GS]IFBRDADDR, SIOCGIFHWADDR, SIOC[GS]IFMTU, SIOCADDRT, SIOCDELRT)
 - [x] sync
 - [x] fsync
 - [x] fdatasync

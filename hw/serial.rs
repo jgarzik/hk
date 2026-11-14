@@ -277,6 +277,11 @@ impl UartOps for SerialTty {
         unsafe { self.outb(regs::THR, b) };
     }
 
+    /// Linux serial8250_tx_chars: the x_char alone in its round
+    fn xchar_ends_round(&self) -> bool {
+        true
+    }
+
     /// Linux serial8250_start_tx / __stop_tx: IER.THRI
     fn tx_irq(&self, on: bool) {
         let v = self.ier.load(Ordering::Relaxed);
@@ -313,8 +318,29 @@ impl UartOps for SerialTty {
 impl TtyDriver for SerialTty {
     /// Linux uart_write: into the transmit buffer, the transmitter
     /// started
-    fn write(&self, data: &[u8]) -> Result<usize, KernelError> {
-        Ok(self.uart.write(self, data))
+    fn write(&self, tty: &Tty, data: &[u8]) -> Result<usize, KernelError> {
+        let (n, wake) = self.uart.write(self, data);
+        if wake {
+            tty.write_wakeup();
+        }
+        Ok(n)
+    }
+
+    /// Linux uart_stop
+    fn stop(&self) {
+        self.uart.stop(self);
+    }
+
+    /// Linux uart_start (the tty layer wakes writers after)
+    fn start(&self) {
+        self.uart.start(self);
+    }
+
+    /// Linux uart_send_xchar
+    fn send_xchar(&self, tty: &Tty, ch: u8) {
+        if self.uart.send_xchar(self, ch) {
+            tty.write_wakeup();
+        }
     }
 
     fn flush(&self) {
@@ -331,6 +357,11 @@ impl TtyDriver for SerialTty {
 
     fn flush_buffer(&self) {
         self.uart.flush_buffer();
+    }
+
+    /// Linux uart_tty_port_shutdown
+    fn shutdown(&self, console: bool) {
+        self.uart.shutdown(self, console);
     }
 
     /// Linux serial8250_console_write: under the port lock
@@ -507,6 +538,9 @@ fn serial8250_probe(
         ConsolePriority::Fallback,
         crate::console::ConsoleFlags::BOOT,
     );
+    // COM2 is set up as COM1 was at boot (Linux serial8250_config_port);
+    // it has no interrupt: a timer drains its transmitter
+    SERIAL_DRIVER_S1.init_hardware(115200);
     let irq = crate::base::platform::pdev(dev).and_then(|p| p.irq);
     *port.irq.get_mut() = irq.and_then(rx_irq_init);
     port.ttys = serial_ttys()

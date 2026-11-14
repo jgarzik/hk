@@ -45,11 +45,14 @@ case "$ARCH" in
         ARCH=x86_64; DEB_ARCH=amd64; QEMU_BIN=qemu-system-x86_64
         QEMU_MACHINE=(-cpu max)
         CONSOLE=ttyS0
+        # COM2 (ttyS1) goes nowhere, as in run-qemu.sh: a non-console tty
+        SERIAL2=(-serial null)
         ;;
     aarch64)
         ARCH=aarch64; DEB_ARCH=arm64; QEMU_BIN=qemu-system-aarch64
         QEMU_MACHINE=(-machine virt,gic-version=3 -cpu max)
         CONSOLE=ttyAMA0
+        SERIAL2=()
         ;;
     *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
@@ -221,7 +224,7 @@ timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
     -m "$MEM" -smp "$SMP" -nographic -no-reboot -monitor none "${QEMU_NET[@]}" "${DISK[@]}" \
     -kernel "$LINUX_KERNEL" -initrd "$WORK/initramfs.cpio" \
     -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet $KHO_OFF ${HK_CMDLINE:-}" \
-    -serial file:"$SERIAL_LOG" </dev/null || true
+    -serial file:"$SERIAL_LOG" "${SERIAL2[@]}" </dev/null || true
 
 # Verdicts come from the log without kernel messages: a printk
 # ("[   66.926307] reboot: Power down") can land inside a line the

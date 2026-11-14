@@ -151,6 +151,19 @@ pub fn disassociate_ctty() {
     }
 }
 
+/// The tty's last close (Linux tty_release's session_clear_tty, then
+/// the tty_struct freed): no session has it and no group is in the
+/// foreground; the window size starts afresh
+pub fn session_clear_tty(tty: &Tty) {
+    let (s, pg) = {
+        let _g = CTTY_LOCK.lock();
+        let mut c = tty.ctrl.lock();
+        let old = core::mem::replace(&mut *c, super::TtyCtrl::new());
+        (old.session, old.pgrp)
+    };
+    drop((s, pg));
+}
+
 /// A background process of the session changing `tty` (`sig` SIGTTOU)
 /// or reading it (SIGTTIN) (Linux __tty_check_change): its group gets
 /// `sig` and the call restarts once it is handled (or the group, by

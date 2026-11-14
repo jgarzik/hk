@@ -37,6 +37,7 @@ pub mod termios;
 pub mod tty_dev;
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
 
@@ -49,7 +50,9 @@ use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId};
 use crate::fs::flags::O_NOCTTY;
 use crate::fs::iov_iter::{IovDest, IovSource};
-use crate::io::fasync::{FasyncList, POLL_IN, PidType, f_setown_pid, fasync_helper, kill_fasync};
+use crate::io::fasync::{
+    FasyncList, POLL_IN, POLL_OUT, PidType, f_setown_pid, fasync_helper, kill_fasync,
+};
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::task::pid::Pid;
 use crate::util::error::KernelError;
@@ -120,9 +123,20 @@ pub use termios::{Termios, Winsize};
 /// `flip::receive`.
 pub trait TtyDriver: Send + Sync {
     /// Queue bytes for the hardware (Linux tty_operations.write): the
-    /// count taken, maybe short; the driver calls `Tty::write_wakeup`
+    /// count taken, maybe short; the driver calls `tty.write_wakeup`
     /// once there is room again
-    fn write(&self, data: &[u8]) -> Result<usize, KernelError>;
+    fn write(&self, tty: &Tty, data: &[u8]) -> Result<usize, KernelError>;
+
+    /// Stop output (Linux tty_operations.stop), under `Tty.flow`
+    fn stop(&self) {}
+
+    /// Restart output (Linux tty_operations.start), under `Tty.flow`;
+    /// the caller wakes writers
+    fn start(&self) {}
+
+    /// Send a flow control character ahead of queued output, stopped
+    /// or not (Linux tty_operations.send_xchar)
+    fn send_xchar(&self, tty: &Tty, ch: u8);
 
     /// Wait until the transmitter is empty
     fn flush(&self) {}
@@ -140,18 +154,31 @@ pub trait TtyDriver: Send + Sync {
     /// Drop the queued bytes (Linux flush_buffer)
     fn flush_buffer(&self) {}
 
+    /// The tty's last close (Linux tty_port_shutdown): unless the port
+    /// is a console (port->console), output stops and its queue is
+    /// freed (uart_shutdown); either way the tty's flow control state
+    /// goes with the tty
+    fn shutdown(&self, console: bool) {
+        let _ = console;
+    }
+
     /// The console write (Linux console->write): bytes straight to the
     /// hardware, LF as CR LF, then a wait until the transmitter is
     /// empty. A UART takes its port lock (`serial_core::UartPort`)
-    fn console_write(&self, data: &[u8]) {
-        for &byte in data {
-            if byte == b'\n' {
-                let _ = self.write(b"\r");
-            }
-            let _ = self.write(&[byte]);
-        }
-        self.flush();
-    }
+    fn console_write(&self, data: &[u8]);
+}
+
+/// How long a last close waits for output to drain (Linux
+/// tty_port.closing_wait, 30 s by default: tty_port_init); 0 would be
+/// ASYNC_CLOSING_WAIT_INF. hk has no TIOCSSERIAL to change it
+const CLOSING_WAIT_MS: u64 = 30_000;
+
+/// Output flow control (Linux tty->flow)
+struct Flow {
+    /// Output is stopped
+    stopped: bool,
+    /// ... by TCOOFF, which only TCOON undoes
+    tco_stopped: bool,
 }
 
 /// Job control state (Linux tty->ctrl and winsize)
@@ -213,6 +240,17 @@ pub struct Tty {
     ctrl: Mutex<TtyCtrl>,
     /// O_ASYNC files (Linux tty->fasync)
     fasync: FasyncList,
+    /// Output flow control (Linux tty->flow, under flow.lock)
+    flow: Mutex<Flow>,
+    /// A write could not finish with O_ASYNC files listening: the next
+    /// wakeup sends them SIGIO (Linux TTY_DO_WRITE_WAKEUP)
+    do_write_wakeup: AtomicBool,
+    /// That SIGIO is due from an interrupt handler: the flip thread
+    /// sends it
+    wakeup_due: AtomicBool,
+    /// Open files (Linux tty->count, under tty_lock): held across an
+    /// open and across the last close, which drains output
+    count: crate::sync::Mutex<usize>,
 }
 
 impl Tty {
@@ -233,6 +271,13 @@ impl Tty {
             write_wait: WaitQueue::new(),
             ctrl: Mutex::new(TtyCtrl::new()),
             fasync: FasyncList::new(),
+            flow: Mutex::new(Flow {
+                stopped: false,
+                tco_stopped: false,
+            }),
+            do_write_wakeup: AtomicBool::new(false),
+            wakeup_due: AtomicBool::new(false),
+            count: crate::sync::Mutex::new(0),
         }
     }
 
@@ -259,7 +304,58 @@ impl Tty {
     /// Write directly to driver (bypassing line discipline): the count
     /// it took
     pub fn driver_write(&self, data: &[u8]) -> Result<usize, KernelError> {
-        self.driver.write(data)
+        self.driver.write(self, data)
+    }
+
+    /// Linux __stop_tty, under `flow`
+    fn stop_locked(&self, f: &mut Flow) {
+        if f.stopped {
+            return;
+        }
+        f.stopped = true;
+        self.driver.stop();
+    }
+
+    /// Linux __start_tty, under `flow`: true if writers are to be woken
+    /// (Linux tty_wakeup there; here after `flow` is released)
+    fn start_locked(&self, f: &mut Flow) -> bool {
+        if !f.stopped || f.tco_stopped {
+            return false;
+        }
+        f.stopped = false;
+        self.driver.start();
+        true
+    }
+
+    /// TCOOFF (Linux n_tty_ioctl_helper's TCXONC): output stops until
+    /// TCOON
+    pub fn tcooff(&self) {
+        let mut f = self.flow.lock();
+        if !f.tco_stopped {
+            f.tco_stopped = true;
+            self.stop_locked(&mut f);
+        }
+    }
+
+    /// TCOON: output restarts, writers are woken
+    pub fn tcoon(&self) {
+        let wake = {
+            let mut f = self.flow.lock();
+            f.tco_stopped && {
+                f.tco_stopped = false;
+                self.start_locked(&mut f)
+            }
+        };
+        if wake {
+            self.write_wakeup();
+        }
+    }
+
+    /// Send `ch` ahead of queued output (Linux tty_send_xchar through
+    /// the driver's send_xchar, under termios_rwsem: `ldata` here)
+    pub fn send_xchar(&self, ch: u8) {
+        let _ld = n_tty::ldata(self);
+        self.driver.send_xchar(self, ch);
     }
 
     /// Bytes the driver takes now (Linux tty_write_room)
@@ -268,9 +364,44 @@ impl Tty {
     }
 
     /// The driver has room again or sent everything (Linux tty_wakeup):
-    /// wake writers, pollers and tcdrain; any context, no lock held
+    /// the line discipline's write wakeup if a write asked for it, then
+    /// writers, pollers and tcdrain woken; any context, no port lock
+    /// held. Signals cannot be sent from an interrupt handler (3.7), so
+    /// there the flip thread sends the SIGIO
     pub fn write_wakeup(&self) {
+        if self.do_write_wakeup.load(Ordering::Acquire) {
+            if crate::sync::in_interrupt() {
+                self.wakeup_due.store(true, Ordering::Release);
+                flip::kick_wakeup();
+            } else {
+                self.ldisc_write_wakeup();
+            }
+        }
         self.write_wait.wake_all();
+    }
+
+    /// N_TTY's write wakeup (Linux n_tty_write_wakeup): SIGIO POLL_OUT
+    /// to the O_ASYNC files, once per write that asked
+    fn ldisc_write_wakeup(&self) {
+        self.do_write_wakeup.store(false, Ordering::Release);
+        kill_fasync(&self.fasync, crate::signal::SIGIO, POLL_OUT);
+    }
+
+    /// The flip thread: a write wakeup due from an interrupt handler
+    pub(crate) fn deferred_wakeup(&self) {
+        if self.wakeup_due.swap(false, Ordering::AcqRel)
+            && self.do_write_wakeup.load(Ordering::Acquire)
+        {
+            self.ldisc_write_wakeup();
+        }
+    }
+
+    /// A write stopped short (Linux n_tty_write's break_out): with
+    /// O_ASYNC files listening, the next wakeup signals them
+    pub(crate) fn want_write_wakeup(&self) {
+        if self.fasync.armed() {
+            self.do_write_wakeup.store(true, Ordering::Release);
+        }
     }
 
     /// Sleep until the driver takes `n` bytes (Linux n_tty_write's
@@ -381,12 +512,70 @@ impl Tty {
     }
 
     /// Wait for output to be sent (Linux tty_wait_until_sent): the
-    /// queue empty, then the transmitter; a signal ends the wait
-    pub fn wait_until_sent(&self) {
-        let _ = self
+    /// queue empty, then the transmitter; a signal or `timeout` ticks
+    /// (0: none) end the wait
+    pub fn wait_until_sent(&self, timeout: u64) {
+        let t = if timeout == 0 {
+            crate::task::percpu::MAX_SCHEDULE_TIMEOUT
+        } else {
+            timeout
+        };
+        let left = self
             .write_wait
-            .wait_event_interruptible(|| self.driver.chars_in_buffer() == 0);
-        self.driver.flush();
+            .wait_event_interruptible_timeout(|| self.driver.chars_in_buffer() == 0, t);
+        if matches!(left, Ok(n) if n > 0) {
+            self.driver.flush();
+        }
+    }
+
+    /// A file opened the tty (Linux tty_open's tty_reopen: tty->count,
+    /// under tty_lock); then it may become the controlling tty
+    fn opened(&self, file: &File, ctty: bool) {
+        let mut n = self.count.lock();
+        *n += 1;
+        if ctty && file.get_flags() & O_NOCTTY == 0 {
+            jobctrl::open_set_tty(self, file);
+        }
+    }
+
+    /// A file of the tty is released (Linux tty_release). The last one
+    /// closes the port (uart_close -> tty_port_close) and the tty
+    /// starts afresh, as Linux frees the tty_struct: flow control, the
+    /// write wakeup, input and the controlling session go; termios
+    /// stays (the driver's saved termios)
+    fn release(&self) {
+        let mut n = self.count.lock();
+        if *n > 1 {
+            *n -= 1;
+            return;
+        }
+        self.close_port();
+        *n = 0;
+        jobctrl::session_clear_tty(self);
+        *self.flow.lock() = Flow {
+            stopped: false,
+            tco_stopped: false,
+        };
+        self.do_write_wakeup.store(false, Ordering::Release);
+        self.wakeup_due.store(false, Ordering::Release);
+    }
+
+    /// The last close (Linux tty_port_close_start, tty_port_shutdown):
+    /// output stopped by TCOOFF is dropped, the rest drains for up to
+    /// closing_wait, input is dropped, then the port shuts down unless
+    /// it is a console
+    fn close_port(&self) {
+        let tco = self.flow.lock().tco_stopped;
+        if tco {
+            self.flush_output();
+        }
+        self.wait_until_sent(crate::task::percpu::ms_to_ticks(CLOSING_WAIT_MS));
+        self.flush_input();
+        let console = crate::console::console_ttys()
+            .iter()
+            .flatten()
+            .any(|t| core::ptr::eq(*t, self));
+        self.driver.shutdown(console);
     }
 
     /// Bytes queued for the hardware (Linux tty_chars_in_buffer)
@@ -520,6 +709,22 @@ impl Redirect {
             .map(|r| r.0)
             .ok_or(KernelError::Io)
     }
+
+    /// Open `tty` through `file`: point the file at it and count it
+    /// (Linux tty->count); `ctty`: it may become the controlling tty.
+    /// The release of a file whose open failed finds no tty to drop
+    fn open(file: &File, tty: &'static Tty, ctty: bool) -> Result<(), KernelError> {
+        Self::set(file, tty)?;
+        tty.opened(file, ctty);
+        Ok(())
+    }
+
+    /// The release of a file opened by `open` (Linux tty_release)
+    fn release(file: &File) {
+        if let Ok(t) = Self::tty(file) {
+            t.release();
+        }
+    }
 }
 
 /// A static tty as a registered character device
@@ -535,7 +740,11 @@ impl CharDevice for TtyChar {
     }
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
-        CharDevice::open(self.0, file)
+        Redirect::open(file, self.0, true)
+    }
+
+    fn release(&self, file: &File) {
+        Redirect::release(file);
     }
 
     fn read(&self, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
