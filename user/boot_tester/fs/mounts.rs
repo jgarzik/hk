@@ -50,6 +50,7 @@ pub fn run_tests() {
     report_r(b"RAMFS_MOUNT_MODE", ramfs_mode());
     report_r(b"UMOUNT_BUSY_CWD", busy_cwd());
     report_r(b"UMOUNT_EXPIRE_BUSY", expire_busy());
+    report_r(b"UMOUNT_EXPIRE_SUBMOUNT", expire_submount());
     report_r(b"MOUNT_HARDLINK", hardlink());
 }
 
@@ -818,6 +819,39 @@ fn expire_busy() -> R {
         check(b"expire", r == 0, r)
     })();
     sys_umount2(d.as_ptr(), 0);
+    sys_rmdir(d.as_ptr());
+    r
+}
+
+/// MNT_EXPIRE on a mount with a submount is EBUSY, never a mark
+/// (Linux do_umount: !list_empty(mnt_mounts)); with the submount gone
+/// it marks (EAGAIN), then unmounts; with MNT_DETACH it is EINVAL
+fn expire_submount() -> R {
+    let d = b"/tmp/exs\0";
+    let sub = b"/tmp/exs/sub\0";
+    sys_mkdir(d.as_ptr(), 0o755);
+    if ramfs(d) != 0 {
+        sys_rmdir(d.as_ptr());
+        return Err((b"mount", -1));
+    }
+    let r = (|| {
+        sys_mkdir(sub.as_ptr(), 0o755);
+        check(b"mount sub", ramfs(sub) == 0, -1)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE | MNT_DETACH);
+        check(b"expire+detach", r == EINVAL, r)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"submount busy", r == EBUSY, r)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"still busy", r == EBUSY, r)?;
+        let r = sys_umount2(sub.as_ptr(), 0);
+        check(b"umount sub", r == 0, r)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"mark", r == EAGAIN, r)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"expire", r == 0, r)
+    })();
+    sys_umount2(sub.as_ptr(), MNT_DETACH);
+    sys_umount2(d.as_ptr(), MNT_DETACH);
     sys_rmdir(d.as_ptr());
     r
 }

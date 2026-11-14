@@ -42,7 +42,8 @@
 //!
 //! Locking: a put's exact path and a `try_get` outside a namespace take
 //! MOUNT_LOCK (write, locking read): no put of a mount outside a
-//! namespace under it.
+//! namespace under it, but [`MountRef::put_held`] (never the last:
+//! umount_tree drops the extra references it holds under MOUNT_LOCK).
 //! `DELAYED_MNTPUT` is an IrqSpinlock leaf. The teardown takes
 //! NAMESPACE_SEM and MOUNT_LOCK (submounts) and `s_mounts`, with nothing
 //! else held.
@@ -200,6 +201,17 @@ impl MountRef {
         debug_assert!(m.is_live(), "mount: doomed entry on a list");
         m.pcp_add(1);
         Self(NonNull::from(m))
+    }
+
+    /// Put a reference that is not the last (Linux mnt_add_count(mnt,
+    /// -1)): another one the caller holds, or the tree's while the
+    /// caller holds NAMESPACE_SEM write and MOUNT_LOCK, outlives it. A
+    /// take from this CPU's part, lock-free, so safe under MOUNT_LOCK
+    /// (an umount drops a list's reference to a mount its set holds).
+    /// A put that is the last instead leaks the mount, never frees it.
+    pub(super) fn put_held(self) {
+        let me = ManuallyDrop::new(self);
+        me.mount().pcp_add(-1);
     }
 
     /// The reference, as the `Arc` an intrusive list keeps (an entry of

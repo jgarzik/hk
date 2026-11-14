@@ -23,8 +23,8 @@ use core::ptr::null;
 
 use super::dentry::{Dentry, DentryRef};
 use super::mount::{
-    MNT_LOCKED, MNT_UMOUNT, MOUNT_LOCK, Mount, MountRef, MpPtr, NsTree, UmountList, copy_plan,
-    copy_tree, for_each_mut, is_path_reachable,
+    MNT_LOCKED, MNT_UMOUNT, MOUNT_LOCK, MntHash, Mount, MountRef, MpPtr, NsTree, UmountList,
+    copy_plan, copy_tree, for_each_mut, is_path_reachable,
 };
 use super::path_ref::Path;
 use crate::util::ida::Ida;
@@ -658,10 +658,12 @@ fn entry(ns: &NsTree, m: *const Mount) -> Arc<Mount> {
     get(ns, m).into_entry()
 }
 
-/// Put the reference an umount list entry held
+/// Put the reference a candidate list entry held, under MOUNT_LOCK
+/// write: never the last, the mount staying in the tree, whose
+/// reference the locks held keep (Linux holds none on candidates)
 fn put_entry(e: Arc<Mount>) {
     // SAFETY: umount list entries are references (`entry`, `into_entry`)
-    drop(unsafe { MountRef::from_entry(e) });
+    unsafe { MountRef::from_entry(e) }.put_held();
 }
 
 /// Linux skip_propagation_subtree: past everything that gets
@@ -749,9 +751,9 @@ fn chain_busy(ns: &NsTree, c: *const Mount, victim: *const Mount) -> bool {
 /// An umount of `m` would fail EBUSY (Linux propagate_mount_busy): it
 /// has submounts or more than `refs` references, or a mount the
 /// propagation takes along has more than its tree's; under
-/// NAMESPACE_SEM and MOUNT_LOCK, approximate as Linux's while fast
-/// paths run
-pub(super) fn propagate_mount_busy(ns: &NsTree, m: &Mount, refs: isize) -> bool {
+/// NAMESPACE_SEM and MOUNT_LOCK write, approximate as Linux's while
+/// fast paths run
+pub(super) fn propagate_mount_busy(ns: &NsTree, _ml: &mut MntHash, m: &Mount, refs: isize) -> bool {
     if m.has_children(ns) || m.mnt_get_count() > refs {
         return true;
     }
@@ -780,8 +782,8 @@ pub(super) fn propagate_mount_busy(ns: &NsTree, m: &Mount, refs: isize) -> bool 
 }
 
 /// Clear MNT_LOCKED on the copies an umount of `m` takes along (Linux
-/// propagate_mount_unlock)
-pub(super) fn propagate_mount_unlock(ns: &NsTree, m: &Mount) {
+/// propagate_mount_unlock), under MOUNT_LOCK write
+pub(super) fn propagate_mount_unlock(ns: &NsTree, ml: &mut MntHash, m: &Mount) {
     let parent = parent_of(ns, core::ptr::from_ref(m));
     if parent.is_null() {
         return;
@@ -791,7 +793,7 @@ pub(super) fn propagate_mount_unlock(ns: &NsTree, m: &Mount) {
     while let Some(qm) = q {
         let c = lookup_at(ns, qm, d);
         if !c.is_null() {
-            mnt(ns, c).mark(MNT_LOCKED, false);
+            mnt(ns, c).mark_in(ml, MNT_LOCKED, false);
         }
         q = propagation_next(ns, qm, parent);
     }
@@ -799,10 +801,9 @@ pub(super) fn propagate_mount_unlock(ns: &NsTree, m: &Mount) {
 
 /// Take `e`'s mount out of its parent's list, committed to going
 /// (Linux umount_one), onto `to_umount` with the reference `e` holds
-fn umount_one(ns: &mut NsTree, e: Arc<Mount>, to_umount: &mut UmountList) {
-    let tree = super::mount::hide_mnt(ns, &e);
+fn umount_one(ns: &mut NsTree, ml: &mut MntHash, e: Arc<Mount>, to_umount: &mut UmountList) {
+    super::mount::hide_mnt(ns, ml, &e);
     to_umount.push_back(e);
-    drop(tree);
 }
 
 /// Linux remove_from_candidate_list: unmarked, off `candidates`, its
@@ -881,6 +882,7 @@ fn trim_ancestors(ns: &mut NsTree, m: *const Mount) {
 /// `candidates`
 fn trim_one(
     ns: &mut NsTree,
+    ml: &mut MntHash,
     m: *const Mount,
     candidates: &mut UmountList,
     to_umount: &mut UmountList,
@@ -913,7 +915,7 @@ fn trim_one(
     }
     if remove_this && let Some(e) = remove_from_candidate_list(ns, m, candidates) {
         if umount_this {
-            umount_one(ns, e, to_umount);
+            umount_one(ns, ml, e, to_umount);
         } else {
             put_entry(e);
         }
@@ -924,6 +926,7 @@ fn trim_one(
 /// that would reveal what it hides (Linux handle_locked)
 fn handle_locked(
     ns: &mut NsTree,
+    ml: &mut MntHash,
     m: *const Mount,
     candidates: &mut UmountList,
     to_umount: &mut UmountList,
@@ -955,7 +958,7 @@ fn handle_locked(
         let e = chain
             .remove(mnt(ns, m))
             .expect("pnode: a candidate below the cutoff off its chain");
-        umount_one(ns, e, to_umount);
+        umount_one(ns, ml, e, to_umount);
         m = parent_of(ns, m);
     }
     while let Some(e) = chain.pop_front() {
@@ -966,8 +969,8 @@ fn handle_locked(
 /// `m` stays, over the top of a stack of mounts that go, each fully
 /// covered by the one above: it slides to where the bottom of the stack
 /// hangs (Linux reparent); for the moment two mounts share that place,
-/// until umount_tree takes the stack off
-fn reparent(ns: &mut NsTree, m: *const Mount) {
+/// until umount_tree takes the stack off. Under MOUNT_LOCK write.
+fn reparent(ns: &mut NsTree, ml: &mut MntHash, m: *const Mount) {
     let mut p = m;
     let mp = loop {
         let mp = mnt(ns, p)
@@ -978,8 +981,11 @@ fn reparent(ns: &mut NsTree, m: *const Mount) {
             break mp;
         }
     };
+    // Both stay in the tree, which holds them
     let (to, m) = (get(ns, p), get(ns, m));
-    super::mount::change_mountpoint(ns, &to, mp, &m);
+    super::mount::change_mountpoint(ns, ml, &to, mp, &m);
+    to.put_held();
+    m.put_held();
 }
 
 /// Add to `set` (mounts an umount takes, each off its parent's list
@@ -988,8 +994,8 @@ fn reparent(ns: &mut NsTree, m: *const Mount) {
 /// Linux Documentation/filesystems/propagate_umount.txt): the
 /// candidates are gathered, reduced until nothing shifts and nothing
 /// locked is revealed, and a mount that stays on the root of one that
-/// goes slides down. Under NAMESPACE_SEM write.
-pub(super) fn propagate_umount(ns: &mut NsTree, set: &mut UmountList) {
+/// goes slides down. Under NAMESPACE_SEM write and MOUNT_LOCK write.
+pub(super) fn propagate_umount(ns: &mut NsTree, ml: &mut MntHash, set: &mut UmountList) {
     let mut to_umount = UmountList::new();
     let mut candidates = UmountList::new();
     gather_candidates(ns, set, &mut candidates);
@@ -997,19 +1003,19 @@ pub(super) fn propagate_umount(ns: &mut NsTree, set: &mut UmountList) {
     let mut cur = candidates.first().map(core::ptr::from_ref);
     while let Some(c) = cur {
         let next = candidates.next_ref(mnt(ns, c)).map(core::ptr::from_ref);
-        trim_one(ns, c, &mut candidates, &mut to_umount);
+        trim_one(ns, ml, c, &mut candidates, &mut to_umount);
         cur = next;
     }
     // ... and non-revealing
     while let Some(m) = candidates.first().map(core::ptr::from_ref) {
-        handle_locked(ns, m, &mut candidates, &mut to_umount);
+        handle_locked(ns, ml, m, &mut candidates, &mut to_umount);
     }
     // A surviving overmount of one that goes slides down
     let mut cur = to_umount.first().map(core::ptr::from_ref);
     while let Some(m) = cur {
         let over = mnt(ns, m).overmount_in(ns);
         if !over.is_null() && !will_be_unmounted(ns, over) {
-            reparent(ns, over);
+            reparent(ns, ml, over);
         }
         cur = to_umount.next_ref(mnt(ns, m)).map(core::ptr::from_ref);
     }

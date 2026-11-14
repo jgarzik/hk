@@ -108,27 +108,98 @@ pub type MountMap = Vec<(MountRef, MountRef)>;
 
 /// What NAMESPACE_SEM owns: the mount tree's links (each mount's
 /// `mnt_mounts`), changed with MOUNT_LOCK also held; `&NsTree`
-/// (either side held) holds them still
-pub struct NsTree(());
+/// (either side held) holds them still. Also what an umount leaves
+/// for [`namespace_unlock`] (Linux `unmounted`, `ex_mountpoints`,
+/// "protected by namespace_sem"): filled under MOUNT_LOCK write,
+/// where nothing that may sleep is put or dropped.
+pub struct NsTree {
+    /// The unmounted mounts, each entry a reference, put a grace
+    /// period after the unlock (Linux unmounted); made on first use
+    unmounted: Option<UmountList>,
+    /// Mountpoints whose last mount left, dropped (their dentries put)
+    /// after the unlock (Linux ex_mountpoints)
+    ex_mountpoints: BoxList<MpHashA>,
+}
 
 // SAFETY: one value, built here for NAMESPACE_SEM alone (private
-// field) and reachable only through its guards
+// fields) and reachable only through its guards
 unsafe impl UniqueOwner for NsTree {}
+
+impl NsTree {
+    /// Put `m`'s reference a grace period after [`namespace_unlock`]
+    /// (Linux hlist_add_head on unmounted)
+    fn add_unmounted(&mut self, m: Arc<Mount>) {
+        self.unmounted
+            .get_or_insert_with(UmountList::new)
+            .push_back(m);
+    }
+
+    /// A mount left `mp` (Linux maybe_free_mountpoint onto
+    /// ex_mountpoints), under MOUNT_LOCK write: a last one's
+    /// mountpoint and dentry go in [`namespace_unlock`]
+    fn maybe_free_mountpoint(&mut self, ml: &mut MntHash, mp: MpPtr) {
+        if let Some(b) = put_mp(ml, mp) {
+            self.ex_mountpoints.push_back(b);
+        }
+    }
+}
 
 /// Mount topology changes: attach, umount, namespace copy, pivot_root;
 /// /proc mount lists and is_local_mountpoint read under it (Linux
 /// namespace_sem, a sleeping rw_semaphore). Outside it: the
 /// mountpoint's i_rwsem; inside it: s_umount, then MOUNT_LOCK.
-static NAMESPACE_SEM: RwSem<NsTree> = RwSem::new(NsTree(()));
+static NAMESPACE_SEM: RwSem<NsTree> = RwSem::new(NsTree {
+    unmounted: None,
+    ex_mountpoints: BoxList::new(),
+});
 
 /// NAMESPACE_SEM held shared
 pub type NsRead = RwSemReadGuard<'static, NsTree>;
-/// NAMESPACE_SEM held exclusive
-pub type NsWrite = RwSemWriteGuard<'static, NsTree>;
+
+/// NAMESPACE_SEM held exclusive (Linux namespace_lock): its drop is
+/// [`namespace_unlock`]
+pub struct NsWrite(core::mem::ManuallyDrop<RwSemWriteGuard<'static, NsTree>>);
+
+impl core::ops::Deref for NsWrite {
+    type Target = NsTree;
+    fn deref(&self) -> &NsTree {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for NsWrite {
+    fn deref_mut(&mut self) -> &mut NsTree {
+        &mut self.0
+    }
+}
+
+impl Drop for NsWrite {
+    fn drop(&mut self) {
+        namespace_unlock(self);
+    }
+}
 
 /// Take NAMESPACE_SEM for a topology change (Linux namespace_lock)
 pub fn namespace_lock() -> NsWrite {
-    NAMESPACE_SEM.write()
+    NsWrite(core::mem::ManuallyDrop::new(NAMESPACE_SEM.write()))
+}
+
+/// Release NAMESPACE_SEM (Linux namespace_unlock): what umounts left
+/// is taken off first, then the semaphore released; the mountpoints
+/// go, then, a grace period later (no fast put that saw a mount in
+/// its namespace still runs), the unmounted mounts' references, a
+/// last one's teardown queued for this task
+fn namespace_unlock(ns: &mut NsWrite) {
+    let head = ns.unmounted.take();
+    let list = core::mem::take(&mut ns.ex_mountpoints);
+    // SAFETY: from NsWrite's drop, once; the guard is not used after
+    unsafe { core::mem::ManuallyDrop::drop(&mut ns.0) };
+    drop(list);
+    let Some(head) = head.filter(|h| !h.is_empty()) else {
+        return;
+    };
+    crate::sync::rcu::synchronize();
+    put_umounted(head);
 }
 
 /// Take NAMESPACE_SEM to read the mount tree (Linux
@@ -160,7 +231,8 @@ crate::owned_adapter!(pub MntChild, Mount, mnt_child, mnt_child_owner);
 crate::owned_adapter!(pub MntListA, Mount, mnt_list, mnt_list_owner);
 
 /// An umount's list of mounts (Linux lists through mnt_list), each
-/// entry a reference: private to the task unmounting them
+/// entry a reference: under NAMESPACE_SEM write, the unmounted
+/// until namespace_unlock puts them
 pub type UmountList = OwnedList<MntListA>;
 
 /// Mount ids: the lowest free one, from 0 (Linux mnt_id_ida, now an
@@ -215,7 +287,7 @@ pub struct Mount {
     mnt_child: Link,
     mnt_child_owner: Owner,
     /// On an umount's list (Linux mnt_list: its set, candidates, or the
-    /// unmounted), private to the task unmounting it
+    /// unmounted), under NAMESPACE_SEM write
     mnt_list: Link,
     mnt_list_owner: Owner,
 
@@ -479,7 +551,11 @@ impl Mount {
     /// Set (`on`) or clear MNT_* bits that need no other checks, under
     /// MOUNT_LOCK as every mnt_flags write
     pub fn mark(&self, bits: u32, on: bool) {
-        let _ml = MOUNT_LOCK.write();
+        self.mark_in(&mut MOUNT_LOCK.write(), bits, on);
+    }
+
+    /// [`Mount::mark`] for a holder of MOUNT_LOCK write
+    pub(super) fn mark_in(&self, _ml: &mut MntHash, bits: u32, on: bool) {
         if on {
             self.mnt_flags.fetch_or(bits, Ordering::SeqCst);
         } else {
@@ -1515,8 +1591,8 @@ const UMOUNT_PROPAGATE: u32 = 2;
 /// the namespace at once, busy or not: open files keep working, the
 /// filesystem goes with its last user. Otherwise a mount with
 /// submounts or users is EBUSY, MNT_FORCE too. MNT_EXPIRE (not with
-/// MNT_FORCE or MNT_DETACH, not the root) only marks an unmarked mount
-/// (EAGAIN).
+/// MNT_FORCE or MNT_DETACH, not the root) is EBUSY for a mount with
+/// submounts or users, else only marks an unmarked mount (EAGAIN).
 pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
     use umount_flags::{MNT_DETACH, MNT_EXPIRE, MNT_FORCE};
     // Linux can_umount, optimistic; repeated under NAMESPACE_SEM
@@ -1530,11 +1606,12 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         if is_root || flags & (MNT_FORCE | MNT_DETACH) != 0 {
             return Err(KernelError::InvalidArgument);
         }
-        // Busy first (Linux: mnt_get_count != 2 under lock_mount_hash),
-        // then the mark
+        // Busy first: a submount, or references beyond the caller's and
+        // the parent's (Linux: under lock_mount_hash, before
+        // namespace_lock), then the mark
         let busy = {
-            let _ml = MOUNT_LOCK.read_excl();
-            mount.mnt_get_count() != UMOUNT_REFS
+            let ml = MOUNT_LOCK.write();
+            mount.has_children(&*ml) || mount.mnt_get_count() != UMOUNT_REFS
         };
         if busy {
             return Err(KernelError::Busy);
@@ -1547,29 +1624,25 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         let _s = mount.sb.s_umount.write();
         return mount.sb.make_rdonly();
     }
-    let mut ns = namespace_lock();
-    // Linux: repeated now that the locks are held
-    if !check_mnt(&mount) || mount.flags() & MNT_LOCKED != 0 || !mount.has_parent(&*ns) {
-        return Err(KernelError::InvalidArgument);
-    }
-    let gone = if detach {
-        umount_tree(&mut ns, &mount, UMOUNT_PROPAGATE)
-    } else {
-        let busy = {
-            let _ml = MOUNT_LOCK.read_excl();
-            super::pnode::propagate_mount_busy(&ns, &mount, UMOUNT_REFS)
-        };
-        if busy {
-            return Err(KernelError::Busy);
+    {
+        let mut ns = namespace_lock();
+        let mut ml = MOUNT_LOCK.write();
+        // Linux: repeated now that the locks are held
+        if !check_mnt(&mount) || mount.flags() & MNT_LOCKED != 0 || !mount.has_parent(&*ns) {
+            return Err(KernelError::InvalidArgument);
         }
-        umount_tree(&mut ns, &mount, UMOUNT_PROPAGATE | UMOUNT_SYNC)
-    };
-    // The references put after a grace period by this task (Linux
-    // namespace_unlock: synchronize_rcu, then mntput), so a last one's
-    // teardown runs before the syscall returns
-    drop(ns);
-    crate::sync::rcu::synchronize();
-    put_umounted(gone);
+        if detach {
+            umount_tree(&mut ns, &mut ml, &mount, UMOUNT_PROPAGATE);
+        } else {
+            if super::pnode::propagate_mount_busy(&ns, &mut ml, &mount, UMOUNT_REFS) {
+                return Err(KernelError::Busy);
+            }
+            umount_tree(&mut ns, &mut ml, &mount, UMOUNT_PROPAGATE | UMOUNT_SYNC);
+        }
+        // MOUNT_LOCK, then NAMESPACE_SEM (namespace_unlock: the
+        // references put a grace period later by this task, so a last
+        // one's teardown runs before the syscall returns)
+    }
 
     // Write the filesystem back, outside namespace_sem: writeback takes
     // inode locks, which nest outside it (Linux: deactivate_super ->
@@ -1580,60 +1653,67 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
 
 /// A mount namespace's last reference went (Linux put_mnt_ns): its whole
 /// tree is unmounted at once (Linux umount_tree of the root, no
-/// propagation); after a grace period (Linux namespace_unlock) the
-/// tree's references, the root's included, are put by the caller,
-/// which may sleep. A mount still used elsewhere (an open file, another
-/// task's cwd) lives on, detached.
+/// propagation) under NAMESPACE_SEM write and MOUNT_LOCK write; a grace
+/// period after the unlock (Linux namespace_unlock) the tree's
+/// references are put, then the caller's to the root, which may sleep.
+/// A mount still used elsewhere (an open file, another task's cwd)
+/// lives on, detached.
 pub fn put_mnt_ns(root: MountRef) {
-    let gone = umount_tree(&mut namespace_lock(), &root, 0);
-    crate::sync::rcu::synchronize();
-    put_umounted(gone);
+    {
+        let mut ns = namespace_lock();
+        umount_tree(&mut ns, &mut MOUNT_LOCK.write(), &root, 0);
+    }
     drop(root);
 }
 
-/// Unmount the tree at `mnt` (Linux umount_tree): each of its mounts,
-/// and with UMOUNT_PROPAGATE what propagation takes along, is marked
-/// MNT_UMOUNT and taken off its parent's list, then all leave
+/// Unmount the tree at `mnt` (Linux umount_tree), under NAMESPACE_SEM
+/// write and MOUNT_LOCK write throughout: each of its mounts is marked
+/// MNT_UMOUNT and taken off its parent's list, and with
+/// UMOUNT_PROPAGATE what propagation takes along joins them; all leave
 /// propagation together (bulk_make_private), then each leaves its
-/// namespace and comes off its parent and mountpoint. The list returned
-/// holds a reference to each, which the caller puts a grace period
-/// after releasing NAMESPACE_SEM (Linux namespace_unlock): none may be
-/// put by the exact path before. Under NAMESPACE_SEM write.
-fn umount_tree(ns: &mut NsTree, mnt: &Mount, how: u32) -> UmountList {
+/// namespace and comes off its parent and mountpoint. Nothing is put or
+/// freed that may sleep: each mount's reference goes on the unmounted
+/// list, a last mountpoint on ex_mountpoints, both released by
+/// [`namespace_unlock`], the references a grace period later (none may
+/// be put by the exact path before).
+fn umount_tree(ns: &mut NsTree, ml: &mut MntHash, mnt: &Mount, how: u32) {
     if how & UMOUNT_PROPAGATE != 0 {
-        super::pnode::propagate_mount_unlock(ns, mnt);
+        super::pnode::propagate_mount_unlock(ns, ml, mnt);
     }
     // Gather the mounts to umount
     let mut set = UmountList::new();
     for_each_mnt(mnt, &*ns, |p| {
+        // A mount is unmounted once
+        debug_assert_eq!(p.flags() & MNT_UMOUNT, 0, "mount: unmounted twice");
+        p.mnt_flags.fetch_or(MNT_UMOUNT, Ordering::SeqCst);
         set.push_back(MountRef::entry_ref(p).into_entry());
     });
-    // Marked, and hidden from their parents' lists: the lists' references
-    // go after the unlock, the set's keep each mount
-    let mut hidden = OwnedList::<MntChild>::new();
-    {
-        let mut ml = MOUNT_LOCK.write();
-        for p in set.iter() {
-            debug_assert_eq!(p.flags() & MNT_UMOUNT, 0, "mount: unmounted twice");
-            p.mnt_flags.fetch_or(MNT_UMOUNT, Ordering::SeqCst);
-            if let Some(e) = unlist(ns, &mut ml, p) {
-                hidden.push_back(e);
-            }
+    // Hide them from their parents' lists; the set's references keep
+    // them
+    for p in set.iter() {
+        if let Some(e) = unlist(ns, ml, p) {
+            // SAFETY: entries of mnt_mounts are references (`attach_mnt`)
+            unsafe { MountRef::from_entry(e) }.put_held();
         }
     }
-    put_entries(hidden);
+    // Add propagated mounts to the set
     if how & UMOUNT_PROPAGATE != 0 {
-        super::pnode::propagate_umount(ns, &mut set);
+        super::pnode::propagate_umount(ns, ml, &mut set);
     }
     super::pnode::bulk_make_private(ns, &set);
-    let mut out = UmountList::new();
     while let Some(p) = set.pop_front() {
         p.set_ns(0);
-        let gone = umount_mnt(&p, how);
-        out.push_back(p);
-        drop(gone);
+        if how & UMOUNT_SYNC != 0 {
+            p.mnt_flags.fetch_or(MNT_SYNC_UMOUNT, Ordering::SeqCst);
+        }
+        if p.has_parent(&*ml) {
+            if needs_cover(ml, &p, how) {
+                leave_cover(ml, &p);
+            }
+            umount_mnt(ns, ml, &p);
+        }
+        ns.add_unmounted(p);
     }
-    out
 }
 
 /// Take `m` off its parent's list (Linux list_del_init of mnt_child),
@@ -1646,42 +1726,47 @@ fn unlist(ns: &mut NsTree, ml: &mut MntHash, m: &Mount) -> Option<Arc<Mount>> {
 }
 
 /// `m` committed to unmounting (Linux umount_one's MNT_UMOUNT and
-/// list_del_init of mnt_child), under NAMESPACE_SEM write: its parent
-/// list's reference, for the caller to put
-pub(super) fn hide_mnt(ns: &mut NsTree, m: &Mount) -> Option<MountRef> {
-    let e = {
-        let mut ml = MOUNT_LOCK.write();
-        m.mnt_flags.fetch_or(MNT_UMOUNT, Ordering::SeqCst);
-        unlist(ns, &mut ml, m)
-    };
-    // SAFETY: entries of mnt_mounts are references (`attach_mnt`)
-    e.map(|e| unsafe { MountRef::from_entry(e) })
+/// list_del_init of mnt_child), under NAMESPACE_SEM write and
+/// MOUNT_LOCK write; the caller holds a reference past the list's
+pub(super) fn hide_mnt(ns: &mut NsTree, ml: &mut MntHash, m: &Mount) {
+    m.mnt_flags.fetch_or(MNT_UMOUNT, Ordering::SeqCst);
+    if let Some(e) = unlist(ns, ml, m) {
+        // SAFETY: entries of mnt_mounts are references (`attach_mnt`)
+        unsafe { MountRef::from_entry(e) }.put_held();
+    }
 }
 
-/// [`mnt_change_mountpoint`] in a MOUNT_LOCK write section of its own,
-/// under NAMESPACE_SEM write
-pub(super) fn change_mountpoint(ns: &mut NsTree, to: &MountRef, mp: MpPtr, m: &Mount) {
-    let gone = mnt_change_mountpoint(ns, &mut MOUNT_LOCK.write(), to, mp, m);
-    drop(gone);
+/// Move `m` onto `to` at `mp` (Linux mnt_change_mountpoint, for
+/// propagate_umount's reparent), under NAMESPACE_SEM write and
+/// MOUNT_LOCK write: a last old mountpoint goes on ex_mountpoints
+pub(super) fn change_mountpoint(
+    ns: &mut NsTree,
+    ml: &mut MntHash,
+    to: &MountRef,
+    mp: MpPtr,
+    m: &Mount,
+) {
+    let (w, old) = mnt_change_mountpoint(ns, ml, to, mp, m);
+    // The old parent link's `Weak`: at most a free (Linux kfree under
+    // mount_lock), never a teardown
+    drop(w);
+    if let Some(b) = old {
+        ns.ex_mountpoints.push_back(b);
+    }
 }
 
 /// `m` off its parent and mountpoint, out of the mount hash (Linux
-/// umount_tree's last loop and __umount_mnt; already off the parent's
-/// list), marked MNT_SYNC_UMOUNT for a synchronous umount, its cover
-/// left if it needs one, under NAMESPACE_SEM write: what the links
-/// held, to drop after MOUNT_LOCK
-fn umount_mnt(m: &Mount, how: u32) -> (Option<Weak<Mount>>, Option<Box<Mountpoint>>) {
-    let mut ml = MOUNT_LOCK.write();
-    if how & UMOUNT_SYNC != 0 {
-        m.mnt_flags.fetch_or(MNT_SYNC_UMOUNT, Ordering::SeqCst);
+/// umount_mnt; already off the parent's list), under NAMESPACE_SEM
+/// write and MOUNT_LOCK write: a last mountpoint goes on
+/// ex_mountpoints
+fn umount_mnt(ns: &mut NsTree, ml: &mut MntHash, m: &Mount) {
+    unhash_mnt(ml, m);
+    // The parent link's `Weak`: at most a free (Linux kfree under
+    // mount_lock), never a teardown
+    drop(m.take_parent(ml));
+    if let Some(mp) = m.take_mountpoint(ml) {
+        ns.maybe_free_mountpoint(ml, mp);
     }
-    if needs_cover(&ml, m, how) {
-        leave_cover(&mut ml, m);
-    }
-    unhash_mnt(&mut ml, m);
-    let w = m.take_parent(&mut ml);
-    let gone = m.take_mountpoint(&ml).and_then(|mp| put_mp(&mut ml, mp));
-    (w, gone)
 }
 
 /// `m`, unmounted with its parent, must leave the mountpoint covered
@@ -1720,14 +1805,6 @@ fn leave_cover(ml: &mut MntHash, m: &Mount) {
 fn put_umounted(mut l: UmountList) {
     while let Some(e) = l.pop_front() {
         // SAFETY: umount list entries are references (`into_entry`)
-        drop(unsafe { MountRef::from_entry(e) });
-    }
-}
-
-/// Put the references of parent list entries taken off (`unlist`)
-fn put_entries(mut l: OwnedList<MntChild>) {
-    while let Some(e) = l.pop_front() {
-        // SAFETY: entries of mnt_mounts are references (`attach_mnt`)
         drop(unsafe { MountRef::from_entry(e) });
     }
 }
@@ -2255,22 +2332,25 @@ impl Mount {
     }
 
     /// Release the covers its submounts left (Linux mntput_no_expire's
-    /// drop_cover): each off the list, freed a grace period later, its
-    /// mountpoint put, one MOUNT_LOCK write section each, the
-    /// mountpoint dropped after it
+    /// drop_cover): all in one MOUNT_LOCK write section, each off the
+    /// list, freed a grace period later, its mountpoint put; a last
+    /// mountpoint is dropped after the unlock (Linux shrink_dentry_list)
     fn drop_covers(&self) {
-        while !self.mnt_covers.is_empty() {
-            let gone = {
-                let mut ml = MOUNT_LOCK.write();
-                let Some(c) = self.mnt_covers.remove_first(|_| true, &mut ml) else {
-                    break;
-                };
+        if self.mnt_covers.is_empty() {
+            return;
+        }
+        let mut list = BoxList::<MpHashA>::new();
+        {
+            let mut ml = MOUNT_LOCK.write();
+            while let Some(c) = self.mnt_covers.remove_first(|_| true, &mut ml) {
                 let mp = NonNull::new(c.item().mp.load(Ordering::Relaxed)).map(MpPtr);
                 c.defer();
-                mp.and_then(|mp| put_mp(&mut ml, mp))
-            };
-            drop(gone);
+                if let Some(b) = mp.and_then(|mp| put_mp(&mut ml, mp)) {
+                    list.push_back(b);
+                }
+            }
         }
+        drop(list);
     }
 
     /// Unhang every submount (Linux umount_mnt for each) in one
@@ -2502,6 +2582,42 @@ mod tests {
         assert!(m.set_flags(MNT_READONLY).is_ok());
         assert_eq!(m.flags(), MNT_READONLY);
         assert!(matches!(m.want_write(), Err(KernelError::ReadOnlyFs)));
+    }
+
+    /// umount_tree runs whole in its caller's MOUNT_LOCK write section
+    /// (Linux umount_tree under lock_mount_hash), propagation included:
+    /// a peer's copy at the same place goes along, a mount over that
+    /// copy slides down to its place (reparent), and both unmounted
+    /// mounts wait on the unmounted list for namespace_unlock
+    #[test]
+    fn umount_tree_propagates_under_mount_lock() {
+        use super::super::pnode::{
+            Prop, change_mnt_propagation, clone_links, invent_group_ids, is_shared,
+        };
+        let mut ns = namespace_lock();
+        let a = mnt();
+        let b = Mount::alloc(a.sb.clone(), a.root.clone(), 0, b"b".as_slice().into()).unwrap();
+        invent_group_ids(&mut ns, &a, false).unwrap();
+        clone_links(&mut ns, &a, &b, 0);
+        assert!(is_shared(&ns, &b));
+        let c = hang(&mut ns, &a);
+        let d = hang(&mut ns, &b);
+        let e = hang(&mut ns, &d);
+        umount_tree(&mut ns, &mut MOUNT_LOCK.write(), &c, UMOUNT_PROPAGATE);
+        for m in [&c, &d] {
+            assert_ne!(m.flags() & MNT_UMOUNT, 0);
+            assert!(!m.has_parent(&*ns));
+        }
+        assert_eq!(e.flags() & MNT_UMOUNT, 0);
+        assert!(e.get_parent(&*ns).is_some_and(|p| MountRef::ptr_eq(&p, &b)));
+        assert!(DentryRef::ptr_eq(&e.get_mountpoint(&*ns).unwrap(), &a.root));
+        assert_eq!(ns.unmounted.as_ref().map_or(0, |l| l.len()), 2);
+        drop(ns);
+        let mut ns = namespace_lock();
+        assert!(ns.unmounted.as_ref().is_none_or(|l| l.is_empty()));
+        assert!(detach_mnt(&mut ns, &e).is_some());
+        change_mnt_propagation(&mut ns, &a, Prop::Private);
+        change_mnt_propagation(&mut ns, &b, Prop::Private);
     }
 
     #[test]
