@@ -204,11 +204,16 @@ if [ -z "${CI:-}" ] && KEY=$(linux_cache_key); then
     fi
 fi
 
+# kho=off: Ubuntu enables kexec handover by default, whose scratch
+# areas (200% of the kernel's boot reservations, made MIGRATE_CMA: no
+# unmovable allocations) take ~300 of the guest's 512 MB when they fit.
+# hk has no such reserve; with it, BPF_PROG_LOAD_BIG's ~80 MB of
+# verifier vmalloc can exhaust the rest and the guest panics on OOM.
 echo "Booting boot_tester on Linux ($([ ${#KVM[@]} = 0 ] && echo TCG || echo KVM), ${TIMEOUT}s timeout)..."
 timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
     -m "$MEM" -smp "$SMP" -nographic -no-reboot -monitor none "${QEMU_NET[@]}" "${DISK[@]}" \
     -kernel "$LINUX_KERNEL" -initrd "$WORK/initramfs.cpio" \
-    -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet ${HK_CMDLINE:-}" \
+    -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet kho=off ${HK_CMDLINE:-}" \
     -serial file:"$SERIAL_LOG" </dev/null || true
 
 # Verdicts come from the log without kernel messages: a printk
