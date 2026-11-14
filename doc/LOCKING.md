@@ -2742,6 +2742,7 @@ of its namespace under MOUNT_LOCK.
 | `MntNamespace.root` (`ns/mod.rs`) | `RwLock<Option<MountRef>>` | Root of the namespace's mount tree (one per mount namespace) |
 | `Mount.mnt_parent` | `AtomicPtr<Mount>` (a `Weak::into_raw`) | Parent mount (Linux mnt_parent; no reference: `get_parent` takes one with `try_get_mnt`): no lock of its own, written under NAMESPACE_SEM write and `MOUNT_LOCK` write (`attach_mnt`'s mnt_set_mountpoint, `detach_mnt`, `put_mnt_ns`, a teardown's `unhang_children`), read under either (`parent_in`, `get_parent`, `up`), or under an RCU read guard checked by MOUNT_LOCK's sequence (`up_rcu`, `__lookup_mnt`) |
 | `Mount.mnt_mountpoint` | `AtomicPtr<Dentry>` | Where it is mounted (Linux mnt_mountpoint): no reference, the dentry pinned by its `Mountpoint` (m_dentry) while set; set and cleared with `mnt_parent`, or for a mount already unhung cleared under MOUNT_LOCK's locking read just before its mountpoint is put (`put_unhung`); `get_mountpoint` takes a reference under an RCU read guard (`DentryRef::try_get`) |
+| `Mount.mnt_mp` | `AtomicPtr<Mountpoint>` | Its mountpoint (Linux mnt_mp), which counts it: set and cleared with `mnt_mountpoint` (`set_mountpoint`, `take_mountpoint`), read under NAMESPACE_SEM or MOUNT_LOCK while the mount has a parent (`mp_in`: copy_tree attaches a copy on its source's, pivot_root pins the old root's) |
 | `Mount.mnt_mounts` | `LockedByEither<OwnedList>` (no lock of its own) | Submounts, each entry a reference to the submount (`MountRef::into_entry`; Linux mnt_mounts, linked through `Mount.mnt_child`): changed only under NAMESPACE_SEM write and `MOUNT_LOCK` both (`attach_mnt`, `detach_mnt`: `&mut NsTree` and `&mut MntHash`), read under either (`Stable`: `&NsTree` from a NAMESPACE_SEM guard, `&MntHash` from `MOUNT_LOCK.read_excl`). Walks step with `next_mnt` (Linux next_mnt: first submount, else the next sibling of the nearest mount up to the walk's root that has one), so no list is copied and no stack is kept |
 | `Mount.mnt_pcp` | `util::percpu_alloc::PcpSlot` (a word per CPU, in that CPU's chunks) | `MountRef` count (Linux mnt_pcp's mnt_count), summed under `MOUNT_LOCK` write once out of its namespace |
 | `Mount.doomed` | `AtomicBool` | Last reference gone (Linux MNT_DOOMED), set under `MOUNT_LOCK` write by that put |
@@ -2814,13 +2815,17 @@ out, all under MOUNT_LOCK write, before its `parent` or `mountpoint`
 changes; the chain's `Arc` is released a grace period later through
 `Mount.mnt_puts`). A dentry with mounts on it has one `Mountpoint`
 (Linux struct mountpoint: a reference to the dentry and `m_count`,
-the mounts attached there) in a bucket under MOUNT_LOCK (`LockedBy`
-its `MntHash`, a locking read or the write side); while it exists
-the dentry is marked mounted (`DentryFlags.mounted`, Linux
-DCACHE_MOUNTED, written under its d_lock inside MOUNT_LOCK). The
-mountpoint is allocated before MOUNT_LOCK (Linux get_mountpoint's
-kmalloc; attach runs under NAMESPACE_SEM write, so no other is made
-meanwhile) and put after it with its dentry (Linux ex_mountpoints).
+the mounts attached there and the pins on it: Linux m_list) in a
+bucket under MOUNT_LOCK (`LockedBy` its `MntHash`, a locking read or
+the write side); each mount on it points at it (`Mount.mnt_mp`), a
+pin (`MpPin`, Linux pinned_mountpoint) keeps it across an attach;
+while it exists the dentry is marked mounted (`DentryFlags.mounted`,
+Linux DCACHE_MOUNTED, written under its d_lock inside MOUNT_LOCK).
+`get_mountpoint` allocates a new one outside MOUNT_LOCK and repeats
+its lookup (Linux get_mountpoint: one may come, or go with an unhung
+mount's put, meanwhile); one left out of the hash, and one whose
+count reaches zero, is dropped with its dentry after the unlock
+(Linux ex_mountpoints).
 Propagation (`fs/pnode.rs`) runs entirely under NAMESPACE_SEM (write),
 as Linux: each mount's `Mount.prop` (`pnode::PropLinks`, `LockedBy`
 NAMESPACE_SEM's `NsTree`, no lock of its own: Linux mnt_group_id, the

@@ -21,7 +21,7 @@ use core::ptr::null;
 
 use super::dentry::DentryRef;
 use super::mount::{
-    MNT_LOCKED, Mount, MountRef, NsTree, attach_mnt, copy_plan, copy_tree, for_each_mut,
+    MNT_LOCKED, Mount, MountRef, MpPtr, NsTree, attach_mnt, copy_plan, copy_tree, for_each_mut,
     is_path_reachable,
 };
 use super::path_ref::Path;
@@ -531,13 +531,16 @@ fn set_mark(ns: &mut NsTree, m: *const Mount, on: bool) {
 /// Each copy is hung on its mount, its tree left out of every
 /// namespace (IS_MNT_NEW) for the caller's commit_tree. The copies'
 /// roots are returned (Linux tree_list).
-pub fn propagate_mnt(
+pub(super) fn propagate_mnt(
     ns: &mut NsTree,
     dest: &MountRef,
-    d: &DentryRef,
+    dest_mp: MpPtr,
     src: &MountRef,
 ) -> Vec<MountRef> {
     let mut list: Vec<MountRef> = Vec::new();
+    // SAFETY: the caller pins it, under NAMESPACE_SEM write
+    let d = unsafe { dest_mp.dentry() };
+    let d = &d;
     let dest_p = MountRef::as_ptr(dest);
     let src_p = MountRef::as_ptr(src);
     let dm = master(ns, dest_p);
@@ -571,7 +574,7 @@ pub fn propagate_mnt(
                     copy = get(ns, c);
                 }
                 let this = copy_prop(ns, &copy, ty);
-                attach_mnt(ns, this.clone(), &Path::new(get(ns, n), d.clone()));
+                attach_mnt(ns, this.clone(), &get(ns, n), dest_mp);
                 let nm = master(ns, n);
                 set_mark(ns, nm, true);
                 copy = this.clone();
