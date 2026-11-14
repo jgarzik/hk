@@ -124,12 +124,11 @@ pub static TRACE_SYSTEM: TraceSystem = TraceSystem {
     ],
 };
 
-/// Record an xHCI trace event, if enabled
+/// Record an xHCI trace event, if enabled (emit checks; the arguments
+/// are formatted only then)
 macro_rules! xhci_trace {
     ($ev:ident, $($arg:tt)*) => {
-        if $ev.enabled() {
-            crate::trace::emit(&$ev, format_args!($($arg)*))
-        }
+        crate::trace::emit(&$ev, format_args!($($arg)*))
     };
 }
 
