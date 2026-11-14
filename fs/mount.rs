@@ -696,8 +696,9 @@ pub fn attach(
         drop(_dir_lock);
     } else {
         let _ns = namespace_lock();
+        // A namespace's root is set once (Linux alloc_mnt_ns' tree root)
+        mnt_ns.set_root(mount.clone())?;
         mount.set_ns(mnt_ns.id);
-        mnt_ns.set_root(mount.clone());
     }
     Ok(mount)
 }

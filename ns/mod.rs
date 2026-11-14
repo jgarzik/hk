@@ -150,10 +150,17 @@ impl MntNamespace {
         Ok(new_ns)
     }
 
-    /// Set the root mount: the tree's reference to it
-    pub fn set_root(&self, mount: MountRef) {
-        let old = self.root.write().replace(mount);
-        drop(old);
+    /// Set the root mount, once (Linux: a namespace's root never
+    /// changes): the tree's reference to it; EBUSY if one is set
+    pub fn set_root(&self, mount: MountRef) -> KernelResult<()> {
+        let mut root = self.root.write();
+        if root.is_some() {
+            // A live root is never replaced (Linux: set once): its
+            // tree's references would leave by the fast path, uncounted
+            return Err(crate::util::error::KernelError::Busy);
+        }
+        *root = Some(mount);
+        Ok(())
     }
 
     /// Get the root mount
