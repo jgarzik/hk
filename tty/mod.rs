@@ -37,6 +37,7 @@ pub mod termios;
 pub mod tty_dev;
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
 
@@ -49,7 +50,9 @@ use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId};
 use crate::fs::flags::O_NOCTTY;
 use crate::fs::iov_iter::{IovDest, IovSource};
-use crate::io::fasync::{FasyncList, POLL_IN, PidType, f_setown_pid, fasync_helper, kill_fasync};
+use crate::io::fasync::{
+    FasyncList, POLL_IN, POLL_OUT, PidType, f_setown_pid, fasync_helper, kill_fasync,
+};
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::task::pid::Pid;
 use crate::util::error::KernelError;
@@ -226,6 +229,12 @@ pub struct Tty {
     fasync: FasyncList,
     /// Output flow control (Linux tty->flow, under flow.lock)
     flow: Mutex<Flow>,
+    /// A write could not finish with O_ASYNC files listening: the next
+    /// wakeup sends them SIGIO (Linux TTY_DO_WRITE_WAKEUP)
+    do_write_wakeup: AtomicBool,
+    /// That SIGIO is due from an interrupt handler: the flip thread
+    /// sends it
+    wakeup_due: AtomicBool,
 }
 
 impl Tty {
@@ -250,6 +259,8 @@ impl Tty {
                 stopped: false,
                 tco_stopped: false,
             }),
+            do_write_wakeup: AtomicBool::new(false),
+            wakeup_due: AtomicBool::new(false),
         }
     }
 
@@ -336,9 +347,44 @@ impl Tty {
     }
 
     /// The driver has room again or sent everything (Linux tty_wakeup):
-    /// wake writers, pollers and tcdrain; any context, no lock held
+    /// the line discipline's write wakeup if a write asked for it, then
+    /// writers, pollers and tcdrain woken; any context, no port lock
+    /// held. Signals cannot be sent from an interrupt handler (3.7), so
+    /// there the flip thread sends the SIGIO
     pub fn write_wakeup(&self) {
+        if self.do_write_wakeup.load(Ordering::Acquire) {
+            if crate::sync::in_interrupt() {
+                self.wakeup_due.store(true, Ordering::Release);
+                flip::kick_wakeup();
+            } else {
+                self.ldisc_write_wakeup();
+            }
+        }
         self.write_wait.wake_all();
+    }
+
+    /// N_TTY's write wakeup (Linux n_tty_write_wakeup): SIGIO POLL_OUT
+    /// to the O_ASYNC files, once per write that asked
+    fn ldisc_write_wakeup(&self) {
+        self.do_write_wakeup.store(false, Ordering::Release);
+        kill_fasync(&self.fasync, crate::signal::SIGIO, POLL_OUT);
+    }
+
+    /// The flip thread: a write wakeup due from an interrupt handler
+    pub(crate) fn deferred_wakeup(&self) {
+        if self.wakeup_due.swap(false, Ordering::AcqRel)
+            && self.do_write_wakeup.load(Ordering::Acquire)
+        {
+            self.ldisc_write_wakeup();
+        }
+    }
+
+    /// A write stopped short (Linux n_tty_write's break_out): with
+    /// O_ASYNC files listening, the next wakeup signals them
+    pub(crate) fn want_write_wakeup(&self) {
+        if self.fasync.armed() {
+            self.do_write_wakeup.store(true, Ordering::Release);
+        }
     }
 
     /// Sleep until the driver takes `n` bytes (Linux n_tty_write's

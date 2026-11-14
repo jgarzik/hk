@@ -4085,7 +4085,7 @@ Each `Tty` struct contains:
 | `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
 | `write_wait` | `WaitQueue` | Writers (under `write_lock`), pollers and tcdrain waiting for the driver's room or an empty queue (Linux write_wait); the driver wakes it with no lock held (`Tty::write_wakeup`) |
 | `flow` | `Mutex<Flow>` (spin, thread context) | Output flow control (Linux `tty->flow` under `flow.lock`): stopped, and stopped by TCOOFF. TCXONC stops and restarts output under it, calling the driver's stop/start (→ `UartPort.xmit`); writers are woken after it is released (Linux `__start_tty`'s tty_wakeup runs under flow.lock) |
-| `fasync` | `FasyncList` (RCU, 3.11) | O_ASYNC files (Linux `tty->fasync`): N_TTY input sends their SIGIO under `ldata` (Linux: under termios_rwsem), at each canonical line end, or after non-canonical input, then wakes `read_wait` |
+| `fasync` | `FasyncList` (RCU, 3.11) | O_ASYNC files (Linux `tty->fasync`): N_TTY input sends their SIGIO under `ldata` (Linux: under termios_rwsem), at each canonical line end, or after non-canonical input, then wakes `read_wait`. A write stopped short with files listening sets `do_write_wakeup` (atomic, Linux TTY_DO_WRITE_WAKEUP); the next `write_wakeup` clears it and sends SIGIO POLL_OUT (Linux n_tty_write_wakeup) with no lock held, or under `ldata` from the echo's driver write. Deviation: Linux sends it from the TX interrupt (uart_write_wakeup -> tty_wakeup); hk's signal locks are thread context only (3.7), so a wakeup in an interrupt handler sets `wakeup_due` and the flip thread sends it |
 
 `termios` and `ctrl` are spin locks taken in thread context only,
 briefly, never across a signal, a sleep or a driver write: the SIGWINCH

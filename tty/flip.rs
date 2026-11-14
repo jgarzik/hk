@@ -5,6 +5,8 @@
 //! (`tty_flip_buffer_push`): the `ttyflip` kernel thread then feeds them
 //! to the line discipline in thread context, where echo may write the
 //! UART and signals may be sent (neither is possible in the handler).
+//! The thread also sends the SIGIO of a write wakeup that came from a
+//! TX interrupt (`Tty::write_wakeup`).
 //! Linux queues per-port work on a workqueue instead; hk's queue_work
 //! is not IRQ-safe and one thread serves the few serial ports.
 
@@ -112,12 +114,21 @@ pub fn kick(tty: &Tty) {
     }
 }
 
+/// A tty's write wakeup is due from an interrupt handler
+/// (`Tty::write_wakeup`): the thread sends its SIGIO
+pub fn kick_wakeup() {
+    PENDING.store(true, Ordering::Release);
+    FLIP_WAIT.wake_all();
+}
+
 fn flip_thread(_: usize) {
     loop {
-        // Kernel threads get no signals: this only returns on input
+        // Kernel threads get no signals: this only returns on input or
+        // a due write wakeup
         let _ = FLIP_WAIT.wait_event_interruptible(|| PENDING.load(Ordering::Acquire));
         PENDING.store(false, Ordering::Release);
         for &tty in super::all() {
+            tty.deferred_wakeup();
             flush_to_ldisc(tty);
         }
     }

@@ -659,7 +659,9 @@ pub fn poll_in(tty: &Tty) -> bool {
 /// Write (Linux iterate_tty_write + n_tty_write), under the tty's
 /// write lock: through a kernel buffer a chunk at a time, waiting for
 /// the driver's room (EAGAIN if `nonblock`); an error after some bytes
-/// returns their count
+/// returns their count. Stopped short with O_ASYNC files listening, it
+/// asks for their SIGIO POLL_OUT once the driver has room (Linux
+/// TTY_DO_WRITE_WAKEUP)
 pub fn write(tty: &Tty, from: &mut IovSource<'_>, nonblock: bool) -> Result<usize, KernelError> {
     let mut chunk = [0u8; 512];
     let mut done = 0;
@@ -672,6 +674,7 @@ pub fn write(tty: &Tty, from: &mut IovSource<'_>, nonblock: bool) -> Result<usiz
         let (n, r) = write_chunk(tty, &chunk[..c], nonblock);
         done += n;
         if let Err(e) = r {
+            tty.want_write_wakeup();
             if done == 0 {
                 return Err(e);
             }

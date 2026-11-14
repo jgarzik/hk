@@ -19,6 +19,10 @@
 //! - TTY_TCXONC: TCOOFF holds a write's bytes in the UART's queue
 //!   (TIOCOUTQ counts all of them) until TCOON; TCIOFF/TCION send
 //!   STOP/START outside the queue; an unknown action is EINVAL
+//! - TTY_SIGIO_OUT: an O_NONBLOCK write stopped short (TCOOFF, the
+//!   UART's queue full) with O_ASYNC armed gets SIGIO POLL_OUT (si_band
+//!   POLLOUT|POLLWRNORM|POLLWRBAND) at the driver's next wakeup, an
+//!   output flush (Linux TTY_DO_WRITE_WAKEUP, n_tty_write_wakeup), once
 
 use crate::harness::{check, fail_num, pass, report_r};
 use crate::helpers::{host_mode, print, println, skip};
@@ -29,6 +33,7 @@ use hk_syscall::{
     sys_poll, sys_read, sys_rt_sigpending, sys_rt_sigprocmask, sys_setitimer, sys_setsid,
     sys_vhangup, sys_wait4, sys_write,
 };
+use hk_syscall::{SigInfo, Zeroable, sys_fcntl, sys_getpid, sys_rt_sigtimedwait};
 
 const O_NOCTTY: u32 = 0o400;
 const TCGETS: u64 = 0x5401;
@@ -43,6 +48,15 @@ const TCOON: u64 = 1;
 const TCIOFF: u64 = 2;
 const TCION: u64 = 3;
 const EINVAL: i64 = -22;
+const TCFLSH: u64 = 0x540B;
+const TCOFLUSH: u64 = 1;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const F_SETOWN: i32 = 8;
+const F_SETSIG: i32 = 10;
+const O_ASYNC: u64 = 0o20000;
+const SIGRT: u32 = 41;
+const POLL_OUT: i32 = 2;
 const SIGHUP: u64 = 1;
 const SIGCONT: u64 = 18;
 const SIGWINCH: u64 = 28;
@@ -66,6 +80,7 @@ pub fn run_tests() {
     test_write_atomic();
     test_outq();
     test_tcxonc();
+    test_sigio_out();
 }
 
 /// Bytes queued for the console's UART
@@ -147,6 +162,83 @@ fn test_tcxonc() {
         )
     })
     .and_then(|()| check(b"xchar queued", xq == 0, xq));
+    report_r(NAME, r);
+}
+
+/// SIGRT within `secs` seconds (0: pending now): the signal or -errno
+fn wait_rt(secs: i64, info: &mut SigInfo) -> i64 {
+    let mask = 1u64 << (SIGRT - 1);
+    let ts = [secs, 0i64];
+    sys_rt_sigtimedwait(
+        &mask as *const u64 as u64,
+        info as *mut SigInfo as u64,
+        ts.as_ptr() as u64,
+        8,
+    )
+}
+
+/// SIGIO POLL_OUT for a short tty write (Linux n_tty_write sets
+/// TTY_DO_WRITE_WAKEUP; uart_flush_buffer's tty_wakeup runs
+/// n_tty_write_wakeup). Output is stopped meanwhile: nothing may print
+fn test_sigio_out() {
+    const NAME: &[u8] = b"TTY_SIGIO_OUT";
+    let fd = sys_open(
+        b"/dev/console\0".as_ptr(),
+        O_WRONLY | O_NOCTTY | O_NONBLOCK,
+        0,
+    );
+    if fd < 0 {
+        return report(NAME, false, fd);
+    }
+    let fd = fd as i32;
+    let mask = 1u64 << (SIGRT - 1);
+    let mut old = 0u64;
+    sys_rt_sigprocmask(
+        0,
+        &mask as *const u64 as u64,
+        &mut old as *mut u64 as u64,
+        8,
+    );
+    sys_ioctl(fd, TCSBRK, 1);
+    let fl = sys_fcntl(fd, F_GETFL, 0) as u64;
+    let armed = sys_fcntl(fd, F_SETFL, fl | O_ASYNC);
+    sys_fcntl(fd, F_SETOWN, sys_getpid() as u64);
+    sys_fcntl(fd, F_SETSIG, SIGRT as u64);
+    sys_ioctl(fd, TCXONC, TCOOFF);
+    // Fill the stopped UART's queue (flushed below: none of it goes out)
+    let buf = [b' '; 1024];
+    let (mut total, mut last) = (0i64, 0i64);
+    for _ in 0..64 {
+        last = sys_write(fd as u64, buf.as_ptr(), buf.len() as u64);
+        if last < 0 {
+            break;
+        }
+        total += last;
+    }
+    let held = outq(fd);
+    let mut info = SigInfo::zeroed();
+    let early = wait_rt(0, &mut info);
+    let flushed = sys_ioctl(fd, TCFLSH, TCOFLUSH);
+    let got = wait_rt(2, &mut info);
+    sys_ioctl(fd, TCFLSH, TCOFLUSH);
+    let mut info2 = SigInfo::zeroed();
+    let again = wait_rt(0, &mut info2);
+    sys_ioctl(fd, TCXONC, TCOON);
+    sys_fcntl(fd, F_SETFL, fl);
+    sys_close(fd as u64);
+    sys_rt_sigprocmask(2, &old as *const u64 as u64, 0, 8);
+    // struct _sigpoll: si_band at 16 (si_pid's place), si_fd at 24
+    let band = info.si_pid as i64;
+    let r = check(b"armed", armed == 0, armed)
+        .and_then(|()| check(b"eagain", last == EAGAIN, last))
+        .and_then(|()| check(b"filled", total > 0 && held == total, held))
+        .and_then(|()| check(b"early", early == EAGAIN, early))
+        .and_then(|()| check(b"tcflsh", flushed == 0, flushed))
+        .and_then(|()| check(b"sigio", got == SIGRT as i64, got))
+        .and_then(|()| check(b"code", info.si_code == POLL_OUT, info.si_code as i64))
+        .and_then(|()| check(b"band", band == 0x304, band))
+        .and_then(|()| check(b"fd", info.si_status == fd, info.si_status as i64))
+        .and_then(|()| check(b"once", again == EAGAIN, again));
     report_r(NAME, r);
 }
 
