@@ -644,6 +644,10 @@ pub mod jobctl {
     pub const TRAP_NOTIFY: u32 = 1 << 20;
     /// An attach waits for it to enter its trap (Linux JOBCTL_TRAPPING)
     pub const TRAPPING: u32 = 1 << 21;
+    /// Its seized tracer listens for job-control events in its
+    /// PTRACE_EVENT_STOP trap (Linux JOBCTL_LISTENING): a NOTIFY ends
+    /// the trap, and wait and ptrace requests no longer see it
+    pub const LISTENING: u32 = 1 << 22;
     /// In a group stop (Linux JOBCTL_STOPPED)
     pub const STOPPED: u32 = 1 << 26;
     /// In a ptrace stop (Linux JOBCTL_TRACED)

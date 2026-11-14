@@ -9,7 +9,9 @@
 //! and tells the parent (CLD_STOPPED). SIGCONT, at generation, ends it:
 //! stopped threads go on and the first of them tells the parent
 //! (CLD_CONTINUED). A traced thread joins a group stop through a ptrace
-//! trap instead (JOBCTL_TRAP_STOP).
+//! trap instead (JOBCTL_TRAP_STOP); a seized one reports a later change
+//! in another trap (JOBCTL_TRAP_NOTIFY), at once if its tracer listens
+//! (PTRACE_LISTEN, JOBCTL_LISTENING), else once it is resumed.
 //!
 //! Locking (doc/LOCKING.md 3.7): the group state is under
 //! `SignalStruct.jobctl` (Linux siglock's group part), taken after
@@ -167,13 +169,29 @@ pub fn signal_wake_up(t: &Task, s: &mut TaskSignalState, fatal: bool) {
     super::signal_wake_task(t, mode);
 }
 
+/// A tracee has a trap or the end of its tracer to act on (Linux
+/// ptrace_signal_wake_up), its Task.sig held: TIF_SIGPENDING set and
+/// `t` woken from an interruptible sleep; `resume` also ends a ptrace
+/// stop it is in, woken there, its code left alone
+pub fn ptrace_signal_wake_up(t: &Task, s: &mut TaskSignalState, resume: bool) {
+    t.set_sigpending(true);
+    let mode = if resume && s.traced() {
+        s.jobctl &= !TRACED;
+        WakeMode::Any
+    } else {
+        WakeMode::Interruptible
+    };
+    super::signal_wake_task(t, mode);
+}
+
 /// A seized tracee is to report a job-control change in a trap (Linux
-/// ptrace_trap_notify; no PTRACE_LISTEN, so a ptrace stop it is in is
-/// left alone), its Task.sig held
+/// ptrace_trap_notify), its Task.sig held: a PTRACE_EVENT_STOP trap its
+/// tracer listens in (PTRACE_LISTEN) ends for it, any other ptrace stop
+/// is left alone and the trap waits for its resume
 fn trap_notify(t: &Task, s: &mut TaskSignalState) {
     set_pending(t, s, TRAP_NOTIFY);
-    t.set_sigpending(true);
-    super::signal_wake_task(t, WakeMode::Interruptible);
+    let listening = s.jobctl & LISTENING != 0;
+    ptrace_signal_wake_up(t, s, listening);
 }
 
 /// `t` (TASKLIST held: the view) is traced with PTRACE_SEIZE
@@ -494,15 +512,7 @@ pub fn unlink(t: &Task) {
         s.jobctl |= STOP_PENDING;
     }
     if s.jobctl & STOP_PENDING != 0 || s.traced() {
-        // Linux ptrace_signal_wake_up(child, true)
-        t.set_sigpending(true);
-        let mode = if s.traced() {
-            s.jobctl &= !TRACED;
-            WakeMode::Any
-        } else {
-            WakeMode::Interruptible
-        };
-        super::signal_wake_task(t, mode);
+        ptrace_signal_wake_up(t, &mut s, true);
     }
 }
 

@@ -61,7 +61,7 @@ pub fn run_tests() {
 
 /// Run `f` in a child with SIGCHLD blocked; NAME:OK if it returns 0,
 /// else NAME:FAIL with its failed step
-fn in_child(name: &[u8], f: fn() -> i32) {
+pub(crate) fn in_child(name: &[u8], f: fn() -> i32) {
     let s = sys_fork();
     if s == 0 {
         let m: u64 = 1 << (SIGCHLD - 1);
@@ -192,7 +192,7 @@ fn take_chld() -> Option<(i32, i32, i64)> {
 
 /// wait4(`pid`, `flags`) within 5 s, so a stop or continue that never
 /// comes fails instead of hanging: its result (0: none yet)
-fn wait_within(pid: i64, st: &mut i32, flags: i32) -> i64 {
+pub(crate) fn wait_within(pid: i64, st: &mut i32, flags: i32) -> i64 {
     for _ in 0..500 {
         let r = sys_wait4(pid, st, flags | WNOHANG, 0);
         if r != 0 {
@@ -203,7 +203,7 @@ fn wait_within(pid: i64, st: &mut i32, flags: i32) -> i64 {
     0
 }
 
-fn kill_reap(pid: i64) {
+pub(crate) fn kill_reap(pid: i64) {
     sys_kill(pid, SIGKILL);
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);

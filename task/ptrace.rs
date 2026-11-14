@@ -10,7 +10,7 @@
 //! Not all ptrace operations are implemented; this focuses on the core subset
 //! needed for basic debugging and tracing.
 
-use crate::signal::jobctl::{PTRACE_FROZEN, TRACED};
+use crate::signal::jobctl::{LISTENING, PTRACE_FROZEN, TRACED, TRAP_NOTIFY, TRAP_STOP};
 use crate::signal::stop::Why;
 use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP, Signal};
 use crate::task::percpu::TaskRef;
@@ -209,10 +209,10 @@ fn ptrace_check_attach(task: &TaskRef) -> KernelResult<Frozen> {
             return Err(KernelError::NoProcess);
         }
 
-        // In a ptrace stop, and not killed: the stop then stays until
-        // the request ends
+        // In a ptrace stop its tracer does not listen in, and not
+        // killed: the stop then stays until the request ends
         let mut s = task.sig.lock();
-        if !s.traced() || s.fatal_pending() {
+        if !s.traced() || s.jobctl & LISTENING != 0 || s.fatal_pending() {
             return Err(KernelError::NoProcess);
         }
         s.jobctl |= PTRACE_FROZEN;
@@ -555,6 +555,64 @@ fn ptrace_kill(target_pid: Pid) -> KernelResult<i64> {
 }
 
 // =============================================================================
+// PTRACE_INTERRUPT / PTRACE_LISTEN implementation
+// =============================================================================
+
+/// PTRACE_INTERRUPT: trap a seized tracee (Linux ptrace_request) with
+/// no effect on its signals or job control. A trap it is in stays, the
+/// new one comes after its resume; one its tracer listens in ends for
+/// it. ESRCH unless the caller traces it, stopped or not (Linux
+/// ptrace_check_attach with ignore_state); EIO unless seized. TASKLIST
+/// read (the tracer link), its group lock and Task.sig (the trap bit).
+fn ptrace_interrupt(target_pid: Pid) -> KernelResult<i64> {
+    let task = tracee(target_pid)?;
+    let table = TASKLIST.read();
+    let v = table.view(&task).ok_or(KernelError::NoProcess)?;
+    if !v.traced_by(&percpu::current()) {
+        return Err(KernelError::NoProcess);
+    }
+    // Linux: !seized || !lock_task_sighand
+    let Some(sig_struct) = task.cpu_group().filter(|_| v.ptrace & PT_SEIZED != 0) else {
+        return Err(KernelError::Io);
+    };
+    let _g = sig_struct.jobctl.lock();
+    let mut s = task.sig.lock();
+    if signal::stop::set_pending(&task, &mut s, TRAP_STOP) {
+        let listening = s.jobctl & LISTENING != 0;
+        signal::stop::ptrace_signal_wake_up(&task, &mut s, listening);
+    }
+    Ok(0)
+}
+
+/// PTRACE_LISTEN: a seized tracee in a PTRACE_EVENT_STOP trap stays in
+/// it, but is no longer stopped for wait or ptrace requests until a
+/// job-control change (JOBCTL_TRAP_NOTIFY) or PTRACE_INTERRUPT traps it
+/// again (Linux ptrace_request): at once if a change came since the
+/// trap began. ESRCH unless stopped for the caller; EIO unless seized
+/// and in such a trap. Set under the tracee's Task.sig.
+fn ptrace_listen(target_pid: Pid) -> KernelResult<i64> {
+    let task = tracee(target_pid)?;
+    let _frozen = ptrace_check_attach(&task)?;
+    let table = TASKLIST.read();
+    let v = table.view(&task).ok_or(KernelError::NoProcess)?;
+    if v.ptrace & PT_SEIZED == 0 {
+        return Err(KernelError::Io);
+    }
+    let mut s = task.sig.lock();
+    let event_stop = s
+        .last_siginfo
+        .is_some_and(|i| i.code >> 8 == PTRACE_EVENT_STOP as i32);
+    if !event_stop {
+        return Err(KernelError::Io);
+    }
+    s.jobctl |= LISTENING;
+    if s.jobctl & TRAP_NOTIFY != 0 {
+        signal::stop::ptrace_signal_wake_up(&task, &mut s, true);
+    }
+    Ok(0)
+}
+
+// =============================================================================
 // PTRACE_PEEKDATA / PTRACE_POKEDATA implementation
 // =============================================================================
 
@@ -872,9 +930,9 @@ pub fn ptrace_stop_why(
     // The stop's siginfo, as the tracer left it (Linux: last_siginfo
     // cleared after the stop)
     let info = s.last_siginfo.take();
-    // Out of the stop: nothing holds it (Linux clears
-    // JOBCTL_PTRACE_FROZEN with the stop)
-    s.jobctl &= !PTRACE_FROZEN;
+    // Out of the stop: nothing holds it, nor listens in it (Linux
+    // clears JOBCTL_LISTENING and JOBCTL_PTRACE_FROZEN with the stop)
+    s.jobctl &= !(LISTENING | PTRACE_FROZEN);
     // Killed while stopped: no longer reported, nothing delivered
     if s.traced() {
         s.end_trace_stop();
@@ -1047,6 +1105,8 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> KernelResult<
         }
 
         PTRACE_KILL => ptrace_kill(pid as Pid),
+        PTRACE_INTERRUPT => ptrace_interrupt(pid as Pid),
+        PTRACE_LISTEN => ptrace_listen(pid as Pid),
 
         PTRACE_SETOPTIONS => ptrace_setoptions(pid as Pid, data as u32),
         PTRACE_GETEVENTMSG => ptrace_geteventmsg(pid as Pid, data),
@@ -1060,9 +1120,7 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> KernelResult<
 
         // Not yet implemented
         PTRACE_PEEKUSER | PTRACE_POKEUSER | PTRACE_GETFPREGS | PTRACE_SETFPREGS
-        | PTRACE_GETREGSET | PTRACE_SETREGSET | PTRACE_INTERRUPT | PTRACE_LISTEN => {
-            Err(KernelError::InvalidArgument)
-        }
+        | PTRACE_GETREGSET | PTRACE_SETREGSET => Err(KernelError::InvalidArgument),
 
         _ => ptrace_unknown(pid as Pid),
     }
