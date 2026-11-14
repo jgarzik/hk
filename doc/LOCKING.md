@@ -541,7 +541,10 @@ VFS locks (detailed order):
         ↓
     mount::NAMESPACE_SEM (sync::RwSem; Linux namespace_sem: write for
                    attach, umount, namespace copy; read for /proc mount
-                   lists and is_local_mountpoint)
+                   lists and is_local_mountpoint; the write guard's
+                   drop is namespace_unlock: an umount's mountpoints
+                   and, after a grace period, references released with
+                   nothing held)
         → ns::MNT_NS_TREE (spin leaf; Linux mnt_ns_tree_lock: a mount
                    namespace added once made, removed at its end;
                    graft's owner check under NAMESPACE_SEM)
@@ -550,12 +553,16 @@ VFS locks (detailed order):
                    bind remount)
         ↓
     mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write, and
-                   the tree's links in attach_mnt/detach_mnt; locking
-                   read in legitimize, path_is_under, umount's
-                   MNT_EXPIRE check and a raced d_path pass; its
-                   sequence read lock-free by d_path and scoped walks)
+                   the tree's links in attach_mnt/detach_mnt; across
+                   all of umount_tree, propagate_umount included, and
+                   do_umount's propagate_mount_busy; locking read in
+                   legitimize, path_is_under, umount's MNT_EXPIRE
+                   check and a raced d_path pass; its sequence read
+                   lock-free by d_path and scoped walks)
         → SuperBlock.s_mounts (spin leaf: a new mount, a read-only
                    remount's walk)
+        → pnode::GROUP_IDA (IrqSpinlock leaf: umount_tree's
+                   bulk_make_private frees a group's id)
         ↓
     dentry::RENAME_LOCK (SeqLock, spin; Linux rename_lock: write in
                    d_move/d_exchange; locking read in a raced
@@ -2791,18 +2798,33 @@ its CPU's part, lock-free. While the mount is in a namespace
 kern_mount) the tree holds a reference to it, so a put takes from its
 CPU's part under an RCU read guard (Linux mntput_no_expire's fast
 path). Taking mounts out of their namespace clears `mnt_ns` under
-NAMESPACE_SEM write, then the caller waits out a grace period
-(`rcu::synchronize`) and puts the tree's references itself (Linux
-umount_tree, then namespace_unlock): umount (its task's teardown, if
-the last, runs before the syscall returns) and a namespace's last
-reference (`put_mnt_ns`), both through `umount_tree`: every mount of
-the tree, and for umount what propagation takes along, is marked
-MNT_UMOUNT and taken off its parent's list (one MOUNT_LOCK write
-section for the tree, one per mount propagation adds), leaves
-propagation, then its namespace, then comes off its parent and
-mountpoint (a MOUNT_LOCK write section each), held meanwhile by a
-reference on an intrusive list (`Mount.mnt_list`, no allocation)
-that the caller puts after the grace period. A mount
+NAMESPACE_SEM write and MOUNT_LOCK write; releasing NAMESPACE_SEM
+(`NsWrite`'s drop, Linux namespace_unlock) waits out a grace period
+(`rcu::synchronize`) and puts the tree's references in the releasing
+task: umount (its task's teardown, if the last, runs before the
+syscall returns) and a namespace's last reference (`put_mnt_ns`),
+both through `umount_tree`, which, as Linux, runs whole in one
+MOUNT_LOCK write section its caller holds (do_umount: NAMESPACE_SEM,
+MOUNT_LOCK, the checks, propagate_mount_busy, umount_tree; unlock in
+reverse): every mount of the tree is marked MNT_UMOUNT and taken off
+its parent's list, propagation adds what it takes along
+(`propagate_umount`: candidates, MNT_LOCKED cleared, `umount_one`,
+`reparent`'s mnt_change_mountpoint), all leave propagation, then
+each leaves its namespace, is marked MNT_SYNC_UMOUNT for a
+synchronous umount, leaves its cover (`leave_cover`, preallocated)
+and comes off its parent, hash and mountpoint. Nothing under it
+allocates, sleeps or puts a reference that could be the last: the
+set's references and the candidates' are list entries
+(`Mount.mnt_list`); the extra ones (a parent list's entry once the
+set holds the mount, a candidate that stays, reparent's) go with
+`MountRef::put_held` (Linux holds none; never the last, lock-free);
+each unmounted mount's reference moves to `NsTree.unmounted` (Linux
+unmounted) and a mountpoint whose last mount left to
+`NsTree.ex_mountpoints` (Linux ex_mountpoints), both owned by
+NAMESPACE_SEM and released by namespace_unlock after it lets go: the
+mountpoints (their dentries put), then, after the grace period, the
+references. Dropping a parent link's `Weak` there is at most a free
+(Linux kfree under mount_lock; the heap is IRQ-safe). A mount
 moved (MS_MOVE, pivot_root) keeps its namespace and its parent's
 reference moves with it. A put of a mount out of its namespace is
 exact: under MOUNT_LOCK write it takes from its part and sums them;
@@ -2825,9 +2847,9 @@ of its namespace under MOUNT_LOCK.
 | `Mount.mnt_pcp` | `util::percpu_alloc::PcpSlot` (a word per CPU, in that CPU's chunks) | `MountRef` count (Linux mnt_pcp's mnt_count), summed under `MOUNT_LOCK` write once out of its namespace |
 | `Mount.doomed` | `AtomicBool` | Last reference gone (Linux MNT_DOOMED), set under `MOUNT_LOCK` write by that put |
 | `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC/READONLY/LOCK_*/LOCKED/SYNC_UMOUNT/UMOUNT; every write under `MOUNT_LOCK` (remount, reconfigure, pivot_root's MNT_LOCKED, lock_mnt_tree's locks, umount_tree's MNT_UMOUNT and MNT_SYNC_UMOUNT), read lock-free (open, exec, statfs, can_change_locked_flags: a lock is never cleared), and by `legitimize`'s locking read |
-| `Mount.mnt_list` | `util::list::Link` (no lock) | On an umount's list (Linux mnt_list: `umount_tree`'s set, `propagate_umount`'s candidates and committed mounts, the unmounted), each entry a reference: lists local to the task unmounting, under NAMESPACE_SEM write until the last, put after it |
+| `Mount.mnt_list` | `util::list::Link` (no lock) | On an umount's list (Linux mnt_list: `umount_tree`'s set, `propagate_umount`'s candidates and committed mounts, `NsTree.unmounted`), each entry a reference: the first three local to `umount_tree` under NAMESPACE_SEM write and MOUNT_LOCK write, the unmounted owned by NAMESPACE_SEM and put by namespace_unlock a grace period after it lets go |
 | `Mount.mnt_cover`, `Mount.mnt_covers` | `LockedBy<Option<Arc<MntCover>>, MntHash>`, `RcuHList<CoverA, MntHash>` | A mount's preallocated cover and the covers its unmounted submounts left (Linux mnt_cover, mnt_covers): umount_tree's `leave_cover` takes a locked mount's cover and links it on its unmounted parent's list under `MOUNT_LOCK` write, the cover counting the mountpoint (`m_count`); `__lookup_mnt` walks the list under an RCU read guard (the caller checks MOUNT_LOCK's sequence, or holds its locking read) and reads the dentry's inode (`d_lock`, under MOUNT_LOCK as attach's DCACHE_MOUNTED) to pick the stand-in; the parent's teardown takes each off under `MOUNT_LOCK` write, frees it a grace period later (`kfree_rcu`) and drops the mountpoint after the unlock |
-| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`: Linux attach_mnt and umount_tree under lock_mount_hash; with NAMESPACE_SEM write it owns `mnt_mounts`); under NAMESPACE_SEM and s_umount; under it only `SuperBlock.s_mounts`, RENAME_LOCK (a raced d_path pass, path_is_under's is_subdir) and in attach/detach the mountpoint dentry's `d_lock` (DCACHE_MOUNTED); with NAMESPACE_SEM write it owns each mount's `mnt_parent`/`mnt_mountpoint`; it owns the mount and mountpoint hashes (below); `MountRef::legitimize`'s locking read takes nothing under it. No mount, mountpoint or dentry is dropped under it (`make_rdonly` releases its references, `detach_mnt` the parent's reference to the mount, its parent link's `Weak`, the mountpoint and its dentry after the unlock; the mount hash's reference goes through `put_rcu`). The sequence is read lock-free by `lookup_mnt`, `choose_mountpoint`, `d_path` and scoped walks (3.3 Path Traversal) |
+| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`, and `umount_tree` whole, its caller holding it across, as Linux do_umount, put_mnt_ns; with NAMESPACE_SEM write it owns `mnt_mounts`); under NAMESPACE_SEM and s_umount; under it only `SuperBlock.s_mounts`, `pnode::GROUP_IDA` (bulk_make_private), RENAME_LOCK (a raced d_path pass, path_is_under's is_subdir) and in attach/detach/umount the mountpoint dentry's `d_lock` (DCACHE_MOUNTED, a cover's inode); with NAMESPACE_SEM write it owns each mount's `mnt_parent`/`mnt_mountpoint`; it owns the mount and mountpoint hashes (below); `MountRef::legitimize`'s locking read takes nothing under it. Helpers that need it take its `&mut MntHash` (`umount_tree`, `propagate_umount`, `propagate_mount_busy`, `propagate_mount_unlock`, `hide_mnt`, `change_mountpoint`, `umount_mnt`, `Mount::mark_in`), so a caller that does not hold it does not compile. No mount, mountpoint or dentry is dropped under it, and no reference put that could be the last (`MountRef::put_held` only) (`make_rdonly` releases its references, `detach_mnt` the parent's reference to the mount, its parent link's `Weak`, the mountpoint and its dentry after the unlock; `umount_tree` leaves its references and mountpoints to namespace_unlock, `NsTree.unmounted` and `NsTree.ex_mountpoints`, and drops parent links' `Weak`s, at most a free; the mount hash's reference goes through `put_rcu`). The sequence is read lock-free by `lookup_mnt`, `choose_mountpoint`, `d_path` and scoped walks (3.3 Path Traversal) |
 | `ns::MNT_NS_TREE` | spin `Mutex<RbTree>` leaf | Live mount namespaces by id, each with a `Weak` of its owning user namespace (Linux mnt_ns_tree, mnt_ns_tree_lock): a namespace is added once made (its node allocated first), removed first thing in its drop (the node freed after the unlock); `mnt_ns_same_owner` compares two namespaces' owners under it, from graft under NAMESPACE_SEM write, before MOUNT_LOCK; nothing is taken under it |
 | `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
 | `Mount.mnt_ns` | `AtomicU64` | Id of the mount's namespace (`MntNamespace.id`, never reused), 0 for none, `MNT_NS_INTERNAL` for a kernel mount (Linux mnt_ns, MNT_NS_INTERNAL): written only under NAMESPACE_SEM write (commit_tree when a tree is grafted or propagated, the namespace root, a namespace copy; umount and `put_mnt_ns` clear it, a grace period before the tree's references are put), or once before a kernel mount is shared; read lock-free by a put's fast path under an RCU read guard, read by `check_mnt` under NAMESPACE_SEM; can_umount and remount read it first without, as Linux (umount repeats it under the lock) |
@@ -2857,8 +2879,9 @@ in `rcuc/N` (1.4.2) and only releases memory and the mount's
 `PcpSlot` number (an IrqSpinlock leaf).
 
 **Busy:** as Linux do_umount (propagate_mount_busy, do_refcount_check),
-umount sums the count under MOUNT_LOCK's locking read and NAMESPACE_SEM
-write: a mount with submounts or more than its caller's and the tree's
+umount sums the count under NAMESPACE_SEM write and MOUNT_LOCK write,
+held on into umount_tree (MNT_EXPIRE's check: its locking read): a
+mount with submounts or more than its caller's and the tree's
 references (two), or a mount the propagation would take along with
 more than its tree's one (`propagate_mount_busy`'s chain_busy, Linux
 7.4), is EBUSY, unless MNT_DETACH; MNT_EXPIRE needs exactly two. An
@@ -2873,7 +2896,7 @@ m_start), which umount excludes. A put clears an MNT_EXPIRE mark
 1. the mountpoint's Inode.i_rwsem (attach: a dead directory is refused)
 2. mount::NAMESPACE_SEM (write: attach, umount, namespace copy)
 3. SuperBlock.s_umount (write: remount)
-4. mount::MOUNT_LOCK (attach_mnt / detach_mnt; Mount::alloc)
+4. mount::MOUNT_LOCK (attach_mnt / detach_mnt / umount_tree; Mount::alloc)
 5. MntNamespace.root (read/write)
 6. Dentry.d_lock (DentryInner.flags: DCACHE_MOUNTED, with the mountpoint)
 ```
@@ -2910,7 +2933,8 @@ Linux DCACHE_MOUNTED, written under its d_lock inside MOUNT_LOCK).
 its lookup (Linux get_mountpoint: one may come, or go with an unhung
 mount's put, meanwhile); one left out of the hash, and one whose
 count reaches zero, is dropped with its dentry after the unlock
-(Linux ex_mountpoints).
+(Linux ex_mountpoints; umount_tree's on `NsTree.ex_mountpoints`,
+dropped by namespace_unlock after NAMESPACE_SEM).
 A tree grafted (`graft`, Linux attach_recursive_mnt) and its
 propagated copies are first hung on their mountpoints with no list or
 hash entry (`set_mountpoint`, under MOUNT_LOCK; reachable only by the
@@ -2930,8 +2954,9 @@ umount and a namespace's end make every mount private before it
 leaves, and a teardown unlinks one still linked (NAMESPACE_SEM read to
 look, write to unlink; never the case today). An umount computes
 what propagation takes (`propagate_umount`) and makes the set private
-at once (`bulk_make_private`) under NAMESPACE_SEM write, taking
-MOUNT_LOCK write only to mark or move a mount. Peer group ids come from
+at once (`bulk_make_private`) under NAMESPACE_SEM write and, inside
+umount_tree, MOUNT_LOCK write (Linux: mount_lock held across
+propagate_umount, which marks, unlists and moves mounts). Peer group ids come from
 `pnode::GROUP_IDA` (`util::ida::Ida`, Linux mnt_group_ida: its
 IrqSpinlock leaf), allocated under NAMESPACE_SEM write and freed when
 a group's last member leaves.
