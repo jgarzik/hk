@@ -23,6 +23,10 @@
 //!   UART's queue full) with O_ASYNC armed gets SIGIO POLL_OUT (si_band
 //!   POLLOUT|POLLWRNORM|POLLWRBAND) at the driver's next wakeup, an
 //!   output flush (Linux TTY_DO_WRITE_WAKEUP, n_tty_write_wakeup), once
+//! - TTY_LAST_CLOSE: the last close of a serial tty (ttyS1, x86) with
+//!   output stopped by TCOOFF drops it instead of waiting closing_wait
+//!   (Linux tty_port_close_start), and the next open finds a fresh tty:
+//!   nothing queued, output flowing
 
 use crate::harness::{check, fail_num, pass, report_r};
 use crate::helpers::{host_mode, print, println, skip};
@@ -81,6 +85,7 @@ pub fn run_tests() {
     test_outq();
     test_tcxonc();
     test_sigio_out();
+    test_last_close();
 }
 
 /// Bytes queued for the console's UART
@@ -239,6 +244,63 @@ fn test_sigio_out() {
         .and_then(|()| check(b"band", band == 0x304, band))
         .and_then(|()| check(b"fd", info.si_status == fd, info.si_status as i64))
         .and_then(|()| check(b"once", again == EAGAIN, again));
+    report_r(NAME, r);
+}
+
+/// Monotonic time in ms
+fn now_ms() -> i64 {
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    sys_clock_gettime(CLOCK_MONOTONIC, &mut ts);
+    ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+}
+
+/// The last close of ttyS1, a serial tty nothing else holds open
+/// (Linux tty_release -> uart_close -> tty_port_close)
+fn test_last_close() {
+    const NAME: &[u8] = b"TTY_LAST_CLOSE";
+    if cfg!(target_arch = "aarch64") {
+        return skip(NAME, b"one UART");
+    }
+    let path = b"/dev/ttyS1\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK, 0);
+    if fd < 0 {
+        return report(NAME, false, fd);
+    }
+    let fd = fd as i32;
+    let off = sys_ioctl(fd, TCXONC, TCOOFF);
+    let buf = [b'x'; 100];
+    let w = sys_write(fd as u64, buf.as_ptr(), buf.len() as u64);
+    let held = outq(fd);
+    let t0 = now_ms();
+    sys_close(fd as u64);
+    let took = now_ms() - t0;
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK, 0);
+    if fd < 0 {
+        return report(NAME, false, fd);
+    }
+    let fd = fd as i32;
+    let fresh = outq(fd);
+    let w2 = sys_write(fd as u64, buf.as_ptr(), 10);
+    // Not stopped: the 10 bytes go out (bounded, never a hang)
+    let mut left = outq(fd);
+    for _ in 0..200 {
+        if left == 0 {
+            break;
+        }
+        crate::helpers::msleep(10);
+        left = outq(fd);
+    }
+    sys_close(fd as u64);
+    let r = check(b"tcooff", off == 0, off)
+        .and_then(|()| check(b"write", w == 100, w))
+        .and_then(|()| check(b"held", held == 100, held))
+        .and_then(|()| check(b"close ms", took < 5000, took))
+        .and_then(|()| check(b"fresh outq", fresh == 0, fresh))
+        .and_then(|()| check(b"write2", w2 == 10, w2))
+        .and_then(|()| check(b"sent", left == 0, left));
     report_r(NAME, r);
 }
 

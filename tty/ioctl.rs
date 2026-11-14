@@ -115,7 +115,7 @@ fn get<T: FromBytes>(arg: u64) -> Result<T, KernelError> {
 /// Wait until the output is sent (Linux tty_wait_until_sent); a
 /// pending signal ends the call with EINTR
 fn drain(tty: &Tty) -> Result<(), KernelError> {
-    tty.wait_until_sent();
+    tty.wait_until_sent(0);
     if crate::sync::waitqueue::signal_pending() {
         return Err(KernelError::Interrupted);
     }

@@ -283,6 +283,20 @@ impl UartPort {
         self.xmit.lock().fifo.reset();
     }
 
+    /// The tty's last close (Linux tty_port_shutdown): the tty's
+    /// stopped state goes with it; unless a console, the transmitter
+    /// stops and the queue is freed (uart_shutdown,
+    /// uart_free_xmit_buf)
+    pub fn shutdown(&self, ops: &dyn UartOps, console: bool) {
+        let mut x = self.xmit.lock();
+        x.stopped = false;
+        if !console {
+            self.stop_tx(ops, &mut x);
+            x.fifo.reset();
+            x.x_char = 0;
+        }
+    }
+
     /// A console write: under the port lock, only tried during an oops
     /// (output then goes out unlocked, as Linux's `locked = 0`), the
     /// port's interrupts quiet, each LF preceded by CR (Linux

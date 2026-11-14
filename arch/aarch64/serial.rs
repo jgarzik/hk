@@ -284,6 +284,11 @@ impl TtyDriver for Pl011 {
         self.uart.flush_buffer();
     }
 
+    /// Linux uart_tty_port_shutdown
+    fn shutdown(&self, console: bool) {
+        self.uart.shutdown(self, console);
+    }
+
     /// Linux pl011_console_write: under the port lock
     fn console_write(&self, data: &[u8]) {
         self.uart.console_write(self, data);

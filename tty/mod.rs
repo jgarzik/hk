@@ -154,11 +154,24 @@ pub trait TtyDriver: Send + Sync {
     /// Drop the queued bytes (Linux flush_buffer)
     fn flush_buffer(&self) {}
 
+    /// The tty's last close (Linux tty_port_shutdown): unless the port
+    /// is a console (port->console), output stops and its queue is
+    /// freed (uart_shutdown); either way the tty's flow control state
+    /// goes with the tty
+    fn shutdown(&self, console: bool) {
+        let _ = console;
+    }
+
     /// The console write (Linux console->write): bytes straight to the
     /// hardware, LF as CR LF, then a wait until the transmitter is
     /// empty. A UART takes its port lock (`serial_core::UartPort`)
     fn console_write(&self, data: &[u8]);
 }
+
+/// How long a last close waits for output to drain (Linux
+/// tty_port.closing_wait, 30 s by default: tty_port_init); 0 would be
+/// ASYNC_CLOSING_WAIT_INF. hk has no TIOCSSERIAL to change it
+const CLOSING_WAIT_MS: u64 = 30_000;
 
 /// Output flow control (Linux tty->flow)
 struct Flow {
@@ -235,6 +248,9 @@ pub struct Tty {
     /// That SIGIO is due from an interrupt handler: the flip thread
     /// sends it
     wakeup_due: AtomicBool,
+    /// Open files (Linux tty->count, under tty_lock): held across an
+    /// open and across the last close, which drains output
+    count: crate::sync::Mutex<usize>,
 }
 
 impl Tty {
@@ -261,6 +277,7 @@ impl Tty {
             }),
             do_write_wakeup: AtomicBool::new(false),
             wakeup_due: AtomicBool::new(false),
+            count: crate::sync::Mutex::new(0),
         }
     }
 
@@ -495,12 +512,70 @@ impl Tty {
     }
 
     /// Wait for output to be sent (Linux tty_wait_until_sent): the
-    /// queue empty, then the transmitter; a signal ends the wait
-    pub fn wait_until_sent(&self) {
-        let _ = self
+    /// queue empty, then the transmitter; a signal or `timeout` ticks
+    /// (0: none) end the wait
+    pub fn wait_until_sent(&self, timeout: u64) {
+        let t = if timeout == 0 {
+            crate::task::percpu::MAX_SCHEDULE_TIMEOUT
+        } else {
+            timeout
+        };
+        let left = self
             .write_wait
-            .wait_event_interruptible(|| self.driver.chars_in_buffer() == 0);
-        self.driver.flush();
+            .wait_event_interruptible_timeout(|| self.driver.chars_in_buffer() == 0, t);
+        if matches!(left, Ok(n) if n > 0) {
+            self.driver.flush();
+        }
+    }
+
+    /// A file opened the tty (Linux tty_open's tty_reopen: tty->count,
+    /// under tty_lock); then it may become the controlling tty
+    fn opened(&self, file: &File, ctty: bool) {
+        let mut n = self.count.lock();
+        *n += 1;
+        if ctty && file.get_flags() & O_NOCTTY == 0 {
+            jobctrl::open_set_tty(self, file);
+        }
+    }
+
+    /// A file of the tty is released (Linux tty_release). The last one
+    /// closes the port (uart_close -> tty_port_close) and the tty
+    /// starts afresh, as Linux frees the tty_struct: flow control, the
+    /// write wakeup, input and the controlling session go; termios
+    /// stays (the driver's saved termios)
+    fn release(&self) {
+        let mut n = self.count.lock();
+        if *n > 1 {
+            *n -= 1;
+            return;
+        }
+        self.close_port();
+        *n = 0;
+        jobctrl::session_clear_tty(self);
+        *self.flow.lock() = Flow {
+            stopped: false,
+            tco_stopped: false,
+        };
+        self.do_write_wakeup.store(false, Ordering::Release);
+        self.wakeup_due.store(false, Ordering::Release);
+    }
+
+    /// The last close (Linux tty_port_close_start, tty_port_shutdown):
+    /// output stopped by TCOOFF is dropped, the rest drains for up to
+    /// closing_wait, input is dropped, then the port shuts down unless
+    /// it is a console
+    fn close_port(&self) {
+        let tco = self.flow.lock().tco_stopped;
+        if tco {
+            self.flush_output();
+        }
+        self.wait_until_sent(crate::task::percpu::ms_to_ticks(CLOSING_WAIT_MS));
+        self.flush_input();
+        let console = crate::console::console_ttys()
+            .iter()
+            .flatten()
+            .any(|t| core::ptr::eq(*t, self));
+        self.driver.shutdown(console);
     }
 
     /// Bytes queued for the hardware (Linux tty_chars_in_buffer)
@@ -634,6 +709,22 @@ impl Redirect {
             .map(|r| r.0)
             .ok_or(KernelError::Io)
     }
+
+    /// Open `tty` through `file`: point the file at it and count it
+    /// (Linux tty->count); `ctty`: it may become the controlling tty.
+    /// The release of a file whose open failed finds no tty to drop
+    fn open(file: &File, tty: &'static Tty, ctty: bool) -> Result<(), KernelError> {
+        Self::set(file, tty)?;
+        tty.opened(file, ctty);
+        Ok(())
+    }
+
+    /// The release of a file opened by `open` (Linux tty_release)
+    fn release(file: &File) {
+        if let Ok(t) = Self::tty(file) {
+            t.release();
+        }
+    }
 }
 
 /// A static tty as a registered character device
@@ -649,7 +740,11 @@ impl CharDevice for TtyChar {
     }
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
-        CharDevice::open(self.0, file)
+        Redirect::open(file, self.0, true)
+    }
+
+    fn release(&self, file: &File) {
+        Redirect::release(file);
     }
 
     fn read(&self, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {

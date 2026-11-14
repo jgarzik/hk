@@ -359,6 +359,11 @@ impl TtyDriver for SerialTty {
         self.uart.flush_buffer();
     }
 
+    /// Linux uart_tty_port_shutdown
+    fn shutdown(&self, console: bool) {
+        self.uart.shutdown(self, console);
+    }
+
     /// Linux serial8250_console_write: under the port lock
     fn console_write(&self, data: &[u8]) {
         self.uart.console_write(self, data);
@@ -533,6 +538,9 @@ fn serial8250_probe(
         ConsolePriority::Fallback,
         crate::console::ConsoleFlags::BOOT,
     );
+    // COM2 is set up as COM1 was at boot (Linux serial8250_config_port);
+    // it has no interrupt: a timer drains its transmitter
+    SERIAL_DRIVER_S1.init_hardware(115200);
     let irq = crate::base::platform::pdev(dev).and_then(|p| p.irq);
     *port.irq.get_mut() = irq.and_then(rx_irq_init);
     port.ttys = serial_ttys()
