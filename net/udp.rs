@@ -38,7 +38,8 @@ use crate::net::inet::fib::RouteType;
 use crate::net::inet::port::{self, BindInfo, Flow, Parity};
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IpParams, Ipv4Addr};
-use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, RecvMsg, SendMsg, cmsgs};
+use crate::net::mib::*;
+use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, RecvMsg, SendMsg, cmsgs};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
@@ -186,7 +187,8 @@ impl UdpSock {
         saddr: Ipv4Addr,
         oif: u32,
     ) -> Result<route::Rtable, KernelError> {
-        let rt = route::output(&self.sk.net, daddr, saddr, oif)?;
+        let rt = route::output(&self.sk.net, daddr, saddr, oif)
+            .inspect_err(|e| self.sk.net.mib.route_err(e))?;
         if rt.rtype == RouteType::Broadcast && !self.sk.flag(sf::BROADCAST) {
             return Err(KernelError::PermissionDenied);
         }
@@ -470,7 +472,13 @@ impl ProtoOps for UdpSock {
         if let Some(e) = self.sk.take_err() {
             return Err(e);
         }
+        let mib = &self.sk.net.mib;
         match self.xmit(&rt, a.sport, dport, &data, p) {
+            Ok(()) => {
+                // Linux udp_send_skb
+                mib.udp.inc(UDP_MIB_OUTDATAGRAMS);
+                Ok(len)
+            }
             Err(KernelError::MessageTooLong) => {
                 // Linux __ip_append_data: IP_RECVERR also queues it
                 // (msg_name port: the connected one)
@@ -478,7 +486,13 @@ impl ProtoOps for UdpSock {
                 af_inet::ip_local_error(&self.sk, &self.inet, e, daddr, a.dport, rt.mtu);
                 Err(e)
             }
-            r => r.map(|()| len),
+            Err(e) => {
+                // Linux udp_sendmsg's out: no kernel memory
+                if e == KernelError::NoBufferSpace {
+                    mib.udp.inc(UDP_MIB_SNDBUFERRORS);
+                }
+                Err(e)
+            }
         }
     }
 
@@ -490,7 +504,17 @@ impl ProtoOps for UdpSock {
         let Some(d) = self.rxq.recv(&self.sk, flags)? else {
             return Ok(0);
         };
-        dgram::deliver(&self.sk, &self.inet, m, &d, flags)
+        let r = dgram::deliver(&self.sk, &self.inet, m, &d, flags);
+        if flags & MSG_PEEK == 0 {
+            // Linux udp_recvmsg: a datagram is counted when it is read
+            let f = if r.is_ok() {
+                UDP_MIB_INDATAGRAMS
+            } else {
+                UDP_MIB_INERRORS
+            };
+            self.sk.net.mib.udp.inc(f);
+        }
+        r
     }
 }
 
@@ -661,16 +685,22 @@ pub fn udp_rcv(mut skb: SkBuff) {
     let (Some(net), Some(saddr), Some(daddr)) = (skb.net(), skb.saddr, skb.daddr) else {
         return;
     };
+    let udp = &net.mib.udp;
     let b = skb.data();
     if b.len() < UDP_HLEN {
+        udp.inc(UDP_MIB_INERRORS);
         return;
     }
     let ulen = u16::from_be_bytes([b[4], b[5]]) as usize;
     if ulen < UDP_HLEN || ulen > b.len() {
+        // Linux short_packet
+        udp.inc(UDP_MIB_INERRORS);
         return;
     }
     let pkt = &b[..ulen];
     if u16::from_be_bytes([b[6], b[7]]) != 0 && !csum_ok(saddr, daddr, pkt) {
+        udp.inc(UDP_MIB_CSUMERRORS);
+        udp.inc(UDP_MIB_INERRORS);
         return;
     }
     let dif = skb.dev.as_ref().map_or(0, |d| d.ifindex());
@@ -684,6 +714,7 @@ pub fn udp_rcv(mut skb: SkBuff) {
     let pad = b.len() - ulen;
     let info = RxInfo::of(&net, &skb);
     if skb.trim(pad).is_none() || skb.pull(UDP_HLEN).is_none() {
+        udp.inc(UDP_MIB_INERRORS);
         return;
     }
     dgram::prepare(&mut skb, info, k.sport);
@@ -691,9 +722,26 @@ pub fn udp_rcv(mut skb: SkBuff) {
         return mcast_deliver(&net, skb, &k);
     }
     match lookup(&net.udp, &k) {
-        Some(s) => s.rxq.enqueue(&s.sk, skb),
-        None => crate::net::icmp::port_unreach(&net, &skb),
+        Some(s) => queue_rcv(&net, &s, skb),
+        None => {
+            udp.inc(UDP_MIB_NOPORTS);
+            crate::net::icmp::port_unreach(&net, &skb);
+        }
     }
+}
+
+/// Queue a datagram to `s`, counting a drop (Linux __udp_queue_rcv_skb:
+/// a full buffer is RcvbufErrors, no memory MemErrors, both InErrors)
+fn queue_rcv(net: &crate::net::NetNamespace, s: &UdpSock, skb: SkBuff) {
+    let Err(e) = s.rxq.enqueue(&s.sk, skb) else {
+        return;
+    };
+    let udp = &net.mib.udp;
+    udp.inc(match e {
+        dgram::QueueErr::RcvBuf => UDP_MIB_RCVBUFERRORS,
+        dgram::QueueErr::NoMem => UDP_MIB_MEMERRORS,
+    });
+    udp.inc(UDP_MIB_INERRORS);
 }
 
 /// A broadcast or multicast datagram to every matching socket (Linux
@@ -709,14 +757,17 @@ fn mcast_deliver(net: &crate::net::NetNamespace, skb: SkBuff, k: &Key) {
             continue;
         }
         match skb.clone_gfp(Gfp::ATOMIC) {
-            Some(c) => s.rxq.enqueue(&s.sk, c),
+            Some(c) => queue_rcv(net, s, c),
             None => {
                 s.sk.drops.fetch_add(1, Ordering::Relaxed);
+                net.mib.udp.inc(UDP_MIB_RCVBUFERRORS);
+                net.mib.udp.inc(UDP_MIB_INERRORS);
             }
         }
     }
-    if let Some(s) = first {
-        s.rxq.enqueue(&s.sk, skb);
+    match first {
+        Some(s) => queue_rcv(net, s, skb),
+        None => net.mib.udp.inc(UDP_MIB_IGNOREDMULTI),
     }
 }
 
@@ -737,6 +788,8 @@ pub fn udp_err(net: &crate::net::NetNamespace, e: &crate::net::icmp::IcmpErr<'_>
         dif: e.rx.ifindex,
     };
     let Some(s) = lookup(&net.udp, &k) else {
+        // Linux __udp4_lib_err: no socket for it
+        net.mib.icmp.inc(ICMP_MIB_INERRORS);
         return;
     };
     let Some((err, hard)) = e.errno(s.inet.pmtudisc()) else {

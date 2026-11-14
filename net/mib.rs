@@ -139,6 +139,14 @@ impl NetMib {
         self.icmpmsg[usize::from(ty)].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A socket's output route lookup failed with `e` (Linux udp,
+    /// ping and tcp_v4_connect: OutNoRoutes on -ENETUNREACH)
+    pub fn route_err(&self, e: &KernelError) {
+        if matches!(e, KernelError::NetworkUnreachable) {
+            self.ip.inc(IPSTATS_MIB_OUTNOROUTES);
+        }
+    }
+
     /// An IcmpMsg entry
     pub fn icmpmsg(&self, i: usize) -> u64 {
         self.icmpmsg[i].load(Ordering::Relaxed)

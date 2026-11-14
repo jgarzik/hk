@@ -161,7 +161,8 @@ impl PingSock {
         saddr: Ipv4Addr,
         oif: u32,
     ) -> Result<route::Rtable, KernelError> {
-        let rt = route::output(&self.sk.net, daddr, saddr, oif)?;
+        let rt = route::output(&self.sk.net, daddr, saddr, oif)
+            .inspect_err(|e| self.sk.net.mib.route_err(e))?;
         if rt.rtype == RouteType::Broadcast && !self.sk.flag(sf::BROADCAST) {
             return Err(KernelError::PermissionDenied);
         }
@@ -520,7 +521,7 @@ pub fn ping_rcv(net: &NetNamespace, skb: &SkBuff) {
     // skb_clone(GFP_ATOMIC) failure)
     if let Some(mut c) = skb.clone_gfp(Gfp::ATOMIC) {
         dgram::prepare(&mut c, info, 0);
-        s.rxq.enqueue(&s.sk, c);
+        let _ = s.rxq.enqueue(&s.sk, c);
     }
 }
 

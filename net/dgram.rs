@@ -43,6 +43,16 @@ pub fn now() -> i64 {
     crate::time::TIMEKEEPER.current_time().to_nanos() as i64
 }
 
+/// Why a datagram was not queued (Linux __udp_enqueue_schedule_skb's
+/// -ENOMEM / -ENOBUFS, which UDP counts apart)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueErr {
+    /// The receive buffer is full
+    RcvBuf,
+    /// No memory
+    NoMem,
+}
+
 /// A socket's receive queue, bounded by SO_RCVBUF
 pub struct RxQueue {
     q: SkbQueue,
@@ -69,10 +79,10 @@ impl RxQueue {
     /// rmem <= rcvbuf); drops are counted. The `Arc` around the skb is
     /// allocated GFP_ATOMIC before the lock (receive path); failing
     /// that, the datagram is dropped like a full queue's.
-    pub fn enqueue(&self, sk: &Sock, mut skb: SkBuff) {
+    pub fn enqueue(&self, sk: &Sock, mut skb: SkBuff) -> Result<(), QueueErr> {
         if self.rmem.load(Ordering::Acquire) > sk.rcvbuf() as usize {
             sk.drops.fetch_add(1, Ordering::Relaxed);
-            return;
+            return Err(QueueErr::RcvBuf);
         }
         skb.dropcount = sk.drops.load(Ordering::Relaxed);
         // No device reference in a socket queue (Linux: the cb keeps
@@ -84,11 +94,12 @@ impl RxQueue {
         let size = skb.truesize();
         let Ok(skb) = try_arc_gfp(skb, Gfp::ATOMIC) else {
             sk.drops.fetch_add(1, Ordering::Relaxed);
-            return;
+            return Err(QueueErr::NoMem);
         };
         self.rmem.fetch_add(size, Ordering::AcqRel);
         self.q.lock().push_back(skb);
         sk.data_ready();
+        Ok(())
     }
 
     pub fn readable(&self) -> bool {

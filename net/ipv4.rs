@@ -16,6 +16,7 @@ use crate::net::arp;
 use crate::net::ethernet::{self, ETH_ALEN, EtherType};
 use crate::net::inet::frag::Defrag;
 use crate::net::inet::route::{self, IpInput};
+use crate::net::mib::*;
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::net::tcp;
 use crate::net::udp;
@@ -310,13 +311,13 @@ pub fn pseudo_header_checksum(saddr: Ipv4Addr, daddr: Ipv4Addr, protocol: u8, le
 /// `skb.data()` starts at the IP header (eth_type_trans pulled the MAC
 /// header). The packet's namespace is its device's.
 pub fn ip_rcv(mut skb: Box<SkBuff>) {
-    let Some(ihl) = ip_check(&mut skb) else {
-        return;
-    };
     let Some(dev) = skb.dev.clone() else {
         return;
     };
     let Some(net) = dev.net() else {
+        return;
+    };
+    let Some(ihl) = ip_rcv_core(&net, &mut skb) else {
         return;
     };
     let (saddr, daddr) = {
@@ -331,10 +332,29 @@ pub fn ip_rcv(mut skb: Box<SkBuff>) {
     skb.ip_bcast = match route::input(&net, saddr, daddr, &dev) {
         IpInput::Local => false,
         IpInput::Broadcast => true,
+        IpInput::HostUnreach => {
+            // Linux ip_error on a host that does not forward
+            net.mib.ip.inc(IPSTATS_MIB_INADDRERRORS);
+            return;
+        }
         IpInput::Drop(_) => return,
     };
-    if !ip_options_ok(&skb.data()[IP_HLEN_MIN..ihl]) {
-        return;
+    if skb.ip_bcast {
+        // Linux ip_rcv_finish_core: RTN_BROADCAST input
+        net.mib.ip.upd_po(
+            IPSTATS_MIB_INBCASTPKTS,
+            IPSTATS_MIB_INBCASTOCTETS,
+            skb.len(),
+        );
+    }
+    match ip_options_check(&skb.data()[IP_HLEN_MIN..ihl]) {
+        Opts::Ok => {}
+        Opts::Bad => {
+            // Linux ip_rcv_options: ip_options_compile failed
+            net.mib.ip.inc(IPSTATS_MIB_INHDRERRORS);
+            return;
+        }
+        Opts::SourceRoute => return,
     }
     let fo = u16::from_be_bytes([skb.data()[6], skb.data()[7]]);
     if fo & 0x3fff == 0 {
@@ -349,23 +369,42 @@ pub fn ip_rcv(mut skb: Box<SkBuff>) {
 }
 
 /// Header validation (Linux ip_rcv_core): version, header length,
-/// checksum, total length; trims link-layer padding. Returns the
-/// header length.
-fn ip_check(skb: &mut SkBuff) -> Option<usize> {
+/// checksum, total length, counted as Linux does; trims link-layer
+/// padding. Returns the header length.
+fn ip_rcv_core(net: &NetNamespace, skb: &mut SkBuff) -> Option<usize> {
+    let ip = &net.mib.ip;
+    ip.upd_po(IPSTATS_MIB_INPKTS, IPSTATS_MIB_INOCTETS, skb.len());
     let h = skb.data();
-    if h.len() < IP_HLEN_MIN || h[0] >> 4 != 4 {
+    if h.len() < IP_HLEN_MIN || h[0] >> 4 != 4 || h[0] & 0x0f < 5 {
+        ip.inc(IPSTATS_MIB_INHDRERRORS);
         return None;
     }
+    // Linux: InNoECTPkts + the ECN field
+    ip.inc(IPSTATS_MIB_NOECTPKTS + usize::from(h[1] & 3));
     let ihl = ((h[0] & 0x0f) as usize) * 4;
-    if ihl < IP_HLEN_MIN || ihl > h.len() || !ip_check_checksum(&h[..ihl]) {
+    if ihl > h.len() {
+        ip.inc(IPSTATS_MIB_INHDRERRORS);
+        return None;
+    }
+    if !ip_check_checksum(&h[..ihl]) {
+        ip.inc(IPSTATS_MIB_CSUMERRORS);
+        ip.inc(IPSTATS_MIB_INHDRERRORS);
         return None;
     }
     let tot = u16::from_be_bytes([h[2], h[3]]) as usize;
-    if tot < ihl || tot > h.len() {
+    if tot > h.len() {
+        ip.inc(IPSTATS_MIB_INTRUNCATEDPKTS);
+        return None;
+    }
+    if tot < ihl {
+        ip.inc(IPSTATS_MIB_INHDRERRORS);
         return None;
     }
     let pad = h.len() - tot;
-    skb.trim(pad)?;
+    if skb.trim(pad).is_none() {
+        ip.inc(IPSTATS_MIB_INDISCARDS);
+        return None;
+    }
     Some(ihl)
 }
 
@@ -375,28 +414,39 @@ const IPOPT_NOOP: u8 = 1;
 const IPOPT_LSRR: u8 = 131;
 const IPOPT_SSRR: u8 = 137;
 
+/// What the options of a received packet allow (Linux ip_rcv_options)
+pub enum Opts {
+    Ok,
+    /// Malformed (ip_options_compile fails)
+    Bad,
+    /// Source routed: dropped (accept_source_route = 0)
+    SourceRoute,
+}
+
 /// Options are skipped, but must be well formed, and source-routed
 /// packets are dropped (Linux ip_options_compile + accept_source_route
 /// = 0)
-pub fn ip_options_ok(opt: &[u8]) -> bool {
+pub fn ip_options_check(opt: &[u8]) -> Opts {
     let mut i = 0;
+    let mut srr = false;
     while i < opt.len() {
         match opt[i] {
-            IPOPT_END => return true,
+            IPOPT_END => break,
             IPOPT_NOOP => i += 1,
             t => {
                 let Some(&l) = opt.get(i + 1) else {
-                    return false;
+                    return Opts::Bad;
                 };
                 let l = l as usize;
-                if l < 2 || i + l > opt.len() || t == IPOPT_LSRR || t == IPOPT_SSRR {
-                    return false;
+                if l < 2 || i + l > opt.len() {
+                    return Opts::Bad;
                 }
+                srr |= t == IPOPT_LSRR || t == IPOPT_SSRR;
                 i += l;
             }
         }
     }
-    true
+    if srr { Opts::SourceRoute } else { Opts::Ok }
 }
 
 /// A reassembled datagram as a received skb (device and link-layer
@@ -430,11 +480,20 @@ fn ip_local_deliver(mut skb: Box<SkBuff>) {
         return;
     };
     let raw = crate::net::raw::raw_deliver(&net, &skb);
+    // Linux ip_protocol_deliver_rcu: InDelivers for a protocol handler
+    // or raw socket that took it, else InUnknownProtos
+    let known = matches!(proto, IPPROTO_TCP | IPPROTO_UDP | IPPROTO_ICMP);
+    if known || raw {
+        net.mib.ip.inc(IPSTATS_MIB_INDELIVERS);
+    }
     match proto {
         IPPROTO_TCP => tcp::tcp_rcv(skb),
         IPPROTO_UDP => udp::udp_rcv(*skb),
         IPPROTO_ICMP => crate::net::icmp::icmp_rcv(*skb),
-        _ if !raw => crate::net::icmp::prot_unreach(&net, &skb),
+        _ if !raw => {
+            net.mib.ip.inc(IPSTATS_MIB_INUNKNOWNPROTOS);
+            crate::net::icmp::prot_unreach(&net, &skb);
+        }
         _ => {}
     }
 }
@@ -553,14 +612,22 @@ pub fn ip_send_rt(
     h[16..20].copy_from_slice(&rt.daddr.to_be_bytes());
     let c = ip_checksum(&h[..IP_HLEN_MIN]);
     h[10..12].copy_from_slice(&c.to_be_bytes());
+    if protocol == IPPROTO_ICMP
+        && let Some(&ty) = skb.data().get(IP_HLEN_MIN)
+    {
+        // Linux __ip_make_skb
+        net.mib.icmp_out_count(ty);
+    }
+    // Linux __ip_local_out
+    net.mib.ip.inc(IPSTATS_MIB_OUTREQUESTS);
     ip_output(net, rt, skb, saddr, mtu)
 }
 
 /// Send a packet with a complete IP header along `rt`, fragmenting it
-/// to `mtu` if needed (Linux ip_finish_output -> ip_fragment); `_net`
-/// is the sender's namespace (Linux counts IP MIB statistics in it)
+/// to `mtu` if needed (Linux ip_finish_output -> ip_fragment); `net`
+/// is the sender's namespace, where the IP MIB counts it
 pub fn ip_output(
-    _net: &NetNamespace,
+    net: &NetNamespace,
     rt: &route::Rtable,
     mut skb: Box<SkBuff>,
     saddr: Ipv4Addr,
@@ -570,12 +637,43 @@ pub fn ip_output(
     skb.saddr = Some(saddr);
     skb.daddr = Some(rt.daddr);
     if skb.len() <= mtu {
-        return neigh_output(&rt.dev, rt, rt.nexthop(), skb);
+        return ip_finish_output2(net, rt, skb);
     }
-    for f in fragment(&skb, mtu)? {
-        neigh_output(&rt.dev, rt, rt.nexthop(), f)?;
+    // Linux ip_do_fragment (slow path)
+    let ip = &net.mib.ip;
+    let frags = fragment(&skb, mtu).inspect_err(|_| ip.inc(IPSTATS_MIB_FRAGFAILS))?;
+    for f in frags {
+        ip_finish_output2(net, rt, f).inspect_err(|_| ip.inc(IPSTATS_MIB_FRAGFAILS))?;
+        ip.inc(IPSTATS_MIB_FRAGCREATES);
     }
+    ip.inc(IPSTATS_MIB_FRAGOKS);
     Ok(())
+}
+
+/// One packet or fragment to its next hop (Linux ip_finish_output2:
+/// OutTransmits and OutOctets after fragmenting)
+fn ip_finish_output2(
+    net: &NetNamespace,
+    rt: &route::Rtable,
+    skb: Box<SkBuff>,
+) -> Result<(), KernelError> {
+    use crate::net::inet::fib::RouteType;
+    let ip = &net.mib.ip;
+    match rt.rtype {
+        RouteType::Multicast => ip.upd_po(
+            IPSTATS_MIB_OUTMCASTPKTS,
+            IPSTATS_MIB_OUTMCASTOCTETS,
+            skb.len(),
+        ),
+        RouteType::Broadcast => ip.upd_po(
+            IPSTATS_MIB_OUTBCASTPKTS,
+            IPSTATS_MIB_OUTBCASTOCTETS,
+            skb.len(),
+        ),
+        _ => {}
+    }
+    ip.upd_po(IPSTATS_MIB_OUTPKTS, IPSTATS_MIB_OUTOCTETS, skb.len());
+    neigh_output(&rt.dev, rt, rt.nexthop(), skb)
 }
 
 /// Split an IP packet (no options are ever generated, so every fragment

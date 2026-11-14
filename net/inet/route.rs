@@ -408,6 +408,10 @@ pub enum IpInput {
     Local,
     /// Limited (255.255.255.255) or a local-table broadcast address
     Broadcast,
+    /// Not ours, and we do not forward (Linux no_route with
+    /// forwarding off: an RTN_UNREACHABLE dst, -EHOSTUNREACH, whose
+    /// ip_error counts InAddrErrors)
+    HostUnreach,
     /// Dropped (reason, for debugging)
     Drop(&'static str),
 }
@@ -469,7 +473,7 @@ pub fn classify(
     match addr_type(daddr) {
         RouteType::Local => IpInput::Local,
         RouteType::Broadcast => IpInput::Broadcast,
-        _ => IpInput::Drop("not for us (no forwarding)"),
+        _ => IpInput::HostUnreach,
     }
 }
 
@@ -504,10 +508,7 @@ mod tests {
 
     #[test]
     fn other_hosts_are_not_forwarded() {
-        assert!(matches!(
-            eth(ip(10, 0, 2, 3), ip(10, 0, 2, 16)),
-            IpInput::Drop(_)
-        ));
+        assert_eq!(eth(ip(10, 0, 2, 3), ip(10, 0, 2, 16)), IpInput::HostUnreach);
     }
 
     #[test]
