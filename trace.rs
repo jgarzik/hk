@@ -309,7 +309,10 @@ fn mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, Ke
             let sb = SuperBlock::alloc(t, &TRACEFS_SOPS, 0)?;
             sb.set_private(try_arc(kernfs::vfs::KfSuper { ns: 0 })?);
             let ri = kernfs::vfs::inode(&sb, root())?;
-            sb.set_root(try_arc(Dentry::new_root(ri, Arc::downgrade(&sb)))?);
+            sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
+                ri,
+                Arc::downgrade(&sb),
+            ))?);
             Ok(sb)
         },
     )
