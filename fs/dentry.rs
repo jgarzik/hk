@@ -38,10 +38,10 @@ use crate::util::list::{ListPtr, RefPtr};
 /// Dentry flags
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DentryFlags {
-    /// Mounts sitting on this dentry, in every namespace (Linux
-    /// DCACHE_MOUNTED, held while a struct mountpoint exists): a hint
-    /// for the walk; which mount covers it is the namespace's business
-    pub mounted: u32,
+    /// A mountpoint exists for it (Linux DCACHE_MOUNTED, set and
+    /// cleared with its struct mountpoint under MOUNT_LOCK): a hint for
+    /// the walk; which mount covers it is the namespace's business
+    pub mounted: bool,
     /// Dropped from its parent's children: deleted, or replaced by a
     /// rename (Linux d_unhashed)
     pub unhashed: bool,
@@ -544,13 +544,13 @@ impl Dentry {
 
     /// Some mount, in some namespace, sits on this dentry
     pub fn is_mountpoint(&self) -> bool {
-        self.d_lock.read().flags.mounted != 0
+        self.d_lock.read().flags.mounted
     }
 
-    /// Count a mount on (`+1`) or off (`-1`) this dentry
-    pub fn note_mounted(&self, delta: i32) {
-        let f = &mut self.d_lock.write().flags;
-        f.mounted = f.mounted.saturating_add_signed(delta);
+    /// Mark it a mountpoint or not (Linux d_set_mounted, clearing
+    /// DCACHE_MOUNTED); under MOUNT_LOCK, with its mountpoint
+    pub fn set_mounted(&self, on: bool) {
+        self.d_lock.write().flags.mounted = on;
     }
 
     /// Get the superblock this dentry belongs to
@@ -907,7 +907,7 @@ fn prune_one(parent: &DentryRef, d: &DentryRef) -> bool {
     let mut p = parent.d_lock.write();
     let di = d.d_lock.read();
     let unused =
-        DentryRef::count(d) == TREE_REFS + 1 && di.children.is_empty() && di.flags.mounted == 0;
+        DentryRef::count(d) == TREE_REFS + 1 && di.children.is_empty() && !di.flags.mounted;
     drop(di);
     if !unused {
         return false;

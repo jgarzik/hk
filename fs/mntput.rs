@@ -216,6 +216,12 @@ impl MountRef {
         Arc::downgrade(&this.arc())
     }
 
+    /// The shared `Arc`, another strong count (an entry of the mount
+    /// hash, which holds one)
+    pub(super) fn arc_of(this: &Self) -> Arc<Mount> {
+        Arc::clone(&this.arc())
+    }
+
     /// The mount's address (its identity)
     pub fn as_ptr(this: &Self) -> *const Mount {
         this.0.as_ptr()

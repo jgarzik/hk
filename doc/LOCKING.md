@@ -533,7 +533,7 @@ VFS locks (detailed order):
         ↓
     mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write, and
                    the tree's links in attach_mnt/detach_mnt; locking
-                   read in lookup_mnt, path_is_under, umount's
+                   read in legitimize, path_is_under, umount's
                    MNT_EXPIRE check and a raced d_path pass; its
                    sequence read lock-free by d_path and scoped walks)
         → SuperBlock.s_mounts (spin leaf: a new mount, a read-only
@@ -2691,9 +2691,10 @@ the one reaching zero sets `Mount.doomed` (Linux MNT_DOOMED). Links
 that must not keep a mount are `Weak` (`Mount.parent`, peer groups,
 `s_mounts`) and take a reference with `MountRef::try_get` (Linux
 legitimize_mnt: an add while in a namespace, else under MOUNT_LOCK's
-locking read, refused once doomed). No put of a mount out of its
-namespace under MOUNT_LOCK: `lookup_mnt` scans its submounts borrowed
-and takes a reference to the match only (Linux __lookup_mnt).
+locking read, refused once doomed). A mount an RCU walk reached
+borrowed (`lookup_mnt`, `choose_mountpoint`) gets its reference from
+`MountRef::legitimize` (Linux __legitimize_mnt). No put of a mount out
+of its namespace under MOUNT_LOCK.
 
 | Field | Type | Purpose |
 |-------|------|---------|
@@ -2704,7 +2705,7 @@ and takes a reference to the match only (Linux __lookup_mnt).
 | `Mount.mnt_pcp` | `util::percpu_alloc::PcpSlot` (a word per CPU, in that CPU's chunks) | `MountRef` count (Linux mnt_pcp's mnt_count), summed under `MOUNT_LOCK` write once out of its namespace |
 | `Mount.doomed` | `AtomicBool` | Last reference gone (Linux MNT_DOOMED), set under `MOUNT_LOCK` write by that put |
 | `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC/READONLY/LOCKED; every write under `MOUNT_LOCK` (remount, reconfigure, pivot_root's MNT_LOCKED), read lock-free (open, exec, statfs) |
-| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`: Linux attach_mnt and umount_tree under lock_mount_hash; with NAMESPACE_SEM write it owns `mnt_mounts`); under NAMESPACE_SEM and s_umount; under it only `SuperBlock.s_mounts`, RENAME_LOCK (a raced d_path pass, path_is_under's is_subdir), the borrowed `parent`/`mountpoint` reads of path_is_under, and in attach/detach the moved mount's `parent`/`mountpoint` and the mountpoint's `d_lock` (mount count), one at a time; in `lookup_mnt`'s locking read a child's `mountpoint` and then `d_lock`; nothing takes it under a Mount field lock. No mount or mountpoint is dropped under it (`make_rdonly` releases its references, `detach_mnt` the parent's reference to the mount and the mountpoint, after the unlock). The sequence is read lock-free by scoped walks (3.3 Path Traversal) |
+| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`: Linux attach_mnt and umount_tree under lock_mount_hash; with NAMESPACE_SEM write it owns `mnt_mounts`); under NAMESPACE_SEM and s_umount; under it only `SuperBlock.s_mounts`, RENAME_LOCK (a raced d_path pass, path_is_under's is_subdir), the borrowed `parent`/`mountpoint` reads of path_is_under, and in attach/detach the moved mount's `parent`/`mountpoint` and the mountpoint dentry's `d_lock` (DCACHE_MOUNTED), one at a time; it owns the mount and mountpoint hashes (below); `MountRef::legitimize`'s locking read takes nothing under it; nothing takes it under a Mount field lock. No mount, mountpoint or dentry is dropped under it (`make_rdonly` releases its references, `detach_mnt` the parent's reference to the mount, the mountpoint and its dentry after the unlock; the mount hash's reference goes through `put_rcu`). The sequence is read lock-free by `lookup_mnt`, `choose_mountpoint`, `d_path` and scoped walks (3.3 Path Traversal) |
 | `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
 | `Mount.mnt_ns` | `AtomicU64` | Id of the mount's namespace (`MntNamespace.id`, never reused), 0 for none, `MNT_NS_INTERNAL` for a kernel mount (Linux mnt_ns, MNT_NS_INTERNAL): written only under NAMESPACE_SEM write (commit_tree when a tree is grafted or propagated, the namespace root, a namespace copy; umount and `put_mnt_ns` clear it, a grace period before the tree's references are put), or once before a kernel mount is shared; read lock-free by a put's fast path under an RCU read guard, read by `check_mnt` under NAMESPACE_SEM; can_umount and remount read it first without, as Linux (umount repeats it under the lock) |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
@@ -2751,7 +2752,7 @@ m_start), which umount excludes. A put clears an MNT_EXPIRE mark
 5. MntNamespace.root (read/write)
 6. Mount.parent (write for set/clear)
 7. Mount.mountpoint (write for set/clear)
-8. Dentry.d_lock (DentryInner.flags: write for the mount count)
+8. Dentry.d_lock (DentryInner.flags: DCACHE_MOUNTED, with the mountpoint)
 ```
 MS_MOVE and pivot_root take the target's (put_old's) i_rwsem, then
 NAMESPACE_SEM; pivot_root's chroot_fs_refs runs after both are
@@ -2761,8 +2762,25 @@ umount writes the filesystem back after releasing NAMESPACE_SEM
 namespace_unlock). Mount ids come from `MNT_IDS` (`util::ida::Ida`,
 Linux mnt_id_ida: its IrqSpinlock leaf, the bitmap grown outside it;
 a mount's teardown frees its id) and
-`MNT_ID_UNIQUE` (atomic). Deviation: no global
-(parent, mountpoint) hash; crossing scans the current mount's children.
+`MNT_ID_UNIQUE` (atomic).
+
+**Mount and mountpoint hashes** (Linux mount_hashtable,
+mountpoint_hashtable; `mount::MountTables`, sized from RAM at boot by
+`mnt_hash_init`, Linux mnt_init): an attached mount is in the chain of
+(parent, mountpoint) (`Mount.mnt_hash`, a `util::rcuhlist` chain whose
+writers pass MOUNT_LOCK's `MntHash`: `attach_mnt` adds it, and
+`detach_mnt`, `put_mnt_ns` and a teardown's `unhang_children` take it
+out, all under MOUNT_LOCK write, before its `parent` or `mountpoint`
+changes; the chain's `Arc` is released a grace period later through
+`Mount.mnt_puts`). A dentry with mounts on it has one `Mountpoint`
+(Linux struct mountpoint: a reference to the dentry and `m_count`,
+the mounts attached there) in a bucket under MOUNT_LOCK (`LockedBy`
+its `MntHash`, a locking read or the write side); while it exists
+the dentry is marked mounted (`DentryFlags.mounted`, Linux
+DCACHE_MOUNTED, written under its d_lock inside MOUNT_LOCK). The
+mountpoint is allocated before MOUNT_LOCK (Linux get_mountpoint's
+kmalloc; attach runs under NAMESPACE_SEM write, so no other is made
+meanwhile) and put after it with its dentry (Linux ex_mountpoints).
 Propagation (`fs/pnode.rs`) runs entirely under NAMESPACE_SEM (write):
 peer groups live in `pnode::GROUPS` (sleeping `sync::Mutex`, inside
 NAMESPACE_SEM, as Linux keeps the mnt_share rings under namespace_sem;
@@ -2771,14 +2789,14 @@ mountinfo reads it under NAMESPACE_SEM read).
 
 **Lock Order for Path Traversal (follow_mount, lookup_mnt):**
 ```
-1. mount::MOUNT_LOCK (locking read, `read_excl`: the walk's current
-   mount's `mnt_mounts`; Linux walks the mount hash under RCU and the
-   sequence instead)
-2. child.mountpoint (read)
-3. Dentry.d_lock (DentryInner.inode: read)
+1. RCU read guard, MOUNT_LOCK's sequence sampled (lookup_mnt; a
+   legitimize that saw it move takes the locking read)
+2. child.parent, child.mountpoint (read, comparing addresses)
 ```
-The walk carries a Path{mnt, dentry}: crossing looks only at the
-current mount's children (Linux lookup_mnt); ".." at a mount root
+The walk carries a Path{mnt, dentry}: a dentry marked mounted is
+crossed with `lookup_mnt` (Linux lookup_mnt, __lookup_mnt: the mount
+hash chain of (mnt, dentry) walked under the guard, the entry found
+legitimized as below, repeated if a mount change raced); ".." at a mount root
 climbs with `choose_mountpoint` (Linux follow_dotdot): `Mount.parent`
 and `Mount.mountpoint` read under an RCU read guard (`up_rcu`) with
 MOUNT_LOCK's sequence sampled, then a reference to the mount found
