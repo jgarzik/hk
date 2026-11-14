@@ -19,7 +19,7 @@ use super::dac::{MAY_EXEC, cred, permission_as};
 use super::dentry::{Dentry, DentryRef};
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use super::inode::{Inode, Link};
-use super::mount::{MOUNT_LOCK, MountRef, follow_mount, is_path_reachable};
+use super::mount::{MOUNT_LOCK, MountRef, choose_mountpoint, follow_mount, is_path_reachable};
 use super::path_ref::Path;
 use crate::fs::syscall::PATH_MAX;
 use crate::ns::current_mnt_ns;
@@ -583,40 +583,38 @@ pub fn nd_root() -> Result<Path, KernelError> {
 }
 
 /// ".." from `p` (Linux follow_dotdot): the root stays (EXDEV beneath);
-/// at a mount's root, climb to its mountpoint (repeatedly, through
-/// stacked mounts; EXDEV for a no-xdev walk) and take that one's
-/// parent; a detached or namespace root stays like the root. Whatever
-/// is mounted on the result is crossed (EXDEV for a no-xdev walk).
+/// at a mount's root, climb to its mountpoint (`choose_mountpoint`:
+/// through mounts stacked on their parent's root; EXDEV for a no-xdev
+/// walk) and take that one's parent; a climb that meets the root, or a
+/// detached or namespace root, stays like the root. Whatever is mounted
+/// on the result is crossed, the root's included (EXDEV for a no-xdev
+/// walk).
 fn follow_dotdot(p: Path, root: &Path, f: LookupFlags) -> Result<Path, KernelError> {
+    // Where ".." stays put, it still lands on what is mounted there
+    // (Linux in_root, then step_into's handle_mounts)
     let in_root = |p: Path| {
         if f.beneath {
             Err(KernelError::CrossDevice)
         } else {
-            Ok(p)
+            step_mounts(p, f)
         }
     };
+    if p.same(root) {
+        return in_root(p);
+    }
     let mut p = p;
-    let mut climbed = false;
-    loop {
-        if p.same(root) {
+    if DentryRef::ptr_eq(&p.dentry, &p.mnt.root) {
+        let Some(up) = choose_mountpoint(&p.mnt, root) else {
             return in_root(p);
+        };
+        p = up;
+        if f.no_xdev {
+            return Err(KernelError::CrossDevice);
         }
-        if !DentryRef::ptr_eq(&p.dentry, &p.mnt.root) {
-            break;
-        }
-        match (p.mnt.get_parent(), p.mnt.get_mountpoint()) {
-            (Some(m), Some(mp)) => p = Path::new(m, mp),
-            _ => return in_root(p),
-        }
-        climbed = true;
     }
-    if climbed && f.no_xdev {
-        return Err(KernelError::CrossDevice);
-    }
-    match p.dentry.get_parent() {
-        Some(parent) => step_mounts(Path::new(p.mnt.clone(), parent), f),
-        None => Ok(p),
-    }
+    // A root dentry is its own parent (Linux dget_parent of IS_ROOT)
+    let parent = p.dentry.get_parent().unwrap_or_else(|| p.dentry.clone());
+    step_mounts(Path::new(p.mnt.clone(), parent), f)
 }
 
 /// Create the entry `p` names (Linux filename_create +

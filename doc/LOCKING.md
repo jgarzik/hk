@@ -2777,7 +2777,14 @@ mountinfo reads it under NAMESPACE_SEM read).
 ```
 The walk carries a Path{mnt, dentry}: crossing looks only at the
 current mount's children (Linux lookup_mnt); ".." at a mount root
-reads `Mount.parent` and `Mount.mountpoint` (follow_dotdot).
+climbs with `choose_mountpoint` (Linux follow_dotdot): `Mount.parent`
+and `Mount.mountpoint` read under an RCU read guard (`up_rcu`) with
+MOUNT_LOCK's sequence sampled, then a reference to the mount found
+(`MountRef::legitimize`, Linux __legitimize_mnt: an add, then the
+sequence; if it moved, MOUNT_LOCK's locking read decides whether the
+add came too late for a doomed mount) and to the mountpoint
+(`DentryRef::try_get`); a raced climb puts what it took after
+releasing the guard and repeats.
 
 A scoped walk (openat2 RESOLVE_BENEATH / RESOLVE_IN_ROOT, `namei::Nd`;
 Linux nd->m_seq, nd->r_seq) samples `MOUNT_LOCK`'s and `RENAME_LOCK`'s

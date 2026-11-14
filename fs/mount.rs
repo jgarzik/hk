@@ -1133,6 +1133,57 @@ fn graft(ns: &mut NsTree, t: MountRef, mp: &Path) {
     }
 }
 
+/// Where `m` is mounted, past mounts stacked on their parent's root,
+/// as a path holding references (Linux choose_mountpoint): None for a
+/// mount on no parent, or when the climb meets `root`. The climb runs
+/// under an RCU read guard and MOUNT_LOCK's sequence, and is repeated
+/// if a mount change raced it (legitimize_mnt).
+pub fn choose_mountpoint(m: &Mount, root: &Path) -> Option<Path> {
+    loop {
+        let g = crate::sync::rcu::read_lock();
+        let seq = MOUNT_LOCK.read_begin();
+        let Some((pm, pd)) = choose_mountpoint_rcu(m, root, &g) else {
+            if !MOUNT_LOCK.read_retry(seq) {
+                return None;
+            }
+            continue;
+        };
+        // The mountpoint is held while the child is hung there, which
+        // the unmoved sequence vouches for (Linux __legitimize_path)
+        let put = match MountRef::legitimize(pm, seq) {
+            Ok(mnt) => match DentryRef::try_get(pd) {
+                Some(d) => return Some(Path::new(mnt, d)),
+                None => Some(mnt),
+            },
+            Err(put) => put,
+        };
+        // Puts after the guard (Linux rcu_read_unlock; path_put)
+        drop(g);
+        drop(put);
+    }
+}
+
+/// One climb of [`choose_mountpoint`] (Linux choose_mountpoint_rcu)
+fn choose_mountpoint_rcu<'g>(
+    m: &'g Mount,
+    root: &Path,
+    g: &'g crate::sync::rcu::RcuReadGuard,
+) -> Option<(&'g Mount, &'g Dentry)> {
+    let mut m = m;
+    while let Some((p, mp)) = m.up_rcu(g) {
+        if core::ptr::eq(mp, DentryRef::as_ptr(&root.dentry))
+            && core::ptr::eq(p, MountRef::as_ptr(&root.mnt))
+        {
+            return None;
+        }
+        if !core::ptr::eq(mp, p.root_addr()) {
+            return Some((p, mp));
+        }
+        m = p;
+    }
+    None
+}
+
 /// `p` is at or below `root`, across mounts (Linux path_is_under:
 /// is_path_reachable under mount_lock's locking read, the mounts
 /// borrowed from it, then is_subdir, which reads RENAME_LOCK's

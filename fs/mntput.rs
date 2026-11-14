@@ -149,6 +149,36 @@ impl MountRef {
         // held; after the teardown, only memory goes
     }
 
+    /// A reference to `m`, reached under an RCU read guard with
+    /// MOUNT_LOCK's sequence `seq` sampled before (Linux
+    /// __legitimize_mnt): the add first, then the sequence. Unmoved, no
+    /// link to `m` changed since the sample, so the tree still holds its
+    /// reference and the add is counted. Moved: under MOUNT_LOCK, an add
+    /// to a doomed mount is taken back (`Err(None)`), else the caller
+    /// gets the reference to put, with the guard released, before it
+    /// retries (`Err(Some)`).
+    pub(super) fn legitimize(m: &Mount, seq: u32) -> Result<Self, Option<Self>> {
+        if MOUNT_LOCK.read_retry(seq) {
+            return Err(None);
+        }
+        m.pcp_add(1);
+        // Pairs with `put_slow`'s: its sum sees this add, or this sees
+        // the write section that took the tree's reference away
+        fence(Ordering::SeqCst);
+        let r = Self(NonNull::from(m));
+        if !MOUNT_LOCK.read_retry(seq) {
+            return Ok(r);
+        }
+        let _ml = MOUNT_LOCK.read_excl();
+        if m.doomed.load(Ordering::Acquire) {
+            // Its count reached zero without this add: never a reference
+            core::mem::forget(r);
+            m.pcp_add(-1);
+            return Err(None);
+        }
+        Err(Some(r))
+    }
+
     /// Another reference to a list entry (by [`MountRef::into_entry`])
     /// while it is on the list (the caller holds the lock that keeps it
     /// there), which holds one
