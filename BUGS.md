@@ -480,9 +480,10 @@ glibc's helper thread), and hk has no such path.
   by a non-leader changes nothing (Linux clears that process's
   signal->tty only).
 - **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
-  TIOCEXCL exclusivity, sending a break (TCSBRK 0), IXON/IXOFF flow
-  control, packet mode, ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT,
-  IUCLC/OLCUC, IMAXBEL, PARMRK and parity/break input handling.
+  TIOCEXCL exclusivity, sending a break (TCSBRK 0), packet mode,
+  ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT, IUCLC/OLCUC, IMAXBEL,
+  PARMRK and parity/break input handling, CRTSCTS (no modem
+  control: IXOFF throttles by STOP/START only).
 - **Serial ports:** ttyS1 is registered without probing COM2; only
   COM1 (and the PL011) take input.
 - **No virtual terminals:** the framebuffer and VGA consoles are not

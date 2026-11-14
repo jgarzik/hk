@@ -1,11 +1,14 @@
 //! N_TTY line discipline (Linux drivers/tty/n_tty.c), the only one
 //!
-//! Input (`receive_buf`, from the flip thread): ISTRIP/IGNCR/ICRNL/INLCR,
-//! ISIG signal characters, canonical line editing (ICANON: erase, kill,
-//! word erase, EOF) and echo. Completed lines and raw input sit in the
+//! Input (`receive_buf`, from the flip thread): ISTRIP, IXON/IXANY
+//! output flow control (STOP/START, also looked at ahead of a full read
+//! ring), ISIG signal characters, IGNCR/ICRNL/INLCR, canonical line
+//! editing (ICANON: erase, kill, word erase, EOF) and echo. Completed lines and raw input sit in the
 //! per-tty read ring, `Tty.ldata`; `read` copies them out (one line at
 //! a time in canonical mode, VMIN/VTIME otherwise) and sleeps on
-//! `Tty.read_wait`. Output (`write`) does OPOST/ONLCR.
+//! `Tty.read_wait`; under IXOFF the driver is throttled (STOP) as the
+//! ring nearly fills and unthrottled (START) once a read empties it.
+//! Output (`write`) does OPOST/ONLCR.
 //!
 //! Locking: `Tty.ldata` is a sleeping mutex (Linux termios_rwsem's
 //! role for the line discipline), thread context only: input echoes
@@ -65,6 +68,10 @@ pub struct NTtyData {
     /// ICANON as last set (Linux ldata->icanon): input, reads and
     /// polls use this, so a termios change is seen by all at once
     icanon: bool,
+    /// Bytes still in the flip buffer whose flow control characters
+    /// were acted on ahead (Linux lookahead_count): not again when
+    /// they come in
+    lookahead_count: usize,
 }
 
 impl NTtyData {
@@ -81,6 +88,7 @@ impl NTtyData {
             line: [0; LINE_MAX],
             line_len: 0,
             icanon: true,
+            lookahead_count: 0,
         }
     }
 
@@ -89,6 +97,17 @@ impl NTtyData {
         self.tail = self.head;
         self.canon_head = self.head;
         self.line_len = 0;
+        self.lookahead_count = 0;
+    }
+
+    /// Input a read can take (Linux chars_in_buffer): complete lines in
+    /// canonical mode
+    fn chars_in_buffer(&self) -> usize {
+        if self.icanon {
+            self.canon_head.wrapping_sub(self.tail)
+        } else {
+            self.cnt()
+        }
     }
 
     /// A complete line is queued (canonical mode)
@@ -325,7 +344,7 @@ pub(super) fn ldata(tty: &Tty) -> Ld<'_> {
 /// Write the queued echo to the driver as far as it takes it, under
 /// `output_lock` (Linux process_echoes -> __process_echoes: what does
 /// not fit stays queued for later)
-fn process_echoes(tty: &Tty, ld: &mut NTtyData) {
+pub(super) fn process_echoes(tty: &Tty, ld: &mut NTtyData) {
     if ld.echo_tail == ld.echo_head {
         return;
     }
@@ -363,12 +382,26 @@ pub fn receive_buf(tty: &Tty, bytes: &[u8]) -> usize {
     // termios_rwsem), so input never sees half a change
     let mut ld = ldata(tty);
     let t = tty.get_termios();
+    let closing = tty.closing.load(Ordering::Acquire);
     for &c in bytes {
         if !ld.room() {
             break;
         }
-        receive_char(tty, &mut ld, &t, c);
+        // Its flow control was done ahead (Linux __receive_buf's
+        // la_count)
+        let la = ld.lookahead_count > 0;
+        if la {
+            ld.lookahead_count -= 1;
+        }
+        if closing {
+            receive_char_closing(tty, &mut ld, &t, c, la);
+        } else {
+            receive_char(tty, &mut ld, &t, c, la);
+        }
         taken += 1;
+    }
+    if closing {
+        return taken;
     }
     // Linux flush_echoes at the end of the input
     process_echoes(tty, &mut ld);
@@ -376,7 +409,92 @@ pub fn receive_buf(tty: &Tty, bytes: &[u8]) -> usize {
     if t.c_lflag & ICANON == 0 && ld.cnt() > 0 {
         input_ready(tty, &mut ld);
     }
+    check_throttle(tty, &ld);
     taken
+}
+
+/// Below this much room the driver is throttled, at or below this much
+/// input it is unthrottled (Linux TTY_THRESHOLD_THROTTLE,
+/// TTY_THRESHOLD_UNTHROTTLE)
+const TTY_THRESHOLD_THROTTLE: usize = 128;
+const TTY_THRESHOLD_UNTHROTTLE: usize = 128;
+
+/// Throttle the driver once the read ring is nearly full (Linux
+/// n_tty_check_throttle: not while a canonical line is being edited
+/// with none complete), `ldata` held
+fn check_throttle(tty: &Tty, ld: &NTtyData) {
+    if ld.icanon && ld.canon_head == ld.tail {
+        return;
+    }
+    if READ_BUF_SIZE - ld.cnt() >= TTY_THRESHOLD_THROTTLE {
+        return;
+    }
+    tty.throttle();
+}
+
+/// Unthrottle the driver once a read has made room (Linux
+/// n_tty_check_unthrottle), `ldata` held
+fn check_unthrottle(tty: &Tty, ld: &NTtyData) {
+    if ld.chars_in_buffer() > TTY_THRESHOLD_UNTHROTTLE {
+        return;
+    }
+    tty.unthrottle();
+}
+
+/// The flow control characters of input the line discipline has no
+/// room for yet, acted on now (Linux n_tty_lookahead_flow_ctrl, from
+/// the flip buffer's lookahead_bufs): a STOP or START behind a full
+/// read ring still works
+pub fn lookahead_flow_ctrl(tty: &Tty, bytes: &[u8]) {
+    let mut ld = ldata(tty);
+    ld.lookahead_count += bytes.len();
+    let t = tty.get_termios();
+    if t.c_iflag & IXON == 0 {
+        return;
+    }
+    for &c in bytes {
+        flow_ctrl(tty, &mut ld, &t, c, false);
+    }
+}
+
+/// A START or STOP character under IXON (Linux
+/// n_tty_receive_char_flow_ctrl): output restarts (pending echo goes
+/// out) or stops; true if `c` was one (consumed, done ahead if `la`)
+fn flow_ctrl(tty: &Tty, ld: &mut NTtyData, t: &Termios, c: u8, la: bool) -> bool {
+    if c != t.c_cc[VSTART] && c != t.c_cc[VSTOP] {
+        return false;
+    }
+    if la {
+        return true;
+    }
+    if c == t.c_cc[VSTART] {
+        tty.start_tty();
+        process_echoes(tty, ld);
+    } else {
+        tty.stop_tty();
+    }
+    true
+}
+
+/// IXANY: any input restarts output stopped by STOP (not by TCOOFF)
+/// (Linux n_tty_receive_char)
+fn ixany(tty: &Tty, ld: &mut NTtyData, t: &Termios) {
+    if t.c_iflag & IXON != 0 && t.c_iflag & IXANY != 0 && tty.stopped_by_input() {
+        tty.start_tty();
+        process_echoes(tty, ld);
+    }
+}
+
+/// Input during a last close's drain: only flow control (Linux
+/// n_tty_receive_char_closing)
+fn receive_char_closing(tty: &Tty, ld: &mut NTtyData, t: &Termios, c: u8, la: bool) {
+    let c = if t.c_iflag & ISTRIP != 0 { c & 0x7f } else { c };
+    if t.c_iflag & IXON == 0 || flow_ctrl(tty, ld, t, c, la) {
+        return;
+    }
+    if [VINTR, VQUIT, VSUSP].iter().all(|&i| t.c_cc[i] != c) {
+        ixany(tty, ld, t);
+    }
 }
 
 /// Input became readable: publish the heads, then SIGIO POLL_IN and
@@ -390,9 +508,8 @@ fn input_ready(tty: &Tty, ld: &mut Ld<'_>) {
     ));
 }
 
-/// Input mapping (ISTRIP, IGNCR, ICRNL, INLCR); None drops the byte
+/// Input mapping (IGNCR, ICRNL, INLCR); None drops the byte
 fn map_input(c: u8, t: &Termios) -> Option<u8> {
-    let c = if t.c_iflag & ISTRIP != 0 { c & 0x7f } else { c };
     match c {
         b'\r' if t.c_iflag & IGNCR != 0 => None,
         b'\r' if t.c_iflag & ICRNL != 0 => Some(b'\n'),
@@ -422,21 +539,36 @@ fn isig(tty: &Tty, ld: &mut NTtyData, t: &Termios, sig: crate::signal::Signal) {
     }
 }
 
-fn receive_char(tty: &Tty, ld: &mut Ld<'_>, t: &Termios, c: u8) {
-    let Some(c) = map_input(c, t) else {
+/// One input byte (Linux n_tty_receive_buf_standard ->
+/// n_tty_receive_char_special / n_tty_receive_char): ISTRIP, then flow
+/// control (IXON), signal characters (ISIG) and IXANY on the byte as
+/// received, then the CR/NL mapping, editing and echo
+fn receive_char(tty: &Tty, ld: &mut Ld<'_>, t: &Termios, c: u8, la: bool) {
+    let c = if t.c_iflag & ISTRIP != 0 { c & 0x7f } else { c };
+    if t.c_iflag & IXON != 0 && flow_ctrl(tty, ld, t, c, la) {
         return;
-    };
+    }
     if t.c_lflag & ISIG != 0
         && let Some(sig) = signal_char(c, t)
     {
-        // Linux n_tty_receive_signal_char: the signal, then its echo
+        // Linux n_tty_receive_signal_char: the signal, output restarted
+        // under IXON, then its echo
         isig(tty, ld, t, sig);
+        if t.c_iflag & IXON != 0 {
+            tty.start_tty();
+        }
         if t.c_lflag & ECHO != 0 {
             echo_char(ld, c, t);
+            commit_echoes(tty, ld);
+        } else {
+            process_echoes(tty, ld);
         }
-        commit_echoes(tty, ld);
         return;
     }
+    ixany(tty, ld, t);
+    let Some(c) = map_input(c, t) else {
+        return;
+    };
     if t.c_lflag & ICANON != 0 {
         let canon_head = ld.canon_head;
         canon_char(ld, t, c);
@@ -554,7 +686,13 @@ const KBUF: usize = 64;
 fn copy_out(tty: &Tty, to: &mut IovDest<'_>) -> Option<Got> {
     let mut kbuf = [0u8; KBUF];
     let want = to.len().min(KBUF);
-    let (k, canon, end) = ldata(tty).copy(&mut kbuf[..want])?;
+    let (k, canon, end) = {
+        let mut ld = ldata(tty);
+        let r = ld.copy(&mut kbuf[..want]);
+        // Linux n_tty_read: n_tty_check_unthrottle after each copy
+        check_unthrottle(tty, &ld);
+        r?
+    };
     let n = to.copy_to(&kbuf[..k]).unwrap_or(0);
     Some(Got {
         n,
@@ -867,5 +1005,117 @@ mod tests {
             "CR repeated: {:?}",
             log
         );
+    }
+
+    /// A driver recording stop/start and flow control characters
+    struct Flow {
+        stopped: AtomicBool,
+        xchars: Mutex<Vec<u8>>,
+    }
+
+    impl TtyDriver for Flow {
+        fn write(&self, _tty: &Tty, data: &[u8]) -> Result<usize, KernelError> {
+            Ok(data.len())
+        }
+        fn stop(&self) {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+        fn start(&self) {
+            self.stopped.store(false, Ordering::Relaxed);
+        }
+        fn send_xchar(&self, _tty: &Tty, ch: u8) {
+            self.xchars.lock().unwrap().push(ch);
+        }
+        fn throttle(&self, tty: &Tty) {
+            if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, true) {
+                self.send_xchar(tty, ch);
+            }
+        }
+        fn unthrottle(&self, tty: &Tty) {
+            if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, false) {
+                self.send_xchar(tty, ch);
+            }
+        }
+        fn console_write(&self, _data: &[u8]) {}
+    }
+
+    static FLOW: Flow = Flow {
+        stopped: AtomicBool::new(false),
+        xchars: Mutex::new(Vec::new()),
+    };
+    static FTTY: Tty = Tty::new("flow", DevId::new(0, 1), &FLOW);
+
+    const XON: u8 = 0x11;
+    const XOFF: u8 = 0x13;
+
+    fn stopped() -> bool {
+        FLOW.stopped.load(Ordering::Relaxed)
+    }
+
+    fn queued() -> usize {
+        ldata(&FTTY).cnt()
+    }
+
+    /// IXON: STOP stops output, START restarts it, neither is input;
+    /// IXANY restarts on any byte; TCOOFF holds against both; clearing
+    /// IXON restarts; a lookahead STOP is not acted on twice; IXOFF
+    /// sends STOP once the read ring is nearly full and START once a
+    /// read has emptied it (Linux n_tty_receive_char_flow_ctrl,
+    /// n_tty_check_throttle, n_tty_check_unthrottle)
+    #[test]
+    fn flow_control() {
+        FTTY.update_termios(|t| t.c_lflag &= !(ICANON | ECHO | ISIG));
+        assert_eq!(receive_buf(&FTTY, &[XOFF]), 1);
+        assert!(stopped());
+        assert_eq!(queued(), 0);
+        receive_buf(&FTTY, b"a");
+        assert!(stopped(), "restarted without IXANY");
+        receive_buf(&FTTY, &[XON]);
+        assert!(!stopped());
+        assert_eq!(queued(), 1);
+        // IXANY
+        FTTY.update_termios(|t| t.c_iflag |= IXANY);
+        receive_buf(&FTTY, &[XOFF]);
+        assert!(stopped());
+        receive_buf(&FTTY, b"b");
+        assert!(!stopped());
+        assert_eq!(queued(), 2);
+        // TCOOFF holds output whatever comes in
+        FTTY.tcooff();
+        receive_buf(&FTTY, &[XON]);
+        receive_buf(&FTTY, b"c");
+        assert!(stopped());
+        FTTY.tcoon();
+        assert!(!stopped());
+        // IXON cleared while stopped: output restarts
+        receive_buf(&FTTY, &[XOFF]);
+        assert!(stopped());
+        FTTY.update_termios(|t| t.c_iflag &= !(IXON | IXANY));
+        assert!(!stopped());
+        receive_buf(&FTTY, &[XOFF]);
+        assert!(!stopped(), "STOP acted on without IXON");
+        FTTY.update_termios(|t| t.c_iflag |= IXON);
+        // Done ahead: not again when it comes in
+        lookahead_flow_ctrl(&FTTY, &[XOFF]);
+        assert!(stopped());
+        FTTY.start_tty();
+        let n = queued();
+        receive_buf(&FTTY, &[XOFF]);
+        assert!(!stopped(), "a lookahead STOP acted on twice");
+        assert_eq!(queued(), n);
+        // IXOFF
+        FTTY.flush_input();
+        FTTY.update_termios(|t| t.c_iflag |= IXOFF);
+        let fill = [b'x'; READ_BUF_SIZE - TTY_THRESHOLD_THROTTLE];
+        receive_buf(&FTTY, &fill);
+        assert!(FLOW.xchars.lock().unwrap().is_empty());
+        receive_buf(&FTTY, b"y");
+        receive_buf(&FTTY, b"z");
+        assert_eq!(&*FLOW.xchars.lock().unwrap(), &[XOFF]);
+        let mut ld = ldata(&FTTY);
+        ld.reset();
+        check_unthrottle(&FTTY, &ld);
+        drop(ld);
+        assert_eq!(&*FLOW.xchars.lock().unwrap(), &[XOFF, XON]);
     }
 }

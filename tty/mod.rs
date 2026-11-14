@@ -139,6 +139,18 @@ pub trait TtyDriver: Send + Sync {
     /// or not (Linux tty_operations.send_xchar)
     fn send_xchar(&self, tty: &Tty, ch: u8);
 
+    /// The line discipline is nearly full: ask the sender to pause
+    /// (Linux tty_operations.throttle; a UART sends STOP under IXOFF)
+    fn throttle(&self, tty: &Tty) {
+        let _ = tty;
+    }
+
+    /// There is room again (Linux tty_operations.unthrottle; a UART
+    /// sends START under IXOFF)
+    fn unthrottle(&self, tty: &Tty) {
+        let _ = tty;
+    }
+
     /// Wait until the transmitter is empty
     fn flush(&self) {}
 
@@ -282,6 +294,12 @@ pub struct Tty {
     fasync: FasyncList,
     /// Output flow control (Linux tty->flow, under flow.lock)
     flow: Mutex<Flow>,
+    /// The driver is throttled (Linux TTY_THROTTLED under
+    /// throttle_mutex)
+    throttle: crate::sync::Mutex<bool>,
+    /// A last close is draining output: input only does flow control
+    /// (Linux tty->closing)
+    closing: AtomicBool,
     /// A write could not finish with O_ASYNC files listening: the next
     /// wakeup sends them SIGIO (Linux TTY_DO_WRITE_WAKEUP)
     do_write_wakeup: AtomicBool,
@@ -318,6 +336,8 @@ impl Tty {
                 stopped: false,
                 tco_stopped: false,
             }),
+            throttle: crate::sync::Mutex::new(false),
+            closing: AtomicBool::new(false),
             do_write_wakeup: AtomicBool::new(false),
             wakeup_due: AtomicBool::new(false),
             count: crate::sync::Mutex::new(0),
@@ -369,6 +389,49 @@ impl Tty {
         f.stopped = false;
         self.driver.start();
         true
+    }
+
+    /// Stop output (Linux stop_tty): a STOP character under IXON
+    pub(crate) fn stop_tty(&self) {
+        let mut f = self.flow.lock();
+        self.stop_locked(&mut f);
+    }
+
+    /// Restart output unless TCOOFF holds it, waking writers (Linux
+    /// start_tty)
+    pub(crate) fn start_tty(&self) {
+        let wake = {
+            let mut f = self.flow.lock();
+            self.start_locked(&mut f)
+        };
+        if wake {
+            self.write_wakeup();
+        }
+    }
+
+    /// Output is stopped, not by TCOOFF (IXANY's test: Linux
+    /// flow.stopped && !flow.tco_stopped)
+    pub(crate) fn stopped_by_input(&self) -> bool {
+        let f = self.flow.lock();
+        f.stopped && !f.tco_stopped
+    }
+
+    /// Throttle the driver once (Linux tty_throttle_safe)
+    pub(crate) fn throttle(&self) {
+        let mut th = self.throttle.lock();
+        if !*th {
+            *th = true;
+            self.driver.throttle(self);
+        }
+    }
+
+    /// Unthrottle a throttled driver (Linux tty_unthrottle_safe)
+    pub(crate) fn unthrottle(&self) {
+        let mut th = self.throttle.lock();
+        if *th {
+            *th = false;
+            self.driver.unthrottle(self);
+        }
     }
 
     /// TCOOFF (Linux n_tty_ioctl_helper's TCXONC): output stops until
@@ -482,12 +545,22 @@ impl Tty {
     /// pollers are woken (VMIN, VTIME or ICANON may make input readable)
     pub fn update_termios(&self, f: impl FnOnce(&mut Termios)) {
         let mut ld = n_tty::ldata(self);
-        let canon = {
+        let (canon, ixon_off) = {
             let mut t = self.termios.lock();
+            let old = t.c_iflag;
             f(&mut t);
-            t.c_lflag & termios::ICANON != 0
+            (
+                t.c_lflag & termios::ICANON != 0,
+                old & IXON != 0 && t.c_iflag & IXON == 0,
+            )
         };
         ld.set_icanon(canon);
+        // Linux n_tty_set_termios: output stopped by STOP restarts once
+        // IXON is cleared (not output stopped by TCOOFF)
+        if ixon_off && !self.flow.lock().tco_stopped {
+            self.start_tty();
+            n_tty::process_echoes(self, &mut ld);
+        }
         drop(ld);
         self.read_wait.wake_all();
     }
@@ -602,6 +675,8 @@ impl Tty {
         };
         self.do_write_wakeup.store(false, Ordering::Release);
         self.wakeup_due.store(false, Ordering::Release);
+        *self.throttle.lock() = false;
+        self.closing.store(false, Ordering::Release);
     }
 
     /// The last close (Linux tty_port_close_start, tty_port_shutdown):
@@ -609,6 +684,7 @@ impl Tty {
     /// closing_wait (none: not at all; 0: as long as it takes), input is dropped, then the port shuts down unless
     /// it is a console
     fn close_port(&self) {
+        self.closing.store(true, Ordering::Release);
         let tco = self.flow.lock().tco_stopped;
         if tco {
             self.flush_output();

@@ -133,6 +133,16 @@ pub struct UartCfg {
     pub fifosize: i32,
 }
 
+/// The flow control character a UART sends to throttle (`stop`) or
+/// unthrottle its sender: STOP or START under IXOFF (Linux
+/// uart_throttle, uart_unthrottle: UPSTAT_AUTOXOFF not done by the
+/// hardware, so by uart_send_xchar)
+pub fn ixoff_char(tty: &super::Tty, stop: bool) -> Option<u8> {
+    use super::termios::{IXOFF, VSTART, VSTOP};
+    let t = tty.get_termios();
+    (t.c_iflag & IXOFF != 0).then(|| t.c_cc[if stop { VSTOP } else { VSTART }])
+}
+
 /// The highest interrupt number + 1 (Linux irq_get_nr_irqs)
 fn nr_irqs() -> i64 {
     use crate::arch::{CurrentArch, IrqChipOps};

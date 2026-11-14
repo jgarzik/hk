@@ -380,6 +380,20 @@ impl TtyDriver for SerialTty {
         }
     }
 
+    /// Linux uart_throttle
+    fn throttle(&self, tty: &Tty) {
+        if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, true) {
+            self.send_xchar(tty, ch);
+        }
+    }
+
+    /// Linux uart_unthrottle
+    fn unthrottle(&self, tty: &Tty) {
+        if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, false) {
+            self.send_xchar(tty, ch);
+        }
+    }
+
     fn flush(&self) {
         SerialTty::flush(self);
     }
