@@ -23,6 +23,9 @@
 //!   a send found none (SOCKWQ_ASYNC_NOSPACE)
 //! - SIGIO_TCP: a listener gets POLL_IN for a connection, a nonblocking
 //!   connect POLL_OUT once established, the accepted socket POLL_IN
+//! - SIGIO_TCP_DISCONNECT: tcp_disconnect reports an error (POLL_ERR,
+//!   si_band POLLERR): a listener's shutdown(SHUT_RD) with SO_ERROR 0,
+//!   a connection's connect(AF_UNSPEC) with SO_ERROR ECONNRESET
 //! - SIGIO_TTY: FIOASYNC on a tty sets O_ASYNC and, with no owner,
 //!   makes the caller's process (or the tty's foreground group) owner
 //! - SIGIO_NOTIFY: an inotify file keeps O_ASYNC (fsnotify_fasync), a
@@ -48,6 +51,7 @@ use hk_syscall::{
     sys_setsid, sys_socket, sys_socketpair, sys_splice, sys_tkill, sys_unlink, sys_wait4,
     sys_write,
 };
+use hk_syscall::{SHUT_RD, sys_getsockopt, sys_shutdown};
 use hk_syscall::{sys_kill, sys_ptrace};
 
 const F_GETFL: i32 = 3;
@@ -86,6 +90,7 @@ pub fn run_tests() {
     test_socket_sigio();
     test_sock_out();
     test_tcp();
+    test_tcp_disconnect();
     test_tty();
     test_notify();
     test_no_fasync();
@@ -682,6 +687,97 @@ fn test_tcp() {
             (b"listener", lis as i64),
             (b"connect", conn as i64),
             (b"data", data as i64),
+        ],
+    );
+}
+
+const SOL_SOCKET: i32 = 1;
+const SO_ERROR: i32 = 4;
+const AF_UNSPEC: u16 = 0;
+const POLL_ERR: i32 = 4;
+const POLLERR: i64 = 8;
+const ECONNRESET: i64 = 104;
+
+/// SO_ERROR of `fd` (taken), or -errno
+fn so_error(fd: i32) -> i64 {
+    let mut v = 0i32;
+    let mut n = 4u32;
+    let r = sys_getsockopt(
+        fd,
+        SOL_SOCKET,
+        SO_ERROR,
+        &mut v as *mut i32 as *mut u8,
+        &mut n,
+    );
+    if r < 0 { r } else { v as i64 }
+}
+
+/// The next SIGRT within 2 s as (si_code, si_band, si_fd), or (-errno,
+/// 0, 0)
+fn next_rt() -> (i64, i64, i64) {
+    let mut info = SigInfo::zeroed();
+    let r = wait_sig(bit(SIGRT), 2, &mut info);
+    if r != SIGRT as i64 {
+        return (r, 0, 0);
+    }
+    // si_band (a long) shares si_pid's offset; si_fd is si_status's
+    let band = info.si_pid as i64;
+    (info.si_code as i64, band, info.si_status as i64)
+}
+
+/// Linux tcp_disconnect ends with sk_error_report whatever the state:
+/// SIGIO POLL_ERR, the pending error ECONNRESET for a connection
+fn test_tcp_disconnect() {
+    let old = block(bit(SIGRT) | bit(SIGIO));
+    let l = sys_socket(AF_INET, SOCK_STREAM, 0) as i32;
+    let mut a = SockAddrIn::new(AF_INET as u16, 0, htonl(make_ipv4(127, 0, 0, 1)));
+    let alen = core::mem::size_of::<SockAddrIn>() as u32;
+    sys_bind(l, &a as *const SockAddrIn as *const u8, alen);
+    sys_listen(l, 4);
+    let mut n = alen;
+    sys_getsockname(l, &mut a as *mut SockAddrIn as *mut u8, &mut n);
+    let c = sys_socket(AF_INET, SOCK_STREAM, 0) as i32;
+    let conn = sys_connect(c, &a as *const SockAddrIn as *const u8, alen);
+    let s = sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
+    arm_rt(l);
+    arm_rt(c);
+    drain_sig(SIGRT);
+    let shut = sys_shutdown(l, SHUT_RD);
+    let (lcode, lband, lfd) = next_rt();
+    let lerr = so_error(l);
+    let none = SockAddrIn::new(AF_UNSPEC, 0, 0);
+    let unspec = sys_connect(c, &none as *const SockAddrIn as *const u8, alen);
+    let (ccode, cband, cfd) = next_rt();
+    let cerr = so_error(c);
+    let extra = take(SIGRT);
+    sys_close(s as u64);
+    sys_close(c as u64);
+    sys_close(l as u64);
+    drain_sig(SIGRT);
+    setmask(old);
+    let ok = conn == 0
+        && s >= 0
+        && shut == 0
+        && (lcode, lband, lfd) == (POLL_ERR as i64, POLLERR, l as i64)
+        && lerr == 0
+        && unspec == 0
+        && (ccode, cband, cfd) == (POLL_ERR as i64, POLLERR, c as i64)
+        && cerr == ECONNRESET
+        && extra == EAGAIN;
+    report(
+        b"SIGIO_TCP_DISCONNECT",
+        ok,
+        &[
+            (b"conn", conn),
+            (b"shut", shut),
+            (b"lcode", lcode),
+            (b"lband", lband),
+            (b"lerr", lerr),
+            (b"unspec", unspec),
+            (b"ccode", ccode),
+            (b"cband", cband),
+            (b"cerr", cerr),
+            (b"extra", extra),
         ],
     );
 }
