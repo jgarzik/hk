@@ -1225,12 +1225,19 @@ pub fn task_fatal_pending(t: &crate::task::Task) -> bool {
 
 /// Whether `sig` would be discarded on arrival (Linux sig_ignored): its
 /// handler is SIG_IGN, or SIG_DFL with an "ignore" default (SIGCHLD,
-/// SIGURG, SIGWINCH, and SIGCONT, which hk does not act on), and it is not
-/// blocked (a blocked signal stays queued: the handler may change), nor
-/// awaited by sigtimedwait (blocked before it: real_blocked)
-fn sig_ignored(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: Signal) -> bool {
+/// SIGURG, SIGWINCH, and SIGCONT once its prepare is done), and it is
+/// not blocked (a blocked signal stays queued: the handler may change),
+/// awaited by sigtimedwait (blocked before it: real_blocked), nor for a
+/// `traced` task, whose tracer sees it first
+fn sig_ignored(
+    state: &TaskSignalState,
+    sighand: Option<&Arc<SigHand>>,
+    sig: Signal,
+    traced: bool,
+) -> bool {
     let held = state.blocked.contains(sig) || state.real_blocked.contains(sig);
-    if held || sig.kernel_only() {
+    // A tracer sees even an ignored signal, but SIGKILL (never ignored)
+    if held || traced || sig.kernel_only() {
         return false;
     }
     sighand.is_some_and(|h| h.get_action(sig).ignores(sig))
@@ -1392,6 +1399,8 @@ struct Target {
     /// A thread of the global init (Linux is_global_init)
     global: bool,
     group_exit: bool,
+    /// Traced: it ignores no signal but SIGKILL (Linux sig_ignored)
+    traced: bool,
     /// The receiver's real uid's counters (Linux task_ucounts)
     ucounts: crate::task::UcountsRef,
     limit: u64,
@@ -1421,6 +1430,7 @@ fn target_in(table: &crate::task::percpu::GlobalTaskTable, t: &Task) -> Option<T
         kthread: v.task.has_flag(crate::task::pf::KTHREAD),
         global: v.task.pid == 1,
         group_exit: sig.is_some_and(|s| matches!(s.group_exit(), GroupExit::Exit(_))),
+        traced: v.ptrace() != 0,
         ucounts: v.ucounts(),
         limit: limit.map_or(0, |r| r.rlim_cur),
         sighand: v.sighand().cloned(),
@@ -1511,6 +1521,7 @@ fn send_task_in(
         init,
         info: &info,
         ty,
+        traced: tg.traced,
         entry,
     };
     // Job control's process-wide effects, whether or not the signal is
@@ -1558,6 +1569,8 @@ struct Send<'a> {
     init: bool,
     info: &'a SendInfo,
     ty: PidType,
+    /// The receiver is traced (`Target::traced`)
+    traced: bool,
     /// What its queue entry is made of, if it gets one (SIGKILL needs
     /// none)
     entry: Option<EntryOf<'a>>,
@@ -1652,7 +1665,8 @@ fn drops(
     if to.ty == PidType::Pid && t.has_flag(crate::task::pf::EXITING) {
         return true;
     }
-    if sig_ignored(state, sighand, sig) || (to.init && init_ignores(state, sighand, sig)) {
+    if sig_ignored(state, sighand, sig, to.traced) || (to.init && init_ignores(state, sighand, sig))
+    {
         return true;
     }
     match to.ty {
@@ -2284,7 +2298,7 @@ pub fn send_timer_sigqueue(
         if exiting && ty == PidType::Pid {
             return Err(false);
         }
-        if sig_ignored(state, sighand, sig) {
+        if sig_ignored(state, sighand, sig, tg.traced) {
             return Err(true);
         }
         let wants = !state.blocked.contains(sig)
