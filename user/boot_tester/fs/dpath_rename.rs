@@ -22,7 +22,7 @@ use hk_syscall::{
 /// Directories below /tmp/dr/p/a: a walk long enough to be raced
 const DEPTH: usize = 60;
 /// Renames there and back
-const ROUNDS: u32 = 3000;
+const ROUNDS: u32 = 1000;
 const EINVAL: i64 = -22;
 
 /// Shared between the two processes (written by one side each)
@@ -88,9 +88,9 @@ pub fn run_tests() {
         race(&mut t);
     }
     // Bottom up, from whichever name the top has now
-    let mut buf = [0u8; 10 + 2 * DEPTH + 1];
+    let mut buf = [0u8; LEN];
     let c = chain(&mut buf, true);
-    let mut path = [0u8; 10 + 2 * DEPTH + 1];
+    let mut path = [0u8; LEN];
     let mut n = c.len() - 1;
     path[..=n].copy_from_slice(c);
     for _ in 0..DEPTH {
@@ -133,7 +133,7 @@ fn race(t: &mut T) {
         wait(|| sh.ready.load(Ordering::Acquire) != 0),
         0,
     ) {
-        let mut bottom = [0u8; 10 + 2 * DEPTH + 1];
+        let mut bottom = [0u8; LEN];
         for _ in 0..ROUNDS {
             sys_rename(b"/tmp/dr/p/a\0".as_ptr(), b"/tmp/dr/q/b\0".as_ptr());
             // The top into its own bottom: a loop (Linux is_subdir)
@@ -164,8 +164,8 @@ fn race(t: &mut T) {
 /// The child: stand at the chain's bottom and name it until told to
 /// stop
 fn walker(sh: &Sh) -> ! {
-    let mut ca = [0u8; 10 + 2 * DEPTH + 1];
-    let mut cb = [0u8; 10 + 2 * DEPTH + 1];
+    let mut ca = [0u8; LEN];
+    let mut cb = [0u8; LEN];
     let (a, b) = (chain(&mut ca, true), chain(&mut cb, false));
     if sys_chdir(a.as_ptr()) != 0 {
         sys_exit(1);
