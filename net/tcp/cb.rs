@@ -331,7 +331,7 @@ pub mod wake {
     /// With STATE: the peer's FIN arrived (Linux tcp_fin: SIGIO POLL_IN,
     /// POLL_HUP once both directions are shut)
     pub const FIN: u8 = 16;
-    /// An error was posted under the lock (SIGIO POLL_ERR after it)
+    /// An error was set under the lock (Linux sk_error_report)
     pub const ERR: u8 = 32;
 }
 

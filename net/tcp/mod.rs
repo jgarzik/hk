@@ -74,7 +74,7 @@ use self::output::Tuple;
 use self::table::Ent;
 use self::timer::now_ms;
 use self::timewait::TimeWait;
-use crate::io::fasync::{POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT};
+use crate::io::fasync::{POLL_HUP, POLL_IN, POLL_OUT};
 use crate::io::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
@@ -583,14 +583,14 @@ impl TcpSock {
 
     /// Apply `out` under the lock (Linux transmits and sets sk_err /
     /// sk_shutdown under the socket lock): publish the shutdown bits and
-    /// the error (reported at once), then transmit to `t`. Returns the
-    /// wakeups still to make.
+    /// the error (reported with the wakeups), then transmit to `t`.
+    /// Returns the wakeups still to make.
     fn emit(&self, out: &mut Out, t: Option<Tuple>) -> u8 {
         if out.shut != 0 {
             self.sk.set_shutdown(out.shut);
         }
         if let Some(e) = out.err {
-            self.sk.post_err(e);
+            self.sk.store_err(e as u32);
         }
         if let Some(t) = t {
             send_segs(&self.sk.net, &t, out, self.inet.params(), self.oif());
@@ -644,15 +644,17 @@ impl TcpSock {
     /// The wakeups `w` (`cb::wake`) asked for, each of them, in Linux's
     /// order within one segment: an establishing state change before the
     /// data it carried (tcp_finish_connect, then tcp_data_queue), the
-    /// data before the FIN behind it (tcp_data_queue, then tcp_fin)
+    /// data before the FIN behind it (tcp_data_queue, then tcp_fin); an
+    /// error is reported after the close's state change (Linux
+    /// tcp_done_with_error: tcp_done, then sk_error_report)
     fn wake(&self, w: u8) {
-        if w & cb::wake::ERR != 0 {
-            self.sk.wake_async(WakeHow::Io, POLL_ERR);
-        }
         let fin = w & cb::wake::FIN != 0;
         if w & cb::wake::STATE != 0 && !fin {
             self.sk.state_change();
             self.state_async(w);
+        }
+        if w & cb::wake::ERR != 0 {
+            self.sk.error_report();
         }
         if w & cb::wake::DATA != 0 {
             self.sk.data_ready();

@@ -244,13 +244,6 @@ impl Sock {
         self.err.load(Ordering::Acquire) != 0
     }
 
-    /// Record an error: waiters wake now, the caller sends its SIGIO
-    /// (`wake_async(Io, POLL_ERR)`) with its other wakeups
-    pub fn post_err(&self, e: KernelError) {
-        self.err.store(e as i32, Ordering::Release);
-        self.wq.wake_poll(u32::from(POLLERR));
-    }
-
     /// Set the pending error without a wakeup (callers report later)
     pub fn store_err(&self, errno: u32) {
         self.err.store(errno as i32, Ordering::Release);
