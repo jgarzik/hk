@@ -555,9 +555,10 @@ VFS locks (detailed order):
     mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write, and
                    the tree's links in attach_mnt/detach_mnt; across
                    all of umount_tree, propagate_umount included, and
-                   do_umount's propagate_mount_busy; locking read in
-                   legitimize, path_is_under, umount's MNT_EXPIRE
-                   check and a raced d_path pass; its sequence read
+                   do_umount's propagate_mount_busy, and its
+                   MNT_EXPIRE check before NAMESPACE_SEM; locking
+                   read in legitimize, path_is_under and a raced
+                   d_path pass; its sequence read
                    lock-free by d_path and scoped walks)
         → SuperBlock.s_mounts (spin leaf: a new mount, a read-only
                    remount's walk)
@@ -2880,11 +2881,13 @@ in `rcuc/N` (1.4.2) and only releases memory and the mount's
 
 **Busy:** as Linux do_umount (propagate_mount_busy, do_refcount_check),
 umount sums the count under NAMESPACE_SEM write and MOUNT_LOCK write,
-held on into umount_tree (MNT_EXPIRE's check: its locking read): a
+held on into umount_tree (MNT_EXPIRE's check: MOUNT_LOCK write alone,
+before NAMESPACE_SEM, as Linux): a
 mount with submounts or more than its caller's and the tree's
 references (two), or a mount the propagation would take along with
 more than its tree's one (`propagate_mount_busy`'s chain_busy, Linux
-7.4), is EBUSY, unless MNT_DETACH; MNT_EXPIRE needs exactly two. An
+7.4), is EBUSY, unless MNT_DETACH; MNT_EXPIRE needs no submount and
+exactly two. An
 open file, a task's root or cwd, any held path counts. /proc mount
 lists hold their references only under NAMESPACE_SEM read (Linux
 m_start), which umount excludes. A put clears an MNT_EXPIRE mark

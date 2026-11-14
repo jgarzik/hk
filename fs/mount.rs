@@ -1591,8 +1591,8 @@ const UMOUNT_PROPAGATE: u32 = 2;
 /// the namespace at once, busy or not: open files keep working, the
 /// filesystem goes with its last user. Otherwise a mount with
 /// submounts or users is EBUSY, MNT_FORCE too. MNT_EXPIRE (not with
-/// MNT_FORCE or MNT_DETACH, not the root) only marks an unmarked mount
-/// (EAGAIN).
+/// MNT_FORCE or MNT_DETACH, not the root) is EBUSY for a mount with
+/// submounts or users, else only marks an unmarked mount (EAGAIN).
 pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
     use umount_flags::{MNT_DETACH, MNT_EXPIRE, MNT_FORCE};
     // Linux can_umount, optimistic; repeated under NAMESPACE_SEM
@@ -1606,11 +1606,12 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         if is_root || flags & (MNT_FORCE | MNT_DETACH) != 0 {
             return Err(KernelError::InvalidArgument);
         }
-        // Busy first (Linux: mnt_get_count != 2 under lock_mount_hash),
-        // then the mark
+        // Busy first: a submount, or references beyond the caller's and
+        // the parent's (Linux: under lock_mount_hash, before
+        // namespace_lock), then the mark
         let busy = {
-            let _ml = MOUNT_LOCK.read_excl();
-            mount.mnt_get_count() != UMOUNT_REFS
+            let ml = MOUNT_LOCK.write();
+            mount.has_children(&*ml) || mount.mnt_get_count() != UMOUNT_REFS
         };
         if busy {
             return Err(KernelError::Busy);
