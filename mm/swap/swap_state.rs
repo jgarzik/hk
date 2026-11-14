@@ -21,7 +21,7 @@ use core::sync::atomic::Ordering;
 
 use super::swap_entry::SwapEntry;
 use super::swapfile::{
-    SwapInfo, get_swap_info, swap_count, swap_read_page, swapcache_clear, swapcache_prepare,
+    SwapInfo, get_swap_device, swap_count, swap_read_page, swapcache_clear, swapcache_prepare,
 };
 use crate::FRAME_ALLOCATOR;
 use crate::mm::fault::VmFault;
@@ -31,7 +31,7 @@ use crate::util::error::KernelError;
 /// The swap-cache page of `e`, with a reference (Linux
 /// swap_cache_get_folio)
 pub fn lookup(e: SwapEntry) -> Option<u64> {
-    let si = get_swap_info(e.swap_type())?;
+    let si = get_swap_device(e)?;
     let cache = si.cache.lock();
     let page = cache.load(e.offset());
     (page != 0 && FRAME_ALLOCATOR.incref(page)).then_some(page)
@@ -47,7 +47,7 @@ fn holds(phys: u64, e: SwapEntry) -> bool {
 /// already counts SWAP_HAS_CACHE (Linux add_to_swap_cache); the cache
 /// takes a page reference. False if out of memory for index nodes.
 pub fn add(e: SwapEntry, phys: u64) -> bool {
-    let (Some(si), Some(pg)) = (get_swap_info(e.swap_type()), phys_to_page(phys)) else {
+    let (Some(si), Some(pg)) = (get_swap_device(e), phys_to_page(phys)) else {
         return false;
     };
     if !FRAME_ALLOCATOR.incref(phys) {
@@ -78,7 +78,7 @@ fn unhash(pg: &crate::mm::page::Page) {
 /// delete_from_swap_cache): its SWAP_HAS_CACHE count and the cache's
 /// page reference go
 pub fn delete(e: SwapEntry, phys: u64) {
-    if let Some(si) = get_swap_info(e.swap_type()) {
+    if let Some(si) = get_swap_device(e) {
         let old = si.cache.lock().erase(e.offset());
         debug_assert_eq!(old, phys);
         si.cached.fetch_sub(1, Ordering::Relaxed);
@@ -96,7 +96,7 @@ pub fn delete(e: SwapEntry, phys: u64) {
 /// cache lock, so no lookup can take a reference meanwhile). The caller
 /// frees the frozen page. False if someone else holds a reference.
 pub fn delete_frozen(e: SwapEntry, phys: u64, expected: u32) -> bool {
-    let (Some(si), Some(pg)) = (get_swap_info(e.swap_type()), phys_to_page(phys)) else {
+    let (Some(si), Some(pg)) = (get_swap_device(e), phys_to_page(phys)) else {
         return false;
     };
     {
