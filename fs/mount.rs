@@ -745,23 +745,37 @@ impl Mount {
     /// own view of the mount hierarchy. A submount's copy keeps
     /// MNT_LOCKED, the root's does not (Linux copy_tree); a copy for
     /// another user namespace is locked whole (lock_mnt_tree).
-    pub fn clone_tree(root: &MountRef, ns: u64, slave: bool) -> (MountRef, MountMap) {
+    pub fn clone_tree(
+        root: &MountRef,
+        ns: u64,
+        slave: bool,
+    ) -> Result<(MountRef, MountMap), KernelError> {
         let flag = if slave { super::pnode::CL_SLAVE } else { 0 };
         let mut g = namespace_lock();
+        // A mount namespace file is left out with what is under it
+        // (copy_tree without CL_COPY_MNT_NS_FILE), EPERM for a locked
+        // one: what it hides would show
+        let ns_file = |m: &Mount| super::pseudo::nsfs::is_mnt_ns_file(&m.root);
+        if walk(root, &*g).any(|m| ns_file(&m) && m.flags() & MNT_LOCKED != 0) {
+            return Err(KernelError::NotPermitted);
+        }
         let new_root = root.copy(&mut g, ns, flag);
         let mut map = alloc::vec![(root.clone(), new_root.clone())];
         copy_below(&mut g, root, &new_root, |g, o| {
+            if ns_file(o) {
+                return None;
+            }
             let c = o.copy(g, ns, flag);
             if o.flags() & MNT_LOCKED != 0 {
                 c.mark(MNT_LOCKED, true);
             }
             map.push((o.clone(), c.clone()));
-            c
+            Some(c)
         });
         if slave {
             lock_mnt_tree(&g, &new_root);
         }
-        (new_root, map)
+        Ok((new_root, map))
     }
 }
 
@@ -864,12 +878,13 @@ impl<S: Stable> Iterator for Walk<'_, S> {
 /// Copies of the mounts below `src` hung on `top`, a copy of `src`, at
 /// the same places and in the same shape (Linux copy_tree's next_mnt
 /// walk, its source and copy cursors climbing together); `copy` makes
-/// each one. Under NAMESPACE_SEM write.
+/// each one, or None to leave it out with what is under it (Linux
+/// skip_mnt_tree). Under NAMESPACE_SEM write.
 pub(super) fn copy_below(
     ns: &mut NsTree,
     src: &MountRef,
     top: &MountRef,
-    mut copy: impl FnMut(&mut NsTree, &MountRef) -> MountRef,
+    mut copy: impl FnMut(&mut NsTree, &MountRef) -> Option<MountRef>,
 ) {
     let (mut p, mut q) = (src.clone(), top.clone());
     let mut next = next_mnt(src, src, &*ns);
@@ -885,7 +900,15 @@ pub(super) fn copy_below(
             };
             (p, q) = (pp, qp);
         }
-        let c = copy(ns, &s);
+        let Some(c) = copy(ns, &s) else {
+            // Past its last descendant (Linux skip_mnt_tree)
+            let mut last = s;
+            while let Some(k) = last.kids(&*ns).last() {
+                last = k;
+            }
+            next = next_mnt(&last, src, &*ns);
+            continue;
+        };
         attach_mnt(ns, c.clone(), &q, mp);
         (p, q) = (s, c);
         next = next_mnt(&p, src, &*ns);
@@ -1315,14 +1338,36 @@ pub(super) struct CopyEnt {
     at: DentryRef,
 }
 
+/// `d` is a mount namespace file of a namespace no newer than the
+/// caller's (Linux mnt_ns_loop): mounting it in the caller's namespace
+/// could make a reference loop (a namespace whose tree holds itself)
+pub fn mnt_ns_loop(d: &Dentry) -> bool {
+    super::pseudo::nsfs::mnt_ns_from_dentry(d)
+        .is_some_and(|m| crate::ns::current_mnt_ns().id >= m.id)
+}
+
+/// No mount of the tree at `m` is a namespace file that could make a
+/// loop (Linux check_for_nsfs_mounts)
+fn check_for_nsfs_mounts(ns: &NsTree, m: &MountRef) -> bool {
+    !walk(m, ns).any(|t| mnt_ns_loop(&t.root))
+}
+
 /// What copy_tree copies of `m` at `root`, parents first: the mounts
 /// below `root`; an unbindable submount is left out with whatever is
-/// under it, EPERM if it is also locked (it hides what is under it)
+/// under it, EPERM if it is also locked (it hides what is under it).
+/// Without `ns_files` (Linux CL_COPY_MNT_NS_FILE) a mount namespace
+/// file is not copied: EINVAL at the top, a submount left out with
+/// what is under it, EPERM if it is locked.
 pub(super) fn copy_plan(
     ns: &NsTree,
     m: &MountRef,
     root: &DentryRef,
+    ns_files: bool,
 ) -> Result<Vec<CopyEnt>, KernelError> {
+    let is_ns_file = |d: &Dentry| !ns_files && super::pseudo::nsfs::is_mnt_ns_file(d);
+    if is_ns_file(root) {
+        return Err(KernelError::InvalidArgument);
+    }
     let mut plan = alloc::vec![CopyEnt {
         src: m.clone(),
         parent: 0,
@@ -1338,7 +1383,7 @@ pub(super) fn copy_plan(
             if i == 0 && !super::is_subdir(&mp, root) {
                 continue;
             }
-            if c.is_unbindable() {
+            if c.is_unbindable() || is_ns_file(&c.root) {
                 if c.flags() & MNT_LOCKED != 0 {
                     return Err(KernelError::NotPermitted);
                 }
@@ -1424,13 +1469,18 @@ fn may_copy_tree(p: &Path) -> bool {
 }
 
 /// Bind `old` (with its submounts if `rec`) on `mp` (Linux do_loopback,
-/// __do_loopback and graft_tree), in Linux's order: the target must be
+/// __do_loopback and graft_tree), in Linux's order: a mount namespace
+/// file that could make a loop is refused (EINVAL); the target must be
 /// in the caller's namespace, the source bindable and in it too or a
 /// namespace file (EINVAL), a lone bind must not uncover a locked
 /// submount (EINVAL), a recursive one not leave out a locked
-/// unbindable one (EPERM); a directory goes only on a directory and a
+/// unbindable one (EPERM) nor copy a mount namespace file that could
+/// make a loop (EINVAL); a directory goes only on a directory and a
 /// file on a file (ENOTDIR)
 pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> {
+    if mnt_ns_loop(&old.dentry) {
+        return Err(KernelError::InvalidArgument);
+    }
     let mut l = lock_mount(mp)?;
     let (ns, mp): (&mut NsTree, _) = (&mut l.ns, &l.at);
     if !check_mnt(&mp.mnt) || old.mnt.is_unbindable() || !may_copy_tree(old) {
@@ -1440,7 +1490,11 @@ pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> 
         return Err(KernelError::InvalidArgument);
     }
     let plan = if rec {
-        copy_plan(ns, &old.mnt, &old.dentry)?
+        let plan = copy_plan(ns, &old.mnt, &old.dentry, true)?;
+        if plan[1..].iter().any(|e| mnt_ns_loop(&e.src.root)) {
+            return Err(KernelError::InvalidArgument);
+        }
+        plan
     } else {
         alloc::vec![CopyEnt {
             src: old.mnt.clone(),
@@ -1881,7 +1935,8 @@ fn graft(ns: &mut NsTree, t: MountRef, at: &Path) -> Result<(), KernelError> {
     let dest = get_mountpoint(&at.dentry);
     let shared = super::pnode::is_shared(ns, &at.mnt);
     let ids = if shared {
-        super::pnode::invent_group_ids(ns, &source, true)
+        may_propagate(ns, &source, at)
+            .and_then(|()| super::pnode::invent_group_ids(ns, &source, true))
     } else {
         Ok(())
     };
@@ -1911,6 +1966,17 @@ fn graft(ns: &mut NsTree, t: MountRef, at: &Path) -> Result<(), KernelError> {
     }
     unpin_both(root, dest);
     Ok(())
+}
+
+/// The tree at `t` may be copied where a mount at `at` propagates
+/// (Linux propagate_mnt's copy_tree without CL_COPY_MNT_NS_FILE): if
+/// any copy is made, its top is no mount namespace file (EINVAL) and
+/// no locked submount is one (EPERM); what is not copied is left out
+fn may_propagate(ns: &NsTree, t: &MountRef, at: &Path) -> Result<(), KernelError> {
+    if !super::pnode::propagates(ns, &at.mnt, &at.dentry) {
+        return Ok(());
+    }
+    copy_plan(ns, t, &t.root, false).map(drop)
 }
 
 /// Let go of graft's pins, after MOUNT_LOCK what they leave
@@ -2090,7 +2156,9 @@ fn lock_mount(p: &Path) -> Result<LockedMp, KernelError> {
 /// a directory goes only on a directory (EINVAL); then, in
 /// Linux's order, `old` in the caller's namespace, attached, unlocked,
 /// not under a shared mount, and the target in the namespace too
-/// (EINVAL), and not into its own subtree (ELOOP)
+/// (EINVAL), holding no mount namespace file that could make a loop and
+/// not into its own subtree (ELOOP); a mount namespace file does not
+/// propagate (EINVAL)
 pub fn do_move(old: &Path, mp: &Path) -> Result<(), KernelError> {
     if !DentryRef::ptr_eq(&old.dentry, &old.mnt.root) {
         return Err(KernelError::InvalidArgument);
@@ -2115,12 +2183,16 @@ pub fn do_move(old: &Path, mp: &Path) -> Result<(), KernelError> {
     if shared(&mp.mnt) && walk(&old.mnt, &*ns).any(|m| m.is_unbindable()) {
         return Err(KernelError::InvalidArgument);
     }
-    if is_path_reachable(mp, old) {
+    // Nor a mount namespace file that could make a loop, nor into its
+    // own subtree (ELOOP)
+    if !check_for_nsfs_mounts(ns, &old.mnt) || is_path_reachable(mp, old) {
         return Err(KernelError::TooManySymlinks);
     }
-    // Peer groups before anything moves (Linux attach_recursive_mnt's
-    // invent_group_ids precedes the detach), so the graft cannot fail
+    // What propagation refuses, and peer groups, before anything moves
+    // (Linux attach_recursive_mnt's propagate_mnt and invent_group_ids
+    // precede the detach), so the graft cannot fail
     if super::pnode::is_shared(ns, &mp.mnt) {
+        may_propagate(ns, &old.mnt, mp)?;
         super::pnode::invent_group_ids(ns, &old.mnt, true)?;
     }
     // It has a parent (checked above): it moves with its tree reference
@@ -2430,7 +2502,7 @@ mod tests {
         let c = hang(&mut ns, &top);
         c.mark(MNT_LOCKED, true);
         let g = hang(&mut ns, &c);
-        let plan = copy_plan(&ns, &top, &top.root).unwrap();
+        let plan = copy_plan(&ns, &top, &top.root, true).unwrap();
         let t = copy_tree(&mut ns, &plan, 0);
         assert!(!locked(&t));
         let kids: Vec<_> = t.kids(&*ns).collect();
@@ -2449,10 +2521,10 @@ mod tests {
         let top = mnt();
         let c = hang(&mut ns, &top);
         c.set_unbindable(true);
-        let plan = copy_plan(&ns, &top, &top.root).unwrap();
+        let plan = copy_plan(&ns, &top, &top.root, true).unwrap();
         assert_eq!(plan.len(), 1);
         c.mark(MNT_LOCKED, true);
-        let r = copy_plan(&ns, &top, &top.root);
+        let r = copy_plan(&ns, &top, &top.root, true);
         assert!(matches!(r, Err(KernelError::NotPermitted)));
     }
 

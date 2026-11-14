@@ -607,13 +607,40 @@ pub(super) fn propagate_mnt(
     list
 }
 
+/// A mount at `d` on the shared mount `dest` is copied somewhere by
+/// [`propagate_mnt`]: some peer or slave it reaches shows `d` (the
+/// first need_secondary hit of its walk, before any copy)
+pub(super) fn propagates(ns: &NsTree, dest: &MountRef, d: &DentryRef) -> bool {
+    if !is_shared(ns, dest) {
+        return false;
+    }
+    let dest_p = MountRef::as_ptr(dest);
+    let mut m = Some(dest_p);
+    while let Some(mp) = m {
+        let mut n = if mp == dest_p { next_peer(ns, mp) } else { mp };
+        while n != dest_p {
+            if need_secondary(ns, n, d) {
+                return true;
+            }
+            n = next_peer(ns, n);
+            if n == mp {
+                break;
+            }
+        }
+        m = next_group(ns, mp, dest_p);
+    }
+    false
+}
+
 /// Linux copy_tree(copy, copy->mnt.mnt_root, ty) for propagate_mnt
 fn copy_prop(ns: &mut NsTree, copy: &MountRef, ty: u32) -> MountRef {
     // A tree being attached holds no unbindable mount (a recursive
     // bind leaves them out, MS_MOVE refuses them under a shared
-    // mount), nor do its copies: no EPERM here
-    let plan = copy_plan(ns, copy, &copy.root)
-        .unwrap_or_else(|_| unreachable!("pnode: a locked unbindable mount in a propagated tree"));
+    // mount), nor do its copies, and graft checked its mount namespace
+    // files (may_propagate): no error here
+    let plan = copy_plan(ns, copy, &copy.root, false).unwrap_or_else(|_| {
+        unreachable!("pnode: a propagated tree that graft's may_propagate refused")
+    });
     copy_tree(ns, &plan, ty)
 }
 

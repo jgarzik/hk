@@ -1,5 +1,6 @@
 //! Namespace file (nsfs) tests
 
+pub mod mntns;
 pub mod nsfs;
 
 use hk_syscall::{Stat, sys_exit, sys_fork, sys_wait4};
@@ -97,4 +98,5 @@ pub fn in_child(f: fn() -> u8) -> i64 {
 
 pub fn run_tests() {
     nsfs::run_tests();
+    mntns::run_tests();
 }

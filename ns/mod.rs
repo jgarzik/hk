@@ -194,7 +194,7 @@ impl MntNamespace {
         let slave = !Arc::ptr_eq(user_ns, &self.user_ns);
         let old_root = self.get_root();
         if let Some(old_root) = old_root {
-            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id, slave);
+            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id, slave)?;
             *new_ns.root.write() = Some(new_root);
             if let Some(fs) = fs {
                 fs.repoint(&map);
