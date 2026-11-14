@@ -944,8 +944,9 @@ fn retarget(t: &Task, which: SigSet) {
     }
 }
 
-/// The current thread starts its exit: group signals it would have
-/// taken go to another thread (Linux exit_signals)
+/// The current thread starts its exit: PF_EXITING set under its group
+/// lock and Task.sig ([`stop::exit_participate`]), then group signals
+/// it would have taken go to another thread (Linux exit_signals)
 #[inline(never)]
 pub fn exit_signals() {
     let me = crate::task::percpu::current();

@@ -2924,11 +2924,6 @@ fn io_thread_name(out: &mut [u8; 16], tid: Tid) {
     }
 }
 
-/// Mark the current task exiting (Linux PF_EXITING)
-fn set_exiting() {
-    current().set_flag(crate::task::pf::EXITING);
-}
-
 /// The current task is exiting (Linux current->flags & PF_EXITING)
 pub fn current_exiting() -> bool {
     current().has_flag(crate::task::pf::EXITING)
@@ -3341,9 +3336,9 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // callbacks as it waits)
         crate::io::io_uring::task_cancel(false);
         crate::task::task_work::task_work_run();
-        // Linux exit_signals sets PF_EXITING first, then hands the
-        // group signals this thread would have taken to another
-        set_exiting();
+        // PF_EXITING, set under the group lock and Task.sig, then the
+        // group signals this thread would have taken go to another
+        // (Linux exit_signals)
         crate::signal::exit_signals();
 
         // Exactly one thread, the one taking the group's live count to
