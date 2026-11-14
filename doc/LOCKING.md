@@ -2743,6 +2743,7 @@ of its namespace under MOUNT_LOCK.
 | `Mount.mnt_parent` | `AtomicPtr<Mount>` (a `Weak::into_raw`) | Parent mount (Linux mnt_parent; no reference: `get_parent` takes one with `try_get_mnt`): no lock of its own, written under NAMESPACE_SEM write and `MOUNT_LOCK` write (`attach_mnt`'s mnt_set_mountpoint, `detach_mnt`, `put_mnt_ns`, a teardown's `unhang_children`), read under either (`parent_in`, `get_parent`, `up`), or under an RCU read guard checked by MOUNT_LOCK's sequence (`up_rcu`, `__lookup_mnt`) |
 | `Mount.mnt_mountpoint` | `AtomicPtr<Dentry>` | Where it is mounted (Linux mnt_mountpoint): no reference, the dentry pinned by its `Mountpoint` (m_dentry) while set; set and cleared with `mnt_parent`, or for a mount already unhung cleared under MOUNT_LOCK's locking read just before its mountpoint is put (`put_unhung`); `get_mountpoint` takes a reference under an RCU read guard (`DentryRef::try_get`) |
 | `Mount.mnt_mp` | `AtomicPtr<Mountpoint>` | Its mountpoint (Linux mnt_mp), which counts it: set and cleared with `mnt_mountpoint` (`set_mountpoint`, `take_mountpoint`), read under NAMESPACE_SEM or MOUNT_LOCK while the mount has a parent (`mp_in`: copy_tree attaches a copy on its source's, pivot_root pins the old root's) |
+| `Mount.overmount` | `AtomicPtr<Mount>` | The mount hung on its root (Linux overmount), no reference: set by `make_visible`, cleared when that mount leaves (`take_parent`, `mnt_change_mountpoint`), all under NAMESPACE_SEM write and `MOUNT_LOCK` write; read under either (`topmost_overmount`: graft's tucking, `where_to_mount` under MOUNT_LOCK's locking read) |
 | `Mount.mnt_mounts` | `LockedByEither<OwnedList>` (no lock of its own) | Submounts, each entry a reference to the submount (`MountRef::into_entry`; Linux mnt_mounts, linked through `Mount.mnt_child`): changed only under NAMESPACE_SEM write and `MOUNT_LOCK` both (`attach_mnt`, `detach_mnt`: `&mut NsTree` and `&mut MntHash`), read under either (`Stable`: `&NsTree` from a NAMESPACE_SEM guard, `&MntHash` from `MOUNT_LOCK.read_excl`). Walks step with `next_mnt` (Linux next_mnt: first submount, else the next sibling of the nearest mount up to the walk's root that has one), so no list is copied and no stack is kept |
 | `Mount.mnt_pcp` | `util::percpu_alloc::PcpSlot` (a word per CPU, in that CPU's chunks) | `MountRef` count (Linux mnt_pcp's mnt_count), summed under `MOUNT_LOCK` write once out of its namespace |
 | `Mount.doomed` | `AtomicBool` | Last reference gone (Linux MNT_DOOMED), set under `MOUNT_LOCK` write by that put |
@@ -2795,8 +2796,11 @@ m_start), which umount excludes. A put clears an MNT_EXPIRE mark
 5. MntNamespace.root (read/write)
 6. Dentry.d_lock (DentryInner.flags: DCACHE_MOUNTED, with the mountpoint)
 ```
-MS_MOVE and pivot_root take the target's (put_old's) i_rwsem, then
-NAMESPACE_SEM; pivot_root's chroot_fs_refs runs after both are
+Every mount, bind, MS_MOVE and pivot_root locks its target with
+`lock_mount` (Linux do_lock_mount): where to mount (`where_to_mount`:
+the root of the topmost mount stacked on the path, under MOUNT_LOCK's
+locking read), then that dentry's i_rwsem, then NAMESPACE_SEM, then
+`where_to_mount` again, all released and repeated if it changed; pivot_root's chroot_fs_refs runs after both are
 released (TASKLIST read to collect the tasks, then each FsStruct.inner).
 umount writes the filesystem back after releasing NAMESPACE_SEM
 (writeback takes inode locks; Linux syncs in deactivate_super after
@@ -2826,6 +2830,13 @@ its lookup (Linux get_mountpoint: one may come, or go with an unhung
 mount's put, meanwhile); one left out of the hash, and one whose
 count reaches zero, is dropped with its dentry after the unlock
 (Linux ex_mountpoints).
+A tree grafted (`graft`, Linux attach_recursive_mnt) and its
+propagated copies are first hung on their mountpoints with no list or
+hash entry (`set_mountpoint`, under MOUNT_LOCK; reachable only by the
+grafting task), then each joins its namespace and is made visible in
+turn under MOUNT_LOCK write; a mount found already at a copy's place
+moves onto the root of the copy's topmost overmount in the same
+section (`mnt_change_mountpoint`, Linux's tucking).
 Propagation (`fs/pnode.rs`) runs entirely under NAMESPACE_SEM (write),
 as Linux: each mount's `Mount.prop` (`pnode::PropLinks`, `LockedBy`
 NAMESPACE_SEM's `NsTree`, no lock of its own: Linux mnt_group_id, the

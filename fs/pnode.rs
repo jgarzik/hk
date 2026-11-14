@@ -21,7 +21,7 @@ use core::ptr::null;
 
 use super::dentry::DentryRef;
 use super::mount::{
-    MNT_LOCKED, Mount, MountRef, MpPtr, NsTree, attach_mnt, copy_plan, copy_tree, for_each_mut,
+    MNT_LOCKED, MOUNT_LOCK, Mount, MountRef, MpPtr, NsTree, copy_plan, copy_tree, for_each_mut,
     is_path_reachable,
 };
 use super::path_ref::Path;
@@ -524,13 +524,13 @@ fn set_mark(ns: &mut NsTree, m: *const Mount, on: bool) {
     }
 }
 
-/// Copies of the tree at `src`, just hung at `d` on the shared mount
+/// Copies of the tree at `src`, to go at `dest_mp` on the shared mount
 /// `dest`, for every mount `dest`'s events reach (Linux
 /// propagate_mnt): peers of `dest` get peers of `src`, the slave
 /// groups slaves, a group of shared slaves a peer group of its own.
-/// Each copy is hung on its mount, its tree left out of every
-/// namespace (IS_MNT_NEW) for the caller's commit_tree. The copies'
-/// roots are returned (Linux tree_list).
+/// Each copy is hung on its mountpoint, not visible (no list or hash
+/// entry), its tree left out of every namespace (IS_MNT_NEW) for
+/// graft to commit. The copies' roots are returned (Linux tree_list).
 pub(super) fn propagate_mnt(
     ns: &mut NsTree,
     dest: &MountRef,
@@ -574,7 +574,10 @@ pub(super) fn propagate_mnt(
                     copy = get(ns, c);
                 }
                 let this = copy_prop(ns, &copy, ty);
-                attach_mnt(ns, this.clone(), &get(ns, n), dest_mp);
+                // On its mountpoint, not yet visible: graft makes it so
+                // (Linux mnt_set_mountpoint under mount_locked_reader)
+                let to = get(ns, n);
+                this.set_mountpoint(&mut MOUNT_LOCK.read_excl(), &to, dest_mp);
                 let nm = master(ns, n);
                 set_mark(ns, nm, true);
                 copy = this.clone();

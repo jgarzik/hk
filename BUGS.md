@@ -518,9 +518,7 @@ glibc's helper thread), and hk has no such path.
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
 Accepted without effect: MS_SILENT, MS_MANDLOCK, MS_POSIXACL,
-MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated
-copy lands on top of what is already mounted at the target (Linux
-tucks it under); an umount keeps a propagated copy with anything
+MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): an umount keeps a propagated copy with anything
 mounted on it (Linux takes it and slides a mount on its root down:
 propagate_umount's reparent); copies of a namespace are always peers
 and not locked (see "Before user namespaces grant capabilities").
