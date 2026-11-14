@@ -49,6 +49,12 @@ pub trait UartOps: Sync {
     /// Put one byte in the transmitter
     fn tx_put(&self, b: u8);
 
+    /// A round that sends the x_char sends nothing else (8250
+    /// serial8250_tx_chars returns after uart_xchar_out; PL011 goes on)
+    fn xchar_ends_round(&self) -> bool {
+        false
+    }
+
     /// Turn the TX interrupt on or off (8250 IER.THRI, PL011 IMSC.TXIM)
     fn tx_irq(&self, on: bool);
 
@@ -81,6 +87,12 @@ struct Xmit {
     fifo: Kfifo<UART_XMIT_SIZE>,
     /// The TX interrupt (or the poll timer) is on
     tx_on: bool,
+    /// Output is stopped (Linux tty->flow.stopped as uart_tx_stopped
+    /// reads it; set by uart_stop, cleared by uart_start)
+    stopped: bool,
+    /// A flow control character to send ahead of the queue, 0 if none
+    /// (Linux uart_port.x_char)
+    x_char: u8,
 }
 
 /// A UART port: its lock and transmit buffer
@@ -96,6 +108,8 @@ impl UartPort {
             xmit: IrqSpinlock::new(Xmit {
                 fifo: Kfifo::new(),
                 tx_on: false,
+                stopped: false,
+                x_char: 0,
             }),
             irq: AtomicBool::new(false),
         }
@@ -121,11 +135,40 @@ impl UartPort {
         self.start_tx(ops, &mut x)
     }
 
-    /// Send what the transmitter takes now; once empty its interrupt
+    /// Turn the transmitter's interrupt (or poll timer) off (Linux
+    /// stop_tx)
+    fn stop_tx(&self, ops: &dyn UartOps, x: &mut Xmit) {
+        if x.tx_on {
+            if self.irq.load(Ordering::Relaxed) {
+                ops.tx_irq(false);
+            }
+            x.tx_on = false;
+        }
+    }
+
+    /// Send what the transmitter takes now: the x_char first, then the
+    /// queue unless stopped; once nothing is left to send its interrupt
     /// goes off. True if writers should be woken (Linux
-    /// serial8250_tx_chars, pl011_tx_chars)
+    /// serial8250_tx_chars, pl011_tx_chars: uart_write_wakeup below
+    /// WAKEUP_CHARS)
     fn tx_chars(&self, ops: &dyn UartOps, x: &mut Xmit, from_irq: bool) -> bool {
-        for _ in 0..ops.tx_burst(from_irq) {
+        let mut n = ops.tx_burst(from_irq);
+        if x.x_char != 0 {
+            if n == 0 || ops.tx_full() {
+                return false;
+            }
+            ops.tx_put(x.x_char);
+            x.x_char = 0;
+            n -= 1;
+            if ops.xchar_ends_round() {
+                return false;
+            }
+        }
+        if x.stopped || x.fifo.is_empty() {
+            self.stop_tx(ops, x);
+            return false;
+        }
+        for _ in 0..n {
             if ops.tx_full() {
                 break;
             }
@@ -135,21 +178,23 @@ impl UartPort {
             }
             ops.tx_put(b[0]);
         }
-        if x.fifo.is_empty() && x.tx_on {
-            if self.irq.load(Ordering::Relaxed) {
-                ops.tx_irq(false);
-            }
-            x.tx_on = false;
+        let wake = x.fifo.len() < WAKEUP_CHARS;
+        if x.fifo.is_empty() {
+            self.stop_tx(ops, x);
         }
-        x.fifo.len() < WAKEUP_CHARS
+        wake
     }
 
-    /// Start the transmitter (Linux __uart_start -> ops->start_tx):
-    /// what it takes now, then its interrupt or the poll timer for the
-    /// rest
+    /// Start the transmitter (Linux ops->start_tx): what it takes now,
+    /// then its interrupt or the poll timer for the rest. True if
+    /// writers should be woken
     fn start_tx(&self, ops: &dyn UartOps, x: &mut Xmit) -> bool {
+        if x.x_char == 0 && x.fifo.is_empty() {
+            return false;
+        }
         let wake = self.tx_chars(ops, x, false);
-        if !x.fifo.is_empty() && !x.tx_on {
+        let more = x.x_char != 0 || (!x.stopped && !x.fifo.is_empty());
+        if more && !x.tx_on {
             x.tx_on = true;
             if self.irq.load(Ordering::Relaxed) {
                 ops.tx_irq(true);
@@ -160,13 +205,43 @@ impl UartPort {
         wake
     }
 
+    /// Start the transmitter unless output is stopped (Linux
+    /// __uart_start)
+    fn uart_start(&self, ops: &dyn UartOps, x: &mut Xmit) -> bool {
+        !x.stopped && self.start_tx(ops, x)
+    }
+
     /// A tty write (Linux uart_write): queue what fits, start the
-    /// transmitter; the bytes queued
-    pub fn write(&self, ops: &dyn UartOps, data: &[u8]) -> usize {
+    /// transmitter unless stopped; the bytes queued, and whether
+    /// writers should be woken (after the port lock is released)
+    pub fn write(&self, ops: &dyn UartOps, data: &[u8]) -> (usize, bool) {
         let mut x = self.xmit.lock();
         let n = x.fifo.push(data);
-        self.start_tx(ops, &mut x);
-        n
+        let wake = self.uart_start(ops, &mut x);
+        (n, wake)
+    }
+
+    /// Stop output (Linux uart_stop -> ops->stop_tx); queued bytes stay
+    pub fn stop(&self, ops: &dyn UartOps) {
+        let mut x = self.xmit.lock();
+        x.stopped = true;
+        self.stop_tx(ops, &mut x);
+    }
+
+    /// Restart output (Linux uart_start): true if writers should be
+    /// woken
+    pub fn start(&self, ops: &dyn UartOps) -> bool {
+        let mut x = self.xmit.lock();
+        x.stopped = false;
+        self.uart_start(ops, &mut x)
+    }
+
+    /// Send `ch` ahead of the queue, stopped or not (Linux
+    /// uart_send_xchar): true if writers should be woken
+    pub fn send_xchar(&self, ops: &dyn UartOps, ch: u8) -> bool {
+        let mut x = self.xmit.lock();
+        x.x_char = ch;
+        ch != 0 && self.start_tx(ops, &mut x)
     }
 
     /// The TX interrupt (Linux serial8250_handle_irq's THRE case,
@@ -275,7 +350,7 @@ mod tests {
             rounds: AtomicUsize::new(0),
         };
         PORT.irq.store(true, Ordering::Relaxed);
-        assert_eq!(PORT.write(&f, b"abcdefghij"), 10);
+        assert_eq!(PORT.write(&f, b"abcdefghij"), (10, true));
         assert_eq!(&*f.out.lock().unwrap(), b"abcd");
         assert!(f.irq_on.load(Ordering::Relaxed));
         assert_eq!(PORT.chars_in_buffer(), 6);
@@ -287,9 +362,37 @@ mod tests {
         assert_eq!(PORT.write_room(), UART_XMIT_SIZE);
         // Full: a write takes what fits
         let big = [b'x'; UART_XMIT_SIZE + 100];
-        let n = PORT.write(&f, &big);
-        assert_eq!(n, UART_XMIT_SIZE);
+        let (n, wake) = PORT.write(&f, &big);
+        assert_eq!((n, wake), (UART_XMIT_SIZE, false));
         PORT.flush_buffer();
         assert_eq!(PORT.chars_in_buffer(), 0);
+    }
+
+    static STOP_PORT: UartPort = UartPort::new();
+
+    /// Stopped, a write only queues; an x_char still goes out; a
+    /// restart sends the queue
+    #[test]
+    fn xmit_stop_start() {
+        let f = Fake {
+            out: Mutex::new(Vec::new()),
+            irq_on: AtomicBool::new(false),
+            rounds: AtomicUsize::new(0),
+        };
+        STOP_PORT.irq.store(true, Ordering::Relaxed);
+        STOP_PORT.stop(&f);
+        assert_eq!(STOP_PORT.write(&f, b"abcdef"), (6, false));
+        assert!(f.out.lock().unwrap().is_empty());
+        assert!(!f.irq_on.load(Ordering::Relaxed));
+        assert!(!STOP_PORT.send_xchar(&f, 0x13));
+        assert_eq!(&*f.out.lock().unwrap(), b"\x13");
+        assert!(!f.irq_on.load(Ordering::Relaxed));
+        assert_eq!(STOP_PORT.chars_in_buffer(), 6);
+        assert!(STOP_PORT.start(&f));
+        assert_eq!(&*f.out.lock().unwrap(), b"\x13abcd");
+        assert!(f.irq_on.load(Ordering::Relaxed));
+        assert!(STOP_PORT.interrupt_tx(&f));
+        assert_eq!(&*f.out.lock().unwrap(), b"\x13abcdef");
+        assert!(!f.irq_on.load(Ordering::Relaxed));
     }
 }

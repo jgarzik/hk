@@ -241,8 +241,29 @@ impl UartOps for Pl011 {
 impl TtyDriver for Pl011 {
     /// Linux uart_write: into the transmit buffer, the transmitter
     /// started
-    fn write(&self, data: &[u8]) -> Result<usize, KernelError> {
-        Ok(self.uart.write(self, data))
+    fn write(&self, tty: &Tty, data: &[u8]) -> Result<usize, KernelError> {
+        let (n, wake) = self.uart.write(self, data);
+        if wake {
+            tty.write_wakeup();
+        }
+        Ok(n)
+    }
+
+    /// Linux uart_stop
+    fn stop(&self) {
+        self.uart.stop(self);
+    }
+
+    /// Linux uart_start (the tty layer wakes writers after)
+    fn start(&self) {
+        self.uart.start(self);
+    }
+
+    /// Linux uart_send_xchar
+    fn send_xchar(&self, tty: &Tty, ch: u8) {
+        if self.uart.send_xchar(self, ch) {
+            tty.write_wakeup();
+        }
     }
 
     fn flush(&self) {

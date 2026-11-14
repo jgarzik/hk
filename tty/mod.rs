@@ -120,9 +120,20 @@ pub use termios::{Termios, Winsize};
 /// `flip::receive`.
 pub trait TtyDriver: Send + Sync {
     /// Queue bytes for the hardware (Linux tty_operations.write): the
-    /// count taken, maybe short; the driver calls `Tty::write_wakeup`
+    /// count taken, maybe short; the driver calls `tty.write_wakeup`
     /// once there is room again
-    fn write(&self, data: &[u8]) -> Result<usize, KernelError>;
+    fn write(&self, tty: &Tty, data: &[u8]) -> Result<usize, KernelError>;
+
+    /// Stop output (Linux tty_operations.stop), under `Tty.flow`
+    fn stop(&self) {}
+
+    /// Restart output (Linux tty_operations.start), under `Tty.flow`;
+    /// the caller wakes writers
+    fn start(&self) {}
+
+    /// Send a flow control character ahead of queued output, stopped
+    /// or not (Linux tty_operations.send_xchar)
+    fn send_xchar(&self, tty: &Tty, ch: u8);
 
     /// Wait until the transmitter is empty
     fn flush(&self) {}
@@ -143,15 +154,15 @@ pub trait TtyDriver: Send + Sync {
     /// The console write (Linux console->write): bytes straight to the
     /// hardware, LF as CR LF, then a wait until the transmitter is
     /// empty. A UART takes its port lock (`serial_core::UartPort`)
-    fn console_write(&self, data: &[u8]) {
-        for &byte in data {
-            if byte == b'\n' {
-                let _ = self.write(b"\r");
-            }
-            let _ = self.write(&[byte]);
-        }
-        self.flush();
-    }
+    fn console_write(&self, data: &[u8]);
+}
+
+/// Output flow control (Linux tty->flow)
+struct Flow {
+    /// Output is stopped
+    stopped: bool,
+    /// ... by TCOOFF, which only TCOON undoes
+    tco_stopped: bool,
 }
 
 /// Job control state (Linux tty->ctrl and winsize)
@@ -213,6 +224,8 @@ pub struct Tty {
     ctrl: Mutex<TtyCtrl>,
     /// O_ASYNC files (Linux tty->fasync)
     fasync: FasyncList,
+    /// Output flow control (Linux tty->flow, under flow.lock)
+    flow: Mutex<Flow>,
 }
 
 impl Tty {
@@ -233,6 +246,10 @@ impl Tty {
             write_wait: WaitQueue::new(),
             ctrl: Mutex::new(TtyCtrl::new()),
             fasync: FasyncList::new(),
+            flow: Mutex::new(Flow {
+                stopped: false,
+                tco_stopped: false,
+            }),
         }
     }
 
@@ -259,7 +276,58 @@ impl Tty {
     /// Write directly to driver (bypassing line discipline): the count
     /// it took
     pub fn driver_write(&self, data: &[u8]) -> Result<usize, KernelError> {
-        self.driver.write(data)
+        self.driver.write(self, data)
+    }
+
+    /// Linux __stop_tty, under `flow`
+    fn stop_locked(&self, f: &mut Flow) {
+        if f.stopped {
+            return;
+        }
+        f.stopped = true;
+        self.driver.stop();
+    }
+
+    /// Linux __start_tty, under `flow`: true if writers are to be woken
+    /// (Linux tty_wakeup there; here after `flow` is released)
+    fn start_locked(&self, f: &mut Flow) -> bool {
+        if !f.stopped || f.tco_stopped {
+            return false;
+        }
+        f.stopped = false;
+        self.driver.start();
+        true
+    }
+
+    /// TCOOFF (Linux n_tty_ioctl_helper's TCXONC): output stops until
+    /// TCOON
+    pub fn tcooff(&self) {
+        let mut f = self.flow.lock();
+        if !f.tco_stopped {
+            f.tco_stopped = true;
+            self.stop_locked(&mut f);
+        }
+    }
+
+    /// TCOON: output restarts, writers are woken
+    pub fn tcoon(&self) {
+        let wake = {
+            let mut f = self.flow.lock();
+            f.tco_stopped && {
+                f.tco_stopped = false;
+                self.start_locked(&mut f)
+            }
+        };
+        if wake {
+            self.write_wakeup();
+        }
+    }
+
+    /// Send `ch` ahead of queued output (Linux tty_send_xchar through
+    /// the driver's send_xchar, under termios_rwsem: `ldata` here)
+    pub fn send_xchar(&self, ch: u8) {
+        let _ld = n_tty::ldata(self);
+        self.driver.send_xchar(self, ch);
     }
 
     /// Bytes the driver takes now (Linux tty_write_room)

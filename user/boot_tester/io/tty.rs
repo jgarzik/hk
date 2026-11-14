@@ -16,6 +16,9 @@
 //!   TX interrupt), at most what was written (NL as CR NL); tcdrain
 //!   waits until none
 //!   are left
+//! - TTY_TCXONC: TCOOFF holds a write's bytes in the UART's queue
+//!   (TIOCOUTQ counts all of them) until TCOON; TCIOFF/TCION send
+//!   STOP/START outside the queue; an unknown action is EINVAL
 
 use crate::harness::{check, fail_num, pass, report_r};
 use crate::helpers::{host_mode, print, println, skip};
@@ -34,6 +37,12 @@ const TIOCSWINSZ: u64 = 0x5414;
 const TCSBRK: u64 = 0x5409;
 const TIOCNOTTY: u64 = 0x5422;
 const TIOCOUTQ: u64 = 0x5411;
+const TCXONC: u64 = 0x540A;
+const TCOOFF: u64 = 0;
+const TCOON: u64 = 1;
+const TCIOFF: u64 = 2;
+const TCION: u64 = 3;
+const EINVAL: i64 = -22;
 const SIGHUP: u64 = 1;
 const SIGCONT: u64 = 18;
 const SIGWINCH: u64 = 28;
@@ -56,6 +65,7 @@ pub fn run_tests() {
     test_sigwinch();
     test_write_atomic();
     test_outq();
+    test_tcxonc();
 }
 
 /// Bytes queued for the console's UART
@@ -90,6 +100,53 @@ fn test_outq() {
         .and_then(|()| check(b"queued", (0..=n + 1).contains(&queued), queued))
         .and_then(|()| check(b"tcdrain", drained == 0, drained))
         .and_then(|()| check(b"left", left == 0, left));
+    report_r(NAME, r);
+}
+
+/// Output stopped and restarted (Linux TCXONC). Nothing may print to
+/// the console while it is stopped: this process would block
+fn test_tcxonc() {
+    const NAME: &[u8] = b"TTY_TCXONC";
+    let fd = sys_open(b"/dev/console\0".as_ptr(), O_WRONLY | O_NOCTTY, 0);
+    if fd < 0 {
+        return report(NAME, false, fd);
+    }
+    let fd = fd as i32;
+    sys_ioctl(fd, TCSBRK, 1);
+    let off = sys_ioctl(fd, TCXONC, TCOOFF);
+    let off2 = sys_ioctl(fd, TCXONC, TCOOFF);
+    let line = b"tty tcxonc: held output\n";
+    let w = sys_write(fd as u64, line.as_ptr(), line.len() as u64);
+    // OPOST|ONLCR: the NL goes out as CR NL
+    let held = outq(fd);
+    let bad = sys_ioctl(fd, TCXONC, 4);
+    let on = sys_ioctl(fd, TCXONC, TCOON);
+    let drained = sys_ioctl(fd, TCSBRK, 1);
+    let left = outq(fd);
+    let ioff = sys_ioctl(fd, TCXONC, TCIOFF);
+    let ion = sys_ioctl(fd, TCXONC, TCION);
+    let xq = outq(fd);
+    sys_close(fd as u64);
+    let n = line.len() as i64;
+    let r = check(
+        b"tcooff",
+        off == 0 && off2 == 0,
+        if off != 0 { off } else { off2 },
+    )
+    .and_then(|()| check(b"write", w == n, w))
+    .and_then(|()| check(b"held", held == n + 1, held))
+    .and_then(|()| check(b"einval", bad == EINVAL, bad))
+    .and_then(|()| check(b"tcoon", on == 0, on))
+    .and_then(|()| check(b"tcdrain", drained == 0, drained))
+    .and_then(|()| check(b"left", left == 0, left))
+    .and_then(|()| {
+        check(
+            b"tcioff",
+            ioff == 0 && ion == 0,
+            if ioff != 0 { ioff } else { ion },
+        )
+    })
+    .and_then(|()| check(b"xchar queued", xq == 0, xq));
     report_r(NAME, r);
 }
 

@@ -38,6 +38,12 @@ pub const TCSBRK: u32 = 0x5409;
 pub const TCXONC: u32 = 0x540A;
 /// Flush queues
 pub const TCFLSH: u32 = 0x540B;
+
+/// TCXONC arguments (asm-generic/termbits.h)
+const TCOOFF: u64 = 0;
+const TCOON: u64 = 1;
+const TCIOFF: u64 = 2;
+const TCION: u64 = 3;
 /// Set exclusive mode
 pub const TIOCEXCL: u32 = 0x540C;
 /// Clear exclusive mode
@@ -188,7 +194,8 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
             drain(tty)?;
             Ok(0)
         }
-        TIOCSBRK | TIOCCBRK | TCXONC | TIOCEXCL | TIOCNXCL => Ok(0),
+        TCXONC => tcxonc(tty, arg),
+        TIOCSBRK | TIOCCBRK | TIOCEXCL | TIOCNXCL => Ok(0),
         // No modem control: the lines read as asserted, sets are ignored
         TIOCMGET => put(
             arg,
@@ -204,6 +211,26 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
         }
         _ => Err(KernelError::NotTty),
     }
+}
+
+/// TCXONC (Linux n_tty_ioctl_helper): stop or restart output, or send
+/// the STOP or START character unless disabled (_POSIX_VDISABLE, 0)
+fn tcxonc(tty: &Tty, arg: u64) -> Result<i64, KernelError> {
+    use crate::tty::termios::{VSTART, VSTOP};
+    let xchar = |i: usize| {
+        let ch = tty.get_termios().c_cc[i];
+        if ch != 0 {
+            tty.send_xchar(ch);
+        }
+    };
+    match arg {
+        TCOOFF => tty.tcooff(),
+        TCOON => tty.tcoon(),
+        TCIOFF => xchar(VSTOP),
+        TCION => xchar(VSTART),
+        _ => return Err(KernelError::InvalidArgument),
+    }
+    Ok(0)
 }
 
 /// A pid as the user's pid_t
