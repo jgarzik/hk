@@ -32,11 +32,103 @@ use crate::ns::{MntNamespace, NsRef};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
-/// The nsfs ioctls (Linux uapi nsfs.h, _IO(NSIO, n))
+/// The nsfs ioctls (Linux uapi nsfs.h: _IO(NSIO, n), _IOR(NSIO, n,
+/// type))
 const NS_GET_USERNS: u32 = 0xb701;
 const NS_GET_PARENT: u32 = 0xb702;
 const NS_GET_NSTYPE: u32 = 0xb703;
 const NS_GET_OWNER_UID: u32 = 0xb704;
+const NS_GET_MNTNS_ID: u32 = 0x8008_b705;
+const NS_GET_PID_FROM_PIDNS: u32 = 0x8004_b706;
+const NS_GET_TGID_FROM_PIDNS: u32 = 0x8004_b707;
+const NS_GET_PID_IN_PIDNS: u32 = 0x8004_b708;
+const NS_GET_TGID_IN_PIDNS: u32 = 0x8004_b709;
+const NS_GET_ID: u32 = 0x8008_b70d;
+/// The extensible ones, by number: _IOR with any size from
+/// MNT_NS_INFO_SIZE_VER0 up (Linux extensible_ioctl_valid)
+const NS_MNT_GET_INFO_NR: u32 = 10;
+const NS_MNT_GET_NEXT_NR: u32 = 11;
+const NS_MNT_GET_PREV_NR: u32 = 12;
+/// struct mnt_ns_info's first published size
+const MNT_NS_INFO_SIZE_VER0: usize = 16;
+
+/// An extensible NSIO read ioctl numbered `nr` of at least
+/// MNT_NS_INFO_SIZE_VER0 bytes: its size, None for another command
+fn extensible(cmd: u32, nr: u32) -> Option<usize> {
+    let size = ((cmd >> 16) & 0x3fff) as usize;
+    let ok = cmd >> 30 == 2 && (cmd >> 8) & 0xff == 0xb7 && cmd & 0xff == nr;
+    (ok && size >= MNT_NS_INFO_SIZE_VER0).then_some(size)
+}
+
+/// Copy struct mnt_ns_info for `m` to `to`, the first `usize` bytes the
+/// caller knows of (Linux copy_ns_info_to_user): size, mounts but the
+/// root, id
+fn copy_ns_info(m: &crate::ns::MntNamespace, to: u64, usize: usize) -> Result<(), KernelError> {
+    let size = usize.min(MNT_NS_INFO_SIZE_VER0);
+    let nr = u32::try_from(m.nr_mounts().saturating_sub(1)).unwrap_or(u32::MAX);
+    let mut b = [0u8; MNT_NS_INFO_SIZE_VER0];
+    b[..4].copy_from_slice(&(size as u32).to_ne_bytes());
+    b[4..8].copy_from_slice(&nr.to_ne_bytes());
+    b[8..].copy_from_slice(&m.id().to_ne_bytes());
+    crate::uaccess::copy_to_user(to, &b[..size]).map_err(|_| KernelError::BadAddress)?;
+    Ok(())
+}
+
+/// The caller may walk every namespace (Linux may_see_all_namespaces):
+/// in the initial pid namespace with CAP_SYS_ADMIN over its owner
+fn may_see_all_namespaces() -> bool {
+    crate::task::pid::current_pid_ns().level == 0
+        && crate::task::capable(crate::task::CAP_SYS_ADMIN)
+}
+
+/// A pid namespace ioctl (Linux ns_ioctl's NS_GET_{PID,TGID}_{FROM,IN}_
+/// PIDNS): the task `arg` names in `ns` (FROM) or in the caller's pid
+/// namespace (IN), and its thread or thread-group id in the caller's
+/// namespace (FROM) or in `ns` (IN); ESRCH if there is none or it has
+/// no number there
+fn pidns_ioctl(ns: &NsRef, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+    use crate::task::percpu::{find_task_by_pid_ns, find_task_by_vpid};
+    use crate::task::pid::{nr_ns, vnr};
+    let NsRef::Pid(p) = ns else {
+        return Err(KernelError::InvalidArgument);
+    };
+    // A pid_t argument
+    let nr = u64::from(arg as u32);
+    let from = matches!(cmd, NS_GET_PID_FROM_PIDNS | NS_GET_TGID_FROM_PIDNS);
+    let t = if from {
+        find_task_by_pid_ns(nr, p)
+    } else {
+        find_task_by_vpid(nr)
+    }
+    .ok_or(KernelError::NoProcess)?;
+    let n = match cmd {
+        NS_GET_PID_FROM_PIDNS => vnr(t.tid()),
+        NS_GET_TGID_FROM_PIDNS => vnr(t.pid),
+        NS_GET_PID_IN_PIDNS => nr_ns(t.tid(), p),
+        _ => nr_ns(t.pid, p),
+    };
+    match n {
+        0 => Err(KernelError::NoProcess),
+        n => Ok(i64::from(n)),
+    }
+}
+
+/// NS_MNT_GET_NEXT / NS_MNT_GET_PREV (Linux ns_ioctl): the mount
+/// namespace after or before `m` in id order the caller may see, as a
+/// new O_CLOEXEC descriptor, with its struct mnt_ns_info copied to
+/// `to` first (EFAULT leaves no descriptor)
+fn mnt_ns_adjoined_fd(
+    m: &crate::ns::MntNamespace,
+    previous: bool,
+    to: u64,
+    usize: usize,
+) -> Result<i64, KernelError> {
+    let next = crate::ns::mnt_ns_adjoined(m.id(), previous)?;
+    let fd = crate::fs::io::get_unused_fd_flags(crate::task::FD_CLOEXEC)?;
+    let file = ns_file(NsRef::Mnt(next.clone()))?;
+    copy_ns_info(&next, to, usize)?;
+    Ok(i64::from(fd.install(file)))
+}
 
 /// A namespace file's operations (Linux ns_file_operations): it opens,
 /// has no read or write (EINVAL), and answers the NS_GET_* ioctls
@@ -51,12 +143,38 @@ impl FileOps for NsFileOps {
     /// O_CLOEXEC descriptor of the owning user namespace or the parent
     /// (pid and user namespaces only, else EINVAL); NS_GET_NSTYPE its
     /// CLONE_NEW* type; NS_GET_OWNER_UID a user namespace's creator's
-    /// uid as the caller's user namespace sees it. ENOTTY otherwise.
+    /// uid as the caller's user namespace sees it; NS_GET_ID its id
+    /// (NS_GET_MNTNS_ID: a mount namespace's only); the pid namespace
+    /// translations; NS_MNT_GET_INFO a mount namespace's struct
+    /// mnt_ns_info, NS_MNT_GET_NEXT/PREV the next or previous one
+    /// (EPERM unless the caller may see all namespaces). ENOTTY
+    /// otherwise.
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         let ns = file
             .get_inode()
             .and_then(|i| get_proc_ns(&i))
             .ok_or(KernelError::NotTty)?;
+        let next = extensible(cmd, NS_MNT_GET_NEXT_NR);
+        let prev = extensible(cmd, NS_MNT_GET_PREV_NR);
+        if (next.is_some() || prev.is_some()) && !may_see_all_namespaces() {
+            return Err(KernelError::NotPermitted);
+        }
+        if let Some(usize) = extensible(cmd, NS_MNT_GET_INFO_NR) {
+            let NsRef::Mnt(m) = &ns else {
+                return Err(KernelError::InvalidArgument);
+            };
+            if arg == 0 {
+                return Err(KernelError::InvalidArgument);
+            }
+            copy_ns_info(m, arg, usize)?;
+            return Ok(0);
+        }
+        if let Some(usize) = next.or(prev) {
+            let NsRef::Mnt(m) = &ns else {
+                return Err(KernelError::InvalidArgument);
+            };
+            return mnt_ns_adjoined_fd(m, prev.is_some(), arg, usize);
+        }
         match cmd {
             NS_GET_USERNS => open_related_ns(ns_get_owner(&ns)?),
             NS_GET_PARENT => open_related_ns(match &ns {
@@ -71,6 +189,18 @@ impl FileOps for NsFileOps {
                 };
                 let uid = crate::ns::current_user_ns().from_kuid_munged(u.owner);
                 crate::uaccess::put_user(arg, uid).map_err(|_| KernelError::BadAddress)?;
+                Ok(0)
+            }
+            NS_GET_PID_FROM_PIDNS
+            | NS_GET_TGID_FROM_PIDNS
+            | NS_GET_PID_IN_PIDNS
+            | NS_GET_TGID_IN_PIDNS => pidns_ioctl(&ns, cmd, arg),
+            NS_GET_MNTNS_ID | NS_GET_ID => {
+                if cmd == NS_GET_MNTNS_ID && !matches!(ns, NsRef::Mnt(_)) {
+                    return Err(KernelError::InvalidArgument);
+                }
+                let id = ns.common().ns_id;
+                crate::uaccess::put_user(arg, id).map_err(|_| KernelError::BadAddress)?;
                 Ok(0)
             }
             _ => Err(KernelError::NotTty),
@@ -112,16 +242,21 @@ fn pidns_get_parent(ns: &crate::ns::PidNamespace) -> Result<NsRef, KernelError> 
 /// A new O_CLOEXEC descriptor of `ns`'s file, opened read-only (Linux
 /// open_related_ns)
 fn open_related_ns(ns: NsRef) -> Result<i64, KernelError> {
+    let fd = crate::fs::io::fd_install(ns_file(ns)?, crate::task::FD_CLOEXEC)?;
+    Ok(i64::from(fd))
+}
+
+/// `ns`'s file opened read-only (Linux open_namespace_file)
+fn ns_file(ns: NsRef) -> Result<crate::fs::FileRef, KernelError> {
     let path = ns_get_path(ns)?;
     let flags = crate::fs::flags::O_RDONLY;
-    let file = File::new(
+    File::new(
         path.dentry.clone(),
         Some(path.mnt.clone()),
         flags,
         &NS_FILE_OPS,
-    );
-    let fd = crate::fs::io::fd_install(file.alloc()?, crate::task::FD_CLOEXEC)?;
-    Ok(i64::from(fd))
+    )
+    .alloc()
 }
 
 pub static NS_FILE_OPS: NsFileOps = NsFileOps;

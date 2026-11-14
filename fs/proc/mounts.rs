@@ -144,7 +144,13 @@ fn show_mountinfo_of(vis: &Vis<'_>) -> Vec<u8> {
             dev & 0xff
         );
         out.extend_from_slice(head.as_bytes());
-        mangle(&mut out, &dentry_path(&m.root).unwrap_or_default(), ESC);
+        // nsfs names its root by its namespace (Linux show_path,
+        // nsfs_show_path)
+        let root = match crate::fs::pseudo::nsfs::ns_of_dentry(&m.root) {
+            Some(ns) => alloc::format!("{}:[{}]", ns.name(), ns.inum()).into_bytes(),
+            None => dentry_path(&m.root).unwrap_or_default(),
+        };
+        mangle(&mut out, &root, ESC);
         out.push(b' ');
         mangle(&mut out, &mp, ESC);
         out.push(b' ');

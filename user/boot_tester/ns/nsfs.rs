@@ -19,9 +19,18 @@
 //! O_CLOEXEC descriptors of the owner or parent, EPERM past what the
 //! caller's own namespace may see, EINVAL for a type with no parent),
 //! NS_GET_OWNER_UID (as the caller's user namespace maps it).
+//!
+//! NSFS_IDS: namespace ids (NS_GET_ID, NS_GET_MNTNS_ID, the initial
+//! namespaces' fixed ones), struct mnt_ns_info (NS_MNT_GET_INFO) and
+//! the mount namespaces next to one in id order (NS_MNT_GET_NEXT/PREV).
+//! NSFS_PIDNS_XLATE: pid numbers between pid namespaces
+//! (NS_GET_{PID,TGID}_{FROM,IN}_PIDNS). Each from the Linux release
+//! that added it, ENOTTY before. NSFS_PIN also finds the bound file's
+//! mount root in mountinfo as "uts:[<inum>]".
 
 use super::{first_bad, fstat, in_child, ns_link, pid_path, stat};
 use crate::harness::verdict_detail;
+use crate::helpers::linux_at_least;
 use hk_syscall::{
     CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS, O_CREAT, O_RDONLY,
     O_WRONLY, UtsName, sys_close, sys_exit, sys_fork, sys_getpid, sys_mkdir, sys_mount, sys_open,
@@ -43,6 +52,10 @@ pub fn run_tests() {
     verdict_detail(b"NSFS_PIDFD", r == 0, r);
     let r = in_child(ioctl_child);
     verdict_detail(b"NSFS_IOCTL", r == 0, r);
+    let r = in_child(ids_child);
+    verdict_detail(b"NSFS_IDS", r == 0, r);
+    let r = in_child(xlate_child);
+    verdict_detail(b"NSFS_PIDNS_XLATE", r == 0, r);
 }
 
 /// Each link's name and what it reads
@@ -207,7 +220,8 @@ fn pin_child() -> u8 {
         inum != 0 && held >= 0,
         bound == 0,
         reaped,
-        st.is_some_and(|s| s.st_ino == inum && s.st_mode == 0o100444),
+        st.is_some_and(|s| s.st_ino == inum && s.st_mode == 0o100444)
+            && mountinfo_has(b"uts", inum),
         fd_ok,
         held_ino == inum,
         byb >= 0 && fstat(byb).is_some_and(|s| s.st_ino == inum),
@@ -386,4 +400,208 @@ fn child_ns_ioctls(user: u64) -> u8 {
         0 => 70 + ((ws >> 8) & 0xff) as u8,
         n => 60 + n,
     }
+}
+
+const NS_GET_MNTNS_ID: u64 = 0x8008_b705;
+const NS_GET_PID_FROM_PIDNS: u64 = 0x8004_b706;
+const NS_GET_TGID_FROM_PIDNS: u64 = 0x8004_b707;
+const NS_GET_PID_IN_PIDNS: u64 = 0x8004_b708;
+const NS_GET_TGID_IN_PIDNS: u64 = 0x8004_b709;
+const NS_MNT_GET_INFO: u64 = 0x8010_b70a;
+const NS_MNT_GET_NEXT: u64 = 0x8010_b70b;
+const NS_MNT_GET_PREV: u64 = 0x8010_b70c;
+const NS_GET_ID: u64 = 0x8008_b70d;
+const ENOENT: i64 = -2;
+
+/// An id ioctl's u64 result, or the error
+fn get_id(fd: i64, cmd: u64) -> Result<u64, i64> {
+    let mut id = 0u64;
+    match hk_syscall::sys_ioctl(fd as i32, cmd, (&raw mut id) as u64) {
+        0 => Ok(id),
+        r => Err(r),
+    }
+}
+
+/// struct mnt_ns_info (size, nr_mounts, mnt_ns_id) an NS_MNT_GET_*
+/// ioctl fills, with its return
+fn mnt_info(fd: i64, cmd: u64) -> (i64, [u32; 2], u64) {
+    let mut b = [0u64; 2];
+    let r = hk_syscall::sys_ioctl(fd as i32, cmd, b.as_mut_ptr() as u64);
+    (r, [b[0] as u32, (b[0] >> 32) as u32], b[1])
+}
+
+/// Child of NSFS_IDS: NS_GET_ID (Linux 6.18; the initial namespaces'
+/// fixed ids from 6.19), NS_GET_MNTNS_ID (6.11), NS_MNT_GET_INFO,
+/// NS_MNT_GET_NEXT and NS_MNT_GET_PREV (6.12); ENOTTY before
+fn ids_child() -> u8 {
+    let open = |p: &[u8]| sys_open(p.as_ptr(), O_RDONLY, 0);
+    let mnt = open(b"/proc/self/ns/mnt\0");
+    let uts = open(b"/proc/self/ns/uts\0");
+    if mnt < 0 || uts < 0 {
+        return 1;
+    }
+    let want = |v: bool, cmd_ok: bool, r: i64| if v { cmd_ok } else { r == ENOTTY };
+    let mid = get_id(mnt, NS_GET_MNTNS_ID);
+    let v611 = linux_at_least(6, 11);
+    let v612 = linux_at_least(6, 12);
+    let v618 = linux_at_least(6, 18);
+    let err = |r: Result<u64, i64>| r.err().unwrap_or(0);
+    let mut steps = [true; 11];
+    steps[0] = want(v611, mid.is_ok_and(|i| i != 0), err(mid));
+    steps[1] = want(
+        v611,
+        err(get_id(uts, NS_GET_MNTNS_ID)) == EINVAL,
+        err(get_id(uts, NS_GET_MNTNS_ID)),
+    );
+    let gid = get_id(mnt, NS_GET_ID);
+    steps[2] = want(v618, gid.is_ok() && gid == mid, err(gid));
+    if linux_at_least(6, 19) {
+        // The initial namespaces' fixed ids (uapi init_ns_id)
+        let fixed: [(&[u8], u64); 6] = [
+            (b"/proc/self/ns/ipc\0", 1),
+            (b"/proc/self/ns/uts\0", 2),
+            (b"/proc/self/ns/user\0", 3),
+            (b"/proc/self/ns/pid\0", 4),
+            (b"/proc/self/ns/cgroup\0", 5),
+            (b"/proc/self/ns/mnt\0", 8),
+        ];
+        steps[3] = fixed
+            .iter()
+            .all(|(p, id)| get_id(open(p), NS_GET_ID) == Ok(*id));
+    }
+    let (r, [size, nr], id) = mnt_info(mnt, NS_MNT_GET_INFO);
+    steps[4] = want(v612, r == 0 && size == 16 && Ok(id) == mid, r);
+    // A new mount namespace: a higher id; one more mount, one more counted
+    let none = core::ptr::null();
+    let new_ok = sys_unshare(CLONE_NEWNS) == 0
+        && sys_mount(none, b"/\0".as_ptr(), none, MS_REC | MS_PRIVATE, 0) == 0;
+    let mine = open(b"/proc/self/ns/mnt\0");
+    let nid = get_id(mine, NS_GET_MNTNS_ID);
+    steps[5] = new_ok && want(v611, nid.is_ok_and(|n| mid.is_ok_and(|m| n > m)), err(nid));
+    let (_, [_, nr0], _) = mnt_info(mine, NS_MNT_GET_INFO);
+    sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
+    sys_mkdir(b"/tmp/nsid\0".as_ptr(), 0o755);
+    let ramfs = sys_mount(
+        b"none\0".as_ptr(),
+        b"/tmp/nsid\0".as_ptr(),
+        b"ramfs\0".as_ptr(),
+        0,
+        0,
+    ) == 0;
+    let (r, [_, nr1], _) = mnt_info(mine, NS_MNT_GET_INFO);
+    steps[6] = ramfs && want(v612, nr1 == nr0 + 1 && nr > 0, r);
+    // Neighbours in id order, each a new descriptor with its info
+    let (r, _, nxt) = mnt_info(mnt, NS_MNT_GET_NEXT);
+    steps[7] = want(
+        v612,
+        r >= 0 && mid.is_ok_and(|m| nxt > m) && get_id(r, NS_GET_MNTNS_ID) == Ok(nxt),
+        r,
+    );
+    let (r, _, prv) = mnt_info(mine, NS_MNT_GET_PREV);
+    steps[8] = want(v612, r >= 0 && nid.is_ok_and(|n| prv < n), r);
+    // Nothing before the initial one
+    let (r, _, _) = mnt_info(mnt, NS_MNT_GET_PREV);
+    steps[9] = want(v612, r == ENOENT, r);
+    steps[10] = want(
+        v612,
+        mnt_info(uts, NS_MNT_GET_INFO).0 == EINVAL,
+        mnt_info(uts, NS_MNT_GET_INFO).0,
+    );
+    first_bad(&steps)
+}
+
+/// Child of NSFS_PIDNS_XLATE: NS_GET_{PID,TGID}_{FROM,IN}_PIDNS (Linux
+/// 6.11; ENOTTY before) between a new pid namespace and this one; and
+/// NS_MNT_GET_NEXT needs the initial pid namespace (EPERM)
+fn xlate_child() -> u8 {
+    if sys_unshare(CLONE_NEWPID) != 0 {
+        return 50;
+    }
+    let (mut up, mut down) = ([0i32; 2], [0i32; 2]);
+    if sys_pipe(up.as_mut_ptr()) != 0 || sys_pipe(down.as_mut_ptr()) != 0 {
+        return 51;
+    }
+    let c = sys_fork();
+    if c == 0 {
+        sys_close(up[0] as u64);
+        sys_close(down[1] as u64);
+        let mnt = sys_open(b"/proc/self/ns/mnt\0".as_ptr(), O_RDONLY, 0);
+        let r = mnt_info(mnt, NS_MNT_GET_NEXT).0;
+        let ok = if linux_at_least(6, 12) {
+            r == EPERM
+        } else {
+            r == ENOTTY
+        };
+        sys_write(up[1] as u64, b"x".as_ptr(), 1);
+        let mut x = 0u8;
+        sys_read(down[0] as u64, &mut x, 1);
+        sys_exit(u64::from(!ok));
+    }
+    sys_close(up[1] as u64);
+    sys_close(down[0] as u64);
+    let mut x = 0u8;
+    if c < 0 || sys_read(up[0] as u64, &mut x, 1) != 1 {
+        return 52;
+    }
+    let mut b = [0u8; 64];
+    let p = sys_open(
+        pid_path(&mut b, b"/proc/", c, b"/ns/pid").as_ptr(),
+        O_RDONLY,
+        0,
+    );
+    let uts = sys_open(b"/proc/self/ns/uts\0".as_ptr(), O_RDONLY, 0);
+    let io = |fd: i64, cmd: u64, arg: i64| hk_syscall::sys_ioctl(fd as i32, cmd, arg as u64);
+    let me = sys_getpid();
+    let checks: [(i64, u64, i64, i64); 7] = [
+        (p, NS_GET_PID_IN_PIDNS, c, 1),
+        (p, NS_GET_TGID_IN_PIDNS, c, 1),
+        (p, NS_GET_PID_FROM_PIDNS, 1, c),
+        (p, NS_GET_TGID_FROM_PIDNS, 1, c),
+        (p, NS_GET_PID_IN_PIDNS, me, ESRCH),
+        (p, NS_GET_PID_FROM_PIDNS, 99999, ESRCH),
+        (uts, NS_GET_PID_IN_PIDNS, me, EINVAL),
+    ];
+    let v = linux_at_least(6, 11);
+    let mut steps = [false; 8];
+    for (k, (fd, cmd, arg, want)) in checks.iter().enumerate() {
+        let r = io(*fd, *cmd, *arg);
+        steps[k] = if v { r == *want } else { r == ENOTTY };
+    }
+    sys_close(down[1] as u64);
+    let mut ws = 0;
+    steps[7] = sys_wait4(c, &mut ws, 0, 0) == c && ws == 0;
+    match first_bad(&[p >= 0 && uts >= 0]) {
+        0 => first_bad(&steps),
+        n => 60 + n,
+    }
+}
+
+/// /proc/self/mountinfo names a mount's root "<ty>:[<inum>]" (Linux
+/// nsfs_show_path)
+fn mountinfo_has(ty: &[u8], inum: u64) -> bool {
+    let mut needle = [0u8; 40];
+    let mut n = ty.len();
+    needle[..n].copy_from_slice(ty);
+    needle[n..n + 2].copy_from_slice(b":[");
+    n += 2;
+    let mut d = [0u8; 20];
+    let (mut k, mut v) = (0, inum);
+    loop {
+        d[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while k > 0 {
+        k -= 1;
+        needle[n] = d[k];
+        n += 1;
+    }
+    needle[n] = b']';
+    n += 1;
+    let mut buf = [0u8; 8192];
+    let len = crate::helpers::read_file(b"/proc/self/mountinfo\0", &mut buf);
+    len > 0 && buf[..len as usize].windows(n).any(|w| w == &needle[..n])
 }

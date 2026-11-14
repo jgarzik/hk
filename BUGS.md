@@ -1029,10 +1029,9 @@ dumb buffer from shmem and blits it on page flip
 
 **Location**: `fs/pseudo/nsfs.rs`, `ns/setns.rs`
 
-No time or time_for_children links (no time namespaces). Of the
-NS_GET_* ioctls only Linux 6.8's: no NS_GET_MNTNS_ID, NS_GET_ID,
-NS_GET_{PID,TGID}_{FROM,IN}_PIDNS, NS_MNT_GET_{INFO,NEXT,PREV}
-(ENOTTY).
+No time namespaces (CLONE_NEWTIME, the time and time_for_children
+links). No nsfs file handles (hk has no name_to_handle_at /
+open_by_handle_at) and no listns(2) / statns(2).
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 
