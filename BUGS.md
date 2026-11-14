@@ -1027,8 +1027,8 @@ dumb buffer from shmem and blits it on page flip
 
 **Location**: `fs/pseudo/nsfs.rs`, `ns/setns.rs`
 
-No time or time_for_children links (no time namespaces), no NS_GET_*
-ioctls, and setns(2) takes no pidfd (EINVAL).
+No time or time_for_children links (no time namespaces), and no
+NS_GET_* ioctls.
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 

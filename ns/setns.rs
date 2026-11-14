@@ -3,7 +3,8 @@
 //!
 //! A namespace file names the namespace it holds (`fs::pseudo::nsfs`),
 //! not a task: setns joins that namespace, even once every task in it
-//! has exited. The new set is built aside ([`NsSet`]), each namespace
+//! has exited. A pidfd joins the namespaces its task is in, those the
+//! flags name. The new set is built aside ([`NsSet`]), each namespace
 //! installed into it with its type's checks, and switched to only once
 //! all succeeded.
 //!
@@ -14,7 +15,8 @@
 use alloc::sync::Arc;
 
 use super::{
-    CLONE_NEWIPC, CLONE_NEWNS, INIT_NSPROXY, NsProxy, NsRef, current, switch_task_namespaces,
+    CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER,
+    CLONE_NEWUTS, CLONE_NS_FLAGS, INIT_NSPROXY, NsProxy, NsRef, current, switch_task_namespaces,
 };
 use crate::fs::FsStruct;
 use crate::task::{CAP_SYS_ADMIN, CAP_SYS_CHROOT, capable};
@@ -141,6 +143,39 @@ impl NsSet {
         }
     }
 
+    /// Install the namespaces of the task `pid` names that the flags
+    /// name, in Linux's order (validate_nsset): ESRCH once it is gone,
+    /// EPERM without ptrace-read access to it (real ids)
+    fn install_from(&mut self, pid: &crate::task::pid::Pid) -> KernelResult<()> {
+        let t = crate::task::percpu::TASKLIST
+            .read()
+            .pid_task_ref(pid)
+            .ok_or(KernelError::NoProcess)?;
+        if !crate::task::ptrace::may_access_task(&t, false) {
+            return Err(KernelError::NotPermitted);
+        }
+        let nsp = t
+            .task_lock()
+            .nsproxy()
+            .cloned()
+            .ok_or(KernelError::NoProcess)?;
+        let order = [
+            (CLONE_NEWUSER, NsRef::User(nsp.user_ns.clone())),
+            (CLONE_NEWNS, NsRef::Mnt(nsp.mnt_ns.clone())),
+            (CLONE_NEWUTS, NsRef::Uts(nsp.uts_ns.clone())),
+            (CLONE_NEWIPC, NsRef::Ipc(nsp.ipc_ns.clone())),
+            (CLONE_NEWPID, NsRef::Pid(t.get_pid_ns())),
+            (CLONE_NEWCGROUP, NsRef::Cgroup(nsp.cgroup_ns.clone())),
+            (CLONE_NEWNET, NsRef::Net(nsp.net_ns.clone())),
+        ];
+        for (flag, ns) in &order {
+            if self.flags & flag != 0 {
+                self.install(ns)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Linux mntns_install: CAP_SYS_ADMIN and CAP_SYS_CHROOT, an fs
     /// context of its own; root and cwd go to the namespace's root,
     /// past what is mounted there (LOOKUP_DOWN)
@@ -179,23 +214,41 @@ impl NsSet {
     }
 }
 
-/// setns(2): join the namespace the namespace file `fd` holds; a
-/// nonzero `flags` must name its type (EINVAL). EBADF for a bad fd,
-/// EINVAL for a file that is no namespace file.
-pub fn sys_setns(fd: i32, flags: i32) -> KernelResult<()> {
-    let file = crate::fs::io::fget(fd)?;
-    let flags = u64::from(flags as u32);
-    let nsfs = crate::fs::pseudo::nsfs::proc_ns_file(&file);
-    let ns = file
-        .get_inode()
-        .filter(|_| nsfs)
-        .and_then(|i| crate::fs::pseudo::nsfs::get_proc_ns(&i))
-        .ok_or(KernelError::InvalidArgument)?;
-    if flags != 0 && flags != ns.ns_type() {
+/// The flags a pidfd setns takes (Linux check_setns_flags): some, and
+/// only namespace types hk has (CLONE_NEWTIME is EINVAL, as Linux
+/// without CONFIG_TIME_NS)
+fn check_setns_flags(flags: u64) -> KernelResult<()> {
+    if flags == 0 || flags & !CLONE_NS_FLAGS != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let mut set = NsSet::prepare(ns.ns_type())?;
-    set.install(&ns)?;
+    Ok(())
+}
+
+/// setns(2): join the namespace the namespace file `fd` holds (a
+/// nonzero `flags` must name its type), or the namespaces `flags`
+/// names of the task the pidfd `fd` refers to. EBADF for a bad fd,
+/// EINVAL for any other file.
+pub fn sys_setns(fd: i32, flags: i32) -> KernelResult<()> {
+    use crate::fs::pseudo::nsfs;
+    let file = crate::fs::io::fget(fd)?;
+    let flags = u64::from(flags as u32);
+    if nsfs::proc_ns_file(&file) {
+        let ns = file
+            .get_inode()
+            .and_then(|i| nsfs::get_proc_ns(&i))
+            .ok_or(KernelError::InvalidArgument)?;
+        if flags != 0 && flags != ns.ns_type() {
+            return Err(KernelError::InvalidArgument);
+        }
+        let mut set = NsSet::prepare(ns.ns_type())?;
+        set.install(&ns)?;
+        set.commit();
+        return Ok(());
+    }
+    let pidfd = crate::task::pidfd::get_pidfd(&file).ok_or(KernelError::InvalidArgument)?;
+    check_setns_flags(flags)?;
+    let mut set = NsSet::prepare(flags)?;
+    set.install_from(pidfd.pid_ref())?;
     set.commit();
     Ok(())
 }

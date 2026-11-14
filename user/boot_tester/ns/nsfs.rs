@@ -10,6 +10,10 @@
 //! bind mount of its file each still join it with setns, which sees
 //! its hostname; a mismatched nstype or a file that is no namespace
 //! file is EINVAL.
+//!
+//! NSFS_PIDFD: setns with a pidfd joins the namespaces its flags name
+//! of that task (Linux validate_nsset); no flags or a flag that is no
+//! namespace type is EINVAL, a reaped task ESRCH.
 
 use super::{first_bad, fstat, in_child, ns_link, pid_path, stat};
 use crate::harness::verdict_detail;
@@ -20,6 +24,7 @@ use hk_syscall::{
 };
 
 const EINVAL: i64 = -22;
+const ESRCH: i64 = -3;
 const MS_BIND: u64 = 4096;
 const MS_REC: u64 = 16384;
 const MS_PRIVATE: u64 = 1 << 18;
@@ -29,6 +34,8 @@ pub fn run_tests() {
     verdict_detail(b"NSFS_INODE", r == 0, r);
     let r = in_child(pin_child);
     verdict_detail(b"NSFS_PIN", r == 0, r);
+    let r = in_child(pidfd_child);
+    verdict_detail(b"NSFS_PIDFD", r == 0, r);
 }
 
 /// Each link's name and what it reads
@@ -119,7 +126,8 @@ fn pinned_task(up: [i32; 2], down: [i32; 2]) -> i64 {
     if c == 0 {
         sys_close(up[0] as u64);
         sys_close(down[1] as u64);
-        let ok = sys_unshare(CLONE_NEWUTS) == 0 && sys_sethostname(b"nsfspin".as_ptr(), 7) == 0;
+        let ok = sys_unshare(CLONE_NEWUTS | CLONE_NEWNET) == 0
+            && sys_sethostname(b"nsfspin".as_ptr(), 7) == 0;
         sys_write(up[1] as u64, b"x".as_ptr(), u64::from(ok));
         sys_close(up[1] as u64);
         let mut x = 0u8;
@@ -201,4 +209,42 @@ fn pin_child() -> u8 {
         hostname_is(b"nsfspin"),
     ];
     first_bad(&steps)
+}
+
+/// Child of NSFS_PIDFD
+fn pidfd_child() -> u8 {
+    let (mut up, mut down) = ([0i32; 2], [0i32; 2]);
+    if sys_pipe(up.as_mut_ptr()) != 0 || sys_pipe(down.as_mut_ptr()) != 0 {
+        return 100;
+    }
+    let c = pinned_task(up, down);
+    sys_close(up[1] as u64);
+    sys_close(down[0] as u64);
+    let mut x = 0u8;
+    if c < 0 || sys_read(up[0] as u64, &mut x, 1) != 1 {
+        return 101;
+    }
+    let mut b = [0u8; 64];
+    let net = ns_link(pid_path(&mut b, b"/proc/", c, b"/ns/net"), b"net");
+    let pfd = hk_syscall::sys_pidfd_open(c as i32, 0);
+    let fd = pfd as i32;
+    let steps1 = [
+        pfd >= 0 && net != 0,
+        sys_setns(fd, 0) == EINVAL,
+        sys_setns(fd, (CLONE_NEWUTS | 1) as i32) == EINVAL,
+        sys_setns(fd, (CLONE_NEWUTS | CLONE_NEWNET) as i32) == 0,
+        hostname_is(b"nsfspin"),
+        ns_link(b"/proc/self/ns/net\0", b"net") == net,
+    ];
+    sys_close(down[1] as u64);
+    let mut ws = 0;
+    let reaped = sys_wait4(c, &mut ws, 0, 0) == c;
+    let bad = first_bad(&steps1);
+    if bad != 0 {
+        return bad;
+    }
+    match first_bad(&[reaped, sys_setns(fd, CLONE_NEWUTS as i32) == ESRCH]) {
+        0 => 0,
+        n => 10 + n,
+    }
 }
