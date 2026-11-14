@@ -26,12 +26,17 @@ use super::mount::MountRef;
 ///     struct dentry *dentry;
 /// };
 /// ```
+///
+/// The dentry is put before the mount (Linux path_put: dput, then
+/// mntput; fields drop in order): what the dentry alone keeps (its
+/// inode, whose eviction looks at the superblock) goes while the
+/// mount still keeps the superblock.
 #[derive(Clone)]
 pub struct Path {
-    /// The mount point this path is on
-    pub mnt: MountRef,
     /// The dentry within that mount
     pub dentry: DentryRef,
+    /// The mount point this path is on
+    pub mnt: MountRef,
 }
 
 impl Path {

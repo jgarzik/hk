@@ -5,6 +5,7 @@
 
 use crate::arch::ArchPageTable;
 use crate::fs::FileRef;
+use crate::fs::file::DenyWrite;
 use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use alloc::vec::Vec;
 
@@ -1060,10 +1061,7 @@ where
     let (file, argv) = resolve_scripts(file, argv, pathname, path_inaccessible)?;
     // No writer while it runs, and none now (Linux do_open_execat ->
     // exe_file_deny_write_access): ETXTBSY if open for writing
-    let deny = file
-        .get_inode()
-        .map(|i| i.deny_write_access())
-        .transpose()?;
+    let exe_file = DenyWrite::new(&file)?;
     // To the least loaded CPU while the footprint is small (Linux
     // bprm_execve -> sched_exec)
     percpu::sched_exec();
@@ -1082,11 +1080,7 @@ where
     };
     // Denied while it loads (Linux open_exec of the interpreter,
     // allowed again once it is loaded)
-    let _interp_deny = interp_file
-        .as_ref()
-        .and_then(|f| f.get_inode())
-        .map(|i| i.deny_write_access())
-        .transpose()?;
+    let _interp_deny = interp_file.as_ref().map(DenyWrite::new).transpose()?;
     let Ok(interp_image) = interp_file.as_deref().map(FileImage::new).transpose() else {
         return Err(KernelError::LibBad);
     };
@@ -1262,7 +1256,7 @@ where
     {
         let mut m = mm.mmap_write();
         m.set_brk(start_brk);
-        m.set_exe(file.f_path(), deny);
+        m.set_exe(exe_file);
         let code = image_layout(&elf, base_addr);
         m.set_args(MmLayout {
             start_code: code.start_code,

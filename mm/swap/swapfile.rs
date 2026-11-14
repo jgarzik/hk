@@ -35,7 +35,8 @@ use crate::sync::spin::{Mutex, RwLock};
 
 use super::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
-use crate::fs::{Inode, lookup_path};
+use crate::fs::namei::path_lookupat;
+use crate::fs::{Inode, LookupFlags, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::mm::page::frame_bytes;
 use crate::mm::xarray::XArray;
@@ -157,6 +158,11 @@ pub struct SwapInfo {
     pub(super) cached: AtomicU64,
     /// Its users, each a [`SwapDev`] (Linux si->users)
     users: PercpuRef,
+    /// What swapon opened (Linux si->swap_file's path): its mount stays
+    /// busy, so the swap file or device node outlives no mount of its
+    /// filesystem (umount is EBUSY meanwhile). Last, so the inode and
+    /// device go before it.
+    swap_file: Option<crate::fs::Path>,
 }
 
 impl Drop for SwapInfo {
@@ -232,6 +238,7 @@ impl SwapInfo {
             cache: IrqSpinlock::new(XArray::new()),
             cached: AtomicU64::new(0),
             users: PercpuRef::new()?,
+            swap_file: None,
         })
     }
 
@@ -554,10 +561,10 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         return Err(KernelError::NotPermitted);
     }
     let path = user_path(path)?;
-    let inode = lookup_path(&path)
-        .map_err(|_| KernelError::NotFound)?
-        .get_inode()
-        .ok_or(KernelError::NotFound)?;
+    let cwd = crate::task::percpu::current_cwd();
+    let swap_file =
+        path_lookupat(cwd, &path, LookupFlags::open()).map_err(|_| KernelError::NotFound)?;
+    let inode = swap_file.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let _g = SWAPON.lock();
     if find_swap_by_path(&path).is_some() {
         return Err(KernelError::Busy);
@@ -611,7 +618,9 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         Some(b) => (None, Some(b)),
         None => (Some(inode), None),
     };
-    let si = try_arc(SwapInfo::new(backing, path, swap_type, max, priority)?)?;
+    let mut si = SwapInfo::new(backing, path, swap_type, max, priority)?;
+    si.swap_file = Some(swap_file);
+    let si = try_arc(si)?;
     // S_SWAPFILE under i_rwsem (Linux claim_swapfile under inode_lock):
     // a write or truncate in flight finishes first, later ones see it
     let si_inode = si.swapfile_inode();

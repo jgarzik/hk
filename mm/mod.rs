@@ -168,11 +168,11 @@ pub struct MmStruct {
     /// Default flags for new VMAs (set by mlockall with MCL_FUTURE)
     /// Contains VM_LOCKED and/or VM_LOCKONFAULT when MCL_FUTURE is active
     def_flags: u32,
-    /// The executable (Linux mm->exe_file's path), for /proc/<pid>/exe
-    exe: Option<crate::fs::Path>,
-    /// Writes to the executable denied while this image runs (Linux
-    /// mm->exe_file's deny_write_access)
-    exe_deny: Option<crate::fs::inode::DenyWrite>,
+    /// The executable, writes to it denied while this image runs (Linux
+    /// mm->exe_file): /proc/<pid>/exe. Released with the mappings by
+    /// the last user (Linux __mmput), never by the last mm_count
+    /// reference, which may go with interrupts off (finish_task_switch)
+    exe_file: Option<crate::fs::file::DenyWrite>,
     /// Where exec put the image, arguments and environment
     args: MmLayout,
     /// The address space these VMAs belong to and its top-level table,
@@ -307,23 +307,18 @@ impl MmStruct {
 
     /// The executable's path (/proc/<pid>/exe)
     pub fn exe(&self) -> Option<crate::fs::Path> {
-        self.exe.clone()
+        self.exe_file.as_ref().and_then(|f| f.file().f_path())
     }
 
-    /// Take the executable's path away (the last user's exit), to drop
-    /// it with no lock held
-    pub fn take_exe(&mut self) -> Option<crate::fs::Path> {
-        self.exe.take()
+    /// Take the executable away (the last user's exit, Linux __mmput's
+    /// set_mm_exe_file(mm, NULL)), to drop it with no lock held
+    pub fn take_exe(&mut self) -> Option<crate::fs::file::DenyWrite> {
+        self.exe_file.take()
     }
 
-    /// Record the executable at exec
-    pub fn set_exe(
-        &mut self,
-        path: Option<crate::fs::Path>,
-        deny: Option<crate::fs::inode::DenyWrite>,
-    ) {
-        self.exe = path;
-        self.exe_deny = deny;
+    /// Record the executable at exec (Linux set_mm_exe_file)
+    pub fn set_exe(&mut self, exe: crate::fs::file::DenyWrite) {
+        self.exe_file = Some(exe);
     }
 
     /// Set the program break region (called during ELF loading)
@@ -1170,8 +1165,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> KernelResult<MmRef> {
     header.start_brk = guard.start_brk;
     header.brk = guard.brk;
     header.total_vm = guard.total_vm;
-    header.exe = guard.exe.clone();
-    header.exe_deny = guard.exe_deny.clone();
+    header.exe_file = guard.exe_file.clone();
     header.args = guard.args;
     let child = MmRef::new(pgd, header);
     // The child's mm lock for writing, nested in the parent's (Linux

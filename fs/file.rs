@@ -1188,6 +1188,61 @@ impl Drop for FileRef {
     }
 }
 
+/// Writes denied to a file's inode while a program runs from it or
+/// loads it (Linux exe_file_deny_write_access on a `struct file`,
+/// exe_file_allow_write_access before its fput). It holds the file,
+/// so the file's mount, and with it the superblock, outlives the
+/// inode it keeps: as in Linux, no inode in use outlives every mount
+/// of its filesystem. The address space's executable (Linux
+/// mm->exe_file) is one.
+pub struct DenyWrite {
+    /// Let go first, as Linux allows writes before the fput
+    inode: Option<Arc<Inode>>,
+    file: FileRef,
+}
+
+impl DenyWrite {
+    /// Deny writes to `file`'s inode: ETXTBSY while it is open for
+    /// writing
+    pub fn new(file: &FileRef) -> Result<Self, KernelError> {
+        let inode = file.get_inode();
+        if let Some(i) = &inode {
+            i.deny_write()?;
+        }
+        Ok(Self {
+            inode,
+            file: file.clone(),
+        })
+    }
+
+    /// The file
+    pub fn file(&self) -> &FileRef {
+        &self.file
+    }
+}
+
+/// fork's copy of the address space denies writes again (Linux
+/// dup_mm_exe_file)
+impl Clone for DenyWrite {
+    fn clone(&self) -> Self {
+        if let Some(i) = &self.inode {
+            i.deny_write_again();
+        }
+        Self {
+            inode: self.inode.clone(),
+            file: self.file.clone(),
+        }
+    }
+}
+
+impl Drop for DenyWrite {
+    fn drop(&mut self) {
+        if let Some(i) = &self.inode {
+            i.allow_write();
+        }
+    }
+}
+
 /// Drop a reference (Linux fput): the last one's release runs later,
 /// with nothing held, in the dropping task on its way back to user mode
 /// (task_work), or from interrupt context, a kernel thread or a task
