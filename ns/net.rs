@@ -55,8 +55,11 @@ pub struct NetNamespace {
     /// Unique id: the sysfs namespace tag of its devices
     pub id: u64,
 
-    /// Its inode number (Linux ns.inum)
-    pub inum: super::inum::Inum,
+    /// Its inode number and nsfs dentry (Linux ns)
+    pub ns: super::NsCommon,
+
+    /// The user namespace that owns it (Linux net->user_ns)
+    pub user_ns: Arc<super::UserNamespace>,
 
     /// Network devices in this namespace (registration = ifindex order;
     /// Linux dev_base_head): read under RCU, changed under RTNL
@@ -165,28 +168,35 @@ impl Drop for NetRef {
 }
 
 impl NetNamespace {
-    /// Create a new network namespace with loopback device, or ENOMEM
-    /// (Linux copy_net_ns -> setup_net)
-    pub fn create() -> Result<NetRef, KernelError> {
+    /// Create a new network namespace owned by `user_ns` with loopback
+    /// device, or ENOMEM (Linux copy_net_ns -> setup_net)
+    pub fn create(user_ns: &Arc<super::UserNamespace>) -> Result<NetRef, KernelError> {
         // The device first: nothing to undo but itself
         let lo = try_arc(loopback_device(try_arc(LoopbackOps)?))?;
-        let ns = try_arc(Self::fresh(super::inum::Inum::alloc()?)?)?;
+        let ns = try_arc(Self::fresh(super::inum::Inum::alloc()?, user_ns.clone())?)?;
         Ok(Self::attach(ns, lo))
     }
 
     /// The initial namespace (boot: failure cannot be reported)
     fn new_init() -> NetRef {
-        let ns = Self::fresh(super::inum::Inum::fixed(super::inum::NET_INIT));
+        let ns = Self::fresh(
+            super::inum::Inum::fixed(super::inum::NET_INIT),
+            super::INIT_USER_NS.clone(),
+        );
         let ns = arc_nofail(ns.expect("init_net: no memory at boot"));
         let lo = arc_nofail(loopback_device(arc_nofail(LoopbackOps)));
         Self::attach(ns, lo)
     }
 
     /// A namespace's state, before it is listed and has its loopback
-    fn fresh(inum: super::inum::Inum) -> Result<Self, KernelError> {
+    fn fresh(
+        inum: super::inum::Inum,
+        user_ns: Arc<super::UserNamespace>,
+    ) -> Result<Self, KernelError> {
         Ok(Self {
             id: NEXT_NET_ID.fetch_add(1, Ordering::Relaxed),
-            inum,
+            ns: super::NsCommon::new(inum),
+            user_ns,
             devices: RcuList::new(),
             next_ifindex: AtomicU32::new(1),
             fib: Fib::new()?,
@@ -234,8 +244,8 @@ impl NetNamespace {
     ///
     /// Network namespaces don't copy state - new namespace starts fresh
     /// with only loopback device (unlike mount namespace which clones tree).
-    pub fn clone_ns(&self) -> Result<NetRef, KernelError> {
-        Self::create()
+    pub fn clone_ns(&self, user_ns: &Arc<super::UserNamespace>) -> Result<NetRef, KernelError> {
+        Self::create(user_ns)
     }
 
     /// An active reference if the namespace still has one (Linux

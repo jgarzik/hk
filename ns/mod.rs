@@ -23,6 +23,7 @@
 //! VFS locks → Namespace locks → Filesystem context → Per-CPU scheduler → TASKLIST
 
 pub mod cgroup;
+pub mod common;
 pub mod inum;
 pub mod net;
 pub mod pid;
@@ -37,6 +38,7 @@ use alloc::sync::{Arc, Weak};
 use spin::Lazy;
 
 pub use cgroup::{CgroupNamespace, INIT_CGROUP_NS};
+pub use common::NsCommon;
 pub use pid::{INIT_PID_NS, PidNamespace};
 pub use user::{INIT_USER_NS, UidGidExtent, UidGidMap, UserNamespace};
 pub use uts::{__NEW_UTS_LEN, INIT_UTS_NS, NewUtsname, UTS_FIELD_SIZE, UtsNamespace};
@@ -136,8 +138,8 @@ pub struct MntNamespace {
     pub id: u64,
     /// Root mount of this namespace
     pub root: RwLock<Option<MountRef>>,
-    /// Its inode number (Linux ns.inum)
-    pub inum: inum::Inum,
+    /// Its inode number (Linux ns)
+    pub ns: NsCommon,
     /// The user namespace that owns it (Linux mnt_namespace.user_ns),
     /// set at creation
     pub user_ns: Arc<UserNamespace>,
@@ -168,7 +170,7 @@ impl MntNamespace {
         Self {
             id: NEXT_MNT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             root: RwLock::new(None),
-            inum,
+            ns: NsCommon::new(inum),
             user_ns,
         }
     }
@@ -307,18 +309,18 @@ impl NsProxy {
     /// * `Ok(Arc<NsProxy>)` - New nsproxy (may share namespaces with self)
     /// * `Err(errno)` - On allocation failure
     pub fn copy(&self, flags: u64, fs: Option<&crate::fs::FsStruct>) -> KernelResult<Arc<Self>> {
-        let uts_ns = if flags & CLONE_NEWUTS != 0 {
-            self.uts_ns.clone_ns()?
-        } else {
-            self.uts_ns.clone()
-        };
-
-        // First: a mount namespace copy is owned by it (Linux
+        // First: every new namespace is owned by it (Linux
         // create_new_namespaces' user_ns, the new creds')
         let user_ns = if flags & CLONE_NEWUSER != 0 {
             UserNamespace::clone_ns(&self.user_ns)?
         } else {
             self.user_ns.clone()
+        };
+
+        let uts_ns = if flags & CLONE_NEWUTS != 0 {
+            self.uts_ns.clone_ns(&user_ns)?
+        } else {
+            self.uts_ns.clone()
         };
 
         let mnt_ns = if flags & CLONE_NEWNS != 0 {
@@ -328,19 +330,19 @@ impl NsProxy {
         };
 
         let pid_ns = if flags & CLONE_NEWPID != 0 {
-            PidNamespace::clone_ns(&self.pid_ns)?
+            PidNamespace::clone_ns(&self.pid_ns, &user_ns)?
         } else {
             self.pid_ns.clone()
         };
 
         let ipc_ns = if flags & CLONE_NEWIPC != 0 {
-            self.ipc_ns.clone_ns()?
+            self.ipc_ns.clone_ns(&user_ns)?
         } else {
             self.ipc_ns.clone()
         };
 
         let net_ns = if flags & CLONE_NEWNET != 0 {
-            self.net_ns.clone_ns()?
+            self.net_ns.clone_ns(&user_ns)?
         } else {
             self.net_ns.clone()
         };
@@ -350,7 +352,7 @@ impl NsProxy {
             // current's css_set, the parent's for a clone)
             let cg = crate::task::percpu::current().cgroup.lock().clone();
             self.cgroup_ns
-                .clone_ns(cg.unwrap_or_else(|| self.cgroup_ns.root()))?
+                .clone_ns(cg.unwrap_or_else(|| self.cgroup_ns.root()), &user_ns)?
         } else {
             self.cgroup_ns.clone()
         };

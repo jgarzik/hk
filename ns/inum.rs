@@ -12,6 +12,7 @@ pub const IPC_INIT: u32 = 0xEFFF_FFFF;
 pub const UTS_INIT: u32 = 0xEFFF_FFFE;
 pub const USER_INIT: u32 = 0xEFFF_FFFD;
 pub const PID_INIT: u32 = 0xEFFF_FFFC;
+pub const CGROUP_INIT: u32 = 0xEFFF_FFFB;
 pub const NET_INIT: u32 = 0xEFFF_FFF9;
 pub const MNT_INIT: u32 = 0xEFFF_FFF8;
 

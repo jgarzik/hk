@@ -145,8 +145,8 @@ pub struct UserNamespace {
     /// Creator's GID in the parent namespace
     pub group: u32,
 
-    /// Its inode number (Linux ns.inum)
-    pub inum: super::inum::Inum,
+    /// Its inode number and nsfs dentry (Linux ns)
+    pub ns: super::NsCommon,
 }
 
 impl UserNamespace {
@@ -160,7 +160,7 @@ impl UserNamespace {
             parent: None,
             owner: 0,
             group: 0,
-            inum: super::inum::Inum::fixed(super::inum::USER_INIT),
+            ns: super::NsCommon::new(super::inum::Inum::fixed(super::inum::USER_INIT)),
         })
     }
 
@@ -192,7 +192,7 @@ impl UserNamespace {
             parent: Some(parent.clone()),
             owner: cred.uid,
             group: cred.gid,
-            inum,
+            ns: super::NsCommon::new(inum),
         })
     }
 

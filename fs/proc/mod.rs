@@ -180,12 +180,12 @@ impl NamespaceType {
     /// ns.inum)
     pub fn inum(&self, ns: &crate::ns::NsProxy) -> u32 {
         match self {
-            Self::Uts => ns.uts_ns.inum.get(),
-            Self::Mnt => ns.mnt_ns.inum.get(),
-            Self::Pid => ns.pid_ns.inum.get(),
-            Self::User => ns.user_ns.inum.get(),
-            Self::Ipc => ns.ipc_ns.inum.get(),
-            Self::Net => ns.net_ns.inum.get(),
+            Self::Uts => ns.uts_ns.ns.inum(),
+            Self::Mnt => ns.mnt_ns.ns.inum(),
+            Self::Pid => ns.pid_ns.ns.inum(),
+            Self::User => ns.user_ns.ns.inum(),
+            Self::Ipc => ns.ipc_ns.ns.inum(),
+            Self::Net => ns.net_ns.ns.inum(),
         }
     }
 
