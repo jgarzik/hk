@@ -63,8 +63,8 @@ unsafe impl UniqueOwner for MntHash {}
 /// Every write of a mount's `mnt_flags` and every change of the mount
 /// tree's links (Linux mount_lock, lock_mount_hash: a seqlock whose
 /// sequence lockless readers may check; read_seqlock_excl is
-/// `read_excl`); under NAMESPACE_SEM, s_umount and (d_path's locking
-/// read) RENAME_LOCK, above nothing but leaves
+/// `read_excl`); under NAMESPACE_SEM and s_umount, above RENAME_LOCK
+/// (d_path, path_is_under) and leaves
 pub static MOUNT_LOCK: SeqLock<MntHash> = SeqLock::new(MntHash(()));
 
 /// Old mount -> its copy, from [`Mount::clone_tree`]
@@ -448,6 +448,35 @@ impl Mount {
         // `Arc`, which cannot finish (nor release its root) before
         // unhanging `self`, under MOUNT_LOCK write.
         Some(unsafe { (&*parent, &*mp) })
+    }
+
+    /// The parent mount and the mountpoint in it, borrowed for an RCU
+    /// read guard's life with no reference (Linux READ_ONCE of
+    /// mnt_parent and mnt_mountpoint in an RCU walk): a walk on them
+    /// checks MOUNT_LOCK's sequence after. None for a mount on no
+    /// parent.
+    pub fn up_rcu<'g>(
+        &self,
+        _g: &'g crate::sync::rcu::RcuReadGuard,
+    ) -> Option<(&'g Mount, &'g Dentry)> {
+        let parent = self.parent.read().as_ref().map(Weak::as_ptr)?;
+        let mp = self.mountpoint.read().as_ref().map(DentryRef::as_ptr)?;
+        // SAFETY: each link was set when read under the guard: the parent
+        // then still had `self` hung on it, and is freed only a grace
+        // period after its teardown, which unhangs `self` first
+        // (`kfree_rcu` in `__cleanup_mnt`); the mountpoint was then a
+        // reference `self` held, and a dentry is freed only a grace
+        // period after its last one goes. Both frees wait for `_g`.
+        Some(unsafe { (&*parent, &*mp) })
+    }
+
+    /// The root dentry's address, read even after the teardown released
+    /// it (Linux compares mnt_root of a mount an RCU walk reached): for
+    /// comparison only
+    pub(super) fn root_addr(&self) -> *const Dentry {
+        // SAFETY: the cell holds a `DentryRef`'s bits, which `take`
+        // leaves in place; only its address is read
+        DentryRef::as_ptr(unsafe { &*self.root.stale() })
     }
 
     /// The parent mount, borrowed from the lock `_s` holds the tree
@@ -1104,17 +1133,20 @@ fn graft(ns: &mut NsTree, t: MountRef, mp: &Path) {
     }
 }
 
-/// `p` is at or below `root`, across mounts (Linux is_path_reachable,
-/// path_is_under)
+/// `p` is at or below `root`, across mounts (Linux path_is_under:
+/// is_path_reachable under mount_lock's locking read, the mounts
+/// borrowed from it, then is_subdir, which reads RENAME_LOCK's
+/// sequence inside it)
 pub fn is_path_reachable(p: &Path, root: &Path) -> bool {
-    let (mut mnt, mut d) = (p.mnt.clone(), p.dentry.clone());
-    while !MountRef::ptr_eq(&mnt, &root.mnt) {
-        match (mnt.get_parent(), mnt.get_mountpoint()) {
-            (Some(m), Some(mp)) => (mnt, d) = (m, mp),
-            _ => return false,
+    let ml = MOUNT_LOCK.read_excl();
+    let (mut mnt, mut d): (&Mount, &Dentry) = (&p.mnt, &p.dentry);
+    while !core::ptr::eq(mnt, MountRef::as_ptr(&root.mnt)) {
+        match mnt.up(&ml) {
+            Some(up) => (mnt, d) = up,
+            None => return false,
         }
     }
-    super::is_subdir(&d, &root.dentry)
+    super::dentry::is_subdir_borrowed(d, &root.dentry)
 }
 
 /// The mountpoint's i_rwsem (Linux lock_mount): a directory removed

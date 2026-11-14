@@ -367,8 +367,16 @@ impl<T> MntOwned<T> {
     /// list that hands out a borrowed one.
     pub(super) unsafe fn take(&self) -> T {
         // SAFETY: the caller's contract: this is the one release. A raw
-        // read, no `&mut`: the bits stay
+        // read, no `&mut`: the bits stay, for `stale`
         unsafe { ManuallyDrop::into_inner(core::ptr::read(self.0.get())) }
+    }
+
+    /// The value's bits, which `take` leaves in place (Linux: the
+    /// pointer fields of a mount torn down but not yet freed): for an
+    /// RCU walk that may reach the mount after its teardown, to compare
+    /// addresses, never to use the value
+    pub(super) fn stale(&self) -> *const T {
+        self.0.get().cast::<T>()
     }
 }
 

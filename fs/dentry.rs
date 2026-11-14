@@ -50,18 +50,13 @@ pub struct DentryFlags {
 /// The dcache's tree shape (Linux rename_lock): held for writing by
 /// d_move / d_exchange, which bumps its sequence; for reading by
 /// whoever walks parents and names and needs one consistent picture
-/// (is_subdir, full_path). A scoped walk (RESOLVE_BENEATH /
+/// (is_subdir, d_path, dentry_path: lockless first, under the lock if
+/// a rename raced; inside MOUNT_LOCK). A scoped walk (RESOLVE_BENEATH /
 /// RESOLVE_IN_ROOT) samples the sequence at its start and gives up
 /// (EAGAIN) if a ".." raced a rename. A locking read excludes other
 /// readers, as Linux read_seqlock_excl. Spinning, never taken in IRQ
 /// context; taken before any d_lock.
 static RENAME_LOCK: crate::sync::SeqLock = crate::sync::SeqLock::new(());
-
-/// RENAME_LOCK held for reading, as a proof [`Dentry::parent_under`]
-/// borrows from (no other lock's guard passes for it)
-struct RenameRead<'a> {
-    _g: crate::sync::spin::MutexGuard<'a, ()>,
-}
 
 /// Sample the rename sequence (Linux path_init's r_seq)
 pub fn rename_seq_begin() -> u32 {
@@ -478,16 +473,19 @@ impl Dentry {
         (!p.is_null()).then(|| unsafe { DentryRef::clone_raw(p) })
     }
 
-    /// The parent, borrowed while `_r` (RENAME_LOCK read) is held: no
-    /// reference is taken (Linux d_parent under rename_lock). Only
-    /// d_move / d_exchange repoint a dentry in the tree, under the
-    /// write side; `Dentry::add` only re-sets the parent it had; and the
-    /// dentry's own reference keeps its parent alive.
-    fn parent_under<'a>(&'a self, _r: &'a RenameRead<'_>) -> Option<&'a Dentry> {
+    /// The parent, borrowed for an RCU read guard's life with no
+    /// reference (Linux READ_ONCE(d_parent) in an RCU walk): the parent
+    /// at the time of the read, or for a killed dentry the one it held
+    /// until its kill. A walk on it checks RENAME_LOCK's sequence after,
+    /// or holds that lock (then it is the parent still).
+    fn parent_rcu<'g>(&self, _g: &'g crate::sync::rcu::RcuReadGuard) -> Option<&'g Dentry> {
         let p = self.parent_ptr();
-        // SAFETY: as above: while `_r` is held and `self` lives, the
-        // pointer stays this dentry's parent and the reference it holds
-        // keeps it alive
+        // SAFETY: `self` is readable under the guard, so it was live when
+        // the guard began or reached through links read under it; its
+        // `d_parent` then held a reference when the guard began, or was
+        // released by a kill after that. Either way the parent's free
+        // (`dentry_kill`'s call_rcu) comes after the guard began, and
+        // waits for it.
         unsafe { p.as_ref() }
     }
 
@@ -552,6 +550,11 @@ impl Prepend {
         })
     }
 
+    /// Empty again, for another pass
+    fn reset(&mut self) {
+        self.pos = PATH_MAX - 1;
+    }
+
     /// "/name" of `d` in front (ENAMETOOLONG when it does not fit)
     fn name(&mut self, d: &Dentry) -> Result<(), KernelError> {
         let dn = d.d_name.read();
@@ -581,46 +584,62 @@ impl Prepend {
 
 /// The name of `p` as seen from `root` (Linux prepend_path): climbs
 /// dentry parents and, at a mount's root, to its mountpoint in the
-/// parent mount; one consistent picture under MOUNT_LOCK (a locking
-/// read: the mount tree's links) and RENAME_LOCK (the dentry tree's).
-/// Like Linux it takes no reference: what it passes is borrowed from
-/// those locks, so nothing is dropped (and no teardown runs) under
-/// them. The bool is false when the walk ended without meeting `root`
-/// (a path outside the caller's root, or on a detached mount): the
-/// name then starts at whatever root it reached. ENAMETOOLONG past
-/// PATH_MAX (its NUL included), ENOMEM without a buffer.
+/// parent mount. Like Linux it walks first with no lock, under an RCU
+/// read guard (dentries and mounts are freed a grace period after they
+/// go), and trusts the result only if neither MOUNT_LOCK's sequence
+/// (the mount tree's links) nor RENAME_LOCK's (the dentry tree's)
+/// moved; otherwise it walks again under that lock's locking read
+/// (read_seqbegin_or_lock, mount_lock outside rename_lock). It takes no
+/// reference, so nothing is dropped inside the walk. The bool is false
+/// when the walk ended without meeting `root` (a path outside the
+/// caller's root, or on a detached mount): the name then starts at
+/// whatever root it reached. ENAMETOOLONG past PATH_MAX (its NUL
+/// included), ENOMEM without a buffer.
 pub fn try_d_path(p: &Path, root: &Path) -> Result<(Vec<u8>, bool), KernelError> {
     let mut b = Prepend::new()?;
-    let reached = {
-        // Linux prepend_path's order: rename_lock, then mount_lock
-        let r = RenameRead {
-            _g: RENAME_LOCK.read_excl(),
-        };
-        let ml = MOUNT_LOCK.read_excl();
-        let (mut mnt, mut d): (&Mount, &Dentry) = (&p.mnt, &p.dentry);
-        loop {
-            if core::ptr::eq(mnt, MountRef::as_ptr(&root.mnt))
-                && core::ptr::eq(d, DentryRef::as_ptr(&root.dentry))
-            {
-                break true;
-            }
-            if core::ptr::eq(d, DentryRef::as_ptr(&mnt.root)) {
-                match mnt.up(&ml) {
-                    Some(up) => {
-                        (mnt, d) = up;
-                        continue;
-                    }
-                    None => break false,
-                }
-            }
-            let Some(parent) = d.parent_under(&r) else {
-                break false;
-            };
-            b.name(d)?;
-            d = parent;
-        }
-    };
+    let g = crate::sync::rcu::read_lock();
+    let reached = MOUNT_LOCK.read_or_lock(|_| {
+        RENAME_LOCK.read_or_lock(|_| {
+            b.reset();
+            prepend_path(&mut b, p, root, &g)
+        })
+    })?;
+    drop(g);
     Ok((b.into_name(), reached))
+}
+
+/// One pass of [`try_d_path`]'s walk (Linux __prepend_path), on what
+/// `g` keeps readable: on a changing tree it may go wrong (a name too
+/// long, the wrong root), never unsafe; the caller decides by the
+/// sequences
+fn prepend_path(
+    b: &mut Prepend,
+    p: &Path,
+    root: &Path,
+    g: &crate::sync::rcu::RcuReadGuard,
+) -> Result<bool, KernelError> {
+    let (mut mnt, mut d): (&Mount, &Dentry) = (&p.mnt, &p.dentry);
+    loop {
+        if core::ptr::eq(mnt, MountRef::as_ptr(&root.mnt))
+            && core::ptr::eq(d, DentryRef::as_ptr(&root.dentry))
+        {
+            return Ok(true);
+        }
+        if core::ptr::eq(d, mnt.root_addr()) {
+            match mnt.up_rcu(g) {
+                Some(up) => {
+                    (mnt, d) = up;
+                    continue;
+                }
+                None => return Ok(false),
+            }
+        }
+        let Some(parent) = d.parent_rcu(g) else {
+            return Ok(false);
+        };
+        b.name(d)?;
+        d = parent;
+    }
 }
 
 /// [`try_d_path`], with an empty name not reaching `root` when it
@@ -630,20 +649,22 @@ pub fn d_path(p: &Path, root: &Path) -> (Vec<u8>, bool) {
 }
 
 /// The path of `d` from the root of its filesystem (Linux
-/// dentry_path_raw): a mount's root in mountinfo; ENAMETOOLONG past
-/// PATH_MAX
+/// dentry_path_raw): a mount's root in mountinfo; lockless first, as
+/// [`try_d_path`], again under RENAME_LOCK if a rename raced it;
+/// ENAMETOOLONG past PATH_MAX
 pub fn dentry_path(d: &DentryRef) -> Result<Vec<u8>, KernelError> {
     let mut b = Prepend::new()?;
-    {
-        let r = RenameRead {
-            _g: RENAME_LOCK.read_excl(),
-        };
+    let g = crate::sync::rcu::read_lock();
+    RENAME_LOCK.read_or_lock(|_| {
+        b.reset();
         let mut cur: &Dentry = d;
-        while let Some(p) = cur.parent_under(&r) {
+        while let Some(p) = cur.parent_rcu(&g) {
             b.name(cur)?;
             cur = p;
         }
-    }
+        Ok::<(), KernelError>(())
+    })?;
+    drop(g);
     Ok(b.into_name())
 }
 
@@ -1055,22 +1076,30 @@ pub static DCACHE: DentryCache = DentryCache::new();
 ///
 /// Following Linux's is_subdir() in fs/dcache.c
 pub fn is_subdir(child: &DentryRef, ancestor: &DentryRef) -> bool {
+    is_subdir_borrowed(child, ancestor)
+}
+
+/// [`is_subdir`] of dentries the caller keeps by other means (a lock
+/// that pins the mount tree it borrowed them from)
+pub fn is_subdir_borrowed(child: &Dentry, ancestor: &Dentry) -> bool {
     // Same dentry - trivially true
-    if DentryRef::ptr_eq(child, ancestor) {
+    if core::ptr::eq(child, ancestor) {
         return true;
     }
 
-    // Walk up the parent chain from child, one picture of the tree
-    let _r = RENAME_LOCK.read_excl();
-    let mut current = child.get_parent();
-    while let Some(parent) = current {
-        if DentryRef::ptr_eq(&parent, ancestor) {
-            return true;
+    // Lockless once, under the lock if a rename raced it (Linux: rcu,
+    // read_seqbegin, d_ancestor, read_seqlock_excl on retry)
+    let g = crate::sync::rcu::read_lock();
+    RENAME_LOCK.read_or_lock(|_| {
+        let mut cur: &Dentry = child;
+        while let Some(p) = cur.parent_rcu(&g) {
+            if core::ptr::eq(p, ancestor) {
+                return true;
+            }
+            cur = p;
         }
-        current = parent.get_parent();
-    }
-
-    false
+        false
+    })
 }
 
 #[cfg(test)]
