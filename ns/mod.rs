@@ -94,7 +94,7 @@ impl Drop for MntNamespace {
     /// unshare/setns, or a namespace file's deferred release); first
     /// it leaves the namespace tree (Linux mnt_ns_tree_remove)
     fn drop(&mut self) {
-        let node = MNT_NS_TREE.lock().remove_node(&self.id);
+        let node = MNT_NS_TREE.lock().remove_node(&self.id());
         drop(node);
         if let Some(root) = self.root.get_mut().take() {
             crate::fs::mount::put_mnt_ns(root);
@@ -102,16 +102,23 @@ impl Drop for MntNamespace {
     }
 }
 
+/// A mount namespace's entry in the namespace tree: its owning user
+/// namespace and itself, neither kept alive by it
+type MntNsEntry = (Weak<UserNamespace>, Weak<MntNamespace>);
+
 /// Live mount namespaces by id, each with its owning user namespace
 /// (Linux mnt_ns_tree, which finds a namespace from a mount's mnt_ns id
-/// here): a namespace is added once made, removed at its end. A spin
-/// leaf (Linux mnt_ns_tree_lock), taken under NAMESPACE_SEM by graft.
-static MNT_NS_TREE: crate::sync::spin::Mutex<RbTree<u64, Weak<UserNamespace>>> =
+/// here, and ns_tree's list NS_MNT_GET_NEXT/PREV walk): a namespace is
+/// added once made, removed at its end. A spin leaf (Linux
+/// mnt_ns_tree_lock), taken under NAMESPACE_SEM by graft; nothing is
+/// upgraded or dropped but a `Weak` under it.
+static MNT_NS_TREE: crate::sync::spin::Mutex<RbTree<u64, MntNsEntry>> =
     crate::sync::spin::Mutex::new(RbTree::new());
 
 /// Add `ns` to the namespace tree (Linux mnt_ns_tree_add)
-fn mnt_ns_tree_add(ns: &MntNamespace, node: RbTreeNodeReservation<u64, Weak<UserNamespace>>) {
-    let node = node.into_node(ns.id, Arc::downgrade(&ns.user_ns));
+fn mnt_ns_tree_add(ns: &Arc<MntNamespace>, node: RbTreeNodeReservation<u64, MntNsEntry>) {
+    let e = (Arc::downgrade(&ns.user_ns), Arc::downgrade(ns));
+    let node = node.into_node(ns.id(), e);
     let old = MNT_NS_TREE.lock().insert(node);
     debug_assert!(old.is_none(), "ns: a mount namespace id reused");
 }
@@ -122,22 +129,46 @@ fn mnt_ns_tree_add(ns: &MntNamespace, node: RbTreeNodeReservation<u64, Weak<User
 pub fn mnt_ns_same_owner(a: u64, b: u64) -> bool {
     let t = MNT_NS_TREE.lock();
     match (t.get(&a), t.get(&b)) {
-        (Some(x), Some(y)) => Weak::ptr_eq(x, y),
+        (Some(x), Some(y)) => Weak::ptr_eq(&x.0, &y.0),
         _ => false,
     }
 }
 
-/// Next mount namespace id (Linux ns_common.ns_id): never reused, so
-/// a mount that outlived its namespace matches no other
-static NEXT_MNT_NS_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// The live mount namespace after (or with `previous` before) the one
+/// numbered `id` in id order whose owner the caller has CAP_SYS_ADMIN
+/// over (Linux get_sequential_mnt_ns, ns_tree_adjoined_rcu): ENOENT
+/// past the end. Each candidate is taken out of the tree's lock as a
+/// `Weak` and upgraded after it, so a dying one is skipped and no last
+/// reference goes under the lock.
+pub fn mnt_ns_adjoined(id: u64, previous: bool) -> Result<Arc<MntNamespace>, KernelError> {
+    let mut at = id;
+    loop {
+        let next = {
+            let t = MNT_NS_TREE.lock();
+            let e = if previous {
+                t.iter().take_while(|(k, _)| **k < at).last()
+            } else {
+                t.range_from(&at.saturating_add(1)).next()
+            };
+            e.map(|(k, v)| (*k, v.1.clone()))
+        };
+        let (k, w) = next.ok_or(KernelError::NotFound)?;
+        at = k;
+        // hk's user namespaces grant no capabilities (BUGS.md): Linux
+        // ns_capable_noaudit(mntns->user_ns, CAP_SYS_ADMIN)
+        if let Some(m) = w.upgrade()
+            && crate::task::capable(crate::task::CAP_SYS_ADMIN)
+        {
+            return Ok(m);
+        }
+    }
+}
 
 /// Mount namespace - per-namespace mount tree
 ///
 /// Each mount namespace has its own view of the filesystem hierarchy.
 /// When CLONE_NEWNS is used, the entire mount tree is cloned.
 pub struct MntNamespace {
-    /// Never-reused id, what `Mount::mnt_ns` names (Linux mnt_ns)
-    pub id: u64,
     /// Root mount of this namespace
     pub root: RwLock<Option<MountRef>>,
     /// Its inode number and nsfs dentry (Linux ns)
@@ -167,10 +198,25 @@ impl MntNamespace {
         ns
     }
 
+    /// Its id, never reused, what `Mount::mnt_ns` names (Linux
+    /// mnt_ns->ns.ns_id)
+    pub fn id(&self) -> u64 {
+        self.ns.ns_id
+    }
+
+    /// The mounts in it (Linux mnt_ns->nr_mounts), by a walk of its
+    /// tree under NAMESPACE_SEM read
+    pub fn nr_mounts(&self) -> usize {
+        let Some(root) = self.get_root() else {
+            return 0;
+        };
+        let g = crate::fs::mount::namespace_read();
+        crate::fs::mount::walk(&root, &*g).count()
+    }
+
     /// An empty namespace numbered `inum`, owned by `user_ns`
     fn with(inum: inum::Inum, user_ns: Arc<UserNamespace>) -> Self {
         Self {
-            id: NEXT_MNT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             root: RwLock::new(None),
             ns: NsCommon::new(inum),
             user_ns,
@@ -194,7 +240,7 @@ impl MntNamespace {
         let slave = !Arc::ptr_eq(user_ns, &self.user_ns);
         let old_root = self.get_root();
         if let Some(old_root) = old_root {
-            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id, slave)?;
+            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id(), slave)?;
             *new_ns.root.write() = Some(new_root);
             if let Some(fs) = fs {
                 fs.repoint(&map);

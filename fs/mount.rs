@@ -1356,7 +1356,7 @@ pub fn attach(
         let _ns = namespace_lock();
         // A namespace's root is set once (Linux alloc_mnt_ns' tree root)
         mnt_ns.set_root(mount.clone())?;
-        mount.set_ns(mnt_ns.id);
+        mount.set_ns(mnt_ns.id());
     }
     Ok(mount)
 }
@@ -1431,7 +1431,7 @@ fn mnt_already_visible(ns: &crate::ns::MntNamespace, sb: &SuperBlock, new: &mut 
 /// `m` is in the caller's mount namespace (Linux check_mnt); under
 /// NAMESPACE_SEM, or an optimistic early check as Linux's
 pub fn check_mnt(m: &Mount) -> bool {
-    m.ns() == crate::ns::current_mnt_ns().id
+    m.ns() == crate::ns::current_mnt_ns().id()
 }
 
 /// The tree at `m`, just hung on its parent, joins the parent's
@@ -1486,7 +1486,7 @@ pub(super) struct CopyEnt {
 /// could make a reference loop (a namespace whose tree holds itself)
 pub fn mnt_ns_loop(d: &Dentry) -> bool {
     super::pseudo::nsfs::mnt_ns_from_dentry(d)
-        .is_some_and(|m| crate::ns::current_mnt_ns().id >= m.id)
+        .is_some_and(|m| crate::ns::current_mnt_ns().id() >= m.id())
 }
 
 /// No mount of the tree at `m` is a namespace file that could make a
