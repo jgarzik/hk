@@ -716,42 +716,38 @@ impl Drop for PipeGuard<'_> {
 /// is there (at most `to`'s room) and returns, 0 at EOF (no writers).
 /// The copy runs under the sleeping `Pipe.inner` (it may fault). Every
 /// read that gets that far, whatever its result, then signals the
-/// O_ASYNC writers (Linux pipe_read's kill_fasync).
+/// O_ASYNC writers (Linux pipe_read's kill_fasync); one a signal
+/// interrupts in its wait returns before (Linux: -ERESTARTSYS).
 fn pipe_read(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
     if to.is_empty() {
         return Ok(0);
     }
-    let r = pipe_read_wait(pipe, to, nonblock);
-    pipe.kill_writers();
-    r
-}
-
-/// pipe_read's wait and copy
-fn pipe_read_wait(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
-    loop {
+    let r = loop {
         let mut inner = pipe.lock();
         if !inner.is_empty() {
             let r = inner.read_to(to);
             drop(inner);
             // Room for writers (Linux pipe_read)
             pipe.wake_wr();
-            return r;
+            break r;
         }
         // EOF is decided under the lock that saw the ring empty (Linux
         // pipe_read checks pipe->writers under pipe->mutex): a writer's
         // last write unlocks before its close drops the count, so data
         // written before the close is never mistaken for EOF
         if !pipe.has_writers() {
-            return Ok(0);
+            break Ok(0);
         }
         drop(inner);
         if nonblock {
-            return Err(KernelError::WouldBlock);
+            break Err(KernelError::WouldBlock);
         }
         // Block until data or EOF; a signal ends the wait (-ERESTARTSYS)
         pipe.wait_queue
             .wait_event_interruptible(|| pipe.readable())?;
-    }
+    };
+    pipe.kill_writers();
+    r
 }
 
 /// EPIPE's SIGPIPE to the writing thread

@@ -6,6 +6,9 @@
 //!   si_band, si_fd
 //! - SIGIO_FIOASYNC: FIOASYNC sets O_ASYNC and arms the file
 //! - SIGIO_WRITER: a read makes room: the writer gets POLL_OUT
+//! - SIGIO_READ_EINTR: a blocking read a signal interrupts sends the
+//!   writers nothing; one that gives up with EAGAIN signals them
+//!   (pipe_read returns -ERESTARTSYS before its kill_fasync)
 //! - SIGIO_FIFO: an O_RDWR FIFO raises SIGIO on input
 //! - SIGIO_CLOSE: a dup keeps the entry (si_fd stays the armed fd); the
 //!   last close removes it
@@ -25,14 +28,17 @@
 //!   keeps no O_ASYNC
 //! - SIGIO_OWNER_EX: F_SETOWN_EX / F_GETOWN_EX round trip a thread owner
 
-use crate::helpers::{print, print_num, println};
+use core::sync::atomic::{AtomicI64, Ordering};
+
+use crate::helpers::{msleep, print, print_num, println};
+use crate::io::nonblock::{on_sig, sigaction};
 use hk_syscall::{
-    AF_INET, AF_UNIX, FIOASYNC, O_CREAT, O_NONBLOCK, O_RDWR, SOCK_STREAM, SigInfo, SockAddrIn,
-    Zeroable, htonl, make_ipv4, sys_accept, sys_bind, sys_close, sys_connect, sys_dup, sys_exit,
-    sys_fanotify_init, sys_fcntl, sys_fork, sys_getpid, sys_getsockname, sys_gettid,
-    sys_inotify_init1, sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe2, sys_read,
+    AF_INET, AF_UNIX, FIOASYNC, O_CREAT, O_NONBLOCK, O_RDWR, SIG_DFL, SIGUSR1, SOCK_STREAM,
+    SigInfo, SockAddrIn, Zeroable, htonl, make_ipv4, sys_accept, sys_bind, sys_close, sys_connect,
+    sys_dup, sys_exit, sys_fanotify_init, sys_fcntl, sys_fork, sys_getpid, sys_getsockname,
+    sys_gettid, sys_inotify_init1, sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe2, sys_read,
     sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid, sys_setresuid, sys_setsid, sys_socket,
-    sys_socketpair, sys_unlink, sys_wait4, sys_write,
+    sys_socketpair, sys_tkill, sys_unlink, sys_wait4, sys_write,
 };
 
 const F_GETFL: i32 = 3;
@@ -53,6 +59,7 @@ const SIGRT: u32 = 41;
 const POLL_IN: i32 = 1;
 const POLL_OUT: i32 = 2;
 const ENOTTY: i64 = -25;
+const EINTR: i64 = -4;
 const EAGAIN: i64 = -11;
 const S_IFIFO: u32 = 0o010000;
 
@@ -61,6 +68,7 @@ pub fn run_tests() {
     test_setsig_info();
     test_fioasync();
     test_writer();
+    test_read_eintr();
     test_fifo();
     test_close();
     test_pgrp();
@@ -281,6 +289,57 @@ fn test_writer() {
             (b"got", got),
             (b"code", info.si_code as i64),
             (b"band", band),
+        ],
+    );
+}
+
+/// The reading thread, for the child to signal
+static READER: AtomicI64 = AtomicI64::new(0);
+
+/// Child: signal the reading thread once it is blocked in read
+fn kick_reader() -> i32 {
+    msleep(150);
+    sys_tkill(READER.load(Ordering::Relaxed), SIGUSR1);
+    0
+}
+
+/// The write end armed: a read interrupted in its wait sends no
+/// POLL_OUT; a nonblocking read finding nothing does
+fn test_read_eintr() {
+    // SIGUSR1 thread-directed and unblocked here, whatever the
+    // process's other threads and earlier masks
+    let old = block(bit(SIGIO));
+    setmask((old | bit(SIGIO)) & !bit(SIGUSR1));
+    let p = pipe();
+    arm(p[1]);
+    sigaction(SIGUSR1, on_sig as *const () as u64, 0);
+    READER.store(sys_gettid(), Ordering::Relaxed);
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(kick_reader() as u64)
+    }
+    let mut b = [0u8; 1];
+    let intr = sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    sigaction(SIGUSR1, SIG_DFL, 0);
+    let none = take(SIGIO);
+    let fl = sys_fcntl(p[0], F_GETFL, 0) as u64;
+    sys_fcntl(p[0], F_SETFL, fl | O_NONBLOCK as u64);
+    let again = sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+    let got = take(SIGIO);
+    close2(p);
+    setmask(old);
+    let ok = pid > 0 && intr == EINTR && none == EAGAIN && again == EAGAIN;
+    let ok = ok && got == SIGIO as i64;
+    report(
+        b"SIGIO_READ_EINTR",
+        ok,
+        &[
+            (b"intr", intr),
+            (b"none", none),
+            (b"again", again),
+            (b"got", got),
         ],
     );
 }
