@@ -28,6 +28,11 @@
 //!   one, as do they a signal ignored then unignored after them;
 //!   SIGEV_THREAD_ID signals that thread; ITIMER_REAL's SIGALRM is
 //!   SI_KERNEL and the interval rearms when it is taken
+//! - a timer's queued stop signal flushed by a SIGCONT that F_SETSIG
+//!   sends from a pipe write (kill_fasync) is gone; the interval timer
+//!   sends no more until set again, then its entry is queued again (the
+//!   timer's preallocated entry survives the flush); a deleted timer's
+//!   flushed entry is freed
 //! - SIGCHLD SIG_IGN or SA_NOCLDWAIT: a child is reaped at its exit
 //!   (wait is ECHILD); with SA_NOCLDWAIT SIGCHLD still comes
 //! - a child's pdeath_signal comes when its parent exits, from it
@@ -94,6 +99,7 @@ pub fn run_tests() {
     test_timer_overrun();
     test_timer_drop();
     test_timer_unignore();
+    test_timer_flush_sigio();
     test_itimer_real();
     test_autoreap();
     test_pdeath();
@@ -982,6 +988,70 @@ fn test_timer_unignore() {
         print(b" r=");
         print_num(r);
         println(b"");
+    }
+}
+
+/// A pipe whose writes send SIGCONT to this process (O_ASYNC,
+/// F_SETOWN, F_SETSIG): its fds
+fn sigcont_pipe() -> [i32; 2] {
+    const F_SETFL: i32 = 4;
+    const F_SETOWN: i32 = 8;
+    const F_SETSIG: i32 = 10;
+    const O_ASYNC: u64 = 0o20000;
+    let mut p = [-1i32; 2];
+    hk_syscall::sys_pipe2(p.as_mut_ptr(), 0);
+    hk_syscall::sys_fcntl(p[0], F_SETOWN, sys_getpid() as u64);
+    hk_syscall::sys_fcntl(p[0], F_SETSIG, 18);
+    hk_syscall::sys_fcntl(p[0], F_SETFL, O_ASYNC);
+    p
+}
+
+/// One byte into the pipe: its reader's SIGIO (SIGCONT) is sent from
+/// the write (Linux pipe_write -> kill_fasync), then the byte is taken
+fn poke(p: &[i32; 2]) {
+    let b = [0u8];
+    hk_syscall::sys_write(p[1] as u64, b.as_ptr(), 1);
+    let mut r = [0u8];
+    sys_read(p[0] as u64, r.as_mut_ptr(), 1);
+}
+
+/// SIGTSTP (blocked) from a 5 ms interval timer, flushed by the SIGCONT
+/// a pipe write sends (prepare_signal from kill_fasync): gone, and no
+/// more come (the interval timer waits for a dequeue that never comes);
+/// set again, the timer queues its entry once more (SI_TIMER). A
+/// deleted timer's queued SIGTSTP flushed the same way is gone too.
+fn test_timer_flush_sigio() {
+    const SIGTSTP: u32 = 20;
+    const SI_TIMER: i32 = -2;
+    let old = block(bit(SIGTSTP));
+    let p = sigcont_pipe();
+    let id = timer(SIGTSTP, 7, 0, 0);
+    arm(id, 5, 5);
+    sleep_ms(30);
+    let queued = pending() & bit(SIGTSTP) != 0;
+    poke(&p);
+    let flushed = pending() & bit(SIGTSTP) == 0;
+    sleep_ms(30);
+    let stalled = pending() & bit(SIGTSTP) == 0;
+    arm(id, 5, 0);
+    let mut i = SigInfo::zeroed();
+    let r = wait_sig(bit(SIGTSTP), 2, &mut i);
+    let again = r == SIGTSTP as i64 && i.si_code == SI_TIMER && i.si_status == 7;
+    // Deleted with its signal queued, then flushed
+    arm(id, 5, 0);
+    sleep_ms(30);
+    let queued2 = pending() & bit(SIGTSTP) != 0;
+    hk_syscall::sys_timer_delete(id);
+    poke(&p);
+    let gone = pending() & bit(SIGTSTP) == 0;
+    drain(SIGTSTP);
+    sys_close(p[0] as u64);
+    sys_close(p[1] as u64);
+    setmask(old);
+    let steps = [id >= 0, queued, flushed, stalled, again, queued2, gone];
+    match steps.iter().position(|ok| !ok) {
+        None => pass(b"SIGQUEUE_TIMER_FLUSH_SIGIO"),
+        Some(n) => fail_num(b"SIGQUEUE_TIMER_FLUSH_SIGIO:FAIL step=", n as i64),
     }
 }
 
