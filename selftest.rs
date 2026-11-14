@@ -239,6 +239,11 @@ fn selftest_thread(_arg: usize) {
     let seen = irq_stack_seen();
     check("irq_stack", seen == IRQ_ON_STACK, seen);
 
+    // 10. A printk in an interrupt handler (the soft-lockup watchdog's)
+    //     reaches every console, the USB serial console too: LOCKDEP
+    //     builds report any non-IRQ-safe lock taken on the way
+    check("printk_hardirq", printk_hardirq(), 0);
+
     if ok {
         printkln!("\nKSELFTEST:OK");
     }
@@ -268,6 +273,29 @@ fn irq_stack_seen() -> u64 {
     }
     t.cancel_sync();
     IRQ_STACK_SEEN.load(Ordering::Acquire)
+}
+
+static PRINTK_HARDIRQ_DONE: AtomicBool = AtomicBool::new(false);
+
+/// A HARD hrtimer callback that prints
+fn printk_hardirq_fire(_t: &crate::time::hrtimer::HrTimer) {
+    printkln!("kselftest: printk in hardirq");
+    PRINTK_HARDIRQ_DONE.store(true, Ordering::Release);
+}
+
+/// Print from a timer interrupt on this CPU: a HARD hrtimer 1 ms out,
+/// and this thread spins until it fired (as `irq_stack_seen`)
+fn printk_hardirq() -> bool {
+    use crate::time::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
+    let t = core::pin::pin!(HrTimer::new(printk_hardirq_fire, HRTIMER_HARD));
+    let now = crate::time::monotonic_ns();
+    t.as_ref().start(now + 1_000_000, HrClock::Monotonic);
+    let deadline = now + 500_000_000;
+    while !PRINTK_HARDIRQ_DONE.load(Ordering::Acquire) && crate::time::monotonic_ns() < deadline {
+        core::hint::spin_loop();
+    }
+    t.cancel_sync();
+    PRINTK_HARDIRQ_DONE.load(Ordering::Acquire)
 }
 
 /// Calls each stress thread makes to every other CPU

@@ -106,6 +106,15 @@ fn usb_trace() -> bool {
     super::usb_trace_enabled()
 }
 
+/// A trace event (Linux xhci-trace.h tracepoints, xhci_dbg_trace): to
+/// the trace ring, never printk, so the USB serial console's own
+/// transfers can be traced
+macro_rules! xhci_trace {
+    ($name:literal, $($arg:tt)*) => {
+        crate::trace::emit($name, format_args!($($arg)*))
+    };
+}
+
 /// Global USB host controller for access from USB drivers (like MSC)
 static USB_CONTROLLER: Mutex<Option<XhciController>> = Mutex::new(None);
 
@@ -192,8 +201,8 @@ fn xhci_irq_handler_common() -> bool {
     true // We handled the interrupt
 }
 
-/// The controller lock (a printk under it never reaches the USB console:
-/// that path only `try_lock`s, see `usb_console_out`)
+/// The controller lock (thread context only; a printk under it only
+/// queues the USB console's output, which its write work sends later)
 fn acquire_usb_controller() -> crate::sync::spin::MutexGuard<'static, Option<XhciController>> {
     USB_CONTROLLER.lock()
 }
@@ -205,13 +214,10 @@ pub fn usb_bulk_out(slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, Usb
     controller.do_bulk_out(slot_id, endpoint, data, XHCI_TRANSFER_US)
 }
 
-/// A bulk OUT transfer for the USB serial console: a short timeout, so
-/// a stalled console device costs each printk little. The controller
-/// lock is only tried: held (by this CPU, whose printk would otherwise
-/// deadlock, or another), the output is dropped (best effort, like the
-/// transfer itself)
+/// A bulk OUT transfer for the USB serial console's write work: a short
+/// timeout, so a stalled console device holds the controller little
 pub fn usb_console_out(slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, UsbError> {
-    let mut guard = USB_CONTROLLER.try_lock().ok_or(UsbError::NoResources)?;
+    let mut guard = acquire_usb_controller();
     let controller = guard.as_mut().ok_or(UsbError::NoDevice)?;
     controller.do_bulk_out(slot_id, endpoint, data, XHCI_CONSOLE_US)
 }
@@ -225,8 +231,7 @@ pub fn usb_bulk_in(slot_id: u8, endpoint: u8, data: &mut [u8]) -> Result<usize, 
 
 /// Store the USB host controller for global access
 fn store_usb_host(controller: XhciController) {
-    // Direct lock here is safe - no USB serial console registered yet during probe
-    *USB_CONTROLLER.lock() = Some(controller);
+    *acquire_usb_controller() = Some(controller);
 }
 
 // ============================================================================
@@ -279,7 +284,7 @@ fn xhci_probe(
         slot,
         XhciDeviceHandle {
             usb,
-            bus_id: pci_dev.bus_id(),
+            bdf: (pci_dev.bus, pci_dev.device, pci_dev.function),
         },
     ))
 }
@@ -287,8 +292,8 @@ fn xhci_probe(
 /// A bound xHCI: its USB devices (the root hub last)
 struct XhciDeviceHandle {
     usb: Vec<alloc::sync::Arc<crate::base::Device>>,
-    /// Its PCI function
-    bus_id: alloc::string::String,
+    /// Its PCI function: bus, device, function
+    bdf: (u8, u8, u8),
 }
 
 impl crate::base::Bound for XhciDeviceHandle {
@@ -305,9 +310,12 @@ impl crate::base::Bound for XhciDeviceHandle {
         super::usbcore::usb_unregister_devices(&self.usb);
         let hc = {
             let mut g = acquire_usb_controller();
-            // Not a second xHCI's, which replaced this one (BUGS.md)
+            // Not a second xHCI's, which replaced this one (BUGS.md);
+            // matched by address, nothing allocated under the lock
             match g.as_ref() {
-                Some(c) if c.pci_dev.bus_id() == self.bus_id => g.take(),
+                Some(c) if (c.pci_dev.bus, c.pci_dev.device, c.pci_dev.function) == self.bdf => {
+                    g.take()
+                }
                 _ => None,
             }
         };
@@ -1112,8 +1120,9 @@ impl XhciController {
 
             let trb_type = trb.get_type();
             if usb_trace() {
-                printkln!(
-                    "xHCI: Event TRB type={}, ctrl=0x{:08x}, status=0x{:08x}",
+                xhci_trace!(
+                    "xhci_handle_event",
+                    "type={} ctrl=0x{:08x} status=0x{:08x}",
                     trb_type,
                     trb.control,
                     trb.status
@@ -1650,19 +1659,17 @@ impl XhciController {
         if let Some(result) = result {
             TRANSFER_COUNT.fetch_add(1, Ordering::Relaxed);
             if usb_trace() {
-                printkln!(
-                    "xHCI TRACE: transfer complete slot={} dci={}",
-                    slot_id,
-                    ep_dci
-                );
+                xhci_trace!("xhci_urb_giveback", "slot={} dci={}", slot_id, ep_dci);
             }
             return result;
         }
 
-        // More detailed timeout message for debugging
+        // A timed-out transfer is the caller's to report (Linux
+        // usb_start_wait_urb returns -ETIMEDOUT); the details are traced
         let count = TRANSFER_COUNT.load(Ordering::Relaxed);
-        printkln!(
-            "xHCI: wait_for_transfer TIMEOUT slot={} dci={} after {} transfers",
+        xhci_trace!(
+            "xhci_urb_timeout",
+            "slot={} dci={} after {} transfers",
             slot_id,
             ep_dci,
             count
@@ -1670,8 +1677,9 @@ impl XhciController {
         // Dump event ring state on first timeout only
         if count == 393 {
             if let Some(event_ring) = self.event_ring.as_ref() {
-                printkln!(
-                    "xHCI: event_ring dequeue={} cycle={}",
+                xhci_trace!(
+                    "xhci_urb_timeout",
+                    "event_ring dequeue={} cycle={}",
                     event_ring.dequeue,
                     event_ring.cycle
                 );
@@ -1681,8 +1689,9 @@ impl XhciController {
                 && let Some(ring) = state.transfer_rings.get(&ep_dci)
             {
                 let (enqueue, dequeue, cycle) = ring.debug_state();
-                printkln!(
-                    "xHCI: transfer_ring enqueue={} dequeue={} cycle={}",
+                xhci_trace!(
+                    "xhci_urb_timeout",
+                    "transfer_ring enqueue={} dequeue={} cycle={}",
                     enqueue,
                     dequeue,
                     cycle
@@ -1718,8 +1727,9 @@ impl XhciController {
                 let transferred = trb.status & 0xFFFFFF;
 
                 if usb_trace() {
-                    printkln!(
-                        "xHCI TRACE: transfer_event slot={} ep={} cc={} residue={} (want slot={} ep={})",
+                    xhci_trace!(
+                        "xhci_handle_transfer",
+                        "slot={} ep={} cc={} residue={} (want slot={} ep={})",
                         event_slot,
                         event_ep,
                         cc,
@@ -1736,7 +1746,7 @@ impl XhciController {
                 }
                 // Transfer for different slot/ep - continue consuming events
             } else if usb_trace() {
-                printkln!("xHCI TRACE: non-transfer event type={}", trb_type);
+                xhci_trace!("xhci_handle_event", "non-transfer type={}", trb_type);
             }
             // Non-transfer event (command completion, port status, etc.) - continue consuming
         }
@@ -1756,8 +1766,9 @@ impl XhciController {
         let ep_dci = endpoint_to_dci(endpoint);
 
         if usb_trace() {
-            printkln!(
-                "xHCI TRACE: bulk_out slot={} ep=0x{:02x} dci={} len={}",
+            xhci_trace!(
+                "xhci_urb_enqueue",
+                "bulk_out slot={} ep=0x{:02x} dci={} len={}",
                 slot_id,
                 endpoint,
                 ep_dci,
@@ -1788,7 +1799,7 @@ impl XhciController {
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), bounce.cpu_addr(), data.len()) };
 
         if usb_trace() {
-            printkln!("xHCI TRACE: bulk_out DMA addr=0x{:x}", dma_addr.as_u64());
+            xhci_trace!("xhci_queue_trb", "bulk_out dma=0x{:x}", dma_addr.as_u64());
         }
 
         // Get the transfer ring
@@ -1829,7 +1840,7 @@ impl XhciController {
         unsafe { crate::hw::dma::dma_free_coherent(&self.pci_dev, bounce) };
 
         if cc != CompletionCode::SUCCESS && cc != CompletionCode::SHORT_PACKET {
-            printkln!("xHCI: Bulk OUT failed with code {}", cc);
+            xhci_trace!("xhci_urb_giveback", "bulk_out failed cc={}", cc);
             return Err(UsbError::TransferError(cc));
         }
 
@@ -1852,8 +1863,9 @@ impl XhciController {
         let ep_dci = endpoint_to_dci(endpoint | 0x80); // IN direction
 
         if usb_trace() {
-            printkln!(
-                "xHCI TRACE: bulk_in slot={} ep=0x{:02x} dci={} len={}",
+            xhci_trace!(
+                "xhci_urb_enqueue",
+                "bulk_in slot={} ep=0x{:02x} dci={} len={}",
                 slot_id,
                 endpoint,
                 ep_dci,
@@ -1881,7 +1893,7 @@ impl XhciController {
         let dma_addr = bounce.dma_addr();
 
         if usb_trace() {
-            printkln!("xHCI TRACE: bulk_in DMA addr=0x{:x}", dma_addr.as_u64());
+            xhci_trace!("xhci_queue_trb", "bulk_in dma=0x{:x}", dma_addr.as_u64());
         }
 
         // Get the transfer ring
@@ -1932,7 +1944,7 @@ impl XhciController {
         }
 
         if cc != CompletionCode::SUCCESS && cc != CompletionCode::SHORT_PACKET {
-            printkln!("xHCI: Bulk IN failed with code {}", cc);
+            xhci_trace!("xhci_urb_giveback", "bulk_in failed cc={}", cc);
             return Err(UsbError::TransferError(cc));
         }
 

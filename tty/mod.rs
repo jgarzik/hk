@@ -32,6 +32,7 @@ pub mod flip;
 pub mod ioctl;
 pub mod jobctrl;
 pub mod n_tty;
+pub mod serial_core;
 pub mod termios;
 pub mod tty_dev;
 
@@ -123,6 +124,19 @@ pub trait TtyDriver: Send + Sync {
 
     /// Wait until the transmitter is empty
     fn flush(&self) {}
+
+    /// The console write (Linux console->write): bytes straight to the
+    /// hardware, LF as CR LF, then a wait until the transmitter is
+    /// empty. A UART takes its port lock (`serial_core::UartPort`)
+    fn console_write(&self, data: &[u8]) {
+        for &byte in data {
+            if byte == b'\n' {
+                let _ = self.write(b"\r");
+            }
+            let _ = self.write(&[byte]);
+        }
+        self.flush();
+    }
 }
 
 /// Job control state (Linux tty->ctrl and winsize)
@@ -410,13 +424,7 @@ impl ConsoleDriver for Tty {
     /// serial8250_console_write, pl011_console_write): what a console
     /// write prints is out before it returns
     fn write(&self, data: &[u8]) {
-        for &byte in data {
-            if byte == b'\n' {
-                let _ = self.driver.write(b"\r");
-            }
-            let _ = self.driver.write(&[byte]);
-        }
-        self.driver.flush();
+        self.driver.console_write(data);
     }
 
     fn flush(&self) {
