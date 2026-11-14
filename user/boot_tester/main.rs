@@ -405,6 +405,7 @@ pub fn run_all_tests() {
     net::tcp_mem::run_tests();
     net::tcp_opt::run_tests();
     net::tcp_close::run_tests();
+    net::snmp::run_tests();
     net::net_stress::run_tests();
     ipc::keys::run_tests();
     process::kcmp::run_tests();
