@@ -542,32 +542,28 @@ impl SuperOps for TracefsSops {
 
 static TRACEFS_SOPS: TracefsSops = TracefsSops;
 
-/// One superblock for every mount (Linux tracefs: get_tree_single)
+/// One superblock for every mount (Linux tracefs_get_tree:
+/// get_tree_single, then the options applied, tracefs_reconfigure)
 fn mount(
-    t: &'static FileSystemType,
-    _opts: &[u8],
-) -> Result<crate::fs::superblock::SbActive, KernelError> {
-    crate::fs::superblock::sget(
-        t,
-        |_| true,
-        || {
-            let sb = SuperBlock::alloc(t, &TRACEFS_SOPS, 0)?;
-            sb.set_private(try_arc(kernfs::vfs::KfSuper { ns: 0 })?);
-            let ri = kernfs::vfs::inode(&sb, root())?;
-            sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
-                ri,
-                Arc::downgrade(&sb),
-            ))?);
-            Ok(sb)
-        },
-    )
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    let sb = crate::fs::superblock::get_tree_single(fc, &TRACEFS_SOPS, |sb| {
+        sb.set_private(try_arc(kernfs::vfs::KfSuper { ns: 0 })?);
+        let ri = kernfs::vfs::inode(sb, root())?;
+        sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
+            ri,
+            Arc::downgrade(sb),
+        ))?);
+        Ok(())
+    })?;
+    sb.s_op.remount(&sb, fc.data)?;
+    Ok(sb)
 }
 
 pub static TRACEFS_TYPE: FileSystemType = FileSystemType {
     name: "tracefs",
     fs_flags: fs_flags::FS_PSEUDO,
     mount,
-    mount_dev: None,
     file_ops: &kernfs::vfs::KERNFS_FOPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

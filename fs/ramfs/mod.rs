@@ -1198,13 +1198,10 @@ pub static RAMFS_SUPER_OPS: RamfsSuperOps = RamfsSuperOps;
 
 /// Mount function for ramfs
 pub(crate) fn ramfs_mount(
-    fs_type: &'static FileSystemType,
-    opts: &[u8],
-) -> Result<crate::fs::superblock::SbActive, KernelError> {
-    let mode = root_mode(opts)?;
-    let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0)?;
-    fill_root(&sb, mode, 0, 0)?;
-    Ok(sb)
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    let mode = root_mode(fc.data)?;
+    crate::fs::superblock::get_tree_nodev(fc, &RAMFS_SUPER_OPS, |sb| fill_root(sb, mode, 0, 0))
 }
 
 /// Give a new superblock its root directory (Linux ramfs_fill_super,
@@ -1235,7 +1232,6 @@ pub static RAMFS_TYPE: FileSystemType = FileSystemType {
     name: "ramfs",
     fs_flags: 0,
     mount: ramfs_mount,
-    mount_dev: None, // Ramfs doesn't use a backing device
     file_ops: &RAMFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use crate::sync::spin::{Mutex, RwLock};
 use crate::sync::{LockedBy, UniqueOwner};
 use crate::util::list::{Adapter, Link, WeakList};
+use ::core::mem::ManuallyDrop;
 use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync;
@@ -188,18 +189,34 @@ use super::file::FileOps;
 
 use crate::block::BlockDevice;
 
-/// Mount function type for pseudo-filesystems (no backing device)
-/// `opts`: the mount data string (comma-separated options, empty for
-/// none). Returns an active reference (Linux ->get_tree's fc->root).
-pub type MountFn =
-    fn(fs_type: &'static FileSystemType, opts: &[u8]) -> Result<SbActive, KernelError>;
+/// What a mount asks of a filesystem (Linux struct fs_context, the
+/// part hk uses): the type, the SB_* flags a new superblock starts with
+/// (Linux fc->sb_flags), the source (a device path for a device
+/// filesystem) and the mount data (comma-separated options)
+pub struct FsContext<'a> {
+    pub fs_type: &'static FileSystemType,
+    pub sb_flags: u32,
+    pub source: &'a [u8],
+    pub data: &'a [u8],
+}
 
-/// Mount function type for device-backed filesystems (ext4, vfat, etc.)
-pub type MountDevFn = fn(
-    fs_type: &'static FileSystemType,
-    bdev: Arc<BlockDevice>,
-    opts: &[u8],
-) -> Result<SbActive, KernelError>;
+impl<'a> FsContext<'a> {
+    /// A kernel mount's context: no flags, no source (Linux
+    /// fs_context_for_mount for vfs_kern_mount)
+    pub fn new(fs_type: &'static FileSystemType, data: &'a [u8]) -> Self {
+        Self {
+            fs_type,
+            sb_flags: 0,
+            source: b"",
+            data,
+        }
+    }
+}
+
+/// A filesystem's mount (Linux ->get_tree): its superblock, new or
+/// shared, set up, with an active reference and s_umount held for
+/// writing ([`SbLocked`])
+pub type MountFn = fn(fc: &FsContext<'_>) -> Result<SbLocked, KernelError>;
 
 /// Filesystem type descriptor
 pub struct FileSystemType {
@@ -209,12 +226,8 @@ pub struct FileSystemType {
     /// Mount flags
     pub fs_flags: u32,
 
-    /// Create a new superblock for this filesystem type (pseudo-filesystems)
+    /// Its superblock for a mount (Linux ->get_tree)
     pub mount: MountFn,
-
-    /// Create a new superblock with a backing block device (disk-backed filesystems)
-    /// None for pseudo-filesystems like ramfs/procfs
-    pub mount_dev: Option<MountDevFn>,
 
     /// Default file operations for files on this filesystem
     pub file_ops: &'static dyn FileOps,
@@ -364,6 +377,9 @@ const SB_DEAD: u32 = 1 << 21;
 /// Set up by its mount (Linux SB_BORN, set by vfs_get_tree): walkers
 /// wait for it or for SB_DYING
 const SB_BORN: u32 = 1 << 29;
+/// Filled (Linux SB_ACTIVE): set after fill_super, cleared by the
+/// shutdown
+const SB_ACTIVE: u32 = 1 << 30;
 
 /// The last passive reference is gone (Linux put_super's final part):
 /// off super_blocks and its type's fs_supers (the lists' contract,
@@ -406,12 +422,62 @@ impl Drop for SuperBlock {
 /// from an inode's or dentry's `Weak` never runs the shutdown.
 pub struct SbActive(Arc<SuperBlock>);
 
+/// A superblock with an active reference and s_umount held for
+/// writing (Linux: what sget_fc and ->get_tree hand back; the mounter
+/// releases s_umount once the superblock is set up and born). Dropped
+/// without [`SbLocked::unlock`] (an error path) it goes as Linux
+/// deactivate_locked_super.
+pub struct SbLocked(ManuallyDrop<Arc<SuperBlock>>);
+
+impl SbLocked {
+    /// # Safety
+    /// The caller holds one of `sb`'s active references and its
+    /// s_umount for writing through a leaked guard, and hands both over.
+    unsafe fn new(sb: Arc<SuperBlock>) -> Self {
+        Self(ManuallyDrop::new(sb))
+    }
+
+    /// Release s_umount, keeping the active reference (Linux
+    /// up_write(&sb->s_umount) after vfs_get_tree)
+    pub fn unlock(self) -> SbActive {
+        let mut me = ManuallyDrop::new(self);
+        // SAFETY: taken once; `me` is never dropped
+        let sb = unsafe { ManuallyDrop::take(&mut me.0) };
+        // SAFETY: held, by the type's contract
+        drop(unsafe { sb.s_umount.write_held() });
+        SbActive(sb)
+    }
+}
+
 impl SbActive {
-    /// The first active reference to a new superblock (Linux
-    /// alloc_super: s_active 1)
-    fn first(sb: Arc<SuperBlock>) -> Self {
-        sb.s_active.store(1, Ordering::Relaxed);
-        Self(sb)
+    /// Take s_umount for writing, this active reference kept (Linux
+    /// atomic_inc(&sb->s_active) then down_write(&sb->s_umount), as
+    /// devtmpfs_get_tree)
+    pub fn lock(self) -> SbLocked {
+        let me = ManuallyDrop::new(self);
+        // SAFETY: read once; `me` is never dropped, so the active
+        // reference moves
+        let sb = unsafe { core::ptr::read(&raw const me.0) };
+        sb.s_umount.write().leak();
+        // SAFETY: the active reference moved in, s_umount leaked
+        unsafe { SbLocked::new(sb) }
+    }
+}
+
+impl core::ops::Deref for SbLocked {
+    type Target = Arc<SuperBlock>;
+    fn deref(&self) -> &Arc<SuperBlock> {
+        &self.0
+    }
+}
+
+impl Drop for SbLocked {
+    fn drop(&mut self) {
+        // SAFETY: taken once, here
+        let sb = unsafe { ManuallyDrop::take(&mut self.0) };
+        // SAFETY: held, by the type's contract
+        let g = unsafe { sb.s_umount.write_held() };
+        deactivate_locked_super(&sb, g);
     }
 }
 
@@ -485,6 +551,7 @@ fn kill_sb(sb: &SuperBlock, g: sync::RwSemWriteGuard<'_, ()>) {
 /// leave s_inodes (evict_inodes); then SB_DYING tells walkers and
 /// mounters
 fn generic_shutdown_super(sb: &SuperBlock, g: sync::RwSemWriteGuard<'_, ()>) {
+    sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
     let root = sb.root.write().take();
     if let Some(root) = root {
         sb.s_fsnotify.sb_delete();
@@ -604,81 +671,183 @@ fn super_trylock_shared(sb: &SuperBlock) -> Option<sync::RwSemReadGuard<'_, ()>>
 }
 
 /// Trade a passive reference to a listed superblock for an active one
-/// (Linux grab_super): under s_umount once it is born, unless it is
-/// dying; a dying one is waited for until its kill_sb is done (SB_DEAD),
-/// so a new mount never overlaps the old one's shutdown (the device it
-/// releases), and None returned. Deviation: s_umount is released before
-/// returning (hk's `sget` hands back a superblock its `make` completed
-/// before listing it, so the caller has nothing left to set up under
-/// it).
-fn grab_super(sb: Arc<SuperBlock>) -> Option<SbActive> {
-    let got = super_lock_excl(&sb).is_some_and(|_g| {
-        sb.s_active
+/// with s_umount held for writing (Linux grab_super): once it is born,
+/// unless it is dying; a dying one is waited for until its kill_sb is
+/// done (SB_DEAD), so a new mount never overlaps the old one's shutdown
+/// (the device it releases), and None returned
+fn grab_super(sb: Arc<SuperBlock>) -> Option<SbLocked> {
+    let got = super_lock_excl(&sb).is_some_and(|g| {
+        let got = sb
+            .s_active
             .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 (v != 0).then(|| v + 1)
             })
-            .is_ok()
+            .is_ok();
+        if got {
+            g.leak();
+        }
+        got
     });
     if got {
-        return Some(SbActive(sb));
+        // SAFETY: the active reference just taken, s_umount leaked
+        return Some(unsafe { SbLocked::new(sb) });
     }
     sb.wait_flags(SB_DEAD);
     None
 }
 
-/// The superblock of `fs_type` that `test` accepts, with an active
-/// reference, else a new one (Linux sget_fc). `test` runs under sb_lock
-/// (a spin lock: it must not sleep), on any superblock not yet dead,
-/// and takes no reference. A match is taken by `grab_super`; one that
-/// turns out dying is waited for and the search repeated. `make` builds
-/// a complete superblock with [`SuperBlock::alloc`] and no lock held;
-/// if another mounter listed one `test` accepts meanwhile, that one is
-/// returned and the new one shut down unlisted.
-pub fn sget(
+/// A new superblock (Linux alloc_super): not listed, with SB_* flags
+/// `sb_flags`, one active reference and s_umount held for writing
+/// (leaked: no one else can reach it yet, so it is free)
+fn alloc_super(
     fs_type: &'static FileSystemType,
-    test: impl Fn(&SuperBlock) -> bool,
-    make: impl FnOnce() -> Result<SbActive, KernelError>,
-) -> Result<SbActive, KernelError> {
-    let mut make = Some(make);
-    let mut new: Option<SbActive> = None;
+    s_op: &'static dyn SuperOps,
+    sb_flags: u32,
+) -> Result<Arc<SuperBlock>, KernelError> {
+    let sb = try_arc(SuperBlock::init(fs_type, s_op, sb_flags))?;
+    sb.s_umount.write().leak();
+    Ok(sb)
+}
+
+/// Free a superblock `alloc_super` made and nothing listed (Linux
+/// destroy_unused_super): nothing was set up on it, so no shutdown
+fn destroy_unused_super(sb: Arc<SuperBlock>) {
+    sb.s_flags.fetch_or(SB_DYING | SB_DEAD, Ordering::Release);
+    sb.s_active.store(0, Ordering::Relaxed);
+    // SAFETY: `alloc_super` leaked the hold; this is its release
+    drop(unsafe { sb.s_umount.write_held() });
+}
+
+/// The superblock of `fc`'s type that `test` accepts (None: always a
+/// new one), else a new one listed for it, with an active reference and
+/// s_umount held for writing (Linux sget_fc). `test` runs under sb_lock
+/// (a spin lock: it must not sleep), on any superblock not yet dead,
+/// and takes no reference; a match is taken by `grab_super`, and one
+/// that turns out dying is waited for and the search repeated. A new
+/// superblock is allocated with no lock held, given its identity by
+/// `set` under sb_lock (Linux set_anon_super, set_bdev_super: it must
+/// not sleep), listed, and returned not yet born: the caller fills it
+/// (Linux fill_super) with s_umount held, while walkers and other
+/// mounters wait for SB_BORN.
+pub fn sget(
+    fc: &FsContext<'_>,
+    s_op: &'static dyn SuperOps,
+    test: Option<&dyn Fn(&SuperBlock) -> bool>,
+    set: &dyn Fn(&SuperBlock) -> Result<(), KernelError>,
+) -> Result<SbLocked, KernelError> {
+    let mut s: Option<Arc<SuperBlock>> = None;
     loop {
         let mut l = SB_LOCK.lock();
-        let old = fs_type
-            .fs_supers
-            .access(&l)
-            .iter()
-            .filter(|e| {
-                let s = e.get();
-                !s.super_flags(SB_DEAD) && test(s)
-            })
-            .find_map(|e| e.upgrade());
-        if let Some(old) = old {
-            drop(l);
-            if let Some(a) = grab_super(old) {
-                // An unlisted one goes (Linux destroy_unused_super)
-                drop(new);
+        if let Some(test) = test {
+            let old = fc
+                .fs_type
+                .fs_supers
+                .access(&l)
+                .iter()
+                .filter(|e| {
+                    let x = e.get();
+                    !x.super_flags(SB_DEAD) && test(x)
+                })
+                .find_map(|e| e.upgrade());
+            if let Some(old) = old {
+                drop(l);
+                let Some(a) = grab_super(old) else {
+                    continue;
+                };
+                if let Some(s) = s {
+                    destroy_unused_super(s);
+                }
                 return Ok(a);
             }
-            continue;
         }
-        if let Some(n) = new.take() {
-            sb_add(&mut l, &n);
+        let Some(new) = s.take() else {
             drop(l);
-            return Ok(n);
+            s = Some(alloc_super(fc.fs_type, s_op, fc.sb_flags)?);
+            continue;
+        };
+        if let Err(e) = set(&new) {
+            drop(l);
+            destroy_unused_super(new);
+            return Err(e);
         }
+        sb_add(&mut l, &new);
         drop(l);
-        let m = make.take().expect("sget: made once, listed or returned");
-        new = Some(m()?);
+        // SAFETY: `alloc_super`'s active reference and leaked s_umount
+        return Ok(unsafe { SbLocked::new(new) });
     }
 }
 
-/// A new superblock from its type's mount, set up (Linux vfs_get_tree:
-/// ->get_tree, then SB_BORN); `opts` the mount data
-pub fn vfs_get_tree(
-    fs_type: &'static FileSystemType,
-    opts: &[u8],
-) -> Result<SbActive, KernelError> {
-    let sb = (fs_type.mount)(fs_type, opts)?;
+/// The superblock `test` picks (None: a new one), filled by `fill` if
+/// new (Linux get_tree_super: sget_fc, then fill_super under s_umount;
+/// SB_ACTIVE once filled). A failed fill shuts the new superblock down
+/// (deactivate_locked_super).
+pub fn get_tree_super(
+    fc: &FsContext<'_>,
+    s_op: &'static dyn SuperOps,
+    test: Option<&dyn Fn(&SuperBlock) -> bool>,
+    fill: impl FnOnce(&Arc<SuperBlock>) -> Result<(), KernelError>,
+) -> Result<SbLocked, KernelError> {
+    let sb = sget(fc, s_op, test, &|_| Ok(()))?;
+    if !sb.has_root() {
+        fill(&sb)?;
+        sb.s_flags.fetch_or(SB_ACTIVE, Ordering::Relaxed);
+    }
+    Ok(sb)
+}
+
+/// A new superblock for every mount (Linux get_tree_nodev)
+pub fn get_tree_nodev(
+    fc: &FsContext<'_>,
+    s_op: &'static dyn SuperOps,
+    fill: impl FnOnce(&Arc<SuperBlock>) -> Result<(), KernelError>,
+) -> Result<SbLocked, KernelError> {
+    get_tree_super(fc, s_op, None, fill)
+}
+
+/// One superblock for every mount of the type (Linux get_tree_single)
+pub fn get_tree_single(
+    fc: &FsContext<'_>,
+    s_op: &'static dyn SuperOps,
+    fill: impl FnOnce(&Arc<SuperBlock>) -> Result<(), KernelError>,
+) -> Result<SbLocked, KernelError> {
+    get_tree_super(fc, s_op, Some(&|_| true), fill)
+}
+
+/// The block device at `path` (Linux lookup_bdev): ENOTBLK for
+/// anything else, ENODEV for a device number no disk has
+fn lookup_bdev(path: &[u8]) -> Result<Arc<BlockDevice>, KernelError> {
+    let d = super::namei::lookup_path(path)?;
+    let inode = d.get_inode().ok_or(KernelError::NotFound)?;
+    if inode.mode().file_type() != Some(super::inode::FileType::BlockDev) {
+        return Err(KernelError::NotBlockDevice);
+    }
+    crate::block::get_blkdev(inode.rdev).ok_or(KernelError::NoDevice)
+}
+
+/// A superblock on the block device `fc.source` names (Linux
+/// get_tree_bdev): the device held open for it (setup_bdev_super:
+/// under the disk's open_mutex, failing for a removed device; a rescan
+/// sees it in use), then `fill`
+pub fn get_tree_bdev(
+    fc: &FsContext<'_>,
+    s_op: &'static dyn SuperOps,
+    fill: impl FnOnce(&Arc<SuperBlock>) -> Result<(), KernelError>,
+) -> Result<SbLocked, KernelError> {
+    if fc.source.is_empty() {
+        return Err(KernelError::InvalidArgument);
+    }
+    let bdev = lookup_bdev(fc.source)?;
+    get_tree_nodev(fc, s_op, |sb| {
+        sb.set_bdev(bdev.open_handle()?);
+        fill(sb)
+    })
+}
+
+/// The mountable superblock of `fc` (Linux vfs_get_tree): its type's
+/// ->get_tree, then SB_BORN; returned with s_umount held, which the
+/// mounter releases ([`SbLocked::unlock`]) before making the mount
+pub fn vfs_get_tree(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
+    let sb = (fc.fs_type.mount)(fc)?;
     sb.set_born();
     Ok(sb)
 }
@@ -784,38 +953,17 @@ impl SuperBlock {
         self.s_d_op.get().copied()
     }
 
-    /// Create a new superblock, listed on super_blocks and its type's
-    /// fs_supers (Linux sget_fc with no test), its first active
-    /// reference; born when its mount returns ([`vfs_get_tree`])
-    #[expect(
-        clippy::new_ret_no_self,
-        reason = "a superblock is only ever handed out through its first active reference"
-    )]
-    pub fn new(
-        fs_type: &'static FileSystemType,
-        s_op: &'static dyn SuperOps,
-        flags: u32,
-    ) -> Result<SbActive, KernelError> {
-        let sb = Self::alloc(fs_type, s_op, flags)?;
-        sb_add(&mut SB_LOCK.lock(), &sb);
-        Ok(sb)
-    }
-
-    /// Create a superblock not listed yet (Linux alloc_super), its
-    /// first active reference, for [`sget`]'s `make`
-    pub fn alloc(
-        fs_type: &'static FileSystemType,
-        s_op: &'static dyn SuperOps,
-        flags: u32,
-    ) -> Result<SbActive, KernelError> {
-        try_arc(Self {
+    /// A superblock's fields, before `alloc_super` puts it in its `Arc`
+    /// (Linux alloc_super's initialisation): one active reference
+    fn init(fs_type: &'static FileSystemType, s_op: &'static dyn SuperOps, flags: u32) -> Self {
+        Self {
             fs_type,
             s_list: Link::new(),
             s_instances: Link::new(),
             root: RwLock::new(None),
             s_op,
             s_flags: AtomicU32::new(flags),
-            s_active: AtomicU32::new(0),
+            s_active: AtomicU32::new(1),
             s_d_op: spin::Once::new(),
             s_writers: AtomicU64::new(0),
             s_mounts: Mutex::new(WeakList::new()),
@@ -830,8 +978,12 @@ impl SuperBlock {
             s_vfs_rename_mutex: sync::Mutex::new(()),
             s_wb_err: crate::util::errseq::ErrSeq::new(),
             s_umount: sync::RwSem::new(()),
-        })
-        .map(SbActive::first)
+        }
+    }
+
+    /// It has its root dentry: filled (Linux sb->s_root set)
+    pub fn has_root(&self) -> bool {
+        self.root.read().is_some()
     }
 
     /// Any of `f`'s SB_BORN/SB_DYING/SB_DEAD bits is set (Linux
@@ -1124,8 +1276,8 @@ mod tests {
 
     static EVICT_OPS: EvictOps = EvictOps;
 
-    fn t1_mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<SbActive, KernelError> {
-        let sb = SuperBlock::new(t, &NULL_SUPER_OPS, 0)?;
+    /// A root directory whose eviction `EvictOps` checks
+    fn t_fill(sb: &Arc<SuperBlock>, ops: &'static dyn InodeOps) -> Result<(), KernelError> {
         let root = Inode::alloc(Inode::new(
             1,
             InodeMode::directory(0o755),
@@ -1133,37 +1285,57 @@ mod tests {
             0,
             0,
             crate::time::TIMEKEEPER.current_time(),
-            Arc::downgrade(&sb),
-            &EVICT_OPS,
+            Arc::downgrade(sb),
+            ops,
         ))?;
-        sb.set_root(DentryRef::new(Dentry::new_root(root, Arc::downgrade(&sb)))?);
-        Ok(sb)
+        sb.set_root(DentryRef::new(Dentry::new_root(root, Arc::downgrade(sb)))?);
+        Ok(())
+    }
+
+    fn t1_mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
+        get_tree_nodev(fc, &NULL_SUPER_OPS, |sb| t_fill(sb, &EVICT_OPS))
     }
 
     static T1: FileSystemType = FileSystemType {
         name: "sbtest1",
         fs_flags: 0,
         mount: t1_mount,
-        mount_dev: None,
         file_ops: &crate::fs::RAMFS_FILE_OPS,
         next: FsNext::new(None),
         fs_supers: FsSupers::new(WeakList::new()),
     };
 
-    /// One superblock shared by every mount (Linux get_tree_single)
-    fn t2_mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<SbActive, KernelError> {
-        sget(t, |_| true, || SuperBlock::alloc(t, &NULL_SUPER_OPS, 0))
+    /// One superblock shared by every mount (Linux get_tree_single); its
+    /// fill checks it runs as Linux fill_super: listed, s_umount held
+    /// for writing, not yet born; it fails while `T2_FAIL` is set
+    fn t2_mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
+        get_tree_single(fc, &NULL_SUPER_OPS, |sb| {
+            assert!(sb.s_umount.try_read().is_none());
+            assert!(!sb.super_flags(SB_BORN));
+            assert!(sb.s_list.is_linked() && sb.s_instances.is_linked());
+            if T2_FAIL.load(Ordering::Relaxed) {
+                return Err(KernelError::Io);
+            }
+            T2_FILLS.fetch_add(1, Ordering::Relaxed);
+            t_fill(sb, &crate::fs::inode::NULL_INODE_OPS)
+        })
     }
+
+    static T2_FAIL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static T2_FILLS: AtomicUsize = AtomicUsize::new(0);
 
     static T2: FileSystemType = FileSystemType {
         name: "sbtest2",
         fs_flags: 0,
         mount: t2_mount,
-        mount_dev: None,
         file_ops: &crate::fs::RAMFS_FILE_OPS,
         next: FsNext::new(None),
         fs_supers: FsSupers::new(WeakList::new()),
     };
+
+    fn get(t: &'static FileSystemType) -> Result<SbActive, KernelError> {
+        vfs_get_tree(&FsContext::new(t, b"")).map(SbLocked::unlock)
+    }
 
     /// A temporary passive reference (an `evict_inode`'s upgrade, a
     /// walker's) that outlives the last active one (the umount): the
@@ -1171,7 +1343,7 @@ mod tests {
     /// passive put afterwards only frees the memory
     #[test]
     fn passive_ref_outliving_umount_runs_no_shutdown() {
-        let active = vfs_get_tree(&T1, b"").unwrap();
+        let active = get(&T1).unwrap();
         let passive = Arc::clone(&active);
         let other = active.clone();
         drop(active);
@@ -1197,18 +1369,26 @@ mod tests {
 
     /// `sget` shares a live superblock (Linux grab_super: one more
     /// active reference) and never a dead one, even while a passive
-    /// reference keeps it listed
+    /// reference keeps it listed; a new one is filled once, listed and
+    /// locked, born only after; a failed fill shuts the new one down
+    /// (deactivate_locked_super)
     #[test]
     fn sget_shares_live_not_dead() {
-        let a = vfs_get_tree(&T2, b"").unwrap();
-        let b = vfs_get_tree(&T2, b"").unwrap();
+        T2_FAIL.store(true, Ordering::Relaxed);
+        assert!(matches!(get(&T2), Err(KernelError::Io)));
+        T2_FAIL.store(false, Ordering::Relaxed);
+        let a = get(&T2).unwrap();
+        assert!(a.super_flags(SB_BORN) && a.super_flags(SB_ACTIVE));
+        let b = get(&T2).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(T2_FILLS.load(Ordering::Relaxed), 1);
         assert_eq!(a.s_active.load(Ordering::Relaxed), 2);
         let passive = Arc::clone(&a);
         drop((a, b));
         assert!(passive.super_flags(SB_DEAD));
-        let c = vfs_get_tree(&T2, b"").unwrap();
+        let c = get(&T2).unwrap();
         assert!(!Arc::ptr_eq(&c, &passive));
         assert_eq!(c.s_active.load(Ordering::Relaxed), 1);
+        assert_eq!(T2_FILLS.load(Ordering::Relaxed), 2);
     }
 }

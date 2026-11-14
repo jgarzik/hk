@@ -2455,63 +2455,66 @@ pub fn proc_flush_pid(t: &crate::task::Task) {
 
 /// Mount function for procfs
 fn procfs_mount(
-    fs_type: &'static FileSystemType,
-    data: &[u8],
-) -> Result<crate::fs::superblock::SbActive, KernelError> {
-    let opts = try_arc(opts::ProcOpts::new(data)?)?;
-    // Create superblock
-    let sb = SuperBlock::new(fs_type, &PROCFS_SUPER_OPS, 0)?;
-    sb.set_private(opts);
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    let opts = try_arc(opts::ProcOpts::new(fc.data)?)?;
+    crate::fs::superblock::get_tree_nodev(fc, &PROCFS_SUPER_OPS, |sb| {
+        sb.set_private(opts);
+        procfs_fill(sb)
+    })
+}
 
+/// The static tree (Linux proc_fill_super)
+fn procfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     // The static tree, built before it is reachable, in the order its
     // inodes are numbered (the root is 1)
-    let mut root = DirBuild::new(&sb)?;
+    let mut root = DirBuild::new(sb)?;
     let file = ProcfsInodeData::new_file;
     let ro = InodeMode::regular(0o444);
-    root.file(&sb, "version", ro, file(gen_version))?;
+    root.file(sb, "version", ro, file(gen_version))?;
     // /proc/mounts -> self/mounts (Linux proc_symlink)
     root.file(
-        &sb,
+        sb,
         "mounts",
         InodeMode::symlink(),
         ProcfsInodeData::FixedLink(b"self/mounts"),
     )?;
-    root.file(&sb, "meminfo", ro, file(gen_meminfo))?;
-    root.file(&sb, "loadavg", ro, file(crate::task::loadavg::proc_loadavg))?;
+    root.file(sb, "meminfo", ro, file(gen_meminfo))?;
+    root.file(sb, "loadavg", ro, file(crate::task::loadavg::proc_loadavg))?;
 
     // /proc/net -> self/net (Linux proc_net_init: proc_symlink)
     root.file(
-        &sb,
+        sb,
         "net",
         InodeMode::symlink(),
         ProcfsInodeData::FixedLink(b"self/net"),
     )?;
 
     root.file(
-        &sb,
+        sb,
         "slabinfo",
         InodeMode::regular(0o400),
         file(crate::mm::slab::slabinfo),
     )?;
     root.file(
-        &sb,
+        sb,
         "partitions",
         ro,
         file(crate::block::genhd::proc_partitions),
     )?;
-    root.file(&sb, "cmdline", ro, file(gen_cmdline))?;
+    root.file(sb, "cmdline", ro, file(gen_cmdline))?;
 
-    build_sys(&sb, &mut root)?;
-    build_sysvipc(&sb, &mut root)?;
+    build_sys(sb, &mut root)?;
+    build_sysvipc(sb, &mut root)?;
     let root_inode = root.finish()?;
 
     // Create root dentry
-    let root_dentry = crate::fs::DentryRef::new(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
+    let root_dentry = crate::fs::DentryRef::new(Dentry::new_root(root_inode, Arc::downgrade(sb)))?;
 
     // Set root in superblock
     sb.set_root(root_dentry);
 
-    Ok(sb)
+    Ok(())
 }
 
 /// Procfs filesystem type
@@ -2520,7 +2523,6 @@ pub static PROCFS_TYPE: FileSystemType = FileSystemType {
     fs_flags: super::superblock::fs_flags::FS_PSEUDO
         | super::superblock::fs_flags::FS_USERNS_MOUNT_RESTRICTED,
     mount: procfs_mount,
-    mount_dev: None, // Procfs doesn't use a backing device
     file_ops: &PROCFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

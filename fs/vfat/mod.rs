@@ -2548,20 +2548,17 @@ pub static VFAT_SUPER_OPS: VfatSuperOps = VfatSuperOps;
 // VFAT Mount
 // ============================================================================
 
-/// Placeholder mount function for pseudo-fs style (shouldn't be called)
-fn vfat_mount_pseudo(
-    _fs_type: &'static FileSystemType,
-    _opts: &[u8],
-) -> Result<crate::fs::superblock::SbActive, KernelError> {
-    Err(KernelError::OperationNotSupported) // FAT32 requires a device
+/// A vfat mount (Linux vfat_get_tree: get_tree_bdev)
+fn vfat_get_tree(
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    crate::fs::superblock::get_tree_bdev(fc, &VFAT_SUPER_OPS, |sb| vfat_fill_super(sb, fc.data))
 }
 
-/// Mount VFAT filesystem on a block device
-fn vfat_mount_dev(
-    fs_type: &'static FileSystemType,
-    bdev: Arc<BlockDevice>,
-    opts: &[u8],
-) -> Result<crate::fs::superblock::SbActive, KernelError> {
+/// Read the filesystem on `sb`'s device (Linux vfat_fill_super ->
+/// fat_fill_super)
+fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError> {
+    let bdev = sb.bdev().ok_or(KernelError::NotBlockDevice)?.clone();
     // Options first: a bad one is EINVAL before any I/O
     let opts = VfatOpts::parse(opts)?;
     // Read boot sector
@@ -2658,8 +2655,6 @@ fn vfat_mount_dev(
     // fat_calc_dir_size walks it: EIO)
     read_cluster_chain(&sb_data, sb_data.root_cluster)?;
 
-    // Create superblock
-    let sb = SuperBlock::new(fs_type, &VFAT_SUPER_OPS, 0)?;
     // FAT sizes are 32-bit (Linux fat_fill_super: s_maxbytes 0xffffffff)
     sb.set_maxbytes(0xffff_ffff);
     sb.set_private(sb_data.clone());
@@ -2673,7 +2668,7 @@ fn vfat_mount_dev(
         sb_data.opts.gid,
         0,
         Timespec::ZERO,
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &VFAT_INODE_OPS,
     ))?;
     root_inode
@@ -2693,18 +2688,17 @@ fn vfat_mount_dev(
     // Names match without case or trailing dots (Linux setup's
     // vfat_ci_dentry_ops), before the root dentry takes them
     sb.set_d_op(&VFAT_CI_DENTRY_OPS);
-    let root_dentry = crate::fs::DentryRef::new(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
+    let root_dentry = crate::fs::DentryRef::new(Dentry::new_root(root_inode, Arc::downgrade(sb)))?;
     sb.set_root(root_dentry);
 
-    Ok(sb)
+    Ok(())
 }
 
 /// VFAT filesystem type
 pub static VFAT_TYPE: FileSystemType = FileSystemType {
     name: "vfat",
     fs_flags: fs_flags::FS_REQUIRES_DEV,
-    mount: vfat_mount_pseudo,
-    mount_dev: Some(vfat_mount_dev),
+    mount: vfat_get_tree,
     file_ops: &VFAT_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

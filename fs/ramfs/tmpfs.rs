@@ -514,16 +514,15 @@ pub static TMPFS_SUPER_OPS: TmpfsSuperOps = TmpfsSuperOps;
 /// A new tmpfs superblock of type `fs_type` from `opts` (Linux
 /// shmem_fill_super): the root directory takes the first inode
 pub(crate) fn tmpfs_mount(
-    fs_type: &'static FileSystemType,
-    opts: &[u8],
-) -> Result<crate::fs::superblock::SbActive, KernelError> {
-    let o = parse(opts)?;
-    let t = ShmemSb::new(&o)?;
-    let (mode, uid, gid) = (t.mode, t.uid, t.gid);
-    let sb = SuperBlock::new(fs_type, &TMPFS_SUPER_OPS, 0)?;
-    sb.set_private(try_arc(t)?);
-    super::fill_root(&sb, mode, uid, gid)?;
-    Ok(sb)
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    let o = parse(fc.data)?;
+    let t = try_arc(ShmemSb::new(&o)?)?;
+    crate::fs::superblock::get_tree_nodev(fc, &TMPFS_SUPER_OPS, |sb| {
+        let (mode, uid, gid) = (t.mode, t.uid, t.gid);
+        sb.set_private(t);
+        super::fill_root(sb, mode, uid, gid)
+    })
 }
 
 /// The rootfs filesystem type (Linux init/do_mounts.c rootfs_fs_type
@@ -536,7 +535,6 @@ pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
     name: "rootfs",
     fs_flags: 0,
     mount: tmpfs_mount,
-    mount_dev: None,
     file_ops: &super::TMPFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
@@ -548,7 +546,8 @@ static SHM_MNT: spin::Once<crate::fs::mount::MountRef> = spin::Once::new();
 
 /// Make the kernel's tmpfs (Linux shmem_init's kern_mount; mnt_init)
 pub fn shmem_init() -> Result<(), KernelError> {
-    let sb = crate::fs::superblock::vfs_get_tree(&TMPFS_TYPE, b"size=0,nr_inodes=0")?;
+    let fc = crate::fs::superblock::FsContext::new(&TMPFS_TYPE, b"size=0,nr_inodes=0");
+    let sb = crate::fs::superblock::vfs_get_tree(&fc)?.unlock();
     let root = sb.get_root().ok_or(KernelError::Io)?;
     let m = crate::fs::mount::Mount::alloc(sb, root, 0, b"tmpfs".as_slice().into())?;
     // A kernel mount (Linux kern_mount)
@@ -589,7 +588,6 @@ pub static TMPFS_TYPE: FileSystemType = FileSystemType {
     name: "tmpfs",
     fs_flags: 0,
     mount: tmpfs_mount,
-    mount_dev: None,
     file_ops: &super::TMPFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

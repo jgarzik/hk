@@ -762,15 +762,15 @@ pub static CGROUPFS_SUPER_OPS: CgroupfsSuperOps = CgroupfsSuperOps;
 
 /// Mount cgroupfs
 fn cgroupfs_mount(
-    fs_type: &'static FileSystemType,
-    _opts: &[u8],
-) -> Result<crate::fs::superblock::SbActive, KernelError> {
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
     // Initialize cgroup subsystem if not done
     cgroup_init();
+    crate::fs::superblock::get_tree_nodev(fc, &CGROUPFS_SUPER_OPS, cgroupfs_fill)
+}
 
-    // Create superblock
-    let sb = SuperBlock::new(fs_type, &CGROUPFS_SUPER_OPS, 0)?;
-
+/// The root directory, the root cgroup's
+fn cgroupfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     // Get root cgroup
     let root_cg = CGROUP_ROOT
         .root_cgroup()
@@ -784,7 +784,7 @@ fn cgroupfs_mount(
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &CGROUPFS_INODE_OPS,
     ))?;
     root_inode.set_private(try_arc(CgroupfsInodeData::Directory {
@@ -792,12 +792,12 @@ fn cgroupfs_mount(
     })?);
 
     // Create root dentry
-    let root_dentry = crate::fs::DentryRef::new(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
+    let root_dentry = crate::fs::DentryRef::new(Dentry::new_root(root_inode, Arc::downgrade(sb)))?;
 
     // Set root in superblock
     sb.set_root(root_dentry);
 
-    Ok(sb)
+    Ok(())
 }
 
 /// Cgroupfs filesystem type
@@ -805,7 +805,6 @@ pub static CGROUPFS_TYPE: FileSystemType = FileSystemType {
     name: "cgroup2",
     fs_flags: crate::fs::superblock::fs_flags::FS_PSEUDO,
     mount: cgroupfs_mount,
-    mount_dev: None,
     file_ops: &CGROUPFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

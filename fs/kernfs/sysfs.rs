@@ -71,33 +71,33 @@ fn sb_ns(sb: &SuperBlock) -> Option<u64> {
 }
 
 /// The namespace's superblock, shared by its mounts (Linux
-/// kernfs_get_tree: sget_fc with kernfs_test_super)
+/// kernfs_get_tree: sget_fc with kernfs_test_super and
+/// kernfs_set_super, then kernfs_fill_super if new)
 fn mount(
-    t: &'static FileSystemType,
-    _opts: &[u8],
-) -> Result<crate::fs::superblock::SbActive, KernelError> {
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
     let ns = crate::net::current_net_ns().id;
-    crate::fs::superblock::sget(
-        t,
-        |sb| sb_ns(sb) == Some(ns),
-        || {
-            let sb = SuperBlock::alloc(t, &SYSFS_SOPS, 0)?;
-            sb.set_private(try_arc(kernfs::vfs::KfSuper { ns })?);
-            let ri = kernfs::vfs::inode(&sb, root())?;
-            sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
-                ri,
-                Arc::downgrade(&sb),
-            ))?);
-            Ok(sb)
-        },
-    )
+    let info: Arc<dyn crate::fs::superblock::SuperBlockData> =
+        try_arc(kernfs::vfs::KfSuper { ns })?;
+    let sb =
+        crate::fs::superblock::sget(fc, &SYSFS_SOPS, Some(&|sb| sb_ns(sb) == Some(ns)), &|sb| {
+            sb.set_private(info.clone());
+            Ok(())
+        })?;
+    if !sb.has_root() {
+        let ri = kernfs::vfs::inode(&sb, root())?;
+        sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
+            ri,
+            Arc::downgrade(&sb),
+        ))?);
+    }
+    Ok(sb)
 }
 
 pub static SYSFS_TYPE: FileSystemType = FileSystemType {
     name: "sysfs",
     fs_flags: fs_flags::FS_PSEUDO | fs_flags::FS_USERNS_MOUNT_RESTRICTED,
     mount,
-    mount_dev: None,
     file_ops: &kernfs::vfs::KERNFS_FOPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

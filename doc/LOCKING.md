@@ -550,8 +550,12 @@ VFS locks (detailed order):
                    namespace added once made, removed at its end;
                    graft's owner check under NAMESPACE_SEM)
         ↓
-    SuperBlock.s_umount (sync::RwSem; write for remount and for the
-                   last active reference's shutdown (taken with
+    SuperBlock.s_umount (sync::RwSem; write for remount, for a new
+                   superblock from sget to its mounter's unlock (its
+                   fill_super under it: inode, dentry and kernfs
+                   locks, the device's I/O; a mount's caller holds
+                   only the mountpoint path then, no VFS lock), and
+                   for the last active reference's shutdown (taken with
                    nothing held: generic_shutdown_super takes d_locks,
                    INODE_SB_LIST_LOCK, inotify locks, the writeback
                    pass (BdiWriteback.pass and what writeback takes)
@@ -2733,11 +2737,19 @@ reading unless it is dying (Linux super_lock_shared), runs its
 callback (which may sleep), and drops the previous reference with the
 lock released. `sget` (Linux sget_fc) runs its test under it, on
 superblocks not yet dead (sysfs: `SuperBlock.private`, a spin RwLock
-read, the only other lock taken under `SB_LOCK`), takes a match's
-passive reference and, unlocked, trades it for an active one under
-s_umount (Linux grab_super: a dying match is waited for until SB_DEAD
-and the search repeated); else it builds a new superblock unlocked
-and lists it unless a matching one was listed meanwhile. `FILE_SYSTEMS` (spin RwLock leaf, thread context; Linux
+read, and a new superblock's `set`, which stores its identity:
+`SuperBlock.private` written, the only other lock taken under
+`SB_LOCK`), takes a match's passive reference and, unlocked, trades it
+for an active one with s_umount held for writing (Linux grab_super:
+once born; a dying match is waited for until SB_DEAD and the search
+repeated); else it allocates a superblock unlocked with its s_umount
+already held for writing (Linux alloc_super), and under the lock sets
+and lists it. Either way the superblock comes back with s_umount held
+(`SbLocked`): the filesystem fills a new one under it (Linux
+fill_super, from get_tree_nodev / get_tree_single / get_tree_bdev /
+kernfs_get_tree), `vfs_get_tree` sets SB_BORN, and the mounter
+releases it before making the mount (Linux do_new_mount_fc, fc_mount);
+an error path drops it as deactivate_locked_super. `FILE_SYSTEMS` (spin RwLock leaf, thread context; Linux
 file_systems_lock) guards the registered types, a singly linked list
 through `FileSystemType.next` in registration order.
 `dentry::d_drop_tree` (a removed directory's cache, inside the

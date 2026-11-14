@@ -28,21 +28,35 @@ use crate::fs::KernelError;
 use crate::fs::dentry::DentryRef;
 use crate::fs::superblock::FileSystemType;
 
-/// The internal superblock
-static DEVTMPFS: Once<crate::fs::superblock::SbActive> = Once::new();
+/// The kernel's mount of the internal superblock (Linux devtmpfs.c
+/// mnt)
+static DEVTMPFS: Once<crate::fs::mount::MountRef> = Once::new();
 
 fn root() -> Option<DentryRef> {
-    DEVTMPFS.get()?.get_root()
+    Some(DEVTMPFS.get()?.root.clone())
 }
 
-/// A mount: the one superblock; `opts` only parsed (a bad option fails
-/// the mount)
+/// The internal type (Linux internal_fs_type: tmpfs's mount under the
+/// name devtmpfs, not registered)
+static INTERNAL_TYPE: FileSystemType = FileSystemType {
+    name: "devtmpfs",
+    fs_flags: 0,
+    mount: crate::fs::ramfs::tmpfs::tmpfs_mount,
+    file_ops: &super::TMPFS_FILE_OPS,
+    next: crate::fs::superblock::FsNext::new(None),
+    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
+};
+
+/// A mount: the one internal superblock, another active reference with
+/// s_umount held (Linux devtmpfs_get_tree); the options are parsed (a
+/// bad one fails the mount) but change nothing on the shared
+/// superblock, as Linux 6.15+
 fn mount(
-    _t: &'static FileSystemType,
-    opts: &[u8],
-) -> Result<crate::fs::superblock::SbActive, KernelError> {
-    crate::fs::ramfs::tmpfs::check_opts(opts)?;
-    DEVTMPFS.get().cloned().ok_or(KernelError::NoDevice)
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    crate::fs::ramfs::tmpfs::check_opts(fc.data)?;
+    let m = DEVTMPFS.get().ok_or(KernelError::NoDevice)?;
+    Ok((*m.sb).clone().lock())
 }
 
 /// The devtmpfs filesystem type
@@ -50,7 +64,6 @@ pub static DEVTMPFS_TYPE: FileSystemType = FileSystemType {
     name: "devtmpfs",
     fs_flags: 0,
     mount,
-    mount_dev: None,
     file_ops: &super::TMPFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
@@ -83,13 +96,20 @@ pub fn device_del(name: &str) {
     }
 }
 
-/// Create the superblock (Linux devtmpfs_init, in driver_init)
+/// Mount the internal superblock (Linux devtmpfs_init, in driver_init:
+/// vfs_kern_mount of the internal type)
 pub fn init() {
-    match crate::fs::ramfs::tmpfs::tmpfs_mount(&DEVTMPFS_TYPE, b"mode=0755") {
-        Ok(sb) => {
-            // Kept without a mount (Linux devtmpfs's internal mount)
-            sb.set_born();
-            DEVTMPFS.call_once(|| sb);
+    let fc = crate::fs::superblock::FsContext::new(&INTERNAL_TYPE, b"mode=0755");
+    let m = crate::fs::superblock::vfs_get_tree(&fc).and_then(|sb| {
+        let sb = sb.unlock();
+        let root = sb.get_root().ok_or(KernelError::Io)?;
+        crate::fs::mount::Mount::alloc(sb, root, 0, b"devtmpfs".as_slice().into())
+    });
+    match m {
+        Ok(m) => {
+            // A kernel mount (Linux vfs_kern_mount)
+            m.set_internal();
+            DEVTMPFS.call_once(|| m);
         }
         Err(e) => {
             crate::printkln!("devtmpfs: {:?}", e);

@@ -16,18 +16,15 @@ use alloc::boxed::Box;
 
 use super::KernelError;
 use super::dentry::{Dentry, DentryRef};
-use super::inode::FileType;
 pub use super::mntput::MountRef;
 use super::mntput::{__cleanup_mnt, MNT_NS_INTERNAL, MntOwned};
 use super::path_ref::Path;
-use super::superblock::{FileSystemType, SbActive, SuperBlock, vfs_get_tree};
+use super::superblock::{FsContext, SbActive, SuperBlock, vfs_get_tree};
 use crate::task::task_work::CallbackHead;
 use crate::util::ida::Ida;
 use crate::util::kalloc::{arc_nofail, try_arc};
 use crate::util::percpu_alloc::PcpSlot;
 use core::sync::atomic::AtomicBool;
-
-use crate::block::get_blkdev;
 
 /// Ignore set-user/group-ID bits on exec (Linux MNT_NOSUID)
 pub const MNT_NOSUID: u32 = 0x1;
@@ -1302,17 +1299,16 @@ static KNULLFS_FILE: spin::Once<MountRef> = spin::Once::new();
 pub fn init_mount_tree() -> Result<MountRef, KernelError> {
     let nullfs = &super::nullfs::NULLFS_TYPE;
     let null = attach(
-        vfs_get_tree(nullfs, b"")?,
+        vfs_get_tree(&FsContext::new(nullfs, b""))?.unlock(),
         None,
         0,
-        false,
         b"nullfs".as_slice().into(),
     )?;
     let rootfs_type = &super::ramfs::tmpfs::ROOTFS_TYPE;
-    let sb = vfs_get_tree(rootfs_type, b"")?;
+    let sb = vfs_get_tree(&FsContext::new(rootfs_type, b""))?.unlock();
     let on = Path::new(null.clone(), null.root.clone());
-    let rootfs = attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())?;
-    let ksb = vfs_get_tree(nullfs, b"")?;
+    let rootfs = attach(sb, Some(on), 0, b"rootfs".as_slice().into())?;
+    let ksb = vfs_get_tree(&FsContext::new(nullfs, b""))?.unlock();
     let root = ksb.get_root().ok_or(KernelError::InvalidArgument)?;
     let file = super::nullfs::new_file(&ksb)?;
     let k = Mount::alloc(ksb.clone(), root, MNT_READONLY, b"nullfs".as_slice().into())?;
@@ -1327,20 +1323,17 @@ pub fn init_mount_tree() -> Result<MountRef, KernelError> {
 }
 
 /// Mount `sb` on `mountpoint` (None: as the namespace root) with MNT_*
-/// flags `mnt_flags` and read-only state `ro`, which are set before the
-/// mount becomes visible (Linux do_new_mount: no window with weaker
-/// flags). The new mount is a child of the mount the mountpoint is in.
+/// flags `mnt_flags`, which are set before the mount becomes visible
+/// (Linux do_new_mount_fc: vfs_create_mount, then do_add_mount; no
+/// window with weaker flags). The new mount is a child of the mount the
+/// mountpoint is in.
 pub fn attach(
     sb: SbActive,
     mountpoint: Option<Path>,
     mnt_flags: u32,
-    ro: bool,
     devname: super::name::FileName,
 ) -> Result<MountRef, KernelError> {
     let root = sb.get_root().ok_or(KernelError::InvalidArgument)?;
-    if ro {
-        sb.make_rdonly()?;
-    }
     let mount = Mount::alloc(sb, root, mnt_flags, devname)?;
     let mnt_ns = crate::ns::current_mnt_ns();
     if let Some(mp) = mountpoint {
@@ -1652,40 +1645,6 @@ pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> 
     }
     let t = copy_tree(ns, &plan, 0);
     graft(ns, t, mp)
-}
-
-/// Superblock of a device-backed filesystem (vfat, ...) on the block
-/// device at `source` (e.g. "/dev/rd1"), set up (Linux vfs_get_tree of
-/// get_tree_bdev); mount it with `attach`
-pub fn dev_super(
-    fs_type: &'static FileSystemType,
-    source: &[u8],
-    opts: &[u8],
-) -> Result<crate::fs::superblock::SbActive, KernelError> {
-    // The filesystem must support device mounting
-    let mount_dev_fn = fs_type
-        .mount_dev
-        .ok_or(KernelError::OperationNotSupported)?;
-
-    // Look up the source device path
-    let source_dentry = super::namei::lookup_path(source)?;
-    let source_inode = source_dentry.get_inode().ok_or(KernelError::NotFound)?;
-
-    // Verify it's a block device
-    if source_inode.mode().file_type() != Some(FileType::BlockDev) {
-        return Err(KernelError::NotBlockDevice);
-    }
-
-    // Get the BlockDevice from the registry using the inode's rdev
-    let bdev = get_blkdev(source_inode.rdev).ok_or(KernelError::NoDevice)?;
-
-    // Opened (under the disk's open_mutex, failing for a removed
-    // device) for the superblock's life: a rescan sees it in use
-    let h = bdev.open_handle()?;
-    let sb = mount_dev_fn(fs_type, bdev, opts)?;
-    sb.set_bdev(h);
-    sb.set_born();
-    Ok(sb)
 }
 
 // ============================================================================
@@ -2619,7 +2578,7 @@ fn lookup_mnt(p: &Path) -> Option<MountRef> {
 #[cfg(test)]
 pub(super) fn test_mnt() -> MountRef {
     let t = &super::nullfs::NULLFS_TYPE;
-    let sb = vfs_get_tree(t, b"").unwrap();
+    let sb = vfs_get_tree(&FsContext::new(t, b"")).unwrap().unlock();
     let root = sb.get_root().unwrap();
     Mount::alloc(sb, root, 0, b"t".as_slice().into()).unwrap()
 }
