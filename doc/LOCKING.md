@@ -525,9 +525,6 @@ VFS locks (detailed order):
                    attach, umount, namespace copy; read for /proc mount
                    lists and is_local_mountpoint)
         ↓
-    pnode::GROUPS (sync::Mutex; peer groups, never held across a call
-                   into the mount tree)
-        ↓
     SuperBlock.s_umount (sync::RwSem; write for remount, read for a
                    bind remount)
         ↓
@@ -2702,8 +2699,7 @@ moved (MS_MOVE, pivot_root) keeps its namespace and its parent's
 reference moves with it. A put of a mount out of its namespace is
 exact: under MOUNT_LOCK write it takes from its part and sums them;
 the one reaching zero sets `Mount.doomed` (Linux MNT_DOOMED). Links
-that must not keep a mount are `Weak` (`Mount.parent`, peer groups,
-`s_mounts`) and take a reference with `MountRef::try_get` (Linux
+that must not keep a mount are `Weak` (`Mount.parent`, `s_mounts`) and take a reference with `MountRef::try_get` (Linux
 legitimize_mnt: an add while in a namespace, else under MOUNT_LOCK's
 locking read, refused once doomed). A mount an RCU walk reached
 borrowed (`lookup_mnt`, `choose_mountpoint`) gets its reference from
@@ -2796,11 +2792,19 @@ DCACHE_MOUNTED, written under its d_lock inside MOUNT_LOCK). The
 mountpoint is allocated before MOUNT_LOCK (Linux get_mountpoint's
 kmalloc; attach runs under NAMESPACE_SEM write, so no other is made
 meanwhile) and put after it with its dentry (Linux ex_mountpoints).
-Propagation (`fs/pnode.rs`) runs entirely under NAMESPACE_SEM (write):
-peer groups live in `pnode::GROUPS` (sleeping `sync::Mutex`, inside
-NAMESPACE_SEM, as Linux keeps the mnt_share rings under namespace_sem;
-never held across a call into the mount tree or with a spin lock held;
-mountinfo reads it under NAMESPACE_SEM read).
+Propagation (`fs/pnode.rs`) runs entirely under NAMESPACE_SEM (write),
+as Linux: each mount's `Mount.prop` (`pnode::PropLinks`, `LockedBy`
+NAMESPACE_SEM's `NsTree`, no lock of its own: Linux mnt_group_id, the
+mnt_share peer ring, mnt_slave_list / mnt_slave, mnt_master, T_MARKED)
+is written under the write side and read under either (mountinfo's
+shared:/master:/propagate_from: under the read side). The links are
+raw pointers: a linked mount is in a namespace or held by the caller,
+umount and a namespace's end make every mount private before it
+leaves, and a teardown unlinks one still linked (NAMESPACE_SEM read to
+look, write to unlink; never the case today). Peer group ids come from
+`pnode::GROUP_IDA` (`util::ida::Ida`, Linux mnt_group_ida: its
+IrqSpinlock leaf), allocated under NAMESPACE_SEM write and freed when
+a group's last member leaves.
 
 **Lock Order for Path Traversal (follow_mount, lookup_mnt):**
 ```
