@@ -386,20 +386,25 @@ pub mod ports {
 static SERIAL_DRIVER_S0: SerialTty = SerialTty::new(ports::COM1, &POLL_S0);
 static SERIAL_DRIVER_S1: SerialTty = SerialTty::new(ports::COM2, &POLL_S1);
 
-/// The ports' transmitter poll timers (Linux serial8250_timeout), for
-/// a port without an interrupt
-static POLL_S0: TimerList = TimerList::new(poll_s0, TIMER_HARD);
-static POLL_S1: TimerList = TimerList::new(poll_s1, TIMER_HARD);
+/// The ports' transmitter poll timers (Linux up->timer), for a port
+/// without an interrupt
+static POLL_S0: TimerList = TimerList::new(serial8250_timeout, TIMER_HARD);
+static POLL_S1: TimerList = TimerList::new(serial8250_timeout, TIMER_HARD);
 
-fn poll_s0(_t: &TimerList) {
-    if SERIAL_DRIVER_S0.uart.poll_tx(&SERIAL_DRIVER_S0) {
-        SERIAL_TTY_S0.write_wakeup();
-    }
-}
+/// The 8250 ports, each driver with its tty (Linux serial8250_ports)
+static PORTS: [(&SerialTty, &Tty); 2] = [
+    (&SERIAL_DRIVER_S0, &SERIAL_TTY_S0),
+    (&SERIAL_DRIVER_S1, &SERIAL_TTY_S1),
+];
 
-fn poll_s1(_t: &TimerList) {
-    if SERIAL_DRIVER_S1.uart.poll_tx(&SERIAL_DRIVER_S1) {
-        SERIAL_TTY_S1.write_wakeup();
+/// A port's poll timer (Linux serial8250_timeout): the port is the one
+/// whose timer fired (Linux from_timer(up, t, timer))
+fn serial8250_timeout(t: &TimerList) {
+    let Some(&(drv, tty)) = PORTS.iter().find(|(d, _)| core::ptr::eq(d.poll, t)) else {
+        return;
+    };
+    if drv.uart.poll_tx(drv) {
+        tty.write_wakeup();
     }
 }
 
