@@ -329,7 +329,11 @@ fn splice_wait() {
     t.done();
 }
 
-static mut VBUF: [u8; 8192] = [b'v'; 8192];
+/// Page aligned: where a segment crosses a page boundary decides how
+/// many pipe buffers it takes (16 bytes across one need two)
+#[repr(C, align(4096))]
+struct VBuf([u8; 8192]);
+static mut VBUF: VBuf = VBuf([b'v'; 8192]);
 
 fn vmsplice_wait() {
     let mut t = T::new(b"VMSPLICE_WAIT");
