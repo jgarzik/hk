@@ -2,7 +2,11 @@
 //! kernel/time/posix-cpu-timers.c, itimer.c, RLIMIT_CPU)
 //!
 //! Each test burns CPU (spinning, checking its clock by syscall) until
-//! a handler sees the signal, or a bound of CPU time:
+//! a handler sees the signal, or a bound of CPU time on the clock the
+//! signal counts: CLOCK_PROCESS_CPUTIME_ID is the scheduler's runtime,
+//! while itimers and RLIMIT_CPU count user+system (CPUCLOCK_PROF/VIRT),
+//! which Linux samples per tick less steal time: on a loaded host they
+//! fall far behind the runtime.
 //! - CPU_TIMER_PROCESS: timer_create(CLOCK_PROCESS_CPUTIME_ID) fires
 //!   once 100 ms of CPU are used, not before
 //! - CPU_TIMER_THREAD: likewise on CLOCK_THREAD_CPUTIME_ID
@@ -40,6 +44,9 @@ const SIGEV_SIGNAL: i32 = 0;
 const CLOCK_TAI: i32 = 11;
 const PROCESS_CLOCK: i32 = 2;
 const THREAD_CLOCK: i32 = 3;
+/// MAKE_PROCESS_CPUCLOCK(0, CPUCLOCK_PROF / CPUCLOCK_VIRT): the caller's
+const PROF_CLOCK: i32 = !0 << 3;
+const VIRT_CLOCK: i32 = PROF_CLOCK | 1;
 const EOPNOTSUPP: i64 = -95;
 
 static HITS: AtomicU32 = AtomicU32::new(0);
@@ -246,8 +253,8 @@ fn itimer_hits(which: i32, sig: u32, clock: i32) -> (u32, i64) {
 fn itimers() {
     const ITIMER_VIRTUAL: i32 = 1;
     const ITIMER_PROF: i32 = 2;
-    let (prof, pleft) = itimer_hits(ITIMER_PROF, SIGPROF, PROCESS_CLOCK);
-    let (virt, vleft) = itimer_hits(ITIMER_VIRTUAL, SIGVTALRM, PROCESS_CLOCK);
+    let (prof, pleft) = itimer_hits(ITIMER_PROF, SIGPROF, PROF_CLOCK);
+    let (virt, vleft) = itimer_hits(ITIMER_VIRTUAL, SIGVTALRM, VIRT_CLOCK);
     // Linux adds a tick to a CPU itimer's value (set_cpu_itimer)
     let left_ok = |l: i64| l > 0 && l <= 100_000;
     verdict(
@@ -270,7 +277,7 @@ fn xcpu_child(fd: i32) -> ! {
     if sys_setrlimit(RLIMIT_CPU, &lim) != 0 {
         sys_exit(1);
     }
-    burn_until(PROCESS_CLOCK, 1, 1800);
+    burn_until(PROF_CLOCK, 1, 1800);
     let mut now = RLimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -279,7 +286,7 @@ fn xcpu_child(fd: i32) -> ! {
     let msg = [HITS.load(Ordering::Relaxed) as u8, now.rlim_cur as u8];
     sys_write(fd as u64, msg.as_ptr(), 2);
     // Into the hard limit: SIGKILL
-    burn_until(PROCESS_CLOCK, u32::MAX, 5000);
+    burn_until(PROF_CLOCK, u32::MAX, 5000);
     sys_exit(2)
 }
 

@@ -22,8 +22,10 @@
 //!   empty pipe with a writer is EAGAIN and pipe to pipe from one with
 //!   no writer is 0
 //! - VMSPLICE_WAIT: vmsplice into a full pipe waits for room, into one
-//!   with no reader is EPIPE (Linux wait_for_space), and takes a
-//!   segment longer than a page whole (iter_to_pipe)
+//!   with no reader is EPIPE (Linux wait_for_space), takes a segment
+//!   longer than a page whole, and one buffer per page touched: a short
+//!   segment across a page boundary into one free slot is partial,
+//!   and a later write does not merge into its buffer (iter_to_pipe)
 
 use crate::harness::T;
 use hk_syscall::{
@@ -329,18 +331,28 @@ fn splice_wait() {
     t.done();
 }
 
-static mut VBUF: [u8; 8192] = [b'v'; 8192];
+/// Page aligned: where a segment crosses a page boundary decides how
+/// many pipe buffers it takes (16 bytes across one need two)
+#[repr(C, align(4096))]
+struct VBuf([u8; 8192]);
+static mut VBUF: VBuf = VBuf([b'v'; 8192]);
 
 fn vmsplice_wait() {
     let mut t = T::new(b"VMSPLICE_WAIT");
-    let iov = |len| IoVec {
-        iov_base: (&raw const VBUF).cast::<u8>(),
+    let iov_at = |off, len| IoVec {
+        iov_base: (&raw const VBUF).cast::<u8>().wrapping_add(off),
         iov_len: len,
     };
+    let iov = |len| iov_at(0, len);
     let f = full_pipe();
     let pid = later(f[0], true);
     t.eq(b"full", sys_vmsplice(f[1], &iov(16), 1, 0), 16);
     reap(pid);
+    // Full again; one page read frees one buffer, too few for 16 bytes
+    // on two pages
+    let mut page = [0u8; 4096];
+    sys_read(f[0] as u64, page.as_mut_ptr(), 4096);
+    t.eq(b"straddle", sys_vmsplice(f[1], &iov_at(4088, 16), 1, 0), 8);
     close(f[0]);
     sigpipe(SIG_IGN);
     t.eq(b"epipe", sys_vmsplice(f[1], &iov(16), 1, 0), EPIPE);
@@ -348,6 +360,20 @@ fn vmsplice_wait() {
     close(f[1]);
     let p = pipe();
     t.eq(b"two pages", sys_vmsplice(p[1], &iov(8192), 1, 0), 8192);
+    close(p[0]);
+    close(p[1]);
+    // A write after it takes its own buffer, not the vmspliced one's
+    // rest: 16 slots less those two leave 14 for pages
+    let p = pipe();
+    sys_vmsplice(p[1], &iov(16), 1, 0);
+    sys_write(p[1] as u64, b"w".as_ptr(), 1);
+    let page = [b'p'; 4096];
+    sys_fcntl(p[1], F_SETFL, u64::from(O_NONBLOCK));
+    let mut pages = 0;
+    while pages < 64 && sys_write(p[1] as u64, page.as_ptr(), 4096) == 4096 {
+        pages += 1;
+    }
+    t.eq(b"no merge", pages, 14);
     close(p[0]);
     close(p[1]);
     t.done();
