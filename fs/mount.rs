@@ -2331,22 +2331,25 @@ impl Mount {
     }
 
     /// Release the covers its submounts left (Linux mntput_no_expire's
-    /// drop_cover): each off the list, freed a grace period later, its
-    /// mountpoint put, one MOUNT_LOCK write section each, the
-    /// mountpoint dropped after it
+    /// drop_cover): all in one MOUNT_LOCK write section, each off the
+    /// list, freed a grace period later, its mountpoint put; a last
+    /// mountpoint is dropped after the unlock (Linux shrink_dentry_list)
     fn drop_covers(&self) {
-        while !self.mnt_covers.is_empty() {
-            let gone = {
-                let mut ml = MOUNT_LOCK.write();
-                let Some(c) = self.mnt_covers.remove_first(|_| true, &mut ml) else {
-                    break;
-                };
+        if self.mnt_covers.is_empty() {
+            return;
+        }
+        let mut list = BoxList::<MpHashA>::new();
+        {
+            let mut ml = MOUNT_LOCK.write();
+            while let Some(c) = self.mnt_covers.remove_first(|_| true, &mut ml) {
                 let mp = NonNull::new(c.item().mp.load(Ordering::Relaxed)).map(MpPtr);
                 c.defer();
-                mp.and_then(|mp| put_mp(&mut ml, mp))
-            };
-            drop(gone);
+                if let Some(b) = mp.and_then(|mp| put_mp(&mut ml, mp)) {
+                    list.push_back(b);
+                }
+            }
         }
+        drop(list);
     }
 
     /// Unhang every submount (Linux umount_mnt for each) in one
