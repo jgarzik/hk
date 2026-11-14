@@ -5,7 +5,8 @@
 //! and whose main thread catches it:
 //! - pidfd_open(tid, PIDFD_THREAD) opens the non-leader thread;
 //! - the thread pidfd polls not readable while the thread runs, readable
-//!   once it exited;
+//!   once it exited, and pidfd_send_signal on it ESRCH once the thread
+//!   is reaped (Linux: soon after readable, not at once);
 //! - pidfd_send_signal on it signals that thread alone (pending there,
 //!   not run by the main thread), PIDFD_SIGNAL_THREAD_GROUP its process
 //!   (the main thread's handler runs);
@@ -18,7 +19,7 @@
 //! Before Linux 6.9 PIDFD_THREAD is EINVAL: the checks are skipped.
 
 use crate::harness::fail_num;
-use crate::helpers::{linux_at_least, print, println, skip};
+use crate::helpers::{linux_at_least, msleep, print, println, skip};
 use crate::mm::fork_mm::{join, spawn_thread};
 use crate::signal::signals::restorer_addr;
 use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -131,6 +132,21 @@ fn poll_in(fd: i64, ms: i32) -> i16 {
     }
 }
 
+/// pidfd_send_signal(fd, 0) once the exited thread `fd` is reaped,
+/// within ~2 s: Linux's exit_notify makes the pidfd readable, and only
+/// release_task, after tasklist_lock is dropped, unhashes the pid;
+/// signals sent in between still succeed
+fn reaped(fd: i64) -> i64 {
+    let mut r = send(fd, 0);
+    let mut n = 0;
+    while r == 0 && n < 2000 {
+        msleep(1);
+        r = send(fd, 0);
+        n += 1;
+    }
+    r
+}
+
 /// SIGUSR1 caught by `on_usr1` and unblocked in the calling thread
 fn catch_usr1() -> bool {
     let act = SigAction {
@@ -205,7 +221,7 @@ fn child() -> u32 {
     sys_write(wake[1] as u64, b"x".as_ptr(), 1);
     let exited = poll_in(fd, 2000) & POLLIN != 0;
     join(&raw mut CTID);
-    if !exited || send(fd, 0) != ESRCH {
+    if !exited || reaped(fd) != ESRCH {
         fails |= 1 << 1;
     }
     let pending = T_PENDING.load(Ordering::SeqCst) as u64 & USR1 != 0;
