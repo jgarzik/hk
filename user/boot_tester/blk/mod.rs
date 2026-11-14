@@ -5,6 +5,7 @@ pub mod dio_alias;
 pub mod dio_bench;
 pub mod dio_nowait;
 pub mod dio_pin;
+pub mod dio_stack;
 pub mod dioalign;
 pub mod disk;
 pub mod dsync;
