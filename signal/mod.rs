@@ -1232,6 +1232,10 @@ pub enum SendInfo {
     Kernel,
     /// This info
     Info(SigInfo),
+    /// A child's notice to its parent or tracer, numbered for the
+    /// receiver already (Linux do_notify_parent's __send_signal_locked):
+    /// queued as given, its sender never checked or forcing
+    Notice(SigInfo),
 }
 
 impl SendInfo {
@@ -1246,32 +1250,38 @@ impl SendInfo {
                 SigInfo::kill(sig, si_code::SI_USER, pid, crate::task::current_cred().uid)
             }
             Self::Kernel => SigInfo::kill(sig, si_code::SI_KERNEL, 0, 0),
-            Self::Info(i) => *i,
+            Self::Info(i) | Self::Notice(i) => *i,
+        }
+    }
+
+    /// SIGKILL and SIGSTOP with it reach a namespace init (Linux
+    /// send_signal_locked's `force`): from the kernel, or from a sender
+    /// the receiver's namespace `ns` does not number (an ancestor's, or
+    /// one whose pid is already detached), with an info that names its
+    /// sender; TASKLIST held (`table`)
+    fn forces(&self, table: &crate::task::percpu::GlobalTaskTable, ns: &PidNs) -> bool {
+        let unseen = || sender_nr(table, ns) == 0;
+        match self {
+            Self::User => unseen(),
+            Self::Kernel => true,
+            Self::Info(i) => i.has_sender() && (i.code == si_code::SI_KERNEL || unseen()),
+            Self::Notice(_) => false,
         }
     }
 
     /// [`resolve`](Self::resolve) for a send that checks its sender
-    /// (Linux send_signal_locked): an info whose sender `ns` does not
-    /// see names none
-    /// SIGKILL and SIGSTOP with it reach a namespace init (Linux
-    /// send_signal_locked's `force`): from the kernel, or from a sender
-    /// outside the receiver's namespace `ns` (an ancestor's), with an
-    /// info that names its sender
-    fn forces(&self, ns: &crate::ns::PidNamespace) -> bool {
-        let outside = || !crate::task::pid::current_in(ns);
-        match self {
-            Self::User => outside(),
-            Self::Kernel => true,
-            Self::Info(i) => i.has_sender() && (i.code == si_code::SI_KERNEL || outside()),
-        }
-    }
-
-    fn resolve_checked(&self, sig: Signal, ns: &crate::ns::PidNamespace) -> SigInfo {
+    /// (Linux send_signal_locked): an info naming its sender names none
+    /// if the receiver's namespace `ns` does not number the sending
+    /// task, in any namespace (an ancestor's sender, or one whose pid
+    /// is already detached); TASKLIST held (`table`)
+    fn resolve_checked(
+        &self,
+        table: &crate::task::percpu::GlobalTaskTable,
+        sig: Signal,
+        ns: &PidNs,
+    ) -> SigInfo {
         let mut i = self.resolve(sig, ns);
-        if matches!(self, Self::Info(_))
-            && ns.level != 0
-            && crate::task::pid::nr_ns(crate::task::percpu::current_tid(), ns) == 0
-        {
+        if matches!(self, Self::Info(_)) && sender_nr(table, ns) == 0 {
             i.hide_sender();
         }
         i
@@ -1281,14 +1291,28 @@ impl SendInfo {
     /// queued it (si_code < 0); an RT one never does (Linux
     /// __send_signal_locked's override_rlimit)
     fn override_rlimit(&self, sig: Signal) -> bool {
-        !sig.is_rt() && !matches!(self, Self::Info(i) if i.code < 0)
+        !sig.is_rt() && !matches!(self, Self::Info(i) | Self::Notice(i) if i.code < 0)
     }
 
     /// With no entry, the send fails with EAGAIN: an RT signal a user
     /// queued with info other than kill's (Linux: queue overflow)
     fn must_queue(&self, sig: Signal) -> bool {
-        sig.is_rt() && matches!(self, Self::Info(i) if i.code != si_code::SI_USER)
+        sig.is_rt() && matches!(self, Self::Info(i) | Self::Notice(i) if i.code != si_code::SI_USER)
     }
+}
+
+type PidNs = crate::ns::PidNamespace;
+
+/// The current task's thread pid as `ns` numbers it, 0 if `ns` does not
+/// see it or it is detached (no longer listed: Linux task_pid_nr_ns(
+/// current, ns) after release_task's detach_pid), under TASKLIST held
+/// by the caller
+fn sender_nr(table: &crate::task::percpu::GlobalTaskTable, ns: &PidNs) -> u32 {
+    let me = crate::task::percpu::current();
+    table
+        .view(&me)
+        .and_then(|v| v.thread_pid().map(|p| p.nr_ns(ns)))
+        .unwrap_or(0)
 }
 
 /// Send a signal to a specific task (thread), from the current task
@@ -1426,14 +1450,14 @@ fn send_task_in(
     {
         s.clear_unkillable();
     }
-    let init = tg.protects(sig, info.forces(t.pid_ns()));
+    let init = tg.protects(sig, info.forces(table, t.pid_ns()));
 
     let sighand = tg.sighand.as_ref();
     // Its entry is made under the receiver's lock, GFP_ATOMIC, once the
     // signal is known to be queued (Linux __send_signal_locked); SIGKILL
     // needs none
     let entry = (sig != SIGKILL).then(|| EntryOf {
-        info: info.resolve_checked(sig, t.pid_ns()),
+        info: info.resolve_checked(table, sig, t.pid_ns()),
         ucounts: &tg.ucounts,
         limit: tg.limit,
         override_rlimit: info.override_rlimit(sig),

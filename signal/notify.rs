@@ -228,7 +228,11 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
     };
     let (sig, autoreap) = (r.sig, r.autoreap);
     if let (Some(sig), Some(info)) = (sig, chld_notice(table, tid, r.to.pid_ns())) {
-        let info = SendInfo::Info(info.with_sig(sig));
+        // Its pid as the receiver numbers it, never hidden (Linux
+        // do_notify_parent: __send_signal_locked, not send_signal_locked:
+        // the last thread's release sends its leader's notice with its
+        // own pid already detached)
+        let info = SendInfo::Notice(info.with_sig(sig));
         let _ = super::send_task_in(table, &r.to, sig, info, super::PidType::Tgid, false);
     }
     Told {
