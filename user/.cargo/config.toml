@@ -8,6 +8,10 @@ rustflags = [
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=-nostartfiles",
     "-C", "link-arg=-static-pie",
+    # x86-64 LLVM 23 drops the prologue of a function whose stack-
+    # realigned local follows an early return when it shrink-wraps
+    # (rust-lang/rust#165958): off until fixed
+    "-C", "llvm-args=-enable-shrink-wrap=false",
 ]
 
 [target.aarch64-unknown-linux-gnu]

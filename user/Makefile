@@ -65,6 +65,10 @@ $(INITRAMFS): $(BOOT_TESTER) $(BOOT_TESTER2) $(ROOTFS_DEPS)
 # while hk's ELF loader does. RUSTFLAGS replaces .cargo/config.toml rustflags.
 HOST_TARGET_DIR = target-host
 HOST_RUSTFLAGS = -C relocation-model=static -C target-feature=+crt-static -C link-arg=-nostartfiles
+# x86-64: shrink-wrapping off, as .cargo/config.toml (rust-lang/rust#165958)
+ifneq ($(findstring x86_64,$(TARGET)),)
+HOST_RUSTFLAGS += -C llvm-args=-enable-shrink-wrap=false
+endif
 
 host:
 	RUSTFLAGS="$(HOST_RUSTFLAGS)" CARGO_TARGET_DIR=$(HOST_TARGET_DIR) $(CARGO) build --release --target $(TARGET)
