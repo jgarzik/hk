@@ -268,7 +268,17 @@ impl TcpCb {
             }
             return;
         }
-        if s.has(flags::SYN) {
+        // Crossed SYNs: the peer's bare SYN-ACK for our SYN completes
+        // the handshake (Linux tcp_validate_incoming, since 6.11; a user
+        // socket only: not a request, not an orphan)
+        let cross = self.state == TcpState::SynReceived
+            && !self.passive
+            && !self.orphan
+            && s.has(flags::ACK)
+            && s.seq_len() == 1
+            && s.seq.wrapping_add(1) == self.rcv_nxt
+            && s.ack == self.snd_nxt;
+        if s.has(flags::SYN) && !cross {
             if req {
                 // A new SYN in window: reset, drop the request (Linux
                 // tcp_check_req embryonic_reset)
@@ -304,6 +314,15 @@ impl TcpCb {
             self.snd_una = s.ack;
             self.syn_unacked = false;
             self.established(s, now, out);
+            // Linux tcp_rcv_state_process scales the completing
+            // segment's window, a SYN-ACK's too
+            self.snd_wnd = u32::from(s.wnd) << self.snd_wscale;
+            if cross {
+                // Its SYN is old: a duplicate, ACKed at once (Linux
+                // tcp_data_queue out_of_window)
+                self.enter_quickack();
+                self.ack_now = true;
+            }
         } else if !self.rcv_ack(s, now, out) {
             return;
         }

@@ -1174,6 +1174,32 @@ fn crossed_syns() -> Pair {
 }
 
 #[test]
+fn crossed_synack_establishes() {
+    let mut p = crossed_syns();
+    // b's bare SYN-ACK completes a's handshake (Linux 6.11+
+    // tcp_validate_incoming), answered by an ACK (a duplicate SYN)
+    let i = p.wire.iter().position(|(to_b, _)| !to_b).unwrap();
+    let (_, synack) = p.wire.remove(i).unwrap();
+    assert_eq!(synack.flags, flags::SYN | flags::ACK);
+    let mut out = Out::default();
+    p.a.feed(&seg_in(&synack), p.now, &mut out);
+    assert_eq!(p.a.state, TcpState::Established);
+    assert!(out.established);
+    let w = wire(&out);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0].flags, flags::ACK);
+    assert_eq!((w[0].seq, w[0].ack), (101, 901));
+    // Anything but a bare SYN-ACK for our SYN still gets a challenge ACK
+    let mut q = crossed_syns();
+    let i = q.wire.iter().position(|(to_b, _)| !to_b).unwrap();
+    let (_, synack) = q.wire.remove(i).unwrap();
+    let mut out = Out::default();
+    let bad = Seg { ack: 100, ..synack };
+    q.a.feed(&seg_in(&bad), q.now, &mut out);
+    assert_eq!(q.a.state, TcpState::SynReceived);
+}
+
+#[test]
 fn shutdown_in_syn_received_sends_fin() {
     let mut p = crossed_syns();
     let mut out = Out::default();

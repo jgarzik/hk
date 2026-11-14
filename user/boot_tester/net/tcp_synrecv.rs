@@ -7,6 +7,9 @@
 //!   sends a FIN, not a RST (Linux __tcp_close: tcp_close_state goes to
 //!   FIN_WAIT_1, tcp_send_fin); the timeout resends the SYN-ACK; the
 //!   peer's ACK and FIN take it to TIME_WAIT
+//! - TCP_SIMOPEN_SYNACK: crossed SYNs, then the peer's bare SYN-ACK:
+//!   answered by an ACK, ESTABLISHED (Linux 6.11 23e89e8ee7be:
+//!   tcp_validate_incoming lets it through; Ubuntu's 6.8 has it too)
 //! - TCP_LISTEN_CLOSE_REQ: a listener closed with a half-open
 //!   connection sends nothing (Linux inet_csk_listen_stop leaves request
 //!   socks alone; reqsk_timer_handler drops them silently); the peer's
@@ -40,6 +43,7 @@ const ACK: u8 = 0x10;
 pub fn run_tests() {
     crate::helpers::println(b"=== TCP SYN_RECEIVED Close Tests ===");
     test_simopen_close();
+    test_simopen_synack();
     test_listen_close_req();
     test_listen_close_acceptq();
 }
@@ -239,6 +243,35 @@ fn test_simopen_close() {
         f == i64::from(ACK) && seq == iss + 2 && ack == Y + 2,
         f,
     );
+    t.done();
+}
+
+fn test_simopen_synack() {
+    const ESTABLISHED: i64 = 1;
+    const Y: u32 = 0x3000_0000;
+    let mut t = T::new(b"TCP_SIMOPEN_SYNACK");
+    let Some(peer) = Peer::new(&mut t) else {
+        return t.done();
+    };
+    let a = sys_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0) as i32;
+    bind(a, LO, 0);
+    let pa = port(a);
+    t.eq(b"connect", connect(a, VOID, PEER_PORT), EINPROGRESS);
+    let (f, iss, _) = got(peer.from(pa, 1000));
+    t.eq(b"syn", f, i64::from(SYN));
+    t.eq(b"peer syn", peer.send(pa, Y, 0, SYN), 40);
+    let (f, _, _) = got(peer.from(pa, 1000));
+    t.eq(b"syn-ack", f, i64::from(SYN | ACK));
+    t.eq(b"peer syn-ack", peer.send(pa, Y, iss + 1, SYN | ACK), 40);
+    let (f, seq, ack) = got(peer.from(pa, 1000));
+    t.ok(
+        b"acked",
+        f == i64::from(ACK) && seq == iss + 1 && ack == Y + 1,
+        f,
+    );
+    // Ubuntu's 6.8 (CI's reference) carries the 6.11 change too
+    t.eq(b"state", tcp_state(a), ESTABLISHED);
+    close(a);
     t.done();
 }
 
