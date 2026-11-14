@@ -58,9 +58,17 @@ pub const T_UNBINDABLE: u32 = 0x1;
 /// a less privileged namespace copied, which would uncover what is
 /// under it; the initial root is protected by having no parent)
 pub const MNT_LOCKED: u32 = 0x80_0000;
+/// Taken out by a synchronous umount (Linux MNT_SYNC_UMOUNT): a
+/// lockless walk that raced it gives back the reference it took
+/// (legitimize), so the umount's puts are the last; set under
+/// MOUNT_LOCK, never cleared
+pub const MNT_SYNC_UMOUNT: u32 = 0x200_0000;
 /// Unmounted, or committed to it by an umount under way (Linux
 /// MNT_UMOUNT): set under MOUNT_LOCK, never cleared
 pub const MNT_UMOUNT: u32 = 0x800_0000;
+/// The kernel's state in `mnt_flags`, not copied by a clone (Linux
+/// MNT_INTERNAL_FLAGS)
+const MNT_INTERNAL_FLAGS: u32 = MNT_SYNC_UMOUNT | MNT_LOCKED | MNT_UMOUNT;
 
 /// What [`MOUNT_LOCK`] owns: the mount tree's links, with
 /// NAMESPACE_SEM ([`NsTree`]); `&MntHash` (a locking read) holds them
@@ -389,7 +397,7 @@ impl Mount {
     pub fn set_flags(&self, f: u32) -> Result<(), KernelError> {
         let _ml = MOUNT_LOCK.write();
         // Lock state is not the caller's to set here, nor the hold
-        let kept = MNT_LOCKED | MNT_UMOUNT;
+        let kept = MNT_INTERNAL_FLAGS;
         let f = (f & !(kept | MNT_WRITE_HOLD)) | (self.flags() & kept);
         // Linux mnt_make_readonly: writers held off; read-only only if
         // none holds access, set before the hold is released
@@ -1161,7 +1169,7 @@ fn clone_mnt(ns: &mut NsTree, m: &Mount, root: DentryRef, flag: u32) -> MountRef
     let c = Mount::alloc_nofail(
         m.sb.clone(),
         root,
-        m.flags() & !(MNT_LOCKED | MNT_UMOUNT),
+        m.flags() & !MNT_INTERNAL_FLAGS,
         m.devname.clone(),
     );
     c.inherit_t_flags(m);
@@ -1479,7 +1487,7 @@ fn umount_tree(ns: &mut NsTree, mnt: &Mount, how: u32) -> UmountList {
     let mut out = UmountList::new();
     while let Some(p) = set.pop_front() {
         p.set_ns(0);
-        let gone = umount_mnt(&p);
+        let gone = umount_mnt(&p, how & UMOUNT_SYNC != 0);
         out.push_back(p);
         drop(gone);
     }
@@ -1516,10 +1524,14 @@ pub(super) fn change_mountpoint(ns: &mut NsTree, to: &MountRef, mp: MpPtr, m: &M
 }
 
 /// `m` off its parent and mountpoint, out of the mount hash (Linux
-/// __umount_mnt; already off the parent's list), under NAMESPACE_SEM
-/// write: what the links held, to drop after MOUNT_LOCK
-fn umount_mnt(m: &Mount) -> (Option<Weak<Mount>>, Option<Box<Mountpoint>>) {
+/// __umount_mnt; already off the parent's list), marked MNT_SYNC_UMOUNT
+/// for a synchronous umount (`sync`), under NAMESPACE_SEM write: what
+/// the links held, to drop after MOUNT_LOCK
+fn umount_mnt(m: &Mount, sync: bool) -> (Option<Weak<Mount>>, Option<Box<Mountpoint>>) {
     let mut ml = MOUNT_LOCK.write();
+    if sync {
+        m.mnt_flags.fetch_or(MNT_SYNC_UMOUNT, Ordering::SeqCst);
+    }
     unhash_mnt(&mut ml, m);
     let w = m.take_parent(&mut ml);
     let gone = m.take_mountpoint(&ml).and_then(|mp| put_mp(&mut ml, mp));
