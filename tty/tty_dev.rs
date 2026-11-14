@@ -27,7 +27,7 @@ impl CharDevice for TtyCharDevice {
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let tty = jobctrl::current_tty().ok_or(KernelError::NoDeviceOrAddress)?;
-        Redirect::open(file, tty, false)
+        Redirect::open(file, tty, false, false)
     }
 
     fn release(&self, file: &File) {

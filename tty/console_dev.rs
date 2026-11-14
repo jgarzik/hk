@@ -29,7 +29,7 @@ impl CharDevice for ConsoleCharDevice {
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let tty = console_tty().ok_or(KernelError::NoDevice)?;
-        Redirect::open(file, tty, false)
+        Redirect::open(file, tty, false, true)
     }
 
     fn release(&self, file: &File) {

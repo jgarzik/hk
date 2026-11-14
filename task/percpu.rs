@@ -3403,7 +3403,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         if group_dead {
             // A session leader's session loses its controlling tty
             // (Linux do_exit -> disassociate_ctty(1))
-            crate::tty::jobctrl::disassociate_ctty();
+            crate::tty::jobctrl::disassociate_ctty(true);
         }
 
         // Clean up SysV semaphore undo list for exiting task

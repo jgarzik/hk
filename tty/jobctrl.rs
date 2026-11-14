@@ -123,17 +123,52 @@ pub fn tiocnotty(tty: &Tty) -> Result<(), KernelError> {
     if !is_current(tty) {
         return Err(KernelError::NotTty);
     }
-    disassociate_ctty();
+    disassociate_ctty(false);
     Ok(())
 }
 
-/// A session leader gives up its controlling tty, by TIOCNOTTY or at
-/// exit (Linux disassociate_ctty): its foreground group gets SIGHUP and
-/// SIGCONT, and the session has no tty any more. No-op for others. At
-/// exit Linux hangs the tty up instead (tty_vhangup_session); hk has no
-/// hangup.
-pub fn disassociate_ctty() {
+/// A hangup takes the tty's session and foreground group (Linux
+/// __tty_hangup under ctrl.lock); the window size stays
+pub(super) fn hangup_take(tty: &Tty) -> (Option<Arc<Pid>>, Option<Arc<Pid>>) {
+    let _g = CTTY_LOCK.lock();
+    let mut c = tty.ctrl.lock();
+    (c.session.take(), c.pgrp.take())
+}
+
+/// A hung up tty's session leader gets SIGHUP and SIGCONT; with
+/// `exit_session` (the leader is exiting) the foreground group gets
+/// SIGHUP too (Linux tty_signal_session_leader: only if the leader is
+/// still there)
+pub(super) fn signal_session_leader(
+    session: Option<Arc<Pid>>,
+    pgrp: Option<Arc<Pid>>,
+    exit_session: bool,
+) {
+    use crate::signal::{SendInfo, kill_pid_info};
+    let Some(s) = session else {
+        return;
+    };
+    if kill_pid_info(&s, SIGHUP, SendInfo::Kernel, |_, _| Ok(())).is_err() {
+        return;
+    }
+    let _ = kill_pid_info(&s, SIGCONT, SendInfo::Kernel, |_, _| Ok(()));
+    if exit_session && let Some(pg) = pgrp {
+        kill_pgrp_pid(&pg, SIGHUP);
+    }
+}
+
+/// A session leader gives up its controlling tty (Linux
+/// disassociate_ctty). At exit (`on_exit`) the tty is hung up (Linux
+/// tty_vhangup_session); by TIOCNOTTY its foreground group gets SIGHUP
+/// and SIGCONT and the session has no tty any more. No-op for others
+pub fn disassociate_ctty(on_exit: bool) {
     if !is_leader() {
+        return;
+    }
+    if on_exit {
+        if let Some(tty) = current_tty() {
+            tty.hangup(true);
+        }
         return;
     }
     let pgrp = {

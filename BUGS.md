@@ -475,22 +475,21 @@ glibc's helper thread), and hk has no such path.
   ISIG signals, canonical lines, the lock-free input check poll uses)
   runs only on the console's real input. A pty (phase H) makes it
   testable from the boot tester.
-- **No hangup:** nothing hangs a tty up (Linux __tty_hangup: vhangup,
-  a session leader's exit, carrier loss), so open files stay usable.
-  A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
-  foreground group and clear the session; vhangup(2) only checks
-  CAP_SYS_TTY_CONFIG. Unbinding a serial port (serial8250, PL011)
-  removes its tty devices, console and interrupt but hangs up no open
-  file (Linux uart_remove_one_port: tty_port_tty_vhangup): writes to
-  an open ttyS0/ttyAMA0 or /dev/console still reach the UART. No boot
-  test unbinds the console UART (the test output goes there).
+- **Hangup gaps:** no carrier (DCD) loss hangs a tty up (no modem
+  control); a session leader exiting with no controlling tty signals
+  no former foreground group (Linux tty_old_pgrp). An unbound serial
+  port's tty is hung up, but its /dev/console files (left alone, as
+  Linux) still write to the UART, where Linux's port is detached
+  (uart_port_check). No boot test unbinds the console UART (the test
+  output goes there).
 - **Per-process controlling tty:** it is the session's tty, so TIOCNOTTY
   by a non-leader changes nothing (Linux clears that process's
   signal->tty only).
 - **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
-  TIOCEXCL exclusivity, sending a break (TCSBRK 0), IXON/IXOFF flow
-  control, packet mode, ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT,
-  IUCLC/OLCUC, IMAXBEL, PARMRK and parity/break input handling.
+  TIOCEXCL exclusivity, sending a break (TCSBRK 0), packet mode,
+  ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT, IUCLC/OLCUC, IMAXBEL,
+  PARMRK and parity/break input handling, CRTSCTS (no modem
+  control: IXOFF throttles by STOP/START only).
 - **Serial ports:** ttyS1 is registered without probing COM2; only
   COM1 (and the PL011) take input.
 - **No virtual terminals:** the framebuffer and VGA consoles are not

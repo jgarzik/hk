@@ -15,7 +15,10 @@ use crate::fs::chardev::{DevId, major};
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::time::timer::{TIMER_HARD, TimerList};
-use crate::tty::serial_core::{UartOps, UartPort};
+use crate::tty::serial_core::{
+    PORT_16550A, PORT_CIRRUS, PORT_STARTECH, PORT_UNKNOWN, UPF_BOOT_AUTOCONF, UPF_SKIP_TEST,
+    UPIO_PORT, UartCfg, UartDesc, UartOps, UartPort,
+};
 use crate::tty::{Tty, TtyDriver};
 
 /// NS16550A register offsets
@@ -118,12 +121,30 @@ pub struct SerialTty {
 impl SerialTty {
     /// Create a new serial TTY
     ///
-    /// `port`: I/O port base address (e.g., 0x3F8 for COM1); `poll`:
-    /// its transmitter poll timer
-    pub const fn new(port: u16, poll: &'static TimerList) -> Self {
+    /// ttyS`line` at I/O port `port` (e.g., 0x3F8 for COM1) on
+    /// interrupt `irq` (Linux SERIAL_PORT_DFNS); `poll`: its
+    /// transmitter poll timer
+    pub const fn new(line: i32, port: u16, irq: i32, poll: &'static TimerList) -> Self {
         Self {
             port,
-            uart: UartPort::new(),
+            uart: UartPort::new(
+                UartDesc {
+                    type_: PORT_16550A,
+                    line,
+                    iobase: port as u32,
+                    mapbase: 0,
+                    iotype: UPIO_PORT,
+                    regshift: 0,
+                },
+                // Linux STD_COMX_FLAGS, BASE_BAUD * 16, the 16550A's FIFO
+                UartCfg {
+                    irq,
+                    flags: UPF_BOOT_AUTOCONF | UPF_SKIP_TEST,
+                    uartclk: 1_843_200,
+                    custom_divisor: 0,
+                    fifosize: TX_LOADSZ as i32,
+                },
+            ),
             ier: AtomicU8::new(0),
             poll,
         }
@@ -313,6 +334,22 @@ impl UartOps for SerialTty {
     fn arm_poll(&self) {
         core::pin::Pin::static_ref(self.poll).mod_timer(crate::task::percpu::get_ticks() + 1);
     }
+
+    /// Linux serial8250_verify_port: a type of uart_config (PORT_BCM7271
+    /// the last), not Cirrus or Startech
+    fn verify_port(&self, ss: &crate::tty::SerialStruct) -> Result<(), KernelError> {
+        const NR_TYPES: i32 = 77;
+        if ss.irq < 0
+            || ss.baud_base < 9600
+            || ss.type_ < PORT_UNKNOWN
+            || ss.type_ >= NR_TYPES
+            || ss.type_ == PORT_CIRRUS
+            || ss.type_ == PORT_STARTECH
+        {
+            return Err(KernelError::InvalidArgument);
+        }
+        Ok(())
+    }
 }
 
 impl TtyDriver for SerialTty {
@@ -343,6 +380,20 @@ impl TtyDriver for SerialTty {
         }
     }
 
+    /// Linux uart_throttle
+    fn throttle(&self, tty: &Tty) {
+        if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, true) {
+            self.send_xchar(tty, ch);
+        }
+    }
+
+    /// Linux uart_unthrottle
+    fn unthrottle(&self, tty: &Tty) {
+        if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, false) {
+            self.send_xchar(tty, ch);
+        }
+    }
+
     fn flush(&self) {
         SerialTty::flush(self);
     }
@@ -359,6 +410,10 @@ impl TtyDriver for SerialTty {
         self.uart.flush_buffer();
     }
 
+    /// Linux uart_hangup
+    fn hangup(&self) {
+        self.uart.hangup(self);
+    }
     /// Linux uart_tty_port_shutdown
     fn shutdown(&self, console: bool) {
         self.uart.shutdown(self, console);
@@ -367,6 +422,25 @@ impl TtyDriver for SerialTty {
     /// Linux serial8250_console_write: under the port lock
     fn console_write(&self, data: &[u8]) {
         self.uart.console_write(self, data);
+    }
+
+    /// Linux uart_get_info
+    fn get_serial(
+        &self,
+        port: &crate::tty::TtyPort,
+    ) -> Result<crate::tty::SerialStruct, KernelError> {
+        Ok(self.uart.get_info(port))
+    }
+
+    /// Linux uart_set_info
+    fn set_serial(
+        &self,
+        port: &mut crate::tty::TtyPort,
+        ss: &crate::tty::SerialStruct,
+        users: usize,
+    ) -> Result<(), KernelError> {
+        let admin = crate::task::capable(crate::task::CAP_SYS_ADMIN);
+        self.uart.set_info(self, port, ss, users > 0, users, admin)
     }
 }
 
@@ -383,23 +457,28 @@ pub mod ports {
 }
 
 /// Static serial hardware driver instances for standard COM ports
-static SERIAL_DRIVER_S0: SerialTty = SerialTty::new(ports::COM1, &POLL_S0);
-static SERIAL_DRIVER_S1: SerialTty = SerialTty::new(ports::COM2, &POLL_S1);
+static SERIAL_DRIVER_S0: SerialTty = SerialTty::new(0, ports::COM1, 4, &POLL_S0);
+static SERIAL_DRIVER_S1: SerialTty = SerialTty::new(1, ports::COM2, 3, &POLL_S1);
 
-/// The ports' transmitter poll timers (Linux serial8250_timeout), for
-/// a port without an interrupt
-static POLL_S0: TimerList = TimerList::new(poll_s0, TIMER_HARD);
-static POLL_S1: TimerList = TimerList::new(poll_s1, TIMER_HARD);
+/// The ports' transmitter poll timers (Linux up->timer), for a port
+/// without an interrupt
+static POLL_S0: TimerList = TimerList::new(serial8250_timeout, TIMER_HARD);
+static POLL_S1: TimerList = TimerList::new(serial8250_timeout, TIMER_HARD);
 
-fn poll_s0(_t: &TimerList) {
-    if SERIAL_DRIVER_S0.uart.poll_tx(&SERIAL_DRIVER_S0) {
-        SERIAL_TTY_S0.write_wakeup();
-    }
-}
+/// The 8250 ports, each driver with its tty (Linux serial8250_ports)
+static PORTS: [(&SerialTty, &Tty); 2] = [
+    (&SERIAL_DRIVER_S0, &SERIAL_TTY_S0),
+    (&SERIAL_DRIVER_S1, &SERIAL_TTY_S1),
+];
 
-fn poll_s1(_t: &TimerList) {
-    if SERIAL_DRIVER_S1.uart.poll_tx(&SERIAL_DRIVER_S1) {
-        SERIAL_TTY_S1.write_wakeup();
+/// A port's poll timer (Linux serial8250_timeout): the port is the one
+/// whose timer fired (Linux from_timer(up, t, timer))
+fn serial8250_timeout(t: &TimerList) {
+    let Some(&(drv, tty)) = PORTS.iter().find(|(d, _)| core::ptr::eq(d.poll, t)) else {
+        return;
+    };
+    if drv.uart.poll_tx(drv) {
+        tty.write_wakeup();
     }
 }
 
@@ -509,11 +588,14 @@ impl crate::base::Bound for Serial8250 {
     }
 
     /// Linux serial8250_remove, uart_remove_one_port per port: its tty
-    /// device and console go, its interrupt is off (no hangup of an
-    /// open tty: BUGS.md)
+    /// device goes, its tty is hung up (tty_port_tty_vhangup), its
+    /// console goes, its interrupt is off
     fn remove(&self) {
         for t in self.ttys.iter().rev() {
             t.del();
+        }
+        for tty in serial_ttys().iter().rev() {
+            tty.hangup(false);
         }
         crate::console::unregister_console(SERIAL_TTY_S0.name());
         let irq = self.irq.lock().take();

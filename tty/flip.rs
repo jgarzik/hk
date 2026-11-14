@@ -24,6 +24,9 @@ pub struct Flip {
     buf: [u8; FLIP_SIZE],
     head: usize,
     len: usize,
+    /// Bytes from `head` whose flow control characters the line
+    /// discipline has seen ahead (Linux tty_buffer.lookahead)
+    lookahead: usize,
 }
 
 impl Flip {
@@ -32,6 +35,7 @@ impl Flip {
             buf: [0; FLIP_SIZE],
             head: 0,
             len: 0,
+            lookahead: 0,
         }
     }
 
@@ -47,9 +51,14 @@ impl Flip {
 
     /// Copy out the oldest bytes, leaving them queued
     fn peek(&self, out: &mut [u8]) -> usize {
-        let n = self.len.min(out.len());
+        self.peek_at(0, out)
+    }
+
+    /// Copy out bytes from `off` past the oldest, leaving them queued
+    fn peek_at(&self, off: usize, out: &mut [u8]) -> usize {
+        let n = self.len.saturating_sub(off).min(out.len());
         for (i, o) in out[..n].iter_mut().enumerate() {
-            *o = self.buf[(self.head + i) % FLIP_SIZE];
+            *o = self.buf[(self.head + off + i) % FLIP_SIZE];
         }
         n
     }
@@ -58,12 +67,14 @@ impl Flip {
     pub(super) fn clear(&mut self) {
         self.head = 0;
         self.len = 0;
+        self.lookahead = 0;
     }
 
     /// Drop the oldest `n` bytes (the line discipline took them)
     fn consume(&mut self, n: usize) {
         self.head = (self.head + n) % FLIP_SIZE;
         self.len -= n;
+        self.lookahead = self.lookahead.saturating_sub(n);
     }
 }
 
@@ -99,9 +110,29 @@ fn flush_to_ldisc(tty: &Tty) {
         let taken = n_tty::receive_buf(tty, &chunk[..n]);
         tty.flip.lock().consume(taken);
         if taken < n {
-            // The line discipline is full: a read kicks it on
+            // The line discipline is full: a read kicks it on; flow
+            // control in what waits acts now (Linux lookahead_bufs)
+            lookahead_bufs(tty);
             return;
         }
+    }
+}
+
+/// Show the line discipline the bytes past its last look, for their
+/// flow control characters (Linux lookahead_bufs), under buf_lock
+fn lookahead_bufs(tty: &Tty) {
+    let mut chunk = [0u8; 256];
+    loop {
+        let n = {
+            let mut f = tty.flip.lock();
+            let n = f.peek_at(f.lookahead, &mut chunk);
+            f.lookahead += n;
+            n
+        };
+        if n == 0 {
+            return;
+        }
+        n_tty::lookahead_flow_ctrl(tty, &chunk[..n]);
     }
 }
 
