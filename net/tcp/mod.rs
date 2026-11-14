@@ -31,8 +31,8 @@
 //! shutdown bits and the lockless view (`Snap`: state, queue sizes,
 //! writability, send window edges, Linux's READ_ONCE fields that
 //! tcp_poll, the waits and tcp_v4_err read) are published. Wakeups run
-//! with no spin lock held (they send SIGIO): from the owner, or after
-//! `slock` is dropped. Transmitting never re-enters a socket lock: `lo`
+//! from the owner, under `slock` in `release_cb` (Linux
+//! tcp_release_cb), or after an unowned step drops `slock`. Transmitting never re-enters a socket lock: `lo`
 //! queues to the receive backlog and `netif_rx_flush_local` runs only
 //! with no lock held.
 //!
@@ -617,7 +617,7 @@ impl TcpSock {
         Wake { w, ready }
     }
 
-    /// `apply`, then the wakeups (the owner holds no spin lock)
+    /// `apply`, then the wakeups (owner; `slock` held in `release_cb`)
     fn finish(&self, g: &mut Inner, out: &mut Out) {
         let w = self.apply(g, out);
         self.wake_up(w);
@@ -1184,9 +1184,10 @@ impl SockHooks<Inner> for TcpSock {
         self.finish(g, &mut out);
     }
 
-    /// Linux tcp_release_cb: the timers that fired, an MTU reduction
-    /// (tcp_v4_mtu_reduced) and the soft error left while owned; then
-    /// the lockless view of the owner's work is published
+    /// Linux tcp_release_cb, under `slock`: the timers that fired, an
+    /// MTU reduction (tcp_v4_mtu_reduced) and the soft error left while
+    /// owned; then the lockless view of the owner's work is published
+    /// and the wakeups made
     fn release_cb(&self, g: &mut Inner, flags: u32) {
         let mut out = Out::default();
         let now = now_ms();

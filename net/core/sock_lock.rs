@@ -13,20 +13,17 @@
 //!
 //! Release (Linux release_sock) feeds the backlog to
 //! `SockHooks::backlog_rcv` (Linux __release_sock) with `slock`
-//! dropped and the socket still owned, then runs
-//! `SockHooks::release_cb` with the deferred flags the same way, until
-//! neither has work; only then is the owned bit cleared, under `slock`,
-//! and a waiting locker woken. Linux runs release_cb under `slock`; hk
-//! runs it owned with `slock` dropped because its wakeups send SIGIO
-//! (a sleeping FasyncList lock). Mutual exclusion is the same: input
-//! seeing the socket owned backlogs, and whatever arrives meanwhile is
-//! picked up by the next round.
+//! dropped and the socket still owned, until it is empty; then, under
+//! `slock`, runs `SockHooks::release_cb` with the deferred flags,
+//! clears the owned bit and wakes a waiting locker. Input that saw the
+//! socket owned meanwhile is in the backlog the loop re-checks; once
+//! `slock` is held for good nothing more is queued or deferred.
 //!
 //! Lock order: owner (sleeping, thread context; above every spin lock)
 //! -> `slock` (spin, thread context; lockdep class: the caller of
 //! `SockLock::new`) -> what the protocol takes under it. `SockLock.wq`
-//! (an IrqSpinlock wait queue) is a leaf under `slock` only in
-//! `lock`'s wait condition.
+//! (an IrqSpinlock wait queue) is a leaf under `slock`: release wakes
+//! a locker under it (Linux release_sock).
 
 use alloc::boxed::Box;
 use core::cell::UnsafeCell;
@@ -44,8 +41,8 @@ pub trait SockHooks<T> {
     /// socket is owned, no spin lock held
     fn backlog_rcv(&self, t: &mut T, skb: Box<SkBuff>);
     /// Work deferred while owned, `flags` (Linux sk_prot->release_cb;
-    /// called on every release, also with no flags); owned, no spin
-    /// lock held
+    /// called on every release, also with no flags); owned, under
+    /// `slock`
     fn release_cb(&self, t: &mut T, flags: u32);
 }
 
@@ -127,36 +124,33 @@ impl<T> SockLock<T> {
         }
     }
 
-    /// Run the backlog and the deferred work as the owner until there
-    /// is none; returns `slock` held with both empty (Linux
-    /// __release_sock + release_cb)
+    /// Run the backlog as the owner with `slock` dropped until it is
+    /// empty, then the deferred work under `slock`; returns `slock`
+    /// held with both empty (Linux __release_sock + release_cb)
     ///
     /// # Safety
     /// - The caller owns the lock (a `SockGuard` that set `owned`) and
     ///   holds no borrow of `data`.
     unsafe fn drain<H: SockHooks<T>>(&self, hooks: &H) -> MutexGuard<'_, Slock> {
-        loop {
-            let mut s = self.slock.lock();
-            if !s.backlog.is_empty() {
-                let mut q = core::mem::take(&mut s.backlog);
-                drop(s);
-                while let Some(skb) = q.pop_front() {
-                    // SAFETY: owned by the caller, who holds no borrow
-                    // of `data` (fn contract, type invariant)
-                    hooks.backlog_rcv(unsafe { &mut *self.data.get() }, skb);
-                }
-                continue;
-            }
-            let flags = core::mem::take(&mut s.deferred);
+        let mut s = self.slock.lock();
+        while !s.backlog.is_empty() {
+            let mut q = core::mem::take(&mut s.backlog);
             drop(s);
-            // SAFETY: as above
-            hooks.release_cb(unsafe { &mut *self.data.get() }, flags);
-            let mut s = self.slock.lock();
-            if s.backlog.is_empty() && s.deferred == 0 {
-                s.len = 0;
-                return s;
+            while let Some(skb) = q.pop_front() {
+                // SAFETY: owned by the caller, who holds no borrow of
+                // `data` (fn contract, type invariant)
+                hooks.backlog_rcv(unsafe { &mut *self.data.get() }, skb);
             }
+            s = self.slock.lock();
         }
+        // Zeroed only here: a flooding producer cannot keep the owner
+        // looping (Linux __release_sock)
+        s.len = 0;
+        let flags = core::mem::take(&mut s.deferred);
+        // SAFETY: as above; `slock` held, so no input, timer or error
+        // adds work until the caller lets it go
+        hooks.release_cb(unsafe { &mut *self.data.get() }, flags);
+        s
     }
 
     /// Give up ownership (Linux release_sock)
@@ -168,8 +162,8 @@ impl<T> SockLock<T> {
         let mut s = unsafe { self.drain(hooks) };
         // INVARIANT: nothing of `data` is borrowed any more
         s.owned = false;
-        drop(s);
         self.wq.wake_one();
+        drop(s);
     }
 
     /// Take `slock` (Linux bh_lock_sock)
