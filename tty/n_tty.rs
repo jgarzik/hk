@@ -322,8 +322,8 @@ pub(super) fn ldata(tty: &Tty) -> Ld<'_> {
     }
 }
 
-/// Write the queued echo to the driver (Linux __process_echoes: the
-/// driver takes it all, its writes are synchronous)
+/// Write the queued echo to the driver as far as it takes it (Linux
+/// __process_echoes: what does not fit stays queued for later)
 fn process_echoes(tty: &Tty, ld: &mut NTtyData) {
     while ld.echo_tail != ld.echo_head {
         let i = ld.echo_tail % ECHO_BUF_SIZE;
@@ -331,8 +331,11 @@ fn process_echoes(tty: &Tty, ld: &mut NTtyData) {
             .echo_head
             .wrapping_sub(ld.echo_tail)
             .min(ECHO_BUF_SIZE - i);
-        let _ = tty.driver_write(&ld.echo[i..i + n]);
-        ld.echo_tail = ld.echo_tail.wrapping_add(n);
+        let took = tty.driver_write(&ld.echo[i..i + n]).unwrap_or(0).min(n);
+        ld.echo_tail = ld.echo_tail.wrapping_add(took);
+        if took < n {
+            break;
+        }
     }
 }
 
@@ -654,45 +657,79 @@ pub fn poll_in(tty: &Tty) -> bool {
 }
 
 /// Write (Linux iterate_tty_write + n_tty_write), under the tty's
-/// write lock: through a kernel buffer a chunk at a time; a short chunk
-/// ends it, an error after some bytes returns their count
-pub fn write(tty: &Tty, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+/// write lock: through a kernel buffer a chunk at a time, waiting for
+/// the driver's room (EAGAIN if `nonblock`); an error after some bytes
+/// returns their count
+pub fn write(tty: &Tty, from: &mut IovSource<'_>, nonblock: bool) -> Result<usize, KernelError> {
     let mut chunk = [0u8; 512];
     let mut done = 0;
     while !from.is_empty() {
-        let r = from
-            .copy_from(&mut chunk)
-            .and_then(|c| Ok((write_chunk(tty, &chunk[..c])?, c)));
-        match r {
-            Ok((n, c)) => {
-                done += n;
-                if n < c {
-                    break;
-                }
-            }
+        let c = match from.copy_from(&mut chunk) {
+            Ok(c) => c,
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
+        };
+        let (n, r) = write_chunk(tty, &chunk[..c], nonblock);
+        done += n;
+        if let Err(e) = r {
+            if done == 0 {
+                return Err(e);
+            }
+            break;
         }
     }
     Ok(done)
 }
 
-/// Write one chunk: OPOST with ONLCR maps NL to CR-NL
-fn write_chunk(tty: &Tty, buf: &[u8]) -> Result<usize, KernelError> {
-    let t = tty.get_termios();
-    if t.c_oflag & OPOST == 0 || t.c_oflag & ONLCR == 0 {
-        return tty.driver_write(buf);
-    }
-    for chunk in buf.split_inclusive(|&b| b == b'\n') {
-        match chunk.split_last() {
-            Some((b'\n', rest)) => {
-                tty.driver_write(rest)?;
-                tty.driver_write(b"\r\n")?;
-            }
-            _ => {
-                tty.driver_write(chunk)?;
-            }
+/// Hand `data` to the driver as it takes it, waiting for room between
+/// partial takes: the bytes taken, and the error that stopped it
+fn write_some(tty: &Tty, mut data: &[u8], nonblock: bool) -> (usize, Result<(), KernelError>) {
+    let mut done = 0;
+    while !data.is_empty() {
+        let n = match tty.driver_write(data) {
+            Ok(n) => n.min(data.len()),
+            Err(e) => return (done, Err(e)),
+        };
+        done += n;
+        data = &data[n..];
+        if !data.is_empty()
+            && let Err(e) = tty.wait_room(1, nonblock)
+        {
+            return (done, Err(e));
         }
     }
-    Ok(buf.len())
+    (done, Ok(()))
+}
+
+/// Write one chunk, OPOST with ONLCR mapping NL to CR-NL (Linux
+/// process_output_block, which waits for room for both): the input
+/// bytes written, and the error that stopped it
+fn write_chunk(tty: &Tty, buf: &[u8], nonblock: bool) -> (usize, Result<(), KernelError>) {
+    let t = tty.get_termios();
+    if t.c_oflag & OPOST == 0 || t.c_oflag & ONLCR == 0 {
+        return write_some(tty, buf, nonblock);
+    }
+    let mut done = 0;
+    for piece in buf.split_inclusive(|&b| b == b'\n') {
+        let (text, nl) = match piece.split_last() {
+            Some((b'\n', rest)) => (rest, true),
+            _ => (piece, false),
+        };
+        let (n, r) = write_some(tty, text, nonblock);
+        done += n;
+        if r.is_err() {
+            return (done, r);
+        }
+        if nl {
+            if let Err(e) = tty.wait_room(2, nonblock) {
+                return (done, Err(e));
+            }
+            let (_, r) = write_some(tty, b"\r\n", nonblock);
+            if r.is_err() {
+                return (done, r);
+            }
+            done += 1;
+        }
+    }
+    (done, Ok(()))
 }

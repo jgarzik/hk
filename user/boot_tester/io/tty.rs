@@ -11,6 +11,9 @@
 //! - TTY_READ_EINTR: a blocking read sleeps until a signal (EINTR)
 //! - TTY_WRITE_ATOMIC: a write holds the tty's write lock to its end
 //!   (an O_NONBLOCK writer meanwhile gets EAGAIN)
+//! - TTY_OUTQ: a console write returns with its bytes queued for the
+//!   UART (TIOCOUTQ > 0; Linux uart_write into the transmit buffer,
+//!   drained by the TX interrupt); tcdrain waits until none are left
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{host_mode, print, println, skip};
@@ -28,6 +31,7 @@ const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
 const TCSBRK: u64 = 0x5409;
 const TIOCNOTTY: u64 = 0x5422;
+const TIOCOUTQ: u64 = 0x5411;
 const SIGHUP: u64 = 1;
 const SIGCONT: u64 = 18;
 const SIGWINCH: u64 = 28;
@@ -49,6 +53,32 @@ pub fn run_tests() {
     test_read_eintr();
     test_sigwinch();
     test_write_atomic();
+    test_outq();
+}
+
+/// Bytes queued for the console's UART
+fn outq(fd: i32) -> i64 {
+    let mut n = -1i32;
+    let r = sys_ioctl(fd, TIOCOUTQ, (&raw mut n) as u64);
+    if r < 0 { r } else { i64::from(n) }
+}
+
+fn test_outq() {
+    const NAME: &[u8] = b"TTY_OUTQ";
+    let fd = sys_open(b"/dev/console\0".as_ptr(), O_WRONLY | O_NOCTTY, 0);
+    if fd < 0 {
+        return report(NAME, false, fd);
+    }
+    let fd = fd as i32;
+    let mut line = [b' '; 1500];
+    line[1499] = b'\n';
+    let w = sys_write(fd as u64, line.as_ptr(), line.len() as u64);
+    let queued = outq(fd);
+    let drained = sys_ioctl(fd, TCSBRK, 1);
+    let left = outq(fd);
+    sys_close(fd as u64);
+    let ok = w == line.len() as i64 && queued > 0 && drained == 0 && left == 0;
+    report(NAME, ok, if queued <= 0 { queued } else { left });
 }
 
 fn report(name: &[u8], ok: bool, got: i64) {

@@ -3974,7 +3974,7 @@ context. Per-TTY locks use Mutex and are accessed from process context only.
 | `OUTPUT_LOCK` | `printk.rs` | `IrqSpinlock<()>` | Serializes all console writes across CPUs |
 | `PRINTK` | `printk.rs` | `IrqSpinlock<PrintkState>` | Protects ring buffer state |
 | `CONSOLE_REGISTRY` | `console.rs` | `IrqSpinlock<ConsoleRegistry>` | Protects console driver list |
-| `UartPort.lock` (8250 `SerialTty`, PL011) | `tty/serial_core.rs` | `IrqSpinlock<()>` | A UART's port lock (Linux uart_port.lock): its console write holds it for the whole message (under `OUTPUT_LOCK`, any context; only tried during an oops, as Linux), its tty write per 16-byte chunk (under the tty's `write_lock`, or from N_TTY echo), so console output never interleaves with a tty write's bytes. A leaf |
+| `UartPort.xmit` (8250 `SerialTty`, PL011) | `tty/serial_core.rs` | `IrqSpinlock<Xmit>` | A UART's port lock (Linux uart_port.lock) and its transmit buffer (4 KiB, Linux xmit_fifo). A tty write (under the tty's `write_lock`, or N_TTY echo from the flip thread) copies into it and starts the transmitter under it (Linux uart_write); the TX interrupt (8250 THRE, PL011 TXIS) or, for a port without one, its HARD poll timer refills the transmitter under it (Linux serial8250_tx_chars, pl011_tx_chars, serial8250_timeout); the driver's interrupt-enable shadow (8250 IER, PL011 IMSC) changes under it. A console write holds it for the whole message (under `OUTPUT_LOCK`, any context; only tried during an oops, as Linux), so console output never interleaves with a tty write's bytes. Order: -> the timer wheel lock (arming the poll timer); nothing else. Writers are woken (`Tty.write_wait`) after it is released: a wakeup takes run-queue locks, and printk, so the console write, may run under one; the interrupt handler reads input (the flip buffer) before taking it |
 
 All three use `IrqSpinlock` for IRQ safety - see Section 3.6 for details.
 
@@ -3993,6 +3993,7 @@ Each `Tty` struct contains:
 | `read_lock` | `sync::Mutex<()>` (sleeping) | One N_TTY reader at a time, held across the whole read and its sleeps (Linux `atomic_read_lock`): a canonical line copied out in pieces goes to one reader; outermost tty lock, taken before `ldata` |
 | `write_lock` | `sync::Mutex<()>` (sleeping) | One writer at a time, held across the whole write(2) (Linux `atomic_write_lock`, tty_write_lock): another writer's bytes never land inside it; outermost on the write side, taken before the TOSTOP check (`termios`, TASKLIST → `ctrl`, SIGTTOU) and the driver writes; O_NONBLOCK try-locks (EAGAIN), else interruptible. Thread context only: printk's console write and N_TTY echo do not take it (as Linux). Not nested with `read_lock` or `buf_lock` |
 | `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
+| `write_wait` | `WaitQueue` | Writers (under `write_lock`), pollers and tcdrain waiting for the driver's room or an empty queue (Linux write_wait); the driver wakes it with no lock held (`Tty::write_wakeup`) |
 | `fasync` | `FasyncList` (RCU, 3.11) | O_ASYNC files (Linux `tty->fasync`): N_TTY input sends their SIGIO under `ldata` (Linux: under termios_rwsem), at each canonical line end, or after non-canonical input, then wakes `read_wait` |
 
 `termios` and `ctrl` are spin locks taken in thread context only,

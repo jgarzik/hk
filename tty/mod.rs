@@ -119,11 +119,26 @@ pub use termios::{Termios, Winsize};
 /// Received bytes come from the driver's interrupt handler through
 /// `flip::receive`.
 pub trait TtyDriver: Send + Sync {
-    /// Write bytes to hardware
+    /// Queue bytes for the hardware (Linux tty_operations.write): the
+    /// count taken, maybe short; the driver calls `Tty::write_wakeup`
+    /// once there is room again
     fn write(&self, data: &[u8]) -> Result<usize, KernelError>;
 
     /// Wait until the transmitter is empty
     fn flush(&self) {}
+
+    /// Bytes `write` takes now (Linux write_room)
+    fn write_room(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Bytes queued, not yet sent (Linux chars_in_buffer)
+    fn chars_in_buffer(&self) -> usize {
+        0
+    }
+
+    /// Drop the queued bytes (Linux flush_buffer)
+    fn flush_buffer(&self) {}
 
     /// The console write (Linux console->write): bytes straight to the
     /// hardware, LF as CR LF, then a wait until the transmitter is
@@ -184,6 +199,9 @@ pub struct Tty {
     buf_lock: crate::sync::Mutex<()>,
     /// Readers and pollers wait here for input (Linux read_wait)
     read_wait: WaitQueue,
+    /// Writers, pollers and tcdrain wait here for the driver's room
+    /// (Linux write_wait)
+    write_wait: WaitQueue,
     /// One reader at a time, so a canonical line goes whole to one
     /// reader though it is copied out in pieces (Linux
     /// n_tty_data.atomic_read_lock)
@@ -212,6 +230,7 @@ impl Tty {
             read_lock: crate::sync::Mutex::new(()),
             write_lock: crate::sync::Mutex::new(()),
             read_wait: WaitQueue::new(),
+            write_wait: WaitQueue::new(),
             ctrl: Mutex::new(TtyCtrl::new()),
             fasync: FasyncList::new(),
         }
@@ -237,9 +256,35 @@ impl Tty {
         }
     }
 
-    /// Write directly to driver (bypassing line discipline)
+    /// Write directly to driver (bypassing line discipline): the count
+    /// it took
     pub fn driver_write(&self, data: &[u8]) -> Result<usize, KernelError> {
         self.driver.write(data)
+    }
+
+    /// Bytes the driver takes now (Linux tty_write_room)
+    pub fn write_room(&self) -> usize {
+        self.driver.write_room()
+    }
+
+    /// The driver has room again or sent everything (Linux tty_wakeup):
+    /// wake writers, pollers and tcdrain; any context, no lock held
+    pub fn write_wakeup(&self) {
+        self.write_wait.wake_all();
+    }
+
+    /// Sleep until the driver takes `n` bytes (Linux n_tty_write's
+    /// wait on write_wait): EAGAIN if `nonblock`, ERESTARTSYS on a
+    /// signal
+    pub fn wait_room(&self, n: usize, nonblock: bool) -> Result<(), KernelError> {
+        if self.write_room() >= n {
+            return Ok(());
+        }
+        if nonblock {
+            return Err(KernelError::WouldBlock);
+        }
+        self.write_wait
+            .wait_event_interruptible(|| self.write_room() >= n)
     }
 
     // =========================================================================
@@ -335,9 +380,18 @@ impl Tty {
         N_TTY
     }
 
-    /// Wait for output to be sent
+    /// Wait for output to be sent (Linux tty_wait_until_sent): the
+    /// queue empty, then the transmitter; a signal ends the wait
     pub fn wait_until_sent(&self) {
+        let _ = self
+            .write_wait
+            .wait_event_interruptible(|| self.driver.chars_in_buffer() == 0);
         self.driver.flush();
+    }
+
+    /// Bytes queued for the hardware (Linux tty_chars_in_buffer)
+    pub fn chars_in_buffer(&self) -> usize {
+        self.driver.chars_in_buffer()
     }
 
     /// Flush the input buffer
@@ -350,9 +404,11 @@ impl Tty {
         n_tty::ldata(self).reset();
     }
 
-    /// Flush the output buffer (no-op for polled driver)
+    /// Drop the queued output (Linux tty_driver_flush_buffer), waking
+    /// writers
     pub fn flush_output(&self) {
-        self.driver.flush();
+        self.driver.flush_buffer();
+        self.write_wakeup();
     }
 }
 
@@ -387,7 +443,8 @@ impl CharDevice for Tty {
         if self.get_termios().c_lflag & TOSTOP != 0 {
             jobctrl::check_change(self, crate::signal::SIGTTOU)?;
         }
-        n_tty::write(self, from)
+        let nonblock = file.get_flags() & crate::fs::flags::O_NONBLOCK != 0;
+        n_tty::write(self, from, nonblock)
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
@@ -398,13 +455,17 @@ impl CharDevice for Tty {
         Some(self.tty_fasync(file, fd, on))
     }
 
-    /// Output is written synchronously: always writable (Linux
+    /// Writable while the driver has room and little queued (Linux
     /// n_tty_poll)
     fn poll(&self, _file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(pt) = pt {
             pt.poll_wait(&self.read_wait);
+            pt.poll_wait(&self.write_wait);
         }
-        let mut mask = POLLOUT | POLLWRNORM;
+        let mut mask = 0;
+        if self.chars_in_buffer() < serial_core::WAKEUP_CHARS && self.write_room() > 0 {
+            mask |= POLLOUT | POLLWRNORM;
+        }
         if n_tty::poll_in(self) {
             mask |= POLLIN | POLLRDNORM;
         }
