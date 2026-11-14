@@ -6,9 +6,10 @@
 //!   si_band, si_fd
 //! - SIGIO_FIOASYNC: FIOASYNC sets O_ASYNC and arms the file
 //! - SIGIO_WRITER: a read makes room: the writer gets POLL_OUT
-//! - SIGIO_READ_EINTR: a blocking read a signal interrupts sends the
-//!   writers nothing; one that gives up with EAGAIN signals them
-//!   (pipe_read returns -ERESTARTSYS before its kill_fasync)
+//! - SIGIO_READ_EINTR: a blocking read a signal interrupts adds no
+//!   SIGIO for the writers to what was pending while it slept; one that
+//!   gives up with EAGAIN signals them (pipe_read returns -ERESTARTSYS
+//!   before its final kill_fasync)
 //! - SIGIO_SPLICE_OUT: a splice from the pipe to a file signals the
 //!   writers only once it frees a buffer (Linux iter_file_splice_write,
 //!   splice_from_pipe_end's need_wakeup)
@@ -43,10 +44,10 @@ use hk_syscall::{
     AF_INET, AF_UNIX, FIOASYNC, O_CREAT, O_NONBLOCK, O_RDWR, O_TRUNC, SIG_DFL, SIGUSR1,
     SOCK_STREAM, SigInfo, SockAddrIn, Zeroable, htonl, make_ipv4, sys_accept, sys_bind, sys_close,
     sys_connect, sys_dup, sys_exit, sys_fanotify_init, sys_fcntl, sys_fork, sys_getpid,
-    sys_getsockname, sys_gettid, sys_inotify_init1, sys_ioctl, sys_listen, sys_mknod, sys_open,
-    sys_pipe2, sys_read, sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid, sys_setresuid,
-    sys_setsid, sys_socket, sys_socketpair, sys_splice, sys_tkill, sys_unlink, sys_wait4,
-    sys_write,
+    sys_getppid, sys_getsockname, sys_gettid, sys_inotify_init1, sys_ioctl, sys_listen, sys_mknod,
+    sys_open, sys_pipe2, sys_read, sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid,
+    sys_setresuid, sys_setsid, sys_socket, sys_socketpair, sys_splice, sys_tkill, sys_unlink,
+    sys_wait4, sys_write,
 };
 use hk_syscall::{sys_kill, sys_ptrace};
 
@@ -307,15 +308,76 @@ fn test_writer() {
 /// The reading thread, for the child to signal
 static READER: AtomicI64 = AtomicI64::new(0);
 
-/// Child: signal the reading thread once it is blocked in read
+/// `sig` pending, process-wide or for its main thread, in
+/// /proc/`pid`/status (ShdPnd, SigPnd); None if unreadable
+fn proc_pending(pid: i64, sig: u32) -> Option<bool> {
+    let mut path = [0u8; 32];
+    let mut n = 0;
+    for &c in b"/proc/" {
+        path[n] = c;
+        n += 1;
+    }
+    let mut digits = [0u8; 20];
+    let (mut d, mut v) = (0, pid as u64);
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while d > 0 {
+        d -= 1;
+        path[n] = digits[d];
+        n += 1;
+    }
+    for &c in b"/status\0" {
+        path[n] = c;
+        n += 1;
+    }
+    let mut buf = [0u8; 2048];
+    let len = crate::helpers::read_file(&path, &mut buf);
+    if len <= 0 {
+        return None;
+    }
+    let mut seen = 0;
+    let mut pending = false;
+    for l in buf[..len as usize].split(|&c| c == b'\n') {
+        let Some(hex) = l
+            .strip_prefix(b"ShdPnd:")
+            .or_else(|| l.strip_prefix(b"SigPnd:"))
+        else {
+            continue;
+        };
+        let mut set = 0u64;
+        for &c in hex.iter().filter(|c| c.is_ascii_hexdigit()) {
+            set = set << 4 | (c as char).to_digit(16).unwrap_or(0) as u64;
+        }
+        pending |= set & bit(sig) != 0;
+        seen += 1;
+    }
+    (seen == 2).then_some(pending)
+}
+
+/// Child: once the reader is blocked in read, report whether its
+/// process has SIGIO pending (exit 1; 0 not, 2 unknown), then signal
+/// the reading thread
 fn kick_reader() -> i32 {
     msleep(150);
+    let r = match proc_pending(sys_getppid(), SIGIO) {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => 2,
+    };
     sys_tkill(READER.load(Ordering::Relaxed), SIGUSR1);
-    0
+    r
 }
 
 /// The write end armed: a read interrupted in its wait sends no
-/// POLL_OUT; a nonblocking read finding nothing does
+/// POLL_OUT of its own (Linux before 6.15 sends one before each sleep,
+/// ee5eda8ea595 removed it: whatever was pending while it slept is all
+/// that is pending after); a nonblocking read finding nothing does
 fn test_read_eintr() {
     // SIGUSR1 thread-directed and unblocked here, whatever the
     // process's other threads and earlier masks
@@ -333,22 +395,34 @@ fn test_read_eintr() {
     let intr = sys_read(p[0] as u64, b.as_mut_ptr(), 1);
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
+    // SIGIO pending while the read slept: 1 yes, 0 no
+    let asleep = if st & 0x7f == 0 {
+        ((st >> 8) & 0xff) as i64
+    } else {
+        -1
+    };
     sigaction(SIGUSR1, SIG_DFL, 0);
-    let none = take(SIGIO);
+    let after = take(SIGIO);
     let fl = sys_fcntl(p[0], F_GETFL, 0) as u64;
     sys_fcntl(p[0], F_SETFL, fl | O_NONBLOCK as u64);
     let again = sys_read(p[0] as u64, b.as_mut_ptr(), 1);
     let got = take(SIGIO);
     close2(p);
     setmask(old);
-    let ok = pid > 0 && intr == EINTR && none == EAGAIN && again == EAGAIN;
+    let same = match asleep {
+        0 => after == EAGAIN,
+        1 => after == SIGIO as i64,
+        _ => false,
+    };
+    let ok = pid > 0 && intr == EINTR && same && again == EAGAIN;
     let ok = ok && got == SIGIO as i64;
     report(
         b"SIGIO_READ_EINTR",
         ok,
         &[
             (b"intr", intr),
-            (b"none", none),
+            (b"asleep", asleep),
+            (b"after", after),
             (b"again", again),
             (b"got", got),
         ],
