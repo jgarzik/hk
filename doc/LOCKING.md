@@ -3425,7 +3425,8 @@ Fallback:** if scheduling is not yet enabled, page locking spins.
 
 ### 3.4 Namespaces
 
-**Location:** `ns/mod.rs`, `ns/uts.rs`
+**Location:** `ns/mod.rs`, `ns/uts.rs`, `ns/common.rs`, `ns/setns.rs`,
+`fs/pseudo/nsfs.rs`
 
 The namespace subsystem follows Linux's `nsproxy` pattern, where each task has
 a reference to an `NsProxy` that holds pointers to its namespaces. Multiple
@@ -3442,6 +3443,7 @@ tasks can share the same `NsProxy` (e.g., threads created without CLONE_NEW* fla
 | `UserNamespace.gid_map.extents` | `RwLock<Vec<UidGidExtent>>` | GID mapping extents |
 | `PidNamespace.alloc` | `AtomicU32` changed under PIDMAP_LOCK | Pid count, NS_ADDING, NS_INIT (3.1.1, "A pid namespace's init") |
 | `PidNamespace.reaper`, `reboot` | `TableCell` (TASKLIST) | Child reaper, reboot(2) status (3.1.1) |
+| `NsCommon.stashed` | `AtomicPtr<Dentry>` (no lock) | The namespace's nsfs dentry while one lives, no reference (Linux ns->stashed): set by a compare-exchange from null (`ns_get_path`; the loser drops its own dentry and retries), cleared by a compare-exchange from that dentry in its kill (`DentryOps.d_prune`, Linux ns_prune_dentry) before its memory's grace period starts; a reader loads it and takes a reference under an RCU read guard (`DentryRef::try_get`, Linux lockref_get_not_dead) |
 
 `CgroupNamespace`, and a `PidNamespace`'s level, parent and number
 bitmap, are immutable after creation (no lock).
@@ -3463,6 +3465,16 @@ bitmap, are immutable after creation (no lock).
 3. **clone/unshare** - `copy_namespaces()` reads the parent's, then
    installs the child's under the child's alloc_lock, never with a
    namespace lock held; it runs early in `do_clone()` (can fail on OOM).
+
+4. **Namespace files** - an nsfs inode holds a reference to its
+   namespace (Linux i_private), dropped with the inode at its dentry's
+   kill: the last reference to a mount or network namespace may go
+   there, and a mount namespace's end sleeps (NAMESPACE_SEM), so an
+   nsfs dentry is put only where sleeping is allowed (a file's
+   deferred release, a mount's teardown, a path put in a syscall), as
+   Linux dput. setns (`ns/setns.rs`) builds the new set aside with no
+   lock held (TASKLIST read briefly for the thread check, as Linux
+   thread_group_empty), then switches to it under the alloc_lock.
 
 #### Lock Order for Namespace Operations
 

@@ -118,86 +118,87 @@ const FDINFO_INO: u64 = 2 << 24;
 /// Content generator function type
 pub type ContentGenerator = fn() -> Vec<u8>;
 
-/// Namespace types for /proc/<pid>/ns/* files
-///
-/// Used by setns(2) to identify which namespace to join.
+/// The links of /proc/<pid>/ns (Linux proc_ns_operations, ns_entries
+/// in this order): each names one of the task's namespaces
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamespaceType {
-    /// UTS namespace (hostname, domainname)
-    Uts,
-    /// Mount namespace (filesystem view)
-    Mnt,
-    /// PID namespace (process IDs)
-    Pid,
-    /// User namespace (UID/GID mapping)
-    User,
-    /// IPC namespace (SysV IPC)
-    Ipc,
     /// Network namespace (network stack isolation)
     Net,
-    // Future: Cgroup, Time
+    /// UTS namespace (hostname, domainname)
+    Uts,
+    /// IPC namespace (SysV IPC)
+    Ipc,
+    /// PID namespace the task is in (Linux task_active_pid_ns)
+    Pid,
+    /// PID namespace its children go to (Linux pid_ns_for_children)
+    PidForChildren,
+    /// User namespace (UID/GID mapping)
+    User,
+    /// Mount namespace (filesystem view)
+    Mnt,
+    /// Cgroup namespace (cgroup root)
+    Cgroup,
 }
 
 impl NamespaceType {
-    /// Get the filename for this namespace type
+    /// Its name in /proc/<pid>/ns (Linux ops->name)
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Uts => "uts",
-            Self::Mnt => "mnt",
-            Self::Pid => "pid",
-            Self::User => "user",
-            Self::Ipc => "ipc",
             Self::Net => "net",
+            Self::Uts => "uts",
+            Self::Ipc => "ipc",
+            Self::Pid => "pid",
+            Self::PidForChildren => "pid_for_children",
+            Self::User => "user",
+            Self::Mnt => "mnt",
+            Self::Cgroup => "cgroup",
         }
     }
 
     /// Convert from filename to namespace type
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "uts" => Some(Self::Uts),
-            "mnt" => Some(Self::Mnt),
-            "pid" => Some(Self::Pid),
-            "user" => Some(Self::User),
-            "ipc" => Some(Self::Ipc),
-            "net" => Some(Self::Net),
-            _ => None,
-        }
+        Self::all().iter().copied().find(|t| t.as_str() == s)
     }
 
-    /// Get the CLONE_NEW* flag for this namespace type
-    pub fn clone_flag(&self) -> u64 {
-        match self {
-            Self::Uts => crate::ns::CLONE_NEWUTS,
-            Self::Mnt => crate::ns::CLONE_NEWNS,
-            Self::Pid => crate::ns::CLONE_NEWPID,
-            Self::User => crate::ns::CLONE_NEWUSER,
-            Self::Ipc => crate::ns::CLONE_NEWIPC,
-            Self::Net => crate::ns::CLONE_NEWNET,
-        }
+    /// Its inode number offset under the process (`pid_ino`)
+    fn offset(&self) -> u64 {
+        2 + Self::all().iter().position(|t| t == self).unwrap_or(0) as u64
     }
 
-    /// The inode number of `ns`'s namespace of this type (Linux
-    /// ns.inum)
-    pub fn inum(&self, ns: &crate::ns::NsProxy) -> u32 {
-        match self {
-            Self::Uts => ns.uts_ns.ns.inum(),
-            Self::Mnt => ns.mnt_ns.ns.inum(),
-            Self::Pid => ns.pid_ns.ns.inum(),
-            Self::User => ns.user_ns.ns.inum(),
-            Self::Ipc => ns.ipc_ns.ns.inum(),
-            Self::Net => ns.net_ns.ns.inum(),
-        }
+    /// Task `t`'s namespace of this type, a new reference (Linux
+    /// ops->get): None once it has exited, and for pid_for_children
+    /// until that namespace has its init (Linux pidns_for_children_get)
+    pub fn get(&self, t: &crate::task::Task) -> Option<crate::ns::NsRef> {
+        use crate::ns::NsRef;
+        let ns = task_nsproxy(t)?;
+        Some(match self {
+            Self::Net => NsRef::Net(ns.net_ns.clone()),
+            Self::Uts => NsRef::Uts(ns.uts_ns.clone()),
+            Self::Ipc => NsRef::Ipc(ns.ipc_ns.clone()),
+            Self::Pid => NsRef::Pid(t.get_pid_ns()),
+            Self::PidForChildren => {
+                if !crate::task::pidns::has_reaper(&ns.pid_ns) {
+                    return None;
+                }
+                NsRef::Pid(ns.pid_ns.clone())
+            }
+            Self::User => NsRef::User(ns.user_ns.clone()),
+            Self::Mnt => NsRef::Mnt(ns.mnt_ns.clone()),
+            Self::Cgroup => NsRef::Cgroup(ns.cgroup_ns.clone()),
+        })
     }
 
     /// List of all supported namespace types
     pub fn all() -> &'static [NamespaceType] {
         &[
-            Self::Uts,
-            Self::Mnt,
-            Self::Pid,
-            Self::User,
-            Self::Ipc,
             Self::Net,
+            Self::Uts,
+            Self::Ipc,
+            Self::Pid,
+            Self::PidForChildren,
+            Self::User,
+            Self::Mnt,
+            Self::Cgroup,
         ]
     }
 }
@@ -424,8 +425,8 @@ impl InodeOps for ProcfsInodeOps {
             Link::Fixed(t) => Ok(t.to_vec()),
             Link::Fd(pid, fd) => fd_link(&pid, fd),
             Link::Ns(pid, ns_type) => {
-                let inum = ns_inum(&pid, ns_type)?;
-                Ok(alloc::format!("{}:[{inum}]", ns_type.as_str()).into_bytes())
+                let ns = task_ns(&pid, ns_type)?;
+                Ok(alloc::format!("{}:[{}]", ns.name(), ns.inum()).into_bytes())
             }
         }
     }
@@ -880,14 +881,7 @@ fn lookup_pid_ns_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode
 
     // Create namespace file inode
     let sb = dir.superblock().ok_or(KernelError::Io)?;
-    let offset = match ns_type {
-        NamespaceType::Uts => 2,
-        NamespaceType::Mnt => 3,
-        NamespaceType::Pid => 4,
-        NamespaceType::User => 5,
-        NamespaceType::Ipc => 6,
-        NamespaceType::Net => 7,
-    };
+    let offset = ns_type.offset();
 
     // A magic link to the namespace (Linux proc_ns_dir_operations:
     // S_IFLNK | 0777)
@@ -1115,36 +1109,18 @@ fn link_task(pid: &ProcPid) -> Result<TaskRef, KernelError> {
     Ok(t)
 }
 
-/// The inode number of the `ns_type` namespace of the task `pid` names
-/// (Linux ns_get_name)
-fn ns_inum(pid: &ProcPid, ns_type: NamespaceType) -> Result<u32, KernelError> {
+/// The `ns_type` namespace of the task `pid` names (Linux
+/// proc_ns_get_link / proc_ns_readlink: EACCES without ptrace-read
+/// access, ENOENT if it has none)
+fn task_ns(pid: &ProcPid, ns_type: NamespaceType) -> Result<crate::ns::NsRef, KernelError> {
     let t = link_task(pid)?;
-    let ns = task_nsproxy(&t).ok_or(KernelError::PermissionDenied)?;
-    Ok(ns_type.inum(&ns))
+    ns_type.get(&t).ok_or(KernelError::NotFound)
 }
 
-/// The file of the `ns_type` namespace of the task `pid` names, where
-/// its /proc link leads: a read-only nsfs inode numbered as the
-/// namespace (Linux ns_get_path: ino ns.inum), which setns takes
+/// Where the /proc link of the `ns_type` namespace of the task `pid`
+/// leads: the namespace's nsfs file (Linux ns_get_path)
 fn ns_file(pid: ProcPid, ns_type: NamespaceType) -> Result<crate::fs::Path, KernelError> {
-    let inum = ns_inum(&pid, ns_type)?;
-    let sb = crate::fs::pseudo::NSFS.sb()?;
-    let inode = Inode::alloc(Inode::new(
-        u64::from(inum),
-        InodeMode::regular(0o444),
-        0,
-        0,
-        0,
-        current_time(),
-        Arc::downgrade(&sb),
-        &PROCFS_INODE_OPS,
-    ))?;
-    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::new_ns_file(pid, ns_type),
-    )))?);
-    // On nsfs's mount (Linux ns_get_path: dname "<type>:[<inum>]")
-    let name = alloc::format!("{}:[{inum}]", ns_type.as_str());
-    crate::fs::pseudo::NSFS.path(&name, inode)
+    crate::fs::pseudo::nsfs::ns_get_path(task_ns(&pid, ns_type)?)
 }
 
 /// Generate content for /proc/<pid>/cgroup
@@ -1950,9 +1926,9 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), Ke
 /// Emit entries for /proc/<pid>/ns/ directory
 fn readdir_emit_ns_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
     // Emit all namespace files
-    for (idx, ns_type) in NamespaceType::all().iter().enumerate() {
+    for ns_type in NamespaceType::all() {
         let should_continue = ctx.emit(DirEntry {
-            ino: pid_ino(pid, 2 + idx as u64),
+            ino: pid_ino(pid, ns_type.offset()),
             file_type: FileType::Symlink,
             name: Vec::from(ns_type.as_str().as_bytes()),
         });

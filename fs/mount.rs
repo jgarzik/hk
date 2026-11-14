@@ -1417,16 +1417,23 @@ fn has_locked_children(ns: &NsTree, m: &Mount, d: &DentryRef) -> bool {
     })
 }
 
+/// The tree at `p` may be copied by the caller (Linux may_copy_tree):
+/// it is in the caller's namespace, or is a namespace file
+fn may_copy_tree(p: &Path) -> bool {
+    check_mnt(&p.mnt) || super::pseudo::nsfs::ns_of_dentry(&p.dentry).is_some()
+}
+
 /// Bind `old` (with its submounts if `rec`) on `mp` (Linux do_loopback,
 /// __do_loopback and graft_tree), in Linux's order: the target must be
-/// in the caller's namespace, the source bindable and in it too
-/// (EINVAL), a lone bind must not uncover a locked submount (EINVAL),
-/// a recursive one not leave out a locked unbindable one (EPERM); a
-/// directory goes only on a directory and a file on a file (ENOTDIR)
+/// in the caller's namespace, the source bindable and in it too or a
+/// namespace file (EINVAL), a lone bind must not uncover a locked
+/// submount (EINVAL), a recursive one not leave out a locked
+/// unbindable one (EPERM); a directory goes only on a directory and a
+/// file on a file (ENOTDIR)
 pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> {
     let mut l = lock_mount(mp)?;
     let (ns, mp): (&mut NsTree, _) = (&mut l.ns, &l.at);
-    if !check_mnt(&mp.mnt) || old.mnt.is_unbindable() || !check_mnt(&old.mnt) {
+    if !check_mnt(&mp.mnt) || old.mnt.is_unbindable() || !may_copy_tree(old) {
         return Err(KernelError::InvalidArgument);
     }
     if !rec && has_locked_children(ns, &old.mnt, &old.dentry) {

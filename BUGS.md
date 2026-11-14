@@ -1023,16 +1023,12 @@ size and depth match it, else ENOMEM; Linux simpledrm allocates any
 dumb buffer from shmem and blits it on page flip
 (drm_gem_shmem_dumb_create).
 
-## Namespace files are not nsfs
+## Namespace file gaps
 
-**Location**: `fs/proc/mod.rs` (`ns_file`), `ns/mod.rs` (`sys_setns`)
+**Location**: `fs/pseudo/nsfs.rs`, `ns/setns.rs`
 
-/proc/<pid>/ns/<type> leads to an inode on the nsfs mount numbered as
-the namespace, but its operations are procfs's: the file names the
-task and the type, so setns joins the namespace that task is in at
-setns time (Linux: the open file pins the namespace itself, and a bind
-mount of it keeps the namespace alive). No cgroup, time,
-pid_for_children or time_for_children links, and no NS_GET_* ioctls.
+No time or time_for_children links (no time namespaces), no NS_GET_*
+ioctls, and setns(2) takes no pidfd (EINVAL).
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 
