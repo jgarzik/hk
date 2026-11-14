@@ -11,7 +11,7 @@ use crate::sync::spin::RwLock;
 use crate::sync::{LockedByEither, RwSem, RwSemReadGuard, RwSemWriteGuard, SeqLock, UniqueOwner};
 use crate::util::list::{BoxList, Link, OwnedList, Owner};
 use crate::util::rcuhlist::{HNode, RcuHList};
-use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use alloc::boxed::Box;
 
 use super::KernelError;
@@ -48,6 +48,10 @@ pub const MNT_ATIME_MASK: u32 = MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME;
 pub const MNT_READONLY: u32 = 0x40;
 /// Symlinks on this mount are not followed (Linux MNT_NOSYMFOLLOW)
 pub const MNT_NOSYMFOLLOW: u32 = 0x80;
+/// New write access through the mount waits (Linux MNT_WRITE_HOLD):
+/// set only under MOUNT_LOCK while writers are counted, never seen by
+/// [`Mount::flags`]
+const MNT_WRITE_HOLD: u32 = 0x200;
 /// Cannot be bind-mounted (Linux T_UNBINDABLE, in `t_flags`)
 pub const T_UNBINDABLE: u32 = 0x1;
 /// Cannot be unmounted, moved or pivoted away (Linux MNT_LOCKED: a mount
@@ -187,9 +191,11 @@ pub struct Mount {
     /// Marked by a first umount2(MNT_EXPIRE) (Linux mnt_expiry_mark)
     expiry: core::sync::atomic::AtomicBool,
 
-    /// Holders of write access through this mount and the WRITE_HOLD bit
-    /// (Linux mnt_writers and WRITE_HOLD): see superblock::get_write
-    writers: AtomicU64,
+    /// Holders of write access through this mount, per CPU (Linux
+    /// mnt_pcp's mnt_writers): a writer adds to any CPU's part, a
+    /// holder sums them with MNT_WRITE_HOLD set (`want_write`,
+    /// `hold_writers`)
+    mnt_writers: PcpSlot,
 
     /// Id in /proc/<pid>/mountinfo and statx (Linux mnt_id): reused
     pub mnt_id: u32,
@@ -237,6 +243,7 @@ impl Mount {
             flags,
             devname,
             pcp,
+            PcpSlot::new()?,
             MNT_IDS.try_alloc()?,
         ))?;
         m.sb.add_mount(&m);
@@ -252,7 +259,16 @@ impl Mount {
         devname: super::name::FileName,
     ) -> MountRef {
         let pcp = PcpSlot::new_nofail();
-        let m = arc_nofail(Self::init(sb, root, flags, devname, pcp, MNT_IDS.alloc()));
+        let w = PcpSlot::new_nofail();
+        let m = arc_nofail(Self::init(
+            sb,
+            root,
+            flags,
+            devname,
+            pcp,
+            w,
+            MNT_IDS.alloc(),
+        ));
         m.sb.add_mount(&m);
         MountRef::first(m)
     }
@@ -264,6 +280,7 @@ impl Mount {
         flags: u32,
         devname: super::name::FileName,
         mnt_pcp: PcpSlot,
+        mnt_writers: PcpSlot,
         mnt_id: u32,
     ) -> Self {
         Self {
@@ -275,7 +292,7 @@ impl Mount {
             mnt_child: Link::new(),
             mnt_child_owner: Owner::new(),
             mnt_flags: AtomicU32::new(flags),
-            writers: AtomicU64::new(0),
+            mnt_writers,
             expiry: core::sync::atomic::AtomicBool::new(false),
             group: AtomicU32::new(0),
             t_flags: AtomicU32::new(0),
@@ -335,9 +352,10 @@ impl Mount {
         self.mnt_ns.store(ns, Ordering::Relaxed);
     }
 
-    /// MNT_* flags
+    /// MNT_* flags (MNT_WRITE_HOLD, a MOUNT_LOCK holder's, left out:
+    /// Linux clone_mnt and remount clear it from what they copy)
     pub fn flags(&self) -> u32 {
-        self.mnt_flags.load(Ordering::Relaxed)
+        self.mnt_flags.load(Ordering::Relaxed) & !MNT_WRITE_HOLD
     }
 
     /// Replace the MNT_* flags (mount, remount): turning MNT_READONLY on
@@ -345,8 +363,8 @@ impl Mount {
     /// through the mount (Linux mnt_make_readonly)
     pub fn set_flags(&self, f: u32) -> Result<(), KernelError> {
         let _ml = MOUNT_LOCK.write();
-        // Lock state is not the caller's to set here
-        let f = (f & !MNT_LOCKED) | (self.flags() & MNT_LOCKED);
+        // Lock state is not the caller's to set here, nor the hold
+        let f = (f & !(MNT_LOCKED | MNT_WRITE_HOLD)) | (self.flags() & MNT_LOCKED);
         // Linux mnt_make_readonly: writers held off; read-only only if
         // none holds access, set before the hold is released
         if f & MNT_READONLY != 0 && self.flags() & MNT_READONLY == 0 {
@@ -361,14 +379,22 @@ impl Mount {
         Ok(())
     }
 
-    /// Linux mnt_hold_writers, under MOUNT_LOCK
+    /// Hold new writers off (Linux mnt_hold_writers), under MOUNT_LOCK:
+    /// true if none holds write access now. The flag is stored before
+    /// the parts are summed (smp_mb), and a writer adds before it looks
+    /// at the flag, so a writer the sum misses waits, then sees the
+    /// read-only state set before `unhold_writers`.
     pub(super) fn hold_writers(&self) -> bool {
-        super::superblock::hold_writers(&self.writers)
+        self.mnt_flags.fetch_or(MNT_WRITE_HOLD, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        self.mnt_writers.sum() <= 0
     }
 
-    /// Linux mnt_unhold_writers, under MOUNT_LOCK
+    /// Let writers in again (Linux mnt_unhold_writers), under
+    /// MOUNT_LOCK: after the read-only state they must see (smp_wmb)
     pub(super) fn unhold_writers(&self) {
-        super::superblock::unhold_writers(&self.writers)
+        fence(Ordering::Release);
+        self.mnt_flags.fetch_and(!MNT_WRITE_HOLD, Ordering::Release);
     }
 
     /// Set (`on`) or clear MNT_* bits that need no other checks, under
@@ -410,9 +436,27 @@ impl Mount {
         self.flags() & MNT_READONLY != 0 || self.sb.rdonly()
     }
 
-    /// Release what want_write took
+    /// Release what want_write took (Linux mnt_put_write_access): from
+    /// any CPU's part, the sum adds up
     pub(super) fn put_write(&self) {
-        self.writers.fetch_sub(1, Ordering::SeqCst);
+        self.mnt_writers.add(-1);
+    }
+
+    /// Take write access (Linux mnt_get_write_access): count first,
+    /// then (smp_mb) wait out a hold, spinning (a holder holds MOUNT_LOCK
+    /// and never waits for writers), then (smp_rmb) EROFS if read-only
+    fn get_write(&self) -> Result<(), KernelError> {
+        self.mnt_writers.add(1);
+        fence(Ordering::SeqCst);
+        while self.mnt_flags.load(Ordering::Relaxed) & MNT_WRITE_HOLD != 0 {
+            core::hint::spin_loop();
+        }
+        fence(Ordering::Acquire);
+        if self.is_readonly() {
+            self.mnt_writers.add(-1);
+            return Err(KernelError::ReadOnlyFs);
+        }
+        Ok(())
     }
 
     /// A use of the mount ended (Linux mntput): an MNT_EXPIRE mark
@@ -1596,7 +1640,7 @@ impl MountRef {
     /// for a read-only mount or superblock; hold the guard across the
     /// modification
     pub fn want_write(&self) -> Result<super::superblock::WriteAccess, KernelError> {
-        super::superblock::get_write(&self.writers, || self.is_readonly())?;
+        self.get_write()?;
         Ok(super::superblock::WriteAccess::mnt(self.clone()))
     }
 }
@@ -1751,6 +1795,22 @@ mod tests {
         assert!(top.root.is_mountpoint());
         assert!(detach_mnt(&mut ns, &a).is_some());
         assert!(lookup_mnt(&at).is_none() && !top.root.is_mountpoint());
+    }
+
+    /// A held write access makes a read-only flip EBUSY (Linux
+    /// mnt_make_readonly over mnt_get_writers' per-CPU sum); once it
+    /// goes the flip succeeds, the hold never shows in the flags, and
+    /// new writers get EROFS
+    #[test]
+    fn writers_block_readonly() {
+        let m = mnt();
+        let w = m.want_write().unwrap();
+        assert!(matches!(m.set_flags(MNT_READONLY), Err(KernelError::Busy)));
+        assert_eq!(m.flags() & (MNT_READONLY | MNT_WRITE_HOLD), 0);
+        drop(w);
+        assert!(m.set_flags(MNT_READONLY).is_ok());
+        assert_eq!(m.flags(), MNT_READONLY);
+        assert!(matches!(m.want_write(), Err(KernelError::ReadOnlyFs)));
     }
 
     #[test]
