@@ -347,7 +347,14 @@ impl Drop for SuperBlock {
     /// fsnotify_sb_delete: its watches get IN_UNMOUNT and go). First it
     /// leaves super_blocks and its type's fs_supers (the lists' contract,
     /// `WeakList`): no walker reaches it once its fields start to go.
+    ///
+    /// Thread context only, nothing atomic held (Linux deactivate_super
+    /// takes s_umount for writing): the teardown sleeps (the device's
+    /// release takes its open_mutex and writes it back). A last reference
+    /// dropped in atomic context (interrupts off, a spin lock held) is
+    /// reported here, wherever the teardown would have slept.
     fn drop(&mut self) {
+        crate::sync::might_sleep();
         let weaks = {
             let mut l = SB_LOCK.lock();
             let me: &Self = self;

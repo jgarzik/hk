@@ -2427,7 +2427,12 @@ holds a mount of its filesystem while the inode goes (a `Path` puts
 its dentry before its mount; the executable's write denial, Linux
 mm->exe_file, holds its file and goes with the address space's last
 user, not with a last mm_count reference in finish_task_switch), or
-by the superblock's own teardown, when the upgrade fails. Deviation from Linux: no
+by the superblock's own teardown, when the upgrade fails. That
+teardown (`Drop for SuperBlock`, Linux deactivate_super under
+s_umount) sleeps, so any last `Arc<SuperBlock>` goes in thread
+context with nothing atomic held, never under a spin lock (mount
+teardown drops mountpoints and superblocks after MOUNT_LOCK):
+`might_sleep` at its start reports one that does not. Deviation from Linux: no
 unused-inode LRU or I_NEW state (an inode is complete before it is
 hashed; the losing builder's inode is dropped unhashed).
 
