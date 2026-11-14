@@ -147,3 +147,22 @@ impl Drop for PcpSlot {
         IDS.free(self.0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_sums_and_a_reused_one_is_zero() {
+        let a = PcpSlot::new().unwrap();
+        a.add(3);
+        a.add(-1);
+        // Another CPU's word (the first's, if there is only one)
+        a.part(1).fetch_add(5, Ordering::Relaxed);
+        assert_eq!(a.sum(), 7);
+        drop(a);
+        // Whatever number comes back, it reads zero everywhere
+        let b = PcpSlot::new().unwrap();
+        assert_eq!(b.sum(), 0);
+    }
+}
