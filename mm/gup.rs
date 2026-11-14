@@ -151,7 +151,14 @@ impl PinnedPages {
 }
 
 impl Drop for PinnedPages {
+    /// Unpin the pages, dirtying them first if written (thread context:
+    /// a page-cache page is dirtied under its page lock, Linux
+    /// bio_release_pages / set_page_dirty_lock, which an interrupt-time
+    /// end defers to bio_dirty_work)
     fn drop(&mut self) {
+        if self.dirty {
+            crate::sync::might_sleep();
+        }
         for (s, owner) in self.segs.iter().zip(self.owners.iter()) {
             if self.dirty {
                 Self::dirty_page(s.phys, owner.as_ref());

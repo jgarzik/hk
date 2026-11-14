@@ -330,7 +330,9 @@ impl Page {
 /// task holds it. A sleeping lock: thread context, no spinlock held;
 /// order: mmap_lock -> page lock -> AnonVma lock -> PTE lock. The
 /// caller holds a reference on the page.
+#[track_caller]
 pub fn lock_page(phys: u64) {
+    crate::sync::might_sleep();
     let Some(pg) = phys_to_page(phys) else {
         return;
     };
