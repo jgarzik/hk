@@ -36,8 +36,9 @@
 //! fault: -> mmap_lock, as in Linux). Wait conditions and poll never take
 //! it (poll runs under epoll's spin lock): like Linux pipe_readable /
 //! pipe_writable they read the ring indices `Pipe.head`/`Pipe.tail`,
-//! which the guard publishes as it unlocks. Wakeups follow the unlock.
-//! O_ASYNC files are on `fasync_readers` /
+//! which the guard publishes as it unlocks (or before a wakeup made
+//! under it). Wakeups follow the unlock where Linux's do (read, write,
+//! most of splice). O_ASYNC files are on `fasync_readers` /
 //! `fasync_writers` (by access mode; changed under `Pipe.inner`, Linux
 //! pipe_fasync); their SIGIO goes with the wakeups (Linux pipe_read,
 //! pipe_write: after the unlock), and a release's under `Inode.i_pipe`,
@@ -694,12 +695,21 @@ impl DerefMut for PipeGuard<'_> {
     }
 }
 
-impl Drop for PipeGuard<'_> {
-    /// Publish the ring indices for lockless readers, then unlock (the
-    /// mutex guard field drops after this)
-    fn drop(&mut self) {
+impl PipeGuard<'_> {
+    /// Publish the ring indices for lockless readers (Linux's stores to
+    /// pipe->head / pipe->tail); a wakeup made under the lock follows
+    /// it, so the woken see the change
+    pub fn publish(&self) {
         self.pipe.head.store(self.g.head, Ordering::Release);
         self.pipe.tail.store(self.g.tail, Ordering::Release);
+    }
+}
+
+impl Drop for PipeGuard<'_> {
+    /// Publish the ring indices, then unlock (the mutex guard field
+    /// drops after this)
+    fn drop(&mut self) {
+        self.publish();
     }
 }
 
