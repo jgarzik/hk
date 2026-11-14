@@ -770,26 +770,30 @@ Phase A2 (net) remaining:
 
 ## xHCI driver gaps on real hardware
 
-**Location**: `hw/usb/xhci.rs`, `hw/usb/msc.rs`
+**Location**: `hw/usb/xhci.rs`, `hw/usb/xhci_ring.rs`, `hw/usb/msc.rs`
 
 QEMU's xHCI hides all of them.
-- Command completions are not matched to their TRB (`wait_for_command`
-  ignores `_trb_addr`): a late completion for a timed-out command is
-  credited to the next one. A timed-out transfer leaves its TRB queued
-  and leaks its bounce buffer; a timeout should stop the endpoint and
-  move its dequeue pointer past the TRB (Linux
-  xhci_handle_cmd_stop_ep).
-- One controller only: the driver keeps a single global
-  `USB_CONTROLLER`; a second xHCI's probe replaces the first, which is
-  left running, and both device handles act on the survivor at
-  shutdown (unbinding the first stops neither).
+- A synchronous request that times out (`usb_start_wait_urb`) leaves
+  its URB queued with its buffer; Linux kills it (usb_kill_urb: Stop
+  Endpoint, then Set TR Dequeue Pointer past its TD,
+  xhci_handle_cmd_stop_ep). No URB can be unlinked or killed.
+- A second controller's root hub is `usb1` too (no bus numbers, Linux
+  usb_register_bus): its devices fail to register.
 - No hub support (route string 0): devices behind a hub are not
   enumerated.
 - Only bulk and interrupt endpoints are added to the controller
   (`configure_endpoints`): isochronous and non-default control
-  endpoints are skipped. A control data stage is one TRB of at most a
-  page: a configuration descriptor longer than 4 KiB is cut short.
+  endpoints are skipped.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
+- Transfer rings are one segment and never grow (Linux
+  xhci_ring_expansion): a submission that does not fit fails
+  (NoResources).
+- A transaction error halts the endpoint at once (Linux retries a
+  few: EP_SOFT_RESET); no quirk for controllers that send a spurious
+  success event after a short transfer (XHCI_SPURIOUS_SUCCESS).
+- INTx only (Linux tries MSI-X, then MSI): see "x86 has no IOAPIC or
+  MSI"; a controller without an INTx line is not started, as Linux
+  without any interrupt.
 
 ## USB core gaps
 
@@ -816,7 +820,9 @@ QEMU's xHCI hides all of them.
   0).
 - usb-storage: SCSI transparent command set over Bulk-Only Transport
   only (no CB/CBI, RBC/UFI/8070 subclasses, UAS, or unusual_devs
-  quirks).
+  quirks). A stalled bulk transfer fails the command: no CLEAR_FEATURE
+  ENDPOINT_HALT to the device, CSW read or reset recovery (Linux
+  usb_stor_clear_halt, usb_stor_Bulk_reset).
 - ftdi_sio: a console only, for the FT232 (0403:6001): no usb-serial
   bus or ttyUSB0 tty device, no baud rate or modem control requests,
   the bulk IN endpoint is never read.

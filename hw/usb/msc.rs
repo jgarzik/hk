@@ -15,7 +15,11 @@ use crate::printkln;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 
-use super::{UsbDeviceId, UsbError, UsbIds, usb_bulk_in, usb_bulk_out};
+use super::{Pipe, UsbDevice, UsbDeviceId, UsbError, UsbIds, usb_bulk_msg};
+
+/// A bulk transfer's time limit (hk has no SCSI error handler to abort
+/// a stuck one, as Linux usb_stor_msg_common's callers do)
+const US_BULK_TIMEOUT_MS: u64 = 5000;
 
 /// CBW signature "USBC"
 const CBW_SIGNATURE: u32 = 0x43425355;
@@ -135,8 +139,8 @@ struct UsbMscState {
 pub struct UsbMscDevice {
     /// Serializes the transactions (a BOT command is CBW, data, CSW)
     state: Mutex<UsbMscState>,
-    /// USB device slot ID
-    slot_id: u8,
+    /// The USB device (Linux us->pusb_dev)
+    dev: UsbDevice,
     /// Bulk IN endpoint address
     bulk_in_ep: u8,
     /// Bulk OUT endpoint address
@@ -144,13 +148,13 @@ pub struct UsbMscDevice {
 }
 
 impl UsbMscDevice {
-    fn new(slot_id: u8, bulk_in_ep: u8, bulk_out_ep: u8) -> Self {
+    fn new(dev: UsbDevice, bulk_in_ep: u8, bulk_out_ep: u8) -> Self {
         Self {
             state: Mutex::new(UsbMscState {
                 tag: 1,
                 gone: false,
             }),
-            slot_id,
+            dev,
             bulk_in_ep,
             bulk_out_ep,
         }
@@ -182,36 +186,30 @@ impl UsbMscDevice {
         let tag = state.tag;
         state.tag = state.tag.wrapping_add(1);
 
-        let slot_id = self.slot_id;
-        let bulk_out = self.bulk_out_ep & 0x0F;
-        let bulk_in = self.bulk_in_ep & 0x0F;
+        let out = Pipe::bulk_out(self.bulk_out_ep);
+        let inp = Pipe::bulk_in(self.bulk_in_ep);
+        let bulk = |pipe, buf: &mut [u8]| {
+            usb_bulk_msg(&self.dev, pipe, buf, US_BULK_TIMEOUT_MS).map_err(usb_to_scsi_error)
+        };
 
-        // Phase 1: Send CBW (CBW and CSW buffers on the heap: the
-        // controller DMAs them, never from a kernel stack; Linux
-        // us->iobuf)
-        let cbw = Cbw::new(tag, data_len, direction, lun, cdb);
-        let cbw_bytes = try_box(cbw.as_bytes()).map_err(|_| ScsiError::NoMemory)?;
-
-        usb_bulk_out(slot_id, bulk_out, &cbw_bytes[..]).map_err(usb_to_scsi_error)?;
+        // Phase 1: Send CBW (the request copies it into its DMA
+        // buffer: Linux us->iobuf)
+        let mut cbw_bytes = Cbw::new(tag, data_len, direction, lun, cdb).as_bytes();
+        bulk(out, &mut cbw_bytes)?;
 
         // Phase 2: Data transfer (if any)
         let mut transferred = 0usize;
         if let Some(buf) = data {
             match direction {
-                DataDirection::FromDevice => {
-                    transferred = usb_bulk_in(slot_id, bulk_in, buf).map_err(usb_to_scsi_error)?;
-                }
-                DataDirection::ToDevice => {
-                    transferred =
-                        usb_bulk_out(slot_id, bulk_out, buf).map_err(usb_to_scsi_error)?;
-                }
+                DataDirection::FromDevice => transferred = bulk(inp, buf)?,
+                DataDirection::ToDevice => transferred = bulk(out, buf)?,
                 DataDirection::None => {}
             }
         }
 
         // Phase 3: Receive CSW
-        let mut csw_bytes = try_box([0u8; Csw::SIZE]).map_err(|_| ScsiError::NoMemory)?;
-        usb_bulk_in(slot_id, bulk_in, &mut csw_bytes[..]).map_err(usb_to_scsi_error)?;
+        let mut csw_bytes = [0u8; Csw::SIZE];
+        bulk(inp, &mut csw_bytes)?;
 
         let csw = Csw::from_bytes(&csw_bytes);
 
@@ -332,7 +330,7 @@ fn usb_storage_probe(
         bulk_in_ep,
         bulk_out_ep
     );
-    let msc_dev = try_arc(UsbMscDevice::new(usb_dev.slot_id, bulk_in_ep, bulk_out_ep))?;
+    let msc_dev = try_arc(UsbMscDevice::new(usb_dev.clone(), bulk_in_ep, bulk_out_ep))?;
     let disk = crate::block::create_scsi_disk(msc_dev.clone(), 0, 0).inspect_err(|e| {
         printkln!("usb-storage {}: no disk: {:?}", dev.name(), e);
     })?;

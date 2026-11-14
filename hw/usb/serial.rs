@@ -23,7 +23,7 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_box};
 use crate::util::kfifo::Kfifo;
 
-use super::{UsbDeviceId, UsbIds};
+use super::{Pipe, UsbDevice, UsbDeviceId, UsbIds, usb_bulk_msg};
 
 /// FTDI's vendor id and the FT232's product id (Linux FTDI_VID,
 /// FTDI_8U232AM_PID)
@@ -61,7 +61,7 @@ fn ftdi_probe(
         bulk_in_ep,
         bulk_out_ep
     );
-    register_usb_serial_console(&serial);
+    register_usb_serial_console(&serial, usb_dev);
     Ok(serial)
 }
 
@@ -94,7 +94,7 @@ impl crate::base::Bound for UsbSerial {
             p.out = None;
             p.fifo.reset();
         }
-        drop(WRITE_BUF.lock());
+        WRITE_BUF.lock().dev = None;
     }
 }
 
@@ -121,7 +121,21 @@ static PORT: IrqSpinlock<Port> = IrqSpinlock::new(Port {
 /// The write transfer's buffer (Linux write_urbs[0]->transfer_buffer),
 /// held across the transfer: one transfer at a time (Linux
 /// USB_SERIAL_WRITE_BUSY), and remove waits one out
-static WRITE_BUF: Mutex<[u8; BULK_OUT_SIZE]> = Mutex::new([0; BULK_OUT_SIZE]);
+static WRITE_BUF: Mutex<WriteBuf> = Mutex::new(WriteBuf {
+    buf: [0; BULK_OUT_SIZE],
+    dev: None,
+});
+
+/// The write transfer's buffer and device
+struct WriteBuf {
+    buf: [u8; BULK_OUT_SIZE],
+    /// The console port's device (None: no console)
+    dev: Option<UsbDevice>,
+}
+
+/// A console write transfer's time limit: a stalled console device
+/// holds the write work little
+const CONSOLE_WRITE_TIMEOUT_MS: u64 = 100;
 
 /// The write work (Linux submits the write URB from the console write
 /// itself; hk's transfers are synchronous, so a thread sends them)
@@ -136,9 +150,9 @@ static ERR_ONCE: AtomicBool = AtomicBool::new(false);
 /// context (Linux usb_serial_generic_write_start, and the write URB's
 /// completion refilling: usb_serial_generic_write_bulk_callback)
 fn write_start() {
-    use crate::hw::usb::xhci::usb_console_out;
+    let mut w = WRITE_BUF.lock();
+    let WriteBuf { buf, dev } = &mut *w;
 
-    let mut buf = WRITE_BUF.lock();
     loop {
         let (out, n) = {
             let mut p = PORT.lock();
@@ -152,8 +166,15 @@ fn write_start() {
         }
         // A failed transfer's data is lost, as a failed URB's (Linux
         // usb_serial_generic_write_bulk_callback)
-        if let Err(e) = usb_console_out(out.0, out.1, &buf[..n])
-            && !ERR_ONCE.swap(true, Ordering::Relaxed)
+        let Some(dev) = dev.as_ref() else {
+            return;
+        };
+        if let Err(e) = usb_bulk_msg(
+            dev,
+            Pipe::bulk_out(out.1),
+            &mut buf[..n],
+            CONSOLE_WRITE_TIMEOUT_MS,
+        ) && !ERR_ONCE.swap(true, Ordering::Relaxed)
         {
             printkln!(
                 "ftdi_sio: write_bulk_callback - nonzero urb status: {:?}",
@@ -210,7 +231,7 @@ impl ConsoleDriver for UsbSerialConsole {
 
 /// Make the port the console (`ttyUSB0`) if there is none: Normal
 /// priority, above legacy serial's Fallback, no special flags
-fn register_usb_serial_console(serial: &UsbSerial) {
+fn register_usb_serial_console(serial: &UsbSerial, dev: &UsbDevice) {
     use crate::console::ConsoleFlags;
 
     WRITE_WORK.call_once(|| arc_nofail(IrqSpinlock::new(Work::new(write_start))));
@@ -221,6 +242,7 @@ fn register_usb_serial_console(serial: &UsbSerial) {
     p.out = Some((serial.slot_id, serial.bulk_out_ep));
     p.fifo.reset();
     drop(p);
+    WRITE_BUF.lock().dev = Some(dev.clone());
     register_console(
         &USB_SERIAL_CONSOLE,
         ConsolePriority::Normal,
