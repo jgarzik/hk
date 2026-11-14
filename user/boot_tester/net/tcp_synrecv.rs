@@ -14,6 +14,10 @@
 //!   connection sends nothing (Linux inet_csk_listen_stop leaves request
 //!   socks alone; reqsk_timer_handler drops them silently); the peer's
 //!   ACK afterwards gets the RST of no socket
+//! - TCP_LISTEN_CLOSE_REBIND: a half-open connection holds no port
+//!   (Linux request socks are not in bhash; the child inherits the port
+//!   in tcp_v4_syn_recv_sock): the closed listener's port binds again
+//!   at once without SO_REUSEADDR
 //! - TCP_LISTEN_CLOSE_ACCEPTQ: a listener closed with a completed,
 //!   unaccepted connection resets it (inet_child_forget): ECONNRESET
 
@@ -45,6 +49,7 @@ pub fn run_tests() {
     test_simopen_close();
     test_simopen_synack();
     test_listen_close_req();
+    test_listen_close_rebind();
     test_listen_close_acceptq();
 }
 
@@ -296,6 +301,25 @@ fn test_listen_close_req() {
     let (f, seq, _) = got(peer.from(pl, 1000));
     t.eq(b"reset", f, i64::from(RST));
     t.ok(b"reset seq", seq == s + 1, seq as i64);
+    t.done();
+}
+
+fn test_listen_close_rebind() {
+    const Y: u32 = 0x4000_0000;
+    let mut t = T::new(b"TCP_LISTEN_CLOSE_REBIND");
+    let Some(peer) = Peer::new(&mut t) else {
+        return t.done();
+    };
+    let l = tcp();
+    bind(l, LO, 0);
+    let pl = port(l);
+    t.eq(b"listen", sys_listen(l, 8), 0);
+    t.eq(b"peer syn", peer.send(pl, Y, 0, SYN), 40);
+    t.eq(b"syn-ack", got(peer.from(pl, 1000)).0, i64::from(SYN | ACK));
+    close(l);
+    let n = tcp();
+    t.eq(b"rebind", bind(n, LO, pl), 0);
+    close(n);
     t.done();
 }
 

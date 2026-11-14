@@ -794,7 +794,25 @@ impl TcpSock {
             self.listen_overflow();
             return;
         }
+        // A request takes its listener's port only as it becomes a full
+        // socket (Linux tcp_v4_syn_recv_sock -> __inet_inherit_port);
+        // without a bind bucket the ACK is dropped, the request kept
+        let req = g.cb.passive && g.cb.state == TcpState::SynReceived && s.has(flags::ACK);
+        if req {
+            if !self.sk.net.tcp.inherit(&self.arc(), t.lport) {
+                // Linux tcp_v4_syn_recv_sock failing: tcp_listendrop
+                self.listen_drop();
+                return;
+            }
+            g.bound = true;
+        }
         g.cb.input(s, skb, now, out);
+        if req && g.cb.state == TcpState::SynReceived {
+            // Still a request (Linux: the ACK failed tcp_check_req
+            // before any child was made)
+            g.bound = false;
+            self.sk.net.tcp.unbind(&self.arc(), t.lport);
+        }
     }
 
     // --- listener ---------------------------------------------------------------
@@ -918,14 +936,6 @@ impl TcpSock {
             return;
         }
         g.tuple = Some(t);
-        if !self.sk.net.tcp.inherit(&c, t.lport) {
-            // No bind bucket: drop the SYN (Linux inet_csk_clone_lock
-            // failing in tcp_v4_syn_recv_sock)
-            self.sk.net.tcp.unhash(&t, &c);
-            self.listen_drop();
-            return;
-        }
-        g.bound = true;
         g.parent = Some(self.me.clone());
         let queued = match self.queue.lock().as_mut() {
             Some(q) => {
