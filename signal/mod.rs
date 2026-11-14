@@ -1457,14 +1457,6 @@ fn send_task_in(
     Ok(())
 }
 
-/// SIGKILL from the kernel to thread `t`, under TASKLIST held by the
-/// caller, read or write (Linux exit_ptrace: send_sig_info(SIGKILL,
-/// SEND_SIG_PRIV) under tasklist_lock): done in place, as any
-/// [`send_task_in`]
-pub fn sigkill_held(table: &crate::task::percpu::GlobalTaskTable, t: &Task) {
-    let _ = send_task_in(table, t, SIGKILL, SendInfo::Kernel, PidType::Pid, false);
-}
-
 /// What a send is, for its locked part
 struct Send<'a> {
     sig: Signal,
@@ -1782,9 +1774,10 @@ pub fn send_group_signal(t: &Task, sig: Signal, info: SendInfo) -> KernelResult<
 }
 
 /// `sig` with `info` to task `t` (`ty` Pid) or its thread group (Tgid),
-/// with no permission check, under TASKLIST's read lock held by the
-/// caller: sent in place, nothing allocated but its queue entry (Linux
-/// send_sigio_to_task's do_send_sig_info under tasklist_lock)
+/// with no permission check, under TASKLIST held by the caller, read
+/// or write: sent in place, nothing allocated but its queue entry
+/// (Linux send_signal_locked under tasklist_lock: send_sigio_to_task,
+/// ptrace_attach's SIGSTOP, exit_ptrace's SIGKILL)
 pub fn send_sig_info_in(
     table: &crate::task::percpu::GlobalTaskTable,
     t: &Task,

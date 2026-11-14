@@ -334,11 +334,13 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
         target.ptracer = Some(alloc::sync::Arc::downgrade(&percpu::task_ref(
             &percpu::current(),
         )));
-    }
 
-    // Send SIGSTOP to the target to stop it (Linux ptrace_attach:
-    // SEND_SIG_PRIV)
-    let _ = signal::send_sig_info(&task, SIGSTOP, signal::SendInfo::Kernel);
+        // SIGSTOP to stop it, in the section that attached (Linux
+        // ptrace_attach: send_signal_locked(SIGSTOP, SEND_SIG_PRIV)
+        // under tasklist_lock)
+        let kernel = signal::SendInfo::Kernel;
+        let _ = signal::send_sig_info_in(&table, &task, SIGSTOP, kernel, signal::PidType::Pid);
+    }
 
     Ok(0)
 }
@@ -777,14 +779,18 @@ pub fn ptrace_stop(
         // (wait_task_inactive), and gives up on a Running tracee
         set_current_state(SleepState::Killable);
         drop(s);
-        t.tracer()
+        let tracer = t.tracer();
+        // The tracer's wait finds the stop; SIGCHLD tells it, in the
+        // TASKLIST hold that saw us traced (Linux ptrace_stop:
+        // do_notify_parent_cldstop, CLD_TRAPPED, under tasklist_lock)
+        super::proc::CHILD_EXIT_WQ.wake_all();
+        if let Some(tr) = tracer.as_ref() {
+            signal::notify::notify_tracer_trapped(&table, &me, tr, code);
+        }
+        // Its reference dropped after TASKLIST
+        tracer
     };
-    // The tracer's wait finds the stop; SIGCHLD tells it (Linux
-    // do_notify_parent_cldstop, CLD_TRAPPED)
-    super::proc::CHILD_EXIT_WQ.wake_all();
-    if let Some(tr) = tracer {
-        signal::notify::notify_tracer_trapped(&me, &tr, code);
-    }
+    drop(tracer);
     loop {
         set_current_state(SleepState::Killable);
         let (st, frozen) = stop_state(&me);
@@ -924,7 +930,9 @@ fn detach_live(me: &crate::task::Task) -> bool {
     let exitkill = v.ptrace_options & PTRACE_O_EXITKILL != 0;
     let t = percpu::task_ref(v.task);
     if exitkill {
-        signal::sigkill_held(&table, &t);
+        // Linux send_sig_info(SIGKILL, SEND_SIG_PRIV)
+        let kernel = signal::SendInfo::Kernel;
+        let _ = signal::send_sig_info_in(&table, &t, SIGKILL, kernel, signal::PidType::Pid);
     }
     if let Some(mut v) = table.view_mut(&t) {
         ptrace_unlink(&mut v);

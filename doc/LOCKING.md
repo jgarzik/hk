@@ -1494,10 +1494,15 @@ stop is `TaskSignalState.jobctl` (`jobctl::TRACED`, `PTRACE_FROZEN`),
 `ptrace_code` and `last_siginfo`, all under the tracee's `Task.sig`.
 The tracee checks it is traced under TASKLIST's read lock (`ptrace`
 is written under the write lock, so a detach cannot slip between) and
-sets the stop under its `Task.sig` inside it, drops both, wakes
-`CHILD_EXIT_WQ` and signals its tracer, then sleeps `Killable` until
+sets the stop under its `Task.sig` inside it, drops `Task.sig`, wakes
+`CHILD_EXIT_WQ` and signals its tracer still inside that read hold
+(Linux ptrace_stop: do_notify_parent_cldstop under tasklist_lock, so
+a tracer that detached first gets no CLD_TRAPPED), drops TASKLIST,
+then sleeps `Killable` until
 the stop has ended (`Task.sig`, rechecked after each wakeup) or
-SIGKILL. The tracer's wait walks its tracees under the read lock and
+SIGKILL. PTRACE_ATTACH sends its SIGSTOP in the TASKLIST write
+section that links the tracer (Linux ptrace_attach under
+tasklist_lock). The tracer's wait walks its tracees under the read lock and
 takes a stop's code under that tracee's `Task.sig` (Linux
 wait_task_stopped); resume, detach and the tracer's exit
 (`exit_ptrace`) end the stop, set the code to deliver and
@@ -1507,7 +1512,7 @@ siglock); detach and the tracer's exit do so in the TASKLIST write
 section that untraces it (Linux __ptrace_detach under tasklist_lock).
 The tracer's exit detaches one tracee per write section; a
 PTRACE_O_EXITKILL tracee's SIGKILL is sent in that section before
-the detach (`sigkill_held`, Linux exit_ptrace under tasklist_lock:
+the detach (`send_sig_info_in`, Linux exit_ptrace under tasklist_lock:
 SIGKILL takes no queue entry, so nothing allocates), its group
 effects and wakeups done there too, so the tracee never runs untraced
 user code. SIGKILL ends the stop
