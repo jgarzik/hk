@@ -11,7 +11,7 @@ use crate::util::list::{Link, OwnedList, Owner};
 use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::KernelError;
-use super::dentry::Dentry;
+use super::dentry::{Dentry, DentryRef};
 use super::inode::FileType;
 pub use super::mntput::MountRef;
 use super::mntput::{__cleanup_mnt, MNT_NS_INTERNAL, MntOwned};
@@ -148,11 +148,11 @@ pub struct Mount {
     pub sb: MntOwned<Arc<SuperBlock>>,
 
     /// Root dentry of the mounted filesystem (Linux mnt_root)
-    pub root: MntOwned<Arc<Dentry>>,
+    pub root: MntOwned<DentryRef>,
 
     /// The dentry where this filesystem is mounted (mount point)
     /// None for the root mount
-    pub mountpoint: RwLock<Option<Arc<Dentry>>>,
+    pub mountpoint: RwLock<Option<DentryRef>>,
 
     /// Parent mount (None for root)
     pub parent: RwLock<Option<Weak<Mount>>>,
@@ -214,7 +214,7 @@ impl Mount {
     /// A new mount, its first reference, or ENOMEM (Linux alloc_vfsmnt)
     pub fn alloc(
         sb: Arc<SuperBlock>,
-        root: Arc<Dentry>,
+        root: DentryRef,
         flags: u32,
         devname: super::name::FileName,
     ) -> Result<MountRef, KernelError> {
@@ -235,7 +235,7 @@ impl Mount {
     /// copy (its peer groups and attachments) on failure
     fn alloc_nofail(
         sb: Arc<SuperBlock>,
-        root: Arc<Dentry>,
+        root: DentryRef,
         flags: u32,
         devname: super::name::FileName,
     ) -> MountRef {
@@ -248,7 +248,7 @@ impl Mount {
     /// A mount with id `mnt_id`, which its drop gives back
     fn init(
         sb: Arc<SuperBlock>,
-        root: Arc<Dentry>,
+        root: DentryRef,
         flags: u32,
         devname: super::name::FileName,
         mnt_pcp: PcpSlot,
@@ -409,12 +409,12 @@ impl Mount {
     }
 
     /// Get the mount point dentry
-    pub fn get_mountpoint(&self) -> Option<Arc<Dentry>> {
+    pub fn get_mountpoint(&self) -> Option<DentryRef> {
         self.mountpoint.read().clone()
     }
 
     /// Set the mount point
-    pub fn set_mountpoint(&self, dentry: Arc<Dentry>) {
+    pub fn set_mountpoint(&self, dentry: DentryRef) {
         note_mp(&dentry, 1);
         *self.mountpoint.write() = Some(dentry);
     }
@@ -434,7 +434,7 @@ impl Mount {
     /// parent.
     pub fn up<'a>(&'a self, _ml: &'a MntHash) -> Option<(&'a Mount, &'a Dentry)> {
         let parent = self.parent.read().as_ref().map(Weak::as_ptr)?;
-        let mp = self.mountpoint.read().as_ref().map(Arc::as_ptr)?;
+        let mp = self.mountpoint.read().as_ref().map(DentryRef::as_ptr)?;
         // SAFETY: both links change only under MOUNT_LOCK write
         // (attach_mnt, detach_mnt, a teardown's unhang_children; the
         // last takes the mountpoint after the unlock, but only once the
@@ -718,7 +718,7 @@ pub(super) fn commit_tree(ns: &NsTree, m: &MountRef) {
 
 /// A new mount of `m`'s filesystem rooted at `root`, with its flags
 /// and source (Linux clone_mnt); not attached
-pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> MountRef {
+pub fn clone_mnt(m: &Mount, root: DentryRef) -> MountRef {
     let c = Mount::alloc_nofail(
         m.sb.clone(),
         root,
@@ -734,13 +734,13 @@ pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> MountRef {
 struct CopyEnt {
     src: MountRef,
     parent: usize,
-    at: Arc<Dentry>,
+    at: DentryRef,
 }
 
 /// What copy_tree copies of `m` at `root`, parents first: the mounts
 /// below `root`; an unbindable submount is left out with whatever is
 /// under it, EPERM if it is also locked (it hides what is under it)
-fn copy_plan(ns: &NsTree, m: &MountRef, root: &Arc<Dentry>) -> Result<Vec<CopyEnt>, KernelError> {
+fn copy_plan(ns: &NsTree, m: &MountRef, root: &DentryRef) -> Result<Vec<CopyEnt>, KernelError> {
     let mut plan = alloc::vec![CopyEnt {
         src: m.clone(),
         parent: 0,
@@ -799,7 +799,7 @@ fn copy_tree(ns: &mut NsTree, plan: &[CopyEnt]) -> MountRef {
 
 /// A mount under `d` in `m` is locked (Linux has_locked_children): a
 /// bind of `d` alone would uncover what it hides
-fn has_locked_children(ns: &NsTree, m: &Mount, d: &Arc<Dentry>) -> bool {
+fn has_locked_children(ns: &NsTree, m: &Mount, d: &DentryRef) -> bool {
     m.kids(ns).any(|c| {
         c.get_mountpoint()
             .is_some_and(|mp| super::is_subdir(&mp, d))
@@ -1131,7 +1131,7 @@ fn lock_mountpoint(mp: &Path) -> Result<super::inode::InodeLockArc, KernelError>
 /// not under a shared mount, and the target in the namespace too
 /// (EINVAL), and not into its own subtree (ELOOP)
 pub fn do_move(old: &Path, mp: &Path) -> Result<(), KernelError> {
-    if !Arc::ptr_eq(&old.dentry, &old.mnt.root) {
+    if !DentryRef::ptr_eq(&old.dentry, &old.mnt.root) {
         return Err(KernelError::InvalidArgument);
     }
     let is_dir = |d: &Dentry| d.get_inode().is_some_and(|i| i.mode().is_dir());
@@ -1199,7 +1199,8 @@ pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
     if MountRef::ptr_eq(&new.mnt, &root.mnt) || MountRef::ptr_eq(&put_old.mnt, &root.mnt) {
         return Err(KernelError::Busy);
     }
-    let mounted = |p: &Path| Arc::ptr_eq(&p.dentry, &p.mnt.root) && p.mnt.get_parent().is_some();
+    let mounted =
+        |p: &Path| DentryRef::ptr_eq(&p.dentry, &p.mnt.root) && p.mnt.get_parent().is_some();
     if !mounted(&root) || !mounted(new) {
         return Err(KernelError::InvalidArgument);
     }
@@ -1344,7 +1345,7 @@ impl Drop for Mount {
 /// is_local_mountpoint, __is_local_mountpoint under namespace_sem
 /// read): a walk of the namespace's mounts for one whose mountpoint is
 /// the dentry `d`
-pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
+pub fn is_local_mountpoint(d: &DentryRef) -> bool {
     // Nothing is mounted on this dentry (or an alias) anywhere: no walk
     if !may_be_mountpoint(d) {
         return false;
@@ -1402,8 +1403,8 @@ fn exact_names(i: &super::inode::Inode) -> bool {
 /// be another object: a directory (no hard links), or a filesystem
 /// without exact names (FAT has no hard links either; Linux gets one
 /// dentry there through vfat's d_hash/d_compare)
-fn same_place(mp: &Arc<Dentry>, d: &Arc<Dentry>) -> bool {
-    if Arc::ptr_eq(mp, d) {
+fn same_place(mp: &DentryRef, d: &DentryRef) -> bool {
+    if DentryRef::ptr_eq(mp, d) {
         return true;
     }
     let (Some(a), Some(b)) = (mp.get_inode(), d.get_inode()) else {

@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use super::KernelError;
 use super::dac::{MAY_EXEC, cred, permission_as};
-use super::dentry::Dentry;
+use super::dentry::{Dentry, DentryRef};
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use super::inode::{Inode, Link};
 use super::mount::{MOUNT_LOCK, MountRef, follow_mount, is_path_reachable};
@@ -103,12 +103,12 @@ impl LookupFlags {
 }
 
 /// Look up an absolute path, or a path relative to the current directory
-pub fn lookup_path(path: &[u8]) -> Result<Arc<Dentry>, KernelError> {
+pub fn lookup_path(path: &[u8]) -> Result<DentryRef, KernelError> {
     lookup_path_flags(path, LookupFlags::open())
 }
 
 /// Look up a path relative to the current directory with specific flags
-pub fn lookup_path_flags(path: &[u8], flags: LookupFlags) -> Result<Arc<Dentry>, KernelError> {
+pub fn lookup_path_flags(path: &[u8], flags: LookupFlags) -> Result<DentryRef, KernelError> {
     lookup_path_at(crate::task::percpu::current_cwd(), path, flags)
 }
 
@@ -120,7 +120,7 @@ pub fn lookup_path_at(
     start: Option<Path>,
     path: &[u8],
     flags: LookupFlags,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<DentryRef, KernelError> {
     path_lookupat(start, path, flags).map(|p| p.dentry.clone())
 }
 
@@ -140,7 +140,7 @@ pub fn path_lookupat(
 /// procfs and cgroupfs compute their entries behind the dcache, and
 /// vfat matches other spellings (case, trailing dots), which Linux
 /// handles with d_revalidate. Permission is the caller's business.
-pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
+pub fn lookup_one(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
     // No file system here has longer names (Linux simple_lookup and the
     // disk file systems' lookups: ENAMETOOLONG)
     if name.len() > NAME_MAX {
@@ -172,7 +172,7 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, Kern
 
 /// The dcache's child `name` of `parent` if it is still valid (Linux
 /// d_revalidate); an invalid one is dropped from the tree
-fn cached(parent: &Arc<Dentry>, name: &[u8]) -> Option<Arc<Dentry>> {
+fn cached(parent: &DentryRef, name: &[u8]) -> Option<DentryRef> {
     let child = parent.lookup_child(name)?;
     match child.get_inode() {
         Some(i) if !i.i_op.revalidate(&i) => {
@@ -189,7 +189,7 @@ pub const NAME_MAX: usize = 255;
 /// Path-walk lookup (Linux lookup_fast + lookup_slow): a dcache hit
 /// needs no lock; a miss asks the file system under the directory's
 /// shared inode lock, so it cannot race a create/unlink/rename there
-fn lookup_slow(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
+fn lookup_slow(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
     if name.len() > NAME_MAX {
         return Err(KernelError::NameTooLong);
     }
@@ -210,7 +210,7 @@ fn lookup_slow(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelE
 /// the ref-walk, is EAGAIN. hk caches a miss (a negative entry) only on
 /// in-memory filesystems, where Linux drops one at once
 /// (always_delete_dentry), so it is a miss here too.
-fn lookup_cached(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
+fn lookup_cached(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
     let child = parent.lookup_child(name).ok_or(KernelError::WouldBlock)?;
     match child.get_inode() {
         Some(i) if !i.i_op.revalidate_blocks(&i) && i.i_op.revalidate(&i) => Ok(child),
@@ -601,7 +601,7 @@ fn follow_dotdot(p: Path, root: &Path, f: LookupFlags) -> Result<Path, KernelErr
         if p.same(root) {
             return in_root(p);
         }
-        if !Arc::ptr_eq(&p.dentry, &p.mnt.root) {
+        if !DentryRef::ptr_eq(&p.dentry, &p.mnt.root) {
             break;
         }
         match (p.mnt.get_parent(), p.mnt.get_mountpoint()) {
@@ -627,7 +627,7 @@ fn follow_dotdot(p: Path, root: &Path, f: LookupFlags) -> Result<Path, KernelErr
 pub fn create_entry(
     p: &Parent,
     make: impl FnOnce(&Arc<Inode>, &Cred) -> Result<Arc<Inode>, KernelError>,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<DentryRef, KernelError> {
     let (parent, name) = (&p.dir, p.name.as_slice());
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     if !dir.mode().is_dir() {
@@ -820,7 +820,7 @@ pub enum Last {
 /// A path split into its walked parent and its last component (Linux
 /// filename_parentat)
 pub struct Parent {
-    pub dir: Arc<Dentry>,
+    pub dir: DentryRef,
     /// The mount `dir` is in
     pub mnt: MountRef,
     pub name: Vec<u8>,

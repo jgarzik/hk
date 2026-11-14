@@ -15,7 +15,7 @@ use ::core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use crate::sync;
 
 use super::KernelError;
-use super::dentry::Dentry;
+use super::dentry::DentryRef;
 use super::inode::{FileType, Inode, InodeId};
 use super::iov_iter::{IovDest, IovSource};
 use super::mount::MountRef;
@@ -524,7 +524,7 @@ pub trait FileOps: Send + Sync {
 /// - File position and operations
 pub struct File {
     /// Dentry this file was opened from
-    pub dentry: Arc<Dentry>,
+    pub dentry: DentryRef,
 
     /// Mount this file belongs to (Linux f_path.mnt): a reference, which
     /// makes the mount busy for umount
@@ -632,7 +632,7 @@ impl File {
     /// object), whose reference keeps the mount busy for umount while
     /// this file is open
     pub fn new(
-        dentry: Arc<Dentry>,
+        dentry: DentryRef,
         mnt: Option<MountRef>,
         flags: u32,
         f_op: &'static dyn FileOps,
@@ -705,7 +705,7 @@ impl File {
     /// and the state goes with the last reference to the file; `mnt` is
     /// its pseudo filesystem's mount
     pub fn new_anon(
-        dentry: Arc<Dentry>,
+        dentry: DentryRef,
         mnt: Option<MountRef>,
         flags: u32,
         f_op: &'static dyn FileOps,

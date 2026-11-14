@@ -265,7 +265,7 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: UserPtr<u8>, mode: u32, dev: u64) -
 /// filename_create at AT_FDCWD + vfs_mknod(S_IFSOCK)): `perm` is
 /// reduced by the umask, DAC on the parent applies, an existing name is
 /// EEXIST; returns the new dentry
-pub fn mknod_sock(path: &[u8], perm: u16) -> Result<alloc::sync::Arc<super::Dentry>, KernelError> {
+pub fn mknod_sock(path: &[u8], perm: u16) -> Result<super::DentryRef, KernelError> {
     let p = filename_create(AT_FDCWD, path, false)?;
     create_entry(&p, |dir, c| {
         let perm = dac::create_mode(c, dir, perm);

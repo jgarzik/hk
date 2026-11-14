@@ -13,7 +13,7 @@ use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::sync;
 
 use super::KernelError;
-use super::dentry::Dentry;
+use super::dentry::DentryRef;
 use super::inode::{Inode, InodeId, InodeMode, InodeOps};
 use crate::util::kalloc::try_arc;
 
@@ -469,7 +469,7 @@ pub struct SuperBlock {
     s_instances: Link,
 
     /// Root dentry of this filesystem
-    pub root: RwLock<Option<Arc<Dentry>>>,
+    pub root: RwLock<Option<DentryRef>>,
 
     /// Superblock operations
     pub s_op: &'static dyn SuperOps,
@@ -707,12 +707,12 @@ impl SuperBlock {
     }
 
     /// Set the root dentry
-    pub fn set_root(&self, root: Arc<Dentry>) {
+    pub fn set_root(&self, root: DentryRef) {
         *self.root.write() = Some(root);
     }
 
     /// Get the root dentry
-    pub fn get_root(&self) -> Option<Arc<Dentry>> {
+    pub fn get_root(&self) -> Option<DentryRef> {
         self.root.read().clone()
     }
 

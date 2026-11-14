@@ -2410,11 +2410,15 @@ pages truncate drops first (`truncate_setsize` before `free_past`).
 **Dentry** (`fs/dentry.rs`):
 
 Following Linux's `d_lock` pattern, each dentry has a single RwLock protecting
-all mutable state, its parent included; the name has its own leaf lock:
+all mutable state; the parent pointer is written under it and read
+lock-free, and the name has its own leaf lock:
 
 ```rust
 pub struct Dentry {
     pub sb: Weak<SuperBlock>,   // Immutable after creation
+    d_count: AtomicUsize,       // DentryRef count (Linux d_lockref.count)
+    d_parent: AtomicPtr<Dentry>, // A reference (Linux d_parent); d_lock
+    d_rcu: RcuHead,             // The free after a grace period
     d_sib: Link, d_sib_owner: Owner, // Parent's children (its d_lock)
     d_hash: Link,               // Hash bucket (its bit lock)
     d_hkey: AtomicU64, d_hparent: AtomicUsize, // Hash key, parent (parent's d_lock)
@@ -2424,11 +2428,26 @@ pub struct Dentry {
 
 struct DentryInner {
     inode: Option<Arc<Inode>>,
-    parent: Option<Arc<Dentry>>, // Pinned by the child (Linux d_parent)
-    children: OwnedList<SibAdapter>, // Linux d_children
+    children: OwnedList<SibAdapter, DentryRef>, // Linux d_children
     flags: DentryFlags,
 }
 ```
+
+A dentry is held through `DentryRef` (Linux dget/dput on d_lockref):
+the tree's two references, each child's `d_parent`, and every
+holder's. The last put kills it (`dentry_kill`, Linux __dentry_kill:
+its inode and parent let go there, the parents it alone held in a
+loop, as Linux dput) and frees its memory a grace period later
+(`call_rcu`, Linux dentry_free's __d_free), leaving `d_parent` in
+place: an RCU reader may follow `d_parent` and read `d_name` of a
+dentry it holds no reference to, and takes one with
+`DentryRef::try_get` (Linux lockref_get_not_dead), refused once the
+count is zero. The free runs in `rcuc/N` (1.4.2) and only releases
+memory. `d_parent` changes under the dentry's d_lock (write; with
+RENAME_LOCK once it is in the tree: d_move, d_exchange), a Release
+store read with Acquire (Linux WRITE_ONCE/READ_ONCE of d_parent);
+`get_parent` (Linux dget_parent) takes its reference under the
+dentry's d_lock.
 
 The tree is Linux's shape: a parent's children are an intrusive list
 (`util::list::OwnedList`, Linux d_children/d_sib) under the parent's
@@ -2455,9 +2474,10 @@ there. That is sound: the key and parent address are stored when the
 dentry is hashed in and change only while it is out of its bucket;
 the name is read under `d_name`, which only d_move/d_exchange write,
 with the dentry out of the tree. Linux walks
-buckets under RCU instead (dentries are not yet freed after a grace
-period, Linux d_free's call_rcu); entries are
-published with Release stores so an RCU walk can come later. A walk
+buckets under RCU instead (__d_lookup); dentries are freed after a
+grace period and entries are published with Release stores, so an
+RCU walk can come later (the bucket's unlink would then have to keep
+`next` for a reader on it, as hlist_bl_del_rcu). A walk
 that misses during a rename (`lookup_cached`/`cached` without the
 directory lock) is fine: lookup_slow rechecks under i_rwsem.
 
@@ -2490,7 +2510,8 @@ releases anything), so nothing is dropped inside the walk. `d_path` and `dentry_
 `d_lock` unless one with that name is cached (Linux d_alloc + d_add):
 one dentry per name. Deviation: Linux readers first walk locklessly
 and retry under the seqlock, taking the exclusive lock only on retry;
-hk takes it at once (dentries are not freed through RCU yet; planned).
+hk takes it at once (planned, now that dentries are freed through
+RCU).
 
 A cached child is revalidated (`InodeOps::revalidate`, Linux
 d_revalidate) after its d_lock is released, inside whatever i_rwsem the
