@@ -27,6 +27,12 @@
 //!   output stopped by TCOOFF drops it instead of waiting closing_wait
 //!   (Linux tty_port_close_start), and the next open finds a fresh tty:
 //!   nothing queued, output flowing
+//! - TTY_SERIAL: TIOCGSERIAL shows the UART (ttyS1 on x86, ttyAMA0 on
+//!   arm64) and its tty_port's close timing defaults (0.5 s, 30 s);
+//!   TIOCSSERIAL with CAP_SYS_ADMIN sets close_delay and closing_wait
+//!   (ASYNC_CLOSING_WAIT_NONE) and refuses a baud_base below 9600;
+//!   without it only the user flags and the custom divisor change
+//!   (Linux uart_set_info: EPERM)
 
 use crate::harness::{check, fail_num, pass, report_r};
 use crate::helpers::{host_mode, print, println, skip};
@@ -86,6 +92,7 @@ pub fn run_tests() {
     test_tcxonc();
     test_sigio_out();
     test_last_close();
+    test_serial_info();
 }
 
 /// Bytes queued for the console's UART
@@ -301,6 +308,207 @@ fn test_last_close() {
         .and_then(|()| check(b"fresh outq", fresh == 0, fresh))
         .and_then(|()| check(b"write2", w2 == 10, w2))
         .and_then(|()| check(b"sent", left == 0, left));
+    report_r(NAME, r);
+}
+
+const TIOCGSERIAL: u64 = 0x541E;
+const TIOCSSERIAL: u64 = 0x541F;
+/// struct serial_struct (Linux uapi/linux/serial.h, 64-bit)
+const SS_SIZE: usize = 72;
+const SS_TYPE: usize = 0;
+const SS_LINE: usize = 4;
+const SS_PORT: usize = 8;
+const SS_FLAGS: usize = 16;
+const SS_FIFO: usize = 20;
+const SS_DIVISOR: usize = 24;
+const SS_BAUD: usize = 28;
+const SS_CLOSE_DELAY: usize = 32;
+const SS_CLOSING_WAIT: usize = 40;
+const SS_IOMEM: usize = 48;
+const ASYNC_CLOSING_WAIT_NONE: u16 = 65535;
+const ASYNC_SKIP_TEST: u32 = 1 << 6;
+const ASYNC_LOW_LATENCY: u32 = 1 << 13;
+const EPERM: i64 = -1;
+const CAP_SYS_ADMIN: u32 = 21;
+
+fn ss_get(b: &[u8; SS_SIZE], off: usize) -> u32 {
+    u32::from_ne_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
+fn ss_set(b: &mut [u8; SS_SIZE], off: usize, v: u32) {
+    b[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+}
+
+fn ss_get16(b: &[u8; SS_SIZE], off: usize) -> u16 {
+    u16::from_ne_bytes([b[off], b[off + 1]])
+}
+
+fn ss_set16(b: &mut [u8; SS_SIZE], off: usize, v: u16) {
+    b[off..off + 2].copy_from_slice(&v.to_ne_bytes());
+}
+
+/// The UART for TIOC[GS]SERIAL: ttyS1 on x86 (not the console),
+/// ttyAMA0 (the console, settings restored) on arm64
+fn serial_port_path() -> &'static [u8] {
+    if cfg!(target_arch = "aarch64") {
+        b"/dev/ttyAMA0\0"
+    } else {
+        b"/dev/ttyS1\0"
+    }
+}
+
+/// Without CAP_SYS_ADMIN: a closing_wait change and a non-user flag
+/// are EPERM; the low latency flag and a custom divisor go in. 0 if
+/// so, else the failing step
+fn serial_unprivileged() -> i32 {
+    use hk_syscall::{CapUserData, CapUserHeader, sys_capget, sys_capset};
+    let mut h = CapUserHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let mut d = [CapUserData::default(); 2];
+    if sys_capget(&mut h, d.as_mut_ptr()) != 0 {
+        return 10;
+    }
+    d[0].effective &= !(1 << CAP_SYS_ADMIN);
+    if sys_capset(&h, d.as_ptr()) != 0 {
+        return 11;
+    }
+    let fd = sys_open(
+        serial_port_path().as_ptr(),
+        O_RDWR | O_NOCTTY | O_NONBLOCK,
+        0,
+    );
+    if fd < 0 {
+        return 12;
+    }
+    let fd = fd as i32;
+    let mut ss = [0u8; SS_SIZE];
+    if sys_ioctl(fd, TIOCGSERIAL, ss.as_mut_ptr() as u64) != 0 {
+        return 13;
+    }
+    let orig = ss;
+    let mut w = ss;
+    ss_set16(&mut w, SS_CLOSING_WAIT, 100);
+    if sys_ioctl(fd, TIOCSSERIAL, w.as_ptr() as u64) != EPERM {
+        return 14;
+    }
+    let mut w = ss;
+    ss_set(&mut w, SS_FLAGS, ss_get(&ss, SS_FLAGS) ^ ASYNC_SKIP_TEST);
+    if sys_ioctl(fd, TIOCSSERIAL, w.as_ptr() as u64) != EPERM {
+        return 15;
+    }
+    let mut w = ss;
+    ss_set(&mut w, SS_FLAGS, ss_get(&ss, SS_FLAGS) | ASYNC_LOW_LATENCY);
+    ss_set(&mut w, SS_DIVISOR, 3);
+    if sys_ioctl(fd, TIOCSSERIAL, w.as_ptr() as u64) != 0 {
+        return 16;
+    }
+    let mut got = [0u8; SS_SIZE];
+    sys_ioctl(fd, TIOCGSERIAL, got.as_mut_ptr() as u64);
+    let set = ss_get(&got, SS_FLAGS) & ASYNC_LOW_LATENCY != 0 && ss_get(&got, SS_DIVISOR) == 3;
+    sys_ioctl(fd, TIOCSSERIAL, orig.as_ptr() as u64);
+    sys_close(fd as u64);
+    if set { 0 } else { 17 }
+}
+
+fn test_serial_info() {
+    const NAME: &[u8] = b"TTY_SERIAL";
+    let arm = cfg!(target_arch = "aarch64");
+    let fd = sys_open(
+        serial_port_path().as_ptr(),
+        O_RDWR | O_NOCTTY | O_NONBLOCK,
+        0,
+    );
+    if fd < 0 {
+        return report(NAME, false, fd);
+    }
+    let fd = fd as i32;
+    let mut ss = [0u8; SS_SIZE];
+    let g = sys_ioctl(fd, TIOCGSERIAL, ss.as_mut_ptr() as u64);
+    let orig = ss;
+    // PORT_16550A ttyS1 at 0x2f8, BASE_BAUD; PORT_AMBA at 0x9000000,
+    // the 24 MHz APB clock
+    let (ty, line, port, baud) = if arm {
+        (32, 0, 0, 1_500_000)
+    } else {
+        (4, 1, 0x2f8, 115_200)
+    };
+    let iomem = u64::from_ne_bytes(ss[SS_IOMEM..SS_IOMEM + 8].try_into().unwrap_or([0; 8]));
+    let mut w = ss;
+    ss_set16(&mut w, SS_CLOSE_DELAY, 10);
+    ss_set16(&mut w, SS_CLOSING_WAIT, ASYNC_CLOSING_WAIT_NONE);
+    let s1 = sys_ioctl(fd, TIOCSSERIAL, w.as_ptr() as u64);
+    let mut got = [0u8; SS_SIZE];
+    sys_ioctl(fd, TIOCGSERIAL, got.as_mut_ptr() as u64);
+    let mut slow = got;
+    ss_set(&mut slow, SS_BAUD, 4800);
+    let s2 = sys_ioctl(fd, TIOCSSERIAL, slow.as_ptr() as u64);
+    let child = in_child(serial_unprivileged);
+    let s3 = sys_ioctl(fd, TIOCSSERIAL, orig.as_ptr() as u64);
+    let mut back = [0u8; SS_SIZE];
+    sys_ioctl(fd, TIOCGSERIAL, back.as_mut_ptr() as u64);
+    sys_close(fd as u64);
+    let r = check(b"tiocgserial", g == 0, g)
+        .and_then(|()| {
+            check(
+                b"type",
+                ss_get(&ss, SS_TYPE) == ty,
+                ss_get(&ss, SS_TYPE) as i64,
+            )
+        })
+        .and_then(|()| {
+            check(
+                b"line",
+                ss_get(&ss, SS_LINE) == line,
+                ss_get(&ss, SS_LINE) as i64,
+            )
+        })
+        .and_then(|()| {
+            check(
+                b"port",
+                ss_get(&ss, SS_PORT) == port,
+                ss_get(&ss, SS_PORT) as i64,
+            )
+        })
+        .and_then(|()| check(b"iomem", !arm || iomem == 0x0900_0000, iomem as i64))
+        .and_then(|()| {
+            check(
+                b"fifo",
+                ss_get(&ss, SS_FIFO) == 16,
+                ss_get(&ss, SS_FIFO) as i64,
+            )
+        })
+        .and_then(|()| {
+            check(
+                b"baud",
+                ss_get(&ss, SS_BAUD) == baud,
+                ss_get(&ss, SS_BAUD) as i64,
+            )
+        })
+        .and_then(|()| {
+            let v = ss_get16(&ss, SS_CLOSE_DELAY);
+            check(b"close_delay", v == 50, v as i64)
+        })
+        .and_then(|()| {
+            let v = ss_get16(&ss, SS_CLOSING_WAIT);
+            check(b"closing_wait", v == 3000, v as i64)
+        })
+        .and_then(|()| check(b"tiocsserial", s1 == 0, s1))
+        .and_then(|()| {
+            let (d, cw) = (
+                ss_get16(&got, SS_CLOSE_DELAY),
+                ss_get16(&got, SS_CLOSING_WAIT),
+            );
+            check(
+                b"set",
+                d == 10 && cw == ASYNC_CLOSING_WAIT_NONE,
+                i64::from(d) * 100_000 + i64::from(cw),
+            )
+        })
+        .and_then(|()| check(b"slow baud", s2 == EINVAL, s2))
+        .and_then(|()| check(b"unprivileged", child == 0, child))
+        .and_then(|()| check(b"restore", s3 == 0 && back == orig, s3));
     report_r(NAME, r);
 }
 

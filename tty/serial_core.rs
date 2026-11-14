@@ -22,7 +22,10 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::IrqSpinlock;
+use crate::sync::spin::Mutex;
 
+use super::TtyPort;
+use crate::util::error::KernelError;
 use crate::util::kfifo::Kfifo;
 
 /// The transmit buffer's size (Linux UART_XMIT_SIZE, PAGE_SIZE)
@@ -30,6 +33,121 @@ pub const UART_XMIT_SIZE: usize = 4096;
 /// Writers are woken when fewer bytes than this are queued (Linux
 /// WAKEUP_CHARS)
 pub const WAKEUP_CHARS: usize = 256;
+
+/// struct serial_struct (Linux uapi/linux/serial.h), TIOCGSERIAL and
+/// TIOCSSERIAL
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SerialStruct {
+    pub type_: i32,
+    pub line: i32,
+    pub port: u32,
+    pub irq: i32,
+    pub flags: i32,
+    pub xmit_fifo_size: i32,
+    pub custom_divisor: i32,
+    pub baud_base: i32,
+    /// Centiseconds
+    pub close_delay: u16,
+    pub io_type: u8,
+    pub reserved_char: u8,
+    pub hub6: i32,
+    /// Centiseconds; ASYNC_CLOSING_WAIT_INF or _NONE
+    pub closing_wait: u16,
+    pub closing_wait2: u16,
+    _pad0: u32,
+    pub iomem_base: u64,
+    pub iomem_reg_shift: u16,
+    _pad1: u16,
+    pub port_high: u32,
+    pub iomap_base: u64,
+}
+crate::pod!(SerialStruct {
+    type_,
+    line,
+    port,
+    irq,
+    flags,
+    xmit_fifo_size,
+    custom_divisor,
+    baud_base,
+    close_delay,
+    io_type,
+    reserved_char,
+    hub6,
+    closing_wait,
+    closing_wait2,
+    _pad0,
+    iomem_base,
+    iomem_reg_shift,
+    _pad1,
+    port_high,
+    iomap_base,
+});
+
+/// closing_wait: wait for output as long as it takes, or not at all
+/// (Linux uapi/linux/serial.h)
+pub const ASYNC_CLOSING_WAIT_INF: u16 = 0;
+pub const ASYNC_CLOSING_WAIT_NONE: u16 = 65535;
+
+/// Port types (Linux uapi/linux/serial.h, serial_core.h)
+pub const PORT_UNKNOWN: i32 = 0;
+pub const PORT_16550A: i32 = 4;
+pub const PORT_CIRRUS: i32 = 5;
+pub const PORT_STARTECH: i32 = 9;
+pub const PORT_AMBA: i32 = 32;
+
+/// I/O types (Linux uart_port.iotype)
+pub const UPIO_PORT: u8 = 0;
+pub const UPIO_MEM: u8 = 2;
+
+/// Port flags (Linux UPF_*, the ASYNC_* bits user space sees)
+pub const UPF_SKIP_TEST: u32 = 1 << 6;
+pub const UPF_SPD_MASK: u32 = 0x1030;
+pub const UPF_LOW_LATENCY: u32 = 1 << 13;
+pub const UPF_BOOT_AUTOCONF: u32 = 1 << 28;
+pub const UPF_FIXED_PORT: u32 = 1 << 29;
+/// What TIOCSSERIAL changes with CAP_SYS_ADMIN, and without
+const UPF_CHANGE_MASK: u32 = 0x17fff;
+const UPF_USR_MASK: u32 = UPF_SPD_MASK | UPF_LOW_LATENCY;
+
+/// A port's fixed resources (Linux uart_port: type, line, iobase,
+/// mapbase, iotype, regshift; hub6 is 0)
+pub struct UartDesc {
+    pub type_: i32,
+    pub line: i32,
+    pub iobase: u32,
+    pub mapbase: u64,
+    pub iotype: u8,
+    pub regshift: u16,
+}
+
+/// What TIOCSSERIAL may change (Linux uart_port: irq, flags, uartclk,
+/// custom_divisor, fifosize)
+#[derive(Clone, Copy)]
+pub struct UartCfg {
+    pub irq: i32,
+    pub flags: u32,
+    pub uartclk: u32,
+    pub custom_divisor: i32,
+    pub fifosize: i32,
+}
+
+/// The highest interrupt number + 1 (Linux irq_get_nr_irqs)
+fn nr_irqs() -> i64 {
+    use crate::arch::{CurrentArch, IrqChipOps};
+    i64::from(<CurrentArch as IrqChipOps>::FIRST_IRQ) + <CurrentArch as IrqChipOps>::NR_IRQS as i64
+}
+
+/// Centiseconds as ticks (Linux msecs_to_jiffies(cs * 10))
+fn cs_to_ticks(cs: u16) -> u32 {
+    crate::task::percpu::ms_to_ticks(u64::from(cs) * 10) as u32
+}
+
+/// Ticks as centiseconds (Linux jiffies_to_msecs(j) / 10)
+fn ticks_to_cs(t: u32) -> u16 {
+    (u64::from(t) * crate::task::percpu::TICK_MS / 10).min(u64::from(u16::MAX)) as u16
+}
 
 /// A UART's transmitter (Linux uart_ops, the transmit side), called
 /// under the port lock
@@ -80,6 +198,13 @@ pub trait UartOps: Sync {
     /// Arm the port's poll timer for the next tick (a port without an
     /// interrupt; its callback calls `UartPort::poll_tx`)
     fn arm_poll(&self);
+
+    /// Check TIOCSSERIAL's settings for the port (Linux
+    /// uart_ops.verify_port)
+    fn verify_port(&self, ss: &SerialStruct) -> Result<(), KernelError> {
+        let _ = ss;
+        Ok(())
+    }
 }
 
 /// The port lock's data (Linux uart_state.port.xmit_fifo)
@@ -100,11 +225,17 @@ pub struct UartPort {
     xmit: IrqSpinlock<Xmit>,
     /// It takes interrupts; else a timer polls the transmitter
     irq: AtomicBool,
+    desc: UartDesc,
+    /// Spin leaf, thread context: under the tty's `port` mutex (Linux
+    /// port->mutex) for TIOCSSERIAL, alone for probe
+    cfg: Mutex<UartCfg>,
 }
 
 impl UartPort {
-    pub const fn new() -> Self {
+    pub const fn new(desc: UartDesc, cfg: UartCfg) -> Self {
         Self {
+            desc,
+            cfg: Mutex::new(cfg),
             xmit: IrqSpinlock::new(Xmit {
                 fifo: Kfifo::new(),
                 tx_on: false,
@@ -297,6 +428,114 @@ impl UartPort {
         }
     }
 
+    /// The port's interrupt number (probe)
+    pub fn set_irq_nr(&self, irq: i32) {
+        self.cfg.lock().irq = irq;
+    }
+
+    /// TIOCGSERIAL (Linux uart_get_info), under the tty's `port`
+    pub fn get_info(&self, port: &TtyPort) -> SerialStruct {
+        let c = *self.cfg.lock();
+        let d = &self.desc;
+        SerialStruct {
+            type_: d.type_,
+            line: d.line,
+            port: d.iobase,
+            irq: c.irq,
+            flags: c.flags as i32,
+            xmit_fifo_size: c.fifosize,
+            baud_base: (c.uartclk / 16) as i32,
+            close_delay: ticks_to_cs(port.close_delay),
+            closing_wait: if port.closing_wait == u32::from(ASYNC_CLOSING_WAIT_NONE) {
+                ASYNC_CLOSING_WAIT_NONE
+            } else {
+                ticks_to_cs(port.closing_wait)
+            },
+            custom_divisor: c.custom_divisor,
+            io_type: d.iotype,
+            iomem_reg_shift: d.regshift,
+            iomem_base: d.mapbase,
+            ..SerialStruct::default()
+        }
+    }
+
+    /// TIOCSSERIAL (Linux uart_set_info), under the tty's `port`:
+    /// `active`, the port is open and not hung up; `users`, its open
+    /// files; `admin`, the caller has CAP_SYS_ADMIN, else only the
+    /// user flags (speed, low latency) and the custom divisor change.
+    /// hk cannot move a port to other resources: a change of its I/O
+    /// address, type or interrupt that Linux would make is EINVAL
+    pub fn set_info(
+        &self,
+        ops: &dyn UartOps,
+        port: &mut TtyPort,
+        ss: &SerialStruct,
+        active: bool,
+        users: usize,
+        admin: bool,
+    ) -> Result<(), KernelError> {
+        if !active {
+            return Err(KernelError::Io);
+        }
+        let mut c = self.cfg.lock();
+        let d = &self.desc;
+        let close_delay = cs_to_ticks(ss.close_delay);
+        let closing_wait = if ss.closing_wait == ASYNC_CLOSING_WAIT_NONE {
+            u32::from(ASYNC_CLOSING_WAIT_NONE)
+        } else {
+            cs_to_ticks(ss.closing_wait)
+        };
+        let fixed = c.flags & UPF_FIXED_PORT != 0;
+        let change_irq = !fixed && ss.irq != c.irq;
+        let change_port = !fixed
+            && (ss.port != d.iobase
+                || ss.iomem_base != d.mapbase
+                || ss.hub6 != 0
+                || ss.io_type != d.iotype
+                || ss.iomem_reg_shift != d.regshift
+                || ss.type_ != d.type_);
+        let new_flags = ss.flags as u32;
+        if !fixed && ss.baud_base.wrapping_mul(16) == 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        if !admin {
+            if change_irq
+                || change_port
+                || ss.baud_base as u32 != c.uartclk / 16
+                || close_delay != port.close_delay
+                || closing_wait != port.closing_wait
+                || (ss.xmit_fifo_size != 0 && ss.xmit_fifo_size != c.fifosize)
+                || (new_flags ^ c.flags) & !UPF_USR_MASK != 0
+            {
+                return Err(KernelError::NotPermitted);
+            }
+            c.flags = (c.flags & !UPF_USR_MASK) | (new_flags & UPF_USR_MASK);
+            c.custom_divisor = ss.custom_divisor;
+            return Ok(());
+        }
+        ops.verify_port(ss)?;
+        if i64::from(ss.irq) >= nr_irqs() || ss.irq < 0 || ss.baud_base < 9600 {
+            return Err(KernelError::InvalidArgument);
+        }
+        if change_port || change_irq {
+            if users > 1 {
+                return Err(KernelError::Busy);
+            }
+            return Err(KernelError::InvalidArgument);
+        }
+        if !fixed {
+            c.uartclk = (ss.baud_base as u32).wrapping_mul(16);
+        }
+        c.flags = (c.flags & !UPF_CHANGE_MASK) | (new_flags & UPF_CHANGE_MASK);
+        c.custom_divisor = ss.custom_divisor;
+        port.close_delay = close_delay;
+        port.closing_wait = closing_wait;
+        if ss.xmit_fifo_size != 0 {
+            c.fifosize = ss.xmit_fifo_size;
+        }
+        Ok(())
+    }
+
     /// A console write: under the port lock, only tried during an oops
     /// (output then goes out unlocked, as Linux's `locked = 0`), the
     /// port's interrupts quiet, each LF preceded by CR (Linux
@@ -351,7 +590,27 @@ mod tests {
         fn arm_poll(&self) {}
     }
 
-    static PORT: UartPort = UartPort::new();
+    const fn port() -> UartPort {
+        UartPort::new(
+            UartDesc {
+                type_: PORT_16550A,
+                line: 0,
+                iobase: 0x3f8,
+                mapbase: 0,
+                iotype: UPIO_PORT,
+                regshift: 0,
+            },
+            UartCfg {
+                irq: 4,
+                flags: UPF_BOOT_AUTOCONF | UPF_SKIP_TEST,
+                uartclk: 1_843_200,
+                custom_divisor: 0,
+                fifosize: 16,
+            },
+        )
+    }
+
+    static PORT: UartPort = port();
 
     /// A write queues and sends a burst, the TX interrupt the rest; the
     /// interrupt goes off once empty; a console write in between goes
@@ -382,7 +641,7 @@ mod tests {
         assert_eq!(PORT.chars_in_buffer(), 0);
     }
 
-    static STOP_PORT: UartPort = UartPort::new();
+    static STOP_PORT: UartPort = port();
 
     /// Stopped, a write only queues; an x_char still goes out; a
     /// restart sends the queue
@@ -408,5 +667,67 @@ mod tests {
         assert!(STOP_PORT.interrupt_tx(&f));
         assert_eq!(&*f.out.lock().unwrap(), b"\x13abcdef");
         assert!(!f.irq_on.load(Ordering::Relaxed));
+    }
+
+    /// TIOCGSERIAL shows the port and tty_port defaults; TIOCSSERIAL
+    /// without CAP_SYS_ADMIN changes only the user flags and the custom
+    /// divisor (Linux uart_set_info); with it the close timing too,
+    /// within verify_port and the generic checks
+    #[test]
+    fn serial_info_rules() {
+        let f = Fake {
+            out: Mutex::new(Vec::new()),
+            irq_on: AtomicBool::new(false),
+            rounds: AtomicUsize::new(0),
+        };
+        let p = port();
+        let mut tp = TtyPort {
+            close_delay: 50,
+            closing_wait: 3000,
+        };
+        let ss = p.get_info(&tp);
+        assert_eq!(
+            (ss.type_, ss.port, ss.irq, ss.baud_base, ss.xmit_fifo_size),
+            (PORT_16550A, 0x3f8, 4, 115_200, 16)
+        );
+        assert_eq!((ss.close_delay, ss.closing_wait), (50, 3000));
+        let set = |tp: &mut TtyPort, s: &SerialStruct, admin| p.set_info(&f, tp, s, true, 1, admin);
+        let mut s2 = ss;
+        s2.closing_wait = 100;
+        assert_eq!(set(&mut tp, &s2, false), Err(KernelError::NotPermitted));
+        let mut s3 = ss;
+        s3.flags ^= UPF_SKIP_TEST as i32;
+        assert_eq!(set(&mut tp, &s3, false), Err(KernelError::NotPermitted));
+        let mut s4 = ss;
+        s4.flags |= UPF_LOW_LATENCY as i32;
+        s4.custom_divisor = 3;
+        assert_eq!(set(&mut tp, &s4, false), Ok(()));
+        let got = p.get_info(&tp);
+        assert_eq!((got.flags, got.custom_divisor), (s4.flags, 3));
+        let mut s5 = got;
+        s5.closing_wait = ASYNC_CLOSING_WAIT_NONE;
+        s5.close_delay = 7;
+        assert_eq!(set(&mut tp, &s5, true), Ok(()));
+        assert_eq!(tp.closing_wait, u32::from(ASYNC_CLOSING_WAIT_NONE));
+        let got = p.get_info(&tp);
+        assert_eq!(
+            (got.close_delay, got.closing_wait),
+            (7, ASYNC_CLOSING_WAIT_NONE)
+        );
+        let mut s6 = got;
+        s6.baud_base = 0;
+        assert_eq!(set(&mut tp, &s6, true), Err(KernelError::InvalidArgument));
+        s6.baud_base = 4800;
+        assert_eq!(set(&mut tp, &s6, true), Err(KernelError::InvalidArgument));
+        let mut s7 = got;
+        s7.irq = 3;
+        assert_eq!(
+            p.set_info(&f, &mut tp, &s7, true, 2, true),
+            Err(KernelError::Busy)
+        );
+        assert_eq!(
+            p.set_info(&f, &mut tp, &got, false, 1, true),
+            Err(KernelError::Io)
+        );
     }
 }

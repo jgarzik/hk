@@ -59,6 +59,7 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
 
 // Re-export commonly used types
+pub use serial_core::SerialStruct;
 pub use termios::{
     B115200,
     BRKINT,
@@ -166,12 +167,48 @@ pub trait TtyDriver: Send + Sync {
     /// hardware, LF as CR LF, then a wait until the transmitter is
     /// empty. A UART takes its port lock (`serial_core::UartPort`)
     fn console_write(&self, data: &[u8]);
+
+    /// TIOCGSERIAL (Linux tty_operations.get_serial), under the tty's
+    /// `port`: ENOTTY if the driver has none
+    fn get_serial(&self, port: &TtyPort) -> Result<SerialStruct, KernelError> {
+        let _ = port;
+        Err(KernelError::NotTty)
+    }
+
+    /// TIOCSSERIAL (Linux tty_operations.set_serial), under the tty's
+    /// `port`; `users`: its open files
+    fn set_serial(
+        &self,
+        port: &mut TtyPort,
+        ss: &SerialStruct,
+        users: usize,
+    ) -> Result<(), KernelError> {
+        let _ = (port, ss, users);
+        Err(KernelError::NotTty)
+    }
 }
 
-/// How long a last close waits for output to drain (Linux
-/// tty_port.closing_wait, 30 s by default: tty_port_init); 0 would be
-/// ASYNC_CLOSING_WAIT_INF. hk has no TIOCSSERIAL to change it
-const CLOSING_WAIT_MS: u64 = 30_000;
+/// A port's close timing (Linux struct tty_port's close_delay and
+/// closing_wait, in ticks), set by TIOCSSERIAL
+pub struct TtyPort {
+    /// Delay after a close with an open waiting for carrier (Linux
+    /// tty_port_close_end; hk has no blocked opens, so it is only kept)
+    pub close_delay: u32,
+    /// How long a last close waits for output to drain; 0 for as long
+    /// as it takes (ASYNC_CLOSING_WAIT_INF), ASYNC_CLOSING_WAIT_NONE
+    /// for not at all
+    pub closing_wait: u32,
+}
+
+impl TtyPort {
+    /// Linux tty_port_init: close_delay 0.5 s, closing_wait 30 s
+    const fn new() -> Self {
+        Self {
+            close_delay: (50 * 1000 / 100 / crate::task::percpu::TICK_MS) as u32,
+            closing_wait: (3000 * 1000 / 100 / crate::task::percpu::TICK_MS) as u32,
+        }
+    }
+}
 
 /// Output flow control (Linux tty->flow)
 struct Flow {
@@ -254,6 +291,8 @@ pub struct Tty {
     /// Open files (Linux tty->count, under tty_lock): held across an
     /// open and across the last close, which drains output
     count: crate::sync::Mutex<usize>,
+    /// Close timing (Linux tty_port, under port->mutex)
+    port: crate::sync::Mutex<TtyPort>,
 }
 
 impl Tty {
@@ -282,6 +321,7 @@ impl Tty {
             do_write_wakeup: AtomicBool::new(false),
             wakeup_due: AtomicBool::new(false),
             count: crate::sync::Mutex::new(0),
+            port: crate::sync::Mutex::new(TtyPort::new()),
         }
     }
 
@@ -566,20 +606,38 @@ impl Tty {
 
     /// The last close (Linux tty_port_close_start, tty_port_shutdown):
     /// output stopped by TCOOFF is dropped, the rest drains for up to
-    /// closing_wait, input is dropped, then the port shuts down unless
+    /// closing_wait (none: not at all; 0: as long as it takes), input is dropped, then the port shuts down unless
     /// it is a console
     fn close_port(&self) {
         let tco = self.flow.lock().tco_stopped;
         if tco {
             self.flush_output();
         }
-        self.wait_until_sent(crate::task::percpu::ms_to_ticks(CLOSING_WAIT_MS));
+        let wait = self.port.lock().closing_wait;
+        if wait != u32::from(serial_core::ASYNC_CLOSING_WAIT_NONE) {
+            self.wait_until_sent(u64::from(wait));
+        }
         self.flush_input();
         let console = crate::console::console_ttys()
             .iter()
             .flatten()
             .any(|t| core::ptr::eq(*t, self));
         self.driver.shutdown(console);
+    }
+
+    /// TIOCGSERIAL (Linux tty_tiocgserial)
+    pub fn get_serial(&self) -> Result<SerialStruct, KernelError> {
+        self.driver.get_serial(&self.port.lock())
+    }
+
+    /// TIOCSSERIAL (Linux tty_set_serial -> uart_set_info_user): under
+    /// the open count (Linux tty_port_users under port->mutex), ldata
+    /// (termios_rwsem, write) and the port mutex
+    pub fn set_serial(&self, ss: &SerialStruct) -> Result<(), KernelError> {
+        let users = self.count.lock();
+        let _ld = n_tty::ldata(self);
+        let mut port = self.port.lock();
+        self.driver.set_serial(&mut port, ss, *users)
     }
 
     /// Bytes queued for the hardware (Linux tty_chars_in_buffer)

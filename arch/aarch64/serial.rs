@@ -12,14 +12,18 @@ use crate::sync::spin::Mutex;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::time::timer::{TIMER_HARD, TimerList};
-use crate::tty::serial_core::{UartOps, UartPort};
+use crate::tty::serial_core::{
+    PORT_AMBA, PORT_UNKNOWN, UPF_BOOT_AUTOCONF, UPIO_MEM, UartCfg, UartDesc, UartOps, UartPort,
+};
 use crate::tty::{Tty, TtyDriver};
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 use core::ptr::{read_volatile, write_volatile};
 
-/// PL011 UART base address on QEMU virt machine
-const PL011_BASE: usize = super::paging::io_va(0x0900_0000) as usize;
+/// PL011 UART physical address on QEMU virt machine (Linux mapbase)
+const PL011_PHYS: u64 = 0x0900_0000;
+/// ... and where the kernel maps it
+const PL011_BASE: usize = super::paging::io_va(PL011_PHYS) as usize;
 
 /// PL011 register offsets
 mod regs {
@@ -102,7 +106,26 @@ impl Pl011 {
         // stays mapped
         Self {
             base,
-            uart: UartPort::new(),
+            uart: UartPort::new(
+                UartDesc {
+                    type_: PORT_AMBA,
+                    line: 0,
+                    iobase: 0,
+                    mapbase: PL011_PHYS,
+                    iotype: UPIO_MEM,
+                    regshift: 0,
+                },
+                // Linux pl011_probe: the APB clock (24 MHz on QEMU
+                // virt), an r1 PL011's 16-byte FIFO (get_fifosize_arm);
+                // the interrupt is known at probe
+                UartCfg {
+                    irq: 0,
+                    flags: UPF_BOOT_AUTOCONF,
+                    uartclk: 24_000_000,
+                    custom_divisor: 0,
+                    fifosize: 16,
+                },
+            ),
             im: AtomicU32::new(0),
         }
     }
@@ -236,6 +259,18 @@ impl UartOps for Pl011 {
     fn arm_poll(&self) {
         core::pin::Pin::static_ref(&POLL).mod_timer(crate::task::percpu::get_ticks() + 1);
     }
+
+    /// Linux pl011_verify_port: an AMBA port at its own address
+    fn verify_port(&self, ss: &crate::tty::SerialStruct) -> Result<(), KernelError> {
+        if (ss.type_ != PORT_UNKNOWN && ss.type_ != PORT_AMBA)
+            || ss.irq < 0
+            || ss.baud_base < 9600
+            || ss.iomem_base != PL011_PHYS
+        {
+            return Err(KernelError::InvalidArgument);
+        }
+        Ok(())
+    }
 }
 
 impl TtyDriver for Pl011 {
@@ -293,6 +328,25 @@ impl TtyDriver for Pl011 {
     fn console_write(&self, data: &[u8]) {
         self.uart.console_write(self, data);
     }
+
+    /// Linux uart_get_info
+    fn get_serial(
+        &self,
+        port: &crate::tty::TtyPort,
+    ) -> Result<crate::tty::SerialStruct, KernelError> {
+        Ok(self.uart.get_info(port))
+    }
+
+    /// Linux uart_set_info
+    fn set_serial(
+        &self,
+        port: &mut crate::tty::TtyPort,
+        ss: &crate::tty::SerialStruct,
+        users: usize,
+    ) -> Result<(), KernelError> {
+        let admin = crate::task::capable(crate::task::CAP_SYS_ADMIN);
+        self.uart.set_info(self, port, ss, users > 0, users, admin)
+    }
 }
 
 /// Polls the transmitter while the PL011 has no interrupt
@@ -328,6 +382,7 @@ fn pl011_irq(_irq: u32) -> IrqReturn {
 /// Take input by interrupt (Linux pl011_startup); `irq` is the GIC
 /// INTID. None without it
 fn rx_irq_init(irq: u32) -> Option<IrqRegistration<IrqFn>> {
+    UART.uart.set_irq_nr(irq as i32);
     let h = try_arc(IrqFn(pl011_irq)).ok()?;
     let reg = crate::irq::request_irq(irq, h)
         .inspect_err(|e| crate::printkln!("ttyAMA0: no IRQ {}: {:?}", irq, e))

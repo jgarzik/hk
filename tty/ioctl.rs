@@ -84,6 +84,10 @@ pub const TIOCSSOFTCAR: u32 = 0x541A;
 pub const FIONREAD: u32 = 0x541B;
 /// Alias for FIONREAD
 pub const TIOCINQ: u32 = FIONREAD;
+/// Get serial port settings (struct serial_struct)
+pub const TIOCGSERIAL: u32 = 0x541E;
+/// Set serial port settings
+pub const TIOCSSERIAL: u32 = 0x541F;
 /// Give up controlling terminal
 pub const TIOCNOTTY: u32 = 0x5422;
 /// Set line discipline
@@ -195,6 +199,11 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
             Ok(0)
         }
         TCXONC => tcxonc(tty, arg),
+        TIOCGSERIAL => put(arg, tty.get_serial()?),
+        TIOCSSERIAL => {
+            tty.set_serial(&get::<super::SerialStruct>(arg)?)?;
+            Ok(0)
+        }
         TIOCSBRK | TIOCCBRK | TIOCEXCL | TIOCNXCL => Ok(0),
         // No modem control: the lines read as asserted, sets are ignored
         TIOCMGET => put(
