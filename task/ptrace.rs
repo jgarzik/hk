@@ -11,6 +11,7 @@
 //! needed for basic debugging and tracing.
 
 use crate::signal::jobctl::{PTRACE_FROZEN, TRACED};
+use crate::signal::stop::Why;
 use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP, Signal};
 use crate::task::percpu::TaskRef;
 use crate::task::percpu::{self, TASKLIST};
@@ -320,6 +321,8 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
         return Err(KernelError::NotPermitted);
     }
 
+    // Entries the SIGSTOP flushes go after TASKLIST
+    let mut gone = signal::SigPending::new();
     {
         let mut table = TASKLIST.write();
         let mut target = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
@@ -339,10 +342,39 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
         // ptrace_attach: send_signal_locked(SIGSTOP, SEND_SIG_PRIV)
         // under tasklist_lock)
         let kernel = signal::SendInfo::Kernel;
-        let _ = signal::send_sig_info_in(&table, &task, SIGSTOP, kernel, signal::PidType::Pid);
+        let _ = signal::send_sig_info_in(
+            &table,
+            &task,
+            SIGSTOP,
+            kernel,
+            signal::PidType::Pid,
+            &mut gone,
+        );
+        // A task in a group stop re-traps for its tracer (Linux
+        // ptrace_attach: JOBCTL_TRAP_STOP | JOBCTL_TRAPPING)
+        signal::stop::attach_stopped(&task);
     }
-
+    drop(gone);
+    wait_trapping(&task);
     Ok(0)
+}
+
+/// An attach waits until its tracee, leaving a group stop, has entered
+/// its STOP trap (Linux ptrace_attach: wait_on_bit(JOBCTL_TRAPPING,
+/// TASK_KILLABLE); cleared, with CHILD_EXIT_WQ woken, by the trap or by
+/// whatever ends the stop)
+fn wait_trapping(t: &Task) {
+    use crate::sync::waitqueue::WaitEntry;
+    use percpu::SleepState;
+    let w = core::pin::pin!(WaitEntry::new());
+    loop {
+        super::proc::CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Killable);
+        if !signal::stop::trapping(t) || signal::fatal_signal_pending() {
+            break;
+        }
+        percpu::schedule();
+    }
+    super::proc::CHILD_EXIT_WQ.finish_wait(w.as_ref());
 }
 
 // =============================================================================
@@ -387,10 +419,12 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> KernelResult<i64> {
             &percpu::current(),
         )));
         target.ptrace_options = options;
+        // A task in a group stop re-traps for its tracer
+        signal::stop::attach_stopped(&task);
     }
 
     // Don't send SIGSTOP - tracee continues running
-
+    wait_trapping(&task);
     Ok(0)
 }
 
@@ -755,42 +789,63 @@ pub fn ptrace_stop(
     code: u32,
     info: Option<crate::signal::SigInfo>,
 ) -> (Option<Signal>, Option<crate::signal::SigInfo>) {
+    ptrace_stop_why(code, Why::Trapped, info)
+}
+
+/// [`ptrace_stop`] for `why`: a trap (CLD_TRAPPED), or a group-stop
+/// trap (CLD_STOPPED: Linux do_jobctl_trap), which takes the thread's
+/// part in the group stop and, if it completes it, tells the real
+/// parent too when the tracer is another process
+pub fn ptrace_stop_why(
+    code: u32,
+    why: Why,
+    info: Option<crate::signal::SigInfo>,
+) -> (Option<Signal>, Option<crate::signal::SigInfo>) {
     use percpu::{SleepState, schedule, set_current_state};
     let me = percpu::current();
-    let tracer = {
+    {
         // Traced, under TASKLIST (which a detach writes); the stop set
-        // under Task.sig inside it, so a tracer's exit detaching us
-        // either came first or sees the stop (Linux ptrace_stop: the
-        // stop under siglock, ->ptrace written under both)
+        // under the group lock and Task.sig inside it, so a tracer's
+        // exit detaching us either came first or sees the stop (Linux
+        // ptrace_stop: the stop under siglock, ->ptrace written under
+        // both)
         let table = TASKLIST.read();
         let Some(t) = table.view(&me) else {
             return (None, info);
         };
-        if t.ptrace == 0 {
+        let sig_struct = me.cpu_group().cloned();
+        let mut g = sig_struct.as_ref().map(|s| s.jobctl.lock());
+        let mut s = me.sig.lock();
+        // Untraced, or killed: no stop (Linux: !current->ptrace ||
+        // __fatal_signal_pending)
+        if t.ptrace == 0 || s.pending.signal.contains(crate::signal::SIGKILL) {
             return (Signal::new(code), info);
         }
-        let mut s = me.sig.lock();
         s.jobctl = (s.jobctl | TRACED) & !PTRACE_FROZEN;
         s.ptrace_code = code;
         s.last_siginfo = info;
+        let event_stop = info.is_some_and(|i| i.code >> 8 == PTRACE_EVENT_STOP as i32);
+        let gstop_done = g
+            .as_mut()
+            .is_some_and(|g| signal::stop::trap_locked(g, &mut s, why, event_stop));
         // Asleep before the tracer can see the stop (Linux
         // set_special_state(TASK_TRACED) before notifying it): a tracer
         // on another CPU waits for us to switch out
         // (wait_task_inactive), and gives up on a Running tracee
         set_current_state(SleepState::Killable);
         drop(s);
-        let tracer = t.tracer();
+        drop(g);
         // The tracer's wait finds the stop; SIGCHLD tells it, in the
         // TASKLIST hold that saw us traced (Linux ptrace_stop:
-        // do_notify_parent_cldstop, CLD_TRAPPED, under tasklist_lock)
-        super::proc::CHILD_EXIT_WQ.wake_all();
-        if let Some(tr) = tracer.as_ref() {
-            signal::notify::notify_tracer_trapped(&table, &me, tr, code);
+        // do_notify_parent_cldstop under tasklist_lock); a completed
+        // group stop also tells the real parent, unless it is the
+        // tracer's process
+        let reparented = t.tracer().is_some_and(|tr| tr.pid != me.ppid());
+        signal::notify::notify_parent_cldstop(&table, &me, true, why);
+        if gstop_done && reparented {
+            signal::notify::notify_parent_cldstop(&table, &me, false, why);
         }
-        // Its reference dropped after TASKLIST
-        tracer
-    };
-    drop(tracer);
+    }
     loop {
         set_current_state(SleepState::Killable);
         let (st, frozen) = stop_state(&me);
@@ -828,6 +883,21 @@ pub fn ptrace_stop(
     // A resume's or detach's signal; the stop's own if its tracer
     // left without waiting for it (ptrace_unlink)
     (Signal::new(core::mem::take(&mut s.ptrace_code)), info)
+}
+
+/// A ptrace stop with info naming the task itself (Linux
+/// ptrace_do_notify): SIGTRAP-style info with `signr` and si_code
+/// `exit_code`, reported with `exit_code`
+pub fn ptrace_do_notify(signr: u32, exit_code: u32, why: Why) -> Option<Signal> {
+    let me = percpu::current();
+    let sig = Signal::new(signr).unwrap_or(SIGTRAP);
+    let info = crate::signal::SigInfo::kill(
+        sig,
+        exit_code as i32,
+        crate::task::pid::vnr(me.tid()) as i32,
+        crate::task::current_cred().uid,
+    );
+    ptrace_stop_why(exit_code, why, Some(info)).0
 }
 
 /// The current task is in a ptrace stop, and its tracer inside a
@@ -887,22 +957,18 @@ pub fn ptrace_signal(info: &mut crate::signal::SigInfo, sig: Signal) -> Option<S
 }
 
 /// Task `t` is no longer traced (Linux __ptrace_unlink), under
-/// TASKLIST's write lock (the view borrows it); under its Task.sig its
-/// frozen bit is cleared and a ptrace stop it is in ends, woken there
-/// (ptrace_signal_wake_up), its code left alone: a stop its tracer
-/// never waited for still delivers its signal, one it did (code 0)
-/// none, a detach's the one PTRACE_DETACH gave
+/// TASKLIST's write lock (the view borrows it); under its group lock and
+/// Task.sig its frozen bit and pending traps are cleared, a group stop
+/// in effect is pending for it again, and a ptrace stop it is in ends,
+/// woken there (ptrace_signal_wake_up), its code left alone: a stop its
+/// tracer never waited for still delivers its signal, one it did (code
+/// 0) none, a detach's the one PTRACE_DETACH gave
 pub(crate) fn ptrace_unlink(t: &mut percpu::TaskViewMut<'_>) {
     t.ptrace = 0;
     t.ptracer = None;
     t.ptrace_options = 0;
     t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
-    let mut s = t.task.sig.lock();
-    s.jobctl &= !PTRACE_FROZEN;
-    if s.traced() {
-        s.jobctl &= !TRACED;
-        percpu::try_to_wake_up(t.task, percpu::WakeMode::Any);
-    }
+    signal::stop::unlink(t.task);
 }
 
 /// The exiting task's tracees are detached (Linux exit_ptrace), one per
@@ -929,6 +995,8 @@ pub fn exit_ptrace() {
 /// send done there; a stopped one is woken there too, its stop's
 /// signal kept ([`ptrace_unlink`]). False once none is left.
 fn detach_live(me: &crate::task::Task) -> bool {
+    // SIGKILL flushes nothing; declared first, dropped after TASKLIST
+    let mut gone = signal::SigPending::new();
     let mut table = TASKLIST.write();
     let Some(v) = table
         .find(|t| t.ptrace != 0 && t.traced_by(me) && !matches!(t.state, TaskState::Zombie(_)))
@@ -940,7 +1008,8 @@ fn detach_live(me: &crate::task::Task) -> bool {
     if exitkill {
         // Linux send_sig_info(SIGKILL, SEND_SIG_PRIV)
         let kernel = signal::SendInfo::Kernel;
-        let _ = signal::send_sig_info_in(&table, &t, SIGKILL, kernel, signal::PidType::Pid);
+        let _ =
+            signal::send_sig_info_in(&table, &t, SIGKILL, kernel, signal::PidType::Pid, &mut gone);
     }
     if let Some(mut v) = table.view_mut(&t) {
         ptrace_unlink(&mut v);

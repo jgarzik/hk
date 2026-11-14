@@ -29,31 +29,70 @@ fn chld_info(
     Some(SigInfo::new(SIGCHLD, code, fields))
 }
 
-/// The traced task `t` stopped with `code` (its exit_code): SIGCHLD
-/// with CLD_TRAPPED to its `tracer`'s process, unless the tracer
-/// ignores SIGCHLD or set SA_NOCLDSTOP (Linux do_notify_parent_cldstop,
-/// for_ptracer); under TASKLIST's read lock held by the caller, the
-/// whole send done there
-pub fn notify_tracer_trapped(table: &GlobalTaskTable, t: &Task, tracer: &Task, code: u32) {
-    let quiet = table
-        .view(tracer)
-        .and_then(|v| v.sighand().map(|h| h.get_action(SIGCHLD)))
-        .is_some_and(|a| a.handler == SigHandler::Ignore || a.flags & sa_flags::SA_NOCLDSTOP != 0);
-    if quiet {
-        return;
-    }
-    let status = (code & 0x7f) as i32;
-    // The tracee as its tracer's namespace numbers it (Linux
-    // do_notify_parent_cldstop: task_pid_nr_ns(tsk, ns of parent))
-    let ns = tracer.pid_ns();
-    let Some(info) = chld_info(table, t, super::si_code::CLD_TRAPPED, status, ns) else {
+/// A stop, continue or ptrace trap of `t` told to its tracer
+/// (`for_ptracer`: `t` itself, CLD_TRAPPED with its stop's code, or a
+/// group stop's code) or to its group leader's real parent (the
+/// leader, with the group's stop signal or SIGCONT) (Linux
+/// do_notify_parent_cldstop): SIGCHLD with its pid, uid and CPU time,
+/// unless the receiver ignores SIGCHLD or set SA_NOCLDSTOP; a wait for
+/// it is woken either way. Under TASKLIST's read lock held by the
+/// caller, the whole send done there.
+pub fn notify_parent_cldstop(
+    table: &GlobalTaskTable,
+    t: &Task,
+    for_ptracer: bool,
+    why: super::stop::Why,
+) {
+    use super::stop::Why;
+    let Some(v) = table.view(t) else {
         return;
     };
-    // Linux __group_send_sig_info to the tracer task's group
-    if let Some(to) = super::group_task(table, table.get(tracer.pid)) {
+    let (tsk, parent) = if for_ptracer {
+        (crate::task::percpu::task_ref(t), v.tracer())
+    } else {
+        let Some(l) = table.get(t.pid) else {
+            return;
+        };
+        (crate::task::percpu::task_ref(l.task), l.real_parent())
+    };
+    let Some(parent) = parent else {
+        return;
+    };
+    let status = match why {
+        Why::Continued => super::SIGCONT.nr() as i32,
+        Why::Stopped => {
+            let code = tsk.cpu_group().map_or(0, |s| super::stop::stop_code(s));
+            (code & 0x7f) as i32
+        }
+        Why::Trapped => (tsk.sig.lock().ptrace_code & 0x7f) as i32,
+    };
+    let quiet = table
+        .view(&parent)
+        .and_then(|v| v.sighand().map(|h| h.get_action(SIGCHLD)))
+        .is_some_and(|a| a.handler == SigHandler::Ignore || a.flags & sa_flags::SA_NOCLDSTOP != 0);
+    // As the receiver's namespace numbers it (Linux task_pid_nr_ns(tsk,
+    // task_active_pid_ns(parent)))
+    let info = chld_info(table, &tsk, why.code(), status, parent.pid_ns());
+    if !quiet
+        && let Some(info) = info
+        && let Some(to) = super::group_task(table, table.get(parent.pid))
+    {
+        // Linux send_signal_locked(SIGCHLD, .., PIDTYPE_TGID); SIGCHLD
+        // flushes nothing
+        let mut gone = super::SigPending::new();
         let info = SendInfo::Info(info);
-        let _ = super::send_task_in(table, &to, SIGCHLD, info, super::PidType::Tgid, false);
+        let _ = super::send_task_in(
+            table,
+            &to,
+            SIGCHLD,
+            info,
+            super::PidType::Tgid,
+            false,
+            &mut gone,
+        );
     }
+    // Linux __wake_up_parent
+    crate::task::proc::CHILD_EXIT_WQ.wake_all();
 }
 
 /// si_code and si_status of wait status `status` (Linux
@@ -197,12 +236,14 @@ pub fn ignoring_children(table: &GlobalTaskTable, pid: crate::task::Pid) -> bool
 pub struct Told {
     pub autoreap: bool,
     rcv: Option<Rcv>,
+    gone: super::SigPending,
 }
 
 impl Told {
     /// Free what the send left (TASKLIST not held)
     pub fn finish(self) {
         drop(self.rcv);
+        drop(self.gone);
     }
 }
 
@@ -221,10 +262,15 @@ impl Told {
 /// signal is pending, and a parent its signal wakes finds it.
 pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
     let tid = z.tid();
+    // A stop-signal exit signal's flushed entries, freed after TASKLIST
+    let mut gone = super::SigPending::new();
     // Its pidfd pollers first (Linux do_notify_parent: do_notify_pidfd)
     crate::task::percpu::notify_pidfd(table, tid);
     let Some(r) = receiver(table, z) else {
-        return Told::default();
+        return Told {
+            gone,
+            ..Told::default()
+        };
     };
     let (sig, autoreap) = (r.sig, r.autoreap);
     if let (Some(sig), Some(info)) = (sig, chld_notice(table, tid, r.to.pid_ns())) {
@@ -233,10 +279,19 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
         // the last thread's release sends its leader's notice with its
         // own pid already detached)
         let info = SendInfo::Notice(info.with_sig(sig));
-        let _ = super::send_task_in(table, &r.to, sig, info, super::PidType::Tgid, false);
+        let _ = super::send_task_in(
+            table,
+            &r.to,
+            sig,
+            info,
+            super::PidType::Tgid,
+            false,
+            &mut gone,
+        );
     }
     Told {
         autoreap,
+        gone,
         rcv: Some(r),
     }
 }

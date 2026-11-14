@@ -486,8 +486,8 @@ glibc's helper thread), and hk has no such path.
   by a non-leader changes nothing (Linux clears that process's
   signal->tty only).
 - **No group stop:** a background process that gets SIGTTOU/SIGTTIN
-  with SIG_DFL (tty_check_change) fails with EIO instead of stopping
-  (see the ptrace stop gaps: stop/continue are not implemented).
+  with SIG_DFL (tty_check_change) fails with EIO instead of restarting
+  once its group is stopped and continued (Linux -ERESTARTSYS).
 - **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
   TIOCEXCL exclusivity, sending a break (TCSBRK 0), IXON/IXOFF flow
   control, packet mode, ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT,
@@ -569,8 +569,8 @@ return trampoline stands in for the vDSO's sigtramp, shown as
 
 Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
 clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
-PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
-to an untraced task is ignored: stop/continue are not implemented).
+PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN (a seized tracee's
+JOBCTL_TRAP_NOTIFY waits for its next resume).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 
@@ -951,8 +951,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   IN_DELETE_SELF, IN_UNMOUNT, IN_IGNORED and IN_Q_OVERFLOW, fanotify
   nothing (the other events have no fsnotify hooks in the VFS
   operations); rename has no
-  IN_MOVED_FROM/IN_MOVED_TO cookie pairing (Linux fsnotify_get_cookie); waitid without WEXITED is
-  EINVAL (C).
+  IN_MOVED_FROM/IN_MOVED_TO cookie pairing (Linux fsnotify_get_cookie).
 - **Copied helpers** (J, or as touched): `current_time` in cgroupfs,
   perm, procfs and ramfs, `current_time_secs` in ipc msg/sem/shm;
   user-timespec readers each validating (futex `read_user_timeout`,
