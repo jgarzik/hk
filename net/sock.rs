@@ -479,8 +479,8 @@ impl Sock {
     }
 
     /// SIGIO to the O_ASYNC files for `band` (a POLL_* code) under rule
-    /// `how` (Linux sk_wake_async / sock_wake_async); thread context, no
-    /// spin lock held
+    /// `how` (Linux sk_wake_async / sock_wake_async): any context but
+    /// hardirq, spin locks held or not (`kill_fasync`)
     pub fn wake_async(&self, how: WakeHow, band: i32) {
         if !self.fasync.armed() {
             return;

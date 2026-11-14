@@ -14,13 +14,14 @@
 //!
 //! ## Locking
 //!
-//! `FasyncList.list` is a sleeping `sync::Mutex` (Linux: fasync_lock for
-//! changes, RCU for kill_fasync): [`kill_fasync`] sends its signals under
-//! it, so it runs in thread context with no spin lock held, the rule for
-//! every signal sender (doc/LOCKING.md 3.7). Under it: `File.f_lock` (the
-//! helper sets O_ASYNC with the list change, Linux f_lock), `FOwner.st`
-//! (spin leaf: a snapshot is taken and the lock dropped before sending),
-//! then the signal locks (TASKLIST read, Task.sig, shared_pending).
+//! As Linux (fasync_lock, fa_lock, fown->lock, RCU readers):
+//! [`fasync_helper`] changes a list under `File.f_lock` (O_ASYNC set with
+//! the change), then `FASYNC_LOCK` (spin, one for every list), then an
+//! entry's `fa` (IrqRwLock). [`kill_fasync`] walks it under RCU, in any
+//! context but hardirq and under any spin locks, holding each entry's
+//! `fa` and its owner's `FOwner.st` (IrqRwLock) read across the send:
+//! then the signal locks (TASKLIST read, Task.sig, shared_pending), the
+//! queue entry allocated GFP_ATOMIC (doc/LOCKING.md 3.7).
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};

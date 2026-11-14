@@ -2940,7 +2940,8 @@ fn forget_original_parent() {
     crate::task::ptrace::exit_ptrace();
     let me = task_ref(&current());
     crate::task::pidns::find_child_reaper(&me);
-    // Room for every child first: nothing allocates under TASKLIST
+    // Room for every child first: the moved list grows outside TASKLIST
+    // (only a notice's queue entry is made under it, GFP_ATOMIC)
     let mut moved = Vec::new();
     loop {
         let n = TASKLIST.read().view(&me).map_or(0, |t| t.children.len());

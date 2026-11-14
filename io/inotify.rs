@@ -620,8 +620,8 @@ impl Inotify {
 
     /// Watch `wd` on `inode` gets `mask` (if it asks for it, or it is
     /// IN_UNMOUNT) with `isdir`, then IN_IGNORED, and goes; its inode is
-    /// released with the group's lock dropped. SIGIO waits for a worker:
-    /// the caller may hold spin locks.
+    /// released with the group's lock dropped. SIGIO is sent there too
+    /// (`kill_fasync`, safe under the caller's spin locks).
     fn destroy_watch(self: &Arc<Self>, wd: i32, inode: &Inode, mask: u32, isdir: u32) {
         // Both events are allocated before the queue lock (Linux
         // inotify_handle_inode_event, then fsnotify_insert_event)

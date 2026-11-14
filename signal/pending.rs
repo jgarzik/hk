@@ -42,8 +42,9 @@ impl SigQueue {
     /// An entry for `sig` with `info` charged to `ucounts`, the
     /// receiver's real uid's (Linux sigqueue_alloc, sig_get_ucounts):
     /// none if that takes the user past `limit` (its RLIMIT_SIGPENDING)
-    /// unless `override_rlimit`, or without memory. Thread context, no
-    /// spin lock held.
+    /// unless `override_rlimit`, or without memory. Allocates with the
+    /// caller's GFP: a send calls it under the receiver's Task.sig with
+    /// GFP_ATOMIC (Linux __send_signal_locked).
     pub fn alloc(
         sig: Signal,
         info: SigInfo,
