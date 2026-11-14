@@ -109,39 +109,54 @@ pub struct MntNamespace {
     pub root: RwLock<Option<MountRef>>,
     /// Its inode number (Linux ns.inum)
     pub inum: inum::Inum,
+    /// The user namespace that owns it (Linux mnt_namespace.user_ns),
+    /// set at creation
+    pub user_ns: Arc<UserNamespace>,
 }
 
 impl MntNamespace {
-    /// Create a new empty mount namespace, or ENOMEM
-    pub fn new() -> Result<Arc<Self>, KernelError> {
-        try_arc(Self::with(inum::Inum::alloc()?))
+    /// Create a new empty mount namespace owned by `user_ns`, or ENOMEM
+    /// (Linux alloc_mnt_ns)
+    pub fn new(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self::with(inum::Inum::alloc()?, user_ns))
     }
 
     /// Create initial mount namespace (boot: failure cannot be reported)
     fn new_init() -> Arc<Self> {
-        arc_nofail(Self::with(inum::Inum::fixed(inum::MNT_INIT)))
+        arc_nofail(Self::with(
+            inum::Inum::fixed(inum::MNT_INIT),
+            INIT_USER_NS.clone(),
+        ))
     }
 
-    /// An empty namespace numbered `inum`
-    fn with(inum: inum::Inum) -> Self {
+    /// An empty namespace numbered `inum`, owned by `user_ns`
+    fn with(inum: inum::Inum, user_ns: Arc<UserNamespace>) -> Self {
         Self {
             id: NEXT_MNT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             root: RwLock::new(None),
             inum,
+            user_ns,
         }
     }
 
-    /// Clone this namespace (for CLONE_NEWNS)
+    /// Clone this namespace for CLONE_NEWNS, owned by `user_ns` (Linux
+    /// copy_mnt_ns)
     ///
     /// Deep-copies the entire mount tree so the new namespace has
-    /// an independent view of the filesystem hierarchy.
+    /// an independent view of the filesystem hierarchy: peers of the
+    /// originals, or their slaves for another user namespace (CL_SLAVE).
     /// `fs` (the new task's, or the unsharer's own) moves its root and
-    /// pwd to the copies of their mounts (Linux copy_mnt_ns)
-    pub fn clone_ns(&self, fs: Option<&crate::fs::FsStruct>) -> KernelResult<Arc<Self>> {
-        let new_ns = Self::new()?;
+    /// pwd to the copies of their mounts
+    pub fn clone_ns(
+        &self,
+        fs: Option<&crate::fs::FsStruct>,
+        user_ns: &Arc<UserNamespace>,
+    ) -> KernelResult<Arc<Self>> {
+        let new_ns = Self::new(user_ns.clone())?;
+        let slave = !Arc::ptr_eq(user_ns, &self.user_ns);
         let old_root = self.get_root();
         if let Some(old_root) = old_root {
-            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id);
+            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id, slave);
             *new_ns.root.write() = Some(new_root);
             if let Some(fs) = fs {
                 fs.repoint(&map);
@@ -264,8 +279,16 @@ impl NsProxy {
             self.uts_ns.clone()
         };
 
+        // First: a mount namespace copy is owned by it (Linux
+        // create_new_namespaces' user_ns, the new creds')
+        let user_ns = if flags & CLONE_NEWUSER != 0 {
+            UserNamespace::clone_ns(&self.user_ns)?
+        } else {
+            self.user_ns.clone()
+        };
+
         let mnt_ns = if flags & CLONE_NEWNS != 0 {
-            self.mnt_ns.clone_ns(fs)?
+            self.mnt_ns.clone_ns(fs, &user_ns)?
         } else {
             self.mnt_ns.clone()
         };
@@ -274,12 +297,6 @@ impl NsProxy {
             PidNamespace::clone_ns(&self.pid_ns)?
         } else {
             self.pid_ns.clone()
-        };
-
-        let user_ns = if flags & CLONE_NEWUSER != 0 {
-            UserNamespace::clone_ns(&self.user_ns)?
-        } else {
-            self.user_ns.clone()
         };
 
         let ipc_ns = if flags & CLONE_NEWIPC != 0 {

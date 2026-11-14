@@ -6,9 +6,9 @@
 
 use crate::harness::{R, check, report_r};
 use hk_syscall::{
-    CLONE_NEWNS, O_CREAT, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_chroot, sys_close, sys_exit,
-    sys_fork, sys_fstatat, sys_mkdir, sys_mount, sys_open, sys_pipe, sys_pivot_root, sys_read,
-    sys_rmdir, sys_stat, sys_umount2, sys_unshare, sys_wait4, sys_write,
+    CLONE_NEWNS, CLONE_NEWUSER, O_CREAT, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_chroot,
+    sys_close, sys_exit, sys_fork, sys_fstatat, sys_mkdir, sys_mount, sys_open, sys_pipe,
+    sys_pivot_root, sys_read, sys_rmdir, sys_stat, sys_umount2, sys_unshare, sys_wait4, sys_write,
 };
 
 const ENOENT: i64 = -2;
@@ -42,6 +42,42 @@ pub fn run_tests() {
     report_r(b"PROPAG_TUCK", tuck());
     report_r(b"PROPAG_UMOUNT_REPARENT", umount_reparent());
     report_r(b"UMOUNT_LAZY_DISCONNECT", lazy_disconnect());
+    report_r(b"PROPAG_UNSHARE_USERNS", unshare_userns());
+}
+
+/// A namespace copied for a new user namespace gets slaves of the
+/// shared mounts (Linux copy_mnt_ns: CL_SLAVE): master:N of the
+/// original's group, shared no more
+fn unshare_userns() -> R {
+    let dirs: [&[u8]; 1] = [b"/tmp/uu_a\0"];
+    mkdirs(&dirs);
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/uu_a\0") == 0, -1)?;
+        check(b"shared", set(b"/tmp/uu_a\0", MS_SHARED) == 0, -1)?;
+        let g = opt(b"/tmp/uu_a", b"shared");
+        check(b"group", g != 0, -1)?;
+        let pid = sys_fork();
+        if pid == 0 {
+            let code = if sys_unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0 {
+                1
+            } else if opt(b"/tmp/uu_a", b"shared") != 0 {
+                2
+            } else if opt(b"/tmp/uu_a", b"master") != g {
+                3
+            } else {
+                0
+            };
+            sys_exit(code);
+        }
+        check(b"fork", pid > 0, pid)?;
+        let mut st: i32 = 0;
+        sys_wait4(pid, &mut st, 0, 0);
+        let code = (st >> 8) & 0xff;
+        check(b"slave copy", st & 0x7f == 0 && code == 0, code as i64)
+    })();
+    sys_umount2(b"/tmp/uu_a\0".as_ptr(), MNT_DETACH);
+    rmdirs(&dirs);
+    r
 }
 
 /// An umount takes a propagated copy whose only submount sits on its
