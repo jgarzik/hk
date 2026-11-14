@@ -383,8 +383,13 @@ impl FileOps for KernfsFops {
         if (file.is_writable() && refused(0o222)) || (file.is_readable() && refused(0o444)) {
             return Err(KernelError::PermissionDenied);
         }
-        if matches!(kn.kind, Kind::Bin(_)) {
-            return Ok(());
+        if let Kind::Bin(b) = &kn.kind {
+            // Linux kernfs_fop_open: ops->open under an active reference
+            let _act = kn.get_active().ok_or(KernelError::NoDevice)?;
+            return match b.ops() {
+                Some(ops) => ops.open(file.is_writable(), file.get_flags()),
+                None => Err(KernelError::NoDevice),
+            };
         }
         let _act = kn.get_active().ok_or(KernelError::NoDevice)?;
         let of = OpenAttr {

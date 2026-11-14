@@ -12,7 +12,8 @@
 //! links) is seen only through mounts of that namespace; one name may
 //! exist once per namespace (Linux KERNFS_NS).
 //!
-//! Attribute show/store run under an active reference (Linux
+//! Attribute show/store and a binary attribute's open hook run under an
+//! active reference (Linux
 //! kernfs_get_active), never under a tree lock. Removal deactivates the
 //! whole subtree first, waits for in-flight operations to drain (Linux
 //! kernfs_drain), then drops the attributes' operations (a node kept by
@@ -105,6 +106,14 @@ pub trait BinAttr: Send + Sync {
     fn write(&self, off: u64, data: &[u8]) -> Result<usize, KernelError> {
         let _ = (off, data);
         Err(KernelError::Io)
+    }
+
+    /// An open of the file (Linux kernfs_ops->open), under an active
+    /// reference: `writable` for an open for writing, `flags` its
+    /// open(2) flags (O_TRUNC still set)
+    fn open(&self, writable: bool, flags: u32) -> Result<(), KernelError> {
+        let _ = (writable, flags);
+        Ok(())
     }
 }
 

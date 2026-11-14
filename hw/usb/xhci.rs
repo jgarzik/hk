@@ -23,6 +23,7 @@ use crate::hw::pci::PciDevice;
 use crate::irq::{IrqFn, IrqRegistration, IrqReturn};
 use crate::printkln;
 use crate::time::delay::{poll_timeout, udelay};
+use crate::trace::{TraceEvent, TraceSystem};
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 
@@ -100,18 +101,35 @@ use super::{
 // Global USB Host Access
 // ============================================================================
 
-/// Check if USB tracing is enabled (uses generic USB stack flag)
-#[inline]
-fn usb_trace() -> bool {
-    super::usb_trace_enabled()
-}
+/// The xHCI trace events (Linux xhci-trace.h, system "xhci-hcd"; the
+/// debug messages as xhci_dbg_trace's events): to the trace ring, never
+/// printk, so the USB serial console's own transfers can be traced
+static HANDLE_EVENT: TraceEvent = TraceEvent::new("xhci_handle_event");
+static HANDLE_TRANSFER: TraceEvent = TraceEvent::new("xhci_handle_transfer");
+static URB_ENQUEUE: TraceEvent = TraceEvent::new("xhci_urb_enqueue");
+static QUEUE_TRB: TraceEvent = TraceEvent::new("xhci_queue_trb");
+static URB_GIVEBACK: TraceEvent = TraceEvent::new("xhci_urb_giveback");
+static DBG_CANCEL_URB: TraceEvent = TraceEvent::new("xhci_dbg_cancel_urb");
 
-/// A trace event (Linux xhci-trace.h tracepoints, xhci_dbg_trace): to
-/// the trace ring, never printk, so the USB serial console's own
-/// transfers can be traced
+/// The "xhci-hcd" trace system
+pub static TRACE_SYSTEM: TraceSystem = TraceSystem {
+    name: "xhci-hcd",
+    events: &[
+        &HANDLE_EVENT,
+        &HANDLE_TRANSFER,
+        &URB_ENQUEUE,
+        &QUEUE_TRB,
+        &URB_GIVEBACK,
+        &DBG_CANCEL_URB,
+    ],
+};
+
+/// Record an xHCI trace event, if enabled
 macro_rules! xhci_trace {
-    ($name:literal, $($arg:tt)*) => {
-        crate::trace::emit($name, format_args!($($arg)*))
+    ($ev:ident, $($arg:tt)*) => {
+        if $ev.enabled() {
+            crate::trace::emit(&$ev, format_args!($($arg)*))
+        }
     };
 }
 
@@ -1119,15 +1137,13 @@ impl XhciController {
             let trb = event_ring.dequeue()?;
 
             let trb_type = trb.get_type();
-            if usb_trace() {
-                xhci_trace!(
-                    "xhci_handle_event",
-                    "type={} ctrl=0x{:08x} status=0x{:08x}",
-                    trb_type,
-                    trb.control,
-                    trb.status
-                );
-            }
+            xhci_trace!(
+                HANDLE_EVENT,
+                "type={} ctrl=0x{:08x} status=0x{:08x}",
+                trb_type,
+                trb.control,
+                trb.status
+            );
 
             // Update ERDP after every dequeue
             let dequeue_phys = self.event_ring.as_ref().unwrap().dequeue_phys();
@@ -1658,9 +1674,7 @@ impl XhciController {
         });
         if let Some(result) = result {
             TRANSFER_COUNT.fetch_add(1, Ordering::Relaxed);
-            if usb_trace() {
-                xhci_trace!("xhci_urb_giveback", "slot={} dci={}", slot_id, ep_dci);
-            }
+            xhci_trace!(URB_GIVEBACK, "slot={} dci={}", slot_id, ep_dci);
             return result;
         }
 
@@ -1668,7 +1682,7 @@ impl XhciController {
         // usb_start_wait_urb returns -ETIMEDOUT); the details are traced
         let count = TRANSFER_COUNT.load(Ordering::Relaxed);
         xhci_trace!(
-            "xhci_urb_timeout",
+            DBG_CANCEL_URB,
             "slot={} dci={} after {} transfers",
             slot_id,
             ep_dci,
@@ -1678,7 +1692,7 @@ impl XhciController {
         if count == 393 {
             if let Some(event_ring) = self.event_ring.as_ref() {
                 xhci_trace!(
-                    "xhci_urb_timeout",
+                    DBG_CANCEL_URB,
                     "event_ring dequeue={} cycle={}",
                     event_ring.dequeue,
                     event_ring.cycle
@@ -1690,7 +1704,7 @@ impl XhciController {
             {
                 let (enqueue, dequeue, cycle) = ring.debug_state();
                 xhci_trace!(
-                    "xhci_urb_timeout",
+                    DBG_CANCEL_URB,
                     "transfer_ring enqueue={} dequeue={} cycle={}",
                     enqueue,
                     dequeue,
@@ -1726,18 +1740,16 @@ impl XhciController {
                 let cc = ((trb.status >> 24) & 0xFF) as u8;
                 let transferred = trb.status & 0xFFFFFF;
 
-                if usb_trace() {
-                    xhci_trace!(
-                        "xhci_handle_transfer",
-                        "slot={} ep={} cc={} residue={} (want slot={} ep={})",
-                        event_slot,
-                        event_ep,
-                        cc,
-                        transferred,
-                        slot_id,
-                        ep_dci
-                    );
-                }
+                xhci_trace!(
+                    HANDLE_TRANSFER,
+                    "slot={} ep={} cc={} residue={} (want slot={} ep={})",
+                    event_slot,
+                    event_ep,
+                    cc,
+                    transferred,
+                    slot_id,
+                    ep_dci
+                );
 
                 // The event's parameter is the address of the TRB it
                 // completes
@@ -1745,8 +1757,8 @@ impl XhciController {
                     return Some(Ok((trb.parameter, transferred, cc)));
                 }
                 // Transfer for different slot/ep - continue consuming events
-            } else if usb_trace() {
-                xhci_trace!("xhci_handle_event", "non-transfer type={}", trb_type);
+            } else {
+                xhci_trace!(HANDLE_EVENT, "non-transfer type={}", trb_type);
             }
             // Non-transfer event (command completion, port status, etc.) - continue consuming
         }
@@ -1765,16 +1777,14 @@ impl XhciController {
         }
         let ep_dci = endpoint_to_dci(endpoint);
 
-        if usb_trace() {
-            xhci_trace!(
-                "xhci_urb_enqueue",
-                "bulk_out slot={} ep=0x{:02x} dci={} len={}",
-                slot_id,
-                endpoint,
-                ep_dci,
-                data.len()
-            );
-        }
+        xhci_trace!(
+            URB_ENQUEUE,
+            "bulk_out slot={} ep=0x{:02x} dci={} len={}",
+            slot_id,
+            endpoint,
+            ep_dci,
+            data.len()
+        );
 
         // The endpoint must exist before the device gets a buffer
         let ring_ok = self
@@ -1798,9 +1808,7 @@ impl XhciController {
         // yet given to the device
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), bounce.cpu_addr(), data.len()) };
 
-        if usb_trace() {
-            xhci_trace!("xhci_queue_trb", "bulk_out dma=0x{:x}", dma_addr.as_u64());
-        }
+        xhci_trace!(QUEUE_TRB, "bulk_out dma=0x{:x}", dma_addr.as_u64());
 
         // Get the transfer ring
         let state = self
@@ -1840,7 +1848,7 @@ impl XhciController {
         unsafe { crate::hw::dma::dma_free_coherent(&self.pci_dev, bounce) };
 
         if cc != CompletionCode::SUCCESS && cc != CompletionCode::SHORT_PACKET {
-            xhci_trace!("xhci_urb_giveback", "bulk_out failed cc={}", cc);
+            xhci_trace!(URB_GIVEBACK, "bulk_out failed cc={}", cc);
             return Err(UsbError::TransferError(cc));
         }
 
@@ -1862,16 +1870,14 @@ impl XhciController {
         }
         let ep_dci = endpoint_to_dci(endpoint | 0x80); // IN direction
 
-        if usb_trace() {
-            xhci_trace!(
-                "xhci_urb_enqueue",
-                "bulk_in slot={} ep=0x{:02x} dci={} len={}",
-                slot_id,
-                endpoint,
-                ep_dci,
-                data.len()
-            );
-        }
+        xhci_trace!(
+            URB_ENQUEUE,
+            "bulk_in slot={} ep=0x{:02x} dci={} len={}",
+            slot_id,
+            endpoint,
+            ep_dci,
+            data.len()
+        );
 
         // The endpoint must exist before the device gets a buffer
         let ring_ok = self
@@ -1892,9 +1898,7 @@ impl XhciController {
             .ok_or(UsbError::NoResources)?;
         let dma_addr = bounce.dma_addr();
 
-        if usb_trace() {
-            xhci_trace!("xhci_queue_trb", "bulk_in dma=0x{:x}", dma_addr.as_u64());
-        }
+        xhci_trace!(QUEUE_TRB, "bulk_in dma=0x{:x}", dma_addr.as_u64());
 
         // Get the transfer ring
         let state = self
@@ -1944,7 +1948,7 @@ impl XhciController {
         }
 
         if cc != CompletionCode::SUCCESS && cc != CompletionCode::SHORT_PACKET {
-            xhci_trace!("xhci_urb_giveback", "bulk_in failed cc={}", cc);
+            xhci_trace!(URB_GIVEBACK, "bulk_in failed cc={}", cc);
             return Err(UsbError::TransferError(cc));
         }
 

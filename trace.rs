@@ -8,16 +8,25 @@
 //! /sys/kernel/tracing) shows the rings, merged by timestamp, in its
 //! `trace` file in Linux's format.
 //!
-//! The buffers are allocated at boot only when something asked for
-//! tracing on the command line (Linux keeps them minimal until tracing
-//! is used: ring_buffer_expanded); events before that are dropped.
+//! Events belong to systems (`TraceSystem`, Linux TRACE_SYSTEM), each
+//! registered with its events at init; an event records only while
+//! enabled, through tracefs's `events/[<system>/[<event>/]]enable` or
+//! the `trace_event=` boot parameter (Linux kernel/trace/
+//! trace_events.c).
+//!
+//! The buffers are allocated when an event is first enabled, at boot
+//! for `trace_event=` (Linux keeps them minimal until tracing is used:
+//! tracing_update_buffers).
 //!
 //! ## Locking
 //!
 //! Each CPU's ring is an `IrqSpinlock` leaf (`emit` runs in any
 //! context: hardirq, under any lock). A reader copies each ring out
 //! under its lock into a buffer allocated before taking it, then
-//! formats with no lock held.
+//! formats with no lock held. `EVENT_MUTEX` (sleeping, Linux
+//! event_mutex) holds the registered systems and serializes enabling,
+//! which allocates the rings under it; an event's flag is an atomic
+//! the emitters read lock-free.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -31,9 +40,9 @@ use crate::cpu::PerCpu;
 use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::inode::{Inode, InodeMode, InodeOps};
-use crate::fs::kernfs::{self, BinAttr, KNode, sysfs};
+use crate::fs::kernfs::{self, Attr, BinAttr, KNode, SysBuf, sysfs};
 use crate::fs::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
-use crate::sync::IrqSpinlock;
+use crate::sync::{IrqSpinlock, Mutex};
 use crate::util::kalloc::{arc_nofail, try_arc};
 use crate::util::kmem::try_vec;
 
@@ -108,17 +117,219 @@ impl Ring {
 /// Each CPU's ring, once allocated
 static RINGS: PerCpu<Once<Box<IrqSpinlock<Ring>>>> = crate::percpu![Once::new()];
 
-/// Tracing was asked for on the command line: allocate the rings
-static WANTED: AtomicBool = AtomicBool::new(false);
-
-/// Events dropped for lack of a ring (before allocation)
+/// Events dropped for lack of a ring
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Ask for the trace buffers (command line parsing; Linux trace_event=
-/// expands the ring buffer at boot)
-pub fn want_buffers() {
-    WANTED.store(true, Ordering::Release);
+/// Allocate every CPU's ring not allocated yet (Linux
+/// tracing_update_buffers); thread context, under `EVENT_MUTEX`
+fn update_buffers() -> Result<(), KernelError> {
+    for cpu in 0..crate::cpu::nr_cpu_ids() {
+        let slot = RINGS.get(cpu);
+        if slot.get().is_some() {
+            continue;
+        }
+        let ring = IrqSpinlock::new(Ring {
+            buf: try_vec(RING_SIZE, 0u8)?,
+            head: 0,
+            used: 0,
+            written: 0,
+            overrun: 0,
+        });
+        let b = crate::util::kalloc::try_box(ring)?;
+        slot.call_once(|| b);
+    }
+    Ok(())
 }
+
+/// A trace event (Linux trace_event_call and its trace_event_file's
+/// enable flag)
+pub struct TraceEvent {
+    name: &'static str,
+    enabled: AtomicBool,
+}
+
+impl TraceEvent {
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            enabled: AtomicBool::new(false),
+        }
+    }
+
+    /// Recording (lock-free: the tracepoint's static key)
+    #[inline]
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+}
+
+/// A trace system and its events (Linux TRACE_SYSTEM)
+pub struct TraceSystem {
+    pub name: &'static str,
+    pub events: &'static [&'static TraceEvent],
+}
+
+/// The registered systems (Linux event_mutex over the event list)
+static EVENT_MUTEX: Mutex<Vec<&'static TraceSystem>> = Mutex::new(Vec::new());
+
+/// Turn `ev` on or off (Linux ftrace_event_enable_disable), the rings
+/// allocated first; under `EVENT_MUTEX`
+fn enable_event(ev: &TraceEvent, on: bool) -> Result<(), KernelError> {
+    if on {
+        update_buffers()?;
+    }
+    ev.enabled.store(on, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Set or clear the events of `systems` that `spec` names (Linux
+/// ftrace_set_clr_event): `<system>:<event>`, either side empty or `*`
+/// for any, or a bare name matching an event or a system. EINVAL if it
+/// names none
+fn set_clr(systems: &[&'static TraceSystem], spec: &str, on: bool) -> Result<(), KernelError> {
+    let any = |s: &str| s.is_empty() || s == "*";
+    let (matches, sub, event) = match spec.split_once(':') {
+        Some((sub, ev)) => (None, (!any(sub)).then_some(sub), (!any(ev)).then_some(ev)),
+        None => (Some(spec), None, None),
+    };
+    let (mut matched, mut err) = (false, None);
+    for sys in systems {
+        for ev in sys.events {
+            if matches.is_some_and(|m| m != ev.name && m != sys.name)
+                || sub.is_some_and(|s| s != sys.name)
+                || event.is_some_and(|e| e != ev.name)
+            {
+                continue;
+            }
+            matched = true;
+            // The first error is returned, the rest still set (Linux eret)
+            if let Err(e) = enable_event(ev, on) {
+                err.get_or_insert(e);
+            }
+        }
+    }
+    match (matched, err) {
+        (false, _) => Err(KernelError::InvalidArgument),
+        (true, Some(e)) => Err(e),
+        (true, None) => Ok(()),
+    }
+}
+
+/// The `trace_event=` boot parameters' events, comma separated, every
+/// occurrence (Linux setup_trace_event appends them to
+/// bootup_event_buf)
+fn boot_events() -> impl Iterator<Item = &'static str> {
+    crate::cmdline::saved()
+        .split_whitespace()
+        .filter_map(|w| w.strip_prefix("trace_event="))
+        .flat_map(|l| l.split(','))
+        .filter(|e| !e.is_empty())
+}
+
+/// Register a system's events (thread context, after `init`): its
+/// tracefs directories, then the boot parameter's events among them
+/// (Linux trace_module_add_events, early_enable_events)
+pub fn register_system(sys: &'static TraceSystem) {
+    let mut systems = EVENT_MUTEX.lock();
+    if systems.try_reserve(1).is_err() {
+        return;
+    }
+    systems.push(sys);
+    if let Some(events) = EVENTS_DIR.get()
+        && let Ok(d) = events.create_dir(sys.name.as_bytes(), 0o755)
+    {
+        let _ = d.create_file(b"enable", 0o640, arc_nofail(SystemEnable(sys)));
+        for &ev in sys.events {
+            if let Ok(e) = d.create_dir(ev.name.as_bytes(), 0o755) {
+                let _ = e.create_file(b"enable", 0o640, arc_nofail(EventEnable(ev)));
+            }
+        }
+    }
+    for spec in boot_events() {
+        let _ = set_clr(&[sys], spec, true);
+    }
+}
+
+/// An enable file's write: 0 or 1, else EINVAL (Linux
+/// kstrtoul_from_user, then the 0/1 switch)
+fn parse_enable(data: &[u8]) -> Result<bool, KernelError> {
+    let d = data.strip_suffix(b"\n").unwrap_or(data);
+    match d {
+        b"0" => Ok(false),
+        b"1" => Ok(true),
+        _ => Err(KernelError::InvalidArgument),
+    }
+}
+
+/// '0' all off, '1' all on, 'X' mixed (Linux system_enable_read)
+fn enable_char<'a>(events: impl Iterator<Item = &'a TraceEvent>) -> u8 {
+    let mut set = 0u8;
+    for ev in events {
+        set |= if ev.enabled() { 2 } else { 1 };
+    }
+    b"001X"[usize::from(set)]
+}
+
+/// events/<system>/<event>/enable (Linux event_enable_fops)
+struct EventEnable(&'static TraceEvent);
+
+impl Attr for EventEnable {
+    fn show(&self, out: &mut SysBuf) -> Result<(), KernelError> {
+        out.bytes(if self.0.enabled() { b"1\n" } else { b"0\n" });
+        Ok(())
+    }
+
+    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
+        let on = parse_enable(data)?;
+        let _g = EVENT_MUTEX.lock();
+        enable_event(self.0, on)?;
+        Ok(data.len())
+    }
+}
+
+/// events/<system>/enable (Linux system_enable_fops)
+struct SystemEnable(&'static TraceSystem);
+
+impl Attr for SystemEnable {
+    fn show(&self, out: &mut SysBuf) -> Result<(), KernelError> {
+        out.bytes(&[enable_char(self.0.events.iter().copied()), b'\n']);
+        Ok(())
+    }
+
+    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
+        let on = parse_enable(data)?;
+        let _g = EVENT_MUTEX.lock();
+        for &ev in self.0.events {
+            enable_event(ev, on)?;
+        }
+        Ok(data.len())
+    }
+}
+
+/// events/enable: every system's events (Linux the top-level
+/// system_enable_fops, dir->subsystem NULL)
+struct AllEnable;
+
+impl Attr for AllEnable {
+    fn show(&self, out: &mut SysBuf) -> Result<(), KernelError> {
+        let systems = EVENT_MUTEX.lock();
+        let c = enable_char(systems.iter().flat_map(|s| s.events.iter().copied()));
+        out.bytes(&[c, b'\n']);
+        Ok(())
+    }
+
+    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
+        let on = parse_enable(data)?;
+        let systems = EVENT_MUTEX.lock();
+        for ev in systems.iter().flat_map(|s| s.events.iter()) {
+            enable_event(ev, on)?;
+        }
+        Ok(data.len())
+    }
+}
+
+/// tracefs's events directory
+static EVENTS_DIR: Once<Arc<KNode>> = Once::new();
 
 /// A writer into a fixed buffer that cuts what does not fit
 struct Cut<'a> {
@@ -135,9 +346,12 @@ impl Write for Cut<'_> {
     }
 }
 
-/// Record event `name` with text `args` on this CPU's ring (Linux
-/// trace_event_buffer_commit), in any context; nothing allocated
-pub fn emit(name: &'static str, args: fmt::Arguments<'_>) {
+/// Record event `ev`, if enabled, with text `args` on this CPU's ring
+/// (Linux trace_event_buffer_commit), in any context; nothing allocated
+pub fn emit(ev: &TraceEvent, args: fmt::Arguments<'_>) {
+    if !ev.enabled() {
+        return;
+    }
     let Some(cpu) = crate::cpu::try_this_id() else {
         return;
     };
@@ -150,7 +364,7 @@ pub fn emit(name: &'static str, args: fmt::Arguments<'_>) {
         buf: &mut text,
         len: 0,
     };
-    let _ = write!(w, "{}: ", name);
+    let _ = write!(w, "{}: ", ev.name);
     let _ = w.write_fmt(args);
     let tlen = w.len;
     let cur = crate::task::percpu::current();
@@ -268,6 +482,34 @@ impl BinAttr for TraceFile {
         buf[..n].copy_from_slice(&t[start..start + n]);
         Ok(n)
     }
+
+    /// Writes are accepted and dropped (Linux tracing_write_stub), so
+    /// `echo > trace` clears through its O_TRUNC open
+    fn write(&self, _off: u64, data: &[u8]) -> Result<usize, KernelError> {
+        Ok(data.len())
+    }
+
+    /// Linux tracing_open: an open for writing with O_TRUNC empties
+    /// every CPU's ring (tracing_reset_online_cpus)
+    fn open(&self, writable: bool, flags: u32) -> Result<(), KernelError> {
+        if writable && flags & crate::fs::file::flags::O_TRUNC != 0 {
+            reset();
+        }
+        Ok(())
+    }
+}
+
+/// Empty every CPU's ring, its counts too (Linux tracing_reset_online_cpus)
+fn reset() {
+    for (_, slot) in RINGS.for_each_possible() {
+        if let Some(ring) = slot.get() {
+            let mut r = ring.lock();
+            r.head = 0;
+            r.used = 0;
+            r.written = 0;
+            r.overrun = 0;
+        }
+    }
 }
 
 static ROOT: Once<Arc<KNode>> = Once::new();
@@ -328,27 +570,89 @@ pub static TRACEFS_TYPE: FileSystemType = FileSystemType {
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
 };
 
-/// Linux tracefs_init (the type, /sys/kernel/tracing to mount it on)
-/// and tracer_init_tracefs (the `trace` file); the rings if asked for
+/// Linux tracefs_init (the type, /sys/kernel/tracing to mount it on),
+/// tracer_init_tracefs (the `trace` file) and event_trace_init (the
+/// events directory); the rings now if `trace_event=` asks for events
+/// (Linux setup_trace_event expands the ring buffer)
 pub fn init() {
-    if WANTED.load(Ordering::Acquire) {
-        for cpu in 0..crate::cpu::nr_cpu_ids() {
-            let Ok(buf) = try_vec(RING_SIZE, 0u8) else {
-                break;
-            };
-            let ring = IrqSpinlock::new(Ring {
-                buf,
-                head: 0,
-                used: 0,
-                written: 0,
-                overrun: 0,
-            });
-            if let Ok(b) = crate::util::kalloc::try_box(ring) {
-                RINGS.get(cpu).call_once(|| b);
-            }
-        }
+    if boot_events().next().is_some() {
+        let _g = EVENT_MUTEX.lock();
+        let _ = update_buffers();
     }
-    let _ = root().create_bin(b"trace", 0o440, arc_nofail(TraceFile));
+    let _ = root().create_bin(b"trace", 0o640, arc_nofail(TraceFile));
+    if let Ok(events) = root().create_dir(b"events", 0o755) {
+        let _ = events.create_file(b"enable", 0o640, arc_nofail(AllEnable));
+        EVENTS_DIR.call_once(|| events);
+    }
     sysfs::mount_point(&sysfs::top_dir(b"kernel"), b"tracing");
     crate::fs::superblock::register_filesystem(&TRACEFS_TYPE).expect("tracefs type");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static A: TraceEvent = TraceEvent::new("a_ev");
+    static B: TraceEvent = TraceEvent::new("b_ev");
+    static C: TraceEvent = TraceEvent::new("a_ev");
+    static S1: TraceSystem = TraceSystem {
+        name: "sys1",
+        events: &[&A, &B],
+    };
+    static S2: TraceSystem = TraceSystem {
+        name: "sys2",
+        events: &[&C],
+    };
+
+    fn all_on() {
+        for e in [&A, &B, &C] {
+            e.enabled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn state() -> [bool; 3] {
+        [A.enabled(), B.enabled(), C.enabled()]
+    }
+
+    /// Linux ftrace_parse_event_string's forms, clearing (no buffers);
+    /// one test, as the events are shared statics
+    #[test]
+    fn event_specs() {
+        let sys = [&S1, &S2];
+        all_on();
+        assert!(set_clr(&sys, "sys1:b_ev", false).is_ok());
+        assert_eq!(state(), [true, false, true]);
+        assert_eq!(enable_char(S1.events.iter().copied()), b'X');
+        all_on();
+        assert!(set_clr(&sys, "sys1:", false).is_ok());
+        assert_eq!(state(), [false, false, true]);
+        assert_eq!(enable_char(S1.events.iter().copied()), b'0');
+        all_on();
+        assert!(set_clr(&sys, "*:a_ev", false).is_ok());
+        assert_eq!(state(), [false, true, false]);
+        all_on();
+        // A bare name: an event or a system of that name
+        assert!(set_clr(&sys, "sys2", false).is_ok());
+        assert_eq!(state(), [true, true, false]);
+        assert_eq!(enable_char(S1.events.iter().copied()), b'1');
+        all_on();
+        assert!(set_clr(&sys, "a_ev", false).is_ok());
+        assert_eq!(state(), [false, true, false]);
+        assert!(matches!(
+            set_clr(&sys, "nope", false),
+            Err(KernelError::InvalidArgument)
+        ));
+        assert!(matches!(
+            set_clr(&sys, "sys1:nope", false),
+            Err(KernelError::InvalidArgument)
+        ));
+    }
+
+    #[test]
+    fn enable_values() {
+        assert!(matches!(parse_enable(b"1\n"), Ok(true)));
+        assert!(matches!(parse_enable(b"0"), Ok(false)));
+        assert!(parse_enable(b"2").is_err());
+        assert!(parse_enable(b"x").is_err());
+    }
 }

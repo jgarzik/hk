@@ -11,8 +11,12 @@
 //! - TTY_READ_EINTR: a blocking read sleeps until a signal (EINTR)
 //! - TTY_WRITE_ATOMIC: a write holds the tty's write lock to its end
 //!   (an O_NONBLOCK writer meanwhile gets EAGAIN)
+//! - TTY_OUTQ: TIOCOUTQ shows a console write's bytes still queued for
+//!   the UART (Linux uart_write into the transmit buffer, drained by the
+//!   TX interrupt), at most what was written; tcdrain waits until none
+//!   are left
 
-use crate::harness::{fail_num, pass};
+use crate::harness::{check, fail_num, pass, report_r};
 use crate::helpers::{host_mode, print, println, skip};
 use crate::io::nonblock::{on_sig, sigaction};
 use hk_syscall::{
@@ -28,6 +32,7 @@ const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
 const TCSBRK: u64 = 0x5409;
 const TIOCNOTTY: u64 = 0x5422;
+const TIOCOUTQ: u64 = 0x5411;
 const SIGHUP: u64 = 1;
 const SIGCONT: u64 = 18;
 const SIGWINCH: u64 = 28;
@@ -49,6 +54,39 @@ pub fn run_tests() {
     test_read_eintr();
     test_sigwinch();
     test_write_atomic();
+    test_outq();
+}
+
+/// Bytes queued for the console's UART
+fn outq(fd: i32) -> i64 {
+    let mut n = -1i32;
+    let r = sys_ioctl(fd, TIOCOUTQ, (&raw mut n) as u64);
+    if r < 0 { r } else { i64::from(n) }
+}
+
+fn test_outq() {
+    const NAME: &[u8] = b"TTY_OUTQ";
+    let fd = sys_open(b"/dev/console\0".as_ptr(), O_WRONLY | O_NOCTTY, 0);
+    if fd < 0 {
+        return report(NAME, false, fd);
+    }
+    let fd = fd as i32;
+    let mut line = [b' '; 1500];
+    line[1499] = b'\n';
+    let w = sys_write(fd as u64, line.as_ptr(), line.len() as u64);
+    let queued = outq(fd);
+    let drained = sys_ioctl(fd, TCSBRK, 1);
+    let left = outq(fd);
+    sys_close(fd as u64);
+    // How much is still queued as the write returns depends on where
+    // the TX interrupt runs: QEMU's UARTs send at once, so on the CPU
+    // taking it the interrupt re-fires until the queue is empty
+    let n = line.len() as i64;
+    let r = check(b"write", w == n, w)
+        .and_then(|()| check(b"queued", (0..=n).contains(&queued), queued))
+        .and_then(|()| check(b"tcdrain", drained == 0, drained))
+        .and_then(|()| check(b"left", left == 0, left));
+    report_r(NAME, r);
 }
 
 fn report(name: &[u8], ok: bool, got: i64) {

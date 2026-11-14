@@ -149,7 +149,7 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
             arg,
             i32::try_from(tty.bytes_available()).unwrap_or(i32::MAX),
         ),
-        TIOCOUTQ => put(arg, 0i32), // output is written synchronously
+        TIOCOUTQ => put(arg, tty.chars_in_buffer().min(i32::MAX as usize) as i32),
         TIOCGPGRP => put(arg, pid_i32(jobctrl::tiocgpgrp(tty)?)),
         TIOCSPGRP => {
             jobctrl::tiocspgrp(tty, get::<i32>(arg)?)?;

@@ -491,8 +491,7 @@ glibc's helper thread), and hk has no such path.
 - **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
   TIOCEXCL exclusivity, sending a break (TCSBRK 0), IXON/IXOFF flow
   control, packet mode, ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT,
-  IUCLC/OLCUC, IMAXBEL, PARMRK and parity/break input handling. Output
-  is written synchronously by polling (TIOCOUTQ 0, no write_wait).
+  IUCLC/OLCUC, IMAXBEL, PARMRK and parity/break input handling.
 - **Serial ports:** ttyS1 is registered without probing COM2; only
   COM1 (and the PL011) take input.
 - **No virtual terminals:** the framebuffer and VGA consoles are not
