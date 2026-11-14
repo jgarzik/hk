@@ -396,13 +396,15 @@ fn move_bufs(
         let to_move = (len - moved).min(available);
 
         if let Some(ref page) = src_buf.page {
-            // Create new buffer in destination
-            let new_buf = PipeBuffer::new(
-                Arc::clone(page),
-                src_buf.offset,
-                to_move as u32,
-                src_buf.flags & !pipe_buf_flags::CAN_MERGE,
-            );
+            // A whole buffer moves with its flags; part of one shares
+            // the page, so the copy may not be stolen or merged into
+            // (Linux splice_pipe_to_pipe)
+            let flags = if to_move == available {
+                src_buf.flags
+            } else {
+                src_buf.flags & !(pipe_buf_flags::GIFT | pipe_buf_flags::CAN_MERGE)
+            };
+            let new_buf = PipeBuffer::new(Arc::clone(page), src_buf.offset, to_move as u32, flags);
 
             if dst_guard.push_buffer(new_buf).is_err() {
                 break;
@@ -480,12 +482,9 @@ fn do_splice_file_to_pipe(
     unsafe {
         core::ptr::copy_nonoverlapping(buf.as_ptr(), crate::arch::phys_to_virt(page.frame), n);
     }
-    let pb = PipeBuffer::new(
-        page,
-        0,
-        n as u32,
-        pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
-    );
+    // Not mergeable: only pipe_write makes such buffers (Linux
+    // copy_splice_read's default_pipe_buf_ops, no CAN_MERGE)
+    let pb = PipeBuffer::new(page, 0, n as u32, pipe_buf_flags::OWNED);
     // Room was seen under this lock: the push cannot fail
     if g.push_buffer(pb).is_err() {
         return Err(KernelError::WouldBlock);
@@ -723,12 +722,7 @@ fn page_from_user(addr: u64, len: u64) -> KernelResult<PipeBuffer> {
     // PAGE_SIZE bytes owned by this buffer, and `n <= PAGE_SIZE`
     let dst = unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), n) };
     copy_from_user(dst, addr, n).map_err(|_| KernelError::BadAddress)?;
-    Ok(PipeBuffer::new(
-        page,
-        0,
-        n as u32,
-        pipe_buf_flags::OWNED,
-    ))
+    Ok(PipeBuffer::new(page, 0, n as u32, pipe_buf_flags::OWNED))
 }
 
 /// sys_sendfile64 - send file data to socket/file

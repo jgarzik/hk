@@ -26,6 +26,10 @@
 //!   longer than a page whole, and one buffer per page touched: a short
 //!   segment across a page boundary into one free slot is partial,
 //!   and a later write does not merge into its buffer (iter_to_pipe)
+//! - SPLICE_MERGE: only write() makes a mergeable buffer (Linux
+//!   pipe_write): a write after a file-to-pipe splice, a tee or a
+//!   partial pipe-to-pipe move takes its own buffer, one after a whole
+//!   buffer's pipe-to-pipe move merges into it (splice_pipe_to_pipe)
 
 use crate::harness::T;
 use hk_syscall::{
@@ -53,6 +57,7 @@ pub fn run_tests() {
     copy_file_range_args();
     splice_wait();
     vmsplice_wait();
+    splice_merge();
     sys_unlink(SRC.as_ptr());
     sys_unlink(DST.as_ptr());
 }
@@ -374,6 +379,47 @@ fn vmsplice_wait() {
         pages += 1;
     }
     t.eq(b"no merge", pages, 14);
+    close(p[0]);
+    close(p[1]);
+    t.done();
+}
+
+/// Pages a nonblocking write still fits into `p` after a 1-byte write
+/// (closes `p`): 15 if that byte merged into the buffer at the head, 14
+/// if it took its own
+fn pages_after_write(p: [i32; 2]) -> i64 {
+    sys_write(p[1] as u64, b"w".as_ptr(), 1);
+    let page = [b'p'; 4096];
+    sys_fcntl(p[1], F_SETFL, u64::from(O_NONBLOCK));
+    let mut pages = 0;
+    while pages < 64 && sys_write(p[1] as u64, page.as_ptr(), 4096) == 4096 {
+        pages += 1;
+    }
+    close(p[0]);
+    close(p[1]);
+    pages
+}
+
+fn splice_merge() {
+    let mut t = T::new(b"SPLICE_MERGE");
+    let null = core::ptr::null_mut();
+    let src = file(SRC, b"0123456789abcdef", 0);
+    let p = pipe();
+    let off = &mut 0i64 as *mut i64;
+    sys_splice(src, off, p[1], null, 16, 0);
+    t.eq(b"file->pipe", pages_after_write(p), 14);
+    close(src);
+    // Written (mergeable) buffers in `p`, moved or linked into `q`
+    let (p, q) = (pipe(), pipe());
+    sys_write(p[1] as u64, b"ab".as_ptr(), 2);
+    sys_tee(p[0], q[1], 2, 0);
+    t.eq(b"tee", pages_after_write(q), 14);
+    let q = pipe();
+    sys_splice(p[0], null, q[1], null, 1, 0);
+    t.eq(b"partial move", pages_after_write(q), 14);
+    let q = pipe();
+    sys_splice(p[0], null, q[1], null, 1, 0);
+    t.eq(b"whole move", pages_after_write(q), 15);
     close(p[0]);
     close(p[1]);
     t.done();
