@@ -126,13 +126,19 @@ pub fn clear_pending(s: &mut TaskSignalState, mask: u32) {
 }
 
 /// End JOBCTL_TRAPPING, waking an attach waiting for it (Linux
-/// task_clear_jobctl_trapping: wake_up_bit; the attach waits on
-/// CHILD_EXIT_WQ)
+/// task_clear_jobctl_trapping: wake_up_bit)
 pub fn clear_trapping(s: &mut TaskSignalState) {
     if s.jobctl & TRAPPING != 0 {
         s.jobctl &= !TRAPPING;
-        crate::task::proc::CHILD_EXIT_WQ.wake_all();
+        trapping_wq(s).wake_all();
     }
+}
+
+/// The queue an attach waits on for `s`'s TRAPPING to clear (Linux
+/// bit_waitqueue(&task->jobctl, JOBCTL_TRAPPING_BIT)): the shared
+/// variable queue its jobctl word hashes to
+pub fn trapping_wq(s: &TaskSignalState) -> &'static crate::sync::waitqueue::WaitQueue {
+    crate::sync::waitqueue::var_waitqueue(core::ptr::addr_of!(s.jobctl) as usize)
 }
 
 /// `t` takes its part in the group stop (Linux

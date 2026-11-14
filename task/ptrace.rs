@@ -361,20 +361,21 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
 
 /// An attach waits until its tracee, leaving a group stop, has entered
 /// its STOP trap (Linux ptrace_attach: wait_on_bit(JOBCTL_TRAPPING,
-/// TASK_KILLABLE); cleared, with CHILD_EXIT_WQ woken, by the trap or by
-/// whatever ends the stop)
+/// TASK_KILLABLE); cleared, with its bit's queue woken, by the trap or
+/// by whatever ends the stop)
 fn wait_trapping(t: &Task) {
     use crate::sync::waitqueue::WaitEntry;
     use percpu::SleepState;
+    let wq = signal::stop::trapping_wq(&t.sig.lock());
     let w = core::pin::pin!(WaitEntry::new());
     loop {
-        super::proc::CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Killable);
+        wq.prepare_to_wait(w.as_ref(), SleepState::Killable);
         if !signal::stop::trapping(t) || signal::fatal_signal_pending() {
             break;
         }
         percpu::schedule();
     }
-    super::proc::CHILD_EXIT_WQ.finish_wait(w.as_ref());
+    wq.finish_wait(w.as_ref());
 }
 
 // =============================================================================

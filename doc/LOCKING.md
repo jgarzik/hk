@@ -1568,9 +1568,11 @@ and TASK_STOPPED): a stopped thread has `jobctl::STOPPED` under its
 cleared, and the thread woken, under the same locks by SIGCONT's
 prepare (`WakeMode::Any`, only a thread it found STOPPED), by a fatal
 signal (`sigkill_task`, `WakeMode::Fatal`) and by a tracer's attach
-(it then re-traps, JOBCTL_TRAP_STOP; the attacher waits on
-`CHILD_EXIT_WQ`, killable, for TRAPPING to clear, which wakes the
-queue). The parent is told (CLD_STOPPED, CLD_CONTINUED) under
+(it then re-traps, JOBCTL_TRAP_STOP; the attacher waits, killable,
+on the `VAR_WAIT_TABLE` queue its tracee's jobctl word hashes to
+(`stop::trapping_wq`, Linux wait_on_bit(JOBCTL_TRAPPING)) for
+TRAPPING to clear, which wakes that queue under the tracee's
+`Task.sig`: an IrqSpinlock leaf taking only run-queue locks). The parent is told (CLD_STOPPED, CLD_CONTINUED) under
 TASKLIST's read lock after the group lock is dropped.
 
 **Source of Truth for Scheduling** (owner CPU's rq, IrqSpinlock):
