@@ -13,14 +13,17 @@
 //! be unmounted or moved, nor its parent bound without it (EINVAL), and
 //! a remount may not drop its read-only, nosuid or atime flags (EPERM);
 //! a mount propagated into such a namespace is locked the same way.
+//! A lazy umount of a tree holding a locked mount leaves it covered: a
+//! walk from an fd on the unmounted tree still does not reach what it
+//! hid (Linux 7.4 leave_cover; before, the locked mount stayed hung).
 
 use crate::harness::{R, check, fail_num, pass, report_r};
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
     _LINUX_CAPABILITY_VERSION_3, AF_INET, CLONE_NEWNS, CLONE_NEWUSER, CapUserData, CapUserHeader,
-    O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, SOCK_DGRAM, sys_capset, sys_close, sys_exit,
-    sys_fchdir, sys_fork, sys_mkdir, sys_mount, sys_open, sys_pipe, sys_read, sys_rmdir,
-    sys_setsockopt, sys_socket, sys_umount2, sys_unshare, sys_wait4, sys_write,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, SOCK_DGRAM, Stat, sys_capset, sys_close, sys_exit,
+    sys_fchdir, sys_fork, sys_fstatat, sys_mkdir, sys_mount, sys_open, sys_pipe, sys_read,
+    sys_rmdir, sys_setsockopt, sys_socket, sys_umount2, sys_unshare, sys_wait4, sys_write,
 };
 
 const MS_RDONLY: u64 = 1;
@@ -28,6 +31,7 @@ const MS_NOSUID: u64 = 2;
 const MS_NOATIME: u64 = 1024;
 const MS_SHARED: u64 = 1 << 20;
 const EPERM: i64 = -1;
+const ENOENT: i64 = -2;
 const MS_REMOUNT: u64 = 32;
 const MS_BIND: u64 = 4096;
 const MS_MOVE: u64 = 8192;
@@ -40,6 +44,7 @@ pub fn run_tests() {
     test_foreign_mount();
     report_r(b"MNT_LOCKED_USERNS", locked_userns());
     report_r(b"MNT_LOCKED_PROPAGATED", locked_propagated());
+    report_r(b"MNT_LOCKED_LAZY_COVER", in_child(cover_child));
     test_prio_net_raw();
 }
 
@@ -134,6 +139,39 @@ fn locked_child() -> u8 {
         ramfs(sub) == 0,
         sys_umount2(sub.as_ptr(), 0) == 0,
         sys_umount2(sub.as_ptr(), 0) == EINVAL,
+    ])
+}
+
+/// Child of MNT_LOCKED_LAZY_COVER: a recursive bind of /tmp/ml copies
+/// the locked /tmp/ml/sub (the copy's top is not locked); a lazy umount
+/// of the copy takes both, and through an fd on the copy's root `sub`
+/// is still a mount, not the directory holding `secret`
+fn cover_child() -> u8 {
+    if !locked_setup() {
+        return 100;
+    }
+    if sys_unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0 {
+        return 101;
+    }
+    let b = b"/tmp/ml/b\0";
+    let bound = sys_mount(
+        b"/tmp/ml\0".as_ptr(),
+        b.as_ptr(),
+        core::ptr::null(),
+        MS_BIND | MS_REC,
+        0,
+    );
+    if bound != 0 {
+        return 102;
+    }
+    let fd = sys_open(b.as_ptr(), O_RDONLY | O_DIRECTORY, 0) as i32;
+    let mut st = Stat::default();
+    first_bad(&[
+        fd >= 0,
+        sys_fstatat(fd, b"sub/secret\0".as_ptr(), &mut st, 0) == ENOENT,
+        sys_umount2(b.as_ptr(), MNT_DETACH) == 0,
+        sys_fstatat(fd, b"sub\0".as_ptr(), &mut st, 0) == 0 && st.st_mode & 0o170000 == 0o040000,
+        sys_fstatat(fd, b"sub/secret\0".as_ptr(), &mut st, 0) == ENOENT,
     ])
 }
 

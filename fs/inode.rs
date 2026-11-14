@@ -225,6 +225,13 @@ pub trait InodeOps: Send + Sync {
         Ok(())
     }
 
+    /// chown may change the owner or group (after the owner checks;
+    /// Linux ->setattr refusing ATTR_UID / ATTR_GID); default yes
+    fn chown_ok(&self, inode: &Inode) -> Result<(), KernelError> {
+        let _ = inode;
+        Ok(())
+    }
+
     /// A new regular file of `dir`'s file system with no name (nlink 0)
     /// for O_TMPFILE (Linux ->tmpfile); default EOPNOTSUPP
     fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {

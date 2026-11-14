@@ -361,9 +361,6 @@ Safe today only because a user namespace grants no capabilities. First:
   `capable`, where Linux keeps it); sockopt_ns_capable sites take the
   socket netns's user_ns, but SO_DEBUG and SO_SNDBUFFORCE/RCVBUFFORCE
   stay init-namespace (Linux sockopt_capable).
-- a lazy umount of a locked mount whose parent goes too leaves Linux
-  7.4's cover (needs_cover, leave_cover): hk unhangs it, so a walk
-  from an fd on the unmounted parent reaches what it hid.
 - a new proc or sysfs mount in a namespace of another user namespace
   needs a fully visible one there (mount_too_revealing).
 - netlink newlink/setlink check CAP_NET_ADMIN in the target netns too
@@ -525,12 +522,11 @@ procfs, tmpfs and devtmpfs apply options on a remount or show them in
 **Location**: `fs/nullfs.rs`, `fs/mount.rs` init_mount_tree,
 `fs/fsstruct.rs` KTHREAD_FS
 
-The nullfs root (Linux 7.0) and the kernel threads' private nullfs
-(7.3) are in place, but no user path reaches either, so what Linux 7.3
-added for when they become reachable is not done: empty mount
-namespaces, the nullfs that stands in for an unmounted mount and the
-empty immutable regular file. Locks are not refused with ENOLCK
-(31a1fb90624d), MS_REMOUNT and umount of the root are not refused on
+The nullfs root (Linux 7.0), the kernel threads' private nullfs (7.3)
+and its file (7.4) are in place; a user path reaches the last two only
+as a cover's stand-in (Linux 7.4 __lookup_mnt). Not done: empty mount
+namespaces and the nullfs that stands in for an unmounted mount. Locks
+are not refused with ENOLCK (31a1fb90624d), MS_REMOUNT and umount of the root are not refused on
 the internal superblock (d791606bb915), and nothing marks knullfs's
 root as unmountable (e22e69c2ad88: dont_mount). Kernel code that resolves a path from a kernel thread finds nothing
 (knullfs); hk has none today, and has no scoped_with_init_fs for one
