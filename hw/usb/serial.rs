@@ -157,6 +157,8 @@ fn write_start() {
         // A failed transfer's data is lost, as a failed URB's
         let _ = usb_console_out(out.0, out.1, &buf[..n]);
         TX_CPU.store(NO_CPU, Ordering::Relaxed);
+        // Busy consoles keep refilling the FIFO: not the CPU's only task
+        crate::task::percpu::cond_resched();
     }
 }
 
