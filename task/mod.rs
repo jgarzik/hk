@@ -665,6 +665,10 @@ pub mod tif {
     /// to user mode; an interruptible sleep ends for it (Linux
     /// TIF_NOTIFY_SIGNAL)
     pub const NOTIFY_SIGNAL: u32 = 1 << 5;
+    /// PTRACE_SINGLESTEP on aarch64: MDSCR_EL1.SS on each return to user
+    /// mode (Linux TIF_SINGLESTEP; set and cleared by the tracer while
+    /// the task is stopped)
+    pub const SINGLESTEP: u32 = 1 << 6;
 }
 
 /// A task (thread or process; Linux task_struct), shared as

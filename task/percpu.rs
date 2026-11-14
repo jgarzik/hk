@@ -2075,6 +2075,62 @@ pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(T
     ))
 }
 
+/// A job-control change a wait reports (Linux wait_task_stopped
+/// without ptrace, wait_task_continued)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobReport {
+    /// The group stop completed, with this signal
+    Stopped(u32),
+    /// SIGCONT continued it
+    Continued,
+}
+
+/// A child of the group `parent_pid` (or a task it traces, for
+/// WCONTINUED) matching `target_pid`, stopped (WUNTRACED/WSTOPPED in
+/// `wflags`) or continued (WCONTINUED) since a wait last reported it:
+/// its tid as the caller numbers it, the report and its real uid; the
+/// report taken unless WNOWAIT (Linux wait_consider_task: a child its
+/// own process traces shows its ptrace stops instead of the group's; a
+/// reapable zombie none). The tasks are walked under TASKLIST's read
+/// lock, each group's state read under its `SignalStruct.jobctl`.
+pub fn wait_jobctl(parent_pid: Pid, target_pid: i64, wflags: i32) -> Option<(Tid, JobReport, u32)> {
+    use super::wait_options::{WCONTINUED, WNOWAIT, WUNTRACED};
+    if wflags & (WUNTRACED | WCONTINUED) == 0 {
+        return None;
+    }
+    let wnowait = wflags & WNOWAIT != 0;
+    let pgid = current_pgid();
+    let table = TASKLIST.read();
+    let (tid, r, uid) = table.iter().find_map(|t| {
+        let child = t.leader && t.task.ppid() == parent_pid && wait_eligible(t.exit_signal, wflags);
+        let traced = tracee_of(&t, parent_pid);
+        if !(child || traced) || !wait_match(&t, target_pid, pgid) {
+            return None;
+        }
+        if matches!(t.state, TaskState::Zombie(_))
+            && !group_pending(&table, t.task.pid, &[t.task.tid()])
+        {
+            return None;
+        }
+        let s = t.signal.as_ref()?;
+        let uid = t.cred_arc().uid;
+        if child
+            && !traced
+            && wflags & WUNTRACED != 0
+            && let Some(code) = crate::signal::stop::take_stopped(s, wnowait)
+        {
+            return Some((t.task.tid(), JobReport::Stopped(code), uid));
+        }
+        (wflags & WCONTINUED != 0 && crate::signal::stop::take_continued(s, wnowait))
+            .then(|| (t.task.tid(), JobReport::Continued, uid))
+    })?;
+    Some((
+        Tid::from(crate::task::pid::nr_ns(tid, current_pid_ns())),
+        r,
+        uid,
+    ))
+}
+
 /// `t` is what wait4's `target_pid` names (`pgid`: the caller's group)
 fn wait_match(t: &TaskView<'_>, target_pid: i64, pgid: Pid) -> bool {
     match target_pid {
@@ -2600,6 +2656,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         }
         table.inherit_pids(&child_task, &current());
         table.insert(child_task.clone());
+        // A new thread joins a group stop in progress or in effect
+        // (Linux copy_process: task_join_group_stop under siglock)
+        if config.flags & CLONE_THREAD != 0 {
+            crate::signal::stop::join_group_stop(&me, &child_task);
+        }
         // A new process joins its real parent's children (Linux: only
         // group leaders are on children lists)
         if config.flags & CLONE_THREAD == 0 {

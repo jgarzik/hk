@@ -470,12 +470,19 @@ fn sigio_target(table: &GlobalTaskTable, o: &Owner, t: &TaskView<'_>) -> Option<
 /// plain SIGIO (SI_KERNEL) when none was chosen or it could not be
 /// queued; thread-directed for a thread owner, else to its process;
 /// sent in place under TASKLIST's read lock, held by the caller
-fn sigio_to_task(table: &GlobalTaskTable, o: &Owner, t: &TaskRef, fd: i32, reason: i32) {
+fn sigio_to_task(
+    table: &GlobalTaskTable,
+    o: &Owner,
+    t: &TaskRef,
+    fd: i32,
+    reason: i32,
+    gone: &mut crate::signal::SigPending,
+) {
     let ty = match o.kind {
         PidType::Tid => crate::signal::PidType::Pid,
         _ => crate::signal::PidType::Tgid,
     };
-    let send = |sig, info| send_sig_info_in(table, t, sig, info, ty);
+    let mut send = |sig, info| send_sig_info_in(table, t, sig, info, ty, gone);
     if let Some(sig) = o.signum {
         // A signal with its own positive codes gets SI_SIGIO, not the
         // ambiguous POLL_* (SIGPOLL itself keeps it)
@@ -505,18 +512,21 @@ fn send_sigio(o: &Owner, fd: i32, reason: i32) {
     let Some(pid) = &o.pid else {
         return;
     };
+    // Entries an F_SETSIG stop signal or SIGCONT flushes, dropped after
+    // TASKLIST
+    let mut gone = crate::signal::SigPending::new();
     let table = TASKLIST.read();
     match o.kind {
         PidType::Tid | PidType::Tgid => {
             let v = table.pid_tid(pid).and_then(|tid| table.get(tid));
             if let Some(t) = v.and_then(|v| sigio_target(&table, o, &v)) {
-                sigio_to_task(&table, o, &t, fd, reason);
+                sigio_to_task(&table, o, &t, fd, reason, &mut gone);
             }
         }
         PidType::Pgrp => {
             for v in table.pgrp(pid) {
                 if let Some(t) = sigio_target(&table, o, &v) {
-                    sigio_to_task(&table, o, &t, fd, reason);
+                    sigio_to_task(&table, o, &t, fd, reason, &mut gone);
                 }
             }
         }

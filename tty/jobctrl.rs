@@ -153,11 +153,9 @@ pub fn disassociate_ctty() {
 
 /// A background process of the session changing `tty` (`sig` SIGTTOU)
 /// or reading it (SIGTTIN) (Linux __tty_check_change): its group gets
-/// `sig` and the call restarts once it is handled; ignored or blocked,
-/// a change goes ahead and a read is EIO; an orphaned group gets EIO.
-/// hk has no group stop, so where Linux would stop the group (SIG_DFL)
-/// the signal is sent and the call fails with EIO instead of
-/// restarting forever
+/// `sig` and the call restarts once it is handled (or the group, by
+/// default, is stopped and continued); ignored or blocked, a change
+/// goes ahead and a read is EIO; an orphaned group gets EIO
 pub fn check_change(tty: &Tty, sig: crate::signal::Signal) -> Result<(), KernelError> {
     use crate::signal::{Disposition, SIGTTIN, disposition};
     let Some((pg, s)) = pids(&TASKLIST.read()) else {
@@ -190,10 +188,7 @@ pub fn check_change(tty: &Tty, sig: crate::signal::Signal) -> Result<(), KernelE
         return Err(KernelError::Io);
     }
     kill_pgrp_pid(&pg, sig);
-    match d {
-        Disposition::Caught => Err(KernelError::RestartSys),
-        _ => Err(KernelError::Io),
-    }
+    Err(KernelError::RestartSys)
 }
 
 /// TIOCGPGRP (Linux tiocgpgrp): the foreground group of the caller's

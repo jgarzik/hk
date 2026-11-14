@@ -68,6 +68,8 @@ pub mod si_code {
     pub const CLD_KILLED: i32 = 2;
     pub const CLD_DUMPED: i32 = 3;
     pub const CLD_TRAPPED: i32 = 4;
+    pub const CLD_STOPPED: i32 = 5;
+    pub const CLD_CONTINUED: i32 = 6;
     pub const NSIGCHLD: i32 = 6;
     /// SIGPOLL codes
     pub const NSIGPOLL: i32 = 6;

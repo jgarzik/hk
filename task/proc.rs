@@ -246,6 +246,16 @@ pub fn sys_wait4(
             let r = put_status(wstatus, wait_status).and_then(|()| put_times(rusage, utime, stime));
             break r.map(|()| child_pid as i64);
         }
+        // A group stop (WUNTRACED): (sig << 8) | 0x7f; a continue
+        // (WCONTINUED): 0xffff (Linux wait_task_stopped,
+        // wait_task_continued)
+        if let Some((tid, r, _)) = super::percpu::wait_jobctl(current_pid, pid, options) {
+            let st = match r {
+                super::percpu::JobReport::Stopped(code) => ((code as i32) << 8) | 0x7f,
+                super::percpu::JobReport::Continued => 0xffff,
+            };
+            break put_status(wstatus, st).map(|()| tid as i64);
+        }
 
         // No zombie child found - check if we have any children at all
         if !super::percpu::has_children(current_pid, pid, options)
@@ -366,10 +376,9 @@ pub fn sys_waitid(
         return Err(KernelError::InvalidArgument);
     }
 
-    // Must specify at least one wait condition
-    // For now we only support WEXITED (terminated children)
-    if options & WEXITED == 0 {
-        // We don't support WSTOPPED or WCONTINUED yet
+    // At least one of WEXITED, WSTOPPED, WCONTINUED (Linux waitid)
+    use super::wait_options::{WCONTINUED, WUNTRACED as WSTOPPED};
+    if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
         return Err(KernelError::InvalidArgument);
     }
 
@@ -424,10 +433,14 @@ pub fn sys_waitid(
             break put_waitid_info(infop, &info).map(|()| 0);
         }
 
-        // Reap a zombie child (with WNOWAIT, only report it)
-        if let Some((child_pid, wait_status, utime, stime)) =
+        // Reap a zombie child (with WNOWAIT, only report it); only for
+        // WEXITED
+        let zombie = if options & WEXITED != 0 {
             super::percpu::reap_zombie_child_times(current_pid, wait_pid, options)
-        {
+        } else {
+            None
+        };
+        if let Some((child_pid, wait_status, utime, stime)) = zombie {
             // Decode the wait status word (exit code vs. killing signal)
             let termsig = wait_status & 0x7f;
             let (code, status) = if termsig == 0 {
@@ -440,6 +453,25 @@ pub fn sys_waitid(
             let info = chld_info(code, child_pid as i32, status);
             let r = put_times(rusage, utime, stime).and_then(|()| put_waitid_info(infop, &info));
             break r.map(|()| 0);
+        }
+        // A group stop (CLD_STOPPED, its signal) or continue
+        // (CLD_CONTINUED, SIGCONT) with the child's uid
+        if let Some((tid, r, uid)) = super::percpu::wait_jobctl(current_pid, wait_pid, options) {
+            let (code, status) = match r {
+                super::percpu::JobReport::Stopped(c) => (si_code::CLD_STOPPED, c as i32),
+                super::percpu::JobReport::Continued => {
+                    (si_code::CLD_CONTINUED, crate::signal::SIGCONT.nr() as i32)
+                }
+            };
+            let fields = crate::signal::SigFields::Chld {
+                pid: tid as i32,
+                uid,
+                status,
+                utime: 0,
+                stime: 0,
+            };
+            let info = crate::signal::SigInfo::new(crate::signal::SIGCHLD, code, fields);
+            break put_waitid_info(infop, &info).map(|()| 0);
         }
 
         // No zombie child found - check if we have any children at all

@@ -262,6 +262,15 @@ impl SigPending {
         self.iter().nth(usize::try_from(n).ok()?).map(|q| q.info)
     }
 
+    /// [`flush_mask`](Self::flush_mask) into `gone`, which takes the
+    /// signals and their entries (to be dropped with no lock held)
+    pub fn flush_mask_into(&mut self, mask: &SigSet, gone: &mut SigPending) {
+        gone.signal = gone.signal.union(&self.signal.intersect(mask));
+        self.signal = self.signal.subtract(mask);
+        self.list
+            .drain_if(|q| mask.contains(q.sig), |q| gone.list.push_back(q));
+    }
+
     /// Take the signals of `mask` out, their queued info with them
     /// (Linux flush_sigqueue_mask): returned to be dropped after the
     /// lock is released

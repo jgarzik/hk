@@ -253,6 +253,7 @@ extern "C" fn ap_rust_entry(boot_data_phys: u64) -> ! {
     // Initialize exception vectors for this CPU
     exceptions::init();
     super::tlb::init_cpu();
+    super::ptrace::debug_init_cpu();
 
     // Privileged Access Never, if the boot CPU found it implemented
     if super::uaccess::pan_enabled() {
