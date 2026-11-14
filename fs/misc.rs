@@ -145,10 +145,15 @@ fn sb_sync_flags(flags: u64) -> u32 {
 }
 
 /// MS_REMOUNT (Linux do_remount): the mount's flags become exactly the
-/// requested set. The read-only switch goes first and is all-or-nothing
-/// (EBUSY while files are open for writing or changes are in progress,
-/// with nothing changed); only then the per-mount flags are replaced.
+/// requested set, EPERM if that drops one a lock keeps
+/// (can_change_locked_flags). The read-only switch goes first and is
+/// all-or-nothing (EBUSY while files are open for writing or changes
+/// are in progress, with nothing changed); only then the per-mount
+/// flags are replaced.
 fn remount(m: &super::mount::MountRef, flags: u64, data: &[u8]) -> Result<(), KernelError> {
+    if !m.can_change_locked_flags(remount_flags(flags, m.flags())) {
+        return Err(KernelError::NotPermitted);
+    }
     let _s = m.sb.s_umount.write();
     // Read-only first (EBUSY changes nothing), then the filesystem's
     // options; their error undoes the switch (Linux reconfigure_super:
@@ -171,8 +176,12 @@ fn remount(m: &super::mount::MountRef, flags: u64, data: &[u8]) -> Result<(), Ke
 }
 
 /// MS_REMOUNT|MS_BIND (Linux do_reconfigure_mnt): this mount's flags
-/// only, read-only included; the superblock is untouched
+/// only, read-only included, EPERM if that drops one a lock keeps; the
+/// superblock is untouched
 fn reconfigure_mnt(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError> {
+    if !m.can_change_locked_flags(remount_flags(flags, m.flags())) {
+        return Err(KernelError::NotPermitted);
+    }
     // s_umount shared, as Linux do_reconfigure_mnt: the superblock does
     // not change, MOUNT_LOCK serializes the flag writers
     let _s = m.sb.s_umount.read();

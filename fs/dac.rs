@@ -393,6 +393,9 @@ pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), 
     if kill != 0 && !owner_or_capable(&c, inode) {
         return Err(KernelError::NotPermitted);
     }
+    if uid.is_some() || gid.is_some() {
+        inode.i_op.chown_ok(inode)?;
+    }
     if let Some(u) = uid {
         inode.set_uid(u);
     }

@@ -48,19 +48,44 @@ pub const MNT_ATIME_MASK: u32 = MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME;
 pub const MNT_READONLY: u32 = 0x40;
 /// Symlinks on this mount are not followed (Linux MNT_NOSYMFOLLOW)
 pub const MNT_NOSYMFOLLOW: u32 = 0x80;
+/// The flags mount(2) sets (Linux MNT_USER_SETTABLE_MASK): a remount
+/// replaces these and keeps the rest
+pub const MNT_USER_SETTABLE_MASK: u32 =
+    MNT_NOSUID | MNT_NODEV | MNT_NOEXEC | MNT_ATIME_MASK | MNT_READONLY | MNT_NOSYMFOLLOW;
 /// New write access through the mount waits (Linux MNT_WRITE_HOLD):
 /// set only under MOUNT_LOCK while writers are counted, never seen by
 /// [`Mount::flags`]
 const MNT_WRITE_HOLD: u32 = 0x200;
 /// Cannot be bind-mounted (Linux T_UNBINDABLE, in `t_flags`)
 pub const T_UNBINDABLE: u32 = 0x1;
+/// A copy for a less privileged user namespace keeps its atime flags
+/// (Linux MNT_LOCK_ATIME), and each lock below the flag it names, set
+/// then: a remount may not drop it (lock_mnt_tree). Set under
+/// MOUNT_LOCK, never cleared, copied by a clone.
+pub const MNT_LOCK_ATIME: u32 = 0x4_0000;
+/// Keeps MNT_NOEXEC (Linux MNT_LOCK_NOEXEC)
+pub const MNT_LOCK_NOEXEC: u32 = 0x8_0000;
+/// Keeps MNT_NOSUID (Linux MNT_LOCK_NOSUID)
+pub const MNT_LOCK_NOSUID: u32 = 0x10_0000;
+/// Keeps MNT_NODEV (Linux MNT_LOCK_NODEV)
+pub const MNT_LOCK_NODEV: u32 = 0x20_0000;
+/// Keeps MNT_READONLY (Linux MNT_LOCK_READONLY)
+pub const MNT_LOCK_READONLY: u32 = 0x40_0000;
 /// Cannot be unmounted, moved or pivoted away (Linux MNT_LOCKED: a mount
 /// a less privileged namespace copied, which would uncover what is
 /// under it; the initial root is protected by having no parent)
 pub const MNT_LOCKED: u32 = 0x80_0000;
+/// Taken out by a synchronous umount (Linux MNT_SYNC_UMOUNT): a
+/// lockless walk that raced it gives back the reference it took
+/// (legitimize), so the umount's puts are the last; set under
+/// MOUNT_LOCK, never cleared
+pub const MNT_SYNC_UMOUNT: u32 = 0x200_0000;
 /// Unmounted, or committed to it by an umount under way (Linux
 /// MNT_UMOUNT): set under MOUNT_LOCK, never cleared
 pub const MNT_UMOUNT: u32 = 0x800_0000;
+/// The kernel's state in `mnt_flags`, not copied by a clone (Linux
+/// MNT_INTERNAL_FLAGS)
+const MNT_INTERNAL_FLAGS: u32 = MNT_SYNC_UMOUNT | MNT_LOCKED | MNT_UMOUNT;
 
 /// What [`MOUNT_LOCK`] owns: the mount tree's links, with
 /// NAMESPACE_SEM ([`NsTree`]); `&MntHash` (a locking read) holds them
@@ -234,6 +259,15 @@ pub struct Mount {
     /// write by that put
     pub(super) doomed: AtomicBool,
 
+    /// The cover it leaves at its parent if both are unmounted at once
+    /// and it is locked (Linux mnt_cover, allocated with the mount so
+    /// the umount cannot fail): taken once, under MOUNT_LOCK write
+    mnt_cover: LockedBy<Option<Arc<MntCover>>, MntHash>,
+    /// The covers its unmounted submounts left (Linux mnt_covers): added
+    /// under MOUNT_LOCK write, read under RCU by `__lookup_mnt` once this
+    /// mount is unmounted, released by its teardown
+    mnt_covers: RcuHList<CoverA, MntHash>,
+
     /// In the mount hash while attached (Linux mnt_hash), its chain's
     /// reference released a grace period after it leaves (`mnt_puts`)
     mnt_hash: HNode,
@@ -259,13 +293,14 @@ impl Mount {
         devname: super::name::FileName,
     ) -> Result<MountRef, KernelError> {
         let pcp = PcpSlot::new()?;
+        let cover = try_arc(MntCover::new())?;
         let m = try_arc(Self::init(
             sb,
             root,
             flags,
             devname,
-            pcp,
-            PcpSlot::new()?,
+            (pcp, PcpSlot::new()?),
+            cover,
             MNT_IDS.try_alloc()?,
         ))?;
         m.sb.add_mount(&m);
@@ -287,24 +322,26 @@ impl Mount {
             root,
             flags,
             devname,
-            pcp,
-            w,
+            (pcp, w),
+            arc_nofail(MntCover::new()),
             MNT_IDS.alloc(),
         ));
         m.sb.add_mount(&m);
         MountRef::first(m)
     }
 
-    /// A mount with id `mnt_id`, which its drop gives back
+    /// A mount with id `mnt_id`, which its drop gives back; `pcp` are
+    /// its count's and its writers' parts
     fn init(
         sb: Arc<SuperBlock>,
         root: DentryRef,
         flags: u32,
         devname: super::name::FileName,
-        mnt_pcp: PcpSlot,
-        mnt_writers: PcpSlot,
+        pcp: (PcpSlot, PcpSlot),
+        cover: Arc<MntCover>,
         mnt_id: u32,
     ) -> Self {
+        let (mnt_pcp, mnt_writers) = pcp;
         Self {
             sb: MntOwned::new(sb),
             root: MntOwned::new(root),
@@ -328,6 +365,8 @@ impl Mount {
             devname,
             mnt_pcp,
             doomed: AtomicBool::new(false),
+            mnt_cover: LockedBy::new(Some(cover)),
+            mnt_covers: RcuHList::new(),
             mnt_hash: HNode::new(),
             mnt_puts: RcuPuts::new(),
             mnt_task_work: CallbackHead::new(__cleanup_mnt),
@@ -337,13 +376,14 @@ impl Mount {
     }
 
     /// A copy of `self` for a namespace copy into namespace `ns`: same
-    /// filesystem, root, flags and source, new ids, not attached; a peer
-    /// of `self`, or with CL_SLAVE in `flag` its slave
+    /// filesystem, root, flags (not the kernel's: Linux clone_mnt) and
+    /// source, new ids, not attached; a peer of `self`, or with CL_SLAVE
+    /// in `flag` its slave
     fn copy(&self, g: &mut NsTree, ns: u64, flag: u32) -> MountRef {
         let c = Self::alloc_nofail(
             self.sb.clone(),
             self.root.clone(),
-            self.flags(),
+            self.flags() & !MNT_INTERNAL_FLAGS,
             self.devname.clone(),
         );
         c.inherit_t_flags(self);
@@ -388,9 +428,9 @@ impl Mount {
     /// through the mount (Linux mnt_make_readonly)
     pub fn set_flags(&self, f: u32) -> Result<(), KernelError> {
         let _ml = MOUNT_LOCK.write();
-        // Lock state is not the caller's to set here, nor the hold
-        let kept = MNT_LOCKED | MNT_UMOUNT;
-        let f = (f & !(kept | MNT_WRITE_HOLD)) | (self.flags() & kept);
+        // Only what mount(2) sets changes (Linux set_mount_attributes):
+        // the locks and the kernel's state stay, the hold is not seen
+        let f = (f & MNT_USER_SETTABLE_MASK) | (self.flags() & !MNT_USER_SETTABLE_MASK);
         // Linux mnt_make_readonly: writers held off; read-only only if
         // none holds access, set before the hold is released
         if f & MNT_READONLY != 0 && self.flags() & MNT_READONLY == 0 {
@@ -421,6 +461,19 @@ impl Mount {
     pub(super) fn unhold_writers(&self) {
         fence(Ordering::Release);
         self.mnt_flags.fetch_and(!MNT_WRITE_HOLD, Ordering::Release);
+    }
+
+    /// A remount to MNT_* flags `f` keeps every flag a lock holds
+    /// (Linux can_change_locked_flags): no lock is ever cleared, so no
+    /// lock is needed to read them
+    pub fn can_change_locked_flags(&self, f: u32) -> bool {
+        let fl = self.flags();
+        let keeps = |lock: u32, flag: u32| fl & lock == 0 || f & flag != 0;
+        keeps(MNT_LOCK_READONLY, MNT_READONLY)
+            && keeps(MNT_LOCK_NODEV, MNT_NODEV)
+            && keeps(MNT_LOCK_NOSUID, MNT_NOSUID)
+            && keeps(MNT_LOCK_NOEXEC, MNT_NOEXEC)
+            && (fl & MNT_LOCK_ATIME == 0 || fl & MNT_ATIME_MASK == f & MNT_ATIME_MASK)
     }
 
     /// Set (`on`) or clear MNT_* bits that need no other checks, under
@@ -689,7 +742,9 @@ impl Mount {
     /// (CL_SLAVE).
     ///
     /// This is used by CLONE_NEWNS to give a new mount namespace its
-    /// own view of the mount hierarchy.
+    /// own view of the mount hierarchy. A submount's copy keeps
+    /// MNT_LOCKED, the root's does not (Linux copy_tree); a copy for
+    /// another user namespace is locked whole (lock_mnt_tree).
     pub fn clone_tree(root: &MountRef, ns: u64, slave: bool) -> (MountRef, MountMap) {
         let flag = if slave { super::pnode::CL_SLAVE } else { 0 };
         let mut g = namespace_lock();
@@ -697,9 +752,15 @@ impl Mount {
         let mut map = alloc::vec![(root.clone(), new_root.clone())];
         copy_below(&mut g, root, &new_root, |g, o| {
             let c = o.copy(g, ns, flag);
+            if o.flags() & MNT_LOCKED != 0 {
+                c.mark(MNT_LOCKED, true);
+            }
             map.push((o.clone(), c.clone()));
             c
         });
+        if slave {
+            lock_mnt_tree(&g, &new_root);
+        }
         (new_root, map)
     }
 }
@@ -830,6 +891,37 @@ pub(super) fn copy_below(
         next = next_mnt(&p, src, &*ns);
     }
 }
+
+/// What an unmounted locked mount leaves at its unmounted parent
+/// instead of staying hung there (Linux struct mnt_cover): a lookup on
+/// the parent at the mountpoint finds a stand-in, so what the mount hid
+/// stays hidden. The cover counts its mountpoint, which keeps the
+/// dentry; the parent's teardown releases both.
+pub struct MntCover {
+    /// On the parent's `mnt_covers` (Linux node), read under RCU
+    node: HNode,
+    /// The mountpoint dentry, for comparison only (Linux dentry): set
+    /// before the cover is linked, under MOUNT_LOCK write
+    dentry: AtomicPtr<Dentry>,
+    /// Its mountpoint, counted (Linux mp; m_covers' pin)
+    mp: AtomicPtr<Mountpoint>,
+    /// The free a grace period after it leaves its list
+    rcu: crate::sync::rcu::RcuHead,
+}
+
+impl MntCover {
+    fn new() -> Self {
+        Self {
+            node: HNode::new(),
+            dentry: AtomicPtr::new(core::ptr::null_mut()),
+            mp: AtomicPtr::new(core::ptr::null_mut()),
+            rcu: crate::sync::rcu::RcuHead::new(),
+        }
+    }
+}
+
+crate::hadapter!(CoverA, MntCover, node);
+crate::rcu_head!(MntCover, rcu);
 
 /// A dentry something is mounted on (Linux struct mountpoint): in
 /// `MountTables.mp` while `m_count` attached mounts sit on it, holding
@@ -1046,16 +1138,37 @@ fn put_mp(ml: &mut MntHash, mp: MpPtr) -> Option<Box<Mountpoint>> {
 /// The child of `parent` mounted on `d` (Linux __lookup_mnt): one walk
 /// of its hash chain under an RCU read guard, comparing each entry's
 /// `parent` and `mountpoint`, which a lockless caller checks with
-/// MOUNT_LOCK's sequence after
+/// MOUNT_LOCK's sequence after. An unmounted `parent` with a cover left
+/// at `d` gives the stand-in: the kernel's nullfs for a directory, its
+/// file for anything else.
 pub(super) fn __lookup_mnt<'g>(
     parent: &Mount,
     d: &Dentry,
     g: &'g RcuReadGuard,
 ) -> Option<&'g Mount> {
-    m_hash(parent, d).iter(g).find(|c| {
+    let c = m_hash(parent, d).iter(g).find(|c| {
         core::ptr::eq(c.mnt_parent.load(Ordering::Acquire), parent)
             && core::ptr::eq(c.mnt_mountpoint.load(Ordering::Acquire), d)
-    })
+    });
+    if c.is_some() {
+        return c;
+    }
+    // A stale flag is harmless: a lockless caller rechecks the sequence
+    // after a miss
+    if parent.mnt_flags.load(Ordering::Relaxed) & MNT_UMOUNT == 0 {
+        return None;
+    }
+    let dp = core::ptr::from_ref(d).cast_mut();
+    if !parent
+        .mnt_covers
+        .iter(g)
+        .any(|c| c.dentry.load(Ordering::Acquire) == dp)
+    {
+        return None;
+    }
+    let dir = d.get_inode().is_some_and(|i| i.mode().is_dir());
+    let stand_in = if dir { &KNULLFS } else { &KNULLFS_FILE };
+    stand_in.get().map(|m| &**m)
 }
 
 /// Take `m` out of the mount hash (Linux hlist_del_init_rcu of
@@ -1075,12 +1188,17 @@ fn unhash_mnt(ml: &mut MntHash, m: &Mount) {
 /// The kernel threads' nullfs mount (Linux knullfs, an internal mount)
 static KNULLFS: spin::Once<MountRef> = spin::Once::new();
 
+/// A second mount of knullfs's superblock rooted on its regular file
+/// (Linux knullfs_file): a cover's stand-in for a mount on a file
+static KNULLFS_FILE: spin::Once<MountRef> = spin::Once::new();
+
 /// The initial mount tree (Linux init_mount_tree, 7.0+): a nullfs mount
 /// (id 1) is the namespace root and the mutable rootfs, a tmpfs under
 /// the type name "rootfs" (id 2), is mounted on it. Root and cwd go to the rootfs, so it can be
 /// pivoted away or unmounted like any other mount. Then the private
-/// nullfs kernel threads start in (id 3, Linux 7.3 knullfs). Returns
-/// the rootfs.
+/// nullfs kernel threads start in (id 3, Linux 7.3 knullfs), and a
+/// mount of it on its regular file (id 4, Linux 7.4 knullfs_file), the
+/// stand-ins a cover shows. Returns the rootfs.
 pub fn init_mount_tree() -> Result<MountRef, KernelError> {
     let nullfs = &super::nullfs::NULLFS_TYPE;
     let null = attach(
@@ -1096,10 +1214,15 @@ pub fn init_mount_tree() -> Result<MountRef, KernelError> {
     let rootfs = attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())?;
     let ksb = (nullfs.mount)(nullfs, b"")?;
     let root = ksb.get_root().ok_or(KernelError::InvalidArgument)?;
-    let k = Mount::alloc(ksb, root, MNT_READONLY, b"nullfs".as_slice().into())?;
+    let file = super::nullfs::new_file(&ksb)?;
+    let k = Mount::alloc(ksb.clone(), root, MNT_READONLY, b"nullfs".as_slice().into())?;
     k.set_internal();
     super::fsstruct::kthread_fs_init(k.clone());
     KNULLFS.call_once(|| k);
+    // Linux knullfs_file_mount: writable, so a write to it is dropped
+    let f = Mount::alloc(ksb, file, 0, b"nullfs".as_slice().into())?;
+    f.set_internal();
+    KNULLFS_FILE.call_once(|| f);
     Ok(rootfs)
 }
 
@@ -1161,7 +1284,7 @@ fn clone_mnt(ns: &mut NsTree, m: &Mount, root: DentryRef, flag: u32) -> MountRef
     let c = Mount::alloc_nofail(
         m.sb.clone(),
         root,
-        m.flags() & !(MNT_LOCKED | MNT_UMOUNT),
+        m.flags() & !MNT_INTERNAL_FLAGS,
         m.devname.clone(),
     );
     c.inherit_t_flags(m);
@@ -1255,6 +1378,33 @@ pub(super) fn copy_tree(ns: &mut NsTree, plan: &[CopyEnt], flag: u32) -> MountRe
         out.push(n);
     }
     out.swap_remove(0)
+}
+
+/// The tree at `m` goes to a less privileged user namespace (Linux
+/// lock_mnt_tree): each mount's atime flags and each of its read-only,
+/// nodev, nosuid and noexec flags are locked on, and every mount below
+/// `m` is MNT_LOCKED, so what it hides stays hidden; under
+/// NAMESPACE_SEM
+fn lock_mnt_tree(ns: &NsTree, m: &Mount) {
+    let _ml = MOUNT_LOCK.write();
+    for_each_mnt(m, ns, |p| {
+        let fl = p.flags();
+        let mut add = MNT_LOCK_ATIME;
+        for (flag, lock) in [
+            (MNT_READONLY, MNT_LOCK_READONLY),
+            (MNT_NODEV, MNT_LOCK_NODEV),
+            (MNT_NOSUID, MNT_LOCK_NOSUID),
+            (MNT_NOEXEC, MNT_LOCK_NOEXEC),
+        ] {
+            if fl & flag != 0 {
+                add |= lock;
+            }
+        }
+        if !core::ptr::eq(p, m) {
+            add |= MNT_LOCKED;
+        }
+        p.mnt_flags.fetch_or(add, Ordering::SeqCst);
+    });
 }
 
 /// A mount under `d` in `m` is locked (Linux has_locked_children): a
@@ -1479,7 +1629,7 @@ fn umount_tree(ns: &mut NsTree, mnt: &Mount, how: u32) -> UmountList {
     let mut out = UmountList::new();
     while let Some(p) = set.pop_front() {
         p.set_ns(0);
-        let gone = umount_mnt(&p);
+        let gone = umount_mnt(&p, how);
         out.push_back(p);
         drop(gone);
     }
@@ -1516,14 +1666,53 @@ pub(super) fn change_mountpoint(ns: &mut NsTree, to: &MountRef, mp: MpPtr, m: &M
 }
 
 /// `m` off its parent and mountpoint, out of the mount hash (Linux
-/// __umount_mnt; already off the parent's list), under NAMESPACE_SEM
-/// write: what the links held, to drop after MOUNT_LOCK
-fn umount_mnt(m: &Mount) -> (Option<Weak<Mount>>, Option<Box<Mountpoint>>) {
+/// umount_tree's last loop and __umount_mnt; already off the parent's
+/// list), marked MNT_SYNC_UMOUNT for a synchronous umount, its cover
+/// left if it needs one, under NAMESPACE_SEM write: what the links
+/// held, to drop after MOUNT_LOCK
+fn umount_mnt(m: &Mount, how: u32) -> (Option<Weak<Mount>>, Option<Box<Mountpoint>>) {
     let mut ml = MOUNT_LOCK.write();
+    if how & UMOUNT_SYNC != 0 {
+        m.mnt_flags.fetch_or(MNT_SYNC_UMOUNT, Ordering::SeqCst);
+    }
+    if needs_cover(&ml, m, how) {
+        leave_cover(&mut ml, m);
+    }
     unhash_mnt(&mut ml, m);
     let w = m.take_parent(&mut ml);
     let gone = m.take_mountpoint(&ml).and_then(|mp| put_mp(&mut ml, mp));
     (w, gone)
+}
+
+/// `m`, unmounted with its parent, must leave the mountpoint covered
+/// (Linux needs_cover): not for a synchronous umount (nothing held it),
+/// only when the parent goes too and `m` is locked; under MOUNT_LOCK
+fn needs_cover(ml: &MntHash, m: &Mount, how: u32) -> bool {
+    if how & UMOUNT_SYNC != 0 {
+        return false;
+    }
+    m.parent_in(ml)
+        .is_some_and(|p| p.flags() & MNT_UMOUNT != 0 && m.flags() & MNT_LOCKED != 0)
+}
+
+/// Leave `m`'s cover at its parent before `m` comes off it (Linux
+/// leave_cover): a lookup on the parent at the mountpoint keeps finding
+/// a mount instead of what `m` covered; the cover counts the
+/// mountpoint, which `m` lets go of next. Under MOUNT_LOCK write.
+fn leave_cover(ml: &mut MntHash, m: &Mount) {
+    let (Some(cover), Some(mp)) = (m.mnt_cover.access_mut(ml).take(), m.mp_in(&*ml)) else {
+        return;
+    };
+    // SAFETY: `m` still counts it, under MOUNT_LOCK
+    unsafe { mp.get() }.m_count.fetch_add(1, Ordering::Relaxed);
+    cover.mp.store(mp.0.as_ptr(), Ordering::Relaxed);
+    cover
+        .dentry
+        .store(m.mountpoint_in(&*ml).cast_mut(), Ordering::Release);
+    let p = m.mnt_parent.load(Ordering::Relaxed);
+    // SAFETY: `m` hangs on it (`mp_in` saw the link), so it lives
+    let parent = unsafe { &*p };
+    parent.mnt_covers.add_head(cover, ml);
 }
 
 /// Put the references on an umount's list (Linux namespace_unlock's
@@ -1674,7 +1863,8 @@ pub(super) fn attach_at(ns: &mut NsTree, m: MountRef, at: &Path) {
 /// the original and each copy join it in turn. One that lands where a
 /// mount already is goes under it: that mount moves onto the root of
 /// the topmost mount of the new tree's root (Linux's tucking), taking
-/// its lock along. Under NAMESPACE_SEM write.
+/// its lock along. A copy in a namespace of another user namespace is
+/// locked (lock_mnt_tree). Under NAMESPACE_SEM write.
 fn graft(ns: &mut NsTree, t: MountRef, at: &Path) -> Result<(), KernelError> {
     let source = MountRef::clone(&t);
     // A mountpoint for where a mount tucked under goes (Linux: get
@@ -1707,9 +1897,10 @@ fn graft(ns: &mut NsTree, t: MountRef, at: &Path) -> Result<(), KernelError> {
     // visible (Linux mnt_set_mountpoint)
     source.set_mountpoint(&mut MOUNT_LOCK.write(), &at.mnt, dest.mp());
     // The original first, then the copies newest first (Linux tree_list)
+    let dest_ns = at.mnt.ns();
     for child in core::iter::once(t).chain(copies.into_iter().rev()) {
         let is_source = MountRef::ptr_eq(&child, &source);
-        commit_one(ns, child, is_source, root.mp());
+        commit_one(ns, child, is_source, root.mp(), dest_ns);
     }
     unpin_both(root, dest);
     Ok(())
@@ -1728,7 +1919,13 @@ fn unpin_both(a: MpPin, b: MpPin) {
 /// attach_recursive_mnt's loop over tree_list: __lookup_mnt, then
 /// commit_tree, then a mount found there tucked over `child`'s topmost
 /// overmount at `root_mp`); under NAMESPACE_SEM write
-fn commit_one(ns: &mut NsTree, child: MountRef, is_source: bool, root_mp: MpPtr) {
+fn commit_one(ns: &mut NsTree, child: MountRef, is_source: bool, root_mp: MpPtr, dest_ns: u64) {
+    // Propagated into a namespace of another user namespace (Linux:
+    // its parent's mnt_ns->user_ns not the destination's)
+    let pns = child.parent_in(&*ns).map_or(0, Mount::ns);
+    if pns != dest_ns && !crate::ns::mnt_ns_same_owner(pns, dest_ns) {
+        lock_mnt_tree(ns, &child);
+    }
     let q = {
         let _ml = MOUNT_LOCK.read_excl();
         let p = child.mnt_parent.load(Ordering::Relaxed).cast_const();
@@ -2046,6 +2243,7 @@ impl Mount {
         // (Linux mntput_no_expire's stuck children: out of any namespace,
         // as their doomed parent is, so put by the exact path)
         put_unhung(self.unhang_children());
+        self.drop_covers();
         super::pnode::teardown_prop(self);
         self.put_mountpoint();
         MNT_IDS.free(self.mnt_id);
@@ -2054,6 +2252,25 @@ impl Mount {
         let (root, sb) = unsafe { (self.root.take(), self.sb.take()) };
         drop(root);
         drop(sb);
+    }
+
+    /// Release the covers its submounts left (Linux mntput_no_expire's
+    /// drop_cover): each off the list, freed a grace period later, its
+    /// mountpoint put, one MOUNT_LOCK write section each, the
+    /// mountpoint dropped after it
+    fn drop_covers(&self) {
+        while !self.mnt_covers.is_empty() {
+            let gone = {
+                let mut ml = MOUNT_LOCK.write();
+                let Some(c) = self.mnt_covers.remove_first(|_| true, &mut ml) else {
+                    break;
+                };
+                let mp = NonNull::new(c.item().mp.load(Ordering::Relaxed)).map(MpPtr);
+                c.defer();
+                mp.and_then(|mp| put_mp(&mut ml, mp))
+            };
+            drop(gone);
+        }
     }
 
     /// Unhang every submount (Linux umount_mnt for each) in one
