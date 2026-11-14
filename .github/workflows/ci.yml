@@ -137,10 +137,10 @@ jobs:
 
       # Differential run on Ubuntu's arm64 Linux kernel (kernel .deb comes
       # from apt-get download; apt lists were updated above). KVM or TCG
-      # as above; under TCG the suite needs over 300 s here.
+      # as above; under TCG the suite needs close to 600 s here.
       - name: Boot test on Linux (aarch64)
         id: linux_arm
-        run: make check-linux LINUX_TEST_TIMEOUT=600
+        run: make check-linux LINUX_TEST_TIMEOUT=900
 
       - name: Upload Linux serial log
         if: failure()
