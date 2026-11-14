@@ -526,8 +526,8 @@ pub struct File {
     /// Dentry this file was opened from
     pub dentry: Arc<Dentry>,
 
-    /// Mount this file belongs to (Linux f_path.mnt): a reference, and
-    /// a user of the mount (`Mount::user_get`) until the release
+    /// Mount this file belongs to (Linux f_path.mnt): a reference, which
+    /// makes the mount busy for umount
     mnt: Option<MountRef>,
 
     /// Current file position
@@ -629,18 +629,14 @@ impl File {
     }
 
     /// Create a new file on `dentry` in mount `mnt` (None: an internal
-    /// object), a user of the mount (`Mount::user_get`) so it cannot
-    /// be unmounted while this file is open
+    /// object), whose reference keeps the mount busy for umount while
+    /// this file is open
     pub fn new(
         dentry: Arc<Dentry>,
         mnt: Option<MountRef>,
         flags: u32,
         f_op: &'static dyn FileOps,
     ) -> Self {
-        if let Some(ref m) = mnt {
-            m.user_get();
-        }
-
         Self {
             dentry,
             mnt,
@@ -1069,9 +1065,10 @@ impl File {
         // may run in another process's context)
         super::flock::release_file_locks(self);
 
-        // No longer a user of the mount (Linux __fput's mntput)
+        // A use of the mount ended: an MNT_EXPIRE mark goes (Linux
+        // __fput's mntput)
         if let Some(ref mnt) = self.mnt {
-            mnt.user_put();
+            mnt.clear_expiry();
         }
     }
 

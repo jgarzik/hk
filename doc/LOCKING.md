@@ -2651,8 +2651,7 @@ that must not keep a mount are `Weak` (`Mount.parent`, peer groups,
 legitimize_mnt: an add while in a namespace, else under MOUNT_LOCK's
 locking read, refused once doomed). No put of a mount out of its
 namespace under MOUNT_LOCK: `lookup_mnt` scans its submounts borrowed
-and takes a reference to the match only (Linux __lookup_mnt). Busy is
-a separate count, `Mount.users` (open files, task roots and cwds):
+and takes a reference to the match only (Linux __lookup_mnt).
 
 | Field | Type | Purpose |
 |-------|------|---------|
@@ -2662,7 +2661,6 @@ a separate count, `Mount.users` (open files, task roots and cwds):
 | `Mount.mnt_mounts` | `LockedByEither<OwnedList>` (no lock of its own) | Submounts, each entry a reference to the submount (`MountRef::into_entry`; Linux mnt_mounts, linked through `Mount.mnt_child`): changed only under NAMESPACE_SEM write and `MOUNT_LOCK` both (`attach_mnt`, `detach_mnt`: `&mut NsTree` and `&mut MntHash`), read under either (`Stable`: `&NsTree` from a NAMESPACE_SEM guard, `&MntHash` from `MOUNT_LOCK.read_excl`). Walks step with `next_mnt` (Linux next_mnt: first submount, else the next sibling of the nearest mount up to the walk's root that has one), so no list is copied and no stack is kept |
 | `Mount.mnt_pcp` | per-CPU `AtomicIsize` parts, a cache line each | `MountRef` count (Linux mnt_pcp's mnt_count), summed under `MOUNT_LOCK` write once out of its namespace |
 | `Mount.doomed` | `AtomicBool` | Last reference gone (Linux MNT_DOOMED), set under `MOUNT_LOCK` write by that put |
-| `Mount.users` | `AtomicU64` | Open files, task roots and cwds (`user_get`/`user_put`): nonzero is EBUSY for umount |
 | `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC/READONLY/LOCKED; every write under `MOUNT_LOCK` (remount, reconfigure, pivot_root's MNT_LOCKED), read lock-free (open, exec, statfs) |
 | `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`: Linux attach_mnt and umount_tree under lock_mount_hash; with NAMESPACE_SEM write it owns `mnt_mounts`); under NAMESPACE_SEM, s_umount and (in d_path) RENAME_LOCK; under it only `SuperBlock.s_mounts`, d_path's borrowed `parent`/`mountpoint` reads, and in attach/detach the moved mount's `parent`/`mountpoint` and the mountpoint's `d_lock` (mount count), one at a time; in `lookup_mnt`'s locking read a child's `mountpoint` and then `d_lock`; nothing takes it under a Mount field lock. No mount or mountpoint is dropped under it (`make_rdonly` releases its references, `detach_mnt` the parent's reference to the mount and the mountpoint, after the unlock). The sequence is read lock-free by scoped walks (3.3 Path Traversal) |
 | `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
@@ -2686,10 +2684,16 @@ dropped under any lock. The `sb` and `root` fields (`MntOwned`) are
 released by the teardown while the mount's memory may live on in a
 `try_get`'s brief `Arc` (a refused one never reads them).
 
-**Users (busy):** an open `File` (`File::new` → `user_get`, its
-release → `user_put`) and an `FsStruct`'s root and cwd are users;
-`is_mount_busy()` is true with submounts or `users() > 0`, and
-unmount fails with `EBUSY` then (unless `MNT_DETACH`).
+**Busy:** as Linux do_umount (propagate_mount_busy, do_refcount_check),
+umount sums the count under MOUNT_LOCK's locking read and NAMESPACE_SEM
+write: a mount with submounts or more than its caller's and the tree's
+references (two; a propagated copy: `propagate_umount`'s and the
+tree's) is EBUSY, unless MNT_DETACH; MNT_EXPIRE needs exactly two. An
+open file, a task's root or cwd, any held path counts. /proc mount
+lists hold their references only under NAMESPACE_SEM read (Linux
+m_start), which umount excludes. A put clears an MNT_EXPIRE mark
+(`Path`'s drop, a file's release; Linux mntput) but umount's own
+(`Path::into_mnt_noexpire`, Linux mntput_no_expire).
 
 **Lock Order for Mount Operations:**
 ```

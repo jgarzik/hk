@@ -204,12 +204,6 @@ pub struct Mount {
     /// write by that put
     pub(super) doomed: AtomicBool,
 
-    /// Users: open files, task roots and cwds (`user_get`); one makes
-    /// it busy for umount, unless MNT_DETACH (Linux compares mnt_count
-    /// against the references the tree holds; transient references,
-    /// such as a walk's, do not count here)
-    users: AtomicU64,
-
     /// The deferred teardown's head (Linux mnt_rcu as task_work, or
     /// mnt_llist on delayed_mntput_list)
     pub(super) mnt_task_work: CallbackHead,
@@ -282,7 +276,6 @@ impl Mount {
             devname,
             mnt_pcp,
             doomed: AtomicBool::new(false),
-            users: AtomicU64::new(0),
             mnt_task_work: CallbackHead::new(__cleanup_mnt),
             mnt_instance: crate::util::list::Link::new(),
         }
@@ -402,30 +395,12 @@ impl Mount {
         self.writers.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// A user of the mount begins: an open file, a task's root or cwd;
-    /// it is busy for umount until `user_put`
-    pub fn user_get(&self) {
-        self.users.fetch_add(1, Ordering::Relaxed);
-        // Use clears an MNT_EXPIRE mark (Linux mntput)
-        self.expiry.store(false, Ordering::Relaxed);
-    }
-
     /// A use of the mount ended (Linux mntput): an MNT_EXPIRE mark
     /// goes; read first, so the common case writes nothing
     pub fn clear_expiry(&self) {
         if self.expiry.load(Ordering::Relaxed) {
             self.expiry.store(false, Ordering::Relaxed);
         }
-    }
-
-    /// A user of the mount ended
-    pub fn user_put(&self) {
-        self.users.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// Its users (umount's busy test)
-    pub fn users(&self) -> u64 {
-        self.users.load(Ordering::Relaxed)
     }
 
     /// Get the mount point dentry
@@ -867,21 +842,19 @@ pub mod umount_flags {
     pub const UMOUNT_NOFOLLOW: i32 = 8;
 }
 
-/// A mount is busy for umount: it has submounts or users (open
-/// files, task roots and cwds; Linux do_umount's mnt_get_count against
-/// the tree's own references)
-fn is_mount_busy(mount: &MountRef, s: &impl Stable) -> bool {
-    // Check for child mounts - can't unmount if there are filesystems mounted under us
-    if mount.has_children(s) {
-        return true;
-    }
-
-    if mount.users() > 0 {
-        return true;
-    }
-
-    false
+/// A mount is busy for umount (Linux propagate_mount_busy's
+/// do_refcount_check): it has submounts, or more references than the
+/// `refs` its caller and the tree hold; under MOUNT_LOCK, a racing fast
+/// path makes it approximate, as in Linux
+fn is_mount_busy(mount: &MountRef, s: &impl Stable, refs: isize) -> bool {
+    mount.has_children(s) || mount.mnt_get_count() > refs
 }
+
+/// The references umount's caller and the tree hold on its target
+/// (Linux do_umount's propagate_mount_busy(mnt, 2)): the caller's, the
+/// parent's (a propagated copy's: `propagate_umount`'s list and the
+/// parent's)
+const UMOUNT_REFS: isize = 2;
 
 /// Unmount `mount` (Linux can_umount, do_umount): EINVAL for a mount
 /// of another namespace, a locked one, or an unattached one (the
@@ -907,7 +880,10 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         }
         // Busy first (Linux: mnt_get_count != 2 under lock_mount_hash),
         // then the mark
-        let busy = is_mount_busy(&mount, &*MOUNT_LOCK.read_excl());
+        let busy = {
+            let _ml = MOUNT_LOCK.read_excl();
+            mount.mnt_get_count() != UMOUNT_REFS
+        };
         if busy {
             return Err(KernelError::Busy);
         }
@@ -929,7 +905,12 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
     // The propagated copies go too (Linux propagate_mount_busy,
     // propagate_umount); a busy one makes it all EBUSY
     let copies = super::pnode::propagate_umount(&ns, &mount);
-    if !detach && (is_mount_busy(&mount, &*ns) || copies.iter().any(|c| c.users() > 0)) {
+    let busy = {
+        let ml = MOUNT_LOCK.read_excl();
+        is_mount_busy(&mount, &*ml, UMOUNT_REFS)
+            || copies.iter().any(|c| is_mount_busy(c, &*ml, UMOUNT_REFS))
+    };
+    if !detach && busy {
         return Err(KernelError::Busy);
     }
     // The tree references taken off, put after a grace period by this

@@ -109,6 +109,12 @@ impl Mount {
             .sum()
     }
 
+    /// Its references, summed (Linux mnt_get_count): exact once out of
+    /// its namespace, approximate while fast puts may run
+    pub(super) fn mnt_get_count(&self) -> isize {
+        self.pcp_sum()
+    }
+
     /// It still has a reference (Linux: not MNT_DOOMED)
     pub(super) fn is_live(&self) -> bool {
         !self.doomed.load(Ordering::Acquire)
