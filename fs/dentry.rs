@@ -25,6 +25,7 @@ use crate::util::hlist_bl::BlHead;
 use crate::util::list::{Link, OwnedList, Owner};
 
 use super::inode::Inode;
+use super::mount::{MOUNT_LOCK, Mount, MountRef};
 use super::name::DName;
 use super::path_ref::Path;
 use super::superblock::SuperBlock;
@@ -48,9 +49,16 @@ pub struct DentryFlags {
 /// whoever walks parents and names and needs one consistent picture
 /// (is_subdir, full_path). A scoped walk (RESOLVE_BENEATH /
 /// RESOLVE_IN_ROOT) samples the sequence at its start and gives up
-/// (EAGAIN) if a ".." raced a rename. Spinning, never taken in IRQ
+/// (EAGAIN) if a ".." raced a rename. A locking read excludes other
+/// readers, as Linux read_seqlock_excl. Spinning, never taken in IRQ
 /// context; taken before any d_lock.
-static RENAME_LOCK: crate::sync::SeqRwLock = crate::sync::SeqRwLock::new();
+static RENAME_LOCK: crate::sync::SeqLock = crate::sync::SeqLock::new(());
+
+/// RENAME_LOCK held for reading, as a proof [`Dentry::parent_under`]
+/// borrows from (no other lock's guard passes for it)
+struct RenameRead<'a> {
+    _g: crate::sync::spin::MutexGuard<'a, ()>,
+}
 
 /// Sample the rename sequence (Linux path_init's r_seq)
 pub fn rename_seq_begin() -> u32 {
@@ -418,6 +426,19 @@ impl Dentry {
         self.d_lock.read().parent.clone()
     }
 
+    /// The parent, borrowed while `_r` (RENAME_LOCK read) is held: no
+    /// reference is taken (Linux d_parent under rename_lock). Only
+    /// d_move / d_exchange repoint a dentry in the tree, under the
+    /// write side; `Dentry::add` only re-sets the parent it had; and the
+    /// dentry's own reference keeps its parent alive.
+    fn parent_under<'a>(&'a self, _r: &'a RenameRead<'_>) -> Option<&'a Dentry> {
+        let p = self.d_lock.read().parent.as_ref().map(Arc::as_ptr)?;
+        // SAFETY: as above: while `_r` is held and `self` lives, the
+        // pointer stays this dentry's parent and the `Arc` it holds
+        // keeps it alive
+        Some(unsafe { &*p })
+    }
+
     /// Look up a child dentry by name
     pub fn lookup_child(&self, name: &[u8]) -> Option<Arc<Dentry>> {
         let p = self.d_lock.read();
@@ -508,33 +529,42 @@ impl Prepend {
 
 /// The name of `p` as seen from `root` (Linux prepend_path): climbs
 /// dentry parents and, at a mount's root, to its mountpoint in the
-/// parent mount; one consistent picture under RENAME_LOCK. The bool is
-/// false when the walk ended without meeting `root` (a path outside
-/// the caller's root, or on a detached mount): the name then starts at
-/// whatever root it reached. ENAMETOOLONG past PATH_MAX (its NUL
-/// included), ENOMEM without a buffer.
+/// parent mount; one consistent picture under MOUNT_LOCK (a locking
+/// read: the mount tree's links) and RENAME_LOCK (the dentry tree's).
+/// Like Linux it takes no reference: what it passes is borrowed from
+/// those locks, so nothing is dropped (and no teardown runs) under
+/// them. The bool is false when the walk ended without meeting `root`
+/// (a path outside the caller's root, or on a detached mount): the
+/// name then starts at whatever root it reached. ENAMETOOLONG past
+/// PATH_MAX (its NUL included), ENOMEM without a buffer.
 pub fn try_d_path(p: &Path, root: &Path) -> Result<(Vec<u8>, bool), KernelError> {
     let mut b = Prepend::new()?;
     let reached = {
-        let _r = RENAME_LOCK.read();
-        let (mut mnt, mut d) = (p.mnt.clone(), p.dentry.clone());
+        // Linux prepend_path's order: rename_lock, then mount_lock
+        let r = RenameRead {
+            _g: RENAME_LOCK.read_excl(),
+        };
+        let ml = MOUNT_LOCK.read_excl();
+        let (mut mnt, mut d): (&Mount, &Dentry) = (&p.mnt, &p.dentry);
         loop {
-            if Arc::ptr_eq(&mnt, &root.mnt) && Arc::ptr_eq(&d, &root.dentry) {
+            if core::ptr::eq(mnt, MountRef::as_ptr(&root.mnt))
+                && core::ptr::eq(d, Arc::as_ptr(&root.dentry))
+            {
                 break true;
             }
-            if Arc::ptr_eq(&d, &mnt.root) {
-                match (mnt.get_parent(), mnt.get_mountpoint()) {
-                    (Some(m), Some(mp)) => {
-                        (mnt, d) = (m, mp);
+            if core::ptr::eq(d, Arc::as_ptr(&mnt.root)) {
+                match mnt.up(&ml) {
+                    Some(up) => {
+                        (mnt, d) = up;
                         continue;
                     }
-                    _ => break false,
+                    None => break false,
                 }
             }
-            let Some(parent) = d.get_parent() else {
+            let Some(parent) = d.parent_under(&r) else {
                 break false;
             };
-            b.name(&d)?;
+            b.name(d)?;
             d = parent;
         }
     };
@@ -553,10 +583,12 @@ pub fn d_path(p: &Path, root: &Path) -> (Vec<u8>, bool) {
 pub fn dentry_path(d: &Arc<Dentry>) -> Result<Vec<u8>, KernelError> {
     let mut b = Prepend::new()?;
     {
-        let _r = RENAME_LOCK.read();
-        let mut cur = d.clone();
-        while let Some(p) = cur.get_parent() {
-            b.name(&cur)?;
+        let r = RenameRead {
+            _g: RENAME_LOCK.read_excl(),
+        };
+        let mut cur: &Dentry = d;
+        while let Some(p) = cur.parent_under(&r) {
+            b.name(cur)?;
             cur = p;
         }
     }
@@ -818,7 +850,7 @@ pub fn is_subdir(child: &Arc<Dentry>, ancestor: &Arc<Dentry>) -> bool {
     }
 
     // Walk up the parent chain from child, one picture of the tree
-    let _r = RENAME_LOCK.read();
+    let _r = RENAME_LOCK.read_excl();
     let mut current = child.get_parent();
     while let Some(parent) = current {
         if Arc::ptr_eq(&parent, ancestor) {

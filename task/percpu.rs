@@ -21,7 +21,7 @@ use crate::arch::CurrentArch;
 use crate::arch::{ContextOps, CpuOps, FrameAlloc, PerCpuOps, SchedArch, UserModeOps, UserRegs};
 use crate::cpu::PerCpu;
 use crate::printkln;
-use crate::signal::notify::{Entry, Told, Zombie, notify};
+use crate::signal::notify::{Told, Zombie, notify};
 use crate::sync::IrqSpinlock;
 use crate::sync::spin::RwLock;
 use crate::task::sched::{self, Class, ClassQueues};
@@ -819,6 +819,49 @@ impl GlobalTaskTable {
             },
             f,
         )
+    }
+
+    /// [`GlobalTaskTable::collect_pgrp`] with fallible allocation, for a
+    /// caller under a named GFP (a SIGIO sent in atomic context): None
+    /// without memory
+    pub fn try_collect_pgrp<T>(
+        pg: &crate::task::pid::Pid,
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Option<Vec<T>> {
+        let walk = |table: &GlobalTaskTable, visit: &mut dyn FnMut(&TaskView<'_>) -> bool| {
+            for t in table.pgrp(pg) {
+                if !visit(&t) {
+                    break;
+                }
+            }
+        };
+        let mut cap = 1;
+        walk(&TASKLIST.read(), &mut |_| {
+            cap += 1;
+            true
+        });
+        loop {
+            let mut v = Vec::new();
+            v.try_reserve(cap).ok()?;
+            let mut full = false;
+            {
+                let table = TASKLIST.read();
+                walk(&table, &mut |t| {
+                    if v.len() == v.capacity() {
+                        full = true;
+                        return false;
+                    }
+                    if let Some(x) = f(&table, t) {
+                        v.push(x);
+                    }
+                    true
+                });
+            }
+            if !full {
+                return Some(v);
+            }
+            cap *= 2;
+        }
     }
 
     /// What `f` picks of each thread of every process of group `pg`,
@@ -1768,7 +1811,7 @@ pub fn reap_zombie_child_times(
         pgid,
         ns: crate::task::pid::current_pid_ns(),
     };
-    let (report, done) = with_entry(|table, entry| wait_zombie(table, entry, &w))?;
+    let (report, done) = wait_zombie(&mut TASKLIST.write(), &w)?;
     done.finish();
     Some(report)
 }
@@ -1840,21 +1883,14 @@ fn ptrace_reparented(t: &TaskView<'_>) -> bool {
 
 /// [`reap_zombie_child_times`]'s TASKLIST write section: the zombie
 /// `w` finds is reported and, unless WNOWAIT, released, a traced
-/// thread as by [`unhash_thread`]; `Err(z)`: an entry for zombie `z`'s
-/// notice is needed first
-fn wait_zombie(
-    table: &mut GlobalTaskTable,
-    entry: &mut Entry,
-    w: &Wait,
-) -> Result<Option<(WaitReport, Unhashed)>, Zombie> {
+/// thread as by [`unhash_thread`]
+fn wait_zombie(table: &mut GlobalTaskTable, w: &Wait) -> Option<(WaitReport, Unhashed)> {
     let found = {
         let tb: &GlobalTaskTable = table;
         tb.find(|t| reapable(tb, t, w))
             .map(|z| (zombie_report(tb, &z), reap_kind(&z)))
     };
-    let Some((report, kind)) = found else {
-        return Ok(None);
-    };
+    let (report, kind) = found?;
     // Numbered for the waiter while the zombie is still listed (Linux
     // wait_task_zombie: task_pid_vnr)
     let tid = report.0;
@@ -1866,26 +1902,23 @@ fn wait_zombie(
     );
     // WNOWAIT (waitid): report the zombie, leave it waitable
     if w.wflags & super::wait_options::WNOWAIT != 0 {
-        return Ok(Some((report, Unhashed::default())));
+        return Some((report, Unhashed::default()));
     }
     if kind == Reap::Traced {
         // Its real parent is told now, as if it had never been traced
         // (Linux wait_task_zombie: EXIT_TRACE, ptrace_unlink,
         // do_notify_parent); the tracer's process gets no child times
         let z = Zombie::Detached(tid);
-        if !entry.fits(table, z) {
-            return Err(z);
-        }
         if let Some(mut v) = table.get_mut(tid) {
             crate::task::ptrace::ptrace_unlink(&mut v);
         }
-        let (told, gone) = tell(table, Some(z), entry);
+        let (told, gone) = tell(table, Some(z));
         let done = Unhashed {
             thread: None,
             told,
             gone,
         };
-        return Ok(Some((report, done)));
+        return Some((report, done));
     }
     if kind == Reap::Thread {
         // A traced thread: its tracer releases it (Linux
@@ -1893,25 +1926,20 @@ fn wait_zombie(
         let z = table
             .get(tid)
             .and_then(|t| thread_teller(table, t.task.pid, tid));
-        if let Some(z) = z
-            && !entry.fits(table, z)
-        {
-            return Err(z);
-        }
-        return Ok(Some((report, unhash_thread(table, tid, z, entry))));
+        return Some((report, unhash_thread(table, tid, z)));
     }
     // The reaper's cutime/cstime
     if let Some(s) = table.view(&current()).and_then(|t| t.signal.clone()) {
         s.add_child_times((report.2, report.3));
     }
     let gone = reap_locked(table, tid);
-    Ok(Some((
+    Some((
         report,
         Unhashed {
             gone,
             ..Unhashed::default()
         },
-    )))
+    ))
 }
 
 /// Zombie `z`'s wait report `(tid, status, utime, stime)`: a leader's
@@ -2912,23 +2940,21 @@ fn forget_original_parent() {
     crate::task::ptrace::exit_ptrace();
     let me = task_ref(&current());
     crate::task::pidns::find_child_reaper(&me);
-    // Room for every child first: nothing allocates under TASKLIST
+    // Room for every child first: the moved list grows outside TASKLIST
+    // (only a notice's queue entry is made under it, GFP_ATOMIC)
     let mut moved = Vec::new();
-    let mut entry = Entry::default();
     loop {
         let n = TASKLIST.read().view(&me).map_or(0, |t| t.children.len());
         moved.reserve(n + 1);
-        match reparent_children(&me, &mut moved, &mut entry) {
+        match reparent_children(&me, &mut moved) {
             Moved::All => break,
             Moved::Full => {}
-            Moved::Entry(reaper) => entry = Entry::parent(&reaper),
             Moved::Told(told, gone) => {
                 told.finish();
                 release(gone);
             }
         }
     }
-    drop(entry);
     // Then, with TASKLIST dropped (Linux forget_original_parent): each
     // moved child's threads get their pdeath_signal, from this task
     for c in &moved {
@@ -2948,18 +2974,15 @@ enum Moved {
     All,
     /// `moved` has no room for the next
     Full,
-    /// The next is a zombie its new parent is told of: an entry for
-    /// that parent is needed first
-    Entry(TaskRef),
     /// A zombie moved and its new parent told (it may be released)
     Told(Told, Option<Reaped>),
 }
 
 /// Hand `me`'s children to their new parent ([`find_reaper`]). A
 /// zombie whose group is gone moving to another process tells its new
-/// parent in the same TASKLIST write section (Linux reparent_leader),
-/// with `entry`; one such move ends the pass.
-fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>, entry: &mut Entry) -> Moved {
+/// parent in the same TASKLIST write section (Linux reparent_leader);
+/// one such move ends the pass.
+fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>) -> Moved {
     let mut table = TASKLIST.write();
     if table.view(me).is_none_or(|t| t.children.is_empty()) {
         return Moved::All;
@@ -2982,13 +3005,10 @@ fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>, entry: &mut Entry) 
             return Moved::All;
         };
         let tells = other && leader_waits(&table, c.pid);
-        if tells && !entry.fits_parent(&table, &reaper) {
-            return Moved::Entry(reaper);
-        }
         table.adopt(&c, &reaper, other);
         moved.push(c.clone());
         if tells {
-            let told = notify(&table, Zombie::Leader(c.pid), core::mem::take(entry));
+            let told = notify(&table, Zombie::Leader(c.pid));
             let gone = if told.autoreap {
                 reap_locked(&mut table, c.pid)
             } else {
@@ -3042,20 +3062,6 @@ pub(crate) fn live_thread(table: &GlobalTaskTable, pid: Pid) -> Option<TaskRef> 
         .map(|t| task_ref(t.task))
 }
 
-/// Run `f` under TASKLIST's write lock with a notice entry; while `f`
-/// asks for one for a zombie (`Err(z)`), the lock is dropped, the
-/// entry made and `f` run again. The entry left is freed after the lock.
-fn with_entry<R>(mut f: impl FnMut(&mut GlobalTaskTable, &mut Entry) -> Result<R, Zombie>) -> R {
-    let mut entry = Entry::default();
-    loop {
-        let r = f(&mut TASKLIST.write(), &mut entry);
-        match r {
-            Ok(r) => return r,
-            Err(z) => entry = Entry::child(z),
-        }
-    }
-}
-
 /// The exiting task becomes a zombie with wait status `status` and
 /// tells its parent or tracer in the same TASKLIST write section (Linux
 /// exit_notify: EXIT_ZOMBIE and do_notify_parent under tasklist_lock),
@@ -3070,22 +3076,15 @@ fn with_entry<R>(mut f: impl FnMut(&mut GlobalTaskTable, &mut Entry) -> Result<R
 // added to exit_current's frame for the rest of the exit
 #[inline(never)]
 fn exit_notify(tid: Tid, status: i32) {
-    if let Some(done) = with_entry(|table, entry| exit_locked(table, entry, tid, status)) {
+    let done = exit_locked(&mut TASKLIST.write(), tid, status);
+    if let Some(done) = done {
         done.finish();
     }
 }
 
-/// [`exit_notify`]'s TASKLIST write section for task `tid`; `Err(z)`:
-/// an entry for zombie `z`'s notice is needed first
-fn exit_locked(
-    table: &mut GlobalTaskTable,
-    entry: &mut Entry,
-    tid: Tid,
-    status: i32,
-) -> Result<Option<Unhashed>, Zombie> {
-    let Some(t) = table.get(tid) else {
-        return Ok(None);
-    };
+/// [`exit_notify`]'s TASKLIST write section for task `tid`
+fn exit_locked(table: &mut GlobalTaskTable, tid: Tid, status: i32) -> Option<Unhashed> {
+    let t = table.get(tid)?;
     let (pid, traced, leader) = (t.task.pid, t.ptrace != 0, t.leader);
     // A traced task stays for its tracer, a leader for its parent; an
     // untraced thread goes now
@@ -3095,11 +3094,6 @@ fn exit_locked(
     } else {
         thread_teller(table, pid, tid)
     };
-    if let Some(z) = teller
-        && !entry.fits(table, z)
-    {
-        return Err(z);
-    }
     if let Some(mut t) = table.get_mut(tid) {
         t.exit_code = status;
         t.state = TaskState::Zombie(status);
@@ -3109,14 +3103,14 @@ fn exit_locked(
         // do_notify_pidfd for an untraced sub-thread); its removal
         // wakes them again
         notify_pidfd(table, tid);
-        return Ok(Some(unhash_thread(table, tid, teller, entry)));
+        return Some(unhash_thread(table, tid, teller));
     }
-    let (told, gone) = tell(table, teller, entry);
-    Ok(Some(Unhashed {
+    let (told, gone) = tell(table, teller);
+    Some(Unhashed {
         thread: None,
         told,
         gone,
-    }))
+    })
 }
 
 /// What a TASKLIST write section that released zombies leaves for
@@ -3146,18 +3140,14 @@ impl Unhashed {
     }
 }
 
-/// Zombie `z`'s notice, if any, sent with `entry` (checked by
-/// [`Entry::fits`] in this section); a zombie its parent does not wait
-/// for is taken out of the list (autoreap)
-fn tell(
-    table: &mut GlobalTaskTable,
-    z: Option<Zombie>,
-    entry: &mut Entry,
-) -> (Option<Told>, Option<Reaped>) {
+/// Zombie `z`'s notice, if any, its queue entry made in this section
+/// (GFP_ATOMIC, Linux do_notify_parent); a zombie its parent does not
+/// wait for is taken out of the list (autoreap)
+fn tell(table: &mut GlobalTaskTable, z: Option<Zombie>) -> (Option<Told>, Option<Reaped>) {
     let Some(z) = z else {
         return (None, None);
     };
-    let told = notify(table, z, core::mem::take(entry));
+    let told = notify(table, z);
     let gone = if told.autoreap {
         reap_locked(table, z.tid())
     } else {
@@ -3169,14 +3159,9 @@ fn tell(
 /// Thread `tid` (not a leader) leaves the task list (Linux
 /// release_task); `z`, from [`thread_teller`] in this section, is its
 /// zombie leader's notice if it was the last thread
-fn unhash_thread(
-    table: &mut GlobalTaskTable,
-    tid: Tid,
-    z: Option<Zombie>,
-    entry: &mut Entry,
-) -> Unhashed {
+fn unhash_thread(table: &mut GlobalTaskTable, tid: Tid, z: Option<Zombie>) -> Unhashed {
     let thread = table.remove(tid);
-    let (told, gone) = tell(table, z, entry);
+    let (told, gone) = tell(table, z);
     Unhashed { thread, told, gone }
 }
 
@@ -3194,21 +3179,19 @@ fn thread_teller(table: &GlobalTaskTable, pid: Pid, tid: Tid) -> Option<Zombie> 
 /// parent as if never traced, or, if that is `me`'s own process, is
 /// released if that process does not wait for children
 pub fn detach_zombies(me: &Task) {
-    while let Some(done) = with_entry(|table, entry| detach_zombie(table, entry, me)) {
+    loop {
+        let done = detach_zombie(&mut TASKLIST.write(), me);
+        let Some(done) = done else {
+            break;
+        };
         done.finish();
     }
 }
 
 /// [`detach_zombies`]'s TASKLIST write section for one zombie `me`
-/// traces; `Err(z)`: an entry for zombie `z`'s notice is needed first
-fn detach_zombie(
-    table: &mut GlobalTaskTable,
-    entry: &mut Entry,
-    me: &Task,
-) -> Result<Option<Unhashed>, Zombie> {
-    let Some((tid, pid, leader, ppid)) = traced_zombie(table, me) else {
-        return Ok(None);
-    };
+/// traces
+fn detach_zombie(table: &mut GlobalTaskTable, me: &Task) -> Option<Unhashed> {
+    let (tid, pid, leader, ppid) = traced_zombie(table, me)?;
     let (z, dead) = if !leader {
         (thread_teller(table, pid, tid), true)
     } else if group_pending(table, pid, &[pid]) {
@@ -3221,26 +3204,21 @@ fn detach_zombie(
             crate::signal::notify::ignoring_children(table, me.pid),
         )
     };
-    if let Some(z) = z
-        && !entry.fits(table, z)
-    {
-        return Err(z);
-    }
     if let Some(mut v) = table.get_mut(tid) {
         crate::task::ptrace::ptrace_unlink(&mut v);
     }
     if !leader {
-        return Ok(Some(unhash_thread(table, tid, z, entry)));
+        return Some(unhash_thread(table, tid, z));
     }
-    let (told, mut gone) = tell(table, z, entry);
+    let (told, mut gone) = tell(table, z);
     if dead {
         gone = reap_locked(table, tid);
     }
-    Ok(Some(Unhashed {
+    Some(Unhashed {
         thread: None,
         told,
         gone,
-    }))
+    })
 }
 
 /// A zombie `me` traces, a leader first: its tid, pid, whether it

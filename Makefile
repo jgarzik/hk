@@ -278,14 +278,17 @@ check-arm: $(call nobuild,build-arm vfat-image disk-image)
 	fi
 
 # Differential test: boot_tester as init on a real Linux kernel (native arch)
-# Bounds hangs only; emulated aarch64 Linux takes ~150s, more in parallel
+# Bounds hangs only
 LINUX_TEST_TIMEOUT ?= 300
 check-linux: $(call nobuild,disk-image)
 	./tools/linux-boot-tester.sh -T $(LINUX_TEST_TIMEOUT)
 
-# Same, aarch64 Linux emulated on any host (for local iteration on x86)
+# Same, aarch64 Linux emulated on any host (for local iteration on x86):
+# under TCG the suite takes close to 300 s alone, more in parallel (the
+# gate's boots), so it gets CI's bound
+LINUX_ARM_TEST_TIMEOUT ?= 900
 check-linux-arm: $(call nobuild,disk-image)
-	./tools/linux-boot-tester.sh -a aarch64 -T $(LINUX_TEST_TIMEOUT)
+	./tools/linux-boot-tester.sh -a aarch64 -T $(LINUX_ARM_TEST_TIMEOUT)
 
 info-arm: build-arm
 	@echo "ARM Kernel: $(KERNEL_ARM)"

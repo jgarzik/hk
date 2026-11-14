@@ -18,7 +18,7 @@ use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
 use super::iov_iter::{IovDest, IovSource};
-use super::mount::Mount;
+use super::mount::MountRef;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLHUP, PollTable};
 use crate::sync::IrqSpinlock;
 use crate::task::task_work::{CallbackHead, CbAdapter, Twa, task_work_add};
@@ -520,15 +520,15 @@ pub trait FileOps: Send + Sync {
 ///
 /// This struct mirrors Linux's `struct file`. It holds references to:
 /// - The dentry (f_path.dentry in Linux)
-/// - The mount (f_path.mnt in Linux) - increments mnt_count
+/// - The mount (f_path.mnt in Linux), a user of it while open
 /// - File position and operations
 pub struct File {
     /// Dentry this file was opened from
     pub dentry: Arc<Dentry>,
 
-    /// Mount this file belongs to (like Linux f_path.mnt)
-    /// Holds a reference via mntget() - decremented on drop via mntput()
-    mnt: Option<Arc<Mount>>,
+    /// Mount this file belongs to (Linux f_path.mnt): a reference, which
+    /// makes the mount busy for umount
+    mnt: Option<MountRef>,
 
     /// Current file position
     pos: AtomicU64,
@@ -629,18 +629,14 @@ impl File {
     }
 
     /// Create a new file on `dentry` in mount `mnt` (None: an internal
-    /// object), counted in the mount's mnt_count (mntget) so it cannot
-    /// be unmounted while this file is open
+    /// object), whose reference keeps the mount busy for umount while
+    /// this file is open
     pub fn new(
         dentry: Arc<Dentry>,
-        mnt: Option<Arc<Mount>>,
+        mnt: Option<MountRef>,
         flags: u32,
         f_op: &'static dyn FileOps,
     ) -> Self {
-        if let Some(ref m) = mnt {
-            m.mntget();
-        }
-
         Self {
             dentry,
             mnt,
@@ -710,7 +706,7 @@ impl File {
     /// its pseudo filesystem's mount
     pub fn new_anon(
         dentry: Arc<Dentry>,
-        mnt: Option<Arc<Mount>>,
+        mnt: Option<MountRef>,
         flags: u32,
         f_op: &'static dyn FileOps,
         private: Arc<dyn core::any::Any + Send + Sync>,
@@ -844,16 +840,12 @@ impl File {
         self.f_op
     }
 
-    /// Set or clear O_ASYNC: only `io::fasync::fasync_helper`, with the
-    /// list change, so the flag means "on a fasync list" (Linux
-    /// fasync_insert_entry under f_lock)
-    pub(crate) fn set_fasync_flag(&self, on: bool) {
-        let mut fl = self.f_lock.lock();
-        if on {
-            *fl |= flags::O_ASYNC;
-        } else {
-            *fl &= !flags::O_ASYNC;
-        }
+    /// The file's flags under `f_lock` (Linux filp->f_lock), for
+    /// `io::fasync::fasync_helper`, which sets or clears O_ASYNC with the
+    /// list change under it, so the flag means "on a fasync list" (Linux
+    /// fasync_insert_entry / fasync_remove_entry)
+    pub(crate) fn f_lock(&self) -> crate::sync::spin::MutexGuard<'_, u32> {
+        self.f_lock.lock()
     }
 
     /// Turn O_ASYNC on or off for descriptor `fd` (F_SETFL, FIOASYNC)
@@ -1069,10 +1061,10 @@ impl File {
         // may run in another process's context)
         super::flock::release_file_locks(self);
 
-        // Decrement mount reference count via mntput
-        // This mirrors Linux's fput() -> mntput()
+        // A use of the mount ended: an MNT_EXPIRE mark goes (Linux
+        // __fput's mntput)
         if let Some(ref mnt) = self.mnt {
-            mnt.mntput();
+            mnt.clear_expiry();
         }
     }
 

@@ -14,6 +14,7 @@ pub mod kalloc;
 pub mod klist;
 pub mod kmem;
 pub mod list;
+pub mod percpu_alloc;
 pub mod percpu_counter;
 pub mod pod;
 pub mod rbtree;

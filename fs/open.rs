@@ -27,7 +27,7 @@ use crate::util::error::KernelResult;
 /// write+search on the parent, the mode gets the umask and SGID
 /// stripping, the owner comes from init_owner
 fn create_in(
-    mnt: &Arc<super::mount::Mount>,
+    mnt: &super::mount::MountRef,
     parent: &Arc<Dentry>,
     name: &[u8],
     mode: u32,

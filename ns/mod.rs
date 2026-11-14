@@ -81,7 +81,18 @@ pub const CLONE_NS_FLAGS: u64 = CLONE_NEWNS
 // Mount Namespace
 // ============================================================================
 
-use crate::fs::mount::Mount;
+use crate::fs::mount::{Mount, MountRef};
+
+impl Drop for MntNamespace {
+    /// Linux put_mnt_ns: the tree is unmounted whole (sleeps: the last
+    /// reference goes in thread context with nothing held, an exit or
+    /// unshare/setns, or a namespace file's deferred release)
+    fn drop(&mut self) {
+        if let Some(root) = self.root.get_mut().take() {
+            crate::fs::mount::put_mnt_ns(root);
+        }
+    }
+}
 
 /// Next mount namespace id (Linux ns_common.ns_id): never reused, so
 /// a mount that outlived its namespace matches no other
@@ -95,7 +106,7 @@ pub struct MntNamespace {
     /// Never-reused id, what `Mount::mnt_ns` names (Linux mnt_ns)
     pub id: u64,
     /// Root mount of this namespace
-    pub root: RwLock<Option<Arc<Mount>>>,
+    pub root: RwLock<Option<MountRef>>,
     /// Its inode number (Linux ns.inum)
     pub inum: inum::Inum,
 }
@@ -128,7 +139,7 @@ impl MntNamespace {
     /// pwd to the copies of their mounts (Linux copy_mnt_ns)
     pub fn clone_ns(&self, fs: Option<&crate::fs::FsStruct>) -> KernelResult<Arc<Self>> {
         let new_ns = Self::new()?;
-        let old_root = self.root.read().clone();
+        let old_root = self.get_root();
         if let Some(old_root) = old_root {
             let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id);
             *new_ns.root.write() = Some(new_root);
@@ -139,16 +150,21 @@ impl MntNamespace {
         Ok(new_ns)
     }
 
-    /// Set the root mount
-    pub fn set_root(&self, mount: Arc<Mount>) {
-        // The old root goes after the unlock (`Mount`: never the last
-        // reference under a spin lock)
-        let old = self.root.write().replace(mount);
-        drop(old);
+    /// Set the root mount, once (Linux: a namespace's root never
+    /// changes): the tree's reference to it; EBUSY if one is set
+    pub fn set_root(&self, mount: MountRef) -> KernelResult<()> {
+        let mut root = self.root.write();
+        if root.is_some() {
+            // A live root is never replaced (Linux: set once): its
+            // tree's references would leave by the fast path, uncounted
+            return Err(crate::util::error::KernelError::Busy);
+        }
+        *root = Some(mount);
+        Ok(())
     }
 
     /// Get the root mount
-    pub fn get_root(&self) -> Option<Arc<Mount>> {
+    pub fn get_root(&self) -> Option<MountRef> {
         self.root.read().clone()
     }
 

@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::dentry::Dentry;
-use super::mount::{Mount, NsTree, attach_mnt, clone_mnt, commit_tree, copy_below, walk};
+use super::mount::{Mount, MountRef, NsTree, attach_mnt, clone_mnt, commit_tree, copy_below, walk};
 use super::path_ref::Path;
 
 /// A peer group: its members, and the mounts it is master of
@@ -42,9 +42,9 @@ pub enum Prop {
     Unbindable,
 }
 
-fn live(v: &mut Vec<Weak<Mount>>) -> Vec<Arc<Mount>> {
-    v.retain(|w| w.strong_count() != 0);
-    v.iter().filter_map(Weak::upgrade).collect()
+fn live(v: &mut Vec<Weak<Mount>>) -> Vec<MountRef> {
+    v.retain(MountRef::is_live);
+    v.iter().filter_map(MountRef::try_get).collect()
 }
 
 /// The lowest free group id: a used one with no live member and no
@@ -62,7 +62,7 @@ fn alloc_group() -> u32 {
 }
 
 /// Live members of group `gid`
-pub fn peers(gid: u32) -> Vec<Arc<Mount>> {
+pub fn peers(gid: u32) -> Vec<MountRef> {
     GROUPS
         .lock()
         .get_mut(&gid)
@@ -70,7 +70,7 @@ pub fn peers(gid: u32) -> Vec<Arc<Mount>> {
 }
 
 /// Live slaves of group `gid`
-fn slaves(gid: u32) -> Vec<Arc<Mount>> {
+fn slaves(gid: u32) -> Vec<MountRef> {
     GROUPS
         .lock()
         .get_mut(&gid)
@@ -78,38 +78,38 @@ fn slaves(gid: u32) -> Vec<Arc<Mount>> {
 }
 
 /// Put `m` in group `gid` (0: none)
-fn join(m: &Arc<Mount>, gid: u32) {
+fn join(m: &MountRef, gid: u32) {
     let old = m.group.swap(gid, Ordering::SeqCst);
     let mut g = GROUPS.lock();
     if let Some(grp) = g.get_mut(&old) {
         grp.members
-            .retain(|w| !core::ptr::eq(w.as_ptr(), Arc::as_ptr(m)));
+            .retain(|w| !core::ptr::eq(w.as_ptr(), MountRef::as_ptr(m)));
     }
     if gid != 0 {
         let grp = g.entry(gid).or_default();
-        grp.members.push(Arc::downgrade(m));
+        grp.members.push(MountRef::downgrade(m));
         grp.used = true;
     }
 }
 
 /// Make `m` a slave of group `gid` (0: of none)
-fn set_master(m: &Arc<Mount>, gid: u32) {
+fn set_master(m: &MountRef, gid: u32) {
     let old = m.master.swap(gid, Ordering::SeqCst);
     let mut g = GROUPS.lock();
     if let Some(grp) = g.get_mut(&old) {
         grp.slaves
-            .retain(|w| !core::ptr::eq(w.as_ptr(), Arc::as_ptr(m)));
+            .retain(|w| !core::ptr::eq(w.as_ptr(), MountRef::as_ptr(m)));
     }
     if gid != 0 {
         let grp = g.entry(gid).or_default();
-        grp.slaves.push(Arc::downgrade(m));
+        grp.slaves.push(MountRef::downgrade(m));
         grp.used = true;
     }
 }
 
 /// `copy` takes `orig`'s place in propagation: a peer of its group and
 /// a slave of its master (Linux clone_mnt without CL_PRIVATE)
-pub fn clone_prop(orig: &Mount, copy: &Arc<Mount>) {
+pub fn clone_prop(orig: &Mount, copy: &MountRef) {
     let (g, m) = (
         orig.group.load(Ordering::SeqCst),
         orig.master.load(Ordering::SeqCst),
@@ -124,7 +124,7 @@ pub fn clone_prop(orig: &Mount, copy: &Arc<Mount>) {
 
 /// Every mount of the tree at `m` gets a peer group if it has none
 /// (Linux invent_group_ids before attaching under a shared mount)
-pub fn invent_groups(ns: &NsTree, m: &Arc<Mount>) {
+pub fn invent_groups(ns: &NsTree, m: &MountRef) {
     for t in walk(m, ns) {
         if t.group.load(Ordering::SeqCst) == 0 {
             join(&t, alloc_group());
@@ -135,12 +135,12 @@ pub fn invent_groups(ns: &NsTree, m: &Arc<Mount>) {
 /// Linux do_make_slave: a mount with peers leaves them and becomes
 /// their slave; the last peer of a group hands the group's slaves to
 /// its own master (or frees them) and the group ends
-fn make_slave(m: &Arc<Mount>) {
+fn make_slave(m: &MountRef) {
     let g = m.group.load(Ordering::SeqCst);
     if g == 0 {
         return;
     }
-    let others = peers(g).into_iter().any(|p| !Arc::ptr_eq(&p, m));
+    let others = peers(g).into_iter().any(|p| !MountRef::ptr_eq(&p, m));
     join(m, 0);
     if others {
         set_master(m, g);
@@ -154,7 +154,7 @@ fn make_slave(m: &Arc<Mount>) {
 }
 
 /// Linux change_mnt_propagation
-pub fn change_propagation(m: &Arc<Mount>, p: Prop) {
+pub fn change_propagation(m: &MountRef, p: Prop) {
     if p == Prop::Shared {
         // Shared ends unbindable (Linux set_mnt_shared: T_SHARED_MASK)
         m.set_unbindable(false);
@@ -172,7 +172,7 @@ pub fn change_propagation(m: &Arc<Mount>, p: Prop) {
 
 /// Copies of the tree at `src`, set up for propagation by `prop(orig,
 /// copy)`, with the same shape (Linux copy_tree for propagate_one)
-fn copy_prop(ns: &mut NsTree, src: &Arc<Mount>, prop: &dyn Fn(&Mount, &Arc<Mount>)) -> Arc<Mount> {
+fn copy_prop(ns: &mut NsTree, src: &MountRef, prop: &dyn Fn(&Mount, &MountRef)) -> MountRef {
     let top = clone_mnt(src, src.root.clone());
     prop(src, &top);
     copy_below(ns, src, &top, |k| {
@@ -196,33 +196,32 @@ fn visible(m: &Mount, d: &Arc<Dentry>) -> bool {
 /// `dest`: copy it to every peer of `dest` (as peers) and down the
 /// slave groups (as slaves; among shared slaves, as a new peer group)
 /// (Linux propagate_mnt)
-pub fn propagate_mnt(ns: &mut NsTree, dest: &Arc<Mount>, d: &Arc<Dentry>, src: &Arc<Mount>) {
+pub fn propagate_mnt(ns: &mut NsTree, dest: &MountRef, d: &Arc<Dentry>, src: &MountRef) {
     let g = dest.group.load(Ordering::SeqCst);
     if g == 0 {
         return;
     }
     for p in peers(g) {
-        if !Arc::ptr_eq(&p, dest) && visible(&p, d) {
+        if !MountRef::ptr_eq(&p, dest) && visible(&p, d) {
             let c = copy_prop(ns, src, &|o, c| clone_prop(o, c));
-            attach_mnt(ns, &c, &Path::new(p, d.clone()));
+            attach_mnt(ns, c.clone(), &Path::new(p, d.clone()));
             commit_tree(ns, &c);
         }
     }
     let up: BTreeMap<usize, u32> = walk(src, &*ns)
-        .map(|m| (Arc::as_ptr(&m) as usize, m.group.load(Ordering::SeqCst)))
+        .map(|m| {
+            (
+                MountRef::as_ptr(&m) as usize,
+                m.group.load(Ordering::SeqCst),
+            )
+        })
         .collect();
     to_slaves(ns, g, d, src, &up);
 }
 
 /// Copies for the slaves of group `g`; `up` maps each mount of the
 /// source tree to the group its copies here are slaves of
-fn to_slaves(
-    ns: &mut NsTree,
-    g: u32,
-    d: &Arc<Dentry>,
-    src: &Arc<Mount>,
-    up: &BTreeMap<usize, u32>,
-) {
+fn to_slaves(ns: &mut NsTree, g: u32, d: &Arc<Dentry>, src: &MountRef, up: &BTreeMap<usize, u32>) {
     let mut seen = BTreeSet::new();
     for s in slaves(g) {
         let sg = s.group.load(Ordering::SeqCst);
@@ -242,7 +241,7 @@ fn to_slaves(
                     join(c, ng);
                 }
             });
-            attach_mnt(ns, &c, &Path::new(m.clone(), d.clone()));
+            attach_mnt(ns, c.clone(), &Path::new(m.clone(), d.clone()));
             commit_tree(ns, &c);
         }
         let new = new.into_inner();
@@ -254,7 +253,7 @@ fn to_slaves(
 
 /// Every mount events in group `g` reach: its members and, down the
 /// slave groups, theirs
-fn reach(g: u32) -> Vec<Arc<Mount>> {
+fn reach(g: u32) -> Vec<MountRef> {
     let mut out = peers(g);
     let mut seen = BTreeSet::from([g]);
     let mut todo = alloc::vec![g];
@@ -276,7 +275,7 @@ fn reach(g: u32) -> Vec<Arc<Mount>> {
 /// mount its parent's events reach, the mount of `m`'s filesystem at
 /// the same place, unless something is mounted on it (Linux
 /// propagate_umount: such a copy stays)
-pub fn propagate_umount(ns: &NsTree, m: &Arc<Mount>) -> Vec<Arc<Mount>> {
+pub fn propagate_umount(ns: &NsTree, m: &MountRef) -> Vec<MountRef> {
     let (Some(parent), Some(mp)) = (m.get_parent(), m.get_mountpoint()) else {
         return Vec::new();
     };
@@ -286,12 +285,12 @@ pub fn propagate_umount(ns: &NsTree, m: &Arc<Mount>) -> Vec<Arc<Mount>> {
     }
     let mut out = Vec::new();
     for t in reach(g) {
-        if Arc::ptr_eq(&t, &parent) {
+        if MountRef::ptr_eq(&t, &parent) {
             continue;
         }
         out.extend(t.kids(ns).filter(|c| {
-            !Arc::ptr_eq(c, m)
-                && Arc::ptr_eq(&c.sb, &m.sb)
+            !MountRef::ptr_eq(c, m)
+                && Arc::ptr_eq(&*c.sb, &*m.sb)
                 && c.get_mountpoint().is_some_and(|x| Arc::ptr_eq(&x, &mp))
                 && !c.has_children(ns)
         }));

@@ -16,6 +16,10 @@
 //!   not keep it mounted: umount succeeds, and each watch reads
 //!   IN_UNMOUNT (with IN_ISDIR for the directory), then IN_IGNORED, and
 //!   is gone (Linux fsnotify_sb_delete)
+//! - INOTIFY_MNTNS_EXIT: a mount namespace's last task exits: its whole
+//!   tree is unmounted (Linux put_mnt_ns, umount_tree), so a watch on a
+//!   file of a ramfs only that namespace had mounted reads IN_UNMOUNT,
+//!   then IN_IGNORED, by the time wait4 reaps the task
 //! - INOTIFY_DELETE_SELF: unlinking a watched file's last name gives
 //!   IN_DELETE_SELF then IN_IGNORED; for a file still open, only once
 //!   it is closed (Linux dentry_unlink_inode -> fsnotify_inoderemove)
@@ -35,6 +39,7 @@ pub fn run_tests() {
     test_inotify_max_user_watches();
     test_inotify_cross_fs();
     test_inotify_unmount();
+    test_inotify_mntns_exit();
     test_inotify_delete_self();
 }
 
@@ -132,6 +137,65 @@ fn unmount(fd: i32, mp: &[u8]) -> crate::harness::R {
     check(b"file IN_IGNORED", f[1] == IN_IGNORED, i64::from(f[1]))?;
     let rm = sys_inotify_rm_watch(fd, wd_dir as i32);
     check(b"watch gone", rm == -22, rm)
+}
+
+fn test_inotify_mntns_exit() {
+    let fd = sys_inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    let mp = b"/tmp/inns\0";
+    hk_syscall::sys_mkdir(mp.as_ptr(), 0o755);
+    let r = mntns_exit(fd as i32, mp);
+    hk_syscall::sys_rmdir(mp.as_ptr());
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    crate::harness::report_r(b"INOTIFY_MNTNS_EXIT", r);
+}
+
+fn mntns_exit(fd: i32, mp: &[u8]) -> crate::harness::R {
+    use crate::harness::check;
+    /// unshare(2) flag, mount(2) flags
+    const CLONE_NEWNS: u64 = 0x2_0000;
+    const MS_REC: u64 = 0x4000;
+    const MS_PRIVATE: u64 = 0x4_0000;
+    check(b"init1", fd >= 0, i64::from(fd))?;
+    let pid = hk_syscall::sys_fork();
+    check(b"fork", pid >= 0, pid)?;
+    if pid == 0 {
+        // A namespace of its own, nothing propagating back, then a ramfs
+        // only it has mounted, a file in it watched through the shared
+        // inotify descriptor
+        let step = if hk_syscall::sys_unshare(CLONE_NEWNS) != 0 {
+            1
+        } else if hk_syscall::sys_mount(
+            core::ptr::null(),
+            b"/\0".as_ptr(),
+            core::ptr::null(),
+            MS_REC | MS_PRIVATE,
+            0,
+        ) != 0
+        {
+            2
+        } else if hk_syscall::sys_mount(b"none\0".as_ptr(), mp.as_ptr(), b"ramfs\0".as_ptr(), 0, 0)
+            != 0
+        {
+            3
+        } else if touch(b"/tmp/inns/f\0") < 0 {
+            4
+        } else if sys_inotify_add_watch(fd, b"/tmp/inns/f\0".as_ptr(), IN_MODIFY) <= 0 {
+            5
+        } else {
+            0
+        };
+        hk_syscall::sys_exit(step);
+    }
+    let mut st = 0i32;
+    hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+    check(b"child", st == 0, i64::from(st >> 8))?;
+    let (ev, n) = events(fd);
+    let ev = &ev[..n];
+    check(b"events", n == 2, n as i64)?;
+    check(b"IN_UNMOUNT", ev[0].1 == IN_UNMOUNT, i64::from(ev[0].1))?;
+    check(b"IN_IGNORED", ev[1].1 == IN_IGNORED, i64::from(ev[1].1))
 }
 
 fn test_inotify_delete_self() {

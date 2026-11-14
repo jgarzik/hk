@@ -23,6 +23,7 @@ use alloc::sync::Arc;
 
 use crate::sync::spin::Mutex;
 
+use super::mount::MountRef;
 use super::path_ref::Path;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
@@ -39,28 +40,11 @@ pub struct FsStruct {
     pub users: core::sync::atomic::AtomicUsize,
 }
 
-/// A path the fs struct holds: its mount is busy while it does (Linux
-/// path_get: an umount of a mount someone stands in is EBUSY)
-struct Pinned(Path);
-
-impl Pinned {
-    fn new(p: Path) -> Self {
-        p.mnt.mntget();
-        Self(p)
-    }
-}
-
-impl Drop for Pinned {
-    fn drop(&mut self) {
-        self.0.mnt.mntput();
-    }
-}
-
 struct FsStructInner {
     /// Current working directory
-    pwd: Pinned,
+    pwd: Path,
     /// Root directory (for chroot support, usually same as global root)
-    root: Pinned,
+    root: Path,
     /// File creation mask
     umask: u16,
 }
@@ -70,8 +54,8 @@ impl FsStruct {
     pub fn new(root: Path, pwd: Path) -> Arc<Self> {
         arc_nofail(Self {
             inner: Mutex::new(FsStructInner {
-                pwd: Pinned::new(pwd),
-                root: Pinned::new(root),
+                pwd,
+                root,
                 umask: 0o022,
             }),
             users: core::sync::atomic::AtomicUsize::new(1),
@@ -88,12 +72,12 @@ impl FsStruct {
 
     /// Get current working directory (returns cloned Path with bumped refs)
     pub fn get_pwd(&self) -> Path {
-        self.inner.lock().pwd.0.clone()
+        self.inner.lock().pwd.clone()
     }
 
     /// Get root directory (returns cloned Path with bumped refs)
     pub fn get_root(&self) -> Path {
-        self.inner.lock().root.0.clone()
+        self.inner.lock().root.clone()
     }
 
     /// Get umask
@@ -108,7 +92,7 @@ impl FsStruct {
     pub fn set_pwd(&self, new_pwd: Path) {
         let old = {
             let mut inner = self.inner.lock();
-            core::mem::replace(&mut inner.pwd, Pinned::new(new_pwd))
+            core::mem::replace(&mut inner.pwd, new_pwd)
         };
         // old Path dropped here, decrementing refcounts
         drop(old);
@@ -118,7 +102,7 @@ impl FsStruct {
     pub fn set_root(&self, new_root: Path) {
         let old = {
             let mut inner = self.inner.lock();
-            core::mem::replace(&mut inner.root, Pinned::new(new_root))
+            core::mem::replace(&mut inner.root, new_root)
         };
         drop(old);
     }
@@ -128,15 +112,15 @@ impl FsStruct {
     pub fn repoint(&self, map: &crate::fs::mount::MountMap) {
         let swap = |p: &Path| {
             map.iter()
-                .find(|(old, _)| Arc::ptr_eq(old, &p.mnt))
+                .find(|(old, _)| MountRef::ptr_eq(old, &p.mnt))
                 .map(|(_, new)| Path::new(new.clone(), p.dentry.clone()))
         };
         let old = {
             let mut inner = self.inner.lock();
-            let (root, pwd) = (swap(&inner.root.0), swap(&inner.pwd.0));
+            let (root, pwd) = (swap(&inner.root), swap(&inner.pwd));
             (
-                root.map(|r| core::mem::replace(&mut inner.root, Pinned::new(r))),
-                pwd.map(|p| core::mem::replace(&mut inner.pwd, Pinned::new(p))),
+                root.map(|r| core::mem::replace(&mut inner.root, r)),
+                pwd.map(|p| core::mem::replace(&mut inner.pwd, p)),
             )
         };
         drop(old);
@@ -160,15 +144,11 @@ impl FsStruct {
     /// new struct allocated after it (Linux copy_fs_struct allocates,
     /// then copies under fs->lock)
     pub fn copy(&self) -> Result<Arc<Self>, KernelError> {
-        // Pinned under the lock (Linux path_get under fs->lock): the
+        // Taken under the lock (Linux path_get under fs->lock): the
         // mount count, an atomic, no allocation
         let (pwd, root, umask) = {
             let inner = self.inner.lock();
-            (
-                Pinned::new(inner.pwd.0.clone()),
-                Pinned::new(inner.root.0.clone()),
-                inner.umask,
-            )
+            (inner.pwd.clone(), inner.root.clone(), inner.umask)
         };
         try_arc(Self {
             inner: Mutex::new(FsStructInner { pwd, root, umask }),
@@ -198,8 +178,8 @@ use crate::task::Task;
 static KTHREAD_FS: spin::Once<Arc<FsStruct>> = spin::Once::new();
 
 /// Set up [`KTHREAD_FS`] on `knullfs` (Linux init_mount_tree)
-pub fn kthread_fs_init(knullfs: Arc<super::Mount>) {
-    let root = Path::new(knullfs.clone(), knullfs.root.clone());
+pub fn kthread_fs_init(knullfs: MountRef) {
+    let root = Path::new(knullfs.clone(), (*knullfs.root).clone());
     KTHREAD_FS.call_once(|| FsStruct::new(root.clone(), root));
 }
 

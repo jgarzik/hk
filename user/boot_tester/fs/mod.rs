@@ -8,6 +8,7 @@ pub mod cpio_nodes;
 pub mod dac;
 pub mod deep_chain;
 pub mod dirents;
+pub mod dpath_umount;
 pub mod emptypath;
 pub mod etxtbsy;
 pub mod fanotify;
