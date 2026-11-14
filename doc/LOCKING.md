@@ -152,8 +152,13 @@ Linux bit_spin_lock as hlist_bl_lock: bit 0 of a hash bucket's head
 word, so a table of buckets costs one pointer each. Thread context only,
 interrupts stay on; to the preempt count and lockdep it is a spin lock
 (`sync::spin::raw_enter`/`raw_leave`, one class for every bucket, never
-two held at once). Used for the dentry hash table (3.3 Dentry), under
-`Dentry.d_lock`, with only `Dentry.d_name` (a leaf) taken inside it.
+two held at once). Only writers take it: readers walk a bucket under
+an RCU read guard (`BlHead::find_rcu`, Linux
+hlist_bl_for_each_entry_rcu), which removal allows by keeping the
+removed link's `next` (hlist_bl_del_init_rcu) for entries freed a
+grace period after the bucket lets go (`RcuFreePtr`). Used for the
+dentry hash table (3.3 Dentry), under `Dentry.d_lock`, with only
+`Dentry.d_name` (a leaf) taken inside it.
 
 ### 1.3.2 Nulls hash bucket lock (util/hlist_nulls.rs)
 
@@ -2482,19 +2487,28 @@ the child's d_lock where that is held: d_drop_tree). Nothing allocates
 to add or remove a child. Order: RENAME_LOCK -> d_lock (parent, then
 child) -> bucket lock (one bucket at a time, a spin lock to the
 preempt count and lockdep, one class) -> `d_name` (leaf).
-`d_lookup` (Linux __d_lookup) holds the parent's d_lock (read: lookups
-take their references under it) and walks the bucket once under its
-lock, comparing key, parent address and name, as Linux compares d_name
-there (a filesystem's `DentryOps`, Linux d_hash/d_compare, hash and
-compare where names match more than their bytes: vfat, without case
-or trailing dots; no lock of their own). That is sound: the key and parent address are stored when the
-dentry is hashed in and change only while it is out of its bucket;
-the name is read under `d_name`, which only d_move/d_exchange write,
-with the dentry out of the tree. Linux walks
-buckets under RCU instead (__d_lookup); dentries are freed after a
-grace period and entries are published with Release stores, so an
-RCU walk can come later (the bucket's unlink would then have to keep
-`next` for a reader on it, as hlist_bl_del_rcu). A walk
+`d_lookup` (Linux d_lookup, __d_lookup) holds the parent's d_lock
+(read: lookups take their references under it) and walks the bucket
+once under an RCU read guard with no lock, comparing key, parent
+address and name, as Linux compares d_name there, and takes its
+reference with `DentryRef::try_get` (lockref_get_not_dead) (a
+filesystem's `DentryOps`, Linux d_hash/d_compare, hash and compare
+where names match more than their bytes: vfat, without case or
+trailing dots; no lock of their own). That is sound: dentries are
+freed a grace period after their last put and published with Release
+stores; the key and parent address are atomics, stored when the
+dentry is hashed in and changed only while it is out of its bucket;
+with the parent's d_lock held no child of it enters or leaves the
+tree, so a match is a child in the tree, its name stable (read under
+`d_name`, which only d_move/d_exchange write, with the dentry out of
+the tree). A walk standing on a dentry a rename moves to another
+bucket follows it there and may miss; only d_move/d_exchange rehash,
+under RENAME_LOCK, so a miss with RENAME_LOCK's sequence moved
+(sampled without waiting, `raw_read_begin`, Linux
+raw_seqcount_begin) walks again under the bucket lock. Linux's
+d_lookup instead repeats the RCU walk after read_seqbegin, but holds
+no d_lock: here a reader waiting out a rename could wait on one that
+waits for the parent's d_lock. A walk
 that misses during a rename (`lookup_cached`/`cached` without the
 directory lock) is fine: lookup_slow rechecks under i_rwsem.
 

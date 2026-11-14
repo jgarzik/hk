@@ -113,6 +113,32 @@ impl Link {
         self.next.store(n, core::sync::atomic::Ordering::Release);
     }
 
+    /// Claim a link off every hash chain for an insert (`util::hlist_bl`,
+    /// which marks a link off its chain by `prev` alone, Linux's pprev:
+    /// `next` stays for a reader standing on it); false if it is on a
+    /// chain or being inserted
+    pub(super) fn claim_hash(&self) -> bool {
+        self.prev
+            .compare_exchange(UNLINKED, null_mut(), Relaxed, Relaxed)
+            .is_ok()
+    }
+
+    /// On a hash chain (`util::hlist_bl`; read under its lock)
+    #[cfg(test)]
+    pub(super) fn is_hashed(&self) -> bool {
+        self.prev.load(Relaxed) != UNLINKED
+    }
+
+    /// Take the link off its hash chain, keeping `next` for a reader
+    /// standing on it (Linux hlist_bl_del_init_rcu: pprev cleared)
+    ///
+    /// # Safety
+    /// As [`Link::set_next`]: the chain's lock is held and the link is
+    /// already unlinked from its neighbours.
+    pub(super) unsafe fn unhash(&self) {
+        self.prev.store(UNLINKED, Relaxed);
+    }
+
     /// Mark the link free again
     ///
     /// # Safety

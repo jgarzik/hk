@@ -8,14 +8,21 @@
 //! on removal): an entry lives at
 //! least as long as it is hashed, and every operation is safe. A link's
 //! `prev` is null for the first entry (Linux's pprev points into the
-//! head). Removal walks the chain to check the entry is there (chains
-//! are short: tables are sized to memory).
+//! head) and `UNLINKED` off every chain (Linux's pprev NULL). Removal
+//! walks the chain to check the entry is there (chains are short:
+//! tables are sized to memory).
 //!
 //! The lock counts as a spin lock for the preempt count and lockdep
-//! (one class for every bucket: two are never held at once). Entries
-//! are added at the head and published with a Release store, the shape
-//! an RCU walk needs (hlist_bl_add_head_rcu); today every walk holds
-//! the lock.
+//! (one class for every bucket: two are never held at once); only
+//! writers need it. Entries are added at the head and published with a
+//! Release store (hlist_bl_add_head_rcu), and removal keeps the removed
+//! link's `next` (hlist_bl_del_init_rcu), so where the bucket's
+//! reference frees its entry only a grace period after it goes
+//! ([`RcuFreePtr`]) a reader may walk the chain under an RCU read guard
+//! with no lock ([`BlHead::find_rcu`], hlist_bl_for_each_entry_rcu). A
+//! reader standing on an entry that moves to another bucket follows it
+//! there and may miss entries of its own: an RCU lookup that misses
+//! must recheck (Linux d_lookup's rename_lock retry).
 
 use alloc::sync::Arc;
 use core::marker::PhantomData;
@@ -23,7 +30,17 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use super::list::{Adapter, Link, RefPtr};
+use crate::sync::rcu::RcuReadGuard;
 use crate::sync::spin::{RawClass, raw_enter, raw_leave};
+
+/// A [`RefPtr`] whose last reference's drop frees the entry's memory
+/// only after an RCU grace period (Linux dentry_free's call_rcu), so an
+/// RCU reader may stand on an entry the bucket let go
+///
+/// # Safety
+/// Dropping the last reference must leave the item's memory readable
+/// until every RCU read guard taken before the drop has ended.
+pub unsafe trait RcuFreePtr: RefPtr {}
 
 /// The lock bit in a head (Linux LIST_BL_LOCKMASK)
 const LOCK: usize = 1;
@@ -38,7 +55,8 @@ static CLASS: RawClass = RawClass::new();
 /// it `next` runs through the links of live items, each inserted with
 /// `P::into_raw` (the bucket holds that reference) and on no other
 /// list through this link, each one's `prev` the link before it (null
-/// for the first). The chain changes only under `LOCK`.
+/// for the first). The chain changes only under `LOCK`. A removed
+/// link's `next` names an entry that was on the chain at its removal.
 pub struct BlHead<A: Adapter, P: RefPtr<Target = A::Item> = Arc<<A as Adapter>::Item>> {
     first: AtomicPtr<Link>,
     /// It drops `P`s wherever it goes: Send/Sync as P's
@@ -73,6 +91,34 @@ impl<A: Adapter, P: RefPtr<Target = A::Item>> BlHead<A, P> {
             id,
             _not_send: PhantomData,
         }
+    }
+}
+
+impl<A: Adapter, P: RcuFreePtr<Target = A::Item>> BlHead<A, P> {
+    /// The first entry for which `pred` holds, borrowed for the guard:
+    /// one walk of the chain with no lock (Linux
+    /// hlist_bl_for_each_entry_rcu). An entry that is moving buckets
+    /// may be missed (module doc); a hit was on this chain when reached.
+    pub fn find_rcu<'g>(
+        &'g self,
+        _g: &'g RcuReadGuard,
+        mut pred: impl FnMut(&'g A::Item) -> bool,
+    ) -> Option<&'g A::Item> {
+        let mut l = self.first.load(Ordering::Acquire).map_addr(|a| a & !LOCK);
+        while !l.is_null() {
+            // SAFETY: `l` was read under `_g`, from the head or from a
+            // link reached so, both Acquire loads of Release-published
+            // links: its item was hashed when the guard began or after,
+            // and once unhashed its memory outlives the guard
+            // (`RcuFreePtr`); a removed link keeps `next`
+            let item = unsafe { &*A::item(l) };
+            if pred(item) {
+                return Some(item);
+            }
+            // SAFETY: as above, `l` is readable for the guard
+            l = unsafe { (*l).next_rcu() };
+        }
+        None
     }
 }
 
@@ -143,14 +189,15 @@ impl<A: Adapter, P: RefPtr<Target = A::Item>> BlGuard<'_, A, P> {
     /// Hash `item` at the head (Linux hlist_bl_add_head_rcu); panics if
     /// its link is on a list
     pub fn add_head(&mut self, item: P) {
-        assert!(A::link(&item).claim(), "hlist_bl: item already linked");
+        assert!(A::link(&item).claim_hash(), "hlist_bl: item already linked");
         let l = Self::link(&item);
         let f = self.first();
         // SAFETY: `l` was claimed for this insert just now and `f` is
-        // this bucket's first link (or null), both live, the lock held
+        // this bucket's first link (or null), both live, the lock held.
+        // A reader still on `l` from an earlier chain follows it here.
         unsafe {
             (*l).set_prev(null_mut());
-            (*l).set_next(f);
+            (*l).publish_next(f);
             if let Some(f) = f.as_ref() {
                 f.set_prev(l);
             }
@@ -176,9 +223,9 @@ impl<A: Adapter, P: RefPtr<Target = A::Item>> BlGuard<'_, A, P> {
             if let Some(n) = next.as_ref() {
                 n.set_prev(prev);
             }
-            // INVARIANT: off the chain, and no lockless reader stands on
-            // it (every walk holds the lock)
-            (*l).reset();
+            // INVARIANT: off the chain; `next` stays for a lockless
+            // reader standing on it (hlist_bl_del_init_rcu)
+            (*l).unhash();
         }
         // SAFETY: hashed by `add_head`'s `into_raw`, whose reference the
         // bucket held until now
@@ -248,13 +295,48 @@ mod tests {
         assert_eq!(g.find(|i| i.v < 3).unwrap().v, 2);
         assert_eq!(Arc::strong_count(&b), 2);
         assert!(g.del(&b).is_some());
-        assert!(g.del(&b).is_none() && !b.link.is_linked());
+        assert!(g.del(&b).is_none() && !b.link.is_hashed());
         assert!(g.find(|i| i.v == 2).is_none());
         assert_eq!(g.find(|i| i.v < 3).unwrap().v, 1);
         drop(g);
         drop(first);
         drop(h);
         assert_eq!(Arc::strong_count(&a), 1);
-        assert!(!a.link.is_linked() && !c.link.is_linked());
+        assert!(!a.link.is_hashed() && !c.link.is_hashed());
+    }
+
+    // SAFETY: the test below keeps its own reference to every item
+    // across the walk, so the bucket's never frees one
+    unsafe impl RcuFreePtr for Arc<Item> {}
+
+    /// A lockless walk standing on an entry removed under it goes on
+    /// down the chain (hlist_bl_del_init_rcu keeps `next`), and the
+    /// removed entry can be hashed again at once
+    #[test]
+    fn rcu_walk_over_removal() {
+        let h = BlHead::<ItemAdapter>::new();
+        let (a, b, c) = (item(1), item(2), item(3));
+        let mut g = h.lock();
+        for i in [&a, &b, &c] {
+            g.add_head(i.clone());
+        }
+        drop(g);
+        let guard = crate::sync::rcu::read_lock();
+        let mut seen = alloc::vec::Vec::new();
+        let hit = h.find_rcu(&guard, |i| {
+            seen.push(i.v);
+            if i.v == 3 {
+                // Unhash the entry the walk stands on
+                assert!(h.lock().del(&c).is_some());
+            }
+            false
+        });
+        assert!(hit.is_none());
+        drop(guard);
+        assert_eq!(seen, [3, 2, 1]);
+        let mut g = h.lock();
+        assert!(g.find(|i| i.v == 3).is_none());
+        g.add_head(c.clone());
+        assert_eq!(g.find(|_| true).unwrap().v, 3);
     }
 }
