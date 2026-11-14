@@ -13,6 +13,8 @@
 #
 # Usage: tools/linux-boot-tester.sh [-a x86_64|aarch64] [-T timeout_seconds]
 # Env:   LINUX_KERNEL=/path/to/vmlinuz  use this kernel instead of Ubuntu's
+#        LINUX_RELEASE=noble   Ubuntu release whose linux-image-generic to
+#                              boot (CI's runner's), not the host's
 #        NO_KVM=1          force TCG even if /dev/kvm works (as on CI)
 #        LINUX_NOCACHE=1   boot even if this PASS is cached
 #        LINUX_CACHE_DIR   cache (default ~/.cache/hk-linux-check)
@@ -60,22 +62,35 @@ esac
 # Verified .deb downloads (native apt or Ubuntu archive/ports)
 . tools/fetch-deb.sh
 
-WORK=target/linux-test-$ARCH
+# The host's apt has the packages of its own release, native arch only
+USE_APT=false
+$NATIVE && [ -z "${LINUX_RELEASE:-}" ] && USE_APT=true
+
+# Per Ubuntu release, so the host's and CI's kernels boot side by side
+REL=${LINUX_RELEASE:+-$LINUX_RELEASE}
+WORK=target/linux-test-$ARCH$REL
 QEMU_LOG_DIR=${QEMU_LOG_DIR:-$TOP/target/qemu}
-SERIAL_LOG=$QEMU_LOG_DIR/serial_linux_$ARCH.log
+SERIAL_LOG=$QEMU_LOG_DIR/serial_linux_$ARCH$REL.log
 mkdir -p "$WORK" "$QEMU_LOG_DIR"
 
 # Kernel: Ubuntu generic, fetched once per version
 if [ -z "${LINUX_KERNEL:-}" ]; then
-    KVER=$(apt-cache depends linux-image-generic | grep -o 'linux-image-[0-9][^ ]*-generic' | head -1)
-    KVER=${KVER#linux-image-}
+    if [ -n "${LINUX_RELEASE:-}" ]; then
+        # Another release's kernel: its archive index, verified
+        export UBUNTU_CODENAME=$LINUX_RELEASE
+        read -r KVER PKGVER < <(archive_kernel "$DEB_ARCH")
+        [ -n "${PKGVER:-}" ] || exit 1
+    else
+        KVER=$(apt-cache depends linux-image-generic | grep -o 'linux-image-[0-9][^ ]*-generic' | head -1)
+        KVER=${KVER#linux-image-}
+        PKGVER=$(apt-cache show "linux-image-$KVER" | sed -n 's/^Version: //p' | head -1)
+    fi
     KDIR=target/linux-kernel/$DEB_ARCH/$KVER
-    PKGVER=$(apt-cache show "linux-image-$KVER" | sed -n 's/^Version: //p' | head -1)
     LINUX_KERNEL=$KDIR/boot/vmlinuz-$KVER
     if [ ! -f "$LINUX_KERNEL" ]; then
         echo "Fetching Linux $KVER ($DEB_ARCH)..."
         mkdir -p "$KDIR"
-        if $NATIVE; then
+        if $USE_APT; then
             (cd "$KDIR" && apt-get download "linux-image-$KVER" >/dev/null)
         else
             # Foreign arch: same version from the ports archive (no multiarch needed)
@@ -115,7 +130,7 @@ fi
 if [ -n "${KDIR:-}" ]; then
     CONFIG=$KDIR/usr/lib/linux/$KVER/config
     if [ ! -f "$CONFIG" ]; then
-        if $NATIVE; then
+        if $USE_APT; then
             (cd "$KDIR" && apt-get download "linux-buildinfo-$KVER" >/dev/null)
         else
             fetch_deb "linux-buildinfo-$KVER" "$DEB_ARCH" "$KDIR/linux-buildinfo.deb" "$PKGVER"
