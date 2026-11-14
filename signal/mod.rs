@@ -666,11 +666,15 @@ pub mod jobctl {
 pub const STOP_SIGNALS: SigSet =
     SigSet(SIGSTOP.bit() | SIGTSTP.bit() | SIGTTIN.bit() | SIGTTOU.bit());
 
-/// A thread group's pending signals (Linux signal->shared_pending) and
-/// the thread that last took one (signal->curr_target)
+/// A thread group's pending signals (Linux signal->shared_pending), the
+/// thread that last took one (signal->curr_target) and its forks in
+/// progress (signal->multiprocess)
 pub struct GroupPending {
     pub pending: SigPending,
     curr_target: Tid,
+    /// Each fork's [`ForkDelay`] node, linked from the fork's start to
+    /// the child's attach (or the fork's failure)
+    multiprocess: crate::util::list::List<DelayLink>,
 }
 
 impl GroupPending {
@@ -678,8 +682,96 @@ impl GroupPending {
         Self {
             pending: SigPending::new(),
             curr_target: 0,
+            multiprocess: crate::util::list::List::new(),
         }
     }
+
+    /// Multiprocess signal `sig`, just queued for the group, appears to
+    /// every fork in progress as sent after it (Linux
+    /// __send_signal_locked: type > PIDTYPE_TGID): its child gets it
+    /// too; a stop signal cancels a delayed SIGCONT and SIGCONT the
+    /// delayed stop signals, as they would pending
+    fn delay(&self, sig: Signal) {
+        for d in self.multiprocess.iter() {
+            let mut s = SigSet(d.signal.load(Ordering::Relaxed));
+            if sig == SIGCONT {
+                s = s.subtract(&STOP_SIGNALS);
+            } else if sig.kernel_stop() {
+                s.remove(SIGCONT);
+            }
+            s.add(sig);
+            d.signal.store(s.0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A fork's set of delayed signals (Linux struct multiprocess_signals),
+/// on its group's `GroupPending.multiprocess`
+struct DelayNode {
+    /// Changed under the group's `SignalStruct.shared`
+    signal: AtomicU64,
+    link: crate::util::list::Link,
+}
+
+crate::adapter!(DelayLink, DelayNode, link);
+
+/// A fork in progress (Linux copy_process's `delayed`): signals sent to
+/// the forking process as one of several (`PidType::Pgid`) after its
+/// start are recorded for the child, which gets them pending at its
+/// attach, so they appear sent after the fork ([`fork_signals_begin`])
+pub struct ForkDelay {
+    /// The forking process's group, while `node` is on its list
+    group: Option<Arc<SignalStruct>>,
+    node: Box<DelayNode>,
+}
+
+impl ForkDelay {
+    /// The signals delayed so far, the node off the list (TASKLIST
+    /// held for writing: the child's attach)
+    fn take(&mut self) -> SigSet {
+        let Some(g) = self.group.take() else {
+            return SigSet::EMPTY;
+        };
+        let mut gp = g.shared.lock();
+        // SAFETY: linked by fork_signals_begin, still (`group` was set)
+        unsafe { gp.multiprocess.remove(&raw const *self.node) };
+        SigSet(self.node.signal.load(Ordering::Relaxed))
+    }
+}
+
+impl Drop for ForkDelay {
+    /// A failed fork's node leaves the list before it is freed
+    fn drop(&mut self) {
+        let _ = self.take();
+    }
+}
+
+/// A fork starts (Linux copy_process): a new process's fork records the
+/// multiprocess signals sent to the caller's group from now on; then a
+/// signal the caller must handle first is ERESTARTNOINTR (Linux
+/// recalc_sigpending, task_sigpending), so the fork restarts after it
+/// and the signal comes before the fork. ENOMEM.
+pub fn fork_signals_begin(me: &Task, thread: bool) -> KernelResult<ForkDelay> {
+    let node = crate::util::kalloc::try_box(DelayNode {
+        signal: AtomicU64::new(0),
+        link: crate::util::list::Link::new(),
+    })?;
+    let mut d = ForkDelay { group: None, node };
+    let s = me.sig.lock();
+    if !thread && let Some(g) = &s.shared_pending.0 {
+        let mut gp = g.shared.lock();
+        // SAFETY: boxed (it never moves), and ForkDelay unlinks it
+        // (`take`) before the box is freed
+        unsafe { gp.multiprocess.push_back(&raw const *d.node) };
+        d.group = Some(g.clone());
+    }
+    let pending = s.has_deliverable_signals();
+    me.set_sigpending(pending);
+    drop(s);
+    if pending {
+        return Err(KernelError::RestartNoIntr);
+    }
+    Ok(d)
 }
 
 impl core::ops::Deref for GroupPending {
@@ -948,8 +1040,9 @@ fn retarget(t: &Task, which: SigSet) {
     }
 }
 
-/// The current thread starts its exit: group signals it would have
-/// taken go to another thread (Linux exit_signals)
+/// The current thread starts its exit: PF_EXITING set under its group
+/// lock and Task.sig ([`stop::exit_participate`]), then group signals
+/// it would have taken go to another thread (Linux exit_signals)
 #[inline(never)]
 pub fn exit_signals() {
     let me = crate::task::percpu::current();
@@ -1078,8 +1171,14 @@ impl ForkSignal {
 }
 
 /// Attach new task `child`'s shared signal objects, once it is in
-/// TASKLIST
-pub fn install_fork_signal(child: &Task, f: ForkSignal) {
+/// TASKLIST.
+/// The multiprocess signals the fork recorded (`delay`) become the new
+/// process's pending signals, in the same TASKLIST hold that makes it
+/// reachable by a send (Linux copy_process: shared_pending.signal =
+/// delayed.signal under siglock and tasklist_lock), and its first
+/// return to user mode looks for them (Linux schedule_tail:
+/// calculate_sigpending).
+pub fn install_fork_signal(child: &Task, f: ForkSignal, mut delay: ForkDelay) {
     if f.joined {
         // CLONE_THREAD: one more live thread
         f.signal.thread_added();
@@ -1090,6 +1189,12 @@ pub fn install_fork_signal(child: &Task, f: ForkSignal) {
         crate::time::cpu_timer::rlimit_cpu_changed(&f.signal, child.tid());
     }
     let mut table = TASKLIST.write();
+    let delayed = delay.take();
+    if delayed.any() && !f.share_signal {
+        let mut gp = f.signal.shared.lock();
+        gp.pending.signal = gp.pending.signal.union(&delayed);
+        child.set_sigpending(true);
+    }
     if table.view(child).is_some() {
         f.sighand.get(&mut table);
     }
@@ -1385,13 +1490,18 @@ pub fn send_sig_info(t: &Task, sig: Signal, info: SendInfo) -> KernelResult<()> 
     send_task(t, sig, info, PidType::Pid, false)
 }
 
-/// Whom a signal is for (Linux enum pid_type, the two a send uses)
+/// Whom a signal is for (Linux enum pid_type, as a send uses it)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PidType {
     /// The thread (PIDTYPE_PID)
     Pid,
     /// Its whole thread group (PIDTYPE_TGID)
     Tgid,
+    /// Its whole thread group, one of the several processes the signal
+    /// goes to: a process group, a session, or every process (Linux
+    /// PIDTYPE_PGID, PIDTYPE_SID, PIDTYPE_MAX: type > PIDTYPE_TGID); a
+    /// fork in progress delays it for its child ([`ForkDelay`])
+    Pgid,
 }
 
 /// The receiver of a send, read under TASKLIST while it is still listed
@@ -1530,7 +1640,9 @@ fn send_task_in(
     };
     // Job control's process-wide effects, whether or not the signal is
     // then ignored, and the send, under the group lock
-    let _g = prepare_signal(table, tg.signal.as_ref(), t.pid, sig, gone);
+    let Ok(_g) = prepare_signal(table, tg.signal.as_ref(), t.pid, sig, gone) else {
+        return Ok(());
+    };
     let sent = with_sig_send(t, |t, state| send_locked(t, state, sighand, &to));
 
     let wants = match sent {
@@ -1549,21 +1661,29 @@ fn send_task_in(
 
 /// A stop signal or SIGCONT for group `tgid` (`sig_struct`): its
 /// process-wide effects ([`stop::prepare`]), under the group lock,
-/// returned held for the rest of the send
+/// returned held for the rest of the send. Err: the group is exiting,
+/// the signal is dropped with no effect (Linux prepare_signal:
+/// SIGNAL_GROUP_EXIT under siglock; a group exit starts under the
+/// group lock, `SignalStruct::start_exit`).
 fn prepare_signal<'a>(
     table: &crate::task::percpu::GlobalTaskTable,
     sig_struct: Option<&'a Arc<SignalStruct>>,
     tgid: Pid,
     sig: Signal,
     gone: &mut SigPending,
-) -> Option<crate::sync::spin::MutexGuard<'a, stop::GroupStop>> {
+) -> Result<Option<crate::sync::spin::MutexGuard<'a, stop::GroupStop>>, ()> {
     if !sig.kernel_stop() && sig != SIGCONT {
-        return None;
+        return Ok(None);
     }
-    let s = sig_struct?;
+    let Some(s) = sig_struct else {
+        return Ok(None);
+    };
     let mut g = s.jobctl.lock();
+    if matches!(s.group_exit(), GroupExit::Exit(_)) {
+        return Err(());
+    }
     stop::prepare(table, s, &mut g, tgid, sig, gone);
-    Some(g)
+    Ok(Some(g))
 }
 
 /// What a send is, for its locked part
@@ -1635,14 +1755,11 @@ fn send_locked(
         shared_pending,
         ..
     } = state;
-    let mut group;
+    let mut group = None;
     let pending = match to.ty {
         PidType::Pid => pending,
-        PidType::Tgid => match shared_pending.group() {
-            Some(g) => {
-                group = g;
-                &mut group.pending
-            }
+        PidType::Tgid | PidType::Pgid => match shared_pending.group() {
+            Some(g) => &mut group.insert(g).pending,
             None => return Sent::Dropped,
         },
     };
@@ -1652,6 +1769,12 @@ fn send_locked(
         None => {}
     }
     pending.add(sig);
+    // Let multiprocess signals appear after forks in progress (Linux)
+    if to.ty == PidType::Pgid
+        && let Some(g) = &group
+    {
+        g.delay(sig);
+    }
     Sent::Queued(wants)
 }
 
@@ -1675,7 +1798,7 @@ fn drops(
     }
     match to.ty {
         PidType::Pid => state.pending.legacy(sig),
-        PidType::Tgid => state
+        PidType::Tgid | PidType::Pgid => state
             .shared_pending
             .group()
             .is_none_or(|g| g.pending.legacy(sig)),
@@ -1856,7 +1979,7 @@ fn checked(
     check(&v, sig?)?;
     let t = match ty {
         PidType::Pid => Some(crate::task::percpu::task_ref(v.task)),
-        PidType::Tgid => group_task(table, Some(v)),
+        PidType::Tgid | PidType::Pgid => group_task(table, Some(v)),
     };
     t.ok_or(KernelError::NoProcess)
 }
@@ -1885,6 +2008,13 @@ pub fn group_task(
 /// (Linux do_send_sig_info, PIDTYPE_TGID, with no permission check)
 pub fn send_group_signal(t: &Task, sig: Signal, info: SendInfo) -> KernelResult<()> {
     send_task(t, sig, info, PidType::Tgid, false)
+}
+
+/// [`send_group_signal`] as one of a signal to every process (Linux
+/// kill_something_info: group_send_sig_info(.., PIDTYPE_MAX)): a fork
+/// in progress delays it for its child
+pub fn send_all_signal(t: &Task, sig: Signal, info: SendInfo) -> KernelResult<()> {
+    send_task(t, sig, info, PidType::Pgid, false)
 }
 
 /// `sig` with `info` to task `t` (`ty` Pid) or its thread group (Tgid),
@@ -1977,7 +2107,7 @@ pub fn kill_pgrp_info(
     for v in table.pgrp(pg) {
         ret = checked(&table, Some(v), PidType::Tgid, sig, &check).and_then(|t| {
             sig?.map_or(Ok(()), |s| {
-                send_task_in(&table, &t, s, info, PidType::Tgid, false, &mut gone)
+                send_task_in(&table, &t, s, info, PidType::Pgid, false, &mut gone)
             })
         });
         ok |= ret.is_ok();
@@ -2295,7 +2425,9 @@ pub fn send_timer_sigqueue(
         return Err((q, true));
     }
     let sighand = tg.sighand.as_ref();
-    let _g = prepare_signal(&table, tg.signal.as_ref(), t.pid, sig, &mut gone);
+    let Ok(_g) = prepare_signal(&table, tg.signal.as_ref(), t.pid, sig, &mut gone) else {
+        return Err((q, true));
+    };
     let mut q = Some(q);
     let r = with_sig_send(&t, |task, state| {
         let exiting = task.has_flag(crate::task::pf::EXITING);
@@ -2314,7 +2446,7 @@ pub fn send_timer_sigqueue(
         };
         match ty {
             PidType::Pid => state.pending.queue(e),
-            PidType::Tgid => match state.shared_pending.group() {
+            PidType::Tgid | PidType::Pgid => match state.shared_pending.group() {
                 Some(mut g) => g.queue(e),
                 None => {
                     q = Some(e);
@@ -2668,8 +2800,13 @@ impl SignalStruct {
 
     /// Start a group exit with wait status `code`: false if one is under
     /// way. A fatal signal (`over_exec`) also overrides an exec's
-    /// de_thread (Linux complete_signal), exit_group does not.
+    /// de_thread (Linux complete_signal), exit_group does not. Under the
+    /// group lock (Linux sets SIGNAL_GROUP_EXIT under siglock), so a
+    /// stop signal or SIGCONT whose effects are applied under it either
+    /// sees the exit or comes before it (`prepare_signal`); never with
+    /// that lock or a Task.sig held.
     fn start_exit(&self, code: i32, over_exec: bool) -> bool {
+        let _g = self.jobctl.lock();
         let mut cur = self.group_exit.load(Ordering::Acquire);
         loop {
             if cur & GROUP_EXIT != 0 || (cur & GROUP_EXEC != 0 && !over_exec) {

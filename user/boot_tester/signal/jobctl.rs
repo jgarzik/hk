@@ -24,6 +24,10 @@
 //! - JOBCTL_PTRACE_IGNORED: a signal ignored by default (SIGWINCH,
 //!   SIGCHLD) still reaches a tracee's signal-delivery stop (Linux
 //!   sig_ignored: only SIGKILL is ignored for a traced task)
+//! - JOBCTL_RUSAGE: wait4(WUNTRACED), wait4(WCONTINUED) and
+//!   waitid(WSTOPPED) fill the rusage argument with the child's CPU time
+//!   (Linux wait_task_stopped / wait_task_continued: getrusage(p,
+//!   RUSAGE_BOTH))
 
 use crate::harness::verdict;
 use crate::helpers::sleep_ms;
@@ -57,6 +61,7 @@ pub fn run_tests() {
     });
     in_child(b"JOBCTL_ATTACH_EXIT", attach_exit);
     in_child(b"JOBCTL_PTRACE_IGNORED", ptrace_ignored);
+    in_child(b"JOBCTL_RUSAGE", rusage);
 }
 
 /// Run `f` in a child with SIGCHLD blocked; NAME:OK if it returns 0,
@@ -286,6 +291,112 @@ fn waitid_body(c: i64, tids: &[i64; 3]) -> i32 {
     }
     sys_kill(c, SIGCONT);
     if waitid(c, WCONTINUED) != (0, CLD_CONTINUED, SIGCONT as i32, c, 0) {
+        return 6;
+    }
+    0
+}
+
+/// struct rusage: the two times (struct timeval), then 14 longs
+#[repr(C)]
+struct Rusage {
+    times: [i64; 4],
+    rest: [i64; 14],
+}
+
+impl Rusage {
+    /// Every field -1, as no kernel writes it
+    fn poisoned() -> Self {
+        Self {
+            times: [-1; 4],
+            rest: [-1; 14],
+        }
+    }
+
+    /// user + system time in ms, None if any field was left unwritten
+    fn cpu_ms(&self) -> Option<i64> {
+        let t = &self.times;
+        if t.iter().chain(self.rest.iter()).any(|&v| v < 0) {
+            return None;
+        }
+        Some((t[0] + t[2]) * 1000 + (t[1] + t[3]) / 1000)
+    }
+}
+
+/// The calling process's CPU time in ms
+fn process_cpu_ms() -> i64 {
+    let mut ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // CLOCK_PROCESS_CPUTIME_ID
+    hk_syscall::sys_clock_gettime(2, &mut ts);
+    ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+}
+
+/// The CPU a child burns before it stops itself
+const BURN_MS: i64 = 100;
+
+fn rusage() -> i32 {
+    let c = sys_fork();
+    if c == 0 {
+        while process_cpu_ms() < BURN_MS {
+            core::hint::spin_loop();
+        }
+        sys_kill(hk_syscall::sys_getpid(), SIGSTOP);
+        loop {
+            sleep_ms(5);
+        }
+    }
+    let r = rusage_steps(c);
+    kill_reap(c);
+    r
+}
+
+/// Each report's rusage has every field written and at least the CPU
+/// time the child burned before stopping
+fn rusage_steps(c: i64) -> i32 {
+    const WSTOPPED: i32 = 2;
+    let burned = |ru: &Rusage| ru.cpu_ms().is_some_and(|ms| ms >= BURN_MS * 8 / 10);
+    let mut st = 0i32;
+    let mut ru = Rusage::poisoned();
+    let mut got = 0;
+    for _ in 0..500 {
+        got = sys_wait4(c, &mut st, WUNTRACED | WNOHANG, &raw mut ru as u64);
+        if got != 0 {
+            break;
+        }
+        sleep_ms(10);
+    }
+    if got != c || st != STOPPED_SIGSTOP {
+        return 1;
+    }
+    if !burned(&ru) {
+        return 2;
+    }
+    sys_kill(c, SIGCONT);
+    let mut ru = Rusage::poisoned();
+    for _ in 0..500 {
+        got = sys_wait4(c, &mut st, WCONTINUED | WNOHANG, &raw mut ru as u64);
+        if got != 0 {
+            break;
+        }
+        sleep_ms(10);
+    }
+    if got != c || st != 0xffff {
+        return 3;
+    }
+    if !burned(&ru) {
+        return 4;
+    }
+    sys_kill(c, SIGSTOP);
+    let mut ru = Rusage::poisoned();
+    let mut i = SigInfo::zeroed();
+    if sys_waitid(P_PID, c as u64, &mut i, WSTOPPED, &raw mut ru as u64) != 0
+        || i.si_code != CLD_STOPPED
+    {
+        return 5;
+    }
+    if !burned(&ru) {
         return 6;
     }
     0

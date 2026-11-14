@@ -2048,12 +2048,13 @@ fn group_status(t: &TaskInner, own: i32) -> i32 {
 /// process group, < -1 that group), not yet reported: its tid (as the
 /// caller numbers it) and the stop's code. Reported once unless
 /// `wnowait` (Linux wait_task_stopped with ptrace: exit_code cleared
-/// under siglock). The tracees are walked under the read lock, each
-/// stop read and its code taken under the tracee's Task.sig.
-pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32)> {
+/// under siglock), with its process's CPU time ([`rusage_both`]). The
+/// tracees are walked under the read lock, each stop read and its code
+/// taken under the tracee's Task.sig.
+pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32, Times)> {
     let pgid = current_pgid();
     let table = TASKLIST.read();
-    let (tid, code) = table.iter().find_map(|t| {
+    let (tid, pid, code) = table.iter().find_map(|t| {
         if !(tracee_of(&t, tracer_pid) && wait_match(&t, target_pid, pgid)) {
             return None;
         }
@@ -2067,13 +2068,15 @@ pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(T
         if !wnowait {
             s.ptrace_code = 0;
         }
-        Some((t.task.tid(), code))
+        Some((t.task.tid(), t.task.pid, code))
     })?;
+    let times = rusage_both(&table, pid);
     // The tracee as the tracer numbers it (Linux wait_task_stopped:
     // task_pid_vnr)
     Some((
         Tid::from(crate::task::pid::nr_ns(tid, current_pid_ns())),
         code,
+        times,
     ))
 }
 
@@ -2093,9 +2096,14 @@ pub enum JobReport {
 /// its tid as the caller numbers it, the report and its real uid; the
 /// report taken unless WNOWAIT (Linux wait_consider_task: a child its
 /// own process traces shows its ptrace stops instead of the group's; a
-/// reapable zombie none). The tasks are walked under TASKLIST's read
-/// lock, each group's state read under its `SignalStruct.jobctl`.
-pub fn wait_jobctl(parent_pid: Pid, target_pid: i64, wflags: i32) -> Option<(Tid, JobReport, u32)> {
+/// reapable zombie none), with its process's CPU time
+/// ([`rusage_both`]). The tasks are walked under TASKLIST's read lock,
+/// each group's state read under its `SignalStruct.jobctl`.
+pub fn wait_jobctl(
+    parent_pid: Pid,
+    target_pid: i64,
+    wflags: i32,
+) -> Option<(Tid, JobReport, u32, Times)> {
     use super::wait_options::{WCONTINUED, WNOWAIT, WUNTRACED};
     if wflags & (WUNTRACED | WCONTINUED) == 0 {
         return None;
@@ -2103,7 +2111,7 @@ pub fn wait_jobctl(parent_pid: Pid, target_pid: i64, wflags: i32) -> Option<(Tid
     let wnowait = wflags & WNOWAIT != 0;
     let pgid = current_pgid();
     let table = TASKLIST.read();
-    let (tid, r, uid) = table.iter().find_map(|t| {
+    let (tid, pid, r, uid) = table.iter().find_map(|t| {
         let child = t.leader && t.task.ppid() == parent_pid && wait_eligible(t.exit_signal, wflags);
         let traced = tracee_of(&t, parent_pid);
         if !(child || traced) || !wait_match(&t, target_pid, pgid) {
@@ -2121,15 +2129,17 @@ pub fn wait_jobctl(parent_pid: Pid, target_pid: i64, wflags: i32) -> Option<(Tid
             && wflags & WUNTRACED != 0
             && let Some(code) = crate::signal::stop::take_stopped(s, wnowait)
         {
-            return Some((t.task.tid(), JobReport::Stopped(code), uid));
+            return Some((t.task.tid(), t.task.pid, JobReport::Stopped(code), uid));
         }
         (wflags & WCONTINUED != 0 && crate::signal::stop::take_continued(s, wnowait))
-            .then(|| (t.task.tid(), JobReport::Continued, uid))
+            .then(|| (t.task.tid(), t.task.pid, JobReport::Continued, uid))
     })?;
+    let times = rusage_both(&table, pid);
     Some((
         Tid::from(crate::task::pid::nr_ns(tid, current_pid_ns())),
         r,
         uid,
+        times,
     ))
 }
 
@@ -2389,6 +2399,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             c_static = sched::DEFAULT_PRIO;
         }
     }
+
+    // Signals that came before this point are handled before the fork
+    // (ERESTARTNOINTR: it restarts after them); multiprocess ones sent
+    // from now on are delayed for the child (Linux copy_process)
+    let delay = crate::signal::fork_signals_begin(&me, config.flags & CLONE_THREAD != 0)?;
 
     // What can still fail runs before the child exists, so an error
     // leaves no task, pid or zombie behind (Linux copy_process: copy_fs,
@@ -2653,6 +2668,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             // The reservation goes with `pidfd` (put_unused_fd)
             return Err(KernelError::OutOfMemory);
         }
+        // A fatal signal ends the fork here: the caller dies, and its
+        // child must not slip out of the kill (Linux copy_process:
+        // fatal_signal_pending under siglock, EINTR)
+        if crate::signal::task_fatal_pending(&me) {
+            drop(table);
+            return Err(KernelError::Interrupted);
+        }
         if child_init {
             crate::task::pidns::attach_init(&mut table, &child_task);
         }
@@ -2695,7 +2717,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Otherwise, child gets a deep copy of handlers
     // If CLONE_CLEAR_SIGHAND is set, handlers are reset to default (except SIG_IGN)
     // CLONE_THREAD also implies sharing shared_pending
-    crate::signal::install_fork_signal(&child_task, child_signal);
+    crate::signal::install_fork_signal(&child_task, child_signal, delay);
     if config.flags & CLONE_THREAD != 0 {
         crate::signal::zap_new_thread(&me, &child_task);
     }
@@ -2914,11 +2936,6 @@ fn io_thread_name(out: &mut [u8; 16], tid: Tid) {
         out[n] = digits[k];
         n += 1;
     }
-}
-
-/// Mark the current task exiting (Linux PF_EXITING)
-fn set_exiting() {
-    current().set_flag(crate::task::pf::EXITING);
 }
 
 /// The current task is exiting (Linux current->flags & PF_EXITING)
@@ -3333,9 +3350,9 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // callbacks as it waits)
         crate::io::io_uring::task_cancel(false);
         crate::task::task_work::task_work_run();
-        // Linux exit_signals sets PF_EXITING first, then hands the
-        // group signals this thread would have taken to another
-        set_exiting();
+        // PF_EXITING, set under the group lock and Task.sig, then the
+        // group signals this thread would have taken go to another
+        // (Linux exit_signals)
         crate::signal::exit_signals();
 
         // Exactly one thread, the one taking the group's live count to
@@ -4752,6 +4769,20 @@ pub fn group_times(table: &GlobalTaskTable, pid: Pid) -> (u64, u64) {
         stime = stime.saturating_add(st);
     }
     (utime, stime)
+}
+
+/// User and system time, ns
+pub type Times = (u64, u64);
+
+/// Process `pid`'s user and system time with its reaped children's,
+/// TASKLIST held (Linux getrusage(p, RUSAGE_BOTH): a wait's rusage for a
+/// stopped, continued or ptrace-stopped child, wait_task_stopped and
+/// wait_task_continued)
+pub fn rusage_both(table: &GlobalTaskTable, pid: Pid) -> Times {
+    let (u, s) = group_times(table, pid);
+    let sig = table.threads(pid).find_map(|t| t.signal.clone());
+    let (cu, cs) = sig.map_or((0, 0), |g| g.child_times());
+    (u.saturating_add(cu), s.saturating_add(cs))
 }
 
 /// The calling process's children's CPU time (cutime, cstime)

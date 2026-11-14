@@ -193,7 +193,7 @@ pub fn sys_vfork() -> KernelResult<i64> {
 ///   - pid == 0: wait for any child in same process group
 /// * `wstatus` - Pointer to store status (can be null)
 /// * `options` - WNOHANG, etc.
-/// * `_rusage` - Resource usage (ignored)
+/// * `rusage` - The child's resource usage, if not NULL
 ///
 /// # Returns
 /// * > 0: PID of terminated child
@@ -234,9 +234,12 @@ pub fn sys_wait4(
 
         // A tracee's ptrace stop: (code << 8) | 0x7f (Linux
         // wait_task_stopped)
-        if let Some((tid, code)) = super::percpu::wait_traced(current_pid, pid, false) {
+        if let Some((tid, code, (utime, stime))) =
+            super::percpu::wait_traced(current_pid, pid, false)
+        {
             let st = ((code as i32) << 8) | 0x7f;
-            break put_status(wstatus, st).map(|()| tid as i64);
+            let r = put_status(wstatus, st).and_then(|()| put_times(rusage, utime, stime));
+            break r.map(|()| tid as i64);
         }
         if let Some((child_pid, wait_status, utime, stime)) =
             super::percpu::reap_zombie_child_times(current_pid, pid, options)
@@ -247,14 +250,18 @@ pub fn sys_wait4(
             break r.map(|()| child_pid as i64);
         }
         // A group stop (WUNTRACED): (sig << 8) | 0x7f; a continue
-        // (WCONTINUED): 0xffff (Linux wait_task_stopped,
-        // wait_task_continued)
-        if let Some((tid, r, _)) = super::percpu::wait_jobctl(current_pid, pid, options) {
+        // (WCONTINUED): 0xffff; the child's CPU time either way (Linux
+        // wait_task_stopped, wait_task_continued: getrusage(p,
+        // RUSAGE_BOTH))
+        if let Some((tid, r, _, (utime, stime))) =
+            super::percpu::wait_jobctl(current_pid, pid, options)
+        {
             let st = match r {
                 super::percpu::JobReport::Stopped(code) => ((code as i32) << 8) | 0x7f,
                 super::percpu::JobReport::Continued => 0xffff,
             };
-            break put_status(wstatus, st).map(|()| tid as i64);
+            let r = put_status(wstatus, st).and_then(|()| put_times(rusage, utime, stime));
+            break r.map(|()| tid as i64);
         }
 
         // No zombie child found - check if we have any children at all
@@ -286,7 +293,7 @@ fn put_status(wstatus: UserPtr<i32>, st: i32) -> KernelResult<()> {
     Ok(())
 }
 
-/// Store a reaped child's CPU times, if asked for
+/// Store a reported child's CPU times, if asked for
 fn put_times(rusage: UserPtr<Rusage>, utime: u64, stime: u64) -> KernelResult<()> {
     if !rusage.is_null() {
         super::misc::put_rusage_times(rusage, utime, stime)?;
@@ -428,9 +435,12 @@ pub fn sys_waitid(
 
         // A tracee's ptrace stop (CLD_TRAPPED)
         let wnowait = options & super::wait_options::WNOWAIT != 0;
-        if let Some((tid, code)) = super::percpu::wait_traced(current_pid, wait_pid, wnowait) {
+        if let Some((tid, code, (utime, stime))) =
+            super::percpu::wait_traced(current_pid, wait_pid, wnowait)
+        {
             let info = chld_info(si_code::CLD_TRAPPED, tid as i32, code as i32);
-            break put_waitid_info(infop, &info).map(|()| 0);
+            let r = put_times(rusage, utime, stime).and_then(|()| put_waitid_info(infop, &info));
+            break r.map(|()| 0);
         }
 
         // Reap a zombie child (with WNOWAIT, only report it); only for
@@ -455,8 +465,12 @@ pub fn sys_waitid(
             break r.map(|()| 0);
         }
         // A group stop (CLD_STOPPED, its signal) or continue
-        // (CLD_CONTINUED, SIGCONT) with the child's uid
-        if let Some((tid, r, uid)) = super::percpu::wait_jobctl(current_pid, wait_pid, options) {
+        // (CLD_CONTINUED, SIGCONT) with the child's uid, and its CPU
+        // time (Linux wait_task_stopped / wait_task_continued:
+        // getrusage(p, RUSAGE_BOTH))
+        if let Some((tid, r, uid, (utime, stime))) =
+            super::percpu::wait_jobctl(current_pid, wait_pid, options)
+        {
             let (code, status) = match r {
                 super::percpu::JobReport::Stopped(c) => (si_code::CLD_STOPPED, c as i32),
                 super::percpu::JobReport::Continued => {
@@ -471,7 +485,8 @@ pub fn sys_waitid(
                 stime: 0,
             };
             let info = crate::signal::SigInfo::new(crate::signal::SIGCHLD, code, fields);
-            break put_waitid_info(infop, &info).map(|()| 0);
+            let r = put_times(rusage, utime, stime).and_then(|()| put_waitid_info(infop, &info));
+            break r.map(|()| 0);
         }
 
         // No zombie child found - check if we have any children at all

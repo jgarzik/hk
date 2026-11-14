@@ -285,6 +285,7 @@ pub fn run_all_tests() {
     signal::signals::run_tests();
     signal::signo::run_tests();
     signal::sigqueue::run_tests();
+    signal::fork_delay::run_tests();
     signal::sigmask::run_tests();
     arch::fpu::run_tests();
     process::preempt::run_tests();

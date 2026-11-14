@@ -203,9 +203,14 @@ pub struct PosixTimer {
     /// it.cpu.elist): linked under the group's `posix_timers`, unlinked
     /// by that run alone after it drops the lock (`inner.collected`)
     elist: crate::util::list::Link,
+    /// The references its signal entry's flush puts, dropped a grace
+    /// period later (Linux posixtimer_putref -> posixtimer_free_timer:
+    /// kfree_rcu)
+    rcu: crate::sync::rcu::RcuPuts,
 }
 
 crate::adapter!(pub ElistAdapter, PosixTimer, elist);
+crate::rcu_puts!(PosixTimer, rcu);
 
 impl PosixTimer {
     /// An itimer, embedded in its SignalStruct (Linux signal->real_timer,
@@ -231,6 +236,7 @@ impl PosixTimer {
             sleeper: false,
             wq: crate::sync::waitqueue::WaitQueue::new(),
             elist: crate::util::list::Link::new(),
+            rcu: crate::sync::rcu::RcuPuts::new(),
         }
     }
 
@@ -263,7 +269,7 @@ impl PosixTimer {
         };
         let nr = match pid_type {
             PidType::Pid => owner_tid,
-            PidType::Tgid => crate::task::percpu::current_pid(),
+            PidType::Tgid | PidType::Pgid => crate::task::percpu::current_pid(),
         };
         let target = u32::try_from(nr)
             .ok()
@@ -281,6 +287,7 @@ impl PosixTimer {
             sleeper,
             wq: crate::sync::waitqueue::WaitQueue::new(),
             elist: crate::util::list::Link::new(),
+            rcu: crate::sync::rcu::RcuPuts::new(),
         }
     }
 
@@ -701,9 +708,17 @@ pub fn deliver(q: Box<SigQueue>) -> Option<crate::signal::SigInfo> {
     ok.then_some(info)
 }
 
-/// Timer `q`'s entry was flushed or not queued: back to its timer; an
-/// interval timer's signal discarded as ignored waits to be unignored
-/// (Linux posixtimer_sig_ignore)
+/// Timer `q`'s entry was flushed or not queued (Linux __sigqueue_free
+/// of a SIGQUEUE_PREALLOC entry, sigqueue_free_ignored): back to its
+/// timer; an interval timer's signal discarded as ignored waits to be
+/// unignored (Linux posixtimer_sig_ignore). Any context but hardirq,
+/// spin locks held or not (kill_fasync drops what its F_SETSIG stop
+/// signal or SIGCONT flushes under its own): the timer reference taken
+/// here is put a grace period later (Linux posixtimer_putref ->
+/// posixtimer_free_timer: kfree_rcu), so a timer deleted meanwhile is
+/// never torn down here. That drop, in `rcuc/N`, finds the timer
+/// deleted (the registry's reference goes after `delete`), its hrtimer
+/// idle.
 pub fn reclaim(q: Box<SigQueue>) {
     let Some(t) = q.timer().and_then(alloc::sync::Weak::upgrade) else {
         return;
@@ -715,6 +730,7 @@ pub fn reclaim(q: Box<SigQueue>) {
         }
     }
     *t.sigq.lock() = Some(q);
+    crate::sync::rcu::put_rcu(t);
 }
 
 /// `sig`'s action no longer ignores it: the current process's interval

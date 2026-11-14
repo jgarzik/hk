@@ -397,7 +397,10 @@ pub fn trap_locked(g: &mut Group<'_>, s: &mut TaskSignalState, why: Why, event_s
 /// real parent, and to the leader's tracer if it is another process
 pub fn notify_cld() {
     let me = crate::task::percpu::current();
-    let Some(sig_struct) = me.cpu_group().cloned() else {
+    // The task's own reference: nothing is cloned on the common pass
+    // with no notice due (Linux tests signal->flags under the siglock
+    // get_signal holds)
+    let Some(sig_struct) = me.cpu_group() else {
         return;
     };
     let why = {
