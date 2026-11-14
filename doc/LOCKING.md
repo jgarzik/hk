@@ -1521,10 +1521,15 @@ leaving `ptrace_stop`), so no stale flag outlives a stop; while it is
 set, SIGKILL leaves the stop alone (`sigkill_task`, and the tracee,
 woken, sleeps `Uninterruptible` once it reads frozen with SIGKILL
 pending), and the guard's drop ends a stop with SIGKILL pending and
-wakes the tracee (Linux ptrace_unfreeze_traced). The arch register
-helpers take the TASKLIST read lock, then the tracee's `Task.sig`,
-held across the frame access (a stop ends only under it); they and
-the single-step helpers lock for themselves, so callers hold neither.
+wakes the tracee (Linux ptrace_unfreeze_traced). The tracee's user
+register frame is touched only through `ptrace::with_stopped_regs`
+(the arch register and single-step helpers): TASKLIST's read lock,
+then the tracee's `Task.sig`, held across the frame access (a stop
+ends only under it), ESRCH unless the tracee is stopped and frozen
+(Linux: regs of a task ptrace_check_attach froze); callers hold
+neither. A detach clears the single-step flag while the tracee is
+still frozen, before it is untraced (Linux ptrace_detach:
+ptrace_disable first).
 
 **Source of Truth for Scheduling** (owner CPU's rq, IrqSpinlock):
 1. **Runnable**: entry `queued` (in `CpuRunQueue.queue`)

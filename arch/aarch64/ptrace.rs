@@ -4,8 +4,8 @@
 //! for ptrace operations.
 
 use crate::task::Task;
-use crate::task::percpu::TASKLIST;
-use crate::util::error::{KernelError, KernelResult};
+use crate::task::ptrace::with_stopped_regs;
+use crate::util::error::KernelResult;
 
 // =============================================================================
 // User register structure (matches Linux struct user_pt_regs)
@@ -42,59 +42,27 @@ pub type UserRegs = UserPtRegs;
 // Register access functions
 // =============================================================================
 
-/// Get all general-purpose registers from a stopped tracee.
-///
-/// The tracee must be in Traced state. This reads its user registers
-/// from its pt_regs (the entry frame at the top of its kernel stack).
+/// All general-purpose registers of tracee `t`, from its pt_regs, held
+/// in its ptrace stop ([`with_stopped_regs`]; ESRCH otherwise)
 pub fn get_user_regs(t: &Task) -> KernelResult<UserPtRegs> {
-    let table = TASKLIST.read();
-    let task = table.view(t).ok_or(KernelError::NoProcess)?;
-
-    // Check task is in traced state
-    let stop = task.task.sig.lock();
-    if !stop.traced() {
-        return Err(KernelError::NoProcess); // not stopped
-    }
-
-    // Its pt_regs: the frame at the top of its kernel stack
-    // SAFETY: the tracee is in a ptrace stop, which ends only under
-    // its Task.sig (held), and switched out (ptrace_check_attach):
-    // its frame is stable
-    let tf = unsafe { &*crate::task::percpu::task_pt_regs(task.task) };
-
-    let regs = UserPtRegs {
+    with_stopped_regs(t, |tf| UserPtRegs {
         regs: tf.x,
         sp: tf.sp,
         pc: tf.elr,
         pstate: tf.spsr,
-    };
-
-    Ok(regs)
+    })
 }
 
-/// Set all general-purpose registers for a stopped tracee.
-///
-/// The tracee must be in Traced state. This updates its pt_regs so the
-/// registers take effect when it resumes.
+/// Set all general-purpose registers of tracee `t`, in its pt_regs,
+/// held in its ptrace stop ([`with_stopped_regs`]; ESRCH otherwise), to
+/// take effect when it resumes
 pub fn set_user_regs(t: &Task, regs: &UserPtRegs) -> KernelResult<()> {
-    let table = TASKLIST.read();
-    let task = table.view(t).ok_or(KernelError::NoProcess)?;
-
-    // Check task is in traced state
-    let stop = task.task.sig.lock();
-    if !stop.traced() {
-        return Err(KernelError::NoProcess); // not stopped
-    }
-
-    // Update its pt_regs with the new register values
-    // SAFETY: as in get_user_regs
-    let tf = unsafe { &mut *crate::task::percpu::task_pt_regs(task.task) };
-    tf.x = regs.regs;
-    tf.sp = regs.sp;
-    tf.elr = regs.pc;
-    tf.spsr = sanitize_pstate(regs.pstate);
-
-    Ok(())
+    with_stopped_regs(t, |tf| {
+        tf.x = regs.regs;
+        tf.sp = regs.sp;
+        tf.elr = regs.pc;
+        tf.spsr = sanitize_pstate(regs.pstate);
+    })
 }
 
 /// Sanitize PSTATE to prevent setting dangerous bits.
@@ -124,25 +92,18 @@ const PSTATE_SS: u64 = 1 << 21;
 /// 2. Set MDSCR_EL1.SS = 1 (handled by kernel debug setup)
 ///
 /// The CPU will generate a software step exception after one instruction.
-pub fn enable_single_step(t: &Task) {
-    let table = TASKLIST.read();
-    if let Some(task) = table.view(t) {
-        // Set SS bit in SPSR (will be loaded into PSTATE on exception return)
-        // SAFETY: as in get_user_regs
-        unsafe { (*crate::task::percpu::task_pt_regs(task.task)).spsr |= PSTATE_SS };
-    }
-
+///
+/// Linux user_enable_single_step; the tracee held in its ptrace stop
+/// ([`with_stopped_regs`]; ESRCH otherwise).
+pub fn enable_single_step(t: &Task) -> KernelResult<()> {
+    // The SS bit in SPSR, loaded into PSTATE on exception return
     // TODO: Also need to set MDSCR_EL1.SS globally or per-task
     // For now, assume debug is enabled system-wide
+    with_stopped_regs(t, |tf| tf.spsr |= PSTATE_SS)
 }
 
-/// Disable single-step mode for a task.
-///
-/// Clears the SS bit in PSTATE.
-pub fn disable_single_step(t: &Task) {
-    let table = TASKLIST.read();
-    if let Some(task) = table.view(t) {
-        // SAFETY: as in get_user_regs
-        unsafe { (*crate::task::percpu::task_pt_regs(task.task)).spsr &= !PSTATE_SS };
-    }
+/// Disable single-step mode for a task: the SS bit in PSTATE cleared
+/// (Linux user_disable_single_step), the tracee held in its ptrace stop
+pub fn disable_single_step(t: &Task) -> KernelResult<()> {
+    with_stopped_regs(t, |tf| tf.spsr &= !PSTATE_SS)
 }

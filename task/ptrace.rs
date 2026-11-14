@@ -248,6 +248,32 @@ impl Drop for Frozen {
     }
 }
 
+/// A tracee's user register frame (Linux task_pt_regs)
+pub type PtRegs = <crate::arch::CurrentArch as crate::arch::Arch>::TrapFrame;
+
+/// Run `f` on tracee `t`'s user register frame, which only a tracer's
+/// request may touch, with the tracee held in its ptrace stop (Linux:
+/// regs of a task ptrace_check_attach froze; arch_ptrace,
+/// user_enable_single_step): ESRCH unless `t` is listed, stopped and
+/// frozen. The stop is checked under TASKLIST's read lock and the
+/// tracee's Task.sig, held across `f` (a stop ends only under it).
+pub fn with_stopped_regs<R>(t: &Task, f: impl FnOnce(&mut PtRegs) -> R) -> KernelResult<R> {
+    let table = TASKLIST.read();
+    let v = table.view(t).ok_or(KernelError::NoProcess)?;
+    let s = v.task.sig.lock();
+    if !s.traced() || !s.frozen() {
+        return Err(KernelError::NoProcess);
+    }
+    // SAFETY: the frame at the top of the tracee's kernel stack, which
+    // the tracee writes only on a kernel entry or exit; it is in a ptrace
+    // stop its tracer's request holds (PTRACE_FROZEN, set before
+    // ptrace_check_attach waited for it to switch out), which ends only
+    // under its Task.sig, held here: no other access races this one
+    let r = f(unsafe { &mut *percpu::task_pt_regs(v.task) });
+    drop(s);
+    Ok(r)
+}
+
 /// Task `t` is being traced
 pub fn is_traced(t: &Task) -> bool {
     TASKLIST.read().view(t).is_some_and(|v| v.ptrace != 0)
@@ -386,12 +412,14 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> KernelResult<i64> {
     let _frozen = ptrace_check_attach(&task)?;
     let sig = resume_sig(u64::from(signal))?;
 
+    // The trap flag off while the tracee is held in its stop, before it
+    // is untraced (Linux ptrace_detach: ptrace_disable first)
+    crate::arch::ptrace::disable_single_step(&task)?;
     {
         let mut table = TASKLIST.write();
         let mut t = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
         ptrace_unlink(&mut t);
     }
-    crate::arch::ptrace::disable_single_step(&task);
 
     // Resume it, delivering `signal` (Linux ptrace_detach: exit_code)
     ptrace_wake(&task, sig);
@@ -462,11 +490,12 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u64) -> KernelResult<i64
         }
     }
 
-    // The trap flag (these take TASKLIST themselves)
+    // The trap flag, in the frame of the tracee held in its stop (Linux
+    // ptrace_resume: user_enable_single_step after ptrace_check_attach)
     if request == PTRACE_SINGLESTEP {
-        crate::arch::ptrace::enable_single_step(&task);
+        crate::arch::ptrace::enable_single_step(&task)?;
     } else {
-        crate::arch::ptrace::disable_single_step(&task);
+        crate::arch::ptrace::disable_single_step(&task)?;
     }
 
     ptrace_wake(&task, sig);
