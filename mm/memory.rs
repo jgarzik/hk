@@ -72,7 +72,8 @@ pub(super) fn exit_mmap(mm: &Mm) {
     // (Linux exit_mmap), so no `PgTables` of this mm lives meanwhile.
     let mut map = mm.mmap_write();
     let vmas: Vec<_> = map.take_vmas();
-    // The executable's path too (Linux mmput: set_mm_exe_file(mm, NULL))
+    // The executable too (Linux __mmput: set_mm_exe_file(mm, NULL)),
+    // with its write denial: the mm itself may outlive its users
     let exe = map.take_exe();
     let mut tlb = Gather::new_full(mm);
     tlb.free_tables(super::pgtable::detach_user(mm, &mut map));

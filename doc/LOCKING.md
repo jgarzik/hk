@@ -2420,7 +2420,14 @@ fails the upgrade and counts as absent. Eviction (`Drop for Inode` ->
 goes, possibly under spin locks: it takes `INODE_HASH_LOCK` (if hashed)
 and calls `->evict_inode`, which must not sleep; vfat queues the
 cluster freeing of an unlinked file on `SYSTEM_WQ`
-(`Workqueue.inner`, IrqSpinlock leaf). Deviation from Linux: no
+(`Workqueue.inner`, IrqSpinlock leaf). `->evict_inode` may upgrade
+the inode's `Weak` superblock: that reference is never the last,
+since an inode in use is reached, as in Linux, through something that
+holds a mount of its filesystem while the inode goes (a `Path` puts
+its dentry before its mount; the executable's write denial, Linux
+mm->exe_file, holds its file and goes with the address space's last
+user, not with a last mm_count reference in finish_task_switch), or
+by the superblock's own teardown, when the upgrade fails. Deviation from Linux: no
 unused-inode LRU or I_NEW state (an inode is complete before it is
 hashed; the losing builder's inode is dropped unhashed).
 
@@ -4828,7 +4835,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `CMDLINE_CONSOLE` | cmdline.rs | spin Mutex | console= choice |
 | `CPU_CRNG` (per CPU) -> `BASE` | random.rs | IrqSpinlock | ChaCha20 CRNG: this CPU's key, then the base key when the CPU key is refreshed or the base reseeded; both leaves otherwise (callers include softirq net code). `GENERATION`/`BIRTH_NS` are atomics read unlocked, rechecked under `BASE` |
 | `Inode.i_linkable` | fs/inode.rs | atomic flag | an O_TMPFILE file not opened O_EXCL may get its first name (Linux I_LINKABLE in i_state under i_lock): set before the file is reachable, tested and cleared by linkat under the inode's `i_rwsem` (`link_locked`) |
-| `Inode.i_writecount`, `Inode.i_swapfile` | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write_access`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: set and cleared by swapon/swapoff
+| `Inode.i_writecount`, `Inode.i_swapfile` | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write` through a file's `DenyWrite`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: set and cleared by swapon/swapoff
 under its i_rwsem, `SWAPON` -> i_rwsem, and checked under it by
 writes and truncates). The address space holds the executable's denial (`MmStruct.exe_deny`, cloned at fork) |
 | `BdiWriteback.pass` | mm/writeback.rs, fs/fs_writeback.rs | sleeping `sync::Mutex` | serializes writeback passes over one disk's lists (`wb_writeback`: sync, syncfs, umount, the periodic writeback; Linux runs them one at a time from the wb's work list), held across their I/O: pass -> page lock -> i_mmap -> PTE lock, and `list_lock` taken and released under it per step. fsync writes its inode without it; a page another pass is writing carries the WRITEBACK mark and its writer holds its page lock, so fsync waits on that lock |
