@@ -322,9 +322,14 @@ pub(super) fn ldata(tty: &Tty) -> Ld<'_> {
     }
 }
 
-/// Write the queued echo to the driver as far as it takes it (Linux
-/// __process_echoes: what does not fit stays queued for later)
+/// Write the queued echo to the driver as far as it takes it, under
+/// `output_lock` (Linux process_echoes -> __process_echoes: what does
+/// not fit stays queued for later)
 fn process_echoes(tty: &Tty, ld: &mut NTtyData) {
+    if ld.echo_tail == ld.echo_head {
+        return;
+    }
+    let _o = tty.output_lock.lock();
     while ld.echo_tail != ld.echo_head {
         let i = ld.echo_tail % ECHO_BUF_SIZE;
         let n = ld
@@ -657,12 +662,13 @@ pub fn poll_in(tty: &Tty) -> bool {
 }
 
 /// Write (Linux iterate_tty_write + n_tty_write), under the tty's
-/// write lock: through a kernel buffer a chunk at a time, waiting for
-/// the driver's room (EAGAIN if `nonblock`); an error after some bytes
-/// returns their count. Stopped short with O_ASYNC files listening, it
-/// asks for their SIGIO POLL_OUT once the driver has room (Linux
-/// TTY_DO_WRITE_WAKEUP)
+/// write lock: pending echo first, then through a kernel buffer a chunk
+/// at a time, waiting for the driver's room (EAGAIN if `nonblock`); an
+/// error after some bytes returns their count. Stopped short with
+/// O_ASYNC files listening, it asks for their SIGIO POLL_OUT once the
+/// driver has room (Linux TTY_DO_WRITE_WAKEUP)
 pub fn write(tty: &Tty, from: &mut IovSource<'_>, nonblock: bool) -> Result<usize, KernelError> {
+    process_echoes(tty, &mut ldata(tty));
     let mut chunk = [0u8; 512];
     let mut done = 0;
     while !from.is_empty() {
@@ -684,55 +690,182 @@ pub fn write(tty: &Tty, from: &mut IovSource<'_>, nonblock: bool) -> Result<usiz
     Ok(done)
 }
 
-/// Hand `data` to the driver as it takes it, waiting for room between
-/// partial takes: the bytes taken, and the error that stopped it
-fn write_some(tty: &Tty, mut data: &[u8], nonblock: bool) -> (usize, Result<(), KernelError>) {
-    let mut done = 0;
-    while !data.is_empty() {
-        let n = match tty.driver_write(data) {
-            Ok(n) => n.min(data.len()),
-            Err(e) => return (done, Err(e)),
-        };
-        done += n;
-        data = &data[n..];
-        if !data.is_empty()
-            && let Err(e) = tty.wait_room(1, nonblock)
-        {
-            return (done, Err(e));
+/// Output one character needing OPOST processing, `output_lock` held
+/// (Linux do_output_char): NL as CR NL under ONLCR, both or neither;
+/// false if the driver has no room for it
+fn do_output_char(tty: &Tty, t: &Termios, c: u8) -> Result<bool, KernelError> {
+    let space = tty.write_room();
+    if c == b'\n' && t.c_oflag & ONLCR != 0 {
+        if space < 2 {
+            return Ok(false);
         }
+        tty.driver_write(b"\r\n")?;
+        return Ok(true);
     }
-    (done, Ok(()))
+    if space == 0 {
+        return Ok(false);
+    }
+    Ok(tty.driver_write(&[c])? == 1)
 }
 
-/// Write one chunk, OPOST with ONLCR mapping NL to CR-NL (Linux
-/// process_output_block, which waits for room for both): the input
-/// bytes written, and the error that stopped it
+/// Linux process_output: one character, under `output_lock`
+fn process_output(tty: &Tty, t: &Termios, c: u8) -> Result<bool, KernelError> {
+    let _o = tty.output_lock.lock();
+    do_output_char(tty, t, c)
+}
+
+/// The run of `buf` the driver has room for, up to the first character
+/// needing processing (Linux process_output_block), under
+/// `output_lock`: the bytes written
+fn process_output_block(tty: &Tty, t: &Termios, buf: &[u8]) -> Result<usize, KernelError> {
+    let _o = tty.output_lock.lock();
+    let space = tty.write_room();
+    let n = buf.len().min(space);
+    let special = |&c: &u8| c == b'\n' && t.c_oflag & ONLCR != 0;
+    let i = buf[..n].iter().position(special).unwrap_or(n);
+    if i == 0 {
+        return Ok(0);
+    }
+    tty.driver_write(&buf[..i])
+}
+
+/// Write one chunk (Linux n_tty_write's loop): OPOST output a block at
+/// a time, else straight to the driver, both under `output_lock` so
+/// echo never lands inside a CR NL; out of room, wait for it (a CR NL
+/// needs two). The input bytes written, and the error that stopped it
 fn write_chunk(tty: &Tty, buf: &[u8], nonblock: bool) -> (usize, Result<(), KernelError>) {
-    let t = tty.get_termios();
-    if t.c_oflag & OPOST == 0 || t.c_oflag & ONLCR == 0 {
-        return write_some(tty, buf, nonblock);
-    }
-    let mut done = 0;
-    for piece in buf.split_inclusive(|&b| b == b'\n') {
-        let (text, nl) = match piece.split_last() {
-            Some((b'\n', rest)) => (rest, true),
-            _ => (piece, false),
+    let mut b = buf;
+    while !b.is_empty() {
+        let t = tty.get_termios();
+        let opost = t.c_oflag & OPOST != 0;
+        let r = if opost {
+            output_opost(tty, &t, &mut b)
+        } else {
+            output_raw(tty, &mut b)
         };
-        let (n, r) = write_some(tty, text, nonblock);
-        done += n;
-        if r.is_err() {
-            return (done, r);
+        if let Err(e) = r {
+            return (buf.len() - b.len(), Err(e));
         }
-        if nl {
-            if let Err(e) = tty.wait_room(2, nonblock) {
-                return (done, Err(e));
-            }
-            let (_, r) = write_some(tty, b"\r\n", nonblock);
-            if r.is_err() {
-                return (done, r);
-            }
-            done += 1;
+        let Some(&c) = b.first() else {
+            break;
+        };
+        let need = if opost && c == b'\n' && t.c_oflag & ONLCR != 0 {
+            2
+        } else {
+            1
+        };
+        if let Err(e) = tty.wait_room(need, nonblock) {
+            return (buf.len() - b.len(), Err(e));
         }
     }
-    (done, Ok(()))
+    (buf.len(), Ok(()))
+}
+
+/// OPOST output of `b` while the driver has room; `b` is left at the
+/// first byte not written
+fn output_opost(tty: &Tty, t: &Termios, b: &mut &[u8]) -> Result<(), KernelError> {
+    while !b.is_empty() {
+        let n = process_output_block(tty, t, b)?.min(b.len());
+        *b = &b[n..];
+        let Some(&c) = b.first() else {
+            break;
+        };
+        if !process_output(tty, t, c)? {
+            break;
+        }
+        *b = &b[1..];
+    }
+    Ok(())
+}
+
+/// Raw output of `b` while the driver takes it
+fn output_raw(tty: &Tty, b: &mut &[u8]) -> Result<(), KernelError> {
+    while !b.is_empty() {
+        let n = {
+            let _o = tty.output_lock.lock();
+            tty.driver_write(b)?.min(b.len())
+        };
+        if n == 0 {
+            break;
+        }
+        *b = &b[n..];
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use crate::fs::chardev::DevId;
+    use crate::tty::TtyDriver;
+    use alloc::vec::Vec;
+    use std::sync::Mutex;
+
+    /// A driver taking 2 bytes; its first room check (`steal`) lets
+    /// N_TTY echo in, unless the output lock keeps it out until the
+    /// write is done (`late`)
+    struct Fake {
+        out: Mutex<Vec<u8>>,
+        steal: AtomicBool,
+        late: AtomicBool,
+    }
+
+    const CAP: usize = 2;
+
+    impl TtyDriver for Fake {
+        fn write(&self, _tty: &Tty, data: &[u8]) -> Result<usize, KernelError> {
+            let mut o = self.out.lock().unwrap();
+            let n = data.len().min(CAP - o.len());
+            o.extend_from_slice(&data[..n]);
+            Ok(n)
+        }
+        fn send_xchar(&self, _tty: &Tty, _ch: u8) {}
+        fn write_room(&self) -> usize {
+            let room = CAP - self.out.lock().unwrap().len();
+            if self.steal.swap(false, Ordering::Relaxed) {
+                if TTY.output_lock.try_lock().is_some() {
+                    self.out.lock().unwrap().push(b'E');
+                } else {
+                    self.late.store(true, Ordering::Relaxed);
+                }
+            }
+            room
+        }
+        fn console_write(&self, _data: &[u8]) {}
+    }
+
+    static FAKE: Fake = Fake {
+        out: Mutex::new(Vec::new()),
+        steal: AtomicBool::new(false),
+        late: AtomicBool::new(false),
+    };
+    static TTY: Tty = Tty::new("fake", DevId::new(0, 0), &FAKE);
+
+    /// An ONLCR newline goes out as CR NL whole or not at all: echo
+    /// arriving between the room check and the write cannot leave a
+    /// lone CR that a retry repeats (Linux do_output_char under
+    /// output_lock)
+    #[test]
+    fn onlcr_pair_whole() {
+        let mut log = Vec::new();
+        FAKE.steal.store(true, Ordering::Relaxed);
+        let mut r = write(&TTY, &mut IovSource::kernel(b"\n"), true);
+        for _ in 0..2 {
+            log.append(&mut FAKE.out.lock().unwrap());
+            if FAKE.late.swap(false, Ordering::Relaxed) {
+                log.push(b'E');
+            }
+            if r != Err(KernelError::WouldBlock) {
+                break;
+            }
+            r = write(&TTY, &mut IovSource::kernel(b"\n"), true);
+        }
+        assert_eq!(r, Ok(1));
+        assert!(
+            !log.windows(2).any(|w| w == b"\r\r"),
+            "CR repeated: {:?}",
+            log
+        );
+    }
 }

@@ -236,6 +236,9 @@ pub struct Tty {
     /// One writer at a time, held across a whole write(2) so another's
     /// bytes never land inside it (Linux tty->atomic_write_lock)
     write_lock: crate::sync::Mutex<()>,
+    /// Serializes N_TTY output with its echo, so a byte pair (CR NL)
+    /// checked for room goes out whole (Linux n_tty_data.output_lock)
+    output_lock: crate::sync::Mutex<()>,
     /// Session, foreground group, window size
     ctrl: Mutex<TtyCtrl>,
     /// O_ASYNC files (Linux tty->fasync)
@@ -267,6 +270,7 @@ impl Tty {
             buf_lock: crate::sync::Mutex::new(()),
             read_lock: crate::sync::Mutex::new(()),
             write_lock: crate::sync::Mutex::new(()),
+            output_lock: crate::sync::Mutex::new(()),
             read_wait: WaitQueue::new(),
             write_wait: WaitQueue::new(),
             ctrl: Mutex::new(TtyCtrl::new()),
