@@ -11,7 +11,7 @@
 //! is left.
 
 use crate::harness::verdict;
-use crate::helpers::sleep_ms;
+use crate::helpers::{linux_at_least, sleep_ms};
 use crate::mm::fork_mm::spawn_thread;
 use hk_syscall::{
     P_PID, SigInfo, WEXITED, Zeroable, sys_close, sys_execve, sys_exit, sys_exit_group, sys_fork,
@@ -301,7 +301,11 @@ fn in_pidns(f: fn() -> u64) -> u64 {
 }
 
 /// SIGCHLD blocked, a child whose leader exits before its thread: the
-/// notice's si_pid, code and status; 0, else the failed step
+/// notice's si_pid, code and status; 0, else the failed step. The last
+/// thread's exit sets the group's exit code (Linux 5.17+
+/// synchronize_group_exit), which the notice carries from Linux 6.15
+/// (9133607de37a: release_task copies it to the leader's exit_code);
+/// before, the leader's own code
 fn notice_steps() -> u64 {
     use hk_syscall::{sys_rt_sigprocmask, sys_rt_sigtimedwait};
     const SIGCHLD: u32 = 17;
@@ -325,7 +329,7 @@ fn notice_steps() -> u64 {
     let w = sys_wait4(pid, &mut st, 0, 0);
     if r != SIGCHLD as i64 {
         1
-    } else if i.si_code != CLD_EXITED || i.si_status != 5 {
+    } else if i.si_code != CLD_EXITED || i.si_status != if linux_at_least(6, 15) { 5 } else { 3 } {
         2
     } else if i.si_pid as i64 != pid {
         3

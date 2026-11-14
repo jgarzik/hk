@@ -195,6 +195,25 @@ fn take_chld() -> Option<(i32, i32, i64)> {
     (r == SIGCHLD as i64).then_some((i.si_code, i.si_status, i.si_pid as i64))
 }
 
+/// Print the SIGCHLD `got` for child `c` where another was due
+fn report_chld(c: i64, got: Option<(i32, i32, i64)>) {
+    use crate::helpers::{print, print_num, println};
+    print(b"JOBCTL notice for ");
+    print_num(c);
+    match got {
+        None => print(b": none within 5 s"),
+        Some((code, status, pid)) => {
+            print(b": code ");
+            print_num(code as i64);
+            print(b" status ");
+            print_num(status as i64);
+            print(b" pid ");
+            print_num(pid);
+        }
+    }
+    println(b"");
+}
+
 /// wait4(`pid`, `flags`) within 5 s, so a stop or continue that never
 /// comes fails instead of hanging: its result (0: none yet)
 pub(crate) fn wait_within(pid: i64, st: &mut i32, flags: i32) -> i64 {
@@ -224,11 +243,18 @@ fn stop_cont() -> i32 {
 fn stop_cont_steps(c: i64, tids: &[i64; 3]) -> i32 {
     let mut st = 0i32;
     sys_kill(c, SIGSTOP);
+    // The notice first: its si_status is the group's stop code, read
+    // once the last stopping thread drops the siglock, which a wait that
+    // already saw the stop consumes (Linux do_notify_parent_cldstop reads
+    // signal->group_exit_code, wait_task_stopped zeroes it): the notice
+    // then says 0, on Linux as on hk
+    let got = take_chld();
+    if got != Some((CLD_STOPPED, SIGSTOP as i32, c)) {
+        report_chld(c, got);
+        return 2;
+    }
     if wait_within(c, &mut st, WUNTRACED) != c || st != STOPPED_SIGSTOP {
         return 1;
-    }
-    if take_chld() != Some((CLD_STOPPED, SIGSTOP as i32, c)) {
-        return 2;
     }
     if !all_threads(c, tids, true) {
         return 3;

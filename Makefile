@@ -31,7 +31,7 @@ KERNEL_FEATURES += $(if $(OVERFLOW),--config profile.release.overflow-checks=tru
 MACHINE ?=
 
 .PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image disk-image
-.PHONY: test-arm build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines gate check-stress unsafe-stats check-bigmem
+.PHONY: test-arm build-arm run-arm check-arm check-linux check-linux-arm check-linux-ci check-linux-arm-ci user-arm clippy clippy-arm fmt list-machines gate check-stress unsafe-stats check-bigmem
 
 # Default: build everything (kernel, user binaries, ISO)
 all: iso
@@ -62,6 +62,7 @@ help:
 	@echo "  make check-arm - Boot ARM64 kernel, verify tests pass"
 	@echo "  make check-linux - Run boot tests on a real Linux kernel (native arch)"
 	@echo "  make check-linux-arm - Same, aarch64 Linux (emulated on x86 hosts)"
+	@echo "  make check-linux-ci, check-linux-arm-ci - Same, on CI's Linux (CI_UBUNTU)"
 	@echo "  make gate     - Full per-commit gate, the four boots in parallel"
 	@echo "  make check-stress - Flake sweep: repeated check/check-arm boots"
 	@echo "                  (STRESS_N=10 per arch, STRESS_JOBS=3 at a time)"
@@ -289,6 +290,16 @@ check-linux: $(call nobuild,disk-image)
 LINUX_ARM_TEST_TIMEOUT ?= 900
 check-linux-arm: $(call nobuild,disk-image)
 	./tools/linux-boot-tester.sh -a aarch64 -T $(LINUX_ARM_TEST_TIMEOUT)
+
+# Both, on CI's reference Linux (the runners' Ubuntu release, so its
+# linux-image-generic), beside the host's: behavior that changed between
+# Linux versions shows before CI
+CI_UBUNTU ?= noble
+check-linux-ci: $(call nobuild,disk-image)
+	LINUX_RELEASE=$(CI_UBUNTU) ./tools/linux-boot-tester.sh -T $(LINUX_TEST_TIMEOUT)
+
+check-linux-arm-ci: $(call nobuild,disk-image)
+	LINUX_RELEASE=$(CI_UBUNTU) ./tools/linux-boot-tester.sh -a aarch64 -T $(LINUX_ARM_TEST_TIMEOUT)
 
 info-arm: build-arm
 	@echo "ARM Kernel: $(KERNEL_ARM)"
