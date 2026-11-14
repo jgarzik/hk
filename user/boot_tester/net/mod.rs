@@ -1,6 +1,7 @@
 //! Networking tests
 
 pub mod bpf;
+pub mod fasync_tap;
 pub mod icmp;
 pub mod neigh;
 pub mod net_stress;

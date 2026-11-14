@@ -840,16 +840,12 @@ impl File {
         self.f_op
     }
 
-    /// Set or clear O_ASYNC: only `io::fasync::fasync_helper`, with the
-    /// list change, so the flag means "on a fasync list" (Linux
-    /// fasync_insert_entry under f_lock)
-    pub(crate) fn set_fasync_flag(&self, on: bool) {
-        let mut fl = self.f_lock.lock();
-        if on {
-            *fl |= flags::O_ASYNC;
-        } else {
-            *fl &= !flags::O_ASYNC;
-        }
+    /// The file's flags under `f_lock` (Linux filp->f_lock), for
+    /// `io::fasync::fasync_helper`, which sets or clears O_ASYNC with the
+    /// list change under it, so the flag means "on a fasync list" (Linux
+    /// fasync_insert_entry / fasync_remove_entry)
+    pub(crate) fn f_lock(&self) -> crate::sync::spin::MutexGuard<'_, u32> {
+        self.f_lock.lock()
     }
 
     /// Turn O_ASYNC on or off for descriptor `fd` (F_SETFL, FIOASYNC)

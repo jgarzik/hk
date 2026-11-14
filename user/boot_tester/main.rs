@@ -394,6 +394,7 @@ pub fn run_all_tests() {
     net::icmp::run_ping_tests();
     net::raw::run_tests();
     net::packet::run_tests();
+    net::fasync_tap::run_tests();
     net::tcp_xfer::run_tests();
     net::tcp_conn::run_tests();
     net::tcp_mem::run_tests();

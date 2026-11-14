@@ -733,11 +733,8 @@ Phase A2 (net) remaining:
 - ICMP global limiter (icmp_global_allow) and inet_peer on the RbTree
   with `new_gfp(ATOMIC)` nodes and Linux's GC thresholds.
 - Raw, UDP, packet and netlink socket tables still allocate under their
-  spin locks: fan-out delivery under RCU needs `kill_fasync` RCU-safe
-  as Linux (fasync_lock spin + RCU fasync list) instead of the
-  sleeping `FasyncList.list`; then hslot/RCU tables, sock_reuseport
-  groups (GFP_ATOMIC under reuseport_lock), packet RCU sklist, netlink
-  RCU portid table.
+  spin locks: hslot/RCU tables, sock_reuseport groups (GFP_ATOMIC under
+  reuseport_lock), packet RCU sklist, netlink RCU portid table.
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
 - TCP (`net/tcp/mod.rs`): a SYN backlogged while `listen()` owns the

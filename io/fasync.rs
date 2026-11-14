@@ -23,7 +23,6 @@
 //! then the signal locks (TASKLIST read, Task.sig, shared_pending).
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fs::File;
@@ -31,10 +30,13 @@ use crate::io::poll::{
     POLLERR, POLLHUP, POLLIN, POLLMSG, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND,
     POLLWRNORM,
 };
+use crate::mm::page_alloc::Gfp;
 use crate::signal::siginfo::{SigFields, SigInfo, si_code};
 use crate::signal::{
     SIGIO, SIGURG, SendInfo, Signal, group_task, send_group_signal, send_sig_info, valid_signal,
 };
+use crate::sync::IrqRwLock;
+use crate::sync::rcu::RcuHead;
 use crate::sync::spin::Mutex;
 use crate::task::Uid;
 use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef, TaskView};
@@ -42,6 +44,9 @@ use crate::task::pid::Pid;
 use crate::uaccess::{get_user, put_user};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
+use crate::util::kalloc::with_gfp;
+use crate::util::list::Link;
+use crate::util::rculist::RcuList;
 
 /// SIGPOLL si_codes, the `band` of [`kill_fasync`] (asm-generic
 /// siginfo.h)
@@ -87,21 +92,22 @@ struct Owner {
 /// A file's SIGIO owner (Linux struct fown_struct)
 #[derive(Default)]
 pub struct FOwner {
-    /// Spin leaf (Linux fown->lock), thread context
-    st: Mutex<Owner>,
+    /// Linux fown->lock: an IRQ-safe rwlock, its read side held across a
+    /// send (the owner's pid borrowed, no reference taken)
+    st: IrqRwLock<Owner>,
 }
 
 impl FOwner {
     /// A copy of the state, the lock released
     fn get(&self) -> Owner {
-        self.st.lock().clone()
+        self.st.read().clone()
     }
 
     /// Linux __f_setown: `pid` of `kind` with the caller's uids, unless
     /// an owner is set and not `force`; the old pid goes after unlocking
     fn set(&self, pid: Option<Arc<Pid>>, kind: PidType, force: bool) {
         let cred = crate::task::current_cred();
-        let mut st = self.st.lock();
+        let mut st = self.st.write();
         if !force && st.pid.is_some() {
             drop(st);
             return;
@@ -254,13 +260,13 @@ pub fn f_setsig(file: &File, sig: u64) -> Result<(), KernelError> {
     // An int (Linux argi) widened to valid_signal's unsigned long, so
     // a negative one is out of range
     let sig = valid_signal(sig as i32 as u64).ok_or(KernelError::InvalidArgument)?;
-    file.f_owner_alloc()?.st.lock().signum = sig;
+    file.f_owner_alloc()?.st.write().signum = sig;
     Ok(())
 }
 
 /// F_GETSIG: 0 when never set
 pub fn f_getsig(file: &File) -> u32 {
-    let sig = file.f_owner().and_then(|own| own.st.lock().signum);
+    let sig = file.f_owner().and_then(|own| own.st.read().signum);
     sig.map_or(0, Signal::nr)
 }
 
@@ -268,28 +274,56 @@ pub fn f_getsig(file: &File) -> u32 {
 // fasync lists
 // =============================================================================
 
-/// One armed file (Linux fasync_struct): its owner and the descriptor
-/// it was armed through (si_fd)
-struct Fasync {
-    owner: Arc<FOwner>,
-    fd: i32,
+/// What an armed entry signals: the file's owner and the descriptor it
+/// was armed through (si_fd); None once the entry is taken off (Linux
+/// fa_file = NULL), which a walker that still sees it skips
+type FaTarget = Option<(Arc<FOwner>, i32)>;
+
+/// One armed file (Linux fasync_struct), on its object's RCU list and
+/// freed a grace period after leaving it
+pub struct Fasync {
+    /// Linux fa_lock: IRQ-safe rwlock, read by a walker around its
+    /// send, written by fasync_helper (a new fd, the entry taken off)
+    fa: IrqRwLock<FaTarget>,
+    link: Link,
+    rcu: RcuHead,
 }
 
+crate::adapter!(pub FaList, Fasync, link);
+crate::rcu_head!(Fasync, rcu);
+
+impl Fasync {
+    /// It signals `owner` (by identity)
+    fn is(&self, owner: &Arc<FOwner>) -> bool {
+        self.fa
+            .read()
+            .as_ref()
+            .is_some_and(|(o, _)| Arc::ptr_eq(o, owner))
+    }
+}
+
+/// Serializes changes to every fasync list (Linux fasync_lock): a
+/// find-then-insert or remove is one step. Spin, thread context; under
+/// `File.f_lock`, above each entry's `fa`
+static FASYNC_LOCK: Mutex<()> = Mutex::new(());
+
 /// The files to signal when an object becomes ready (Linux struct
-/// fasync_struct *, e.g. pipe->fasync_readers)
+/// fasync_struct *, e.g. pipe->fasync_readers): read under RCU
+/// ([`kill_fasync`], any context but hardirq, spin locks held or not),
+/// changed under `FASYNC_LOCK` ([`fasync_helper`])
 pub struct FasyncList {
-    /// Sleeping lock, thread context; signals are sent under it
-    list: crate::sync::Mutex<Vec<Fasync>>,
-    /// `list` is not empty: written under it, read lock-free so a wakeup
-    /// with nobody armed (nearly all) costs one load (Linux kill_fasync's
-    /// unlocked `*fp` test); a racing add may be missed, as in Linux
+    list: RcuList<FaList>,
+    /// `list` is not empty: written under `FASYNC_LOCK`, read lock-free
+    /// so a wakeup with nobody armed (nearly all) costs one load (Linux
+    /// kill_fasync's unlocked `*fp` test); a racing add may be missed,
+    /// as in Linux
     armed: AtomicBool,
 }
 
 impl FasyncList {
     pub const fn new() -> Self {
         Self {
-            list: crate::sync::Mutex::new(Vec::new()),
+            list: RcuList::new(),
             armed: AtomicBool::new(false),
         }
     }
@@ -314,48 +348,77 @@ pub fn fasync_helper(
         return Ok(fasync_remove(list, file));
     }
     let owner = file.f_owner_alloc()?.clone();
-    let mut l = list.list.lock();
-    if let Some(e) = l.iter_mut().find(|e| Arc::ptr_eq(&e.owner, &owner)) {
-        e.fd = fd;
+    // Made before the locks (Linux fasync_alloc)
+    let new = try_arc(Fasync {
+        fa: IrqRwLock::new(Some((owner.clone(), fd))),
+        link: Link::new(),
+        rcu: RcuHead::new(),
+    })?;
+    // Linux fasync_insert_entry: f_lock, then fasync_lock
+    let mut fl = file.f_lock();
+    let _l = FASYNC_LOCK.lock();
+    let g = crate::sync::rcu::read_lock();
+    if let Some(e) = list.list.iter(&g).find(|e| e.is(&owner)) {
+        if let Some((_, f)) = e.fa.write().as_mut() {
+            *f = fd;
+        }
         return Ok(false);
     }
-    l.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
-    l.push(Fasync { owner, fd });
+    drop(g);
+    list.list.push_back(new);
     list.armed.store(true, Ordering::Release);
-    file.set_fasync_flag(true);
+    *fl |= crate::fs::file::flags::O_ASYNC;
     Ok(true)
 }
 
-/// Linux fasync_remove_entry
+/// Linux fasync_remove_entry: the entry's target cleared under its
+/// `fa` (a walker still seeing it sends nothing), the entry unlinked and
+/// freed a grace period later
 fn fasync_remove(list: &FasyncList, file: &File) -> bool {
-    let Some(owner) = file.f_owner() else {
+    let Some(owner) = file.f_owner().cloned() else {
         return false;
     };
-    let mut l = list.list.lock();
-    let Some(i) = l.iter().position(|e| Arc::ptr_eq(&e.owner, owner)) else {
-        return false;
+    let gone = {
+        let mut fl = file.f_lock();
+        let _l = FASYNC_LOCK.lock();
+        let Some(e) = list.list.remove_first(|e| e.is(&owner)) else {
+            return false;
+        };
+        let target = e.item().fa.write().take();
+        list.armed.store(!list.list.is_empty(), Ordering::Release);
+        *fl &= !crate::fs::file::flags::O_ASYNC;
+        (e, target)
     };
-    l.swap_remove(i);
-    list.armed.store(!l.is_empty(), Ordering::Release);
-    file.set_fasync_flag(false);
+    // The owner reference and the entry go after the locks
+    let (e, target) = gone;
+    drop(target);
+    e.defer();
     true
 }
 
 /// Signal every file on `list` that the object is ready for `band` (a
-/// POLL_* code; Linux kill_fasync). `sig` SIGURG reaches only owners
-/// that chose a signal (SIGURG has its own path). Thread context, no
-/// spin lock held.
+/// POLL_* code; Linux kill_fasync, kill_fasync_rcu). `sig` SIGURG
+/// reaches only owners that chose a signal (SIGURG has its own path).
+/// Any context but hardirq, spin locks held or not: the list is walked
+/// under RCU, each entry's `fa` and its owner's `st` read-held around
+/// its send, which allocates GFP_ATOMIC (Linux send_sigio).
 pub fn kill_fasync(list: &FasyncList, sig: Signal, band: i32) {
     if !list.armed() {
         return;
     }
-    let l = list.list.lock();
-    for e in l.iter() {
-        let o = e.owner.get();
-        if !(sig == SIGURG && o.signum.is_none()) {
-            send_sigio(&o, e.fd, band);
+    let g = crate::sync::rcu::read_lock();
+    with_gfp(Gfp::ATOMIC, || {
+        for e in list.list.iter(&g) {
+            let fa = e.fa.read();
+            let Some((owner, fd)) = fa.as_ref() else {
+                continue;
+            };
+            let o = owner.st.read();
+            if !(sig == SIGURG && o.signum.is_none()) {
+                send_sigio(&o, *fd, band);
+            }
         }
-    }
+    });
 }
 
 // =============================================================================
@@ -435,18 +498,26 @@ fn send_sigio(o: &Owner, fd: i32, reason: i32) {
     let Some(pid) = &o.pid else {
         return;
     };
-    let targets = match o.kind {
+    match o.kind {
         PidType::Tid | PidType::Tgid => {
             let t = {
                 let table = TASKLIST.read();
                 let v = table.pid_tid(pid).and_then(|tid| table.get(tid));
                 v.and_then(|v| sigio_target(&table, o, &v))
             };
-            t.into_iter().collect()
+            if let Some(t) = t {
+                sigio_to_task(o, &t, fd, reason);
+            }
         }
-        PidType::Pgrp => GlobalTaskTable::collect_pgrp(pid, |table, t| sigio_target(table, o, t)),
-    };
-    for t in &targets {
-        sigio_to_task(o, t, fd, reason);
+        PidType::Pgrp => {
+            // GFP_ATOMIC: no memory, no signal (Linux walks the group
+            // under tasklist_lock instead)
+            let targets =
+                GlobalTaskTable::try_collect_pgrp(pid, |table, t| sigio_target(table, o, t))
+                    .unwrap_or_default();
+            for t in &targets {
+                sigio_to_task(o, t, fd, reason);
+            }
+        }
     }
 }

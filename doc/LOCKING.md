@@ -639,7 +639,7 @@ epoll, inotify, fanotify (3.11, io/): EPNESTED (sleeping) →
 Pipes (3.11): Pipe.inner (sleeping; two in address order) → frame
     allocator, and the mmap_lock of a faulting user copy (read, write
     and vmsplice copy between pipe pages and the caller's memory under
-    it, Linux pipe_read/pipe_write/vmsplice_to_pipe), and `FasyncList.list` (pipe_fasync);
+    it, Linux pipe_read/pipe_write/vmsplice_to_pipe), and `FASYNC_LOCK` (pipe_fasync);
     a pipe-to-file splice also writes the output file under it (its
     write path: i_rwsem, page cache, socket locks; Linux
     iter_file_splice_write under pipe_lock), and a file-to-pipe splice
@@ -648,12 +648,12 @@ Pipes (3.11): Pipe.inner (sleeping; two in address order) → frame
     write path of a non-pipe file takes a Pipe.inner; no other lock
     under it, none of these above it
 
-SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fown->lock):
-    FasyncList.list (sleeping, per object: a pipe's two, a socket's) → File.f_lock (fasync_helper
-    sets O_ASYNC with the list change) | FOwner.st (spin leaf, copied
-    and released before a send); kill_fasync sends under
-    FasyncList.list → TASKLIST (read) → Task.sig → shared_pending, so
-    its callers hold no spin lock (no Inode.i_pipe, no Pipe.inner)
+SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fa_lock,
+    fown->lock): fasync_helper: File.f_lock → FASYNC_LOCK (spin, one
+    for every list) → an entry's `fa` (IrqRwLock); kill_fasync walks a
+    list under RCU, any context but hardirq, spin locks held or not:
+    `fa` (read) → FOwner.st (IrqRwLock, read) → TASKLIST (read) →
+    Task.sig → shared_pending, its entry GFP_ATOMIC (3.7 rule 5)
 
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem, INODE_HASH_LOCK
@@ -676,10 +676,10 @@ Network locks (3.10 Network Subsystem has the full order):
         ↓ (transmit under a socket lock)
     FIB / neighbour / device TX → Softnet.backlog
     Socket wakeups (`Sock::data_ready`, `write_space`,
-    `error_report`, `wake_async`) send SIGIO (`Sock.fasync` ->
-    FasyncList.list), so they run after every network spin lock is
-    dropped (TCP posts an error under its slock with `post_err` and
-    signals after dropping it, or as the owner). `Sock.wq_flags` (NOSPACE, WAITDATA) are
+    `error_report`, `wake_async`) may send SIGIO (`kill_fasync`, RCU)
+    under network spin locks (a packet tap fed by a transmit under its
+    socket's locks, Linux the same); TCP still posts an error under its
+    slock with `post_err` and signals after dropping it, or as the owner. `Sock.wq_flags` (NOSPACE, WAITDATA) are
     atomic bits, Linux socket_wq.flags.
     Network spin locks are taken in thread context only (softnet
     threads, socket calls); ISRs only touch atomics, `Softnet.poll_list`
@@ -750,7 +750,7 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     feeding input and by flush_input; Tty.flip (IrqSpinlock leaf,
     also under IrqDesc.lock in the UART handler). No tty spin lock is held
     across a signal, a sleep or a driver write; Tty.buf_lock is (SIGIO
-    after ldata is dropped: Tty.buf_lock → `Tty.fasync` FasyncList.list).
+    after ldata is dropped, under Tty.buf_lock: kill_fasync, RCU).
     tty_fasync reads Tty.ctrl (the foreground group) after
     `Tty.fasync` is released.
 ```
@@ -3554,8 +3554,8 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    Deviation: Linux siglock is IRQ-safe and per thread group; hk's is
    per task, thread context only. Audit (T0): no interrupt handler
    sends a signal (the tty receive path is not driven from the UART
-   IRQ, SIGIO comes from `kill_fasync` in thread context with no spin
-   lock held, no SIGURG generation, POSIX timer/itimer expiry runs in
+   IRQ, SIGIO comes from `kill_fasync` in thread context, spin locks
+   possibly held, no SIGURG generation, POSIX timer/itimer expiry runs in
    `ktimers/N`, no tick-based SIGXCPU/SIGPROF, fault signals are sent by
    the faulting task with interrupts on). `send_signal` reports
    `SIGNAL:FAIL` if called with a nonzero interrupt depth (arm64 IRQ
@@ -3584,8 +3584,10 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    after; an exiting task's sets are swapped out under TASKLIST and
    `Task.sig` and freed after both, and an exiting task (PF_EXITING,
    read under `Task.sig`) gets no entries, so none outlives that flush.
-   Senders run in thread context with no spin lock held (mqueue drops
-   its notify lock before sending).
+   Senders run in thread context, never from hardirq; every step of a
+   send takes only spin locks and allocates GFP_ATOMIC, so a sender may
+   hold spin locks (SIGIO from a socket wakeup under its locks, as in
+   Linux): its held locks order above TASKLIST and the signal locks.
 
 6. **A group signal's thread is chosen under TASKLIST, not siglock**
    (Linux complete_signal under siglock): after the signal is queued
@@ -3937,7 +3939,7 @@ Each `Tty` struct contains:
 | `read_lock` | `sync::Mutex<()>` (sleeping) | One N_TTY reader at a time, held across the whole read and its sleeps (Linux `atomic_read_lock`): a canonical line copied out in pieces goes to one reader; outermost tty lock, taken before `ldata` |
 | `write_lock` | `sync::Mutex<()>` (sleeping) | One writer at a time, held across the whole write(2) (Linux `atomic_write_lock`, tty_write_lock): another writer's bytes never land inside it; outermost on the write side, taken before the TOSTOP check (`termios`, TASKLIST → `ctrl`, SIGTTOU) and the driver writes; O_NONBLOCK try-locks (EAGAIN), else interruptible. Thread context only: printk's console write and N_TTY echo do not take it (as Linux). Not nested with `read_lock` or `buf_lock` |
 | `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
-| `fasync` | `FasyncList` (sleeping, 3.11) | O_ASYNC files (Linux `tty->fasync`): N_TTY input sends their SIGIO after dropping `ldata`, under `buf_lock` |
+| `fasync` | `FasyncList` (RCU, 3.11) | O_ASYNC files (Linux `tty->fasync`): N_TTY input sends their SIGIO after dropping `ldata`, under `buf_lock` |
 
 `termios` and `ctrl` are spin locks taken in thread context only,
 briefly, never across a signal, a sleep or a driver write: the SIGWINCH
@@ -4519,8 +4521,8 @@ the backlog and timers and errors set deferred flags, which the owner's
 release runs (`backlog_rcv`, `release_cb`, Linux __release_sock and
 tcp_release_cb) before clearing `owned`. The one difference: Linux runs
 release_cb under `slock`; hk runs it, like the backlog, owned with
-`slock` dropped, because its wakeups send SIGIO (a sleeping FasyncList
-lock); input meanwhile still sees the socket owned and backlogs, so the
+`slock` dropped, because its wakeups sent SIGIO through a sleeping lock
+(no longer: moving it under `slock` is planned); input meanwhile still sees the socket owned and backlogs, so the
 exclusion is the same. Lock-free readers (poll, the sleepers'
 conditions, SIOCOUTQ) read the `Snap` atomics every locked step
 publishes, as Linux reads sk_state and the queue edges with READ_ONCE.
@@ -4589,15 +4591,15 @@ else is taken under it) unless an order is given. "spin" is the
 | `INODE_SB_LIST_LOCK` | fs/inode.rs | spin Mutex | every superblock's `s_inodes` (Linux inode_sb_list_lock); 3.3 Superblock inode lists |
 | `INODE_HASH_LOCK` | fs/icache.rs | spin Mutex | the inode cache's buckets (Linux inode_hash_lock); 3.3 Inode cache: under it `Inode.private` -> `VfatInode.d` (vfat's `test`) |
 | `CHARDEV_REGISTRY` | fs/chardev.rs | sleeping `sync::RwSem` (Linux chrdevs_lock, cdev_map->lock: mutexes) | character device registry: registered at probe, looked up at open and mmap (under mmap_lock); never under a spin lock |
-| `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf, also under `FasyncList.list` (O_ASYNC is set or cleared only with the file's fasync entry). `File.f_iocb` (the flags' I/O part, Linux f_iocb_flags: O_APPEND, O_DIRECT, O_DSYNC, __O_SYNC) is an atomic written only under it with the flags (F_SETFL), read lock-free by each read and write: an I/O racing an F_SETFL sees the old or the new word, as Linux's unlocked read of f_iocb_flags. `File.f_wb_err` / `f_sb_err` (Linux f_wb_err, f_sb_err: the writeback errors of the file's mapping and filesystem it has seen) are atomics sampled at open and advanced only under it (`errseq` check-and-advance, Linux file_check_and_advance_wb_err), read lock-free first. `AddressSpace.wb_err`, `SuperBlock.s_wb_err` (`util::errseq::ErrSeq`, Linux errseq_t) are lock-free words set by a failed writeback and a stale page cache after a direct write |
-| `FasyncList.list` → `File.f_lock`, `FOwner.st` | io/fasync.rs | sleeping `sync::Mutex` (per object: a pipe's readers and writers, a socket's, a tty's, an inotify group's); `FOwner.st` spin leaf | SIGIO (Linux fasync_lock and RCU readers, fown->lock): `FasyncList.armed` (atomic, written under the lock, read lock-free: Linux kill_fasync's unlocked list test) lets a wakeup with no armed file skip the lock; a list's entries (a file's `FOwner` reference and the armed fd), changed by `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) and walked by `kill_fasync`, which sends each entry's signal under it: thread context, no spin lock held (3.7 rule 1). `FOwner.st` (a file's owner pid, type, setter uids and F_SETSIG signal; allocated once per file) is copied under it and released before the send. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |
+| `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf but for `FASYNC_LOCK` under it (O_ASYNC is set or cleared only with the file's fasync entry, Linux fasync_insert_entry). `File.f_iocb` (the flags' I/O part, Linux f_iocb_flags: O_APPEND, O_DIRECT, O_DSYNC, __O_SYNC) is an atomic written only under it with the flags (F_SETFL), read lock-free by each read and write: an I/O racing an F_SETFL sees the old or the new word, as Linux's unlocked read of f_iocb_flags. `File.f_wb_err` / `f_sb_err` (Linux f_wb_err, f_sb_err: the writeback errors of the file's mapping and filesystem it has seen) are atomics sampled at open and advanced only under it (`errseq` check-and-advance, Linux file_check_and_advance_wb_err), read lock-free first. `AddressSpace.wb_err`, `SuperBlock.s_wb_err` (`util::errseq::ErrSeq`, Linux errseq_t) are lock-free words set by a failed writeback and a stale page cache after a direct write |
+| `File.f_lock` → `FASYNC_LOCK` → `Fasync.fa`; `Fasync.fa` → `FOwner.st` → TASKLIST | io/fasync.rs | `FASYNC_LOCK`: spin Mutex, thread context; `fa`, `FOwner.st`: `IrqRwLock` | SIGIO (Linux fasync_lock, fasync_struct's fa_lock, fown->lock, RCU readers): a `FasyncList` (a pipe's readers and writers, a socket's, a tty's, an inotify group's) is an `RcuList` of `Fasync` entries, each a file's `FOwner` reference and armed fd in `fa`. `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) allocates the entry first, then under `File.f_lock` and `FASYNC_LOCK` finds the owner's entry (a new fd under its `fa` write) or links the new one, and sets O_ASYNC with it; a removal clears `fa` (Linux fa_file = NULL), unlinks the entry and frees it a grace period later (`RcuUnlinked::defer`), the owner reference dropped after the locks. `kill_fasync` walks under RCU with `with_gfp(ATOMIC)`, any context but hardirq, any spin locks held: per entry `fa` read, then the owner's `st` read held across `send_sigio` (the owner's pid borrowed, no reference); a pgrp owner's targets are gathered GFP_ATOMIC under TASKLIST. `FasyncList.armed` (atomic, written under `FASYNC_LOCK`, read lock-free: Linux kill_fasync's unlocked list test) lets a wakeup with no armed file skip the walk. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
 | `RamfsInodeData.xattrs` | fs/ramfs/mod.rs | spin | tmpfs xattrs (under VFS locks); nothing allocates under it: the name and value are copied before it is taken (Linux simple_xattr_alloc), the list grows with it released (`kmem::spare`), and a replaced or removed attribute is freed after. Only tmpfs has them (ramfs: EOPNOTSUPP, as Linux). Their space is the inode space under `tmpfs::Acct.stat` (Linux free_ispace under stat_lock), never nested with this lock: a set takes its space before the lock (ENOSPC) and returns what it did not use after; the inode's share (`RamfsInodeData.xattr_bytes`) goes back when it is freed |
 | tmpfs accounting (`tmpfs::Acct`: `stat`, `max_blocks`, `used_blocks`) | fs/ramfs/tmpfs.rs | `stat` IrqSpinlock leaf; `used_blocks` a `PercpuCounter` | as Linux shmem_sb_info: `stat` (Linux stat_lock) holds the inode limit, the inode space (Linux free_ispace: each inode, extra hard link and user.* xattr takes from it; returned at unlink of an extra link, at `evict_inode` in any context, and when the xattr goes) and the inode64/noswap options; `max_blocks` (an atomic written under `stat`, read without it as Linux does) is the block limit; file pages are charged to `used_blocks` as they enter the cache (`filemap::add`, under the page lock, before `i_pages`) by a limited add that is exact near the limit, and returned as they leave (`remove`, eviction). A remount (under `s_umount` held for writing) checks every new limit against the use and changes them all under `stat`, or nothing. Uncounted while unlimited; an unlimited mount cannot be limited again (Linux "Cannot retroactively limit size") |
 | `PercpuCounter.lock` | util/percpu_counter.rs | IrqSpinlock leaf | a per-CPU counter's folded count (Linux percpu_counter.lock): parts (atomics, one cache line each) fold into it at the batch size; an exact sum or a limited add near its limit takes it; the folded count is read without it for estimates. A caller's choice of its CPU's part, the read, the check and the add run with interrupts off (Linux local_irq_save), so nothing on that CPU slips an add in between and a part never passes the batch (the bound a limited add's fast path relies on) |
 | membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | task/membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`: `curr_mm` SeqCst, then a full fence, then the registrations read, so a registration either sees the CPU in its mm and refreshes it by IPI or is seen by the switch; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
 | `Inode.i_pipe` | fs/inode.rs, io/pipe.rs (FIFOs, pipefs) | spin Mutex leaf (Linux inode->i_lock around i_pipe) | a FIFO's or pipefs inode's pipe and its open-file count: attached by the first open (pipe(2): at creation, with both ends counted; a FIFO's pipe is allocated with the lock dropped and installed if the slot is still empty, Linux fifo_open, the losing one freed after the unlock), dropped by the last release (a pipe end's release as a FIFO's); every change of the pipe's reader/writer counts and open counters happens under it (so a blocking open decides, and samples the counter it waits on, before unlocking; the release wakes the other side under it: -> `Pipe.wait_queue`); never held across a wait (a blocking open waits on `Pipe.wait_queue` after unlocking) or under `Pipe.inner` |
-| `Pipe.inner` | io/pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation and across read/write's copy to or from the caller's memory (may fault: -> mmap_lock, as Linux pipe->mutex), never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator; -> `FasyncList.list` (pipe_fasync changes both lists under it, Linux too); -> the output file's write path (i_rwsem, page cache, socket locks) for a pipe-to-file splice, which consumes only what the write took (Linux iter_file_splice_write under pipe_lock); -> the input file's read path for a file-to-pipe splice, which reads only once the pipe has room (Linux splice_file_to_pipe: wait_for_space, then do_splice_read under pipe_lock). A splice, tee or vmsplice waits for data or room with it dropped (`lock_data`, `lock_room`; Linux pipe_wait_readable/writable) and decides EOF, EPIPE or progress under it. SIGIO is sent after it is dropped (Linux sends under pipe->mutex) and after `Inode.i_pipe`. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock. A read decides EOF (no writers) under it, after seeing the ring empty (Linux pipe_read under pipe->mutex): a writer's last write unlocks before its release drops the count, so its data is never read as EOF |
+| `Pipe.inner` | io/pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation and across read/write's copy to or from the caller's memory (may fault: -> mmap_lock, as Linux pipe->mutex), never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator; -> `FASYNC_LOCK` (pipe_fasync changes both lists under it, Linux too); -> the output file's write path (i_rwsem, page cache, socket locks) for a pipe-to-file splice, which consumes only what the write took (Linux iter_file_splice_write under pipe_lock); -> the input file's read path for a file-to-pipe splice, which reads only once the pipe has room (Linux splice_file_to_pipe: wait_for_space, then do_splice_read under pipe_lock). A splice, tee or vmsplice waits for data or room with it dropped (`lock_data`, `lock_room`; Linux pipe_wait_readable/writable) and decides EOF, EPIPE or progress under it. SIGIO is sent after it is dropped (Linux sends under pipe->mutex) and after `Inode.i_pipe`. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock. A read decides EOF (no writers) under it, after seeing the ring empty (Linux pipe_read under pipe->mutex): a writer's last write unlocks before its release drops the count, so its data is never read as EOF |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state` | hw/gfx/ | sleeping `sync::Mutex` (Linux DRM modeset locks) | framebuffer device state, DRM ioctls only |
 | `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device registry |

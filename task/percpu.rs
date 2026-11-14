@@ -821,6 +821,49 @@ impl GlobalTaskTable {
         )
     }
 
+    /// [`GlobalTaskTable::collect_pgrp`] with fallible allocation, for a
+    /// caller under a named GFP (a SIGIO sent in atomic context): None
+    /// without memory
+    pub fn try_collect_pgrp<T>(
+        pg: &crate::task::pid::Pid,
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Option<Vec<T>> {
+        let walk = |table: &GlobalTaskTable, visit: &mut dyn FnMut(&TaskView<'_>) -> bool| {
+            for t in table.pgrp(pg) {
+                if !visit(&t) {
+                    break;
+                }
+            }
+        };
+        let mut cap = 1;
+        walk(&TASKLIST.read(), &mut |_| {
+            cap += 1;
+            true
+        });
+        loop {
+            let mut v = Vec::new();
+            v.try_reserve(cap).ok()?;
+            let mut full = false;
+            {
+                let table = TASKLIST.read();
+                walk(&table, &mut |t| {
+                    if v.len() == v.capacity() {
+                        full = true;
+                        return false;
+                    }
+                    if let Some(x) = f(&table, t) {
+                        v.push(x);
+                    }
+                    true
+                });
+            }
+            if !full {
+                return Some(v);
+            }
+            cap *= 2;
+        }
+    }
+
     /// What `f` picks of each thread of every process of group `pg`,
     /// gathered as `collect_threads` does
     pub fn collect_pgrp_threads<T>(
