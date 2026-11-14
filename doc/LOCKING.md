@@ -3702,11 +3702,12 @@ ending the others (group_exec_task). The first exit_group or fatal
 signal wins the swap; a fatal signal also overrides an exec's
 de_thread, exit_group does not.
 
-- `zap_threads` queues SIGKILL in each live thread's private pending
-  set and sets its TIF_SIGPENDING under TASKLIST, collects the tasks,
-  drops TASKLIST, then wakes each still listed (`WakeMode::Fatal`:
-  interruptible and killable sleeps), as `send_signal` does (TASKLIST
-  is never held across a wakeup where it can be dropped first).
+- `zap_threads` walks the group's thread list under TASKLIST's write
+  lock (`first_thread`/`next_thread`, nothing allocated: Linux
+  zap_other_threads under siglock), queuing SIGKILL in each live
+  thread's private pending set, setting its TIF_SIGPENDING and waking
+  it there (`WakeMode::Fatal`: interruptible and killable sleeps; a
+  wakeup takes only pi_lock and run-queue locks under TASKLIST).
 - A thread cloned into a group whose state is set gets SIGKILL after
   `install_fork_signal` set up its signal state (`zap_new_thread`): the
   state is set before a zap takes TASKLIST, so either the zap saw the

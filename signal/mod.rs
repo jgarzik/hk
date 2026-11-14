@@ -1699,14 +1699,7 @@ fn wants_signal(t: &crate::task::Task, stopped: bool, sig: Signal) -> bool {
 /// A signal for `t` is deliverable (Linux signal_wake_up_state): wake
 /// it from a sleep `mode` ends, else, if it runs on another CPU, kick it
 /// into the kernel so its return to user mode delivers the signal
-/// (kick_process); nothing once it is reaped. Process context, TASKLIST
-/// not held.
-fn signal_wake_up(t: &TaskRef, mode: crate::task::percpu::WakeMode) {
-    if TASKLIST.read().view(t).is_some() {
-        signal_wake_task(t, mode);
-    }
-}
-
+/// (kick_process). Any context a send runs in, TASKLIST held or not.
 fn signal_wake_task(t: &TaskRef, mode: crate::task::percpu::WakeMode) {
     if !crate::task::percpu::try_to_wake_up(t, mode) {
         crate::task::percpu::kick_process(t);
@@ -1972,38 +1965,31 @@ fn group_signal(
 }
 
 /// SIGKILL every thread of `tgid` that has not started exiting, but
-/// `except` (Linux zap_other_threads): queued privately, then woken
-/// from interruptible and killable sleeps once TASKLIST is dropped.
+/// `except` (Linux zap_other_threads): queued privately and woken from
+/// interruptible and killable sleeps in one TASKLIST write section.
 /// A thread running user code dies on its next return to user mode (a
 /// tick or a kick IPI interrupts it: `entry::exit_to_user_mode`).
 fn zap_threads(tgid: Pid, except: Option<&Task>) {
-    // Room made before the write lock (nothing allocates under
-    // TASKLIST), again if the group grew
-    let mut room = TASKLIST.read().threads(tgid).count();
-    let zapped = loop {
-        let mut zapped: alloc::vec::Vec<TaskRef> = alloc::vec::Vec::with_capacity(room);
-        let mut table = TASKLIST.write();
-        let n = table.threads(tgid).count();
-        if n > room {
-            drop(table);
-            room = n;
+    // Each thread killed and woken in one TASKLIST write section, walked
+    // by its thread list (Linux zap_other_threads under siglock: no
+    // allocation, so it may run where a send does, under a caller's spin
+    // lock); a wakeup under TASKLIST is allowed (it takes only pi_lock
+    // and run-queue locks)
+    let mut table = TASKLIST.write();
+    let mut cur = table.first_thread(tgid);
+    while let Some(t) = cur {
+        cur = table.next_thread(tgid, &t);
+        if except.is_some_and(|e| core::ptr::eq(Arc::as_ptr(&t), e)) {
             continue;
         }
-        for t in table.threads(tgid) {
-            if !except.is_some_and(|e| core::ptr::eq(t.task, e)) && task_live(&t) {
-                zapped.push(crate::task::percpu::task_ref(t.task));
-            }
+        if !table.view(&t).is_some_and(|v| task_live(&v)) {
+            continue;
         }
-        for t in &zapped {
-            if let Some(mut v) = table.view_mut(t) {
-                sigkill_task(&mut v);
-            }
-        }
-        drop(table);
-        break zapped;
-    };
-    for t in &zapped {
-        signal_wake_up(t, crate::task::percpu::WakeMode::Fatal);
+        let Some(mut v) = table.view_mut(&t) else {
+            continue;
+        };
+        sigkill_task(&mut v);
+        signal_wake_task(&t, crate::task::percpu::WakeMode::Fatal);
     }
 }
 
