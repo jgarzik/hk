@@ -551,6 +551,8 @@ pub fn shmem_init() -> Result<(), KernelError> {
     let sb = tmpfs_mount(&TMPFS_TYPE, b"size=0,nr_inodes=0")?;
     let root = sb.get_root().ok_or(KernelError::Io)?;
     let m = crate::fs::mount::Mount::alloc(sb, root, 0, b"tmpfs".as_slice().into())?;
+    // A kernel mount (Linux kern_mount)
+    m.set_internal();
     SHM_MNT.call_once(|| m);
     Ok(())
 }

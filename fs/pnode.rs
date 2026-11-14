@@ -204,7 +204,7 @@ pub fn propagate_mnt(ns: &mut NsTree, dest: &MountRef, d: &Arc<Dentry>, src: &Mo
     for p in peers(g) {
         if !MountRef::ptr_eq(&p, dest) && visible(&p, d) {
             let c = copy_prop(ns, src, &|o, c| clone_prop(o, c));
-            attach_mnt(ns, &c, &Path::new(p, d.clone()));
+            attach_mnt(ns, c.clone(), &Path::new(p, d.clone()));
             commit_tree(ns, &c);
         }
     }
@@ -241,7 +241,7 @@ fn to_slaves(ns: &mut NsTree, g: u32, d: &Arc<Dentry>, src: &MountRef, up: &BTre
                     join(c, ng);
                 }
             });
-            attach_mnt(ns, &c, &Path::new(m.clone(), d.clone()));
+            attach_mnt(ns, c.clone(), &Path::new(m.clone(), d.clone()));
             commit_tree(ns, &c);
         }
         let new = new.into_inner();

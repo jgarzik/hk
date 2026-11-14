@@ -1,178 +1,285 @@
-//! Mount references (Linux mntget, mntput, mntput_no_expire,
-//! cleanup_mnt, delayed_mntput)
+//! Mount references (Linux mnt_pcp, mntget, mntput, mntput_no_expire,
+//! legitimize_mnt, cleanup_mnt, delayed_mntput)
 //!
 //! A [`MountRef`] is a counted reference to a mount (Linux a `struct
-//! vfsmount *` holding mnt_count): paths, namespace roots, a parent's
-//! list of its submounts. A link that must not keep its mount (a
-//! submount's parent, a peer group's members, the superblock's
-//! s_mounts) is a `Weak`, and takes a reference with
-//! [`MountRef::try_get`]; a plain `Arc<Mount>` never escapes this module
-//! except as a counted list entry ([`MountRef::into_counted`]).
+//! vfsmount *` holding mnt_count): paths, open files, namespace roots,
+//! a parent's list of its submounts. The count is per CPU (Linux
+//! mnt_pcp): a clone adds one to the calling CPU's part, lock-free. A
+//! link that must not keep its mount (a submount's parent, a peer
+//! group's members, the superblock's s_mounts) is a `Weak` (it keeps
+//! the memory only) and takes a reference with [`MountRef::try_get`].
 //!
-//! The last reference's drop never tears the mount down where it is:
-//! the teardown (Linux cleanup_mnt: submounts, mountpoint, root dentry,
+//! While the mount is in a namespace (`Mount.mnt_ns` set; a kernel
+//! mount carries `MNT_NS_INTERNAL`), the tree holds a reference to it
+//! (its parent's list entry, or the namespace root), so no count can
+//! reach zero: a put only takes from its CPU's part, under an RCU read
+//! guard (Linux mntput_no_expire's fast path). Taking a mount out of
+//! its namespace clears `mnt_ns`, waits out a grace period
+//! (`rcu::synchronize`), then puts the tree's references (Linux
+//! umount_tree, then namespace_unlock), so no fast put that saw the
+//! namespace still runs. From then on a put is exact: under MOUNT_LOCK
+//! write it takes from its part and sums them all; the one that reaches
+//! zero marks the mount doomed (Linux MNT_DOOMED) and queues its
+//! teardown. [`MountRef::try_get`] from a `Weak` is a fast add while the
+//! mount is in a namespace, else refused once doomed, under MOUNT_LOCK
+//! (Linux legitimize_mnt).
+//!
+//! The teardown (Linux cleanup_mnt: submounts, mountpoint, root dentry,
 //! superblock, any of which may sleep) runs later with nothing held, in
 //! the dropping task on its way back to user mode (task_work, so an
 //! umount(2) is complete when it returns), or from interrupt context, a
 //! kernel thread or a task past `exit_task_work` in the system
-//! workqueue (Linux delayed_mntput_work). A put is safe under any lock.
+//! workqueue (Linux delayed_mntput_work). A put is safe under any lock
+//! but MOUNT_LOCK.
 //!
-//! Locking: `DELAYED_MNTPUT` is an IrqSpinlock leaf. The teardown takes
-//! NAMESPACE_SEM and MOUNT_LOCK (submounts) and `s_mounts`, with
-//! nothing else held.
+//! The mount's memory is an `Arc`: one strong count stands for all its
+//! references, taken back by the teardown; list entries and `Weak`s keep
+//! the rest.
+//!
+//! Locking: a put's exact path and a `try_get` outside a namespace take
+//! MOUNT_LOCK (write, locking read): no put of a mount outside a
+//! namespace under it.
+//! `DELAYED_MNTPUT` is an IrqSpinlock leaf. The teardown takes
+//! NAMESPACE_SEM and MOUNT_LOCK (submounts) and `s_mounts`, with nothing
+//! else held.
 
+use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
-use core::sync::atomic::{Ordering, fence};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicIsize, Ordering, fence};
 
-use super::mount::Mount;
+use super::mount::{MOUNT_LOCK, Mount};
+
+/// `Mount.mnt_ns` of a kernel mount, in no namespace of its own (Linux
+/// MNT_NS_INTERNAL): its puts take the fast path, and it is never
+/// released
+pub(super) const MNT_NS_INTERNAL: u64 = u64::MAX;
 use crate::sync::IrqSpinlock;
 use crate::task::task_work::{CallbackHead, CbAdapter, Twa, task_work_add};
 use crate::task::workqueue::{DelayedWork, SYSTEM_WQ};
+use crate::util::error::KernelError;
 use crate::util::list::List;
 
-/// `Mount.mnt_count` once the mount is torn down (or being torn down):
-/// no reference can be taken again
-pub(super) const MNT_REF_DEAD: usize = usize::MAX;
+/// One CPU's part of a mount's count (Linux struct mnt_pcp), alone on
+/// its cache line
+#[repr(align(64))]
+#[derive(Default)]
+pub(super) struct MntPcp(AtomicIsize);
+
+impl Clone for MntPcp {
+    fn clone(&self) -> Self {
+        Self(AtomicIsize::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+/// A part per possible CPU, all zero (Linux alloc_percpu); ENOMEM
+pub(super) fn alloc_pcp() -> Result<Box<[MntPcp]>, KernelError> {
+    let n = crate::cpu::nr_cpu_ids().max(1) as usize;
+    Ok(crate::util::kmem::try_vec(n, MntPcp::default())?.into_boxed_slice())
+}
+
+/// [`alloc_pcp`] that cannot fail (a tree copy)
+pub(super) fn alloc_pcp_nofail() -> Box<[MntPcp]> {
+    let n = crate::cpu::nr_cpu_ids().max(1) as usize;
+    alloc::vec![MntPcp::default(); n].into_boxed_slice()
+}
+
+/// This CPU is set up to take an RCU read guard and queue callbacks
+/// (not in host unit tests, nor at the start of boot)
+fn have_cpu() -> bool {
+    !cfg!(test) && crate::cpu::try_this_id().is_some()
+}
+
+impl Mount {
+    /// Add `n` to this CPU's part (Linux mnt_add_count): another CPU's
+    /// part would do (they are atomics), only slower
+    fn pcp_add(&self, n: isize) {
+        let i = crate::cpu::try_this_id().unwrap_or(0) as usize;
+        let p = self.mnt_pcp.get(i).unwrap_or(&self.mnt_pcp[0]);
+        p.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The count, exact once no fast put runs (Linux mnt_get_count)
+    fn pcp_sum(&self) -> isize {
+        self.mnt_pcp
+            .iter()
+            .map(|p| p.0.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// It still has a reference (Linux: not MNT_DOOMED)
+    pub(super) fn is_live(&self) -> bool {
+        !self.doomed.load(Ordering::Acquire)
+    }
+}
 
 /// A counted reference to a mount (Linux mntget'd `struct vfsmount *`):
 /// a clone takes one, the last one's drop queues the teardown
 ///
 /// # Invariants
-/// Holds one strong count of its `Arc` and one of the mount's
-/// `mnt_count`.
-pub struct MountRef(ManuallyDrop<Arc<Mount>>);
+/// Holds one of its mount's references (its parts' sum, Linux
+/// mnt_count), which keep the `Arc` that the mount's references share.
+pub struct MountRef(NonNull<Mount>);
+
+// SAFETY: a counted reference to a Sync mount, usable from any thread
+unsafe impl Send for MountRef {}
+// SAFETY: as above; `&MountRef` only reads the mount
+unsafe impl Sync for MountRef {}
 
 impl MountRef {
-    /// The first reference to a new mount, whose count is one
+    /// The first reference to a new mount: its `Arc` becomes the one
+    /// its references share
     pub(super) fn first(m: Arc<Mount>) -> Self {
-        debug_assert_eq!(m.mnt_count.load(Ordering::Relaxed), 1);
-        Self(ManuallyDrop::new(m))
+        m.pcp_add(1);
+        // SAFETY: from `Arc::into_raw`, never null
+        Self(unsafe { NonNull::new_unchecked(Arc::into_raw(m).cast_mut()) })
+    }
+
+    fn mount(&self) -> &Mount {
+        // SAFETY: the type invariant keeps the mount alive
+        unsafe { self.0.as_ref() }
+    }
+
+    /// The shared `Arc`, borrowed
+    fn arc(&self) -> ManuallyDrop<Arc<Mount>> {
+        // SAFETY: the shared strong count is held while a reference is
+        // (type invariant); ManuallyDrop keeps it from being dropped
+        ManuallyDrop::new(unsafe { Arc::from_raw(self.0.as_ptr()) })
     }
 
     /// A reference to the mount `w` names, unless its last one is gone
-    /// (Linux legitimize_mnt / mnt_add_count on a mount not doomed). A
-    /// failure briefly holds an `Arc` that may drop the mount's memory;
-    /// that drop does no teardown (the teardown owns its own `Arc`)
+    /// (Linux legitimize_mnt): an add while it is long-term, else
+    /// decided under MOUNT_LOCK, where a mount is doomed
     pub fn try_get(w: &Weak<Mount>) -> Option<Self> {
-        Self::try_from_arc(w.upgrade()?)
-    }
-
-    /// A reference to the mount `m`, unless its last one is gone
-    fn try_from_arc(m: Arc<Mount>) -> Option<Self> {
-        let mut n = m.mnt_count.load(Ordering::Relaxed);
-        loop {
-            if n == 0 || n == MNT_REF_DEAD {
-                return None;
-            }
-            match m
-                .mnt_count
-                .compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Relaxed)
-            {
-                Ok(_) => return Some(Self(ManuallyDrop::new(m))),
-                Err(v) => n = v,
+        let a = w.upgrade()?;
+        let p = NonNull::from(a.as_ref());
+        if have_cpu() {
+            let _g = crate::sync::rcu::read_lock();
+            // In a namespace: taking it out clears `mnt_ns` and puts the
+            // tree's reference only after a grace period, so this add is
+            // counted first
+            if a.ns() != 0 {
+                a.pcp_add(1);
+                return Some(Self(p));
             }
         }
+        // In no namespace: no fast put runs, and the count reaches zero
+        // only with `doomed` set, under the write side
+        let _ml = MOUNT_LOCK.read_excl();
+        if a.doomed.load(Ordering::Acquire) {
+            return None;
+        }
+        a.pcp_add(1);
+        Some(Self(p))
+        // `a` dropped: never the last strong count while a reference is
+        // held; after the teardown, only memory goes
     }
 
-    /// A reference to a list entry handed out by
-    /// [`MountRef::into_counted`] while it is on the list (the caller
-    /// holds the lock that keeps it there), so it is live: None (and a
-    /// debug assertion) only if that was broken
-    pub(super) fn from_entry(m: Arc<Mount>) -> Option<Self> {
-        let r = Self::try_from_arc(m);
-        debug_assert!(r.is_some(), "mount: dead entry on a counted list");
-        r
+    /// Another reference to a list entry (by [`MountRef::into_entry`])
+    /// while it is on the list (the caller holds the lock that keeps it
+    /// there), which holds one
+    pub(super) fn entry_ref(m: &Mount) -> Self {
+        debug_assert!(m.is_live(), "mount: doomed entry on a list");
+        m.pcp_add(1);
+        Self(NonNull::from(m))
     }
 
-    /// The reference as a plain `Arc` that keeps its count, for a list
-    /// that holds counted entries (a parent's submounts); given back by
-    /// [`MountRef::from_counted`]
-    pub(super) fn into_counted(self) -> Arc<Mount> {
-        let mut me = ManuallyDrop::new(self);
-        // SAFETY: taken once; `me` is never dropped
-        unsafe { ManuallyDrop::take(&mut me.0) }
+    /// The reference, as the `Arc` an intrusive list keeps (an entry of
+    /// a parent's `mnt_mounts`); back by [`MountRef::from_entry`]
+    pub(super) fn into_entry(self) -> Arc<Mount> {
+        let me = ManuallyDrop::new(self);
+        Arc::clone(&me.arc())
     }
 
-    /// The reference an entry from [`MountRef::into_counted`] holds
+    /// The reference a list entry holds
     ///
     /// # Safety
-    /// `m` came from `into_counted` and its count was not taken back.
-    pub(super) unsafe fn from_counted(m: Arc<Mount>) -> Self {
-        Self(ManuallyDrop::new(m))
+    /// `a` came from [`MountRef::into_entry`] and was not given back.
+    pub(super) unsafe fn from_entry(a: Arc<Mount>) -> Self {
+        let p = NonNull::from(a.as_ref());
+        drop(a);
+        Self(p)
     }
 
-    /// The mount `w` names still has a reference (none can be taken
-    /// once the last is gone, though its teardown may not have run)
+    /// The mount `w` names is not doomed (a reference can still be
+    /// taken)
     pub fn is_live(w: &Weak<Mount>) -> bool {
         w.upgrade().is_some_and(|m| m.is_live())
     }
 
     /// A non-owning link to the mount (no reference)
     pub fn downgrade(this: &Self) -> Weak<Mount> {
-        Arc::downgrade(&this.0)
+        Arc::downgrade(&this.arc())
     }
 
     /// The mount's address (its identity)
     pub fn as_ptr(this: &Self) -> *const Mount {
-        Arc::as_ptr(&this.0)
+        this.0.as_ptr()
     }
 
     /// Both are the same mount
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
-        Arc::ptr_eq(&a.0, &b.0)
+        a.0 == b.0
     }
 
-    /// Drop the reference: its `Arc` back for the teardown if it was the
-    /// last
-    fn put(self) -> Option<Arc<Mount>> {
-        let m = self.into_counted();
-        if m.mnt_count.fetch_sub(1, Ordering::Release) != 1 {
-            return None;
+    /// The exact put (Linux mntput_no_expire after its fast path):
+    /// under MOUNT_LOCK write, the last reference dooms the mount
+    fn put_slow(self) {
+        let me = ManuallyDrop::new(self);
+        let m = me.mount();
+        let last = {
+            let _ml = MOUNT_LOCK.write();
+            // With the grace period after `mnt_ns` was cleared: every
+            // fast put that saw it is in the parts (Linux smp_mb)
+            fence(Ordering::SeqCst);
+            m.pcp_add(-1);
+            let count = m.pcp_sum();
+            debug_assert!(count >= 0, "mount: count below zero");
+            let last = count == 0 && !m.doomed.load(Ordering::Relaxed);
+            if last {
+                m.doomed.store(true, Ordering::Release);
+            }
+            last
+        };
+        if last {
+            // SAFETY: the shared strong count, which the references held
+            // and the teardown now owns
+            mntput_deferred(unsafe { Arc::from_raw(me.0.as_ptr()) });
         }
-        // Every other holder's use comes before the teardown
-        fence(Ordering::Acquire);
-        // No reference can be taken from here on (try_get sees 0 until
-        // then, and refuses it too)
-        m.mnt_count.store(MNT_REF_DEAD, Ordering::Relaxed);
-        Some(m)
     }
 }
 
 impl Clone for MountRef {
-    /// Another reference (Linux mntget)
+    /// Another reference (Linux mntget): the caller's keeps the count
+    /// above zero, so an add is enough
     fn clone(&self) -> Self {
-        self.0.mnt_count.fetch_add(1, Ordering::Relaxed);
-        Self(self.0.clone())
+        self.mount().pcp_add(1);
+        Self(self.0)
     }
 }
 
 impl core::ops::Deref for MountRef {
     type Target = Mount;
     fn deref(&self) -> &Mount {
-        &self.0
+        self.mount()
     }
 }
 
 impl Drop for MountRef {
-    /// mntput: the last reference queues the teardown
+    /// mntput: a take from this CPU's part while the mount is in a
+    /// namespace, else the exact put
     fn drop(&mut self) {
-        // SAFETY: taken once, here; `put` owns it from now on
-        let r = MountRef(ManuallyDrop::new(unsafe {
-            ManuallyDrop::take(&mut self.0)
-        }));
-        if let Some(m) = r.put() {
-            mntput_deferred(m);
+        if have_cpu() {
+            let _g = crate::sync::rcu::read_lock();
+            let m = self.mount();
+            if m.ns() != 0 {
+                m.pcp_add(-1);
+                return;
+            }
         }
-    }
-}
-
-impl Mount {
-    /// It still has a counted reference (Linux: not MNT_DOOMED)
-    pub(super) fn is_live(&self) -> bool {
-        let n = self.mnt_count.load(Ordering::Acquire);
-        n != 0 && n != MNT_REF_DEAD
+        MountRef(self.0).put_slow();
     }
 }
 
@@ -182,8 +289,7 @@ fn mntput_deferred(m: Arc<Mount>) {
     let p = Arc::into_raw(m);
     // No task before per-CPU data (or in host unit tests): the delayed
     // list, drained once `mnt_init` made its work
-    let me =
-        (!cfg!(test) && crate::cpu::try_this_id().is_some()).then(crate::task::percpu::current);
+    let me = have_cpu().then(crate::task::percpu::current);
     if let Some(me) = me
         && !crate::sync::in_interrupt()
         && !me.is_kthread()
@@ -222,8 +328,8 @@ pub(super) unsafe fn __cleanup_mnt(cb: *const CallbackHead) {
     // `Arc` is ours
     let m = unsafe { Arc::from_raw(cb.cast::<u8>().sub(off).cast::<Mount>()) };
     crate::sync::might_sleep();
-    // SAFETY: the count is MNT_REF_DEAD (`put`): no reference exists
-    // or can be made, and this runs once per mount
+    // SAFETY: the mount is doomed (`put_slow`): no reference exists or
+    // can be made, and this runs once per mount
     unsafe { m.cleanup() };
 }
 
@@ -279,8 +385,8 @@ impl<T> MntOwned<T> {
     ///
     /// # Safety
     /// Called once; no reference to the value exists or is made later:
-    /// the mount has no counted reference left (`MNT_REF_DEAD`) and is
-    /// off every list that hands out a borrowed one.
+    /// the mount is doomed (or never had a reference) and is off every
+    /// list that hands out a borrowed one.
     pub(super) unsafe fn take(&self) -> T {
         // SAFETY: the caller's contract gives exclusive use
         unsafe { ManuallyDrop::take(&mut *self.0.get()) }

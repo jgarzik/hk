@@ -8,18 +8,22 @@ use alloc::vec::Vec;
 use crate::sync::spin::RwLock;
 use crate::sync::{LockedByEither, RwSem, RwSemReadGuard, RwSemWriteGuard, SeqLock, UniqueOwner};
 use crate::util::list::{Link, OwnedList, Owner};
-use ::core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::FileType;
 pub use super::mntput::MountRef;
-use super::mntput::{__cleanup_mnt, MNT_REF_DEAD, MntOwned};
+use super::mntput::{
+    __cleanup_mnt, MNT_NS_INTERNAL, MntOwned, MntPcp, alloc_pcp, alloc_pcp_nofail,
+};
 use super::path_ref::Path;
 use super::superblock::{FileSystemType, SuperBlock};
 use crate::task::task_work::CallbackHead;
 use crate::util::ida::Ida;
 use crate::util::kalloc::{arc_nofail, try_arc};
+use alloc::boxed::Box;
+use core::sync::atomic::AtomicBool;
 
 use crate::block::get_blkdev;
 
@@ -136,9 +140,10 @@ static MNT_ID_UNIQUE: AtomicU64 = AtomicU64::new(MNT_UNIQUE_ID_OFFSET + 1);
 
 /// A mount point in the namespace (Linux struct mount / vfsmount)
 ///
-/// Held through [`MountRef`] (`mnt_count`, Linux mnt_count); the last
-/// reference's teardown (`cleanup`) is deferred (`fs::mntput`), so a
-/// reference may be dropped under any lock. Its users (`users`: open
+/// Held through [`MountRef`] (a per-CPU count, Linux mnt_pcp, exact
+/// once out of its namespace); the last reference's teardown
+/// (`cleanup`) is deferred (`fs::mntput`), so a reference may be dropped
+/// under any lock but MOUNT_LOCK. Its users (`users`: open
 /// files, a task's root and cwd) make it busy for umount.
 pub struct Mount {
     /// The mounted filesystem's superblock (Linux mnt_sb)
@@ -192,13 +197,17 @@ pub struct Mount {
     /// mounts made by the kernel (Linux mnt_devname)
     pub devname: super::name::FileName,
 
-    /// Counted references ([`MountRef`], Linux mnt_count);
-    /// `MNT_REF_DEAD` once the teardown is queued
-    pub(super) mnt_count: AtomicUsize,
+    /// Its references' count, per CPU ([`MountRef`], Linux mnt_pcp's
+    /// mnt_count)
+    pub(super) mnt_pcp: Box<[MntPcp]>,
+    /// Its last reference went (Linux MNT_DOOMED): set under MOUNT_LOCK
+    /// write by that put
+    pub(super) doomed: AtomicBool,
 
     /// Users: open files, task roots and cwds (`user_get`); one makes
     /// it busy for umount, unless MNT_DETACH (Linux compares mnt_count
-    /// against the references the tree holds)
+    /// against the references the tree holds; transient references,
+    /// such as a walk's, do not count here)
     users: AtomicU64,
 
     /// The deferred teardown's head (Linux mnt_rcu as task_work, or
@@ -217,7 +226,15 @@ impl Mount {
         flags: u32,
         devname: super::name::FileName,
     ) -> Result<MountRef, KernelError> {
-        let m = try_arc(Self::init(sb, root, flags, devname, MNT_IDS.try_alloc()?))?;
+        let pcp = alloc_pcp()?;
+        let m = try_arc(Self::init(
+            sb,
+            root,
+            flags,
+            devname,
+            pcp,
+            MNT_IDS.try_alloc()?,
+        ))?;
         m.sb.add_mount(&m);
         Ok(MountRef::first(m))
     }
@@ -230,7 +247,8 @@ impl Mount {
         flags: u32,
         devname: super::name::FileName,
     ) -> MountRef {
-        let m = arc_nofail(Self::init(sb, root, flags, devname, MNT_IDS.alloc()));
+        let pcp = alloc_pcp_nofail();
+        let m = arc_nofail(Self::init(sb, root, flags, devname, pcp, MNT_IDS.alloc()));
         m.sb.add_mount(&m);
         MountRef::first(m)
     }
@@ -241,6 +259,7 @@ impl Mount {
         root: Arc<Dentry>,
         flags: u32,
         devname: super::name::FileName,
+        mnt_pcp: Box<[MntPcp]>,
         mnt_id: u32,
     ) -> Self {
         Self {
@@ -261,7 +280,8 @@ impl Mount {
             mnt_id,
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
             devname,
-            mnt_count: AtomicUsize::new(1),
+            mnt_pcp,
+            doomed: AtomicBool::new(false),
             users: AtomicU64::new(0),
             mnt_task_work: CallbackHead::new(__cleanup_mnt),
             mnt_instance: crate::util::list::Link::new(),
@@ -288,6 +308,13 @@ impl Mount {
     /// under NAMESPACE_SEM
     pub(super) fn ns(&self) -> u64 {
         self.mnt_ns.load(Ordering::Relaxed)
+    }
+
+    /// A kernel mount, in no namespace of its own (Linux kern_mount's
+    /// MNT_NS_INTERNAL): its references take the fast path, and it is
+    /// never taken out; set before the mount is shared
+    pub(super) fn set_internal(&self) {
+        self.mnt_ns.store(MNT_NS_INTERNAL, Ordering::Relaxed);
     }
 
     /// Put it in namespace `ns` (0: none); under NAMESPACE_SEM write
@@ -415,7 +442,10 @@ impl Mount {
     /// The parent mount, unless it is gone (Linux mnt_parent: a
     /// lazily unmounted parent's teardown may be queued)
     pub fn get_parent(&self) -> Option<MountRef> {
-        self.parent.read().as_ref().and_then(MountRef::try_get)
+        // Out of the field lock first: a refused fast path takes
+        // MOUNT_LOCK, which nests outside the Mount fields
+        let w = self.parent.read().clone()?;
+        MountRef::try_get(&w)
     }
 
     /// The parent mount and the mountpoint in it, borrowed from a
@@ -500,7 +530,7 @@ impl Iterator for Kids<'_> {
 /// whose lock the caller holds: each entry there is counted
 /// (`attach_mnt`)
 fn entry(c: Option<Arc<Mount>>) -> Option<MountRef> {
-    c.and_then(MountRef::from_entry)
+    c.as_deref().map(MountRef::entry_ref)
 }
 
 /// The mount after `p` in a walk of the tree at `root`, parents first
@@ -571,11 +601,14 @@ pub(super) fn copy_below(
             (p, q) = (pp, qp);
         }
         let c = copy(&s);
-        attach_mnt(ns, &c, &Path::new(q.clone(), mp));
+        attach_mnt(ns, c.clone(), &Path::new(q.clone(), mp));
         (p, q) = (s, c);
         next = next_mnt(&p, src, &*ns);
     }
 }
+
+/// The kernel threads' nullfs mount (Linux knullfs, an internal mount)
+static KNULLFS: spin::Once<MountRef> = spin::Once::new();
 
 /// The initial mount tree (Linux init_mount_tree, 7.0+): a nullfs mount
 /// (id 1) is the namespace root and the mutable rootfs, a tmpfs under
@@ -598,12 +631,10 @@ pub fn init_mount_tree() -> Result<MountRef, KernelError> {
     let rootfs = attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())?;
     let ksb = (nullfs.mount)(nullfs, b"")?;
     let root = ksb.get_root().ok_or(KernelError::InvalidArgument)?;
-    super::fsstruct::kthread_fs_init(Mount::alloc(
-        ksb,
-        root,
-        MNT_READONLY,
-        b"nullfs".as_slice().into(),
-    )?);
+    let k = Mount::alloc(ksb, root, MNT_READONLY, b"nullfs".as_slice().into())?;
+    k.set_internal();
+    super::fsstruct::kthread_fs_init(k.clone());
+    KNULLFS.call_once(|| k);
     Ok(rootfs)
 }
 
@@ -638,7 +669,7 @@ pub fn attach(
         if !check_mnt(&mp.mnt) {
             return Err(KernelError::InvalidArgument);
         }
-        graft(&mut ns, &mount, &mp);
+        graft(&mut ns, mount.clone(), &mp);
         drop(ns);
         drop(_dir_lock);
     } else {
@@ -734,7 +765,11 @@ fn copy_tree(ns: &mut NsTree, plan: &[CopyEnt]) -> MountRef {
             if e.src.flags() & MNT_LOCKED != 0 {
                 n.mark(MNT_LOCKED, true);
             }
-            attach_mnt(ns, &n, &Path::new(out[e.parent].clone(), e.at.clone()));
+            attach_mnt(
+                ns,
+                n.clone(),
+                &Path::new(out[e.parent].clone(), e.at.clone()),
+            );
         }
         out.push(n);
     }
@@ -780,7 +815,7 @@ pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> 
         return Err(KernelError::NotDirectory);
     }
     let t = copy_tree(&mut ns, &plan);
-    graft(&mut ns, &t, mp);
+    graft(&mut ns, t, mp);
     Ok(())
 }
 
@@ -897,8 +932,16 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
     if !detach && (is_mount_busy(&mount, &*ns) || copies.iter().any(|c| c.users() > 0)) {
         return Err(KernelError::Busy);
     }
+    // The tree references taken off, put after a grace period by this
+    // task (Linux namespace_unlock: synchronize_rcu, then mntput), so a
+    // last one's teardown runs before the syscall returns
+    let mut gone: Vec<MountRef> = Vec::new();
+    gone.try_reserve(copies.len() + 1)
+        .map_err(|_| KernelError::OutOfMemory)?;
     for m in core::iter::once(&mount).chain(copies.iter()) {
-        detach_mnt(&mut ns, m);
+        if let Some(t) = detach_mnt(&mut ns, m) {
+            gone.push(t);
+        }
         // Unmounted mounts leave propagation and the namespace
         // (Linux umount_tree)
         for t in walk(m, &*ns) {
@@ -907,6 +950,8 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         }
     }
     drop(ns);
+    crate::sync::rcu::synchronize();
+    drop(gone);
 
     // Write the filesystem back, outside namespace_sem: writeback takes
     // inode locks, which nest outside it (Linux: deactivate_super ->
@@ -915,53 +960,101 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// A mount namespace's last reference went (Linux put_mnt_ns): its whole
+/// tree is unmounted at once (Linux umount_tree of the root): every
+/// mount leaves the namespace and propagation, and loses its parent
+/// and mountpoint; after a grace period (Linux namespace_unlock) the
+/// tree's references, the root's included, are put by the caller,
+/// which may sleep. A mount still used elsewhere (an open file, another
+/// task's cwd) lives on, detached.
+pub fn put_mnt_ns(root: MountRef) {
+    let mut gone = OwnedList::<MntChild>::new();
+    {
+        let mut ns = namespace_lock();
+        for t in walk(&root, &*ns) {
+            super::pnode::change_propagation(&t, super::pnode::Prop::Private);
+            t.set_ns(0);
+        }
+        // Every submount off its parent, breadth first, onto `gone`
+        // (intrusive: nothing allocated under the locks)
+        let mut ml = MOUNT_LOCK.write();
+        let mut todo = OwnedList::<MntChild>::new();
+        let top = root.mnt_mounts.access_mut(&mut ns, &mut ml);
+        while let Some(c) = top.pop_front() {
+            todo.push_back(c);
+        }
+        while let Some(c) = todo.pop_front() {
+            *c.parent.write() = None;
+            let kids = c.mnt_mounts.access_mut(&mut ns, &mut ml);
+            while let Some(k) = kids.pop_front() {
+                todo.push_back(k);
+            }
+            gone.push_back(c);
+        }
+    }
+    crate::sync::rcu::synchronize();
+    while let Some(c) = gone.pop_front() {
+        // SAFETY: entries of mnt_mounts are references (`attach_mnt`),
+        // moved here as they were
+        let c = unsafe { MountRef::from_entry(c) };
+        // Its parent link is gone: `up` no longer reads this
+        if let Some(mp) = c.mountpoint.write().take() {
+            note_mp(&mp, -1);
+        }
+    }
+    drop(root);
+}
+
 /// Take `m` (and what is mounted below it) off its parent; under
 /// NAMESPACE_SEM write
-fn detach_mnt(ns: &mut NsTree, m: &MountRef) {
+fn detach_mnt(ns: &mut NsTree, m: &MountRef) -> Option<MountRef> {
     let parent = m.get_parent();
     // A tree change under MOUNT_LOCK (Linux umount_tree under
     // lock_mount_hash), for the walks that check its sequence; the
-    // parent's reference to `m` and the mountpoint go after the unlock
+    // mountpoint goes after the unlock, the parent's tree reference to
+    // `m` to the caller (a move hangs it elsewhere, an umount releases
+    // it)
     let mut ml = MOUNT_LOCK.write();
     let link = parent
         .as_ref()
         .and_then(|p| p.mnt_mounts.access_mut(ns, &mut ml).remove(m))
-        // SAFETY: entries of mnt_mounts are counted (`attach_mnt`)
-        .map(|c| unsafe { MountRef::from_counted(c) });
+        // SAFETY: entries of mnt_mounts are references (`attach_mnt`)
+        .map(|c| unsafe { MountRef::from_entry(c) });
     *m.parent.write() = None;
     let mp = m.mountpoint.write().take();
     if let Some(mp) = &mp {
         note_mp(mp, -1);
     }
     drop(ml);
-    drop(link);
+    link
 }
 
 /// Hang `m` on `mp` (Linux attach_mnt, under lock_mount_hash: here
 /// MOUNT_LOCK, for the walks that check its sequence); under
 /// NAMESPACE_SEM write
-pub(super) fn attach_mnt(ns: &mut NsTree, m: &MountRef, mp: &Path) {
+pub(super) fn attach_mnt(ns: &mut NsTree, m: MountRef, mp: &Path) {
     let mut ml = MOUNT_LOCK.write();
     m.set_mountpoint(mp.dentry.clone());
     m.set_parent(&mp.mnt);
     mp.mnt
         .mnt_mounts
         .access_mut(ns, &mut ml)
-        .push_back(m.clone().into_counted());
+        .push_back(m.into_entry());
 }
 
 /// Hang the tree at `m` on `mp` and, under a shared mount, propagate
 /// it (Linux attach_recursive_mnt: the tree is made shared first);
 /// under NAMESPACE_SEM write
-fn graft(ns: &mut NsTree, m: &MountRef, mp: &Path) {
+fn graft(ns: &mut NsTree, t: MountRef, mp: &Path) {
+    let m = MountRef::clone(&t);
     let shared = mp.mnt.group.load(Ordering::SeqCst) != 0;
     if shared {
-        super::pnode::invent_groups(ns, m);
+        super::pnode::invent_groups(ns, &m);
     }
-    attach_mnt(ns, m, mp);
-    commit_tree(ns, m);
+    attach_mnt(ns, t, mp);
+    commit_tree(ns, &m);
     if shared {
-        super::pnode::propagate_mnt(ns, &mp.mnt, &mp.dentry, m);
+        super::pnode::propagate_mnt(ns, &mp.mnt, &mp.dentry, &m);
     }
 }
 
@@ -1021,8 +1114,11 @@ pub fn do_move(old: &Path, mp: &Path) -> Result<(), KernelError> {
     if is_path_reachable(mp, old) {
         return Err(KernelError::TooManySymlinks);
     }
-    detach_mnt(&mut ns, &old.mnt);
-    graft(&mut ns, &old.mnt, mp);
+    // It has a parent (checked above): it moves with its tree reference
+    let Some(t) = detach_mnt(&mut ns, &old.mnt) else {
+        unreachable!("mount: an attached mount off no parent");
+    };
+    graft(&mut ns, t, mp);
     Ok(())
 }
 
@@ -1071,14 +1167,20 @@ pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
     else {
         return Err(KernelError::InvalidArgument);
     };
-    detach_mnt(&mut ns, &new.mnt);
-    detach_mnt(&mut ns, &root.mnt);
+    // Both are mounted (checked above): each comes off its parent with
+    // the tree reference it moves with
+    let (Some(tn), Some(tr)) = (
+        detach_mnt(&mut ns, &new.mnt),
+        detach_mnt(&mut ns, &root.mnt),
+    ) else {
+        unreachable!("pivot_root: a mounted mount off no parent");
+    };
     if root.mnt.flags() & MNT_LOCKED != 0 {
         new.mnt.mark(MNT_LOCKED, true);
         root.mnt.mark(MNT_LOCKED, false);
     }
-    attach_mnt(&mut ns, &root.mnt, put_old);
-    attach_mnt(&mut ns, &new.mnt, &Path::new(root_parent, root_mp));
+    attach_mnt(&mut ns, tr, put_old);
+    attach_mnt(&mut ns, tn, &Path::new(root_parent, root_mp));
     drop(ns);
     chroot_fs_refs(&root, &Path::new(new.mnt.clone(), new.mnt.root.clone()));
     Ok(())
@@ -1119,8 +1221,8 @@ impl Mount {
     /// id freed, then its root dentry and superblock released. Sleeps.
     ///
     /// # Safety
-    /// Once per mount, with no counted reference left or to come:
-    /// its `MountRef` count went `MNT_REF_DEAD`, or it never had one.
+    /// Once per mount, with no counted reference left or to come: it is
+    /// doomed, or it never had a reference.
     pub(super) unsafe fn cleanup(&self) {
         // Off s_mounts first, so no walk of it borrows the mount after
         // this (the list's contract, `WeakList`)
@@ -1135,11 +1237,17 @@ impl Mount {
         // A tree torn down whole (a namespace's last reference) still
         // has its submounts hung on it: each loses its parent and
         // mountpoint, and the reference this one held
-        let mut kids = self.unhang_children();
+        let (mut kids, in_ns) = self.unhang_children();
+        // One that was still in a namespace (Linux never has such: the
+        // parent of a doomed mount is in none) had fast puts: wait them
+        // out before its reference goes (Linux namespace_unlock)
+        if in_ns {
+            crate::sync::rcu::synchronize();
+        }
         while let Some(c) = kids.pop_front() {
-            // SAFETY: entries of mnt_mounts are counted (`attach_mnt`),
-            // and moved here with their counts
-            let c = unsafe { MountRef::from_counted(c) };
+            // SAFETY: entries of mnt_mounts are references
+            // (`attach_mnt`), moved here as they were
+            let c = unsafe { MountRef::from_entry(c) };
             // Its parent link is gone: `up` no longer reads this
             if let Some(mp) = c.mountpoint.write().take() {
                 note_mp(&mp, -1);
@@ -1161,19 +1269,23 @@ impl Mount {
     /// parent link there, and moves, with the reference it held, to the
     /// list returned (intrusive: nothing allocated), released after the
     /// locks
-    fn unhang_children(&self) -> OwnedList<MntChild> {
+    fn unhang_children(&self) -> (OwnedList<MntChild>, bool) {
         let mut out = OwnedList::new();
         if !self.has_children(&*MOUNT_LOCK.read_excl()) {
-            return out;
+            return (out, false);
         }
         let mut ns = namespace_lock();
         let mut ml = MOUNT_LOCK.write();
         let list = self.mnt_mounts.access_mut(&mut ns, &mut ml);
+        let mut in_ns = false;
         while let Some(c) = list.pop_front() {
+            debug_assert_eq!(c.ns(), 0, "mount: a doomed mount's submount in a namespace");
+            in_ns |= c.ns() != 0;
+            c.set_ns(0);
             *c.parent.write() = None;
             out.push_back(c);
         }
-        out
+        (out, in_ns)
     }
 }
 
@@ -1191,7 +1303,7 @@ impl MountRef {
 /// reference (`Mount::alloc` failed to allocate its `Arc`)
 impl Drop for Mount {
     fn drop(&mut self) {
-        if *self.mnt_count.get_mut() != MNT_REF_DEAD {
+        if !*self.doomed.get_mut() {
             // SAFETY: never referenced (`&mut self`), so this is its one
             // teardown
             unsafe { self.cleanup() };
@@ -1234,14 +1346,18 @@ pub fn follow_mount(p: Path) -> Path {
 /// sequence)
 fn lookup_mnt(p: &Path) -> Option<MountRef> {
     let ml = MOUNT_LOCK.read_excl();
-    let mut kids = p.mnt.kids(&*ml);
-    let m = kids.find(|c| {
-        c.get_mountpoint()
-            .is_some_and(|mp| same_place(&mp, &p.dentry))
-    });
-    drop(kids);
-    drop(ml);
-    m
+    // Borrowed while scanning (Linux __lookup_mnt takes no reference):
+    // a put under MOUNT_LOCK of a mount out of its namespace would take
+    // it again; only the match gets one
+    ml.mounts(&p.mnt)
+        .iter()
+        .find(|c| {
+            c.mountpoint
+                .read()
+                .as_ref()
+                .is_some_and(|mp| same_place(mp, &p.dentry))
+        })
+        .map(MountRef::entry_ref)
 }
 
 /// Names on this inode's filesystem are their exact bytes (in-memory
@@ -1291,7 +1407,11 @@ mod tests {
     /// A new mount on `parent`'s root
     fn hang(ns: &mut NsTree, parent: &MountRef) -> MountRef {
         let c = mnt();
-        attach_mnt(ns, &c, &Path::new(parent.clone(), parent.root.clone()));
+        attach_mnt(
+            ns,
+            c.clone(),
+            &Path::new(parent.clone(), parent.root.clone()),
+        );
         c
     }
 

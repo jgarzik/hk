@@ -2628,33 +2628,52 @@ takes (Linux lockdep's kernfs active "lock").
 
 **Location:** `fs/mount.rs`
 
-A `MountRef` (`fs/mntput.rs`) counts one reference in
-`Mount.mnt_count` (Linux mnt_count): paths, namespace roots, open
-files, the entries of a parent's `mnt_mounts`. Links that must not
-keep a mount are `Weak` (`Mount.parent`, peer groups, `s_mounts`) and
-take a reference with `MountRef::try_get` (refused once the count is
-zero). Busy is a separate count, `Mount.users` (open files, task roots
-and cwds):
+A `MountRef` (`fs/mntput.rs`) counts one reference in the mount's
+per-CPU parts `Mount.mnt_pcp` (Linux mnt_pcp): paths, namespace roots,
+open files, the entries of a parent's `mnt_mounts`. A clone adds to
+its CPU's part, lock-free. While the mount is in a namespace
+(`Mount.mnt_ns` set; a kernel mount carries `MNT_NS_INTERNAL`, Linux
+kern_mount) the tree holds a reference to it, so a put takes from its
+CPU's part under an RCU read guard (Linux mntput_no_expire's fast
+path). Taking mounts out of their namespace clears `mnt_ns` under
+NAMESPACE_SEM write, then the caller waits out a grace period
+(`rcu::synchronize`) and puts the tree's references itself (Linux
+umount_tree, then namespace_unlock): umount (its task's teardown, if
+the last, runs before the syscall returns) and a namespace's last
+reference (`put_mnt_ns`: the whole tree unmounted in one pass, every
+mount off its parent onto an intrusive list, then the puts). A mount
+moved (MS_MOVE, pivot_root) keeps its namespace and its parent's
+reference moves with it. A put of a mount out of its namespace is
+exact: under MOUNT_LOCK write it takes from its part and sums them;
+the one reaching zero sets `Mount.doomed` (Linux MNT_DOOMED). Links
+that must not keep a mount are `Weak` (`Mount.parent`, peer groups,
+`s_mounts`) and take a reference with `MountRef::try_get` (Linux
+legitimize_mnt: an add while in a namespace, else under MOUNT_LOCK's
+locking read, refused once doomed). No put of a mount out of its
+namespace under MOUNT_LOCK: `lookup_mnt` scans its submounts borrowed
+and takes a reference to the match only (Linux __lookup_mnt). Busy is
+a separate count, `Mount.users` (open files, task roots and cwds):
 
 | Field | Type | Purpose |
 |-------|------|---------|
 | `MntNamespace.root` (`ns/mod.rs`) | `RwLock<Option<MountRef>>` | Root of the namespace's mount tree (one per mount namespace) |
 | `Mount.mountpoint` | `RwLock<Option<Arc<Dentry>>>` | Where this fs is mounted |
 | `Mount.parent` | `RwLock<Option<Weak<Mount>>>` | Parent mount (no reference; `get_parent` takes one with `try_get`) |
-| `Mount.mnt_mounts` | `LockedByEither<OwnedList>` (no lock of its own) | Submounts, each entry holding a counted reference (`MountRef::into_counted`; Linux mnt_mounts, linked through `Mount.mnt_child`): changed only under NAMESPACE_SEM write and `MOUNT_LOCK` both (`attach_mnt`, `detach_mnt`: `&mut NsTree` and `&mut MntHash`), read under either (`Stable`: `&NsTree` from a NAMESPACE_SEM guard, `&MntHash` from `MOUNT_LOCK.read_excl`). Walks step with `next_mnt` (Linux next_mnt: first submount, else the next sibling of the nearest mount up to the walk's root that has one), so no list is copied and no stack is kept |
-| `Mount.mnt_count` | `AtomicUsize` | `MountRef` count (Linux mnt_count); `MNT_REF_DEAD` once the teardown is queued |
+| `Mount.mnt_mounts` | `LockedByEither<OwnedList>` (no lock of its own) | Submounts, each entry a reference to the submount (`MountRef::into_entry`; Linux mnt_mounts, linked through `Mount.mnt_child`): changed only under NAMESPACE_SEM write and `MOUNT_LOCK` both (`attach_mnt`, `detach_mnt`: `&mut NsTree` and `&mut MntHash`), read under either (`Stable`: `&NsTree` from a NAMESPACE_SEM guard, `&MntHash` from `MOUNT_LOCK.read_excl`). Walks step with `next_mnt` (Linux next_mnt: first submount, else the next sibling of the nearest mount up to the walk's root that has one), so no list is copied and no stack is kept |
+| `Mount.mnt_pcp` | per-CPU `AtomicIsize` parts, a cache line each | `MountRef` count (Linux mnt_pcp's mnt_count), summed under `MOUNT_LOCK` write once out of its namespace |
+| `Mount.doomed` | `AtomicBool` | Last reference gone (Linux MNT_DOOMED), set under `MOUNT_LOCK` write by that put |
 | `Mount.users` | `AtomicU64` | Open files, task roots and cwds (`user_get`/`user_put`): nonzero is EBUSY for umount |
 | `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC/READONLY/LOCKED; every write under `MOUNT_LOCK` (remount, reconfigure, pivot_root's MNT_LOCKED), read lock-free (open, exec, statfs) |
 | `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`: Linux attach_mnt and umount_tree under lock_mount_hash; with NAMESPACE_SEM write it owns `mnt_mounts`); under NAMESPACE_SEM, s_umount and (in d_path) RENAME_LOCK; under it only `SuperBlock.s_mounts`, d_path's borrowed `parent`/`mountpoint` reads, and in attach/detach the moved mount's `parent`/`mountpoint` and the mountpoint's `d_lock` (mount count), one at a time; in `lookup_mnt`'s locking read a child's `mountpoint` and then `d_lock`; nothing takes it under a Mount field lock. No mount or mountpoint is dropped under it (`make_rdonly` releases its references, `detach_mnt` the parent's reference to the mount and the mountpoint, after the unlock). The sequence is read lock-free by scoped walks (3.3 Path Traversal) |
 | `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
-| `Mount.mnt_ns` | `AtomicU64` | Id of the mount's namespace (`MntNamespace.id`, never reused), 0 for none (Linux mnt_ns): written only under NAMESPACE_SEM write (commit_tree when a tree is grafted or propagated, the namespace root, a namespace copy; umount clears it), read by `check_mnt` under NAMESPACE_SEM; can_umount and remount read it first without, as Linux (umount repeats it under the lock) |
+| `Mount.mnt_ns` | `AtomicU64` | Id of the mount's namespace (`MntNamespace.id`, never reused), 0 for none, `MNT_NS_INTERNAL` for a kernel mount (Linux mnt_ns, MNT_NS_INTERNAL): written only under NAMESPACE_SEM write (commit_tree when a tree is grafted or propagated, the namespace root, a namespace copy; umount and `put_mnt_ns` clear it, a grace period before the tree's references are put), or once before a kernel mount is shared; read lock-free by a put's fast path under an RCU read guard, read by `check_mnt` under NAMESPACE_SEM; can_umount and remount read it first without, as Linux (umount repeats it under the lock) |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
 | `Mount.writers`, `SuperBlock.s_writers` | `AtomicU64` (count + WRITE_HOLD bit 63) | Write-access holders (Linux mnt_writers + WRITE_HOLD): through a mount on the mount, for mountless internal objects on the superblock. A writer adds itself, spins while WRITE_HOLD is set, then checks read-only state (EROFS, backing out). Making a mount read-only (`set_flags`, Linux mnt_make_readonly) or the file system (`make_rdonly`, Linux sb_prepare_remount_readonly: every writable mount in `s_mounts` and `s_writers`) sets WRITE_HOLD under `MOUNT_LOCK`, is EBUSY with nothing changed if any count is nonzero, else sets the read-only flag before clearing the hold (Release). The writer's spin is invisible to lockdep; holders never wait for writers |
 | `SuperBlock.s_mounts` | spin Mutex leaf | the superblock's mounts (Linux s_mounts: a `WeakList` through `Mount.mnt_instance`): a new mount is added under `MOUNT_LOCK` (`Mount::alloc`, Linux clone_mnt under lock_mount_hash), so a read-only remount's walk (`make_rdonly`, under `MOUNT_LOCK` and this lock across both passes, taking no reference) misses no mount a writer could use; a mount leaves it first thing in its teardown, under this lock alone, before its superblock is released |
 
 **Last reference:** as for files (`fput`), the last `MountRef`'s drop
 never tears the mount down itself (Linux mntput_no_expire): it marks
-the count `MNT_REF_DEAD` and queues the teardown (`Mount::cleanup`,
+the mount doomed and queues the teardown (`Mount::cleanup`,
 Linux cleanup_mnt: off `s_mounts`, its submounts unhung under
 NAMESPACE_SEM write and MOUNT_LOCK and their references dropped, its
 mountpoint and id released, then its root dentry and superblock,
@@ -2665,7 +2684,7 @@ on `DELAYED_MNTPUT` (IrqSpinlock leaf, the mounts' embedded callback
 heads) drained by delayed work on `SYSTEM_WQ`. So a `MountRef` may be
 dropped under any lock. The `sb` and `root` fields (`MntOwned`) are
 released by the teardown while the mount's memory may live on in a
-failed `try_get`'s brief `Arc`, which never reads them.
+`try_get`'s brief `Arc` (a refused one never reads them).
 
 **Users (busy):** an open `File` (`File::new` → `user_get`, its
 release → `user_put`) and an `FsStruct`'s root and cwd are users;

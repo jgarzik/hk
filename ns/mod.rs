@@ -83,6 +83,17 @@ pub const CLONE_NS_FLAGS: u64 = CLONE_NEWNS
 
 use crate::fs::mount::{Mount, MountRef};
 
+impl Drop for MntNamespace {
+    /// Linux put_mnt_ns: the tree is unmounted whole (sleeps: the last
+    /// reference goes in thread context with nothing held, an exit or
+    /// unshare/setns, or a namespace file's deferred release)
+    fn drop(&mut self) {
+        if let Some(root) = self.root.get_mut().take() {
+            crate::fs::mount::put_mnt_ns(root);
+        }
+    }
+}
+
 /// Next mount namespace id (Linux ns_common.ns_id): never reused, so
 /// a mount that outlived its namespace matches no other
 static NEXT_MNT_NS_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -128,7 +139,7 @@ impl MntNamespace {
     /// pwd to the copies of their mounts (Linux copy_mnt_ns)
     pub fn clone_ns(&self, fs: Option<&crate::fs::FsStruct>) -> KernelResult<Arc<Self>> {
         let new_ns = Self::new()?;
-        let old_root = self.root.read().clone();
+        let old_root = self.get_root();
         if let Some(old_root) = old_root {
             let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id);
             *new_ns.root.write() = Some(new_root);
@@ -139,9 +150,10 @@ impl MntNamespace {
         Ok(new_ns)
     }
 
-    /// Set the root mount
+    /// Set the root mount: the tree's reference to it
     pub fn set_root(&self, mount: MountRef) {
-        *self.root.write() = Some(mount);
+        let old = self.root.write().replace(mount);
+        drop(old);
     }
 
     /// Get the root mount

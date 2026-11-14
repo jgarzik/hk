@@ -148,6 +148,8 @@ impl Pseudo {
         let root = sb.get_root().ok_or(KernelError::Io)?;
         let name = self.ty.name.as_bytes().into();
         let m = Mount::alloc(sb, root, MNT_NOEXEC | MNT_NODEV, name)?;
+        // A kernel mount (Linux kern_mount)
+        m.set_internal();
         self.mnt.call_once(|| m);
         Ok(())
     }
