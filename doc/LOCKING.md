@@ -652,7 +652,8 @@ SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fa_lock,
     fown->lock): fasync_helper: File.f_lock → FASYNC_LOCK (spin, one
     for every list) → an entry's `fa` (IrqRwLock); kill_fasync walks a
     list under RCU, any context but hardirq, spin locks held or not:
-    `fa` (read) → FOwner.st (IrqRwLock, read) → TASKLIST (read) →
+    `fa` (read) → FOwner.st (IrqRwLock, read) → TASKLIST (read; a
+    pgrp owner's group walked under it, each send in place) →
     Task.sig → shared_pending, its entry GFP_ATOMIC (3.7 rule 5)
 
 Block locks (3.10 Block Device Subsystem):
@@ -1264,7 +1265,11 @@ one of those two, is dropped in the section and frees nothing); a group's `Pid` 
 (`find_pgrp`, PIDMAP_LOCK) before TASKLIST is taken. Group 0, where
 init starts, is `INIT_STRUCT_PID` (Linux init_struct_pid, never
 hashed). kill(-pgrp), kill(0), tty ISIG, F_SETOWN and PRIO_PGRP /
-IOPRIO_WHO_PGRP walk a group's list, never the whole task list.
+IOPRIO_WHO_PGRP walk a group's list, never the whole task list; the
+signal senders (`kill_pgrp_info`, `send_sigio`) walk it under one
+TASKLIST read hold and send to each process in place (Linux
+__kill_pgrp_info, send_sigio under tasklist_lock), allocating nothing
+but each signal's queue entry.
 
 A `Task` has five kinds of fields: fixed at creation (`tid`, `pid`,
 `pid_ns`, `kind`, `kstack_top`); hot atomics written by the task itself (or its
@@ -1475,38 +1480,45 @@ list, seccomp filter) are `TaskInner` fields under TASKLIST, and
 ### 3.1.3 Task State Invariants
 
 The `TaskState` enum in `TASKLIST` is informational (and records
-`Zombie(wait_status)` / `Traced`), not the scheduling source of truth:
+`Zombie(wait_status)`), not the scheduling source of truth:
 
-**ptrace stops** (`task/ptrace.rs`, Linux ptrace_stop): the tracee
-sets `TaskState::Traced(code)` and `ptrace_code` under the TASKLIST
-write lock, drops it, wakes `CHILD_EXIT_WQ` and signals its tracer, then
-sleeps `Killable` until its TASKLIST state is no longer `Traced` (read
-lock, rechecked after each wakeup) or SIGKILL. The tracer's wait clears
-`ptrace_code` under the write lock; resume, detach and the tracer's exit
-(`exit_ptrace`) set the state and the code to deliver under it, then
-`try_to_wake_up` the tracee with it dropped. The tracer's exit detaches
+**ptrace stops** (`task/ptrace.rs`, Linux ptrace_stop; JOBCTL_TRACED,
+JOBCTL_PTRACE_FROZEN, exit_code and last_siginfo under siglock): a
+stop is `TaskSignalState.jobctl` (`jobctl::TRACED`, `PTRACE_FROZEN`),
+`ptrace_code` and `last_siginfo`, all under the tracee's `Task.sig`.
+The tracee checks it is traced under TASKLIST's read lock (`ptrace`
+is written under the write lock, so a detach cannot slip between) and
+sets the stop under its `Task.sig` inside it, drops both, wakes
+`CHILD_EXIT_WQ` and signals its tracer, then sleeps `Killable` until
+the stop has ended (`Task.sig`, rechecked after each wakeup) or
+SIGKILL. The tracer's wait walks its tracees under the read lock and
+takes a stop's code under that tracee's `Task.sig` (Linux
+wait_task_stopped); resume, detach and the tracer's exit
+(`exit_ptrace`) end the stop and set the code to deliver under it, then
+`try_to_wake_up` the tracee. The tracer's exit detaches
 one tracee per write section; a PTRACE_O_EXITKILL tracee's SIGKILL is
 queued in that section before the detach (`sigkill_held`, Linux
 exit_ptrace under tasklist_lock: SIGKILL takes no queue entry, so
 nothing allocates), so a tracee woken by anything between the section
 and its wakeup still dies before user code; the kill's group effects
-and wakeups follow the lock (`Posted::finish`). SIGKILL ends the stop in
-the section that queues it (`sigkill_task` from `zap_threads`, Linux
-signal_wake_up(fatal) clearing JOBCTL_TRACED), so a wait after the
-kill never reports the stop. A tracer's request holds the stop while it
-runs (`TaskInner.ptrace_frozen`, Linux JOBCTL_PTRACE_FROZEN): set under
-the write lock by `ptrace_check_attach` (in the stop, no SIGKILL
-pending), cleared under it when the request's `Frozen` guard drops (if
-the tracee is still listed: `view_mut`),
-and whenever a stop begins or ends (resume, detach, the tracer's exit,
-the tracee leaving `ptrace_stop`), so no stale flag outlives a stop;
-while it is set, SIGKILL leaves the stop alone (`sigkill_task`, and the
-tracee, woken, sleeps `Uninterruptible` once it reads frozen with
-SIGKILL pending), and the guard's drop ends a stop with SIGKILL pending
-and wakes the tracee after the lock (Linux ptrace_unfreeze_traced). The
-arch register and
-single-step helpers take the TASKLIST read lock themselves, so callers
-never hold it.
+and wakeups follow the lock (`Posted::finish`). SIGKILL ends the stop
+under the `Task.sig` hold that queues it (`sigkill_task`, Linux
+signal_wake_up(fatal) clearing JOBCTL_TRACED under siglock), so a wait
+after the kill never reports the stop, and a kill needs no TASKLIST
+write lock (`zap_threads` walks the group under the read lock). A
+tracer's request holds the stop while it runs (`PTRACE_FROZEN`): set
+by `ptrace_check_attach` under the tracee's `Task.sig` (in the stop, no
+SIGKILL pending) inside TASKLIST's read lock (the tracer link), cleared
+under `Task.sig` when the request's `Frozen` guard drops, and whenever
+a stop begins or ends (resume, detach, the tracer's exit, the tracee
+leaving `ptrace_stop`), so no stale flag outlives a stop; while it is
+set, SIGKILL leaves the stop alone (`sigkill_task`, and the tracee,
+woken, sleeps `Uninterruptible` once it reads frozen with SIGKILL
+pending), and the guard's drop ends a stop with SIGKILL pending and
+wakes the tracee (Linux ptrace_unfreeze_traced). The arch register
+helpers take the TASKLIST read lock, then the tracee's `Task.sig`,
+held across the frame access (a stop ends only under it); they and
+the single-step helpers lock for themselves, so callers hold neither.
 
 **Source of Truth for Scheduling** (owner CPU's rq, IrqSpinlock):
 1. **Runnable**: entry `queued` (in `CpuRunQueue.queue`)
@@ -3521,7 +3533,7 @@ state patterns.
 |----------|------|---------|
 | `Task.sighand` | `Option<Arc<SigHand>>` under TASKLIST | The task's handler table |
 | `SigHand.users` | `TableCell<u32>` (TASKLIST) | Tasks whose `Task.sighand` it is, changed with that field (Linux sighand->count): exec copies a table with more than one (unshare_sighand) |
-| `Task.sig` | `spin::Mutex<TaskSignalState>` (per task) | Blocked mask, private pending set, altstack (Linux siglock's per-task part) |
+| `Task.sig` | `spin::Mutex<TaskSignalState>` (per task) | Blocked mask, private pending set, altstack; a ptrace stop: `jobctl` (TRACED, PTRACE_FROZEN), `ptrace_code`, `last_siginfo` (3.1.3) (Linux siglock's per-task part: jobctl, exit_code, last_siginfo) |
 | `Task.thread_flags` TIF_SIGPENDING | atomic, recomputed under `Task.sig` | Pending-signal flag |
 | `SignalStruct.shared` | `spin::Mutex<GroupPending>`, reached through `TaskSignalState.shared_pending` (the task's `Arc<SignalStruct>`); a flush on SIG_IGN (`flush_group_signal`) takes it alone, through the group's `SignalStruct` | Thread-group pending set and curr_target (Linux signal->shared_pending, curr_target) |
 | `SigPending` list | `Option<Box<SigQueue>>` under the set's lock | Queued siginfo (Linux sigpending.list of struct sigqueue) |
@@ -3590,19 +3602,26 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    Linux): its held locks order above TASKLIST and the signal locks.
 
 6. **A group signal's thread is chosen under TASKLIST, not siglock**
-   (Linux complete_signal under siglock): after the signal is queued
-   on the group set under the receiver's `Task.sig`, the threads are
-   walked under TASKLIST (`signal::choose`: read lock; a send under the
-   write lock, a child's notice, chooses in that section), each
-   candidate's `Task.sig` taken alone to test wants_signal, and whether
-   it ends the group decided there, never for an init its protection
-   covers (`Target::protects`). The lock is dropped before the chosen
-   thread's TIF_SIGPENDING is recomputed under its `Task.sig` and it is
-   woken (a decided group kill done then too). A thread that blocks a group signal or starts
-   exiting hands it on the same way after dropping its own lock
-   (retarget_shared_pending). A thread that changes its mask between
-   the test and the wakeup sees the signal when it recomputes
-   TIF_SIGPENDING.
+   (Linux complete_signal under siglock): a send holds TASKLIST's read
+   lock from finding its receiver to its last wakeup (`send_task_in`;
+   a caller already holding it, a process-group walk, sends in place,
+   as Linux group_send_sig_info under tasklist_lock). After the signal
+   is queued under the receiver's `Task.sig`, the threads are walked
+   (`signal::choose`; a send under the write lock, a child's notice,
+   chooses in that section), each candidate's `Task.sig` taken alone
+   to test wants_signal, and whether it ends the group decided there,
+   never for an init its protection covers (`Target::protects`). Then,
+   still under TASKLIST, a decided group kill is done (`group_kill`,
+   `zap_threads`: each thread's `Task.sig` alone, nothing allocated)
+   and the chosen thread's TIF_SIGPENDING is recomputed under its
+   `Task.sig` and it is woken; a send under the write lock leaves
+   these to `Posted::finish`, which takes the read lock after the
+   write lock is dropped. A send changes no blocked mask, so it never
+   retargets (`with_sig_send`), which would take TASKLIST again. A
+   thread that blocks a group signal or starts exiting hands it on
+   the same way after dropping its own lock (retarget_shared_pending).
+   A thread that changes its mask between the test and the wakeup
+   sees the signal when it recomputes TIF_SIGPENDING.
 
 #### Lock Order for Signal Operations
 
@@ -3673,14 +3692,15 @@ process context only). The syscall finds the target once, under one
 TASKLIST read hold (the number, the permission check, a `TaskRef`);
 the send works on that task:
 ```rust
-let tg = target(t)?;                      // TASKLIST read: still listed,
-                                          // its handlers, group, limits
-let sent = with_sig(t, |t, state| {       // Task.sig
+let table = TASKLIST.read();
+let tg = target_in(&table, t)?;           // still listed, its handlers,
+                                          // group, limits
+let sent = with_sig_send(t, |t, state| {  // Task.sig
     if sig_ignored(..) { return Dropped } // SIG_IGN / default-ignore
     state.pending.add(sig);
     Queued(wants)
 });                                       // TIF_SIGPENDING recomputed
-// both released, then (complete_signal):
+// Task.sig released, TASKLIST still read-held (complete_signal):
 signal_wake_task(&c, WakeMode::Interruptible) // try_to_wake_up(&Task) or
                                               // kick_process
 ```
@@ -3713,11 +3733,13 @@ ending the others (group_exec_task). The first exit_group or fatal
 signal wins the swap; a fatal signal also overrides an exec's
 de_thread, exit_group does not.
 
-- `zap_threads` walks the group's thread list under TASKLIST's write
-  lock (`first_thread`/`next_thread`, nothing allocated: Linux
+- `zap_threads` walks the group's thread list under its caller's
+  TASKLIST hold (a send's read lock, exit_group's and de_thread's own
+  read lock, or a write section's; nothing allocated: Linux
   zap_other_threads under siglock), queuing SIGKILL in each live
-  thread's private pending set, setting its TIF_SIGPENDING and waking
-  it there (`WakeMode::Fatal`: interruptible and killable sleeps; a
+  thread's private pending set under its `Task.sig`, setting its
+  TIF_SIGPENDING and ending a ptrace stop there (`sigkill_task`), and
+  waking it (`WakeMode::Fatal`: interruptible and killable sleeps; a
   wakeup takes only pi_lock and run-queue locks under TASKLIST).
 - A thread cloned into a group whose state is set gets SIGKILL after
   `install_fork_signal` set up its signal state (`zap_new_thread`): the
@@ -4596,7 +4618,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `INODE_HASH_LOCK` | fs/icache.rs | spin Mutex | the inode cache's buckets (Linux inode_hash_lock); 3.3 Inode cache: under it `Inode.private` -> `VfatInode.d` (vfat's `test`) |
 | `CHARDEV_REGISTRY` | fs/chardev.rs | sleeping `sync::RwSem` (Linux chrdevs_lock, cdev_map->lock: mutexes) | character device registry: registered at probe, looked up at open and mmap (under mmap_lock); never under a spin lock |
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf but for `FASYNC_LOCK` under it (O_ASYNC is set or cleared only with the file's fasync entry, Linux fasync_insert_entry). `File.f_iocb` (the flags' I/O part, Linux f_iocb_flags: O_APPEND, O_DIRECT, O_DSYNC, __O_SYNC) is an atomic written only under it with the flags (F_SETFL), read lock-free by each read and write: an I/O racing an F_SETFL sees the old or the new word, as Linux's unlocked read of f_iocb_flags. `File.f_wb_err` / `f_sb_err` (Linux f_wb_err, f_sb_err: the writeback errors of the file's mapping and filesystem it has seen) are atomics sampled at open and advanced only under it (`errseq` check-and-advance, Linux file_check_and_advance_wb_err), read lock-free first. `AddressSpace.wb_err`, `SuperBlock.s_wb_err` (`util::errseq::ErrSeq`, Linux errseq_t) are lock-free words set by a failed writeback and a stale page cache after a direct write |
-| `File.f_lock` → `FASYNC_LOCK` → `Fasync.fa`; `Fasync.fa` → `FOwner.st` → TASKLIST | io/fasync.rs | `FASYNC_LOCK`: spin Mutex, thread context; `fa`, `FOwner.st`: `IrqRwLock` | SIGIO (Linux fasync_lock, fasync_struct's fa_lock, fown->lock, RCU readers): a `FasyncList` (a pipe's readers and writers, a socket's, a tty's, an inotify group's) is an `RcuList` of `Fasync` entries, each a file's `FOwner` reference and armed fd in `fa`. `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) allocates the entry first, then under `File.f_lock` and `FASYNC_LOCK` finds the owner's entry (a new fd under its `fa` write) or links the new one, and sets O_ASYNC with it; a removal clears `fa` (Linux fa_file = NULL), unlinks the entry and frees it a grace period later (`RcuUnlinked::defer`), the owner reference dropped after the locks. `kill_fasync` walks under RCU with `with_gfp(ATOMIC)`, any context but hardirq, any spin locks held: per entry `fa` read, then the owner's `st` read held across `send_sigio` (the owner's pid borrowed, no reference); a pgrp owner's targets are gathered GFP_ATOMIC under TASKLIST. `FasyncList.armed` (atomic, written under `FASYNC_LOCK`, read lock-free: Linux kill_fasync's unlocked list test) lets a wakeup with no armed file skip the walk. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |
+| `File.f_lock` → `FASYNC_LOCK` → `Fasync.fa`; `Fasync.fa` → `FOwner.st` → TASKLIST | io/fasync.rs | `FASYNC_LOCK`: spin Mutex, thread context; `fa`, `FOwner.st`: `IrqRwLock` | SIGIO (Linux fasync_lock, fasync_struct's fa_lock, fown->lock, RCU readers): a `FasyncList` (a pipe's readers and writers, a socket's, a tty's, an inotify group's) is an `RcuList` of `Fasync` entries, each a file's `FOwner` reference and armed fd in `fa`. `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) allocates the entry first, then under `File.f_lock` and `FASYNC_LOCK` finds the owner's entry (a new fd under its `fa` write) or links the new one, and sets O_ASYNC with it; a removal clears `fa` (Linux fa_file = NULL), unlinks the entry and frees it a grace period later (`RcuUnlinked::defer`), the owner reference dropped after the locks. `kill_fasync` walks under RCU with `with_gfp(ATOMIC)`, any context but hardirq, any spin locks held: per entry `fa` read, then the owner's `st` read held across `send_sigio` (the owner's pid borrowed, no reference); the owner's thread, process or process group is found and sent to under one TASKLIST read hold, a group walked and each process sent to in place (Linux send_sigio: do_each_pid_task under tasklist_lock), nothing allocated but each signal's queue entry (GFP_ATOMIC, 3.7 rule 5). `FasyncList.armed` (atomic, written under `FASYNC_LOCK`, read lock-free: Linux kill_fasync's unlocked list test) lets a wakeup with no armed file skip the walk. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
 | `RamfsInodeData.xattrs` | fs/ramfs/mod.rs | spin | tmpfs xattrs (under VFS locks); nothing allocates under it: the name and value are copied before it is taken (Linux simple_xattr_alloc), the list grows with it released (`kmem::spare`), and a replaced or removed attribute is freed after. Only tmpfs has them (ramfs: EOPNOTSUPP, as Linux). Their space is the inode space under `tmpfs::Acct.stat` (Linux free_ispace under stat_lock), never nested with this lock: a set takes its space before the lock (ENOSPC) and returns what it did not use after; the inode's share (`RamfsInodeData.xattr_bytes`) goes back when it is freed |
 | tmpfs accounting (`tmpfs::Acct`: `stat`, `max_blocks`, `used_blocks`) | fs/ramfs/tmpfs.rs | `stat` IrqSpinlock leaf; `used_blocks` a `PercpuCounter` | as Linux shmem_sb_info: `stat` (Linux stat_lock) holds the inode limit, the inode space (Linux free_ispace: each inode, extra hard link and user.* xattr takes from it; returned at unlink of an extra link, at `evict_inode` in any context, and when the xattr goes) and the inode64/noswap options; `max_blocks` (an atomic written under `stat`, read without it as Linux does) is the block limit; file pages are charged to `used_blocks` as they enter the cache (`filemap::add`, under the page lock, before `i_pages`) by a limited add that is exact near the limit, and returned as they leave (`remove`, eviction). A remount (under `s_umount` held for writing) checks every new limit against the use and changes them all under `stat`, or nothing. Uncounted while unlimited; an unlimited mount cannot be limited again (Linux "Cannot retroactively limit size") |
