@@ -14,13 +14,18 @@
 //! NSFS_PIDFD: setns with a pidfd joins the namespaces its flags name
 //! of that task (Linux validate_nsset); no flags or a flag that is no
 //! namespace type is EINVAL, a reaped task ESRCH.
+//!
+//! NSFS_IOCTL: NS_GET_NSTYPE, NS_GET_USERNS and NS_GET_PARENT (new
+//! O_CLOEXEC descriptors of the owner or parent, EPERM past what the
+//! caller's own namespace may see, EINVAL for a type with no parent),
+//! NS_GET_OWNER_UID (as the caller's user namespace maps it).
 
 use super::{first_bad, fstat, in_child, ns_link, pid_path, stat};
 use crate::harness::verdict_detail;
 use hk_syscall::{
-    CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWUTS, O_CREAT, O_RDONLY, O_WRONLY, UtsName, sys_close,
-    sys_exit, sys_fork, sys_getpid, sys_mkdir, sys_mount, sys_open, sys_pipe, sys_read,
-    sys_sethostname, sys_setns, sys_uname, sys_unshare, sys_wait4, sys_write,
+    CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS, O_CREAT, O_RDONLY,
+    O_WRONLY, UtsName, sys_close, sys_exit, sys_fork, sys_getpid, sys_mkdir, sys_mount, sys_open,
+    sys_pipe, sys_read, sys_sethostname, sys_setns, sys_uname, sys_unshare, sys_wait4, sys_write,
 };
 
 const EINVAL: i64 = -22;
@@ -36,6 +41,8 @@ pub fn run_tests() {
     verdict_detail(b"NSFS_PIN", r == 0, r);
     let r = in_child(pidfd_child);
     verdict_detail(b"NSFS_PIDFD", r == 0, r);
+    let r = in_child(ioctl_child);
+    verdict_detail(b"NSFS_IOCTL", r == 0, r);
 }
 
 /// Each link's name and what it reads
@@ -246,5 +253,137 @@ fn pidfd_child() -> u8 {
     match first_bad(&[reaped, sys_setns(fd, CLONE_NEWUTS as i32) == ESRCH]) {
         0 => 0,
         n => 10 + n,
+    }
+}
+
+const NS_GET_USERNS: u64 = 0xb701;
+const NS_GET_PARENT: u64 = 0xb702;
+const NS_GET_NSTYPE: u64 = 0xb703;
+const NS_GET_OWNER_UID: u64 = 0xb704;
+const EPERM: i64 = -1;
+const ENOTTY: i64 = -25;
+
+/// ioctl(2) on a namespace file with no argument
+fn nsio(fd: i64, cmd: u64) -> i64 {
+    hk_syscall::sys_ioctl(fd as i32, cmd, 0)
+}
+
+/// st_ino of `fd`, 0 on error
+fn ino(fd: i64) -> u64 {
+    fstat(fd).map_or(0, |s| s.st_ino)
+}
+
+/// NS_GET_OWNER_UID of `fd`: the uid, or the error
+fn owner_uid(fd: i64) -> i64 {
+    let mut uid = u32::MAX;
+    let r = hk_syscall::sys_ioctl(fd as i32, NS_GET_OWNER_UID, (&raw mut uid) as u64);
+    if r < 0 { r } else { i64::from(uid) }
+}
+
+/// Child of NSFS_IOCTL
+fn ioctl_child() -> u8 {
+    let user = ns_link(b"/proc/self/ns/user\0", b"user");
+    let uts = sys_open(b"/proc/self/ns/uts\0".as_ptr(), O_RDONLY, 0);
+    let pid = sys_open(b"/proc/self/ns/pid\0".as_ptr(), O_RDONLY, 0);
+    let u = nsio(uts, NS_GET_USERNS);
+    let steps = [
+        user != 0 && uts >= 0 && pid >= 0,
+        nsio(uts, NS_GET_NSTYPE) == CLONE_NEWUTS as i64,
+        u >= 0 && ino(u) == user,
+        hk_syscall::sys_fcntl(u as i32, 1, 0) == 1,
+        nsio(u, NS_GET_NSTYPE) == CLONE_NEWUSER as i64,
+        // The initial namespaces have no owner or parent to give
+        nsio(u, NS_GET_USERNS) == EPERM,
+        nsio(u, NS_GET_PARENT) == EPERM,
+        nsio(pid, NS_GET_PARENT) == EPERM,
+        nsio(uts, NS_GET_PARENT) == EINVAL,
+        owner_uid(uts) == EINVAL,
+        owner_uid(u) == 0,
+        nsio(uts, 0xb7ff) == ENOTTY,
+    ];
+    let bad = first_bad(&steps);
+    if bad != 0 {
+        return bad;
+    }
+    child_ns_ioctls(user)
+}
+
+/// The grandchild of NSFS_IOCTL: in a new pid namespace, it makes new
+/// user and UTS namespaces and checks them from inside; exits 0 if
+/// all passed once `down` is closed
+fn ioctl_grandchild(user: u64, up: [i32; 2], down: [i32; 2]) -> ! {
+    sys_close(up[0] as u64);
+    sys_close(down[1] as u64);
+    let mine = |p: &[u8]| sys_open(p.as_ptr(), O_RDONLY, 0);
+    let pid = mine(b"/proc/self/ns/pid\0");
+    let new_user = sys_unshare(CLONE_NEWUSER | CLONE_NEWUTS) == 0;
+    let uts = mine(b"/proc/self/ns/uts\0");
+    let u = mine(b"/proc/self/ns/user\0");
+    let me = ns_link(b"/proc/self/ns/user\0", b"user");
+    let o = nsio(uts, NS_GET_USERNS);
+    let code = first_bad(&[
+        new_user && me != 0 && me != user,
+        o >= 0 && ino(o) == me,
+        // Its parent is outside what it may see; its creator's uid has
+        // no mapping in it
+        nsio(u, NS_GET_PARENT) == EPERM,
+        nsio(u, NS_GET_USERNS) == EPERM,
+        owner_uid(u) == 65534,
+        nsio(pid, NS_GET_PARENT) == EPERM,
+    ]);
+    sys_write(up[1] as u64, b"x".as_ptr(), 1);
+    let mut x = 0u8;
+    sys_read(down[0] as u64, &mut x, 1);
+    sys_exit(u64::from(code));
+}
+
+/// NSFS_IOCTL on a child's new user, UTS and pid namespaces, seen from
+/// inside and from here
+fn child_ns_ioctls(user: u64) -> u8 {
+    let pidns = ns_link(b"/proc/self/ns/pid\0", b"pid");
+    if sys_unshare(CLONE_NEWPID) != 0 {
+        return 50;
+    }
+    let (mut up, mut down) = ([0i32; 2], [0i32; 2]);
+    if sys_pipe(up.as_mut_ptr()) != 0 || sys_pipe(down.as_mut_ptr()) != 0 {
+        return 51;
+    }
+    let c = sys_fork();
+    if c == 0 {
+        ioctl_grandchild(user, up, down);
+    }
+    sys_close(up[1] as u64);
+    sys_close(down[0] as u64);
+    let mut x = 0u8;
+    if c < 0 || sys_read(up[0] as u64, &mut x, 1) != 1 {
+        return 52;
+    }
+    let mut b = [0u8; 64];
+    let u = sys_open(
+        pid_path(&mut b, b"/proc/", c, b"/ns/user").as_ptr(),
+        O_RDONLY,
+        0,
+    );
+    let p = sys_open(
+        pid_path(&mut b, b"/proc/", c, b"/ns/pid").as_ptr(),
+        O_RDONLY,
+        0,
+    );
+    let (pu, pp) = (nsio(u, NS_GET_PARENT), nsio(p, NS_GET_PARENT));
+    let steps = [
+        pu >= 0 && ino(pu) == user,
+        owner_uid(u) == 0,
+        nsio(p, NS_GET_NSTYPE) == CLONE_NEWPID as i64,
+        pp >= 0 && ino(pp) == pidns,
+    ];
+    sys_close(down[1] as u64);
+    let mut ws = 0;
+    if sys_wait4(c, &mut ws, 0, 0) != c {
+        return 53;
+    }
+    match first_bad(&steps) {
+        0 if ws == 0 => 0,
+        0 => 70 + ((ws >> 8) & 0xff) as u8,
+        n => 60 + n,
     }
 }

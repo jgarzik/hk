@@ -32,14 +32,96 @@ use crate::ns::{MntNamespace, NsRef};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
+/// The nsfs ioctls (Linux uapi nsfs.h, _IO(NSIO, n))
+const NS_GET_USERNS: u32 = 0xb701;
+const NS_GET_PARENT: u32 = 0xb702;
+const NS_GET_NSTYPE: u32 = 0xb703;
+const NS_GET_OWNER_UID: u32 = 0xb704;
+
 /// A namespace file's operations (Linux ns_file_operations): it opens,
-/// and has no read or write (EINVAL)
+/// has no read or write (EINVAL), and answers the NS_GET_* ioctls
 pub struct NsFileOps;
 
 impl FileOps for NsFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+
+    /// Linux ns_ioctl: NS_GET_USERNS and NS_GET_PARENT give a new
+    /// O_CLOEXEC descriptor of the owning user namespace or the parent
+    /// (pid and user namespaces only, else EINVAL); NS_GET_NSTYPE its
+    /// CLONE_NEW* type; NS_GET_OWNER_UID a user namespace's creator's
+    /// uid as the caller's user namespace sees it. ENOTTY otherwise.
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        let ns = file
+            .get_inode()
+            .and_then(|i| get_proc_ns(&i))
+            .ok_or(KernelError::NotTty)?;
+        match cmd {
+            NS_GET_USERNS => open_related_ns(ns_get_owner(&ns)?),
+            NS_GET_PARENT => open_related_ns(match &ns {
+                NsRef::User(_) => ns_get_owner(&ns)?,
+                NsRef::Pid(p) => pidns_get_parent(p)?,
+                _ => return Err(KernelError::InvalidArgument),
+            }),
+            NS_GET_NSTYPE => Ok(ns.ns_type() as i64),
+            NS_GET_OWNER_UID => {
+                let NsRef::User(u) = &ns else {
+                    return Err(KernelError::InvalidArgument);
+                };
+                let uid = crate::ns::current_user_ns().from_kuid_munged(u.owner);
+                crate::uaccess::put_user(arg, uid).map_err(|_| KernelError::BadAddress)?;
+                Ok(0)
+            }
+            _ => Err(KernelError::NotTty),
+        }
+    }
+}
+
+/// `ns`'s owning user namespace, if the caller's user namespace is it
+/// or one of its ancestors (Linux ns_get_owner): EPERM if not, and for
+/// the initial user namespace, which has none
+fn ns_get_owner(ns: &NsRef) -> Result<NsRef, KernelError> {
+    let mine = crate::ns::current_user_ns();
+    let owner = ns.owner().ok_or(KernelError::NotPermitted)?;
+    let mut p = Some(&owner);
+    while let Some(u) = p {
+        if Arc::ptr_eq(u, &mine) {
+            return Ok(NsRef::User(owner.clone()));
+        }
+        p = u.parent.as_ref();
+    }
+    Err(KernelError::NotPermitted)
+}
+
+/// `ns`'s parent pid namespace, if the caller's pid namespace is it or
+/// one of its ancestors (Linux pidns_get_parent): EPERM if not
+fn pidns_get_parent(ns: &crate::ns::PidNamespace) -> Result<NsRef, KernelError> {
+    let active = crate::task::pid::current_pid_ns();
+    let parent = ns.parent.as_ref().ok_or(KernelError::NotPermitted)?;
+    let mut p = Some(parent);
+    while let Some(n) = p {
+        if core::ptr::eq(Arc::as_ptr(n), active) {
+            return Ok(NsRef::Pid(parent.clone()));
+        }
+        p = n.parent.as_ref();
+    }
+    Err(KernelError::NotPermitted)
+}
+
+/// A new O_CLOEXEC descriptor of `ns`'s file, opened read-only (Linux
+/// open_related_ns)
+fn open_related_ns(ns: NsRef) -> Result<i64, KernelError> {
+    let path = ns_get_path(ns)?;
+    let flags = crate::fs::flags::O_RDONLY;
+    let file = File::new(
+        path.dentry.clone(),
+        Some(path.mnt.clone()),
+        flags,
+        &NS_FILE_OPS,
+    );
+    let fd = crate::fs::io::fd_install(file.alloc()?, crate::task::FD_CLOEXEC)?;
+    Ok(i64::from(fd))
 }
 
 pub static NS_FILE_OPS: NsFileOps = NsFileOps;
