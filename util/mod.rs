@@ -11,6 +11,7 @@ pub mod hlist_bl;
 pub mod hlist_nulls;
 pub mod ida;
 pub mod kalloc;
+pub mod kfifo;
 pub mod klist;
 pub mod kmem;
 pub mod list;

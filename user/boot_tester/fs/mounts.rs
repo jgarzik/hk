@@ -36,6 +36,7 @@ pub fn run_tests() {
     report_r(b"RENAME_PINNED_TRAP", pinned_trap());
     report_r(b"RENAME_ANCESTOR_MOUNT", ancestor_mount());
     report_r(b"DOTDOT_MOUNT", dotdot_mount());
+    report_r(b"DOTDOT_ROOT_OVERMOUNT", dotdot_root_overmount());
     report_r(b"GETCWD_IN_MOUNT", getcwd_in_mount());
     report_r(b"MOUNT_NESTED_BUSY", nested_busy());
     report_r(b"EXDEV_SAME_SB", exdev_same_sb());
@@ -261,6 +262,53 @@ fn dotdot_mount() -> R {
     sys_umount2(dm.as_ptr(), 0);
     sys_rmdir(dm.as_ptr());
     r
+}
+
+/// ".." at a root that something was mounted on afterwards steps onto
+/// that mount (Linux follow_dotdot's in_root, then step_into's
+/// handle_mounts), and ".." at the root of that mount stays there
+/// (choose_mountpoint stops at the root): in a chroot to /tmp/om with
+/// a ramfs then mounted on "/", "/under" is the covered directory's
+/// file, "/../under" and "/../../under" are looked up in the ramfs
+fn dotdot_root_overmount() -> R {
+    sys_mkdir(b"/tmp/om\0".as_ptr(), 0o755);
+    touch(b"/tmp/om/under\0");
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(overmount_child() as u64);
+    }
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    sys_unlink(b"/tmp/om/under\0".as_ptr());
+    sys_rmdir(b"/tmp/om\0".as_ptr());
+    check(b"child", ws == 0, (ws >> 8) as i64)
+}
+
+/// 0, or the step that failed
+fn overmount_child() -> i32 {
+    if sys_unshare(CLONE_NEWNS) != 0 {
+        return 1;
+    }
+    if sys_chroot(b"/tmp/om\0".as_ptr()) != 0 || sys_chdir(b"/\0".as_ptr()) != 0 {
+        return 2;
+    }
+    if ramfs(b"/\0") != 0 {
+        return 3;
+    }
+    let mut st = Stat::default();
+    if sys_stat(b"/under\0".as_ptr(), &mut st) != 0 {
+        return 4;
+    }
+    if sys_stat(b"/../under\0".as_ptr(), &mut st) != ENOENT {
+        return 5;
+    }
+    if sys_chdir(b"/..\0".as_ptr()) != 0 || sys_stat(b"../under\0".as_ptr(), &mut st) != ENOENT {
+        return 6;
+    }
+    if sys_stat(b"under\0".as_ptr(), &mut st) != ENOENT {
+        return 7;
+    }
+    0
 }
 
 /// getcwd and /proc/self/fd links name files inside a mount by their

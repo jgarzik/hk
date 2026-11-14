@@ -12,6 +12,7 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 
 use crate::fs::chardev::{DevId, major};
+use crate::tty::serial_core::UartPort;
 use crate::tty::{Tty, TtyDriver};
 
 /// NS16550A register offsets
@@ -96,6 +97,8 @@ mod fcr {
 pub struct SerialTty {
     /// I/O port base address
     port: u16,
+    /// Its port lock (Linux uart_port.lock): console and tty writes
+    uart: UartPort,
 }
 
 impl SerialTty {
@@ -103,7 +106,10 @@ impl SerialTty {
     ///
     /// `port`: I/O port base address (e.g., 0x3F8 for COM1)
     pub const fn new(port: u16) -> Self {
-        Self { port }
+        Self {
+            port,
+            uart: UartPort::new(),
+        }
     }
 
     /// Initialize the UART hardware
@@ -233,14 +239,18 @@ impl SerialTty {
 
 impl TtyDriver for SerialTty {
     fn write(&self, data: &[u8]) -> Result<usize, KernelError> {
-        for &byte in data {
-            self.write_byte(byte);
-        }
+        self.uart.write(data, |b| self.write_byte(b));
         Ok(data.len())
     }
 
     fn flush(&self) {
         SerialTty::flush(self);
+    }
+
+    /// Linux serial8250_console_write: under the port lock
+    fn console_write(&self, data: &[u8]) {
+        self.uart
+            .console_write(data, |b| self.write_byte(b), || SerialTty::flush(self));
     }
 }
 

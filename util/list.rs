@@ -13,7 +13,8 @@
 //!   [`ArcList`] one strong reference per entry (run queues, children
 //!   and thread-group lists), [`BoxList`] the entry itself (queued
 //!   signals, the packet backlog).
-//! - [`OwnedList`]: an `ArcList` whose items carry an [`Owner`] mark,
+//! - [`OwnedList`]: a list of counted references ([`RefPtr`], an `Arc`
+//!   by default) whose items carry an [`Owner`] mark,
 //!   so removing or stepping from any given item is safe in O(1): a
 //!   dentry's children.
 //! - [`WeakList`]: the list holds a `Weak` per entry, which leaves it in
@@ -110,6 +111,32 @@ impl Link {
     /// As [`Link::set_next`].
     pub(super) unsafe fn publish_next(&self, n: *mut Link) {
         self.next.store(n, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Claim a link off every hash chain for an insert (`util::hlist_bl`,
+    /// which marks a link off its chain by `prev` alone, Linux's pprev:
+    /// `next` stays for a reader standing on it); false if it is on a
+    /// chain or being inserted
+    pub(super) fn claim_hash(&self) -> bool {
+        self.prev
+            .compare_exchange(UNLINKED, null_mut(), Relaxed, Relaxed)
+            .is_ok()
+    }
+
+    /// On a hash chain (`util::hlist_bl`; read under its lock)
+    #[cfg(test)]
+    pub(super) fn is_hashed(&self) -> bool {
+        self.prev.load(Relaxed) != UNLINKED
+    }
+
+    /// Take the link off its hash chain, keeping `next` for a reader
+    /// standing on it (Linux hlist_bl_del_init_rcu: pprev cleared)
+    ///
+    /// # Safety
+    /// As [`Link::set_next`]: the chain's lock is held and the link is
+    /// already unlinked from its neighbours.
+    pub(super) unsafe fn unhash(&self) {
+        self.prev.store(UNLINKED, Relaxed);
     }
 
     /// Mark the link free again
@@ -433,6 +460,34 @@ unsafe impl<T> ListPtr for Arc<T> {
     }
 }
 
+/// A [`ListPtr`] that is a counted reference: a container that holds
+/// one can hand out another from the entry's address (Linux a get on a
+/// listed object: `Arc::increment_strong_count`, dget)
+///
+/// # Safety
+/// `clone_raw(p)` returns a new pointer of this type owning its own
+/// reference to the value at `p`, as a clone of the one `p` came from.
+pub unsafe trait RefPtr: ListPtr {
+    /// Another reference to the value at `p`
+    ///
+    /// # Safety
+    /// `p` came from `into_raw` of this pointer type, whose reference is
+    /// still held (not yet taken back by `from_raw`).
+    unsafe fn clone_raw(p: *const Self::Target) -> Self;
+}
+
+// SAFETY: increment_strong_count then from_raw is a clone of the
+// reference `p` stands for
+unsafe impl<T> RefPtr for Arc<T> {
+    #[inline]
+    unsafe fn clone_raw(p: *const T) -> Self {
+        // SAFETY: the caller's contract: from into_raw, still held
+        unsafe { Arc::increment_strong_count(p) };
+        // SAFETY: the reference just taken
+        unsafe { Arc::from_raw(p) }
+    }
+}
+
 // SAFETY: a static item lives and stays put forever; the "pointer" is
 // the reference itself
 unsafe impl<T> ListPtr for &'static T {
@@ -664,22 +719,23 @@ macro_rules! owned_adapter {
 /// Ids of [`OwnedList`]s: each list its own, never reused (64 bits)
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
-/// An [`ArcList`] that knows its items by their [`Owner`] mark, so
-/// removing or stepping from a given item is safe and O(1) (Linux
-/// hlist_del / the next sibling on a dentry's d_children)
+/// A [`PtrList`] of counted references (`P`, an `Arc` by default)
+/// that knows its items by their [`Owner`] mark, so removing or
+/// stepping from a given item is safe and O(1) (Linux hlist_del / the
+/// next sibling on a dentry's d_children)
 ///
 /// # Invariants
 /// An item's owner mark is `id` exactly while it is on `list`; no
 /// other list ever writes `id`.
-pub struct OwnedList<A: OwnerAdapter> {
-    list: ArcList<A>,
+pub struct OwnedList<A: OwnerAdapter, P: RefPtr<Target = A::Item> = Arc<<A as Adapter>::Item>> {
+    list: PtrList<A, P>,
     id: u64,
 }
 
-impl<A: OwnerAdapter> OwnedList<A> {
+impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
     pub fn new() -> Self {
         Self {
-            list: ArcList::new(),
+            list: PtrList::new(),
             id: NEXT_OWNER.fetch_add(1, Relaxed),
         }
     }
@@ -702,16 +758,18 @@ impl<A: OwnerAdapter> OwnedList<A> {
     }
 
     /// Append `item`; panics if it is on a list through this link
-    pub fn push_back(&mut self, item: Arc<A::Item>) {
-        let mark = item.clone();
+    pub fn push_back(&mut self, item: P) {
+        let p = core::ptr::from_ref::<A::Item>(&item);
         self.list.push_back(item);
+        // SAFETY: on this list now, which keeps it live
+        let item = unsafe { &*p };
         // INVARIANT: on this list from here (the push claimed its link)
-        A::owner(&mark).0.store(self.id, Relaxed);
+        A::owner(item).0.store(self.id, Relaxed);
     }
 
     /// Take `item` off and hand back the list's reference; None if it
     /// is not on this list
-    pub fn remove(&mut self, item: &A::Item) -> Option<Arc<A::Item>> {
+    pub fn remove(&mut self, item: &A::Item) -> Option<P> {
         if !self.mine(item) {
             return None;
         }
@@ -722,7 +780,7 @@ impl<A: OwnerAdapter> OwnedList<A> {
     }
 
     /// Take the first entry off and hand back the list's reference
-    pub fn pop_front(&mut self) -> Option<Arc<A::Item>> {
+    pub fn pop_front(&mut self) -> Option<P> {
         let item = self.list.pop_front()?;
         // INVARIANT: off the list
         A::owner(&item).0.store(0, Relaxed);
@@ -735,14 +793,10 @@ impl<A: OwnerAdapter> OwnedList<A> {
     }
 
     /// A new reference to the first entry
-    pub fn front(&self) -> Option<Arc<A::Item>> {
-        self.list.list.front().map(|p| {
-            // SAFETY: inserted with `into_raw`; the list holds that
-            // reference while the entry is on it
-            unsafe { Arc::increment_strong_count(p) };
-            // SAFETY: the reference just taken
-            unsafe { Arc::from_raw(p) }
-        })
+    pub fn front(&self) -> Option<P> {
+        // SAFETY: inserted with `into_raw`; the list holds that
+        // reference while the entry is on it
+        self.list.list.front().map(|p| unsafe { P::clone_raw(p) })
     }
 
     /// A new reference to the entry after `item`; None if `item` is the
@@ -760,16 +814,14 @@ impl<A: OwnerAdapter> OwnedList<A> {
         Some(unsafe { &*p })
     }
 
-    pub fn next(&self, item: &A::Item) -> Option<Arc<A::Item>> {
+    pub fn next(&self, item: &A::Item) -> Option<P> {
         if !self.mine(item) {
             return None;
         }
         // SAFETY: marked with this list's id, so on it (type invariant)
         let p = unsafe { self.list.list.next(core::ptr::from_ref(item)) }?;
         // SAFETY: as in `front`
-        unsafe { Arc::increment_strong_count(p) };
-        // SAFETY: the reference just taken
-        Some(unsafe { Arc::from_raw(p) })
+        Some(unsafe { P::clone_raw(p) })
     }
 
     pub fn iter(&self) -> Iter<'_, A> {
@@ -777,7 +829,7 @@ impl<A: OwnerAdapter> OwnedList<A> {
     }
 }
 
-impl<A: OwnerAdapter> Default for OwnedList<A> {
+impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> Default for OwnedList<A, P> {
     fn default() -> Self {
         Self::new()
     }

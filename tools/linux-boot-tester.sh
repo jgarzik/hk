@@ -128,6 +128,18 @@ if [ -n "${KDIR:-}" ]; then
     done
 fi
 
+# kho=off: kernels with kexec handover (Ubuntu's since 7.0) enable it by
+# default, and its scratch areas (200% of the kernel's boot reservations,
+# made MIGRATE_CMA: no unmovable allocations) take ~300 of the guest's
+# 512 MB when they fit. hk has no such reserve; with it, BPF_PROG_LOAD_BIG's
+# ~80 MB of verifier vmalloc can exhaust the rest and the guest panics on
+# OOM. Only where the config has KHO: an older kernel would hand the
+# unknown parameter to init's environment (INIT_ENV)
+KHO_OFF=
+if [ -n "${CONFIG:-}" ] && grep -qx "CONFIG_KEXEC_HANDOVER=y" "$CONFIG"; then
+    KHO_OFF=kho=off
+fi
+
 # Initramfs: host build of boot_tester, same layout as user/Makefile
 # (busybox and /etc from tools/busybox-root.sh)
 make -s -C user host ARCH=$ARCH
@@ -208,7 +220,7 @@ echo "Booting boot_tester on Linux ($([ ${#KVM[@]} = 0 ] && echo TCG || echo KVM
 timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
     -m "$MEM" -smp "$SMP" -nographic -no-reboot -monitor none "${QEMU_NET[@]}" "${DISK[@]}" \
     -kernel "$LINUX_KERNEL" -initrd "$WORK/initramfs.cpio" \
-    -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet ${HK_CMDLINE:-}" \
+    -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet $KHO_OFF ${HK_CMDLINE:-}" \
     -serial file:"$SERIAL_LOG" </dev/null || true
 
 # Verdicts come from the log without kernel messages: a printk

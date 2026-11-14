@@ -55,6 +55,13 @@ impl SeqCount {
         fence(Ordering::Acquire);
         self.seq.load(Ordering::Relaxed) != start
     }
+
+    /// Begin a lockless read without waiting out a writer (Linux
+    /// raw_seqcount_begin): with one in progress, `read_retry` says so.
+    /// For a reader that may hold a lock the writer takes.
+    pub fn raw_read_begin(&self) -> u32 {
+        self.seq.load(Ordering::Acquire) & !1
+    }
 }
 
 impl Drop for SeqCountGuard<'_> {
@@ -126,5 +133,58 @@ impl<T> SeqLock<T> {
     /// read_seqretry)
     pub fn read_retry(&self, start: u32) -> bool {
         self.seq.read_retry(start)
+    }
+
+    /// Begin a lockless read without waiting out a writer (Linux
+    /// raw_seqcount_begin on the seqlock's count)
+    pub fn raw_read_begin(&self) -> u32 {
+        self.seq.raw_read_begin()
+    }
+
+    /// One read of what the lock covers (Linux read_seqbegin_or_lock,
+    /// need_seqretry, done_seqretry): `f` runs lockless (`None`) and,
+    /// if a writer raced it, once more under the locking read (`Some`),
+    /// so a reader always finishes. A lockless pass must be safe on a
+    /// changing picture (an RCU read guard keeps what it reaches) and is
+    /// trusted only if no writer ran; a raced result is dropped.
+    pub fn read_or_lock<R>(&self, mut f: impl FnMut(Option<&T>) -> R) -> R {
+        let start = self.read_begin();
+        let r = f(None);
+        if !self.read_retry(start) {
+            return r;
+        }
+        drop(r);
+        let g = self.read_excl();
+        f(Some(&g))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unraced read runs once, lockless; one a writer raced runs
+    /// again under the lock
+    #[test]
+    fn read_or_lock_retries_locked() {
+        let l = SeqLock::new(7u32);
+        let mut passes = 0;
+        assert_eq!(
+            l.read_or_lock(|g| {
+                passes += 1;
+                g.is_some()
+            }),
+            false
+        );
+        assert_eq!(passes, 1);
+        let mut passes = 0;
+        let r = l.read_or_lock(|g| {
+            passes += 1;
+            if g.is_none() {
+                *l.write() += 1;
+            }
+            g.copied()
+        });
+        assert_eq!((r, passes), (Some(8), 2));
     }
 }

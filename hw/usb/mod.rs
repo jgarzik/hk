@@ -33,6 +33,7 @@ static USB_TRACE: AtomicBool = AtomicBool::new(false);
 /// all USB host controllers and drivers.
 pub fn enable_usb_trace() {
     USB_TRACE.store(true, Ordering::Release);
+    crate::trace::want_buffers();
     printkln!("USB: Protocol tracing enabled");
 }
 

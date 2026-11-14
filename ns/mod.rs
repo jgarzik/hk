@@ -169,7 +169,7 @@ impl MntNamespace {
     }
 
     /// Get the root dentry
-    pub fn get_root_dentry(&self) -> Option<Arc<crate::fs::dentry::Dentry>> {
+    pub fn get_root_dentry(&self) -> Option<crate::fs::dentry::DentryRef> {
         self.get_root().map(|m| m.root.clone())
     }
 

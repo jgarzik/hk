@@ -6,6 +6,13 @@
 //!   si_band, si_fd
 //! - SIGIO_FIOASYNC: FIOASYNC sets O_ASYNC and arms the file
 //! - SIGIO_WRITER: a read makes room: the writer gets POLL_OUT
+//! - SIGIO_READ_EINTR: a blocking read a signal interrupts adds no
+//!   SIGIO for the writers to what was pending while it slept; one that
+//!   gives up with EAGAIN signals them (pipe_read returns -ERESTARTSYS
+//!   before its final kill_fasync)
+//! - SIGIO_SPLICE_OUT: a splice from the pipe to a file signals the
+//!   writers only once it frees a buffer (Linux iter_file_splice_write,
+//!   splice_from_pipe_end's need_wakeup)
 //! - SIGIO_FIFO: an O_RDWR FIFO raises SIGIO on input
 //! - SIGIO_CLOSE: a dup keeps the entry (si_fd stays the armed fd); the
 //!   last close removes it
@@ -17,6 +24,9 @@
 //!   a send found none (SOCKWQ_ASYNC_NOSPACE)
 //! - SIGIO_TCP: a listener gets POLL_IN for a connection, a nonblocking
 //!   connect POLL_OUT once established, the accepted socket POLL_IN
+//! - SIGIO_TCP_DISCONNECT: tcp_disconnect reports an error (POLL_ERR,
+//!   si_band POLLERR): a listener's shutdown(SHUT_RD) with SO_ERROR 0,
+//!   a connection's connect(AF_UNSPEC) with SO_ERROR ECONNRESET
 //! - SIGIO_TTY: FIOASYNC on a tty sets O_ASYNC and, with no owner,
 //!   makes the caller's process (or the tty's foreground group) owner
 //! - SIGIO_NOTIFY: an inotify file keeps O_ASYNC (fsnotify_fasync), a
@@ -24,16 +34,26 @@
 //! - SIGIO_NO_FASYNC: a file without fasync: FIOASYNC is ENOTTY, F_SETFL
 //!   keeps no O_ASYNC
 //! - SIGIO_OWNER_EX: F_SETOWN_EX / F_GETOWN_EX round trip a thread owner
+//! - SIGIO_PGRP_KILL: a fatal F_SETSIG signal to a process group kills
+//!   its leader and a two-thread member; a member in a ptrace stop
+//!   keeps the stop until kill(-pgrp, SIGKILL), which its tracer's wait
+//!   reports
 
-use crate::helpers::{print, print_num, println};
+use core::sync::atomic::{AtomicI64, Ordering};
+
+use crate::helpers::{msleep, print, print_num, println};
+use crate::io::nonblock::{on_sig, sigaction};
 use hk_syscall::{
-    AF_INET, AF_UNIX, FIOASYNC, O_CREAT, O_NONBLOCK, O_RDWR, SOCK_STREAM, SigInfo, SockAddrIn,
-    Zeroable, htonl, make_ipv4, sys_accept, sys_bind, sys_close, sys_connect, sys_dup, sys_exit,
-    sys_fanotify_init, sys_fcntl, sys_fork, sys_getpid, sys_getsockname, sys_gettid,
-    sys_inotify_init1, sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe2, sys_read,
-    sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid, sys_setresuid, sys_setsid, sys_socket,
-    sys_socketpair, sys_unlink, sys_wait4, sys_write,
+    AF_INET, AF_UNIX, FIOASYNC, O_CREAT, O_NONBLOCK, O_RDWR, O_TRUNC, SIG_DFL, SIGUSR1,
+    SOCK_STREAM, SigInfo, SockAddrIn, Zeroable, htonl, make_ipv4, sys_accept, sys_bind, sys_close,
+    sys_connect, sys_dup, sys_exit, sys_fanotify_init, sys_fcntl, sys_fork, sys_getpid,
+    sys_getppid, sys_getsockname, sys_gettid, sys_inotify_init1, sys_ioctl, sys_listen, sys_mknod,
+    sys_open, sys_pipe2, sys_read, sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid,
+    sys_setresuid, sys_setsid, sys_socket, sys_socketpair, sys_splice, sys_tkill, sys_unlink,
+    sys_wait4, sys_write,
 };
+use hk_syscall::{SHUT_RD, sys_getsockopt, sys_shutdown};
+use hk_syscall::{sys_kill, sys_ptrace};
 
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
@@ -53,6 +73,7 @@ const SIGRT: u32 = 41;
 const POLL_IN: i32 = 1;
 const POLL_OUT: i32 = 2;
 const ENOTTY: i64 = -25;
+const EINTR: i64 = -4;
 const EAGAIN: i64 = -11;
 const S_IFIFO: u32 = 0o010000;
 
@@ -61,6 +82,8 @@ pub fn run_tests() {
     test_setsig_info();
     test_fioasync();
     test_writer();
+    test_read_eintr();
+    test_splice_out();
     test_fifo();
     test_close();
     test_pgrp();
@@ -68,10 +91,12 @@ pub fn run_tests() {
     test_socket_sigio();
     test_sock_out();
     test_tcp();
+    test_tcp_disconnect();
     test_tty();
     test_notify();
     test_no_fasync();
     test_owner_ex();
+    test_pgrp_kill();
 }
 
 fn bit(sig: u32) -> u64 {
@@ -281,6 +306,162 @@ fn test_writer() {
             (b"got", got),
             (b"code", info.si_code as i64),
             (b"band", band),
+        ],
+    );
+}
+
+/// The reading thread, for the child to signal
+static READER: AtomicI64 = AtomicI64::new(0);
+
+/// `sig` pending, process-wide or for its main thread, in
+/// /proc/`pid`/status (ShdPnd, SigPnd); None if unreadable
+fn proc_pending(pid: i64, sig: u32) -> Option<bool> {
+    let mut path = [0u8; 32];
+    let mut n = 0;
+    for &c in b"/proc/" {
+        path[n] = c;
+        n += 1;
+    }
+    let mut digits = [0u8; 20];
+    let (mut d, mut v) = (0, pid as u64);
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while d > 0 {
+        d -= 1;
+        path[n] = digits[d];
+        n += 1;
+    }
+    for &c in b"/status\0" {
+        path[n] = c;
+        n += 1;
+    }
+    let mut buf = [0u8; 2048];
+    let len = crate::helpers::read_file(&path, &mut buf);
+    if len <= 0 {
+        return None;
+    }
+    let mut seen = 0;
+    let mut pending = false;
+    for l in buf[..len as usize].split(|&c| c == b'\n') {
+        let Some(hex) = l
+            .strip_prefix(b"ShdPnd:")
+            .or_else(|| l.strip_prefix(b"SigPnd:"))
+        else {
+            continue;
+        };
+        let mut set = 0u64;
+        for &c in hex.iter().filter(|c| c.is_ascii_hexdigit()) {
+            set = set << 4 | (c as char).to_digit(16).unwrap_or(0) as u64;
+        }
+        pending |= set & bit(sig) != 0;
+        seen += 1;
+    }
+    (seen == 2).then_some(pending)
+}
+
+/// Child: once the reader is blocked in read, report whether its
+/// process has SIGIO pending (exit 1; 0 not, 2 unknown), then signal
+/// the reading thread
+fn kick_reader() -> i32 {
+    msleep(150);
+    let r = match proc_pending(sys_getppid(), SIGIO) {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => 2,
+    };
+    sys_tkill(READER.load(Ordering::Relaxed), SIGUSR1);
+    r
+}
+
+/// The write end armed: a read interrupted in its wait sends no
+/// POLL_OUT of its own (Linux before 6.15 sends one before each sleep,
+/// ee5eda8ea595 removed it: whatever was pending while it slept is all
+/// that is pending after); a nonblocking read finding nothing does
+fn test_read_eintr() {
+    // SIGUSR1 thread-directed and unblocked here, whatever the
+    // process's other threads and earlier masks
+    let old = block(bit(SIGIO));
+    setmask((old | bit(SIGIO)) & !bit(SIGUSR1));
+    let p = pipe();
+    arm(p[1]);
+    sigaction(SIGUSR1, on_sig as *const () as u64, 0);
+    READER.store(sys_gettid(), Ordering::Relaxed);
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(kick_reader() as u64)
+    }
+    let mut b = [0u8; 1];
+    let intr = sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    // SIGIO pending while the read slept: 1 yes, 0 no
+    let asleep = if st & 0x7f == 0 {
+        ((st >> 8) & 0xff) as i64
+    } else {
+        -1
+    };
+    sigaction(SIGUSR1, SIG_DFL, 0);
+    let after = take(SIGIO);
+    let fl = sys_fcntl(p[0], F_GETFL, 0) as u64;
+    sys_fcntl(p[0], F_SETFL, fl | O_NONBLOCK as u64);
+    let again = sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+    let got = take(SIGIO);
+    close2(p);
+    setmask(old);
+    let same = match asleep {
+        0 => after == EAGAIN,
+        1 => after == SIGIO as i64,
+        _ => false,
+    };
+    let ok = pid > 0 && intr == EINTR && same && again == EAGAIN;
+    let ok = ok && got == SIGIO as i64;
+    report(
+        b"SIGIO_READ_EINTR",
+        ok,
+        &[
+            (b"intr", intr),
+            (b"asleep", asleep),
+            (b"after", after),
+            (b"again", again),
+            (b"got", got),
+        ],
+    );
+}
+
+/// The write end armed: splicing half a buffer to a file sends no
+/// POLL_OUT, splicing the rest (the buffer freed) does
+fn test_splice_out() {
+    const PATH: &[u8] = b"/tmp/sigio_splice\0";
+    let null = core::ptr::null_mut();
+    let old = block(bit(SIGIO));
+    let p = pipe();
+    let out = sys_open(PATH.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o600) as i32;
+    arm(p[1]);
+    sys_write(p[1] as u64, b"abcdefgh".as_ptr(), 8);
+    let half = sys_splice(p[0], null, out, null, 4, 0);
+    let none = take(SIGIO);
+    let rest = sys_splice(p[0], null, out, null, 4, 0);
+    let got = take(SIGIO);
+    sys_close(out as u64);
+    sys_unlink(PATH.as_ptr());
+    close2(p);
+    setmask(old);
+    let ok = out >= 0 && half == 4 && none == EAGAIN && rest == 4 && got == SIGIO as i64;
+    report(
+        b"SIGIO_SPLICE_OUT",
+        ok,
+        &[
+            (b"out", out as i64),
+            (b"half", half),
+            (b"none", none),
+            (b"rest", rest),
+            (b"got", got),
         ],
     );
 }
@@ -584,6 +765,97 @@ fn test_tcp() {
     );
 }
 
+const SOL_SOCKET: i32 = 1;
+const SO_ERROR: i32 = 4;
+const AF_UNSPEC: u16 = 0;
+const POLL_ERR: i32 = 4;
+const POLLERR: i64 = 8;
+const ECONNRESET: i64 = 104;
+
+/// SO_ERROR of `fd` (taken), or -errno
+fn so_error(fd: i32) -> i64 {
+    let mut v = 0i32;
+    let mut n = 4u32;
+    let r = sys_getsockopt(
+        fd,
+        SOL_SOCKET,
+        SO_ERROR,
+        &mut v as *mut i32 as *mut u8,
+        &mut n,
+    );
+    if r < 0 { r } else { v as i64 }
+}
+
+/// The next SIGRT within 2 s as (si_code, si_band, si_fd), or (-errno,
+/// 0, 0)
+fn next_rt() -> (i64, i64, i64) {
+    let mut info = SigInfo::zeroed();
+    let r = wait_sig(bit(SIGRT), 2, &mut info);
+    if r != SIGRT as i64 {
+        return (r, 0, 0);
+    }
+    // si_band (a long) shares si_pid's offset; si_fd is si_status's
+    let band = info.si_pid as i64;
+    (info.si_code as i64, band, info.si_status as i64)
+}
+
+/// Linux tcp_disconnect ends with sk_error_report whatever the state:
+/// SIGIO POLL_ERR, the pending error ECONNRESET for a connection
+fn test_tcp_disconnect() {
+    let old = block(bit(SIGRT) | bit(SIGIO));
+    let l = sys_socket(AF_INET, SOCK_STREAM, 0) as i32;
+    let mut a = SockAddrIn::new(AF_INET as u16, 0, htonl(make_ipv4(127, 0, 0, 1)));
+    let alen = core::mem::size_of::<SockAddrIn>() as u32;
+    sys_bind(l, &a as *const SockAddrIn as *const u8, alen);
+    sys_listen(l, 4);
+    let mut n = alen;
+    sys_getsockname(l, &mut a as *mut SockAddrIn as *mut u8, &mut n);
+    let c = sys_socket(AF_INET, SOCK_STREAM, 0) as i32;
+    let conn = sys_connect(c, &a as *const SockAddrIn as *const u8, alen);
+    let s = sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
+    arm_rt(l);
+    arm_rt(c);
+    drain_sig(SIGRT);
+    let shut = sys_shutdown(l, SHUT_RD);
+    let (lcode, lband, lfd) = next_rt();
+    let lerr = so_error(l);
+    let none = SockAddrIn::new(AF_UNSPEC, 0, 0);
+    let unspec = sys_connect(c, &none as *const SockAddrIn as *const u8, alen);
+    let (ccode, cband, cfd) = next_rt();
+    let cerr = so_error(c);
+    let extra = take(SIGRT);
+    sys_close(s as u64);
+    sys_close(c as u64);
+    sys_close(l as u64);
+    drain_sig(SIGRT);
+    setmask(old);
+    let ok = conn == 0
+        && s >= 0
+        && shut == 0
+        && (lcode, lband, lfd) == (POLL_ERR as i64, POLLERR, l as i64)
+        && lerr == 0
+        && unspec == 0
+        && (ccode, cband, cfd) == (POLL_ERR as i64, POLLERR, c as i64)
+        && cerr == ECONNRESET
+        && extra == EAGAIN;
+    report(
+        b"SIGIO_TCP_DISCONNECT",
+        ok,
+        &[
+            (b"conn", conn),
+            (b"shut", shut),
+            (b"lcode", lcode),
+            (b"lband", lband),
+            (b"lerr", lerr),
+            (b"unspec", unspec),
+            (b"ccode", ccode),
+            (b"cband", cband),
+            (b"cerr", cerr),
+            (b"extra", extra),
+        ],
+    );
+}
+
 /// The serial tty (ttyS0 on x86, ttyAMA0 on arm64)
 fn open_serial() -> i32 {
     let fl = O_RDWR | O_NOCTTY | O_NONBLOCK;
@@ -692,4 +964,143 @@ fn test_owner_ex() {
             (b"pid", get.pid as i64),
         ],
     );
+}
+
+const SIGKILL: u32 = 9;
+const SIGTERM: u32 = 15;
+const SIGSTOP: u32 = 19;
+const PTRACE_TRACEME: i64 = 0;
+const WNOHANG: i32 = 1;
+
+#[repr(C, align(16))]
+struct Stack([u8; 16384]);
+static mut KILL_STACK: Stack = Stack([0; 16384]);
+static mut KILL_CTID: u32 = 0;
+
+/// A thread that sleeps on a pipe no one writes (`fd`)
+extern "C" fn pgrp_kill_sleeper(fd: u64) -> ! {
+    let mut b = [0u8; 1];
+    sys_read(fd, b.as_mut_ptr(), 1);
+    sys_exit(71)
+}
+
+/// The group's leader: owner -pgrp with F_SETSIG SIGTERM; on the go
+/// byte, input makes the group's SIGIO, which kills it (exit 50 if it
+/// lives)
+fn pgrp_kill_leader(go: [i32; 2]) -> i32 {
+    setmask(0);
+    let me = sys_getpid();
+    let p = pipe();
+    if arm_to(p[0], -me) != 0 || sys_fcntl(p[0], F_SETSIG, SIGTERM as u64) != 0 {
+        return 51;
+    }
+    let mut b = [0u8; 1];
+    sys_read(go[0] as u64, b.as_mut_ptr(), 1);
+    sys_write(p[1] as u64, b"x".as_ptr(), 1);
+    50
+}
+
+/// A member with two threads, both asleep; `ready` written once the
+/// second is made (exit 70 if it lives)
+fn pgrp_kill_threads(pg: i64, ready: [i32; 2]) -> i32 {
+    setmask(0);
+    sys_setpgid(0, pg as u64);
+    let q = pipe();
+    let top = (&raw mut KILL_STACK) as u64 + 16384;
+    // SAFETY: the stack and tid word are this process's alone
+    let tid = unsafe {
+        crate::mm::fork_mm::spawn_thread(top, pgrp_kill_sleeper, q[0] as u64, &raw mut KILL_CTID)
+    };
+    if tid < 0 {
+        return 72;
+    }
+    sys_write(ready[1] as u64, b"r".as_ptr(), 1);
+    let mut b = [0u8; 1];
+    sys_read(q[0] as u64, b.as_mut_ptr(), 1);
+    70
+}
+
+/// A member in a ptrace stop for its parent (exit 60 if resumed)
+fn pgrp_kill_traced(pg: i64) -> ! {
+    sys_setpgid(0, pg as u64);
+    sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+    sys_kill(sys_getpid(), SIGSTOP);
+    sys_exit(60)
+}
+
+/// Reap `pid` within 5 s: the signal that killed it, -(status) for an
+/// exit, -1000 if it did not end
+fn killed_by(pid: i64) -> i64 {
+    let mut st = 0i32;
+    for _ in 0..500 {
+        let r = sys_wait4(pid, &mut st, WNOHANG, 0);
+        if r == pid {
+            return if st & 0x7f != 0 {
+                (st & 0x7f) as i64
+            } else {
+                -(st as i64)
+            };
+        }
+        if r < 0 {
+            return r;
+        }
+        crate::helpers::sleep_ms(10);
+    }
+    -1000
+}
+
+/// SIGIO_PGRP_KILL: a fatal F_SETSIG signal sent to a process group by
+/// SIGIO kills the leader and a two-thread member, while a member in a
+/// ptrace stop keeps its stop ('t'); kill(-pgrp, SIGKILL) then ends
+/// the stop, its tracer's wait reporting the kill (Linux send_sigio,
+/// __kill_pgrp_info under tasklist_lock, complete_signal's group kill)
+fn test_pgrp_kill() {
+    let mut t = crate::harness::T::new(b"SIGIO_PGRP_KILL");
+    let go = pipe();
+    let ready = pipe();
+    let l = sys_fork();
+    if l == 0 {
+        sys_setpgid(0, 0);
+        sys_exit(pgrp_kill_leader(go) as u64)
+    }
+    sys_setpgid(l as u64, l as u64);
+    let m = sys_fork();
+    if m == 0 {
+        sys_exit(pgrp_kill_threads(l, ready) as u64)
+    }
+    sys_setpgid(m as u64, l as u64);
+    let tr = sys_fork();
+    if tr == 0 {
+        pgrp_kill_traced(l)
+    }
+    sys_setpgid(tr as u64, l as u64);
+    let mut st = 0i32;
+    let w = sys_wait4(tr, &mut st, 0, 0);
+    let stop = if w == tr {
+        ((st >> 8) & 0xff) as i64
+    } else {
+        w
+    };
+    t.eq(b"stop", stop, SIGSTOP as i64);
+    let mut b = [0u8; 1];
+    t.eq(b"ready", sys_read(ready[0] as u64, b.as_mut_ptr(), 1), 1);
+    sys_write(go[1] as u64, b"g".as_ptr(), 1);
+    let mk = killed_by(m);
+    t.eq(b"threads", mk, SIGTERM as i64);
+    let state = crate::signal::ptrace_exit::stat_state(tr);
+    t.eq(b"traced", state as i64, b't' as i64);
+    t.eq(b"kill", sys_kill(-l, SIGKILL), 0);
+    let tk = killed_by(tr);
+    t.eq(b"traced killed", tk, SIGKILL as i64);
+    let lk = killed_by(l);
+    t.eq(b"leader", lk, SIGTERM as i64);
+    // What a failed run left
+    for (p, k) in [(l, lk), (m, mk), (tr, tk)] {
+        if k < 0 {
+            crate::helpers::reap(p);
+        }
+    }
+    close2(go);
+    close2(ready);
+    t.done();
 }

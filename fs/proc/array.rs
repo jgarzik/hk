@@ -48,6 +48,9 @@ struct Snap {
     levels: usize,
     comm: [u8; 16],
     state: TaskState,
+    /// In a ptrace stop (Linux __TASK_TRACED; JOBCTL_TRACED under its
+    /// Task.sig)
+    traced: bool,
     cred: Cred,
     kthread: bool,
     exiting: bool,
@@ -118,9 +121,14 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         let a = t.task.task_lock();
         (a.comm(), a.fs().cloned(), a.files().cloned())
     };
-    let (blocked, pending, shared) = {
+    let (blocked, pending, shared, traced) = {
         let s = t.task.sig.lock();
-        (s.blocked.0, s.pending.signal.0, s.shared_pending.clone())
+        (
+            s.blocked.0,
+            s.pending.signal.0,
+            s.shared_pending.clone(),
+            s.traced(),
+        )
     };
     // The whole thread group's CPU time (Linux do_task_stat with whole)
     let (utime, stime) = crate::task::percpu::group_times(&table, pid);
@@ -144,6 +152,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
             }
             s => s,
         },
+        traced,
         cred: t.cred(),
         kthread: matches!(t.task.kind, TaskKind::KernelThread),
         exiting: t.task.has_flag(crate::task::pf::EXITING),
@@ -180,10 +189,10 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
 /// Linux task_state_array letter and name
 fn state(s: &Snap) -> (char, &'static str) {
     match s.state {
+        TaskState::Zombie(_) => ('Z', "zombie"),
+        _ if s.traced => ('t', "tracing stop"),
         TaskState::Ready | TaskState::Running => ('R', "running"),
         TaskState::Sleeping => ('S', "sleeping"),
-        TaskState::Traced(_) => ('t', "tracing stop"),
-        TaskState::Zombie(_) => ('Z', "zombie"),
     }
 }
 
@@ -571,7 +580,9 @@ mod tests {
             levels: 0,
             comm: c,
             state: TaskState::Sleeping,
+            traced: false,
             cred: Cred::ROOT,
+
             kthread: false,
             exiting: false,
             utime: 2_000_000_000,

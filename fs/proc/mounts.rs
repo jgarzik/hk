@@ -9,7 +9,7 @@ use super::super::Path;
 use super::super::dentry::{d_path, dentry_path};
 use super::super::mount::{
     MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW, MNT_READONLY,
-    MNT_RELATIME, Mount, MountRef, namespace_read, walk,
+    MNT_RELATIME, Mount, MountRef, NsTree, namespace_read, walk,
 };
 use super::super::name::mangle;
 use crate::task::percpu::TaskRef;
@@ -29,7 +29,7 @@ const MOUNTINFO_LINE: usize = 128;
 /// formats them under NAMESPACE_SEM read (Linux m_start .. m_stop), so
 /// no umount runs meanwhile and the references held here make no mount
 /// busy for one.
-fn with_visible(t: &TaskRef, show: impl FnOnce(&[(MountRef, Vec<u8>)]) -> Vec<u8>) -> Vec<u8> {
+fn with_visible(t: &TaskRef, show: impl FnOnce(&Vis<'_>) -> Vec<u8>) -> Vec<u8> {
     let (Some(ns), Some(fs)) = (super::task_nsproxy(t), crate::fs::get_task_fs(t)) else {
         return Vec::new();
     };
@@ -47,11 +47,23 @@ fn with_visible(t: &TaskRef, show: impl FnOnce(&[(MountRef, Vec<u8>)]) -> Vec<u8
             reached.then_some((m, mp))
         })
         .collect();
-    let out = show(&vis);
+    let out = show(&Vis {
+        mnts: &vis,
+        ns: &g,
+        root: &root,
+    });
     drop(vis);
     drop(top);
     drop(g);
     out
+}
+
+/// What a mount list shows: the mounts with their mountpoints, under
+/// NAMESPACE_SEM read, for a reader rooted at `root`
+struct Vis<'a> {
+    mnts: &'a [(MountRef, Vec<u8>)],
+    ns: &'a NsTree,
+    root: &'a Path,
 }
 
 /// The superblock's options after rw/ro (Linux show_sb_opts)
@@ -89,9 +101,9 @@ pub fn show_mounts(t: &TaskRef) -> Vec<u8> {
     with_visible(t, show_mounts_of)
 }
 
-fn show_mounts_of(vis: &[(MountRef, Vec<u8>)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vis.len() * MOUNTS_LINE);
-    for (m, mp) in vis {
+fn show_mounts_of(vis: &Vis<'_>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vis.mnts.len() * MOUNTS_LINE);
+    for (m, mp) in vis.mnts {
         mangle(&mut out, &m.devname, ESC_HASH);
         out.push(b' ');
         mangle(&mut out, mp, ESC);
@@ -115,12 +127,12 @@ pub fn show_mountinfo(t: &TaskRef) -> Vec<u8> {
     with_visible(t, show_mountinfo_of)
 }
 
-fn show_mountinfo_of(vis: &[(MountRef, Vec<u8>)]) -> Vec<u8> {
+fn show_mountinfo_of(vis: &Vis<'_>) -> Vec<u8> {
     use alloc::fmt::Write;
-    let mut out = Vec::with_capacity(vis.len() * MOUNTINFO_LINE);
-    for (m, mp) in vis.iter().cloned() {
+    let mut out = Vec::with_capacity(vis.mnts.len() * MOUNTINFO_LINE);
+    for (m, mp) in vis.mnts.iter().cloned() {
         // The namespace root's parent is itself (Linux: its mnt_parent)
-        let parent = m.get_parent().map_or(m.mnt_id, |p| p.mnt_id);
+        let parent = m.parent_in(vis.ns).map_or(m.mnt_id, |p| p.mnt_id);
         let dev = m.sb.dev_id;
         let mut head = alloc::string::String::new();
         let _ = write!(
@@ -143,13 +155,7 @@ fn show_mountinfo_of(vis: &[(MountRef, Vec<u8>)]) -> Vec<u8> {
             b"rw"
         });
         mnt_opts(&mut out, &m);
-        // A group has a member the reader sees (propagate_from)
-        let sees = |g: u32| {
-            super::super::pnode::peers(g)
-                .iter()
-                .any(|p| vis.iter().any(|(v, _)| MountRef::ptr_eq(v, p)))
-        };
-        out.extend_from_slice(&super::super::pnode::optional_fields(&m, &sees));
+        out.extend_from_slice(&super::super::pnode::optional_fields(vis.ns, &m, vis.root));
         out.extend_from_slice(b" - ");
         mangle(&mut out, m.sb.fs_type.name.as_bytes(), ESC_HASH);
         out.push(b' ');

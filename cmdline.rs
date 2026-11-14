@@ -4,7 +4,8 @@
 //!
 //! ## Supported Options
 //!
-//! - `usb_trace` - Enable USB protocol tracing for debugging
+//! - `usb_trace` - Enable USB protocol tracing (xHCI trace events in
+//!   /sys/kernel/tracing/trace)
 //! - `console=<device>[,<options>]` - Set kernel console device
 //!   - Examples: `console=ttyS0`, `console=ttyS0,115200`
 //!   - Multiple console= options can be specified; all receive output

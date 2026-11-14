@@ -514,6 +514,8 @@ fn do_splice_pipe_to_file(
     };
     let mut written = 0;
     let mut err = None;
+    // A buffer was freed: room for writers (Linux sd->need_wakeup)
+    let mut wake = false;
     while written < len && !g.is_empty() {
         let tail = g.tail;
         let pb = &g.bufs[tail];
@@ -552,6 +554,7 @@ fn do_splice_pipe_to_file(
         if n == avail {
             pb.release();
             g.tail = (tail + 1) % PIPE_RING;
+            wake = true;
         } else {
             pb.offset += n as u32;
             pb.len -= n as u32;
@@ -562,10 +565,12 @@ fn do_splice_pipe_to_file(
             break;
         }
     }
-    drop(g);
-    if written > 0 {
+    // Linux splice_from_pipe_end, under pipe_lock
+    if wake {
+        g.publish();
         pipe.wake_writers();
     }
+    drop(g);
     if written == 0
         && let Some(e) = err
     {

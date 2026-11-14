@@ -2,21 +2,23 @@
 //! do_notify_parent_cldstop in kernel/signal.c)
 
 use super::{SIGCHLD, SendInfo, SigFields, SigHandler, SigInfo, Signal, sa_flags};
-use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef};
+use crate::task::percpu::{GlobalTaskTable, TaskRef};
 use crate::task::{Task, Tid};
 
 /// SIGCHLD info for child `t` with `code` (CLD_*) and `status`: its
 /// pid, real uid and CPU time in clock ticks (Linux
-/// do_notify_parent_cldstop's fields). None once it is gone.
-fn chld_info(t: &Task, code: i32, status: i32, ns: &crate::ns::PidNamespace) -> Option<SigInfo> {
-    let (uid, (utime, stime)) = {
-        let table = TASKLIST.read();
-        let v = table.view(t)?;
-        (
-            v.cred_arc().uid,
-            v.task.cputime(crate::time::monotonic_ns()),
-        )
-    };
+/// do_notify_parent_cldstop's fields), read under TASKLIST. None once
+/// it is gone.
+fn chld_info(
+    table: &GlobalTaskTable,
+    t: &Task,
+    code: i32,
+    status: i32,
+    ns: &crate::ns::PidNamespace,
+) -> Option<SigInfo> {
+    let v = table.view(t)?;
+    let uid = v.cred_arc().uid;
+    let (utime, stime) = v.task.cputime(crate::time::monotonic_ns());
     let fields = SigFields::Chld {
         pid: crate::task::pid::nr_ns(t.tid(), ns) as i32,
         uid,
@@ -30,10 +32,12 @@ fn chld_info(t: &Task, code: i32, status: i32, ns: &crate::ns::PidNamespace) -> 
 /// The traced task `t` stopped with `code` (its exit_code): SIGCHLD
 /// with CLD_TRAPPED to its `tracer`'s process, unless the tracer
 /// ignores SIGCHLD or set SA_NOCLDSTOP (Linux do_notify_parent_cldstop,
-/// for_ptracer)
-pub fn notify_tracer_trapped(t: &Task, tracer: &Task, code: u32) {
-    let quiet = super::get_task_sighand(tracer)
-        .map(|h| h.get_action(SIGCHLD))
+/// for_ptracer); under TASKLIST's read lock held by the caller, the
+/// whole send done there
+pub fn notify_tracer_trapped(table: &GlobalTaskTable, t: &Task, tracer: &Task, code: u32) {
+    let quiet = table
+        .view(tracer)
+        .and_then(|v| v.sighand().map(|h| h.get_action(SIGCHLD)))
         .is_some_and(|a| a.handler == SigHandler::Ignore || a.flags & sa_flags::SA_NOCLDSTOP != 0);
     if quiet {
         return;
@@ -42,8 +46,13 @@ pub fn notify_tracer_trapped(t: &Task, tracer: &Task, code: u32) {
     // The tracee as its tracer's namespace numbers it (Linux
     // do_notify_parent_cldstop: task_pid_nr_ns(tsk, ns of parent))
     let ns = tracer.pid_ns();
-    if let Some(info) = chld_info(t, super::si_code::CLD_TRAPPED, status, ns) {
-        let _ = super::group_send_sig_info(tracer, SIGCHLD, SendInfo::Info(info));
+    let Some(info) = chld_info(table, t, super::si_code::CLD_TRAPPED, status, ns) else {
+        return;
+    };
+    // Linux __group_send_sig_info to the tracer task's group
+    if let Some(to) = super::group_task(table, table.get(tracer.pid)) {
+        let info = SendInfo::Info(info);
+        let _ = super::send_task_in(table, &to, SIGCHLD, info, super::PidType::Tgid, false);
     }
 }
 
@@ -182,23 +191,17 @@ pub fn ignoring_children(table: &GlobalTaskTable, pid: crate::task::Pid) -> bool
 }
 
 /// What [`notify`] did: the parent is to release the zombie now
-/// (`autoreap`); the signal's wakeups wait for TASKLIST to be dropped
-/// ([`Told::finish`])
+/// (`autoreap`); what the send read is freed by [`Told::finish`]
 #[must_use]
 #[derive(Default)]
 pub struct Told {
     pub autoreap: bool,
-    posted: Option<super::Posted>,
     rcv: Option<Rcv>,
 }
 
 impl Told {
-    /// Wake whoever takes the signal and free what the send left
-    /// (TASKLIST not held)
+    /// Free what the send left (TASKLIST not held)
     pub fn finish(self) {
-        if let Some(p) = self.posted {
-            p.finish();
-        }
         drop(self.rcv);
     }
 }
@@ -212,8 +215,9 @@ impl Told {
 ///
 /// Under TASKLIST's write lock, in the section that made it reportable
 /// (Linux exit_notify, release_task, reparent_leader call
-/// do_notify_parent under tasklist_lock), its queue entry made there
-/// GFP_ATOMIC (Linux __send_signal_locked): no wait reaps it before its
+/// do_notify_parent under tasklist_lock), the whole send done there,
+/// its queue entry GFP_ATOMIC, its wakeup and any group kill (Linux
+/// __group_send_sig_info, complete_signal): no wait reaps it before its
 /// signal is pending, and a parent its signal wakes finds it.
 pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
     let tid = z.tid();
@@ -223,16 +227,12 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
         return Told::default();
     };
     let (sig, autoreap) = (r.sig, r.autoreap);
-    let posted = match (sig, chld_notice(table, tid, r.to.pid_ns())) {
-        (Some(sig), Some(info)) => {
-            let info = SendInfo::Info(info.with_sig(sig));
-            super::send_held(table, &r.to, sig, info, super::PidType::Tgid)
-        }
-        _ => None,
-    };
+    if let (Some(sig), Some(info)) = (sig, chld_notice(table, tid, r.to.pid_ns())) {
+        let info = SendInfo::Info(info.with_sig(sig));
+        let _ = super::send_task_in(table, &r.to, sig, info, super::PidType::Tgid, false);
+    }
     Told {
         autoreap,
-        posted,
         rcv: Some(r),
     }
 }

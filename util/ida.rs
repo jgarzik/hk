@@ -29,12 +29,34 @@ impl Ida {
 
     /// [`alloc`](Self::alloc), or ENOMEM if the bitmap cannot grow
     pub fn try_alloc(&self) -> Result<u32, crate::util::error::KernelError> {
+        self.try_alloc_min(0)
+    }
+
+    /// The lowest free id from `min` (Linux ida_alloc_min); thread
+    /// context, panicking where the bitmap cannot grow
+    pub fn alloc_min(&self, min: u32) -> u32 {
+        self.try_alloc_min(min).expect("ida: out of memory")
+    }
+
+    /// [`alloc_min`](Self::alloc_min), or ENOMEM if the bitmap cannot
+    /// grow
+    pub fn try_alloc_min(&self, min: u32) -> Result<u32, crate::util::error::KernelError> {
         loop {
             let mut w = self.0.lock();
-            if let Some((i, word)) = w.iter_mut().enumerate().find(|(_, x)| **x != !0) {
-                let b = (!*word).trailing_zeros();
-                *word |= 1 << b;
-                return Ok(i as u32 * 64 + b);
+            for (i, word) in w.iter_mut().enumerate() {
+                let base = i as u32 * 64;
+                // The bits below `min` count as taken
+                let below = match min.saturating_sub(base) {
+                    0 => 0,
+                    k if k >= 64 => !0,
+                    k => (1u64 << k) - 1,
+                };
+                let free = !(*word | below);
+                if free != 0 {
+                    let b = free.trailing_zeros();
+                    *word |= 1 << b;
+                    return Ok(base + b);
+                }
             }
             let n = w.len();
             drop(w);
@@ -82,5 +104,18 @@ mod tests {
         ida.free(130);
         assert_eq!(ida.alloc(), 130);
         assert_eq!(ida.alloc(), 200);
+    }
+
+    /// Ids from a minimum, as Linux mnt_group_ida's ida_alloc_min(1)
+    #[test]
+    fn alloc_min() {
+        let ida = Ida::new();
+        assert_eq!(ida.alloc_min(1), 1);
+        assert_eq!(ida.alloc_min(1), 2);
+        assert_eq!(ida.alloc_min(70), 70);
+        ida.free(1);
+        assert_eq!(ida.alloc_min(1), 1);
+        assert_eq!(ida.alloc(), 0);
+        assert_eq!(ida.alloc_min(64), 64);
     }
 }

@@ -9,6 +9,7 @@ use core::fmt;
 use crate::fs::chardev::{DevId, major};
 use crate::irq::{IrqFn, IrqRegistration, IrqReturn};
 use crate::sync::spin::Mutex;
+use crate::tty::serial_core::UartPort;
 use crate::tty::{Tty, TtyDriver};
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
@@ -79,6 +80,8 @@ mod cr {
 /// `base` is the PL011's register block, mapped for the kernel's life.
 struct Pl011 {
     base: usize,
+    /// Its port lock (Linux uart_port.lock): console and tty writes
+    uart: UartPort,
 }
 
 impl Pl011 {
@@ -86,7 +89,10 @@ impl Pl011 {
     const fn new(base: usize) -> Self {
         // INVARIANT: PL011_BASE is mapped by the early page tables and
         // stays mapped
-        Self { base }
+        Self {
+            base,
+            uart: UartPort::new(),
+        }
     }
 
     /// Read a register
@@ -182,9 +188,7 @@ static UART: Pl011 = Pl011::new(PL011_BASE);
 
 impl TtyDriver for Pl011 {
     fn write(&self, data: &[u8]) -> Result<usize, KernelError> {
-        for &b in data {
-            self.write_byte(b);
-        }
+        self.uart.write(data, |b| self.write_byte(b));
         Ok(data.len())
     }
 
@@ -192,6 +196,12 @@ impl TtyDriver for Pl011 {
         while self.read_reg(regs::FR) & fr::BUSY != 0 {
             core::hint::spin_loop();
         }
+    }
+
+    /// Linux pl011_console_write: under the port lock
+    fn console_write(&self, data: &[u8]) {
+        self.uart
+            .console_write(data, |b| self.write_byte(b), || TtyDriver::flush(self));
     }
 }
 

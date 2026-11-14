@@ -803,67 +803,6 @@ impl GlobalTaskTable {
         )
     }
 
-    /// What `f` picks of each process of group `pg` (its leaders on the
-    /// group's list), gathered as `collect_threads` does
-    pub fn collect_pgrp<T>(
-        pg: &crate::task::pid::Pid,
-        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
-    ) -> Vec<T> {
-        Self::collect(
-            |table, visit| {
-                for t in table.pgrp(pg) {
-                    if !visit(&t) {
-                        break;
-                    }
-                }
-            },
-            f,
-        )
-    }
-
-    /// [`GlobalTaskTable::collect_pgrp`] with fallible allocation, for a
-    /// caller under a named GFP (a SIGIO sent in atomic context): None
-    /// without memory
-    pub fn try_collect_pgrp<T>(
-        pg: &crate::task::pid::Pid,
-        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
-    ) -> Option<Vec<T>> {
-        let walk = |table: &GlobalTaskTable, visit: &mut dyn FnMut(&TaskView<'_>) -> bool| {
-            for t in table.pgrp(pg) {
-                if !visit(&t) {
-                    break;
-                }
-            }
-        };
-        let mut cap = 1;
-        walk(&TASKLIST.read(), &mut |_| {
-            cap += 1;
-            true
-        });
-        loop {
-            let mut v = Vec::new();
-            v.try_reserve(cap).ok()?;
-            let mut full = false;
-            {
-                let table = TASKLIST.read();
-                walk(&table, &mut |t| {
-                    if v.len() == v.capacity() {
-                        full = true;
-                        return false;
-                    }
-                    if let Some(x) = f(&table, t) {
-                        v.push(x);
-                    }
-                    true
-                });
-            }
-            if !full {
-                return Some(v);
-            }
-            cap *= 2;
-        }
-    }
-
     /// What `f` picks of each thread of every process of group `pg`,
     /// gathered as `collect_threads` does
     pub fn collect_pgrp_threads<T>(
@@ -2107,29 +2046,27 @@ fn group_status(t: &TaskInner, own: i32) -> i32 {
 /// A ptrace stop of a task traced by the group `tracer_pid`, matching
 /// `target_pid` (wait4's pid: > 0 that tid, -1 any, 0 the caller's
 /// process group, < -1 that group), not yet reported: its tid (as the
-/// caller numbers it) and the stop's code. Reported once unless `wnowait` (Linux wait_task_stopped
-/// with ptrace: exit_code cleared). Found under the read lock; the write
-/// lock only to take the code.
+/// caller numbers it) and the stop's code. Reported once unless
+/// `wnowait` (Linux wait_task_stopped with ptrace: exit_code cleared
+/// under siglock). The tracees are walked under the read lock, each
+/// stop read and its code taken under the tracee's Task.sig.
 pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32)> {
     let pgid = current_pgid();
-    let found = |t: &TaskView<'_>| {
-        matches!(t.state, TaskState::Traced(_))
-            && t.ptrace_code != 0
-            && tracee_of(t, tracer_pid)
-            && wait_match(t, target_pid, pgid)
-    };
-    let tid = TASKLIST.read().find(found)?.task.tid();
-    let mut table = TASKLIST.write();
-    // Everything may have changed meanwhile (resumed, reported,
-    // detached, the tid reused): the whole check again
-    if !table.get(tid).is_some_and(|t| found(&t)) {
-        return None;
-    }
-    let mut t = table.get_mut(tid)?;
-    let code = t.ptrace_code;
-    if !wnowait {
-        t.ptrace_code = 0;
-    }
+    let table = TASKLIST.read();
+    let (tid, code) = table.iter().find_map(|t| {
+        if !(tracee_of(&t, tracer_pid) && wait_match(&t, target_pid, pgid)) {
+            return None;
+        }
+        let mut s = t.task.sig.lock();
+        if !s.traced() || s.ptrace_code == 0 {
+            return None;
+        }
+        let code = s.ptrace_code;
+        if !wnowait {
+            s.ptrace_code = 0;
+        }
+        Some((t.task.tid(), code))
+    })?;
     // The tracee as the tracer numbers it (Linux wait_task_stopped:
     // task_pid_vnr)
     Some((
@@ -4323,6 +4260,7 @@ pub fn scheduler_tick() {
     crate::time::timer::run_local();
     crate::time::watchdog::tick();
     crate::kmsg::tick();
+    crate::console::tick();
     if let Some(cpu) = crate::cpu::try_this_id() {
         balance_tick(cpu);
     }
@@ -4598,15 +4536,6 @@ pub fn pgrp_tasks(pgid: Pid) -> alloc::vec::Vec<TaskRef> {
     GlobalTaskTable::collect_pgrp_threads(&pg, |_, t| Some(task_ref(t.task)))
 }
 
-/// The processes of group `pgid`, by pid (their leaders on its list;
-/// Linux do_each_pid_task PIDTYPE_PGID)
-pub fn pgrp_pids(pgid: Pid) -> alloc::vec::Vec<Pid> {
-    match crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid) {
-        Some(pg) => pgrp_members(&pg),
-        None => alloc::vec::Vec::new(),
-    }
-}
-
 /// Is group `pg` orphaned: no member has a parent in another group of
 /// its session (Linux will_become_orphaned_pgrp(pg, NULL); members that
 /// exited and children of the global init do not count)
@@ -4633,11 +4562,6 @@ pub fn pgrp_orphaned(pg: &crate::task::pid::Pid) -> bool {
         };
         !same(&p.pgrp, pg) && same(&p.session, ms)
     })
-}
-
-/// The processes of group `pg`, by pid
-pub fn pgrp_members(pg: &crate::task::pid::Pid) -> alloc::vec::Vec<Pid> {
-    GlobalTaskTable::collect_pgrp(pg, |_, t| Some(t.task.pid))
 }
 
 /// Get all unique PIDs in the system

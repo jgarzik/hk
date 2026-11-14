@@ -6,7 +6,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use super::cb::{
-    Cfg, MSS_DEFAULT, Open, Out, RCV_SHUTDOWN, RTO_MAX, TIMEWAIT_LEN, TcpCb, TcpState, flags,
+    Cfg, MSS_DEFAULT, Open, Out, RCV_SHUTDOWN, RTO_MAX, TIMEWAIT_LEN, TcpCb, TcpState, flags, wake,
 };
 use crate::mm::page_alloc::Gfp;
 use crate::net::skb::SkBuff;
@@ -839,6 +839,24 @@ fn reset_errors_by_state() {
     let mut out = Out::default();
     p.a.feed(&rst, 0, &mut out);
     assert_eq!(out.err, Some(KernelError::BrokenPipe));
+}
+
+/// Linux tcp_disconnect: RST and ECONNRESET for a connection, a bare
+/// error report (no state change wakeup) for a closed socket
+#[test]
+fn disconnect_reports() {
+    let mut p = Pair::new(1460);
+    let mut out = Out::default();
+    p.a.disconnect(&mut out);
+    assert_eq!(p.a.state, TcpState::Closed);
+    assert!(wire(&out)[0].has(flags::RST));
+    assert_eq!(out.err, Some(KernelError::ConnectionReset));
+    assert_eq!(out.wake & (wake::STATE | wake::ERR), wake::ERR);
+    let mut out = Out::default();
+    p.a.disconnect(&mut out);
+    assert!(wire(&out).is_empty());
+    assert_eq!(out.err, None);
+    assert_eq!(out.wake, wake::ERR);
 }
 
 #[test]

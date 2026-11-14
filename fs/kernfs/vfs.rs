@@ -237,7 +237,18 @@ fn bin_of(file: &File) -> Option<Result<BinFile, KernelError>> {
     Some(b.map(|b| (kn, b)))
 }
 
-/// Linux sysfs_kf_bin_read/write: clipped to the size, EOF past it
+/// Bytes of a `len`-byte access at `off` within an attribute of `size`
+/// (Linux sysfs_kf_bin_read/write: clipped to the size, EOF past it; a
+/// size of 0 is unbounded)
+fn bin_len(size: u64, off: u64, len: usize) -> usize {
+    match size {
+        0 => len,
+        s if off >= s => 0,
+        s => len.min(usize::try_from(s - off).unwrap_or(usize::MAX)),
+    }
+}
+
+/// Run a binary attribute access under an active reference
 fn bin_io(
     kn: &KNode,
     b: &dyn BinAttr,
@@ -247,10 +258,10 @@ fn bin_io(
 ) -> Result<usize, KernelError> {
     let _act = kn.get_active().ok_or(KernelError::NoDevice)?;
     let size = b.size();
-    if off >= size {
+    if size != 0 && off >= size {
         return Ok(0);
     }
-    io(len.min((size - off) as usize))
+    io(bin_len(size, off, len))
 }
 
 /// Linux kernfs_file_read_iter of a binary attribute: at most a page,
@@ -275,8 +286,7 @@ fn bin_write(
     from: &mut IovSource<'_>,
     off: u64,
 ) -> Result<usize, KernelError> {
-    let room = usize::try_from(b.size().saturating_sub(off)).unwrap_or(usize::MAX);
-    let mut buf = try_vec(from.len().min(PAGE_SIZE).min(room), 0u8)?;
+    let mut buf = try_vec(bin_len(b.size(), off, from.len().min(PAGE_SIZE)), 0u8)?;
     // Whole or EFAULT (Linux kernfs_fop_write_iter)
     from.copy_from_full(&mut buf)?;
     bin_io(kn, b, off, buf.len(), |n| b.write(off, &buf[..n]))
@@ -521,3 +531,18 @@ impl FileOps for KernfsFops {
 }
 
 pub static KERNFS_FOPS: KernfsFops = KernfsFops;
+
+#[cfg(test)]
+mod tests {
+    use super::bin_len;
+
+    #[test]
+    fn bin_len_clips_to_size() {
+        assert_eq!(bin_len(4, 0, 10), 4);
+        assert_eq!(bin_len(4, 3, 10), 1);
+        assert_eq!(bin_len(4, 4, 10), 0);
+        // Size 0: no limit (Linux sysfs_kf_bin_read)
+        assert_eq!(bin_len(0, 0, 10), 10);
+        assert_eq!(bin_len(0, 1 << 40, 10), 10);
+    }
+}

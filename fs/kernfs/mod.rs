@@ -95,9 +95,9 @@ pub trait Attr: Send + Sync {
 }
 
 /// A binary attribute (Linux bin_attribute): raw reads and writes at an
-/// offset below `size`, no show() buffering
+/// offset below `size` (any offset if 0), no show() buffering
 pub trait BinAttr: Send + Sync {
-    /// st_size
+    /// st_size; 0: no limit (Linux sysfs_kf_bin_read)
     fn size(&self) -> u64;
 
     fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, KernelError>;

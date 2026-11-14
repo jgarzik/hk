@@ -24,7 +24,6 @@ use super::inode::{FileType, Inode, InodeMode, InodeOps};
 use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 use crate::task::Cred;
-use crate::util::kalloc::try_arc;
 
 /// statfs f_type (Linux NULL_FS_MAGIC, "NULL")
 pub const NULL_FS_MAGIC: u64 = 0x4E55_4C4C;
@@ -145,7 +144,10 @@ fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBloc
         Arc::downgrade(&sb),
         &NULLFS_INODE_OPS,
     ))?;
-    sb.set_root(try_arc(Dentry::new_root(root, Arc::downgrade(&sb)))?);
+    sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
+        root,
+        Arc::downgrade(&sb),
+    ))?);
     Ok(sb)
 }
 

@@ -21,7 +21,9 @@
 //! context but hardirq and under any spin locks, holding each entry's
 //! `fa` and its owner's `FOwner.st` (IrqRwLock) read across the send:
 //! then the signal locks (TASKLIST read, Task.sig, shared_pending), the
-//! queue entry allocated GFP_ATOMIC (doc/LOCKING.md 3.7).
+//! queue entry allocated GFP_ATOMIC (doc/LOCKING.md 3.7). A process
+//! group owner's processes are walked under that TASKLIST read hold,
+//! each sent to in place, as Linux send_sigio: nothing else allocates.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -33,9 +35,8 @@ use crate::io::poll::{
 };
 use crate::mm::page_alloc::Gfp;
 use crate::signal::siginfo::{SigFields, SigInfo, si_code};
-use crate::signal::{
-    SIGIO, SIGURG, SendInfo, Signal, group_task, send_group_signal, send_sig_info, valid_signal,
-};
+use crate::signal::{SIGIO, SIGURG, SendInfo, Signal, group_task, send_sig_info_in, valid_signal};
+
 use crate::sync::IrqRwLock;
 use crate::sync::rcu::RcuHead;
 use crate::sync::spin::Mutex;
@@ -467,12 +468,14 @@ fn sigio_target(table: &GlobalTaskTable, o: &Owner, t: &TaskView<'_>) -> Option<
 
 /// Linux send_sigio_to_task: the chosen signal with its POLL info, or
 /// plain SIGIO (SI_KERNEL) when none was chosen or it could not be
-/// queued; thread-directed for a thread owner, else to its process
-fn sigio_to_task(o: &Owner, t: &TaskRef, fd: i32, reason: i32) {
-    let send = |sig, info| match o.kind {
-        PidType::Tid => send_sig_info(t, sig, info),
-        _ => send_group_signal(t, sig, info),
+/// queued; thread-directed for a thread owner, else to its process;
+/// sent in place under TASKLIST's read lock, held by the caller
+fn sigio_to_task(table: &GlobalTaskTable, o: &Owner, t: &TaskRef, fd: i32, reason: i32) {
+    let ty = match o.kind {
+        PidType::Tid => crate::signal::PidType::Pid,
+        _ => crate::signal::PidType::Tgid,
     };
+    let send = |sig, info| send_sig_info_in(table, t, sig, info, ty);
     if let Some(sig) = o.signum {
         // A signal with its own positive codes gets SI_SIGIO, not the
         // ambiguous POLL_* (SIGPOLL itself keeps it)
@@ -494,30 +497,27 @@ fn sigio_to_task(o: &Owner, t: &TaskRef, fd: i32, reason: i32) {
 
 /// Linux send_sigio: to the owner's thread or process, or once to each
 /// process of its group, each found through the owner's struct pid
-/// (never by a number its process may have freed for reuse)
+/// (never by a number its process may have freed for reuse). All under
+/// one TASKLIST read hold, each send done in place (Linux: read_lock
+/// tasklist_lock, do_each_pid_task), so a group walk allocates nothing
+/// but each signal's queue entry.
 fn send_sigio(o: &Owner, fd: i32, reason: i32) {
     let Some(pid) = &o.pid else {
         return;
     };
+    let table = TASKLIST.read();
     match o.kind {
         PidType::Tid | PidType::Tgid => {
-            let t = {
-                let table = TASKLIST.read();
-                let v = table.pid_tid(pid).and_then(|tid| table.get(tid));
-                v.and_then(|v| sigio_target(&table, o, &v))
-            };
-            if let Some(t) = t {
-                sigio_to_task(o, &t, fd, reason);
+            let v = table.pid_tid(pid).and_then(|tid| table.get(tid));
+            if let Some(t) = v.and_then(|v| sigio_target(&table, o, &v)) {
+                sigio_to_task(&table, o, &t, fd, reason);
             }
         }
         PidType::Pgrp => {
-            // GFP_ATOMIC: no memory, no signal (Linux walks the group
-            // under tasklist_lock instead)
-            let targets =
-                GlobalTaskTable::try_collect_pgrp(pid, |table, t| sigio_target(table, o, t))
-                    .unwrap_or_default();
-            for t in &targets {
-                sigio_to_task(o, t, fd, reason);
+            for v in table.pgrp(pid) {
+                if let Some(t) = sigio_target(&table, o, &v) {
+                    sigio_to_task(&table, o, &t, fd, reason);
+                }
             }
         }
     }

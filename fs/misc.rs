@@ -183,7 +183,7 @@ fn reconfigure_mnt(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelE
 /// do_change_type): exactly one type (else EINVAL), for the subtree
 /// with MS_REC
 fn change_type(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError> {
-    use super::pnode::{Prop, change_propagation};
+    use super::pnode::{Prop, change_mnt_propagation, invent_group_ids};
     let p = match flags & !(ms::REC | ms::SILENT) {
         ms::SHARED => Prop::Shared,
         ms::SLAVE => Prop::Slave,
@@ -191,19 +191,21 @@ fn change_type(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError
         ms::UNBINDABLE => Prop::Unbindable,
         _ => return Err(KernelError::InvalidArgument),
     };
-    let ns = super::mount::namespace_lock();
+    let mut ns = super::mount::namespace_lock();
     // Mounted in some namespace, not a kernel mount (Linux
     // may_change_propagation's IS_ERR_OR_NULL(mnt_ns): not necessarily
     // the caller's)
     if !m.is_mounted() {
         return Err(KernelError::InvalidArgument);
     }
-    if flags & ms::REC != 0 {
-        for t in super::mount::walk(m, &*ns) {
-            change_propagation(&t, p);
-        }
+    let rec = flags & ms::REC != 0;
+    if p == Prop::Shared {
+        invent_group_ids(&mut ns, m, rec)?;
+    }
+    if rec {
+        super::mount::for_each_mut(&mut ns, m, |ns, t| change_mnt_propagation(ns, t, p));
     } else {
-        change_propagation(m, p);
+        change_mnt_propagation(&mut ns, m, p);
     }
     Ok(())
 }
@@ -219,7 +221,7 @@ fn own_mount_at(target: &super::Path) -> Result<super::mount::MountRef, KernelEr
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
 fn mount_at(target: &super::Path) -> Result<super::mount::MountRef, KernelError> {
-    if Arc::ptr_eq(&target.dentry, &target.mnt.root) {
+    if super::DentryRef::ptr_eq(&target.dentry, &target.mnt.root) {
         Ok(target.mnt.clone())
     } else {
         Err(KernelError::InvalidArgument)

@@ -525,9 +525,11 @@ glibc's helper thread), and hk has no such path.
 Accepted without effect: MS_SILENT, MS_MANDLOCK, MS_POSIXACL,
 MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated
 copy lands on top of what is already mounted at the target (Linux
-tucks it under); a slave's master is its master's peer group, not one
-mount; copies of a namespace are always peers and not locked (see
-"Before user namespaces grant capabilities"). Mount options are
+tucks it under); an umount keeps a propagated copy with anything
+mounted on it (Linux takes it and slides a mount on its root down:
+propagate_umount's reparent); copies of a namespace are always peers
+and not locked (see "Before user namespaces grant capabilities").
+Mount options are
 parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
 cp437 only), ramfs (mode=), tmpfs and devtmpfs (see "tmpfs gaps") and
 procfs (hidepid=, gid=, subset=pid; devtmpfs drops a new mount's after
@@ -814,9 +816,6 @@ QEMU's xHCI hides all of them.
   endpoints are skipped. A control data stage is one TRB of at most a
   page: a configuration descriptor longer than 4 KiB is cut short.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
-- The USB serial console drops output while `USB_CONTROLLER` is held
-  (by any CPU): it only try-locks it; Linux queues console output in a
-  write FIFO sent asynchronously.
 
 ## USB core gaps
 

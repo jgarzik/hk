@@ -247,6 +247,7 @@ pub fn run_all_tests() {
     fs::mntns_check::run_tests();
     fs::mountinfo::run_tests();
     proc::sysfs::run_tests();
+    proc::tracefs::run_tests();
     fs::pnode::run_tests();
     proc::proc_dcache::run_tests();
     process::process::run_tests();
@@ -335,6 +336,8 @@ pub fn run_all_tests() {
     process::caps_checks::run_tests();
     fs::mount_race::run_tests();
     isolated(b"DPATH_UMOUNT", fs::dpath_umount::run_tests);
+    isolated(b"DPATH_RENAME", fs::dpath_rename::run_tests);
+    isolated(b"VFAT_CI_DENTRY", fs::vfat_names::run_tests);
     fs::tmpfs::run_tests();
     time::timerfd::run_tests();
     time::posix_timer::run_tests();

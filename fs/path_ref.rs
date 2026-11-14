@@ -10,7 +10,7 @@
 
 use alloc::sync::Arc;
 
-use super::dentry::Dentry;
+use super::dentry::DentryRef;
 use super::mount::MountRef;
 
 /// A filesystem path - pair of (mount, dentry)
@@ -31,25 +31,25 @@ pub struct Path {
     /// The mount point this path is on
     pub mnt: MountRef,
     /// The dentry within that mount
-    pub dentry: Arc<Dentry>,
+    pub dentry: DentryRef,
 }
 
 impl Path {
     /// Create a new Path, taking ownership of the provided Arc references
-    pub fn new(mnt: MountRef, dentry: Arc<Dentry>) -> Self {
+    pub fn new(mnt: MountRef, dentry: DentryRef) -> Self {
         Self { mnt, dentry }
     }
 
     /// A dentry of the mount "/" lands on (the rootfs) as a Path
     /// (boot-time objects, internal files)
-    pub fn from_dentry(dentry: Arc<Dentry>) -> Option<Self> {
+    pub fn from_dentry(dentry: DentryRef) -> Option<Self> {
         let mnt = crate::ns::current_mnt_ns().root_path()?.mnt.clone();
         Some(Self { mnt, dentry })
     }
 
     /// The same mount and dentry (Linux path_equal)
     pub fn same(&self, o: &Path) -> bool {
-        MountRef::ptr_eq(&self.mnt, &o.mnt) && Arc::ptr_eq(&self.dentry, &o.dentry)
+        MountRef::ptr_eq(&self.mnt, &o.mnt) && DentryRef::ptr_eq(&self.dentry, &o.dentry)
     }
 
     /// Check if this path points to a directory
@@ -61,7 +61,7 @@ impl Path {
     }
 
     /// Get the dentry
-    pub fn dentry(&self) -> &Arc<Dentry> {
+    pub fn dentry(&self) -> &DentryRef {
         &self.dentry
     }
 
@@ -71,7 +71,7 @@ impl Path {
     }
 
     /// The mount and dentry (path_get of both, then path_put of this)
-    pub fn into_parts(self) -> (MountRef, Arc<Dentry>) {
+    pub fn into_parts(self) -> (MountRef, DentryRef) {
         (self.mnt.clone(), self.dentry.clone())
     }
 
