@@ -535,14 +535,15 @@ fn signal_char(c: u8, t: &Termios) -> Option<crate::signal::Signal> {
         .map(|(_, s)| s)
 }
 
-/// Signal the foreground group, then flush input and queued echo unless
-/// NOFLSH (Linux isig, __isig)
+/// Signal the foreground group, then unless NOFLSH flush queued echo,
+/// the driver's queued output and input (Linux isig, __isig)
 fn isig(tty: &Tty, ld: &mut NTtyData, t: &Termios, sig: crate::signal::Signal) {
     if let Some(pg) = tty.pgrp() {
         crate::signal::kill_pgrp_pid(&pg, sig);
     }
     if t.c_lflag & NOFLSH == 0 {
         ld.clear_echo();
+        tty.flush_output();
         ld.reset();
     }
 }
@@ -1039,6 +1040,7 @@ mod tests {
     struct Flow {
         stopped: AtomicBool,
         xchars: Mutex<Vec<u8>>,
+        flushed: AtomicBool,
     }
 
     impl TtyDriver for Flow {
@@ -1053,6 +1055,9 @@ mod tests {
         }
         fn send_xchar(&self, _tty: &Tty, ch: u8) {
             self.xchars.lock().unwrap().push(ch);
+        }
+        fn flush_buffer(&self) {
+            self.flushed.store(true, Ordering::Relaxed);
         }
         fn throttle(&self, tty: &Tty) {
             if let Some(ch) = crate::tty::serial_core::ixoff_char(tty, true) {
@@ -1070,6 +1075,7 @@ mod tests {
     static FLOW: Flow = Flow {
         stopped: AtomicBool::new(false),
         xchars: Mutex::new(Vec::new()),
+        flushed: AtomicBool::new(false),
     };
     static FTTY: Tty = Tty::new("flow", DevId::new(0, 1), &FLOW);
 
@@ -1145,5 +1151,13 @@ mod tests {
         check_unthrottle(&FTTY, &ld);
         drop(ld);
         assert_eq!(&*FLOW.xchars.lock().unwrap(), &[XOFF, XON]);
+        // ISIG without NOFLSH flushes queued output (Linux isig:
+        // tty_driver_flush_buffer); with NOFLSH it does not
+        FTTY.update_termios(|t| t.c_lflag |= ISIG | NOFLSH);
+        receive_buf(&FTTY, &[0x03]);
+        assert!(!FLOW.flushed.load(Ordering::Relaxed));
+        FTTY.update_termios(|t| t.c_lflag &= !NOFLSH);
+        receive_buf(&FTTY, &[0x03]);
+        assert!(FLOW.flushed.load(Ordering::Relaxed), "ISIG kept output");
     }
 }
