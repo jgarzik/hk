@@ -13,7 +13,8 @@
 //!   (an O_NONBLOCK writer meanwhile gets EAGAIN)
 //! - TTY_OUTQ: TIOCOUTQ shows a console write's bytes still queued for
 //!   the UART (Linux uart_write into the transmit buffer, drained by the
-//!   TX interrupt), at most what was written; tcdrain waits until none
+//!   TX interrupt), at most what was written (NL as CR NL); tcdrain
+//!   waits until none
 //!   are left
 
 use crate::harness::{check, fail_num, pass, report_r};
@@ -73,6 +74,8 @@ fn test_outq() {
     let fd = fd as i32;
     let mut line = [b' '; 1500];
     line[1499] = b'\n';
+    // Earlier output (this process's last report) may still be queued
+    sys_ioctl(fd, TCSBRK, 1);
     let w = sys_write(fd as u64, line.as_ptr(), line.len() as u64);
     let queued = outq(fd);
     let drained = sys_ioctl(fd, TCSBRK, 1);
@@ -80,10 +83,11 @@ fn test_outq() {
     sys_close(fd as u64);
     // How much is still queued as the write returns depends on where
     // the TX interrupt runs: QEMU's UARTs send at once, so on the CPU
-    // taking it the interrupt re-fires until the queue is empty
+    // taking it the interrupt re-fires until the queue is empty. OPOST
+    // ONLCR: the NL goes out as CR NL
     let n = line.len() as i64;
     let r = check(b"write", w == n, w)
-        .and_then(|()| check(b"queued", (0..=n).contains(&queued), queued))
+        .and_then(|()| check(b"queued", (0..=n + 1).contains(&queued), queued))
         .and_then(|()| check(b"tcdrain", drained == 0, drained))
         .and_then(|()| check(b"left", left == 0, left));
     report_r(NAME, r);
