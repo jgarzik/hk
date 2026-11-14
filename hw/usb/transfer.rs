@@ -302,8 +302,12 @@ pub fn bulk_trbs(
     is_in: bool,
     maxp: u16,
     hci_version: u16,
-) -> alloc::vec::Vec<Trb> {
+) -> Option<alloc::vec::Vec<Trb>> {
+    let count = (len as u64 + (addr & (TRB_MAX_BUFF_SIZE - 1)))
+        .div_ceil(TRB_MAX_BUFF_SIZE)
+        .max(1);
     let mut trbs = alloc::vec::Vec::new();
+    trbs.try_reserve_exact(count as usize).ok()?;
     let mut done = 0usize;
     loop {
         let at = addr + done as u64;
@@ -318,7 +322,7 @@ pub fn bulk_trbs(
         trbs.push(t);
         done += n;
         if !more {
-            return trbs;
+            return Some(trbs);
         }
     }
 }
@@ -693,7 +697,7 @@ mod tests {
     /// Split at each 64 KiB boundary, chained, IOC on the last only
     #[test]
     fn bulk_split() {
-        let t = bulk_trbs(0xf000, 0x12000, true, 512, 0x100);
+        let t = bulk_trbs(0xf000, 0x12000, true, 512, 0x100).unwrap();
         let lens: alloc::vec::Vec<u32> = t.iter().map(Trb::get_transfer_length).collect();
         assert_eq!(lens, [0x1000, 0x10000, 0x1000]);
         let chain = |t: &Trb| t.control & (1 << 4) != 0;
@@ -702,11 +706,11 @@ mod tests {
         assert!(!ioc(&t[0]) && !ioc(&t[1]) && ioc(&t[2]));
         assert!(t.iter().all(|t| t.control & (1 << 2) != 0), "ISP on IN");
         assert_eq!(t[1].parameter, 0x10000);
-        let z = bulk_trbs(0x1000, 0, false, 64, 0x100);
+        let z = bulk_trbs(0x1000, 0, false, 64, 0x100).unwrap();
         assert_eq!(z.len(), 1);
         assert_eq!(z[0].get_transfer_length(), 0);
         assert_eq!(z[0].control & (1 << 2), 0);
         // 128 KiB never overflows a TRB's 17-bit length
-        assert_eq!(bulk_trbs(0, 0x20000, false, 512, 0x100).len(), 2);
+        assert_eq!(bulk_trbs(0, 0x20000, false, 512, 0x100).unwrap().len(), 2);
     }
 }

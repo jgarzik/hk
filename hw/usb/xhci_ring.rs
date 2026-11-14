@@ -452,7 +452,8 @@ impl Xhci {
                 bulk_trbs(urb.dma_addr(), len, pipe.is_in(), maxp, self.hci_version)
             }
             _ => return Err(UsbError::InvalidParam),
-        };
+        }
+        .ok_or(UsbError::NoResources)?;
         let mut st = self.lock.lock();
         if st.xhc_state & (xhc_state::DYING | xhc_state::HALTED) != 0 {
             return Err(UsbError::Shutdown);
@@ -492,7 +493,7 @@ impl Xhci {
         setup: &super::SetupPacket,
         len: usize,
         maxp: u16,
-    ) -> alloc::vec::Vec<Trb> {
+    ) -> Option<alloc::vec::Vec<Trb>> {
         let is_in = setup.is_in();
         // Transfer type (TRT) from xHCI 1.0 on: 3 IN data, 2 OUT, 0 none
         let trt = match (self.hci_version >= 0x100, len > 0, is_in) {
@@ -500,7 +501,8 @@ impl Xhci {
             (true, true, false) => 2,
             _ => 0,
         };
-        let mut trbs = alloc::vec::Vec::with_capacity(3);
+        let mut trbs = alloc::vec::Vec::new();
+        trbs.try_reserve_exact(3).ok()?;
         trbs.push(Trb::setup_stage(&setup.bytes(), trt));
         if len > 0 {
             let mut d = Trb::data_stage(urb.dma_addr(), len as u32, is_in);
@@ -509,7 +511,7 @@ impl Xhci {
         }
         // Status in the opposite direction of the data, IN without any
         trbs.push(Trb::status_stage(!(len > 0 && is_in)));
-        trbs
+        Some(trbs)
     }
 
     /// Ring endpoint `dci`'s doorbell unless a command for it is

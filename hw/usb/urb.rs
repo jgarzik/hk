@@ -362,6 +362,17 @@ pub fn usb_kill_urb(urb: &Arc<Urb>) {
     urb.reject.fetch_sub(1, Ordering::AcqRel);
 }
 
+/// Kill `urb` for good: as `usb_kill_urb`, and every later submission
+/// fails (Rejected), so a racing resubmission cannot queue it again
+/// (Linux usb_poison_urb). Thread context, no spinlock
+pub fn usb_poison_urb(urb: &Arc<Urb>) {
+    crate::sync::might_sleep();
+    urb.reject.fetch_add(1, Ordering::AcqRel);
+    fence(Ordering::SeqCst);
+    let _ = usb_hcd_unlink_urb(urb, UsbError::Killed);
+    USB_KILL_URB_QUEUE.wait_event(|| urb.use_count.load(Ordering::Acquire) == 0);
+}
+
 /// Give `urb` back to its owner with `status` (Linux
 /// usb_hcd_giveback_urb): queued for the giveback bottom half; any
 /// context
