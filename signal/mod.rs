@@ -1516,7 +1516,9 @@ fn send_task_in(
     };
     // Job control's process-wide effects, whether or not the signal is
     // then ignored, and the send, under the group lock
-    let _g = prepare_signal(table, tg.signal.as_ref(), t.pid, sig, gone);
+    let Ok(_g) = prepare_signal(table, tg.signal.as_ref(), t.pid, sig, gone) else {
+        return Ok(());
+    };
     let sent = with_sig_send(t, |t, state| send_locked(t, state, sighand, &to));
 
     let wants = match sent {
@@ -1535,21 +1537,29 @@ fn send_task_in(
 
 /// A stop signal or SIGCONT for group `tgid` (`sig_struct`): its
 /// process-wide effects ([`stop::prepare`]), under the group lock,
-/// returned held for the rest of the send
+/// returned held for the rest of the send. Err: the group is exiting,
+/// the signal is dropped with no effect (Linux prepare_signal:
+/// SIGNAL_GROUP_EXIT under siglock; a group exit starts under the
+/// group lock, `SignalStruct::start_exit`).
 fn prepare_signal<'a>(
     table: &crate::task::percpu::GlobalTaskTable,
     sig_struct: Option<&'a Arc<SignalStruct>>,
     tgid: Pid,
     sig: Signal,
     gone: &mut SigPending,
-) -> Option<crate::sync::spin::MutexGuard<'a, stop::GroupStop>> {
+) -> Result<Option<crate::sync::spin::MutexGuard<'a, stop::GroupStop>>, ()> {
     if !sig.kernel_stop() && sig != SIGCONT {
-        return None;
+        return Ok(None);
     }
-    let s = sig_struct?;
+    let Some(s) = sig_struct else {
+        return Ok(None);
+    };
     let mut g = s.jobctl.lock();
+    if matches!(s.group_exit(), GroupExit::Exit(_)) {
+        return Err(());
+    }
     stop::prepare(table, s, &mut g, tgid, sig, gone);
-    Some(g)
+    Ok(Some(g))
 }
 
 /// What a send is, for its locked part
@@ -2278,7 +2288,9 @@ pub fn send_timer_sigqueue(
         return Err((q, true));
     }
     let sighand = tg.sighand.as_ref();
-    let _g = prepare_signal(&table, tg.signal.as_ref(), t.pid, sig, &mut gone);
+    let Ok(_g) = prepare_signal(&table, tg.signal.as_ref(), t.pid, sig, &mut gone) else {
+        return Err((q, true));
+    };
     let mut q = Some(q);
     let r = with_sig_send(&t, |task, state| {
         let exiting = task.has_flag(crate::task::pf::EXITING);
@@ -2651,8 +2663,13 @@ impl SignalStruct {
 
     /// Start a group exit with wait status `code`: false if one is under
     /// way. A fatal signal (`over_exec`) also overrides an exec's
-    /// de_thread (Linux complete_signal), exit_group does not.
+    /// de_thread (Linux complete_signal), exit_group does not. Under the
+    /// group lock (Linux sets SIGNAL_GROUP_EXIT under siglock), so a
+    /// stop signal or SIGCONT whose effects are applied under it either
+    /// sees the exit or comes before it (`prepare_signal`); never with
+    /// that lock or a Task.sig held.
     fn start_exit(&self, code: i32, over_exec: bool) -> bool {
+        let _g = self.jobctl.lock();
         let mut cur = self.group_exit.load(Ordering::Acquire);
         loop {
             if cur & GROUP_EXIT != 0 || (cur & GROUP_EXEC != 0 && !over_exec) {
