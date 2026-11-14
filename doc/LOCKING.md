@@ -3530,6 +3530,16 @@ bitflags! {
 - `CONSDEV` consoles (e.g., graphics) are the primary interactive console
 - `ENABLED` is automatically set on registration; only enabled consoles receive output
 
+**Trace ring (`trace.rs`; Linux kernel/trace ring_buffer):** trace
+events (`trace::emit`, e.g. xHCI's under `usb_trace`) never reach
+printk: each is formatted on the stack and appended to this CPU's ring,
+an `IrqSpinlock` leaf (any context, hardirq included; nothing allocated
+under it; the oldest records are overwritten). The rings are allocated
+once at boot (`trace::init`, before any reader) only when the command
+line asked for tracing. tracefs's `trace` file (kernfs, /sys/kernel/
+tracing) copies each ring out under its lock into a buffer allocated
+before taking it, one CPU at a time, and formats with no lock held.
+
 ### 3.7 Signal Infrastructure
 
 **Location:** `signal/mod.rs`, `signal/pending.rs`, `signal/syscall.rs`

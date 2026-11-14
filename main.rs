@@ -37,6 +37,7 @@ pub mod syscall;
 pub mod sysctl;
 pub mod system_state;
 pub mod time;
+pub mod trace;
 pub mod uaccess;
 
 // Device subsystems
@@ -317,6 +318,8 @@ pub(crate) fn kmain() -> ! {
     fs::ramfs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();
+    // tracefs (Linux tracefs_init, a core initcall; trace files, fs_initcall)
+    trace::init();
     // sock_init, a core initcall after kernel/'s (ksysfs)
     pseudo_init(&fs::pseudo::SOCKFS);
     base::topology_init();

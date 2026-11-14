@@ -13,3 +13,4 @@ pub mod procfs_access;
 pub mod sysctl;
 pub mod sysfs;
 pub mod sysinfo;
+pub mod tracefs;

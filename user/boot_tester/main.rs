@@ -247,6 +247,7 @@ pub fn run_all_tests() {
     fs::mntns_check::run_tests();
     fs::mountinfo::run_tests();
     proc::sysfs::run_tests();
+    proc::tracefs::run_tests();
     fs::pnode::run_tests();
     proc::proc_dcache::run_tests();
     process::process::run_tests();
