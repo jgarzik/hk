@@ -16,6 +16,7 @@ pub mod kmem;
 pub mod list;
 pub mod percpu_alloc;
 pub mod percpu_counter;
+pub mod percpu_ref;
 pub mod pod;
 pub mod rbtree;
 pub mod rcuhlist;

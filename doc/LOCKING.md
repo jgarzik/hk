@@ -180,6 +180,19 @@ bucket's reference of an entry taken off comes back as
 reference (`NullsRef::arc`). A bucket dropped with entries waits for a
 grace period first (readers of other buckets may stand on them).
 
+### 1.3.3 Per-CPU reference with kill (util/percpu_ref.rs)
+
+Linux percpu_ref: a count of an object's users (`PercpuRef`), a word
+per CPU (`PcpSlot`). `tryget_live` and `put` add to the caller's word
+under an RCU read guard, lock-free, safe under any lock in thread
+context. The owner's `kill` marks it dead (later trygets fail) and
+waits a grace period, so every tryget that saw it live has counted;
+`wait` sleeps (uninterruptibly) until the words sum to zero, woken by
+puts that see it dead, then waits one more grace period so no put
+still touches the object. kill and wait sleep: no spinlock held, and
+the owner must not hold anything a user waits for while holding a
+reference. Not a lock to lockdep.
+
 ### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (sync/)
 
 Linux `struct mutex` and `struct rw_semaphore`: a contended lock sleeps
