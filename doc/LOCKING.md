@@ -738,7 +738,9 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     termios is read under ldata by input processing and swapped under
     it by set_termios, as Linux's termios_rwsem spans both), and →
     Tty.ctrl, TASKLIST and the signal locks (ISIG signals sent under
-    it, Linux __isig) and the echo's driver writes; Tty.avail
+    it, Linux __isig; input's SIGIO and read_wait wakeup too, Linux
+    n_tty_receive_buf_common: kill_fasync, RCU) and the echo's driver
+    writes; Tty.avail
     (atomics) is read lock-free by poll and readers; Tty.read_lock (sleeping Mutex, Linux
     atomic_read_lock) → Tty.ldata, Tty.flip: held by a reader across its
     sleeps on read_wait; Tty.write_lock (sleeping Mutex, Linux
@@ -749,8 +751,8 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     tty_bufhead.lock) → Tty.ldata: held by the flip thread across
     feeding input and by flush_input; Tty.flip (IrqSpinlock leaf,
     also under IrqDesc.lock in the UART handler). No tty spin lock is held
-    across a signal, a sleep or a driver write; Tty.buf_lock is (SIGIO
-    after ldata is dropped, under Tty.buf_lock: kill_fasync, RCU).
+    across a signal, a sleep or a driver write; Tty.buf_lock and
+    Tty.ldata are.
     tty_fasync reads Tty.ctrl (the foreground group) after
     `Tty.fasync` is released.
 ```
@@ -3939,7 +3941,7 @@ Each `Tty` struct contains:
 | `read_lock` | `sync::Mutex<()>` (sleeping) | One N_TTY reader at a time, held across the whole read and its sleeps (Linux `atomic_read_lock`): a canonical line copied out in pieces goes to one reader; outermost tty lock, taken before `ldata` |
 | `write_lock` | `sync::Mutex<()>` (sleeping) | One writer at a time, held across the whole write(2) (Linux `atomic_write_lock`, tty_write_lock): another writer's bytes never land inside it; outermost on the write side, taken before the TOSTOP check (`termios`, TASKLIST → `ctrl`, SIGTTOU) and the driver writes; O_NONBLOCK try-locks (EAGAIN), else interruptible. Thread context only: printk's console write and N_TTY echo do not take it (as Linux). Not nested with `read_lock` or `buf_lock` |
 | `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
-| `fasync` | `FasyncList` (RCU, 3.11) | O_ASYNC files (Linux `tty->fasync`): N_TTY input sends their SIGIO after dropping `ldata`, under `buf_lock` |
+| `fasync` | `FasyncList` (RCU, 3.11) | O_ASYNC files (Linux `tty->fasync`): N_TTY input sends their SIGIO under `ldata` (Linux: under termios_rwsem), at each canonical line end, or after non-canonical input, then wakes `read_wait` |
 
 `termios` and `ctrl` are spin locks taken in thread context only,
 briefly, never across a signal, a sleep or a driver write: the SIGWINCH
@@ -3962,7 +3964,7 @@ Input (`tty/flip.rs`, Linux tty_buffer.c): the UART handler (IRQ
 context, under its line's `IrqDesc.lock`) drains its FIFO into `Tty.flip` (leaf), sets
 `flip::PENDING` and wakes `flip::FLIP_WAIT`; the `ttyflip` kernel thread
 takes the bytes out (`flip`, released before the line discipline runs)
-and feeds them to N_TTY (`ldata`), then wakes `read_wait`. It is the only
+and feeds them to N_TTY, which wakes `read_wait` under `ldata`. It is the only
 consumer, so input stays in order. Order: `IrqDesc.lock` → `Tty.flip`;
 `IrqDesc.lock` → wait queue head (the wakeup).
 
