@@ -642,10 +642,11 @@ pub type SbInodes = LockedBy<WeakList<SbInodeA>, InodeSbLists>;
 
 /// Linux inode_sb_list_lock (one lock for every superblock's s_inodes,
 /// as Linux had before s_inode_list_lock went per superblock): an
-/// inode holds only a `Weak` to its superblock and may be evicted
-/// while the superblock is torn down, which drains its list under this
-/// lock first; an inode still linked under it therefore has a
-/// superblock whose fields are intact. A spin leaf, thread context
+/// inode holds only a `Weak` to its superblock (Linux i_sb, a pointer
+/// the shutdown keeps valid by evicting first) and may be evicted after
+/// the superblock's shutdown (`generic_shutdown_super`), which drains
+/// its list under this lock; an inode still linked under it therefore
+/// has a superblock whose fields are intact. A spin leaf, thread context
 /// only: an inode's last reference never goes in an interrupt handler
 /// (pinned pages and files are released in thread context:
 /// `PinnedPages`, `fput`), and lockdep reports a tracked spin lock taken
@@ -659,7 +660,7 @@ fn sb_list_add(sb: &SuperBlock, inode: &Arc<Inode>) {
 }
 
 /// Take an evicted inode off its superblock's list (Linux
-/// inode_sb_list_del), unless the superblock's teardown drained it
+/// inode_sb_list_del), unless the superblock's shutdown drained it
 fn sb_list_del(inode: &Inode) {
     let weak = {
         let mut l = INODE_SB_LIST_LOCK.lock();
@@ -667,9 +668,9 @@ fn sb_list_del(inode: &Inode) {
             return;
         }
         // SAFETY: linked, so `sb` is the superblock `alloc` listed it on
-        // (alive then), whose teardown drains s_inodes under this lock
-        // before any of its fields go: they are intact, and the inode's
-        // Weak keeps the allocation
+        // (alive then), whose shutdown drains s_inodes under this lock
+        // before its last passive put frees any field: they are intact,
+        // and the inode's Weak keeps the allocation
         let sb = unsafe { &*inode.sb.as_ptr() };
         // SAFETY: linked on its superblock's list
         unsafe { sb.s_inodes.access_mut(&mut l).remove(inode) }
@@ -677,9 +678,9 @@ fn sb_list_del(inode: &Inode) {
     drop(weak);
 }
 
-/// Unlink every inode of a superblock in its teardown (Linux
-/// evict_inodes' list walk; here an inode may outlive its superblock,
-/// so its later eviction finds itself unlinked)
+/// Unlink every inode of a superblock in its shutdown (Linux
+/// evict_inodes' list walk; here an inode may outlive its superblock's
+/// shutdown, so its later eviction finds itself unlinked)
 pub(super) fn sb_list_drain(list: &SbInodes) {
     let mut l = INODE_SB_LIST_LOCK.lock();
     let list = list.access_mut(&mut l);

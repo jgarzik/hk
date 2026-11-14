@@ -72,7 +72,10 @@ fn sb_ns(sb: &SuperBlock) -> Option<u64> {
 
 /// The namespace's superblock, shared by its mounts (Linux
 /// kernfs_get_tree: sget_fc with kernfs_test_super)
-fn mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
+fn mount(
+    t: &'static FileSystemType,
+    _opts: &[u8],
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     let ns = crate::net::current_net_ns().id;
     crate::fs::superblock::sget(
         t,

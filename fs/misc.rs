@@ -355,7 +355,7 @@ fn new_mount(
     let sb = if fs_type.mount_dev.is_some() && !source.is_empty() {
         super::mount::dev_super(fs_type, source, data)
     } else {
-        (fs_type.mount)(fs_type, data)
+        super::superblock::vfs_get_tree(fs_type, data)
     };
     // Linux do_new_mount_fc: "Mount too revealing"
     let mut revealing = false;

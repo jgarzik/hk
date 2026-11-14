@@ -2457,7 +2457,7 @@ pub fn proc_flush_pid(t: &crate::task::Task) {
 fn procfs_mount(
     fs_type: &'static FileSystemType,
     data: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     let opts = try_arc(opts::ProcOpts::new(data)?)?;
     // Create superblock
     let sb = SuperBlock::new(fs_type, &PROCFS_SUPER_OPS, 0)?;

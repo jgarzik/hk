@@ -516,7 +516,7 @@ pub static TMPFS_SUPER_OPS: TmpfsSuperOps = TmpfsSuperOps;
 pub(crate) fn tmpfs_mount(
     fs_type: &'static FileSystemType,
     opts: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     let o = parse(opts)?;
     let t = ShmemSb::new(&o)?;
     let (mode, uid, gid) = (t.mode, t.uid, t.gid);
@@ -548,7 +548,7 @@ static SHM_MNT: spin::Once<crate::fs::mount::MountRef> = spin::Once::new();
 
 /// Make the kernel's tmpfs (Linux shmem_init's kern_mount; mnt_init)
 pub fn shmem_init() -> Result<(), KernelError> {
-    let sb = tmpfs_mount(&TMPFS_TYPE, b"size=0,nr_inodes=0")?;
+    let sb = crate::fs::superblock::vfs_get_tree(&TMPFS_TYPE, b"size=0,nr_inodes=0")?;
     let root = sb.get_root().ok_or(KernelError::Io)?;
     let m = crate::fs::mount::Mount::alloc(sb, root, 0, b"tmpfs".as_slice().into())?;
     // A kernel mount (Linux kern_mount)

@@ -20,18 +20,16 @@
 //! `open_mutex` (a block device is opened after the walk), so the order
 //! `open_mutex -> i_rwsem` cannot invert (doc/LOCKING.md 3.10).
 
-use alloc::sync::Arc;
-
 use spin::Once;
 
 use crate::fs::chardev::DevId;
 
 use crate::fs::KernelError;
 use crate::fs::dentry::DentryRef;
-use crate::fs::superblock::{FileSystemType, SuperBlock};
+use crate::fs::superblock::FileSystemType;
 
 /// The internal superblock
-static DEVTMPFS: Once<Arc<SuperBlock>> = Once::new();
+static DEVTMPFS: Once<crate::fs::superblock::SbActive> = Once::new();
 
 fn root() -> Option<DentryRef> {
     DEVTMPFS.get()?.get_root()
@@ -39,7 +37,10 @@ fn root() -> Option<DentryRef> {
 
 /// A mount: the one superblock; `opts` only parsed (a bad option fails
 /// the mount)
-fn mount(_t: &'static FileSystemType, opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
+fn mount(
+    _t: &'static FileSystemType,
+    opts: &[u8],
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     crate::fs::ramfs::tmpfs::check_opts(opts)?;
     DEVTMPFS.get().cloned().ok_or(KernelError::NoDevice)
 }
@@ -86,6 +87,8 @@ pub fn device_del(name: &str) {
 pub fn init() {
     match crate::fs::ramfs::tmpfs::tmpfs_mount(&DEVTMPFS_TYPE, b"mode=0755") {
         Ok(sb) => {
+            // Kept without a mount (Linux devtmpfs's internal mount)
+            sb.set_born();
             DEVTMPFS.call_once(|| sb);
         }
         Err(e) => {

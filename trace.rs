@@ -543,7 +543,10 @@ impl SuperOps for TracefsSops {
 static TRACEFS_SOPS: TracefsSops = TracefsSops;
 
 /// One superblock for every mount (Linux tracefs: get_tree_single)
-fn mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
+fn mount(
+    t: &'static FileSystemType,
+    _opts: &[u8],
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     crate::fs::superblock::sget(
         t,
         |_| true,

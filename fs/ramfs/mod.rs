@@ -1200,7 +1200,7 @@ pub static RAMFS_SUPER_OPS: RamfsSuperOps = RamfsSuperOps;
 pub(crate) fn ramfs_mount(
     fs_type: &'static FileSystemType,
     opts: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     let mode = root_mode(opts)?;
     let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0)?;
     fill_root(&sb, mode, 0, 0)?;

@@ -764,7 +764,7 @@ pub static CGROUPFS_SUPER_OPS: CgroupfsSuperOps = CgroupfsSuperOps;
 fn cgroupfs_mount(
     fs_type: &'static FileSystemType,
     _opts: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     // Initialize cgroup subsystem if not done
     cgroup_init();
 

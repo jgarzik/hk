@@ -410,8 +410,9 @@ impl SbMarks {
     /// The filesystem is shutting down (Linux fsnotify_sb_delete, from
     /// generic_shutdown_super): every watch on its inodes gets
     /// IN_UNMOUNT, then IN_IGNORED, and goes, releasing its inode
-    pub fn sb_delete(&mut self) {
-        for w in core::mem::take(self.0.get_mut()) {
+    pub fn sb_delete(&self) {
+        let list = core::mem::take(&mut *self.0.lock());
+        for w in list {
             if let Some(inode) = w.upgrade() {
                 destroy_marks(&inode, IN_UNMOUNT);
             }

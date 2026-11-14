@@ -2552,7 +2552,7 @@ pub static VFAT_SUPER_OPS: VfatSuperOps = VfatSuperOps;
 fn vfat_mount_pseudo(
     _fs_type: &'static FileSystemType,
     _opts: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     Err(KernelError::OperationNotSupported) // FAT32 requires a device
 }
 
@@ -2561,7 +2561,7 @@ fn vfat_mount_dev(
     fs_type: &'static FileSystemType,
     bdev: Arc<BlockDevice>,
     opts: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     // Options first: a bad one is EINVAL before any I/O
     let opts = VfatOpts::parse(opts)?;
     // Read boot sector

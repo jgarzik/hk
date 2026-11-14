@@ -192,7 +192,10 @@ pub fn new_file(sb: &Arc<SuperBlock>) -> Result<crate::fs::DentryRef, KernelErro
 
 /// A new instance (Linux nullfs_fs_fill_super): the root is inode 1,
 /// mode 0555, owned by root
-fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
+fn mount(
+    fs_type: &'static FileSystemType,
+    _opts: &[u8],
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     let sb = SuperBlock::new(fs_type, &NULLFS_SUPER_OPS, 0)?;
     let root = Inode::alloc(Inode::new(
         1,

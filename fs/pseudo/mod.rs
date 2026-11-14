@@ -140,7 +140,10 @@ fn of_type(ty: &FileSystemType) -> Option<&'static Pseudo> {
 
 /// A superblock with its root, a directory only the kernel uses (Linux
 /// init_pseudo: S_IFDIR | 0600, inode 1)
-fn pseudo_mount(ty: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
+fn pseudo_mount(
+    ty: &'static FileSystemType,
+    _opts: &[u8],
+) -> Result<crate::fs::superblock::SbActive, KernelError> {
     let p = of_type(ty).ok_or(KernelError::InvalidArgument)?;
     let sb = SuperBlock::new(ty, &p.ops, 0)?;
     if let Some(op) = p.d_op {
@@ -167,7 +170,7 @@ impl Pseudo {
     /// Mount it for the kernel (Linux kern_mount: SB_I_NOEXEC and
     /// SB_I_NODEV as mount flags)
     pub fn init(&'static self) -> Result<(), KernelError> {
-        let sb = (self.ty.mount)(&self.ty, b"")?;
+        let sb = crate::fs::superblock::vfs_get_tree(&self.ty, b"")?;
         let root = sb.get_root().ok_or(KernelError::Io)?;
         let name = self.ty.name.as_bytes().into();
         let m = Mount::alloc(sb, root, MNT_NOEXEC | MNT_NODEV, name)?;
@@ -189,7 +192,7 @@ impl Pseudo {
 
     /// Its superblock, for the inodes made on it
     pub fn sb(&self) -> Result<Arc<SuperBlock>, KernelError> {
-        Ok(self.mnt()?.sb.clone())
+        Ok(Arc::clone(&self.mnt()?.sb))
     }
 
     /// A dentry `name` for `inode` outside any tree (Linux
