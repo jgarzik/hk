@@ -1829,6 +1829,9 @@ fn mib_open_close() {
     assert_eq!(m.tcp.fold(TCP_MIB_RETRANSSEGS), 0);
     // Both FINs were new sequence space
     assert_eq!(m.net.fold(LINUX_MIB_TCPORIGDATASENT), 2);
+    // a's SYN and both FINs; the ACKs of the FINs are pure
+    assert_eq!(m.net.fold(LINUX_MIB_TCPDELIVERED), 3);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPPUREACKS), 2);
 }
 
 /// An abort resets both ends: EstabResets on each, one OutRst

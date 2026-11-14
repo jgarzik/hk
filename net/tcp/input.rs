@@ -80,6 +80,8 @@ impl TcpCb {
             return;
         }
         self.snd_una = s.ack;
+        // Linux tcp_clean_rtx_queue acknowledges the SYN
+        self.net_stat(LINUX_MIB_TCPDELIVERED);
         self.established(s, now, out);
         self.ack_now = true;
         self.rcv_text(s, skb, now, out);
@@ -219,22 +221,34 @@ impl TcpCb {
                 self.syn_challenge(out);
                 return;
             }
+            if s.seq_len() == 0 && before(s.seq, self.rcv_nxt) {
+                // An old pure ACK is just dropped (Linux
+                // TCP_RFC7323_PAWS_ACK)
+                self.net_stat(LINUX_MIB_PAWS_OLD_ACK);
+                return;
+            }
             self.net_stat(if self.state == TcpState::TimeWait {
                 LINUX_MIB_PAWS_TW_REJECTED
             } else {
                 LINUX_MIB_PAWSESTABREJECTED
             });
-            if !(s.seq_len() == 0 && before(s.seq, self.rcv_nxt))
-                && !self.oow_limited(s, LINUX_MIB_TCPACKSKIPPEDPAWS)
-            {
-                self.send_ack(out); // dupack (an old pure ACK is just dropped)
+            if !self.oow_limited(s, LINUX_MIB_TCPACKSKIPPEDPAWS) {
+                self.send_ack(out); // dupack
             }
             return;
         }
         if !self.acceptable(s) {
             if s.has(flags::SYN) {
                 self.syn_challenge(out);
-            } else if !s.has(flags::RST) && !self.oow_limited(s, LINUX_MIB_TCPACKSKIPPEDSEQ) {
+                return;
+            }
+            if s.has(flags::RST) {
+                return;
+            }
+            // Linux tcp_sequence: starting past the window
+            let edge = self.rcv_nxt.wrapping_add(self.rcv_wnd());
+            self.net_stat_if(after(s.seq, edge), LINUX_MIB_BEYOND_WINDOW);
+            if !self.oow_limited(s, LINUX_MIB_TCPACKSKIPPEDSEQ) {
                 self.dupack(s, out);
             }
             return;
@@ -411,6 +425,9 @@ impl TcpCb {
         if before(ack, self.snd_una) {
             return true;
         }
+        // Linux tcp_ack's slow path (hk has no header prediction, so
+        // never TCPHPAcks)
+        self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
         self.update_ts_recent(s);
         self.probes = 0;
         self.rcv_tstamp = now;
@@ -486,9 +503,14 @@ impl TcpCb {
     /// tcp_clean_rtx_queue): skbs wholly acknowledged go, a partly
     /// acknowledged head loses its acknowledged bytes (tcp_trim_head)
     fn clean_rtx(&mut self, ack: u32) {
+        let mut delivered = 0;
         while self.rtx.first().is_some_and(|f| !after(f.tcp.end_seq, ack)) {
             drop(self.rtx.pop_first());
+            delivered += 1;
         }
+        // Linux tcp_newly_delivered (every skb is one segment: hk cuts
+        // them at the MSS)
+        self.net_add(LINUX_MIB_TCPDELIVERED, delivered);
         let mut c = self.rtx.cursor_front_mut();
         let _ = c.with_current_mut(|h| {
             if before(h.tcp.seq, ack) {
@@ -537,6 +559,15 @@ impl TcpCb {
             return;
         }
         let edge = self.rcv_nxt.wrapping_add(self.rcv_wnd());
+        if len != 0 {
+            // Linux tcp_data_queue: in order into a closed window, or
+            // starting at or past the window's end
+            if seq == self.rcv_nxt && self.rcv_wnd() == 0 {
+                self.net_stat(LINUX_MIB_TCPZEROWINDOWDROP);
+            } else if !before(seq, edge) {
+                self.net_stat(LINUX_MIB_BEYOND_WINDOW);
+            }
+        }
         let room = if after(edge, seq) {
             edge.wrapping_sub(seq) as usize
         } else {
@@ -608,14 +639,29 @@ impl TcpCb {
     fn rmem_ok(&mut self, seq: u32, len: usize, out: &mut Out) -> bool {
         let in_order = seq == self.rcv_nxt;
         let size = if in_order { len } else { len + OOO_OVERHEAD };
-        loop {
+        // Linux tcp_prune_queue (when anything is held) and
+        // tcp_prune_ofo_queue
+        let held = self.rcv_bytes != 0 || !self.ooo.is_empty();
+        let mut pruned = false;
+        let mut first = true;
+        let ok = loop {
             if self.mem_schedule(size, MemKind::Recv) {
-                return true;
+                break true;
+            }
+            if first {
+                first = false;
+                self.net_stat_if(held, LINUX_MIB_PRUNECALLED);
             }
             if !self.ooo.prune_after(seq) {
-                break;
+                break false;
             }
+            pruned = true;
+        };
+        self.net_stat_if(pruned, LINUX_MIB_OFOPRUNED);
+        if ok {
+            return true;
         }
+        self.net_stat_if(held, LINUX_MIB_RCVPRUNED);
         self.mem_settle();
         out.wake |= wake::DATA;
         if !in_order {
@@ -642,6 +688,8 @@ impl TcpCb {
         skb.dev = None;
         if skb.tcp.seq != self.rcv_nxt {
             self.ooo.insert(skb);
+            let m = core::mem::take(&mut self.ooo.merged);
+            self.net_add(LINUX_MIB_TCPOFOMERGE, m);
             self.ack_now = true;
             self.mem_settle();
             return;

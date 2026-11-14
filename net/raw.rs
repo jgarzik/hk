@@ -374,8 +374,17 @@ impl ProtoOps for RawSock {
         if self.inet.flag(ipf::HDRINCL) {
             return self.send_hdrinc(&rt, &data).map(|()| len);
         }
-        let mut skb = SkBuff::alloc_tx(len, Gfp::KERNEL).ok_or(KernelError::NoBufferSpace)?;
-        skb.put_slice(&data).ok_or(KernelError::NoBufferSpace)?;
+        // Linux ip_append_data's error path, then ip_send_skb's
+        let discard = |e| {
+            self.sk.net.mib.out_discard();
+            e
+        };
+        let mut skb = SkBuff::alloc_tx(len, Gfp::KERNEL)
+            .ok_or(KernelError::NoBufferSpace)
+            .map_err(discard)?;
+        skb.put_slice(&data)
+            .ok_or(KernelError::NoBufferSpace)
+            .map_err(discard)?;
         skb.saddr = Some(rt.saddr);
         skb.daddr = Some(rt.daddr);
         let mut p = self.inet.params();
@@ -387,7 +396,7 @@ impl ProtoOps for RawSock {
                 af_inet::ip_local_error(&self.sk, &self.inet, e, rt.daddr, a.dport, rt.mtu);
                 Err(e)
             }
-            r => r.map(|()| len),
+            r => r.map_err(discard).map(|()| len),
         }
     }
 

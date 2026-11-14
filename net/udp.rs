@@ -487,7 +487,9 @@ impl ProtoOps for UdpSock {
                 Err(e)
             }
             Err(e) => {
-                // Linux udp_sendmsg's out: no kernel memory
+                // Linux __ip_append_data's error path or ip_send_skb;
+                // udp_sendmsg's out: no kernel memory
+                mib.out_discard();
                 if e == KernelError::NoBufferSpace {
                     mib.udp.inc(UDP_MIB_SNDBUFERRORS);
                 }

@@ -252,8 +252,8 @@ impl FragTable {
     /// Add a fragment (`pkt` = whole IP packet, header validated) of a
     /// datagram for us in `net`. `high`: ipfrag_high_thresh;
     /// `timeout`: ipfrag_time in ms. Counted as Linux ip_defrag does:
-    /// ReasmReqds for each, then ReasmOKs or ReasmFails (and
-    /// ReasmOverlaps) when the queue completes or dies.
+    /// ReasmReqds for each, ReasmFails (and ReasmOverlaps) when the
+    /// queue dies; the caller counts ReasmOKs for a `Whole`.
     pub fn add(&self, net: &Arc<crate::net::NetNamespace>, pkt: &[u8]) -> Defrag {
         let ip = &net.mib.ip;
         ip.inc(IPSTATS_MIB_REASMREQDS);
@@ -301,12 +301,11 @@ impl FragTable {
             Ins::Done => {
                 let whole = st.q.get(&key).and_then(|q| q.assemble());
                 self.remove(&mut st, &key);
-                // Linux ip_frag_reasm
-                ip.inc(if whole.is_some() {
-                    IPSTATS_MIB_REASMOKS
-                } else {
-                    IPSTATS_MIB_REASMFAILS
-                });
+                // Linux ip_frag_reasm's out_nomem; ReasmOKs once the
+                // caller made the datagram's skb
+                if whole.is_none() {
+                    ip.inc(IPSTATS_MIB_REASMFAILS);
+                }
                 whole.map_or(Defrag::Pending, Defrag::Whole)
             }
         };

@@ -259,6 +259,12 @@ impl Cong {
         true
     }
 
+    /// Duplicate ACKs since the last advance (Linux TCP_CA_Disorder
+    /// while below the threshold)
+    pub fn dupacks(&self) -> u32 {
+        self.dupacks
+    }
+
     /// Retransmission timeout with `flight` bytes outstanding (loss
     /// window of one segment)
     pub fn on_rto(&mut self, flight: u32) {

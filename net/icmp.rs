@@ -334,10 +334,12 @@ fn icmp_echo(net: &NetNamespace, skb: &SkBuff) {
     let Some(mut out) = SkBuff::alloc_tx(req.len(), Gfp::ATOMIC) else {
         // Linux icmp_push_reply: ip_append_data failed
         net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
+        net.mib.out_discard();
         return;
     };
     if out.put_slice(req).is_none() {
         net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
+        net.mib.out_discard();
         return;
     }
     let h = out.data_mut();
@@ -353,7 +355,13 @@ fn icmp_echo(net: &NetNamespace, skb: &SkBuff) {
         tos: skb.ip_tos,
         ..Default::default()
     };
-    let _ = ipv4::ip_queue_xmit(net, out, IPPROTO_ICMP, p);
+    // Linux icmp_reply: no reply without a route
+    let Ok(rt) = route::output(net, src, out.saddr.unwrap_or_default(), 0) else {
+        return;
+    };
+    if ipv4::ip_send_rt(net, &rt, out, IPPROTO_ICMP, p).is_err() {
+        net.mib.out_discard();
+    }
 }
 
 /// An ICMP error as seen by the transport error handlers (Linux
@@ -596,6 +604,7 @@ fn xmit(
     let Some(mut skb) = SkBuff::alloc_tx(ICMP_HLEN + data.len(), Gfp::ATOMIC) else {
         // Linux icmp_push_reply: ip_append_data failed
         net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
+        net.mib.out_discard();
         return;
     };
     if skb.put_slice(&[ty, code, 0, 0]).is_none()
@@ -603,6 +612,7 @@ fn xmit(
         || skb.put_slice(data).is_none()
     {
         net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
+        net.mib.out_discard();
         return;
     }
     let c = ip_checksum(skb.data());
@@ -614,7 +624,10 @@ fn xmit(
         pmtudisc: pmtu::DONT,
         ..Default::default()
     };
-    let _ = ipv4::ip_send_rt(net, rt, skb, IPPROTO_ICMP, p);
+    if ipv4::ip_send_rt(net, rt, skb, IPPROTO_ICMP, p).is_err() {
+        // Linux ip_push_pending_frames -> ip_send_skb
+        net.mib.out_discard();
+    }
 }
 
 /// UDP datagram for no socket (Linux __udp4_lib_rcv)

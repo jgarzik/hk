@@ -363,7 +363,10 @@ impl ProtoOps for PingSock {
         if let Some(e) = self.sk.take_err() {
             return Err(e);
         }
-        let mut skb = self.build(&user, a.sport)?;
+        // Linux ip_append_data's error path, then ip_send_skb's
+        let mut skb = self
+            .build(&user, a.sport)
+            .inspect_err(|_| self.sk.net.mib.out_discard())?;
         skb.saddr = Some(rt.saddr);
         skb.daddr = Some(rt.daddr);
         let mut p = self.inet.params();
@@ -375,7 +378,9 @@ impl ProtoOps for PingSock {
                 af_inet::ip_local_error(&self.sk, &self.inet, e, rt.daddr, a.dport, rt.mtu);
                 Err(e)
             }
-            r => r.map(|()| len),
+            r => r
+                .inspect_err(|_| self.sk.net.mib.out_discard())
+                .map(|()| len),
         }
     }
 

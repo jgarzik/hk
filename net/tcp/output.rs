@@ -314,6 +314,8 @@ impl TcpCb {
             self.send_new(n, fl, out)
         };
         if !sent {
+            // Linux tcp_retransmit_skb: __tcp_retransmit_skb failed
+            self.net_stat_if(rexmit, LINUX_MIB_TCPRETRANSFAIL);
             return None;
         }
         if self.snd_nxt == self.snd_max
@@ -458,6 +460,7 @@ impl TcpCb {
         let mss = self.mss as usize;
         if len > mss {
             if !self.send_rtx_at(seq, self.mss, flags::ACK, out) {
+                self.net_stat(LINUX_MIB_TCPRETRANSFAIL);
                 return;
             }
         } else {
@@ -473,6 +476,7 @@ impl TcpCb {
                 return;
             }
             let Some(clone) = clone_data(head, out.gfp) else {
+                self.net_stat(LINUX_MIB_TCPRETRANSFAIL);
                 return;
             };
             self.send_clone(clone, seq, fl, out);

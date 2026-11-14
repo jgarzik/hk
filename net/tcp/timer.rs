@@ -176,6 +176,14 @@ impl TcpCb {
             self.timed_out(out);
             return;
         }
+        if self.backoff == 0 && !handshake {
+            // Linux: the first timeout ends Reno recovery or disorder
+            if self.cong.in_recovery() {
+                self.net_stat(LINUX_MIB_TCPRENORECOVERYFAIL);
+            } else if self.cong.dupacks() != 0 {
+                self.net_stat(LINUX_MIB_TCPRENOFAILURES);
+            }
+        }
         let flight = self.snd_max.wrapping_sub(self.snd_una);
         self.cong.on_rto(flight);
         self.rtt_seq = None;
