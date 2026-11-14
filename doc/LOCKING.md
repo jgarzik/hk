@@ -191,7 +191,7 @@ waits a grace period, so every tryget that saw it live has counted;
 puts that see it dead, then waits one more grace period so no put
 still touches the object. kill and wait sleep: no spinlock held, and
 the owner must not hold anything a user waits for while holding a
-reference. Not a lock to lockdep.
+reference. Not a lock to lockdep. Users: swap devices (3.2, Swap).
 
 ### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (sync/)
 
@@ -1895,6 +1895,16 @@ pub struct Zone {
   swapoff (`try_to_unuse`) clears SWP_WRITEOK, then walks `MMLIST`
   and faults the device's swap PTEs of each address space in, its
   mmap_lock held for reading.
+- `SwapInfo.users` (`PercpuRef`, 1.3.3; Linux si->users): every use
+  of a device by entry or type holds a `SwapDev` (Linux
+  get_swap_device / put_swap_device), taken under `SWAP_INFO` read
+  (tryget, refused once killed) and put anywhere, PTE lock included.
+  swapoff, its device empty, kills and waits for it under `SWAPON`
+  with nothing else held, then takes the device out of `SWAP_INFO`
+  and drops the last `Arc` itself: the release (block device close
+  under `Disk.open_mutex`, sync, page-cache invalidate; a swap file's
+  iput) sleeps, so it runs only there (`SwapInfo` drop asserts
+  might_sleep). No `SwapDev` is held while waiting on `SWAPON`.
 - `MMLIST` (`spin::Mutex` leaf, mm/mod.rs; Linux init_mm.mmlist under
   mmlist_lock): an `OwnedList` of the address spaces that may hold
   swap entries, one `Arc<Mm>` each. An mm is linked the first time it
