@@ -192,8 +192,8 @@ fn xhci_irq_handler_common() -> bool {
     true // We handled the interrupt
 }
 
-/// The controller lock (a printk under it never reaches the USB console:
-/// that path only `try_lock`s, see `usb_console_out`)
+/// The controller lock (thread context only; a printk under it only
+/// queues the USB console's output, which its write work sends later)
 fn acquire_usb_controller() -> crate::sync::spin::MutexGuard<'static, Option<XhciController>> {
     USB_CONTROLLER.lock()
 }
@@ -205,13 +205,10 @@ pub fn usb_bulk_out(slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, Usb
     controller.do_bulk_out(slot_id, endpoint, data, XHCI_TRANSFER_US)
 }
 
-/// A bulk OUT transfer for the USB serial console: a short timeout, so
-/// a stalled console device costs each printk little. The controller
-/// lock is only tried: held (by this CPU, whose printk would otherwise
-/// deadlock, or another), the output is dropped (best effort, like the
-/// transfer itself)
+/// A bulk OUT transfer for the USB serial console's write work: a short
+/// timeout, so a stalled console device holds the controller little
 pub fn usb_console_out(slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, UsbError> {
-    let mut guard = USB_CONTROLLER.try_lock().ok_or(UsbError::NoResources)?;
+    let mut guard = acquire_usb_controller();
     let controller = guard.as_mut().ok_or(UsbError::NoDevice)?;
     controller.do_bulk_out(slot_id, endpoint, data, XHCI_CONSOLE_US)
 }
@@ -225,8 +222,7 @@ pub fn usb_bulk_in(slot_id: u8, endpoint: u8, data: &mut [u8]) -> Result<usize, 
 
 /// Store the USB host controller for global access
 fn store_usb_host(controller: XhciController) {
-    // Direct lock here is safe - no USB serial console registered yet during probe
-    *USB_CONTROLLER.lock() = Some(controller);
+    *acquire_usb_controller() = Some(controller);
 }
 
 // ============================================================================

@@ -817,9 +817,6 @@ QEMU's xHCI hides all of them.
   endpoints are skipped. A control data stage is one TRB of at most a
   page: a configuration descriptor longer than 4 KiB is cut short.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
-- The USB serial console drops output while `USB_CONTROLLER` is held
-  (by any CPU): it only try-locks it; Linux queues console output in a
-  write FIFO sent asynchronously.
 
 ## USB core gaps
 

@@ -3423,6 +3423,15 @@ waits until the transmitter is empty before it returns (Linux
 serial8250_console_write, pl011_console_write), so nothing else needs
 to flush a console: the idle loop never touches one.
 
+A console whose output a thread sends (the USB serial console, 3.10)
+only queues it in its write: printk runs in any context, run-queue
+locks included, so the write cannot wake the thread. It calls
+`console_defer_kick` (sets `KICK_PENDING`, an atomic) and the
+scheduler tick (`console::tick`, no locks held) snapshots the enabled
+consoles under `CONSOLE_REGISTRY` and calls each one's `kick` with it
+released, which queues work (Linux defers printk's wakeups through
+irq_work, defer_console_output).
+
 ```rust
 pub fn console_write(data: &[u8]) {
     let snapshot = {
@@ -3953,6 +3962,10 @@ Per-TTY spin locks (termios, ctrl) - independent between TTYs
 GfxConsole.state (Mutex, if graphics console receives output)
 ```
 
+The console writes run after `CONSOLE_REGISTRY` is released, under
+`OUTPUT_LOCK` alone: the USB serial console's `PORT` (IrqSpinlock,
+3.10) is a leaf there.
+
 #### Panic-Safe Console Output
 
 During panic, the normal locking path can deadlock if the panicking CPU already
@@ -4046,14 +4059,15 @@ context. `dma_alloc_coherent` allocates frames (thread context only).
 
 | Lock | Type | Purpose |
 |------|------|---------|
-| `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access; the USB console's transfer only `try_lock`s it (busy, by this CPU's printk or another's: the output is dropped), so a printk under it never deadlocks |
+| `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access, thread context only, held across each (synchronous) transfer; a printk under it reaches the USB console's FIFO only (`PORT`), never the controller |
 | `XHCI_IRQ_STATE.*` | `AtomicU64`, `AtomicBool` | ISR state (lock-free) |
-| `PORT` (hw/usb/serial.rs) | spin `Mutex<Port>` | The USB serial console's device (slot, bulk OUT endpoint; none while no FTDI port is the console) and DMA buffer: the console write `try_lock`s it (busy: the output is dropped) and holds it across the bulk transfer, so it orders before `USB_CONTROLLER`; probe and remove take it alone (remove after `unregister_console` released `CONSOLE_REGISTRY`), and remove's clearing waits out a write in progress |
+| `PORT` (hw/usb/serial.rs; Linux usb_serial_port.lock) | `IrqSpinlock<Port>` | The USB serial console's device (slot, bulk OUT endpoint; none while no FTDI port is the console) and its write FIFO (4 KiB, Linux write_fifo). Leaf, any context: the console write (under `OUTPUT_LOCK`, interrupt handlers included) queues into the FIFO under it, dropping what does not fit (Linux kfifo_in_locked), and asks the tick to kick the console (`console_defer_kick`, 3.6); the tick's kick checks the FIFO under it and queues the write work after releasing it; the write work takes a chunk out under it (Linux kfifo_out_locked) and transfers with it released; probe and remove take it alone (remove after `unregister_console` released `CONSOLE_REGISTRY`) |
+| `WRITE_BUF` (hw/usb/serial.rs; Linux the write URB and USB_SERIAL_WRITE_BUSY) | sleeping `sync::Mutex<[u8; 256]>`, thread only | The console's transfer buffer, held by the write work (`SYSTEM_WQ`) across each chunk: -> `PORT` (taking the chunk), then -> `USB_CONTROLLER` (the transfer, `PORT` released). One write work at a time; remove takes it after clearing `PORT`'s device to wait out a transfer in progress (Linux usb_kill_urb). What the work's CPU prints in thread context during a transfer (USB trace, transfer errors) is not queued (`TX_CPU`), or each transfer would queue the next forever (Linux dev_err_console prints a console port's errors once) |
 
 DMA buffers never live on a kernel stack (stacks are not in the linear
 map, `mm::vmstack`; `DirectDmaOps` panics on one): the mass-storage
 CBW/CSW and the INQUIRY/READ CAPACITY data are heap buffers, the
-console's output goes through `PORT`'s buffer; control transfers
+console's output goes through `WRITE_BUF`; control transfers
 bounce through a coherent buffer of their own.
 
 Enumeration (descriptor reads, Evaluate Context, Configure Endpoint,
@@ -4072,7 +4086,7 @@ deleted, the root hub last; its generic driver's release, under its
 lock, deletes the interfaces, whose drivers' removes run under the
 interface's lock (usb-storage: the disk's `open_mutex` for
 del_gendisk, then `UsbMscDevice.state`; ftdi_sio: `CONSOLE_REGISTRY`,
-then `PORT`). The controller is then taken out of `USB_CONTROLLER`
+then `PORT`, then `WRITE_BUF`). The controller is then taken out of `USB_CONTROLLER`
 (drivers' transfers fail with no device from there on) and stopped
 with no lock held: slots disabled, halted, reset, the IRQ handler
 unregistered (`IrqDesc.lock`, which waits out a running handler), memory
