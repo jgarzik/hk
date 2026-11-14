@@ -20,6 +20,10 @@
 //! - PTRACE_RESUME_SIG_EIO: a resume or detach with a signal past _NSIG
 //!   is EIO (the whole word for a resume, Linux ptrace_resume; its low
 //!   32 bits for a detach, ptrace_detach) and leaves the tracee stopped
+//! - PTRACE_SINGLESTEP_TRACE: from its SIGSTOP stop, each
+//!   PTRACE_SINGLESTEP runs one instruction of a tight loop and stops
+//!   with SIGTRAP, si_code TRAP_TRACE, si_addr the next instruction
+//!   (x86-64 TF, arm64 MDSCR_EL1.SS / SPSR.SS)
 
 use crate::harness::T;
 use hk_syscall::{
@@ -43,6 +47,73 @@ pub fn run_tests() {
     test_poke_text();
     test_unknown_request();
     test_resume_sig_eio();
+    test_singlestep();
+}
+
+/// A traced child that stops itself with SIGSTOP, its kill's syscall
+/// instruction followed at once by a loop of three nops and a branch
+fn step_child() -> ! {
+    sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+    let pid = sys_getpid();
+    // SAFETY: kill(pid, SIGSTOP), then a loop that touches no memory
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall", "2:", "nop", "nop", "nop", "jmp 2b",
+            in("rax") 62, in("rdi") pid, in("rsi") SIGSTOP,
+            options(noreturn)
+        )
+    }
+    // SAFETY: kill(pid, SIGSTOP), then a loop that touches no memory
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0", "2:", "nop", "nop", "nop", "b 2b",
+            in("x8") 129, in("x0") pid, in("x1") SIGSTOP,
+            options(noreturn)
+        )
+    }
+}
+
+fn test_singlestep() {
+    const PTRACE_SINGLESTEP: i64 = 9;
+    const PTRACE_GETSIGINFO: i64 = 0x4202;
+    const SIGTRAP: i64 = 5;
+    const TRAP_TRACE: i64 = 2;
+    let mut t = T::new(b"PTRACE_SINGLESTEP_TRACE");
+    let pid = sys_fork();
+    if pid == 0 {
+        step_child();
+    }
+    t.eq(b"sigstop stop", stop_sig(pid) as i64, SIGSTOP as i64);
+    let mut addrs = [0u64; 8];
+    for a in addrs.iter_mut() {
+        if !t.eq(b"step", sys_ptrace(PTRACE_SINGLESTEP, pid, 0, 0), 0)
+            || !t.eq(b"trap stop", stop_sig(pid) as i64, SIGTRAP)
+        {
+            break;
+        }
+        // siginfo: si_signo, si_errno, si_code, pad, si_addr
+        let mut si = [0u64; 16];
+        sys_ptrace(PTRACE_GETSIGINFO, pid, 0, si.as_mut_ptr() as u64);
+        t.eq(b"si_signo", si[0] as i32 as i64, SIGTRAP);
+        t.eq(b"si_code", si[1] as i32 as i64, TRAP_TRACE);
+        *a = si[2];
+    }
+    // Each step moved within the loop (nops and the branch back)
+    let lo = addrs.iter().copied().min().unwrap_or(0);
+    let hi = addrs.iter().copied().max().unwrap_or(0);
+    t.ok(
+        b"si_addr in the loop",
+        lo != 0 && hi - lo <= 16,
+        (hi - lo) as i64,
+    );
+    let moved = addrs.windows(2).all(|w| w[0] != w[1]);
+    t.ok(b"each step moves", moved, 0);
+    sys_kill(pid, SIGKILL);
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    t.done();
 }
 
 /// Never called: the text word POKETEXT writes

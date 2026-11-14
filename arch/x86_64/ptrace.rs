@@ -197,3 +197,8 @@ pub fn enable_single_step(t: &Task) -> KernelResult<()> {
 pub fn disable_single_step(t: &Task) -> KernelResult<()> {
     with_stopped_regs(t, |tf| tf.rflags &= !RFLAGS_TF)
 }
+
+/// The last step back to user mode, interrupts off (Linux arm64
+/// ret_to_user's enable_step_tsk): nothing here, TF lives in RFLAGS
+#[inline]
+pub fn exit_to_user() {}
