@@ -7,11 +7,6 @@ Failures that also occur when the boot tester runs on real Linux
 real bug in Linux as well as hk: Linux is the reference, not
 infallible, so each one is investigated, not written off.
 
-- **NICE_ADJACENT flaky on the arm64 Linux reference**: one emulated
-  `check-linux-arm` run had two adjacent-nice spinners' CPU share off
-  (`share a:b tenths got 26`); passed on the uncached rerun. Likely
-  TCG timing noise in a ratio test; widen the tolerance if it recurs.
-
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
 Files marked `#![expect(clippy::undocumented_unsafe_blocks)]

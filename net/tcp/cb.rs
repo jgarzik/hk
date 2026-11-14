@@ -1224,11 +1224,12 @@ impl TcpCb {
         true
     }
 
-    /// The user closed the socket (Linux tcp_close): unread data or
-    /// `linger0` (SO_LINGER {1, 0}) abort with RST, else close the
-    /// sending side. The connection lives on as an orphan. A connection
-    /// still in SYN_RECEIVED (simultaneous open) is reset instead of
-    /// sending a FIN before its SYN is acknowledged.
+    /// The user closed the socket (Linux tcp_close): unread data resets
+    /// in any state, then `linger0` (SO_LINGER {1, 0}) aborts as
+    /// tcp_disconnect, else the sending side closes. The connection
+    /// lives on as an orphan. A connection still in SYN_RECEIVED
+    /// (simultaneous open) is reset instead of sending a FIN before its
+    /// SYN is acknowledged.
     pub fn close(&mut self, linger0: bool, now: u64, out: &mut Out) {
         self.orphan = true;
         self.rcv_shut = true;
@@ -1236,7 +1237,12 @@ impl TcpCb {
         match self.state {
             TcpState::Listen | TcpState::SynSent | TcpState::Closed => self.set_closed(out),
             TcpState::TimeWait => {}
-            _ if unread || linger0 || self.state == TcpState::SynReceived => self.abort(out),
+            _ if unread => {
+                self.send_reset(out);
+                self.set_closed(out);
+            }
+            _ if linger0 => self.disconnect(out),
+            TcpState::SynReceived => self.abort(out),
             _ => {
                 self.shutdown_wr(now, out);
                 if self.state == TcpState::FinWait2 {
@@ -1250,14 +1256,19 @@ impl TcpCb {
     /// tcp_disconnect / tcp_send_active_reset)
     pub fn abort(&mut self, out: &mut Out) {
         if self.need_reset() {
-            out.ctl(Seg {
-                seq: self.snd_max,
-                ack: self.rcv_nxt,
-                flags: flags::RST | flags::ACK,
-                ..Default::default()
-            });
+            self.send_reset(out);
         }
         self.set_closed(out);
+    }
+
+    /// RST to the peer (Linux tcp_send_active_reset)
+    fn send_reset(&self, out: &mut Out) {
+        out.ctl(Seg {
+            seq: self.snd_max,
+            ack: self.rcv_nxt,
+            flags: flags::RST | flags::ACK,
+            ..Default::default()
+        });
     }
 
     /// Linux tcp_disconnect's abort: CLOSED, RST to a synchronized peer
@@ -1269,12 +1280,7 @@ impl TcpCb {
             && self.snd_max != self.write_seq.wrapping_add(1);
         let reset = unsent || self.state == TcpState::SynSent || self.need_reset();
         if unsent {
-            out.ctl(Seg {
-                seq: self.snd_max,
-                ack: self.rcv_nxt,
-                flags: flags::RST | flags::ACK,
-                ..Default::default()
-            });
+            self.send_reset(out);
         }
         self.abort(out);
         if reset {

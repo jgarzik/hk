@@ -34,7 +34,8 @@
 //!   sched_rt_runtime_us, now the fair server's default reservation).
 //! - NICE_WEIGHT, NICE_ADJACENT, SCHED_IDLE_SHARE: two spinners on
 //!   one CPU share it by weight (EEVDF): nice 0 vs 5 about 3:1, nice 0
-//!   vs 1 about 5:4 (neither starves), SCHED_IDLE under a tenth.
+//!   vs 1 about 5:4 (neither starves), SCHED_IDLE under a tenth, by
+//!   the CPU time each was charged.
 //! - ASYNC_SIG_REGS: every general register (rcx/r11 on x86, x0-x30 on
 //!   arm64) holds its value across a SIGUSR1 handler that interrupts a
 //!   spin loop; on x86 the loop runs with DF set (`std`), which the
@@ -195,9 +196,8 @@ fn test_rt_place() {
     t.done();
 }
 
-/// A child pinned to `cpu` with `nice` and fair `policy` counting in
-/// `counter` forever
-fn fair_spinner(cpu: u32, nice: i32, policy: i32, counter: *mut u64) -> i64 {
+/// A child pinned to `cpu` with `nice` and fair `policy` spinning forever
+fn fair_spinner(cpu: u32, nice: i32, policy: i32) -> i64 {
     use hk_syscall::{SchedParam, sys_sched_setscheduler, sys_setpriority};
     let pid = sys_fork();
     if pid == 0 {
@@ -208,49 +208,45 @@ fn fair_spinner(cpu: u32, nice: i32, policy: i32, counter: *mut u64) -> i64 {
             sys_sched_setscheduler(0, policy, &SchedParam { sched_priority: 0 });
         }
         loop {
-            // SAFETY: the shared page the parent mapped
-            unsafe { counter.write_volatile(counter.read_volatile() + 1) };
+            core::hint::spin_loop();
         }
     }
     pid
 }
 
+/// Process `pid`'s CPU time in µs (MAKE_PROCESS_CPUCLOCK(pid,
+/// CPUCLOCK_SCHED): the runtime the scheduler charged it)
+fn cpu_us(pid: i64) -> u64 {
+    let clock = ((!(pid as i32)) << 3) | 2;
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    sys_clock_gettime(clock, &mut ts);
+    ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
+}
+
 /// Two fair spinners `a` and `b` ((nice, policy)) on one CPU for 400 ms:
-/// a's progress over b's, in tenths, within `range` (Linux EEVDF shares
-/// a CPU by weight)
+/// a's CPU time over b's, in tenths, within `range` (Linux EEVDF shares
+/// a CPU by weight). CPU time, not work done: what the scheduler
+/// shares, while work per CPU ms varies on a loaded host (an emulated
+/// CPU the host stalls charges the stall to the task it was running)
 fn test_fair_share(name: &'static [u8], a: (i32, i32), b: (i32, i32), range: (u64, u64)) {
     use crate::harness::T;
     let mut t = T::new(name);
-    let page = sys_mmap(
-        0,
-        4096,
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED | MAP_ANONYMOUS,
-        -1,
-        0,
-    );
-    if !t.ok(b"mmap", page >= 0, page) {
-        t.done();
-        return;
-    }
-    let c = page as *mut u64;
     let cpu = {
         let mut m = [0u64; 16];
         sys_sched_getaffinity(0, core::mem::size_of_val(&m), m.as_mut_ptr());
         63 - m[0].leading_zeros()
     };
-    let pa = fair_spinner(cpu, a.0, a.1, c);
-    // SAFETY: the second counter of the page
-    let pb = fair_spinner(cpu, b.0, b.1, unsafe { c.add(1) });
+    let pa = fair_spinner(cpu, a.0, a.1);
+    let pb = fair_spinner(cpu, b.0, b.1);
     sleep_ms(100);
-    // SAFETY: counters 0 and 1 of the shared page
-    let at = |i: usize| unsafe { c.add(i).read_volatile() };
-    let (a0, b0) = (at(0), at(1));
+    let (a0, b0) = (cpu_us(pa), cpu_us(pb));
     sleep_ms(400);
-    let (da, db) = (at(0) - a0, at(1) - b0);
+    let (da, db) = (cpu_us(pa) - a0, cpu_us(pb) - b0);
     reap(pa);
     reap(pb);
-    sys_munmap(page as u64, 4096);
     let tenths = da * 10 / db.max(1);
     t.ok(b"both ran", da > 0, da as i64);
     t.ok(

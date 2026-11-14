@@ -875,6 +875,26 @@ fn close_with_unread_data_resets() {
     assert_eq!(p.a_out.err, Some(KernelError::ConnectionReset));
 }
 
+/// Linux __tcp_close: unread data resets in LAST_ACK too (not a
+/// need-reset state), the FIN still unacknowledged
+#[test]
+fn close_with_unread_data_resets_in_last_ack() {
+    let mut p = Pair::new(1460);
+    p.send_a(b"unread");
+    let mut out = Out::default();
+    assert!(p.a.shutdown_wr(p.now, &mut out));
+    p.take(true, out);
+    p.run();
+    assert_eq!(p.b.state, TcpState::CloseWait);
+    let mut out = Out::default();
+    assert!(p.b.shutdown_wr(p.now, &mut out));
+    assert_eq!(p.b.state, TcpState::LastAck);
+    let mut out = Out::default();
+    p.b.close(false, p.now, &mut out);
+    assert_eq!(p.b.state, TcpState::Closed);
+    assert!(wire(&out).iter().any(|s| s.has(flags::RST)));
+}
+
 #[test]
 fn linger_zero_resets() {
     let mut p = Pair::new(1460);
