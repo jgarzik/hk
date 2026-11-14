@@ -777,17 +777,21 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     feeding input and by flush_input; Tty.flip (IrqSpinlock leaf,
     also under IrqDesc.lock in the UART handler). No tty spin lock is held
     across a signal, a sleep or a driver write; Tty.buf_lock and
-    Tty.ldata are. Tty.count (sleeping, Linux tty_lock; outermost) →
+    Tty.ldata are. Tty.files (sleeping, Linux tty_lock; outermost) →
     CTTY_LOCK, Tty.flow, Tty.buf_lock, UartPort.xmit and the
-    write_wait sleep of the last close's drain.
+    write_wait sleep of the port's last close's drain; a hangup under
+    it → CTTY_LOCK → Tty.ctrl, then the session leader's signals
+    (TASKLIST, signal locks), the hung files' fasync removal
+    (File.f_lock → FASYNC_LOCK), Tty.buf_lock → Tty.ldata,
+    UartPort.xmit, Tty.throttle.
     Tty.output_lock (sleeping Mutex, Linux n_tty_data.output_lock):
     Tty.write_lock → Tty.ldata (pending echo) → Tty.output_lock →
     UartPort.xmit; the echo's driver writes take it under Tty.ldata.
     TIOCSSERIAL (Linux uart_set_info_user: termios_rwsem write,
-    port->mutex): Tty.count → Tty.ldata → Tty.port (sleeping Mutex,
+    port->mutex): Tty.files → Tty.ldata → Tty.port (sleeping Mutex,
     Linux tty_port.mutex) → UartPort.cfg (spin leaf); TIOCGSERIAL
     Tty.port → UartPort.cfg; the last close reads closing_wait under
-    Tty.count → Tty.port (released before the drain).
+    Tty.files → Tty.port (released before the drain).
     Tty.flow (spin, thread context) → UartPort.xmit
     (TCXONC, and IXON's STOP/START from input and IXON cleared by a
     termios change, both under Tty.ldata: Tty.ldata → Tty.flow;
@@ -4207,9 +4211,9 @@ Each `Tty` struct contains:
 | `buf_lock` | `sync::Mutex<()>` (sleeping) | Feeding `flip` to N_TTY vs input flushes (Linux `tty_bufhead.lock`); outside `ldata` |
 | `read_lock` | `sync::Mutex<()>` (sleeping) | One N_TTY reader at a time, held across the whole read and its sleeps (Linux `atomic_read_lock`): a canonical line copied out in pieces goes to one reader; outermost tty lock, taken before `ldata` |
 | `write_lock` | `sync::Mutex<()>` (sleeping) | One writer at a time, held across the whole write(2) (Linux `atomic_write_lock`, tty_write_lock): another writer's bytes never land inside it; outermost on the write side, taken before the TOSTOP check (`termios`, TASKLIST → `ctrl`, SIGTTOU) and the driver writes; O_NONBLOCK try-locks (EAGAIN), else interruptible. Thread context only: printk's console write and N_TTY echo do not take it (as Linux). Not nested with `read_lock` or `buf_lock` |
-| `port` | `sync::Mutex<TtyPort>` (sleeping) | The port's close_delay and closing_wait (Linux `tty_port` under `port->mutex`), set by TIOCSSERIAL under `count` → `ldata` → `port` → `UartPort.cfg`, read by TIOCGSERIAL and by the last close (under `count`, released before its drain) |
+| `port` | `sync::Mutex<TtyPort>` (sleeping) | The port's close_delay and closing_wait (Linux `tty_port` under `port->mutex`), set by TIOCSSERIAL under `files` → `ldata` → `port` → `UartPort.cfg`, read by TIOCGSERIAL and by the port's last close (under `files`, released before its drain) |
 | `output_lock` | `sync::Mutex<()>` (sleeping) | N_TTY output against its echo (Linux `n_tty_data.output_lock`): a write checks the driver's room and writes a block, or a CR NL pair (ONLCR) whole, under it (Linux process_output_block, process_output -> do_output_char), and writes non-OPOST output under it; echo is written to the driver under it (`ldata` → `output_lock`, Linux process_echoes), so no echo lands between a room check and its write. Order: `write_lock` → `ldata` → `output_lock` → `UartPort.xmit`; never held across a sleep for room |
-| `count` | `sync::Mutex<usize>` (sleeping) | Open files (Linux `tty->count` under `tty_lock`), counted by every open of the tty, /dev/tty and /dev/console included. Held across an open's count and controlling-tty setup (→ CTTY_LOCK, Linux tty_open under tty_lock) and across a release; the last release, under it, drops TCOOFF-stopped output (`flow`, the port lock), waits on `write_wait` for output to drain (up to closing_wait, 30 s, interruptible; Linux tty_port_close_start under tty_lock), flushes input (`buf_lock` → `ldata`), shuts the port down (the port lock), clears the session (CTTY_LOCK → `ctrl`) and resets `flow`. Outermost tty lock: taken with no tty lock held, never under `read_lock` or `write_lock` |
+| `files` | `sync::Mutex<TtyFiles>` (sleeping) | Open files (Linux `tty->count` and `tty_files` under `tty_lock`: every open of the tty, /dev/tty and /dev/console included, each its `Redirect`), the port's opens (Linux `port->count`: a hangup takes the hung files' away) and TTY_HUPPED. Held across an open's listing and controlling-tty setup (→ CTTY_LOCK, Linux tty_open under tty_lock), across a release and across a hangup. The port's last open's release, under it, drops TCOOFF-stopped output (`flow`, the port lock), waits on `write_wait` for output to drain (up to closing_wait, interruptible; Linux tty_port_close_start under tty_lock), flushes input (`buf_lock` → `ldata`) and shuts the port down (the port lock); the tty's last file's clears the session (CTTY_LOCK → `ctrl`) and resets `flow`. A hangup (Linux __tty_hangup under tty_lock) marks the files hung (each `Redirect.hung`, atomic, read lock-free by the file's operations and by readers' and writers' wait conditions; `Tty.hupping` likewise), takes them off `fasync` (`fasync_helper`: File.f_lock → FASYNC_LOCK; the file's address, recorded by its fasync call, is valid while its `Redirect` is listed, since its release unlists it under `files`), takes the session (CTTY_LOCK → `ctrl`), signals the session leader and foreground group (TASKLIST, signal locks), flushes input and output and resets `ldata` and `throttle`. Outermost tty lock: taken with no tty lock held, never under `read_lock` or `write_lock` |
 | `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
 | `write_wait` | `WaitQueue` | Writers (under `write_lock`), pollers and tcdrain waiting for the driver's room or an empty queue (Linux write_wait); the driver wakes it with no lock held (`Tty::write_wakeup`) |
 | `flow` | `Mutex<Flow>` (spin, thread context) | Output flow control (Linux `tty->flow` under `flow.lock`): stopped, and stopped by TCOOFF. TCXONC stops and restarts output under it, calling the driver's stop/start (→ `UartPort.xmit`); writers are woken after it is released (Linux `__start_tty`'s tty_wakeup runs under flow.lock) |

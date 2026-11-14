@@ -37,7 +37,8 @@ pub mod termios;
 pub mod tty_dev;
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
 
@@ -53,7 +54,7 @@ use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::fasync::{
     FasyncList, POLL_IN, POLL_OUT, PidType, f_setown_pid, fasync_helper, kill_fasync,
 };
-use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::io::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::task::pid::Pid;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
@@ -167,6 +168,10 @@ pub trait TtyDriver: Send + Sync {
     /// Drop the queued bytes (Linux flush_buffer)
     fn flush_buffer(&self) {}
 
+    /// A hangup with no /dev/console file open (Linux uart_hangup):
+    /// queued output is dropped and the transmitter stops
+    fn hangup(&self) {}
+
     /// The tty's last close (Linux tty_port_shutdown): unless the port
     /// is a console (port->console), output stops and its queue is
     /// freed (uart_shutdown); either way the tty's flow control state
@@ -188,7 +193,7 @@ pub trait TtyDriver: Send + Sync {
     }
 
     /// TIOCSSERIAL (Linux tty_operations.set_serial), under the tty's
-    /// `port`; `users`: its open files
+    /// `port`; `users`: the port's opens (0: hung up, not active)
     fn set_serial(
         &self,
         port: &mut TtyPort,
@@ -218,6 +223,25 @@ impl TtyPort {
         Self {
             close_delay: (50 * 1000 / 100 / crate::task::percpu::TICK_MS) as u32,
             closing_wait: (3000 * 1000 / 100 / crate::task::percpu::TICK_MS) as u32,
+        }
+    }
+}
+
+/// A tty's open files (Linux tty->count and tty_files) and its port's
+/// opens (Linux port->count: not those a hangup took away)
+struct TtyFiles {
+    list: Vec<Arc<Redirect>>,
+    port_count: usize,
+    /// Hung up, not opened since (Linux TTY_HUPPED)
+    hupped: bool,
+}
+
+impl TtyFiles {
+    const fn new() -> Self {
+        Self {
+            list: Vec::new(),
+            port_count: 0,
+            hupped: false,
         }
     }
 }
@@ -306,9 +330,12 @@ pub struct Tty {
     /// That SIGIO is due from an interrupt handler: the flip thread
     /// sends it
     wakeup_due: AtomicBool,
-    /// Open files (Linux tty->count, under tty_lock): held across an
-    /// open and across the last close, which drains output
-    count: crate::sync::Mutex<usize>,
+    /// Open files and the port's opens (Linux tty_lock: tty->count,
+    /// tty_files, port->count): held across an open, a release (the
+    /// port's last close drains output) and a hangup
+    files: crate::sync::Mutex<TtyFiles>,
+    /// A hangup is under way: readers stop (Linux TTY_HUPPING)
+    hupping: AtomicBool,
     /// Close timing (Linux tty_port, under port->mutex)
     port: crate::sync::Mutex<TtyPort>,
 }
@@ -340,7 +367,8 @@ impl Tty {
             closing: AtomicBool::new(false),
             do_write_wakeup: AtomicBool::new(false),
             wakeup_due: AtomicBool::new(false),
-            count: crate::sync::Mutex::new(0),
+            files: crate::sync::Mutex::new(TtyFiles::new()),
+            hupping: AtomicBool::new(false),
             port: crate::sync::Mutex::new(TtyPort::new()),
         }
     }
@@ -511,10 +539,15 @@ impl Tty {
         }
     }
 
-    /// Sleep until the driver takes `n` bytes (Linux n_tty_write's
-    /// wait on write_wait): EAGAIN if `nonblock`, ERESTARTSYS on a
-    /// signal
-    pub fn wait_room(&self, n: usize, nonblock: bool) -> Result<(), KernelError> {
+    /// Sleep until the driver takes `n` bytes or `hung` (Linux
+    /// n_tty_write's wait on write_wait): EAGAIN if `nonblock`,
+    /// ERESTARTSYS on a signal
+    pub fn wait_room(
+        &self,
+        n: usize,
+        nonblock: bool,
+        hung: &dyn Fn() -> bool,
+    ) -> Result<(), KernelError> {
         if self.write_room() >= n {
             return Ok(());
         }
@@ -522,7 +555,12 @@ impl Tty {
             return Err(KernelError::WouldBlock);
         }
         self.write_wait
-            .wait_event_interruptible(|| self.write_room() >= n)
+            .wait_event_interruptible(|| self.write_room() >= n || hung())
+    }
+
+    /// A hangup is under way (Linux TTY_HUPPING)
+    pub(crate) fn hupping(&self) -> bool {
+        self.hupping.load(Ordering::Acquire)
     }
 
     // =========================================================================
@@ -599,6 +637,10 @@ impl Tty {
     /// Linux __tty_fasync: a newly armed file without an owner gets the
     /// foreground group, or the caller's process when there is none
     fn tty_fasync(&self, file: &File, fd: i32, on: bool) -> Result<(), KernelError> {
+        if let Some(r) = file.private_ref::<Redirect>() {
+            r.file
+                .store(core::ptr::from_ref(file).cast_mut(), Ordering::Release);
+        }
         if !fasync_helper(&self.fasync, file, fd, on)? || !on {
             return Ok(());
         }
@@ -645,29 +687,38 @@ impl Tty {
         }
     }
 
-    /// A file opened the tty (Linux tty_open's tty_reopen: tty->count,
-    /// under tty_lock); then it may become the controlling tty
-    fn opened(&self, file: &File, ctty: bool) {
-        let mut n = self.count.lock();
-        *n += 1;
+    /// A file opened the tty (Linux tty_open: tty_reopen's tty->count,
+    /// tty_add_file, the port's open, TTY_HUPPED cleared, under
+    /// tty_lock); then it may become the controlling tty
+    fn opened(&self, r: Arc<Redirect>, file: &File, ctty: bool) {
+        let mut f = self.files.lock();
+        f.list.push(r);
+        f.port_count += 1;
+        f.hupped = false;
         if ctty && file.get_flags() & O_NOCTTY == 0 {
             jobctrl::open_set_tty(self, file);
         }
     }
 
-    /// A file of the tty is released (Linux tty_release). The last one
-    /// closes the port (uart_close -> tty_port_close) and the tty
-    /// starts afresh, as Linux frees the tty_struct: flow control, the
+    /// A file of the tty is released (Linux tty_release). The port's
+    /// last open closes it (uart_close -> tty_port_close), unless a
+    /// hangup took this file's open away; the tty's last file makes it
+    /// start afresh, as Linux frees the tty_struct: flow control, the
     /// write wakeup, input and the controlling session go; termios
     /// stays (the driver's saved termios)
-    fn release(&self) {
-        let mut n = self.count.lock();
-        if *n > 1 {
-            *n -= 1;
+    fn release(&self, r: &Arc<Redirect>) {
+        let mut f = self.files.lock();
+        f.list.retain(|x| !Arc::ptr_eq(x, r));
+        if !r.hung.load(Ordering::Acquire) && f.port_count > 0 {
+            f.port_count -= 1;
+            if f.port_count == 0 {
+                self.close_port();
+            }
+        }
+        if !f.list.is_empty() {
             return;
         }
-        self.close_port();
-        *n = 0;
+        f.hupped = false;
         jobctrl::session_clear_tty(self);
         *self.flow.lock() = Flow {
             stopped: false,
@@ -679,9 +730,10 @@ impl Tty {
         self.closing.store(false, Ordering::Release);
     }
 
-    /// The last close (Linux tty_port_close_start, tty_port_shutdown):
-    /// output stopped by TCOOFF is dropped, the rest drains for up to
-    /// closing_wait (none: not at all; 0: as long as it takes), input is dropped, then the port shuts down unless
+    /// The port's last close (Linux tty_port_close_start,
+    /// tty_port_shutdown): output stopped by TCOOFF is dropped, the
+    /// rest drains for up to closing_wait (none: not at all; 0: as long
+    /// as it takes), input is dropped, then the port shuts down unless
     /// it is a console
     fn close_port(&self) {
         self.closing.store(true, Ordering::Release);
@@ -707,13 +759,69 @@ impl Tty {
     }
 
     /// TIOCSSERIAL (Linux tty_set_serial -> uart_set_info_user): under
-    /// the open count (Linux tty_port_users under port->mutex), ldata
+    /// the files (Linux tty_port_users under port->mutex), ldata
     /// (termios_rwsem, write) and the port mutex
     pub fn set_serial(&self, ss: &SerialStruct) -> Result<(), KernelError> {
-        let users = self.count.lock();
+        let f = self.files.lock();
         let _ld = n_tty::ldata(self);
         let mut port = self.port.lock();
-        self.driver.set_serial(&mut port, ss, *users)
+        self.driver.set_serial(&mut port, ss, f.port_count)
+    }
+
+    /// Hang the tty up (Linux __tty_hangup; `exit_session`: its session
+    /// leader is exiting, tty_vhangup_session). Its files but those of
+    /// /dev/console become hung up (Linux hung_up_tty_fops: read 0,
+    /// write EIO, poll POLLHUP, ioctl EIO) and leave the O_ASYNC list;
+    /// the session leader gets SIGHUP and SIGCONT (and with
+    /// `exit_session` the foreground group SIGHUP); input and output
+    /// are flushed and the line discipline starts afresh; the tty has
+    /// no session any more. With a /dev/console file open the port
+    /// stays open (Linux closes it once per hung file), else it is hung
+    /// up (uart_hangup) and has no opens left
+    pub fn hangup(&self, exit_session: bool) {
+        let mut f = self.files.lock();
+        // Not open (Linux: no tty_struct to hang up), or hung up and
+        // not opened since (TTY_HUPPED)
+        if f.list.is_empty() || f.hupped {
+            return;
+        }
+        self.hupping.store(true, Ordering::Release);
+        let (mut cons, mut closecount) = (false, 0);
+        for r in &f.list {
+            if r.console {
+                cons = true;
+                continue;
+            }
+            if r.hung.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            closecount += 1;
+            r.fasync_off(self);
+        }
+        let (session, pgrp) = jobctrl::hangup_take(self);
+        jobctrl::signal_session_leader(session, pgrp, exit_session);
+        // Linux tty_ldisc_hangup: the line discipline's and the
+        // driver's buffers flushed, a pending write wakeup run, readers
+        // and writers woken, the line discipline reset (reinit or kill)
+        self.flush_input();
+        self.driver.flush_buffer();
+        if self.do_write_wakeup.load(Ordering::Acquire) {
+            self.ldisc_write_wakeup();
+        }
+        self.write_wait.wake_all();
+        self.read_wait.wake_all();
+        n_tty::ldata(self).reinit();
+        *self.throttle.lock() = false;
+        self.do_write_wakeup.store(false, Ordering::Release);
+        self.wakeup_due.store(false, Ordering::Release);
+        if cons {
+            f.port_count = f.port_count.saturating_sub(closecount);
+        } else {
+            self.driver.hangup();
+            f.port_count = 0;
+        }
+        f.hupped = true;
+        self.hupping.store(false, Ordering::Release);
     }
 
     /// Bytes queued for the hardware (Linux tty_chars_in_buffer)
@@ -757,34 +865,59 @@ impl CharDevice for Tty {
         Ok(())
     }
 
-    /// A background reader gets SIGTTIN (Linux job_control)
+    /// A background reader gets SIGTTIN (Linux job_control); a hung up
+    /// file reads end of file (Linux hung_up_tty_read)
     fn read(&self, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        if tty_hung_up_p(file) {
+            return Ok(0);
+        }
         jobctrl::check_change(self, crate::signal::SIGTTIN)?;
         n_tty::read(self, file, to)
     }
 
     /// Under the write lock to the end (Linux iterate_tty_write); with
-    /// TOSTOP a background writer gets SIGTTOU (Linux n_tty_write)
+    /// TOSTOP a background writer gets SIGTTOU (Linux n_tty_write); a
+    /// hung up file EIO (Linux hung_up_tty_write)
     fn write(&self, file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        if tty_hung_up_p(file) {
+            return Err(KernelError::Io);
+        }
         let _writer = self.lock_write(file)?;
         if self.get_termios().c_lflag & TOSTOP != 0 {
             jobctrl::check_change(self, crate::signal::SIGTTOU)?;
         }
         let nonblock = file.get_flags() & crate::fs::flags::O_NONBLOCK != 0;
-        n_tty::write(self, from, nonblock)
+        n_tty::write(self, from, nonblock, &|| tty_hung_up_p(file))
     }
 
+    /// A hung up file: ENOTTY for TIOCSPGRP, else EIO (Linux
+    /// hung_up_tty_ioctl)
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        if tty_hung_up_p(file) {
+            return Err(if cmd == ioctl::TIOCSPGRP {
+                KernelError::NotTty
+            } else {
+                KernelError::Io
+            });
+        }
         ioctl::tty_ioctl(self, file, cmd, arg)
     }
 
+    /// A hung up file: ENOTTY (Linux hung_up_tty_fasync)
     fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        if tty_hung_up_p(file) {
+            return Some(Err(KernelError::NotTty));
+        }
         Some(self.tty_fasync(file, fd, on))
     }
 
     /// Writable while the driver has room and little queued (Linux
-    /// n_tty_poll)
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
+    /// n_tty_poll); a hung up file is everything (Linux
+    /// hung_up_tty_poll)
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
+        if tty_hung_up_p(file) {
+            return POLLIN | POLLOUT | POLLERR | POLLHUP | POLLRDNORM | POLLWRNORM;
+        }
         if let Some(pt) = pt {
             pt.poll_wait(&self.read_wait);
             pt.poll_wait(&self.write_wait);
@@ -829,40 +962,75 @@ pub fn all() -> &'static [&'static Tty] {
     crate::arch::serial_ttys()
 }
 
-/// The tty a /dev/tty or /dev/console file works on (its private
-/// data; Linux points such a file at the tty itself)
-struct Redirect(&'static Tty);
+/// An open file of a tty, its private data (Linux points the file at
+/// the tty, tty_file_private): listed on the tty (`TtyFiles`) from its
+/// open to its release
+struct Redirect {
+    tty: &'static Tty,
+    /// Opened through /dev/console (Linux redirected_tty_write): a
+    /// hangup leaves it be
+    console: bool,
+    /// Hung up (Linux f_op = hung_up_tty_fops): set under `Tty.files`
+    hung: AtomicBool,
+    /// The file, recorded by its first fasync call (the file is in its
+    /// final place by then), for a hangup to take it off the O_ASYNC
+    /// list; null if it never armed
+    file: AtomicPtr<File>,
+}
 
 impl Redirect {
-    /// Point `file` at `tty` (at open)
-    fn set(file: &File, tty: &'static Tty) -> Result<(), KernelError> {
-        let r = try_arc(Redirect(tty))?;
-        file.private.call_once(|| r);
-        Ok(())
-    }
-
     /// The tty `file` was pointed at
     fn tty(file: &File) -> Result<&'static Tty, KernelError> {
         file.private_ref::<Redirect>()
-            .map(|r| r.0)
+            .map(|r| r.tty)
             .ok_or(KernelError::Io)
     }
 
-    /// Open `tty` through `file`: point the file at it and count it
-    /// (Linux tty->count); `ctty`: it may become the controlling tty.
-    /// The release of a file whose open failed finds no tty to drop
-    fn open(file: &File, tty: &'static Tty, ctty: bool) -> Result<(), KernelError> {
-        Self::set(file, tty)?;
-        tty.opened(file, ctty);
+    /// Open `tty` through `file`: point the file at it and list it on
+    /// the tty (Linux tty->count, tty_add_file); `ctty`: it may become
+    /// the controlling tty; `console`: /dev/console. The release of a
+    /// file whose open failed finds no tty to drop
+    fn open(file: &File, tty: &'static Tty, ctty: bool, console: bool) -> Result<(), KernelError> {
+        let r = try_arc(Redirect {
+            tty,
+            console,
+            hung: AtomicBool::new(false),
+            file: AtomicPtr::new(core::ptr::null_mut()),
+        })?;
+        let any: Arc<dyn core::any::Any + Send + Sync> = r.clone();
+        file.private.call_once(|| any);
+        tty.opened(r, file, ctty);
         Ok(())
     }
 
     /// The release of a file opened by `open` (Linux tty_release)
     fn release(file: &File) {
-        if let Ok(t) = Self::tty(file) {
-            t.release();
+        if let Some(r) = file.private_arc::<Redirect>() {
+            r.tty.release(&r);
         }
     }
+
+    /// Take the file off `tty`'s O_ASYNC list (Linux __tty_hangup's
+    /// __tty_fasync(-1, filp, 0)), under `Tty.files`
+    fn fasync_off(&self, tty: &Tty) {
+        let p = self.file.load(Ordering::Acquire);
+        if p.is_null() {
+            return;
+        }
+        // SAFETY: `p` is this file's address, taken in its fasync call
+        // (made on the file in its final allocation); the file's
+        // release unlists this Redirect under `Tty.files`, which the
+        // caller holds with it listed, so the file is not yet released
+        // and its memory is live
+        let file = unsafe { &*p };
+        let _ = fasync_helper(&tty.fasync, file, -1, false);
+    }
+}
+
+/// The file was hung up (Linux tty_hung_up_p)
+pub(crate) fn tty_hung_up_p(file: &File) -> bool {
+    file.private_ref::<Redirect>()
+        .is_some_and(|r| r.hung.load(Ordering::Acquire))
 }
 
 /// A static tty as a registered character device
@@ -878,7 +1046,7 @@ impl CharDevice for TtyChar {
     }
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
-        Redirect::open(file, self.0, true)
+        Redirect::open(file, self.0, true, false)
     }
 
     fn release(&self, file: &File) {
@@ -1003,38 +1171,15 @@ fn tty_devnode(d: &Device) -> Option<DevNode> {
 // vhangup syscall
 // =============================================================================
 
-/// vhangup syscall - simulate hangup on controlling terminal
-///
-/// This syscall simulates a hangup on the current process's controlling terminal.
-/// It is typically used by login(1) and getty(8) to ensure a clean terminal state
-/// before a new user logs in.
-///
-/// # Returns
-/// * 0 on success
-/// * -EPERM if caller lacks CAP_SYS_TTY_CONFIG capability
-///
-/// # Linux Compatibility
-/// Linux requires CAP_SYS_TTY_CONFIG. The full implementation would:
-/// - Send SIGHUP to the foreground process group
-/// - Revoke terminal access for all processes using the terminal
-/// - Clear the session's controlling terminal association
-///
-/// For MVP, we implement the permission check and return success,
-/// as the boot_tester runs with full capabilities and doesn't rely
-/// on the terminal revocation behavior.
+/// vhangup(2): hang up the caller's controlling tty, if any (Linux
+/// tty_vhangup_self); EPERM without CAP_SYS_TTY_CONFIG
 pub fn sys_vhangup() -> crate::util::error::KernelResult<()> {
     use crate::task::{CAP_SYS_TTY_CONFIG, capable};
-
-    // Requires CAP_SYS_TTY_CONFIG capability
     if !capable(CAP_SYS_TTY_CONFIG) {
         return Err(KernelError::NotPermitted);
     }
-
-    // MVP: Return success
-    // A full implementation would:
-    // 1. Find the controlling terminal for current session
-    // 2. Send SIGHUP to foreground process group
-    // 3. Revoke terminal access for all users
-    // 4. Clear session/ctty associations
+    if let Some(tty) = jobctrl::current_tty() {
+        tty.hangup(false);
+    }
     Ok(())
 }

@@ -93,6 +93,14 @@ impl NTtyData {
     }
 
     /// Drop all input (Linux n_tty_flush_buffer)
+    /// The line discipline afresh after a hangup (Linux
+    /// tty_ldisc_reinit or tty_ldisc_kill then a reopen): input, the
+    /// edited line and queued echo gone
+    pub fn reinit(&mut self) {
+        self.reset();
+        self.echo_tail = self.echo_head;
+    }
+
     pub fn reset(&mut self) {
         self.tail = self.head;
         self.canon_head = self.head;
@@ -734,8 +742,9 @@ pub fn read(tty: &Tty, file: &File, to: &mut IovDest<'_>) -> Result<usize, Kerne
         tty.read_lock.lock_interruptible()?
     };
     // Lock-free: the condition runs with the task state set (Linux
-    // n_tty_read's input_available_p)
-    let ready = || tty.avail.ready(1);
+    // n_tty_read's input_available_p); a hangup ends the wait
+    let hung = || super::tty_hung_up_p(file) || tty.hupping();
+    let ready = || tty.avail.ready(1) || hung();
     let mut n = 0;
     loop {
         if let Some(g) = copy_out(tty, to) {
@@ -760,6 +769,11 @@ pub fn read(tty: &Tty, file: &File, to: &mut IovDest<'_>) -> Result<usize, Kerne
         }
         // What was there is out (a full kernel buffer went on)
         if n > 0 && n >= min {
+            break;
+        }
+        // Hung up, or a hangup under way (Linux n_tty_read:
+        // tty_hung_up_p, TTY_HUPPING)
+        if hung() {
             break;
         }
         if timeout == 0 {
@@ -805,7 +819,12 @@ pub fn poll_in(tty: &Tty) -> bool {
 /// error after some bytes returns their count. Stopped short with
 /// O_ASYNC files listening, it asks for their SIGIO POLL_OUT once the
 /// driver has room (Linux TTY_DO_WRITE_WAKEUP)
-pub fn write(tty: &Tty, from: &mut IovSource<'_>, nonblock: bool) -> Result<usize, KernelError> {
+pub fn write(
+    tty: &Tty,
+    from: &mut IovSource<'_>,
+    nonblock: bool,
+    hung: &dyn Fn() -> bool,
+) -> Result<usize, KernelError> {
     process_echoes(tty, &mut ldata(tty));
     let mut chunk = [0u8; 512];
     let mut done = 0;
@@ -815,7 +834,7 @@ pub fn write(tty: &Tty, from: &mut IovSource<'_>, nonblock: bool) -> Result<usiz
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
         };
-        let (n, r) = write_chunk(tty, &chunk[..c], nonblock);
+        let (n, r) = write_chunk(tty, &chunk[..c], nonblock, hung);
         done += n;
         if let Err(e) = r {
             tty.want_write_wakeup();
@@ -871,9 +890,18 @@ fn process_output_block(tty: &Tty, t: &Termios, buf: &[u8]) -> Result<usize, Ker
 /// a time, else straight to the driver, both under `output_lock` so
 /// echo never lands inside a CR NL; out of room, wait for it (a CR NL
 /// needs two). The input bytes written, and the error that stopped it
-fn write_chunk(tty: &Tty, buf: &[u8], nonblock: bool) -> (usize, Result<(), KernelError>) {
+fn write_chunk(
+    tty: &Tty,
+    buf: &[u8],
+    nonblock: bool,
+    hung: &dyn Fn() -> bool,
+) -> (usize, Result<(), KernelError>) {
     let mut b = buf;
     while !b.is_empty() {
+        // Hung up meanwhile: EIO (Linux n_tty_write's tty_hung_up_p)
+        if hung() {
+            return (buf.len() - b.len(), Err(KernelError::Io));
+        }
         let t = tty.get_termios();
         let opost = t.c_oflag & OPOST != 0;
         let r = if opost {
@@ -892,7 +920,7 @@ fn write_chunk(tty: &Tty, buf: &[u8], nonblock: bool) -> (usize, Result<(), Kern
         } else {
             1
         };
-        if let Err(e) = tty.wait_room(need, nonblock) {
+        if let Err(e) = tty.wait_room(need, nonblock, hung) {
             return (buf.len() - b.len(), Err(e));
         }
     }
@@ -988,7 +1016,7 @@ mod tests {
     fn onlcr_pair_whole() {
         let mut log = Vec::new();
         FAKE.steal.store(true, Ordering::Relaxed);
-        let mut r = write(&TTY, &mut IovSource::kernel(b"\n"), true);
+        let mut r = write(&TTY, &mut IovSource::kernel(b"\n"), true, &|| false);
         for _ in 0..2 {
             log.append(&mut FAKE.out.lock().unwrap());
             if FAKE.late.swap(false, Ordering::Relaxed) {
@@ -997,7 +1025,7 @@ mod tests {
             if r != Err(KernelError::WouldBlock) {
                 break;
             }
-            r = write(&TTY, &mut IovSource::kernel(b"\n"), true);
+            r = write(&TTY, &mut IovSource::kernel(b"\n"), true, &|| false);
         }
         assert_eq!(r, Ok(1));
         assert!(

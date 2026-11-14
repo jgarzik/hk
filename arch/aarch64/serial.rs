@@ -333,6 +333,10 @@ impl TtyDriver for Pl011 {
         self.uart.flush_buffer();
     }
 
+    /// Linux uart_hangup
+    fn hangup(&self) {
+        self.uart.hangup(self);
+    }
     /// Linux uart_tty_port_shutdown
     fn shutdown(&self, console: bool) {
         self.uart.shutdown(self, console);
@@ -507,13 +511,14 @@ impl crate::base::Bound for Pl011Port {
         self
     }
 
-    /// Linux pl011_remove, uart_remove_one_port: the tty device and
-    /// console go, the interrupt is off (no hangup of an open tty:
-    /// BUGS.md). Printk then has no console, as on Linux
+    /// Linux pl011_remove, uart_remove_one_port: the tty device goes,
+    /// the tty is hung up (tty_port_tty_vhangup), the console goes, the
+    /// interrupt is off. Printk then has no console, as on Linux
     fn remove(&self) {
         if let Some(t) = &self.tty {
             t.del();
         }
+        TTY_AMA0.hangup(false);
         crate::console::unregister_console(TTY_AMA0.name());
         let irq = self.irq.lock().take();
         if let Some(irq) = irq {

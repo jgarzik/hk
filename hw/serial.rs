@@ -410,6 +410,10 @@ impl TtyDriver for SerialTty {
         self.uart.flush_buffer();
     }
 
+    /// Linux uart_hangup
+    fn hangup(&self) {
+        self.uart.hangup(self);
+    }
     /// Linux uart_tty_port_shutdown
     fn shutdown(&self, console: bool) {
         self.uart.shutdown(self, console);
@@ -584,11 +588,14 @@ impl crate::base::Bound for Serial8250 {
     }
 
     /// Linux serial8250_remove, uart_remove_one_port per port: its tty
-    /// device and console go, its interrupt is off (no hangup of an
-    /// open tty: BUGS.md)
+    /// device goes, its tty is hung up (tty_port_tty_vhangup), its
+    /// console goes, its interrupt is off
     fn remove(&self) {
         for t in self.ttys.iter().rev() {
             t.del();
+        }
+        for tty in serial_ttys().iter().rev() {
+            tty.hangup(false);
         }
         crate::console::unregister_console(SERIAL_TTY_S0.name());
         let irq = self.irq.lock().take();

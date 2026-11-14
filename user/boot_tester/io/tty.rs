@@ -27,6 +27,16 @@
 //!   output stopped by TCOOFF drops it instead of waiting closing_wait
 //!   (Linux tty_port_close_start), and the next open finds a fresh tty:
 //!   nothing queued, output flowing
+//! - TTY_HANGUP: vhangup(2) by a session leader hangs up its
+//!   controlling tty (ttyS1 on x86, ttyAMA0 on arm64): its files read
+//!   0, write EIO, poll everything, ioctl EIO (TIOCSPGRP ENOTTY), left
+//!   the O_ASYNC list (F_SETFL O_ASYNC ENOTTY); the leader got SIGHUP
+//!   and SIGCONT and has no controlling tty; a new open works (Linux
+//!   __tty_hangup, hung_up_tty_fops)
+//! - TTY_HANGUP_EXIT: a session leader's exit hangs up its controlling
+//!   tty: a member's open file writes EIO, its foreground group got
+//!   SIGHUP and no SIGCONT (Linux disassociate_ctty(1) ->
+//!   tty_vhangup_session)
 //! - TTY_SERIAL: TIOCGSERIAL shows the UART (ttyS1 on x86, ttyAMA0 on
 //!   arm64) and its tty_port's close timing defaults (0.5 s, 30 s);
 //!   TIOCSSERIAL with CAP_SYS_ADMIN sets close_delay and closing_wait
@@ -44,6 +54,7 @@ use hk_syscall::{
     sys_vhangup, sys_wait4, sys_write,
 };
 use hk_syscall::{SigInfo, Zeroable, sys_fcntl, sys_getpid, sys_rt_sigtimedwait};
+use hk_syscall::{sys_getppid, sys_pipe};
 
 const O_NOCTTY: u32 = 0o400;
 const TCGETS: u64 = 0x5401;
@@ -93,6 +104,8 @@ pub fn run_tests() {
     test_sigio_out();
     test_last_close();
     test_serial_info();
+    test_hangup();
+    test_hangup_exit();
 }
 
 /// Bytes queued for the console's UART
@@ -509,6 +522,180 @@ fn test_serial_info() {
         .and_then(|()| check(b"slow baud", s2 == EINVAL, s2))
         .and_then(|()| check(b"unprivileged", child == 0, child))
         .and_then(|()| check(b"restore", s3 == 0 && back == orig, s3));
+    report_r(NAME, r);
+}
+
+const TIOCSPGRP: u64 = 0x5410;
+const ENOTTY: i64 = -25;
+const SIG_BLOCK: i32 = 0;
+
+/// Block SIGHUP and SIGCONT; the pending set
+fn pending_sigs() -> u64 {
+    let mut p = 0u64;
+    sys_rt_sigpending(&mut p as *mut u64 as u64, 8);
+    p
+}
+
+fn block_hup_cont() {
+    let m: u64 = 1 << (SIGHUP - 1) | 1 << (SIGCONT - 1);
+    sys_rt_sigprocmask(SIG_BLOCK, &m as *const u64 as u64, 0, 8);
+}
+
+/// The hangup test's tty, made the controlling tty of a new session
+fn open_ctty() -> i64 {
+    sys_open(serial_port_path().as_ptr(), O_RDWR | O_NONBLOCK, 0)
+}
+
+/// In a new session: vhangup of the controlling tty. 0 or the failing
+/// step
+fn hangup_child() -> i32 {
+    // Queued console output would be flushed (arm64: the console tty)
+    sys_ioctl(1, TCSBRK, 1);
+    block_hup_cont();
+    sys_setsid();
+    let fd = open_ctty();
+    let fd2 = sys_open(
+        serial_port_path().as_ptr(),
+        O_RDWR | O_NOCTTY | O_NONBLOCK,
+        0,
+    );
+    if fd < 0 || fd2 < 0 {
+        return 2;
+    }
+    let (fd, fd2) = (fd as i32, fd2 as i32);
+    let fl = sys_fcntl(fd2, F_GETFL, 0) as u64;
+    if sys_fcntl(fd2, F_SETFL, fl | O_ASYNC) != 0 {
+        return 3;
+    }
+    if sys_vhangup() != 0 {
+        return 4;
+    }
+    let mut b = [0u8; 4];
+    if sys_read(fd as u64, b.as_mut_ptr(), 4) != 0 {
+        return 5;
+    }
+    if sys_write(fd as u64, b.as_ptr(), 1) != EIO {
+        return 6;
+    }
+    let mut p = PollFd {
+        fd,
+        events: 0x145,
+        revents: 0,
+    };
+    if sys_poll(&mut p, 1, 0) != 1 || p.revents != 0x15d {
+        return 7;
+    }
+    let mut t = [0u8; 64];
+    if sys_ioctl(fd, TCGETS, t.as_mut_ptr() as u64) != EIO {
+        return 8;
+    }
+    let pg = 1i32;
+    if sys_ioctl(fd, TIOCSPGRP, &pg as *const i32 as u64) != ENOTTY {
+        return 9;
+    }
+    if sys_fcntl(fd2, F_GETFL, 0) as u64 & O_ASYNC != 0 {
+        return 10;
+    }
+    if sys_fcntl(fd2, F_SETFL, fl | O_ASYNC) != ENOTTY {
+        return 11;
+    }
+    let want = 1 << (SIGHUP - 1) | 1 << (SIGCONT - 1);
+    if pending_sigs() & want != want {
+        return 12;
+    }
+    if sys_open(b"/dev/tty\0".as_ptr(), O_RDWR, 0) != ENXIO {
+        return 13;
+    }
+    let fd3 = sys_open(
+        serial_port_path().as_ptr(),
+        O_RDWR | O_NOCTTY | O_NONBLOCK,
+        0,
+    );
+    if fd3 < 0 || sys_ioctl(fd3 as i32, TCGETS, t.as_mut_ptr() as u64) != 0 {
+        return 14;
+    }
+    0
+}
+
+fn test_hangup() {
+    let code = in_child(hangup_child);
+    report(b"TTY_HANGUP", code == 0, code);
+}
+
+/// The leader of a new session with a controlling tty forks a member
+/// that keeps the tty open, then exits; the member reports through
+/// `res`: its pid and the step that failed (0: none)
+fn hangup_exit_leader(res: i32) -> i32 {
+    sys_ioctl(1, TCSBRK, 1);
+    sys_setsid();
+    let fd = open_ctty();
+    if fd < 0 {
+        return 2;
+    }
+    let mut ready = [0i32; 2];
+    if sys_pipe(ready.as_mut_ptr()) != 0 {
+        return 3;
+    }
+    let leader = sys_getpid();
+    let pid = sys_fork();
+    if pid == 0 {
+        block_hup_cont();
+        sys_write(ready[1] as u64, b"r".as_ptr(), 1);
+        // Until the leader is gone (reparented)
+        for _ in 0..500 {
+            if sys_getppid() != leader {
+                break;
+            }
+            crate::helpers::msleep(10);
+        }
+        let step: u8 = if sys_write(fd as u64, b"x".as_ptr(), 1) != EIO {
+            1
+        } else if pending_sigs() & 1 << (SIGHUP - 1) == 0 {
+            2
+        } else if pending_sigs() & 1 << (SIGCONT - 1) != 0 {
+            3
+        } else {
+            0
+        };
+        let me = sys_getpid() as i32;
+        let mut out = [0u8; 5];
+        out[..4].copy_from_slice(&me.to_ne_bytes());
+        out[4] = step;
+        sys_write(res as u64, out.as_ptr(), 5);
+        sys_exit(0);
+    }
+    if pid < 0 {
+        return 4;
+    }
+    let mut b = [0u8; 1];
+    sys_read(ready[0] as u64, b.as_mut_ptr(), 1);
+    0
+}
+
+fn test_hangup_exit() {
+    const NAME: &[u8] = b"TTY_HANGUP_EXIT";
+    let mut res = [0i32; 2];
+    if sys_pipe(res.as_mut_ptr()) != 0 {
+        return report(NAME, false, -1);
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_close(res[0] as u64);
+        sys_exit(hangup_exit_leader(res[1]) as u64);
+    }
+    sys_close(res[1] as u64);
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    let mut out = [0u8; 5];
+    let n = sys_read(res[0] as u64, out.as_mut_ptr(), 5);
+    sys_close(res[0] as u64);
+    if n == 5 {
+        let member = i32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
+        sys_wait4(member as i64, &mut st, 0, 0);
+    }
+    let r = check(b"leader", st & 0x7f == 0, i64::from(st))
+        .and_then(|()| check(b"report", n == 5, n))
+        .and_then(|()| check(b"member", out[4] == 0, i64::from(out[4])));
     report_r(NAME, r);
 }
 

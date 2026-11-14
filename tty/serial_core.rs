@@ -424,6 +424,16 @@ impl UartPort {
         self.xmit.lock().fifo.reset();
     }
 
+    /// A hangup (Linux uart_hangup: uart_flush_buffer, uart_shutdown):
+    /// queued output and the x_char dropped, the transmitter stopped;
+    /// the tty's stopped state stays with the tty
+    pub fn hangup(&self, ops: &dyn UartOps) {
+        let mut x = self.xmit.lock();
+        self.stop_tx(ops, &mut x);
+        x.fifo.reset();
+        x.x_char = 0;
+    }
+
     /// The tty's last close (Linux tty_port_shutdown): the tty's
     /// stopped state goes with it; unless a console, the transmitter
     /// stops and the queue is freed (uart_shutdown,
