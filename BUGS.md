@@ -88,18 +88,8 @@ Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. /proc/net/raw, /proc/net/icmp, /proc/net/sockstat
-and /proc/<pid>/net do not exist (/proc/net follows the reader's
-namespace; Linux makes it a link to self/net).
-MIB counters (`net/mib.rs`): TcpExt counts the connection lifecycle,
-timeouts, aborts, listen drops, TIME_WAIT, delayed ACKs, Reno
-recovery, retransmissions, PAWS, challenge ACKs, out-of-order and
-memory drops and probes; header prediction (TCPHPHits, TCPPureAcks,
-TCPHPAcks), coalescing, zero-window advertisement, undo and
-delivered counters stay 0. Ip InDiscards/OutDiscards count
-only some of Linux's sites. Counters of features hk lacks (SACK,
-DSACK, TLP, Fast Open, syncookies, MD5/AO, forwarding, multicast
-receive) stay 0 by nature.
+IP_TRANSPARENT. /proc/net/raw and
+/proc/net/icmp do not exist.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
 NIC removal: e1000 leaves the function's bus mastering and memory

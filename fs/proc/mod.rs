@@ -29,6 +29,7 @@
 mod array;
 mod mounts;
 mod opts;
+mod proc_net;
 pub mod seq;
 
 use alloc::collections::BTreeMap;
@@ -259,6 +260,14 @@ pub enum ProcfsInodeData {
     /// /proc/<pid>/fail-nth: the task's fault-injection countdown
     /// (Linux proc_fail_nth_operations, `mm::fault_inject`)
     FailNth { pid: ProcPid },
+    /// /proc/<pid>/net: the task's network namespace (`proc_net`)
+    PidNetDirectory { pid: ProcPid },
+    /// A file of /proc/<pid>/net, bound to the namespace it was found
+    /// in (a passive reference: Linux PDE's net)
+    NetFile {
+        net: Arc<crate::net::NetNamespace>,
+        generator: proc_net::NetGen,
+    },
 }
 
 impl ProcfsInodeData {
@@ -339,6 +348,7 @@ impl ProcfsInodeData {
             | Self::NamespaceFile { pid, .. }
             | Self::PidFdDirectory { pid }
             | Self::PidTaskDirectory { pid }
+            | Self::PidNetDirectory { pid }
             | Self::PidFdinfoDirectory { pid }
             | Self::FdSymlink { pid, .. }
             | Self::FdinfoFile { pid, .. }
@@ -365,6 +375,7 @@ impl ProcfsInodeData {
                 | Self::PidNsDirectory { .. }
                 | Self::PidFdDirectory { .. }
                 | Self::PidTaskDirectory { .. }
+                | Self::PidNetDirectory { .. }
                 | Self::PidFdinfoDirectory { .. }
         )
     }
@@ -444,6 +455,7 @@ impl InodeOps for ProcfsInodeOps {
                     | ProcfsInodeData::File { .. }
                     | ProcfsInodeData::Directory { .. }
                     | ProcfsInodeData::FixedLink(_)
+                    | ProcfsInodeData::NetFile { .. }
             )
         })
         .unwrap_or(false)
@@ -525,6 +537,11 @@ impl InodeOps for ProcfsInodeOps {
     /// is gone, or of an fd no longer open, is invalid; a live one takes
     /// the task's current owner (pid_update_inode)
     fn revalidate(&self, inode: &Inode) -> bool {
+        // A /proc/<pid>/net file is looked up afresh by every walk, so
+        // it follows the task's namespace (Linux proc_net_d_revalidate)
+        if with_data(inode, |d| matches!(d, ProcfsInodeData::NetFile { .. })).unwrap_or(false) {
+            return false;
+        }
         let fd_of = |d: &ProcfsInodeData| match d {
             ProcfsInodeData::FdSymlink { fd, .. } | ProcfsInodeData::FdinfoFile { fd, .. } => {
                 Some(*fd)
@@ -595,6 +612,7 @@ fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         Fd(ProcPid),
         Task(ProcPid),
         Fdinfo(ProcPid),
+        Net(ProcPid),
     }
     let kind = with_data(dir, |d| -> Result<_, KernelError> {
         Ok(match d {
@@ -609,6 +627,7 @@ fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
             ProcfsInodeData::PidFdDirectory { pid } => Dir::Fd(pid.clone()),
             ProcfsInodeData::PidTaskDirectory { pid } => Dir::Task(pid.clone()),
             ProcfsInodeData::PidFdinfoDirectory { pid } => Dir::Fdinfo(pid.clone()),
+            ProcfsInodeData::PidNetDirectory { pid } => Dir::Net(pid.clone()),
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
@@ -618,6 +637,7 @@ fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
             | ProcfsInodeData::FdinfoFile { .. }
             | ProcfsInodeData::PidFile { .. }
             | ProcfsInodeData::FailNth { .. }
+            | ProcfsInodeData::NetFile { .. }
             | ProcfsInodeData::Sysctl { .. } => return Err(KernelError::NotDirectory),
         })
     })
@@ -678,6 +698,7 @@ fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
             )
         }
         Dir::Fdinfo(p) => lookup_pid_fdinfo_entry(dir, &p, name),
+        Dir::Net(p) => proc_net::lookup(dir, &p, name),
     }
 }
 
@@ -710,6 +731,28 @@ fn create_dir_inode(
     let inode = Inode::alloc(Inode::new(
         ino,
         InodeMode::directory(0o555),
+        0,
+        0,
+        0,
+        current_time(),
+        Arc::downgrade(&sb),
+        &PROCFS_INODE_OPS,
+    ))?;
+    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
+    Ok(inode)
+}
+
+/// A procfs file inode (root's) with `mode` and `data`
+fn create_file_inode(
+    parent: &Inode,
+    ino: u64,
+    mode: InodeMode,
+    data: ProcfsInodeData,
+) -> Result<Arc<Inode>, KernelError> {
+    let sb = parent.superblock().ok_or(KernelError::Io)?;
+    let inode = Inode::alloc(Inode::new(
+        ino,
+        mode,
         0,
         0,
         0,
@@ -786,6 +829,12 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
             dir,
             pid_ino(pid, 120),
             ProcfsInodeData::PidTaskDirectory { pid: p.clone() },
+        ),
+        // Linux tgid_base_stuff / tid_base_stuff DIR("net")
+        "net" => create_dir_inode(
+            dir,
+            pid_ino(pid, proc_net::NET_DIR_INO),
+            ProcfsInodeData::PidNetDirectory { pid: p.clone() },
         ),
         "fdinfo" => {
             // Create /proc/<pid>/fdinfo directory
@@ -1208,6 +1257,9 @@ fn mm_access(t: &TaskRef) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
 /// generated
 struct ProcOpen {
     mm: Option<Arc<crate::mm::Mm>>,
+    /// The network namespace a /proc/<pid>/net file was opened on
+    /// (Linux seq_net_private.net: an active reference)
+    net: Option<crate::net::NetRef>,
     /// Held across generation and the copy out, which may fault (Linux
     /// seq_file m->lock); under f_pos_lock for read()
     seq: crate::sync::Mutex<Option<SeqBuf>>,
@@ -1221,6 +1273,19 @@ struct SeqBuf {
 
 fn proc_open(file: &File) -> Option<Arc<ProcOpen>> {
     file.private.get()?.clone().downcast::<ProcOpen>().ok()
+}
+
+/// The namespace a /proc/<pid>/net inode is bound to
+fn net_of(inode: &Inode) -> Option<Arc<crate::net::NetNamespace>> {
+    with_data(inode, |d| match d {
+        ProcfsInodeData::NetFile { net, .. } => Some(net.clone()),
+        _ => None,
+    })?
+}
+
+/// The namespace an open /proc/<pid>/net file pinned
+fn open_net(file: &File) -> Option<crate::net::NetRef> {
+    proc_open(file)?.net.clone()
 }
 
 /// Content of a per-process file for this open file (or, with none,
@@ -1287,7 +1352,9 @@ fn proc_poll(file: &File) -> ProcPoll {
         return ProcPoll::None;
     };
     with_data(&inode, |d| match d {
-        ProcfsInodeData::File { .. } | ProcfsInodeData::Sysctl { .. } => ProcPoll::Default,
+        ProcfsInodeData::File { .. }
+        | ProcfsInodeData::NetFile { .. }
+        | ProcfsInodeData::Sysctl { .. } => ProcPoll::Default,
         ProcfsInodeData::PidFile {
             generator: PidGen::Mnt(_),
             ..
@@ -1508,6 +1575,7 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
         Fdinfo(ProcPid, i32),
         Sysctl(&'static crate::sysctl::Ctl),
         FailNth(ProcPid),
+        Net(Arc<crate::net::NetNamespace>, proc_net::NetGen),
     }
     let g = with_data(&inode, |d| -> Result<_, KernelError> {
         Ok(match d {
@@ -1518,6 +1586,7 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
             ProcfsInodeData::FdinfoFile { pid, fd } => Gen::Fdinfo(pid.clone(), *fd),
             ProcfsInodeData::Sysctl { ctl } => Gen::Sysctl(ctl),
             ProcfsInodeData::FailNth { pid } => Gen::FailNth(pid.clone()),
+            ProcfsInodeData::NetFile { net, generator } => Gen::Net(net.clone(), *generator),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
             | ProcfsInodeData::SelfLink
@@ -1527,6 +1596,7 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
             | ProcfsInodeData::PidTaskDirectory { .. }
             | ProcfsInodeData::PidNsDirectory { .. }
             | ProcfsInodeData::PidFdDirectory { .. }
+            | ProcfsInodeData::PidNetDirectory { .. }
             | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
         })
     })
@@ -1544,6 +1614,15 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
                 .fail_nth
                 .load(core::sync::atomic::Ordering::Relaxed);
             alloc::format!("{n}\n").into_bytes()
+        }
+        // The namespace the open pinned (Linux seq_file_net), else
+        // pinned for this read
+        Gen::Net(net, generator) => {
+            let n = match open_net(file) {
+                Some(n) => n,
+                None => net.maybe_get().ok_or(KernelError::NoDeviceOrAddress)?,
+            };
+            generator(&n)
         }
     })
 }
@@ -1564,7 +1643,13 @@ impl FileOps for ProcfsFileOps {
     /// and sysctl files have no mmap (ENODEV)
     fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
         let pde = file.get_inode().is_some_and(|i| {
-            with_data(&i, |d| matches!(d, ProcfsInodeData::File { .. })).unwrap_or(false)
+            with_data(&i, |d| {
+                matches!(
+                    d,
+                    ProcfsInodeData::File { .. } | ProcfsInodeData::NetFile { .. }
+                )
+            })
+            .unwrap_or(false)
         });
         Err(if pde {
             KernelError::Io
@@ -1598,10 +1683,17 @@ impl FileOps for ProcfsFileOps {
             }
             _ => None,
         };
+        // A /proc/<pid>/net file pins its namespace while it lives
+        // (Linux seq_open_net: get_proc_net, else ENXIO)
+        let net = match net_of(&inode) {
+            Some(n) => Some(n.maybe_get().ok_or(KernelError::NoDeviceOrAddress)?),
+            None => None,
+        };
         // A generated file keeps its last generation (seq_file)
         if inode.mode().is_file() && sysctl_of(&inode).is_none() && fail_nth_of(&inode).is_none() {
             let po = try_arc(ProcOpen {
                 mm,
+                net,
                 seq: crate::sync::Mutex::new(None),
             })?;
             file.private.call_once(|| po);
@@ -1691,6 +1783,7 @@ impl FileOps for ProcfsFileOps {
             Fd(ProcPid),
             Task(ProcPid),
             Fdinfo(ProcPid),
+            Net(ProcPid),
         }
         let kind = with_data(&inode, |d| -> Result<_, KernelError> {
             Ok(match d {
@@ -1700,6 +1793,7 @@ impl FileOps for ProcfsFileOps {
                 ProcfsInodeData::PidFdDirectory { pid } => Dir::Fd(pid.clone()),
                 ProcfsInodeData::PidTaskDirectory { pid } => Dir::Task(pid.clone()),
                 ProcfsInodeData::PidFdinfoDirectory { pid } => Dir::Fdinfo(pid.clone()),
+                ProcfsInodeData::PidNetDirectory { pid } => Dir::Net(pid.clone()),
                 ProcfsInodeData::File { .. }
                 | ProcfsInodeData::NamespaceFile { .. }
                 | ProcfsInodeData::FdSymlink { .. }
@@ -1709,6 +1803,7 @@ impl FileOps for ProcfsFileOps {
                 | ProcfsInodeData::FdinfoFile { .. }
                 | ProcfsInodeData::PidFile { .. }
                 | ProcfsInodeData::FailNth { .. }
+                | ProcfsInodeData::NetFile { .. }
                 | ProcfsInodeData::Sysctl { .. } => return Err(KernelError::NotDirectory),
             })
         })
@@ -1718,7 +1813,7 @@ impl FileOps for ProcfsFileOps {
         // proc_pident_readdir: ENOENT)
         let task = match &kind {
             Dir::Static(_) => None,
-            Dir::Pid(p) | Dir::Ns(p) | Dir::Fd(p) | Dir::Task(p) | Dir::Fdinfo(p) => {
+            Dir::Pid(p) | Dir::Ns(p) | Dir::Fd(p) | Dir::Task(p) | Dir::Fdinfo(p) | Dir::Net(p) => {
                 Some(p.task().ok_or(KernelError::NotFound)?)
             }
         };
@@ -1803,6 +1898,11 @@ impl FileOps for ProcfsFileOps {
                 }
             }
             Dir::Fdinfo(_) => readdir_emit_fdinfo_entries(task, ctx)?,
+            Dir::Net(_) => {
+                if let Some(t) = task {
+                    proc_net::readdir(t, ctx)?;
+                }
+            }
         }
 
         Ok(())
@@ -1876,6 +1976,14 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), Ke
         ino: pid_ino(pid, 120),
         file_type: FileType::Directory,
         name: Vec::from(&b"task"[..]),
+    }) {
+        return Ok(());
+    }
+
+    if !ctx.emit(DirEntry {
+        ino: pid_ino(pid, proc_net::NET_DIR_INO),
+        file_type: FileType::Directory,
+        name: Vec::from(&b"net"[..]),
     }) {
         return Ok(());
     }
@@ -2374,22 +2482,13 @@ fn procfs_mount(
     root.file(&sb, "meminfo", ro, file(gen_meminfo))?;
     root.file(&sb, "loadavg", ro, file(crate::task::loadavg::proc_loadavg))?;
 
-    // /proc/net: contents follow the reader's network namespace
-    let net = root.dir(&sb, "net")?;
-    let net_files: [(&str, ContentGenerator); 9] = [
-        ("dev", crate::net::proc::proc_net_dev),
-        ("netstat", crate::net::proc::proc_net_netstat),
-        ("snmp", crate::net::proc::proc_net_snmp),
-        ("route", crate::net::proc::proc_net_route),
-        ("arp", crate::net::arp::proc_net_arp),
-        ("udp", crate::net::udp::proc_net_udp),
-        ("tcp", crate::net::tcp::info::proc_net_tcp),
-        ("unix", crate::net::unix::proc_net_unix),
-        ("packet", crate::net::packet::proc_net_packet),
-    ];
-    for (name, g) in net_files {
-        net.file(&sb, name, ro, file(g))?;
-    }
+    // /proc/net -> self/net (Linux proc_net_init: proc_symlink)
+    root.file(
+        &sb,
+        "net",
+        InodeMode::symlink(),
+        ProcfsInodeData::FixedLink(b"self/net"),
+    )?;
 
     root.file(
         &sb,

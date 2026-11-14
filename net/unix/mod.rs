@@ -1128,9 +1128,8 @@ fn proc_line(m: &mut SeqBuf, s: &UnixSock, refs: usize) {
     let _ = m.write_char('\n');
 }
 
-/// `/proc/net/unix` of the reader's namespace
-pub fn proc_net_unix() -> Vec<u8> {
-    let net = crate::net::current_net_ns();
+/// `/proc/net/unix` of `net`
+pub fn proc_net_unix(net: &crate::net::NetNamespace) -> Vec<u8> {
     crate::fs::proc::seq::generate(|m| {
         let _ = m.write_str("Num       RefCount Protocol Flags    Type St Inode Path\n");
         net.unix.show(m);

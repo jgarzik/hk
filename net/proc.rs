@@ -1,4 +1,5 @@
-//! /proc/net files (generated per reader's network namespace)
+//! /proc/net files, each generated for the network namespace its
+//! /proc/<pid>/net directory shows (Linux proc_net.c)
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -7,8 +8,7 @@ use core::sync::atomic::Ordering;
 /// `/proc/net/dev`: per-interface counters in Linux's format
 /// (net/core/net-procfs.c dev_seq_show), the devices walked under RCU
 /// into a fixed buffer (Linux dev_seq_start's rcu_read_lock)
-pub fn proc_net_dev() -> Vec<u8> {
-    let net = crate::net::current_net_ns();
+pub fn proc_net_dev(net: &crate::net::NetNamespace) -> Vec<u8> {
     crate::fs::proc::seq::generate(|m| {
         let _ = m.write_str(concat!(
             "Inter-|   Receive                                                |  Transmit\n",
@@ -52,9 +52,8 @@ fn dev_seq_show(m: &mut crate::fs::proc::seq::SeqBuf, dev: &crate::net::device::
 /// (net/ipv4/fib_trie.c fib_route_seq_show): addresses as the raw
 /// network-order u32 in hex, every line padded to 127 columns; the
 /// table walked under RCU into a fixed buffer
-pub fn proc_net_route() -> Vec<u8> {
+pub fn proc_net_route(net: &crate::net::NetNamespace) -> Vec<u8> {
     use crate::net::inet::fib::RT_TABLE_MAIN;
-    let net = crate::net::current_net_ns();
     crate::fs::proc::seq::generate(|m| {
         let _ = writeln!(
             m,
@@ -362,10 +361,9 @@ const SNMP4_NET_LIST: [(&str, usize); 135] = [
     ("TCPAODroppedIcmps", LINUX_MIB_TCPAODROPPEDICMPS),
 ];
 
-/// `/proc/net/snmp` of the reader's namespace (Linux snmp_seq_show; no
+/// `/proc/net/snmp` of `net` (Linux snmp_seq_show; no
 /// UdpLite rows: hk has no UDP-Lite, which Linux retired)
-pub fn proc_net_snmp() -> Vec<u8> {
-    let net = crate::net::current_net_ns();
+pub fn proc_net_snmp(net: &crate::net::NetNamespace) -> Vec<u8> {
     let mib = &net.mib;
     crate::fs::proc::seq::generate(|m| {
         ipstats_show(m, mib);
@@ -491,11 +489,10 @@ fn tcp_udp_show(m: &mut crate::fs::proc::seq::SeqBuf, mib: &NetMib) {
     let _ = m.write_char('\n');
 }
 
-/// `/proc/net/netstat` of the reader's namespace (Linux
+/// `/proc/net/netstat` of `net` (Linux
 /// netstat_seq_show; no MPTcpExt rows: hk has no MPTCP, like a kernel
 /// without CONFIG_MPTCP)
-pub fn proc_net_netstat() -> Vec<u8> {
-    let net = crate::net::current_net_ns();
+pub fn proc_net_netstat(net: &crate::net::NetNamespace) -> Vec<u8> {
     let mib = &net.mib;
     crate::fs::proc::seq::generate(|m| {
         mib_head(m, "TcpExt", SNMP4_NET_LIST.iter().map(|e| e.0));

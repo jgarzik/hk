@@ -346,11 +346,10 @@ fn tw_line(m: &mut SeqBuf, i: usize, tw: &super::timewait::TimeWait, now: u64) {
     l.put(m);
 }
 
-/// `/proc/net/tcp` of the reader's namespace: listeners, then
+/// `/proc/net/tcp` of `net`: listeners, then
 /// connections and TIME_WAIT entries, generated under RCU into a
 /// `SeqBuf` (Linux tcp4_seq_show over the hash walk)
-pub fn proc_net_tcp() -> Vec<u8> {
-    let net = crate::net::current_net_ns();
+pub fn proc_net_tcp(net: &crate::net::NetNamespace) -> Vec<u8> {
     seq::generate(|m| {
         let mut l = Line::new();
         let _ = l.write_str(

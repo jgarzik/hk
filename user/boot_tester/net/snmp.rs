@@ -13,8 +13,14 @@
 //!   AttemptFails; a datagram to a closed UDP port Udp NoPorts and the
 //!   ICMP port unreachable both ways; a received datagram InDatagrams.
 //!   Deltas are checked with >=, as Linux counts some events twice.
+//! - PROC_PID_NET: /proc/net is the link self/net; a child in a new
+//!   namespace, read by its parent through /proc/<pid>/net and
+//!   /proc/<pid>/task/<tid>/net, shows its own devices and counters
 
-use hk_syscall::{CLONE_NEWNET, sys_exit, sys_fork, sys_setsockopt, sys_unshare};
+use hk_syscall::{
+    CLONE_NEWNET, sys_exit, sys_fork, sys_pipe2, sys_read, sys_readlink, sys_setsockopt,
+    sys_unshare, sys_write,
+};
 
 use crate::harness::{T, fail_num, pass};
 use crate::helpers::{host_mode, loopback_up, msleep, println, read_file, skip};
@@ -30,6 +36,7 @@ pub fn run_tests() {
     test_snmp_format();
     test_netstat_format();
     test_snmp_netns();
+    test_proc_pid_net();
 }
 
 /// A /proc MIB file's text
@@ -493,5 +500,138 @@ fn netns_udp() {
     grew(&mut t, &b, &c, b"Udp", b"OutDatagrams", 1);
     close(r);
     close(u);
+    t.done();
+}
+
+/// `v` in decimal, in `buf`
+fn dec(buf: &mut [u8; 20], mut v: u64) -> &[u8] {
+    let mut k = buf.len();
+    loop {
+        k -= 1;
+        buf[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    &buf[k..]
+}
+
+/// `parts` joined and NUL-terminated in `buf`
+fn join<'a>(buf: &'a mut [u8; 96], parts: &[&[u8]]) -> &'a [u8] {
+    let mut n = 0;
+    for &c in parts.iter().flat_map(|p| p.iter()) {
+        buf[n] = c;
+        n += 1;
+    }
+    buf[n] = 0;
+    &buf[..=n]
+}
+
+/// The number of lines of a /proc/net/dev text (2 header lines, then
+/// one per device)
+fn dev_lines(path: &[u8]) -> i64 {
+    let mut b = [0u8; 4096];
+    let n = read_file(path, &mut b);
+    if n <= 0 {
+        return n;
+    }
+    b[..n as usize]
+        .split(|&c| c == b'\n')
+        .filter(|l| !l.is_empty())
+        .count() as i64
+}
+
+/// /proc/net is the link self/net, and /proc/<pid>/net and
+/// /proc/<pid>/task/<tid>/net show that task's namespace: a child in a
+/// new namespace, seen from its parent, has its own devices (lo only)
+/// and its own counters (exactly the datagrams it sent)
+fn test_proc_pid_net() {
+    let mut t = T::new(b"PROC_PID_NET");
+    let mut l = [0u8; 32];
+    let n = sys_readlink(b"/proc/net\0".as_ptr(), l.as_mut_ptr(), l.len() as u64);
+    t.ok(b"readlink", n == 8 && &l[..8] == b"self/net", n);
+    let mut ready = [0i32; 2];
+    let mut done = [0i32; 2];
+    if sys_pipe2(ready.as_mut_ptr(), 0) != 0 || sys_pipe2(done.as_mut_ptr(), 0) != 0 {
+        println(b"PROC_PID_NET:FAIL pipe");
+        return;
+    }
+    const SENT: i64 = 7;
+    let pid = sys_fork();
+    if pid == 0 {
+        let ok = sys_unshare(CLONE_NEWNET) == 0;
+        if ok {
+            loopback_up();
+            let u = udp();
+            bind(u, LO, 0);
+            for _ in 0..SENT {
+                send_to(u, b"x", LO, port(u), 0);
+            }
+        }
+        let b = [u8::from(ok)];
+        sys_write(ready[1] as u64, b.as_ptr(), 1);
+        let mut c = [0u8; 1];
+        sys_read(done[0] as u64, c.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    let mut b = [0u8; 1];
+    sys_read(ready[0] as u64, b.as_mut_ptr(), 1);
+    if b[0] == 0 {
+        sys_write(done[1] as u64, b.as_ptr(), 1);
+        wait_child(pid);
+        for fd in ready.into_iter().chain(done) {
+            close(fd);
+        }
+        if host_mode() {
+            skip(b"PROC_PID_NET", b"unshare(CLONE_NEWNET) not permitted");
+        } else {
+            println(b"PROC_PID_NET:FAIL unshare");
+        }
+        return;
+    }
+    let mut d = [0u8; 20];
+    let pid_s = dec(&mut d, pid as u64);
+    let mut p = [0u8; 96];
+    let child = Mib::read(join(&mut p, &[b"/proc/", pid_s, b"/net/snmp"]));
+    // The child is single-threaded: its tid is its pid
+    let thread = Mib::read(join(
+        &mut p,
+        &[b"/proc/", pid_s, b"/task/", pid_s, b"/net/snmp"],
+    ));
+    let mine = Mib::read(b"/proc/self/net/snmp\0");
+    match (child, thread, mine) {
+        (Some(c), Some(th), Some(m)) => {
+            t.eq(b"child OutDatagrams", c.val(b"Udp", b"OutDatagrams"), SENT);
+            t.eq(
+                b"thread OutDatagrams",
+                th.val(b"Udp", b"OutDatagrams"),
+                SENT,
+            );
+            t.ok(
+                b"own OutDatagrams",
+                m.val(b"Udp", b"OutDatagrams") != SENT,
+                m.val(b"Udp", b"OutDatagrams"),
+            );
+        }
+        _ => {
+            t.ok(b"read snmp", false, 0);
+        }
+    }
+    t.eq(
+        b"child dev lines",
+        dev_lines(join(&mut p, &[b"/proc/", pid_s, b"/net/dev"])),
+        3,
+    );
+    t.ok(
+        b"own dev lines",
+        dev_lines(b"/proc/self/net/dev\0") > 3,
+        dev_lines(b"/proc/self/net/dev\0"),
+    );
+    sys_write(done[1] as u64, b.as_ptr(), 1);
+    wait_child(pid);
+    for fd in ready.into_iter().chain(done) {
+        close(fd);
+    }
     t.done();
 }

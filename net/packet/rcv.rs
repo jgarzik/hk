@@ -344,9 +344,9 @@ pub fn tap(t: &Tap<'_>) {
 }
 
 /// `/proc/net/packet` (Linux packet_seq_show; socket addresses hidden)
-pub fn proc_net_packet() -> Vec<u8> {
+pub fn proc_net_packet(net: &crate::net::NetNamespace) -> Vec<u8> {
     let mut out = String::from("sk               RefCnt Type Proto  Iface R Rmem   User   Inode\n");
-    for s in crate::net::current_net_ns().packet.all() {
+    for s in net.packet.all() {
         let (num, ifindex) = s.bound();
         let _ = writeln!(
             out,
