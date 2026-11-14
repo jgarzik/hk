@@ -21,6 +21,9 @@
 //!   stop of PTRACE_ATTACH's SIGSTOP leaves the tracee group-stopped
 //!   (Linux __ptrace_unlink keeps exit_code), which its parent's
 //!   wait4(WUNTRACED) reports
+//! - JOBCTL_PTRACE_IGNORED: a signal ignored by default (SIGWINCH,
+//!   SIGCHLD) still reaches a tracee's signal-delivery stop (Linux
+//!   sig_ignored: only SIGKILL is ignored for a traced task)
 
 use crate::harness::verdict;
 use crate::helpers::sleep_ms;
@@ -53,11 +56,12 @@ pub fn run_tests() {
         r => r,
     });
     in_child(b"JOBCTL_ATTACH_EXIT", attach_exit);
+    in_child(b"JOBCTL_PTRACE_IGNORED", ptrace_ignored);
 }
 
 /// Run `f` in a child with SIGCHLD blocked; NAME:OK if it returns 0,
 /// else NAME:FAIL with its failed step
-fn in_child(name: &[u8], f: fn() -> i32) {
+pub(crate) fn in_child(name: &[u8], f: fn() -> i32) {
     let s = sys_fork();
     if s == 0 {
         let m: u64 = 1 << (SIGCHLD - 1);
@@ -188,7 +192,7 @@ fn take_chld() -> Option<(i32, i32, i64)> {
 
 /// wait4(`pid`, `flags`) within 5 s, so a stop or continue that never
 /// comes fails instead of hanging: its result (0: none yet)
-fn wait_within(pid: i64, st: &mut i32, flags: i32) -> i64 {
+pub(crate) fn wait_within(pid: i64, st: &mut i32, flags: i32) -> i64 {
     for _ in 0..500 {
         let r = sys_wait4(pid, st, flags | WNOHANG, 0);
         if r != 0 {
@@ -199,7 +203,7 @@ fn wait_within(pid: i64, st: &mut i32, flags: i32) -> i64 {
     0
 }
 
-fn kill_reap(pid: i64) {
+pub(crate) fn kill_reap(pid: i64) {
     sys_kill(pid, SIGKILL);
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
@@ -423,4 +427,39 @@ fn attach_exit() -> i32 {
     };
     kill_reap(c);
     r
+}
+
+/// A seized child stops for its tracer on SIGWINCH and SIGCHLD, both
+/// ignored by default, then runs on when continued
+fn ptrace_ignored() -> i32 {
+    const PTRACE_SEIZE: i64 = 0x4206;
+    const SIGWINCH: u32 = 28;
+    let c = sys_fork();
+    if c == 0 {
+        let none = 0u64;
+        sys_rt_sigprocmask(2, &none as *const u64 as u64, 0, 8);
+        loop {
+            sleep_ms(5);
+        }
+    }
+    let r = if sys_ptrace(PTRACE_SEIZE, c, 0, 0) != 0 {
+        1
+    } else {
+        ptrace_ignored_steps(c, &[SIGWINCH, SIGCHLD])
+    };
+    kill_reap(c);
+    r
+}
+
+fn ptrace_ignored_steps(c: i64, sigs: &[u32]) -> i32 {
+    const PTRACE_CONT: i64 = 7;
+    let mut st = 0i32;
+    for (i, &sig) in sigs.iter().enumerate() {
+        sys_kill(c, sig);
+        if wait_within(c, &mut st, 0) != c || st != ((sig as i32) << 8) | 0x7f {
+            return 2 + i as i32;
+        }
+        sys_ptrace(PTRACE_CONT, c, 0, 0);
+    }
+    0
 }

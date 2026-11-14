@@ -554,8 +554,7 @@ return trampoline stands in for the vDSO's sigtramp, shown as
 
 Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
 clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
-PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN (a seized tracee's
-JOBCTL_TRAP_NOTIFY waits for its next resume).
+PTRACE_EVENT_FORK..PTRACE_EVENT_EXIT).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 

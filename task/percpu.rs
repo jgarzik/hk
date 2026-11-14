@@ -2058,7 +2058,9 @@ pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(T
             return None;
         }
         let mut s = t.task.sig.lock();
-        if !s.traced() || s.ptrace_code == 0 {
+        // Not one its tracer listens in (Linux task_stopped_code:
+        // JOBCTL_LISTENING)
+        if !s.traced() || s.jobctl & crate::signal::jobctl::LISTENING != 0 || s.ptrace_code == 0 {
             return None;
         }
         let code = s.ptrace_code;
