@@ -190,45 +190,82 @@ fn hash_out(p: &mut DentryInner, d: &Dentry) -> Option<DentryRef> {
     Some(c)
 }
 
-/// The child `name` of `parent` (Linux d_lookup, __d_lookup), whose
-/// d_lock `_p` is held (lookups take their references under it): one
-/// walk of the bucket under an RCU read guard with no lock, comparing
-/// key, parent and name as Linux compares d_name there, the reference
-/// taken with `try_get` (lockref_get_not_dead). With `_p` held no
-/// child of `parent` enters or leaves the tree, so a match is a child
-/// in it, its name stable (`d_name`, a leaf, changes only while a
-/// dentry is out of the tree). A walk may miss when a rename moves a
-/// dentry it stands on to another bucket (only d_move and d_exchange
-/// rehash, under RENAME_LOCK): a miss with RENAME_LOCK's sequence moved
-/// walks again under the bucket lock (Linux d_lookup retries the RCU
-/// walk instead, holding no d_lock; spinning for a writer here could
-/// wait on one that waits for `_p`). A new reference.
-fn d_lookup(parent: &Dentry, _p: &DentryInner, name: &[u8]) -> Option<DentryRef> {
+/// The bucket's test for the child `name` of `parent`: key and parent
+/// address (atomics, so a dentry being rehashed reads safely)
+fn d_matcher<'a>(parent: &'a Dentry, name: &'a [u8]) -> (u64, impl Fn(&Dentry) -> bool + 'a) {
     let key = d_key(parent, name_hash_in(parent, name));
     let pa = core::ptr::from_ref(parent).addr();
-    let same = |stored: &[u8]| match parent.d_op {
+    (key, move |c: &Dentry| {
+        c.d_hkey.load(Relaxed) == key && c.d_hparent.load(Relaxed) == pa
+    })
+}
+
+/// `stored` names the child `name` of `parent` (Linux d_same_name)
+fn d_same_name(parent: &Dentry, stored: &[u8], name: &[u8]) -> bool {
+    match parent.d_op {
         Some(op) => (op.d_compare)(stored, name),
         None => stored == name,
-    };
-    let is = |c: &Dentry| {
-        c.d_hkey.load(Relaxed) == key
-            && c.d_hparent.load(Relaxed) == pa
-            && same(c.d_name.read().as_bytes())
-    };
-    let b = d_hash(key);
-    let seq = RENAME_LOCK.raw_read_begin();
-    {
-        let g = crate::sync::rcu::read_lock();
-        if let Some(c) = b.find_rcu(&g, &is)
-            && let Some(r) = DentryRef::try_get(c)
+    }
+}
+
+/// The child `name` of `parent` (Linux __d_lookup): one walk of the
+/// bucket under an RCU read guard with no lock; a candidate (key and
+/// parent address match) is checked under its own d_lock (Linux
+/// spin_lock(&dentry->d_lock)): still a child of `parent`, in the
+/// tree, the name matching (`d_name`, written only while a dentry is
+/// out of the tree), and the reference is taken there (Linux
+/// d_lockref.count++; `try_get`, which refuses a dying one), so the
+/// count checks made under a child's d_lock (`add`, `d_delete`) see
+/// every lookup's reference. May miss while a rename moves a dentry
+/// the walk stands on: `d_lookup` retries.
+fn __d_lookup(parent: &Dentry, name: &[u8]) -> Option<DentryRef> {
+    let (key, is) = d_matcher(parent, name);
+    let g = crate::sync::rcu::read_lock();
+    let mut found = None;
+    d_hash(key).find_rcu(&g, |c| {
+        if !is(c) {
+            return false;
+        }
+        let cl = c.d_lock.read();
+        if !core::ptr::eq(c.parent_ptr(), parent)
+            || cl.flags.unhashed
+            || !d_same_name(parent, c.d_name.read().as_bytes(), name)
         {
-            return Some(r);
+            return false;
+        }
+        found = DentryRef::try_get(c);
+        found.is_some()
+    });
+    found
+}
+
+/// The child `name` of `parent` (Linux d_lookup): [`__d_lookup`],
+/// repeated while a rename raced a miss (read_seqbegin / read_seqretry
+/// on RENAME_LOCK). The caller holds no d_lock: a rename takes them
+/// inside RENAME_LOCK. A new reference.
+fn d_lookup(parent: &Dentry, name: &[u8]) -> Option<DentryRef> {
+    loop {
+        let seq = RENAME_LOCK.read_begin();
+        if let Some(d) = __d_lookup(parent, name) {
+            return Some(d);
+        }
+        if !RENAME_LOCK.read_retry(seq) {
+            return None;
         }
     }
-    if !RENAME_LOCK.read_retry(seq) {
-        return None;
-    }
-    b.lock().find(is)
+}
+
+/// The child `name` of `parent`, whose d_lock `_p` is held for writing
+/// (to add or drop a child): one walk of the bucket under its lock,
+/// which every hash writer holds, so it is exact (Linux __d_add and
+/// d_alloc_parallel decide under the bucket's hlist_bl_lock). With `_p`
+/// held no child of `parent` enters or leaves the tree; the name is
+/// read under `d_name`, a leaf. A new reference.
+fn d_lookup_locked(parent: &Dentry, _p: &DentryInner, name: &[u8]) -> Option<DentryRef> {
+    let (key, is) = d_matcher(parent, name);
+    d_hash(key)
+        .lock()
+        .find(|c| is(c) && d_same_name(parent, c.d_name.read().as_bytes(), name))
 }
 
 /// Dentries alive (/proc/sys/fs/dentry-state nr_dentry)
@@ -433,14 +470,14 @@ impl Dentry {
     pub fn add(parent: &DentryRef, d: DentryRef, inode: Option<Arc<Inode>>) -> DentryRef {
         let name = d.name();
         let mut p = parent.d_lock.write();
-        if let Some(c) = d_lookup(parent, &p, &name) {
+        if let Some(c) = d_lookup_locked(parent, &p, &name) {
             let mut ci = c.d_lock.write();
             if ci.inode.is_some() {
                 drop(ci);
                 return c;
             }
             // A negative one is filled only if no one else holds it
-            // (lookups take their reference under the parent's d_lock);
+            // (lookups take their reference under its d_lock, held here);
             // a held one is replaced, so a holder never sees an inode
             // it did not look up
             if DentryRef::count(&c) == TREE_REFS + 1 {
@@ -484,22 +521,27 @@ impl Dentry {
     /// dentry_unlink_inode: fsnotify_inoderemove and iput after d_lock
     /// and i_lock are dropped); a held one leaves the tree (__d_drop),
     /// and lets go when its last holder does. Decided under this
-    /// parent's d_lock, where lookups take their references. A removed
+    /// parent's d_lock and the child's, where lookups take their references. A removed
     /// directory has nothing cached below it any more (`delete_entry`,
     /// Linux vfs_rmdir's shrink_dcache_parent).
     pub fn d_delete(&self, name: &[u8], held: usize) {
         let mut p = self.d_lock.write();
-        let Some(c) = d_lookup(self, &p, name) else {
+        let Some(c) = d_lookup_locked(self, &p, name) else {
             return;
         };
+        // Under the child's d_lock, where lookups take their references
+        // (Linux d_delete: d_lockref.count == 1 under dentry->d_lock)
+        let mut cl = c.d_lock.write();
         if DentryRef::count(&c) <= held + TREE_REFS + 1 {
-            let inode = c.d_lock.write().inode.take();
+            let inode = cl.inode.take();
+            drop(cl);
             drop(p);
             if let Some(i) = inode {
                 crate::io::inotify::d_iput(&i);
             }
         } else {
-            c.d_lock.write().flags.unhashed = true;
+            cl.flags.unhashed = true;
+            drop(cl);
             let ours = hash_out(&mut p, &c);
             drop(p);
             drop(ours);
@@ -544,8 +586,7 @@ impl Dentry {
 
     /// Look up a child dentry by name
     pub fn lookup_child(&self, name: &[u8]) -> Option<DentryRef> {
-        let p = self.d_lock.read();
-        d_lookup(self, &p, name)
+        d_lookup(self, name)
     }
 
     /// Drop the child `name` from the tree (Linux d_delete / d_drop):
@@ -553,7 +594,7 @@ impl Dentry {
     /// dentry
     pub fn remove_child(&self, name: &[u8]) -> Option<DentryRef> {
         let mut p = self.d_lock.write();
-        let c = d_lookup(self, &p, name)?;
+        let c = d_lookup_locked(self, &p, name)?;
         c.d_lock.write().flags.unhashed = true;
         let ours = hash_out(&mut p, &c);
         drop(p);
@@ -1036,6 +1077,9 @@ pub fn shrink_dcache(budget: usize) -> usize {
 /// Take `d` out of the tree under `parent`, if it is there
 fn unhook_from(d: &DentryRef, parent: &Dentry) {
     let mut p = parent.d_lock.write();
+    // A lookup on it meanwhile skips it, and retries for the rename
+    // (Linux __d_move's __d_drop under the dentry's d_lock)
+    d.d_lock.write().flags.unhashed = true;
     let ours = hash_out(&mut p, d);
     drop(p);
     drop(ours);
@@ -1346,5 +1390,22 @@ mod tests {
             r.lookup_child(b"a")
                 .is_some_and(|c| DentryRef::ptr_eq(&c, &b))
         );
+    }
+
+    /// A lookup holds no d_lock of the parent (Linux d_lookup): it runs
+    /// while the parent's is held for writing, takes its reference
+    /// under the child's, and skips an unhashed child
+    #[test]
+    fn lookup_without_parent_lock() {
+        let r = DentryRef::new(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        let w = r.d_lock.write();
+        let found = r.lookup_child(b"a").unwrap();
+        assert!(DentryRef::ptr_eq(&found, &a));
+        a.d_lock.write().flags.unhashed = true;
+        assert!(r.lookup_child(b"a").is_none());
+        a.d_lock.write().flags.unhashed = false;
+        drop(w);
+        assert_eq!(DentryRef::count(&a), TREE_REFS + 2);
     }
 }

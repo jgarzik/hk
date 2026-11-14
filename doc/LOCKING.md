@@ -2501,28 +2501,31 @@ the child's d_lock where that is held: d_drop_tree). Nothing allocates
 to add or remove a child. Order: RENAME_LOCK -> d_lock (parent, then
 child) -> bucket lock (one bucket at a time, a spin lock to the
 preempt count and lockdep, one class) -> `d_name` (leaf).
-`d_lookup` (Linux d_lookup, __d_lookup) holds the parent's d_lock
-(read: lookups take their references under it) and walks the bucket
-once under an RCU read guard with no lock, comparing key, parent
-address and name, as Linux compares d_name there, and takes its
-reference with `DentryRef::try_get` (lockref_get_not_dead) (a
+`d_lookup` (Linux d_lookup, __d_lookup; `Dentry::lookup_child`) holds
+no d_lock: it walks the bucket once under an RCU read guard with no
+lock, and checks a candidate whose key and parent address match under
+the candidate's own d_lock (read; Linux spin_lock(&dentry->d_lock)):
+still a child of the parent, not unhashed, the name matching (a
 filesystem's `DentryOps`, Linux d_hash/d_compare, hash and compare
 where names match more than their bytes: vfat, without case or
-trailing dots; no lock of their own). That is sound: dentries are
-freed a grace period after their last put and published with Release
-stores; the key and parent address are atomics, stored when the
-dentry is hashed in and changed only while it is out of its bucket;
-with the parent's d_lock held no child of it enters or leaves the
-tree, so a match is a child in the tree, its name stable (read under
-`d_name`, which only d_move/d_exchange write, with the dentry out of
-the tree). A walk standing on a dentry a rename moves to another
-bucket follows it there and may miss; only d_move/d_exchange rehash,
-under RENAME_LOCK, so a miss with RENAME_LOCK's sequence moved
-(sampled without waiting, `raw_read_begin`, Linux
-raw_seqcount_begin) walks again under the bucket lock. Linux's
-d_lookup instead repeats the RCU walk after read_seqbegin, but holds
-no d_lock: here a reader waiting out a rename could wait on one that
-waits for the parent's d_lock. A walk
+trailing dots; no lock of their own), then takes its reference there
+with `DentryRef::try_get` (Linux d_lockref.count++, refusing a dying
+one). So `Dentry::add` and `d_delete`, which decide on a child's
+count under that child's d_lock (write), see every lookup's
+reference. That is sound: dentries are freed a grace period after
+their last put and published with Release stores; the key and parent
+address are atomics; the name is read under `d_name`, which only
+d_move/d_exchange write, with the dentry unhashed (every unhook sets
+`unhashed` under the dentry's d_lock first, as Linux __d_move's
+__d_drop under it). A walk standing on a dentry a rename moves to
+another bucket follows it there and may miss; only d_move/d_exchange
+rehash, under RENAME_LOCK, so `d_lookup` repeats a miss while
+RENAME_LOCK's sequence moved (read_seqbegin / read_seqretry, as
+Linux). Adding or dropping a child (`add`, `d_delete`,
+`remove_child`) looks up under the parent's d_lock (write) with
+`d_lookup_locked`: one walk under the bucket lock, exact, since every
+hash writer holds it (Linux __d_add and d_alloc_parallel decide under
+hlist_bl_lock). A walk
 that misses during a rename (`lookup_cached`/`cached` without the
 directory lock) is fine: lookup_slow rechecks under i_rwsem.
 
