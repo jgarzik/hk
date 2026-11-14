@@ -43,12 +43,11 @@
 //! NAMESPACE_SEM and MOUNT_LOCK (submounts) and `s_mounts`, with nothing
 //! else held.
 
-use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicIsize, Ordering, fence};
+use core::sync::atomic::{Ordering, fence};
 
 use super::mount::{MOUNT_LOCK, Mount};
 
@@ -59,32 +58,7 @@ pub(super) const MNT_NS_INTERNAL: u64 = u64::MAX;
 use crate::sync::IrqSpinlock;
 use crate::task::task_work::{CallbackHead, CbAdapter, Twa, task_work_add};
 use crate::task::workqueue::{DelayedWork, SYSTEM_WQ};
-use crate::util::error::KernelError;
 use crate::util::list::List;
-
-/// One CPU's part of a mount's count (Linux struct mnt_pcp), alone on
-/// its cache line
-#[repr(align(64))]
-#[derive(Default)]
-pub(super) struct MntPcp(AtomicIsize);
-
-impl Clone for MntPcp {
-    fn clone(&self) -> Self {
-        Self(AtomicIsize::new(self.0.load(Ordering::Relaxed)))
-    }
-}
-
-/// A part per possible CPU, all zero (Linux alloc_percpu); ENOMEM
-pub(super) fn alloc_pcp() -> Result<Box<[MntPcp]>, KernelError> {
-    let n = crate::cpu::nr_cpu_ids().max(1) as usize;
-    Ok(crate::util::kmem::try_vec(n, MntPcp::default())?.into_boxed_slice())
-}
-
-/// [`alloc_pcp`] that cannot fail (a tree copy)
-pub(super) fn alloc_pcp_nofail() -> Box<[MntPcp]> {
-    let n = crate::cpu::nr_cpu_ids().max(1) as usize;
-    alloc::vec![MntPcp::default(); n].into_boxed_slice()
-}
 
 /// This CPU is set up to take an RCU read guard and queue callbacks
 /// (not in host unit tests, nor at the start of boot)
@@ -96,18 +70,13 @@ impl Mount {
     /// Add `n` to this CPU's part (Linux mnt_add_count): another CPU's
     /// part would do (they are atomics), only slower
     fn pcp_add(&self, n: isize) {
-        let i = crate::cpu::try_this_id().unwrap_or(0) as usize;
-        let p = self.mnt_pcp.get(i).unwrap_or(&self.mnt_pcp[0]);
-        p.0.fetch_add(n, Ordering::Relaxed);
+        self.mnt_pcp.add(n);
     }
 
     /// Its references, summed (Linux mnt_get_count): exact once out of
     /// its namespace, approximate while fast puts may run
     pub(super) fn mnt_get_count(&self) -> isize {
-        self.mnt_pcp
-            .iter()
-            .map(|p| p.0.load(Ordering::Relaxed))
-            .sum()
+        self.mnt_pcp.sum()
     }
 
     /// It still has a reference (Linux: not MNT_DOOMED)

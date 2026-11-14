@@ -14,15 +14,13 @@ use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::FileType;
 pub use super::mntput::MountRef;
-use super::mntput::{
-    __cleanup_mnt, MNT_NS_INTERNAL, MntOwned, MntPcp, alloc_pcp, alloc_pcp_nofail,
-};
+use super::mntput::{__cleanup_mnt, MNT_NS_INTERNAL, MntOwned};
 use super::path_ref::Path;
 use super::superblock::{FileSystemType, SuperBlock};
 use crate::task::task_work::CallbackHead;
 use crate::util::ida::Ida;
 use crate::util::kalloc::{arc_nofail, try_arc};
-use alloc::boxed::Box;
+use crate::util::percpu_alloc::PcpSlot;
 use core::sync::atomic::AtomicBool;
 
 use crate::block::get_blkdev;
@@ -199,7 +197,7 @@ pub struct Mount {
 
     /// Its references' count, per CPU ([`MountRef`], Linux mnt_pcp's
     /// mnt_count)
-    pub(super) mnt_pcp: Box<[MntPcp]>,
+    pub(super) mnt_pcp: PcpSlot,
     /// Its last reference went (Linux MNT_DOOMED): set under MOUNT_LOCK
     /// write by that put
     pub(super) doomed: AtomicBool,
@@ -220,7 +218,7 @@ impl Mount {
         flags: u32,
         devname: super::name::FileName,
     ) -> Result<MountRef, KernelError> {
-        let pcp = alloc_pcp()?;
+        let pcp = PcpSlot::new()?;
         let m = try_arc(Self::init(
             sb,
             root,
@@ -241,7 +239,7 @@ impl Mount {
         flags: u32,
         devname: super::name::FileName,
     ) -> MountRef {
-        let pcp = alloc_pcp_nofail();
+        let pcp = PcpSlot::new_nofail();
         let m = arc_nofail(Self::init(sb, root, flags, devname, pcp, MNT_IDS.alloc()));
         m.sb.add_mount(&m);
         MountRef::first(m)
@@ -253,7 +251,7 @@ impl Mount {
         root: Arc<Dentry>,
         flags: u32,
         devname: super::name::FileName,
-        mnt_pcp: Box<[MntPcp]>,
+        mnt_pcp: PcpSlot,
         mnt_id: u32,
     ) -> Self {
         Self {
