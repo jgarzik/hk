@@ -3561,28 +3561,22 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 
 4. **Never hold IrqSpinlock while acquiring Mutex** - Would violate lock ordering.
 
-5. **Queue entries are made and freed outside the locks** (Linux
-   allocates its sigqueue GFP_ATOMIC under siglock; hk allocates under
-   no spin lock): a sender allocates its `SigQueue` and charges the
-   receiver's user (an atomic on its `Ucounts`, whose reference the
-   entry keeps, 3.1.1) before taking `Task.sig`, the locked
-   section only links it in, and an unused one is dropped after the
-   lock is released. A dequeue unlinks its entry under the lock and the
-   caller frees it (`Dequeued::info`) after; an exiting task's sets are
-   swapped out under TASKLIST and `Task.sig` and freed after both, and
-   an exiting task (PF_EXITING, read under `Task.sig`) gets no entries,
-   so none outlives that flush. Senders run in thread context with no
-   spin lock held (mqueue drops its notify lock before sending). A
-   send first decides under `Task.sig` (then `SignalStruct.shared` and
-   `SigHand.action`, the usual order) whether the signal is dropped
-   (ignored, or non-RT and already pending: Linux prepare_signal,
-   legacy_queue) and makes no entry then; the locked section decides
-   again. The charge comes before the lock, not under it as in Linux,
-   so while an entry that turns out unused (the state changed between
-   the two decisions) is alive its user's count is one high: a racing
-   send for the same user at its RLIMIT_SIGPENDING can see EAGAIN. The
-   entry carries its charge from its allocation, which needs no lock;
-   the window is one locked section and matters only at the limit.
+5. **Queue entries are made under `Task.sig`, GFP_ATOMIC, and freed
+   outside it** (Linux __send_signal_locked's __sigqueue_alloc): once
+   the locked section has decided the signal is queued (not ignored,
+   not a non-RT one already pending: Linux prepare_signal,
+   legacy_queue), it makes the `SigQueue` with `with_gfp(ATOMIC)` and
+   charges the receiver's user (an atomic on its `Ucounts`, whose
+   reference the entry keeps, 3.1.1), as Linux under siglock; a failed
+   one leaves a non-RT signal pending without info and refuses an RT
+   one (EAGAIN). TASKLIST may be held around it (a child's notice,
+   Linux do_notify_parent under tasklist_lock). A dequeue unlinks its
+   entry under the lock and the caller frees it (`Dequeued::info`)
+   after; an exiting task's sets are swapped out under TASKLIST and
+   `Task.sig` and freed after both, and an exiting task (PF_EXITING,
+   read under `Task.sig`) gets no entries, so none outlives that flush.
+   Senders run in thread context with no spin lock held (mqueue drops
+   its notify lock before sending).
 
 6. **A group signal's thread is chosen under TASKLIST, not siglock**
    (Linux complete_signal under siglock): after the signal is queued

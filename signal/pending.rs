@@ -1,11 +1,11 @@
 //! Pending signals and their queued info (Linux struct sigpending and
 //! struct sigqueue, kernel/signal.c)
 //!
-//! Neither allocation nor free happens under `Task.sig` or the shared
-//! pending lock: a sender builds its entry first ([`SigQueue::alloc`]),
-//! hands it to [`SigPending::queue`] under the lock and drops an unused
-//! one after unlocking; a dequeue returns its entry inside a
-//! [`Dequeued`], which the caller drops (`Dequeued::info`) after
+//! A sender makes its entry under the receiver's `Task.sig` with
+//! GFP_ATOMIC once the signal is known to be queued (Linux
+//! __send_signal_locked: __sigqueue_alloc(.., GFP_ATOMIC, ..)) and
+//! hands it to [`SigPending::queue`]; a dequeue returns its entry inside
+//! a [`Dequeued`], which the caller drops (`Dequeued::info`) after
 //! unlocking, and a flushed set is dropped the same way.
 //!
 //! A POSIX timer's entry is made with the timer (Linux
@@ -75,12 +75,6 @@ impl SigQueue {
         let mut q = Self::alloc(sig, info, &ucounts, limit, false)?;
         q.timer = Some(timer);
         Some(q)
-    }
-
-    /// Fill in its info (an entry made before the info was known), for
-    /// its signal
-    pub fn set_info(&mut self, info: SigInfo) {
-        self.info = info.with_sig(self.sig);
     }
 
     /// Its signal

@@ -1347,36 +1347,24 @@ fn send_task(t: &Task, sig: Signal, info: SendInfo, ty: PidType, force: bool) ->
     let init = tg.protects(sig, info.forces(t.pid_ns()));
 
     let sighand = tg.sighand.as_ref();
+    // Its entry is made under the receiver's lock, GFP_ATOMIC, once the
+    // signal is known to be queued (Linux __send_signal_locked); SIGKILL
+    // needs none
+    let entry = (sig != SIGKILL).then(|| EntryOf {
+        info: info.resolve_checked(sig, t.pid_ns()),
+        ucounts: &tg.ucounts,
+        limit: tg.limit,
+        override_rlimit: info.override_rlimit(sig),
+    });
     let to = Send {
         sig,
         init,
         info: &info,
         ty,
         stopped: tg.stopped,
+        entry,
     };
-    // A signal that would be dropped makes and charges no entry (Linux
-    // prepare_signal and legacy_queue come before __sigqueue_alloc);
-    // send_locked decides again under the lock
-    if sig != SIGKILL && drops(t, &t.sig.lock(), sighand, &to) {
-        return Ok(());
-    }
-
-    // The info's entry, made before the receiver's lock is taken; SIGKILL
-    // needs none (Linux __send_signal_locked). Unused, it is freed after
-    // the lock is dropped.
-    let mut q = if sig == SIGKILL {
-        None
-    } else {
-        SigQueue::alloc(
-            sig,
-            info.resolve_checked(sig, t.pid_ns()),
-            &tg.ucounts,
-            tg.limit,
-            info.override_rlimit(sig),
-        )
-    };
-    let sent = with_sig(t, |t, state| send_locked(t, state, sighand, &to, &mut q));
-    drop(q);
+    let sent = with_sig(t, |t, state| send_locked(t, state, sighand, &to));
 
     let wants = match sent {
         Sent::Dropped => return Ok(()),
@@ -1406,29 +1394,33 @@ fn send_held(
     sig: Signal,
     info: SendInfo,
     ty: PidType,
-    q: &mut Option<Box<SigQueue>>,
 ) -> Option<Posted> {
     check_send_context();
     let tg = target_in(table, t)?;
     if tg.kthread || tg.group_exit {
         return None;
     }
+    // Numbered in the receiver's namespace by the sender already (Linux
+    // do_notify_parent: __send_signal_locked, no check); its entry made
+    // under the receiver's lock, GFP_ATOMIC, as TASKLIST is held
+    let entry = (sig != SIGKILL).then(|| EntryOf {
+        info: info.resolve(sig, t.pid_ns()),
+        ucounts: &tg.ucounts,
+        limit: tg.limit,
+        override_rlimit: info.override_rlimit(sig),
+    });
     let to = Send {
         sig,
         init: tg.protects(sig, info.forces(t.pid_ns())),
         info: &info,
         ty,
         stopped: tg.stopped,
+        entry,
     };
-    if let Some(e) = q.as_mut() {
-        // Numbered in the receiver's namespace by the sender already
-        // (Linux do_notify_parent: __send_signal_locked, no check)
-        e.set_info(info.resolve(sig, t.pid_ns()));
-    }
     // A send changes no blocked mask: with_sig retargets nothing (which
     // would take TASKLIST)
     let sighand = tg.sighand.as_ref();
-    let sent = with_sig(t, |t, state| send_locked(t, state, sighand, &to, q));
+    let sent = with_sig(t, |t, state| send_locked(t, state, sighand, &to));
     let Sent::Queued(wants) = sent else {
         return None;
     };
@@ -1450,7 +1442,7 @@ fn send_held(
 /// under tasklist_lock); SIGKILL needs no queue entry, so nothing
 /// allocates. Its wakeups wait for [`Posted::finish`].
 pub fn sigkill_held(table: &crate::task::percpu::GlobalTaskTable, t: &TaskRef) -> Option<Posted> {
-    send_held(table, t, SIGKILL, SendInfo::Kernel, PidType::Pid, &mut None)
+    send_held(table, t, SIGKILL, SendInfo::Kernel, PidType::Pid)
 }
 
 /// A signal [`send_held`] queued, whose wakeups wait for TASKLIST to be
@@ -1484,6 +1476,36 @@ struct Send<'a> {
     ty: PidType,
     /// The receiver is in a ptrace stop
     stopped: bool,
+    /// What its queue entry is made of, if it gets one (SIGKILL needs
+    /// none)
+    entry: Option<EntryOf<'a>>,
+}
+
+/// A queue entry's makings (Linux __sigqueue_alloc's arguments): the
+/// info as the receiver's namespace numbers it, and the receiver's user
+/// it is charged to within RLIMIT_SIGPENDING
+struct EntryOf<'a> {
+    info: SigInfo,
+    ucounts: &'a crate::task::UcountsRef,
+    limit: u64,
+    override_rlimit: bool,
+}
+
+impl EntryOf<'_> {
+    /// The entry, made under the receiver's Task.sig with GFP_ATOMIC
+    /// (Linux __send_signal_locked: __sigqueue_alloc(.., GFP_ATOMIC, ..));
+    /// None past the limit or without memory
+    fn make(&self, sig: Signal) -> Option<Box<SigQueue>> {
+        crate::util::kalloc::with_gfp(crate::mm::page_alloc::Gfp::ATOMIC, || {
+            SigQueue::alloc(
+                sig,
+                self.info,
+                self.ucounts,
+                self.limit,
+                self.override_rlimit,
+            )
+        })
+    }
 }
 
 /// Queue `to.sig` for task `t` under its Task.sig (Linux
@@ -1499,7 +1521,6 @@ fn send_locked(
     state: &mut TaskSignalState,
     sighand: Option<&Arc<SigHand>>,
     to: &Send<'_>,
-    q: &mut Option<Box<SigQueue>>,
 ) -> Sent {
     let sig = to.sig;
     if drops(t, state, sighand, to) {
@@ -1526,7 +1547,7 @@ fn send_locked(
             None => return Sent::Dropped,
         },
     };
-    match q.take() {
+    match to.entry.as_ref().and_then(|e| e.make(sig)) {
         Some(e) => pending.queue(e),
         None if to.info.must_queue(sig) => return Sent::Overflow,
         None => {}
