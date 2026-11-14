@@ -105,14 +105,11 @@ pub struct UtsNamespace {
     /// exclusive writes (sethostname/setdomainname).
     pub name: RwLock<NewUtsname>,
 
-    /// User namespace that owns this (for capability checks)
-    ///
-    /// None = init user namespace (root always has CAP_SYS_ADMIN)
-    /// Future: proper user namespace with capability checking
-    user_ns: Option<Arc<super::UserNamespace>>,
+    /// The user namespace that owns it (Linux uts_namespace.user_ns)
+    pub user_ns: Arc<super::UserNamespace>,
 
-    /// Its inode number (Linux ns.inum)
-    pub inum: super::inum::Inum,
+    /// Its inode number and nsfs dentry (Linux ns)
+    pub ns: super::NsCommon,
 }
 
 impl UtsNamespace {
@@ -132,8 +129,8 @@ impl UtsNamespace {
 
         Self {
             name: RwLock::new(name),
-            user_ns: None,
-            inum: super::inum::Inum::fixed(super::inum::UTS_INIT),
+            user_ns: super::INIT_USER_NS.clone(),
+            ns: super::NsCommon::new(super::inum::Inum::fixed(super::inum::UTS_INIT)),
         }
     }
 
@@ -142,15 +139,15 @@ impl UtsNamespace {
     /// Creates a new UTS namespace with a copy of the current
     /// name values. Changes in the new namespace won't affect
     /// the original (and vice versa).
-    pub fn clone_ns(&self) -> Result<Arc<Self>, KernelError> {
+    pub fn clone_ns(&self, user_ns: &Arc<super::UserNamespace>) -> Result<Arc<Self>, KernelError> {
         // Copy current name values
         let name_copy = *self.name.read();
 
         let inum = super::inum::Inum::alloc()?;
         try_arc(Self {
             name: RwLock::new(name_copy),
-            user_ns: self.user_ns.clone(),
-            inum,
+            user_ns: user_ns.clone(),
+            ns: super::NsCommon::new(inum),
         })
     }
 }

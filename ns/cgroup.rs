@@ -29,14 +29,13 @@ pub struct CgroupNamespace {
     /// Root cgroup for this namespace
     /// Processes in this namespace see this cgroup as "/"
     root: Arc<Cgroup>,
+    /// Its inode number and nsfs dentry (Linux ns)
+    pub ns: super::NsCommon,
+    /// The user namespace that owns it (Linux cgroup_namespace.user_ns)
+    pub user_ns: Arc<super::UserNamespace>,
 }
 
 impl CgroupNamespace {
-    /// Create a new cgroup namespace rooted at the given cgroup, or ENOMEM
-    pub fn new(root: Arc<Cgroup>) -> Result<Arc<Self>, KernelError> {
-        try_arc(Self { root })
-    }
-
     /// Create the initial cgroup namespace (rooted at the real root cgroup)
     fn new_init() -> Arc<Self> {
         // The initial namespace uses the real root cgroup
@@ -46,6 +45,8 @@ impl CgroupNamespace {
             root: CGROUP_ROOT
                 .root_cgroup()
                 .unwrap_or_else(create_placeholder_root),
+            ns: super::NsCommon::new(super::inum::Inum::fixed(super::inum::CGROUP_INIT)),
+            user_ns: super::INIT_USER_NS.clone(),
         })
     }
 
@@ -56,10 +57,20 @@ impl CgroupNamespace {
 
     /// Clone this namespace (for CLONE_NEWCGROUP)
     ///
-    /// Creates a new cgroup namespace rooted at the given cgroup.
-    /// Typically called with the current task's cgroup.
-    pub fn clone_ns(&self, new_root: Arc<Cgroup>) -> Result<Arc<Self>, KernelError> {
-        Self::new(new_root)
+    /// Creates a new cgroup namespace rooted at the given cgroup, owned
+    /// by `user_ns`, or ENOMEM (Linux copy_cgroup_ns). Typically called
+    /// with the current task's cgroup.
+    pub fn clone_ns(
+        &self,
+        new_root: Arc<Cgroup>,
+        user_ns: &Arc<super::UserNamespace>,
+    ) -> Result<Arc<Self>, KernelError> {
+        let ns = super::NsCommon::new(super::inum::Inum::alloc()?);
+        try_arc(Self {
+            root: new_root,
+            ns,
+            user_ns: user_ns.clone(),
+        })
     }
 
     /// The path of `cgroup` seen from this namespace (Linux

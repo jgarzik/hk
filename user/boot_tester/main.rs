@@ -16,6 +16,7 @@ pub mod io;
 pub mod ipc;
 pub mod mm;
 pub mod net;
+pub mod ns;
 pub mod proc;
 pub mod process;
 pub mod signal;
@@ -320,6 +321,7 @@ pub fn run_all_tests() {
     process::rlimit::run_tests();
     isolated(b"NR_OPEN", io::nr_open::run_tests);
     process::namespace::run_tests();
+    ns::run_tests();
     process::pidns::run_tests();
     net::sockets::run_tests();
     net::sockcore::run_tests();

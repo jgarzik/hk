@@ -357,11 +357,18 @@ fn new_mount(
     } else {
         (fs_type.mount)(fs_type, data)
     };
+    // Linux do_new_mount_fc: "Mount too revealing"
+    let mut revealing = false;
     let r = sb.and_then(|sb| {
         // A superblock already mounted elsewhere (sysfs of a namespace)
         // keeps its flags (Linux: only a new one gets the mount's)
         if !sb.is_mounted() {
             sb.set_sync_flags(sb_sync_flags(flags));
+        }
+        let mut mnt_flags = mnt_flags(flags);
+        if super::mount::mount_too_revealing(&sb, &mut mnt_flags) {
+            revealing = true;
+            return Err(KernelError::NotPermitted);
         }
         // Linux: no source is "none"
         let devname = if source.is_empty() {
@@ -372,13 +379,14 @@ fn new_mount(
         super::mount::attach(
             sb,
             Some(mp),
-            mnt_flags(flags),
+            mnt_flags,
             flags & ms::RDONLY != 0,
             devname.into(),
         )
     });
     match r {
         Ok(_) => Ok(()),
+        Err(e) if revealing => Err(e),
         Err(
             e @ (KernelError::NotBlockDevice
             | KernelError::NoDevice

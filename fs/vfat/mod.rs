@@ -750,6 +750,7 @@ fn vfat_cmpi(stored: &[u8], name: &[u8]) -> bool {
 static VFAT_CI_DENTRY_OPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
     d_hash: vfat_hashi,
     d_compare: vfat_cmpi,
+    d_prune: None,
 };
 
 /// A name for a new entry (Linux vfat_create_shortname /

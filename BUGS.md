@@ -361,8 +361,6 @@ Safe today only because a user namespace grants no capabilities. First:
   `capable`, where Linux keeps it); sockopt_ns_capable sites take the
   socket netns's user_ns, but SO_DEBUG and SO_SNDBUFFORCE/RCVBUFFORCE
   stay init-namespace (Linux sockopt_capable).
-- a new proc or sysfs mount in a namespace of another user namespace
-  needs a fully visible one there (mount_too_revealing).
 - netlink newlink/setlink check CAP_NET_ADMIN in the target netns too
   once IFLA_NET_NS_PID/FD are implemented (`7b735ef81286`).
 - creating a namespace together with CLONE_NEWUSER checks capabilities
@@ -1025,16 +1023,14 @@ size and depth match it, else ENOMEM; Linux simpledrm allocates any
 dumb buffer from shmem and blits it on page flip
 (drm_gem_shmem_dumb_create).
 
-## Namespace files are not nsfs
+## Namespace file gaps
 
-**Location**: `fs/proc/mod.rs` (`ns_file`), `ns/mod.rs` (`sys_setns`)
+**Location**: `fs/pseudo/nsfs.rs`, `ns/setns.rs`
 
-/proc/<pid>/ns/<type> leads to an inode on the nsfs mount numbered as
-the namespace, but its operations are procfs's: the file names the
-task and the type, so setns joins the namespace that task is in at
-setns time (Linux: the open file pins the namespace itself, and a bind
-mount of it keeps the namespace alive). No cgroup, time,
-pid_for_children or time_for_children links, and no NS_GET_* ioctls.
+No time or time_for_children links (no time namespaces). Of the
+NS_GET_* ioctls only Linux 6.8's: no NS_GET_MNTNS_ID, NS_GET_ID,
+NS_GET_{PID,TGID}_{FROM,IN}_PIDNS, NS_MNT_GET_{INFO,NEXT,PREV}
+(ENOTTY).
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 

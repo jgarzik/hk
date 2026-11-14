@@ -143,16 +143,20 @@ fn d_hash(key: u64) -> &'static Bucket {
     &t[i]
 }
 
-/// Name hashing and comparison for a filesystem whose names match
-/// more than their bytes (Linux dentry_operations' d_hash and
-/// d_compare): vfat ignores case and trailing dots, so each object has
-/// one dentry whatever the spelling it was reached by
+/// A filesystem's dentry operations (Linux dentry_operations): name
+/// hashing and comparison for one whose names match more than their
+/// bytes (vfat ignores case and trailing dots, so each object has one
+/// dentry whatever the spelling it was reached by), and a hook at a
+/// dentry's kill (nsfs forgets its stashed dentry)
 pub struct DentryOps {
     /// The name's hash (Linux d_hash): names `d_compare` matches hash
     /// alike
     pub d_hash: fn(&[u8]) -> u64,
     /// The cached name `stored` is `name` (Linux d_compare)
     pub d_compare: fn(stored: &[u8], name: &[u8]) -> bool,
+    /// Called as the dentry is killed, before its memory's grace period
+    /// starts (Linux d_prune): no reference is left or can be taken
+    pub d_prune: Option<fn(&Dentry)>,
 }
 
 /// The hash of the child name `name` under `parent` (Linux
@@ -927,6 +931,9 @@ unsafe fn dentry_kill(d: NonNull<Dentry>) -> Option<NonNull<Dentry>> {
     // SAFETY: live until the free queued below runs
     let r = unsafe { d.as_ref() };
     NR_DENTRY.fetch_sub(1, Ordering::Relaxed);
+    if let Some(prune) = r.d_op.and_then(|o| o.d_prune) {
+        prune(r);
+    }
     let inode = r.d_lock.write().inode.take();
     if let Some(i) = inode {
         crate::io::inotify::d_iput(&i);

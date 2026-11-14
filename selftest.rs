@@ -159,7 +159,7 @@ fn selftest_thread(_arg: usize) {
     use crate::net::inet::ifaddr::{InIfaddr, inet_insert_ifa};
     use crate::net::netlink::NlInfo;
     use crate::net::{Ipv4Addr, device::flags::IFF_UP, rtnl};
-    match crate::net::NetNamespace::create() {
+    match crate::net::NetNamespace::create(&crate::ns::INIT_USER_NS) {
         Ok(net) => {
             let extra = Ipv4Addr::new(192, 0, 2, 1);
             if let Some(lo) = net.loopback() {

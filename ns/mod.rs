@@ -23,9 +23,11 @@
 //! VFS locks → Namespace locks → Filesystem context → Per-CPU scheduler → TASKLIST
 
 pub mod cgroup;
+pub mod common;
 pub mod inum;
 pub mod net;
 pub mod pid;
+pub mod setns;
 pub mod user;
 pub mod uts;
 
@@ -37,7 +39,9 @@ use alloc::sync::{Arc, Weak};
 use spin::Lazy;
 
 pub use cgroup::{CgroupNamespace, INIT_CGROUP_NS};
+pub use common::{NsCommon, NsRef};
 pub use pid::{INIT_PID_NS, PidNamespace};
+pub use setns::sys_setns;
 pub use user::{INIT_USER_NS, UidGidExtent, UidGidMap, UserNamespace};
 pub use uts::{__NEW_UTS_LEN, INIT_UTS_NS, NewUtsname, UTS_FIELD_SIZE, UtsNamespace};
 
@@ -136,8 +140,8 @@ pub struct MntNamespace {
     pub id: u64,
     /// Root mount of this namespace
     pub root: RwLock<Option<MountRef>>,
-    /// Its inode number (Linux ns.inum)
-    pub inum: inum::Inum,
+    /// Its inode number and nsfs dentry (Linux ns)
+    pub ns: NsCommon,
     /// The user namespace that owns it (Linux mnt_namespace.user_ns),
     /// set at creation
     pub user_ns: Arc<UserNamespace>,
@@ -168,7 +172,7 @@ impl MntNamespace {
         Self {
             id: NEXT_MNT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             root: RwLock::new(None),
-            inum,
+            ns: NsCommon::new(inum),
             user_ns,
         }
     }
@@ -190,7 +194,7 @@ impl MntNamespace {
         let slave = !Arc::ptr_eq(user_ns, &self.user_ns);
         let old_root = self.get_root();
         if let Some(old_root) = old_root {
-            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id, slave);
+            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id, slave)?;
             *new_ns.root.write() = Some(new_root);
             if let Some(fs) = fs {
                 fs.repoint(&map);
@@ -263,7 +267,8 @@ pub struct NsProxy {
     /// Mount namespace (filesystem view)
     pub mnt_ns: Arc<MntNamespace>,
 
-    /// PID namespace (process ID isolation)
+    /// PID namespace its children go to (Linux pid_ns_for_children;
+    /// the task's own is `Task::pid_ns`)
     pub pid_ns: Arc<PidNamespace>,
 
     /// User namespace (UID/GID mapping)
@@ -295,6 +300,20 @@ impl NsProxy {
         }
     }
 
+    /// A copy sharing every namespace (Linux create_new_namespaces with
+    /// no flags)
+    pub fn dup(&self) -> Self {
+        Self {
+            uts_ns: self.uts_ns.clone(),
+            mnt_ns: self.mnt_ns.clone(),
+            pid_ns: self.pid_ns.clone(),
+            user_ns: self.user_ns.clone(),
+            ipc_ns: self.ipc_ns.clone(),
+            net_ns: self.net_ns.clone(),
+            cgroup_ns: self.cgroup_ns.clone(),
+        }
+    }
+
     /// Copy this nsproxy, optionally creating new namespaces
     ///
     /// For each CLONE_NEW* flag set, create a new namespace.
@@ -307,18 +326,18 @@ impl NsProxy {
     /// * `Ok(Arc<NsProxy>)` - New nsproxy (may share namespaces with self)
     /// * `Err(errno)` - On allocation failure
     pub fn copy(&self, flags: u64, fs: Option<&crate::fs::FsStruct>) -> KernelResult<Arc<Self>> {
-        let uts_ns = if flags & CLONE_NEWUTS != 0 {
-            self.uts_ns.clone_ns()?
-        } else {
-            self.uts_ns.clone()
-        };
-
-        // First: a mount namespace copy is owned by it (Linux
+        // First: every new namespace is owned by it (Linux
         // create_new_namespaces' user_ns, the new creds')
         let user_ns = if flags & CLONE_NEWUSER != 0 {
             UserNamespace::clone_ns(&self.user_ns)?
         } else {
             self.user_ns.clone()
+        };
+
+        let uts_ns = if flags & CLONE_NEWUTS != 0 {
+            self.uts_ns.clone_ns(&user_ns)?
+        } else {
+            self.uts_ns.clone()
         };
 
         let mnt_ns = if flags & CLONE_NEWNS != 0 {
@@ -328,19 +347,19 @@ impl NsProxy {
         };
 
         let pid_ns = if flags & CLONE_NEWPID != 0 {
-            PidNamespace::clone_ns(&self.pid_ns)?
+            PidNamespace::clone_ns(&self.pid_ns, &user_ns)?
         } else {
             self.pid_ns.clone()
         };
 
         let ipc_ns = if flags & CLONE_NEWIPC != 0 {
-            self.ipc_ns.clone_ns()?
+            self.ipc_ns.clone_ns(&user_ns)?
         } else {
             self.ipc_ns.clone()
         };
 
         let net_ns = if flags & CLONE_NEWNET != 0 {
-            self.net_ns.clone_ns()?
+            self.net_ns.clone_ns(&user_ns)?
         } else {
             self.net_ns.clone()
         };
@@ -350,7 +369,7 @@ impl NsProxy {
             // current's css_set, the parent's for a clone)
             let cg = crate::task::percpu::current().cgroup.lock().clone();
             self.cgroup_ns
-                .clone_ns(cg.unwrap_or_else(|| self.cgroup_ns.root()))?
+                .clone_ns(cg.unwrap_or_else(|| self.cgroup_ns.root()), &user_ns)?
         } else {
             self.cgroup_ns.clone()
         };
@@ -585,137 +604,4 @@ pub fn sys_unshare(unshare_flags: u64) -> KernelResult<()> {
 /// unshare() and setns().
 pub fn switch_task_namespaces(t: &Task, new_ns: Arc<NsProxy>) {
     init_task_ns(t, new_ns);
-}
-
-// ============================================================================
-// Setns Syscall
-// ============================================================================
-
-/// sys_setns - reassociate thread with a namespace
-///
-/// Join an existing namespace by file descriptor. The fd should refer
-/// to a namespace file (typically `/proc/<pid>/ns/<type>`).
-///
-/// # Arguments
-/// * `fd` - File descriptor referring to a namespace
-/// * `nstype` - Type of namespace (0 = any, or specific CLONE_NEW* flag)
-///
-/// # Returns
-/// * 0 on success
-/// * -EBADF if fd is invalid or not a namespace file
-/// * -EINVAL if nstype doesn't match the namespace type
-/// * -EPERM if permission denied
-pub fn sys_setns(fd: i32, nstype: i32) -> KernelResult<()> {
-    use crate::fs::proc::{NamespaceType, ProcfsInodeData, with_data};
-
-    let file = crate::fs::io::fget(fd)?;
-    let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-    // A namespace file: procfs private data naming one, copied out (the
-    // inode data's spin lock is not held for the rest)
-    let (target_pid, ns_type) = with_data(&inode, |d| match d {
-        ProcfsInodeData::NamespaceFile { pid, ns_type } => Some((pid.clone(), *ns_type)),
-        _ => None,
-    })
-    .flatten()
-    .ok_or(KernelError::InvalidArgument)?;
-
-    // Validate nstype if specified
-    if nstype != 0 && nstype != ns_type.clone_flag() as i32 {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    // The target task, pinned through its struct pid
-    let target = target_pid.task().ok_or(KernelError::NoProcess)?;
-
-    // Linux ->install: CAP_SYS_ADMIN, and CAP_SYS_CHROOT for a mount
-    // namespace (mntns_install)
-    let chroot_ok =
-        !matches!(ns_type, NamespaceType::Mnt) || crate::task::capable(crate::task::CAP_SYS_CHROOT);
-    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) || !chroot_ok {
-        return Err(KernelError::NotPermitted);
-    }
-
-    // The target task's namespaces
-    let target_ns = crate::fs::proc::task_nsproxy(&target).ok_or(KernelError::NoProcess)?;
-    let current_ns = current().nsproxy().unwrap_or_else(|| INIT_NSPROXY.clone());
-
-    // A mount namespace moves root and cwd: not with an fs struct
-    // shared with other tasks (Linux mntns_install: fs->users != 1)
-    if matches!(ns_type, NamespaceType::Mnt)
-        && crate::task::percpu::current_fs()
-            .is_some_and(|fs| fs.users.load(core::sync::atomic::Ordering::SeqCst) != 1)
-    {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    // Create new nsproxy with the target namespace for the specified type
-    let new_ns = match ns_type {
-        NamespaceType::Uts => NsProxy {
-            uts_ns: target_ns.uts_ns.clone(),
-            mnt_ns: current_ns.mnt_ns.clone(),
-            pid_ns: current_ns.pid_ns.clone(),
-            user_ns: current_ns.user_ns.clone(),
-            ipc_ns: current_ns.ipc_ns.clone(),
-            net_ns: current_ns.net_ns.clone(),
-            cgroup_ns: current_ns.cgroup_ns.clone(),
-        },
-        NamespaceType::Mnt => NsProxy {
-            uts_ns: current_ns.uts_ns.clone(),
-            mnt_ns: target_ns.mnt_ns.clone(),
-            pid_ns: current_ns.pid_ns.clone(),
-            user_ns: current_ns.user_ns.clone(),
-            ipc_ns: current_ns.ipc_ns.clone(),
-            net_ns: current_ns.net_ns.clone(),
-            cgroup_ns: current_ns.cgroup_ns.clone(),
-        },
-        NamespaceType::Pid => NsProxy {
-            uts_ns: current_ns.uts_ns.clone(),
-            mnt_ns: current_ns.mnt_ns.clone(),
-            pid_ns: target_ns.pid_ns.clone(),
-            user_ns: current_ns.user_ns.clone(),
-            ipc_ns: current_ns.ipc_ns.clone(),
-            net_ns: current_ns.net_ns.clone(),
-            cgroup_ns: current_ns.cgroup_ns.clone(),
-        },
-        NamespaceType::User => NsProxy {
-            uts_ns: current_ns.uts_ns.clone(),
-            mnt_ns: current_ns.mnt_ns.clone(),
-            pid_ns: current_ns.pid_ns.clone(),
-            user_ns: target_ns.user_ns.clone(),
-            ipc_ns: current_ns.ipc_ns.clone(),
-            net_ns: current_ns.net_ns.clone(),
-            cgroup_ns: current_ns.cgroup_ns.clone(),
-        },
-        NamespaceType::Ipc => NsProxy {
-            uts_ns: current_ns.uts_ns.clone(),
-            mnt_ns: current_ns.mnt_ns.clone(),
-            pid_ns: current_ns.pid_ns.clone(),
-            user_ns: current_ns.user_ns.clone(),
-            ipc_ns: target_ns.ipc_ns.clone(),
-            net_ns: current_ns.net_ns.clone(),
-            cgroup_ns: current_ns.cgroup_ns.clone(),
-        },
-        NamespaceType::Net => NsProxy {
-            uts_ns: current_ns.uts_ns.clone(),
-            mnt_ns: current_ns.mnt_ns.clone(),
-            pid_ns: current_ns.pid_ns.clone(),
-            user_ns: current_ns.user_ns.clone(),
-            ipc_ns: current_ns.ipc_ns.clone(),
-            net_ns: target_ns.net_ns.clone(),
-            cgroup_ns: current_ns.cgroup_ns.clone(),
-        },
-    };
-    let new_ns = try_arc(new_ns)?;
-
-    let mnt_root = matches!(ns_type, NamespaceType::Mnt)
-        .then(|| new_ns.mnt_ns.root_path())
-        .flatten();
-    switch_task_namespaces(&current(), new_ns);
-    // Joining a mount namespace puts root and cwd at its root, past
-    // what is mounted there (Linux mntns_install: LOOKUP_DOWN)
-    if let (Some(root), Some(fs)) = (mnt_root, crate::task::percpu::current_fs()) {
-        fs.set_root(root.clone());
-        fs.set_pwd(root);
-    }
-    Ok(())
 }
