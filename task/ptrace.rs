@@ -417,8 +417,8 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> KernelResult<i64> {
     // __ptrace_detach's wakeup, under tasklist_lock)
     let mut table = TASKLIST.write();
     let mut t = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
+    t.task.sig.lock().ptrace_code = sig.map_or(0, Signal::nr);
     ptrace_unlink(&mut t);
-    ptrace_wake(&task, sig);
     Ok(0)
 }
 
@@ -825,7 +825,8 @@ pub fn ptrace_stop(
         s.end_trace_stop();
         return (None, info);
     }
-    // A resume's signal (ptrace_wake)
+    // A resume's or detach's signal; the stop's own if its tracer
+    // left without waiting for it (ptrace_unlink)
     (Signal::new(core::mem::take(&mut s.ptrace_code)), info)
 }
 
@@ -886,14 +887,22 @@ pub fn ptrace_signal(info: &mut crate::signal::SigInfo, sig: Signal) -> Option<S
 }
 
 /// Task `t` is no longer traced (Linux __ptrace_unlink), under
-/// TASKLIST's write lock (the view borrows it), its frozen bit under
-/// its Task.sig
+/// TASKLIST's write lock (the view borrows it); under its Task.sig its
+/// frozen bit is cleared and a ptrace stop it is in ends, woken there
+/// (ptrace_signal_wake_up), its code left alone: a stop its tracer
+/// never waited for still delivers its signal, one it did (code 0)
+/// none, a detach's the one PTRACE_DETACH gave
 pub(crate) fn ptrace_unlink(t: &mut percpu::TaskViewMut<'_>) {
     t.ptrace = 0;
-    t.task.sig.lock().jobctl &= !PTRACE_FROZEN;
     t.ptracer = None;
     t.ptrace_options = 0;
     t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
+    let mut s = t.task.sig.lock();
+    s.jobctl &= !PTRACE_FROZEN;
+    if s.traced() {
+        s.jobctl &= !TRACED;
+        percpu::try_to_wake_up(t.task, percpu::WakeMode::Any);
+    }
 }
 
 /// The exiting task's tracees are detached (Linux exit_ptrace), one per
@@ -917,9 +926,8 @@ pub fn exit_ptrace() {
 /// EXITKILL one gets SIGKILL before it is detached and resumed (Linux
 /// exit_ptrace: send_sig_info under tasklist_lock, then
 /// __ptrace_detach), so it never runs untraced code first, the whole
-/// send done there; a stopped one is woken there too (Linux
-/// __ptrace_unlink: ptrace_signal_wake_up under siglock). False once
-/// none is left.
+/// send done there; a stopped one is woken there too, its stop's
+/// signal kept ([`ptrace_unlink`]). False once none is left.
 fn detach_live(me: &crate::task::Task) -> bool {
     let mut table = TASKLIST.write();
     let Some(v) = table
@@ -937,7 +945,6 @@ fn detach_live(me: &crate::task::Task) -> bool {
     if let Some(mut v) = table.view_mut(&t) {
         ptrace_unlink(&mut v);
     }
-    ptrace_wake(&t, None);
     true
 }
 

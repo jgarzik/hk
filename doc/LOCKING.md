@@ -1507,11 +1507,13 @@ section that links the tracer (Linux ptrace_attach under
 tasklist_lock). The tracer's wait walks its tracees under the read lock and
 takes a stop's code under that tracee's `Task.sig` (Linux
 wait_task_stopped); resume, detach and the tracer's exit
-(`exit_ptrace`) end the stop, set the code to deliver and
-`try_to_wake_up` the tracee under it (`ptrace_wake`, Linux
-ptrace_resume and __ptrace_unlink's ptrace_signal_wake_up under
-siglock); detach and the tracer's exit do so in the TASKLIST write
-section that untraces it (Linux __ptrace_detach under tasklist_lock).
+(`exit_ptrace`) end the stop and `try_to_wake_up` the tracee under it
+(`ptrace_wake`, `ptrace_unlink`; Linux ptrace_resume and
+__ptrace_unlink's ptrace_signal_wake_up under siglock), a resume and
+a detach setting the code to deliver there, the tracer's exit leaving
+it (a stop it never waited for delivers its signal); detach and the
+tracer's exit do so in the TASKLIST write section that untraces it
+(Linux __ptrace_detach under tasklist_lock).
 The tracer's exit detaches one tracee per write section; a
 PTRACE_O_EXITKILL tracee's SIGKILL is sent in that section before
 the detach (`send_sig_info_in`, Linux exit_ptrace under tasklist_lock:
