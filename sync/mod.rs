@@ -28,7 +28,7 @@ pub use locked_by::{LockedBy, LockedByEither, UniqueOwner};
 pub use mutex::{Mutex, MutexGuard};
 pub use racy::RacyCell;
 pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
-pub use seqlock::{SeqCount, SeqCountGuard, SeqLock, SeqRwLock, SeqRwWriteGuard, SeqWriteGuard};
+pub use seqlock::{SeqCount, SeqCountGuard, SeqLock, SeqWriteGuard};
 
 /// What the sleeping locks take from the scheduler
 #[cfg(not(test))]

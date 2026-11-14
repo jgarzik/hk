@@ -49,14 +49,15 @@ pub struct DentryFlags {
 /// whoever walks parents and names and needs one consistent picture
 /// (is_subdir, full_path). A scoped walk (RESOLVE_BENEATH /
 /// RESOLVE_IN_ROOT) samples the sequence at its start and gives up
-/// (EAGAIN) if a ".." raced a rename. Spinning, never taken in IRQ
+/// (EAGAIN) if a ".." raced a rename. A locking read excludes other
+/// readers, as Linux read_seqlock_excl. Spinning, never taken in IRQ
 /// context; taken before any d_lock.
-static RENAME_LOCK: crate::sync::SeqRwLock = crate::sync::SeqRwLock::new();
+static RENAME_LOCK: crate::sync::SeqLock = crate::sync::SeqLock::new(());
 
 /// RENAME_LOCK held for reading, as a proof [`Dentry::parent_under`]
 /// borrows from (no other lock's guard passes for it)
 struct RenameRead<'a> {
-    _g: crate::sync::spin::RwLockReadGuard<'a, ()>,
+    _g: crate::sync::spin::MutexGuard<'a, ()>,
 }
 
 /// Sample the rename sequence (Linux path_init's r_seq)
@@ -541,7 +542,7 @@ pub fn try_d_path(p: &Path, root: &Path) -> Result<(Vec<u8>, bool), KernelError>
     let reached = {
         // Linux prepend_path's order: rename_lock, then mount_lock
         let r = RenameRead {
-            _g: RENAME_LOCK.read(),
+            _g: RENAME_LOCK.read_excl(),
         };
         let ml = MOUNT_LOCK.read_excl();
         let (mut mnt, mut d): (&Mount, &Dentry) = (&p.mnt, &p.dentry);
@@ -583,7 +584,7 @@ pub fn dentry_path(d: &Arc<Dentry>) -> Result<Vec<u8>, KernelError> {
     let mut b = Prepend::new()?;
     {
         let r = RenameRead {
-            _g: RENAME_LOCK.read(),
+            _g: RENAME_LOCK.read_excl(),
         };
         let mut cur: &Dentry = d;
         while let Some(p) = cur.parent_under(&r) {
@@ -849,7 +850,7 @@ pub fn is_subdir(child: &Arc<Dentry>, ancestor: &Arc<Dentry>) -> bool {
     }
 
     // Walk up the parent chain from child, one picture of the tree
-    let _r = RENAME_LOCK.read();
+    let _r = RENAME_LOCK.read_excl();
     let mut current = child.get_parent();
     while let Some(parent) = current {
         if Arc::ptr_eq(&parent, ancestor) {
