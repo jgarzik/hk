@@ -51,7 +51,7 @@ pub struct DentryFlags {
 /// RESOLVE_IN_ROOT) samples the sequence at its start and gives up
 /// (EAGAIN) if a ".." raced a rename. Spinning, never taken in IRQ
 /// context; taken before any d_lock.
-static RENAME_LOCK: crate::sync::SeqRwLock = crate::sync::SeqRwLock::new(());
+static RENAME_LOCK: crate::sync::SeqRwLock = crate::sync::SeqRwLock::new();
 
 /// RENAME_LOCK held for reading, as a proof [`Dentry::parent_under`]
 /// borrows from (no other lock's guard passes for it)
@@ -539,10 +539,11 @@ impl Prepend {
 pub fn try_d_path(p: &Path, root: &Path) -> Result<(Vec<u8>, bool), KernelError> {
     let mut b = Prepend::new()?;
     let reached = {
-        let ml = MOUNT_LOCK.read();
+        // Linux prepend_path's order: rename_lock, then mount_lock
         let r = RenameRead {
             _g: RENAME_LOCK.read(),
         };
+        let ml = MOUNT_LOCK.read_excl();
         let (mut mnt, mut d): (&Mount, &Dentry) = (&p.mnt, &p.dentry);
         loop {
             if core::ptr::eq(mnt, MountRef::as_ptr(&root.mnt))
