@@ -1,37 +1,42 @@
 //! Mount propagation (Linux fs/pnode.c): peer groups and slaves
 //!
-//! A shared mount belongs to a peer group (`Mount::group`, an id from
-//! 1); a slave mount receives from a master group (`Mount::master`).
-//! Linux points a slave at one master mount, but propagation always
-//! covers the master's whole peer group, so the group is the master
-//! here. A mount attached under a shared mount is copied to every peer
-//! and, as slaves, down the slave groups; an umount takes the copies
-//! that hold nothing with it. Changes run under `mount::NAMESPACE_SEM`
-//! (write); `GROUPS` (a sleeping `Mutex`, inside NAMESPACE_SEM; Linux
-//! keeps the mnt_share rings under namespace_sem itself) is never held
-//! across a call into the mount tree.
+//! As Linux, the members of a peer group are a ring through
+//! `mnt_share` sharing `group_id`; a slave hangs on one master mount's
+//! `slave_list` through `slave` and points at it with `master`, and
+//! receives from the master's whole peer group. A mount attached under
+//! a shared mount is copied to every peer and down the slave groups;
+//! an umount takes the copies that hold nothing with it.
+//!
+//! Every link lives in [`PropLinks`] (`Mount.prop`), owned by
+//! NAMESPACE_SEM ([`NsTree`]: read under either side, written under
+//! write), Linux's namespace_sem; there is no lock of its own. A mount
+//! a link names is linked itself, and stays alive while linked: it is
+//! in a namespace (the tree holds it) or held by the caller, and is
+//! made private before it leaves (umount, a namespace's end); its
+//! teardown unlinks one left behind (`teardown_prop`). Group ids come
+//! from [`GROUP_IDA`] (Linux mnt_group_ida).
 
-use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::ptr::null;
 
 use super::dentry::DentryRef;
-use super::mount::{Mount, MountRef, NsTree, attach_mnt, clone_mnt, commit_tree, copy_below, walk};
+use super::mount::{
+    MNT_LOCKED, Mount, MountRef, NsTree, attach_mnt, copy_plan, copy_tree, for_each_mut,
+    is_path_reachable,
+};
 use super::path_ref::Path;
+use crate::util::ida::Ida;
 
-/// A peer group: its members, and the mounts it is master of
-#[derive(Default)]
-struct Group {
-    members: Vec<Weak<Mount>>,
-    slaves: Vec<Weak<Mount>>,
-    /// Has had a member or slave: only such a group, now without any,
-    /// is free again (a fresh one waits for the copies it was made for)
-    used: bool,
-}
+/// Not a peer of the original: a slave of it (Linux CL_SLAVE)
+pub const CL_SLAVE: u32 = 0x02;
+/// A peer group of its own if it has none (Linux CL_MAKE_SHARED)
+pub const CL_MAKE_SHARED: u32 = 0x08;
+/// No propagation at all (Linux CL_PRIVATE)
+pub const CL_PRIVATE: u32 = 0x10;
 
-/// Peer groups by id (Linux mnt_group_ida plus the mnt_share rings)
-static GROUPS: crate::sync::Mutex<BTreeMap<u32, Group>> = crate::sync::Mutex::new(BTreeMap::new());
+/// Peer group ids, from 1 (Linux mnt_group_ida): allocated under
+/// NAMESPACE_SEM write, freed when a group's last member leaves
+static GROUP_IDA: Ida = Ida::new();
 
 /// The propagation type of a mount (Linux MS_SHARED and friends)
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,280 +47,643 @@ pub enum Prop {
     Unbindable,
 }
 
-fn live(v: &mut Vec<Weak<Mount>>) -> Vec<MountRef> {
-    v.retain(MountRef::is_live);
-    v.iter().filter_map(MountRef::try_get).collect()
+/// Where a slave's `slave` link hangs (Linux mnt_slave.pprev): first
+/// on its master's list, or after another slave
+#[derive(Clone, Copy)]
+enum Pprev {
+    Unlinked,
+    Head(*const Mount),
+    After(*const Mount),
 }
 
-/// The lowest free group id: a used one with no live member and no
-/// live slave is free again
-fn alloc_group() -> u32 {
-    let mut g = GROUPS.lock();
-    g.retain(|_, grp| {
-        live(&mut grp.members);
-        live(&mut grp.slaves);
-        !grp.used || !grp.members.is_empty() || !grp.slaves.is_empty()
+/// A mount's propagation state (Linux mnt_group_id, mnt_share,
+/// mnt_slave_list, mnt_slave, mnt_master, T_MARKED), under
+/// NAMESPACE_SEM
+pub struct PropLinks {
+    /// Peer group, 0 if not shared (Linux mnt_group_id; shared exactly
+    /// when nonzero: Linux's T_SHARED without the window
+    /// invent_group_ids leaves before it is set)
+    group_id: u32,
+    /// The peer ring (Linux mnt_share); null alone (list_empty)
+    share_next: *const Mount,
+    share_prev: *const Mount,
+    /// First of this mount's slaves (Linux mnt_slave_list.first)
+    slave_first: *const Mount,
+    /// The next slave of this mount's master (Linux mnt_slave.next)
+    slave_next: *const Mount,
+    slave_pprev: Pprev,
+    /// The mount this one is a slave of (Linux mnt_master)
+    master: *const Mount,
+    /// propagate_mnt's mark (Linux T_MARKED)
+    marked: bool,
+}
+
+// SAFETY: the pointers name mounts (Sync), followed only under
+// NAMESPACE_SEM (the `LockedBy` owner), while the mounts are linked
+unsafe impl Send for PropLinks {}
+// SAFETY: as above
+unsafe impl Sync for PropLinks {}
+
+impl PropLinks {
+    pub const fn new() -> Self {
+        Self {
+            group_id: 0,
+            share_next: null(),
+            share_prev: null(),
+            slave_first: null(),
+            slave_next: null(),
+            slave_pprev: Pprev::Unlinked,
+            master: null(),
+            marked: false,
+        }
+    }
+
+    /// On some ring or list, or the head of one
+    fn linked(&self) -> bool {
+        self.group_id != 0
+            || !self.share_next.is_null()
+            || !self.slave_first.is_null()
+            || !matches!(self.slave_pprev, Pprev::Unlinked)
+            || !self.master.is_null()
+    }
+}
+
+/// The mount `p` names, borrowed for the guard's borrow `ns`
+fn mnt(ns: &NsTree, p: *const Mount) -> &Mount {
+    let _ = ns;
+    // SAFETY: `p` is a held mount or one a link names, linked; a linked
+    // mount stays alive (module doc) and is unlinked only under
+    // `&mut NsTree`, which cannot be borrowed while `ns` is
+    unsafe { &*p }
+}
+
+fn links(ns: &NsTree, p: *const Mount) -> &PropLinks {
+    mnt(ns, p).prop.access(ns)
+}
+
+fn links_mut(ns: &mut NsTree, p: *const Mount) -> &mut PropLinks {
+    // SAFETY: as `mnt`: alive for this borrow of the guard, the only
+    // one that can unlink it
+    let m = unsafe { &*p };
+    m.prop.access_mut(ns)
+}
+
+/// A reference to the linked mount `p` (in a namespace or held)
+fn get(ns: &NsTree, p: *const Mount) -> MountRef {
+    MountRef::entry_ref(mnt(ns, p))
+}
+
+/// The peer group of `m`, 0 if not shared; stable under NAMESPACE_SEM
+pub fn group_id(ns: &NsTree, m: &Mount) -> u32 {
+    m.prop.access(ns).group_id
+}
+
+/// `m` is shared (Linux IS_MNT_SHARED)
+pub fn is_shared(ns: &NsTree, m: &Mount) -> bool {
+    group_id(ns, m) != 0
+}
+
+fn master(ns: &NsTree, m: *const Mount) -> *const Mount {
+    links(ns, m).master
+}
+
+/// Linux next_peer: alone, itself
+fn next_peer(ns: &NsTree, m: *const Mount) -> *const Mount {
+    let n = links(ns, m).share_next;
+    if n.is_null() { m } else { n }
+}
+
+/// Linux peers()
+fn peers(ns: &NsTree, a: *const Mount, b: *const Mount) -> bool {
+    let g = links(ns, a).group_id;
+    g != 0 && g == links(ns, b).group_id
+}
+
+/// Added by the propagation under way: in no namespace yet (Linux
+/// IS_MNT_NEW)
+fn is_new(ns: &NsTree, m: *const Mount) -> bool {
+    mnt(ns, m).ns() == 0
+}
+
+/// Linux mnt_alloc_group_id, failing with ENOMEM
+fn alloc_group_id(ns: &mut NsTree, m: *const Mount) -> Result<(), super::KernelError> {
+    links_mut(ns, m).group_id = GROUP_IDA.try_alloc_min(1)?;
+    Ok(())
+}
+
+/// Linux mnt_release_group_id
+fn release_group_id(ns: &mut NsTree, m: *const Mount) {
+    let l = links_mut(ns, m);
+    GROUP_IDA.free(l.group_id);
+    l.group_id = 0;
+}
+
+/// Linux set_mnt_shared: shared ends unbindable (T_SHARED_MASK)
+fn set_mnt_shared(ns: &NsTree, m: *const Mount) {
+    mnt(ns, m).set_unbindable(false);
+}
+
+/// Linux list_add(&new->mnt_share, &old->mnt_share)
+fn share_add(ns: &mut NsTree, new: *const Mount, old: *const Mount) {
+    let on = next_peer(ns, old);
+    {
+        let l = links_mut(ns, new);
+        l.share_next = on;
+        l.share_prev = old;
+    }
+    links_mut(ns, on).share_prev = new;
+    links_mut(ns, old).share_next = new;
+}
+
+/// Linux list_del_init(&m->mnt_share)
+fn share_del_init(ns: &mut NsTree, m: *const Mount) {
+    let (p, n) = {
+        let l = links(ns, m);
+        (l.share_prev, l.share_next)
+    };
+    if n.is_null() {
+        return;
+    }
+    if p == n {
+        // Two in the ring: the other is left alone
+        let l = links_mut(ns, p);
+        l.share_next = null();
+        l.share_prev = null();
+    } else {
+        links_mut(ns, p).share_next = n;
+        links_mut(ns, n).share_prev = p;
+    }
+    let l = links_mut(ns, m);
+    l.share_next = null();
+    l.share_prev = null();
+}
+
+/// Point `pp` (a list head or a slave) at `next`
+fn set_pprev_target(ns: &mut NsTree, pp: Pprev, next: *const Mount) {
+    match pp {
+        Pprev::Unlinked => {}
+        Pprev::Head(o) => links_mut(ns, o).slave_first = next,
+        Pprev::After(p) => links_mut(ns, p).slave_next = next,
+    }
+}
+
+/// Linux hlist_add_head(&m->mnt_slave, &to->mnt_slave_list)
+fn slave_add_head(ns: &mut NsTree, m: *const Mount, to: *const Mount) {
+    let first = links(ns, to).slave_first;
+    if !first.is_null() {
+        links_mut(ns, first).slave_pprev = Pprev::After(m);
+    }
+    {
+        let l = links_mut(ns, m);
+        l.slave_next = first;
+        l.slave_pprev = Pprev::Head(to);
+    }
+    links_mut(ns, to).slave_first = m;
+}
+
+/// Linux hlist_add_behind(&m->mnt_slave, &prev->mnt_slave)
+fn slave_add_behind(ns: &mut NsTree, m: *const Mount, prev: *const Mount) {
+    let next = links(ns, prev).slave_next;
+    if !next.is_null() {
+        links_mut(ns, next).slave_pprev = Pprev::After(m);
+    }
+    {
+        let l = links_mut(ns, m);
+        l.slave_next = next;
+        l.slave_pprev = Pprev::After(prev);
+    }
+    links_mut(ns, prev).slave_next = m;
+}
+
+/// Linux hlist_del_init(&m->mnt_slave)
+fn slave_del_init(ns: &mut NsTree, m: *const Mount) {
+    let (pp, next) = {
+        let l = links(ns, m);
+        (l.slave_pprev, l.slave_next)
+    };
+    if matches!(pp, Pprev::Unlinked) {
+        return;
+    }
+    set_pprev_target(ns, pp, next);
+    if !next.is_null() {
+        links_mut(ns, next).slave_pprev = pp;
+    }
+    let l = links_mut(ns, m);
+    l.slave_next = null();
+    l.slave_pprev = Pprev::Unlinked;
+}
+
+/// Linux hlist_splice_init(&from->mnt_slave_list, last,
+/// &to->mnt_slave_list): `from`'s slaves, `last` the final one, go to
+/// the front of `to`'s
+fn slave_splice_init(ns: &mut NsTree, from: *const Mount, last: *const Mount, to: *const Mount) {
+    let tf = links(ns, to).slave_first;
+    if !tf.is_null() {
+        links_mut(ns, tf).slave_pprev = Pprev::After(last);
+    }
+    links_mut(ns, last).slave_next = tf;
+    let ff = links(ns, from).slave_first;
+    links_mut(ns, to).slave_first = ff;
+    links_mut(ns, ff).slave_pprev = Pprev::Head(to);
+    links_mut(ns, from).slave_first = null();
+}
+
+/// Set up `new`, a clone of `old`, for propagation as `flag` says
+/// (Linux clone_mnt's part after alloc_vfsmnt): a peer of `old`
+/// unless CL_SLAVE or CL_PRIVATE, a group of its own with
+/// CL_MAKE_SHARED, a slave of `old` (CL_SLAVE, `old` shared) or of
+/// `old`'s master, nothing with CL_PRIVATE. `new` is fresh: no
+/// reference to it was shared.
+pub fn clone_links(ns: &mut NsTree, old: &Mount, new: &Mount, flag: u32) {
+    let (old, new) = (core::ptr::from_ref(old), core::ptr::from_ref(new));
+    let og = links(ns, old).group_id;
+    links_mut(ns, new).group_id = if flag & (CL_SLAVE | CL_PRIVATE) != 0 {
+        0
+    } else {
+        og
+    };
+    if flag & CL_MAKE_SHARED != 0 && links(ns, new).group_id == 0 {
+        // A copy cannot be unwound here (Linux: -ENOMEM unwinds it)
+        links_mut(ns, new).group_id = GROUP_IDA.alloc_min(1);
+    }
+    if links(ns, new).group_id != 0 {
+        set_mnt_shared(ns, new);
+    }
+    if flag & CL_PRIVATE != 0 {
+        return;
+    }
+    if peers(ns, new, old) {
+        share_add(ns, new, old);
+    }
+    let om = master(ns, old);
+    if flag & CL_SLAVE != 0 && og != 0 {
+        slave_add_head(ns, new, old);
+        links_mut(ns, new).master = old;
+    } else if !om.is_null() {
+        slave_add_behind(ns, new, old);
+        links_mut(ns, new).master = om;
+    }
+}
+
+/// `m`, and with `recurse` every mount below it, gets a peer group if
+/// it has none (Linux invent_group_ids), or ENOMEM with the ids it gave
+/// released (cleanup_group_ids)
+pub fn invent_group_ids(
+    ns: &mut NsTree,
+    m: &MountRef,
+    recurse: bool,
+) -> Result<(), super::KernelError> {
+    let mut fresh: Vec<*const Mount> = Vec::new();
+    let mut err = Ok(());
+    let top = MountRef::as_ptr(m);
+    for_each_mut(ns, m, |ns, t| {
+        let t = MountRef::as_ptr(t);
+        if err.is_err() || (!recurse && t != top) || links(ns, t).group_id != 0 {
+            return;
+        }
+        if fresh.try_reserve(1).is_err() {
+            err = Err(super::KernelError::OutOfMemory);
+            return;
+        }
+        err = alloc_group_id(ns, t);
+        if err.is_ok() {
+            fresh.push(t);
+        }
     });
-    let id = (1..).find(|i| !g.contains_key(i)).unwrap_or(u32::MAX);
-    g.insert(id, Group::default());
-    id
-}
-
-/// Live members of group `gid`
-pub fn peers(gid: u32) -> Vec<MountRef> {
-    GROUPS
-        .lock()
-        .get_mut(&gid)
-        .map_or_else(Vec::new, |g| live(&mut g.members))
-}
-
-/// Live slaves of group `gid`
-fn slaves(gid: u32) -> Vec<MountRef> {
-    GROUPS
-        .lock()
-        .get_mut(&gid)
-        .map_or_else(Vec::new, |g| live(&mut g.slaves))
-}
-
-/// Put `m` in group `gid` (0: none)
-fn join(m: &MountRef, gid: u32) {
-    let old = m.group.swap(gid, Ordering::SeqCst);
-    let mut g = GROUPS.lock();
-    if let Some(grp) = g.get_mut(&old) {
-        grp.members
-            .retain(|w| !core::ptr::eq(w.as_ptr(), MountRef::as_ptr(m)));
-    }
-    if gid != 0 {
-        let grp = g.entry(gid).or_default();
-        grp.members.push(MountRef::downgrade(m));
-        grp.used = true;
-    }
-}
-
-/// Make `m` a slave of group `gid` (0: of none)
-fn set_master(m: &MountRef, gid: u32) {
-    let old = m.master.swap(gid, Ordering::SeqCst);
-    let mut g = GROUPS.lock();
-    if let Some(grp) = g.get_mut(&old) {
-        grp.slaves
-            .retain(|w| !core::ptr::eq(w.as_ptr(), MountRef::as_ptr(m)));
-    }
-    if gid != 0 {
-        let grp = g.entry(gid).or_default();
-        grp.slaves.push(MountRef::downgrade(m));
-        grp.used = true;
-    }
-}
-
-/// `copy` takes `orig`'s place in propagation: a peer of its group and
-/// a slave of its master (Linux clone_mnt without CL_PRIVATE)
-pub fn clone_prop(orig: &Mount, copy: &MountRef) {
-    let (g, m) = (
-        orig.group.load(Ordering::SeqCst),
-        orig.master.load(Ordering::SeqCst),
-    );
-    if g != 0 {
-        join(copy, g);
-    }
-    if m != 0 {
-        set_master(copy, m);
-    }
-}
-
-/// Every mount of the tree at `m` gets a peer group if it has none
-/// (Linux invent_group_ids before attaching under a shared mount)
-pub fn invent_groups(ns: &NsTree, m: &MountRef) {
-    for t in walk(m, ns) {
-        if t.group.load(Ordering::SeqCst) == 0 {
-            join(&t, alloc_group());
+    if err.is_err() {
+        for t in fresh {
+            release_group_id(ns, t);
         }
     }
+    err
 }
 
-/// Linux do_make_slave: a mount with peers leaves them and becomes
-/// their slave; the last peer of a group hands the group's slaves to
-/// its own master (or frees them) and the group ends
-fn make_slave(m: &MountRef) {
-    let g = m.group.load(Ordering::SeqCst);
-    if g == 0 {
+/// Linux transfer_propagation: `mnt`'s slaves go to `to` (or are freed)
+fn transfer_propagation(ns: &mut NsTree, mnt: *const Mount, to: *const Mount) {
+    let mut last = null();
+    let mut s = links(ns, mnt).slave_first;
+    while !s.is_null() {
+        let n = links(ns, s).slave_next;
+        links_mut(ns, s).master = to;
+        if to.is_null() {
+            slave_del_init(ns, s);
+        } else {
+            last = s;
+        }
+        s = n;
+    }
+    if !last.is_null() {
+        slave_splice_init(ns, mnt, last, to);
+    }
+}
+
+/// Linux change_mnt_propagation; MS_SHARED needs a group id already
+/// (do_change_type's invent_group_ids)
+pub fn change_mnt_propagation(ns: &mut NsTree, mnt: &Mount, ty: Prop) {
+    let mnt = core::ptr::from_ref(mnt);
+    let mut m = master(ns, mnt);
+    if ty == Prop::Shared {
+        set_mnt_shared(ns, mnt);
         return;
     }
-    let others = peers(g).into_iter().any(|p| !MountRef::ptr_eq(&p, m));
-    join(m, 0);
-    if others {
-        set_master(m, g);
-        return;
-    }
-    let master = m.master.load(Ordering::SeqCst);
-    for s in slaves(g) {
-        set_master(&s, master);
-    }
-    GROUPS.lock().remove(&g);
-}
-
-/// Linux change_mnt_propagation
-pub fn change_propagation(m: &MountRef, p: Prop) {
-    if p == Prop::Shared {
-        // Shared ends unbindable (Linux set_mnt_shared: T_SHARED_MASK)
-        m.set_unbindable(false);
-        if m.group.load(Ordering::SeqCst) == 0 {
-            join(m, alloc_group());
+    if is_shared(ns, crate::fs::pnode::mnt(ns, mnt)) {
+        if links(ns, mnt).share_next.is_null() {
+            release_group_id(ns, mnt);
+        } else {
+            m = next_peer(ns, mnt);
+            share_del_init(ns, mnt);
+            links_mut(ns, mnt).group_id = 0;
         }
-        return;
+        transfer_propagation(ns, mnt, m);
     }
-    make_slave(m);
-    if p != Prop::Slave {
-        set_master(m, 0);
-        m.set_unbindable(p == Prop::Unbindable);
-    }
-}
-
-/// Copies of the tree at `src`, set up for propagation by `prop(orig,
-/// copy)`, with the same shape (Linux copy_tree for propagate_one)
-fn copy_prop(ns: &mut NsTree, src: &MountRef, prop: &dyn Fn(&Mount, &MountRef)) -> MountRef {
-    let top = clone_mnt(src, src.root.clone());
-    prop(src, &top);
-    copy_below(ns, src, &top, |k| {
-        let n = clone_mnt(k, k.root.clone());
-        prop(k, &n);
-        // A submount keeps hiding what is under it (Linux copy_tree)
-        if k.flags() & super::mount::MNT_LOCKED != 0 {
-            n.mark(super::mount::MNT_LOCKED, true);
+    slave_del_init(ns, mnt);
+    if ty == Prop::Slave {
+        links_mut(ns, mnt).master = m;
+        if !m.is_null() {
+            slave_add_head(ns, mnt, m);
         }
-        n
-    });
-    top
-}
-
-/// `d` is inside what `m` shows
-fn visible(m: &Mount, d: &DentryRef) -> bool {
-    super::is_subdir(d, &m.root)
-}
-
-/// The tree at `src` was attached at `d` under the shared mount
-/// `dest`: copy it to every peer of `dest` (as peers) and down the
-/// slave groups (as slaves; among shared slaves, as a new peer group)
-/// (Linux propagate_mnt)
-pub fn propagate_mnt(ns: &mut NsTree, dest: &MountRef, d: &DentryRef, src: &MountRef) {
-    let g = dest.group.load(Ordering::SeqCst);
-    if g == 0 {
-        return;
+    } else {
+        links_mut(ns, mnt).master = null();
+        self::mnt(ns, mnt).set_unbindable(ty == Prop::Unbindable);
     }
-    for p in peers(g) {
-        if !MountRef::ptr_eq(&p, dest) && visible(&p, d) {
-            let c = copy_prop(ns, src, &|o, c| clone_prop(o, c));
-            attach_mnt(ns, c.clone(), &Path::new(p, d.clone()));
-            commit_tree(ns, &c);
-        }
-    }
-    let up: BTreeMap<usize, u32> = walk(src, &*ns)
-        .map(|m| {
-            (
-                MountRef::as_ptr(&m) as usize,
-                m.group.load(Ordering::SeqCst),
-            )
-        })
-        .collect();
-    to_slaves(ns, g, d, src, &up);
 }
 
-/// Copies for the slaves of group `g`; `up` maps each mount of the
-/// source tree to the group its copies here are slaves of
-fn to_slaves(ns: &mut NsTree, g: u32, d: &DentryRef, src: &MountRef, up: &BTreeMap<usize, u32>) {
-    let mut seen = BTreeSet::new();
-    for s in slaves(g) {
-        let sg = s.group.load(Ordering::SeqCst);
-        if sg != 0 && !seen.insert(sg) {
-            continue;
+/// Linux __propagation_next
+fn __propagation_next(ns: &NsTree, m: *const Mount, origin: *const Mount) -> Option<*const Mount> {
+    let mut m = m;
+    loop {
+        let master = master(ns, m);
+        if master == self::master(ns, origin) {
+            let next = next_peer(ns, m);
+            return (next != origin).then_some(next);
         }
-        let set = if sg != 0 { peers(sg) } else { alloc::vec![s] };
-        // Copies among shared slaves are peers of one another: a group
-        // per source mount, made with its first copy
-        let new = core::cell::RefCell::new(BTreeMap::<usize, u32>::new());
-        for m in set.iter().filter(|m| visible(m, d)) {
-            let c = copy_prop(ns, src, &|o, c| {
-                let k = core::ptr::from_ref::<Mount>(o) as usize;
-                set_master(c, up.get(&k).copied().unwrap_or(0));
-                if sg != 0 {
-                    let ng = *new.borrow_mut().entry(k).or_insert_with(alloc_group);
-                    join(c, ng);
+        let n = links(ns, m).slave_next;
+        if !n.is_null() {
+            return Some(n);
+        }
+        // Back at the master
+        m = master;
+    }
+}
+
+/// The next mount in the propagation tree from `origin`, `m` seen
+/// last (Linux propagation_next)
+fn propagation_next(ns: &NsTree, m: *const Mount, origin: *const Mount) -> Option<*const Mount> {
+    let first = links(ns, m).slave_first;
+    if !is_new(ns, m) && !first.is_null() {
+        return Some(first);
+    }
+    __propagation_next(ns, m, origin)
+}
+
+/// The first mount of the next peer group in the propagation tree
+/// from `origin`, depth first (Linux next_group)
+fn next_group(ns: &NsTree, m: *const Mount, origin: *const Mount) -> Option<*const Mount> {
+    let og = links(ns, origin).group_id;
+    let mut m = m;
+    loop {
+        loop {
+            let first = links(ns, m).slave_first;
+            if !is_new(ns, m) && !first.is_null() {
+                return Some(first);
+            }
+            let next = next_peer(ns, m);
+            if links(ns, m).group_id == og {
+                if next == origin {
+                    return None;
                 }
-            });
-            attach_mnt(ns, c.clone(), &Path::new(m.clone(), d.clone()));
-            commit_tree(ns, &c);
+            } else if links(ns, m).slave_next != next {
+                break;
+            }
+            m = next;
         }
-        let new = new.into_inner();
-        if !new.is_empty() {
-            to_slaves(ns, sg, d, src, &new);
+        // m is the last peer
+        loop {
+            let master = master(ns, m);
+            let sn = links(ns, m).slave_next;
+            if !sn.is_null() {
+                return Some(sn);
+            }
+            m = next_peer(ns, master);
+            if links(ns, master).group_id == og {
+                break;
+            }
+            if links(ns, master).slave_next == m {
+                break;
+            }
+            m = master;
+        }
+        if m == origin {
+            return None;
         }
     }
 }
 
-/// Every mount events in group `g` reach: its members and, down the
-/// slave groups, theirs
-fn reach(g: u32) -> Vec<MountRef> {
-    let mut out = peers(g);
-    let mut seen = BTreeSet::from([g]);
-    let mut todo = alloc::vec![g];
-    while let Some(x) = todo.pop() {
-        for s in slaves(x) {
-            let sg = s.group.load(Ordering::SeqCst);
-            if sg == 0 {
-                out.push(s);
-            } else if seen.insert(sg) {
-                out.extend(peers(sg));
-                todo.push(sg);
+/// Linux need_secondary: not one of this propagation's copies, and the
+/// mountpoint is inside what `m` shows
+fn need_secondary(ns: &NsTree, m: *const Mount, d: &DentryRef) -> bool {
+    !is_new(ns, m) && super::is_subdir(d, &mnt(ns, m).root)
+}
+
+/// Linux find_master: the copy the copies for `m`'s group are slaves
+/// of, from `last_copy` up the chain of copies toward `original`
+fn find_master(
+    ns: &NsTree,
+    m: *const Mount,
+    last_copy: *const Mount,
+    original: *const Mount,
+) -> *const Mount {
+    let mut m = m;
+    // Ascend until there's a copy for something with the same master
+    let p = loop {
+        let p = master(ns, m);
+        if p.is_null() || links(ns, p).marked {
+            break p;
+        }
+        m = p;
+    };
+    let mut last_copy = last_copy;
+    while !peers(ns, last_copy, original) {
+        let parent = mnt(ns, last_copy)
+            .parent_in(ns)
+            .map_or(null(), core::ptr::from_ref);
+        if master(ns, parent) == p {
+            if !peers(ns, parent, m) {
+                last_copy = master(ns, last_copy);
+            }
+            break;
+        }
+        last_copy = master(ns, last_copy);
+    }
+    last_copy
+}
+
+fn set_mark(ns: &mut NsTree, m: *const Mount, on: bool) {
+    if !m.is_null() {
+        links_mut(ns, m).marked = on;
+    }
+}
+
+/// Copies of the tree at `src`, just hung at `d` on the shared mount
+/// `dest`, for every mount `dest`'s events reach (Linux
+/// propagate_mnt): peers of `dest` get peers of `src`, the slave
+/// groups slaves, a group of shared slaves a peer group of its own.
+/// Each copy is hung on its mount, its tree left out of every
+/// namespace (IS_MNT_NEW) for the caller's commit_tree. The copies'
+/// roots are returned (Linux tree_list).
+pub fn propagate_mnt(
+    ns: &mut NsTree,
+    dest: &MountRef,
+    d: &DentryRef,
+    src: &MountRef,
+) -> Vec<MountRef> {
+    let mut list: Vec<MountRef> = Vec::new();
+    let dest_p = MountRef::as_ptr(dest);
+    let src_p = MountRef::as_ptr(src);
+    let dm = master(ns, dest_p);
+    set_mark(ns, dm, true);
+    let mut copy = src.clone();
+    let mut m = Some(dest_p);
+    while let Some(mp) = m {
+        let (mut ty, mut n);
+        if mp == dest_p {
+            // Have one for dest itself
+            copy = src.clone();
+            ty = CL_MAKE_SHARED;
+            n = next_peer(ns, mp);
+            if n == mp {
+                m = next_group(ns, mp, dest_p);
+                continue;
+            }
+        } else {
+            ty = CL_SLAVE;
+            // Beginning of a peer group among the slaves?
+            if links(ns, mp).group_id != 0 {
+                ty |= CL_MAKE_SHARED;
+            }
+            n = mp;
+        }
+        loop {
+            if need_secondary(ns, n, d) {
+                if ty & CL_SLAVE != 0 {
+                    // First in this peer group
+                    let c = find_master(ns, n, MountRef::as_ptr(&copy), src_p);
+                    copy = get(ns, c);
+                }
+                let this = copy_prop(ns, &copy, ty);
+                attach_mnt(ns, this.clone(), &Path::new(get(ns, n), d.clone()));
+                let nm = master(ns, n);
+                set_mark(ns, nm, true);
+                copy = this.clone();
+                list.push(this);
+                ty = CL_MAKE_SHARED;
+            }
+            n = next_peer(ns, n);
+            if n == mp {
+                break;
             }
         }
+        m = next_group(ns, mp, dest_p);
     }
-    out
+    for c in &list {
+        let pm = c
+            .parent_in(&*ns)
+            .map_or(null(), |p| master(ns, core::ptr::from_ref(p)));
+        set_mark(ns, pm, false);
+    }
+    set_mark(ns, dm, false);
+    list
 }
 
-/// The propagated copies an umount of `m` takes along: under every
-/// mount its parent's events reach, the mount of `m`'s filesystem at
-/// the same place, unless something is mounted on it (Linux
-/// propagate_umount: such a copy stays)
+/// Linux copy_tree(copy, copy->mnt.mnt_root, ty) for propagate_mnt
+fn copy_prop(ns: &mut NsTree, copy: &MountRef, ty: u32) -> MountRef {
+    // A tree being attached holds no unbindable mount (a recursive
+    // bind leaves them out, MS_MOVE refuses them under a shared
+    // mount), nor do its copies: no EPERM here
+    let plan = copy_plan(ns, copy, &copy.root)
+        .unwrap_or_else(|_| unreachable!("pnode: a locked unbindable mount in a propagated tree"));
+    copy_tree(ns, &plan, ty)
+}
+
+/// The propagated copies an umount of `m` takes along (Linux
+/// propagate_umount's gather_candidates and trim_one): on every mount
+/// receiving propagation from `m`'s parent, the mount at `m`'s
+/// mountpoint, unless something is mounted on it or it is locked
+/// (such a copy stays)
 pub fn propagate_umount(ns: &NsTree, m: &MountRef) -> Vec<MountRef> {
-    let (Some(parent), Some(mp)) = (m.get_parent(), m.get_mountpoint()) else {
-        return Vec::new();
-    };
-    let g = parent.group.load(Ordering::SeqCst);
-    if g == 0 {
-        return Vec::new();
-    }
     let mut out = Vec::new();
-    for t in reach(g) {
-        if MountRef::ptr_eq(&t, &parent) {
-            continue;
+    let (Some(parent), Some(mp)) = (m.parent_in(ns), m.get_mountpoint(ns)) else {
+        return out;
+    };
+    let p = core::ptr::from_ref(parent);
+    let mut q = propagation_next(ns, p, p);
+    while let Some(qm) = q {
+        let g = crate::sync::rcu::read_lock();
+        let child = super::mount::__lookup_mnt(mnt(ns, qm), &mp, &g).map(MountRef::entry_ref);
+        drop(g);
+        if let Some(c) = child
+            && !MountRef::ptr_eq(&c, m)
+            && !c.has_children(ns)
+            && c.flags() & MNT_LOCKED == 0
+        {
+            out.push(c);
         }
-        out.extend(t.kids(ns).filter(|c| {
-            !MountRef::ptr_eq(c, m)
-                && Arc::ptr_eq(&*c.sb, &*m.sb)
-                && c.get_mountpoint()
-                    .is_some_and(|x| DentryRef::ptr_eq(&x, &mp))
-                && !c.has_children(ns)
-        }));
+        q = propagation_next(ns, qm, p);
     }
     out
 }
 
-/// The mountinfo optional fields of `m` (Linux show_mountinfo):
-/// shared:N, master:N, propagate_from:N (the nearest group up the
-/// master chain with a member the reader sees, if not the master),
+/// A peer of `mnt` in namespace `ns_id` that the reader's `root`
+/// reaches (Linux get_peer_under_root)
+fn get_peer_under_root(
+    ns: &NsTree,
+    mnt: *const Mount,
+    ns_id: u64,
+    root: &Path,
+) -> Option<*const Mount> {
+    let mut m = mnt;
+    loop {
+        // The namespace first, it is cheap
+        if self::mnt(ns, m).ns() == ns_id
+            && is_path_reachable(&Path::new(get(ns, m), self::mnt(ns, m).root.clone()), root)
+        {
+            return Some(m);
+        }
+        m = next_peer(ns, m);
+        if m == mnt {
+            return None;
+        }
+    }
+}
+
+/// The id of the closest dominating peer group with a member under
+/// `root` (Linux get_dominating_id), 0 if none
+fn get_dominating_id(ns: &NsTree, mnt: &Mount, root: &Path) -> u32 {
+    let mut m = master(ns, mnt);
+    while !m.is_null() {
+        if let Some(d) = get_peer_under_root(ns, m, mnt.ns(), root) {
+            return links(ns, d).group_id;
+        }
+        m = master(ns, m);
+    }
+    0
+}
+
+/// The mountinfo optional fields of `m` for a reader rooted at `root`
+/// (Linux show_mountinfo): shared:N, master:N, propagate_from:N,
 /// unbindable
-pub fn optional_fields(m: &Mount, visible_peer: &dyn Fn(u32) -> bool) -> Vec<u8> {
+pub fn optional_fields(ns: &NsTree, m: &Mount, root: &Path) -> Vec<u8> {
     use alloc::fmt::Write;
     let mut s = alloc::string::String::new();
-    let g = m.group.load(Ordering::SeqCst);
-    let master = m.master.load(Ordering::SeqCst);
-    if g != 0 {
-        let _ = write!(s, " shared:{}", g);
+    let l = m.prop.access(ns);
+    if l.group_id != 0 {
+        let _ = write!(s, " shared:{}", l.group_id);
     }
-    if master != 0 {
+    if !l.master.is_null() {
+        let master = links(ns, l.master).group_id;
+        let dom = get_dominating_id(ns, m, root);
         let _ = write!(s, " master:{}", master);
-        if let Some(dom) = dominating(master, visible_peer)
-            && dom != master
-        {
+        if dom != 0 && dom != master {
             let _ = write!(s, " propagate_from:{}", dom);
         }
     }
@@ -325,19 +693,71 @@ pub fn optional_fields(m: &Mount, visible_peer: &dyn Fn(u32) -> bool) -> Vec<u8>
     s.into_bytes()
 }
 
-/// The first group up the master chain from `gid` with a member the
-/// reader sees (Linux get_dominating_id)
-fn dominating(gid: u32, visible_peer: &dyn Fn(u32) -> bool) -> Option<u32> {
-    let mut g = gid;
-    let mut hops = 0;
-    while g != 0 && hops < 64 {
-        if visible_peer(g) {
-            return Some(g);
-        }
-        g = peers(g)
-            .first()
-            .map_or(0, |p| p.master.load(Ordering::SeqCst));
-        hops += 1;
+/// A mount being torn down leaves propagation if it is still in it:
+/// it never is (umount and a namespace's end make every mount private
+/// first), but a link left to freed memory would be unsound
+pub fn teardown_prop(m: &Mount) {
+    let linked = m.prop.access(&super::mount::namespace_read()).linked();
+    if linked {
+        let mut ns = super::mount::namespace_lock();
+        change_mnt_propagation(&mut ns, m, Prop::Private);
     }
-    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::mount::{namespace_lock, test_mnt};
+
+    /// Peer rings and slave lists as Linux keeps them: a peer leaving
+    /// keeps the group, the last one frees it and hands its slaves to
+    /// its own master
+    #[test]
+    fn peers_and_slaves() {
+        let mut ns = namespace_lock();
+        let (a, b, s) = (test_mnt(), test_mnt(), test_mnt());
+        let (pa, pb, ps) = (
+            MountRef::as_ptr(&a),
+            MountRef::as_ptr(&b),
+            MountRef::as_ptr(&s),
+        );
+        alloc_group_id(&mut ns, pa).unwrap();
+        links_mut(&mut ns, pb).group_id = links(&ns, pa).group_id;
+        share_add(&mut ns, pb, pa);
+        assert!(peers(&ns, pa, pb));
+        assert_eq!(next_peer(&ns, pa), pb);
+        assert_eq!(next_peer(&ns, pb), pa);
+        // s: a slave of the group, through a
+        links_mut(&mut ns, ps).master = pa;
+        slave_add_head(&mut ns, ps, pa);
+        change_mnt_propagation(&mut ns, &a, Prop::Private);
+        assert_eq!(group_id(&ns, &a), 0);
+        assert!(is_shared(&ns, &b) && next_peer(&ns, pb) == pb);
+        // a's slaves went to its peer
+        assert_eq!(master(&ns, ps), pb);
+        assert_eq!(links(&ns, pb).slave_first, ps);
+        change_mnt_propagation(&mut ns, &b, Prop::Private);
+        assert_eq!(master(&ns, ps), null());
+        assert!(links(&ns, pb).slave_first.is_null());
+        assert!(!links(&ns, pa).linked() && !links(&ns, pb).linked());
+        assert!(!links(&ns, ps).linked());
+    }
+
+    /// A slave made shared then slave again keeps its master; one with
+    /// peers becomes their slave
+    #[test]
+    fn make_slave() {
+        let mut ns = namespace_lock();
+        let (a, b) = (test_mnt(), test_mnt());
+        let (pa, pb) = (MountRef::as_ptr(&a), MountRef::as_ptr(&b));
+        alloc_group_id(&mut ns, pa).unwrap();
+        clone_links(&mut ns, &a, &b, 0);
+        assert!(peers(&ns, pa, pb));
+        change_mnt_propagation(&mut ns, &b, Prop::Slave);
+        assert_eq!(master(&ns, pb), pa);
+        assert_eq!(group_id(&ns, &b), 0);
+        change_mnt_propagation(&mut ns, &a, Prop::Private);
+        change_mnt_propagation(&mut ns, &b, Prop::Private);
+        assert!(!links(&ns, pa).linked() && !links(&ns, pb).linked());
+    }
 }

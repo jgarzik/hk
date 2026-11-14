@@ -190,13 +190,19 @@ fn hash_out(p: &mut DentryInner, d: &Dentry) -> Option<DentryRef> {
     Some(c)
 }
 
-/// The child `name` of `parent` (Linux __d_lookup), whose d_lock `_p`
-/// is held (lookups take their references under it): one walk of the
-/// bucket under its lock, comparing key, parent and name as Linux
-/// compares d_name there. A hashed dentry's key and parent change only
-/// while it is out of its bucket, and its name only under `d_name`, a
-/// leaf taken here inside the bucket lock (written only while the
-/// dentry is out of the tree, by d_move). A new reference.
+/// The child `name` of `parent` (Linux d_lookup, __d_lookup), whose
+/// d_lock `_p` is held (lookups take their references under it): one
+/// walk of the bucket under an RCU read guard with no lock, comparing
+/// key, parent and name as Linux compares d_name there, the reference
+/// taken with `try_get` (lockref_get_not_dead). With `_p` held no
+/// child of `parent` enters or leaves the tree, so a match is a child
+/// in it, its name stable (`d_name`, a leaf, changes only while a
+/// dentry is out of the tree). A walk may miss when a rename moves a
+/// dentry it stands on to another bucket (only d_move and d_exchange
+/// rehash, under RENAME_LOCK): a miss with RENAME_LOCK's sequence moved
+/// walks again under the bucket lock (Linux d_lookup retries the RCU
+/// walk instead, holding no d_lock; spinning for a writer here could
+/// wait on one that waits for `_p`). A new reference.
 fn d_lookup(parent: &Dentry, _p: &DentryInner, name: &[u8]) -> Option<DentryRef> {
     let key = d_key(parent, name_hash_in(parent, name));
     let pa = core::ptr::from_ref(parent).addr();
@@ -204,11 +210,25 @@ fn d_lookup(parent: &Dentry, _p: &DentryInner, name: &[u8]) -> Option<DentryRef>
         Some(op) => (op.d_compare)(stored, name),
         None => stored == name,
     };
-    d_hash(key).lock().find(|c| {
+    let is = |c: &Dentry| {
         c.d_hkey.load(Relaxed) == key
             && c.d_hparent.load(Relaxed) == pa
             && same(c.d_name.read().as_bytes())
-    })
+    };
+    let b = d_hash(key);
+    let seq = RENAME_LOCK.raw_read_begin();
+    {
+        let g = crate::sync::rcu::read_lock();
+        if let Some(c) = b.find_rcu(&g, &is)
+            && let Some(r) = DentryRef::try_get(c)
+        {
+            return Some(r);
+        }
+    }
+    if !RENAME_LOCK.read_retry(seq) {
+        return None;
+    }
+    b.lock().find(is)
 }
 
 /// Dentries alive (/proc/sys/fs/dentry-state nr_dentry)
@@ -831,6 +851,10 @@ unsafe impl ListPtr for DentryRef {
         Self(unsafe { NonNull::new_unchecked(p.cast_mut()) })
     }
 }
+
+// SAFETY: a dentry's last put frees its memory by call_rcu
+// (`dentry_kill`), or at once only where no other CPU runs a reader
+unsafe impl crate::util::hlist_bl::RcuFreePtr for DentryRef {}
 
 // SAFETY: a count increment, then the reference it stands for
 unsafe impl RefPtr for DentryRef {

@@ -55,6 +55,13 @@ impl SeqCount {
         fence(Ordering::Acquire);
         self.seq.load(Ordering::Relaxed) != start
     }
+
+    /// Begin a lockless read without waiting out a writer (Linux
+    /// raw_seqcount_begin): with one in progress, `read_retry` says so.
+    /// For a reader that may hold a lock the writer takes.
+    pub fn raw_read_begin(&self) -> u32 {
+        self.seq.load(Ordering::Acquire) & !1
+    }
 }
 
 impl Drop for SeqCountGuard<'_> {
@@ -126,6 +133,12 @@ impl<T> SeqLock<T> {
     /// read_seqretry)
     pub fn read_retry(&self, start: u32) -> bool {
         self.seq.read_retry(start)
+    }
+
+    /// Begin a lockless read without waiting out a writer (Linux
+    /// raw_seqcount_begin on the seqlock's count)
+    pub fn raw_read_begin(&self) -> u32 {
+        self.seq.raw_read_begin()
     }
 
     /// One read of what the lock covers (Linux read_seqbegin_or_lock,
