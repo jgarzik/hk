@@ -4024,10 +4024,13 @@ change in between; the pid lookup (PIDMAP_LOCK) comes before TASKLIST.
 
 | Lock | Type | Purpose |
 |------|------|---------|
-| `GfxConsole.state` | `Mutex<GfxConsoleState>` | Framebuffer surface + cursor position |
+| `GfxConsole.state` | `IrqSpinlock<GfxConsoleState>` | Framebuffer surface + cursor position |
 
 The graphics console uses a **single lock** protecting both cursor position and
-framebuffer surface. This ensures atomic character rendering and cursor updates.
+framebuffer surface, held across a whole console write (any context,
+under `OUTPUT_LOCK`). The write only tries it: held (a printk nested in
+the write, a concurrent oops), the output is dropped (Linux
+vt_console_print's printing_lock trylock under console_lock). A leaf.
 
 #### Lock Ordering
 
@@ -4040,7 +4043,7 @@ CONSOLE_REGISTRY (IrqSpinlock, console dispatch to drivers)
     ↓
 Per-TTY spin locks (termios, ctrl) - independent between TTYs
     ↓
-GfxConsole.state (Mutex, if graphics console receives output)
+GfxConsole.state (IrqSpinlock, try_lock; if graphics console receives output)
 ```
 
 The console writes run after `CONSOLE_REGISTRY` is released, under
