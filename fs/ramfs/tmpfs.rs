@@ -507,6 +507,13 @@ impl SuperOps for TmpfsSuperOps {
     fn show_options(&self, sb: &SuperBlock, out: &mut Vec<u8>) {
         with(sb, |t| t.show(out));
     }
+
+    /// Its limits and accounting go (Linux shmem_put_super: the
+    /// sbinfo freed)
+    fn put_super(&self, sb: &SuperBlock) {
+        let info = sb.private.write().take();
+        drop(info);
+    }
 }
 
 pub static TMPFS_SUPER_OPS: TmpfsSuperOps = TmpfsSuperOps;
@@ -525,6 +532,12 @@ pub(crate) fn tmpfs_mount(
     })
 }
 
+/// rootfs's kill_sb (Linux rootfs_kill_sb): a tmpfs one, so
+/// kill_anon_super
+fn rootfs_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
+    crate::fs::superblock::kill_anon_super(sb, g);
+}
+
 /// The rootfs filesystem type (Linux init/do_mounts.c rootfs_fs_type
 /// with CONFIG_TMPFS and no root=: rootfs_init_fs_context fills it as
 /// tmpfs): the initramfs's, mounted on the nullfs root by
@@ -535,6 +548,7 @@ pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
     name: "rootfs",
     fs_flags: 0,
     mount: tmpfs_mount,
+    kill_sb: rootfs_kill_sb,
     file_ops: &super::TMPFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
@@ -588,6 +602,7 @@ pub static TMPFS_TYPE: FileSystemType = FileSystemType {
     name: "tmpfs",
     fs_flags: 0,
     mount: tmpfs_mount,
+    kill_sb: crate::fs::superblock::kill_anon_super,
     file_ops: &super::TMPFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

@@ -564,6 +564,7 @@ pub static TRACEFS_TYPE: FileSystemType = FileSystemType {
     name: "tracefs",
     fs_flags: fs_flags::FS_PSEUDO,
     mount,
+    kill_sb: crate::fs::superblock::kill_anon_super,
     file_ops: &kernfs::vfs::KERNFS_FOPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

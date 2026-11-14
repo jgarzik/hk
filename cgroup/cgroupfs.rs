@@ -800,11 +800,19 @@ fn cgroupfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// cgroup2's kill_sb (Linux cgroup_kill_sb, ending in kernfs_kill_sb's
+/// kill_anon_super; hk's cgroupfs keeps no root reference or kernfs
+/// info on the superblock)
+fn cgroup_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
+    crate::fs::superblock::kill_anon_super(sb, g);
+}
+
 /// Cgroupfs filesystem type
 pub static CGROUPFS_TYPE: FileSystemType = FileSystemType {
     name: "cgroup2",
     fs_flags: crate::fs::superblock::fs_flags::FS_PSEUDO,
     mount: cgroupfs_mount,
+    kill_sb: cgroup_kill_sb,
     file_ops: &CGROUPFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

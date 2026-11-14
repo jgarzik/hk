@@ -392,6 +392,17 @@ fn vfat(d: &Disk) {
     if r != 0 {
         return;
     }
+    // A device filesystem's st_dev is its device (Linux
+    // set_bdev_super: s_dev = bd_dev)
+    let mut node = Stat::default();
+    let mut root = Stat::default();
+    let a = sys_stat(p1.path(&mut p).as_ptr(), &mut node);
+    let b = sys_stat(b"/mnt/vd1\0".as_ptr(), &mut root);
+    verdict(
+        b"VFAT_ST_DEV",
+        a == 0 && b == 0 && root.st_dev == node.st_rdev,
+        root.st_dev as i64,
+    );
     let mut b = [0u8; 64];
     let n = read_file(b"/mnt/vd1/HKDISK.TXT\0", &mut b);
     verdict(

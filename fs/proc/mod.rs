@@ -2453,6 +2453,14 @@ pub fn proc_flush_pid(t: &crate::task::Task) {
     });
 }
 
+/// procfs's kill_sb (Linux proc_kill_sb): kill_anon_super, then its
+/// options (the pid namespace reference) go
+fn proc_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
+    crate::fs::superblock::kill_anon_super(sb, g);
+    let info = sb.private.write().take();
+    drop(info);
+}
+
 /// Mount function for procfs
 fn procfs_mount(
     fc: &crate::fs::superblock::FsContext<'_>,
@@ -2523,6 +2531,7 @@ pub static PROCFS_TYPE: FileSystemType = FileSystemType {
     fs_flags: super::superblock::fs_flags::FS_PSEUDO
         | super::superblock::fs_flags::FS_USERNS_MOUNT_RESTRICTED,
     mount: procfs_mount,
+    kill_sb: proc_kill_sb,
     file_ops: &PROCFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

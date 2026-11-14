@@ -81,8 +81,9 @@ fn mount(
         try_arc(kernfs::vfs::KfSuper { ns })?;
     let sb =
         crate::fs::superblock::sget(fc, &SYSFS_SOPS, Some(&|sb| sb_ns(sb) == Some(ns)), &|sb| {
+            // Linux kernfs_set_super
             sb.set_private(info.clone());
-            Ok(())
+            crate::fs::superblock::set_anon_super(sb)
         })?;
     if !sb.has_root() {
         let ri = kernfs::vfs::inode(&sb, root())?;
@@ -90,14 +91,24 @@ fn mount(
             ri,
             Arc::downgrade(&sb),
         ))?);
+        sb.set_active();
     }
     Ok(sb)
+}
+
+/// sysfs's kill_sb (Linux sysfs_kill_sb -> kernfs_kill_sb:
+/// kill_anon_super, then the kernfs info freed)
+fn sysfs_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
+    crate::fs::superblock::kill_anon_super(sb, g);
+    let info = sb.private.write().take();
+    drop(info);
 }
 
 pub static SYSFS_TYPE: FileSystemType = FileSystemType {
     name: "sysfs",
     fs_flags: fs_flags::FS_PSEUDO | fs_flags::FS_USERNS_MOUNT_RESTRICTED,
     mount,
+    kill_sb: sysfs_kill_sb,
     file_ops: &kernfs::vfs::KERNFS_FOPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

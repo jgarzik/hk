@@ -2738,8 +2738,11 @@ callback (which may sleep), and drops the previous reference with the
 lock released. `sget` (Linux sget_fc) runs its test under it, on
 superblocks not yet dead (sysfs: `SuperBlock.private`, a spin RwLock
 read, and a new superblock's `set`, which stores its identity:
-`SuperBlock.private` written, the only other lock taken under
-`SB_LOCK`), takes a match's passive reference and, unlocked, trades it
+`SuperBlock.private` written, and an anonymous device number taken
+from `UNNAMED_DEV_IDA` (Linux get_anon_bdev under sb_lock: the
+`util::ida::Ida` IrqSpinlock leaf, its bitmap grown GFP_ATOMIC; freed
+by kill_anon_super after SB_DEAD, any context) — the only other locks
+taken under `SB_LOCK`), takes a match's passive reference and, unlocked, trades it
 for an active one with s_umount held for writing (Linux grab_super:
 once born; a dying match is waited for until SB_DEAD and the search
 repeated); else it allocates a superblock unlocked with its s_umount

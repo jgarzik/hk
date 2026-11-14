@@ -1227,11 +1227,20 @@ pub(crate) fn fill_root(
     Ok(())
 }
 
+/// ramfs's kill_sb (Linux ramfs_kill_sb): its private data, then
+/// kill_anon_super
+fn ramfs_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
+    let info = sb.private.write().take();
+    drop(info);
+    crate::fs::superblock::kill_anon_super(sb, g);
+}
+
 /// Ramfs filesystem type
 pub static RAMFS_TYPE: FileSystemType = FileSystemType {
     name: "ramfs",
     fs_flags: 0,
     mount: ramfs_mount,
+    kill_sb: ramfs_kill_sb,
     file_ops: &RAMFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

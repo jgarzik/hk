@@ -133,16 +133,9 @@ fn show_mountinfo_of(vis: &Vis<'_>) -> Vec<u8> {
     for (m, mp) in vis.mnts.iter().cloned() {
         // The namespace root's parent is itself (Linux: its mnt_parent)
         let parent = m.parent_in(vis.ns).map_or(m.mnt_id, |p| p.mnt_id);
-        let dev = m.sb.dev_id;
+        let (major, minor) = m.sb.dev_major_minor();
         let mut head = alloc::string::String::new();
-        let _ = write!(
-            head,
-            "{} {} {}:{} ",
-            m.mnt_id,
-            parent,
-            (dev >> 8) & 0xfff,
-            dev & 0xff
-        );
+        let _ = write!(head, "{} {} {}:{} ", m.mnt_id, parent, major, minor);
         out.extend_from_slice(head.as_bytes());
         // The filesystem's own root path if it has one (Linux
         // show_mountinfo: sb->s_op->show_path), else the dentry's

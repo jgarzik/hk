@@ -31,6 +31,10 @@ pub trait SuperOps: Send + Sync {
     /// Called when inode is no longer referenced
     fn drop_inode(&self, _inode: &Inode) {}
 
+    /// The filesystem's own teardown, after its inodes are evicted
+    /// (Linux ->put_super, from generic_shutdown_super)
+    fn put_super(&self, _sb: &SuperBlock) {}
+
     /// Sync filesystem to backing store (no-op for in-memory fs)
     fn sync_fs(&self) -> Result<(), KernelError> {
         Ok(())
@@ -218,6 +222,13 @@ impl<'a> FsContext<'a> {
 /// writing ([`SbLocked`])
 pub type MountFn = fn(fc: &FsContext<'_>) -> Result<SbLocked, KernelError>;
 
+/// s_umount held for writing, as a superblock's shutdown gets it
+pub type SbUmount<'a> = sync::RwSemWriteGuard<'a, ()>;
+
+/// A filesystem's kill_sb (Linux ->kill_sb): it ends in
+/// generic_shutdown_super, which releases s_umount
+pub type KillSbFn = for<'a> fn(&'a SuperBlock, SbUmount<'a>);
+
 /// Filesystem type descriptor
 pub struct FileSystemType {
     /// Filesystem name (e.g., "ramfs", "procfs", "vfat")
@@ -228,6 +239,11 @@ pub struct FileSystemType {
 
     /// Its superblock for a mount (Linux ->get_tree)
     pub mount: MountFn,
+
+    /// Its superblock's shutdown, the last active reference's, called
+    /// with s_umount held for writing (Linux ->kill_sb: kill_anon_super,
+    /// kill_block_super, or the filesystem's own around one of them)
+    pub kill_sb: KillSbFn,
 
     /// Default file operations for files on this filesystem
     pub file_ops: &'static dyn FileOps,
@@ -260,9 +276,6 @@ pub mod fs_flags {
     /// and sysfs
     pub const FS_USERNS_MOUNT_RESTRICTED: u32 = 0x100;
 }
-
-/// Global counter for unique device IDs per superblock
-static NEXT_DEV_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The superblock structure - represents a mounted filesystem instance
 /// Read-only file system (Linux SB_RDONLY)
@@ -528,19 +541,69 @@ fn deactivate_locked_super(sb: &SuperBlock, g: sync::RwSemWriteGuard<'_, ()>) {
     if sb.s_active.fetch_sub(1, Ordering::AcqRel) != 1 {
         return;
     }
-    kill_sb(sb, g);
+    (sb.fs_type.kill_sb)(sb, g);
     kill_super_notify(sb);
 }
 
-/// The filesystem's shutdown (Linux fs->kill_sb). Deviation: no per-type
-/// hook, as no hk filesystem needs more than the two generic ones:
-/// kill_block_super for a device filesystem (its device released after
-/// the generic part, s_umount dropped), else kill_anon_super (no
-/// anonymous device number to free: `dev_id` is never reused)
-fn kill_sb(sb: &SuperBlock, g: sync::RwSemWriteGuard<'_, ()>) {
+/// The kill_sb of a filesystem with an anonymous device number (Linux
+/// kill_anon_super): the generic shutdown, SB_DEAD, the number freed
+pub fn kill_anon_super(sb: &SuperBlock, g: SbUmount<'_>) {
+    let dev = sb.dev();
     generic_shutdown_super(sb, g);
+    kill_super_notify(sb);
+    free_anon_bdev(dev);
+}
+
+/// The kill_sb of a device filesystem (Linux kill_block_super): the
+/// generic shutdown (s_umount released), then the device written back
+/// and released
+pub fn kill_block_super(sb: &SuperBlock, g: SbUmount<'_>) {
+    generic_shutdown_super(sb, g);
+    if let Some(b) = sb.bdev() {
+        let _ = crate::block::blkdev::sync_blockdev(b);
+    }
     let file = sb.s_bdev_file.lock().take();
     drop(file);
+}
+
+/// Anonymous device numbers (Linux unnamed_dev_ida): minors of major 0
+static UNNAMED_DEV_IDA: crate::util::ida::Ida = crate::util::ida::Ida::new();
+
+/// Bits of a device number's minor (Linux MINORBITS)
+const MINORBITS: u32 = 20;
+
+/// An anonymous device number (Linux get_anon_bdev): the lowest free
+/// minor of major 0 from 1 (an fsid of 0 counts as invalid), EMFILE once
+/// they are all taken. Called under sb_lock: the bitmap grows atomically
+/// (Linux GFP_ATOMIC).
+fn get_anon_bdev() -> Result<u32, KernelError> {
+    use crate::mm::page_alloc::Gfp;
+    use crate::util::kalloc::with_gfp;
+    let dev = with_gfp(Gfp::ATOMIC, || UNNAMED_DEV_IDA.try_alloc_min(1))?;
+    if dev >= 1 << MINORBITS {
+        UNNAMED_DEV_IDA.free(dev);
+        return Err(KernelError::ProcessFileLimit);
+    }
+    Ok(dev)
+}
+
+/// Give an anonymous device number back (Linux free_anon_bdev)
+fn free_anon_bdev(dev: u32) {
+    UNNAMED_DEV_IDA.free(dev & ((1 << MINORBITS) - 1));
+}
+
+/// A new superblock's identity, an anonymous device number (Linux
+/// set_anon_super): `sget`'s `set`, under sb_lock
+pub fn set_anon_super(sb: &SuperBlock) -> Result<(), KernelError> {
+    sb.s_dev.store(get_anon_bdev()?, Ordering::Relaxed);
+    Ok(())
+}
+
+/// A device superblock's identity, its device's number (Linux
+/// set_bdev_super)
+fn set_bdev_super(sb: &SuperBlock, dev: u32) -> Result<(), KernelError> {
+    sb.s_dev.store(dev, Ordering::Relaxed);
+    Ok(())
 }
 
 /// What every filesystem's shutdown does (Linux generic_shutdown_super),
@@ -550,7 +613,7 @@ fn kill_sb(sb: &SuperBlock, g: sync::RwSemWriteGuard<'_, ()>) {
 /// while the device is still open (sync_filesystem) and the inodes
 /// leave s_inodes (evict_inodes); then SB_DYING tells walkers and
 /// mounters
-fn generic_shutdown_super(sb: &SuperBlock, g: sync::RwSemWriteGuard<'_, ()>) {
+pub fn generic_shutdown_super(sb: &SuperBlock, g: SbUmount<'_>) {
     sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
     let root = sb.root.write().take();
     if let Some(root) = root {
@@ -560,6 +623,7 @@ fn generic_shutdown_super(sb: &SuperBlock, g: sync::RwSemWriteGuard<'_, ()>) {
         // Linux ignores sync_filesystem's error here too
         let _ = super::fs_writeback::writeback_sb(sb);
         super::inode::sb_list_drain(&sb.s_inodes);
+        sb.s_op.put_super(sb);
     }
     sb.super_wake(SB_DYING);
     drop(g);
@@ -567,8 +631,12 @@ fn generic_shutdown_super(sb: &SuperBlock, g: sync::RwSemWriteGuard<'_, ()>) {
 
 /// Its kill_sb is done (Linux kill_super_notify): SB_DEAD is set under
 /// sb_lock, so no `sget` test runs on it from then on, and a mounter
-/// waiting for it (`grab_super`) is woken
+/// waiting for it (`grab_super`) is woken; once (kill_anon_super
+/// notifies before freeing its number, deactivate_locked_super after)
 fn kill_super_notify(sb: &SuperBlock) {
+    if sb.super_flags(SB_DEAD) {
+        return;
+    }
     let _l = SB_LOCK.lock();
     sb.super_wake(SB_DEAD);
 }
@@ -787,10 +855,10 @@ pub fn get_tree_super(
     test: Option<&dyn Fn(&SuperBlock) -> bool>,
     fill: impl FnOnce(&Arc<SuperBlock>) -> Result<(), KernelError>,
 ) -> Result<SbLocked, KernelError> {
-    let sb = sget(fc, s_op, test, &|_| Ok(()))?;
+    let sb = sget(fc, s_op, test, &set_anon_super)?;
     if !sb.has_root() {
         fill(&sb)?;
-        sb.s_flags.fetch_or(SB_ACTIVE, Ordering::Relaxed);
+        sb.set_active();
     }
     Ok(sb)
 }
@@ -837,10 +905,12 @@ pub fn get_tree_bdev(
         return Err(KernelError::InvalidArgument);
     }
     let bdev = lookup_bdev(fc.source)?;
-    get_tree_nodev(fc, s_op, |sb| {
-        sb.set_bdev(bdev.open_handle()?);
-        fill(sb)
-    })
+    let dev = bdev.dev.encode();
+    let sb = sget(fc, s_op, None, &|sb| set_bdev_super(sb, dev))?;
+    sb.set_bdev(bdev.open_handle()?);
+    fill(&sb)?;
+    sb.set_active();
+    Ok(sb)
 }
 
 /// The mountable superblock of `fc` (Linux vfs_get_tree): its type's
@@ -893,8 +963,10 @@ pub struct SuperBlock {
     /// dentry is made
     s_d_op: spin::Once<&'static super::dentry::DentryOps>,
 
-    /// Unique device ID for this filesystem instance (for stat st_dev)
-    pub dev_id: u64,
+    /// Its device number (Linux s_dev, a kernel dev_t: major << 20 |
+    /// minor): the device's for a device filesystem, else an anonymous
+    /// one; set by `sget`'s `set` before it is listed, fixed after
+    s_dev: AtomicU32,
 
     /// Largest file size (Linux s_maxbytes): writes are cut short at it,
     /// growing past it is EFBIG. Set by the filesystem at mount.
@@ -968,7 +1040,7 @@ impl SuperBlock {
             s_writers: AtomicU64::new(0),
             s_mounts: Mutex::new(WeakList::new()),
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
-            dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
+            s_dev: AtomicU32::new(0),
             s_maxbytes: AtomicU64::new(MAX_LFS_FILESIZE),
             private: RwLock::new(None),
             s_bdev: spin::Once::new(),
@@ -979,6 +1051,29 @@ impl SuperBlock {
             s_wb_err: crate::util::errseq::ErrSeq::new(),
             s_umount: sync::RwSem::new(()),
         }
+    }
+
+    /// Filled (Linux sb->s_flags |= SB_ACTIVE after fill_super)
+    pub fn set_active(&self) {
+        self.s_flags.fetch_or(SB_ACTIVE, Ordering::Relaxed);
+    }
+
+    /// Its device number (Linux s_dev)
+    pub fn dev(&self) -> u32 {
+        self.s_dev.load(Ordering::Relaxed)
+    }
+
+    /// Its device number's major and minor (Linux MAJOR, MINOR)
+    pub fn dev_major_minor(&self) -> (u32, u32) {
+        let d = self.dev();
+        (d >> MINORBITS, d & ((1 << MINORBITS) - 1))
+    }
+
+    /// Its device number as st_dev (Linux new_encode_dev)
+    pub fn st_dev(&self) -> u64 {
+        let (ma, mi) = self.dev_major_minor();
+        let (ma, mi) = (u64::from(ma), u64::from(mi));
+        (mi & 0xff) | (ma << 8) | ((mi & !0xff) << 12)
     }
 
     /// It has its root dentry: filled (Linux sb->s_root set)
@@ -1300,6 +1395,7 @@ mod tests {
         name: "sbtest1",
         fs_flags: 0,
         mount: t1_mount,
+        kill_sb: kill_anon_super,
         file_ops: &crate::fs::RAMFS_FILE_OPS,
         next: FsNext::new(None),
         fs_supers: FsSupers::new(WeakList::new()),
@@ -1328,6 +1424,7 @@ mod tests {
         name: "sbtest2",
         fs_flags: 0,
         mount: t2_mount,
+        kill_sb: kill_anon_super,
         file_ops: &crate::fs::RAMFS_FILE_OPS,
         next: FsNext::new(None),
         fs_supers: FsSupers::new(WeakList::new()),

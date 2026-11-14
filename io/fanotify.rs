@@ -687,7 +687,9 @@ pub fn sys_fanotify_mark(
     // or (simplified) a mount mark, else the inode number
     let inode = dentry.get_inode();
     let target_id = if (mark_flags & (FAN_MARK_FILESYSTEM | FAN_MARK_MOUNT)) != 0 {
-        inode.and_then(|i| i.sb.upgrade()).map_or(0, |sb| sb.dev_id)
+        inode
+            .and_then(|i| i.sb.upgrade())
+            .map_or(0, |sb| sb.st_dev())
     } else {
         inode.ok_or(KernelError::NotFound)?.ino
     };

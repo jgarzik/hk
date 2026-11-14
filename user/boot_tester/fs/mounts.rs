@@ -52,6 +52,7 @@ pub fn run_tests() {
     report_r(b"UMOUNT_EXPIRE_BUSY", expire_busy());
     report_r(b"UMOUNT_EXPIRE_SUBMOUNT", expire_submount());
     report_r(b"MOUNT_HARDLINK", hardlink());
+    report_r(b"ANON_DEV_REUSE", anon_dev());
 }
 
 fn ramfs(target: &[u8]) -> i64 {
@@ -858,6 +859,34 @@ fn expire_submount() -> R {
 
 /// Hard links are different mountpoints: a bind on one leaves the other
 /// showing the file, and it can be unlinked
+/// A filesystem without a device gets an anonymous device number
+/// (Linux set_anon_super: major 0, the lowest free minor from 1), given
+/// back at its shutdown (kill_anon_super), so the next one reuses it
+fn anon_dev() -> R {
+    let p = b"/tmp/anon_dev\0";
+    sys_mkdir(p.as_ptr(), 0o755);
+    let major = |d: u64| ((d >> 8) & 0xfff) | ((d >> 32) & !0xfff);
+    let minor = |d: u64| (d & 0xff) | ((d >> 12) & !0xff);
+    let once = || -> Result<u64, i64> {
+        let m = ramfs(p);
+        if m != 0 {
+            return Err(m);
+        }
+        let d = dev(p);
+        sys_umount2(p.as_ptr(), 0);
+        d
+    };
+    let r = (|| {
+        let a = once().map_err(|e| (&b"mount 1"[..], e))?;
+        let b = once().map_err(|e| (&b"mount 2"[..], e))?;
+        check(b"anonymous major", major(a) == 0, major(a) as i64)?;
+        check(b"minor from 1", minor(a) >= 1, minor(a) as i64)?;
+        check(b"reused", a == b, b as i64)
+    })();
+    sys_rmdir(p.as_ptr());
+    r
+}
+
 fn hardlink() -> R {
     touch(b"/tmp/hl_a\0");
     sys_link(b"/tmp/hl_a\0".as_ptr(), b"/tmp/hl_b\0".as_ptr());

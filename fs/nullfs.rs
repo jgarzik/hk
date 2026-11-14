@@ -222,6 +222,7 @@ pub static NULLFS_TYPE: FileSystemType = FileSystemType {
     name: "nullfs",
     fs_flags: super::superblock::fs_flags::FS_PSEUDO,
     mount,
+    kill_sb: crate::fs::superblock::kill_anon_super,
     file_ops: &NULLFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

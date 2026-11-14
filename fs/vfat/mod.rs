@@ -2512,6 +2512,12 @@ pub static VFAT_FILE_OPS: VfatFileOps = VfatFileOps;
 pub struct VfatSuperOps;
 
 impl SuperOps for VfatSuperOps {
+    /// Its filesystem data goes (Linux fat_put_super: the sbi freed)
+    fn put_super(&self, sb: &SuperBlock) {
+        let sbi = sb.private.write().take();
+        drop(sbi);
+    }
+
     fn statfs(&self, _sb: &SuperBlock) -> StatFs {
         // TODO: Could provide actual block counts from VfatSbData if available
         // For now, return minimal valid values
@@ -2699,6 +2705,7 @@ pub static VFAT_TYPE: FileSystemType = FileSystemType {
     name: "vfat",
     fs_flags: fs_flags::FS_REQUIRES_DEV,
     mount: vfat_get_tree,
+    kill_sb: crate::fs::superblock::kill_block_super,
     file_ops: &VFAT_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
