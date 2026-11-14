@@ -7,15 +7,22 @@
 //!   sends a FIN, not a RST (Linux __tcp_close: tcp_close_state goes to
 //!   FIN_WAIT_1, tcp_send_fin); the timeout resends the SYN-ACK; the
 //!   peer's ACK and FIN take it to TIME_WAIT
+//! - TCP_LISTEN_CLOSE_REQ: a listener closed with a half-open
+//!   connection sends nothing (Linux inet_csk_listen_stop leaves request
+//!   socks alone; reqsk_timer_handler drops them silently); the peer's
+//!   ACK afterwards gets the RST of no socket
+//! - TCP_LISTEN_CLOSE_ACCEPTQ: a listener closed with a completed,
+//!   unaccepted connection resets it (inet_child_forget): ECONNRESET
 
 use hk_syscall::{
     AF_INET, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_RAW, SOCK_STREAM, sys_bind, sys_getsockopt,
-    sys_recvfrom, sys_socket,
+    sys_listen, sys_recvfrom, sys_socket,
 };
 
 use crate::harness::T;
 use crate::net::nl::{NLM_F_CREATE, NLM_F_EXCL, Nl, route};
 use crate::net::sk::*;
+use crate::net::tcp_xfer::set_timeo;
 
 /// The played peer's address (TEST-NET-1), routed out lo
 const VOID: [u8; 4] = [192, 0, 2, 78];
@@ -23,14 +30,18 @@ const PEER_PORT: u16 = 7781;
 const AF_PACKET: i32 = 17;
 const ETH_P_IP: u16 = 0x0800;
 const IPPROTO_RAW: i32 = 255;
+const ECONNRESET: i64 = -104;
 
 const FIN: u8 = 0x01;
 const SYN: u8 = 0x02;
+const RST: u8 = 0x04;
 const ACK: u8 = 0x10;
 
 pub fn run_tests() {
     crate::helpers::println(b"=== TCP SYN_RECEIVED Close Tests ===");
     test_simopen_close();
+    test_listen_close_req();
+    test_listen_close_acceptq();
 }
 
 /// A TCP segment as captured
@@ -228,5 +239,44 @@ fn test_simopen_close() {
         f == i64::from(ACK) && seq == iss + 2 && ack == Y + 2,
         f,
     );
+    t.done();
+}
+
+fn test_listen_close_req() {
+    const Y: u32 = 0x2000_0000;
+    let mut t = T::new(b"TCP_LISTEN_CLOSE_REQ");
+    let Some(peer) = Peer::new(&mut t) else {
+        return t.done();
+    };
+    let l = tcp();
+    bind(l, LO, 0);
+    let pl = port(l);
+    t.eq(b"listen", sys_listen(l, 8), 0);
+    t.eq(b"peer syn", peer.send(pl, Y, 0, SYN), 40);
+    let (f, s, ack) = got(peer.from(pl, 1000));
+    t.ok(b"syn-ack", f == i64::from(SYN | ACK) && ack == Y + 1, f);
+    // Neither a RST at close nor a SYN-ACK resent after it
+    close(l);
+    t.eq(b"silent", got(peer.from(pl, 1500)).0, -1);
+    // The request is gone: the completing ACK finds no socket
+    t.eq(b"peer ack", peer.send(pl, Y + 1, s + 1, ACK), 40);
+    let (f, seq, _) = got(peer.from(pl, 1000));
+    t.eq(b"reset", f, i64::from(RST));
+    t.ok(b"reset seq", seq == s + 1, seq as i64);
+    t.done();
+}
+
+fn test_listen_close_acceptq() {
+    let mut t = T::new(b"TCP_LISTEN_CLOSE_ACCEPTQ");
+    let l = tcp();
+    bind(l, LO, 0);
+    sys_listen(l, 8);
+    let c = tcp();
+    set_timeo(c, 5000);
+    t.eq(b"connect", connect(c, LO, port(l)), 0);
+    close(l);
+    let mut b = [0u8; 4];
+    t.eq(b"reset", recv(c, &mut b, 0), ECONNRESET);
+    close(c);
     t.done();
 }

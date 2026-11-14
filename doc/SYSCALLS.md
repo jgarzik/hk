@@ -334,7 +334,8 @@ probes, tcp_congestion_control, tcp_available_congestion_control.
 yet: SACK (never advertised), receive buffer autotuning, the per-netns
 challenge-ACK budget (out-of-window and challenge ACKs are limited per
 connection to one per 500 ms like tcp_invalid_ratelimit); listeners keep full child sockets in SYN_RECEIVED
-(no SYN cookies).
+(no SYN cookies), which act as Linux request socks (a closed
+listener's are dropped silently by their timer or next segment).
 
 - [x] socket (AF_INET: TCP, UDP, ping SOCK_DGRAM/IPPROTO_ICMP gated by
   ping_group_range, SOCK_RAW with CAP_NET_RAW: IP_HDRINCL, SOL_RAW

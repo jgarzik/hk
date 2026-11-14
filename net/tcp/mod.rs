@@ -489,10 +489,18 @@ impl TcpSock {
         }
         let mut ready = None;
         if out.established
-            && let Some(p) = g.parent.take().and_then(|w| w.upgrade())
-            && p.child_ready(&self.arc())
+            && let Some(w) = g.parent.take()
         {
-            ready = Some(p);
+            match w.upgrade() {
+                Some(p) if p.child_ready(&self.arc()) => ready = Some(p),
+                // The listener stopped listening: the new child is
+                // aborted (Linux inet_csk_complete_hashdance ->
+                // inet_child_forget -> tcp_disconnect)
+                _ => {
+                    g.cb.orphan = true;
+                    g.cb.disconnect(out);
+                }
+            }
         }
         if out.done {
             if let Some(p) = g.parent.take().and_then(|w| w.upgrade()) {
@@ -708,16 +716,42 @@ impl TcpSock {
     /// A segment found for this socket under `t` in ehash or lhash
     /// (Linux tcp_v4_rcv's socket part): processed at once unless the
     /// socket is owned, else queued to the backlog for the owner
-    fn rcv(&self, skb: Box<SkBuff>, t: Tuple) {
+    /// A request whose listener stopped listening is dropped and the
+    /// segment handed back to be looked up again (Linux tcp_v4_rcv:
+    /// inet_csk_reqsk_queue_drop_and_put, goto lookup).
+    fn rcv(&self, skb: Box<SkBuff>, t: Tuple) -> Option<Box<SkBuff>> {
         let mut b = self.lock.bh_lock();
         match self.bh_get(&mut b) {
             Some(g) => {
                 let mut out = Out::default();
+                if g.tuple == Some(t) && self.req_dead(g) {
+                    self.req_drop(g, &mut out);
+                    self.finish(g, &mut out);
+                    return Some(skb);
+                }
                 self.do_rcv(g, skb, t, now_ms(), &mut out);
                 self.finish(g, &mut out);
             }
             None => self.add_backlog(b, skb),
         }
+        None
+    }
+
+    /// A listener's child still in SYN_RECEIVED (Linux's request sock)
+    /// whose listener is no longer listening (closed, or gone)
+    fn req_dead(&self, g: &Inner) -> bool {
+        g.cb.passive
+            && g.cb.state == TcpState::SynReceived
+            && g.parent
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_none_or(|p| p.state() != TcpState::Listen)
+    }
+
+    /// Drop a dead request silently: it leaves the tables, its timer
+    /// stops (Linux inet_csk_reqsk_queue_drop)
+    fn req_drop(&self, g: &mut Inner, out: &mut Out) {
+        g.cb.set_closed(out);
     }
 
     /// Linux tcp_add_backlog: over rcvbuf * 2 + sndbuf / 2 + 64 KiB of
@@ -786,7 +820,9 @@ impl TcpSock {
     /// LISTEN meanwhile takes the locked path
     fn listen_rcv(&self, skb: Box<SkBuff>, t: Tuple) {
         if self.state() != TcpState::Listen {
-            return self.rcv(skb, t);
+            // Not a request: nothing comes back
+            drop(self.rcv(skb, t));
+            return;
         }
         let s = skb.tcp;
         drop(skb);
@@ -916,15 +952,19 @@ impl TcpSock {
 
     /// A child completed its handshake (Linux inet_csk_complete_hashdance;
     /// under the child's lock). True: it was queued, the step wakes the
-    /// listener under the child's lock (Linux tcp_child_process).
+    /// listener under the child's lock (Linux tcp_child_process). False:
+    /// not listening (Linux inet_csk_reqsk_queue_add); a request made
+    /// before the listener closed and listened again is queued too, as
+    /// in Linux (the request still names its listener).
     fn child_ready(&self, c: &Arc<TcpSock>) -> bool {
         let mut q = self.queue.lock();
         let Some(q) = q.as_mut() else {
             return false;
         };
-        let Some(r) = q.syn.remove_first(|x| core::ptr::eq(x, Arc::as_ptr(c))) else {
-            return false;
-        };
+        let r = q
+            .syn
+            .remove_first(|x| core::ptr::eq(x, Arc::as_ptr(c)))
+            .unwrap_or_else(|| c.clone());
         q.ready.push_back(r);
         true
     }
@@ -1101,12 +1141,20 @@ impl TcpSock {
             || self.sk.shutdown() & SEND_SHUTDOWN != 0
     }
 
-    /// Abort children of a closed listener (Linux inet_csk_listen_stop)
+    /// The queues of a listener that stopped listening (Linux
+    /// inet_csk_listen_stop): children not yet accepted are aborted, a
+    /// RST to each peer (inet_child_forget -> tcp_disconnect); requests
+    /// (children in SYN_RECEIVED) are left alone: each is dropped
+    /// silently when its timer fires, or when a segment comes, which is
+    /// then looked up again (`req_dead`; Linux reqsk_timer_handler,
+    /// tcp_v4_rcv)
     fn listen_stop(&self, mut q: Accept) {
-        while let Some(c) = q.syn.pop_front().or_else(|| q.ready.pop_front()) {
+        while q.syn.pop_front().is_some() {}
+        while let Some(c) = q.ready.pop_front() {
             c.step(|g, out| {
                 g.parent = None;
-                g.cb.close(true, now_ms(), out);
+                g.cb.orphan = true;
+                g.cb.disconnect(out);
             });
         }
     }
@@ -1202,7 +1250,7 @@ impl TcpSock {
         match self.bh_get(&mut b) {
             Some(g) => {
                 let mut out = Out::default();
-                g.cb.on_timer(now_ms(), &mut out);
+                self.on_timer(g, now_ms(), &mut out);
                 self.finish(g, &mut out);
                 true
             }
@@ -1210,6 +1258,16 @@ impl TcpSock {
                 b.defer(deferred::TIMER);
                 false
             }
+        }
+    }
+
+    /// The control block's due timer work; a dead request is dropped
+    /// instead of resending its SYN-ACK (Linux reqsk_timer_handler)
+    fn on_timer(&self, g: &mut Inner, now: u64, out: &mut Out) {
+        if self.req_dead(g) {
+            self.req_drop(g, out);
+        } else {
+            g.cb.on_timer(now, out);
         }
     }
 }
@@ -1234,7 +1292,7 @@ impl SockHooks<Inner> for TcpSock {
         let mut out = Out::default();
         let now = now_ms();
         if flags & deferred::TIMER != 0 {
-            g.cb.on_timer(now, &mut out);
+            self.on_timer(g, now, &mut out);
         }
         if flags & deferred::MTU != 0 && !matches!(g.cb.state, TcpState::Listen | TcpState::Closed)
         {
@@ -1303,14 +1361,21 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
     let dev = skb.dev.take();
     let dif = dev.as_ref().map_or(0, |d| d.ifindex());
     let now = now_ms();
-    let skb = match net.tcp.lookup(&t) {
-        Some(Ent::Sk(sk)) => return sk.rcv(skb, t),
-        // A TIME_WAIT entry consumes it unless it is a new SYN
-        Some(Ent::Tw(tw)) => match tw.rcv(skb, now) {
-            Some(skb) => skb,
-            None => return,
-        },
-        None => skb,
+    let mut skb = skb;
+    let skb = loop {
+        match net.tcp.lookup(&t) {
+            // A dead request hands the segment back, dropped from ehash
+            Some(Ent::Sk(sk)) => match sk.rcv(skb, t) {
+                Some(again) => skb = again,
+                None => return,
+            },
+            // A TIME_WAIT entry consumes it unless it is a new SYN
+            Some(Ent::Tw(tw)) => match tw.rcv(skb, now) {
+                Some(skb) => break skb,
+                None => return,
+            },
+            None => break skb,
+        }
     };
     if let Some(l) = net.tcp.listener(daddr, t.lport, dif) {
         return l.listen_rcv(skb, t);
