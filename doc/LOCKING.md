@@ -1500,14 +1500,17 @@ the stop has ended (`Task.sig`, rechecked after each wakeup) or
 SIGKILL. The tracer's wait walks its tracees under the read lock and
 takes a stop's code under that tracee's `Task.sig` (Linux
 wait_task_stopped); resume, detach and the tracer's exit
-(`exit_ptrace`) end the stop and set the code to deliver under it, then
-`try_to_wake_up` the tracee. The tracer's exit detaches
-one tracee per write section; a PTRACE_O_EXITKILL tracee's SIGKILL is
-queued in that section before the detach (`sigkill_held`, Linux
-exit_ptrace under tasklist_lock: SIGKILL takes no queue entry, so
-nothing allocates), so a tracee woken by anything between the section
-and its wakeup still dies before user code; the kill's group effects
-and wakeups are done in that section too. SIGKILL ends the stop
+(`exit_ptrace`) end the stop, set the code to deliver and
+`try_to_wake_up` the tracee under it (`ptrace_wake`, Linux
+ptrace_resume and __ptrace_unlink's ptrace_signal_wake_up under
+siglock); detach and the tracer's exit do so in the TASKLIST write
+section that untraces it (Linux __ptrace_detach under tasklist_lock).
+The tracer's exit detaches one tracee per write section; a
+PTRACE_O_EXITKILL tracee's SIGKILL is sent in that section before
+the detach (`sigkill_held`, Linux exit_ptrace under tasklist_lock:
+SIGKILL takes no queue entry, so nothing allocates), its group
+effects and wakeups done there too, so the tracee never runs untraced
+user code. SIGKILL ends the stop
 under the `Task.sig` hold that queues it (`sigkill_task`, Linux
 signal_wake_up(fatal) clearing JOBCTL_TRACED under siglock), so a wait
 after the kill never reports the stop, and a kill needs no TASKLIST
@@ -1521,7 +1524,8 @@ leaving `ptrace_stop`), so no stale flag outlives a stop; while it is
 set, SIGKILL leaves the stop alone (`sigkill_task`, and the tracee,
 woken, sleeps `Uninterruptible` once it reads frozen with SIGKILL
 pending), and the guard's drop ends a stop with SIGKILL pending and
-wakes the tracee (Linux ptrace_unfreeze_traced). The tracee's user
+wakes the tracee under its `Task.sig` (Linux ptrace_unfreeze_traced).
+The tracee's user
 register frame is touched only through `ptrace::with_stopped_regs`
 (the arch register and single-step helpers): TASKLIST's read lock,
 then the tracee's `Task.sig`, held across the frame access (a stop
