@@ -303,6 +303,13 @@ impl Mount {
         self.mnt_ns.load(Ordering::Relaxed)
     }
 
+    /// Mounted in some namespace, not a kernel mount (Linux is_mounted:
+    /// mnt_ns neither NULL nor MNT_NS_INTERNAL)
+    pub fn is_mounted(&self) -> bool {
+        let ns = self.ns();
+        ns != 0 && ns != MNT_NS_INTERNAL
+    }
+
     /// A kernel mount, in no namespace of its own (Linux kern_mount's
     /// MNT_NS_INTERNAL): its references take the fast path, and it is
     /// never taken out; set before the mount is shared

@@ -192,9 +192,10 @@ fn change_type(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError
         _ => return Err(KernelError::InvalidArgument),
     };
     let ns = super::mount::namespace_lock();
-    // Mounted in some namespace (Linux may_change_propagation: not
-    // necessarily the caller's)
-    if m.ns() == 0 {
+    // Mounted in some namespace, not a kernel mount (Linux
+    // may_change_propagation's IS_ERR_OR_NULL(mnt_ns): not necessarily
+    // the caller's)
+    if !m.is_mounted() {
         return Err(KernelError::InvalidArgument);
     }
     if flags & ms::REC != 0 {
