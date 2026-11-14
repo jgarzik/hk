@@ -3,8 +3,9 @@
 //! A [`BlHead`] is one word: the first entry's [`Link`], with bit 0 as
 //! a spinning bit lock (Linux hlist_bl_lock / bit_spin_lock), so a
 //! table of them costs a pointer per bucket. Entries are linked through
-//! an [`Adapter`]'s link and the bucket owns a strong reference to each
-//! (`Arc::into_raw` on insert, back on removal): an entry lives at
+//! an [`Adapter`]'s link and the bucket owns a counted reference to
+//! each (a [`RefPtr`], an `Arc` by default: `into_raw` on insert, back
+//! on removal): an entry lives at
 //! least as long as it is hashed, and every operation is safe. A link's
 //! `prev` is null for the first entry (Linux's pprev points into the
 //! head). Removal walks the chain to check the entry is there (chains
@@ -21,7 +22,7 @@ use core::marker::PhantomData;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use super::list::{Adapter, Link};
+use super::list::{Adapter, Link, RefPtr};
 use crate::sync::spin::{RawClass, raw_enter, raw_leave};
 
 /// The lock bit in a head (Linux LIST_BL_LOCKMASK)
@@ -35,22 +36,22 @@ static CLASS: RawClass = RawClass::new();
 /// # Invariants
 /// Apart from `LOCK`, `first` is the first entry's link (or null); from
 /// it `next` runs through the links of live items, each inserted with
-/// `Arc::into_raw` (the bucket holds that reference) and on no other
+/// `P::into_raw` (the bucket holds that reference) and on no other
 /// list through this link, each one's `prev` the link before it (null
 /// for the first). The chain changes only under `LOCK`.
-pub struct BlHead<A: Adapter> {
+pub struct BlHead<A: Adapter, P: RefPtr<Target = A::Item> = Arc<<A as Adapter>::Item>> {
     first: AtomicPtr<Link>,
-    /// It drops `Arc<Item>`s wherever it goes: Send/Sync as Arc's
-    _owns: PhantomData<Arc<A::Item>>,
+    /// It drops `P`s wherever it goes: Send/Sync as P's
+    _owns: PhantomData<(fn() -> A, P)>,
 }
 
 // SAFETY: the chain is only touched under `LOCK` (type invariant) and
-// the bucket hands out `Arc<Item>` clones: Send/Sync as `Arc<Item>`
-unsafe impl<A: Adapter> Send for BlHead<A> where A::Item: Send + Sync {}
+// the bucket hands out `P` clones: Send/Sync as `P`
+unsafe impl<A: Adapter, P: RefPtr<Target = A::Item> + Send + Sync> Send for BlHead<A, P> {}
 // SAFETY: as above
-unsafe impl<A: Adapter> Sync for BlHead<A> where A::Item: Send + Sync {}
+unsafe impl<A: Adapter, P: RefPtr<Target = A::Item> + Send + Sync> Sync for BlHead<A, P> {}
 
-impl<A: Adapter> BlHead<A> {
+impl<A: Adapter, P: RefPtr<Target = A::Item>> BlHead<A, P> {
     pub const fn new() -> Self {
         Self {
             first: AtomicPtr::new(null_mut()),
@@ -59,7 +60,7 @@ impl<A: Adapter> BlHead<A> {
     }
 
     /// Take the bucket's bit lock (Linux hlist_bl_lock)
-    pub fn lock(&self) -> BlGuard<'_, A> {
+    pub fn lock(&self) -> BlGuard<'_, A, P> {
         let id = core::ptr::from_ref(self).addr();
         raw_enter(id, &CLASS);
         while self.first.fetch_or(LOCK, Ordering::Acquire).addr() & LOCK != 0 {
@@ -75,13 +76,13 @@ impl<A: Adapter> BlHead<A> {
     }
 }
 
-impl<A: Adapter> Default for BlHead<A> {
+impl<A: Adapter, P: RefPtr<Target = A::Item>> Default for BlHead<A, P> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<A: Adapter> Drop for BlHead<A> {
+impl<A: Adapter, P: RefPtr<Target = A::Item>> Drop for BlHead<A, P> {
     fn drop(&mut self) {
         let mut g = self.lock();
         while let Some(i) = g.find(|_| true) {
@@ -92,14 +93,14 @@ impl<A: Adapter> Drop for BlHead<A> {
 
 /// A locked bucket: releases the bit lock when dropped
 #[must_use]
-pub struct BlGuard<'a, A: Adapter> {
-    head: &'a BlHead<A>,
+pub struct BlGuard<'a, A: Adapter, P: RefPtr<Target = A::Item> = Arc<<A as Adapter>::Item>> {
+    head: &'a BlHead<A, P>,
     id: usize,
     /// Holding a lock is CPU state (the preempt count)
     _not_send: PhantomData<*const ()>,
 }
 
-impl<A: Adapter> BlGuard<'_, A> {
+impl<A: Adapter, P: RefPtr<Target = A::Item>> BlGuard<'_, A, P> {
     fn first(&self) -> *mut Link {
         self.head
             .first
@@ -141,7 +142,7 @@ impl<A: Adapter> BlGuard<'_, A> {
 
     /// Hash `item` at the head (Linux hlist_bl_add_head_rcu); panics if
     /// its link is on a list
-    pub fn add_head(&mut self, item: Arc<A::Item>) {
+    pub fn add_head(&mut self, item: P) {
         assert!(A::link(&item).claim(), "hlist_bl: item already linked");
         let l = Self::link(&item);
         let f = self.first();
@@ -156,13 +157,13 @@ impl<A: Adapter> BlGuard<'_, A> {
         }
         // INVARIANT: `l` heads the chain, its item's reference kept by
         // the bucket (`into_raw`)
-        let _ = Arc::into_raw(item);
+        let _ = P::into_raw(item);
         self.set_first(l);
     }
 
     /// Unhash `item` (Linux hlist_bl_del) and hand back the bucket's
     /// reference; None if it is not in this bucket
-    pub fn del(&mut self, item: &A::Item) -> Option<Arc<A::Item>> {
+    pub fn del(&mut self, item: &A::Item) -> Option<P> {
         let l = self.find_link(item)?;
         // SAFETY: `l` and its neighbours are links of this bucket (just
         // found), live, the lock held
@@ -181,12 +182,12 @@ impl<A: Adapter> BlGuard<'_, A> {
         }
         // SAFETY: hashed by `add_head`'s `into_raw`, whose reference the
         // bucket held until now
-        Some(unsafe { Arc::from_raw(core::ptr::from_ref(item)) })
+        Some(unsafe { P::from_raw(core::ptr::from_ref(item)) })
     }
 
     /// The first entry for which `pred` holds, as a new reference: one
     /// walk of the chain (Linux hlist_bl_for_each_entry)
-    pub fn find(&self, pred: impl Fn(&A::Item) -> bool) -> Option<Arc<A::Item>> {
+    pub fn find(&self, pred: impl Fn(&A::Item) -> bool) -> Option<P> {
         let mut l = self.first();
         while !l.is_null() {
             // SAFETY: a link of this bucket, inside a live item (type
@@ -195,11 +196,9 @@ impl<A: Adapter> BlGuard<'_, A> {
             // SAFETY: live while hashed, and the lock is held
             let item = unsafe { &*p };
             if pred(item) {
-                // SAFETY: `p` came from `Arc::into_raw` and the bucket
+                // SAFETY: `p` came from `P::into_raw` and the bucket
                 // still holds that reference
-                unsafe { Arc::increment_strong_count(p) };
-                // SAFETY: the reference just taken
-                return Some(unsafe { Arc::from_raw(p) });
+                return Some(unsafe { P::clone_raw(p) });
             }
             l = Self::next(l);
         }
@@ -207,7 +206,7 @@ impl<A: Adapter> BlGuard<'_, A> {
     }
 }
 
-impl<A: Adapter> Drop for BlGuard<'_, A> {
+impl<A: Adapter, P: RefPtr<Target = A::Item>> Drop for BlGuard<'_, A, P> {
     #[inline]
     fn drop(&mut self) {
         self.head.first.fetch_and(!LOCK, Ordering::Release);
