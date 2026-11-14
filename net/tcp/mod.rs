@@ -1079,8 +1079,9 @@ impl TcpSock {
     }
 
     /// tcp_disconnect's part under the socket lock: stop listening,
-    /// abort, clear the shutdown bits and the connecting state; the
-    /// listener's queue, if any, to stop after the unlock
+    /// abort, clear the shutdown bits and the connecting state, report
+    /// the error (ECONNRESET for a connection; the report comes anyway);
+    /// the listener's queue, if any, to stop after the unlock
     fn disconnect_locked(&self, g: &mut Inner, out: &mut Out) -> Option<Accept> {
         let q = if g.cb.state == TcpState::Listen {
             self.sk.set_flag(sf::ACCEPTCONN, false);
@@ -1092,7 +1093,7 @@ impl TcpSock {
         } else {
             None
         };
-        g.cb.abort(out);
+        g.cb.disconnect(out);
         out.shut = 0;
         self.sk.clear_shutdown();
         g.connecting = false;

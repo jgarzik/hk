@@ -1249,14 +1249,7 @@ impl TcpCb {
     /// Abort: RST to a synchronized peer, then CLOSED (Linux
     /// tcp_disconnect / tcp_send_active_reset)
     pub fn abort(&mut self, out: &mut Out) {
-        if matches!(
-            self.state,
-            TcpState::SynReceived
-                | TcpState::Established
-                | TcpState::FinWait1
-                | TcpState::FinWait2
-                | TcpState::CloseWait
-        ) {
+        if self.need_reset() {
             out.ctl(Seg {
                 seq: self.snd_max,
                 ack: self.rcv_nxt,
@@ -1265,6 +1258,41 @@ impl TcpCb {
             });
         }
         self.set_closed(out);
+    }
+
+    /// Linux tcp_disconnect's abort: CLOSED, RST to a synchronized peer
+    /// or (CLOSING, LAST_ACK) one still owed data or the FIN, then
+    /// ECONNRESET for a connection made or being made. The error is
+    /// reported whether or not one was set; no state change wakeup.
+    pub fn disconnect(&mut self, out: &mut Out) {
+        let unsent = matches!(self.state, TcpState::Closing | TcpState::LastAck)
+            && self.snd_max != self.write_seq.wrapping_add(1);
+        let reset = unsent || self.state == TcpState::SynSent || self.need_reset();
+        if unsent {
+            out.ctl(Seg {
+                seq: self.snd_max,
+                ack: self.rcv_nxt,
+                flags: flags::RST | flags::ACK,
+                ..Default::default()
+            });
+        }
+        self.abort(out);
+        if reset {
+            out.err = Some(KernelError::ConnectionReset);
+        }
+        out.wake = (out.wake & !wake::STATE) | wake::ERR;
+    }
+
+    /// Linux tcp_need_reset: an abort sends RST
+    fn need_reset(&self) -> bool {
+        matches!(
+            self.state,
+            TcpState::SynReceived
+                | TcpState::Established
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::CloseWait
+        )
     }
 
     /// Drop the send queues (Linux tcp_write_queue_purge): nothing is
