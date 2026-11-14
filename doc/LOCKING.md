@@ -2754,7 +2754,7 @@ list through `Device.kset_link`, a spin leaf. Nothing allocates under
 these locks. `device_shutdown` (reboot(2)) takes the devices off the
 list's end one at a time, as Linux, and runs each bound driver's
 shutdown callback with the lock dropped, so callbacks (which may poll
-hardware or take driver locks such as `USB_CONTROLLER`) never run under
+hardware or wait on driver commands, such as an xHCI's) never run under
 it. `PciDev.driver_override` is a sleeping
 `sync::Mutex` leaf (Linux device_lock).
 Net devices: `NetNamespace::register_device` links the device on the
@@ -4383,30 +4383,68 @@ context. `dma_alloc_coherent` allocates frames (thread context only).
 
 #### USB Subsystem
 
-**Location:** `hw/usb/`
+**Location:** `hw/usb/` (`urb.rs`, `hcd.rs`, `message.rs`: Linux
+drivers/usb/core urb.c, hcd.c, message.c; `xhci.rs`, `xhci_ring.rs`:
+Linux drivers/usb/host/xhci.c, xhci-ring.c)
 
-| Lock | Type | Purpose |
-|------|------|---------|
-| `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access, thread context only, held across each (synchronous) transfer; a printk under it reaches the USB console's FIFO only (`PORT`), never the controller |
-| `XHCI_IRQ_STATE.*` | `AtomicU64`, `AtomicBool` | ISR state (lock-free) |
-| `PORT` (hw/usb/serial.rs; Linux usb_serial_port.lock) | `IrqSpinlock<Port>` | The USB serial console's device (slot, bulk OUT endpoint; none while no FTDI port is the console) and its write FIFO (4 KiB, Linux write_fifo). Leaf, any context: the console write (under `OUTPUT_LOCK`, interrupt handlers included) queues into the FIFO under it, dropping what does not fit (Linux kfifo_in_locked), and asks the tick to kick the console (`console_defer_kick`, 3.6); the tick's kick checks the FIFO under it and queues the write work after releasing it; the write work takes a chunk out under it (Linux kfifo_out_locked) and transfers with it released; probe and remove take it alone (remove after `unregister_console` released `CONSOLE_REGISTRY`) |
-| `WRITE_BUF` (hw/usb/serial.rs; Linux the write URB and USB_SERIAL_WRITE_BUSY) | sleeping `sync::Mutex<[u8; 256]>`, thread only | The console's transfer buffer, held by the write work (`SYSTEM_WQ`) across each chunk: -> `PORT` (taking the chunk), then -> `USB_CONTROLLER` (the transfer, `PORT` released). One write work at a time; remove takes it after clearing `PORT`'s device to wait out a transfer in progress (Linux usb_kill_urb). Nothing on the transfer path prints: xHCI tracing goes to the trace ring (`trace.rs`), and a failed transfer is reported once (`ERR_ONCE`, Linux dev_err_console), so the console never queues its own transfers' messages forever |
+Linux model: a driver submits an URB (`usb_submit_urb`), the host
+controller queues its TD on the endpoint ring under its IRQ-safe lock,
+its interrupt handler consumes the event ring and gives finished URBs
+back (`usb_hcd_giveback_urb`), and their completion handlers run from
+the giveback bottom half (Linux HCD_BH on system_bh_wq; here the
+`usb_bh` workqueue's thread, `USB_BH_WQ`, as hk has no softirqs; the
+handlers keep the bottom-half rule and never sleep, so one worker
+serves every controller). Synchronous requests (`usb_control_msg`,
+`usb_bulk_msg`: Linux usb_start_wait_urb) sleep on a `Completion` the
+handler completes. Commands (Enable Slot, Address Device, Configure
+Endpoint, Reset Endpoint, Set TR Dequeue Pointer, ...) are queued on
+the command ring the same way; their completion events are matched to
+the oldest outstanding command by TRB address, and a waiter sleeps on
+its command's `Completion`. The command timer (`Xhci.cmd_timer`, a
+`DelayedWork` on `SYSTEM_WQ`, Linux xhci->cmd_timer) aborts the
+command ring when the controller sits on a command for 5 s, so no
+waiter sleeps forever. There is one `Arc<Xhci>` per bound controller;
+the USB devices below it reach it as their `Hcd` (`UsbDevice.bus`).
 
-DMA buffers never live on a kernel stack (stacks are not in the linear
-map, `mm::vmstack`; `DirectDmaOps` panics on one): the mass-storage
-CBW/CSW and the INQUIRY/READ CAPACITY data are heap buffers, the
-console's output goes through `WRITE_BUF`; control transfers
-bounce through a coherent buffer of their own.
+Cancellation (Linux usb_unlink_urb, usb_kill_urb, xhci_urb_dequeue):
+`usb_unlink_urb` (any context) marks the URB unlinked under `Urb.st`
+and its TD cancelled under `Xhci.lock`, and queues a Stop Endpoint
+nobody waits for (allocated GFP_ATOMIC, as Linux); its completion, in
+the interrupt handler, turns the cancelled TDs into No-ops, queues a
+Set TR Dequeue Pointer past one the endpoint sat on and gives back
+the others; that command's completion gives back the rest and
+restarts the endpoint. `usb_kill_urb` (thread, may sleep) also raises
+the URB's `reject` and sleeps on `USB_KILL_URB_QUEUE` until its
+`use_count` drops, which the giveback does after the completion
+handler; the atomics' fences pair as Linux's (`reject` before
+`use_count` in the kill, the reverse in submit and giveback). A
+synchronous request that times out kills its URB before returning, so
+the caller's buffer and the URB's are never the device's after it.
+
+| Lock | Type | IRQ class | Order |
+|------|------|-----------|-------|
+| `Xhci.lock` (`xhci.rs`; Linux xhci->lock) | `IrqSpinlock<XhciState>` | any context: the interrupt handler (under its line's `IrqDesc.lock`), URB submission, command queueing and the command timeout work (thread) | `IrqDesc.lock` -> `Xhci.lock` -> {`Urb.st`, `GivebackBh.list`, the `usb_bh` and system workqueues' locks (`queue_work`, `mod_delayed_work`, `cancel_delayed_work`), a command's `Completion` (`done` -> wait queue -> run queue), the slab (the commands the interrupt handler queues for a halted endpoint are allocated GFP_ATOMIC, as Linux), the trace ring, printk on error paths}. Holds the command and event rings, the command list, each device's contexts, endpoint rings, TD lists and endpoint state. Never sleeps or waits: the command abort releases it for its handshake (Linux xhci_abort_cmd_ring); halt and reset poll the controller under it, as Linux xhci_stop. Queueing never allocates: TD and command lists have their room reserved with the ring. No URB is freed under it (a finished TD's URB reference moves to the bottom half's list) |
+| `Xhci.mutex` (`xhci.rs`; Linux xhci->mutex) | sleeping `sync::Mutex<()>` | thread only | serializes slot and context commands, held across their waits: Enable Slot with Address Device, Evaluate Context, Configure Endpoint, Disable Slot; -> `Xhci.lock` |
+| `Urb.st` (`urb.rs`; Linux urb->status, actual_length, unlinked, hcpriv) | `IrqSpinlock` | any context | leaf: under `Xhci.lock` (the length measured from an event) or alone (submit, giveback, the buffer copies, which only happen while the URB is not queued) |
+| `GivebackBh.list` (`hcd.rs`; Linux giveback_urb_bh.lock) | `IrqSpinlock<ArcList<Urb>>` | any context | leaf, under `Xhci.lock`: given-back URBs; the `usb_bh` work takes the whole list out under it and runs the completion handlers with nothing held. A work queued while running runs again (WORK_RERUN), as Linux's re-queues itself |
+| `PORT` (hw/usb/serial.rs; Linux usb_serial_port.lock) | `IrqSpinlock<Port>` | any context | The USB serial console's device (slot, bulk OUT endpoint; none while no FTDI port is the console), its write FIFO (4 KiB, Linux write_fifo), its write URB and busy flag (Linux write_urbs[0], USB_SERIAL_WRITE_BUSY). Leaf: the console write (under `OUTPUT_LOCK`, interrupt handlers included) queues into the FIFO under it, dropping what does not fit (Linux kfifo_in_locked), and asks the tick to kick the console (`console_defer_kick`, 3.6); the tick's kick checks it and queues the write work after releasing it; the write start (the write work on `SYSTEM_WQ`, or the URB's completion handler in the giveback bottom half) takes a chunk out and marks the URB busy under it (Linux kfifo_out_locked), then fills and submits the URB with it released (`Urb.st`, `Xhci.lock`); the completion handler clears busy under it. Probe and remove take it alone (remove after `unregister_console` released `CONSOLE_REGISTRY`), remove taking the URB out and poisoning it (`usb_poison_urb`, Linux usb_serial_port_poison_urbs: waits for its giveback, refuses resubmission) with it released. Nothing on the transfer path prints: xHCI tracing goes to the trace ring (`trace.rs`), and a failed transfer is reported once (`ERR_ONCE`, Linux dev_err_console), so the console never queues its own transfers' messages forever |
+| `PORT_DEV` (hw/usb/serial.rs; Linux port->serial->dev) | sleeping `sync::Mutex`, thread only | leaf: the console port's device and bulk IN endpoint, set by probe and cleared by remove, cloned out for the boot self-test |
+
+Transfer buffers are coherent DMA memory allocated with each URB
+(Linux usb_alloc_coherent with URB_NO_TRANSFER_DMA_MAP), aligned so
+no TRB buffer crosses a 64 KiB boundary unsplit; the synchronous
+requests copy the caller's data in and out, so callers may pass any
+buffer, the stack included.
 
 Enumeration (descriptor reads, Evaluate Context, Configure Endpoint,
-SET_CONFIGURATION) runs in the xHCI probe on the controller it owns,
-before it is published in `USB_CONTROLLER`: no lock. The devices are
-then registered under the PCI device's lock: the root hub `usb1`, its
-generic driver's probe adding the interfaces under `usb1`'s device
-lock, then each port's device the same way, so device locks nest PCI
-function -> usb_device -> interface (parent before child, as Linux);
-interface drivers' probes (usb-storage's SCSI scan) take
-`USB_CONTROLLER` per transfer under them.
+SET_CONFIGURATION) runs in the xHCI probe, after its interrupt handler
+is registered and the controller started, with `Xhci.mutex` around the
+slot and context commands. The devices are then registered under the
+PCI device's lock: the root hub `usb1`, its generic driver's probe
+adding the interfaces under `usb1`'s device lock, then each port's
+device the same way, so device locks nest PCI function -> usb_device ->
+interface (parent before child, as Linux); interface drivers' probes
+(usb-storage's SCSI scan) submit URBs under them.
 
 Unbinding the xHCI runs the same nesting top-down (Linux
 usb_remove_hcd): under the PCI device's lock each USB device is
@@ -4414,16 +4452,15 @@ deleted, the root hub last; its generic driver's release, under its
 lock, deletes the interfaces, whose drivers' removes run under the
 interface's lock (usb-storage: the disk's `open_mutex` for
 del_gendisk, then `UsbMscDevice.state`; ftdi_sio: `CONSOLE_REGISTRY`,
-then `PORT`, then `WRITE_BUF`). The controller is then taken out of `USB_CONTROLLER`
-(matched by PCI bus/device/function: nothing allocates under it;
-drivers' transfers fail with no device from there on) and stopped
-with no lock held: slots disabled, halted, reset, the IRQ handler
-unregistered (`IrqDesc.lock`, which waits out a running handler), memory
-freed.
-
-**ISR Pattern:** The xHCI ISR sets `interrupt_pending` atomic but does NOT acquire
-`USB_CONTROLLER` mutex. This avoids IRQ-context deadlock since the mutex is not
-IRQ-safe.
+then `PORT`, then the write URB's poisoning, then `PORT_DEV`). The controller is then stopped: each
+slot disabled (`Xhci.mutex`, a Disable Slot command, its TDs given
+back with Shutdown), then halted and reset under `Xhci.lock`, which
+marks it dying (later submissions fail with Shutdown) and gives back
+what is still queued, the command timer cancelled, the IRQ handler
+unregistered (`IrqDesc.lock`, which waits out a running handler), bus
+mastering turned off. The register mapping and the controller's
+memory go with the last `Arc<Xhci>`, which URBs a driver still holds
+keep: no access ever reaches an unmapped register.
 
 #### Block Device Subsystem
 
@@ -4905,7 +4942,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state` | hw/gfx/ | sleeping `sync::Mutex` (Linux DRM modeset locks) | framebuffer device state, DRM ioctls only |
 | `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device registry |
-| `UsbMscDevice.state` | hw/usb/msc.rs | sleeping `sync::Mutex` (Linux us->dev_mutex), thread only | a mass-storage interface's CBW tag and disconnected flag, held across each BOT transaction (CBW, data, CSW: the transfers take `USB_CONTROLLER` under it); its unbind sets the flag under it, after the disk is gone and the command in progress is done |
+| `UsbMscDevice.state` | hw/usb/msc.rs | sleeping `sync::Mutex` (Linux us->dev_mutex), thread only | a mass-storage interface's CBW tag and disconnected flag, held across each BOT transaction (CBW, data, CSW: synchronous bulk requests, sleeping on their URBs' completions, under it); its unbind sets the flag under it, after the disk is gone and the command in progress is done |
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
 | `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |
 | PCI fixups (`hw/pci/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |

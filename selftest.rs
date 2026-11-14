@@ -46,6 +46,13 @@ fn selftest_thread(_arg: usize) {
         }
     };
 
+    // 0. URB cancellation (unlink, kill, a synchronous timeout) on the
+    //    USB serial console's bulk IN endpoint, which QEMU NAKs; first,
+    //    before user space unbinds the xHCI
+    if let Some((dev, pipe)) = crate::hw::usb::serial::console_in_pipe() {
+        crate::hw::usb::urb::urb_selftest(&dev, pipe, &mut check);
+    }
+
     // 1. Scheduler tick rate: 200 ms of CLOCK_MONOTONIC is ~20 ticks
     let k0 = get_ticks();
     sleep_ms(200);

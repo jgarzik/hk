@@ -2,22 +2,28 @@
 //!
 //! The host controller (xHCI), the USB core on the device core
 //! (`usbcore`: devices, interfaces, the generic driver; `driver`: id
-//! matching and uevents; `config`: descriptor parsing) and the device
-//! drivers (usb-storage, ftdi_sio).
+//! matching and uevents; `config`: descriptor parsing; `urb`, `hcd`,
+//! `message`: requests to the host controller) and the device drivers
+//! (usb-storage, ftdi_sio).
 
 pub mod config;
 pub mod context;
 pub mod driver;
 pub mod ext_caps;
+pub mod hcd;
+pub mod message;
 pub mod msc;
 pub mod pci_quirks;
 pub mod serial;
 pub mod transfer;
+pub mod urb;
 pub mod usbcore;
 pub mod xhci;
+mod xhci_ring;
 
-// Re-export USB host functions for use by USB drivers
-pub use xhci::{usb_bulk_in, usb_bulk_out};
+pub use hcd::{Hcd, HcdRef};
+pub use message::{usb_bulk_msg, usb_control_msg};
+pub use urb::{Pipe, Urb, usb_kill_urb, usb_poison_urb, usb_submit_urb, usb_unlink_urb};
 
 // Re-export USB serial driver for registration
 pub use serial::{USB_SERIAL_DRIVER, UsbSerial};
@@ -235,6 +241,9 @@ pub struct UsbConfig {
 /// Represents a connected USB device
 #[derive(Debug, Clone)]
 pub struct UsbDevice {
+    /// Its host controller (Linux usb_device.bus; none for the root
+    /// hub, which has no host-side endpoints yet)
+    pub bus: HcdRef,
     /// Device slot ID assigned by xHCI
     pub slot_id: u8,
     /// Device speed
@@ -263,6 +272,7 @@ impl UsbDevice {
     /// A device not yet described (descriptors unread)
     pub fn new(slot_id: u8, port: u8, speed: UsbSpeed) -> Self {
         Self {
+            bus: HcdRef::default(),
             slot_id,
             speed,
             port,
@@ -281,59 +291,40 @@ impl UsbDevice {
     }
 }
 
-/// USB error types
-#[derive(Debug)]
+/// USB request errors (Linux URB status and usb_submit_urb errnos,
+/// Documentation/driver-api/usb/error-codes.rst)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsbError {
-    /// Transfer timeout
+    /// Queued, not yet given back (-EINPROGRESS)
+    InProgress,
+    /// A synchronous request did not complete in time (-ETIMEDOUT)
     Timeout,
-    /// Transfer stalled (endpoint error)
+    /// Killed by usb_kill_urb (-ENOENT)
+    Killed,
+    /// Unlinked by usb_unlink_urb (-ECONNRESET)
+    Unlinked,
+    /// The host controller went away (-ESHUTDOWN)
+    Shutdown,
+    /// The endpoint stalled (-EPIPE)
     Stall,
-    /// Data buffer error
+    /// More data than the buffer holds (-EOVERFLOW)
+    Overflow,
+    /// The controller could not reach the buffer in time (-ENOSR)
     BufferError,
-    /// USB bus error
+    /// Protocol or transaction error (-EPROTO; -EILSEQ for a TRB error)
     BusError,
-    /// Device not responding
+    /// No such device or endpoint (-ENODEV)
     NoDevice,
-    /// Out of resources (slots, memory)
+    /// Out of resources: memory, slots, ring space (-ENOMEM)
     NoResources,
-    /// Invalid parameter
+    /// Invalid parameter (-EINVAL)
     InvalidParam,
-    /// Transfer failed with xHCI completion code
+    /// Submitted already, or being given back (-EBUSY)
+    Busy,
+    /// Not queued: nothing to unlink (-EIDRM)
+    Idle,
+    /// Refused: being killed (-EPERM)
+    Rejected,
+    /// Failed with this xHCI completion code
     TransferError(u8),
-}
-
-/// USB host controller trait
-pub trait UsbController: Send {
-    /// Reset the controller
-    fn reset(&mut self) -> Result<(), UsbError>;
-
-    /// Start the controller
-    fn start(&mut self) -> Result<(), UsbError>;
-
-    /// Enumerate connected devices
-    fn enumerate_devices(&mut self) -> Result<Vec<UsbDevice>, UsbError>;
-
-    /// Perform a control transfer: `data` is read (IN) or sent (OUT)
-    fn control_transfer(
-        &mut self,
-        device: &UsbDevice,
-        setup: &SetupPacket,
-        data: Option<&mut [u8]>,
-    ) -> Result<usize, UsbError>;
-
-    /// Perform a bulk OUT transfer (host to device)
-    fn bulk_out(
-        &mut self,
-        device: &UsbDevice,
-        endpoint: u8,
-        data: &[u8],
-    ) -> Result<usize, UsbError>;
-
-    /// Perform a bulk IN transfer (device to host)
-    fn bulk_in(
-        &mut self,
-        device: &UsbDevice,
-        endpoint: u8,
-        data: &mut [u8],
-    ) -> Result<usize, UsbError>;
 }

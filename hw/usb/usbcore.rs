@@ -111,8 +111,10 @@ fn usb_drv_attrs(drv: &'static Driver, dir: &Arc<crate::fs::kernfs::KNode>) {
 pub static USB_GENERIC_DRIVER: Driver =
     Driver::new("usb", &USB_BUS, None, &UsbIds::Device, generic_probe);
 
-/// Linux usb_init: the bus and the generic driver
+/// Linux usb_init: the giveback bottom half's worker, the bus and the
+/// generic driver
 pub fn usb_init() {
+    super::hcd::usb_bh_init();
     USB_BUS.register();
     USB_GENERIC_DRIVER.register();
 }
