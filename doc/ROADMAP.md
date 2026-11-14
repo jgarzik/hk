@@ -67,9 +67,8 @@ WAIT_STOPPED, PTRACE_STOP.
 
 ## 3. Y — tty and console core
 
-- Tty open counts and release; TtyDriver ops (install, close, ioctl
-  fall-through, resize, stop, start, init_termios) on the serial
-  drivers.
+- TtyDriver ops (install, ioctl fall-through, resize, init_termios)
+  on the serial drivers.
 - Console core: register_console with console= rules, preferred
   console and CON_CONSDEV order, `console_device` for /dev/console,
   arm64 stdout-path, per-console log replay, /proc/consoles,
