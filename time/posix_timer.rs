@@ -269,7 +269,7 @@ impl PosixTimer {
         };
         let nr = match pid_type {
             PidType::Pid => owner_tid,
-            PidType::Tgid => crate::task::percpu::current_pid(),
+            PidType::Tgid | PidType::Pgid => crate::task::percpu::current_pid(),
         };
         let target = u32::try_from(nr)
             .ok()

@@ -2398,6 +2398,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         }
     }
 
+    // Signals that came before this point are handled before the fork
+    // (ERESTARTNOINTR: it restarts after them); multiprocess ones sent
+    // from now on are delayed for the child (Linux copy_process)
+    let delay = crate::signal::fork_signals_begin(&me, config.flags & CLONE_THREAD != 0)?;
+
     // What can still fail runs before the child exists, so an error
     // leaves no task, pid or zombie behind (Linux copy_process: copy_fs,
     // copy_namespaces and the CLONE_INTO_CGROUP lookup come before the
@@ -2661,6 +2666,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             // The reservation goes with `pidfd` (put_unused_fd)
             return Err(KernelError::OutOfMemory);
         }
+        // A fatal signal ends the fork here: the caller dies, and its
+        // child must not slip out of the kill (Linux copy_process:
+        // fatal_signal_pending under siglock, EINTR)
+        if crate::signal::task_fatal_pending(&me) {
+            drop(table);
+            return Err(KernelError::Interrupted);
+        }
         if child_init {
             crate::task::pidns::attach_init(&mut table, &child_task);
         }
@@ -2703,7 +2715,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Otherwise, child gets a deep copy of handlers
     // If CLONE_CLEAR_SIGHAND is set, handlers are reset to default (except SIG_IGN)
     // CLONE_THREAD also implies sharing shared_pending
-    crate::signal::install_fork_signal(&child_task, child_signal);
+    crate::signal::install_fork_signal(&child_task, child_signal, delay);
     if config.flags & CLONE_THREAD != 0 {
         crate::signal::zap_new_thread(&me, &child_task);
     }

@@ -478,8 +478,11 @@ fn sigio_to_task(
     reason: i32,
     gone: &mut crate::signal::SigPending,
 ) {
+    // A process group owner's signal is one of several (Linux
+    // send_sigio_to_task with PIDTYPE_PGID: delayed by a fork)
     let ty = match o.kind {
         PidType::Tid => crate::signal::PidType::Pid,
+        PidType::Pgrp => crate::signal::PidType::Pgid,
         _ => crate::signal::PidType::Tgid,
     };
     let mut send = |sig, info| send_sig_info_in(table, t, sig, info, ty, gone);
