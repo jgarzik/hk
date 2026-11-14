@@ -1857,6 +1857,20 @@ pub fn send_group_signal(t: &Task, sig: Signal, info: SendInfo) -> KernelResult<
     send_task(t, sig, info, PidType::Tgid, false)
 }
 
+/// `sig` with `info` to task `t` (`ty` Pid) or its thread group (Tgid),
+/// with no permission check, under TASKLIST's read lock held by the
+/// caller: sent in place, nothing allocated but its queue entry (Linux
+/// send_sigio_to_task's do_send_sig_info under tasklist_lock)
+pub fn send_sig_info_in(
+    table: &crate::task::percpu::GlobalTaskTable,
+    t: &Task,
+    sig: Signal,
+    info: SendInfo,
+    ty: PidType,
+) -> KernelResult<()> {
+    send_task_in(table, t, sig, info, ty, false)
+}
+
 /// `sig` with `info` to task `t`'s process, received as a signal to the
 /// process is ([`group_task`] of its leader; Linux group_send_sig_info,
 /// with no permission check): ESRCH once the process is gone
@@ -1911,23 +1925,26 @@ fn send_or_probe(t: &Task, sig: KillSig, info: SendInfo, ty: PidType) -> KernelR
 /// the reference cannot come to name another group); `sig` None only
 /// checks, a bad number is EINVAL for each process. 0 if any process
 /// got it, else the last error (ESRCH for an empty group).
+///
+/// The group is walked under TASKLIST's read lock and each process
+/// sent to in place (Linux __kill_pgrp_info: do_each_pid_task under
+/// tasklist_lock), nothing allocated but each signal's queue entry
+/// (GFP_ATOMIC, under its receiver's Task.sig).
 pub fn kill_pgrp_info(
     pg: &crate::task::pid::Pid,
     sig: KillSig,
     info: SendInfo,
     check: impl Fn(&crate::task::percpu::TaskView<'_>, Option<Signal>) -> KernelResult<()>,
 ) -> KernelResult<()> {
-    let procs = crate::task::percpu::GlobalTaskTable::collect_pgrp(pg, |table, t| {
-        Some((sig.and_then(|s| check(t, s)), group_task(table, Some(*t))))
-    });
+    let table = TASKLIST.read();
     let mut ret = Err(KernelError::NoProcess);
     let mut ok = false;
-    for (e, t) in &procs {
-        ret = match (t, e) {
-            (Some(t), Ok(())) => send_or_probe(t, sig, info, PidType::Tgid),
-            (Some(_), Err(e)) => Err(*e),
-            (None, _) => Err(KernelError::NoProcess),
-        };
+    for v in table.pgrp(pg) {
+        ret = checked(&table, Some(v), PidType::Tgid, sig, &check).and_then(|t| {
+            sig?.map_or(Ok(()), |s| {
+                send_task_in(&table, &t, s, info, PidType::Tgid, false)
+            })
+        });
         ok |= ret.is_ok();
     }
     if ok { Ok(()) } else { ret }
@@ -1948,33 +1965,24 @@ pub fn send_signal_to_pgrp(pgid: Pid, sig: Signal) -> KernelResult<()> {
 /// kill_pgrp(struct pid *)): unlike a number, the reference cannot come
 /// to name another group
 pub fn kill_pgrp_pid(pg: &crate::task::pid::Pid, sig: Signal) {
-    let procs = crate::task::percpu::GlobalTaskTable::collect_pgrp(pg, |table, t| {
-        group_task(table, Some(*t))
-    });
-    for t in &procs {
-        let _ = send_group_signal(t, sig, SendInfo::Kernel);
-    }
+    let _ = kill_pgrp_info(pg, Ok(Some(sig)), SendInfo::Kernel, |_, _| Ok(()));
 }
 
-/// `sig` with `info` once to each process of group `pgid` (Linux __kill_pgrp_info:
-/// its leader on the group's list, the signal process-directed), after
-/// `check` of it allows it; `sig` None only checks, a bad number is
-/// EINVAL for each process. 0 if any process got it, else the last
-/// error (ESRCH for an empty group).
+/// `sig` with `info` once to each process of group `pgid` (Linux
+/// kill_something_info: __kill_pgrp_info of find_vpid's struct pid, its
+/// processes' leaders on the group's list, the signal
+/// process-directed), as [`kill_pgrp_info`]: ESRCH if no group has
+/// that number
 pub fn kill_pgrp(
     pgid: Pid,
     sig: KillSig,
     info: SendInfo,
     check: impl Fn(&crate::task::percpu::TaskView<'_>, Option<Signal>) -> KernelResult<()>,
 ) -> KernelResult<()> {
-    let mut ret = Err(KernelError::NoProcess);
-    let mut ok = false;
-    for pid in crate::task::percpu::pgrp_pids(pgid) {
-        ret =
-            proc_target(pid, sig, &check).and_then(|t| send_or_probe(&t, sig, info, PidType::Tgid));
-        ok |= ret.is_ok();
-    }
-    if ok { Ok(()) } else { ret }
+    // The struct pid found before TASKLIST (PIDMAP_LOCK), dropped after
+    let pg =
+        crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid).ok_or(KernelError::NoProcess)?;
+    kill_pgrp_info(&pg, sig, info, check)
 }
 
 // =============================================================================

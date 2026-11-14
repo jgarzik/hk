@@ -803,67 +803,6 @@ impl GlobalTaskTable {
         )
     }
 
-    /// What `f` picks of each process of group `pg` (its leaders on the
-    /// group's list), gathered as `collect_threads` does
-    pub fn collect_pgrp<T>(
-        pg: &crate::task::pid::Pid,
-        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
-    ) -> Vec<T> {
-        Self::collect(
-            |table, visit| {
-                for t in table.pgrp(pg) {
-                    if !visit(&t) {
-                        break;
-                    }
-                }
-            },
-            f,
-        )
-    }
-
-    /// [`GlobalTaskTable::collect_pgrp`] with fallible allocation, for a
-    /// caller under a named GFP (a SIGIO sent in atomic context): None
-    /// without memory
-    pub fn try_collect_pgrp<T>(
-        pg: &crate::task::pid::Pid,
-        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
-    ) -> Option<Vec<T>> {
-        let walk = |table: &GlobalTaskTable, visit: &mut dyn FnMut(&TaskView<'_>) -> bool| {
-            for t in table.pgrp(pg) {
-                if !visit(&t) {
-                    break;
-                }
-            }
-        };
-        let mut cap = 1;
-        walk(&TASKLIST.read(), &mut |_| {
-            cap += 1;
-            true
-        });
-        loop {
-            let mut v = Vec::new();
-            v.try_reserve(cap).ok()?;
-            let mut full = false;
-            {
-                let table = TASKLIST.read();
-                walk(&table, &mut |t| {
-                    if v.len() == v.capacity() {
-                        full = true;
-                        return false;
-                    }
-                    if let Some(x) = f(&table, t) {
-                        v.push(x);
-                    }
-                    true
-                });
-            }
-            if !full {
-                return Some(v);
-            }
-            cap *= 2;
-        }
-    }
-
     /// What `f` picks of each thread of every process of group `pg`,
     /// gathered as `collect_threads` does
     pub fn collect_pgrp_threads<T>(
@@ -4596,15 +4535,6 @@ pub fn pgrp_tasks(pgid: Pid) -> alloc::vec::Vec<TaskRef> {
     GlobalTaskTable::collect_pgrp_threads(&pg, |_, t| Some(task_ref(t.task)))
 }
 
-/// The processes of group `pgid`, by pid (their leaders on its list;
-/// Linux do_each_pid_task PIDTYPE_PGID)
-pub fn pgrp_pids(pgid: Pid) -> alloc::vec::Vec<Pid> {
-    match crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid) {
-        Some(pg) => pgrp_members(&pg),
-        None => alloc::vec::Vec::new(),
-    }
-}
-
 /// Is group `pg` orphaned: no member has a parent in another group of
 /// its session (Linux will_become_orphaned_pgrp(pg, NULL); members that
 /// exited and children of the global init do not count)
@@ -4631,11 +4561,6 @@ pub fn pgrp_orphaned(pg: &crate::task::pid::Pid) -> bool {
         };
         !same(&p.pgrp, pg) && same(&p.session, ms)
     })
-}
-
-/// The processes of group `pg`, by pid
-pub fn pgrp_members(pg: &crate::task::pid::Pid) -> alloc::vec::Vec<Pid> {
-    GlobalTaskTable::collect_pgrp(pg, |_, t| Some(t.task.pid))
 }
 
 /// Get all unique PIDs in the system
