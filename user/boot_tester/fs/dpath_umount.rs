@@ -54,7 +54,8 @@ fn mount_vfat(dev: &BlkDev) -> i64 {
         DIR.as_ptr(),
         b"vfat\0".as_ptr(),
         0,
-        0,
+        // A charset every Linux config has (its default may be absent)
+        b"iocharset=cp437\0".as_ptr() as u64,
     )
 }
 
