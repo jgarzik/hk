@@ -277,7 +277,7 @@ pub struct Out {
     pub err: Option<KernelError>,
     /// Socket shutdown bits to set (Linux sk_shutdown)
     pub shut: u8,
-    /// Wakeups to make after the lock (`wake::*`)
+    /// Wakeups to make at the end of the locked step (`wake::*`)
     pub wake: u8,
     /// The connection is over (CLOSED): leave the tables
     pub done: bool,

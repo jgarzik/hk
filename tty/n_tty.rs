@@ -345,40 +345,41 @@ fn commit_echoes(tty: &Tty, ld: &mut NTtyData) {
 }
 
 /// Input bytes from the driver, in thread context (Linux
-/// n_tty_receive_buf_common, under termios_rwsem); wakes readers. The
+/// n_tty_receive_buf_common, under termios_rwsem); readers learn of
+/// each canonical line end, or of non-canonical input at the end. The
 /// bytes taken: the rest wait in the flip buffer until a read makes
 /// room
 pub fn receive_buf(tty: &Tty, bytes: &[u8]) -> usize {
-    // Input became readable: SIGIO POLL_IN (Linux kill_fasync at a
-    // canonical line end, or after non-canonical input)
-    let mut kill = false;
     let mut taken = 0;
-    {
-        // termios under ldata: set_termios changes both under it (Linux
-        // termios_rwsem), so input never sees half a change
-        let mut ld = ldata(tty);
-        let t = tty.get_termios();
-        for &c in bytes {
-            if !ld.room() {
-                break;
-            }
-            receive_char(tty, &mut ld, &t, c, &mut kill);
-            taken += 1;
+    // termios under ldata: set_termios changes both under it (Linux
+    // termios_rwsem), so input never sees half a change
+    let mut ld = ldata(tty);
+    let t = tty.get_termios();
+    for &c in bytes {
+        if !ld.room() {
+            break;
         }
-        // Linux flush_echoes at the end of the input
-        process_echoes(tty, &mut ld);
-        // Linux n_tty_receive_buf_common: non-canonical input queued
-        if t.c_lflag & ICANON == 0 && ld.cnt() > 0 {
-            kill = true;
-        }
+        receive_char(tty, &mut ld, &t, c);
+        taken += 1;
     }
-    if kill {
-        tty.kill_input();
+    // Linux flush_echoes at the end of the input
+    process_echoes(tty, &mut ld);
+    // Linux n_tty_receive_buf_common: non-canonical input queued
+    if t.c_lflag & ICANON == 0 && ld.cnt() > 0 {
+        input_ready(tty, &mut ld);
     }
+    taken
+}
+
+/// Input became readable: publish the heads, then SIGIO POLL_IN and
+/// the readers' wakeup, `ldata` held (Linux smp_store_release of
+/// canon_head / commit_head, kill_fasync, wake_up_interruptible_poll)
+fn input_ready(tty: &Tty, ld: &mut Ld<'_>) {
+    ld.g.publish(ld.av);
+    tty.kill_input();
     tty.read_wait.wake_poll(u32::from(
         crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM,
     ));
-    taken
 }
 
 /// Input mapping (ISTRIP, IGNCR, ICRNL, INLCR); None drops the byte
@@ -413,7 +414,7 @@ fn isig(tty: &Tty, ld: &mut NTtyData, t: &Termios, sig: crate::signal::Signal) {
     }
 }
 
-fn receive_char(tty: &Tty, ld: &mut NTtyData, t: &Termios, c: u8, kill: &mut bool) {
+fn receive_char(tty: &Tty, ld: &mut Ld<'_>, t: &Termios, c: u8) {
     let Some(c) = map_input(c, t) else {
         return;
     };
@@ -432,7 +433,9 @@ fn receive_char(tty: &Tty, ld: &mut NTtyData, t: &Termios, c: u8, kill: &mut boo
         let canon_head = ld.canon_head;
         canon_char(ld, t, c);
         // Linux n_tty_receive_handle_newline
-        *kill |= ld.canon_head != canon_head;
+        if ld.canon_head != canon_head {
+            input_ready(tty, ld);
+        }
     } else {
         ld.push(c, false);
         if t.c_lflag & ECHO != 0 {

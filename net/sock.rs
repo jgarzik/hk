@@ -11,10 +11,11 @@
 //! `Sock` holds atomics, its `WaitQueue` (IrqSpinlock leaf) and the
 //! error queue `errq` (an `SkbQueue`, spin leaf, thread only: the skbs
 //! are built before it and freed after it). Wakeups
-//! (`data_ready`, `write_space`, `state_change`, `error_report`) are
-//! issued after the caller dropped its protocol locks, in thread context:
-//! they also send the O_ASYNC owners' SIGIO (`wake_async`, Linux
-//! sk_wake_async; `fasync`, a sleeping lock taken when a file is armed).
+//! (`data_ready`, `write_space`, `state_change`, `error_report`) run
+//! in thread context, where Linux makes them (TCP's under its socket
+//! lock, either level): they also send the O_ASYNC owners' SIGIO
+//! (`wake_async`, Linux sk_wake_async; `fasync`, RCU, spin locks held
+//! or not).
 
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -243,9 +244,8 @@ impl Sock {
         self.err.load(Ordering::Acquire) != 0
     }
 
-    /// Record an error under a protocol lock: waiters wake now, the
-    /// caller sends its SIGIO (`wake_async(Io, POLL_ERR)`) after
-    /// unlocking
+    /// Record an error: waiters wake now, the caller sends its SIGIO
+    /// (`wake_async(Io, POLL_ERR)`) with its other wakeups
     pub fn post_err(&self, e: KernelError) {
         self.err.store(e as i32, Ordering::Release);
         self.wq.wake_poll(u32::from(POLLERR));
