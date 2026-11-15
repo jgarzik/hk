@@ -516,6 +516,11 @@ procfs (hidepid=, gid=, subset=pid; devtmpfs drops a new mount's after
 parsing them, as Linux 6.15+); cgroupfs ignores its own, and only
 procfs, tmpfs and devtmpfs apply options on a remount or show them in
 /proc/mounts.
+A mount names its namespace by id (`Mount::mnt_ns`; Linux
+mnt->mnt_ns points to it), so a namespace keeps no mount count:
+NS_MNT_GET_INFO's nr_mounts is a walk of its tree under NAMESPACE_SEM
+(Linux reads mnt_ns->nr_mounts), and there is no fs.mount-max limit
+(sysctl_mount_max, count_mounts: ENOSPC).
 
 ## nullfs gaps
 

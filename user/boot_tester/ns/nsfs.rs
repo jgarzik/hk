@@ -448,11 +448,8 @@ fn ids_child() -> u8 {
     let err = |r: Result<u64, i64>| r.err().unwrap_or(0);
     let mut steps = [true; 11];
     steps[0] = want(v611, mid.is_ok_and(|i| i != 0), err(mid));
-    steps[1] = want(
-        v611,
-        err(get_id(uts, NS_GET_MNTNS_ID)) == EINVAL,
-        err(get_id(uts, NS_GET_MNTNS_ID)),
-    );
+    let uts_mid = err(get_id(uts, NS_GET_MNTNS_ID));
+    steps[1] = want(v611, uts_mid == EINVAL, uts_mid);
     let gid = get_id(mnt, NS_GET_ID);
     steps[2] = want(v618, gid.is_ok() && gid == mid, err(gid));
     if linux_at_least(6, 19) {
@@ -465,9 +462,12 @@ fn ids_child() -> u8 {
             (b"/proc/self/ns/cgroup\0", 5),
             (b"/proc/self/ns/mnt\0", 8),
         ];
-        steps[3] = fixed
-            .iter()
-            .all(|(p, id)| get_id(open(p), NS_GET_ID) == Ok(*id));
+        steps[3] = fixed.iter().all(|(p, id)| {
+            let fd = open(p);
+            let r = get_id(fd, NS_GET_ID);
+            sys_close(fd as u64);
+            r == Ok(*id)
+        });
     }
     let (r, [size, nr], id) = mnt_info(mnt, NS_MNT_GET_INFO);
     steps[4] = want(v612, r == 0 && size == 16 && Ok(id) == mid, r);
@@ -497,16 +497,24 @@ fn ids_child() -> u8 {
         r >= 0 && mid.is_ok_and(|m| nxt > m) && get_id(r, NS_GET_MNTNS_ID) == Ok(nxt),
         r,
     );
+    if r >= 0 {
+        sys_close(r as u64);
+    }
     let (r, _, prv) = mnt_info(mine, NS_MNT_GET_PREV);
     steps[8] = want(v612, r >= 0 && nid.is_ok_and(|n| prv < n), r);
+    if r >= 0 {
+        sys_close(r as u64);
+    }
     // Nothing before the initial one
     let (r, _, _) = mnt_info(mnt, NS_MNT_GET_PREV);
     steps[9] = want(v612, r == ENOENT, r);
-    steps[10] = want(
-        v612,
-        mnt_info(uts, NS_MNT_GET_INFO).0 == EINVAL,
-        mnt_info(uts, NS_MNT_GET_INFO).0,
-    );
+    let uts_info = mnt_info(uts, NS_MNT_GET_INFO).0;
+    steps[10] = want(v612, uts_info == EINVAL, uts_info);
+    for fd in [mnt, uts, mine] {
+        if fd >= 0 {
+            sys_close(fd as u64);
+        }
+    }
     first_bad(&steps)
 }
 
@@ -577,31 +585,40 @@ fn xlate_child() -> u8 {
 }
 
 /// /proc/self/mountinfo names a mount's root "<ty>:[<inum>]" (Linux
-/// nsfs_show_path)
+/// nsfs_show_path), anywhere in the file however long it is
 fn mountinfo_has(ty: &[u8], inum: u64) -> bool {
-    let mut needle = [0u8; 40];
-    let mut n = ty.len();
-    needle[..n].copy_from_slice(ty);
-    needle[n..n + 2].copy_from_slice(b":[");
-    n += 2;
-    let mut d = [0u8; 20];
-    let (mut k, mut v) = (0, inum);
+    let mut pre = [0u8; 16];
+    pre[..ty.len()].copy_from_slice(ty);
+    pre[ty.len()..ty.len() + 2].copy_from_slice(b":[");
+    let mut nb = [0u8; 64];
+    let needle = pid_path(&mut nb, &pre[..ty.len() + 2], inum as i64, b"]");
+    let needle = &needle[..needle.len() - 1];
+    let fd = sys_open(b"/proc/self/mountinfo\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    // Read on, keeping the last needle-length bytes so a match across
+    // two reads is seen
+    let mut buf = [0u8; 4096];
+    let (mut have, mut found) = (0usize, false);
     loop {
-        d[k] = b'0' + (v % 10) as u8;
-        k += 1;
-        v /= 10;
-        if v == 0 {
+        let n = sys_read(
+            fd as u64,
+            buf[have..].as_mut_ptr(),
+            (buf.len() - have) as u64,
+        );
+        if n <= 0 {
             break;
         }
+        have += n as usize;
+        if buf[..have].windows(needle.len()).any(|w| w == needle) {
+            found = true;
+            break;
+        }
+        let keep = needle.len().min(have);
+        buf.copy_within(have - keep..have, 0);
+        have = keep;
     }
-    while k > 0 {
-        k -= 1;
-        needle[n] = d[k];
-        n += 1;
-    }
-    needle[n] = b']';
-    n += 1;
-    let mut buf = [0u8; 8192];
-    let len = crate::helpers::read_file(b"/proc/self/mountinfo\0", &mut buf);
-    len > 0 && buf[..len as usize].windows(n).any(|w| w == &needle[..n])
+    sys_close(fd as u64);
+    found
 }
