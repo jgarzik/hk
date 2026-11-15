@@ -544,7 +544,10 @@ impl SuperOps for TracefsSops {
     /// option is EINVAL (vfs_parse_fs_param: "Unknown parameter")
     fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {
         let o = parse_opts(data)?;
-        let root = sb.get_root().and_then(|r| r.get_inode()).ok_or(KernelError::Io)?;
+        let root = sb
+            .get_root()
+            .and_then(|r| r.get_inode())
+            .ok_or(KernelError::Io)?;
         if let Some(m) = o.mode {
             root.set_mode_perm(m);
         }
