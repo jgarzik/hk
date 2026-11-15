@@ -1575,7 +1575,7 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
         Fdinfo(ProcPid, i32),
         Sysctl(&'static crate::sysctl::Ctl),
         FailNth(ProcPid),
-        Net(Arc<crate::net::NetNamespace>, proc_net::NetGen),
+        Net(proc_net::NetGen),
     }
     let g = with_data(&inode, |d| -> Result<_, KernelError> {
         Ok(match d {
@@ -1586,7 +1586,7 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
             ProcfsInodeData::FdinfoFile { pid, fd } => Gen::Fdinfo(pid.clone(), *fd),
             ProcfsInodeData::Sysctl { ctl } => Gen::Sysctl(ctl),
             ProcfsInodeData::FailNth { pid } => Gen::FailNth(pid.clone()),
-            ProcfsInodeData::NetFile { net, generator } => Gen::Net(net.clone(), *generator),
+            ProcfsInodeData::NetFile { generator, .. } => Gen::Net(*generator),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
             | ProcfsInodeData::SelfLink
@@ -1615,13 +1615,10 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
                 .load(core::sync::atomic::Ordering::Relaxed);
             alloc::format!("{n}\n").into_bytes()
         }
-        // The namespace the open pinned (Linux seq_file_net), else
-        // pinned for this read
-        Gen::Net(net, generator) => {
-            let n = match open_net(file) {
-                Some(n) => n,
-                None => net.maybe_get().ok_or(KernelError::NoDeviceOrAddress)?,
-            };
+        // The namespace the open pinned (Linux seq_file_net): every
+        // open of a net file pins one or fails with ENXIO
+        Gen::Net(generator) => {
+            let n = open_net(file).ok_or(KernelError::NoDeviceOrAddress)?;
             generator(&n)
         }
     })
