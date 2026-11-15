@@ -857,8 +857,6 @@ fn expire_submount() -> R {
     r
 }
 
-/// Hard links are different mountpoints: a bind on one leaves the other
-/// showing the file, and it can be unlinked
 /// A filesystem without a device gets an anonymous device number
 /// (Linux set_anon_super: major 0, the lowest free minor from 1), given
 /// back at its shutdown (kill_anon_super), so the next one reuses it
@@ -887,6 +885,8 @@ fn anon_dev() -> R {
     r
 }
 
+/// Hard links are different mountpoints: a bind on one leaves the other
+/// showing the file, and it can be unlinked
 fn hardlink() -> R {
     touch(b"/tmp/hl_a\0");
     sys_link(b"/tmp/hl_a\0".as_ptr(), b"/tmp/hl_b\0".as_ptr());
