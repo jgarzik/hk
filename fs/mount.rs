@@ -20,7 +20,7 @@ use super::inode::FileType;
 pub use super::mntput::MountRef;
 use super::mntput::{__cleanup_mnt, MNT_NS_INTERNAL, MntOwned};
 use super::path_ref::Path;
-use super::superblock::{FileSystemType, SbActive, vfs_get_tree};
+use super::superblock::{FileSystemType, SbActive, SuperBlock, vfs_get_tree};
 use crate::task::task_work::CallbackHead;
 use crate::util::ida::Ida;
 use crate::util::kalloc::{arc_nofail, try_arc};
