@@ -358,8 +358,9 @@ pub trait InodeOps: Send + Sync {
 
     /// The last reference to the inode is gone (Linux ->evict_inode):
     /// release what the object still owns, e.g. the blocks of an
-    /// unlinked file. Called from `Drop for Inode` in any context:
-    /// must not sleep (defer I/O to a workqueue).
+    /// unlinked file. Called from `Drop for Inode`, where the last
+    /// reference goes: a context that may sleep (Linux iput's
+    /// might_sleep), so it may do I/O.
     fn evict_inode(&self, inode: &Inode) {
         let _ = inode;
     }

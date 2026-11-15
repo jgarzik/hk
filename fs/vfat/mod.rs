@@ -33,7 +33,7 @@ use super::superblock::{
     FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
 };
 use crate::util::error::KernelError;
-use crate::util::kalloc::{arc_nofail, try_arc};
+use crate::util::kalloc::try_arc;
 
 mod cache;
 mod direct;
@@ -1839,9 +1839,9 @@ impl InodeOps for VfatInodeOps {
         a
     }
 
-    /// An unlinked file's clusters are freed with its inode (Linux
-    /// fat_evict_inode), on the system workqueue: the last reference can
-    /// go where no I/O may be done
+    /// An unlinked file's clusters are freed with its inode, at once
+    /// (Linux fat_evict_inode: fat_truncate_blocks(inode, 0); the last
+    /// reference goes where sleeping is allowed, as Linux iput)
     fn evict_inode(&self, inode: &Inode) {
         if inode.get_nlink() != 0 {
             return;
@@ -1852,17 +1852,9 @@ impl InodeOps for VfatInodeOps {
         let Ok(sb_data) = get_sb_data(&sb) else {
             return;
         };
-        if d.start_cluster == 0 {
-            return;
+        if d.start_cluster != 0 {
+            let _ = free_cluster_chain(&sb_data, d.start_cluster);
         }
-        let mut job = Some((sb_data, d.start_cluster));
-        let work = crate::task::workqueue::Work::new(move || {
-            if let Some((sb_data, start)) = job.take() {
-                let _ = free_cluster_chain(&sb_data, start);
-            }
-        });
-        crate::task::workqueue::SYSTEM_WQ
-            .queue_work(arc_nofail(crate::sync::IrqSpinlock::new(work)));
     }
 
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {

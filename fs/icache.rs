@@ -200,10 +200,11 @@ pub fn rehash(inode: &Arc<Inode>, hashval: u64) {
 
 /// The last reference to `inode` is gone (Linux iput_final -> evict):
 /// unhash it and let its filesystem release what it still owns. Runs
-/// from `Drop for Inode`, in whatever (thread) context the last
-/// reference went: it must not sleep (filesystems defer I/O to a
-/// workqueue)
+/// from `Drop for Inode` where the last reference went, which must be
+/// a context that may sleep (Linux iput: might_sleep): the filesystem
+/// may do I/O (vfat frees an unlinked file's clusters)
 pub fn evict(inode: &Inode) {
+    crate::sync::might_sleep();
     remove_inode_hash(inode);
     inode.i_op.evict_inode(inode);
 }

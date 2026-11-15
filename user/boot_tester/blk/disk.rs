@@ -437,6 +437,7 @@ fn vfat(d: &Disk) {
     vfat_rename_ino();
     vfat_unlink_open();
     vfat_unlink_reuse();
+    vfat_statfs();
     vfat_evict_writeback();
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     verdict(b"BLK_VFAT_UMOUNT", u == 0, u);
@@ -1070,6 +1071,57 @@ fn vfat_mount_alias(p1: &BlkDev) {
     sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     let ok = r == 0 && fd >= 0 && m == 0 && lower == -2 && upper == -2;
     verdict(b"VFAT_MOUNT_ALIAS", ok, lower * 100 + upper);
+}
+
+/// statfs of vfat (Linux fat_statfs): clusters as blocks, the long
+/// name limit 255 * 6 bytes; a written file takes its clusters from
+/// f_bfree, and the last close of it unlinked gives them all back at
+/// once (Linux fat_evict_inode frees the chain in the final iput)
+fn vfat_statfs() {
+    const MSDOS_SUPER_MAGIC: i64 = 0x4d44;
+    const SIZE: usize = 64 * 1024;
+    let mnt = b"/mnt/vd1\0";
+    let f = b"/mnt/vd1/STATFS.BIN\0";
+    let free = || {
+        let mut st = hk_syscall::LinuxStatFs::default();
+        let r = hk_syscall::sys_statfs(mnt.as_ptr(), &mut st);
+        (r, st)
+    };
+    let (r0, st0) = free();
+    let fd = sys_open(f.as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let buf = [b'q'; 4096];
+    let mut w = 0;
+    for i in 0..SIZE / 4096 {
+        w += sys_pwrite64(fd, buf.as_ptr(), 4096, (i * 4096) as i64);
+    }
+    sys_fsync(fd);
+    let (_, st1) = free();
+    sys_unlink(f.as_ptr());
+    let (_, st2) = free();
+    sys_close(fd as u64);
+    let (_, st3) = free();
+    let bs = st0.f_bsize.max(1);
+    let used = (SIZE as i64 + bs - 1) / bs;
+    let ok = r0 == 0
+        && st0.f_type == MSDOS_SUPER_MAGIC
+        && st0.f_namelen == 255 * 6
+        && st0.f_blocks > 0
+        && st0.f_bfree <= st0.f_blocks
+        && st0.f_bavail == st0.f_bfree
+        && w == SIZE as i64
+        && st0.f_bfree - st1.f_bfree >= used
+        // Held while open after the unlink, back at the last close
+        && st2.f_bfree == st1.f_bfree
+        && st3.f_bfree == st0.f_bfree;
+    verdict(
+        b"VFAT_STATFS",
+        ok,
+        if r0 != 0 {
+            r0
+        } else {
+            st0.f_bfree - st3.f_bfree
+        },
+    );
 }
 
 /// A file written and closed without fsync keeps its data when its

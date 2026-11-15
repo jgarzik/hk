@@ -2492,10 +2492,11 @@ last reference's eviction takes it); an entry in its teardown (Linux
 I_FREEING: its last `Arc` gone, its eviction waiting for the lock)
 fails the upgrade and counts as absent. Eviction (`Drop for Inode` ->
 `icache::evict`, Linux iput_final -> evict) runs where the last `Arc`
-goes, possibly under spin locks: it takes `INODE_HASH_LOCK` (if hashed)
-and calls `->evict_inode`, which must not sleep; vfat queues the
-cluster freeing of an unlinked file on `SYSTEM_WQ`
-(`Workqueue.inner`, IrqSpinlock leaf). `->evict_inode` may upgrade
+goes, which must be a context that may sleep (Linux iput's
+might_sleep, checked there): never under a spin lock or with
+interrupts off. It takes `INODE_HASH_LOCK` (if hashed) and calls
+`->evict_inode`, which may sleep and do I/O (vfat frees an unlinked
+file's clusters at once, Linux fat_evict_inode). `->evict_inode` may upgrade
 the inode's `Weak` superblock: that is a passive reference (`Arc`,
 Linux s_passive), which keeps only the memory, so its drop never
 shuts the filesystem down, whatever the context (it takes `SB_LOCK`
