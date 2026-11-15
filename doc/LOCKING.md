@@ -2846,7 +2846,8 @@ it. `PciDev.driver_override` is a sleeping
 I/O port resources (base/resource.rs): `IOPORT` (spin RwLock, Linux
 resource_lock), the /proc/ioports tree: thread context only, a leaf;
 a claimed range is allocated before it is taken and a released one
-freed after, so the tree is only relinked under it. Taken by a
+freed after, so the tree is only relinked under it; /proc/ioports
+copies it out into room reserved before and formats unlocked. Taken by a
 driver's probe and remove (`Device.lock` → IOPORT) and by a serial
 port's move (`Tty.port` → IOPORT, 3.9).
 Net devices: `NetNamespace::register_device` links the device on the

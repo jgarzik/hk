@@ -11,7 +11,8 @@
 //!
 //! Locking: `IOPORT` is a spin RwLock leaf (Linux resource_lock), thread
 //! context only; a new range is allocated before it is taken, and the
-//! tree is relinked under it, nothing allocated or freed there.
+//! tree is relinked or copied out under it, nothing allocated or freed
+//! there.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -118,37 +119,60 @@ impl Resource {
         }
     }
 
-    /// /proc/ioports' lines for the children, `depth` deep (Linux
-    /// r_show: two spaces a level, `width` hex digits, the range shown
-    /// only to CAP_SYS_ADMIN)
-    fn show(&self, depth: usize, width: usize, admin: bool, out: &mut Vec<u8>) {
-        use core::fmt::Write;
+    /// The ranges below this one
+    fn count(&self) -> usize {
+        let mut n = 0;
         let mut c = self.child.as_deref();
         while let Some(r) = c {
-            let (s, e) = if admin { (r.start, r.end) } else { (0, 0) };
-            let mut line = alloc::string::String::new();
-            let _ = writeln!(
-                line,
-                "{:indent$}{s:0width$x}-{e:0width$x} : {}",
-                "",
-                r.name,
-                indent = depth * 2
-            );
-            out.extend_from_slice(line.as_bytes());
-            r.show(depth + 1, width, admin, out);
+            n += 1 + r.count();
             c = r.sibling.as_deref();
         }
+        n
+    }
+
+    /// The ranges below this one, `depth` deep, in /proc/ioports order,
+    /// into `out` while it has room (it never grows: the caller holds
+    /// IOPORT); false if some did not fit
+    fn snapshot(&self, depth: usize, out: &mut Vec<Line>) -> bool {
+        let mut c = self.child.as_deref();
+        while let Some(r) = c {
+            if out.len() == out.capacity() {
+                return false;
+            }
+            out.push(Line {
+                start: r.start,
+                end: r.end,
+                name: r.name,
+                depth,
+            });
+            if !r.snapshot(depth + 1, out) {
+                return false;
+            }
+            c = r.sibling.as_deref();
+        }
+        true
     }
 }
+
+/// One /proc/ioports line, copied out of the tree
+struct Line {
+    start: u64,
+    end: u64,
+    name: &'static str,
+    depth: usize,
+}
+
+impl Resource {}
 
 /// Linux ioport_resource
 static IOPORT: RwLock<Resource> = RwLock::new(Resource::root("PCI IO", 0xffff));
 
 /// Claim the I/O ports [start, start + n) for `name` (Linux
-/// request_region); EBUSY if a busy range overlaps them, ENOMEM
+/// request_region); EBUSY if a busy range overlaps them or they lie
+/// outside the root (Linux __request_region's NULL), ENOMEM
 pub fn request_region(start: u64, n: u64, name: &'static str) -> Result<(), KernelError> {
     if n == 0 || start.checked_add(n - 1).is_none_or(|e| e > 0xffff) {
-        return Err(KernelError::InvalidArgument);
+        return Err(KernelError::Busy);
     }
     let new = crate::util::kalloc::try_box(Resource {
         start,
@@ -170,12 +194,36 @@ pub fn release_region(start: u64, n: u64) {
     drop(gone);
 }
 
-/// /proc/ioports (Linux ioports_proc_show)
-pub fn proc_ioports() -> Vec<u8> {
-    let admin = crate::task::capable(crate::task::CAP_SYS_ADMIN);
-    let mut out = Vec::new();
-    IOPORT.read().show(0, 4, admin, &mut out);
-    out
+/// /proc/ioports (Linux ioports_proc_show, r_show): two spaces a
+/// level, four hex digits, the ranges shown only if the file's opener
+/// had CAP_SYS_ADMIN (file_ns_capable), else zero. The tree is copied
+/// out under IOPORT into room allocated before, then formatted
+pub fn proc_ioports(file: &crate::fs::File) -> Vec<u8> {
+    use core::fmt::Write;
+    let admin = file.f_cred.cap_effective.has(crate::task::CAP_SYS_ADMIN);
+    let lines = loop {
+        let n = IOPORT.read().count();
+        let mut v = Vec::new();
+        if v.try_reserve_exact(n + 8).is_err() {
+            return Vec::new();
+        }
+        // A tree grown past the room meanwhile: again
+        if IOPORT.read().snapshot(0, &mut v) {
+            break v;
+        }
+    };
+    let mut out = alloc::string::String::new();
+    for l in &lines {
+        let (s, e) = if admin { (l.start, l.end) } else { (0, 0) };
+        let _ = writeln!(
+            out,
+            "{:indent$}{s:04x}-{e:04x} : {}",
+            "",
+            l.name,
+            indent = l.depth * 2
+        );
+    }
+    out.into_bytes()
 }
 
 #[cfg(test)]

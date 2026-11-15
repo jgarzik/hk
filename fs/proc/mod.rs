@@ -116,8 +116,14 @@ const FD_INO: u64 = 1 << 24;
 /// Offset base of /proc/<pid>/fdinfo/<fd>
 const FDINFO_INO: u64 = 2 << 24;
 
-/// Content generator function type
-pub type ContentGenerator = fn() -> Vec<u8>;
+/// A generated file's content (Linux its show()): from the system
+/// state alone, or also from the open file (the opener's credentials:
+/// Linux file_ns_capable(m->file, ..))
+#[derive(Clone, Copy)]
+pub enum ContentGenerator {
+    Plain(fn() -> Vec<u8>),
+    Opener(fn(&File) -> Vec<u8>),
+}
 
 /// The links of /proc/<pid>/ns (Linux proc_ns_operations, ns_entries
 /// in this order): each names one of the task's namespaces
@@ -279,8 +285,17 @@ impl ProcfsInodeData {
     }
 
     /// Create file data with generator
-    pub fn new_file(generator: ContentGenerator) -> Self {
-        Self::File { generator }
+    pub fn new_file(generator: fn() -> Vec<u8>) -> Self {
+        Self::File {
+            generator: ContentGenerator::Plain(generator),
+        }
+    }
+
+    /// File data whose generator reads the open file
+    pub fn new_opener_file(generator: fn(&File) -> Vec<u8>) -> Self {
+        Self::File {
+            generator: ContentGenerator::Opener(generator),
+        }
     }
 
     /// Create per-PID directory data
@@ -327,15 +342,6 @@ impl ProcfsInodeData {
     pub fn children(&self) -> Option<&BTreeMap<String, Arc<Inode>>> {
         match self {
             Self::Directory { children } => Some(children),
-            _ => None,
-        }
-    }
-
-    /// Generate content (for generator files)
-    pub fn generate(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::File { generator } => Some(generator()),
-            Self::Sysctl { ctl } => Some(crate::sysctl::read(ctl)),
             _ => None,
         }
     }
@@ -1606,7 +1612,8 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
     let task = |p: &ProcPid| p.task().ok_or(KernelError::NoProcess);
     Ok(match g {
         Gen::Pid(p, g) => return pid_content(Some(file), &task(&p)?, g),
-        Gen::File(generator) => generator(),
+        Gen::File(ContentGenerator::Plain(g)) => g(),
+        Gen::File(ContentGenerator::Opener(g)) => g(file),
         Gen::Fdinfo(p, fd) => gen_fdinfo_content(&task(&p)?, fd, &opts::pid_ns(&inode)),
         Gen::Sysctl(ctl) => crate::sysctl::read(ctl),
         Gen::FailNth(p) => {
@@ -2494,7 +2501,12 @@ fn procfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     root.file(sb, "meminfo", ro, file(gen_meminfo))?;
     root.file(sb, "loadavg", ro, file(crate::task::loadavg::proc_loadavg))?;
     // Linux ioresources_init: /proc/ioports
-    root.file(sb, "ioports", ro, file(crate::base::resource::proc_ioports))?;
+    root.file(
+        sb,
+        "ioports",
+        ro,
+        ProcfsInodeData::new_opener_file(crate::base::resource::proc_ioports),
+    )?;
 
     // /proc/net -> self/net (Linux proc_net_init: proc_symlink)
     root.file(
