@@ -221,9 +221,15 @@ impl TcpCb {
                 self.syn_challenge(out);
                 return;
             }
-            if s.seq_len() == 0 && before(s.seq, self.rcv_nxt) {
+            if self.state != TcpState::TimeWait
+                && s.has(flags::ACK)
+                && s.seq_len() == 0
+                && before(s.seq, self.rcv_nxt)
+            {
                 // An old pure ACK is just dropped (Linux
-                // TCP_RFC7323_PAWS_ACK)
+                // tcp_disordered_ack_check TCP_RFC7323_PAWS_ACK; a
+                // TIME_WAIT socket rejects it as any other,
+                // tcp_timewait_state_process)
                 self.net_stat(LINUX_MIB_PAWS_OLD_ACK);
                 return;
             }

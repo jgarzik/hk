@@ -1836,6 +1836,40 @@ fn mib_open_close() {
     assert_eq!(m.net.fold(LINUX_MIB_TCPPUREACKS), 3);
 }
 
+/// A TIME_WAIT socket rejects an old-timestamp pure ACK as any PAWS
+/// failure (Linux tcp_timewait_state_process: PAWSTimewait, an ACK
+/// back), not as an established socket's silent old ACK
+#[test]
+fn mib_timewait_paws_rejects() {
+    use crate::net::mib::*;
+    let (mut p, m) = mib_pair();
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    p.take(true, out);
+    p.run();
+    let mut out = Out::default();
+    p.b.close(false, p.now, &mut out);
+    p.take(false, out);
+    p.run();
+    assert_eq!(p.a.state, TcpState::TimeWait);
+    let last = p.log.iter().rev().find(|l| !l.1).unwrap().2.clone();
+    let (tsv, tse) = last.ts.unwrap();
+    let old = Seg {
+        seq: p.a.rcv_nxt.wrapping_sub(1),
+        ack: last.ack,
+        flags: flags::ACK,
+        wnd: last.wnd,
+        ts: Some((tsv.wrapping_sub(1000), tse)),
+        ..Default::default()
+    };
+    p.now += 10;
+    let mut out = Out::default();
+    p.a.feed(&seg_in(&old), p.now, &mut out);
+    assert_eq!(m.net.fold(LINUX_MIB_PAWS_TW_REJECTED), 1);
+    assert_eq!(m.net.fold(LINUX_MIB_PAWS_OLD_ACK), 0);
+    assert_eq!(wire(&out).len(), 1);
+}
+
 /// An abort resets both ends: EstabResets on each, one OutRst
 #[test]
 fn mib_reset() {
