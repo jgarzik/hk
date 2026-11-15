@@ -579,9 +579,21 @@ pub struct VfatSbData {
     pub cluster_size: u32,
     /// Mount options
     pub opts: VfatOpts,
+    /// Serializes FAT allocation and freeing and the free count (Linux
+    /// sbi->fat_lock, lock_fat): sleeping, under the inodes' i_rwsem,
+    /// above the device's I/O; shared by every copy of this data
+    pub fat: Arc<crate::sync::Mutex<FatState>>,
 }
 
 impl SuperBlockData for VfatSbData {}
+
+/// What the FAT lock guards beyond the FAT itself
+pub struct FatState {
+    /// Free data clusters, -1 until counted (Linux sbi->free_clusters,
+    /// counted by the first statfs, fat_count_free_clusters, then kept
+    /// by every allocation and free)
+    free: i64,
+}
 
 /// How long names map to bytes (Linux iocharset and utf8)
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -871,7 +883,7 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), Kernel
 // ============================================================================
 
 /// Get VFAT superblock data from superblock (cloned to avoid lifetime issues)
-fn get_sb_data(sb: &Arc<SuperBlock>) -> Result<VfatSbData, KernelError> {
+fn get_sb_data(sb: &SuperBlock) -> Result<VfatSbData, KernelError> {
     let guard = sb.private.read();
     guard
         .as_ref()
@@ -996,6 +1008,9 @@ fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), K
 /// Searches the FAT for a free cluster (value 0), marks it as end-of-chain,
 /// and returns the cluster number.
 fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
+    // The search and the claim as one (Linux fat_alloc_clusters under
+    // lock_fat): no two allocations take one cluster
+    let mut fat = sb_data.fat.lock();
     // Search for free cluster among the data clusters (the BPB's size,
     // not the device's)
     for cluster in 2..sb_data.max_cluster {
@@ -1003,6 +1018,10 @@ fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
         if entry == FAT_FREE {
             // Found free cluster, mark as end-of-chain
             set_fat_entry(sb_data, cluster, FAT_EOC)?;
+            if fat.free > 0 {
+                fat.free -= 1;
+            }
+            drop(fat);
 
             // Zeroed on the disk itself, after the device cache's pages
             // of it are written back and dropped (Linux
@@ -1025,13 +1044,18 @@ fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
     Err(KernelError::NoSpace)
 }
 
-/// Free a cluster chain starting from start_cluster
+/// Free a cluster chain starting from start_cluster (Linux
+/// fat_free_clusters, under lock_fat)
 fn free_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<(), KernelError> {
+    let mut fat = sb_data.fat.lock();
     let mut cluster = start_cluster;
 
     while is_valid_cluster(cluster) {
         let next = get_fat_entry(sb_data, cluster)?;
         set_fat_entry(sb_data, cluster, FAT_FREE)?;
+        if fat.free >= 0 {
+            fat.free += 1;
+        }
 
         if is_end_of_chain(next) {
             break;
@@ -1040,6 +1064,22 @@ fn free_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<(), Ke
     }
 
     Ok(())
+}
+
+/// The free data clusters, counted from the FAT the first time (Linux
+/// fat_count_free_clusters, under lock_fat)
+fn free_clusters(sb_data: &VfatSbData) -> Result<u64, KernelError> {
+    let mut fat = sb_data.fat.lock();
+    if fat.free < 0 {
+        let mut n = 0i64;
+        for cluster in 2..sb_data.max_cluster {
+            if get_fat_entry(sb_data, cluster)? == FAT_FREE {
+                n += 1;
+            }
+        }
+        fat.free = n;
+    }
+    Ok(fat.free as u64)
 }
 
 /// Extend a cluster chain by `count` clusters, linking them as it goes
@@ -2518,15 +2558,23 @@ impl SuperOps for VfatSuperOps {
         drop(sbi);
     }
 
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        // TODO: Could provide actual block counts from VfatSbData if available
-        // For now, return minimal valid values
-        StatFs {
+    /// Linux fat_statfs: clusters as blocks, the free ones counted once
+    /// and kept; a long name of 255 characters of up to 6 bytes each
+    /// (FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE)
+    fn statfs(&self, sb: &SuperBlock) -> StatFs {
+        let mut st = StatFs {
             f_type: MSDOS_SUPER_MAGIC,
-            f_bsize: 4096,  // Cluster size varies; use common value
-            f_namelen: 255, // LFN max length
+            f_namelen: 255 * 6,
             ..StatFs::default()
+        };
+        if let Ok(d) = get_sb_data(sb) {
+            let free = free_clusters(&d).unwrap_or(0);
+            st.f_bsize = u64::from(d.cluster_size);
+            st.f_blocks = u64::from(d.max_cluster - 2);
+            st.f_bfree = free;
+            st.f_bavail = free;
         }
+        st
     }
 
     fn alloc_inode(
@@ -2655,6 +2703,7 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         max_cluster: (total_clusters + 2) as u32,
         cluster_size,
         opts,
+        fat: try_arc(crate::sync::Mutex::new(FatState { free: -1 }))?,
     })?;
 
     // The root directory's chain must be sound (Linux fat_read_root ->

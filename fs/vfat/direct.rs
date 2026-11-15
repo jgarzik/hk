@@ -91,7 +91,8 @@ fn map(
 
 /// The filesystem of `inode`
 fn sb_of(inode: &Inode) -> Result<VfatSbData, KernelError> {
-    get_sb_data(&inode.superblock().ok_or(KernelError::Io)?)
+    let sb = inode.superblock().ok_or(KernelError::Io)?;
+    get_sb_data(&sb)
 }
 
 /// O_DIRECT read of `to` at `pos` (Linux generic_file_read_iter with
