@@ -495,8 +495,8 @@ hub6, where Linux moves the port (uart_change_port).
   ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT, IUCLC/OLCUC, IMAXBEL,
   PARMRK and parity/break input handling, CRTSCTS (no modem
   control: IXOFF throttles by STOP/START only).
-- **Serial ports:** ttyS1 is registered without probing COM2; only
-  COM1 (and the PL011) take input. The PL011 has no startup or
+- **Serial ports:** ttyS1 is registered without probing COM2. The
+  PL011 has no startup or
   shutdown (Linux pl011_startup/pl011_shutdown): its interrupts stay
   on while the port is down.
 - **No virtual terminals:** the framebuffer and VGA consoles are not

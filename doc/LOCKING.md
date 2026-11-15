@@ -816,10 +816,13 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     allocates); TIOCGSERIAL Tty.port → UartPort.cfg. An open
     activates the port (Linux tty_port_open: uart_startup under
     port->mutex) under Tty.files → Tty.port → UartPort.xmit, the
-    driver's startup after it is released; a hangup and the last
+    driver's startup after it is released (the 8250 requests its
+    interrupt there: Tty.port → IrqDesc.lock); a hangup and the last
     close take it down under Tty.files → Tty.port (the close after
     its drain, closing_wait read under Tty.port released before it)
-    → UartPort.xmit, the driver's shutdown again outside it.
+    → UartPort.xmit, the driver's shutdown again outside it (the
+    8250 frees its interrupt, waiting out a running handler, which
+    takes no tty lock but Tty.flip and UartPort.xmit).
     Tty.flow (spin, thread context) → UartPort.xmit
     (TCXONC, and IXON's STOP/START from input and IXON cleared by a
     termios change, both under Tty.ldata: Tty.ldata → Tty.flow;
@@ -4815,7 +4818,7 @@ not rely on either.
 | virtio-net `tx` queue | `spin::Mutex<Option<..>>` | thread only (xmit, poll reclaim, remove) | leaf; one descriptor per frame; ring full -> drop, `tx_dropped`, ENOBUFS; empty once removed |
 | virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx`. With the event index the device ignores the flag: suppressing also sets `used_event` to 0 (Linux virtqueue_disable_cb_split), which `get` leaves alone while the flag is set, so a suppressed ring interrupts only when its used index wraps past 0; `enable_cb` (under `rx`) moves it back to the next entry. A suppression racing a `get` that just saw the flag clear may leave one more interrupt (a hint, as in Linux) |
 | virtio-PCI transport (`hw/virtio/pci.rs`) | none | probe and remove (under the virtio device's or the PCI function's `Device.lock`), then IRQ (ISR byte) | common config (status, features, queues, reset) written only under those device locks; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
-| Drivers' IRQ registrations: `VirtioDevice.irq` (MSI-X vectors, then their per-vector handlers or the INTx handler, owning the virtio driver's callbacks), the e1000 binding's `irq`, `Serial8250.irq`, `Pl011Port.irq` | spin `Mutex<Option<IrqRegistration<..>>>` (virtio: `Mutex<IrqSlot>`) | thread only (probe sets it, remove takes it; virtio: `alloc_vectors` enables MSI-X unlocked and stores the vectors, `setup_vq` writes a queue's vector under it, `request_irq` claims the slot, registers unlocked, then stores it or frees the claim; `free_irq` takes it) | leaf: vectors are enabled, registrations made and dropped (`IrqDesc.lock`, `MATRIX`) unlocked; the ISR never takes it (the handler holds its device state) |
+| Drivers' IRQ registrations: `VirtioDevice.irq` (MSI-X vectors, then their per-vector handlers or the INTx handler, owning the virtio driver's callbacks), the e1000 binding's `irq`, `SerialTty.irq` (8250), `Pl011Port.irq` | spin `Mutex<Option<IrqRegistration<..>>>` (virtio: `Mutex<IrqSlot>`) | thread only (probe sets it, remove takes it; the 8250's: its port's startup and shutdown, under `Tty.port`, the handler finding the port by `SerialTty.irq_line`, atomic; virtio: `alloc_vectors` enables MSI-X unlocked and stores the vectors, `setup_vq` writes a queue's vector under it, `request_irq` claims the slot, registers unlocked, then stores it or frees the claim; `free_irq` takes it) | leaf: vectors are enabled, registrations made and dropped (`IrqDesc.lock`, `MATRIX`) unlocked; the ISR never takes it (the handler holds its device state) |
 | PCI and USB `DYNIDS` (hw/pci/driver.rs, hw/usb/usbcore.rs; Linux dynids.lock) | spin Mutex | thread only | leaf over an intrusive list of boxed ids (Linux pci_dynid/usb_dynid): new_id allocates its entry before taking it, remove_id frees after releasing it; each match takes it alone; the probing after new_id runs with it dropped |
 | `ScsiDisk.state` (block/sd.rs, Linux sdev_state + state_mutex) | spin `Mutex<ScsiDeviceState>` | thread only | leaf: transitions (Linux's legal table) and each command's state check take it alone, never across I/O |
 | `util::ida::Ida` allocators: virtio, virtio-blk and sd indexes (Linux virtio_index_ida, vd_index_ida, sd_index_ida), namespace inode numbers (`ns::inum`, Linux proc_inum_ida), mount ids (`fs::mount` MNT_IDS, Linux mnt_id_ida) | `IrqSpinlock` | alloc thread only; free any context | leaf; nothing allocates under it (alloc grows the bitmap with it dropped, fallibly for `try_alloc`); a disk index is freed when the disk's last reference drops, a namespace's number when the namespace goes, a mount id when the mount drops |

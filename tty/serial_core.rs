@@ -521,6 +521,11 @@ impl UartPort {
         self.cfg.lock().irq = irq;
     }
 
+    /// The port's interrupt number, 0 if none (Linux uport->irq)
+    pub fn irq_nr(&self) -> i32 {
+        self.cfg.lock().irq
+    }
+
     /// TIOCGSERIAL (Linux uart_get_info), under the tty's `port`
     pub fn get_info(&self, port: &TtyPort) -> SerialStruct {
         let c = *self.cfg.lock();
@@ -796,6 +801,7 @@ mod tests {
     }
 
     static NULL_TTY: NullTty = NullTty;
+
     static TTY: super::super::Tty = super::super::Tty::new(
         "t",
         crate::fs::chardev::DevId::new(crate::fs::chardev::major::TTYS, 99),
