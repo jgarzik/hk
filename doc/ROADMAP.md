@@ -12,7 +12,7 @@ phase end. Gaps a phase leaves go to BUGS.md.
 | # | Phase | Why here |
 |---|-------|----------|
 | 1 | A — heap allocations out of atomic context | the LOCKDEP ATOMIC_ALLOC list; before more code grows collections under spin locks |
-| 2 | C — group stop, job control, ptrace stops | Debian JOBCTL; VT needs stops |
+| 2 | C — ptrace event stops, reboot CAD | strace -f, gdb; init's Ctrl-Alt-Del |
 | 3 | Y — tty and console core | prerequisite of devpts (4) and VT (7) |
 | 4 | H — Debian kernel interfaces | DEB_SH, DEB_RCS |
 | 5 | I — Debian networking | DEB_NET |
@@ -56,14 +56,12 @@ design pass and ends with /code-review and the heavy gate.
 - A3 an unnamed allocation in atomic context fails in every build
   (`MIGHT_ALLOC:FAIL`, Linux CONFIG_DEBUG_ATOMIC_SLEEP).
 
-## 2. C — group stop, job control, ptrace stops
+## 2. C — ptrace event stops, reboot CAD
 
-Group stop and continue (SIGSTOP/TSTP/TTIN/TTOU defaults, SIGCONT,
-CLD_STOPPED/CLD_CONTINUED, orphaned process groups); wait4/waitid
-WUNTRACED/WCONTINUED/WSTOPPED; SIGTTIN/SIGTTOU on background tty I/O
-(tty_check_change stops instead of failing); ptrace_stop (signal-delivery, syscall, exec
-stops), FOLL_FORCE for POKE; reboot CAD_ON/CAD_OFF. Tests JOBCTL,
-WAIT_STOPPED, PTRACE_STOP.
+ptrace exec, fork, clone and exit event stops (PTRACE_O_TRACEEXEC and
+friends, PTRACE_EVENT_FORK..PTRACE_EVENT_EXIT; BUGS.md "ptrace stop
+gaps"); reboot CAD_ON/CAD_OFF (C_A_D, cad_pid; EINVAL today). Tests
+PTRACE_EVENT, REBOOT_CAD.
 
 ## 3. Y — tty and console core
 
