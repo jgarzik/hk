@@ -182,13 +182,13 @@ impl MntNamespace {
     /// A new empty mount namespace owned by `user_ns`, not yet in the
     /// namespace tree, or ENOMEM (Linux alloc_mnt_ns)
     fn alloc(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
-        try_arc(Self::with(inum::Inum::alloc()?, user_ns))
+        try_arc(Self::with(NsCommon::new(inum::Inum::alloc()?), user_ns))
     }
 
     /// Create initial mount namespace (boot: failure cannot be reported)
     fn new_init() -> Arc<Self> {
         let ns = arc_nofail(Self::with(
-            inum::Inum::fixed(inum::MNT_INIT),
+            NsCommon::init(inum::Inum::fixed(inum::MNT_INIT)),
             INIT_USER_NS.clone(),
         ));
         mnt_ns_tree_add(&ns, RbTreeNodeReservation::new_nofail());
@@ -211,11 +211,11 @@ impl MntNamespace {
         crate::fs::mount::walk(&root, &*g).count()
     }
 
-    /// An empty namespace numbered `inum`, owned by `user_ns`
-    fn with(inum: inum::Inum, user_ns: Arc<UserNamespace>) -> Self {
+    /// An empty namespace with common part `ns`, owned by `user_ns`
+    fn with(ns: NsCommon, user_ns: Arc<UserNamespace>) -> Self {
         Self {
             root: RwLock::new(None),
-            ns: NsCommon::new(inum),
+            ns,
             user_ns,
         }
     }

@@ -41,11 +41,21 @@ pub struct NsCommon {
 }
 
 impl NsCommon {
-    /// A new namespace's, numbered `inum`: a fresh id, or an initial
-    /// namespace's fixed one
+    /// A new namespace's, numbered `inum`, with a fresh id (Linux
+    /// ns_tree_gen_id)
     pub fn new(inum: Inum) -> Self {
-        let ns_id = super::inum::init_id(inum.get())
-            .unwrap_or_else(|| NS_ID.fetch_add(1, Ordering::Relaxed) + 1);
+        Self::with_id(inum, NS_ID.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// An initial namespace's (only its constructor calls this): its
+    /// fixed inode number `inum` and the type's fixed id (Linux decides
+    /// by identity, __ns == ns_init_ns(__ns))
+    pub fn init(inum: Inum) -> Self {
+        let id = super::inum::init_id(inum.get()).expect("ns: not an initial inode number");
+        Self::with_id(inum, id)
+    }
+
+    fn with_id(inum: Inum, ns_id: u64) -> Self {
         Self {
             ns_id,
             inum,
