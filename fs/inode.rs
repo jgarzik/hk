@@ -1290,6 +1290,8 @@ impl Drop for Inode {
     /// (the lists' contract, `WeakList`) and the filesystem's eviction.
     /// An unlinked inode's dirty pages just go (truncate_inode_pages_final).
     fn drop(&mut self) {
+        // Linux iput: the last reference goes where sleeping is allowed
+        crate::sync::might_sleep();
         let keep = self.get_nlink() != 0 && self.i_hash_node.is_linked();
         if keep && self.i_dirty.load(Ordering::Acquire) {
             let _ = crate::mm::filemap::write_and_wait(self);

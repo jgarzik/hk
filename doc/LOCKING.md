@@ -2489,14 +2489,23 @@ taken in an interrupt handler is reported). A lookup (Linux
 find_inode) runs `test` on each candidate before taking a reference,
 then upgrades the match, so no reference is dropped under the lock (a
 last reference's eviction takes it); an entry in its teardown (Linux
-I_FREEING: its last `Arc` gone, its eviction waiting for the lock)
-fails the upgrade and counts as absent. Eviction (`Drop for Inode` ->
+I_WILL_FREE / I_FREEING: its last `Arc` gone, its `Drop` writing it
+back or evicting it while still hashed) fails the upgrade, and the
+lookup sleeps with no lock held until an eviction finishes (`FREED`,
+a sequence sampled under the lock, and `FREED_WQ`, Linux
+__wait_on_freeing_inode), then searches again: a lookup may sleep, so
+its callers hold no spin lock (vfat's hold its directory's `i_rwsem`,
+which no writeback or eviction takes). Eviction (`Drop for Inode` ->
 `icache::evict`, Linux iput_final -> evict) runs where the last `Arc`
 goes, which must be a context that may sleep (Linux iput's
-might_sleep, checked there): never under a spin lock or with
-interrupts off. It takes `INODE_HASH_LOCK` (if hashed) and calls
-`->evict_inode`, which may sleep and do I/O (vfat frees an unlinked
-file's clusters at once, Linux fat_evict_inode). `->evict_inode` may upgrade
+might_sleep, checked first): never under a spin lock or with
+interrupts off. A linked, hashed, dirty inode is written back first
+(Linux write_inode_now for an inode not kept cached; hk keeps none);
+then it leaves its superblock's and writeback lists,
+`->evict_inode` runs while it is still hashed (may sleep and do I/O:
+vfat frees an unlinked file's clusters at once, Linux
+fat_evict_inode), and `INODE_HASH_LOCK` is taken to unhash it, the
+waiters woken after (Linux evict's remove_inode_hash, wake_up_bit). `->evict_inode` may upgrade
 the inode's `Weak` superblock: that is a passive reference (`Arc`,
 Linux s_passive), which keeps only the memory, so its drop never
 shuts the filesystem down, whatever the context (it takes `SB_LOCK`
