@@ -146,7 +146,7 @@ pub fn mnt_ns_adjoined(id: u64, previous: bool) -> Result<Arc<MntNamespace>, Ker
         let next = {
             let t = MNT_NS_TREE.lock();
             let e = if previous {
-                t.iter().take_while(|(k, _)| **k < at).last()
+                t.before(&at)
             } else {
                 t.range_from(&at.saturating_add(1)).next()
             };
@@ -154,11 +154,11 @@ pub fn mnt_ns_adjoined(id: u64, previous: bool) -> Result<Arc<MntNamespace>, Ker
         };
         let (k, w) = next.ok_or(KernelError::NotFound)?;
         at = k;
-        // hk's user namespaces grant no capabilities (BUGS.md): Linux
-        // ns_capable_noaudit(mntns->user_ns, CAP_SYS_ADMIN)
-        if let Some(m) = w.upgrade()
-            && crate::task::capable(crate::task::CAP_SYS_ADMIN)
-        {
+        // Linux also requires ns_capable_noaudit(mntns->user_ns,
+        // CAP_SYS_ADMIN) per candidate; hk's capabilities ignore user
+        // namespaces (BUGS.md), so that is the caller's
+        // may_see_all_namespaces check, already made
+        if let Some(m) = w.upgrade() {
             return Ok(m);
         }
     }
@@ -179,13 +179,10 @@ pub struct MntNamespace {
 }
 
 impl MntNamespace {
-    /// Create a new empty mount namespace owned by `user_ns`, or ENOMEM
-    /// (Linux alloc_mnt_ns)
-    pub fn new(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
-        let node = RbTreeNodeReservation::new()?;
-        let ns = try_arc(Self::with(inum::Inum::alloc()?, user_ns))?;
-        mnt_ns_tree_add(&ns, node);
-        Ok(ns)
+    /// A new empty mount namespace owned by `user_ns`, not yet in the
+    /// namespace tree, or ENOMEM (Linux alloc_mnt_ns)
+    fn alloc(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self::with(inum::Inum::alloc()?, user_ns))
     }
 
     /// Create initial mount namespace (boot: failure cannot be reported)
@@ -236,7 +233,10 @@ impl MntNamespace {
         fs: Option<&crate::fs::FsStruct>,
         user_ns: &Arc<UserNamespace>,
     ) -> KernelResult<Arc<Self>> {
-        let new_ns = Self::new(user_ns.clone())?;
+        // Its tree node first: once the copy is built, listing it
+        // cannot fail
+        let node = RbTreeNodeReservation::new()?;
+        let new_ns = Self::alloc(user_ns.clone())?;
         let slave = !Arc::ptr_eq(user_ns, &self.user_ns);
         let old_root = self.get_root();
         if let Some(old_root) = old_root {
@@ -246,6 +246,10 @@ impl MntNamespace {
                 fs.repoint(&map);
             }
         }
+        // Listed only now, whole (Linux copy_mnt_ns: ns_tree_add_raw at
+        // the end), so NS_MNT_GET_NEXT/PREV never find a namespace
+        // half built or whose copy failed
+        mnt_ns_tree_add(&new_ns, node);
         Ok(new_ns)
     }
 

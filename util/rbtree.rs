@@ -803,6 +803,31 @@ impl<K: Ord, V> RbTree<K, V> {
             _t: PhantomData,
         }
     }
+
+    /// The entry with the greatest key below `key` (BTreeMap
+    /// `range(..key).next_back()`; Rust-for-Linux `cursor_lower_bound`
+    /// then prev): one descent
+    pub fn before(&self, key: &K) -> Option<(&K, &V)> {
+        let (mut n, mut found) = (self.root.node, null_mut());
+        while !n.is_null() {
+            // SAFETY: a link of this tree heads a live node (type
+            // invariant)
+            let node = unsafe { &*n.cast::<Node<K, V>>() };
+            if node.key < *key {
+                found = n;
+                n = node.link.right;
+            } else {
+                n = node.link.left;
+            }
+        }
+        if found.is_null() {
+            return None;
+        }
+        // SAFETY: a link of this tree heads a live node (type
+        // invariant), borrowed with the tree
+        let node = unsafe { &*found.cast::<Node<K, V>>() };
+        Some((&node.key, &node.value))
+    }
 }
 
 impl<K, V> Drop for RbTree<K, V> {
@@ -1584,6 +1609,8 @@ mod tests {
                     let a: Vec<_> = t.range_from(&k).map(|(k, v)| (*k, *v)).collect();
                     let b: Vec<_> = m.range(k..).map(|(k, v)| (*k, *v)).collect();
                     assert_eq!(a, b);
+                    let p = t.before(&k).map(|(k, v)| (*k, *v));
+                    assert_eq!(p, m.range(..k).next_back().map(|(k, v)| (*k, *v)));
                 }
             }
             let keys = check(&t);
