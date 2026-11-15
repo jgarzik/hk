@@ -719,10 +719,8 @@ fn dev_tty() -> i64 {
     fd
 }
 
-/// A child of the calling session leader running `f`: its exit code
-fn member(f: fn() -> i32) -> i64 {
-    in_child(f)
-}
+/// SIGHUP and SIGCONT, as a pending-set mask
+const HUP_CONT: u64 = 1 << (SIGHUP - 1) | 1 << (SIGCONT - 1);
 
 fn ctty_proc_child() -> i32 {
     sys_ioctl(1, TCSBRK, 1);
@@ -734,10 +732,13 @@ fn ctty_proc_child() -> i32 {
     }
     let early = sys_fork();
     if early == 0 {
+        // Its parent's end only: a read ends if the parent dies
+        sys_close(go[1] as u64);
         let mut b = [0u8; 1];
         sys_read(go[0] as u64, b.as_mut_ptr(), 1);
         sys_exit(if dev_tty() == ENXIO { 0 } else { 1 });
     }
+    sys_close(go[0] as u64);
     let fd = open_ctty();
     if fd < 0 || early < 0 {
         return 3;
@@ -748,12 +749,14 @@ fn ctty_proc_child() -> i32 {
     if st != 0 {
         return 4;
     }
-    let late = member(|| {
-        if dev_tty() != 0 {
+    let late = in_child(|| {
+        let fd = sys_open(b"/dev/tty\0".as_ptr(), O_RDWR | O_NONBLOCK, 0);
+        if fd < 0 {
             return 1;
         }
-        let fd = sys_open(b"/dev/tty\0".as_ptr(), O_RDWR | O_NONBLOCK, 0);
-        if sys_ioctl(fd as i32, TIOCNOTTY, 0) != 0 {
+        let r = sys_ioctl(fd as i32, TIOCNOTTY, 0);
+        sys_close(fd as u64);
+        if r != 0 {
             return 2;
         }
         if dev_tty() != ENXIO { 3 } else { 0 }
@@ -788,11 +791,13 @@ fn old_pgrp_leader(res: i32) -> i32 {
     let leader = sys_getpid();
     let pid = sys_fork();
     if pid == 0 {
+        // The other side's ends only: a read ends if the leader dies
+        sys_close(ready[0] as u64);
+        sys_close(hung[1] as u64);
         let mut b = [0u8; 1];
         sys_write(ready[1] as u64, b"r".as_ptr(), 1);
         sys_read(hung[0] as u64, b.as_mut_ptr(), 1);
-        let want = 1 << (SIGHUP - 1) | 1 << (SIGCONT - 1);
-        let mut step: u8 = if pending_sigs() & want != 0 { 1 } else { 0 };
+        let mut step: u8 = if pending_sigs() & HUP_CONT != 0 { 1 } else { 0 };
         sys_write(ready[1] as u64, b"c".as_ptr(), 1);
         for _ in 0..500 {
             if sys_getppid() != leader {
@@ -800,7 +805,7 @@ fn old_pgrp_leader(res: i32) -> i32 {
             }
             crate::helpers::msleep(10);
         }
-        if step == 0 && pending_sigs() & want != want {
+        if step == 0 && pending_sigs() & HUP_CONT != HUP_CONT {
             step = 2;
         }
         let me = sys_getpid() as i32;
@@ -813,6 +818,8 @@ fn old_pgrp_leader(res: i32) -> i32 {
     if pid < 0 {
         return 3;
     }
+    sys_close(ready[1] as u64);
+    sys_close(hung[0] as u64);
     let mut b = [0u8; 1];
     sys_read(ready[0] as u64, b.as_mut_ptr(), 1);
     let v = sys_vhangup();
@@ -820,12 +827,11 @@ fn old_pgrp_leader(res: i32) -> i32 {
     sys_write(hung[1] as u64, b"h".as_ptr(), 1);
     // Exit only once the member has looked
     sys_read(ready[0] as u64, b.as_mut_ptr(), 1);
-    let want = 1 << (SIGHUP - 1) | 1 << (SIGCONT - 1);
     if v != 0 {
         4
     } else if gone != ENXIO {
         5
-    } else if pending_sigs() & want != want {
+    } else if pending_sigs() & HUP_CONT != HUP_CONT {
         6
     } else {
         0
