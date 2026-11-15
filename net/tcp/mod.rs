@@ -711,7 +711,8 @@ impl TcpSock {
 
     /// A segment found for this socket under `t` in ehash or lhash
     /// (Linux tcp_v4_rcv's socket part): processed at once unless the
-    /// socket is owned, else queued to the backlog for the owner
+    /// socket is owned, else queued to the backlog for the owner.
+    ///
     /// A request whose listener stopped listening is dropped and the
     /// segment handed back to be looked up again (Linux tcp_v4_rcv:
     /// inet_csk_reqsk_queue_drop_and_put, goto lookup).
@@ -1398,7 +1399,6 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
     let dev = skb.dev.take();
     let dif = dev.as_ref().map_or(0, |d| d.ifindex());
     let now = now_ms();
-    let mut skb = skb;
     let skb = loop {
         match net.tcp.lookup(&t) {
             // A dead request hands the segment back, dropped from ehash
