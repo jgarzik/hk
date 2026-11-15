@@ -23,7 +23,7 @@ use crate::block::blkdev::DevId;
 use crate::fs::fs_writeback::IoListA;
 use crate::sync::spin::Mutex;
 use crate::task::workqueue::{DelayedWork, Workqueue, wq_flags};
-use crate::util::list::ArcList;
+use crate::util::list::WeakList;
 
 /// The periodic writeback's interval in scheduler ticks
 /// (vm.dirty_writeback_centisecs)
@@ -64,14 +64,15 @@ pub struct BdiWriteback {
     background: AtomicBool,
 }
 
-/// A disk's dirty inodes, each list holding a reference per inode
-/// (linked through `Inode.i_io_list`)
+/// A disk's dirty inodes, linked through `Inode.i_io_list`, holding no
+/// reference to them (Linux wb->b_dirty, b_io): an inode's last
+/// reference evicts it whether dirty or not, its `Drop` unlinking it
 pub(crate) struct WbLists {
     /// Dirtied and not yet taken by a pass, oldest first (Linux b_dirty,
     /// which keeps them newest first)
-    pub b_dirty: ArcList<IoListA>,
+    pub b_dirty: WeakList<IoListA>,
     /// Taken by the running pass, to write in order (Linux b_io)
-    pub b_io: ArcList<IoListA>,
+    pub b_io: WeakList<IoListA>,
 }
 
 impl BdiWriteback {
@@ -86,8 +87,8 @@ impl BdiWriteback {
         Self {
             dev_id,
             list_lock: Mutex::new(WbLists {
-                b_dirty: ArcList::new(),
-                b_io: ArcList::new(),
+                b_dirty: WeakList::new(),
+                b_io: WeakList::new(),
             }),
             pass: crate::sync::Mutex::new(()),
             dwork,

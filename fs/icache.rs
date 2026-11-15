@@ -9,7 +9,7 @@
 //! insert_inode_hash.
 //!
 //! An inode lives as long as someone holds an `Arc` to it: a dentry, an
-//! open file, a mapping, the writeback lists while it is dirty. The hash
+//! open file, a mapping (the writeback lists hold none). The hash
 //! holds a `Weak` only (a `WeakList` per bucket, linked through the
 //! inode's own `i_hash_node`: hashing allocates nothing). When the last
 //! `Arc` goes, `Drop for Inode` runs [`evict`]: it unhashes the inode
@@ -25,9 +25,12 @@
 //! thread inserted the same object meanwhile (then the new one is
 //! dropped, never seen). So there is no I_NEW state to wait on. A lookup
 //! runs the filesystem's `test` on each candidate before taking a
-//! reference (Linux find_inode); one racing the drop of the last
-//! reference (still hashed, its eviction waiting for the lock: Linux
-//! I_FREEING) cannot be upgraded and is treated as absent.
+//! reference (Linux find_inode). One whose last reference went (its
+//! `Drop` writing it back or evicting it while still hashed: Linux
+//! I_WILL_FREE, I_FREEING) cannot be upgraded: the lookup sleeps until
+//! an eviction finishes and searches again (Linux
+//! __wait_on_freeing_inode), so no second inode of the object is built
+//! while the first may still write it or free its blocks.
 //!
 //! Locking: one `INODE_HASH_LOCK` (Linux inode_hash_lock), a spin leaf
 //! apart from `test` (which may take `Inode.private` and the
@@ -46,6 +49,7 @@ use spin::Once;
 use super::inode::Inode;
 use super::superblock::SuperBlock;
 use crate::sync::spin::Mutex;
+use crate::sync::waitqueue::WaitQueue;
 use crate::sync::{LockedBy, UniqueOwner};
 use crate::util::error::KernelError;
 use crate::util::list::WeakList;
@@ -89,7 +93,23 @@ fn bucket(sb: *const SuperBlock, hashval: u64) -> &'static Bucket {
     &t[(h >> 32) as usize & (t.len() - 1)]
 }
 
-/// The live inode of (sb, hashval) passing `test`, if hashed (Linux
+/// Evictions of hashed inodes so far, and their waiters (Linux wakes
+/// __I_NEW's bit queue at the end of evict): a lookup that found the
+/// object's inode dying samples this under `INODE_HASH_LOCK` and sleeps
+/// until it moves, never touching the dying inode again
+static FREED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FREED_WQ: WaitQueue = WaitQueue::new();
+
+/// What a search found
+enum Found {
+    Live(Arc<Inode>),
+    /// Its inode, its last reference gone, is still hashed (Linux
+    /// I_WILL_FREE / I_FREEING): `FREED` as it was then
+    Dying(u64),
+    None,
+}
+
+/// The inode of (sb, hashval) passing `test`, if hashed (Linux
 /// find_inode): `test` runs before any reference is taken, so nothing
 /// is dropped under the lock (the last reference's eviction takes it).
 /// `b` is the bucket of (sb, hashval), found before the lock (the table
@@ -100,28 +120,51 @@ fn find(
     sb: *const SuperBlock,
     hashval: u64,
     test: &dyn Fn(&Inode) -> bool,
-) -> Option<Arc<Inode>> {
-    b.access(l)
-        .iter()
-        .filter(|e| {
-            let i = e.get();
-            core::ptr::eq(i.sb.as_ptr(), sb)
-                && i.i_hash.load(Ordering::Relaxed) == hashval
-                && test(i)
-        })
-        .find_map(|e| e.upgrade())
+) -> Found {
+    let mut dying = false;
+    for e in b.access(l).iter() {
+        let i = e.get();
+        if core::ptr::eq(i.sb.as_ptr(), sb)
+            && i.i_hash.load(Ordering::Relaxed) == hashval
+            && test(i)
+        {
+            match e.upgrade() {
+                Some(a) => return Found::Live(a),
+                None => dying = true,
+            }
+        }
+    }
+    if dying {
+        Found::Dying(FREED.load(Ordering::Acquire))
+    } else {
+        Found::None
+    }
+}
+
+/// Sleep until an eviction after `seen` finished (Linux
+/// __wait_on_freeing_inode), the dying inode gone from the hash
+fn wait_freed(seen: u64) {
+    crate::sync::might_sleep();
+    FREED_WQ.wait_event(|| FREED.load(Ordering::Acquire) != seen);
 }
 
 /// The cached inode of (sb, hashval) for which `test` holds (Linux
-/// ilookup5); `test` runs under a spinlock and must not sleep
+/// ilookup5): one being freed is waited for, then searched again.
+/// `test` runs under a spinlock and must not sleep; this may sleep.
 pub fn ilookup5(
     sb: &Arc<SuperBlock>,
     hashval: u64,
     test: &dyn Fn(&Inode) -> bool,
 ) -> Option<Arc<Inode>> {
     let b = bucket(Arc::as_ptr(sb), hashval);
-    let l = INODE_HASH_LOCK.lock();
-    find(&l, b, Arc::as_ptr(sb), hashval, test)
+    loop {
+        let found = find(&INODE_HASH_LOCK.lock(), b, Arc::as_ptr(sb), hashval, test);
+        match found {
+            Found::Live(i) => return Some(i),
+            Found::None => return None,
+            Found::Dying(seen) => wait_freed(seen),
+        }
+    }
 }
 
 /// The inode of (sb, hashval) for which `test` holds, building and
@@ -140,15 +183,25 @@ pub fn iget5(
     }
     let new = make()?;
     let b = bucket(Arc::as_ptr(sb), hashval);
-    let mut l = INODE_HASH_LOCK.lock();
-    if let Some(i) = find(&l, b, Arc::as_ptr(sb), hashval, test) {
-        drop(l);
-        // `new` is dropped unhashed, after the unlock
-        return Ok(i);
+    loop {
+        let mut l = INODE_HASH_LOCK.lock();
+        match find(&l, b, Arc::as_ptr(sb), hashval, test) {
+            Found::Live(i) => {
+                drop(l);
+                // `new` is dropped unhashed, after the unlock
+                return Ok(i);
+            }
+            Found::Dying(seen) => {
+                drop(l);
+                wait_freed(seen);
+            }
+            Found::None => {
+                hash_locked(&mut l, b, &new, hashval);
+                drop(l);
+                return Ok(new);
+            }
+        }
     }
-    hash_locked(&mut l, b, &new, hashval);
-    drop(l);
-    Ok(new)
 }
 
 /// Hash `i` under `hashval` on its bucket `b` (Linux
@@ -171,16 +224,21 @@ pub fn insert_inode_hash(inode: &Arc<Inode>, hashval: u64) {
 /// Unhash `inode` (Linux remove_inode_hash): later lookups of its
 /// object build a new inode (an unlinked or moved entry)
 pub fn remove_inode_hash(inode: &Inode) {
+    let _ = unhash(inode);
+}
+
+/// [`remove_inode_hash`]; true if it was hashed
+fn unhash(inode: &Inode) -> bool {
     // Hashing and unhashing are the inode's owner's (create, rename,
     // unlink, eviction), never concurrent with this: unlocked, the link
     // reads its own last state
     if !inode.i_hash_node.is_linked() {
-        return;
+        return false;
     }
     let weak = {
         let mut l = INODE_HASH_LOCK.lock();
         if !inode.i_hash_node.is_linked() {
-            return;
+            return false;
         }
         let b = bucket(inode.sb.as_ptr(), inode.i_hash.load(Ordering::Relaxed));
         // SAFETY: linked, so on the bucket of its superblock and hash
@@ -190,6 +248,7 @@ pub fn remove_inode_hash(inode: &Inode) {
     };
     // Only the hash's weak reference goes: never the inode's Drop
     drop(weak);
+    true
 }
 
 /// Move `inode` to `hashval` (Linux fat_detach + fat_attach on rename)
@@ -199,11 +258,16 @@ pub fn rehash(inode: &Arc<Inode>, hashval: u64) {
 }
 
 /// The last reference to `inode` is gone (Linux iput_final -> evict):
-/// unhash it and let its filesystem release what it still owns. Runs
-/// from `Drop for Inode`, in whatever (thread) context the last
-/// reference went: it must not sleep (filesystems defer I/O to a
-/// workqueue)
+/// its filesystem releases what it still owns while it is still hashed
+/// (lookups of its object wait), then it is unhashed and the waiters
+/// woken (Linux evict: ->evict_inode, remove_inode_hash, wake_up_bit).
+/// Runs from `Drop for Inode` in a context that may sleep (Linux iput:
+/// might_sleep): the filesystem may do I/O (vfat frees an unlinked
+/// file's clusters).
 pub fn evict(inode: &Inode) {
-    remove_inode_hash(inode);
     inode.i_op.evict_inode(inode);
+    if unhash(inode) {
+        FREED.fetch_add(1, Ordering::AcqRel);
+        FREED_WQ.wake_all();
+    }
 }

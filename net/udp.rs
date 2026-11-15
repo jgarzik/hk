@@ -487,7 +487,9 @@ impl ProtoOps for UdpSock {
                 Err(e)
             }
             Err(e) => {
-                // Linux udp_sendmsg's out: no kernel memory
+                // Linux __ip_append_data's error path or ip_send_skb;
+                // udp_sendmsg's out: no kernel memory
+                mib.out_discard();
                 if e == KernelError::NoBufferSpace {
                     mib.udp.inc(UDP_MIB_SNDBUFERRORS);
                 }
@@ -842,9 +844,9 @@ pub fn udp_checksum(saddr: Ipv4Addr, daddr: Ipv4Addr, udp: &[u8]) -> u16 {
 }
 
 /// `/proc/net/udp` (Linux udp4_seq_show): every bound socket of the
-/// reader's namespace, addresses as raw network-order hex, lines padded
+/// `net`, addresses as raw network-order hex, lines padded
 /// to 127 columns
-pub fn proc_net_udp() -> Vec<u8> {
+pub fn proc_net_udp(net: &crate::net::NetNamespace) -> Vec<u8> {
     use core::fmt::Write;
     let mut out = alloc::string::String::new();
     let _ = writeln!(
@@ -853,7 +855,7 @@ pub fn proc_net_udp() -> Vec<u8> {
         "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops"
     );
     let raw = |a: Ipv4Addr| u32::from_ne_bytes(a.to_be_bytes());
-    for s in crate::net::current_net_ns().udp.all() {
+    for s in net.udp.all() {
         let a = s.inet.get();
         // TCP_ESTABLISHED (1) when connected, else TCP_CLOSE (7)
         let st = if s.connected.load(Ordering::Acquire) {

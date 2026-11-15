@@ -10,7 +10,7 @@
 
 use alloc::sync::Arc;
 use core::ptr::null_mut;
-use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use super::inum::Inum;
 use super::{
@@ -20,8 +20,17 @@ use super::{
 use crate::fs::dentry::Dentry;
 use crate::ipc::IpcNamespace;
 
+/// The last namespace id handed out (Linux namespace_cookie), one
+/// sequence for every type, past the initial namespaces' fixed ids
+static NS_ID: AtomicU64 = AtomicU64::new(super::inum::NS_LAST_INIT_ID + 1);
+
 /// A namespace's common part (Linux struct ns_common)
 pub struct NsCommon {
+    /// Its id, never reused, in creation order across all types (Linux
+    /// ns_id, __ns_tree_gen_id): an initial namespace's is fixed (Linux
+    /// init_ns_id); NS_GET_ID and NS_GET_MNTNS_ID give it, and a mount
+    /// names its mount namespace by it
+    pub ns_id: u64,
     /// Its inode number (Linux ns.inum): /proc/<pid>/ns/<type> reads
     /// "<type>:[<inum>]", the st_ino of its nsfs file
     pub inum: Inum,
@@ -32,8 +41,23 @@ pub struct NsCommon {
 }
 
 impl NsCommon {
-    pub const fn new(inum: Inum) -> Self {
+    /// A new namespace's, numbered `inum`, with a fresh id (Linux
+    /// ns_tree_gen_id)
+    pub fn new(inum: Inum) -> Self {
+        Self::with_id(inum, NS_ID.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// An initial namespace's (only its constructor calls this): its
+    /// fixed inode number `inum` and the type's fixed id (Linux decides
+    /// by identity, __ns == ns_init_ns(__ns))
+    pub fn init(inum: Inum) -> Self {
+        let id = super::inum::init_id(inum.get()).expect("ns: not an initial inode number");
+        Self::with_id(inum, id)
+    }
+
+    fn with_id(inum: Inum, ns_id: u64) -> Self {
         Self {
+            ns_id,
             inum,
             stashed: AtomicPtr::new(null_mut()),
         }

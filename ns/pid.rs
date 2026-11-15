@@ -76,7 +76,7 @@ impl PidNamespace {
         // child_reaper is set from the start
         arc_nofail(Self {
             level: 0,
-            ns: super::NsCommon::new(super::inum::Inum::fixed(super::inum::PID_INIT)),
+            ns: super::NsCommon::init(super::inum::Inum::fixed(super::inum::PID_INIT)),
             user_ns: super::INIT_USER_NS.clone(),
             parent: None,
             map: crate::task::pid::PidMap::new(),

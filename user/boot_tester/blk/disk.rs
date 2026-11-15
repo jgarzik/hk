@@ -392,6 +392,17 @@ fn vfat(d: &Disk) {
     if r != 0 {
         return;
     }
+    // A device filesystem's st_dev is its device (Linux
+    // set_bdev_super: s_dev = bd_dev)
+    let mut node = Stat::default();
+    let mut root = Stat::default();
+    let a = sys_stat(p1.path(&mut p).as_ptr(), &mut node);
+    let b = sys_stat(b"/mnt/vd1\0".as_ptr(), &mut root);
+    verdict(
+        b"VFAT_ST_DEV",
+        a == 0 && b == 0 && root.st_dev == node.st_rdev,
+        root.st_dev as i64,
+    );
     let mut b = [0u8; 64];
     let n = read_file(b"/mnt/vd1/HKDISK.TXT\0", &mut b);
     verdict(
@@ -426,13 +437,17 @@ fn vfat(d: &Disk) {
     vfat_rename_ino();
     vfat_unlink_open();
     vfat_unlink_reuse();
+    vfat_statfs();
+    vfat_evict_writeback();
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     verdict(b"BLK_VFAT_UMOUNT", u == 0, u);
     vfat_remount(p1);
+    vfat_lazy_umount(p1);
     vfat_names(p1);
     vfat_opts(p1);
     vfat_neg_case(p1);
     vfat_mount_alias(p1);
+    vfat_shared_sb(p1);
     vfat_sync(p1);
     vfat_corrupt_chain(p1);
 }
@@ -522,6 +537,32 @@ fn vfat_remount(p1: &BlkDev) {
         println(b"");
     }
     verdict(b"VFAT_REMOUNT_DATA", ok && u == 0, n);
+}
+
+/// What a file left open by a lazy umount writes reaches the disk when
+/// its last user goes (Linux: the last deactivate_super's
+/// generic_shutdown_super runs sync_filesystem, before the close
+/// returns): a new mount reads it
+fn vfat_lazy_umount(p1: &BlkDev) {
+    const MNT_DETACH: u64 = 2;
+    let opts = b"iocharset=cp437\0";
+    let path = b"/mnt/vd1/LAZY.TXT\0";
+    let r = mount_vd1(p1, opts);
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), MNT_DETACH);
+    let w = sys_pwrite64(fd, b"after detach".as_ptr(), 12, 0);
+    sys_close(fd as u64);
+    let m = mount_vd1(p1, opts);
+    let mut b = [0u8; 32];
+    let n = read_file(path, &mut b);
+    sys_unlink(path.as_ptr());
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    let ok = r == 0 && fd >= 0 && u == 0 && w == 12 && m == 0;
+    verdict(
+        b"VFAT_LAZY_UMOUNT_SYNC",
+        ok && n == 12 && &b[..12] == b"after detach",
+        if ok { n } else { r * 1000 + u * 100 + m },
+    );
 }
 
 /// Mount vda1 on /mnt/vd1 with mount data `opts` (NUL-terminated)
@@ -1030,6 +1071,111 @@ fn vfat_mount_alias(p1: &BlkDev) {
     sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     let ok = r == 0 && fd >= 0 && m == 0 && lower == -2 && upper == -2;
     verdict(b"VFAT_MOUNT_ALIAS", ok, lower * 100 + upper);
+}
+
+/// statfs of vfat (Linux fat_statfs): clusters as blocks, the long
+/// name limit 255 * 6 bytes; a written file takes its clusters from
+/// f_bfree, and the last close of it unlinked gives them all back at
+/// once (Linux fat_evict_inode frees the chain in the final iput)
+fn vfat_statfs() {
+    const MSDOS_SUPER_MAGIC: i64 = 0x4d44;
+    const SIZE: usize = 64 * 1024;
+    let mnt = b"/mnt/vd1\0";
+    let f = b"/mnt/vd1/STATFS.BIN\0";
+    let free = || {
+        let mut st = hk_syscall::LinuxStatFs::default();
+        let r = hk_syscall::sys_statfs(mnt.as_ptr(), &mut st);
+        (r, st)
+    };
+    let (r0, st0) = free();
+    let fd = sys_open(f.as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let buf = [b'q'; 4096];
+    let mut w = 0;
+    for i in 0..SIZE / 4096 {
+        w += sys_pwrite64(fd, buf.as_ptr(), 4096, (i * 4096) as i64);
+    }
+    sys_fsync(fd);
+    let (_, st1) = free();
+    sys_unlink(f.as_ptr());
+    let (_, st2) = free();
+    sys_close(fd as u64);
+    let (_, st3) = free();
+    let bs = st0.f_bsize.max(1);
+    let used = (SIZE as i64 + bs - 1) / bs;
+    let ok = r0 == 0
+        && st0.f_type == MSDOS_SUPER_MAGIC
+        && st0.f_namelen == 255 * 6
+        && st0.f_blocks > 0
+        && st0.f_bfree <= st0.f_blocks
+        && st0.f_bavail == st0.f_bfree
+        && w == SIZE as i64
+        && st0.f_bfree - st1.f_bfree >= used
+        // Held while open after the unlink, back at the last close
+        && st2.f_bfree == st1.f_bfree
+        && st3.f_bfree == st0.f_bfree;
+    verdict(
+        b"VFAT_STATFS",
+        ok,
+        if r0 != 0 {
+            r0
+        } else {
+            st0.f_bfree - st3.f_bfree
+        },
+    );
+}
+
+/// A file written and closed without fsync keeps its data when its
+/// inode is evicted (drop_caches): the eviction writes it back first
+/// (Linux iput_final -> write_inode_now for an inode not kept), and the
+/// next inode reads it from the disk
+fn vfat_evict_writeback() {
+    let f = b"/mnt/vd1/EVICT.BIN\0";
+    let fd = sys_open(f.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644) as i32;
+    let mut pat = [0u8; 8192];
+    for (i, b) in pat.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let w = sys_pwrite64(fd, pat.as_ptr(), pat.len() as u64, 0);
+    sys_close(fd as u64);
+    drop_caches();
+    let mut back = [0u8; 8192];
+    let n = read_file(f, &mut back);
+    sys_unlink(f.as_ptr());
+    let ok = w == pat.len() as i64 && n == pat.len() as i64 && back == pat;
+    verdict(b"VFAT_EVICT_WRITEBACK", ok, if w != 8192 { w } else { n });
+}
+
+/// Two mounts of vda1 share one superblock (Linux get_tree_bdev:
+/// sget_dev): a file made through one is there through the other at
+/// once, root inodes and st_dev alike; a read-only mount while it is
+/// read-write is EBUSY (Linux: "would change RO state")
+fn vfat_shared_sb(p1: &BlkDev) {
+    const MS_RDONLY: u64 = 1;
+    let mut p = [0u8; 48];
+    let dev = p1.path(&mut p).as_ptr();
+    sys_mkdir(b"/mnt/vd1b ".as_ptr(), 0o755);
+    sys_mkdir(b"/mnt/vd1c ".as_ptr(), 0o755);
+    let opts = b"iocharset=cp437\0".as_ptr() as u64;
+    let fs = b"vfat\0".as_ptr();
+    let a = sys_mount(dev, b"/mnt/vd1\0".as_ptr(), fs, 0, opts);
+    let b = sys_mount(dev, b"/mnt/vd1b\0".as_ptr(), fs, 0, opts);
+    let fd = sys_open(b"/mnt/vd1/SHARED.TXT\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd as u64);
+    let mut st = Stat::default();
+    let seen = sys_stat(b"/mnt/vd1b/SHARED.TXT\0".as_ptr(), &mut st);
+    let (mut ra, mut rb) = (Stat::default(), Stat::default());
+    sys_stat(b"/mnt/vd1\0".as_ptr(), &mut ra);
+    sys_stat(b"/mnt/vd1b\0".as_ptr(), &mut rb);
+    let same = ra.st_ino == rb.st_ino && ra.st_dev == rb.st_dev;
+    let ro = sys_mount(dev, b"/mnt/vd1c\0".as_ptr(), fs, MS_RDONLY, opts);
+    if ro == 0 {
+        sys_umount2(b"/mnt/vd1c\0".as_ptr(), 0);
+    }
+    sys_unlink(b"/mnt/vd1/SHARED.TXT\0".as_ptr());
+    sys_umount2(b"/mnt/vd1b\0".as_ptr(), 0);
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    let ok = a == 0 && b == 0 && fd >= 0 && seen == 0 && same && ro == EBUSY;
+    verdict(b"VFAT_SHARED_SB", ok, if seen != 0 { seen } else { ro });
 }
 
 /// Dirty kB after writing 2 MiB to a new file on vda1 mounted with

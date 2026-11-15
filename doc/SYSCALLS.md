@@ -86,7 +86,7 @@
 - [x] tee
 - [x] vmsplice
 - [x] copy_file_range
-- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD (regular files, pipes/FIFOs, inotify, fanotify), xHCI USB; ttys (also via /dev/tty and /dev/console): TCGETS, TCSETS[WF], TIOC[GS]WINSZ (SIGWINCH), TIOC[GS]PGRP, TIOCGSID, TIOCSCTTY, TIOCNOTTY, TIOC[GS]ETD, TCFLSH, TCXONC, TCSBRK[P] (drain), TIOCINQ, TIOCOUTQ, TIOC[GS]SERIAL (serial ports); block devices: BLKGETSIZE, BLKGETSIZE64, BLKSSZGET, BLKPBSZGET, BLKBSZGET, BLKBSZSET, BLKROGET, BLKRRPART, BLKFLSBUF; sockets: FIONREAD/SIOCINQ, SIOCOUTQ, FIOSETOWN/SIOCSPGRP, FIOGETOWN/SIOCGPGRP, SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFNAME, SIOC[GS]IFFLAGS, SIOC[GS]IFADDR, SIOC[GS]IFNETMASK, SIOC[GS]IFBRDADDR, SIOCGIFHWADDR, SIOC[GS]IFMTU, SIOCADDRT, SIOCDELRT; namespace files: NS_GET_USERNS, NS_GET_PARENT, NS_GET_NSTYPE, NS_GET_OWNER_UID)
+- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD (regular files, pipes/FIFOs, inotify, fanotify), xHCI USB; ttys (also via /dev/tty and /dev/console): TCGETS, TCSETS[WF], TIOC[GS]WINSZ (SIGWINCH), TIOC[GS]PGRP, TIOCGSID, TIOCSCTTY, TIOCNOTTY, TIOC[GS]ETD, TCFLSH, TCXONC, TCSBRK[P] (drain), TIOCINQ, TIOCOUTQ, TIOC[GS]SERIAL (serial ports); block devices: BLKGETSIZE, BLKGETSIZE64, BLKSSZGET, BLKPBSZGET, BLKBSZGET, BLKBSZSET, BLKROGET, BLKRRPART, BLKFLSBUF; sockets: FIONREAD/SIOCINQ, SIOCOUTQ, FIOSETOWN/SIOCSPGRP, FIOGETOWN/SIOCGPGRP, SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFNAME, SIOC[GS]IFFLAGS, SIOC[GS]IFADDR, SIOC[GS]IFNETMASK, SIOC[GS]IFBRDADDR, SIOCGIFHWADDR, SIOC[GS]IFMTU, SIOCADDRT, SIOCDELRT; namespace files: NS_GET_USERNS, NS_GET_PARENT, NS_GET_NSTYPE, NS_GET_OWNER_UID, NS_GET_ID, NS_GET_MNTNS_ID, NS_GET_{PID,TGID}_{FROM,IN}_PIDNS, NS_MNT_GET_{INFO,NEXT,PREV})
 - [x] sync
 - [x] fsync
 - [x] fdatasync
@@ -334,7 +334,8 @@ probes, tcp_congestion_control, tcp_available_congestion_control.
 yet: SACK (never advertised), receive buffer autotuning, the per-netns
 challenge-ACK budget (out-of-window and challenge ACKs are limited per
 connection to one per 500 ms like tcp_invalid_ratelimit); listeners keep full child sockets in SYN_RECEIVED
-(no SYN cookies).
+(no SYN cookies), which act as Linux request socks (a closed
+listener's are dropped silently by their timer or next segment).
 
 - [x] socket (AF_INET: TCP, UDP, ping SOCK_DGRAM/IPPROTO_ICMP gated by
   ping_group_range, SOCK_RAW with CAP_NET_RAW: IP_HDRINCL, SOL_RAW

@@ -16,6 +16,24 @@ pub const CGROUP_INIT: u32 = 0xEFFF_FFFB;
 pub const NET_INIT: u32 = 0xEFFF_FFF9;
 pub const MNT_INIT: u32 = 0xEFFF_FFF8;
 
+/// An initial namespace's fixed id (Linux uapi nsfs.h init_ns_id), by
+/// its fixed number
+pub fn init_id(inum: u32) -> Option<u64> {
+    Some(match inum {
+        IPC_INIT => 1,
+        UTS_INIT => 2,
+        USER_INIT => 3,
+        PID_INIT => 4,
+        CGROUP_INIT => 5,
+        NET_INIT => 7,
+        MNT_INIT => 8,
+        _ => return None,
+    })
+}
+
+/// The highest initial namespace id (Linux NS_LAST_INIT_ID)
+pub const NS_LAST_INIT_ID: u64 = 8;
+
 /// The first number handed out (Linux PROC_DYNAMIC_FIRST)
 const DYNAMIC_FIRST: u32 = 0xF000_0000;
 

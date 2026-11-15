@@ -41,8 +41,13 @@ pub struct Pseudo {
     mnt: spin::Once<MountRef>,
 }
 
+/// A pseudo filesystem's ->show_path (Linux super_operations.show_path)
+type ShowPath = fn(&super::Dentry) -> Option<alloc::vec::Vec<u8>>;
+
 struct PseudoSuperOps {
     magic: u64,
+    /// Its ->show_path, if any
+    show_path: Option<ShowPath>,
 }
 
 impl SuperOps for PseudoSuperOps {
@@ -55,14 +60,20 @@ impl SuperOps for PseudoSuperOps {
         Err(KernelError::NotPermitted)
     }
 
+    fn show_path(&self, root: &super::Dentry) -> Option<alloc::vec::Vec<u8>> {
+        self.show_path.and_then(|f| f(root))
+    }
+
     /// Linux simple_statfs
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        StatFs {
-            f_type: self.magic,
-            f_bsize: 4096,
-            f_namelen: 255,
-            ..StatFs::default()
-        }
+    fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok({
+            StatFs {
+                f_type: self.magic,
+                f_bsize: 4096,
+                f_namelen: 255,
+                ..StatFs::default()
+            }
+        })
     }
 }
 
@@ -83,7 +94,7 @@ impl FileOps for NoOpen {
 static NO_OPEN: NoOpen = NoOpen;
 
 const fn pseudo(name: &'static str, magic: u64, file_ops: &'static dyn FileOps) -> Pseudo {
-    with_d_op(name, magic, file_ops, None)
+    with_d_op(name, magic, file_ops, None, None)
 }
 
 /// One with dentry operations of its own (Linux init_pseudo's dops)
@@ -92,18 +103,19 @@ const fn with_d_op(
     magic: u64,
     file_ops: &'static dyn FileOps,
     d_op: Option<&'static DentryOps>,
+    show_path: Option<ShowPath>,
 ) -> Pseudo {
     Pseudo {
         ty: FileSystemType {
             name,
             fs_flags: fs_flags::FS_PSEUDO,
             mount: pseudo_mount,
-            mount_dev: None,
+            kill_sb: crate::fs::superblock::kill_anon_super,
             file_ops,
             next: crate::fs::superblock::FsNext::new(None),
             fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
         },
-        ops: PseudoSuperOps { magic },
+        ops: PseudoSuperOps { magic, show_path },
         d_op,
         mnt: spin::Once::new(),
     }
@@ -117,6 +129,7 @@ pub static NSFS: Pseudo = with_d_op(
     NSFS_MAGIC,
     &nsfs::NS_FILE_OPS,
     Some(&nsfs::NS_DENTRY_OPS),
+    Some(nsfs::nsfs_show_path),
 );
 pub static BDEV: Pseudo = pseudo("bdev", BDEVFS_MAGIC, &NO_OPEN);
 
@@ -129,10 +142,17 @@ fn of_type(ty: &FileSystemType) -> Option<&'static Pseudo> {
 
 /// A superblock with its root, a directory only the kernel uses (Linux
 /// init_pseudo: S_IFDIR | 0600, inode 1)
-fn pseudo_mount(ty: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
-    let p = of_type(ty).ok_or(KernelError::InvalidArgument)?;
-    let sb = SuperBlock::new(ty, &p.ops, 0)?;
-    if let Some(op) = p.d_op {
+fn pseudo_mount(
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    let p = of_type(fc.fs_type).ok_or(KernelError::InvalidArgument)?;
+    crate::fs::superblock::get_tree_nodev(fc, &p.ops, pseudo_fill)
+}
+
+/// A pseudo superblock's root (Linux pseudo_fs_fill_super), with its
+/// dentry operations if it has any (Linux init_pseudo's dops)
+fn pseudo_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
+    if let Some(op) = of_type(sb.fs_type).and_then(|p| p.d_op) {
         sb.set_d_op(op);
     }
     let root = Inode::alloc(Inode::new(
@@ -142,21 +162,22 @@ fn pseudo_mount(ty: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBl
         0,
         0,
         crate::time::TIMEKEEPER.current_time(),
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &NULL_INODE_OPS,
     ))?;
     sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
         root,
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
     ))?);
-    Ok(sb)
+    Ok(())
 }
 
 impl Pseudo {
     /// Mount it for the kernel (Linux kern_mount: SB_I_NOEXEC and
     /// SB_I_NODEV as mount flags)
     pub fn init(&'static self) -> Result<(), KernelError> {
-        let sb = (self.ty.mount)(&self.ty, b"")?;
+        let fc = crate::fs::superblock::FsContext::new(&self.ty, b"");
+        let sb = crate::fs::superblock::vfs_get_tree(&fc)?.unlock();
         let root = sb.get_root().ok_or(KernelError::Io)?;
         let name = self.ty.name.as_bytes().into();
         let m = Mount::alloc(sb, root, MNT_NOEXEC | MNT_NODEV, name)?;
@@ -178,7 +199,7 @@ impl Pseudo {
 
     /// Its superblock, for the inodes made on it
     pub fn sb(&self) -> Result<Arc<SuperBlock>, KernelError> {
-        Ok(self.mnt()?.sb.clone())
+        Ok(Arc::clone(&self.mnt()?.sb))
     }
 
     /// A dentry `name` for `inode` outside any tree (Linux

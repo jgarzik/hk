@@ -1174,13 +1174,15 @@ pub static TMPFS_FILE_OPS: RamfsFileOps = RamfsFileOps { shmem: true };
 pub struct RamfsSuperOps;
 
 impl SuperOps for RamfsSuperOps {
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        StatFs {
-            f_type: RAMFS_MAGIC,
-            f_bsize: 4096,
-            f_namelen: 255,
-            ..StatFs::default()
-        }
+    fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok({
+            StatFs {
+                f_type: RAMFS_MAGIC,
+                f_bsize: 4096,
+                f_namelen: 255,
+                ..StatFs::default()
+            }
+        })
     }
 
     fn alloc_inode(
@@ -1198,13 +1200,10 @@ pub static RAMFS_SUPER_OPS: RamfsSuperOps = RamfsSuperOps;
 
 /// Mount function for ramfs
 pub(crate) fn ramfs_mount(
-    fs_type: &'static FileSystemType,
-    opts: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
-    let mode = root_mode(opts)?;
-    let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0)?;
-    fill_root(&sb, mode, 0, 0)?;
-    Ok(sb)
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    let mode = root_mode(fc.data)?;
+    crate::fs::superblock::get_tree_nodev(fc, &RAMFS_SUPER_OPS, |sb| fill_root(sb, mode, 0, 0))
 }
 
 /// Give a new superblock its root directory (Linux ramfs_fill_super,
@@ -1230,12 +1229,20 @@ pub(crate) fn fill_root(
     Ok(())
 }
 
+/// ramfs's kill_sb (Linux ramfs_kill_sb): its private data, then
+/// kill_anon_super
+fn ramfs_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
+    let info = sb.private.write().take();
+    drop(info);
+    crate::fs::superblock::kill_anon_super(sb, g);
+}
+
 /// Ramfs filesystem type
 pub static RAMFS_TYPE: FileSystemType = FileSystemType {
     name: "ramfs",
     fs_flags: 0,
     mount: ramfs_mount,
-    mount_dev: None, // Ramfs doesn't use a backing device
+    kill_sb: ramfs_kill_sb,
     file_ops: &RAMFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

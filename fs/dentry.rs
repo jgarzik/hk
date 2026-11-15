@@ -1064,14 +1064,15 @@ fn prune_tree(root: &DentryRef, budget: usize) -> usize {
     }
 }
 
-/// The dcache shrinker (Linux prune_dcache_sb over every superblock):
-/// up to `budget` unused dentries, negative ones included, leave the
-/// tree; what they held (inodes not otherwise cached) goes with them.
+/// The dcache shrinker (Linux prune_dcache_sb over every superblock,
+/// super_cache_scan: one whose s_umount is busy is skipped): up to
+/// `budget` unused dentries, negative ones included, leave the tree;
+/// what they held (inodes not otherwise cached) goes with them.
 /// Allocates nothing. Deviation: no LRU, so not oldest first. The
 /// number dropped.
 pub fn shrink_dcache(budget: usize) -> usize {
     let mut freed = 0;
-    super::superblock::iterate_supers(|sb| {
+    super::superblock::iterate_supers_trylock(|sb| {
         if freed < budget
             && let Some(root) = sb.get_root()
         {

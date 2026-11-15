@@ -108,9 +108,7 @@ impl Pl011 {
             base,
             uart: UartPort::new(
                 UartDesc {
-                    type_: PORT_AMBA,
                     line: 0,
-                    iobase: 0,
                     mapbase: PL011_PHYS,
                     iotype: UPIO_MEM,
                     regshift: 0,
@@ -119,6 +117,8 @@ impl Pl011 {
                 // virt), an r1 PL011's 16-byte FIFO (get_fifosize_arm);
                 // the interrupt is known at probe
                 UartCfg {
+                    type_: PORT_AMBA,
+                    iobase: 0,
                     irq: 0,
                     flags: UPF_BOOT_AUTOCONF,
                     uartclk: 24_000_000,
@@ -333,13 +333,24 @@ impl TtyDriver for Pl011 {
         self.uart.flush_buffer();
     }
 
-    /// Linux uart_hangup
-    fn hangup(&self) {
-        self.uart.hangup(self);
+    /// Linux uart_port_activate
+    fn activate(&self, admin: bool) -> Result<bool, KernelError> {
+        self.uart.activate(self, admin)
     }
+
+    /// Linux uart_state.uart_port, set and cleared
+    fn detach(&self, gone: bool) {
+        self.uart.detach(gone);
+    }
+
+    /// Linux uart_hangup
+    fn hangup(&self, up: bool) {
+        self.uart.down(self, up);
+    }
+
     /// Linux uart_tty_port_shutdown
-    fn shutdown(&self, console: bool) {
-        self.uart.shutdown(self, console);
+    fn shutdown(&self, down: bool) {
+        self.uart.shutdown(self, down);
     }
 
     /// Linux pl011_console_write: under the port lock
@@ -352,18 +363,19 @@ impl TtyDriver for Pl011 {
         &self,
         port: &crate::tty::TtyPort,
     ) -> Result<crate::tty::SerialStruct, KernelError> {
-        Ok(self.uart.get_info(port))
+        self.uart.get_info(port)
     }
 
     /// Linux uart_set_info
     fn set_serial(
         &self,
+        tty: &crate::tty::Tty,
         port: &mut crate::tty::TtyPort,
         ss: &crate::tty::SerialStruct,
         users: usize,
     ) -> Result<(), KernelError> {
         let admin = crate::task::capable(crate::task::CAP_SYS_ADMIN);
-        self.uart.set_info(self, port, ss, users > 0, users, admin)
+        self.uart.set_info(self, tty, port, ss, users, admin)
     }
 }
 

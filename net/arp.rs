@@ -7,7 +7,8 @@
 //! module parses and answers ARP packets and feeds the table.
 //!
 //! One table serves every namespace (Linux arp_tbl): entries are keyed
-//! by device, and dumps and /proc/net/arp show the reader's namespace.
+//! by device; netlink dumps show the reader's namespace, /proc/net/arp
+//! the namespace of the /proc/<pid>/net it is read through.
 
 use crate::mm::page_alloc::Gfp;
 use alloc::boxed::Box;
@@ -335,16 +336,15 @@ const ATF_COM: u32 = 0x02;
 const ATF_PERM: u32 = 0x04;
 
 /// `/proc/net/arp` (Linux arp_seq_show; NOARP entries are hidden):
-/// the reader's namespace's entries, walked under RCU into a fixed
+/// `net`'s entries, walked under RCU into a fixed
 /// buffer (Linux neigh_seq_start's rcu_read_lock)
-pub fn proc_net_arp() -> Vec<u8> {
-    let net = crate::net::current_net_ns();
+pub fn proc_net_arp(net: &crate::net::NetNamespace) -> Vec<u8> {
     crate::fs::proc::seq::generate(|m| {
         let _ = m.write_str(
             "IP address       HW type     Flags       HW address            Mask     Device\n",
         );
         let g = crate::sync::rcu::read_lock();
-        for n in arp_tbl().iter_rcu(&g).filter(|n| n.dev.net_is(&net)) {
+        for n in arp_tbl().iter_rcu(&g).filter(|n| n.dev.net_is(net)) {
             arp_format_neigh_entry(m, n);
         }
     })

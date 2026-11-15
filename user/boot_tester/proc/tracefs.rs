@@ -12,12 +12,16 @@
 //!   event_enable_write). On hk, xHCI transfers (a USB disk read,
 //!   console output to the USB serial port) record xhci_urb_enqueue
 //!   events while it is on, none once it is off
+//! - TRACEFS_OPTS: the root is mode 0700 by default; a mount with
+//!   mode=, uid=, gid= sets them on the one shared superblock and
+//!   /proc/mounts shows them; an unknown option is EINVAL since Linux
+//!   6.10 (the new mount API; ignored before)
 
 use crate::harness::{R, check, report_r};
-use crate::helpers::{host_mode, msleep, read_file, skip};
+use crate::helpers::{host_mode, linux_at_least, msleep, read_file, skip};
 use hk_syscall::{
-    LinuxStatFs, O_DIRECT, O_RDONLY, O_TRUNC, O_WRONLY, sys_close, sys_mount, sys_open,
-    sys_pread64, sys_statfs, sys_umount2, sys_write,
+    LinuxStatFs, O_DIRECT, O_RDONLY, O_TRUNC, O_WRONLY, Stat, sys_close, sys_mkdir, sys_mount,
+    sys_open, sys_pread64, sys_stat, sys_statfs, sys_umount2, sys_write,
 };
 
 const MP: &[u8] = b"/sys/kernel/tracing\0";
@@ -39,6 +43,7 @@ pub fn run_tests() {
         skip(b"TRACEFS_TRACE", b"host kernel without tracefs");
         skip(b"TRACEFS_TRUNC", b"host kernel without tracefs");
         skip(b"TRACEFS_EVENTS", b"host kernel without tracefs");
+        skip(b"TRACEFS_OPTS", b"host kernel without tracefs");
         return;
     }
     report_r(b"TRACEFS_TRACE", mounted(r));
@@ -47,8 +52,59 @@ pub fn run_tests() {
         let r = events();
         write_str(EV, b"0");
         report_r(b"TRACEFS_EVENTS", r);
+        report_r(b"TRACEFS_OPTS", opts());
         sys_umount2(MP.as_ptr(), 0);
     }
+}
+
+/// A second tracefs mount at /tmp/tr2 with options `data`
+fn mount_tr2(data: &[u8]) -> i64 {
+    sys_mount(
+        b"nodev\0".as_ptr(),
+        b"/tmp/tr2\0".as_ptr(),
+        b"tracefs\0".as_ptr(),
+        0,
+        data.as_ptr() as u64,
+    )
+}
+
+/// The root's (mode, uid, gid) as /sys/kernel/tracing shows it
+fn root_attrs() -> (u32, u32, u32) {
+    let mut st = Stat::default();
+    sys_stat(MP.as_ptr(), &mut st);
+    (st.st_mode & 0o7777, st.st_uid, st.st_gid)
+}
+
+fn opts() -> R {
+    const EINVAL: i64 = -22;
+    check(
+        b"default",
+        root_attrs().0 == 0o700,
+        i64::from(root_attrs().0),
+    )?;
+    sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
+    sys_mkdir(b"/tmp/tr2\0".as_ptr(), 0o755);
+    let m = mount_tr2(b"mode=0750,uid=1,gid=2\0");
+    let set = root_attrs();
+    let mut buf = [0u8; 8192];
+    let n = read_file(b"/proc/mounts\0", &mut buf).max(0) as usize;
+    let shown = buf[..n].windows(21).any(|w| w == b",uid=1,gid=2,mode=750");
+    if m == 0 {
+        sys_umount2(b"/tmp/tr2\0".as_ptr(), 0);
+    }
+    let bad = mount_tr2(b"bogus=1\0");
+    if bad == 0 {
+        sys_umount2(b"/tmp/tr2\0".as_ptr(), 0);
+    }
+    // Back to the defaults, for the shared superblock's later users
+    if mount_tr2(b"mode=0700,uid=0,gid=0\0") == 0 {
+        sys_umount2(b"/tmp/tr2\0".as_ptr(), 0);
+    }
+    check(b"mount", m == 0, m)?;
+    check(b"set", set == (0o750, 1, 2), i64::from(set.0))?;
+    check(b"shown", shown, 0)?;
+    let want = if linux_at_least(6, 10) { EINVAL } else { 0 };
+    check(b"unknown", bad == want, bad)
 }
 
 fn mounted(r: i64) -> R {

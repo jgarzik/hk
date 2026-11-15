@@ -29,7 +29,6 @@
 //! the group's CPU time, which may take TASKLIST, is read before it.
 //! Signals go out after it is dropped.
 
-use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::time::posix_timer::ElistAdapter;
@@ -148,11 +147,6 @@ impl GroupCputimer {
     }
 }
 
-/// The calling process's SignalStruct
-fn my_group() -> Option<Arc<crate::signal::SignalStruct>> {
-    crate::task::percpu::current().cpu_group().cloned()
-}
-
 /// Group `pid`'s current CPU time: its kept totals, else the sum over
 /// its threads (Linux cpu_clock_sample_group with start=false; thread
 /// context). Never starts the totals: only arming a process timer does
@@ -182,7 +176,7 @@ pub fn thread_sample(tid: Tid) -> Option<(u64, u64)> {
 pub fn sample_now(clock: CpuClock, pid: crate::task::Pid) -> Option<u64> {
     match clock.thread {
         Some(tid) => thread_sample(tid).map(|t| clock.sample.pick(t)),
-        None => my_group().map(|g| clock.sample.pick(group_sample(&g, pid))),
+        None => crate::signal::current_signal().map(|g| clock.sample.pick(group_sample(&g, pid))),
     }
 }
 
@@ -212,14 +206,14 @@ pub fn arm(clock: CpuClock, at: u64) {
                     .get(tid)
                     .map(|t| crate::task::percpu::task_ref(t.task))
             };
-            let (Some(t), Some(g)) = (task, my_group()) else {
+            let (Some(t), Some(g)) = (task, crate::signal::current_signal()) else {
                 return;
             };
             let _reg = g.posix_timers.lock();
             t.cpu_next[clock.sample as usize].fetch_min(at, Ordering::Relaxed);
         }
         None => {
-            if let Some(g) = my_group() {
+            if let Some(g) = crate::signal::current_signal() {
                 let sample = group_sample(&g, crate::task::percpu::current_pid());
                 arm_group(&g, clock.sample, at, sample);
             }

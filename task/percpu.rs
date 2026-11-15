@@ -1064,6 +1064,15 @@ impl GlobalTaskTable {
         pg.pgrp.access(self).iter().map(move |t| view(self, t))
     }
 
+    /// The group leaders in session `s` (Linux do_each_pid_task(s,
+    /// PIDTYPE_SID))
+    pub fn session<'a>(
+        &'a self,
+        s: &'a crate::task::pid::Pid,
+    ) -> impl Iterator<Item = TaskView<'a>> + 'a {
+        s.session.access(self).iter().map(move |t| view(self, t))
+    }
+
     /// The threads of every process in group `pg` (Linux
     /// do_each_pid_thread(pg, PIDTYPE_PGID))
     pub fn pgrp_threads<'a>(
@@ -5079,8 +5088,12 @@ pub fn create_session(caller_pid: Pid) -> KernelResult<Pid> {
         }
         pid
     };
-    // The whole process: pid becomes sid and pgid
+    // The whole process: pid becomes sid and pgid, with no controlling
+    // tty (Linux ksys_setsid: proc_clear_tty)
     let old = table.change_pids(caller_pid, &pid, Some(&pid));
+    if let Some(sig) = table.get(caller_pid).and_then(|l| l.signal().cloned()) {
+        crate::tty::jobctrl::proc_clear_tty(&sig);
+    }
     drop(table);
     drop(old);
     Ok(caller_pid)

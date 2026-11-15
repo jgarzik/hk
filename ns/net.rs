@@ -18,7 +18,7 @@ use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use crate::sync::IrqSpinlock;
 use crate::sync::spin::RwLock;
@@ -32,9 +32,6 @@ use crate::net::netlink::NlTable;
 use crate::net::udp::UdpTable;
 use crate::util::error::KernelError;
 use crate::util::rculist::RcuList;
-
-/// Next network namespace id (never reused)
-static NEXT_NET_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Network namespace - isolates network stack per-namespace
 ///
@@ -52,7 +49,8 @@ static NEXT_NET_ID: AtomicU64 = AtomicU64::new(1);
 /// - ARP cache
 /// - netlink sockets
 pub struct NetNamespace {
-    /// Unique id: the sysfs namespace tag of its devices
+    /// Unique id, its `ns.ns_id` (Linux net_cookie): the sysfs
+    /// namespace tag of its devices
     pub id: u64,
 
     /// Its inode number and nsfs dentry (Linux ns)
@@ -177,14 +175,15 @@ impl NetNamespace {
     pub fn create(user_ns: &Arc<super::UserNamespace>) -> Result<NetRef, KernelError> {
         // The device first: nothing to undo but itself
         let lo = try_arc(loopback_device(try_arc(LoopbackOps)?))?;
-        let ns = try_arc(Self::fresh(super::inum::Inum::alloc()?, user_ns.clone())?)?;
+        let common = super::NsCommon::new(super::inum::Inum::alloc()?);
+        let ns = try_arc(Self::fresh(common, user_ns.clone())?)?;
         Ok(Self::attach(ns, lo))
     }
 
     /// The initial namespace (boot: failure cannot be reported)
     fn new_init() -> NetRef {
         let ns = Self::fresh(
-            super::inum::Inum::fixed(super::inum::NET_INIT),
+            super::NsCommon::init(super::inum::Inum::fixed(super::inum::NET_INIT)),
             super::INIT_USER_NS.clone(),
         );
         let ns = arc_nofail(ns.expect("init_net: no memory at boot"));
@@ -193,13 +192,11 @@ impl NetNamespace {
     }
 
     /// A namespace's state, before it is listed and has its loopback
-    fn fresh(
-        inum: super::inum::Inum,
-        user_ns: Arc<super::UserNamespace>,
-    ) -> Result<Self, KernelError> {
+    fn fresh(ns: super::NsCommon, user_ns: Arc<super::UserNamespace>) -> Result<Self, KernelError> {
         Ok(Self {
-            id: NEXT_NET_ID.fetch_add(1, Ordering::Relaxed),
-            ns: super::NsCommon::new(inum),
+            // Linux net->net_cookie: the namespace's id
+            id: ns.ns_id,
+            ns,
             user_ns,
             devices: RcuList::new(),
             next_ifindex: AtomicU32::new(1),

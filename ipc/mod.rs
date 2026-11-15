@@ -142,7 +142,7 @@ impl IpcNamespace {
             shm_ctlall: usize::MAX - (1 << 24), // SHMALL (pages)
             shm_tot: AtomicU64::new(0),
             shm_ctlmni: 4096, // SHMMNI
-            ns: crate::ns::NsCommon::new(crate::ns::inum::Inum::fixed(crate::ns::inum::IPC_INIT)),
+            ns: crate::ns::NsCommon::init(crate::ns::inum::Inum::fixed(crate::ns::inum::IPC_INIT)),
             user_ns: crate::ns::INIT_USER_NS.clone(),
         }
     }

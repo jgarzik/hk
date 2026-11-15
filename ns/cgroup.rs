@@ -45,7 +45,7 @@ impl CgroupNamespace {
             root: CGROUP_ROOT
                 .root_cgroup()
                 .unwrap_or_else(create_placeholder_root),
-            ns: super::NsCommon::new(super::inum::Inum::fixed(super::inum::CGROUP_INIT)),
+            ns: super::NsCommon::init(super::inum::Inum::fixed(super::inum::CGROUP_INIT)),
             user_ns: super::INIT_USER_NS.clone(),
         })
     }

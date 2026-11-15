@@ -15,7 +15,7 @@
 //! mode flag, publishing no other data.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
 use crate::cpu::PerCpu;
 
@@ -45,8 +45,9 @@ static LIMITS: [AtomicUsize; 3] = [
     AtomicUsize::new(128),
     AtomicUsize::new(192),
 ];
-/// Linux tcp_memory_pressure: past tcp_mem[1], until back under [0]
-static PRESSURE: AtomicBool = AtomicBool::new(false);
+/// Linux tcp_memory_pressure: past tcp_mem[1], until back under [0];
+/// when it began (ms, never 0), 0 when off
+static PRESSURE: AtomicU64 = AtomicU64::new(0);
 /// TCP control blocks alive (Linux tcp_sockets_allocated)
 static SOCKETS: AtomicUsize = AtomicUsize::new(0);
 
@@ -109,21 +110,30 @@ pub fn allocated() -> usize {
 }
 
 pub fn under_pressure() -> bool {
-    PRESSURE.load(Ordering::Relaxed)
+    PRESSURE.load(Ordering::Relaxed) != 0
 }
 
-/// Linux tcp_enter_memory_pressure (a mode, not a decision: racing
-/// callers store the same value; the load spares the cache line)
-pub fn enter_pressure() {
-    if !PRESSURE.load(Ordering::Relaxed) {
-        PRESSURE.store(true, Ordering::Relaxed);
+/// Linux tcp_enter_memory_pressure (a mode, not a decision; the load
+/// spares the cache line): true for the one caller that began it
+pub fn enter_pressure() -> bool {
+    if PRESSURE.load(Ordering::Relaxed) != 0 {
+        return false;
     }
+    let now = super::timer::now_ms().max(1);
+    PRESSURE
+        .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
-/// Linux tcp_leave_memory_pressure
-pub fn leave_pressure() {
-    if PRESSURE.load(Ordering::Relaxed) {
-        PRESSURE.store(false, Ordering::Relaxed);
+/// Linux tcp_leave_memory_pressure: how long it lasted (ms), for the
+/// one caller that ended it
+pub fn leave_pressure() -> Option<u64> {
+    if PRESSURE.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    match PRESSURE.swap(0, Ordering::Relaxed) {
+        0 => None,
+        t => Some(super::timer::now_ms().saturating_sub(t)),
     }
 }
 

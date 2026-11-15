@@ -530,41 +530,125 @@ impl SuperOps for TracefsSops {
         Err(KernelError::OperationNotSupported)
     }
 
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        StatFs {
-            f_type: TRACEFS_MAGIC,
-            f_bsize: 4096,
-            f_namelen: 255,
-            ..StatFs::default()
+    fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok({
+            StatFs {
+                f_type: TRACEFS_MAGIC,
+                f_bsize: 4096,
+                f_namelen: 255,
+                ..StatFs::default()
+            }
+        })
+    }
+
+    /// Linux tracefs_parse_param + tracefs_apply_options(remount): uid=,
+    /// gid=, mode= (octal) set the root's, only those given; any other
+    /// option is EINVAL (vfs_parse_fs_param: "Unknown parameter")
+    fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {
+        let o = parse_opts(data)?;
+        let root = sb
+            .get_root()
+            .and_then(|r| r.get_inode())
+            .ok_or(KernelError::Io)?;
+        if let Some(m) = o.mode {
+            root.set_mode_perm(m);
+        }
+        if let Some(u) = o.uid {
+            root.set_uid(u);
+        }
+        if let Some(g) = o.gid {
+            root.set_gid(g);
+        }
+        Ok(())
+    }
+
+    /// Linux tracefs_show_options: uid, gid when not 0, mode when not
+    /// the default
+    fn show_options(&self, sb: &SuperBlock, out: &mut Vec<u8>) {
+        let Some(root) = sb.get_root().and_then(|r| r.get_inode()) else {
+            return;
+        };
+        let mut s = alloc::string::String::new();
+        if root.uid() != 0 {
+            let _ = write!(s, ",uid={}", root.uid());
+        }
+        if root.gid() != 0 {
+            let _ = write!(s, ",gid={}", root.gid());
+        }
+        let mode = root.mode().perm();
+        if mode != TRACEFS_DEFAULT_MODE {
+            let _ = write!(s, ",mode={mode:o}");
+        }
+        out.extend_from_slice(s.as_bytes());
+    }
+}
+
+/// The root's mode without a mode= option (Linux TRACEFS_DEFAULT_MODE)
+const TRACEFS_DEFAULT_MODE: u16 = 0o700;
+
+/// tracefs's mount options (Linux tracefs_fs_info: each set if given)
+#[derive(Default)]
+struct TraceOpts {
+    uid: Option<u32>,
+    gid: Option<u32>,
+    mode: Option<u16>,
+}
+
+/// Linux tracefs_param_specs (fsparam_uid, fsparam_gid, fsparam_u32oct)
+fn parse_opts(data: &[u8]) -> Result<TraceOpts, KernelError> {
+    let mut o = TraceOpts::default();
+    let num = |v: &[u8], radix: u32| {
+        core::str::from_utf8(v)
+            .ok()
+            .and_then(|s| u32::from_str_radix(s, radix).ok())
+            .ok_or(KernelError::InvalidArgument)
+    };
+    let data = data.split(|&c| c == 0).next().unwrap_or(b"");
+    for w in data.split(|&c| c == b',').filter(|w| !w.is_empty()) {
+        if crate::fs::superblock::sb_flag_word(w) {
+            continue;
+        }
+        let (k, v) = match w.iter().position(|&c| c == b'=') {
+            Some(i) => (&w[..i], &w[i + 1..]),
+            None => return Err(KernelError::InvalidArgument),
+        };
+        match k {
+            b"uid" => o.uid = Some(num(v, 10)?),
+            b"gid" => o.gid = Some(num(v, 10)?),
+            b"mode" => o.mode = Some((num(v, 8)? & 0o7777) as u16),
+            _ => return Err(KernelError::InvalidArgument),
         }
     }
+    Ok(o)
 }
 
 static TRACEFS_SOPS: TracefsSops = TracefsSops;
 
-/// One superblock for every mount (Linux tracefs: get_tree_single)
-fn mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
-    crate::fs::superblock::sget(
-        t,
-        |_| true,
-        || {
-            let sb = SuperBlock::alloc(t, &TRACEFS_SOPS, 0)?;
-            sb.set_private(try_arc(kernfs::vfs::KfSuper { ns: 0 })?);
-            let ri = kernfs::vfs::inode(&sb, root())?;
-            sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
-                ri,
-                Arc::downgrade(&sb),
-            ))?);
-            Ok(sb)
-        },
-    )
+/// One superblock for every mount (Linux tracefs_get_tree:
+/// get_tree_single, then the options applied, tracefs_reconfigure)
+fn mount(
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    let sb = crate::fs::superblock::get_tree_single(fc, &TRACEFS_SOPS, |sb| {
+        sb.set_private(try_arc(kernfs::vfs::KfSuper { ns: 0 })?);
+        let ri = kernfs::vfs::inode(sb, root())?;
+        // Linux tracefs_fill_super: tracefs_apply_options(sb, false)
+        ri.set_mode_perm(TRACEFS_DEFAULT_MODE);
+        sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
+            ri,
+            Arc::downgrade(sb),
+        ))?);
+        Ok(())
+    })?;
+    sb.s_op.remount(&sb, fc.data)?;
+    Ok(sb)
 }
 
 pub static TRACEFS_TYPE: FileSystemType = FileSystemType {
     name: "tracefs",
     fs_flags: fs_flags::FS_PSEUDO,
     mount,
-    mount_dev: None,
+    kill_sb: crate::fs::superblock::kill_anon_super,
     file_ops: &kernfs::vfs::KERNFS_FOPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

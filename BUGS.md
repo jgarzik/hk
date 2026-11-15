@@ -88,18 +88,16 @@ Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. /proc/net/raw, /proc/net/icmp, /proc/net/sockstat
-and /proc/<pid>/net do not exist (/proc/net follows the reader's
-namespace; Linux makes it a link to self/net).
-MIB counters (`net/mib.rs`): TcpExt counts the connection lifecycle,
-timeouts, aborts, listen drops, TIME_WAIT, delayed ACKs, Reno
-recovery, retransmissions, PAWS, challenge ACKs, out-of-order and
-memory drops and probes; header prediction (TCPHPHits, TCPPureAcks,
-TCPHPAcks), coalescing, zero-window advertisement, undo and
-delivered counters stay 0. Ip InDiscards/OutDiscards count
-only some of Linux's sites. Counters of features hk lacks (SACK,
-DSACK, TLP, Fast Open, syncookies, MD5/AO, forwarding, multicast
-receive) stay 0 by nature.
+IP_TRANSPARENT. /proc/net/raw, /proc/net/icmp and /proc/net/sockstat
+do not exist. No tcp_can_ingest: a segment is not refused for taking
+receive memory past SO_RCVBUF (only the window and tcp_mem limit it).
+MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
+prediction (TCPHPHits, TCPHPAcks; without the fast path every pure
+ACK counts TCPPureAcks, where Linux's fast path skips it), receive
+coalescing and collapse, undo and F-RTO (TCP*Undo, TCPSpuriousRTOs),
+the CA_Loss state (TCPLossFailures), RcvPruned (no tcp_can_ingest),
+SACK/DSACK, TLP, Fast Open, syncookies, MD5/AO, forwarding and
+multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
 NIC removal: e1000 leaves the function's bus mastering and memory
@@ -427,6 +425,18 @@ mq_notify with SIGEV_THREAD is EINVAL: Linux delivers that notice as
 a message on a netlink socket the caller names (NETLINK_NOTIFY_COOKIE,
 glibc's helper thread), and hk has no such path.
 
+## Resource tree gaps
+
+**Location**: `base/resource.rs`
+
+/proc/ioports holds the x86 legacy ranges, PCI conf1 and the 8250
+ports only: no PCI host bridge windows (Linux reads the root bus's
+from ACPI _CRS, which needs AML), PCI BARs, ACPI register blocks,
+PNP devices or vga+. There is no iomem tree (request_mem_region) and
+no /proc/iomem (System RAM, Kernel code, reserved, BARs), so
+TIOCSSERIAL refuses (EINVAL) a new io_type, iomem_base, regshift or
+hub6, where Linux moves the port (uart_change_port).
+
 ## sysfs gaps
 
 **Location**: `fs/kernfs/`, `fs/kernfs/sysfs.rs`, `base/`, `block/genhd.rs`,
@@ -476,22 +486,17 @@ glibc's helper thread), and hk has no such path.
   runs only on the console's real input. A pty (phase H) makes it
   testable from the boot tester.
 - **Hangup gaps:** no carrier (DCD) loss hangs a tty up (no modem
-  control); a session leader exiting with no controlling tty signals
-  no former foreground group (Linux tty_old_pgrp). An unbound serial
-  port's tty is hung up, but its /dev/console files (left alone, as
-  Linux) still write to the UART, where Linux's port is detached
-  (uart_port_check). No boot test unbinds the console UART (the test
-  output goes there).
-- **Per-process controlling tty:** it is the session's tty, so TIOCNOTTY
-  by a non-leader changes nothing (Linux clears that process's
-  signal->tty only).
+  control). No boot test unbinds the console UART (the test output
+  goes there).
 - **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
   TIOCEXCL exclusivity, sending a break (TCSBRK 0), packet mode,
   ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT, IUCLC/OLCUC, IMAXBEL,
   PARMRK and parity/break input handling, CRTSCTS (no modem
   control: IXOFF throttles by STOP/START only).
-- **Serial ports:** ttyS1 is registered without probing COM2; only
-  COM1 (and the PL011) take input.
+- **Serial ports:** ttyS1 is registered without probing COM2. The
+  PL011 has no startup or
+  shutdown (Linux pl011_startup/pl011_shutdown): its interrupts stay
+  on while the port is down.
 - **No virtual terminals:** the framebuffer and VGA consoles are not
   ttys (Linux: fbcon/vgacon draw VTs, tty0..tty63, fed by the
   keyboard), so /dev/console is always a serial tty. With a screen
@@ -523,6 +528,11 @@ procfs (hidepid=, gid=, subset=pid; devtmpfs drops a new mount's after
 parsing them, as Linux 6.15+); cgroupfs ignores its own, and only
 procfs, tmpfs and devtmpfs apply options on a remount or show them in
 /proc/mounts.
+A mount names its namespace by id (`Mount::mnt_ns`; Linux
+mnt->mnt_ns points to it), so a namespace keeps no mount count:
+NS_MNT_GET_INFO's nr_mounts is a walk of its tree under NAMESPACE_SEM
+(Linux reads mnt_ns->nr_mounts), and there is no fs.mount-max limit
+(sysctl_mount_max, count_mounts: ENOSPC).
 
 ## nullfs gaps
 
@@ -960,7 +970,10 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move
   onto `util/ida.rs` (or an IDR), as sd, virtio-blk, virtio and
-  ns/inum already do.
+  ns/inum already do. `util/ida.rs` is one contiguous bitmap grown a
+  word at a time (Linux ida: an xarray of 1 KiB chunks), so a large
+  one (UNNAMED_DEV_IDA, up to 2^20 ids) copies itself under its lock
+  every 64 ids and needs one large GFP_ATOMIC block.
 - **procfs** (H): a file is generated whole (no seq_file records): an
   open file's reads continuing one another see one generation, where
   Linux generates record by record, so a long file's later chunks are
@@ -1023,6 +1036,12 @@ Tag = roadmap phase (doc/ROADMAP.md).
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
 
+10. **TCP_ETH0_REFUSED flake** (cause unknown): `TCP_ETH0_REFUSED:FAIL
+    refused got 0` (hk x86 LOCKDEP=1, once; once earlier on hk
+    x86): a connect through slirp to 10.0.2.2 port 1, refused on the
+    host, completed (SO_ERROR 0, POLLOUT). Not reproduced on rerun;
+    the socket is an active connect (no listener-side code involved).
+
 ## DRM dumb buffers are the boot framebuffer only
 
 **Location**: `hw/gfx/simplegfx.rs` (`create_dumb`)
@@ -1036,10 +1055,9 @@ dumb buffer from shmem and blits it on page flip
 
 **Location**: `fs/pseudo/nsfs.rs`, `ns/setns.rs`
 
-No time or time_for_children links (no time namespaces). Of the
-NS_GET_* ioctls only Linux 6.8's: no NS_GET_MNTNS_ID, NS_GET_ID,
-NS_GET_{PID,TGID}_{FROM,IN}_PIDNS, NS_MNT_GET_{INFO,NEXT,PREV}
-(ENOTTY).
+No time namespaces (CLONE_NEWTIME, the time and time_for_children
+links). No nsfs file handles (hk has no name_to_handle_at /
+open_by_handle_at) and no listns(2) / statns(2).
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 

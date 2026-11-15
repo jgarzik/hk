@@ -147,6 +147,12 @@ impl NetMib {
         }
     }
 
+    /// A datagram could not be built or sent (Linux __ip_append_data's
+    /// error path, ip_send_skb)
+    pub fn out_discard(&self) {
+        self.ip.inc(IPSTATS_MIB_OUTDISCARDS);
+    }
+
     /// An IcmpMsg entry
     pub fn icmpmsg(&self, i: usize) -> u64 {
         self.icmpmsg[i].load(Ordering::Relaxed)

@@ -1198,10 +1198,17 @@ pub fn install_fork_signal(child: &Task, f: ForkSignal, mut delay: ForkDelay) {
     if table.view(child).is_some() {
         f.sighand.get(&mut table);
     }
-    // A new process: the child leads it
+    // A new process: the child leads it, with its parent's controlling
+    // tty (Linux copy_process, under tasklist_lock)
     if !f.share_signal {
         let pid = table.view(child).and_then(|c| c.thread_pid().cloned());
         f.signal.set_leader_pid(&mut table, pid);
+        let me = crate::task::percpu::current();
+        if let Some(ps) = table.view(&me).and_then(|p| p.signal().cloned()) {
+            // One ctty lock at a time: it is a leaf
+            let tty = ps.ctty.lock().tty();
+            f.signal.ctty.lock().inherit(tty);
+        }
     }
     if let Some(mut c) = table.view_mut(child) {
         c.set_sighand(f.sighand);
@@ -2550,6 +2557,10 @@ pub struct SignalStruct {
     /// the kernel forces such a signal on it (force_sig_info_to_task).
     /// A monotonic flag no other state is ordered with: an atomic.
     unkillable: AtomicBool,
+    /// The process's controlling tty and the group of one a hangup took
+    /// (Linux signal->tty, signal->tty_old_pgrp, under siglock): spin
+    /// leaf, thread context, under TASKLIST when held
+    pub ctty: Mutex<crate::tty::jobctrl::Ctty>,
 }
 
 const GROUP_EXIT: u64 = 1 << 63;
@@ -2692,6 +2703,7 @@ impl SignalStruct {
             jobctl: Mutex::new(stop::GroupStop::new()),
             subreaper: crate::task::TableCell::new(false),
             unkillable: AtomicBool::new(false),
+            ctty: Mutex::new(crate::tty::jobctrl::Ctty::new()),
         }
     }
 
@@ -2914,6 +2926,18 @@ impl Drop for SignalStruct {
 // =============================================================================
 
 // Task.signal field accessors (SignalStruct - shared by thread group)
+
+/// The calling process's signal struct (Linux current->signal); None
+/// for a kernel thread without one
+pub fn current_signal() -> Option<Arc<SignalStruct>> {
+    crate::task::percpu::current().cpu_group().cloned()
+}
+
+/// `f` on the calling process's signal struct, borrowed: no reference
+/// taken (Linux reads current->signal in place)
+pub fn with_current_signal<R>(f: impl FnOnce(&SignalStruct) -> R) -> Option<R> {
+    crate::task::percpu::current().cpu_group().map(|s| f(s))
+}
 
 /// Task `t`'s signal struct (none once it is reaped)
 pub fn get_task_signal_struct(t: &Task) -> Option<Arc<SignalStruct>> {

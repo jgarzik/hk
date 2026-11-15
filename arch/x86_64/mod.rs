@@ -405,11 +405,32 @@ impl PowerOps for X86_64Arch {
     }
 }
 
+/// The PC's legacy I/O ranges, claimed so no driver takes them (Linux
+/// reserve_standard_io_resources, standard_io_resources[])
+fn reserve_standard_io_resources() {
+    const STD: [(u64, u64, &str); 10] = [
+        (0x00, 0x20, "dma1"),
+        (0x20, 2, "pic1"),
+        (0x40, 4, "timer0"),
+        (0x50, 4, "timer1"),
+        (0x60, 1, "keyboard"),
+        (0x64, 1, "keyboard"),
+        (0x80, 0x10, "dma page reg"),
+        (0xa0, 2, "pic2"),
+        (0xc0, 0x20, "dma2"),
+        (0xf0, 0x10, "fpu"),
+    ];
+    for (start, n, name) in STD {
+        let _ = crate::base::resource::request_region(start, n, name);
+    }
+}
+
 impl ArchBusOps for X86_64Arch {
     /// The legacy 8250 ports (Linux serial8250 platform device; the
     /// PIC and PIT are set up at boot, not devices)
     fn platform_init() {
         use crate::base::platform::{PlatformDevice, platform_device_register};
+        reserve_standard_io_resources();
         let _ = platform_device_register(PlatformDevice {
             name: "serial8250",
             compatible: &[],
@@ -424,6 +445,8 @@ impl ArchBusOps for X86_64Arch {
 
     /// Configuration mechanism #1 (ports 0xCF8/0xCFC)
     fn pci_config_init() {
+        // Linux pci_check_type1: request_region(0xCF8, 8, "PCI conf1")
+        let _ = crate::base::resource::request_region(0xcf8, 8, "PCI conf1");
         crate::hw::pci::init_config(&pci_conf::PORT_IO);
         crate::printkln!("PCI: Using port I/O config access");
     }
@@ -587,4 +610,10 @@ pub fn early_init() {
 
     // Enable timer interrupt
     pic::enable_irq(0);
+}
+
+/// The interrupt a device configured for `irq` uses: IRQ 2 is the PIC cascade: a device asking for it gets 9 (Linux
+/// arch/x86 irq_canonicalize)
+pub fn irq_canonicalize(irq: i32) -> i32 {
+    if irq == 2 { 9 } else { irq }
 }

@@ -13,10 +13,11 @@
 //!   chain per bucket (Linux lhash2; address and device scored).
 //! - `bhash`: bind buckets (Linux inet_bind_bucket) by (namespace,
 //!   local port) holding the port's owners (bound, listening, connected
-//!   and TIME_WAIT sockets) for the bind conflict rules; an owner that
-//!   came from bind()/listen() (`by_bind`, Linux tb->fastreuse >= 0)
-//!   keeps connect()'s ephemeral port selection off its port, while
-//!   ports chosen by connect() are shared by different four-tuples
+//!   and TIME_WAIT sockets; a listener's child from its handshake's
+//!   completion, never as a request) for the bind conflict rules; an
+//!   owner that came from bind()/listen() (`by_bind`, Linux
+//!   tb->fastreuse >= 0) keeps connect()'s ephemeral port selection off
+//!   its port, while ports chosen by connect() are shared by different four-tuples
 //!   (Linux __inet_hash_connect). A bucket is allocated GFP_ATOMIC under
 //!   its chain's lock (Linux inet_bind_bucket_create) and freed with
 //!   its last owner.
@@ -365,8 +366,8 @@ impl TcpTables {
             .unwrap_or(true)
     }
 
-    /// A child shares its listener's port (Linux inet_inherit_port);
-    /// false without memory
+    /// A child completing its handshake shares its listener's port
+    /// (Linux __inet_inherit_port); false without memory
     pub fn inherit(&self, child: &Arc<TcpSock>, port: u16) -> bool {
         let mut c = self.bchain(port).lock();
         self.own(&mut c, child, port, true)

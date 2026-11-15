@@ -73,10 +73,11 @@ fn fragment(skb: &mut SkBuff, at: usize, gfp: Gfp) -> Option<Box<SkBuff>> {
 }
 
 impl TcpCb {
-    /// Queue a SYN (SYN_SENT) or SYN-ACK (SYN_RECEIVED) with our
+    /// Queue a SYN (SYN_SENT) or SYN-ACK (the peer's SYN received:
+    /// SYN_RECEIVED, or FIN_WAIT_1 after a close there) with our
     /// options; false without memory
     pub(super) fn syn_seg(&mut self, out: &mut Out) -> bool {
-        let synack = self.state == TcpState::SynReceived;
+        let synack = self.state != TcpState::SynSent;
         let ts = if !self.ts_ok {
             None
         } else if synack {
@@ -314,6 +315,8 @@ impl TcpCb {
             self.send_new(n, fl, out)
         };
         if !sent {
+            // Linux tcp_retransmit_skb: __tcp_retransmit_skb failed
+            self.net_stat_if(rexmit, LINUX_MIB_TCPRETRANSFAIL);
             return None;
         }
         if self.snd_nxt == self.snd_max
@@ -447,7 +450,7 @@ impl TcpCb {
     /// to the MSS (tcp_retrans_try_collapse); never an RTT sample (Karn)
     pub(super) fn retransmit_head(&mut self, out: &mut Out) {
         self.rtt_seq = None;
-        if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
+        if self.syn_unacked {
             self.syn_rtx(out);
             return;
         }
@@ -458,6 +461,7 @@ impl TcpCb {
         let mss = self.mss as usize;
         if len > mss {
             if !self.send_rtx_at(seq, self.mss, flags::ACK, out) {
+                self.net_stat(LINUX_MIB_TCPRETRANSFAIL);
                 return;
             }
         } else {
@@ -473,6 +477,7 @@ impl TcpCb {
                 return;
             }
             let Some(clone) = clone_data(head, out.gfp) else {
+                self.net_stat(LINUX_MIB_TCPRETRANSFAIL);
                 return;
             };
             self.send_clone(clone, seq, fl, out);

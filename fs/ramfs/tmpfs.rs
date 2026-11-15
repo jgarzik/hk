@@ -495,8 +495,8 @@ impl SuperOps for TmpfsSuperOps {
         super::RAMFS_SUPER_OPS.alloc_inode(sb, mode, i_op)
     }
 
-    fn statfs(&self, sb: &SuperBlock) -> StatFs {
-        with(sb, ShmemSb::statfs).unwrap_or_default()
+    fn statfs(&self, sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok(with(sb, ShmemSb::statfs).unwrap_or_default())
     }
 
     fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {
@@ -507,6 +507,13 @@ impl SuperOps for TmpfsSuperOps {
     fn show_options(&self, sb: &SuperBlock, out: &mut Vec<u8>) {
         with(sb, |t| t.show(out));
     }
+
+    /// Its limits and accounting go (Linux shmem_put_super: the
+    /// sbinfo freed)
+    fn put_super(&self, sb: &SuperBlock) {
+        let info = sb.private.write().take();
+        drop(info);
+    }
 }
 
 pub static TMPFS_SUPER_OPS: TmpfsSuperOps = TmpfsSuperOps;
@@ -514,16 +521,21 @@ pub static TMPFS_SUPER_OPS: TmpfsSuperOps = TmpfsSuperOps;
 /// A new tmpfs superblock of type `fs_type` from `opts` (Linux
 /// shmem_fill_super): the root directory takes the first inode
 pub(crate) fn tmpfs_mount(
-    fs_type: &'static FileSystemType,
-    opts: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
-    let o = parse(opts)?;
-    let t = ShmemSb::new(&o)?;
-    let (mode, uid, gid) = (t.mode, t.uid, t.gid);
-    let sb = SuperBlock::new(fs_type, &TMPFS_SUPER_OPS, 0)?;
-    sb.set_private(try_arc(t)?);
-    super::fill_root(&sb, mode, uid, gid)?;
-    Ok(sb)
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    let o = parse(fc.data)?;
+    let t = try_arc(ShmemSb::new(&o)?)?;
+    crate::fs::superblock::get_tree_nodev(fc, &TMPFS_SUPER_OPS, |sb| {
+        let (mode, uid, gid) = (t.mode, t.uid, t.gid);
+        sb.set_private(t);
+        super::fill_root(sb, mode, uid, gid)
+    })
+}
+
+/// rootfs's kill_sb (Linux rootfs_kill_sb): a tmpfs one, so
+/// kill_anon_super
+fn rootfs_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
+    crate::fs::superblock::kill_anon_super(sb, g);
 }
 
 /// The rootfs filesystem type (Linux init/do_mounts.c rootfs_fs_type
@@ -536,7 +548,7 @@ pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
     name: "rootfs",
     fs_flags: 0,
     mount: tmpfs_mount,
-    mount_dev: None,
+    kill_sb: rootfs_kill_sb,
     file_ops: &super::TMPFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
@@ -548,7 +560,8 @@ static SHM_MNT: spin::Once<crate::fs::mount::MountRef> = spin::Once::new();
 
 /// Make the kernel's tmpfs (Linux shmem_init's kern_mount; mnt_init)
 pub fn shmem_init() -> Result<(), KernelError> {
-    let sb = tmpfs_mount(&TMPFS_TYPE, b"size=0,nr_inodes=0")?;
+    let fc = crate::fs::superblock::FsContext::new(&TMPFS_TYPE, b"size=0,nr_inodes=0");
+    let sb = crate::fs::superblock::vfs_get_tree(&fc)?.unlock();
     let root = sb.get_root().ok_or(KernelError::Io)?;
     let m = crate::fs::mount::Mount::alloc(sb, root, 0, b"tmpfs".as_slice().into())?;
     // A kernel mount (Linux kern_mount)
@@ -589,7 +602,7 @@ pub static TMPFS_TYPE: FileSystemType = FileSystemType {
     name: "tmpfs",
     fs_flags: 0,
     mount: tmpfs_mount,
-    mount_dev: None,
+    kill_sb: crate::fs::superblock::kill_anon_super,
     file_ops: &super::TMPFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

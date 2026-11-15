@@ -48,13 +48,15 @@ impl SuperOps for SysfsSops {
         Err(KernelError::OperationNotSupported)
     }
 
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        StatFs {
-            f_type: SYSFS_MAGIC,
-            f_bsize: 4096,
-            f_namelen: 255,
-            ..StatFs::default()
-        }
+    fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok({
+            StatFs {
+                f_type: SYSFS_MAGIC,
+                f_bsize: 4096,
+                f_namelen: 255,
+                ..StatFs::default()
+            }
+        })
     }
 }
 
@@ -71,30 +73,44 @@ fn sb_ns(sb: &SuperBlock) -> Option<u64> {
 }
 
 /// The namespace's superblock, shared by its mounts (Linux
-/// kernfs_get_tree: sget_fc with kernfs_test_super)
-fn mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
+/// kernfs_get_tree: sget_fc with kernfs_test_super and
+/// kernfs_set_super, then kernfs_fill_super if new)
+fn mount(
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
     let ns = crate::net::current_net_ns().id;
-    crate::fs::superblock::sget(
-        t,
-        |sb| sb_ns(sb) == Some(ns),
-        || {
-            let sb = SuperBlock::alloc(t, &SYSFS_SOPS, 0)?;
-            sb.set_private(try_arc(kernfs::vfs::KfSuper { ns })?);
-            let ri = kernfs::vfs::inode(&sb, root())?;
-            sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
-                ri,
-                Arc::downgrade(&sb),
-            ))?);
-            Ok(sb)
-        },
-    )
+    let info: Arc<dyn crate::fs::superblock::SuperBlockData> =
+        try_arc(kernfs::vfs::KfSuper { ns })?;
+    let sb =
+        crate::fs::superblock::sget(fc, &SYSFS_SOPS, Some(&|sb| sb_ns(sb) == Some(ns)), &|sb| {
+            // Linux kernfs_set_super
+            sb.set_private(info.clone());
+            crate::fs::superblock::set_anon_super(sb)
+        })?;
+    if !sb.has_root() {
+        let ri = kernfs::vfs::inode(&sb, root())?;
+        sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
+            ri,
+            Arc::downgrade(&sb),
+        ))?);
+        sb.set_active();
+    }
+    Ok(sb)
+}
+
+/// sysfs's kill_sb (Linux sysfs_kill_sb -> kernfs_kill_sb:
+/// kill_anon_super, then the kernfs info freed)
+fn sysfs_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
+    crate::fs::superblock::kill_anon_super(sb, g);
+    let info = sb.private.write().take();
+    drop(info);
 }
 
 pub static SYSFS_TYPE: FileSystemType = FileSystemType {
     name: "sysfs",
     fs_flags: fs_flags::FS_PSEUDO | fs_flags::FS_USERNS_MOUNT_RESTRICTED,
     mount,
-    mount_dev: None,
+    kill_sb: sysfs_kill_sb,
     file_ops: &kernfs::vfs::KERNFS_FOPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

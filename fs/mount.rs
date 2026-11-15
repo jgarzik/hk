@@ -16,18 +16,15 @@ use alloc::boxed::Box;
 
 use super::KernelError;
 use super::dentry::{Dentry, DentryRef};
-use super::inode::FileType;
 pub use super::mntput::MountRef;
 use super::mntput::{__cleanup_mnt, MNT_NS_INTERNAL, MntOwned};
 use super::path_ref::Path;
-use super::superblock::{FileSystemType, SuperBlock};
+use super::superblock::{FsContext, SbActive, SuperBlock, vfs_get_tree};
 use crate::task::task_work::CallbackHead;
 use crate::util::ida::Ida;
 use crate::util::kalloc::{arc_nofail, try_arc};
 use crate::util::percpu_alloc::PcpSlot;
 use core::sync::atomic::AtomicBool;
-
-use crate::block::get_blkdev;
 
 /// Ignore set-user/group-ID bits on exec (Linux MNT_NOSUID)
 pub const MNT_NOSUID: u32 = 0x1;
@@ -256,8 +253,9 @@ static MNT_ID_UNIQUE: AtomicU64 = AtomicU64::new(MNT_UNIQUE_ID_OFFSET + 1);
 /// under any lock but MOUNT_LOCK. References beyond its caller's and
 /// the tree's make it busy for umount.
 pub struct Mount {
-    /// The mounted filesystem's superblock (Linux mnt_sb)
-    pub sb: MntOwned<Arc<SuperBlock>>,
+    /// The mounted filesystem's superblock, an active reference (Linux
+    /// mnt_sb and its s_active), released by the teardown
+    pub sb: MntOwned<SbActive>,
 
     /// Root dentry of the mounted filesystem (Linux mnt_root)
     pub root: MntOwned<DentryRef>,
@@ -359,7 +357,7 @@ pub struct Mount {
 impl Mount {
     /// A new mount, its first reference, or ENOMEM (Linux alloc_vfsmnt)
     pub fn alloc(
-        sb: Arc<SuperBlock>,
+        sb: SbActive,
         root: DentryRef,
         flags: u32,
         devname: super::name::FileName,
@@ -382,7 +380,7 @@ impl Mount {
     /// [`Mount::alloc`] for a tree copy, which cannot unwind a partial
     /// copy (its peer groups and attachments) on failure
     fn alloc_nofail(
-        sb: Arc<SuperBlock>,
+        sb: SbActive,
         root: DentryRef,
         flags: u32,
         devname: super::name::FileName,
@@ -405,7 +403,7 @@ impl Mount {
     /// A mount with id `mnt_id`, which its drop gives back; `pcp` are
     /// its count's and its writers' parts
     fn init(
-        sb: Arc<SuperBlock>,
+        sb: SbActive,
         root: DentryRef,
         flags: u32,
         devname: super::name::FileName,
@@ -1301,17 +1299,16 @@ static KNULLFS_FILE: spin::Once<MountRef> = spin::Once::new();
 pub fn init_mount_tree() -> Result<MountRef, KernelError> {
     let nullfs = &super::nullfs::NULLFS_TYPE;
     let null = attach(
-        (nullfs.mount)(nullfs, b"")?,
+        vfs_get_tree(&FsContext::new(nullfs, b""))?.unlock(),
         None,
         0,
-        false,
         b"nullfs".as_slice().into(),
     )?;
     let rootfs_type = &super::ramfs::tmpfs::ROOTFS_TYPE;
-    let sb = (rootfs_type.mount)(rootfs_type, b"")?;
+    let sb = vfs_get_tree(&FsContext::new(rootfs_type, b""))?.unlock();
     let on = Path::new(null.clone(), null.root.clone());
-    let rootfs = attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())?;
-    let ksb = (nullfs.mount)(nullfs, b"")?;
+    let rootfs = attach(sb, Some(on), 0, b"rootfs".as_slice().into())?;
+    let ksb = vfs_get_tree(&FsContext::new(nullfs, b""))?.unlock();
     let root = ksb.get_root().ok_or(KernelError::InvalidArgument)?;
     let file = super::nullfs::new_file(&ksb)?;
     let k = Mount::alloc(ksb.clone(), root, MNT_READONLY, b"nullfs".as_slice().into())?;
@@ -1326,20 +1323,17 @@ pub fn init_mount_tree() -> Result<MountRef, KernelError> {
 }
 
 /// Mount `sb` on `mountpoint` (None: as the namespace root) with MNT_*
-/// flags `mnt_flags` and read-only state `ro`, which are set before the
-/// mount becomes visible (Linux do_new_mount: no window with weaker
-/// flags). The new mount is a child of the mount the mountpoint is in.
+/// flags `mnt_flags`, which are set before the mount becomes visible
+/// (Linux do_new_mount_fc: vfs_create_mount, then do_add_mount; no
+/// window with weaker flags). The new mount is a child of the mount the
+/// mountpoint is in.
 pub fn attach(
-    sb: Arc<SuperBlock>,
+    sb: SbActive,
     mountpoint: Option<Path>,
     mnt_flags: u32,
-    ro: bool,
     devname: super::name::FileName,
 ) -> Result<MountRef, KernelError> {
     let root = sb.get_root().ok_or(KernelError::InvalidArgument)?;
-    if ro {
-        sb.make_rdonly()?;
-    }
     let mount = Mount::alloc(sb, root, mnt_flags, devname)?;
     let mnt_ns = crate::ns::current_mnt_ns();
     if let Some(mp) = mountpoint {
@@ -1356,7 +1350,7 @@ pub fn attach(
         let _ns = namespace_lock();
         // A namespace's root is set once (Linux alloc_mnt_ns' tree root)
         mnt_ns.set_root(mount.clone())?;
-        mount.set_ns(mnt_ns.id);
+        mount.set_ns(mnt_ns.id());
     }
     Ok(mount)
 }
@@ -1431,7 +1425,7 @@ fn mnt_already_visible(ns: &crate::ns::MntNamespace, sb: &SuperBlock, new: &mut 
 /// `m` is in the caller's mount namespace (Linux check_mnt); under
 /// NAMESPACE_SEM, or an optimistic early check as Linux's
 pub fn check_mnt(m: &Mount) -> bool {
-    m.ns() == crate::ns::current_mnt_ns().id
+    m.ns() == crate::ns::current_mnt_ns().id()
 }
 
 /// The tree at `m`, just hung on its parent, joins the parent's
@@ -1486,7 +1480,7 @@ pub(super) struct CopyEnt {
 /// could make a reference loop (a namespace whose tree holds itself)
 pub fn mnt_ns_loop(d: &Dentry) -> bool {
     super::pseudo::nsfs::mnt_ns_from_dentry(d)
-        .is_some_and(|m| crate::ns::current_mnt_ns().id >= m.id)
+        .is_some_and(|m| crate::ns::current_mnt_ns().id() >= m.id())
 }
 
 /// No mount of the tree at `m` is a namespace file that could make a
@@ -1653,38 +1647,6 @@ pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> 
     graft(ns, t, mp)
 }
 
-/// Superblock of a device-backed filesystem (vfat, ...) on the block
-/// device at `source` (e.g. "/dev/rd1"); mount it with `attach`
-pub fn dev_super(
-    fs_type: &'static FileSystemType,
-    source: &[u8],
-    opts: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
-    // The filesystem must support device mounting
-    let mount_dev_fn = fs_type
-        .mount_dev
-        .ok_or(KernelError::OperationNotSupported)?;
-
-    // Look up the source device path
-    let source_dentry = super::namei::lookup_path(source)?;
-    let source_inode = source_dentry.get_inode().ok_or(KernelError::NotFound)?;
-
-    // Verify it's a block device
-    if source_inode.mode().file_type() != Some(FileType::BlockDev) {
-        return Err(KernelError::NotBlockDevice);
-    }
-
-    // Get the BlockDevice from the registry using the inode's rdev
-    let bdev = get_blkdev(source_inode.rdev).ok_or(KernelError::NoDevice)?;
-
-    // Opened (under the disk's open_mutex, failing for a removed
-    // device) for the superblock's life: a rescan sees it in use
-    let h = bdev.open_handle()?;
-    let sb = mount_dev_fn(fs_type, bdev, opts)?;
-    sb.set_bdev(h);
-    Ok(sb)
-}
-
 // ============================================================================
 // Umount Support
 // ============================================================================
@@ -1772,10 +1734,11 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         // one's teardown runs before the syscall returns)
     }
 
-    // Write the filesystem back, outside namespace_sem: writeback takes
-    // inode locks, which nest outside it (Linux: deactivate_super ->
-    // sync_filesystem after namespace_unlock)
-    let _ = super::fs_writeback::writeback_sb(&mount.sb);
+    // The filesystem is written back by its shutdown, when the last
+    // active reference goes (Linux deactivate_super ->
+    // generic_shutdown_super's sync_filesystem): here, once the
+    // caller's reference is put, or later, with its last user, after a
+    // lazy umount or with another mount left
     Ok(())
 }
 
@@ -2444,7 +2407,9 @@ impl Mount {
     /// Tear the mount down (Linux cleanup_mnt, with mntput_no_expire's
     /// release of the submounts still hung on it): off its
     /// superblock's s_mounts, its submounts and mountpoint let go, its
-    /// id freed, then its root dentry and superblock released. Sleeps.
+    /// id freed, then its root dentry and its active reference to the
+    /// superblock released (Linux deactivate_super: the last one shuts
+    /// the filesystem down). Sleeps.
     ///
     /// # Safety
     /// Once per mount, with no counted reference left or to come: it is
@@ -2613,7 +2578,7 @@ fn lookup_mnt(p: &Path) -> Option<MountRef> {
 #[cfg(test)]
 pub(super) fn test_mnt() -> MountRef {
     let t = &super::nullfs::NULLFS_TYPE;
-    let sb = (t.mount)(t, b"").unwrap();
+    let sb = vfs_get_tree(&FsContext::new(t, b"")).unwrap().unlock();
     let root = sb.get_root().unwrap();
     Mount::alloc(sb, root, 0, b"t".as_slice().into()).unwrap()
 }

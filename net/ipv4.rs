@@ -361,10 +361,15 @@ pub fn ip_rcv(mut skb: Box<SkBuff>) {
         return ip_local_deliver(skb);
     }
     // Linux ip_local_deliver -> ip_defrag
-    if let Defrag::Whole(pkt) = net.frags.add(&net, skb.data())
-        && let Some(whole) = rebuild(&skb, &pkt)
-    {
-        ip_local_deliver(whole);
+    if let Defrag::Whole(pkt) = net.frags.add(&net, skb.data()) {
+        // Linux ip_frag_reasm: the reassembled skb, or out_nomem
+        match rebuild(&skb, &pkt) {
+            Some(whole) => {
+                net.mib.ip.inc(IPSTATS_MIB_REASMOKS);
+                ip_local_deliver(whole);
+            }
+            None => net.mib.ip.inc(IPSTATS_MIB_REASMFAILS),
+        }
     }
 }
 

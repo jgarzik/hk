@@ -46,13 +46,15 @@ impl SuperOps for NullfsSuperOps {
     }
 
     /// Linux simple_statfs
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        StatFs {
-            f_type: NULL_FS_MAGIC,
-            f_bsize: 4096,
-            f_namelen: 255,
-            ..StatFs::default()
-        }
+    fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok({
+            StatFs {
+                f_type: NULL_FS_MAGIC,
+                f_bsize: 4096,
+                f_namelen: 255,
+                ..StatFs::default()
+            }
+        })
     }
 }
 
@@ -192,8 +194,14 @@ pub fn new_file(sb: &Arc<SuperBlock>) -> Result<crate::fs::DentryRef, KernelErro
 
 /// A new instance (Linux nullfs_fs_fill_super): the root is inode 1,
 /// mode 0555, owned by root
-fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
-    let sb = SuperBlock::new(fs_type, &NULLFS_SUPER_OPS, 0)?;
+fn mount(
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    crate::fs::superblock::get_tree_nodev(fc, &NULLFS_SUPER_OPS, fill)
+}
+
+/// Linux nullfs_fs_fill_super
+fn fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     let root = Inode::alloc(Inode::new(
         1,
         InodeMode::directory(0o555),
@@ -201,14 +209,14 @@ fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBloc
         0,
         0,
         crate::time::TIMEKEEPER.current_time(),
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &NULLFS_INODE_OPS,
     ))?;
     sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
         root,
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
     ))?);
-    Ok(sb)
+    Ok(())
 }
 
 /// The nullfs filesystem type; mounted only by the kernel
@@ -216,7 +224,7 @@ pub static NULLFS_TYPE: FileSystemType = FileSystemType {
     name: "nullfs",
     fs_flags: super::superblock::fs_flags::FS_PSEUDO,
     mount,
-    mount_dev: None,
+    kill_sb: crate::fs::superblock::kill_anon_super,
     file_ops: &NULLFS_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

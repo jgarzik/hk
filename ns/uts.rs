@@ -130,7 +130,7 @@ impl UtsNamespace {
         Self {
             name: RwLock::new(name),
             user_ns: super::INIT_USER_NS.clone(),
-            ns: super::NsCommon::new(super::inum::Inum::fixed(super::inum::UTS_INIT)),
+            ns: super::NsCommon::init(super::inum::Inum::fixed(super::inum::UTS_INIT)),
         }
     }
 

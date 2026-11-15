@@ -358,8 +358,9 @@ pub trait InodeOps: Send + Sync {
 
     /// The last reference to the inode is gone (Linux ->evict_inode):
     /// release what the object still owns, e.g. the blocks of an
-    /// unlinked file. Called from `Drop for Inode` in any context:
-    /// must not sleep (defer I/O to a workqueue).
+    /// unlinked file. Called from `Drop for Inode`, where the last
+    /// reference goes: a context that may sleep (Linux iput's
+    /// might_sleep), so it may do I/O.
     fn evict_inode(&self, inode: &Inode) {
         let _ = inode;
     }
@@ -597,8 +598,15 @@ pub struct Inode {
     /// list lock by the pass that takes it off `b_io`
     pub(crate) i_dirty: core::sync::atomic::AtomicBool,
     /// On its device's `b_dirty` or `b_io` (Linux i_io_list, under the
-    /// wb's list_lock)
+    /// wb's list_lock), which hold no reference to it: its `Drop` takes
+    /// it off (Linux evict's inode_io_list_del)
     pub(crate) i_io_list: list::Link,
+    /// Which of the two (`fs_writeback::ON_*`), changed with the link
+    /// under the wb's list_lock
+    pub(crate) i_io_on: core::sync::atomic::AtomicU8,
+    /// The writeback state it was queued on (Linux inode->i_wb), set
+    /// the first time and never changed
+    pub(crate) i_wb: spin::Once<Arc<crate::mm::writeback::BdiWriteback>>,
 
     /// Writers (> 0) or executions denying them (< 0) (Linux
     /// i_writecount; `get_write_access`, `deny_write`)
@@ -624,7 +632,7 @@ pub struct Inode {
     pub(crate) i_sequence: crate::task::futex::KeySeq,
     /// On its superblock's `s_inodes` (Linux i_sb_list), from
     /// [`Inode::alloc`] to its eviction
-    i_sb_list: list::Link,
+    pub(super) i_sb_list: list::Link,
 }
 
 crate::adapter!(pub SbInodeA, Inode, i_sb_list);
@@ -642,10 +650,11 @@ pub type SbInodes = LockedBy<WeakList<SbInodeA>, InodeSbLists>;
 
 /// Linux inode_sb_list_lock (one lock for every superblock's s_inodes,
 /// as Linux had before s_inode_list_lock went per superblock): an
-/// inode holds only a `Weak` to its superblock and may be evicted
-/// while the superblock is torn down, which drains its list under this
-/// lock first; an inode still linked under it therefore has a
-/// superblock whose fields are intact. A spin leaf, thread context
+/// inode holds only a `Weak` to its superblock (Linux i_sb, a pointer
+/// the shutdown keeps valid by evicting first) and may be evicted after
+/// the superblock's shutdown (`generic_shutdown_super`), which drains
+/// its list under this lock; an inode still linked under it therefore
+/// has a superblock whose fields are intact. A spin leaf, thread context
 /// only: an inode's last reference never goes in an interrupt handler
 /// (pinned pages and files are released in thread context:
 /// `PinnedPages`, `fput`), and lockdep reports a tracked spin lock taken
@@ -659,7 +668,7 @@ fn sb_list_add(sb: &SuperBlock, inode: &Arc<Inode>) {
 }
 
 /// Take an evicted inode off its superblock's list (Linux
-/// inode_sb_list_del), unless the superblock's teardown drained it
+/// inode_sb_list_del), unless the superblock's shutdown drained it
 fn sb_list_del(inode: &Inode) {
     let weak = {
         let mut l = INODE_SB_LIST_LOCK.lock();
@@ -667,9 +676,9 @@ fn sb_list_del(inode: &Inode) {
             return;
         }
         // SAFETY: linked, so `sb` is the superblock `alloc` listed it on
-        // (alive then), whose teardown drains s_inodes under this lock
-        // before any of its fields go: they are intact, and the inode's
-        // Weak keeps the allocation
+        // (alive then), whose shutdown drains s_inodes under this lock
+        // before its last passive put frees any field: they are intact,
+        // and the inode's Weak keeps the allocation
         let sb = unsafe { &*inode.sb.as_ptr() };
         // SAFETY: linked on its superblock's list
         unsafe { sb.s_inodes.access_mut(&mut l).remove(inode) }
@@ -677,9 +686,9 @@ fn sb_list_del(inode: &Inode) {
     drop(weak);
 }
 
-/// Unlink every inode of a superblock in its teardown (Linux
-/// evict_inodes' list walk; here an inode may outlive its superblock,
-/// so its later eviction finds itself unlinked)
+/// Unlink every inode of a superblock in its shutdown (Linux
+/// evict_inodes' list walk; here an inode may outlive its superblock's
+/// shutdown, so its later eviction finds itself unlinked)
 pub(super) fn sb_list_drain(list: &SbInodes) {
     let mut l = INODE_SB_LIST_LOCK.lock();
     let list = list.access_mut(&mut l);
@@ -758,6 +767,8 @@ impl Inode {
             fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_io_list: list::Link::new(),
+            i_io_on: core::sync::atomic::AtomicU8::new(0),
+            i_wb: spin::Once::new(),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
             i_dio_count: AtomicU32::new(0),
@@ -819,6 +830,8 @@ impl Inode {
             fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_io_list: list::Link::new(),
+            i_io_on: core::sync::atomic::AtomicU8::new(0),
+            i_wb: spin::Once::new(),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
             i_dio_count: AtomicU32::new(0),
@@ -1270,10 +1283,21 @@ impl Drop for InodeWrite {
 }
 
 impl Drop for Inode {
-    /// Linux iput_final -> evict: off its superblock's list first (the
-    /// list's contract, `WeakList`), then the filesystem's eviction
+    /// Linux iput_final -> evict: an inode it would not drop (linked and
+    /// hashed, inode_generic_drop) is written back first, as Linux does
+    /// for one it does not keep cached (hk keeps no unused inodes):
+    /// write_inode_now; then off its superblock's and writeback lists
+    /// (the lists' contract, `WeakList`) and the filesystem's eviction.
+    /// An unlinked inode's dirty pages just go (truncate_inode_pages_final).
     fn drop(&mut self) {
+        // Linux iput: the last reference goes where sleeping is allowed
+        crate::sync::might_sleep();
+        let keep = self.get_nlink() != 0 && self.i_hash_node.is_linked();
+        if keep && self.i_dirty.load(Ordering::Acquire) {
+            let _ = crate::mm::filemap::write_and_wait(self);
+        }
         sb_list_del(self);
+        super::fs_writeback::inode_io_list_del(self);
         super::icache::evict(self);
     }
 }

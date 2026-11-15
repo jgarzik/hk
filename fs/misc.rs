@@ -351,20 +351,25 @@ fn new_mount(
     {
         return Err(KernelError::NotDirectory);
     }
-    // Flags are set before the mount becomes visible (Linux do_new_mount)
-    let sb = if fs_type.mount_dev.is_some() && !source.is_empty() {
-        super::mount::dev_super(fs_type, source, data)
-    } else {
-        (fs_type.mount)(fs_type, data)
+    // Flags are set before the mount becomes visible (Linux
+    // do_new_mount: a new superblock starts with the SB_* flags, the
+    // mount gets the MNT_* ones; a shared superblock keeps its own)
+    let mut sb_flags = sb_sync_flags(flags);
+    if flags & ms::RDONLY != 0 {
+        sb_flags |= super::superblock::SB_RDONLY;
+    }
+    let fc = super::superblock::FsContext {
+        fs_type,
+        sb_flags,
+        source,
+        data,
     };
+    // s_umount released before the mount is made (Linux
+    // do_new_mount_fc)
+    let sb = super::superblock::vfs_get_tree(&fc).map(super::superblock::SbLocked::unlock);
     // Linux do_new_mount_fc: "Mount too revealing"
     let mut revealing = false;
     let r = sb.and_then(|sb| {
-        // A superblock already mounted elsewhere (sysfs of a namespace)
-        // keeps its flags (Linux: only a new one gets the mount's)
-        if !sb.is_mounted() {
-            sb.set_sync_flags(sb_sync_flags(flags));
-        }
         let mut mnt_flags = mnt_flags(flags);
         if super::mount::mount_too_revealing(&sb, &mut mnt_flags) {
             revealing = true;
@@ -376,13 +381,7 @@ fn new_mount(
         } else {
             source
         };
-        super::mount::attach(
-            sb,
-            Some(mp),
-            mnt_flags,
-            flags & ms::RDONLY != 0,
-            devname.into(),
-        )
+        super::mount::attach(sb, Some(mp), mnt_flags, devname.into())
     });
     match r {
         Ok(_) => Ok(()),
@@ -393,7 +392,9 @@ fn new_mount(
             | KernelError::Busy
             | KernelError::NotFound
             | KernelError::Io
-            | KernelError::OutOfMemory),
+            | KernelError::OutOfMemory
+            // No anonymous device number left (Linux get_anon_bdev)
+            | KernelError::ProcessFileLimit),
         ) => Err(e),
         Err(_) => Err(KernelError::InvalidArgument),
     }

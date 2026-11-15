@@ -3,9 +3,12 @@
 //! An inode whose page cache gets a dirty page is marked dirty once
 //! (`Inode.i_dirty`, Linux I_DIRTY_PAGES) and put at the tail of its
 //! device's `b_dirty` list (`BdiWriteback`, Linux wb->b_dirty) through
-//! its embedded `Inode.i_io_list`; the list holds a reference: a dirty
-//! inode stays in memory until written back. The device's periodic
-//! writeback is armed when its lists were empty (every ~5 s).
+//! its embedded `Inode.i_io_list`. The lists hold no reference (Linux):
+//! an inode's last reference evicts it, dirty or not, and its `Drop`
+//! takes it off (`inode_io_list_del`, Linux evict); a pass takes a
+//! reference to each inode it writes, skipping one already being freed
+//! (Linux I_FREEING). The device's periodic writeback is armed when its
+//! lists were empty (every ~5 s).
 //!
 //! A pass (Linux wb_writeback) moves the inodes it takes from `b_dirty`
 //! to `b_io` (Linux queue_io / move_expired_inodes: those dirtied at or
@@ -30,6 +33,11 @@
 
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
+
+/// `Inode.i_io_on`: on no list, on `b_dirty`, on `b_io`
+const ON_NONE: u8 = 0;
+const ON_DIRTY: u8 = 1;
+const ON_IO: u8 = 2;
 
 use super::inode::Inode;
 use super::superblock::{SuperBlock, iterate_supers};
@@ -60,20 +68,51 @@ pub fn mark_inode_dirty(inode: &Arc<Inode>) {
     if !inode.i_data.aops().can_dirty() || inode.i_dirty.swap(true, Ordering::AcqRel) {
         return;
     }
-    let Some(wb) = inode_to_wb(inode) else {
-        return;
+    // Its wb, found once (Linux inode->i_wb)
+    let wb = match inode.i_wb.get() {
+        Some(wb) => wb.clone(),
+        None => {
+            let Some(wb) = inode_to_wb(inode) else {
+                return;
+            };
+            inode.i_wb.call_once(|| wb).clone()
+        }
     };
     let first = {
         let mut l = wb.list_lock.lock();
         let first = l.b_dirty.is_empty() && l.b_io.is_empty();
         // Off every list: the pass that took it marked it clean under
         // this lock after taking it off b_io
-        l.b_dirty.push_back(inode.clone());
+        l.b_dirty.push_back(inode);
+        inode.i_io_on.store(ON_DIRTY, Ordering::Relaxed);
         first
     };
     if first {
         wb.wakeup_delayed();
     }
+}
+
+/// The last reference to `inode` went: off its device's writeback list
+/// if it is on one (Linux evict -> inode_io_list_del), before any of
+/// its fields go (the lists' `WeakList` contract)
+pub(super) fn inode_io_list_del(inode: &Inode) {
+    let Some(wb) = inode.i_wb.get() else {
+        return;
+    };
+    let weak = {
+        let mut l = wb.list_lock.lock();
+        let on = inode.i_io_on.swap(ON_NONE, Ordering::Relaxed);
+        // SAFETY: `i_io_on` names the list it is linked on, both changed
+        // under this lock
+        unsafe {
+            match on {
+                ON_DIRTY => Some(l.b_dirty.remove(inode)),
+                ON_IO => Some(l.b_io.remove(inode)),
+                _ => None,
+            }
+        }
+    };
+    drop(weak);
 }
 
 /// Write back one inode's dirty pages (Linux writeback_single_inode,
@@ -104,23 +143,40 @@ fn wb_writeback(
         let mut l = wb.list_lock.lock();
         let l = &mut *l;
         l.b_dirty.move_if(&mut l.b_io, |i| {
-            expired(i, cutoff) && sb.is_none_or(|s| core::ptr::eq(i.sb.as_ptr(), s))
+            let take = expired(i, cutoff) && sb.is_none_or(|s| core::ptr::eq(i.sb.as_ptr(), s));
+            if take {
+                i.i_io_on.store(ON_IO, Ordering::Relaxed);
+            }
+            take
         });
     }
     let mut err = Ok(());
     loop {
-        let inode = {
+        let (inode, weak) = {
             let mut l = wb.list_lock.lock();
-            let i = l.b_io.pop_front();
-            // Marked clean under the lock it was queued under: one
-            // dirtied from now on goes back on b_dirty
+            let Some(w) = l.b_io.pop_front() else {
+                break;
+            };
+            // A reference for the write (Linux __iget), unless its last
+            // one went and its Drop waits for this lock (I_FREEING):
+            // skipped. Marked clean under the lock it was queued under:
+            // one dirtied from now on goes back on b_dirty
+            // SAFETY: just unlinked under this lock, which an inode's
+            // Drop takes before any field goes (inode_io_list_del): its
+            // fields are intact, the weak reference keeps the memory
+            unsafe { &*w.as_ptr() }
+                .i_io_on
+                .store(ON_NONE, Ordering::Relaxed);
+            let i = w.upgrade();
             if let Some(i) = &i {
                 i.i_dirty.store(false, Ordering::Release);
             }
-            i
+            (i, w)
         };
+        // The list's weak reference goes with no lock held
+        drop(weak);
         let Some(inode) = inode else {
-            break;
+            continue;
         };
         if let Err(e) = writeback_inode(&inode)
             && err.is_ok()

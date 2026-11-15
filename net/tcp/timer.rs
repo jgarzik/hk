@@ -176,6 +176,14 @@ impl TcpCb {
             self.timed_out(out);
             return;
         }
+        if self.backoff == 0 && !handshake {
+            // Linux: the first timeout ends Reno recovery or disorder
+            if self.cong.in_recovery() {
+                self.net_stat(LINUX_MIB_TCPRENORECOVERYFAIL);
+            } else if self.cong.dupacks() != 0 {
+                self.net_stat(LINUX_MIB_TCPRENOFAILURES);
+            }
+        }
         let flight = self.snd_max.wrapping_sub(self.snd_una);
         self.cong.on_rto(flight);
         self.rtt_seq = None;
@@ -185,6 +193,13 @@ impl TcpCb {
             self.syn_rtx = true;
             self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
             self.syn_rtx(out);
+        } else if self.syn_unacked {
+            // Closed in SYN_RECEIVED: the SYN-ACK heads the queue and
+            // goes alone (Linux tcp_retransmit_skb of the head; a SYN is
+            // never collapsed), the FIN behind it once that is acked
+            self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
+            self.syn_rtx(out);
+            self.snd_nxt = self.snd_una.wrapping_add(1);
         } else {
             self.snd_nxt = self.snd_una;
             self.output(now, out);

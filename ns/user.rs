@@ -163,7 +163,7 @@ impl UserNamespace {
             parent: None,
             owner: 0,
             group: 0,
-            ns: super::NsCommon::new(super::inum::Inum::fixed(super::inum::USER_INIT)),
+            ns: super::NsCommon::init(super::inum::Inum::fixed(super::inum::USER_INIT)),
         })
     }
 

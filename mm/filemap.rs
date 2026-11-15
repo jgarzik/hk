@@ -1417,13 +1417,20 @@ pub fn fault(inode: &Inode, index: u64) -> Result<u64, VmFault> {
 
 /// `f` on each inode that may hold reclaimable cache (every
 /// superblock's, the block devices' on the bdev superblock) until it
-/// returns false; no allocation
-fn for_each_cache_inode(f: &mut dyn FnMut(&Inode) -> bool) {
+/// returns false; no allocation. `reclaim`: skip a superblock whose
+/// s_umount is not free at once (reclaim may run under one)
+fn for_each_cache_inode(reclaim: bool, f: &mut dyn FnMut(&Inode) -> bool) {
+    use crate::fs::superblock::{iterate_supers, iterate_supers_trylock};
     let mut more = true;
-    crate::fs::superblock::iterate_supers(|sb| {
+    let each = |sb: &alloc::sync::Arc<crate::fs::superblock::SuperBlock>| {
         more = more
             && crate::fs::inode::for_each_sb_inode(sb, &mut |i| i.i_data.nrpages() == 0 || f(i));
-    });
+    };
+    if reclaim {
+        iterate_supers_trylock(each);
+    } else {
+        iterate_supers(each);
+    }
 }
 
 /// Drop up to `nr` clean, unmapped page-cache pages for direct reclaim
@@ -1433,7 +1440,7 @@ fn for_each_cache_inode(f: &mut dyn FnMut(&Inode) -> bool) {
 /// lock (trylock); stops once `nr` are freed. The number freed.
 pub fn shrink_cache(nr: usize) -> usize {
     let mut freed = 0;
-    for_each_cache_inode(&mut |inode| {
+    for_each_cache_inode(true, &mut |inode| {
         freed += invalidate_clean(inode, 0, u64::MAX) as usize;
         freed < nr
     });
@@ -1443,7 +1450,7 @@ pub fn shrink_cache(nr: usize) -> usize {
 /// vm.drop_caches 1 (Linux drop_pagecache_sb over every superblock):
 /// drop every clean, unmapped page-cache page
 pub fn drop_pagecache() {
-    for_each_cache_inode(&mut |inode| {
+    for_each_cache_inode(false, &mut |inode| {
         invalidate_clean(inode, 0, u64::MAX);
         true
     });

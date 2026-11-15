@@ -33,7 +33,7 @@ use super::superblock::{
     FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
 };
 use crate::util::error::KernelError;
-use crate::util::kalloc::{arc_nofail, try_arc};
+use crate::util::kalloc::try_arc;
 
 mod cache;
 mod direct;
@@ -579,9 +579,24 @@ pub struct VfatSbData {
     pub cluster_size: u32,
     /// Mount options
     pub opts: VfatOpts,
+    /// Serializes FAT allocation and freeing and the free count (Linux
+    /// sbi->fat_lock, lock_fat): sleeping, under the inodes' i_rwsem,
+    /// above the device's I/O; shared by every copy of this data
+    pub fat: Arc<crate::sync::Mutex<FatState>>,
 }
 
 impl SuperBlockData for VfatSbData {}
+
+/// What the FAT lock guards beyond the FAT itself
+pub struct FatState {
+    /// Free data clusters, -1 until counted (Linux sbi->free_clusters,
+    /// counted by the first statfs, fat_count_free_clusters, then kept
+    /// by every allocation and free)
+    free: i64,
+    /// The cluster allocated last: the next search starts after it
+    /// (Linux sbi->prev_free, next fit)
+    prev_free: u32,
+}
 
 /// How long names map to bytes (Linux iocharset and utf8)
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -871,7 +886,7 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), Kernel
 // ============================================================================
 
 /// Get VFAT superblock data from superblock (cloned to avoid lifetime issues)
-fn get_sb_data(sb: &Arc<SuperBlock>) -> Result<VfatSbData, KernelError> {
+fn get_sb_data(sb: &SuperBlock) -> Result<VfatSbData, KernelError> {
     let guard = sb.private.read();
     guard
         .as_ref()
@@ -996,42 +1011,91 @@ fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), K
 /// Searches the FAT for a free cluster (value 0), marks it as end-of-chain,
 /// and returns the cluster number.
 fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
-    // Search for free cluster among the data clusters (the BPB's size,
-    // not the device's)
-    for cluster in 2..sb_data.max_cluster {
-        let entry = get_fat_entry(sb_data, cluster)?;
-        if entry == FAT_FREE {
-            // Found free cluster, mark as end-of-chain
-            set_fat_entry(sb_data, cluster, FAT_EOC)?;
-
-            // Zeroed on the disk itself, after the device cache's pages
-            // of it are written back and dropped (Linux
-            // clean_bdev_aliases): a file's data never goes through the
-            // device cache, so no stale or dirty copy of an old
-            // directory block may outlive the reuse
-            let off = cluster_to_offset(sb_data, cluster);
-            let len = u64::from(sb_data.cluster_size);
-            filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
-            let mut zeros = crate::util::kmem::try_vec(len as usize, 0u8)?;
-            bdev_rw_bytes(&sb_data.bdev, BioOp::Write, off, &mut zeros)?;
-            // Again: a page a reader cached before the zeros landed
-            // holds the old bytes
-            filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
-
-            return Ok(cluster);
-        }
+    // The search and the claim as one (Linux fat_alloc_clusters under
+    // lock_fat): no two allocations take one cluster
+    let mut fat = sb_data.fat.lock();
+    // Next fit among the data clusters (the BPB's size, not the
+    // device's): after the last one taken, then from the start
+    let after = fat.prev_free.max(1) + 1;
+    let found = match fat_scan(sb_data, after, sb_data.max_cluster, |_, e| e == FAT_FREE)? {
+        Some(c) => Some(c),
+        None => fat_scan(sb_data, 2, after.min(sb_data.max_cluster), |_, e| {
+            e == FAT_FREE
+        })?,
+    };
+    let Some(cluster) = found else {
+        return Err(KernelError::NoSpace);
+    };
+    // Marked end-of-chain
+    set_fat_entry(sb_data, cluster, FAT_EOC)?;
+    fat.prev_free = cluster;
+    if fat.free > 0 {
+        fat.free -= 1;
     }
-
-    Err(KernelError::NoSpace)
+    drop(fat);
+    if let Err(e) = zero_cluster(sb_data, cluster) {
+        // Claimed and in no chain: given back, not leaked
+        let _ = free_cluster_chain(sb_data, cluster);
+        return Err(e);
+    }
+    Ok(cluster)
 }
 
-/// Free a cluster chain starting from start_cluster
+/// The first cluster in [from, to) whose FAT entry `f` picks, the FAT
+/// read a page at a time (Linux fat_ent_next over its blocks, not an
+/// entry at a time)
+fn fat_scan(
+    sb_data: &VfatSbData,
+    from: u32,
+    to: u32,
+    mut f: impl FnMut(u32, u32) -> bool,
+) -> Result<Option<u32>, KernelError> {
+    const PER: u32 = 1024; // 4-byte entries in 4 KiB
+    let base = sb_data.fat_start_sector * u64::from(sb_data.bytes_per_sector);
+    let mut buf = [0u8; 4096];
+    let mut c = from;
+    while c < to {
+        let n = (PER - c % PER).min(to - c);
+        let bytes = &mut buf[..n as usize * 4];
+        read_bytes(&sb_data.bdev, base + u64::from(c) * 4, bytes)?;
+        for (k, e) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            let v = u32::from_le_bytes(*e) & 0x0FFF_FFFF;
+            if f(c + k as u32, v) {
+                return Ok(Some(c + k as u32));
+            }
+        }
+        c += n;
+    }
+    Ok(None)
+}
+
+/// Zero `cluster` on the disk itself, after the device cache's pages of
+/// it are written back and dropped (Linux clean_bdev_aliases): a file's
+/// data never goes through the device cache, so no stale or dirty copy
+/// of an old directory block may outlive the reuse
+fn zero_cluster(sb_data: &VfatSbData, cluster: u32) -> Result<(), KernelError> {
+    let off = cluster_to_offset(sb_data, cluster);
+    let len = u64::from(sb_data.cluster_size);
+    filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
+    let mut zeros = crate::util::kmem::try_vec(len as usize, 0u8)?;
+    bdev_rw_bytes(&sb_data.bdev, BioOp::Write, off, &mut zeros)?;
+    // Again: a page a reader cached before the zeros landed holds the
+    // old bytes
+    filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)
+}
+
+/// Free a cluster chain starting from start_cluster (Linux
+/// fat_free_clusters, under lock_fat)
 fn free_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<(), KernelError> {
+    let mut fat = sb_data.fat.lock();
     let mut cluster = start_cluster;
 
     while is_valid_cluster(cluster) {
         let next = get_fat_entry(sb_data, cluster)?;
         set_fat_entry(sb_data, cluster, FAT_FREE)?;
+        if fat.free >= 0 {
+            fat.free += 1;
+        }
 
         if is_end_of_chain(next) {
             break;
@@ -1040,6 +1104,21 @@ fn free_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<(), Ke
     }
 
     Ok(())
+}
+
+/// The free data clusters, counted from the FAT the first time (Linux
+/// fat_count_free_clusters, under lock_fat)
+fn free_clusters(sb_data: &VfatSbData) -> Result<u64, KernelError> {
+    let mut fat = sb_data.fat.lock();
+    if fat.free < 0 {
+        let mut n = 0i64;
+        fat_scan(sb_data, 2, sb_data.max_cluster, |_, e| {
+            n += i64::from(e == FAT_FREE);
+            false
+        })?;
+        fat.free = n;
+    }
+    Ok(fat.free as u64)
 }
 
 /// Extend a cluster chain by `count` clusters, linking them as it goes
@@ -1068,8 +1147,9 @@ fn extend_cluster_chain(
         if prev != 0
             && let Err(e) = set_fat_entry(sb_data, prev, cluster)
         {
-            // `cluster` is allocated but not yet linked: free it directly
-            let _ = set_fat_entry(sb_data, cluster, FAT_FREE);
+            // `cluster` is allocated but not yet linked: a chain of its own
+            // (end of chain), freed under the FAT lock with the count
+            let _ = free_cluster_chain(sb_data, cluster);
             return Err(e);
         }
         if *first == 0 {
@@ -1799,9 +1879,9 @@ impl InodeOps for VfatInodeOps {
         a
     }
 
-    /// An unlinked file's clusters are freed with its inode (Linux
-    /// fat_evict_inode), on the system workqueue: the last reference can
-    /// go where no I/O may be done
+    /// An unlinked file's clusters are freed with its inode, at once
+    /// (Linux fat_evict_inode: fat_truncate_blocks(inode, 0); the last
+    /// reference goes where sleeping is allowed, as Linux iput)
     fn evict_inode(&self, inode: &Inode) {
         if inode.get_nlink() != 0 {
             return;
@@ -1812,17 +1892,9 @@ impl InodeOps for VfatInodeOps {
         let Ok(sb_data) = get_sb_data(&sb) else {
             return;
         };
-        if d.start_cluster == 0 {
-            return;
+        if d.start_cluster != 0 {
+            let _ = free_cluster_chain(&sb_data, d.start_cluster);
         }
-        let mut job = Some((sb_data, d.start_cluster));
-        let work = crate::task::workqueue::Work::new(move || {
-            if let Some((sb_data, start)) = job.take() {
-                let _ = free_cluster_chain(&sb_data, start);
-            }
-        });
-        crate::task::workqueue::SYSTEM_WQ
-            .queue_work(arc_nofail(crate::sync::IrqSpinlock::new(work)));
     }
 
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
@@ -2512,15 +2584,29 @@ pub static VFAT_FILE_OPS: VfatFileOps = VfatFileOps;
 pub struct VfatSuperOps;
 
 impl SuperOps for VfatSuperOps {
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        // TODO: Could provide actual block counts from VfatSbData if available
-        // For now, return minimal valid values
-        StatFs {
+    /// Its filesystem data goes (Linux fat_put_super: the sbi freed)
+    fn put_super(&self, sb: &SuperBlock) {
+        let sbi = sb.private.write().take();
+        drop(sbi);
+    }
+
+    /// Linux fat_statfs: clusters as blocks, the free ones counted once
+    /// and kept; a long name of 255 characters of up to 6 bytes each
+    /// (FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE)
+    fn statfs(&self, sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        let d = get_sb_data(sb)?;
+        // A FAT that cannot be read fails the call (Linux
+        // fat_count_free_clusters' error)
+        let free = free_clusters(&d)?;
+        Ok(StatFs {
             f_type: MSDOS_SUPER_MAGIC,
-            f_bsize: 4096,  // Cluster size varies; use common value
-            f_namelen: 255, // LFN max length
+            f_bsize: u64::from(d.cluster_size),
+            f_blocks: u64::from(d.max_cluster - 2),
+            f_bfree: free,
+            f_bavail: free,
+            f_namelen: 255 * 6,
             ..StatFs::default()
-        }
+        })
     }
 
     fn alloc_inode(
@@ -2548,20 +2634,17 @@ pub static VFAT_SUPER_OPS: VfatSuperOps = VfatSuperOps;
 // VFAT Mount
 // ============================================================================
 
-/// Placeholder mount function for pseudo-fs style (shouldn't be called)
-fn vfat_mount_pseudo(
-    _fs_type: &'static FileSystemType,
-    _opts: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
-    Err(KernelError::OperationNotSupported) // FAT32 requires a device
+/// A vfat mount (Linux vfat_get_tree: get_tree_bdev)
+fn vfat_get_tree(
+    fc: &crate::fs::superblock::FsContext<'_>,
+) -> Result<crate::fs::superblock::SbLocked, KernelError> {
+    crate::fs::superblock::get_tree_bdev(fc, &VFAT_SUPER_OPS, |sb| vfat_fill_super(sb, fc.data))
 }
 
-/// Mount VFAT filesystem on a block device
-fn vfat_mount_dev(
-    fs_type: &'static FileSystemType,
-    bdev: Arc<BlockDevice>,
-    opts: &[u8],
-) -> Result<Arc<SuperBlock>, KernelError> {
+/// Read the filesystem on `sb`'s device (Linux vfat_fill_super ->
+/// fat_fill_super)
+fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError> {
+    let bdev = sb.bdev().ok_or(KernelError::NotBlockDevice)?.clone();
     // Options first: a bad one is EINVAL before any I/O
     let opts = VfatOpts::parse(opts)?;
     // Read boot sector
@@ -2652,14 +2735,16 @@ fn vfat_mount_dev(
         max_cluster: (total_clusters + 2) as u32,
         cluster_size,
         opts,
+        fat: try_arc(crate::sync::Mutex::new(FatState {
+            free: -1,
+            prev_free: 2,
+        }))?,
     })?;
 
     // The root directory's chain must be sound (Linux fat_read_root ->
     // fat_calc_dir_size walks it: EIO)
     read_cluster_chain(&sb_data, sb_data.root_cluster)?;
 
-    // Create superblock
-    let sb = SuperBlock::new(fs_type, &VFAT_SUPER_OPS, 0)?;
     // FAT sizes are 32-bit (Linux fat_fill_super: s_maxbytes 0xffffffff)
     sb.set_maxbytes(0xffff_ffff);
     sb.set_private(sb_data.clone());
@@ -2673,7 +2758,7 @@ fn vfat_mount_dev(
         sb_data.opts.gid,
         0,
         Timespec::ZERO,
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &VFAT_INODE_OPS,
     ))?;
     root_inode
@@ -2693,18 +2778,18 @@ fn vfat_mount_dev(
     // Names match without case or trailing dots (Linux setup's
     // vfat_ci_dentry_ops), before the root dentry takes them
     sb.set_d_op(&VFAT_CI_DENTRY_OPS);
-    let root_dentry = crate::fs::DentryRef::new(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
+    let root_dentry = crate::fs::DentryRef::new(Dentry::new_root(root_inode, Arc::downgrade(sb)))?;
     sb.set_root(root_dentry);
 
-    Ok(sb)
+    Ok(())
 }
 
 /// VFAT filesystem type
 pub static VFAT_TYPE: FileSystemType = FileSystemType {
     name: "vfat",
     fs_flags: fs_flags::FS_REQUIRES_DEV,
-    mount: vfat_mount_pseudo,
-    mount_dev: Some(vfat_mount_dev),
+    mount: vfat_get_tree,
+    kill_sb: crate::fs::superblock::kill_block_super,
     file_ops: &VFAT_FILE_OPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),

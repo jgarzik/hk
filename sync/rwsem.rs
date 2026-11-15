@@ -744,6 +744,27 @@ impl<T: ?Sized> DerefMut for RwSemWriteGuard<'_, T> {
     }
 }
 
+impl<T: ?Sized> RwSemWriteGuard<'_, T> {
+    /// Keep the semaphore held past the guard, for an owner that
+    /// releases it later through [`RwSem::write_held`] (Linux: a
+    /// down_write whose up_write is in another function)
+    pub fn leak(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl<T: ?Sized> RwSem<T> {
+    /// The guard of an exclusive hold taken earlier and leaked
+    /// ([`RwSemWriteGuard::leak`])
+    ///
+    /// # Safety
+    /// The caller holds the semaphore exclusively through a leaked guard
+    /// and hands that hold to the one returned.
+    pub unsafe fn write_held(&self) -> RwSemWriteGuard<'_, T> {
+        RwSemWriteGuard { s: self }
+    }
+}
+
 impl<T: ?Sized> Drop for RwSemWriteGuard<'_, T> {
     fn drop(&mut self) {
         // SAFETY: the guard holds the semaphore exclusively

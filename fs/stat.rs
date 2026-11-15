@@ -35,7 +35,7 @@ fn fill_stat(inode: &Inode) -> Result<Stat, KernelError> {
     let attr = inode.i_op.getattr(inode);
 
     // Get device ID from superblock (filesystem device)
-    let st_dev = inode.superblock().map(|sb| sb.dev_id).unwrap_or(0);
+    let st_dev = inode.superblock().map_or(0, |sb| sb.st_dev());
 
     // Get rdev for device files (char/block device major/minor)
     let st_rdev = if attr.mode.is_device() {
@@ -304,8 +304,8 @@ pub fn sys_statfs(path_ptr: UserPtr<u8>, buf: UserPtr<LinuxStatFs>) -> KernelRes
     let sb = path.dentry.superblock().ok_or(KernelError::NotFound)?;
     let st = sb
         .s_op
-        .statfs(&sb)
-        .to_linux(sb.dev_id, st_flags(path.mnt.flags(), &sb));
+        .statfs(&sb)?
+        .to_linux(sb.st_dev(), st_flags(path.mnt.flags(), &sb));
     Ok(buf.write(&st)?)
 }
 
@@ -344,9 +344,9 @@ pub fn sys_fstatfs(fd: i32, buf: UserPtr<LinuxStatFs>) -> KernelResult<()> {
     let sb = file.dentry.superblock().ok_or(KernelError::BadFd)?;
 
     // Get stats
-    let statfs = sb.s_op.statfs(&sb);
+    let statfs = sb.s_op.statfs(&sb)?;
     let linux_statfs = statfs.to_linux(
-        sb.dev_id,
+        sb.st_dev(),
         st_flags(file.f_path().map_or(0, |p| p.mnt.flags()), &sb),
     );
 
@@ -365,7 +365,8 @@ fn fill_statx(
 ) -> Result<Statx, KernelError> {
     inode.i_op.getattr_ok(inode)?;
     let attr = inode.i_op.getattr(inode);
-    let st_dev = inode.superblock().map(|sb| sb.dev_id).unwrap_or(0);
+    let sb = inode.superblock();
+    let (dev_major, dev_minor) = sb.as_ref().map_or((0, 0), |sb| sb.dev_major_minor());
 
     let st_rdev = if attr.mode.is_device() {
         attr.rdev.to_user()
@@ -397,8 +398,8 @@ fn fill_statx(
         stx_mtime: attr.mtime.into(),
         stx_rdev_major: ((st_rdev >> 8) & 0xfff) as u32,
         stx_rdev_minor: (st_rdev & 0xff) as u32 | ((st_rdev >> 12) & 0xfff00) as u32,
-        stx_dev_major: ((st_dev >> 8) & 0xfff) as u32,
-        stx_dev_minor: (st_dev & 0xff) as u32,
+        stx_dev_major: dev_major,
+        stx_dev_minor: dev_minor,
         stx_mnt_id: match mnt {
             Some(m) if mask & STATX_MNT_ID_UNIQUE != 0 => m.mnt_id_unique,
             Some(m) => u64::from(m.mnt_id),

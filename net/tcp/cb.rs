@@ -287,6 +287,11 @@ pub struct Out {
     pub timewait: bool,
     /// The handshake completed (SYN_RECEIVED/SYN_SENT -> ESTABLISHED)
     pub established: bool,
+    /// A request's completing ACK passed tcp_check_req, unprocessed: the
+    /// socket layer makes it a full socket (its port, the accept queue)
+    /// and feeds it again (Linux tcp_v4_syn_recv_sock,
+    /// inet_csk_complete_hashdance, tcp_child_process)
+    pub req_ack: Option<Box<SkBuff>>,
 }
 
 impl Default for Out {
@@ -300,6 +305,7 @@ impl Default for Out {
             done: false,
             timewait: false,
             established: false,
+            req_ack: None,
         }
     }
 }
@@ -514,6 +520,9 @@ pub struct Ooo {
     tree: SkbTree,
     /// Payload bytes held
     bytes: usize,
+    /// Skbs dropped as covered since the owner last looked (Linux
+    /// TCPOFOMerge)
+    pub(super) merged: u64,
 }
 
 /// `skb`'s payload end (its `end_seq` less a FIN)
@@ -547,6 +556,7 @@ impl Ooo {
         if let Some(prev) = c.current() {
             if !after(end, data_end(prev)) {
                 // Wholly inside one held (Linux: DSACK, drop)
+                self.merged += 1;
                 return false;
             }
             if prev.tcp.seq == seq {
@@ -554,6 +564,7 @@ impl Ooo {
                 let len = skb.len();
                 let old = c.replace_current(skb);
                 self.bytes = self.bytes + len - old.len();
+                self.merged += 1;
                 self.drop_covered(seq, end);
                 return true;
             }
@@ -578,6 +589,7 @@ impl Ooo {
             }
             if let Some(gone) = c.remove_current() {
                 self.bytes -= gone.len();
+                self.merged += 1;
             }
         }
     }
@@ -715,9 +727,17 @@ pub struct TcpCb {
     /// Karn: (sequence that must be acknowledged, send time)
     pub(super) rtt_seq: Option<(u32, u64)>,
     pub(super) syn_rtx: bool,
+    /// Our SYN is not yet acknowledged (Linux: the SYN skb heads the
+    /// retransmit queue): a retransmission resends the SYN or SYN-ACK,
+    /// in FIN_WAIT_1 too after a close in SYN_RECEIVED
+    pub(super) syn_unacked: bool,
     /// A listener's child: in SYN_RECEIVED it is Linux's request sock
     /// (tcp_check_req rules), not a simultaneous open
     pub(super) passive: bool,
+    /// The listener made this request a full socket (Linux: the child
+    /// sock exists, tcp_v4_syn_recv_sock): its completing ACK is
+    /// processed as tcp_child_process does
+    pub(super) req_full: bool,
     pub(super) tmr: Option<(Tmr, u64)>,
     /// TIME_WAIT 2MSL or orphan FIN_WAIT_2 deadline
     pub(super) wait_at: Option<u64>,
@@ -807,6 +827,7 @@ impl TcpCb {
         self.snd_nxt = o.iss.wrapping_add(1);
         self.snd_max = self.snd_nxt;
         self.write_seq = self.snd_nxt;
+        self.syn_unacked = true;
         self.ts_off = if self.cfg.ts == 1 { o.ts_off } else { 0 };
         self.cong.set_algo(self.opts.ca);
         self.set_adv_mss(o.mss);
@@ -1217,14 +1238,11 @@ impl TcpCb {
     /// Close the sending side (shutdown(SHUT_WR) / close): FIN after the
     /// queued data (Linux tcp_close_state + tcp_send_fin). Returns false
     /// if there is nothing to close (Linux: no FIN in SYN_SENT/CLOSED).
+    /// SYN_RECEIVED goes to FIN_WAIT_1 at once, its FIN sent behind the
+    /// unacknowledged SYN-ACK (Linux's new_state table)
     pub fn shutdown_wr(&mut self, now: u64, out: &mut Out) -> bool {
         let next = match self.state {
-            TcpState::Established => TcpState::FinWait1,
-            TcpState::SynReceived => {
-                // The FIN follows once the SYN is acknowledged
-                self.fin_queued = true;
-                return true;
-            }
+            TcpState::Established | TcpState::SynReceived => TcpState::FinWait1,
             TcpState::CloseWait => TcpState::LastAck,
             _ => return false,
         };
@@ -1236,10 +1254,9 @@ impl TcpCb {
 
     /// The user closed the socket (Linux tcp_close): unread data resets
     /// in any state, then `linger0` (SO_LINGER {1, 0}) aborts as
-    /// tcp_disconnect, else the sending side closes. The connection
-    /// lives on as an orphan. A connection still in SYN_RECEIVED
-    /// (simultaneous open) is reset instead of sending a FIN before its
-    /// SYN is acknowledged.
+    /// tcp_disconnect, else the sending side closes (SYN_RECEIVED of a
+    /// simultaneous open included: FIN_WAIT_1 and a FIN). The
+    /// connection lives on as an orphan.
     pub fn close(&mut self, linger0: bool, now: u64, out: &mut Out) {
         self.orphan = true;
         self.rcv_shut = true;
@@ -1256,7 +1273,6 @@ impl TcpCb {
                 self.disconnect(out);
                 self.net_stat(LINUX_MIB_TCPABORTONDATA);
             }
-            TcpState::SynReceived => self.abort(out),
             _ => {
                 self.shutdown_wr(now, out);
                 if self.state == TcpState::FinWait2 {
@@ -1439,6 +1455,13 @@ impl TcpCb {
         }
     }
 
+    /// Linux NET_ADD_STATS
+    pub(super) fn net_add(&self, f: usize, n: u64) {
+        if let Some(m) = &self.mib {
+            m.net.add(f, n);
+        }
+    }
+
     /// NET_INC_STATS when `cond`
     pub(super) fn net_stat_if(&self, cond: bool, f: usize) {
         if cond {
@@ -1516,15 +1539,24 @@ impl TcpCb {
             return 0;
         }
         let unit = 1u32 << self.rcv_wscale;
+        let old = self.rcv_adv.wrapping_sub(self.rcv_wup);
         let cur = self.rcv_wnd();
         let mut w = self.window_now();
         if w < cur {
+            // Never shrink: a zero window wanted is not offered yet
+            self.net_stat_if(w == 0, LINUX_MIB_TCPWANTZEROWINDOWADV);
             w = cur.div_ceil(unit) * unit;
         }
         let w = w.min(MAX_WINDOW << self.rcv_wscale);
         self.rcv_adv = self.rcv_nxt.wrapping_add(w);
         self.rcv_wup = self.rcv_nxt;
-        (w >> self.rcv_wscale) as u16
+        let field = (w >> self.rcv_wscale) as u16;
+        if field == 0 {
+            self.net_stat_if(old != 0, LINUX_MIB_TCPTOZEROWINDOWADV);
+        } else if old == 0 {
+            self.net_stat(LINUX_MIB_TCPFROMZEROWINDOWADV);
+        }
+        field
     }
 
     /// Window field of a SYN or SYN-ACK: never scaled (RFC 7323 2.2)
@@ -1583,11 +1615,13 @@ impl TcpCb {
     /// of [2].
     fn mem_raise(&self, allocated: usize, size: usize, kind: MemKind) -> bool {
         if allocated <= mem::limit(0) {
-            mem::leave_pressure();
+            if let Some(ms) = mem::leave_pressure() {
+                self.net_add(LINUX_MIB_TCPMEMORYPRESSURESCHRONO, ms);
+            }
             return true;
         }
-        if allocated > mem::limit(1) {
-            mem::enter_pressure();
+        if allocated > mem::limit(1) && mem::enter_pressure() {
+            self.net_stat(LINUX_MIB_TCPMEMORYPRESSURES);
         }
         if allocated <= mem::limit(2) {
             let floor = match kind {
