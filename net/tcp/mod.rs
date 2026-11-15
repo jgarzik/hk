@@ -1161,49 +1161,52 @@ impl TcpSock {
     fn listen_stop(&self, mut q: Accept) {
         while q.syn.pop_front().is_some() {}
         while let Some(c) = q.ready.pop_front() {
-            c.step(|g, out| {
+            // Unaccepted, so never owned (Linux WARN_ON
+            // sock_owned_by_user): its slock (bh_lock_sock(child))
+            let mut b = c.lock.bh_lock();
+            if let Some(g) = c.bh_get(&mut b) {
+                let mut out = Out::default();
                 g.parent = None;
                 g.cb.orphan = true;
-                g.cb.disconnect(out);
-            });
+                g.cb.disconnect(&mut out);
+                c.finish(g, &mut out);
+            }
         }
     }
 
     /// Linux tcp_disconnect (connect(AF_UNSPEC)): abort, stop listening,
     /// back to an unconnected socket keeping a bind()-fixed address/port
     fn disconnect(&self) {
-        let q = self.step(|g, out| self.disconnect_locked(g, out));
-        self.disconnect_done(q);
+        self.step(|g, out| self.disconnect_locked(g, out));
+        self.disconnect_done();
     }
 
-    /// tcp_disconnect's part under the socket lock: stop listening,
-    /// abort, clear the shutdown bits and the connecting state, report
-    /// the error (ECONNRESET for a connection; the report comes anyway);
-    /// the listener's queue, if any, to stop after the unlock
-    fn disconnect_locked(&self, g: &mut Inner, out: &mut Out) -> Option<Accept> {
-        let q = if g.cb.state == TcpState::Listen {
+    /// tcp_disconnect's part under the socket lock: stop listening (its
+    /// unaccepted children aborted as the owner, Linux
+    /// inet_csk_listen_stop under lock_sock), abort, clear the shutdown
+    /// bits and the connecting state, report the error (ECONNRESET for a
+    /// connection; the report comes anyway)
+    fn disconnect_locked(&self, g: &mut Inner, out: &mut Out) {
+        if g.cb.state == TcpState::Listen {
             self.sk.set_flag(sf::ACCEPTCONN, false);
             self.sk
                 .net
                 .tcp
                 .listen_del(self.inet.get().sport, &self.arc());
-            self.queue.lock().take()
-        } else {
-            None
-        };
+            let q = self.queue.lock().take();
+            if let Some(q) = q {
+                self.listen_stop(q);
+            }
+        }
         g.cb.disconnect(out);
         out.shut = 0;
         self.sk.clear_shutdown();
         g.connecting = false;
-        q
     }
 
     /// tcp_disconnect's rest, after the unlock: the listener's queue
     /// and the connection's addresses
-    fn disconnect_done(&self, q: Option<Accept>) {
-        if let Some(q) = q {
-            self.listen_stop(q);
-        }
+    fn disconnect_done(&self) {
         dev::netif_rx_flush_local();
         let mut ad = self.inet.addr.lock();
         ad.daddr = Ipv4Addr::default();
@@ -1855,7 +1858,7 @@ impl ProtoOps for TcpSock {
     /// Last close (Linux tcp_close)
     fn release(&self) {
         let linger0 = self.sk.linger() == Some(0);
-        let q = self.step(|g, out| {
+        self.step(|g, out| {
             // As the owner, as every write of the shutdown bits (Linux
             // __tcp_close under lock_sock)
             self.sk.set_shutdown(SHUTDOWN_MASK);
@@ -1867,17 +1870,19 @@ impl ProtoOps for TcpSock {
                     .tcp
                     .listen_del(self.inet.get().sport, &self.arc());
                 g.cb.set_closed(out);
-                return self.queue.lock().take();
+                // Its children stop as the owner (Linux tcp_close ->
+                // inet_csk_listen_stop under lock_sock, after TCP_CLOSE)
+                let q = self.queue.lock().take();
+                if let Some(q) = q {
+                    self.listen_stop(q);
+                }
+                return;
             }
             g.cb.close(linger0, now_ms(), out);
             if g.cb.state == TcpState::Closed {
                 out.done = true;
             }
-            None
         });
-        if let Some(q) = q {
-            self.listen_stop(q);
-        }
         dev::netif_rx_flush_local();
         self.linger_wait();
     }
@@ -2104,12 +2109,15 @@ impl ProtoOps for TcpSock {
         let (r, q) = self.step(|g, out| match g.cb.state {
             TcpState::Closed => {
                 self.sk.or_shutdown(bits);
-                (Err(KernelError::NotConnected), None)
+                (Err(KernelError::NotConnected), false)
             }
             // Linux: a listener stops listening on SHUT_RD, a SYN_SENT
             // socket goes back to unconnected (disconnect)
-            TcpState::Listen if bits & RCV_SHUTDOWN == 0 => (Ok(()), None),
-            TcpState::Listen | TcpState::SynSent => (Ok(()), Some(self.disconnect_locked(g, out))),
+            TcpState::Listen if bits & RCV_SHUTDOWN == 0 => (Ok(()), false),
+            TcpState::Listen | TcpState::SynSent => {
+                self.disconnect_locked(g, out);
+                (Ok(()), true)
+            }
             _ => {
                 self.sk.or_shutdown(bits);
                 if bits & RCV_SHUTDOWN != 0 {
@@ -2118,12 +2126,13 @@ impl ProtoOps for TcpSock {
                 if bits & SEND_SHUTDOWN != 0 {
                     g.cb.shutdown_wr(now_ms(), out);
                 }
-                (Ok(()), None)
+                (Ok(()), false)
             }
         });
-        match q {
-            Some(q) => self.disconnect_done(q),
-            None => dev::netif_rx_flush_local(),
+        if q {
+            self.disconnect_done();
+        } else {
+            dev::netif_rx_flush_local();
         }
         self.sk.state_change();
         r
