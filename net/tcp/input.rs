@@ -271,9 +271,10 @@ impl TcpCb {
         // Crossed SYNs: the peer's bare SYN-ACK for our SYN completes
         // the handshake (Linux tcp_validate_incoming, since 6.11; a user
         // socket only: not a request, not an orphan)
+        // (Linux also tests sk->sk_socket: an orphan never stays in
+        // SYN_RECEIVED here, close() takes it to FIN_WAIT_1 or CLOSED)
         let cross = self.state == TcpState::SynReceived
             && !self.passive
-            && !self.orphan
             && s.has(flags::ACK)
             && s.seq_len() == 1
             && s.seq.wrapping_add(1) == self.rcv_nxt
@@ -325,7 +326,8 @@ impl TcpCb {
             self.snd_wnd = u32::from(s.wnd) << self.snd_wscale;
             if cross {
                 // Its SYN is old: a duplicate, ACKed at once (Linux
-                // tcp_data_queue out_of_window)
+                // tcp_data_queue: a retransmit, DelayedACKLost)
+                self.net_stat(LINUX_MIB_DELAYEDACKLOST);
                 self.enter_quickack();
                 self.ack_now = true;
             }
