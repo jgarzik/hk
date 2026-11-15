@@ -51,6 +51,14 @@
 //!   (ASYNC_CLOSING_WAIT_NONE) and refuses a baud_base below 9600;
 //!   without it only the user flags and the custom divisor change
 //!   (Linux uart_set_info: EPERM)
+//! - TTY_SERIAL_MOVE: TIOCSSERIAL moves ttyS1 (x86) to another I/O
+//!   address (Linux uart_set_info -> uart_change_port): EBUSY with a
+//!   second open; to 0x3e8, where no UART answers, it succeeds (for
+//!   CAP_SYS_ADMIN) with the tty's I/O failing (write, TCGETS EIO:
+//!   TTY_IO_ERROR) and /proc/ioports' serial range moved; to 0x3f8,
+//!   ttyS0's registers, EBUSY and the port stays; back at 0x2f8 the
+//!   port is up but I/O still fails until the tty is closed and
+//!   reopened
 
 use crate::harness::{check, fail_num, pass, report_r};
 use crate::helpers::{host_mode, print, println, skip};
@@ -112,6 +120,7 @@ pub fn run_tests() {
     test_sigio_out();
     test_last_close();
     test_serial_info();
+    test_serial_move();
     test_hangup();
     test_hangup_exit();
     test_ctty_proc();
@@ -532,6 +541,97 @@ fn test_serial_info() {
         .and_then(|()| check(b"slow baud", s2 == EINVAL, s2))
         .and_then(|()| check(b"unprivileged", child == 0, child))
         .and_then(|()| check(b"restore", s3 == 0 && back == orig, s3));
+    report_r(NAME, r);
+}
+
+const EBUSY: i64 = -16;
+
+/// /proc/ioports has `line` (at any depth)
+fn ioports_has(line: &[u8]) -> bool {
+    let mut buf = [0u8; 4096];
+    let n = crate::helpers::read_file(b"/proc/ioports\0", &mut buf).max(0) as usize;
+    buf[..n].split(|&c| c == b'\n').any(|l| {
+        let i = l.iter().take_while(|&&c| c == b' ').count();
+        &l[i..] == line
+    })
+}
+
+/// ttyS1's port moved with TIOCSSERIAL: a failed result, else the
+/// errno of each step
+fn test_serial_move() {
+    const NAME: &[u8] = b"TTY_SERIAL_MOVE";
+    if cfg!(target_arch = "aarch64") {
+        return skip(NAME, b"no I/O ports");
+    }
+    let path = b"/dev/ttyS1\0";
+    let flags = O_RDWR | O_NOCTTY | O_NONBLOCK;
+    let fd = sys_open(path.as_ptr(), flags, 0);
+    if fd < 0 {
+        return report(NAME, false, fd);
+    }
+    let fd = fd as i32;
+    let mut orig = [0u8; SS_SIZE];
+    let g = sys_ioctl(fd, TIOCGSERIAL, orig.as_mut_ptr() as u64);
+    let at = |port: u32| {
+        let mut w = orig;
+        ss_set(&mut w, SS_PORT, port);
+        w
+    };
+    let port_now = || {
+        let mut ss = [0u8; SS_SIZE];
+        sys_ioctl(fd, TIOCGSERIAL, ss.as_mut_ptr() as u64);
+        i64::from(ss_get(&ss, SS_PORT))
+    };
+    let mut t = [0u8; 64];
+    let x = b"x";
+    // A second open: only the sole user may move it
+    let fd2 = sys_open(path.as_ptr(), flags, 0);
+    let w = at(0x3e8);
+    let shared = sys_ioctl(fd, TIOCSSERIAL, w.as_ptr() as u64);
+    if fd2 >= 0 {
+        sys_close(fd2 as u64);
+    }
+    // No UART at 0x3e8
+    let nouart = sys_ioctl(fd, TIOCSSERIAL, w.as_ptr() as u64);
+    let p1 = port_now();
+    let wr1 = sys_write(fd as u64, x.as_ptr(), 1);
+    let tc1 = sys_ioctl(fd, TCGETS, t.as_mut_ptr() as u64);
+    let moved = ioports_has(b"03e8-03ef : serial") && !ioports_has(b"02f8-02ff : serial");
+    // ttyS0's registers
+    let w = at(0x3f8);
+    let taken = sys_ioctl(fd, TIOCSSERIAL, w.as_ptr() as u64);
+    let p2 = port_now();
+    // Home again: up, the tty's I/O error stays
+    let back = sys_ioctl(fd, TIOCSSERIAL, orig.as_ptr() as u64);
+    let wr2 = sys_write(fd as u64, x.as_ptr(), 1);
+    let home = ioports_has(b"02f8-02ff : serial") && !ioports_has(b"03e8-03ef : serial");
+    sys_close(fd as u64);
+    let fd = sys_open(path.as_ptr(), flags, 0);
+    let (wr3, tc3) = if fd >= 0 {
+        let r = (
+            sys_write(fd as u64, x.as_ptr(), 1),
+            sys_ioctl(fd as i32, TCGETS, t.as_mut_ptr() as u64),
+        );
+        sys_close(fd as u64);
+        r
+    } else {
+        (fd, fd)
+    };
+    let r = check(b"tiocgserial", g == 0, g)
+        .and_then(|()| check(b"second open", fd2 >= 0, fd2))
+        .and_then(|()| check(b"shared", shared == EBUSY, shared))
+        .and_then(|()| check(b"no uart", nouart == 0, nouart))
+        .and_then(|()| check(b"port 3e8", p1 == 0x3e8, p1))
+        .and_then(|()| check(b"write eio", wr1 == EIO, wr1))
+        .and_then(|()| check(b"tcgets eio", tc1 == EIO, tc1))
+        .and_then(|()| check(b"ioports moved", moved, 0))
+        .and_then(|()| check(b"taken", taken == EBUSY, taken))
+        .and_then(|()| check(b"stays", p2 == 0x3e8, p2))
+        .and_then(|()| check(b"back", back == 0, back))
+        .and_then(|()| check(b"still eio", wr2 == EIO, wr2))
+        .and_then(|()| check(b"ioports home", home, 0))
+        .and_then(|()| check(b"reopen write", wr3 == 1, wr3))
+        .and_then(|()| check(b"reopen tcgets", tc3 == 0, tc3));
     report_r(NAME, r);
 }
 

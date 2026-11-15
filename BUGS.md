@@ -433,7 +433,9 @@ glibc's helper thread), and hk has no such path.
 ports only: no PCI host bridge windows (Linux reads the root bus's
 from ACPI _CRS, which needs AML), PCI BARs, ACPI register blocks,
 PNP devices or vga+. There is no iomem tree (request_mem_region) and
-no /proc/iomem (System RAM, Kernel code, reserved, BARs).
+no /proc/iomem (System RAM, Kernel code, reserved, BARs), so
+TIOCSSERIAL refuses (EINVAL) a new io_type, iomem_base, regshift or
+hub6, where Linux moves the port (uart_change_port).
 
 ## sysfs gaps
 
@@ -494,7 +496,9 @@ no /proc/iomem (System RAM, Kernel code, reserved, BARs).
   PARMRK and parity/break input handling, CRTSCTS (no modem
   control: IXOFF throttles by STOP/START only).
 - **Serial ports:** ttyS1 is registered without probing COM2; only
-  COM1 (and the PL011) take input.
+  COM1 (and the PL011) take input. The PL011 has no startup or
+  shutdown (Linux pl011_startup/pl011_shutdown): its interrupts stay
+  on while the port is down.
 - **No virtual terminals:** the framebuffer and VGA consoles are not
   ttys (Linux: fbcon/vgacon draw VTs, tty0..tty63, fed by the
   keyboard), so /dev/console is always a serial tty. With a screen

@@ -168,16 +168,31 @@ pub trait TtyDriver: Send + Sync {
     /// Drop the queued bytes (Linux flush_buffer)
     fn flush_buffer(&self) {}
 
-    /// A hangup with no /dev/console file open (Linux uart_hangup):
-    /// queued output is dropped and the transmitter stops
-    fn hangup(&self) {}
+    /// Bring the port up at an open of a port that is not (Linux
+    /// tty_port_operations.activate, uart_port_activate), under the
+    /// tty's `port`: true if up; false if not but the open goes on, the
+    /// tty's I/O failing (Linux's 1: a port of unknown type, or one
+    /// that did not start for CAP_SYS_ADMIN, `admin`); else the error
+    /// the open fails with
+    fn activate(&self, admin: bool) -> Result<bool, KernelError> {
+        let _ = admin;
+        Ok(true)
+    }
 
-    /// The tty's last close (Linux tty_port_shutdown): unless the port
-    /// is a console (port->console), output stops and its queue is
-    /// freed (uart_shutdown); either way the tty's flow control state
-    /// goes with the tty
-    fn shutdown(&self, console: bool) {
-        let _ = console;
+    /// A hangup with no /dev/console file open (Linux uart_hangup,
+    /// uart_shutdown), under the tty's `port`: queued output is dropped
+    /// and its buffer freed; `up`: the port was up, and now goes down
+    fn hangup(&self, up: bool) {
+        let _ = up;
+    }
+
+    /// The tty's last close (Linux tty_port_shutdown), under the tty's
+    /// `port`: `down`, the port was up and is not a console
+    /// (port->console), so it goes down and its output buffer is freed
+    /// (uart_tty_port_shutdown); either way the tty's flow control
+    /// state goes with the tty
+    fn shutdown(&self, down: bool) {
+        let _ = down;
     }
 
     /// The console write (Linux console->write): bytes straight to the
@@ -196,18 +211,23 @@ pub trait TtyDriver: Send + Sync {
     /// `port`; `users`: the port's opens (0: hung up, not active)
     fn set_serial(
         &self,
+        tty: &Tty,
         port: &mut TtyPort,
         ss: &SerialStruct,
         users: usize,
     ) -> Result<(), KernelError> {
-        let _ = (port, ss, users);
+        let _ = (tty, port, ss, users);
         Err(KernelError::NotTty)
     }
 }
 
-/// A port's close timing (Linux struct tty_port's close_delay and
-/// closing_wait, in ticks), set by TIOCSSERIAL
+/// A port's state (Linux struct tty_port: close_delay and
+/// closing_wait in ticks, set by TIOCSSERIAL; the initialized flag)
 pub struct TtyPort {
+    /// The port is up: from the open that activated it to the close,
+    /// hangup or port move that took it down (Linux
+    /// TTY_PORT_INITIALIZED)
+    pub initialized: bool,
     /// Delay after a close with an open waiting for carrier (Linux
     /// tty_port_close_end; hk has no blocked opens, so it is only kept)
     pub close_delay: u32,
@@ -221,6 +241,7 @@ impl TtyPort {
     /// Linux tty_port_init: close_delay 0.5 s, closing_wait 30 s
     const fn new() -> Self {
         Self {
+            initialized: false,
             close_delay: (50 * 1000 / 100 / crate::task::percpu::TICK_MS) as u32,
             closing_wait: (3000 * 1000 / 100 / crate::task::percpu::TICK_MS) as u32,
         }
@@ -336,7 +357,12 @@ pub struct Tty {
     files: crate::sync::Mutex<TtyFiles>,
     /// A hangup is under way: readers stop (Linux TTY_HUPPING)
     hupping: AtomicBool,
-    /// Close timing (Linux tty_port, under port->mutex)
+    /// The port is down or failed to come up: read, write and the
+    /// hardware ioctls fail with EIO (Linux TTY_IO_ERROR); an open of
+    /// a port that is down clears it, as does the last release (Linux
+    /// frees the tty_struct)
+    io_error: AtomicBool,
+    /// Port state (Linux tty_port, under port->mutex)
     port: crate::sync::Mutex<TtyPort>,
 }
 
@@ -369,8 +395,19 @@ impl Tty {
             wakeup_due: AtomicBool::new(false),
             files: crate::sync::Mutex::new(TtyFiles::new()),
             hupping: AtomicBool::new(false),
+            io_error: AtomicBool::new(false),
             port: crate::sync::Mutex::new(TtyPort::new()),
         }
+    }
+
+    /// Mark the tty's I/O failing or not (Linux TTY_IO_ERROR)
+    pub fn set_io_error(&self, on: bool) {
+        self.io_error.store(on, Ordering::Release);
+    }
+
+    /// The tty's I/O fails (Linux tty_io_error)
+    pub fn io_error(&self) -> bool {
+        self.io_error.load(Ordering::Acquire)
     }
 
     /// Device name (/dev node)
@@ -689,15 +726,46 @@ impl Tty {
 
     /// A file opened the tty (Linux tty_open: tty_reopen's tty->count,
     /// tty_add_file, the port's open, TTY_HUPPED cleared, under
-    /// tty_lock); then it may become the controlling tty
-    fn opened(&self, r: Arc<Redirect>, file: &File, ctty: bool) {
+    /// tty_lock); then it may become the controlling tty. A failed
+    /// activation fails the open; the failed file's release undoes it
+    /// (Linux tty_open's tty_release)
+    fn opened(&self, r: Arc<Redirect>, file: &File, ctty: bool) -> Result<(), KernelError> {
         let tty = r.tty;
         let mut f = self.files.lock();
         f.list.push(r);
         f.port_count += 1;
+        self.port_open()?;
         f.hupped = false;
         if ctty && file.get_flags() & O_NOCTTY == 0 {
             jobctrl::open_set_tty(tty, file);
+        }
+        Ok(())
+    }
+
+    /// The port's part of an open (Linux tty_port_open): a port that is
+    /// not up is brought up, the tty's I/O error cleared first (and set
+    /// again if it does not come up); under `files`
+    fn port_open(&self) -> Result<(), KernelError> {
+        let mut port = self.port.lock();
+        if port.initialized {
+            return Ok(());
+        }
+        self.set_io_error(false);
+        let admin = crate::task::capable(crate::task::CAP_SYS_ADMIN);
+        match self.driver.activate(admin) {
+            Ok(true) => {
+                port.initialized = true;
+                Ok(())
+            }
+            // Linux uart_open: tty_port_open's 1 is a successful open
+            Ok(false) => {
+                self.set_io_error(true);
+                Ok(())
+            }
+            Err(e) => {
+                self.set_io_error(true);
+                Err(e)
+            }
         }
     }
 
@@ -720,6 +788,7 @@ impl Tty {
             return;
         }
         f.hupped = false;
+        self.set_io_error(false);
         jobctrl::session_clear_tty(self);
         *self.flow.lock() = Flow {
             stopped: false,
@@ -751,7 +820,15 @@ impl Tty {
             .iter()
             .flatten()
             .any(|t| core::ptr::eq(*t, self));
-        self.driver.shutdown(console);
+        let mut port = self.port.lock();
+        let down = !console && port.initialized;
+        if down {
+            port.initialized = false;
+        }
+        self.driver.shutdown(down);
+        if !console {
+            self.set_io_error(true);
+        }
     }
 
     /// TIOCGSERIAL (Linux tty_tiocgserial)
@@ -766,7 +843,7 @@ impl Tty {
         let f = self.files.lock();
         let _ld = n_tty::ldata(self);
         let mut port = self.port.lock();
-        self.driver.set_serial(&mut port, ss, f.port_count)
+        self.driver.set_serial(self, &mut port, ss, f.port_count)
     }
 
     /// Hang the tty up (Linux __tty_hangup; `exit_session`: its session
@@ -818,7 +895,12 @@ impl Tty {
         if cons {
             f.port_count = f.port_count.saturating_sub(closecount);
         } else {
-            self.driver.hangup();
+            // Linux uart_hangup -> uart_shutdown(tty), tty_port_hangup
+            self.set_io_error(true);
+            let mut port = self.port.lock();
+            let up = core::mem::replace(&mut port.initialized, false);
+            self.driver.hangup(up);
+            drop(port);
             f.port_count = 0;
         }
         f.hupped = true;
@@ -865,6 +947,10 @@ impl CharDevice for Tty {
         if tty_hung_up_p(file) {
             return Ok(0);
         }
+        // Linux tty_read
+        if self.io_error() {
+            return Err(KernelError::Io);
+        }
         jobctrl::check_change(self, crate::signal::SIGTTIN)?;
         n_tty::read(self, file, to)
     }
@@ -873,7 +959,8 @@ impl CharDevice for Tty {
     /// TOSTOP a background writer gets SIGTTOU (Linux n_tty_write); a
     /// hung up file EIO (Linux hung_up_tty_write)
     fn write(&self, file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
-        if tty_hung_up_p(file) {
+        // Linux hung_up_tty_write, file_tty_write
+        if tty_hung_up_p(file) || self.io_error() {
             return Err(KernelError::Io);
         }
         let _writer = self.lock_write(file)?;
@@ -983,7 +1070,8 @@ impl Redirect {
     /// Open `tty` through `file`: point the file at it and list it on
     /// the tty (Linux tty->count, tty_add_file); `ctty`: it may become
     /// the controlling tty; `console`: /dev/console. The release of a
-    /// file whose open failed finds no tty to drop
+    /// file whose open failed before it was pointed at the tty finds no
+    /// tty to drop; one that failed later drops it as any release
     fn open(file: &File, tty: &'static Tty, ctty: bool, console: bool) -> Result<(), KernelError> {
         let r = try_arc(Redirect {
             tty,
@@ -993,8 +1081,7 @@ impl Redirect {
         })?;
         let any: Arc<dyn core::any::Any + Send + Sync> = r.clone();
         file.private.call_once(|| any);
-        tty.opened(r, file, ctty);
-        Ok(())
+        tty.opened(r, file, ctty)
     }
 
     /// The release of a file opened by `open` (Linux tty_release)

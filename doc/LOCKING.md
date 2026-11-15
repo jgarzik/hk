@@ -810,9 +810,16 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     UartPort.xmit; the echo's driver writes take it under Tty.ldata.
     TIOCSSERIAL (Linux uart_set_info_user: termios_rwsem write,
     port->mutex): Tty.files → Tty.ldata → Tty.port (sleeping Mutex,
-    Linux tty_port.mutex) → UartPort.cfg (spin leaf); TIOCGSERIAL
-    Tty.port → UartPort.cfg; the last close reads closing_wait under
-    Tty.files → Tty.port (released before the drain).
+    Linux tty_port.mutex) → UartPort.cfg (spin leaf), UartPort.xmit
+    (the port's shutdown and startup), IOPORT (a port move's
+    release_port/request_port, UartPort.cfg released: claiming
+    allocates); TIOCGSERIAL Tty.port → UartPort.cfg. An open
+    activates the port (Linux tty_port_open: uart_startup under
+    port->mutex) under Tty.files → Tty.port → UartPort.xmit, the
+    driver's startup after it is released; a hangup and the last
+    close take it down under Tty.files → Tty.port (the close after
+    its drain, closing_wait read under Tty.port released before it)
+    → UartPort.xmit, the driver's shutdown again outside it.
     Tty.flow (spin, thread context) → UartPort.xmit
     (TCXONC, and IXON's STOP/START from input and IXON cleared by a
     termios change, both under Tty.ldata: Tty.ldata → Tty.flow;
@@ -2832,6 +2839,12 @@ shutdown callback with the lock dropped, so callbacks (which may poll
 hardware or wait on driver commands, such as an xHCI's) never run under
 it. `PciDev.driver_override` is a sleeping
 `sync::Mutex` leaf (Linux device_lock).
+I/O port resources (base/resource.rs): `IOPORT` (spin RwLock, Linux
+resource_lock), the /proc/ioports tree: thread context only, a leaf;
+a claimed range is allocated before it is taken and a released one
+freed after, so the tree is only relinked under it. Taken by a
+driver's probe and remove (`Device.lock` → IOPORT) and by a serial
+port's move (`Tty.port` → IOPORT, 3.9).
 Net devices: `NetNamespace::register_device` links the device on the
 namespace's `devices` RCU list (its leaf writer lock released) before
 creating the device's sysfs entries (under RTNL for driver
@@ -4314,7 +4327,8 @@ Each `Tty` struct contains:
 | `buf_lock` | `sync::Mutex<()>` (sleeping) | Feeding `flip` to N_TTY vs input flushes (Linux `tty_bufhead.lock`); outside `ldata` |
 | `read_lock` | `sync::Mutex<()>` (sleeping) | One N_TTY reader at a time, held across the whole read and its sleeps (Linux `atomic_read_lock`): a canonical line copied out in pieces goes to one reader; outermost tty lock, taken before `ldata` |
 | `write_lock` | `sync::Mutex<()>` (sleeping) | One writer at a time, held across the whole write(2) (Linux `atomic_write_lock`, tty_write_lock): another writer's bytes never land inside it; outermost on the write side, taken before the TOSTOP check (`termios`, TASKLIST → `ctrl`, SIGTTOU) and the driver writes; O_NONBLOCK try-locks (EAGAIN), else interruptible. Thread context only: printk's console write and N_TTY echo do not take it (as Linux). Not nested with `read_lock` or `buf_lock` |
-| `port` | `sync::Mutex<TtyPort>` (sleeping) | The port's close_delay and closing_wait (Linux `tty_port` under `port->mutex`), set by TIOCSSERIAL under `files` → `ldata` → `port` → `UartPort.cfg`, read by TIOCGSERIAL and by the port's last close (under `files`, released before its drain) |
+| `port` | `sync::Mutex<TtyPort>` (sleeping) | The port's close_delay, closing_wait and initialized flag (Linux `tty_port` under `port->mutex`). TIOCSSERIAL sets them under `files` → `ldata` → `port` → `UartPort.cfg`, and moves the port under it (shutdown, `IOPORT`, startup); an open brings a port that is down up under `files` → `port`, a hangup or the last close takes it down there; TIOCGSERIAL reads it |
+| `io_error` | `AtomicBool` | TTY_IO_ERROR: set and cleared under `port` (an open, a shutdown, TIOCSSERIAL) and, cleared, by the tty's last release under `files`; read with no lock by read, write and ioctl |
 | `output_lock` | `sync::Mutex<()>` (sleeping) | N_TTY output against its echo (Linux `n_tty_data.output_lock`): a write checks the driver's room and writes a block, or a CR NL pair (ONLCR) whole, under it (Linux process_output_block, process_output -> do_output_char), and writes non-OPOST output under it; echo is written to the driver under it (`ldata` → `output_lock`, Linux process_echoes), so no echo lands between a room check and its write. Order: `write_lock` → `ldata` → `output_lock` → `UartPort.xmit`; never held across a sleep for room |
 | `files` | `sync::Mutex<TtyFiles>` (sleeping) | Open files (Linux `tty->count` and `tty_files` under `tty_lock`: every open of the tty, /dev/tty and /dev/console included, each its `Redirect`), the port's opens (Linux `port->count`: a hangup takes the hung files' away) and TTY_HUPPED. Held across an open's listing and controlling-tty setup (→ CTTY_LOCK, Linux tty_open under tty_lock), across a release and across a hangup. The port's last open's release, under it, drops TCOOFF-stopped output (`flow`, the port lock), waits on `write_wait` for output to drain (up to closing_wait, interruptible; Linux tty_port_close_start under tty_lock), flushes input (`buf_lock` → `ldata`) and shuts the port down (the port lock); the tty's last file's clears the session (CTTY_LOCK → `ctrl`) and resets `flow`. A hangup (Linux __tty_hangup under tty_lock) marks the files hung (each `Redirect.hung`, atomic, read lock-free by the file's operations and by readers' and writers' wait conditions; `Tty.hupping` likewise), takes them off `fasync` (`fasync_helper`: File.f_lock → FASYNC_LOCK; the file's address, recorded by its fasync call, is valid while its `Redirect` is listed, since its release unlists it under `files`), takes the session (CTTY_LOCK → `ctrl`), signals the session leader and foreground group (TASKLIST, signal locks), flushes input and output and resets `ldata` and `throttle`. Outermost tty lock: taken with no tty lock held, never under `read_lock` or `write_lock` |
 | `read_wait` | `WaitQueue` | Readers and pollers waiting for input |

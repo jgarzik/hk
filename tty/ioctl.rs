@@ -126,9 +126,57 @@ fn drain(tty: &Tty) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// A command Linux tty_ioctl and tty_jobctrl_ioctl handle themselves,
+/// not passing it on to the driver (uart_ioctl) and line discipline
+fn tty_own(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        TIOCGWINSZ
+            | TIOCSWINSZ
+            | TIOCEXCL
+            | TIOCNXCL
+            | TIOCGETD
+            | TIOCSETD
+            | TIOCSBRK
+            | TIOCCBRK
+            | TCSBRK
+            | TCSBRKP
+            | TIOCMGET
+            | TIOCMSET
+            | TIOCMBIC
+            | TIOCMBIS
+            | TIOCGSERIAL
+            | TIOCSSERIAL
+            | TIOCSCTTY
+            | TIOCNOTTY
+            | TIOCGPGRP
+            | TIOCSPGRP
+            | TIOCGSID
+    )
+}
+
+/// The driver's part of a break or modem line command (Linux
+/// uart_break_ctl, uart_tiocmget, uart_tiocmset): EIO while the tty's
+/// I/O fails
+fn hw(tty: &Tty) -> Result<(), KernelError> {
+    if tty.io_error() {
+        return Err(KernelError::Io);
+    }
+    Ok(())
+}
+
 /// A tty's ioctl (Linux tty_ioctl, tty_jobctrl_ioctl and
 /// n_tty_ioctl_helper); `arg` is a user pointer for most commands
 pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+    // While the tty's I/O fails, what reaches the driver's ioctl does
+    // too, line discipline commands included (Linux uart_ioctl's
+    // TTY_IO_ERROR check); TCFLSH's input flush comes first
+    if !tty_own(cmd) && tty.io_error() {
+        if cmd == TCFLSH && matches!(arg, 0 | 2) {
+            tty.flush_input();
+        }
+        return Err(KernelError::Io);
+    }
     // A background process may not change the tty (Linux
     // tty_check_change in set_termios, n_tty_ioctl_helper, tty_ioctl)
     if matches!(
@@ -194,9 +242,12 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
             Ok(0)
         }
         // A break (TCSBRK 0, TCSBRKP) is not sent: drain only (tcdrain
-        // is TCSBRK 1)
+        // is TCSBRK 1), then the driver's break (Linux send_break)
         TCSBRK | TCSBRKP => {
             drain(tty)?;
+            if cmd == TCSBRKP || arg == 0 {
+                hw(tty)?;
+            }
             Ok(0)
         }
         TCXONC => tcxonc(tty, arg),
@@ -205,13 +256,20 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
             tty.set_serial(&get::<super::SerialStruct>(arg)?)?;
             Ok(0)
         }
-        TIOCSBRK | TIOCCBRK | TIOCEXCL | TIOCNXCL => Ok(0),
+        TIOCSBRK | TIOCCBRK => hw(tty).map(|()| 0),
+        TIOCEXCL | TIOCNXCL => Ok(0),
         // No modem control: the lines read as asserted, sets are ignored
-        TIOCMGET => put(
-            arg,
-            TIOCM_DTR | TIOCM_RTS | TIOCM_CTS | TIOCM_CAR | TIOCM_DSR,
-        ),
-        TIOCMBIS | TIOCMBIC | TIOCMSET => get::<i32>(arg).map(|_| 0),
+        TIOCMGET => {
+            hw(tty)?;
+            put(
+                arg,
+                TIOCM_DTR | TIOCM_RTS | TIOCM_CTS | TIOCM_CAR | TIOCM_DSR,
+            )
+        }
+        TIOCMBIS | TIOCMBIC | TIOCMSET => {
+            get::<i32>(arg)?;
+            hw(tty).map(|()| 0)
+        }
         // Soft carrier is CLOCAL (Linux tty_change_softcar)
         TIOCGSOFTCAR => put(arg, i32::from(tty.get_termios().c_cflag & CLOCAL != 0)),
         TIOCSSOFTCAR => {
