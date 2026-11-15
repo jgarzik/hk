@@ -958,7 +958,10 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move
   onto `util/ida.rs` (or an IDR), as sd, virtio-blk, virtio and
-  ns/inum already do.
+  ns/inum already do. `util/ida.rs` is one contiguous bitmap grown a
+  word at a time (Linux ida: an xarray of 1 KiB chunks), so a large
+  one (UNNAMED_DEV_IDA, up to 2^20 ids) copies itself under its lock
+  every 64 ids and needs one large GFP_ATOMIC block.
 - **procfs** (H): a file is generated whole (no seq_file records): an
   open file's reads continuing one another see one generation, where
   Linux generates record by record, so a long file's later chunks are

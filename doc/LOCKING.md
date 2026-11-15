@@ -2716,13 +2716,15 @@ reclaim never runs in atomic context (`may_direct_reclaim`), so an
 allocation under a d_lock cannot re-enter it.
 
 **Superblock lists** (`fs/superblock.rs`; Linux fs/super.c,
-fs/filesystems.c): `SB_LOCK` (spin Mutex leaf, thread context; Linux
-sb_lock) guards `super_blocks` (`SuperBlock.s_list`) and each type's
-`FileSystemType.fs_supers` (`SuperBlock.s_instances`, a `LockedBy`
-cell of the lock's data). Both are `util::list::WeakList`s: a `Weak`
-per superblock, linked by `SuperBlock::new` (or `sget`) and unlinked
-by its last passive put (`Drop for SuperBlock`, Linux put_super), so
-nothing allocates under the lock. A superblock has two counts, as in
+fs/filesystems.c): `SB_LOCK` (spin Mutex, thread context; Linux
+sb_lock; under it only what `sget`'s test and set take, below, and
+the SB_DEAD wakeup's `var_waitqueue` lock) guards `super_blocks`
+(`SuperBlock.s_list`) and each type's `FileSystemType.fs_supers`
+(`SuperBlock.s_instances`, a `LockedBy` cell of the lock's data). Both
+are `util::list::WeakList`s: a `Weak` per superblock, linked by `sget`
+and unlinked by its last passive put (`Drop for SuperBlock`, Linux
+put_super), so the lists allocate nothing under the lock (only a new
+superblock's anonymous device number may, GFP_ATOMIC, below). A superblock has two counts, as in
 Linux: active references (`SbActive`, `SuperBlock.s_active`, Linux
 s_active; never raised from zero) and passive ones (the `Arc`, Linux
 s_passive). Its life's flags in `s_flags` (Linux SB_BORN: set when its
@@ -2777,7 +2779,7 @@ dropped. No dentry's last reference is dropped under a d_lock.
 | `KNode.iattr` | spin Mutex, leaf (Linux kernfs_iattr_rwsem) | written by chmod/chown/utimes under the inode's i_rwsem; read (copied out) when lookup builds an inode, under the parent's i_rwsem |
 | `AttrNode.ops`, `BinNode.ops` | spin RwLock, leaf | read (clone) under an active reference by show()/store(); cleared by `KNode::remove` after the drain, with no lock held, the operations dropped after it is released (a removed node kept by a dentry or open file pins nothing) |
 | `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks, and across a read's copy to the caller (may fault: -> mmap_lock; no active reference held then, Linux seq_read_iter under m->lock); a write copies its data in before taking it; under f_pos_lock for read/write |
-| `SB_LOCK` (sget) | spin Mutex (under it only `SuperBlock.private` read by a test, and the SB_DEAD wakeup) | a network namespace's sysfs superblock is found in `SYSFS_TYPE.fs_supers` by `sget` (Linux kernfs_get_tree), its test reading `SuperBlock.private` under the lock; the match is then taken by `grab_super` with the lock released |
+| `SB_LOCK` (sget) | spin Mutex (under it only `SuperBlock.private` read by a test or written by a set, `UNNAMED_DEV_IDA` (IrqSpinlock leaf, its bitmap grown GFP_ATOMIC), and the SB_DEAD wakeup's `var_waitqueue` lock) | a network namespace's sysfs superblock is found in `SYSFS_TYPE.fs_supers` by `sget` (Linux kernfs_get_tree), its test reading `SuperBlock.private` under the lock; the match is then taken by `grab_super` with the lock released |
 
 Device model (base/): `Device.lock` (sync::Mutex, Linux device_lock)
 guards the device's "dead" flag, set first by `del` (a dead device is
