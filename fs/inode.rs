@@ -624,7 +624,7 @@ pub struct Inode {
     pub(crate) i_sequence: crate::task::futex::KeySeq,
     /// On its superblock's `s_inodes` (Linux i_sb_list), from
     /// [`Inode::alloc`] to its eviction
-    i_sb_list: list::Link,
+    pub(super) i_sb_list: list::Link,
 }
 
 crate::adapter!(pub SbInodeA, Inode, i_sb_list);

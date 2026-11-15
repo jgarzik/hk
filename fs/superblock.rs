@@ -624,6 +624,11 @@ pub fn generic_shutdown_super(sb: &SuperBlock, g: SbUmount<'_>) {
         let _ = super::fs_writeback::writeback_sb(sb);
         super::inode::sb_list_drain(&sb.s_inodes);
         sb.s_op.put_super(sb);
+    } else {
+        // A fill that failed before its root may have made inodes that
+        // outlive it: unlinked all the same, so their eviction never
+        // reaches this superblock's list once its memory goes
+        super::inode::sb_list_drain(&sb.s_inodes);
     }
     sb.super_wake(SB_DYING);
     drop(g);
@@ -1441,6 +1446,40 @@ mod tests {
         fs_supers: FsSupers::new(WeakList::new()),
     };
 
+    /// An inode a failing fill made and kept, and a passive reference
+    /// to its superblock (`T3`)
+    static T3_KEPT: std::sync::Mutex<Option<(Arc<Inode>, Arc<SuperBlock>)>> =
+        std::sync::Mutex::new(None);
+
+    /// A fill that makes an inode, keeps it, and fails before setting
+    /// a root
+    fn t3_mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
+        get_tree_nodev(fc, &NULL_SUPER_OPS, |sb| {
+            let inode = Inode::alloc(Inode::new(
+                2,
+                InodeMode::regular(0o644),
+                0,
+                0,
+                0,
+                crate::time::TIMEKEEPER.current_time(),
+                Arc::downgrade(sb),
+                &crate::fs::inode::NULL_INODE_OPS,
+            ))?;
+            *T3_KEPT.lock().unwrap() = Some((inode, Arc::clone(sb)));
+            Err(KernelError::Io)
+        })
+    }
+
+    static T3: FileSystemType = FileSystemType {
+        name: "sbtest3",
+        fs_flags: 0,
+        mount: t3_mount,
+        kill_sb: kill_anon_super,
+        file_ops: &crate::fs::RAMFS_FILE_OPS,
+        next: FsNext::new(None),
+        fs_supers: FsSupers::new(WeakList::new()),
+    };
+
     fn get(t: &'static FileSystemType) -> Result<SbActive, KernelError> {
         vfs_get_tree(&FsContext::new(t, b"")).map(SbLocked::unlock)
     }
@@ -1473,6 +1512,20 @@ mod tests {
         drop(passive);
         assert!(gone.upgrade().is_none());
         assert_eq!(EVICTS.load(Ordering::Relaxed), 1);
+    }
+
+    /// A fill that fails before its root leaves no inode on the
+    /// superblock's list once shut down (under INODE_SB_LIST_LOCK, not
+    /// by the list's drop with the memory, which an eviction racing it
+    /// would reach): checked while a passive reference keeps the memory
+    #[test]
+    fn failed_fill_unlinks_its_inodes() {
+        assert!(matches!(get(&T3), Err(KernelError::Io)));
+        let (inode, sb) = T3_KEPT.lock().unwrap().take().unwrap();
+        assert!(sb.super_flags(SB_DEAD));
+        assert!(!inode.i_sb_list.is_linked(), "left on s_inodes");
+        drop(sb);
+        drop(inode);
     }
 
     /// `sget` shares a live superblock (Linux grab_super: one more
