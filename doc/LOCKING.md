@@ -2546,9 +2546,9 @@ fat_free_clusters, an unlinked file's from its eviction included) and
 the free count (`FatState.free`, Linux sbi->free_clusters: counted by
 the first statfs, then kept by both). Taken under the inodes'
 `i_rwsem` (write and truncate paths) or with nothing held (eviction);
-the FAT and the zeroing of a new cluster are read and written through
-the device under it (page locks, block I/O); never held with
-`VfatInode.cache` or `VfatInode.d`.
+the FAT is read and written through the device under it (page locks,
+block I/O), a claimed cluster zeroed after it is released; never held
+with `VfatInode.cache` or `VfatInode.d`.
 
 **vfat chain cache** (`fs/vfat/cache.rs`, Linux fs/fat/cache.c):
 `VfatInode.cache` (spin Mutex, Linux cache_lru_lock), a leaf in

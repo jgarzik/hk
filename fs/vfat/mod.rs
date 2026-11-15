@@ -593,6 +593,9 @@ pub struct FatState {
     /// counted by the first statfs, fat_count_free_clusters, then kept
     /// by every allocation and free)
     free: i64,
+    /// The cluster allocated last: the next search starts after it
+    /// (Linux sbi->prev_free, next fit)
+    prev_free: u32,
 }
 
 /// How long names map to bytes (Linux iocharset and utf8)
@@ -1011,37 +1014,74 @@ fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
     // The search and the claim as one (Linux fat_alloc_clusters under
     // lock_fat): no two allocations take one cluster
     let mut fat = sb_data.fat.lock();
-    // Search for free cluster among the data clusters (the BPB's size,
-    // not the device's)
-    for cluster in 2..sb_data.max_cluster {
-        let entry = get_fat_entry(sb_data, cluster)?;
-        if entry == FAT_FREE {
-            // Found free cluster, mark as end-of-chain
-            set_fat_entry(sb_data, cluster, FAT_EOC)?;
-            if fat.free > 0 {
-                fat.free -= 1;
-            }
-            drop(fat);
-
-            // Zeroed on the disk itself, after the device cache's pages
-            // of it are written back and dropped (Linux
-            // clean_bdev_aliases): a file's data never goes through the
-            // device cache, so no stale or dirty copy of an old
-            // directory block may outlive the reuse
-            let off = cluster_to_offset(sb_data, cluster);
-            let len = u64::from(sb_data.cluster_size);
-            filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
-            let mut zeros = crate::util::kmem::try_vec(len as usize, 0u8)?;
-            bdev_rw_bytes(&sb_data.bdev, BioOp::Write, off, &mut zeros)?;
-            // Again: a page a reader cached before the zeros landed
-            // holds the old bytes
-            filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
-
-            return Ok(cluster);
-        }
+    // Next fit among the data clusters (the BPB's size, not the
+    // device's): after the last one taken, then from the start
+    let after = fat.prev_free.max(1) + 1;
+    let found = match fat_scan(sb_data, after, sb_data.max_cluster, |_, e| e == FAT_FREE)? {
+        Some(c) => Some(c),
+        None => fat_scan(sb_data, 2, after.min(sb_data.max_cluster), |_, e| {
+            e == FAT_FREE
+        })?,
+    };
+    let Some(cluster) = found else {
+        return Err(KernelError::NoSpace);
+    };
+    // Marked end-of-chain
+    set_fat_entry(sb_data, cluster, FAT_EOC)?;
+    fat.prev_free = cluster;
+    if fat.free > 0 {
+        fat.free -= 1;
     }
+    drop(fat);
+    if let Err(e) = zero_cluster(sb_data, cluster) {
+        // Claimed and in no chain: given back, not leaked
+        let _ = free_cluster_chain(sb_data, cluster);
+        return Err(e);
+    }
+    Ok(cluster)
+}
 
-    Err(KernelError::NoSpace)
+/// The first cluster in [from, to) whose FAT entry `f` picks, the FAT
+/// read a page at a time (Linux fat_ent_next over its blocks, not an
+/// entry at a time)
+fn fat_scan(
+    sb_data: &VfatSbData,
+    from: u32,
+    to: u32,
+    mut f: impl FnMut(u32, u32) -> bool,
+) -> Result<Option<u32>, KernelError> {
+    const PER: u32 = 1024; // 4-byte entries in 4 KiB
+    let base = sb_data.fat_start_sector * u64::from(sb_data.bytes_per_sector);
+    let mut buf = [0u8; 4096];
+    let mut c = from;
+    while c < to {
+        let n = (PER - c % PER).min(to - c);
+        let bytes = &mut buf[..n as usize * 4];
+        read_bytes(&sb_data.bdev, base + u64::from(c) * 4, bytes)?;
+        for (k, e) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            let v = u32::from_le_bytes(*e) & 0x0FFF_FFFF;
+            if f(c + k as u32, v) {
+                return Ok(Some(c + k as u32));
+            }
+        }
+        c += n;
+    }
+    Ok(None)
+}
+
+/// Zero `cluster` on the disk itself, after the device cache's pages of
+/// it are written back and dropped (Linux clean_bdev_aliases): a file's
+/// data never goes through the device cache, so no stale or dirty copy
+/// of an old directory block may outlive the reuse
+fn zero_cluster(sb_data: &VfatSbData, cluster: u32) -> Result<(), KernelError> {
+    let off = cluster_to_offset(sb_data, cluster);
+    let len = u64::from(sb_data.cluster_size);
+    filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
+    let mut zeros = crate::util::kmem::try_vec(len as usize, 0u8)?;
+    bdev_rw_bytes(&sb_data.bdev, BioOp::Write, off, &mut zeros)?;
+    // Again: a page a reader cached before the zeros landed holds the
+    // old bytes
+    filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)
 }
 
 /// Free a cluster chain starting from start_cluster (Linux
@@ -1072,11 +1112,10 @@ fn free_clusters(sb_data: &VfatSbData) -> Result<u64, KernelError> {
     let mut fat = sb_data.fat.lock();
     if fat.free < 0 {
         let mut n = 0i64;
-        for cluster in 2..sb_data.max_cluster {
-            if get_fat_entry(sb_data, cluster)? == FAT_FREE {
-                n += 1;
-            }
-        }
+        fat_scan(sb_data, 2, sb_data.max_cluster, |_, e| {
+            n += i64::from(e == FAT_FREE);
+            false
+        })?;
         fat.free = n;
     }
     Ok(fat.free as u64)
@@ -1108,8 +1147,9 @@ fn extend_cluster_chain(
         if prev != 0
             && let Err(e) = set_fat_entry(sb_data, prev, cluster)
         {
-            // `cluster` is allocated but not yet linked: free it directly
-            let _ = set_fat_entry(sb_data, cluster, FAT_FREE);
+            // `cluster` is allocated but not yet linked: a chain of its own
+            // (end of chain), freed under the FAT lock with the count
+            let _ = free_cluster_chain(sb_data, cluster);
             return Err(e);
         }
         if *first == 0 {
@@ -2695,7 +2735,10 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         max_cluster: (total_clusters + 2) as u32,
         cluster_size,
         opts,
-        fat: try_arc(crate::sync::Mutex::new(FatState { free: -1 }))?,
+        fat: try_arc(crate::sync::Mutex::new(FatState {
+            free: -1,
+            prev_free: 2,
+        }))?,
     })?;
 
     // The root directory's chain must be sound (Linux fat_read_root ->
