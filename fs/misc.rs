@@ -392,7 +392,9 @@ fn new_mount(
             | KernelError::Busy
             | KernelError::NotFound
             | KernelError::Io
-            | KernelError::OutOfMemory),
+            | KernelError::OutOfMemory
+            // No anonymous device number left (Linux get_anon_bdev)
+            | KernelError::ProcessFileLimit),
         ) => Err(e),
         Err(_) => Err(KernelError::InvalidArgument),
     }
