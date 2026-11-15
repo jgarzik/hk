@@ -88,8 +88,16 @@ Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. /proc/net/raw and
-/proc/net/icmp do not exist.
+IP_TRANSPARENT. /proc/net/raw, /proc/net/icmp and /proc/net/sockstat
+do not exist. No tcp_can_ingest: a segment is not refused for taking
+receive memory past SO_RCVBUF (only the window and tcp_mem limit it).
+MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
+prediction (TCPHPHits, TCPHPAcks; without the fast path every pure
+ACK counts TCPPureAcks, where Linux's fast path skips it), receive
+coalescing and collapse, undo and F-RTO (TCP*Undo, TCPSpuriousRTOs),
+the CA_Loss state (TCPLossFailures), RcvPruned (no tcp_can_ingest),
+SACK/DSACK, TLP, Fast Open, syncookies, MD5/AO, forwarding and
+multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
 NIC removal: e1000 leaves the function's bus mastering and memory

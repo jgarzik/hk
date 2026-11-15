@@ -650,7 +650,6 @@ impl TcpCb {
         // Linux tcp_prune_queue (when anything is held) and
         // tcp_prune_ofo_queue
         let held = self.rcv_bytes != 0 || !self.ooo.is_empty();
-        let mut pruned = false;
         let mut first = true;
         let ok = loop {
             if self.mem_schedule(size, MemKind::Recv) {
@@ -663,13 +662,14 @@ impl TcpCb {
             if !self.ooo.prune_after(seq) {
                 break false;
             }
-            pruned = true;
+            // Each pass that freed some (Linux tcp_prune_ofo_queue)
+            self.net_stat(LINUX_MIB_OFOPRUNED);
         };
-        self.net_stat_if(pruned, LINUX_MIB_OFOPRUNED);
         if ok {
             return true;
         }
-        self.net_stat_if(held, LINUX_MIB_RCVPRUNED);
+        // No RcvPruned: Linux counts it only when the receive buffer
+        // limit (tcp_can_ingest) still fails, a check hk lacks
         self.mem_settle();
         out.wake |= wake::DATA;
         if !in_order {
