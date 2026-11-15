@@ -26,6 +26,7 @@ use crate::harness::{T, fail_num, pass};
 use crate::helpers::{host_mode, loopback_up, msleep, println, read_file, skip};
 use crate::net::sk::*;
 use crate::net::tcp_xfer::{accept, listener, set_timeo, wait_child};
+use crate::ns::pid_path;
 
 const SNMP: &[u8] = b"/proc/net/snmp\0";
 const NETSTAT: &[u8] = b"/proc/net/netstat\0";
@@ -503,31 +504,6 @@ fn netns_udp() {
     t.done();
 }
 
-/// `v` in decimal, in `buf`
-fn dec(buf: &mut [u8; 20], mut v: u64) -> &[u8] {
-    let mut k = buf.len();
-    loop {
-        k -= 1;
-        buf[k] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    &buf[k..]
-}
-
-/// `parts` joined and NUL-terminated in `buf`
-fn join<'a>(buf: &'a mut [u8; 96], parts: &[&[u8]]) -> &'a [u8] {
-    let mut n = 0;
-    for &c in parts.iter().flat_map(|p| p.iter()) {
-        buf[n] = c;
-        n += 1;
-    }
-    buf[n] = 0;
-    &buf[..=n]
-}
-
 /// The number of lines of a /proc/net/dev text (2 header lines, then
 /// one per device)
 fn dev_lines(path: &[u8]) -> i64 {
@@ -559,7 +535,14 @@ fn test_proc_pid_net() {
     }
     const SENT: i64 = 7;
     let pid = sys_fork();
+    if pid < 0 {
+        println(b"PROC_PID_NET:FAIL fork");
+        return;
+    }
     if pid == 0 {
+        // The parent's ends only: a read ends if the parent dies
+        close(ready[0]);
+        close(done[1]);
         let ok = sys_unshare(CLONE_NEWNET) == 0;
         if ok {
             loopback_up();
@@ -575,14 +558,16 @@ fn test_proc_pid_net() {
         sys_read(done[0] as u64, c.as_mut_ptr(), 1);
         sys_exit(0);
     }
+    // The child's ends only: a read ends if the child dies
+    close(ready[1]);
+    close(done[0]);
     let mut b = [0u8; 1];
     sys_read(ready[0] as u64, b.as_mut_ptr(), 1);
     if b[0] == 0 {
         sys_write(done[1] as u64, b.as_ptr(), 1);
         wait_child(pid);
-        for fd in ready.into_iter().chain(done) {
-            close(fd);
-        }
+        close(ready[0]);
+        close(done[1]);
         if host_mode() {
             skip(b"PROC_PID_NET", b"unshare(CLONE_NEWNET) not permitted");
         } else {
@@ -590,15 +575,13 @@ fn test_proc_pid_net() {
         }
         return;
     }
-    let mut d = [0u8; 20];
-    let pid_s = dec(&mut d, pid as u64);
-    let mut p = [0u8; 96];
-    let child = Mib::read(join(&mut p, &[b"/proc/", pid_s, b"/net/snmp"]));
+    let mut p = [0u8; 64];
+    let child = Mib::read(pid_path(&mut p, b"/proc/", pid, b"/net/snmp"));
     // The child is single-threaded: its tid is its pid
-    let thread = Mib::read(join(
-        &mut p,
-        &[b"/proc/", pid_s, b"/task/", pid_s, b"/net/snmp"],
-    ));
+    let mut t1 = [0u8; 64];
+    let task = pid_path(&mut t1, b"/proc/", pid, b"/task/");
+    let task = &task[..task.len() - 1];
+    let thread = Mib::read(pid_path(&mut p, task, pid, b"/net/snmp"));
     let mine = Mib::read(b"/proc/self/net/snmp\0");
     match (child, thread, mine) {
         (Some(c), Some(th), Some(m)) => {
@@ -620,7 +603,7 @@ fn test_proc_pid_net() {
     }
     t.eq(
         b"child dev lines",
-        dev_lines(join(&mut p, &[b"/proc/", pid_s, b"/net/dev"])),
+        dev_lines(pid_path(&mut p, b"/proc/", pid, b"/net/dev")),
         3,
     );
     t.ok(
@@ -630,8 +613,7 @@ fn test_proc_pid_net() {
     );
     sys_write(done[1] as u64, b.as_ptr(), 1);
     wait_child(pid);
-    for fd in ready.into_iter().chain(done) {
-        close(fd);
-    }
+    close(ready[0]);
+    close(done[1]);
     t.done();
 }
