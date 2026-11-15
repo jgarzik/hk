@@ -41,8 +41,13 @@ pub struct Pseudo {
     mnt: spin::Once<MountRef>,
 }
 
+/// A pseudo filesystem's ->show_path (Linux super_operations.show_path)
+type ShowPath = fn(&super::Dentry) -> Option<alloc::vec::Vec<u8>>;
+
 struct PseudoSuperOps {
     magic: u64,
+    /// Its ->show_path, if any
+    show_path: Option<ShowPath>,
 }
 
 impl SuperOps for PseudoSuperOps {
@@ -53,6 +58,10 @@ impl SuperOps for PseudoSuperOps {
         _i_op: &'static dyn super::inode::InodeOps,
     ) -> Result<Arc<Inode>, KernelError> {
         Err(KernelError::NotPermitted)
+    }
+
+    fn show_path(&self, root: &super::Dentry) -> Option<alloc::vec::Vec<u8>> {
+        self.show_path.and_then(|f| f(root))
     }
 
     /// Linux simple_statfs
@@ -83,7 +92,7 @@ impl FileOps for NoOpen {
 static NO_OPEN: NoOpen = NoOpen;
 
 const fn pseudo(name: &'static str, magic: u64, file_ops: &'static dyn FileOps) -> Pseudo {
-    with_d_op(name, magic, file_ops, None)
+    with_d_op(name, magic, file_ops, None, None)
 }
 
 /// One with dentry operations of its own (Linux init_pseudo's dops)
@@ -92,6 +101,7 @@ const fn with_d_op(
     magic: u64,
     file_ops: &'static dyn FileOps,
     d_op: Option<&'static DentryOps>,
+    show_path: Option<ShowPath>,
 ) -> Pseudo {
     Pseudo {
         ty: FileSystemType {
@@ -103,7 +113,7 @@ const fn with_d_op(
             next: crate::fs::superblock::FsNext::new(None),
             fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
         },
-        ops: PseudoSuperOps { magic },
+        ops: PseudoSuperOps { magic, show_path },
         d_op,
         mnt: spin::Once::new(),
     }
@@ -117,6 +127,7 @@ pub static NSFS: Pseudo = with_d_op(
     NSFS_MAGIC,
     &nsfs::NS_FILE_OPS,
     Some(&nsfs::NS_DENTRY_OPS),
+    Some(nsfs::nsfs_show_path),
 );
 pub static BDEV: Pseudo = pseudo("bdev", BDEVFS_MAGIC, &NO_OPEN);
 

@@ -309,6 +309,13 @@ pub fn ns_of_dentry(d: &Dentry) -> Option<NsRef> {
     get_proc_ns(&inode)
 }
 
+/// An nsfs mount's root, as mountinfo shows it: "<type>:[<inum>]"
+/// (Linux nsfs_show_path)
+pub(super) fn nsfs_show_path(root: &Dentry) -> Option<alloc::vec::Vec<u8>> {
+    let ns = ns_of_dentry(root)?;
+    Some(alloc::format!("{}:[{}]", ns.name(), ns.inum()).into_bytes())
+}
+
 /// The mount namespace `d`'s file holds, if it is a mount namespace
 /// file (Linux mnt_ns_from_dentry)
 pub fn mnt_ns_from_dentry(d: &Dentry) -> Option<Arc<MntNamespace>> {

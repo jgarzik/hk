@@ -144,12 +144,12 @@ fn show_mountinfo_of(vis: &Vis<'_>) -> Vec<u8> {
             dev & 0xff
         );
         out.extend_from_slice(head.as_bytes());
-        // nsfs names its root by its namespace (Linux show_path,
-        // nsfs_show_path)
-        let root = match crate::fs::pseudo::nsfs::ns_of_dentry(&m.root) {
-            Some(ns) => alloc::format!("{}:[{}]", ns.name(), ns.inum()).into_bytes(),
-            None => dentry_path(&m.root).unwrap_or_default(),
-        };
+        // The filesystem's own root path if it has one (Linux
+        // show_mountinfo: sb->s_op->show_path), else the dentry's
+        let root =
+            m.sb.s_op
+                .show_path(&m.root)
+                .unwrap_or_else(|| dentry_path(&m.root).unwrap_or_default());
         mangle(&mut out, &root, ESC);
         out.push(b' ');
         mangle(&mut out, &mp, ESC);
