@@ -23,7 +23,7 @@
 
 use hk_syscall::{
     AF_INET, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_RAW, SOCK_STREAM, sys_bind, sys_getsockopt,
-    sys_listen, sys_recvfrom, sys_socket,
+    sys_listen, sys_recvfrom, sys_setsockopt, sys_socket,
 };
 
 use crate::harness::T;
@@ -276,6 +276,10 @@ fn test_simopen_synack() {
     );
     // Ubuntu's 6.8 (CI's reference) carries the 6.11 change too
     t.eq(b"state", tcp_state(a), ESTABLISHED);
+    // Aborted, not closed: an orphan would resend its FIN to the played
+    // peer after its route is gone
+    let linger0 = [1i32, 0];
+    sys_setsockopt(a, SOL_SOCKET, SO_LINGER, linger0.as_ptr().cast(), 8);
     close(a);
     t.done();
 }
