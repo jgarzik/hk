@@ -1,6 +1,6 @@
 # Linux-equivalent virtual terminals for hk: design and plan
 
-Design and plan for doc/ROADMAP.md phase V; its P0 prerequisites are in phases C (group stop, Ctrl-Alt-Del) and Y (tty and console core). Reference: Linux drivers/tty/vt, drivers/video/fbdev/core/fbcon.c, drivers/video/console/vgacon.c, drivers/input, drivers/hid/usbhid, kernel/printk. Linux semantics are binding: no deviations; anything not yet built is a staged missing feature.
+Design and plan for doc/ROADMAP.md phase V; its P0 prerequisites are in phases C (Ctrl-Alt-Del) and Y (tty and console core). Reference: Linux drivers/tty/vt, drivers/video/fbdev/core/fbcon.c, drivers/video/console/vgacon.c, drivers/input, drivers/hid/usbhid, kernel/printk. Linux semantics are binding: no deviations; anything not yet built is a staged missing feature.
 
 ## 0. Constraints
 | # | Topic | Rule |
@@ -120,7 +120,7 @@ UEFI GOP fb (gfxpayload=keep) → BOOT_FRAMEBUFFER → fbcon, ~1920x1080 = 240x6
 QEMU virt: no display by default → dummycon. P9: virtio-gpu 2D (rule 4; resource create, attach backing, set scanout, transfer_to_host, flush; fbcon damage/flush hook like deferred I/O; also x86; seeds DRM for weston). Keyboard: USB HID first (shared with Dell, QEMU usb-kbd), then virtio-input (small; evdev-format events). Linux reference has none (modules) → tests use dummycon + uinput.
 
 ## 12. Phased plan (each item a bisectable gate-passing commit; LOCKING/BUGS same commit)
-P0 Prerequisites (ROADMAP C and Y; with hangup and group stop; highest blast radius)
+P0 Prerequisites (ROADMAP C and Y; with the rest of hangup; highest blast radius)
 - 0a Tty core: TtyDriver ops (install, close, ioctl fall-through, resize, stop, start, init_termios) on both serial drivers; leaked dynamic ttys (flip input moves to per-port work in 0c). Tests: existing tty. LOCKING: flip list.
 - 0b Console core: port register_console (console_cmdline, preferred, CON_CONSDEV ordering, default enable, name+index match, device() -> (tty, index)); console_device → /dev/console; ttyS0 a real console; arm64 of_console_check (stdout-path); per-console kmsg-seq replay (PRINTBUFFER) replacing global `flushed`; /proc/consoles; earlyprintk/earlycon boot consoles from current vgacon/GfxConsole writers. Tests: CONSOLE_PROC, STDIO_CONSOLE_FDS. LOCKING §3.6/§3.9.
 - 0c IRQ-safe deferred work: static Work, atomic PENDING + intrusive list, no alloc; ttyflip becomes per-port flip work on it (rule 7). LOCKING §3.1.
