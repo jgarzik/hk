@@ -437,6 +437,7 @@ fn vfat(d: &Disk) {
     vfat_rename_ino();
     vfat_unlink_open();
     vfat_unlink_reuse();
+    vfat_evict_writeback();
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     verdict(b"BLK_VFAT_UMOUNT", u == 0, u);
     vfat_remount(p1);
@@ -1069,6 +1070,27 @@ fn vfat_mount_alias(p1: &BlkDev) {
     sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     let ok = r == 0 && fd >= 0 && m == 0 && lower == -2 && upper == -2;
     verdict(b"VFAT_MOUNT_ALIAS", ok, lower * 100 + upper);
+}
+
+/// A file written and closed without fsync keeps its data when its
+/// inode is evicted (drop_caches): the eviction writes it back first
+/// (Linux iput_final -> write_inode_now for an inode not kept), and the
+/// next inode reads it from the disk
+fn vfat_evict_writeback() {
+    let f = b"/mnt/vd1/EVICT.BIN\0";
+    let fd = sys_open(f.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644) as i32;
+    let mut pat = [0u8; 8192];
+    for (i, b) in pat.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let w = sys_pwrite64(fd, pat.as_ptr(), pat.len() as u64, 0);
+    sys_close(fd as u64);
+    drop_caches();
+    let mut back = [0u8; 8192];
+    let n = read_file(f, &mut back);
+    sys_unlink(f.as_ptr());
+    let ok = w == pat.len() as i64 && n == pat.len() as i64 && back == pat;
+    verdict(b"VFAT_EVICT_WRITEBACK", ok, if w != 8192 { w } else { n });
 }
 
 /// Two mounts of vda1 share one superblock (Linux get_tree_bdev:

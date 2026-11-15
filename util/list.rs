@@ -919,6 +919,29 @@ impl<A: Adapter> WeakList<A> {
         }
     }
 
+    /// Move every entry `f` picks to the tail of `to`, in order, with
+    /// its weak reference, upgrading none (Linux move_expired_inodes'
+    /// list_move): an entry is a live value while linked (the type's
+    /// contract: its `Drop` unlinks it under the lock held here first)
+    pub fn move_if(&mut self, to: &mut Self, mut f: impl FnMut(&A::Item) -> bool) {
+        let mut cur = self.list.front();
+        while let Some(p) = cur {
+            // SAFETY: `p` is on this list; its successor is read before
+            // `p` may leave it
+            cur = unsafe { self.list.next(p) };
+            // SAFETY: linked, so not yet past its Drop's unlink: a live
+            // value, kept allocated by the list's weak reference
+            if f(unsafe { &*p }) {
+                // SAFETY: on this list, then on no list; each list holds
+                // one into_raw weak reference per entry, which moves
+                unsafe {
+                    self.list.remove(p);
+                    to.list.push_back(p);
+                }
+            }
+        }
+    }
+
     /// Remove the first entry, handing back the list's weak reference
     pub fn pop_front(&mut self) -> Option<Weak<A::Item>> {
         // SAFETY: entries were inserted with into_raw

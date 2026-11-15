@@ -597,8 +597,15 @@ pub struct Inode {
     /// list lock by the pass that takes it off `b_io`
     pub(crate) i_dirty: core::sync::atomic::AtomicBool,
     /// On its device's `b_dirty` or `b_io` (Linux i_io_list, under the
-    /// wb's list_lock)
+    /// wb's list_lock), which hold no reference to it: its `Drop` takes
+    /// it off (Linux evict's inode_io_list_del)
     pub(crate) i_io_list: list::Link,
+    /// Which of the two (`fs_writeback::ON_*`), changed with the link
+    /// under the wb's list_lock
+    pub(crate) i_io_on: core::sync::atomic::AtomicU8,
+    /// The writeback state it was queued on (Linux inode->i_wb), set
+    /// the first time and never changed
+    pub(crate) i_wb: spin::Once<Arc<crate::mm::writeback::BdiWriteback>>,
 
     /// Writers (> 0) or executions denying them (< 0) (Linux
     /// i_writecount; `get_write_access`, `deny_write`)
@@ -759,6 +766,8 @@ impl Inode {
             fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_io_list: list::Link::new(),
+            i_io_on: core::sync::atomic::AtomicU8::new(0),
+            i_wb: spin::Once::new(),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
             i_dio_count: AtomicU32::new(0),
@@ -820,6 +829,8 @@ impl Inode {
             fsnotify: crate::io::inotify::Marks::default(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_io_list: list::Link::new(),
+            i_io_on: core::sync::atomic::AtomicU8::new(0),
+            i_wb: spin::Once::new(),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
             i_dio_count: AtomicU32::new(0),
@@ -1271,10 +1282,19 @@ impl Drop for InodeWrite {
 }
 
 impl Drop for Inode {
-    /// Linux iput_final -> evict: off its superblock's list first (the
-    /// list's contract, `WeakList`), then the filesystem's eviction
+    /// Linux iput_final -> evict: an inode it would not drop (linked and
+    /// hashed, inode_generic_drop) is written back first, as Linux does
+    /// for one it does not keep cached (hk keeps no unused inodes):
+    /// write_inode_now; then off its superblock's and writeback lists
+    /// (the lists' contract, `WeakList`) and the filesystem's eviction.
+    /// An unlinked inode's dirty pages just go (truncate_inode_pages_final).
     fn drop(&mut self) {
+        let keep = self.get_nlink() != 0 && self.i_hash_node.is_linked();
+        if keep && self.i_dirty.load(Ordering::Acquire) {
+            let _ = crate::mm::filemap::write_and_wait(self);
+        }
         sb_list_del(self);
+        super::fs_writeback::inode_io_list_del(self);
         super::icache::evict(self);
     }
 }
