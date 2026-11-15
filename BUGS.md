@@ -425,6 +425,16 @@ mq_notify with SIGEV_THREAD is EINVAL: Linux delivers that notice as
 a message on a netlink socket the caller names (NETLINK_NOTIFY_COOKIE,
 glibc's helper thread), and hk has no such path.
 
+## Resource tree gaps
+
+**Location**: `base/resource.rs`
+
+/proc/ioports holds the x86 legacy ranges, PCI conf1 and the 8250
+ports only: no PCI host bridge windows (Linux reads the root bus's
+from ACPI _CRS, which needs AML), PCI BARs, ACPI register blocks,
+PNP devices or vga+. There is no iomem tree (request_mem_region) and
+no /proc/iomem (System RAM, Kernel code, reserved, BARs).
+
 ## sysfs gaps
 
 **Location**: `fs/kernfs/`, `fs/kernfs/sysfs.rs`, `base/`, `block/genhd.rs`,

@@ -602,6 +602,10 @@ impl crate::base::Bound for Serial8250 {
         if let Some(irq) = irq {
             rx_irq_exit(irq);
         }
+        // Linux serial8250_release_std_resource
+        for d in [&SERIAL_DRIVER_S0, &SERIAL_DRIVER_S1] {
+            crate::base::resource::release_region(u64::from(d.port), 8);
+        }
     }
 }
 
@@ -613,6 +617,17 @@ fn serial8250_probe(
         irq: Mutex::new(None),
         ttys: alloc::vec::Vec::new(),
     })?;
+    // Each port's registers (Linux serial8250_request_std_resource:
+    // request_region(iobase, 8, "serial"))
+    let ports = [&SERIAL_DRIVER_S0, &SERIAL_DRIVER_S1];
+    for (i, d) in ports.iter().enumerate() {
+        if let Err(e) = crate::base::resource::request_region(u64::from(d.port), 8, "serial") {
+            for done in &ports[..i] {
+                crate::base::resource::release_region(u64::from(done.port), 8);
+            }
+            return Err(e);
+        }
+    }
     // Registered at boot already, or again after an unbind (Linux
     // uart_add_one_port's uart_configure_port -> register_console)
     register_console(

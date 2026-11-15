@@ -267,6 +267,7 @@ pub fn run_all_tests() {
     fs::dac::run_tests();
     fs::sync::run_tests();
     proc::sysinfo::run_tests();
+    proc::ioports::run_tests();
     io::gencalls::run_tests();
     process::init_args::run_tests();
     process::init_signals::run_tests();

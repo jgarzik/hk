@@ -9,6 +9,7 @@ pub mod dd;
 pub mod driver;
 pub mod node;
 pub mod platform;
+pub mod resource;
 pub mod uevent;
 
 pub use bus::BusType;

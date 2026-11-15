@@ -4,6 +4,7 @@ pub mod acct;
 pub mod cgroup;
 pub mod cgroup_race;
 pub mod cpu_acct;
+pub mod ioports;
 pub mod kmsg;
 pub mod proc_dcache;
 pub mod proc_hidepid;

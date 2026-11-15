@@ -2493,6 +2493,8 @@ fn procfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     )?;
     root.file(sb, "meminfo", ro, file(gen_meminfo))?;
     root.file(sb, "loadavg", ro, file(crate::task::loadavg::proc_loadavg))?;
+    // Linux ioresources_init: /proc/ioports
+    root.file(sb, "ioports", ro, file(crate::base::resource::proc_ioports))?;
 
     // /proc/net -> self/net (Linux proc_net_init: proc_symlink)
     root.file(
