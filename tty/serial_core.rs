@@ -802,6 +802,41 @@ mod tests {
 
     static NULL_TTY: NullTty = NullTty;
 
+    /// A driver counting its hangups' `up` (taken down) calls
+    struct DownTty(AtomicUsize);
+
+    impl super::super::TtyDriver for DownTty {
+        fn write(&self, _tty: &super::super::Tty, data: &[u8]) -> Result<usize, KernelError> {
+            Ok(data.len())
+        }
+        fn send_xchar(&self, _tty: &super::super::Tty, _ch: u8) {}
+        fn console_write(&self, _data: &[u8]) {}
+        fn hangup(&self, up: bool) {
+            if up {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    static DOWN_TTY: DownTty = DownTty(AtomicUsize::new(0));
+    static REMOVED: super::super::Tty = super::super::Tty::new(
+        "r",
+        crate::fs::chardev::DevId::new(crate::fs::chardev::major::TTYS, 98),
+        &DOWN_TTY,
+    );
+
+    /// A removed port still up (Linux serial_core_remove_one_port:
+    /// uart_shutdown(NULL)) goes down once, the tty's I/O error unset
+    #[test]
+    fn port_remove_takes_down() {
+        REMOVED.port.lock().initialized = true;
+        REMOVED.port_remove();
+        assert!(!REMOVED.port.lock().initialized);
+        assert_eq!(DOWN_TTY.0.load(Ordering::Relaxed), 1);
+        assert!(!REMOVED.io_error());
+        REMOVED.port_remove();
+        assert_eq!(DOWN_TTY.0.load(Ordering::Relaxed), 1);
+    }
     static TTY: super::super::Tty = super::super::Tty::new(
         "t",
         crate::fs::chardev::DevId::new(crate::fs::chardev::major::TTYS, 99),

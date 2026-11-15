@@ -831,6 +831,18 @@ impl Tty {
         }
     }
 
+    /// The port's device goes (Linux serial_core_remove_one_port,
+    /// after the hangup and unregister_console): a port still up, kept
+    /// so by /dev/console files a hangup leaves alone, goes down
+    /// without a tty (uart_shutdown(NULL)): those files' writes take
+    /// nothing from now on, and their I/O error is not set
+    pub fn port_remove(&self) {
+        let mut port = self.port.lock();
+        if core::mem::replace(&mut port.initialized, false) {
+            self.driver.hangup(true);
+        }
+    }
+
     /// TIOCGSERIAL (Linux tty_tiocgserial)
     pub fn get_serial(&self) -> Result<SerialStruct, KernelError> {
         self.driver.get_serial(&self.port.lock())

@@ -658,7 +658,9 @@ impl crate::base::Bound for Serial8250 {
 
     /// Linux serial8250_remove, uart_remove_one_port per port: its tty
     /// device goes, its tty is hung up (tty_port_tty_vhangup), its
-    /// console goes, it releases its registers
+    /// console goes, a port still up (its /dev/console files) goes
+    /// down without a tty, its interrupt freed, then it releases its
+    /// registers
     fn remove(&self) {
         for t in self.ttys.iter().rev() {
             t.del();
@@ -667,6 +669,9 @@ impl crate::base::Bound for Serial8250 {
             tty.hangup(false);
         }
         crate::console::unregister_console(SERIAL_TTY_S0.name());
+        for tty in serial_ttys() {
+            tty.port_remove();
+        }
         // A port of known type releases its registers
         for d in [&SERIAL_DRIVER_S0, &SERIAL_DRIVER_S1] {
             if d.uart.port().1 != PORT_UNKNOWN {

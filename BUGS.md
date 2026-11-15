@@ -486,10 +486,8 @@ hub6, where Linux moves the port (uart_change_port).
   runs only on the console's real input. A pty (phase H) makes it
   testable from the boot tester.
 - **Hangup gaps:** no carrier (DCD) loss hangs a tty up (no modem
-  control). An unbound serial port's tty is hung up, but its
-  /dev/console files (left alone, as Linux) still write to the UART,
-  where Linux's port is detached (uart_port_check). No boot test unbinds the console UART (the test
-  output goes there).
+  control). No boot test unbinds the console UART (the test output
+  goes there).
 - **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
   TIOCEXCL exclusivity, sending a break (TCSBRK 0), packet mode,
   ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT, IUCLC/OLCUC, IMAXBEL,

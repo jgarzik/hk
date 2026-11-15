@@ -822,7 +822,8 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     its drain, closing_wait read under Tty.port released before it)
     → UartPort.xmit, the driver's shutdown again outside it (the
     8250 frees its interrupt, waiting out a running handler, which
-    takes no tty lock but Tty.flip and UartPort.xmit).
+    takes no tty lock but Tty.flip and UartPort.xmit). A port's
+    removal takes a port still up down under Device.lock → Tty.port.
     Tty.flow (spin, thread context) → UartPort.xmit
     (TCXONC, and IXON's STOP/START from input and IXON cleared by a
     termios change, both under Tty.ldata: Tty.ldata → Tty.flow;
