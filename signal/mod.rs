@@ -1205,8 +1205,9 @@ pub fn install_fork_signal(child: &Task, f: ForkSignal, mut delay: ForkDelay) {
         f.signal.set_leader_pid(&mut table, pid);
         let me = crate::task::percpu::current();
         if let Some(ps) = table.view(&me).and_then(|p| p.signal().cloned()) {
-            let parent = ps.ctty.lock();
-            f.signal.ctty.lock().inherit(&parent);
+            // One ctty lock at a time: it is a leaf
+            let tty = ps.ctty.lock().tty();
+            f.signal.ctty.lock().inherit(tty);
         }
     }
     if let Some(mut c) = table.view_mut(child) {
@@ -2925,6 +2926,18 @@ impl Drop for SignalStruct {
 // =============================================================================
 
 // Task.signal field accessors (SignalStruct - shared by thread group)
+
+/// The calling process's signal struct (Linux current->signal); None
+/// for a kernel thread without one
+pub fn current_signal() -> Option<Arc<SignalStruct>> {
+    crate::task::percpu::current().cpu_group().cloned()
+}
+
+/// `f` on the calling process's signal struct, borrowed: no reference
+/// taken (Linux reads current->signal in place)
+pub fn with_current_signal<R>(f: impl FnOnce(&SignalStruct) -> R) -> Option<R> {
+    crate::task::percpu::current().cpu_group().map(|s| f(s))
+}
 
 /// Task `t`'s signal struct (none once it is reaped)
 pub fn get_task_signal_struct(t: &Task) -> Option<Arc<SignalStruct>> {

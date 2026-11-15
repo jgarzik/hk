@@ -18,7 +18,6 @@
 //! references are dropped after the locks.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use super::Tty;
 use crate::fs::File;
@@ -48,10 +47,15 @@ impl Ctty {
         }
     }
 
-    /// A forked process inherits its parent's controlling tty, not the
-    /// old group (Linux copy_process; tty_old_pgrp starts NULL)
-    pub fn inherit(&mut self, parent: &Ctty) {
-        self.tty = parent.tty;
+    /// The controlling tty
+    pub fn tty(&self) -> Option<&'static Tty> {
+        self.tty
+    }
+
+    /// A forked process inherits its parent's controlling tty `tty`,
+    /// not the old group (Linux copy_process; tty_old_pgrp starts NULL)
+    pub fn inherit(&mut self, tty: Option<&'static Tty>) {
+        self.tty = tty;
     }
 }
 
@@ -66,11 +70,6 @@ fn pids(table: &GlobalTaskTable) -> Option<(Arc<Pid>, Arc<Pid>)> {
 /// The caller's session
 fn session() -> Option<Arc<Pid>> {
     pids(&TASKLIST.read()).map(|(_, s)| s)
-}
-
-/// The caller's process's signal struct (None for a kernel thread)
-fn my_signal() -> Option<Arc<SignalStruct>> {
-    crate::task::percpu::current().cpu_group().cloned()
 }
 
 /// The caller leads its session (Linux signal->leader)
@@ -90,7 +89,7 @@ fn owns(tty: &Tty, s: &Pid) -> bool {
 
 /// The caller's controlling tty (Linux get_current_tty)
 pub fn current_tty() -> Option<&'static Tty> {
-    my_signal()?.ctty.lock().tty
+    crate::signal::with_current_signal(|s| s.ctty.lock().tty).flatten()
 }
 
 /// Is `tty` the caller's controlling tty (Linux current->signal->tty
@@ -104,20 +103,9 @@ pub fn proc_clear_tty(s: &SignalStruct) {
     s.ctty.lock().tty = None;
 }
 
-/// `tty` as the static tty it is (every tty is one of `all()`)
-fn static_tty(tty: &Tty) -> Option<&'static Tty> {
-    super::all()
-        .iter()
-        .copied()
-        .find(|t| core::ptr::eq(*t, tty))
-}
-
 /// Make `tty` the caller's controlling tty, with the caller's session
 /// and group on it (Linux __proc_set_tty); CTTY_LOCK held
-fn proc_set_tty(tty: &Tty) {
-    let Some(tty) = static_tty(tty) else {
-        return;
-    };
+fn proc_set_tty(tty: &'static Tty) {
     let table = TASKLIST.read();
     let Some((pg, s)) = pids(&table) else {
         return;
@@ -126,7 +114,7 @@ fn proc_set_tty(tty: &Tty) {
         let mut c = tty.ctrl.lock();
         (c.session.replace(s), c.pgrp.replace(pg))
     };
-    let old_pgrp = my_signal().and_then(|sig| {
+    let old_pgrp = crate::signal::current_signal().and_then(|sig| {
         let mut c = sig.ctty.lock();
         c.tty = Some(tty);
         c.old_pgrp.take()
@@ -139,11 +127,8 @@ fn proc_set_tty(tty: &Tty) {
 /// session_clear_tty: proc_clear_tty of each)
 fn session_clear(s: &Pid) {
     let table = TASKLIST.read();
-    for t in table.iter() {
-        if t.session()
-            .is_some_and(|ts| core::ptr::eq(&raw const **ts, s))
-            && let Some(sig) = t.signal()
-        {
+    for t in table.session(s) {
+        if let Some(sig) = t.signal() {
             proc_clear_tty(sig);
         }
     }
@@ -153,7 +138,7 @@ fn session_clear(s: &Pid) {
 /// session leader that has none, if no session has it and the open can
 /// read it (Linux tty_open_proc_set_tty). /dev/tty and /dev/console
 /// never get here (Linux noctty for them)
-pub fn open_set_tty(tty: &Tty, file: &File) {
+pub fn open_set_tty(tty: &'static Tty, file: &File) {
     if !is_leader() || file.get_flags() & O_ACCMODE == O_WRONLY {
         return;
     }
@@ -165,7 +150,7 @@ pub fn open_set_tty(tty: &Tty, file: &File) {
 
 /// TIOCSCTTY (Linux tiocsctty): `steal` (arg 1) takes it from another
 /// session, with CAP_SYS_ADMIN, whose members then have none
-pub fn tiocsctty(tty: &Tty, file: &File, steal: bool) -> Result<(), KernelError> {
+pub fn tiocsctty(tty: &'static Tty, file: &File, steal: bool) -> Result<(), KernelError> {
     use crate::task::{CAP_SYS_ADMIN, capable};
     let _g = CTTY_LOCK.lock();
     if is_leader() && session().is_some_and(|s| owns(tty, &s)) {
@@ -196,7 +181,7 @@ pub fn tiocnotty(tty: &Tty) -> Result<(), KernelError> {
         return Err(KernelError::NotTty);
     }
     disassociate_ctty(false);
-    if let Some(sig) = my_signal() {
+    if let Some(sig) = crate::signal::current_signal() {
         proc_clear_tty(&sig);
     }
     Ok(())
@@ -225,14 +210,13 @@ pub(super) fn signal_session_leader(
     let Some(s) = session else {
         return;
     };
-    let mut gone = Vec::new();
+    // The leader's old group, dropped once no lock is held (one
+    // session leader: nothing to collect)
+    let mut gone = None;
     let leader = {
         let table = TASKLIST.read();
         let mut leader = false;
-        for t in table.iter() {
-            if !t.session().is_some_and(|ts| Arc::ptr_eq(ts, &s)) {
-                continue;
-            }
+        for t in table.session(&s) {
             let Some(sig) = t.signal() else {
                 continue;
             };
@@ -244,7 +228,7 @@ pub(super) fn signal_session_leader(
             if leads {
                 leader = true;
                 if let Some(pg) = &pgrp {
-                    gone.push(c.old_pgrp.replace(pg.clone()));
+                    gone = c.old_pgrp.replace(pg.clone());
                 }
             }
         }
@@ -271,7 +255,7 @@ pub fn disassociate_ctty(on_exit: bool) {
     if !is_leader() {
         return;
     }
-    let me = my_signal();
+    let me = crate::signal::current_signal();
     match current_tty() {
         Some(tty) if on_exit => tty.hangup(true),
         Some(tty) => {

@@ -691,12 +691,13 @@ impl Tty {
     /// tty_add_file, the port's open, TTY_HUPPED cleared, under
     /// tty_lock); then it may become the controlling tty
     fn opened(&self, r: Arc<Redirect>, file: &File, ctty: bool) {
+        let tty = r.tty;
         let mut f = self.files.lock();
         f.list.push(r);
         f.port_count += 1;
         f.hupped = false;
         if ctty && file.get_flags() & O_NOCTTY == 0 {
-            jobctrl::open_set_tty(self, file);
+            jobctrl::open_set_tty(tty, file);
         }
     }
 
@@ -856,13 +857,6 @@ impl CharDevice for Tty {
     /// tty_fops has tty_poll
     fn can_poll(&self) -> bool {
         true
-    }
-
-    fn open(&self, file: &File) -> Result<(), KernelError> {
-        if file.get_flags() & O_NOCTTY == 0 {
-            jobctrl::open_set_tty(self, file);
-        }
-        Ok(())
     }
 
     /// A background reader gets SIGTTIN (Linux job_control); a hung up

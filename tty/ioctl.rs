@@ -167,7 +167,8 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
         }
         TIOCGSID => put(arg, pid_i32(jobctrl::tiocgsid(tty)?)),
         TIOCSCTTY => {
-            jobctrl::tiocsctty(tty, file, arg == 1)?;
+            // The file's tty (Linux file_tty)
+            jobctrl::tiocsctty(super::Redirect::tty(file)?, file, arg == 1)?;
             Ok(0)
         }
         TIOCNOTTY => {

@@ -77,10 +77,8 @@ WAIT_STOPPED, PTRACE_STOP.
 - IRQ-safe deferred work (static, intrusive, no allocation); each port's
   flip buffer pushed by its own work item.
 - ioremap_wc (x86 PAT WC, arm64 Normal-NC) and bulk IoMem copies.
-- Hangup: __tty_hangup for vhangup, TIOCVHANGUP, session-leader exit,
-  carrier loss and port removal (hung-up file ops: EIO, POLLHUP),
-  SIGHUP/SIGCONT, controlling tty cleared; per-process controlling
-  tty.
+- Hangup by TIOCVHANGUP and carrier loss (vhangup, session-leader
+  exit and port removal hang up already).
 - `-vga std` pinned in run-qemu.sh and linux-boot-tester.sh.
 
 ## 4. H — Debian kernel interfaces

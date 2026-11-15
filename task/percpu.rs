@@ -1064,6 +1064,15 @@ impl GlobalTaskTable {
         pg.pgrp.access(self).iter().map(move |t| view(self, t))
     }
 
+    /// The group leaders in session `s` (Linux do_each_pid_task(s,
+    /// PIDTYPE_SID))
+    pub fn session<'a>(
+        &'a self,
+        s: &'a crate::task::pid::Pid,
+    ) -> impl Iterator<Item = TaskView<'a>> + 'a {
+        s.session.access(self).iter().map(move |t| view(self, t))
+    }
+
     /// The threads of every process in group `pg` (Linux
     /// do_each_pid_thread(pg, PIDTYPE_PGID))
     pub fn pgrp_threads<'a>(

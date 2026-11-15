@@ -767,7 +767,9 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
     KmsgUser.rate (spin leaf)
 
 TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
-    (spin; never takes TASKLIST under it); Tty.ldata (sleeping Mutex,
+    (spin; never takes TASKLIST under it); CTTY_LOCK → TASKLIST (read)
+    → SignalStruct.ctty (spin leaf, one at a time, never with
+    Tty.ctrl); Tty.ldata (sleeping Mutex,
     Linux termios_rwsem's role) → Tty.termios (spin, thread context;
     termios is read under ldata by input processing and swapped under
     it by set_termios, as Linux's termios_rwsem spans both), and →
@@ -4293,6 +4295,7 @@ signal->tty_old_pgrp under siglock) are set and cleared under it alone,
 under TASKLIST (read) when sessions are walked (session_clear_tty, a
 hangup's tty_signal_session_leader), never nested with `Tty.ctrl`; pid
 references taken out of it are dropped after the locks.
+
 `tty::jobctrl::CTTY_LOCK` (spin `Mutex`, thread context; Linux tty_lock
 + siglock in `__proc_set_tty`/`session_clear_tty`) serializes giving and
 taking controlling ttys (open without O_NOCTTY, TIOCSCTTY, TIOCNOTTY, a
