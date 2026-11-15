@@ -445,6 +445,7 @@ fn vfat(d: &Disk) {
     vfat_opts(p1);
     vfat_neg_case(p1);
     vfat_mount_alias(p1);
+    vfat_shared_sb(p1);
     vfat_sync(p1);
     vfat_corrupt_chain(p1);
 }
@@ -1068,6 +1069,39 @@ fn vfat_mount_alias(p1: &BlkDev) {
     sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     let ok = r == 0 && fd >= 0 && m == 0 && lower == -2 && upper == -2;
     verdict(b"VFAT_MOUNT_ALIAS", ok, lower * 100 + upper);
+}
+
+/// Two mounts of vda1 share one superblock (Linux get_tree_bdev:
+/// sget_dev): a file made through one is there through the other at
+/// once, root inodes and st_dev alike; a read-only mount while it is
+/// read-write is EBUSY (Linux: "would change RO state")
+fn vfat_shared_sb(p1: &BlkDev) {
+    const MS_RDONLY: u64 = 1;
+    let mut p = [0u8; 48];
+    let dev = p1.path(&mut p).as_ptr();
+    sys_mkdir(b"/mnt/vd1b ".as_ptr(), 0o755);
+    sys_mkdir(b"/mnt/vd1c ".as_ptr(), 0o755);
+    let opts = b"iocharset=cp437\0".as_ptr() as u64;
+    let fs = b"vfat\0".as_ptr();
+    let a = sys_mount(dev, b"/mnt/vd1\0".as_ptr(), fs, 0, opts);
+    let b = sys_mount(dev, b"/mnt/vd1b\0".as_ptr(), fs, 0, opts);
+    let fd = sys_open(b"/mnt/vd1/SHARED.TXT\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd as u64);
+    let mut st = Stat::default();
+    let seen = sys_stat(b"/mnt/vd1b/SHARED.TXT\0".as_ptr(), &mut st);
+    let (mut ra, mut rb) = (Stat::default(), Stat::default());
+    sys_stat(b"/mnt/vd1\0".as_ptr(), &mut ra);
+    sys_stat(b"/mnt/vd1b\0".as_ptr(), &mut rb);
+    let same = ra.st_ino == rb.st_ino && ra.st_dev == rb.st_dev;
+    let ro = sys_mount(dev, b"/mnt/vd1c\0".as_ptr(), fs, MS_RDONLY, opts);
+    if ro == 0 {
+        sys_umount2(b"/mnt/vd1c\0".as_ptr(), 0);
+    }
+    sys_unlink(b"/mnt/vd1/SHARED.TXT\0".as_ptr());
+    sys_umount2(b"/mnt/vd1b\0".as_ptr(), 0);
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    let ok = a == 0 && b == 0 && fd >= 0 && seen == 0 && same && ro == EBUSY;
+    verdict(b"VFAT_SHARED_SB", ok, if seen != 0 { seen } else { ro });
 }
 
 /// Dirty kB after writing 2 MiB to a new file on vda1 mounted with

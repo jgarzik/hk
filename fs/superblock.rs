@@ -892,10 +892,12 @@ fn lookup_bdev(path: &[u8]) -> Result<Arc<BlockDevice>, KernelError> {
     crate::block::get_blkdev(inode.rdev).ok_or(KernelError::NoDevice)
 }
 
-/// A superblock on the block device `fc.source` names (Linux
-/// get_tree_bdev): the device held open for it (setup_bdev_super:
-/// under the disk's open_mutex, failing for a removed device; a rescan
-/// sees it in use), then `fill`
+/// The superblock on the block device `fc.source` names (Linux
+/// get_tree_bdev): one per device (sget_dev, test_bdev_super), shared
+/// by every mount of it; a mount that would change its read-only state
+/// is EBUSY. A new one holds the device open (setup_bdev_super: under
+/// the disk's open_mutex, failing for a removed device; a rescan sees
+/// it in use), then `fill`
 pub fn get_tree_bdev(
     fc: &FsContext<'_>,
     s_op: &'static dyn SuperOps,
@@ -906,7 +908,16 @@ pub fn get_tree_bdev(
     }
     let bdev = lookup_bdev(fc.source)?;
     let dev = bdev.dev.encode();
-    let sb = sget(fc, s_op, None, &|sb| set_bdev_super(sb, dev))?;
+    let test = |sb: &SuperBlock| sb.s_dev.load(Ordering::Relaxed) == dev;
+    let sb = sget(fc, s_op, Some(&test), &|sb| set_bdev_super(sb, dev))?;
+    if sb.has_root() {
+        // Don't summarily change the RO/RW state (Linux): the active
+        // reference grab_super took goes (deactivate_locked_super)
+        if (fc.sb_flags ^ sb.s_flags.load(Ordering::Relaxed)) & SB_RDONLY != 0 {
+            return Err(KernelError::Busy);
+        }
+        return Ok(sb);
+    }
     sb.set_bdev(bdev.open_handle()?);
     fill(&sb)?;
     sb.set_active();
