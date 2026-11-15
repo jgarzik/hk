@@ -40,9 +40,9 @@ pub trait SuperOps: Send + Sync {
         Ok(())
     }
 
-    /// Get filesystem statistics
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        StatFs::default()
+    /// Filesystem statistics (Linux ->statfs: an error fails statfs(2))
+    fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok(StatFs::default())
     }
 
     /// The options string of a remount (Linux ->reconfigure), before

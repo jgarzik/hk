@@ -2593,20 +2593,20 @@ impl SuperOps for VfatSuperOps {
     /// Linux fat_statfs: clusters as blocks, the free ones counted once
     /// and kept; a long name of 255 characters of up to 6 bytes each
     /// (FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE)
-    fn statfs(&self, sb: &SuperBlock) -> StatFs {
-        let mut st = StatFs {
+    fn statfs(&self, sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        let d = get_sb_data(sb)?;
+        // A FAT that cannot be read fails the call (Linux
+        // fat_count_free_clusters' error)
+        let free = free_clusters(&d)?;
+        Ok(StatFs {
             f_type: MSDOS_SUPER_MAGIC,
+            f_bsize: u64::from(d.cluster_size),
+            f_blocks: u64::from(d.max_cluster - 2),
+            f_bfree: free,
+            f_bavail: free,
             f_namelen: 255 * 6,
             ..StatFs::default()
-        };
-        if let Ok(d) = get_sb_data(sb) {
-            let free = free_clusters(&d).unwrap_or(0);
-            st.f_bsize = u64::from(d.cluster_size);
-            st.f_blocks = u64::from(d.max_cluster - 2);
-            st.f_bfree = free;
-            st.f_bavail = free;
-        }
-        st
+        })
     }
 
     fn alloc_inode(

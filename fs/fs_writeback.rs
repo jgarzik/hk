@@ -68,10 +68,16 @@ pub fn mark_inode_dirty(inode: &Arc<Inode>) {
     if !inode.i_data.aops().can_dirty() || inode.i_dirty.swap(true, Ordering::AcqRel) {
         return;
     }
-    let Some(wb) = inode_to_wb(inode) else {
-        return;
+    // Its wb, found once (Linux inode->i_wb)
+    let wb = match inode.i_wb.get() {
+        Some(wb) => wb.clone(),
+        None => {
+            let Some(wb) = inode_to_wb(inode) else {
+                return;
+            };
+            inode.i_wb.call_once(|| wb).clone()
+        }
     };
-    let wb = inode.i_wb.call_once(|| wb).clone();
     let first = {
         let mut l = wb.list_lock.lock();
         let first = l.b_dirty.is_empty() && l.b_io.is_empty();

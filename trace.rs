@@ -530,13 +530,15 @@ impl SuperOps for TracefsSops {
         Err(KernelError::OperationNotSupported)
     }
 
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        StatFs {
-            f_type: TRACEFS_MAGIC,
-            f_bsize: 4096,
-            f_namelen: 255,
-            ..StatFs::default()
-        }
+    fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok({
+            StatFs {
+                f_type: TRACEFS_MAGIC,
+                f_bsize: 4096,
+                f_namelen: 255,
+                ..StatFs::default()
+            }
+        })
     }
 
     /// Linux tracefs_parse_param + tracefs_apply_options(remount): uid=,

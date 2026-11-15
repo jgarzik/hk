@@ -721,13 +721,15 @@ pub static CGROUPFS_FILE_OPS: CgroupfsFileOps = CgroupfsFileOps;
 pub struct CgroupfsSuperOps;
 
 impl SuperOps for CgroupfsSuperOps {
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        StatFs {
-            f_type: CGROUP2_SUPER_MAGIC,
-            f_bsize: 4096,
-            f_namelen: 255,
-            ..StatFs::default()
-        }
+    fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok({
+            StatFs {
+                f_type: CGROUP2_SUPER_MAGIC,
+                f_bsize: 4096,
+                f_namelen: 255,
+                ..StatFs::default()
+            }
+        })
     }
 
     fn alloc_inode(

@@ -495,8 +495,8 @@ impl SuperOps for TmpfsSuperOps {
         super::RAMFS_SUPER_OPS.alloc_inode(sb, mode, i_op)
     }
 
-    fn statfs(&self, sb: &SuperBlock) -> StatFs {
-        with(sb, ShmemSb::statfs).unwrap_or_default()
+    fn statfs(&self, sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok(with(sb, ShmemSb::statfs).unwrap_or_default())
     }
 
     fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {

@@ -2144,13 +2144,15 @@ impl SuperOps for ProcfsSuperOps {
         opts::with_sb(sb, |o| o.show(out));
     }
 
-    fn statfs(&self, _sb: &SuperBlock) -> StatFs {
-        StatFs {
-            f_type: PROC_SUPER_MAGIC,
-            f_bsize: 4096,
-            f_namelen: 255,
-            ..StatFs::default()
-        }
+    fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
+        Ok({
+            StatFs {
+                f_type: PROC_SUPER_MAGIC,
+                f_bsize: 4096,
+                f_namelen: 255,
+                ..StatFs::default()
+            }
+        })
     }
 
     fn alloc_inode(
