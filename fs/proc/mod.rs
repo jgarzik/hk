@@ -2437,7 +2437,9 @@ pub fn proc_flush_pid(t: &crate::task::Task) {
         return;
     };
     let name = |n: u32| alloc::format!("{n}").into_bytes();
-    crate::fs::superblock::iterate_supers_type(&PROCFS_TYPE, |sb| {
+    // No s_umount (Linux proc_flush_pid takes none): every reap passes
+    // here, and must not wait for a procfs mount's fill or shutdown
+    crate::fs::superblock::iterate_supers_type_active(&PROCFS_TYPE, |sb| {
         let ns = opts::sb_pid_ns(sb);
         let (Some(root), Some(tid)) = (sb.get_root(), thread.nr_in(&ns)) else {
             return;

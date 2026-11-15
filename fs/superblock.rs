@@ -463,6 +463,17 @@ impl SbLocked {
 }
 
 impl SbActive {
+    /// Another active reference to `sb` unless its last one went (Linux
+    /// atomic_inc_not_zero(&sb->s_active))
+    pub fn try_get(sb: &Arc<SuperBlock>) -> Option<Self> {
+        sb.s_active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v != 0).then(|| v + 1)
+            })
+            .ok()
+            .map(|_| Self(sb.clone()))
+    }
+
     /// Take s_umount for writing, this active reference kept (Linux
     /// atomic_inc(&sb->s_active) then down_write(&sb->s_umount), as
     /// devtmpfs_get_tree)
@@ -687,6 +698,21 @@ pub fn iterate_supers(f: impl FnMut(&Arc<SuperBlock>)) {
 /// `f` on every superblock of `fs_type` (Linux iterate_supers_type)
 pub fn iterate_supers_type(fs_type: &'static FileSystemType, f: impl FnMut(&Arc<SuperBlock>)) {
     walk(f, |l| fs_type.fs_supers.access(l), super_lock_shared);
+}
+
+/// `f` on every running superblock of `fs_type`, each held by an active
+/// reference taken without s_umount (Linux proc_invalidate_siblings_dcache:
+/// atomic_inc_not_zero(&sb->s_active), then deactivate_super): no wait
+/// for a superblock being filled, remounted or shut down; `f` may sleep,
+/// and so may the put of a last active reference after it
+pub fn iterate_supers_type_active(fs_type: &'static FileSystemType, mut f: impl FnMut(&SbActive)) {
+    let mut cur: Option<Arc<SuperBlock>> = None;
+    while let Some(sb) = next_live(cur.as_ref(), |l| fs_type.fs_supers.access(l)) {
+        if let Some(a) = SbActive::try_get(&sb) {
+            f(&a);
+        }
+        cur = Some(sb);
+    }
 }
 
 /// [`iterate_supers`] for reclaim, which may run under any s_umount and
