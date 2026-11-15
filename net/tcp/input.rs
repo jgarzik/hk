@@ -308,6 +308,12 @@ impl TcpCb {
                 );
                 return;
             }
+            if req && !self.req_full {
+                // tcp_check_req accepted it: the listener makes the
+                // child, then the child processes it (state unchanged)
+                out.req_ack = Some(skb);
+                return;
+            }
             self.update_ts_recent(s);
             // Linux tcp_rcv_state_process: tcp_ack(FLAG_SLOWPATH)
             self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);

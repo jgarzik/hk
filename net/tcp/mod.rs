@@ -491,20 +491,15 @@ impl TcpSock {
         if out.established
             && let Some(w) = g.parent.take()
         {
-            match w.upgrade() {
-                Some(p) if p.child_ready(&self.arc()) => ready = Some(p),
-                // The listener stopped listening: the new child is
-                // aborted (Linux inet_csk_complete_hashdance ->
-                // inet_child_forget -> tcp_disconnect)
-                _ => {
-                    g.cb.orphan = true;
-                    g.cb.disconnect(out);
-                }
-            }
+            // A child completing its handshake was queued on its
+            // listener (`syn_recv_sock`): wake it (Linux
+            // tcp_child_process -> sk_data_ready)
+            ready = w.upgrade();
         }
         if out.done {
             if let Some(p) = g.parent.take().and_then(|w| w.upgrade()) {
                 p.child_gone(self);
+                put_listener(p);
             }
             // Like Linux tcp_set_state(TCP_CLOSE): a port fixed by bind()
             // stays until close()
@@ -654,6 +649,7 @@ impl TcpSock {
         self.wake(w.w);
         if let Some(l) = w.ready {
             l.sk.data_ready();
+            put_listener(l);
         }
     }
 
@@ -725,7 +721,9 @@ impl TcpSock {
             Some(g) => {
                 let mut out = Out::default();
                 if g.tuple == Some(t) && self.req_dead(g) {
-                    self.req_drop(g, &mut out);
+                    // Dropped silently: it leaves the tables, its timer
+                    // stops (Linux inet_csk_reqsk_queue_drop_and_put)
+                    g.cb.set_closed(&mut out);
                     self.finish(g, &mut out);
                     return Some(skb);
                 }
@@ -740,18 +738,17 @@ impl TcpSock {
     /// A listener's child still in SYN_RECEIVED (Linux's request sock)
     /// whose listener is no longer listening (closed, or gone)
     fn req_dead(&self, g: &Inner) -> bool {
-        g.cb.passive
-            && g.cb.state == TcpState::SynReceived
-            && g.parent
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .is_none_or(|p| p.state() != TcpState::Listen)
-    }
-
-    /// Drop a dead request silently: it leaves the tables, its timer
-    /// stops (Linux inet_csk_reqsk_queue_drop)
-    fn req_drop(&self, g: &mut Inner, out: &mut Out) {
-        g.cb.set_closed(out);
+        if !(g.cb.passive && g.cb.state == TcpState::SynReceived) {
+            return false;
+        }
+        match g.parent.as_ref().and_then(Weak::upgrade) {
+            None => true,
+            Some(p) => {
+                let dead = !p.listening();
+                put_listener(p);
+                dead
+            }
+        }
     }
 
     /// Linux tcp_add_backlog: over rcvbuf * 2 + sndbuf / 2 + 64 KiB of
@@ -782,43 +779,62 @@ impl TcpSock {
         if g.tuple != Some(t) {
             return;
         }
-        if g.cb.state == TcpState::SynReceived
-            && s.has(flags::ACK)
-            && g.parent
-                .as_ref()
-                .and_then(|w| w.upgrade())
-                .is_some_and(|p| p.acceptq_full())
-        {
-            // Linux listen overflow (tcp_v4_syn_recv_sock): drop the
-            // completing ACK, the SYN-ACK is retransmitted later
-            self.listen_overflow();
-            return;
-        }
-        // A request takes its listener's port only as it becomes a full
-        // socket (Linux tcp_v4_syn_recv_sock -> __inet_inherit_port);
-        // without a bind bucket the ACK is dropped, the request kept
-        let req = g.cb.passive && g.cb.state == TcpState::SynReceived && s.has(flags::ACK);
-        if req {
-            if !self.sk.net.tcp.inherit(&self.arc(), t.lport) {
-                // Linux tcp_v4_syn_recv_sock failing: tcp_listendrop
-                self.listen_drop();
-                return;
-            }
-            g.bound = true;
-        }
         g.cb.input(s, skb, now, out);
-        if req && g.cb.state == TcpState::SynReceived {
-            // Still a request (Linux: the ACK failed tcp_check_req
-            // before any child was made)
-            g.bound = false;
-            self.sk.net.tcp.unbind(&self.arc(), t.lport);
+        if let Some(skb) = out.req_ack.take() {
+            self.syn_recv_sock(g, s, skb, t, now, out);
         }
+    }
+
+    /// A request's completing ACK passed tcp_check_req (Linux
+    /// tcp_v4_syn_recv_sock, inet_csk_complete_hashdance, then
+    /// tcp_child_process): a full accept queue drops it (the request
+    /// stays, its SYN-ACK is resent); it takes the listener's port
+    /// (without a bind bucket it is dropped); it is queued as a full
+    /// socket, or forgotten with a reset if the listener stopped
+    /// listening (Linux inet_child_forget: tcp_disconnect from
+    /// SYN_RECV), before it processes the segment
+    fn syn_recv_sock(
+        &self,
+        g: &mut Inner,
+        s: &SegIn,
+        skb: Box<SkBuff>,
+        t: Tuple,
+        now: u64,
+        out: &mut Out,
+    ) {
+        let Some(p) = g.parent.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        let full = p.acceptq_full();
+        if full {
+            self.listen_overflow();
+        } else if !self.sk.net.tcp.inherit(&self.arc(), t.lport) {
+            self.listen_drop();
+        } else {
+            g.bound = true;
+            if p.child_ready(&self.arc()) {
+                g.cb.req_full = true;
+                g.cb.input(s, skb, now, out);
+            } else {
+                g.parent = None;
+                g.cb.orphan = true;
+                g.cb.disconnect(out);
+            }
+        }
+        put_listener(p);
     }
 
     // --- listener ---------------------------------------------------------------
 
     fn acceptq_full(&self) -> bool {
-        self.queue.lock().as_ref().is_none_or(|q| q.full())
+        self.queue.lock().as_ref().is_some_and(|q| q.full())
+    }
+
+    /// Listening: an accept queue exists (taken under the owner by
+    /// close and disconnect before their children are stopped, Linux
+    /// TCP_CLOSE set before inet_csk_listen_stop)
+    fn listening(&self) -> bool {
+        self.queue.lock().is_some()
     }
 
     /// Linux tcp_listendrop: a connection request was dropped
@@ -1278,11 +1294,19 @@ impl TcpSock {
     /// instead of resending its SYN-ACK (Linux reqsk_timer_handler)
     fn on_timer(&self, g: &mut Inner, now: u64, out: &mut Out) {
         if self.req_dead(g) {
-            self.req_drop(g, out);
+            g.cb.set_closed(out);
         } else {
             g.cb.on_timer(now, out);
         }
     }
+}
+
+/// Put a listener reference taken under one of its children's slocks:
+/// a grace period later, so its last drop never runs nested under
+/// another socket's lock (a TCP socket's last drop runs in `rcuc/N`,
+/// as the tables' references do; Linux sock_put of rsk_listener)
+fn put_listener(p: Arc<TcpSock>) {
+    crate::sync::rcu::put_rcu(p);
 }
 
 impl SockHooks<Inner> for TcpSock {

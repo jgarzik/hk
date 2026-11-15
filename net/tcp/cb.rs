@@ -287,6 +287,11 @@ pub struct Out {
     pub timewait: bool,
     /// The handshake completed (SYN_RECEIVED/SYN_SENT -> ESTABLISHED)
     pub established: bool,
+    /// A request's completing ACK passed tcp_check_req, unprocessed: the
+    /// socket layer makes it a full socket (its port, the accept queue)
+    /// and feeds it again (Linux tcp_v4_syn_recv_sock,
+    /// inet_csk_complete_hashdance, tcp_child_process)
+    pub req_ack: Option<Box<SkBuff>>,
 }
 
 impl Default for Out {
@@ -300,6 +305,7 @@ impl Default for Out {
             done: false,
             timewait: false,
             established: false,
+            req_ack: None,
         }
     }
 }
@@ -728,6 +734,10 @@ pub struct TcpCb {
     /// A listener's child: in SYN_RECEIVED it is Linux's request sock
     /// (tcp_check_req rules), not a simultaneous open
     pub(super) passive: bool,
+    /// The listener made this request a full socket (Linux: the child
+    /// sock exists, tcp_v4_syn_recv_sock): its completing ACK is
+    /// processed as tcp_child_process does
+    pub(super) req_full: bool,
     pub(super) tmr: Option<(Tmr, u64)>,
     /// TIME_WAIT 2MSL or orphan FIN_WAIT_2 deadline
     pub(super) wait_at: Option<u64>,

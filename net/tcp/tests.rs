@@ -75,10 +75,18 @@ trait Feed {
 }
 
 impl Feed for TcpCb {
+    /// Feed `s`; a request's completing ACK is handed back, as the
+    /// socket layer does with a listener that has room
+    /// (`TcpSock::syn_recv_sock`): made a full socket, fed again
     fn feed(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
         let skb = s.skb();
         let h = skb.tcp;
         self.input(&h, skb, now, out);
+        if let Some(skb) = out.req_ack.take() {
+            self.req_full = true;
+            let h = skb.tcp;
+            self.input(&h, skb, now, out);
+        }
     }
 
     fn passive_in(&mut self, s: &SegIn<'_>, o: Open, now: u64, out: &mut Out) {
