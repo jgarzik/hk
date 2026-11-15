@@ -1024,6 +1024,12 @@ Tag = roadmap phase (doc/ROADMAP.md).
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
 
+10. **TCP_ETH0_REFUSED flake** (cause unknown): `TCP_ETH0_REFUSED:FAIL
+    refused got 0` (hk x86 LOCKDEP=1, once; once earlier on hk
+    x86): a connect through slirp to 10.0.2.2 port 1, refused on the
+    host, completed (SO_ERROR 0, POLLOUT). Not reproduced on rerun;
+    the socket is an active connect (no listener-side code involved).
+
 ## DRM dumb buffers are the boot framebuffer only
 
 **Location**: `hw/gfx/simplegfx.rs` (`create_dumb`)
