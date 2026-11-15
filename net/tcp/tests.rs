@@ -1831,7 +1831,9 @@ fn mib_open_close() {
     assert_eq!(m.net.fold(LINUX_MIB_TCPORIGDATASENT), 2);
     // a's SYN and both FINs; the ACKs of the FINs are pure
     assert_eq!(m.net.fold(LINUX_MIB_TCPDELIVERED), 3);
-    assert_eq!(m.net.fold(LINUX_MIB_TCPPUREACKS), 2);
+    // The third ACK and the two FINs' ACKs (Linux: tcp_ack's slow
+    // path, the handshake's included)
+    assert_eq!(m.net.fold(LINUX_MIB_TCPPUREACKS), 3);
 }
 
 /// An abort resets both ends: EstabResets on each, one OutRst

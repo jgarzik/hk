@@ -297,6 +297,8 @@ impl TcpCb {
                 return;
             }
             self.update_ts_recent(s);
+            // Linux tcp_rcv_state_process: tcp_ack(FLAG_SLOWPATH)
+            self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
             self.snd_una = s.ack;
             self.established(s, now, out);
         } else if !self.rcv_ack(s, now, out) {
