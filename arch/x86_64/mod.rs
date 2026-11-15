@@ -611,3 +611,9 @@ pub fn early_init() {
     // Enable timer interrupt
     pic::enable_irq(0);
 }
+
+/// The interrupt a device configured for `irq` uses: IRQ 2 is the PIC cascade: a device asking for it gets 9 (Linux
+/// arch/x86 irq_canonicalize)
+pub fn irq_canonicalize(irq: i32) -> i32 {
+    if irq == 2 { 9 } else { irq }
+}

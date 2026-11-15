@@ -731,3 +731,8 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     // Continue to unified main kernel
     crate::kmain()
 }
+
+/// The interrupt a device configured for `irq` uses: Every number is itself (Linux asm-generic irq_canonicalize)
+pub fn irq_canonicalize(irq: i32) -> i32 {
+    irq
+}

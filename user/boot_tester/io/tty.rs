@@ -53,7 +53,8 @@
 //!   (Linux uart_set_info: EPERM)
 //! - TTY_SERIAL_MOVE: TIOCSSERIAL moves ttyS1 (x86) to another I/O
 //!   address (Linux uart_set_info -> uart_change_port): EBUSY with a
-//!   second open; to 0x3e8, where no UART answers, it succeeds (for
+//!   second open; above the I/O space (port_high) EBUSY, the port
+//!   staying; to 0x3e8, where no UART answers, it succeeds (for
 //!   CAP_SYS_ADMIN) with the tty's I/O failing (write, TCGETS EIO:
 //!   TTY_IO_ERROR) and /proc/ioports' serial range moved; to 0x3f8,
 //!   ttyS0's registers, EBUSY and the port stays; back at 0x2f8 the
@@ -357,6 +358,7 @@ const SS_BAUD: usize = 28;
 const SS_CLOSE_DELAY: usize = 32;
 const SS_CLOSING_WAIT: usize = 40;
 const SS_IOMEM: usize = 48;
+const SS_PORT_HIGH: usize = 60;
 const ASYNC_CLOSING_WAIT_NONE: u16 = 65535;
 const ASYNC_SKIP_TEST: u32 = 1 << 6;
 const ASYNC_LOW_LATENCY: u32 = 1 << 13;
@@ -591,6 +593,11 @@ fn test_serial_move() {
     if fd2 >= 0 {
         sys_close(fd2 as u64);
     }
+    // port_high: the address's high half (Linux HIGH_BITS_OFFSET)
+    let mut high = orig;
+    ss_set(&mut high, SS_PORT_HIGH, 1);
+    let above = sys_ioctl(fd, TIOCSSERIAL, high.as_ptr() as u64);
+    let p0 = port_now();
     // No UART at 0x3e8
     let nouart = sys_ioctl(fd, TIOCSSERIAL, w.as_ptr() as u64);
     let p1 = port_now();
@@ -620,6 +627,8 @@ fn test_serial_move() {
     let r = check(b"tiocgserial", g == 0, g)
         .and_then(|()| check(b"second open", fd2 >= 0, fd2))
         .and_then(|()| check(b"shared", shared == EBUSY, shared))
+        .and_then(|()| check(b"above", above == EBUSY, above))
+        .and_then(|()| check(b"port 2f8", p0 == 0x2f8, p0))
         .and_then(|()| check(b"no uart", nouart == 0, nouart))
         .and_then(|()| check(b"port 3e8", p1 == 0x3e8, p1))
         .and_then(|()| check(b"write eio", wr1 == EIO, wr1))

@@ -338,9 +338,14 @@ impl TtyDriver for Pl011 {
         self.uart.activate(self, admin)
     }
 
+    /// Linux uart_state.uart_port, set and cleared
+    fn detach(&self, gone: bool) {
+        self.uart.detach(gone);
+    }
+
     /// Linux uart_hangup
     fn hangup(&self, up: bool) {
-        self.uart.hangup(self, up);
+        self.uart.down(self, up);
     }
 
     /// Linux uart_tty_port_shutdown
@@ -358,7 +363,7 @@ impl TtyDriver for Pl011 {
         &self,
         port: &crate::tty::TtyPort,
     ) -> Result<crate::tty::SerialStruct, KernelError> {
-        Ok(self.uart.get_info(port))
+        self.uart.get_info(port)
     }
 
     /// Linux uart_set_info

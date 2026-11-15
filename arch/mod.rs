@@ -67,7 +67,11 @@ pub use x86_64::io::{inb, inl, inw, io_wait, outb, outl, outw};
 #[cfg(target_arch = "x86_64")]
 pub use crate::hw::serial::serial_ttys;
 #[cfg(target_arch = "aarch64")]
+pub use aarch64::irq_canonicalize;
+#[cfg(target_arch = "aarch64")]
 pub use aarch64::serial::serial_ttys;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::irq_canonicalize;
 
 // Power management
 #[cfg(target_arch = "x86_64")]

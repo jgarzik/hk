@@ -125,7 +125,9 @@ pub struct UartDesc {
 #[derive(Clone, Copy)]
 pub struct UartCfg {
     pub type_: i32,
-    pub iobase: u32,
+    /// I/O port base: TIOCSSERIAL's port and port_high << 32 (Linux
+    /// HIGH_BITS_OFFSET on 64-bit)
+    pub iobase: u64,
     pub irq: i32,
     pub flags: u32,
     pub uartclk: u32,
@@ -237,7 +239,7 @@ pub trait UartOps: Sync {
 
     /// Drive the port at `iobase` as `type_` from now on (Linux sets
     /// uport->iobase and uport->type in uart_set_info)
-    fn set_port(&self, iobase: u32, type_: i32) {
+    fn set_port(&self, iobase: u64, type_: i32) {
         let _ = (iobase, type_);
     }
 }
@@ -264,6 +266,10 @@ pub struct UartPort {
     xmit: IrqSpinlock<Xmit>,
     /// It takes interrupts; else a timer polls the transmitter
     irq: AtomicBool,
+    /// Its device is gone (Linux state->uart_port NULL after
+    /// serial_core_remove_one_port): set and cleared under the tty's
+    /// `port`
+    detached: AtomicBool,
     desc: UartDesc,
     /// Spin leaf, thread context: under the tty's `port` mutex (Linux
     /// port->mutex) for TIOCSSERIAL, alone for probe
@@ -283,18 +289,25 @@ impl UartPort {
                 buf: false,
             }),
             irq: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
         }
+    }
+
+    /// The port's device goes (true) or comes (false) (Linux
+    /// serial_core_remove_one_port, serial_core_add_one_port)
+    pub fn detach(&self, gone: bool) {
+        self.detached.store(gone, Ordering::Release);
+    }
+
+    /// The port's device is gone (Linux uart_port_check NULL)
+    fn gone(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
     }
 
     /// Run `f` under the port lock (the driver's interrupt enables)
     pub fn locked<R>(&self, f: impl FnOnce() -> R) -> R {
         let _g = self.xmit.lock();
         f()
-    }
-
-    /// The port takes interrupts (`set_irq`)
-    pub fn irq_on(&self) -> bool {
-        self.irq.load(Ordering::Relaxed)
     }
 
     /// The port has an interrupt (probe) or lost it (remove); queued
@@ -467,13 +480,6 @@ impl UartPort {
         self.xmit.lock().fifo.reset();
     }
 
-    /// A hangup (Linux uart_hangup: uart_flush_buffer, uart_shutdown):
-    /// the port down if `up`, its transmit buffer freed; the tty's
-    /// stopped state stays with the tty
-    pub fn hangup(&self, ops: &dyn UartOps, up: bool) {
-        self.down(ops, up);
-    }
-
     /// The tty's last close (Linux tty_port_shutdown): the tty's
     /// stopped state goes with it; `down`, the port is up and not a
     /// console, so it goes down (uart_tty_port_shutdown)
@@ -501,11 +507,12 @@ impl UartPort {
         }
     }
 
-    /// Linux uart_shutdown's port part: if `up`, the transmitter
-    /// stopped and the port taken down (uart_port_shutdown, which takes
-    /// the port lock itself); then the transmit buffer freed, queued
-    /// output and the x_char with it (uart_free_xmit_buf)
-    fn down(&self, ops: &dyn UartOps, up: bool) {
+    /// Linux uart_shutdown's port part (a hangup's, a removal's): if
+    /// `up`, the transmitter stopped and the port taken down
+    /// (uart_port_shutdown, which takes the port lock itself); then the
+    /// transmit buffer freed, queued output and the x_char with it
+    /// (uart_free_xmit_buf); the tty's stopped state stays with the tty
+    pub fn down(&self, ops: &dyn UartOps, up: bool) {
         if up {
             self.stop_tx(ops, &mut self.xmit.lock());
             ops.shutdown();
@@ -526,14 +533,19 @@ impl UartPort {
         self.cfg.lock().irq
     }
 
-    /// TIOCGSERIAL (Linux uart_get_info), under the tty's `port`
-    pub fn get_info(&self, port: &TtyPort) -> SerialStruct {
+    /// TIOCGSERIAL (Linux uart_get_info), under the tty's `port`:
+    /// ENODEV once the port's device is gone
+    pub fn get_info(&self, port: &TtyPort) -> Result<SerialStruct, KernelError> {
+        if self.gone() {
+            return Err(KernelError::NoDevice);
+        }
         let c = *self.cfg.lock();
         let d = &self.desc;
-        SerialStruct {
+        Ok(SerialStruct {
             type_: c.type_,
             line: d.line,
-            port: c.iobase,
+            port: c.iobase as u32,
+            port_high: (c.iobase >> 32) as u32,
             irq: c.irq,
             flags: c.flags as i32,
             xmit_fifo_size: c.fifosize,
@@ -549,7 +561,7 @@ impl UartPort {
             iomem_reg_shift: d.regshift,
             iomem_base: d.mapbase,
             ..SerialStruct::default()
-        }
+        })
     }
 
     /// TIOCSSERIAL (Linux uart_set_info), under the tty's `port`:
@@ -570,9 +582,15 @@ impl UartPort {
         users: usize,
         admin: bool,
     ) -> Result<(), KernelError> {
-        if users == 0 {
+        // A port whose device is gone, or one hung up (Linux: !uport,
+        // !tty_port_active)
+        if self.gone() || users == 0 {
             return Err(KernelError::Io);
         }
+        let new_port = u64::from(ss.port) | u64::from(ss.port_high) << 32;
+        let mut ss = *ss;
+        ss.irq = crate::arch::irq_canonicalize(ss.irq);
+        let ss = &ss;
         let mut c = self.cfg.lock();
         let d = &self.desc;
         let close_delay = cs_to_ticks(ss.close_delay);
@@ -583,7 +601,7 @@ impl UartPort {
         };
         let fixed = c.flags & UPF_FIXED_PORT != 0;
         let change_irq = !fixed && ss.irq != c.irq;
-        let change_port = !fixed && (ss.port != c.iobase || ss.type_ != c.type_);
+        let change_port = !fixed && (new_port != c.iobase || ss.type_ != c.type_);
         // Another I/O type or a memory-mapped address: the port's
         // registers would be iomem, which has no resource tree here
         // (BUGS.md "Resource tree gaps")
@@ -631,7 +649,7 @@ impl UartPort {
         }
         if change_port {
             drop(c);
-            self.change_port(ops, ss.port, ss.type_)?;
+            self.change_port(ops, new_port, ss.type_)?;
             c = self.cfg.lock();
         }
         if change_irq {
@@ -681,7 +699,7 @@ impl UartPort {
     /// the old settings come back with their registers (EBUSY; the
     /// port's type unknown if those are gone too). Under the tty's
     /// `port`, not `cfg`: claiming allocates
-    fn change_port(&self, ops: &dyn UartOps, iobase: u32, type_: i32) -> Result<(), KernelError> {
+    fn change_port(&self, ops: &dyn UartOps, iobase: u64, type_: i32) -> Result<(), KernelError> {
         let (old_iobase, old_type) = {
             let c = self.cfg.lock();
             (c.iobase, c.type_)
@@ -708,7 +726,7 @@ impl UartPort {
 
     /// Record the port's address and type, for TIOCGSERIAL and the
     /// driver
-    fn set_port(&self, ops: &dyn UartOps, iobase: u32, type_: i32) {
+    fn set_port(&self, ops: &dyn UartOps, iobase: u64, type_: i32) {
         {
             let mut c = self.cfg.lock();
             c.iobase = iobase;
@@ -718,7 +736,7 @@ impl UartPort {
     }
 
     /// The port's I/O address and type
-    pub fn port(&self) -> (u32, i32) {
+    pub fn port(&self) -> (u64, i32) {
         let c = self.cfg.lock();
         (c.iobase, c.type_)
     }
@@ -731,8 +749,12 @@ impl UartPort {
         self.down(ops, up);
     }
 
-    /// Linux uart_port_activate: uart_startup without init_hw
+    /// Linux uart_port_activate: ENXIO once the port's device is gone,
+    /// else uart_startup without init_hw
     pub fn activate(&self, ops: &dyn UartOps, admin: bool) -> Result<bool, KernelError> {
+        if self.gone() {
+            return Err(KernelError::NoDeviceOrAddress);
+        }
         self.port_startup(ops, admin)
     }
 
@@ -772,19 +794,19 @@ mod tests {
         out: Mutex<Vec<u8>>,
         irq_on: AtomicBool,
         rounds: AtomicUsize,
-        at: core::sync::atomic::AtomicU32,
-        claimed: Mutex<Vec<u32>>,
+        at: core::sync::atomic::AtomicU64,
+        claimed: Mutex<Vec<u64>>,
     }
 
-    const TAKEN: u32 = 0x3f8;
-    const ABSENT: u32 = 0x3e8;
+    const TAKEN: u64 = 0x3f8;
+    const ABSENT: u64 = 0x3e8;
 
     fn fake() -> Fake {
         Fake {
             out: Mutex::new(Vec::new()),
             irq_on: AtomicBool::new(false),
             rounds: AtomicUsize::new(0),
-            at: core::sync::atomic::AtomicU32::new(0x2f8),
+            at: core::sync::atomic::AtomicU64::new(0x2f8),
             claimed: Mutex::new(alloc::vec![0x2f8]),
         }
     }
@@ -868,7 +890,8 @@ mod tests {
         fn request_port(&self) -> Result<(), KernelError> {
             let at = self.at.load(Ordering::Relaxed);
             let mut c = self.claimed.lock().unwrap();
-            if at == TAKEN || c.contains(&at) {
+            // Linux __request_region: outside the root or busy
+            if at > 0xffff || at == TAKEN || c.contains(&at) {
                 return Err(KernelError::Busy);
             }
             c.push(at);
@@ -878,7 +901,7 @@ mod tests {
             let at = self.at.load(Ordering::Relaxed);
             self.claimed.lock().unwrap().retain(|&x| x != at);
         }
-        fn set_port(&self, iobase: u32, _type: i32) {
+        fn set_port(&self, iobase: u64, _type: i32) {
             self.at.store(iobase, Ordering::Relaxed);
         }
     }
@@ -972,7 +995,7 @@ mod tests {
             close_delay: 50,
             closing_wait: 3000,
         };
-        let ss = p.get_info(&tp);
+        let ss = p.get_info(&tp).unwrap();
         assert_eq!(
             (ss.type_, ss.port, ss.irq, ss.baud_base, ss.xmit_fifo_size),
             (PORT_16550A, 0x2f8, 4, 115_200, 16)
@@ -989,14 +1012,14 @@ mod tests {
         s4.flags |= UPF_LOW_LATENCY as i32;
         s4.custom_divisor = 3;
         assert_eq!(set(&mut tp, &s4, false), Ok(()));
-        let got = p.get_info(&tp);
+        let got = p.get_info(&tp).unwrap();
         assert_eq!((got.flags, got.custom_divisor), (s4.flags, 3));
         let mut s5 = got;
         s5.closing_wait = ASYNC_CLOSING_WAIT_NONE;
         s5.close_delay = 7;
         assert_eq!(set(&mut tp, &s5, true), Ok(()));
         assert_eq!(tp.closing_wait, u32::from(ASYNC_CLOSING_WAIT_NONE));
-        let got = p.get_info(&tp);
+        let got = p.get_info(&tp).unwrap();
         assert_eq!(
             (got.close_delay, got.closing_wait),
             (7, ASYNC_CLOSING_WAIT_NONE)
@@ -1031,14 +1054,14 @@ mod tests {
         assert_eq!(p.activate(&f, true), Ok(true));
         tp.initialized = true;
         TTY.set_io_error(false);
-        let home = p.get_info(&tp);
+        let home = p.get_info(&tp).unwrap();
         let mut ss = home;
-        ss.port = ABSENT;
+        ss.port = ABSENT as u32;
         assert_eq!(p.set_info(&f, &TTY, &mut tp, &ss, 1, true), Ok(()));
         assert!(!tp.initialized && TTY.io_error());
         assert_eq!(p.port(), (ABSENT, PORT_16550A));
         assert_eq!(&*f.claimed.lock().unwrap(), &[ABSENT]);
-        ss.port = TAKEN;
+        ss.port = TAKEN as u32;
         assert_eq!(
             p.set_info(&f, &TTY, &mut tp, &ss, 1, true),
             Err(KernelError::Busy)
@@ -1055,5 +1078,51 @@ mod tests {
         p.down(&f, true);
         assert_eq!(p.activate(&f, false), Err(KernelError::NoDevice));
         assert_eq!(p.activate(&f, true), Ok(false));
+    }
+
+    /// TIOCSSERIAL's port_high is the iobase's high half (Linux
+    /// HIGH_BITS_OFFSET): an address above the I/O space cannot be
+    /// claimed (EBUSY, the port stays); an IRQ is canonical (x86: 2 is
+    /// 9)
+    #[test]
+    fn port_high_and_irq() {
+        let f = fake();
+        let p = port();
+        let mut tp = TtyPort::new();
+        assert_eq!(p.activate(&f, true), Ok(true));
+        tp.initialized = true;
+        let home = p.get_info(&tp).unwrap();
+        let mut ss = home;
+        ss.port_high = 1;
+        assert_eq!(
+            p.set_info(&f, &TTY, &mut tp, &ss, 1, true),
+            Err(KernelError::Busy)
+        );
+        assert_eq!(p.port(), (0x2f8, PORT_16550A));
+        let mut ss = home;
+        ss.irq = 2;
+        assert_eq!(p.set_info(&f, &TTY, &mut tp, &ss, 1, true), Ok(()));
+        let want = if cfg!(target_arch = "x86_64") { 9 } else { 2 };
+        assert_eq!(p.get_info(&tp).unwrap().irq, want);
+    }
+
+    /// A port whose device is gone (Linux uart_port_check NULL): an
+    /// open ENXIO, TIOCSSERIAL EIO, TIOCGSERIAL ENODEV, until it comes
+    /// back
+    #[test]
+    fn detached_port() {
+        let f = fake();
+        let p = port();
+        let mut tp = TtyPort::new();
+        let ss = p.get_info(&tp).unwrap();
+        p.detach(true);
+        assert_eq!(p.activate(&f, true), Err(KernelError::NoDeviceOrAddress));
+        assert_eq!(
+            p.set_info(&f, &TTY, &mut tp, &ss, 1, true),
+            Err(KernelError::Io)
+        );
+        assert_eq!(p.get_info(&tp), Err(KernelError::NoDevice));
+        p.detach(false);
+        assert_eq!(p.activate(&f, true), Ok(true));
     }
 }

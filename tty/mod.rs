@@ -186,6 +186,12 @@ pub trait TtyDriver: Send + Sync {
         let _ = up;
     }
 
+    /// The port's device goes (true) or comes back (false), under the
+    /// tty's `port` (Linux uart_state.uart_port)
+    fn detach(&self, gone: bool) {
+        let _ = gone;
+    }
+
     /// The tty's last close (Linux tty_port_shutdown), under the tty's
     /// `port`: `down`, the port was up and is not a console
     /// (port->console), so it goes down and its output buffer is freed
@@ -841,6 +847,16 @@ impl Tty {
         if core::mem::replace(&mut port.initialized, false) {
             self.driver.hangup(true);
         }
+        // Linux state->uart_port = NULL: opens ENXIO, TIOCSSERIAL EIO,
+        // TIOCGSERIAL ENODEV from now on
+        self.driver.detach(true);
+    }
+
+    /// The port's device comes (again) (Linux serial_core_add_one_port:
+    /// state->uart_port set under port->mutex)
+    pub fn port_add(&self) {
+        let _port = self.port.lock();
+        self.driver.detach(false);
     }
 
     /// TIOCGSERIAL (Linux tty_tiocgserial)
@@ -908,8 +924,8 @@ impl Tty {
             f.port_count = f.port_count.saturating_sub(closecount);
         } else {
             // Linux uart_hangup -> uart_shutdown(tty), tty_port_hangup
-            self.set_io_error(true);
             let mut port = self.port.lock();
+            self.set_io_error(true);
             let up = core::mem::replace(&mut port.initialized, false);
             self.driver.hangup(up);
             drop(port);

@@ -6,13 +6,13 @@
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::console::{ConsolePriority, register_console};
-use crate::irq::{IrqFn, IrqRegistration, IrqReturn};
+use crate::irq::{IrqRegistration, IrqReturn};
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 
 use crate::fs::chardev::{DevId, major};
-use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::time::timer::{TIMER_HARD, TimerList};
 use crate::tty::serial_core::{
@@ -111,7 +111,7 @@ mod fcr {
 pub struct SerialTty {
     /// I/O port base address (Linux uport->iobase, moved by
     /// TIOCSSERIAL)
-    port: AtomicU16,
+    port: AtomicU64,
     /// Its port lock and transmit buffer (Linux uart_port)
     uart: UartPort,
     /// IER as last written (Linux up->ier), under the port lock
@@ -120,10 +120,7 @@ pub struct SerialTty {
     poll: &'static TimerList,
     /// Its interrupt while the port is up (Linux serial_link_irq_chain;
     /// spin leaf, thread context, the registration dropped unlocked)
-    irq: Mutex<Option<IrqRegistration<IrqFn>>>,
-    /// That interrupt's line, 0 if none: the handler finds the port by
-    /// it without a lock (Linux irq_info's port list)
-    irq_line: AtomicU32,
+    irq: Mutex<Option<IrqRegistration<PortIrq>>>,
 }
 
 impl SerialTty {
@@ -134,7 +131,7 @@ impl SerialTty {
     /// transmitter poll timer
     pub const fn new(line: i32, port: u16, irq: i32, poll: &'static TimerList) -> Self {
         Self {
-            port: AtomicU16::new(port),
+            port: AtomicU64::new(port as u64),
             uart: UartPort::new(
                 UartDesc {
                     line,
@@ -145,7 +142,7 @@ impl SerialTty {
                 // Linux STD_COMX_FLAGS, BASE_BAUD * 16, the 16550A's FIFO
                 UartCfg {
                     type_: PORT_16550A,
-                    iobase: port as u32,
+                    iobase: port as u64,
                     irq,
                     flags: UPF_BOOT_AUTOCONF | UPF_SKIP_TEST,
                     uartclk: 1_843_200,
@@ -156,7 +153,6 @@ impl SerialTty {
             ier: AtomicU8::new(0),
             poll,
             irq: Mutex::new(None),
-            irq_line: AtomicU32::new(0),
         }
     }
 
@@ -266,7 +262,7 @@ impl SerialTty {
         unsafe {
             core::arch::asm!(
                 "out dx, al",
-                in("dx") self.port.load(Ordering::Relaxed) + offset,
+                in("dx") self.port.load(Ordering::Relaxed) as u16 + offset,
                 in("al") value,
                 options(nostack, preserves_flags)
             );
@@ -283,7 +279,7 @@ impl SerialTty {
         unsafe {
             core::arch::asm!(
                 "in al, dx",
-                in("dx") self.port.load(Ordering::Relaxed) + offset,
+                in("dx") self.port.load(Ordering::Relaxed) as u16 + offset,
                 out("al") value,
                 options(nostack, preserves_flags)
             );
@@ -357,15 +353,19 @@ impl UartOps for SerialTty {
         }
         let irq = self.uart.irq_nr();
         if irq > 0 {
-            let h = try_arc(IrqFn(serial8250_interrupt))?;
-            // Before the line can fire for it
-            self.irq_line.store(irq as u32, Ordering::Release);
-            let reg = crate::irq::request_irq(irq as u32, h)
-                .inspect_err(|_| self.irq_line.store(0, Ordering::Release))?;
+            // This port as the static it is, with its tty
+            let &(drv, tty) = PORTS
+                .iter()
+                .find(|(d, _)| core::ptr::eq(*d, self))
+                .ok_or(KernelError::NoDevice)?;
+            let h = try_arc(PortIrq(drv, tty))?;
+            let reg = crate::irq::request_irq(irq as u32, h)?;
             *self.irq.lock() = Some(reg);
             self.uart.set_irq(self, true);
         }
-        self.init_hardware(115200);
+        // Linux serial8250_do_set_termios: under the port lock, so a
+        // console write's THR byte never lands in the divisor latch
+        self.uart.locked(|| self.init_hardware(115200));
         if irq > 0 {
             self.enable_rx_irq();
         }
@@ -377,10 +377,13 @@ impl UartOps for SerialTty {
     /// free_irq waits out a running handler) and the transmitter back
     /// on its poll timer. The caller holds no port lock
     fn shutdown(&self) {
-        self.uart.locked(|| self.set_ier(0));
-        // SAFETY: MCR, FCR and RBR are registers of this UART
+        self.uart.locked(|| {
+            self.set_ier(0);
+            // SAFETY: MCR is a register of this UART
+            unsafe { self.outb(regs::MCR, mcr::DTR | mcr::RTS) };
+        });
+        // SAFETY: FCR and RBR are registers of this UART
         unsafe {
-            self.outb(regs::MCR, mcr::DTR | mcr::RTS);
             self.outb(regs::FCR, fcr::ENABLE | fcr::CLEAR_RX | fcr::CLEAR_TX);
             self.outb(regs::FCR, 0);
             self.inb(regs::RBR);
@@ -390,24 +393,23 @@ impl UartOps for SerialTty {
             self.uart.set_irq(self, false);
         }
         drop(reg);
-        self.irq_line.store(0, Ordering::Release);
     }
 
     /// Linux serial8250_request_port -> serial8250_request_std_resource
     fn request_port(&self) -> Result<(), KernelError> {
         let base = self.port.load(Ordering::Relaxed);
-        crate::base::resource::request_region(u64::from(base), 8, "serial")
+        crate::base::resource::request_region(base, 8, "serial")
     }
 
     /// Linux serial8250_release_port -> serial8250_release_std_resource
     fn release_port(&self) {
         let base = self.port.load(Ordering::Relaxed);
-        crate::base::resource::release_region(u64::from(base), 8);
+        crate::base::resource::release_region(base, 8);
     }
 
     /// The registers move with the port (Linux reads uport->iobase)
-    fn set_port(&self, iobase: u32, _type: i32) {
-        self.port.store(iobase as u16, Ordering::Relaxed);
+    fn set_port(&self, iobase: u64, _type: i32) {
+        self.port.store(iobase, Ordering::Relaxed);
     }
 
     fn arm_poll(&self) {
@@ -494,9 +496,14 @@ impl TtyDriver for SerialTty {
         self.uart.activate(self, admin)
     }
 
+    /// Linux uart_state.uart_port, set and cleared
+    fn detach(&self, gone: bool) {
+        self.uart.detach(gone);
+    }
+
     /// Linux uart_hangup
     fn hangup(&self, up: bool) {
-        self.uart.hangup(self, up);
+        self.uart.down(self, up);
     }
 
     /// Linux uart_tty_port_shutdown
@@ -514,7 +521,7 @@ impl TtyDriver for SerialTty {
         &self,
         port: &crate::tty::TtyPort,
     ) -> Result<crate::tty::SerialStruct, KernelError> {
-        Ok(self.uart.get_info(port))
+        self.uart.get_info(port)
     }
 
     /// Linux uart_set_info
@@ -611,23 +618,24 @@ pub fn write_byte_com1(byte: u8) {
     SERIAL_DRIVER_S0.write_byte(byte);
 }
 
-/// The 8250 interrupt handler (IRQ context; Linux
-/// serial8250_interrupt over the line's ports, serial8250_handle_irq
-/// for each): a port up on this line with an interrupt pending has its
-/// input fed to its tty, then its transmitter refilled under the port
-/// lock, its writers woken after
-fn serial8250_interrupt(irq: u32) -> IrqReturn {
-    let mut ret = IrqReturn::None;
-    for &(drv, tty) in &PORTS {
-        if drv.irq_line.load(Ordering::Acquire) != irq || !drv.rx_chars(tty) {
-            continue;
+/// A port's interrupt handler, the port and its tty (Linux
+/// serial8250_interrupt for the port on the line's chain,
+/// serial8250_handle_irq): with an interrupt pending, its input is fed
+/// to its tty, then its transmitter refilled under the port lock, its
+/// writers woken after
+struct PortIrq(&'static SerialTty, &'static Tty);
+
+impl crate::irq::IrqHandler for PortIrq {
+    fn handle(&self, _irq: u32) -> IrqReturn {
+        let PortIrq(drv, tty) = *self;
+        if !drv.rx_chars(tty) {
+            return IrqReturn::None;
         }
         if drv.uart.interrupt_tx(drv) {
             tty.write_wakeup();
         }
-        ret = IrqReturn::Handled;
+        IrqReturn::Handled
     }
-    ret
 }
 
 /// The serial ports' ttys (Linux serial8250 ports)
@@ -715,6 +723,9 @@ fn serial8250_probe(
     // COM1's interrupt as the device names it (Linux 8250_pnp)
     if let Some(irq) = crate::base::platform::pdev(dev).and_then(|p| p.irq) {
         SERIAL_DRIVER_S0.uart.set_irq_nr(irq as i32);
+    }
+    for tty in serial_ttys() {
+        tty.port_add();
     }
     port.ttys = serial_ttys()
         .iter()
