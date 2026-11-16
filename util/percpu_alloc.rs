@@ -54,7 +54,7 @@ static GROW: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 fn areas() -> &'static [CpuArea] {
     AREAS.call_once(|| {
-        let n = crate::cpu::nr_cpu_ids().max(1) as usize;
+        let n = crate::cpu::nr_possible() as usize;
         (0..n).map(|_| CpuArea::new()).collect()
     })
 }

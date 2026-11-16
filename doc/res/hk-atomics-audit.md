@@ -83,15 +83,6 @@ argued / published copy of locked state.
   `waitqueue_active` fast path; drop the global counter (re-check the hash
   instead). LOCKING.md VFS section.
 
-### 9. `NetDeviceStats`: shared atomics per packet — (c)
-- Where: `net/device.rs` `NetDeviceStats` (`inc_rx_packets`, `rx_bytes`,
-  `tx_*`), used by `lo` and every driver.
-- Wrong: several locked RMWs on one shared line per packet from every CPU;
-  violates LOCKING.md §5.4 rule 9.
-- Linux: per-CPU `pcpu_lstats`/`pcpu_sw_netstats` (u64_stats_sync) for
-  virtual devices, per-queue stats for drivers; `ndo_get_stats64` sums.
-- Fix: per-CPU (cache-aligned) stats like `net/mib.rs`, summed on read.
-
 ### 10. `TcpSock.snap`: a full published copy of the control block — (e)(c)
 - Where: `net/tcp/mod.rs` `Snap`, `Snap::store` (end of every locked step),
   `Snap::proc_view`.

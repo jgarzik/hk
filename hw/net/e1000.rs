@@ -452,7 +452,7 @@ impl E1000 {
                         skb.dev = Some(Arc::clone(dev));
                         dev.stats.rx_packet(len);
                         if src[0] & 1 != 0 {
-                            dev.stats.multicast.fetch_add(1, Ordering::Relaxed);
+                            dev.stats.inc_multicast();
                         }
                         out.push_back(skb);
                         n += 1;

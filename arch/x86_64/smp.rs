@@ -51,15 +51,6 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
     // Use existing LAPIC instance (already mapped via ioremap in main.rs)
     let lapic = LocalApic::get();
     let bsp_apic_id = u32::from(lapic.id());
-    // Every possible CPU's per-CPU area before any AP starts (Linux
-    // setup_per_cpu_areas): the boot CPU and each AP the loop below may
-    // start, numbered as it numbers them
-    let aps = acpi
-        .cpus
-        .iter()
-        .filter(|c| c.apic_id != bsp_apic_id && c.enabled)
-        .count();
-    crate::cpu::setup_areas((1 + aps).min(MAX_CPUS) as u32);
 
     // Initialize BSP per-CPU data
     // Note: percpu uses u8 APIC ID for xAPIC compatibility

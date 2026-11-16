@@ -68,7 +68,7 @@ pub struct PercpuCounter {
 impl PercpuCounter {
     /// A counter at 0 with a part per possible CPU; ENOMEM
     pub fn new() -> Result<Self, KernelError> {
-        let n = crate::cpu::nr_cpu_ids() as usize;
+        let n = crate::cpu::nr_possible() as usize;
         Ok(Self {
             lock: IrqSpinlock::new(()),
             count: AtomicI64::new(0),

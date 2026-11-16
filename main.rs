@@ -187,6 +187,14 @@ pub(crate) fn kmain() -> ! {
 
     // Initialize SMP (bring up additional CPUs)
     if let Some(mut acpi_info) = CurrentArch::parse_acpi() {
+        // Every possible CPU's per-CPU area, before anything sizes
+        // per-CPU data by the CPU count (Linux setup_per_cpu_areas from
+        // the possible map prefilled from the MADT/DT): each enabled CPU
+        // listed, plus one in case the list leaves out the boot CPU (the
+        // bring-up loop then numbers every entry as an AP)
+        let listed = acpi_info.cpus.iter().filter(|c| c.enabled).count();
+        crate::cpu::setup_areas((listed + 1) as u32);
+
         // Initialize power management from ACPI/device tree
         if let Some(power_info) = &acpi_info.power_info {
             CurrentArch::power_init(power_info);

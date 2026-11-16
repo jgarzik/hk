@@ -34,7 +34,7 @@ pub struct Mib<const N: usize> {
 impl<const N: usize> Mib<N> {
     /// All zero, a part per possible CPU (Linux alloc_percpu); ENOMEM
     fn new() -> Result<Self, KernelError> {
-        let n = (crate::cpu::nr_cpu_ids() as usize).max(1);
+        let n = crate::cpu::nr_possible() as usize;
         let mut v = crate::util::kmem::KVec::try_with_capacity(n)?;
         for _ in 0..n {
             v.try_push(Part([const { AtomicU64::new(0) }; N]))?;
@@ -42,6 +42,15 @@ impl<const N: usize> Mib<N> {
         Ok(Self {
             parts: v.into_vec(),
         })
+    }
+
+    /// [`new`](Self::new) for a structure made where allocation cannot
+    /// fail (a network device: Linux alloc_netdev's pcpu stats)
+    pub fn new_nofail() -> Self {
+        let n = crate::cpu::nr_possible() as usize;
+        let mut v = alloc::vec::Vec::with_capacity(n);
+        v.resize_with(n, || Part([const { AtomicU64::new(0) }; N]));
+        Self { parts: v }
     }
 
     /// Add `n` (two's complement for a decrement) to the calling CPU's
