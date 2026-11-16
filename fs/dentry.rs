@@ -1094,13 +1094,17 @@ pub fn dentry_state() -> Vec<i64> {
 
 /// Drop `d` from `parent` if it is an unused leaf: in the tree and held
 /// by nothing but the tree and the caller, nothing cached below, nothing
-/// mounted on it; decided under the parent's d_lock, where lookups take
-/// their references (Linux dentry_kill from the LRU)
-fn prune_one(parent: &DentryRef, d: &DentryRef) -> bool {
+/// mounted on it, and negative if its filesystem keeps its positive
+/// dentries (`keep`, Linux DCACHE_PERSISTENT); decided under the
+/// parent's d_lock, where lookups take their references (Linux
+/// dentry_kill from the LRU)
+fn prune_one(parent: &DentryRef, d: &DentryRef, keep: bool) -> bool {
     let mut p = parent.d_lock.write();
     let di = d.d_lock.read();
-    let unused =
-        DentryRef::count(d) == TREE_REFS + 1 && di.children.is_empty() && !di.flags.mounted;
+    let unused = DentryRef::count(d) == TREE_REFS + 1
+        && di.children.is_empty()
+        && !di.flags.mounted
+        && !(keep && di.inode.is_some());
     drop(di);
     if !unused {
         return false;
@@ -1155,8 +1159,9 @@ fn first_child(d: &Dentry) -> Option<DentryRef> {
 }
 
 /// Prune up to `budget` unused leaves of the tree under `root`, post
-/// order, so a directory left empty goes too
-fn prune_tree(root: &DentryRef, budget: usize) -> usize {
+/// order, so a directory left empty goes too; positive ones stay if
+/// `keep`
+fn prune_tree(root: &DentryRef, budget: usize, keep: bool) -> usize {
     let mut freed = 0;
     let mut cur = root.clone();
     loop {
@@ -1171,7 +1176,7 @@ fn prune_tree(root: &DentryRef, budget: usize) -> usize {
                 return freed;
             };
             let next = next_sibling(&parent, &cur);
-            if prune_one(&parent, &cur) {
+            if prune_one(&parent, &cur, keep) {
                 freed += 1;
             }
             match next {
@@ -1188,16 +1193,18 @@ fn prune_tree(root: &DentryRef, budget: usize) -> usize {
 /// The dcache shrinker (Linux prune_dcache_sb over every superblock,
 /// super_cache_scan: one whose s_umount is busy is skipped): up to
 /// `budget` unused dentries, negative ones included, leave the tree;
-/// what they held (inodes not otherwise cached) goes with them.
-/// Allocates nothing. Deviation: no LRU, so not oldest first. The
-/// number dropped.
+/// what they held (inodes not otherwise cached) goes with them. The
+/// positive dentries of a filesystem whose entries live in the dcache
+/// (ramfs, tmpfs: `SuperOps::d_persistent`, Linux d_make_persistent)
+/// stay. Allocates nothing. Deviation: no LRU, so not oldest first.
+/// The number dropped.
 pub fn shrink_dcache(budget: usize) -> usize {
     let mut freed = 0;
     super::superblock::iterate_supers_trylock(|sb| {
         if freed < budget
             && let Some(root) = sb.get_root()
         {
-            freed += prune_tree(&root, budget - freed);
+            freed += prune_tree(&root, budget - freed, sb.s_op.d_persistent());
         }
     });
     freed
@@ -1471,12 +1478,26 @@ mod tests {
         }
         let k = Dentry::alloc(&r, b"k", Some(inode())).unwrap();
         drop(a);
-        assert_eq!(prune_tree(&r, 100), 3);
+        assert_eq!(prune_tree(&r, 100, false), 3);
         assert!(r.lookup_child(b"a").is_none());
         assert!(
             r.lookup_child(b"k")
                 .is_some_and(|c| DentryRef::ptr_eq(&c, &k))
         );
+    }
+
+    /// On a filesystem that keeps its positive dentries only the
+    /// negative ones go
+    #[test]
+    fn prune_keeps_persistent() {
+        let r = crate::fs::DentryRef::new(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        for n in [b"x", b"y"] {
+            Dentry::alloc(&a, n, None).unwrap();
+        }
+        drop(a);
+        assert_eq!(prune_tree(&r, 100, true), 2);
+        assert!(r.lookup_child(b"a").is_some_and(|a| a.num_children() == 0));
     }
 
     /// The last put of a deep chain of parents, each held only by its

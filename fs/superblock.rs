@@ -58,6 +58,13 @@ pub trait SuperOps: Send + Sync {
         let _ = (sb, out);
     }
 
+    /// Its positive dentries are its directory entries and stay cached
+    /// until removed (Linux DCACHE_PERSISTENT, d_make_persistent):
+    /// the shrinker leaves them. Default false.
+    fn d_persistent(&self) -> bool {
+        false
+    }
+
     /// The root path mountinfo shows for a mount rooted at `root`
     /// (Linux ->show_path); None: the dentry's path. Default None.
     fn show_path(&self, root: &crate::fs::Dentry) -> Option<alloc::vec::Vec<u8>> {

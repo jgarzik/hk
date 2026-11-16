@@ -499,6 +499,11 @@ impl SuperOps for TmpfsSuperOps {
         Ok(with(sb, ShmemSb::statfs).unwrap_or_default())
     }
 
+    /// Linux shmem_mknod's d_make_persistent
+    fn d_persistent(&self) -> bool {
+        true
+    }
+
     fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {
         let o = parse(data)?;
         with(sb, |t| t.reconfigure(&o)).unwrap_or(Ok(()))

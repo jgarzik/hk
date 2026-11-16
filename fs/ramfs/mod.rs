@@ -1174,6 +1174,11 @@ pub static TMPFS_FILE_OPS: RamfsFileOps = RamfsFileOps { shmem: true };
 pub struct RamfsSuperOps;
 
 impl SuperOps for RamfsSuperOps {
+    /// Linux ramfs_mknod's d_make_persistent
+    fn d_persistent(&self) -> bool {
+        true
+    }
+
     fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
         Ok({
             StatFs {
