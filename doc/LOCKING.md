@@ -2295,9 +2295,11 @@ layout in `doc/MEMORY.md`
 - Direct reclaim runs for a `Gfp::RECLAIM` allocation (GFP_KERNEL,
   GFP_USER, GFP_HIGHUSER_MOVABLE) only when the caller really may sleep
   (`page_alloc::may_direct_reclaim`): no spin lock held, interrupts on,
-  a task (not tid 0), not reclaim itself (PF_MEMALLOC) and I/O allowed
-  (no PF_MEMALLOC_NOIO). Otherwise it drains the per-CPU lists and
-  retries once. Reclaim runs with PF_MEMALLOC set
+  a task (not tid 0) and not reclaim itself (PF_MEMALLOC). Otherwise it
+  drains the per-CPU lists and retries once. Under PF_MEMALLOC_NOIO
+  (Linux current_gfp_context: no __GFP_IO/__GFP_FS) reclaim frees clean
+  pages only: page cache and clean swap cache, no swap writeback and no
+  dcache shrink. Reclaim runs with PF_MEMALLOC set
   (`mm::memalloc_scope`, Linux memalloc_noreclaim_save), so its own
   allocations take GFP_ATOMIC and never reclaim again; swap writeback
   runs with PF_MEMALLOC_NOIO (Linux memalloc_noio_save). The reverse map
