@@ -586,6 +586,10 @@ VFS locks (detailed order):
                    MOUNT_LOCK's locking read, d_path under an RCU
                    read guard)
         ↓
+    Inode.i_dentry (spin Mutex: the inode's dentries, Linux i_dentry
+                   under i_lock; taken before the d_locks of the
+                   dentry it links or unlinks and its parent)
+        ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across
                    i_rwsem; parent before child)
         → dentry hash bucket (util::hlist_bl bit lock: Linux
@@ -2599,6 +2603,7 @@ pub struct Dentry {
     d_hash: Link,               // Hash bucket (its bit lock)
     d_hkey: AtomicU64, d_hparent: AtomicUsize, // Hash key, parent (parent's d_lock)
     d_name: RwLock<DName>,      // Leaf; changed by d_move/d_exchange
+    d_alias: Link,              // Its inode's i_dentry (that lock)
     d_lock: RwLock<DentryInner>, // Single lock (like Linux d_lock)
 }
 
@@ -2708,6 +2713,26 @@ walk (Linux prepend_buffer): nothing allocates under the locks or
 the guard; a pass that raced starts the buffer over. `Dentry::alloc`
 inserts a child under the parent's `d_lock` unless one with that name
 is cached (Linux d_alloc + d_add): one dentry per name.
+
+An inode's dentries (`Inode.i_dentry`, Linux i_dentry and
+d_u.d_alias) are an intrusive list through `Dentry.d_alias` under a
+spin Mutex of their own (Linux keeps them under i_lock), thread
+context only. A dentry is on its inode's list exactly while its d_lock
+holds that inode: `DentryRef::new` links a positive one, `add` links
+one it makes positive, `d_delete` (making it negative in place) and
+`dentry_kill` unlink it, each with the inode's list lock taken first
+and the dentry's d_lock (and in `add` and `d_delete` the parent's)
+inside it, as Linux takes i_lock before d_lock. `d_delete` therefore
+finds the child (`d_lookup`) and its inode before any lock and checks
+under the locks that it is still that child with that inode (the
+caller's `i_rwsem` keeps it so). The lookups (`d_find_alias`,
+`d_find_any_alias`, `d_find_alias_by`: Linux d_find_alias,
+d_find_any_alias, find_acceptable_alias's walk) read each entry's
+d_lock under the list lock and take references with
+`DentryRef::try_get`: the list lock keeps an entry's memory, since a
+dying dentry leaves the list in `dentry_kill` before its free is
+queued. No reference is dropped under the list lock (a last put would
+take it again), and nothing else is taken under it.
 
 A cached child is revalidated (`InodeOps::revalidate`, Linux
 d_revalidate) after its d_lock is released, inside whatever i_rwsem the

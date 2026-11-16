@@ -70,6 +70,10 @@ pub fn rename_seq_retry(start: u32) -> bool {
 
 crate::owned_adapter!(SibAdapter, Dentry, d_sib, d_sib_owner);
 crate::adapter!(HashAdapter, Dentry, d_hash);
+crate::adapter!(pub AliasA, Dentry, d_alias);
+
+/// An inode's dentries (Linux i_dentry), its `i_dentry`'s contents
+type Aliases = crate::util::list::List<AliasA>;
 
 /// A parent's children, each entry the list's reference
 type Children = OwnedList<SibAdapter, DentryRef>;
@@ -306,6 +310,15 @@ struct DentryInner {
 /// freed a grace period after the last one goes (Linux dentry_free's
 /// call_rcu), so an RCU reader may follow `d_parent` and read `d_name`
 /// of a dentry it holds no reference to.
+///
+/// # Invariants
+/// A dentry a [`DentryRef`] owns is on its inode's `i_dentry` through
+/// `d_alias` exactly while `d_lock`'s inode is set, from
+/// `DentryRef::new` or the `add` that set it until the `d_delete` or
+/// `dentry_kill` that takes it; both change together under that
+/// inode's `i_dentry` lock and the dentry's d_lock (Linux
+/// d_instantiate and dentry_unlink_inode under i_lock and d_lock), so
+/// it is unlinked before its memory is freed.
 pub struct Dentry {
     /// Back pointer to superblock - immutable after creation
     pub sb: Weak<SuperBlock>,
@@ -335,6 +348,8 @@ pub struct Dentry {
     d_hkey: AtomicU64,
     /// The parent's address when hashed (compared, never followed)
     d_hparent: AtomicUsize,
+    /// On its inode's `i_dentry` (Linux d_u.d_alias)
+    d_alias: Link,
 
     /// Name in the parent (empty for a root): a leaf, taken inside
     /// d_lock or a bucket lock
@@ -357,6 +372,7 @@ impl Dentry {
             d_hash: Link::new(),
             d_hkey: AtomicU64::new(0),
             d_hparent: AtomicUsize::new(0),
+            d_alias: Link::new(),
             d_name: RwLock::new(name),
             d_lock: RwLock::new(DentryInner {
                 inode,
@@ -473,6 +489,9 @@ impl Dentry {
     /// two dentries
     pub fn add(parent: &DentryRef, d: DentryRef, inode: Option<Arc<Inode>>) -> DentryRef {
         let name = d.name();
+        // The inode's alias lock first (Linux d_add: i_lock, then d_lock)
+        let i = inode.clone();
+        let mut al = i.as_ref().map(|i| i.i_dentry.lock());
         let mut p = parent.d_lock.write();
         if let Some(c) = d_lookup_locked(parent, &p, &name) {
             let mut ci = c.d_lock.write();
@@ -486,6 +505,9 @@ impl Dentry {
             // it did not look up
             if DentryRef::count(&c) == TREE_REFS + 1 {
                 ci.inode = inode;
+                if let Some(al) = &mut al {
+                    alias_add(al, &ci, &c);
+                }
                 drop(ci);
                 return c;
             }
@@ -495,7 +517,11 @@ impl Dentry {
         }
         {
             let mut dl = d.d_lock.write();
+            debug_assert!(dl.inode.is_none(), "dcache: add of a positive dentry");
             dl.inode = inode;
+            if let Some(al) = &mut al {
+                alias_add(al, &dl, &d);
+            }
             d.set_parent(&dl, parent.clone());
         }
         hash_in(parent, &mut p, &d, &name);
@@ -514,11 +540,6 @@ impl Dentry {
         self.d_lock.read().inode.clone()
     }
 
-    /// Set the inode for this dentry
-    pub fn set_inode(&self, inode: Arc<Inode>) {
-        self.d_lock.write().inode = Some(inode);
-    }
-
     /// The child `name` was unlinked (Linux d_delete): one no one but
     /// the caller (`held` references) holds becomes negative in place
     /// and lets go of its inode after the locks (Linux
@@ -529,25 +550,42 @@ impl Dentry {
     /// directory has nothing cached below it any more (`delete_entry`,
     /// Linux vfs_rmdir's shrink_dcache_parent).
     pub fn d_delete(&self, name: &[u8], held: usize) {
-        let mut p = self.d_lock.write();
-        let Some(c) = d_lookup_locked(self, &p, name) else {
+        // The child and its inode first: the inode's alias lock comes
+        // before any d_lock (Linux d_delete: i_lock, then d_lock)
+        let Some(c) = d_lookup(self, name) else {
             return;
         };
+        let Some(inode) = c.get_inode() else {
+            return;
+        };
+        let mut al = inode.i_dentry.lock();
+        let mut p = self.d_lock.write();
         // Under the child's d_lock, where lookups take their references
         // (Linux d_delete: d_lockref.count == 1 under dentry->d_lock)
         let mut cl = c.d_lock.write();
+        // Still this child of that name with that inode (the caller
+        // holds the directory's i_rwsem: no rename or delete raced)
+        let same = !cl.flags.unhashed
+            && core::ptr::eq(c.parent_ptr(), self)
+            && d_same_name(self, c.d_name.read().as_bytes(), name)
+            && cl.inode.as_ref().is_some_and(|i| Arc::ptr_eq(i, &inode));
+        if !same {
+            return;
+        }
         if DentryRef::count(&c) <= held + TREE_REFS + 1 {
-            let inode = cl.inode.take();
+            let i = cl.inode.take();
+            alias_del(&mut al, &cl, &c);
             drop(cl);
             drop(p);
-            if let Some(i) = inode {
-                crate::io::inotify::d_iput(&i);
-            }
+            drop(al);
+            crate::io::inotify::d_iput(&inode);
+            drop(i);
         } else {
             cl.flags.unhashed = true;
             drop(cl);
             let ours = hash_out(&mut p, &c);
             drop(p);
+            drop(al);
             drop(ours);
         }
     }
@@ -627,6 +665,73 @@ impl Dentry {
     pub fn num_children(&self) -> usize {
         self.d_lock.read().children.len()
     }
+}
+
+/// Link `d`, just made positive (its d_lock `dl`, written, holds the
+/// inode `al` belongs to), on that inode's aliases (Linux
+/// __d_instantiate's hlist_add_head)
+fn alias_add(al: &mut Aliases, dl: &DentryInner, d: &DentryRef) {
+    debug_assert!(dl.inode.is_some());
+    // SAFETY: `d` is owned by a DentryRef (live, its memory freed only
+    // after `dentry_kill` unlinks it) and was negative until now, so on
+    // no alias list (type invariant); `al` is its inode's, locked
+    unsafe { al.push_front(DentryRef::as_ptr(d)) };
+}
+
+/// Unlink `d`, whose inode its d_lock `dl` (written) just let go of,
+/// from that inode's aliases `al` (Linux dentry_unlink_inode's
+/// hlist_del_init)
+fn alias_del(al: &mut Aliases, dl: &DentryInner, d: &Dentry) {
+    debug_assert!(dl.inode.is_none());
+    // SAFETY: `d` was positive with the inode `al` belongs to, so on
+    // that list (type invariant), under its lock
+    unsafe { al.remove(d) };
+}
+
+/// The first alias of `inode` for which `ok` holds of its d_lock, with
+/// a reference (Linux __d_find_any_alias / __d_find_alias): under the
+/// inode's alias lock, which keeps every entry's memory (unlinked
+/// before it is freed); a dying one is skipped. No reference is
+/// dropped under the lock.
+fn find_alias(inode: &Inode, ok: impl Fn(&DentryInner) -> bool) -> Option<DentryRef> {
+    let al = inode.i_dentry.lock();
+    al.iter().find_map(|d| {
+        ok(&d.d_lock.read())
+            .then(|| DentryRef::try_get(d))
+            .flatten()
+    })
+}
+
+/// A reference to a dentry of `inode` (Linux d_find_any_alias)
+pub fn d_find_any_alias(inode: &Inode) -> Option<DentryRef> {
+    find_alias(inode, |_| true)
+}
+
+/// A reference to a hashed dentry of `inode`, or to a directory's one
+/// dentry, hashed or not (Linux d_find_alias)
+pub fn d_find_alias(inode: &Inode) -> Option<DentryRef> {
+    if inode.mode().is_dir() {
+        return d_find_any_alias(inode);
+    }
+    find_alias(inode, |dl| !dl.flags.unhashed)
+}
+
+/// The first alias of `inode` for which `f` holds (Linux
+/// find_acceptable_alias's walk): each taken under the alias lock and
+/// tested with it released, so `f` may take any lock and the
+/// references not kept are dropped unlocked; aliases added or removed
+/// meanwhile may be missed or seen twice
+pub fn d_find_alias_by(inode: &Inode, mut f: impl FnMut(&DentryRef) -> bool) -> Option<DentryRef> {
+    for n in 0.. {
+        let d = {
+            let al = inode.i_dentry.lock();
+            DentryRef::try_get(al.iter().nth(n)?)
+        };
+        if let Some(d) = d.filter(|d| f(d)) {
+            return Some(d);
+        }
+    }
+    None
 }
 
 /// Longest path name, its NUL included (Linux PATH_MAX)
@@ -799,7 +904,14 @@ impl DentryRef {
     pub fn new(d: Dentry) -> Result<Self, KernelError> {
         let b = crate::util::kalloc::try_box(d)?;
         NR_DENTRY.fetch_add(1, Ordering::Relaxed);
-        Ok(Self(NonNull::from(Box::leak(b))))
+        let r = Self(NonNull::from(Box::leak(b)));
+        // A positive one joins its inode's aliases (Linux d_instantiate)
+        let inode = r.d_lock.read().inode.clone();
+        if let Some(i) = inode {
+            let mut al = i.i_dentry.lock();
+            alias_add(&mut al, &r.d_lock.read(), &r);
+        }
+        Ok(r)
     }
 
     /// Both are the same dentry
@@ -934,8 +1046,17 @@ unsafe fn dentry_kill(d: NonNull<Dentry>) -> Option<NonNull<Dentry>> {
     if let Some(prune) = r.d_op.and_then(|o| o.d_prune) {
         prune(r);
     }
-    let inode = r.d_lock.write().inode.take();
+    // Its inode's alias lock first; nothing else changes the inode of
+    // a dentry with no reference left
+    let inode = r.d_lock.read().inode.clone();
     if let Some(i) = inode {
+        let mut al = i.i_dentry.lock();
+        let mut dl = r.d_lock.write();
+        let taken = dl.inode.take();
+        alias_del(&mut al, &dl, r);
+        drop(dl);
+        drop(al);
+        drop(taken);
         crate::io::inotify::d_iput(&i);
     }
     // The parent's reference is ours now; the pointer stays
@@ -1381,6 +1502,37 @@ mod tests {
         assert!(DentryRef::ptr_eq(&g, &r) && DentryRef::count(&r) == 2);
         drop(g);
         assert_eq!(DentryRef::count(&r), 1);
+    }
+
+    /// An inode's aliases follow its dentries: a hashed one is found
+    /// before one a delete left unhashed for its holder, and a killed
+    /// one leaves the list
+    #[test]
+    fn aliases_follow_dentries() {
+        let r = DentryRef::new(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let i = Inode::alloc(Inode::new(
+            2,
+            InodeMode::regular(0o644),
+            0,
+            0,
+            0,
+            Timespec::from_secs(0),
+            Weak::new(),
+            &NULL_INODE_OPS,
+        ))
+        .unwrap();
+        let b = Dentry::alloc(&r, b"b", Some(i.clone())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(i.clone())).unwrap();
+        assert!(d_find_any_alias(&i).is_some_and(|d| DentryRef::ptr_eq(&d, &a)));
+        let holder = a.clone();
+        r.d_delete(b"a", 1);
+        assert!(a.is_unhashed() && !a.is_negative());
+        assert!(d_find_alias(&i).is_some_and(|d| DentryRef::ptr_eq(&d, &b)));
+        assert!(d_find_alias_by(&i, |d| DentryRef::ptr_eq(d, &a)).is_some());
+        drop((a, holder));
+        assert_eq!(i.i_dentry.lock().len(), 1);
+        r.d_delete(b"b", 1);
+        assert!(b.is_negative() && d_find_any_alias(&i).is_none());
     }
 
     /// A real exchange swaps names and parents

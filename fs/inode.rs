@@ -633,6 +633,10 @@ pub struct Inode {
     /// On its superblock's `s_inodes` (Linux i_sb_list), from
     /// [`Inode::alloc`] to its eviction
     pub(super) i_sb_list: list::Link,
+    /// Its dentries (Linux i_dentry, under i_lock): every live dentry
+    /// whose inode it is, linked through `Dentry.d_alias`; a spin lock
+    /// taken before any d_lock (`fs::dentry`)
+    pub(super) i_dentry: Mutex<list::List<super::dentry::AliasA>>,
 }
 
 crate::adapter!(pub SbInodeA, Inode, i_sb_list);
@@ -776,6 +780,7 @@ impl Inode {
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
             i_sb_list: list::Link::new(),
+            i_dentry: Mutex::new(list::List::new()),
         }
     }
 
@@ -839,6 +844,7 @@ impl Inode {
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
             i_sb_list: list::Link::new(),
+            i_dentry: Mutex::new(list::List::new()),
         }
     }
 
