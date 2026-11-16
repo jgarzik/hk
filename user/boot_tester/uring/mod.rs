@@ -6,6 +6,7 @@ pub mod dio;
 pub mod fixed;
 pub mod iopoll;
 pub mod iowq;
+pub mod openat2;
 pub mod ring;
 pub mod setup;
 pub mod wait;
@@ -29,6 +30,7 @@ pub fn run_tests() {
     fixed::run_tests();
     iopoll::run_tests();
     iowq::run_tests();
+    openat2::run_tests();
 }
 
 /// One mapped region

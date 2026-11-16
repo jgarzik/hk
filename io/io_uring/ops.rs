@@ -36,8 +36,8 @@ pub enum How {
 /// How the non-read/write opcode `op` is issued
 pub fn how(op: u8) -> How {
     match op {
-        IORING_OP_OPENAT | IORING_OP_FSYNC | IORING_OP_STATX | IORING_OP_FTRUNCATE
-        | IORING_OP_ACCEPT | IORING_OP_CONNECT => How::Punt,
+        IORING_OP_OPENAT | IORING_OP_OPENAT2 | IORING_OP_FSYNC | IORING_OP_STATX
+        | IORING_OP_FTRUNCATE | IORING_OP_ACCEPT | IORING_OP_CONNECT => How::Punt,
         IORING_OP_SEND | IORING_OP_RECV | IORING_OP_SENDMSG | IORING_OP_RECVMSG => How::TryNoWait,
         _ => How::Inline,
     }
@@ -85,6 +85,12 @@ pub fn run_blocking(sqe: &IoUringSqe) -> KernelResult<i32> {
         IORING_OP_OPENAT => {
             crate::fs::syscall::sys_openat(sqe.fd, UserPtr::new(sqe.addr), sqe.op_flags, sqe.len)
         }
+        IORING_OP_OPENAT2 => crate::fs::open::uring_openat2(
+            sqe.fd,
+            UserPtr::new(sqe.addr),
+            sqe.off,
+            sqe.len as usize,
+        ),
         IORING_OP_FSYNC => fsync(sqe),
         IORING_OP_STATX => crate::fs::syscall::sys_statx(
             sqe.fd,
@@ -101,6 +107,32 @@ pub fn run_blocking(sqe: &IoUringSqe) -> KernelResult<i32> {
         IORING_OP_LINK_TIMEOUT => Ok(0),
         _ => net(sqe, 0).unwrap_or(Err(KernelError::InvalidArgument)),
     }
+}
+
+/// The submission checks of IORING_OP_OPENAT and IORING_OP_OPENAT2, in
+/// Linux's order (io_openat2_prep, __io_openat_prep): OPENAT2's
+/// open_how sized and readable (EINVAL, EFAULT, E2BIG), no buffer index
+/// (EINVAL), no registered file (EBADF), no direct descriptor slot
+/// (`file_index`: EINVAL with O_CLOEXEC; hk installs none, EINVAL too,
+/// BUGS.md). The worker reads the open_how again
+pub fn open_prep(sqe: &IoUringSqe) -> KernelResult<()> {
+    use crate::fs::open::{OPEN_HOW_SIZE_VER0, read_open_how};
+    if sqe.opcode == IORING_OP_OPENAT2 {
+        if (sqe.len as usize) < OPEN_HOW_SIZE_VER0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        read_open_how(sqe.off, sqe.len as usize)?;
+    }
+    if sqe.buf_index != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    if sqe.flags & super::abi::IOSQE_FIXED_FILE != 0 {
+        return Err(KernelError::BadFd);
+    }
+    if sqe.splice_fd_in != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(())
 }
 
 fn fsync(sqe: &IoUringSqe) -> KernelResult<i32> {

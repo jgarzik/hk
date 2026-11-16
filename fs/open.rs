@@ -101,7 +101,7 @@ pub mod resolve {
 }
 
 /// The first published open_how (Linux OPEN_HOW_SIZE_VER0)
-const OPEN_HOW_SIZE_VER0: usize = 24;
+pub const OPEN_HOW_SIZE_VER0: usize = 24;
 
 /// What an open does (Linux struct open_flags, fs/internal.h)
 pub struct OpenFlags {
@@ -351,6 +351,13 @@ pub fn sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: u64, usize: usize) ->
     if usize as u64 > crate::mm::PAGE_SIZE {
         return Err(KernelError::ArgListTooLong);
     }
+    do_sys_openat2(dirfd, path_ptr, &read_open_how(how, usize)?)
+}
+
+/// The `struct open_how` of `usize` bytes at `how` (Linux
+/// copy_struct_from_user: E2BIG for unknown nonzero fields, EFAULT),
+/// O_LARGEFILE added unless O_PATH; the caller checked the size
+pub fn read_open_how(how: u64, usize: usize) -> KernelResult<OpenHow> {
     let mut how = match crate::uaccess::copy_struct_from_user::<OpenHow>(how, usize) {
         Ok(h) => h,
         Err(None) => return Err(KernelError::ArgListTooLong),
@@ -359,7 +366,21 @@ pub fn sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: u64, usize: usize) ->
     if how.flags & u64::from(O_PATH) == 0 {
         how.flags |= u64::from(O_LARGEFILE);
     }
-    do_sys_openat2(dirfd, path_ptr, &how)
+    Ok(how)
+}
+
+/// IORING_OP_OPENAT2 (Linux io_openat2): openat2 with no page limit on
+/// the struct's size
+pub fn uring_openat2(
+    dirfd: i32,
+    path_ptr: UserPtr<u8>,
+    how: u64,
+    usize: usize,
+) -> KernelResult<i32> {
+    if usize < OPEN_HOW_SIZE_VER0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    do_sys_openat2(dirfd, path_ptr, &read_open_how(how, usize)?)
 }
 
 /// Open as `how` asks and install the file (Linux do_sys_openat2): the

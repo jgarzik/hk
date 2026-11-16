@@ -300,6 +300,11 @@ impl IoRing {
             IORING_OP_WRITE_FIXED => return rw::rw(self, s, sqe, true, Kind::Fixed),
             // Valid only inside a chain
             IORING_OP_LINK_TIMEOUT => return Some(Err(KernelError::InvalidArgument)),
+            IORING_OP_OPENAT | IORING_OP_OPENAT2 => {
+                if let Err(e) = ops::open_prep(sqe) {
+                    return Some(Err(e));
+                }
+            }
             _ => {}
         }
         let force = sqe.flags & IOSQE_ASYNC != 0;

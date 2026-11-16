@@ -69,6 +69,7 @@ pub const IORING_OP_READ: u8 = 22;
 pub const IORING_OP_WRITE: u8 = 23;
 pub const IORING_OP_SEND: u8 = 26;
 pub const IORING_OP_RECV: u8 = 27;
+pub const IORING_OP_OPENAT2: u8 = 28;
 pub const IORING_OP_SHUTDOWN: u8 = 34;
 pub const IORING_OP_FTRUNCATE: u8 = 46;
 
