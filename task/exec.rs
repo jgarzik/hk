@@ -1269,6 +1269,10 @@ where
             if vma.flags & crate::mm::VM_SIGPAGE != 0 {
                 mm.set_sigpage(vma.start);
             }
+            // Counted in total_vm as every mapping (Linux: vm_mmap of
+            // each segment, the stack's in __bprm_mm_init), so
+            // RLIMIT_AS sees the image and the stack
+            m.add_total_vm(vma.size() / crate::mm::PAGE_SIZE);
             m.insert_vma(vma);
         }
     }

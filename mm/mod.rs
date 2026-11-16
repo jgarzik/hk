@@ -486,6 +486,27 @@ impl MmStruct {
         (floor, ceiling)
     }
 
+    /// Bytes of [start, end) already mapped (Linux count_vma_pages_range,
+    /// in bytes): what a fixed mapping there replaces
+    pub fn mapped_in(&self, start: u64, end: u64) -> u64 {
+        self.vmas
+            .iter()
+            .map(|v| v.end.min(end).saturating_sub(v.start.max(start)))
+            .sum()
+    }
+
+    /// Whether the address space may grow by `len` bytes, `replaced`
+    /// of them already mapped where they go (Linux may_expand_vm with
+    /// mmap_region's overlap): RLIMIT_AS
+    pub fn may_expand(&self, len: u64, replaced: u64) -> bool {
+        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_AS);
+        limit == crate::task::rlimit::RLIM_INFINITY
+            || (self.total_vm() * PAGE_SIZE)
+                .saturating_sub(replaced)
+                .saturating_add(len)
+                <= limit
+    }
+
     /// Check if the given range overlaps any existing VMA
     pub fn overlaps(&self, start: u64, end: u64) -> bool {
         self.vmas

@@ -150,9 +150,6 @@ Missing:
   (Linux gup_must_unshare).
 - shmdt needs the address an attachment starts at (Linux also finds a
   piece moved by mremap); SHM_EXEC is ignored.
-- shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
-  range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
-  an address).
 
 ## NUMA gaps
 

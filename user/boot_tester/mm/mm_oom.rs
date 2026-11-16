@@ -5,6 +5,11 @@
 //! - OOM_RLIMIT_AS: past RLIMIT_AS, mmap and mremap fail with ENOMEM and
 //!   brk leaves the break where it was; mremap(MREMAP_DONTUNMAP), which
 //!   keeps the old range, is charged the whole new one
+//! - OOM_RLIMIT_AS_FIXED: a MAP_FIXED mapping that would grow past
+//!   RLIMIT_AS fails with ENOMEM and leaves the mapping it would have
+//!   replaced (Linux mmap_region checks before unmapping)
+//! - OOM_RLIMIT_AS_SHM_REMAP: at the limit, shmat(SHM_REMAP) over a
+//!   mapping of the segment's size adds nothing and succeeds
 //! - OOM_RLIMIT_MEMLOCK: an unprivileged process cannot grow an mlocked
 //!   mapping with mremap past RLIMIT_MEMLOCK (EAGAIN)
 //! - OOM_FAULT_KILL (hk only: on Linux the OOM killer's victim choice
@@ -33,6 +38,9 @@ use crate::harness::verdict_detail;
 use crate::helpers::{host_mode, print, print_num, println, skip};
 use crate::mm::mm_life::{exhaust_ok, meminfo};
 use hk_syscall::{
+    IPC_CREAT, IPC_PRIVATE, IPC_RMID, MAP_FIXED, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget,
+};
+use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_MAYMOVE, O_NONBLOCK, O_RDONLY,
     PROT_READ, PROT_WRITE, RLIMIT_AS, RLIMIT_MEMLOCK, RLIMIT_NOFILE, RLimit, Timespec, sys_brk,
     sys_close, sys_exit, sys_fork, sys_mlock, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep,
@@ -48,6 +56,10 @@ const MB: u64 = 1 << 20;
 
 pub fn run_tests() {
     rlimit_as();
+    let r = in_child(rlimit_as_fixed_child);
+    verdict_detail(b"OOM_RLIMIT_AS_FIXED", r == 0, r);
+    let r = in_child(rlimit_as_shm_child);
+    verdict_detail(b"OOM_RLIMIT_AS_SHM_REMAP", r == 0, r);
     rlimit_memlock();
     fault_kill(b"OOM_FAULT_KILL", hog);
     fault_kill(b"OOM_SHARED_KILL", hog_shared);
@@ -174,6 +186,75 @@ fn rlimit_as_child() -> u64 {
         return 6;
     }
     0
+}
+
+/// RLIMIT_AS at what is mapped plus `room`
+fn limit_as(room: u64) -> bool {
+    let used = mapped_bytes();
+    let lim = RLimit {
+        rlim_cur: used + room,
+        rlim_max: used + room,
+    };
+    used != 0 && sys_setrlimit(RLIMIT_AS, &lim) == 0
+}
+
+/// Child: one page mapped and written, a page of room; a 3-page
+/// MAP_FIXED over it is ENOMEM and the page still reads back
+fn rlimit_as_fixed_child() -> u64 {
+    let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+    let m = sys_mmap(0, 3 * PAGE, PROT_READ | PROT_WRITE, anon, -1, 0);
+    if m < 0 {
+        return 1;
+    }
+    let m = m as u64;
+    sys_munmap(m + PAGE, 2 * PAGE);
+    // SAFETY: the page just mapped
+    unsafe { core::ptr::write_volatile(m as *mut u8, 0xab) };
+    if !limit_as(PAGE) {
+        return 2;
+    }
+    let r = sys_mmap(m, 3 * PAGE, PROT_READ | PROT_WRITE, anon | MAP_FIXED, -1, 0);
+    if r != ENOMEM {
+        return 3;
+    }
+    // SAFETY: still mapped if the refused mapping left it (else SIGSEGV)
+    if unsafe { core::ptr::read_volatile(m as *const u8) } != 0xab {
+        return 4;
+    }
+    0
+}
+
+/// Child: a page-sized segment attached with SHM_REMAP over a mapped
+/// page while the address space is at its limit
+fn rlimit_as_shm_child() -> u64 {
+    const SHM_REMAP: i32 = 0o40000;
+    let id = sys_shmget(IPC_PRIVATE, PAGE as usize, IPC_CREAT | 0o600);
+    if id < 0 {
+        return 1;
+    }
+    let a = sys_mmap(
+        0,
+        PAGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    let ok = a > 0 && limit_as(0);
+    let r = if ok {
+        sys_shmat(id as i32, a as u64, SHM_REMAP)
+    } else {
+        -1
+    };
+    if r > 0 {
+        sys_shmdt(r as u64);
+    }
+    sys_shmctl(id as i32, IPC_RMID, 0);
+    match () {
+        _ if !ok => 2,
+        _ if r != a => 3,
+        _ => 0,
+    }
 }
 
 /// Child: RLIMIT_MEMLOCK 64KB, no privileges, 16KB mlocked; growing

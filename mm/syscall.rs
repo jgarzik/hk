@@ -257,6 +257,13 @@ pub fn do_mmap(
             return Err(KernelError::OutOfMemory);
         }
         if is_fixed {
+            // RLIMIT_AS counts what the mapping adds, before anything
+            // is unmapped (Linux mmap_region: a refused mapping leaves
+            // the old one)
+            let old = mm_guard.mapped_in(addr, addr + length);
+            if !mm_guard.may_expand(length, old) {
+                return Err(KernelError::OutOfMemory);
+            }
             replaced = munmap_locked(&mut mm_guard, &mm, addr, addr + length);
         }
         addr
@@ -277,13 +284,10 @@ pub fn do_mmap(
             .ok_or(KernelError::OutOfMemory)?
     };
 
-    // Check RLIMIT_AS (address space limit) before creating VMA
-    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_AS);
-    if limit != crate::task::rlimit::RLIM_INFINITY {
-        let current_bytes = mm_guard.total_vm() * PAGE_SIZE;
-        if current_bytes.saturating_add(length) > limit {
-            return Err(KernelError::OutOfMemory);
-        }
+    // RLIMIT_AS (Linux may_expand_vm): a MAP_FIXED mapping was checked
+    // above, its old pages already unmapped
+    if !mm_guard.may_expand(length, 0) {
+        return Err(KernelError::OutOfMemory);
     }
 
     // A shared mapping of /dev/zero is shared anonymous memory (Linux
