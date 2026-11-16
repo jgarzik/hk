@@ -140,6 +140,11 @@ impl T {
         cond
     }
 
+    /// Has a check failed?
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
     pub fn done(self) {
         if !self.failed {
             print(self.name);

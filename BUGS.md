@@ -11,6 +11,12 @@ infallible, so each one is investigated, not written off.
   -95 (EOPNOTSUPP) on Ubuntu 26.04's 7.0 kernel
   (`LINUX_RELEASE=resolute ./tools/linux-boot-tester.sh`); passes on 6.8
   and hk. Likely the boot's poll queues or the 7.0 IOPOLL rules.
+- **ICMP reply counted as echo reply:** Linux icmp_reply leaves
+  fl4_icmp_type 0 and the ICMP control socket is SOCK_RAW, so
+  __ip_make_skb's icmp_out_count counts every reply (timestamp replies
+  included) as an echo reply: Icmp OutEchoReps and IcmpMsg OutType0,
+  never OutTimestampReps. hk's icmp_reply matches it (the
+  `IpParams::icmp_type` override); `net/icmp_ts` tests the Linux count.
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
@@ -87,8 +93,9 @@ so memory pressure does not clamp windows), no orphan count limit
 (tcp_max_orphans; only the memory half of tcp_out_of_resources), no per-netns
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
-No SYN cookies (a full listener drops SYNs). ICMP
-timestamp requests are not answered.
+No SYN cookies (a full listener drops SYNs). Echo and timestamp
+replies skip the ICMP rate limits (Linux icmp_reply applies them when
+icmp_ratemask names the reply type, which the default does not).
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are

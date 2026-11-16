@@ -181,6 +181,7 @@ impl Inet {
             ttl: self.ttl(),
             pmtudisc: self.pmtudisc(),
             id: connected.then(|| self.id.fetch_add(1, Ordering::Relaxed)),
+            icmp_type: None,
         }
     }
 

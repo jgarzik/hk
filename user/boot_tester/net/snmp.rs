@@ -28,7 +28,7 @@ use crate::net::sk::*;
 use crate::net::tcp_xfer::{accept, listener, set_timeo, wait_child};
 use crate::ns::pid_path;
 
-const SNMP: &[u8] = b"/proc/net/snmp\0";
+pub const SNMP: &[u8] = b"/proc/net/snmp\0";
 const NETSTAT: &[u8] = b"/proc/net/netstat\0";
 const ECONNREFUSED: i64 = -111;
 
@@ -41,13 +41,13 @@ pub fn run_tests() {
 }
 
 /// A /proc MIB file's text
-struct Mib {
+pub struct Mib {
     buf: [u8; 8192],
     len: usize,
 }
 
 impl Mib {
-    fn read(path: &[u8]) -> Option<Mib> {
+    pub fn read(path: &[u8]) -> Option<Mib> {
         let mut m = Mib {
             buf: [0; 8192],
             len: 0,
@@ -92,7 +92,7 @@ impl Mib {
     }
 
     /// `get`, with a missing field as 0
-    fn val(&self, tag: &[u8], name: &[u8]) -> i64 {
+    pub fn val(&self, tag: &[u8], name: &[u8]) -> i64 {
         self.get(tag, name).unwrap_or(0)
     }
 }

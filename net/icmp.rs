@@ -1,7 +1,8 @@
 //! ICMP (Linux net/ipv4/icmp.c)
 //!
 //! Receive: echo requests are answered (icmp_echo_ignore_all,
-//! icmp_echo_ignore_broadcasts), echo replies go to ping sockets, and
+//! icmp_echo_ignore_broadcasts), so are timestamp requests (only
+//! icmp_echo_ignore_broadcasts applies), echo replies go to ping sockets, and
 //! error messages (destination unreachable, time exceeded, parameter
 //! problem) are matched to the socket that sent the offending packet
 //! (`IcmpErr` -> raw, UDP, ping; TCP's hook waits for the TCP rewrite).
@@ -48,6 +49,7 @@ pub mod icmp_type {
     pub const TIME_EXCEEDED: u8 = 11;
     pub const PARAMETERPROB: u8 = 12;
     pub const TIMESTAMP: u8 = 13;
+    pub const TIMESTAMPREPLY: u8 = 14;
     pub const ADDRESS: u8 = 17;
     pub const ADDRESSREPLY: u8 = 18;
     /// Highest known type (NR_ICMP_TYPES)
@@ -305,6 +307,7 @@ pub fn icmp_rcv(skb: SkBuff) {
     }
     match ty {
         icmp_type::ECHO => icmp_echo(&net, &skb),
+        icmp_type::TIMESTAMP => icmp_timestamp(&net, &skb),
         icmp_type::ECHO_REPLY => {
             ICMP_IN_ECHO_REPS.fetch_add(1, Ordering::Relaxed);
             ICMP_ECHO_REPLY_WQ.wake_all();
@@ -318,11 +321,47 @@ pub fn icmp_rcv(skb: SkBuff) {
     }
 }
 
-/// Answer an echo request (Linux icmp_echo + icmp_reply)
+/// Answer an echo request (Linux icmp_echo)
 fn icmp_echo(net: &NetNamespace, skb: &SkBuff) {
     if net.sysctl.icmp_echo_ignore_all() {
         return;
     }
+    icmp_reply(net, skb, icmp_type::ECHO_REPLY, skb.data(), &[]);
+}
+
+/// Answer a timestamp request (Linux icmp_timestamp): the request's
+/// header and originate time, then receive and transmit times, both
+/// now; anything past the originate time is not echoed
+fn icmp_timestamp(net: &NetNamespace, skb: &SkBuff) {
+    let req = skb.data();
+    // Linux: too short past the header
+    if req.len() < ICMP_HLEN + 4 {
+        net.mib.icmp.inc(ICMP_MIB_INERRORS);
+        return;
+    }
+    let now = inet_current_timestamp().to_be_bytes();
+    let mut times = [0u8; 8];
+    times[..4].copy_from_slice(&now);
+    times[4..].copy_from_slice(&now);
+    let head = &req[..ICMP_HLEN + 4];
+    icmp_reply(net, skb, icmp_type::TIMESTAMPREPLY, head, &times);
+}
+
+/// Milliseconds since midnight UTC (Linux inet_current_timestamp,
+/// net/ipv4/af_inet.c; host order here, sent big-endian)
+pub fn inet_current_timestamp() -> u32 {
+    ms_of_day(crate::time::realtime_ns())
+}
+
+/// Milliseconds into the UTC day of a CLOCK_REALTIME `ns`
+fn ms_of_day(ns: u64) -> u32 {
+    ((ns / 1_000_000) % 86_400_000) as u32
+}
+
+/// Send `head` (a received request's ICMP header and leading data)
+/// then `tail` back to its sender as type `ty`, code 0 (Linux
+/// icmp_reply + icmp_push_reply)
+fn icmp_reply(net: &NetNamespace, skb: &SkBuff, ty: u8, head: &[u8], tail: &[u8]) {
     let (Some(src), Some(dst)) = (skb.saddr, skb.daddr) else {
         return;
     };
@@ -330,20 +369,20 @@ fn icmp_echo(net: &NetNamespace, skb: &SkBuff) {
     if bad(src) {
         return;
     }
-    let req = skb.data();
-    let Some(mut out) = SkBuff::alloc_tx(req.len(), Gfp::ATOMIC) else {
+    let Some(mut out) = SkBuff::alloc_tx(head.len() + tail.len(), Gfp::ATOMIC) else {
         // Linux icmp_push_reply: ip_append_data failed
         net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
         net.mib.out_discard();
         return;
     };
-    if out.put_slice(req).is_none() {
+    if out.put_slice(head).is_none() || out.put_slice(tail).is_none() {
         net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
         net.mib.out_discard();
         return;
     }
     let h = out.data_mut();
-    h[0] = icmp_type::ECHO_REPLY;
+    h[0] = ty;
+    h[1] = 0;
     h[2] = 0;
     h[3] = 0;
     let c = ip_checksum(h);
@@ -351,8 +390,11 @@ fn icmp_echo(net: &NetNamespace, skb: &SkBuff) {
     // A broadcast request is answered from our address on that link
     out.saddr = Some(if skb.ip_bcast { Ipv4Addr(0) } else { dst });
     out.daddr = Some(src);
+    // Linux icmp_reply leaves fl4_icmp_type 0, so every reply counts
+    // as an echo reply (Icmp OutEchoReps, IcmpMsg OutType0)
     let p = IpParams {
         tos: skb.ip_tos,
+        icmp_type: Some(icmp_type::ECHO_REPLY),
         ..Default::default()
     };
     // Linux icmp_reply: no reply without a route
@@ -736,6 +778,17 @@ mod tests {
         assert!(!p.allow(100_500, 1000));
         assert!(p.allow(101_000, 1000));
         assert!(!p.allow(101_001, 1000));
+    }
+
+    #[test]
+    fn timestamp_ms_of_day() {
+        assert_eq!(ms_of_day(0), 0);
+        // 1 day + 1 h + 2.345678 s past the epoch
+        let ns = (86_400 + 3_600 + 2) * 1_000_000_000 + 345_678_901;
+        assert_eq!(ms_of_day(ns), 3_602_345);
+        // Last millisecond of a day, then the next midnight
+        assert_eq!(ms_of_day(86_400_000_000_000 - 1), 86_399_999);
+        assert_eq!(ms_of_day(86_400_000_000_000), 0);
     }
 
     #[test]

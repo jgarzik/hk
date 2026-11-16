@@ -538,6 +538,10 @@ pub struct IpParams {
     /// Identification from a connected socket's counter (Linux
     /// inet_id); None = DF packets get 0, others a hashed id
     pub id: Option<u16>,
+    /// ICMP type counted for the packet in place of its header's
+    /// (Linux fl4_icmp_type of a SOCK_RAW sender, which
+    /// __ip_make_skb counts)
+    pub icmp_type: Option<u8>,
 }
 
 impl Default for IpParams {
@@ -547,6 +551,7 @@ impl Default for IpParams {
             ttl: IP_DEFAULT_TTL,
             pmtudisc: pmtu::WANT,
             id: None,
+            icmp_type: None,
         }
     }
 }
@@ -618,7 +623,7 @@ pub fn ip_send_rt(
     let c = ip_checksum(&h[..IP_HLEN_MIN]);
     h[10..12].copy_from_slice(&c.to_be_bytes());
     if protocol == IPPROTO_ICMP
-        && let Some(&ty) = skb.data().get(IP_HLEN_MIN)
+        && let Some(ty) = p.icmp_type.or(skb.data().get(IP_HLEN_MIN).copied())
     {
         // Linux __ip_make_skb
         net.mib.icmp_out_count(ty);
