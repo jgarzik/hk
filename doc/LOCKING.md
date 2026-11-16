@@ -5220,10 +5220,14 @@ refcount.fetch_add(1, Ordering::Relaxed);
 
 // Tick count
 TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-
-// Preempt count
-preempt_count.fetch_add(1, Ordering::Relaxed);
 ```
+
+The preempt count and interrupt depth are this CPU's alone: one
+unlocked `add gs:[field]` on x86 (Linux raw_cpu_add_4 on
+`__preempt_count`), a plain load and store on arm64 (Linux
+`__preempt_count_add`), with a compiler barrier on the inside of the
+section. No lock prefix is needed: only the CPU writes them, and an
+interrupt that changes them restores them before returning.
 
 ### 5.2 Atomic File Position
 

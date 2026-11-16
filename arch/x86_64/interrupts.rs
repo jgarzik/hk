@@ -717,16 +717,11 @@ pub const RESCHEDULE_VECTOR: u8 = 0xfd;
 /// Run `f` as an interrupt handler: interrupt depth and lockdep's
 /// interrupt context account for it
 fn in_irq(f: impl FnOnce()) {
-    let percpu = super::percpu::try_current_cpu();
-    if let Some(p) = percpu {
-        p.interrupt_depth.fetch_add(1, Ordering::Relaxed);
-    }
+    super::percpu::irq_depth_enter();
     crate::sync::lockdep::irq_enter();
     f();
     crate::sync::lockdep::irq_exit();
-    if let Some(p) = percpu {
-        p.interrupt_depth.fetch_sub(1, Ordering::Relaxed);
-    }
+    super::percpu::irq_depth_exit();
 }
 
 /// Call-function IPI (Linux sysvec_call_function): EOI first, so a call
@@ -818,11 +813,11 @@ fn handle_lapic_timer() {
         return;
     };
 
-    // Increment interrupt depth
-    percpu.interrupt_depth.fetch_add(1, Ordering::Relaxed);
+    super::percpu::irq_depth_enter();
 
-    // Increment per-CPU tick counter
-    percpu.ticks.fetch_add(1, Ordering::Relaxed);
+    // This CPU's tick count: its only writer (a plain add; others read)
+    let t = percpu.ticks.load(Ordering::Relaxed);
+    percpu.ticks.store(t.wrapping_add(1), Ordering::Relaxed);
 
     // Update global timekeeper (only on CPU 0 to avoid contention)
     if percpu.id() == 0 {
@@ -835,8 +830,7 @@ fn handle_lapic_timer() {
     // Send EOI to LAPIC (must be done before any potential context switch)
     lapic::eoi();
 
-    // Decrement interrupt depth
-    percpu.interrupt_depth.fetch_sub(1, Ordering::Relaxed);
+    super::percpu::irq_depth_exit();
 }
 
 /// Legacy PIC interrupt `irq` (0-15)

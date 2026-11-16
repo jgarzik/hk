@@ -342,10 +342,32 @@ pub const ARCH_SET_CPUID: i32 = 0x1012;
 /// Must be paired with `preempt_enable()`.
 #[inline]
 pub fn preempt_disable() {
-    if let Some(percpu) = try_current_cpu() {
-        percpu.preempt_count.fetch_add(1, Ordering::Relaxed);
+    if crate::task::percpu::PERCPU_UP.load(Ordering::Relaxed) {
+        this_cpu_add!(preempt_count, 1u32);
     }
 }
+
+/// Add `$v` (wrapping) to this CPU's u32 field `$f` of its `PerCpu`
+/// in one unlocked instruction on the GS base (Linux raw_cpu_add_4:
+/// `addl %gs:`): only this CPU writes the field, and an interrupt
+/// cannot split one instruction (one that changes the field restores
+/// it before returning). No `nomem`: a compiler barrier, as Linux's
+/// preempt_disable has
+macro_rules! this_cpu_add {
+    ($f:ident, $v:expr) => {
+        // SAFETY: GS base is this CPU's PerCpu once PERCPU_UP is set (its
+        // callers check), and `$f` is a u32 field of it
+        unsafe {
+            ::core::arch::asm!(
+                "add dword ptr gs:[{o}], {v:e}",
+                o = const ::core::mem::offset_of!(PerCpu, $f),
+                v = in(reg) $v,
+                options(nostack)
+            )
+        }
+    };
+}
+pub(super) use this_cpu_add;
 
 /// Enable preemption on the current CPU
 ///
@@ -355,13 +377,31 @@ pub fn preempt_disable() {
 /// Must be paired with `preempt_disable()`.
 #[inline]
 pub fn preempt_enable() {
-    if let Some(percpu) = try_current_cpu() {
-        let prev = percpu.preempt_count.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(prev > 0, "preempt_enable called with preempt_count == 0");
+    if crate::task::percpu::PERCPU_UP.load(Ordering::Relaxed) {
+        debug_assert!(
+            preempt_count() > 0,
+            "preempt_enable called with preempt_count == 0"
+        );
+        this_cpu_add!(preempt_count, u32::MAX);
+        // A reschedule this enable could owe waits for the next check
+        // point (interrupt exit, yield): the kernel is not preemptive
+    }
+}
 
-        // If preempt_count is now 0 and reschedule is needed, we could
-        // trigger a reschedule here. For now, we defer to the existing
-        // reschedule check points (timer interrupt exit, yield, etc.)
+/// Enter interrupt context on this CPU (Linux irq_enter's
+/// preempt_count HARDIRQ_OFFSET): `interrupt_depth` + 1
+#[inline]
+pub fn irq_depth_enter() {
+    if crate::task::percpu::PERCPU_UP.load(Ordering::Relaxed) {
+        this_cpu_add!(interrupt_depth, 1u32);
+    }
+}
+
+/// Leave interrupt context on this CPU (`interrupt_depth` - 1)
+#[inline]
+pub fn irq_depth_exit() {
+    if crate::task::percpu::PERCPU_UP.load(Ordering::Relaxed) {
+        this_cpu_add!(interrupt_depth, u32::MAX);
     }
 }
 

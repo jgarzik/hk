@@ -267,8 +267,19 @@ pub fn online_cpu_count() -> u32 {
 #[inline]
 pub fn preempt_disable() {
     if let Some(percpu) = try_current_cpu() {
-        percpu.preempt_count.fetch_add(1, Ordering::Relaxed);
+        this_cpu_add(&percpu.preempt_count, 1);
+        // Linux preempt_disable's barrier(): the section stays after it
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
     }
+}
+
+/// Add `v` (wrapping) to this CPU's counter `c` with a plain load and
+/// store (Linux arm64 __preempt_count_add: READ_ONCE, WRITE_ONCE): only
+/// this CPU writes it, and an interrupt between the two that changes it
+/// restores it before returning
+#[inline]
+pub fn this_cpu_add(c: &AtomicU32, v: u32) {
+    c.store(c.load(Ordering::Relaxed).wrapping_add(v), Ordering::Relaxed);
 }
 
 /// Enable preemption on the current CPU
@@ -280,12 +291,15 @@ pub fn preempt_disable() {
 #[inline]
 pub fn preempt_enable() {
     if let Some(percpu) = try_current_cpu() {
-        let prev = percpu.preempt_count.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(prev > 0, "preempt_enable called with preempt_count == 0");
-
-        // If preempt_count is now 0 and reschedule is needed, we could
-        // trigger a reschedule here. For now, we defer to the existing
-        // reschedule check points (timer interrupt exit, yield, etc.)
+        debug_assert!(
+            percpu.preempt_count.load(Ordering::Relaxed) > 0,
+            "preempt_enable called with preempt_count == 0"
+        );
+        // Linux preempt_enable's barrier(): the section stays before it
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        this_cpu_add(&percpu.preempt_count, u32::MAX);
+        // A reschedule this enable could owe waits for the next check
+        // point (interrupt exit, yield): the kernel is not preemptive
     }
 }
 

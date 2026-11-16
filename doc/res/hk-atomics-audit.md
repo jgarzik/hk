@@ -10,7 +10,7 @@ argued / published copy of locked state.
 
 - **Locked RMW where Linux does a plain per-CPU or single-writer update.**
   `fetch_add`/`swap` on state that only one CPU or one task writes (preempt
-  count, seqcount, per-task counters, rq fields under the rq lock). On x86 each
+  seqcount, per-task counters, rq fields under the rq lock). On x86 each
   is a `lock`-prefixed instruction (a full barrier), on arm64 an LSE atomic or
   an LL/SC loop; Linux uses `this_cpu_inc` / plain `++` / `WRITE_ONCE`.
 - **Sibling atomics of a lock.** Fields mutated only under a lock but kept as
@@ -26,21 +26,6 @@ argued / published copy of locked state.
   `sched`+`disable`) and the spin-lock primitive itself (`IrqSpinlock`).
 
 ## Findings
-
-### 1. preempt_count and interrupt_depth use locked RMW — (c)(a)
-- Where: `arch/x86_64/percpu.rs` and `arch/aarch64/percpu.rs`
-  `preempt_disable`/`preempt_enable` (`PerCpu.preempt_count.fetch_add/sub`);
-  `arch/x86_64/interrupts.rs` `interrupt_depth.fetch_add/sub`.
-- Wrong: the hottest counter in the kernel (every `IrqSpinlock`, spin `Mutex`,
-  `rcu::read_lock`, `kalloc::with_gfp`) pays a `lock xadd` (x86) / atomic
-  (arm64) twice per critical section. Only the owning CPU writes it.
-- Linux: x86 `__preempt_count` is a per-CPU int updated with a non-locked
-  `incl %gs:`; arm64 keeps it in `thread_info` with plain
-  `READ_ONCE`/`WRITE_ONCE` + `barrier()`. Safe because an interrupt that
-  changes it restores it before returning.
-- Fix: Relaxed `load` + `store` (or arch asm `incl %gs:off` on x86) plus a
-  compiler fence; same for `interrupt_depth`. Document the "interrupt restores
-  it" argument in LOCKING.md §6.
 
 ### 3. `IrqSpinlock` spins on compare-exchange; locks are unfair TAS — (c)(d)
 - Where: `sync/irqspin.rs` `IrqSpinlock::lock` (loop of
@@ -208,8 +193,8 @@ argued / published copy of locked state.
 
 ### 13. Dirty throttling sums every possible CPU's slot per write — (c)
 - Where: `mm/writeback.rs` `balance_dirty_pages` -> `mm/filemap.rs`
-  `nr_dirty`/`sum` over `NR_DIRTY` (all `NR_CPUS` slots, false-shared,
-  finding 2), plus `FRAME_ALLOCATOR.stats()`.
+  `nr_dirty`/`sum` over `NR_DIRTY` (every possible CPU's slot), plus
+  `FRAME_ALLOCATOR.stats()`.
 - Wrong: every buffered write and write fault walks the whole per-CPU array.
 - Linux: `global_node_page_state` reads one atomic (per-CPU diffs folded past
   a threshold); `balance_dirty_pages_ratelimited` checks only every
@@ -323,8 +308,7 @@ argued / published copy of locked state.
 - Sysctl knobs as Relaxed atomics (`net/sysctl.rs` `NetSysctl`, `io/pipe.rs`
   `PIPE_MAX_SIZE`/`PIPE_USER_PAGES_*`, `mm/writeback.rs` ratios): Linux
   READ_ONCE of sysctls; `ping_group` packs its pair in one word.
-- `net/tcp/mem.rs` `ALLOCATED`/`PRESSURE`/`LIMITS` (Linux design; only the
-  `FW_ALLOC` packing in finding 2 is wrong). `SOCKETS` could be a
+- `net/tcp/mem.rs` `ALLOCATED`/`PRESSURE`/`LIMITS` (Linux design). `SOCKETS` could be a
   `PercpuCounter` (Linux `tcp_sockets_allocated`), low.
 - `time/mod.rs` `TimeKeeper` seqlock; `mm/tlb.rs` `MmContext.tlb_gen`;
   `arch/aarch64/asid.rs` (Linux's generation + per-CPU active ASID scheme).
@@ -363,6 +347,6 @@ argued / published copy of locked state.
    §5.1 (`preempt_count.fetch_add`), §5.2 (`File::advance_pos` `fetch_add`
    though callers hold `f_pos_lock`), the `CachedPage` row (no such type),
    and the `TcpSock.snap` row once finding 10 lands.
-5. Phase order by blast radius: 1-3 (every lock, every per-CPU counter), then
+5. Phase order by blast radius: 3 (every lock), then
    4-6 (scheduler, allocator, syscall path), then 7-14 (RCU, VFS, net, mm
    hot paths), the rest as their subsystems are touched.

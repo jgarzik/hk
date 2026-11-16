@@ -144,13 +144,13 @@ fn irq_body() {
     // signal-context check)
     let depth = super::percpu::try_current_cpu().map(|p| &p.interrupt_depth);
     if let Some(d) = depth {
-        d.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        super::percpu::this_cpu_add(d, 1);
     }
     // On this CPU's IRQ stack, from either level (Linux
     // do_interrupt_handler)
     crate::irq_stack::run(irq_dispatch);
     if let Some(d) = depth {
-        d.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        super::percpu::this_cpu_add(d, u32::MAX);
     }
 }
 
