@@ -87,18 +87,37 @@ pub fn usb_bulk_msg(
     data: &mut [u8],
     timeout_ms: u64,
 ) -> Result<usize, UsbError> {
-    let (urb, done) = blocking_urb(dev, pipe, None, data.len())?;
-    if pipe.is_in() {
-        urb.fill(None, data.len())?;
+    let (r, n) = usb_bulk_msg_len(dev, pipe, data, timeout_ms);
+    r.map(|()| n)
+}
+
+/// `usb_bulk_msg` with the bytes moved even when it failed (Linux
+/// usb_bulk_msg's actual_length): a stalled transfer may have moved
+/// some, which IN copies into `data`
+pub fn usb_bulk_msg_len(
+    dev: &UsbDevice,
+    pipe: Pipe,
+    data: &mut [u8],
+    timeout_ms: u64,
+) -> (Result<(), UsbError>, usize) {
+    let (urb, done) = match blocking_urb(dev, pipe, None, data.len()) {
+        Ok(u) => u,
+        Err(e) => return (Err(e), 0),
+    };
+    let filled = if pipe.is_in() {
+        urb.fill(None, data.len())
     } else {
-        urb.fill(Some(data), data.len())?;
+        urb.fill(Some(data), data.len())
+    };
+    if let Err(e) = filled {
+        return (Err(e), 0);
     }
-    usb_start_wait_urb(&urb, &done, timeout_ms)?;
-    if pipe.is_in() {
-        urb.copy_out(data)
-    } else {
-        Ok(urb.actual_length())
+    let r = usb_start_wait_urb(&urb, &done, timeout_ms);
+    let n = urb.actual_length().min(data.len());
+    if pipe.is_in() && n > 0 && urb.copy_out(&mut data[..n]).is_err() {
+        return (Err(UsbError::BufferError), 0);
     }
+    (r, n)
 }
 
 /// Reset the host side of endpoint `ep` of `dev` (Linux
@@ -118,16 +137,7 @@ pub fn usb_clear_halt(dev: &UsbDevice, pipe: Pipe) -> Result<(), UsbError> {
 
 /// `usb_clear_halt` with a time limit (usb-storage's is 3 s)
 pub(super) fn clear_halt(dev: &UsbDevice, pipe: Pipe, timeout_ms: u64) -> Result<(), UsbError> {
-    const USB_REQ_CLEAR_FEATURE: u8 = 1;
-    const USB_RECIP_ENDPOINT: u8 = 2;
-    const USB_ENDPOINT_HALT: u16 = 0;
-    let setup = SetupPacket {
-        request_type: USB_RECIP_ENDPOINT,
-        request: USB_REQ_CLEAR_FEATURE,
-        value: USB_ENDPOINT_HALT,
-        index: u16::from(pipe.ep),
-        length: 0,
-    };
+    let setup = SetupPacket::clear_halt(pipe.ep);
     usb_control_msg(dev, &setup, &mut [], timeout_ms)?;
     usb_reset_endpoint(dev, pipe.ep);
     Ok(())

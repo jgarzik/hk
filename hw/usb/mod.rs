@@ -114,6 +114,30 @@ impl SetupPacket {
         }
     }
 
+    /// CLEAR_FEATURE(ENDPOINT_HALT) for endpoint address `ep` (Linux
+    /// usb_clear_halt)
+    pub fn clear_halt(ep: u8) -> Self {
+        Self {
+            request_type: 0x02, // USB_RECIP_ENDPOINT
+            request: 0x01,      // USB_REQ_CLEAR_FEATURE
+            value: 0,           // USB_ENDPOINT_HALT
+            index: u16::from(ep),
+            length: 0,
+        }
+    }
+
+    /// A class request with no data to interface `ifnum` (Linux
+    /// USB_TYPE_CLASS | USB_RECIP_INTERFACE)
+    pub fn class_intf(request: u8, ifnum: u8) -> Self {
+        Self {
+            request_type: 0x21,
+            request,
+            value: 0,
+            index: u16::from(ifnum),
+            length: 0,
+        }
+    }
+
     /// Device to host
     pub fn is_in(&self) -> bool {
         self.request_type & USB_DIR_IN != 0

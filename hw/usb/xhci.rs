@@ -1381,23 +1381,31 @@ impl Xhci {
             e.ep_state |= ep_state::EP_SOFT_CLEAR_TOGGLE;
         }
         let ctx_size = self.ctx_size;
-        let _ = self
-            .command(
+        {
+            // The device's input context, as every other command filling
+            // it (Linux gives the command its own)
+            let _m = self.mutex.lock();
+            // Configured whatever the stop completed with (an endpoint
+            // already stopped answers Context State Error), as Linux;
+            // only one never queued gives up
+            let stop = self.command(
                 slot_trb(trb_type::STOP_ENDPOINT, slot, dci, 0),
                 "Stop Endpoint",
-            )
-            .and_then(|_| {
-                self.fill_input_ctx(slot, |dev| {
-                    dev.out_ctx.copy_for_reset(ctx_size, dci, &mut dev.in_ctx);
-                    Ok(())
-                })
-            })
-            .and_then(|addr| {
-                self.command(
-                    slot_trb(trb_type::CONFIGURE_ENDPOINT, slot, 0, addr),
-                    "Configure Endpoint",
-                )
-            });
+            );
+            if matches!(stop, Ok(_) | Err(UsbError::TransferError(_))) {
+                let _ = self
+                    .fill_input_ctx(slot, |dev| {
+                        dev.out_ctx.copy_for_reset(ctx_size, dci, &mut dev.in_ctx);
+                        Ok(())
+                    })
+                    .and_then(|addr| {
+                        self.command(
+                            slot_trb(trb_type::CONFIGURE_ENDPOINT, slot, 0, addr),
+                            "Configure Endpoint",
+                        )
+                    });
+            }
+        }
         if let Some(e) = self.lock.lock().ep(slot, dci) {
             e.ep_state &= !ep_state::EP_SOFT_CLEAR_TOGGLE;
         }

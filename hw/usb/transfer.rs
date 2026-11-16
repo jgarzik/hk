@@ -523,10 +523,14 @@ impl TransferRing {
         self.segs[i / self.seg].dma + ((i % self.seg) * 16) as u64
     }
 
-    /// The transfer TRB at device address `dma` (not a Link TRB)
+    /// The transfer TRB at device address `dma` (not a Link TRB): the
+    /// segments searched from the dequeue's on, where an event's TRB
+    /// almost always is (Linux trb_in_td from the TD's segment)
     pub fn index_of(&self, dma: u64) -> Option<usize> {
-        self.segs.iter().enumerate().find_map(|(k, s)| {
-            let off = dma.checked_sub(s.dma)?;
+        let n = self.segs.len();
+        let first = self.dequeue / self.seg;
+        (0..n).map(|j| (first + j) % n).find_map(|k| {
+            let off = dma.checked_sub(self.segs[k].dma)?;
             let i = usize::try_from(off / 16).ok()?;
             (off % 16 == 0 && i < self.seg).then_some(k * self.seg + i)
         })
@@ -561,8 +565,12 @@ impl TransferRing {
     /// the owner's TDs. None (ring unchanged) out of memory
     pub fn expand<D: DmaDevice>(&mut self, dev: &D, n: usize, gfp: Gfp) -> Option<RingShift> {
         let mut new = alloc::vec::Vec::new();
-        new.try_reserve_exact(n).ok()?;
-        self.segs.try_reserve(n).ok()?;
+        // Under the owner's spin lock: the heap takes `gfp` too
+        crate::util::kalloc::with_gfp(gfp, || {
+            new.try_reserve_exact(n)?;
+            self.segs.try_reserve(n)
+        })
+        .ok()?;
         for _ in 0..n {
             new.push(Self::dma_seg(dev, gfp, self.cycle)?);
         }

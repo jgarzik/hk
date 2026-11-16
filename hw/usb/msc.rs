@@ -15,8 +15,9 @@ use crate::printkln;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
 
+use super::message::usb_bulk_msg_len;
 use super::message::usb_control_msg;
-use super::{Pipe, SetupPacket, UsbDevice, UsbDeviceId, UsbError, UsbIds, usb_bulk_msg};
+use super::{Pipe, SetupPacket, UsbDevice, UsbDeviceId, UsbError, UsbIds};
 use crate::sync::completion::Completion;
 use crate::task::percpu::ms_to_ticks;
 
@@ -160,8 +161,9 @@ enum Transport {
 /// A Bulk-Only device as the protocol uses it (a trait so the
 /// transport is tested against a scripted device)
 trait BotIo {
-    /// A bulk transfer into (`is_in`) or out of `buf`: bytes moved
-    fn bulk(&self, is_in: bool, buf: &mut [u8]) -> Result<usize, UsbError>;
+    /// A bulk transfer into (`is_in`) or out of `buf`: how it ended
+    /// and the bytes moved, failed or not
+    fn bulk(&self, is_in: bool, buf: &mut [u8]) -> (Result<(), UsbError>, usize);
     /// Clear a halt on the bulk endpoint (Linux usb_stor_clear_halt)
     fn clear_halt(&self, is_in: bool) -> Result<(), UsbError>;
     /// The Bulk-Only Mass Storage Reset class request
@@ -175,16 +177,18 @@ trait BotIo {
 /// usb_stor_bulk_transfer_buf, interpret_urb_result): a stall clears
 /// the halt; the bytes moved
 fn xfer(io: &impl BotIo, is_in: bool, buf: &mut [u8]) -> (Xfer, usize) {
-    match io.bulk(is_in, buf) {
-        Ok(n) if n == buf.len() => (Xfer::Good, n),
-        Ok(n) => (Xfer::Short, n),
+    let (r, n) = io.bulk(is_in, buf);
+    let x = match r {
+        Ok(()) if n == buf.len() => Xfer::Good,
+        Ok(()) => Xfer::Short,
         Err(UsbError::Stall) => match io.clear_halt(is_in) {
-            Ok(()) => (Xfer::Stalled, 0),
-            Err(e) => (Xfer::Error(e), 0),
+            Ok(()) => Xfer::Stalled,
+            Err(e) => Xfer::Error(e),
         },
-        Err(UsbError::Overflow) => (Xfer::Long, 0),
-        Err(e) => (Xfer::Error(e), 0),
-    }
+        Err(UsbError::Overflow) => Xfer::Long,
+        Err(e) => Xfer::Error(e),
+    };
+    (x, n)
 }
 
 /// A transfer's error for the transport: why it failed, else a
@@ -356,34 +360,18 @@ pub struct UsbMscDevice {
 }
 
 impl BotIo for UsbMscDevice {
-    fn bulk(&self, is_in: bool, buf: &mut [u8]) -> Result<usize, UsbError> {
-        let pipe = if is_in {
-            Pipe::bulk_in(self.bulk_in_ep)
-        } else {
-            Pipe::bulk_out(self.bulk_out_ep)
-        };
-        usb_bulk_msg(&self.dev, pipe, buf, US_BULK_TIMEOUT_MS)
+    fn bulk(&self, is_in: bool, buf: &mut [u8]) -> (Result<(), UsbError>, usize) {
+        usb_bulk_msg_len(&self.dev, self.pipe(is_in), buf, US_BULK_TIMEOUT_MS)
     }
 
     fn clear_halt(&self, is_in: bool) -> Result<(), UsbError> {
-        let pipe = if is_in {
-            Pipe::bulk_in(self.bulk_in_ep)
-        } else {
-            Pipe::bulk_out(self.bulk_out_ep)
-        };
         // Linux usb_stor_clear_halt: 3 s
-        super::message::clear_halt(&self.dev, pipe, 3000)
+        super::message::clear_halt(&self.dev, self.pipe(is_in), 3000)
     }
 
     fn reset_request(&self) -> Result<(), UsbError> {
-        // Class request to the interface (Linux US_BULK_RESET_REQUEST)
-        let setup = SetupPacket {
-            request_type: 0x21,
-            request: 0xff,
-            value: 0,
-            index: u16::from(self.ifnum),
-            length: 0,
-        };
+        // Linux US_BULK_RESET_REQUEST
+        let setup = SetupPacket::class_intf(0xff, self.ifnum);
         usb_control_msg(&self.dev, &setup, &mut [], 5000).map(|_| ())
     }
 
@@ -393,6 +381,15 @@ impl BotIo for UsbMscDevice {
 }
 
 impl UsbMscDevice {
+    /// Its bulk IN or OUT pipe
+    fn pipe(&self, is_in: bool) -> Pipe {
+        if is_in {
+            Pipe::bulk_in(self.bulk_in_ep)
+        } else {
+            Pipe::bulk_out(self.bulk_out_ep)
+        }
+    }
+
     fn new(dev: UsbDevice, ifnum: u8, bulk_in_ep: u8, bulk_out_ep: u8) -> Self {
         Self {
             state: Mutex::new(UsbMscState {
@@ -562,8 +559,12 @@ mod tests {
     use core::cell::RefCell;
 
     /// What the scripted device does on a bulk transfer: IN data (or an
-    /// OUT count), or an error
-    type Step = Result<Vec<u8>, UsbError>;
+    /// OUT count), or an error after moving some
+    type Step = Result<Vec<u8>, (UsbError, Vec<u8>)>;
+
+    fn err(e: UsbError) -> Step {
+        Err((e, Vec::new()))
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     enum Call {
@@ -587,19 +588,17 @@ mod tests {
     }
 
     impl BotIo for Dev {
-        fn bulk(&self, is_in: bool, buf: &mut [u8]) -> Result<usize, UsbError> {
+        fn bulk(&self, is_in: bool, buf: &mut [u8]) -> (Result<(), UsbError>, usize) {
             self.calls.borrow_mut().push(Call::Bulk(is_in));
-            let d = self
-                .steps
-                .borrow_mut()
-                .pop_front()
-                .expect("unscripted transfer")?;
-            if !is_in {
-                return Ok(d.len().min(buf.len()));
-            }
+            let (r, d) = match self.steps.borrow_mut().pop_front().expect("unscripted") {
+                Ok(d) => (Ok(()), d),
+                Err((e, d)) => (Err(e), d),
+            };
             let n = d.len().min(buf.len());
-            buf[..n].copy_from_slice(&d[..n]);
-            Ok(n)
+            if is_in {
+                buf[..n].copy_from_slice(&d[..n]);
+            }
+            (r, n)
         }
         fn clear_halt(&self, is_in: bool) -> Result<(), UsbError> {
             self.calls.borrow_mut().push(Call::ClearHalt(is_in));
@@ -659,7 +658,7 @@ mod tests {
     /// Linux: a stalled data phase clears the halt and reads the CSW
     #[test]
     fn data_stall_reads_csw() {
-        let d = Dev::new(alloc::vec![cbw(), Err(UsbError::Stall), csw(7, 512, 1)]);
+        let d = Dev::new(alloc::vec![cbw(), err(UsbError::Stall), csw(7, 512, 1)]);
         let r = read(&d, &mut state(), 0x28, 512);
         assert_eq!(r, Transport::Failed { invalid_cdb: false });
         assert_eq!(
@@ -671,6 +670,18 @@ mod tests {
                 Call::Bulk(true)
             ]
         );
+    }
+
+    /// A data phase that stalls part way keeps what it moved, less the
+    /// residue (Linux urb->actual_length)
+    #[test]
+    fn partial_stall() {
+        let d = Dev::new(alloc::vec![
+            cbw(),
+            Err((UsbError::Stall, alloc::vec![1; 256])),
+            csw(7, 256, 0)
+        ]);
+        assert_eq!(read(&d, &mut state(), 0x28, 512), Transport::Good(256));
     }
 
     /// A zero-length CSW is read again; so is a stalled one
@@ -686,7 +697,7 @@ mod tests {
         let d = Dev::new(alloc::vec![
             cbw(),
             Ok(alloc::vec![0; 8]),
-            Err(UsbError::Stall),
+            err(UsbError::Stall),
             csw(7, 0, 0)
         ]);
         assert_eq!(read(&d, &mut state(), 0x28, 8), Transport::Good(8));
@@ -738,7 +749,7 @@ mod tests {
     /// Babble: Linux's fake ILLEGAL REQUEST sense
     #[test]
     fn babble_fake_sense() {
-        let d = Dev::new(alloc::vec![cbw(), Err(UsbError::Overflow), csw(7, 0, 0)]);
+        let d = Dev::new(alloc::vec![cbw(), err(UsbError::Overflow), csw(7, 0, 0)]);
         let r = read(&d, &mut state(), 0x28, 512);
         assert_eq!(r, Transport::Failed { invalid_cdb: true });
         let e = invoke_transport(&d, r);
