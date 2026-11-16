@@ -119,7 +119,6 @@ pub fn prep(sqe: &IoUringSqe) -> KernelResult<Option<OpenArgs>> {
 /// ENOENT), a direct slot (file_index) not with O_CLOEXEC (EINVAL), and
 /// RLIMIT_NOFILE as of now
 fn open_prep(sqe: &IoUringSqe) -> KernelResult<OpenArgs> {
-    use crate::fs::flags::{O_LARGEFILE, O_PATH};
     use crate::fs::open::build_open_how;
     let mut how = if sqe.opcode == IORING_OP_OPENAT2 {
         crate::fs::open::copy_open_how(sqe.off, sqe.len as usize)?
@@ -132,9 +131,7 @@ fn open_prep(sqe: &IoUringSqe) -> KernelResult<OpenArgs> {
     if sqe.flags & IOSQE_FIXED_FILE != 0 {
         return Err(KernelError::BadFd);
     }
-    if how.flags & u64::from(O_PATH) == 0 {
-        how.flags |= u64::from(O_LARGEFILE);
-    }
+    crate::fs::open::force_largefile(&mut how);
     let name = crate::fs::namei::getname(UserPtr::new(sqe.addr), false)?;
     let slot = sqe.splice_fd_in as u32;
     if slot != 0 && how.flags & u64::from(crate::fs::file::flags::O_CLOEXEC) != 0 {
@@ -151,15 +148,24 @@ fn open_prep(sqe: &IoUringSqe) -> KernelResult<OpenArgs> {
 
 /// Linux io_openat2: the open flags built (EINVAL), then a descriptor
 /// reserved below the prep's RLIMIT_NOFILE and the file installed there,
-/// or with a slot the file installed in the registered table
-/// (`IoRing::fixed_install`)
-pub fn open(r: &IoRing, a: &OpenArgs) -> KernelResult<i32> {
+/// or with a slot the file installed in the registered table under the
+/// submission lock: `held` if the caller has it (Linux
+/// io_ring_submit_lock skips it then), else taken
+pub fn open(r: &IoRing, a: &OpenArgs, held: Option<&mut Submit>) -> KernelResult<i32> {
     use crate::fs::open::{open_file, open_install};
     if a.slot == 0 {
         return open_install(a.dfd, &a.name, &a.how, a.nofile);
     }
     let file = open_file(a.dfd, &a.name, &a.how)?;
-    r.fixed_install(file, a.slot)
+    match held {
+        Some(s) => {
+            let (res, old) = s.fixed_install(file, a.slot);
+            // A replaced file's put is deferred (fput); fine under it
+            drop(old);
+            res
+        }
+        None => r.fixed_install(file, a.slot),
+    }
 }
 
 fn fsync(sqe: &IoUringSqe) -> KernelResult<i32> {

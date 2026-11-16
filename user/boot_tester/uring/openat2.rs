@@ -10,21 +10,25 @@
 //! - URING_OPEN_BATCH: a request failing its submission checks ends the
 //!   batch (enter counts it, the next SQE stays queued); inside a chain
 //!   it fails the chain (its own error, ECANCELED for the rest) and the
-//!   batch goes on (Linux io_submit_fail_init)
+//!   batch goes on (Linux io_submit_fail_init); a batch ending inside a
+//!   chain still runs (or fails) it
 //! - URING_OPEN_DIRECT: an open into a registered slot (file_index):
-//!   ENXIO with no table; slot N installs there (0), EINVAL past the
+//!   ENXIO with no table (ENFILE to allocate one); slot N installs there
+//!   (0), EINVAL past the
 //!   table, IORING_FILE_INDEX_ALLOC takes the next free slot and returns
-//!   it, ENFILE once none is free (Linux io_fixed_fd_install)
+//!   it, ENFILE once none is free (Linux io_fixed_fd_install); also as
+//!   a chain member run within io_uring_enter
 
 use super::{Ring, sqe};
 use crate::harness::{R, check, report_r};
 use hk_syscall::{
-    AT_FDCWD, IORING_ENTER_GETEVENTS, IORING_OP_NOP, IORING_OP_OPENAT, IORING_OP_OPENAT2,
-    IORING_REGISTER_FILES, IOSQE_FIXED_FILE, IOSQE_IO_LINK, IoUringSqe, O_CLOEXEC, O_RDONLY,
-    sys_close, sys_io_uring_register,
+    AT_FDCWD, IORING_ENTER_GETEVENTS, IORING_OP_ASYNC_CANCEL, IORING_OP_NOP, IORING_OP_OPENAT,
+    IORING_OP_OPENAT2, IORING_REGISTER_FILES, IOSQE_FIXED_FILE, IOSQE_IO_HARDLINK, IOSQE_IO_LINK,
+    IoUringSqe, O_CLOEXEC, O_RDONLY, sys_close, sys_io_uring_register,
 };
 
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const ENOENT: i32 = -2;
 const ENXIO: i32 = -6;
 const E2BIG: i32 = -7;
 const EBADF: i32 = -9;
@@ -160,7 +164,31 @@ fn batch() -> R {
     let mut c = reap(&r, 4);
     c.sort_unstable();
     let want = [(3, ECANCELED), (4, EINVAL), (5, ECANCELED), (6, 0)];
-    check(b"chain res", c == want, i64::from(c[1].1))
+    check(b"chain res", c == want, i64::from(c[1].1))?;
+    // A batch ending inside a chain queues it as it is (Linux
+    // io_submit_state_end): runs if whole, fails if a member failed
+    let mut a = sqe(IORING_OP_NOP, 0, 0, 0, 0, 9);
+    a.flags = IOSQE_IO_LINK;
+    r.push(a);
+    let n = r.enter(1, 0, 0);
+    check(b"open chain", n == 1, n)?;
+    let c = reap(&r, 1);
+    check(b"open chain res", c[0] == (9, 0), i64::from(c[0].1))?;
+    let mut a = sqe(IORING_OP_NOP, 0, 0, 0, 0, 10);
+    a.flags = IOSQE_IO_LINK;
+    let mut b = plain.sqe(NULL, 8, 11);
+    b.flags = IOSQE_IO_LINK;
+    r.push(a);
+    r.push(b);
+    let n = r.enter(2, 0, 0);
+    check(b"failed open chain", n == 2, n)?;
+    let mut c = reap(&r, 2);
+    c[..2].sort_unstable();
+    check(
+        b"failed chain res",
+        c[..2] == [(10, ECANCELED), (11, EINVAL)],
+        i64::from(c[0].1),
+    )
 }
 
 /// An OPENAT of /dev/null into `slot`
@@ -175,6 +203,8 @@ fn direct() -> R {
     let mut r = Ring::simple(4).map_err(|e| (&b"setup"[..], e))?;
     let n = direct_open(&mut r, 1);
     check(b"no table", n == ENXIO, i64::from(n))?;
+    let n = direct_open(&mut r, FILE_INDEX_ALLOC);
+    check(b"alloc no table", n == ENFILE, i64::from(n))?;
     let empty = [-1i32; 2];
     let n = sys_io_uring_register(r.fd as u32, IORING_REGISTER_FILES, empty.as_ptr() as u64, 2);
     check(b"register", n == 0, n)?;
@@ -185,5 +215,28 @@ fn direct() -> R {
     let n = direct_open(&mut r, FILE_INDEX_ALLOC);
     check(b"alloc", n == 1, i64::from(n))?;
     let n = direct_open(&mut r, FILE_INDEX_ALLOC);
-    check(b"full", n == ENFILE, i64::from(n))
+    check(b"full", n == ENFILE, i64::from(n))?;
+    direct_chain()
+}
+
+/// A hard-linked chain [ASYNC_CANCEL of nothing, direct open]: the
+/// cancel's chain runs in io_uring_enter, the open installs in slot 0
+fn direct_chain() -> R {
+    let mut r = Ring::simple(4).map_err(|e| (&b"setup"[..], e))?;
+    let empty = [-1i32; 2];
+    let n = sys_io_uring_register(r.fd as u32, IORING_REGISTER_FILES, empty.as_ptr() as u64, 2);
+    check(b"register", n == 0, n)?;
+    let mut c = sqe(IORING_OP_ASYNC_CANCEL, -1, 0x5eed, 0, 0, 7);
+    c.flags = IOSQE_IO_HARDLINK;
+    let mut o = sqe(IORING_OP_OPENAT, AT_FDCWD, NULL.as_ptr() as u64, 0, 0, 8);
+    o.op_flags = O_RDONLY;
+    o.splice_fd_in = FILE_INDEX_ALLOC;
+    r.push(c);
+    r.push(o);
+    let n = r.enter(2, 0, 0);
+    check(b"chain submitted", n == 2, n)?;
+    let mut got = reap(&r, 2);
+    got[..2].sort_unstable();
+    check(b"cancel", got[0] == (7, ENOENT), i64::from(got[0].1))?;
+    check(b"chain open", got[1] == (8, 0), i64::from(got[1].1))
 }

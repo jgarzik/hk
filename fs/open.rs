@@ -351,10 +351,16 @@ pub fn sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: u64, usize: usize) ->
         return Err(KernelError::ArgListTooLong);
     }
     let mut how = copy_open_how(how, usize)?;
+    force_largefile(&mut how);
+    do_sys_openat2(dirfd, path_ptr, &how)
+}
+
+/// O_LARGEFILE unless O_PATH (Linux openat2 and io_openat_prep:
+/// force_o_largefile on 64-bit)
+pub fn force_largefile(how: &mut OpenHow) {
     if how.flags & u64::from(O_PATH) == 0 {
         how.flags |= u64::from(O_LARGEFILE);
     }
-    do_sys_openat2(dirfd, path_ptr, &how)
 }
 
 /// The `struct open_how` of `usize` bytes at `how` (Linux openat2's and
@@ -379,8 +385,9 @@ pub fn open_file(dirfd: i32, name: &[u8], how: &OpenHow) -> KernelResult<FileRef
 }
 
 /// [`open_file`] at a descriptor reserved first below `nofile` (Linux
-/// io_openat2: __get_unused_fd_flags with the prep's RLIMIT_NOFILE,
-/// then fd_install); the descriptor
+/// FD_ADD: get_unused_fd_flags, then do_file_open; EMFILE first, the
+/// descriptor released if the open fails; io_openat2 passes the prep's
+/// RLIMIT_NOFILE); the descriptor
 pub fn open_install(dirfd: i32, name: &[u8], how: &OpenHow, nofile: u64) -> KernelResult<i32> {
     let op = build_open_flags(how)?;
     let fd_flags = if how.flags & u64::from(O_CLOEXEC) != 0 {
@@ -399,17 +406,7 @@ fn do_sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: &OpenHow) -> KernelRes
     let op = build_open_flags(how)?;
     // O_EMPTYPATH: an empty name is dirfd itself (Linux LOOKUP_EMPTY)
     let path = getname(path_ptr, op.flags & O_EMPTYPATH != 0)?;
-    // The descriptor is reserved before the open (Linux FD_ADD:
-    // get_unused_fd_flags, then do_file_open; EMFILE first) and
-    // released if it fails
-    let fd_flags = if how.flags & u64::from(O_CLOEXEC) != 0 {
-        FD_CLOEXEC
-    } else {
-        0
-    };
-    let fd = super::io::get_unused_fd_flags(fd_flags)?;
-    let file = filp_open(OpenAt::Fd(dirfd), &path, &op)?;
-    Ok(fd.install(file))
+    open_install(dirfd, &path, how, super::syscall::get_nofile_limit())
 }
 
 /// Open `root` itself with open(2) `flags` (Linux file_open_root with an
