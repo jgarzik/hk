@@ -3,7 +3,9 @@
 use super::file::EMPTY_FOPS;
 use crate::fs::DentryRef;
 use crate::fs::FileRef;
-use crate::fs::namei::{CreateAt, Last, Nd, filename_lookup, getname, path_start};
+use crate::fs::namei::{
+    CreateAt, Last, Nd, filename_lookup, filename_lookup_from, getname, path_start,
+};
 use crate::fs::{
     Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac, lookup_one,
 };
@@ -223,23 +225,50 @@ fn open_lookup(flags: u32, res: u64) -> LookupFlags {
     }
 }
 
+/// Where an open's walk starts (Linux nameidata: a dirfd, or the root
+/// path file_open_root gives with LOOKUP_ROOT)
+#[derive(Clone, Copy)]
+enum OpenAt<'a> {
+    Fd(i32),
+    Root(&'a Path),
+}
+
+impl OpenAt<'_> {
+    /// The walk's start (Linux path_init)
+    fn start(self, path: &[u8], lf: LookupFlags) -> Result<Option<Path>, KernelError> {
+        match self {
+            Self::Fd(fd) => path_start(fd, path, lf),
+            Self::Root(r) => Ok(Some(r.clone())),
+        }
+    }
+
+    /// Resolve `path` (Linux filename_lookup); an empty one names the
+    /// start
+    fn lookup(self, path: &[u8], lf: LookupFlags) -> Result<Path, KernelError> {
+        match self {
+            Self::Fd(fd) => filename_lookup(fd, path, lf),
+            Self::Root(r) => filename_lookup_from(Some(r.clone()), path, lf),
+        }
+    }
+}
+
 /// Resolve the open target: an existing file, or (O_CREAT) a newly
 /// created one; the bool says it was created by this call
-fn open_target(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), KernelError> {
+fn open_target(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), KernelError> {
     let (flags, lf) = (op.flags, op.lookup);
     if flags & O_CREAT == 0 {
-        return Ok((filename_lookup(dirfd, path, lf)?, false));
+        return Ok((at.lookup(path, lf)?, false));
     }
     // O_CREAT|O_EMPTYPATH of an empty name: dirfd's own file; there is
     // no last name, so no parent's sticky check (Linux nd->dir_mode is 0)
     if path.is_empty() {
-        return creat_existing(filename_lookup(dirfd, path, lf)?, flags);
+        return creat_existing(at.lookup(path, lf)?, flags);
     }
     // O_CREAT (Linux open_last_lookups): the parent is walked, then a
     // last name of "/", "." or ".." (a directory) or one with a trailing
     // slash is EISDIR, existing or not; one lookup (Nd) throughout, so
     // RESOLVE_* holds for the parent, the symlinks and the last name
-    let start = path_start(dirfd, path, lf)?;
+    let start = at.start(path, lf)?;
     let nd = Nd::new(&start, lf)?;
     let p = nd.parentat(start, path, lf)?;
     if p.last != Last::Norm || p.slash {
@@ -348,20 +377,31 @@ fn do_sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: &OpenHow) -> KernelRes
         0
     };
     let fd = super::io::get_unused_fd_flags(fd_flags)?;
-    let file = filp_open(dirfd, &path, &op)?;
+    let file = filp_open(OpenAt::Fd(dirfd), &path, &op)?;
     Ok(fd.install(file))
+}
+
+/// Open `root` itself with open(2) `flags` (Linux file_open_root with an
+/// empty name, do_file_open_root): the flags checked as open(2) would
+/// (unknown ones dropped), a symlink ELOOP unless O_PATH
+pub fn file_open_root(root: &Path, flags: u32) -> Result<FileRef, KernelError> {
+    let op = build_open_flags(&build_open_how(flags, 0))?;
+    if op.flags & O_PATH == 0 && root.get_inode().is_some_and(|i| i.mode().is_symlink()) {
+        return Err(KernelError::TooManySymlinks);
+    }
+    filp_open(OpenAt::Root(root), b"", &op)
 }
 
 /// O_TMPFILE (Linux do_tmpfile, vfs_tmpfile): an unnamed regular file in
 /// the directory `path`; ENOTDIR or ENOENT from the walk, EROFS, then
 /// write and search on the directory (EACCES), EOPNOTSUPP from a file
 /// system without tmpfile. Linkable unless O_EXCL.
-fn tmpfile_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
+fn tmpfile_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
     let lf = LookupFlags {
         directory: true,
         ..op.lookup
     };
-    let dir = filename_lookup(dirfd, path, lf)?;
+    let dir = at.lookup(path, lf)?;
     let dir_inode = dir.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let w = dir.mnt.want_write()?;
     let c = dac::cred();
@@ -391,8 +431,8 @@ fn tmpfile_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<FileRef, Kern
 /// walk alone (a final symlink with O_NOFOLLOW is the link itself,
 /// O_DIRECTORY is ENOTDIR on anything else), with no permission check,
 /// device or FIFO open, write access or ->open; the file does no I/O
-fn do_o_path(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
-    let p = filename_lookup(dirfd, path, op.lookup)?;
+fn do_o_path(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
+    let p = at.lookup(path, op.lookup)?;
     let file = File::new(p.dentry.clone(), Some(p.mnt.clone()), op.flags, &EMPTY_FOPS);
     file.alloc()
 }
@@ -413,15 +453,15 @@ fn dentry_open(mut file: File) -> Result<FileRef, KernelError> {
 
 /// Open `path` (relative to `start`) as a new file (Linux do_filp_open):
 /// resolve or create the target, may_open, O_TRUNC, then the file object
-fn filp_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
+fn filp_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
     let flags = op.flags;
     if flags & O_PATH != 0 {
-        return do_o_path(dirfd, path, op);
+        return do_o_path(at, path, op);
     }
     if flags & __O_TMPFILE != 0 {
-        return tmpfile_open(dirfd, path, op);
+        return tmpfile_open(at, path, op);
     }
-    let (path, created) = open_target(dirfd, path, op)?;
+    let (path, created) = open_target(at, path, op)?;
     let dentry = path.dentry.clone();
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
 
@@ -509,7 +549,7 @@ fn filp_open(dirfd: i32, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelE
 /// console_on_rootfs); call in init's context before it runs
 pub fn console_on_rootfs() {
     let op = build_open_flags(&build_open_how(O_RDWR, 0));
-    let Ok(file) = op.and_then(|op| filp_open(AT_FDCWD, b"/dev/console", &op)) else {
+    let Ok(file) = op.and_then(|op| filp_open(OpenAt::Fd(AT_FDCWD), b"/dev/console", &op)) else {
         crate::printkln!("Warning: unable to open an initial console.");
         return;
     };

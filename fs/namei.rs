@@ -780,7 +780,17 @@ fn may_linkat_empty(file: &crate::fs::File) -> bool {
 /// path (getname let it through: AT_EMPTY_PATH, O_EMPTYPATH) names
 /// dirfd itself
 pub fn filename_lookup(dirfd: i32, path: &[u8], flags: LookupFlags) -> Result<Path, KernelError> {
-    let start = path_start(dirfd, path, flags)?;
+    filename_lookup_from(path_start(dirfd, path, flags)?, path, flags)
+}
+
+/// Resolve `path` from `start` (None: the root), an empty path naming
+/// `start` itself: [`filename_lookup`]'s walk, also for a start that is
+/// no descriptor (Linux LOOKUP_ROOT: file_open_root)
+pub fn filename_lookup_from(
+    start: Option<Path>,
+    path: &[u8],
+    flags: LookupFlags,
+) -> Result<Path, KernelError> {
     if path.is_empty() {
         let p = match start {
             Some(p) => p,

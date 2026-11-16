@@ -35,6 +35,8 @@ use crate::task::percpu;
 
 /// The uid an id with no mapping shows as (Linux overflowuid)
 pub const OVERFLOWUID: u32 = 65534;
+/// The gid an id with no mapping shows as (Linux overflowgid)
+pub const OVERFLOWGID: u32 = 65534;
 
 /// Maximum user namespace nesting level (same as Linux)
 pub const MAX_USER_NS_LEVEL: u32 = 32;
@@ -156,7 +158,7 @@ impl UserNamespace {
     /// Create the initial (root) user namespace
     fn new_init() -> Arc<Self> {
         // Boot: failure cannot be reported
-        arc_nofail(Self {
+        let ns = arc_nofail(Self {
             uid_map: UidGidMap::new_identity(),
             gid_map: UidGidMap::new_identity(),
             level: 0,
@@ -164,7 +166,13 @@ impl UserNamespace {
             owner: 0,
             group: 0,
             ns: super::NsCommon::init(super::inum::Inum::fixed(super::inum::USER_INIT)),
-        })
+        });
+        // Linux user_namespaces_init: ns_tree_add(&init_user_ns)
+        super::tree::add(
+            &super::NsRef::User(ns.clone()),
+            super::tree::Nodes::nofail(),
+        );
+        ns
     }
 
     /// Clone this namespace (create a child namespace)
@@ -180,15 +188,16 @@ impl UserNamespace {
     /// * `Err(ENOSPC)` - If max nesting level exceeded (Linux
     ///   create_user_ns)
     pub fn clone_ns(parent: &Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
-        if parent.level >= MAX_USER_NS_LEVEL {
+        if !may_nest(parent.level) {
             return Err(KernelError::NoSpace);
         }
 
         // Get creator's credentials
         let cred = percpu::current_cred();
+        let nodes = super::tree::Nodes::new()?;
         let inum = super::inum::Inum::alloc()?;
 
-        try_arc(Self {
+        let ns = try_arc(Self {
             uid_map: UidGidMap::default(),
             gid_map: UidGidMap::default(),
             level: parent.level + 1,
@@ -196,7 +205,10 @@ impl UserNamespace {
             owner: cred.uid,
             group: cred.gid,
             ns: super::NsCommon::new(inum),
-        })
+        })?;
+        // Linux create_user_ns: ns_tree_add once made
+        super::tree::add(&super::NsRef::User(ns.clone()), nodes);
+        Ok(ns)
     }
 
     /// Check if this namespace is an ancestor of another
@@ -240,6 +252,12 @@ impl UserNamespace {
         self.gid_map.map_id_up(kgid)
     }
 
+    /// The id `kgid` has in this namespace, or the overflow gid 65534
+    /// if it has none (Linux from_kgid_munged)
+    pub fn from_kgid_munged(&self, kgid: u32) -> u32 {
+        self.from_kgid(kgid).unwrap_or(OVERFLOWGID)
+    }
+
     /// Get the kernel GID from a namespace GID
     pub fn to_kgid(&self, gid: u32) -> Option<u32> {
         self.gid_map.map_id_down(gid)
@@ -251,3 +269,22 @@ impl UserNamespace {
 /// All processes belong to this namespace unless they create child namespaces.
 /// This namespace has an identity UID/GID mapping.
 pub static INIT_USER_NS: Lazy<Arc<UserNamespace>> = Lazy::new(UserNamespace::new_init);
+
+/// A child of a namespace at `level` may be made: past level 32 only
+/// is ENOSPC (Linux create_user_ns), so 33 levels nest
+fn may_nest(level: u32) -> bool {
+    level <= MAX_USER_NS_LEVEL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Linux create_user_ns: a parent past level 32 is refused, so
+    /// levels 1 to 33 are made from parents at 0 to 32
+    #[test]
+    fn nests_33_levels() {
+        assert!((0..=32).all(may_nest));
+        assert!(!may_nest(33));
+    }
+}

@@ -34,6 +34,7 @@ pub fn run_tests() {
     test_console();
     test_new_id();
     test_bus_usb();
+    test_usb_busnum();
     test_unbind_usb();
     test_unbind_blk();
     test_unbind_net();
@@ -1110,20 +1111,30 @@ fn unbind_pci(fd: i32, d: &[u8], v: &[u8], before: &[u8; 512]) -> Result<(), (&'
 
 /// The first sector of /dev/<d>
 fn sector0(d: &[u8], out: &mut [u8; 512]) -> i64 {
+    sector_at(d, 0, out)
+}
+
+/// The sector at byte `off` of /dev/<d>
+fn sector_at(d: &[u8], off: i64, out: &mut [u8; 512]) -> i64 {
     let mut b = [0u8; 256];
     let fd = sys_open(path(&mut b, &[b"/dev/", d]).as_ptr(), O_RDONLY, 0);
     if fd < 0 {
         return fd;
     }
-    let n = hk_syscall::sys_pread64(fd as i32, out.as_mut_ptr(), 512, 0);
+    let n = hk_syscall::sys_pread64(fd as i32, out.as_mut_ptr(), 512, off);
     sys_close(fd as u64);
     n
 }
 
+/// Past the test disk's last partition (tools/mkdisk.sh): free to write
+const UNUSED_OFF: i64 = 120 << 20;
+
 /// Unbinding the first virtio disk's device from virtio_blk removes the
 /// disk (/sys/block, /dev, "remove" then "unbind" uevents) and fails
 /// I/O on a file still open with EIO; binding it back brings the disk
-/// back under its name with the same data. hk only: the Linux reference
+/// back under its name with the same data, a write still cached when
+/// it went included (Linux del_gendisk syncs on an orderly removal).
+/// hk only: the Linux reference
 /// VM may boot from its virtio disk
 fn test_unbind_blk() {
     const N: &[u8] = b"SYSFS_UNBIND_BLK";
@@ -1159,9 +1170,16 @@ fn test_unbind_blk() {
     let r = (|| {
         let mut nb = [0u8; 256];
         let node = path(&mut nb, &[b"/dev/", d]);
-        let held = sys_open(node.as_ptr(), O_RDONLY, 0);
+        let held = sys_open(node.as_ptr(), hk_syscall::O_RDWR, 0);
         if held < 0 {
             return Err((&b"open"[..], held));
+        }
+        // Cached only: no fsync, the file stays open past the removal
+        let pat = [0x5au8; 512];
+        let wr = hk_syscall::sys_pwrite64(held as i32, pat.as_ptr(), 512, UNUSED_OFF);
+        if wr != 512 {
+            sys_close(held as u64);
+            return Err((&b"write"[..], wr));
         }
         let drv: &[u8] = b"/sys/bus/virtio/drivers/virtio_blk/";
         let mut ub = [0u8; 256];
@@ -1206,6 +1224,11 @@ fn test_unbind_blk() {
         let r = sector0(d, &mut after);
         if r != 512 || after != before {
             return Err((&b"read after bind"[..], r));
+        }
+        let mut wrote = [0u8; 512];
+        let r = sector_at(d, UNUSED_OFF, &mut wrote);
+        if r != 512 || wrote != [0x5au8; 512] {
+            return Err((&b"cached write lost"[..], r));
         }
         unbind_pci(fd, d, v, &before)
     })();
@@ -1406,6 +1429,26 @@ fn bound_dev(drv: &[u8]) -> Option<([u8; 63], usize)> {
     Some((out, d.len()))
 }
 
+/// The bound xHCI the usb-storage interface `intf` is below (its
+/// device path names the controller)
+fn storage_hc(intf: &[u8]) -> Option<([u8; 63], usize)> {
+    let mut lb = [0u8; 256];
+    let mut t = [0u8; 256];
+    let p = path(&mut lb, &[b"/sys/bus/usb/drivers/usb-storage/", intf]);
+    let n = sys_readlink(p.as_ptr(), t.as_mut_ptr(), t.len() as u64);
+    let target = &t[..n.max(0) as usize];
+    let hcs = Names::of(b"/sys/bus/pci/drivers/xhci_hcd\0", DT_LNK);
+    let hc = (0..hcs.n).map(|i| hcs.get(i)).find(|hc| {
+        *hc != b"module"
+            && target
+                .windows(hc.len() + 2)
+                .any(|w| w[0] == b'/' && &w[1..=hc.len()] == *hc && w[hc.len() + 1] == b'/')
+    })?;
+    let mut out = [0u8; 63];
+    out[..hc.len()].copy_from_slice(hc);
+    Some((out, hc.len()))
+}
+
 /// Receive until an event whose header is `action` and ends in `tail`
 fn wait_event(fd: i32, action: &[u8], tail: &[u8]) -> bool {
     let mut buf = [0u8; 2048];
@@ -1486,6 +1529,60 @@ fn usb_unbind_rebind(
     Ok(())
 }
 
+/// The leading decimal number of `b` (0 if none)
+fn dec(b: &[u8]) -> usize {
+    b.iter()
+        .take_while(|c| c.is_ascii_digit())
+        .fold(0, |n, &c| n * 10 + usize::from(c - b'0'))
+}
+
+/// Each bound xHCI has its own root hubs (Linux usb_register_bus's
+/// usb_bus_idr): every `usbN` below it reads busnum N, no N twice. hk
+/// boots with two xHCIs (run-qemu.sh); the reference VM has none
+fn test_usb_busnum() {
+    const N: &[u8] = b"SYSFS_USB_BUSNUM";
+    let drv: &[u8] = b"/sys/bus/pci/drivers/xhci_hcd/";
+    let hcs = Names::of(b"/sys/bus/pci/drivers/xhci_hcd\0", DT_LNK);
+    let mut seen = [false; 64];
+    let mut nhc = 0;
+    for i in 0..hcs.n {
+        let hc = hcs.get(i);
+        if hc == b"module" {
+            continue;
+        }
+        nhc += 1;
+        let mut pb = [0u8; 256];
+        let kids = Names::of(path(&mut pb, &[drv, hc]), DT_DIR);
+        let mut hubs = 0;
+        for k in 0..kids.n {
+            let Some(num) = kids.get(k).strip_prefix(b"usb") else {
+                continue;
+            };
+            let want = dec(num);
+            let mut b = [0u8; 256];
+            let mut v = [0u8; 16];
+            let n = read_file(
+                path(&mut b, &[drv, hc, b"/", kids.get(k), b"/busnum"]),
+                &mut v,
+            );
+            let got = if n > 0 { dec(&v[..n as usize]) } else { 0 };
+            if want == 0 || want >= seen.len() || got != want || seen[want] {
+                return fail_why(N, b"busnum", (i * 1000 + got) as i64);
+            }
+            seen[want] = true;
+            hubs += 1;
+        }
+        if hubs == 0 {
+            return fail_why(N, b"xHCI without a root hub", i as i64);
+        }
+    }
+    match nhc {
+        0 if host_mode() => skip(N, b"no xHCI on the reference VM"),
+        0 | 1 if !host_mode() => fail_why(N, b"want two xHCIs", nhc),
+        _ => pass(N),
+    }
+}
+
 /// Driver unbind and rebind (hk): the usb-storage interface (its disk,
 /// sda, goes with del_gendisk semantics and comes back the same), then
 /// the xHCI (the whole USB tree goes and is enumerated again). The
@@ -1498,7 +1595,7 @@ fn test_unbind_usb() {
         }
         return fail_why(N, b"no usb-storage interface", 0);
     };
-    let Some((pb, pl)) = bound_dev(b"/sys/bus/pci/drivers/xhci_hcd\0") else {
+    let Some((pb, pl)) = storage_hc(&ib[..il]) else {
         return fail_why(N, b"no xhci_hcd device", 0);
     };
     let Some(sector) = sda_sector() else {

@@ -1,6 +1,7 @@
 //! Additional prctl tests
 //!
 //! Tests for PR_SET/GET_KEEPCAPS, PR_SET/GET_CHILD_SUBREAPER, PR_SET/GET_THP_DISABLE,
+//! PR_SET/GET_IO_FLUSHER,
 //! x86-64 specific PR_SET/GET_TSC, and x86-64 arch_prctl(ARCH_GET/SET_CPUID)
 //!
 //! The subreaper flag is the process's (Linux signal->is_child_subreaper):
@@ -21,6 +22,7 @@ use hk_syscall::{
     PR_SET_KEEPCAPS, PR_SET_THP_DISABLE, sys_close, sys_exit, sys_fork, sys_getpid, sys_getppid,
     sys_pipe2, sys_prctl, sys_read, sys_wait4, sys_write,
 };
+use hk_syscall::{PR_GET_IO_FLUSHER, PR_SET_IO_FLUSHER};
 
 /// Run all prctl extra tests
 pub fn run_tests() {
@@ -33,6 +35,7 @@ pub fn run_tests() {
 
     // THP disable test (all architectures)
     test_thp_disable();
+    test_io_flusher();
 
     // x86-64 specific tests
     #[cfg(target_arch = "x86_64")]
@@ -303,6 +306,50 @@ fn test_thp_disable() {
     }
 
     pass(b"PRCTL_THP_DISABLE");
+}
+
+/// Test: PR_SET/GET_IO_FLUSHER: off by default, set and cleared, bad
+/// arguments EINVAL, inherited by a forked child
+fn test_io_flusher() {
+    const EINVAL: i64 = -22;
+    let get = || sys_prctl(PR_GET_IO_FLUSHER, 0, 0, 0, 0);
+    let checks = [
+        (b"PRCTL_IO_FLUSHER_DEFAULT" as &[u8], get(), 0),
+        (
+            b"PRCTL_IO_FLUSHER_SET",
+            sys_prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0),
+            0,
+        ),
+        (b"PRCTL_IO_FLUSHER_GET", get(), 1),
+        (
+            b"PRCTL_IO_FLUSHER_BAD_VAL",
+            sys_prctl(PR_SET_IO_FLUSHER, 2, 0, 0, 0),
+            EINVAL,
+        ),
+        (
+            b"PRCTL_IO_FLUSHER_BAD_ARG",
+            sys_prctl(PR_SET_IO_FLUSHER, 1, 1, 0, 0),
+            EINVAL,
+        ),
+        (
+            b"PRCTL_IO_FLUSHER_GET_ARG",
+            sys_prctl(PR_GET_IO_FLUSHER, 1, 0, 0, 0),
+            EINVAL,
+        ),
+    ];
+    for (name, got, want) in checks {
+        verdict(name, got == want, got);
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(get() as u64);
+    }
+    let mut status = 0i32;
+    sys_wait4(pid, &mut status, 0, 0);
+    let code = i64::from((status >> 8) & 0xff);
+    verdict(b"PRCTL_IO_FLUSHER_FORK", pid > 0 && code == 1, code);
+    sys_prctl(PR_SET_IO_FLUSHER, 0, 0, 0, 0);
+    verdict(b"PRCTL_IO_FLUSHER_CLEAR", get() == 0, get());
 }
 
 /// Test: TSC mode set and get (x86-64 only)

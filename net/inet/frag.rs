@@ -331,6 +331,13 @@ impl FragTable {
         self.st.lock().mem
     }
 
+    /// Queues and bytes held (Linux fqdir's rhashtable nelems and
+    /// frag_mem_limit, as /proc/net/sockstat's FRAG line shows them)
+    pub fn usage(&self) -> (usize, usize) {
+        let st = self.st.lock();
+        (st.q.len(), st.mem)
+    }
+
     /// Drop expired queues; returns the first-fragment headers of those
     /// that had one (for ICMP time exceeded) and the next expiry
     fn expire(&self, net: &crate::net::NetNamespace, now: u64) -> (Vec<Vec<u8>>, Option<u64>) {

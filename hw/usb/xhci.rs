@@ -65,7 +65,7 @@ pub(super) const PCI_VENDOR_INTEL: u16 = 0x8086;
 pub(super) const XHCI_IRQS: u32 = (1 << 2) | (1 << 3) | (1 << 10);
 
 /// Chipset quirks, set once from the PCI IDs (Linux xhci_pci_quirks)
-mod quirk {
+pub(super) mod quirk {
     use super::PCI_VENDOR_INTEL;
     use crate::hw::pci::PciDevice;
 
@@ -75,12 +75,33 @@ mod quirk {
     pub const SPURIOUS_REBOOT: u32 = 1 << 1;
     /// Reset and D3hot at shutdown, or spurious wakeups follow
     pub const SPURIOUS_WAKEUP: u32 = 1 << 2;
+    /// No soft retry of a transaction error (Linux XHCI_NO_SOFT_RETRY)
+    pub const NO_SOFT_RETRY: u32 = 1 << 3;
+    /// A success event may follow a short transfer's (Linux
+    /// XHCI_SPURIOUS_SUCCESS)
+    pub const SPURIOUS_SUCCESS: u32 = 1 << 4;
 
-    pub fn of(dev: &PciDevice) -> u32 {
-        if dev.header.vendor_id != PCI_VENDOR_INTEL {
-            return 0;
+    /// From the PCI IDs and the interface version: xHCI 1.0 hosts send
+    /// the spurious success, as does the ASMedia 1042 that says 0.96
+    /// (Linux xhci_gen_setup, xhci_pci_quirks)
+    pub fn of(dev: &PciDevice, hci_version: u16) -> u32 {
+        let q = if hci_version > 0x96 {
+            SPURIOUS_SUCCESS
+        } else {
+            0
+        };
+        let (vendor, device) = (dev.header.vendor_id, dev.header.device_id);
+        match (vendor, device) {
+            // Etron EJ168, EJ188; AMD Promontory A
+            (0x1b6f, 0x7023 | 0x7052) | (0x1022, 0x43b9 | 0x43bb) => return q | NO_SOFT_RETRY,
+            // ASMedia 1042
+            (0x1b21, 0x1042) => return q | SPURIOUS_SUCCESS,
+            _ => {}
         }
-        INTEL_HOST
+        if vendor != PCI_VENDOR_INTEL {
+            return q;
+        }
+        q | INTEL_HOST
             | match dev.header.device_id {
                 0x1e31 => SPURIOUS_REBOOT,                            // Panther Point
                 0x9c31 | 0x9cb1 => SPURIOUS_REBOOT | SPURIOUS_WAKEUP, // LPT-LP, WPT-LP
@@ -188,7 +209,15 @@ fn xhci_probe(
     };
     printkln!("xHCI: Controller initialized and running");
     let usb_devices = xhci.enumerate();
-    let usb = super::usb_register_devices(dev, usb_devices);
+    let usb = match super::usb_register_devices(dev, usb_devices) {
+        Ok(u) => u,
+        Err(e) => {
+            xhci.stop();
+            drop(irq);
+            pci_disable_device(pci_dev);
+            return Err(e);
+        }
+    };
     Ok(Box::write(
         slot,
         XhciDeviceHandle {
@@ -211,7 +240,7 @@ struct XhciDeviceHandle {
     xhci: Arc<Xhci>,
     /// The handler (Linux hcd->irq); taken at remove
     irq: crate::sync::spin::Mutex<Option<IrqRegistration<Xhci>>>,
-    usb: Vec<alloc::sync::Arc<crate::base::Device>>,
+    usb: super::usbcore::UsbBus,
 }
 
 impl crate::base::Bound for XhciDeviceHandle {
@@ -719,16 +748,22 @@ pub(super) mod ep_state {
     pub const EP_HALTED: u32 = 1 << 1;
     /// Stop Endpoint queued
     pub const EP_STOP_CMD_PENDING: u32 = 1 << 2;
+    /// A hard Reset Endpoint reset the toggle: the next endpoint_reset
+    /// has nothing to do
+    pub const EP_HARD_CLEAR_TOGGLE: u32 = 1 << 3;
+    /// endpoint_reset is stopping and reconfiguring it: no queueing
+    pub const EP_SOFT_CLEAR_TOGGLE: u32 = 1 << 4;
 }
 
-/// Most TDs an endpoint has queued: one TRB each, the ring full
-const MAX_TDS: usize = TransferRing::DEFAULT_SIZE;
+/// TDs an endpoint's list has room for when its ring is made, one per
+/// TRB of the first segment; queueing past them grows the list
+const MAX_TDS: usize = TransferRing::SEG_TRBS;
 
 /// An endpoint of a device (Linux struct xhci_virt_ep)
 pub(super) struct VirtEp {
     pub(super) ring: Option<TransferRing>,
     /// Its TDs in ring order, room for `MAX_TDS` reserved with the ring
-    /// so queueing never allocates (Linux ring->td_list and
+    /// (Linux ring->td_list and
     /// ep->cancelled_td_list, the latter as `Td.cancel`)
     pub(super) tds: alloc::collections::VecDeque<Td>,
     pub(super) ep_state: u32,
@@ -740,6 +775,11 @@ pub(super) struct VirtEp {
     /// When its last Stop Endpoint was queued (monotonic ns; Linux
     /// ep->stop_time)
     pub(super) stop_time: u64,
+    /// Transaction errors soft-retried in a row (Linux ep->err_count)
+    pub(super) err_count: u32,
+    /// The completion code of the last event that found its TD (Linux
+    /// ring->old_trb_comp_code)
+    pub(super) old_cc: u8,
 }
 
 impl VirtEp {
@@ -751,6 +791,8 @@ impl VirtEp {
             queued_deq: None,
             maxp: 0,
             stop_time: 0,
+            err_count: 0,
+            old_cc: 0,
         }
     }
 
@@ -766,6 +808,8 @@ impl VirtEp {
             queued_deq: None,
             maxp,
             stop_time: 0,
+            err_count: 0,
+            old_cc: 0,
         })
     }
 }
@@ -813,7 +857,7 @@ impl XhciState {
 pub struct Xhci {
     pub(super) pci_dev: PciDevice,
     pub(super) regs: Regs,
-    quirks: u32,
+    pub(super) quirks: u32,
     pub(super) hci_version: u16,
     max_slots: u8,
     max_ports: u8,
@@ -887,7 +931,7 @@ impl Xhci {
         cmd_list
             .try_reserve_exact(CommandRing::SIZE)
             .map_err(|_| UsbError::NoResources)?;
-        let quirks = quirk::of(&pci_dev);
+        let quirks = quirk::of(&pci_dev, hciversion as u16);
         halt_regs(&regs)?;
         reset_regs(&regs, quirks, XHCI_RESET_LONG_US)?;
         let dcbaa_phys = mem.frame()?;
@@ -1303,6 +1347,70 @@ impl Xhci {
         Ok(())
     }
 
+    /// Reset endpoint `ep`'s data toggle or sequence number, its halt
+    /// cleared on the device (Linux xhci_endpoint_reset): nothing to do
+    /// after a hard Reset Endpoint (EP_HARD_CLEAR_TOGGLE); else the idle
+    /// endpoint is stopped (the controller updates its output context)
+    /// and dropped and added back as it is by a Configure Endpoint. EP0
+    /// has no toggle to reset
+    fn endpoint_reset(&self, slot: u8, ep: u8) {
+        let dci = endpoint_to_dci(ep);
+        if dci <= 1 {
+            return;
+        }
+        {
+            let mut st = self.lock.lock();
+            let Some(e) = st.ep(slot, dci) else {
+                return;
+            };
+            if e.ep_state & ep_state::EP_HARD_CLEAR_TOGGLE != 0 {
+                e.ep_state &= !ep_state::EP_HARD_CLEAR_TOGGLE;
+                return;
+            }
+            if e.ring.is_none() {
+                return;
+            }
+            if !e.tds.is_empty() {
+                printkln!(
+                    "xHCI: slot {} ep {:#04x}: EP not empty, refuse reset",
+                    slot,
+                    ep
+                );
+                return;
+            }
+            e.ep_state |= ep_state::EP_SOFT_CLEAR_TOGGLE;
+        }
+        let ctx_size = self.ctx_size;
+        {
+            // The device's input context, as every other command filling
+            // it (Linux gives the command its own)
+            let _m = self.mutex.lock();
+            // Configured whatever the stop completed with (an endpoint
+            // already stopped answers Context State Error), as Linux;
+            // only one never queued gives up
+            let stop = self.command(
+                slot_trb(trb_type::STOP_ENDPOINT, slot, dci, 0),
+                "Stop Endpoint",
+            );
+            if matches!(stop, Ok(_) | Err(UsbError::TransferError(_))) {
+                let _ = self
+                    .fill_input_ctx(slot, |dev| {
+                        dev.out_ctx.copy_for_reset(ctx_size, dci, &mut dev.in_ctx);
+                        Ok(())
+                    })
+                    .and_then(|addr| {
+                        self.command(
+                            slot_trb(trb_type::CONFIGURE_ENDPOINT, slot, 0, addr),
+                            "Configure Endpoint",
+                        )
+                    });
+            }
+        }
+        if let Some(e) = self.lock.lock().ep(slot, dci) {
+            e.ep_state &= !ep_state::EP_SOFT_CLEAR_TOGGLE;
+        }
+    }
+
     /// Disable a slot and free its state (Linux xhci_free_dev,
     /// xhci_disable_slot): what is still queued on it is given back
     /// (Shutdown)
@@ -1487,6 +1595,10 @@ impl Hcd for Xhci {
 
     fn bh(&self) -> &GivebackBh {
         &self.bh
+    }
+
+    fn endpoint_reset(&self, dev: &UsbDevice, ep: u8) {
+        self.endpoint_reset(dev.slot_id, ep);
     }
 
     /// Coherent memory no TRB buffer of which crosses a 64 KiB boundary

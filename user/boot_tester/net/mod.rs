@@ -2,7 +2,9 @@
 
 pub mod bpf;
 pub mod fasync_tap;
+pub mod fib_rules;
 pub mod icmp;
+pub mod icmp_ts;
 pub mod neigh;
 pub mod net_stress;
 pub mod netdev;
@@ -16,6 +18,7 @@ pub mod snmp;
 pub mod sockcore;
 pub mod sockets;
 pub mod sockopts;
+pub mod sockstat;
 pub mod tcp;
 pub mod tcp_close;
 pub mod tcp_conn;

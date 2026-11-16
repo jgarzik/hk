@@ -427,6 +427,12 @@ pub struct QueueLimits {
     /// Smallest efficient I/O in bytes as the device reports it, 0 if it
     /// does not (`io_min` raises it to the physical block size)
     pub io_min: u32,
+    /// Optimal I/O in bytes as the device reports it, 0 if it does not
+    /// (`io_opt` rounds it down to the physical block size)
+    pub io_opt: u32,
+    /// Bytes from the disk's start to its first naturally aligned
+    /// physical block (`alignment_offset` keeps it within one)
+    pub alignment_offset: u32,
     /// A bio-based driver that never waits takes NOWAIT bios (Linux
     /// BLK_FEAT_NOWAIT, which blk-mq queues always have)
     pub nowait: bool,
@@ -437,6 +443,27 @@ impl QueueLimits {
     /// at least the physical block size)
     pub fn io_min(&self) -> u32 {
         self.io_min.max(self.physical_block_size)
+    }
+
+    /// Optimal I/O (Linux io_opt after blk_validate_limits: rounded
+    /// down to the physical block size)
+    pub fn io_opt(&self) -> u32 {
+        self.io_opt / self.physical_block_size * self.physical_block_size
+    }
+
+    /// Alignment offset (Linux alignment_offset after
+    /// blk_validate_limits: within one physical block)
+    pub fn alignment_offset(&self) -> u32 {
+        self.alignment_offset & (self.physical_block_size - 1)
+    }
+
+    /// The alignment offset of a partition from sector `start`, in
+    /// units of the larger of the physical block and the smallest
+    /// efficient I/O (Linux queue_limit_alignment_offset)
+    pub fn alignment_offset_at(&self, start: u64) -> u32 {
+        let g = u64::from(self.io_min());
+        let a = (start % (g >> SECTOR_SHIFT)) << SECTOR_SHIFT;
+        ((g + u64::from(self.alignment_offset()) - a) % g) as u32
     }
 }
 
@@ -452,6 +479,8 @@ impl Default for QueueLimits {
             rotational: true,
             dma_alignment: SECTOR_SIZE as u32 - 1,
             io_min: 0,
+            io_opt: 0,
+            alignment_offset: 0,
             nowait: false,
         }
     }
@@ -802,11 +831,38 @@ pub(super) struct OpenState {
     pub(super) part_tbl: Box<[Option<Arc<BlockDevice>>]>,
 }
 
-/// A disk (Linux struct gendisk)
+/// A disk's CHS geometry and a block device's first sector (Linux
+/// struct hd_geometry, HDIO_GETGEO)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HdGeometry {
+    pub heads: u8,
+    pub sectors: u8,
+    pub cylinders: u16,
+    pub start: u64,
+}
+
+impl HdGeometry {
+    /// The user layout on 64-bit: heads, sectors, cylinders, padding,
+    /// then `start` as an unsigned long
+    pub fn to_bytes(self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0] = self.heads;
+        b[1] = self.sectors;
+        b[2..4].copy_from_slice(&self.cylinders.to_ne_bytes());
+        b[8..].copy_from_slice(&self.start.to_ne_bytes());
+        b
+    }
+}
+
+/// A driver's HDIO_GETGEO (Linux block_device_operations.getgeo): fills
+/// in the geometry, `start` already set and the driver's to override
+pub type GetGeo = fn(&Disk, &mut HdGeometry) -> Result<(), KernelError>;
+
 /// Next disk sequence number (Linux diskseq: an atomic64 counter; only
 /// uniqueness matters)
 static DISKSEQ: AtomicU64 = AtomicU64::new(1);
 
+/// A disk (Linux struct gendisk)
 pub struct Disk {
     pub major: DevMajor,
     pub first_minor: DevMinor,
@@ -815,8 +871,13 @@ pub struct Disk {
     pub name: String,
     /// Size in sectors, fixed at creation (no resize yet)
     capacity: u64,
-    /// Write-protected, fixed before the disk is added
+    /// Write-protected by the device, fixed before the disk is added
+    /// (Linux GD_READ_ONLY)
     ro: bool,
+    /// The whole disk's BLKROSET flag (Linux BD_READ_ONLY of part0,
+    /// which get_disk_ro tests for every partition); here, so a
+    /// partition's write checks it without the part table
+    part0_ro: AtomicBool,
     pub queue: RequestQueue,
     pub bdi: Arc<BdiWriteback>,
     /// Opens, releases and rescans (Linux open_mutex), and the state
@@ -828,6 +889,9 @@ pub struct Disk {
     /// Driver state freed with the disk, after its last reference
     /// (Linux private_data with fops->free_disk: a driver's disk index)
     pub private: spin::Once<Box<dyn core::any::Any + Send + Sync>>,
+    /// The driver's HDIO_GETGEO, set before the disk is added; none:
+    /// ENOTTY (Linux fops->getgeo)
+    pub getgeo: spin::Once<GetGeo>,
 }
 
 impl Disk {
@@ -851,6 +915,7 @@ impl Disk {
             name,
             capacity,
             ro,
+            part0_ro: AtomicBool::new(false),
             queue,
             bdi,
             open_mutex: crate::sync::Mutex::new(OpenState {
@@ -859,6 +924,7 @@ impl Disk {
             }),
             seq: DISKSEQ.fetch_add(1, Ordering::Relaxed),
             private: spin::Once::new(),
+            getgeo: spin::Once::new(),
         })
         .inspect_err(|_| bdi_unregister(&wb))
     }
@@ -868,8 +934,10 @@ impl Disk {
         self.capacity
     }
 
+    /// Read-only, by the device or BLKROSET on the whole disk (Linux
+    /// get_disk_ro)
     pub fn ro(&self) -> bool {
-        self.ro
+        self.ro || self.part0_ro.load(Ordering::Relaxed)
     }
 
     /// Its block devices, whole disk first (its `part_tbl`, under
@@ -903,6 +971,12 @@ pub struct BlockDevice {
     bsize: AtomicU32,
     /// Removed (hot unplug or partition rescan): I/O fails
     dead: AtomicBool,
+    /// A partition's BLKROSET flag (Linux BD_READ_ONLY; the whole
+    /// disk's is `Disk::part0_ro`): a lone flag, read lock-free by
+    /// every write, as Linux's atomic bd_flags
+    read_only: AtomicBool,
+    /// A write to it while read-only was reported (Linux BD_RO_WARNED)
+    ro_warned: AtomicBool,
     /// The device's inode in the bdev pseudo filesystem: its page cache
     /// (Linux bd_mapping) serves device-node I/O and filesystem metadata
     pub bd_inode: Arc<crate::fs::Inode>,
@@ -934,6 +1008,8 @@ impl BlockDevice {
             openers: AtomicU32::new(0),
             bsize: AtomicU32::new(512),
             dead: AtomicBool::new(false),
+            read_only: AtomicBool::new(false),
+            ro_warned: AtomicBool::new(false),
             bd_inode,
             kdev: spin::Once::new(),
         })
@@ -971,8 +1047,42 @@ impl BlockDevice {
         self.disk.queue.limits.io_min()
     }
 
+    /// Linux bdev_io_opt
+    pub fn io_opt(&self) -> u32 {
+        self.disk.queue.limits.io_opt()
+    }
+
+    /// Bytes from its start to the first naturally aligned physical
+    /// block (Linux bdev_alignment_offset; hk stacks no queues, so no
+    /// misalignment: never -1)
+    pub fn alignment_offset(&self) -> u32 {
+        let l = &self.disk.queue.limits;
+        if self.partno == 0 {
+            l.alignment_offset()
+        } else {
+            l.alignment_offset_at(self.start)
+        }
+    }
+
+    /// Read-only: its own BLKROSET flag or the disk's (Linux
+    /// bdev_read_only)
     pub fn ro(&self) -> bool {
-        self.disk.ro()
+        self.ro_flag().load(Ordering::Relaxed) || self.disk.ro()
+    }
+
+    /// Its BLKROSET flag (Linux BD_READ_ONLY)
+    fn ro_flag(&self) -> &AtomicBool {
+        if self.partno == 0 {
+            &self.disk.part0_ro
+        } else {
+            &self.read_only
+        }
+    }
+
+    /// BLKROSET (Linux blkdev_roset): set or clear its read-only flag;
+    /// writes check it as they start
+    pub fn set_ro(&self, ro: bool) {
+        self.ro_flag().store(ro, Ordering::Relaxed);
     }
 
     pub fn block_size(&self) -> u32 {
@@ -1189,7 +1299,19 @@ pub fn submit_bio(bdev: &BlockDevice, mut bio: Box<Bio>) {
         }
         bio.sector += bdev.start;
     }
+    bio_check_ro(bdev, &bio);
     bdev.disk.queue.submit(bio);
+}
+
+/// A write to a read-only device is reported once, then goes ahead
+/// (Linux bio_check_ro): pages dirtied before BLKROSET are written back
+fn bio_check_ro(bdev: &BlockDevice, bio: &Bio) {
+    if bio.op != BioOp::Write || !bdev.ro() {
+        return;
+    }
+    if !bdev.ro_warned.swap(true, Ordering::Relaxed) {
+        crate::printkln!("Trying to write to read-only block-device {}", bdev.name);
+    }
 }
 
 /// What `submit_bio_wait` waits on; lives on the waiter's stack
@@ -1598,5 +1720,41 @@ mod tests {
         let lens: Vec<usize> = b.segs.iter().map(|s| s.len).collect();
         assert_eq!(lens, [1536, 1536, 1024]);
         assert_eq!(b.sectors(), 8);
+    }
+
+    /// io_opt rounds down to the physical block, alignment_offset stays
+    /// within one; a partition's offset counts from its start (Linux
+    /// blk_validate_limits, queue_limit_alignment_offset)
+    #[test]
+    fn topology() {
+        let l = QueueLimits {
+            physical_block_size: 4096,
+            io_opt: 3 * 4096 + 512,
+            alignment_offset: 4096 + 3584,
+            ..QueueLimits::default()
+        };
+        assert_eq!(l.io_opt(), 3 * 4096);
+        assert_eq!(l.io_min(), 4096);
+        assert_eq!(l.alignment_offset(), 3584);
+        // 7 sectors in: the next aligned block is one sector further
+        assert_eq!(l.alignment_offset_at(0), 3584);
+        assert_eq!(l.alignment_offset_at(7), 0);
+        assert_eq!(l.alignment_offset_at(8), 3584);
+        assert_eq!(QueueLimits::default().alignment_offset_at(198656), 0);
+    }
+
+    /// struct hd_geometry: heads, sectors, cylinders, padding, start
+    #[test]
+    fn hd_geometry_layout() {
+        let g = HdGeometry {
+            heads: 16,
+            sectors: 63,
+            cylinders: 0x0102,
+            start: 198656,
+        };
+        let b = g.to_bytes();
+        assert_eq!(b[..4], [16, 63, 0x02, 0x01]);
+        assert_eq!(b[4..8], [0; 4]);
+        assert_eq!(b[8..], 198656u64.to_le_bytes());
     }
 }

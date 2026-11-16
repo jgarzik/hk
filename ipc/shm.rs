@@ -356,14 +356,11 @@ pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> KernelResult<u64> {
     let mut mm_guard = mm
         .mmap_write_killable()
         .map_err(|_| KernelError::Interrupted)?;
-    // RLIMIT_AS, as for any mapping (Linux may_expand_vm)
-    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_AS);
-    if limit != crate::task::rlimit::RLIM_INFINITY
-        && (mm_guard.total_vm() * PAGE_SIZE as u64).saturating_add(size) > limit
-    {
-        return Err(KernelError::OutOfMemory);
-    }
     let addr = if shmaddr == 0 {
+        // RLIMIT_AS, as for any mapping (Linux may_expand_vm)
+        if !mm_guard.may_expand(size, 0) {
+            return Err(KernelError::OutOfMemory);
+        }
         mm_guard
             .find_free_area(size)
             .ok_or(KernelError::OutOfMemory)?
@@ -382,10 +379,17 @@ pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> KernelResult<u64> {
             return Err(einval);
         }
         crate::mm::check_fixed(aligned, size)?;
-        if mm_guard.overlaps(aligned, aligned + size) {
-            if shmflg & SHM_REMAP == 0 {
-                return Err(einval);
-            }
+        let old = mm_guard.mapped_in(aligned, aligned + size);
+        if old != 0 && shmflg & SHM_REMAP == 0 {
+            return Err(einval);
+        }
+        // RLIMIT_AS counts what the attach adds, what SHM_REMAP replaces
+        // apart, before anything is unmapped (Linux do_mmap ->
+        // mmap_region)
+        if !mm_guard.may_expand(size, old) {
+            return Err(KernelError::OutOfMemory);
+        }
+        if old != 0 {
             // SHM_REMAP: unmap what was there (dropped after unlocking)
             replaced =
                 crate::mm::syscall::munmap_locked(&mut mm_guard, &mm, aligned, aligned + size);

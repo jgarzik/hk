@@ -17,6 +17,7 @@
 //! after dropping the table lock. `RawSock.filter` is an atomic.
 
 use crate::mm::page_alloc::Gfp;
+use crate::net::mib::INUSE_RAW;
 use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -427,14 +428,21 @@ pub struct RawTable {
 }
 
 impl RawTable {
+    /// Hash `s` (Linux raw_hash_sk)
     fn insert(&self, s: &Arc<RawSock>) {
         self.socks.write().entry(s.num).or_default().push(s.clone());
+        s.sk.net.mib.inuse_add(INUSE_RAW, true);
     }
 
+    /// Unhash `s` (Linux raw_unhash_sk)
     fn remove(&self, s: &RawSock) {
         let mut t = self.socks.write();
         if let Some(v) = t.get_mut(&s.num) {
+            let n = v.len();
             v.retain(|o| !core::ptr::eq(Arc::as_ptr(o), s));
+            if v.len() < n {
+                s.sk.net.mib.inuse_add(INUSE_RAW, false);
+            }
             if v.is_empty() {
                 t.remove(&s.num);
             }

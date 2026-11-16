@@ -131,6 +131,8 @@ pub struct Ntp {
     /// Frequency offset, ns/s << 32 (Linux time_freq; reported, not yet
     /// applied to the clock)
     pub freq: i64,
+    /// The monotonic second `maxerror` was last aged to
+    aged: u64,
 }
 
 /// Beyond the largest dispersion, us (Linux NTP_PHASE_LIMIT)
@@ -145,6 +147,27 @@ impl Ntp {
             status: STA_UNSYNC, // Initially unsynchronized
             constant: 2,
             tick: 10000, // 10ms in usec (100Hz)
+            aged: 0,
+        }
+    }
+
+    /// Bring `maxerror` to second `now` (Linux second_overflow, once a
+    /// second): 500 us more per second (MAXFREQ), capped at
+    /// NTP_PHASE_LIMIT, where the clock counts as unsynchronized
+    fn age(&mut self, now: u64) {
+        let secs = now.saturating_sub(self.aged);
+        self.aged = now;
+        if secs == 0 {
+            return;
+        }
+        let grown = self
+            .maxerror
+            .saturating_add(i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(500));
+        if grown > NTP_PHASE_LIMIT {
+            self.maxerror = NTP_PHASE_LIMIT;
+            self.status |= STA_UNSYNC;
+        } else {
+            self.maxerror = grown;
         }
     }
 }
@@ -460,7 +483,9 @@ impl TimeKeeper {
     /// and may set a new TAI offset; returns the NTP state, the TAI
     /// offset and CLOCK_REALTIME as they are after it
     pub fn ntp_update(&self, f: impl FnOnce(&mut Ntp) -> Option<i32>) -> (Ntp, i32, Timespec) {
+        let secs = self.read(ClockId::Monotonic, self.get_read_cycles()).sec;
         let mut g = self.lock.lock();
+        g.age(u64::try_from(secs).unwrap_or(0));
         if let Some(tai) = f(&mut g) {
             self.write_begin();
             self.tai_offset.store(tai, Ordering::Relaxed);

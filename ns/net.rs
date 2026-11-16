@@ -175,9 +175,10 @@ impl NetNamespace {
     pub fn create(user_ns: &Arc<super::UserNamespace>) -> Result<NetRef, KernelError> {
         // The device first: nothing to undo but itself
         let lo = try_arc(loopback_device(try_arc(LoopbackOps)?))?;
+        let nodes = super::tree::Nodes::new()?;
         let common = super::NsCommon::new(super::inum::Inum::alloc()?);
         let ns = try_arc(Self::fresh(common, user_ns.clone())?)?;
-        Ok(Self::attach(ns, lo))
+        Ok(Self::attach(ns, lo, nodes))
     }
 
     /// The initial namespace (boot: failure cannot be reported)
@@ -188,7 +189,7 @@ impl NetNamespace {
         );
         let ns = arc_nofail(ns.expect("init_net: no memory at boot"));
         let lo = arc_nofail(loopback_device(arc_nofail(LoopbackOps)));
-        Self::attach(ns, lo)
+        Self::attach(ns, lo, super::tree::Nodes::nofail())
     }
 
     /// A namespace's state, before it is listed and has its loopback
@@ -225,14 +226,16 @@ impl NetNamespace {
         })
     }
 
-    /// List `ns` and give it its loopback device `lo`
-    fn attach(ns: Arc<Self>, lo: Arc<NetDevice>) -> NetRef {
+    /// List `ns`, in the namespace tree with `nodes`, and give it its
+    /// loopback device `lo`
+    fn attach(ns: Arc<Self>, lo: Arc<NetDevice>, nodes: super::tree::Nodes) -> NetRef {
         let ns = NetRef::first(ns);
-        // Linux setup_net: list_add_tail_rcu under net_rwsem (write);
-        // `cleanup_net` unlists it
-        NET_NAMESPACE_LIST
-            .write()
-            .push(Arc::downgrade(ns.passive()));
+        // Linux setup_net: ns_tree_add_raw and list_add_tail_rcu under
+        // net_rwsem (write); `cleanup_net` unlists it
+        let mut l = NET_NAMESPACE_LIST.write();
+        super::tree::add(&super::NsRef::Net(ns.clone()), nodes);
+        l.push(Arc::downgrade(ns.passive()));
+        drop(l);
 
         // Loopback device: ifindex 1, down and without addresses until
         // brought up (then 127.0.0.1/8, like Linux)
@@ -460,11 +463,18 @@ fn cleanup_net() {
     if nets.is_empty() {
         return;
     }
-    NET_NAMESPACE_LIST.write().retain(|w| {
+    // Linux cleanup_net: ns_tree_remove and list_del_rcu under
+    // net_rwsem (write)
+    let mut l = NET_NAMESPACE_LIST.write();
+    for net in &nets {
+        super::tree::remove(&net.ns);
+    }
+    l.retain(|w| {
         !nets
             .iter()
             .any(|n| core::ptr::eq(w.as_ptr(), Arc::as_ptr(n)))
     });
+    drop(l);
     for net in &nets {
         crate::net::rtnl::netns_exit(net);
         // Linux loopback_net_exit

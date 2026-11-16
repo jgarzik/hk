@@ -23,7 +23,7 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use crate::ns::PidNamespace;
+use crate::ns::{Namespace, PidNamespace};
 use crate::sync::spin::Mutex;
 use crate::task::TableCell;
 use crate::task::percpu::{PgrpLink, SessionLink};
@@ -77,9 +77,11 @@ pub struct Pid {
     /// the leader carries): what it registered before an exec is not
     /// delivered after it
     exec_gen: AtomicU64,
-    /// Its numbers are hashed and taken: from alloc until the last task
-    /// leaves it (`release_numbers`, Linux free_pid) or it is dropped;
-    /// changed under PIDMAP_LOCK, which orders it
+    /// Its numbers are hashed and taken, and it holds an active
+    /// reference to the namespace it was made in (Linux alloc_pid's
+    /// ns_ref_active_get): from alloc until the last task leaves it
+    /// (`release_numbers`, Linux free_pid) or it is dropped; changed
+    /// under PIDMAP_LOCK, which orders it
     hashed: AtomicBool,
 }
 
@@ -337,8 +339,12 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>,
         free_numbers(&numbers);
         return Err(e);
     }
-    // Counted now: on failure the unbuilt Pid's Drop uncounts it and
-    // gives its numbers back (it was never hashed)
+    // It holds its namespace active until its numbers go back (Linux
+    // alloc_pid: ns_ref_active_get, put by free_pid)
+    ns.active_get();
+    // Counted now: on failure the unbuilt Pid's Drop uncounts it, puts
+    // that active reference and gives its numbers back (it was never
+    // hashed)
     let pid = try_arc(Pid {
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
@@ -602,6 +608,8 @@ impl Pid {
         for u in self.numbers.iter() {
             u.ns.map.free(u.nr);
         }
+        // Linux free_pid: ns_ref_active_put(pid->numbers[level].ns)
+        self.ns().active_put();
         // A dying namespace's init waits for its last pids
         // (zap_pid_ns_processes; Linux free_pid wakes child_reaper)
         if zapping {

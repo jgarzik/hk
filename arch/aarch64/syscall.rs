@@ -145,6 +145,8 @@ pub const SYS_SETDOMAINNAME: u64 = 162;
 pub const SYS_UNSHARE: u64 = 97;
 /// setns(fd, nstype) - reassociate thread with a namespace
 pub const SYS_SETNS: u64 = 268;
+/// listns(req, ns_ids, nr_ns_ids, flags) - list namespaces by id
+pub const SYS_LISTNS: u64 = 470;
 
 // Process syscalls
 pub const SYS_EXIT: u64 = 93;
@@ -186,6 +188,12 @@ pub const SYS_INOTIFY_RM_WATCH: u64 = 28;
 pub const SYS_FANOTIFY_INIT: u64 = 262;
 /// fanotify_mark(fanotify_fd, flags, mask, dirfd, pathname)
 pub const SYS_FANOTIFY_MARK: u64 = 263;
+
+// File handles
+/// name_to_handle_at(dfd, name, handle, mnt_id, flag)
+pub const SYS_NAME_TO_HANDLE_AT: u64 = 264;
+/// open_by_handle_at(mountdirfd, handle, flags)
+pub const SYS_OPEN_BY_HANDLE_AT: u64 = 265;
 
 // epoll syscalls (Section 9.1) - NOTE: aarch64 only has epoll_create1, not legacy epoll_create
 /// epoll_create1(flags)
@@ -602,6 +610,8 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_FALLOCATE => Sys::Fallocate,
         SYS_FANOTIFY_INIT => Sys::FanotifyInit,
         SYS_FANOTIFY_MARK => Sys::FanotifyMark,
+        SYS_NAME_TO_HANDLE_AT => Sys::NameToHandleAt,
+        SYS_OPEN_BY_HANDLE_AT => Sys::OpenByHandleAt,
         SYS_FCHDIR => Sys::Fchdir,
         SYS_FCHMOD => Sys::Fchmod,
         SYS_FCHMODAT => Sys::Fchmodat,
@@ -773,6 +783,7 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_SETHOSTNAME => Sys::Sethostname,
         SYS_SETITIMER => Sys::Setitimer,
         SYS_SETNS => Sys::Setns,
+        SYS_LISTNS => Sys::Listns,
         SYS_SETPGID => Sys::Setpgid,
         SYS_SETPRIORITY => Sys::Setpriority,
         SYS_SETREGID => Sys::Setregid,

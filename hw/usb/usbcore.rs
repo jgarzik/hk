@@ -325,12 +325,56 @@ fn usb_new_device(
     })
 }
 
-/// Register the root hub `usbN` below the host controller and each
-/// device on its ports as `N-<port>` (Linux usb_add_hcd, then
-/// hub_event's usb_new_device); devnums go in order from 1, the root
-/// hub's (Linux choose_devnum)
-pub fn usb_register_devices(hcd: &Arc<Device>, devs: Vec<UsbDevice>) -> Vec<Arc<Device>> {
-    let busnum = 1;
+/// Bus numbers end below this (Linux USB_MAXBUS)
+const USB_MAXBUS: u32 = 64;
+
+/// Bus numbers in use (Linux usb_bus_idr)
+static USB_BUS_IDA: crate::util::ida::Ida = crate::util::ida::Ida::new();
+
+/// A bus number, free again when dropped (Linux usb_deregister_bus)
+struct UsbBusnum(u8);
+
+impl UsbBusnum {
+    /// The lowest free number from 1 (Linux usb_register_bus); E2BIG
+    /// once all are taken
+    fn alloc() -> Result<Self, KernelError> {
+        let n = USB_BUS_IDA.try_alloc_min(1)?;
+        match u8::try_from(n) {
+            Ok(b) if n < USB_MAXBUS => Ok(Self(b)),
+            _ => {
+                USB_BUS_IDA.free(n);
+                printkln!("usbcore: failed to get bus number");
+                Err(KernelError::ArgListTooLong)
+            }
+        }
+    }
+}
+
+impl Drop for UsbBusnum {
+    fn drop(&mut self) {
+        USB_BUS_IDA.free(u32::from(self.0));
+    }
+}
+
+/// A host controller's registered bus (Linux struct usb_bus): its
+/// number, held until the bus is dropped, and its devices, the root hub
+/// last
+pub struct UsbBus {
+    _busnum: UsbBusnum,
+    devs: Vec<Arc<Device>>,
+}
+
+/// Register a bus for the host controller `hcd`: the root hub `usbN`
+/// below it and each device on its ports as `N-<port>` (Linux
+/// usb_add_hcd, then hub_event's usb_new_device); devnums go in order
+/// from 1, the root hub's (Linux choose_devnum). No bus number or root
+/// hub fails it, as usb_add_hcd
+pub fn usb_register_devices(
+    hcd: &Arc<Device>,
+    devs: Vec<UsbDevice>,
+) -> Result<UsbBus, KernelError> {
+    let num = UsbBusnum::alloc()?;
+    let busnum = num.0;
     let mut out = Vec::new();
     let rh = UsbDevNode {
         dev: root_hub(),
@@ -338,13 +382,9 @@ pub fn usb_register_devices(hcd: &Arc<Device>, devs: Vec<UsbDevice>) -> Vec<Arc<
         devnum: 1,
         devpath: String::from("0"),
     };
-    let root = match usb_new_device(hcd, &format!("usb{}", busnum), rh) {
-        Ok(r) => r,
-        Err(e) => {
-            printkln!("usb: root hub registration failed: {:?}", e);
-            return out;
-        }
-    };
+    let root = usb_new_device(hcd, &format!("usb{}", busnum), rh).inspect_err(|e| {
+        printkln!("usb: root hub registration failed: {:?}", e);
+    })?;
     for (i, d) in devs.into_iter().enumerate() {
         let devpath = format!("{}", d.port);
         let name = format!("{}-{}", busnum, devpath);
@@ -360,15 +400,19 @@ pub fn usb_register_devices(hcd: &Arc<Device>, devs: Vec<UsbDevice>) -> Vec<Arc<
         }
     }
     out.push(root);
-    out
+    Ok(UsbBus {
+        _busnum: num,
+        devs: out,
+    })
 }
 
 /// Unregister what `usb_register_devices` registered, the root hub's
 /// devices before it (Linux usb_disconnect, depth first: each device's
 /// interfaces go when its generic driver unbinds, Linux
-/// usb_disable_device, then the device)
-pub fn usb_unregister_devices(devs: &[Arc<Device>]) {
-    for d in devs {
+/// usb_disable_device, then the device); the bus number stays taken
+/// until `bus` is dropped
+pub fn usb_unregister_devices(bus: &UsbBus) {
+    for d in &bus.devs {
         d.del();
     }
 }

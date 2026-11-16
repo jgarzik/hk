@@ -58,6 +58,19 @@ pub trait SuperOps: Send + Sync {
         let _ = (sb, out);
     }
 
+    /// Its file handle operations (Linux s_export_op); None: handles
+    /// are file ids only (AT_HANDLE_FID). Default None.
+    fn export_op(&self) -> Option<&'static dyn super::exportfs::ExportOps> {
+        None
+    }
+
+    /// Its positive dentries are its directory entries and stay cached
+    /// until removed (Linux DCACHE_PERSISTENT, d_make_persistent):
+    /// the shrinker leaves them. Default false.
+    fn d_persistent(&self) -> bool {
+        false
+    }
+
     /// The root path mountinfo shows for a mount rooted at `root`
     /// (Linux ->show_path); None: the dentry's path. Default None.
     fn show_path(&self, root: &crate::fs::Dentry) -> Option<alloc::vec::Vec<u8>> {
@@ -948,6 +961,11 @@ pub fn get_tree_bdev(
             return Err(KernelError::Busy);
         }
         return Ok(sb);
+    }
+    // A writable mount of a read-only device is EACCES (Linux
+    // setup_bdev_super: a write open of a bdev_read_only device)
+    if fc.sb_flags & SB_RDONLY == 0 && bdev.ro() {
+        return Err(KernelError::PermissionDenied);
     }
     sb.set_bdev(bdev.open_handle()?);
     fill(&sb)?;

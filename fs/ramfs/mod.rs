@@ -1174,6 +1174,11 @@ pub static TMPFS_FILE_OPS: RamfsFileOps = RamfsFileOps { shmem: true };
 pub struct RamfsSuperOps;
 
 impl SuperOps for RamfsSuperOps {
+    /// Linux ramfs_mknod's d_make_persistent
+    fn d_persistent(&self) -> bool {
+        true
+    }
+
     fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
         Ok({
             StatFs {
@@ -1277,7 +1282,8 @@ impl Kind {
 
 /// A new inode of `sb` (Linux ramfs_get_inode, shmem_get_inode): on
 /// tmpfs one of its inodes is taken first (ENOSPC), given back when the
-/// inode goes (`evict_inode`)
+/// inode goes (`evict_inode`), and it gets a random generation for its
+/// file handles (Linux shmem_get_inode's get_random_u32)
 fn new_inode(
     sb: &Arc<SuperBlock>,
     kind: Kind,
@@ -1289,23 +1295,15 @@ fn new_inode(
     reserve_inode(sb)?;
     let (ino, w) = (sb.alloc_ino(), Arc::downgrade(sb));
     let ops = &RAMFS_INODE_OPS;
-    let inode = match &kind {
-        Kind::Dev(rdev) => {
-            Inode::alloc(Inode::new_device(ino, mode, uid, gid, *rdev, time, w, ops))
-        }
-        Kind::Symlink(t) => Inode::alloc(Inode::new(
-            ino,
-            mode,
-            uid,
-            gid,
-            t.len() as u64,
-            time,
-            w,
-            ops,
-        )),
-        _ => Inode::alloc(Inode::new(ino, mode, uid, gid, 0, time, w, ops)),
+    let mut i = match &kind {
+        Kind::Dev(rdev) => Inode::new_device(ino, mode, uid, gid, *rdev, time, w, ops),
+        Kind::Symlink(t) => Inode::new(ino, mode, uid, gid, t.len() as u64, time, w, ops),
+        _ => Inode::new(ino, mode, uid, gid, 0, time, w, ops),
+    };
+    if tmpfs::with(sb, |_| ()).is_some() {
+        i.i_generation = crate::random::get_random_u32();
     }
-    .inspect_err(|_| free_inode(sb))?;
+    let inode = Inode::alloc(i).inspect_err(|_| free_inode(sb))?;
     // From here the inode's drop gives the reservation back
     match kind {
         Kind::File => {

@@ -21,6 +21,7 @@
 //! while queueing. No lock is held across a sleep or a transmit.
 
 use crate::mm::page_alloc::Gfp;
+use crate::net::mib::INUSE_UDP;
 use crate::util::kalloc::try_arc_cyclic;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -112,6 +113,8 @@ impl UdpSock {
         };
         let p = self.sk.net.udp.insert(&me, &info, port, flow)?;
         self.hashed.store(true, Ordering::Release);
+        // Linux udp_lib_get_port
+        self.sk.net.mib.inuse_add(INUSE_UDP, true);
         Ok(p)
     }
 
@@ -138,6 +141,8 @@ impl UdpSock {
         if self.hashed.swap(false, Ordering::AcqRel) {
             let port = self.inet.get().sport;
             self.sk.net.udp.remove(self, port);
+            // Linux udp_lib_unhash
+            self.sk.net.mib.inuse_add(INUSE_UDP, false);
         }
     }
 
@@ -207,7 +212,8 @@ impl UdpSock {
         Ok(rt.mtu as i32)
     }
 
-    /// Build and send one datagram
+    /// Build and send one datagram: whether it went out, false if the
+    /// send's ENOBUFS was swallowed (`send_err`)
     fn xmit(
         &self,
         rt: &route::Rtable,
@@ -215,11 +221,15 @@ impl UdpSock {
         dport: u16,
         data: &[u8],
         p: IpParams,
-    ) -> Result<(), KernelError> {
-        let mut skb = SkBuff::alloc_tx(UDP_HLEN + data.len(), Gfp::KERNEL)
-            .ok_or(KernelError::NoBufferSpace)?;
-        skb.put_slice(data).ok_or(KernelError::NoBufferSpace)?;
-        let h = skb.push(UDP_HLEN).ok_or(KernelError::NoBufferSpace)?;
+    ) -> Result<bool, KernelError> {
+        // Linux __ip_append_data's error path counts the discard
+        let nobufs = || {
+            self.sk.net.mib.out_discard();
+            KernelError::NoBufferSpace
+        };
+        let mut skb = SkBuff::alloc_tx(UDP_HLEN + data.len(), Gfp::KERNEL).ok_or_else(nobufs)?;
+        skb.put_slice(data).ok_or_else(nobufs)?;
+        let h = skb.push(UDP_HLEN).ok_or_else(nobufs)?;
         h[0..2].copy_from_slice(&sport.to_be_bytes());
         h[2..4].copy_from_slice(&dport.to_be_bytes());
         h[4..6].copy_from_slice(&((UDP_HLEN + data.len()) as u16).to_be_bytes());
@@ -229,8 +239,32 @@ impl UdpSock {
         skb.data_mut()[6..8].copy_from_slice(&csum.to_be_bytes());
         skb.saddr = Some(saddr);
         skb.daddr = Some(rt.daddr);
-        ipv4::ip_send_rt(&self.sk.net, rt, skb, IPPROTO_UDP as u8, p)
+        // Linux udp_send_skb: what ip_send_skb failed with
+        match ipv4::ip_send_rt(&self.sk.net, rt, skb, IPPROTO_UDP as u8, p) {
+            Ok(()) => Ok(true),
+            // Linux __ip_append_data: no discard counted
+            Err(KernelError::MessageTooLong) => Err(KernelError::MessageTooLong),
+            Err(e) => {
+                let mib = &self.sk.net.mib;
+                // ip_send_skb counts the discard either way
+                mib.out_discard();
+                match send_err(e, self.inet.flag(af_inet::ipf::RECVERR)) {
+                    Some(e) => Err(e),
+                    None => {
+                        mib.udp.inc(UDP_MIB_SNDBUFERRORS);
+                        Ok(false)
+                    }
+                }
+            }
+        }
     }
+}
+
+/// What the sender sees of a send that failed past building the
+/// datagram (Linux udp_send_skb): ENOBUFS (a full device queue) is
+/// swallowed, None, unless IP_RECVERR asks for errors
+fn send_err(e: KernelError, recverr: bool) -> Option<KernelError> {
+    (e != KernelError::NoBufferSpace || recverr).then_some(e)
 }
 
 /// Per-message IP parameters from sendmsg control data (Linux
@@ -474,9 +508,11 @@ impl ProtoOps for UdpSock {
         }
         let mib = &self.sk.net.mib;
         match self.xmit(&rt, a.sport, dport, &data, p) {
-            Ok(()) => {
+            Ok(sent) => {
                 // Linux udp_send_skb
-                mib.udp.inc(UDP_MIB_OUTDATAGRAMS);
+                if sent {
+                    mib.udp.inc(UDP_MIB_OUTDATAGRAMS);
+                }
                 Ok(len)
             }
             Err(KernelError::MessageTooLong) => {
@@ -487,9 +523,8 @@ impl ProtoOps for UdpSock {
                 Err(e)
             }
             Err(e) => {
-                // Linux __ip_append_data's error path or ip_send_skb;
-                // udp_sendmsg's out: no kernel memory
-                mib.out_discard();
+                // Linux udp_sendmsg's out: no kernel memory (the
+                // discard counted where it failed)
                 if e == KernelError::NoBufferSpace {
                     mib.udp.inc(UDP_MIB_SNDBUFERRORS);
                 }
@@ -890,7 +925,18 @@ pub fn proc_net_udp(net: &crate::net::NetNamespace) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::pick;
+    use super::*;
+
+    /// Linux udp_send_skb: a send's ENOBUFS is the sender's only with
+    /// IP_RECVERR; other errors always are
+    #[test]
+    fn enobufs_swallowed() {
+        let nb = KernelError::NoBufferSpace;
+        assert_eq!(send_err(nb, false), None);
+        assert_eq!(send_err(nb, true), Some(nb));
+        let u = KernelError::HostUnreachable;
+        assert_eq!(send_err(u, false), Some(u));
+    }
 
     #[test]
     fn pick_best_first() {

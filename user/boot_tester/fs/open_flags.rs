@@ -5,8 +5,8 @@
 //! O_CLOEXEC steer only the open (fdinfo adds O_CLOEXEC from the
 //! descriptor)
 
-use crate::fs::mountinfo::{field, octal, slurp_pub};
 use crate::harness::{R, check, report_r};
+use crate::mount::mountinfo::{field, octal, slurp_pub};
 use hk_syscall::{
     O_CLOEXEC, O_CREAT, O_EXCL, O_LARGEFILE, O_RDWR, O_TRUNC, O_WRONLY, sys_close, sys_fcntl,
     sys_open, sys_unlink,

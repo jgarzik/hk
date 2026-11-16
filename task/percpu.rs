@@ -20,6 +20,7 @@ use crate::arch::ArchPageTable;
 use crate::arch::CurrentArch;
 use crate::arch::{ContextOps, CpuOps, FrameAlloc, PerCpuOps, SchedArch, UserModeOps, UserRegs};
 use crate::cpu::PerCpu;
+use crate::ns::Namespace;
 use crate::printkln;
 use crate::signal::notify::{Told, Zombie, notify};
 use crate::sync::IrqSpinlock;
@@ -971,10 +972,15 @@ impl GlobalTaskTable {
     /// Add a task (fork, kernel thread creation); it has a pid. It joins
     /// its group leader's threads (a new process leads its own).
     pub fn insert(&mut self, task: TaskRef) {
-        if let Some(inner) = task.inner().access(self)
-            && let Some(p) = &inner.thread_pid
-        {
-            p.set_task(Arc::as_ptr(&task).cast::<()>());
+        if let Some(inner) = task.inner().access(self) {
+            if let Some(p) = &inner.thread_pid {
+                p.set_task(Arc::as_ptr(&task).cast::<()>());
+            }
+            // Its credentials' user namespace is active while it is
+            // listed (Linux copy_creds: get_cred_namespaces)
+            if let Some(u) = &inner.user_ns {
+                u.active_get();
+            }
         }
         self.tasks.push_back(task.clone());
         self.attach_pids(&task);
@@ -1036,6 +1042,16 @@ impl GlobalTaskTable {
         }
         if release {
             self.release_pids(&t);
+        }
+        // Linux release_task: exit_cred_namespaces (atomics only; the
+        // namespace itself goes with the task, after the unlock)
+        if let Some(u) = t
+            .inner()
+            .access(self)
+            .as_ref()
+            .and_then(|i| i.user_ns.as_ref())
+        {
+            u.active_put();
         }
         // SAFETY: found through the hash, so on this list
         drop(unsafe { self.tasks.remove(&t) });
@@ -1629,6 +1645,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> 
         // The boot group and session, number 0 (Linux init_struct_pid)
         pgrp: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.pgid),
         session: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.sid),
+        user_ns: Some(crate::ns::INIT_USER_NS.clone()),
         exit_signal: crate::signal::ExitSignal::SIGCHLD,
         // Shared resources: set by the caller via init_* functions
         ..crate::task::TaskInner::new(
@@ -2421,6 +2438,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // namespace moves that fs context) and the target cgroup (a bad fd
     // is EBADF)
     let child_fs = crate::fs::fsstruct::fork_fs(config.flags & CLONE_FS != 0)?;
+    // CLONE_SYSVSEM shares the parent's undo list, made now if it has
+    // none (Linux copy_semundo's get_undo_list): SEM_UNDO from either
+    // side then lands in the one list
+    if config.flags & CLONE_SYSVSEM != 0 {
+        crate::ipc::sem::get_or_create_undo_list(&me)?;
+    }
     let child_ns = crate::ns::fork_nsproxy(config.flags, child_fs.as_deref())?;
     // A thread stays in its group's pid namespace (Linux copy_process:
     // CLONE_THREAD with CLONE_NEWPID or CLONE_NEWUSER, or after an
@@ -2542,6 +2565,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // (`inherit_pids`); TLS fields and shared resources from the clone
     // flags below; pdeath_signal is never inherited
     let child_task_inner = crate::task::TaskInner {
+        // Its credentials' user namespace: a new one with CLONE_NEWUSER
+        // (Linux copy_creds -> create_user_ns)
+        user_ns: Some(child_ns.user_ns.clone()),
         // Linux copy_process: a thread -1, a CLONE_PARENT child the
         // group leader's; their parent_exec_id the caller's, else the
         // caller's exec count
@@ -2631,6 +2657,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     if parent_nproc_exceeded {
         child_task.set_flag(crate::task::pf::NPROC_EXCEEDED);
     }
+    // Linux dup_task_struct copies the parent's flags: the I/O flusher
+    // mark (PR_SET_IO_FLUSHER) is inherited
+    child_task.set_flag(current().flags() & crate::task::pf::IO_FLUSHER);
     // Its keyrings (Linux copy_creds), made before it is visible
     {
         // The child's credentials are a copy of the parent's here
@@ -5142,6 +5171,30 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
             }
             t.set_cred(new)
         })
+    };
+    drop(old);
+}
+
+/// Task `t` (the caller itself) moves to user namespace `new` (Linux
+/// commit_creds -> switch_cred_namespaces when the user namespace
+/// changes): the active reference its credentials hold moves, under
+/// TASKLIST, as `TaskInner.user_ns` is written; the old namespace is
+/// dropped after it
+pub fn switch_cred_namespaces(t: &Task, new: &Arc<crate::ns::UserNamespace>) {
+    let old = {
+        let mut table = TASKLIST.write();
+        let Some(mut v) = table.view_mut(t) else {
+            return;
+        };
+        if v.user_ns.as_ref().is_some_and(|u| Arc::ptr_eq(u, new)) {
+            return;
+        }
+        new.active_get();
+        let old = v.user_ns.replace(new.clone());
+        if let Some(o) = &old {
+            o.active_put();
+        }
+        old
     };
     drop(old);
 }

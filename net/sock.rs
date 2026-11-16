@@ -18,7 +18,9 @@
 //! or not).
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::io::fasync::{FasyncList, POLL_ERR, POLL_IN, POLL_OUT, kill_fasync};
 use crate::io::poll::{
@@ -164,11 +166,38 @@ pub struct Sock {
     pub fasync: FasyncList,
     /// `wqf` bits
     wq_flags: AtomicU32,
+    /// Counted in its namespace's INUSE_ALL (`inuse_start`)
+    inuse: AtomicBool,
+}
+
+impl Drop for Sock {
+    /// Linux __sk_free's sock_inuse_add
+    fn drop(&mut self) {
+        if *self.inuse.get_mut() {
+            self.net.mib.inuse_add(crate::net::mib::INUSE_ALL, false);
+        }
+    }
 }
 
 impl Sock {
-    /// New socket state in `net`, created by the current task
+    /// New socket state in `net`, created by the current task; counted
+    /// in its namespace while it lives (Linux sk_alloc's sock_inuse_add)
     pub fn new(net: NetRef, family: u16, stype: i32, protocol: i32) -> Self {
+        let s = Self::uncounted(net, family, stype, protocol);
+        s.inuse_start();
+        s
+    }
+
+    /// Counted from now on, once (Linux sk_alloc, or sk_clone_lock for
+    /// a TCP child, which Linux makes only when its handshake completes)
+    pub fn inuse_start(&self) {
+        if !self.inuse.swap(true, Ordering::Relaxed) {
+            self.net.mib.inuse_add(crate::net::mib::INUSE_ALL, true);
+        }
+    }
+
+    /// `new`, not yet counted
+    fn uncounted(net: NetRef, family: u16, stype: i32, protocol: i32) -> Self {
         Self {
             family,
             stype,
@@ -194,14 +223,16 @@ impl Sock {
             errmem: AtomicUsize::new(0),
             fasync: FasyncList::new(),
             wq_flags: AtomicU32::new(0),
+            inuse: AtomicBool::new(false),
         }
     }
 
     /// A child (accept) inheriting the listener's options and owner
     /// (Linux sk_clone_lock: sk_uid comes from the listener, never from
-    /// whatever task runs the receive path)
+    /// whatever task runs the receive path); not counted until
+    /// `inuse_start`
     pub fn clone_from(p: &Sock) -> Self {
-        let mut s = Self::new(p.net.clone(), p.family, p.stype, p.protocol);
+        let mut s = Self::uncounted(p.net.clone(), p.family, p.stype, p.protocol);
         s.cred = p.cred.clone();
         s.rcvbuf.store(p.rcvbuf(), Ordering::Relaxed);
         s.sndbuf.store(p.sndbuf(), Ordering::Relaxed);

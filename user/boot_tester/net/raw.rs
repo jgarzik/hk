@@ -70,7 +70,7 @@ fn raw(proto: i32) -> i32 {
 }
 
 /// Internet checksum
-fn csum(d: &[u8]) -> u16 {
+pub fn csum(d: &[u8]) -> u16 {
     let mut s: u32 = 0;
     for c in d.chunks(2) {
         s += u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32;

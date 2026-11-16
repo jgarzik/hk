@@ -32,6 +32,11 @@
 //!   8th passes MAX_INSNS_PER_PATH and is ENOMEM
 //! - SECCOMP_ACTION_AVAIL: GET_ACTION_AVAIL reads a u32 through its
 //!   pointer; STRICT with args is EINVAL
+//! - SECCOMP_FLAGS: TSYNC blocked by a thread with its own filter
+//!   returns that thread's tid, ESRCH with TSYNC_ESRCH; SPEC_ALLOW is
+//!   accepted; TSYNC with NEW_LISTENER but no TSYNC_ESRCH, and
+//!   WAIT_KILLABLE_RECV without NEW_LISTENER, are EINVAL;
+//!   GET_NOTIF_SIZES gives 80, 24 and 64 and takes no flags
 
 use crate::harness::fail_num;
 use crate::helpers::{print, println};
@@ -155,6 +160,74 @@ pub fn run_tests() {
     rejects();
     path_enomem();
     action_avail();
+    flags();
+}
+
+static READY: AtomicU32 = AtomicU32::new(0);
+
+/// A thread with a filter of its own (no ancestor of the main one's),
+/// until GO
+extern "C" fn own_filter(_: u64) -> ! {
+    let prog = [ins(RET_K, 0, 0, RET_ALLOW)];
+    let r = load(&prog, 0);
+    READY.store(if r == 0 { 1 } else { 2 }, Ordering::Release);
+    while GO.load(Ordering::Acquire) == 0 {
+        core::hint::spin_loop();
+    }
+    sys_exit(0)
+}
+
+fn flags() {
+    const SPEC_ALLOW: u32 = 1 << 2;
+    const NEW_LISTENER: u32 = 1 << 3;
+    const TSYNC_ESRCH: u32 = 1 << 4;
+    const WAIT_KILLABLE_RECV: u32 = 1 << 5;
+    const GET_NOTIF_SIZES: u32 = 3;
+    const ESRCH: i64 = -3;
+    let mut t = crate::harness::T::new(b"SECCOMP_FLAGS");
+    let mut sizes = [0u16; 3];
+    let r = sys_seccomp(GET_NOTIF_SIZES, 0, sizes.as_mut_ptr() as u64);
+    t.eq(b"notif sizes", r, 0);
+    t.ok(b"sizes", sizes == [80, 24, 64], i64::from(sizes[0]));
+    t.eq(
+        b"sizes flags",
+        sys_seccomp(GET_NOTIF_SIZES, 1, sizes.as_mut_ptr() as u64),
+        EINVAL,
+    );
+    let st = child(|| {
+        let allow = [ins(RET_K, 0, 0, RET_ALLOW)];
+        unsafe {
+            let top = (&raw mut STACK as *mut u8).add(16384) as u64;
+            let ctid = &raw mut CTID;
+            core::ptr::write_volatile(ctid, 1);
+            if spawn_thread(top, own_filter, 0, ctid) <= 0 {
+                return 1;
+            }
+        }
+        while READY.load(Ordering::Acquire) == 0 {
+            core::hint::spin_loop();
+        }
+        if READY.load(Ordering::Acquire) != 1 {
+            return 2;
+        }
+        let tid = load(&allow, SECCOMP_FILTER_FLAG_TSYNC);
+        let esrch = load(&allow, SECCOMP_FILTER_FLAG_TSYNC | TSYNC_ESRCH);
+        let pair = load(&allow, SECCOMP_FILTER_FLAG_TSYNC | NEW_LISTENER);
+        let killable = load(&allow, WAIT_KILLABLE_RECV);
+        let spec = load(&allow, SPEC_ALLOW);
+        GO.store(1, Ordering::Release);
+        join(&raw mut CTID);
+        match () {
+            _ if tid <= 0 => 3,
+            _ if esrch != ESRCH => 4,
+            _ if pair != EINVAL => 5,
+            _ if killable != EINVAL => 6,
+            _ if spec != 0 => 7,
+            _ => 0,
+        }
+    });
+    t.eq(b"thread flags", i64::from((st >> 8) & 0xff), 0);
+    t.done();
 }
 
 /// SECCOMP_GET_ACTION_AVAIL reads the action from the user pointer

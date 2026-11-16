@@ -273,7 +273,8 @@ the mmap_lock (`Mm.map`), `AnonVma.chain`, `Cgroup.{children,
 subsys}`; `Mutex`:
 `SuperBlock.s_vfs_rename_mutex`, `File.f_pos_lock`,
 `SignalStruct.cred_guard`, RTNL (Linux rtnl_mutex),
-`UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex`, `SWAPON`,
+`UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex`,
+`VdDisk.vdev`, `SWAPON`,
 `Pipe.inner` (Linux pipe->mutex), `Eventpoll.mtx` (Linux ep->mtx) and
 the inotify and fanotify `mark_mutex` (Linux group->mark_mutex).
 The socket owner lock `net::sock_lock::SockLock` (Linux socket_lock_t:
@@ -546,9 +547,8 @@ VFS locks (detailed order):
                    the write guard's drop is namespace_unlock: an
                    umount's mountpoints and, after a grace period,
                    references released with nothing held)
-        → ns::MNT_NS_TREE (spin leaf; Linux mnt_ns_tree_lock: a mount
-                   namespace added once made, removed at its end;
-                   graft's owner check under NAMESPACE_SEM)
+        → ns::tree NS_TREE (IrqSpinlock leaf, 3.4; graft's
+                   mount namespace owner check under NAMESPACE_SEM)
         ↓
     SuperBlock.s_umount (sync::RwSem; write for remount, for a new
                    superblock from sget to its mounter's unlock (its
@@ -586,6 +586,10 @@ VFS locks (detailed order):
                    path_is_under borrows parent/mountpoint under
                    MOUNT_LOCK's locking read, d_path under an RCU
                    read guard)
+        ↓
+    Inode.i_dentry (spin Mutex: the inode's dentries, Linux i_dentry
+                   under i_lock; taken before the d_locks of the
+                   dentry it links or unlinks and its parent)
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across
                    i_rwsem; parent before child)
@@ -705,6 +709,8 @@ Block locks (3.10 Block Device Subsystem):
     a poll queue is a hardware queue no interrupt reaches: taken by the
     polled bio's submitter and by pollers, `BlkMq::poll_queues`)
     Completion.done (IrqSpinlock) → wait queue head → run-queue lock
+    VdDisk.vdev (sleeping) → virtio-blk teardown (IRQ free, hardware
+    queues, rings); HDIO_GETGEO's config read takes nothing
 
 Network locks (3.10 Network Subsystem has the full order):
     RTNL (sleeping, outermost; never under any spinlock)
@@ -1242,7 +1248,10 @@ while the `Pid` lives: the hash holds weak ones), and they are
 unlinked and given back when the last task leaves the `Pid`
 (`release_numbers` from `GlobalTaskTable::remove`, `change_pids` and
 `take_leadership`, under TASKLIST's write lock: Linux free_pid from
-detach_pid), or at its last drop if no task ever left it. It is taken
+detach_pid), or at its last drop if no task ever left it; from
+`alloc_pid` until then the `Pid` holds an active reference to the
+namespace it was made in (3.4, atomics, put after PIDMAP_LOCK is
+released). It is taken
 under nothing but may be taken under TASKLIST and, being a leaf, under
 any thread-context lock where a last `Arc<Pid>` reference may go (an
 AF_UNIX queue's SCM credentials and SO_PEERCRED, a tty's group, an
@@ -2295,9 +2304,11 @@ layout in `doc/MEMORY.md`
 - Direct reclaim runs for a `Gfp::RECLAIM` allocation (GFP_KERNEL,
   GFP_USER, GFP_HIGHUSER_MOVABLE) only when the caller really may sleep
   (`page_alloc::may_direct_reclaim`): no spin lock held, interrupts on,
-  a task (not tid 0), not reclaim itself (PF_MEMALLOC) and I/O allowed
-  (no PF_MEMALLOC_NOIO). Otherwise it drains the per-CPU lists and
-  retries once. Reclaim runs with PF_MEMALLOC set
+  a task (not tid 0) and not reclaim itself (PF_MEMALLOC). Otherwise it
+  drains the per-CPU lists and retries once. Under PF_MEMALLOC_NOIO
+  (Linux current_gfp_context: no __GFP_IO/__GFP_FS) reclaim frees clean
+  pages only: page cache and clean swap cache, no swap writeback and no
+  dcache shrink. Reclaim runs with PF_MEMALLOC set
   (`mm::memalloc_scope`, Linux memalloc_noreclaim_save), so its own
   allocations take GFP_ATOMIC and never reclaim again; swap writeback
   runs with PF_MEMALLOC_NOIO (Linux memalloc_noio_save). The reverse map
@@ -2486,8 +2497,12 @@ pub struct Inode {
 
 **Inode cache** (`fs/icache.rs`, Linux inode_hashtable): vfat inodes
 (by directory-entry position) are hashed so each on-disk object has one
-`Inode`, and block devices' inodes on the bdev superblock by device
-number, so a device is found by its number (3.10). A RAM-sized table of buckets, each a `WeakList` through the
+`Inode`, block devices' inodes on the bdev superblock by device
+number, so a device is found by its number (3.10), and a tmpfs inode
+by number plus generation once a file handle of it is made
+(`insert_inode_hash_once`, checked and hashed under the lock; Linux
+shmem_encode_fh's own spin lock), so open_by_handle_at finds it
+(`ilookup5`, then its dentry under `Inode.i_dentry`). A RAM-sized table of buckets, each a `WeakList` through the
 inode's embedded `i_hash_node` (one `Weak` per entry, nothing
 allocated), all under one `INODE_HASH_LOCK` (spin Mutex, Linux
 inode_hash_lock, thread context): under it only the bucket links and
@@ -2598,6 +2613,7 @@ pub struct Dentry {
     d_hash: Link,               // Hash bucket (its bit lock)
     d_hkey: AtomicU64, d_hparent: AtomicUsize, // Hash key, parent (parent's d_lock)
     d_name: RwLock<DName>,      // Leaf; changed by d_move/d_exchange
+    d_alias: Link,              // Its inode's i_dentry (that lock)
     d_lock: RwLock<DentryInner>, // Single lock (like Linux d_lock)
 }
 
@@ -2707,6 +2723,26 @@ walk (Linux prepend_buffer): nothing allocates under the locks or
 the guard; a pass that raced starts the buffer over. `Dentry::alloc`
 inserts a child under the parent's `d_lock` unless one with that name
 is cached (Linux d_alloc + d_add): one dentry per name.
+
+An inode's dentries (`Inode.i_dentry`, Linux i_dentry and
+d_u.d_alias) are an intrusive list through `Dentry.d_alias` under a
+spin Mutex of their own (Linux keeps them under i_lock), thread
+context only. A dentry is on its inode's list exactly while its d_lock
+holds that inode: `DentryRef::new` links a positive one, `add` links
+one it makes positive, `d_delete` (making it negative in place) and
+`dentry_kill` unlink it, each with the inode's list lock taken first
+and the dentry's d_lock (and in `add` and `d_delete` the parent's)
+inside it, as Linux takes i_lock before d_lock. `d_delete` therefore
+finds the child (`d_lookup`) and its inode before any lock and checks
+under the locks that it is still that child with that inode (the
+caller's `i_rwsem` keeps it so). The lookups (`d_find_alias`,
+`d_find_any_alias`, `d_find_alias_by`: Linux d_find_alias,
+d_find_any_alias, find_acceptable_alias's walk) read each entry's
+d_lock under the list lock and take references with
+`DentryRef::try_get`: the list lock keeps an entry's memory, since a
+dying dentry leaves the list in `dentry_kill` before its free is
+queued. No reference is dropped under the list lock (a last put would
+take it again), and nothing else is taken under it.
 
 A cached child is revalidated (`InodeOps::revalidate`, Linux
 d_revalidate) after its d_lock is released, inside whatever i_rwsem the
@@ -2944,7 +2980,7 @@ of its namespace under MOUNT_LOCK.
 | `Mount.mnt_list` | `util::list::Link` (no lock) | On an umount's list (Linux mnt_list: `umount_tree`'s set, `propagate_umount`'s candidates and committed mounts, `NsTree.unmounted`), each entry a reference: the first three local to `umount_tree` under NAMESPACE_SEM write and MOUNT_LOCK write, the unmounted owned by NAMESPACE_SEM and put by namespace_unlock a grace period after it lets go |
 | `Mount.mnt_cover`, `Mount.mnt_covers` | `LockedBy<Option<Arc<MntCover>>, MntHash>`, `RcuHList<CoverA, MntHash>` | A mount's preallocated cover and the covers its unmounted submounts left (Linux mnt_cover, mnt_covers): umount_tree's `leave_cover` takes a locked mount's cover and links it on its unmounted parent's list under `MOUNT_LOCK` write, the cover counting the mountpoint (`m_count`); `__lookup_mnt` walks the list under an RCU read guard (the caller checks MOUNT_LOCK's sequence, or holds its locking read) and reads the dentry's inode (`d_lock`, under MOUNT_LOCK as attach's DCACHE_MOUNTED) to pick the stand-in; the parent's teardown takes them all off in one `MOUNT_LOCK` write section (Linux mntput_no_expire's drop_cover), frees each a grace period later (`kfree_rcu`) and drops a last mountpoint after the unlock |
 | `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`, and `umount_tree` whole, its caller holding it across, as Linux do_umount, put_mnt_ns; with NAMESPACE_SEM write it owns `mnt_mounts`); under NAMESPACE_SEM and s_umount; under it only `SuperBlock.s_mounts`, `pnode::GROUP_IDA` (bulk_make_private), RENAME_LOCK (a raced d_path pass, path_is_under's is_subdir) and in attach/detach/umount the mountpoint dentry's `d_lock` (DCACHE_MOUNTED, a cover's inode); with NAMESPACE_SEM write it owns each mount's `mnt_parent`/`mnt_mountpoint`; it owns the mount and mountpoint hashes (below); `MountRef::legitimize`'s locking read takes nothing under it. Helpers that need it take its `&mut MntHash` (`umount_tree`, `propagate_umount`, `propagate_mount_busy`, `propagate_mount_unlock`, `hide_mnt`, `change_mountpoint`, `umount_mnt`, `Mount::mark_in`), so a caller that does not hold it does not compile. No mount, mountpoint or dentry is dropped under it, and no reference put that could be the last (`MountRef::put_held` only) (`make_rdonly` releases its references, `detach_mnt` the parent's reference to the mount, its parent link's `Weak`, the mountpoint and its dentry after the unlock; `umount_tree` leaves its references and mountpoints to namespace_unlock, `NsTree.unmounted` and `NsTree.ex_mountpoints`, and drops parent links' `Weak`s, at most a free; the mount hash's reference goes through `put_rcu`). The sequence is read lock-free by `lookup_mnt`, `choose_mountpoint`, `d_path` and scoped walks (3.3 Path Traversal) |
-| `ns::MNT_NS_TREE` | spin `Mutex<RbTree>` leaf | Live mount namespaces by id, each with a `Weak` of its owning user namespace and one of itself (Linux mnt_ns_tree, mnt_ns_tree_lock): a namespace is added once made (its node allocated first), removed first thing in its drop (the node freed after the unlock); `mnt_ns_same_owner` compares two namespaces' owners under it, from graft under NAMESPACE_SEM write, before MOUNT_LOCK; `mnt_ns_adjoined` (NS_MNT_GET_NEXT/PREV) clones a neighbour's `Weak` under it and upgrades it after the unlock, so no last reference to a namespace goes under it; nothing is taken under it |
+| `ns::tree` `NS_TREE` (3.4) | `IrqSpinlock` leaf | Mount namespaces by id are its mount tree (Linux mnt_ns_tree): a mount namespace leaves it first thing in its drop; `mnt_ns_same_owner` compares two namespaces' owner ids under it with no reference taken, from graft under NAMESPACE_SEM write, before MOUNT_LOCK; `mnt_ns_adjoined` (NS_MNT_GET_NEXT/PREV) is `tree::adjoined_any` (inactive ones too, Linux ns_ref_get) |
 | `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
 | `Mount.mnt_ns` | `AtomicU64` | Id of the mount's namespace (`MntNamespace.id`, never reused), 0 for none, `MNT_NS_INTERNAL` for a kernel mount (Linux mnt_ns, MNT_NS_INTERNAL): written only under NAMESPACE_SEM write (commit_tree when a tree is grafted or propagated, the namespace root, a namespace copy; umount and `put_mnt_ns` clear it, a grace period before the tree's references are put), or once before a kernel mount is shared; read lock-free by a put's fast path under an RCU read guard, read by `check_mnt` under NAMESPACE_SEM; can_umount and remount read it first without, as Linux (umount repeats it under the lock) |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks. SB_BORN, SB_DYING (under s_umount write), SB_DEAD (under `SB_LOCK`): set once each, release, read acquire (Linux super_wake / super_flags) |
@@ -3550,8 +3586,8 @@ Fallback:** if scheduling is not yet enabled, page locking spins.
 
 ### 3.4 Namespaces
 
-**Location:** `ns/mod.rs`, `ns/uts.rs`, `ns/common.rs`, `ns/setns.rs`,
-`fs/pseudo/nsfs.rs`
+**Location:** `ns/mod.rs`, `ns/uts.rs`, `ns/common.rs`, `ns/tree.rs`, `ns/setns.rs`,
+`ns/listns.rs`, `fs/pseudo/nsfs.rs`
 
 The namespace subsystem follows Linux's `nsproxy` pattern, where each task has
 a reference to an `NsProxy` that holds pointers to its namespaces. Multiple
@@ -3568,6 +3604,11 @@ tasks can share the same `NsProxy` (e.g., threads created without CLONE_NEW* fla
 | `UserNamespace.gid_map.extents` | `RwLock<Vec<UidGidExtent>>` | GID mapping extents |
 | `PidNamespace.alloc` | `AtomicU32` changed under PIDMAP_LOCK | Pid count, NS_ADDING, NS_INIT (3.1.1, "A pid namespace's init") |
 | `PidNamespace.reaper`, `reboot` | `TableCell` (TASKLIST) | Child reaper, reboot(2) status (3.1.1) |
+| `ns::tree` `NS_TREE` | `IrqSpinlock<Trees>` leaf, global | Every namespace of every type by `ns_id` (Linux ns_tree_lock, a seqlock, and ns_unified_root, the per-type roots, each user namespace's ns_owner_root, here one tree keyed by (owner id, id)): each entry a `Weak` (a network namespace's passive) and its owner's id. Global as Linux's: a lookup by id must see every namespace. `tree::add` lists a namespace once made whole, its three nodes allocated before it is made (`tree::Nodes`: creation fails with ENOMEM, the insert cannot); `tree::remove` takes it out where its last reference goes (`NsCommon`'s drop; a network namespace's `cleanup_net` under NET_NAMESPACE_LIST write, a mount namespace's drop before its unmount), so in any context, hence IRQ-safe; the nodes are freed after the unlock. Lookups and walks (`lookup`, `lookup_at`, `adjoined`, `adjoined_any`, `walk`) upgrade a `Weak` under it (an atomic) and check the namespace (`Strong::get`: in active use, Linux ns_get_unless_inactive, and a network namespace's counted reference, `get_net`) or drop the reference only after the unlock. Under it nothing is allocated, freed or dropped and no lock taken: innermost, below any lock a namespace's last put may run under |
+| `NsCommon.linked` | `AtomicBool` under `NS_TREE` | The namespace is in the tree (Linux !RB_EMPTY_NODE(ns_tree_node)): set by `tree::add`, cleared by `tree::remove`, both under `NS_TREE`; `NsCommon`'s drop reads it with exclusive access and takes the lock only if set |
+| `NsCommon.active` | `AtomicU32` (no lock) | Active references (Linux __ns_ref_active, an atomic_t), changed lock-free in any context, TASKLIST and PIDMAP_LOCK-free paths included (`Namespace::active_get`/`active_put`): a first one takes one on the owning user namespace and a last puts it, walking up the owners (each kept in memory by its child's `Arc`); 1 and never changed for an initial namespace. Held by an installed nsproxy for each namespace but the user one (`NsProxy.active`), by a listed task for its credentials' user namespace (`TaskInner.user_ns`), by a `Pid` for its namespace (alloc to `release_numbers`) and by an nsfs inode (`NsInode`, made to dropped). `tree`'s hand-out reads it after the unlock, racily, as Linux |
+| `NsProxy.active` | `bool` (no lock) | It holds its namespaces' active references (Linux deactivate_nsproxy vs nsproxy_free): set once by `activate` at install (`init_task_ns`) while the `Arc` is still unique, read by its drop |
+| `TaskInner.user_ns` | `TableCell` (TASKLIST) | The user namespace whose active reference the task holds while listed (Linux real_cred->user_ns: get_cred_namespaces, exit_cred_namespaces): taken in `GlobalTaskTable::insert`, put in `remove_task`, moved by `switch_cred_namespaces` (the task itself, TASKLIST write; the old `Arc` dropped after) |
 | `NsCommon.stashed` | `AtomicPtr<Dentry>` (no lock) | The namespace's nsfs dentry while one lives, no reference (Linux ns->stashed): set by a compare-exchange from null (`ns_get_path`; the loser drops its own dentry and retries), cleared by a compare-exchange from that dentry in its kill (`DentryOps.d_prune`, Linux ns_prune_dentry) before its memory's grace period starts; a reader loads it and takes a reference under an RCU read guard (`DentryRef::try_get`, Linux lockref_get_not_dead) |
 
 `CgroupNamespace`, and a `PidNamespace`'s level, parent and number
@@ -3601,12 +3642,21 @@ bitmap, are immutable after creation (no lock).
    lock held (TASKLIST read briefly for the thread check, as Linux
    thread_group_empty), then switches to it under the alloc_lock.
 
+5. **listns(2)** (`ns/listns.rs`) - no lock held across its walk:
+   each step takes `NS_TREE` once (`tree::walk`), the namespace it
+   hands out is checked (type, the caller's own or may see all) and
+   its id copied out with nothing held; a reference it held last may
+   be dropped there, in syscall context.
+
 #### Lock Order for Namespace Operations
 
 ```
 Task.alloc_lock (clone the Arc<NsProxy> out, release; none for the
     task itself) then, with nothing held: UtsNamespace.name / MntNamespace.root /
     UidGidMap.extents (leaves)
+Any lock (a namespace's last put, NET_NAMESPACE_LIST write in
+    cleanup_net, NAMESPACE_SEM in graft) → ns::tree NS_TREE
+    (IrqSpinlock, innermost leaf)
 ```
 
 #### Syscall Patterns
@@ -4608,6 +4658,8 @@ thread context, the driver completes it from its interrupt handler and
 | blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list, the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock), the in-flight count and the dying flag | thread (dispatch, drain, release) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep (virtio-blk's descriptor tables are allocated with the queue: a small one per tag and a bounded set of full-size ones; a request that finds no full-size one free stays on the dispatch list until a completion puts one back); taken under its line's `IrqDesc.lock` in the ISR |
 | `BlkMq.drained` | `WaitQueue` (Linux mq_freeze_wq) | woken from any context (the request end that empties a dying queue's count, after the queue locks are dropped); waited in thread context (`del_gendisk`, no lock held) | its head lock -> run-queue lock; the condition reads the counts only |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
+| `VdDisk.vdev` (`hw/virtio/blk.rs`) | sleeping `sync::Mutex<Option<Arc<VirtioDevice>>>` (Linux vblk->vdev_mutex) | thread only | HDIO_GETGEO (`getgeo`) reads the device config under it, lock-free (the config generation loop), nothing else taken; remove, after `del_gendisk`, clears it and resets the device, frees its IRQ and takes its queues and rings back under it, so no config read follows the reset |
+| `BlockDevice.read_only`, `Disk.part0_ro`, `BlockDevice.ro_warned` | `AtomicBool`, lock-free (Linux BD_READ_ONLY, BD_RO_WARNED in the atomic bd_flags) | any (stored by BLKROSET, read by writes, writeback's bios and mmap) | lone flags: a write checks them as it starts, as Linux bdev_read_only; one in flight when BLKROSET lands completes, as in Linux |
 | `RamDisk.pages` | spin `Mutex<XArray>` (Linux brd_pages xa_lock) | thread only (bio-based driver) | leaf; a page's frame is allocated before it, index nodes with it dropped (`xarray::store_nomem`), a frame that lost a race freed |
 
 Rules:
@@ -4791,7 +4843,7 @@ not rely on either.
 | `NeighTable.lock` (`net/core/neigh.rs`; `arp::arp_tbl`, one table for every namespace, IPv6 ND later; Linux tbl->lock) | `spin::Mutex<TblLocked>` | thread only (softnet, socket output, `ktimers/N` neighbour timers, the system workqueue's periodic GC, RTNL-held configuration) | writers of the RCU hash (`NeighHash`: `RcuHList` chains published through an `RcuArc`; lookups, dumps and /proc/net/arp walk them under `rcu::read_lock`, no lock, no copy), the gc list and every device's list (`NetDevice.neighbours`, a `LockedBy` it owns). An entry is allocated with `Gfp::ATOMIC` before it is taken (Linux neigh_alloc); the hash doubles under it with `Gfp::ATOMIC` (neigh_hash_grow: entries move between chains with no grace period, the old table is freed after one; on failure it stays); unhashed entries are released after a grace period (`RcuHRef::defer`). Order: -> `Neighbour.inner` (GC, flush, delete, gc-list moves); the forced GC runs from `create` before it is taken; periodic GC drops it between chains and re-queues itself under it (-> the workqueue's IrqSpinlock, Linux queue_delayed_work under tbl->lock) |
 | `Neighbour.inner` (Linux neigh->lock) | `spin::Mutex` | thread only | NUD state, the entry's timer and its unresolved queue (`arp_queue`: an intrusive `SkbHead`, bounded by truesize at unres_qlen_bytes). The timer (`ArcTimer`, a pending arm holds a reference, Linux neigh_add_timer's neigh_hold) is armed and deleted under it (-> the timer base's IrqSpinlock). Never held while transmitting, soliciting or reporting errors: state changes return actions run after the unlock |
 | `timer::Alarm.st` (IP reassembly) | `spin::Mutex` | thread only | held across arming its SOFT `TimerList` (-> the timer base's IrqSpinlock); otherwise leaf |
-| `NetMib` (`net/mib.rs`, per netns `NetNamespace.mib`; Linux net->mib) | none: per-CPU `AtomicU64` words (IcmpMsg: one atomic per entry, Linux DEFINE_SNMP_STAT_ATOMIC) | any (receive, transmit under socket and queue locks, timers, syscalls) | lock-free counters: an update is one relaxed RMW on the calling CPU's word (Linux this_cpu_inc: safe from IRQs and preemption; a task moved between picking the word and the RMW still counts exactly, on the other CPU's word); /proc/net/snmp and /proc/net/netstat sum every CPU's words (snmp_fold_field), not a snapshot. Takes no lock, so it has no order position |
+| `NetMib` (`net/mib.rs`, per netns `NetNamespace.mib`; Linux net->mib) | none: per-CPU `AtomicU64` words (IcmpMsg: one atomic per entry, Linux DEFINE_SNMP_STAT_ATOMIC) | any (receive, transmit under socket and queue locks, timers, syscalls) | lock-free counters: an update is one relaxed RMW on the calling CPU's word (Linux this_cpu_inc: safe from IRQs and preemption; a task moved between picking the word and the RMW still counts exactly, on the other CPU's word); /proc/net/snmp and /proc/net/netstat sum every CPU's words (snmp_fold_field), not a snapshot. Its `inuse` gauges (/proc/net/sockstat's sockets, TCP/UDP/RAW hashed and TIME_WAIT counts; Linux prot_inuse) also go down by one: a part may wrap, the sum (read clamped at 0, sock_prot_inuse_get) does not; each socket moves them once each way, guarded by its own flag (`Sock.inuse`, `TcpSock.inuse`, swapped). Takes no lock, so it has no order position |
 | `FragTable.st` (`net/inet/frag.rs`, per netns) | `spin::Mutex` | thread only (softnet, reassembly timer on ktimers/N) | leaf: reassembly queues + memory charge; completed datagrams are delivered and expiry ICMP errors sent after it is dropped. Reassembly `TABLES` (registered namespaces) is a leaf `spin::Mutex` |
 | `route::FNHE_LOCK` (`net/inet/route.rs`, global; Linux fnhe_lock) | `spin::Mutex<FnheLock>` (its `UniqueOwner` proves writers of every nexthop's `RcuHList` exception chains) | thread only (softnet ICMP frag-needed input, `route::output` deleting an expired exception, possibly under a socket lock) | leaf: a route's chains are allocated at its first exception and each exception is created under it with `Gfp::ATOMIC` (Linux kzalloc GFP_ATOMIC under fnhe_lock), dropped without memory; past a chain depth of 5 to 9 (randomized, Linux FNHE_RECLAIM_DEPTH) the oldest is removed first; removed ones are freed after a grace period. Readers (`route::output`) walk the chain under RCU; pmtu and expiry are atomics updated in place. The chains go with their route (a replaced route's with it) |
 | `NlTable.socks` (`net/netlink`, per netns) | `spin::RwLock` | thread only | leaf; bound netlink sockets by (protocol, portid); lookups return `Arc` clones. A bind/autobind checks the socket's `bound` and publishes its portid under the write lock (Linux netlink_insert), so concurrent binds of one socket cannot both insert |
@@ -5067,7 +5119,7 @@ list taken whole under its lock) takes the marks out under `Marks.list`, release
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state` | hw/gfx/ | sleeping `sync::Mutex` (Linux DRM modeset locks) | framebuffer device state, DRM ioctls only |
 | `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device registry |
-| `UsbMscDevice.state` | hw/usb/msc.rs | sleeping `sync::Mutex` (Linux us->dev_mutex), thread only | a mass-storage interface's CBW tag and disconnected flag, held across each BOT transaction (CBW, data, CSW: synchronous bulk requests, sleeping on their URBs' completions, under it); its unbind sets the flag under it, after the disk is gone and the command in progress is done |
+| `UsbMscDevice.state` | hw/usb/msc.rs | sleeping `sync::Mutex` (Linux us->dev_mutex), thread only | a mass-storage interface's CBW tag, disconnected flag and learnt CSW signature and residue quirk, held across each BOT transaction (CBW, data, CSW: synchronous bulk requests, sleeping on their URBs' completions, under it) and its recovery (clear-halt control requests, each an xHCI endpoint reset waiting on Stop and Configure Endpoint commands; a Bulk-Only reset's up to 6 s wait on `UsbMscDevice.dying`, Linux delay_wait). The transaction runs under PF_MEMALLOC_NOIO (Linux GFP_NOIO), so reclaim from inside it never writes back through the device. Its unbind completes `dying` before taking the lock (ending a reset's wait, Linux US_FLIDX_DISCONNECTING), then sets the flag under it, after the disk is gone and the command in progress is done |
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
 | `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |
 | PCI fixups (`hw/pci/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |
@@ -5265,6 +5317,7 @@ Correct uses of atomics in hk:
 | TCP `mem::ALLOCATED` | quanta all connections hold, less the CPUs' reserves | Linux tcp_memory_allocated: read lock-free by every charge to check the limits (add-then-check: the charge is added before the check, subtracted on failure); lags by up to the reserve per CPU, as Linux. Relaxed |
 | TCP `mem::LIMITS[3]`, `mem::PCPU_RSV` | tcp_mem, net.core.mem_pcpu_rsv | sysctl words (initial netns only), each independent, read lock-free per charge (Linux sysctl_tcp_mem, mem_pcpu_rsv with READ_ONCE). Relaxed |
 | TCP `mem::PRESSURE` | memory pressure mode: when it began (ms), 0 when off | Linux tcp_memory_pressure: set past tcp_mem[1] (compare-exchange from 0: the one winner counts TCPMemoryPressures), cleared under tcp_mem[0] (swap: the one that ends it counts TCPMemoryPressuresChrono), by any charge. Relaxed |
+| TCP `mem::ORPHANS` (per-CPU `AtomicIsize`) | orphaned TCP connections, every namespace's | Linux tcp_orphan_count: a `mem::Orphan` guard held in the socket's `Inner` increments this CPU's part when the connection is orphaned and decrements the part of the CPU it drops on (destroy, TIME_WAIT hand-over, or the socket's drop); /proc/net/sockstat sums the parts, clamped at 0. Relaxed |
 | TCP `mem::SOCKETS` | live TCP control blocks | Linux tcp_sockets_allocated: incremented and decremented at control-block creation and drop, read for the fair-share test under pressure. Relaxed. Global, not per-CPU: socket churn, not per packet |
 | `CachedPage` | refcount, dirty, writeback, locked | Linux page cache pattern - flags + refcount |
 | `cpu::NR_CPU_IDS` | CPU count | Linux nr_cpu_ids: stored once (Release) by `smp::init` on the boot CPU, after the others are up but before they schedule; read Acquire |

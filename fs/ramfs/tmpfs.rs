@@ -19,6 +19,8 @@
 //! the lock as Linux does. A remount checks and changes everything under
 //! the stat lock, all or nothing, holding s_umount. Nothing sleeps.
 
+use crate::fs::dentry::{DentryRef, d_find_alias, d_find_any_alias};
+use crate::fs::exportfs::{Encoded, ExportOps, FILEID_INO32_GEN};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -499,6 +501,15 @@ impl SuperOps for TmpfsSuperOps {
         Ok(with(sb, ShmemSb::statfs).unwrap_or_default())
     }
 
+    /// Linux shmem_mknod's d_make_persistent
+    fn d_persistent(&self) -> bool {
+        true
+    }
+
+    fn export_op(&self) -> Option<&'static dyn ExportOps> {
+        Some(&SHMEM_EXPORT_OPS)
+    }
+
     fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {
         let o = parse(data)?;
         with(sb, |t| t.reconfigure(&o)).unwrap_or(Ok(()))
@@ -517,6 +528,63 @@ impl SuperOps for TmpfsSuperOps {
 }
 
 pub static TMPFS_SUPER_OPS: TmpfsSuperOps = TmpfsSuperOps;
+
+// ============================================================================
+// File handles (Linux shmem_export_ops)
+// ============================================================================
+
+/// tmpfs file handles (Linux shmem_export_ops): the generation, then
+/// the inode number's low and high halves. An inode is found by them
+/// in the inode cache, where it is hashed by number plus generation
+/// when its first handle is made; a handle of an inode gone is stale.
+/// No ->get_parent: dentries here are never disconnected (Linux
+/// shmem_get_parent is ESTALE anyway).
+struct ShmemExportOps;
+
+static SHMEM_EXPORT_OPS: ShmemExportOps = ShmemExportOps;
+
+/// Words of a tmpfs handle
+const SHMEM_FH_LEN: usize = 3;
+
+/// The inode cache key of (number, generation) (Linux: inum + gen)
+fn fh_hash(ino: u64, generation: u32) -> u64 {
+    ino.wrapping_add(u64::from(generation))
+}
+
+impl ExportOps for ShmemExportOps {
+    /// Linux shmem_encode_fh
+    fn encode_fh(&self, inode: &Arc<crate::fs::inode::Inode>, fh: &mut [u32]) -> Encoded {
+        let Some(w) = fh.get_mut(..SHMEM_FH_LEN) else {
+            return Err(SHMEM_FH_LEN);
+        };
+        let generation = inode.i_generation;
+        crate::fs::icache::insert_inode_hash_once(inode, fh_hash(inode.ino, generation));
+        w[0] = generation;
+        // Low and high halves of the inode number: truncation intended
+        w[1] = inode.ino as u32;
+        w[2] = (inode.ino >> 32) as u32;
+        Ok((FILEID_INO32_GEN, SHMEM_FH_LEN))
+    }
+
+    /// Linux shmem_fh_to_dentry: the inode by number and generation, then
+    /// a dentry of it, a hashed one first (shmem_find_alias); none for a
+    /// short handle or an inode gone
+    fn fh_to_dentry(
+        &self,
+        sb: &Arc<SuperBlock>,
+        fh: &[u32],
+        _ty: i32,
+    ) -> Result<Option<DentryRef>, KernelError> {
+        let [generation, lo, hi, ..] = *fh else {
+            return Ok(None);
+        };
+        let ino = u64::from(hi) << 32 | u64::from(lo);
+        let found = crate::fs::icache::ilookup5(sb, fh_hash(ino, generation), &|i| {
+            i.ino == ino && i.i_generation == generation
+        });
+        Ok(found.and_then(|i| d_find_alias(&i).or_else(|| d_find_any_alias(&i))))
+    }
+}
 
 /// A new tmpfs superblock of type `fs_type` from `opts` (Linux
 /// shmem_fill_super): the root directory takes the first inode

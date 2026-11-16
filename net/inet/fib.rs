@@ -48,6 +48,7 @@ use crate::util::error::KernelError;
 
 /// Routing table ids (Linux RT_TABLE_*)
 pub const RT_TABLE_UNSPEC: u32 = 0;
+pub const RT_TABLE_DEFAULT: u32 = 253;
 pub const RT_TABLE_MAIN: u32 = 254;
 pub const RT_TABLE_LOCAL: u32 = 255;
 

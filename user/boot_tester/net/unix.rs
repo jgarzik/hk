@@ -1,7 +1,8 @@
 //! AF_UNIX tests (hk and Linux): filesystem and abstract names,
 //! autobind, name lengths, permissions, stream/datagram/seqpacket data
 //! and EOF rules, socketpair, backlog, buffer accounting, SCM_RIGHTS
-//! (MSG_CTRUNC, MSG_CMSG_CLOEXEC), SO_PEERCRED, SCM_CREDENTIALS checks,
+//! (MSG_CTRUNC, MSG_CMSG_CLOEXEC), SO_PEERCRED, SO_PEERGROUPS,
+//! SCM_CREDENTIALS checks,
 //! EPIPE/SIGPIPE, poll states, /proc/net/unix.
 
 use hk_syscall::{
@@ -10,8 +11,9 @@ use hk_syscall::{
     SOCK_STREAM, Stat, sys_accept, sys_bind, sys_chmod, sys_connect, sys_epoll_create1,
     sys_epoll_ctl, sys_epoll_wait, sys_exit, sys_fcntl, sys_fork, sys_getpeername, sys_getpid,
     sys_getsockname, sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe, sys_read, sys_recvfrom,
-    sys_rt_sigaction, sys_sendmsg, sys_sendto, sys_setresgid, sys_setresuid, sys_shutdown,
-    sys_socket, sys_socketpair, sys_stat, sys_umask, sys_unlink, sys_wait4, sys_write,
+    sys_rt_sigaction, sys_sendmsg, sys_sendto, sys_setgroups, sys_setresgid, sys_setresuid,
+    sys_shutdown, sys_socket, sys_socketpair, sys_stat, sys_umask, sys_unlink, sys_wait4,
+    sys_write,
 };
 
 use crate::harness::T;
@@ -20,6 +22,7 @@ use crate::net::sk::*;
 const SOCK_SEQPACKET: i32 = 5;
 const SO_PASSCRED: i32 = 16;
 const SO_PEERCRED: i32 = 17;
+const SO_PEERGROUPS: i32 = 59;
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
 const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
@@ -34,6 +37,8 @@ const POLLRDHUP: i16 = 0x2000;
 
 const ENOENT: i64 = -2;
 const ENXIO: i64 = -6;
+const ERANGE: i64 = -34;
+const ENODATA: i64 = -61;
 const EPROTOTYPE: i64 = -91;
 const ECONNRESET: i64 = -104;
 const ENOTCONN_: i64 = -107;
@@ -67,6 +72,7 @@ pub fn run_tests() {
     test_ctrunc();
     test_inflight();
     test_peercred();
+    test_peergroups();
     test_scm_creds();
     test_poll();
     test_proc();
@@ -240,6 +246,22 @@ fn peercred(fd: i32) -> (i64, i32, u32, u32) {
     let r = hk_syscall::sys_getsockopt(fd, SOL_SOCKET, SO_PEERCRED, b.as_mut_ptr(), &mut len);
     let w = |o: usize| u32::from_ne_bytes(b[o..o + 4].try_into().unwrap());
     (r, w(0) as i32, w(4), w(8))
+}
+
+/// SO_PEERGROUPS into `b` offering `len` bytes: (return, length out)
+fn peergroups(fd: i32, b: &mut [u8], len: u32) -> (i64, u32) {
+    let mut l = len;
+    let r = hk_syscall::sys_getsockopt(fd, SOL_SOCKET, SO_PEERGROUPS, b.as_mut_ptr(), &mut l);
+    (r, l)
+}
+
+/// `b` holds exactly the gids `want`
+fn gids_are(b: &[u8], want: &[u32]) -> bool {
+    b.len() == want.len() * 4
+        && want
+            .iter()
+            .enumerate()
+            .all(|(i, g)| b[i * 4..i * 4 + 4] == g.to_ne_bytes())
 }
 
 fn ucred(pid: i32, uid: u32, gid: u32) -> [u8; 12] {
@@ -1340,6 +1362,72 @@ fn test_peercred() {
     close(acc);
     t.eq(b"child", wait_status(pid) as i64, 0);
     for f in [a, b, s, l] {
+        close(f);
+    }
+    t.done();
+}
+
+/// The sorted list setgroups([1000, 7, 3]) leaves
+const PG_SORTED: [u32; 3] = [3, 7, 1000];
+
+/// Forked child of test_peergroups: groups set, then a socketpair and a
+/// connect capture them; still reported after the groups change
+fn peergroups_child(sa: &Sun) -> u64 {
+    let g = [1000u32, 7, 3];
+    if sys_setgroups(3, g.as_ptr()) != 0 {
+        return 90;
+    }
+    let (_a, b) = pair(SOCK_STREAM);
+    let c = ux(SOCK_STREAM);
+    if uconnect(c, sa) != 0 {
+        return 91;
+    }
+    if sys_setgroups(0, core::ptr::null()) != 0 {
+        return 92;
+    }
+    let mut buf = [0u8; 16];
+    let (r, len) = peergroups(b, &mut buf, 16);
+    if r != 0 || len != 12 || !gids_are(&buf[..12], &PG_SORTED) {
+        return 93;
+    }
+    let mut x = [0u8; 1];
+    recv(c, &mut x, 0);
+    0
+}
+
+/// SO_PEERGROUPS: the peer's supplementary groups as captured at
+/// socketpair/connect; a short buffer is ERANGE with the needed length;
+/// ENODATA without peer credentials (unconnected, or not AF_UNIX)
+fn test_peergroups() {
+    let mut t = T::new(b"UNIX_PEERGROUPS");
+    let sa = sun_abs(b"hk-ux-groups");
+    let l = listener(SOCK_STREAM, &sa, 5);
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(peergroups_child(&sa));
+    }
+    let acc = sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
+    let mut buf = [0u8; 16];
+    let (r, len) = peergroups(acc, &mut buf, 16);
+    t.eq(b"accepted", r, 0);
+    t.ok(
+        b"list",
+        len == 12 && gids_are(&buf[..12], &PG_SORTED),
+        len as i64,
+    );
+    let (r, len) = peergroups(acc, &mut buf, 4);
+    t.eq(b"short", r, ERANGE);
+    t.eq(b"short len", len as i64, 12);
+    let (r, len) = peergroups(acc, &mut buf, 0);
+    t.eq(b"zero", r, ERANGE);
+    t.eq(b"zero len", len as i64, 12);
+    send(acc, b"x", 0);
+    t.eq(b"child", wait_status(pid) as i64, 0);
+    let s = ux(SOCK_STREAM);
+    t.eq(b"unconnected", peergroups(s, &mut buf, 16).0, ENODATA);
+    let u = sys_socket(hk_syscall::AF_INET, SOCK_DGRAM, 0) as i32;
+    t.eq(b"inet", peergroups(u, &mut buf, 16).0, ENODATA);
+    for f in [acc, l, s, u] {
         close(f);
     }
     t.done();

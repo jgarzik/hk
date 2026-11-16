@@ -10,7 +10,7 @@
 //! - OutputDeviceContext: Where xHCI writes device state
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use crate::hw::dma::{DmaCoherent, DmaDevice, dma_alloc_coherent};
+use crate::hw::dma::{DmaBox, DmaDevice};
 
 /// Slot Context (32 bytes)
 ///
@@ -344,7 +344,7 @@ pub fn dci_to_endpoint(dci: u8) -> u8 {
 /// - Offset 0x3E0: Endpoint Context 30 (32 bytes)
 pub struct InputContext {
     /// DMA allocation for the context
-    dma: DmaCoherent,
+    dma: DmaBox,
     /// Bytes per context: 32, or 64 (HCCPARAMS1.CSZ)
     ctx_size: usize,
 }
@@ -356,7 +356,7 @@ impl InputContext {
 
     /// Create a new Input Context with `ctx_size`-byte contexts
     pub fn new<D: DmaDevice>(dev: &D, ctx_size: usize) -> Option<Self> {
-        let dma = dma_alloc_coherent(dev, Self::SIZE)?;
+        let dma = DmaBox::alloc(dev, Self::SIZE)?;
         Some(Self { dma, ctx_size })
     }
 
@@ -390,6 +390,14 @@ impl InputContext {
             core::ptr::write_bytes(self.dma.cpu_addr(), 0, Self::SIZE);
         }
     }
+
+    /// Write the dword at byte `off` (4-aligned, inside the context)
+    fn put_dword(&mut self, off: usize, v: u32) {
+        assert!(off + 4 <= Self::SIZE && off.is_multiple_of(4));
+        // SAFETY: inside the context's allocation, which `&mut self`
+        // holds alone (the controller reads it only during a command)
+        unsafe { core::ptr::write_volatile(self.dma.cpu_addr().add(off).cast::<u32>(), v) };
+    }
 }
 
 /// Offset of endpoint context `dci` in an input context: after the
@@ -416,7 +424,7 @@ pub fn ctx_size(hcc_params1: u32) -> usize {
 pub struct OutputDeviceContext {
     /// DMA allocation for the context (written by the controller; the
     /// driver never reads it)
-    dma: DmaCoherent,
+    dma: DmaBox,
 }
 
 impl OutputDeviceContext {
@@ -426,7 +434,7 @@ impl OutputDeviceContext {
 
     /// Create a new Output Device Context
     pub fn new<D: DmaDevice>(dev: &D) -> Option<Self> {
-        let dma = dma_alloc_coherent(dev, Self::SIZE)?;
+        let dma = DmaBox::alloc(dev, Self::SIZE)?;
         Some(Self { dma })
     }
 
@@ -448,10 +456,38 @@ impl OutputDeviceContext {
         if !(1..=31).contains(&dci) {
             return 0;
         }
-        let off = ctx_size * usize::from(dci) + i * 4;
-        // SAFETY: inside the 4 KiB context (31 * 64 + 16 < 4096); the
-        // controller's writes are read volatile
+        self.dword(ctx_size * usize::from(dci) + i * 4)
+    }
+
+    /// The dword at byte `off` (< 2048, 4-aligned)
+    fn dword(&self, off: usize) -> u32 {
+        assert!(off < 2048 && off.is_multiple_of(4));
+        // SAFETY: inside the 4 KiB context; the controller's writes are
+        // read volatile
         unsafe { core::ptr::read_volatile(self.dma.cpu_addr().add(off).cast::<u32>()) }
+    }
+
+    /// Fill `input` for a Configure Endpoint that drops and adds
+    /// endpoint `dci` back as the controller has it, which resets its
+    /// data toggle or sequence number (Linux
+    /// xhci_setup_input_ctx_for_config_ep: xhci_slot_copy,
+    /// xhci_endpoint_copy); `input` cleared first
+    pub fn copy_for_reset(&self, ctx_size: usize, dci: u8, input: &mut InputContext) {
+        input.clear();
+        // Slot: dev_info, dev_info2, tt_info, dev_state
+        for i in 0..4 {
+            input.put_dword(ctx_size + i * 4, self.dword(i * 4));
+        }
+        // Endpoint: ep_info, ep_info2, deq (2), tx_info
+        for i in 0..5 {
+            input.put_dword(
+                ctx_size * (usize::from(dci) + 1) + i * 4,
+                self.ep_dword(ctx_size, dci, i),
+            );
+        }
+        input.control_mut().drop_endpoint(dci);
+        input.control_mut().add_endpoint(dci);
+        input.control_mut().add_slot();
     }
 
     /// Endpoint `dci`'s state (Linux GET_EP_CTX_STATE)

@@ -15,17 +15,19 @@ use super::context::ep_ctx_state;
 use super::transfer::{CompletionCode as Cc, Trb, TrbType, bulk_trbs, td_remainder};
 use super::urb::{Urb, usb_hcd_giveback_urb};
 use super::xhci::{
-    CmdRingState, Td, TdCancel, VirtEp, Xhci, XhciCommand, XhciState, ep_state, ir, op, slot_trb,
-    trb_type, usbsts, xhc_state, xhci_trace,
+    CmdRingState, Td, TdCancel, VirtEp, Xhci, XhciCommand, XhciState, ep_state, ir, op, quirk,
+    slot_trb, trb_type, usbsts, xhc_state, xhci_trace,
 };
 use super::{EndpointType, UsbError};
 use crate::irq::{IrqHandler, IrqReturn};
+use crate::mm::page_alloc::Gfp;
 use crate::printkln;
 use crate::sync::IrqSpinlockGuard;
 use crate::task::percpu::ms_to_ticks;
 use crate::task::workqueue::SYSTEM_WQ;
 use crate::time::delay::poll_timeout;
 use crate::util::kalloc::try_arc_gfp;
+use crate::util::kalloc::with_gfp;
 
 /// Command completion (Linux XHCI_CMD_DEFAULT_TIMEOUT, ms)
 const XHCI_CMD_DEFAULT_TIMEOUT_MS: u64 = 5000;
@@ -66,6 +68,42 @@ fn tx_status(cc: u8) -> Option<Result<(), UsbError>> {
         Cc::DATA_BUFFER_ERROR => Err(UsbError::BufferError),
         _ => return None,
     })
+}
+
+/// Soft retries of a transaction error before the hard reset (Linux
+/// MAX_SOFT_RETRY)
+const MAX_SOFT_RETRY: u32 = 3;
+
+/// Reset Endpoint's Transfer State Preserve bit (Linux TRB_TSP)
+const TRB_TSP: u32 = 1 << 9;
+
+/// How a halted endpoint is reset (Linux enum xhci_ep_reset_type)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reset {
+    /// The halted TD is skipped and fails
+    Hard,
+    /// Transfer state kept: the TD is retried
+    Soft,
+}
+
+/// Whether a transaction error is retried in place (Linux
+/// process_bulk_intr_td): not with the quirk (`off`), nor once
+/// `count`, the errors in a row, passes MAX_SOFT_RETRY
+fn soft_retry(count: &mut u32, off: bool) -> bool {
+    if off {
+        return false;
+    }
+    let c = *count;
+    *count += 1;
+    c <= MAX_SOFT_RETRY
+}
+
+/// Whether an event that found no TD is the spurious success some
+/// hosts send after a short transfer, `old_cc` the ring's last code
+/// (Linux xhci_spurious_success_tx_event; its Etron isochronous case
+/// does not arise: hk queues no isochronous transfers)
+fn spurious_success(quirks: u32, old_cc: u8) -> bool {
+    old_cc == Cc::SHORT_PACKET && quirks & quirk::SPURIOUS_SUCCESS != 0
 }
 
 /// Whether the controller halted the endpoint (Linux
@@ -459,11 +497,12 @@ impl Xhci {
             return Err(UsbError::Shutdown);
         }
         let ep = st.ep(slot, dci).ok_or(UsbError::NoDevice)?;
-        let ring = ep.ring.as_mut().ok_or(UsbError::NoDevice)?;
-        // One segment, never expanded (BUGS.md)
-        if ring.free_trbs() < trbs.len() || ep.tds.len() >= ep.tds.capacity() {
-            return Err(UsbError::NoResources);
+        if ep.ep_state & ep_state::EP_SOFT_CLEAR_TOGGLE != 0 {
+            printkln!("xHCI: Can't enqueue URB while manually clearing toggle");
+            return Err(UsbError::InvalidParam);
         }
+        self.prepare_ring(ep, trbs.len())?;
+        let ring = ep.ring.as_mut().ok_or(UsbError::NoDevice)?;
         let span = ring.enqueue_td(&trbs);
         xhci_trace!(
             QUEUE_TRB,
@@ -482,6 +521,33 @@ impl Xhci {
         });
         let ep_state = ep.ep_state;
         self.ring_ep_doorbell(ep_state, slot, dci);
+        Ok(())
+    }
+
+    /// Room on `ep` for a TD of `n` TRBs (Linux prepare_ring): the ring
+    /// grows by the segments it lacks and the TD list by its length,
+    /// GFP_ATOMIC under the lock as Linux's xhci_urb_enqueue; ENOMEM
+    /// (NoResources) if they cannot be had
+    fn prepare_ring(&self, ep: &mut VirtEp, n: usize) -> Result<(), UsbError> {
+        let ring = ep.ring.as_mut().ok_or(UsbError::NoDevice)?;
+        let need = ring.segs_needed(n);
+        if need > 0 {
+            let shift = ring
+                .expand(&self.pci_dev, need, Gfp::ATOMIC)
+                .ok_or_else(|| {
+                    printkln!("xHCI: Ring expansion failed");
+                    UsbError::NoResources
+                })?;
+            for td in ep.tds.iter_mut() {
+                td.span.start = shift.apply(td.span.start);
+            }
+            ep.queued_deq = ep.queued_deq.map(|i| shift.apply(i));
+        }
+        if ep.tds.len() == ep.tds.capacity() {
+            let more = ep.tds.len().max(1);
+            with_gfp(Gfp::ATOMIC, || ep.tds.try_reserve(more))
+                .map_err(|_| UsbError::NoResources)?;
+        }
         Ok(())
     }
 
@@ -638,7 +704,7 @@ impl Xhci {
                         if let Some(i) = ti {
                             ep.tds[i].status = Err(UsbError::BusError);
                         }
-                        self.handle_halted_endpoint(st, slot, dci, ti);
+                        self.handle_halted_endpoint(st, slot, dci, ti, Reset::Hard);
                     }
                     if let Some(ep) = st.ep(slot, dci) {
                         ep.ep_state &= !ep_state::EP_STOP_CMD_PENDING;
@@ -735,7 +801,7 @@ impl Xhci {
         // An event naming no transfer TRB of the ring (xHCI 4.17.4)
         let Some(idx) = ring.index_of(ev.parameter) else {
             if halted_host_endpoint(ctx_state, cc) {
-                self.handle_halted_endpoint(st, slot, dci, None);
+                self.handle_halted_endpoint(st, slot, dci, None, Reset::Hard);
             }
             return;
         };
@@ -748,8 +814,14 @@ impl Xhci {
             // A Force Stopped event names the TRB before the TD the
             // endpoint stopped at; the Stop Endpoint completion handles it
             if !is_stopped(cc) && halted_host_endpoint(ctx_state, cc) {
-                self.handle_halted_endpoint(st, slot, dci, None);
-            } else if !is_stopped(cc) && ep.tds.iter().any(Td::on_ring) {
+                self.handle_halted_endpoint(st, slot, dci, None, Reset::Hard);
+            } else if is_stopped(cc) || !ep.tds.iter().any(Td::on_ring) {
+                // Nothing queued it could be for (Linux: no warning)
+            } else if spurious_success(self.quirks, ep.old_cc) {
+                // A second event for the short TD already given back
+                // (Linux xhci_spurious_success_tx_event)
+                ep.old_cc = 0;
+            } else {
                 printkln!(
                     "xHCI: event trb@{:#x} for slot {} ep {} not part of a TD",
                     ev.parameter,
@@ -759,9 +831,10 @@ impl Xhci {
             }
             return;
         };
+        ep.old_cc = cc;
         if noop {
             if halted_host_endpoint(ctx_state, cc) {
-                self.handle_halted_endpoint(st, slot, dci, Some(ti));
+                self.handle_halted_endpoint(st, slot, dci, Some(ti), Reset::Hard);
             }
             return;
         }
@@ -772,6 +845,20 @@ impl Xhci {
             remaining,
             ctx_state,
         };
+        if ep.tds[ti].urb.pipe().ty != EndpointType::Control {
+            // Linux process_bulk_intr_td: a transaction error is retried
+            // in place a few times (no TT slots: hk has no hubs)
+            let off = self.quirks & quirk::NO_SOFT_RETRY != 0;
+            match cc {
+                Cc::SUCCESS | Cc::SHORT_PACKET => ep.err_count = 0,
+                Cc::USB_TRANSACTION_ERROR if soft_retry(&mut ep.err_count, off) => {
+                    ep.tds[ti].status = Ok(());
+                    self.handle_halted_endpoint(st, slot, dci, Some(ti), Reset::Soft);
+                    return;
+                }
+                _ => {}
+            }
+        }
         let finish = if ep.tds[ti].urb.pipe().ty == EndpointType::Control {
             process_ctrl_td(ep, ti, &event)
         } else {
@@ -791,7 +878,7 @@ impl Xhci {
             return;
         }
         if halted_host_endpoint(ev.ctx_state, ev.cc) {
-            self.handle_halted_endpoint(st, slot, dci, Some(ti));
+            self.handle_halted_endpoint(st, slot, dci, Some(ti), Reset::Hard);
             return;
         }
         let Some(ep) = st.ep(slot, dci) else {
@@ -806,14 +893,28 @@ impl Xhci {
         td_cleanup(td);
     }
 
-    /// The endpoint halted: the TD it halted on is marked so, and a
-    /// Reset Endpoint queued, whose completion moves the dequeue past
-    /// it (Linux xhci_handle_halted_endpoint, EP_HARD_RESET)
-    fn handle_halted_endpoint(&self, st: &mut XhciState, slot: u8, dci: u8, ti: Option<usize>) {
+    /// The endpoint halted: a Reset Endpoint queued (Linux
+    /// xhci_handle_halted_endpoint). A hard reset marks the TD it halted
+    /// on, and its completion moves the dequeue past it; a soft one
+    /// (Transfer State Preserve) leaves the TD to be retried when the
+    /// completion restarts the endpoint
+    fn handle_halted_endpoint(
+        &self,
+        st: &mut XhciState,
+        slot: u8,
+        dci: u8,
+        ti: Option<usize>,
+        reset: Reset,
+    ) {
         let Some(ep) = st.ep(slot, dci) else {
             return;
         };
-        if let Some(td) = ti.and_then(|i| ep.tds.get_mut(i))
+        if reset == Reset::Hard {
+            // It resets the toggle (TSP 0): endpoint_reset need not
+            ep.ep_state |= ep_state::EP_HARD_CLEAR_TOGGLE;
+        }
+        if reset == Reset::Hard
+            && let Some(td) = ti.and_then(|i| ep.tds.get_mut(i))
             && td.cancel == TdCancel::None
         {
             td.cancel = TdCancel::Halted;
@@ -821,7 +922,10 @@ impl Xhci {
         if ep.ep_state & ep_state::EP_HALTED != 0 {
             return;
         }
-        let trb = slot_trb(trb_type::RESET_ENDPOINT, slot, dci, 0);
+        let mut trb = slot_trb(trb_type::RESET_ENDPOINT, slot, dci, 0);
+        if reset == Reset::Soft {
+            trb.control |= TRB_TSP;
+        }
         let Ok(cmd) = try_arc_gfp(
             XhciCommand::new_nowait(trb),
             crate::mm::page_alloc::Gfp::ATOMIC,
@@ -854,6 +958,10 @@ impl Xhci {
             ep.ep_state &= !ep_state::EP_HALTED;
         }
         self.giveback_invalidated_tds(st, slot, dci);
+        // A soft reset restarts the endpoint on the TD it halted on
+        if trb.control & TRB_TSP != 0 {
+            self.ring_doorbell_for_active_rings(st, slot, dci);
+        }
     }
 
     /// Take the cancelled TDs of a stopped endpoint off the ring (Linux
@@ -907,7 +1015,7 @@ impl Xhci {
         let Some(c) = cached else {
             return;
         };
-        if self.move_dequeue_past_td(st, slot, dci, c, hw).is_err()
+        if self.move_dequeue_past_td(st, slot, dci, c).is_err()
             && let Some(ep) = st.ep(slot, dci)
         {
             // Not moved past: the TD is No-ops, given back anyway
@@ -920,25 +1028,19 @@ impl Xhci {
     }
 
     /// Queue a Set TR Dequeue Pointer past TD `ti` (Linux
-    /// xhci_move_dequeue_past_td): `hw` is the controller's dequeue
-    /// with its cycle state
+    /// xhci_move_deq_to_next_td): to the next TD, or the enqueue
+    /// position
     fn move_dequeue_past_td(
         &self,
         st: &mut XhciState,
         slot: u8,
         dci: u8,
         ti: usize,
-        hw: u64,
     ) -> Result<(), UsbError> {
         let ep = st.ep(slot, dci).ok_or(UsbError::NoDevice)?;
         let ring = ep.ring.as_ref().ok_or(UsbError::NoDevice)?;
         let span = ep.tds.get(ti).ok_or(UsbError::NoDevice)?.span;
-        let (to, cycle) = ring
-            .deq_past_td(span, ring.index_of(hw & !0xf), hw & 1 != 0)
-            .ok_or_else(|| {
-                printkln!("xHCI: Error: Failed finding new dequeue state");
-                UsbError::InvalidParam
-            })?;
+        let (to, cycle) = ring.deq_past_td(span);
         let addr = ring.dma_of(to) | u64::from(cycle);
         let trb = slot_trb(trb_type::SET_TR_DEQUEUE, slot, dci, addr);
         let cmd = try_arc_gfp(
@@ -1130,5 +1232,32 @@ impl XhciCommand {
     /// xhci_alloc_command without a completion)
     pub(super) fn new_nowait(trb: Trb) -> Self {
         Self::new_cmd(trb, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Linux: `err_count++ > MAX_SOFT_RETRY` ends the retries, so four
+    /// soft resets, then the hard one; the quirk allows none
+    #[test]
+    fn soft_retry_count() {
+        let mut n = 0;
+        let tries: alloc::vec::Vec<bool> = (0..6).map(|_| soft_retry(&mut n, false)).collect();
+        assert_eq!(tries, [true, true, true, true, false, false]);
+        let mut q = 0;
+        assert!(!soft_retry(&mut q, true));
+        assert_eq!(q, 0, "the quirk counts nothing");
+    }
+
+    /// Only after a short packet, only with the quirk
+    #[test]
+    fn spurious_after_short() {
+        let q = quirk::SPURIOUS_SUCCESS;
+        assert!(spurious_success(q, Cc::SHORT_PACKET));
+        assert!(!spurious_success(0, Cc::SHORT_PACKET));
+        assert!(!spurious_success(q, Cc::SUCCESS));
+        assert!(!spurious_success(q, 0));
     }
 }

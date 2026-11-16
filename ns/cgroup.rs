@@ -41,13 +41,19 @@ impl CgroupNamespace {
         // The initial namespace uses the real root cgroup
         // We'll get it lazily when first accessed since cgroup_init()
         // might not have been called yet (boot: failure cannot be reported)
-        arc_nofail(Self {
+        let ns = arc_nofail(Self {
             root: CGROUP_ROOT
                 .root_cgroup()
                 .unwrap_or_else(create_placeholder_root),
             ns: super::NsCommon::init(super::inum::Inum::fixed(super::inum::CGROUP_INIT)),
             user_ns: super::INIT_USER_NS.clone(),
-        })
+        });
+        // Linux cgroup_init: ns_tree_add(&init_cgroup_ns)
+        super::tree::add(
+            &super::NsRef::Cgroup(ns.clone()),
+            super::tree::Nodes::nofail(),
+        );
+        ns
     }
 
     /// Get the root cgroup for this namespace
@@ -65,12 +71,16 @@ impl CgroupNamespace {
         new_root: Arc<Cgroup>,
         user_ns: &Arc<super::UserNamespace>,
     ) -> Result<Arc<Self>, KernelError> {
+        let nodes = super::tree::Nodes::new()?;
         let ns = super::NsCommon::new(super::inum::Inum::alloc()?);
-        try_arc(Self {
+        let ns = try_arc(Self {
             root: new_root,
             ns,
             user_ns: user_ns.clone(),
-        })
+        })?;
+        // Linux copy_cgroup_ns: ns_tree_add
+        super::tree::add(&super::NsRef::Cgroup(ns.clone()), nodes);
+        Ok(ns)
     }
 
     /// The path of `cgroup` seen from this namespace (Linux

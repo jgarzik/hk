@@ -8,15 +8,18 @@ use crate::util::error::{KernelError, KernelResult};
 
 use super::filter::{SeccompFilter, SockFprog, create_filter_from_user};
 use super::{
-    SECCOMP_FILTER_FLAG_LOG, SECCOMP_FILTER_FLAG_TSYNC, SECCOMP_GET_ACTION_AVAIL,
-    SECCOMP_GET_NOTIF_SIZES, SECCOMP_MODE_DISABLED, SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT,
-    SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD,
-    SECCOMP_RET_LOG, SECCOMP_RET_TRACE, SECCOMP_RET_TRAP, SECCOMP_RET_USER_NOTIF,
-    SECCOMP_SET_MODE_FILTER, SECCOMP_SET_MODE_STRICT,
+    SECCOMP_FILTER_FLAG_LOG, SECCOMP_FILTER_FLAG_SPEC_ALLOW, SECCOMP_FILTER_FLAG_TSYNC,
+    SECCOMP_FILTER_FLAG_TSYNC_ESRCH, SECCOMP_GET_ACTION_AVAIL, SECCOMP_GET_NOTIF_SIZES,
+    SECCOMP_MODE_DISABLED, SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT, SECCOMP_RET_ALLOW,
+    SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD, SECCOMP_RET_LOG,
+    SECCOMP_RET_TRACE, SECCOMP_RET_TRAP, SECCOMP_RET_USER_NOTIF, SECCOMP_SET_MODE_FILTER,
+    SECCOMP_SET_MODE_STRICT,
 };
 
 /// seccomp(op, flags, args)
 pub fn sys_seccomp(op: u64, flags: u64, args: u64) -> KernelResult<i64> {
+    // Both unsigned int in Linux: the high bits are dropped
+    let flags = u64::from(flags as u32);
     match op as u32 {
         SECCOMP_SET_MODE_STRICT => {
             if flags != 0 || args != 0 {
@@ -25,13 +28,27 @@ pub fn sys_seccomp(op: u64, flags: u64, args: u64) -> KernelResult<i64> {
             set_seccomp_strict().map(|()| 0)
         }
         SECCOMP_SET_MODE_FILTER => {
-            let known_flags = SECCOMP_FILTER_FLAG_LOG | SECCOMP_FILTER_FLAG_TSYNC;
-            if flags as u32 & !known_flags != 0 {
+            // No user notification: NEW_LISTENER and WAIT_KILLABLE_RECV
+            // (which needs it) are unknown, so EINVAL as Linux's checks
+            // of the pairs would be. SPEC_ALLOW asks to skip speculation
+            // mitigations hk does not apply per task
+            let known_flags = SECCOMP_FILTER_FLAG_LOG
+                | SECCOMP_FILTER_FLAG_TSYNC
+                | SECCOMP_FILTER_FLAG_SPEC_ALLOW
+                | SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
+            let f = flags as u32;
+            if f & !known_flags != 0 {
                 return Err(KernelError::InvalidArgument);
             }
-            let log = flags as u32 & SECCOMP_FILTER_FLAG_LOG != 0;
-            let tsync = flags as u32 & SECCOMP_FILTER_FLAG_TSYNC != 0;
-            set_seccomp_filter(UserPtr::new(args), log, tsync)
+            let log = f & SECCOMP_FILTER_FLAG_LOG != 0;
+            let tsync = f & SECCOMP_FILTER_FLAG_TSYNC != 0;
+            let r = set_seccomp_filter(UserPtr::new(args), log, tsync)?;
+            // Linux seccomp_set_mode_filter: a thread TSYNC cannot
+            // cover is ESRCH, not its tid, with TSYNC_ESRCH
+            if r > 0 && f & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0 {
+                return Err(KernelError::NoProcess);
+            }
+            Ok(r)
         }
         SECCOMP_GET_ACTION_AVAIL => {
             if flags != 0 {
@@ -39,10 +56,22 @@ pub fn sys_seccomp(op: u64, flags: u64, args: u64) -> KernelResult<i64> {
             }
             get_action_avail(UserPtr::new(args)).map(|()| 0)
         }
-        // No user notification
-        SECCOMP_GET_NOTIF_SIZES => Err(KernelError::OperationNotSupported),
+        SECCOMP_GET_NOTIF_SIZES => {
+            if flags != 0 {
+                return Err(KernelError::InvalidArgument);
+            }
+            get_notif_sizes(UserPtr::new(args)).map(|()| 0)
+        }
         _ => Err(KernelError::InvalidArgument),
     }
+}
+
+/// The user notification structures' sizes (Linux
+/// seccomp_get_notif_sizes): struct seccomp_notif, seccomp_notif_resp
+/// and seccomp_data
+fn get_notif_sizes(to: UserPtr<[u16; 3]>) -> KernelResult<()> {
+    to.write(&[80, 24, 64])?;
+    Ok(())
 }
 
 /// Enable STRICT seccomp mode

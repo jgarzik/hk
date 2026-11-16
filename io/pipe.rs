@@ -719,7 +719,11 @@ impl Drop for PipeGuard<'_> {
 /// read that gets that far, whatever its result, then signals the
 /// O_ASYNC writers (Linux pipe_read's kill_fasync); one a signal
 /// interrupts in its wait returns before (Linux: -ERESTARTSYS).
-fn pipe_read(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
+pub(crate) fn pipe_read(
+    pipe: &Pipe,
+    to: &mut IovDest<'_>,
+    nonblock: bool,
+) -> Result<usize, KernelError> {
     if to.is_empty() {
         return Ok(0);
     }

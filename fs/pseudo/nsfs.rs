@@ -28,7 +28,7 @@ use crate::fs::dentry::{Dentry, DentryOps, DentryRef};
 use crate::fs::file::{File, FileOps};
 use crate::fs::inode::{AsAny, Inode, InodeData, InodeMode, NULL_INODE_OPS};
 use crate::fs::path_ref::Path;
-use crate::ns::{MntNamespace, NsRef};
+use crate::ns::{MntNamespace, Namespace, NsRef};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
@@ -72,13 +72,6 @@ fn copy_ns_info(m: &crate::ns::MntNamespace, to: u64, usize: usize) -> Result<()
     b[8..].copy_from_slice(&m.id().to_ne_bytes());
     crate::uaccess::copy_to_user(to, &b[..size]).map_err(|_| KernelError::BadAddress)?;
     Ok(())
-}
-
-/// The caller may walk every namespace (Linux may_see_all_namespaces):
-/// in the initial pid namespace with CAP_SYS_ADMIN over its owner
-fn may_see_all_namespaces() -> bool {
-    crate::task::pid::current_pid_ns().level == 0
-        && crate::task::capable(crate::task::CAP_SYS_ADMIN)
 }
 
 /// A pid namespace ioctl (Linux ns_ioctl's NS_GET_{PID,TGID}_{FROM,IN}_
@@ -156,7 +149,7 @@ impl FileOps for NsFileOps {
             .ok_or(KernelError::NotTty)?;
         let next = extensible(cmd, NS_MNT_GET_NEXT_NR);
         let prev = extensible(cmd, NS_MNT_GET_PREV_NR);
-        if (next.is_some() || prev.is_some()) && !may_see_all_namespaces() {
+        if (next.is_some() || prev.is_some()) && !crate::ns::may_see_all_namespaces() {
             return Err(KernelError::NotPermitted);
         }
         if let Some(usize) = extensible(cmd, NS_MNT_GET_INFO_NR) {
@@ -270,8 +263,24 @@ pub static NS_DENTRY_OPS: DentryOps = DentryOps {
 };
 
 /// A namespace file inode's private data (Linux i_private): the
-/// namespace, held until the inode goes (Linux nsfs_evict)
+/// namespace, held until the inode goes, and an active reference to
+/// it, taken as the inode is made (Linux nsfs_init_inode: one made for
+/// an inactive namespace, as SIOCGSKNS's, brings it and its owners back
+/// to life) and put as it goes (Linux nsfs_evict)
 struct NsInode(NsRef);
+
+impl NsInode {
+    fn new(ns: NsRef) -> Self {
+        ns.active_get();
+        Self(ns)
+    }
+}
+
+impl Drop for NsInode {
+    fn drop(&mut self) {
+        self.0.active_put();
+    }
+}
 
 impl AsAny for NsInode {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -382,7 +391,7 @@ pub fn ns_get_path(ns: NsRef) -> Result<Path, KernelError> {
             &NULL_INODE_OPS,
         ))?;
         let name = alloc::format!("{}:[{inum}]", ns.name());
-        inode.set_private(try_arc(NsInode(ns.clone()))?);
+        inode.set_private(try_arc(NsInode::new(ns.clone()))?);
         let d = DentryRef::new(Dentry::new_pseudo(name.as_bytes(), inode, &mnt.sb)?)?;
         let me = DentryRef::as_ptr(&d).cast_mut();
         match ns.common().stashed.compare_exchange(

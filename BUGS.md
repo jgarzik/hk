@@ -7,6 +7,17 @@ Failures that also occur when the boot tester runs on real Linux
 real bug in Linux as well as hk: Linux is the reference, not
 infallible, so each one is investigated, not written off.
 
+- **IO_URING_IOPOLL_READ on Linux 7.0** (`user/boot_tester/uring/iopoll.rs`):
+  -95 (EOPNOTSUPP) on Ubuntu 26.04's 7.0 kernel
+  (`LINUX_RELEASE=resolute ./tools/linux-boot-tester.sh`); passes on 6.8
+  and hk. Likely the boot's poll queues or the 7.0 IOPOLL rules.
+- **ICMP reply counted as echo reply:** Linux icmp_reply leaves
+  fl4_icmp_type 0 and the ICMP control socket is SOCK_RAW, so
+  __ip_make_skb's icmp_out_count counts every reply (timestamp replies
+  included) as an echo reply: Icmp OutEchoReps and IcmpMsg OutType0,
+  never OutTimestampReps. hk's icmp_reply matches it (the
+  `IpParams::icmp_type` override); `net/icmp_ts` tests the Linux count.
+
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
 Files marked `#![expect(clippy::undocumented_unsafe_blocks)]
@@ -82,14 +93,17 @@ so memory pressure does not clamp windows), no orphan count limit
 (tcp_max_orphans; only the memory half of tcp_out_of_resources), no per-netns
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
-No SYN cookies (a full listener drops SYNs). ICMP
-timestamp requests are not answered.
+No SYN cookies (a full listener drops SYNs). Echo and timestamp
+replies skip the ICMP rate limits (Linux icmp_reply applies them when
+icmp_ratemask names the reply type, which the default does not).
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. /proc/net/raw, /proc/net/icmp and /proc/net/sockstat
-do not exist. No tcp_can_ingest: a segment is not refused for taking
+IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. UDP
+memory is not accounted (Linux udp_memory_allocated, udp_mem): a
+socket is bounded by SO_RCVBUF only, and /proc/net/sockstat's UDP mem
+is 0. No tcp_can_ingest: a segment is not refused for taking
 receive memory past SO_RCVBUF (only the window and tcp_mem limit it).
 MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
 prediction (TCPHPHits, TCPHPAcks; without the fast path every pure
@@ -124,6 +138,10 @@ Missing:
   memory). No errseq: fsync reports a writeback error once, to the
   caller that ran the writeback, not to every open file.
 
+- The dcache shrinker (`fs/dentry.rs` shrink_dcache) walks the whole
+  tree, locking every dentry, persistent ramfs/tmpfs ones included,
+  to free the unused ones (Linux keeps an LRU of unused dentries):
+  each pass costs the size of the tree, not what it frees.
 - Reclaim (J) drops clean, unmapped page-cache pages inode by inode
   (no file LRU, no aging: Linux reclaims the oldest file pages; dirty
   or mapped ones stay until written back or unmapped), then swaps out
@@ -148,9 +166,7 @@ Missing:
   (Linux gup_must_unshare).
 - shmdt needs the address an attachment starts at (Linux also finds a
   piece moved by mremap); SHM_EXEC is ignored.
-- shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
-  range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
-  an address).
+- exec does not check RLIMIT_AS for the new image and stack (`task/exec.rs`): Linux maps each segment with vm_mmap, whose may_expand_vm makes an image past the limit fail the exec (fatal past the point of no return); hk counts them in total_vm but runs the image.
 
 ## NUMA gaps
 
@@ -251,8 +267,6 @@ lo (hk has no checksum offload states).
 - fanotify_mark keeps only the mask: FAN_MARK_IGNORED_MASK,
   FAN_MARK_IGNORE, FAN_MARK_IGNORED_SURV_MODIFY and FAN_MARK_EVICTABLE
   are accepted but have no effect (Linux fanotify_add_mark).
-- A NULL pathname is EINVAL; Linux fanotify_find_path marks dfd's own
-  file (a descriptor, not a path-only one).
 
 ## O_DIRECT gaps
 
@@ -310,9 +324,9 @@ No leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 **Location**: `seccomp/`
 
 No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS as with no tracer), no
-user notification (SECCOMP_RET_USER_NOTIF, SECCOMP_GET_NOTIF_SIZES), no
-FLAG_TSYNC_ESRCH / FLAG_SPEC_ALLOW / FLAG_WAIT_KILLABLE_RECV, and
-nothing is logged for RET_LOG or FLAG_LOG.
+user notification (SECCOMP_RET_USER_NOTIF; FLAG_NEW_LISTENER and
+FLAG_WAIT_KILLABLE_RECV are EINVAL), and nothing is logged for RET_LOG
+or FLAG_LOG.
 
 ## Pipe size is fixed
 
@@ -321,14 +335,6 @@ nothing is logged for RET_LOG or FLAG_LOG.
 Every pipe holds 16 buffers; fcntl F_GETPIPE_SZ and F_SETPIPE_SZ are
 EINVAL and there is no /proc/sys/fs/pipe-max-size (Linux pipe_fcntl,
 pipe_set_size).
-
-## vmsplice from a pipe is not done
-
-**Location**: `fs/splice.rs` (`sys_vmsplice`)
-
-vmsplice on a pipe or FIFO open for writing copies user memory into it
-(Linux vmsplice_to_pipe). On one open only for reading Linux copies the
-pipe's data into the user iovecs (vmsplice_to_user); hk returns EBADF.
 
 ## AF_UNIX gaps
 
@@ -349,8 +355,13 @@ can be pinned.
 
 Not implemented: MSG_OOB on streams (EOPNOTSUPP; Linux supports one
 out-of-band byte), SO_PEEK_OFF, SO_PASSPIDFD / SCM_PIDFD /
-SO_PEERPIDFD, SO_PEERGROUPS, SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC,
-SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
+SO_PEERPIDFD, SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC, SIOCUNIXFILE,
+SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
+
+SO_PEERCRED (`peercred_opt`) and SCM_CREDENTIALS (`scm::Creds`) report
+uid/gid unmapped; Linux maps them into the reader's user namespace
+(cred_to_ucred, scm_recv: from_kuid_munged/from_kgid_munged), as
+SO_PEERGROUPS already does.
 
 ## File permission (DAC) gaps
 
@@ -362,7 +373,7 @@ EPERM).
 ## Before user namespaces grant capabilities
 
 **Location**: `task/mod.rs` (`capable`), `fs/dac.rs`, `ns/mod.rs`,
-`fs/mount.rs`, `fs/pnode.rs`, `net/netlink/rtnetlink.rs`
+`fs/mount.rs`, `fs/pnode.rs`, `fs/fhandle.rs`, `net/netlink/rtnetlink.rs`
 
 Safe today only because a user namespace grants no capabilities. First:
 - each `capable()` becomes Linux's `ns_capable(<owner>->user_ns)` (or
@@ -378,6 +389,29 @@ Safe today only because a user namespace grants no capabilities. First:
   gid_map become writable.
 - mounts become user-namespace aware (plain `capable()` today, Linux
   ns_capable of the mount namespace's `user_ns`).
+- open_by_handle_at's `may_decode_fh` (`fs/fhandle.rs`) gains Linux's
+  O_DIRECTORY path for a caller with CAP_SYS_ADMIN over the file
+  system's or mount namespace's user namespace (HANDLE_CHECK_PERMS,
+  HANDLE_CHECK_SUBTREE with has_locked_children, EXPORT_FH_DIR_ONLY);
+  today it is CAP_DAC_READ_SEARCH or EPERM.
+
+## File handle gaps
+
+**Location**: `fs/exportfs/mod.rs`, `fs/fhandle.rs`, `fs/vfat/`,
+`cgroup/cgroupfs.rs`, `fs/pseudo/nsfs.rs`
+
+Only tmpfs decodes handles; elsewhere name_to_handle_at encodes a file
+id (AT_HANDLE_FID) and is otherwise EOPNOTSUPP. Missing export
+operations, as Linux has them:
+- vfat's (fat_export_ops, FILEID_FAT_*): needs ->fh_to_parent,
+  ->get_parent and ->get_name, disconnected dentries (d_obtain_alias,
+  DCACHE_DISCONNECTED) and reconnect_path; with ->fh_to_parent,
+  AT_HANDLE_CONNECTABLE handles (now EOPNOTSUPP everywhere).
+- cgroup2's (kernfs_export_ops, FILEID_KERNFS).
+- nsfs's (nsfs_export_operations, FILEID_NSFS, with ->permission and
+  ->open): FD_NSFS_ROOT is accepted as a mount fd, but nothing there
+  decodes.
+- pidfs (FD_PIDFS_ROOT is EBADF: pidfds are anonymous inodes).
 
 ## Credentials have no identity
 
@@ -392,30 +426,10 @@ linked on hk without CAP_DAC_READ_SEARCH; Linux gives ENOENT. The
 capability is checked in the caller's namespace (Linux: the opener's
 `user_ns`); hk has one user namespace.
 
-## SysV semaphore undo gaps
-
-**Location**: `ipc/sem.rs` (`clone_task_semundo`), `ns/mod.rs`
-
-- CLONE_SYSVSEM from a parent with no undo list leaves parent and
-  child with separate lists made later (Linux copy_semundo allocates
-  the list first, so both share it): a thread's SEM_UNDO adjustments
-  are then undone at that thread's exit, not the process's.
-- clone(CLONE_NEWIPC | CLONE_SYSVSEM) is not EINVAL, unshare
-  (CLONE_NEWIPC) does not imply CLONE_SYSVSEM and setns into an ipc
-  namespace does not run exit_sem (Linux copy_namespaces,
-  ksys_unshare, ipcns_install): an undo list can outlive its
-  namespace's arrays. Each undo structure names its array, so exit
-  undoes nothing there instead of touching another array.
-
 ## POSIX mqueue gaps
 
 **Location**: `ipc/mqueue.rs`
 
-POSIX message queues reject creation by an unprivileged user with
-EACCES: hk has no 01777 `/dev/mqueue`, so only root
-creates queues, where Linux lets any user. mq_attr_ok's soft caps
-(msgsize_max 8192, msg_max 10 without CAP_SYS_RESOURCE) are therefore
-unreachable today.
 There is no mqueue filesystem at all: queues live only in a kernel
 table, so they cannot be listed or read as files under /dev/mqueue
 (Linux mqueue_fs_type), and an mq_open descriptor does not open again
@@ -577,9 +591,11 @@ Missing, each answered with a Linux errno rather than silently: link
 creation and rename (EOPNOTSUPP), multipath routes and nexthop objects
 (EOPNOTSUPP), input-route simulation `ip route get ... iif` (EOPNOTSUPP),
 NLM_F_ECHO (not echoed), extended-ACK message/offset TLVs (plain errors),
-RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
-is no rule engine: lookups are local then main), address lifetimes are
-always infinite, promote_secondaries is off.
+address lifetimes are always infinite, promote_secondaries is off.
+Routing rules are Linux's three IPv4 defaults, fixed: RTM_NEWRULE and
+RTM_DELRULE are EOPNOTSUPP, lookups walk tables local then main and never
+default (no rule engine), and rule dumps of other families are
+EAFNOSUPPORT (Linux lists the IPv6 and multicast-routing defaults).
 RTM_NEWLINK/RTM_SETLINK ignore IFLA_NET_NS_PID/IFLA_NET_NS_FD: they
 return 0 without moving the device (Linux: moved, or an error).
 
@@ -652,6 +668,14 @@ F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
 waiting).
 
+## renameat2 flag gaps
+
+**Location**: `fs/ramfs/`, `fs/vfat/mod.rs`
+
+- RENAME_WHITEOUT is EINVAL everywhere; Linux tmpfs makes whiteouts
+  (shmem_whiteout).
+- vfat lacks RENAME_EXCHANGE (Linux vfat_rename_exchange).
+
 ## Kernel heap (slab) gaps
 
 **Location**: `mm/slab.rs`, `mm/heap.rs`
@@ -722,7 +746,7 @@ phase A (A0-A3).
 Phase A2 (net) remaining:
 - IPv4 reassembly (`net/inet/frag.rs` `FragTable.st`): Linux per-queue
   locks and timers, fragments in the skb rbtree, inet_frag_alloc
-  GFP_ATOMIC, ip_expire's ICMP_EXC_FRAGTIME.
+  GFP_ATOMIC.
 - ICMP global limiter (icmp_global_allow) and inet_peer on the RbTree
   with `new_gfp(ATOMIC)` nodes and Linux's GC thresholds.
 - Raw, UDP, packet and netlink socket tables still allocate under their
@@ -790,20 +814,12 @@ Phase A2 (net) remaining:
 **Location**: `hw/usb/xhci.rs`, `hw/usb/xhci_ring.rs`, `hw/usb/msc.rs`
 
 QEMU's xHCI hides all of them.
-- A second controller's root hub is `usb1` too (no bus numbers, Linux
-  usb_register_bus): its devices fail to register.
 - No hub support (route string 0): devices behind a hub are not
   enumerated.
 - Only bulk and interrupt endpoints are added to the controller
   (`configure_endpoints`): isochronous and non-default control
   endpoints are skipped.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
-- Transfer rings are one segment and never grow (Linux
-  xhci_ring_expansion): a submission that does not fit fails
-  (NoResources).
-- A transaction error halts the endpoint at once (Linux retries a
-  few: EP_SOFT_RESET); no quirk for controllers that send a spurious
-  success event after a short transfer (XHCI_SPURIOUS_SUCCESS).
 - INTx only (Linux tries MSI-X, then MSI): see "x86 has no IOAPIC or
   MSI"; a controller without an INTx line is not started, as Linux
   without any interrupt.
@@ -833,12 +849,26 @@ QEMU's xHCI hides all of them.
   0).
 - usb-storage: SCSI transparent command set over Bulk-Only Transport
   only (no CB/CBI, RBC/UFI/8070 subclasses, UAS, or unusual_devs
-  quirks). A stalled bulk transfer fails the command: no CLEAR_FEATURE
-  ENDPOINT_HALT to the device, CSW read or reset recovery (Linux
-  usb_stor_clear_halt, usb_stor_Bulk_reset).
+  quirks). A failed command's sense is not fetched (Linux
+  usb_stor_invoke_transport's REQUEST SENSE), and past a Bulk-Only
+  reset there is no port reset (Linux usb_stor_port_reset,
+  usb_reset_device) or SCSI error handler.
 - ftdi_sio: a console only, for the FT232 (0403:6001): no usb-serial
   bus or ttyUSB0 tty device, no baud rate or modem control requests,
   the bulk IN endpoint is never read.
+
+## Driver probe failure leaks
+
+**Location**: `hw/net/e1000.rs` (`e1000_probe`, `alloc_bufs`),
+`hw/net/virtio_net.rs` (`setup_queues`, `probe`)
+
+A probe that fails part-way does not undo what it set up (Linux
+devm_*, or the probe's goto unwind): e1000's descriptor rings and
+buffers (`DmaCoherent`, freed by hand only at remove) and its register
+mapping leak when a later allocation fails; virtio-net's virtqueues
+and buffer pools leak when the second queue or a pool fails. Owners
+freeing on drop (`DmaBox`) would unwind them; doc/res/hk-driver-api.md
+proposes the design.
 
 ## No DMA for 32-bit devices with RAM above 4GB
 
@@ -870,6 +900,29 @@ and r8169 all support: MSI-X exists (`hw/pci/msix.rs`, x86 vectors in
 MSI capability, which RTL8168g and some AHCI parts offer alone) is
 missing. The MADT parser skips IOAPIC entries (Linux
 acpi_parse_ioapic registers them).
+
+## UEFI boot finds no ACPI tables
+
+**Location**: `arch/x86_64/acpi.rs` (`find_rsdp`), `arch/x86_64/multiboot2.rs`
+
+The RSDP is found only by scanning the legacy BIOS areas (EBDA,
+0xE0000-0xFFFFF). Under UEFI it is not there: GRUB passes it in the
+multiboot2 ACPI old/new RSDP tags (types 14 and 15; Linux takes it from
+the EFI system table or boot_params.acpi_rsdp_addr), which hk ignores,
+so a UEFI boot of the Dell OptiPlex 3020 panics without ACPI.
+
+## TLB gaps
+
+**Location**: `arch/x86_64/tlb.rs`, `mm/tlb.rs`, `arch/aarch64/`
+
+- x86 has no PCID and no global pages (CR4.PGE clear): every CR3 write
+  drops the whole TLB, kernel entries included (Linux: PCID-tagged
+  ASIDs per CPU, _PAGE_GLOBAL kernel mappings), and no lazy TLB mode
+  for kernel threads (Linux switch_mm_irqs_off leaves the old mm loaded).
+- No ranged or broadcast invalidation hardware: arm64 FEAT_TLBIRANGE
+  (Linux __flush_tlb_range_op), AMD INVLPGB/TLBSYNC (Linux
+  invlpgb_flush_user_nr_nosync) and Intel RAR; every remote flush is
+  an IPI on x86 and per-page TLBI on arm64.
 
 ## ACPI power management gaps
 
@@ -913,18 +966,17 @@ its no-writeback skip, before it relies on sync.
   swap (any holder of the partition besides the registry); Linux also
   takes the whole disk for exclusive use during the scan
   (bd_prepare_to_claim), so a rescan can race an exclusive opener.
-  BLKROSET, BLKDISCARD, BLKZEROOUT, BLKIOMIN/OPT, BLKALIGNOFF,
-  BLKSECTGET, HDIO_GETGEO and the BLKPG partition ioctls are ENOTTY.
+  BLKDISCARD, BLKZEROOUT, BLKSECDISCARD, BLKGETDISKSEQ, BLKROTATIONAL,
+  BLKDISCARDZEROES, BLKRAGET/BLKRASET, BLKFRAGET/BLKFRASET, BLKTRACE*,
+  the zone, persistent reservation and BLKPG partition ioctls are
+  ENOTTY. HDIO_GETGEO is ENOTTY on sd disks (Linux sd_getgeo:
+  scsicam_bios_param from the MBR, else a computed CHS).
 - virtio-blk: modern devices only (QEMU needs `disable-legacy=on`;
   Linux also drives transitional devices), INTx on arm64 (no MSI: the
   GICv3 ITS has no driver; Linux uses it on QEMU virt),
   capacity changes (config interrupts) are ignored, no DISCARD,
   WRITE_ZEROES, GET_ID (serial) or secure erase. The disk's queues are
   fixed at probe.
-- Disk removal (`del_gendisk`) drops the page cache without writing it
-  back; Linux syncs it first on an orderly removal (bdev_mark_dead with
-  surprise = false: sync_blockdev), so dirty device-file data is lost
-  on unbind.
 - virtio-pci remove leaves the BAR mappings (common, notify, ISR,
   device config): `IoMem` windows are copyable and never unmapped, so
   each transport rebind leaks the ioremap space of one device (Linux
@@ -985,9 +1037,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   reading or writing, not the one the file was opened in (Linux binds
   the file to the opener's namespace): an fd passed across namespaces
   reads and writes the other one's values.
-- **Stale comments** (as touched): "for now"/TODO markers; the
-  `ns/mod.rs` `sys_setns` doc says EBADF for a non-namespace fd, the
-  code returns EINVAL.
+- **Stale comments** (as touched): "for now"/TODO markers.
 
 ## Review gaps, by phase
 
@@ -1042,6 +1092,22 @@ Tag = roadmap phase (doc/ROADMAP.md).
     host, completed (SO_ERROR 0, POLLOUT). Not reproduced on rerun;
     the socket is an active connect (no listener-side code involved).
 
+11. **STACK near-overflow flake** (arm64, once in three local
+    `check-arm` runs): `STACK:FAIL kernel stack nearly overflowed: 4016
+    of 16384 bytes left (need 4096)`, reported by
+    `task/percpu.rs` `check_stack_usage` for a task that exited around
+    the FAULT_INJECT tests. Some path comes within 80 bytes of the
+    margin; the check does not say which. Find the deep path (a
+    per-task high-water site, Linux stack_trace_max) and shrink it.
+
+12. **FORK_PGRP_SIGNAL flake** (hk x86, once in three local `check`
+    runs): `FORK_PGRP_SIGNAL:FAIL got 11`: in round 1 a child forked
+    before the group's SIGUSR1 showed pending in its parent did not
+    get it (`user/boot_tester/signal/fork_delay.rs` `round`). A
+    process-group kill racing fork (Linux copy_process's
+    signal->multiprocess delay and its recheck under siglock) may
+    miss a child that joined the group before the walk.
+
 ## DRM dumb buffers are the boot framebuffer only
 
 **Location**: `hw/gfx/simplegfx.rs` (`create_dumb`)
@@ -1056,8 +1122,7 @@ dumb buffer from shmem and blits it on page flip
 **Location**: `fs/pseudo/nsfs.rs`, `ns/setns.rs`
 
 No time namespaces (CLONE_NEWTIME, the time and time_for_children
-links). No nsfs file handles (hk has no name_to_handle_at /
-open_by_handle_at) and no listns(2) / statns(2).
+links). No nsfs file handles (File handle gaps).
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 
@@ -1082,12 +1147,4 @@ the ACPI PM timer, which hk lacks.
 
 adjtimex keeps and reports the NTP frequency (ADJ_FREQUENCY) and the
 tick, but neither changes how fast the clock runs (Linux
-ntp_update_frequency), and maxerror does not grow each second (Linux
-second_overflow).
-
-## Errno differs from Linux
-
-- **User namespaces nest one level short** (ns/user.rs clone_ns): hk
-  refuses a child of a level-32 namespace; Linux create_user_ns refuses
-  only past `parent_ns->level > 32`, so 33 levels nest. Not testable on
-  both until uid_map is writable (Linux needs a mapping per level).
+ntp_update_frequency).

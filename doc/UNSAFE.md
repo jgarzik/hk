@@ -41,7 +41,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | frame borrows | typed handle |
 | `Pod` byte views | marker trait |
 | `IoMem` registers | checked volatile |
-| `DmaBox` | owned device memory |
+| `DmaBox` (`hw/dma.rs`, Rust-for-Linux CoherentAllocation) | owned device memory, freed on drop |
 | page-table `PgTables` / `Pte` / `PteTable` / `Pmd` / `Dir`, `PgPrune` (`mm/pgtable.rs`) | typed handle borrowing the lock |
 | vmalloc-area range `VmArea` (`mm/vmalloc.rs`, Linux vm_struct) | ownership token |
 | kernel stack `VmStack`, a task's `StackSlot` (`mm/vmstack.rs`) | ownership token |

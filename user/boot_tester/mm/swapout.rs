@@ -2,7 +2,8 @@
 //! the test disk, tools/mkdisk.sh): MADV_PAGEOUT writes anonymous pages
 //! out (SwapFree and VmSwap drop, Linux reclaim_pages), faults read them
 //! back intact, fork and mremap carry swapped pages, munmap gives the
-//! slots back, swapoff reads everything in (Linux try_to_unuse).
+//! slots back, swapoff reads everything in (Linux try_to_unuse). With
+//! swap off, an I/O flusher still has clean page cache reclaimed.
 //! Expectations from Linux 6.8; both kernels run it.
 
 use crate::harness::verdict;
@@ -11,9 +12,9 @@ use crate::helpers::{
 };
 use crate::process::preempt::ncpus_allowed;
 use hk_syscall::{
-    MADV_COLD, MADV_PAGEOUT, MAP_ANONYMOUS, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE, PROT_READ,
-    PROT_WRITE, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mprotect, sys_mremap, sys_munmap,
-    sys_wait4,
+    MADV_COLD, MADV_PAGEOUT, MAP_ANONYMOUS, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE, O_RDONLY,
+    PR_SET_IO_FLUSHER, PROT_READ, PROT_WRITE, sys_close, sys_exit, sys_fork, sys_madvise, sys_mmap,
+    sys_mprotect, sys_mremap, sys_munmap, sys_open, sys_prctl, sys_read, sys_wait4,
 };
 
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -128,6 +129,59 @@ pub fn run_tests() {
     direct_reclaim();
     swapoff_swapped(path);
     swapoff_race(path);
+    noio_reclaim(path);
+}
+
+/// Read all of `path` (NUL-terminated) through the page cache: the
+/// descriptor, still open (the last close drops a block device's cache,
+/// Linux kill_bdev), or -1
+fn read_through(path: &[u8]) -> i64 {
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    let buf = map(MIB);
+    if fd < 0 || buf == 0 {
+        return -1;
+    }
+    let mut total = 0;
+    loop {
+        let n = sys_read(fd as u64, buf as *mut u8, MIB);
+        if n <= 0 {
+            break;
+        }
+        total += n as u64;
+    }
+    sys_munmap(buf, MIB);
+    if total != 64 * MIB {
+        sys_close(fd as u64);
+        return -1;
+    }
+    fd
+}
+
+/// A task marked PR_SET_IO_FLUSHER (PF_MEMALLOC_NOIO) still gets clean
+/// page cache reclaimed for it (Linux: NOIO only bars reclaim I/O): the
+/// 64 MiB partition read into the cache (swap off), then more anonymous
+/// memory than is free touched
+fn noio_reclaim(path: &[u8]) {
+    let fd = read_through(path);
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0) != 0 {
+            sys_exit(2);
+        }
+        let free = proc_kb(b"/proc/meminfo\0", b"MemFree:");
+        let len = ((free as u64 * 1024) + 16 * MIB) & !(MIB - 1);
+        let p = map(len);
+        if free <= 0 || p == 0 {
+            sys_exit(3);
+        }
+        fill(p, len, 5);
+        sys_exit(if check(p, len, 5).is_none() { 0 } else { 1 });
+    }
+    let st = wait_bounded(pid, 300);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    verdict(b"SWAPOUT_NOIO_RECLAIM", fd >= 0 && st == 0, st as i64);
 }
 
 /// Page out 16 MiB, read it back through fork and mremap, then unmap

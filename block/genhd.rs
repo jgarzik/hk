@@ -112,7 +112,9 @@ type BAttr = (&'static [u8], fn(&BlockDevice) -> String);
 const COMMON_ATTRS: [BAttr; 4] = [
     (b"size", |b| format!("{}\n", b.nr_sects())),
     (b"ro", |b| format!("{}\n", u8::from(b.ro()))),
-    (b"alignment_offset", |_| String::from("0\n")),
+    (b"alignment_offset", |b| {
+        format!("{}\n", b.alignment_offset())
+    }),
     (b"discard_alignment", |_| String::from("0\n")),
 ];
 
@@ -145,10 +147,8 @@ fn disk_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
         (b"hw_sector_size", |b| {
             format!("{}\n", b.logical_block_size())
         }),
-        (b"minimum_io_size", |b| {
-            format!("{}\n", b.physical_block_size())
-        }),
-        (b"optimal_io_size", |_| String::from("0\n")),
+        (b"minimum_io_size", |b| format!("{}\n", b.io_min())),
+        (b"optimal_io_size", |b| format!("{}\n", b.io_opt())),
         (b"rotational", |b| {
             format!("{}\n", u8::from(b.disk.queue.limits.rotational))
         }),
@@ -299,6 +299,21 @@ pub fn rescan(bdev: &BlockDevice) -> Result<(), KernelError> {
 /// fails with EIO, open files get EIO, and the requests in flight
 /// complete before it returns, so the driver may then stop the device
 pub fn del_gendisk(disk: &Arc<Disk>) {
+    // An orderly removal writes the cached data back first (Linux
+    // blk_report_disk_dead(disk, false) -> bdev_mark_dead: sync_blockdev
+    // of each block device), with no lock held: the writes sleep
+    let bdevs: Vec<Arc<BlockDevice>> = disk
+        .open_mutex
+        .lock()
+        .part_tbl
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    for b in &bdevs {
+        let _ = crate::block::blkdev::sync_blockdev(b);
+    }
+    drop(bdevs);
     {
         // Under open_mutex, like a rescan: an open in progress either
         // finished before or sees the device dead

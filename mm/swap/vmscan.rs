@@ -45,9 +45,10 @@ enum Fate {
 /// reference, Linux shrink_folio_list): the number freed; the others
 /// go back to the LRU
 pub fn shrink_folio_list(pages: Vec<u64>) -> usize {
+    let io = may_io();
     let mut freed = 0;
     for phys in pages {
-        match shrink_page(phys) {
+        match shrink_page(phys, io) {
             Fate::Freed => freed += 1,
             Fate::Keep { active } => {
                 let l = if active {
@@ -62,8 +63,19 @@ pub fn shrink_folio_list(pages: Vec<u64>) -> usize {
     freed
 }
 
-/// Reclaim one isolated page
-fn shrink_page(phys: u64) -> Fate {
+/// The reclaiming task may start I/O: not under PF_MEMALLOC_NOIO
+/// (Linux current_gfp_context clearing __GFP_IO and __GFP_FS)
+fn may_io() -> bool {
+    #[cfg(not(test))]
+    {
+        !crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC_NOIO)
+    }
+    #[cfg(test)]
+    true
+}
+
+/// Reclaim one isolated page (`io`: it may be written to swap)
+fn shrink_page(phys: u64, io: bool) -> Fate {
     let Some(pg) = phys_to_page(phys) else {
         return Fate::Keep { active: true };
     };
@@ -76,20 +88,26 @@ fn shrink_page(phys: u64) -> Fate {
         unlock_page(phys);
         return Fate::Keep { active: true };
     }
-    let fate = pageout(phys);
+    let fate = pageout(phys, io);
     if !matches!(fate, Fate::Freed) {
         unlock_page(phys);
     }
     fate
 }
 
-/// Swap out the locked page `phys` (isolation reference held)
-fn pageout(phys: u64) -> Fate {
+/// Swap out the locked page `phys` (isolation reference held). Without
+/// `io` (Linux no __GFP_IO) only a clean swap-cache page is freed: no
+/// slot is taken and nothing is written (shrink_folio_list's
+/// keep_locked, may_enter_fs)
+fn pageout(phys: u64, io: bool) -> Fate {
     let Some(pg) = phys_to_page(phys) else {
         return Fate::Keep { active: true };
     };
     // A slot and a swap-cache place (Linux add_to_swap)
     if !pg.is_swapcache() {
+        if !io {
+            return Fate::Keep { active: false };
+        }
         let Some(e) = get_swap_page() else {
             return Fate::Keep { active: true };
         };
@@ -108,6 +126,9 @@ fn pageout(phys: u64) -> Fate {
     // Written only if changed since the slot last held it (a page read
     // back from swap is mapped read-only while it stays in the cache)
     if pg.is_dirty() {
+        if !io {
+            return Fate::Keep { active: false };
+        }
         pg.clear_flag(PG_DIRTY);
         if super::swapfile::swap_write_page(e, phys).is_err() {
             pg.set_flag(PG_DIRTY);
@@ -132,7 +153,8 @@ pub fn reclaim_pages(pages: Vec<u64>) -> usize {
 /// Direct reclaim (Linux try_to_free_pages, one pass of
 /// shrink_inactive_list): up to `nr` pages from the inactive tail, the
 /// active list aged into it first when it runs short. Only with swap.
-/// The number freed.
+/// Under PF_MEMALLOC_NOIO only clean pages go: page cache and clean
+/// swap cache. The number freed.
 pub fn try_to_free_pages(nr: usize) -> usize {
     // Clean page cache first: no I/O to free it (Linux balances the file
     // and anon LRUs; with no file LRU hk takes the cache first)
@@ -141,8 +163,11 @@ pub fn try_to_free_pages(nr: usize) -> usize {
         return cached;
     }
     // Then the dcache (Linux shrink_slab): unused dentries and the
-    // inodes only they hold; their memory is slab, not counted here
-    crate::fs::dentry::shrink_dcache(nr.saturating_mul(16));
+    // inodes only they hold; their memory is slab, not counted here.
+    // Not without I/O (Linux super_cache_scan: no __GFP_FS)
+    if may_io() {
+        crate::fs::dentry::shrink_dcache(nr.saturating_mul(16));
+    }
     let nr = nr - cached;
     let (total, free) = super::swapfile::swap_totals();
     if total == 0 || free == 0 || !super::swapfile::bdev_swap_active() {

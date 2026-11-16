@@ -143,12 +143,16 @@ impl UtsNamespace {
         // Copy current name values
         let name_copy = *self.name.read();
 
+        let nodes = super::tree::Nodes::new()?;
         let inum = super::inum::Inum::alloc()?;
-        try_arc(Self {
+        let ns = try_arc(Self {
             name: RwLock::new(name_copy),
             user_ns: user_ns.clone(),
             ns: super::NsCommon::new(inum),
-        })
+        })?;
+        // Linux clone_uts_ns: ns_tree_add
+        super::tree::add(&super::NsRef::Uts(ns.clone()), nodes);
+        Ok(ns)
     }
 }
 
@@ -156,8 +160,12 @@ impl UtsNamespace {
 ///
 /// The root UTS namespace used by all tasks unless they create
 /// a new one via clone(CLONE_NEWUTS) or unshare(CLONE_NEWUTS).
-pub static INIT_UTS_NS: Lazy<Arc<UtsNamespace>> =
-    Lazy::new(|| arc_nofail(UtsNamespace::new_init()));
+pub static INIT_UTS_NS: Lazy<Arc<UtsNamespace>> = Lazy::new(|| {
+    let ns = arc_nofail(UtsNamespace::new_init());
+    // Linux uts_ns_init: ns_tree_add(&init_uts_ns)
+    super::tree::add(&super::NsRef::Uts(ns.clone()), super::tree::Nodes::nofail());
+    ns
+});
 
 // ============================================================================
 // Helper Functions

@@ -538,6 +538,10 @@ pub struct IpParams {
     /// Identification from a connected socket's counter (Linux
     /// inet_id); None = DF packets get 0, others a hashed id
     pub id: Option<u16>,
+    /// ICMP type counted for the packet in place of its header's
+    /// (Linux fl4_icmp_type of a SOCK_RAW sender, which
+    /// __ip_make_skb counts)
+    pub icmp_type: Option<u8>,
 }
 
 impl Default for IpParams {
@@ -547,6 +551,7 @@ impl Default for IpParams {
             ttl: IP_DEFAULT_TTL,
             pmtudisc: pmtu::WANT,
             id: None,
+            icmp_type: None,
         }
     }
 }
@@ -618,7 +623,7 @@ pub fn ip_send_rt(
     let c = ip_checksum(&h[..IP_HLEN_MIN]);
     h[10..12].copy_from_slice(&c.to_be_bytes());
     if protocol == IPPROTO_ICMP
-        && let Some(&ty) = skb.data().get(IP_HLEN_MIN)
+        && let Some(ty) = p.icmp_type.or(skb.data().get(IP_HLEN_MIN).copied())
     {
         // Linux __ip_make_skb
         net.mib.icmp_out_count(ty);
@@ -683,7 +688,8 @@ fn ip_finish_output2(
 
 /// Split an IP packet (no options are ever generated, so every fragment
 /// repeats the header) into fragments of at most `mtu` bytes (Linux
-/// ip_do_fragment slow path)
+/// ip_do_fragment slow path); ENOMEM if one cannot be allocated (Linux
+/// ip_frag_next)
 pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelError> {
     let pkt = skb.data();
     let ihl = ((pkt[0] & 0x0f) as usize) * 4;
@@ -697,10 +703,10 @@ pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelErro
     while off < payload.len() {
         let len = room.min(payload.len() - off);
         let more = off + len < payload.len();
-        let mut f = SkBuff::alloc_tx(ihl + len, Gfp::ATOMIC).ok_or(KernelError::NoBufferSpace)?;
-        f.put_slice(&pkt[..ihl]).ok_or(KernelError::NoBufferSpace)?;
+        let mut f = SkBuff::alloc_tx(ihl + len, Gfp::ATOMIC).ok_or(KernelError::OutOfMemory)?;
+        f.put_slice(&pkt[..ihl]).ok_or(KernelError::OutOfMemory)?;
         f.put_slice(&payload[off..off + len])
-            .ok_or(KernelError::NoBufferSpace)?;
+            .ok_or(KernelError::OutOfMemory)?;
         let h = f.data_mut();
         h[2..4].copy_from_slice(&((ihl + len) as u16).to_be_bytes());
         let fo = (off / 8) as u16 | if more { 0x2000 } else { 0 };

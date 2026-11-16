@@ -25,7 +25,9 @@ pub mod syscall;
 // Syscall implementation modules
 pub mod anon_inodes;
 pub mod dir;
+pub mod exportfs;
 pub mod fd;
+pub mod fhandle;
 pub mod flock;
 pub mod fs_writeback;
 pub mod icache;

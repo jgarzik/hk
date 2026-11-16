@@ -218,11 +218,16 @@ impl FrameAllocator {
     /// kernel stacks and multi-frame DMA buffers (Linux
     /// alloc_pages_exact)
     pub fn alloc_contig(&self, n: usize) -> Option<u64> {
+        self.alloc_contig_gfp(n, Gfp::KERNEL)
+    }
+
+    /// `alloc_contig` with `gfp`
+    pub fn alloc_contig_gfp(&self, n: usize, gfp: Gfp) -> Option<u64> {
         if n == 0 {
             return None;
         }
         let order = n.next_power_of_two().trailing_zeros();
-        let p = self.zone.alloc_pages(order, Gfp::KERNEL)?;
+        let p = self.zone.alloc_pages(order, gfp)?;
         self.zone.split_block(p, order);
         for i in n as u64..1 << order {
             self.zone.free_pages(p + i, 0);

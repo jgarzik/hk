@@ -44,6 +44,7 @@ pub fn run_tests() {
     test_tee_pipe_to_pipe();
     test_tee_invalid_same_pipe();
     test_vmsplice_to_pipe();
+    test_vmsplice_from_pipe();
     test_sendfile_to_pipe();
     test_sendfile_invalid_pipe_input();
 
@@ -1026,6 +1027,42 @@ fn test_vmsplice_to_pipe() {
 
     sys_close(pipefd[0] as u64);
     sys_close(pipefd[1] as u64);
+}
+
+/// vmsplice on a pipe's read end copies its data out (Linux
+/// vmsplice_to_user): what was written, then EAGAIN with
+/// SPLICE_F_NONBLOCK once empty, 0 once the writer is gone; a file that
+/// is not a pipe is EBADF
+fn test_vmsplice_from_pipe() {
+    const SPLICE_F_NONBLOCK: u32 = 2;
+    const EAGAIN: i64 = -11;
+    const EBADF: i64 = -9;
+    let mut t = crate::harness::T::new(b"VMSPLICE_FROM_PIPE");
+    let mut p: [i32; 2] = [0, 0];
+    if !t.eq(b"pipe", sys_pipe(p.as_mut_ptr()), 0) {
+        t.done();
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let iov = IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: buf.len(),
+    };
+    sys_write(p[1] as u64, b"hello".as_ptr(), 5);
+    t.eq(b"read", sys_vmsplice(p[0], &iov, 1, 0), 5);
+    t.ok(b"data", &buf[..5] == b"hello", 0);
+    t.eq(
+        b"empty",
+        sys_vmsplice(p[0], &iov, 1, SPLICE_F_NONBLOCK),
+        EAGAIN,
+    );
+    sys_close(p[1] as u64);
+    t.eq(b"eof", sys_vmsplice(p[0], &iov, 1, 0), 0);
+    sys_close(p[0] as u64);
+    let f = sys_open(b"/test.txt\0".as_ptr(), hk_syscall::O_RDONLY, 0);
+    t.eq(b"not a pipe", sys_vmsplice(f as i32, &iov, 1, 0), EBADF);
+    sys_close(f as u64);
+    t.done();
 }
 
 /// Test sendfile from file to pipe

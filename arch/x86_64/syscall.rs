@@ -582,11 +582,19 @@ pub const SYS_SETRLIMIT: u64 = 160;
 /// prlimit64(pid, resource, new_rlim, old_rlim)
 pub const SYS_PRLIMIT64: u64 = 302;
 
+// File handles
+/// name_to_handle_at(dfd, name, handle, mnt_id, flag)
+pub const SYS_NAME_TO_HANDLE_AT: u64 = 303;
+/// open_by_handle_at(mountdirfd, handle, flags)
+pub const SYS_OPEN_BY_HANDLE_AT: u64 = 304;
+
 // Namespaces
 /// unshare(flags) - disassociate parts of process execution context
 pub const SYS_UNSHARE: u64 = 272;
 /// setns(fd, nstype) - reassociate thread with a namespace
 pub const SYS_SETNS: u64 = 308;
+/// listns(req, ns_ids, nr_ns_ids, flags) - list namespaces by id
+pub const SYS_LISTNS: u64 = 470;
 
 // Socket syscalls
 /// socket(domain, type, protocol)
@@ -1039,6 +1047,8 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_PREADV => Sys::Preadv,
         SYS_PREADV2 => Sys::Preadv2,
         SYS_PRLIMIT64 => Sys::Prlimit64,
+        SYS_NAME_TO_HANDLE_AT => Sys::NameToHandleAt,
+        SYS_OPEN_BY_HANDLE_AT => Sys::OpenByHandleAt,
         SYS_PROCESS_VM_READV => Sys::ProcessVmReadv,
         SYS_PROCESS_VM_WRITEV => Sys::ProcessVmWritev,
         SYS_PSELECT6 => Sys::Pselect6,
@@ -1091,6 +1101,7 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_SETHOSTNAME => Sys::Sethostname,
         SYS_SETITIMER => Sys::Setitimer,
         SYS_SETNS => Sys::Setns,
+        SYS_LISTNS => Sys::Listns,
         SYS_SETPGID => Sys::Setpgid,
         SYS_SETPRIORITY => Sys::Setpriority,
         SYS_SETREGID => Sys::Setregid,

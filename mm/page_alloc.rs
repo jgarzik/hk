@@ -60,7 +60,8 @@ impl Gfp {
     pub const COMP: Gfp = Gfp(1 << 2);
     /// The caller may sleep (Linux __GFP_DIRECT_RECLAIM): direct reclaim
     /// runs when it really can (`may_direct_reclaim`: no spin lock,
-    /// interrupts on, not reclaim itself, I/O allowed)
+    /// interrupts on, not reclaim itself; clean pages only under
+    /// PF_MEMALLOC_NOIO)
     pub const RECLAIM: Gfp = Gfp(1 << 3);
     /// For user space (Linux __GFP_HARDWALL)
     pub const HARDWALL: Gfp = Gfp(1 << 4);
@@ -186,19 +187,16 @@ fn direct_reclaim() -> usize {
     0
 }
 
-/// This allocation may run direct reclaim: it may sleep, and is neither
-/// made by reclaim itself (PF_MEMALLOC) nor barred from I/O
-/// (PF_MEMALLOC_NOIO). Linux: gfpflags_allow_blocking plus the
-/// current_gfp_context / PF_MEMALLOC checks of the slowpath.
+/// This allocation may run direct reclaim: it may sleep and is not
+/// made by reclaim itself (PF_MEMALLOC). Under PF_MEMALLOC_NOIO reclaim
+/// runs without I/O (`vmscan`). Linux: gfpflags_allow_blocking plus the
+/// PF_MEMALLOC check of the slowpath.
 fn may_direct_reclaim() -> bool {
     #[cfg(not(test))]
     {
-        use crate::task::pf::{MEMALLOC, MEMALLOC_NOIO};
-        let me = crate::task::percpu::current();
         crate::task::percpu::can_sleep()
             && !crate::sync::in_atomic()
-            && !me.has_flag(MEMALLOC)
-            && !me.has_flag(MEMALLOC_NOIO)
+            && !crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC)
     }
     #[cfg(test)]
     false

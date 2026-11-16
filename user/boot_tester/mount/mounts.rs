@@ -454,7 +454,7 @@ fn bind_view() -> R {
         let r = sys_rename(b"/tmp/bt/g\0".as_ptr(), b"/tmp/bs/sub/g2\0".as_ptr());
         check(b"rename across", r == EXDEV, r)?;
         let mut buf = [0u8; 8192];
-        let n = crate::fs::mountinfo::slurp_pub(b"/proc/self/mountinfo\0", &mut buf);
+        let n = crate::mount::mountinfo::slurp_pub(b"/proc/self/mountinfo\0", &mut buf);
         let root_ok = buf[..n]
             .split(|&c| c == b'\n')
             .find(|l| l.split(|&c| c == b' ').nth(4) == Some(b"/tmp/bt"))
