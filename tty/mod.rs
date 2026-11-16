@@ -748,21 +748,22 @@ impl Tty {
     /// A file opened the tty (Linux tty_open: tty_reopen's tty->count,
     /// tty_add_file, the port's open, TTY_HUPPED cleared, under
     /// tty_lock); then it may become the controlling tty. In exclusive
-    /// mode a reopen by its node or /dev/console needs CAP_SYS_ADMIN
-    /// (Linux tty_reopen: EBUSY; /dev/tty, tty_open_current_tty, skips
-    /// it), the file left unlisted. A failed activation fails the open;
-    /// the failed file's release undoes it (Linux tty_open's
-    /// tty_release)
+    /// mode a reopen, by any path, needs CAP_SYS_ADMIN (Linux
+    /// tty_reopen: EBUSY), the file left unlisted and not pointed at
+    /// the tty. A listed file is pointed at it: a later failure (the
+    /// activation) fails the open, and the file's release undoes it
+    /// (Linux tty_open's tty_release)
     fn opened(&self, r: Arc<Redirect>, file: &File, via: Via) -> Result<(), KernelError> {
         let tty = r.tty;
         let mut f = self.files.lock();
-        if via != Via::Current
-            && !f.list.is_empty()
+        if !f.list.is_empty()
             && self.exclusive()
             && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
         {
             return Err(KernelError::Busy);
         }
+        let any: Arc<dyn core::any::Any + Send + Sync> = r.clone();
+        file.private.call_once(|| any);
         f.list.push(r);
         f.port_count += 1;
         self.port_open()?;
@@ -808,12 +809,7 @@ impl Tty {
     /// stays (the driver's saved termios)
     fn release(&self, r: &Arc<Redirect>) {
         let mut f = self.files.lock();
-        let n = f.list.len();
         f.list.retain(|x| !Arc::ptr_eq(x, r));
-        // An open refused before listing the file (exclusive mode)
-        if f.list.len() == n {
-            return;
-        }
         if !r.hung.load(Ordering::Acquire) && f.port_count > 0 {
             f.port_count -= 1;
             if f.port_count == 0 {
@@ -1111,8 +1107,7 @@ pub(crate) enum Via {
     /// /dev/console (tty_open_by_driver via console_device): a hangup
     /// leaves the file be
     Console,
-    /// /dev/tty, the controlling tty (tty_open_current_tty: no
-    /// tty_reopen checks)
+    /// /dev/tty, the controlling tty (tty_open_current_tty)
     Current,
 }
 
@@ -1140,11 +1135,11 @@ impl Redirect {
             .ok_or(KernelError::Io)
     }
 
-    /// Open `tty` through `file`: point the file at it and list it on
-    /// the tty (Linux tty->count, tty_add_file), reached `via` its
+    /// Open `tty` through `file`: list the file on the tty and point
+    /// it there (Linux tty->count, tty_add_file), reached `via` its
     /// node, /dev/console or /dev/tty. The release of a file whose
-    /// open failed before it was listed on the tty finds nothing to
-    /// drop; one that failed later drops it as any release
+    /// open failed before it was listed finds nothing to drop; one
+    /// that failed later drops it as any release
     fn open(file: &File, tty: &'static Tty, via: Via) -> Result<(), KernelError> {
         let r = try_arc(Redirect {
             tty,
@@ -1152,8 +1147,6 @@ impl Redirect {
             hung: AtomicBool::new(false),
             file: AtomicPtr::new(core::ptr::null_mut()),
         })?;
-        let any: Arc<dyn core::any::Any + Send + Sync> = r.clone();
-        file.private.call_once(|| any);
         tty.opened(r, file, via)
     }
 

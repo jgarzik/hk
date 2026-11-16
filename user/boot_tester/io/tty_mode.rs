@@ -19,11 +19,15 @@
 //!   open works again. CAP_SYS_ADMIN is dropped by capset, the uid kept:
 //!   /dev/console is 0600 root on Linux, so another uid's open would be
 //!   EACCES before the tty sees it
+//! - TTY_EXCL_CTTY: in exclusive mode an open of /dev/tty without
+//!   CAP_SYS_ADMIN is EBUSY as well (Linux tty_open_current_tty calls
+//!   tty_reopen), one with it works; after TIOCNXCL it works again
 
+use super::tty::{block_hup_cont, dev_tty, in_child, open_ctty, report};
 use crate::harness::{R, check, report_r};
 use hk_syscall::{
-    CapUserData, CapUserHeader, O_RDWR, sys_capget, sys_capset, sys_close, sys_exit, sys_fork,
-    sys_ioctl, sys_open, sys_wait4,
+    CapUserData, CapUserHeader, O_RDWR, sys_capget, sys_capset, sys_close, sys_ioctl, sys_open,
+    sys_setsid,
 };
 
 const O_NOCTTY: u32 = 0o400;
@@ -36,6 +40,8 @@ const TCSETS2: u64 = 0x402C_542B;
 const TIOCEXCL: u64 = 0x540C;
 const TIOCNXCL: u64 = 0x540D;
 const TIOCGEXCL: u64 = 0x8004_5440;
+const TIOCNOTTY: u64 = 0x5422;
+const TCSBRK: u64 = 0x5409;
 const EBUSY: i64 = -16;
 const CAP_SYS_ADMIN: u32 = 21;
 
@@ -63,6 +69,7 @@ pub fn run_tests() {
     test_termios2();
     test_termio();
     test_excl();
+    test_excl_ctty();
 }
 
 fn u32_at(b: &[u8], off: usize) -> u32 {
@@ -239,30 +246,34 @@ fn drop_sys_admin() -> i32 {
     0
 }
 
-/// In a child without CAP_SYS_ADMIN: the open's result (0 for a file)
-/// as exit code 0 (opened), 1 (EBUSY), else 2+
+/// In a child without CAP_SYS_ADMIN: the open's result as exit code
+/// 0 (opened), 1 (EBUSY), else 2+
 fn open_unprivileged() -> i64 {
-    let pid = sys_fork();
-    if pid == 0 {
+    in_child(|| {
         if drop_sys_admin() != 0 {
-            sys_exit(3);
+            return 3;
         }
-        let fd = open_console();
-        let code = match i64::from(fd) {
+        match i64::from(open_console()) {
             EBUSY => 1,
             f if f >= 0 => 0,
             _ => 2,
-        };
-        sys_exit(code)
-    }
-    if pid < 0 {
-        return -1;
-    }
-    let mut st = 0i32;
-    if sys_wait4(pid, &mut st, 0, 0) != pid || st & 0x7f != 0 {
-        return -1;
-    }
-    i64::from((st >> 8) & 0xff)
+        }
+    })
+}
+
+/// In a child without CAP_SYS_ADMIN: /dev/tty's open as exit code 0
+/// (opened), 1 (EBUSY), else 2+
+fn dev_tty_unprivileged() -> i64 {
+    in_child(|| {
+        if drop_sys_admin() != 0 {
+            return 3;
+        }
+        match dev_tty() {
+            0 => 0,
+            EBUSY => 1,
+            _ => 2,
+        }
+    })
 }
 
 fn gexcl(fd: i32) -> i64 {
@@ -301,4 +312,38 @@ fn excl_steps(fd: i32) -> R {
     check(b"cleared", g == 0, g)?;
     let c = open_unprivileged();
     check(b"unprivileged open", c == 0, c)
+}
+
+fn test_excl_ctty() {
+    let code = in_child(excl_ctty_child);
+    report(b"TTY_EXCL_CTTY", code == 0, code);
+}
+
+/// In a new session whose controlling tty is put in exclusive mode:
+/// 0, or the failing step
+fn excl_ctty_child() -> i32 {
+    // Queued console output would be flushed (arm64: the console tty)
+    sys_ioctl(1, TCSBRK, 1);
+    block_hup_cont();
+    sys_setsid();
+    let fd = open_ctty();
+    if fd < 0 {
+        return 2;
+    }
+    let fd = fd as i32;
+    if sys_ioctl(fd, TIOCEXCL, 0) != 0 {
+        return 3;
+    }
+    let busy = dev_tty_unprivileged();
+    let admin = dev_tty();
+    sys_ioctl(fd, TIOCNXCL, 0);
+    let after = dev_tty_unprivileged();
+    sys_ioctl(fd, TIOCNOTTY, 0);
+    sys_close(fd as u64);
+    match (busy, admin, after) {
+        (1, 0, 0) => 0,
+        (1, 0, a) => 30 + a as i32,
+        (1, _, _) => 4,
+        (b, _, _) => 10 + b as i32,
+    }
 }

@@ -655,13 +655,13 @@ fn pending_sigs() -> u64 {
     p
 }
 
-fn block_hup_cont() {
+pub(super) fn block_hup_cont() {
     let m: u64 = 1 << (SIGHUP - 1) | 1 << (SIGCONT - 1);
     sys_rt_sigprocmask(SIG_BLOCK, &m as *const u64 as u64, 0, 8);
 }
 
 /// The hangup test's tty, made the controlling tty of a new session
-fn open_ctty() -> i64 {
+pub(super) fn open_ctty() -> i64 {
     sys_open(serial_port_path().as_ptr(), O_RDWR | O_NONBLOCK, 0)
 }
 
@@ -819,7 +819,7 @@ fn test_hangup_exit() {
 }
 
 /// /dev/tty opens (the caller has a controlling tty): 0, or -errno
-fn dev_tty() -> i64 {
+pub(super) fn dev_tty() -> i64 {
     let fd = sys_open(b"/dev/tty\0".as_ptr(), O_RDWR | O_NONBLOCK, 0);
     if fd >= 0 {
         sys_close(fd as u64);
@@ -975,7 +975,7 @@ fn test_old_pgrp() {
     report_r(NAME, r);
 }
 
-fn report(name: &[u8], ok: bool, got: i64) {
+pub(super) fn report(name: &[u8], ok: bool, got: i64) {
     print(name);
     if ok {
         println(b":OK");
@@ -985,7 +985,7 @@ fn report(name: &[u8], ok: bool, got: i64) {
 }
 
 /// Run `f` in a forked child; its exit code (-1 if fork/wait failed)
-fn in_child(f: fn() -> i32) -> i64 {
+pub(super) fn in_child(f: fn() -> i32) -> i64 {
     let pid = sys_fork();
     if pid == 0 {
         sys_exit(f() as u64)
