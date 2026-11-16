@@ -1015,8 +1015,9 @@ pub struct SuperBlock {
     /// under MOUNT_LOCK; a mount leaves it in its teardown
     pub(super) s_mounts: Mutex<WeakList<MntInstanceA>>,
 
-    /// Next inode number to allocate
-    next_ino: AtomicU64,
+    /// Inode numbers, handed out in per-CPU batches (Linux shmem's
+    /// ino_batch, get_next_ino)
+    next_ino: crate::util::id_batch::IdBatch,
 
     /// Name hashing and comparison for its dentries, if names match
     /// more than their bytes (Linux s_d_op): set before its root
@@ -1099,7 +1100,7 @@ impl SuperBlock {
             s_d_op: spin::Once::new(),
             s_writers: AtomicU64::new(0),
             s_mounts: Mutex::new(WeakList::new()),
-            next_ino: AtomicU64::new(1), // Start inode numbers at 1
+            next_ino: crate::util::id_batch::IdBatch::new(),
             s_dev: AtomicU32::new(0),
             s_maxbytes: AtomicU64::new(MAX_LFS_FILESIZE),
             private: RwLock::new(None),
@@ -1295,7 +1296,7 @@ impl SuperBlock {
 
     /// Allocate the next inode number
     pub fn alloc_ino(&self) -> InodeId {
-        self.next_ino.fetch_add(1, Ordering::Relaxed)
+        self.next_ino.next()
     }
 
     /// The block device it is mounted from, held open until its

@@ -276,8 +276,12 @@ fn d_lookup_locked(parent: &Dentry, _p: &DentryInner, name: &[u8]) -> Option<Den
         .find(|c| is(c) && d_same_name(parent, c.d_name.read().as_bytes(), name))
 }
 
-/// Dentries alive (/proc/sys/fs/dentry-state nr_dentry)
-static NR_DENTRY: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+crate::percpu! {
+    /// Dentries alive (/proc/sys/fs/dentry-state nr_dentry): per CPU,
+    /// summed on read (Linux DEFINE_PER_CPU nr_dentry, get_nr_dentry); a
+    /// CPU's count goes negative when it frees others' dentries
+    static NR_DENTRY: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+}
 
 /// Inner mutable state protected by d_lock
 struct DentryInner {
@@ -903,7 +907,7 @@ impl DentryRef {
     /// one); ENOMEM
     pub fn new(d: Dentry) -> Result<Self, KernelError> {
         let b = crate::util::kalloc::try_box(d)?;
-        NR_DENTRY.fetch_add(1, Ordering::Relaxed);
+        NR_DENTRY.this_add(1);
         let r = Self(NonNull::from(Box::leak(b)));
         // A positive one joins its inode's aliases (Linux d_instantiate)
         let inode = r.d_lock.read().inode.clone();
@@ -1042,7 +1046,7 @@ fn have_cpu() -> bool {
 unsafe fn dentry_kill(d: NonNull<Dentry>) -> Option<NonNull<Dentry>> {
     // SAFETY: live until the free queued below runs
     let r = unsafe { d.as_ref() };
-    NR_DENTRY.fetch_sub(1, Ordering::Relaxed);
+    NR_DENTRY.this_add(-1);
     if let Some(prune) = r.d_op.and_then(|o| o.d_prune) {
         prune(r);
     }
@@ -1088,7 +1092,11 @@ unsafe fn d_free(p: *const ()) {
 /// /proc/sys/fs/dentry-state (Linux: nr_dentry, nr_unused, age_limit,
 /// want_pages, nr_negative, dummy); hk counts only nr_dentry
 pub fn dentry_state() -> Vec<i64> {
-    let n = NR_DENTRY.load(core::sync::atomic::Ordering::Relaxed);
+    let n: i64 = NR_DENTRY
+        .for_each_possible()
+        .map(|(_, c)| c.load(core::sync::atomic::Ordering::Relaxed))
+        .sum::<i64>()
+        .max(0);
     alloc::vec![n, 0, 45, 0, 0, 0]
 }
 

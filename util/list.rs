@@ -716,8 +716,14 @@ macro_rules! owned_adapter {
     };
 }
 
-/// Ids of [`OwnedList`]s: each list its own, never reused (64 bits)
-static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+/// Ids of [`OwnedList`]s: each list its own, never reused (64 bits),
+/// handed out in per-CPU batches (`util::id_batch`)
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(0);
+
+crate::percpu! {
+    /// Each CPU's last [`OwnedList`] id handed out
+    static OWNER_LAST: AtomicU64 = AtomicU64::new(0);
+}
 
 /// A [`PtrList`] of counted references (`P`, an `Arc` by default)
 /// that knows its items by their [`Owner`] mark, so removing or
@@ -736,7 +742,11 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
     pub fn new() -> Self {
         Self {
             list: PtrList::new(),
-            id: NEXT_OWNER.fetch_add(1, Relaxed),
+            id: crate::util::id_batch::next_from(
+                &NEXT_OWNER,
+                |c| Some(OWNER_LAST.get(c as u32)),
+                crate::cpu::nr_possible() as usize,
+            ),
         }
     }
 

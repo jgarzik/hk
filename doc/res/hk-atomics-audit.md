@@ -148,18 +148,6 @@ argued / published copy of locked state.
 - Fix: vmstat-style counter (per-CPU diff + global atomic folded at a
   threshold, i.e. `PercpuCounter`) and a per-CPU ratelimit before the check.
 
-### 14. Dentry allocation does global RMWs — (c)
-- Where: `fs/dentry.rs` `NR_DENTRY` (`fetch_add`/`fetch_sub` per dentry
-  alloc/free); `util/list.rs` `NEXT_OWNER` (`OwnedList::new`, one per
-  dentry's `children` and every skb queue); `util/rcuhlist.rs` `NEXT_CHAIN`,
-  `util/hlist_nulls.rs` `NEXT_BUCKET` (lazy ids).
-- Wrong: two global locked RMWs per dentry creation on all CPUs.
-- Linux: `nr_dentry` is a per-CPU long summed for `/proc`; lists need no
-  identity.
-- Fix: `NR_DENTRY` as a `PercpuCounter` (or per-CPU slots summed); derive the
-  `OwnedList` id from the list's own address/owner (stable while the list
-  lives) or a per-CPU batched allocator.
-
 ### 16. Mount change numbers: global atomic + `fetch_max` instead of `mount_lock` — (d)(b)
 - Where: `ns/mod.rs` `MNT_EVENT`, `MntEvents.event`, `MntEvents::bump`.
 - Wrong: two atomics updated separately and a `fetch_max` to repair the
@@ -199,13 +187,6 @@ argued / published copy of locked state.
   (SCHED, MISSED, DISABLE).
 - Fix: single NAPI state word with Linux's transitions (including MISSED);
   run the backlog as a NAPI instance so `busy` disappears.
-
-### 19. tmpfs/inode numbers from a shared per-superblock atomic — (c)
-- Where: `fs/superblock.rs` `SuperBlock.next_ino` (every create on the
-  filesystem).
-- Linux: `get_next_ino` per-CPU batches (`LAST_INO_BATCH`); shmem
-  `ino_batch` per CPU.
-- Fix: per-CPU batched allocation (as `fs/anon_inodes.rs` already does).
 
 ### 22. Inode identity bits as unrelated atomics — (b), low
 - Where: `fs/inode.rs` `Inode.mode`, `uid`, `gid` (chown/chmod write them
