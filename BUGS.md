@@ -591,9 +591,11 @@ Missing, each answered with a Linux errno rather than silently: link
 creation and rename (EOPNOTSUPP), multipath routes and nexthop objects
 (EOPNOTSUPP), input-route simulation `ip route get ... iif` (EOPNOTSUPP),
 NLM_F_ECHO (not echoed), extended-ACK message/offset TLVs (plain errors),
-RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
-is no rule engine: lookups are local then main), address lifetimes are
-always infinite, promote_secondaries is off.
+address lifetimes are always infinite, promote_secondaries is off.
+Routing rules are Linux's three IPv4 defaults, fixed: RTM_NEWRULE and
+RTM_DELRULE are EOPNOTSUPP, lookups walk tables local then main and never
+default (no rule engine), and rule dumps of other families are
+EAFNOSUPPORT (Linux lists the IPv6 and multicast-routing defaults).
 RTM_NEWLINK/RTM_SETLINK ignore IFLA_NET_NS_PID/IFLA_NET_NS_FD: they
 return 0 without moving the device (Linux: moved, or an error).
 
