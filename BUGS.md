@@ -7,6 +7,11 @@ Failures that also occur when the boot tester runs on real Linux
 real bug in Linux as well as hk: Linux is the reference, not
 infallible, so each one is investigated, not written off.
 
+- **IO_URING_IOPOLL_READ on Linux 7.0** (`user/boot_tester/uring/iopoll.rs`):
+  -95 (EOPNOTSUPP) on Ubuntu 26.04's 7.0 kernel
+  (`LINUX_RELEASE=resolute ./tools/linux-boot-tester.sh`); passes on 6.8
+  and hk. Likely the boot's poll queues or the 7.0 IOPOLL rules.
+
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
 Files marked `#![expect(clippy::undocumented_unsafe_blocks)]
