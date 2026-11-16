@@ -23,7 +23,6 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::mm::page::{PG_SLAB, Page};
 use crate::mm::page_alloc::{Gfp, this_cpu};
 use crate::sync::{IrqSpinlock, local_irq_restore, local_irq_save};
-use crate::util::cpumask::NR_CPUS;
 
 /// Largest per-CPU array
 const MAX_LIMIT: usize = 64;
@@ -48,7 +47,18 @@ struct ArrayCache {
     entry: [usize; MAX_LIMIT],
 }
 
-struct CpuCell(UnsafeCell<ArrayCache>);
+/// One CPU's object cache of a `KmemCache`: a per-CPU variable (Linux
+/// kmem_cache->cpu_slab, alloc_percpu)
+pub struct CpuCell(UnsafeCell<ArrayCache>);
+
+impl CpuCell {
+    pub const fn new() -> Self {
+        CpuCell(UnsafeCell::new(ArrayCache {
+            avail: 0,
+            entry: [0; MAX_LIMIT],
+        }))
+    }
+}
 
 // SAFETY: each cell is used only by its CPU with interrupts off
 unsafe impl Sync for CpuCell {}
@@ -77,7 +87,8 @@ pub struct KmemCache {
     limit: usize,
     batch: usize,
     src: &'static dyn SlabPages,
-    cpu: [CpuCell; NR_CPUS],
+    /// Each CPU's object cache, in its per-CPU area
+    cpu: &'static crate::cpu::PerCpu<CpuCell>,
     list_lock: IrqSpinlock<Lists>,
     /// Slabs allocated (meminfo Slab)
     nr_slabs: AtomicUsize,
@@ -114,6 +125,7 @@ impl KmemCache {
         size: usize,
         align: usize,
         src: &'static dyn SlabPages,
+        cpu: &'static crate::cpu::PerCpu<CpuCell>,
     ) -> Self {
         let obj = (size, align);
         let a = if align < 8 { 8 } else { align };
@@ -129,12 +141,7 @@ impl KmemCache {
             limit,
             batch: limit.div_ceil(2),
             src,
-            cpu: [const {
-                CpuCell(UnsafeCell::new(ArrayCache {
-                    avail: 0,
-                    entry: [0; MAX_LIMIT],
-                }))
-            }; NR_CPUS],
+            cpu,
             list_lock: IrqSpinlock::new(Lists {
                 partial: 0,
                 empty: 0,
@@ -311,7 +318,7 @@ impl KmemCache {
     #[expect(clippy::mut_from_ref)]
     unsafe fn array(&self) -> Option<&mut ArrayCache> {
         // SAFETY: only this CPU uses its cell, and interrupts are off
-        this_cpu().map(|c| unsafe { &mut *self.cpu[c].0.get() })
+        this_cpu().map(|c| unsafe { &mut *self.cpu.get(c as u32).0.get() })
     }
 
     /// Fill `ac` with up to `batch` objects from the slabs (Linux
@@ -485,7 +492,12 @@ const SIZES: [usize; 13] = [
 
 macro_rules! kmalloc_caches {
     ($($n:literal),*) => {
-        [$(KmemCache::new(concat!("kmalloc-", stringify!($n)), $n, 8, &KERNEL_PAGES)),*]
+        [$({
+            crate::percpu! {
+                static CPU: CpuCell = CpuCell::new();
+            }
+            KmemCache::new(concat!("kmalloc-", stringify!($n)), $n, 8, &KERNEL_PAGES, &CPU)
+        }),*]
     };
 }
 
@@ -534,9 +546,12 @@ const fn box_of<T>() -> (usize, usize) {
 }
 
 macro_rules! named_cache {
-    ($name:literal, $layout:expr) => {
-        KmemCache::new($name, $layout.0, $layout.1, &KERNEL_PAGES)
-    };
+    ($name:literal, $layout:expr) => {{
+        crate::percpu! {
+            static CPU: CpuCell = CpuCell::new();
+        }
+        KmemCache::new($name, $layout.0, $layout.1, &KERNEL_PAGES, &CPU)
+    }};
 }
 
 /// VMAs (`Box<Vma>`; Linux vm_area_cachep)
@@ -684,7 +699,10 @@ pub mod tests {
 
     fn cache(size: usize, align: usize) -> (&'static KmemCache, &'static HostPages) {
         let src = HostPages::new();
-        let c = Box::leak(Box::new(KmemCache::new("test", size, align, src)));
+        let cpu = Box::leak(Box::new(crate::cpu::PerCpu::new(
+            [const { CpuCell::new() }; crate::util::cpumask::NR_CPUS],
+        )));
+        let c = Box::leak(Box::new(KmemCache::new("test", size, align, src, cpu)));
         (c, src)
     }
 

@@ -13,9 +13,6 @@ argued / published copy of locked state.
   count, seqcount, per-task counters, rq fields under the rq lock). On x86 each
   is a `lock`-prefixed instruction (a full barrier), on arm64 an LSE atomic or
   an LL/SC loop; Linux uses `this_cpu_inc` / plain `++` / `WRITE_ONCE`.
-- **"Per-CPU" that is not.** Inline `[X; NR_CPUS]` arrays
-  (`page_alloc::Zone.pcp`, `slab::KmemCache.cpu`) put several CPUs in one
-  cache line, so the per-CPU design is defeated by false sharing.
 - **Sibling atomics of a lock.** Fields mutated only under a lock but kept as
   atomics beside it (rule 1 of LOCKING.md §5.4 violated): `SchedEntity`,
   `PerCpuScheduler`, `TimerList`, `Pcp.count`, `AddressSpace.nrpages`.
@@ -44,16 +41,6 @@ argued / published copy of locked state.
 - Fix: Relaxed `load` + `store` (or arch asm `incl %gs:off` on x86) plus a
   compiler fence; same for `interrupt_depth`. Document the "interrupt restores
   it" argument in LOCKING.md §6.
-
-### 2. Inline per-CPU arrays pack CPUs into shared cache lines — (c)
-- Where: `mm/page_alloc.rs` `Zone.pcp: [Pcp; NR_CPUS]` (lock word + count
-  of adjacent CPUs share lines on every order-0 alloc/free) and
-  `mm/slab.rs` `KmemCache.cpu` (slot boundaries share lines). Static
-  per-CPU variables already live in per-CPU areas (`cpu::PerCpu`).
-- Linux: `alloc_percpu` units in per-CPU chunks; per-CPU data of different
-  CPUs never share a line.
-- Fix: a typed `alloc_percpu` (generalize `util/percpu_alloc.rs`) for
-  them. Then convert the owner-only slots to load+store (finding 15).
 
 ### 3. `IrqSpinlock` spins on compare-exchange; locks are unfair TAS — (c)(d)
 - Where: `sync/irqspin.rs` `IrqSpinlock::lock` (loop of
@@ -103,8 +90,7 @@ argued / published copy of locked state.
 ### 5. Page allocator per-CPU lists: RMW under lock, shared lines, trylock flag — (a)(c)(d)
 - Where: `mm/page_alloc.rs` `Pcp.count` (`pcp_push`/`pcp_pop` `fetch_add/sub`
   under `Pcp.lock`), `Zone.nr_free` (`free_one`/`take` under `Zone.lock`),
-  `Zone.draining` (`drain_all`: `swap(true)` as trylock), `Zone.pcp` array
-  (finding 2).
+  `Zone.draining` (`drain_all`: `swap(true)` as trylock).
 - Wrong: locked RMWs on every order-0 alloc/free under a lock that already
   serializes them; `draining` is an invisible lock (no lockdep class, no
   owner). Boot-only fields (`map`, `start`, `end`, `managed`, `sections`,

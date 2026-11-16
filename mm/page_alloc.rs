@@ -33,7 +33,6 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::mm::page::{PG_BUDDY, PG_HEAD, PG_RESERVED, PG_TAIL, Page, put_mapping};
 use crate::sync::IrqSpinlock;
-use crate::util::cpumask::NR_CPUS;
 
 /// Largest block order (2^10 pages = 4MB, Linux MAX_PAGE_ORDER)
 pub const MAX_ORDER: u32 = 10;
@@ -144,8 +143,9 @@ fn alloc_mark(wmark: &[AtomicUsize; 3], gfp: Gfp) -> usize {
 // Per-CPU page lists
 // ============================================================================
 
-/// One CPU's order-0 page list (Linux per_cpu_pages)
-struct Pcp {
+/// One CPU's order-0 page list (Linux per_cpu_pages): a zone's are a
+/// per-CPU variable (Linux zone->per_cpu_pageset, alloc_percpu)
+pub struct Pcp {
     /// First page (pfn + 1, 0 = empty), linked through `Page.next`
     /// (under `lock`)
     lock: IrqSpinlock<u64>,
@@ -155,7 +155,7 @@ struct Pcp {
 }
 
 impl Pcp {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             lock: IrqSpinlock::new(0),
             count: AtomicUsize::new(0),
@@ -270,13 +270,14 @@ pub struct Zone {
     /// Per-CPU list refill/drain size and limit
     batch: AtomicUsize,
     high: AtomicUsize,
-    pcp: [Pcp; NR_CPUS],
+    /// The per-CPU lists, each in its CPU's per-CPU area
+    pcp: &'static crate::cpu::PerCpu<Pcp>,
     /// A drain of every CPU's list is running (Linux pcpu_drain_mutex)
     draining: AtomicBool,
 }
 
 impl Zone {
-    pub const fn new() -> Self {
+    pub const fn new(pcp: &'static crate::cpu::PerCpu<Pcp>) -> Self {
         Self {
             map: AtomicUsize::new(0),
             start: AtomicU64::new(0),
@@ -293,7 +294,7 @@ impl Zone {
             min_kb: AtomicUsize::new(0),
             batch: AtomicUsize::new(1),
             high: AtomicUsize::new(0),
-            pcp: [const { Pcp::new() }; NR_CPUS],
+            pcp,
             draining: AtomicBool::new(false),
         }
     }
@@ -433,7 +434,7 @@ impl Zone {
 
     /// This CPU's list (None: no per-CPU data yet)
     fn pcp(&self) -> Option<&Pcp> {
-        this_cpu().map(|c| &self.pcp[c])
+        this_cpu().map(|c| self.pcp.get(c as u32))
     }
 
     fn pcp_push(&self, p: &Pcp, head: &mut u64, pfn: u64) {
@@ -507,7 +508,7 @@ impl Zone {
     }
 
     fn drain_lists(&self) {
-        for p in &self.pcp {
+        for (_, p) in self.pcp.for_each_possible() {
             if p.count.load(Ordering::Relaxed) == 0 {
                 continue;
             }
@@ -911,8 +912,8 @@ impl Zone {
     pub fn free_pages_all(&self) -> usize {
         let pcp: usize = self
             .pcp
-            .iter()
-            .map(|p| p.count.load(Ordering::Relaxed))
+            .for_each_possible()
+            .map(|(_, p)| p.count.load(Ordering::Relaxed))
             .sum();
         self.nr_free() + pcp
     }
@@ -924,8 +925,15 @@ impl Zone {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A zone's own per-CPU lists (host tests: leaked)
+    pub fn test_pcp() -> &'static crate::cpu::PerCpu<Pcp> {
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(crate::cpu::PerCpu::new(
+            [const { Pcp::new() }; crate::util::cpumask::NR_CPUS],
+        )))
+    }
 
     /// A zone over pfns [start, start + n) backed by a host array
     struct TestZone {
@@ -935,7 +943,7 @@ mod tests {
 
     fn zone(start: u64, n: usize) -> TestZone {
         let map: Vec<Page> = (0..n).map(|_| Page::new()).collect();
-        let z = Zone::new();
+        let z = Zone::new(test_pcp());
         let base = (map.as_ptr() as usize).wrapping_sub(start as usize * 64);
         z.init(base, start, start + n as u64, false);
         TestZone { z, _map: map }
@@ -1217,14 +1225,14 @@ mod tests {
                 v.into_iter().for_each(|p| t.z.free_pages(p, 0));
             });
         });
-        let parked = t.z.pcp[1].count.load(Ordering::Relaxed);
+        let parked = t.z.pcp.get(1).count.load(Ordering::Relaxed);
         assert!(parked > 0);
         while t.z.alloc_pages(0, Gfp::NOWAIT).is_some() {}
         assert!(t.z.alloc_pages(0, Gfp::TRANSHUGE_LIGHT).is_none());
-        assert_eq!(t.z.pcp[1].count.load(Ordering::Relaxed), parked);
+        assert_eq!(t.z.pcp.get(1).count.load(Ordering::Relaxed), parked);
         // A thread-context allocation drains it
         assert!(t.z.alloc_pages(0, Gfp::KERNEL).is_some());
-        assert_eq!(t.z.pcp[1].count.load(Ordering::Relaxed), 0);
+        assert_eq!(t.z.pcp.get(1).count.load(Ordering::Relaxed), 0);
     }
 
     #[test]

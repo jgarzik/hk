@@ -30,9 +30,24 @@ fn phys(pfn: u64) -> u64 {
     pfn * FRAME_SIZE as u64
 }
 
+crate::percpu! {
+    /// The zone's per-CPU page lists (Linux zone->per_cpu_pageset)
+    static PCP: crate::mm::page_alloc::Pcp = crate::mm::page_alloc::Pcp::new();
+}
+
 impl FrameAllocator {
     pub const fn new() -> Self {
-        Self { zone: Zone::new() }
+        Self {
+            zone: Zone::new(&PCP),
+        }
+    }
+
+    /// An allocator with per-CPU lists of its own (host tests)
+    #[cfg(test)]
+    fn new_test() -> Self {
+        Self {
+            zone: Zone::new(crate::mm::page_alloc::tests::test_pcp()),
+        }
     }
 
     /// Span the physical range [base, base + size) with struct pages at
@@ -357,7 +372,7 @@ mod tests {
     /// struct pages in a host array
     fn fa(n: usize) -> (FrameAllocator, Vec<Page>) {
         let map: Vec<Page> = (0..n).map(|_| Page::new()).collect();
-        let a = FrameAllocator::new();
+        let a = FrameAllocator::new_test();
         let base = (map.as_ptr() as usize).wrapping_sub(pfn(BASE) as usize * 64);
         a.init_at(base, BASE, (n * FRAME_SIZE) as u64);
         a.free_range(pa(1), pa(n));
