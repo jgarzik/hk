@@ -1406,6 +1406,12 @@ fn test_peergroups() {
     if pid == 0 {
         sys_exit(peergroups_child(&sa));
     }
+    // A child that fails before connecting must not hang the accept
+    if poll1(l, POLLIN, 10_000).0 != 1 {
+        t.ok(b"connect", false, wait_status(pid) as i64);
+        close(l);
+        return t.done();
+    }
     let acc = sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
     let mut buf = [0u8; 16];
     let (r, len) = peergroups(acc, &mut buf, 16);
