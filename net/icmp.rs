@@ -326,7 +326,7 @@ fn icmp_echo(net: &NetNamespace, skb: &SkBuff) {
     if net.sysctl.icmp_echo_ignore_all() {
         return;
     }
-    icmp_reply(net, skb, icmp_type::ECHO_REPLY, skb.data(), &[]);
+    icmp_reply(net, skb, icmp_type::ECHO_REPLY, None, skb.data(), &[]);
 }
 
 /// Answer a timestamp request (Linux icmp_timestamp): the request's
@@ -344,7 +344,7 @@ fn icmp_timestamp(net: &NetNamespace, skb: &SkBuff) {
     times[..4].copy_from_slice(&now);
     times[4..].copy_from_slice(&now);
     let head = &req[..ICMP_HLEN + 4];
-    icmp_reply(net, skb, icmp_type::TIMESTAMPREPLY, head, &times);
+    icmp_reply(net, skb, icmp_type::TIMESTAMPREPLY, Some(0), head, &times);
 }
 
 /// Milliseconds since midnight UTC (Linux inet_current_timestamp,
@@ -359,9 +359,17 @@ fn ms_of_day(ns: u64) -> u32 {
 }
 
 /// Send `head` (a received request's ICMP header and leading data)
-/// then `tail` back to its sender as type `ty`, code 0 (Linux
-/// icmp_reply + icmp_push_reply)
-fn icmp_reply(net: &NetNamespace, skb: &SkBuff, ty: u8, head: &[u8], tail: &[u8]) {
+/// then `tail` back to its sender as type `ty`, its code `code` or, if
+/// None, the request's (Linux icmp_echo keeps it, icmp_timestamp sets
+/// 0; icmp_reply + icmp_push_reply)
+fn icmp_reply(
+    net: &NetNamespace,
+    skb: &SkBuff,
+    ty: u8,
+    code: Option<u8>,
+    head: &[u8],
+    tail: &[u8],
+) {
     let (Some(src), Some(dst)) = (skb.saddr, skb.daddr) else {
         return;
     };
@@ -382,7 +390,9 @@ fn icmp_reply(net: &NetNamespace, skb: &SkBuff, ty: u8, head: &[u8], tail: &[u8]
     }
     let h = out.data_mut();
     h[0] = ty;
-    h[1] = 0;
+    if let Some(c) = code {
+        h[1] = c;
+    }
     h[2] = 0;
     h[3] = 0;
     let c = ip_checksum(h);

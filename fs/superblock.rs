@@ -962,6 +962,11 @@ pub fn get_tree_bdev(
         }
         return Ok(sb);
     }
+    // A writable mount of a read-only device is EACCES (Linux
+    // setup_bdev_super: a write open of a bdev_read_only device)
+    if fc.sb_flags & SB_RDONLY == 0 && bdev.ro() {
+        return Err(KernelError::PermissionDenied);
+    }
     sb.set_bdev(bdev.open_handle()?);
     fill(&sb)?;
     sb.set_active();

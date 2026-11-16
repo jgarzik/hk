@@ -393,6 +393,8 @@ fn new_mount(
             | KernelError::NotFound
             | KernelError::Io
             | KernelError::OutOfMemory
+            // A writable mount of a read-only device (setup_bdev_super)
+            | KernelError::PermissionDenied
             // No anonymous device number left (Linux get_anon_bdev)
             | KernelError::ProcessFileLimit),
         ) => Err(e),

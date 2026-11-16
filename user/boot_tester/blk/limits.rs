@@ -253,7 +253,42 @@ fn roset(w: i32, p: i32) {
     verdict(b"BLK_ROSET_NULL", r == EFAULT, r);
     let r = roset_unprivileged(p);
     let (_, ro) = get_int(p, BLKROGET);
-    // Writable again for the tests after, whatever the child did
+    // Writable again for the tests after, whatever failed above
     set_int(p, BLKROSET, 0);
+    set_int(w, BLKROSET, 0);
     verdict(b"BLK_ROSET_EACCES", r == EACCES && ro == 0, r);
+    roset_mount();
+}
+
+/// A read-only partition cannot be mounted read-write: EACCES (Linux
+/// setup_bdev_super); read-only it mounts
+fn roset_mount() {
+    use hk_syscall::{O_RDONLY, sys_close, sys_mkdir, sys_mount, sys_open, sys_rmdir, sys_umount2};
+    const MS_RDONLY: u64 = 1;
+    const EACCES: i64 = -13;
+    let dir = b"/tmp/rom\0";
+    sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
+    sys_mkdir(dir.as_ptr(), 0o755);
+    let dev = b"/dev/vda1\0";
+    let fd = sys_open(dev.as_ptr(), O_RDONLY, 0) as i32;
+    let set = set_int(fd, BLKROSET, 1);
+    let opts = b"iocharset=cp437\0".as_ptr() as u64;
+    let vfat = b"vfat\0".as_ptr();
+    let rw = sys_mount(dev.as_ptr(), dir.as_ptr(), vfat, 0, opts);
+    if rw == 0 {
+        sys_umount2(dir.as_ptr(), 0);
+    }
+    let ro = sys_mount(dev.as_ptr(), dir.as_ptr(), vfat, MS_RDONLY, opts);
+    if ro == 0 {
+        sys_umount2(dir.as_ptr(), 0);
+    }
+    set_int(fd, BLKROSET, 0);
+    sys_close(fd as u64);
+    sys_rmdir(dir.as_ptr());
+    let ok = set == 0 && rw == EACCES && ro == 0;
+    verdict(
+        b"BLK_ROSET_MOUNT",
+        ok,
+        if set != 0 { set } else { rw * 1000 + ro },
+    );
 }

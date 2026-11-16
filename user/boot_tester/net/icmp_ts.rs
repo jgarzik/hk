@@ -12,6 +12,9 @@
 //!   OutTimestamps count both requests, InErrors the short one; the
 //!   reply counts as Linux counts it, as an echo reply (OutEchoReps,
 //!   OutType0; not OutTimestampReps, OutType14)
+//! - ICMP_ECHO_CODE: an echo reply keeps the request's code (Linux
+//!   icmp_echo copies the header and changes only the type); run after
+//!   ICMP_TS_SNMP, whose counts it would move
 
 use hk_syscall::{
     AF_INET, CLOCK_REALTIME, CLONE_NEWNET, SOCK_RAW, Timespec, sys_clock_gettime, sys_exit,
@@ -70,8 +73,40 @@ fn netns_tests() -> bool {
         return false;
     }
     let ok = test_reply(fd) & test_short(fd);
+    let snmp = test_snmp(&before);
+    let echo = test_echo_code(fd);
     close(fd);
-    ok & test_snmp(&before)
+    ok & snmp & echo
+}
+
+/// An echo request with code 5 gets an echo reply with code 5
+fn test_echo_code(fd: i32) -> bool {
+    let mut t = T::new(b"ICMP_ECHO_CODE");
+    let mut req = [0u8; 16];
+    req[0] = 8;
+    req[1] = 5;
+    req[4..6].copy_from_slice(&ID.to_be_bytes());
+    req[6..8].copy_from_slice(&77u16.to_be_bytes());
+    let c = csum(&req);
+    req[2..4].copy_from_slice(&c.to_be_bytes());
+    t.eq(b"send", send_to(fd, &req, LO, 0, 0), req.len() as i64);
+    let mut buf = [0u8; 256];
+    let mut code = -1i64;
+    for _ in 0..8 {
+        let (n, ip) = recv_wait(fd, &mut buf, 1000);
+        if n < 28 {
+            break;
+        }
+        let ihl = ((buf[0] & 0xf) * 4) as usize;
+        let m = &buf[ihl..n as usize];
+        if ip == LO && m[0] == 0 && u16::from_be_bytes([m[6], m[7]]) == 77 {
+            code = i64::from(m[1]);
+            break;
+        }
+    }
+    let ok = t.eq(b"reply code", code, 5);
+    t.done();
+    ok
 }
 
 /// CLOCK_REALTIME now, in ms since midnight UTC
