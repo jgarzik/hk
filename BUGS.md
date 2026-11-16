@@ -841,6 +841,19 @@ QEMU's xHCI hides all of them.
   bus or ttyUSB0 tty device, no baud rate or modem control requests,
   the bulk IN endpoint is never read.
 
+## Driver probe failure leaks
+
+**Location**: `hw/net/e1000.rs` (`e1000_probe`, `alloc_bufs`),
+`hw/net/virtio_net.rs` (`setup_queues`, `probe`)
+
+A probe that fails part-way does not undo what it set up (Linux
+devm_*, or the probe's goto unwind): e1000's descriptor rings and
+buffers (`DmaCoherent`, freed by hand only at remove) and its register
+mapping leak when a later allocation fails; virtio-net's virtqueues
+and buffer pools leak when the second queue or a pool fails. Owners
+freeing on drop (`DmaBox`) would unwind them; doc/res/hk-driver-api.md
+proposes the design.
+
 ## No DMA for 32-bit devices with RAM above 4GB
 
 **Location**: `hw/dma.rs`, `mm/frame_alloc.rs`,
@@ -1036,6 +1049,14 @@ Tag = roadmap phase (doc/ROADMAP.md).
    its port in bhash (`TcpSock::assert_owner`). On failure the test
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
+
+11. **STACK near-overflow flake** (arm64, once in three local
+    `check-arm` runs): `STACK:FAIL kernel stack nearly overflowed: 4016
+    of 16384 bytes left (need 4096)`, reported by
+    `task/percpu.rs` `check_stack_usage` for a task that exited around
+    the FAULT_INJECT tests. Some path comes within 80 bytes of the
+    margin; the check does not say which. Find the deep path (a
+    per-task high-water site, Linux stack_trace_max) and shrink it.
 
 10. **TCP_ETH0_REFUSED flake** (cause unknown): `TCP_ETH0_REFUSED:FAIL
     refused got 0` (hk x86 LOCKDEP=1, once; once earlier on hk
