@@ -894,6 +894,29 @@ MSI capability, which RTL8168g and some AHCI parts offer alone) is
 missing. The MADT parser skips IOAPIC entries (Linux
 acpi_parse_ioapic registers them).
 
+## UEFI boot finds no ACPI tables
+
+**Location**: `arch/x86_64/acpi.rs` (`find_rsdp`), `arch/x86_64/multiboot2.rs`
+
+The RSDP is found only by scanning the legacy BIOS areas (EBDA,
+0xE0000-0xFFFFF). Under UEFI it is not there: GRUB passes it in the
+multiboot2 ACPI old/new RSDP tags (types 14 and 15; Linux takes it from
+the EFI system table or boot_params.acpi_rsdp_addr), which hk ignores,
+so a UEFI boot of the Dell OptiPlex 3020 panics without ACPI.
+
+## TLB gaps
+
+**Location**: `arch/x86_64/tlb.rs`, `mm/tlb.rs`, `arch/aarch64/`
+
+- x86 has no PCID and no global pages (CR4.PGE clear): every CR3 write
+  drops the whole TLB, kernel entries included (Linux: PCID-tagged
+  ASIDs per CPU, _PAGE_GLOBAL kernel mappings), and no lazy TLB mode
+  for kernel threads (Linux switch_mm_irqs_off leaves the old mm loaded).
+- No ranged or broadcast invalidation hardware: arm64 FEAT_TLBIRANGE
+  (Linux __flush_tlb_range_op), AMD INVLPGB/TLBSYNC (Linux
+  invlpgb_flush_user_nr_nosync) and Intel RAR; every remote flush is
+  an IPI on x86 and per-page TLBI on arm64.
+
 ## ACPI power management gaps
 
 **Location**: `hw/acpi/`, `arch/x86_64/{acpi,power}.rs`

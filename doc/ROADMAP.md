@@ -3,7 +3,7 @@
 One sequence of phases, in order. Order rule: bugs first, then the
 largest blast radius (refactors before more code lands on them), then
 dependencies, then the Debian goal (boot Debian trixie from a tmpfs
-initramfs: sysvinit now, systemd next). Every phase follows CLAUDE.md:
+initramfs: sysvinit now, systemd next: doc/res/hk-systemd-prep.md). Every phase follows CLAUDE.md:
 Linux semantics binding, each commit gated alone, LOCKING.md with each
 lock change, a boot test on hk and Linux for new behavior, /code-review
 and the heavy gate (uncached gate, LOCKDEP x86+arm, TCG, stress with OVERFLOW=1) at
