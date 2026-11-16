@@ -1047,6 +1047,12 @@ Tag = roadmap phase (doc/ROADMAP.md).
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
 
+10. **TCP_ETH0_REFUSED flake** (cause unknown): `TCP_ETH0_REFUSED:FAIL
+    refused got 0` (hk x86 LOCKDEP=1, once; once earlier on hk
+    x86): a connect through slirp to 10.0.2.2 port 1, refused on the
+    host, completed (SO_ERROR 0, POLLOUT). Not reproduced on rerun;
+    the socket is an active connect (no listener-side code involved).
+
 11. **STACK near-overflow flake** (arm64, once in three local
     `check-arm` runs): `STACK:FAIL kernel stack nearly overflowed: 4016
     of 16384 bytes left (need 4096)`, reported by
@@ -1055,11 +1061,13 @@ Tag = roadmap phase (doc/ROADMAP.md).
     margin; the check does not say which. Find the deep path (a
     per-task high-water site, Linux stack_trace_max) and shrink it.
 
-10. **TCP_ETH0_REFUSED flake** (cause unknown): `TCP_ETH0_REFUSED:FAIL
-    refused got 0` (hk x86 LOCKDEP=1, once; once earlier on hk
-    x86): a connect through slirp to 10.0.2.2 port 1, refused on the
-    host, completed (SO_ERROR 0, POLLOUT). Not reproduced on rerun;
-    the socket is an active connect (no listener-side code involved).
+12. **FORK_PGRP_SIGNAL flake** (hk x86, once in three local `check`
+    runs): `FORK_PGRP_SIGNAL:FAIL got 11`: in round 1 a child forked
+    before the group's SIGUSR1 showed pending in its parent did not
+    get it (`user/boot_tester/signal/fork_delay.rs` `round`). A
+    process-group kill racing fork (Linux copy_process's
+    signal->multiprocess delay and its recheck under siglock) may
+    miss a child that joined the group before the walk.
 
 ## DRM dumb buffers are the boot framebuffer only
 
