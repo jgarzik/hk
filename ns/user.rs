@@ -35,6 +35,8 @@ use crate::task::percpu;
 
 /// The uid an id with no mapping shows as (Linux overflowuid)
 pub const OVERFLOWUID: u32 = 65534;
+/// The gid an id with no mapping shows as (Linux overflowgid)
+pub const OVERFLOWGID: u32 = 65534;
 
 /// Maximum user namespace nesting level (same as Linux)
 pub const MAX_USER_NS_LEVEL: u32 = 32;
@@ -248,6 +250,12 @@ impl UserNamespace {
     /// Get the effective GID in the init namespace
     pub fn from_kgid(&self, kgid: u32) -> Option<u32> {
         self.gid_map.map_id_up(kgid)
+    }
+
+    /// The id `kgid` has in this namespace, or the overflow gid 65534
+    /// if it has none (Linux from_kgid_munged)
+    pub fn from_kgid_munged(&self, kgid: u32) -> u32 {
+        self.from_kgid(kgid).unwrap_or(OVERFLOWGID)
     }
 
     /// Get the kernel GID from a namespace GID

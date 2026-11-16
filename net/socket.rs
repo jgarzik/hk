@@ -99,6 +99,9 @@ impl OptIn {
 pub enum OptOut {
     Int(i32),
     Bytes(Vec<u8>),
+    /// Copied only whole: a shorter buffer is ERANGE with the length
+    /// needed written back (Linux SO_PEERGROUPS)
+    Whole(Vec<u8>),
 }
 
 /// Protocol operations of a socket (Linux proto_ops + the parts of
@@ -428,6 +431,7 @@ pub const SO_DOMAIN: i32 = 39;
 pub const SO_RXQ_OVFL: i32 = 40;
 pub const SO_PEEK_OFF: i32 = 42;
 pub const SO_COOKIE: i32 = 57;
+pub const SO_PEERGROUPS: i32 = 59;
 pub const SO_BINDTOIFINDEX: i32 = 62;
 pub const SO_RCVTIMEO_NEW: i32 = 66;
 pub const SO_SNDTIMEO_NEW: i32 = 67;
@@ -628,6 +632,8 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW => Ok(OptOut::Bytes(timeval_bytes(sk.rcvtimeo()))),
         SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW => Ok(OptOut::Bytes(timeval_bytes(sk.sndtimeo()))),
         SO_PEERCRED => Ok(OptOut::Bytes(peercred_bytes(None))),
+        // Only AF_UNIX (and Linux's Bluetooth) has peer credentials
+        SO_PEERGROUPS => Err(KernelError::NoData),
         SO_BINDTODEVICE => {
             let i = sk.bound_dev_if();
             let mut b = Vec::new();
@@ -666,6 +672,11 @@ pub fn put_opt(
     let b = match out {
         OptOut::Int(v) => v.to_ne_bytes().to_vec(),
         OptOut::Bytes(b) => b,
+        OptOut::Whole(b) if b.len() > len as usize => {
+            lenp.write(&(b.len() as u32))?;
+            return Err(KernelError::Range);
+        }
+        OptOut::Whole(b) => b,
     };
     let n = (len as usize).min(b.len());
     if n > 0 {

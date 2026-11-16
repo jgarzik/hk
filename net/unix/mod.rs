@@ -82,8 +82,8 @@ use crate::net::msg::{RecvMsg, SendMsg};
 use crate::net::skb::{SkBuff, SkbCb, SkbOwned, SkbOwnedQueue};
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, WakeHow, sf};
 use crate::net::socket::{
-    AF_UNIX, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_PEERCRED, SOCK_DGRAM, SOCK_RAW,
-    SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
+    AF_UNIX, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_PEERCRED, SO_PEERGROUPS, SOCK_DGRAM,
+    SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
 };
 use crate::net::{NetNamespace, NetRef};
 use crate::sync::Mutex as SMutex;
@@ -125,13 +125,15 @@ impl UnixAddr {
     }
 }
 
-/// SO_PEERCRED values (Linux sk_peer_pid + sk_peer_cred): the peer's
-/// struct pid, numbered for each reader
+/// SO_PEERCRED and SO_PEERGROUPS values (Linux sk_peer_pid +
+/// sk_peer_cred): the peer's struct pid, numbered for each reader
 #[derive(Clone)]
 pub struct PeerCred {
     pid: Option<Arc<crate::task::pid::Pid>>,
     uid: u32,
     gid: u32,
+    /// Supplementary groups (shared with the credentials)
+    groups: crate::task::GroupInfo,
 }
 
 impl PeerCred {
@@ -144,6 +146,7 @@ impl PeerCred {
             ),
             uid: c.euid,
             gid: c.egid,
+            groups: c.groups.clone(),
         }
     }
 }
@@ -839,6 +842,23 @@ impl UnixSock {
         })))
     }
 
+    /// SO_PEERGROUPS: the peer's supplementary groups as gid_t[] in
+    /// the reader's user namespace, ENODATA without peer credentials
+    /// (Linux sk_getsockopt, groups_to_user)
+    fn peergroups_opt(&self) -> Result<OptOut, KernelError> {
+        let c = self.peercred.lock().clone();
+        let c = c.ok_or(KernelError::NoData)?;
+        let ns = crate::ns::current_user_ns();
+        let g = c.groups.as_slice();
+        let mut b = Vec::new();
+        b.try_reserve_exact(g.len() * 4)
+            .map_err(|_| KernelError::OutOfMemory)?;
+        for &k in g {
+            b.extend_from_slice(&ns.from_kgid_munged(k).to_ne_bytes());
+        }
+        Ok(OptOut::Whole(b))
+    }
+
     /// Linux unix_inq_len: EINVAL on a listener; a stream's unread
     /// bytes, a seqpacket's queued bytes, a datagram socket's first
     /// message
@@ -1022,13 +1042,17 @@ impl ProtoOps for UnixSock {
         (level != SOL_SOCKET).then_some(Err(KernelError::OperationNotSupported))
     }
 
-    /// Linux: no proto getsockopt (EOPNOTSUPP), SO_PEERCRED from the
-    /// connection
+    /// Linux: no proto getsockopt (EOPNOTSUPP), SO_PEERCRED and
+    /// SO_PEERGROUPS from the connection
     fn getsockopt(&self, level: i32, opt: i32) -> Option<Result<OptOut, KernelError>> {
         if level != SOL_SOCKET {
             return Some(Err(KernelError::OperationNotSupported));
         }
-        (opt == SO_PEERCRED).then(|| Ok(self.peercred_opt()))
+        match opt {
+            SO_PEERCRED => Some(Ok(self.peercred_opt())),
+            SO_PEERGROUPS => Some(self.peergroups_opt()),
+            _ => None,
+        }
     }
 
     fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
