@@ -7,12 +7,6 @@ Failures that also occur when the boot tester runs on real Linux
 real bug in Linux as well as hk: Linux is the reference, not
 infallible, so each one is investigated, not written off.
 
-- **VFAT_CORRUPT_CHAIN on Linux** (cause unknown, seen once on local
-  `check-linux`, Linux 7.0): `VFAT_CORRUPT_CHAIN:FAIL got -161616`,
-  each of its three vd1 mounts EBUSY (`blk/disk.rs`
-  `vfat_corrupt_chain`), as if the previous test's umount of
-  /mnt/vd1 had not yet released the device. Passed on rerun.
-
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
 Files marked `#![expect(clippy::undocumented_unsafe_blocks)]

@@ -176,6 +176,9 @@ fn race(t: &mut T, dev: &BlkDev) {
             sys_umount2(DIR.as_ptr(), 0);
             break;
         }
+        // Counted before the walker starts: it may make all its calls
+        // before this side runs again
+        let base = sh.calls.load(Ordering::Acquire);
         sh.go.store(round, Ordering::Release);
         if !t.ok(
             b"walker ready",
@@ -185,7 +188,6 @@ fn race(t: &mut T, dev: &BlkDev) {
             break;
         }
         // Inside a batch of walks, detach the mount they climb through
-        let base = sh.calls.load(Ordering::Acquire);
         if !t.ok(
             b"walks under way",
             wait(|| sh.calls.load(Ordering::Acquire) >= base + 2),
