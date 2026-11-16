@@ -39,6 +39,11 @@ pub trait Hcd: Send + Sync {
     /// The bottom half its URBs are given back through
     fn bh(&self) -> &GivebackBh;
 
+    /// Reset the host side of endpoint `ep` (address with direction)
+    /// of `dev` to DATA0 / sequence 0, its halt cleared on the device
+    /// (Linux hc_driver.endpoint_reset); thread context, no URB queued
+    fn endpoint_reset(&self, dev: &super::UsbDevice, ep: u8);
+
     /// A transfer buffer of `size` bytes the controller can reach (Linux
     /// hcd_buffer_alloc); thread context
     fn buffer_alloc(&self, size: usize) -> Option<DmaCoherent>;

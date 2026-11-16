@@ -831,9 +831,10 @@ QEMU's xHCI hides all of them.
   0).
 - usb-storage: SCSI transparent command set over Bulk-Only Transport
   only (no CB/CBI, RBC/UFI/8070 subclasses, UAS, or unusual_devs
-  quirks). A stalled bulk transfer fails the command: no CLEAR_FEATURE
-  ENDPOINT_HALT to the device, CSW read or reset recovery (Linux
-  usb_stor_clear_halt, usb_stor_Bulk_reset).
+  quirks). A failed command's sense is not fetched (Linux
+  usb_stor_invoke_transport's REQUEST SENSE), and past a Bulk-Only
+  reset there is no port reset (Linux usb_stor_port_reset,
+  usb_reset_device) or SCSI error handler.
 - ftdi_sio: a console only, for the FT232 (0403:6001): no usb-serial
   bus or ttyUSB0 tty device, no baud rate or modem control requests,
   the bulk IN endpoint is never read.

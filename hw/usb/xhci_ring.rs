@@ -497,6 +497,10 @@ impl Xhci {
             return Err(UsbError::Shutdown);
         }
         let ep = st.ep(slot, dci).ok_or(UsbError::NoDevice)?;
+        if ep.ep_state & ep_state::EP_SOFT_CLEAR_TOGGLE != 0 {
+            printkln!("xHCI: Can't enqueue URB while manually clearing toggle");
+            return Err(UsbError::InvalidParam);
+        }
         self.prepare_ring(ep, trbs.len())?;
         let ring = ep.ring.as_mut().ok_or(UsbError::NoDevice)?;
         let span = ring.enqueue_td(&trbs);
@@ -905,6 +909,10 @@ impl Xhci {
         let Some(ep) = st.ep(slot, dci) else {
             return;
         };
+        if reset == Reset::Hard {
+            // It resets the toggle (TSP 0): endpoint_reset need not
+            ep.ep_state |= ep_state::EP_HARD_CLEAR_TOGGLE;
+        }
         if reset == Reset::Hard
             && let Some(td) = ti.and_then(|i| ep.tds.get_mut(i))
             && td.cancel == TdCancel::None

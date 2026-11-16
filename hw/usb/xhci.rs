@@ -748,6 +748,11 @@ pub(super) mod ep_state {
     pub const EP_HALTED: u32 = 1 << 1;
     /// Stop Endpoint queued
     pub const EP_STOP_CMD_PENDING: u32 = 1 << 2;
+    /// A hard Reset Endpoint reset the toggle: the next endpoint_reset
+    /// has nothing to do
+    pub const EP_HARD_CLEAR_TOGGLE: u32 = 1 << 3;
+    /// endpoint_reset is stopping and reconfiguring it: no queueing
+    pub const EP_SOFT_CLEAR_TOGGLE: u32 = 1 << 4;
 }
 
 /// TDs an endpoint's list has room for when its ring is made, one per
@@ -1342,6 +1347,62 @@ impl Xhci {
         Ok(())
     }
 
+    /// Reset endpoint `ep`'s data toggle or sequence number, its halt
+    /// cleared on the device (Linux xhci_endpoint_reset): nothing to do
+    /// after a hard Reset Endpoint (EP_HARD_CLEAR_TOGGLE); else the idle
+    /// endpoint is stopped (the controller updates its output context)
+    /// and dropped and added back as it is by a Configure Endpoint. EP0
+    /// has no toggle to reset
+    fn endpoint_reset(&self, slot: u8, ep: u8) {
+        let dci = endpoint_to_dci(ep);
+        if dci <= 1 {
+            return;
+        }
+        {
+            let mut st = self.lock.lock();
+            let Some(e) = st.ep(slot, dci) else {
+                return;
+            };
+            if e.ep_state & ep_state::EP_HARD_CLEAR_TOGGLE != 0 {
+                e.ep_state &= !ep_state::EP_HARD_CLEAR_TOGGLE;
+                return;
+            }
+            if e.ring.is_none() {
+                return;
+            }
+            if !e.tds.is_empty() {
+                printkln!(
+                    "xHCI: slot {} ep {:#04x}: EP not empty, refuse reset",
+                    slot,
+                    ep
+                );
+                return;
+            }
+            e.ep_state |= ep_state::EP_SOFT_CLEAR_TOGGLE;
+        }
+        let ctx_size = self.ctx_size;
+        let _ = self
+            .command(
+                slot_trb(trb_type::STOP_ENDPOINT, slot, dci, 0),
+                "Stop Endpoint",
+            )
+            .and_then(|_| {
+                self.fill_input_ctx(slot, |dev| {
+                    dev.out_ctx.copy_for_reset(ctx_size, dci, &mut dev.in_ctx);
+                    Ok(())
+                })
+            })
+            .and_then(|addr| {
+                self.command(
+                    slot_trb(trb_type::CONFIGURE_ENDPOINT, slot, 0, addr),
+                    "Configure Endpoint",
+                )
+            });
+        if let Some(e) = self.lock.lock().ep(slot, dci) {
+            e.ep_state &= !ep_state::EP_SOFT_CLEAR_TOGGLE;
+        }
+    }
+
     /// Disable a slot and free its state (Linux xhci_free_dev,
     /// xhci_disable_slot): what is still queued on it is given back
     /// (Shutdown)
@@ -1526,6 +1587,10 @@ impl Hcd for Xhci {
 
     fn bh(&self) -> &GivebackBh {
         &self.bh
+    }
+
+    fn endpoint_reset(&self, dev: &UsbDevice, ep: u8) {
+        self.endpoint_reset(dev.slot_id, ep);
     }
 
     /// Coherent memory no TRB buffer of which crosses a 64 KiB boundary

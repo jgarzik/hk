@@ -100,3 +100,35 @@ pub fn usb_bulk_msg(
         Ok(urb.actual_length())
     }
 }
+
+/// Reset the host side of endpoint `ep` of `dev` (Linux
+/// usb_reset_endpoint): its data toggle back to DATA0
+pub fn usb_reset_endpoint(dev: &UsbDevice, ep: u8) {
+    if let Some(hcd) = dev.bus.get() {
+        hcd.endpoint_reset(dev, ep);
+    }
+}
+
+/// Clear a halt (stall) on `pipe`'s endpoint (Linux usb_clear_halt):
+/// CLEAR_FEATURE(ENDPOINT_HALT) to the device, then, only if it
+/// succeeded, the host side reset to DATA0 as the device's is
+pub fn usb_clear_halt(dev: &UsbDevice, pipe: Pipe) -> Result<(), UsbError> {
+    clear_halt(dev, pipe, USB_CTRL_SET_TIMEOUT)
+}
+
+/// `usb_clear_halt` with a time limit (usb-storage's is 3 s)
+pub(super) fn clear_halt(dev: &UsbDevice, pipe: Pipe, timeout_ms: u64) -> Result<(), UsbError> {
+    const USB_REQ_CLEAR_FEATURE: u8 = 1;
+    const USB_RECIP_ENDPOINT: u8 = 2;
+    const USB_ENDPOINT_HALT: u16 = 0;
+    let setup = SetupPacket {
+        request_type: USB_RECIP_ENDPOINT,
+        request: USB_REQ_CLEAR_FEATURE,
+        value: USB_ENDPOINT_HALT,
+        index: u16::from(pipe.ep),
+        length: 0,
+    };
+    usb_control_msg(dev, &setup, &mut [], timeout_ms)?;
+    usb_reset_endpoint(dev, pipe.ep);
+    Ok(())
+}
