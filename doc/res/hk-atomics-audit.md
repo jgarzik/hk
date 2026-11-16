@@ -47,20 +47,11 @@ argued / published copy of locked state.
   `ctx`) for the fields with no lockless reader. LOCKING.md §3.1 lists
   each field's lock.
 
-### 5. Page allocator per-CPU lists: RMW under lock, shared lines, trylock flag — (a)(c)(d)
-- Where: `mm/page_alloc.rs` `Pcp.count` (`pcp_push`/`pcp_pop` `fetch_add/sub`
-  under `Pcp.lock`), `Zone.nr_free` (`free_one`/`take` under `Zone.lock`),
-  `Zone.draining` (`drain_all`: `swap(true)` as trylock).
-- Wrong: locked RMWs on every order-0 alloc/free under a lock that already
-  serializes them; `draining` is an invisible lock (no lockdep class, no
-  owner). Boot-only fields (`map`, `start`, `end`, `managed`, `sections`,
-  `batch`, `high`) are atomics rather than set-once (rule 5).
-- Linux: `pcp->count` plain under `pcp->lock`; NR_FREE_PAGES via per-CPU
-  vmstat diffs folded at a threshold; `pcpu_drain_mutex` with
-  `mutex_trylock`.
-- Fix: plain counts inside the locked structs (Relaxed shadow only where
-  `drain_lists` peeks lock-free); `draining` becomes a real trylock-able
-  mutex; boot fields `Once`/constructor. LOCKING.md §3.2.
+### 5. Page allocator boot-only fields as atomics — (a)
+- Where: `mm/page_alloc.rs` `Zone.map`, `start`, `end`, `managed`,
+  `sections`, `batch`, `high` (set at boot, atomics rather than set-once,
+  rule 5). The counts and the drain lock are done.
+- Fix: set-once (`Once` or the constructor) where boot order allows.
 
 ### 6. CPU-time accounting at every syscall boundary uses RMW seqcount — (c)(a)
 - Where: `task/mod.rs` `Task::acct_begin`/`acct_end` (`acct_seq.fetch_add`),

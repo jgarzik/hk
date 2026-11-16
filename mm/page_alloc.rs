@@ -29,7 +29,7 @@
 //! leaked. Every pfn from outside is checked against the zone and the
 //! memory map's sections before its struct page is touched.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::mm::page::{PG_BUDDY, PG_HEAD, PG_RESERVED, PG_TAIL, Page, put_mapping};
 use crate::sync::IrqSpinlock;
@@ -272,8 +272,9 @@ pub struct Zone {
     high: AtomicUsize,
     /// The per-CPU lists, each in its CPU's per-CPU area
     pcp: &'static crate::cpu::PerCpu<Pcp>,
-    /// A drain of every CPU's list is running (Linux pcpu_drain_mutex)
-    draining: AtomicBool,
+    /// Serializes draining every CPU's list (Linux pcpu_drain_mutex,
+    /// taken with mutex_trylock: a drain that finds one running returns)
+    drain_lock: crate::sync::Mutex<()>,
 }
 
 impl Zone {
@@ -295,7 +296,7 @@ impl Zone {
             batch: AtomicUsize::new(1),
             high: AtomicUsize::new(0),
             pcp,
-            draining: AtomicBool::new(false),
+            drain_lock: crate::sync::Mutex::new(()),
         }
     }
 
@@ -392,7 +393,9 @@ impl Zone {
     /// Free block [pfn, pfn + 2^order): merge with free buddies (Linux
     /// __free_one_page)
     fn free_one(&self, fa: &mut FreeArea, mut pfn: u64, mut order: u32) {
-        self.nr_free.fetch_add(1 << order, Ordering::Relaxed);
+        // Under the zone lock (`fa`): a load and a store, read lock-free
+        // for watermarks (Linux NR_FREE_PAGES via __mod_zone_page_state)
+        crate::sync::Sole::sole_add(&self.nr_free, 1 << order);
         while order < MAX_ORDER {
             // A buddy is in the same 2^MAX_ORDER block, so in the same
             // memory section; outside the zone it is never merged
@@ -424,7 +427,8 @@ impl Zone {
             o -= 1;
             self.list_add(fa, pfn + (1 << o), o);
         }
-        self.nr_free.fetch_sub(1 << order, Ordering::Relaxed);
+        // Under the zone lock, as in `free_one`
+        crate::sync::Sole::sole_add(&self.nr_free, (1usize << order).wrapping_neg());
         Some(pfn)
     }
 
@@ -440,13 +444,15 @@ impl Zone {
     fn pcp_push(&self, p: &Pcp, head: &mut u64, pfn: u64) {
         self.page(pfn).next.store(*head, Ordering::Relaxed);
         *head = pfn + 1;
-        p.count.fetch_add(1, Ordering::Relaxed);
+        // Under `p.lock` (`head`): Linux pcp->count++
+        crate::sync::Sole::sole_add(&p.count, 1);
     }
 
     fn pcp_pop(&self, p: &Pcp, head: &mut u64) -> Option<u64> {
         let pfn = head.checked_sub(1)?;
         *head = self.page(pfn).next.load(Ordering::Relaxed);
-        p.count.fetch_sub(1, Ordering::Relaxed);
+        // Under `p.lock`: Linux pcp->count--
+        crate::sync::Sole::sole_add(&p.count, usize::MAX);
         Some(pfn)
     }
 
@@ -499,11 +505,10 @@ impl Zone {
     /// (it may hold spinlocks, or have interrupted the drainer); false
     /// then.
     pub fn drain_all(&self) -> bool {
-        if self.draining.swap(true, Ordering::Acquire) {
+        let Some(_g) = self.drain_lock.try_lock() else {
             return false;
-        }
+        };
         self.drain_lists();
-        self.draining.store(false, Ordering::Release);
         true
     }
 
@@ -1201,11 +1206,11 @@ pub(crate) mod tests {
     fn nested_drain_returns_at_once() {
         let t = zone(0, 64);
         t.z.free_range(0, 64);
-        t.z.draining.store(true, Ordering::Relaxed);
+        let g = t.z.drain_lock.try_lock().unwrap();
         assert!(!t.z.drain_all());
-        t.z.draining.store(false, Ordering::Relaxed);
+        drop(g);
         assert!(t.z.drain_all());
-        assert!(!t.z.draining.load(Ordering::Relaxed));
+        assert!(t.z.drain_lock.try_lock().is_some());
     }
 
     /// Atomic and opportunistic allocations (a huge-page try on every

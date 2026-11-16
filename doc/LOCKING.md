@@ -1703,10 +1703,12 @@ pub struct Zone {
   try) fail at once. A drain takes each list's lock in turn, never two
   at once, so CPUs draining each other cannot deadlock, and needs no
   IPI (it may run under any lock). One drain runs at a time
-  (`Zone.draining`, an atomic flag; Linux pcpu_drain_mutex, which
-  hk takes like a trylock): a caller that finds one running never
-  waits (it may hold a spinlock, or have interrupted the drainer) and
-  just retries its allocation. Allocations in interrupt context never
+  (`Zone.drain_lock`, a sleeping mutex only ever taken with try_lock,
+  Linux pcpu_drain_mutex's mutex_trylock in drain_all_pages(NULL)): a
+  caller that finds one running never waits (it may hold a spinlock)
+  and just retries its allocation. `Pcp.count` (under its list's lock)
+  and `Zone.nr_free` (under `Zone.lock`) are loads and stores, read
+  lock-free for statistics and watermarks. Allocations in interrupt context never
   drain (debug builds assert they do not pass `Gfp::RECLAIM`). A CPU
   without
   per-CPU data yet (coming up, or the boot CPU early) never touches a
