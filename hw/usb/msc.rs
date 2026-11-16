@@ -166,8 +166,24 @@ impl UsbMscDevice {
         self.state.lock().gone = true;
     }
 
-    /// Execute a BOT transaction
+    /// Execute a BOT transaction. Its allocations (URBs, DMA buffers,
+    /// TRB lists) do no reclaim I/O (Linux usb-storage's GFP_NOIO): a
+    /// swap or page-cache write to this disk from inside it would wait
+    /// for the `state` lock it holds
     fn bot_transfer(
+        &self,
+        lun: u8,
+        cdb: &[u8],
+        direction: DataDirection,
+        data: Option<&mut [u8]>,
+    ) -> ScsiResult<usize> {
+        crate::mm::memalloc_scope(crate::task::pf::MEMALLOC_NOIO, || {
+            self.bot_cmd(lun, cdb, direction, data)
+        })
+    }
+
+    /// `bot_transfer`'s CBW, data and CSW phases
+    fn bot_cmd(
         &self,
         lun: u8,
         cdb: &[u8],
