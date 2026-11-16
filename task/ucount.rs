@@ -111,6 +111,13 @@ impl Ucounts {
         old == v
     }
 
+    /// Give back `v`; the new count (Linux atomic_long_sub_return)
+    pub fn sub(&self, t: Ucount, v: u64) -> u64 {
+        let old = self.ctr(t).fetch_sub(v, Ordering::Relaxed);
+        debug_assert!(old >= v, "ucounts: {t:?} below zero");
+        old.wrapping_sub(v)
+    }
+
     /// The count (Linux get_rlimit_value)
     pub fn get(&self, t: Ucount) -> u64 {
         self.ctr(t).load(Ordering::Relaxed)

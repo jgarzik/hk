@@ -96,8 +96,7 @@ fn account_pipe_buffers(user: &UcountsRef, old: usize, new: usize) -> usize {
     if new >= old {
         user.inc(Ucount::PipeBufs, (new - old) as u64) as usize
     } else {
-        user.dec(Ucount::PipeBufs, (old - new) as u64);
-        user.get(Ucount::PipeBufs) as usize
+        user.sub(Ucount::PipeBufs, (old - new) as u64) as usize
     }
 }
 
@@ -292,10 +291,6 @@ pub struct PipeInner {
     /// Ring of buffer slots, a power of two (Linux pipe->bufs,
     /// ring_size); index `i` is slot `i & (len - 1)`
     bufs: alloc::boxed::Box<[PipeBuffer]>,
-    /// Slots that may be in use (Linux max_usage), at most the ring's
-    max_usage: usize,
-    /// Slots charged to the creator (Linux nr_accounted)
-    nr_accounted: usize,
     /// Head index, free-running (Linux pipe->head): the next slot
     /// written
     pub head: usize,
@@ -305,13 +300,10 @@ pub struct PipeInner {
     pub total_len: usize,
 }
 
-/// A ring of `n` empty slots (`n` a power of two), or ENOMEM
+/// A ring of `n` empty slots (`n` a power of two), or ENOMEM (Linux
+/// kcalloc: past the largest allocation too)
 fn new_ring(n: usize) -> Result<alloc::boxed::Box<[PipeBuffer]>, KernelError> {
-    let mut v = alloc::vec::Vec::new();
-    v.try_reserve_exact(n)
-        .map_err(|_| KernelError::OutOfMemory)?;
-    v.resize_with(n, PipeBuffer::empty);
-    Ok(v.into_boxed_slice())
+    Ok(crate::util::kmem::try_vec_with(n, PipeBuffer::empty)?.into_boxed_slice())
 }
 
 impl PipeInner {
@@ -319,8 +311,6 @@ impl PipeInner {
     fn new(slots: usize) -> Result<Self, KernelError> {
         Ok(Self {
             bufs: new_ring(slots)?,
-            max_usage: slots,
-            nr_accounted: slots,
             head: 0,
             tail: 0,
             total_len: 0,
@@ -338,9 +328,10 @@ impl PipeInner {
         &mut self.bufs[i & mask]
     }
 
-    /// Slots that may be in use (Linux max_usage)
+    /// Slots that may be in use (Linux max_usage), also those charged
+    /// to the creator (nr_accounted): the ring's (no watch queues)
     pub fn max_usage(&self) -> usize {
-        self.max_usage
+        self.bufs.len()
     }
 
     /// A ring of `slots` (a power of two) holding what is buffered at
@@ -357,8 +348,6 @@ impl PipeInner {
         self.bufs = bufs;
         self.tail = 0;
         self.head = n;
-        self.max_usage = slots;
-        self.nr_accounted = slots;
         Ok(())
     }
 
@@ -369,7 +358,7 @@ impl PipeInner {
 
     /// Check if pipe is full (all buffer slots used)
     pub fn is_full(&self) -> bool {
-        self.buffer_count() >= self.max_usage
+        self.buffer_count() >= self.max_usage()
     }
 
     /// Number of used buffer slots
@@ -674,14 +663,14 @@ impl Pipe {
             return Err(KernelError::InvalidArgument);
         }
         let mut g = self.lock();
-        let grow = slots > g.max_usage;
+        let grow = slots > g.max_usage();
         if grow
             && size > PIPE_MAX_SIZE.load(Ordering::Relaxed)
             && !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
         {
             return Err(KernelError::NotPermitted);
         }
-        let old = g.nr_accounted;
+        let old = g.max_usage();
         let user_bufs = account_pipe_buffers(&self.user, old, slots);
         let over_limit =
             over(&PIPE_USER_PAGES_HARD, user_bufs) || over(&PIPE_USER_PAGES_SOFT, user_bufs);
@@ -876,7 +865,7 @@ fn pipe_fasync(pipe: &Pipe, file: &File, fd: i32, on: bool) -> Result<(), Kernel
 impl Drop for Pipe {
     /// Give the creator's charge back (Linux free_pipe_info)
     fn drop(&mut self) {
-        let n = self.inner.get_mut().nr_accounted;
+        let n = self.inner.get_mut().max_usage();
         account_pipe_buffers(&self.user, n, 0);
     }
 }
@@ -909,7 +898,7 @@ impl PipeGuard<'_> {
         self.pipe.tail.store(self.g.tail, Ordering::Release);
         self.pipe
             .max_usage
-            .store(self.g.max_usage, Ordering::Release);
+            .store(self.g.max_usage(), Ordering::Release);
     }
 }
 
