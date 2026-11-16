@@ -188,7 +188,15 @@ fn xhci_probe(
     };
     printkln!("xHCI: Controller initialized and running");
     let usb_devices = xhci.enumerate();
-    let usb = super::usb_register_devices(dev, usb_devices);
+    let usb = match super::usb_register_devices(dev, usb_devices) {
+        Ok(u) => u,
+        Err(e) => {
+            xhci.stop();
+            drop(irq);
+            pci_disable_device(pci_dev);
+            return Err(e);
+        }
+    };
     Ok(Box::write(
         slot,
         XhciDeviceHandle {
@@ -211,7 +219,7 @@ struct XhciDeviceHandle {
     xhci: Arc<Xhci>,
     /// The handler (Linux hcd->irq); taken at remove
     irq: crate::sync::spin::Mutex<Option<IrqRegistration<Xhci>>>,
-    usb: Vec<alloc::sync::Arc<crate::base::Device>>,
+    usb: super::usbcore::UsbBus,
 }
 
 impl crate::base::Bound for XhciDeviceHandle {

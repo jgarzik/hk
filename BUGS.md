@@ -796,8 +796,6 @@ Phase A2 (net) remaining:
 **Location**: `hw/usb/xhci.rs`, `hw/usb/xhci_ring.rs`, `hw/usb/msc.rs`
 
 QEMU's xHCI hides all of them.
-- A second controller's root hub is `usb1` too (no bus numbers, Linux
-  usb_register_bus): its devices fail to register.
 - No hub support (route string 0): devices behind a hub are not
   enumerated.
 - Only bulk and interrupt endpoints are added to the controller

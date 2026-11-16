@@ -179,6 +179,8 @@ setup_x86_config() {
     # them: boots run the USB BIOS hand-off's EHCI path (QEMU's EHCI has
     # no legacy support capability: halt and quiesce only)
     QEMU_ARGS+=(-device ich9-usb-ehci1,id=ehci)
+    # A second, empty xHCI: each controller gets its own bus number
+    QEMU_ARGS+=(-device qemu-xhci,id=xhci2)
 
     QEMU_ARGS+=("${QEMU_DISK[@]}")
 
@@ -258,6 +260,8 @@ setup_arm_config() {
 
     # xHCI USB controller, and an idle EHCI (as on x86)
     QEMU_ARGS+=(-device qemu-xhci,id=xhci -device ich9-usb-ehci1,id=ehci)
+    # A second, empty xHCI (as on x86)
+    QEMU_ARGS+=(-device qemu-xhci,id=xhci2)
 
     # USB mass storage (make vfat-image), snapshot=on as on x86
     VFAT_IMG="target/vfat.img"
