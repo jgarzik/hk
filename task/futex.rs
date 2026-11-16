@@ -1199,7 +1199,7 @@ pub fn sys_futex_waitv(
 /// this CPU's. hk hashes futexes in one table, so the node picks no
 /// bucket; only the word is observable.
 fn futex_node(uaddr: u64, flags: u32) -> KernelResult<()> {
-    use crate::mm::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY};
+    use crate::mm::numa::NUMA_TOPOLOGY;
     if flags & futex2::NUMA == 0 {
         return Ok(());
     }
@@ -1208,13 +1208,11 @@ fn futex_node(uaddr: u64, flags: u32) -> KernelResult<()> {
     }
     let naddr = uaddr + 4;
     let mut node = get_user::<u32>(naddr)?;
-    if node != FUTEX_NO_NODE
-        && (node as usize >= MAX_NUMA_NODES || !NUMA_TOPOLOGY.lock().node_online(node))
-    {
-        return Err(KernelError::InvalidArgument);
-    }
     if node != FUTEX_NO_NODE {
-        return Ok(());
+        return match NUMA_TOPOLOGY.lock().node_online(node) {
+            true => Ok(()),
+            false => Err(KernelError::InvalidArgument),
+        };
     }
     if flags & futex2::MPOL != 0 {
         node = futex_mpol(uaddr)?;

@@ -393,14 +393,16 @@ fn test_futex_waitv_numa() {
         skip(b"FUTEX_WAITV_NUMA", b"Linux < 6.16");
         return;
     }
-    let mut node: u32 = 0;
-    sys_getcpu(ptr::null_mut(), &mut node);
     let set = |flags: u32, name: &[u8]| {
+        // The node of the CPU before and after: the task may migrate
+        let (mut before, mut after) = (0u32, 0u32);
         let mut f = NumaFutex([42, u32::MAX]);
+        sys_getcpu(ptr::null_mut(), &mut before);
         let ret = waitv_numa(f.0.as_mut_ptr() as u64, flags);
+        sys_getcpu(ptr::null_mut(), &mut after);
         // SAFETY: the kernel wrote the node word during the call
         let got = unsafe { ptr::read_volatile(&f.0[1]) };
-        if ret == -11 && got == node {
+        if ret == -11 && (got == before || got == after) {
             pass(name);
         } else {
             print(name);

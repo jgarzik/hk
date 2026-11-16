@@ -530,6 +530,11 @@ hub6, where Linux moves the port (uart_change_port).
 **Location:** `task/futex.rs`
 
 - **FUTEX_WAKE_OP and PI futexes** are missing.
+- **FUTEX2_MPOL:** MPOL_BIND and MPOL_PREFERRED_MANY policies name no
+  node (Linux: their home_node; hk has no set_mempolicy_home_node).
+- **FUTEX2_NUMA:** each call takes the global `NUMA_TOPOLOGY` lock for
+  the node checks (Linux numa_node_id and node_possible read per-CPU
+  and static state).
 - **MAP_PRIVATE file mappings:** a shared futex there is keyed by
   (mm, address) from the VMA; Linux keys a page still in the page
   cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
