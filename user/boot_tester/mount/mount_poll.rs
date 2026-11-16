@@ -8,12 +8,13 @@
 //! In a child with its own mount namespace, all mounts private.
 //!
 //! MOUNTS_OPEN_NS: a mounts file shows the namespace it was opened on.
+//! MOUNTS_REAPED: and reads it after its process is reaped.
 
 use crate::harness::{R, check, report_r};
 use crate::helpers::linux_at_least;
 use hk_syscall::{
     CLONE_NEWNS, O_RDONLY, PollFd, sys_close, sys_exit, sys_fork, sys_mkdir, sys_mount, sys_open,
-    sys_poll, sys_read, sys_rmdir, sys_umount2, sys_unshare, sys_wait4,
+    sys_pipe, sys_poll, sys_read, sys_rmdir, sys_umount2, sys_unshare, sys_wait4, sys_write,
 };
 
 const MS_REMOUNT: u64 = 32;
@@ -34,6 +35,52 @@ const DIR: &[u8] = b"/tmp/mpoll\0";
 pub fn run_tests() {
     report_r(b"MOUNT_POLL", in_child(poll_child));
     report_r(b"MOUNTS_OPEN_NS", in_child(open_ns_child));
+    report_r(b"MOUNTS_REAPED", in_child(reaped_child));
+}
+
+/// MOUNTS_REAPED: /proc/<pid>/mountinfo opened while the process lived
+/// still reads its namespace after it is reaped (Linux m_start uses the
+/// namespace and root the open took, not the task)
+fn reaped_child() -> i64 {
+    let (mut go, mut ready) = ([0i32; 2], [0i32; 2]);
+    if sys_pipe(go.as_mut_ptr()) != 0 || sys_pipe(ready.as_mut_ptr()) != 0 {
+        return 1;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        let ok = sys_unshare(CLONE_NEWNS) == 0
+            && remount(b"/\0", MS_REC | MS_PRIVATE) == 0
+            && tmpfs(DIR) == 0;
+        sys_write(ready[1] as u64, [ok as u8].as_ptr(), 1);
+        let mut b = [0u8; 1];
+        sys_read(go[0] as u64, b.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    sys_mkdir(DIR.as_ptr(), 0o755);
+    let mut b = [0u8; 1];
+    if sys_read(ready[0] as u64, b.as_mut_ptr(), 1) != 1 || b[0] != 1 {
+        return 2;
+    }
+    let mut pb = [0u8; 64];
+    let p = crate::ns::pid_path(&mut pb, b"/proc/", pid, b"/mountinfo\0");
+    let fd = sys_open(p.as_ptr(), O_RDONLY, 0) as i32;
+    sys_write(go[1] as u64, b"g".as_ptr(), 1);
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    if fd < 0 {
+        return 3;
+    }
+    let mut buf = [0u8; 16384];
+    let n = read_all(fd, &mut buf);
+    sys_close(fd as u64);
+    sys_rmdir(DIR.as_ptr());
+    if n == 0 {
+        return 4;
+    }
+    if !contains(&buf[..n], b" /tmp/mpoll ") {
+        return 5;
+    }
+    0
 }
 
 /// Whether `hay` holds `needle`

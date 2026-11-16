@@ -1644,6 +1644,12 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
     // proc_single_show: get_pid_task fails)
     let task = |p: &ProcPid| p.task().ok_or(KernelError::NoProcess);
     Ok(match g {
+        // A mounts file shows what its open took, the task gone or not
+        // (Linux mounts_open_common pins the namespace and root)
+        Gen::Pid(_, PidGen::Mnt(f)) if proc_open(file).is_some_and(|p| p.mnt.is_some()) => {
+            let p = proc_open(file).ok_or(KernelError::Io)?;
+            p.mnt.as_ref().map_or_else(Vec::new, |m| f(&m.view))
+        }
         Gen::Pid(p, g) => return pid_content(Some(file), &task(&p)?, g),
         Gen::File(ContentGenerator::Plain(g)) => g(),
         Gen::File(ContentGenerator::Opener(g)) => g(file),
@@ -1709,11 +1715,11 @@ impl FileOps for ProcfsFileOps {
         let Some(MntOpen { view, seen }) = po.mnt.as_ref() else {
             return POLLIN | POLLRDNORM;
         };
-        let ns = &view.ns;
+        let ev = &view.ns.events;
         if let Some(pt) = pt {
-            pt.poll_wait(&ns.poll);
+            pt.poll_wait(&ev.poll);
         }
-        let event = ns.event();
+        let event = ev.event();
         let mut res = POLLIN | POLLRDNORM;
         if seen.swap(event, Ordering::AcqRel) != event {
             res |= crate::io::poll::POLLERR | crate::io::poll::POLLPRI;
@@ -1746,7 +1752,7 @@ impl FileOps for ProcfsFileOps {
         let mnt = match proc_poll(file) {
             ProcPoll::Mounts => {
                 let view = mnt_view_of(&inode)?;
-                let seen = core::sync::atomic::AtomicU64::new(view.ns.event());
+                let seen = core::sync::atomic::AtomicU64::new(view.ns.events.event());
                 Some(MntOpen { view, seen })
             }
             _ => None,

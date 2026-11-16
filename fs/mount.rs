@@ -121,9 +121,10 @@ pub struct NsTree {
     touched: Touched,
 }
 
-/// The ids of namespaces changed under one hold of NAMESPACE_SEM: a
-/// few, or with `all` every mount namespace (no allocation under
-/// MOUNT_LOCK, where umount_tree records them)
+/// The ids of namespaces changed under one hold of NAMESPACE_SEM, whose
+/// pollers are woken after the unlock: a few, or with `all` every mount
+/// namespace's (spurious wakeups; each change number was bumped at the
+/// change). No allocation: umount_tree records them under MOUNT_LOCK
 #[derive(Clone, Copy)]
 struct Touched {
     ids: [u64; 4],
@@ -140,8 +141,14 @@ impl Touched {
         }
     }
 
+    /// Namespace `id` changed (Linux touch_mnt_namespace): its number
+    /// now (NS_TREE, a leaf), its wakeup after the unlock
     fn add(&mut self, id: u64) {
-        if id == 0 || id == MNT_NS_INTERNAL || self.ids[..self.n].contains(&id) {
+        if id == 0 || id == MNT_NS_INTERNAL {
+            return;
+        }
+        crate::ns::tree::mnt_bump(id);
+        if self.all || self.ids[..self.n].contains(&id) {
             return;
         }
         match self.ids.get_mut(self.n) {
@@ -153,25 +160,23 @@ impl Touched {
         }
     }
 
-    /// Touch them (Linux touch_mnt_namespace, here after the unlock:
-    /// a namespace's last reference may go here, and its put takes
-    /// NAMESPACE_SEM)
-    fn touch(self) {
-        use crate::ns::tree::{Tree, lookup, walk};
-        let tree = Tree::Type(crate::ns::CLONE_NEWNS);
-        let touch = |r: crate::ns::NsRef| {
-            if let crate::ns::NsRef::Mnt(ns) = r {
-                ns.touch();
+    /// Wake the changed namespaces' pollers (Linux touch_mnt_namespace's
+    /// wake_up_interruptible), with no lock held; only their change
+    /// numbers and pollers are referenced, never a namespace
+    fn wake(self) {
+        use crate::ns::tree::{mnt_events, mnt_events_from};
+        if !self.all {
+            for &id in &self.ids[..self.n] {
+                if let Some(e) = mnt_events(id) {
+                    e.poll.wake_all();
+                }
             }
-        };
-        if self.all {
-            walk(tree).for_each(touch);
             return;
         }
-        for &id in &self.ids[..self.n] {
-            if let Some(r) = lookup(tree, id) {
-                touch(r);
-            }
+        let mut at = 0;
+        while let Some((id, e)) = mnt_events_from(at) {
+            e.poll.wake_all();
+            at = id + 1;
         }
     }
 }
@@ -257,7 +262,7 @@ fn namespace_unlock(ns: &mut NsWrite) {
     // SAFETY: from NsWrite's drop, once; the guard is not used after
     unsafe { core::mem::ManuallyDrop::drop(&mut ns.0) };
     drop(list);
-    touched.touch();
+    touched.wake();
     let Some(head) = head.filter(|h| !h.is_empty()) else {
         return;
     };

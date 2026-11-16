@@ -146,36 +146,63 @@ pub struct MntNamespace {
     /// The user namespace that owns it (Linux mnt_namespace.user_ns),
     /// set at creation
     pub user_ns: Arc<UserNamespace>,
-    /// The number of its last change (Linux mnt_namespace.event)
-    event: core::sync::atomic::AtomicU64,
-    /// Pollers of its mount lists (Linux mnt_namespace.poll)
-    pub poll: crate::sync::waitqueue::WaitQueue,
+    /// Its change number and pollers, also listed with it in the
+    /// namespace tree so a change reaches them by id with no reference
+    /// to the namespace
+    pub events: Arc<MntEvents>,
 }
 
 /// The last mount change's number, of any namespace (Linux
-/// fs/namespace.c event, under namespace_sem; here an atomic, as the
-/// changes are numbered after the unlock)
+/// fs/namespace.c event, under namespace_sem; an atomic, as a remount
+/// changes a namespace outside it)
 static MNT_EVENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-impl MntNamespace {
-    /// Its mount table changed (Linux touch_mnt_namespace): a new
-    /// change number, and its pollers woken
-    pub fn touch(&self) {
+/// A mount namespace's change number and the pollers of its mount lists
+/// (Linux mnt_namespace.event, .poll)
+pub struct MntEvents {
+    event: core::sync::atomic::AtomicU64,
+    pub poll: crate::sync::waitqueue::WaitQueue,
+}
+
+impl MntEvents {
+    const fn new() -> Self {
+        Self {
+            event: core::sync::atomic::AtomicU64::new(0),
+            poll: crate::sync::waitqueue::WaitQueue::new(),
+        }
+    }
+
+    /// A change: a new number (Linux touch_mnt_namespace's ++event),
+    /// never below one stored before; pollers are woken by the caller
+    pub fn bump(&self) {
         use core::sync::atomic::Ordering;
         let e = MNT_EVENT.fetch_add(1, Ordering::Relaxed) + 1;
-        self.event.store(e, Ordering::Release);
-        self.poll.wake_all();
+        self.event.fetch_max(e, Ordering::AcqRel);
     }
 
     /// The number of its last change (Linux ns->event)
     pub fn event(&self) -> u64 {
         self.event.load(core::sync::atomic::Ordering::Acquire)
     }
+}
+
+impl MntNamespace {
+    /// Its mount table changed (Linux touch_mnt_namespace): a new
+    /// change number, and its pollers woken
+    pub fn touch(&self) {
+        self.events.bump();
+        self.events.poll.wake_all();
+    }
 
     /// A new empty mount namespace owned by `user_ns`, not yet in the
     /// namespace tree, or ENOMEM (Linux alloc_mnt_ns)
     fn alloc(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
-        try_arc(Self::with(NsCommon::new(inum::Inum::alloc()?), user_ns))
+        let events = try_arc(MntEvents::new())?;
+        try_arc(Self::with(
+            NsCommon::new(inum::Inum::alloc()?),
+            user_ns,
+            events,
+        ))
     }
 
     /// Create initial mount namespace (boot: failure cannot be reported)
@@ -183,6 +210,7 @@ impl MntNamespace {
         let ns = arc_nofail(Self::with(
             NsCommon::init(inum::Inum::fixed(inum::MNT_INIT)),
             INIT_USER_NS.clone(),
+            arc_nofail(MntEvents::new()),
         ));
         // Linux mnt_init -> init_mount_tree: ns_tree_add(&init_mnt_ns)
         tree::add(&NsRef::Mnt(ns.clone()), tree::Nodes::nofail());
@@ -206,13 +234,12 @@ impl MntNamespace {
     }
 
     /// An empty namespace with common part `ns`, owned by `user_ns`
-    fn with(ns: NsCommon, user_ns: Arc<UserNamespace>) -> Self {
+    fn with(ns: NsCommon, user_ns: Arc<UserNamespace>, events: Arc<MntEvents>) -> Self {
         Self {
             root: RwLock::new(None),
             ns,
             user_ns,
-            event: core::sync::atomic::AtomicU64::new(0),
-            poll: crate::sync::waitqueue::WaitQueue::new(),
+            events,
         }
     }
 
