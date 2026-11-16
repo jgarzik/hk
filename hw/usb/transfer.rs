@@ -562,45 +562,18 @@ impl TransferRing {
     }
 
     /// Where a Set TR Dequeue Pointer moves a stopped endpoint to skip
-    /// `td`: the TRB after it, with the cycle state the controller will
-    /// expect there (Linux xhci_move_dequeue_past_td). The walk starts
-    /// at the ring's dequeue; from the controller's dequeue `hw` (an
-    /// index, or None for the Link TRB) with its cycle state `hw_cycle`
-    /// on, each pass over the Link TRB toggles it. None if the walk
-    /// wraps without finding both
-    pub fn deq_past_td(
-        &self,
-        td: TdSpan,
-        hw: Option<usize>,
-        hw_cycle: bool,
-    ) -> Option<(usize, bool)> {
-        let end = self.td_end(td);
-        let mut i = self.dequeue;
-        let (mut cycle, mut hw_found, mut end_found) = (hw_cycle, false, false);
-        loop {
-            if !hw_found && hw == Some(i) {
-                hw_found = true;
-                if end_found {
-                    break;
-                }
-            }
-            if i == end {
-                end_found = true;
-            }
-            if i + 1 == self.size {
-                // Over the Link TRB, where the controller may sit
-                hw_found |= hw.is_none();
-                cycle ^= hw_found;
-            }
-            i = (i + 1) % self.size;
-            if hw_found && end_found {
-                break;
-            }
-            if i == self.dequeue {
-                return None;
-            }
-        }
-        Some((self.td_next(td), cycle))
+    /// `td`, and the cycle state the controller is to expect there
+    /// (Linux xhci_move_deq_to_next_td): the TRB after it, the first of
+    /// the next TD (its cycle bit as written) or, with none queued, the
+    /// enqueue position (the ring's cycle state)
+    pub fn deq_past_td(&self, td: TdSpan) -> (usize, bool) {
+        let to = self.td_next(td);
+        let cycle = if to == self.enqueue {
+            self.cycle
+        } else {
+            self.get(to).get_cycle()
+        };
+        (to, cycle)
     }
 
     /// A ring of `size` TRBs on the heap (never freed), at device
@@ -658,8 +631,9 @@ mod tests {
         assert_eq!(r.free_trbs(), 7);
     }
 
-    /// The new dequeue skips the TD; the cycle state toggles only for
-    /// a Link TRB passed at or after the controller's position
+    /// The new dequeue is the TRB after the TD: the next TD's first,
+    /// with its cycle bit, or the enqueue position with the ring's
+    /// cycle state
     #[test]
     fn dequeue_past_td() {
         let mut r = TransferRing::for_test(4, 0x3000);
@@ -667,20 +641,18 @@ mod tests {
         r.dequeue_past(a);
         let td = r.enqueue_td(&[trb_n(true), trb_n(false)]);
         assert_eq!((td.start, td.n), (1, 2));
-        // stopped in the TD, nothing to pass before the TRB after it
-        assert_eq!(r.deq_past_td(td, Some(1), true), Some((3, true)));
-        assert_eq!(r.deq_past_td(td, Some(2), true), Some((3, true)));
+        // nothing queued after it: the enqueue position, cycle 1
+        assert_eq!(r.deq_past_td(td), (3, true));
         r.dequeue_past(td);
         let w = r.enqueue_td(&[trb_n(true), trb_n(false)]);
         assert_eq!((w.start, w.n), (3, 2));
-        // the TRB after it lies past the Link TRB: toggled
-        assert_eq!(r.deq_past_td(w, Some(3), true), Some((1, false)));
-        // the controller on the Link TRB itself: toggled there
-        assert_eq!(r.deq_past_td(w, None, true), Some((1, false)));
-        // halted past the TD already: its cycle state as it is
-        assert_eq!(r.deq_past_td(w, Some(1), false), Some((1, false)));
-        // a position the walk never meets: none
-        assert_eq!(r.deq_past_td(w, Some(9), true), None);
+        // past the Link TRB: the ring's toggled cycle state
+        assert_eq!(r.deq_past_td(w), (1, false));
+        // a TD queued after it: its first TRB's cycle bit
+        let n = r.enqueue_td(&[trb_n(false)]);
+        assert_eq!(n.start, 1);
+        assert_eq!(r.deq_past_td(w), (1, false));
+        assert_eq!(r.deq_past_td(td), (3, true));
     }
 
     /// TD Size (xHCI 1.0): packets after this TRB; 0 on the last

@@ -907,7 +907,7 @@ impl Xhci {
         let Some(c) = cached else {
             return;
         };
-        if self.move_dequeue_past_td(st, slot, dci, c, hw).is_err()
+        if self.move_dequeue_past_td(st, slot, dci, c).is_err()
             && let Some(ep) = st.ep(slot, dci)
         {
             // Not moved past: the TD is No-ops, given back anyway
@@ -920,25 +920,19 @@ impl Xhci {
     }
 
     /// Queue a Set TR Dequeue Pointer past TD `ti` (Linux
-    /// xhci_move_dequeue_past_td): `hw` is the controller's dequeue
-    /// with its cycle state
+    /// xhci_move_deq_to_next_td): to the next TD, or the enqueue
+    /// position
     fn move_dequeue_past_td(
         &self,
         st: &mut XhciState,
         slot: u8,
         dci: u8,
         ti: usize,
-        hw: u64,
     ) -> Result<(), UsbError> {
         let ep = st.ep(slot, dci).ok_or(UsbError::NoDevice)?;
         let ring = ep.ring.as_ref().ok_or(UsbError::NoDevice)?;
         let span = ep.tds.get(ti).ok_or(UsbError::NoDevice)?.span;
-        let (to, cycle) = ring
-            .deq_past_td(span, ring.index_of(hw & !0xf), hw & 1 != 0)
-            .ok_or_else(|| {
-                printkln!("xHCI: Error: Failed finding new dequeue state");
-                UsbError::InvalidParam
-            })?;
+        let (to, cycle) = ring.deq_past_td(span);
         let addr = ring.dma_of(to) | u64::from(cycle);
         let trb = slot_trb(trb_type::SET_TR_DEQUEUE, slot, dci, addr);
         let cmd = try_arc_gfp(
