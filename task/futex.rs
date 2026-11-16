@@ -252,19 +252,24 @@ impl Drop for FutexQ {
     }
 }
 
-/// Dequeue `q` from `b` for a wakeup (Linux futex_wake_mark): its task
-/// goes on `wq` (a reference: the waiter may return at once), then
-/// `lock_ptr` is cleared, the last touch of `q`
+/// Dequeue `q` from `b` for a wakeup (Linux futex_wake_mark): a
+/// reference to its task first (the waiter may return once `lock_ptr`
+/// clears), the entry off the list, `lock_ptr` cleared (the last touch
+/// of `q`), then the task on `wq`. The claim comes after the condition
+/// store: if another queue holds the task, that queue's wakeup follows
+/// its claim, which follows our store (wake_q_add_safe's barrier), so the
+/// task sees it
 ///
 /// # Safety
 /// `q` is on `b`, whose lock the caller holds (`list`).
 unsafe fn wake_mark(b: &FutexHashBucket, list: &mut List<QAdapter>, q: &FutexQ, wq: &mut WakeQ) {
+    // SAFETY: the waiter is alive while its entry is queued
+    let t = crate::task::percpu::task_ref(unsafe { &*q.task });
     // SAFETY: see above
     unsafe { list.remove(q) };
     b.dec_waiters();
-    // SAFETY: the waiter is alive while its entry is queued
-    wq.add(unsafe { &*q.task });
     q.lock_ptr.store(core::ptr::null_mut(), Ordering::Release);
+    wq.add_safe(t);
 }
 
 /// Why a futex sleep ended
