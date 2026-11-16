@@ -2491,8 +2491,12 @@ pub struct Inode {
 
 **Inode cache** (`fs/icache.rs`, Linux inode_hashtable): vfat inodes
 (by directory-entry position) are hashed so each on-disk object has one
-`Inode`, and block devices' inodes on the bdev superblock by device
-number, so a device is found by its number (3.10). A RAM-sized table of buckets, each a `WeakList` through the
+`Inode`, block devices' inodes on the bdev superblock by device
+number, so a device is found by its number (3.10), and a tmpfs inode
+by number plus generation once a file handle of it is made
+(`insert_inode_hash_once`, checked and hashed under the lock; Linux
+shmem_encode_fh's own spin lock), so open_by_handle_at finds it
+(`ilookup5`, then its dentry under `Inode.i_dentry`). A RAM-sized table of buckets, each a `WeakList` through the
 inode's embedded `i_hash_node` (one `Weak` per entry, nothing
 allocated), all under one `INODE_HASH_LOCK` (spin Mutex, Linux
 inode_hash_lock, thread context): under it only the bucket links and

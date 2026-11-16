@@ -381,8 +381,8 @@ Safe today only because a user namespace grants no capabilities. First:
 `cgroup/cgroupfs.rs`, `fs/pseudo/nsfs.rs`
 
 Only tmpfs decodes handles; elsewhere name_to_handle_at encodes a file
-id (AT_HANDLE_FID) and is otherwise EOPNOTSUPP. Missing, as Linux has:
-- tmpfs export operations (shmem_export_ops).
+id (AT_HANDLE_FID) and is otherwise EOPNOTSUPP. Missing export
+operations, as Linux has them:
 - vfat's (fat_export_ops, FILEID_FAT_*): needs ->fh_to_parent,
   ->get_parent and ->get_name, disconnected dentries (d_obtain_alias,
   DCACHE_DISCONNECTED) and reconnect_path; with ->fh_to_parent,

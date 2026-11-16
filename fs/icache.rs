@@ -6,7 +6,9 @@
 //! here, so every lookup, open file and lock of it shares one `Inode`
 //! (Linux iget5_locked). Pseudo filesystems and ramfs never hash their
 //! inodes (their dentries hold them), like Linux new_inode without
-//! insert_inode_hash.
+//! insert_inode_hash; tmpfs hashes one by number and generation when a
+//! file handle is first made of it, for open_by_handle_at's lookup
+//! (Linux shmem_encode_fh, shmem_fh_to_dentry).
 //!
 //! An inode lives as long as someone holds an `Arc` to it: a dentry, an
 //! open file, a mapping (the writeback lists hold none). The hash
@@ -219,6 +221,21 @@ pub fn insert_inode_hash(inode: &Arc<Inode>, hashval: u64) {
     }
     let b = bucket(inode.sb.as_ptr(), hashval);
     hash_locked(&mut INODE_HASH_LOCK.lock(), b, inode, hashval);
+}
+
+/// Hash `inode` under `hashval` unless it is hashed (Linux
+/// shmem_encode_fh: inode_unhashed, then __insert_inode_hash under a
+/// lock of its own, here this lock): for a filesystem that hashes its
+/// inodes only once some lookup may need them
+pub fn insert_inode_hash_once(inode: &Arc<Inode>, hashval: u64) {
+    if inode.superblock().is_none() || inode.i_hash_node.is_linked() {
+        return;
+    }
+    let b = bucket(inode.sb.as_ptr(), hashval);
+    let mut l = INODE_HASH_LOCK.lock();
+    if !inode.i_hash_node.is_linked() {
+        hash_locked(&mut l, b, inode, hashval);
+    }
 }
 
 /// Unhash `inode` (Linux remove_inode_hash): later lookups of its
