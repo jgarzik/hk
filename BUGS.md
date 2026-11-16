@@ -413,11 +413,6 @@ capability is checked in the caller's namespace (Linux: the opener's
 
 **Location**: `ipc/mqueue.rs`
 
-POSIX message queues reject creation by an unprivileged user with
-EACCES: hk has no 01777 `/dev/mqueue`, so only root
-creates queues, where Linux lets any user. mq_attr_ok's soft caps
-(msgsize_max 8192, msg_max 10 without CAP_SYS_RESOURCE) are therefore
-unreachable today.
 There is no mqueue filesystem at all: queues live only in a kernel
 table, so they cannot be listed or read as files under /dev/mqueue
 (Linux mqueue_fs_type), and an mq_open descriptor does not open again
@@ -724,7 +719,7 @@ phase A (A0-A3).
 Phase A2 (net) remaining:
 - IPv4 reassembly (`net/inet/frag.rs` `FragTable.st`): Linux per-queue
   locks and timers, fragments in the skb rbtree, inet_frag_alloc
-  GFP_ATOMIC, ip_expire's ICMP_EXC_FRAGTIME.
+  GFP_ATOMIC.
 - ICMP global limiter (icmp_global_allow) and inet_peer on the RbTree
   with `new_gfp(ATOMIC)` nodes and Linux's GC thresholds.
 - Raw, UDP, packet and netlink socket tables still allocate under their
@@ -993,9 +988,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   reading or writing, not the one the file was opened in (Linux binds
   the file to the opener's namespace): an fd passed across namespaces
   reads and writes the other one's values.
-- **Stale comments** (as touched): "for now"/TODO markers; the
-  `ns/mod.rs` `sys_setns` doc says EBADF for a non-namespace fd, the
-  code returns EINVAL.
+- **Stale comments** (as touched): "for now"/TODO markers.
 
 ## Review gaps, by phase
 
