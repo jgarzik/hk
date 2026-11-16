@@ -74,7 +74,7 @@ impl PidNamespace {
     fn new_init() -> Arc<Self> {
         // Boot: failure cannot be reported. Linux init_pid_ns: its
         // child_reaper is set from the start
-        arc_nofail(Self {
+        let ns = arc_nofail(Self {
             level: 0,
             ns: super::NsCommon::init(super::inum::Inum::fixed(super::inum::PID_INIT)),
             user_ns: super::INIT_USER_NS.clone(),
@@ -85,7 +85,10 @@ impl PidNamespace {
             reboot: TableCell::new(0),
             bacct: crate::task::acct::Acct::default(),
             memfd_noexec: core::sync::atomic::AtomicU8::new(0),
-        })
+        });
+        // Linux pid_namespaces_init: ns_tree_add(&init_pid_ns)
+        super::tree::add(&super::NsRef::Pid(ns.clone()), super::tree::Nodes::nofail());
+        ns
     }
 
     /// The vm.memfd_noexec scope in force: the highest set here or in
@@ -110,8 +113,9 @@ impl PidNamespace {
         if parent.level >= MAX_PID_NS_LEVEL {
             return Err(KernelError::NoSpace);
         }
+        let nodes = super::tree::Nodes::new()?;
         let inum = super::inum::Inum::alloc()?;
-        try_arc(Self {
+        let ns = try_arc(Self {
             level: parent.level + 1,
             ns: super::NsCommon::new(inum),
             user_ns: user_ns.clone(),
@@ -122,7 +126,10 @@ impl PidNamespace {
             reboot: TableCell::new(0),
             bacct: crate::task::acct::Acct::default(),
             memfd_noexec: core::sync::atomic::AtomicU8::new(parent.memfd_noexec()),
-        })
+        })?;
+        // Linux create_pid_namespace: ns_tree_add
+        super::tree::add(&super::NsRef::Pid(ns.clone()), nodes);
+        Ok(ns)
     }
 }
 

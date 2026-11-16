@@ -156,7 +156,7 @@ impl UserNamespace {
     /// Create the initial (root) user namespace
     fn new_init() -> Arc<Self> {
         // Boot: failure cannot be reported
-        arc_nofail(Self {
+        let ns = arc_nofail(Self {
             uid_map: UidGidMap::new_identity(),
             gid_map: UidGidMap::new_identity(),
             level: 0,
@@ -164,7 +164,13 @@ impl UserNamespace {
             owner: 0,
             group: 0,
             ns: super::NsCommon::init(super::inum::Inum::fixed(super::inum::USER_INIT)),
-        })
+        });
+        // Linux user_namespaces_init: ns_tree_add(&init_user_ns)
+        super::tree::add(
+            &super::NsRef::User(ns.clone()),
+            super::tree::Nodes::nofail(),
+        );
+        ns
     }
 
     /// Clone this namespace (create a child namespace)
@@ -186,9 +192,10 @@ impl UserNamespace {
 
         // Get creator's credentials
         let cred = percpu::current_cred();
+        let nodes = super::tree::Nodes::new()?;
         let inum = super::inum::Inum::alloc()?;
 
-        try_arc(Self {
+        let ns = try_arc(Self {
             uid_map: UidGidMap::default(),
             gid_map: UidGidMap::default(),
             level: parent.level + 1,
@@ -196,7 +203,10 @@ impl UserNamespace {
             owner: cred.uid,
             group: cred.gid,
             ns: super::NsCommon::new(inum),
-        })
+        })?;
+        // Linux create_user_ns: ns_tree_add once made
+        super::tree::add(&super::NsRef::User(ns.clone()), nodes);
+        Ok(ns)
     }
 
     /// Check if this namespace is an ancestor of another

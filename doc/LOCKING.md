@@ -546,9 +546,8 @@ VFS locks (detailed order):
                    the write guard's drop is namespace_unlock: an
                    umount's mountpoints and, after a grace period,
                    references released with nothing held)
-        → ns::MNT_NS_TREE (spin leaf; Linux mnt_ns_tree_lock: a mount
-                   namespace added once made, removed at its end;
-                   graft's owner check under NAMESPACE_SEM)
+        → ns::tree NS_TREE (IrqSpinlock leaf, 3.4; graft's
+                   mount namespace owner check under NAMESPACE_SEM)
         ↓
     SuperBlock.s_umount (sync::RwSem; write for remount, for a new
                    superblock from sget to its mounter's unlock (its
@@ -2946,7 +2945,7 @@ of its namespace under MOUNT_LOCK.
 | `Mount.mnt_list` | `util::list::Link` (no lock) | On an umount's list (Linux mnt_list: `umount_tree`'s set, `propagate_umount`'s candidates and committed mounts, `NsTree.unmounted`), each entry a reference: the first three local to `umount_tree` under NAMESPACE_SEM write and MOUNT_LOCK write, the unmounted owned by NAMESPACE_SEM and put by namespace_unlock a grace period after it lets go |
 | `Mount.mnt_cover`, `Mount.mnt_covers` | `LockedBy<Option<Arc<MntCover>>, MntHash>`, `RcuHList<CoverA, MntHash>` | A mount's preallocated cover and the covers its unmounted submounts left (Linux mnt_cover, mnt_covers): umount_tree's `leave_cover` takes a locked mount's cover and links it on its unmounted parent's list under `MOUNT_LOCK` write, the cover counting the mountpoint (`m_count`); `__lookup_mnt` walks the list under an RCU read guard (the caller checks MOUNT_LOCK's sequence, or holds its locking read) and reads the dentry's inode (`d_lock`, under MOUNT_LOCK as attach's DCACHE_MOUNTED) to pick the stand-in; the parent's teardown takes them all off in one `MOUNT_LOCK` write section (Linux mntput_no_expire's drop_cover), frees each a grace period later (`kfree_rcu`) and drops a last mountpoint after the unlock |
 | `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes, and is held around every change of the tree's links (`attach_mnt`, `detach_mnt`, and `umount_tree` whole, its caller holding it across, as Linux do_umount, put_mnt_ns; with NAMESPACE_SEM write it owns `mnt_mounts`); under NAMESPACE_SEM and s_umount; under it only `SuperBlock.s_mounts`, `pnode::GROUP_IDA` (bulk_make_private), RENAME_LOCK (a raced d_path pass, path_is_under's is_subdir) and in attach/detach/umount the mountpoint dentry's `d_lock` (DCACHE_MOUNTED, a cover's inode); with NAMESPACE_SEM write it owns each mount's `mnt_parent`/`mnt_mountpoint`; it owns the mount and mountpoint hashes (below); `MountRef::legitimize`'s locking read takes nothing under it. Helpers that need it take its `&mut MntHash` (`umount_tree`, `propagate_umount`, `propagate_mount_busy`, `propagate_mount_unlock`, `hide_mnt`, `change_mountpoint`, `umount_mnt`, `Mount::mark_in`), so a caller that does not hold it does not compile. No mount, mountpoint or dentry is dropped under it, and no reference put that could be the last (`MountRef::put_held` only) (`make_rdonly` releases its references, `detach_mnt` the parent's reference to the mount, its parent link's `Weak`, the mountpoint and its dentry after the unlock; `umount_tree` leaves its references and mountpoints to namespace_unlock, `NsTree.unmounted` and `NsTree.ex_mountpoints`, and drops parent links' `Weak`s, at most a free; the mount hash's reference goes through `put_rcu`). The sequence is read lock-free by `lookup_mnt`, `choose_mountpoint`, `d_path` and scoped walks (3.3 Path Traversal) |
-| `ns::MNT_NS_TREE` | spin `Mutex<RbTree>` leaf | Live mount namespaces by id, each with a `Weak` of its owning user namespace and one of itself (Linux mnt_ns_tree, mnt_ns_tree_lock): a namespace is added once made (its node allocated first), removed first thing in its drop (the node freed after the unlock); `mnt_ns_same_owner` compares two namespaces' owners under it, from graft under NAMESPACE_SEM write, before MOUNT_LOCK; `mnt_ns_adjoined` (NS_MNT_GET_NEXT/PREV) clones a neighbour's `Weak` under it and upgrades it after the unlock, so no last reference to a namespace goes under it; nothing is taken under it |
+| `ns::tree` `NS_TREE` (3.4) | `IrqSpinlock` leaf | Mount namespaces by id are its mount tree (Linux mnt_ns_tree): a mount namespace leaves it first thing in its drop; `mnt_ns_same_owner` compares two namespaces' owner ids under it with no reference taken, from graft under NAMESPACE_SEM write, before MOUNT_LOCK; `mnt_ns_adjoined` (NS_MNT_GET_NEXT/PREV) is `tree::adjoined` |
 | `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
 | `Mount.mnt_ns` | `AtomicU64` | Id of the mount's namespace (`MntNamespace.id`, never reused), 0 for none, `MNT_NS_INTERNAL` for a kernel mount (Linux mnt_ns, MNT_NS_INTERNAL): written only under NAMESPACE_SEM write (commit_tree when a tree is grafted or propagated, the namespace root, a namespace copy; umount and `put_mnt_ns` clear it, a grace period before the tree's references are put), or once before a kernel mount is shared; read lock-free by a put's fast path under an RCU read guard, read by `check_mnt` under NAMESPACE_SEM; can_umount and remount read it first without, as Linux (umount repeats it under the lock) |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks. SB_BORN, SB_DYING (under s_umount write), SB_DEAD (under `SB_LOCK`): set once each, release, read acquire (Linux super_wake / super_flags) |
@@ -3552,7 +3551,7 @@ Fallback:** if scheduling is not yet enabled, page locking spins.
 
 ### 3.4 Namespaces
 
-**Location:** `ns/mod.rs`, `ns/uts.rs`, `ns/common.rs`, `ns/setns.rs`,
+**Location:** `ns/mod.rs`, `ns/uts.rs`, `ns/common.rs`, `ns/tree.rs`, `ns/setns.rs`,
 `fs/pseudo/nsfs.rs`
 
 The namespace subsystem follows Linux's `nsproxy` pattern, where each task has
@@ -3570,6 +3569,8 @@ tasks can share the same `NsProxy` (e.g., threads created without CLONE_NEW* fla
 | `UserNamespace.gid_map.extents` | `RwLock<Vec<UidGidExtent>>` | GID mapping extents |
 | `PidNamespace.alloc` | `AtomicU32` changed under PIDMAP_LOCK | Pid count, NS_ADDING, NS_INIT (3.1.1, "A pid namespace's init") |
 | `PidNamespace.reaper`, `reboot` | `TableCell` (TASKLIST) | Child reaper, reboot(2) status (3.1.1) |
+| `ns::tree` `NS_TREE` | `IrqSpinlock<Trees>` leaf, global | Every namespace of every type by `ns_id` (Linux ns_tree_lock, a seqlock, and ns_unified_root, the per-type roots, each user namespace's ns_owner_root, here one tree keyed by (owner id, id)): each entry a `Weak` (a network namespace's passive) and its owner's id. Global as Linux's: a lookup by id must see every namespace. `tree::add` lists a namespace once made whole, its three nodes allocated before it is made (`tree::Nodes`: creation fails with ENOMEM, the insert cannot); `tree::remove` takes it out where its last reference goes (`NsCommon`'s drop; a network namespace's `cleanup_net` under NET_NAMESPACE_LIST write, a mount namespace's drop before its unmount), so in any context, hence IRQ-safe; the nodes are freed after the unlock. Lookups and walks (`lookup`, `lookup_at`, `adjoined`, `walk`) upgrade a `Weak` under it (an atomic) and check the namespace (`Strong::get`: a network namespace's active reference) or drop the reference only after the unlock. Under it nothing is allocated, freed or dropped and no lock taken: innermost, below any lock a namespace's last put may run under |
+| `NsCommon.linked` | `AtomicBool` under `NS_TREE` | The namespace is in the tree (Linux !RB_EMPTY_NODE(ns_tree_node)): set by `tree::add`, cleared by `tree::remove`, both under `NS_TREE`; `NsCommon`'s drop reads it with exclusive access and takes the lock only if set |
 | `NsCommon.stashed` | `AtomicPtr<Dentry>` (no lock) | The namespace's nsfs dentry while one lives, no reference (Linux ns->stashed): set by a compare-exchange from null (`ns_get_path`; the loser drops its own dentry and retries), cleared by a compare-exchange from that dentry in its kill (`DentryOps.d_prune`, Linux ns_prune_dentry) before its memory's grace period starts; a reader loads it and takes a reference under an RCU read guard (`DentryRef::try_get`, Linux lockref_get_not_dead) |
 
 `CgroupNamespace`, and a `PidNamespace`'s level, parent and number
@@ -3609,6 +3610,9 @@ bitmap, are immutable after creation (no lock).
 Task.alloc_lock (clone the Arc<NsProxy> out, release; none for the
     task itself) then, with nothing held: UtsNamespace.name / MntNamespace.root /
     UidGidMap.extents (leaves)
+Any lock (a namespace's last put, NET_NAMESPACE_LIST write in
+    cleanup_net, NAMESPACE_SEM in graft) → ns::tree NS_TREE
+    (IrqSpinlock, innermost leaf)
 ```
 
 #### Syscall Patterns

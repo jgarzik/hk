@@ -152,8 +152,9 @@ impl IpcNamespace {
     /// Creates a new empty namespace with same limits.
     /// IPC objects are NOT copied - new namespace starts empty.
     pub fn clone_ns(&self, user_ns: &Arc<crate::ns::UserNamespace>) -> KernelResult<Arc<Self>> {
+        let nodes = crate::ns::tree::Nodes::new()?;
         let inum = crate::ns::inum::Inum::alloc()?;
-        try_arc(Self {
+        let ns = try_arc(Self {
             sem_ids: IpcIds::new(),
             msg_ids: IpcIds::new(),
             shm_ids: IpcIds::new(),
@@ -170,7 +171,10 @@ impl IpcNamespace {
             shm_ctlmni: self.shm_ctlmni,
             ns: crate::ns::NsCommon::new(inum),
             user_ns: user_ns.clone(),
-        })
+        })?;
+        // Linux copy_ipcs: ns_tree_add_raw once made
+        crate::ns::tree::add(&crate::ns::NsRef::Ipc(ns.clone()), nodes);
+        Ok(ns)
     }
 
     /// Get semaphore IDs table
@@ -193,8 +197,15 @@ impl IpcNamespace {
 }
 
 /// Initial (root) IPC namespace
-pub static INIT_IPC_NS: Lazy<Arc<IpcNamespace>> =
-    Lazy::new(|| arc_nofail(IpcNamespace::new_init()));
+pub static INIT_IPC_NS: Lazy<Arc<IpcNamespace>> = Lazy::new(|| {
+    let ns = arc_nofail(IpcNamespace::new_init());
+    // Linux ipc_init: ns_tree_add(&init_ipc_ns)
+    crate::ns::tree::add(
+        &crate::ns::NsRef::Ipc(ns.clone()),
+        crate::ns::tree::Nodes::nofail(),
+    );
+    ns
+});
 
 // ============================================================================
 // User-space ABI structures (must match Linux exactly)

@@ -6,11 +6,12 @@
 //! Locking: `stashed` is an atomic pointer, set by a compare-exchange
 //! and cleared the same way by the dentry's kill (`fs::nsfs`); a reader
 //! takes a reference under an RCU read guard (Linux ns->stashed with
-//! lockref_get_not_dead).
+//! lockref_get_not_dead). `linked` is changed under the namespace
+//! tree's lock (`ns::tree`).
 
 use alloc::sync::Arc;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use super::inum::Inum;
 use super::{
@@ -38,6 +39,11 @@ pub struct NsCommon {
     /// ns->stashed): every open of a /proc/<pid>/ns link while it does
     /// gets that dentry, cleared by its kill (`fs::nsfs`)
     pub(crate) stashed: AtomicPtr<Dentry>,
+    /// It is in the namespace tree (Linux !RB_EMPTY_NODE of
+    /// ns_tree_node, ns_tree_active): set by `tree::add`, cleared by
+    /// `tree::remove`, both under its lock; an atomic only because it
+    /// lives here, outside the lock's data, as Linux's node does
+    pub(super) linked: AtomicBool,
 }
 
 impl NsCommon {
@@ -60,12 +66,25 @@ impl NsCommon {
             ns_id,
             inum,
             stashed: AtomicPtr::new(null_mut()),
+            linked: AtomicBool::new(false),
         }
     }
 
     /// Its inode number
     pub fn inum(&self) -> u32 {
         self.inum.get()
+    }
+}
+
+impl Drop for NsCommon {
+    /// Linux ns_tree_remove in each type's free path: the namespace
+    /// leaves the tree as its memory goes, if it has not already (a
+    /// network namespace leaves at its teardown, a mount namespace
+    /// before its unmount); any context
+    fn drop(&mut self) {
+        if *self.linked.get_mut() {
+            super::tree::remove(self);
+        }
     }
 }
 
@@ -142,6 +161,21 @@ impl NsRef {
             Self::User(n) => return n.parent.clone(),
             Self::Cgroup(n) => n.user_ns.clone(),
         })
+    }
+
+    /// A reference that does not keep it alive, for the namespace tree
+    /// (a network namespace's passive one)
+    pub(super) fn downgrade(&self) -> super::tree::NsWeak {
+        use super::tree::NsWeak;
+        match self {
+            Self::Mnt(n) => NsWeak::Mnt(Arc::downgrade(n)),
+            Self::Uts(n) => NsWeak::Uts(Arc::downgrade(n)),
+            Self::Ipc(n) => NsWeak::Ipc(Arc::downgrade(n)),
+            Self::Net(n) => NsWeak::Net(Arc::downgrade(n.passive())),
+            Self::Pid(n) => NsWeak::Pid(Arc::downgrade(n)),
+            Self::User(n) => NsWeak::User(Arc::downgrade(n)),
+            Self::Cgroup(n) => NsWeak::Cgroup(Arc::downgrade(n)),
+        }
     }
 
     /// The same namespace
