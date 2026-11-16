@@ -1398,7 +1398,10 @@ by anyone (`flags` = Linux PF_*, `thread_flags` = TIF_*, `cpu`,
 and the other counters; utime/stime/last_run_ns/in_kernel are written
 only on the task's own CPU with interrupts off (its syscall entry and
 exit, its context switches, the tick) inside the `acct_seq` sequence
-count, which readers on other CPUs retry on); `cred` (below); the
+count, which readers on other CPUs retry on; `prev_cputime`, in the
+task and in its SignalStruct, is an IrqSpinlock leaf (Linux
+prev_cputime.lock) held only by `cputime_adjust` (times, getrusage,
+wait's rusage, /proc/<pid>/stat), under TASKLIST or not); `cred` (below); the
 alloc_lock fields; and
 the rest, `TaskInner`, in a `TableCell` (`sync::LockedBy` owned by
 `GlobalTaskTable`): a borrow of the locked table is the key, `&table`

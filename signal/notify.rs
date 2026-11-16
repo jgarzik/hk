@@ -18,7 +18,9 @@ fn chld_info(
 ) -> Option<SigInfo> {
     let v = table.view(t)?;
     let uid = v.cred_arc().uid;
-    let (utime, stime) = v.task.cputime(crate::time::monotonic_ns());
+    // Raw samples (Linux task_cputime)
+    let c = crate::task::cputime::task_cputime(v.task);
+    let (utime, stime) = (c.utime, c.stime);
     let fields = SigFields::Chld {
         pid: crate::task::pid::nr_ns(t.tid(), ns) as i32,
         uid,
@@ -298,7 +300,7 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
 
 /// Zombie `tid`'s notice info, read under TASKLIST: its pid (as the
 /// receiver's namespace `ns` numbers it: Linux do_notify_parent), uid, wait
-/// status, and its CPU times (a leader's: its group's)
+/// status, and its CPU times with its group's exited threads
 fn chld_notice(table: &GlobalTaskTable, tid: Tid, ns: &crate::ns::PidNamespace) -> Option<SigInfo> {
     let t = table.get(tid)?;
     let crate::task::TaskState::Zombie(own) = t.state() else {
@@ -308,11 +310,13 @@ fn chld_notice(table: &GlobalTaskTable, tid: Tid, ns: &crate::ns::PidNamespace) 
         Some(super::GroupExit::Exit(code)) => code,
         _ => own,
     };
-    let (utime, stime) = if t.leader() {
-        crate::task::percpu::group_times(table, t.task.pid)
-    } else {
-        t.task.cputime(crate::time::monotonic_ns())
-    };
+    // Its raw samples and its group's exited threads' (Linux
+    // do_notify_parent: task_cputime + signal->utime/stime)
+    let mut c = crate::task::cputime::task_cputime(t.task);
+    if let Some(s) = t.signal() {
+        c = c + s.dead_times();
+    }
+    let (utime, stime) = (c.utime, c.stime);
     let (code, st) = chld_code(status);
     let fields = SigFields::Chld {
         pid: crate::task::pid::nr_ns(tid, ns) as i32,

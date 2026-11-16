@@ -1927,10 +1927,11 @@ fn zombie_report(table: &GlobalTaskTable, z: &TaskView<'_>) -> WaitReport {
         TaskState::Zombie(s) => s,
         _ => 0,
     };
+    // Linux wait_task_zombie: thread_group_cputime_adjusted
     let (mut utime, mut stime) = if z.leader {
-        group_times(table, z.task.pid)
+        crate::task::cputime::thread_group_cputime_adjusted(table, z.task.pid)
     } else {
-        z.task.cputime(crate::time::monotonic_ns())
+        crate::task::cputime::task_cputime_adjusted(z.task)
     };
     if z.leader
         && let Some(s) = &z.signal
@@ -4739,26 +4740,20 @@ pub fn lookup_task_rt_priority(t: &Task) -> Option<i32> {
     table.view(t).map(|t| i32::from(t.task.se.rt_priority()))
 }
 
-/// Task `t`'s (utime_ns, stime_ns); (0, 0) once it is reaped
+/// Task `t`'s (utime_ns, stime_ns), adjusted (Linux
+/// task_cputime_adjusted); (0, 0) once it is reaped
 pub fn get_task_times(t: &Task) -> (u64, u64) {
     let table = TASKLIST.read();
-    let now = crate::time::monotonic_ns();
-    table.view(t).map_or((0, 0), |t| t.task.cputime(now))
+    table.view(t).map_or((0, 0), |t| {
+        crate::task::cputime::task_cputime_adjusted(t.task)
+    })
 }
 
-/// Get aggregate CPU times for a process (all threads)
-///
-/// Returns (utime_ns, stime_ns) summed across all threads in the process.
-/// Returns (0, 0) if no threads are found.
+/// Process `pid`'s (utime_ns, stime_ns), adjusted (Linux
+/// thread_group_cputime_adjusted)
 pub fn get_process_times(pid: Pid) -> (u64, u64) {
     let table = TASKLIST.read();
-    group_times(&table, pid)
-}
-
-/// Thread group `pid`'s (utime, stime) (`cputime::thread_group_cputime`)
-pub fn group_times(table: &GlobalTaskTable, pid: Pid) -> (u64, u64) {
-    let t = crate::task::cputime::thread_group_cputime(table, pid);
-    (t.utime, t.stime)
+    crate::task::cputime::thread_group_cputime_adjusted(&table, pid)
 }
 
 /// User and system time, ns
@@ -4769,7 +4764,7 @@ pub type Times = (u64, u64);
 /// stopped, continued or ptrace-stopped child, wait_task_stopped and
 /// wait_task_continued)
 pub fn rusage_both(table: &GlobalTaskTable, pid: Pid) -> Times {
-    let (u, s) = group_times(table, pid);
+    let (u, s) = crate::task::cputime::thread_group_cputime_adjusted(table, pid);
     let sig = table.threads(pid).find_map(|t| t.signal.clone());
     let (cu, cs) = sig.map_or((0, 0), |g| g.child_times());
     (u.saturating_add(cu), s.saturating_add(cs))

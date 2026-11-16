@@ -2540,6 +2540,9 @@ pub struct SignalStruct {
     child_times: [AtomicU64; 2],
     /// Process CPU timers' state (Linux signal->cputimer)
     pub cputimer: crate::time::cpu_timer::GroupCputimer,
+    /// The group's utime/stime last reported, adjusted (Linux
+    /// signal->prev_cputime)
+    pub prev_cputime: crate::task::cputime::PrevCputime,
     /// The group's pending signals (Linux signal->shared_pending, and
     /// curr_target): spin, under the receiving thread's Task.sig
     shared: Mutex<GroupPending>,
@@ -2700,6 +2703,7 @@ impl SignalStruct {
             dead_times: [const { AtomicU64::new(0) }; 3],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
             cputimer: crate::time::cpu_timer::GroupCputimer::new(),
+            prev_cputime: crate::task::cputime::PrevCputime::new(),
             shared: Mutex::new(GroupPending::new()),
             jobctl: Mutex::new(stop::GroupStop::new()),
             subreaper: crate::task::TableCell::new(false),

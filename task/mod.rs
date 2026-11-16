@@ -841,6 +841,8 @@ pub struct Task {
     pub utime: AtomicU64,
     /// System CPU time consumed (nanoseconds)
     pub stime: AtomicU64,
+    /// utime/stime last reported, adjusted (Linux p->prev_cputime)
+    pub prev_cputime: cputime::PrevCputime,
     /// When the task last started running or crossed the user/kernel
     /// boundary (for the utime/stime split)
     pub last_run_ns: AtomicU64,
@@ -1628,6 +1630,7 @@ impl Task {
             last_run_ns: AtomicU64::new(now),
             in_kernel: AtomicBool::new(kind == TaskKind::KernelThread),
             acct_seq: AtomicU32::new(0),
+            prev_cputime: cputime::PrevCputime::new(),
             acct_running: AtomicBool::new(false),
             cpu_next: [const { AtomicU64::new(crate::time::cpu_timer::NONE) }; 3],
             cpu_group: spin::Once::new(),
@@ -1698,6 +1701,7 @@ impl Task {
             last_run_ns: AtomicU64::new(0),
             in_kernel: AtomicBool::new(true),
             acct_seq: AtomicU32::new(0),
+            prev_cputime: cputime::PrevCputime::new(),
             acct_running: AtomicBool::new(false),
             cpu_next: [const { AtomicU64::new(crate::time::cpu_timer::NONE) }; 3],
             cpu_group: spin::Once::new(),

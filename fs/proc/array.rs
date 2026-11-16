@@ -133,8 +133,9 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
             s.jobctl & crate::signal::jobctl::STOPPED != 0,
         )
     };
-    // The whole thread group's CPU time (Linux do_task_stat with whole)
-    let (utime, stime) = crate::task::percpu::group_times(&table, pid);
+    // The whole thread group's CPU time (Linux do_task_stat with whole:
+    // thread_group_cputime_adjusted)
+    let (utime, stime) = crate::task::cputime::thread_group_cputime_adjusted(&table, pid);
     // One setting of the scheduling parameters (one load)
     let params = t.task.se.params();
     Some(Snap {
