@@ -50,7 +50,6 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::sync::Arc;
 
-use crate::cpu::PerCpu;
 use crate::sync::IrqSpinlock;
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
@@ -178,11 +177,12 @@ pub struct BlkMq {
     poll_rqs: AtomicUsize,
 }
 
-/// The block layer's workqueues: one worker per CPU, high priority
-/// (Linux kblockd_workqueue: per-CPU, WQ_MEM_RECLAIM | WQ_HIGHPRI, the
-/// highpri pool's nice -20 workers)
-static KBLOCKD: PerCpu<Workqueue> =
-    crate::percpu![Workqueue::new("kblockd", WQ_MEM_RECLAIM | WQ_HIGHPRI)];
+crate::percpu! {
+    /// The block layer's workqueues: one worker per CPU, high priority
+    /// (Linux kblockd_workqueue: per-CPU, WQ_MEM_RECLAIM | WQ_HIGHPRI, the
+    /// highpri pool's nice -20 workers)
+    static KBLOCKD: Workqueue = Workqueue::new("kblockd", WQ_MEM_RECLAIM | WQ_HIGHPRI);
+}
 
 /// Start each CPU's kblockd worker, bound to it (Linux blk_dev_init);
 /// before any disk

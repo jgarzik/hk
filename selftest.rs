@@ -310,8 +310,10 @@ fn printk_hardirq() -> bool {
 
 /// Calls each stress thread makes to every other CPU
 const IPI_ROUNDS: u64 = 300;
-/// Calls run on each CPU by the stress test
-static IPI_RECV: crate::cpu::PerCpu<AtomicU64> = crate::percpu![AtomicU64::new(0)];
+crate::percpu! {
+    /// Calls run on each CPU by the stress test
+    static IPI_RECV: AtomicU64 = AtomicU64::new(0);
+}
 /// Stress threads finished
 static IPI_DONE: AtomicU64 = AtomicU64::new(0);
 

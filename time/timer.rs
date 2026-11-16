@@ -38,7 +38,6 @@ use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use crate::cpu::PerCpu;
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{TICK_NS, get_ticks};
@@ -366,8 +365,10 @@ pub fn forward(expires: u64, interval: u64, now: u64) -> (u64, Option<u64>) {
     (missed, next)
 }
 
-/// Per CPU: [HARD, SOFT]
-static BASES: PerCpu<[TimerBase; 2]> = crate::percpu![[TimerBase::new(), TimerBase::new()]];
+crate::percpu! {
+    /// Per CPU: [HARD, SOFT]
+    static BASES: [TimerBase; 2] = [TimerBase::new(), TimerBase::new()];
+}
 
 fn base_of(cpu: u32, flags: u8) -> &'static TimerBase {
     &BASES.get(cpu)[if flags & TIMER_HARD != 0 { 0 } else { 1 }]

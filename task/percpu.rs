@@ -19,7 +19,6 @@ use alloc::vec::Vec;
 use crate::arch::ArchPageTable;
 use crate::arch::CurrentArch;
 use crate::arch::{ContextOps, CpuOps, FrameAlloc, PerCpuOps, SchedArch, UserModeOps, UserRegs};
-use crate::cpu::PerCpu;
 use crate::ns::Namespace;
 use crate::printkln;
 use crate::signal::notify::{Told, Zombie, notify};
@@ -559,10 +558,12 @@ impl PerCpuScheduler {
     }
 }
 
-/// Global per-CPU scheduler array
-///
-/// Each CPU accesses its own entry by CPU ID.
-static PERCPU_SCHEDS: PerCpu<PerCpuScheduler> = crate::percpu![PerCpuScheduler::new()];
+crate::percpu! {
+    /// Global per-CPU scheduler array
+    ///
+    /// Each CPU accesses its own entry by CPU ID.
+    static PERCPU_SCHEDS: PerCpuScheduler = PerCpuScheduler::new();
+}
 
 /// A reference to a task (Linux struct task_struct *, pinned by a
 /// reference count)

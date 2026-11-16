@@ -682,6 +682,9 @@ impl VfsInitOps for Aarch64Arch {
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
+    // SAFETY: first thing on the boot CPU: nothing used a per-CPU
+    // variable yet
+    unsafe { crate::cpu::setup_boot_area() };
     // Initialize serial FIRST before anything else
     serial::init();
 

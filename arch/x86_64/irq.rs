@@ -30,7 +30,6 @@ use core::sync::atomic::{AtomicU16, Ordering};
 
 use super::{X86_64Arch, pic};
 use crate::arch::IrqChipOps;
-use crate::cpu::PerCpu;
 use crate::irq::MsiMsg;
 use crate::sync::spin::Mutex;
 use crate::util::cpumask::NR_CPUS;
@@ -49,9 +48,10 @@ const NR_MSI: usize = 240;
 /// SDM 11.11.1)
 const MSI_ADDR_BASE: u64 = 0xfee0_0000;
 
-/// Per CPU, the line on each device vector (0: none)
-static VECTOR_IRQ: PerCpu<[AtomicU16; NR_DEV_VECTORS]> =
-    crate::percpu![[const { AtomicU16::new(0) }; NR_DEV_VECTORS]];
+crate::percpu! {
+    /// Per CPU, the line on each device vector (0: none)
+    static VECTOR_IRQ: [AtomicU16; NR_DEV_VECTORS] = [const { AtomicU16::new(0) }; NR_DEV_VECTORS];
+}
 
 /// Vectors in use per CPU and each MSI line's (CPU, vector index)
 /// (Linux irq_matrix)

@@ -5165,6 +5165,18 @@ circular wait conditions.
 
 ### 4.4 Per-CPU Data Structures
 
+Per-CPU variables (`percpu!`, `cpu::PerCpu`, Linux DEFINE_PER_CPU) live
+in per-CPU areas: the `.data..percpu` template is the pristine image,
+each possible CPU's area a copy of it (the boot CPU's in .bss, made
+first thing at boot; the others' by `cpu::setup_areas`, before any AP
+starts), reached at `per_cpu_offset(cpu)` from the template (Linux
+per_cpu_ptr). One CPU's variables sit together, so two CPUs never share
+a cache line through them. The offsets are set once before the CPUs
+that read them exist (Release on the possible count). State that names
+its CPU is set in a new area before it is published (`cpu::prepare_cpu`,
+Linux's CPU prepare states: `HrBase.cpu`); nothing derives a CPU from a
+copy's address.
+
 The scheduler uses per-CPU run queues: a CPU's own scheduling takes only
 its own lock; a wakeup takes the target's (3.1).
 
@@ -5595,7 +5607,6 @@ Features present in Linux but not yet implemented in hk:
 | Threaded IRQs | IRQ handlers in thread context | Not implemented | All IRQs run in interrupt context |
 | lockdep | Runtime deadlock detection | Lockdep-lite (1.5): spin-lock order and sleep-in-atomic checks, `make check LOCKDEP=1` | No sleeping-lock order graph, no IRQ-state classes per lock |
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
-| Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
 | Lazy TLB, PCID, global pages | kernel threads keep the last user mm; PCID tags; PGE | Kernel threads load the kernel table; every CR3 write flushes all | More flushes on context switch (x86) |
 | PTE locks | `spinlock_t` in the page-table page (ptdesc) | A lock word in the table's struct page (lockdep-tracked as one class) | No owner or fairness (test-and-set) |
 

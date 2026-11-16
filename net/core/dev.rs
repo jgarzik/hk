@@ -50,7 +50,6 @@ use crate::util::list::{ArcList, Link};
 use crate::util::rculist::RcuList;
 use spin::Once;
 
-use crate::cpu::PerCpu;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{self, PktType};
 use crate::net::skb::{SkBuff, SkbQueue};
@@ -335,7 +334,9 @@ impl Softnet {
     }
 }
 
-static SOFTNET: PerCpu<Softnet> = crate::percpu![Softnet::new()];
+crate::percpu! {
+    static SOFTNET: Softnet = Softnet::new();
+}
 
 static SOFTNET_STARTED: AtomicU32 = AtomicU32::new(0);
 

@@ -33,9 +33,10 @@
 
 use core::marker::PhantomPinned;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
-use crate::cpu::PerCpu;
 use crate::sync::{IrqSpinlock, IrqSpinlockGuard};
 use crate::task::percpu::TICK_NS;
 use crate::util::list::{Link, List};
@@ -309,6 +310,10 @@ impl HrQueues {
 pub struct HrBase {
     q: IrqSpinlock<HrQueues>,
     running: AtomicPtr<HrTimer>,
+    /// Its CPU (Linux hrtimer_cpu_base.cpu): 0 in the template, set by
+    /// `prepare_cpu` in each other CPU's area before the area is
+    /// published (cpu::setup_areas); read only after
+    cpu: AtomicU32,
 }
 
 impl HrBase {
@@ -319,6 +324,7 @@ impl HrBase {
                 real: List::new(),
             }),
             running: AtomicPtr::new(core::ptr::null_mut()),
+            cpu: AtomicU32::new(0),
         }
     }
 
@@ -354,21 +360,31 @@ impl HrBase {
     }
 }
 
-/// Per CPU: [HARD, SOFT]
-static BASES: PerCpu<[HrBase; 2]> = crate::percpu![[HrBase::new(), HrBase::new()]];
+crate::percpu! {
+    /// Per CPU: [HARD, SOFT]
+    static BASES: [HrBase; 2] = [HrBase::new(), HrBase::new()];
+}
 
-/// Per CPU: due SOFT timers were handed to `ktimers/N`, which has not
-/// run them yet (Linux cpu_base->softirq_activated): the clock event
-/// is programmed from the HARD timers only meanwhile, or the expired
-/// SOFT expiry would make it fire again at once, over and over, and
-/// keep the CPU in the interrupt instead of letting `ktimers/N` run
-static SOFT_ACTIVATED: PerCpu<AtomicBool> = crate::percpu![AtomicBool::new(false)];
+crate::percpu! {
+    /// Per CPU: due SOFT timers were handed to `ktimers/N`, which has not
+    /// run them yet (Linux cpu_base->softirq_activated): the clock event
+    /// is programmed from the HARD timers only meanwhile, or the expired
+    /// SOFT expiry would make it fire again at once, over and over, and
+    /// keep the CPU in the interrupt instead of letting `ktimers/N` run
+    static SOFT_ACTIVATED: AtomicBool = AtomicBool::new(false);
+}
 
 /// The CPU whose base `b` is
 fn base_cpu(b: &HrBase) -> u32 {
-    let first = BASES.get(0).as_ptr() as usize;
-    ((core::ptr::from_ref::<HrBase>(b) as usize - first) / core::mem::size_of::<[HrBase; 2]>())
-        as u32
+    b.cpu.load(Ordering::Relaxed)
+}
+
+/// Give CPU `cpu`'s bases their CPU (Linux hrtimers_prepare_cpu), in
+/// its new per-CPU area before the area is published
+pub fn prepare_cpu(cpu: u32) {
+    for b in BASES.get_unpublished(cpu) {
+        b.cpu.store(cpu, Ordering::Relaxed);
+    }
 }
 
 fn base_of(cpu: u32, flags: u8) -> &'static HrBase {
@@ -393,8 +409,10 @@ fn reprogram(cpu: u32) {
     crate::arch::clockevent_next(delta);
 }
 
-/// The scheduler tick of each CPU (Linux tick_sched_timer)
-static TICK: PerCpu<HrTimer> = crate::percpu![HrTimer::new(tick_fire, HRTIMER_HARD)];
+crate::percpu! {
+    /// The scheduler tick of each CPU (Linux tick_sched_timer)
+    static TICK: HrTimer = HrTimer::new(tick_fire, HRTIMER_HARD);
+}
 
 /// The tick: scheduler work, then the next tick (catching up from now
 /// if ticks were lost)

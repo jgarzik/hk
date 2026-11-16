@@ -279,20 +279,24 @@ impl Drop for AddressSpace {
     }
 }
 
-/// Dirty page-cache pages, per CPU (Linux NR_FILE_DIRTY vmstat): summed
-/// for balance_dirty_pages and /proc/meminfo
-static NR_DIRTY: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
-    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
+crate::percpu! {
+    /// Dirty page-cache pages, per CPU (Linux NR_FILE_DIRTY vmstat): summed
+    /// for balance_dirty_pages and /proc/meminfo
+    static NR_DIRTY: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+}
 
-/// Page-cache pages, and those of unevictable mappings, per CPU
-/// (Linux NR_FILE_PAGES, NR_UNEVICTABLE): /proc/meminfo
-static NR_FILE: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
-    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
-static NR_UNEVICT: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
-    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
-/// tmpfs pages (Linux NR_SHMEM): those of a mapping charged to a tmpfs
-static NR_SHMEM: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
-    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
+crate::percpu! {
+    /// Page-cache pages, and those of unevictable mappings, per CPU
+    /// (Linux NR_FILE_PAGES, NR_UNEVICTABLE): /proc/meminfo
+    static NR_FILE: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+}
+crate::percpu! {
+    static NR_UNEVICT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+}
+crate::percpu! {
+    /// tmpfs pages (Linux NR_SHMEM): those of a mapping charged to a tmpfs
+    static NR_SHMEM: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+}
 
 fn sum(c: &crate::cpu::PerCpu<core::sync::atomic::AtomicI64>) -> u64 {
     c.for_each_possible()

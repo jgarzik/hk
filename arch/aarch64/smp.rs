@@ -65,6 +65,9 @@ unsafe extern "C" {
 pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut FA) -> usize {
     let bsp_mpidr = cpu::read_mpidr();
     let bsp_cpu_id = (bsp_mpidr & 0xFF) as u32;
+    // Every possible CPU's per-CPU area before any AP starts (Linux
+    // setup_per_cpu_areas): each CPU the firmware lists
+    crate::cpu::setup_areas(acpi.cpus.len().max(1) as u32);
 
     // Get BSP kernel stack (from current SP, rounded to stack top)
     let bsp_stack: u64;

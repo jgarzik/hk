@@ -51,6 +51,10 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
     // Use existing LAPIC instance (already mapped via ioremap in main.rs)
     let lapic = LocalApic::get();
     let bsp_apic_id = u32::from(lapic.id());
+    // Every possible CPU's per-CPU area before any AP starts (Linux
+    // setup_per_cpu_areas): each CPU the firmware lists (Linux's
+    // possible map counts disabled ones too)
+    crate::cpu::setup_areas(acpi.cpus.len().max(1) as u32);
 
     // Initialize BSP per-CPU data
     // Note: percpu uses u8 APIC ID for xAPIC compatibility

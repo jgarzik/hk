@@ -24,7 +24,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Once;
 
-use crate::cpu::PerCpu;
 use crate::fs::FileRef;
 use crate::fs::file::{File, FileOps};
 use crate::fs::inode::{Inode, InodeMode, InodeOps, Timespec};
@@ -37,8 +36,10 @@ const LAST_INO_BATCH: u64 = 1024;
 /// The next batch's start
 static SHARED_LAST_INO: AtomicU64 = AtomicU64::new(0);
 
-/// Each CPU's last number handed out (0: take a new batch)
-static LAST_INO: PerCpu<IrqSpinlock<u64>> = crate::percpu![IrqSpinlock::new(0)];
+crate::percpu! {
+    /// Each CPU's last number handed out (0: take a new batch)
+    static LAST_INO: IrqSpinlock<u64> = IrqSpinlock::new(0);
+}
 
 /// A new inode number for a pseudo filesystem (Linux get_next_ino):
 /// 32 bits wide like Linux's `unsigned int`, never 0

@@ -92,7 +92,6 @@ mod imp {
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::Loc;
-    use crate::cpu::PerCpu;
     use crate::sync::IrqSpinlock;
 
     /// Held tracked locks per CPU
@@ -143,7 +142,8 @@ mod imp {
     // kernel switches tasks only at points that hold no slot reference)
     unsafe impl Sync for Slot {}
 
-    static CPUS: PerCpu<Slot> = crate::percpu![Slot(Cpu {
+    crate::percpu! {
+        static CPUS: Slot = Slot(Cpu {
         held: [const { Cell::new(None) }; DEPTH],
         depth: Cell::new(0),
         busy: Cell::new(false),
@@ -153,7 +153,8 @@ mod imp {
         irqoff_at: Cell::new(None),
         rcu: Cell::new(0),
         rcu_at: Cell::new(None),
-    })];
+    });
+    }
 
     #[derive(Clone, Copy)]
     struct Edge {

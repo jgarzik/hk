@@ -90,10 +90,12 @@ static GP_KICK: WaitQueue = WaitQueue::new();
 /// `synchronize` callers wait here for their grace period's end
 static GP_DONE: WaitQueue = WaitQueue::new();
 
-/// A CPU's view (Linux struct rcu_data): the grace period in which a
-/// context switch passed a quiescent state (written by its CPU with
-/// interrupts off)
-static SWITCHED: crate::cpu::PerCpu<AtomicU64> = crate::percpu![AtomicU64::new(0)];
+crate::percpu! {
+    /// A CPU's view (Linux struct rcu_data): the grace period in which a
+    /// context switch passed a quiescent state (written by its CPU with
+    /// interrupts off)
+    static SWITCHED: AtomicU64 = AtomicU64::new(0);
+}
 
 /// `GP_SEQ` value after which a grace period begun after now has ended
 /// (Linux rcu_seq_snap)
@@ -473,7 +475,8 @@ struct RcuData {
     wq: WaitQueue,
 }
 
-static RDP: crate::cpu::PerCpu<RcuData> = crate::percpu![RcuData {
+crate::percpu! {
+    static RDP: RcuData = RcuData {
     cbs: IrqSpinlock::new(CbList {
         head: core::ptr::null_mut(),
         tail: core::ptr::null_mut(),
@@ -481,7 +484,8 @@ static RDP: crate::cpu::PerCpu<RcuData> = crate::percpu![RcuData {
     }),
     next_gp: AtomicU64::new(u64::MAX),
     wq: WaitQueue::new(),
-}];
+};
+}
 
 /// Callbacks run per batch at least (Linux DEFAULT_RCU_BLIMIT)
 const BLIMIT: usize = 10;
@@ -806,8 +810,10 @@ static BARRIER_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 static BARRIER_LEFT: AtomicUsize = AtomicUsize::new(0);
 static BARRIER_DONE: crate::sync::completion::Completion =
     crate::sync::completion::Completion::new();
-/// Each CPU's barrier callback (Linux rcu_data.barrier_head)
-static BARRIER_HEAD: crate::cpu::PerCpu<RcuHead> = crate::percpu![RcuHead::new()];
+crate::percpu! {
+    /// Each CPU's barrier callback (Linux rcu_data.barrier_head)
+    static BARRIER_HEAD: RcuHead = RcuHead::new();
+}
 
 /// A barrier callback ran
 ///

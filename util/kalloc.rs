@@ -45,16 +45,19 @@ struct Reserve {
     align: AtomicUsize,
 }
 
-static RESERVE: crate::cpu::PerCpu<Reserve> = crate::percpu!(Reserve {
+crate::percpu! {
+    static RESERVE: Reserve = Reserve {
     ptr: AtomicPtr::new(core::ptr::null_mut()),
     size: AtomicUsize::new(0),
     align: AtomicUsize::new(0),
-});
+};
+}
 
-/// This CPU's named heap GFP ([`with_gfp`]): 0 for none, else
-/// `NAMED | interrupt depth << 32 | gfp`
-static GFP_CX: crate::cpu::PerCpu<core::sync::atomic::AtomicU64> =
-    crate::percpu!(core::sync::atomic::AtomicU64::new(0));
+crate::percpu! {
+    /// This CPU's named heap GFP ([`with_gfp`]): 0 for none, else
+    /// `NAMED | interrupt depth << 32 | gfp`
+    static GFP_CX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+}
 
 /// A [`GFP_CX`] value is set
 const NAMED: u64 = 1 << 63;

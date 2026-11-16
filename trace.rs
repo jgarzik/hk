@@ -36,7 +36,6 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use spin::Once;
 
-use crate::cpu::PerCpu;
 use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::inode::{Inode, InodeMode, InodeOps};
@@ -114,8 +113,10 @@ impl Ring {
     }
 }
 
-/// Each CPU's ring, once allocated
-static RINGS: PerCpu<Once<Box<IrqSpinlock<Ring>>>> = crate::percpu![Once::new()];
+crate::percpu! {
+    /// Each CPU's ring, once allocated
+    static RINGS: Once<Box<IrqSpinlock<Ring>>> = Once::new();
+}
 
 /// Events dropped for lack of a ring
 static DROPPED: AtomicU64 = AtomicU64::new(0);

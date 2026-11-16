@@ -13,10 +13,9 @@ argued / published copy of locked state.
   count, seqcount, per-task counters, rq fields under the rq lock). On x86 each
   is a `lock`-prefixed instruction (a full barrier), on arm64 an LSE atomic or
   an LL/SC loop; Linux uses `this_cpu_inc` / plain `++` / `WRITE_ONCE`.
-- **"Per-CPU" that is not.** `cpu::PerCpu<T>` is a dense `[T; NR_CPUS]`;
-  small `T` (an atomic, a small lock) puts several CPUs in one cache line, so
-  the per-CPU design is defeated by false sharing. Same for inline
-  `[X; NR_CPUS]` arrays (`page_alloc::Zone.pcp`, `slab::KmemCache.cpu`).
+- **"Per-CPU" that is not.** Inline `[X; NR_CPUS]` arrays
+  (`page_alloc::Zone.pcp`, `slab::KmemCache.cpu`) put several CPUs in one
+  cache line, so the per-CPU design is defeated by false sharing.
 - **Sibling atomics of a lock.** Fields mutated only under a lock but kept as
   atomics beside it (rule 1 of LOCKING.md §5.4 violated): `SchedEntity`,
   `PerCpuScheduler`, `TimerList`, `Pcp.count`, `AddressSpace.nrpages`.
@@ -46,27 +45,15 @@ argued / published copy of locked state.
   compiler fence; same for `interrupt_depth`. Document the "interrupt restores
   it" argument in LOCKING.md §6.
 
-### 2. `cpu::PerCpu<T>` packs CPUs into shared cache lines — (c)
-- Where: `cpu.rs` `PerCpu` (`[T; NR_CPUS]`, no per-slot alignment). Worst
-  users: `mm/filemap.rs` `NR_DIRTY`/`NR_FILE`/`NR_UNEVICT`/`NR_SHMEM`
-  (every page dirty/insert), `mm/tlb.rs` `TLB_STATE` (written every context
-  switch; its comment claims "no cross-CPU traffic"), `sync/rcu.rs`
-  `SWITCHED` (every switch during a GP), `util/kalloc.rs` `GFP_CX` (read on
-  every heap alloc, swapped by `with_gfp`) and `RESERVE`, `net/tcp/mem.rs`
-  `FW_ALLOC`/`ORPHANS`, `smp.rs` `QUEUE`, `fs/anon_inodes.rs` `LAST_INO`,
-  `mm/swap/lru.rs` `BATCHES`, `random.rs` `CPU_CRNG`. Also inline arrays:
-  `mm/page_alloc.rs` `Zone.pcp: [Pcp; NR_CPUS]` (lock word + count of adjacent
-  CPUs share lines on every order-0 alloc/free) and `mm/slab.rs`
-  `KmemCache.cpu` (slot boundaries share lines).
-- Wrong: each "per-CPU" update invalidates the neighbours' line; with RMW
-  atomics it is a contended shared counter in disguise.
-- Linux: per-CPU areas are separate per-CPU chunks; per-CPU data of different
+### 2. Inline per-CPU arrays pack CPUs into shared cache lines — (c)
+- Where: `mm/page_alloc.rs` `Zone.pcp: [Pcp; NR_CPUS]` (lock word + count
+  of adjacent CPUs share lines on every order-0 alloc/free) and
+  `mm/slab.rs` `KmemCache.cpu` (slot boundaries share lines). Static
+  per-CPU variables already live in per-CPU areas (`cpu::PerCpu`).
+- Linux: `alloc_percpu` units in per-CPU chunks; per-CPU data of different
   CPUs never share a line.
-- Fix: make `PerCpu` store `[CacheAligned<T>; NR_CPUS]` (`#[repr(align(64))]`
-  wrapper, as `util/percpu_counter.rs` `Part` and `net/mib.rs` already do), or a
-  real per-CPU area. Apply to `Zone.pcp` and `KmemCache.cpu`. Then convert the
-  owner-only slots to load+store (finding 15). Add the rule to LOCKING.md §5.4
-  rule 9: "per-CPU means its own cache line".
+- Fix: a typed `alloc_percpu` (generalize `util/percpu_alloc.rs`) for
+  them. Then convert the owner-only slots to load+store (finding 15).
 
 ### 3. `IrqSpinlock` spins on compare-exchange; locks are unfair TAS — (c)(d)
 - Where: `sync/irqspin.rs` `IrqSpinlock::lock` (loop of
