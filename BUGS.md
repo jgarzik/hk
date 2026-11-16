@@ -927,10 +927,6 @@ its no-writeback skip, before it relies on sync.
   capacity changes (config interrupts) are ignored, no DISCARD,
   WRITE_ZEROES, GET_ID (serial) or secure erase. The disk's queues are
   fixed at probe.
-- Disk removal (`del_gendisk`) drops the page cache without writing it
-  back; Linux syncs it first on an orderly removal (bdev_mark_dead with
-  surprise = false: sync_blockdev), so dirty device-file data is lost
-  on unbind.
 - virtio-pci remove leaves the BAR mappings (common, notify, ISR,
   device config): `IoMem` windows are copyable and never unmapped, so
   each transport rebind leaks the ioremap space of one device (Linux

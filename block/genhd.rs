@@ -299,6 +299,21 @@ pub fn rescan(bdev: &BlockDevice) -> Result<(), KernelError> {
 /// fails with EIO, open files get EIO, and the requests in flight
 /// complete before it returns, so the driver may then stop the device
 pub fn del_gendisk(disk: &Arc<Disk>) {
+    // An orderly removal writes the cached data back first (Linux
+    // blk_report_disk_dead(disk, false) -> bdev_mark_dead: sync_blockdev
+    // of each block device), with no lock held: the writes sleep
+    let bdevs: Vec<Arc<BlockDevice>> = disk
+        .open_mutex
+        .lock()
+        .part_tbl
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    for b in &bdevs {
+        let _ = crate::block::blkdev::sync_blockdev(b);
+    }
+    drop(bdevs);
     {
         // Under open_mutex, like a rescan: an open in progress either
         // finished before or sees the device dead

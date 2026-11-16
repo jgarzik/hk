@@ -1111,20 +1111,30 @@ fn unbind_pci(fd: i32, d: &[u8], v: &[u8], before: &[u8; 512]) -> Result<(), (&'
 
 /// The first sector of /dev/<d>
 fn sector0(d: &[u8], out: &mut [u8; 512]) -> i64 {
+    sector_at(d, 0, out)
+}
+
+/// The sector at byte `off` of /dev/<d>
+fn sector_at(d: &[u8], off: i64, out: &mut [u8; 512]) -> i64 {
     let mut b = [0u8; 256];
     let fd = sys_open(path(&mut b, &[b"/dev/", d]).as_ptr(), O_RDONLY, 0);
     if fd < 0 {
         return fd;
     }
-    let n = hk_syscall::sys_pread64(fd as i32, out.as_mut_ptr(), 512, 0);
+    let n = hk_syscall::sys_pread64(fd as i32, out.as_mut_ptr(), 512, off);
     sys_close(fd as u64);
     n
 }
 
+/// Past the test disk's last partition (tools/mkdisk.sh): free to write
+const UNUSED_OFF: i64 = 120 << 20;
+
 /// Unbinding the first virtio disk's device from virtio_blk removes the
 /// disk (/sys/block, /dev, "remove" then "unbind" uevents) and fails
 /// I/O on a file still open with EIO; binding it back brings the disk
-/// back under its name with the same data. hk only: the Linux reference
+/// back under its name with the same data, a write still cached when
+/// it went included (Linux del_gendisk syncs on an orderly removal).
+/// hk only: the Linux reference
 /// VM may boot from its virtio disk
 fn test_unbind_blk() {
     const N: &[u8] = b"SYSFS_UNBIND_BLK";
@@ -1160,9 +1170,16 @@ fn test_unbind_blk() {
     let r = (|| {
         let mut nb = [0u8; 256];
         let node = path(&mut nb, &[b"/dev/", d]);
-        let held = sys_open(node.as_ptr(), O_RDONLY, 0);
+        let held = sys_open(node.as_ptr(), hk_syscall::O_RDWR, 0);
         if held < 0 {
             return Err((&b"open"[..], held));
+        }
+        // Cached only: no fsync, the file stays open past the removal
+        let pat = [0x5au8; 512];
+        let wr = hk_syscall::sys_pwrite64(held as i32, pat.as_ptr(), 512, UNUSED_OFF);
+        if wr != 512 {
+            sys_close(held as u64);
+            return Err((&b"write"[..], wr));
         }
         let drv: &[u8] = b"/sys/bus/virtio/drivers/virtio_blk/";
         let mut ub = [0u8; 256];
@@ -1207,6 +1224,11 @@ fn test_unbind_blk() {
         let r = sector0(d, &mut after);
         if r != 512 || after != before {
             return Err((&b"read after bind"[..], r));
+        }
+        let mut wrote = [0u8; 512];
+        let r = sector_at(d, UNUSED_OFF, &mut wrote);
+        if r != 512 || wrote != [0x5au8; 512] {
+            return Err((&b"cached write lost"[..], r));
         }
         unbind_pci(fd, d, v, &before)
     })();
