@@ -20,4 +20,5 @@ pub mod pollperm;
 pub mod sigio;
 pub mod stdio;
 pub mod tty;
+pub mod tty_mode;
 pub mod uaccess;

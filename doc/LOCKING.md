@@ -4374,7 +4374,7 @@ Each `Tty` struct contains:
 
 | Lock | Type | Purpose |
 |------|------|---------|
-| `termios` | `Mutex<Termios>` | Terminal I/O settings (baud, echo, etc.) |
+| `termios` | `Mutex<KTermios>` | Terminal I/O settings with the speeds (Linux `tty->termios`, a ktermios, under `termios_rwsem`): TCSETS*, TCSETS*2 and TCSETA* read it, build the new settings unlocked, then store them under `ldata` → `termios` (Linux set_termios: tty_set_termios) |
 | `ldata` | `sync::Mutex<NTtyData>` (sleeping) | N_TTY read ring, edited line and echo ring (Linux `n_tty_data` under `termios_rwsem`): input processing, reads' copies out, flushes and termios changes; held across the echo's driver writes and ISIG signals |
 | `avail` | atomics (`n_tty::Avail`) | `ldata`'s commit, line and read heads and ICANON, stored (Release) under `ldata` as each holder releases it, loaded (Acquire) with no lock by poll and a reader's wait condition (Linux `input_available_p` on `commit_head`/`canon_head`/`read_tail`): a poll may run under a spin lock (an epoll's), a wait condition with the task state set. A hint only: the input itself is copied under `ldata` |
 | `ctrl` | `Mutex<TtyCtrl>` | Session, foreground group, window size (Linux `ctrl.lock` + `winsize_mutex`) |

@@ -502,11 +502,19 @@ hub6, where Linux moves the port (uart_change_port).
 - **Hangup gaps:** no carrier (DCD) loss hangs a tty up (no modem
   control). No boot test unbinds the console UART (the test output
   goes there).
-- **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
-  TIOCEXCL exclusivity, sending a break (TCSBRK 0), packet mode,
+- **Missing:** TIOCSTI, TIOCEXCL exclusivity, sending a break
+  (TCSBRK 0), packet mode,
   ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT, IUCLC/OLCUC, IMAXBEL,
   PARMRK and parity/break input handling, CRTSCTS (no modem
   control: IXOFF throttles by STOP/START only).
+- **No driver set_termios:** a termios change never reaches the
+  UART (Linux uart_set_termios -> serial8250_do_set_termios,
+  pl011_set_termios): speed, character size, parity and stop bits stay
+  as booted, and the speed is not clamped to the UART's range and
+  encoded back (uart_get_baud_rate, tty_termios_encode_baud_rate), so
+  a BOTHER speed reads back as BOTHER where Linux reports the nearest
+  Bfoo; locked termios (TIOCGLCKTRMIOS, TIOCSLCKTRMIOS) and the ADDRB
+  reset (tty_set_termios) are missing too.
 - **Serial ports:** ttyS1 is registered without probing COM2. The
   PL011 has no startup or
   shutdown (Linux pl011_startup/pl011_shutdown): its interrupts stay

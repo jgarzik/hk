@@ -421,6 +421,7 @@ pub fn run_all_tests() {
     process::kcmp::run_tests();
     mm::process_vm::run_tests();
     io::tty::run_tests();
+    io::tty_mode::run_tests();
     proc::cgroup::run_tests();
     proc::cgroup_race::run_tests();
     mm::mempolicy::run_tests();

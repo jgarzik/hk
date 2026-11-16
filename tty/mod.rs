@@ -117,7 +117,7 @@ pub use termios::{
     VSUSP,
     VTIME,
 };
-pub use termios::{Termios, Winsize};
+pub use termios::{KTermios, Termios, Winsize};
 
 /// TTY driver trait - hardware interface (Linux tty_operations)
 ///
@@ -311,7 +311,7 @@ pub struct Tty {
     /// Device number (/dev node)
     dev: DevId,
     /// Terminal settings
-    pub termios: Mutex<Termios>,
+    pub termios: Mutex<KTermios>,
     /// Hardware driver
     driver: &'static dyn TtyDriver,
     /// N_TTY input state (sleeping: Linux termios_rwsem's role for the
@@ -378,7 +378,7 @@ impl Tty {
         Self {
             name,
             dev,
-            termios: Mutex::new(Termios::cooked()),
+            termios: Mutex::new(KTermios::from_termios(Termios::cooked())),
             driver,
             ldata: crate::sync::Mutex::new(n_tty::NTtyData::new()),
             avail: n_tty::Avail::new(),
@@ -611,12 +611,12 @@ impl Tty {
     // =========================================================================
 
     /// Get a copy of the termios structure
-    pub fn get_termios(&self) -> Termios {
+    pub fn get_termios(&self) -> KTermios {
         *self.termios.lock()
     }
 
     /// Set the termios structure
-    pub fn set_termios(&self, termios: Termios) {
+    pub fn set_termios(&self, termios: KTermios) {
         self.update_termios(|t| *t = termios);
     }
 
@@ -624,7 +624,7 @@ impl Tty {
     /// ldata, so input, reads and polls see the old settings or the new
     /// ones with the ICANON change applied, never half; readers and
     /// pollers are woken (VMIN, VTIME or ICANON may make input readable)
-    pub fn update_termios(&self, f: impl FnOnce(&mut Termios)) {
+    pub fn update_termios(&self, f: impl FnOnce(&mut KTermios)) {
         let mut ld = n_tty::ldata(self);
         let (canon, ixon_off) = {
             let mut t = self.termios.lock();
