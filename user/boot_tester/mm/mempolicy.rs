@@ -558,8 +558,8 @@ fn maxnode() -> R {
 /// MPOL_MODE_FLAGS: mode flags (Linux sanitize_mpol_flags, mpol_new):
 /// MPOL_F_STATIC_NODES and MPOL_F_RELATIVE_NODES exclude each other,
 /// need nodes, and make get_mempolicy report the caller's mask;
-/// MPOL_F_NUMA_BALANCING only with MPOL_BIND (MPOL_PREFERRED_MANY too
-/// since Linux 6.10); a mode past MPOL_MAX (MPOL_WEIGHTED_INTERLEAVE
+/// MPOL_F_NUMA_BALANCING only with MPOL_BIND and MPOL_PREFERRED_MANY
+/// (the latter since Linux 6.10); a mode past MPOL_MAX (MPOL_WEIGHTED_INTERLEAVE
 /// since 6.9) is EINVAL
 fn mode_flags() -> R {
     let both = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
@@ -571,8 +571,9 @@ fn mode_flags() -> R {
     check(b"balancing bind", r == 0, r)?;
     is_pol(MPOL_BIND | MPOL_F_NUMA_BALANCING, 1)?;
     let r = set1(MPOL_PREFERRED_MANY | MPOL_F_NUMA_BALANCING, 1);
-    let want = if linux_at_least(6, 10) { 0 } else { EINVAL };
-    check(b"balancing preferred many", r == want, r)?;
+    // Before 6.10 EINVAL, unless backported (Ubuntu's 6.8 has it)
+    let old = !linux_at_least(6, 10) && r == EINVAL;
+    check(b"balancing preferred many", r == 0 || old, r)?;
     let r = set1(MPOL_BIND | MPOL_F_STATIC_NODES, 1 | 1 << 5);
     check(b"static", r == 0, r)?;
     is_pol(MPOL_BIND | MPOL_F_STATIC_NODES, 1 | 1 << 5)?;
