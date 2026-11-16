@@ -6,12 +6,14 @@
 //! wakes when another process of the namespace mounts.
 //!
 //! In a child with its own mount namespace, all mounts private.
+//!
+//! MOUNTS_OPEN_NS: a mounts file shows the namespace it was opened on.
 
 use crate::harness::{R, check, report_r};
 use crate::helpers::linux_at_least;
 use hk_syscall::{
     CLONE_NEWNS, O_RDONLY, PollFd, sys_close, sys_exit, sys_fork, sys_mkdir, sys_mount, sys_open,
-    sys_poll, sys_rmdir, sys_umount2, sys_unshare, sys_wait4,
+    sys_poll, sys_read, sys_rmdir, sys_umount2, sys_unshare, sys_wait4,
 };
 
 const MS_REMOUNT: u64 = 32;
@@ -31,6 +33,58 @@ const DIR: &[u8] = b"/tmp/mpoll\0";
 
 pub fn run_tests() {
     report_r(b"MOUNT_POLL", in_child(poll_child));
+    report_r(b"MOUNTS_OPEN_NS", in_child(open_ns_child));
+}
+
+/// Whether `hay` holds `needle`
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// mountinfo read whole from `fd` into `buf`: its length
+fn read_all(fd: i32, buf: &mut [u8]) -> usize {
+    let mut n = 0;
+    while n < buf.len() {
+        let r = sys_read(fd as u64, buf[n..].as_mut_ptr(), (buf.len() - n) as u64);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    n
+}
+
+/// MOUNTS_OPEN_NS: a mounts file lists the namespace it was opened on
+/// (Linux mounts_open_common: proc_mounts.ns); after an unshare and a
+/// mount in the new namespace it still does not show that mount, a
+/// new open of it does
+fn open_ns_child() -> i64 {
+    let fd = sys_open(b"/proc/self/mountinfo\0".as_ptr(), O_RDONLY, 0) as i32;
+    if fd < 0 {
+        return 1;
+    }
+    if sys_unshare(CLONE_NEWNS) != 0 || remount(b"/\0", MS_REC | MS_PRIVATE) != 0 {
+        return 2;
+    }
+    sys_mkdir(DIR.as_ptr(), 0o755);
+    if tmpfs(DIR) != 0 {
+        return 3;
+    }
+    let mut buf = [0u8; 16384];
+    let n = read_all(fd, &mut buf);
+    sys_close(fd as u64);
+    let old = n == 0 || contains(&buf[..n], b" /tmp/mpoll ");
+    let fd = sys_open(b"/proc/self/mountinfo\0".as_ptr(), O_RDONLY, 0) as i32;
+    let n = if fd < 0 { 0 } else { read_all(fd, &mut buf) };
+    sys_close(fd as u64);
+    let new = contains(&buf[..n], b" /tmp/mpoll ");
+    sys_umount2(DIR.as_ptr(), 0);
+    sys_rmdir(DIR.as_ptr());
+    match (!old, new) {
+        (true, true) => 0,
+        (false, _) => 4,
+        (_, false) => 5,
+    }
 }
 
 /// The exit status of a child running `f` (0, or its failed step)

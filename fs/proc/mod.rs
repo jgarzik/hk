@@ -1233,7 +1233,7 @@ pub enum PidGen {
     Ns(fn(&TaskRef, &PidNamespace) -> Vec<u8>),
     /// A mount table of the process (mounts, mountinfo): as `Pub`, and
     /// pollable (Linux mounts_poll)
-    Mnt(fn(&TaskRef) -> Vec<u8>),
+    Mnt(fn(&mounts::MntView) -> Vec<u8>),
     /// Private content of the address space: open needs ptrace-read
     /// access and pins the mm it reads from (Linux proc_mem_open: an
     /// mm_count reference)
@@ -1266,7 +1266,7 @@ struct ProcOpen {
     /// The mount namespace a mounts file was opened on and the number
     /// of its change last reported (Linux proc_mounts.ns,
     /// seq_file.poll_event)
-    mnt: Option<(Arc<crate::ns::MntNamespace>, core::sync::atomic::AtomicU64)>,
+    mnt: Option<MntOpen>,
     /// The network namespace a /proc/<pid>/net file was opened on
     /// (Linux seq_net_private.net: an active reference)
     net: Option<crate::net::NetRef>,
@@ -1293,10 +1293,9 @@ fn net_of(inode: &Inode) -> Option<Arc<crate::net::NetNamespace>> {
     })?
 }
 
-/// The mount namespace of a /proc/<pid>/mounts inode's process, for an
-/// open (Linux mounts_open_common: EINVAL without the task or its
-/// nsproxy)
-fn mnt_ns_of(inode: &Inode) -> Result<Arc<crate::ns::MntNamespace>, KernelError> {
+/// What a /proc/<pid>/mounts file shows, taken at its open (Linux
+/// mounts_open_common: EINVAL without the task)
+fn mnt_view_of(inode: &Inode) -> Result<mounts::MntView, KernelError> {
     let pid = with_data(inode, |d| match d {
         ProcfsInodeData::PidFile { pid, .. } => Some(pid.clone()),
         _ => None,
@@ -1304,9 +1303,14 @@ fn mnt_ns_of(inode: &Inode) -> Result<Arc<crate::ns::MntNamespace>, KernelError>
     .flatten()
     .ok_or(KernelError::InvalidArgument)?;
     let t = pid.task().ok_or(KernelError::InvalidArgument)?;
-    task_nsproxy(&t)
-        .map(|n| n.mnt_ns.clone())
-        .ok_or(KernelError::InvalidArgument)
+    mounts::task_view(&t)
+}
+
+/// An open mounts file's view and the change number of its namespace
+/// last reported (Linux proc_mounts, seq_file.poll_event)
+struct MntOpen {
+    view: mounts::MntView,
+    seen: core::sync::atomic::AtomicU64,
 }
 
 /// The namespace an open /proc/<pid>/net file pinned
@@ -1318,7 +1322,16 @@ fn open_net(file: &File) -> Option<crate::net::NetRef> {
 /// checked afresh)
 fn pid_content(file: Option<&File>, t: &TaskRef, g: PidGen) -> Result<Vec<u8>, KernelError> {
     match g {
-        PidGen::Pub(f) | PidGen::Mnt(f) => Ok(f(t)),
+        PidGen::Pub(f) => Ok(f(t)),
+        // The namespace and root taken at open (afresh without a file)
+        PidGen::Mnt(f) => {
+            if let Some(p) = file.and_then(proc_open)
+                && let Some(m) = &p.mnt
+            {
+                return Ok(f(&m.view));
+            }
+            Ok(f(&mounts::task_view(t)?))
+        }
         PidGen::Ns(f) => {
             let ns = file
                 .and_then(File::get_inode)
@@ -1693,9 +1706,10 @@ impl FileOps for ProcfsFileOps {
         let Some(po) = proc_open(file) else {
             return POLLIN | POLLRDNORM;
         };
-        let Some((ns, seen)) = po.mnt.as_ref() else {
+        let Some(MntOpen { view, seen }) = po.mnt.as_ref() else {
             return POLLIN | POLLRDNORM;
         };
+        let ns = &view.ns;
         if let Some(pt) = pt {
             pt.poll_wait(&ns.poll);
         }
@@ -1731,9 +1745,9 @@ impl FileOps for ProcfsFileOps {
         };
         let mnt = match proc_poll(file) {
             ProcPoll::Mounts => {
-                let ns = mnt_ns_of(&inode)?;
-                let ev = core::sync::atomic::AtomicU64::new(ns.event());
-                Some((ns, ev))
+                let view = mnt_view_of(&inode)?;
+                let seen = core::sync::atomic::AtomicU64::new(view.ns.event());
+                Some(MntOpen { view, seen })
             }
             _ => None,
         };
