@@ -380,8 +380,11 @@ the grace period that must end (`snap(GP_SEQ)`, sampled after a SeqCst
 fence under the list lock), links it on this CPU's list (`RcuData.cbs`:
 an IrqSpinlock leaf, Linux rcu_segcblist under the rdp lock; call_rcu
 may run in any context, an interrupt handler included) and asks
-`rcu_gp` for that grace period (`GP_REQ`, its wait queue woken after
-the list lock is released). Nothing else is taken under `cbs`. Each
+`rcu_gp` for that grace period, unless this CPU asked for it already
+(`RcuData.needed`, under `cbs`: Linux rdp->gp_seq_needed) or the global
+request is past it (a Relaxed load first; `GP_REQ.fetch_max` and the
+wakeup of its wait queue only when behind, after the list lock is
+released). Nothing else is taken under `cbs`. Each
 CPU's clock interrupt wakes its `rcuc/N` once the first callback's
 grace period is over (`RcuData.next_gp`, written under `cbs`; Linux
 rcu_pending -> invoke_rcu_core); `rcuc/N` takes a batch of ready

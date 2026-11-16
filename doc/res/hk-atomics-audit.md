@@ -71,17 +71,6 @@ argued / published copy of locked state.
   group cputimer at switch/tick only; decide whether per-syscall precision is
   needed at all (Linux does not provide it by default). LOCKING.md §3.1/§3.5.
 
-### 7. `call_rcu` does a global SeqCst `fetch_max` on every call — (c)
-- Where: `sync/rcu.rs` `call_rcu` (`GP_REQ.fetch_max(want, SeqCst)`), also
-  reached by every `kfree_rcu`.
-- Wrong: a CAS loop on one global line from every CPU on every deferred free
-  (sockets, dentries, files, rcuhlist nodes).
-- Linux: `rdp->gp_seq_needed` per CPU; `rcu_start_this_gp` touches the
-  `rcu_node` only when this CPU has not already requested that GP.
-- Fix: keep a per-CPU `needed` in `RcuData` (under `cbs`); only when `want`
-  exceeds it, Relaxed-load `GP_REQ` and `fetch_max` if still behind.
-  LOCKING.md RCU section.
-
 ### 8. Inode eviction bumps a global counter and global wait queue — (c)
 - Where: `fs/icache.rs` `FREED`, `FREED_WQ`, `evict` (`fetch_add(AcqRel)` +
   `wake_all` on every hashed inode's eviction), `find`/`wait_freed`.

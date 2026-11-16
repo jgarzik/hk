@@ -471,6 +471,10 @@ struct RcuData {
     /// The grace period the first callback waits for (u64::MAX: none),
     /// written under `cbs`, read by the clock interrupt
     next_gp: AtomicU64,
+    /// The latest grace period this CPU asked `rcu_gp` for (Linux
+    /// rdp->gp_seq_needed), under `cbs`: a callback that needs no later
+    /// one asks nothing
+    needed: AtomicU64,
     /// `rcuc/N` waits here
     wq: WaitQueue,
 }
@@ -483,6 +487,7 @@ crate::percpu! {
         pending: 0,
     }),
     next_gp: AtomicU64::new(u64::MAX),
+    needed: AtomicU64::new(0),
     wq: WaitQueue::new(),
 };
 }
@@ -571,7 +576,7 @@ pub unsafe fn call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) {
     // SAFETY: claimed: only this queueing writes it (type invariant)
     unsafe { *h.func.get() = Some((func, arg)) };
     let d = RDP.this();
-    let want = {
+    let (want, ask) = {
         let mut l = d.cbs.lock();
         // The caller's unlink is seen before the grace period sampled
         // (Linux's full barrier in __call_rcu_common)
@@ -584,10 +589,21 @@ pub unsafe fn call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) {
         if first {
             d.next_gp.store(want, Ordering::Release);
         }
-        want
+        // Linux rcu_start_this_gp: nothing to ask if this CPU asked for
+        // this grace period (or a later one) already
+        let ask = d.needed.load(Ordering::Relaxed) < want;
+        if ask {
+            d.needed.store(want, Ordering::Relaxed);
+        }
+        (want, ask)
     };
-    // Ask rcu_gp for the grace period (Linux rcu_start_this_gp)
-    if GP_REQ.fetch_max(want, Ordering::SeqCst) < want {
+    // Ask rcu_gp for it, unless someone already did (a request for a
+    // later grace period covers this one): the global word is written
+    // only when it is behind
+    if ask
+        && GP_REQ.load(Ordering::Relaxed) < want
+        && GP_REQ.fetch_max(want, Ordering::SeqCst) < want
+    {
         GP_KICK.wake_all();
     }
 }
