@@ -282,6 +282,7 @@ pub fn run_all_tests() {
     process::groups::run_tests();
     fs::fifo::run_tests();
     io::pipe_packet::run_tests();
+    io::pipe_size::run_tests();
     fs::splice::run_tests();
     fs::deep_chain::run_tests();
     fs::anon_inode::run_tests();

@@ -337,13 +337,15 @@ user notification (SECCOMP_RET_USER_NOTIF; FLAG_NEW_LISTENER and
 FLAG_WAIT_KILLABLE_RECV are EINVAL), and nothing is logged for RET_LOG
 or FLAG_LOG.
 
-## Pipe size is fixed
+## Pipe buffer accounting
 
-**Location**: `io/pipe.rs`, `fs/fd.rs` (`sys_fcntl`)
+**Location**: `io/pipe.rs`
 
-Every pipe holds 16 buffers; fcntl F_GETPIPE_SZ and F_SETPIPE_SZ are
-EINVAL and there is no /proc/sys/fs/pipe-max-size (Linux pipe_fcntl,
-pipe_set_size).
+fs.pipe-user-pages-soft and -hard are stored but not enforced: a user
+over the soft limit still gets 16-page pipes (Linux: 2,
+PIPE_MIN_DEF_BUFFERS) and F_SETPIPE_SZ is not refused over the hard
+one (Linux account_pipe_buffers, too_many_pipe_buffers_soft/_hard on
+user_struct.pipe_bufs).
 
 ## AF_UNIX gaps
 

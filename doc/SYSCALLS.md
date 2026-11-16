@@ -58,7 +58,7 @@
 - [x] dup
 - [x] dup2 (x86-64 only, legacy)
 - [x] dup3
-- [x] fcntl (DUPFD, FD/FL flags, locks, OWN/SIG, seals, O_ASYNC)
+- [x] fcntl (DUPFD, FD/FL flags, locks, OWN/SIG, seals, O_ASYNC, PIPE_SZ)
 
 2.2 Read/write + position
 

@@ -3576,7 +3576,8 @@ wq.wake_poll(POLLIN | POLLRDNORM);                       // Linux wake_up_poll
   but never a sleeping lock (`sync::Mutex`, `RwSem`), whose contended
   path would sleep and reset the task state. Objects guarded by a
   sleeping lock publish what their waiters test: a pipe's ring indices
-  are atomics read without `Pipe.inner` (Linux pipe_readable /
+  and its usable slot count (`max_usage`, changed by F_SETPIPE_SZ) are
+  atomics read without `Pipe.inner` (Linux pipe_readable /
   pipe_writable).
 
 **Page Locking (Linux folio_wait_table Pattern):**

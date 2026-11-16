@@ -302,6 +302,8 @@ mod fcntl_cmd {
     pub const F_SETOWN_EX: i32 = 15;
     pub const F_GETOWN_EX: i32 = 16;
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
+    pub const F_SETPIPE_SZ: i32 = 1031;
+    pub const F_GETPIPE_SZ: i32 = 1032;
 }
 
 /// Lock `flock` was just set through `fd`: if a close (by another
@@ -410,6 +412,13 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
 
         F_SETOWN | F_GETOWN | F_SETOWN_EX | F_GETOWN_EX | F_SETSIG | F_GETSIG => {
             fcntl_owner(&file, cmd, arg)
+        }
+
+        // Linux pipe_fcntl: a pipe or FIFO only (EBADF), the size an
+        // unsigned int
+        F_GETPIPE_SZ => Ok(crate::io::pipe::pipe_of(&file)?.size() as i64),
+        F_SETPIPE_SZ => {
+            Ok(crate::io::pipe::pipe_of(&file)?.set_size(u64::from(arg as u32))? as i64)
         }
 
         _ => Err(KernelError::InvalidArgument),

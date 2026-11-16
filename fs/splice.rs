@@ -36,8 +36,7 @@ use crate::fs::superblock::MAX_LFS_FILESIZE;
 use crate::fs::syscall::MAX_RW_COUNT;
 use crate::io::pipe::PipePage;
 use crate::io::pipe::{
-    PIPE_RING, Pipe, PipeBuffer, PipeGuard, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags,
-    sigpipe,
+    Pipe, PipeBuffer, PipeGuard, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags, sigpipe,
 };
 use crate::mm::filemap::PAGE_SIZE;
 use crate::uaccess::{UserPtr, copy_from_user};
@@ -151,7 +150,7 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
 
     // Iterate through source buffers
     while copied < len && src_idx != src_guard.head && !dst_guard.is_full() {
-        let src_buf = &src_guard.bufs[src_idx];
+        let src_buf = src_guard.buf(src_idx);
 
         if let Some(ref page) = src_buf.page {
             let to_copy = (len - copied).min(src_buf.len as usize);
@@ -174,7 +173,7 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
             }
         }
 
-        src_idx = (src_idx + 1) % PIPE_RING;
+        src_idx = src_idx.wrapping_add(1);
     }
 
     // Wake readers on destination
@@ -385,10 +384,10 @@ fn move_bufs(
 
     while moved < len && !src_guard.is_empty() && !dst_guard.is_full() {
         let tail_idx = src_guard.tail;
-        let src_buf = &mut src_guard.bufs[tail_idx];
+        let src_buf = src_guard.buf_mut(tail_idx);
 
         if src_buf.is_empty() {
-            src_guard.tail = (src_guard.tail + 1) % PIPE_RING;
+            src_guard.tail = src_guard.tail.wrapping_add(1);
             continue;
         }
 
@@ -413,7 +412,7 @@ fn move_bufs(
             // Consume from source
             if to_move == available {
                 src_buf.release();
-                src_guard.tail = (src_guard.tail + 1) % PIPE_RING;
+                src_guard.tail = src_guard.tail.wrapping_add(1);
             } else {
                 src_buf.offset += to_move as u32;
                 src_buf.len -= to_move as u32;
@@ -421,7 +420,7 @@ fn move_bufs(
             src_guard.total_len = src_guard.total_len.saturating_sub(to_move);
             moved += to_move;
         } else {
-            src_guard.tail = (src_guard.tail + 1) % PIPE_RING;
+            src_guard.tail = src_guard.tail.wrapping_add(1);
         }
     }
 
@@ -517,10 +516,10 @@ fn do_splice_pipe_to_file(
     let mut wake = false;
     while written < len && !g.is_empty() {
         let tail = g.tail;
-        let pb = &g.bufs[tail];
+        let pb = g.buf(tail);
         let Some(page) = pb.page.clone().filter(|_| !pb.is_empty()) else {
-            g.bufs[tail].release();
-            g.tail = (tail + 1) % PIPE_RING;
+            g.buf_mut(tail).release();
+            g.tail = tail.wrapping_add(1);
             continue;
         };
         let (offset, avail) = (pb.offset, pb.len as usize);
@@ -549,10 +548,10 @@ fn do_splice_pipe_to_file(
             }
         };
         // Consume exactly what was written
-        let pb = &mut g.bufs[tail];
+        let pb = g.buf_mut(tail);
         if n == avail {
             pb.release();
-            g.tail = (tail + 1) % PIPE_RING;
+            g.tail = tail.wrapping_add(1);
             wake = true;
         } else {
             pb.offset += n as u32;

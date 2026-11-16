@@ -35,8 +35,9 @@
 //! pipe pages and the caller's iterator under it (a user copy may
 //! fault: -> mmap_lock, as in Linux). Wait conditions and poll never take
 //! it (poll runs under epoll's spin lock): like Linux pipe_readable /
-//! pipe_writable they read the ring indices `Pipe.head`/`Pipe.tail`,
-//! which the guard publishes as it unlocks (or before a wakeup made
+//! pipe_writable they read the ring indices `Pipe.head`/`Pipe.tail`
+//! and the usable slots `Pipe.max_usage`, which the guard publishes as
+//! it unlocks (or before a wakeup made
 //! under it). Wakeups follow the unlock where Linux's do (read, write,
 //! most of splice). O_ASYNC files are on `fasync_readers` /
 //! `fasync_writers` (by access mode; changed under `Pipe.inner`, Linux
@@ -71,12 +72,69 @@ use crate::sync::waitqueue::WaitQueue;
 /// Pipe buffer size (matches Linux PIPE_BUF for atomic writes)
 pub const PIPE_BUF: usize = 4096;
 
-/// Number of buffer slots in a pipe (like Linux's PIPE_DEF_BUFFERS)
-pub const PIPE_BUFFERS: usize = 16;
+/// Buffer slots of a new pipe (Linux PIPE_DEF_BUFFERS)
+pub const PIPE_DEF_BUFFERS: usize = 16;
 
-/// Ring slots: one more than the capacity, so a full ring (head one
-/// behind tail) is distinguishable from an empty one (head == tail)
-pub const PIPE_RING: usize = PIPE_BUFFERS + 1;
+/// fs.pipe-max-size: the largest size F_SETPIPE_SZ grants without
+/// CAP_SYS_RESOURCE (Linux pipe_max_size, 1 MiB)
+static PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(1 << 20);
+
+/// fs.pipe-user-pages-hard and -soft (Linux pipe_user_pages_hard,
+/// _soft); stored, not enforced (BUGS.md)
+static PIPE_USER_PAGES_HARD: AtomicUsize = AtomicUsize::new(0);
+static PIPE_USER_PAGES_SOFT: AtomicUsize = AtomicUsize::new(16384);
+
+/// A requested pipe size rounded up to a power of two pages, at least
+/// one; 0 past 2^31 (Linux round_pipe_size)
+fn round_pipe_size(size: u64) -> usize {
+    if size > 1 << 31 {
+        return 0;
+    }
+    (size as usize).max(PAGE_SIZE).next_power_of_two()
+}
+
+/// /proc/sys/fs/pipe-* (Linux fs/pipe.c fs_pipe_sysctls)
+pub static PIPE_CTLS: &[crate::sysctl::Ctl] = &[
+    crate::sysctl::Ctl {
+        path: "fs/pipe-max-size",
+        mode: 0o644,
+        show: || alloc::vec![PIPE_MAX_SIZE.load(Ordering::Relaxed) as i64],
+        // Linux proc_dopipe_max_size: an unsigned int, rounded
+        store: |v| {
+            let n = u32::try_from(v[0]).map_err(|_| KernelError::InvalidArgument)?;
+            match round_pipe_size(u64::from(n)) {
+                0 => Err(KernelError::InvalidArgument),
+                r => {
+                    PIPE_MAX_SIZE.store(r, Ordering::Relaxed);
+                    Ok(())
+                }
+            }
+        },
+        text: None,
+    },
+    crate::sysctl::Ctl {
+        path: "fs/pipe-user-pages-hard",
+        mode: 0o644,
+        show: || alloc::vec![PIPE_USER_PAGES_HARD.load(Ordering::Relaxed) as i64],
+        store: |v| {
+            let n = usize::try_from(v[0]).map_err(|_| KernelError::InvalidArgument)?;
+            PIPE_USER_PAGES_HARD.store(n, Ordering::Relaxed);
+            Ok(())
+        },
+        text: None,
+    },
+    crate::sysctl::Ctl {
+        path: "fs/pipe-user-pages-soft",
+        mode: 0o644,
+        show: || alloc::vec![PIPE_USER_PAGES_SOFT.load(Ordering::Relaxed) as i64],
+        store: |v| {
+            let n = usize::try_from(v[0]).map_err(|_| KernelError::InvalidArgument)?;
+            PIPE_USER_PAGES_SOFT.store(n, Ordering::Relaxed);
+            Ok(())
+        },
+        text: None,
+    },
+];
 
 /// Pipe buffer flags
 pub mod pipe_buf_flags {
@@ -201,27 +259,73 @@ impl PipeBuffer {
 /// Uses page-based ring buffer to support zero-copy splice operations.
 /// Public for splice module access.
 pub struct PipeInner {
-    /// Ring of buffer slots (like Linux's struct pipe_inode_info.bufs)
-    pub bufs: [PipeBuffer; PIPE_RING],
-    /// Head index - producer writes here (mod PIPE_RING)
+    /// Ring of buffer slots, a power of two (Linux pipe->bufs,
+    /// ring_size); index `i` is slot `i & (len - 1)`
+    bufs: alloc::boxed::Box<[PipeBuffer]>,
+    /// Slots that may be in use (Linux max_usage), at most the ring's
+    max_usage: usize,
+    /// Head index, free-running (Linux pipe->head): the next slot
+    /// written
     pub head: usize,
-    /// Tail index - consumer reads from here (mod PIPE_RING)
+    /// Tail index, free-running (Linux pipe->tail): the next slot read
     pub tail: usize,
     /// Total bytes in all buffers
     pub total_len: usize,
 }
 
+/// A ring of `n` empty slots (`n` a power of two), or ENOMEM
+fn new_ring(n: usize) -> Result<alloc::boxed::Box<[PipeBuffer]>, KernelError> {
+    let mut v = alloc::vec::Vec::new();
+    v.try_reserve_exact(n)
+        .map_err(|_| KernelError::OutOfMemory)?;
+    v.resize_with(n, PipeBuffer::empty);
+    Ok(v.into_boxed_slice())
+}
+
 impl PipeInner {
-    /// Create a new empty pipe inner
-    fn new() -> Self {
-        // Initialize all buffer slots as empty
-        const EMPTY_BUF: PipeBuffer = PipeBuffer::empty();
-        Self {
-            bufs: [EMPTY_BUF; PIPE_RING],
+    /// An empty pipe of PIPE_DEF_BUFFERS slots
+    fn new() -> Result<Self, KernelError> {
+        Ok(Self {
+            bufs: new_ring(PIPE_DEF_BUFFERS)?,
+            max_usage: PIPE_DEF_BUFFERS,
             head: 0,
             tail: 0,
             total_len: 0,
+        })
+    }
+
+    /// The slot of index `i`
+    pub fn buf(&self, i: usize) -> &PipeBuffer {
+        &self.bufs[i & (self.bufs.len() - 1)]
+    }
+
+    /// The slot of index `i`, to change
+    pub fn buf_mut(&mut self, i: usize) -> &mut PipeBuffer {
+        let mask = self.bufs.len() - 1;
+        &mut self.bufs[i & mask]
+    }
+
+    /// Slots that may be in use (Linux max_usage)
+    pub fn max_usage(&self) -> usize {
+        self.max_usage
+    }
+
+    /// A ring of `slots` (a power of two) holding what is buffered at
+    /// its start (Linux pipe_resize_ring): EBUSY if that does not fit
+    fn resize(&mut self, slots: usize) -> Result<(), KernelError> {
+        let n = self.buffer_count();
+        if slots < n {
+            return Err(KernelError::Busy);
         }
+        let mut bufs = new_ring(slots)?;
+        for (i, b) in bufs.iter_mut().take(n).enumerate() {
+            *b = core::mem::replace(self.buf_mut(self.tail.wrapping_add(i)), PipeBuffer::empty());
+        }
+        self.bufs = bufs;
+        self.tail = 0;
+        self.head = n;
+        self.max_usage = slots;
+        Ok(())
     }
 
     /// Check if pipe is empty
@@ -231,16 +335,12 @@ impl PipeInner {
 
     /// Check if pipe is full (all buffer slots used)
     pub fn is_full(&self) -> bool {
-        self.buffer_count() >= PIPE_BUFFERS
+        self.buffer_count() >= self.max_usage
     }
 
     /// Number of used buffer slots
     pub fn buffer_count(&self) -> usize {
-        if self.head >= self.tail {
-            self.head - self.tail
-        } else {
-            PIPE_RING - self.tail + self.head
-        }
+        self.head.wrapping_sub(self.tail)
     }
 
     /// Bytes available for reading
@@ -253,7 +353,7 @@ impl PipeInner {
         if self.is_empty() {
             None
         } else {
-            Some(&self.bufs[self.tail])
+            Some(self.buf(self.tail))
         }
     }
 
@@ -262,7 +362,7 @@ impl PipeInner {
         if self.is_empty() {
             None
         } else {
-            Some(&mut self.bufs[self.tail])
+            Some(self.buf_mut(self.tail))
         }
     }
 
@@ -271,13 +371,8 @@ impl PipeInner {
         if self.is_empty() {
             None
         } else {
-            // Head points to next free slot, so previous slot is (head - 1)
-            let prev = if self.head == 0 {
-                PIPE_RING - 1
-            } else {
-                self.head - 1
-            };
-            Some(&self.bufs[prev])
+            // Head is the next free slot: the last one written is before
+            Some(self.buf(self.head.wrapping_sub(1)))
         }
     }
 
@@ -286,19 +381,14 @@ impl PipeInner {
         if self.is_empty() {
             None
         } else {
-            let prev = if self.head == 0 {
-                PIPE_RING - 1
-            } else {
-                self.head - 1
-            };
-            Some(&mut self.bufs[prev])
+            Some(self.buf_mut(self.head.wrapping_sub(1)))
         }
     }
 
     /// Advance tail after consuming a buffer
     pub fn advance_tail(&mut self, bytes: usize) {
         self.total_len = self.total_len.saturating_sub(bytes);
-        self.tail = (self.tail + 1) % PIPE_RING;
+        self.tail = self.tail.wrapping_add(1);
     }
 
     /// Add a buffer at head position
@@ -307,8 +397,8 @@ impl PipeInner {
             return Err(buf);
         }
         let bytes = buf.len as usize;
-        self.bufs[self.head] = buf;
-        self.head = (self.head + 1) % PIPE_RING;
+        *self.buf_mut(self.head) = buf;
+        self.head = self.head.wrapping_add(1);
         self.total_len += bytes;
         Ok(())
     }
@@ -398,10 +488,10 @@ impl PipeInner {
         let (mut read, mut dropped) = (0, 0);
         while !to.is_empty() && !self.is_empty() {
             let tail = self.tail;
-            let buf = &mut self.bufs[tail];
+            let buf = self.buf_mut(tail);
             let Some(page) = buf.page.as_ref().filter(|_| buf.len > 0) else {
                 // An empty slot: skip it
-                self.tail = (tail + 1) % PIPE_RING;
+                self.tail = tail.wrapping_add(1);
                 continue;
             };
             let (off, len) = (buf.offset as usize, buf.len as usize);
@@ -430,7 +520,7 @@ impl PipeInner {
             }
             if buf.len == 0 {
                 buf.release();
-                self.tail = (tail + 1) % PIPE_RING;
+                self.tail = tail.wrapping_add(1);
             }
             if packet {
                 break;
@@ -459,10 +549,12 @@ fn allocate_pipe_page() -> Option<Arc<PipePage>> {
 pub struct Pipe {
     /// Pipe buffer (Linux pipe->mutex); taken through [`Pipe::lock`]
     inner: Mutex<PipeInner>,
-    /// `inner.head` and `inner.tail` as of the last unlock, for lockless
-    /// readers (Linux READ_ONCE(pipe->head/tail))
+    /// `inner.head`, `inner.tail` and `inner.max_usage` as of the last
+    /// unlock, for lockless readers (Linux READ_ONCE(pipe->head/tail),
+    /// pipe->max_usage)
     head: AtomicUsize,
     tail: AtomicUsize,
+    max_usage: AtomicUsize,
     /// Wait queue for readers/writers
     pub wait_queue: WaitQueue,
     /// Number of read end references
@@ -483,7 +575,48 @@ pub struct Pipe {
 impl Pipe {
     /// Create a new pipe
     pub fn new() -> Result<Arc<Self>, KernelError> {
-        try_arc(Self::default())
+        try_arc(Self {
+            inner: Mutex::new(PipeInner::new()?),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            max_usage: AtomicUsize::new(PIPE_DEF_BUFFERS),
+            wait_queue: WaitQueue::new(),
+            readers: AtomicU32::new(1),
+            writers: AtomicU32::new(1),
+            r_counter: AtomicU32::new(0),
+            w_counter: AtomicU32::new(0),
+            fasync_readers: FasyncList::new(),
+            fasync_writers: FasyncList::new(),
+        })
+    }
+
+    /// F_GETPIPE_SZ: the pipe's size in bytes (Linux pipe_fcntl:
+    /// max_usage pages)
+    pub fn size(&self) -> usize {
+        self.lock().max_usage() * PAGE_SIZE
+    }
+
+    /// F_SETPIPE_SZ (Linux pipe_set_size): `arg` rounded up to a power
+    /// of two pages (EINVAL past 2^31); above fs.pipe-max-size needs
+    /// CAP_SYS_RESOURCE (EPERM); fewer slots than are in use is EBUSY.
+    /// The new size in bytes; writers waiting for room are woken
+    pub fn set_size(&self, arg: u64) -> Result<usize, KernelError> {
+        let size = round_pipe_size(arg);
+        let slots = size / PAGE_SIZE;
+        if slots == 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        if size > PIPE_MAX_SIZE.load(Ordering::Relaxed)
+            && !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
+        {
+            return Err(KernelError::NotPermitted);
+        }
+        let mut g = self.lock();
+        g.resize(slots)?;
+        let n = g.max_usage() * PAGE_SIZE;
+        drop(g);
+        self.wait_queue.wake_all();
+        Ok(n)
     }
 
     /// Lock the buffer (Linux pipe_lock); may sleep. Wake waiters only
@@ -499,7 +632,7 @@ impl Pipe {
     fn occupancy(&self) -> usize {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
-        (head + PIPE_RING - tail) % PIPE_RING
+        head.wrapping_sub(tail)
     }
 
     /// No buffered data, without the lock
@@ -509,7 +642,7 @@ impl Pipe {
 
     /// Every slot used, without the lock
     pub fn ring_full(&self) -> bool {
-        self.occupancy() >= PIPE_BUFFERS
+        self.occupancy() >= self.max_usage.load(Ordering::Acquire)
     }
 
     /// A reader need not wait (Linux pipe_readable): data or no writer
@@ -659,23 +792,6 @@ fn pipe_fasync(pipe: &Pipe, file: &File, fd: i32, on: bool) -> Result<(), Kernel
     Ok(())
 }
 
-impl Default for Pipe {
-    fn default() -> Self {
-        Self {
-            inner: Mutex::new(PipeInner::new()),
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
-            wait_queue: WaitQueue::new(),
-            readers: AtomicU32::new(1),
-            writers: AtomicU32::new(1),
-            r_counter: AtomicU32::new(0),
-            w_counter: AtomicU32::new(0),
-            fasync_readers: FasyncList::new(),
-            fasync_writers: FasyncList::new(),
-        }
-    }
-}
-
 /// A locked pipe buffer ([`Pipe::lock`])
 pub struct PipeGuard<'a> {
     pipe: &'a Pipe,
@@ -702,6 +818,9 @@ impl PipeGuard<'_> {
     pub fn publish(&self) {
         self.pipe.head.store(self.g.head, Ordering::Release);
         self.pipe.tail.store(self.g.tail, Ordering::Release);
+        self.pipe
+            .max_usage
+            .store(self.g.max_usage, Ordering::Release);
     }
 }
 
