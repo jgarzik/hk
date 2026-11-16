@@ -1103,10 +1103,3 @@ adjtimex keeps and reports the NTP frequency (ADJ_FREQUENCY) and the
 tick, but neither changes how fast the clock runs (Linux
 ntp_update_frequency), and maxerror does not grow each second (Linux
 second_overflow).
-
-## Errno differs from Linux
-
-- **User namespaces nest one level short** (ns/user.rs clone_ns): hk
-  refuses a child of a level-32 namespace; Linux create_user_ns refuses
-  only past `parent_ns->level > 32`, so 33 levels nest. Not testable on
-  both until uid_map is writable (Linux needs a mapping per level).

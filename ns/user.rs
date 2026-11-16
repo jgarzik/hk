@@ -186,7 +186,7 @@ impl UserNamespace {
     /// * `Err(ENOSPC)` - If max nesting level exceeded (Linux
     ///   create_user_ns)
     pub fn clone_ns(parent: &Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
-        if parent.level >= MAX_USER_NS_LEVEL {
+        if !may_nest(parent.level) {
             return Err(KernelError::NoSpace);
         }
 
@@ -261,3 +261,22 @@ impl UserNamespace {
 /// All processes belong to this namespace unless they create child namespaces.
 /// This namespace has an identity UID/GID mapping.
 pub static INIT_USER_NS: Lazy<Arc<UserNamespace>> = Lazy::new(UserNamespace::new_init);
+
+/// A child of a namespace at `level` may be made: past level 32 only
+/// is ENOSPC (Linux create_user_ns), so 33 levels nest
+fn may_nest(level: u32) -> bool {
+    level <= MAX_USER_NS_LEVEL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Linux create_user_ns: a parent past level 32 is refused, so
+    /// levels 1 to 33 are made from parents at 0 to 32
+    #[test]
+    fn nests_33_levels() {
+        assert!((0..=32).all(may_nest));
+        assert!(!may_nest(33));
+    }
+}
