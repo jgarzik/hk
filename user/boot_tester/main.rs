@@ -364,6 +364,7 @@ pub fn run_all_tests() {
     process::pidfd_thread::run_tests();
     mm::swap::run_tests();
     isolated(b"BLK", blk::disk::run_tests);
+    blk::limits::run_tests();
     blk::odirect::run_tests();
     blk::dioalign::run_tests();
     blk::dsync::run_tests();

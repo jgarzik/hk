@@ -4,8 +4,9 @@
 //!
 //! ## Design
 //!
-//! - Features: SIZE_MAX, SEG_MAX, BLK_SIZE, TOPOLOGY (physical block
-//!   size), FLUSH (volatile write cache), RO, MQ (one virtqueue per
+//! - Features: SIZE_MAX, SEG_MAX, GEOMETRY (HDIO_GETGEO), BLK_SIZE,
+//!   TOPOLOGY (physical block size, alignment, minimum and optimal
+//!   I/O), FLUSH (volatile write cache), RO, MQ (one virtqueue per
 //!   hardware queue, CPUs spread over them).
 //! - Limits from the device (Linux virtblk_read_limits): SEG_MAX
 //!   segments, SIZE_MAX bytes each (no limit without it), no sector
@@ -48,6 +49,10 @@
 //! (`IrqSpinlock`, leaf; Linux virtio_blk_vq.lock): `queue_rq` runs in
 //! thread context or, restarting, in the IRQ handler; `complete` in the
 //! IRQ handler or a polling submitter. Neither allocates nor sleeps.
+//! `VdDisk.vdev` (sleeping `sync::Mutex`, leaf; Linux vdev_mutex):
+//! HDIO_GETGEO reads the device's config under it; remove clears it,
+//! then resets the device and frees its IRQ and rings under it, so the
+//! config is never read after.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
@@ -61,8 +66,8 @@ use spin::Once;
 use crate::arch::phys_to_virt;
 use crate::block::blk_mq::{BlkMq, MqOps, Queued};
 use crate::block::blkdev::{
-    BLK_DEF_MAX_SECTORS_CAP, Bio, BioList, BioOp, Disk, QueueLimits, RequestQueue, SECTOR_SHIFT,
-    register_blkdev,
+    BLK_DEF_MAX_SECTORS_CAP, Bio, BioList, BioOp, Disk, HdGeometry, QueueLimits, RequestQueue,
+    SECTOR_SHIFT, register_blkdev,
 };
 use crate::block::genhd::{add_disk, del_gendisk, disk_name};
 use crate::hw::dma::{DmaAddr, DmaCoherent, DmaDirection, dma_map_single, dma_unmap_single};
@@ -79,6 +84,7 @@ use crate::util::kmem::{KVec, try_vec};
 mod feature {
     pub const SIZE_MAX: u32 = 1;
     pub const SEG_MAX: u32 = 2;
+    pub const GEOMETRY: u32 = 4;
     pub const RO: u32 = 5;
     pub const BLK_SIZE: u32 = 6;
     pub const FLUSH: u32 = 9;
@@ -91,9 +97,14 @@ mod cfg {
     pub const CAPACITY: u32 = 0;
     pub const SIZE_MAX: u32 = 8;
     pub const SEG_MAX: u32 = 12;
+    pub const CYLINDERS: u32 = 16;
+    pub const HEADS: u32 = 18;
+    pub const SECTORS: u32 = 19;
     pub const BLK_SIZE: u32 = 20;
     pub const PHYS_EXP: u32 = 24;
+    pub const ALIGNMENT_OFFSET: u32 = 25;
     pub const MIN_IO_SIZE: u32 = 26;
+    pub const OPT_IO_SIZE: u32 = 28;
     pub const NUM_QUEUES: u32 = 34;
 }
 
@@ -471,12 +482,20 @@ impl crate::base::Bound for VirtioBlkDev {
         let b = &self.0;
         // Nothing in flight, nothing more started
         del_gendisk(&b.disk);
+        // No config read from now on (Linux: vblk->vdev = NULL under
+        // vdev_mutex, held over the reset and del_vqs)
+        let g = vd_disk(&b.disk).map(|vd| {
+            let mut g = vd.vdev.lock();
+            *g = None;
+            g
+        });
         // Quiet before its IRQ goes (Linux: virtio_reset_device, then
         // del_vqs frees the IRQ); `stop` frees the rings
         let _ = b.vdev.reset();
         b.vdev.free_irq();
         let qs = b.disk.queue.mq().map_or(Vec::new(), |m| m.release());
         stop(&b.vdev, qs);
+        drop(g);
         printkln!("virtio-blk: {} removed", b.disk.name);
     }
 }
@@ -528,6 +547,37 @@ impl Drop for VdIndex {
     }
 }
 
+/// A disk's driver data (Linux struct virtio_blk, the part the disk
+/// reaches): its index and its device until removed (Linux vblk->vdev
+/// under vdev_mutex)
+struct VdDisk {
+    _index: VdIndex,
+    vdev: crate::sync::Mutex<Option<Arc<VirtioDevice>>>,
+}
+
+fn vd_disk(disk: &Disk) -> Option<&VdDisk> {
+    disk.private.get()?.downcast_ref::<VdDisk>()
+}
+
+/// HDIO_GETGEO (Linux virtblk_getgeo): the device's geometry if it
+/// reports one, else sd's default of 64 heads and 32 sectors; ENXIO
+/// once removed
+fn getgeo(disk: &Disk, geo: &mut HdGeometry) -> Result<(), KernelError> {
+    let vd = vd_disk(disk).ok_or(KernelError::NoDeviceOrAddress)?;
+    let g = vd.vdev.lock();
+    let vdev = g.as_ref().ok_or(KernelError::NoDeviceOrAddress)?;
+    if vdev.has_feature(feature::GEOMETRY) {
+        geo.cylinders = vdev.read_config(|d| d.cfg16(cfg::CYLINDERS));
+        geo.heads = vdev.read_config(|d| d.cfg8(cfg::HEADS));
+        geo.sectors = vdev.read_config(|d| d.cfg8(cfg::SECTORS));
+    } else {
+        geo.heads = 1 << 6;
+        geo.sectors = 1 << 5;
+        geo.cylinders = (disk.capacity() >> 11) as u16;
+    }
+    Ok(())
+}
+
 /// Queue limits from the device (Linux virtblk_read_limits, then
 /// blk_validate_limits); EINVAL for a segment size under a page (Linux
 /// BLK_MIN_SEGMENT_SIZE). `ring`: the smallest ring, which bounds a
@@ -543,12 +593,17 @@ fn limits(vdev: &VirtioDevice, ring: u16) -> Result<QueueLimits, KernelError> {
     } else {
         lbs
     };
-    // Linux virtblk_probe: min_io_size in logical blocks
-    let io_min = if f(feature::TOPOLOGY) {
-        lbs.saturating_mul(u32::from(vdev.read_config(|d| d.cfg16(cfg::MIN_IO_SIZE))))
-    } else {
-        0
+    // Linux virtblk_read_limits: in logical blocks
+    let topo = |off, read: fn(&VirtioDevice, u32) -> u32| {
+        if f(feature::TOPOLOGY) {
+            lbs.saturating_mul(vdev.read_config(|d| read(d, off)))
+        } else {
+            0
+        }
     };
+    let io_min = topo(cfg::MIN_IO_SIZE, |d, o| u32::from(d.cfg16(o)));
+    let io_opt = topo(cfg::OPT_IO_SIZE, |d, o| d.cfg32(o));
+    let alignment_offset = topo(cfg::ALIGNMENT_OFFSET, |d, o| u32::from(d.cfg8(o)));
     // At least one, at most what a request can carry
     let mut seg_max = if f(feature::SEG_MAX) {
         vdev.read_config(|d| d.cfg32(cfg::SEG_MAX))
@@ -580,6 +635,8 @@ fn limits(vdev: &VirtioDevice, ring: u16) -> Result<QueueLimits, KernelError> {
         max_segment_size: size_max,
         rotational: true,
         io_min,
+        io_opt,
+        alignment_offset,
         ..QueueLimits::default()
     })
 }
@@ -685,7 +742,10 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
     if i as usize * VD_MINORS as usize > u16::MAX as usize - VD_MINORS as usize {
         return Err(KernelError::Io);
     }
-    let private = try_box(index)?;
+    let private = try_box(VdDisk {
+        _index: index,
+        vdev: crate::sync::Mutex::new(Some(vdev.clone())),
+    })?;
     let (mq, lim) = setup_queues(vdev)?;
     let nq = mq.nr_hw_queues();
     let npoll = mq.nr_poll_queues();
@@ -701,6 +761,7 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
         vdev.has_feature(feature::RO),
     )?;
     disk.private.call_once(|| private);
+    disk.getgeo.call_once(|| getgeo);
     printkln!(
         "virtio-blk: {} {} sectors, {}/{} bytes, {} queues ({}), {} poll{}{}",
         disk.name,
@@ -721,6 +782,7 @@ impl VirtioDriver for VirtioBlkDriver {
         [
             feature::SIZE_MAX,
             feature::SEG_MAX,
+            feature::GEOMETRY,
             feature::RO,
             feature::BLK_SIZE,
             feature::FLUSH,

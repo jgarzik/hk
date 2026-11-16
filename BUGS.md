@@ -929,8 +929,11 @@ its no-writeback skip, before it relies on sync.
   swap (any holder of the partition besides the registry); Linux also
   takes the whole disk for exclusive use during the scan
   (bd_prepare_to_claim), so a rescan can race an exclusive opener.
-  BLKROSET, BLKDISCARD, BLKZEROOUT, BLKIOMIN/OPT, BLKALIGNOFF,
-  BLKSECTGET, HDIO_GETGEO and the BLKPG partition ioctls are ENOTTY.
+  BLKDISCARD, BLKZEROOUT, BLKSECDISCARD, BLKGETDISKSEQ, BLKROTATIONAL,
+  BLKDISCARDZEROES, BLKRAGET/BLKRASET, BLKFRAGET/BLKFRASET, BLKTRACE*,
+  the zone, persistent reservation and BLKPG partition ioctls are
+  ENOTTY. HDIO_GETGEO is ENOTTY on sd disks (Linux sd_getgeo:
+  scsicam_bios_param from the MBR, else a computed CHS).
 - virtio-blk: modern devices only (QEMU needs `disable-legacy=on`;
   Linux also drives transitional devices), INTx on arm64 (no MSI: the
   GICv3 ITS has no driver; Linux uses it on QEMU virt),

@@ -112,7 +112,9 @@ type BAttr = (&'static [u8], fn(&BlockDevice) -> String);
 const COMMON_ATTRS: [BAttr; 4] = [
     (b"size", |b| format!("{}\n", b.nr_sects())),
     (b"ro", |b| format!("{}\n", u8::from(b.ro()))),
-    (b"alignment_offset", |_| String::from("0\n")),
+    (b"alignment_offset", |b| {
+        format!("{}\n", b.alignment_offset())
+    }),
     (b"discard_alignment", |_| String::from("0\n")),
 ];
 
@@ -145,10 +147,8 @@ fn disk_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
         (b"hw_sector_size", |b| {
             format!("{}\n", b.logical_block_size())
         }),
-        (b"minimum_io_size", |b| {
-            format!("{}\n", b.physical_block_size())
-        }),
-        (b"optimal_io_size", |_| String::from("0\n")),
+        (b"minimum_io_size", |b| format!("{}\n", b.io_min())),
+        (b"optimal_io_size", |b| format!("{}\n", b.io_opt())),
         (b"rotational", |b| {
             format!("{}\n", u8::from(b.disk.queue.limits.rotational))
         }),

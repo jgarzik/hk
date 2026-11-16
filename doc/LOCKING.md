@@ -273,7 +273,8 @@ the mmap_lock (`Mm.map`), `AnonVma.chain`, `Cgroup.{children,
 subsys}`; `Mutex`:
 `SuperBlock.s_vfs_rename_mutex`, `File.f_pos_lock`,
 `SignalStruct.cred_guard`, RTNL (Linux rtnl_mutex),
-`UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex`, `SWAPON`,
+`UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex`,
+`VdDisk.vdev`, `SWAPON`,
 `Pipe.inner` (Linux pipe->mutex), `Eventpoll.mtx` (Linux ep->mtx) and
 the inotify and fanotify `mark_mutex` (Linux group->mark_mutex).
 The socket owner lock `net::sock_lock::SockLock` (Linux socket_lock_t:
@@ -708,6 +709,8 @@ Block locks (3.10 Block Device Subsystem):
     a poll queue is a hardware queue no interrupt reaches: taken by the
     polled bio's submitter and by pollers, `BlkMq::poll_queues`)
     Completion.done (IrqSpinlock) → wait queue head → run-queue lock
+    VdDisk.vdev (sleeping) → virtio-blk teardown (IRQ free, hardware
+    queues, rings); HDIO_GETGEO's config read takes nothing
 
 Network locks (3.10 Network Subsystem has the full order):
     RTNL (sleeping, outermost; never under any spinlock)
@@ -4655,6 +4658,8 @@ thread context, the driver completes it from its interrupt handler and
 | blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list, the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock), the in-flight count and the dying flag | thread (dispatch, drain, release) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep (virtio-blk's descriptor tables are allocated with the queue: a small one per tag and a bounded set of full-size ones; a request that finds no full-size one free stays on the dispatch list until a completion puts one back); taken under its line's `IrqDesc.lock` in the ISR |
 | `BlkMq.drained` | `WaitQueue` (Linux mq_freeze_wq) | woken from any context (the request end that empties a dying queue's count, after the queue locks are dropped); waited in thread context (`del_gendisk`, no lock held) | its head lock -> run-queue lock; the condition reads the counts only |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
+| `VdDisk.vdev` (`hw/virtio/blk.rs`) | sleeping `sync::Mutex<Option<Arc<VirtioDevice>>>` (Linux vblk->vdev_mutex) | thread only | HDIO_GETGEO (`getgeo`) reads the device config under it, lock-free (the config generation loop), nothing else taken; remove, after `del_gendisk`, clears it and resets the device, frees its IRQ and takes its queues and rings back under it, so no config read follows the reset |
+| `BlockDevice.read_only`, `Disk.part0_ro`, `BlockDevice.ro_warned` | `AtomicBool`, lock-free (Linux BD_READ_ONLY, BD_RO_WARNED in the atomic bd_flags) | any (stored by BLKROSET, read by writes, writeback's bios and mmap) | lone flags: a write checks them as it starts, as Linux bdev_read_only; one in flight when BLKROSET lands completes, as in Linux |
 | `RamDisk.pages` | spin `Mutex<XArray>` (Linux brd_pages xa_lock) | thread only (bio-based driver) | leaf; a page's frame is allocated before it, index nodes with it dropped (`xarray::store_nomem`), a frame that lost a race freed |
 
 Rules:

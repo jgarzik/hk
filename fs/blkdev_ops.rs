@@ -16,13 +16,13 @@ use alloc::sync::Arc;
 
 use crate::block::DevId;
 use crate::block::blkdev::{
-    BioOp, BlockDevice, SECTOR_SHIFT, bdev_rw_bytes, bdev_rw_frame, blkdev_issue_flush, get_blkdev,
-    sync_blockdev,
+    BioOp, BlockDevice, HdGeometry, SECTOR_SHIFT, bdev_rw_bytes, bdev_rw_frame, blkdev_issue_flush,
+    get_blkdev, sync_blockdev,
 };
 use crate::block::genhd;
 use crate::fs::inode::{Inode, InodeMode, Timespec};
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
-use crate::uaccess::{get_user, put_user};
+use crate::uaccess::{copy_to_user, get_user, put_user};
 use crate::util::error::KernelError;
 use core::sync::atomic::Ordering;
 
@@ -30,16 +30,22 @@ use super::file::{File, FileOps, RwFlags, generic_write_sync, seek};
 use super::iov_iter::{IovDest, IovSource};
 use crate::block::dio;
 
-/// Block device ioctls (Linux include/uapi/linux/fs.h)
+/// Block device ioctls (Linux include/uapi/linux/fs.h, hdreg.h)
 pub mod ioc {
+    pub const HDIO_GETGEO: u32 = 0x0301;
+    pub const BLKROSET: u32 = 0x125d;
     pub const BLKROGET: u32 = 0x125e;
     pub const BLKRRPART: u32 = 0x125f;
     pub const BLKGETSIZE: u32 = 0x1260;
     pub const BLKFLSBUF: u32 = 0x1261;
+    pub const BLKSECTGET: u32 = 0x1267;
     pub const BLKSSZGET: u32 = 0x1268;
     pub const BLKBSZGET: u32 = 0x8008_1270;
     pub const BLKBSZSET: u32 = 0x4008_1271;
     pub const BLKGETSIZE64: u32 = 0x8008_1272;
+    pub const BLKIOMIN: u32 = 0x1278;
+    pub const BLKIOOPT: u32 = 0x1279;
+    pub const BLKALIGNOFF: u32 = 0x127a;
     pub const BLKPBSZGET: u32 = 0x127b;
 }
 
@@ -432,9 +438,6 @@ impl Aops for BdevAops {
 
     fn writepage(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
         let b = inode_bdev(inode)?;
-        if b.ro() {
-            return Err(KernelError::NotPermitted);
-        }
         let bits = page_struct(phys)?.private.swap(0, Ordering::Relaxed);
         if bits == 0 {
             return bdev_rw_frame(&b, BioOp::Write, index << (12 - SECTOR_SHIFT), phys);
@@ -516,6 +519,11 @@ fn put_int(arg: u64, v: i32) -> Result<i64, KernelError> {
     Ok(0)
 }
 
+fn put_u16(arg: u64, v: u16) -> Result<i64, KernelError> {
+    put_user::<u16>(arg, v).map_err(|_| KernelError::BadAddress)?;
+    Ok(0)
+}
+
 fn put_u64(arg: u64, v: u64) -> Result<i64, KernelError> {
     put_user::<u64>(arg, v).map_err(|_| KernelError::BadAddress)?;
     Ok(0)
@@ -529,12 +537,50 @@ fn need_admin() -> Result<(), KernelError> {
     }
 }
 
+/// BLKROSET (Linux blkdev_roset): no driver has a set_read_only hook
+fn roset(b: &BlockDevice, arg: u64) -> Result<i64, KernelError> {
+    need_admin()?;
+    let n = get_user::<i32>(arg).map_err(|_| KernelError::BadAddress)?;
+    b.set_ro(n != 0);
+    Ok(0)
+}
+
+/// HDIO_GETGEO (Linux blkdev_getgeo): the driver's geometry, `start`
+/// the device's first sector unless the driver overrides it; ENOTTY
+/// if the driver has none
+fn getgeo(b: &BlockDevice, arg: u64) -> Result<i64, KernelError> {
+    if arg == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let f = b.disk.getgeo.get().ok_or(KernelError::NotTty)?;
+    let mut geo = HdGeometry {
+        start: b.start,
+        ..HdGeometry::default()
+    };
+    f(&b.disk, &mut geo)?;
+    copy_to_user(arg, &geo.to_bytes()).map_err(|_| KernelError::BadAddress)?;
+    Ok(0)
+}
+
+/// BLKSECTGET: the largest request in sectors, capped to a u16 (Linux
+/// queue_max_sectors, USHRT_MAX)
+fn sectget(b: &BlockDevice, arg: u64) -> Result<i64, KernelError> {
+    let n = b.disk.queue.limits.max_sectors.min(u32::from(u16::MAX));
+    put_u16(arg, n as u16)
+}
+
 /// Linux blkdev_common_ioctl / blkdev_ioctl subset
 fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError> {
     match cmd {
+        ioc::HDIO_GETGEO => getgeo(b, arg),
+        ioc::BLKROSET => roset(b, arg),
         ioc::BLKROGET => put_int(arg, i32::from(b.ro())),
         ioc::BLKSSZGET => put_int(arg, b.logical_block_size() as i32),
         ioc::BLKPBSZGET => put_int(arg, b.physical_block_size() as i32),
+        ioc::BLKIOMIN => put_int(arg, b.io_min() as i32),
+        ioc::BLKIOOPT => put_int(arg, b.io_opt() as i32),
+        ioc::BLKALIGNOFF => put_int(arg, b.alignment_offset() as i32),
+        ioc::BLKSECTGET => sectget(b, arg),
         ioc::BLKBSZGET => put_int(arg, b.block_size() as i32),
         ioc::BLKGETSIZE => put_u64(arg, b.nr_sects()),
         ioc::BLKGETSIZE64 => put_u64(arg, b.nr_sects() << SECTOR_SHIFT),
