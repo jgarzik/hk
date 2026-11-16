@@ -1003,6 +1003,7 @@ when no fair task is there.
 Each `PerCpu` (per-CPU data) contains:
 ```rust
 pub interrupt_depth: AtomicU32,   // Nesting depth of interrupts
+pub irq_user: AtomicBool,         // The interrupt came from user mode (3.5)
 pub preempt_count: AtomicU32,     // Preemption disable count
 ```
 
@@ -1395,10 +1396,9 @@ A `Task` has five kinds of fields: fixed at creation (`tid`, `pid`,
 creator before it first runs) or under TASKLIST, and read lock-free
 by anyone (`flags` = Linux PF_*, `thread_flags` = TIF_*, `cpu`,
 `start_time`, `ppid`/`pgid`/`sid`, `seccomp_mode`, `tls`, utime/stime
-and the other counters; utime/stime/last_run_ns/in_kernel are written
-only on the task's own CPU with interrupts off (its syscall entry and
-exit, its context switches, the tick) inside the `acct_seq` sequence
-count, which readers on other CPUs retry on; `prev_cputime`, in the
+and the other counters; utime/stime are tick samples, added (a load
+and a store) only by the tick of the CPU running the task, interrupts
+off (3.5); `prev_cputime`, in the
 task and in its SignalStruct, is an IrqSpinlock leaf (Linux
 prev_cputime.lock) held only by `cputime_adjust` (times, getrusage,
 wait's rusage, /proc/<pid>/stat), under TASKLIST or not); `cred` (below); the
@@ -3779,6 +3779,26 @@ Writers (`write_begin`/`write_end`, under `TimeKeeper.lock`): `seq += 1`
 then `fence(Release)` (smp_wmb) before the field stores, and
 `fence(Release)` then `seq += 1` after them (Linux write_seqcount_*).
 
+#### CPU time (task/cputime.rs; Linux kernel/sched/cputime.c)
+
+Tick-based, as Linux CONFIG_TICK_CPU_ACCOUNTING: nothing is done at
+syscall entry or exit. The arch's interrupt entry records in its
+`PerCpu.irq_user` whether the interrupted frame was user mode (x86: the
+frame's CS RPL; arm64: the EL0 vector), saved and restored around the
+handler (Linux set_irq_regs); only that CPU writes it, interrupts off.
+Each tick (`scheduler_tick`, interrupt context) then calls
+`account_process_tick`: `TICK_NS` of utime if `irq_user`, else of stime
+unless it interrupted only the idle task, added to the running task
+(load and store: the tick of its CPU is the only writer) and, while
+its group keeps CPU timer totals, to `GroupCputimer`'s sums (RMWs:
+every thread's CPU adds). Runtime is exact (`se.sum_exec_runtime`,
+3.1). Readers: SCHED clocks read the runtime (`task_sched_runtime`
+under the task's rq lock); PROF/VIRT clocks, CPU timers, itimers and
+RLIMIT_CPU the raw samples; times, getrusage, wait's rusage and
+/proc/<pid>/stat scale the samples to the runtime (`cputime_adjust`,
+under `prev_cputime`, an IrqSpinlock leaf); SIGCHLD's times are the
+raw samples (Linux do_notify_parent).
+
 ### 3.6 Kernel Logging (printk)
 
 **Location:** `printk.rs`, `console.rs`
@@ -5115,7 +5135,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `SignalStruct.leader_pid` | signal/mod.rs | `TableCell` (TASKLIST) | the group leader's struct pid (Linux signal->pids[PIDTYPE_TGID]), ITIMER_REAL's target: set under the write lock when the group's first task is attached (`install_fork_signal`, `init_task_signal`); an exec by another thread keeps it (that thread takes the leader's struct pid, exchange_tids); read under the read lock |
 | `PosixTimer.inner` | time/posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete). A CPU-time timer's clock value is read before it (that may take TASKLIST) |
 | `PosixTimer.sigq` | time/posix_timer.rs | spin Mutex | a timer_create timer's preallocated signal entry while it is not queued (Linux SIGQUEUE_PREALLOC); leaf, never in hardirq, never with `inner` or a signal lock. The entry is taken out to be queued by `signal::send_timer_sigqueue` with no lock held, and put back when its signal is dequeued (`posix_timer::deliver`, which rearms an interval timer under `inner`), flushed or refused (`reclaim`). A flushed set is dropped wherever its send ran: kill_fasync's F_SETSIG stop signal or SIGCONT drops it under `Fasync.fa` / `FOwner.st` (interrupts off), RCU and the caller's spin locks, so `reclaim` takes `sigq` there as a leaf and puts the timer reference it upgraded through `put_rcu` (Linux posixtimer_putref: kfree_rcu): a timer deleted meanwhile is torn down in `rcuc/N`, its hrtimer idle, never under those locks |
-| CPU-timer state (`time/cpu_timer.rs`): `SignalStruct.cputimer`, `Task.cpu_next` | time/cpu_timer.rs | atomics | the group's running CPU totals (utime, stime, sum_exec_runtime: Linux cputime_atomic, RMWs from every thread's CPU) and expiry hints per PROF/VIRT/SCHED sample, a thread's hints; written by the tick, accounting and runtime charges (rq lock, interrupts off) and by `run` in task context. The group totals start (arming a process timer, `arm_group`) and stop (`run` finding nothing armed) only under `posix_timers`; sampling never starts them (Linux cpu_clock_sample_group with start=false for gettime). `run` (TIF_NOTIFY_RESUME on the way to user mode) takes `posix_timers` -> `PosixTimer.inner`, then `SignalStruct.rlim`, and sends signals after dropping them: expired timers go on a local firing list through their embedded `PosixTimer.elist` (Linux collect_timerqueue, no allocation), marked `collected` and `firing` under `inner`; after the lock each is unlinked, `collected` cleared under `inner`, and fired if `firing` is still set (settime and delete clear it). A timer still `collected` is skipped by another thread's pass, so it is never linked twice. The itimers' and RLIMIT_CPU's process signals are kept in locals (one each) |
+| CPU-timer state (`time/cpu_timer.rs`): `SignalStruct.cputimer`, `Task.cpu_next` | time/cpu_timer.rs | atomics | the group's running CPU totals (utime, stime, sum_exec_runtime: Linux cputime_atomic, RMWs from every thread's CPU) and expiry hints per PROF/VIRT/SCHED sample, a thread's hints; written by the tick's samples and runtime charges (rq lock, interrupts off) and by `run` in task context. The group totals start (arming a process timer, `arm_group`) and stop (`run` finding nothing armed) only under `posix_timers`; sampling never starts them (Linux cpu_clock_sample_group with start=false for gettime). `run` (TIF_NOTIFY_RESUME on the way to user mode) takes `posix_timers` -> `PosixTimer.inner`, then `SignalStruct.rlim`, and sends signals after dropping them: expired timers go on a local firing list through their embedded `PosixTimer.elist` (Linux collect_timerqueue, no allocation), marked `collected` and `firing` under `inner`; after the lock each is unlinked, `collected` cleared under `inner`, and fired if `firing` is still set (settime and delete clear it). A timer still `collected` is skipped by another thread's pass, so it is never linked twice. The itimers' and RLIMIT_CPU's process signals are kept in locals (one each) |
 | timerfd `CANCEL_LIST` | time/timerfd.rs | `RcuList` (its `ends` spin leaf), thread only | the timerfds that armed TFD_TIMER_CANCEL_ON_SET (Linux cancel_list), linked through `Timerfd.clist`: `clock_was_set` walks it under `rcu::read_lock` and takes each one's `inner` (IrqSpinlock) in turn, skipping one whose `might_cancel` is off; `setup_cancel` decides under `inner` (`might_cancel`, `listed`), drops it, and the first arming links the timerfd; it stays linked until its release, which clears `listed` under `inner` and unlinks it with no lock held; the list's reference goes with `RcuUnlinked::defer` (Linux kfree_rcu: `Timerfd.rcu`), dropped by `rcuc/N` after a grace period, its timer already cancelled (a HARD hrtimer's drop only spins on a running callback, and none runs). Never nested with `inner` |
 | `TimerBase.wheel` (per CPU, HARD and SOFT) | time/timer.rs | IrqSpinlock leaf | a 64-slot wheel of `TimerList`s (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the tick, by `ktimers/N` and by arming/deleting code in any context |
 | `HrBase.q` (per CPU, HARD and SOFT) | time/hrtimer.rs | IrqSpinlock leaf | sorted lists of `HrTimer`s per clock (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the clock event interrupt, by `ktimers/N` and by start/cancel in any context. `SOFT_ACTIVATED` (per-CPU atomic, Linux softirq_activated): set by the clock interrupt when it hands due SOFT timers to `ktimers/N`, cleared by it after its pass (interrupts off, then reprogram); while set the clock event counts only HARD timers |

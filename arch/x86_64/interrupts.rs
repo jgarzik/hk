@@ -308,10 +308,19 @@ pub extern "C" fn idt_dispatch(regs: &UserFrame, vector: u64) {
     match vector {
         // Exceptions stay on the stack they hit
         0..=31 => handle_exception(regs, vector),
-        // From user mode the task stack is empty: interrupts run there
-        // (Linux run_irq_on_irqstack_cond, run_sysvec_on_irqstack_cond)
-        v if user => handle_interrupt(v),
-        v => crate::irq_stack::run(|| handle_interrupt(v)),
+        v => {
+            // Where it came from, for the tick (Linux set_irq_regs)
+            let old = super::percpu::irq_regs_enter(user);
+            // From user mode the task stack is empty: interrupts run
+            // there (Linux run_irq_on_irqstack_cond,
+            // run_sysvec_on_irqstack_cond)
+            if user {
+                handle_interrupt(v);
+            } else {
+                crate::irq_stack::run(|| handle_interrupt(v));
+            }
+            super::percpu::irq_regs_exit(old);
+        }
     }
     // Back to user mode: its pending work first (Linux
     // irqentry_exit_to_user_mode); not for NMI, #DF, #MC (paranoid)

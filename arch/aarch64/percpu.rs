@@ -51,6 +51,12 @@ pub struct PerCpu {
     /// Nesting depth of interrupt handlers
     pub interrupt_depth: AtomicU32,
 
+    /// The interrupt being handled came from user mode (Linux
+    /// __irq_regs, as user_mode(regs)): written only by this CPU at
+    /// interrupt entry and exit (`irq_regs_enter`/`_exit`), read by its
+    /// tick
+    pub irq_user: AtomicBool,
+
     /// Preemption count - tracks nested critical sections
     pub preempt_count: AtomicU32,
 }
@@ -71,6 +77,7 @@ impl PerCpu {
             ticks: AtomicU64::new(0),
             curr: AtomicUsize::new(0),
             interrupt_depth: AtomicU32::new(0),
+            irq_user: AtomicBool::new(false),
             preempt_count: AtomicU32::new(0),
         }
     }
@@ -86,6 +93,7 @@ impl PerCpu {
         self.ticks.store(0, Ordering::Relaxed);
         self.curr.store(0, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
+        self.irq_user.store(false, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
     }
 
@@ -270,6 +278,27 @@ pub fn preempt_disable() {
         this_cpu_add(&percpu.preempt_count, 1);
         // Linux preempt_disable's barrier(): the section stays after it
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+/// Entering an interrupt that came from user mode or not (Linux
+/// set_irq_regs): recorded for the tick (`irq_from_user`); returns the
+/// value of the context it interrupted, for `irq_regs_exit`
+#[inline]
+pub fn irq_regs_enter(user: bool) -> bool {
+    // This CPU's word, interrupts off: a load and a store
+    try_current_cpu().is_some_and(|p| {
+        let old = p.irq_user.load(Ordering::Relaxed);
+        p.irq_user.store(user, Ordering::Relaxed);
+        old
+    })
+}
+
+/// Leaving the interrupt: restore the interrupted context's value
+#[inline]
+pub fn irq_regs_exit(old: bool) {
+    if let Some(p) = try_current_cpu() {
+        p.irq_user.store(old, Ordering::Relaxed);
     }
 }
 

@@ -53,23 +53,6 @@ argued / published copy of locked state.
   rule 5). The counts and the drain lock are done.
 - Fix: set-once (`Once` or the constructor) where boot order allows.
 
-### 6. CPU-time accounting at every syscall boundary uses RMW seqcount — (c)(a)
-- Where: `task/mod.rs` `Task::acct_begin`/`acct_end` (`acct_seq.fetch_add`),
-  called by `account`, `switch_in`, `switch_out`; `task/percpu.rs`
-  `account_syscall_enter`/`_exit`; `time/cpu_timer.rs`
-  `GroupCputimer::charge` (shared `sums[].fetch_add` per syscall for every
-  thread of a group with a process CPU timer).
-- Wrong: the sequence has one writer (the task's CPU, IRQs off) yet each
-  boundary does two locked RMWs plus clock read and IRQ save/restore on every
-  syscall entry and exit; with a process timer armed all threads hammer one
-  shared line per syscall.
-- Linux: default tick-based accounting does nothing on syscall entry;
-  VIRT_CPU_ACCOUNTING_GEN uses `write_seqcount_begin` (plain increment +
-  `smp_wmb`) and only on nohz_full CPUs; group sums are charged from
-  `update_curr` (tick/switch), not per syscall.
-- Fix: `acct_seq` Relaxed load+store with the existing fences; charge the
-  group cputimer at switch/tick only; decide whether per-syscall precision is
-  needed at all (Linux does not provide it by default). LOCKING.md §3.1/§3.5.
 
 ### 8. Inode eviction bumps a global counter and global wait queue — (c)
 - Where: `fs/icache.rs` `FREED`, `FREED_WQ`, `evict` (`fetch_add(AcqRel)` +

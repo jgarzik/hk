@@ -527,6 +527,12 @@ impl PerCpuOps for Aarch64Arch {
             .unwrap_or(0)
     }
 
+    #[inline]
+    fn irq_from_user() -> bool {
+        percpu::try_current_cpu()
+            .is_some_and(|p| p.irq_user.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
     fn cpu_online(cpu: u32) -> bool {
         (cpu as usize) < percpu::MAX_CPUS
             && percpu::get_percpu(cpu)

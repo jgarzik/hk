@@ -837,27 +837,14 @@ pub struct Task {
     /// (ioprio_set), so read only under `alloc_lock`
     io_context: OwnCell<Option<Arc<IoContext>>>,
 
-    /// User CPU time consumed (nanoseconds)
+    /// User CPU time, ns: tick samples (Linux p->utime), added only by
+    /// the tick of the CPU running the task (a load and a store), read
+    /// lock-free
     pub utime: AtomicU64,
-    /// System CPU time consumed (nanoseconds)
+    /// System CPU time, ns: tick samples (Linux p->stime), as `utime`
     pub stime: AtomicU64,
     /// utime/stime last reported, adjusted (Linux p->prev_cputime)
     pub prev_cputime: cputime::PrevCputime,
-    /// When the task last started running or crossed the user/kernel
-    /// boundary (for the utime/stime split)
-    pub last_run_ns: AtomicU64,
-    /// In kernel mode (for the utime/stime split)
-    pub in_kernel: AtomicBool,
-    /// Sequence count around changes of utime/stime/last_run_ns/in_kernel
-    /// (Linux seqcount, as vtime->seqcount): odd while one is under way.
-    /// Their only writer is the task's own CPU with interrupts off (its
-    /// syscalls, its switches, the tick), so readers on other CPUs retry
-    acct_seq: AtomicU32,
-    /// On a CPU since its last accounting point, for readers adding
-    /// the current slice: set by `switch_in`, cleared by `switch_out`,
-    /// both inside `acct_seq` (`se.on_cpu` clears only after the
-    /// switch, which would add a slice already charged)
-    acct_running: AtomicBool,
     /// Earliest expiry (ns of its PROF, VIRT, SCHED time) of a CPU
     /// timer on this thread's clock: a hint for the tick (`cpu_timer`;
     /// Linux posix_cputimers' expiry cache)
@@ -1627,11 +1614,7 @@ impl Task {
             io_context: OwnCell::new(None),
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
-            last_run_ns: AtomicU64::new(now),
-            in_kernel: AtomicBool::new(kind == TaskKind::KernelThread),
-            acct_seq: AtomicU32::new(0),
             prev_cputime: cputime::PrevCputime::new(),
-            acct_running: AtomicBool::new(false),
             cpu_next: [const { AtomicU64::new(crate::time::cpu_timer::NONE) }; 3],
             cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
@@ -1698,11 +1681,7 @@ impl Task {
             io_context: OwnCell::new(None),
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
-            last_run_ns: AtomicU64::new(0),
-            in_kernel: AtomicBool::new(true),
-            acct_seq: AtomicU32::new(0),
             prev_cputime: cputime::PrevCputime::new(),
-            acct_running: AtomicBool::new(false),
             cpu_next: [const { AtomicU64::new(crate::time::cpu_timer::NONE) }; 3],
             cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
@@ -1946,38 +1925,6 @@ impl Task {
         self.thread_flags.fetch_and(!f, Ordering::AcqRel) & f != 0
     }
 
-    /// Charge the time since the last boundary to user or system time
-    /// and start a new interval in `kernel` mode (the task itself: the
-    /// only writer, so plain loads and stores suffice)
-    pub fn account(&self, now: u64, kernel: bool) {
-        self.acct_begin();
-        self.charge(now, kernel);
-        self.acct_end();
-    }
-
-    /// The body of `account`, inside the caller's sequence window
-    fn charge(&self, now: u64, kernel: bool) {
-        let delta = now.saturating_sub(self.last_run_ns.load(Ordering::Relaxed));
-        let was_kernel = self.in_kernel.load(Ordering::Relaxed);
-        // The group's running totals for its CPU timers (when kept)
-        if let Some(g) = self.cpu_group.get() {
-            g.cputimer.charge(delta, was_kernel);
-        }
-        let t = if was_kernel { &self.stime } else { &self.utime };
-        t.store(
-            t.load(Ordering::Relaxed).saturating_add(delta),
-            Ordering::Relaxed,
-        );
-        self.last_run_ns.store(now, Ordering::Relaxed);
-        self.in_kernel.store(kernel, Ordering::Relaxed);
-    }
-
-    /// Charge the time since the last accounting point to the mode the
-    /// task is in, staying in it (a context switch away, the tick)
-    pub fn account_now(&self, now: u64) {
-        self.account(now, self.in_kernel.load(Ordering::Relaxed));
-    }
-
     /// Its thread group's SignalStruct (none for kernel threads)
     pub fn cpu_group(&self) -> Option<&Arc<crate::signal::SignalStruct>> {
         self.cpu_group.get()
@@ -1988,74 +1935,9 @@ impl Task {
         self.cpu_group.call_once(|| s.clone());
     }
 
-    /// The task starts running at `now`: the time it was off a CPU is
-    /// nobody's (Linux vtime_task_switch)
-    pub fn switch_in(&self, now: u64) {
-        self.acct_begin();
-        self.last_run_ns.store(now, Ordering::Relaxed);
-        self.acct_running.store(true, Ordering::Relaxed);
-        self.acct_end();
-    }
-
-    /// The task leaves its CPU at `now`: charge its time up to now and
-    /// stop counting a running slice, in one sequence window
-    pub fn switch_out(&self, now: u64) {
-        self.acct_begin();
-        self.charge(now, self.in_kernel.load(Ordering::Relaxed));
-        self.acct_running.store(false, Ordering::Relaxed);
-        self.acct_end();
-    }
-
-    fn acct_begin(&self) {
-        self.acct_seq.fetch_add(1, Ordering::Relaxed);
-        core::sync::atomic::fence(Ordering::Release);
-    }
-
-    fn acct_end(&self) {
-        self.acct_seq.fetch_add(1, Ordering::Release);
-    }
-
-    /// (utime, stime) at `now`, including the slice of a task running
-    /// on a CPU since its last accounting point (Linux task_cputime with
-    /// vtime_delta), consistent from any CPU
-    pub fn cputime(&self, now: u64) -> (u64, u64) {
-        loop {
-            let s1 = self.acct_seq.load(Ordering::Acquire);
-            if s1 & 1 != 0 {
-                core::hint::spin_loop();
-                continue;
-            }
-            let (mut u, mut s) = self.times();
-            let last = self.last_run_ns.load(Ordering::Relaxed);
-            let kernel = self.in_kernel.load(Ordering::Relaxed);
-            let running = self.acct_running.load(Ordering::Relaxed);
-            core::sync::atomic::fence(Ordering::Acquire);
-            if self.acct_seq.load(Ordering::Relaxed) != s1 {
-                continue;
-            }
-            if running {
-                let d = now.saturating_sub(last);
-                if kernel {
-                    s += d;
-                } else {
-                    u += d;
-                }
-            }
-            return (u, s);
-        }
-    }
-
     /// Start time (monotonic ns)
     pub fn start_time(&self) -> u64 {
         self.start_time.load(Ordering::Relaxed)
-    }
-
-    /// (utime, stime) in nanoseconds
-    pub fn times(&self) -> (u64, u64) {
-        (
-            self.utime.load(Ordering::Relaxed),
-            self.stime.load(Ordering::Relaxed),
-        )
     }
 }
 

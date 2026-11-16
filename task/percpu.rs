@@ -3659,16 +3659,10 @@ fn context_switch_locked(
     }
     // SAFETY: a task of this run queue, alive while it holds it
     let n = unsafe { &*next };
-    // The outgoing task's time up to now; the incoming one counts from
-    // now (its time off the CPU is nobody's)
-    let now = crate::time::monotonic_ns();
-    // Its runtime up to now (Linux put_prev_task -> update_curr); the
-    // incoming one's counts from `make_current` (set_next_entity)
-    rq.update_curr(now);
-    if prev.tid() != 0 {
-        prev.switch_out(now);
-    }
-    n.switch_in(now);
+    // The outgoing task's runtime up to now (Linux put_prev_task ->
+    // update_curr); the incoming one's counts from `make_current`
+    // (set_next_entity): its time off the CPU is nobody's
+    rq.update_curr(crate::time::monotonic_ns());
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(n);
     rq.curr = next;
     rq.prev = prev;
@@ -4364,12 +4358,9 @@ pub fn scheduler_tick() {
     // the CPU's rt runtime (`rt_tick`, `rt_period_tick`)
     let me = current();
     let now = crate::time::monotonic_ns();
-    // Its CPU time so far, so a task that never makes a syscall or
-    // switches is charged too (Linux account_process_tick)
-    if me.tid() != 0 {
-        me.account_now(now);
-        crate::time::cpu_timer::tick(&me);
-    }
+    // The tick's sample of the task it interrupted, user or system
+    // time (Linux update_process_times -> account_process_tick)
+    crate::task::cputime::account_process_tick(&me, CurrentArch::irq_from_user());
     let resched = match me.se.class() {
         Class::Stop => false,
         Class::Rt => {
@@ -4386,6 +4377,11 @@ pub fn scheduler_tick() {
     };
     if resched {
         me.set_tif(crate::task::tif::NEED_RESCHED);
+    }
+    // Its CPU timers, on the samples and runtime charged above (Linux
+    // run_posix_cpu_timers after sched_tick)
+    if me.tid() != 0 {
+        crate::time::cpu_timer::tick(&me);
     }
 }
 
@@ -4777,26 +4773,6 @@ pub fn children_times() -> (u64, u64) {
         .view(&current())
         .and_then(|t| t.signal.clone())
         .map_or((0, 0), |s| s.child_times())
-}
-
-/// Syscall entry: user time ends, system time starts
-pub fn account_syscall_enter() {
-    account_current(true);
-}
-
-/// Syscall return: system time ends, user time starts
-pub fn account_syscall_exit() {
-    account_current(false);
-}
-
-fn account_current(kernel: bool) {
-    let me = current();
-    if me.tid() != 0 {
-        // Interrupts off: the tick charges this task too (acct_seq)
-        let irq = crate::sync::local_irq_save();
-        me.account(crate::time::monotonic_ns(), kernel);
-        crate::sync::local_irq_restore(irq);
-    }
 }
 
 /// Task `t`'s CPU affinity mask; None once it is reaped

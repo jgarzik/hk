@@ -19,8 +19,8 @@
 //! The group totals (Linux thread_group_cputimer) are atomics in the
 //! SignalStruct, started from the group's CPU time when the first
 //! process timer or a finite RLIMIT_CPU is armed and fed after by
-//! every thread's runtime charge (`sched::update_se`) and accounting
-//! point (`Task::account`), so they are exact to a tick. Thread caches
+//! every thread's runtime charges (`sched::update_se`) and tick samples
+//! (`cputime::account_process_tick`), so they are exact to a tick. Thread caches
 //! are per-task atomics. Both are hints: a stale one only costs a pass
 //! of `run`.
 //!
@@ -107,11 +107,19 @@ impl GroupCputimer {
         }
     }
 
-    /// A thread of the group ran `delta` ns in user (or kernel) mode
-    /// (Linux account_group_*_time)
-    pub fn charge(&self, delta: u64, kernel: bool) {
+    /// A thread of the group got `delta` ns of user time (Linux
+    /// account_group_user_time)
+    pub fn account_user_time(&self, delta: u64) {
         if self.active.load(Ordering::Relaxed) {
-            self.sums[usize::from(kernel)].fetch_add(delta, Ordering::Relaxed);
+            self.sums[0].fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// A thread of the group got `delta` ns of system time (Linux
+    /// account_group_system_time)
+    pub fn account_system_time(&self, delta: u64) {
+        if self.active.load(Ordering::Relaxed) {
+            self.sums[1].fetch_add(delta, Ordering::Relaxed);
         }
     }
 

@@ -393,6 +393,11 @@ pub trait PerCpuOps {
     /// Get the interrupt nesting depth
     fn interrupt_depth() -> u32;
 
+    /// The interrupt this CPU is handling arrived from user mode (Linux
+    /// user_mode(get_irq_regs())): set at interrupt entry from the
+    /// interrupted frame; false outside an interrupt
+    fn irq_from_user() -> bool;
+
     /// Whether logical CPU `cpu` has been brought online
     fn cpu_online(cpu: u32) -> bool;
 }

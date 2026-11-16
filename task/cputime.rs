@@ -1,18 +1,24 @@
 //! Task and thread group CPU time (Linux kernel/sched/cputime.c)
 //!
-//! Each task's runtime (`SchedEntity::sum_exec_runtime`) is advanced by
-//! the scheduler whenever it charges the running task (`update_curr`:
-//! the tick, a switch away, a reader of a running task's clock).
+//! Tick-based accounting (Linux CONFIG_TICK_CPU_ACCOUNTING): nothing
+//! happens at a syscall's entry or exit. Each tick samples the running
+//! task: a tick that interrupted user mode adds a tick to its utime,
+//! one that interrupted the kernel to its stime, unless it hit the idle
+//! task (`account_process_tick`). Each task's runtime
+//! (`SchedEntity::sum_exec_runtime`) is advanced by the scheduler
+//! whenever it charges the running task (`update_curr`: the tick, a
+//! switch away, a reader of a running task's clock).
 //! times(2), getrusage(2), wait's rusage and /proc/<pid>/stat report
 //! utime/stime scaled to that runtime (`cputime_adjust`), never going
 //! backwards.
 
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use super::Task;
 use super::percpu::{GlobalTaskTable, current, task_sched_runtime};
 use crate::signal::SignalStruct;
-use crate::sync::IrqSpinlock;
+use crate::sync::{IrqSpinlock, Sole};
 use crate::task::Pid;
 
 /// A task's or thread group's CPU time, ns (Linux struct task_cputime)
@@ -35,14 +41,44 @@ impl core::ops::Add for TaskCputime {
     }
 }
 
-/// Task `t`'s CPU time, its runtime as of its last charge (Linux
-/// task_sample_cputime)
+/// Task `t`'s CPU time: its samples and its runtime as of its last
+/// charge (Linux task_cputime, task_sample_cputime)
 pub fn task_cputime(t: &Task) -> TaskCputime {
-    let (utime, stime) = t.cputime(crate::time::monotonic_ns());
     TaskCputime {
-        utime,
-        stime,
+        utime: t.utime.load(Ordering::Relaxed),
+        stime: t.stime.load(Ordering::Relaxed),
         sum_exec_runtime: t.se.sum_exec_runtime(),
+    }
+}
+
+/// The tick's sample of the task `p` it interrupted (Linux
+/// account_process_tick; interrupt context, on `p`'s CPU, its only
+/// writer): a tick of user time if it came from user mode, else of
+/// system time, unless `p` is the idle task and the tick interrupted
+/// nothing but it (idle time is nobody's)
+pub fn account_process_tick(p: &Task, user_tick: bool) {
+    use crate::arch::{CurrentArch, PerCpuOps};
+    let cputime = super::percpu::TICK_NS;
+    if user_tick {
+        account_user_time(p, cputime);
+    } else if p.tid() != 0 || CurrentArch::interrupt_depth() != 1 {
+        account_system_time(p, cputime);
+    }
+}
+
+/// Linux account_user_time: the task's and its group's running totals
+fn account_user_time(p: &Task, cputime: u64) {
+    p.utime.sole_add(cputime);
+    if let Some(g) = p.cpu_group() {
+        g.cputimer.account_user_time(cputime);
+    }
+}
+
+/// Linux account_system_index_time
+fn account_system_time(p: &Task, cputime: u64) {
+    p.stime.sole_add(cputime);
+    if let Some(g) = p.cpu_group() {
+        g.cputimer.account_system_time(cputime);
     }
 }
 
