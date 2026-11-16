@@ -58,6 +58,12 @@ pub trait SuperOps: Send + Sync {
         let _ = (sb, out);
     }
 
+    /// Its file handle operations (Linux s_export_op); None: handles
+    /// are file ids only (AT_HANDLE_FID). Default None.
+    fn export_op(&self) -> Option<&'static dyn super::exportfs::ExportOps> {
+        None
+    }
+
     /// Its positive dentries are its directory entries and stay cached
     /// until removed (Linux DCACHE_PERSISTENT, d_make_persistent):
     /// the shrinker leaves them. Default false.

@@ -543,6 +543,11 @@ pub struct Inode {
     /// Link count (atomic for thread-safe hard link management)
     pub nlink: AtomicU32,
 
+    /// Its generation (Linux i_generation): with the number, tells a
+    /// file handle's object from a later one that reuses the number;
+    /// set by the filesystem before the inode is shared, then fixed
+    pub i_generation: u32,
+
     /// A removed directory (Linux S_DEAD): set by rmdir, or a rename
     /// replacing it, under its i_rwsem; mount refuses it
     dead: core::sync::atomic::AtomicBool,
@@ -755,6 +760,7 @@ impl Inode {
             gid: AtomicU32::new(gid),
             size: AtomicU64::new(size),
             nlink: AtomicU32::new(1),
+            i_generation: 0,
             dead: core::sync::atomic::AtomicBool::new(false),
             rdev: DevId::null(),
             atime: InodeTime::new(mtime),
@@ -819,6 +825,7 @@ impl Inode {
             gid: AtomicU32::new(gid),
             size: AtomicU64::new(0),
             nlink: AtomicU32::new(1),
+            i_generation: 0,
             dead: core::sync::atomic::AtomicBool::new(false),
             rdev,
             atime: InodeTime::new(mtime),

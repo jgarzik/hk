@@ -353,7 +353,7 @@ EPERM).
 ## Before user namespaces grant capabilities
 
 **Location**: `task/mod.rs` (`capable`), `fs/dac.rs`, `ns/mod.rs`,
-`fs/mount.rs`, `fs/pnode.rs`, `net/netlink/rtnetlink.rs`
+`fs/mount.rs`, `fs/pnode.rs`, `fs/fhandle.rs`, `net/netlink/rtnetlink.rs`
 
 Safe today only because a user namespace grants no capabilities. First:
 - each `capable()` becomes Linux's `ns_capable(<owner>->user_ns)` (or
@@ -369,6 +369,29 @@ Safe today only because a user namespace grants no capabilities. First:
   gid_map become writable.
 - mounts become user-namespace aware (plain `capable()` today, Linux
   ns_capable of the mount namespace's `user_ns`).
+- open_by_handle_at's `may_decode_fh` (`fs/fhandle.rs`) gains Linux's
+  O_DIRECTORY path for a caller with CAP_SYS_ADMIN over the file
+  system's or mount namespace's user namespace (HANDLE_CHECK_PERMS,
+  HANDLE_CHECK_SUBTREE with has_locked_children, EXPORT_FH_DIR_ONLY);
+  today it is CAP_DAC_READ_SEARCH or EPERM.
+
+## File handle gaps
+
+**Location**: `fs/exportfs/mod.rs`, `fs/fhandle.rs`, `fs/vfat/`,
+`cgroup/cgroupfs.rs`, `fs/pseudo/nsfs.rs`
+
+Only tmpfs decodes handles; elsewhere name_to_handle_at encodes a file
+id (AT_HANDLE_FID) and is otherwise EOPNOTSUPP. Missing, as Linux has:
+- tmpfs export operations (shmem_export_ops).
+- vfat's (fat_export_ops, FILEID_FAT_*): needs ->fh_to_parent,
+  ->get_parent and ->get_name, disconnected dentries (d_obtain_alias,
+  DCACHE_DISCONNECTED) and reconnect_path; with ->fh_to_parent,
+  AT_HANDLE_CONNECTABLE handles (now EOPNOTSUPP everywhere).
+- cgroup2's (kernfs_export_ops, FILEID_KERNFS).
+- nsfs's (nsfs_export_operations, FILEID_NSFS, with ->permission and
+  ->open): FD_NSFS_ROOT is accepted as a mount fd, but nothing there
+  decodes.
+- pidfs (FD_PIDFS_ROOT is EBADF: pidfds are anonymous inodes).
 
 ## Credentials have no identity
 
@@ -1047,8 +1070,8 @@ dumb buffer from shmem and blits it on page flip
 **Location**: `fs/pseudo/nsfs.rs`, `ns/setns.rs`
 
 No time namespaces (CLONE_NEWTIME, the time and time_for_children
-links). No nsfs file handles (hk has no name_to_handle_at /
-open_by_handle_at) and no listns(2) / statns(2).
+links). No nsfs file handles (File handle gaps) and no listns(2) /
+statns(2).
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 

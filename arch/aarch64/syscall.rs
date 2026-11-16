@@ -187,6 +187,12 @@ pub const SYS_FANOTIFY_INIT: u64 = 262;
 /// fanotify_mark(fanotify_fd, flags, mask, dirfd, pathname)
 pub const SYS_FANOTIFY_MARK: u64 = 263;
 
+// File handles
+/// name_to_handle_at(dfd, name, handle, mnt_id, flag)
+pub const SYS_NAME_TO_HANDLE_AT: u64 = 264;
+/// open_by_handle_at(mountdirfd, handle, flags)
+pub const SYS_OPEN_BY_HANDLE_AT: u64 = 265;
+
 // epoll syscalls (Section 9.1) - NOTE: aarch64 only has epoll_create1, not legacy epoll_create
 /// epoll_create1(flags)
 pub const SYS_EPOLL_CREATE1: u64 = 20;
@@ -602,6 +608,8 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_FALLOCATE => Sys::Fallocate,
         SYS_FANOTIFY_INIT => Sys::FanotifyInit,
         SYS_FANOTIFY_MARK => Sys::FanotifyMark,
+        SYS_NAME_TO_HANDLE_AT => Sys::NameToHandleAt,
+        SYS_OPEN_BY_HANDLE_AT => Sys::OpenByHandleAt,
         SYS_FCHDIR => Sys::Fchdir,
         SYS_FCHMOD => Sys::Fchmod,
         SYS_FCHMODAT => Sys::Fchmodat,

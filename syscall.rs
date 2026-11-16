@@ -150,8 +150,10 @@ pub enum Sys {
     Munlock,
     Munlockall,
     Munmap,
+    NameToHandleAt,
     Nanosleep,
     Newfstatat,
+    OpenByHandleAt,
     Openat,
     Openat2,
     PerfEventOpen,
@@ -844,6 +846,17 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[3] as i32,
         )
         .ret() as u64,
+        Sys::NameToHandleAt => crate::fs::fhandle::sys_name_to_handle_at(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2],
+            a[3],
+            a[4] as i32,
+        )
+        .ret() as u64,
+        Sys::OpenByHandleAt => {
+            crate::fs::fhandle::sys_open_by_handle_at(a[0] as i32, a[1], a[2] as i32).ret() as u64
+        }
         Sys::Openat => crate::fs::syscall::sys_openat(
             a[0] as i32,
             UserPtr::new(a[1]),

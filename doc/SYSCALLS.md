@@ -120,6 +120,8 @@
 - [x] fchdir
 - [x] getcwd
 - [x] chroot
+- [x] name_to_handle_at (no AT_HANDLE_CONNECTABLE)
+- [x] open_by_handle_at
 
 3.2 Stat & attributes
 

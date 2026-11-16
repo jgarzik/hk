@@ -180,6 +180,8 @@ pub enum KernelError {
     AlreadyInProgress = 114,
     /// Operation now in progress (EINPROGRESS)
     InProgress = 115,
+    /// Stale file handle (ESTALE)
+    StaleHandle = 116,
 
     // =========================================================================
     // Additional errno values
@@ -296,6 +298,7 @@ impl KernelError {
             113 => Self::HostUnreachable,
             114 => Self::AlreadyInProgress,
             115 => Self::InProgress,
+            116 => Self::StaleHandle,
             121 => Self::RemoteIo,
             122 => Self::QuotaExceeded,
             125 => Self::Canceled,
