@@ -130,16 +130,24 @@ structures that are **NOT** accessed from interrupt context.
 need to access the data from an interrupt handler, use `IrqSpinlock` instead or
 defer the work.
 
-### 1.3 RwLock<T> (spin crate, via `sync::spin`)
+### 1.3 RwLock<T> (`sync::spin`)
 
-A read-write lock from the `spin` crate. Allows multiple concurrent readers
-or one exclusive writer.
+Linux rwlock_t on qrwlock (`sync/qrwlock.rs`). Allows multiple
+concurrent readers or one exclusive writer.
 
 **Properties:**
 - Multiple readers OR single writer
 - Does NOT disable interrupts
 - Raises `preempt_count` while held, like `Mutex` (1.2)
-- Reader-writer fairness depends on implementation
+- Fair (Linux qrwlock): one count word (writer byte, a waiting-writer
+  bit, readers) plus a queued spin lock that contenders line up on, so
+  readers and writers are served in arrival order: a reader finding a
+  writer, or a writer waiting, queues, and a writer marks itself
+  waiting so new readers stop taking the fast path. A recursive read in
+  thread context therefore deadlocks behind a waiting writer, as on
+  Linux; a reader in an interrupt handler does not queue (it waits only
+  for a writer that holds it). `IrqRwLock` (1.1.1) is the same lock
+  with interrupts masked
 
 **Use cases:**
 - TASKLIST (Linux tasklist_lock: Linux takes it with write_lock_irq;

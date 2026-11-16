@@ -23,23 +23,17 @@ argued / published copy of locked state.
 - **Global RMW on per-op paths** (`call_rcu`, inode eviction, netdev stats,
   dentry alloc, dirty throttling).
 - **Atomic flags as locks** (`Softnet.busy`, `Zone.draining`, NAPI
-  `sched`+`disable`) and the spin `RwLock` primitive.
+  `sched`+`disable`).
 
 ## Findings
 
-### 3. Spin `RwLock`: unfair, reader count one shared RMW word — (c)(d)
-- Where: `sync/spin.rs` `RwLock` and `sync/irqspin.rs` `IrqRwLock` wrap
-  `spin::RwLock` (test-and-set, unfair; the RwLock reader count is one
-  shared RMW word). `IrqSpinlock` and the spin `Mutex` are queued spin
-  locks now (`sync/qspinlock.rs`).
-- Wrong: no FIFO fairness between readers and writers; read side (e.g.
-  `Dentry.d_lock`, `Dentry.d_name` on every path component) writes the lock
-  word, so popular directories become contended lines.
-- Linux: qrwlock (a reader count and writer byte in one word, contenders
-  queued through a qspinlock); path walk is RCU-walk with `d_seq`
-  seqcount, no stores to shared dentries.
-- Fix: qrwlock on `sync/qspinlock.rs`. Track RCU-walk for dcache
-  separately. Update LOCKING.md §1.3.
+### 3. Dentry reads store to shared lock words — (c)
+- Where: `fs/dentry.rs` `Dentry.d_lock`, `Dentry.d_name` (RwLocks): every
+  path component's read lock writes the lock word, so popular
+  directories become contended lines.
+- Linux: path walk is RCU-walk with the `d_seq` seqcount, no stores to
+  shared dentries.
+- Fix: RCU-walk for dcache (its own phase).
 
 ### 4. `SchedEntity` and run-queue counters: lock-protected state as atomics — (a)(b)
 - Where: `task/sched.rs` `SchedEntity` `vruntime`, `deadline`, `vlag`,

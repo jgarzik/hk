@@ -16,6 +16,7 @@ mod irqspin;
 pub mod lockdep;
 mod locked_by;
 mod mutex;
+pub mod qrwlock;
 pub mod qspinlock;
 mod racy;
 pub mod rcu;
