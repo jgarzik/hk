@@ -28,7 +28,7 @@ use crate::fs::dentry::{Dentry, DentryOps, DentryRef};
 use crate::fs::file::{File, FileOps};
 use crate::fs::inode::{AsAny, Inode, InodeData, InodeMode, NULL_INODE_OPS};
 use crate::fs::path_ref::Path;
-use crate::ns::{MntNamespace, NsRef};
+use crate::ns::{MntNamespace, Namespace, NsRef};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
@@ -270,8 +270,24 @@ pub static NS_DENTRY_OPS: DentryOps = DentryOps {
 };
 
 /// A namespace file inode's private data (Linux i_private): the
-/// namespace, held until the inode goes (Linux nsfs_evict)
+/// namespace, held until the inode goes, and an active reference to
+/// it, taken as the inode is made (Linux nsfs_init_inode: one made for
+/// an inactive namespace, as SIOCGSKNS's, brings it and its owners back
+/// to life) and put as it goes (Linux nsfs_evict)
 struct NsInode(NsRef);
+
+impl NsInode {
+    fn new(ns: NsRef) -> Self {
+        ns.active_get();
+        Self(ns)
+    }
+}
+
+impl Drop for NsInode {
+    fn drop(&mut self) {
+        self.0.active_put();
+    }
+}
 
 impl AsAny for NsInode {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -382,7 +398,7 @@ pub fn ns_get_path(ns: NsRef) -> Result<Path, KernelError> {
             &NULL_INODE_OPS,
         ))?;
         let name = alloc::format!("{}:[{inum}]", ns.name());
-        inode.set_private(try_arc(NsInode(ns.clone()))?);
+        inode.set_private(try_arc(NsInode::new(ns.clone()))?);
         let d = DentryRef::new(Dentry::new_pseudo(name.as_bytes(), inode, &mnt.sb)?)?;
         let me = DentryRef::as_ptr(&d).cast_mut();
         match ns.common().stashed.compare_exchange(

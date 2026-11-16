@@ -903,6 +903,15 @@ pub struct TaskInner {
     session: Option<Arc<pid::Pid>>,
     /// A group leader on its `pgrp`'s and `session`'s lists
     pids_linked: bool,
+    /// The user namespace of its credentials (Linux
+    /// real_cred->user_ns; hk keeps the namespace itself in the
+    /// nsproxy, `NsProxy.user_ns`, which goes at exit): while the task
+    /// is in the task list, zombie included, it holds an active
+    /// reference to it (Linux get_cred_namespaces at fork,
+    /// exit_cred_namespaces at release_task), moved by
+    /// `percpu::switch_cred_namespaces`. None for kernel threads (the
+    /// initial one, always active)
+    user_ns: Option<Arc<crate::ns::UserNamespace>>,
     // =========================================================================
     // Exit handling (like Linux task_struct exit fields)
     // =========================================================================
@@ -1039,6 +1048,7 @@ impl TaskInner {
             pgrp: None,
             session: None,
             pids_linked: false,
+            user_ns: None,
             exit_code: 0,
             exit_signal: crate::signal::ExitSignal::NONE,
             parent_exec_id: 0,

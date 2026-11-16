@@ -3,15 +3,29 @@
 //! and [`NsRef`], a counted reference to a namespace of any type with
 //! its type's operations
 //!
+//! Active references (Linux __ns_ref_active, kernel/nscommon.c): a
+//! namespace is in active use while something holds one, as opposed to
+//! merely being kept in memory by a counted reference. An nsproxy holds
+//! one on each of its namespaces once installed on a task, a task in
+//! the task list one on its user namespace, a `Pid` one on the
+//! namespace it was made in, and an nsfs inode one on its namespace
+//! ([`Namespace::active_get`] callers). The namespace tree hands out
+//! only active namespaces (listns(2), Linux ns_get_unless_inactive).
+//! A namespace's first active reference takes one on its owning user
+//! namespace and its last puts that one, up the chain of owners; the
+//! initial namespaces are always active and never counted.
+//!
 //! Locking: `stashed` is an atomic pointer, set by a compare-exchange
 //! and cleared the same way by the dentry's kill (`fs::nsfs`); a reader
 //! takes a reference under an RCU read guard (Linux ns->stashed with
 //! lockref_get_not_dead). `linked` is changed under the namespace
-//! tree's lock (`ns::tree`).
+//! tree's lock (`ns::tree`). `active` is an atomic count, as Linux's
+//! atomic_t, changed lock-free in any context (no lock to take: its
+//! holders come and go under unrelated locks, TASKLIST included).
 
 use alloc::sync::Arc;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use super::inum::Inum;
 use super::{
@@ -44,6 +58,11 @@ pub struct NsCommon {
     /// `tree::remove`, both under its lock; an atomic only because it
     /// lives here, outside the lock's data, as Linux's node does
     pub(super) linked: AtomicBool,
+    /// Its active references (Linux __ns_ref_active): 1 for an initial
+    /// namespace, never changed; a new one starts at 0 (Linux
+    /// __ns_common_init) until it is installed in an nsproxy, a task's
+    /// credentials, a pid or a namespace file
+    active: AtomicU32,
 }
 
 impl NsCommon {
@@ -62,17 +81,144 @@ impl NsCommon {
     }
 
     fn with_id(inum: Inum, ns_id: u64) -> Self {
+        let init = ns_id <= super::inum::NS_LAST_INIT_ID;
         Self {
             ns_id,
             inum,
             stashed: AtomicPtr::new(null_mut()),
             linked: AtomicBool::new(false),
+            active: AtomicU32::new(u32::from(init)),
         }
     }
 
     /// Its inode number
     pub fn inum(&self) -> u32 {
         self.inum.get()
+    }
+
+    /// An initial namespace (Linux is_ns_init_id): always active
+    fn is_init(&self) -> bool {
+        self.ns_id <= super::inum::NS_LAST_INIT_ID
+    }
+
+    /// Something holds an active reference to it (Linux
+    /// __ns_ref_active_read != 0); racy, as Linux's: a namespace may
+    /// become inactive, or active again, right after
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire) != 0
+    }
+
+    /// One more active reference; true if it was the first (Linux
+    /// atomic_fetch_add == 0)
+    fn active_inc(&self) -> bool {
+        let prev = self.active.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(prev != u32::MAX, "ns: active count overflow");
+        prev == 0
+    }
+
+    /// One active reference fewer; true if it was the last (Linux
+    /// atomic_dec_and_test)
+    fn active_dec(&self) -> bool {
+        let prev = self.active.fetch_sub(1, Ordering::AcqRel);
+        // Linux VFS_WARN_ON_ONCE(__ns_ref_active_read(ns) < 0)
+        debug_assert!(prev != 0, "ns: active count underflow, id {}", self.ns_id);
+        prev == 1
+    }
+}
+
+/// A namespace of any type, for its active references (Linux struct
+/// ns_common with ops->owner)
+pub trait Namespace {
+    /// Its common part
+    fn ns_common(&self) -> &NsCommon;
+
+    /// The user namespace that owns it (Linux ns_owner's ops->owner): a
+    /// user namespace's parent, None for the initial user namespace
+    fn ns_owner(&self) -> Option<&UserNamespace>;
+
+    /// Take an active reference (Linux __ns_ref_active_get): a first one
+    /// takes one on its owner, and so on up the owners until one was
+    /// already active. Any context: atomics only.
+    fn active_get(&self) {
+        let c = self.ns_common();
+        if c.is_init() || !c.active_inc() {
+            return;
+        }
+        let mut owner = self.ns_owner();
+        // Linux ns_owner skips the initial user namespace: always active
+        while let Some(u) = owner.filter(|u| !u.ns.is_init()) {
+            if !u.ns.active_inc() {
+                return;
+            }
+            owner = u.parent.as_deref();
+        }
+    }
+
+    /// Put an active reference (Linux __ns_ref_active_put): the last one
+    /// puts its owner's, and so on up while each was the last. The
+    /// holder keeps a counted reference, which keeps the owners in
+    /// memory. Any context.
+    fn active_put(&self) {
+        let c = self.ns_common();
+        if c.is_init() || !c.active_dec() {
+            return;
+        }
+        let mut owner = self.ns_owner();
+        while let Some(u) = owner.filter(|u| !u.ns.is_init()) {
+            if !u.ns.active_dec() {
+                return;
+            }
+            owner = u.parent.as_deref();
+        }
+    }
+}
+
+/// Namespace types with an owning user namespace in `user_ns`
+macro_rules! owned_namespace {
+    ($($t:ty),*) => {$(
+        impl Namespace for $t {
+            fn ns_common(&self) -> &NsCommon {
+                &self.ns
+            }
+            fn ns_owner(&self) -> Option<&UserNamespace> {
+                Some(&self.user_ns)
+            }
+        }
+    )*};
+}
+
+owned_namespace!(
+    MntNamespace,
+    UtsNamespace,
+    IpcNamespace,
+    super::NetNamespace,
+    PidNamespace,
+    CgroupNamespace
+);
+
+impl Namespace for UserNamespace {
+    fn ns_common(&self) -> &NsCommon {
+        &self.ns
+    }
+    fn ns_owner(&self) -> Option<&UserNamespace> {
+        self.parent.as_deref()
+    }
+}
+
+impl Namespace for NsRef {
+    fn ns_common(&self) -> &NsCommon {
+        self.common()
+    }
+    fn ns_owner(&self) -> Option<&UserNamespace> {
+        match self {
+            Self::Mnt(n) => n.ns_owner(),
+            Self::Uts(n) => n.ns_owner(),
+            Self::Ipc(n) => n.ns_owner(),
+            Self::Net(n) => (**n).ns_owner(),
+            Self::Pid(n) => n.ns_owner(),
+            Self::User(n) => n.ns_owner(),
+            Self::Cgroup(n) => n.ns_owner(),
+        }
     }
 }
 
@@ -82,6 +228,13 @@ impl Drop for NsCommon {
     /// network namespace leaves at its teardown, a mount namespace
     /// before its unmount); any context
     fn drop(&mut self) {
+        // Nothing holds it actively once it is unreferenced (Linux
+        // __ns_ref_put: VFS_WARN_ON_ONCE(__ns_ref_active_read(ns)))
+        debug_assert!(
+            self.is_init() || *self.active.get_mut() == 0,
+            "ns: id {} freed while active",
+            self.ns_id
+        );
         if *self.linked.get_mut() {
             super::tree::remove(self);
         }

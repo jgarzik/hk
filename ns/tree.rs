@@ -11,7 +11,8 @@
 //! holds a `Weak`, upgraded under the lock only if the namespace still
 //! has a reference, so a namespace being freed is never returned.
 //! [`Strong::get`] is where the walk asks whether a namespace may be
-//! handed out (Linux ns_get_unless_inactive). A caller may hold the
+//! handed out: only one in active use (Linux ns_get_unless_inactive,
+//! `ns::common`'s active references). A caller may hold the
 //! last reference to what it gets, so it drops it only where that
 //! namespace's last put may run (a mount namespace's sleeps).
 //!
@@ -93,10 +94,21 @@ enum Strong {
 
 impl Strong {
     /// The namespace, if it may be handed out (Linux
-    /// ns_get_unless_inactive): a network namespace with an active
-    /// reference left (Linux maybe_get_net). The later step that adds
-    /// Linux's active references (__ns_ref_active) checks them here.
+    /// ns_get_unless_inactive): one something holds actively
+    /// (`NsCommon::is_active`, Linux __ns_ref_active), and for a network
+    /// namespace a counted reference left too (Linux __ns_ref_get, here
+    /// maybe_get_net)
     fn get(self) -> Option<NsRef> {
+        match self {
+            Self::Ref(r) => r.common().is_active().then_some(r),
+            Self::Net(n) if n.ns.is_active() => n.maybe_get().map(NsRef::Net),
+            Self::Net(_) => None,
+        }
+    }
+
+    /// The namespace, active or not, if it still has a counted
+    /// reference (Linux ns_ref_get: a network namespace's maybe_get_net)
+    fn get_any(self) -> Option<NsRef> {
         match self {
             Self::Ref(r) => Some(r),
             Self::Net(n) => n.maybe_get().map(NsRef::Net),
@@ -320,10 +332,26 @@ pub fn lookup_at(tree: Tree, id: u64) -> Option<NsRef> {
 }
 
 /// The first namespace after the one numbered `id` in `tree` that may
-/// be handed out, counted (Linux ns_tree_adjoined_rcu, or a list walk
-/// skipping what legitimize_ns refuses); with `previous`, the last one
+/// be handed out, counted (a list walk skipping what Linux
+/// ns_get_unless_inactive refuses); with `previous`, the last one
 /// before it
 pub fn adjoined(tree: Tree, id: u64, previous: bool) -> Option<NsRef> {
+    adjoined_by(tree, id, previous, Strong::get)
+}
+
+/// [`adjoined`] for any namespace still referenced, active or not
+/// (Linux ns_tree_adjoined_rcu then ns_ref_get: NS_MNT_GET_NEXT/PREV)
+pub fn adjoined_any(tree: Tree, id: u64, previous: bool) -> Option<NsRef> {
+    adjoined_by(tree, id, previous, Strong::get_any)
+}
+
+/// [`adjoined`], each candidate checked by `get`
+fn adjoined_by(
+    tree: Tree,
+    id: u64,
+    previous: bool,
+    get: fn(Strong) -> Option<NsRef>,
+) -> Option<NsRef> {
     let mut at = id;
     loop {
         let (k, s) = {
@@ -336,7 +364,7 @@ pub fn adjoined(tree: Tree, id: u64, previous: bool) -> Option<NsRef> {
             (k, e.ns.upgrade())
         };
         // A refused candidate is dropped here, the lock released
-        if let Some(r) = s.and_then(Strong::get) {
+        if let Some(r) = s.and_then(get) {
             return Some(r);
         }
         at = k;
@@ -370,7 +398,7 @@ impl Iterator for Walk {
 mod tests {
     use super::*;
     use crate::ns::inum::Inum;
-    use crate::ns::{INIT_USER_NS, INIT_UTS_NS, UidGidMap};
+    use crate::ns::{INIT_USER_NS, INIT_UTS_NS, Namespace, UidGidMap};
     use alloc::vec::Vec;
 
     /// A user namespace below the initial one, listed
@@ -390,9 +418,33 @@ mod tests {
         u
     }
 
-    /// A UTS namespace owned by `owner`, listed
-    fn uts_ns(owner: &Arc<UserNamespace>) -> Arc<UtsNamespace> {
+    /// An active reference to a namespace (as an installed nsproxy's),
+    /// put as it drops, before the namespace's own
+    struct Held<T: Namespace>(Arc<T>);
+
+    impl<T: Namespace> core::ops::Deref for Held<T> {
+        type Target = Arc<T>;
+        fn deref(&self) -> &Arc<T> {
+            &self.0
+        }
+    }
+
+    impl<T: Namespace> Drop for Held<T> {
+        fn drop(&mut self) {
+            self.0.active_put();
+        }
+    }
+
+    /// A UTS namespace owned by `owner`, listed and not yet active
+    fn new_uts_ns(owner: &Arc<UserNamespace>) -> Arc<UtsNamespace> {
         INIT_UTS_NS.clone_ns(owner).unwrap()
+    }
+
+    /// A UTS namespace owned by `owner`, listed, held active
+    fn uts_ns(owner: &Arc<UserNamespace>) -> Held<UtsNamespace> {
+        let n = new_uts_ns(owner);
+        n.active_get();
+        Held(n)
     }
 
     fn ids(it: impl Iterator<Item = NsRef>) -> Vec<u64> {
@@ -444,9 +496,10 @@ mod tests {
         assert_eq!(lookup_at(o, ia).unwrap().common().ns_id, ia);
         assert_eq!(lookup_at(o, ia + 1).unwrap().common().ns_id, ib);
         assert!(lookup_at(o, ib + 1).is_none());
-        // The type tree past `a` holds `b` or one made since, never `a`
-        let n = lookup_at(Tree::Type(CLONE_NEWUTS), ia + 1).unwrap();
-        assert!(n.common().ns_id > ia && n.common().ns_id <= ib);
+        // The type tree holds `b` at its id (other tests' namespaces,
+        // some inactive, come and go between `a` and `b`)
+        let n = lookup_at(Tree::Type(CLONE_NEWUTS), ib).unwrap();
+        assert_eq!(n.common().ns_id, ib);
     }
 
     #[test]
@@ -478,5 +531,31 @@ mod tests {
         assert!(adjoined(o, want[2], false).is_none());
         drop((a, c, n, p));
         assert!(walk(o).next().is_none());
+    }
+
+    /// Only a namespace in active use is handed out; its first active
+    /// reference activates its owner, its last deactivates it
+    #[test]
+    fn only_active_handed_out() {
+        let u = user_ns();
+        let a = new_uts_ns(&u);
+        let (id, uid) = (a.ns.ns_id, u.ns.ns_id);
+        assert!(lookup(Tree::All, id).is_none());
+        assert!(lookup(Tree::All, uid).is_none());
+        assert!(walk(Tree::owned_by(&u)).next().is_none());
+        a.active_get();
+        assert!(lookup(Tree::All, id).is_some());
+        assert!(lookup(Tree::Type(CLONE_NEWUSER), uid).is_some());
+        // A second holder: the owner is not counted again
+        a.active_get();
+        a.active_put();
+        assert!(u.ns.is_active());
+        a.active_put();
+        assert!(!a.ns.is_active() && !u.ns.is_active());
+        assert!(lookup(Tree::All, id).is_none());
+        assert!(lookup_at(Tree::owned_by(&u), 0).is_none());
+        // The initial ones are always active, never counted
+        INIT_UTS_NS.active_put();
+        assert!(lookup(Tree::All, INIT_UTS_NS.ns.ns_id).is_some());
     }
 }

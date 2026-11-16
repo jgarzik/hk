@@ -39,7 +39,7 @@ use alloc::sync::Arc;
 use spin::Lazy;
 
 pub use cgroup::{CgroupNamespace, INIT_CGROUP_NS};
-pub use common::{NsCommon, NsRef};
+pub use common::{Namespace, NsCommon, NsRef};
 pub use pid::{INIT_PID_NS, PidNamespace};
 pub use setns::sys_setns;
 pub use user::{INIT_USER_NS, UidGidExtent, UidGidMap, UserNamespace};
@@ -119,13 +119,14 @@ const MNT_TREE: tree::Tree = tree::Tree::Type(CLONE_NEWNS);
 /// The live mount namespace after (or with `previous` before) the one
 /// numbered `id` in id order whose owner the caller has CAP_SYS_ADMIN
 /// over (Linux get_sequential_mnt_ns, ns_tree_adjoined_rcu): ENOENT
-/// past the end; a dying one is skipped
+/// past the end; a dying one is skipped, an inactive one is not (Linux
+/// ns_ref_get, not ns_get_unless_inactive)
 pub fn mnt_ns_adjoined(id: u64, previous: bool) -> Result<Arc<MntNamespace>, KernelError> {
     // Linux also requires ns_capable_noaudit(mntns->user_ns,
     // CAP_SYS_ADMIN) per candidate; hk's capabilities ignore user
     // namespaces (BUGS.md), so that is the caller's
     // may_see_all_namespaces check, already made
-    match tree::adjoined(MNT_TREE, id, previous) {
+    match tree::adjoined_any(MNT_TREE, id, previous) {
         Some(NsRef::Mnt(m)) => Ok(m),
         Some(_) => unreachable!("ns: not a mount namespace in its tree"),
         None => Err(KernelError::NotFound),
@@ -303,6 +304,36 @@ pub struct NsProxy {
     pub cgroup_ns: Arc<CgroupNamespace>,
     // Future namespaces:
     // pub time_ns: Arc<TimeNamespace>,
+    /// It holds active references to its namespaces but the user one
+    /// ([`activate`]): set once, while it is still its installer's
+    /// alone, so the drop puts them only if they were taken (Linux
+    /// deactivate_nsproxy vs nsproxy_free of one never installed)
+    active: bool,
+}
+
+impl Drop for NsProxy {
+    /// Linux deactivate_nsproxy, the last put_nsproxy of one installed:
+    /// its active references go before its counted ones
+    fn drop(&mut self) {
+        if self.active {
+            self.active_put();
+        }
+    }
+}
+
+/// Install-time activation of `np` (Linux nsproxy_ns_active_get in
+/// copy_namespaces and switch_task_namespaces): a new set, still its
+/// installer's alone, takes its active references once; one already
+/// installed (a parent's or thread's shared, the initial one) holds
+/// them already
+fn activate(np: &mut Arc<NsProxy>) {
+    match Arc::get_mut(np) {
+        Some(n) if !n.active => {
+            n.active = true;
+            n.active_get();
+        }
+        _ => debug_assert!(np.active, "ns: a shared nsproxy never installed"),
+    }
 }
 
 impl NsProxy {
@@ -316,7 +347,31 @@ impl NsProxy {
             ipc_ns: INIT_IPC_NS.clone(),
             net_ns: INIT_NET_NS.clone(),
             cgroup_ns: INIT_CGROUP_NS.clone(),
+            // The initial namespaces are always active (Linux
+            // init_nsproxy is never activated)
+            active: true,
         }
+    }
+
+    /// Linux nsproxy_ns_active_get: each namespace but the user one,
+    /// which the task's credentials hold (Linux's nsproxy has none)
+    fn active_get(&self) {
+        self.mnt_ns.active_get();
+        self.uts_ns.active_get();
+        self.ipc_ns.active_get();
+        self.pid_ns.active_get();
+        self.cgroup_ns.active_get();
+        self.net_ns.active_get();
+    }
+
+    /// Linux nsproxy_ns_active_put
+    fn active_put(&self) {
+        self.mnt_ns.active_put();
+        self.uts_ns.active_put();
+        self.ipc_ns.active_put();
+        self.pid_ns.active_put();
+        self.cgroup_ns.active_put();
+        self.net_ns.active_put();
     }
 
     /// A copy sharing every namespace (Linux create_new_namespaces with
@@ -330,6 +385,7 @@ impl NsProxy {
             ipc_ns: self.ipc_ns.clone(),
             net_ns: self.net_ns.clone(),
             cgroup_ns: self.cgroup_ns.clone(),
+            active: false,
         }
     }
 
@@ -401,6 +457,7 @@ impl NsProxy {
             ipc_ns,
             net_ns,
             cgroup_ns,
+            active: false,
         })
     }
 }
@@ -425,7 +482,9 @@ use crate::task::percpu::current;
 ///
 /// Called when creating a new task to set up its namespace context, or
 /// by the task itself (unshare, setns; Linux switch_task_namespaces).
-pub fn init_task_ns(t: &Task, nsproxy: Arc<NsProxy>) {
+/// A new set takes its namespaces' active references first.
+pub fn init_task_ns(t: &Task, mut nsproxy: Arc<NsProxy>) {
+    activate(&mut nsproxy);
     let old = t.task_lock().set_nsproxy(Some(nsproxy));
     drop(old);
 }
@@ -620,7 +679,10 @@ pub fn sys_unshare(unshare_flags: u64) -> KernelResult<()> {
 /// Switch task `t`'s namespaces to a new nsproxy
 ///
 /// This atomically replaces the task's nsproxy. Used by both
-/// unshare() and setns().
+/// unshare() and setns(). A new user namespace is the task's
+/// credentials' too, which move their active reference to it (Linux
+/// commit_creds -> switch_cred_namespaces).
 pub fn switch_task_namespaces(t: &Task, new_ns: Arc<NsProxy>) {
+    crate::task::percpu::switch_cred_namespaces(t, &new_ns.user_ns);
     init_task_ns(t, new_ns);
 }
