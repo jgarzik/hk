@@ -661,20 +661,27 @@ pub fn sys_vmsplice(
         return Err(KernelError::InvalidArgument);
     }
 
-    // A pipe open for writing (Linux vmsplice_to_pipe); vmsplice from
-    // a pipe open only for reading (vmsplice_to_user) is not done: EBADF
     let file = fget(fd)?;
     // The segments as readv takes them (Linux import_iovec): EINVAL
     // past IOV_MAX or for a negative length, cut to MAX_RW_COUNT
     let n = i32::try_from(nr_segs).map_err(|_| KernelError::InvalidArgument)?;
     let segs = crate::fs::iov::import_iovec(iov, n)?;
-    let pipe = pipe_of_file(&file).ok_or(KernelError::InvalidArgument)?;
+    // Not a pipe: EBADF (Linux get_pipe_info failing in both directions)
+    let pipe = pipe_of_file(&file).ok_or(KernelError::BadFd)?;
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
     if !file.is_writable() {
-        return Err(KernelError::BadFd);
+        if !file.is_readable() {
+            return Err(KernelError::BadFd);
+        }
+        // Open only for reading (Linux vmsplice_to_user): the pipe's
+        // data copied into the segments as a read, waiting unless
+        // SPLICE_F_NONBLOCK (the file's O_NONBLOCK does not count)
+        let mut to = crate::fs::iov_iter::IovDest::user(&segs, usize::MAX);
+        return crate::io::pipe::pipe_read(&pipe, &mut to, nonblock);
     }
 
     // Linux vmsplice_to_pipe: wait for room, then fill what fits
-    let mut g = pipe.lock_room(flags & SPLICE_F_NONBLOCK != 0)?;
+    let mut g = pipe.lock_room(nonblock)?;
     let r = iter_to_pipe(&mut g, &segs);
     drop(g);
     if matches!(r, Ok(n) if n > 0) {

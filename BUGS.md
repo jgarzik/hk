@@ -324,14 +324,6 @@ Every pipe holds 16 buffers; fcntl F_GETPIPE_SZ and F_SETPIPE_SZ are
 EINVAL and there is no /proc/sys/fs/pipe-max-size (Linux pipe_fcntl,
 pipe_set_size).
 
-## vmsplice from a pipe is not done
-
-**Location**: `fs/splice.rs` (`sys_vmsplice`)
-
-vmsplice on a pipe or FIFO open for writing copies user memory into it
-(Linux vmsplice_to_pipe). On one open only for reading Linux copies the
-pipe's data into the user iovecs (vmsplice_to_user); hk returns EBADF.
-
 ## AF_UNIX gaps
 
 **Location**: `net/unix/`
