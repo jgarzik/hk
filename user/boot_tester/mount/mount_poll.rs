@@ -46,6 +46,8 @@ fn reaped_child() -> i64 {
     if sys_pipe(go.as_mut_ptr()) != 0 || sys_pipe(ready.as_mut_ptr()) != 0 {
         return 1;
     }
+    // Made before the fork: the child mounts on it
+    sys_mkdir(DIR.as_ptr(), 0o755);
     let pid = sys_fork();
     if pid == 0 {
         let ok = sys_unshare(CLONE_NEWNS) == 0
@@ -56,7 +58,6 @@ fn reaped_child() -> i64 {
         sys_read(go[0] as u64, b.as_mut_ptr(), 1);
         sys_exit(0);
     }
-    sys_mkdir(DIR.as_ptr(), 0o755);
     let mut b = [0u8; 1];
     if sys_read(ready[0] as u64, b.as_mut_ptr(), 1) != 1 || b[0] != 1 {
         return 2;
