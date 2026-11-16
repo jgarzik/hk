@@ -12,6 +12,7 @@ pub mod dpath_rename;
 pub mod emptypath;
 pub mod etxtbsy;
 pub mod fanotify;
+pub mod fhandle;
 pub mod fifo;
 pub mod file_io;
 pub mod flock;

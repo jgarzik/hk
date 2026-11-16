@@ -505,6 +505,27 @@ pub fn sys_openat2(dirfd: i32, path: *const u8, how: *const u8, size: usize) -> 
     unsafe { syscall4!(SYS_OPENAT2, dirfd, path, how, size) }
 }
 
+pub const SYS_NAME_TO_HANDLE_AT: u64 = 264;
+pub const SYS_OPEN_BY_HANDLE_AT: u64 = 265;
+
+/// name_to_handle_at(dfd, name, handle, mnt_id, flag)
+#[inline(always)]
+pub fn sys_name_to_handle_at(
+    dfd: i32,
+    name: *const u8,
+    handle: *mut u8,
+    mnt_id: *mut u8,
+    flag: i32,
+) -> i64 {
+    unsafe { syscall5!(SYS_NAME_TO_HANDLE_AT, dfd, name, handle, mnt_id, flag) }
+}
+
+/// open_by_handle_at(mountdirfd, handle, flags)
+#[inline(always)]
+pub fn sys_open_by_handle_at(mountdirfd: i32, handle: *const u8, flags: u32) -> i64 {
+    unsafe { syscall3!(SYS_OPEN_BY_HANDLE_AT, mountdirfd, handle, flags) }
+}
+
 /// open(path, flags, mode) - compatibility wrapper using openat with AT_FDCWD
 #[inline(always)]
 pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> i64 {
