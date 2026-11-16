@@ -78,7 +78,10 @@ pub fn with_gfp<R>(gfp: Gfp, f: impl FnOnce() -> R) -> R {
     crate::arch::preempt_disable();
     let cx = GFP_CX.this();
     let depth = u64::from(CurrentArch::interrupt_depth());
-    let old = cx.swap(NAMED | depth << 32 | u64::from(gfp.0), Relaxed);
+    // This CPU's word alone, and an interrupt nesting a scope restores
+    // it: a load and a store (Linux: the GFP is an argument)
+    let old = cx.load(Relaxed);
+    cx.store(NAMED | depth << 32 | u64::from(gfp.0), Relaxed);
     let r = f();
     cx.store(old, Relaxed);
     crate::arch::preempt_enable();

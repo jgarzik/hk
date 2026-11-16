@@ -204,13 +204,6 @@ argued / published copy of locked state.
   `OwnedList` id from the list's own address/owner (stable while the list
   lives) or a per-CPU batched allocator.
 
-### 15. Single-writer state updated with RMW — (a)
-- Where: `util/kalloc.rs` `with_gfp` (`GFP_CX.swap`, this CPU's slot).
-  The task counters, PF flags, tick and switch counts, softnet counters
-  and the timekeeper sequence use `sync::Sole` (a load and a store).
-- Fix: `GFP_CX` as a load and a store (its CPU alone writes it,
-  interrupts restore it).
-
 ### 16. Mount change numbers: global atomic + `fetch_max` instead of `mount_lock` — (d)(b)
 - Where: `ns/mod.rs` `MNT_EVENT`, `MntEvents.event`, `MntEvents::bump`.
 - Wrong: two atomics updated separately and a `fetch_max` to repair the
