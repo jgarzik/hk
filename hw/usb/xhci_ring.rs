@@ -98,6 +98,14 @@ fn soft_retry(count: &mut u32, off: bool) -> bool {
     c <= MAX_SOFT_RETRY
 }
 
+/// Whether an event that found no TD is the spurious success some
+/// hosts send after a short transfer, `old_cc` the ring's last code
+/// (Linux xhci_spurious_success_tx_event; its Etron isochronous case
+/// does not arise: hk queues no isochronous transfers)
+fn spurious_success(quirks: u32, old_cc: u8) -> bool {
+    old_cc == Cc::SHORT_PACKET && quirks & quirk::SPURIOUS_SUCCESS != 0
+}
+
 /// Whether the controller halted the endpoint (Linux
 /// xhci_halted_host_endpoint): a stall always; transaction and babble
 /// errors when the endpoint context says halted
@@ -803,7 +811,13 @@ impl Xhci {
             // endpoint stopped at; the Stop Endpoint completion handles it
             if !is_stopped(cc) && halted_host_endpoint(ctx_state, cc) {
                 self.handle_halted_endpoint(st, slot, dci, None, Reset::Hard);
-            } else if !is_stopped(cc) && ep.tds.iter().any(Td::on_ring) {
+            } else if is_stopped(cc) || !ep.tds.iter().any(Td::on_ring) {
+                // Nothing queued it could be for (Linux: no warning)
+            } else if spurious_success(self.quirks, ep.old_cc) {
+                // A second event for the short TD already given back
+                // (Linux xhci_spurious_success_tx_event)
+                ep.old_cc = 0;
+            } else {
                 printkln!(
                     "xHCI: event trb@{:#x} for slot {} ep {} not part of a TD",
                     ev.parameter,
@@ -813,6 +827,7 @@ impl Xhci {
             }
             return;
         };
+        ep.old_cc = cc;
         if noop {
             if halted_host_endpoint(ctx_state, cc) {
                 self.handle_halted_endpoint(st, slot, dci, Some(ti), Reset::Hard);
@@ -1226,5 +1241,15 @@ mod tests {
         let mut q = 0;
         assert!(!soft_retry(&mut q, true));
         assert_eq!(q, 0, "the quirk counts nothing");
+    }
+
+    /// Only after a short packet, only with the quirk
+    #[test]
+    fn spurious_after_short() {
+        let q = quirk::SPURIOUS_SUCCESS;
+        assert!(spurious_success(q, Cc::SHORT_PACKET));
+        assert!(!spurious_success(0, Cc::SHORT_PACKET));
+        assert!(!spurious_success(q, Cc::SUCCESS));
+        assert!(!spurious_success(q, 0));
     }
 }

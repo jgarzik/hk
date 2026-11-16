@@ -77,18 +77,31 @@ pub(super) mod quirk {
     pub const SPURIOUS_WAKEUP: u32 = 1 << 2;
     /// No soft retry of a transaction error (Linux XHCI_NO_SOFT_RETRY)
     pub const NO_SOFT_RETRY: u32 = 1 << 3;
+    /// A success event may follow a short transfer's (Linux
+    /// XHCI_SPURIOUS_SUCCESS)
+    pub const SPURIOUS_SUCCESS: u32 = 1 << 4;
 
-    pub fn of(dev: &PciDevice) -> u32 {
+    /// From the PCI IDs and the interface version: xHCI 1.0 hosts send
+    /// the spurious success, as does the ASMedia 1042 that says 0.96
+    /// (Linux xhci_gen_setup, xhci_pci_quirks)
+    pub fn of(dev: &PciDevice, hci_version: u16) -> u32 {
+        let q = if hci_version > 0x96 {
+            SPURIOUS_SUCCESS
+        } else {
+            0
+        };
         let (vendor, device) = (dev.header.vendor_id, dev.header.device_id);
         match (vendor, device) {
             // Etron EJ168, EJ188; AMD Promontory A
-            (0x1b6f, 0x7023 | 0x7052) | (0x1022, 0x43b9 | 0x43bb) => return NO_SOFT_RETRY,
+            (0x1b6f, 0x7023 | 0x7052) | (0x1022, 0x43b9 | 0x43bb) => return q | NO_SOFT_RETRY,
+            // ASMedia 1042
+            (0x1b21, 0x1042) => return q | SPURIOUS_SUCCESS,
             _ => {}
         }
         if vendor != PCI_VENDOR_INTEL {
-            return 0;
+            return q;
         }
-        INTEL_HOST
+        q | INTEL_HOST
             | match dev.header.device_id {
                 0x1e31 => SPURIOUS_REBOOT,                            // Panther Point
                 0x9c31 | 0x9cb1 => SPURIOUS_REBOOT | SPURIOUS_WAKEUP, // LPT-LP, WPT-LP
@@ -759,6 +772,9 @@ pub(super) struct VirtEp {
     pub(super) stop_time: u64,
     /// Transaction errors soft-retried in a row (Linux ep->err_count)
     pub(super) err_count: u32,
+    /// The completion code of the last event that found its TD (Linux
+    /// ring->old_trb_comp_code)
+    pub(super) old_cc: u8,
 }
 
 impl VirtEp {
@@ -771,6 +787,7 @@ impl VirtEp {
             maxp: 0,
             stop_time: 0,
             err_count: 0,
+            old_cc: 0,
         }
     }
 
@@ -787,6 +804,7 @@ impl VirtEp {
             maxp,
             stop_time: 0,
             err_count: 0,
+            old_cc: 0,
         })
     }
 }
@@ -908,7 +926,7 @@ impl Xhci {
         cmd_list
             .try_reserve_exact(CommandRing::SIZE)
             .map_err(|_| UsbError::NoResources)?;
-        let quirks = quirk::of(&pci_dev);
+        let quirks = quirk::of(&pci_dev, hciversion as u16);
         halt_regs(&regs)?;
         reset_regs(&regs, quirks, XHCI_RESET_LONG_US)?;
         let dcbaa_phys = mem.frame()?;
