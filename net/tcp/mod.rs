@@ -140,6 +140,13 @@ mod deferred {
     pub const ERR: u32 = 4;
 }
 
+/// Mark the connection orphaned (Linux sock_orphan with the
+/// tcp_orphan_count increment): counted once until destroyed
+fn orphan(g: &mut Inner) {
+    g.cb.orphan = true;
+    g.orphan.get_or_insert_with(mem::Orphan::new);
+}
+
 /// What `TcpSock.lock` protects
 struct Inner {
     cb: TcpCb,
@@ -273,6 +280,8 @@ pub struct TcpSock {
     bind_link: Link,
     by_bind: AtomicBool,
     /// The tables' references, dropped a grace period after unhashing
+    /// Counted in its namespace's INUSE_TCP (`table::tcp_inuse`)
+    pub(super) inuse: AtomicBool,
     rcu_puts: RcuPuts,
     /// A child's place on its listener's SYN or accept queue
     accept_link: Link,
@@ -425,6 +434,7 @@ impl TcpSock {
             ehkey: table::EhKey::new(),
             bind_link: Link::new(),
             by_bind: AtomicBool::new(false),
+            inuse: AtomicBool::new(false),
             rcu_puts: RcuPuts::new(),
             accept_link: Link::new(),
             listen_opts: Mutex::new(cb::Opts::default()),
@@ -491,6 +501,12 @@ impl TcpSock {
             self.to_timewait(g, out);
         }
         let mut ready = None;
+        if out.established && g.tuple.is_some() {
+            // A child whose handshake completed is a socket now (Linux
+            // makes it here: sk_clone_lock, inet_ehash_nolisten)
+            self.sk.inuse_start();
+            table::tcp_inuse(self, true);
+        }
         if out.established
             && let Some(w) = g.parent.take()
         {
@@ -573,6 +589,8 @@ impl TcpSock {
         };
         self.sk.net.tcp.tw_hashdance(&self.arc(), &tw);
         g.bound = false;
+        // Linux tcp_time_wait -> tcp_done -> inet_csk_destroy_sock
+        g.orphan = None;
         // Linux inet_twsk_schedule: 2MSL is past the "killed" bound
         self.sk.net.mib.net.inc(LINUX_MIB_TIMEWAITED);
         tw.start();
@@ -823,8 +841,7 @@ impl TcpSock {
                 g.cb.input(s, skb, now, out);
             } else {
                 g.parent = None;
-                g.cb.orphan = true;
-                g.orphan.get_or_insert_with(mem::Orphan::new);
+                orphan(g);
                 g.cb.disconnect(out);
             }
         }
@@ -1190,8 +1207,7 @@ impl TcpSock {
             if let Some(g) = c.bh_get(&mut b) {
                 let mut out = Out::default();
                 g.parent = None;
-                g.cb.orphan = true;
-                g.orphan.get_or_insert_with(mem::Orphan::new);
+                orphan(g);
                 g.cb.disconnect(&mut out);
                 c.finish(g, &mut out);
             }

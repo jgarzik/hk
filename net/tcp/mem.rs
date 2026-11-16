@@ -50,9 +50,9 @@ static LIMITS: [AtomicUsize; 3] = [
 static PRESSURE: AtomicU64 = AtomicU64::new(0);
 /// TCP control blocks alive (Linux tcp_sockets_allocated)
 static SOCKETS: AtomicUsize = AtomicUsize::new(0);
-/// Orphaned connections, every namespace's (Linux tcp_orphan_count,
-/// per CPU there; a global count as SOCKETS)
-static ORPHANS: AtomicUsize = AtomicUsize::new(0);
+/// Orphaned connections, every namespace's, per CPU (Linux
+/// tcp_orphan_count): a part may go negative, the sum does not
+static ORPHANS: PerCpu<AtomicIsize> = crate::percpu![AtomicIsize::new(0)];
 
 /// Quanta covering `bytes` (Linux sk_mem_pages)
 pub fn quanta(bytes: usize) -> usize {
@@ -146,7 +146,11 @@ pub fn sockets() -> usize {
 
 /// Orphaned connections (Linux tcp_orphan_count_sum)
 pub fn orphans() -> usize {
-    ORPHANS.load(Ordering::Relaxed)
+    let n: isize = ORPHANS
+        .for_each_possible()
+        .map(|(_, c)| c.load(Ordering::Relaxed))
+        .sum();
+    n.max(0) as usize
 }
 
 /// A connection counted as an orphan (closed by its owner, or a child
@@ -157,14 +161,14 @@ pub struct Orphan(());
 
 impl Orphan {
     pub fn new() -> Self {
-        ORPHANS.fetch_add(1, Ordering::Relaxed);
+        ORPHANS.this().fetch_add(1, Ordering::Relaxed);
         Self(())
     }
 }
 
 impl Drop for Orphan {
     fn drop(&mut self) {
-        ORPHANS.fetch_sub(1, Ordering::Relaxed);
+        ORPHANS.this().fetch_sub(1, Ordering::Relaxed);
     }
 }
 

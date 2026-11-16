@@ -56,6 +56,14 @@ impl Stat {
         None
     }
 
+    /// No text (a read that failed: every field reads -1)
+    fn empty() -> Stat {
+        Stat {
+            buf: [0; 1024],
+            len: 0,
+        }
+    }
+
     fn val(&self, tag: &[u8], name: &[u8]) -> i64 {
         self.get(tag, name).unwrap_or(-1)
     }
@@ -151,10 +159,7 @@ fn counts() {
 
     // UDP: a socket, bound
     let u = udp();
-    let s = Stat::read().unwrap_or(Stat {
-        buf: [0; 1024],
-        len: 0,
-    });
+    let s = Stat::read().unwrap_or_else(Stat::empty);
     t.eq(b"udp used", used(&s) - base, 1);
     t.eq(b"udp unbound", s.val(b"UDP:", b"inuse"), 0);
     bind(u, LO, 0);
@@ -164,10 +169,9 @@ fn counts() {
         1,
     );
     close(u);
-    let s = Stat::read().unwrap_or(Stat {
-        buf: [0; 1024],
-        len: 0,
-    });
+    // Counts drop when the socket is freed, which may come after close
+    // returns (Linux __sk_free on the last reference)
+    let s = settle(|s| used(s) == base).unwrap_or_else(Stat::empty);
     t.eq(b"udp closed", s.val(b"UDP:", b"inuse"), 0);
     t.eq(b"udp closed used", used(&s) - base, 0);
 
@@ -196,24 +200,15 @@ fn counts() {
     let c = tcp();
     t.eq(b"connect", connect(c, LO, p), 0);
     let a = accept(l);
-    let s = Stat::read().unwrap_or(Stat {
-        buf: [0; 1024],
-        len: 0,
-    });
+    let s = Stat::read().unwrap_or_else(Stat::empty);
     t.eq(b"established", s.val(b"TCP:", b"inuse"), 3);
     t.eq(b"tcp used", used(&s) - base, 3);
     close(c);
     close(a);
-    let s = settle(|s| s.val(b"TCP:", b"tw") == 1).unwrap_or(Stat {
-        buf: [0; 1024],
-        len: 0,
-    });
+    let s = settle(|s| s.val(b"TCP:", b"tw") == 1).unwrap_or_else(Stat::empty);
     t.eq(b"time wait", s.val(b"TCP:", b"tw"), 1);
     close(l);
-    let s = settle(|s| s.val(b"TCP:", b"inuse") == 0).unwrap_or(Stat {
-        buf: [0; 1024],
-        len: 0,
-    });
+    let s = settle(|s| s.val(b"TCP:", b"inuse") == 0).unwrap_or_else(Stat::empty);
     t.eq(b"tcp closed", s.val(b"TCP:", b"inuse"), 0);
     t.done();
 }

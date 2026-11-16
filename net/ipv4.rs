@@ -683,7 +683,8 @@ fn ip_finish_output2(
 
 /// Split an IP packet (no options are ever generated, so every fragment
 /// repeats the header) into fragments of at most `mtu` bytes (Linux
-/// ip_do_fragment slow path)
+/// ip_do_fragment slow path); ENOMEM if one cannot be allocated (Linux
+/// ip_frag_next)
 pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelError> {
     let pkt = skb.data();
     let ihl = ((pkt[0] & 0x0f) as usize) * 4;
@@ -697,10 +698,10 @@ pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelErro
     while off < payload.len() {
         let len = room.min(payload.len() - off);
         let more = off + len < payload.len();
-        let mut f = SkBuff::alloc_tx(ihl + len, Gfp::ATOMIC).ok_or(KernelError::NoBufferSpace)?;
-        f.put_slice(&pkt[..ihl]).ok_or(KernelError::NoBufferSpace)?;
+        let mut f = SkBuff::alloc_tx(ihl + len, Gfp::ATOMIC).ok_or(KernelError::OutOfMemory)?;
+        f.put_slice(&pkt[..ihl]).ok_or(KernelError::OutOfMemory)?;
         f.put_slice(&payload[off..off + len])
-            .ok_or(KernelError::NoBufferSpace)?;
+            .ok_or(KernelError::OutOfMemory)?;
         let h = f.data_mut();
         h[2..4].copy_from_slice(&((ihl + len) as u16).to_be_bytes());
         let fo = (off / 8) as u16 | if more { 0x2000 } else { 0 };

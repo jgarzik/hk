@@ -222,6 +222,14 @@ pub fn twsk_purge(nets: &[Arc<NetNamespace>]) {
     }
 }
 
+/// Count `s` in or out of its namespace's TCP inuse, once each way
+/// (Linux sock_prot_inuse_add at hash and unhash)
+pub fn tcp_inuse(s: &TcpSock, up: bool) {
+    if s.inuse.swap(up, Ordering::Relaxed) != up {
+        s.sk.net.mib.inuse_add(INUSE_TCP, up);
+    }
+}
+
 /// The namespace an entry is in, as the tables name it
 fn net_id(net: &NetNamespace) -> usize {
     core::ptr::from_ref(&net.tcp).addr()
@@ -406,7 +414,7 @@ impl TcpTables {
     /// Hash `s` under `t` if no connection or TIME_WAIT entry of this
     /// namespace has the tuple (Linux __inet_check_established's
     /// uniqueness test and insert, under the ehash bucket lock)
-    fn hash_unique(&self, t: &Tuple, s: &Arc<TcpSock>) -> bool {
+    fn hash_unique(&self, t: &Tuple, s: &Arc<TcpSock>, count: bool) -> bool {
         let mut g = self.esk(t).lock();
         if g.find(|x| self.mine_sk(x) && x.ehkey.is(t)).is_some() {
             return false;
@@ -418,8 +426,10 @@ impl TcpTables {
         drop(tw);
         s.ehkey.set(t);
         g.add_head_rcu(s.clone());
-        // Linux inet_ehash_nolisten
-        s.sk.net.mib.inuse_add(INUSE_TCP, true);
+        // Linux inet_ehash_nolisten (a child counts once established)
+        if count {
+            tcp_inuse(s, true);
+        }
         true
     }
 
@@ -436,7 +446,7 @@ impl TcpTables {
         range: (u16, u16),
     ) -> Result<Tuple, KernelError> {
         if t.lport != 0 {
-            return if self.hash_unique(&t, s) {
+            return if self.hash_unique(&t, s, true) {
                 Ok(t)
             } else {
                 Err(KernelError::AddressNotAvailable)
@@ -454,7 +464,7 @@ impl TcpTables {
             let usable = self
                 .with_bucket(&mut c, p, false, |b| b.owners.lock().connect_only())
                 .unwrap_or(true);
-            if !usable || !self.hash_unique(&tp, s) {
+            if !usable || !self.hash_unique(&tp, s, true) {
                 return false;
             }
             if !self.own(&mut c, s, p, false) {
@@ -471,7 +481,7 @@ impl TcpTables {
 
     /// Insert a connection (a listener's child); false if `t` is taken
     pub fn hash(&self, t: Tuple, s: &Arc<TcpSock>) -> bool {
-        self.hash_unique(&t, s)
+        self.hash_unique(&t, s, false)
     }
 
     /// Remove `s`'s entry for `t` (Linux inet_unhash): the chain's
@@ -480,7 +490,7 @@ impl TcpTables {
         let mut g = self.esk(t).lock();
         if let Some(u) = g.del_rcu(s) {
             u.defer();
-            s.sk.net.mib.inuse_add(INUSE_TCP, false);
+            tcp_inuse(s, false);
         }
     }
 
@@ -529,7 +539,7 @@ impl TcpTables {
         if let Some(u) = g.del_rcu(s) {
             u.defer();
             // Linux inet_twsk_hashdance: the socket leaves
-            mib.inuse_add(INUSE_TCP, false);
+            tcp_inuse(s, false);
         }
     }
 
@@ -557,7 +567,7 @@ impl TcpTables {
 
     /// Hash a listener on `port` (Linux __inet_hash into lhash2)
     pub fn listen_add(&self, port: u16, s: Arc<TcpSock>) {
-        s.sk.net.mib.inuse_add(INUSE_TCP, true);
+        tcp_inuse(&s, true);
         self.lhead(port).lock().add_head_rcu(s);
     }
 
@@ -566,7 +576,7 @@ impl TcpTables {
         let mut g: NullsGuard<'_, SkLhash> = self.lhead(port).lock();
         if let Some(u) = g.del_rcu(s) {
             u.defer();
-            s.sk.net.mib.inuse_add(INUSE_TCP, false);
+            tcp_inuse(s, false);
         }
     }
 
