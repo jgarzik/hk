@@ -215,7 +215,9 @@ impl KmemCache {
         let next = unsafe { *(obj as *const usize) };
         pg.private.store(next as u64, Ordering::Relaxed);
         l.active += 1;
-        let inuse = pg.inuse.fetch_add(1, Ordering::Relaxed) as usize + 1;
+        // Under list_lock (`l`): Linux slab->inuse++
+        let inuse = pg.inuse.load(Ordering::Relaxed) as usize + 1;
+        pg.inuse.store(inuse as u32, Ordering::Relaxed);
         if inuse == 1 {
             self.unlink(&mut l.empty, base);
             l.nr_empty -= 1;
@@ -236,7 +238,9 @@ impl KmemCache {
         unsafe { *(obj as *mut usize) = pg.private.load(Ordering::Relaxed) as usize };
         pg.private.store(obj as u64, Ordering::Relaxed);
         l.active -= 1;
-        let inuse = pg.inuse.fetch_sub(1, Ordering::Relaxed) as usize - 1;
+        // Under list_lock (`l`): Linux slab->inuse--
+        let inuse = pg.inuse.load(Ordering::Relaxed) as usize - 1;
+        pg.inuse.store(inuse as u32, Ordering::Relaxed);
         if inuse + 1 < self.objs {
             if inuse == 0 {
                 self.unlink(&mut l.partial, base);

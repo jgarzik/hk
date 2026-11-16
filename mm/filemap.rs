@@ -411,7 +411,7 @@ fn insert(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
     pg.mapping.store(m.key(), Ordering::Release);
     FRAME_ALLOCATOR.incref(phys);
     // Nothing allocated under the spin lock (Linux xas_nomem)
-    let stored = super::xarray::store_nomem(
+    let stored = super::xarray::store_nomem_locked(
         || m.i_pages.lock(),
         index,
         phys,
@@ -425,8 +425,11 @@ fn insert(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
         KernelError::OutOfMemory,
     );
     match stored {
-        Ok(_) => {
-            m.nrpages.fetch_add(1, Ordering::Relaxed);
+        Ok((_, pages)) => {
+            // Under the i_pages lock, read lock-free (Linux nrpages under
+            // the xa_lock, READ_ONCE): a load and a store
+            crate::sync::Sole::sole_add(&m.nrpages, 1);
+            drop(pages);
             count_file(m, 1);
             Ok(())
         }
@@ -509,11 +512,12 @@ pub fn remove(m: &AddressSpace, phys: u64) {
         let old = pages.erase(index);
         debug_assert_eq!(old, phys);
         pg.mapping.store(0, Ordering::Release);
+        // Under the i_pages lock (Linux page_cache_delete: nrpages -= nr)
+        crate::sync::Sole::sole_add(&m.nrpages, u64::MAX);
     }
     test_clear_dirty(pg);
     pg.flags.fetch_and(!PG_UPTODATE, Ordering::Relaxed);
     pg.private.store(0, Ordering::Relaxed);
-    m.nrpages.fetch_sub(1, Ordering::Relaxed);
     count_file(m, -1);
     m.uncharge(1);
     put_page(phys);

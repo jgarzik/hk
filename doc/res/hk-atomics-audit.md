@@ -227,15 +227,6 @@ argued / published copy of locked state.
   `ino_batch` per CPU.
 - Fix: per-CPU batched allocation (as `fs/anon_inodes.rs` already does).
 
-### 20. Slab and page-cache counts: RMW under the owning lock — (a)
-- Where: `mm/slab.rs` `take_obj`/`put_obj` (`Page.inuse.fetch_add/sub` under
-  `list_lock`), `KmemCache.nr_slabs`; `mm/filemap.rs`
-  `AddressSpace.nrpages` (`fetch_add/sub` under the `i_pages` lock).
-- Linux: `slab->inuse` and `mapping->nrpages` plain under `list_lock` /
-  `xa_lock`, `nrpages` read with READ_ONCE.
-- Fix: Relaxed load+store under the lock (the `Page` fields must stay atomic
-  types for interior mutability; only the RMW goes).
-
 ### 22. Inode identity bits as unrelated atomics — (b), low
 - Where: `fs/inode.rs` `Inode.mode`, `uid`, `gid` (chown/chmod write them
   separately), `dead`, `i_swapfile`, `i_linkable`.
