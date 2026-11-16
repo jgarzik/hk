@@ -290,6 +290,7 @@ mod imp {
             irq_report(c, class, at);
         }
         if check {
+            recursion(c, id, class, at);
             order(c, class, at);
         }
         let d = c.depth.get();
@@ -307,6 +308,26 @@ mod imp {
                     "LOCKDEP:FAIL non-IRQ-safe spin lock {} taken in interrupt context at {}",
                     class,
                     at
+                );
+            });
+        }
+    }
+
+    /// Report taking lock `id` while this CPU holds it already: a
+    /// spin lock deadlocks at once, a queued rwlock's read as soon as a
+    /// writer waits between the two (Linux lockdep's recursive read of a
+    /// non-recursive rwlock); once per lock class
+    fn recursion(c: &Cpu, id: usize, class: Loc, at: Loc) {
+        let Some(h) = c.held().find(|h| h.id == id) else {
+            return;
+        };
+        if GRAPH.lock().first(key(class) ^ 0x2) {
+            report(c, || {
+                crate::printkln!(
+                    "LOCKDEP:FAIL lock {} taken again at {} (held since {})",
+                    class,
+                    at,
+                    h.at
                 );
             });
         }

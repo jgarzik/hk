@@ -145,7 +145,7 @@ concurrent readers or one exclusive writer.
   writer, or a writer waiting, queues, and a writer marks itself
   waiting so new readers stop taking the fast path. A recursive read in
   thread context therefore deadlocks behind a waiting writer, as on
-  Linux; a reader in an interrupt handler does not queue (it waits only
+  Linux (lockdep-lite reports any lock taken again while held, 1.5); a reader in an interrupt handler does not queue (it waits only
   for a writer that holds it). `IrqRwLock` (1.1.1) is the same lock
   with interrupts masked
 
