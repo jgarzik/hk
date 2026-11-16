@@ -603,9 +603,10 @@ fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) -> Result<(), KernelEr
 }
 
 /// A VMA the heap can grow into: private anonymous memory, no file
-/// or shared object behind it
+/// or shared object behind it, and no memory policy (Linux
+/// do_brk_flags: !vma_policy(vma))
 fn is_heap(v: &Vma) -> bool {
-    v.file.is_none() && v.shm.is_none() && v.is_private()
+    v.file.is_none() && v.shm.is_none() && v.is_private() && v.mempolicy.is_none()
 }
 
 // ============================================================================

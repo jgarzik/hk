@@ -7,7 +7,7 @@ use crate::harness::{R, check, report_r};
 use crate::helpers::{linux_at_least, print, print_num, println};
 #[allow(unused_imports)]
 use hk_syscall::{
-    sys_get_mempolicy, sys_mbind, sys_migrate_pages, sys_mmap, sys_move_pages, sys_munmap,
+    sys_brk, sys_get_mempolicy, sys_mbind, sys_migrate_pages, sys_mmap, sys_move_pages, sys_munmap,
     sys_set_mempolicy,
 };
 
@@ -59,6 +59,8 @@ pub fn run_tests() {
     run(b"MBIND_HOLES", mbind_holes);
     run(b"MBIND_STRICT", mbind_strict);
     run(b"MBIND_FORK", mbind_fork);
+    run(b"MBIND_BRK", mbind_brk);
+    run(b"MIGRATE_MAXNODE", migrate_maxnode);
 }
 
 /// Test: Get default memory policy
@@ -884,4 +886,37 @@ fn mbind_fork() -> R {
         sys_wait4(pid, &mut st, 0, 0);
         check(b"child", st == 0, i64::from(st))
     })
+}
+
+/// MBIND_BRK: brk does not grow a heap VMA that has a policy; the new
+/// pages are a VMA of their own, with none (Linux do_brk_flags:
+/// !vma_policy(vma))
+fn mbind_brk() -> R {
+    let b0 = sys_brk(0) as u64;
+    let base = (b0 + PAGE - 1) & !(PAGE - 1);
+    let r = brk_steps(base);
+    sys_brk(b0);
+    r
+}
+
+fn brk_steps(base: u64) -> R {
+    let r = sys_brk(base + PAGE) as u64;
+    check(b"brk one page", r == base + PAGE, r as i64)?;
+    let r = mbind1(base, PAGE, MPOL_BIND, 1, 0);
+    check(b"mbind heap", r == 0, r)?;
+    vma_is(base, MPOL_BIND, 1)?;
+    let r = sys_brk(base + 2 * PAGE) as u64;
+    check(b"brk grow", r == base + 2 * PAGE, r as i64)?;
+    vma_is(base + PAGE, MPOL_DEFAULT, 0)?;
+    vma_is(base, MPOL_BIND, 1)
+}
+
+/// MIGRATE_MAXNODE: migrate_pages reads its masks as get_nodes does:
+/// maxnode 1 holds no node bits, so the new nodes are empty (EINVAL)
+fn migrate_maxnode() -> R {
+    let one = 1u64;
+    let r = sys_migrate_pages(0, 1, &one, &one);
+    check(b"maxnode 1", r == -22, r)?;
+    let r = sys_migrate_pages(0, 2, &one, &one);
+    check(b"maxnode 2", r >= 0, r)
 }

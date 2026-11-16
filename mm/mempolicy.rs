@@ -118,8 +118,6 @@ impl Mempolicy {
     pub fn query_nodes(&self) -> u64 {
         if self.store_user() {
             self.user_nodes
-        } else if self.mode == MPOL_LOCAL {
-            0
         } else {
             self.nodes
         }
@@ -380,7 +378,7 @@ fn mpol_set_nodemask(mut pol: Mempolicy, nodes: u64, allowed: u64) -> KernelResu
 /// node_states[N_MEMORY]; with no cpusets also
 /// cpuset_current_mems_allowed)
 fn mems_allowed() -> u64 {
-    NUMA_TOPOLOGY.lock().online_mask()
+    NUMA_TOPOLOGY.lock().memory_mask()
 }
 
 /// One past the highest possible node (Linux nr_node_ids)
@@ -471,11 +469,10 @@ fn vma_policy(addr: u64) -> KernelResult<Option<Mempolicy>> {
 }
 
 /// The node of the page at `addr`, faulted in for reading if missing
-/// (Linux lookup_node: get_user_pages_fast); its error if it cannot be
+/// (Linux lookup_node: get_user_pages_fast without FOLL_WRITE); its
+/// error if it cannot be
 fn lookup_node(addr: u64) -> KernelResult<i32> {
-    let mut pages = crate::mm::gup::PinnedPages::new(1)?;
-    crate::mm::gup::pin_user(&mut pages, addr & !(PAGE_SIZE - 1), 1, false, 1)?;
-    let phys = pages.segs().first().ok_or(KernelError::BadAddress)?.phys;
+    let phys = crate::mm::gup::user_page_phys(addr)?;
     Ok(NUMA_TOPOLOGY.lock().pfn_to_node(phys / PAGE_SIZE) as i32)
 }
 
@@ -565,6 +562,11 @@ fn do_mbind(
     }
     let new = mpol_new(mode, mode_flags, nmask)?;
     let allowed = mems_allowed();
+    let mut spans = alloc::vec::Vec::new();
+    spans
+        .try_reserve_exact(crate::mm::numa::MAX_NUMA_NODES)
+        .map_err(|_| KernelError::OutOfMemory)?;
+    NUMA_TOPOLOGY.lock().spans_into(&mut spans);
     let mm = crate::task::percpu::current()
         .mm()
         .ok_or(KernelError::BadAddress)?;
@@ -577,6 +579,7 @@ fn do_mbind(
         flags,
         target: target_nodes(new.as_ref()),
         failed: 0,
+        spans,
     };
     q.range(&mm, &map, start, end, new.is_none())?;
     mbind_vmas(&mut map, start, end, new)?;
@@ -603,6 +606,8 @@ struct Queue {
     flags: u32,
     target: u64,
     failed: u64,
+    /// The nodes' page frame spans, taken once before the walk
+    spans: alloc::vec::Vec<(u64, u64, u32)>,
 }
 
 impl Queue {
@@ -622,7 +627,8 @@ impl Queue {
         let t = crate::mm::pgtable::PgTables::new(mm, map);
         let mut vmas = map
             .iter()
-            .filter(|v| v.end > start && v.start < end)
+            .skip_while(|v| v.end <= start)
+            .take_while(|v| v.start < end)
             .peekable();
         let mut first = true;
         while let Some(v) = vmas.next() {
@@ -651,7 +657,7 @@ impl Queue {
         if crate::mm::page::phys_to_page(phys).is_none() {
             return Ok(());
         }
-        let node = NUMA_TOPOLOGY.lock().pfn_to_node(phys / PAGE_SIZE);
+        let node = crate::mm::numa::node_of(&self.spans, phys / PAGE_SIZE);
         let bit = 1u64 << node;
         let moving = self.flags & (MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) != 0;
         if self.nmask & bit != 0 || (moving && self.target & bit != 0) {
@@ -745,54 +751,29 @@ fn mm_target(pid: i64) -> Result<(), KernelError> {
 /// # Returns
 /// Number of pages that could not be moved, or negative errno
 ///
-/// Validates node masks against real online NUMA nodes; no page is
-/// migrated yet (BUGS.md).
+/// No page is migrated yet (BUGS.md).
 ///
-/// Linux kernel_migrate_pages order: the masks (EFAULT, EINVAL), the
-/// target ([`mm_target`]: ESRCH, EPERM), then new nodes outside the
-/// online ones (cpuset_mems_allowed) need CAP_SYS_NICE (EPERM), and
-/// none online is EINVAL
+/// Linux kernel_migrate_pages order: the masks (`get_nodes`: EFAULT,
+/// EINVAL), the target ([`mm_target`]: ESRCH, EPERM), then new nodes
+/// outside those with memory (cpuset_mems_allowed) need CAP_SYS_NICE
+/// (EPERM), and none of them is EINVAL
 pub fn sys_migrate_pages(
     pid: i64,
     maxnode: u64,
     old_nodes: UserPtr<u64>,
     new_nodes: UserPtr<u64>,
 ) -> KernelResult<u64> {
-    // get_nodes: maxnode 0 leaves no bit count (EINVAL)
-    if maxnode == 0 {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    if maxnode > MAX_MASK_BITS + 1 {
-        return Err(KernelError::InvalidArgument);
-    }
-    let mask_bytes = maxnode.div_ceil(64) * 8;
-    let online_mask = NUMA_TOPOLOGY.lock().online_mask();
-
-    // Validate and read old_nodes if provided
-    if !old_nodes.is_null() {
-        if !access_ok(old_nodes.addr(), mask_bytes as usize) {
-            return Err(KernelError::BadAddress);
-        }
-        old_nodes.read()?;
-    }
-
-    // Validate and read new_nodes if provided; NULL is an empty mask
-    let mut new_mask: u64 = 0;
-    if !new_nodes.is_null() {
-        if !access_ok(new_nodes.addr(), mask_bytes as usize) {
-            return Err(KernelError::BadAddress);
-        }
-        new_mask = new_nodes.read()?;
-    }
-
+    // The old nodes are only checked: nothing is migrated (BUGS.md)
+    get_nodes(old_nodes, maxnode)?;
+    let new = get_nodes(new_nodes, maxnode)?;
     mm_target(pid)?;
-    // Nodes the target may not use (no cpusets: the online ones)
-    if new_mask & !online_mask != 0 && !crate::task::capable(crate::task::CAP_SYS_NICE) {
+    // Nodes the target may not use (no cpusets: those with memory)
+    let allowed = mems_allowed();
+    if new & !allowed != 0 && !crate::task::capable(crate::task::CAP_SYS_NICE) {
         return Err(KernelError::NotPermitted);
     }
     // No allowed target node: EINVAL (Linux kernel_migrate_pages)
-    if new_mask & online_mask == 0 {
+    if new & allowed == 0 {
         return Err(KernelError::InvalidArgument);
     }
 
@@ -919,10 +900,6 @@ fn move_pages_resched(i: u64) -> KernelResult<()> {
     }
     Ok(())
 }
-
-/// Largest node mask accepted from/copied to user space: one page of bits
-/// (Linux get_nodes / copy_nodes_to_user)
-const MAX_MASK_BITS: u64 = PAGE_SIZE * 8;
 
 #[cfg(test)]
 mod tests {

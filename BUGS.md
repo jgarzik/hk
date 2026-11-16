@@ -186,6 +186,14 @@ getcpu reports it; nothing else uses it. Missing (Linux
   MPOL_MF_MOVE move nothing (mbind counts a page off the policy's
   nodes as not moved: EIO with MPOL_MF_STRICT); move_pages query mode
   reports node 0 for every page.
+- A node is one page frame span (`NumaNode.start_pfn`..`end_pfn`,
+  the bounds of all its SRAT/DT ranges): with interleaved ranges
+  `pfn_to_node` gives a page the first node whose span covers it
+  (Linux page_to_nid: per-section node ids), so get_mempolicy's
+  MPOL_F_NODE|MPOL_F_ADDR and mbind's page check see the wrong node.
+- mbind with MPOL_MF_MOVE counts a misplaced page mapped by several
+  processes as not moved; Linux skips it without MPOL_MF_MOVE_ALL
+  (migrate_folio_add).
 - Nodemasks are one `u64` (64 nodes); the gate has no multi-node QEMU
   run (by hand: `QEMU_EXTRA="-object memory-backend-ram,id=m0,size=256M
   -object memory-backend-ram,id=m1,size=256M -numa

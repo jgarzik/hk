@@ -256,6 +256,25 @@ impl NumaTopology {
             .map_or(0, |n| n.node_id)
     }
 
+    /// Each node's page frame span and id, into `out` (room reserved
+    /// for MAX_NUMA_NODES by the caller: nothing allocates here)
+    pub fn spans_into(&self, out: &mut alloc::vec::Vec<(u64, u64, u32)>) {
+        out.clear();
+        for n in self.nodes.iter().flatten().take(out.capacity()) {
+            out.push((n.start_pfn, n.end_pfn, n.node_id));
+        }
+    }
+
+    /// The nodes with memory (Linux node_states[N_MEMORY]): a node of
+    /// CPUs only is online but holds no pages
+    pub fn memory_mask(&self) -> u64 {
+        self.nodes
+            .iter()
+            .flatten()
+            .filter(|n| n.present_pages > 0)
+            .fold(0, |m, n| m | 1 << n.node_id)
+    }
+
     /// Assign a CPU to a specific node
     pub fn assign_cpu_to_node(&mut self, cpu: u32, node: u32) {
         if (cpu as usize) < NR_CPUS && (node as usize) < MAX_NUMA_NODES {
@@ -311,6 +330,14 @@ impl NumaTopology {
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
+}
+
+/// The node of `spans` whose span holds `pfn`; node 0 if none does
+pub fn node_of(spans: &[(u64, u64, u32)], pfn: u64) -> u32 {
+    spans
+        .iter()
+        .find(|&&(s, e, _)| (s..e).contains(&pfn))
+        .map_or(0, |&(_, _, n)| n)
 }
 
 /// Global NUMA topology singleton
