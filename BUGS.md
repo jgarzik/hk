@@ -176,14 +176,16 @@ Topology is discovered (ACPI SRAT/SLIT, DT `numa-node-id`) and
 getcpu reports it; nothing else uses it. Missing (Linux
 `mm/mempolicy.c`, `mm/migrate.c`):
 
-- mbind does not store its policy: it validates and returns 0
-  (`Vma.mempolicy` stays None, so get_mempolicy MPOL_F_ADDR always
-  reports MPOL_DEFAULT).
+- No shared policy: mbind on a shmem or SysV shm mapping sets only
+  that VMA's `mempolicy` (Linux shmem_set_policy keeps it on the
+  inode, seen by every mapping of it).
 - One buddy zone for all RAM: no per-node zones (pg_data_t) or
   node-aware allocation, so no policy (BIND, PREFERRED, INTERLEAVE,
   local) affects where pages come from.
-- No page migration: migrate_pages and move_pages validate and move
-  nothing; move_pages query mode reports node 0 for every page.
+- No page migration: migrate_pages, move_pages and mbind's
+  MPOL_MF_MOVE move nothing (mbind counts a page off the policy's
+  nodes as not moved: EIO with MPOL_MF_STRICT); move_pages query mode
+  reports node 0 for every page.
 - Nodemasks are one `u64` (64 nodes); the gate has no multi-node QEMU
   run (by hand: `QEMU_EXTRA="-object memory-backend-ram,id=m0,size=256M
   -object memory-backend-ram,id=m1,size=256M -numa

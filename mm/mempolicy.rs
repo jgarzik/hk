@@ -507,78 +507,210 @@ fn do_set_mempolicy(mode: u16, flags: u16, nodes: u64) -> KernelResult<()> {
     Ok(())
 }
 
-/// sys_mbind - Set memory policy for a memory range
-///
-/// # Arguments
-/// * `start` - Start address of range (must be page-aligned)
-/// * `len` - Length of range (will be rounded up to page boundary)
-/// * `mode` - Policy mode with optional flags
-/// * `nmask_ptr` - User pointer to node mask
-/// * `maxnode` - Size of node mask in bits
-/// * `flags` - MPOL_MF_STRICT, MPOL_MF_MOVE, MPOL_MF_MOVE_ALL
-///
-/// # Returns
-/// 0 on success, negative errno on error
-///
-/// Validates nodemask against real online NUMA nodes; the policy is
-/// not stored yet (BUGS.md).
+/// sys_mbind - Set the memory policy of a range (Linux kernel_mbind):
+/// `mode` (its int, as Linux takes it) with its flags checked, the
+/// nodemask read, then [`do_mbind`]
 pub fn sys_mbind(
     start: u64,
     len: u64,
     mode: u64,
-    nmask_ptr: UserPtr<u64>,
+    nmask: UserPtr<u64>,
     maxnode: u64,
     flags: u32,
 ) -> KernelResult<()> {
-    // Validate flags
+    let (mode, mode_flags) = sanitize_mpol_flags(mode as i32)?;
+    let nodes = get_nodes(nmask, maxnode)?;
+    do_mbind(start, len, mode, mode_flags, nodes, flags)
+}
+
+/// Give the VMAs of [start, start + len) the policy (Linux do_mbind):
+/// unknown flags EINVAL, MPOL_MF_MOVE_ALL without CAP_SYS_NICE EPERM,
+/// an unaligned start EINVAL, a wrapping range EINVAL, an empty one
+/// nothing. Under the mmap_lock for writing, the pages of the range are
+/// checked (`queue_pages`: a hole is EFAULT unless the policy is
+/// MPOL_DEFAULT, a range with no VMA always; a misplaced page with
+/// MPOL_MF_STRICT alone EIO, nothing changed), then each VMA is split
+/// at the range edges and takes the policy (`mbind_vmas`). With
+/// MPOL_MF_STRICT, a misplaced page left in place is EIO after that
+/// (MPOL_DEFAULT drops MPOL_MF_STRICT). Nothing is migrated (BUGS.md):
+/// with MPOL_MF_MOVE a page is in place only where the policy would
+/// put it anyway.
+fn do_mbind(
+    start: u64,
+    len: u64,
+    mode: u16,
+    mode_flags: u16,
+    nmask: u64,
+    mut flags: u32,
+) -> KernelResult<()> {
     if flags & !MPOL_MF_VALID != 0 {
         return Err(KernelError::InvalidArgument);
     }
-
-    // Validate address alignment
-    if start & (PAGE_SIZE - 1) != 0 {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    // Zero length is a no-op
-    if len == 0 {
-        return Ok(());
-    }
-
-    // Extract policy mode (lower bits)
-    let policy_mode = (mode & 0x7fff) as u16;
-
-    // Validate policy mode
-    if !(0..MPOL_MAX).contains(&policy_mode) {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    // MPOL_DEFAULT doesn't use nodemask
-    if policy_mode != MPOL_DEFAULT && policy_mode != MPOL_LOCAL {
-        if nmask_ptr.is_null() || maxnode == 0 {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        let nodemask = nmask_ptr.read()?;
-
-        // Empty mask is invalid
-        if nodemask == 0 {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        // Validate that all specified nodes are online
-        let online_mask = NUMA_TOPOLOGY.lock().online_mask();
-        if nodemask & !online_mask != 0 {
-            return Err(KernelError::InvalidArgument);
-        }
-    }
-
-    // MPOL_MF_MOVE_ALL requires CAP_SYS_NICE
     if flags & MPOL_MF_MOVE_ALL != 0 && !crate::task::capable(crate::task::CAP_SYS_NICE) {
         return Err(KernelError::NotPermitted);
     }
+    if start & (PAGE_SIZE - 1) != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    if mode == MPOL_DEFAULT {
+        flags &= !MPOL_MF_STRICT;
+    }
+    let len = len.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let end = start.wrapping_add(len);
+    if end < start {
+        return Err(KernelError::InvalidArgument);
+    }
+    if end == start {
+        return Ok(());
+    }
+    let new = mpol_new(mode, mode_flags, nmask)?;
+    let allowed = mems_allowed();
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::BadAddress)?;
+    let mut map = mm.mmap_write();
+    let new = new
+        .map(|p| mpol_set_nodemask(p, nmask, allowed))
+        .transpose()?;
+    let mut q = Queue {
+        nmask,
+        flags,
+        target: target_nodes(new.as_ref()),
+        failed: 0,
+    };
+    q.range(&mm, &map, start, end, new.is_none())?;
+    mbind_vmas(&mut map, start, end, new)?;
+    if q.failed > 0 && flags & MPOL_MF_STRICT != 0 {
+        return Err(KernelError::Io);
+    }
+    Ok(())
+}
 
-    // Valid, but not stored and nothing is migrated (BUGS.md)
+/// The nodes `pol` allocates on, where a migration would put a page:
+/// the local node for MPOL_LOCAL and MPOL_DEFAULT
+fn target_nodes(pol: Option<&Mempolicy>) -> u64 {
+    match pol {
+        Some(p) if p.mode != MPOL_LOCAL => p.nodes,
+        _ => 1u64 << NUMA_TOPOLOGY.lock().cpu_to_node(crate::cpu::this_id()),
+    }
+}
+
+/// mbind's page check (Linux struct queue_pages, MPOL_MF_INVERT): a
+/// present page off the nodes of `nmask` is misplaced, and a failure
+/// unless MPOL_MF_MOVE would leave it where it is (`target`)
+struct Queue {
+    nmask: u64,
+    flags: u32,
+    target: u64,
+    failed: u64,
+}
+
+impl Queue {
+    /// Check the VMAs of [start, end) in `map` (Linux queue_pages_range,
+    /// queue_pages_test_walk): EFAULT at a hole unless `discontig`, and
+    /// with no VMA there at all; pages are looked at only for
+    /// MPOL_MF_STRICT or a move, EIO at the first misplaced one for
+    /// MPOL_MF_STRICT alone
+    fn range(
+        &mut self,
+        mm: &crate::mm::Mm,
+        map: &crate::mm::MmStruct,
+        start: u64,
+        end: u64,
+        discontig: bool,
+    ) -> KernelResult<()> {
+        let t = crate::mm::pgtable::PgTables::new(mm, map);
+        let mut vmas = map
+            .iter()
+            .filter(|v| v.end > start && v.start < end)
+            .peekable();
+        let mut first = true;
+        while let Some(v) = vmas.next() {
+            if first && !discontig && start < v.start {
+                return Err(KernelError::BadAddress);
+            }
+            first = false;
+            let hole = v.end < end && vmas.peek().is_none_or(|n| v.end < n.start);
+            if hole && !discontig {
+                return Err(KernelError::BadAddress);
+            }
+            if self.flags & MPOL_MF_VALID != 0 {
+                let (s, e) = (start.max(v.start), end.min(v.end));
+                crate::mm::pagewalk::walk_pte_range(t, s, e, self).map_err(|()| KernelError::Io)?;
+            }
+        }
+        if first {
+            return Err(KernelError::BadAddress);
+        }
+        Ok(())
+    }
+
+    /// The page at `phys` (Linux queue_folio_required and the checks
+    /// after it); Err stops the walk (MPOL_MF_STRICT alone)
+    fn page(&mut self, phys: u64) -> Result<(), ()> {
+        if crate::mm::page::phys_to_page(phys).is_none() {
+            return Ok(());
+        }
+        let node = NUMA_TOPOLOGY.lock().pfn_to_node(phys / PAGE_SIZE);
+        let bit = 1u64 << node;
+        let moving = self.flags & (MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) != 0;
+        if self.nmask & bit != 0 || (moving && self.target & bit != 0) {
+            return Ok(());
+        }
+        self.failed += 1;
+        if moving { Ok(()) } else { Err(()) }
+    }
+}
+
+impl crate::mm::pagewalk::PteWalk for Queue {
+    type Err = ();
+
+    fn huge(&mut self, pmd: crate::mm::pgtable::Pmd<'_>, _: u64, _: u64) -> Result<bool, ()> {
+        use crate::mm::huge_page::HUGE_PAGE_MASK;
+        self.page(crate::arch::paging::pte_addr(pmd.settled()) & !HUGE_PAGE_MASK)?;
+        Ok(true)
+    }
+
+    fn pte(&mut self, e: &core::sync::atomic::AtomicU64, _: u64) -> Result<(), ()> {
+        let pte = e.load(core::sync::atomic::Ordering::Acquire);
+        if crate::arch::paging::pte_present(pte) {
+            self.page(crate::arch::paging::pte_addr(pte))?;
+        }
+        Ok(())
+    }
+}
+
+/// Give the VMAs of [start, end) the policy `new` (Linux mbind_range,
+/// vma_modify_policy): a VMA that has it already is left alone, else
+/// split at the range edges (ENOMEM at vm.max_map_count), given it and
+/// merged with neighbours that have the same
+fn mbind_vmas(
+    map: &mut crate::mm::MmStruct,
+    start: u64,
+    end: u64,
+    new: Option<Mempolicy>,
+) -> KernelResult<()> {
+    let mut addr = start;
+    while addr < end {
+        let Some(v) = map.next_vma(addr).and_then(|i| map.get_vma(i)) else {
+            break;
+        };
+        if v.start >= end {
+            break;
+        }
+        let (s, e) = (addr.max(v.start), v.end.min(end));
+        if !mpol_equal(v.mempolicy.as_ref(), new.as_ref()) {
+            map.split_at_checked(s)?;
+            map.split_at_checked(e)?;
+            if let Some(j) = map.find_vma_exact(s) {
+                if let Some(v) = map.get_vma_mut(j) {
+                    v.mempolicy = new;
+                }
+                map.merge_adjacent(j);
+            }
+        }
+        addr = e;
+    }
     Ok(())
 }
 
@@ -909,6 +1041,39 @@ mod tests {
         assert_eq!(next_node_in(1, 0b1010), 3);
         assert_eq!(next_node_in(3, 0b1010), 1);
         assert_eq!(next_node_in(0, 0), MAX_NUMNODES as u32);
+    }
+
+    #[test]
+    fn mbind_splits_and_merges() {
+        use crate::mm::{MAP_ANONYMOUS, MAP_PRIVATE, MmStruct, PROT_READ, Vma};
+        let mut m = MmStruct::new(0x7000_0000);
+        m.insert_vma(Vma::new(
+            0x10000,
+            0x14000,
+            PROT_READ,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        ));
+        let bind = mpol_set_nodemask(mpol_new(MPOL_BIND, 0, 1).unwrap().unwrap(), 1, 1).unwrap();
+        let spans = |m: &MmStruct| -> alloc::vec::Vec<(u64, u64, bool)> {
+            m.iter()
+                .map(|v| (v.start, v.end, v.mempolicy.is_some()))
+                .collect()
+        };
+        mbind_vmas(&mut m, 0x11000, 0x13000, Some(bind)).unwrap();
+        assert_eq!(
+            spans(&m),
+            [
+                (0x10000, 0x11000, false),
+                (0x11000, 0x13000, true),
+                (0x13000, 0x14000, false)
+            ]
+        );
+        // The same policy again: no change
+        mbind_vmas(&mut m, 0x11000, 0x12000, Some(bind)).unwrap();
+        assert_eq!(m.iter().count(), 3);
+        // Default over all of it: one VMA again
+        mbind_vmas(&mut m, 0x10000, 0x14000, None).unwrap();
+        assert_eq!(spans(&m), [(0x10000, 0x14000, false)]);
     }
 
     #[test]

@@ -55,6 +55,10 @@ pub fn run_tests() {
     run(b"MPOL_GET_FLAGS", get_flags);
     run(b"MPOL_FORK", fork_inherits);
     run(b"MPOL_ADDR", addr_policy);
+    run(b"MBIND_POLICY", mbind_policy);
+    run(b"MBIND_HOLES", mbind_holes);
+    run(b"MBIND_STRICT", mbind_strict);
+    run(b"MBIND_FORK", mbind_fork);
 }
 
 /// Test: Get default memory policy
@@ -704,4 +708,179 @@ fn addr_checks(a: u64) -> R {
     check(b"touched node", r == 0 && p == 0, r)?;
     let (r, p, _) = get1(a + PAGE, MPOL_F_ADDR | MPOL_F_NODE);
     check(b"untouched node", r == 0 && p == 0, r)
+}
+
+const MPOL_MF_STRICT: u32 = 1;
+const MPOL_MF_MOVE: u32 = 2;
+const MPOL_MF_LAZY: u32 = 8;
+
+/// mbind with a one-word mask, all 64 bits read
+fn mbind1(a: u64, len: u64, mode: i32, mask: u64, flags: u32) -> i64 {
+    sys_mbind(a, len, mode as u64, &mask, 65, flags)
+}
+
+/// The VMA policy at `a` is `want` with nodes `mask`
+fn vma_is(a: u64, want: i32, mask: u64) -> R {
+    let (r, p, m) = get1(a, MPOL_F_ADDR);
+    check(b"get_mempolicy addr", r == 0, r)?;
+    check(b"vma policy", p == want, i64::from(p))?;
+    check(b"vma nodes", m == mask, m as i64)
+}
+
+/// `pages` fresh anonymous read-write pages
+fn map_pages(pages: u64) -> Result<u64, (&'static [u8], i64)> {
+    let p = sys_mmap(
+        0,
+        pages * PAGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    check(b"mmap", p > 0, p)?;
+    Ok(p as u64)
+}
+
+/// Run `f` on `pages` fresh pages, unmapped after it
+fn with_pages(pages: u64, f: fn(u64) -> R) -> R {
+    let a = map_pages(pages)?;
+    let r = f(a);
+    sys_munmap(a, pages * PAGE);
+    r
+}
+
+/// MBIND_POLICY: mbind gives the VMAs of the range the policy, split at
+/// its edges, the length rounded up to pages (Linux do_mbind,
+/// mbind_range); MPOL_DEFAULT removes it; the task policy is untouched;
+/// argument checks (EINVAL: flags, alignment, a wrapping range, the
+/// mode's nodes)
+fn mbind_policy() -> R {
+    with_pages(4, |a| {
+        let r = mbind1(a + PAGE, 2 * PAGE, MPOL_BIND, 1, 0);
+        check(b"mbind bind", r == 0, r)?;
+        vma_is(a, MPOL_DEFAULT, 0)?;
+        vma_is(a + PAGE, MPOL_BIND, 1)?;
+        vma_is(a + 2 * PAGE + 8, MPOL_BIND, 1)?;
+        vma_is(a + 3 * PAGE, MPOL_DEFAULT, 0)?;
+        is_pol(MPOL_DEFAULT, 0)?;
+        let r = mbind1(a, 1, MPOL_INTERLEAVE, 1, 0);
+        check(b"mbind one byte", r == 0, r)?;
+        vma_is(a, MPOL_INTERLEAVE, 1)?;
+        vma_is(a + PAGE, MPOL_BIND, 1)?;
+        let r = mbind1(
+            a + 3 * PAGE,
+            PAGE,
+            MPOL_PREFERRED | MPOL_F_STATIC_NODES,
+            1 | 1 << 5,
+            0,
+        );
+        check(b"mbind static", r == 0, r)?;
+        vma_is(
+            a + 3 * PAGE,
+            MPOL_PREFERRED | MPOL_F_STATIC_NODES,
+            1 | 1 << 5,
+        )?;
+        let r = mbind1(a + 2 * PAGE, PAGE, MPOL_PREFERRED, 0, 0);
+        check(b"mbind preferred local", r == 0, r)?;
+        vma_is(a + 2 * PAGE, MPOL_LOCAL, 0)?;
+        let r = mbind1(a, 4 * PAGE, MPOL_DEFAULT, 0, 0);
+        check(b"mbind default", r == 0, r)?;
+        for i in 0..4 {
+            vma_is(a + i * PAGE, MPOL_DEFAULT, 0)?;
+        }
+        let r = mbind1(a, 0, MPOL_BIND, 1, 0);
+        check(b"length 0", r == 0, r)?;
+        let r = mbind1(a + 1, PAGE, MPOL_BIND, 1, 0);
+        check(b"unaligned", r == EINVAL, r)?;
+        let r = mbind1(a, PAGE, MPOL_BIND, 1, MPOL_MF_LAZY);
+        check(b"lazy", r == EINVAL, r)?;
+        let r = mbind1(a, !(PAGE - 1), MPOL_BIND, 1, 0);
+        check(b"wraps", r == EINVAL, r)?;
+        let r = mbind1(a, PAGE, MPOL_BIND, 0, 0);
+        check(b"bind without nodes", r == EINVAL, r)?;
+        let r = mbind1(a, PAGE, MPOL_DEFAULT, 1, 0);
+        check(b"default with nodes", r == EINVAL, r)?;
+        let r = mbind1(a, PAGE, MPOL_BIND, 1 << 5, 0);
+        check(b"no node with memory", r == EINVAL, r)?;
+        vma_is(a, MPOL_DEFAULT, 0)
+    })
+}
+
+/// MBIND_HOLES: a hole in the range is EFAULT and nothing changes,
+/// except for MPOL_DEFAULT; a range with no VMA is EFAULT for every
+/// mode (Linux queue_pages_range, queue_pages_test_walk)
+fn mbind_holes() -> R {
+    let a = map_pages(3)?;
+    sys_munmap(a + PAGE, PAGE);
+    let r = holes(a);
+    sys_munmap(a, 3 * PAGE);
+    r?;
+    let r = mbind1(a, PAGE, MPOL_DEFAULT, 0, 0);
+    check(b"unmapped", r == EFAULT, r)
+}
+
+/// The MBIND_HOLES checks: pages 0 and 2 at `a` mapped, 1 not
+fn holes(a: u64) -> R {
+    let r = mbind1(a, 3 * PAGE, MPOL_BIND, 1, 0);
+    check(b"middle hole", r == EFAULT, r)?;
+    vma_is(a, MPOL_DEFAULT, 0)?;
+    let r = mbind1(a, 2 * PAGE, MPOL_BIND, 1, 0);
+    check(b"tail hole", r == EFAULT, r)?;
+    let r = mbind1(a + PAGE, 2 * PAGE, MPOL_BIND, 1, 0);
+    check(b"head hole", r == EFAULT, r)?;
+    vma_is(a + 2 * PAGE, MPOL_DEFAULT, 0)?;
+    let r = mbind1(a + PAGE, PAGE, MPOL_DEFAULT, 0, 0);
+    check(b"default in the hole", r == EFAULT, r)?;
+    let r = mbind1(a + 2 * PAGE, PAGE, MPOL_BIND, 1, 0);
+    check(b"bind", r == 0, r)?;
+    let r = mbind1(a, 3 * PAGE, MPOL_DEFAULT, 0, 0);
+    check(b"default over the hole", r == 0, r)?;
+    vma_is(a + 2 * PAGE, MPOL_DEFAULT, 0)
+}
+
+/// MBIND_STRICT: MPOL_MF_STRICT with a page off the policy's nodes is
+/// EIO and, without a move, leaves the policy unchanged; with
+/// MPOL_MF_MOVE the page goes where the policy puts it (here: where it
+/// is); untouched pages and MPOL_DEFAULT check nothing (Linux
+/// queue_folios_pte_range, strictly_unmovable)
+fn mbind_strict() -> R {
+    with_pages(2, |a| {
+        // SAFETY: the first page is mapped writable
+        unsafe { core::ptr::write_volatile(a as *mut u8, 1) };
+        let r = mbind1(a, 2 * PAGE, MPOL_BIND, 1, MPOL_MF_STRICT);
+        check(b"strict on node 0", r == 0, r)?;
+        vma_is(a, MPOL_BIND, 1)?;
+        let r = mbind1(a, 2 * PAGE, MPOL_LOCAL, 0, MPOL_MF_STRICT);
+        check(b"strict local", r == -5, r)?;
+        vma_is(a, MPOL_BIND, 1)?;
+        let r = mbind1(a + PAGE, PAGE, MPOL_LOCAL, 0, MPOL_MF_STRICT);
+        check(b"strict untouched", r == 0, r)?;
+        vma_is(a + PAGE, MPOL_LOCAL, 0)?;
+        let r = mbind1(a, 2 * PAGE, MPOL_LOCAL, 0, MPOL_MF_STRICT | MPOL_MF_MOVE);
+        check(b"strict move local", r == 0, r)?;
+        vma_is(a, MPOL_LOCAL, 0)?;
+        let r = mbind1(a, 2 * PAGE, MPOL_DEFAULT, 0, MPOL_MF_STRICT);
+        check(b"strict default", r == 0, r)?;
+        vma_is(a, MPOL_DEFAULT, 0)
+    })
+}
+
+/// MBIND_FORK: a child's VMAs keep their policies (Linux dup_mmap:
+/// vma_dup_policy)
+fn mbind_fork() -> R {
+    use hk_syscall::{sys_exit, sys_fork, sys_wait4};
+    with_pages(2, |a| {
+        let r = mbind1(a + PAGE, PAGE, MPOL_INTERLEAVE, 1, 0);
+        check(b"mbind", r == 0, r)?;
+        let pid = sys_fork();
+        if pid == 0 {
+            let ok =
+                vma_is(a, MPOL_DEFAULT, 0).is_ok() && vma_is(a + PAGE, MPOL_INTERLEAVE, 1).is_ok();
+            sys_exit(if ok { 0 } else { 1 });
+        }
+        check(b"fork", pid > 0, pid)?;
+        let mut st = 0i32;
+        sys_wait4(pid, &mut st, 0, 0);
+        check(b"child", st == 0, i64::from(st))
+    })
 }

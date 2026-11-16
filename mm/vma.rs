@@ -419,6 +419,7 @@ impl Vma {
     /// - VMA flags (flags)
     /// - File backing (both anonymous or same file with contiguous offsets)
     /// - anon_vma (must be same Arc for anonymous mappings)
+    /// - memory policy (Linux vma_merge: mpol_equal)
     pub fn can_merge_with(&self, other: &Vma) -> bool {
         // Must be adjacent (this VMA ends where other begins)
         if self.end != other.start {
@@ -430,6 +431,9 @@ impl Vma {
         }
         // Must have same flags
         if self.flags != other.flags {
+            return false;
+        }
+        if !crate::mm::mempolicy::mpol_equal(self.mempolicy.as_ref(), other.mempolicy.as_ref()) {
             return false;
         }
         // Must have same anon_vma (or both None)
