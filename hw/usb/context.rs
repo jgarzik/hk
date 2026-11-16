@@ -10,7 +10,7 @@
 //! - OutputDeviceContext: Where xHCI writes device state
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use crate::hw::dma::{DmaCoherent, DmaDevice, dma_alloc_coherent};
+use crate::hw::dma::{DmaBox, DmaDevice};
 
 /// Slot Context (32 bytes)
 ///
@@ -344,7 +344,7 @@ pub fn dci_to_endpoint(dci: u8) -> u8 {
 /// - Offset 0x3E0: Endpoint Context 30 (32 bytes)
 pub struct InputContext {
     /// DMA allocation for the context
-    dma: DmaCoherent,
+    dma: DmaBox,
     /// Bytes per context: 32, or 64 (HCCPARAMS1.CSZ)
     ctx_size: usize,
 }
@@ -356,7 +356,7 @@ impl InputContext {
 
     /// Create a new Input Context with `ctx_size`-byte contexts
     pub fn new<D: DmaDevice>(dev: &D, ctx_size: usize) -> Option<Self> {
-        let dma = dma_alloc_coherent(dev, Self::SIZE)?;
+        let dma = DmaBox::alloc(dev, Self::SIZE)?;
         Some(Self { dma, ctx_size })
     }
 
@@ -416,7 +416,7 @@ pub fn ctx_size(hcc_params1: u32) -> usize {
 pub struct OutputDeviceContext {
     /// DMA allocation for the context (written by the controller; the
     /// driver never reads it)
-    dma: DmaCoherent,
+    dma: DmaBox,
 }
 
 impl OutputDeviceContext {
@@ -426,7 +426,7 @@ impl OutputDeviceContext {
 
     /// Create a new Output Device Context
     pub fn new<D: DmaDevice>(dev: &D) -> Option<Self> {
-        let dma = dma_alloc_coherent(dev, Self::SIZE)?;
+        let dma = DmaBox::alloc(dev, Self::SIZE)?;
         Some(Self { dma })
     }
 

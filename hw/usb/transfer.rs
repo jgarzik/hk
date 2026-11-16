@@ -9,7 +9,7 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
 
-use crate::hw::dma::{DmaCoherent, DmaDevice, dma_alloc_coherent};
+use crate::hw::dma::{DmaBox, DmaDevice};
 use crate::mm::frame_alloc::FRAME_SIZE;
 
 /// Transfer Request Block (TRB) - same structure as in xhci.rs
@@ -337,7 +337,7 @@ pub struct TdSpan {
 
 /// The ring's memory: its DMA allocation, or (unit tests) leaked heap
 enum RingMem {
-    Dma(#[expect(dead_code, reason = "owns the DMA allocation")] DmaCoherent),
+    Dma(#[expect(dead_code, reason = "owns the DMA allocation")] DmaBox),
     #[cfg(test)]
     Heap,
 }
@@ -379,7 +379,7 @@ impl TransferRing {
     /// Create a new transfer ring using DMA allocation
     pub fn new<D: DmaDevice>(dev: &D) -> Option<Self> {
         // One page: 255 TRBs and the Link TRB
-        let dma = dma_alloc_coherent(dev, FRAME_SIZE)?;
+        let dma = DmaBox::alloc(dev, FRAME_SIZE)?;
         let (trbs, base) = (dma.cpu_addr().cast::<Trb>(), dma.dma_addr().as_u64());
         // SAFETY: the fresh page the ring owns
         Some(unsafe { Self::init(RingMem::Dma(dma), trbs, base, Self::DEFAULT_SIZE) })

@@ -520,6 +520,54 @@ pub unsafe fn dma_free_coherent<D: DmaDevice>(_dev: &D, alloc: DmaCoherent) {
     }
 }
 
+/// Coherent DMA memory freed when dropped (Rust-for-Linux
+/// dma::CoherentAllocation), for a driver whose ownership of the memory
+/// outlives the device's use of it: a controller's rings and contexts,
+/// dropped once the controller no longer addresses them (slot disabled,
+/// command failed, controller halted)
+///
+/// # Invariants
+/// `mem` came from `ops.alloc_coherent` and is freed once, by `drop`.
+pub struct DmaBox {
+    mem: core::mem::ManuallyDrop<DmaCoherent>,
+    ops: &'static dyn DmaOps,
+}
+
+impl DmaBox {
+    /// `size` bytes of zeroed coherent memory for `dev`
+    pub fn alloc<D: DmaDevice>(dev: &D, size: usize) -> Option<Self> {
+        Self::alloc_in(ops()?, dev.dma_config(), size)
+    }
+
+    /// `size` bytes from `ops`
+    fn alloc_in(ops: &'static dyn DmaOps, config: &DmaConfig, size: usize) -> Option<Self> {
+        let mem = ops.alloc_coherent(config, size, FRAME_SIZE)?;
+        // INVARIANT: allocated by `ops`, freed only by drop
+        Some(Self {
+            mem: core::mem::ManuallyDrop::new(mem),
+            ops,
+        })
+    }
+}
+
+impl core::ops::Deref for DmaBox {
+    type Target = DmaCoherent;
+
+    #[inline]
+    fn deref(&self) -> &DmaCoherent {
+        &self.mem
+    }
+}
+
+impl Drop for DmaBox {
+    fn drop(&mut self) {
+        // SAFETY: `mem` is never used again (dropping); taken once
+        let mem = unsafe { core::mem::ManuallyDrop::take(&mut self.mem) };
+        // Type invariant: `ops` allocated it
+        self.ops.free_coherent(mem);
+    }
+}
+
 /// Map a buffer for DMA
 ///
 /// Creates a streaming DMA mapping. The CPU should not access the buffer
@@ -621,4 +669,69 @@ pub mod align {
     pub const AHCI_FIS: usize = 256;
     /// AHCI Command Table alignment (128 bytes)
     pub const AHCI_CMD_TABLE: usize = 128;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts coherent allocations and frees (heap memory, leaked)
+    struct CountOps {
+        allocs: AtomicUsize,
+        frees: AtomicUsize,
+    }
+
+    impl DmaOps for CountOps {
+        fn alloc_coherent(&self, _: &DmaConfig, size: usize, _: usize) -> Option<DmaCoherent> {
+            self.allocs.fetch_add(1, Ordering::Relaxed);
+            let mem = alloc::vec![0u8; size].leak();
+            Some(DmaCoherent {
+                cpu_addr: mem.as_mut_ptr(),
+                dma_addr: DmaAddr(mem.as_ptr() as u64),
+                size,
+            })
+        }
+        fn free_coherent(&self, _: DmaCoherent) {
+            self.frees.fetch_add(1, Ordering::Relaxed);
+        }
+        fn map_single(
+            &self,
+            _: &DmaConfig,
+            _: *const u8,
+            _: usize,
+            _: DmaDirection,
+        ) -> Option<DmaAddr> {
+            None
+        }
+        fn unmap_single(&self, _: &DmaConfig, _: DmaAddr, _: usize, _: DmaDirection) {}
+        fn map_sg(
+            &self,
+            _: &DmaConfig,
+            _: &[(*const u8, usize)],
+            _: DmaDirection,
+        ) -> Option<DmaSgList> {
+            None
+        }
+        fn unmap_sg(&self, _: &DmaConfig, _: DmaSgList) {}
+        fn sync_for_cpu(&self, _: &DmaConfig, _: DmaAddr, _: usize, _: DmaDirection) {}
+        fn sync_for_device(&self, _: &DmaConfig, _: DmaAddr, _: usize, _: DmaDirection) {}
+        fn name(&self) -> &'static str {
+            "count"
+        }
+    }
+
+    #[test]
+    fn dma_box_frees_on_drop() {
+        static OPS: CountOps = CountOps {
+            allocs: AtomicUsize::new(0),
+            frees: AtomicUsize::new(0),
+        };
+        let b = DmaBox::alloc_in(&OPS, &DmaConfig::default(), 64).unwrap();
+        assert_eq!(b.size(), 64);
+        assert_eq!(OPS.frees.load(Ordering::Relaxed), 0);
+        drop(b);
+        assert_eq!(OPS.allocs.load(Ordering::Relaxed), 1);
+        assert_eq!(OPS.frees.load(Ordering::Relaxed), 1);
+    }
 }
