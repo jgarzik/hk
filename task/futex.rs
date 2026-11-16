@@ -1062,14 +1062,21 @@ pub fn sys_futex(
 /// Maximum number of futexes in a single futex_waitv call
 const FUTEX_WAITV_MAX: usize = 128;
 
-/// FUTEX2 size flags
+/// FUTEX2 flags
 mod futex2 {
     pub const SIZE_U32: u32 = 0x02;
     pub const SIZE_MASK: u32 = 0x03;
+    /// The word is followed by a node word
+    pub const NUMA: u32 = 0x04;
+    /// An unset node word takes the memory policy's node
+    pub const MPOL: u32 = 0x08;
     pub const PRIVATE: u32 = 128;
-    /// Valid mask for futex2 flags (size + private only for now)
-    pub const VALID_MASK: u32 = SIZE_MASK | PRIVATE;
+    /// Linux FUTEX2_VALID_MASK
+    pub const VALID_MASK: u32 = SIZE_MASK | NUMA | MPOL | PRIVATE;
 }
+
+/// FUTEX_NO_NODE: a node word not yet set
+const FUTEX_NO_NODE: u32 = u32::MAX;
 
 /// struct futex_waitv from userspace
 #[repr(C)]
@@ -1093,8 +1100,8 @@ struct FutexWaitvEntry {
     val: u32,
     /// User address
     uaddr: u64,
-    /// Is this a private futex?
-    is_private: bool,
+    /// FUTEX2_* flags
+    flags: u32,
 }
 
 /// Linux futex_waitv syscall entry point
@@ -1164,33 +1171,74 @@ pub fn sys_futex_waitv(
             return Err(KernelError::InvalidArgument);
         }
 
-        // Validate flags - only support SIZE_U32 and PRIVATE for now
-        if (flags_field & !futex2::VALID_MASK) != 0 {
+        // Linux futex_flags_valid: only 32-bit futexes
+        if (flags_field & !futex2::VALID_MASK) != 0
+            || flags_field & futex2::SIZE_MASK != futex2::SIZE_U32
+        {
             return Err(KernelError::InvalidArgument);
         }
-
-        // Check size - only support 32-bit futexes
-        let size = flags_field & futex2::SIZE_MASK;
-        if size != futex2::SIZE_U32 {
+        // Linux futex_validate_input: the value fits the word
+        let Ok(val) = u32::try_from(val) else {
             return Err(KernelError::InvalidArgument);
-        }
-
-        // Check alignment (must be 4-byte aligned for u32)
-        if uaddr % 4 != 0 {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        let is_private = (flags_field & futex2::PRIVATE) != 0;
+        };
 
         entries.push(FutexWaitvEntry {
-            val: val as u32,
+            val,
             uaddr,
-            is_private,
+            flags: flags_field,
         });
     }
 
     // Call the main wait logic
     futex_wait_multiple(&entries, timeout_ns, use_realtime)
+}
+
+/// The node word of a FUTEX2_NUMA futex (Linux get_futex_key): the
+/// pair is 8-byte aligned, a set node must exist, and an unset one
+/// (FUTEX_NO_NODE) is written with the policy's node (FUTEX2_MPOL) or
+/// this CPU's. hk hashes futexes in one table, so the node picks no
+/// bucket; only the word is observable.
+fn futex_node(uaddr: u64, flags: u32) -> KernelResult<()> {
+    use crate::mm::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY};
+    if flags & futex2::NUMA == 0 {
+        return Ok(());
+    }
+    if !uaddr.is_multiple_of(8) {
+        return Err(KernelError::InvalidArgument);
+    }
+    let naddr = uaddr + 4;
+    let mut node = get_user::<u32>(naddr)?;
+    if node != FUTEX_NO_NODE
+        && (node as usize >= MAX_NUMA_NODES || !NUMA_TOPOLOGY.lock().node_online(node))
+    {
+        return Err(KernelError::InvalidArgument);
+    }
+    if node != FUTEX_NO_NODE {
+        return Ok(());
+    }
+    if flags & futex2::MPOL != 0 {
+        node = futex_mpol(uaddr)?;
+    }
+    if node == FUTEX_NO_NODE {
+        node = NUMA_TOPOLOGY.lock().cpu_to_node(crate::cpu::this_id());
+    }
+    Ok(crate::uaccess::put_user::<u32>(naddr, node)?)
+}
+
+/// The node of the VMA policy at `uaddr` (Linux __futex_key_to_node):
+/// MPOL_PREFERRED's node; MPOL_BIND and MPOL_PREFERRED_MANY name one
+/// only by a home node, which hk does not keep
+fn futex_mpol(uaddr: u64) -> KernelResult<u32> {
+    use crate::mm::mempolicy::MPOL_PREFERRED;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::BadAddress)?;
+    let map = mm.mmap_read();
+    let pol = map.find_vma(uaddr).and_then(|v| v.mempolicy);
+    Ok(match pol {
+        Some(p) if p.mode == MPOL_PREFERRED && p.nodemask != 0 => p.nodemask.trailing_zeros(),
+        _ => FUTEX_NO_NODE,
+    })
 }
 
 /// Wait on multiple futexes - returns index of woken futex or error
@@ -1204,16 +1252,20 @@ fn futex_wait_multiple(
     timeout_ns: Option<u64>,
     use_realtime: bool,
 ) -> KernelResult<i32> {
-    // Fault every word in (a real EFAULT is reported here); they are
-    // read again under the bucket locks with faults disabled
+    // Linux futex_wait_multiple_setup: every key first, then fault
+    // every word in (a real EFAULT is reported here); they are read
+    // again under the bucket locks with faults disabled
+    let keys: KernelResult<Vec<FutexKey>> = entries
+        .iter()
+        .map(|e| {
+            futex_node(e.uaddr, e.flags)?;
+            make_key(e.uaddr, e.flags & futex2::PRIVATE != 0)
+        })
+        .collect();
+    let keys = keys?;
     for entry in entries {
         read_user_u32(entry.uaddr)?;
     }
-    let keys: KernelResult<Vec<FutexKey>> = entries
-        .iter()
-        .map(|e| make_key(e.uaddr, e.is_private))
-        .collect();
-    let keys = keys?;
 
     loop {
         let qs: alloc::boxed::Box<[FutexQ]> = keys

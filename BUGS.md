@@ -530,8 +530,6 @@ hub6, where Linux moves the port (uart_change_port).
 **Location:** `task/futex.rs`
 
 - **FUTEX_WAKE_OP and PI futexes** are missing.
-- **futex_waitv flags:** FUTEX2_NUMA and FUTEX2_MPOL are EINVAL;
-  Linux accepts them (futex_parse_waitv, FUTEX2_VALID_MASK).
 - **MAP_PRIVATE file mappings:** a shared futex there is keyed by
   (mm, address) from the VMA; Linux keys a page still in the page
   cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
