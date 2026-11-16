@@ -343,7 +343,7 @@ fn excl_ctty_child() -> i32 {
     match (busy, admin, after) {
         (1, 0, 0) => 0,
         (1, 0, a) => 30 + a as i32,
-        (1, _, _) => 4,
+        (1, a, _) => 40 - a as i32,
         (b, _, _) => 10 + b as i32,
     }
 }

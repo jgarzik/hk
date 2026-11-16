@@ -1408,6 +1408,7 @@ fn test_peergroups() {
     }
     // A child that fails before connecting must not hang the accept
     if poll1(l, POLLIN, 10_000).0 != 1 {
+        hk_syscall::sys_kill(pid, hk_syscall::SIGKILL);
         t.ok(b"connect", false, wait_status(pid) as i64);
         close(l);
         return t.done();
