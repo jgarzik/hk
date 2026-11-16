@@ -520,6 +520,7 @@ goes down later.
 
 - [x] unshare
 - [x] setns (namespace file or pidfd)
+- [x] listns
 - [x] clone with namespace flags (CLONE_NEWPID: the first process is pid 1 and its child reaper; its death kills the namespace, then fork into it is ENOMEM)
 
 11.3 Host identity

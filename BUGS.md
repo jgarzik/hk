@@ -1068,8 +1068,7 @@ dumb buffer from shmem and blits it on page flip
 **Location**: `fs/pseudo/nsfs.rs`, `ns/setns.rs`
 
 No time namespaces (CLONE_NEWTIME, the time and time_for_children
-links). No nsfs file handles (File handle gaps) and no listns(2) /
-statns(2).
+links). No nsfs file handles (File handle gaps).
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 

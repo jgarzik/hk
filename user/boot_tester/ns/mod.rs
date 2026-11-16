@@ -1,5 +1,6 @@
 //! Namespace file (nsfs) tests
 
+pub mod listns;
 pub mod mntns;
 pub mod nsfs;
 
@@ -99,4 +100,5 @@ pub fn in_child(f: fn() -> u8) -> i64 {
 pub fn run_tests() {
     nsfs::run_tests();
     mntns::run_tests();
+    listns::run_tests();
 }

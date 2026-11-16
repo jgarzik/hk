@@ -321,6 +321,8 @@ pub const SYS_SETDOMAINNAME: u64 = 162;
 // Namespace syscalls
 pub const SYS_UNSHARE: u64 = 97;
 pub const SYS_SETNS: u64 = 268;
+/// listns(req, ns_ids, nr_ns_ids, flags)
+pub const SYS_LISTNS: u64 = 470;
 
 // Signal syscalls (aarch64 numbers)
 pub const SYS_KILL: u64 = 129;
@@ -1986,6 +1988,12 @@ pub fn sys_unshare(flags: u64) -> i64 {
 #[inline(always)]
 pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
     unsafe { syscall2!(SYS_SETNS, fd, nstype) }
+}
+
+/// listns(2): the ids of the namespaces `req` (struct ns_id_req) asks
+/// for, up to `nr` of them, into `ids`
+pub fn sys_listns(req: u64, ids: u64, nr: u64, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_LISTNS, req, ids, nr, flags) }
 }
 
 // ============================================================================

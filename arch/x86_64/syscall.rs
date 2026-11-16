@@ -593,6 +593,8 @@ pub const SYS_OPEN_BY_HANDLE_AT: u64 = 304;
 pub const SYS_UNSHARE: u64 = 272;
 /// setns(fd, nstype) - reassociate thread with a namespace
 pub const SYS_SETNS: u64 = 308;
+/// listns(req, ns_ids, nr_ns_ids, flags) - list namespaces by id
+pub const SYS_LISTNS: u64 = 470;
 
 // Socket syscalls
 /// socket(domain, type, protocol)
@@ -1099,6 +1101,7 @@ pub fn sys_of(nr: u64) -> Option<Sys> {
         SYS_SETHOSTNAME => Sys::Sethostname,
         SYS_SETITIMER => Sys::Setitimer,
         SYS_SETNS => Sys::Setns,
+        SYS_LISTNS => Sys::Listns,
         SYS_SETPGID => Sys::Setpgid,
         SYS_SETPRIORITY => Sys::Setpriority,
         SYS_SETREGID => Sys::Setregid,

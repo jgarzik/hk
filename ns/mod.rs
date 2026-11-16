@@ -25,6 +25,7 @@
 pub mod cgroup;
 pub mod common;
 pub mod inum;
+pub mod listns;
 pub mod net;
 pub mod pid;
 pub mod setns;
@@ -587,6 +588,30 @@ pub fn current_user_ns() -> Arc<UserNamespace> {
         .nsproxy()
         .map(|ns| ns.user_ns.clone())
         .unwrap_or_else(|| INIT_USER_NS.clone())
+}
+
+/// `ns` is one of the caller's own namespaces (Linux
+/// is_current_namespace): its nsproxy's, its credentials' user
+/// namespace, its own pid namespace (Linux task_active_pid_ns)
+pub fn is_current_namespace(ns: &NsRef) -> bool {
+    let np = current().nsproxy().unwrap_or_else(|| INIT_NSPROXY.clone());
+    match ns {
+        NsRef::Mnt(n) => Arc::ptr_eq(n, &np.mnt_ns),
+        NsRef::Uts(n) => Arc::ptr_eq(n, &np.uts_ns),
+        NsRef::Ipc(n) => Arc::ptr_eq(n, &np.ipc_ns),
+        NsRef::Net(n) => Arc::ptr_eq(n.passive(), np.net_ns.passive()),
+        NsRef::Pid(n) => core::ptr::eq(Arc::as_ptr(n), crate::task::pid::current_pid_ns()),
+        NsRef::User(n) => Arc::ptr_eq(n, &np.user_ns),
+        NsRef::Cgroup(n) => Arc::ptr_eq(n, &np.cgroup_ns),
+    }
+}
+
+/// The caller may see every namespace (Linux may_see_all_namespaces):
+/// in the initial pid namespace with CAP_SYS_ADMIN over its owner (hk's
+/// capabilities ignore user namespaces, BUGS.md: the caller's own)
+pub fn may_see_all_namespaces() -> bool {
+    crate::task::pid::current_pid_ns().level == 0
+        && crate::task::capable(crate::task::CAP_SYS_ADMIN)
 }
 
 /// Get current task's network namespace

@@ -379,6 +379,8 @@ pub const SYS_PRLIMIT64: u64 = 302;
 pub const SYS_SYNCFS: u64 = 306;
 pub const SYS_SENDMMSG: u64 = 307;
 pub const SYS_SETNS: u64 = 308;
+/// listns(req, ns_ids, nr_ns_ids, flags)
+pub const SYS_LISTNS: u64 = 470;
 pub const SYS_GETCPU: u64 = 309;
 pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_MEMBARRIER: u64 = 324;
@@ -1766,6 +1768,12 @@ pub fn sys_unshare(flags: u64) -> i64 {
 #[inline(always)]
 pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
     unsafe { syscall2!(SYS_SETNS, fd, nstype) }
+}
+
+/// listns(2): the ids of the namespaces `req` (struct ns_id_req) asks
+/// for, up to `nr` of them, into `ids`
+pub fn sys_listns(req: u64, ids: u64, nr: u64, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_LISTNS, req, ids, nr, flags) }
 }
 
 // --- Sockets ---

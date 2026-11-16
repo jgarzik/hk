@@ -3584,7 +3584,7 @@ Fallback:** if scheduling is not yet enabled, page locking spins.
 ### 3.4 Namespaces
 
 **Location:** `ns/mod.rs`, `ns/uts.rs`, `ns/common.rs`, `ns/tree.rs`, `ns/setns.rs`,
-`fs/pseudo/nsfs.rs`
+`ns/listns.rs`, `fs/pseudo/nsfs.rs`
 
 The namespace subsystem follows Linux's `nsproxy` pattern, where each task has
 a reference to an `NsProxy` that holds pointers to its namespaces. Multiple
@@ -3638,6 +3638,12 @@ bitmap, are immutable after creation (no lock).
    Linux dput. setns (`ns/setns.rs`) builds the new set aside with no
    lock held (TASKLIST read briefly for the thread check, as Linux
    thread_group_empty), then switches to it under the alloc_lock.
+
+5. **listns(2)** (`ns/listns.rs`) - no lock held across its walk:
+   each step takes `NS_TREE` once (`tree::walk`), the namespace it
+   hands out is checked (type, the caller's own or may see all) and
+   its id copied out with nothing held; a reference it held last may
+   be dropped there, in syscall context.
 
 #### Lock Order for Namespace Operations
 

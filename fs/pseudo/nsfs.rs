@@ -74,13 +74,6 @@ fn copy_ns_info(m: &crate::ns::MntNamespace, to: u64, usize: usize) -> Result<()
     Ok(())
 }
 
-/// The caller may walk every namespace (Linux may_see_all_namespaces):
-/// in the initial pid namespace with CAP_SYS_ADMIN over its owner
-fn may_see_all_namespaces() -> bool {
-    crate::task::pid::current_pid_ns().level == 0
-        && crate::task::capable(crate::task::CAP_SYS_ADMIN)
-}
-
 /// A pid namespace ioctl (Linux ns_ioctl's NS_GET_{PID,TGID}_{FROM,IN}_
 /// PIDNS): the task `arg` names in `ns` (FROM) or in the caller's pid
 /// namespace (IN), and its thread or thread-group id in the caller's
@@ -156,7 +149,7 @@ impl FileOps for NsFileOps {
             .ok_or(KernelError::NotTty)?;
         let next = extensible(cmd, NS_MNT_GET_NEXT_NR);
         let prev = extensible(cmd, NS_MNT_GET_PREV_NR);
-        if (next.is_some() || prev.is_some()) && !may_see_all_namespaces() {
+        if (next.is_some() || prev.is_some()) && !crate::ns::may_see_all_namespaces() {
             return Err(KernelError::NotPermitted);
         }
         if let Some(usize) = extensible(cmd, NS_MNT_GET_INFO_NR) {

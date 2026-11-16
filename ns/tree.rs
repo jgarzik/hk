@@ -378,6 +378,16 @@ pub fn walk(tree: Tree) -> Walk {
     Walk { tree, at: Some(0) }
 }
 
+/// [`walk`] from the namespace numbered `id` (ids start at 1), itself
+/// included if it may still be handed out (Linux
+/// list_for_each_entry_from_rcu from a first namespace looked up)
+pub fn walk_from(tree: Tree, id: u64) -> Walk {
+    Walk {
+        tree,
+        at: id.checked_sub(1),
+    }
+}
+
 /// A walk of one tree ([`walk`]): the last id reached, None at the end
 pub struct Walk {
     tree: Tree,

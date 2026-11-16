@@ -115,6 +115,7 @@ pub enum Sys {
     Lgetxattr,
     Linkat,
     Listen,
+    Listns,
     Listxattr,
     Llistxattr,
     Lremovexattr,
@@ -1187,6 +1188,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         )
         .ret() as u64,
         Sys::Setns => crate::ns::sys_setns(a[0] as i32, a[1] as i32).ret() as u64,
+        Sys::Listns => crate::ns::listns::sys_listns(a[0], a[1], a[2], a[3] as u32).ret() as u64,
         Sys::Setpgid => crate::task::syscall::sys_setpgid(
             a[0] as i32,
             a[1] as i32,
