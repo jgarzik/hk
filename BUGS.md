@@ -312,9 +312,9 @@ No leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 **Location**: `seccomp/`
 
 No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS as with no tracer), no
-user notification (SECCOMP_RET_USER_NOTIF, SECCOMP_GET_NOTIF_SIZES), no
-FLAG_TSYNC_ESRCH / FLAG_SPEC_ALLOW / FLAG_WAIT_KILLABLE_RECV, and
-nothing is logged for RET_LOG or FLAG_LOG.
+user notification (SECCOMP_RET_USER_NOTIF; FLAG_NEW_LISTENER and
+FLAG_WAIT_KILLABLE_RECV are EINVAL), and nothing is logged for RET_LOG
+or FLAG_LOG.
 
 ## Pipe size is fixed
 
