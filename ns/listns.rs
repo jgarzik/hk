@@ -50,8 +50,8 @@ const LISTNS_CURRENT_USER: u64 = u64::MAX;
 /// The most ids one call takes (Linux listns' maxcount)
 const MAXCOUNT: u64 = 1_000_000;
 
-/// Linux CLONE_NEWTIME: a type listns knows; hk has no time namespaces,
-/// so its tree is empty
+/// Linux CLONE_NEWTIME: a type listns knows; hk has no time namespaces
+/// (no tree, as Linux without CONFIG_TIME_NS)
 const CLONE_NEWTIME: u64 = 0x80;
 
 /// Every type listns knows (Linux NS_ALL)
@@ -102,12 +102,16 @@ pub fn sys_listns(req: u64, ids: u64, nr: u64, flags: u32) -> KernelResult<i64> 
         return listns_userns(&k, ids, nr);
     }
     // One type: its own tree; none or several: every type's (Linux
-    // do_listns: hweight32 == 1). Every type listns knows has a tree.
+    // do_listns: hweight32 == 1). Time namespaces have no tree: EINVAL,
+    // as Linux without CONFIG_TIME_NS (ns_tree_from_type NULL)
     let ty = if k.ns_type.count_ones() == 1 {
         u64::from(k.ns_type)
     } else {
         0
     };
+    if ty == CLONE_NEWTIME {
+        return Err(KernelError::InvalidArgument);
+    }
     list(Tree::of_type(ty), &k, ids, nr)
 }
 

@@ -284,9 +284,9 @@ pub fn do_mmap(
             .ok_or(KernelError::OutOfMemory)?
     };
 
-    // RLIMIT_AS (Linux may_expand_vm): a MAP_FIXED mapping was checked
-    // above, its old pages already unmapped
-    if !mm_guard.may_expand(length, 0) {
+    // RLIMIT_AS (Linux may_expand_vm); a MAP_FIXED mapping was checked
+    // above, before its old pages were unmapped
+    if !is_fixed && !mm_guard.may_expand(length, 0) {
         return Err(KernelError::OutOfMemory);
     }
 

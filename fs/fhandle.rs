@@ -154,12 +154,12 @@ fn handle_type(dentry: &DentryRef, ty: u8, fh_flags: u32) -> i32 {
     t
 }
 
-/// The mount fd's path (Linux get_path_anchor): a descriptor's path
-/// (any open file, O_PATH included), the cwd, or nsfs's root; EBADF
-/// otherwise. FD_PIDFS_ROOT is EBADF: hk has no pidfs (BUGS.md).
+/// The mount fd's path (Linux get_path_anchor): an open file's path
+/// (fdget: an O_PATH descriptor is EBADF), the cwd, or nsfs's root;
+/// EBADF otherwise. FD_PIDFS_ROOT is EBADF: hk has no pidfs (BUGS.md).
 fn path_anchor(fd: i32) -> Result<Path, KernelError> {
     if fd >= 0 {
-        return super::io::fget_raw(fd)?.f_path().ok_or(KernelError::BadFd);
+        return super::io::fget(fd)?.f_path().ok_or(KernelError::BadFd);
     }
     match fd {
         AT_FDCWD => crate::task::percpu::current_cwd().ok_or(KernelError::NotFound),

@@ -451,13 +451,19 @@ fn stale() -> R {
     r
 }
 
-/// The mount fd: EBADF, or a filesystem that does not decode
+/// The mount fd: EBADF (an O_PATH one too: Linux fdget), or a
+/// filesystem that does not decode
 fn mount_fd() -> R {
     let f = handle(F, 0)?;
     for bad in [-1, 9999] {
         let r = obh_ret(bad, &f, O_RDONLY);
         check(b"bad fd", r == EBADF, r)?;
     }
+    const O_PATH: u32 = 0o10000000;
+    let opath = sys_open(b"/tmp\0".as_ptr(), O_PATH, 0);
+    let r = obh_ret(opath as i32, &f, O_RDONLY);
+    sys_close(opath as u64);
+    check(b"O_PATH fd", r == EBADF, r)?;
     let pfd = open_fd(b"/proc\0", true)?;
     let r = obh_ret(pfd, &f, O_RDONLY);
     sys_close(pfd as u64);

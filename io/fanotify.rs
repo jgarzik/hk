@@ -643,16 +643,17 @@ pub fn sys_fanotify_mark(
 
     let file = fget(fd)?;
     let fanotify = get_fanotify(&file).ok_or(KernelError::BadFd)?;
+    // Mount and filesystem marks need CAP_SYS_ADMIN, FLUSH of them too;
+    // only an inode mark may be evictable (Linux fanotify_mark)
+    if mark_flags & types != 0 && !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        return Err(KernelError::NotPermitted);
+    }
+    if mark_flags & FAN_MARK_EVICTABLE != 0 && mark_flags & types != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
     if cmd == FAN_MARK_FLUSH {
         fanotify.flush_marks(mark_flags);
         return Ok(());
-    }
-
-    // Check for privileged mark types
-    if (mark_flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM)) != 0
-        && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
-    {
-        return Err(KernelError::NotPermitted);
     }
 
     // No pathname: dirfd's own file (Linux fanotify_find_path: fdget,

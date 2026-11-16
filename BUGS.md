@@ -126,6 +126,10 @@ Missing:
   memory). No errseq: fsync reports a writeback error once, to the
   caller that ran the writeback, not to every open file.
 
+- The dcache shrinker (`fs/dentry.rs` shrink_dcache) walks the whole
+  tree, locking every dentry, persistent ramfs/tmpfs ones included,
+  to free the unused ones (Linux keeps an LRU of unused dentries):
+  each pass costs the size of the tree, not what it frees.
 - Reclaim (J) drops clean, unmapped page-cache pages inode by inode
   (no file LRU, no aging: Linux reclaims the oldest file pages; dirty
   or mapped ones stay until written back or unmapped), then swaps out
@@ -150,6 +154,7 @@ Missing:
   (Linux gup_must_unshare).
 - shmdt needs the address an attachment starts at (Linux also finds a
   piece moved by mremap); SHM_EXEC is ignored.
+- exec does not check RLIMIT_AS for the new image and stack (`task/exec.rs`): Linux maps each segment with vm_mmap, whose may_expand_vm makes an image past the limit fail the exec (fatal past the point of no return); hk counts them in total_vm but runs the image.
 
 ## NUMA gaps
 
