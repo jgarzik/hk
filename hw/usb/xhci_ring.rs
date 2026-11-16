@@ -20,12 +20,14 @@ use super::xhci::{
 };
 use super::{EndpointType, UsbError};
 use crate::irq::{IrqHandler, IrqReturn};
+use crate::mm::page_alloc::Gfp;
 use crate::printkln;
 use crate::sync::IrqSpinlockGuard;
 use crate::task::percpu::ms_to_ticks;
 use crate::task::workqueue::SYSTEM_WQ;
 use crate::time::delay::poll_timeout;
 use crate::util::kalloc::try_arc_gfp;
+use crate::util::kalloc::with_gfp;
 
 /// Command completion (Linux XHCI_CMD_DEFAULT_TIMEOUT, ms)
 const XHCI_CMD_DEFAULT_TIMEOUT_MS: u64 = 5000;
@@ -459,11 +461,8 @@ impl Xhci {
             return Err(UsbError::Shutdown);
         }
         let ep = st.ep(slot, dci).ok_or(UsbError::NoDevice)?;
+        self.prepare_ring(ep, trbs.len())?;
         let ring = ep.ring.as_mut().ok_or(UsbError::NoDevice)?;
-        // One segment, never expanded (BUGS.md)
-        if ring.free_trbs() < trbs.len() || ep.tds.len() >= ep.tds.capacity() {
-            return Err(UsbError::NoResources);
-        }
         let span = ring.enqueue_td(&trbs);
         xhci_trace!(
             QUEUE_TRB,
@@ -482,6 +481,33 @@ impl Xhci {
         });
         let ep_state = ep.ep_state;
         self.ring_ep_doorbell(ep_state, slot, dci);
+        Ok(())
+    }
+
+    /// Room on `ep` for a TD of `n` TRBs (Linux prepare_ring): the ring
+    /// grows by the segments it lacks and the TD list by its length,
+    /// GFP_ATOMIC under the lock as Linux's xhci_urb_enqueue; ENOMEM
+    /// (NoResources) if they cannot be had
+    fn prepare_ring(&self, ep: &mut VirtEp, n: usize) -> Result<(), UsbError> {
+        let ring = ep.ring.as_mut().ok_or(UsbError::NoDevice)?;
+        let need = ring.segs_needed(n);
+        if need > 0 {
+            let shift = ring
+                .expand(&self.pci_dev, need, Gfp::ATOMIC)
+                .ok_or_else(|| {
+                    printkln!("xHCI: Ring expansion failed");
+                    UsbError::NoResources
+                })?;
+            for td in ep.tds.iter_mut() {
+                td.span.start = shift.apply(td.span.start);
+            }
+            ep.queued_deq = ep.queued_deq.map(|i| shift.apply(i));
+        }
+        if ep.tds.len() == ep.tds.capacity() {
+            let more = ep.tds.len().max(1);
+            with_gfp(Gfp::ATOMIC, || ep.tds.try_reserve(more))
+                .map_err(|_| UsbError::NoResources)?;
+        }
         Ok(())
     }
 

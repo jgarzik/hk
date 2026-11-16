@@ -802,9 +802,6 @@ QEMU's xHCI hides all of them.
   (`configure_endpoints`): isochronous and non-default control
   endpoints are skipped.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
-- Transfer rings are one segment and never grow (Linux
-  xhci_ring_expansion): a submission that does not fit fails
-  (NoResources).
 - A transaction error halts the endpoint at once (Linux retries a
   few: EP_SOFT_RESET); no quirk for controllers that send a spurious
   success event after a short transfer (XHCI_SPURIOUS_SUCCESS).

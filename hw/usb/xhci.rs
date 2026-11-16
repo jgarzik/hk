@@ -729,14 +729,15 @@ pub(super) mod ep_state {
     pub const EP_STOP_CMD_PENDING: u32 = 1 << 2;
 }
 
-/// Most TDs an endpoint has queued: one TRB each, the ring full
-const MAX_TDS: usize = TransferRing::DEFAULT_SIZE;
+/// TDs an endpoint's list has room for when its ring is made, one per
+/// TRB of the first segment; queueing past them grows the list
+const MAX_TDS: usize = TransferRing::SEG_TRBS;
 
 /// An endpoint of a device (Linux struct xhci_virt_ep)
 pub(super) struct VirtEp {
     pub(super) ring: Option<TransferRing>,
     /// Its TDs in ring order, room for `MAX_TDS` reserved with the ring
-    /// so queueing never allocates (Linux ring->td_list and
+    /// (Linux ring->td_list and
     /// ep->cancelled_td_list, the latter as `Td.cancel`)
     pub(super) tds: alloc::collections::VecDeque<Td>,
     pub(super) ep_state: u32,

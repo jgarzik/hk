@@ -11,6 +11,7 @@ use core::sync::atomic::{Ordering, fence};
 
 use crate::hw::dma::{DmaBox, DmaDevice};
 use crate::mm::frame_alloc::FRAME_SIZE;
+use crate::mm::page_alloc::Gfp;
 
 /// Transfer Request Block (TRB) - same structure as in xhci.rs
 /// but with additional types for data transfers
@@ -335,28 +336,53 @@ pub struct TdSpan {
     pub n: usize,
 }
 
-/// The ring's memory: its DMA allocation, or (unit tests) leaked heap
+/// A segment's memory: its DMA allocation, or (unit tests) leaked heap
 enum RingMem {
     Dma(#[expect(dead_code, reason = "owns the DMA allocation")] DmaBox),
     #[cfg(test)]
     Heap,
 }
 
-/// Transfer Ring for bulk/interrupt/control endpoint transfers (one
-/// segment: `size` TRBs, then a Link TRB back to the start)
-///
-/// Producer side only (Linux struct xhci_ring): `enqueue` is where the
-/// next TRB goes, `dequeue` the first TRB of the oldest TD not yet
-/// given back (Linux ring->dequeue, moved past each finished TD and by
-/// Set TR Dequeue Pointer); the TRBs from one to the other are the
-/// controller's. Touched only under its owner's lock (xHCI:
-/// `Xhci.lock`).
-pub struct TransferRing {
+/// One segment of a transfer ring (Linux struct xhci_segment): its
+/// TRBs, then a Link TRB to the next segment
+struct Segment {
     #[expect(dead_code, reason = "owns the TRBs' memory")]
     mem: RingMem,
     trbs: *mut Trb,
-    dma_base: u64,
-    /// Number of TRBs in ring (excluding link TRB)
+    dma: u64,
+}
+
+/// Where the ring grew (`TransferRing::expand`): indices from `at` on
+/// moved up by `by`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingShift {
+    at: usize,
+    by: usize,
+}
+
+impl RingShift {
+    /// Index `i` after the expansion
+    pub fn apply(&self, i: usize) -> usize {
+        if i >= self.at { i + self.by } else { i }
+    }
+}
+
+/// Transfer Ring for bulk/interrupt/control endpoint transfers: a
+/// circle of segments, each `seg` TRBs then a Link TRB to the next, the
+/// last one's toggling the cycle state (Linux struct xhci_ring). TRBs
+/// are numbered 0..size across the segments in ring order, Link TRBs
+/// apart.
+///
+/// Producer side only: `enqueue` is where the next TRB goes, `dequeue`
+/// the first TRB of the oldest TD not yet given back (Linux
+/// ring->dequeue, moved past each finished TD and by Set TR Dequeue
+/// Pointer); the TRBs from one to the other are the controller's.
+/// Touched only under its owner's lock (xHCI: `Xhci.lock`).
+pub struct TransferRing {
+    segs: alloc::vec::Vec<Segment>,
+    /// TRBs per segment, its Link TRB apart (Linux TRBS_PER_SEGMENT - 1)
+    seg: usize,
+    /// TRBs in the ring, Link TRBs apart
     size: usize,
     /// Enqueue pointer index
     enqueue: usize,
@@ -366,62 +392,101 @@ pub struct TransferRing {
     cycle: bool,
 }
 
-// SAFETY: `trbs` points into the memory the ring owns (`mem`), touched
-// only through `&mut self` or under the owner's lock
+// SAFETY: each segment's `trbs` points into the memory it owns (`mem`),
+// touched only through `&mut self` or under the owner's lock
 unsafe impl Send for TransferRing {}
 // SAFETY: as above
 unsafe impl Sync for TransferRing {}
 
 impl TransferRing {
-    /// Default ring size (leaves room for link TRB)
-    pub const DEFAULT_SIZE: usize = 255;
+    /// TRBs per segment: a page, its last TRB the Link TRB
+    pub const SEG_TRBS: usize = FRAME_SIZE / 16 - 1;
+    /// Segments of a new endpoint ring (Linux xhci_endpoint_init's 2)
+    const INIT_SEGS: usize = 2;
 
-    /// Create a new transfer ring using DMA allocation
+    /// A new ring of two segments
     pub fn new<D: DmaDevice>(dev: &D) -> Option<Self> {
-        // One page: 255 TRBs and the Link TRB
-        let dma = DmaBox::alloc(dev, FRAME_SIZE)?;
-        let (trbs, base) = (dma.cpu_addr().cast::<Trb>(), dma.dma_addr().as_u64());
-        // SAFETY: the fresh page the ring owns
-        Some(unsafe { Self::init(RingMem::Dma(dma), trbs, base, Self::DEFAULT_SIZE) })
+        let mut segs = alloc::vec::Vec::new();
+        segs.try_reserve_exact(Self::INIT_SEGS).ok()?;
+        for _ in 0..Self::INIT_SEGS {
+            segs.push(Self::dma_seg(dev, Gfp::KERNEL, true)?);
+        }
+        Some(Self::init(segs, Self::SEG_TRBS))
     }
 
-    /// A ring of `size` TRBs at `trbs` (device address `base`)
+    /// A zeroed DMA segment, its TRBs' cycle bits set unless `pcs` (the
+    /// ring's cycle state): none is the controller's yet (Linux
+    /// xhci_link_rings' TRB_CYCLE fill)
+    fn dma_seg<D: DmaDevice>(dev: &D, gfp: Gfp, pcs: bool) -> Option<Segment> {
+        let dma = DmaBox::alloc_gfp(dev, FRAME_SIZE, gfp)?;
+        let (trbs, base) = (dma.cpu_addr().cast::<Trb>(), dma.dma_addr().as_u64());
+        let s = Segment {
+            mem: RingMem::Dma(dma),
+            trbs,
+            dma: base,
+        };
+        // SAFETY: the fresh page the segment owns: SEG_TRBS + 1 TRBs
+        unsafe { Self::fill_seg(&s, Self::SEG_TRBS, pcs) };
+        Some(s)
+    }
+
+    /// Zero `seg + 1` TRBs of `s`, cycle bits set unless `pcs`
     ///
     /// # Safety
-    /// `trbs` points at `size + 1` TRBs that `mem` keeps allocated.
-    unsafe fn init(mem: RingMem, trbs: *mut Trb, base: u64, size: usize) -> Self {
-        // SAFETY: the caller's `size + 1` TRBs
-        unsafe { core::ptr::write_bytes(trbs, 0, size + 1) };
+    /// `s.trbs` points at `seg + 1` TRBs its memory keeps allocated.
+    unsafe fn fill_seg(s: &Segment, seg: usize, pcs: bool) {
+        // SAFETY: the caller's `seg + 1` TRBs
+        unsafe { core::ptr::write_bytes(s.trbs, 0, seg + 1) };
+        if !pcs {
+            for i in 0..=seg {
+                // SAFETY: as above
+                unsafe { write_volatile(&raw mut (*s.trbs.add(i)).control, 1) };
+            }
+        }
+    }
+
+    /// A ring of `segs` (each `seg` TRBs and a Link TRB), linked in
+    /// order
+    fn init(segs: alloc::vec::Vec<Segment>, seg: usize) -> Self {
         let r = Self {
-            mem,
-            trbs,
-            dma_base: base,
-            size,
+            size: segs.len() * seg,
+            segs,
+            seg,
             enqueue: 0,
             dequeue: 0,
             cycle: true,
         };
-        // The Link TRB back to the start, toggling the cycle state
-        let mut link = Trb::link(base, true);
-        link.set_cycle(true);
-        r.put(size, link);
+        for k in 0..r.segs.len() {
+            r.link_seg(k);
+        }
         r
     }
 
-    /// TRB `i` (0..=size)
-    fn get(&self, i: usize) -> Trb {
-        assert!(i <= self.size);
-        // SAFETY: one of the ring's size + 1 TRBs
-        unsafe { read_volatile(self.trbs.add(i)) }
+    /// Point segment `k`'s Link TRB at the next segment, toggling the
+    /// cycle state if `k` is the last; its cycle and chain bits kept
+    /// (Linux xhci_set_link_trb, LINK_TOGGLE on the last segment)
+    fn link_seg(&self, k: usize) {
+        let n = self.segs.len();
+        let old = self.raw(k, self.seg);
+        let mut link = Trb::link(self.segs[(k + 1) % n].dma, k + 1 == n);
+        link.control |= old.control & (1 | 1 << 4);
+        self.raw_put(k, self.seg, link);
     }
 
-    /// Write TRB `i` (0..=size): the first three words, then the
-    /// control word with its cycle bit (Linux queue_trb's wmb), so the
-    /// controller never sees a valid TRB half written
-    fn put(&self, i: usize, trb: Trb) {
-        assert!(i <= self.size);
-        // SAFETY: one of the ring's size + 1 TRBs
-        let p = unsafe { self.trbs.add(i) };
+    /// TRB `off` (0..=seg) of segment `k`
+    fn raw(&self, k: usize, off: usize) -> Trb {
+        assert!(off <= self.seg);
+        // SAFETY: one of the segment's seg + 1 TRBs
+        unsafe { read_volatile(self.segs[k].trbs.add(off)) }
+    }
+
+    /// Write TRB `off` (0..=seg) of segment `k`: the first three words,
+    /// then the control word with its cycle bit (Linux queue_trb's
+    /// wmb), so the controller never sees a valid TRB half written
+    fn raw_put(&self, k: usize, off: usize, trb: Trb) {
+        assert!(off <= self.seg);
+        // SAFETY: one of the segment's seg + 1 TRBs
+        let p = unsafe { self.segs[k].trbs.add(off) };
         // SAFETY: as above; fields of a 16-byte TRB
         unsafe {
             write_volatile(&raw mut (*p).parameter, trb.parameter);
@@ -432,34 +497,106 @@ impl TransferRing {
         fence(Ordering::SeqCst);
     }
 
-    /// Get the physical/DMA address of the ring
+    /// TRB `i` (0..size)
+    fn get(&self, i: usize) -> Trb {
+        self.raw(i / self.seg, i % self.seg)
+    }
+
+    /// Write TRB `i` (0..size)
+    fn put(&self, i: usize, trb: Trb) {
+        self.raw_put(i / self.seg, i % self.seg, trb);
+    }
+
+    /// Whether TRB `i` is the last of its segment (its Link TRB next)
+    fn seg_end(&self, i: usize) -> bool {
+        (i + 1).is_multiple_of(self.seg)
+    }
+
+    /// Device address of the ring's first TRB (the endpoint context's
+    /// TR Dequeue Pointer)
     pub fn dma_addr(&self) -> u64 {
-        self.dma_base
+        self.segs[0].dma
     }
 
     /// Device address of TRB `i`
     pub fn dma_of(&self, i: usize) -> u64 {
-        self.dma_base + (i * 16) as u64
+        self.segs[i / self.seg].dma + ((i % self.seg) * 16) as u64
     }
 
-    /// The transfer TRB at device address `dma` (not the Link TRB)
+    /// The transfer TRB at device address `dma` (not a Link TRB)
     pub fn index_of(&self, dma: u64) -> Option<usize> {
-        let off = dma.checked_sub(self.dma_base)?;
-        let i = usize::try_from(off / 16).ok()?;
-        (off % 16 == 0 && i < self.size).then_some(i)
+        self.segs.iter().enumerate().find_map(|(k, s)| {
+            let off = dma.checked_sub(s.dma)?;
+            let i = usize::try_from(off / 16).ok()?;
+            (off % 16 == 0 && i < self.seg).then_some(k * self.seg + i)
+        })
     }
 
-    /// TRBs free for new TDs: one stays empty so a full ring differs
-    /// from an empty one (Linux xhci_num_trbs_free)
-    pub fn free_trbs(&self) -> usize {
-        let used = (self.enqueue + self.size - self.dequeue) % self.size;
-        self.size - 1 - used
+    /// Segments to add before `n` more TRBs are queued (Linux
+    /// xhci_ring_expansion_needed): a TD goes only into segments the
+    /// dequeue is not in, its own segment apart, and one that would
+    /// fill the enqueue segment needs the next free too (a full ring
+    /// must differ from an empty one)
+    pub fn segs_needed(&self, n: usize) -> usize {
+        let used = self.enqueue % self.seg;
+        let Some(past) = (used + n).checked_sub(self.seg) else {
+            return 0;
+        };
+        let (deq_seg, nsegs) = (self.dequeue / self.seg, self.segs.len());
+        let mut k = self.enqueue / self.seg;
+        let mut need = 1 + past / self.seg;
+        while need > 0 {
+            k = (k + 1) % nsegs;
+            if k == deq_seg {
+                return need;
+            }
+            need -= 1;
+        }
+        0
     }
 
-    /// Enqueue the TRBs of one TD (the caller checked `free_trbs`).
-    /// The first is written with the wrong cycle bit and given the
-    /// right one last, so the controller never starts on a partial TD
-    /// (Linux giveback_first_trb)
+    /// Grow by `n` segments after the enqueue segment (Linux
+    /// xhci_ring_expansion, xhci_link_rings), each allocated with `gfp`
+    /// and its TRBs not yet the controller's: where indices moved, for
+    /// the owner's TDs. None (ring unchanged) out of memory
+    pub fn expand<D: DmaDevice>(&mut self, dev: &D, n: usize, gfp: Gfp) -> Option<RingShift> {
+        let mut new = alloc::vec::Vec::new();
+        new.try_reserve_exact(n).ok()?;
+        self.segs.try_reserve(n).ok()?;
+        for _ in 0..n {
+            new.push(Self::dma_seg(dev, gfp, self.cycle)?);
+        }
+        Some(self.insert_segs(new))
+    }
+
+    /// Link `new` in after the enqueue segment (room for them reserved
+    /// in `segs`); the dequeue (never in a segment after the enqueue's)
+    /// moves with what follows
+    fn insert_segs(&mut self, new: alloc::vec::Vec<Segment>) -> RingShift {
+        let k = self.enqueue / self.seg;
+        let shift = RingShift {
+            at: (k + 1) * self.seg,
+            by: new.len() * self.seg,
+        };
+        let n = new.len();
+        for (j, s) in new.into_iter().enumerate() {
+            self.segs.insert(k + 1 + j, s);
+        }
+        self.size = self.segs.len() * self.seg;
+        // The enqueue segment's link points at the first new one (no
+        // longer toggling if it was the last), the last new one's at
+        // what followed (toggling if now the last)
+        for j in k..=k + n {
+            self.link_seg(j);
+        }
+        self.dequeue = shift.apply(self.dequeue);
+        shift
+    }
+
+    /// Enqueue the TRBs of one TD (the caller made room:
+    /// `segs_needed` 0). The first is written with the wrong cycle bit
+    /// and given the right one last, so the controller never starts on
+    /// a partial TD (Linux giveback_first_trb)
     pub fn enqueue_td(&mut self, trbs: &[Trb]) -> TdSpan {
         let start = self.enqueue;
         let cycle = self.cycle;
@@ -478,22 +615,25 @@ impl TransferRing {
     }
 
     /// Write `trb` with cycle bit `cycle` at the enqueue position and
-    /// advance it; past the last TRB, the Link TRB is handed to the
-    /// controller with the chain bit of the TRB before it (a TD that
-    /// wraps stays one TD: xHCI 4.11.5.1, Linux inc_enq) and the cycle
-    /// state toggles
+    /// advance it; past a segment's last TRB, its Link TRB is handed to
+    /// the controller with the chain bit of the TRB before it (a TD
+    /// that crosses stays one TD: xHCI 4.11.5.1, Linux inc_enq), and
+    /// past the last segment's the cycle state toggles
     fn write(&mut self, mut trb: Trb, cycle: bool) {
         trb.set_cycle(cycle);
         let chain = trb.control & (1 << 4);
-        self.put(self.enqueue, trb);
-        self.enqueue += 1;
-        if self.enqueue == self.size {
-            self.enqueue = 0;
-            let mut link = self.get(self.size);
+        let i = self.enqueue;
+        self.put(i, trb);
+        self.enqueue = (i + 1) % self.size;
+        if self.seg_end(i) {
+            let k = i / self.seg;
+            let mut link = self.raw(k, self.seg);
             link.control = (link.control & !(1 << 4)) | chain;
             link.set_cycle(self.cycle);
-            self.put(self.size, link);
-            self.cycle = !self.cycle;
+            self.raw_put(k, self.seg, link);
+            if k + 1 == self.segs.len() {
+                self.cycle = !self.cycle;
+            }
         }
     }
 
@@ -533,7 +673,7 @@ impl TransferRing {
 
     /// Turn `td` into No-op TRBs, cycle bits kept, chains broken, so a
     /// stopped endpoint skips it once restarted (Linux td_to_noop); a
-    /// TD that wrapped no longer chains through the Link TRB
+    /// TD that crossed a segment no longer chains through its Link TRB
     pub fn td_to_noop(&mut self, td: TdSpan) {
         for k in 0..td.n {
             let i = (td.start + k) % self.size;
@@ -541,11 +681,12 @@ impl TransferRing {
             t.set_type(TrbType::NO_OP);
             t.control |= self.get(i).control & 1;
             self.put(i, t);
-        }
-        if td.start + td.n > self.size {
-            let mut link = self.get(self.size);
-            link.control &= !(1 << 4);
-            self.put(self.size, link);
+            if self.seg_end(i) && k + 1 < td.n {
+                let s = i / self.seg;
+                let mut link = self.raw(s, self.seg);
+                link.control &= !(1 << 4);
+                self.raw_put(s, self.seg, link);
+            }
         }
     }
 
@@ -576,13 +717,45 @@ impl TransferRing {
         (to, cycle)
     }
 
-    /// A ring of `size` TRBs on the heap (never freed), at device
-    /// address `base`, for unit tests
+    /// A heap segment of `seg` TRBs (never freed) at device address
+    /// `base`, for unit tests
+    #[cfg(test)]
+    fn heap_seg(seg: usize, base: u64, pcs: bool) -> Segment {
+        let mem = alloc::vec![Trb::new(); seg + 1].leak();
+        let s = Segment {
+            mem: RingMem::Heap,
+            trbs: mem.as_mut_ptr(),
+            dma: base,
+        };
+        // SAFETY: `seg + 1` leaked TRBs
+        unsafe { Self::fill_seg(&s, seg, pcs) };
+        s
+    }
+
+    /// A ring of `nsegs` heap segments of `seg` TRBs, segment `k` at
+    /// device address `base + k * 0x1000`, for unit tests
+    #[cfg(test)]
+    pub fn for_test_segs(nsegs: usize, seg: usize, base: u64) -> Self {
+        let segs = (0..nsegs)
+            .map(|k| Self::heap_seg(seg, base + k as u64 * 0x1000, true))
+            .collect();
+        Self::init(segs, seg)
+    }
+
+    /// A one-segment ring of `size` TRBs, for unit tests
     #[cfg(test)]
     pub fn for_test(size: usize, base: u64) -> Self {
-        let mem = alloc::vec![Trb::new(); size + 1].leak();
-        // SAFETY: `size + 1` leaked TRBs
-        unsafe { Self::init(RingMem::Heap, mem.as_mut_ptr(), base, size) }
+        Self::for_test_segs(1, size, base)
+    }
+
+    /// `expand` with heap segments at `base + j * 0x1000`
+    #[cfg(test)]
+    fn expand_test(&mut self, n: usize, base: u64) -> RingShift {
+        let new = (0..n)
+            .map(|j| Self::heap_seg(self.seg, base + j as u64 * 0x1000, self.cycle))
+            .collect();
+        self.segs.reserve(n);
+        self.insert_segs(new)
     }
 }
 
@@ -599,36 +772,111 @@ mod tests {
     #[test]
     fn wrap_chains_link() {
         let mut r = TransferRing::for_test(4, 0x10_0000);
+        assert!(!r.raw(0, 4).get_cycle(), "link not the controller's yet");
         let td = r.enqueue_td(&[trb_n(false), trb_n(false)]);
         assert_eq!((td.start, td.n), (0, 2));
         r.dequeue_past(td);
         let td = r.enqueue_td(&[trb_n(true), trb_n(true), trb_n(false)]);
         assert_eq!((td.start, td.n), (2, 3));
-        assert_ne!(r.get(4).control & (1 << 4), 0, "link chained");
+        assert_ne!(r.raw(0, 4).control & (1 << 4), 0, "link chained");
         assert!(r.td_contains(td, 3) && r.td_contains(td, 0) && !r.td_contains(td, 1));
         assert_eq!(r.td_end(td), 0);
         // cycle: the first pass wrote 1, the TRB after the link 0
         assert!(r.get(2).get_cycle() && r.get(3).get_cycle() && !r.get(0).get_cycle());
-        assert!(r.get(4).get_cycle(), "link handed over on the first pass");
+        assert!(
+            r.raw(0, 4).get_cycle(),
+            "link handed over on the first pass"
+        );
         r.td_to_noop(td);
-        assert_eq!(r.get(4).control & (1 << 4), 0, "noop unchains the link");
+        assert_eq!(r.raw(0, 4).control & (1 << 4), 0, "noop unchains the link");
         assert_eq!(r.get(3).get_type(), TrbType::NO_OP);
         assert!(r.get(3).get_cycle() && !r.get(0).get_cycle());
     }
 
     #[test]
-    fn room_and_addresses() {
-        let mut r = TransferRing::for_test(8, 0x2000);
-        assert_eq!(r.free_trbs(), 7);
+    fn addresses() {
+        let mut r = TransferRing::for_test_segs(2, 8, 0x2000);
         let td = r.enqueue_td(&[trb_n(false); 3]);
-        assert_eq!(r.free_trbs(), 4);
         assert_eq!(r.index_of(r.dma_of(2)), Some(2));
-        assert_eq!(r.index_of(0x2000 + 8 * 16), None, "the link TRB");
+        assert_eq!(r.dma_of(9), 0x3000 + 16);
+        assert_eq!(r.index_of(0x3000 + 16), Some(9));
+        assert_eq!(r.index_of(0x2000 + 8 * 16), None, "a link TRB");
         assert_eq!(r.index_of(0x2004), None);
         assert_eq!(r.index_of(0x1ff0), None);
         assert_eq!(r.sum_trb_lengths(td, 2), 16);
+        // links: segment 0 to 1, 1 back to 0 toggling
+        assert_eq!(r.raw(0, 8).parameter, 0x3000);
+        assert_eq!(
+            (r.raw(1, 8).parameter, r.raw(1, 8).control & 2),
+            (0x2000, 2)
+        );
+        assert_eq!(r.raw(0, 8).control & 2, 0);
+    }
+
+    /// Linux xhci_ring_expansion_needed: a TD may fill the rest of the
+    /// enqueue segment only if the next is free of the dequeue
+    #[test]
+    fn segs_needed() {
+        let mut r = TransferRing::for_test_segs(2, 4, 0x4000);
+        assert_eq!(r.segs_needed(3), 0);
+        // filling segment 0 needs segment 1, free
+        assert_eq!(r.segs_needed(4), 0);
+        // into segment 0 again, where the dequeue is
+        assert_eq!(r.segs_needed(8), 1);
+        assert_eq!(r.segs_needed(13), 2);
+        let td = r.enqueue_td(&[trb_n(false); 4]);
+        // enqueue at 4 (segment 1); the dequeue still in segment 0
+        assert_eq!(r.segs_needed(3), 0);
+        assert_eq!(r.segs_needed(4), 1);
         r.dequeue_past(td);
-        assert_eq!(r.free_trbs(), 7);
+        assert_eq!(r.segs_needed(4), 0, "dequeue left segment 0");
+    }
+
+    /// Segments go in after the enqueue segment, links rewired, the
+    /// toggle on the last; indices past them move; their TRBs are not
+    /// the controller's until written
+    #[test]
+    fn expand_after_enqueue() {
+        let mut r = TransferRing::for_test_segs(2, 4, 0x10_000);
+        let a = r.enqueue_td(&[trb_n(false); 4]);
+        r.dequeue_past(a);
+        let b = r.enqueue_td(&[trb_n(false); 2]);
+        // enqueue 6 (segment 1), dequeue 4: segment 1 is the last
+        let sh = r.expand_test(1, 0x20_000);
+        assert_eq!(sh.apply(3), 3);
+        assert_eq!(sh.apply(8), 12, "past the enqueue segment");
+        assert_eq!(r.size, 12);
+        assert_eq!(r.raw(1, 4).parameter, 0x20_000, "enqueue seg links to new");
+        assert_eq!(r.raw(1, 4).control & 2, 0, "toggle moved off");
+        assert_eq!(
+            (r.raw(2, 4).parameter, r.raw(2, 4).control & 2),
+            (0x10_000, 2)
+        );
+        assert!(!r.raw(2, 0).get_cycle(), "new TRBs not the controller's");
+        assert_eq!(r.dequeue, 4);
+        // the TD crossing into the new segment is one TD
+        let c = r.enqueue_td(&[trb_n(true), trb_n(true), trb_n(false)]);
+        assert_eq!((c.start, c.n), (6, 3));
+        assert_eq!(r.td_end(c), 8);
+        assert!(r.get(8).get_cycle(), "still the first pass");
+        r.dequeue_past(b);
+        assert_eq!(r.deq_past_td(c), (9, true));
+        // in the middle: what follows moves; the dequeue with it
+        let mut m = TransferRing::for_test_segs(2, 4, 0x30_000);
+        let d = m.enqueue_td(&[trb_n(false); 4]);
+        m.dequeue_past(d);
+        let e = m.enqueue_td(&[trb_n(false); 3]);
+        m.dequeue_past(e);
+        let f = m.enqueue_td(&[trb_n(false); 2]);
+        // enqueue 1 (segment 0, second pass), dequeue 7 (segment 1)
+        assert_eq!((m.enqueue, m.dequeue, m.cycle), (1, 7, false));
+        let sh = m.expand_test(1, 0x40_000);
+        assert_eq!(m.dequeue, 11);
+        assert_eq!(sh.apply(f.start), 11, "the queued TD moved too");
+        assert_eq!(m.raw(0, 4).parameter, 0x40_000);
+        assert_eq!(m.raw(1, 4).parameter, 0x30_000 + 0x1000);
+        assert!(m.raw(1, 0).get_cycle(), "filled for pcs 0");
+        assert_eq!(m.raw(2, 4).control & 2, 2, "old last keeps the toggle");
     }
 
     /// The new dequeue is the TRB after the TD: the next TD's first,
