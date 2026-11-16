@@ -205,19 +205,11 @@ argued / published copy of locked state.
   lives) or a per-CPU batched allocator.
 
 ### 15. Single-writer state updated with RMW — (a)
-- Where: `task/mod.rs` `Task.nvcsw`, `nivcsw`, `min_flt`, `maj_flt`
-  (`fetch_add` by the task itself), `Task::set_flag`/`clear_flag`
-  (`flags.fetch_or/and(AcqRel)`; PF_* are written by the task itself);
-  `util/kalloc.rs` `with_gfp` (`GFP_CX.swap`); `task/percpu.rs`
-  `scheduler_tick` (`TICK_COUNT.fetch_add`, CPU 0 only),
-  `PerCpuScheduler.nr_switches`/`ticks`; `net/core/dev.rs` `Napi.polls`,
-  `Softnet.processed`/`dropped`/`time_squeeze`; `time/mod.rs`
-  `TimeKeeper::write_begin`/`write_end` (under its lock).
-- Wrong: locked RMWs and unargued AcqRel where one writer exists.
-- Linux: plain `++`/`|=` on `current`, `this_cpu_inc`, `WRITE_ONCE`.
-- Fix: Relaxed load+store helper (e.g. `util::once_writer_add`) and Relaxed
-  for PF flags with the "only current writes" argument in a comment; any
-  PF flag set on another task must instead go through a lock.
+- Where: `util/kalloc.rs` `with_gfp` (`GFP_CX.swap`, this CPU's slot).
+  The task counters, PF flags, tick and switch counts, softnet counters
+  and the timekeeper sequence use `sync::Sole` (a load and a store).
+- Fix: `GFP_CX` as a load and a store (its CPU alone writes it,
+  interrupts restore it).
 
 ### 16. Mount change numbers: global atomic + `fetch_max` instead of `mount_lock` — (d)(b)
 - Where: `ns/mod.rs` `MNT_EVENT`, `MntEvents.event`, `MntEvents::bump`.

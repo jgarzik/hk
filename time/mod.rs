@@ -289,14 +289,14 @@ impl TimeKeeper {
     /// Linux write_seqcount_begin: `seq` odd, then smp_wmb so no field
     /// store is seen before it (caller holds `lock`, IRQs off)
     fn write_begin(&self) {
-        self.seq.fetch_add(1, Ordering::Relaxed);
+        crate::sync::Sole::sole_add(&self.seq, 1);
         ::core::sync::atomic::fence(Ordering::Release);
     }
 
     /// Linux write_seqcount_end: smp_wmb, then `seq` even again
     fn write_end(&self) {
         ::core::sync::atomic::fence(Ordering::Release);
-        self.seq.fetch_add(1, Ordering::Relaxed);
+        crate::sync::Sole::sole_add(&self.seq, 1);
     }
 
     /// Check if the timekeeper has been initialized

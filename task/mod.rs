@@ -1896,12 +1896,16 @@ impl Task {
         self.flags.load(Ordering::Acquire) & f != 0
     }
 
+    /// Set PF_* bits: the task's own flags, which only it writes
+    /// (Linux current->flags |= PF_*), a load and a store; Release for
+    /// the readers that test them from other tasks (PF_EXITING)
     pub fn set_flag(&self, f: u32) {
-        self.flags.fetch_or(f, Ordering::AcqRel);
+        crate::sync::Sole::sole_or(&self.flags, f, Ordering::Release);
     }
 
+    /// Clear PF_* bits (as [`set_flag`](Self::set_flag))
     pub fn clear_flag(&self, f: u32) {
-        self.flags.fetch_and(!f, Ordering::AcqRel);
+        crate::sync::Sole::sole_clear(&self.flags, f, Ordering::Release);
     }
 
     /// The task's CPU (its run queue)

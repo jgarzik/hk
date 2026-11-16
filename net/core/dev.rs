@@ -207,7 +207,8 @@ impl Napi {
     }
 
     fn poll(&self, budget: usize) -> usize {
-        self.polls.fetch_add(1, Ordering::Relaxed);
+        // One poller at a time (NAPI_STATE_SCHED)
+        crate::sync::Sole::sole_add(&self.polls, 1);
         match self.poller.get().and_then(|w| w.upgrade()) {
             Some(p) => p.poll(self, budget),
             None => {
@@ -398,7 +399,8 @@ fn softnet_thread(cpu: usize) {
         }
 
         if budget == 0 {
-            sd.time_squeeze.fetch_add(1, Ordering::Relaxed);
+            // This CPU's softnet (Linux sd->time_squeeze++)
+            crate::sync::Sole::sole_add(&sd.time_squeeze, 1);
         }
         if sd.has_work() {
             // Work left after the budget: a scheduling point (Linux
@@ -510,7 +512,8 @@ pub fn netif_receive_skb(mut skb: Box<SkBuff>) {
     let Some(dev) = skb.dev.clone() else {
         return;
     };
-    this_softnet().processed.fetch_add(1, Ordering::Relaxed);
+    // This CPU's softnet (Linux __this_cpu_inc(softnet_data.processed))
+    crate::sync::Sole::sole_add(&this_softnet().processed, 1);
     if !dev.is_up() {
         // Closed device (a frame raced with dev_close)
         dev.stats.inc_rx_dropped();

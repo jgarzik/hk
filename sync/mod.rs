@@ -22,6 +22,7 @@ mod racy;
 pub mod rcu;
 mod rwsem;
 mod seqlock;
+mod sole;
 pub mod spin;
 
 pub use irqflags::{IrqFlags, irqs_disabled, local_irq_restore, local_irq_save};
@@ -31,6 +32,7 @@ pub use mutex::{Mutex, MutexGuard};
 pub use racy::RacyCell;
 pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 pub use seqlock::{SeqCount, SeqCountGuard, SeqLock, SeqWriteGuard};
+pub use sole::Sole;
 
 /// What the sleeping locks take from the scheduler
 #[cfg(not(test))]

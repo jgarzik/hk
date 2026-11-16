@@ -3541,7 +3541,8 @@ pub fn exit_current(status: Option<i32>) -> ! {
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(unsafe { &*next });
     rq.curr = next;
     rq.prev = &raw const *me;
-    sched.nr_switches.fetch_add(1, Ordering::Relaxed);
+    // Under the rq lock (Linux rq->nr_switches++)
+    crate::sync::Sole::sole_add(&sched.nr_switches, 1);
 
     // The rq lock stays held across the switch, as for any switch: the
     // next task releases it (finish_task_switch), and only then frees our
@@ -3652,7 +3653,8 @@ fn context_switch_locked(
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(n);
     rq.curr = next;
     rq.prev = prev;
-    sched.nr_switches.fetch_add(1, Ordering::Relaxed);
+    // Under the rq lock (Linux rq->nr_switches++)
+    crate::sync::Sole::sole_add(&sched.nr_switches, 1);
 
     // SAFETY: both frames are under the rq lock we hold
     unsafe {
@@ -3754,7 +3756,8 @@ pub fn schedule() {
         me.se.contrib_load.store(true, Ordering::Relaxed);
         sched.nr_uninterruptible.fetch_add(1, Ordering::Relaxed);
     }
-    me.nvcsw.fetch_add(1, Ordering::Relaxed);
+    // The task's own counter (Linux prev->nvcsw++)
+    crate::sync::Sole::sole_add(&me.nvcsw, 1);
     let next = rq.pick_next();
     context_switch_locked(sched, rq, &me, next);
 }
@@ -4152,7 +4155,10 @@ fn sched_balance_rq(this: u32) {
 /// every tick, a busy one every 8
 fn balance_tick(cpu: u32) {
     let interval = if idle_cpu(cpu) { 1 } else { 8 };
-    let t = PERCPU_SCHEDS.get(cpu).ticks.fetch_add(1, Ordering::Relaxed);
+    // This CPU's tick count, written only by its tick
+    let ticks = &PERCPU_SCHEDS.get(cpu).ticks;
+    let t = ticks.load(Ordering::Relaxed);
+    ticks.store(t.wrapping_add(1), Ordering::Relaxed);
     if t.is_multiple_of(interval) {
         sched_balance_rq(cpu);
     }
@@ -4373,7 +4379,10 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 /// Linux scheduler_tick -> resched_curr).
 pub fn scheduler_tick() {
     if crate::cpu::try_this_id() == Some(0) {
-        let t = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        // CPU 0's tick alone writes it (Linux jiffies on the do_timer
+        // CPU)
+        let t = TICK_COUNT.load(Ordering::Relaxed).wrapping_add(1);
+        TICK_COUNT.store(t, Ordering::Relaxed);
         crate::task::loadavg::tick(t);
     }
     crate::time::timer::run_local();
@@ -4545,7 +4554,7 @@ pub fn cond_resched() {
 /// `yield_now`, an involuntary switch if another task runs
 pub fn preempt_schedule_user() {
     if yield_cpu(true) {
-        current().nivcsw.fetch_add(1, Ordering::Relaxed);
+        crate::sync::Sole::sole_add(&current().nivcsw, 1);
     }
 }
 
@@ -4636,7 +4645,8 @@ pub fn current_sid() -> Pid {
 /// Called after successfully handling a demand-paging or COW fault
 /// (no I/O required - page was already in memory or newly allocated).
 pub fn increment_min_flt() {
-    current().min_flt.fetch_add(1, Ordering::Relaxed);
+    // The task's own counter (Linux current->min_flt++)
+    crate::sync::Sole::sole_add(&current().min_flt, 1);
 }
 
 /// Increment major page fault counter for current task
@@ -4644,7 +4654,7 @@ pub fn increment_min_flt() {
 /// Called after successfully handling a swap-in fault
 /// (I/O was required - page had to be read from disk).
 pub fn increment_maj_flt() {
-    current().maj_flt.fetch_add(1, Ordering::Relaxed);
+    crate::sync::Sole::sole_add(&current().maj_flt, 1);
 }
 
 /// Every thread of every process in group `pgid` (its pid links)
@@ -5523,7 +5533,8 @@ pub fn try_schedule() {
     // SAFETY: a task of this run queue, alive while it holds it
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(unsafe { &*next });
     rq.curr = next;
-    sched.nr_switches.fetch_add(1, Ordering::Relaxed);
+    // Under the rq lock (Linux rq->nr_switches++)
+    crate::sync::Sole::sole_add(&sched.nr_switches, 1);
     // Held across the switch like any other: the task switched to
     // releases it (finish_context_switch or its own guard). Dropping it
     // here left the per-CPU preempt count at -1 after that release.
