@@ -39,6 +39,7 @@
 //! locks (`TcpSock.lock`, owner or slock) are never taken under a table
 //! lock (callers may hold their own).
 
+use crate::net::mib::{INUSE_TCP, INUSE_TW};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
@@ -417,6 +418,8 @@ impl TcpTables {
         drop(tw);
         s.ehkey.set(t);
         g.add_head_rcu(s.clone());
+        // Linux inet_ehash_nolisten
+        s.sk.net.mib.inuse_add(INUSE_TCP, true);
         true
     }
 
@@ -477,6 +480,7 @@ impl TcpTables {
         let mut g = self.esk(t).lock();
         if let Some(u) = g.del_rcu(s) {
             u.defer();
+            s.sk.net.mib.inuse_add(INUSE_TCP, false);
         }
     }
 
@@ -518,10 +522,14 @@ impl TcpTables {
             }
         });
         drop(c);
+        let mib = &s.sk.net.mib;
         let mut g = self.esk(&tw.tuple).lock();
         self.etw(&tw.tuple).lock().add_head_rcu(tw.clone());
+        mib.inuse_add(INUSE_TW, true);
         if let Some(u) = g.del_rcu(s) {
             u.defer();
+            // Linux inet_twsk_hashdance: the socket leaves
+            mib.inuse_add(INUSE_TCP, false);
         }
     }
 
@@ -541,6 +549,7 @@ impl TcpTables {
         let mut g = self.etw(&tw.tuple).lock();
         if let Some(u) = g.del_rcu(tw) {
             u.defer();
+            tw.net().mib.inuse_add(INUSE_TW, false);
         }
     }
 
@@ -548,6 +557,7 @@ impl TcpTables {
 
     /// Hash a listener on `port` (Linux __inet_hash into lhash2)
     pub fn listen_add(&self, port: u16, s: Arc<TcpSock>) {
+        s.sk.net.mib.inuse_add(INUSE_TCP, true);
         self.lhead(port).lock().add_head_rcu(s);
     }
 
@@ -556,6 +566,7 @@ impl TcpTables {
         let mut g: NullsGuard<'_, SkLhash> = self.lhead(port).lock();
         if let Some(u) = g.del_rcu(s) {
             u.defer();
+            s.sk.net.mib.inuse_add(INUSE_TCP, false);
         }
     }
 

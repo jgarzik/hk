@@ -16,6 +16,7 @@ pub mod snmp;
 pub mod sockcore;
 pub mod sockets;
 pub mod sockopts;
+pub mod sockstat;
 pub mod tcp;
 pub mod tcp_close;
 pub mod tcp_conn;

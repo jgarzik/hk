@@ -154,6 +154,8 @@ struct Inner {
     /// A non-blocking connect is in progress (Linux sock->state
     /// SS_CONNECTING, under lock_sock)
     connecting: bool,
+    /// Counted as an orphan (`cb.orphan`) until destroyed
+    orphan: Option<mem::Orphan>,
 }
 
 /// A listener's queues (Linux request_sock_queue + accept queue):
@@ -404,6 +406,7 @@ impl TcpSock {
                 cb,
                 tuple: None,
                 bound: false,
+                orphan: None,
                 parent: None,
                 armed: [None; 3],
                 connecting: false,
@@ -504,6 +507,8 @@ impl TcpSock {
             // Like Linux tcp_set_state(TCP_CLOSE): a port fixed by bind()
             // stays until close()
             let keep = !g.cb.orphan && self.inet.get().port_lock;
+            // Linux inet_csk_destroy_sock: no longer an orphan
+            g.orphan = None;
             self.unhash_conn(g);
             if !keep {
                 self.unbind(g);
@@ -819,6 +824,7 @@ impl TcpSock {
             } else {
                 g.parent = None;
                 g.cb.orphan = true;
+                g.orphan.get_or_insert_with(mem::Orphan::new);
                 g.cb.disconnect(out);
             }
         }
@@ -1185,6 +1191,7 @@ impl TcpSock {
                 let mut out = Out::default();
                 g.parent = None;
                 g.cb.orphan = true;
+                g.orphan.get_or_insert_with(mem::Orphan::new);
                 g.cb.disconnect(&mut out);
                 c.finish(g, &mut out);
             }
@@ -1887,6 +1894,7 @@ impl ProtoOps for TcpSock {
             // __tcp_close under lock_sock)
             self.sk.set_shutdown(SHUTDOWN_MASK);
             g.cb.orphan = true;
+            g.orphan.get_or_insert_with(mem::Orphan::new);
             if g.cb.state == TcpState::Listen {
                 self.sk.set_flag(sf::ACCEPTCONN, false);
                 self.sk

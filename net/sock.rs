@@ -166,9 +166,18 @@ pub struct Sock {
     wq_flags: AtomicU32,
 }
 
+impl Drop for Sock {
+    /// Linux __sk_free's sock_inuse_add
+    fn drop(&mut self) {
+        self.net.mib.inuse_add(crate::net::mib::INUSE_ALL, false);
+    }
+}
+
 impl Sock {
-    /// New socket state in `net`, created by the current task
+    /// New socket state in `net`, created by the current task; counted
+    /// in its namespace while it lives (Linux sk_alloc's sock_inuse_add)
     pub fn new(net: NetRef, family: u16, stype: i32, protocol: i32) -> Self {
+        net.mib.inuse_add(crate::net::mib::INUSE_ALL, true);
         Self {
             family,
             stype,

@@ -25,13 +25,14 @@ pub type NetGen = fn(&NetNamespace) -> Vec<u8>;
 
 /// The files of a /proc/<pid>/net directory (Linux: what the protocols
 /// register in net->proc_net), read-only
-const NET_FILES: [(&str, NetGen); 9] = [
+const NET_FILES: [(&str, NetGen); 10] = [
     ("arp", crate::net::arp::proc_net_arp),
     ("dev", crate::net::proc::proc_net_dev),
     ("netstat", crate::net::proc::proc_net_netstat),
     ("packet", crate::net::packet::proc_net_packet),
     ("route", crate::net::proc::proc_net_route),
     ("snmp", crate::net::proc::proc_net_snmp),
+    ("sockstat", crate::net::proc::proc_net_sockstat),
     ("tcp", crate::net::tcp::info::proc_net_tcp),
     ("udp", crate::net::udp::proc_net_udp),
     ("unix", crate::net::unix::proc_net_unix),

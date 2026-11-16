@@ -91,6 +91,17 @@ impl<const N: usize> Mib<N> {
 /// ICMPMSG_MIB_MAX)
 pub const ICMPMSG_MIB_MAX: usize = 512;
 
+/// /proc/net/sockstat gauges, per CPU (summed with `fold`): sockets
+/// alive and hashed per protocol (Linux struct prot_inuse: `all`, the
+/// protocols' sock_prot_inuse_add), TIME_WAIT entries (Linux
+/// tcp_death_row.tw_refcount)
+pub const INUSE_ALL: usize = 0;
+pub const INUSE_TCP: usize = 1;
+pub const INUSE_UDP: usize = 2;
+pub const INUSE_RAW: usize = 3;
+pub const INUSE_TW: usize = 4;
+pub const INUSE_MAX: usize = 5;
+
 /// A namespace's MIBs (Linux struct netns_mib, IPv4 part)
 pub struct NetMib {
     pub ip: Mib<IPSTATS_MIB_MAX>,
@@ -101,6 +112,8 @@ pub struct NetMib {
     pub udp: Mib<UDP_MIB_MAX>,
     /// TcpExt (Linux net_statistics)
     pub net: Mib<LINUX_MIB_MAX>,
+    /// `INUSE_*` gauges
+    pub inuse: Mib<INUSE_MAX>,
 }
 
 impl NetMib {
@@ -113,6 +126,7 @@ impl NetMib {
             tcp: Mib::new()?,
             udp: Mib::new()?,
             net: Mib::new()?,
+            inuse: Mib::new()?,
         })?;
         m.tcp_init();
         Ok(m)
@@ -126,6 +140,20 @@ impl NetMib {
         self.tcp.add(TCP_MIB_RTOMIN, RTO_MIN);
         self.tcp.add(TCP_MIB_RTOMAX, RTO_MAX);
         self.tcp.add(TCP_MIB_MAXCONN, u64::MAX); // -1
+    }
+
+    /// Gauge `f` up or down by one (Linux sock_prot_inuse_add)
+    pub fn inuse_add(&self, f: usize, up: bool) {
+        if up {
+            self.inuse.inc(f);
+        } else {
+            self.inuse.dec(f);
+        }
+    }
+
+    /// Gauge `f`, summed (Linux sock_prot_inuse_get: never below 0)
+    pub fn inuse_get(&self, f: usize) -> u64 {
+        (self.inuse.fold(f) as i64).max(0) as u64
     }
 
     /// Linux icmp_out_count

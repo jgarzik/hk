@@ -21,6 +21,7 @@
 //! while queueing. No lock is held across a sleep or a transmit.
 
 use crate::mm::page_alloc::Gfp;
+use crate::net::mib::INUSE_UDP;
 use crate::util::kalloc::try_arc_cyclic;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -112,6 +113,8 @@ impl UdpSock {
         };
         let p = self.sk.net.udp.insert(&me, &info, port, flow)?;
         self.hashed.store(true, Ordering::Release);
+        // Linux udp_lib_get_port
+        self.sk.net.mib.inuse_add(INUSE_UDP, true);
         Ok(p)
     }
 
@@ -138,6 +141,8 @@ impl UdpSock {
         if self.hashed.swap(false, Ordering::AcqRel) {
             let port = self.inet.get().sport;
             self.sk.net.udp.remove(self, port);
+            // Linux udp_lib_unhash
+            self.sk.net.mib.inuse_add(INUSE_UDP, false);
         }
     }
 
