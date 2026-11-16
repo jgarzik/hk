@@ -502,8 +502,7 @@ hub6, where Linux moves the port (uart_change_port).
 - **Hangup gaps:** no carrier (DCD) loss hangs a tty up (no modem
   control). No boot test unbinds the console UART (the test output
   goes there).
-- **Missing:** TIOCSTI, TIOCEXCL exclusivity, sending a break
-  (TCSBRK 0), packet mode,
+- **Missing:** TIOCSTI, sending a break (TCSBRK 0), packet mode,
   ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT, IUCLC/OLCUC, IMAXBEL,
   PARMRK and parity/break input handling, CRTSCTS (no modem
   control: IXOFF throttles by STOP/START only).

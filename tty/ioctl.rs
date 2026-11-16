@@ -56,6 +56,8 @@ const TCION: u64 = 3;
 pub const TIOCEXCL: u32 = 0x540C;
 /// Clear exclusive mode
 pub const TIOCNXCL: u32 = 0x540D;
+/// Get exclusive mode (_IOR('T', 0x40, int))
+pub const TIOCGEXCL: u32 = 0x8004_5440;
 /// Set controlling terminal
 pub const TIOCSCTTY: u32 = 0x540E;
 /// Get foreground process group
@@ -143,6 +145,7 @@ fn tty_own(cmd: u32) -> bool {
             | TIOCSWINSZ
             | TIOCEXCL
             | TIOCNXCL
+            | TIOCGEXCL
             | TIOCGETD
             | TIOCSETD
             | TIOCSBRK
@@ -273,7 +276,11 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
             Ok(0)
         }
         TIOCSBRK | TIOCCBRK => hw(tty).map(|()| 0),
-        TIOCEXCL | TIOCNXCL => Ok(0),
+        TIOCEXCL | TIOCNXCL => {
+            tty.set_exclusive(cmd == TIOCEXCL);
+            Ok(0)
+        }
+        TIOCGEXCL => put(arg, i32::from(tty.exclusive())),
         // No modem control: the lines read as asserted, sets are ignored
         TIOCMGET => {
             hw(tty)?;

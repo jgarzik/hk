@@ -1,5 +1,6 @@
-//! TTY mode ioctl tests (termios2, termio), on the console: hk has no
-//! ptys yet, and the serial console behaves alike on hk and Linux. Every test puts the console's settings back
+//! TTY mode ioctl tests (termios2, termio, exclusive mode), on the
+//! console: hk has no ptys yet, and the serial console behaves alike
+//! on hk and Linux. Every test puts the console's settings back
 //!
 //! Tests:
 //! - TTY_TERMIOS2: TCGETS2's struct termios2 starts with TCGETS's
@@ -12,9 +13,18 @@
 //!   the line discipline and the first 8 control characters, its tail
 //!   padding zero; TCSETAW replaces those and keeps the flags' high
 //!   halves (Linux user_termio_to_kernel_termios)
+//! - TTY_EXCL: TIOCEXCL sets exclusive mode (TIOCGEXCL reads 1): an
+//!   open by a process without CAP_SYS_ADMIN is EBUSY, one with it
+//!   works (Linux tty_reopen); TIOCNXCL clears it (TIOCGEXCL 0) and the
+//!   open works again. CAP_SYS_ADMIN is dropped by capset, the uid kept:
+//!   /dev/console is 0600 root on Linux, so another uid's open would be
+//!   EACCES before the tty sees it
 
 use crate::harness::{R, check, report_r};
-use hk_syscall::{O_RDWR, sys_close, sys_ioctl, sys_open};
+use hk_syscall::{
+    CapUserData, CapUserHeader, O_RDWR, sys_capget, sys_capset, sys_close, sys_exit, sys_fork,
+    sys_ioctl, sys_open, sys_wait4,
+};
 
 const O_NOCTTY: u32 = 0o400;
 const TCGETS: u64 = 0x5401;
@@ -23,6 +33,11 @@ const TCGETA: u64 = 0x5405;
 const TCSETAW: u64 = 0x5407;
 const TCGETS2: u64 = 0x802C_542A;
 const TCSETS2: u64 = 0x402C_542B;
+const TIOCEXCL: u64 = 0x540C;
+const TIOCNXCL: u64 = 0x540D;
+const TIOCGEXCL: u64 = 0x8004_5440;
+const EBUSY: i64 = -16;
+const CAP_SYS_ADMIN: u32 = 21;
 
 /// struct termios, termios2 and termio sizes; offsets in them
 const T_SIZE: usize = 36;
@@ -47,6 +62,7 @@ const IBSHIFT: u32 = 16;
 pub fn run_tests() {
     test_termios2();
     test_termio();
+    test_excl();
 }
 
 fn u32_at(b: &[u8], off: usize) -> u32 {
@@ -204,4 +220,85 @@ fn termio_steps(fd: i32, orig: &[u8; T_SIZE]) -> R {
         i64::from(got[C_CC + VSWTC]),
     )?;
     Ok(())
+}
+
+/// Drop CAP_SYS_ADMIN from the effective set; 0 if done
+fn drop_sys_admin() -> i32 {
+    let mut h = CapUserHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let mut d = [CapUserData::default(); 2];
+    if sys_capget(&mut h, d.as_mut_ptr()) != 0 {
+        return 1;
+    }
+    d[0].effective &= !(1 << CAP_SYS_ADMIN);
+    if sys_capset(&h, d.as_ptr()) != 0 {
+        return 2;
+    }
+    0
+}
+
+/// In a child without CAP_SYS_ADMIN: the open's result (0 for a file)
+/// as exit code 0 (opened), 1 (EBUSY), else 2+
+fn open_unprivileged() -> i64 {
+    let pid = sys_fork();
+    if pid == 0 {
+        if drop_sys_admin() != 0 {
+            sys_exit(3);
+        }
+        let fd = open_console();
+        let code = match i64::from(fd) {
+            EBUSY => 1,
+            f if f >= 0 => 0,
+            _ => 2,
+        };
+        sys_exit(code)
+    }
+    if pid < 0 {
+        return -1;
+    }
+    let mut st = 0i32;
+    if sys_wait4(pid, &mut st, 0, 0) != pid || st & 0x7f != 0 {
+        return -1;
+    }
+    i64::from((st >> 8) & 0xff)
+}
+
+fn gexcl(fd: i32) -> i64 {
+    let mut v = -1i32;
+    let r = sys_ioctl(fd, TIOCGEXCL, (&raw mut v) as u64);
+    if r < 0 { r } else { i64::from(v) }
+}
+
+fn test_excl() {
+    const NAME: &[u8] = b"TTY_EXCL";
+    let fd = open_console();
+    if fd < 0 {
+        return report_r(NAME, Err((b"open", i64::from(fd))));
+    }
+    let r = excl_steps(fd);
+    sys_ioctl(fd, TIOCNXCL, 0);
+    sys_close(fd as u64);
+    report_r(NAME, r);
+}
+
+fn excl_steps(fd: i32) -> R {
+    let g = gexcl(fd);
+    check(b"initial", g == 0, g)?;
+    let s = sys_ioctl(fd, TIOCEXCL, 0);
+    check(b"tiocexcl", s == 0, s)?;
+    let g = gexcl(fd);
+    check(b"set", g == 1, g)?;
+    let c = open_unprivileged();
+    check(b"unprivileged ebusy", c == 1, c)?;
+    let fd2 = open_console();
+    check(b"admin open", fd2 >= 0, i64::from(fd2))?;
+    sys_close(fd2 as u64);
+    let s = sys_ioctl(fd, TIOCNXCL, 0);
+    check(b"tiocnxcl", s == 0, s)?;
+    let g = gexcl(fd);
+    check(b"cleared", g == 0, g)?;
+    let c = open_unprivileged();
+    check(b"unprivileged open", c == 0, c)
 }

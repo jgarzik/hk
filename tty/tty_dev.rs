@@ -10,7 +10,7 @@ use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::PollTable;
 use crate::util::error::KernelError;
 
-use super::{Redirect, jobctrl};
+use super::{Redirect, Via, jobctrl};
 
 /// /dev/tty character device
 pub struct TtyCharDevice;
@@ -27,7 +27,7 @@ impl CharDevice for TtyCharDevice {
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let tty = jobctrl::current_tty().ok_or(KernelError::NoDeviceOrAddress)?;
-        Redirect::open(file, tty, false, false)
+        Redirect::open(file, tty, Via::Current)
     }
 
     fn release(&self, file: &File) {

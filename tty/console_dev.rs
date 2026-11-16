@@ -12,7 +12,7 @@ use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::PollTable;
 use crate::util::error::KernelError;
 
-use super::Redirect;
+use super::{Redirect, Via};
 
 /// /dev/console character device
 pub struct ConsoleCharDevice;
@@ -29,7 +29,7 @@ impl CharDevice for ConsoleCharDevice {
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let tty = console_tty().ok_or(KernelError::NoDevice)?;
-        Redirect::open(file, tty, false, true)
+        Redirect::open(file, tty, Via::Console)
     }
 
     fn release(&self, file: &File) {
