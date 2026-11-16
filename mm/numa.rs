@@ -246,6 +246,16 @@ impl NumaTopology {
         self.node_online_mask
     }
 
+    /// The node whose memory holds page frame `pfn` (Linux
+    /// page_to_nid); node 0 if none claims it
+    pub fn pfn_to_node(&self, pfn: u64) -> u32 {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|n| (n.start_pfn..n.end_pfn).contains(&pfn))
+            .map_or(0, |n| n.node_id)
+    }
+
     /// Assign a CPU to a specific node
     pub fn assign_cpu_to_node(&mut self, cpu: u32, node: u32) {
         if (cpu as usize) < NR_CPUS && (node as usize) < MAX_NUMA_NODES {

@@ -1536,6 +1536,15 @@ impl TaskLock<'_> {
         unsafe { self.task.nsproxy.replace(ns) }
     }
 
+    /// Install a memory policy (Linux do_set_mempolicy)
+    ///
+    /// Panics as [`TaskLock::set_mm`]
+    pub fn set_mempolicy(&mut self, p: crate::mm::mempolicy::TaskMempolicy) {
+        self.owner_check();
+        // SAFETY: as above
+        unsafe { self.task.mempolicy.replace(p) };
+    }
+
     /// Rename the task (Linux __set_task_comm)
     ///
     /// Panics as [`TaskLock::set_mm`]

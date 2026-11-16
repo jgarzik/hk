@@ -176,10 +176,9 @@ Topology is discovered (ACPI SRAT/SLIT, DT `numa-node-id`) and
 getcpu reports it; nothing else uses it. Missing (Linux
 `mm/mempolicy.c`, `mm/migrate.c`):
 
-- Policies are not stored: set_mempolicy and mbind validate and
-  return 0 (the `TaskMempolicy`/`Vma.mempolicy` fields stay default);
-  get_mempolicy always reports MPOL_LOCAL (Linux: the stored mode,
-  MPOL_DEFAULT when none) and ignores MPOL_F_NODE/MPOL_F_ADDR.
+- mbind does not store its policy: it validates and returns 0
+  (`Vma.mempolicy` stays None, so get_mempolicy MPOL_F_ADDR always
+  reports MPOL_DEFAULT).
 - One buddy zone for all RAM: no per-node zones (pg_data_t) or
   node-aware allocation, so no policy (BIND, PREFERRED, INTERLEAVE,
   local) affects where pages come from.

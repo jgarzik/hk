@@ -261,10 +261,9 @@ pub struct Vma {
     /// anonymous VMA): `start / 4KB` when created, kept by mremap,
     /// advanced by a split, lowered when a stack grows down
     pub pgoff: u64,
-    /// Per-VMA NUMA memory policy (set by mbind)
-    ///
-    /// If None, the task's default mempolicy is used.
-    pub mempolicy: Option<crate::mm::mempolicy::TaskMempolicy>,
+    /// NUMA memory policy (Linux vm_policy, set by mbind); None: the
+    /// task's
+    pub mempolicy: Option<crate::mm::mempolicy::Mempolicy>,
     /// The SysV shm attachment this VMA is (counted in shm_nattch)
     pub shm: Option<crate::ipc::shm::ShmAttach>,
 }

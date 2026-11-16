@@ -1,9 +1,16 @@
-//! NUMA Memory Policy Syscalls
+//! NUMA Memory Policy Syscalls (Linux mm/mempolicy.c)
 //!
 //! Implements get_mempolicy, set_mempolicy, mbind, migrate_pages, and move_pages.
 //! Uses the NUMA topology discovered from ACPI SRAT (x86-64) or device tree (aarch64).
+//!
+//! A task's policy lives in its `mempolicy` field (Linux task->mempolicy,
+//! under task_lock), copied by fork. Nodemasks are one `u64`:
+//! [`MAX_NUMNODES`] is 64 (Linux CONFIG_NODES_SHIFT=6), and every node
+//! that is online has memory and is allowed (no cpusets: Linux
+//! cpuset_current_mems_allowed = node_states[N_MEMORY]).
 
-use crate::mm::numa::NUMA_TOPOLOGY;
+use crate::mm::PAGE_SIZE;
+use crate::mm::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY};
 use crate::uaccess::{UserPtr, access_ok, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 
@@ -11,35 +18,45 @@ use crate::util::error::{KernelError, KernelResult};
 // Policy modes (MPOL_*)
 // ============================================================================
 
-/// Default policy: allocate on local node
-pub const MPOL_DEFAULT: i32 = 0;
+/// Default policy: the task's, else allocate on the local node
+pub const MPOL_DEFAULT: u16 = 0;
 /// Prefer a specific node, fallback to others
-pub const MPOL_PREFERRED: i32 = 1;
+pub const MPOL_PREFERRED: u16 = 1;
 /// Restrict allocation to specific nodes only
-pub const MPOL_BIND: i32 = 2;
+pub const MPOL_BIND: u16 = 2;
 /// Round-robin allocation across nodes
-pub const MPOL_INTERLEAVE: i32 = 3;
+pub const MPOL_INTERLEAVE: u16 = 3;
 /// Allocate on local CPU's node
-pub const MPOL_LOCAL: i32 = 4;
+pub const MPOL_LOCAL: u16 = 4;
 /// Prefer a set of nodes (newer variant)
-pub const MPOL_PREFERRED_MANY: i32 = 5;
+pub const MPOL_PREFERRED_MANY: u16 = 5;
+/// Round-robin by node weight (Linux 6.9)
+pub const MPOL_WEIGHTED_INTERLEAVE: u16 = 6;
 /// Maximum policy value (for validation)
-pub const MPOL_MAX: i32 = 6;
+pub const MPOL_MAX: u16 = 7;
 
 // ============================================================================
 // Mode flags (combined with policy mode)
 // ============================================================================
 
 /// Use static node set (don't remap on cpuset changes)
-pub const MPOL_F_STATIC_NODES: u64 = 1 << 15;
+pub const MPOL_F_STATIC_NODES: u16 = 1 << 15;
 /// Use relative node set
-pub const MPOL_F_RELATIVE_NODES: u64 = 1 << 14;
+pub const MPOL_F_RELATIVE_NODES: u16 = 1 << 14;
 /// Enable NUMA balancing optimization
-pub const MPOL_F_NUMA_BALANCING: u64 = 1 << 13;
+pub const MPOL_F_NUMA_BALANCING: u16 = 1 << 13;
 
 /// Mask for mode flags
-pub const MPOL_MODE_FLAGS: u64 =
+pub const MPOL_MODE_FLAGS: u16 =
     MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES | MPOL_F_NUMA_BALANCING;
+
+/// The flags that keep the caller's nodemask
+const MPOL_USER_NODEMASK_FLAGS: u16 = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
+
+/// Internal: migrate on fault (Linux MPOL_F_MOF)
+const MPOL_F_MOF: u16 = 1 << 3;
+/// Internal: migrate on protnone reference on node (Linux MPOL_F_MORON)
+const MPOL_F_MORON: u16 = 1 << 4;
 
 // ============================================================================
 // get_mempolicy flags
@@ -68,185 +85,425 @@ pub const MPOL_MF_LAZY: u32 = 1 << 3;
 /// Valid mbind flags mask
 pub const MPOL_MF_VALID: u32 = MPOL_MF_STRICT | MPOL_MF_MOVE | MPOL_MF_MOVE_ALL;
 
+/// Nodes a nodemask holds (Linux MAX_NUMNODES)
+pub const MAX_NUMNODES: u64 = MAX_NUMA_NODES as u64;
+
 // ============================================================================
-// Per-task NUMA memory policy
+// Policies
 // ============================================================================
 
-/// Per-task NUMA memory policy
-///
-/// Stores the memory policy set via set_mempolicy() for this task.
-/// Inherited by child tasks on fork.
+/// A memory policy (Linux struct mempolicy); MPOL_DEFAULT is the absence
+/// of one (`None`)
+#[derive(Clone, Copy, Debug)]
+pub struct Mempolicy {
+    /// MPOL_PREFERRED .. MPOL_WEIGHTED_INTERLEAVE, never MPOL_DEFAULT
+    pub mode: u16,
+    /// Mode flags (MPOL_F_*), with the internal MPOL_F_MOF/MORON
+    pub flags: u16,
+    /// The nodes it uses (MPOL_PREFERRED: one; MPOL_LOCAL: none)
+    pub nodes: u64,
+    /// The caller's nodemask, kept for MPOL_F_STATIC_NODES and
+    /// MPOL_F_RELATIVE_NODES (Linux w.user_nodemask); else 0
+    pub user_nodes: u64,
+}
+
+impl Mempolicy {
+    /// It keeps the caller's nodemask (Linux mpol_store_user_nodemask)
+    fn store_user(&self) -> bool {
+        self.flags & MPOL_USER_NODEMASK_FLAGS != 0
+    }
+
+    /// The nodemask get_mempolicy reports (Linux do_get_mempolicy,
+    /// get_policy_nodemask)
+    pub fn query_nodes(&self) -> u64 {
+        if self.store_user() {
+            self.user_nodes
+        } else if self.mode == MPOL_LOCAL {
+            0
+        } else {
+            self.nodes
+        }
+    }
+
+    /// Same policy (Linux __mpol_equal; hk keeps no home node)
+    fn same(&self, b: &Mempolicy) -> bool {
+        self.mode == b.mode
+            && self.flags == b.flags
+            && (!self.store_user() || self.user_nodes == b.user_nodes)
+            && (self.mode == MPOL_LOCAL || self.nodes == b.nodes)
+    }
+}
+
+/// Two optional policies are the same (Linux mpol_equal)
+pub fn mpol_equal(a: Option<&Mempolicy>, b: Option<&Mempolicy>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.same(b),
+        _ => false,
+    }
+}
+
+/// A task's memory policy state (Linux task->mempolicy, il_prev): an
+/// `alloc_lock` field, copied by fork
 #[derive(Clone, Copy, Debug)]
 pub struct TaskMempolicy {
-    /// Policy mode (MPOL_DEFAULT, MPOL_BIND, etc.)
-    pub mode: i32,
-    /// Bitmask of allowed NUMA nodes
-    pub nodemask: u64,
-    /// Mode flags (MPOL_F_STATIC_NODES, etc.)
-    pub flags: u32,
-    /// Preferred node for MPOL_PREFERRED (-1 = none)
-    pub preferred_node: i32,
+    /// set_mempolicy's policy; None: MPOL_DEFAULT
+    pub pol: Option<Mempolicy>,
+    /// Last node interleaved on (Linux il_prev)
+    pub il_prev: u32,
 }
 
 impl TaskMempolicy {
-    /// Create a new default memory policy (MPOL_DEFAULT)
+    /// MPOL_DEFAULT
     pub const fn new() -> Self {
         Self {
-            mode: MPOL_DEFAULT,
-            nodemask: 0,
-            flags: 0,
-            preferred_node: -1,
+            pol: None,
+            il_prev: 0,
         }
     }
+}
 
-    /// Create a LOCAL policy (allocate on current CPU's node)
-    pub const fn local() -> Self {
-        Self {
-            mode: MPOL_LOCAL,
-            nodemask: 0,
-            flags: 0,
-            preferred_node: -1,
+// ============================================================================
+// Nodemask helpers (pure: unit-tested)
+// ============================================================================
+
+/// Bits of `orig` folded modulo `sz` (Linux bitmap_fold)
+fn nodes_fold(orig: u64, sz: u32) -> u64 {
+    if sz == 0 {
+        return 0;
+    }
+    (0..64)
+        .filter(|n| orig & (1u64 << n) != 0)
+        .fold(0, |m, n| m | 1u64 << (n % sz))
+}
+
+/// Bit n of `orig` set as the n-th set bit of `rel` (Linux bitmap_onto)
+fn nodes_onto(orig: u64, rel: u64) -> u64 {
+    let mut out = 0;
+    let mut r = rel;
+    let mut n = 0;
+    while r != 0 {
+        let bit = r.trailing_zeros();
+        if orig & (1u64 << n) != 0 {
+            out |= 1u64 << bit;
+        }
+        r &= r - 1;
+        n += 1;
+    }
+    out
+}
+
+/// `orig` relative to `rel` (Linux mpol_relative_nodemask)
+fn mpol_relative_nodemask(orig: u64, rel: u64) -> u64 {
+    nodes_onto(nodes_fold(orig, rel.count_ones()), rel)
+}
+
+/// The first set node after `node`, wrapping (Linux next_node_in);
+/// MAX_NUMNODES if `mask` is empty
+fn next_node_in(node: u32, mask: u64) -> u32 {
+    let after = if node >= 63 {
+        0
+    } else {
+        mask & !((2u64 << node) - 1)
+    };
+    if after != 0 {
+        after.trailing_zeros()
+    } else if mask != 0 {
+        mask.trailing_zeros()
+    } else {
+        MAX_NUMNODES as u32
+    }
+}
+
+/// Mode and flags of set_mempolicy's or mbind's `mode` (Linux
+/// sanitize_mpol_flags); MPOL_F_NUMA_BALANCING only for MPOL_BIND and
+/// MPOL_PREFERRED_MANY (Linux 6.10)
+fn sanitize_mpol_flags(mode: i32) -> KernelResult<(u16, u16)> {
+    let mut flags = (mode as u32 & u32::from(MPOL_MODE_FLAGS)) as u16;
+    let mode = mode as u32 & !u32::from(MPOL_MODE_FLAGS);
+    if mode >= u32::from(MPOL_MAX) {
+        return Err(KernelError::InvalidArgument);
+    }
+    let mode = mode as u16;
+    if flags & MPOL_F_STATIC_NODES != 0 && flags & MPOL_F_RELATIVE_NODES != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    if flags & MPOL_F_NUMA_BALANCING != 0 {
+        if mode != MPOL_BIND && mode != MPOL_PREFERRED_MANY {
+            return Err(KernelError::InvalidArgument);
+        }
+        flags |= MPOL_F_MOF | MPOL_F_MORON;
+    }
+    Ok((mode, flags))
+}
+
+/// A node mask of `maxnode` - 1 bits from user space, word `i` read by
+/// `word(i)` (Linux get_nodes; `null`: no mask). Bits past
+/// MAX_NUMNODES must be zero, checked a word at a time from the top
+/// (whole words: Linux get_bitmap masks by the count, not the word's
+/// place); more than a page of bits is EINVAL.
+fn get_nodes_with(
+    null: bool,
+    maxnode: u64,
+    mut word: impl FnMut(u64) -> KernelResult<u64>,
+) -> KernelResult<u64> {
+    let mut maxnode = maxnode.wrapping_sub(1);
+    if maxnode == 0 || null {
+        return Ok(0);
+    }
+    if maxnode > PAGE_SIZE * 8 {
+        return Err(KernelError::InvalidArgument);
+    }
+    while maxnode > MAX_NUMNODES {
+        let bits = maxnode.min(64);
+        let mut t = bitmap_word(word((maxnode - 1) / 64)?, bits);
+        if maxnode - bits >= MAX_NUMNODES {
+            maxnode -= bits;
+        } else {
+            maxnode = MAX_NUMNODES;
+            t &= !((1u64 << (MAX_NUMNODES % 64)) - 1);
+        }
+        if t != 0 {
+            return Err(KernelError::InvalidArgument);
         }
     }
+    Ok(bitmap_word(word(0)?, maxnode))
+}
 
-    /// Check if this is the default policy
-    pub fn is_default(&self) -> bool {
-        self.mode == MPOL_DEFAULT || self.mode == MPOL_LOCAL
+/// The low `bits` bits of `w` (Linux get_bitmap of one word)
+fn bitmap_word(w: u64, bits: u64) -> u64 {
+    if !bits.is_multiple_of(64) {
+        w & ((1u64 << (bits % 64)) - 1)
+    } else {
+        w
     }
+}
+
+/// `get_nodes_with` from the user mask `nmask`: EFAULT if unreadable
+fn get_nodes(nmask: UserPtr<u64>, maxnode: u64) -> KernelResult<u64> {
+    get_nodes_with(nmask.is_null(), maxnode, |i| Ok(nth(nmask, i)?.read()?))
+}
+
+/// (bytes to copy, bytes to clear after them) of a node mask for a
+/// `maxnode`-bit user buffer (Linux copy_nodes_to_user: whole words up
+/// to bit maxnode - 1; past the `nr_node_ids` bits the kernel has, the
+/// rest is zeroed, at most a page). The caller checked maxnode >=
+/// nr_node_ids >= 1.
+fn copy_nodes_len(maxnode: u64, nr_node_ids: u64) -> KernelResult<(u64, u64)> {
+    let copy = (maxnode.wrapping_sub(1).wrapping_add(63) & !63) / 8;
+    let nbytes = nr_node_ids.div_ceil(64) * 8;
+    if copy <= nbytes {
+        return Ok((copy, 0));
+    }
+    if copy > PAGE_SIZE {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok((nbytes, copy - nbytes))
+}
+
+/// Zeros for clearing user memory (at most a page)
+static ZEROS: [u8; PAGE_SIZE as usize] = [0; PAGE_SIZE as usize];
+
+/// Copy `nodes` to the user mask `mask` of `maxnode` bits (Linux
+/// copy_nodes_to_user)
+fn copy_nodes_to_user(
+    mask: UserPtr<u64>,
+    maxnode: u64,
+    nodes: u64,
+    nr_node_ids: u64,
+) -> KernelResult<()> {
+    let (copy, clear) = copy_nodes_len(maxnode, nr_node_ids)?;
+    if clear > 0 {
+        copy_to_user(mask.addr().wrapping_add(copy), &ZEROS[..clear as usize])?;
+    }
+    copy_to_user(mask.addr(), &nodes.to_ne_bytes()[..copy as usize])?;
+    Ok(())
+}
+
+/// A new policy, its nodes not yet set (Linux mpol_new): None for
+/// MPOL_DEFAULT (EINVAL with nodes); MPOL_PREFERRED without nodes is
+/// MPOL_LOCAL (EINVAL with MPOL_F_STATIC_NODES or
+/// MPOL_F_RELATIVE_NODES, as is MPOL_LOCAL with nodes or those flags);
+/// every other mode needs nodes
+fn mpol_new(mode: u16, flags: u16, nodes: u64) -> KernelResult<Option<Mempolicy>> {
+    if mode == MPOL_DEFAULT {
+        if nodes != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        return Ok(None);
+    }
+    let user = flags & MPOL_USER_NODEMASK_FLAGS != 0;
+    let mode = match mode {
+        MPOL_PREFERRED if nodes == 0 && user => return Err(KernelError::InvalidArgument),
+        MPOL_PREFERRED if nodes == 0 => MPOL_LOCAL,
+        MPOL_LOCAL if nodes != 0 || user => return Err(KernelError::InvalidArgument),
+        MPOL_LOCAL | MPOL_PREFERRED => mode,
+        _ if nodes == 0 => return Err(KernelError::InvalidArgument),
+        _ => mode,
+    };
+    Ok(Some(Mempolicy {
+        mode,
+        flags,
+        nodes: 0,
+        user_nodes: 0,
+    }))
+}
+
+/// Set `pol`'s nodes from the caller's `nodes` and the nodes it may use,
+/// `allowed` (Linux mpol_set_nodemask and the mode's create): relative
+/// to them with MPOL_F_RELATIVE_NODES, else those of them it names;
+/// EINVAL if none is left; MPOL_PREFERRED keeps the first
+fn mpol_set_nodemask(mut pol: Mempolicy, nodes: u64, allowed: u64) -> KernelResult<Mempolicy> {
+    if pol.mode == MPOL_LOCAL {
+        return Ok(pol);
+    }
+    let usable = if pol.flags & MPOL_F_RELATIVE_NODES != 0 {
+        mpol_relative_nodemask(nodes, allowed)
+    } else {
+        nodes & allowed
+    };
+    if pol.store_user() {
+        pol.user_nodes = nodes;
+    }
+    if usable == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    pol.nodes = if pol.mode == MPOL_PREFERRED {
+        usable.isolate_lowest_one()
+    } else {
+        usable
+    };
+    Ok(pol)
+}
+
+/// The nodes a policy may use: those with memory (Linux
+/// node_states[N_MEMORY]; with no cpusets also
+/// cpuset_current_mems_allowed)
+fn mems_allowed() -> u64 {
+    NUMA_TOPOLOGY.lock().online_mask()
+}
+
+/// One past the highest possible node (Linux nr_node_ids)
+fn nr_node_ids(allowed: u64) -> u64 {
+    (64 - u64::from(allowed.leading_zeros())).max(1)
 }
 
 // ============================================================================
 // Syscall implementations
 // ============================================================================
 
-/// sys_get_mempolicy - Get memory policy for process or VMA
-///
-/// # Arguments
-/// * `policy_ptr` - Output pointer for policy mode (can be NULL)
-/// * `nmask_ptr` - Output pointer for node mask (can be NULL)
-/// * `maxnode` - Size of node mask in bits
-/// * `addr` - Address for MPOL_F_ADDR lookup (ignored otherwise)
-/// * `flags` - MPOL_F_NODE, MPOL_F_ADDR, MPOL_F_MEMS_ALLOWED
-///
-/// # Returns
-/// 0 on success, negative errno on error
+/// sys_get_mempolicy - Get memory policy for process or VMA (Linux
+/// kernel_get_mempolicy): a `nmask` of fewer than nr_node_ids bits is
+/// EINVAL; the policy (`do_get_mempolicy`), then the mask
 pub fn sys_get_mempolicy(
-    policy_ptr: UserPtr<i32>,
-    nmask_ptr: UserPtr<u64>,
+    policy: UserPtr<i32>,
+    nmask: UserPtr<u64>,
     maxnode: u64,
-    _addr: u64,
+    addr: u64,
     flags: u64,
 ) -> KernelResult<()> {
-    // Validate flags
-    let valid_flags = MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED;
-    if flags & !valid_flags != 0 {
+    let allowed = mems_allowed();
+    let nr = nr_node_ids(allowed);
+    if !nmask.is_null() && maxnode < nr {
         return Err(KernelError::InvalidArgument);
     }
-
-    // MPOL_F_NODE and MPOL_F_ADDR are mutually exclusive when no policy is set
-    if flags & MPOL_F_NODE != 0 && flags & MPOL_F_ADDR != 0 {
-        // This combination is allowed but has special semantics
+    let (pval, nodes) = do_get_mempolicy(addr, flags, allowed)?;
+    if !policy.is_null() {
+        policy.write(&pval)?;
     }
-
-    // Return policy if requested
-    if !policy_ptr.is_null() {
-        // Default policy is MPOL_LOCAL (allocate on local node)
-        let policy = if flags & MPOL_F_MEMS_ALLOWED != 0 {
-            // Special case: return 0 for MEMS_ALLOWED query
-            0i32
-        } else {
-            MPOL_LOCAL
-        };
-
-        policy_ptr.write(&policy)?;
+    if !nmask.is_null() {
+        copy_nodes_to_user(nmask, maxnode, nodes, nr)?;
     }
-
-    // Return node mask if requested
-    if !nmask_ptr.is_null() && maxnode > 0 {
-        // The copy is sized by the user: bound it (no huge allocation)
-        if maxnode > MAX_MASK_BITS + 1 {
-            return Err(KernelError::InvalidArgument);
-        }
-        // Calculate mask size in bytes (rounded up to unsigned long boundary)
-        let mask_bytes = maxnode.div_ceil(64) * 8;
-
-        // Get the online node mask from real topology
-        let online_mask = NUMA_TOPOLOGY.lock().online_mask();
-
-        // First word holds the online nodes; remaining words are zero
-        // (we only support up to 64 nodes)
-        let mut words = alloc::vec![0u64; (mask_bytes / 8) as usize];
-        words[0] = online_mask;
-        let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        copy_to_user(nmask_ptr.addr(), &bytes)?;
-    }
-
     Ok(())
 }
 
-/// sys_set_mempolicy - Set memory policy for process
-///
-/// # Arguments
-/// * `mode` - Policy mode (MPOL_DEFAULT, MPOL_BIND, etc.) with optional flags
-/// * `nmask_ptr` - User pointer to node mask
-/// * `maxnode` - Size of node mask in bits
-///
-/// # Returns
-/// 0 on success, negative errno on error
-///
-/// Validates nodemask against real online NUMA nodes; the policy is
-/// not stored yet (BUGS.md).
-pub fn sys_set_mempolicy(mode: i32, nmask_ptr: UserPtr<u64>, maxnode: u64) -> KernelResult<()> {
-    // Extract mode and flags
-    let policy_mode = mode & 0x7fff; // Lower 15 bits are mode
-    let mode_flags = (mode as u64) & MPOL_MODE_FLAGS;
-
-    // Validate policy mode
-    if !(0..MPOL_MAX).contains(&policy_mode) {
+/// The policy value and nodemask get_mempolicy reports (Linux
+/// do_get_mempolicy): MPOL_F_MEMS_ALLOWED alone gives 0 and the allowed
+/// nodes; MPOL_F_ADDR the policy of the VMA at `addr` (EFAULT if none;
+/// MPOL_DEFAULT if it has none, never the task's), else `addr` must be
+/// 0; MPOL_F_NODE the node of the page at `addr` with MPOL_F_ADDR, else
+/// the task's next interleave node (EINVAL for any other policy);
+/// otherwise the mode with its mode flags
+fn do_get_mempolicy(addr: u64, flags: u64, allowed: u64) -> KernelResult<(i32, u64)> {
+    if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 {
         return Err(KernelError::InvalidArgument);
     }
-
-    // MPOL_DEFAULT doesn't use nodemask
-    if policy_mode == MPOL_DEFAULT {
-        return Ok(());
+    if flags & MPOL_F_MEMS_ALLOWED != 0 {
+        if flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        return Ok((0, allowed));
     }
-
-    // MPOL_LOCAL doesn't use nodemask
-    if policy_mode == MPOL_LOCAL {
-        return Ok(());
-    }
-
-    // Other policies require a node mask
-    if nmask_ptr.is_null() || maxnode == 0 {
+    let me = crate::task::percpu::current();
+    let task = me.task_lock().mempolicy();
+    let pol = if flags & MPOL_F_ADDR != 0 {
+        vma_policy(addr)?
+    } else if addr != 0 {
         return Err(KernelError::InvalidArgument);
+    } else {
+        task.pol
+    };
+    let nodes = pol.map_or(0, |p| p.query_nodes());
+    if flags & MPOL_F_NODE == 0 {
+        let pval = pol.map_or(MPOL_DEFAULT, |p| p.mode | (p.flags & MPOL_MODE_FLAGS));
+        return Ok((i32::from(pval), nodes));
     }
-
-    let nodemask = nmask_ptr.read()?;
-
-    // Empty mask is invalid for most policies
-    if nodemask == 0 {
-        return Err(KernelError::InvalidArgument);
+    if flags & MPOL_F_ADDR != 0 {
+        return Ok((lookup_node(addr)?, nodes));
     }
-
-    // Validate that all specified nodes are online
-    let online_mask = NUMA_TOPOLOGY.lock().online_mask();
-    if nodemask & !online_mask != 0 {
-        // Requested nodes that don't exist
-        return Err(KernelError::InvalidArgument);
+    match pol {
+        Some(p) if p.mode == MPOL_INTERLEAVE || p.mode == MPOL_WEIGHTED_INTERLEAVE => {
+            // hk keeps no interleave weight (Linux il_weight 0)
+            Ok((next_node_in(task.il_prev, p.nodes) as i32, nodes))
+        }
+        _ => Err(KernelError::InvalidArgument),
     }
+}
 
-    // Validate mode flags combinations
-    if mode_flags & MPOL_F_STATIC_NODES != 0 && mode_flags & MPOL_F_RELATIVE_NODES != 0 {
-        // Mutually exclusive flags
-        return Err(KernelError::InvalidArgument);
+/// The policy of the current task's VMA at `addr` (Linux vma_lookup,
+/// __get_vma_policy): EFAULT if no VMA holds it
+fn vma_policy(addr: u64) -> KernelResult<Option<Mempolicy>> {
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::BadAddress)?;
+    let map = mm.mmap_read();
+    Ok(map.find_vma(addr).ok_or(KernelError::BadAddress)?.mempolicy)
+}
+
+/// The node of the page at `addr`, faulted in for reading if missing
+/// (Linux lookup_node: get_user_pages_fast); its error if it cannot be
+fn lookup_node(addr: u64) -> KernelResult<i32> {
+    let mut pages = crate::mm::gup::PinnedPages::new(1)?;
+    crate::mm::gup::pin_user(&mut pages, addr & !(PAGE_SIZE - 1), 1, false, 1)?;
+    let phys = pages.segs().first().ok_or(KernelError::BadAddress)?.phys;
+    Ok(NUMA_TOPOLOGY.lock().pfn_to_node(phys / PAGE_SIZE) as i32)
+}
+
+/// sys_set_mempolicy - Set the calling task's memory policy (Linux
+/// kernel_set_mempolicy): `mode` with its flags checked, the nodemask
+/// read, then installed (`do_set_mempolicy`)
+pub fn sys_set_mempolicy(mode: i32, nmask: UserPtr<u64>, maxnode: u64) -> KernelResult<()> {
+    let (mode, flags) = sanitize_mpol_flags(mode)?;
+    let nodes = get_nodes(nmask, maxnode)?;
+    do_set_mempolicy(mode, flags, nodes)
+}
+
+/// Make the policy and install it as the task's under its alloc_lock
+/// (Linux do_set_mempolicy); a new interleave starts over (il_prev at
+/// the last node)
+fn do_set_mempolicy(mode: u16, flags: u16, nodes: u64) -> KernelResult<()> {
+    let allowed = mems_allowed();
+    let new = mpol_new(mode, flags, nodes)?
+        .map(|p| mpol_set_nodemask(p, nodes, allowed))
+        .transpose()?;
+    let me = crate::task::percpu::current();
+    let mut t = me.task_lock();
+    let mut tp = t.mempolicy();
+    tp.pol = new;
+    if new.is_some_and(|p| p.mode == MPOL_INTERLEAVE || p.mode == MPOL_WEIGHTED_INTERLEAVE) {
+        tp.il_prev = MAX_NUMNODES as u32 - 1;
     }
-
-    // For MPOL_PREFERRED, only one node should be set
-    if policy_mode == MPOL_PREFERRED && nodemask.count_ones() > 1 {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    // Valid, but not stored and not used by the allocator (BUGS.md)
+    t.set_mempolicy(tp);
     Ok(())
 }
 
@@ -273,8 +530,6 @@ pub fn sys_mbind(
     maxnode: u64,
     flags: u32,
 ) -> KernelResult<()> {
-    use super::PAGE_SIZE;
-
     // Validate flags
     if flags & !MPOL_MF_VALID != 0 {
         return Err(KernelError::InvalidArgument);
@@ -291,7 +546,7 @@ pub fn sys_mbind(
     }
 
     // Extract policy mode (lower bits)
-    let policy_mode = (mode & 0x7fff) as i32;
+    let policy_mode = (mode & 0x7fff) as u16;
 
     // Validate policy mode
     if !(0..MPOL_MAX).contains(&policy_mode) {
@@ -535,4 +790,135 @@ fn move_pages_resched(i: u64) -> KernelResult<()> {
 
 /// Largest node mask accepted from/copied to user space: one page of bits
 /// (Linux get_nodes / copy_nodes_to_user)
-const MAX_MASK_BITS: u64 = 4096 * 8;
+const MAX_MASK_BITS: u64 = PAGE_SIZE * 8;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EINVAL: Result<u64, KernelError> = Err(KernelError::InvalidArgument);
+
+    /// get_nodes over the words `w` (missing words: EFAULT)
+    fn nodes(w: &[u64], maxnode: u64) -> KernelResult<u64> {
+        get_nodes_with(false, maxnode, |i| {
+            w.get(i as usize).copied().ok_or(KernelError::BadAddress)
+        })
+    }
+
+    #[test]
+    fn get_nodes_counts() {
+        assert_eq!(get_nodes_with(true, 64, |_| unreachable!()), Ok(0));
+        assert_eq!(nodes(&[], 0), EINVAL);
+        assert_eq!(nodes(&[], 1), Ok(0));
+        assert_eq!(nodes(&[!0], 2), Ok(1));
+        // maxnode counts one past the last bit
+        assert_eq!(nodes(&[!0], 64), Ok(!0 >> 1));
+        assert_eq!(nodes(&[!0], 65), Ok(!0));
+    }
+
+    #[test]
+    fn get_nodes_high_bits() {
+        assert_eq!(nodes(&[1, 0], 128), Ok(1));
+        assert_eq!(nodes(&[1, 1 << 5], 128), EINVAL);
+        // The whole last word is checked, past maxnode too
+        assert_eq!(nodes(&[1, 1 << 60], 101), EINVAL);
+        assert_eq!(nodes(&[1, 1], 66), EINVAL);
+        assert_eq!(nodes(&[1, 0], 66), Ok(1));
+        let page = [0u64; 512];
+        assert_eq!(nodes(&page, PAGE_SIZE * 8 + 1), Ok(0));
+        assert_eq!(nodes(&page, PAGE_SIZE * 8 + 2), EINVAL);
+        assert_eq!(nodes(&[1], 128), Err(KernelError::BadAddress));
+    }
+
+    #[test]
+    fn copy_nodes_lengths() {
+        assert_eq!(copy_nodes_len(1, 1), Ok((0, 0)));
+        assert_eq!(copy_nodes_len(64, 1), Ok((8, 0)));
+        assert_eq!(copy_nodes_len(65, 1), Ok((8, 0)));
+        assert_eq!(copy_nodes_len(66, 1), Ok((8, 8)));
+        assert_eq!(copy_nodes_len(PAGE_SIZE * 8 + 1, 1), Ok((8, PAGE_SIZE - 8)));
+        assert_eq!(
+            copy_nodes_len(PAGE_SIZE * 8 + 2, 1),
+            Err(KernelError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn sanitize() {
+        let s = sanitize_mpol_flags;
+        assert_eq!(s(MPOL_BIND as i32), Ok((MPOL_BIND, 0)));
+        assert!(s(MPOL_MAX as i32).is_err());
+        assert!(s(-1).is_err());
+        assert!(s(1 << 16 | MPOL_BIND as i32).is_err());
+        let both = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
+        assert!(s(i32::from(both) | MPOL_BIND as i32).is_err());
+        let nb = i32::from(MPOL_F_NUMA_BALANCING);
+        assert_eq!(
+            s(nb | MPOL_BIND as i32),
+            Ok((MPOL_BIND, MPOL_F_NUMA_BALANCING | MPOL_F_MOF | MPOL_F_MORON))
+        );
+        assert!(s(nb | MPOL_PREFERRED_MANY as i32).is_ok());
+        assert!(s(nb | MPOL_INTERLEAVE as i32).is_err());
+    }
+
+    #[test]
+    fn new_policies() {
+        let mode = |m, f, n| mpol_new(m, f, n).map(|p| p.map(|p| p.mode));
+        assert_eq!(mode(MPOL_DEFAULT, 0, 0), Ok(None));
+        assert!(mode(MPOL_DEFAULT, 0, 1).is_err());
+        assert_eq!(mode(MPOL_PREFERRED, 0, 0), Ok(Some(MPOL_LOCAL)));
+        assert!(mode(MPOL_PREFERRED, MPOL_F_STATIC_NODES, 0).is_err());
+        assert_eq!(mode(MPOL_LOCAL, 0, 0), Ok(Some(MPOL_LOCAL)));
+        assert!(mode(MPOL_LOCAL, 0, 1).is_err());
+        assert!(mode(MPOL_LOCAL, MPOL_F_RELATIVE_NODES, 0).is_err());
+        assert!(mode(MPOL_BIND, 0, 0).is_err());
+        assert_eq!(mode(MPOL_INTERLEAVE, 0, 3), Ok(Some(MPOL_INTERLEAVE)));
+    }
+
+    /// mpol_new + mpol_set_nodemask: (nodes, user_nodes)
+    fn set(mode: u16, flags: u16, nodes: u64, allowed: u64) -> KernelResult<(u64, u64)> {
+        let p = mpol_new(mode, flags, nodes)?.unwrap();
+        mpol_set_nodemask(p, nodes, allowed).map(|p| (p.nodes, p.user_nodes))
+    }
+
+    #[test]
+    fn set_nodemask() {
+        // Nodes without memory are dropped; none left is EINVAL
+        assert_eq!(set(MPOL_BIND, 0, 0b100001, 1), Ok((1, 0)));
+        assert_eq!(
+            set(MPOL_BIND, 0, 0b10, 1),
+            Err(KernelError::InvalidArgument)
+        );
+        assert_eq!(set(MPOL_PREFERRED, 0, 0b1100, 0b1111), Ok((0b100, 0)));
+        assert_eq!(set(MPOL_BIND, MPOL_F_STATIC_NODES, 0b11, 1), Ok((1, 0b11)));
+        // Relative: node n is the n-th allowed one, folded
+        assert_eq!(
+            set(MPOL_BIND, MPOL_F_RELATIVE_NODES, 0b10, 0b1010),
+            Ok((0b1000, 0b10))
+        );
+        assert_eq!(
+            set(MPOL_BIND, MPOL_F_RELATIVE_NODES, 0b100, 1),
+            Ok((1, 0b100))
+        );
+        assert_eq!(set(MPOL_LOCAL, 0, 0, 1), Ok((0, 0)));
+    }
+
+    #[test]
+    fn interleave_next() {
+        assert_eq!(next_node_in(63, 0b1010), 1);
+        assert_eq!(next_node_in(1, 0b1010), 3);
+        assert_eq!(next_node_in(3, 0b1010), 1);
+        assert_eq!(next_node_in(0, 0), MAX_NUMNODES as u32);
+    }
+
+    #[test]
+    fn equal() {
+        let a = mpol_set_nodemask(mpol_new(MPOL_BIND, 0, 1).unwrap().unwrap(), 1, 1).unwrap();
+        let mut b = a;
+        assert!(mpol_equal(Some(&a), Some(&b)));
+        assert!(!mpol_equal(Some(&a), None));
+        assert!(mpol_equal(None, None));
+        b.nodes = 3;
+        assert!(!mpol_equal(Some(&a), Some(&b)));
+    }
+}

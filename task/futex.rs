@@ -1234,7 +1234,7 @@ fn futex_mpol(uaddr: u64) -> KernelResult<u32> {
     let map = mm.mmap_read();
     let pol = map.find_vma(uaddr).and_then(|v| v.mempolicy);
     Ok(match pol {
-        Some(p) if p.mode == MPOL_PREFERRED && p.nodemask != 0 => p.nodemask.trailing_zeros(),
+        Some(p) if p.mode == MPOL_PREFERRED && p.nodes != 0 => p.nodes.trailing_zeros(),
         _ => FUTEX_NO_NODE,
     })
 }

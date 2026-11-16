@@ -1,13 +1,10 @@
 //! NUMA Memory Policy syscall tests
 //!
 //! Tests for get_mempolicy, set_mempolicy, and mbind syscalls.
-//! These are stub implementations for single-node systems.
-//!
-//! NOTE: Running these tests on aarch64 causes CLONE_CLEAR_SIGHAND to fail
-//! due to a binary layout sensitivity issue. The tests are conditionally
-//! skipped on ARM until this is investigated.
+//! Single-node machines: node 0 is the only one with memory.
 
-use crate::helpers::{print, print_num, println};
+use crate::harness::{R, check, report_r};
+use crate::helpers::{linux_at_least, print, print_num, println};
 #[allow(unused_imports)]
 use hk_syscall::{
     sys_get_mempolicy, sys_mbind, sys_migrate_pages, sys_mmap, sys_move_pages, sys_munmap,
@@ -50,6 +47,14 @@ pub fn run_tests() {
     test_move_pages_node0();
     test_move_pages_invalid_node();
     test_migrate_pages_perm();
+    reset();
+
+    run(b"MPOL_SET_GET", set_get);
+    run(b"MPOL_MAXNODE", maxnode);
+    run(b"MPOL_MODE_FLAGS", mode_flags);
+    run(b"MPOL_GET_FLAGS", get_flags);
+    run(b"MPOL_FORK", fork_inherits);
+    run(b"MPOL_ADDR", addr_policy);
 }
 
 /// Test: Get default memory policy
@@ -60,7 +65,7 @@ fn test_get_mempolicy_default() {
     let mut policy: i32 = -1;
     let ret = sys_get_mempolicy(&mut policy as *mut i32, core::ptr::null_mut(), 0, 0, 0);
 
-    if ret == 0 && (policy == MPOL_DEFAULT || policy == MPOL_LOCAL) {
+    if ret == 0 && policy == MPOL_DEFAULT {
         println(b"PASS");
     } else {
         print(b"FAIL (ret=");
@@ -431,4 +436,272 @@ fn test_migrate_pages_perm() {
         print_num(i64::from(st));
         println(b"");
     }
+}
+
+const EINVAL: i64 = -22;
+const EFAULT: i64 = -14;
+const MPOL_PREFERRED_MANY: i32 = 5;
+const MPOL_WEIGHTED_INTERLEAVE: i32 = 6;
+const MPOL_F_STATIC_NODES: i32 = 1 << 15;
+const MPOL_F_RELATIVE_NODES: i32 = 1 << 14;
+const MPOL_F_NUMA_BALANCING: i32 = 1 << 13;
+const MPOL_F_NODE: u64 = 1;
+const MPOL_F_ADDR: u64 = 2;
+const MPOL_F_MEMS_ALLOWED: u64 = 4;
+const PAGE: u64 = 4096;
+
+/// Run `f` with the task policy reset after it, and report it
+fn run(name: &[u8], f: fn() -> R) {
+    let r = f();
+    reset();
+    report_r(name, r);
+}
+
+/// Back to MPOL_DEFAULT
+fn reset() {
+    sys_set_mempolicy(MPOL_DEFAULT, core::ptr::null(), 0);
+}
+
+/// set_mempolicy with a one-word mask, all 64 bits read
+fn set1(mode: i32, mask: u64) -> i64 {
+    sys_set_mempolicy(mode, &mask, 65)
+}
+
+/// (return, policy, mask) of get_mempolicy with a one-word mask
+fn get1(addr: u64, flags: u64) -> (i64, i32, u64) {
+    let mut p = -1;
+    let mut m = !0u64;
+    let r = sys_get_mempolicy(&mut p, &mut m, 64, addr, flags);
+    (r, p, m)
+}
+
+/// The task policy is `want` with nodes `mask`
+fn is_pol(want: i32, mask: u64) -> R {
+    let (r, p, m) = get1(0, 0);
+    check(b"get_mempolicy", r == 0, r)?;
+    check(b"policy", p == want, i64::from(p))?;
+    check(b"nodes", m == mask, m as i64)
+}
+
+/// MPOL_SET_GET: set_mempolicy stores the policy and get_mempolicy
+/// reports it (Linux do_set_mempolicy, do_get_mempolicy): nodes without
+/// memory are dropped, none left is EINVAL; MPOL_PREFERRED without
+/// nodes is MPOL_LOCAL; MPOL_DEFAULT and MPOL_LOCAL take no nodes; a
+/// refused call keeps the old policy
+fn set_get() -> R {
+    let cases: [(i32, u64, i32, u64); 7] = [
+        (MPOL_BIND, 1, MPOL_BIND, 1),
+        (MPOL_PREFERRED, 1, MPOL_PREFERRED, 1),
+        (MPOL_INTERLEAVE, 1, MPOL_INTERLEAVE, 1),
+        (MPOL_LOCAL, 0, MPOL_LOCAL, 0),
+        (MPOL_PREFERRED, 0, MPOL_LOCAL, 0),
+        (MPOL_BIND, 1 | 1 << 5, MPOL_BIND, 1),
+        (MPOL_DEFAULT, 0, MPOL_DEFAULT, 0),
+    ];
+    for (mode, mask, want, wmask) in cases {
+        let r = set1(mode, mask);
+        check(b"set_mempolicy", r == 0, r)?;
+        is_pol(want, wmask)?;
+    }
+    let r = set1(MPOL_BIND, 1 << 5);
+    check(b"no node with memory", r == EINVAL, r)?;
+    let r = set1(MPOL_DEFAULT, 1);
+    check(b"default with nodes", r == EINVAL, r)?;
+    let r = set1(MPOL_LOCAL, 1);
+    check(b"local with nodes", r == EINVAL, r)?;
+    let r = set1(MPOL_BIND, 0);
+    check(b"bind without nodes", r == EINVAL, r)?;
+    let r = sys_set_mempolicy(MPOL_INTERLEAVE, core::ptr::null(), 64);
+    check(b"interleave null mask", r == EINVAL, r)?;
+    let r = set1(MPOL_PREFERRED, 1);
+    check(b"preferred", r == 0, r)?;
+    let r = set1(MPOL_BIND, 1 << 5);
+    check(b"refused", r == EINVAL, r)?;
+    is_pol(MPOL_PREFERRED, 1)
+}
+
+/// MPOL_MAXNODE: the mask holds maxnode - 1 bits (Linux get_nodes):
+/// maxnode 0 is EINVAL, 1 reads none; bits past the kernel's
+/// MAX_NUMNODES must be zero; more than a page of bits is EINVAL
+fn maxnode() -> R {
+    let one = 1u64;
+    let r = sys_set_mempolicy(MPOL_BIND, &one, 0);
+    check(b"maxnode 0", r == EINVAL, r)?;
+    let r = sys_set_mempolicy(MPOL_BIND, &one, 1);
+    check(b"maxnode 1", r == EINVAL, r)?;
+    let r = sys_set_mempolicy(MPOL_BIND, &one, 2);
+    check(b"maxnode 2", r == 0, r)?;
+    let top = 1u64 << 63;
+    let r = sys_set_mempolicy(MPOL_BIND, &top, 64);
+    check(b"bit 63 of 64", r == EINVAL, r)?;
+    let r = sys_set_mempolicy(MPOL_BIND, &(top | 1), 64);
+    check(b"bits 0 and 63 of 64", r == 0, r)?;
+    // A page of bits; 1100 is past any MAX_NUMNODES (at most 1024)
+    let mut page = [0u64; 512];
+    page[0] = 1;
+    page[1100 / 64] = 1 << (1100 % 64);
+    let r = sys_set_mempolicy(MPOL_BIND, page.as_ptr(), 2048);
+    check(b"node 1100", r == EINVAL, r)?;
+    page[1100 / 64] = 0;
+    let r = sys_set_mempolicy(MPOL_BIND, page.as_ptr(), 2048);
+    check(b"2047 bits", r == 0, r)?;
+    let r = sys_set_mempolicy(MPOL_BIND, page.as_ptr(), PAGE * 8 + 1);
+    check(b"a page of bits", r == 0, r)?;
+    let r = sys_set_mempolicy(MPOL_BIND, page.as_ptr(), PAGE * 8 + 2);
+    check(b"past a page", r == EINVAL, r)
+}
+
+/// MPOL_MODE_FLAGS: mode flags (Linux sanitize_mpol_flags, mpol_new):
+/// MPOL_F_STATIC_NODES and MPOL_F_RELATIVE_NODES exclude each other,
+/// need nodes, and make get_mempolicy report the caller's mask;
+/// MPOL_F_NUMA_BALANCING only with MPOL_BIND (MPOL_PREFERRED_MANY too
+/// since Linux 6.10); a mode past MPOL_MAX (MPOL_WEIGHTED_INTERLEAVE
+/// since 6.9) is EINVAL
+fn mode_flags() -> R {
+    let both = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
+    let r = set1(MPOL_BIND | both, 1);
+    check(b"static and relative", r == EINVAL, r)?;
+    let r = set1(MPOL_INTERLEAVE | MPOL_F_NUMA_BALANCING, 1);
+    check(b"balancing interleave", r == EINVAL, r)?;
+    let r = set1(MPOL_BIND | MPOL_F_NUMA_BALANCING, 1);
+    check(b"balancing bind", r == 0, r)?;
+    is_pol(MPOL_BIND | MPOL_F_NUMA_BALANCING, 1)?;
+    let r = set1(MPOL_PREFERRED_MANY | MPOL_F_NUMA_BALANCING, 1);
+    let want = if linux_at_least(6, 10) { 0 } else { EINVAL };
+    check(b"balancing preferred many", r == want, r)?;
+    let r = set1(MPOL_BIND | MPOL_F_STATIC_NODES, 1 | 1 << 5);
+    check(b"static", r == 0, r)?;
+    is_pol(MPOL_BIND | MPOL_F_STATIC_NODES, 1 | 1 << 5)?;
+    let r = set1(MPOL_BIND | MPOL_F_RELATIVE_NODES, 1 << 1);
+    check(b"relative", r == 0, r)?;
+    is_pol(MPOL_BIND | MPOL_F_RELATIVE_NODES, 1 << 1)?;
+    let r = set1(MPOL_LOCAL | MPOL_F_STATIC_NODES, 0);
+    check(b"static local", r == EINVAL, r)?;
+    let r = set1(MPOL_PREFERRED | MPOL_F_RELATIVE_NODES, 0);
+    check(b"relative preferred local", r == EINVAL, r)?;
+    let r = set1(MPOL_BIND | 1 << 16, 1);
+    check(b"unknown flag", r == EINVAL, r)?;
+    let r = set1(7, 1);
+    check(b"mode 7", r == EINVAL, r)?;
+    let r = set1(MPOL_WEIGHTED_INTERLEAVE, 1);
+    if !linux_at_least(6, 9) {
+        return check(b"weighted interleave", r == EINVAL, r);
+    }
+    check(b"weighted interleave", r == 0, r)?;
+    is_pol(MPOL_WEIGHTED_INTERLEAVE, 1)?;
+    let (r, p, _) = get1(0, MPOL_F_NODE);
+    check(b"weighted next node", r == 0 && p == 0, r)
+}
+
+/// MPOL_GET_FLAGS: get_mempolicy flags and mask sizes (Linux
+/// kernel_get_mempolicy, do_get_mempolicy, copy_nodes_to_user):
+/// MPOL_F_MEMS_ALLOWED alone; an address without MPOL_F_ADDR is EINVAL;
+/// MPOL_F_NODE is the next interleave node, EINVAL for other policies;
+/// a mask shorter than the kernel's node count is EINVAL, words past it
+/// are zeroed, more than a page EINVAL
+fn get_flags() -> R {
+    let (r, _, _) = get1(0, 8);
+    check(b"unknown flag", r == EINVAL, r)?;
+    let (r, p, m) = get1(0, MPOL_F_MEMS_ALLOWED);
+    check(b"mems allowed", r == 0 && p == 0 && m & 1 != 0, r)?;
+    let (r, _, _) = get1(0, MPOL_F_MEMS_ALLOWED | MPOL_F_NODE);
+    check(b"mems allowed node", r == EINVAL, r)?;
+    let (r, _, _) = get1(0, MPOL_F_MEMS_ALLOWED | MPOL_F_ADDR);
+    check(b"mems allowed addr", r == EINVAL, r)?;
+    let (r, _, _) = get1(PAGE, 0);
+    check(b"addr without flag", r == EINVAL, r)?;
+    let (r, _, _) = get1(0, MPOL_F_NODE);
+    check(b"default next node", r == EINVAL, r)?;
+    set1(MPOL_BIND, 1);
+    let (r, _, _) = get1(0, MPOL_F_NODE);
+    check(b"bind next node", r == EINVAL, r)?;
+    set1(MPOL_INTERLEAVE, 1);
+    let (r, p, m) = get1(0, MPOL_F_NODE);
+    check(b"interleave next node", r == 0 && p == 0 && m == 1, r)?;
+    let mut p = -1;
+    let mut w = [!0u64; 3];
+    let r = sys_get_mempolicy(&mut p, w.as_mut_ptr(), 0, 0, 0);
+    check(b"maxnode 0", r == EINVAL, r)?;
+    let r = sys_get_mempolicy(&mut p, core::ptr::null_mut(), 0, 0, 0);
+    check(b"no mask", r == 0 && p == MPOL_INTERLEAVE, r)?;
+    let r = sys_get_mempolicy(&mut p, w.as_mut_ptr(), 129, 0, 0);
+    check(b"129 bits", r == 0, r)?;
+    check(b"word 0", w[0] == 1, w[0] as i64)?;
+    check(b"word 1 zeroed", w[1] == 0, w[1] as i64)?;
+    check(b"word 2 kept", w[2] == !0, w[2] as i64)?;
+    let r = sys_get_mempolicy(&mut p, w.as_mut_ptr(), PAGE * 8 + 2, 0, 0);
+    check(b"past a page", r == EINVAL, r)
+}
+
+/// MPOL_FORK: a child starts with its parent's policy (Linux
+/// copy_process: mpol_dup) and changes only its own
+fn fork_inherits() -> R {
+    use hk_syscall::{sys_exit, sys_fork, sys_wait4};
+    set1(MPOL_INTERLEAVE, 1);
+    let pid = sys_fork();
+    if pid == 0 {
+        let (r, p, m) = get1(0, 0);
+        let code = if r != 0 || p != MPOL_INTERLEAVE || m != 1 {
+            1
+        } else if get1(0, MPOL_F_NODE) != (0, 0, 1) {
+            2
+        } else if set1(MPOL_LOCAL, 0) != 0 {
+            3
+        } else {
+            0
+        };
+        sys_exit(code);
+    }
+    check(b"fork", pid > 0, pid)?;
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    check(b"child", st == 0, i64::from(st))?;
+    is_pol(MPOL_INTERLEAVE, 1)
+}
+
+/// MPOL_ADDR: MPOL_F_ADDR reports the policy of the VMA at the address,
+/// MPOL_DEFAULT without one (never the task's), EFAULT outside any VMA;
+/// with MPOL_F_NODE the node of its page, faulted in if missing (Linux
+/// lookup_node), EFAULT if it cannot be read
+fn addr_policy() -> R {
+    set1(MPOL_BIND, 1);
+    let len = 2 * PAGE;
+    let p = sys_mmap(
+        0,
+        len,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    check(b"mmap", p > 0, p)?;
+    let a = p as u64;
+    let r = addr_checks(a);
+    sys_munmap(a, len);
+    r?;
+    let (r, _, _) = get1(a, MPOL_F_ADDR);
+    check(b"unmapped", r == EFAULT, r)?;
+    let q = sys_mmap(0, PAGE, 0, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(b"mmap none", q > 0, q)?;
+    let (r1, p1, _) = get1(q as u64, MPOL_F_ADDR);
+    let (r2, _, _) = get1(q as u64, MPOL_F_ADDR | MPOL_F_NODE);
+    sys_munmap(q as u64, PAGE);
+    check(b"prot none", r1 == 0 && p1 == MPOL_DEFAULT, r1)?;
+    check(b"prot none node", r2 == EFAULT, r2)
+}
+
+/// The MPOL_ADDR checks on the two fresh pages at `a`
+fn addr_checks(a: u64) -> R {
+    let (r, p, m) = get1(a + 8, MPOL_F_ADDR);
+    check(
+        b"vma policy",
+        r == 0 && p == MPOL_DEFAULT && m == 0,
+        i64::from(p),
+    )?;
+    // SAFETY: the first page is mapped writable
+    unsafe { core::ptr::write_volatile(a as *mut u8, 1) };
+    let (r, p, _) = get1(a, MPOL_F_ADDR | MPOL_F_NODE);
+    check(b"touched node", r == 0 && p == 0, r)?;
+    let (r, p, _) = get1(a + PAGE, MPOL_F_ADDR | MPOL_F_NODE);
+    check(b"untouched node", r == 0 && p == 0, r)
 }
