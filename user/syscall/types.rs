@@ -1100,6 +1100,8 @@ pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
 pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 pub const PR_SET_THP_DISABLE: i32 = 41;
 pub const PR_GET_THP_DISABLE: i32 = 42;
+pub const PR_SET_IO_FLUSHER: i32 = 57;
+pub const PR_GET_IO_FLUSHER: i32 = 58;
 
 // x86-64 specific prctl operations
 #[cfg(target_arch = "x86_64")]

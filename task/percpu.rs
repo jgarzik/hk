@@ -2631,6 +2631,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     if parent_nproc_exceeded {
         child_task.set_flag(crate::task::pf::NPROC_EXCEEDED);
     }
+    // Linux dup_task_struct copies the parent's flags: the I/O flusher
+    // mark (PR_SET_IO_FLUSHER) is inherited
+    child_task.set_flag(current().flags() & crate::task::pf::IO_FLUSHER);
     // Its keyrings (Linux copy_creds), made before it is visible
     {
         // The child's credentials are a copy of the parent's here

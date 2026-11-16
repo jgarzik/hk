@@ -546,6 +546,10 @@ pub mod prctl_ops {
     pub const PR_SET_THP_DISABLE: i32 = 41;
     /// Get THP disable flag
     pub const PR_GET_THP_DISABLE: i32 = 42;
+    /// Mark the task an I/O flusher (PF_MEMALLOC_NOIO | PF_LOCAL_THROTTLE)
+    pub const PR_SET_IO_FLUSHER: i32 = 57;
+    /// Get the I/O flusher mark
+    pub const PR_GET_IO_FLUSHER: i32 = 58;
 
     /// TSC mode: allow RDTSC instruction
     pub const PR_TSC_ENABLE: i32 = 1;
@@ -620,6 +624,12 @@ pub mod pf {
     /// Its allocations do no I/O to reclaim, so no direct reclaim (Linux
     /// PF_MEMALLOC_NOIO, memalloc_noio_save)
     pub const MEMALLOC_NOIO: u32 = 0x0008_0000;
+    /// Throttled only against the device it writes to (Linux
+    /// PF_LOCAL_THROTTLE); stored only: hk does not throttle dirtying
+    pub const LOCAL_THROTTLE: u32 = 0x0010_0000;
+    /// What PR_SET_IO_FLUSHER sets (Linux PR_IO_FLUSHER), inherited by
+    /// fork and kept across execve
+    pub const IO_FLUSHER: u32 = MEMALLOC_NOIO | LOCAL_THROTTLE;
     /// Forked and not yet exec'd (Linux PF_FORKNOEXEC): its parent may
     /// still move it to another process group (setpgid)
     pub const FORKNOEXEC: u32 = 0x0000_0040;
@@ -1855,6 +1865,11 @@ impl Task {
     pub unsafe fn comm(&self) -> [u8; 16] {
         // SAFETY: see above
         unsafe { *self.comm.get() }
+    }
+
+    /// Linux PF_* flags
+    pub fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Acquire)
     }
 
     /// Linux PF_* test

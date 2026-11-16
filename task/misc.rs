@@ -380,6 +380,7 @@ use crate::task::prctl_ops::{
     PR_SET_CHILD_SUBREAPER, PR_SET_DUMPABLE, PR_SET_KEEPCAPS, PR_SET_NAME, PR_SET_NO_NEW_PRIVS,
     PR_SET_PDEATHSIG, PR_SET_SECCOMP, PR_SET_THP_DISABLE, PR_SET_TIMERSLACK,
 };
+use crate::task::prctl_ops::{PR_GET_IO_FLUSHER, PR_SET_IO_FLUSHER};
 use crate::task::prctl_ops::{PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSEGV};
 
 /// sys_prctl - Process/thread control operations
@@ -402,10 +403,12 @@ use crate::task::prctl_ops::{PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSE
 /// - PR_GET_CHILD_SUBREAPER (37): Get subreaper flag (arg2 = int* for result)
 /// - PR_SET_NO_NEW_PRIVS (38): Disable privilege escalation (arg2 = 1, irreversible)
 /// - PR_GET_NO_NEW_PRIVS (39): Get no_new_privs flag (returns 0 or 1)
+/// - PR_SET_IO_FLUSHER (57) / PR_GET_IO_FLUSHER (58): the I/O flusher
+///   mark (CAP_SYS_RESOURCE)
 ///
 /// Returns 0 on success, or the value for GET operations. arg2 is a
 /// number or a user pointer, by option.
-pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> KernelResult<i64> {
+pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> KernelResult<i64> {
     use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_USER};
     use crate::task::percpu::{TASKLIST, current_tid};
 
@@ -587,8 +590,33 @@ pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> K
             Ok(i64::from(task.prctl.thp_disable))
         }
 
+        PR_SET_IO_FLUSHER | PR_GET_IO_FLUSHER => io_flusher(option, arg2, arg3 | arg4 | arg5),
+
         _ => Err(KernelError::InvalidArgument), // unsupported operation
     }
+}
+
+/// PR_SET_IO_FLUSHER / PR_GET_IO_FLUSHER (Linux prctl): the calling
+/// thread's PF_MEMALLOC_NOIO | PF_LOCAL_THROTTLE; `rest` the other
+/// arguments, which must be 0
+fn io_flusher(option: i32, arg2: u64, rest: u64) -> KernelResult<i64> {
+    use crate::task::pf::IO_FLUSHER;
+    if !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
+        return Err(KernelError::NotPermitted);
+    }
+    let me = crate::task::percpu::current();
+    if option == PR_GET_IO_FLUSHER {
+        if arg2 | rest != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        return Ok(i64::from(me.flags() & IO_FLUSHER == IO_FLUSHER));
+    }
+    match (arg2, rest) {
+        (1, 0) => me.set_flag(IO_FLUSHER),
+        (0, 0) => me.clear_flag(IO_FLUSHER),
+        _ => return Err(KernelError::InvalidArgument),
+    }
+    Ok(0)
 }
 
 /// PR_SET_NAME's name: up to 16 bytes from `addr`, stopping at a NUL,
