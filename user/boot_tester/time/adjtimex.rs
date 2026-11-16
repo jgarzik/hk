@@ -23,6 +23,34 @@ pub fn run_tests() {
     test_adjtimex_invalid_tick();
     test_adjtimex_offset();
     test_adjtimex_freq_constant();
+    test_adjtimex_maxerror_grows();
+}
+
+/// maxerror grows 500 us a second (Linux second_overflow): set to 0,
+/// it reads 1000..=1500 after 2.2 s (two or three second boundaries)
+fn test_adjtimex_maxerror_grows() {
+    let mut txc = Timex::default();
+    txc.modes = ADJ_MAXERROR;
+    txc.maxerror = 0;
+    let r = sys_adjtimex(&mut txc);
+    let ts = hk_syscall::Timespec {
+        tv_sec: 2,
+        tv_nsec: 200_000_000,
+    };
+    hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    let mut txc2 = Timex::default();
+    sys_adjtimex(&mut txc2);
+    let m = txc2.maxerror;
+    // Put back an unsynchronized clock's value
+    let mut back = Timex::default();
+    back.modes = ADJ_MAXERROR;
+    back.maxerror = 16_000_000;
+    sys_adjtimex(&mut back);
+    if r >= 0 && (1000..=1500).contains(&m) {
+        pass(b"ADJTIMEX_MAXERROR_GROWS");
+    } else {
+        fail_num(b"ADJTIMEX_MAXERROR_GROWS:FAIL: maxerror=", m);
+    }
 }
 
 /// ADJ_FREQUENCY reads back (clamped at 500 ppm); ADJ_TIMECONST is
@@ -117,7 +145,9 @@ fn test_adjtimex_set_errors() {
         let mut txc2 = Timex::default();
         sys_adjtimex(&mut txc2);
 
-        if txc2.maxerror == 100000 && txc2.esterror == 50000 {
+        // maxerror may have grown 500 us at a second boundary between
+        // the two calls (Linux second_overflow)
+        if (100000..=100500).contains(&txc2.maxerror) && txc2.esterror == 50000 {
             pass(b"ADJTIMEX_SET_ERRORS");
         } else {
             print(b"ADJTIMEX_SET_ERRORS:FAIL: maxerror=");

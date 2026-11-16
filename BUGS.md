@@ -1101,5 +1101,4 @@ the ACPI PM timer, which hk lacks.
 
 adjtimex keeps and reports the NTP frequency (ADJ_FREQUENCY) and the
 tick, but neither changes how fast the clock runs (Linux
-ntp_update_frequency), and maxerror does not grow each second (Linux
-second_overflow).
+ntp_update_frequency).
