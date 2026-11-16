@@ -250,8 +250,6 @@ lo (hk has no checksum offload states).
 - fanotify_mark keeps only the mask: FAN_MARK_IGNORED_MASK,
   FAN_MARK_IGNORE, FAN_MARK_IGNORED_SURV_MODIFY and FAN_MARK_EVICTABLE
   are accepted but have no effect (Linux fanotify_add_mark).
-- A NULL pathname is EINVAL; Linux fanotify_find_path marks dfd's own
-  file (a descriptor, not a path-only one).
 
 ## O_DIRECT gaps
 

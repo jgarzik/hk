@@ -610,32 +610,42 @@ pub fn sys_fanotify_mark(
     pathname: UserPtr<u8>,
 ) -> KernelResult<()> {
     use crate::fs::io::fget;
-    use crate::fs::path_ref::Path;
-    use crate::fs::{LookupFlags, lookup_path_at};
+
+    // Linux fanotify_mark checks the request before the descriptor:
+    // the mask's high half, unknown flags, the mark type (no mount
+    // namespace marks: EINVAL) and exactly one command
+    let known = FAN_MARK_ADD
+        | FAN_MARK_REMOVE
+        | FAN_MARK_FLUSH
+        | FAN_MARK_DONT_FOLLOW
+        | FAN_MARK_ONLYDIR
+        | FAN_MARK_MOUNT
+        | FAN_MARK_FILESYSTEM
+        | FAN_MARK_IGNORED_MASK
+        | FAN_MARK_IGNORE
+        | FAN_MARK_IGNORED_SURV_MODIFY
+        | FAN_MARK_EVICTABLE;
+    let types = FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM;
+    if mask >> 32 != 0 || mark_flags & !known != 0 || mark_flags & types == types {
+        return Err(KernelError::InvalidArgument);
+    }
+    let cmd = mark_flags & (FAN_MARK_ADD | FAN_MARK_REMOVE | FAN_MARK_FLUSH);
+    match cmd {
+        FAN_MARK_ADD | FAN_MARK_REMOVE if mask == 0 => return Err(KernelError::InvalidArgument),
+        FAN_MARK_ADD | FAN_MARK_REMOVE => {}
+        FAN_MARK_FLUSH if mark_flags & !(types | FAN_MARK_FLUSH) != 0 => {
+            return Err(KernelError::InvalidArgument);
+        }
+        FAN_MARK_FLUSH => {}
+        _ => return Err(KernelError::InvalidArgument),
+    }
+    let is_remove = cmd == FAN_MARK_REMOVE;
 
     let file = fget(fd)?;
     let fanotify = get_fanotify(&file).ok_or(KernelError::BadFd)?;
-
-    // Determine operation
-    let is_add = (mark_flags & FAN_MARK_ADD) != 0;
-    let is_remove = (mark_flags & FAN_MARK_REMOVE) != 0;
-    let is_flush = (mark_flags & FAN_MARK_FLUSH) != 0;
-
-    // Exactly one of ADD, REMOVE, FLUSH must be set (or none for flush compatibility)
-    let op_count = u32::from(is_add) + u32::from(is_remove) + u32::from(is_flush);
-    if op_count > 1 {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    // FLUSH needs no path; neither does no operation without a path
-    if is_flush || (op_count == 0 && pathname.is_null()) {
+    if cmd == FAN_MARK_FLUSH {
         fanotify.flush_marks(mark_flags);
         return Ok(());
-    }
-
-    // Validate mask for ADD/REMOVE
-    if mask == 0 && is_add {
-        return Err(KernelError::InvalidArgument);
     }
 
     // Check for privileged mark types
@@ -645,31 +655,14 @@ pub fn sys_fanotify_mark(
         return Err(KernelError::NotPermitted);
     }
 
-    // pathname required for ADD/REMOVE
-    if pathname.is_null() {
-        return Err(KernelError::InvalidArgument);
-    }
-    let pathname_str = crate::fs::namei::getname(pathname, false)?;
-
-    // Get starting directory
-    let start: Option<Path> = if pathname_str.starts_with(b"/") {
-        None // Absolute path
-    } else if dirfd == -100 {
-        // AT_FDCWD
-        crate::task::percpu::current_cwd()
+    // No pathname: dirfd's own file (Linux fanotify_find_path: fdget,
+    // so a path-only descriptor or AT_FDCWD is EBADF)
+    let dentry = if pathname.is_null() {
+        let f = fget(dirfd)?;
+        f.f_path().ok_or(KernelError::BadFd)?.dentry.clone()
     } else {
-        crate::fs::io::fget_raw(dirfd)?.f_path()
+        mark_lookup(pathname, dirfd, mark_flags)?
     };
-
-    // Set up lookup flags
-    let mut lookup_flags = LookupFlags::open();
-    if (mark_flags & FAN_MARK_DONT_FOLLOW) != 0 {
-        lookup_flags.follow = false;
-    }
-
-    // Any lookup error as is (Linux fanotify_find_path)
-    let dentry = lookup_path_at(start, &pathname_str, lookup_flags)?;
-
     // Check ONLYDIR
     if (mark_flags & FAN_MARK_ONLYDIR) != 0
         && let Some(inode) = dentry.get_inode()
@@ -697,8 +690,35 @@ pub fn sys_fanotify_mark(
     if is_remove {
         fanotify.remove_mark(mark_flags, mask, target_id);
     } else {
-        // ADD (default if no op specified and pathname given)
         fanotify.add_mark(mark_flags, mask, target_id);
     }
     Ok(())
+}
+
+/// The object a mark names by path (Linux fanotify_find_path's
+/// user_path_at)
+fn mark_lookup(
+    pathname: UserPtr<u8>,
+    dirfd: i32,
+    mark_flags: u32,
+) -> KernelResult<crate::fs::DentryRef> {
+    use crate::fs::path_ref::Path;
+    use crate::fs::{LookupFlags, lookup_path_at};
+    let pathname_str = crate::fs::namei::getname(pathname, false)?;
+    let start: Option<Path> = if pathname_str.starts_with(b"/") {
+        None // Absolute path
+    } else if dirfd == -100 {
+        // AT_FDCWD
+        crate::task::percpu::current_cwd()
+    } else {
+        crate::fs::io::fget_raw(dirfd)?.f_path()
+    };
+    // Set up lookup flags
+    let mut lookup_flags = LookupFlags::open();
+    if (mark_flags & FAN_MARK_DONT_FOLLOW) != 0 {
+        lookup_flags.follow = false;
+    }
+
+    // Any lookup error as is (Linux fanotify_find_path)
+    lookup_path_at(start, &pathname_str, lookup_flags)
 }
