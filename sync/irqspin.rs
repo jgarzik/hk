@@ -12,7 +12,6 @@
 use ::core::cell::UnsafeCell;
 use ::core::marker::PhantomData;
 use ::core::ops::{Deref, DerefMut};
-use ::core::sync::atomic::{AtomicBool, Ordering};
 
 use super::irqflags::{self, Raw};
 
@@ -36,7 +35,8 @@ mod percpu {
 ///
 /// Based on Linux's raw_spinlock with IRQ disable (spin_lock_irqsave).
 pub struct IrqSpinlock<T> {
-    lock: AtomicBool,
+    /// A queued spin lock (Linux raw_spinlock_t on qspinlock)
+    lock: super::qspinlock::QSpinLock,
     data: UnsafeCell<T>,
 }
 
@@ -50,7 +50,7 @@ impl<T> IrqSpinlock<T> {
     /// Create a new IRQ-safe spinlock
     pub const fn new(data: T) -> Self {
         Self {
-            lock: AtomicBool::new(false),
+            lock: super::qspinlock::QSpinLock::new(),
             data: UnsafeCell::new(data),
         }
     }
@@ -73,13 +73,7 @@ impl<T> IrqSpinlock<T> {
     pub fn lock(&self) -> IrqSpinlockGuard<'_, T> {
         let irq_state = irqflags::save();
         percpu::preempt_disable();
-        while self
-            .lock
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
+        self.lock.lock();
         crate::sync::lockdep::irqsafe_acquire(::core::panic::Location::caller());
         IrqSpinlockGuard {
             lock: self,
@@ -97,11 +91,7 @@ impl<T> IrqSpinlock<T> {
     pub fn try_lock(&self) -> Option<IrqSpinlockGuard<'_, T>> {
         let irq_state = irqflags::save();
         percpu::preempt_disable();
-        if self
-            .lock
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
+        if self.lock.try_lock() {
             crate::sync::lockdep::irqsafe_acquire(::core::panic::Location::caller());
             Some(IrqSpinlockGuard {
                 lock: self,
@@ -206,7 +196,8 @@ impl<T> crate::sync::waitqueue::Relock for IrqSpinlockGuard<'_, T> {
 
 impl<T> Drop for IrqSpinlockGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.lock.store(false, Ordering::Release);
+        // SAFETY: this guard's acquisition holds it
+        unsafe { self.lock.lock.unlock() };
         percpu::preempt_enable();
         crate::sync::lockdep::irqsafe_release(
             core::ptr::from_ref(self.lock).cast::<u8>() as usize,

@@ -34,6 +34,7 @@ pub mod pit;
 pub mod power;
 pub mod process;
 pub mod ptrace;
+pub mod qspin;
 pub mod rtc;
 pub mod signal;
 pub mod smp;

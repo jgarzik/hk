@@ -23,27 +23,23 @@ argued / published copy of locked state.
 - **Global RMW on per-op paths** (`call_rcu`, inode eviction, netdev stats,
   dentry alloc, dirty throttling).
 - **Atomic flags as locks** (`Softnet.busy`, `Zone.draining`, NAPI
-  `sched`+`disable`) and the spin-lock primitive itself (`IrqSpinlock`).
+  `sched`+`disable`) and the spin `RwLock` primitive.
 
 ## Findings
 
-### 3. `IrqSpinlock` spins on compare-exchange; locks are unfair TAS — (c)(d)
-- Where: `sync/irqspin.rs` `IrqSpinlock::lock` (loop of
-  `compare_exchange_weak` with no read-only inner spin); `sync/spin.rs` wraps
-  `spin::Mutex`/`spin::RwLock` (test-and-test-and-set, unfair; the RwLock
-  reader count is one shared RMW word).
-- Wrong: every waiter issues a locked RMW per iteration, bouncing the line
-  away from the holder (who must write it to unlock): contention collapses
-  throughput and there is no FIFO fairness (starvation of a remote CPU on a
-  run-queue or zone lock). RwLock read side (e.g. `Dentry.d_lock`,
-  `Dentry.d_name` on every path component) writes the lock word, so popular
-  directories become contended lines.
-- Linux: qspinlock (MCS, waiters spin on their own node; arm64 and x86) or
-  ticket locks; path walk is RCU-walk with `d_seq` seqcount, no stores to
-  shared dentries.
-- Fix: at minimum test-and-test-and-set in `IrqSpinlock::lock`; properly a
-  ticket lock (two u16 in one u32, fair) now, qspinlock later. Track RCU-walk
-  for dcache separately. Update LOCKING.md §1.1 "Properties".
+### 3. Spin `RwLock`: unfair, reader count one shared RMW word — (c)(d)
+- Where: `sync/spin.rs` `RwLock` and `sync/irqspin.rs` `IrqRwLock` wrap
+  `spin::RwLock` (test-and-set, unfair; the RwLock reader count is one
+  shared RMW word). `IrqSpinlock` and the spin `Mutex` are queued spin
+  locks now (`sync/qspinlock.rs`).
+- Wrong: no FIFO fairness between readers and writers; read side (e.g.
+  `Dentry.d_lock`, `Dentry.d_name` on every path component) writes the lock
+  word, so popular directories become contended lines.
+- Linux: qrwlock (a reader count and writer byte in one word, contenders
+  queued through a qspinlock); path walk is RCU-walk with `d_seq`
+  seqcount, no stores to shared dentries.
+- Fix: qrwlock on `sync/qspinlock.rs`. Track RCU-walk for dcache
+  separately. Update LOCKING.md §1.3.
 
 ### 4. `SchedEntity` and run-queue counters: lock-protected state as atomics — (a)(b)
 - Where: `task/sched.rs` `SchedEntity` `vruntime`, `deadline`, `vlag`,

@@ -24,6 +24,7 @@ pub mod pci_irq;
 pub mod percpu;
 pub mod power;
 pub mod ptrace;
+pub mod qspin;
 pub mod rtc;
 pub mod serial;
 pub mod signal;

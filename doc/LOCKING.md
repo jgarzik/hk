@@ -51,19 +51,27 @@ process context.
 - Disables interrupts on lock acquisition
 - Increments `preempt_count` (prevents context switch)
 - Saves and restores interrupt state on unlock
-- Uses `AtomicBool` with compare-exchange for lock state
-- Non-blocking spin loop while waiting
+- A queued spin lock (`sync/qspinlock.rs`, Linux qspinlock): one
+  32-bit word (locked byte, pending byte, tail); uncontended a
+  compare-exchange to take and a byte store-release to give back; the
+  first contender spins on the word as the pending waiter, later ones
+  queue FIFO on per-CPU MCS nodes (four per CPU: task, softirq,
+  hardirq, NMI nesting) and each spins on its own node, so waiters do
+  not bounce the lock's line and are served in order. The narrow
+  accesses (unlock, set_locked, clear_pending_set_locked, xchg_tail)
+  are arch instructions (`arch::qspin`): Rust has no mixed-size
+  atomics
 
 **Semantics (Linux equivalent: `spin_lock_irqsave`):**
 ```rust
 // On lock():
 1. local_irq_save           // Save flags, disable interrupts
 2. preempt_count++          // Disable preemption
-3. atomic compare-exchange  // Acquire lock
+3. queued_spin_lock         // Acquire lock
 4. lockdep irqsafe_acquire
 
 // On drop()/unlock():
-1. atomic store(false)      // Release lock
+1. store-release locked = 0 // Release lock
 2. preempt_count--          // Re-enable preemption
 3. lockdep irqsafe_release
 4. local_irq_restore        // Restore interrupt state (last)
@@ -100,11 +108,11 @@ is ordered like an `IrqSpinlock` (non-IRQ-safe locks such as TASKLIST
 may be taken inside it, never the reverse in interrupt context). Used
 for SIGIO's `Fasync.fa` and `FOwner.st` (Linux fa_lock, fown->lock).
 
-### 1.2 Mutex<T> (spin crate, via `sync::spin`)
+### 1.2 Mutex<T> (`sync::spin`)
 
-A standard spinning mutex from the `spin` crate (taken through
-`crate::sync::spin`, tracked by lockdep-lite in `LOCKDEP=1` builds, 1.5). Used for data structures that
-are **NOT** accessed from interrupt context.
+Linux spinlock_t: the queued spin lock of 1.1 without interrupt masking
+(tracked by lockdep-lite in `LOCKDEP=1` builds, 1.5). Used for data
+structures that are **NOT** accessed from interrupt context.
 
 **Properties:**
 - Blocking (spins until lock acquired)

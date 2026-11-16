@@ -93,16 +93,22 @@ fn addr<T: ?Sized>(p: &T) -> usize {
     core::ptr::from_ref::<T>(p).cast::<u8>() as usize
 }
 
-/// Spinning mutex (Linux spinlock_t)
+/// Spinning mutex (Linux spinlock_t on qspinlock)
 pub struct Mutex<T: ?Sized> {
     class: Class,
-    inner: spin::Mutex<T>,
+    lock: super::qspinlock::QSpinLock,
+    data: core::cell::UnsafeCell<T>,
 }
+
+// SAFETY: the lock gives one holder at a time access to `data`
+unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
+// SAFETY: moving the mutex moves its data
+unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
 
 /// Guard of a [`Mutex`]: releases it, then lowers the preempt count
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     id: usize,
-    g: ManuallyDrop<spin::MutexGuard<'a, T>>,
+    m: &'a Mutex<T>,
     /// Holding a lock is CPU state (preempt count, IRQ flags) or owner
     /// state: the guard stays on the task and CPU that took it
     _not_send: PhantomData<*const ()>,
@@ -113,12 +119,13 @@ impl<T> Mutex<T> {
     pub const fn new(v: T) -> Self {
         Self {
             class: class(),
-            inner: spin::Mutex::new(v),
+            lock: super::qspinlock::QSpinLock::new(),
+            data: core::cell::UnsafeCell::new(v),
         }
     }
 
     pub fn into_inner(self) -> T {
-        self.inner.into_inner()
+        self.data.into_inner()
     }
 }
 
@@ -128,9 +135,10 @@ impl<T: ?Sized> Mutex<T> {
     pub fn lock(&self) -> MutexGuard<'_, T> {
         let id = addr(self);
         enter(id, self.class, true);
+        self.lock.lock();
         MutexGuard {
             id,
-            g: ManuallyDrop::new(self.inner.lock()),
+            m: self,
             _not_send: PhantomData,
         }
     }
@@ -140,21 +148,20 @@ impl<T: ?Sized> Mutex<T> {
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         let id = addr(self);
         enter(id, self.class, false);
-        match self.inner.try_lock() {
-            Some(g) => Some(MutexGuard {
+        if self.lock.try_lock() {
+            Some(MutexGuard {
                 id,
-                g: ManuallyDrop::new(g),
+                m: self,
                 _not_send: PhantomData,
-            }),
-            None => {
-                leave(id);
-                None
-            }
+            })
+        } else {
+            leave(id);
+            None
         }
     }
 
     pub fn get_mut(&mut self) -> &mut T {
-        self.inner.get_mut()
+        self.data.get_mut()
     }
 }
 
@@ -165,30 +172,34 @@ impl<T: Default> Default for Mutex<T> {
     }
 }
 
-impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
+impl<T: ?Sized> fmt::Debug for Mutex<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.inner.fmt(f)
+        f.debug_struct("Mutex")
+            .field("locked", &self.lock.is_locked())
+            .finish_non_exhaustive()
     }
 }
 
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.g
+        // SAFETY: the guard holds the lock
+        unsafe { &*self.m.data.get() }
     }
 }
 
 impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.g
+        // SAFETY: the guard holds the lock, and `&mut self` is unique
+        unsafe { &mut *self.m.data.get() }
     }
 }
 
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        // SAFETY: dropped once, here
-        unsafe { ManuallyDrop::drop(&mut self.g) };
+        // SAFETY: this guard's acquisition holds it
+        unsafe { self.m.lock.unlock() };
         leave(self.id);
     }
 }

@@ -89,6 +89,12 @@ pub use x86_64::barrier;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::percpu::{preempt_count, preempt_disable, preempt_enable};
 
+// Queued spin lock word accesses (sync::qspinlock)
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::qspin;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::qspin;
+
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::percpu::{preempt_count, preempt_disable, preempt_enable};
 

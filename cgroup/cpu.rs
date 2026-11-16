@@ -55,14 +55,14 @@ struct CpuBw {
 /// cpu.max write never tears against a read (thread context only; no
 /// bandwidth is enforced yet, see BUGS "cgroup controller application")
 pub struct CpuState {
-    bw: spin::Mutex<CpuBw>,
+    bw: crate::sync::spin::Mutex<CpuBw>,
 }
 
 impl CpuState {
     /// Create a new CPU state
     pub fn new() -> Self {
         Self {
-            bw: spin::Mutex::new(CpuBw {
+            bw: crate::sync::spin::Mutex::new(CpuBw {
                 weight: CPU_WEIGHT_DEFAULT,
                 quota: CPU_QUOTA_UNLIMITED,
                 period: CPU_PERIOD_DEFAULT,
