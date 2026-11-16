@@ -35,6 +35,15 @@
 //! - SEM_UNDO_WAKE: a SEM_UNDO decrement that slept and was completed
 //!   by another process's increment records its adjustment: the exit
 //!   gives the unit back.
+//! - SEM_UNDO_SYSVSEM: a process with no undo list yet clones a child
+//!   with CLONE_SYSVSEM; the child's SEM_UNDO goes into the list they
+//!   share (Linux copy_semundo makes it first), so the child's exit
+//!   undoes nothing and the parent's does.
+//! - SEM_UNDO_UNSHARE_IPC: unshare(CLONE_NEWIPC) leaves the undo list as
+//!   exit does (Linux ksys_unshare implies CLONE_SYSVSEM): the old
+//!   namespace's adjustment is undone then, not at exit.
+//! - SEM_CLONE_NEWIPC_SYSVSEM: clone with both flags is EINVAL (Linux
+//!   copy_namespaces).
 //! - SEM_NCNT: GETNCNT and GETZCNT count the waiters blocked on that
 //!   semaphore (Linux count_semcnt); IPC_RMID wakes them with EIDRM.
 //! - SEM_MIXED_STRESS: single-operation semops on one semaphore (the
@@ -53,6 +62,7 @@
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use crate::harness::{R, check, report_r};
+use hk_syscall::{CLONE_NEWIPC, CLONE_SYSVSEM, sys_clone, sys_unshare};
 use hk_syscall::{
     GETALL, GETNCNT, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_RMID,
     IPC_SET, IPC_STAT, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE, SETVAL, Sembuf, Timespec,
@@ -60,6 +70,8 @@ use hk_syscall::{
     sys_msgsnd, sys_munmap, sys_semctl, sys_semget, sys_semop, sys_semtimedop, sys_setuid,
     sys_shmctl, sys_shmget, sys_wait4,
 };
+
+const SIGCHLD: u64 = 17;
 
 const EINVAL: i64 = -22;
 const EEXIST: i64 = -17;
@@ -83,6 +95,9 @@ pub fn run_tests() {
     report_r(b"SEM_UNDO_ERANGE", sem_undo(undo_erange_child, 0));
     report_r(b"SEM_UNDO_RMID", sem_undo(undo_rmid_child, 1));
     report_r(b"SEM_UNDO_WAKE", sem_undo_wake());
+    report_r(b"SEM_UNDO_SYSVSEM", sem_undo(undo_sysvsem_child, 0));
+    report_r(b"SEM_UNDO_UNSHARE_IPC", sem_undo_unshare_ipc());
+    report_r(b"SEM_CLONE_NEWIPC_SYSVSEM", sem_clone_newipc_sysvsem());
     report_r(b"SEM_NCNT", sem_ncnt());
     report_r(b"SEM_MIXED_STRESS", sem_mixed_stress());
     report_r(b"MSGCTL_QBYTES", msgctl_qbytes());
@@ -391,6 +406,65 @@ fn sem_undo(child: fn(i32) -> u64, want: i64) -> R {
 fn undo_exit_child(id: i32) -> u64 {
     let op = [Sembuf::new(0, 3, UNDO)];
     (sys_semop(id, op.as_ptr(), 1) != 0) as u64
+}
+
+/// The middle process: its CLONE_SYSVSEM child's +3 stays after that
+/// child exits (the shared list lives on in this process)
+fn undo_sysvsem_child(id: i32) -> u64 {
+    let pid = sys_clone(SIGCHLD | CLONE_SYSVSEM, 0, 0, 0, 0);
+    if pid == 0 {
+        let op = [Sembuf::new(0, 3, UNDO)];
+        sys_exit((sys_semop(id, op.as_ptr(), 1) != 0) as u64);
+    }
+    if pid < 0 {
+        return 2;
+    }
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+    if ws != 0 {
+        return 3;
+    }
+    (sys_semctl(id, 0, GETVAL, 0) != 3) as u64 * 4
+}
+
+/// A child's +3 is undone by its unshare(CLONE_NEWIPC), while it lives
+fn sem_undo_unshare_ipc() -> R {
+    let set = Set::new(1);
+    check(b"semget", set.0 >= 0, set.0 as i64)?;
+    let flag = shared(1);
+    let pid = sys_fork();
+    if pid == 0 {
+        let op = [Sembuf::new(0, 3, UNDO)];
+        let ok = sys_semop(set.0, op.as_ptr(), 1) == 0 && sys_unshare(CLONE_NEWIPC) == 0;
+        flag[0].store(if ok { 1 } else { -1 }, Ordering::Release);
+        while flag[0].load(Ordering::Acquire) != 2 {
+            hk_syscall::sys_sched_yield();
+        }
+        sys_exit(0);
+    }
+    while flag[0].load(Ordering::Acquire) == 0 {
+        hk_syscall::sys_sched_yield();
+    }
+    let ok = flag[0].load(Ordering::Acquire) == 1;
+    let v = set.get(0);
+    flag[0].store(2, Ordering::Release);
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+    unshare(flag);
+    check(b"semop and unshare", ok, 0)?;
+    check(b"undone at unshare", v == 0, v)
+}
+
+fn sem_clone_newipc_sysvsem() -> R {
+    let r = sys_clone(SIGCHLD | CLONE_NEWIPC | CLONE_SYSVSEM, 0, 0, 0, 0);
+    if r == 0 {
+        sys_exit(0);
+    }
+    if r > 0 {
+        let mut ws = 0;
+        sys_wait4(r, &mut ws, 0, 0);
+    }
+    check(b"EINVAL", r == EINVAL, r)
 }
 
 fn undo_setval_child(id: i32) -> u64 {

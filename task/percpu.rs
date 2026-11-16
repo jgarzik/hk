@@ -2421,6 +2421,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // namespace moves that fs context) and the target cgroup (a bad fd
     // is EBADF)
     let child_fs = crate::fs::fsstruct::fork_fs(config.flags & CLONE_FS != 0)?;
+    // CLONE_SYSVSEM shares the parent's undo list, made now if it has
+    // none (Linux copy_semundo's get_undo_list): SEM_UNDO from either
+    // side then lands in the one list
+    if config.flags & CLONE_SYSVSEM != 0 {
+        crate::ipc::sem::get_or_create_undo_list(&me)?;
+    }
     let child_ns = crate::ns::fork_nsproxy(config.flags, child_fs.as_deref())?;
     // A thread stays in its group's pid namespace (Linux copy_process:
     // CLONE_THREAD with CLONE_NEWPID or CLONE_NEWUSER, or after an

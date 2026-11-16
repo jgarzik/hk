@@ -1452,7 +1452,7 @@ pub fn clone_task_semundo(parent: &Task, child: &Task, share: bool) {
                 child.set_sysvsem(undo);
             }
         }
-        // If parent has no undo list, child also starts with none (will be created on demand)
+        // The parent's list was made before the child (do_clone)
     }
     // Without CLONE_SYSVSEM: child starts with no undo list
     // It will be created lazily if the child uses SEM_UNDO

@@ -479,6 +479,13 @@ pub fn fork_nsproxy(
     if !may_create_namespaces(ns_flags) {
         return Err(KernelError::NotPermitted);
     }
+    // A new ipc namespace cannot share the undo list (Linux
+    // copy_namespaces): the old namespace's arrays are unreachable
+    // from it
+    let both = CLONE_NEWIPC | CLONE_SYSVSEM;
+    if flags & both == both {
+        return Err(KernelError::InvalidArgument);
+    }
     let parent_ns = current().nsproxy().unwrap_or_else(|| INIT_NSPROXY.clone());
     if ns_flags == 0 {
         return Ok(parent_ns);
@@ -570,50 +577,43 @@ const CLONE_SYSVSEM: u64 = 0x00040000;
 /// The new namespace takes effect immediately.
 pub fn sys_unshare(unshare_flags: u64) -> KernelResult<()> {
     let ns_flags = unshare_flags & CLONE_NS_FLAGS;
-    let sysvsem_flag = unshare_flags & CLONE_SYSVSEM;
-
-    // Handle CLONE_SYSVSEM - detach from shared semaphore undo list
-    // Similar to what Linux does: exit_sem(current) effectively
-    if sysvsem_flag != 0 {
-        // Detach from any shared undo list by exiting and re-creating
-        // This applies any pending undos if we're the last holder
-        crate::ipc::sem::exit_sem(&crate::task::percpu::current());
-    }
-
-    // No namespace flags - nothing more to do
-    if ns_flags == 0 {
-        return Ok(());
-    }
-
-    // Check for unsupported namespace flags
+    // A new ipc namespace also leaves the undo list (Linux ksys_unshare):
+    // the old namespace's arrays are unreachable from it
+    let sysvsem = unshare_flags & (CLONE_SYSVSEM | CLONE_NEWIPC) != 0;
     if ns_flags & !SUPPORTED_NS_FLAGS != 0 {
         return Err(KernelError::InvalidArgument);
     }
     if !may_create_namespaces(ns_flags) {
         return Err(KernelError::NotPermitted);
     }
-
-    // Get current namespace proxy
-    let current_ns = current().nsproxy().unwrap_or_else(|| INIT_NSPROXY.clone());
-
-    // Create new nsproxy with new namespace(s)
-    // CLONE_NEWNS implies CLONE_FS (Linux unshare): a private fs
-    // struct, moved to the copies of its mounts
-    let fs = if ns_flags & CLONE_NEWNS != 0 {
-        let fs = crate::task::percpu::current_fs()
-            .map(|f| f.copy())
-            .transpose()?;
-        if let Some(f) = &fs {
-            crate::fs::init_task_fs(&current(), f.clone());
+    // Everything new is made before anything changes (Linux
+    // unshare_fs, unshare_nsproxy_namespaces, then the switch): a
+    // failure leaves the task as it was. CLONE_NEWNS implies CLONE_FS:
+    // a private fs struct, moved to the copies of its mounts
+    let mut new = None;
+    if ns_flags != 0 {
+        let fs = if ns_flags & CLONE_NEWNS != 0 {
+            crate::task::percpu::current_fs()
+                .map(|f| f.copy())
+                .transpose()?
+        } else {
+            None
+        };
+        let current_ns = current().nsproxy().unwrap_or_else(|| INIT_NSPROXY.clone());
+        let ns = current_ns.copy(ns_flags, fs.as_deref())?;
+        new = Some((fs, ns));
+    }
+    if sysvsem {
+        // Detach from the undo list as exit does (Linux exit_sem): its
+        // adjustments are applied if this task was the last sharing it
+        crate::ipc::sem::exit_sem(&current());
+    }
+    if let Some((fs, ns)) = new {
+        if let Some(f) = fs {
+            crate::fs::init_task_fs(&current(), f);
         }
-        fs
-    } else {
-        None
-    };
-    let new_ns = current_ns.copy(ns_flags, fs.as_deref())?;
-
-    // Switch to new namespace (atomic via mutex)
-    switch_task_namespaces(&current(), new_ns);
+        switch_task_namespaces(&current(), ns);
+    }
     Ok(())
 }
 
