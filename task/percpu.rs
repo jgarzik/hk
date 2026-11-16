@@ -315,7 +315,7 @@ impl CpuRunQueue {
     /// a higher class always wins; within rt, the higher priority;
     /// once this CPU's rt runtime is used up, fair wins over rt,
     /// `rt_throttled`); a fair task waits for the tick
-    fn check_preempt(&self, p: &Task) {
+    fn check_preempt(&mut self, p: &Task) {
         // SAFETY: the running task, kept alive by this run queue
         let Some(curr) = (unsafe { self.curr.as_ref() }) else {
             return;
@@ -335,7 +335,7 @@ impl CpuRunQueue {
     /// A woken fair task preempts the running fair one if EEVDF would
     /// pick it now (Linux check_preempt_wakeup_fair): never a SCHED_BATCH
     /// or SCHED_IDLE one, always over a SCHED_IDLE one
-    fn fair_wakeup_preempts(&self, p: &Task, curr: &Task) -> bool {
+    fn fair_wakeup_preempts(&mut self, p: &Task, curr: &Task) -> bool {
         use crate::task::{SCHED_BATCH, SCHED_IDLE};
         let (pp, cp) = (p.se.policy(), curr.se.policy());
         if pp == SCHED_BATCH || pp == SCHED_IDLE {
@@ -344,7 +344,7 @@ impl CpuRunQueue {
         if cp == SCHED_IDLE {
             return true;
         }
-        crate::task::fair::update_curr(&curr.se, crate::time::monotonic_ns());
+        self.update_curr(crate::time::monotonic_ns());
         let q = self.queue.as_ref().expect("run queue not initialized");
         let ents = q
             .fair_iter()
@@ -424,21 +424,30 @@ impl CpuRunQueue {
             && (q.has_fair() || self.curr_fair().is_some())
     }
 
-    /// Charge the running task's CPU time if it is an rt task (Linux
-    /// update_curr_rt)
-    fn update_curr_rt(&mut self, now: u64) {
+    /// Charge the running task for its time since it last was (Linux
+    /// curr->sched_class->update_curr): its runtime in every class but
+    /// idle (`sched::update_se`), then a fair task's vruntime (true:
+    /// its slice ran out) or an rt task's time against this CPU's rt
+    /// runtime (update_curr_rt)
+    fn update_curr(&mut self, now: u64) -> bool {
         // SAFETY: the running task, kept alive by this run queue
         let Some(curr) = (unsafe { self.curr.as_ref() }) else {
-            return;
+            return false;
         };
-        if self.curr_is_idle() || curr.se.class() != Class::Rt {
-            return;
+        if self.curr_is_idle() {
+            return false;
         }
-        // Under the rq lock (Linux curr->se.exec_start)
-        let start = curr.se.exec_start.load(Ordering::Relaxed);
-        curr.se.exec_start.store(now, Ordering::Relaxed);
-        if start != 0 && now > start {
-            self.rt_bw.charge(now, now - start);
+        let delta = sched::update_se(curr, now);
+        if delta == 0 {
+            return false;
+        }
+        match curr.se.class() {
+            Class::Fair => crate::task::fair::update_curr(&curr.se, delta),
+            Class::Rt => {
+                self.rt_bw.charge(now, delta);
+                false
+            }
+            Class::Stop | Class::Idle => false,
         }
     }
 
@@ -446,7 +455,7 @@ impl CpuRunQueue {
     /// its CPU's rt runtime with fair tasks waiting (Linux
     /// sched_rt_runtime_exceeded -> resched_curr)
     fn rt_tick(&mut self, now: u64) -> bool {
-        self.update_curr_rt(now);
+        self.update_curr(now);
         self.rt_throttled()
     }
 
@@ -2018,7 +2027,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
             // The old leader's CPU time stays the group's (Linux
             // release_task -> __exit_signal)
             if let Some(s) = &li.signal {
-                s.add_dead_times(l.times());
+                s.add_dead_times(crate::task::cputime::task_cputime(l));
             }
             core::mem::swap(&mut mi.thread_pid, &mut li.thread_pid);
             // The pid hash names the caller by its new number
@@ -3604,7 +3613,7 @@ fn make_current(t: &Task) -> (u64, *const crate::mm::Mm, (u64, u64)) {
     CurrentArch::set_current_task_ptr(core::ptr::from_ref::<Task>(t) as usize);
     // Linux prepare_task
     t.se.set_on_cpu(true);
-    // A fair task's runtime counts from now (Linux set_next_entity)
+    // Its runtime counts from now (Linux set_next_entity, set_next_task_*)
     t.se.exec_start
         .store(crate::time::monotonic_ns(), Ordering::Relaxed);
     let tls = (
@@ -3652,6 +3661,9 @@ fn context_switch_locked(
     // The outgoing task's time up to now; the incoming one counts from
     // now (its time off the CPU is nobody's)
     let now = crate::time::monotonic_ns();
+    // Its runtime up to now (Linux put_prev_task -> update_curr); the
+    // incoming one's counts from `make_current` (set_next_entity)
+    rq.update_curr(now);
     if prev.tid() != 0 {
         prev.switch_out(now);
     }
@@ -3747,12 +3759,8 @@ pub fn schedule() {
     // Leave the run queue (Linux deactivate_task), a fair task keeping
     // its lag; an uninterruptible or killable sleep counts in the load
     // (task_contributes_to_load)
-    let now = crate::time::monotonic_ns();
-    if me.se.class() == Class::Fair {
-        crate::task::fair::update_curr(&me.se, now);
-        rq.save_lag(&me);
-    }
-    rq.update_curr_rt(now);
+    rq.update_curr(crate::time::monotonic_ns());
+    rq.save_lag(&me);
     me.se.set_on_rq(false);
     rq.add_nr(-1);
     // A slice that ran out is not carried past the sleep
@@ -3819,6 +3827,23 @@ fn task_rq_lock(p: &Task) -> crate::sync::IrqSpinlockGuard<'static, CpuRunQueue>
             return rq;
         }
     }
+}
+
+/// Task `p`'s runtime with the slice it is running now (Linux
+/// task_sched_runtime: under its rq lock, the running task is charged
+/// up to now first, `update_curr`)
+pub fn task_sched_runtime(p: &Task) -> u64 {
+    // Not running or not queued: nothing pending (Linux's 64-bit fast
+    // path)
+    if !p.se.on_cpu() || !p.se.on_rq() {
+        return p.se.sum_exec_runtime();
+    }
+    let mut rq = task_rq_lock(p);
+    if core::ptr::eq(rq.curr, p) && p.se.on_rq() && rq.update_curr(crate::time::monotonic_ns()) {
+        // Its slice ran out (Linux update_curr -> resched_curr)
+        rq.resched_curr();
+    }
+    p.se.sum_exec_runtime()
 }
 
 /// Move `p` to `cpu`'s run queue's ownership (Linux set_task_cpu):
@@ -4354,7 +4379,7 @@ pub fn scheduler_tick() {
         // task_tick_fair -> update_deadline)
         Class::Fair => this_sched().is_some_and(|s| {
             let mut rq = s.lock.lock();
-            crate::task::fair::update_curr(&me.se, now) | rq.rt_period_tick(now)
+            rq.update_curr(now) | rq.rt_period_tick(now)
         }),
         Class::Idle => true,
     };
@@ -4515,13 +4540,9 @@ fn yield_cpu(preempted: bool) -> bool {
     // sched_yield moves its deadline on); the idle task is never queued
     me.se.set_state(RUNNING);
     if !rq.curr_is_idle() {
-        let now = crate::time::monotonic_ns();
-        rq.update_curr_rt(now);
-        if me.se.class() == Class::Fair {
-            crate::task::fair::update_curr(&me.se, now);
-            if !preempted {
-                crate::task::fair::yield_task(&me.se);
-            }
+        rq.update_curr(crate::time::monotonic_ns());
+        if me.se.class() == Class::Fair && !preempted {
+            crate::task::fair::yield_task(&me.se);
         }
         rq.enqueue_prev(&me, preempted);
     }
@@ -4734,29 +4755,10 @@ pub fn get_process_times(pid: Pid) -> (u64, u64) {
     group_times(&table, pid)
 }
 
-/// Thread group `pid`'s CPU time (Linux thread_group_cputime): its
-/// threads gone (in its SignalStruct) plus those still holding the
-/// SignalStruct, each with its running slice. A thread that left gave
-/// its time to the struct when it lost it, so none counts twice.
+/// Thread group `pid`'s (utime, stime) (`cputime::thread_group_cputime`)
 pub fn group_times(table: &GlobalTaskTable, pid: Pid) -> (u64, u64) {
-    let now = crate::time::monotonic_ns();
-    let mut sig = None;
-    let (mut utime, mut stime) = (0u64, 0u64);
-    for task in table.threads(pid) {
-        let Some(s) = &task.signal else {
-            continue;
-        };
-        sig.get_or_insert_with(|| s.clone());
-        let (u, st) = task.task.cputime(now);
-        utime = utime.saturating_add(u);
-        stime = stime.saturating_add(st);
-    }
-    if let Some(s) = sig {
-        let (u, st) = s.dead_times();
-        utime = utime.saturating_add(u);
-        stime = stime.saturating_add(st);
-    }
-    (utime, stime)
+    let t = crate::task::cputime::thread_group_cputime(table, pid);
+    (t.utime, t.stime)
 }
 
 /// User and system time, ns

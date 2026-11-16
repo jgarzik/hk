@@ -120,9 +120,14 @@ pub struct SchedEntity {
     pub deadline: AtomicU64,
     /// Fair: lag saved when it left its run queue (Linux se->vlag)
     pub vlag: AtomicI64,
-    /// Fair and rt: when it last started running or was charged
-    /// (monotonic ns; 0 before it first runs)
+    /// When it last started running or was charged (monotonic ns; 0
+    /// before it first runs; Linux se->exec_start), under the rq lock
     pub exec_start: AtomicU64,
+    /// Time run in total, ns (Linux se->sum_exec_runtime): advanced
+    /// under the rq lock of its CPU (`update_se`), read lock-free
+    /// (thread_group_cputime, cputime_adjust: Linux
+    /// read_sum_exec_runtime's READ_ONCE)
+    sum_exec_runtime: AtomicU64,
     /// Its slice ran out: requeued at the tail, not the head
     requeue_tail: AtomicBool,
     /// Its place in a priority list (under the rq lock)
@@ -153,6 +158,7 @@ impl SchedEntity {
             deadline: AtomicU64::new(0),
             vlag: AtomicI64::new(0),
             exec_start: AtomicU64::new(0),
+            sum_exec_runtime: AtomicU64::new(0),
             requeue_tail: AtomicBool::new(false),
             link: Link::new(),
             ctx: UnsafeCell::new(
@@ -202,6 +208,13 @@ impl SchedEntity {
     #[inline]
     pub fn set_on_cpu(&self, v: bool) {
         self.on_cpu.store(v, Ordering::Release);
+    }
+
+    /// Time run in total as of its last charge (Linux
+    /// read_sum_exec_runtime; `task_sched_runtime` adds a running
+    /// slice)
+    pub fn sum_exec_runtime(&self) -> u64 {
+        self.sum_exec_runtime.load(Ordering::Relaxed)
     }
 
     /// The scheduling parameters, one setting (one load)
@@ -280,6 +293,31 @@ impl SchedEntity {
         // SAFETY: see above
         unsafe { &mut *self.ctx.get() }
     }
+}
+
+/// Charge running task `t` for its time since `exec_start` (Linux
+/// update_se, every class's update_curr): its sum_exec_runtime and,
+/// while its thread group keeps CPU timer totals, the group's
+/// (account_group_exec_runtime). Under the rq lock of its CPU. The
+/// time charged, 0 for none.
+pub fn update_se(t: &super::Task, now: u64) -> u64 {
+    let se = &t.se;
+    // Under the rq lock: loads and stores (Linux se->exec_start,
+    // se->sum_exec_runtime += delta)
+    let start = se.exec_start.load(Ordering::Relaxed);
+    if now <= start {
+        return 0;
+    }
+    se.exec_start.store(now, Ordering::Relaxed);
+    if start == 0 {
+        return 0;
+    }
+    let delta = now - start;
+    crate::sync::Sole::sole_add(&se.sum_exec_runtime, delta);
+    if let Some(g) = t.cpu_group() {
+        g.cputimer.account_exec_runtime(delta);
+    }
+    delta
 }
 
 /// The runnable tasks of a CPU but the running one and the idle task,

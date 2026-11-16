@@ -62,17 +62,12 @@ fn calc_delta_fair(delta: u64, se: &SchedEntity) -> u64 {
     (u128::from(delta) * u128::from(NICE_0_LOAD) / u128::from(w)) as u64
 }
 
-/// Charge the running `se` for the time since it last was (Linux
-/// update_curr, update_deadline): true once it used up its slice, which
-/// gives it a new deadline
-pub fn update_curr(se: &SchedEntity, now: u64) -> bool {
-    // Under the rq lock: a load and a store (Linux curr->exec_start)
-    let start = se.exec_start.load(Ordering::Relaxed);
-    se.exec_start.store(now, Ordering::Relaxed);
-    if start == 0 || now <= start {
-        return false;
-    }
-    let v = se.vruntime.load(Ordering::Relaxed) + calc_delta_fair(now - start, se);
+/// Advance the running `se` by `delta` ns it ran (Linux update_curr's
+/// fair part, after update_se charged the runtime; update_deadline):
+/// true once it used up its slice, which gives it a new deadline
+pub fn update_curr(se: &SchedEntity, delta: u64) -> bool {
+    // Under the rq lock: loads and stores
+    let v = se.vruntime.load(Ordering::Relaxed) + calc_delta_fair(delta, se);
     se.vruntime.store(v, Ordering::Relaxed);
     if v < se.deadline.load(Ordering::Relaxed) {
         return false;

@@ -12,6 +12,9 @@
 //!   spins
 //! - CPU_ACCT_EXITED: a thread's CPU time stays the process's after it
 //!   exits (Linux signal->utime/stime)
+//! - CPU_ACCT_SCHED_FINE: the thread CPU clock (CPUCLOCK_SCHED) is the
+//!   scheduler's runtime, not tick samples: spinning, it advances in
+//!   steps well under a tick
 //! - CPU_ACCT_CHILDREN: a reaped child's CPU time shows in wait4's
 //!   rusage, getrusage(RUSAGE_CHILDREN), times()'s tms_cutime/cstime and
 //!   /proc/self/stat's cutime/cstime
@@ -35,6 +38,7 @@ const MS: i64 = 1_000_000;
 
 pub fn run_tests() {
     sleep();
+    sched_fine();
     user();
     spinner();
     exited();
@@ -149,6 +153,30 @@ fn children() {
         0
     };
     verdict(b"CPU_ACCT_CHILDREN", step == 0, step * 100_000 + waited);
+}
+
+/// The calling thread's CPU clock in ns
+fn own_cpu_ns() -> i64 {
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    sys_clock_gettime(3, &mut ts);
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+fn sched_fine() {
+    // The smallest of a few steps (a step may span a preemption)
+    let mut best = i64::MAX;
+    for _ in 0..8 {
+        let a = own_cpu_ns();
+        let mut b = own_cpu_ns();
+        while b == a {
+            b = own_cpu_ns();
+        }
+        best = best.min(b - a);
+    }
+    verdict(b"CPU_ACCT_SCHED_FINE", best < 2 * MS, best);
 }
 
 fn nap(ms: i64) {

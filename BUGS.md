@@ -243,8 +243,7 @@ credentials unchanged, so set-id programs run unprivileged.
 
 timer_create and clock_nanosleep take only the caller's own process
 CPU clock (and its threads' for timer_create): another process's is
-EINVAL (Linux runs those too, checked when that process runs). The
-SCHED CPU clock counts utime + stime like PROF (Linux: exact runtime).
+EINVAL (Linux runs those too, checked when that process runs).
 A CPU-clock clock_nanosleep's hidden timer takes a timer id from the
 process's registry (Linux posix_cpu_nsleep's timer is not hashed: the
 next timer_create id does not move). rseq is ENOSYS (glibc runs

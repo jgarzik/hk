@@ -3,6 +3,7 @@
 pub mod acct;
 pub(crate) mod argstr;
 pub(crate) mod binfmt_script;
+pub mod cputime;
 pub mod futex;
 pub mod kcmp;
 pub mod membarrier;
@@ -855,9 +856,10 @@ pub struct Task {
     /// both inside `acct_seq` (`se.on_cpu` clears only after the
     /// switch, which would add a slice already charged)
     acct_running: AtomicBool,
-    /// Earliest expiry (ns of its PROF, VIRT time) of a CPU timer on
-    /// this thread's clock: a hint for the tick (`cpu_timer`)
-    pub cpu_next: [AtomicU64; 2],
+    /// Earliest expiry (ns of its PROF, VIRT, SCHED time) of a CPU
+    /// timer on this thread's clock: a hint for the tick (`cpu_timer`;
+    /// Linux posix_cputimers' expiry cache)
+    pub cpu_next: [AtomicU64; 3],
     /// Its thread group's SignalStruct, set once when the task gets it
     /// (never changes): the tick and the accounting reach the group's
     /// CPU timer state through it without TASKLIST
@@ -1627,10 +1629,7 @@ impl Task {
             in_kernel: AtomicBool::new(kind == TaskKind::KernelThread),
             acct_seq: AtomicU32::new(0),
             acct_running: AtomicBool::new(false),
-            cpu_next: [
-                AtomicU64::new(crate::time::cpu_timer::NONE),
-                AtomicU64::new(crate::time::cpu_timer::NONE),
-            ],
+            cpu_next: [const { AtomicU64::new(crate::time::cpu_timer::NONE) }; 3],
             cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
@@ -1700,10 +1699,7 @@ impl Task {
             in_kernel: AtomicBool::new(true),
             acct_seq: AtomicU32::new(0),
             acct_running: AtomicBool::new(false),
-            cpu_next: [
-                AtomicU64::new(crate::time::cpu_timer::NONE),
-                AtomicU64::new(crate::time::cpu_timer::NONE),
-            ],
+            cpu_next: [const { AtomicU64::new(crate::time::cpu_timer::NONE) }; 3],
             cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),

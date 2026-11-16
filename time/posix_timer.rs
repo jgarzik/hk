@@ -1225,9 +1225,10 @@ pub fn sys_timer_settime(
     // A thread CPU clock whose thread is gone: ESRCH (Linux
     // posix_cpu_timer_set finds no task)
     if let Some(crate::time::cpu_timer::CpuClock {
-        thread: Some(t), ..
+        thread: Some(t),
+        sample,
     }) = timer.cpu
-        && crate::time::cpu_timer::thread_sample(t).is_none()
+        && crate::time::cpu_timer::thread_sample(t, sample).is_none()
     {
         return Err(KernelError::NoProcess);
     }

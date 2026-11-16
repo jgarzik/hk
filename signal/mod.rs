@@ -1233,7 +1233,7 @@ pub fn exit_task_signal(t: &Task) {
                 None
             } else {
                 // Its CPU time stays the group's (Linux __exit_signal)
-                let t = task.task.cputime(crate::time::monotonic_ns());
+                let t = crate::task::cputime::task_cputime(task.task);
                 if let Some(s) = task.signal() {
                     s.add_dead_times(t);
                 }
@@ -2532,8 +2532,9 @@ pub struct SignalStruct {
     /// takes it to 0 is the group's last (group_dead)
     live: AtomicU32,
     /// CPU time (ns) of the group's threads already gone (Linux
-    /// signal->utime/stime): added when one leaves the group
-    dead_times: [AtomicU64; 2],
+    /// signal->utime, stime, sum_sched_runtime): added when one leaves
+    /// the group, under TASKLIST's write lock; read under its read lock
+    dead_times: [AtomicU64; 3],
     /// CPU time (ns) of reaped children and theirs (Linux
     /// signal->cutime/cstime)
     child_times: [AtomicU64; 2],
@@ -2696,7 +2697,7 @@ impl SignalStruct {
             itimers: unsafe { crate::time::posix_timer::ITimers::new() },
             leader_pid: crate::task::TableCell::new(None),
             live: AtomicU32::new(1),
-            dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
+            dead_times: [const { AtomicU64::new(0) }; 3],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
             cputimer: crate::time::cpu_timer::GroupCputimer::new(),
             shared: Mutex::new(GroupPending::new()),
@@ -2743,19 +2744,23 @@ impl SignalStruct {
         *self.subreaper.access_mut(table) = on;
     }
 
-    /// A thread leaving the group takes its (utime, stime) here (Linux
-    /// __exit_signal)
-    pub fn add_dead_times(&self, (u, s): (u64, u64)) {
-        self.dead_times[0].fetch_add(u, Ordering::Relaxed);
-        self.dead_times[1].fetch_add(s, Ordering::Relaxed);
+    /// A thread leaving the group takes its CPU time here (Linux
+    /// __exit_signal), TASKLIST held for writing: the only writer, so a
+    /// load and a store
+    pub fn add_dead_times(&self, t: crate::task::cputime::TaskCputime) {
+        use crate::sync::Sole;
+        self.dead_times[0].sole_add(t.utime);
+        self.dead_times[1].sole_add(t.stime);
+        self.dead_times[2].sole_add(t.sum_exec_runtime);
     }
 
-    /// (utime, stime) of the group's threads already gone
-    pub fn dead_times(&self) -> (u64, u64) {
-        (
-            self.dead_times[0].load(Ordering::Relaxed),
-            self.dead_times[1].load(Ordering::Relaxed),
-        )
+    /// The CPU time of the group's threads already gone
+    pub fn dead_times(&self) -> crate::task::cputime::TaskCputime {
+        crate::task::cputime::TaskCputime {
+            utime: self.dead_times[0].load(Ordering::Relaxed),
+            stime: self.dead_times[1].load(Ordering::Relaxed),
+            sum_exec_runtime: self.dead_times[2].load(Ordering::Relaxed),
+        }
     }
 
     /// A reaped child's own and its children's (utime, stime) (Linux
