@@ -82,11 +82,17 @@ impl Creds {
         }
     }
 
-    /// struct ucred, its pid in the reader's namespace (Linux
-    /// scm_set_cred: pid_vnr; 0 if not visible)
+    /// struct ucred in the reader's namespaces: the pid 0 if not
+    /// visible, an unmapped id the overflow id (Linux scm_recv:
+    /// pid_vnr, from_kuid_munged, from_kgid_munged)
     fn bytes(c: Option<&Self>) -> [u8; 12] {
+        let ns = crate::ns::current_user_ns();
         let (pid, uid, gid) = c.map_or((0, OVERFLOW_ID, OVERFLOW_ID), |c| {
-            (c.pid.as_ref().map_or(0, |p| p.vnr()), c.uid, c.gid)
+            (
+                c.pid.as_ref().map_or(0, |p| p.vnr()),
+                ns.from_kuid_munged(c.uid),
+                ns.from_kgid_munged(c.gid),
+            )
         });
         let mut b = [0u8; 12];
         b[..4].copy_from_slice(&pid.to_ne_bytes());
@@ -236,18 +242,22 @@ impl Scm {
 }
 
 /// SCM_CREDENTIALS from a sender (Linux scm_check_creds + __scm_send):
-/// exactly a struct ucred; the pid must be the sender's tgid (or any
-/// existing process with CAP_SYS_ADMIN: ESRCH if none), the uid one of
-/// its real/effective/saved uids (or CAP_SETUID), the gid likewise
+/// exactly a struct ucred whose ids map in the sender's user namespace
+/// (EINVAL); the pid must be the sender's tgid (or any existing process
+/// with CAP_SYS_ADMIN: ESRCH if none), the uid one of its
+/// real/effective/saved uids (or CAP_SETUID), the gid likewise
 fn check_creds(data: &[u8]) -> Result<Creds, KernelError> {
     if data.len() != 12 {
         return Err(KernelError::InvalidArgument);
     }
     let w = |o: usize| u32::from_ne_bytes(data[o..o + 4].try_into().unwrap());
     let (pid, uid, gid) = (w(0) as i32, w(4), w(8));
-    if uid == u32::MAX || gid == u32::MAX {
+    // Linux make_kuid / make_kgid in cred->user_ns; -1 never maps
+    let ns = crate::ns::current_user_ns();
+    let kid = |id: u32, k: Option<u32>| k.filter(|_| id != u32::MAX);
+    let (Some(uid), Some(gid)) = (kid(uid, ns.to_kuid(uid)), kid(gid, ns.to_kgid(gid))) else {
         return Err(KernelError::InvalidArgument);
-    }
+    };
     let c = crate::task::current_cred();
     // The caller's numbers (Linux scm_check_creds: task_tgid_vnr)
     let me = crate::task::pid::vnr(crate::task::percpu::current_pid()) as i32;

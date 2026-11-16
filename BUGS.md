@@ -359,11 +359,6 @@ out-of-band byte), SO_PEEK_OFF, SO_PASSPIDFD / SCM_PIDFD /
 SO_PEERPIDFD, SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC, SIOCUNIXFILE,
 SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 
-SO_PEERCRED (`peercred_opt`) and SCM_CREDENTIALS (`scm::Creds`) report
-uid/gid unmapped; Linux maps them into the reader's user namespace
-(cred_to_ucred, scm_recv: from_kuid_munged/from_kgid_munged), as
-SO_PEERGROUPS already does.
-
 ## File permission (DAC) gaps
 
 **Location**: `fs/dac.rs`, `task/exec.rs`
