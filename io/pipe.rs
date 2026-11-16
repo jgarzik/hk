@@ -68,6 +68,7 @@ use crate::io::fasync::{FasyncList, POLL_IN, POLL_OUT, fasync_helper, kill_fasyn
 use crate::io::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::sync::waitqueue::WaitQueue;
+use crate::task::UcountsRef;
 
 /// Pipe buffer size (matches Linux PIPE_BUF for atomic writes)
 pub const PIPE_BUF: usize = 4096;
@@ -80,9 +81,38 @@ pub const PIPE_DEF_BUFFERS: usize = 16;
 static PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(1 << 20);
 
 /// fs.pipe-user-pages-hard and -soft (Linux pipe_user_pages_hard,
-/// _soft); stored, not enforced (BUGS.md)
+/// _soft): the slots a user's pipes may hold in all, 0 for no limit
 static PIPE_USER_PAGES_HARD: AtomicUsize = AtomicUsize::new(0);
 static PIPE_USER_PAGES_SOFT: AtomicUsize = AtomicUsize::new(16384);
+
+/// Slots of a new pipe of a user over the soft limit (Linux
+/// PIPE_MIN_DEF_BUFFERS)
+const PIPE_MIN_DEF_BUFFERS: usize = 2;
+
+/// Move `user`'s charge for one pipe from `old` slots to `new`; the
+/// user's slots now (Linux account_pipe_buffers)
+fn account_pipe_buffers(user: &UcountsRef, old: usize, new: usize) -> usize {
+    use crate::task::ucount::Ucount;
+    if new >= old {
+        user.inc(Ucount::PipeBufs, (new - old) as u64) as usize
+    } else {
+        user.dec(Ucount::PipeBufs, (old - new) as u64);
+        user.get(Ucount::PipeBufs) as usize
+    }
+}
+
+/// Over a limit (Linux too_many_pipe_buffers_soft/_hard: 0 is none)
+fn over(limit: &AtomicUsize, user_bufs: usize) -> bool {
+    let l = limit.load(Ordering::Relaxed);
+    l != 0 && user_bufs > l
+}
+
+/// Neither CAP_SYS_RESOURCE nor CAP_SYS_ADMIN (Linux
+/// pipe_is_unprivileged_user)
+fn unprivileged() -> bool {
+    !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
+        && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
+}
 
 /// A requested pipe size rounded up to a power of two pages, at least
 /// one; 0 past 2^31 (Linux round_pipe_size)
@@ -264,6 +294,8 @@ pub struct PipeInner {
     bufs: alloc::boxed::Box<[PipeBuffer]>,
     /// Slots that may be in use (Linux max_usage), at most the ring's
     max_usage: usize,
+    /// Slots charged to the creator (Linux nr_accounted)
+    nr_accounted: usize,
     /// Head index, free-running (Linux pipe->head): the next slot
     /// written
     pub head: usize,
@@ -283,11 +315,12 @@ fn new_ring(n: usize) -> Result<alloc::boxed::Box<[PipeBuffer]>, KernelError> {
 }
 
 impl PipeInner {
-    /// An empty pipe of PIPE_DEF_BUFFERS slots
-    fn new() -> Result<Self, KernelError> {
+    /// An empty pipe of `slots` (a power of two), charged for them
+    fn new(slots: usize) -> Result<Self, KernelError> {
         Ok(Self {
-            bufs: new_ring(PIPE_DEF_BUFFERS)?,
-            max_usage: PIPE_DEF_BUFFERS,
+            bufs: new_ring(slots)?,
+            max_usage: slots,
+            nr_accounted: slots,
             head: 0,
             tail: 0,
             total_len: 0,
@@ -325,6 +358,7 @@ impl PipeInner {
         self.tail = 0;
         self.head = n;
         self.max_usage = slots;
+        self.nr_accounted = slots;
         Ok(())
     }
 
@@ -549,6 +583,8 @@ fn allocate_pipe_page() -> Option<Arc<PipePage>> {
 pub struct Pipe {
     /// Pipe buffer (Linux pipe->mutex); taken through [`Pipe::lock`]
     inner: Mutex<PipeInner>,
+    /// The user charged for its slots (Linux pipe->user)
+    user: UcountsRef,
     /// `inner.head`, `inner.tail` and `inner.max_usage` as of the last
     /// unlock, for lockless readers (Linux READ_ONCE(pipe->head/tail),
     /// pipe->max_usage)
@@ -574,12 +610,41 @@ pub struct Pipe {
 
 impl Pipe {
     /// Create a new pipe
+    /// A new pipe charged to the caller's user (Linux alloc_pipe_info):
+    /// PIPE_DEF_BUFFERS slots, fewer if fs.pipe-max-size is smaller
+    /// (without CAP_SYS_RESOURCE); PIPE_MIN_DEF_BUFFERS for an
+    /// unprivileged user over fs.pipe-user-pages-soft, ENFILE over -hard
     pub fn new() -> Result<Arc<Self>, KernelError> {
+        let user = crate::task::current_cred().ucounts;
+        let max_size = PIPE_MAX_SIZE.load(Ordering::Relaxed);
+        let mut slots = PIPE_DEF_BUFFERS;
+        if slots * PAGE_SIZE > max_size && !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
+            slots = max_size / PAGE_SIZE;
+        }
+        let mut user_bufs = account_pipe_buffers(&user, 0, slots);
+        if over(&PIPE_USER_PAGES_SOFT, user_bufs) && unprivileged() {
+            user_bufs = account_pipe_buffers(&user, slots, PIPE_MIN_DEF_BUFFERS);
+            slots = PIPE_MIN_DEF_BUFFERS;
+        }
+        let inner = if over(&PIPE_USER_PAGES_HARD, user_bufs) && unprivileged() {
+            Err(KernelError::SystemFileLimit)
+        } else {
+            PipeInner::new(slots)
+        };
+        let inner = match inner {
+            Ok(i) => i,
+            Err(e) => {
+                account_pipe_buffers(&user, slots, 0);
+                return Err(e);
+            }
+        };
+        // From here the pipe's drop gives the charge back
         try_arc(Self {
-            inner: Mutex::new(PipeInner::new()?),
+            inner: Mutex::new(inner),
+            user,
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
-            max_usage: AtomicUsize::new(PIPE_DEF_BUFFERS),
+            max_usage: AtomicUsize::new(slots),
             wait_queue: WaitQueue::new(),
             readers: AtomicU32::new(1),
             writers: AtomicU32::new(1),
@@ -597,22 +662,38 @@ impl Pipe {
     }
 
     /// F_SETPIPE_SZ (Linux pipe_set_size): `arg` rounded up to a power
-    /// of two pages (EINVAL past 2^31); above fs.pipe-max-size needs
-    /// CAP_SYS_RESOURCE (EPERM); fewer slots than are in use is EBUSY.
-    /// The new size in bytes; writers waiting for room are woken
+    /// of two pages (EINVAL past 2^31); growing above fs.pipe-max-size
+    /// needs CAP_SYS_RESOURCE, and past the user's soft or hard limit
+    /// CAP_SYS_RESOURCE or CAP_SYS_ADMIN (EPERM); fewer slots than are
+    /// in use is EBUSY. The new size in bytes; writers waiting for room
+    /// are woken
     pub fn set_size(&self, arg: u64) -> Result<usize, KernelError> {
         let size = round_pipe_size(arg);
         let slots = size / PAGE_SIZE;
         if slots == 0 {
             return Err(KernelError::InvalidArgument);
         }
-        if size > PIPE_MAX_SIZE.load(Ordering::Relaxed)
+        let mut g = self.lock();
+        let grow = slots > g.max_usage;
+        if grow
+            && size > PIPE_MAX_SIZE.load(Ordering::Relaxed)
             && !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
         {
             return Err(KernelError::NotPermitted);
         }
-        let mut g = self.lock();
-        g.resize(slots)?;
+        let old = g.nr_accounted;
+        let user_bufs = account_pipe_buffers(&self.user, old, slots);
+        let over_limit =
+            over(&PIPE_USER_PAGES_HARD, user_bufs) || over(&PIPE_USER_PAGES_SOFT, user_bufs);
+        let r = if grow && over_limit && unprivileged() {
+            Err(KernelError::NotPermitted)
+        } else {
+            g.resize(slots)
+        };
+        if let Err(e) = r {
+            account_pipe_buffers(&self.user, slots, old);
+            return Err(e);
+        }
         let n = g.max_usage() * PAGE_SIZE;
         drop(g);
         self.wait_queue.wake_all();
@@ -790,6 +871,14 @@ fn pipe_fasync(pipe: &Pipe, file: &File, fd: i32, on: bool) -> Result<(), Kernel
         return Err(e);
     }
     Ok(())
+}
+
+impl Drop for Pipe {
+    /// Give the creator's charge back (Linux free_pipe_info)
+    fn drop(&mut self) {
+        let n = self.inner.get_mut().nr_accounted;
+        account_pipe_buffers(&self.user, n, 0);
+    }
 }
 
 /// A locked pipe buffer ([`Pipe::lock`])

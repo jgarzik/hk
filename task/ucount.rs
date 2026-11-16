@@ -47,9 +47,12 @@ pub enum Ucount {
     /// user_struct.unix_inflight, charged to the sending user from
     /// queueing until received or dropped
     UnixInflight,
+    /// Pipe buffer slots: Linux user_struct.pipe_bufs, charged for each
+    /// pipe's slots from its creation to its free
+    PipeBufs,
 }
 
-const NR_UCOUNTS: usize = 5;
+const NR_UCOUNTS: usize = 6;
 
 /// One user's counters (Linux struct ucounts)
 pub struct Ucounts {

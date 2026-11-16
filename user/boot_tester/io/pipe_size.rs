@@ -9,7 +9,10 @@
 //! - PIPE_SZ_MAX: above fs.pipe-max-size needs CAP_SYS_RESOURCE (EPERM
 //!   without); the sysctl reads 1048576, rounds what is written up to a
 //!   power of two pages and refuses a negative value
-//! - PIPE_USER_PAGES: fs.pipe-user-pages-soft reads 16384, -hard 0
+//! - PIPE_USER_PAGES: fs.pipe-user-pages-soft reads 16384, -hard 0;
+//!   for an unprivileged user over the soft limit a new pipe has two
+//!   pages and cannot grow (EPERM), past the hard limit pipe() is
+//!   ENFILE (Linux alloc_pipe_info, account_pipe_buffers)
 
 use crate::harness::{R, check, report_r};
 use crate::proc::sysctl::{read_file, write_file};
@@ -29,6 +32,9 @@ const EPERM: i64 = -1;
 const CAP_SYS_RESOURCE: u32 = 24;
 const PAGE: usize = 4096;
 const MAX: &[u8] = b"/proc/sys/fs/pipe-max-size\0";
+const SOFT: &[u8] = b"/proc/sys/fs/pipe-user-pages-soft\0";
+const HARD: &[u8] = b"/proc/sys/fs/pipe-user-pages-hard\0";
+const ENFILE: i64 = -23;
 
 pub fn run_tests() {
     report_r(b"PIPE_SZ", with_pipe(sizes));
@@ -173,8 +179,53 @@ fn unprivileged() -> u8 {
 
 fn user_pages() -> R {
     let mut b = [0u8; 32];
-    let n = read_file(b"/proc/sys/fs/pipe-user-pages-soft\0", &mut b);
+    let n = read_file(SOFT, &mut b);
     check(b"soft", n > 0 && &b[..n as usize] == b"16384\n", n)?;
-    let n = read_file(b"/proc/sys/fs/pipe-user-pages-hard\0", &mut b);
-    check(b"hard", n > 0 && &b[..n as usize] == b"0\n", n)
+    let n = read_file(HARD, &mut b);
+    check(b"hard", n > 0 && &b[..n as usize] == b"0\n", n)?;
+    check(b"set soft", write_file(SOFT, b"4\n") == 2, 0)?;
+    check(b"set hard", write_file(HARD, b"4\n") == 2, 0)?;
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(limited() as u64);
+    }
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    write_file(SOFT, b"16384\n");
+    write_file(HARD, b"0\n");
+    check(b"limited user", ws == 0, i64::from(ws >> 8))
+}
+
+/// As a user of its own, without capabilities, both limits at 4
+/// slots: a new pipe over the soft limit gets 2 slots and may not
+/// grow (EPERM) but may shrink; one past the hard limit is ENFILE. 0
+/// or the failed step
+fn limited() -> u8 {
+    const UID: u32 = 31337;
+    if hk_syscall::sys_setresgid(UID, UID, UID) != 0
+        || hk_syscall::sys_setresuid(UID, UID, UID) != 0
+    {
+        return 1;
+    }
+    let mut p = [[0i32; 2]; 3];
+    if sys_pipe2(p[0].as_mut_ptr(), 0) != 0 {
+        return 2;
+    }
+    if get(p[0][0]) != 8192 {
+        return 3;
+    }
+    if set(p[0][1], 65536) != EPERM {
+        return 4;
+    }
+    if set(p[0][1], 4096) != 4096 {
+        return 5;
+    }
+    // 1 + 2 slots: within the hard limit; then 5 is past it
+    if sys_pipe2(p[1].as_mut_ptr(), 0) != 0 || get(p[1][0]) != 8192 {
+        return 6;
+    }
+    if sys_pipe2(p[2].as_mut_ptr(), 0) != ENFILE {
+        return 7;
+    }
+    0
 }
