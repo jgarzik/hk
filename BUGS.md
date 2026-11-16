@@ -644,6 +644,14 @@ F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
 waiting).
 
+## renameat2 flag gaps
+
+**Location**: `fs/ramfs/`, `fs/vfat/mod.rs`
+
+- RENAME_WHITEOUT is EINVAL everywhere; Linux tmpfs makes whiteouts
+  (shmem_whiteout).
+- vfat lacks RENAME_EXCHANGE (Linux vfat_rename_exchange).
+
 ## Kernel heap (slab) gaps
 
 **Location**: `mm/slab.rs`, `mm/heap.rs`
