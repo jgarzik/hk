@@ -15,6 +15,7 @@
 
 use crate::arch::{CurrentArch, DmaSyncOps, phys_to_virt, virt_to_phys};
 use crate::mm::frame_alloc::{FRAME_SIZE, FrameAllocator};
+use crate::mm::page_alloc::Gfp;
 use alloc::vec::Vec;
 
 /// DMA address type - what devices see
@@ -212,11 +213,18 @@ pub trait DmaDevice {
 /// - IommuDmaOps: uses IOVA from IOMMU (future)
 /// - SwiotlbDmaOps: bounce buffering for limited devices (future)
 pub trait DmaOps: Send + Sync {
-    /// Allocate coherent DMA memory
+    /// Allocate coherent DMA memory with `gfp` (Linux dma_alloc_coherent's
+    /// gfp: GFP_ATOMIC where the caller may not sleep)
     ///
     /// Returns memory that is always cache-coherent between CPU and device.
     /// Both CPU and device can access without explicit sync operations.
-    fn alloc_coherent(&self, config: &DmaConfig, size: usize, align: usize) -> Option<DmaCoherent>;
+    fn alloc_coherent(
+        &self,
+        config: &DmaConfig,
+        size: usize,
+        align: usize,
+        gfp: Gfp,
+    ) -> Option<DmaCoherent>;
 
     /// Free coherent DMA memory
     fn free_coherent(&self, alloc: DmaCoherent);
@@ -327,6 +335,7 @@ impl DmaOps for DirectDmaOps {
         config: &DmaConfig,
         size: usize,
         _align: usize,
+        gfp: Gfp,
     ) -> Option<DmaCoherent> {
         // Calculate number of frames needed
         let num_frames = size.div_ceil(FRAME_SIZE);
@@ -334,7 +343,7 @@ impl DmaOps for DirectDmaOps {
         // Multi-frame buffers must be physically contiguous: frames
         // allocated one by one are not, once memory has been freed
         if num_frames > 1 {
-            let first_frame = self.frame_alloc.alloc_contig(num_frames)?;
+            let first_frame = self.frame_alloc.alloc_contig_gfp(num_frames, gfp)?;
             let last = first_frame + (num_frames * FRAME_SIZE) as u64 - 1;
             if !self.check_mask(last, config.coherent_dma_mask) {
                 for i in 0..num_frames {
@@ -356,7 +365,7 @@ impl DmaOps for DirectDmaOps {
         }
 
         // Single frame allocation
-        let phys = self.frame_alloc.alloc()?;
+        let phys = self.frame_alloc.alloc_gfp(gfp)?;
 
         // Check mask
         if !self.check_mask(phys, config.coherent_dma_mask) {
@@ -506,7 +515,7 @@ pub fn dma_alloc_coherent_aligned<D: DmaDevice>(
     size: usize,
     align: usize,
 ) -> Option<DmaCoherent> {
-    ops()?.alloc_coherent(dev.dma_config(), size, align)
+    ops()?.alloc_coherent(dev.dma_config(), size, align, Gfp::KERNEL)
 }
 
 /// Free coherent DMA memory
@@ -536,12 +545,22 @@ pub struct DmaBox {
 impl DmaBox {
     /// `size` bytes of zeroed coherent memory for `dev`
     pub fn alloc<D: DmaDevice>(dev: &D, size: usize) -> Option<Self> {
-        Self::alloc_in(ops()?, dev.dma_config(), size)
+        Self::alloc_gfp(dev, size, Gfp::KERNEL)
+    }
+
+    /// `alloc` with `gfp` (GFP_ATOMIC under a spin lock)
+    pub fn alloc_gfp<D: DmaDevice>(dev: &D, size: usize, gfp: Gfp) -> Option<Self> {
+        Self::alloc_in(ops()?, dev.dma_config(), size, gfp)
     }
 
     /// `size` bytes from `ops`
-    fn alloc_in(ops: &'static dyn DmaOps, config: &DmaConfig, size: usize) -> Option<Self> {
-        let mem = ops.alloc_coherent(config, size, FRAME_SIZE)?;
+    fn alloc_in(
+        ops: &'static dyn DmaOps,
+        config: &DmaConfig,
+        size: usize,
+        gfp: Gfp,
+    ) -> Option<Self> {
+        let mem = ops.alloc_coherent(config, size, FRAME_SIZE, gfp)?;
         // INVARIANT: allocated by `ops`, freed only by drop
         Some(Self {
             mem: core::mem::ManuallyDrop::new(mem),
@@ -683,7 +702,13 @@ mod tests {
     }
 
     impl DmaOps for CountOps {
-        fn alloc_coherent(&self, _: &DmaConfig, size: usize, _: usize) -> Option<DmaCoherent> {
+        fn alloc_coherent(
+            &self,
+            _: &DmaConfig,
+            size: usize,
+            _: usize,
+            _: Gfp,
+        ) -> Option<DmaCoherent> {
             self.allocs.fetch_add(1, Ordering::Relaxed);
             let mem = alloc::vec![0u8; size].leak();
             Some(DmaCoherent {
@@ -727,7 +752,7 @@ mod tests {
             allocs: AtomicUsize::new(0),
             frees: AtomicUsize::new(0),
         };
-        let b = DmaBox::alloc_in(&OPS, &DmaConfig::default(), 64).unwrap();
+        let b = DmaBox::alloc_in(&OPS, &DmaConfig::default(), 64, Gfp::ATOMIC).unwrap();
         assert_eq!(b.size(), 64);
         assert_eq!(OPS.frees.load(Ordering::Relaxed), 0);
         drop(b);
