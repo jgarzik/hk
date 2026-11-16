@@ -70,6 +70,9 @@ pub const IORING_OP_WRITE: u8 = 23;
 pub const IORING_OP_SEND: u8 = 26;
 pub const IORING_OP_RECV: u8 = 27;
 pub const IORING_OP_OPENAT2: u8 = 28;
+
+/// A direct open picks the registered slot (Linux IORING_FILE_INDEX_ALLOC)
+pub const IORING_FILE_INDEX_ALLOC: u32 = !0;
 pub const IORING_OP_SHUTDOWN: u8 = 34;
 pub const IORING_OP_FTRUNCATE: u8 = 46;
 

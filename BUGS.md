@@ -624,10 +624,6 @@ return 0 without moving the device (Linux: moved, or an error).
 - IORING_OP_LINK_TIMEOUT returns 0 without arming anything
 - poll ops never complete asynchronously
 - Most opcodes past IORING_OP_SHUTDOWN are not handled (EINVAL CQEs)
-- OPENAT/OPENAT2 with a direct descriptor slot (`file_index`) are
-  EINVAL (Linux installs the file in the registered table,
-  io_fixed_fd_install); the open_how is read at submission to check it
-  and again by the worker (Linux copies it once, at prep)
 - Setup flags: no SQPOLL (Linux allows it unprivileged), SUBMIT_ALL,
   COOP_TASKRUN, TASKRUN_FLAG, SINGLE_ISSUER, DEFER_TASKRUN,
   NO_SQARRAY, SQE128/CQE32, NO_MMAP, REGISTERED_FD_ONLY, R_DISABLED,

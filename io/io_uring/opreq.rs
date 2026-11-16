@@ -24,10 +24,62 @@ use crate::task::{Cred, override_creds};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kmem::KVec;
 
+/// An SQE and what its opcode's prep copied at submission (Linux
+/// io_kiocb's command data, filled by def->prep in io_init_req); reads
+/// as the SQE
+#[derive(Default)]
+pub struct Sqe {
+    pub sqe: IoUringSqe,
+    pub open: Option<OpenArgs>,
+    /// Its checks or prep failed (a chain member, failed with its chain)
+    pub err: Option<KernelError>,
+}
+
+impl core::ops::Deref for Sqe {
+    type Target = IoUringSqe;
+    fn deref(&self) -> &IoUringSqe {
+        &self.sqe
+    }
+}
+
+impl Sqe {
+    /// A copy, for a chain's list
+    pub fn dup(&self) -> Self {
+        Self {
+            sqe: self.sqe,
+            open: self.open.clone(),
+            err: self.err,
+        }
+    }
+
+    /// The body of an operation that is not a read or write: an open's
+    /// copied arguments, else its syscall
+    pub fn body(&self) -> KernelResult<Body> {
+        Ok(match &self.open {
+            Some(a) => Body::Open(a.clone()),
+            None => Body::Op,
+        })
+    }
+}
+
+/// IORING_OP_OPENAT/OPENAT2 as prepped (Linux struct io_open): the
+/// name and open_how copied at submission, the direct descriptor slot
+/// (`file_index`, 0 for none) and RLIMIT_NOFILE then
+#[derive(Clone)]
+pub struct OpenArgs {
+    pub dfd: i32,
+    pub name: Vec<u8>,
+    pub how: crate::fs::open::OpenHow,
+    pub slot: u32,
+    pub nofile: u64,
+}
+
 /// What an `OpReq` does
 pub enum Body {
     /// An operation through its syscall (`ops::run_blocking`)
     Op,
+    /// An open of what its prep copied (`ops::open`)
+    Open(OpenArgs),
     /// A read or write of `file`: user iovecs, or `len` bytes at `addr`
     /// of a registered buffer
     Rw {
@@ -93,6 +145,7 @@ impl OpReq {
         match &self.body {
             Body::Rw { file, .. } => !super::rw::bounded_file(file),
             Body::Op => super::ops::unbound(self.sqe.opcode),
+            Body::Open(_) => false,
             Body::Failed(_) => false,
         }
     }
@@ -105,6 +158,7 @@ impl OpReq {
         let _creds = override_creds(self.creds.clone());
         let r = match &self.body {
             Body::Op => super::ops::run_blocking(&self.sqe),
+            Body::Open(a) => super::ops::open(&self.ring, a),
             Body::Rw {
                 file,
                 write,

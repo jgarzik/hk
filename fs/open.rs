@@ -345,42 +345,52 @@ pub fn sys_openat(dirfd: i32, path_ptr: UserPtr<u8>, flags: u32, mode: u32) -> K
 /// first version EINVAL, one over a page or with unknown nonzero
 /// fields E2BIG; O_LARGEFILE unless O_PATH
 pub fn sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: u64, usize: usize) -> KernelResult<i32> {
-    if usize < OPEN_HOW_SIZE_VER0 {
-        return Err(KernelError::InvalidArgument);
-    }
+    // Linux openat2: EINVAL below the first version (copy_open_how), then
+    // E2BIG past a page
     if usize as u64 > crate::mm::PAGE_SIZE {
         return Err(KernelError::ArgListTooLong);
     }
-    do_sys_openat2(dirfd, path_ptr, &read_open_how(how, usize)?)
-}
-
-/// The `struct open_how` of `usize` bytes at `how` (Linux
-/// copy_struct_from_user: E2BIG for unknown nonzero fields, EFAULT),
-/// O_LARGEFILE added unless O_PATH; the caller checked the size
-pub fn read_open_how(how: u64, usize: usize) -> KernelResult<OpenHow> {
-    let mut how = match crate::uaccess::copy_struct_from_user::<OpenHow>(how, usize) {
-        Ok(h) => h,
-        Err(None) => return Err(KernelError::ArgListTooLong),
-        Err(Some(_)) => return Err(KernelError::BadAddress),
-    };
+    let mut how = copy_open_how(how, usize)?;
     if how.flags & u64::from(O_PATH) == 0 {
         how.flags |= u64::from(O_LARGEFILE);
     }
-    Ok(how)
+    do_sys_openat2(dirfd, path_ptr, &how)
 }
 
-/// IORING_OP_OPENAT2 (Linux io_openat2): openat2 with no page limit on
-/// the struct's size
-pub fn uring_openat2(
-    dirfd: i32,
-    path_ptr: UserPtr<u8>,
-    how: u64,
-    usize: usize,
-) -> KernelResult<i32> {
+/// The `struct open_how` of `usize` bytes at `how` (Linux openat2's and
+/// io_openat2_prep's checks and copy_struct_from_user): EINVAL below the
+/// first version, E2BIG for unknown nonzero fields, EFAULT
+pub fn copy_open_how(how: u64, usize: usize) -> KernelResult<OpenHow> {
     if usize < OPEN_HOW_SIZE_VER0 {
         return Err(KernelError::InvalidArgument);
     }
-    do_sys_openat2(dirfd, path_ptr, &read_open_how(how, usize)?)
+    match crate::uaccess::copy_struct_from_user::<OpenHow>(how, usize) {
+        Ok(h) => Ok(h),
+        Err(None) => Err(KernelError::ArgListTooLong),
+        Err(Some(_)) => Err(KernelError::BadAddress),
+    }
+}
+
+/// Open `name` (already copied in) relative to `dirfd` as `how` asks
+/// (Linux build_open_flags + do_file_open): the file, not installed
+pub fn open_file(dirfd: i32, name: &[u8], how: &OpenHow) -> KernelResult<FileRef> {
+    let op = build_open_flags(how)?;
+    filp_open(OpenAt::Fd(dirfd), name, &op)
+}
+
+/// [`open_file`] at a descriptor reserved first below `nofile` (Linux
+/// io_openat2: __get_unused_fd_flags with the prep's RLIMIT_NOFILE,
+/// then fd_install); the descriptor
+pub fn open_install(dirfd: i32, name: &[u8], how: &OpenHow, nofile: u64) -> KernelResult<i32> {
+    let op = build_open_flags(how)?;
+    let fd_flags = if how.flags & u64::from(O_CLOEXEC) != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
+    let fd = super::io::get_unused_fd_nofile(fd_flags, nofile)?;
+    let file = filp_open(OpenAt::Fd(dirfd), name, &op)?;
+    Ok(fd.install(file))
 }
 
 /// Open as `how` asks and install the file (Linux do_sys_openat2): the

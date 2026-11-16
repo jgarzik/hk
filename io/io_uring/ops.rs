@@ -6,6 +6,7 @@
 //! completes asynchronously: BUGS "io_uring gaps")
 
 use super::abi::*;
+use super::opreq::OpenArgs;
 use super::{IoRing, Submit};
 use crate::uaccess::{UserPtr, copy_val_from_user};
 use crate::util::error::{KernelError, KernelResult};
@@ -82,15 +83,6 @@ pub fn run_blocking(sqe: &IoUringSqe) -> KernelResult<i32> {
     match sqe.opcode {
         IORING_OP_NOP => Ok(0),
         IORING_OP_CLOSE => crate::fs::syscall::sys_close(sqe.fd).map(|()| 0),
-        IORING_OP_OPENAT => {
-            crate::fs::syscall::sys_openat(sqe.fd, UserPtr::new(sqe.addr), sqe.op_flags, sqe.len)
-        }
-        IORING_OP_OPENAT2 => crate::fs::open::uring_openat2(
-            sqe.fd,
-            UserPtr::new(sqe.addr),
-            sqe.off,
-            sqe.len as usize,
-        ),
         IORING_OP_FSYNC => fsync(sqe),
         IORING_OP_STATX => crate::fs::syscall::sys_statx(
             sqe.fd,
@@ -109,30 +101,65 @@ pub fn run_blocking(sqe: &IoUringSqe) -> KernelResult<i32> {
     }
 }
 
-/// The submission checks of IORING_OP_OPENAT and IORING_OP_OPENAT2, in
-/// Linux's order (io_openat2_prep, __io_openat_prep): OPENAT2's
-/// open_how sized and readable (EINVAL, EFAULT, E2BIG), no buffer index
-/// (EINVAL), no registered file (EBADF), no direct descriptor slot
-/// (`file_index`: EINVAL with O_CLOEXEC; hk installs none, EINVAL too,
-/// BUGS.md). The worker reads the open_how again
-pub fn open_prep(sqe: &IoUringSqe) -> KernelResult<()> {
-    use crate::fs::open::{OPEN_HOW_SIZE_VER0, read_open_how};
-    if sqe.opcode == IORING_OP_OPENAT2 {
-        if (sqe.len as usize) < OPEN_HOW_SIZE_VER0 {
-            return Err(KernelError::InvalidArgument);
-        }
-        read_open_how(sqe.off, sqe.len as usize)?;
+/// The opcode's prep at submission (Linux def->prep from io_init_req):
+/// what must be copied from user memory now, so the SQE's pointers are
+/// not read again (IORING_FEAT_SUBMIT_STABLE); an error ends the batch
+pub fn prep(sqe: &IoUringSqe) -> KernelResult<Option<OpenArgs>> {
+    match sqe.opcode {
+        IORING_OP_OPENAT | IORING_OP_OPENAT2 => open_prep(sqe).map(Some),
+        _ => Ok(None),
     }
+}
+
+/// Linux io_openat_prep / io_openat2_prep, then __io_openat_prep: the
+/// open_how (OPENAT: from open_flags and the mode in len; OPENAT2:
+/// copied from addr2, len bytes, EINVAL below the first version, E2BIG,
+/// EFAULT), no buffer index (EINVAL), no registered file (EBADF),
+/// O_LARGEFILE unless O_PATH, the name copied in (getname: an empty one
+/// ENOENT), a direct slot (file_index) not with O_CLOEXEC (EINVAL), and
+/// RLIMIT_NOFILE as of now
+fn open_prep(sqe: &IoUringSqe) -> KernelResult<OpenArgs> {
+    use crate::fs::flags::{O_LARGEFILE, O_PATH};
+    use crate::fs::open::build_open_how;
+    let mut how = if sqe.opcode == IORING_OP_OPENAT2 {
+        crate::fs::open::copy_open_how(sqe.off, sqe.len as usize)?
+    } else {
+        build_open_how(sqe.op_flags, sqe.len)
+    };
     if sqe.buf_index != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    if sqe.flags & super::abi::IOSQE_FIXED_FILE != 0 {
+    if sqe.flags & IOSQE_FIXED_FILE != 0 {
         return Err(KernelError::BadFd);
     }
-    if sqe.splice_fd_in != 0 {
+    if how.flags & u64::from(O_PATH) == 0 {
+        how.flags |= u64::from(O_LARGEFILE);
+    }
+    let name = crate::fs::namei::getname(UserPtr::new(sqe.addr), false)?;
+    let slot = sqe.splice_fd_in as u32;
+    if slot != 0 && how.flags & u64::from(crate::fs::file::flags::O_CLOEXEC) != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    Ok(())
+    Ok(OpenArgs {
+        dfd: sqe.fd,
+        name,
+        how,
+        slot,
+        nofile: crate::fs::syscall::get_nofile_limit(),
+    })
+}
+
+/// Linux io_openat2: the open flags built (EINVAL), then a descriptor
+/// reserved below the prep's RLIMIT_NOFILE and the file installed there,
+/// or with a slot the file installed in the registered table
+/// (`IoRing::fixed_install`)
+pub fn open(r: &IoRing, a: &OpenArgs) -> KernelResult<i32> {
+    use crate::fs::open::{open_file, open_install};
+    if a.slot == 0 {
+        return open_install(a.dfd, &a.name, &a.how, a.nofile);
+    }
+    let file = open_file(a.dfd, &a.name, &a.how)?;
+    r.fixed_install(file, a.slot)
 }
 
 fn fsync(sqe: &IoUringSqe) -> KernelResult<i32> {
