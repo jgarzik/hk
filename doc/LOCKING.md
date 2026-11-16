@@ -957,9 +957,9 @@ Each `Task` carries its scheduling entity (`Task.se`, Linux
 sched_entity + `__state`/`on_rq`): `state` (`SleepState` as an
 atomic), `on_rq` (queued or running), `on_cpu` (running, or its CPU
 still switching away from it), the scheduling class and Linux
-parameters (`class`, `policy`, `static_prio`, `rt_priority`,
-`reset_on_fork`; SCHED_RR's slice), the run-list `link`, the saved
-switch frame, and the WakeQ link; plus
+parameters (`params`: class, policy, static and rt priority in one
+word; `reset_on_fork`; SCHED_RR's slice), the run-list `link` and the
+saved switch frame (the wake queue link is `Task.wake_q`, 1.4); plus
 `Task.pi_lock` (IrqSpinlock, Linux pi_lock). The run queue owns one
 reference to each task of its CPU, from its first wakeup (or creation
 asleep) until its final switch away (`DeadTask`; Linux: the task's own
@@ -4310,7 +4310,7 @@ Neither thread can miss the other's update.
 FutexHashBucket.waiters (spin Mutex): leaf (two in address order for a
 requeue). Wakers dequeue FutexQ entries under it into a WakeQ (a
 reference to each task, Linux wake_q_add), drop it, then wake them
-(`WakeQ::wake_up` -> try_to_wake_up; no TASKLIST).
+(`task::wake_q::WakeQ::wake` -> try_to_wake_up; no TASKLIST).
 ```
 
 Keys (`make_key`, Linux get_futex_key) are made before any bucket

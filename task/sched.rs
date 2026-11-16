@@ -7,9 +7,7 @@
 //! change in interrupt context.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering,
-};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use super::Priority;
 use crate::util::list::{Adapter, Link, List};
@@ -134,9 +132,6 @@ pub struct SchedEntity {
     /// The kernel stack it owns, freed after its last switch away (none
     /// for the boot stack of the first user task, nor an idle task's)
     pub stack: crate::mm::vmstack::StackSlot,
-    /// Next task on a [`WakeQ`](crate::task::percpu::WakeQ); null when
-    /// on none (Linux wake_q_node)
-    pub wake_q: AtomicPtr<()>,
 }
 
 // SAFETY: `ctx` (the UnsafeCell) is only touched under the rq lock of the
@@ -164,7 +159,6 @@ impl SchedEntity {
                 <crate::arch::CurrentArch as crate::arch::ContextOps>::ZERO_CONTEXT,
             ),
             stack: crate::mm::vmstack::StackSlot::empty(),
-            wake_q: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 

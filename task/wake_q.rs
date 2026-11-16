@@ -76,6 +76,32 @@ impl WakeQ {
         self.last = p;
     }
 
+    /// Queue `t` for a wakeup, taking a reference if it is claimed for
+    /// this queue (Linux wake_q_add: get_task_struct after the claim);
+    /// one already on a queue is left to that queue's wakeup, issued
+    /// after the caller's condition store
+    pub fn add(&mut self, t: &Task) {
+        fence(Ordering::SeqCst);
+        if t.wake_q
+            .compare_exchange(
+                core::ptr::null_mut(),
+                TAIL,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let p = Arc::into_raw(super::percpu::task_ref(t));
+        // SAFETY: `last` is a task this queue holds a reference to
+        match unsafe { self.last.as_ref() } {
+            Some(l) => l.wake_q.store(p.cast_mut(), Ordering::Relaxed),
+            None => self.first = p,
+        }
+        self.last = p;
+    }
+
     /// Wake every queued task and drop its reference (Linux wake_up_q);
     /// the queue is empty again
     pub fn wake(&mut self) {

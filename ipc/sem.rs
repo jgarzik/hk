@@ -24,7 +24,8 @@ use crate::ipc::{
 };
 use crate::sync::spin::Mutex;
 use crate::task::Task;
-use crate::task::percpu::{WakeQ, current_pid};
+use crate::task::percpu::current_pid;
+use crate::task::wake_q::WakeQ;
 use crate::time::TIMEKEEPER;
 use crate::uaccess::{UserPtr, UserSlice};
 use crate::util::error::{KernelError, KernelResult};
@@ -745,7 +746,7 @@ impl SemArray {
         let mut wq = WakeQ::new();
         do_smart_update(&mut l, sops, &mut wq);
         drop(l);
-        wq.wake_up();
+        wq.wake();
     }
 
     /// Fill semid64_ds structure for IPC_STAT (complex mode)
@@ -795,7 +796,7 @@ impl IpcObject for SemArray {
             }
         }
         drop(dead);
-        wq.wake_up();
+        wq.wake();
         self.ns.used_sems.fetch_sub(self.nsems, Ordering::Relaxed);
     }
 }

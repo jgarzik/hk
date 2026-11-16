@@ -43,7 +43,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use crate::sync::spin::Mutex as SpinMutex;
 use crate::task::Task;
 use crate::task::Tid;
-use crate::task::percpu::WakeQ;
+use crate::task::wake_q::WakeQ;
 use crate::time::time_syscall::LinuxTimespec;
 use crate::uaccess::{UserPtr, get_user};
 use crate::util::error::{KernelError, KernelResult};
@@ -652,7 +652,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> K
     }
 
     // Wake tasks outside the bucket lock
-    to_wake.wake_up();
+    to_wake.wake();
 
     Ok(woken)
 }
@@ -732,7 +732,7 @@ pub fn futex_requeue(
     };
 
     // Wake collected tasks (bucket locks dropped)
-    to_wake.wake_up();
+    to_wake.wake();
     r
 }
 

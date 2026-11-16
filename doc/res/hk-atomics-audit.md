@@ -236,14 +236,6 @@ argued / published copy of locked state.
 - Fix: Relaxed load+store under the lock (the `Page` fields must stay atomic
   types for interior mutability; only the RMW goes).
 
-### 21. Two wake-queue links per task — (a)
-- Where: `task/mod.rs` `Task.wake_q` (used by `task/wake_q.rs`) and
-  `task/sched.rs` `SchedEntity.wake_q` (used by `task/percpu.rs` `WakeQ`).
-- Wrong: two parallel implementations of Linux `wake_q`; a task can be on
-  both, and each has its own claim protocol.
-- Linux: one `wake_q_node` per task, claimed with `cmpxchg`.
-- Fix: one implementation, one node.
-
 ### 22. Inode identity bits as unrelated atomics — (b), low
 - Where: `fs/inode.rs` `Inode.mode`, `uid`, `gid` (chown/chmod write them
   separately), `dead`, `i_swapfile`, `i_linkable`.
