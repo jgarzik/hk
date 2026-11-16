@@ -1118,6 +1118,14 @@ Tag = roadmap phase (doc/ROADMAP.md).
     signal->multiprocess delay and its recheck under siglock) may
     miss a child that joined the group before the walk.
 
+13. **TCP_MEM_PRESSURE flake** (hk x86, once in four local `check`
+    runs, in a gate): `TCP_MEM_PRESSURE:FAIL pair status got 1024`: a
+    pair's reader got less than 128 KiB before its 20 s receive
+    timeout (`user/boot_tester/net/tcp_mem.rs` `pair`, exit 4) with
+    every tcp_mem limit at 4 pages. A connection stalled under memory
+    pressure: a forced charge for an empty queue, or the window or
+    retransmit timer after a drop, may not restart it.
+
 ## DRM dumb buffers are the boot framebuffer only
 
 **Location**: `hw/gfx/simplegfx.rs` (`create_dumb`)
