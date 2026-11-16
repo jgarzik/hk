@@ -248,6 +248,7 @@ pub fn run_all_tests() {
     mount::mounts::run_tests();
     mount::mntns_check::run_tests();
     mount::mountinfo::run_tests();
+    mount::mount_poll::run_tests();
     proc::sysfs::run_tests();
     proc::tracefs::run_tests();
     mount::pnode::run_tests();

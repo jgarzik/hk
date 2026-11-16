@@ -1151,13 +1151,15 @@ dumb buffer from shmem and blits it on page flip
 No time namespaces (CLONE_NEWTIME, the time and time_for_children
 links). No nsfs file handles (File handle gaps).
 
-## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
+## /proc/<pid>/mounts reads the task's namespace at read time
 
-**Location**: `fs/proc/mod.rs` (`ProcfsFileOps::poll`)
+**Location**: `fs/proc/mounts.rs` (`with_visible`)
 
-mounts and mountinfo poll readable only: a change of the mount table
-never reports POLLERR|POLLPRI (Linux mounts_poll: the namespace's
-event count against the reader's).
+mounts, mountinfo and mountstats are generated from the process's
+mount namespace and root at each read; Linux takes both at open
+(mounts_open_common: proc_mounts.ns, .root), so after a setns or
+chroot an open file still lists the old ones. Polling already uses the
+namespace taken at open (`ProcOpen.mnt`).
 
 ## TSC trusted without the invariant flag
 

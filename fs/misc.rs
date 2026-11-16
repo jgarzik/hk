@@ -172,7 +172,11 @@ fn remount(m: &super::mount::MountRef, flags: u64, data: &[u8]) -> Result<(), Ke
         m.sb.make_rdwr();
     }
     m.sb.set_sync_flags(sb_sync_flags(flags));
-    m.set_flags(remount_flags(flags, m.flags()))
+    m.set_flags(remount_flags(flags, m.flags()))?;
+    // Linux set_mount_attributes: touch_mnt_namespace (the caller's
+    // namespace: check_mnt)
+    crate::ns::current_mnt_ns().touch();
+    Ok(())
 }
 
 /// MS_REMOUNT|MS_BIND (Linux do_reconfigure_mnt): this mount's flags
@@ -185,7 +189,9 @@ fn reconfigure_mnt(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelE
     // s_umount shared, as Linux do_reconfigure_mnt: the superblock does
     // not change, MOUNT_LOCK serializes the flag writers
     let _s = m.sb.s_umount.read();
-    m.set_flags(remount_flags(flags, m.flags()))
+    m.set_flags(remount_flags(flags, m.flags()))?;
+    crate::ns::current_mnt_ns().touch();
+    Ok(())
 }
 
 /// MS_SHARED / MS_SLAVE / MS_PRIVATE / MS_UNBINDABLE (Linux
@@ -216,6 +222,8 @@ fn change_type(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError
     } else {
         change_mnt_propagation(&mut ns, m, p);
     }
+    // Linux do_change_type: touch_mnt_namespace
+    ns.touch(m.ns());
     Ok(())
 }
 

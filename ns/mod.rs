@@ -146,9 +146,32 @@ pub struct MntNamespace {
     /// The user namespace that owns it (Linux mnt_namespace.user_ns),
     /// set at creation
     pub user_ns: Arc<UserNamespace>,
+    /// The number of its last change (Linux mnt_namespace.event)
+    event: core::sync::atomic::AtomicU64,
+    /// Pollers of its mount lists (Linux mnt_namespace.poll)
+    pub poll: crate::sync::waitqueue::WaitQueue,
 }
 
+/// The last mount change's number, of any namespace (Linux
+/// fs/namespace.c event, under namespace_sem; here an atomic, as the
+/// changes are numbered after the unlock)
+static MNT_EVENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 impl MntNamespace {
+    /// Its mount table changed (Linux touch_mnt_namespace): a new
+    /// change number, and its pollers woken
+    pub fn touch(&self) {
+        use core::sync::atomic::Ordering;
+        let e = MNT_EVENT.fetch_add(1, Ordering::Relaxed) + 1;
+        self.event.store(e, Ordering::Release);
+        self.poll.wake_all();
+    }
+
+    /// The number of its last change (Linux ns->event)
+    pub fn event(&self) -> u64 {
+        self.event.load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// A new empty mount namespace owned by `user_ns`, not yet in the
     /// namespace tree, or ENOMEM (Linux alloc_mnt_ns)
     fn alloc(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
@@ -188,6 +211,8 @@ impl MntNamespace {
             root: RwLock::new(None),
             ns,
             user_ns,
+            event: core::sync::atomic::AtomicU64::new(0),
+            poll: crate::sync::waitqueue::WaitQueue::new(),
         }
     }
 

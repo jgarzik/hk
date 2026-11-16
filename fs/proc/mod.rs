@@ -1263,6 +1263,10 @@ fn mm_access(t: &TaskRef) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
 /// generated
 struct ProcOpen {
     mm: Option<Arc<crate::mm::Mm>>,
+    /// The mount namespace a mounts file was opened on and the number
+    /// of its change last reported (Linux proc_mounts.ns,
+    /// seq_file.poll_event)
+    mnt: Option<(Arc<crate::ns::MntNamespace>, core::sync::atomic::AtomicU64)>,
     /// The network namespace a /proc/<pid>/net file was opened on
     /// (Linux seq_net_private.net: an active reference)
     net: Option<crate::net::NetRef>,
@@ -1287,6 +1291,22 @@ fn net_of(inode: &Inode) -> Option<Arc<crate::net::NetNamespace>> {
         ProcfsInodeData::NetFile { net, .. } => Some(net.clone()),
         _ => None,
     })?
+}
+
+/// The mount namespace of a /proc/<pid>/mounts inode's process, for an
+/// open (Linux mounts_open_common: EINVAL without the task or its
+/// nsproxy)
+fn mnt_ns_of(inode: &Inode) -> Result<Arc<crate::ns::MntNamespace>, KernelError> {
+    let pid = with_data(inode, |d| match d {
+        ProcfsInodeData::PidFile { pid, .. } => Some(pid.clone()),
+        _ => None,
+    })
+    .flatten()
+    .ok_or(KernelError::InvalidArgument)?;
+    let t = pid.task().ok_or(KernelError::InvalidArgument)?;
+    task_nsproxy(&t)
+        .map(|n| n.mnt_ns.clone())
+        .ok_or(KernelError::InvalidArgument)
 }
 
 /// The namespace an open /proc/<pid>/net file pinned
@@ -1662,13 +1682,29 @@ impl FileOps for ProcfsFileOps {
         })
     }
 
-    /// A mount table is readable (Linux mounts_poll; no POLLERR|POLLPRI
-    /// on a change of it yet); the rest DEFAULT_POLLMASK (vfs_poll)
-    fn poll(&self, file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
-        match proc_poll(file) {
-            ProcPoll::Mounts => POLLIN | POLLRDNORM,
-            _ => DEFAULT_POLLMASK,
+    /// A mount table is readable, and POLLERR|POLLPRI once after each
+    /// change of its namespace's mounts (Linux mounts_poll); the rest
+    /// DEFAULT_POLLMASK (vfs_poll)
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
+        use core::sync::atomic::Ordering;
+        if proc_poll(file) != ProcPoll::Mounts {
+            return DEFAULT_POLLMASK;
         }
+        let Some(po) = proc_open(file) else {
+            return POLLIN | POLLRDNORM;
+        };
+        let Some((ns, seen)) = po.mnt.as_ref() else {
+            return POLLIN | POLLRDNORM;
+        };
+        if let Some(pt) = pt {
+            pt.poll_wait(&ns.poll);
+        }
+        let event = ns.event();
+        let mut res = POLLIN | POLLRDNORM;
+        if seen.swap(event, Ordering::AcqRel) != event {
+            res |= crate::io::poll::POLLERR | crate::io::poll::POLLPRI;
+        }
+        res
     }
 
     fn can_poll(&self, file: &File) -> bool {
@@ -1693,10 +1729,19 @@ impl FileOps for ProcfsFileOps {
             Some(n) => Some(n.maybe_get().ok_or(KernelError::NoDeviceOrAddress)?),
             None => None,
         };
+        let mnt = match proc_poll(file) {
+            ProcPoll::Mounts => {
+                let ns = mnt_ns_of(&inode)?;
+                let ev = core::sync::atomic::AtomicU64::new(ns.event());
+                Some((ns, ev))
+            }
+            _ => None,
+        };
         // A generated file keeps its last generation (seq_file)
         if inode.mode().is_file() && sysctl_of(&inode).is_none() && fail_nth_of(&inode).is_none() {
             let po = try_arc(ProcOpen {
                 mm,
+                mnt,
                 net,
                 seq: crate::sync::Mutex::new(None),
             })?;

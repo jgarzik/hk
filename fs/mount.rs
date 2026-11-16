@@ -116,6 +116,64 @@ pub struct NsTree {
     /// Mountpoints whose last mount left, dropped (their dentries put)
     /// after the unlock (Linux ex_mountpoints)
     ex_mountpoints: BoxList<MpHashA>,
+    /// The namespaces whose mount tables changed, touched after the
+    /// unlock (Linux touch_mnt_namespace)
+    touched: Touched,
+}
+
+/// The ids of namespaces changed under one hold of NAMESPACE_SEM: a
+/// few, or with `all` every mount namespace (no allocation under
+/// MOUNT_LOCK, where umount_tree records them)
+#[derive(Clone, Copy)]
+struct Touched {
+    ids: [u64; 4],
+    n: usize,
+    all: bool,
+}
+
+impl Touched {
+    const fn new() -> Self {
+        Self {
+            ids: [0; 4],
+            n: 0,
+            all: false,
+        }
+    }
+
+    fn add(&mut self, id: u64) {
+        if id == 0 || id == MNT_NS_INTERNAL || self.ids[..self.n].contains(&id) {
+            return;
+        }
+        match self.ids.get_mut(self.n) {
+            Some(s) => {
+                *s = id;
+                self.n += 1;
+            }
+            None => self.all = true,
+        }
+    }
+
+    /// Touch them (Linux touch_mnt_namespace, here after the unlock:
+    /// a namespace's last reference may go here, and its put takes
+    /// NAMESPACE_SEM)
+    fn touch(self) {
+        use crate::ns::tree::{Tree, lookup, walk};
+        let tree = Tree::Type(crate::ns::CLONE_NEWNS);
+        let touch = |r: crate::ns::NsRef| {
+            if let crate::ns::NsRef::Mnt(ns) = r {
+                ns.touch();
+            }
+        };
+        if self.all {
+            walk(tree).for_each(touch);
+            return;
+        }
+        for &id in &self.ids[..self.n] {
+            if let Some(r) = lookup(tree, id) {
+                touch(r);
+            }
+        }
+    }
 }
 
 // SAFETY: one value, built here for NAMESPACE_SEM alone (private
@@ -123,6 +181,11 @@ pub struct NsTree {
 unsafe impl UniqueOwner for NsTree {}
 
 impl NsTree {
+    /// Namespace `id`'s mount table changed: touched after the unlock
+    pub(super) fn touch(&mut self, id: u64) {
+        self.touched.add(id);
+    }
+
     /// Put `m`'s reference a grace period after [`namespace_unlock`]
     /// (Linux hlist_add_head on unmounted)
     fn add_unmounted(&mut self, m: Arc<Mount>) {
@@ -148,6 +211,7 @@ impl NsTree {
 static NAMESPACE_SEM: RwSem<NsTree> = RwSem::new(NsTree {
     unmounted: None,
     ex_mountpoints: BoxList::new(),
+    touched: Touched::new(),
 });
 
 /// NAMESPACE_SEM held shared
@@ -189,9 +253,11 @@ pub fn namespace_lock() -> NsWrite {
 fn namespace_unlock(ns: &mut NsWrite) {
     let head = ns.unmounted.take();
     let list = core::mem::take(&mut ns.ex_mountpoints);
+    let touched = core::mem::replace(&mut ns.touched, Touched::new());
     // SAFETY: from NsWrite's drop, once; the guard is not used after
     unsafe { core::mem::ManuallyDrop::drop(&mut ns.0) };
     drop(list);
+    touched.touch();
     let Some(head) = head.filter(|h| !h.is_empty()) else {
         return;
     };
@@ -1430,11 +1496,12 @@ pub fn check_mnt(m: &Mount) -> bool {
 
 /// The tree at `m`, just hung on its parent, joins the parent's
 /// namespace (Linux commit_tree); under NAMESPACE_SEM write
-pub(super) fn commit_tree(ns: &NsTree, m: &MountRef) {
+pub(super) fn commit_tree(ns: &mut NsTree, m: &MountRef) {
     let id = m.parent_in(ns).map_or(0, Mount::ns);
     for t in walk(m, ns) {
         t.set_ns(id);
     }
+    ns.touch(id);
 }
 
 /// A new mount of `m`'s filesystem rooted at `root`, with its flags
@@ -1793,6 +1860,7 @@ fn umount_tree(ns: &mut NsTree, ml: &mut MntHash, mnt: &Mount, how: u32) {
     }
     super::pnode::bulk_make_private(ns, &set);
     while let Some(p) = set.pop_front() {
+        ns.touch(p.ns());
         p.set_ns(0);
         if how & UMOUNT_SYNC != 0 {
             p.mnt_flags.fetch_or(MNT_SYNC_UMOUNT, Ordering::SeqCst);
@@ -2367,6 +2435,8 @@ pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
     }
     attach_at(ns, tr, put_old);
     attach_mnt(ns, tn, &root_parent, root_mp.mp());
+    // Linux path_pivot_root: touch_mnt_namespace
+    ns.touch(new.mnt.ns());
     let gone = unpin_mountpoint(&mut MOUNT_LOCK.read_excl(), root_mp);
     drop(l);
     drop(gone);
