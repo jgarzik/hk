@@ -65,7 +65,7 @@ pub(super) const PCI_VENDOR_INTEL: u16 = 0x8086;
 pub(super) const XHCI_IRQS: u32 = (1 << 2) | (1 << 3) | (1 << 10);
 
 /// Chipset quirks, set once from the PCI IDs (Linux xhci_pci_quirks)
-mod quirk {
+pub(super) mod quirk {
     use super::PCI_VENDOR_INTEL;
     use crate::hw::pci::PciDevice;
 
@@ -75,9 +75,17 @@ mod quirk {
     pub const SPURIOUS_REBOOT: u32 = 1 << 1;
     /// Reset and D3hot at shutdown, or spurious wakeups follow
     pub const SPURIOUS_WAKEUP: u32 = 1 << 2;
+    /// No soft retry of a transaction error (Linux XHCI_NO_SOFT_RETRY)
+    pub const NO_SOFT_RETRY: u32 = 1 << 3;
 
     pub fn of(dev: &PciDevice) -> u32 {
-        if dev.header.vendor_id != PCI_VENDOR_INTEL {
+        let (vendor, device) = (dev.header.vendor_id, dev.header.device_id);
+        match (vendor, device) {
+            // Etron EJ168, EJ188; AMD Promontory A
+            (0x1b6f, 0x7023 | 0x7052) | (0x1022, 0x43b9 | 0x43bb) => return NO_SOFT_RETRY,
+            _ => {}
+        }
+        if vendor != PCI_VENDOR_INTEL {
             return 0;
         }
         INTEL_HOST
@@ -749,6 +757,8 @@ pub(super) struct VirtEp {
     /// When its last Stop Endpoint was queued (monotonic ns; Linux
     /// ep->stop_time)
     pub(super) stop_time: u64,
+    /// Transaction errors soft-retried in a row (Linux ep->err_count)
+    pub(super) err_count: u32,
 }
 
 impl VirtEp {
@@ -760,6 +770,7 @@ impl VirtEp {
             queued_deq: None,
             maxp: 0,
             stop_time: 0,
+            err_count: 0,
         }
     }
 
@@ -775,6 +786,7 @@ impl VirtEp {
             queued_deq: None,
             maxp,
             stop_time: 0,
+            err_count: 0,
         })
     }
 }
@@ -822,7 +834,7 @@ impl XhciState {
 pub struct Xhci {
     pub(super) pci_dev: PciDevice,
     pub(super) regs: Regs,
-    quirks: u32,
+    pub(super) quirks: u32,
     pub(super) hci_version: u16,
     max_slots: u8,
     max_ports: u8,

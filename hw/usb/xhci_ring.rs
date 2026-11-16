@@ -15,8 +15,8 @@ use super::context::ep_ctx_state;
 use super::transfer::{CompletionCode as Cc, Trb, TrbType, bulk_trbs, td_remainder};
 use super::urb::{Urb, usb_hcd_giveback_urb};
 use super::xhci::{
-    CmdRingState, Td, TdCancel, VirtEp, Xhci, XhciCommand, XhciState, ep_state, ir, op, slot_trb,
-    trb_type, usbsts, xhc_state, xhci_trace,
+    CmdRingState, Td, TdCancel, VirtEp, Xhci, XhciCommand, XhciState, ep_state, ir, op, quirk,
+    slot_trb, trb_type, usbsts, xhc_state, xhci_trace,
 };
 use super::{EndpointType, UsbError};
 use crate::irq::{IrqHandler, IrqReturn};
@@ -68,6 +68,34 @@ fn tx_status(cc: u8) -> Option<Result<(), UsbError>> {
         Cc::DATA_BUFFER_ERROR => Err(UsbError::BufferError),
         _ => return None,
     })
+}
+
+/// Soft retries of a transaction error before the hard reset (Linux
+/// MAX_SOFT_RETRY)
+const MAX_SOFT_RETRY: u32 = 3;
+
+/// Reset Endpoint's Transfer State Preserve bit (Linux TRB_TSP)
+const TRB_TSP: u32 = 1 << 9;
+
+/// How a halted endpoint is reset (Linux enum xhci_ep_reset_type)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reset {
+    /// The halted TD is skipped and fails
+    Hard,
+    /// Transfer state kept: the TD is retried
+    Soft,
+}
+
+/// Whether a transaction error is retried in place (Linux
+/// process_bulk_intr_td): not with the quirk (`off`), nor once
+/// `count`, the errors in a row, passes MAX_SOFT_RETRY
+fn soft_retry(count: &mut u32, off: bool) -> bool {
+    if off {
+        return false;
+    }
+    let c = *count;
+    *count += 1;
+    c <= MAX_SOFT_RETRY
 }
 
 /// Whether the controller halted the endpoint (Linux
@@ -664,7 +692,7 @@ impl Xhci {
                         if let Some(i) = ti {
                             ep.tds[i].status = Err(UsbError::BusError);
                         }
-                        self.handle_halted_endpoint(st, slot, dci, ti);
+                        self.handle_halted_endpoint(st, slot, dci, ti, Reset::Hard);
                     }
                     if let Some(ep) = st.ep(slot, dci) {
                         ep.ep_state &= !ep_state::EP_STOP_CMD_PENDING;
@@ -761,7 +789,7 @@ impl Xhci {
         // An event naming no transfer TRB of the ring (xHCI 4.17.4)
         let Some(idx) = ring.index_of(ev.parameter) else {
             if halted_host_endpoint(ctx_state, cc) {
-                self.handle_halted_endpoint(st, slot, dci, None);
+                self.handle_halted_endpoint(st, slot, dci, None, Reset::Hard);
             }
             return;
         };
@@ -774,7 +802,7 @@ impl Xhci {
             // A Force Stopped event names the TRB before the TD the
             // endpoint stopped at; the Stop Endpoint completion handles it
             if !is_stopped(cc) && halted_host_endpoint(ctx_state, cc) {
-                self.handle_halted_endpoint(st, slot, dci, None);
+                self.handle_halted_endpoint(st, slot, dci, None, Reset::Hard);
             } else if !is_stopped(cc) && ep.tds.iter().any(Td::on_ring) {
                 printkln!(
                     "xHCI: event trb@{:#x} for slot {} ep {} not part of a TD",
@@ -787,7 +815,7 @@ impl Xhci {
         };
         if noop {
             if halted_host_endpoint(ctx_state, cc) {
-                self.handle_halted_endpoint(st, slot, dci, Some(ti));
+                self.handle_halted_endpoint(st, slot, dci, Some(ti), Reset::Hard);
             }
             return;
         }
@@ -798,6 +826,20 @@ impl Xhci {
             remaining,
             ctx_state,
         };
+        if ep.tds[ti].urb.pipe().ty != EndpointType::Control {
+            // Linux process_bulk_intr_td: a transaction error is retried
+            // in place a few times (no TT slots: hk has no hubs)
+            let off = self.quirks & quirk::NO_SOFT_RETRY != 0;
+            match cc {
+                Cc::SUCCESS | Cc::SHORT_PACKET => ep.err_count = 0,
+                Cc::USB_TRANSACTION_ERROR if soft_retry(&mut ep.err_count, off) => {
+                    ep.tds[ti].status = Ok(());
+                    self.handle_halted_endpoint(st, slot, dci, Some(ti), Reset::Soft);
+                    return;
+                }
+                _ => {}
+            }
+        }
         let finish = if ep.tds[ti].urb.pipe().ty == EndpointType::Control {
             process_ctrl_td(ep, ti, &event)
         } else {
@@ -817,7 +859,7 @@ impl Xhci {
             return;
         }
         if halted_host_endpoint(ev.ctx_state, ev.cc) {
-            self.handle_halted_endpoint(st, slot, dci, Some(ti));
+            self.handle_halted_endpoint(st, slot, dci, Some(ti), Reset::Hard);
             return;
         }
         let Some(ep) = st.ep(slot, dci) else {
@@ -832,14 +874,24 @@ impl Xhci {
         td_cleanup(td);
     }
 
-    /// The endpoint halted: the TD it halted on is marked so, and a
-    /// Reset Endpoint queued, whose completion moves the dequeue past
-    /// it (Linux xhci_handle_halted_endpoint, EP_HARD_RESET)
-    fn handle_halted_endpoint(&self, st: &mut XhciState, slot: u8, dci: u8, ti: Option<usize>) {
+    /// The endpoint halted: a Reset Endpoint queued (Linux
+    /// xhci_handle_halted_endpoint). A hard reset marks the TD it halted
+    /// on, and its completion moves the dequeue past it; a soft one
+    /// (Transfer State Preserve) leaves the TD to be retried when the
+    /// completion restarts the endpoint
+    fn handle_halted_endpoint(
+        &self,
+        st: &mut XhciState,
+        slot: u8,
+        dci: u8,
+        ti: Option<usize>,
+        reset: Reset,
+    ) {
         let Some(ep) = st.ep(slot, dci) else {
             return;
         };
-        if let Some(td) = ti.and_then(|i| ep.tds.get_mut(i))
+        if reset == Reset::Hard
+            && let Some(td) = ti.and_then(|i| ep.tds.get_mut(i))
             && td.cancel == TdCancel::None
         {
             td.cancel = TdCancel::Halted;
@@ -847,7 +899,10 @@ impl Xhci {
         if ep.ep_state & ep_state::EP_HALTED != 0 {
             return;
         }
-        let trb = slot_trb(trb_type::RESET_ENDPOINT, slot, dci, 0);
+        let mut trb = slot_trb(trb_type::RESET_ENDPOINT, slot, dci, 0);
+        if reset == Reset::Soft {
+            trb.control |= TRB_TSP;
+        }
         let Ok(cmd) = try_arc_gfp(
             XhciCommand::new_nowait(trb),
             crate::mm::page_alloc::Gfp::ATOMIC,
@@ -880,6 +935,10 @@ impl Xhci {
             ep.ep_state &= !ep_state::EP_HALTED;
         }
         self.giveback_invalidated_tds(st, slot, dci);
+        // A soft reset restarts the endpoint on the TD it halted on
+        if trb.control & TRB_TSP != 0 {
+            self.ring_doorbell_for_active_rings(st, slot, dci);
+        }
     }
 
     /// Take the cancelled TDs of a stopped endpoint off the ring (Linux
@@ -1150,5 +1209,22 @@ impl XhciCommand {
     /// xhci_alloc_command without a completion)
     pub(super) fn new_nowait(trb: Trb) -> Self {
         Self::new_cmd(trb, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Linux: `err_count++ > MAX_SOFT_RETRY` ends the retries, so four
+    /// soft resets, then the hard one; the quirk allows none
+    #[test]
+    fn soft_retry_count() {
+        let mut n = 0;
+        let tries: alloc::vec::Vec<bool> = (0..6).map(|_| soft_retry(&mut n, false)).collect();
+        assert_eq!(tries, [true, true, true, true, false, false]);
+        let mut q = 0;
+        assert!(!soft_retry(&mut q, true));
+        assert_eq!(q, 0, "the quirk counts nothing");
     }
 }

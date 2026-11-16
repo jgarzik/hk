@@ -802,9 +802,8 @@ QEMU's xHCI hides all of them.
   (`configure_endpoints`): isochronous and non-default control
   endpoints are skipped.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
-- A transaction error halts the endpoint at once (Linux retries a
-  few: EP_SOFT_RESET); no quirk for controllers that send a spurious
-  success event after a short transfer (XHCI_SPURIOUS_SUCCESS).
+- No quirk for controllers that send a spurious success event after a
+  short transfer (XHCI_SPURIOUS_SUCCESS).
 - INTx only (Linux tries MSI-X, then MSI): see "x86 has no IOAPIC or
   MSI"; a controller without an INTx line is not started, as Linux
   without any interrupt.
