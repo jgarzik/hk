@@ -35,32 +35,17 @@ argued / published copy of locked state.
   shared dentries.
 - Fix: RCU-walk for dcache (its own phase).
 
-### 4. `SchedEntity` and run-queue counters: lock-protected state as atomics — (a)(b)
+### 4. `SchedEntity` fields owned by the rq lock kept as atomics — (a)
 - Where: `task/sched.rs` `SchedEntity` `vruntime`, `deadline`, `vlag`,
-  `exec_start`, `rr_left`, `requeue_tail`, `contrib_load`, `class`, `policy`,
-  `static_prio`, `rt_priority`, `reset_on_fork`; `task/fair.rs` `update_curr`
-  (`exec_start.swap`), `place`/`save_lag` (`vlag.swap`);
-  `task/percpu.rs` `CpuRunQueue::update_curr_rt` (`exec_start.swap`),
-  `activate` (`contrib_load.swap`), `add_nr`; `PerCpuScheduler`
-  `nr_running`, `nr_uninterruptible`, `nr_switches`, `ticks`.
-- Wrong: all written under the rq lock (the `unsafe impl Sync` rationale is
-  "every other field is atomic"), yet `swap`/`fetch_*` make every tick,
-  switch, wakeup and enqueue pay several locked RMWs. The atomics hide the
-  real rule. `set_params` writes class/policy/static_prio/rt_priority as four
-  separate stores; lock-free readers (`sched_getattr`, `/proc/<pid>/stat`,
-  `curr_rank`-based placement) can combine a new class with an old priority.
-  `nr_running` etc. sit outside the lock's `CpuRunQueue` as sibling atomics.
-- Linux: `sched_entity`, `sched_rt_entity`, `rq->nr_running`,
-  `rq->nr_uninterruptible`, `rq->nr_switches` are plain fields under
-  `rq->__lock`; `p->policy`/`static_prio` change under `pi_lock` + rq lock and
-  are read with plain loads (tolerated torn reads only in getters).
-- Fix: move the fair/rt fields into an rq-lock-owned cell (accessed with the
-  rq guard as proof, like `ctx`); keep atomics only for fields with a named
-  lockless reader (`state`, `on_rq`, `on_cpu`, `cpu`) and use Relaxed
-  load+store there. Pack class/policy/prio into one word if lockless readers
-  must see a consistent tuple. Move `nr_running`/`nr_uninterruptible` into
-  `CpuRunQueue` with a Relaxed shadow only for `nr_running` (Linux READ_ONCE
-  readers). LOCKING.md §3.1 lists each field's lock.
+  `exec_start`, `rr_left`, `requeue_tail`, `contrib_load`. Their updates
+  are loads and stores under the rq lock now (no RMW), the parameters one
+  word (`Params`), the run-queue counts plain under their lock.
+- Wrong: still atomics only for interior mutability: the type does not
+  say which lock owns them.
+- Linux: plain fields of sched_entity / sched_rt_entity under the rq lock.
+- Fix: an rq-lock-owned cell (accessed with the rq guard as proof, like
+  `ctx`) for the fields with no lockless reader. LOCKING.md §3.1 lists
+  each field's lock.
 
 ### 5. Page allocator per-CPU lists: RMW under lock, shared lines, trylock flag — (a)(c)(d)
 - Where: `mm/page_alloc.rs` `Pcp.count` (`pcp_push`/`pcp_pop` `fetch_add/sub`

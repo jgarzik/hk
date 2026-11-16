@@ -135,6 +135,8 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     };
     // The whole thread group's CPU time (Linux do_task_stat with whole)
     let (utime, stime) = crate::task::percpu::group_times(&table, pid);
+    // One setting of the scheduling parameters (one load)
+    let params = t.task.se.params();
     Some(Snap {
         pid: u64::from(nr(me, ns)),
         tgid: u64::from(nr(leader, ns)),
@@ -169,9 +171,9 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         nivcsw: t.task.nivcsw.load(core::sync::atomic::Ordering::Relaxed),
         min_flt: t.task.min_flt.load(core::sync::atomic::Ordering::Relaxed),
         maj_flt: t.task.maj_flt.load(core::sync::atomic::Ordering::Relaxed),
-        nice: t.task.se.nice(),
-        policy: t.task.se.policy(),
-        rt_priority: i32::from(t.task.se.rt_priority()),
+        nice: params.nice(),
+        policy: params.policy(),
+        rt_priority: i32::from(params.rt_priority()),
         cpus: t.task.cpus_mask.snapshot(),
         cpu: t.task.cpu.load(core::sync::atomic::Ordering::Relaxed),
         exit_signal: t.exit_signal().raw(),

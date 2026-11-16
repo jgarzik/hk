@@ -6,7 +6,7 @@
 //! `rq->nr_switches++` under the rq lock). [`Sole`] is that: a load
 //! then a store, atomic only so other contexts may read the word.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Updates of an atomic only the caller writes: no lock prefix, no
 /// exclusive pair
@@ -49,3 +49,4 @@ macro_rules! sole {
 sole!(AtomicU32, u32);
 sole!(AtomicU64, u64);
 sole!(AtomicUsize, usize);
+sole!(AtomicI64, i64);

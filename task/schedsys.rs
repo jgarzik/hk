@@ -289,12 +289,14 @@ fn check_setscheduler(
     // One snapshot of the task (Linux reads p's fields under its locks)
     let snap = super::percpu::TASKLIST.read().view(t).map(|v| {
         let se = &v.task.se;
+        // One setting of the parameters (one load)
+        let p = se.params();
         (
             v.cred(),
-            se.policy(),
+            p.policy(),
             se.reset_on_fork(),
-            i32::from(se.rt_priority()),
-            se.nice(),
+            i32::from(p.rt_priority()),
+            p.nice(),
         )
     });
     let Some((c, cur, cur_reset, cur_prio, nice)) = snap else {

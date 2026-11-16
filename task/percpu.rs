@@ -294,11 +294,12 @@ impl CpuRunQueue {
     /// out)
     fn activate(&mut self, p: &Task) {
         p.se.set_state(RUNNING);
-        if p.se.contrib_load.swap(false, Ordering::Relaxed) {
-            PERCPU_SCHEDS
-                .get(self.cpu)
-                .nr_uninterruptible
-                .fetch_sub(1, Ordering::Relaxed);
+        // Under this rq's lock: plain updates (Linux
+        // p->sched_contributes_to_load, rq->nr_uninterruptible--); a
+        // run queue's count may go negative, the sum is right
+        if p.se.contrib_load.load(Ordering::Relaxed) {
+            p.se.contrib_load.store(false, Ordering::Relaxed);
+            crate::sync::Sole::sole_add(&PERCPU_SCHEDS.get(self.cpu).nr_uninterruptible, -1);
         }
         if !p.se.on_rq() {
             self.place_fair(p, false);
@@ -358,10 +359,9 @@ impl CpuRunQueue {
     /// A task joined (+1) or left (-1) this run queue (Linux
     /// add_nr_running / sub_nr_running)
     fn add_nr(&self, d: i32) {
-        PERCPU_SCHEDS
-            .get(self.cpu)
-            .nr_running
-            .fetch_add(d as u32, Ordering::Relaxed);
+        // Under this rq's lock, read lock-free elsewhere (Linux
+        // rq->nr_running, READ_ONCE): a load and a store
+        crate::sync::Sole::sole_add(&PERCPU_SCHEDS.get(self.cpu).nr_running, d as u32);
     }
 
     /// Make the running task switch at its next scheduling point: flag
@@ -434,7 +434,9 @@ impl CpuRunQueue {
         if self.curr_is_idle() || curr.se.class() != Class::Rt {
             return;
         }
-        let start = curr.se.exec_start.swap(now, Ordering::Relaxed);
+        // Under the rq lock (Linux curr->se.exec_start)
+        let start = curr.se.exec_start.load(Ordering::Relaxed);
+        curr.se.exec_start.store(now, Ordering::Relaxed);
         if start != 0 && now > start {
             self.rt_bw.charge(now, now - start);
         }
@@ -2378,12 +2380,16 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.task.ppid(),
             parent.task.pgid(),
             parent.task.sid(),
-            (
-                parent.task.se.policy(),
-                parent.task.se.static_prio(),
-                parent.task.se.rt_priority(),
-                parent.task.se.reset_on_fork(),
-            ),
+            {
+                // One setting of the parameters (one load)
+                let p = parent.task.se.params();
+                (
+                    p.policy(),
+                    p.static_prio(),
+                    p.rt_priority(),
+                    parent.task.se.reset_on_fork(),
+                )
+            },
             parent.task.cpus_mask.snapshot(),
             parent.pgd,
             parent.cred_arc(),
@@ -3754,7 +3760,8 @@ pub fn schedule() {
     let st = me.se.state();
     if st == SleepState::Uninterruptible as u8 || st == SleepState::Killable as u8 {
         me.se.contrib_load.store(true, Ordering::Relaxed);
-        sched.nr_uninterruptible.fetch_add(1, Ordering::Relaxed);
+        // Under this rq's lock (Linux rq->nr_uninterruptible++)
+        crate::sync::Sole::sole_add(&sched.nr_uninterruptible, 1);
     }
     // The task's own counter (Linux prev->nvcsw++)
     crate::sync::Sole::sole_add(&me.nvcsw, 1);

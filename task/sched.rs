@@ -39,6 +39,41 @@ impl Class {
     }
 }
 
+/// A task's scheduling parameters in one word (`SchedEntity.params`):
+/// class, policy, static priority and rt priority, a byte each
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Params(u32);
+
+impl Params {
+    const fn pack(class: Class, policy: u8, static_prio: u8, rt_priority: u8) -> u32 {
+        class as u32
+            | (policy as u32) << 8
+            | (static_prio as u32) << 16
+            | (rt_priority as u32) << 24
+    }
+
+    pub fn class(self) -> Class {
+        Class::from_u8(self.0 as u8)
+    }
+
+    pub fn policy(self) -> i32 {
+        i32::from((self.0 >> 8) as u8)
+    }
+
+    pub fn static_prio(self) -> u8 {
+        (self.0 >> 16) as u8
+    }
+
+    pub fn rt_priority(self) -> u8 {
+        (self.0 >> 24) as u8
+    }
+
+    /// Linux task_nice
+    pub fn nice(self) -> i32 {
+        i32::from(self.static_prio()) - i32::from(DEFAULT_PRIO)
+    }
+}
+
 /// Linux NICE_TO_PRIO(0): static_prio of nice 0
 pub const DEFAULT_PRIO: u8 = 120;
 
@@ -71,14 +106,11 @@ pub struct SchedEntity {
     /// p->on_cpu): set when it is made current, cleared by the task
     /// switched to once the switch is complete (finish_task_switch)
     on_cpu: AtomicBool,
-    /// Scheduling class (`Class`)
-    class: AtomicU8,
-    /// SCHED_* policy (Linux p->policy)
-    policy: AtomicU8,
-    /// 100 + 20 + nice (Linux p->static_prio)
-    static_prio: AtomicU8,
-    /// 1..99 for SCHED_FIFO/RR, else 0 (Linux p->rt_priority)
-    rt_priority: AtomicU8,
+    /// Scheduling parameters, one word so a lockless reader sees one
+    /// setting (`Params`): class, SCHED_* policy (Linux p->policy),
+    /// 100 + 20 + nice (p->static_prio), 1..99 for SCHED_FIFO/RR else 0
+    /// (p->rt_priority); set under pi_lock and the rq lock
+    params: AtomicU32,
     /// A fork child starts with SCHED_NORMAL and nice >= 0 (Linux
     /// p->sched_reset_on_fork)
     reset_on_fork: AtomicBool,
@@ -119,10 +151,7 @@ impl SchedEntity {
             on_rq: AtomicBool::new(false),
             on_cpu: AtomicBool::new(false),
             contrib_load: AtomicBool::new(false),
-            class: AtomicU8::new(Class::Fair as u8),
-            policy: AtomicU8::new(0),
-            static_prio: AtomicU8::new(DEFAULT_PRIO),
-            rt_priority: AtomicU8::new(0),
+            params: AtomicU32::new(Params::pack(Class::Fair, 0, DEFAULT_PRIO, 0)),
             reset_on_fork: AtomicBool::new(false),
             rr_left: AtomicU32::new(RR_TICKS),
             vruntime: AtomicU64::new(0),
@@ -181,16 +210,21 @@ impl SchedEntity {
         self.on_cpu.store(v, Ordering::Release);
     }
 
+    /// The scheduling parameters, one setting (one load)
+    pub fn params(&self) -> Params {
+        Params(self.params.load(Ordering::Relaxed))
+    }
+
     pub fn class(&self) -> Class {
-        Class::from_u8(self.class.load(Ordering::Relaxed))
+        self.params().class()
     }
 
     pub fn policy(&self) -> i32 {
-        i32::from(self.policy.load(Ordering::Relaxed))
+        self.params().policy()
     }
 
     pub fn static_prio(&self) -> u8 {
-        self.static_prio.load(Ordering::Relaxed)
+        self.params().static_prio()
     }
 
     /// Linux task_nice
@@ -199,7 +233,7 @@ impl SchedEntity {
     }
 
     pub fn rt_priority(&self) -> u8 {
-        self.rt_priority.load(Ordering::Relaxed)
+        self.params().rt_priority()
     }
 
     pub fn reset_on_fork(&self) -> bool {
@@ -210,10 +244,8 @@ impl SchedEntity {
     /// rq lock held, and off the run queue lists, or not yet started).
     /// A SCHED_RR slice goes on (Linux leaves p->rt.time_slice).
     pub fn set_params(&self, class: Class, policy: i32, static_prio: u8, rt_priority: u8) {
-        self.class.store(class as u8, Ordering::Relaxed);
-        self.policy.store(policy as u8, Ordering::Relaxed);
-        self.static_prio.store(static_prio, Ordering::Relaxed);
-        self.rt_priority.store(rt_priority, Ordering::Relaxed);
+        let p = Params::pack(class, policy as u8, static_prio, rt_priority);
+        self.params.store(p, Ordering::Relaxed);
     }
 
     pub fn set_reset_on_fork(&self, v: bool) {
@@ -224,7 +256,10 @@ impl SchedEntity {
     /// up, which starts a new one and requeues it at the tail (Linux
     /// task_tick_rt)
     pub fn rr_tick(&self) -> bool {
-        if self.rr_left.fetch_sub(1, Ordering::Relaxed) > 1 {
+        // Under the rq lock (Linux p->rt.time_slice--)
+        let left = self.rr_left.load(Ordering::Relaxed);
+        if left > 1 {
+            self.rr_left.store(left - 1, Ordering::Relaxed);
             return false;
         }
         self.rr_left.store(RR_TICKS, Ordering::Relaxed);
@@ -235,7 +270,10 @@ impl SchedEntity {
     /// Whether a preempted task goes to the tail (its slice ran out),
     /// clearing that
     pub fn take_requeue_tail(&self) -> bool {
-        self.requeue_tail.swap(false, Ordering::Relaxed)
+        // Under the rq lock: a load and a store
+        let v = self.requeue_tail.load(Ordering::Relaxed);
+        self.requeue_tail.store(false, Ordering::Relaxed);
+        v
     }
 
     /// The switch frame

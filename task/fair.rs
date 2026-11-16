@@ -66,7 +66,9 @@ fn calc_delta_fair(delta: u64, se: &SchedEntity) -> u64 {
 /// update_curr, update_deadline): true once it used up its slice, which
 /// gives it a new deadline
 pub fn update_curr(se: &SchedEntity, now: u64) -> bool {
-    let start = se.exec_start.swap(now, Ordering::Relaxed);
+    // Under the rq lock: a load and a store (Linux curr->exec_start)
+    let start = se.exec_start.load(Ordering::Relaxed);
+    se.exec_start.store(now, Ordering::Relaxed);
     if start == 0 || now <= start {
         return false;
     }
@@ -122,7 +124,9 @@ pub fn save_lag(se: &SchedEntity, avg: u64) {
 /// slice to its first deadline (PLACE_DEADLINE_INITIAL)
 pub fn place(se: &SchedEntity, avg: u64, load: u64, initial: bool) {
     let w = i128::from(weight(se));
-    let mut lag = i128::from(se.vlag.swap(0, Ordering::Relaxed));
+    // Under the rq lock (Linux se->vlag)
+    let mut lag = i128::from(se.vlag.load(Ordering::Relaxed));
+    se.vlag.store(0, Ordering::Relaxed);
     if load > 0 {
         lag = lag * (i128::from(load) + w) / i128::from(load);
     }
