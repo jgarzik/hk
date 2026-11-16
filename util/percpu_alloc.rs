@@ -124,11 +124,16 @@ impl PcpSlot {
         unsafe { &(*a.chunks[c].load(Ordering::Acquire))[i] }
     }
 
-    /// Add `n` to this CPU's word (Linux this_cpu_add); any CPU's would
-    /// do, so preemption may move the caller meanwhile
+    /// Add `n` to this CPU's word (Linux this_cpu_add: no lock prefix
+    /// when the word is its own; a CPU past the table shares the first's
+    /// and adds atomically)
     pub fn add(&self, n: isize) {
         let cpu = crate::cpu::try_this_id().unwrap_or(0) as usize;
-        self.part(cpu).fetch_add(n, Ordering::Relaxed);
+        if cpu < areas().len() {
+            crate::cpu::LocalWord::local_add(self.part(cpu), n as i64);
+        } else {
+            self.part(cpu).fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     /// The words of every CPU, summed (Linux's per_cpu_ptr loop): exact

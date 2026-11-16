@@ -457,3 +457,44 @@ impl PerCpuOps for X86_64Arch {
         (cpu as usize) < MAX_CPUS && get_percpu(cpu).is_online.load(Ordering::Acquire)
     }
 }
+
+/// Add `v` to the word at `p` in one unlocked instruction (Linux
+/// this_cpu_add on x86: `add`): for a per-CPU word only this CPU
+/// writes. The kernel is not preemptive, so the caller stays on the CPU
+/// whose word it chose, and an interrupt cannot split one instruction.
+///
+/// # Safety
+/// `p` is valid, aligned, and written only by this CPU (its interrupts
+/// included).
+#[inline(always)]
+pub unsafe fn local_add_u64(p: *mut u64, v: u64) {
+    // SAFETY: the caller's word; one read-modify-write instruction
+    unsafe {
+        core::arch::asm!(
+            "add qword ptr [{p}], {v}",
+            p = in(reg) p,
+            v = in(reg) v,
+            options(nostack)
+        )
+    };
+}
+
+/// [`local_add_u64`] returning the old value (Linux
+/// this_cpu_add_return: an unlocked `xadd`)
+///
+/// # Safety
+/// As [`local_add_u64`].
+#[inline(always)]
+pub unsafe fn local_xadd_u64(p: *mut u64, v: u64) -> u64 {
+    let mut r = v;
+    // SAFETY: the caller's word; one read-modify-write instruction
+    unsafe {
+        core::arch::asm!(
+            "xadd qword ptr [{p}], {r}",
+            p = in(reg) p,
+            r = inout(reg) r,
+            options(nostack)
+        )
+    };
+    r
+}

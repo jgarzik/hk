@@ -9,8 +9,8 @@ argued / published copy of locked state.
 ## Patterns
 
 - **Locked RMW where Linux does a plain per-CPU or single-writer update.**
-  `fetch_add`/`swap` on state that only one CPU or one task writes (preempt
-  seqcount, per-task counters, rq fields under the rq lock). On x86 each
+  `fetch_add`/`swap` on state that only one CPU or one task writes
+  (seqcount, per-task counters, rq fields under the rq lock). On x86 each
   is a `lock`-prefixed instruction (a full barrier), on arm64 an LSE atomic or
   an LL/SC loop; Linux uses `this_cpu_inc` / plain `++` / `WRITE_ONCE`.
 - **Sibling atomics of a lock.** Fields mutated only under a lock but kept as
@@ -321,22 +321,13 @@ argued / published copy of locked state.
 
 ## Systemic recommendations
 
-1. Enforce LOCKING.md §5.4 rules in review; add: (10) "an atomic RMW needs
-   two concurrent writers: single-writer state uses Relaxed load+store";
-   (11) "per-CPU data is cache-line aligned per CPU"; (12) "no published
-   copies: the lockless reader reads the real field, stored once where it
-   changes".
-2. Provide the missing primitives so atomics stop being the path of least
-   resistance: a lock-owned cell (`LockedBy`-style, proof by guard) for
-   rq/timer-base/zone fields; an aligned `PerCpu`; a `this_cpu_add`-style
-   non-atomic per-CPU counter; a `SeqCount` type; a fair ticket spinlock.
-3. Each atomic field's doc comment names its lockless reader and Linux
-   equivalent (rule 7); a field "under lock X" with no lockless reader is a
-   bug to fix, not to document.
-4. Fix the LOCKING.md §5 examples that endorse the anti-patterns:
-   §5.1 (`preempt_count.fetch_add`), §5.2 (`File::advance_pos` `fetch_add`
-   though callers hold `f_pos_lock`), the `CachedPage` row (no such type),
-   and the `TcpSock.snap` row once finding 10 lands.
-5. Phase order by blast radius: 3 (every lock), then
-   4-6 (scheduler, allocator, syscall path), then 7-14 (RCU, VFS, net, mm
-   hot paths), the rest as their subsystems are touched.
+LOCKING.md §5.4 rules 10-12 (single writers, per-CPU areas, no published
+copies) and the primitives behind them (`percpu!` areas, queued spin and
+rwlocks, `cpu::LocalWord`) are in place. Still to provide: a lock-owned
+cell (`LockedBy`-style, proof by guard) for rq/timer-base/zone fields and
+a `SeqCount` type, with their first users. Each atomic field's doc
+comment names its lockless reader and Linux equivalent (rule 7); a field
+"under lock X" with no lockless reader is a bug to fix. Remaining phases
+by blast radius: 4-6 and 15/21 (scheduler, allocator, syscall path),
+then 7-14 and 19-20 (RCU, VFS, net, mm hot paths), then 10-12, 16-18
+and 22 (published copies, flag locks).

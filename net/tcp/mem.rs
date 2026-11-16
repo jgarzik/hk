@@ -85,7 +85,8 @@ fn rsv() -> isize {
 
 /// Add `amt` quanta (Linux sk_memory_allocated_add)
 pub fn add(amt: usize) {
-    let v = FW_ALLOC.this().fetch_add(amt as isize, Ordering::Relaxed) + amt as isize;
+    use crate::cpu::LocalWord;
+    let v = FW_ALLOC.this().local_add_return(amt as i64) as isize;
     if v >= rsv() {
         drain();
     }
@@ -93,7 +94,8 @@ pub fn add(amt: usize) {
 
 /// Give back `amt` quanta (Linux sk_memory_allocated_sub)
 pub fn sub(amt: usize) {
-    let v = FW_ALLOC.this().fetch_sub(amt as isize, Ordering::Relaxed) - amt as isize;
+    use crate::cpu::LocalWord;
+    let v = FW_ALLOC.this().local_add_return(-(amt as i64)) as isize;
     if v <= -rsv() {
         drain();
     }
@@ -163,14 +165,14 @@ pub struct Orphan(());
 
 impl Orphan {
     pub fn new() -> Self {
-        ORPHANS.this().fetch_add(1, Ordering::Relaxed);
+        crate::cpu::LocalWord::local_add(ORPHANS.this(), 1);
         Self(())
     }
 }
 
 impl Drop for Orphan {
     fn drop(&mut self) {
-        ORPHANS.this().fetch_sub(1, Ordering::Relaxed);
+        crate::cpu::LocalWord::local_add(ORPHANS.this(), -1);
     }
 }
 

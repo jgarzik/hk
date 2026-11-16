@@ -87,13 +87,16 @@ impl PercpuCounter {
     pub fn add(&self, amount: i64) {
         let _irq = IrqOff::new();
         if let Some(p) = self.part() {
-            let v = p.fetch_add(amount, Ordering::Relaxed) + amount;
+            use crate::cpu::LocalWord;
+            // This CPU's own word, interrupts off (Linux
+            // percpu_counter_add_batch: this_cpu ops)
+            let v = p.local_add_return(amount);
             if v.unsigned_abs() < self.batch.unsigned_abs() {
                 return;
             }
             let _l = self.lock.lock();
-            self.count
-                .fetch_add(p.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+            self.count.fetch_add(v, Ordering::Relaxed);
+            p.local_add(v.wrapping_neg());
         } else {
             let _l = self.lock.lock();
             self.count.fetch_add(amount, Ordering::Relaxed);

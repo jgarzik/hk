@@ -44,18 +44,34 @@ impl<const N: usize> Mib<N> {
         })
     }
 
-    /// The calling CPU's words (a CPU past the parts, possible only for
-    /// a MIB made before SMP bring-up, shares the first's)
+    /// The calling CPU's words, and whether they are its alone (a CPU
+    /// past the parts, possible only for a MIB made before SMP bring-up,
+    /// shares the first's)
     #[inline]
-    fn part(&self) -> &[AtomicU64; N] {
+    fn part(&self) -> (&[AtomicU64; N], bool) {
         let cpu = crate::cpu::try_this_id().unwrap_or(0) as usize;
-        &self.parts.get(cpu).unwrap_or(&self.parts[0]).0
+        match self.parts.get(cpu) {
+            Some(p) => (&p.0, true),
+            None => (&self.parts[0].0, false),
+        }
+    }
+
+    /// Add `n` (two's complement for a decrement) to this CPU's word
+    /// (Linux this_cpu_add: no lock prefix when the word is its own)
+    #[inline]
+    fn add_word(&self, field: usize, n: u64) {
+        let (p, own) = self.part();
+        if own {
+            crate::cpu::LocalWord::local_add(&p[field], n as i64);
+        } else {
+            p[field].fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     /// Linux SNMP_ADD_STATS
     #[inline]
     pub fn add(&self, field: usize, n: u64) {
-        self.part()[field].fetch_add(n, Ordering::Relaxed);
+        self.add_word(field, n);
     }
 
     /// Linux SNMP_INC_STATS
@@ -67,16 +83,15 @@ impl<const N: usize> Mib<N> {
     /// Linux SNMP_DEC_STATS (a gauge: words may wrap, the sum does not)
     #[inline]
     pub fn dec(&self, field: usize) {
-        self.part()[field].fetch_sub(1, Ordering::Relaxed);
+        self.add_word(field, u64::MAX);
     }
 
     /// Linux SNMP_UPD_PO_STATS: a packet at `pkts` and its bytes at
     /// `pkts + 1` (every *PKTS entry is followed by its *OCTETS one)
     #[inline]
     pub fn upd_po(&self, pkts: usize, octets: usize, len: usize) {
-        let p = self.part();
-        p[pkts].fetch_add(1, Ordering::Relaxed);
-        p[octets].fetch_add(len as u64, Ordering::Relaxed);
+        self.add_word(pkts, 1);
+        self.add_word(octets, len as u64);
     }
 
     /// Every CPU's word of `field`, summed (Linux snmp_fold_field)

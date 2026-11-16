@@ -319,7 +319,7 @@ static IPI_DONE: AtomicU64 = AtomicU64::new(0);
 
 /// One stress call: count it on the CPU running it
 fn ipi_count(_info: usize) {
-    IPI_RECV.this().fetch_add(1, Ordering::Relaxed);
+    crate::cpu::LocalWord::local_add(IPI_RECV.this(), 1);
 }
 
 /// A stress thread (one per CPU, all at once): rounds of calls to every

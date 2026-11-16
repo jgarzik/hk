@@ -87,7 +87,9 @@ pub use aarch64::barrier;
 pub use x86_64::barrier;
 
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::percpu::{preempt_count, preempt_disable, preempt_enable};
+pub use x86_64::percpu::{
+    local_add_u64, local_xadd_u64, preempt_count, preempt_disable, preempt_enable,
+};
 
 // Queued spin lock word accesses (sync::qspinlock)
 #[cfg(target_arch = "aarch64")]
@@ -96,7 +98,9 @@ pub use aarch64::qspin;
 pub use x86_64::qspin;
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::percpu::{preempt_count, preempt_disable, preempt_enable};
+pub use aarch64::percpu::{
+    local_add_u64, local_xadd_u64, preempt_count, preempt_disable, preempt_enable,
+};
 
 // Ptrace architecture-specific support
 #[cfg(target_arch = "x86_64")]

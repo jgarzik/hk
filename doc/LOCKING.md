@@ -5245,15 +5245,13 @@ unlocked `add gs:[field]` on x86 (Linux raw_cpu_add_4 on
 section. No lock prefix is needed: only the CPU writes them, and an
 interrupt that changes them restores them before returning.
 
-### 5.2 Atomic File Position
+### 5.2 File Position
 
-File position updates use lock-free atomics:
-
-```rust
-pub fn advance_pos(&self, n: u64) -> u64 {
-    self.pos.fetch_add(n, Ordering::Relaxed)
-}
-```
+`File.pos` is an atomic only so it can be read and written from shared
+references: `advance_pos` and `set_pos` are a plain load and store
+(Linux `f_pos`), made under `f_pos_lock` for regular files and
+directories (`pos_lock`, Linux FMODE_ATOMIC_POS) and racy for the rest,
+as Linux's.
 
 ### 5.3 Seqlock for Time
 
@@ -5335,6 +5333,17 @@ guard.b = 2;
    indexes), not a monotonic counter.
 9. **Counters hit on every packet or op on every CPU are per-CPU with
    batching.**
+10. **An atomic read-modify-write needs two concurrent writers.** State
+    one CPU or one task writes is a Relaxed load and store (a lock's
+    own fields, the owner's counters); a per-CPU word only its CPU
+    writes is `cpu::LocalWord::local_add` (Linux this_cpu_add: no lock
+    prefix on x86), the preempt count an unlocked per-CPU add (5.1).
+11. **Per-CPU data lives in the per-CPU areas** (`percpu!`, 4.4): never
+    an inline `[T; NR_CPUS]`, whose neighbouring CPUs share cache
+    lines.
+12. **No published copies.** A lockless reader reads the real field,
+    stored once where it changes (Linux READ_ONCE of the field), not a
+    second set of atomics refreshed from locked state.
 
 #### hk Pattern Examples
 

@@ -758,9 +758,13 @@ impl File {
         (m.is_file() || m.is_dir()).then(|| self.f_pos_lock.lock())
     }
 
-    /// Advance file position by n bytes
+    /// Advance the position by `n` bytes, the old one (Linux: `f_pos`
+    /// updated with a plain store, under f_pos_lock for the files that
+    /// take it (`pos_lock`), racy for the rest, as Linux's)
     pub fn advance_pos(&self, n: u64) -> u64 {
-        self.pos.fetch_add(n, Ordering::Relaxed)
+        let p = self.pos.load(Ordering::Relaxed);
+        self.pos.store(p.wrapping_add(n), Ordering::Relaxed);
+        p
     }
 
     /// Drop open-only flags before the file is shared (Linux

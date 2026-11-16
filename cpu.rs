@@ -279,6 +279,42 @@ macro_rules! percpu {
     };
 }
 
+/// A 64-bit per-CPU counter word: one this CPU alone writes (Linux
+/// this_cpu_add / this_cpu_add_return): no lock prefix on x86, a
+/// barrier-free atomic on arm64 (`arch::local_add_u64`)
+pub trait LocalWord {
+    /// Add `v` (two's complement for a negative one)
+    fn local_add(&self, v: i64);
+    /// Add `v`, the new value
+    fn local_add_return(&self, v: i64) -> i64;
+}
+
+macro_rules! local_word {
+    ($t:ty) => {
+        impl LocalWord for $t {
+            #[inline]
+            fn local_add(&self, v: i64) {
+                // SAFETY: the word is this CPU's alone (the trait's
+                // contract, stated at each use), 8 bytes, aligned
+                unsafe { crate::arch::local_add_u64(self.as_ptr().cast::<u64>(), v as u64) };
+            }
+
+            #[inline]
+            fn local_add_return(&self, v: i64) -> i64 {
+                let p = self.as_ptr().cast::<u64>();
+                // SAFETY: as local_add
+                let old = unsafe { crate::arch::local_xadd_u64(p, v as u64) };
+                (old as i64).wrapping_add(v)
+            }
+        }
+    };
+}
+
+local_word!(core::sync::atomic::AtomicU64);
+local_word!(core::sync::atomic::AtomicI64);
+local_word!(core::sync::atomic::AtomicIsize);
+local_word!(core::sync::atomic::AtomicUsize);
+
 #[cfg(test)]
 mod tests {
     use super::*;

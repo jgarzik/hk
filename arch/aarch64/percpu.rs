@@ -310,3 +310,27 @@ pub fn preempt_count() -> u32 {
         .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed))
         .unwrap_or(0)
 }
+
+/// Add `v` to the word at `p` (Linux this_cpu_add on arm64: an atomic
+/// add with no barriers): for a per-CPU word only this CPU writes; the
+/// exclusive pair keeps an interrupt's own add on the word
+///
+/// # Safety
+/// `p` is valid, aligned, and written only by this CPU (its interrupts
+/// included).
+#[inline(always)]
+pub unsafe fn local_add_u64(p: *mut u64, v: u64) {
+    // SAFETY: the caller's valid, aligned word, used only atomically
+    unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.fetch_add(v, Ordering::Relaxed);
+}
+
+/// [`local_add_u64`] returning the old value (Linux
+/// this_cpu_add_return)
+///
+/// # Safety
+/// As [`local_add_u64`].
+#[inline(always)]
+pub unsafe fn local_xadd_u64(p: *mut u64, v: u64) -> u64 {
+    // SAFETY: as local_add_u64
+    unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.fetch_add(v, Ordering::Relaxed)
+}
