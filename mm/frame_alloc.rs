@@ -31,14 +31,17 @@ fn phys(pfn: u64) -> u64 {
 }
 
 crate::percpu! {
-    /// The zone's per-CPU page lists (Linux zone->per_cpu_pageset)
-    static PCP: crate::mm::page_alloc::Pcp = crate::mm::page_alloc::Pcp::new();
+    /// The kernel zone's per-CPU page lists (Linux zone->per_cpu_pageset):
+    /// `FRAME_ALLOCATOR`'s
+    pub static ZONE_PCP: crate::mm::page_alloc::Pcp = crate::mm::page_alloc::Pcp::new();
 }
 
 impl FrameAllocator {
-    pub const fn new() -> Self {
+    /// An allocator whose zone keeps its per-CPU page lists in `pcp`,
+    /// its own (Linux: each zone's per_cpu_pageset)
+    pub const fn new(pcp: &'static crate::cpu::PerCpu<crate::mm::page_alloc::Pcp>) -> Self {
         Self {
-            zone: Zone::new(&PCP),
+            zone: Zone::new(pcp),
         }
     }
 

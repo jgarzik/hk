@@ -381,8 +381,12 @@ fn base_cpu(b: &HrBase) -> u32 {
 
 /// Give CPU `cpu`'s bases their CPU (Linux hrtimers_prepare_cpu), in
 /// its new per-CPU area before the area is published
-pub fn prepare_cpu(cpu: u32) {
-    for b in BASES.get_unpublished(cpu) {
+///
+/// # Safety
+/// As [`crate::cpu::PerCpu::get_unpublished`].
+pub unsafe fn prepare_cpu(cpu: u32) {
+    // SAFETY: the caller's contract
+    for b in unsafe { BASES.get_unpublished(cpu) } {
         b.cpu.store(cpu, Ordering::Relaxed);
     }
 }

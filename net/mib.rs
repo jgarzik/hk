@@ -44,27 +44,21 @@ impl<const N: usize> Mib<N> {
         })
     }
 
-    /// The calling CPU's words, and whether they are its alone (a CPU
-    /// past the parts, possible only for a MIB made before SMP bring-up,
-    /// shares the first's)
-    #[inline]
-    fn part(&self) -> (&[AtomicU64; N], bool) {
-        let cpu = crate::cpu::try_this_id().unwrap_or(0) as usize;
-        match self.parts.get(cpu) {
-            Some(p) => (&p.0, true),
-            None => (&self.parts[0].0, false),
-        }
-    }
-
-    /// Add `n` (two's complement for a decrement) to this CPU's word
-    /// (Linux this_cpu_add: no lock prefix when the word is its own)
+    /// Add `n` (two's complement for a decrement) to the calling CPU's
+    /// word (Linux this_cpu_add: no lock prefix when the part is its
+    /// own; an atomic add on a part CPUs share, past the parts of a MIB
+    /// made before SMP bring-up)
     #[inline]
     fn add_word(&self, field: usize, n: u64) {
-        let (p, own) = self.part();
-        if own {
-            crate::cpu::LocalWord::local_add(&p[field], n as i64);
-        } else {
-            p[field].fetch_add(n, Ordering::Relaxed);
+        use crate::cpu::LocalWord;
+        match crate::cpu::own_slot(self.parts.len()) {
+            // SAFETY: own_slot: this CPU's part alone, nothing schedules
+            Some(c) => unsafe { self.parts[c].0[field].local_add(n as i64) },
+            None => {
+                let cpu = crate::cpu::try_this_id().unwrap_or(0) as usize;
+                let p = self.parts.get(cpu).unwrap_or(&self.parts[0]);
+                p.0[field].fetch_add(n, Ordering::Relaxed);
+            }
         }
     }
 

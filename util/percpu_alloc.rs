@@ -128,11 +128,14 @@ impl PcpSlot {
     /// when the word is its own; a CPU past the table shares the first's
     /// and adds atomically)
     pub fn add(&self, n: isize) {
-        let cpu = crate::cpu::try_this_id().unwrap_or(0) as usize;
-        if cpu < areas().len() {
-            crate::cpu::LocalWord::local_add(self.part(cpu), n as i64);
-        } else {
-            self.part(cpu).fetch_add(n, Ordering::Relaxed);
+        use crate::cpu::LocalWord;
+        match crate::cpu::own_slot(areas().len()) {
+            // SAFETY: own_slot: this CPU's word alone, nothing schedules
+            Some(c) => unsafe { self.part(c).local_add(n as i64) },
+            None => {
+                let cpu = crate::cpu::try_this_id().unwrap_or(0) as usize;
+                self.part(cpu).fetch_add(n, Ordering::Relaxed);
+            }
         }
     }
 

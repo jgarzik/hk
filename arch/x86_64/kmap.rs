@@ -47,6 +47,7 @@ unsafe extern "C" {
     static _text: u8;
     static _etext: u8;
     static __end_rodata: u8;
+    static __per_cpu_start: u8;
     static _sdata: u8;
     static __kernel_start: u8;
     static __kernel_end: u8;
@@ -157,7 +158,9 @@ unsafe fn map_direct(pml4: *mut RawPageTable, ram: &dyn RamMap) {
 }
 
 /// Map the kernel image with 4KB pages: text read-only executable,
-/// rodata read-only, data and bss writable, neither executable (W^X)
+/// rodata and the per-CPU template read-only (the template is only the
+/// pristine image areas are copied from, after CPU 0's copy is made),
+/// data and bss writable, neither executable (W^X)
 ///
 /// # Safety
 /// As [`next`] for `pml4`.
@@ -165,6 +168,7 @@ unsafe fn map_image(pml4: *mut RawPageTable) {
     let text = &raw const _text as u64;
     let etext = &raw const _etext as u64;
     let erodata = &raw const __end_rodata as u64;
+    let pcpu = &raw const __per_cpu_start as u64;
     let sdata = &raw const _sdata as u64;
     let mut va = &raw const __kernel_start as u64;
     let end = &raw const __kernel_end as u64;
@@ -174,7 +178,7 @@ unsafe fn map_image(pml4: *mut RawPageTable) {
         } else if va >= sdata {
             PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE
         } else {
-            debug_assert!(va < erodata || va >= sdata);
+            debug_assert!(va < erodata || (pcpu..sdata).contains(&va));
             PAGE_PRESENT | PAGE_NO_EXECUTE
         };
         // SAFETY: as in `map_direct`

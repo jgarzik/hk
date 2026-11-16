@@ -94,10 +94,16 @@ impl<T> PerCpu<T> {
         unsafe { &*p }
     }
 
-    /// The calling CPU's copy
+    /// The calling CPU's copy (Linux this_cpu_ptr): a running CPU's
+    /// area exists, so no bounds check (CPU 0's from the first
+    /// instruction, the others' before they start)
     #[inline]
     pub fn this(&self) -> &T {
-        self.slot(this_id())
+        let off = OFFSETS[this_id() as usize].load(Ordering::Relaxed);
+        let p = (self.0.get() as usize).wrapping_add(off) as *const T;
+        // SAFETY: as `slot`: the calling CPU runs, so its area was made
+        // (and published to it) before it started
+        unsafe { &*p }
     }
 
     /// CPU `cpu`'s copy (`cpu` a possible CPU)
@@ -118,12 +124,16 @@ impl<T> PerCpu<T> {
     }
 
     /// CPU `cpu`'s copy in an area made but not yet published, for a
-    /// CPU prepare step (`setup_areas`)
-    pub fn get_unpublished(&self, cpu: u32) -> &T {
+    /// CPU prepare step
+    ///
+    /// # Safety
+    /// `setup_areas` made `cpu`'s area (`cpu` > 0) and calls this before
+    /// publishing it; nothing else runs on that CPU yet.
+    pub unsafe fn get_unpublished(&self, cpu: u32) -> &T {
         let off = OFFSETS[cpu as usize].load(Ordering::Relaxed);
+        debug_assert!(cpu > 0 && off != 0, "percpu: no unpublished area");
         let p = (self.0.get() as usize).wrapping_add(off) as *const T;
-        // SAFETY: as `slot`: the area exists (made by `setup_areas`,
-        // which alone calls this, for `cpu` it just made)
+        // SAFETY: as `slot`: the area exists (the caller's contract)
         unsafe { &*p }
     }
 }
@@ -172,9 +182,17 @@ fn template() -> (usize, usize) {
     (s, e - s)
 }
 
+/// Possible CPUs (Linux nr_cpu_ids at setup_per_cpu_areas): those
+/// with a per-CPU area
 #[cfg(not(test))]
-fn nr_possible() -> u32 {
+pub fn nr_possible() -> u32 {
     NR_POSSIBLE.load(Ordering::Acquire)
+}
+
+/// Host unit tests: every slot
+#[cfg(test)]
+pub fn nr_possible() -> u32 {
+    NR_CPUS as u32
 }
 
 /// CPU `cpu`'s area offset, None if it has no area
@@ -203,9 +221,13 @@ pub unsafe fn setup_boot_area() {
 
 /// Per-CPU state that names its CPU, set in a new area (Linux CPU
 /// hotplug prepare states, run before the CPU starts)
+///
+/// # Safety
+/// As [`PerCpu::get_unpublished`].
 #[cfg(not(test))]
-fn prepare_cpu(cpu: u32) {
-    crate::time::hrtimer::prepare_cpu(cpu);
+unsafe fn prepare_cpu(cpu: u32) {
+    // SAFETY: the caller's contract
+    unsafe { crate::time::hrtimer::prepare_cpu(cpu) };
 }
 
 /// Make the areas of CPUs 1..`n` from the template, `n` the possible
@@ -225,7 +247,8 @@ pub fn setup_areas(n: u32) {
         // pristine (the boot CPU uses its own area)
         unsafe { core::ptr::copy_nonoverlapping(start as *const u8, p, len) };
         OFFSETS[cpu as usize].store((p as usize).wrapping_sub(start), Ordering::Relaxed);
-        prepare_cpu(cpu);
+        // SAFETY: its area was just made, not yet published
+        unsafe { prepare_cpu(cpu) };
     }
     // The offsets before the count (Release): a CPU that sees the count
     // sees its area
@@ -259,7 +282,9 @@ impl<T> PerCpu<T> {
         self.0.iter().enumerate().map(|(c, t)| (c as u32, t))
     }
 
-    pub fn get_unpublished(&self, cpu: u32) -> &T {
+    /// # Safety
+    /// None (host tests).
+    pub unsafe fn get_unpublished(&self, cpu: u32) -> &T {
         &self.0[cpu as usize]
     }
 }
@@ -279,41 +304,89 @@ macro_rules! percpu {
     };
 }
 
-/// A 64-bit per-CPU counter word: one this CPU alone writes (Linux
-/// this_cpu_add / this_cpu_add_return): no lock prefix on x86, a
-/// barrier-free atomic on arm64 (`arch::local_add_u64`)
+/// The calling CPU's slot in an array of `len` per-CPU slots where CPUs
+/// past it share slot 0 (one made before SMP bring-up), if the slot is
+/// this CPU's alone: None for an unknown CPU (no per-CPU data yet) or
+/// for slot 0 while other CPUs share it
+pub fn own_slot(len: usize) -> Option<usize> {
+    let cpu = try_this_id()? as usize;
+    (cpu < len && (cpu != 0 || len >= nr_possible() as usize)).then_some(cpu)
+}
+
+/// A 64-bit per-CPU counter word (Linux this_cpu_add /
+/// this_cpu_add_return): no lock prefix on x86, a barrier-free atomic on
+/// arm64 (`arch::local_add_u64`)
 pub trait LocalWord {
     /// Add `v` (two's complement for a negative one)
-    fn local_add(&self, v: i64);
+    ///
+    /// # Safety
+    /// Only the calling CPU writes the word (its interrupts included),
+    /// and the caller stays on it (no scheduling point between choosing
+    /// the word and this call): a static per-CPU variable's `this()`, or
+    /// a slot [`own_slot`] gave.
+    unsafe fn local_add(&self, v: i64);
     /// Add `v`, the new value
-    fn local_add_return(&self, v: i64) -> i64;
+    ///
+    /// # Safety
+    /// As [`local_add`](Self::local_add).
+    unsafe fn local_add_return(&self, v: i64) -> i64;
+    /// Add `v` atomically, for a word CPUs share; the new value
+    fn atomic_add_return(&self, v: i64) -> i64;
+}
+
+impl<T: LocalWord> PerCpu<T> {
+    /// Add `v` to the calling CPU's word (Linux this_cpu_add); a CPU with
+    /// no per-CPU data yet (the boot CPU early) adds atomically to CPU
+    /// 0's
+    #[inline]
+    pub fn this_add(&self, v: i64) {
+        self.this_add_return(v);
+    }
+
+    /// [`this_add`](Self::this_add), the word's new value (Linux
+    /// this_cpu_add_return)
+    #[inline]
+    pub fn this_add_return(&self, v: i64) -> i64 {
+        match try_this_id() {
+            // SAFETY: a static per-CPU variable's word of the calling
+            // CPU, which only it writes; nothing schedules before the add
+            Some(c) => unsafe { self.get(c).local_add_return(v) },
+            None => self.get(0).atomic_add_return(v),
+        }
+    }
 }
 
 macro_rules! local_word {
-    ($t:ty) => {
+    ($t:ty, $v:ty) => {
         impl LocalWord for $t {
             #[inline]
-            fn local_add(&self, v: i64) {
-                // SAFETY: the word is this CPU's alone (the trait's
-                // contract, stated at each use), 8 bytes, aligned
+            unsafe fn local_add(&self, v: i64) {
+                // SAFETY: the word is this CPU's alone (the caller's
+                // contract), 8 bytes, aligned
                 unsafe { crate::arch::local_add_u64(self.as_ptr().cast::<u64>(), v as u64) };
             }
 
             #[inline]
-            fn local_add_return(&self, v: i64) -> i64 {
+            unsafe fn local_add_return(&self, v: i64) -> i64 {
                 let p = self.as_ptr().cast::<u64>();
                 // SAFETY: as local_add
                 let old = unsafe { crate::arch::local_xadd_u64(p, v as u64) };
+                (old as i64).wrapping_add(v)
+            }
+
+            #[inline]
+            fn atomic_add_return(&self, v: i64) -> i64 {
+                let old = self.fetch_add(v as $v, core::sync::atomic::Ordering::Relaxed);
                 (old as i64).wrapping_add(v)
             }
         }
     };
 }
 
-local_word!(core::sync::atomic::AtomicU64);
-local_word!(core::sync::atomic::AtomicI64);
-local_word!(core::sync::atomic::AtomicIsize);
-local_word!(core::sync::atomic::AtomicUsize);
+local_word!(core::sync::atomic::AtomicU64, u64);
+local_word!(core::sync::atomic::AtomicI64, i64);
+local_word!(core::sync::atomic::AtomicIsize, isize);
+local_word!(core::sync::atomic::AtomicUsize, usize);
 
 #[cfg(test)]
 mod tests {

@@ -108,7 +108,9 @@ unsafe fn map_linear(root: *mut RawPageTable, base: u64, size: u64) -> u64 {
 }
 
 /// Map the kernel image with 4KB pages: text read-only executable,
-/// rodata read-only, data and bss writable, neither executable (W^X)
+/// rodata and the per-CPU template read-only (the template is only the
+/// pristine image areas are copied from, after CPU 0's copy is made),
+/// data and bss writable, neither executable (W^X)
 ///
 /// # Safety
 /// As [`next`] for `root`.

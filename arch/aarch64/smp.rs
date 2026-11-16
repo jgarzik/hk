@@ -66,8 +66,14 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
     let bsp_mpidr = cpu::read_mpidr();
     let bsp_cpu_id = (bsp_mpidr & 0xFF) as u32;
     // Every possible CPU's per-CPU area before any AP starts (Linux
-    // setup_per_cpu_areas): each CPU the firmware lists
-    crate::cpu::setup_areas(acpi.cpus.len().max(1) as u32);
+    // setup_per_cpu_areas): the boot CPU and each AP the loop below may
+    // start, numbered as it numbers them
+    let aps = acpi
+        .cpus
+        .iter()
+        .filter(|c| c.hw_cpu_id != bsp_cpu_id && c.enabled)
+        .count();
+    crate::cpu::setup_areas((1 + aps).min(percpu::MAX_CPUS) as u32);
 
     // Get BSP kernel stack (from current SP, rounded to stack top)
     let bsp_stack: u64;

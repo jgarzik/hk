@@ -77,23 +77,28 @@ impl QNode {
     }
 }
 
+/// A CPU's nodes on cache lines of their own: other CPUs write them (a
+/// predecessor's `next`, a successor's `locked`)
+#[repr(align(64))]
+struct QNodes([QNode; MAX_NODES]);
+
 #[cfg(not(test))]
 crate::percpu! {
     /// Each CPU's queue nodes (Linux qnodes, DEFINE_PER_CPU_ALIGNED)
-    static QNODES: [QNode; MAX_NODES] = [const { QNode::new() }; MAX_NODES];
+    static QNODES: QNodes = QNodes([const { QNode::new() }; MAX_NODES]);
 }
 
 /// This CPU's nodes and id (+1 for the tail: 0 means no tail)
 #[cfg(not(test))]
 fn this_nodes() -> (&'static [QNode; MAX_NODES], u32) {
     let cpu = crate::cpu::this_id();
-    (QNODES.get(cpu), cpu)
+    (&QNODES.get(cpu).0, cpu)
 }
 
 /// CPU `cpu`'s node `idx`
 #[cfg(not(test))]
 fn node_of(cpu: u32, idx: u32) -> &'static QNode {
-    &QNODES.get(cpu)[idx as usize]
+    &QNODES.get(cpu).0[idx as usize]
 }
 
 // Host unit tests: each thread is a "CPU" with nodes of its own

@@ -28,9 +28,9 @@ pub const QUANTUM: usize = 4096;
 static ALLOCATED: AtomicIsize = AtomicIsize::new(0);
 crate::percpu! {
     /// Each CPU's changes not yet in `ALLOCATED` (Linux
-    /// tcp_memory_per_cpu_fw_alloc). An atomic RMW on the slot, so a task
-    /// moved to another CPU between two steps only changes that CPU's
-    /// reserve (Linux this_cpu ops)
+    /// tcp_memory_per_cpu_fw_alloc): written only by its CPU, with
+    /// this_cpu adds (`PerCpu::this_add_return`; the kernel is not
+    /// preemptive, so a step stays on one CPU), drained by its CPU too
     static FW_ALLOC: AtomicIsize = AtomicIsize::new(0);
 }
 /// Linux SK_MEMORY_PCPU_RESERVE: 1 MiB in quanta, the default and the
@@ -85,8 +85,7 @@ fn rsv() -> isize {
 
 /// Add `amt` quanta (Linux sk_memory_allocated_add)
 pub fn add(amt: usize) {
-    use crate::cpu::LocalWord;
-    let v = FW_ALLOC.this().local_add_return(amt as i64) as isize;
+    let v = FW_ALLOC.this_add_return(amt as i64) as isize;
     if v >= rsv() {
         drain();
     }
@@ -94,8 +93,7 @@ pub fn add(amt: usize) {
 
 /// Give back `amt` quanta (Linux sk_memory_allocated_sub)
 pub fn sub(amt: usize) {
-    use crate::cpu::LocalWord;
-    let v = FW_ALLOC.this().local_add_return(-(amt as i64)) as isize;
+    let v = FW_ALLOC.this_add_return(-(amt as i64)) as isize;
     if v <= -rsv() {
         drain();
     }
@@ -165,14 +163,14 @@ pub struct Orphan(());
 
 impl Orphan {
     pub fn new() -> Self {
-        crate::cpu::LocalWord::local_add(ORPHANS.this(), 1);
+        ORPHANS.this_add(1);
         Self(())
     }
 }
 
 impl Drop for Orphan {
     fn drop(&mut self) {
-        crate::cpu::LocalWord::local_add(ORPHANS.this(), -1);
+        ORPHANS.this_add(-1);
     }
 }
 

@@ -307,13 +307,12 @@ fn sum(c: &crate::cpu::PerCpu<core::sync::atomic::AtomicI64>) -> u64 {
 
 /// `d` pages entered (or left) the cache of `m`
 fn count_file(m: &AddressSpace, d: i64) {
-    use crate::cpu::LocalWord;
-    NR_FILE.this().local_add(d);
+    NR_FILE.this_add(d);
     if m.has_flag(AS_UNEVICTABLE) {
-        NR_UNEVICT.this().local_add(d);
+        NR_UNEVICT.this_add(d);
     }
     if m.acct.get().is_some() {
-        NR_SHMEM.this().local_add(d);
+        NR_SHMEM.this_add(d);
     }
 }
 
@@ -333,8 +332,7 @@ pub fn nr_unevictable() -> u64 {
 }
 
 fn count_dirty(d: i64) {
-    use crate::cpu::LocalWord;
-    NR_DIRTY.this().local_add(d);
+    NR_DIRTY.this_add(d);
 }
 
 /// Dirty page-cache pages (Linux global_node_page_state(NR_FILE_DIRTY))

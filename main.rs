@@ -92,7 +92,8 @@ use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 static ALLOCATOR: mm::heap::KernelAlloc = mm::heap::KernelAlloc::new();
 
 /// Global frame allocator
-static FRAME_ALLOCATOR: mm::frame_alloc::FrameAllocator = mm::frame_alloc::FrameAllocator::new();
+static FRAME_ALLOCATOR: mm::frame_alloc::FrameAllocator =
+    mm::frame_alloc::FrameAllocator::new(&mm::frame_alloc::ZONE_PCP);
 
 /// Global DMA operations (direct mapping backend)
 static DIRECT_DMA_OPS: DirectDmaOps = DirectDmaOps::new(&FRAME_ALLOCATOR);
