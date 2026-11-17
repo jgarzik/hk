@@ -702,9 +702,6 @@ waiting).
 
 **Location**: `fs/vfat/mod.rs`
 
-- mkdir writes the root's first cluster into a root child's ".."
-  entry; Linux (and the FAT spec) write 0 there (i_logstart of the
-  root), as rename's `logstart` does.
 - No directory link counts: Linux counts subdirectories (mkdir and
   rmdir inc_nlink/drop_nlink the parent, a cross-directory rename of a
   directory drop_nlink(old_dir) / inc_nlink(new_dir)).

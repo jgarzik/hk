@@ -2044,14 +2044,16 @@ impl InodeOps for VfatInodeOps {
         dot_entry[26..28].copy_from_slice(&(new_cluster as u16).to_le_bytes());
         write_bytes(&sb_data.bdev, cluster_offset, &dot_entry)?;
 
-        // Create .. entry (points to parent)
+        // Create .. entry (points to parent: Linux fat_alloc_new_dir,
+        // the parent's i_logstart, 0 for the root)
         let mut dotdot_entry = [0u8; 32];
         dotdot_entry[0..8].copy_from_slice(b"..      ");
         dotdot_entry[8..11].copy_from_slice(b"   ");
         dotdot_entry[11] = attr::DIRECTORY;
         let parent_cluster = dir_inode_data.start_cluster;
-        dotdot_entry[20..22].copy_from_slice(&((parent_cluster >> 16) as u16).to_le_bytes());
-        dotdot_entry[26..28].copy_from_slice(&(parent_cluster as u16).to_le_bytes());
+        let up = logstart(&sb_data, parent_cluster);
+        dotdot_entry[20..22].copy_from_slice(&((up >> 16) as u16).to_le_bytes());
+        dotdot_entry[26..28].copy_from_slice(&(up as u16).to_le_bytes());
         write_bytes(&sb_data.bdev, cluster_offset + 32, &dotdot_entry)?;
 
         // Create entry in parent (function returns the generated short name)

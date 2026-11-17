@@ -348,6 +348,7 @@ pub fn run_all_tests() {
     isolated(b"DPATH_UMOUNT", mount::dpath_umount::run_tests);
     isolated(b"DPATH_RENAME", fs::dpath_rename::run_tests);
     isolated(b"VFAT_CI_DENTRY", fs::vfat_names::run_tests);
+    isolated(b"VFAT_DOTDOT", fs::vfat_disk::run_tests);
     fs::tmpfs::run_tests();
     time::timerfd::run_tests();
     time::posix_timer::run_tests();
