@@ -646,20 +646,31 @@ impl PosixTimer {
         }
     }
 
-    /// Delete the timer (cancel, waiting out its callback; thread
-    /// context): a queued signal of it is dropped at dequeue
+    /// Delete the timer by a thread of its process (Linux
+    /// posix_timer_delete: timer_delete, exec, the process's last exit;
+    /// cancel, waiting out its callback; thread context): it leaves the
+    /// ignored list under that thread's siglock (Linux
+    /// posix_timer_cleanup_ignored under current->sighand->siglock); a
+    /// queued signal of it is dropped at dequeue
     fn delete(&self) {
-        {
-            let mut i = self.inner.lock();
-            i.armed = false;
-            i.requeue = false;
-            i.firing = false;
-            i.signal_seq += 1;
-        }
-        // Off its process's ignored list (Linux
-        // posix_timer_cleanup_ignored under siglock): the deleter is a
-        // thread of that process
+        self.invalidate();
         crate::signal::cleanup_ignored(self);
+        self.stop();
+    }
+
+    /// No signal of it is delivered or rearms it from now (Linux
+    /// it_signal_seq++ and the it_signal invalidation)
+    fn invalidate(&self) {
+        let mut i = self.inner.lock();
+        i.armed = false;
+        i.requeue = false;
+        i.firing = false;
+        i.signal_seq += 1;
+    }
+
+    /// Cancel its hrtimer, waiting out a running callback, and wake a
+    /// clock_nanosleep sleeper (Linux timer_del)
+    fn stop(&self) {
         self.timer.cancel_sync();
         self.wq.wake_all();
     }
@@ -977,11 +988,22 @@ fn next_free(next: &mut TimerT, taken: impl Fn(TimerT) -> bool) -> Option<TimerT
     None
 }
 
-/// A group's timers that were not deleted at its last exit (two last
-/// threads raced) stop with its SignalStruct
-impl Drop for PosixTimerRegistry {
-    fn drop(&mut self) {
-        delete_all(self.take());
+/// Its SignalStruct is going, no thread or reference left to reach it
+/// (`sig`, borrowed exclusively): timers its last exit did not delete
+/// (two last threads raced) stop without a siglock, ITIMER_REAL's
+/// callback is waited out, then the interval timers still on its
+/// ignored list are put (Linux exit_itimers: posix_timer_delete, then
+/// the ignored list's mop-up with posix_timer_cleanup_ignored)
+pub fn drop_timers(sig: &mut crate::signal::SignalStruct) {
+    let timers = sig.posix_timers.get_mut().take();
+    for t in timers.iter().filter_map(|(_, t)| t.as_ref()) {
+        t.invalidate();
+        t.stop();
+    }
+    sig.itimers.real.timer.cancel_sync();
+    let l = sig.ignored_timers_mut();
+    while let Some(t) = l.pop_front() {
+        crate::sync::rcu::put_rcu(t);
     }
 }
 
@@ -1375,11 +1397,6 @@ impl ITimers {
     /// these, in its Arc (before it can be armed)
     pub fn own(&self, sig: *const crate::signal::SignalStruct) {
         self.real.timer.set_data(sig as usize);
-    }
-
-    /// Wait out and stop ITIMER_REAL (its SignalStruct is going: Drop)
-    pub fn cancel(&self) {
-        self.real.timer.cancel_sync();
     }
 
     /// Itimer `which` (a valid one)

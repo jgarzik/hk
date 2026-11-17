@@ -2657,8 +2657,10 @@ pub fn queue_timer_locked(
 }
 
 /// Timer `t` leaves the current process's ignored list, under its
-/// siglock (Linux posix_timer_cleanup_ignored): it is being deleted by
-/// one of that process's threads
+/// siglock (Linux posix_timer_cleanup_ignored under
+/// current->sighand->siglock): it is being deleted by one of that
+/// process's threads (`PosixTimer::delete`; a process with none left
+/// puts its list in `posix_timer::drop_timers`)
 pub fn cleanup_ignored(t: &crate::time::posix_timer::PosixTimer) {
     let me = crate::task::percpu::current();
     let rcu = crate::sync::rcu::read_lock();
@@ -2987,6 +2989,14 @@ impl SignalStruct {
         self.ignored_timers.borrow_mut(g)
     }
 
+    /// Its ignored interval timers, through exclusive access (it is
+    /// going: `posix_timer::drop_timers`)
+    pub fn ignored_timers_mut(
+        &mut self,
+    ) -> &mut crate::util::list::OwnedList<crate::time::posix_timer::IgnoredAdapter> {
+        self.ignored_timers.get_mut()
+    }
+
     /// Its job-control state, under its table's siglock `g`
     pub fn jobctl<'a>(
         &'a self,
@@ -3225,10 +3235,12 @@ impl SignalStruct {
 
 /// ITIMER_REAL's callback reaches the SignalStruct by its address: it
 /// is waited out before any field goes (Linux cancels real_timer at the
-/// group's exit, `exit_itimers`, before the struct is freed)
+/// group's exit, `exit_itimers`, before the struct is freed); timers
+/// and ignored-list entries left by a racing last exit go with it
+/// (`posix_timer::drop_timers`, no siglock: nothing else reaches it)
 impl Drop for SignalStruct {
     fn drop(&mut self) {
-        self.itimers.cancel();
+        crate::time::posix_timer::drop_timers(self);
     }
 }
 
