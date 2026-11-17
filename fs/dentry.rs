@@ -30,7 +30,7 @@ use crate::util::list::{Link, OwnedList, Owner};
 
 use super::inode::Inode;
 use super::mount::{MOUNT_LOCK, Mount, MountRef};
-use super::name::DName;
+use super::name::{DName, DNameSlot};
 use super::path_ref::Path;
 use super::superblock::SuperBlock;
 use crate::sync::rcu::{RcuHead, RcuReadGuard};
@@ -179,8 +179,6 @@ fn hash_in(parent: &Dentry, p: &mut DentryInner, d: &DentryRef, name: &DName) {
     };
     let key = d_key(parent, h);
     d.d_hkey.store(key, Relaxed);
-    d.d_hparent
-        .store(core::ptr::from_ref(parent).addr(), Relaxed);
     p.children.push_back(d.clone());
     d_hash(key).lock().add_head(d.clone());
 }
@@ -207,12 +205,13 @@ fn __d_drop(p: &mut DentryInner, d: &Dentry, _dl: &mut DentryInner) -> Option<De
 }
 
 /// The bucket's test for the child `name` of `parent`: key and parent
-/// address (atomics, so a dentry being rehashed reads safely)
+/// (atomics, so a dentry being moved reads safely; under the bucket's
+/// lock both are those it was hashed with, since a move takes it out
+/// first; Linux compares d_parent)
 fn d_matcher<'a>(parent: &'a Dentry, name: &'a [u8]) -> (u64, impl Fn(&Dentry) -> bool + 'a) {
     let key = d_key(parent, name_hash_in(parent, name));
-    let pa = core::ptr::from_ref(parent).addr();
     (key, move |c: &Dentry| {
-        c.d_hkey.load(Relaxed) == key && c.d_hparent.load(Relaxed) == pa
+        c.d_hkey.load(Relaxed) == key && core::ptr::eq(c.parent_ptr(), parent)
     })
 }
 
@@ -245,7 +244,7 @@ fn __d_lookup(parent: &Dentry, name: &[u8]) -> Option<DentryRef> {
         let _cl = c.d_lock.read();
         if !core::ptr::eq(c.parent_ptr(), parent)
             || c.d_unhashed()
-            || !d_same_name(parent, c.d_name.read().as_bytes(), name)
+            || !c.d_name.read(&g, |s| d_same_name(parent, s, name))
         {
             return false;
         }
@@ -275,13 +274,15 @@ fn d_lookup(parent: &Dentry, name: &[u8]) -> Option<DentryRef> {
 /// (to add or drop a child): one walk of the bucket under its lock,
 /// which every hash writer holds, so it is exact (Linux __d_add and
 /// d_alloc_parallel decide under the bucket's hlist_bl_lock). With `_p`
-/// held no child of `parent` enters or leaves the tree; the name is
-/// read under `d_name`, a leaf. A new reference.
+/// held no child of `parent` enters or leaves the tree, and a name
+/// changes only out of every bucket (a move holds the bucket's lock to
+/// take it out), so the names read are whole. A new reference.
 fn d_lookup_locked(parent: &Dentry, _p: &DentryInner, name: &[u8]) -> Option<DentryRef> {
     let (key, is) = d_matcher(parent, name);
+    let g = crate::sync::rcu::read_lock();
     d_hash(key)
         .lock()
-        .find(|c| is(c) && d_same_name(parent, c.d_name.read().as_bytes(), name))
+        .find(|c| is(c) && c.d_name.read(&g, |s| d_same_name(parent, s, name)))
 }
 
 crate::percpu! {
@@ -303,16 +304,15 @@ struct DentryInner {
 /// ## Locking
 ///
 /// `d_lock` serializes every change, the parent included (Linux
-/// d_lock); a parent's d_lock is taken before a child's. `d_inode`
-/// and `d_flags` are atomics written under it (inside `d_seq` write
-/// sections for the inode) and read with no lock. The name has
-/// its own leaf lock, `d_name`, so a bucket walk can compare it (Linux
-/// reads d_name there under d_seq): written by d_move with the dentry's
-/// d_lock held and the dentry out of the tree. `sb` is immutable. `d_sib`/`d_sib_owner` belong to the parent's children
-/// list (its d_lock), `d_hash` to the bucket's bit lock; `d_hkey` and
-/// `d_hparent` are written under the parent's d_lock before the dentry
-/// goes in its bucket and read under the bucket's lock; they change
-/// only while it is out (Linux d_name.hash, d_parent). `d_parent` is
+/// d_lock); a parent's d_lock is taken before a child's. What an RCU
+/// walk reads (`d_inode`, `d_flags`, `d_name`, `d_parent`) are atomics
+/// written under it (inside `d_seq` write sections for the inode, the
+/// name and a move's parent) and read with no lock (Linux READ_ONCE
+/// under d_seq). `sb` is immutable. `d_sib`/`d_sib_owner` belong to
+/// the parent's children list (its d_lock), `d_hash` to the bucket's
+/// bit lock; `d_hkey` is written under the parent's d_lock before the
+/// dentry goes in its bucket and read under the bucket's lock; it
+/// changes only while it is out (Linux d_name.hash). `d_parent` is
 /// written under the dentry's d_lock (and, once it is in the tree,
 /// RENAME_LOCK) and read lock-free (Linux READ_ONCE(d_parent)).
 ///
@@ -373,14 +373,15 @@ pub struct Dentry {
     d_hash: Link,
     /// The key it was hashed under (`d_key`)
     d_hkey: AtomicU64,
-    /// The parent's address when hashed (compared, never followed)
-    d_hparent: AtomicUsize,
     /// On its inode's `i_dentry` (Linux d_u.d_alias)
     d_alias: Link,
 
-    /// Name in the parent (empty for a root): a leaf, taken inside
-    /// d_lock or a bucket lock
-    d_name: RwLock<DName>,
+    /// Name in the parent (empty for a root; Linux d_name): changed
+    /// only by a move, under the d_lock (write) inside a `d_seq` write
+    /// section, with the dentry out of every bucket; read with no lock
+    /// (`DNameSlot::read`, checked by `d_seq` unless the d_lock or a
+    /// bucket lock it is in is held)
+    d_name: DNameSlot,
 
     /// Single lock protecting all mutable state (like Linux d_lock)
     d_lock: RwLock<DentryInner>,
@@ -416,9 +417,8 @@ impl Dentry {
             d_sib_owner: Owner::new(),
             d_hash: Link::new(),
             d_hkey: AtomicU64::new(0),
-            d_hparent: AtomicUsize::new(0),
             d_alias: Link::new(),
-            d_name: RwLock::new(name),
+            d_name: DNameSlot::new(name),
             d_lock: RwLock::new(DentryInner {
                 children: OwnedList::new(),
             }),
@@ -579,7 +579,22 @@ impl Dentry {
     /// d_move may change it): a byte copy or a shared reference, never an
     /// allocation
     pub fn name(&self) -> DName {
-        self.d_name.read().clone()
+        let g = crate::sync::rcu::read_lock();
+        // Linux take_dentry_name_snapshot: repeated while a move raced
+        loop {
+            let seq = self.d_seq.read_begin();
+            let n = self.d_name.snapshot(&g);
+            if !self.d_seq.read_retry(seq) {
+                return n;
+            }
+        }
+    }
+
+    /// Name in the parent, a snapshot taken under its d_lock (`_dl`),
+    /// which every name writer holds: whole with no `d_seq` check (so
+    /// also inside this dentry's own write section)
+    fn name_locked(&self, _dl: &DentryInner) -> DName {
+        self.d_name.snapshot(&crate::sync::rcu::read_lock())
     }
 
     /// A reference to its inode (Linux d_inode + ihold): read with no
@@ -653,7 +668,9 @@ impl Dentry {
         // holds the directory's i_rwsem: no rename or delete raced)
         let same = !c.d_unhashed()
             && core::ptr::eq(c.parent_ptr(), self)
-            && d_same_name(self, c.d_name.read().as_bytes(), name)
+            && c.d_name.read(&crate::sync::rcu::read_lock(), |s| {
+                d_same_name(self, s, name)
+            })
             && core::ptr::eq(c.d_inode.load(Relaxed), Arc::as_ptr(&inode));
         if !same {
             return;
@@ -876,10 +893,14 @@ impl Prepend {
         self.pos = PATH_MAX - 1;
     }
 
-    /// "/name" of `d` in front (ENAMETOOLONG when it does not fit)
-    fn name(&mut self, d: &Dentry) -> Result<(), KernelError> {
-        let dn = d.d_name.read();
-        let n: &[u8] = &dn;
+    /// "/name" of `d` in front (ENAMETOOLONG when it does not fit):
+    /// read with no lock (Linux prepend_name), torn by a rename only in
+    /// a pass that RENAME_LOCK's sequence then rejects
+    fn name(&mut self, d: &Dentry, g: &RcuReadGuard) -> Result<(), KernelError> {
+        d.d_name.read(g, |n| self.prepend(n))
+    }
+
+    fn prepend(&mut self, n: &[u8]) -> Result<(), KernelError> {
         let start = self
             .pos
             .checked_sub(n.len() + 1)
@@ -958,7 +979,7 @@ fn prepend_path(
         let Some(parent) = d.parent_rcu(g) else {
             return Ok(false);
         };
-        b.name(d)?;
+        b.name(d, g)?;
         d = parent;
     }
 }
@@ -980,7 +1001,7 @@ pub fn dentry_path(d: &DentryRef) -> Result<Vec<u8>, KernelError> {
         b.reset();
         let mut cur: &Dentry = d;
         while let Some(p) = cur.parent_rcu(&g) {
-            b.name(cur)?;
+            b.name(cur, &g)?;
             cur = p;
         }
         Ok::<(), KernelError>(())
@@ -1379,7 +1400,8 @@ fn __d_move(d: &DentryRef, target: &DentryRef, exchange: bool) {
     };
     let mut dl = d.d_lock.write();
     let mut tl = target.d_lock.write();
-    let (dn, tn) = (target.name(), d.name());
+    // Both names, whole under the d_locks
+    let (dn, tn) = (target.name_locked(&tl), d.name_locked(&dl));
     let sd = d.seq_write(&mut dl);
     let st = target.seq_write(&mut tl);
     // Out of both buckets (Linux ___d_drop of each)
@@ -1390,10 +1412,10 @@ fn __d_move(d: &DentryRef, target: &DentryRef, exchange: bool) {
     };
     let t_old = hash_out(&mut npl, target);
     d.set_parent(&dl, np.clone());
-    *d.d_name.write() = dn.clone();
+    d.d_name.store(dn.clone());
     if exchange && let Some(o) = &op {
         target.set_parent(&tl, o.clone());
-        *target.d_name.write() = tn.clone();
+        target.d_name.store(tn.clone());
         let ol = opl.as_mut().unwrap_or(&mut npl);
         hash_in(o, ol, target, &tn);
     }

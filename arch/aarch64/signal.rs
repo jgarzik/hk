@@ -416,6 +416,10 @@ fn parse_reserved(addr: u64) -> Option<FpsimdContext> {
 ///
 /// Returns the value that should be in x0 (return value),
 /// or error code if restore fails.
+// Never inlined: its frame holds the copied signal frame (~1.9 KiB),
+// which inlined into the syscall dispatch, and that into the exception
+// entry, every syscall would carry on a 16 KiB stack
+#[inline(never)]
 pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     let frame = crate::task::percpu::current_pt_regs();
     // A copy, written back once the whole context is restored

@@ -173,8 +173,8 @@ an RCU read guard (`BlHead::find_rcu`, Linux
 hlist_bl_for_each_entry_rcu), which removal allows by keeping the
 removed link's `next` (hlist_bl_del_init_rcu) for entries freed a
 grace period after the bucket lets go (`RcuFreePtr`). Used for the
-dentry hash table (3.3 Dentry), under `Dentry.d_lock`, with only
-`Dentry.d_name` (a leaf) taken inside it.
+dentry hash table (3.3 Dentry), under `Dentry.d_lock`, with nothing
+taken inside it.
 
 ### 1.3.2 Nulls hash bucket lock (util/hlist_nulls.rs)
 
@@ -623,9 +623,7 @@ VFS locks (detailed order):
     Dentry.d_lock (single d_lock like Linux; short, never held across
                    i_rwsem; parent before child)
         → dentry hash bucket (util::hlist_bl bit lock: Linux
-                   hlist_bl_lock on dentry_hashtable)
-        → Dentry.d_name (spin RwLock, leaf: the name, read in a
-                   bucket walk; written by d_move under d_lock)
+                   hlist_bl_lock on dentry_hashtable; leaf)
         ↓
     Inode.private
         ↓
@@ -2786,8 +2784,8 @@ pub struct Dentry {
     d_flags: AtomicU32,         // DCACHE_MOUNTED; d_lock (write), read lock-free
     d_sib: Link, d_sib_owner: Owner, // Parent's children (its d_lock)
     d_hash: Link,               // Hash bucket (its bit lock); linked = hashed
-    d_hkey: AtomicU64, d_hparent: AtomicUsize, // Hash key, parent (parent's d_lock)
-    d_name: RwLock<DName>,      // Leaf; changed by d_move/d_exchange
+    d_hkey: AtomicU64,          // Hash key (parent's d_lock, before hashing)
+    d_name: DNameSlot,          // Linux d_name; d_lock (write) + d_seq, read lock-free
     d_alias: Link,              // Its inode's i_dentry (that lock)
     d_lock: RwLock<DentryInner>, // Single lock (like Linux d_lock)
 }
@@ -2862,7 +2860,7 @@ d_lock held for writing, the bucket lock taken inside it (and inside
 the child's d_lock where that is held: d_drop_tree). Nothing allocates
 to add or remove a child. Order: RENAME_LOCK -> d_lock (parent, then
 child) -> bucket lock (one bucket at a time, a spin lock to the
-preempt count and lockdep, one class) -> `d_name` (leaf).
+preempt count and lockdep, one class; a leaf).
 `d_lookup` (Linux d_lookup, __d_lookup; `Dentry::lookup_child`) holds
 no d_lock: it walks the bucket once under an RCU read guard with no
 lock, and checks a candidate whose key and parent address match under
@@ -2876,9 +2874,9 @@ one). So `Dentry::add` and `d_delete`, which decide on a child's
 count under that child's d_lock (write), see every lookup's
 reference. That is sound: dentries are freed a grace period after
 their last put and published with Release stores; the key and parent
-address are atomics; the name is read under `d_name`, which only
-d_move/d_exchange write, with the dentry unhashed under its d_lock
-(Linux __d_move's ___d_drop under it). A walk standing on a dentry a rename moves to
+address are atomics; the name is read with no lock (`DNameSlot`,
+below) and whole under the candidate's d_lock, which every name
+writer holds. A walk standing on a dentry a rename moves to
 another bucket follows it there and may miss; only d_move/d_exchange
 rehash, under RENAME_LOCK, so `d_lookup` repeats a miss while
 RENAME_LOCK's sequence moved (read_seqbegin / read_seqretry, as
@@ -2892,8 +2890,22 @@ directory lock) is fine: lookup_slow rechecks under i_rwsem.
 
 A name (`fs::name::DName`, Linux qstr over d_shortname or an
 external_name) is inline below `DNAME_INLINE_LEN` (40) bytes, else a
-refcounted `Arc<[u8]>` allocated, fallibly, when the dentry is made,
-before any lock. `Dentry::name` returns a snapshot (Linux
+refcounted `ExternalName` block allocated, fallibly, when the dentry
+is made, before any lock. A dentry keeps it in a `DNameSlot` (Linux
+d_name over d_shortname / external_name): the hash, the length, the
+long name's block pointer and the short name's words, each an atomic,
+so a reader with no lock gets a picture a rename may tear but never
+reads out of bounds. Only `__d_move` writes it, under the dentry's
+d_lock (write) inside its `d_seq` write section, with the dentry out
+of every bucket; so it is whole under that d_lock or under a bucket
+lock the dentry is in (`d_lookup_locked`), and otherwise checked by
+`d_seq` (`Dentry::name`, Linux take_dentry_name_snapshot, repeats
+while it moved) or by RENAME_LOCK's sequence (d_path, dentry_path:
+Linux prepend_name). A long block a move replaces is let go a grace
+period later (`put_rcu` on its `RcuPuts`: several dentries may give
+one block up within a grace period; Linux copy_name's kfree_rcu): the
+callback drops one count, and the last frees the bytes, which never
+sleeps. `Dentry::name` returns a snapshot (Linux
 take_dentry_name_snapshot: a byte copy or a reference) and a rename
 moves names by copy or reference (copy_name, swap_names), so no name
 is allocated under RENAME_LOCK or a d_lock. `d_move` takes the target
