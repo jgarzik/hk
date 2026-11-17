@@ -197,8 +197,9 @@ pub fn path_lookupat(
 /// [`path_lookupat`] from `start` (Linux filename_lookup's
 /// path_lookupat: in RCU mode, again in ref mode if that is ECHILD)
 pub fn path_lookup(start: Start<'_>, path: &[u8], flags: LookupFlags) -> Result<Path, KernelError> {
-    match Nd::new(start, flags, true)?.lookup(start, path, flags) {
-        Err(ECHILD) => Nd::new(start, flags, false)?.lookup(start, path, flags),
+    let links = Cell::new(0);
+    match Nd::new(start, flags, true, &links)?.lookup(start, path, flags) {
+        Err(ECHILD) => Nd::new(start, flags, false, &links)?.lookup(start, path, flags),
         r => r,
     }
 }
@@ -456,8 +457,6 @@ struct RefWalk<'p, 'h> {
     stack: &'h mut Held,
     user: &'p [u8],
     f: LookupFlags,
-    /// Symlinks followed so far (nd->total_link_count)
-    total: usize,
 }
 
 /// A component of the current text: the name's offsets, whether it is
@@ -472,19 +471,9 @@ struct Comp {
 }
 
 impl<'p, 'h> RefWalk<'p, 'h> {
-    fn new(
-        stack: &'h mut Held,
-        user: &'p [u8],
-        f: LookupFlags,
-        total: usize,
-    ) -> Result<Self, KernelError> {
+    fn new(stack: &'h mut Held, user: &'p [u8], f: LookupFlags) -> Result<Self, KernelError> {
         stack.prepare()?;
-        Ok(Self {
-            stack,
-            user,
-            f,
-            total,
-        })
+        Ok(Self { stack, user, f })
     }
 
     /// The current text, and whether nothing follows it below; ECHILD
@@ -621,6 +610,8 @@ pub struct Nd<'a> {
     r_seq: u32,
     /// LOOKUP_IS_SCOPED
     scoped: bool,
+    /// An open's flags (Linux op->open_flag): 0 for any other lookup
+    open_flag: u32,
     /// The permission bits an O_CREAT open's file is made with (Linux
     /// op->mode)
     mode: u32,
@@ -629,6 +620,10 @@ pub struct Nd<'a> {
     /// The mode and owner of the directory the last name was looked up
     /// in (Linux nd->dir_mode, nd->dir_vfsuid): 0 if there was none
     dir: Cell<(u16, Uid)>,
+    /// Symlinks followed so far (Linux nd->total_link_count): the
+    /// caller's, set once per lookup (__set_nameidata), so an RCU
+    /// attempt's count carries into its ref-mode retry
+    links: &'a Cell<usize>,
 }
 
 impl<'a> Nd<'a> {
@@ -636,8 +631,14 @@ impl<'a> Nd<'a> {
     /// (dirfd or the cwd), any other the task's root, taken (ref mode)
     /// or read (RCU mode) when a walk needs it. `rcu`: LOOKUP_RCU,
     /// which LOOKUP_CACHED needs (EAGAIN without: the retry of a walk
-    /// that had to leave RCU mode).
-    pub fn new(start: Start<'a>, f: LookupFlags, rcu: bool) -> Result<Self, KernelError> {
+    /// that had to leave RCU mode). `links`: the lookup's symlink
+    /// count, shared by its tries.
+    pub fn new(
+        start: Start<'a>,
+        f: LookupFlags,
+        rcu: bool,
+        links: &'a Cell<usize>,
+    ) -> Result<Self, KernelError> {
         if f.cached && !rcu {
             return Err(KernelError::WouldBlock);
         }
@@ -651,16 +652,33 @@ impl<'a> Nd<'a> {
             m_seq,
             r_seq,
             scoped: f.scoped(),
+            open_flag: 0,
             mode: 0,
             created: Cell::new(false),
             dir: Cell::new((0, 0)),
+            links,
         })
     }
 
-    /// An O_CREAT open's lookup, its file made with permission bits
-    /// `mode` (Linux op->mode)
-    pub fn create_mode(self, mode: u32) -> Self {
-        Self { mode, ..self }
+    /// An open's lookup (Linux path_openat): its flags, and the
+    /// permission bits an O_CREAT open's file is made with (op->mode)
+    pub fn open(self, open_flag: u32, mode: u32) -> Self {
+        Self {
+            open_flag,
+            mode,
+            ..self
+        }
+    }
+
+    /// One more symlink to follow (Linux reserve_stack's count):
+    /// MAX_SYMLINK_DEPTH in all along the lookup, else ELOOP
+    fn count_link(&self) -> Result<(), KernelError> {
+        let n = self.links.get();
+        if n >= MAX_SYMLINK_DEPTH {
+            return Err(KernelError::TooManySymlinks);
+        }
+        self.links.set(n + 1);
+        Ok(())
     }
 
     /// The lookup's open made its file (Linux FMODE_CREATED)
@@ -823,7 +841,7 @@ impl<'a> Nd<'a> {
         } else {
             self.start_ref(start)?
         };
-        let mut w = RefWalk::new(links, path, f, 0)?;
+        let mut w = RefWalk::new(links, path, f)?;
         self.walk_ref(start, &mut w)
     }
 
@@ -884,10 +902,9 @@ impl<'a> Nd<'a> {
     /// lookup_slow, or, for an O_CREAT open's last name (LOOKUP_CREATE:
     /// only there), open_last_lookups' lookup_open, a negative entry
     /// discarded (lookup_fast_for_open: the create needs the lock); a
-    /// negative answer to step into is ENOENT (step_into). An open
-    /// without O_CREAT takes walk_component's way: Linux's lookup_open
-    /// without O_CREAT is lookup_slow's (the shared lock, the dcache,
-    /// ->lookup).
+    /// negative answer to step into is ENOENT (step_into). An open's
+    /// last name without O_CREAT (LOOKUP_OPEN) goes to lookup_open too,
+    /// under the shared lock.
     fn lookup_rest(
         &self,
         cur: &Path,
@@ -896,10 +913,10 @@ impl<'a> Nd<'a> {
         bits: LookupBits,
         fast: Option<DentryRef>,
     ) -> Result<Found, KernelError> {
-        let open = bits.contains(LookupBits::CREATE);
-        match fast.filter(|d| !(open && d.is_negative())) {
+        let create = bits.contains(LookupBits::CREATE);
+        match fast.filter(|d| !(create && d.is_negative())) {
             Some(d) => Ok(Found::Child(positive(d)?)),
-            None if open => self.lookup_open(cur, dir, name, bits),
+            None if bits.contains(LookupBits::OPEN) => self.lookup_open(cur, dir, name, bits),
             None => {
                 name_ok(name)?;
                 let d = lookup_slow(&cur.dentry, dir, name, bits)?;
@@ -908,13 +925,15 @@ impl<'a> Nd<'a> {
         }
     }
 
-    /// Linux lookup_open with O_CREAT (no ->atomic_open here): `name` in
-    /// `cur` (whose inode is `dir`) under the directory's i_rwsem held
-    /// for writing, write access asked before it and its error kept for
-    /// a create (EROFS after EEXIST); ENOENT in a dead directory; the
-    /// dcache under the lock (a stale entry invalidated), else the file
-    /// system. A positive answer is the file to open; on a negative one
-    /// the file is made (may_o_create: write and search on the
+    /// Linux lookup_open (no ->atomic_open here): `name` in `cur` (whose
+    /// inode is `dir`) under the directory's i_rwsem, held for writing
+    /// with O_CREAT (`bits`: LOOKUP_CREATE), else shared; write access
+    /// asked before it for O_CREAT, O_TRUNC or a write mode, its error
+    /// kept for a create (EROFS after EEXIST); ENOENT in a dead
+    /// directory; the dcache under the lock (a stale entry
+    /// invalidated), else the file system. A positive answer is the
+    /// file to open; a negative one is ENOENT without O_CREAT (step_into),
+    /// else the file is made (may_o_create: write and search on the
     /// directory; the mode with the umask and SGID stripping, the owner
     /// from init_owner) and its dentry cached, the dentry first so an
     /// ENOMEM leaves no file made.
@@ -925,9 +944,17 @@ impl<'a> Nd<'a> {
         name: &[u8],
         bits: LookupBits,
     ) -> Result<Found, KernelError> {
+        use super::flags::{O_CREAT, O_RDWR, O_TRUNC, O_WRONLY};
         let parent = &cur.dentry;
-        let w = cur.mnt.want_write();
-        let _lock = dir.lock();
+        let create = bits.contains(LookupBits::CREATE);
+        let writes = self.open_flag & (O_CREAT | O_TRUNC | O_WRONLY | O_RDWR) != 0;
+        let w = writes.then(|| cur.mnt.want_write());
+        let (_excl, _shared);
+        if create {
+            _excl = dir.lock();
+        } else {
+            _shared = dir.lock_shared();
+        }
         if dir.is_dead() {
             return Err(KernelError::NotFound);
         }
@@ -945,6 +972,9 @@ impl<'a> Nd<'a> {
         if let Some(d) = d.filter(|d| !d.is_negative()) {
             return Ok(Found::Child(d));
         }
+        let Some(w) = w.filter(|_| create) else {
+            return Err(KernelError::NotFound);
+        };
         let _w = w?;
         let c = self.cred();
         super::dac::may_create(c, dir)?;
@@ -1004,8 +1034,8 @@ impl<'a> Nd<'a> {
     /// counted
     #[inline(never)]
     fn unlazied(&self, l: Lazy<'_>, links: &mut Held) -> Result<Path, KernelError> {
-        let Lazy { to, user, f, depth } = l;
-        let mut w = RefWalk::new(links, user, f, depth)?;
+        let Lazy { to, user, f } = l;
+        let mut w = RefWalk::new(links, user, f)?;
         let cur = match to {
             To::Done(p) => return self.finish(p, w.f),
             To::Comp(cur) => cur,
@@ -1063,10 +1093,7 @@ impl<'a> Nd<'a> {
         last: bool,
         w: &mut RefWalk<'_, '_>,
     ) -> Result<Path, KernelError> {
-        if w.total >= MAX_SYMLINK_DEPTH {
-            return Err(KernelError::TooManySymlinks);
-        }
-        w.total += 1;
+        self.count_link()?;
         self.may_pick(&dir, &link, last, w.f)?;
         self.get_link(dir, link, last, w)
     }
@@ -1501,8 +1528,9 @@ pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError>
     let f = LookupFlags::default();
     let start = path_start(dirfd, path, f)?;
     let s = start.start();
-    match Nd::new(s, f, true)?.parentat(s, path, f) {
-        Err(ECHILD) => Nd::new(s, f, false)?.parentat(s, path, f),
+    let links = Cell::new(0);
+    match Nd::new(s, f, true, &links)?.parentat(s, path, f) {
+        Err(ECHILD) => Nd::new(s, f, false, &links)?.parentat(s, path, f),
         r => r,
     }
 }
@@ -1650,7 +1678,6 @@ mod tests {
                 stack: &mut stack,
                 user: b"x",
                 f: LookupFlags::default(),
-                total: 0,
             };
             assert_eq!(w.next().err(), Some(ECHILD));
         }
@@ -1677,7 +1704,6 @@ mod tests {
             stack: &mut stack,
             user: b"x",
             f: LookupFlags::default(),
-            total: 0,
         };
         let a = w.next().unwrap().unwrap();
         w.advance(&a);

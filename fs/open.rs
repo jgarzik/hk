@@ -7,6 +7,7 @@ use crate::fs::namei::{
     Dfd, Nd, filename_lookup, filename_lookup_from, filename_lookup_start, getname, path_start,
 };
 use crate::fs::{Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac};
+use core::cell::Cell;
 
 use super::file::flags::AT_FDCWD;
 use super::flags::{
@@ -228,18 +229,6 @@ impl OpenAt<'_> {
             Self::Root(r) => filename_lookup_from(Some(r.clone()), path, lf),
         }
     }
-
-    /// [`OpenAt::lookup`] in one try, its walks starting in RCU mode if
-    /// `rcu` (Linux path_openat's path_init + link_path_walk, with or
-    /// without LOOKUP_RCU); the caller retries on ECHILD (`open_target`)
-    fn lookup_try(self, path: &[u8], lf: LookupFlags, rcu: bool) -> Result<Path, KernelError> {
-        let start = self.start(path, lf)?;
-        let s = start.start();
-        if path.is_empty() {
-            return filename_lookup_start(s, path, lf);
-        }
-        Nd::new(s, lf, rcu)?.lookup(s, path, lf)
-    }
 }
 
 /// Resolve the open target: an existing file, or (O_CREAT) a newly
@@ -248,38 +237,47 @@ impl OpenAt<'_> {
 /// do_filp_open's retry of path_openat), which comes before anything
 /// is created; the only RCU-to-ref retry, as every walk below is one
 /// try in the mode given. (Linux's third try, LOOKUP_REVAL on ESTALE,
-/// has no case here: no walk returns ESTALE.)
+/// has no case here: no walk returns ESTALE.) The symlink count is the
+/// open's, carried into the retry (Linux nameidata, set once by
+/// do_filp_open).
 fn open_target(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), KernelError> {
-    match open_target_nd(at, path, op, true) {
-        Err(KernelError::NoChild) => open_target_nd(at, path, op, false),
+    let links = Cell::new(0);
+    match open_target_nd(at, path, op, true, &links) {
+        Err(KernelError::NoChild) => open_target_nd(at, path, op, false, &links),
         r => r,
     }
 }
 
 /// [`open_target`], its lookup's walks starting in RCU mode if `rcu`
+/// (Linux path_openat): one walk, its last name looked up with the
+/// open's intent (a trailing symlink followed unless O_NOFOLLOW or
+/// O_EXCL, its body walked the same way), on a miss under the parent's
+/// lock and with O_CREAT made there (open_last_lookups, lookup_open)
 fn open_target_nd(
     at: OpenAt<'_>,
     path: &[u8],
     op: &OpenFlags,
     rcu: bool,
+    links: &Cell<usize>,
 ) -> Result<(Path, bool), KernelError> {
     let (flags, lf) = (op.flags, op.lookup);
-    if flags & O_CREAT == 0 {
-        return Ok((at.lookup_try(path, lf, rcu)?, false));
-    }
-    // O_CREAT|O_EMPTYPATH of an empty name: dirfd's own file; there is
-    // no last name, so no parent's sticky check (Linux nd->dir_mode is 0)
-    if path.is_empty() {
-        return creat_existing(at.lookup_try(path, lf, rcu)?, flags);
-    }
-    // O_CREAT (Linux path_openat): one walk, its last name looked up
-    // with the open's intent (a trailing symlink followed unless
-    // O_NOFOLLOW or O_EXCL, its body walked the same way) and made under
-    // the parent's lock if missing (open_last_lookups, lookup_open)
     let start = at.start(path, lf)?;
     let s = start.start();
-    let nd = Nd::new(s, lf, rcu)?.create_mode(op.mode);
+    // An empty name (O_EMPTYPATH): dirfd's own file, no walk; with
+    // O_CREAT there is no last name, so no parent's sticky check (Linux
+    // nd->dir_mode is 0)
+    if path.is_empty() {
+        let p = filename_lookup_start(s, path, lf)?;
+        if flags & O_CREAT == 0 {
+            return Ok((p, false));
+        }
+        return creat_existing(p, flags);
+    }
+    let nd = Nd::new(s, lf, rcu, links)?.open(flags, op.mode);
     let d = nd.lookup(s, path, lf)?;
+    if flags & O_CREAT == 0 {
+        return Ok((d, false));
+    }
     let created = nd.created();
     // do_open's O_CREAT checks
     if !created && flags & O_EXCL != 0 {
@@ -678,7 +676,8 @@ mod tests {
         let mut seen = (0, 0);
         for _ in 0..1000 {
             CALLS.store(0, Ordering::Relaxed);
-            let r = open_target_nd(OpenAt::Root(&top), b"d/x", &op, true);
+            let links = Cell::new(0);
+            let r = open_target_nd(OpenAt::Root(&top), b"d/x", &op, true, &links);
             seen = (CALLS.load(Ordering::Relaxed), BITS.load(Ordering::Relaxed));
             if r.is_ok_and(|(p, made)| !made && p.get_inode().is_some_and(|i| i.ino == SEEN))
                 && seen == (1, want.bits())
@@ -687,5 +686,43 @@ mod tests {
             }
         }
         panic!("revalidations {} flags {:#x}", seen.0, seen.1);
+    }
+
+    /// The symlink count is the open's, not one try's (Linux
+    /// nd->total_link_count, set once by do_filp_open): each followed
+    /// link adds to it, and a try that starts with MAXSYMLINKS counted
+    /// already, as a ref-mode retry after an RCU try that followed them
+    /// would, is ELOOP at its first link
+    #[test]
+    // The walk reads the current task, an aarch64 per-CPU register a
+    // host (EL0) test cannot read
+    #[cfg_attr(target_arch = "aarch64", ignore)]
+    fn link_count_is_the_opens() {
+        let root = DentryRef::new(Dentry::new_root_op(
+            inode(1, InodeMode::directory(0o755)),
+            &OPS,
+        ))
+        .unwrap();
+        let _f = Dentry::alloc(&root, b"f", Some(inode(5, InodeMode::regular(0o644)))).unwrap();
+        let l = inode(6, InodeMode::symlink());
+        l.set_link(b"f".as_slice().into());
+        let _l = Dentry::alloc(&root, b"l", Some(l)).unwrap();
+        let top = Path::new(crate::fs::mount::test_mnt_root(root.clone()), root);
+        let op = build_open_flags(&build_open_how(O_RDONLY, 0)).unwrap();
+        // One try from `n` links counted: its answer (an RCU try a
+        // concurrent mount change made ECHILD is tried again) and the
+        // count after it
+        let try_from = |rcu: bool, n: usize| loop {
+            let links = Cell::new(n);
+            let r = open_target_nd(OpenAt::Root(&top), b"l", &op, rcu, &links);
+            if !matches!(r, Err(KernelError::NoChild)) {
+                return (r.map(|(p, _)| p.get_inode().map(|i| i.ino)), links.get());
+            }
+        };
+        for rcu in [true, false] {
+            assert_eq!(try_from(rcu, 0), (Ok(Some(5)), 1), "rcu {rcu}");
+            let (r, n) = try_from(rcu, 40);
+            assert_eq!((r.err(), n), (Some(KernelError::TooManySymlinks), 40));
+        }
     }
 }

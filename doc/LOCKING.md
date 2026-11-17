@@ -3987,7 +3987,10 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
   for page locks and block I/O while holding `i_rwsem`, which a spinlock
   would forbid.
 - Path walk (`namei.rs::lookup_slow`) takes a directory's `i_rwsem`
-  shared on a dcache miss (Linux lookup_slow); callers already holding
+  shared on a dcache miss (Linux lookup_slow), as an open's last name
+  without O_CREAT does (`Nd::lookup_open`, Linux lookup_open's
+  inode_lock_shared, after mnt_want_write for O_TRUNC or a write
+  mode, its result dropped); callers already holding
   that directory exclusively (create, unlink, rename) use `lookup_one`
   directly.
 

@@ -184,8 +184,7 @@ impl Puts {
 /// same loop, LOOKUP_RCU cleared, from where try_to_unlazy returned):
 /// what it stood on, the rest of the caller's path below the link stack
 /// (each link held on the caller's [`Held`]: legitimize_links), the
-/// flags (a trailing slash added: lookup_last) and the symlinks
-/// followed so far (nd->total_link_count). The current text (the top
+/// flags (a trailing slash added: lookup_last). The current text (the top
 /// body's rest, else `user`) starts at the component the walk stopped
 /// at (`Comp`, `Lookup`, `Child`), or after it (`Step`, `Link`: a body
 /// it ended put already); empty for `Done`.
@@ -193,7 +192,6 @@ pub(super) struct Lazy<'p> {
     pub(super) to: To,
     pub(super) user: &'p [u8],
     pub(super) f: LookupFlags,
-    pub(super) depth: usize,
 }
 
 /// A level of the link stack in ref mode (Linux struct saved, its link
@@ -700,7 +698,6 @@ impl Nd<'_> {
         puts: &mut Puts,
     ) -> Result<Lazy<'p>, KernelError> {
         let mut user = path;
-        let mut total = 0;
         loop {
             // The current text: the top body's rest, else the path's
             let (text, tail_empty) = match stack.top() {
@@ -733,7 +730,7 @@ impl Nd<'_> {
                     puts.path(Role::Path, p);
                     return Err(e);
                 }
-                return self.lazy(To::Comp(p), stack, user, at, f, total, puts);
+                return self.lazy(To::Comp(p), stack, user, at, f, puts);
             }
             if last && let Some(dir) = cur.inode {
                 self.set_dir(dir);
@@ -748,7 +745,7 @@ impl Nd<'_> {
                 _ if create && slash => return Err(KernelError::IsDirectory),
                 _ => match self.lookup_fast_rcu(rc, &cur, name, f, last, puts)? {
                     Ok(c) => Some(c),
-                    Err(to) => return self.lazy(to, stack, user, at, f, total, puts),
+                    Err(to) => return self.lazy(to, stack, user, at, f, puts),
                 },
             };
             // Past the component; a body whose last component this is
@@ -787,7 +784,7 @@ impl Nd<'_> {
             };
             let l = match step {
                 Step::On => continue,
-                Step::Lazy(to) => return self.lazy(to, stack, user, 0, f, total, puts),
+                Step::Lazy(to) => return self.lazy(to, stack, user, 0, f, puts),
                 Step::Link {
                     mnt,
                     link,
@@ -803,8 +800,8 @@ impl Nd<'_> {
                     tail_empty: last,
                 },
             };
-            if let Some(to) = self.pick_link_rcu(rc, &mut cur, stack, l, &mut total, f, puts)? {
-                return self.lazy(to, stack, user, 0, f, total, puts);
+            if let Some(to) = self.pick_link_rcu(rc, &mut cur, stack, l, f, puts)? {
+                return self.lazy(to, stack, user, 0, f, puts);
             }
         }
         // complete_walk: LOOKUP_CACHED is cleared for this last unlazy,
@@ -815,7 +812,6 @@ impl Nd<'_> {
             to: To::Done(p),
             user: &[],
             f,
-            depth: total,
         })
     }
 
@@ -832,7 +828,6 @@ impl Nd<'_> {
         user: &'p [u8],
         from: usize,
         f: LookupFlags,
-        depth: usize,
         puts: &mut Puts,
     ) -> Result<Lazy<'p>, KernelError> {
         if stack.depth() == 0 {
@@ -840,7 +835,6 @@ impl Nd<'_> {
                 to,
                 user: &user[from..],
                 f,
-                depth,
             });
         }
         if !legitimize_links(stack, self.m_seq, puts) {
@@ -852,7 +846,7 @@ impl Nd<'_> {
         if let Some(top) = stack.held.0.top_mut() {
             top.pos += from;
         }
-        Ok(Lazy { to, user, f, depth })
+        Ok(Lazy { to, user, f })
     }
 
     /// may_lookup under LOOKUP_RCU: `cur` is a directory (link_path_walk's
@@ -1081,7 +1075,6 @@ impl Nd<'_> {
         cur: &mut RcuPath<'g>,
         stack: &mut Stack<'g, '_>,
         l: PickRcu<'g>,
-        total: &mut usize,
         f: LookupFlags,
         puts: &mut Puts,
     ) -> Result<Option<To>, KernelError> {
@@ -1090,10 +1083,7 @@ impl Nd<'_> {
             return Err(ECHILD);
         }
         // reserve_stack's count
-        if *total >= super::MAX_SYMLINK_DEPTH {
-            return Err(KernelError::TooManySymlinks);
-        }
-        *total += 1;
+        self.count_link()?;
         if l.last
             && let Some(d) = cur.inode
             && may_follow_link(self.cred(), d, l.inode).is_err()
